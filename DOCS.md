@@ -31,10 +31,11 @@ when sections are added.)
 | 4.8 | Physical Memory Manager | 364 |
 | 4.9 | Virtual Memory Manager | 395 |
 | 4.X | Tasks + scheduler (M13: preemption) | 422 |
-| 4.X | Keyboard layouts (M16) | ~492 |
-| 4.X | USB host stack — xHCI + HID (M15) | ~575 |
-| 4.X | Virtual consoles / pane split (M14) | ~665 |
-| 4.X | Ring 3 / user mode | ~750 |
+| 4.X | HAL — arch-independent interface (M17) | ~492 |
+| 4.X | Keyboard layouts (M16) | ~575 |
+| 4.X | USB host stack — xHCI + HID (M15) | ~660 |
+| 4.X | Virtual consoles / pane split (M14) | ~750 |
+| 4.X | Ring 3 / user mode | ~835 |
 | 4.X | Block layer + virtio-blk (M11) | 490 |
 | 4.X | procfs | 542 |
 | 4.X | devfs | 573 |
@@ -491,6 +492,63 @@ active at a time, FB preferred):
   prompt — the user-facing version of the boot self-test.  With
   cooperative scheduling the shell would lock up; under M13
   preemption the prompt stays responsive.
+
+### 4.X HAL — arch-independent interface (`kernel/includes/hal_api.h`)
+
+M17 walled off the arch-specific CPU/interrupt/task-bring-up calls
+behind a portable interface so x64 and aarch64 ports drop in as new
+implementations rather than core refactors.
+
+**Surface (hal_api.h):**
+
+| Function                              | Purpose                                         |
+|---------------------------------------|-------------------------------------------------|
+| `hal_cpu_halt`                        | Park CPU until next IRQ (x86 `hlt`, arm `wfi`)  |
+| `hal_cpu_pause`                       | Spin-loop hint (`pause` / `yield`)              |
+| `hal_cpu_idle`                        | **Atomic** enable-interrupts + halt (`sti; hlt` pair on x86 — the CPU guarantees no IRQ delivery between the two, so a "check ring, then sleep" idiom is race-free against an IRQ that fires between the check and the halt) |
+| `hal_intr_enable` / `hal_intr_disable`| Direct IF set/clear                             |
+| `hal_intr_save` / `hal_intr_restore`  | Save+disable / restore pair (cookie is opaque)  |
+| `hal_arch_early_init`                 | One-shot arch bring-up (x86: TSS+GDT+IDT)       |
+| `hal_task_init_stack`                 | Pre-build a fresh kernel stack so first `context_switch` lands in an arch-specific trampoline that `sti`s and calls `entry` |
+| `hal_syscall_exit_to_kernel`          | Restore saved kernel SP/PC for SYS_EXIT (noreturn) |
+
+**x86 implementation:** `kernel/hal/x86/hal_arch.c` (single-instruction
+wrappers + delegation to existing gdt/idt/tss inits) and
+`kernel/hal/x86/task_arch.c` (the brand-new-task trampoline + stack
+layout).  Both files are tiny — the interface intentionally exposes
+just what core code actually calls.
+
+**Migrations done in M17:**
+- `kernel/core/task.c` — `local_irq_save`/`restore` → `hal_intr_*`;
+  the `task_trampoline` + stack-build moved out to `task_arch.c`.
+  `struct task.esp` typed `uintptr_t` so signatures match on any
+  arch.  `context_switch`'s extern decl widened the same way.
+- `kernel/core/lock.c` — `spin_lock_irqsave`/`unlock_irqrestore` now
+  delegates to `hal_intr_save`/`restore`.
+- `kernel/core/vc.c` — `sti; hlt` → `hal_cpu_idle()`.
+- `kernel/core/kernel.c` — boot order swaps `tss_init() / gdt_init() /
+  idt_init()` for `hal_arch_early_init()`; boot self-test halts via
+  `hal_cpu_halt()`; the kernel idle loop too.
+- `kernel/core/syscall.c` — SYS_EXIT ESP/EIP rewrite moved out to
+  `hal_syscall_exit_to_kernel`.
+- Legacy PC drivers (`pit.c`, `ps2_keyboard.c`) — their port I/O
+  stays direct (driver is x86-only), but their `sti; hlt` idle uses
+  `hal_cpu_idle`.
+- `kernel/drivers/block/virtio_blk.c` — `pause` → `hal_cpu_pause`.
+
+**Verified end-to-end:** boot self-test results unchanged (vmm,
+kmalloc, exFAT, bcache, preempt 104M ticks, VC, shell), no behavioral
+regressions.
+
+**Deliberately NOT done in M17 (deferred):**
+- `kernel/mem/vmm.c` still pokes CR0 / CR3 / CR4 / invlpg directly.
+  Hiding those behind a `hal_map` / `hal_unmap` interface is best
+  done at the same time the x64 4-level / aarch64 granule paging
+  lands — premature now.  Tracked in PLAN §M17.
+- `kernel/core/syscall.c` still includes `idt.h` for the
+  arch-specific `struct int_frame`.  The clean fix is to split the
+  syscall dispatcher into a portable arg-marshalling layer and an
+  arch-specific frame-unpack — also a follow-up.
 
 ### 4.X Keyboard layouts (`kernel/core/keymap.c`, `kernel/core/layouts.c`, `kernel/includes/keymap.h`)
 
@@ -1173,6 +1231,31 @@ Linker: `ld -m elf_i386 -T linker.ld -nostdlib`.
 
 ## 8. Change log
 
+- **2026-06-27 — M17: HAL portability cut.**  Introduced
+  `kernel/includes/hal_api.h` — the arch-independent interface that
+  `kernel/core/`, `kernel/mem/`, and `kernel/fs/` reach for CPU
+  control, interrupt-flag manipulation, arch bring-up, and task
+  stack setup.  x86 implementation in
+  `kernel/hal/x86/hal_arch.c` (single-instruction wrappers + GDT/
+  IDT/TSS delegation) and `kernel/hal/x86/task_arch.c` (the
+  brand-new-task trampoline + stack-layout knowledge that used to
+  inline in task.c).  Migrations: `task.c`, `lock.c`, `vc.c`,
+  `kernel.c`, `syscall.c` lost all direct `__asm__` and their
+  `gdt.h`/`idt.h`/`tss.h` includes; legacy PC drivers (`pit`, `ps2`)
+  kept their port I/O (they're PC-only by definition) but switched
+  their `sti; hlt` idle to the atomic `hal_cpu_idle`.  `struct
+  task.esp` typed `uintptr_t` to be 32/64-bit-arch agnostic.  Boot
+  test unchanged: vmm + kmalloc + exFAT + bcache + preempt (104M
+  hog ticks) + VC + shell all pass.  Deliberately deferred to a
+  later milestone (best done with x64 paging): walling
+  `kernel/mem/vmm.c`'s CR0/CR3/CR4/invlpg behind a `hal_map`/
+  `hal_unmap` interface, and splitting `kernel/core/syscall.c`
+  along the arch-specific `struct int_frame` boundary.  Pitfalls
+  codified: `sti; hlt` is an atomic CPU-guaranteed pair (Intel SDM
+  Vol 2: `sti` blocks IRQ recognition for ONE instruction boundary)
+  — split it into `hal_intr_enable()` + `hal_cpu_halt()` and you
+  reintroduce a race against IRQs posted between the two; that's
+  why `hal_cpu_idle()` exists as its own primitive.
 - **2026-06-27 — M16: Keyboard layout abstraction.**  Introduced a
   shared keyboard pipeline (`kernel/core/keymap.c`,
   `kernel/core/layouts.c`, `kernel/includes/keymap.h`): input drivers

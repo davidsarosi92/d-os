@@ -50,7 +50,7 @@ struct task {
     char     name[TASK_NAME_MAX + 1];
     int      pid;
     enum task_state state;
-    uint32_t esp;                       /* saved kernel-stack pointer */
+    uintptr_t esp;                      /* saved kernel-stack pointer (HAL-typed) */
     void*    kstack_base;               /* kmalloc'd; freed at reap */
     struct task* next;                  /* circular run-queue link */
     /* M14: optional per-task output binding.  When non-NULL, console.c

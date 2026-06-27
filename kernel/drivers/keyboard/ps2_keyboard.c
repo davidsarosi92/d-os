@@ -17,6 +17,7 @@
 
 #include "keyboard.h"
 #include "hal.h"
+#include "hal_api.h"
 #include "idt.h"
 #include "module.h"
 #include "task.h"
@@ -216,7 +217,7 @@ char keyboard_getchar(void) {
          * to any other RUNNABLE task before checking the buffer again.
          * This is how a parallel kernel task gets a slice of CPU while
          * the shell is at the prompt. */
-        __asm__ volatile ("sti; hlt");
+        hal_cpu_idle();
         task_yield();
     }
 }

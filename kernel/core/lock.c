@@ -13,6 +13,7 @@
  * ============================================================================= */
 
 #include "lock.h"
+#include "hal_api.h"
 #include "printf.h"
 #include <stdint.h>
 
@@ -33,8 +34,10 @@ static volatile int g_preempt_count = 0;
  * might have changed.
  * -------------------------------------------------------------------------- */
 uint32_t spin_lock_irqsave(spinlock_t* l) {
-    uint32_t fl;
-    __asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    /* M17: arch-specific irq-save behind hal_intr_save.  On x86 this
+     * still expands to one pushf/pop/cli pair; on ARM it'll be a
+     * cpsid + flag read. */
+    uint32_t fl = hal_intr_save();
 
     /* On UP, with IRQs masked, the only way `l->locked` could already be 1
      * is if we recursively acquired the same lock from the same context.
@@ -48,10 +51,8 @@ uint32_t spin_lock_irqsave(spinlock_t* l) {
 
 void spin_unlock_irqrestore(spinlock_t* l, uint32_t flags) {
     l->locked = 0;
-    /* Restore EFLAGS exactly as they were before the matching irqsave.
-     * If the caller had IRQs enabled, popf re-enables them; if they were
-     * masked, popf leaves them masked. */
-    __asm__ volatile ("push %0; popf" :: "r"(flags) : "memory", "cc");
+    /* Restore IRQ state as it was before the matching irqsave. */
+    hal_intr_restore(flags);
 }
 
 /* --------------------------------------------------------------------------

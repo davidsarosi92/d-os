@@ -22,6 +22,7 @@
 #include "idt.h"
 #include "console.h"
 #include "printf.h"
+#include "hal_api.h"
 #include <stdint.h>
 
 /* Imports from usermode.s — the saved kernel context that lets SYS_EXIT
@@ -44,21 +45,13 @@ void syscall_dispatch(struct int_frame* f) {
         }
 
         case SYS_EXIT: {
-            /* Restore the kernel ESP saved in `enter_user_mode_wrap`,
-             * then jump to its `.return` label.  popad / ret over there
-             * unwinds back to the original caller.
-             *
-             * This bypasses the normal iret-back-to-ring-3 path; the
-             * interrupt frame on this (syscall) stack is simply
-             * abandoned, which is fine because TSS.esp0 will reset it
-             * for the next ring-3 → ring-0 transition. */
-            __asm__ volatile (
-                "mov %0, %%esp\n\t"
-                "jmp *%1\n\t"
-                :
-                : "r"(saved_esp), "r"(saved_eip)
-            );
-            __builtin_unreachable();
+            /* Restore the kernel SP / PC saved by the arch's
+             * `enter_user_mode_wrap` and resume there.  Bypasses the
+             * normal iret-back-to-ring-3 path; the interrupt frame on
+             * this (syscall) stack is simply abandoned, which is fine
+             * because the arch's ring-3 → ring-0 transition (e.g. TSS.
+             * esp0 on x86) resets it for the next transition.  Noreturn. */
+            hal_syscall_exit_to_kernel(saved_esp, saved_eip);
         }
 
         default:

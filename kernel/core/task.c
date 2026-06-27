@@ -69,11 +69,15 @@
 #include "kmalloc.h"
 #include "printf.h"
 #include "lock.h"
+#include "hal_api.h"
 #include <stddef.h>
 #include <stdint.h>
 
-/* The asm context-switch routine.  See kernel/hal/x86/switch.s. */
-extern void context_switch(uint32_t* save_esp_to, uint32_t new_esp);
+/* The arch-specific context-switch routine.  On x86 see
+ * kernel/hal/x86/switch.s; on x64/aarch64 the equivalent ships with
+ * those ports.  Signature is intentionally `uintptr_t` so the same
+ * declaration works on every 32/64-bit arch. */
+extern void context_switch(uintptr_t* save_esp_to, uintptr_t new_esp);
 
 /* Run-queue is a circular singly-linked list rooted at `current`.
  * `head` exists for diagnostic listing only. */
@@ -88,24 +92,13 @@ static int          next_pid = 0;
 static volatile int need_resched = 0;
 
 /* ------------------------------------------------------------------- */
-/* Local IRQ-save / IRQ-restore — duplicates lock.c's pattern to keep   */
-/* schedule() in a single translation unit (the compiler can then       */
-/* inline it cleanly into the hot path).                                 */
+/* IRQ-save / IRQ-restore — go through the HAL (M17).                   */
+/*                                                                      */
+/* Pre-M17 we inlined the pushf/cli pair here for "compiler-friendly    */
+/* hot path" reasons; that's now a HAL call.  Same single instruction   */
+/* generated on x86, and the same source compiles unchanged on x64 /    */
+/* aarch64 once their HAL ships.                                         */
 /* ------------------------------------------------------------------- */
-
-static inline uint32_t local_irq_save(void) {
-    uint32_t fl;
-    __asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
-    return fl;
-}
-
-static inline void local_irq_restore(uint32_t fl) {
-    /* Only restore IF — don't blindly popf, since other flag bits
-     * (CF/ZF/...) may have been changed by code running between our
-     * save and restore (notably context_switch).  IF is the only bit
-     * we care about for correctness. */
-    if (fl & 0x200) __asm__ volatile ("sti" ::: "memory");
-}
 
 /* ------------------------------------------------------------------- */
 /* Helpers.                                                             */
@@ -157,35 +150,22 @@ void task_init(void) {
     t0->esp         = 0;                /* set by first context_switch */
     t0->kstack_base = NULL;             /* we don't own boot's stack */
 
-    uint32_t fl = local_irq_save();
+    uint32_t fl = hal_intr_save();
     runqueue_insert_locked(t0);
-    local_irq_restore(fl);
+    hal_intr_restore(fl);
 
     kprintf("task: pid 0 (kernel) installed\n");
 }
 
 /* ------------------------------------------------------------------- */
 /* Spawn.                                                               */
+/*                                                                      */
+/* The arch-specific stack pre-build (trampoline + register layout for  */
+/* the first context_switch) lives in `kernel/hal/<arch>/task_arch.c`   */
+/* behind `hal_task_init_stack` (M17).  This file only owns the          */
+/* portable bits: kmalloc the stack, fill the `struct task`, link into  */
+/* the runqueue.                                                        */
 /* ------------------------------------------------------------------- */
-
-/* Wrapper that runs the task entry, then calls task_exit if the entry
- * returns.  Crucially: the first thing it does is `sti` so the new
- * task can be preempted by the timer.  Brand-new tasks reach the CPU
- * via context_switch's `ret` without going through a normal schedule()
- * cleanup, so the IRQ-enable that schedule() would have done on the
- * outgoing side has to be replicated here. */
-static void task_trampoline(void) {
-    /* New tasks always start with interrupts enabled — without this
-     * `sti` the timer would never fire on us and we could not be
-     * preempted (or even cooperatively yield back, in many cases). */
-    __asm__ volatile ("sti");
-
-    /* Pull the entry out of ebx, where task_spawn stashed it. */
-    void (*entry)(void);
-    __asm__ volatile ("mov %%ebx, %0" : "=r"(entry));
-    entry();
-    task_exit();
-}
 
 struct task* task_spawn(const char* name, void (*entry)(void)) {
     struct task* t = (struct task*)kcalloc(1, sizeof(struct task));
@@ -194,25 +174,15 @@ struct task* task_spawn(const char* name, void (*entry)(void)) {
     void* stack = kmalloc(TASK_KSTACK_SZ);
     if (!stack) { kfree(t); return NULL; }
 
-    /* Build the initial stack so context_switch's pop+ret lands in
-     * task_trampoline, with ebx pre-set to the caller's `entry`. */
-    uint32_t* sp = (uint32_t*)((char*)stack + TASK_KSTACK_SZ);
-    *--sp = 0xDEADBEEFu;                /* unreachable: trampoline calls task_exit */
-    *--sp = (uint32_t)(uintptr_t)task_trampoline;   /* return addr for ret */
-    *--sp = 0;                          /* ebp */
-    *--sp = 0;                          /* edi */
-    *--sp = 0;                          /* esi */
-    *--sp = (uint32_t)(uintptr_t)entry; /* ebx <- carries entry to trampoline */
-
     str_copy_n(t->name, name, sizeof t->name);
     t->pid         = next_pid++;
     t->state       = TASK_RUNNABLE;
-    t->esp         = (uint32_t)(uintptr_t)sp;
+    t->esp         = hal_task_init_stack((char*)stack + TASK_KSTACK_SZ, entry);
     t->kstack_base = stack;
 
-    uint32_t fl = local_irq_save();
+    uint32_t fl = hal_intr_save();
     runqueue_insert_locked(t);
-    local_irq_restore(fl);
+    hal_intr_restore(fl);
 
     return t;
 }
@@ -241,9 +211,9 @@ static void schedule_locked(void) {
 }
 
 void schedule(void) {
-    uint32_t fl = local_irq_save();
+    uint32_t fl = hal_intr_save();
     schedule_locked();
-    local_irq_restore(fl);
+    hal_intr_restore(fl);
 }
 
 void task_yield(void) {
@@ -266,12 +236,12 @@ void task_set_out_console(struct task* t, void* console) {
 void task_exit(void) {
     /* Mark ourselves DEAD then call schedule.  No future selection will
      * pick a DEAD task, so schedule_locked won't context-switch back. */
-    __asm__ volatile ("cli");
+    hal_intr_disable();
     current->state = TASK_DEAD;
     schedule_locked();
     /* Unreachable if at least one other RUNNABLE task exists.  Halt
      * forever if somehow we get back — the system has no one to run. */
-    for (;;) __asm__ volatile ("cli; hlt");
+    for (;;) { hal_intr_disable(); hal_cpu_halt(); }
 }
 
 /* ------------------------------------------------------------------- */

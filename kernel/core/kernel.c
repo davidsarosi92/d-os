@@ -37,9 +37,7 @@
 #include "shell.h"
 #include "printf.h"
 #include "acpi.h"
-#include "gdt.h"
-#include "idt.h"
-#include "tss.h"
+#include "hal_api.h"
 #include "multiboot.h"
 #include "pmm.h"
 #include "vmm.h"
@@ -67,13 +65,11 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
      * console sink — every kprintf below this line lands on COM1. */
     serial_module_init();
 
-    /* Arch essentials.  Direct calls because everything downstream
-     * assumes interrupts can be safely installed.  Order: TSS first
-     * (its address is baked into the GDT entry), then GDT (which also
-     * loads TR), then IDT. */
-    tss_init();
-    gdt_init();
-    idt_init();
+    /* Arch essentials behind the HAL (M17).  On x86 this runs TSS,
+     * GDT, IDT init in that order; other ports plug in their own
+     * `hal_arch_early_init` implementation.  Either way, IRQs may be
+     * safely installed after this call returns. */
+    hal_arch_early_init();
 
     /* Capture the multiboot info pointer — many later subsystems (PMM,
      * FB, meminfo) read the mmap and framebuffer fields out of it. */
@@ -243,18 +239,18 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
 
         /* Enable interrupts BEFORE spawning the hog — otherwise the
          * first PIT tick that would preempt us never arrives. */
-        __asm__ volatile ("sti");
+        hal_intr_enable();
 
         struct task* hog = task_spawn("preempt-test", preempt_test_entry);
         if (hog) {
             uint64_t deadline = timer_ticks_ms() + 500;
-            while (timer_ticks_ms() < deadline) __asm__ volatile ("hlt");
+            while (timer_ticks_ms() < deadline) hal_cpu_halt();
 
             uint32_t ticks = preempt_test_counter;
             preempt_test_stop = 1;
             /* Let the hog observe stop_flag and exit cleanly. */
             uint64_t reap_deadline = timer_ticks_ms() + 100;
-            while (timer_ticks_ms() < reap_deadline) __asm__ volatile ("hlt");
+            while (timer_ticks_ms() < reap_deadline) hal_cpu_halt();
 
             if (ticks > 0) {
                 kprintf("preempt self-test: PASS — kernel ran while hog tight-looped (hog ticks=%u)\n",
@@ -304,7 +300,7 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
      * shell tasks (or any other spawned worker); we just hlt to save
      * power until the next interrupt and then yield. */
     for (;;) {
-        __asm__ volatile ("hlt");
+        hal_cpu_halt();
         task_yield();
     }
 }

@@ -43,6 +43,7 @@
 #include "task.h"
 #include "console.h"
 #include "lock.h"
+#include "hal_api.h"
 #include "kmalloc.h"
 #include "printf.h"
 #include <stddef.h>
@@ -359,8 +360,10 @@ char vc_getchar(struct vc* v) {
         }
         /* Sleep until the next interrupt arrives (IRQ may have filled
          * our ring), then offer the CPU to other tasks before re-
-         * checking.  Same atomic sti+hlt trick as in keyboard_getchar. */
-        __asm__ volatile ("sti; hlt");
+         * checking.  Same atomic enable+halt pair as in
+         * keyboard_getchar — must be back-to-back so an IRQ posted
+         * between the ring check and the halt never gets missed. */
+        hal_cpu_idle();
         task_yield();
     }
 }

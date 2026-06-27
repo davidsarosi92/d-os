@@ -53,7 +53,9 @@ C_SRCS := \
     kernel/hal/x86/gdt.c \
     kernel/hal/x86/idt.c \
     kernel/hal/x86/tss.c \
-    kernel/hal/x86/pci.c
+    kernel/hal/x86/pci.c \
+    kernel/hal/x86/hal_arch.c \
+    kernel/hal/x86/task_arch.c
 
 ASM_SRCS := \
     kernel/hal/x86/boot.s \

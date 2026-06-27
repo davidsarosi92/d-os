@@ -146,7 +146,7 @@ what); a session can pick a theme and push on it.
 | M14 | Multi-session shell with FB pane splitting      | UX               | ✅ DOCS §4.X |
 | M15 | USB host stack + USB HID keyboard              | Input            | ✅ DOCS §4.X |
 | M16 | Keyboard layout abstraction (US, HU, DE, …)     | Input            | ✅ DOCS §4.X |
-| M17 | Portability cut — extract `hal_api.h`           | Architecture     | §M17    |
+| M17 | Portability cut — extract `hal_api.h`           | Architecture     | ✅ DOCS §4.X (partial — see notes) |
 | M18 | SMP support — APIC, AP boot, per-CPU, locking   | Concurrency      | §M18    |
 | M19 | Memory at scale — slab, huge pages, near-NUMA   | Memory           | §M19    |
 | M20 | x64 (long mode) port                            | Architecture     | §M20    |
@@ -809,25 +809,61 @@ truth, replaces old hardcoded tables in ps2/usb drivers) and `hu`
 
 ---
 
-## §M17 — Portability cut — extract `hal_api.h`
+## §M17 — Portability cut — extract `hal_api.h` — **shipped (partial)**
 
-**Why now:** before §M20 (x64) and §M21 (ARM).  Doing this earlier
-locks us into x86 thinking; doing it at port time creates churn in
-the port itself.  Right after the device-fs work and before the
-arch ports is the sweet spot.
+Shipped 2026-06-27 as a phased cut.  See DOCS.md §4.X (HAL —
+arch-independent interface) and the 2026-06-27 change-log entry.
 
-**Design:** see §P above for the full interface sketch and refactor
-plan.  This milestone is just the execution: actually move all the
-declarations behind `hal_api.h`, fix every consumer, run the same
-test suite.
+**What landed:**
+- `kernel/includes/hal_api.h` — CPU control (halt/pause/idle),
+  interrupt-flag manipulation (enable/disable/save/restore), arch
+  bring-up (`hal_arch_early_init`), task stack setup
+  (`hal_task_init_stack`), syscall epilogue helper
+  (`hal_syscall_exit_to_kernel`).
+- x86 implementation: `kernel/hal/x86/hal_arch.c` +
+  `kernel/hal/x86/task_arch.c`.
+- `kernel/core/task.c`, `lock.c`, `vc.c`, `kernel.c`, `syscall.c`
+  migrated — no direct `__asm__`, no `gdt.h`/`idt.h`/`tss.h`
+  includes remain.
+- `struct task.esp` widened from `uint32_t` to `uintptr_t` so x64
+  and aarch64 plug in without source change.
+- Legacy PC drivers (`pit`, `ps2`) kept their port I/O (PC-only by
+  definition) but switched their `sti; hlt` idle to the atomic
+  `hal_cpu_idle`.
 
-**Definition of done:**
-- `grep -r "__asm__" kernel/core kernel/mem kernel/fs` returns
-  *nothing*.
-- All x86 specifics are in `kernel/hal/x86/`.
-- `kernel_main(struct boot_info*)` replaces `kernel_main(uint32_t,
-  uint32_t)`; the boot-info struct is filled in by the arch entry.
-- Boot test passes unchanged.
+**What was deliberately deferred** (= the partial in the table):
+
+- `kernel/mem/vmm.c` still pokes CR0/CR3/CR4/invlpg directly.  The
+  clean fix is `hal_map(virt, phys, size, flags)` /
+  `hal_unmap(virt, size)` in the HAL — but that abstraction is best
+  designed at the same time the x64 (4-level) and aarch64 (granule)
+  page tables land.  Bundling it into the x64 port milestone
+  (§M20) avoids inventing an API shape blindly.
+- `kernel/core/syscall.c` still includes `idt.h` for the x86-
+  specific `struct int_frame`.  Splitting the dispatcher into a
+  portable arg-marshalling layer plus an arch-specific
+  frame-unpack is straightforward but its own follow-up — every
+  arch has a different syscall ABI (`int 0x80` vs `syscall`/
+  `sysret` vs `svc`), and most of the syscall code IS the
+  arch-specific frame work.
+- `kernel_main(struct boot_info*)` normalization — today still
+  takes `(uint32_t magic, uint32_t info)`.  Naturally cleaned up
+  with multiboot2 / EFI handoff in x64 port.
+
+**Lessons learned:**
+
+- *`sti; hlt` is an atomic CPU-guaranteed pair.*  Intel SDM Vol 2:
+  `sti` blocks IRQ recognition for exactly one instruction
+  boundary, so the immediately-following `hlt` begins before any
+  pending IRQ can fire.  That gates the "check ring, then sleep"
+  pattern against the IRQ-posted-between-the-two race.  Splitting
+  into `hal_intr_enable()` + `hal_cpu_halt()` was the obvious
+  first instinct and it would silently break under load — hence
+  `hal_cpu_idle()` as its own primitive.
+- *Carry HAL types through every layer.*  Widening `task->esp` to
+  `uintptr_t` meant the `context_switch` extern declaration needed
+  matching, and the cast in `task_spawn` disappeared.  Get the
+  type right once and the conversions evaporate.
 
 ---
 

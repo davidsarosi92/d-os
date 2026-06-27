@@ -50,6 +50,7 @@
 #include "block.h"
 #include "pci.h"
 #include "hal.h"
+#include "hal_api.h"
 #include "pmm.h"
 #include "vmm.h"
 #include "kmalloc.h"
@@ -304,7 +305,7 @@ static int vblk_request(struct virtio_blk* v, uint32_t type, uint64_t lba,
      *    doesn't hang the whole shell forever; ~5–50s of `pause`. */
     uint32_t spins = 0;
     while (v->used->idx == v->last_used_idx) {
-        __asm__ volatile ("pause");
+        hal_cpu_pause();
         if (++spins > 50000000u) {
             kprintf("vblk: timeout (isr=%x dev_status=%x)\n",
                     inb(v->io_base + VBLK_OFF_ISR_STATUS),

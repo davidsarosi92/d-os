@@ -30,6 +30,7 @@
 
 #include "timer.h"
 #include "hal.h"
+#include "hal_api.h"
 #include "idt.h"
 #include "module.h"
 #include "task.h"
@@ -60,10 +61,10 @@ uint64_t timer_ticks_ms(void) {
 void timer_msleep(uint32_t ms) {
     uint64_t deadline = ticks_ms + ms;
     while (ticks_ms < deadline) {
-        /* sti + hlt to sleep until the next interrupt arrives, including
-         * our own IRQ0.  Cheap idle for now; will be replaced by
-         * `task_yield()` once a scheduler exists. */
-        __asm__ volatile ("sti; hlt");
+        /* Atomic enable+halt — sleep until the next interrupt arrives,
+         * including our own IRQ0.  Cheap idle for now; could be
+         * replaced by `task_yield()` for tighter scheduling. */
+        hal_cpu_idle();
     }
 }
 
