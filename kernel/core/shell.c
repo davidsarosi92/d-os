@@ -29,6 +29,7 @@
 #include "block_cache.h"
 #include "vc.h"
 #include "lock.h"
+#include "keymap.h"
 
 #define LINE_MAX        128             /* max accepted bytes per command line */
 #define DEFAULT_PROMPT  "d-os> "        /* fallback when config is unavailable */
@@ -102,6 +103,7 @@ static void cmd_help(void) {
                   "  config, getconf <key>, setconf <key> <value>, saveconf\n"
                   "  ringtest, ps, spawn, yield, loop\n"
                   "  pane, pane split horizontal|vertical\n"
+                  "  lslayout, setlayout <us|hu|...>\n"
                   "  shutdown, reboot\n");
 }
 
@@ -322,6 +324,36 @@ static void cmd_pane_split(struct vc* my_vc, enum vc_split_dir dir) {
         return;
     }
     /* The new pane's shell will draw its own prompt as soon as it runs. */
+}
+
+/* -------------------------------------------------------------------- */
+/* Keyboard layout commands (M16).                                       */
+/*                                                                      */
+/* `lslayout`        → list registered layouts + show the active one   */
+/* `setlayout <name>` → switch active layout (e.g. `setlayout hu`)      */
+/*                                                                      */
+/* Equivalent to `setconf keyboard.layout <name>` followed by reload,   */
+/* but a one-shot command is friendlier and doesn't persist to disk.    */
+/* -------------------------------------------------------------------- */
+
+static void lslayout_one(const struct kbd_layout* l, void* ctx) {
+    (void)ctx;
+    const char* tag = streq(l->name, keymap_current()) ? " <active>" : "";
+    kprintf("  %s%s\n", l->name, tag);
+}
+
+static void cmd_lslayout(void) {
+    kprintf("keyboard layouts:\n");
+    keymap_for_each(lslayout_one, NULL);
+}
+
+static void cmd_setlayout(const char* name) {
+    if (!name || !*name) { console_write("setlayout: missing name\n"); return; }
+    if (keymap_select(name) == 0) {
+        kprintf("layout: now '%s'\n", keymap_current());
+    } else {
+        kprintf("setlayout: unknown layout '%s'\n", name);
+    }
 }
 
 /* `pane [split horizontal|vertical]` argument parser. */
@@ -599,6 +631,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "loop"))           { cmd_loop();     return; }
     if (streq(line, "pane"))           { cmd_pane(my_vc, "");      return; }
     if (starts_with(line, "pane "))    { cmd_pane(my_vc, line + 5); return; }
+    if (streq(line, "lslayout"))       { cmd_lslayout();             return; }
+    if (starts_with(line, "setlayout ")) { cmd_setlayout(line + 10); return; }
     if (streq(line, "saveconf"))       {
         if (config_save() == 0) console_write("config saved.\n");
         else                    console_write("saveconf: failed\n");

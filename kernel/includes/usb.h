@@ -161,12 +161,6 @@ struct hid_boot_kbd_report {
 #define HID_MOD_RALT    0x40
 #define HID_MOD_RGUI    0x80
 
-/* Translation tables for HID usage IDs 0x04..0x38 (the printable USB
- * keyboard subset).  Defined in usb_hid.c.  Index 0..255 — anything
- * outside the populated range maps to 0 (= "no character"). */
-extern const char usb_hid_kbd_lower[256];
-extern const char usb_hid_kbd_upper[256];
-
 /* HID class driver entry — called from xhci.c when a HID boot keyboard
  * is detected on an endpoint.  Hands every fresh boot-report to the
  * class driver, which diffs it against the previous report, decodes

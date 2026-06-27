@@ -22,6 +22,7 @@
 #include "task.h"
 #include "devfs.h"
 #include "vc.h"
+#include "keymap.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -29,28 +30,68 @@
 #define KBD_STATUS   0x64
 #define KBD_OUT_FULL 0x01
 
-/* Same scancode-set-1 translation tables as the old polled driver.  Moved
- * here verbatim; interpretation happens now inside the IRQ handler. */
-static const char sc_lower[128] = {
-    /* 0x00-0x0E */  0,   27,  '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
-    /* 0x0F-0x1C */ '\t','q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
-    /* 0x1D-0x29 */  0,   'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'','`',
-    /* 0x2A-0x35 */  0,   '\\','z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',
-    /* 0x36-0x39 */  0,   '*', 0,   ' ',
+/* PS/2 scancode set 1 → USB HID Usage ID (M16).
+ *
+ * From M16 onward the keyboard pipeline is two-stage:
+ *
+ *   PS/2 scancode  ──[this table]──►  HID Usage ID
+ *                                            │
+ *                                            ▼
+ *                            keymap_translate(usage, modifiers)
+ *                                            │
+ *                                            ▼
+ *                                       ASCII char
+ *
+ * This puts the layout-specific knowledge (US vs HU vs ...) in
+ * `kernel/core/layouts.c`, not in each input driver.  We only carry
+ * the hardware-specific scancode → usage mapping here.
+ *
+ * Set-1 scancodes are bytes 0x01..0x53 on the main keyboard; multi-byte
+ * extended scancodes (0xE0 prefix) cover modifiers like RCtrl/RAlt and
+ * the cursor cluster — we handle RAlt (0xE0 0x38) below since it
+ * doubles as AltGr.
+ *
+ * Indices outside the populated range map to 0 ("unknown key", silently
+ * dropped). */
+static const uint8_t sc1_to_hid[128] = {
+    [0x01] = KC_ESC,
+    [0x02] = KC_1, [0x03] = 0x1F, [0x04] = 0x20, [0x05] = 0x21, [0x06] = 0x22,
+    [0x07] = 0x23, [0x08] = 0x24, [0x09] = 0x25, [0x0A] = KC_9, [0x0B] = KC_0,
+    [0x0C] = 0x2D /* - */, [0x0D] = 0x2E /* = */, [0x0E] = KC_BACKSPACE,
+    [0x0F] = KC_TAB,
+    [0x10] = 0x14 /* q */, [0x11] = 0x1A /* w */, [0x12] = 0x08 /* e */,
+    [0x13] = 0x15 /* r */, [0x14] = 0x17 /* t */, [0x15] = 0x1C /* y */,
+    [0x16] = 0x18 /* u */, [0x17] = 0x0C /* i */, [0x18] = 0x12 /* o */,
+    [0x19] = 0x13 /* p */,
+    [0x1A] = 0x2F /* [ */, [0x1B] = 0x30 /* ] */,
+    [0x1C] = KC_ENTER,
+    /* 0x1D = LCtrl — handled as modifier */
+    [0x1E] = KC_A,           [0x1F] = 0x16 /* s */, [0x20] = 0x07 /* d */,
+    [0x21] = 0x09 /* f */, [0x22] = 0x0A /* g */, [0x23] = 0x0B /* h */,
+    [0x24] = 0x0D /* j */, [0x25] = 0x0E /* k */, [0x26] = 0x0F /* l */,
+    [0x27] = 0x33 /* ; */, [0x28] = 0x34 /* ' */,
+    [0x29] = 0x35 /* ` */,
+    /* 0x2A = LShift — handled as modifier */
+    [0x2B] = 0x31 /* \ */,
+    [0x2C] = KC_Z,           [0x2D] = 0x1B /* x */, [0x2E] = 0x06 /* c */,
+    [0x2F] = 0x19 /* v */, [0x30] = 0x05 /* b */, [0x31] = 0x11 /* n */,
+    [0x32] = 0x10 /* m */, [0x33] = 0x36 /* , */, [0x34] = 0x37 /* . */,
+    [0x35] = 0x38 /* / */,
+    /* 0x36 = RShift — handled as modifier */
+    /* 0x38 = LAlt — handled as modifier */
+    [0x39] = KC_SPACE,
+    [0x56] = KC_NONUS_BSLASH,
 };
 
-static const char sc_upper[128] = {
-    /* 0x00-0x0E */  0,   27,  '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
-    /* 0x0F-0x1C */ '\t','Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
-    /* 0x1D-0x29 */  0,   'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
-    /* 0x2A-0x35 */  0,   '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?',
-    /* 0x36-0x39 */  0,   '*', 0,   ' ',
-};
+/* Modifier state.  Bits match keymap.h's KBD_MOD_* layout so we can
+ * hand `mods` straight to keymap_translate without conversion. */
+static uint8_t mods = 0;
 
-static int shift_down = 0;
-/* M14: Alt modifier — Alt+1..9 switches focus to the Nth VC instead of
- * producing a character.  Alt scancode (set 1): 0x38 make / 0xB8 break. */
-static int alt_down = 0;
+/* RAlt (AltGr) comes in as the 2-byte sequence 0xE0 0x38.  Track that
+ * we just saw the 0xE0 prefix so the next byte is interpreted as the
+ * "extended" variant.  Same prefix marks RCtrl, cursor keys, keypad
+ * Enter, etc. — for M16 we only care about RAlt. */
+static int e0_pending = 0;
 
 /* --------------------------------------------------------------------------
  * Input ring buffer shared between the ISR (producer) and the shell
@@ -92,23 +133,51 @@ static void keyboard_irq(struct int_frame* f) {
 
     uint8_t sc = inb(KBD_DATA);
 
-    if (sc == 0x2A || sc == 0x36) { shift_down = 1; return; }   /* shift make */
-    if (sc == 0xAA || sc == 0xB6) { shift_down = 0; return; }   /* shift break */
-    if (sc == 0x38)               { alt_down   = 1; return; }   /* Alt make  */
-    if (sc == 0xB8)               { alt_down   = 0; return; }   /* Alt break */
-    if (sc & 0x80) return;                                      /* any other break */
+    /* Extended (0xE0-prefixed) scancodes: stash the prefix and handle
+     * the follow-up byte on the next IRQ.  We only care about RAlt
+     * (0xE0 0x38 make / 0xE0 0xB8 break) — everything else gets
+     * dropped via the e0_pending consume below. */
+    if (sc == 0xE0) { e0_pending = 1; return; }
+    int was_e0 = e0_pending;
+    e0_pending = 0;
 
-    /* M14: Alt+1..9 switches focus to the Nth VC.  Scancodes (set 1)
-     * for the digit row: '1' = 0x02 .. '9' = 0x0A.  We intercept these
-     * BEFORE the translation table so they never reach the shell as
-     * literal digits while Alt is held. */
-    if (alt_down && sc >= 0x02 && sc <= 0x0A) {
+    /* Modifier handling — these MUST come before the break-bit check
+     * because we care about both make AND break for modifiers. */
+    if (was_e0) {
+        /* Extended modifier set. */
+        if (sc == 0x38) { mods |=  KBD_MOD_RALT;  return; }
+        if (sc == 0xB8) { mods &= ~KBD_MOD_RALT;  return; }
+        if (sc == 0x1D) { mods |=  KBD_MOD_RCTRL; return; }
+        if (sc == 0x9D) { mods &= ~KBD_MOD_RCTRL; return; }
+        /* All other extended keys: drop for M16 (cursor keys, etc). */
+        return;
+    }
+    if (sc == 0x2A) { mods |=  KBD_MOD_LSHIFT; return; }
+    if (sc == 0xAA) { mods &= ~KBD_MOD_LSHIFT; return; }
+    if (sc == 0x36) { mods |=  KBD_MOD_RSHIFT; return; }
+    if (sc == 0xB6) { mods &= ~KBD_MOD_RSHIFT; return; }
+    if (sc == 0x1D) { mods |=  KBD_MOD_LCTRL;  return; }
+    if (sc == 0x9D) { mods &= ~KBD_MOD_LCTRL;  return; }
+    if (sc == 0x38) { mods |=  KBD_MOD_LALT;   return; }
+    if (sc == 0xB8) { mods &= ~KBD_MOD_LALT;   return; }
+
+    if (sc & 0x80) return;                                      /* other break */
+
+    /* M14: LAlt+1..9 switches focus to the Nth VC.  Scancodes (set 1)
+     * for the digit row: '1' = 0x02 .. '9' = 0x0A.  Intercept BEFORE
+     * keymap_translate so they never reach the shell as literal digits.
+     * Use LAlt specifically — RAlt is AltGr and should produce layout
+     * symbols, not pane-switch. */
+    if ((mods & KBD_MOD_LALT) && sc >= 0x02 && sc <= 0x0A) {
         int n = (int)sc - 0x02 + 1;
         vc_focus_by_id(n);
         return;
     }
 
-    char c = shift_down ? sc_upper[sc] : sc_lower[sc];
+    /* Hardware → universal keycode → ASCII via the active layout. */
+    uint8_t keycode = sc1_to_hid[sc & 0x7F];
+    if (!keycode) return;
+    char c = keymap_translate(keycode, mods);
     if (!c) return;
 
     /* M14 routing: prefer the focused VC's ring; fall back to the

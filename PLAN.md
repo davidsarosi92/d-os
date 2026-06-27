@@ -145,7 +145,7 @@ what); a session can pick a theme and push on it.
 | M13 | Preemptive scheduling (timer IRQ → schedule)    | Concurrency      | ✅ DOCS §4.X |
 | M14 | Multi-session shell with FB pane splitting      | UX               | ✅ DOCS §4.X |
 | M15 | USB host stack + USB HID keyboard              | Input            | ✅ DOCS §4.X |
-| M16 | Keyboard layout abstraction (US, HU, DE, …)     | Input            | §M16    |
+| M16 | Keyboard layout abstraction (US, HU, DE, …)     | Input            | ✅ DOCS §4.X |
 | M17 | Portability cut — extract `hal_api.h`           | Architecture     | §M17    |
 | M18 | SMP support — APIC, AP boot, per-CPU, locking   | Concurrency      | §M18    |
 | M19 | Memory at scale — slab, huge pages, near-NUMA   | Memory           | §M19    |
@@ -766,42 +766,46 @@ Verified with `-device qemu-xhci -device usb-kbd` in QEMU.
 
 ---
 
-## §M16 — Keyboard layout abstraction
+## §M16 — Keyboard layout abstraction — **shipped**
 
-**Why now:** today the PS/2 driver hardcodes US QWERTY in two static
-tables.  As soon as USB and other physical keyboards land, we need
-a clean way to swap layouts without re-touching driver code.
+Shipped 2026-06-27.  See DOCS.md §4.X (Keyboard layouts) and the
+2026-06-27 change-log entry.  One-line summary: input drivers emit
+(universal keycode = USB HID Usage, modifier-mask = HID layout);
+`keymap_translate` resolves it via the active `struct kbd_layout`
+which is selected by `keyboard.layout` (config default) or
+`setlayout <name>` at runtime.  Layouts: `us` (single source of
+truth, replaces old hardcoded tables in ps2/usb drivers) and `hu`
+(Magyar QWERTZ).  Verified end-to-end: `setlayout hu` + `echo yz`
+→ `zy`.
 
-**Design.**
+**Lessons learned:**
 
-Layered translation:
-1. Hardware → universal keycode (similar to Linux's `KEY_*` codes).
-   Each input driver does its scancode → keycode map locally.
-2. Universal keycode + modifier state → character / action via the
-   active layout.
+- *Pick the universal keycode well.*  Using USB HID Usage IDs as the
+  canonical form means the USB driver does no translation at all,
+  and the PS/2 driver only carries one small sc1 → HID table.  The
+  alternative (a custom KEY_* enum) would have doubled the table
+  count for zero benefit.
+- *PS/2 modifier tracking needs the 0xE0 state machine.*  RAlt
+  (= AltGr) arrives as the 2-byte 0xE0 0x38 sequence.  Without a
+  one-shot `e0_pending` flag, the second byte gets misinterpreted as
+  a regular scancode (LAlt's 0x38) and the AltGr column never
+  activates.
+- *LAlt vs RAlt MATTERS.*  LAlt is the policy modifier (intercepted
+  for VC pane-switch in the input driver, before keymap_translate).
+  RAlt is the layout modifier (feeds the AltGr column).  Both
+  drivers must distinguish them.
 
-```c
-struct kbd_layout {
-    const char* name;               /* "us", "hu", "de", ... */
-    /* 256 keycodes × 4 modifier combos (none, shift, altgr, shift+altgr) */
-    const char* maps[4];
-};
+**Deferred follow-ups (not blockers for M17):**
 
-void kbd_layout_register(const struct kbd_layout*);
-int  kbd_layout_select(const char* name);
-```
-
-- Built-in layouts: at minimum `us` and `hu`.  Easy to add `de`,
-  `fr`, `uk` etc. as data files.
-- Active layout selectable at runtime: `setconf keyboard.layout hu`
-  (already wired to config from §M5).
-- AltGr / Compose key support on day one — international layouts
-  don't work without it.
-
-**Definition of done:**
-- `setconf keyboard.layout hu && save` produces Hungarian characters
-  on the next boot.
-- DOCS.md §4.x (input) updated.
+- Extended font (CP437 magyar / ISO-8859-2 / UTF-8) so the magyar
+  accented vowels (á, é, í, ó, ú, ö, ő, ü, ű) can actually render.
+  Their slots in `hu_base[]` / `hu_shift[]` are 0 today.
+- More layouts: DE, FR, UK, DVORAK.  Once the font's there, these
+  are pure data adds.
+- Compose / dead-key sequences (`´` + `e` → `é`).  Needs a per-VC
+  modal state in the keymap layer.
+- Per-VC layout selection — `keyboard.layout` is global today.
+- Caps Lock toggle (currently ignored; layouts only honor Shift).
 
 ---
 

@@ -65,6 +65,7 @@ static const struct config_default builtin_defaults[] = {
     { "console.bg_color", "0x101828" },
     { "shell.prompt",     "d-os> "   },
     { "shell.motd",       "welcome." },
+    { "keyboard.layout",  "us"       },     /* M16 — consumed by keymap_init */
     { NULL, NULL }
 };
 

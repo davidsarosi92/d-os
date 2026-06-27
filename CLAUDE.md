@@ -18,25 +18,30 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
-✅ **M1 – M15** shipped.  Done so far: kmalloc, driver registry
+✅ **M1 – M16** shipped.  Done so far: kmalloc, driver registry
 (`MODULE()`), PIT 1 kHz tick, VFS + ramfs, config store, ring-3 user
 mode (TSS + iret), cooperative scheduler, richer `DRIVER()` lifecycle,
 devfs, procfs, block layer + virtio-blk, multi-fs-shaped VFS + block
 cache + exFAT (read + write + persistence), preemptive scheduling
 (PIT IRQ → deferred `schedule()` after EOI) + lock primitives,
 virtual consoles + dynamic pane split tree (Alt-N focus, per-task
-kprintf routing, shell as a per-pane task), **xHCI USB host stack +
-HID boot-keyboard class driver (root-port enumeration, Address Device,
-Configure Endpoint, Event Ring polled from PIT IRQ)**.
+kprintf routing, shell as a per-pane task), xHCI USB host stack +
+HID boot-keyboard class driver (root-port enumeration, Address
+Device, Configure Endpoint, Event Ring polled from PIT IRQ),
+**keyboard layout abstraction (PS/2 + USB common keycode pipeline
+= HID Usage IDs; US + HU QWERTZ layouts; `keyboard.layout` config +
+`setlayout` shell command)**.
 
-🔲 **Next: §M16** — keyboard layout abstraction.  Both PS/2 and USB
-HID drivers hardcode US QWERTY tables today; M16 introduces a
-layered keycode → layout mapping so `setconf keyboard.layout hu`
-swaps the layout without touching driver code.
+🔲 **Next: §M17** — portability cut, extract `hal_api.h`.  Today
+arch-independent code (`kernel/core/`, `kernel/mem/`, `kernel/fs/`,
+portable drivers) still includes x86 headers directly in places.
+M17 walls every x86-specific call behind `kernel/includes/hal_api.h`
+so x64 + aarch64 ports become drop-in HAL implementations rather
+than core refactors.
 
-🔲 Remaining: M16 keyboard layouts, M17 portability cut (hal_api.h),
-M18 SMP, M19 memory at scale, M20 x64, M21 aarch64, M22 GUI.  See
-PLAN.md "Active backlog" table for the full grid.
+🔲 Remaining: M17 portability cut (hal_api.h), M18 SMP, M19 memory
+at scale, M20 x64, M21 aarch64, M22 GUI.  See PLAN.md "Active
+backlog" table for the full grid.
 
 ## Hard conventions (do NOT deviate without asking)
 

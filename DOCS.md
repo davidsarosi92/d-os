@@ -31,9 +31,10 @@ when sections are added.)
 | 4.8 | Physical Memory Manager | 364 |
 | 4.9 | Virtual Memory Manager | 395 |
 | 4.X | Tasks + scheduler (M13: preemption) | 422 |
-| 4.X | USB host stack — xHCI + HID (M15) | ~492 |
-| 4.X | Virtual consoles / pane split (M14) | ~580 |
-| 4.X | Ring 3 / user mode | ~665 |
+| 4.X | Keyboard layouts (M16) | ~492 |
+| 4.X | USB host stack — xHCI + HID (M15) | ~575 |
+| 4.X | Virtual consoles / pane split (M14) | ~665 |
+| 4.X | Ring 3 / user mode | ~750 |
 | 4.X | Block layer + virtio-blk (M11) | 490 |
 | 4.X | procfs | 542 |
 | 4.X | devfs | 573 |
@@ -490,6 +491,81 @@ active at a time, FB preferred):
   prompt — the user-facing version of the boot self-test.  With
   cooperative scheduling the shell would lock up; under M13
   preemption the prompt stays responsive.
+
+### 4.X Keyboard layouts (`kernel/core/keymap.c`, `kernel/core/layouts.c`, `kernel/includes/keymap.h`)
+
+M16 introduces a layered translation pipeline shared between every
+input driver:
+
+```
+Hardware ──► [driver]: scancode/usage → universal keycode + modifier
+                                                │
+                                                ▼
+                            keymap_translate(keycode, modifiers)
+                                                │
+                                                ▼
+                                          ASCII char  ──► vc_kbd_push
+```
+
+**Universal keycode = USB HID Usage ID** (HID 1.11 §10, Page 0x07).
+That choice means the USB HID driver does zero scancode translation
+(it passes `report->keys[i]` straight through), and the PS/2 driver
+only has to carry one small "set-1 → HID usage" table.  New input
+classes (serial-console escape sequences, virtual KB over RPC, …)
+just need to produce the same keycode + modifier pair.
+
+**Modifier bitmask** (`KBD_MOD_*`) mirrors the HID boot-report layout
+bit for bit, so the USB driver's `report->modifiers` byte is also
+zero-conversion.  Only `KBD_MOD_SHIFT_MASK` and `KBD_MOD_RALT`
+influence the layout lookup:
+
+- BASE        → `maps[0]`
+- + SHIFT     → `maps[1]`
+- + RAlt      → `maps[2]`  (AltGr column)
+- + both      → `maps[3]`
+
+Ctrl/Alt/GUI are policy-only — the input driver intercepts what it
+wants (e.g. PS/2 grabs `LAlt+digit` for `vc_focus_by_id` BEFORE
+calling keymap_translate) and the rest pass through unchanged.
+
+**Layouts** ship as static tables in `layouts.c`:
+
+| Name | Notes                                                          |
+|------|----------------------------------------------------------------|
+| `us` | The previous hardcoded US table from ps2_keyboard.c / usb_hid.c, now the single source of truth.                                                                |
+| `hu` | Magyar 102-key QWERTZ.  Z ↔ Y swap, magyar shifted number row (`!`, `"`, `+`, etc.), AltGr column with ASCII-only symbols (`\`, `|`, `@`, `[`, `]`, `{`, `}`, etc.).  Accented vowels (á, é, ő, ű, ...) are intentionally left blank — the 8×8 ASCII glyph font can't render them; populate when the font grows. |
+
+**Active-layout selection.**  `keymap_init()` (called from kernel_main
+right after `config_init()`) reads `keyboard.layout` from the config
+(default `"us"`) and activates the matching layout, falling back to
+`"us"` if the name is unknown.
+
+**Runtime switch.**  The active-layout pointer is updated only from a
+shell-task; IRQ handlers read it from `keymap_translate`.  On x86 a
+pointer-sized write is atomic and the rare "switched mid-keystroke"
+race produces one char from the new layout — harmless.
+
+**Shell commands:**
+- `lslayout`              — list registered layouts, mark the active one.
+- `setlayout <name>`      — switch active layout (e.g. `setlayout hu`).
+- `setconf keyboard.layout <name> && saveconf` to make it stick.
+
+**Verified path (M16 boot test):**
+- `keymap: active layout 'us' (2 available)`
+- `echo yz` under `us` → `yz`.
+- `setlayout hu` → `layout: now 'hu'`.
+- `echo yz` under `hu` → `zy` (Z↔Y QWERTZ swap visible end-to-end).
+- The very next attempt to type `lslayout` lands as `lslazout`
+  because the user's 'y' keypress now produces 'z' under the active
+  layout — the cleanest live demo of "this actually does something."
+
+**Out of scope (M16 follow-ups, tracked in PLAN.md §M16):**
+- Extended font (CP437 magyar / ISO-8859-2 / UTF-8) so HU's accented
+  vowels actually render.  Today they're 0 in the layout table.
+- DE, FR, etc. — straightforward additions once the abstraction is in.
+- Compose / dead-key sequences — useful for international layouts that
+  build accented chars from base + accent.
+- Per-VC layout selection — today's `keyboard.layout` is global.
 
 ### 4.X USB host stack — xHCI + HID boot keyboard (`kernel/drivers/usb/`)
 
@@ -1097,6 +1173,32 @@ Linker: `ld -m elf_i386 -T linker.ld -nostdlib`.
 
 ## 8. Change log
 
+- **2026-06-27 — M16: Keyboard layout abstraction.**  Introduced a
+  shared keyboard pipeline (`kernel/core/keymap.c`,
+  `kernel/core/layouts.c`, `kernel/includes/keymap.h`): input drivers
+  produce (universal keycode, modifier-mask), the keymap layer
+  resolves it to ASCII via the active `struct kbd_layout`.  The
+  universal keycode IS the USB HID Usage ID (Page 0x07), so USB HID
+  driver is now a zero-translation pass-through.  PS/2 driver gained
+  a `sc1_to_hid[]` table and per-modifier bit-tracking (LShift,
+  RShift, LCtrl, RCtrl, LAlt, RAlt, plus the 0xE0 extended-byte
+  state machine so RAlt = AltGr is recognized).  Layouts: `us`
+  (formerly hardcoded inside ps2_keyboard.c + usb_hid.c, now the
+  single source of truth) and `hu` (Magyar 102-key QWERTZ — Z↔Y
+  swap, magyar shifted number row, AltGr column with ASCII-only
+  symbols; accented vowels left blank until the font grows).
+  New `keyboard.layout` config default (`"us"`); `keymap_init()`
+  consults it after `config_init` and falls back to `us` on an
+  unknown name.  Shell commands: `lslayout`, `setlayout <name>`.
+  Verified end-to-end in QEMU: under `us`, `echo yz` → `yz`; under
+  `hu`, `echo yz` → `zy`, AND the very next attempted `lslayout`
+  comes through as `lslazout` because the 'y' keypress now produces
+  'z' — live proof the new pipeline is doing the work.  Pitfalls
+  codified: PS/2 modifier tracking must handle both LAlt (intercepted
+  for VC pane-switch) and RAlt (= AltGr, feeds the layout's altgr
+  column); the 0xE0 prefix is a one-shot state flag, not a sticky
+  mode; the active-layout pointer is read from IRQ context so the
+  shell-task is the only writer (pointer-sized atomic on x86).
 - **2026-06-27 — M15: USB host stack (xHCI) + HID boot keyboard.**
   Brought up a full USB pipeline: PCI-discovered xHCI controller with
   DCBAA, Command Ring, Event Ring (1 segment + ERST), root-port

@@ -57,6 +57,7 @@
 #include "timer.h"
 #include "vc.h"
 #include "lock.h"
+#include "keymap.h"
 #include <stdint.h>
 
 #define MULTIBOOT1_BOOTLOADER_MAGIC 0x2BADB002
@@ -122,6 +123,12 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
     /* Configuration store: defaults + overlay from /etc/d-os.conf if
      * present.  Must run after the fs is mounted (module_init_all). */
     config_init();
+
+    /* Keyboard layout (M16) — reads `keyboard.layout` from config and
+     * activates one of the built-in layouts (us, hu).  Must run after
+     * config_init.  PS/2 and USB drivers consult the active layout via
+     * keymap_translate, so no further wiring is needed. */
+    keymap_init();
 
     /* Bring up the task table.  Synthesizes pid 0 = "kernel" from the
      * current execution context so subsequent `task_spawn` calls have

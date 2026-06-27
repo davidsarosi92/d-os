@@ -29,6 +29,8 @@ C_SRCS := \
     kernel/core/block_cache.c \
     kernel/core/lock.c \
     kernel/core/vc.c \
+    kernel/core/keymap.c \
+    kernel/core/layouts.c \
     kernel/drivers/serial/serial.c \
     kernel/drivers/terminal/fb_terminal.c \
     kernel/drivers/terminal/vga_terminal.c \
