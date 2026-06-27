@@ -1,0 +1,64 @@
+# =============================================================================
+# .gitignore — what NOT to track in d-os.
+#
+# Goal: a clean checkout has only sources, build scripts, and docs.  Everything
+# the build / dev workflow generates lives in /build/ and stays out of git.
+#
+# When adding a new ignore: prefer a pattern that's narrow (e.g. only the file
+# extensions actually produced) over a blanket directory ignore that could
+# accidentally hide a real source file.
+# =============================================================================
+
+# --- Build outputs --------------------------------------------------------
+# Everything the Makefile + Docker emit lands here.  Includes kernel.bin,
+# d-os.iso, and the iso/ staging tree.
+/build/
+
+# Object files emitted next to .c sources by the in-tree compile rule.
+# Match anywhere (e.g. kernel/core/foo.o, kernel/hal/x86/io.o).
+*.o
+
+# Final binary / ISO / debug artifacts at any depth — defensive, in case
+# someone drops one outside /build/ during ad-hoc work.
+*.bin
+*.iso
+*.elf
+*.map
+*.lst
+
+# --- Editor / OS noise ----------------------------------------------------
+# macOS Finder metadata, recursive.
+.DS_Store
+**/.DS_Store
+
+# Vim swap files.
+*.sw[ponm]
+*~
+
+# Emacs autosave / backup.
+*#
+.\#*
+
+# JetBrains, VS Code, Sublime, Xcode local config.
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+*.xcodeproj/
+*.xcuserdatad/
+
+# Claude Code local settings (per-machine permission allowlist).
+.claude/
+
+# --- Local debug / test artifacts ----------------------------------------
+# Files our smoke-test scripts and pmemsave tricks dump locally.  They live
+# under /tmp normally but a developer occasionally lands them at the repo
+# root by mistake.
+*.log
+serial.log
+qemu.log
+vga.bin
+fb.bin
+mbi.bin
+test.img
+disk.img
