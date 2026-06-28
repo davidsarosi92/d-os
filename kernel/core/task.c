@@ -144,9 +144,37 @@ static void runqueue_insert_locked(struct task* t) {
     }
 }
 
+/* Append `t` to the ring without touching any `current` pointer.
+ * Used by AP bootstrap (the AP wants its own idle as `current` but
+ * the global ring already exists, so the empty-queue branch above
+ * would be wrong). */
+static void runqueue_append_locked(struct task* t) {
+    if (!head) {
+        /* Same as empty-queue path of insert; shouldn't happen on
+         * AP, but stay safe. */
+        t->next = t;
+        head    = t;
+    } else {
+        t->next    = head->next;
+        head->next = t;
+    }
+}
+
 /* ------------------------------------------------------------------- */
 /* Init.                                                                */
 /* ------------------------------------------------------------------- */
+
+/* Generic per-CPU idle entry — halt forever until preempted away.
+ * Used by the BSP idle thread synthesized at task_init time; APs use
+ * their own ap_main loop body which serves the same role (idle = the
+ * already-running context). */
+static void cpu_idle_entry(void) {
+    for (;;) {
+        hal_intr_enable();
+        hal_cpu_halt();
+        task_yield();
+    }
+}
 
 void task_init(void) {
     /* Synthesize task 0 = the running kernel_main context. */
@@ -165,7 +193,84 @@ void task_init(void) {
     runqueue_insert_locked(t0);
     spin_unlock_irqrestore(&runqueue_lock, fl);
 
+    /* Synthesize BSP idle (M18.5).  Distinct from kernel_main: when
+     * the kernel_main flow eventually task_exit()s, the scheduler
+     * needs a non-DEAD task to fall back to or BSP would halt
+     * forever — and that halts PIT delivery, which freezes time on
+     * every other CPU too.  Spawning idle here makes BSP a proper
+     * scheduler citizen from the start. */
+    void* idle_stack = kmalloc(TASK_KSTACK_SZ);
+    struct task* bsp_idle = (struct task*)kcalloc(1, sizeof(struct task));
+    if (bsp_idle && idle_stack) {
+        str_copy_n(bsp_idle->name, "idle-0", sizeof bsp_idle->name);
+        bsp_idle->pid         = next_pid++;
+        bsp_idle->state       = TASK_RUNNABLE;
+        bsp_idle->esp         = hal_task_init_stack(
+                                    (char*)idle_stack + TASK_KSTACK_SZ,
+                                    cpu_idle_entry);
+        bsp_idle->kstack_base = idle_stack;
+        bsp_idle->is_idle     = 1;
+
+        uint32_t fl2 = spin_lock_irqsave(&runqueue_lock);
+        runqueue_append_locked(bsp_idle);
+        this_cpu()->idle = bsp_idle;
+        spin_unlock_irqrestore(&runqueue_lock, fl2);
+    }
+
     kprintf("task: pid 0 (kernel) installed\n");
+}
+
+/* AP-side idle-task bootstrap (M18.5).  Each AP calls this from its
+ * C entry to (1) synthesize a task struct for its currently-running
+ * context (the ap_main flow), (2) splice that task into the global
+ * ring, and (3) stamp it as this CPU's current+idle pointers.
+ *
+ * Like `task_init`, we don't allocate a stack — the AP is already
+ * running on the per-AP stack `smp_boot_aps` allocated for it.
+ * `esp` is left zero; the first time the scheduler switches AWAY
+ * from this idle task, `context_switch` populates it.
+ *
+ * After this returns, the AP is a full scheduler participant: when
+ * its LAPIC timer fires the schedule_check path picks up any
+ * RUNNABLE non-idle task in the ring. */
+void task_install_ap_idle(void) {
+    struct task* idle = (struct task*)kcalloc(1, sizeof(struct task));
+    if (!idle) {
+        kprintf("task: failed to allocate AP idle\n");
+        return;
+    }
+    /* Name encodes CPU index so `ps` reads sensibly: "idle-N". */
+    char buf[TASK_NAME_MAX + 1] = "idle-";
+    int cpu = this_cpu_id();
+    /* Tiny manual itoa, single digit covers up to CPU 9 — fine for
+     * our ACPI_MAX_CPUS = 32 cap (CPUs 10+ get "idle-1"+digit). */
+    int pos = 5;
+    if (cpu >= 10) { buf[pos++] = '0' + (cpu / 10); cpu %= 10; }
+    buf[pos++] = '0' + cpu;
+    buf[pos]   = 0;
+    str_copy_n(idle->name, buf, sizeof idle->name);
+
+    idle->pid         = next_pid++;
+    idle->state       = TASK_RUNNABLE;
+    idle->esp         = 0;
+    idle->kstack_base = NULL;     /* AP stack owned by smp.c, not us */
+    idle->is_idle     = 1;
+
+    uint32_t fl = spin_lock_irqsave(&runqueue_lock);
+    runqueue_append_locked(idle);
+    this_cpu()->current = idle;
+    this_cpu()->idle    = idle;
+    spin_unlock_irqrestore(&runqueue_lock, fl);
+}
+
+void task_become_idle(void) {
+    uint32_t fl = spin_lock_irqsave(&runqueue_lock);
+    struct task* me = this_cpu()->current;
+    if (me) {
+        me->is_idle = 1;
+        this_cpu()->idle = me;
+    }
+    spin_unlock_irqrestore(&runqueue_lock, fl);
 }
 
 /* ------------------------------------------------------------------- */
@@ -220,20 +325,56 @@ static int task_running_elsewhere(struct task* t) {
     return 0;
 }
 
+/* Find the next runnable non-idle task in the ring (round-robin
+ * starting from prev->next).  Skip:
+ *   - tasks that aren't RUNNABLE,
+ *   - tasks currently `current` on another CPU,
+ *   - idle tasks (those are pure fallbacks).
+ * Returns NULL if no eligible task exists. */
+static struct task* pick_next_locked(struct task* prev) {
+    struct task* t = prev->next;
+    while (t != prev) {
+        if (t->state == TASK_RUNNABLE &&
+            !t->is_idle &&
+            !task_running_elsewhere(t)) {
+            return t;
+        }
+        t = t->next;
+    }
+    /* The walk skipped prev itself.  Treat prev as a candidate too —
+     * if we're already on a non-idle RUNNABLE task and nothing else
+     * is eligible, staying put is the right answer. */
+    return NULL;
+}
+
 static void schedule_locked(void) {
-    struct task* prev = this_cpu()->current;
+    struct percpu* me = this_cpu();
+    struct task* prev = me->current;
     if (!prev) return;
 
-    /* Walk the ring starting at prev->next, picking the first task
-     * that is RUNNABLE and not running on another CPU. */
-    struct task* next = prev->next;
-    while (next != prev) {
-        if (next->state == TASK_RUNNABLE && !task_running_elsewhere(next)) break;
-        next = next->next;
-    }
-    if (next == prev) return;           /* no one else to run */
+    /* First preference: any RUNNABLE non-idle task in the ring. */
+    struct task* next = pick_next_locked(prev);
 
-    this_cpu()->current = next;
+    if (!next) {
+        /* No real work found.  If prev is itself a working task and
+         * still RUNNABLE, stay put — pointless to bounce into idle
+         * and back on the next tick. */
+        if (prev->state == TASK_RUNNABLE && !prev->is_idle) return;
+
+        /* Otherwise fall back to this CPU's idle.  If we don't have
+         * an idle (BSP before task_become_idle, e.g.) and prev is
+         * unusable, there's literally nothing we can do — return
+         * and let the caller (likely IRQ exit) iret back to whatever
+         * was running.  Won't make progress but won't crash. */
+        struct task* idle = me->idle;
+        if (!idle || idle->state != TASK_RUNNABLE) return;
+        if (idle == prev) return;
+        next = idle;
+    }
+
+    if (next == prev) return;
+
+    me->current = next;
     context_switch(&prev->esp, next->esp);
     /* When `prev` is later scheduled back in, control resumes here.
      * IRQs are still off; caller restores IF and releases the lock. */

@@ -23,4 +23,11 @@
  * (NOT counting the BSP). */
 int smp_boot_aps(void);
 
+/* Stash the BSP-calibrated LAPIC timer count.  Every AP reads this
+ * value to program its own LAPIC timer in periodic mode.  Must be
+ * set before smp_boot_aps; passing 0 disables the AP timer (APs
+ * boot online but never preempt-tick). */
+#include <stdint.h>
+void smp_set_lapic_timer_count(uint32_t count);
+
 #endif

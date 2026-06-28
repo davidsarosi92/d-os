@@ -18,27 +18,27 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
-✅ **M1 – M19** shipped.  Highlights so far: VFS + ramfs + exFAT on
-virtio-blk, devfs + procfs, preemptive scheduler with lock-handoff,
-multi-pane shell, xHCI USB + HID, keyboard layouts, HAL cut
-(`hal_api.h`), SMP (APIC + IOAPIC + INIT/SIPI APs + per-CPU current
-+ real cmpxchg spinlocks), **memory at scale — per-zone binary
-buddy PMM (`page_alloc(order, zone)`), slab allocator with per-CPU
-magazines (8 caches 16..2048), legacy `pmm_alloc_*` + `kmalloc` API
-unchanged; new `slabinfo` / `buddyinfo` shell commands**.
+✅ **M1 – M19 + M18.5** shipped.  Highlights so far: VFS + ramfs +
+exFAT on virtio-blk, devfs + procfs, preemptive scheduler with
+lock-handoff, multi-pane shell, xHCI USB + HID, keyboard layouts,
+HAL cut (`hal_api.h`), SMP (APIC + IOAPIC + INIT/SIPI APs + per-CPU
+current + real cmpxchg spinlocks), memory at scale (per-zone buddy
+PMM + slab + per-CPU magazines), **APs scheduling — LAPIC timer
+per-CPU (100 Hz, calibrated against PIT), per-CPU idle tasks,
+scheduler idle-fallback policy; verified on `-smp 4`: two CPU-bound
+hogs run concurrently (PASS)**.
 
-🔲 **Next options** (pick one; M18.5 is the bounded SMP follow-up,
-the rest are independent):
+🔲 **Next options** (pick one):
 
-- **M18.5** — close the SMP "two CPU-bound tasks parallel" DOD:
-  LAPIC timer per-CPU + cross-CPU preempt IPI + per-CPU runqueue +
-  load balancer + taskset/affinity.  APs currently idle.
 - **M20** — x64 (long mode) port.  Tests the HAL boundary (M17).
 - **M21** — aarch64 port.
 - **M22** — GUI infrastructure (compositor + windows; Wayland-reuse
   evaluation phase per §M22).
 - **M23** — Audio (AC97 → HDA → I2S).
 - **M24** — Network (NIC → IP/UDP/TCP → sockets).
+- **Polish backlog** (smaller, can interleave): per-CPU runqueue +
+  load balancer, per-CPU `preempt_count`, task affinity / taskset,
+  cross-CPU preempt IPI (vector 0x41 reserved), MSI/MSI-X.
 
 🔲 **PLAN extensions (placeholders, design only):**
 - §M22 — GUI includes a Wayland-reuse evaluation phase

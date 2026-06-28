@@ -29,6 +29,7 @@
 #include "vmm.h"
 #include "hal.h"
 #include "printf.h"
+#include "timer.h"
 #include <stdint.h>
 
 /* LAPIC MMIO register offsets. */
@@ -45,6 +46,27 @@
 #define LAPIC_REG_LVT_LINT0 0x350
 #define LAPIC_REG_LVT_LINT1 0x360
 #define LAPIC_REG_LVT_ERROR 0x370
+#define LAPIC_REG_INITCNT   0x380
+#define LAPIC_REG_CURRCNT   0x390
+#define LAPIC_REG_DIVCONF   0x3E0
+
+/* LVT timer mode bits (bits 17..18 of LVT_TIMER):
+ *   00 = one-shot, 01 = periodic, 10 = TSC-deadline. */
+#define LAPIC_LVT_PERIODIC  (1u << 17)
+
+/* DIVIDE_CONFIG encoding (Intel SDM Vol 3 §10.5.4 Table 10-1):
+ *   value  divisor
+ *   0xB    1
+ *   0x0    2
+ *   0x1    4
+ *   0x2    8
+ *   0x3    16
+ *   0x8    32
+ *   0x9    64
+ *   0xA    128
+ * We pick /16 — enough resolution at GHz-class bus clocks, fits in
+ * 32-bit count for milliseconds at QEMU's ~250 MHz APIC. */
+#define LAPIC_DIVIDE_16     0x3u
 
 /* SIVR bits. */
 #define LAPIC_SIVR_ENABLE   (1u << 8)
@@ -177,4 +199,68 @@ void lapic_send_sipi(uint8_t target_apic_id, uint8_t vector) {
     lapic_w(LAPIC_REG_ICR_HI, ((uint32_t)target_apic_id) << 24);
     lapic_w(LAPIC_REG_ICR_LO, LAPIC_DM_STARTUP | LAPIC_ICR_ASSERT | vector);
     ipi_wait_idle();
+}
+
+/* ---------------------------------------------------------------------------
+ * LAPIC timer — per-CPU preempt source (M18.5).
+ *
+ * Calibration: program one-shot mode with the maximum count, sleep
+ * N PIT-ms, sample the elapsed count, scale to the target frequency.
+ * All LAPICs in a CPU package share the same bus clock so the
+ * calibrated value is reusable across CPUs.
+ * --------------------------------------------------------------------------- */
+
+uint32_t lapic_timer_calibrate(uint32_t target_hz) {
+    if (target_hz == 0) target_hz = 100;
+
+    /* Configure divider first — Intel says divide config must be
+     * stable before LVT timer programming. */
+    lapic_w(LAPIC_REG_DIVCONF, LAPIC_DIVIDE_16);
+
+    /* Mask the timer so the one-shot countdown doesn't fire an IRQ. */
+    lapic_w(LAPIC_REG_LVT_TIMER, LAPIC_LVT_MASKED);
+
+    /* Start one-shot countdown from the max 32-bit value. */
+    lapic_w(LAPIC_REG_INITCNT, 0xFFFFFFFFu);
+
+    /* Calibration window — 50 PIT-ms.  Short enough to keep boot
+     * snappy, long enough to wash out single-tick jitter. */
+    const uint32_t window_ms = 50;
+    uint64_t start = timer_ticks_ms();
+    while (timer_ticks_ms() - start < window_ms) {
+        __asm__ volatile ("pause");
+    }
+
+    /* Sample remaining count + freeze further countdown. */
+    uint32_t remaining = lapic_r(LAPIC_REG_CURRCNT);
+    lapic_w(LAPIC_REG_INITCNT, 0);
+
+    uint32_t elapsed = 0xFFFFFFFFu - remaining;
+    uint32_t ticks_per_ms = elapsed / window_ms;
+    if (ticks_per_ms == 0) ticks_per_ms = 1;
+
+    /* Count for one period of `target_hz`: ticks per (1000/target_hz) ms. */
+    uint32_t count = ticks_per_ms * (1000u / target_hz);
+    if (count == 0) count = 1;
+
+    kprintf("lapic: timer calibrated — %u ticks/ms, count=%u for %u Hz\n",
+            ticks_per_ms, count, target_hz);
+    return count;
+}
+
+void lapic_timer_start_periodic(uint32_t count, uint8_t vector) {
+    /* Divider must be set on every CPU that runs the timer — it's
+     * a per-LAPIC register. */
+    lapic_w(LAPIC_REG_DIVCONF, LAPIC_DIVIDE_16);
+
+    /* LVT_TIMER: periodic mode + vector.  No mask. */
+    lapic_w(LAPIC_REG_LVT_TIMER, LAPIC_LVT_PERIODIC | (uint32_t)vector);
+
+    /* Writing INITCNT (re)arms the timer. */
+    lapic_w(LAPIC_REG_INITCNT, count);
+}
+
+void lapic_timer_stop(void) {
+    lapic_w(LAPIC_REG_LVT_TIMER, LAPIC_LVT_MASKED);
+    lapic_w(LAPIC_REG_INITCNT, 0);
 }

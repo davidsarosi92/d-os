@@ -871,7 +871,7 @@ arch-independent interface) and the 2026-06-27 change-log entry.
 
 ---
 
-## §M18 — SMP support — **shipped (BSP+APs online, full parallel exec deferred)**
+## §M18 — SMP support — ✅ shipped
 
 Shipped 2026-06-28.  See DOCS.md §4.X (SMP) and the 2026-06-28
 change-log entry.  Single-CPU UP became a multiprocessor: ACPI MADT
@@ -897,32 +897,59 @@ all 4 cores online on `-smp 4`.  `lscpu` lists them.
   on the way out).  Solution: the arch trampoline calls
   `task_finish_first_switch` (which drops the lock) before sti'ing.
 
-**Definition of done (status):**
-- ✅ ACPI MADT parsed, `lscpu` lists every present core with online state.
-- ✅ All ACPI-listed APs reach online state on `-smp N`.
-- ⚠ "Two CPU-bound tasks pinned to different cores actually run in
-   parallel" — APs DO boot and idle, but per-CPU scheduler hooks for
-   cross-CPU preemption + task pinning are M18.5 work (see follow-ups).
+## §M18.5 — APs scheduling — ✅ shipped
 
-**Deferred follow-ups (M18.5):**
+Shipped 2026-06-28.  See DOCS.md §4.X (SMP) and the M18.5 change-log
+entry.  APs went from "online but idle" to "running RUNNABLE tasks
+in parallel with BSP."
 
-- *Cross-CPU preemption IRQ source.*  APs currently have no
-  scheduler IRQ (PIT delivers only to BSP via the IOAPIC).  Two
-  paths: (a) LAPIC timer per-CPU (most scalable; one-shot or
-  periodic mode), (b) BSP-driven IPI broadcast every quantum.  (a)
-  is the long-term answer; (b) ships in one afternoon.
-- *Per-CPU runqueue + load balancer.*  Today's global runqueue +
-  `task_running_elsewhere` walk is O(ncpus) per pick; per-CPU rqs
-  + a periodic balancer eliminate cross-CPU lock pressure.  Land
-  with §M19 (slab allocator) since both benefit from the same
-  per-CPU machinery.
-- *Per-CPU `preempt_count`.*  Today's plain global is wrong on SMP
-  the moment more than one CPU wants to ban preemption locally.
-- *Task affinity / `taskset`.*  Needed for the canonical "pin two
-  CPU-bound tasks, observe parallel speedup" demo.
-- *MSI/MSI-X.*  IOAPIC routing is enough for legacy IRQs; modern
-  PCIe devices want MSI / MSI-X to deliver directly to a chosen
-  CPU's LAPIC vector.  Needed for high-bandwidth I/O.
+**What landed:**
+
+- LAPIC timer driver (calibrate / start_periodic / stop) — calibrated
+  once on BSP against PIT, count reused on every AP for 100 Hz.
+- IDT vector 0x40 for LAPIC timer; 0x41 reserved for cross-CPU
+  preempt IPI (placeholder).
+- `idt_load()` for per-CPU `lidt` on APs (IDT data shared, IDTR
+  per-CPU).
+- `task_install_ap_idle()` — each AP joins the runqueue as its own
+  idle task in `ap_main`.
+- BSP idle task synthesized separately at `task_init` time so
+  kernel_main can `task_exit` cleanly after boot.
+- Scheduler policy refactor: round-robin among RUNNABLE non-idle
+  tasks; idle is a fallback only.
+- Boot self-test: two CPU-bound hogs run concurrently; PASS on
+  `-smp 2` and `-smp 4`.
+
+**Lessons learned:**
+
+- *IDTR is per-CPU.*  The IDT data structure is shared in memory,
+  but each CPU's `lidt` programs its own per-core IDTR register.
+  Without per-AP `idt_load`, IRQs land in la-la-land and the AP
+  silently triple-faults.
+- *BSP MUST have an explicit idle from boot.*  If kernel_main is
+  the only thing in the ring and the last non-idle worker on BSP
+  dies, BSP halts forever via `task_exit`'s halt loop.  That halts
+  PIT IRQ delivery, which freezes `timer_ticks_ms` on every other
+  CPU and the whole system deadlocks waiting on the timer.
+  Fix: spawn `idle-0` in `task_init` as a separate kernel task
+  with `is_idle = 1`, distinct from pid 0.
+- *Scheduler must NOT round-robin into idle when a worker is
+  RUNNABLE on this CPU.*  Without an explicit "skip idle in normal
+  walk + fallback only" policy, the scheduler bounces between a
+  hog and idle every quantum, killing throughput.  Fix:
+  `pick_next_locked` skips `is_idle` tasks; only the no-work
+  fallback path picks idle.
+
+**Still deferred (genuine M19/later work):**
+
+- Per-CPU runqueue + load balancer.  Today's global queue +
+  `task_running_elsewhere` walk is O(ncpus) per pick — fine for
+  ncpus≤8 but not the long-term shape.
+- Per-CPU `preempt_count`.
+- Task affinity / `taskset`-style pinning.
+- Cross-CPU preempt IPI (vector 0x41 reserved; sender not built).
+- MSI/MSI-X (IOAPIC suffices for legacy IRQs; modern PCIe wants
+  MSI for direct-to-CPU delivery).
 
 ---
 

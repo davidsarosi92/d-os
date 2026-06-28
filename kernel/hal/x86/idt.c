@@ -87,6 +87,8 @@ extern void isr32(void); extern void isr33(void); extern void isr34(void); exter
 extern void isr36(void); extern void isr37(void); extern void isr38(void); extern void isr39(void);
 extern void isr40(void); extern void isr41(void); extern void isr42(void); extern void isr43(void);
 extern void isr44(void); extern void isr45(void); extern void isr46(void); extern void isr47(void);
+extern void isr64(void);                           /* LAPIC timer (M18.5) */
+extern void isr65(void);                           /* reserved: cross-CPU preempt IPI */
 extern void isr128(void);                          /* int 0x80 — syscall */
 
 static void (*const isr_table[48])(void) = {
@@ -195,6 +197,12 @@ void idt_init(void) {
      * ring 0, 32-bit interrupt gate. */
     for (int i = 0; i < 48; i++) set_gate(i, isr_table[i], 0x8E);
 
+    /* APIC vectors (M18.5).  0x40 is the per-CPU LAPIC timer tick;
+     * 0x41 is reserved for a future cross-CPU preempt IPI.  DPL=0
+     * (kernel-only). */
+    set_gate(0x40, isr64, 0x8E);
+    set_gate(0x41, isr65, 0x8E);
+
     /* Vector 0x80 (syscall): installed with DPL=3 so ring 3 can `int 0x80`
      * without the CPU raising #GP.  0xEE = P=1, DPL=3, 32-bit interrupt
      * gate. */
@@ -208,6 +216,13 @@ void idt_init(void) {
 
     kprintf("IDT: %d entries @ %p, PIC remapped to 0x20..0x2F\n",
             IDT_ENTRIES, (void*)idtr.base);
+}
+
+/* APs call this to load the shared IDT on their own CPU.  IDTR is a
+ * per-CPU register even though the table itself is one in memory —
+ * each core needs its own lidt to start delivering interrupts. */
+void idt_load(void) {
+    __asm__ volatile ("lidt %0" : : "m"(idtr));
 }
 
 void irq_install(int irq, irq_handler_t handler) {
@@ -279,6 +294,18 @@ void isr_handler(struct int_frame* f) {
          * the deferred-reschedule flag, honor it now — AFTER the EOI so
          * the interrupt controller will keep delivering ticks to
          * whichever task we pivot to. */
+        schedule_check();
+        return;
+    }
+
+    /* LAPIC vectors (M18.5).  0x40 is the per-CPU preempt tick: each
+     * CPU's LAPIC timer fires this independently of the PIT (which
+     * only delivers to BSP).  We post a deferred reschedule the same
+     * way pit_irq does so the standard schedule_check() at IRQ exit
+     * honors it on the right core. */
+    if (f->int_no == 0x40 || f->int_no == 0x41) {
+        if (f->int_no == 0x40) schedule_request();
+        lapic_eoi();
         schedule_check();
         return;
     }

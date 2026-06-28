@@ -600,20 +600,54 @@ CPU  APIC_ID  STATE
 3    3        online
 ```
 
-**Out of scope (M18 follow-ups, see PLAN.md):**
+**M18.5 — APs actually scheduling (closed):**
 
-- Cross-CPU IRQ delivery for preemption — APs currently have no
-  scheduler IRQ source (PIT is BSP-only via IOAPIC default routing).
-  Need either LAPIC timer per-CPU or BSP-driven IPI broadcast every
-  quantum so APs actually run RUNNABLE tasks instead of just idling.
-- Per-CPU runqueues + load balancer — the single global runqueue
-  with `task_running_elsewhere` is O(1) for ncpus≤8 but doesn't
-  scale; per-CPU rq + a periodic balancer is the long-term shape.
-- `preempt_count` is still a plain global — needs to be per-CPU
-  before more than one CPU touches it.
-- Task affinity / pinning (`taskset`-style) — needed for the
-  "two CPU-bound tasks pinned to different cores" canonical SMP
-  demo to work.
+- **LAPIC timer per-CPU** (`lapic_timer_calibrate / _start_periodic
+  / _stop` in `kernel/hal/x86/lapic.c`).  BSP calibrates against PIT
+  once during init (typical QEMU result: ~78000 ticks/ms, count ~780k
+  for 100 Hz with divide-by-16).  Every CPU programs its own LAPIC
+  with the calibrated count — they all run at the same rate without
+  re-calibrating per core.
+- **IDT vector 0x40** added (`isr64` stub + `set_gate` in `idt.c`)
+  for the LAPIC timer.  `isr_handler` dispatches it: `schedule_request`
+  (sets the M13 deferred-reschedule flag), `lapic_eoi`, `schedule_check`
+  (consumes the flag and may context-switch).  Vector 0x41 reserved
+  for a future cross-CPU preempt IPI (stub only today).
+- **`idt_load`** exposed so every AP can `lidt` the shared IDT data
+  structure on its own CPU (IDTR is per-CPU even though the table is
+  one in memory).
+- **AP-side idle task** (`task_install_ap_idle` in `task.c`).  Each
+  AP synthesizes a `struct task` for its current ap_main context,
+  splices it into the global ring with `is_idle = 1`, and stamps
+  this CPU's `current` + `idle` pointers.  Reuses the existing
+  `kstack_base = NULL` trick from BSP pid 0.
+- **BSP idle task** synthesized at `task_init` time (separate from
+  kernel_main pid 0).  Without this, if kernel_main eventually
+  `task_exit`s, BSP would have no fallback and halt forever — and
+  that halts PIT delivery, which freezes `timer_ticks_ms` on every
+  other CPU too.  See lesson-learned in PLAN §M18.5.
+- **Scheduler policy** (`pick_next_locked` in `task.c`) — round-robin
+  among RUNNABLE non-idle tasks not running elsewhere; idle is a
+  fallback only when no real work is available.  Keeps cores from
+  pointlessly bouncing into idle and back when they have work to do.
+- **`ap_main`** wired end-to-end: `lapic_init_ap` → `percpu_init_ap`
+  → `idt_load` → kprintf → `task_install_ap_idle` →
+  `lapic_timer_start_periodic` → idle loop (sti + halt + yield).
+  Once IRQs are on the LAPIC timer fires every 10 ms and the
+  scheduler picks up any RUNNABLE task in the ring.
+- **Parallel self-test** at boot — spawn two CPU-bound hogs, busy-
+  wait 500 ms, check both counters > 0.  Verified on `-smp 2` and
+  `-smp 4` that both hogs make progress concurrently.
+
+**Still deferred (genuine M19/later work):**
+
+- Per-CPU runqueues + load balancer — global queue + spinlock holds
+  up fine to ncpus≤8 under our scheduling rate; per-CPU rq is the
+  long-term shape.
+- `preempt_count` is still a plain global — needs to move per-CPU
+  before more than one CPU exercises preempt_disable bracketing.
+- Task affinity / pinning (`taskset`-style).
+- Cross-CPU preempt IPI (vector 0x41 is reserved; sender not built).
 - `vmm.c` CR0/CR3/CR4 pokes remain x86-only; M17 deferred their
   HAL wrap-up to be done with the x64 port.
 
@@ -1394,6 +1428,34 @@ Linker: `ld -m elf_i386 -T linker.ld -nostdlib`.
 ---
 
 ## 8. Change log
+
+- **2026-06-28 — M18.5: APs scheduling (LAPIC timer per-CPU +
+  per-CPU idle + scheduler idle-fallback policy).**  Closed the M18
+  follow-up that left APs idling.  Added LAPIC timer driver
+  (`lapic_timer_calibrate / _start_periodic / _stop`) — calibrated
+  once on BSP against PIT, same count reused on every AP for a
+  per-CPU 100 Hz preempt tick.  New IDT vector 0x40 (`isr64` stub),
+  dispatched in `isr_handler` as the standard
+  schedule_request + lapic_eoi + schedule_check sequence; 0x41
+  reserved for a future cross-CPU preempt IPI.  Each AP now joins
+  the scheduler in `ap_main`: `idt_load` (per-CPU lidt), then
+  `task_install_ap_idle` to synthesize an idle task for the running
+  context and splice into the global ring with `is_idle = 1`.
+  Scheduler policy (`pick_next_locked` in task.c) is round-robin
+  over RUNNABLE non-idle tasks, idle is a fallback only when no
+  real work exists for this CPU.  BSP idle task is now synthesized
+  separately at `task_init` time so kernel_main can `task_exit`
+  cleanly after boot — without this, BSP would halt forever when
+  the last non-idle task on it died, which also halts PIT delivery
+  and freezes `timer_ticks_ms` on every other CPU.  New parallel
+  self-test at boot: two CPU-bound hogs run concurrently for
+  500 ms; verified PASS on `-smp 2` and `-smp 4` (both hogs make
+  progress).  Pitfalls codified: (1) IDTR is a per-CPU register —
+  each AP must `lidt` even though the IDT data is shared; (2) BSP
+  needs its own idle from boot or task_exit becomes terminal for
+  the whole system via PIT-starvation; (3) the schedule policy
+  must NOT round-robin into idle when a worker is RUNNABLE on this
+  CPU, otherwise CPUs constantly bounce between hog and idle.
 
 - **2026-06-28 — M19: Memory at scale (buddy PMM + slab + per-CPU
   magazines).**  PMM rewritten as a per-zone binary buddy allocator;

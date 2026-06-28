@@ -26,9 +26,11 @@
 #include "acpi.h"
 #include "lapic.h"
 #include "gdt.h"
+#include "idt.h"
 #include "vmm.h"
 #include "hal_api.h"
 #include "percpu.h"
+#include "task.h"
 #include "timer.h"
 #include "kmalloc.h"
 #include "printf.h"
@@ -79,26 +81,54 @@ static void copy_trampoline(void) {
                _binary_kernel_hal_x86_ap_trampoline_bin_start, len);
 }
 
+/* Calibrated count for the LAPIC timer at LAPIC_TIMER_HZ.  The BSP
+ * fills this in once (via lapic_timer_calibrate) and every AP reads
+ * the same value — LAPICs in one package share the bus clock. */
+static uint32_t g_lapic_timer_count = 0;
+#define LAPIC_TIMER_VECTOR 0x40
+
+void smp_set_lapic_timer_count(uint32_t count) {
+    g_lapic_timer_count = count;
+}
+
 /* ---------------------------------------------------------------------------
  * AP entry — first C function any AP runs.  Stack is already set up
  * (by the trampoline) and paging is on with the BSP's page directory.
+ *
+ * M18.5 bring-up sequence:
+ *   1. Enable LAPIC + register self in percpu table.
+ *   2. Load the shared IDT (IDTR is per-CPU; trampoline didn't lidt).
+ *   3. Synthesize an idle task for the current context and join the
+ *      global runqueue (`task_install_ap_idle`).
+ *   4. Start LAPIC timer in periodic mode at the BSP-calibrated count.
+ *   5. Enable interrupts and enter the idle loop.  On every LAPIC
+ *      timer tick `schedule_check` runs and picks any non-idle
+ *      runnable task off the global ring.
  * --------------------------------------------------------------------------- */
 static void ap_main(void) {
     lapic_init_ap();
     percpu_init_ap();
+    idt_load();
 
     /* Announce ourselves on serial — once per boot per AP. */
     kprintf("ap: cpu %d (apic_id=%u) online\n",
             this_cpu_id(), lapic_id());
 
-    /* No per-AP scheduler hooks today (no LAPIC timer wiring, no
-     * cross-CPU IPI for preemption, no per-CPU runqueue).  Just
-     * halt forever — the AP is observable via `lscpu` but won't
-     * actually pick up RUNNABLE tasks until M18.5 lands those
-     * pieces.  See PLAN.md §M18 follow-ups. */
+    /* Become a real scheduler participant: synthesize an idle task
+     * for the running context and start receiving LAPIC timer
+     * preempt ticks. */
+    task_install_ap_idle();
+    if (g_lapic_timer_count) {
+        lapic_timer_start_periodic(g_lapic_timer_count, LAPIC_TIMER_VECTOR);
+    }
+
+    /* Idle loop: enable IRQs, halt until the next one (LAPIC timer
+     * tick or otherwise), then yield in case the scheduler wants
+     * to hand us actual work.  Same shape as the BSP's pid-0 loop. */
     for (;;) {
         hal_intr_enable();
         hal_cpu_halt();
+        task_yield();
     }
 }
 

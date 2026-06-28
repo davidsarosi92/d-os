@@ -58,12 +58,30 @@ struct task {
      * (or in addition to) the global sinks.  Opaque `void*` so task.h
      * does not need to know about `struct vc`. */
     void*    out_console;
+    /* M18.5: idle-task marker.  Idle tasks are skipped during normal
+     * scheduling and only picked as a fallback when no other task is
+     * runnable on this CPU.  Set via task_become_idle() (current task)
+     * or by task_install_ap_idle() (AP bootstrap). */
+    int      is_idle;
 };
 
 /* Set up the scheduler and convert the current `kernel_main` context
  * into pid 0 (named "kernel").  Must be called once, after kmalloc is
  * up, before any `task_spawn`. */
 void task_init(void);
+
+/* AP-side bootstrap (M18.5).  Each AP calls this from its C entry to
+ * synthesize an idle task for its current execution context, splice
+ * it into the global ring, and stamp it as this CPU's current + idle.
+ * After this returns, the AP is a full scheduler participant — its
+ * LAPIC timer can drive normal preemption. */
+void task_install_ap_idle(void);
+
+/* Mark the currently-running task as this CPU's idle task (M18.5).
+ * Called by kernel_main on the BSP right before it enters its
+ * halt+yield loop, so the scheduler treats pid 0 as the BSP's
+ * fallback rather than a competitor for the runqueue. */
+void task_become_idle(void);
 
 /* Create a new kernel-mode task.  `entry` runs on its own stack.  Args
  * are not passed (the entry function may consult globals / config).

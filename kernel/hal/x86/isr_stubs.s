@@ -109,6 +109,17 @@ ISR_NOERR 46
 ISR_NOERR 47
 
 ; -----------------------------------------------------------------------------
+; LAPIC vectors (M18.5).  These ride on top of the standard isr_common
+; dispatch — `isr_handler` recognizes them by vector number and EOIs
+; via the LAPIC instead of the legacy IRQ path.
+;
+;   0x40 (64) — LAPIC timer (per-CPU preempt tick)
+;   0x41 (65) — reserved for cross-CPU preempt IPI (placeholder)
+; -----------------------------------------------------------------------------
+ISR_NOERR 64
+ISR_NOERR 65
+
+; -----------------------------------------------------------------------------
 ; Syscall vector — int 0x80.  Ring-3 callable; the IDT entry for this
 ; vector is installed with DPL=3 so user mode is allowed to invoke it.
 ; The label is literally `isr128` (NASM expands %1 verbatim into the name)

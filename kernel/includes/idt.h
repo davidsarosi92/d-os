@@ -51,6 +51,11 @@ typedef void (*irq_handler_t)(struct int_frame* f);
  * `lidt`.  Does NOT enable interrupts (callers do `sti` when ready). */
 void idt_init(void);
 
+/* Per-CPU `lidt` (M18.5).  IDTR is a per-CPU register even though the
+ * IDT data itself is shared.  APs call this from their C entry to
+ * start accepting interrupts on their own LAPIC. */
+void idt_load(void);
+
 /* Register a handler for IRQ line `irq` (0..15).  Passing NULL removes a
  * previously registered handler.  Multiple registrations on the same IRQ
  * overwrite each other — there is no chaining today. */

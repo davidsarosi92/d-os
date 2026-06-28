@@ -155,13 +155,27 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
         kprintf("apic: not available, staying on 8259\n");
     }
 
+    /* IRQs on.  PIT is already firing through IOAPIC at this point
+     * (idt_use_apic re-routed it).  We need IRQs for both the LAPIC
+     * timer calibration (uses PIT-based timer_msleep) and the AP
+     * bring-up SIPI sequence below. */
+    hal_intr_enable();
+
+    /* LAPIC timer (M18.5) — per-CPU preempt source.  Calibrate once
+     * on the BSP and stash the count so every AP can program its own
+     * timer with the same value (LAPICs in one package share the bus
+     * clock).  100 Hz target tick = 10 ms quantum upper bound. */
+    if (acpi_lapic_phys()) {
+        uint32_t lapic_count = lapic_timer_calibrate(100);
+        smp_set_lapic_timer_count(lapic_count);
+        lapic_timer_start_periodic(lapic_count, 0x40);
+    }
+
     /* SMP application-processor bring-up — INIT + SIPI + SIPI sequence
-     * per Intel SDM Vol 3 §8.4.  No-op on UP (smp_ncpus() == 1).  IRQs
-     * must be enabled for timer_msleep to work (the SIPI sequence
-     * needs ~11 ms of waits), so we enable here and the preempt
-     * self-test below can rely on them already being on. */
+     * per Intel SDM Vol 3 §8.4.  No-op on UP (smp_ncpus() == 1).
+     * Each AP, in ap_main, loads the IDT, joins the runqueue as an
+     * idle task, and arms its own LAPIC timer. */
     if (smp_ncpus() > 1) {
-        hal_intr_enable();
         smp_boot_aps();
     }
 
@@ -286,9 +300,7 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
         preempt_test_counter = 0;
         preempt_test_stop    = 0;
 
-        /* Enable interrupts BEFORE spawning the hog — otherwise the
-         * first PIT tick that would preempt us never arrives. */
-        hal_intr_enable();
+        /* IRQs are already on (enabled above before SMP bring-up). */
 
         struct task* hog = task_spawn("preempt-test", preempt_test_entry);
         if (hog) {
@@ -309,6 +321,54 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
             }
         } else {
             kprintf("preempt self-test: skipped (spawn failed)\n");
+        }
+    }
+
+    /* Parallel-execution self-test (M18.5) — on SMP, two CPU-bound
+     * tasks should run in PARALLEL on two different cores.  With
+     * per-AP LAPIC timer + AP-side scheduling now active, the
+     * scheduler should land hog1 on one CPU and hog2 on another.
+     *
+     * PASS criterion: both counters are non-zero.  Run BEFORE the
+     * shell spawn so kernel_main is the only non-idle RUNNABLE task
+     * besides the hogs themselves — keeps the test cheap to schedule
+     * under TCG even on -smp 4. */
+    if (smp_ncpus() > 1) {
+        extern volatile uint32_t par_test_counter1;
+        extern volatile uint32_t par_test_counter2;
+        extern volatile int      par_test_stop;
+        extern void par_test_entry1(void);
+        extern void par_test_entry2(void);
+
+        par_test_counter1 = 0;
+        par_test_counter2 = 0;
+        par_test_stop     = 0;
+
+        struct task* h1 = task_spawn("par-hog1", par_test_entry1);
+        struct task* h2 = task_spawn("par-hog2", par_test_entry2);
+        if (h1 && h2) {
+            uint64_t deadline = timer_ticks_ms() + 500;
+            while (timer_ticks_ms() < deadline) hal_cpu_halt();
+
+            uint32_t t1 = par_test_counter1;
+            uint32_t t2 = par_test_counter2;
+            par_test_stop = 1;
+            /* Let them observe stop_flag and exit. */
+            uint64_t reap = timer_ticks_ms() + 100;
+            while (timer_ticks_ms() < reap) hal_cpu_halt();
+
+            uint64_t total = (uint64_t)t1 + (uint64_t)t2;
+            int both_progressed = (t1 > 0 && t2 > 0);
+            kprintf("parallel self-test: hog1=%u hog2=%u total=%u\n",
+                    (unsigned)t1, (unsigned)t2, (unsigned)total);
+            if (both_progressed) {
+                kprintf("parallel self-test: PASS — both hogs made progress on %d-CPU system\n",
+                        smp_ncpus());
+            } else {
+                kprintf("parallel self-test: FAIL — one hog starved\n");
+            }
+        } else {
+            kprintf("parallel self-test: skipped (spawn failed)\n");
         }
     }
 
@@ -344,14 +404,10 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
         }
     }
 
-    /* IRQs are already on (sti above for the preempt test).  pid 0
-     * (this thread) is now the idle task: every preemption picks the
-     * shell tasks (or any other spawned worker); we just hlt to save
-     * power until the next interrupt and then yield. */
-    for (;;) {
-        hal_cpu_halt();
-        task_yield();
-    }
+    /* Boot complete.  kernel_main was just a worker thread for the
+     * init sequence and self-tests; the dedicated BSP idle task (set
+     * up in task_init) takes over now via task_exit. */
+    task_exit();
 }
 
 /* Symbol re-export: kernel_main spawns the shell with this entry,
@@ -375,4 +431,21 @@ void preempt_test_entry(void) {
     while (!preempt_test_stop) {
         preempt_test_counter++;
     }
+}
+
+/* M18.5 parallel self-test — two independent hog tasks.  Each
+ * increments its own counter; if APs are scheduling real work
+ * (LAPIC timer + per-CPU current pointer + cross-CPU pick), both
+ * counters should be roughly equal because the scheduler will
+ * keep one hog on each available core via the "task_running_
+ * elsewhere" check. */
+volatile uint32_t par_test_counter1 = 0;
+volatile uint32_t par_test_counter2 = 0;
+volatile int      par_test_stop     = 0;
+
+void par_test_entry1(void) {
+    while (!par_test_stop) par_test_counter1++;
+}
+void par_test_entry2(void) {
+    while (!par_test_stop) par_test_counter2++;
 }
