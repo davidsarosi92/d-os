@@ -1,21 +1,32 @@
 #!/bin/sh
 # Boot the built ISO in QEMU. Prefers a host-installed qemu (faster, gives
 # you a real window); falls back to the Docker image with -nographic.
+#
+# Default arch is i386 (the reference port).  Override with ARCH=x86_64
+# to boot the long-mode build:
+#     ARCH=x86_64 ./scripts/run_qemu.sh
 
 set -eu
 
 cd "$(dirname "$0")/.."
 
-ISO=build/d-os.iso
+ARCH=${ARCH:-i386}
+ISO=build/$ARCH/d-os.iso
+case "$ARCH" in
+    i386)   QEMU=qemu-system-i386 ;;
+    x86_64) QEMU=qemu-system-x86_64 ;;
+    *) echo "Unsupported ARCH '$ARCH' — supported: i386, x86_64" >&2; exit 1 ;;
+esac
+
 if [ ! -f "$ISO" ]; then
-    echo "ISO not found at $ISO — run scripts/build.sh first." >&2
+    echo "ISO not found at $ISO — run scripts/build.sh first (with matching ARCH)." >&2
     exit 1
 fi
 
-if command -v qemu-system-i386 >/dev/null 2>&1; then
-    exec qemu-system-i386 -cdrom "$ISO"
+if command -v "$QEMU" >/dev/null 2>&1; then
+    exec "$QEMU" -cdrom "$ISO"
 fi
 
-echo "qemu-system-i386 not found on host; running headless inside Docker." >&2
+echo "$QEMU not found on host; running headless inside Docker." >&2
 exec docker run --rm -it -v "$PWD":/src d-os-build \
-    qemu-system-i386 -nographic -cdrom "$ISO"
+    "$QEMU" -nographic -cdrom "$ISO"
