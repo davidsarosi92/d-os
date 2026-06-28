@@ -94,6 +94,54 @@ struct fadt {
 } __attribute__((packed));
 
 /* ------------------------------------------------------------------------- */
+/* MADT — Multiple APIC Description Table (M18).                              */
+/*                                                                            */
+/* Header + variable-length entry list.  Each entry begins with a 2-byte      */
+/* (type, length) header; we recognize types 0 (Local APIC), 1 (IOAPIC),      */
+/* and 2 (Interrupt Source Override).  Other entry types (NMI sources, x2APIC */
+/* entries on 64-bit systems, ...) are silently skipped via the length field. */
+/* ------------------------------------------------------------------------- */
+
+#define MADT_TYPE_LAPIC     0
+#define MADT_TYPE_IOAPIC    1
+#define MADT_TYPE_ISO       2
+
+struct madt {
+    struct sdt_header header;
+    uint32_t lapic_address;
+    uint32_t flags;                     /* bit 0 = PCAT_COMPAT (8259 present) */
+    /* entries follow */
+} __attribute__((packed));
+
+struct madt_entry_header {
+    uint8_t type;
+    uint8_t length;
+} __attribute__((packed));
+
+struct madt_lapic {
+    struct madt_entry_header h;
+    uint8_t  acpi_processor_id;
+    uint8_t  apic_id;
+    uint32_t flags;                     /* bit 0 = enabled */
+} __attribute__((packed));
+
+struct madt_ioapic {
+    struct madt_entry_header h;
+    uint8_t  ioapic_id;
+    uint8_t  _reserved;
+    uint32_t ioapic_address;
+    uint32_t gsi_base;
+} __attribute__((packed));
+
+struct madt_iso {                       /* Interrupt Source Override */
+    struct madt_entry_header h;
+    uint8_t  bus_source;                /* always 0 for ISA */
+    uint8_t  irq_source;                /* legacy ISA IRQ (0..15) */
+    uint32_t gsi;                       /* destination GSI */
+    uint16_t flags;                     /* polarity + trigger mode */
+} __attribute__((packed));
+
+/* ------------------------------------------------------------------------- */
 /* Cached state filled by acpi_init and consumed by acpi_shutdown.           */
 /* ------------------------------------------------------------------------- */
 
@@ -105,6 +153,22 @@ static uint32_t           g_dsdt_len  = 0;   /* length of that body region */
 static uint8_t            g_slp_typ_a = 0;   /* SLP_TYPa value to write */
 static uint8_t            g_slp_typ_b = 0;   /* SLP_TYPb value to write */
 static int                g_have_s5   = 0;   /* set to 1 once parse_s5 succeeds */
+
+/* MADT-derived (M18). */
+static uint32_t           g_lapic_phys     = 0;
+static uint32_t           g_ioapic_phys    = 0;
+static uint32_t           g_ioapic_gsi_base= 0;
+static uint8_t            g_cpu_apic_ids[ACPI_MAX_CPUS];
+static int                g_ncpus          = 0;
+
+#define ACPI_MAX_ISO 16
+struct iso_override {
+    uint8_t  isa_irq;
+    uint32_t gsi;
+    uint16_t flags;
+};
+static struct iso_override g_iso[ACPI_MAX_ISO];
+static int                 g_iso_n = 0;
 
 /* ------------------------------------------------------------------------- */
 /* Helpers.                                                                  */
@@ -213,6 +277,62 @@ static int parse_s5(const uint8_t* start, uint32_t len,
 }
 
 /* ------------------------------------------------------------------------- */
+/* MADT parser (M18).                                                        */
+/*                                                                            */
+/* Walks the variable-length entry list and fills the topology cache.        */
+/* Unknown entry types are skipped via the `length` field — that's the       */
+/* contract for forward-compat with newer MADT entry types.                  */
+/* ------------------------------------------------------------------------- */
+
+static void parse_madt(const struct madt* m) {
+    g_lapic_phys = m->lapic_address;
+
+    const uint8_t* p   = (const uint8_t*)(m + 1);
+    const uint8_t* end = (const uint8_t*)m + m->header.length;
+
+    while (p + sizeof(struct madt_entry_header) <= end) {
+        const struct madt_entry_header* h = (const struct madt_entry_header*)p;
+        if (h->length < 2 || p + h->length > end) break;   /* malformed */
+
+        switch (h->type) {
+            case MADT_TYPE_LAPIC: {
+                const struct madt_lapic* l = (const struct madt_lapic*)p;
+                /* bit 0 of flags = "processor is enabled"; ignore disabled
+                 * entries — they correspond to sockets with no CPU. */
+                if ((l->flags & 0x1) && g_ncpus < ACPI_MAX_CPUS) {
+                    g_cpu_apic_ids[g_ncpus++] = l->apic_id;
+                }
+                break;
+            }
+            case MADT_TYPE_IOAPIC: {
+                const struct madt_ioapic* io = (const struct madt_ioapic*)p;
+                /* First IOAPIC wins for this milestone; most QEMU
+                 * configurations only present one. */
+                if (g_ioapic_phys == 0) {
+                    g_ioapic_phys     = io->ioapic_address;
+                    g_ioapic_gsi_base = io->gsi_base;
+                }
+                break;
+            }
+            case MADT_TYPE_ISO: {
+                const struct madt_iso* iso = (const struct madt_iso*)p;
+                if (g_iso_n < ACPI_MAX_ISO) {
+                    g_iso[g_iso_n].isa_irq = iso->irq_source;
+                    g_iso[g_iso_n].gsi     = iso->gsi;
+                    g_iso[g_iso_n].flags   = iso->flags;
+                    g_iso_n++;
+                }
+                break;
+            }
+            default:
+                /* Unknown — skip via length. */
+                break;
+        }
+        p += h->length;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 /* Public interface.                                                         */
 /* ------------------------------------------------------------------------- */
 
@@ -233,14 +353,16 @@ int acpi_init(void) {
     }
 
     /* RSDT payload is an array of 32-bit physical pointers, one per table.
-     * Count = (table length − header length) / 4. */
+     * Count = (table length − header length) / 4.  M18: scan the same
+     * list for both FACP (shutdown) and APIC (= MADT, SMP topology). */
     uint32_t n = (rsdt->length - sizeof(struct sdt_header)) / 4;
     const uint32_t* entries = (const uint32_t*)(rsdt + 1);
     for (uint32_t i = 0; i < n; i++) {
         const struct sdt_header* h = (const struct sdt_header*)entries[i];
         if (sig4(h->signature, "FACP") && checksum_ok(h, h->length)) {
             g_fadt = (const struct fadt*)h;
-            break;
+        } else if (sig4(h->signature, "APIC") && checksum_ok(h, h->length)) {
+            parse_madt((const struct madt*)h);
         }
     }
     if (!g_fadt) {
@@ -268,6 +390,13 @@ int acpi_init(void) {
     } else {
         kprintf("ACPI: _S5_ not parseable (PM1a=%x)\n", g_pm1a_cnt);
     }
+
+    /* M18 — log MADT topology summary if one was found. */
+    if (g_ncpus > 0 || g_ioapic_phys) {
+        kprintf("ACPI: MADT — %d CPU(s), lapic=%p ioapic=%p\n",
+                g_ncpus, (void*)g_lapic_phys, (void*)g_ioapic_phys);
+    }
+
     return 0;
 }
 
@@ -292,4 +421,29 @@ void acpi_shutdown(void) {
         uint16_t val_b = ((uint16_t)g_slp_typ_b << 10) | (1 << 13);
         outw(g_pm1b_cnt, val_b);
     }
+}
+
+/* ------------------------------------------------------------------------- */
+/* MADT-derived topology getters (M18).                                      */
+/* ------------------------------------------------------------------------- */
+
+uint32_t acpi_lapic_phys(void)      { return g_lapic_phys; }
+int      acpi_ncpus(void)           { return g_ncpus; }
+uint32_t acpi_ioapic_phys(void)     { return g_ioapic_phys; }
+uint32_t acpi_ioapic_gsi_base(void) { return g_ioapic_gsi_base; }
+
+uint8_t acpi_cpu_apic_id(int i) {
+    if (i < 0 || i >= g_ncpus) return 0xFF;
+    return g_cpu_apic_ids[i];
+}
+
+int acpi_irq_override(int isa_irq, uint32_t* out_gsi, uint16_t* out_flags) {
+    for (int i = 0; i < g_iso_n; i++) {
+        if (g_iso[i].isa_irq == (uint8_t)isa_irq) {
+            if (out_gsi)   *out_gsi   = g_iso[i].gsi;
+            if (out_flags) *out_flags = g_iso[i].flags;
+            return 1;
+        }
+    }
+    return 0;
 }

@@ -18,28 +18,26 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
-✅ **M1 – M17** shipped.  Done so far: kmalloc, driver registry
-(`MODULE()`), PIT 1 kHz tick, VFS + ramfs, config store, ring-3 user
-mode (TSS + iret), cooperative scheduler, richer `DRIVER()` lifecycle,
-devfs, procfs, block layer + virtio-blk, multi-fs-shaped VFS + block
-cache + exFAT (read + write + persistence), preemptive scheduling
-(PIT IRQ → deferred `schedule()` after EOI) + lock primitives,
-virtual consoles + dynamic pane split tree (Alt-N focus, per-task
-kprintf routing, shell as a per-pane task), xHCI USB host stack +
-HID boot-keyboard class driver (root-port enumeration, Address
-Device, Configure Endpoint, Event Ring polled from PIT IRQ),
-keyboard layout abstraction (PS/2 + USB common keycode pipeline
-= HID Usage IDs; US + HU QWERTZ layouts), **HAL portability cut
-(`hal_api.h`: CPU/intr/arch_init/task_init_stack/idle/syscall_exit;
-core has no direct `__asm__` or arch-header includes any more;
-deferred: vmm CR-pokes + syscall int_frame)**.
+✅ **M1 – M18** shipped.  Highlights so far: VFS + ramfs + exFAT on
+virtio-blk, devfs + procfs, preemptive scheduler with lock-handoff,
+multi-pane shell, xHCI USB + HID, keyboard layouts, HAL cut
+(`hal_api.h`), **SMP — APIC + IOAPIC + 8259 disabled, real cmpxchg
+spinlocks, per-CPU `current` task, AP boot via INIT+SIPI+SIPI
+(verified on `-smp 4`: all 4 cores online), `lscpu` shell command**.
 
-🔲 **Next: §M18** — SMP support (APIC, AP boot, per-CPU storage,
-spinlock teeth).  M13 shipped the API but on UP the locks are stubs;
-M18 makes them real and wakes up cores 1..N.
+🔲 **Next: §M19** — memory at scale (buddy allocator, slab on top,
+2 MiB kernel direct map, zone abstraction).  M18 unlocks per-CPU
+slab magazines, so the two milestones reinforce each other.
 
-🔲 Remaining: M18 SMP, M19 memory at scale, M20 x64, M21 aarch64,
-M22 GUI.  See PLAN.md "Active backlog" table for the full grid.
+🔲 **PLAN extensions added (placeholders, design only):**
+- §M22 — GUI infrastructure now includes a Wayland-reuse evaluation
+  phase (libwayland-server port vs. custom protocol).
+- §M23 — Audio subsystem (AC97 → HDA → I2S).
+- §M24 — Network stack (virtio-net → IP/UDP/TCP → sockets).
+
+🔲 Remaining: M19 memory at scale, M20 x64, M21 aarch64, M22 GUI,
+M23 audio, M24 network.  See PLAN.md "Active backlog" for the
+full grid.
 
 ## Hard conventions (do NOT deviate without asking)
 

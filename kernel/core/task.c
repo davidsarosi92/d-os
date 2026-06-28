@@ -70,6 +70,7 @@
 #include "printf.h"
 #include "lock.h"
 #include "hal_api.h"
+#include "percpu.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -79,11 +80,19 @@
  * declaration works on every 32/64-bit arch. */
 extern void context_switch(uintptr_t* save_esp_to, uintptr_t new_esp);
 
-/* Run-queue is a circular singly-linked list rooted at `current`.
- * `head` exists for diagnostic listing only. */
-static struct task* current = NULL;
-static struct task* head    = NULL;
-static int          next_pid = 0;
+/* Run-queue (M18): a single circular singly-linked list shared by
+ * every CPU.  `head` is the diagnostic anchor; the per-CPU pointer
+ * to the currently-running task lives in `this_cpu()->current`.
+ *
+ * A single global runqueue with a spinlock is the simplest correct
+ * SMP design — fine until contention shows up.  Per-CPU runqueues +
+ * a load-balancer is an M19/M18.5 follow-up (see PLAN.md).  Today's
+ * lock contention is invisible on -smp 2 because both CPUs spend
+ * most of their time in their idle tasks. */
+static struct task* head      = NULL;
+static int          next_pid  = 0;
+static spinlock_t   runqueue_lock = SPINLOCK_INIT;
+
 
 /* Deferred-reschedule flag.  Set by schedule_request() (from pit_irq),
  * consumed by schedule_check() (from isr_handler after pic_eoi).  Reader
@@ -119,17 +128,19 @@ static const char* state_name(enum task_state s) {
     return "?";
 }
 
-/* Insert `t` into the circular list right after `current`.  Caller must
- * have IRQs disabled. */
+/* Insert `t` into the circular list.  Caller must hold runqueue_lock
+ * and have IRQs disabled.  If the queue is empty, `t` becomes the
+ * sole occupant AND the BSP's current task — that's the bootstrap
+ * path for pid 0. */
 static void runqueue_insert_locked(struct task* t) {
-    if (!current) {
-        /* First task — circle of one. */
+    if (!head) {
         t->next = t;
         head    = t;
-        current = t;
+        /* Bootstrap: BSP picks up this first task as its current. */
+        this_cpu()->current = t;
     } else {
-        t->next       = current->next;
-        current->next = t;
+        t->next    = head->next;
+        head->next = t;
     }
 }
 
@@ -150,9 +161,9 @@ void task_init(void) {
     t0->esp         = 0;                /* set by first context_switch */
     t0->kstack_base = NULL;             /* we don't own boot's stack */
 
-    uint32_t fl = hal_intr_save();
+    uint32_t fl = spin_lock_irqsave(&runqueue_lock);
     runqueue_insert_locked(t0);
-    hal_intr_restore(fl);
+    spin_unlock_irqrestore(&runqueue_lock, fl);
 
     kprintf("task: pid 0 (kernel) installed\n");
 }
@@ -180,9 +191,9 @@ struct task* task_spawn(const char* name, void (*entry)(void)) {
     t->esp         = hal_task_init_stack((char*)stack + TASK_KSTACK_SZ, entry);
     t->kstack_base = stack;
 
-    uint32_t fl = hal_intr_save();
+    uint32_t fl = spin_lock_irqsave(&runqueue_lock);
     runqueue_insert_locked(t);
-    hal_intr_restore(fl);
+    spin_unlock_irqrestore(&runqueue_lock, fl);
 
     return t;
 }
@@ -191,29 +202,47 @@ struct task* task_spawn(const char* name, void (*entry)(void)) {
 /* Schedule + yield + exit.                                             */
 /* ------------------------------------------------------------------- */
 
-/* Core scheduler — picks the next RUNNABLE task and context-switches.
- * MUST be called with IRQs already disabled.  Returns with IRQs still
- * disabled; caller is responsible for restoring IF. */
-static void schedule_locked(void) {
-    if (!current) return;
+/* Core scheduler — picks the next RUNNABLE task for THIS CPU and
+ * context-switches.  MUST be called with the runqueue lock held +
+ * IRQs disabled.  Returns with both invariants intact; caller
+ * releases the lock.
+ *
+ * SMP shape: we skip tasks that are RUNNABLE but currently `current`
+ * on ANOTHER CPU.  Cheap to detect because every CPU stamps its
+ * current pointer in this_cpu()->current and we can scan all
+ * per-CPU slots in O(ncpus).  Tracked under PLAN §M18 follow-ups
+ * (per-CPU runqueue would eliminate the scan entirely). */
+static int task_running_elsewhere(struct task* t) {
+    for (int i = 0; i < smp_ncpus(); i++) {
+        struct percpu* p = percpu_at(i);
+        if (p && p != this_cpu() && p->current == t) return 1;
+    }
+    return 0;
+}
 
-    struct task* prev = current;
+static void schedule_locked(void) {
+    struct task* prev = this_cpu()->current;
+    if (!prev) return;
+
+    /* Walk the ring starting at prev->next, picking the first task
+     * that is RUNNABLE and not running on another CPU. */
     struct task* next = prev->next;
-    while (next != prev && next->state != TASK_RUNNABLE) next = next->next;
+    while (next != prev) {
+        if (next->state == TASK_RUNNABLE && !task_running_elsewhere(next)) break;
+        next = next->next;
+    }
     if (next == prev) return;           /* no one else to run */
 
-    current = next;
+    this_cpu()->current = next;
     context_switch(&prev->esp, next->esp);
     /* When `prev` is later scheduled back in, control resumes here.
-     * IF is still 0 (the resume path inherited cli from the schedule()
-     * that put us out).  Our caller will restore IF based on its own
-     * captured `fl`. */
+     * IRQs are still off; caller restores IF and releases the lock. */
 }
 
 void schedule(void) {
-    uint32_t fl = hal_intr_save();
+    uint32_t fl = spin_lock_irqsave(&runqueue_lock);
     schedule_locked();
-    hal_intr_restore(fl);
+    spin_unlock_irqrestore(&runqueue_lock, fl);
 }
 
 void task_yield(void) {
@@ -225,7 +254,7 @@ void task_yield(void) {
 /* ------------------------------------------------------------------- */
 
 struct task* task_current(void) {
-    return current;
+    return this_cpu() ? this_cpu()->current : NULL;
 }
 
 void task_set_out_console(struct task* t, void* console) {
@@ -233,12 +262,18 @@ void task_set_out_console(struct task* t, void* console) {
     t->out_console = console;
 }
 
+/* Lock-handoff finisher for brand-new tasks.  See task.h. */
+void task_finish_first_switch(void) {
+    spin_unlock(&runqueue_lock);
+}
+
 void task_exit(void) {
     /* Mark ourselves DEAD then call schedule.  No future selection will
      * pick a DEAD task, so schedule_locked won't context-switch back. */
-    hal_intr_disable();
-    current->state = TASK_DEAD;
+    uint32_t fl = spin_lock_irqsave(&runqueue_lock);
+    this_cpu()->current->state = TASK_DEAD;
     schedule_locked();
+    spin_unlock_irqrestore(&runqueue_lock, fl);
     /* Unreachable if at least one other RUNNABLE task exists.  Halt
      * forever if somehow we get back — the system has no one to run. */
     for (;;) { hal_intr_disable(); hal_cpu_halt(); }
@@ -269,18 +304,25 @@ void task_list(void) {
     kprintf("PID  STATE  NAME\n");
     struct task* t = head;
     do {
+        /* "running" if ANY CPU currently has us scheduled — useful on
+         * SMP where it's not just BSP. */
+        int running = 0;
+        for (int i = 0; i < smp_ncpus(); i++) {
+            if (percpu_at(i) && percpu_at(i)->current == t) { running = 1; break; }
+        }
         kprintf("%d   %s    %s%s\n",
                 t->pid, state_name(t->state), t->name,
-                (t == current) ? " (running)" : "");
+                running ? " (running)" : "");
         t = t->next;
     } while (t != head);
 }
 
 void task_for_each(task_iter_fn fn, void* ctx) {
     if (!fn || !head) return;
+    struct task* me = task_current();
     struct task* t = head;
     do {
-        fn(t, t == current, ctx);
+        fn(t, t == me, ctx);
         t = t->next;
     } while (t != head);
 }

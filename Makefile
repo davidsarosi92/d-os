@@ -31,6 +31,7 @@ C_SRCS := \
     kernel/core/vc.c \
     kernel/core/keymap.c \
     kernel/core/layouts.c \
+    kernel/core/percpu.c \
     kernel/drivers/serial/serial.c \
     kernel/drivers/terminal/fb_terminal.c \
     kernel/drivers/terminal/vga_terminal.c \
@@ -55,7 +56,10 @@ C_SRCS := \
     kernel/hal/x86/tss.c \
     kernel/hal/x86/pci.c \
     kernel/hal/x86/hal_arch.c \
-    kernel/hal/x86/task_arch.c
+    kernel/hal/x86/task_arch.c \
+    kernel/hal/x86/lapic.c \
+    kernel/hal/x86/ioapic.c \
+    kernel/hal/x86/smp.c
 
 ASM_SRCS := \
     kernel/hal/x86/boot.s \
@@ -63,7 +67,7 @@ ASM_SRCS := \
     kernel/hal/x86/usermode.s \
     kernel/hal/x86/switch.s
 
-OBJS := $(C_SRCS:.c=.o) $(ASM_SRCS:.s=.o)
+OBJS := $(C_SRCS:.c=.o) $(ASM_SRCS:.s=.o) kernel/hal/x86/ap_trampoline_blob.o
 
 BUILD_DIR  := build
 KERNEL_BIN := $(BUILD_DIR)/kernel.bin
@@ -81,6 +85,17 @@ kernel: $(KERNEL_BIN)
 
 %.o: %.s
 	$(AS) $(ASFLAGS) $< -o $@
+
+# AP boot trampoline: assembled as a flat binary (so `org 0x8000` works),
+# then wrapped in an ELF object via objcopy so the linker can pull it
+# in.  Symbol prefix is `_binary_<path-with-_-instead-of-/>_start/_end`.
+kernel/hal/x86/ap_trampoline.bin: kernel/hal/x86/ap_trampoline.s
+	nasm -f bin $< -o $@
+
+kernel/hal/x86/ap_trampoline_blob.o: kernel/hal/x86/ap_trampoline.bin
+	objcopy --input-target=binary --output-target=elf32-i386 \
+	         --binary-architecture=i386 \
+	         kernel/hal/x86/ap_trampoline.bin kernel/hal/x86/ap_trampoline_blob.o
 
 $(KERNEL_BIN): $(OBJS) linker.ld
 	@mkdir -p $(BUILD_DIR)

@@ -1,19 +1,32 @@
 /* =============================================================================
- * lock.c — UP implementation of the lock.h API.
+ * lock.c — spinlock + preempt-count implementation.
  *
- * The "spinlock" is a stub on UP: there's no other CPU to contend with,
- * so the lock body is just `cli` (atomicity vs. our own IRQ handlers) and
- * the unlock restores EFLAGS.IF.  The `locked` field on struct spinlock
- * exists only so we can spot a recursive acquire from the same context —
- * a real bug we'd otherwise discover much later.
+ * M18 made the spinlock real: `lock cmpxchg` test-and-set with pause-
+ * loop backoff, plus IRQ-save so the CPU we run on can't preempt
+ * itself while holding the lock.  The previous UP stub (just cli/sti)
+ * was correct on one CPU but became a no-op the moment APs joined.
  *
- * preempt_count is a plain global for now.  When SMP lands it becomes a
- * per-CPU slot keyed off the current APIC ID; the API in lock.h doesn't
- * change.
+ * Pattern (Linux-style `spin_lock_irqsave`):
+ *   1. hal_intr_save() — disable IRQs on THIS CPU and save the prior
+ *      flag state.  Stops self-preemption.
+ *   2. atomic_cmpxchg(&l->locked, 0, 1) until success — spin until we
+ *      win the contention with peer CPUs.  `hal_cpu_pause` between
+ *      attempts to relax the pipeline.
+ *
+ * Release does the inverse: store-release 0 to `locked` so peer CPUs'
+ * acquire-load sees zero with our preceding writes visible, then
+ * restore IRQ state.
+ *
+ * preempt_count stays a plain global for now (M18 follow-up: per-CPU).
+ * On a UP system we never observe it from another CPU, so the global
+ * is correct; on SMP the wrong CPU might see another's count and
+ * either over-eagerly skip a reschedule or pointlessly check it.
+ * Tracked under §M18 follow-ups in PLAN.md.
  * ============================================================================= */
 
 #include "lock.h"
 #include "hal_api.h"
+#include "atomic.h"
 #include "printf.h"
 #include <stdint.h>
 
@@ -34,25 +47,35 @@ static volatile int g_preempt_count = 0;
  * might have changed.
  * -------------------------------------------------------------------------- */
 uint32_t spin_lock_irqsave(spinlock_t* l) {
-    /* M17: arch-specific irq-save behind hal_intr_save.  On x86 this
-     * still expands to one pushf/pop/cli pair; on ARM it'll be a
-     * cpsid + flag read. */
+    /* IRQs off on THIS CPU first — prevents the timer IRQ from yanking
+     * the CPU away from us mid-lock and creating a hold time so long
+     * that another CPU's acquire times out.  On UP this is also the
+     * only protection we need; on SMP the cmpxchg below picks up
+     * cross-CPU contention. */
     uint32_t fl = hal_intr_save();
 
-    /* On UP, with IRQs masked, the only way `l->locked` could already be 1
-     * is if we recursively acquired the same lock from the same context.
-     * That's a programming error — flag it loudly. */
-    if (l->locked) {
-        kprintf("spin_lock_irqsave: recursive acquire on %p\n", (void*)l);
+    /* Spin until we win the test-and-set.  `hal_cpu_pause` (= x86
+     * `pause`) drops the CPU out of speculation-heavy mode and avoids
+     * starving the lock holder on the other core.  M18 follow-up:
+     * exponential backoff + queued ticket lock if we ever measure
+     * pathological contention. */
+    while (!atomic_cmpxchg(&l->locked, 0, 1)) {
+        hal_cpu_pause();
     }
-    l->locked = 1;
     return fl;
 }
 
 void spin_unlock_irqrestore(spinlock_t* l, uint32_t flags) {
-    l->locked = 0;
-    /* Restore IRQ state as it was before the matching irqsave. */
+    /* Store-release so any peer CPU that subsequently acquires the
+     * lock observes every write we made inside the critical section. */
+    atomic_store_release(&l->locked, 0);
     hal_intr_restore(flags);
+}
+
+void spin_unlock(spinlock_t* l) {
+    /* Lock-handoff variant — see spinlock_t comment in lock.h.  Just
+     * drops the lock; IRQ state is the caller's problem. */
+    atomic_store_release(&l->locked, 0);
 }
 
 /* --------------------------------------------------------------------------

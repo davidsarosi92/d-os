@@ -25,4 +25,8 @@
  * to call more than once, though today we only call it from kernel_main. */
 void gdt_init(void);
 
+/* Get the GDTR struct (6 bytes: 2-byte limit + 4-byte base).  Used by
+ * the AP boot trampoline (M18) so the AP can lgdt the same table. */
+void* gdt_get_ptr_struct(void);
+
 #endif

@@ -84,6 +84,13 @@ struct task* task_current(void);
  * via the per-task hook installed by vc_init.  Pass NULL to clear. */
 void task_set_out_console(struct task* t, void* console);
 
+/* Called by the arch-specific task trampoline on the first context
+ * switch into a brand-new task.  Releases the runqueue lock that
+ * the spawning schedule() acquired and never got to release (the
+ * lock-handoff trick — see task.c header for the rationale).
+ * Trampoline must call this BEFORE sti'ing and calling the entry. */
+void task_finish_first_switch(void);
+
 /* Mark the current task DEAD and never return — the scheduler picks the
  * next runnable task on the next yield cycle. */
 void task_exit(void) __attribute__((noreturn));

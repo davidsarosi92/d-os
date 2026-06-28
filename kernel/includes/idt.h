@@ -56,4 +56,16 @@ void idt_init(void);
  * overwrite each other — there is no chaining today. */
 void irq_install(int irq, irq_handler_t handler);
 
+/* Switch the IRQ delivery path from the 8259 PIC to the IOAPIC + LAPIC
+ * pair (M18).  After this call:
+ *   - new `irq_install` invocations program the IOAPIC redirection
+ *     table instead of unmasking a PIC line;
+ *   - already-installed handlers (PIT, PS/2) are re-routed transparently;
+ *   - the EOI in `isr_handler` goes to the LAPIC;
+ *   - both 8259s are masked off entirely.
+ *
+ * Idempotent in the sense that calling it twice is harmless, but only
+ * the first call does the real work; subsequent calls just re-route. */
+void idt_use_apic(uint8_t bsp_apic_id);
+
 #endif

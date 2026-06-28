@@ -74,6 +74,12 @@ struct gdt_ptr {
 static struct gdt_entry gdt[GDT_ENTRIES];
 static struct gdt_ptr   gdtr;
 
+/* AP-boot helper (M18): expose the GDTR pointer so the trampoline
+ * can lgdt the same table the BSP uses.  Returns a pointer to the
+ * static gdtr struct in `.bss`; caller treats it as opaque, just
+ * memcpy's it into the trampoline's data area. */
+void* gdt_get_ptr_struct(void) { return &gdtr; }
+
 /* Fill in one entry.  `flags` is the 4-bit nibble that goes into the high
  * half of byte 6; `access` is the full 8-bit access byte. */
 static void set_entry(int i, uint32_t base, uint32_t limit,

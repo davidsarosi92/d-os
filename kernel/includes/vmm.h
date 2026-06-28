@@ -39,6 +39,10 @@ void vmm_init(void);
  * entry or a PT allocation fails. */
 int vmm_map(uint32_t virt, uint32_t phys, uint32_t flags);
 
+/* Physical address of the kernel page directory.  Used by the AP boot
+ * trampoline (M18) so each AP can load CR3 before enabling paging. */
+uint32_t vmm_kernel_pd_phys(void);
+
 /* Install a single 4 MiB PSE mapping.  `virt` and `phys` must both be
  * 4 MiB aligned.  Returns 0 on success, non-zero if a non-PSE mapping
  * already exists in that PDE slot.  Useful for mapping MMIO-ish regions

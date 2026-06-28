@@ -22,6 +22,8 @@
 #include "gdt.h"
 #include "syscall.h"
 #include "task.h"
+#include "lapic.h"
+#include "ioapic.h"
 #include <stdint.h>
 
 /* --------------------------------------------------------------------------
@@ -60,6 +62,14 @@ static struct idt_ptr   idtr;
 
 /* C-callable handler table for the 16 PIC IRQs (vectors 32..47). */
 static irq_handler_t irq_handlers[16] = { 0 };
+
+/* APIC mode flag (M18).  Until M18 brings up LAPIC + IOAPIC, IRQs are
+ * delivered via the 8259 PIC and EOIs go to it.  Once `idt_use_apic`
+ * is called: route new IRQs through the IOAPIC and EOI via the LAPIC.
+ * The IDT vector layout (IRQ N → vector 0x20+N) stays the same so the
+ * isr_common stubs and handler table need no change. */
+static int g_apic_mode = 0;
+static uint8_t g_bsp_apic_id = 0;
 
 /* --------------------------------------------------------------------------
  * asm stubs — declared so we can take their addresses in set_gate().  One
@@ -203,7 +213,44 @@ void idt_init(void) {
 void irq_install(int irq, irq_handler_t handler) {
     if (irq < 0 || irq > 15) return;
     irq_handlers[irq] = handler;
-    if (handler) pic_unmask(irq);
+    if (!handler) return;
+    if (g_apic_mode) {
+        /* Route via IOAPIC to BSP, vector = 0x20+irq.  ACPI ISO overrides
+         * are honored inside ioapic_route_isa. */
+        ioapic_route_isa(irq, (uint8_t)(0x20 + irq), g_bsp_apic_id);
+    } else {
+        pic_unmask(irq);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * APIC mode switch (M18).  Called from kernel_main once acpi_init,
+ * lapic_init_bsp, and ioapic_init have all succeeded.  Mask every
+ * 8259 line and remember that future irq_install calls + EOIs route
+ * through APIC instead.  Existing already-installed handlers
+ * (typically PIT IRQ0 and PS/2 IRQ1) are re-routed via the IOAPIC
+ * now that we know where to send them.
+ * --------------------------------------------------------------------------- */
+void idt_use_apic(uint8_t bsp_apic_id) {
+    g_bsp_apic_id = bsp_apic_id;
+    g_apic_mode   = 1;
+
+    /* Re-route any IRQ that already has a handler — these were
+     * installed under the 8259 path and want IOAPIC entries instead. */
+    for (int irq = 0; irq < 16; irq++) {
+        if (irq_handlers[irq]) {
+            ioapic_route_isa(irq, (uint8_t)(0x20 + irq), bsp_apic_id);
+        }
+    }
+
+    /* Mask every line on both 8259s — no more IRQ delivery from
+     * legacy PIC.  Cascade (master IRQ2) included; we don't need it
+     * once IOAPIC is the source. */
+    outb(0x21, 0xFF);
+    outb(0xA1, 0xFF);
+
+    kprintf("apic: routing live (bsp_apic_id=%u), 8259 disabled\n",
+            bsp_apic_id);
 }
 
 /* --------------------------------------------------------------------------
@@ -223,12 +270,15 @@ void isr_handler(struct int_frame* f) {
     if (f->int_no >= 32 && f->int_no < 48) {
         int irq = (int)f->int_no - 32;
         if (irq_handlers[irq]) irq_handlers[irq](f);
-        pic_eoi(irq);
+        /* EOI: LAPIC for vectors delivered via IOAPIC, 8259 otherwise.
+         * Switching at this single point keeps the rest of the handler
+         * dispatch path arch-agnostic. */
+        if (g_apic_mode) lapic_eoi();
+        else             pic_eoi(irq);
         /* Preemption point (M13): if the PIT (or any other handler) set
          * the deferred-reschedule flag, honor it now — AFTER the EOI so
-         * the PIC will keep delivering ticks to whichever task we pivot
-         * to.  schedule_check is a no-op when no reschedule is pending
-         * or preempt_count > 0, so the cost on every IRQ is one branch. */
+         * the interrupt controller will keep delivering ticks to
+         * whichever task we pivot to. */
         schedule_check();
         return;
     }

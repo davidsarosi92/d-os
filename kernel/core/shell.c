@@ -30,6 +30,7 @@
 #include "vc.h"
 #include "lock.h"
 #include "keymap.h"
+#include "percpu.h"
 
 #define LINE_MAX        128             /* max accepted bytes per command line */
 #define DEFAULT_PROMPT  "d-os> "        /* fallback when config is unavailable */
@@ -103,7 +104,7 @@ static void cmd_help(void) {
                   "  config, getconf <key>, setconf <key> <value>, saveconf\n"
                   "  ringtest, ps, spawn, yield, loop\n"
                   "  pane, pane split horizontal|vertical\n"
-                  "  lslayout, setlayout <us|hu|...>\n"
+                  "  lslayout, setlayout <us|hu|...>, lscpu\n"
                   "  shutdown, reboot\n");
 }
 
@@ -353,6 +354,24 @@ static void cmd_setlayout(const char* name) {
         kprintf("layout: now '%s'\n", keymap_current());
     } else {
         kprintf("setlayout: unknown layout '%s'\n", name);
+    }
+}
+
+/* -------------------------------------------------------------------- */
+/* CPU topology — `lscpu` (M18).                                         */
+/* -------------------------------------------------------------------- */
+
+static void cmd_lscpu(void) {
+    int n = smp_ncpus();
+    int me = this_cpu_id();
+    kprintf("CPU  APIC_ID  STATE%s\n", "");
+    for (int i = 0; i < n; i++) {
+        struct percpu* p = percpu_at(i);
+        if (!p) continue;
+        kprintf("%d    %u        %s%s\n",
+                i, p->apic_id,
+                p->online ? "online" : "offline",
+                (i == me) ? " <this>" : "");
     }
 }
 
@@ -633,6 +652,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "pane "))    { cmd_pane(my_vc, line + 5); return; }
     if (streq(line, "lslayout"))       { cmd_lslayout();             return; }
     if (starts_with(line, "setlayout ")) { cmd_setlayout(line + 10); return; }
+    if (streq(line, "lscpu"))          { cmd_lscpu();                return; }
     if (streq(line, "saveconf"))       {
         if (config_save() == 0) console_write("config saved.\n");
         else                    console_write("saveconf: failed\n");

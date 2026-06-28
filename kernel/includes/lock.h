@@ -60,6 +60,15 @@ uint32_t spin_lock_irqsave(spinlock_t* l);
  * spin_lock_irqsave.  `flags` must be the value that call returned. */
 void spin_unlock_irqrestore(spinlock_t* l, uint32_t flags);
 
+/* Plain release — drops the lock without touching IRQ state.  Used
+ * by the scheduler's lock-handoff trick: when context_switch lands
+ * on a brand-new task, that task never came through schedule()'s
+ * matching unlock-restore, so the trampoline releases the lock
+ * directly and sti's separately.  Don't use this in normal code —
+ * the irqsave/irqrestore pair is the right shape for every other
+ * caller. */
+void spin_unlock(spinlock_t* l);
+
 /* ---------------------------------------------------------------------------
  * preempt_disable / preempt_enable
  *

@@ -31,11 +31,12 @@ when sections are added.)
 | 4.8 | Physical Memory Manager | 364 |
 | 4.9 | Virtual Memory Manager | 395 |
 | 4.X | Tasks + scheduler (M13: preemption) | 422 |
-| 4.X | HAL — arch-independent interface (M17) | ~492 |
-| 4.X | Keyboard layouts (M16) | ~575 |
-| 4.X | USB host stack — xHCI + HID (M15) | ~660 |
-| 4.X | Virtual consoles / pane split (M14) | ~750 |
-| 4.X | Ring 3 / user mode | ~835 |
+| 4.X | SMP — APIC, AP boot, per-CPU, real spinlocks (M18) | ~492 |
+| 4.X | HAL — arch-independent interface (M17) | ~580 |
+| 4.X | Keyboard layouts (M16) | ~665 |
+| 4.X | USB host stack — xHCI + HID (M15) | ~750 |
+| 4.X | Virtual consoles / pane split (M14) | ~840 |
+| 4.X | Ring 3 / user mode | ~925 |
 | 4.X | Block layer + virtio-blk (M11) | 490 |
 | 4.X | procfs | 542 |
 | 4.X | devfs | 573 |
@@ -492,6 +493,100 @@ active at a time, FB preferred):
   prompt — the user-facing version of the boot self-test.  With
   cooperative scheduling the shell would lock up; under M13
   preemption the prompt stays responsive.
+
+### 4.X SMP — APIC, AP boot, per-CPU, real spinlocks (M18)
+
+The single-CPU UP build became a real multiprocessor.  Boot order:
+
+1. **ACPI MADT** parsed alongside the FADT in `acpi_init` — exports
+   `acpi_lapic_phys()`, `acpi_ncpus()`, `acpi_cpu_apic_id(i)`,
+   `acpi_ioapic_phys()`, `acpi_irq_override(isa_irq)`.
+2. **LAPIC** brought up on BSP (`kernel/hal/x86/lapic.c`) — MMIO
+   mapped cache-disabled, SIVR.APIC_EN set, LVT lines masked, IDT
+   vector layout unchanged so the same `isr_common` stubs work.
+3. **IOAPIC** programmed (`kernel/hal/x86/ioapic.c`) — every
+   redirection entry starts masked; `ioapic_route_isa` programs a
+   single vector with the BSP's APIC ID, honoring ACPI ISO
+   overrides (very common: IRQ0 → GSI 2 on QEMU).
+4. **8259 PIC disabled** in `idt_use_apic` — both halves masked,
+   `irq_install` re-routes already-installed handlers (PIT, PS/2)
+   via the IOAPIC, EOIs go to LAPIC instead of PIC.
+5. **Per-CPU table** (`kernel/core/percpu.c`) — array of `struct
+   percpu` indexed 0..ncpus-1; sparse LAPIC ID → dense slot map via
+   `apic_to_index[256]`.  `this_cpu_id()` reads LAPIC ID and
+   looks up; constant-time, two MMIO accesses.
+6. **AP bring-up** (`kernel/hal/x86/smp.c` + `ap_trampoline.s`) —
+   16-bit real-mode trampoline assembled as flat binary, linked
+   into the kernel via `objcopy --input-target=binary`, copied to
+   physical 0x8000 at runtime.  INIT + SIPI + SIPI sequence per
+   Intel SDM Vol 3 §8.4; each AP runs `ap_main` which calls
+   `lapic_init_ap` + `percpu_init_ap`, kprintf's its arrival, then
+   enters `for(;;) hal_cpu_idle();`.
+
+**Real spinlocks** (`kernel/core/lock.c`) — `cmpxchg`-based
+test-and-set with `hal_cpu_pause` backoff; replaces the M13 UP-stub.
+Acquire-release memory ordering via `atomic_store_release` /
+`atomic_load_acquire`.  IRQs-off-on-this-CPU comes first so we
+can't preempt ourselves mid-critical-section.
+
+**Lock-handoff trick** (`task_finish_first_switch` in task.c +
+`task_arch.c` trampoline) — when `schedule()` switches into a
+brand-new task, the lock acquired by the spawning schedule was
+never released.  An established task's schedule pairs its own
+acquire with its own release; a brand-new task has no schedule
+frame on its stack.  The trampoline calls `task_finish_first_switch`
+which drops the runqueue lock, then `sti`s and calls the entry.
+
+**Per-CPU `current` task** — `task->esp` is now per-CPU via
+`this_cpu()->current`.  `schedule_locked` walks the global runqueue
+skipping tasks that other CPUs already have scheduled
+(`task_running_elsewhere`); single-CPU is the trivial no-skip path.
+Per-CPU runqueues + a load-balancer is a §M19 follow-up; the
+global queue + spinlock is fine until contention shows up.
+
+**Shell command:** `lscpu` — lists every percpu slot with APIC ID
+and online state.  Marks `<this>` on the slot the calling shell
+task is running on.
+
+**Verified on QEMU `-smp 4`:**
+```
+ACPI: MADT — 4 CPU(s), lapic=0xfee00000 ioapic=0xfec00000
+lapic: BSP enabled at 0xfee00000 (id=0)
+ioapic: 24 entries at 0xfec00000, gsi_base=0
+apic: routing live (bsp_apic_id=0), 8259 disabled
+percpu: 4 CPUs known, BSP at slot 0 (apic_id=0)
+ap: cpu 1 (apic_id=1) online
+ap: cpu 2 (apic_id=2) online
+ap: cpu 3 (apic_id=3) online
+smp: 3 AP(s) started (of 4 total CPU(s))
+preempt self-test: PASS — kernel ran while hog tight-looped (hog ticks=...)
+```
+
+And `lscpu` from the shell:
+```
+CPU  APIC_ID  STATE
+0    0        online <this>
+1    1        online
+2    2        online
+3    3        online
+```
+
+**Out of scope (M18 follow-ups, see PLAN.md):**
+
+- Cross-CPU IRQ delivery for preemption — APs currently have no
+  scheduler IRQ source (PIT is BSP-only via IOAPIC default routing).
+  Need either LAPIC timer per-CPU or BSP-driven IPI broadcast every
+  quantum so APs actually run RUNNABLE tasks instead of just idling.
+- Per-CPU runqueues + load balancer — the single global runqueue
+  with `task_running_elsewhere` is O(1) for ncpus≤8 but doesn't
+  scale; per-CPU rq + a periodic balancer is the long-term shape.
+- `preempt_count` is still a plain global — needs to be per-CPU
+  before more than one CPU touches it.
+- Task affinity / pinning (`taskset`-style) — needed for the
+  "two CPU-bound tasks pinned to different cores" canonical SMP
+  demo to work.
+- `vmm.c` CR0/CR3/CR4 pokes remain x86-only; M17 deferred their
+  HAL wrap-up to be done with the x64 port.
 
 ### 4.X HAL — arch-independent interface (`kernel/includes/hal_api.h`)
 
@@ -1231,6 +1326,40 @@ Linker: `ld -m elf_i386 -T linker.ld -nostdlib`.
 
 ## 8. Change log
 
+- **2026-06-28 — M18: SMP support (APIC + AP boot + per-CPU + real
+  spinlocks).**  Single-CPU UP became a multiprocessor.  ACPI MADT
+  parsed for LAPIC + IOAPIC topology in `acpi_init`.  New x86 HAL
+  files: `kernel/hal/x86/lapic.c` (MMIO + INIT/SIPI IPI), `ioapic.c`
+  (redirection table programming, ACPI ISO honoring), `smp.c`
+  (BSP-side bring-up), `ap_trampoline.s` (16-bit real-mode → 32-bit
+  protected mode + paging, assembled as flat binary and linked via
+  `objcopy --input-target=binary`).  `idt.c` gained `idt_use_apic`
+  switching IRQ delivery from 8259 to IOAPIC+LAPIC, EOIs to LAPIC.
+  New core files: `kernel/core/percpu.c` (per-CPU `struct percpu`
+  array indexed by LAPIC-ID → dense map), `kernel/includes/atomic.h`
+  (cmpxchg/fetch_add/fences via `__sync_*`/`__atomic_*` builtins),
+  shared-runqueue spinlock in `task.c`.  `task->esp` now per-CPU
+  via `this_cpu()->current`; `schedule_locked` walks the global
+  runqueue skipping tasks `task_running_elsewhere`.  Lock-handoff
+  trick: `task_finish_first_switch` releases the runqueue lock from
+  the brand-new-task trampoline (which never ran a schedule frame
+  of its own).  New shell command: `lscpu`.  Verified end-to-end
+  on QEMU `-smp 4`: all 4 CPUs online, BSP preempt self-test PASS
+  (107M hog ticks).  Pitfalls codified: (1) `percpu_init_bsp` must
+  NOT zero existing slot state — `task_init` runs earlier and has
+  already stamped the BSP's `current` pointer; wiping it leaves the
+  scheduler with prev=NULL and dead-silent boots.  (2) AP trampoline
+  has to be assembled as `-f bin` with `org 0x8000` so labels
+  resolve at the physical run address; ELF + an org directive
+  doesn't help because the trampoline lives at 0x8000 at run time
+  but at a different offset in the kernel image.  (3) The
+  `objcopy --input-target=binary` symbol names embed the input path
+  (slashes → underscores), so the Makefile must NOT `cd` into the
+  source directory before invoking objcopy or the C-side extern
+  symbol names won't match.  Out of scope (M18 follow-ups): cross-
+  CPU preemption IRQ (LAPIC timer per-CPU or BSP-broadcast IPI),
+  per-CPU runqueues + load balancer, per-CPU `preempt_count`, task
+  affinity / pinning, `vmm.c` HAL wrap-up.
 - **2026-06-27 — M17: HAL portability cut.**  Introduced
   `kernel/includes/hal_api.h` — the arch-independent interface that
   `kernel/core/`, `kernel/mem/`, and `kernel/fs/` reach for CPU

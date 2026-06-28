@@ -40,7 +40,9 @@
 | §M19 | Memory at scale (slab, huge pages) | 804 |
 | §M20 | x64 (long mode) port | 836 |
 | §M21 | ARM (aarch64) port | 867 |
-| §M22 | GUI infrastructure | 894 |
+| §M22 | GUI infrastructure (+ Wayland reuse if viable) | 894 |
+| §M23 | Audio subsystem | ~1040 |
+| §M24 | Network stack (Ethernet → TCP/IP → sockets) | ~1080 |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -147,11 +149,13 @@ what); a session can pick a theme and push on it.
 | M15 | USB host stack + USB HID keyboard              | Input            | ✅ DOCS §4.X |
 | M16 | Keyboard layout abstraction (US, HU, DE, …)     | Input            | ✅ DOCS §4.X |
 | M17 | Portability cut — extract `hal_api.h`           | Architecture     | ✅ DOCS §4.X (partial — see notes) |
-| M18 | SMP support — APIC, AP boot, per-CPU, locking   | Concurrency      | §M18    |
+| M18 | SMP support — APIC, AP boot, per-CPU, locking   | Concurrency      | ✅ DOCS §4.X |
 | M19 | Memory at scale — slab, huge pages, near-NUMA   | Memory           | §M19    |
 | M20 | x64 (long mode) port                            | Architecture     | §M20    |
 | M21 | ARM (aarch64 generic / RPi) port                | Architecture     | §M21    |
-| M22 | GUI infrastructure — compositor + windows       | UX               | §M22    |
+| M22 | GUI infrastructure (+ Wayland reuse if viable)  | UX               | §M22    |
+| M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
+| M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
 
 ### Cross-cutting constraints
 
@@ -867,33 +871,58 @@ arch-independent interface) and the 2026-06-27 change-log entry.
 
 ---
 
-## §M18 — SMP support (APIC, AP boot, per-CPU, locking)
+## §M18 — SMP support — **shipped (BSP+APs online, full parallel exec deferred)**
 
-**Why now:** the moment a single CPU isn't enough — for d-os that's
-"as soon as we want responsiveness under load".  Should land before
-§M19 (memory at scale) so the slab allocator can use proper per-CPU
-caches from day one.
+Shipped 2026-06-28.  See DOCS.md §4.X (SMP) and the 2026-06-28
+change-log entry.  Single-CPU UP became a multiprocessor: ACPI MADT
+parsed, LAPIC + IOAPIC up, 8259 disabled, real cmpxchg-spinlocks,
+per-CPU `current` task + percpu table, AP bring-up via INIT+SIPI+SIPI,
+all 4 cores online on `-smp 4`.  `lscpu` lists them.
 
-**Design.**
+**Lessons learned:**
 
-- **APIC discovery:** parse ACPI MADT for the local APIC + IOAPIC
-  topology and the list of present CPUs.
-- **Local APIC programming:** replace 8259 PIC with LAPIC + IOAPIC
-  for IRQ routing.  Mostly mechanical; the IRQ install API stays.
-- **AP bring-up:** SIPI sequence to start each application processor
-  in 16-bit real mode, transition through pmode → long mode, jump to
-  a per-CPU init routine.
-- **Per-CPU data:** every CPU has its own page mapped via `gs:`-
-  segment on x86 (or `tpidr_el1` on ARM).  `this_cpu()` returns the
-  index.  Per-CPU runqueue + per-CPU current-task pointer.
-- **Locking:** `spinlock` becomes a real test-and-set with backoff;
-  `mutex` adds proper sleep/wake.
+- *AP trampoline must be flat-binary.*  ELF + `org` doesn't get you
+  position-resolved labels at the physical address you copy the
+  blob to.  Assemble with `nasm -f bin` and link via
+  `objcopy --input-target=binary`.  The symbol names embed the
+  input path verbatim (`/` → `_`), so don't `cd` before `objcopy`
+  or the extern symbol names on the C side won't match.
+- *`percpu_init_bsp` must NOT zero existing slot state.*  task_init
+  runs earlier in boot and stamps slot 0's `current` with pid 0;
+  blindly memsetting the slot to zero leaves the scheduler with
+  prev=NULL.  The system silently never preempts.
+- *Lock-handoff for brand-new tasks.*  A scheduler that holds a
+  runqueue lock across `context_switch` deadlocks if the new task
+  is brand-new (no schedule frame on its stack to release the lock
+  on the way out).  Solution: the arch trampoline calls
+  `task_finish_first_switch` (which drops the lock) before sti'ing.
 
-**Definition of done:**
-- `cat /proc/cpuinfo` lists every present core.
-- Two CPU-bound tasks pinned to different cores actually run in
-  parallel (verifiable by uptime ratio).
-- All earlier shell commands still work.
+**Definition of done (status):**
+- ✅ ACPI MADT parsed, `lscpu` lists every present core with online state.
+- ✅ All ACPI-listed APs reach online state on `-smp N`.
+- ⚠ "Two CPU-bound tasks pinned to different cores actually run in
+   parallel" — APs DO boot and idle, but per-CPU scheduler hooks for
+   cross-CPU preemption + task pinning are M18.5 work (see follow-ups).
+
+**Deferred follow-ups (M18.5):**
+
+- *Cross-CPU preemption IRQ source.*  APs currently have no
+  scheduler IRQ (PIT delivers only to BSP via the IOAPIC).  Two
+  paths: (a) LAPIC timer per-CPU (most scalable; one-shot or
+  periodic mode), (b) BSP-driven IPI broadcast every quantum.  (a)
+  is the long-term answer; (b) ships in one afternoon.
+- *Per-CPU runqueue + load balancer.*  Today's global runqueue +
+  `task_running_elsewhere` walk is O(ncpus) per pick; per-CPU rqs
+  + a periodic balancer eliminate cross-CPU lock pressure.  Land
+  with §M19 (slab allocator) since both benefit from the same
+  per-CPU machinery.
+- *Per-CPU `preempt_count`.*  Today's plain global is wrong on SMP
+  the moment more than one CPU wants to ban preemption locally.
+- *Task affinity / `taskset`.*  Needed for the canonical "pin two
+  CPU-bound tasks, observe parallel speedup" demo.
+- *MSI/MSI-X.*  IOAPIC routing is enough for legacy IRQs; modern
+  PCIe devices want MSI / MSI-X to deliver directly to a chosen
+  CPU's LAPIC vector.  Needed for high-bandwidth I/O.
 
 ---
 
@@ -1007,6 +1036,33 @@ display server.
    compositor to draw, similar to Wayland's design (Linux divergence:
    we'd skip X11's complexity entirely).
 
+**Wayland reuse — investigate, adopt if it doesn't pull focus.**
+
+A custom protocol is straightforward, but Wayland's wire format is
+small, well-documented, and has a mature client ecosystem (GTK,
+weston-utils, Qt, Firefox).  Spend an explicit sub-phase at the
+START of M22 evaluating:
+
+- *Surface of wayland-protocols we'd actually need:* wl_compositor,
+  wl_shm, xdg_shell, wl_seat (keyboard + pointer).  That's a small
+  subset; we don't need the colour-management / DMA-BUF / explicit
+  sync extensions.
+- *Implementation cost vs. custom protocol:* libwayland-server is
+  ~3 KLOC of C; reimplementing the marshalling is the bulk.  Could
+  port libwayland-server itself (it's clean C, no Linux-specific
+  syscalls beyond epoll which we can shim) or write a minimal subset
+  in-tree.
+- *Client testing path:* one upstream `weston-terminal` running
+  unchanged against our compositor is a much sharper DOD than any
+  in-tree window.
+
+**Decision rule:** if the evaluation shows we can ship a minimal
+Wayland-compatible compositor in roughly the same effort as the
+custom protocol (estimate ≤ 50% overhead), do Wayland.  If it
+balloons, ship a custom protocol that uses the same shapes
+(surface + buffer + commit) so a Wayland port stays achievable
+later.  In either case, document the call in the M22 change-log.
+
 **Pre-requisites.**
 
 - USB or PS/2 mouse driver.
@@ -1020,6 +1076,83 @@ display server.
 - Mouse moves a cursor, clicks focus windows.
 - Drag-resize works.
 - DOCS.md gains a "GUI" chapter.
+- Wayland evaluation outcome recorded.
+
+---
+
+## §M23 — Audio subsystem
+
+**Why now:** after GUI infrastructure (M22), sound is the natural
+follow-up for "the OS feels alive."  Decoupled enough from the rest
+that it can also land earlier if a driver project pulls it in.
+
+**Design — staged.**
+
+1. **Audio core (`kernel/audio/`)** — `struct audio_dev` registry
+   shaped like `block_device`: device name, rate caps, format caps,
+   start/stop/write callbacks.  One opaque PCM buffer interface.
+2. **First HC driver:** pick by emulator availability:
+   - **AC97** (QEMU `-device AC97`) — simplest, well-documented,
+     16-bit stereo at 48 kHz.  Recommended first cut.
+   - **Intel HDA** (QEMU `-device intel-hda -device hda-output`) —
+     modern but heavier (codec discovery, stream descriptors); right
+     long-term choice.
+   - **Virtio-sound** — pretty, but not on every emulator.
+3. **`/dev/dsp`-style char device** for raw PCM writes; mixer
+   abstraction (volume per stream) deferred to a follow-up.
+4. **WAV player shell command** (`play <path>`) as the smoke test.
+
+**Definition of done:**
+- `play /test.wav` produces audible PCM on QEMU's audio backend.
+- `lsaudio` lists registered audio devices.
+- DOCS.md gains a "Audio" chapter.
+
+**Out of scope:** mixer / multiple streams / resampling, MIDI,
+synthesis, surround, ALSA-compat layer.
+
+---
+
+## §M24 — Network stack (NIC → TCP/IP → sockets)
+
+**Why now:** after SMP and (probably) the x64 port, when the kernel
+can usefully share state across cores and a real network workload
+has the headroom to make sense.
+
+**Design — staged subsystems, each with its own sub-milestone:**
+
+1. **NIC driver** — first cut: virtio-net (QEMU's standard) for the
+   same reasons virtio-blk was first for storage: simple ring-based
+   interface, well-documented, deterministic.  Eventual second
+   driver: Intel e1000 / e1000e for real hardware.
+2. **`struct net_device` registry** mirroring `block_device` — name,
+   MAC, MTU, send/recv callbacks, statistics.
+3. **Link layer:** Ethernet frame parse/build, ARP cache.
+4. **Network layer:** IPv4 routing table + ICMP echo; IPv6 deferred
+   to a follow-up milestone.
+5. **Transport layer:** UDP first (stateless, easy), then TCP
+   (sliding window, retransmit, congestion control — the bulk of
+   the work).
+6. **Socket API** in the kernel: `sys_socket / bind / connect /
+   send / recv / close`.  Linux-shaped.
+7. **DHCP client + DNS resolver** as user-mode tools once the socket
+   API is up.
+
+**Definition of done (staged):**
+- §M24.1 — `lsnic` shows the virtio-net device; `ping <host>`
+  works from the shell (uses raw socket internally).
+- §M24.2 — `nc -u <host> <port>` (UDP) works.
+- §M24.3 — `wget http://host/path` returns a response over TCP.
+
+**Out of scope of this milestone (later work):**
+- IPv6, multicast, IPsec.
+- Bridge / VLAN / bonding device classes.
+- Performance: zero-copy RX, GRO/GSO.
+- Firewall / netfilter framework.
+
+**Linux divergence:** we won't ship the full `iproute2` toolchain.
+Configuration via `setconf net.eth0.ip4 = ...` + `/proc/net/*`-style
+diagnostic files is enough; netlink/socket-config protocols are out
+of scope.
 
 ---
 

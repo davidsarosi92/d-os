@@ -73,6 +73,11 @@
 /* ------------------------------------------------------------------------- */
 static uint32_t kernel_pd[1024] __attribute__((aligned(4096)));
 
+/* Phys address of the page directory — needed by the AP boot trampoline
+ * (M18) so each AP can load CR3 before enabling paging.  The kernel is
+ * identity-mapped, so virt = phys for the array itself. */
+uint32_t vmm_kernel_pd_phys(void) { return (uint32_t)(uintptr_t)&kernel_pd[0]; }
+
 /* ------------------------------------------------------------------------- */
 /* Low-level helpers — tiny inline asm wrappers to read/write CRx and
  * invalidate a single TLB entry.  Keeping them `static inline` lets the

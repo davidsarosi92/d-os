@@ -50,6 +50,13 @@ extern void task_exit(void) __attribute__((noreturn));
  * was sitting in ebx, sti to permit preemption, and call entry().
  * --------------------------------------------------------------------------- */
 static void task_trampoline(void) {
+    /* Lock-handoff finish (M18).  The schedule() that switched into
+     * us acquired the runqueue lock and disabled IRQs; an established
+     * task release-pairs that on its own schedule()'s exit, but we've
+     * never been through schedule() before, so we have to perform
+     * the matching unlock + sti by hand. */
+    task_finish_first_switch();
+
     /* New tasks always start with interrupts enabled — without this
      * `sti` the timer would never fire on us, and a never-yielding
      * entry would soft-lock the system. */

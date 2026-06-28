@@ -39,6 +39,11 @@
 #include "acpi.h"
 #include "hal_api.h"
 #include "multiboot.h"
+#include "lapic.h"
+#include "ioapic.h"
+#include "idt.h"
+#include "percpu.h"
+#include "smp.h"
 #include "pmm.h"
 #include "vmm.h"
 #include "kmalloc.h"
@@ -131,8 +136,34 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
      * something to schedule against. */
     task_init();
 
-    /* ACPI discovery — enables soft-off via `shutdown`. */
+    /* ACPI discovery — enables soft-off via `shutdown`, and on the
+     * same pass enumerates LAPIC + IOAPIC topology for SMP (M18). */
     acpi_init();
+
+    /* APIC bring-up (M18).  If ACPI gave us a MADT with a LAPIC + at
+     * least one IOAPIC, switch IRQ routing from the 8259 to APIC.
+     * `idt_use_apic` re-routes the already-installed PIT (IRQ0) and
+     * PS/2 keyboard (IRQ1) handlers and masks both 8259s. */
+    if (acpi_lapic_phys() && acpi_ioapic_phys() && acpi_ncpus() > 0) {
+        lapic_init_bsp(acpi_lapic_phys());
+        ioapic_init(acpi_ioapic_phys(), acpi_ioapic_gsi_base());
+        idt_use_apic(lapic_id());
+        /* Per-CPU table init must come AFTER LAPIC bring-up: it reads
+         * this_cpu's LAPIC ID to pin the BSP at the right slot. */
+        percpu_init_bsp();
+    } else {
+        kprintf("apic: not available, staying on 8259\n");
+    }
+
+    /* SMP application-processor bring-up — INIT + SIPI + SIPI sequence
+     * per Intel SDM Vol 3 §8.4.  No-op on UP (smp_ncpus() == 1).  IRQs
+     * must be enabled for timer_msleep to work (the SIPI sequence
+     * needs ~11 ms of waits), so we enable here and the preempt
+     * self-test below can rely on them already being on. */
+    if (smp_ncpus() > 1) {
+        hal_intr_enable();
+        smp_boot_aps();
+    }
 
     /* Two-level paging path round-trip. */
     {
