@@ -80,13 +80,23 @@ else ifeq ($(ARCH),x86_64)
   LIBGCC  := $(shell $(CC) -m64 -print-libgcc-file-name)
   QEMU    := qemu-system-x86_64
 
-  # x86_64 HAL implementation.  Bare-bones for Phase 1 of M20: just
-  # boot.s to validate the multiboot2 / long-mode entry path.  Phases
-  # 3-6 will land gdt.c, idt.c, vmm.c, etc.
-  ARCH_C_SRCS :=
+  # x86_64 HAL implementation.  Phase 3 of M20 adds the GDT/IDT/TSS
+  # + context-switch + isr stubs needed for kernel_main to link (the
+  # final wiring happens in Phase 5 once vmm.c is ported).  SMP-side
+  # files (lapic, ioapic, smp, ap_trampoline) come in a later phase /
+  # M20.5 milestone; UP boot is the M20 DoD.
+  ARCH_C_SRCS := \
+      kernel/hal/x86_64/io.c \
+      kernel/hal/x86_64/hal_arch.c \
+      kernel/hal/x86_64/gdt.c \
+      kernel/hal/x86_64/idt.c \
+      kernel/hal/x86_64/tss.c \
+      kernel/hal/x86_64/task_arch.c
 
   ARCH_ASM_SRCS := \
-      kernel/hal/x86_64/boot.s
+      kernel/hal/x86_64/boot.s \
+      kernel/hal/x86_64/isr_stubs.s \
+      kernel/hal/x86_64/switch.s
 
   ARCH_EXTRA_OBJS :=
 

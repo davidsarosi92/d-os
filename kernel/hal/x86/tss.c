@@ -63,9 +63,9 @@ void tss_init(void) {
     tss.iomap_base = sizeof(tss);
 }
 
-void tss_set_kernel_stack(uint32_t esp) {
-    tss.esp0 = esp;
+void tss_set_kernel_stack(uintptr_t esp) {
+    tss.esp0 = (uint32_t)esp;
 }
 
-uint32_t tss_get_addr(void)  { return (uint32_t)(uintptr_t)&tss; }
-uint32_t tss_get_limit(void) { return sizeof(tss) - 1; }
+uintptr_t tss_get_addr(void)  { return (uintptr_t)&tss; }
+uint32_t  tss_get_limit(void) { return sizeof(tss) - 1; }

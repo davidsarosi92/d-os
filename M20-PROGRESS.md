@@ -34,7 +34,7 @@ unchanged through every phase.
 |---|---|---|---|
 | 1 | Build infra: Makefile ARCH switch, linker-x86_64.ld, grub.cfg, empty hal/x86_64 skeleton that produces a valid (halting) multiboot2 ELF64 | ✅ shipped | (this commit) |
 | 2 | boot.s: multiboot2 header + 32→64 long-mode entry + early serial "hello" print + halt | ✅ shipped | (this commit) |
-| 3 | hal/x86_64 stubs: hal_arch.c, gdt.c, idt.c, tss.c, task_arch.c, switch.s, isr_stubs.s, usermode.s (compile-only) | 🔲 pending |  |
+| 3 | hal/x86_64 stubs: hal_arch.c, gdt.c, idt.c, tss.c, task_arch.c, switch.s, isr_stubs.s (compile-only; usermode.s deferred to M20.5) | ✅ shipped | (this commit) |
 | 4 | hal/x86_64/vmm.c (4-level paging behind vmm.h API), widen vmm.h to uintptr_t | 🔲 pending |  |
 | 5 | Full kernel_main link + boot; fix driver compile issues on 64-bit | 🔲 pending |  |
 | 6 | IDT + PIT IRQ + scheduler + shell prompt up | 🔲 pending |  |
@@ -129,6 +129,32 @@ qemu-system-x86_64 -smp 4 ...
   per-arch build tree.  See Makefile rule for
   `ap_trampoline_blob.o`.
 
+**Phase 3:**
+- `idt.h`'s `struct int_frame` is necessarily arch-specific (different
+  push count, different register names, different segment-save
+  semantics).  Solution: `#if defined(__x86_64__)` conditional inside
+  the header, with both layouts having the same int_no + err_code
+  field names so portable handlers (pit_irq, keyboard_irq) compile
+  for both archs.  Register-set fields (eax vs rax) only get touched
+  in arch-specific code (syscall.c — and even there only for i386
+  until M20.5 lands SYSCALL/SYSRET on x86_64).
+- `tss.h` API widened to `uintptr_t` for the pointer-shaped values
+  (tss_set_kernel_stack, tss_get_addr) so the same signature works
+  on both 32- and 64-bit kernels.  No external callers needed
+  changes since uintptr_t == uint32_t on i386.
+- The x86_64 TSS descriptor is **16 bytes** (2 GDT slots) because it
+  holds a 64-bit base — see kernel/hal/x86_64/gdt.c set_tss_entry.
+  Skipping the high half writes garbage into the next slot, which
+  the CPU sees as a malformed system descriptor and #GPs on `ltr`.
+- Long-mode interrupt entry always pushes 5 quadwords (ss, rsp,
+  rflags, cs, rip) — no "only on privilege change" asymmetry like
+  i386.  Our isr_stubs.s relies on that uniform shape to compute
+  16-byte stack alignment before `call isr_handler`.
+- `Makefile` has no header dependencies, so changing a .h does NOT
+  trigger a .c rebuild.  Run `make clean ARCH=<arch>` after editing
+  shared headers.  Quality-of-life fix (auto-generated .d files via
+  `gcc -MMD`) deferred to a post-M20 polish commit.
+
 **Phase 2:**
 - The Intel-prescribed long-mode entry sequence (Vol 3A §9.8.5) is
   PAE → CR3 → EFER.LME → CR0.PG → far-jmp.  Skipping the far-jmp
@@ -157,49 +183,37 @@ qemu-system-x86_64 -smp 4 ...
 
 ## Next concrete action
 
-Phase 3.  Create the per-arch HAL files under `kernel/hal/x86_64/`.
-The goal is to mirror everything in `kernel/hal/x86/` so kernel_main
-will link cleanly once Phase 5 lands.  Files to author (all
-compile-only at the end of Phase 3 — no link target yet):
+Phase 4.  Port the VMM (virtual memory manager) for x86_64 4-level
+paging.  Concrete tasks:
 
-1. `hal_arch.c` — implements all of `hal_api.h`.  Most of it is
-   line-for-line ports of i386 with 64-bit register names
-   (pushfq/popq, rflags vs eflags).
-2. `io.c` — copy of i386 io.c; `inb`/`outb` opcodes are identical
-   in 64-bit mode, just with REX.W when accessing 64-bit regs (we
-   don't).
-3. `gdt.c` — 64-bit GDT.  Differences from i386:
-   - Code segment uses L=1 (long mode bit, D must be 0).
-   - Ring-3 code/data + TSS descriptor (TSS desc is 16 bytes in
-     long mode, not 8).
-   - No per-segment base/limit handling — long mode ignores them
-     except for fs/gs base which we'll set via MSRs in a later
-     milestone.
-4. `tss.c` — 64-bit TSS: very different layout.  No ESP1/SS1/...
-   stack arrays; instead RSP0/RSP1/RSP2 (8 bytes each) + 7 IST
-   stacks.  Total size is 104 bytes (vs i386's 104 too,
-   coincidentally — but the field layout is different).
-5. `idt.c` — 64-bit IDT.  Each gate is 16 bytes (was 8 on i386):
-   offset is now 64 bits split across three fields, and there's a
-   new IST selector (3 bits) that lets the CPU switch to one of
-   TSS.IST[1..7] on entry.
-6. `isr_stubs.s` — 64-bit ISRs.  push all 16 GPRs (rax..r15), no
-   segment register saving (segments are largely ignored in long
-   mode), iretq instead of iret.  The C handler signature widens
-   to take a 64-bit context struct.
-7. `switch.s` — `context_switch(uint64_t* save_rsp_to, uint64_t
-   new_rsp)`.  System V x86_64 ABI: callee-saved are rbx, rbp,
-   r12-r15.  Args come in rdi/rsi (not the stack).
-8. `usermode.s` — `enter_user_mode_wrap`: iretq instead of iret,
-   pushes rsp/rflags/cs/rip + ss (note: 8-byte each, total 40
-   bytes pushed).
-9. `task_arch.c` — `hal_task_init_stack` builds the initial 64-bit
-   frame layout that matches switch.s's pop order.
+1. Widen `kernel/includes/vmm.h` API to `uintptr_t` for virt/phys/
+   return types (vmm_map / vmm_map_4mib / vmm_unmap / vmm_translate /
+   vmm_kernel_pd_phys).  i386 build sees `uintptr_t == uint32_t` so
+   no caller changes are needed.  x86_64 callers can pass full
+   64-bit addresses.
 
-DoD for Phase 3: `make ARCH=x86_64` compiles each new .c/.s into a
-.o file (we can list them in the Makefile and run `make` even
-without a link target — `make build/x86_64/obj/.../foo.o` proves
-each file is self-consistent).  Nothing actually runs yet.
+2. Move `kernel/mem/vmm.c` → `kernel/hal/x86/vmm.c` (it's 32-bit
+   specific; the move reflects that).  Update i386 Makefile source
+   list.
+
+3. Write `kernel/hal/x86_64/vmm.c` implementing the same vmm.h API
+   atop 4-level paging (PML4 → PDPT → PD → PT).  Reuse the
+   identity-mapping convention from i386: vmm_init promises that
+   addresses below some limit (1 GiB suffices for now — that's
+   what boot.s set up) are 1:1 mapped after init.
+   - vmm_map: walk PML4[idx]→PDPT[idx]→PD[idx]→PT[idx], allocating
+     intermediate tables from pmm_alloc_frame on demand.
+   - vmm_map_4mib: actually 2 MiB granularity on x86_64 (matches the
+     2 MiB pages we already use in boot.s).  Renamed semantically
+     but keeps the name for API stability.
+   - vmm_unmap, vmm_translate: walk and clear/return.
+   - vmm_kernel_pd_phys: returns PML4 phys for AP trampoline reuse.
+
+4. Test: `make ARCH=x86_64` still builds all HAL .o's (and now adds
+   vmm.o).  Link still fails — Phase 5 closes that.
+
+DoD for Phase 4: vmm.h API widened to uintptr_t (i386 baseline still
+builds + boots), kernel/hal/x86_64/vmm.c compiles cleanly.
 
 ---
 
