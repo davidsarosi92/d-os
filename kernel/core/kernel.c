@@ -179,7 +179,15 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
         }
     }
 
-    /* Heap alloc / free / reuse round-trip. */
+    /* Heap alloc / free / reuse round-trip + microbench (M19).
+     *
+     * The reuse check is the M1-era smoke test: alloc → free → re-alloc
+     * the same size should hand back the same address (slab pops the
+     * just-freed slot off the magazine LIFO).
+     *
+     * The microbench does N small allocs + frees and reports wall time
+     * + per-op timing.  Sets a baseline so future allocator changes
+     * can be compared.  N is bounded to keep boot fast (~few ms). */
     {
         void* a = kmalloc(64);
         void* b = kmalloc(128);
@@ -189,6 +197,16 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
                 a, b, c, (a == c) ? "yes" : "no");
         kfree(b);
         kfree(c);
+
+        const int N = 10000;
+        uint64_t t0 = timer_ticks_ms();
+        for (int i = 0; i < N; i++) {
+            void* p = kmalloc(64);
+            kfree(p);
+        }
+        uint64_t t1 = timer_ticks_ms();
+        kprintf("kmalloc microbench: %d × {alloc(64)+free} in %u ms\n",
+                N, (unsigned)(t1 - t0));
     }
 
     /* exFAT round-trip self-test.

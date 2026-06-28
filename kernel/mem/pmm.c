@@ -1,106 +1,235 @@
 /* =============================================================================
- * pmm.c — bitmap-based Physical Memory Manager.
+ * pmm.c — zoned buddy physical-memory allocator (M19).
  *
- * The allocator is deliberately simple: one bit per 4 KiB frame in a
- * statically-allocated bitmap that covers the full 32-bit address space
- * (1 Mi frames → 128 KiB of bitmap in .bss).  Sizing it for the whole
- * address space means we never need to reason about "managed range" vs
- * "bitmap range" at lookup time; any frame index between 0 and 2^20-1 is
- * addressable.
+ * Replaces the M1 bitmap PMM.  The public API (`pmm_alloc_frame`,
+ * `pmm_alloc_contiguous`, `pmm_free_frame`, the stats getters) is
+ * unchanged so existing drivers keep working.  Internally everything
+ * is now a buddy allocator over per-zone free lists.
  *
- * Bitmap convention: bit = 1 means the frame is in use (or doesn't exist
- * as usable memory), bit = 0 means the frame is free.  We start with
- * every bit set to 1, then walk the multiboot memory map clearing bits
- * for frames inside AVAILABLE regions.  Finally we re-mark a few
- * protected ranges: frame 0 (NULL safety), everything below 1 MiB (BIOS,
- * VGA, EBDA, option ROMs), the kernel image [kernel_start, kernel_end),
- * and a generous region around the multiboot info structure itself.
+ * ---------------------------------------------------------------------
+ * Data layout
+ * ---------------------------------------------------------------------
  *
- * Allocation is a linear scan for the first 0 bit; freeing is a direct
- * bit clear.  This is O(N/32) worst case on allocation but in practice
- * the pointer walks very quickly because most of the bitmap is set.
- * A "next free hint" can shave average-case time later if it matters.
+ * One byte of state per physical frame in `page_state[]`:
+ *
+ *   0xFF      — frame doesn't exist (BIOS-reserved, beyond memory,
+ *               or in a region we've explicitly carved out)
+ *   0xFE      — frame allocated (head or interior of any block)
+ *   0..MAX    — head of a FREE buddy block of order = page_state[pfn].
+ *               Only the head carries this; interior frames keep 0xFE
+ *               on alloc and revert to 0xFE-with-list-presence on
+ *               free (intermediate states are hidden inside locked
+ *               critical sections).
+ *
+ * Each zone owns `BUDDY_MAX_ORDER + 1` singly-linked free lists.  The
+ * link is stored INSIDE the free page itself — the first 4 bytes of
+ * a free block hold the physical address of the next free block at
+ * the same order (or 0 for end-of-list).  This is the textbook
+ * "freelist threaded through free pages" trick and costs no extra
+ * metadata.
+ *
+ * Buddy address: for a block at `pfn` of order `O`, the buddy is at
+ *   pfn XOR (1 << O)
+ * The buddy address is valid as long as the block is properly aligned
+ * to its size (which we enforce by always splitting from the head down).
+ *
+ * ---------------------------------------------------------------------
+ * Zone layout
+ * ---------------------------------------------------------------------
+ *
+ *   ZONE_DMA    : pfn  [0,    4096)  — first 16 MiB; legacy ISA + small DMA
+ *   ZONE_NORMAL : pfn  [4096, ...)   — bulk of RAM up to BUDDY_MAX_FRAMES
+ *   ZONE_HIGHMEM:                    — slot reserved; not populated
+ *
+ * Boundary handling: during init we never emit a free block that
+ * straddles a zone boundary, and during coalesce we refuse to merge
+ * across one — the buddy address is rejected if it sits in a
+ * different zone.
+ *
+ * ---------------------------------------------------------------------
+ * Concurrency
+ * ---------------------------------------------------------------------
+ *
+ * Each zone has its own spinlock (M18 cmpxchg).  All alloc/free calls
+ * are IRQ-safe (spin_lock_irqsave).  Per-zone locks let the BSP and an
+ * AP allocate at the same time as long as they hit different zones —
+ * the common ZONE_NORMAL case still serializes, but that's a
+ * single-line fix later if it shows up in profiles (per-CPU magazines
+ * are the bigger win and live in the slab layer).
  * ============================================================================= */
 
 #include "pmm.h"
+#include "lock.h"
 #include "multiboot.h"
 #include "printf.h"
 #include <stdint.h>
 
 /* -------------------------------------------------------------------------- */
-/* Sizing.                                                                    */
+/* Sizing and helpers.                                                        */
 /* -------------------------------------------------------------------------- */
 
-#define MAX_FRAMES   (1u << 20)                     /* 4 GiB / 4 KiB */
-#define WORD_BITS    32
-#define BITMAP_WORDS (MAX_FRAMES / WORD_BITS)       /* 32768 words = 128 KiB */
+/* `0xFF` = doesn't exist; `0xFE` = allocated / interior; <=BUDDY_MAX_ORDER = */
+/* head of free block at that order.  See file header.                       */
+#define PS_NONE     0xFFu
+#define PS_USED     0xFEu
 
-/* The bitmap lives in .bss so no disk footprint; zeroed by the loader. */
-static uint32_t bitmap[BITMAP_WORDS];
+static uint8_t page_state[BUDDY_MAX_FRAMES];
 
-/* Counters.  `managed` is bumped every time we first mark a frame free
- * during init; `free` moves up and down with free / alloc operations.
- * `used = managed - free` is computed on demand. */
-static uint32_t managed_frames = 0;
-static uint32_t free_frames_cnt = 0;
+#define ZONE_DMA_FRAME_LIMIT  4096u         /* 16 MiB / 4 KiB */
+
+struct zone {
+    const char* name;
+    uint32_t    start_pfn;          /* inclusive */
+    uint32_t    end_pfn;            /* exclusive */
+    uint32_t    managed;            /* total frames ever marked free here */
+    uint32_t    free_frames;        /* dynamic count */
+    uint32_t    free_lists[BUDDY_MAX_ORDER + 1];  /* head = first free pfn at order, 0 = empty */
+    uint32_t    nr_at_order[BUDDY_MAX_ORDER + 1]; /* diagnostic */
+    spinlock_t  lock;
+};
+
+static struct zone zones[NR_ZONES];
 
 /* Symbols from linker.ld marking the kernel image bounds. */
 extern uint8_t kernel_start[];
 extern uint8_t kernel_end[];
 
 /* -------------------------------------------------------------------------- */
-/* Bit helpers.  Inlined by the compiler in non-debug builds.                 */
+/* Tiny helpers.                                                              */
 /* -------------------------------------------------------------------------- */
 
-static inline int bit_is_set(uint32_t idx) {
-    return (bitmap[idx / WORD_BITS] >> (idx % WORD_BITS)) & 1u;
+static inline uint32_t pfn_to_phys(uint32_t pfn) { return pfn << PMM_FRAME_SHIFT; }
+static inline uint32_t phys_to_pfn(uint32_t p)   { return p   >> PMM_FRAME_SHIFT; }
+
+/* Which zone owns this pfn?  Returns zone index, or -1 if out of range. */
+static int zone_of_pfn(uint32_t pfn) {
+    if (pfn >= BUDDY_MAX_FRAMES) return -1;
+    if (pfn <  ZONE_DMA_FRAME_LIMIT) return ZONE_DMA;
+    return ZONE_NORMAL;
 }
 
-static inline void bit_set(uint32_t idx) {
-    bitmap[idx / WORD_BITS] |= (1u << (idx % WORD_BITS));
+/* Ceiling log2: smallest k such that (1 << k) >= n.  0 → 0, 1 → 0,
+ * 2 → 1, 3 → 2, 4 → 2, ..., 17 → 5.  Used to translate the legacy
+ * N-frame contig API into an order. */
+static int ceil_log2(uint32_t n) {
+    if (n <= 1) return 0;
+    int k = 0;
+    uint32_t v = 1;
+    while (v < n) { v <<= 1; k++; }
+    return k;
 }
 
-static inline void bit_clear(uint32_t idx) {
-    bitmap[idx / WORD_BITS] &= ~(1u << (idx % WORD_BITS));
+/* -------------------------------------------------------------------------- */
+/* Intrusive free list — link stored in the page itself.                      */
+/*                                                                            */
+/* We trust that all our frames live in the kernel's 256 MiB identity         */
+/* map, so `phys` == kernel-accessible virtual.  When that stops being        */
+/* true (e.g. HIGHMEM lands) the link-store will need a kmap-style            */
+/* temporary mapping.                                                         */
+/* -------------------------------------------------------------------------- */
+
+static inline uint32_t link_load(uint32_t phys) {
+    return *(volatile uint32_t*)(uintptr_t)phys;
+}
+static inline void link_store(uint32_t phys, uint32_t next) {
+    *(volatile uint32_t*)(uintptr_t)phys = next;
 }
 
-/* Frame-level "mark free" / "mark used" with counter bookkeeping.  Never
- * double-counts: a mark-free on an already-free frame is a no-op, same
- * for mark-used on an already-used frame. */
-static void frame_mark_free(uint32_t idx) {
-    if (idx >= MAX_FRAMES) return;
-    if (bit_is_set(idx)) {
-        bit_clear(idx);
-        managed_frames++;
-        free_frames_cnt++;
+/* Push a free block of `order` onto a zone's free list.  Caller holds
+ * zone->lock.  Stamps the head pfn's state with the order so coalesce
+ * can recognize it as the same-order partner. */
+static void zone_push(struct zone* z, uint32_t pfn, int order) {
+    uint32_t phys = pfn_to_phys(pfn);
+    link_store(phys, z->free_lists[order]);
+    z->free_lists[order]   = phys;
+    z->nr_at_order[order] += 1;
+    page_state[pfn]        = (uint8_t)order;
+}
+
+/* Remove a specific (pfn, order) from the zone's free list.  O(list_len)
+ * walk; only invoked during coalesce, where the buddy we're trying to
+ * pull off is generally near the head.  Caller holds zone->lock. */
+static int zone_remove(struct zone* z, uint32_t pfn, int order) {
+    uint32_t target = pfn_to_phys(pfn);
+    uint32_t prev   = 0;
+    uint32_t cur    = z->free_lists[order];
+    while (cur) {
+        uint32_t next = link_load(cur);
+        if (cur == target) {
+            if (prev) link_store(prev, next);
+            else      z->free_lists[order] = next;
+            z->nr_at_order[order] -= 1;
+            return 0;
+        }
+        prev = cur;
+        cur  = next;
     }
+    return -1;
 }
 
-static void frame_mark_used(uint32_t idx) {
-    if (idx >= MAX_FRAMES) return;
-    if (!bit_is_set(idx)) {
-        bit_set(idx);
-        free_frames_cnt--;                          /* total managed stays the same */
-    }
+/* Pop the head of a zone's free list at `order`.  Returns pfn, or 0 if
+ * empty.  Caller holds zone->lock. */
+static uint32_t zone_pop(struct zone* z, int order) {
+    uint32_t head = z->free_lists[order];
+    if (!head) return 0;
+    z->free_lists[order] = link_load(head);
+    z->nr_at_order[order] -= 1;
+    return phys_to_pfn(head);
 }
 
-/* Mark every frame in a byte range as used.  `start` rounds down, `end`
- * rounds up — when in doubt we err on the side of wasting a frame rather
- * than handing one out that partially overlaps a protected region. */
-static void mark_range_used(uint32_t start, uint32_t end) {
+/* -------------------------------------------------------------------------- */
+/* Init helpers.                                                              */
+/* -------------------------------------------------------------------------- */
+
+/* Mark every frame in a byte range as allocated/non-existent so the
+ * subsequent buddy seeding skips them.  `start` rounds down, `end`
+ * rounds up — when in doubt we err on the side of NOT handing out a
+ * partially-protected frame. */
+static void carve_out_range(uint32_t start, uint32_t end) {
     uint32_t s = start / PMM_FRAME_SIZE;
     uint32_t e = (end + PMM_FRAME_SIZE - 1) / PMM_FRAME_SIZE;
-    for (uint32_t i = s; i < e; i++) frame_mark_used(i);
+    if (e > BUDDY_MAX_FRAMES) e = BUDDY_MAX_FRAMES;
+    for (uint32_t i = s; i < e; i++) page_state[i] = PS_NONE;
 }
+
+/* Mark a single frame as part of an AVAILABLE region — initially we
+ * tag it PS_USED (= "allocated") so seeding can later free it via
+ * the normal coalescing path.  This keeps the seed loop simple. */
+static void seed_mark_available(uint32_t pfn) {
+    if (pfn >= BUDDY_MAX_FRAMES) return;
+    /* Only flip if not already carved out. */
+    if (page_state[pfn] == PS_NONE) page_state[pfn] = PS_USED;
+}
+
+/* Free a single frame into its zone via the standard coalescing path.
+ * Used only by the post-init seeding loop. */
+static void buddy_release_one(uint32_t pfn);
 
 /* -------------------------------------------------------------------------- */
 /* Init.                                                                      */
 /* -------------------------------------------------------------------------- */
 
 void pmm_init(void) {
-    /* Everything starts "used" — we then clear bits for memory the BIOS
-     * told us is AVAILABLE. */
-    for (uint32_t i = 0; i < BITMAP_WORDS; i++) bitmap[i] = 0xFFFFFFFFu;
+    /* Set up zone descriptors. */
+    zones[ZONE_DMA].name        = "DMA";
+    zones[ZONE_DMA].start_pfn   = 0;
+    zones[ZONE_DMA].end_pfn     = ZONE_DMA_FRAME_LIMIT;
+    spin_lock_init(&zones[ZONE_DMA].lock);
+
+    zones[ZONE_NORMAL].name     = "NORMAL";
+    zones[ZONE_NORMAL].start_pfn = ZONE_DMA_FRAME_LIMIT;
+    zones[ZONE_NORMAL].end_pfn  = BUDDY_MAX_FRAMES;
+    spin_lock_init(&zones[ZONE_NORMAL].lock);
+
+    zones[ZONE_HIGHMEM].name    = "HIGHMEM";
+    spin_lock_init(&zones[ZONE_HIGHMEM].lock);
+    /* HIGHMEM stays empty — no frames mapped to it today. */
+
+    /* Initialize every frame as PS_NONE (doesn't exist).  The mmap walk
+     * flips bits to PS_USED for frames inside AVAILABLE regions, then
+     * the reservation pass carves out kernel image / low memory etc.
+     * Finally the seeding loop frees the remainder. */
+    for (uint32_t i = 0; i < BUDDY_MAX_FRAMES; i++) page_state[i] = PS_NONE;
 
     const struct mboot_info* mbi = mboot_get_info();
     if (!mbi || (mbi->flags & MBI_FLAG_MMAP) == 0 || mbi->mmap_length == 0) {
@@ -108,143 +237,252 @@ void pmm_init(void) {
         return;
     }
 
-    /* First pass: clear bits for every AVAILABLE frame. */
+    /* Pass 1: tag AVAILABLE frames as PS_USED.  Anything outside an
+     * AVAILABLE region stays PS_NONE. */
     uintptr_t p   = mbi->mmap_addr;
     uintptr_t end = mbi->mmap_addr + mbi->mmap_length;
-    int entry_budget = 64;                          /* defensive iteration cap */
+    int entry_budget = 64;
     while (p < end && entry_budget-- > 0) {
         const struct mboot_mmap_entry* e = (const struct mboot_mmap_entry*)p;
         if (e->type == MMAP_TYPE_AVAILABLE) {
             uint64_t base = e->base;
             uint64_t len  = e->length;
 
-            /* We're a 32-bit kernel — clamp anything above 4 GiB so our
-             * frame index stays within MAX_FRAMES. */
-            if (base >= 0x100000000ull) {
-                p += e->size + 4;
-                continue;
-            }
+            if (base >= 0x100000000ull) { p += e->size + 4; continue; }
             if (base + len > 0x100000000ull) len = 0x100000000ull - base;
 
-            /* Round base UP, end DOWN.  A partial frame that straddles
-             * an AVAILABLE boundary could cover non-memory; skipping it
-             * is safer than handing it out. */
             uint32_t first = (uint32_t)((base + PMM_FRAME_SIZE - 1) / PMM_FRAME_SIZE);
             uint32_t last  = (uint32_t)((base + len) / PMM_FRAME_SIZE);
-            for (uint32_t i = first; i < last; i++) frame_mark_free(i);
+            if (last > BUDDY_MAX_FRAMES) last = BUDDY_MAX_FRAMES;
+            for (uint32_t i = first; i < last; i++) seed_mark_available(i);
         }
         p += e->size + 4;
     }
 
-    /* Second pass: re-reserve regions that the mmap might have lumped
-     * into AVAILABLE but that we don't want the allocator touching. */
+    /* Pass 2: re-carve protected regions.  Each carve writes PS_NONE
+     * unconditionally so even AVAILABLE-marked frames inside the
+     * carve-out range disappear from the pool. */
 
-    /* (a) Frame 0.  Prevents an accidental NULL-looking allocation and
-     *     reserves the real-mode IVT / BDA area underneath. */
-    frame_mark_used(0);
+    /* (a) Frame 0 — NULL safety. */
+    page_state[0] = PS_NONE;
 
-    /* (b) Everything below 1 MiB.  Modern PCs treat low memory as a
-     *     minefield (VGA buffer at 0xA0000, BIOS shadow at 0xE0000,
-     *     legacy DMA buffers, ...).  Our kernel lives at 1 MiB anyway. */
-    mark_range_used(0, 0x100000);
+    /* (b) Everything below 1 MiB (BIOS / VGA / EBDA / option ROMs). */
+    carve_out_range(0, 0x100000);
 
-    /* (c) The kernel image.  Symbols come from linker.ld. */
-    mark_range_used((uint32_t)(uintptr_t)kernel_start,
+    /* (c) Kernel image bounds from linker.ld. */
+    carve_out_range((uint32_t)(uintptr_t)kernel_start,
                     (uint32_t)(uintptr_t)kernel_end);
 
-    /* (d) The multiboot info + its attached memory map.  The info
-     *     struct itself is small, but `mmap_addr` can sit outside the
-     *     struct, so reserve both separately. */
-    mark_range_used((uint32_t)(uintptr_t)mbi,
+    /* (d) Multiboot info + the attached memory map (lives outside
+     *     the kernel image, can land anywhere in low memory). */
+    carve_out_range((uint32_t)(uintptr_t)mbi,
                     (uint32_t)(uintptr_t)mbi + sizeof(struct mboot_info));
-    mark_range_used(mbi->mmap_addr, mbi->mmap_addr + mbi->mmap_length);
+    carve_out_range(mbi->mmap_addr, mbi->mmap_addr + mbi->mmap_length);
 
-    kprintf("pmm: %u frames managed, %u free (%u MiB total, %u MiB free)\n",
-            managed_frames, free_frames_cnt,
-            (managed_frames * 4) / 1024,
-            (free_frames_cnt * 4) / 1024);
-}
+    /* (e) AP trampoline destination + per-AP info (M18 puts these at
+     *     fixed low addresses).  Reserving a generous 16 KiB window
+     *     covers the trampoline (~256 bytes), the ap_info struct
+     *     (4 KiB later), and slop for future expansion. */
+    carve_out_range(0x8000, 0x8000 + 0x4000);
 
-/* -------------------------------------------------------------------------- */
-/* Alloc / free.                                                              */
-/* -------------------------------------------------------------------------- */
-
-uint32_t pmm_alloc_frame(void) {
-    if (free_frames_cnt == 0) return PMM_ALLOC_FAIL;
-
-    for (uint32_t w = 0; w < BITMAP_WORDS; w++) {
-        uint32_t word = bitmap[w];
-        if (word == 0xFFFFFFFFu) continue;          /* fully used — skip fast */
-
-        /* Find the lowest zero bit.  Could use __builtin_ctz on ~word for
-         * speed; a manual scan is fine for today's working set. */
-        for (int b = 0; b < WORD_BITS; b++) {
-            if ((word & (1u << b)) == 0) {
-                uint32_t idx = w * WORD_BITS + b;
-                bitmap[w] |= (1u << b);
-                free_frames_cnt--;
-                return idx * PMM_FRAME_SIZE;
-            }
+    /* Pass 3: seed the buddy free lists.  Walk every frame; for each
+     * frame still in PS_USED state (i.e. AVAILABLE and not reserved),
+     * release it as order-0.  The coalescing path in page_free will
+     * automatically build up higher-order blocks. */
+    uint32_t initially_free = 0;
+    for (uint32_t pfn = 0; pfn < BUDDY_MAX_FRAMES; pfn++) {
+        if (page_state[pfn] == PS_USED) {
+            int z = zone_of_pfn(pfn);
+            if (z >= 0) zones[z].managed++;
+            buddy_release_one(pfn);
+            initially_free++;
         }
     }
 
-    /* Reached if the free counter is stale — shouldn't happen, but fall
-     * through cleanly rather than loop. */
+    kprintf("pmm: buddy ready — DMA managed=%u free=%u, NORMAL managed=%u free=%u (%u MiB total free)\n",
+            zones[ZONE_DMA].managed, zones[ZONE_DMA].free_frames,
+            zones[ZONE_NORMAL].managed, zones[ZONE_NORMAL].free_frames,
+            (initially_free * 4) / 1024);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Buddy core: alloc / free / split / coalesce.                                */
+/* -------------------------------------------------------------------------- */
+
+/* Try to allocate from a specific zone at exact `order`.  Returns the
+ * pfn of the head, or 0 on failure.  Caller does NOT hold the lock —
+ * we acquire it here.  If the requested order is empty, we split a
+ * larger block: pop at the smallest non-empty order > requested, push
+ * the buddy halves down to the requested order. */
+static uint32_t buddy_alloc_in_zone(struct zone* z, int order) {
+    if (order < 0 || order > BUDDY_MAX_ORDER) return 0;
+
+    uint32_t fl = spin_lock_irqsave(&z->lock);
+
+    int o = order;
+    while (o <= BUDDY_MAX_ORDER && z->free_lists[o] == 0) o++;
+    if (o > BUDDY_MAX_ORDER) {
+        spin_unlock_irqrestore(&z->lock, fl);
+        return 0;
+    }
+
+    uint32_t pfn = zone_pop(z, o);
+
+    /* Split down: while we're bigger than requested, give the upper
+     * half back to a smaller-order free list. */
+    while (o > order) {
+        o--;
+        uint32_t buddy_pfn = pfn + (1u << o);
+        zone_push(z, buddy_pfn, o);
+    }
+
+    /* Mark the allocated head + interior as USED. */
+    uint32_t span = 1u << order;
+    for (uint32_t i = 0; i < span; i++) page_state[pfn + i] = PS_USED;
+    z->free_frames -= span;
+
+    spin_unlock_irqrestore(&z->lock, fl);
+    return pfn;
+}
+
+/* Free a block of `order` into the right zone, coalescing with the
+ * buddy if it's free at the same order, recursively up to MAX_ORDER. */
+static void buddy_free_in_zone(struct zone* z, uint32_t pfn, int order) {
+    if (order < 0 || order > BUDDY_MAX_ORDER) return;
+
+    uint32_t fl = spin_lock_irqsave(&z->lock);
+
+    uint32_t span = 1u << order;
+    z->free_frames += span;
+
+    while (order < BUDDY_MAX_ORDER) {
+        uint32_t buddy_pfn = pfn ^ (1u << order);
+
+        /* Buddy must exist and be in the SAME zone — never coalesce
+         * across DMA/NORMAL boundary. */
+        if (buddy_pfn >= BUDDY_MAX_FRAMES) break;
+        if (buddy_pfn <  z->start_pfn || buddy_pfn >= z->end_pfn) break;
+
+        /* Buddy must be free at the same order. */
+        if (page_state[buddy_pfn] != (uint8_t)order) break;
+
+        /* Remove buddy from the free list, merge, retry at order+1. */
+        if (zone_remove(z, buddy_pfn, order) != 0) break;
+        if (buddy_pfn < pfn) pfn = buddy_pfn;
+        order++;
+    }
+
+    zone_push(z, pfn, order);
+
+    spin_unlock_irqrestore(&z->lock, fl);
+    (void)span;
+}
+
+/* Init-time helper — same as buddy_free_in_zone but takes a pfn
+ * directly and infers the zone.  Used by the seeding loop. */
+static void buddy_release_one(uint32_t pfn) {
+    int zi = zone_of_pfn(pfn);
+    if (zi < 0) return;
+    /* Mark the frame USED so buddy_free has the right precondition,
+     * then release at order 0. */
+    page_state[pfn] = PS_USED;
+    buddy_free_in_zone(&zones[zi], pfn, 0);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Public API: order-aware page_alloc / page_free.                            */
+/* -------------------------------------------------------------------------- */
+
+uint32_t page_alloc(int order, int zone_hint) {
+    if (order < 0 || order > BUDDY_MAX_ORDER) return PMM_ALLOC_FAIL;
+
+    /* Try the hinted zone first, then fall back per Linux convention:
+     * NORMAL -> DMA on default; DMA-only on ZONE_DMA; NORMAL-only on
+     * ZONE_NORMAL.  Keeps drivers that need DMA-reachable memory
+     * from accidentally getting a NORMAL frame they can't address. */
+    int try_order[3] = { -1, -1, -1 };
+    int n = 0;
+
+    if (zone_hint == ZONE_DMA) {
+        try_order[n++] = ZONE_DMA;
+    } else if (zone_hint == ZONE_NORMAL) {
+        try_order[n++] = ZONE_NORMAL;
+    } else {
+        /* ZONE_DEFAULT or anything unrecognised. */
+        try_order[n++] = ZONE_NORMAL;
+        try_order[n++] = ZONE_DMA;
+    }
+
+    for (int i = 0; i < n; i++) {
+        uint32_t pfn = buddy_alloc_in_zone(&zones[try_order[i]], order);
+        if (pfn) return pfn_to_phys(pfn);
+    }
     return PMM_ALLOC_FAIL;
+}
+
+void page_free(uint32_t phys, int order) {
+    if (phys == 0) return;
+    if (phys & (PMM_FRAME_SIZE - 1)) return;   /* misaligned — caller bug */
+
+    uint32_t pfn = phys_to_pfn(phys);
+    int zi = zone_of_pfn(pfn);
+    if (zi < 0) return;
+
+    buddy_free_in_zone(&zones[zi], pfn, order);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Legacy API wrappers — keep call sites working unchanged.                   */
+/* -------------------------------------------------------------------------- */
+
+uint32_t pmm_alloc_frame(void) {
+    return page_alloc(0, ZONE_DEFAULT);
 }
 
 uint32_t pmm_alloc_contiguous(uint32_t n) {
     if (n == 0) return PMM_ALLOC_FAIL;
-    if (n == 1) return pmm_alloc_frame();
-    if (free_frames_cnt < n) return PMM_ALLOC_FAIL;
+    if (n == 1) return page_alloc(0, ZONE_DEFAULT);
 
-    /* Linear scan for n consecutive 0 bits.  Start at frame 256 (1 MiB)
-     * to skip low memory deliberately; below that lies BIOS + VGA we
-     * never want to hand out anyway. */
-    uint32_t run_start = 0;
-    uint32_t run_len   = 0;
-    for (uint32_t i = 256; i < MAX_FRAMES; i++) {
-        if (bit_is_set(i)) {
-            run_len = 0;
-            continue;
-        }
-        if (run_len == 0) run_start = i;
-        run_len++;
-        if (run_len == n) {
-            /* Claim them all. */
-            for (uint32_t j = 0; j < n; j++) {
-                bit_set(run_start + j);
-                free_frames_cnt--;
-            }
-            return run_start * PMM_FRAME_SIZE;
-        }
-    }
-    return PMM_ALLOC_FAIL;
+    int order = ceil_log2(n);
+    if (order > BUDDY_MAX_ORDER) return PMM_ALLOC_FAIL;
+    return page_alloc(order, ZONE_DEFAULT);
 }
 
 void pmm_free_frame(uint32_t addr) {
-    if (addr == 0) return;                          /* NULL never allocated */
-    if (addr & (PMM_FRAME_SIZE - 1)) return;        /* misaligned — caller bug */
-
-    uint32_t idx = addr / PMM_FRAME_SIZE;
-    if (idx >= MAX_FRAMES) return;
-
-    if (bit_is_set(idx)) {
-        bit_clear(idx);
-        free_frames_cnt++;
-    }
+    page_free(addr, 0);
 }
 
 /* -------------------------------------------------------------------------- */
-/* Queries.                                                                   */
+/* Stats.                                                                     */
 /* -------------------------------------------------------------------------- */
 
-uint32_t pmm_managed_frames(void) { return managed_frames; }
-uint32_t pmm_free_frames(void)    { return free_frames_cnt; }
-uint32_t pmm_used_frames(void)    { return managed_frames - free_frames_cnt; }
+uint32_t pmm_managed_frames(void) {
+    return zones[ZONE_DMA].managed + zones[ZONE_NORMAL].managed;
+}
+uint32_t pmm_free_frames(void) {
+    return zones[ZONE_DMA].free_frames + zones[ZONE_NORMAL].free_frames;
+}
+uint32_t pmm_used_frames(void) {
+    return pmm_managed_frames() - pmm_free_frames();
+}
+
+void pmm_zone_stats(int zone, uint32_t* out_free_per_order, uint32_t* out_managed) {
+    if (zone < 0 || zone >= NR_ZONES) return;
+    struct zone* z = &zones[zone];
+
+    if (out_managed) *out_managed = z->managed;
+    if (out_free_per_order) {
+        for (int o = 0; o <= BUDDY_MAX_ORDER; o++)
+            out_free_per_order[o] = z->nr_at_order[o];
+    }
+}
 
 void pmm_print_stats(void) {
-    kprintf("pmm: managed=%u free=%u used=%u (%u/%u MiB free)\n",
-            managed_frames, free_frames_cnt, managed_frames - free_frames_cnt,
-            (free_frames_cnt * 4) / 1024, (managed_frames * 4) / 1024);
+    uint32_t total_mgr  = pmm_managed_frames();
+    uint32_t total_free = pmm_free_frames();
+    kprintf("pmm: managed=%u free=%u used=%u (%u/%u MiB free) | DMA: m=%u f=%u | NORMAL: m=%u f=%u\n",
+            total_mgr, total_free, total_mgr - total_free,
+            (total_free * 4) / 1024, (total_mgr * 4) / 1024,
+            zones[ZONE_DMA].managed,    zones[ZONE_DMA].free_frames,
+            zones[ZONE_NORMAL].managed, zones[ZONE_NORMAL].free_frames);
 }

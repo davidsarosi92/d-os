@@ -1,17 +1,32 @@
 /* =============================================================================
- * pmm.h — Physical Memory Manager public interface.
+ * pmm.h — Physical Memory Manager: zoned buddy allocator.
  *
- * Hands out 4 KiB page frames of physical memory.  Built on top of a
- * bitmap: one bit per frame, 1 = in use, 0 = free.  A request for a frame
- * scans the bitmap for the first clear bit, sets it, and returns the
- * frame's base physical address.
+ * Hands out physical frames (4 KiB) or larger power-of-2 page blocks
+ * (`page_alloc(order)`) from per-zone free lists.  Memory is split into
+ * zones so allocations with physical-address constraints land in the
+ * right region:
  *
- * Initialization requires that `mboot_init` has already been called — the
- * PMM walks the multiboot memory map to learn which ranges are usable.
+ *   ZONE_DMA    : pfn  < 4096  (i.e. phys < 16 MiB) — legacy ISA DMA
+ *   ZONE_NORMAL : pfn >= 4096                       — the bulk of RAM
  *
- * Concurrency: all PMM operations currently run from the main (non-IRQ)
- * context.  If an interrupt handler ever needs to allocate, add cli/sti
- * (or irq_save/restore) around the critical section.
+ * (HIGHMEM > 256 MiB is reserved as a structural slot but not yet
+ *  managed — the i386 identity map only covers 256 MiB and we have no
+ *  pressure for more yet.  M19 leaves the abstraction extensible.)
+ *
+ * Public API is split in two layers:
+ *
+ *   page_alloc / page_free        — new, order-aware.  Use these for
+ *                                   anything larger than a single frame.
+ *   pmm_alloc_frame / *_contiguous / pmm_free_frame
+ *                                 — legacy 1-frame / N-frame API.
+ *                                   Wired on top of page_alloc internally
+ *                                   so existing callers don't change.
+ *
+ * Initialization requires that `mboot_init` has already been called —
+ * the PMM walks the multiboot memory map to discover usable frames.
+ *
+ * Concurrency: each zone has its own spinlock.  All paths are SMP-safe
+ * (M18 cmpxchg spinlocks).
  * ============================================================================= */
 
 #ifndef PMM_H
@@ -21,37 +36,62 @@
 
 #define PMM_FRAME_SIZE      4096
 #define PMM_FRAME_SHIFT     12
-#define PMM_ALLOC_FAIL      0u      /* returned on out-of-memory — 0 is a safe sentinel
-                                     * because frame 0 is always marked in-use */
+#define PMM_ALLOC_FAIL      0u      /* OOM sentinel — frame 0 is always reserved */
 
-/* Build the bitmap, pre-populate it from the mmap, reserve protected
- * regions (kernel image, low memory, multiboot info).  Call once at boot
- * after `mboot_init`. */
+/* Buddy allocator parameters.  See pmm.c file header for the rationale
+ * behind each cap.  Bumping BUDDY_MAX_FRAMES raises the supported
+ * physical-memory ceiling (it's a .bss cost: 1 byte per frame). */
+#define BUDDY_MAX_ORDER     10
+#define BUDDY_MAX_FRAMES    (1u << 18)      /* 1 GiB cap, 256 KiB metadata */
+
+/* Zone identifiers.  Allocators that don't care should pass
+ * ZONE_DEFAULT — which falls back NORMAL → DMA → fail. */
+#define ZONE_DMA            0
+#define ZONE_NORMAL         1
+#define ZONE_HIGHMEM        2      /* reserved; not populated today */
+#define NR_ZONES            3
+#define ZONE_DEFAULT        (-1)
+
+/* Build the buddy free lists from the multiboot mmap, reserve protected
+ * regions (kernel image, low memory, multiboot info).  Call once at
+ * boot after `mboot_init`. */
 void pmm_init(void);
 
-/* Allocate one 4 KiB frame.  Returns its physical base address, or
- * PMM_ALLOC_FAIL (0) if no free frame exists. */
+/* ---------------------------------------------------------------------------
+ * Order-aware API.  An "order" is a log2 page count: order 0 = one
+ * frame (4 KiB), order 1 = 2 frames (8 KiB), ..., order 10 = 1024
+ * frames (4 MiB).  Returns the physical base address of the block, or
+ * PMM_ALLOC_FAIL on OOM.
+ *
+ * `zone_hint`: ZONE_DMA / ZONE_NORMAL / ZONE_DEFAULT.  DEFAULT tries
+ * NORMAL first then falls back to DMA; DMA returns DMA-only; NORMAL
+ * returns NORMAL-only.
+ * --------------------------------------------------------------------------- */
+uint32_t page_alloc(int order, int zone_hint);
+void     page_free (uint32_t phys, int order);
+
+/* ---------------------------------------------------------------------------
+ * Legacy 1-frame / N-frame API.  Kept stable so existing drivers
+ * (virtio_blk, xhci, ramfs frame slabs) don't need rewrites; internally
+ * dispatches to page_alloc / page_free.
+ * --------------------------------------------------------------------------- */
 uint32_t pmm_alloc_frame(void);
-
-/* Allocate `n` physically-contiguous frames.  Returns the base
- * physical address (4 KiB aligned), or PMM_ALLOC_FAIL on failure.
- * Used by drivers that hand the device a single page-aligned base
- * (legacy virtio queues, DMA buffers, ...).  Scans the bitmap linearly
- * for `n` consecutive zero bits — O(MAX_FRAMES) worst case but fine
- * for the handful of contiguous allocations the kernel does at boot. */
 uint32_t pmm_alloc_contiguous(uint32_t n);
+void     pmm_free_frame(uint32_t addr);
 
-/* Free a previously allocated frame.  `addr` must be 4 KiB aligned. */
-void pmm_free_frame(uint32_t addr);
-
-/* Statistics.  `managed` is the total count of frames the PMM knows about
- * (sum of AVAILABLE mmap regions in frames).  `free` and `used` always
- * add up to `managed`. */
+/* Statistics.  `managed` is the total count of frames the PMM knows
+ * about (sum of AVAILABLE mmap regions in frames).  `free` and `used`
+ * always add up to `managed`. */
 uint32_t pmm_managed_frames(void);
 uint32_t pmm_free_frames(void);
 uint32_t pmm_used_frames(void);
 
-/* Dump a human-readable summary to the console.  Used by `meminfo`. */
+/* Per-zone free-block count at each order.  `out_free_per_order` must
+ * point to an array of at least (BUDDY_MAX_ORDER + 1) uint32_t.  Used
+ * by the `buddyinfo` shell command. */
+void pmm_zone_stats(int zone, uint32_t* out_free_per_order, uint32_t* out_managed);
+
+/* Human-readable one-line dump.  Used by `meminfo`. */
 void pmm_print_stats(void);
 
 #endif

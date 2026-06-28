@@ -50,6 +50,7 @@ C_SRCS := \
     kernel/mem/pmm.c \
     kernel/mem/vmm.c \
     kernel/mem/kmalloc.c \
+    kernel/mem/slab.c \
     kernel/hal/x86/io.c \
     kernel/hal/x86/gdt.c \
     kernel/hal/x86/idt.c \

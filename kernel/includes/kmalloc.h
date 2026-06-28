@@ -1,54 +1,55 @@
 /* =============================================================================
- * kmalloc.h — kernel heap allocator.
+ * kmalloc.h — kernel heap allocator (size-class slab + page-alloc).
  *
- * After `kmalloc_init` (called from kernel_main once paging is on) the
- * heap lives at virtual `KHEAP_START` and currently has a fixed size
- * (`KHEAP_SIZE`).  Future revisions may grow on demand by mapping more
- * frames from the PMM when the free list runs dry; the public API does
- * not change.
+ * After `kmalloc_init` (called from kernel_main once paging is on),
+ * small allocations (<= 2048 B) come from per-size slab caches and
+ * larger allocations come from the buddy page allocator.  Each slab
+ * cache has per-CPU magazines for a lock-free common path.
  *
- * Allocations are 8-byte aligned.  Each chunk carries a small header
- * directly before the returned pointer; do NOT free a pointer that did
- * not come from `kmalloc` — the header decode would walk into garbage.
+ * The public API has not changed since M1 — only the backend.  Drivers
+ * that called `kmalloc / kfree / kcalloc` continue to work unchanged.
  *
- * Concurrency: single-threaded today.  Once we have IRQ-safe allocations
- * (e.g. a driver wants to allocate from inside an ISR) the alloc/free
- * critical sections must wrap in `hal_intr_save / restore`.
+ * Allocations are 8-byte aligned.  `kmalloc` returns 4-KiB-aligned
+ * pointers for any allocation > 2048 B (because they come directly
+ * from `page_alloc`); smaller allocations are 8-byte aligned but not
+ * page-aligned (the slab header sits at the start of the page).
+ *
+ * Concurrency: slab fast paths run with IRQs off + per-CPU magazines;
+ * slow paths (refill / flush / big-alloc) acquire the matching
+ * spinlock.  Safe to call from IRQ context.
  * =========================================================================== */
 
 #ifndef KMALLOC_H
 #define KMALLOC_H
 
 #include <stdint.h>
-
-/* `size_t` is provided by the freestanding `<stddef.h>`. */
 #include <stddef.h>
 
-/* Heap location and initial extent — exposed so other subsystems can
- * sanity-check pointers during debugging. */
-#define KHEAP_START   0xD0000000u
-#define KHEAP_SIZE    (4u * 1024u * 1024u)      /* 4 MiB */
-
-/* One-time init.  Maps KHEAP_SIZE bytes of virtual memory starting at
- * KHEAP_START using fresh frames from the PMM, then plants a single
- * "all free" chunk covering the whole region. */
+/* One-time init.  Wires up the slab caches and clears the big-alloc
+ * side table.  Idempotent — safe to call more than once. */
 void kmalloc_init(void);
 
-/* Allocate `size` bytes.  Returns an 8-byte aligned pointer to at least
- * `size` usable bytes, or NULL if no chunk fits.  `size == 0` returns
- * NULL by convention (consistent with the spirit of malloc(0) being
- * implementation-defined; we pick the more useful one). */
+/* Allocate `size` bytes.  Returns an aligned pointer, or NULL on
+ * OOM / size == 0.  Pick the smallest size-class cache that fits,
+ * or fall through to a buddy page allocation if size > 2048 B. */
 void* kmalloc(size_t size);
 
 /* Allocate `n * size` bytes, zeroed.  Returns NULL on overflow or OOM. */
 void* kcalloc(size_t n, size_t size);
 
-/* Return a previously allocated pointer to the heap.  Coalesces with
- * adjacent free neighbors so future allocations can use the merged
- * region.  Safe to pass NULL (no-op). */
+/* Return a previously allocated pointer.  Dispatches automatically
+ * between slab and page-alloc based on the owning page.  Safe to
+ * pass NULL (no-op). */
 void  kfree(void* p);
 
-/* Diagnostics — used by `meminfo` / `kmstat` shell commands. */
+/* Diagnostics — used by `meminfo` / `slabinfo` shell commands.
+ *
+ * Field semantics (synthesized across slab + big-alloc):
+ *   total_bytes      = bytes of memory the heap currently owns
+ *   used_bytes       = bytes handed out to live allocations
+ *   free_bytes       = total_bytes - used_bytes (slack inside slabs)
+ *   chunk_count      = live allocation count
+ *   free_chunk_count = free objects sitting in slabs (not big-alloc) */
 struct kmstat {
     size_t   total_bytes;
     size_t   used_bytes;

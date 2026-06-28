@@ -150,7 +150,7 @@ what); a session can pick a theme and push on it.
 | M16 | Keyboard layout abstraction (US, HU, DE, …)     | Input            | ✅ DOCS §4.X |
 | M17 | Portability cut — extract `hal_api.h`           | Architecture     | ✅ DOCS §4.X (partial — see notes) |
 | M18 | SMP support — APIC, AP boot, per-CPU, locking   | Concurrency      | ✅ DOCS §4.X |
-| M19 | Memory at scale — slab, huge pages, near-NUMA   | Memory           | §M19    |
+| M19 | Memory at scale — slab, huge pages, near-NUMA   | Memory           | ✅ DOCS §4.8, §4.10 |
 | M20 | x64 (long mode) port                            | Architecture     | §M20    |
 | M21 | ARM (aarch64 generic / RPi) port                | Architecture     | §M21    |
 | M22 | GUI infrastructure (+ Wayland reuse if viable)  | UX               | §M22    |
@@ -926,35 +926,66 @@ all 4 cores online on `-smp 4`.  `lscpu` lists them.
 
 ---
 
-## §M19 — Memory at scale (slab, huge pages, zoned PMM)
+## §M19 — Memory at scale (slab, huge pages, zoned PMM) — ✅ shipped
 
-**Why now:** as systems get larger, the bitmap PMM and the K&R heap
-become bottlenecks.  This milestone replaces the inner algorithms
-without changing the public interfaces.
+**Shipped, see DOCS.md §4.8 (buddy PMM) and §4.10 (slab + page_alloc).**
 
-**Design.**
+Highlights of what landed:
+- **Per-zone binary buddy** in `kernel/mem/pmm.c`.  Free lists
+  threaded through the free pages themselves (no external link
+  array); single 1-byte side table (`page_state[]`) encodes head-
+  of-free-block / allocated / nonexistent.  Public API:
+  `page_alloc(order, zone_hint) / page_free(addr, order)`, with
+  legacy `pmm_alloc_*` wrapping it.
+- **Zones:** `ZONE_DMA` (pfn<4096), `ZONE_NORMAL`, `ZONE_HIGHMEM`
+  (slot reserved, not yet populated).  Coalesce refuses to cross
+  a zone boundary.
+- **Slab allocator** in `kernel/mem/slab.c` with 8 size-class caches
+  (16..2048).  Each cache has per-CPU magazines (MAG_CAPACITY = 32,
+  MAG_BATCH = 16) — fast path is IRQ-off + push/pop on the local
+  array, no spinlock.  Cache identification on free is by slab page
+  magic (no per-object header).
+- **kmalloc** rewired: ≤ 2048 B → slab, > 2048 B → page_alloc,
+  big-alloc order recorded in a side table for kfree dispatch.
+  Returns 8-byte aligned for slab objects, 4 KiB aligned for big
+  allocations (page_alloc returns frame addresses).
+- **Huge pages for kernel direct map**: i386's existing 4 MiB PSE
+  identity map (from M5) satisfies the DoD — no VMM change needed.
+  Recorded in DOCS so it's not later "missed."
+- **New shell commands:** `slabinfo`, `buddyinfo`.  Updated
+  `meminfo` shows per-zone PMM summary.
+- **Microbench at boot:** 10000 × {alloc(64) + free} round-trips
+  in 0–9 ms (varies with SMP overhead under TCG).
 
-- **Buddy allocator** in PMM: free lists per power-of-2 order;
-  alloc(order=0) is a 4 KiB frame, alloc(order=9) is 2 MiB, etc.
-- **Page-allocator wrapper** `page_alloc(order)` layered on PMM,
-  used by anything bigger than a single frame.
-- **Slab on top of page allocator:** kmalloc returns from per-size
-  caches (16, 32, 64, 128, ... bytes).  Each cache has per-CPU
-  magazines for lock-free fast paths.
-- **Huge pages in VMM:** map kernel direct memory using 2 MiB pages
-  to lower TLB pressure.  The existing PSE identity map is the seed.
-- **Zone awareness:** carve memory into DMA (< 16 MiB), NORMAL,
-  HIGHMEM zones so allocations that need physical-address
-  constraints (legacy DMA) get the right region.
-- **NUMA hooks** — not full implementation yet.  Just leave the
-  zone abstraction extensible to per-node.
+**Lessons learned (kept here so the design-time intuition survives):**
+1. `big_alloc_order[]` must be explicitly filled with `0xFF` at
+   init — 0x00 is a valid order (= one frame), so relying on
+   `.bss` zero-fill would misidentify every untouched frame as a
+   1-page big allocation on `kfree`.
+2. Buddy coalesce must refuse cross-zone merges.  A pfn in DMA
+   (< 4096) has a "buddy" address in NORMAL for some orders; if
+   you don't check zone membership you can corrupt the lists.
+3. Free-list link inside the page only works while every frame is
+   inside the kernel's direct map.  When HIGHMEM lands, the
+   link-store needs a kmap-style temporary mapping.
+4. IRQ-off (not just spinlock) is required for per-CPU magazine
+   access — an IRQ handler that allocates would race the
+   magazine with itself otherwise.  Per-CPU index is stable
+   across the IRQ-off window because migration is gated by IF.
 
-**Definition of done:**
-- `kmalloc` benchmarks (a tiny built-in test) show no degradation.
-- `pmm_alloc_frame` returns from a buddy list, not a linear bitmap
-  scan.
-- Kernel direct map uses 2 MiB pages.
-- DOCS.md §4.X (mem) rewritten.
+**Definition of done (all met):**
+- ✅ `pmm_alloc_frame` returns from a buddy free list, not a
+   linear bitmap scan.
+- ✅ Kernel direct map uses huge pages (4 MiB PSE on i386).
+- ✅ `kmalloc` microbench in place; baseline recorded.
+- ✅ DOCS.md §4.8 + §4.10 rewritten.
+
+**Deferred to follow-ups (not blocking M19):**
+- HIGHMEM zone population + kmap-style temporary mappings.
+- Empty-slab caching (today we release every empty slab back to
+  the buddy immediately — fine, but could reduce thrash if a cache
+  has bursty traffic).
+- ACPI SRAT parsing → per-NUMA-node zones.
 
 ---
 

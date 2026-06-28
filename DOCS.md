@@ -28,8 +28,8 @@ when sections are added.)
 | 4.5 | GDT | 304 |
 | 4.6 | IDT + PIC + IRQ dispatch | 324 |
 | 4.7 | Multiboot info | 348 |
-| 4.8 | Physical Memory Manager | 364 |
-| 4.9 | Virtual Memory Manager | 395 |
+| 4.8 | Physical Memory Manager (M19: buddy + zones) | 378 |
+| 4.9 | Virtual Memory Manager | ~440 |
 | 4.X | Tasks + scheduler (M13: preemption) | 422 |
 | 4.X | SMP — APIC, AP boot, per-CPU, real spinlocks (M18) | ~492 |
 | 4.X | HAL — arch-independent interface (M17) | ~580 |
@@ -45,7 +45,7 @@ when sections are added.)
 | 4.X | Block cache (M12) | ~700 |
 | 4.X | exFAT (M12) | ~730 |
 | 4.X | Timer (PIT) | 646 |
-| 4.10 | Kernel heap (kmalloc) | 664 |
+| 4.10 | Kernel heap (M19: slab + per-CPU mag + page_alloc) | ~1255 |
 | 4.11 | Serial debug (COM1) | 687 |
 | 4.12 | ACPI (shutdown) | 701 |
 | 5 | Build & run | 722 |
@@ -375,36 +375,65 @@ active at a time, FB preferred):
 - **Planned users:** the PMM will build its bitmap from the AVAILABLE
   regions; the VBE milestone will read the framebuffer fields.
 
-### 4.8 Physical Memory Manager (`kernel/mem/pmm.c`)
+### 4.8 Physical Memory Manager (`kernel/mem/pmm.c`) — **buddy allocator (M19)**
 - **Granularity:** 4 KiB page frame.  `PMM_FRAME_SIZE` is the single
-  source of truth; every other subsystem in the kernel that needs a
-  frame size uses that constant.
-- **Data structure:** static bitmap in `.bss`, 1 bit per frame for the
-  entire 32-bit address space (1 Mi frames, 128 KiB).  Sizing it for
-  4 GiB means any physical address can be indexed without a second
-  lookup.  Bit convention: 1 = used / nonexistent, 0 = free.
+  source of truth.
+- **Algorithm:** classic binary buddy with per-zone free lists.  Each
+  zone has `BUDDY_MAX_ORDER + 1` (= 11) free lists; order 0 holds
+  single frames, order 10 holds 4 MiB blocks.  The free-list link is
+  stored inside the free page itself — first 4 bytes hold the physical
+  address of the next free block at the same order, terminated by 0.
+  No external linked-list metadata; the only side table is `page_state[]`
+  (1 byte per frame, 256 KiB for the 1 GiB BUDDY_MAX_FRAMES cap).
+- **Page state encoding** (`page_state[pfn]`):
+  - `0xFF`: frame doesn't exist (BIOS-reserved, beyond memory, or
+    explicitly carved out).
+  - `0xFE`: frame allocated (head or interior of any block).
+  - `0..10`: frame is the HEAD of a free buddy block at that order.
+    Interior frames of free blocks read as `0xFE` plus list
+    membership; only the head is reachable from the free list.
+- **Zones:**
+  - `ZONE_DMA`: `pfn < 4096` (first 16 MiB) — legacy ISA / small DMA.
+  - `ZONE_NORMAL`: `pfn ∈ [4096, BUDDY_MAX_FRAMES)` — bulk of RAM.
+  - `ZONE_HIGHMEM`: declared, not populated.  Reserved for the
+    eventual extension when we map memory beyond the 256 MiB identity
+    region.
+  - Coalesce refuses to merge across a zone boundary (a DMA buddy
+    never pairs with a NORMAL block).
+- **API:**
+  - `page_alloc(order, zone_hint)` — order-aware.  `ZONE_DEFAULT` tries
+    NORMAL → DMA; explicit `ZONE_DMA` returns DMA-only; explicit
+    `ZONE_NORMAL` returns NORMAL-only.
+  - `page_free(addr, order)` — coalesces with the buddy at the same
+    order, up to `BUDDY_MAX_ORDER`.
+  - Legacy wrappers `pmm_alloc_frame` / `pmm_alloc_contiguous(n)` /
+    `pmm_free_frame` are kept stable so existing drivers (xhci,
+    virtio-blk, ramfs, block_cache) compile unchanged.
 - **Init sequence:**
-  1. Set every bit to 1.
-  2. Walk the multiboot memory map; for each `AVAILABLE` region, clear
-     bits for the fully-contained 4 KiB frames.  `managed_frames` is
-     bumped for each frame that transitions 1 → 0.
-  3. Re-mark a few protected regions:
-     - frame 0 (NULL safety),
-     - everything below 1 MiB (BIOS, VGA, EBDA, option ROMs),
-     - `[kernel_start, kernel_end)` (from linker-provided symbols),
-     - the multiboot info struct and its attached memory-map list.
-- **Allocator:** `pmm_alloc_frame` linearly scans the bitmap for a 0 bit,
-  flips it, decrements `free_frames_cnt`, returns the frame's base
-  physical address.  O(N/32) worst case; in practice the leading
-  128 KiB is mostly ones and the scan is fast.  Returns `0` on OOM,
-  which doubles as a sentinel because frame 0 is always marked in-use.
-- **Stats:** `meminfo` now prints a one-line PMM summary after the
-  mmap dump.
-- **Concurrency caveat:** no locking yet.  Fine today because PMM is
-  only touched from the main context.  When IRQ handlers need
-  allocations, wrap critical sections in cli/sti (or irq_save/restore).
-- **Linker symbols used:** `kernel_start`, `kernel_end` are provided by
-  `linker.ld` via `PROVIDE()`.
+  1. Zero `page_state[]` to all `0xFF` (nothing exists).
+  2. Walk the multiboot mmap; for each AVAILABLE frame, tag it
+     `PS_USED` (= "allocated, not in any free list yet").
+  3. Re-carve protected regions (frame 0, below 1 MiB, kernel image,
+     multiboot info + mmap, AP trampoline window).  These overwrite
+     `PS_USED` with `PS_NONE` so they never enter a free list.
+  4. Walk frames one more time: every `PS_USED` frame is released
+     into its zone at order 0.  The standard coalesce path
+     automatically builds up max-order blocks where contiguous free
+     ranges exist.  No two-phase "find longest aligned run" — same
+     end state, much less code.
+- **Concurrency:** one spinlock per zone (M18 cmpxchg + IRQ-save).
+  All alloc / free paths are IRQ-safe.  Cross-zone allocations don't
+  serialize against each other.
+- **Stats:** `meminfo` prints a one-liner; `buddyinfo` shows free-block
+  counts per (zone × order); `pmm_print_stats` is the underlying
+  formatter.  Sample after boot on `-m 256M`:
+  - DMA: 8 free blocks (mostly small orders + one order-10).
+  - NORMAL: 59 order-10 blocks (= 236 MiB in 4 MiB chunks).
+- **Lesson learned:** linear bitmap scan was O(N/32) but cache-hot
+  (128 KiB bitmap).  Buddy is O(log N) per call but has a larger
+  metadata footprint (256 KiB `page_state[]`).  The microbench shows
+  10000 × 64-byte kmalloc round-trips in 0–9 ms across builds, well
+  under the slab+buddy combined budget.
 
 ### 4.9 Virtual Memory Manager (`kernel/mem/vmm.c`)
 - **Mode:** 32-bit protected mode, 4 KiB and 4 MiB (PSE) pages.
@@ -1222,28 +1251,68 @@ from Linux's exfatprogs after each write.
   `gcc -m32 -print-libgcc-file-name` and links it explicitly because
   we link with `-nostdlib`.
 
-### 4.10 Kernel heap (`kernel/mem/kmalloc.c`)
-- **Strategy:** classic block free-list (K&R style).  Each chunk has an
-  inline header `{ size, free, next }` followed by its payload.
-- **Heap location:** virtual `KHEAP_START` (`0xD0000000`), fixed initial
-  size `KHEAP_SIZE` (4 MiB).  Backed by 1024 PMM frames mapped via
-  `vmm_map`.  No grow-on-demand yet; OOM returns NULL.
-- **Alignment:** every payload is 8-byte aligned (header is sized so
-  the next chunk's header lands aligned too).
-- **Allocation:** first-fit walk of the chain, with chunk splitting
-  when the slack would be ≥ 32 bytes after the new payload.
-- **Free:** marks the chunk free, coalesces forward (cheap), then walks
-  to find the predecessor and coalesces backward.  Backward walk is
-  O(n) — fine for hundreds of chunks; revisit if it ever shows up in
-  profiling.
-- **Diagnostics:** `kmalloc_stats` populates a small struct; `meminfo`
-  shell command prints used/total bytes + chunk counts.
-- **Self-test:** `kernel_main` does an `alloc(64) / alloc(128) / free /
-  alloc(48)` round trip after `kmalloc_init`; the third allocation
-  must land at the same address as the first to demonstrate reuse.
-- **Concurrency caveat:** single-threaded today.  When IRQs need to
-  allocate, wrap the alloc/free critical sections in `hal_intr_save /
-  restore`.
+### 4.10 Kernel heap (`kernel/mem/kmalloc.c` + `kernel/mem/slab.c`) — **slab + page_alloc (M19)**
+- **Public API unchanged since M1:** `kmalloc / kfree / kcalloc /
+  kmalloc_init / kmalloc_stats`.  Drivers compile unchanged; the
+  K&R block free-list under the hood is gone.
+- **Two-layer dispatch** based on requested size:
+  - `size <= 2048 B` → size-class **slab** cache (16, 32, 64, 128,
+    256, 512, 1024, 2048 — powers of two).
+  - `size  > 2048 B` → buddy `page_alloc(order)` where
+    `order = ceil_log2(ceil(size / 4 KiB))`.  Side table
+    `big_alloc_order[]` (1 byte per frame) records the order of every
+    live big allocation so `kfree` can pass it back to `page_free`.
+- **Slab layout (one slab = one 4 KiB page):**
+  - First 24 bytes = `struct slab` header: `magic` (`0xC0DEBABE`),
+    back pointer to the owning `slab_cache`, intrusive next/prev,
+    in_use + capacity + free_head.
+  - Remaining bytes = array of `capacity` slots, each `slot_size`
+    bytes (= obj_size rounded up to 8).
+  - **Free list inside the slab:** each free slot's first 2 bytes
+    holds the index of the next free slot, or `FREE_END` (0xFFFF)
+    for the tail.  No external bitmap.  Allocation = pop
+    `free_head`; free = push back onto `free_head`.
+- **Per-CPU magazines** (the M19 showcase of M18's percpu infra):
+  - One `struct mag` per CPU per cache (`mag[ACPI_MAX_CPUS]`),
+    fixed-size array of object pointers (`MAG_CAPACITY = 32`).
+  - **Alloc fast path:** IRQ-off, pop from `mag[this_cpu_id()]`.
+    No spinlock acquired; cross-CPU contention is invisible to
+    the fast path.
+  - **Free fast path:** IRQ-off, push to `mag[this_cpu_id()]`.
+  - **Slow paths** (mag empty / mag full) call `mag_refill` or
+    `mag_flush`, which batch `MAG_BATCH = 16` objects under the
+    cache's spinlock and touch the partial/full slab lists.
+  - IRQ-off (not just spinlock) is required because an IRQ handler
+    that allocates could race the magazine with itself otherwise.
+    Per-CPU index is stable across an IRQ-off window because
+    migration is also gated by IF.
+- **kfree dispatch:**
+  - Mask `p` to the page boundary.  If `((struct slab*)page)->magic
+    == SLAB_MAGIC`, route via `slab_free(slab->cache, p)`.
+  - Else check `big_alloc_order[pfn]` — if not `0xFF`, it's a
+    page-alloc-backed allocation; `page_free(p, order)`.
+  - Else complain (pointer wasn't from us).
+  - No per-object header in the slab path; the slab page tells you
+    everything.
+- **Returned-pointer alignment:** 8-byte aligned for slab objects,
+  4 KiB aligned for big allocations (because `page_alloc` returns
+  frame addresses directly).
+- **Diagnostics:**
+  - `meminfo`: PMM + zone + kheap summary (unchanged interface).
+  - `slabinfo`: per-cache obj_size / slot_size / slab count / in_use
+    / free / magazine total.
+  - `buddyinfo`: per-zone free-block counts at each order.
+- **Self-test + microbench** (at boot):
+  - `alloc(64) / alloc(128) / free / alloc(48)` round trip; the third
+    allocation must land at the same address as the first to
+    demonstrate magazine LIFO reuse.
+  - 10000 × `{alloc(64) + free}` microbench, measured in ms; gives
+    a baseline number to spot regressions in future allocator work.
+- **Concurrency:** per-cache spinlock + per-CPU magazines + per-zone
+  spinlock in the buddy.  Safe to call from IRQ context.
+- **Memory budget added by M19:** `page_state[]` (256 KiB) +
+  `big_alloc_order[]` (256 KiB) in `.bss`, BUDDY_MAX_FRAMES = 1 GiB
+  cap.
 
 ### 4.11 Serial debug (`kernel/drivers/serial/serial.c`)
 - **Hardware:** 8250/16550 UART on COM1 (base I/O 0x3F8).
@@ -1325,6 +1394,38 @@ Linker: `ld -m elf_i386 -T linker.ld -nostdlib`.
 ---
 
 ## 8. Change log
+
+- **2026-06-28 — M19: Memory at scale (buddy PMM + slab + per-CPU
+  magazines).**  PMM rewritten as a per-zone binary buddy allocator;
+  legacy `pmm_alloc_frame / pmm_alloc_contiguous / pmm_free_frame`
+  retained as thin wrappers around the new `page_alloc(order,
+  zone_hint) / page_free(addr, order)` API.  Zones: `ZONE_DMA`
+  (pfn<4096, first 16 MiB), `ZONE_NORMAL` (bulk), `ZONE_HIGHMEM`
+  (declared, not populated).  Per-zone spinlock (M18 cmpxchg) keeps
+  allocator IRQ-safe and SMP-safe.  Free-list link stored inside the
+  free page itself, no external link arrays.  New side table:
+  `page_state[]` (1 byte/frame, 256 KiB for BUDDY_MAX_FRAMES = 1 GiB
+  cap) encodes "head of free block at order N" or "allocated /
+  doesn't exist".  New module `kernel/mem/slab.c` implements size-
+  class slab caches (8 sizes from 16 B to 2048 B) with **per-CPU
+  magazines** (32-deep array per CPU per cache, IRQ-off fast path,
+  M18's percpu infrastructure paying off).  Cache lookup via slab
+  page header (SLAB_MAGIC) — no per-object header.  `kfree` dispatch:
+  page magic check (slab) → big-alloc side table (page-backed
+  kmalloc>2048 B) → error.  Microbench at boot: 10000 × {alloc(64)+
+  free} round-trips in 0–9 ms.  Shell additions: `slabinfo` (per-
+  cache usage), `buddyinfo` (free-block counts per zone × order).
+  Direct map: i386's 4 MiB PSE identity map from M5 already satisfies
+  the "huge pages for the kernel" DoD; no VMM change needed.
+  Verified end-to-end on QEMU `-smp 4` and UP: all self-tests PASS,
+  exFAT mount/read/write still works, virtio-blk + xhci + ramfs
+  unchanged.  Pitfalls: (1) `big_alloc_order[]` must be init'd to
+  `0xFF` explicitly — 0x00 is a valid order (= one frame), so
+  reliance on `.bss` zero-fill would misidentify every never-touched
+  frame as a 1-page big-alloc.  (2) `kmalloc_init` runs in boot
+  order after `pmm_init`, but BEFORE other subsystems that allocate
+  — the side-table fill is on the critical path of every later
+  `kfree` so it cannot be lazy.
 
 - **2026-06-28 — M18: SMP support (APIC + AP boot + per-CPU + real
   spinlocks).**  Single-CPU UP became a multiprocessor.  ACPI MADT

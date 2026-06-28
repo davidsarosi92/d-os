@@ -18,26 +18,33 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
-✅ **M1 – M18** shipped.  Highlights so far: VFS + ramfs + exFAT on
+✅ **M1 – M19** shipped.  Highlights so far: VFS + ramfs + exFAT on
 virtio-blk, devfs + procfs, preemptive scheduler with lock-handoff,
 multi-pane shell, xHCI USB + HID, keyboard layouts, HAL cut
-(`hal_api.h`), **SMP — APIC + IOAPIC + 8259 disabled, real cmpxchg
-spinlocks, per-CPU `current` task, AP boot via INIT+SIPI+SIPI
-(verified on `-smp 4`: all 4 cores online), `lscpu` shell command**.
+(`hal_api.h`), SMP (APIC + IOAPIC + INIT/SIPI APs + per-CPU current
++ real cmpxchg spinlocks), **memory at scale — per-zone binary
+buddy PMM (`page_alloc(order, zone)`), slab allocator with per-CPU
+magazines (8 caches 16..2048), legacy `pmm_alloc_*` + `kmalloc` API
+unchanged; new `slabinfo` / `buddyinfo` shell commands**.
 
-🔲 **Next: §M19** — memory at scale (buddy allocator, slab on top,
-2 MiB kernel direct map, zone abstraction).  M18 unlocks per-CPU
-slab magazines, so the two milestones reinforce each other.
+🔲 **Next options** (pick one; M18.5 is the bounded SMP follow-up,
+the rest are independent):
 
-🔲 **PLAN extensions added (placeholders, design only):**
-- §M22 — GUI infrastructure now includes a Wayland-reuse evaluation
-  phase (libwayland-server port vs. custom protocol).
+- **M18.5** — close the SMP "two CPU-bound tasks parallel" DOD:
+  LAPIC timer per-CPU + cross-CPU preempt IPI + per-CPU runqueue +
+  load balancer + taskset/affinity.  APs currently idle.
+- **M20** — x64 (long mode) port.  Tests the HAL boundary (M17).
+- **M21** — aarch64 port.
+- **M22** — GUI infrastructure (compositor + windows; Wayland-reuse
+  evaluation phase per §M22).
+- **M23** — Audio (AC97 → HDA → I2S).
+- **M24** — Network (NIC → IP/UDP/TCP → sockets).
+
+🔲 **PLAN extensions (placeholders, design only):**
+- §M22 — GUI includes a Wayland-reuse evaluation phase
+  (libwayland-server port vs. custom protocol).
 - §M23 — Audio subsystem (AC97 → HDA → I2S).
 - §M24 — Network stack (virtio-net → IP/UDP/TCP → sockets).
-
-🔲 Remaining: M19 memory at scale, M20 x64, M21 aarch64, M22 GUI,
-M23 audio, M24 network.  See PLAN.md "Active backlog" for the
-full grid.
 
 ## Hard conventions (do NOT deviate without asking)
 

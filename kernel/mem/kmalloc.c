@@ -1,146 +1,111 @@
 /* =============================================================================
- * kmalloc.c — kernel heap allocator (block free-list, K&R style).
+ * kmalloc.c — kernel heap allocator façade (M19).
  *
- * Layout of the heap:
+ * Two-layer dispatch:
  *
- *      KHEAP_START
- *      +---------------+--------+---------------+--------+
- *      |  hdr   |       payload      |  hdr   |   payload  | ...
- *      +---------------+--------+---------------+--------+
- *      ^               ^
- *      chunk           pointer returned to caller
+ *   size <= 2048 B  →  slab cache (slab_lookup_cache → slab_alloc)
+ *   size  > 2048 B  →  page_alloc(order) where order = ceil_log2(pages)
  *
- * Each chunk has an inline header `struct chunk` containing its total
- * size (header + payload), a "free" flag, and a forward link to the
- * next chunk.  Chunks are laid out contiguously in memory; the `next`
- * link is therefore redundant with `(char*)c + c->size`, but we keep it
- * for cheap traversal and to make a future allocator that interleaves
- * free chunks in arbitrary order easier to retrofit.
+ * `kfree(p)` figures out which path by inspecting the page that
+ * `p` lives in:
+ *   1. Mask `p` to the page boundary.
+ *   2. Ask the slab layer if the page is a slab page; if yes,
+ *      slab_free routes it back into the magazine / cache.
+ *   3. Otherwise look up `big_alloc_order[pfn]` (a side table sized to
+ *      BUDDY_MAX_FRAMES) for the order of the page-alloc-backed
+ *      allocation; if found, page_free at that order.
+ *   4. Otherwise complain — the pointer wasn't from us.
  *
- * `kmalloc(n)` walks the list looking for the first chunk that is free
- * and at least `n + sizeof(chunk)` bytes large; if much bigger, the
- * chunk is split in two so the leftover stays available.
+ * The side table is 1 byte per frame, sized to BUDDY_MAX_FRAMES.  It
+ * holds 0xFF for "not a kmalloc-big-alloc page" and 0..BUDDY_MAX_ORDER
+ * for the head of one.  Interior frames stay 0xFF — kfree only looks
+ * up the head pfn (== p >> 12 for a returned page-aligned pointer).
  *
- * `kfree(p)` finds the header right before `p`, marks it free, and
- * tries to coalesce with its forward neighbor.  Backward coalescing
- * requires a list walk to find the predecessor (the inline link is
- * forward-only); for a heap with hundreds of chunks this is fine — if
- * it ever becomes a hotspot we'll add a back link or a free-list
- * indexed by size class.
+ * Why no per-object header?  The slab side identifies its objects by
+ * the page they live in (the slab header has SLAB_MAGIC).  For big
+ * allocations the page is always 4 KiB aligned because page_alloc
+ * returns frame addresses.  So we don't need any in-band tagging.
  *
- * Failure modes we deliberately leave loud (kprintf to console + serial)
- * so a misbehaving caller is visible during development.
- * =========================================================================== */
+ * Backwards compat: `kmalloc_init` is still called from kernel_main;
+ * it just initializes the slab subsystem.  `kmalloc_stats` reports a
+ * synthesized view that's roughly comparable to the old block-heap
+ * counters (total_bytes / used_bytes / free_bytes / chunk_count).
+ * ============================================================================= */
 
 #include "kmalloc.h"
-#include "vmm.h"
+#include "slab.h"
 #include "pmm.h"
 #include "printf.h"
 #include <stdint.h>
 #include <stddef.h>
 
 /* -------------------------------------------------------------------------- */
-/* Tunables.                                                                   */
+/* Big-allocation side table.  See file header for the layout.                */
 /* -------------------------------------------------------------------------- */
 
-/* Allocations are aligned to 8 bytes — sufficient for double-precision
- * floats and 64-bit integers, and matches the System V i386 minimum.   */
-#define KMALLOC_ALIGN 8u
+#define BIG_NONE 0xFFu
+static uint8_t big_alloc_order[BUDDY_MAX_FRAMES];
 
-/* If a candidate free chunk is larger than the requested size by at
- * least this many bytes, split it so the leftover stays usable.  Below
- * this threshold we hand out the whole chunk unchanged (avoids a
- * proliferation of tiny unusable fragments). */
-#define KMALLOC_SPLIT_MIN 32u
+static uint32_t big_allocs   = 0;
+static uint32_t big_bytes    = 0;     /* sum of order_to_bytes for live big allocs */
+
+static int initialized = 0;
 
 /* -------------------------------------------------------------------------- */
-/* Chunk header layout.                                                        */
+/* Small helpers.                                                             */
 /* -------------------------------------------------------------------------- */
 
-struct chunk {
-    size_t        size;         /* total size, header + payload, in bytes  */
-    uint32_t      free;         /* 1 = available, 0 = in use               */
-    struct chunk* next;         /* next chunk in physical order            */
-    /* payload follows immediately after this header                       */
-};
-
-/* Round up to the nearest multiple of KMALLOC_ALIGN. */
-static inline size_t align_up(size_t v, size_t a) {
-    return (v + (a - 1u)) & ~(a - 1u);
+/* ceil_log2(bytes-to-pages) — gives the order argument for page_alloc. */
+static int order_for_bytes(size_t bytes) {
+    size_t pages = (bytes + 4095u) / 4096u;
+    if (pages <= 1) return 0;
+    int order = 0;
+    size_t v = 1;
+    while (v < pages) { v <<= 1; order++; }
+    return order;
 }
 
 /* -------------------------------------------------------------------------- */
-/* Module state.                                                               */
-/* -------------------------------------------------------------------------- */
-
-static struct chunk* heap_head = NULL;          /* first chunk in the heap */
-static int           initialized = 0;
-
-/* -------------------------------------------------------------------------- */
-/* Init — map the heap region and plant the initial single free chunk.        */
+/* Init.                                                                      */
 /* -------------------------------------------------------------------------- */
 
 void kmalloc_init(void) {
     if (initialized) return;
 
-    /* Pull KHEAP_SIZE / 4 KiB frames from the PMM and map each into the
-     * heap window with `vmm_map`.  4 KiB at a time keeps the API simple
-     * and lets the PMM hand out non-contiguous physical frames. */
-    for (uint32_t off = 0; off < KHEAP_SIZE; off += 0x1000) {
-        uint32_t phys = pmm_alloc_frame();
-        if (phys == 0) {
-            kprintf("kmalloc: PMM exhausted while mapping heap (got %u/%u bytes)\n",
-                    off, KHEAP_SIZE);
-            break;
-        }
-        if (vmm_map(KHEAP_START + off, phys, VMM_WRITABLE) != 0) {
-            kprintf("kmalloc: vmm_map failed at virt %p\n", (void*)(KHEAP_START + off));
-            pmm_free_frame(phys);
-            break;
-        }
-    }
+    /* Mark the entire side table as "not a big-alloc page".  Done
+     * explicitly even though .bss is zero — 0x00 is a valid order
+     * (= one frame), so we'd misidentify every never-touched frame
+     * as a 1-page big-alloc page.  Manual fill it is. */
+    for (uint32_t i = 0; i < BUDDY_MAX_FRAMES; i++) big_alloc_order[i] = BIG_NONE;
 
-    /* Plant a single all-free chunk covering the entire heap. */
-    heap_head = (struct chunk*)KHEAP_START;
-    heap_head->size = KHEAP_SIZE;
-    heap_head->free = 1;
-    heap_head->next = NULL;
-
+    slab_init();
     initialized = 1;
-    kprintf("kmalloc: heap %u KiB @ %p\n", KHEAP_SIZE / 1024, (void*)KHEAP_START);
+
+    kprintf("kmalloc: slab + page_alloc backend ready\n");
 }
 
 /* -------------------------------------------------------------------------- */
-/* Allocation.                                                                 */
+/* Allocation.                                                                */
 /* -------------------------------------------------------------------------- */
 
 void* kmalloc(size_t size) {
     if (!initialized || size == 0) return NULL;
 
-    /* Required total size: header + payload, rounded up so the next
-     * chunk's header still lands aligned. */
-    size_t need = align_up(size + sizeof(struct chunk), KMALLOC_ALIGN);
+    /* Fast path: size class cache. */
+    struct slab_cache* c = slab_lookup_cache(size);
+    if (c) return slab_alloc(c);
 
-    for (struct chunk* c = heap_head; c != NULL; c = c->next) {
-        if (!c->free || c->size < need) continue;
+    /* Slow path: page-alloc backed.  Round up to the smallest order
+     * that fits, allocate from the buddy, record in the side table. */
+    int order = order_for_bytes(size);
+    uint32_t phys = page_alloc(order, ZONE_DEFAULT);
+    if (!phys) return NULL;
 
-        /* Big enough — split if there's enough leftover to bother. */
-        if (c->size >= need + sizeof(struct chunk) + KMALLOC_SPLIT_MIN) {
-            struct chunk* tail = (struct chunk*)((char*)c + need);
-            tail->size = c->size - need;
-            tail->free = 1;
-            tail->next = c->next;
+    big_alloc_order[phys >> 12] = (uint8_t)order;
+    big_allocs++;
+    big_bytes += (1u << order) * 4096u;
 
-            c->size = need;
-            c->next = tail;
-        }
-        c->free = 0;
-        return (void*)((char*)c + sizeof(struct chunk));
-    }
-
-    /* Out of memory.  A grow-on-demand policy could ask the PMM for
-     * fresh frames here; for now we just fail. */
-    return NULL;
+    return (void*)(uintptr_t)phys;
 }
 
 void* kcalloc(size_t n, size_t size) {
@@ -151,70 +116,87 @@ void* kcalloc(size_t n, size_t size) {
     void* p = kmalloc(total);
     if (!p) return NULL;
 
-    /* Manual zero-fill — no memset in our libc-less environment. */
+    /* Zero-fill — no memset in libc-less env. */
     char* b = (char*)p;
     for (size_t i = 0; i < total; i++) b[i] = 0;
     return p;
 }
 
 /* -------------------------------------------------------------------------- */
-/* Free + coalesce.                                                            */
+/* Free.                                                                      */
 /* -------------------------------------------------------------------------- */
 
 void kfree(void* p) {
     if (!p) return;
-
-    /* Sanity: pointer must be inside the heap. */
-    if ((uintptr_t)p < KHEAP_START + sizeof(struct chunk) ||
-        (uintptr_t)p >= KHEAP_START + KHEAP_SIZE) {
-        kprintf("kfree: pointer %p outside heap\n", p);
+    if (!initialized) {
+        kprintf("kfree: called before init (p=%p)\n", p);
         return;
     }
 
-    struct chunk* c = (struct chunk*)((char*)p - sizeof(struct chunk));
-    if (c->free) {
-        kprintf("kfree: double-free of %p\n", p);
+    /* Try slab first — its dispatch is the cheapest (page magic
+     * read).  Slab objects are NEVER page-aligned because the slab
+     * header eats the first 32 bytes, so a page-aligned p can't be
+     * a slab object. */
+    struct slab_cache* c = slab_cache_of(p);
+    if (c) {
+        slab_free(c, p);
         return;
     }
-    c->free = 1;
 
-    /* Forward coalesce — cheap because we already have c->next. */
-    if (c->next && c->next->free) {
-        c->size += c->next->size;
-        c->next  = c->next->next;
+    /* Otherwise check the big-alloc side table.  p must be 4 KiB
+     * aligned for this to make sense. */
+    if (((uintptr_t)p & 0xFFFu) != 0) {
+        kprintf("kfree: pointer %p not in any known allocation\n", p);
+        return;
     }
 
-    /* Backward coalesce — find the chunk whose `next` is `c`.  O(n) walk;
-     * acceptable for now, see the file header comment. */
-    for (struct chunk* w = heap_head; w; w = w->next) {
-        if (w->next == c && w->free) {
-            w->size += c->size;
-            w->next  = c->next;
-            break;
-        }
+    uint32_t pfn = (uint32_t)(uintptr_t)p >> 12;
+    if (pfn >= BUDDY_MAX_FRAMES || big_alloc_order[pfn] == BIG_NONE) {
+        kprintf("kfree: pointer %p not from kmalloc\n", p);
+        return;
     }
+
+    int order = big_alloc_order[pfn];
+    big_alloc_order[pfn] = BIG_NONE;
+    if (big_allocs) big_allocs--;
+    if (big_bytes >= (1u << order) * 4096u) big_bytes -= (1u << order) * 4096u;
+
+    page_free((uint32_t)(uintptr_t)p, order);
 }
 
 /* -------------------------------------------------------------------------- */
-/* Stats.                                                                      */
+/* Stats — synthesized over slab + page_alloc.                                */
+/*                                                                            */
+/* `chunk_count` and `free_chunk_count` map awkwardly onto the slab           */
+/* world (objects, not chunks), but we keep the field names to avoid          */
+/* breaking the existing `meminfo` shell command.  Map:                       */
+/*   total_bytes      = slab_pages * 4 KiB + big_bytes                        */
+/*   used_bytes       = sum(slab in-use * slot_size) + big_bytes              */
+/*   free_bytes       = slab_pages * 4 KiB - used_slab + big slack            */
+/*   chunk_count      = sum(slab in-use objs) + big_allocs                    */
+/*   free_chunk_count = sum(slab free objs)                                   */
 /* -------------------------------------------------------------------------- */
-
 void kmalloc_stats(struct kmstat* out) {
     if (!out) return;
 
-    out->total_bytes      = KHEAP_SIZE;
+    out->total_bytes      = 0;
     out->used_bytes       = 0;
     out->free_bytes       = 0;
     out->chunk_count      = 0;
     out->free_chunk_count = 0;
 
-    for (struct chunk* c = heap_head; c; c = c->next) {
-        out->chunk_count++;
-        if (c->free) {
-            out->free_bytes += c->size;
-            out->free_chunk_count++;
-        } else {
-            out->used_bytes += c->size;
-        }
+    int n = slab_cache_count();
+    for (int i = 0; i < n; i++) {
+        struct slab_stats s;
+        slab_cache_get_stats(i, &s);
+        out->total_bytes      += (size_t)s.slabs * 4096u;
+        out->used_bytes       += (size_t)s.in_use_objs * s.slot_size;
+        out->chunk_count      += s.in_use_objs;
+        out->free_chunk_count += s.free_objs;
     }
+    out->total_bytes += big_bytes;
+    out->used_bytes  += big_bytes;
+    out->chunk_count += big_allocs;
+    out->free_bytes   = (out->total_bytes > out->used_bytes)
+                        ? (out->total_bytes - out->used_bytes) : 0;
 }

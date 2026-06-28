@@ -31,6 +31,7 @@
 #include "lock.h"
 #include "keymap.h"
 #include "percpu.h"
+#include "slab.h"
 
 #define LINE_MAX        128             /* max accepted bytes per command line */
 #define DEFAULT_PROMPT  "d-os> "        /* fallback when config is unavailable */
@@ -105,6 +106,7 @@ static void cmd_help(void) {
                   "  ringtest, ps, spawn, yield, loop\n"
                   "  pane, pane split horizontal|vertical\n"
                   "  lslayout, setlayout <us|hu|...>, lscpu\n"
+                  "  slabinfo, buddyinfo\n"
                   "  shutdown, reboot\n");
 }
 
@@ -372,6 +374,39 @@ static void cmd_lscpu(void) {
                 i, p->apic_id,
                 p->online ? "online" : "offline",
                 (i == me) ? " <this>" : "");
+    }
+}
+
+/* -------------------------------------------------------------------- */
+/* Memory — `slabinfo` and `buddyinfo` (M19).                            */
+/* -------------------------------------------------------------------- */
+
+static void cmd_slabinfo(void) {
+    int n = slab_cache_count();
+    kprintf("NAME           OBJSZ  SLOT  SLABS  IN_USE  FREE  MAG\n");
+    for (int i = 0; i < n; i++) {
+        struct slab_stats s;
+        slab_cache_get_stats(i, &s);
+        kprintf("%s  %u  %u  %u  %u  %u  %u\n",
+                s.name, (unsigned)s.obj_size, (unsigned)s.slot_size,
+                s.slabs, s.in_use_objs, s.free_objs, s.mag_total);
+    }
+}
+
+static void cmd_buddyinfo(void) {
+    const char* zone_names[NR_ZONES] = { "DMA", "NORMAL", "HIGHMEM" };
+    uint32_t order_counts[BUDDY_MAX_ORDER + 1];
+    kprintf("ZONE     MANAGED  FREE-BLOCKS-PER-ORDER (0..%u)\n",
+            BUDDY_MAX_ORDER);
+    for (int z = 0; z < NR_ZONES; z++) {
+        uint32_t managed = 0;
+        pmm_zone_stats(z, order_counts, &managed);
+        kprintf("%s ", zone_names[z]);
+        kprintf("m=%u  ", managed);
+        for (int o = 0; o <= BUDDY_MAX_ORDER; o++) {
+            kprintf("%u ", order_counts[o]);
+        }
+        kprintf("\n");
     }
 }
 
@@ -653,6 +688,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "lslayout"))       { cmd_lslayout();             return; }
     if (starts_with(line, "setlayout ")) { cmd_setlayout(line + 10); return; }
     if (streq(line, "lscpu"))          { cmd_lscpu();                return; }
+    if (streq(line, "slabinfo"))       { cmd_slabinfo();             return; }
+    if (streq(line, "buddyinfo"))      { cmd_buddyinfo();            return; }
     if (streq(line, "saveconf"))       {
         if (config_save() == 0) console_write("config saved.\n");
         else                    console_write("saveconf: failed\n");
