@@ -75,8 +75,11 @@ static uint32_t kernel_pd[1024] __attribute__((aligned(4096)));
 
 /* Phys address of the page directory — needed by the AP boot trampoline
  * (M18) so each AP can load CR3 before enabling paging.  The kernel is
- * identity-mapped, so virt = phys for the array itself. */
-uint32_t vmm_kernel_pd_phys(void) { return (uint32_t)(uintptr_t)&kernel_pd[0]; }
+ * identity-mapped, so virt = phys for the array itself.  Returned as
+ * uintptr_t for arch-API symmetry with the x86_64 vmm.c; the SMP code
+ * truncates to uint32_t when patching the AP info area (i386 PD is in
+ * the low 4 GiB by construction). */
+uintptr_t vmm_kernel_pd_phys(void) { return (uintptr_t)&kernel_pd[0]; }
 
 /* ------------------------------------------------------------------------- */
 /* Low-level helpers — tiny inline asm wrappers to read/write CRx and
@@ -143,7 +146,11 @@ void vmm_init(void) {
 /* Mapping operations.                                                       */
 /* ------------------------------------------------------------------------- */
 
-int vmm_map(uint32_t virt, uint32_t phys, uint32_t flags) {
+int vmm_map(uintptr_t virt32, uintptr_t phys32, uint32_t flags) {
+    /* On i386 uintptr_t == uint32_t so the casts are no-ops; making them
+     * explicit keeps the arch-portable interface obvious. */
+    uint32_t virt = (uint32_t)virt32;
+    uint32_t phys = (uint32_t)phys32;
     uint32_t pdi = PD_IDX(virt);
     uint32_t pti = PT_IDX(virt);
     uint32_t pde = kernel_pd[pdi];
@@ -175,7 +182,9 @@ int vmm_map(uint32_t virt, uint32_t phys, uint32_t flags) {
     return 0;
 }
 
-int vmm_map_4mib(uint32_t virt, uint32_t phys, uint32_t flags) {
+int vmm_map_4mib(uintptr_t virt32, uintptr_t phys32, uint32_t flags) {
+    uint32_t virt = (uint32_t)virt32;
+    uint32_t phys = (uint32_t)phys32;
     /* PSE requires the low 22 bits of both `virt` and `phys` to be zero. */
     if (virt & 0x003FFFFFu) return -1;
     if (phys & 0x003FFFFFu) return -1;
@@ -194,7 +203,8 @@ int vmm_map_4mib(uint32_t virt, uint32_t phys, uint32_t flags) {
     return 0;
 }
 
-void vmm_unmap(uint32_t virt) {
+void vmm_unmap(uintptr_t virt32) {
+    uint32_t virt = (uint32_t)virt32;
     uint32_t pdi = PD_IDX(virt);
     uint32_t pti = PT_IDX(virt);
     uint32_t pde = kernel_pd[pdi];
@@ -207,20 +217,21 @@ void vmm_unmap(uint32_t virt) {
     invlpg(virt);
 }
 
-uint32_t vmm_translate(uint32_t virt) {
+uintptr_t vmm_translate(uintptr_t virt32) {
+    uint32_t virt = (uint32_t)virt32;
     uint32_t pdi = PD_IDX(virt);
     uint32_t pde = kernel_pd[pdi];
     if ((pde & PDE_P) == 0) return 0;
 
     if (pde & PDE_PS) {
         /* 4 MiB PSE page — low 22 bits are the offset. */
-        return (pde & PSE_MASK) | (virt & 0x003FFFFFu);
+        return (uintptr_t)((pde & PSE_MASK) | (virt & 0x003FFFFFu));
     }
 
     uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
     uint32_t pte = pt[PT_IDX(virt)];
     if ((pte & PTE_P) == 0) return 0;
-    return (pte & PAGE_MASK) | (virt & 0x00000FFFu);
+    return (uintptr_t)((pte & PAGE_MASK) | (virt & 0x00000FFFu));
 }
 
 void vmm_print_status(void) {

@@ -35,7 +35,7 @@ unchanged through every phase.
 | 1 | Build infra: Makefile ARCH switch, linker-x86_64.ld, grub.cfg, empty hal/x86_64 skeleton that produces a valid (halting) multiboot2 ELF64 | ✅ shipped | (this commit) |
 | 2 | boot.s: multiboot2 header + 32→64 long-mode entry + early serial "hello" print + halt | ✅ shipped | (this commit) |
 | 3 | hal/x86_64 stubs: hal_arch.c, gdt.c, idt.c, tss.c, task_arch.c, switch.s, isr_stubs.s (compile-only; usermode.s deferred to M20.5) | ✅ shipped | (this commit) |
-| 4 | hal/x86_64/vmm.c (4-level paging behind vmm.h API), widen vmm.h to uintptr_t | 🔲 pending |  |
+| 4 | hal/x86_64/vmm.c (4-level paging behind vmm.h API), widen vmm.h to uintptr_t | ✅ shipped | (this commit) |
 | 5 | Full kernel_main link + boot; fix driver compile issues on 64-bit | 🔲 pending |  |
 | 6 | IDT + PIT IRQ + scheduler + shell prompt up | 🔲 pending |  |
 | 7 | SYSCALL/SYSRET (can defer to M20.5) | 🔲 deferable |  |
@@ -129,6 +129,28 @@ qemu-system-x86_64 -smp 4 ...
   per-arch build tree.  See Makefile rule for
   `ap_trampoline_blob.o`.
 
+**Phase 4:**
+- `vmm.h` API widened to `uintptr_t` for virt/phys/return types
+  (vmm_map, vmm_map_4mib, vmm_unmap, vmm_translate,
+  vmm_kernel_pd_phys).  i386 build sees uintptr_t == uint32_t, so
+  no caller changes were needed; the i386 vmm.c keeps its uint32_t
+  internals but casts at the API boundary.
+- `kernel/mem/vmm.c` moved to `kernel/hal/x86/vmm.c` — it's
+  i386-specific (2-level paging + PSE), so its location now
+  reflects that.  Makefile updated.
+- x86_64 vmm.c **inherits** boot.s's PML4/PDPT/PD via extern symbols
+  rather than rebuilding the kernel page tables from scratch.  This
+  avoids the chicken-and-egg of building new tables while
+  identity-mapped on the old ones.  vmm_init only logs status.
+- `vmm_map_4mib` semantic preservation: on i386 it's literally a
+  PSE 4 MiB PDE; on x86_64 it installs TWO adjacent 2 MiB large
+  PD entries to keep the 4 MiB contract.  Callers (fb_terminal,
+  xhci) don't need source changes.
+- x86_64 `rdmsr` cannot use the `=A` GCC asm constraint (which
+  means "edx:eax pair as one 64-bit value" — long-mode rdmsr
+  zero-extends into rax/rdx, not the eax+edx legacy split).
+  Use two separate `=a`/`=d` outputs and combine in C.
+
 **Phase 3:**
 - `idt.h`'s `struct int_frame` is necessarily arch-specific (different
   push count, different register names, different segment-save
@@ -183,37 +205,57 @@ qemu-system-x86_64 -smp 4 ...
 
 ## Next concrete action
 
-Phase 4.  Port the VMM (virtual memory manager) for x86_64 4-level
-paging.  Concrete tasks:
+Phase 5.  Link the full kernel against the x86_64 HAL and reach
+kernel_main.  This phase is the riskiest of M20 — every core .c file
+must compile under -m64 -mcmodel=large.  Expect to spot-fix:
 
-1. Widen `kernel/includes/vmm.h` API to `uintptr_t` for virt/phys/
-   return types (vmm_map / vmm_map_4mib / vmm_unmap / vmm_translate /
-   vmm_kernel_pd_phys).  i386 build sees `uintptr_t == uint32_t` so
-   no caller changes are needed.  x86_64 callers can pass full
-   64-bit addresses.
+1. **CORE_C_SRCS for x86_64**: in the Makefile, set CORE_C_SRCS to
+   the same list i386 uses, MINUS smp.c/lapic.c/ioapic.c/pci.c
+   (SMP is M20.5; LAPIC/IOAPIC need MMIO + we have no x86_64
+   trampoline yet).  Probably also need to skip syscall.c (no
+   ring-3 path until Phase 7).
 
-2. Move `kernel/mem/vmm.c` → `kernel/hal/x86/vmm.c` (it's 32-bit
-   specific; the move reflects that).  Update i386 Makefile source
-   list.
+2. **boot.s entry → kernel_main**: replace the current "print +
+   halt" tail in long_mode_entry with `call kernel_main`.  Pass
+   the multiboot magic + info pointer from r12/r13 into rdi/rsi
+   (System V ABI first args).
 
-3. Write `kernel/hal/x86_64/vmm.c` implementing the same vmm.h API
-   atop 4-level paging (PML4 → PDPT → PD → PT).  Reuse the
-   identity-mapping convention from i386: vmm_init promises that
-   addresses below some limit (1 GiB suffices for now — that's
-   what boot.s set up) are 1:1 mapped after init.
-   - vmm_map: walk PML4[idx]→PDPT[idx]→PD[idx]→PT[idx], allocating
-     intermediate tables from pmm_alloc_frame on demand.
-   - vmm_map_4mib: actually 2 MiB granularity on x86_64 (matches the
-     2 MiB pages we already use in boot.s).  Renamed semantically
-     but keeps the name for API stability.
-   - vmm_unmap, vmm_translate: walk and clear/return.
-   - vmm_kernel_pd_phys: returns PML4 phys for AP trampoline reuse.
+3. **kernel.c entry signature**: kernel_main(uint32_t magic,
+   uint32_t info_ptr) needs to widen info_ptr to uintptr_t (the
+   multiboot info struct could in principle live > 4 GiB on
+   real hardware; in QEMU it doesn't, but the type should be
+   correct).
 
-4. Test: `make ARCH=x86_64` still builds all HAL .o's (and now adds
-   vmm.o).  Link still fails — Phase 5 closes that.
+4. **multiboot1 vs multiboot2 parsing**: i386 uses multiboot1
+   (magic 0x2BADB002).  x86_64 uses multiboot2 (magic 0x36d76289)
+   with a tag-based info structure.  Options:
+   a. Write a multiboot2 shim that translates into the existing
+      multiboot1 `struct multiboot_info`.
+   b. Generalise multiboot.c into a tag-based parser supporting
+      both.
+   Probably (a) is fastest — the existing pmm.c, fb_terminal.c
+   etc. all read multiboot1 fields, we don't want to churn them.
 
-DoD for Phase 4: vmm.h API widened to uintptr_t (i386 baseline still
-builds + boots), kernel/hal/x86_64/vmm.c compiles cleanly.
+5. **Compile-error cleanup**: every C file in CORE_C_SRCS gets
+   compiled with -m64 for the first time.  Likely issues:
+   - `printf` %x for pointers — needs %p or %lx for 64-bit
+   - implicit int↔ptr conversions
+   - `sizeof(long)` differences
+   - alignment of packed structs
+
+6. **Conditional-compile SMP init in kernel.c**: any direct call
+   to lapic_init_*, ioapic_init, smp_boot_aps should be gated with
+   `#if defined(__i386__)` for now.  Similarly for any ring-3
+   self-test (the ring 3 path is i386-only until Phase 7).
+
+7. **Test**: ARCH=x86_64 produces a kernel that runs through
+   kernel_main, prints the boot banner via serial, and halts at
+   the (synthesised) BSP idle task.  PIT IRQ doesn't fire yet —
+   that's Phase 6.
+
+DoD for Phase 5: `make ARCH=x86_64 iso` succeeds with no
+unresolved symbols.  Serial log shows the boot banner + module
+init + driver init messages.
 
 ---
 

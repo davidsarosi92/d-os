@@ -45,11 +45,11 @@ ifeq ($(ARCH),i386)
 
   # i386 HAL implementation.
   ARCH_C_SRCS := \
-      kernel/mem/vmm.c \
       kernel/hal/x86/io.c \
       kernel/hal/x86/gdt.c \
       kernel/hal/x86/idt.c \
       kernel/hal/x86/tss.c \
+      kernel/hal/x86/vmm.c \
       kernel/hal/x86/pci.c \
       kernel/hal/x86/hal_arch.c \
       kernel/hal/x86/task_arch.c \
@@ -91,6 +91,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/gdt.c \
       kernel/hal/x86_64/idt.c \
       kernel/hal/x86_64/tss.c \
+      kernel/hal/x86_64/vmm.c \
       kernel/hal/x86_64/task_arch.c
 
   ARCH_ASM_SRCS := \
