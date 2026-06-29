@@ -61,10 +61,11 @@ struct slab_stats {
     const char* name;
     size_t      obj_size;
     size_t      slot_size;
-    uint32_t    slabs;        /* total slab pages held */
+    uint32_t    slabs;        /* total slab pages held (partial + full + cached empty) */
     uint32_t    in_use_objs;  /* allocated objects */
     uint32_t    free_objs;    /* free objects (in slabs + mags) */
     uint32_t    mag_total;    /* objects currently in any magazine */
+    uint32_t    cached_empty; /* M19.5.2 — cached empty slabs awaiting reuse */
 };
 int  slab_cache_count(void);
 void slab_cache_get_stats(int idx, struct slab_stats* out);

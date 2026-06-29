@@ -21,8 +21,12 @@
 
 /* Map the IOAPIC MMIO at `phys` and record the GSI base.  Caches the
  * "max redirection entries" count from the version register so route
- * calls can bounds-check. */
-int  ioapic_init(uint32_t phys, uint32_t gsi_base);
+ * calls can bounds-check.
+ *
+ * `phys` is `uintptr_t` for the same reason as `lapic_init_bsp`:
+ * x86_64 platforms could relocate the IOAPIC window above 4 GiB,
+ * though QEMU keeps it at 0xFEC00000 on both archs. */
+int  ioapic_init(uintptr_t phys, uint32_t gsi_base);
 
 /* Route a legacy ISA IRQ to (vector, dest_apic_id).  Honors the ACPI
  * Interrupt Source Override table — if the firmware remapped IRQ N to

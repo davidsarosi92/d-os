@@ -115,6 +115,27 @@ static uint64_t* walk_to_pt(uintptr_t virt, int create, uint32_t parent_flags) {
              * mirrors i386's behaviour for the analogous 4 MiB PSE
              * case. */
             if (level >= 1 && (e & PTE_PS)) return 0;
+
+            /* Widen the existing entry's permissions if the caller's
+             * mapping is broader.  This matters in particular for
+             * user mappings: the boot-time PML4[0]/PDPT[0]/PD[i]
+             * entries are built with US=0 by boot.s (kernel-only); a
+             * later user mapping under the same PML4 subtree would
+             * still #PF in ring 3 because EVERY level of the long-
+             * mode walk checks US.  OR'ing the bit in is safe (we're
+             * only relaxing permissions, never tightening) — and the
+             * pages below the bit are still controlled by their PT
+             * entry's own US bit.
+             *
+             * For a kernel-only mapping (parent_flags & PTE_US = 0)
+             * this is a no-op. */
+            uint64_t widen = (uint64_t)parent_flags & PTE_US;
+            if (widen && !(e & PTE_US)) {
+                tbl[idx] = e | widen;
+                /* No invlpg here — the lower-level walk hasn't been
+                 * cached yet, and changing US in a higher level
+                 * doesn't invalidate any TLB entry that mattered. */
+            }
             tbl = table_at((uintptr_t)e);
             continue;
         }

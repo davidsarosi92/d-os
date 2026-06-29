@@ -18,22 +18,18 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
-✅ **M1 – M20 + M18.5** shipped.  Highlights so far: VFS + ramfs +
-exFAT on virtio-blk, devfs + procfs, preemptive scheduler with
-lock-handoff, multi-pane shell, xHCI USB + HID, keyboard layouts,
-HAL cut (`hal_api.h`), SMP on i386 (APIC + IOAPIC + INIT/SIPI APs
-+ per-CPU current + real cmpxchg spinlocks), memory at scale (per-
-zone buddy PMM + slab + per-CPU magazines), APs scheduling (LAPIC
-timer per-CPU, per-CPU idle tasks, scheduler idle-fallback policy),
-**x86_64 (long mode) UP port — multiboot2 + 32→64 entry, 4-level
-paging, 64-bit GDT/IDT/TSS/ISR stubs, vmm.h API widened to
-uintptr_t, full kernel_main runs to the same shell prompt as i386;
-SMP + SYSCALL/SYSRET on x86_64 deferred to M20.5**.
+✅ **M1 – M20 + M18.5 + M20.5 + M18.6 (4/5) + M19.5.2** shipped.
+Highlights so far: VFS + ramfs + exFAT on virtio-blk, devfs +
+procfs, preemptive scheduler, multi-pane shell, xHCI USB + HID,
+keyboard layouts, HAL cut (`hal_api.h`), **SMP on i386 + x86_64**
+with per-CPU runqueue + load balancer + per-CPU preempt_count + task
+affinity (`taskset`) + cross-CPU preempt IPI, memory at scale (per-
+zone buddy PMM + slab + per-CPU magazines + empty-slab caching),
+APs scheduling, **x86_64 (long mode) — full parity with i386**.
+m20_stubs.c down to just `xhci_poll`.
 
 🔲 **Next options** (pick one):
 
-- **M20.5** — x86_64 SMP + APIC + SYSCALL/SYSRET (closes the
-  x86_64 port).
 - **M21** — aarch64 port.  Third arch, real torture test of HAL
   portability (no port I/O, GIC instead of APIC, EL1/EL0 instead
   of rings).
@@ -41,10 +37,13 @@ SMP + SYSCALL/SYSRET on x86_64 deferred to M20.5**.
   evaluation phase per §M22).
 - **M23** — Audio (AC97 → HDA → I2S).
 - **M24** — Network (NIC → IP/UDP/TCP → sockets).
-- **Polish backlog** (smaller, can interleave): per-CPU runqueue +
-  load balancer, per-CPU `preempt_count`, task affinity / taskset,
-  cross-CPU preempt IPI (vector 0x41 reserved), MSI/MSI-X,
-  printf rewrite to support %l (M20 lesson: blocked us briefly).
+- **§M18.6.5** — MSI/MSI-X discovery + vector allocator (remaining
+  M18.6 sub-item; not blocking — IOAPIC routes legacy IRQs fine).
+- **§M19.5.1** — HIGHMEM zone population + kmap (i386) /
+  identity-map extension (x86_64).
+- **§M19.5.3** — ACPI SRAT → per-NUMA-node zones.
+- **§M20.6** — x86_64 closure: SYSCALL/SYSRET instruction path
+  (needs GDT slot reorg), xHCI + virtio-blk 64-bit DMA audit.
 
 🔲 **PLAN extensions (placeholders, design only):**
 - §M22 — GUI includes a Wayland-reuse evaluation phase

@@ -107,17 +107,23 @@ static inline void wrmsr(uint32_t msr, uint64_t v) {
     __asm__ volatile ("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
 }
 
-int lapic_init_bsp(uint32_t phys) {
+int lapic_init_bsp(uintptr_t phys) {
     /* Map a single 4 KiB page covering the LAPIC's MMIO window with
      * cache-disabled + write-through so reads always go to the device
-     * and never come back from a stale cache line. */
-    uint32_t aligned = phys & ~0xFFFu;
+     * and never come back from a stale cache line.
+     *
+     * `phys` is uintptr_t so an x86_64 board reporting an MMIO base
+     * above 4 GiB compiles without truncation; vmm_map's i386 impl
+     * still rejects > 4 GiB (CR3 layout), which is the right failure
+     * for that case. */
+    uintptr_t aligned = phys & ~((uintptr_t)0xFFFu);
     if (vmm_map(aligned, aligned, VMM_WRITABLE | VMM_CACHE_DIS) != 0) {
-        /* Possibly already mapped by the 4 MiB identity range — that's
-         * fine, the cache-disable bit will lose, but on QEMU 0xFEE00000
-         * is above the identity range so vmm_map should win. */
+        /* Possibly already mapped by the kernel's identity map — that's
+         * fine; the cache-disable bit will lose, but on QEMU
+         * 0xFEE00000 is above the identity range so vmm_map should
+         * win.  On x86_64 the 1 GiB boot identity already covers it. */
     }
-    g_lapic_mmio = (volatile uint8_t*)(uintptr_t)phys;
+    g_lapic_mmio = (volatile uint8_t*)phys;
 
     /* Force IA32_APIC_BASE.APIC_EN = 1 — firmware usually leaves it on
      * but spec says we should re-set it after a reset. */
@@ -198,6 +204,26 @@ void lapic_send_init(uint8_t target_apic_id) {
 void lapic_send_sipi(uint8_t target_apic_id, uint8_t vector) {
     lapic_w(LAPIC_REG_ICR_HI, ((uint32_t)target_apic_id) << 24);
     lapic_w(LAPIC_REG_ICR_LO, LAPIC_DM_STARTUP | LAPIC_ICR_ASSERT | vector);
+    ipi_wait_idle();
+}
+
+/* M18.6.4 — generic fixed-delivery IPI sender.  Used for cross-CPU
+ * preempt requests (vector 0x41) and any future "kick this CPU" path.
+ *
+ * Fixed delivery: target CPU's LAPIC vectors `vector` into the IDT
+ * exactly like any other IRQ.  Caller is expected to have an IDT
+ * gate installed for `vector` already (idt.c sets up 0x41 at boot).
+ *
+ * Avoid sending to self — Intel guarantees self-IPIs work but they
+ * defeat the purpose here (we wanted a different CPU to reschedule).
+ * Callers that want self-reschedule should `schedule_request()` and
+ * let the next local tick honor it. */
+void lapic_send_ipi(uint8_t target_apic_id, uint8_t vector) {
+    /* Self-IPI is a no-op for our use case; cheap guard to avoid the
+     * round-trip through LAPIC for a wakeup we don't need. */
+    if (g_lapic_mmio && target_apic_id == lapic_id()) return;
+    lapic_w(LAPIC_REG_ICR_HI, ((uint32_t)target_apic_id) << 24);
+    lapic_w(LAPIC_REG_ICR_LO, LAPIC_DM_FIXED | LAPIC_ICR_ASSERT | (uint32_t)vector);
     ipi_wait_idle();
 }
 

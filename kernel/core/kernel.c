@@ -140,15 +140,15 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * same pass enumerates LAPIC + IOAPIC topology for SMP (M18). */
     acpi_init();
 
-    /* APIC bring-up (M18).  If ACPI gave us a MADT with a LAPIC + at
-     * least one IOAPIC, switch IRQ routing from the 8259 to APIC.
-     * `idt_use_apic` re-routes the already-installed PIT (IRQ0) and
-     * PS/2 keyboard (IRQ1) handlers and masks both 8259s.
+    /* APIC bring-up (M18, x86_64 enabled by M20.5 Phase A).  If ACPI
+     * gave us a MADT with a LAPIC + at least one IOAPIC, switch IRQ
+     * routing from the 8259 to APIC.  `idt_use_apic` re-routes the
+     * already-installed PIT (IRQ0) and PS/2 keyboard (IRQ1) handlers
+     * and masks both 8259s.
      *
-     * Gated on i386 only for M20 — the x86_64 LAPIC/IOAPIC port lands
-     * in M20.5 along with SMP.  Until then x86_64 stays on the 8259
-     * (which still works fine on QEMU's q35/pc machines for UP). */
-#if defined(__i386__)
+     * Shared between i386 and x86_64 — lapic.c and ioapic.c compile
+     * for both archs (pure MMIO + MSR, no port I/O).  x86_64 SMP AP
+     * trampoline + SYSCALL/SYSRET remain in M20.5 Phase B/C. */
     if (acpi_lapic_phys() && acpi_ioapic_phys() && acpi_ncpus() > 0) {
         lapic_init_bsp(acpi_lapic_phys());
         ioapic_init(acpi_ioapic_phys(), acpi_ioapic_gsi_base());
@@ -159,9 +159,6 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     } else {
         kprintf("apic: not available, staying on 8259\n");
     }
-#else
-    kprintf("apic: x86_64 SMP/APIC bring-up deferred (M20.5)\n");
-#endif
 
     /* IRQs on.  PIT is already firing through IOAPIC at this point
      * (idt_use_apic re-routed it).  We need IRQs for both the LAPIC
@@ -174,9 +171,10 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * timer with the same value (LAPICs in one package share the bus
      * clock).  100 Hz target tick = 10 ms quantum upper bound.
      *
-     * i386-only for M20 (matches the APIC bring-up gate above).  On
-     * x86_64 the PIT continues delivering IRQ0 via the 8259 path. */
-#if defined(__i386__)
+     * Active on both i386 and x86_64 since M20.5 Phase A.  On x86_64
+     * `smp_boot_aps` is still a stub (returns 0) — Phase B lands the
+     * 16→32→64-bit AP trampoline.  Until then x86_64 stays single-CPU
+     * even with `-smp N`. */
     if (acpi_lapic_phys()) {
         uint32_t lapic_count = lapic_timer_calibrate(100);
         smp_set_lapic_timer_count(lapic_count);
@@ -190,7 +188,6 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     if (smp_ncpus() > 1) {
         smp_boot_aps();
     }
-#endif
 
     /* Two-level paging path round-trip. */
     {

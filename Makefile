@@ -55,7 +55,8 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/task_arch.c \
       kernel/hal/x86/lapic.c \
       kernel/hal/x86/ioapic.c \
-      kernel/hal/x86/smp.c
+      kernel/hal/x86/smp.c \
+      kernel/hal/x86/syscall.c
 
   ARCH_ASM_SRCS := \
       kernel/hal/x86/boot.s \
@@ -80,7 +81,11 @@ else ifeq ($(ARCH),x86_64)
   LIBGCC  := $(shell $(CC) -m64 -print-libgcc-file-name)
   QEMU    := qemu-system-x86_64
 
-  # x86_64 HAL implementation.  Phase 3 of M20 adds the GDT/IDT/TSS
+  # x86_64 HAL implementation.  Phase A of M20.5 reuses the i386
+  # lapic.c + ioapic.c verbatim (both files are pure MMIO + MSR with
+  # no port I/O), widening their `phys` params to uintptr_t.
+  #
+  # Phase 3 of M20 adds the GDT/IDT/TSS
   # + context-switch + isr stubs needed for kernel_main to link (the
   # final wiring happens in Phase 5 once vmm.c is ported).  SMP-side
   # files (lapic, ioapic, smp, ap_trampoline) come in a later phase /
@@ -95,14 +100,19 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/task_arch.c \
       kernel/hal/x86_64/mb2.c \
       kernel/hal/x86_64/main_entry.c \
-      kernel/hal/x86_64/m20_stubs.c
+      kernel/hal/x86_64/m20_stubs.c \
+      kernel/hal/x86_64/smp.c \
+      kernel/hal/x86_64/syscall.c \
+      kernel/hal/x86/lapic.c \
+      kernel/hal/x86/ioapic.c
 
   ARCH_ASM_SRCS := \
       kernel/hal/x86_64/boot.s \
       kernel/hal/x86_64/isr_stubs.s \
-      kernel/hal/x86_64/switch.s
+      kernel/hal/x86_64/switch.s \
+      kernel/hal/x86_64/usermode.s
 
-  ARCH_EXTRA_OBJS :=
+  ARCH_EXTRA_OBJS := kernel/hal/x86_64/ap_trampoline_blob.o
 
 else
   $(error Unsupported ARCH "$(ARCH)" — supported: i386, x86_64)
@@ -130,7 +140,6 @@ CORE_C_SRCS := \
     kernel/core/module.c \
     kernel/core/driver.c \
     kernel/core/config.c \
-    kernel/core/syscall.c \
     kernel/core/task.c \
     kernel/core/block.c \
     kernel/core/block_cache.c \
@@ -229,14 +238,15 @@ $(OBJ_DIR)/%.o: %.s
 	@mkdir -p $(@D)
 	$(AS) $(ASFLAGS) $< -o $@
 
-# AP boot trampoline (i386 SMP path).  Assembled as a flat binary so
-# `org 0x8000` works, then wrapped in an ELF object via objcopy.  Only
-# built on the i386 path because the x86_64 SMP bring-up will need its
-# own variant (16-bit real → 32-bit prot → 64-bit long).
+# AP boot trampoline — assembled as a flat binary so `org 0x8000` works,
+# then wrapped in an ELF object via objcopy.  Each arch has its own
+# trampoline source (i386 needs only real→protected; x86_64 chains
+# real→protected→long-mode) so the blob lives in arch-specific source
+# trees.  M20.5 Phase B added the x86_64 variant.
 #
 # objcopy mints symbol names from the input filename (replacing '/' and
 # '.' with '_'), and smp.c hard-references those names — so we MUST
-# keep the .bin file at its source-relative path.  Only the wrapper
+# keep the .bin files at their source-relative paths.  Only the wrapper
 # .o goes into the per-arch build tree.
 kernel/hal/x86/ap_trampoline.bin: kernel/hal/x86/ap_trampoline.s
 	nasm -f bin $< -o $@
@@ -245,6 +255,15 @@ $(OBJ_DIR)/kernel/hal/x86/ap_trampoline_blob.o: kernel/hal/x86/ap_trampoline.bin
 	@mkdir -p $(@D)
 	objcopy --input-target=binary --output-target=elf32-i386 \
 	         --binary-architecture=i386 \
+	         $< $@
+
+kernel/hal/x86_64/ap_trampoline.bin: kernel/hal/x86_64/ap_trampoline.s
+	nasm -f bin $< -o $@
+
+$(OBJ_DIR)/kernel/hal/x86_64/ap_trampoline_blob.o: kernel/hal/x86_64/ap_trampoline.bin
+	@mkdir -p $(@D)
+	objcopy --input-target=binary --output-target=elf64-x86-64 \
+	         --binary-architecture=i386:x86-64 \
 	         $< $@
 
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)

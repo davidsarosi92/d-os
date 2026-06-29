@@ -79,21 +79,26 @@ void hal_arch_early_init(void) {
 }
 
 /* ---------------------------------------------------------------------------
- * Syscall epilogue — stubbed for M20 phases 1-6.
+ * Syscall epilogue — SYS_EXIT teleport from a ring-3 program back to
+ * the kernel context saved by `enter_user_mode_wrap` (usermode.s).
  *
- * The int 0x80 path is not wired up on x86_64 yet (Phase 7 / M20.5
- * lands SYSCALL/SYSRET).  Until then any SYS_EXIT from a ring-3 task
- * would call here; we trap with a recognisable signature so it shows
- * up clearly in a serial log rather than silently misbehaving.
+ * Same shape as i386's `hal_syscall_exit_to_kernel`: load RSP with the
+ * stashed kernel value, then jump to the stashed return label.  This
+ * abandons the interrupt frame on the syscall stack (TSS.RSP0 →
+ * syscall_stack), which is fine because the next ring-3 → ring-0
+ * transition will reset RSP from TSS.RSP0 again.
  *
- * Once SYSCALL lands this becomes a real swapgs + register-restore
- * path mirroring i386's ESP/EIP rewrite.
+ * `noreturn` — the caller never sees control come back.
  * --------------------------------------------------------------------------- */
 
+__attribute__((noreturn))
 void hal_syscall_exit_to_kernel(uintptr_t saved_sp, uintptr_t saved_pc) {
-    (void)saved_sp;
-    (void)saved_pc;
-    /* No ring-3 path on x86_64 yet.  Hard-stop so a misrouted SYS_EXIT
-     * doesn't run off into garbage. */
-    for (;;) __asm__ volatile ("cli; hlt");
+    __asm__ volatile (
+        "movq %0, %%rsp\n\t"
+        "jmpq *%1\n\t"
+        :
+        : "r"(saved_sp), "r"(saved_pc)
+        : "memory"
+    );
+    __builtin_unreachable();
 }

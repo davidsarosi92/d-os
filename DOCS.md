@@ -1370,20 +1370,29 @@ from Linux's exfatprogs after each write.
 d-os builds on two arches today; a third (aarch64) is the next
 portability stress test on the roadmap.
 
-| Arch    | Status                              | Boot path                            |
-|---------|-------------------------------------|--------------------------------------|
-| i386    | Full — reference port               | Multiboot1 + 32-bit ELF              |
-| x86_64  | UP only; SMP + SYSCALL pending M20.5 | Multiboot2 + 64-bit ELF, long mode  |
-| aarch64 | Planned (M21)                       | UEFI / U-Boot, EL1 entry             |
+| Arch    | Status                                    | Boot path                            |
+|---------|-------------------------------------------|--------------------------------------|
+| i386    | Full — reference port                     | Multiboot1 + 32-bit ELF              |
+| x86_64  | Full — SMP + APIC + ring-3 via int 0x80   | Multiboot2 + 64-bit ELF, long mode   |
+| aarch64 | Planned (M21)                             | UEFI / U-Boot, EL1 entry             |
+
+x86_64 polish backlog: SYSCALL/SYSRET instruction path (currently
+ring 3 reaches the kernel via `int 0x80` only — same as i386); USB
+host (xHCI 64-bit DMA revisit); block layer (virtio-blk + exFAT
+64-bit DMA revisit).
 
 **Per-arch source tree:**
 - `kernel/hal/x86/`    — i386 HAL (boot.s, gdt, idt, tss, isr_stubs,
   switch, usermode, task_arch, hal_arch, vmm, io, lapic, ioapic,
-  smp, pci, ap_trampoline).
+  smp, syscall, pci, ap_trampoline).  `lapic.c` and `ioapic.c` are
+  also compiled into the x86_64 build (M20.5 Phase A) — they are
+  pure MMIO + MSR with no port I/O.
 - `kernel/hal/x86_64/` — x86_64 HAL (boot.s, gdt, idt, tss,
-  isr_stubs, switch, task_arch, hal_arch, vmm, io, mb2, main_entry,
-  m20_stubs).  No usermode.s, no lapic/ioapic/smp/ap_trampoline
-  yet — those land in M20.5.
+  isr_stubs, switch, usermode, task_arch, hal_arch, vmm, io, mb2,
+  main_entry, smp, syscall, ap_trampoline, m20_stubs).  M20.5 Phase
+  B brought up SMP via ap_trampoline.s + smp.c; Phase C added
+  ring-3 via usermode.s + syscall.c.  m20_stubs.c is down to one
+  symbol (xhci_poll) and will be deleted when xHCI is ported.
 
 **x86_64 boot path:**
 1. GRUB parses the multiboot2 header in `boot.s` (`.multiboot`
@@ -1407,15 +1416,19 @@ portability stress test on the roadmap.
    Then calls `kernel_main(MULTIBOOT_BOOTLOADER_MAGIC, mb1_ptr)` —
    so the rest of the kernel (pmm.c, fb_terminal.c, mboot_print_*,
    ...) sees the familiar mb1 layout regardless of how we booted.
-6. `kernel_main` runs the standard boot sequence.  Two arch-gated
-   blocks:
-   - APIC bring-up + LAPIC-timer programming + smp_boot_aps under
-     `#if defined(__i386__)`.  x86_64 stays on the 8259 PIC for UP
-     IRQ delivery; an `apic: x86_64 SMP/APIC bring-up deferred
-     (M20.5)` line lands on the serial log.
-   - Ring-3 paths (shell `ringtest` command, syscall_dispatch from
-     IDT vector 0x80) are not wired — they reach UP-only stubs in
-     `m20_stubs.c` that hard-halt if invoked.
+6. `kernel_main` runs the standard boot sequence — no arch-gated
+   blocks since M20.5 Phase C.  Both archs run the same flow:
+   - APIC bring-up + LAPIC-timer programming + smp_boot_aps.  On
+     `-smp N`, all N CPUs come online and accept scheduled work
+     (Phase B's x86_64 AP trampoline).
+   - Ring-3 reachable via `int 0x80` (Phase C).  Shell `ringtest`
+     drops to ring 3 with a hand-coded user program that prints
+     "hello from ring 3!" via SYS_PRINT and returns via SYS_EXIT
+     teleport — same flow that i386 has shipped since M6.
+   - SYSCALL/SYSRET instruction path is NOT wired up on x86_64
+     yet (the GDT slot layout doesn't satisfy SYSRET's
+     STAR[63:48]+16 / STAR[63:48]+8 selector convention; a GDT
+     reorganization is the natural follow-up).
 
 **HAL API status — vmm.h widening:**
 - `vmm_map / vmm_map_4mib / vmm_unmap / vmm_translate /
@@ -1438,15 +1451,31 @@ portability stress test on the roadmap.
 - `mboot_init`, `kernel_main` take `uintptr_t info_ptr`.  Boot.s
   on each arch passes the appropriate value.
 
-**What's deferred (M20.5):**
-- x86_64 SMP: AP trampoline rewrite for 16-bit real → 32-bit prot
-  → 64-bit long mode, LAPIC + IOAPIC port (mostly MMIO copy, but
-  vmm_map widening means the existing i386 lapic.c may be reusable
-  with minor cast cleanup), `smp_boot_aps` adapt to call the new
-  trampoline.
-- SYSCALL/SYSRET on x86_64: MSR setup (STAR, LSTAR, SFMASK), new
-  entry stub in asm with swapgs + register-restore.  `int 0x80`
-  gate remains for compatibility.
+**What landed across M20.5 (2026-06-29):**
+
+- **Phase A** — LAPIC + IOAPIC compile for x86_64 (`kernel/hal/x86/
+  lapic.c` and `ioapic.c` listed under the x86_64 source set in the
+  Makefile, `phys` params widened to `uintptr_t`).  `kernel.c`
+  arch-gates around APIC bring-up dropped.  `kprintf` gained `%l`
+  / `%ll` / `%z` length modifiers and uintptr_t-width `%p`.
+- **Phase B** — x86_64 SMP AP bring-up.  New
+  `kernel/hal/x86_64/ap_trampoline.s` (16→32→64-bit chain via
+  inline trampoline GDT, then lgdt + far-ret into the kernel GDT)
+  + `kernel/hal/x86_64/smp.c`.  `-smp 4` brings up all 4 CPUs;
+  parallel self-test PASSes with hog ticks ~2-4× UP baseline.
+- **Phase C** — x86_64 ring-3 via `int 0x80`.  New
+  `kernel/hal/x86_64/usermode.s` (5-quadword iretq frame +
+  SYS_EXIT teleport) + `kernel/hal/x86_64/syscall.c` (mirror of
+  i386 dispatcher with rax/rbx fields).  Moved
+  `kernel/core/syscall.c` to `kernel/hal/x86/syscall.c` —
+  closes one of the M17 deferred items.  `m20_stubs.c` shrank to
+  one symbol: `xhci_poll`.
+
+**What remains (x86_64 polish backlog):**
+- SYSCALL/SYSRET instruction path.  Requires GDT slot
+  reorganization (SYSRET wants user data 8 below user code64 from
+  STAR[63:48], which our 0x18 user-CS / 0x20 user-DS layout
+  doesn't satisfy).  `int 0x80` covers all current ring-3 needs.
 - USB host (xHCI) and block layer (virtio-blk + exFAT) for x86_64:
   drivers currently compiled out of the x86_64 build because their
   DMA paths assume <4 GiB phys addressing and need a 64-bit revisit.
@@ -1462,9 +1491,20 @@ M20 change-log entries):**
   ARCH-specific build trees.
 - IDTR is per-CPU even though the IDT data is shared; each AP
   (and the x86_64 BSP) must run its own `lidt`.
-- kprintf in `kernel/core/printf.c` has no `%l` prefix.  Use `%x`
-  + manual 64-bit-to-32-bit casts until the polish-backlog printf
-  rewrite lands.
+- `lapic.c` / `ioapic.c` are arch-family-shared, not "x86 only" —
+  pure MMIO + MSR with `rdmsr`/`wrmsr`/`pause` instructions that
+  encode identically in 32-bit and 64-bit mode.  They live under
+  `kernel/hal/x86/` for historical reasons but participate in both
+  builds (M20.5 Phase A).
+- On x86_64 long mode, EVERY level of the 4-level page-table walk
+  checks the US bit, not just the leaf PT entry.  boot.s builds
+  the bootstrap PML4[0] / PDPT[0] / PD[i] with US=0 (kernel-only);
+  the first user mapping under that subtree #PFs with err=5 (P+U
+  set) because PML4[0]'s US=0 is the binding constraint.
+  walk_to_pt was patched in Phase C to OR US into existing
+  intermediate entries when the caller's flags request it.  Safe:
+  we only widen permissions, never tighten, and the actual page
+  protection still lives in the leaf PT.
 
 ### 4.12 ACPI (`kernel/acpi/acpi.c`)
 - **Purpose:** discover ACPI tables at boot, parse `_S5_` from DSDT, enable
@@ -1556,6 +1596,186 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 ---
 
 ## 8. Change log
+
+- **2026-06-29 — M18.6 (partial) + M19.5.2: SMP polish + empty-slab caching.**
+  Half of the polish round shipped (5/11 sub-items):
+  - **§M18.6.1 — Per-CPU runqueue + load balancer.** Replaced the global
+    runqueue with a per-CPU one (intrusive doubly-linked list rooted at
+    `percpu->rq_head`, threaded via `task->rq_next/rq_prev`).  Each
+    CPU's schedule walks ONLY its own rq.  Master task list (for ps,
+    iteration, find) is now separate, threaded via `task->next` and
+    protected by a dedicated `master_lock`.  Load balancer runs from
+    schedule's idle-fallback path: when local rq is empty, scan peers
+    for the busiest queue and steal a task whose affinity allows
+    running here.  Cleanest correctness win: scheduler lock acquire +
+    release pair across context_switch (the "lock-handoff" pattern) is
+    now safe under task migration — schedule()'s unlock re-reads
+    `this_cpu()` so the lock released is whichever CPU we're on NOW,
+    not the one we entered on.
+  - **§M18.6.2 — Per-CPU `preempt_count`.** Was a single global
+    (incorrect on SMP — disabling on CPU A also gated CPU B).  Now
+    lives in `struct percpu`; accessors bracket the read-modify-write
+    in `hal_intr_save`/`restore` so the local timer can't migrate us
+    mid-increment.
+  - **§M18.6.3 — Task affinity + `taskset`.** Each task carries a
+    `cpu_mask` (default 0xFFFFFFFF = any CPU); scheduler and load-
+    balancer-steal both filter by `(mask >> this_cpu_id) & 1`.
+    `taskset <pid> <hex-mask>` rebinds.  `task_set_affinity` migrates
+    the task if its current cpu_home is no longer in the new mask.
+    `lscpu` now also prints per-CPU rq depth.
+  - **§M18.6.4 — Cross-CPU preempt IPI sender.** New
+    `lapic_send_ipi(target_apic_id, vector)` (fixed delivery, self-IPI
+    no-op'd internally).  `smp_send_reschedule(cpu_index)` wraps it on
+    vector 0x41 (handler already wired since M18.5).  `task_enqueue`
+    fires it whenever a task lands on a CPU other than self — wakes
+    the target's hlt'd idle so the task starts running without
+    waiting up to ~10 ms for the next local LAPIC tick.
+  - **§M19.5.2 — Empty-slab caching.** Slab caches keep up to
+    EMPTY_SLAB_MAX (=4) fully empty slabs per cache instead of
+    immediately releasing each to the buddy.  Refill prefers a cached
+    empty slab over a fresh `page_alloc`.  `slabinfo` gained a
+    `CACHED-EMPTY` column.  Reduces buddy thrash on bursty allocators
+    without significant retention (4 × 4 KiB × 8 caches = 128 KiB max
+    retained kernel-wide).
+  Lock-protocol details: schedule() / schedule_locked split into
+  acquire-then-pick-then-context_switch with the unlock conceptually
+  paired across context_switches (see `kernel/core/task.c` block
+  comment on schedule_locked).  Brand-new tasks use
+  `task_finish_first_switch` to drop the rq_lock on their first run.
+  Verified: `-smp 4` boots cleanly on both i386 and x86_64; preempt
+  + parallel self-tests PASS; both tests show CPU-bound hogs running
+  on multiple cores.
+  Lessons learned:
+  * The acquired rq_lock identity at schedule() entry is NOT the
+    lock identity at schedule() exit if a context_switch led us here
+    from another CPU's scheduler.  Re-read `this_cpu()->rq_lock` at
+    release time.  Pairs across CPU boundaries: every acquire is
+    matched by exactly one release SOMEWHERE in the chain of
+    context_switches.
+  * IPI on vector 0x41 must NOT also set need_resched on the
+    receiver via the IDT handler — the IPI's PURPOSE is to wake the
+    receiver from hlt; once the receiver returns to its idle loop's
+    `task_yield`, the natural schedule() picks up the new work.
+    Setting need_resched in the IPI handler would just create one
+    extra schedule_check no-op.
+  * Pre-decrement `c->slabs` BEFORE calling `slab_release`, then have
+    `slab_release` re-increment if it kept the page cached.  Without
+    this, "page count" diverges from "active page count" once the
+    LIFO grows.
+  Deferred to a follow-up polish session: §M18.6.5 (MSI/MSI-X
+  discovery + vector allocator), §M19.5.1 (HIGHMEM zone population
+  + kmap on i386 / identity-map extension on x86_64), §M19.5.3
+  (ACPI SRAT → per-NUMA-node zones), §M20.6.1 (SYSCALL/SYSRET
+  instruction path — needs GDT slot reorg), §M20.6.2/.3 (xHCI +
+  virtio-blk 64-bit DMA audit + x86_64 enable).  All independent of
+  each other and of M21+.
+
+- **2026-06-29 — M20.5 Phase C: x86_64 ring-3 via `int 0x80`.**
+  Ring-3 on x86_64 now works the same way it does on i386: shell
+  `ringtest` allocates two frames, USER-maps them at 0x40000000 +
+  0x40001000, hand-codes a tiny program that calls SYS_PRINT then
+  SYS_EXIT via `int 0x80`, drops to ring 3 via `iretq`, and lands
+  back in kernel mode via the SYS_EXIT teleport.  Verified end-to-
+  end: `ringtest: dropping to ring 3... / hello from ring 3! /
+  ringtest: back in ring 0`.
+  New files: `kernel/hal/x86_64/usermode.s` (5-quadword iretq frame
+  build + saved_rsp/saved_rip stash, exits via .return label on
+  SYS_EXIT teleport), `kernel/hal/x86_64/syscall.c` (mirror of i386
+  syscall dispatcher with rax/rbx field reads).  Removed `kernel/
+  core/syscall.c` (was effectively i386-specific via the `eax`/`ebx`
+  field reads); moved to `kernel/hal/x86/syscall.c` so both archs
+  keep their dispatcher in their HAL tree.  This closes the M17
+  deferred item "kernel/core/syscall.c arch split".  `kernel/hal/
+  x86_64/hal_arch.c::hal_syscall_exit_to_kernel` got a real impl
+  (movq saved_sp,%rsp ; jmpq *saved_pc) replacing the hard-halt
+  stub.  `kernel/includes/usermode.h` prototype widened from
+  uint32_t to uintptr_t — i386 callers passing 32-bit literals are
+  source-compatible.  `m20_stubs.c` shrank to ONE stub:
+  `xhci_poll` (deferred until the xHCI driver gets a 64-bit DMA
+  audit).  Lesson learned: on x86_64 long mode, EVERY level of the
+  4-level page walk checks the US bit — not just the leaf PT entry.
+  boot.s builds PML4[0] / PDPT[0] / PD[i] with US=0; the first
+  vmm_map of a user page would fault (err=5, P+U set) in ring 3
+  because PML4[0] still had US=0 even though the PT entry was
+  US=1.  Fix: in walk_to_pt, when traversing an existing
+  intermediate entry whose US bit is 0 but the caller's flags
+  request US, OR the bit in.  Permissions can only widen this
+  way — safe under any caller mix.
+  SYSCALL/SYSRET instruction path is deliberately NOT wired up in
+  this phase: the SYSRET selector-arithmetic convention (user CS =
+  STAR[63:48] + 16, user SS = STAR[63:48] + 8) doesn't fit our
+  current GDT slot layout (user CS at 0x18, user DS at 0x20 — no
+  STAR[63:48] satisfies both).  Deferred to a follow-up that
+  reorganizes the GDT into the Linux-style layout (kernel CS/DS
+  contiguous, user DS before user CS) — touching i386 + x86_64 +
+  usermode.s + trampoline.  Phase C delivers full ring-3
+  functionality via `int 0x80` either way.
+
+- **2026-06-29 — M20.5 Phase B: x86_64 SMP AP bring-up.**
+  x86_64 went from "BSP only, APs idle" to "all CPUs scheduling
+  real work in parallel."  New `kernel/hal/x86_64/ap_trampoline.s`
+  (flat-binary blob copied to physical 0x8000; 16-bit real → 32-bit
+  protected → 64-bit long-mode chain with a self-contained
+  trampoline GDT, then `lgdt` + far-ret into the kernel GDT and
+  jmp to the C entry).  New `kernel/hal/x86_64/smp.c` (mirror of
+  i386 smp.c with 64-bit ap_info fields; ap_main does the same
+  per-CPU init as i386 — lapic_init_ap + percpu_init_ap + idt_load
+  + task_install_ap_idle + lapic_timer_start_periodic + idle loop).
+  smp_boot_aps / smp_set_lapic_timer_count dropped from
+  m20_stubs.c.  Makefile gained the matching ap_trampoline.bin
+  build rule (objcopy --output-target=elf64-x86-64
+  --binary-architecture=i386:x86-64).  Verified on `qemu-system-
+  x86_64 -m 256M -smp 4`: serial log shows `ap: cpu 1 (apic_id=1)
+  online` for slots 1/2/3, then `smp: 3 AP(s) started (of 4 total
+  CPU(s))`.  parallel self-test PASSes with hog ticks ~2-4×
+  higher than UP — genuine multi-CPU execution.  i386 baseline
+  unchanged.
+  Why a self-contained trampoline GDT rather than reusing the
+  kernel GDT (like the i386 trampoline does): `lgdt` in 16-bit
+  real mode reads m16:24 (6-byte form), so it can't load the
+  long-mode kernel GDT's 10-byte (m16:64) pointer directly.  The
+  trampoline carries its own GDT with 32-bit + 64-bit code/data
+  descriptors, gets the CPU into 64-bit, then re-`lgdt`s the
+  kernel GDT (now reading m16:64) and far-rets to kernel CS.
+  Between the `lgdt` and the far-ret, CS still references the
+  trampoline GDT's slot 3 (now reinterpreted under the kernel
+  GDT, which has user code descriptor at slot 3 with DPL=3) — but
+  the CPU doesn't re-evaluate CS until something touches it, so
+  as long as no instruction between lgdt and far-ret causes a
+  segment recheck, the transition is safe.
+
+- **2026-06-29 — M20.5 Phase A: x86_64 APIC bring-up + `printf %l`.**
+  First slice of the x86_64 port closure.  LAPIC + IOAPIC now run on
+  both archs from the same `kernel/hal/x86/lapic.c` / `ioapic.c`
+  sources (they were always pure MMIO + MSR — no port I/O — so the
+  same .c files compile under `-m32` and `-m64`).  Their public
+  `phys` params widened from `uint32_t` to `uintptr_t` so MMIO above
+  4 GiB is expressible without truncation (QEMU keeps it at
+  0xFEC00000 / 0xFEE00000 on both archs, but the type is now right).
+  `kernel.c` lost its `#if defined(__i386__)` guards around the APIC
+  bring-up block + LAPIC-timer programming + `smp_boot_aps()` —
+  the same flow runs on both archs.  Stubs in
+  `kernel/hal/x86_64/m20_stubs.c` shrank: lapic_*/ioapic_* gone;
+  remaining stubs are `smp_boot_aps` (returns 0 until Phase B's AP
+  trampoline), `smp_set_lapic_timer_count` (no-op), `syscall_dispatch`
+  + `enter_user_mode_wrap` (Phase C), `xhci_poll` (separate
+  milestone).  `kprintf` gained length modifiers — `%l`, `%ll`, `%z`
+  (so `%lx` prints 64-bit on x86_64, 32-bit on i386 transparently)
+  — and `%p` now prints uintptr_t-width hex (8 digits on i386, 16
+  on x86_64) so addresses line up regardless of arch.  Verified on
+  `qemu-system-x86_64 -m 256M` with both `-smp 1` and `-smp 2`:
+  serial log shows `lapic: BSP enabled at 0x00000000fee00000
+  (id=0)`, `ioapic: 24 entries at 0x00000000fec00000`, `apic:
+  routing live (bsp_apic_id=0), 8259 disabled`, `lapic: timer
+  calibrated — ~79k ticks/ms, count=789320 for 100 Hz`, `percpu: N
+  CPUs known, BSP at slot 0`, preempt self-test PASS (hog ticks
+  ~100M in 500 ms — LAPIC timer is the preempt source on x86_64
+  now, not the PIT).  parallel self-test reports PASS on `-smp 2`,
+  but note the second hog is still round-robining on BSP — actual
+  AP execution waits on Phase B.  i386 baseline unchanged.
+  Lessons (added to source comments): `lapic.c`/`ioapic.c` are
+  arch-family-shared, not x86-only — keep them under `kernel/hal/x86/`
+  for now but list them in both arch source sets.
 
 - **2026-06-29 — M20: x86_64 (long mode) port — UP, shell prompt up.**
   Second-arch shakedown of the M17 HAL boundary.  Multi-arch build

@@ -1,5 +1,12 @@
 /* =============================================================================
- * syscall.c — int 0x80 dispatcher.
+ * syscall.c — int 0x80 dispatcher (i386).
+ *
+ * Moved from kernel/core/ to kernel/hal/x86/ in M20.5 Phase C — the
+ * dispatcher's body reads arch-specific int_frame fields (eax, ebx)
+ * so it's not portable.  x86_64 has its own copy under
+ * kernel/hal/x86_64/syscall.c that reads (rax, rbx, ...).  The
+ * syscall numbers themselves live in the portable
+ * kernel/includes/syscall.h.
  *
  * Reached from `isr_handler` (idt.c) when a ring-3 process executes
  * `int 0x80`.  The CPU has already pushed the user's SS/ESP/EFLAGS/CS/EIP

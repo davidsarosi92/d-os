@@ -1,68 +1,73 @@
 /* =============================================================================
- * task.c — kernel task table + preemptive round-robin scheduler.
+ * task.c — kernel task table + per-CPU preemptive round-robin scheduler.
  *
- * Run-queue is a circular singly-linked list of `struct task`, rooted at
- * `current`.  `schedule()` walks `current->next` looking for the next
- * RUNNABLE task; if none other is found, it returns immediately.
- * Otherwise it calls `context_switch` (switch.s) to swap registers and
- * stack.
+ * Two data structures.
  *
- * Two entry points reach `schedule()`:
- *   - Cooperative:   task_yield() → schedule()
- *   - Preemptive:    pit_irq() → schedule_request() sets a deferred flag;
- *                    isr_handler, after pic_eoi, calls schedule_check()
- *                    which honors the flag (if preempt_count == 0).
+ *   1. Master task list — circular singly-linked list of every alive
+ *      (non-DEAD) task, rooted at `master_head` and threaded via
+ *      `task->next`.  Used by ps / task_for_each / task_find — i.e.
+ *      iteration paths that don't care which CPU a task is on.  The
+ *      master list is protected by `master_lock`.
  *
- * Why the deferred flag instead of context-switching directly from
- * pit_irq?  If we switched away mid-handler, pic_eoi would never fire
- * on that IRQ — the PIC would consider IRQ0 still in-service and stop
- * delivering further timer interrupts to the new task.  The flag lets
- * us complete the EOI on the OLD task's stack, then pivot.
+ *   2. Per-CPU runqueues — one intrusive doubly-linked list per CPU,
+ *      rooted at `percpu->rq_head` and threaded via
+ *      `task->rq_next/rq_prev`.  ONLY RUNNABLE non-idle tasks live on
+ *      a runqueue, and a task is on AT MOST one runqueue at a time
+ *      (which CPU is recorded in task->cpu_home).  Idle tasks are
+ *      not on any runqueue — each CPU's idle is reached via
+ *      percpu->idle.  Each per-CPU runqueue is protected by its
+ *      own `percpu->rq_lock`.
  *
- * Synchronization (UP).  We rely on `cli` to keep the runqueue stable
- * against the timer IRQ (the only other thing that could mutate it).
- * Every runqueue mutator brackets its work in pushf/cli ... popf-equiv.
- * No spinlock_t is needed here — UP has no second CPU to spin against.
- * (`spinlock_t` from lock.h is still used by other subsystems that need
- * the API shape for the SMP future; the scheduler doesn't need that
- * shape because schedule() itself is the thing other code synchronizes
- * around, not the other way.)
+ * Lock ordering (when both are needed):  master_lock outer, rq_lock
+ * inner.  Most fast-paths only need rq_lock for this_cpu().
  *
- * Bootstrap subtlety: pid 0 is the original kernel_main flow.  We
- * synthesize its `struct task` without allocating a stack (we already
- * have one) — its `esp` field is left zero and gets populated by the
- * very first `context_switch` that swaps away from it.
+ * ---------------------------------------------------------------------
+ * Scheduling sketch (per-CPU, M18.6.1)
+ * ---------------------------------------------------------------------
  *
- * Stack layout for a fresh task (so context_switch's pop+ret lands at
- * task_trampoline, which then `sti`s and jumps to the entry):
+ *   schedule() runs in the context of THIS CPU only.  It looks at the
+ *   local rq head, picks the first task that:
+ *     - is RUNNABLE
+ *     - has this_cpu_id in its cpu_mask (M18.6.3 affinity)
+ *     - is not currently `current` on some other CPU (safety net for
+ *       a corner case where the load balancer just stole the task)
+ *   and rotates it to the tail (round-robin).  Falls back to the
+ *   per-CPU idle if no candidate exists.  Worst case is O(rq_len) per
+ *   pick instead of O(ntasks * ncpus) under the global lock — and the
+ *   common case is O(1) when the head matches.
  *
- *   [low addr]
- *     ebx = entry      \   ebx-via-spawn carries the entry pointer into
- *     esi = 0           |  the trampoline (which moves it out before the
- *     edi = 0           |  call); the rest of the callee-saved regs are
- *     ebp = 0          /   zeroed to keep gdb traces tidy
- *     task_trampoline  <-- return addr; `ret` jumps here on first switch
- *     0xDEADBEEF       <-- guard if entry returns despite task_exit
- *   [high addr / stack top]
+ *   Load balance runs every LOAD_BALANCE_INTERVAL_MS on the local
+ *   tick: if this CPU's rq is empty, scan peers for the longest queue
+ *   and steal one task whose affinity allows running here.  Then send
+ *   a reschedule IPI to ourselves only if the steal woke us up from
+ *   idle and we want immediate pickup (the natural next local tick is
+ *   usually fine and avoids self-IPI overhead).
  *
- * `task->esp` is set to point at the `ebx` slot.
+ * ---------------------------------------------------------------------
+ * Brand-new task wiring (unchanged from M18)
+ * ---------------------------------------------------------------------
  *
- * IRQ-on / IRQ-off invariants across context_switch:
+ *   task_spawn pre-builds the kernel stack so the first context_switch
+ *   `ret` lands at task_trampoline (arch-specific), which releases the
+ *   runqueue lock (held by the spawning schedule()) and then sti's
+ *   before calling the entry.  See hal/<arch>/task_arch.c.
  *
- *   schedule() entered IF=1 (cooperative):
- *     cli → fl saved with IF=1 → switch out → ... → switch back in →
- *     schedule() restores IF=1.  Caller's view: nothing changed.
+ *   On the per-CPU rq world, the lock that the trampoline releases is
+ *   this_cpu()'s rq_lock — the same lock the schedule() that picked
+ *   the brand-new task was holding.
  *
- *   schedule() entered IF=0 (called from IRQ via schedule_check):
- *     cli (no-op) → fl saved with IF=0 → switch out → ... → switch back
- *     in → schedule() does NOT sti (fl had IF=0).  Returns to IRQ-exit
- *     path, which iret restores the pre-IRQ EFLAGS (and with it, the
- *     pre-IRQ IF).
+ * ---------------------------------------------------------------------
+ * Deferred reschedule
+ * ---------------------------------------------------------------------
  *
- *   brand-new task first run:
- *     reached via context_switch's `ret` → task_trampoline.  We never
- *     went through a schedule() to get here, so we explicitly `sti` in
- *     the trampoline to let interrupts start arriving at our entry.
+ *   `need_resched` is one bit per CPU (lives in percpu).  Timer IRQ
+ *   sets the local flag; IRQ exit consults it.  This makes a remote
+ *   schedule_request via lapic IPI (vector 0x41) safe — it'll set the
+ *   right CPU's flag.
+ *
+ * Bootstrap: pid 0 = the original kernel_main flow.  We synthesize its
+ * `struct task` without allocating a stack; esp is set by the first
+ * context_switch that swaps away from it.
  * ============================================================================= */
 
 #include "task.h"
@@ -71,43 +76,19 @@
 #include "lock.h"
 #include "hal_api.h"
 #include "percpu.h"
+#include "smp.h"
 #include <stddef.h>
 #include <stdint.h>
 
-/* The arch-specific context-switch routine.  On x86 see
- * kernel/hal/x86/switch.s; on x64/aarch64 the equivalent ships with
- * those ports.  Signature is intentionally `uintptr_t` so the same
- * declaration works on every 32/64-bit arch. */
 extern void context_switch(uintptr_t* save_esp_to, uintptr_t new_esp);
 
-/* Run-queue (M18): a single circular singly-linked list shared by
- * every CPU.  `head` is the diagnostic anchor; the per-CPU pointer
- * to the currently-running task lives in `this_cpu()->current`.
- *
- * A single global runqueue with a spinlock is the simplest correct
- * SMP design — fine until contention shows up.  Per-CPU runqueues +
- * a load-balancer is an M19/M18.5 follow-up (see PLAN.md).  Today's
- * lock contention is invisible on -smp 2 because both CPUs spend
- * most of their time in their idle tasks. */
-static struct task* head      = NULL;
-static int          next_pid  = 0;
-static spinlock_t   runqueue_lock = SPINLOCK_INIT;
-
-
-/* Deferred-reschedule flag.  Set by schedule_request() (from pit_irq),
- * consumed by schedule_check() (from isr_handler after pic_eoi).  Reader
- * and writer always run with IF=0 (writer is in IRQ context; reader is
- * in IRQ-exit), so no torn 32-bit reads. */
-static volatile int need_resched = 0;
-
 /* ------------------------------------------------------------------- */
-/* IRQ-save / IRQ-restore — go through the HAL (M17).                   */
-/*                                                                      */
-/* Pre-M17 we inlined the pushf/cli pair here for "compiler-friendly    */
-/* hot path" reasons; that's now a HAL call.  Same single instruction   */
-/* generated on x86, and the same source compiles unchanged on x64 /    */
-/* aarch64 once their HAL ships.                                         */
+/* Master list state.                                                   */
 /* ------------------------------------------------------------------- */
+
+static struct task* master_head = NULL;   /* circular SLL of all alive tasks */
+static int          next_pid    = 0;
+static spinlock_t   master_lock = SPINLOCK_INIT;
 
 /* ------------------------------------------------------------------- */
 /* Helpers.                                                             */
@@ -128,46 +109,112 @@ static const char* state_name(enum task_state s) {
     return "?";
 }
 
-/* Insert `t` into the circular list.  Caller must hold runqueue_lock
- * and have IRQs disabled.  If the queue is empty, `t` becomes the
- * sole occupant AND the BSP's current task — that's the bootstrap
- * path for pid 0. */
-static void runqueue_insert_locked(struct task* t) {
-    if (!head) {
-        t->next = t;
-        head    = t;
-        /* Bootstrap: BSP picks up this first task as its current. */
-        this_cpu()->current = t;
+/* Master-list insertion — caller holds master_lock. */
+static void master_insert_locked(struct task* t) {
+    if (!master_head) {
+        t->next     = t;
+        master_head = t;
     } else {
-        t->next    = head->next;
-        head->next = t;
+        t->next            = master_head->next;
+        master_head->next  = t;
     }
 }
 
-/* Append `t` to the ring without touching any `current` pointer.
- * Used by AP bootstrap (the AP wants its own idle as `current` but
- * the global ring already exists, so the empty-queue branch above
- * would be wrong). */
-static void runqueue_append_locked(struct task* t) {
-    if (!head) {
-        /* Same as empty-queue path of insert; shouldn't happen on
-         * AP, but stay safe. */
-        t->next = t;
-        head    = t;
+/* ------------------------------------------------------------------- */
+/* Per-CPU runqueue plumbing.                                           */
+/* ------------------------------------------------------------------- */
+
+/* Insert at tail of rq.  Caller holds rq->rq_lock; task->cpu_home is
+ * the caller-set destination CPU index.  Idempotent: re-enqueueing
+ * an already-on-this-rq task is a no-op (defensive — shouldn't
+ * happen if state transitions are right). */
+static void rq_insert_tail_locked(struct percpu* rq, struct task* t) {
+    if (t->rq_next || t->rq_prev || rq->rq_head == t) return;
+    if (!rq->rq_head) {
+        rq->rq_head = t;
+        t->rq_next  = t;
+        t->rq_prev  = t;
     } else {
-        t->next    = head->next;
-        head->next = t;
+        struct task* head = rq->rq_head;
+        struct task* tail = head->rq_prev;
+        t->rq_next     = head;
+        t->rq_prev     = tail;
+        tail->rq_next  = t;
+        head->rq_prev  = t;
     }
+    rq->rq_count++;
+}
+
+/* Remove a task from its current rq.  Caller holds the OWNING rq's
+ * lock (= percpu_at(t->cpu_home)->rq_lock).  After return, t's
+ * rq_next/rq_prev are NULL and t is no longer on any runqueue. */
+static void rq_remove_locked(struct percpu* rq, struct task* t) {
+    if (!t->rq_next && !t->rq_prev && rq->rq_head != t) return;
+    if (rq->rq_head == t) {
+        if (t->rq_next == t) {
+            /* Single-element rq. */
+            rq->rq_head = NULL;
+        } else {
+            rq->rq_head = t->rq_next;
+        }
+    }
+    t->rq_prev->rq_next = t->rq_next;
+    t->rq_next->rq_prev = t->rq_prev;
+    t->rq_next = NULL;
+    t->rq_prev = NULL;
+    if (rq->rq_count > 0) rq->rq_count--;
+}
+
+/* Pick the lightest-loaded online CPU among those allowed by `mask`.
+ * Tiebreak: prefer this_cpu_id so newly spawned tasks land here. */
+static int pick_lightest_cpu(uint32_t mask) {
+    int self = this_cpu_id();
+    int best = -1;
+    int best_load = 0x7FFFFFFF;
+    int n = smp_ncpus();
+    for (int i = 0; i < n; i++) {
+        if ((mask & (1u << i)) == 0) continue;
+        struct percpu* p = percpu_at(i);
+        if (!p || !p->online) continue;
+        int load = p->rq_count;
+        if (load < best_load || (load == best_load && i == self)) {
+            best = i;
+            best_load = load;
+        }
+    }
+    /* If no online CPU is in the mask, fall back to self even though
+     * the mask doesn't include it — caller is expected to validate
+     * masks before calling, but be defensive. */
+    if (best < 0) best = self;
+    return best;
+}
+
+/* Enqueue `t` onto a runqueue.  Picks a destination CPU based on
+ * affinity + current load.  Caller must NOT hold any rq_lock; we
+ * acquire here.  Caller is responsible for setting t->state = RUNNABLE
+ * before calling. */
+static void task_enqueue(struct task* t) {
+    if (t->is_idle) return;                       /* idle is not on any rq */
+
+    int cpu = pick_lightest_cpu(t->cpu_mask ? t->cpu_mask : 0xFFFFFFFFu);
+    struct percpu* rq = percpu_at(cpu);
+    if (!rq) return;
+
+    uint32_t fl = spin_lock_irqsave(&rq->rq_lock);
+    t->cpu_home = cpu;
+    rq_insert_tail_locked(rq, t);
+    spin_unlock_irqrestore(&rq->rq_lock, fl);
+
+    /* If we enqueued onto a different CPU, kick it so it picks up
+     * the work without waiting up to a quantum for its own tick. */
+    if (cpu != this_cpu_id()) smp_send_reschedule(cpu);
 }
 
 /* ------------------------------------------------------------------- */
 /* Init.                                                                */
 /* ------------------------------------------------------------------- */
 
-/* Generic per-CPU idle entry — halt forever until preempted away.
- * Used by the BSP idle thread synthesized at task_init time; APs use
- * their own ap_main loop body which serves the same role (idle = the
- * already-running context). */
+/* Generic per-CPU idle entry — halt forever until preempted away. */
 static void cpu_idle_entry(void) {
     for (;;) {
         hal_intr_enable();
@@ -188,17 +235,32 @@ void task_init(void) {
     t0->state       = TASK_RUNNABLE;
     t0->esp         = 0;                /* set by first context_switch */
     t0->kstack_base = NULL;             /* we don't own boot's stack */
+    t0->cpu_mask    = 0xFFFFFFFFu;
+    t0->cpu_home    = 0;                /* BSP */
+    t0->rq_next = t0->rq_prev = NULL;
 
-    uint32_t fl = spin_lock_irqsave(&runqueue_lock);
-    runqueue_insert_locked(t0);
-    spin_unlock_irqrestore(&runqueue_lock, fl);
+    /* Insert into master list. */
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    master_insert_locked(t0);
+    spin_unlock_irqrestore(&master_lock, fl);
+
+    /* Stamp BSP's current pointer.  At this point percpu_init_bsp has
+     * NOT run yet (acpi+lapic come later in kernel_main); this_cpu()
+     * still returns slot 0 since the lapic_id() readback is 0 before
+     * the LAPIC is enabled.  That's the right slot. */
+    this_cpu()->current = t0;
+
+    /* Enqueue t0 onto its home rq so scheduler's rotate-to-tail and
+     * round-robin walk see it like any other RUNNABLE non-idle task.
+     * rq_lock is zero-initialized (= unlocked) before percpu_init_bsp
+     * runs, which is the same state spin_lock_init leaves it in. */
+    uint32_t fl_rq = spin_lock_irqsave(&this_cpu()->rq_lock);
+    rq_insert_tail_locked(this_cpu(), t0);
+    spin_unlock_irqrestore(&this_cpu()->rq_lock, fl_rq);
 
     /* Synthesize BSP idle (M18.5).  Distinct from kernel_main: when
-     * the kernel_main flow eventually task_exit()s, the scheduler
-     * needs a non-DEAD task to fall back to or BSP would halt
-     * forever — and that halts PIT delivery, which freezes time on
-     * every other CPU too.  Spawning idle here makes BSP a proper
-     * scheduler citizen from the start. */
+     * kernel_main eventually task_exits, the scheduler falls back to
+     * BSP idle rather than halt forever. */
     void* idle_stack = kmalloc(TASK_KSTACK_SZ);
     struct task* bsp_idle = (struct task*)kcalloc(1, sizeof(struct task));
     if (bsp_idle && idle_stack) {
@@ -210,77 +272,68 @@ void task_init(void) {
                                     cpu_idle_entry);
         bsp_idle->kstack_base = idle_stack;
         bsp_idle->is_idle     = 1;
+        bsp_idle->cpu_mask    = 1u << 0;        /* pinned to BSP */
+        bsp_idle->cpu_home    = 0;
+        bsp_idle->rq_next = bsp_idle->rq_prev = NULL;
 
-        uint32_t fl2 = spin_lock_irqsave(&runqueue_lock);
-        runqueue_append_locked(bsp_idle);
+        uint32_t fl2 = spin_lock_irqsave(&master_lock);
+        master_insert_locked(bsp_idle);
+        spin_unlock_irqrestore(&master_lock, fl2);
+
         this_cpu()->idle = bsp_idle;
-        spin_unlock_irqrestore(&runqueue_lock, fl2);
     }
 
     kprintf("task: pid 0 (kernel) installed\n");
 }
 
 /* AP-side idle-task bootstrap (M18.5).  Each AP calls this from its
- * C entry to (1) synthesize a task struct for its currently-running
- * context (the ap_main flow), (2) splice that task into the global
- * ring, and (3) stamp it as this CPU's current+idle pointers.
- *
- * Like `task_init`, we don't allocate a stack — the AP is already
- * running on the per-AP stack `smp_boot_aps` allocated for it.
- * `esp` is left zero; the first time the scheduler switches AWAY
- * from this idle task, `context_switch` populates it.
- *
- * After this returns, the AP is a full scheduler participant: when
- * its LAPIC timer fires the schedule_check path picks up any
- * RUNNABLE non-idle task in the ring. */
+ * C entry to synthesize a task struct for its current context, splice
+ * it into the master list, and stamp it as this CPU's current+idle. */
 void task_install_ap_idle(void) {
     struct task* idle = (struct task*)kcalloc(1, sizeof(struct task));
     if (!idle) {
         kprintf("task: failed to allocate AP idle\n");
         return;
     }
-    /* Name encodes CPU index so `ps` reads sensibly: "idle-N". */
-    char buf[TASK_NAME_MAX + 1] = "idle-";
     int cpu = this_cpu_id();
-    /* Tiny manual itoa, single digit covers up to CPU 9 — fine for
-     * our ACPI_MAX_CPUS = 32 cap (CPUs 10+ get "idle-1"+digit). */
+    char buf[TASK_NAME_MAX + 1] = "idle-";
     int pos = 5;
-    if (cpu >= 10) { buf[pos++] = '0' + (cpu / 10); cpu %= 10; }
-    buf[pos++] = '0' + cpu;
+    int c = cpu;
+    if (c >= 10) { buf[pos++] = '0' + (c / 10); c %= 10; }
+    buf[pos++] = '0' + c;
     buf[pos]   = 0;
     str_copy_n(idle->name, buf, sizeof idle->name);
 
     idle->pid         = next_pid++;
     idle->state       = TASK_RUNNABLE;
     idle->esp         = 0;
-    idle->kstack_base = NULL;     /* AP stack owned by smp.c, not us */
+    idle->kstack_base = NULL;       /* AP stack owned by smp.c */
     idle->is_idle     = 1;
+    idle->cpu_mask    = 1u << cpu;  /* pinned to this AP */
+    idle->cpu_home    = cpu;
+    idle->rq_next = idle->rq_prev = NULL;
 
-    uint32_t fl = spin_lock_irqsave(&runqueue_lock);
-    runqueue_append_locked(idle);
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    master_insert_locked(idle);
+    spin_unlock_irqrestore(&master_lock, fl);
+
     this_cpu()->current = idle;
     this_cpu()->idle    = idle;
-    spin_unlock_irqrestore(&runqueue_lock, fl);
 }
 
 void task_become_idle(void) {
-    uint32_t fl = spin_lock_irqsave(&runqueue_lock);
+    /* Mark the CURRENT task as the per-CPU idle.  No master/rq lock
+     * needed — we're modifying our own task's idle flag and the
+     * per-CPU `idle` pointer; both are read only by us. */
     struct task* me = this_cpu()->current;
     if (me) {
         me->is_idle = 1;
         this_cpu()->idle = me;
     }
-    spin_unlock_irqrestore(&runqueue_lock, fl);
 }
 
 /* ------------------------------------------------------------------- */
 /* Spawn.                                                               */
-/*                                                                      */
-/* The arch-specific stack pre-build (trampoline + register layout for  */
-/* the first context_switch) lives in `kernel/hal/<arch>/task_arch.c`   */
-/* behind `hal_task_init_stack` (M17).  This file only owns the          */
-/* portable bits: kmalloc the stack, fill the `struct task`, link into  */
-/* the runqueue.                                                        */
 /* ------------------------------------------------------------------- */
 
 struct task* task_spawn(const char* name, void (*entry)(void)) {
@@ -295,77 +348,209 @@ struct task* task_spawn(const char* name, void (*entry)(void)) {
     t->state       = TASK_RUNNABLE;
     t->esp         = hal_task_init_stack((char*)stack + TASK_KSTACK_SZ, entry);
     t->kstack_base = stack;
+    t->cpu_mask    = 0xFFFFFFFFu;
+    t->cpu_home    = -1;
+    t->rq_next = t->rq_prev = NULL;
 
-    uint32_t fl = spin_lock_irqsave(&runqueue_lock);
-    runqueue_insert_locked(t);
-    spin_unlock_irqrestore(&runqueue_lock, fl);
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    master_insert_locked(t);
+    spin_unlock_irqrestore(&master_lock, fl);
 
+    /* Pick a CPU and enqueue.  task_enqueue does the affinity-respecting
+     * lightest-load selection. */
+    task_enqueue(t);
     return t;
 }
 
 /* ------------------------------------------------------------------- */
-/* Schedule + yield + exit.                                             */
+/* Scheduler.                                                           */
 /* ------------------------------------------------------------------- */
 
-/* Core scheduler — picks the next RUNNABLE task for THIS CPU and
- * context-switches.  MUST be called with the runqueue lock held +
- * IRQs disabled.  Returns with both invariants intact; caller
- * releases the lock.
- *
- * SMP shape: we skip tasks that are RUNNABLE but currently `current`
- * on ANOTHER CPU.  Cheap to detect because every CPU stamps its
- * current pointer in this_cpu()->current and we can scan all
- * per-CPU slots in O(ncpus).  Tracked under PLAN §M18 follow-ups
- * (per-CPU runqueue would eliminate the scan entirely). */
+/* Defensive helper: is `t` currently `current` on some other CPU?
+ * Used as a last-line safety net — the load balancer should never
+ * steal a `current` task, but if a race ever sneaks through this
+ * guards against double-running. */
 static int task_running_elsewhere(struct task* t) {
-    for (int i = 0; i < smp_ncpus(); i++) {
+    int self = this_cpu_id();
+    int n = smp_ncpus();
+    for (int i = 0; i < n; i++) {
+        if (i == self) continue;
         struct percpu* p = percpu_at(i);
-        if (p && p != this_cpu() && p->current == t) return 1;
+        if (p && p->current == t) return 1;
     }
     return 0;
 }
 
-/* Find the next runnable non-idle task in the ring (round-robin
- * starting from prev->next).  Skip:
- *   - tasks that aren't RUNNABLE,
- *   - tasks currently `current` on another CPU,
- *   - idle tasks (those are pure fallbacks).
- * Returns NULL if no eligible task exists. */
-static struct task* pick_next_locked(struct task* prev) {
-    struct task* t = prev->next;
-    while (t != prev) {
+/* Walk this CPU's runqueue and return the first RUNNABLE task whose
+ * affinity includes us and which isn't running elsewhere.  Caller
+ * holds rq->rq_lock.  Returns NULL if no candidate. */
+static struct task* pick_next_local_locked(struct percpu* rq) {
+    int self = this_cpu_id();
+    struct task* head = rq->rq_head;
+    if (!head) return NULL;
+    struct task* t = head;
+    do {
         if (t->state == TASK_RUNNABLE &&
             !t->is_idle &&
+            (t->cpu_mask & (1u << self)) &&
             !task_running_elsewhere(t)) {
             return t;
         }
-        t = t->next;
-    }
-    /* The walk skipped prev itself.  Treat prev as a candidate too —
-     * if we're already on a non-idle RUNNABLE task and nothing else
-     * is eligible, staying put is the right answer. */
+        t = t->rq_next;
+    } while (t != head);
     return NULL;
 }
 
-static void schedule_locked(void) {
-    struct percpu* me = this_cpu();
+/* Rotate `t` to the tail of its current rq (round-robin).  Caller
+ * holds rq->rq_lock.  No-op if `t` isn't actually on this rq
+ * (defensive — covers e.g. brand-new t0 before its first enqueue
+ * and any state transition that detaches it while still being
+ * `current`). */
+static void rq_rotate_to_tail_locked(struct percpu* rq, struct task* t) {
+    if (!t || !rq->rq_head) return;
+    /* Detect "not on this rq" cheaply: a queued task has both rq_next
+     * and rq_prev non-NULL (circular list).  Or it's head with NULL
+     * links — but then rq->rq_head == t is impossible without proper
+     * links, so an unlinked t never matches head either. */
+    if (!t->rq_next || !t->rq_prev) return;
+    if (rq->rq_head == t && t->rq_next == t) return;   /* singleton */
+    if (rq->rq_head == t) rq->rq_head = t->rq_next;
+    t->rq_prev->rq_next = t->rq_next;
+    t->rq_next->rq_prev = t->rq_prev;
+    struct task* head = rq->rq_head;
+    struct task* tail = head->rq_prev;
+    t->rq_next    = head;
+    t->rq_prev    = tail;
+    tail->rq_next = t;
+    head->rq_prev = t;
+}
+
+/* ---------------------------------------------------------------------
+ * Load balancer.
+ *
+ * Cheap, opportunistic.  Runs ONLY when this CPU's rq is empty (we're
+ * about to fall back to idle).  Scans peer rqs for the heaviest one
+ * and steals a single non-current task whose affinity allows running
+ * on us.  Returns the stolen task or NULL.
+ *
+ * Why "only when empty": that's the cheapest right time to balance
+ * (we'd otherwise idle uselessly), avoids cross-CPU lock contention
+ * on the hot path of every tick, and converges quickly under common
+ * workloads (a task becoming runnable on a loaded CPU will get stolen
+ * the next time some other CPU goes empty).
+ * --------------------------------------------------------------------- */
+
+/* Find a task on `victim`'s rq that:
+ *   - is RUNNABLE non-idle
+ *   - isn't `current` on the victim CPU
+ *   - has us in its affinity mask
+ * Returns the task with rq_lock dropped (caller re-acquires if
+ * needed).  Caller does NOT hold any lock entering. */
+static struct task* load_steal_one(struct percpu* victim) {
+    int self = this_cpu_id();
+    uint32_t fl = spin_lock_irqsave(&victim->rq_lock);
+    struct task* head = victim->rq_head;
+    struct task* found = NULL;
+    if (head) {
+        struct task* t = head;
+        do {
+            if (t->state == TASK_RUNNABLE &&
+                !t->is_idle &&
+                t != victim->current &&
+                (t->cpu_mask & (1u << self))) {
+                found = t;
+                break;
+            }
+            t = t->rq_next;
+        } while (t != head);
+    }
+    if (found) {
+        rq_remove_locked(victim, found);
+        found->cpu_home = self;
+    }
+    spin_unlock_irqrestore(&victim->rq_lock, fl);
+    return found;
+}
+
+/* Try to steal one task onto this_cpu's rq.  Returns 1 if we got
+ * one, 0 otherwise.  Caller must NOT hold this CPU's rq_lock. */
+static int load_balance_pull(void) {
+    int self = this_cpu_id();
+    int n = smp_ncpus();
+    /* Find the busiest peer (snapshot read of rq_count without the
+     * lock — races are fine: worst case we pick a slightly-less-busy
+     * CPU, which still beats spinning idle). */
+    int best = -1;
+    int best_load = 0;
+    for (int i = 0; i < n; i++) {
+        if (i == self) continue;
+        struct percpu* p = percpu_at(i);
+        if (!p || !p->online) continue;
+        if (p->rq_count > best_load) {
+            best = i;
+            best_load = p->rq_count;
+        }
+    }
+    if (best < 0 || best_load <= 0) return 0;
+
+    struct task* stolen = load_steal_one(percpu_at(best));
+    if (!stolen) return 0;
+
+    struct percpu* mine = this_cpu();
+    uint32_t fl = spin_lock_irqsave(&mine->rq_lock);
+    rq_insert_tail_locked(mine, stolen);
+    spin_unlock_irqrestore(&mine->rq_lock, fl);
+    return 1;
+}
+
+/* schedule_locked — pick + context_switch.  NEVER releases the lock:
+ * after context_switch, the LOCK OWNERSHIP transfers to whoever resumes
+ * us next.  This is the Linux pattern (finish_task_switch).  Reasoning:
+ *
+ *   Each schedule() invocation acquires this_cpu()->rq_lock at entry.
+ *   If schedule_locked context_switches OUT, the current schedule()
+ *   frame is suspended; the rq_lock we acquired stays held until SOME
+ *   future moment when we (this task) get scheduled BACK IN, returning
+ *   to the schedule_locked frame that's been paused on our stack.
+ *   At that moment the lock we should release is THIS CPU's rq_lock
+ *   — i.e. the CPU we're now running on, which may differ from the
+ *   one we yielded on (if the load balancer migrated us).  We can't
+ *   pass the old CPU's lock identity through the stack — it's no
+ *   longer the right thing to release.  Instead the resumer re-reads
+ *   this_cpu() at unlock time.
+ *
+ *   The matching invariant: every CPU's schedule() pairs its rq_lock
+ *   acquire with EXACTLY ONE rq_lock release somewhere — that release
+ *   may happen on a different CPU's stack (the resumed task's), but
+ *   it WILL release the right lock (the one the resuming CPU's
+ *   schedule_locked just took).
+ *
+ * Brand-new task path: task_finish_first_switch performs the unlock
+ * for the brand-new task's "first schedule that never was."  See
+ * hal/<arch>/task_arch.c task_trampoline. */
+static void schedule_locked(struct percpu* me) {
     struct task* prev = me->current;
     if (!prev) return;
 
-    /* First preference: any RUNNABLE non-idle task in the ring. */
-    struct task* next = pick_next_locked(prev);
+    if (prev->state == TASK_RUNNABLE && !prev->is_idle &&
+        prev->cpu_home == this_cpu_id()) {
+        rq_rotate_to_tail_locked(me, prev);
+    }
+
+    struct task* next = pick_next_local_locked(me);
 
     if (!next) {
-        /* No real work found.  If prev is itself a working task and
-         * still RUNNABLE, stay put — pointless to bounce into idle
-         * and back on the next tick. */
-        if (prev->state == TASK_RUNNABLE && !prev->is_idle) return;
+        /* No candidate on local rq.  Drop the lock briefly to try a
+         * load-balance steal — can't hold rq_lock while taking
+         * another CPU's lock (would risk deadlock). */
+        spin_unlock(&me->rq_lock);
+        int stole = load_balance_pull();
+        spin_lock(&me->rq_lock);
+        if (stole) next = pick_next_local_locked(me);
+    }
 
-        /* Otherwise fall back to this CPU's idle.  If we don't have
-         * an idle (BSP before task_become_idle, e.g.) and prev is
-         * unusable, there's literally nothing we can do — return
-         * and let the caller (likely IRQ exit) iret back to whatever
-         * was running.  Won't make progress but won't crash. */
+    if (!next) {
+        if (prev->state == TASK_RUNNABLE && !prev->is_idle) return;
         struct task* idle = me->idle;
         if (!idle || idle->state != TASK_RUNNABLE) return;
         if (idle == prev) return;
@@ -376,14 +561,19 @@ static void schedule_locked(void) {
 
     me->current = next;
     context_switch(&prev->esp, next->esp);
-    /* When `prev` is later scheduled back in, control resumes here.
-     * IRQs are still off; caller restores IF and releases the lock. */
+    /* Resumes here when `prev` is scheduled back in by SOME CPU. */
 }
 
 void schedule(void) {
-    uint32_t fl = spin_lock_irqsave(&runqueue_lock);
-    schedule_locked();
-    spin_unlock_irqrestore(&runqueue_lock, fl);
+    uint32_t fl = hal_intr_save();
+    spin_lock(&this_cpu()->rq_lock);
+    schedule_locked(this_cpu());
+    /* Re-read this_cpu() at unlock time — see schedule_locked header.
+     * The lock we're releasing is whichever CPU we are NOW (which may
+     * differ from entry CPU if context_switch resumed us on another
+     * core after a load-balance migration). */
+    spin_unlock(&this_cpu()->rq_lock);
+    hal_intr_restore(fl);
 }
 
 void task_yield(void) {
@@ -403,20 +593,39 @@ void task_set_out_console(struct task* t, void* console) {
     t->out_console = console;
 }
 
-/* Lock-handoff finisher for brand-new tasks.  See task.h. */
+/* Lock-handoff finisher for brand-new tasks.  See task.h.  Releases
+ * the rq_lock the spawning schedule() acquired and never had a chance
+ * to release on the new task's first switch.  The "rq" here is the
+ * one schedule() was looking at — i.e. THIS CPU's rq.  Safe to call
+ * because the new task is running on the CPU that did schedule(). */
 void task_finish_first_switch(void) {
-    spin_unlock(&runqueue_lock);
+    spin_unlock(&this_cpu()->rq_lock);
 }
 
 void task_exit(void) {
-    /* Mark ourselves DEAD then call schedule.  No future selection will
-     * pick a DEAD task, so schedule_locked won't context-switch back. */
-    uint32_t fl = spin_lock_irqsave(&runqueue_lock);
-    this_cpu()->current->state = TASK_DEAD;
-    schedule_locked();
-    spin_unlock_irqrestore(&runqueue_lock, fl);
-    /* Unreachable if at least one other RUNNABLE task exists.  Halt
-     * forever if somehow we get back — the system has no one to run. */
+    struct percpu* me = this_cpu();
+    struct task* self = me->current;
+
+    /* Mark DEAD under master_lock so iterators see a consistent state. */
+    uint32_t mfl = spin_lock_irqsave(&master_lock);
+    self->state = TASK_DEAD;
+    spin_unlock_irqrestore(&master_lock, mfl);
+
+    /* Remove from this CPU's rq so the next pick doesn't keep
+     * tripping over a DEAD entry.  (M18.6.1 — pre-refactor, DEAD
+     * tasks were left in the ring and skipped by the state check;
+     * with per-CPU rqs we have a clean remove path.)  Then schedule
+     * away.  The DEAD task is not on any rq and not RUNNABLE — won't
+     * be picked again. */
+    uint32_t rfl = spin_lock_irqsave(&me->rq_lock);
+    if (self->cpu_home == this_cpu_id()) {
+        rq_remove_locked(me, self);
+    }
+    schedule_locked(me);
+    spin_unlock_irqrestore(&me->rq_lock, rfl);
+
+    /* Unreachable if any other task exists.  Halt-forever fallback
+     * only if literally nothing else can run. */
     for (;;) { hal_intr_disable(); hal_cpu_halt(); }
 }
 
@@ -425,14 +634,18 @@ void task_exit(void) {
 /* ------------------------------------------------------------------- */
 
 void schedule_request(void) {
-    need_resched = 1;
+    /* Per-CPU flag (M18.6.1).  Timer IRQ on CPU N sets CPU N's bit;
+     * IRQ exit on CPU N consumes it.  Cross-CPU preempt IPI (vector
+     * 0x41) sets the receiver's bit before schedule_check runs. */
+    this_cpu()->need_resched = 1;
 }
 
 void schedule_check(void) {
-    if (!need_resched)        return;
+    struct percpu* me = this_cpu();
+    if (!me->need_resched)    return;
     if (preempt_count() != 0) return;   /* hot path asked us to wait */
 
-    need_resched = 0;
+    me->need_resched = 0;
     schedule();
 }
 
@@ -441,37 +654,98 @@ void schedule_check(void) {
 /* ------------------------------------------------------------------- */
 
 void task_list(void) {
-    if (!head) { kprintf("ps: no tasks\n"); return; }
-    kprintf("PID  STATE  NAME\n");
-    struct task* t = head;
+    if (!master_head) { kprintf("ps: no tasks\n"); return; }
+    kprintf("PID  STATE  CPU  NAME\n");
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    struct task* t = master_head;
     do {
-        /* "running" if ANY CPU currently has us scheduled — useful on
-         * SMP where it's not just BSP. */
         int running = 0;
-        for (int i = 0; i < smp_ncpus(); i++) {
+        int n = smp_ncpus();
+        for (int i = 0; i < n; i++) {
             if (percpu_at(i) && percpu_at(i)->current == t) { running = 1; break; }
         }
-        kprintf("%d   %s    %s%s\n",
-                t->pid, state_name(t->state), t->name,
-                running ? " (running)" : "");
+        kprintf("%d   %s    %d   %s%s\n",
+                t->pid, state_name(t->state), t->cpu_home,
+                t->name, running ? " (running)" : "");
         t = t->next;
-    } while (t != head);
+    } while (t != master_head);
+    spin_unlock_irqrestore(&master_lock, fl);
 }
 
 void task_for_each(task_iter_fn fn, void* ctx) {
-    if (!fn || !head) return;
+    if (!fn || !master_head) return;
+    /* Snapshot of "current at the moment of iteration."  Doesn't
+     * promise the task is still current by the time fn() reads it
+     * — that's a fundamentally racy notion on SMP.  Good enough for
+     * /proc rendering. */
     struct task* me = task_current();
-    struct task* t = head;
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    struct task* t = master_head;
     do {
         fn(t, t == me, ctx);
         t = t->next;
-    } while (t != head);
+    } while (t != master_head);
+    spin_unlock_irqrestore(&master_lock, fl);
 }
 
 int task_count(void) {
-    if (!head) return 0;
+    if (!master_head) return 0;
     int n = 0;
-    struct task* t = head;
-    do { n++; t = t->next; } while (t != head);
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    struct task* t = master_head;
+    do { n++; t = t->next; } while (t != master_head);
+    spin_unlock_irqrestore(&master_lock, fl);
     return n;
+}
+
+struct task* task_find(int pid) {
+    if (!master_head) return NULL;
+    struct task* found = NULL;
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    struct task* t = master_head;
+    do {
+        if (t->pid == pid) { found = t; break; }
+        t = t->next;
+    } while (t != master_head);
+    spin_unlock_irqrestore(&master_lock, fl);
+    return found;
+}
+
+/* ------------------------------------------------------------------- */
+/* Affinity (M18.6.3).                                                  */
+/* ------------------------------------------------------------------- */
+
+int task_set_affinity(struct task* t, uint32_t mask) {
+    if (!t || mask == 0) return -1;
+    /* If the task is currently on a rq, and we're restricting it
+     * off that rq's CPU, move it to a CPU that's allowed.
+     *
+     * Strategy: remove from old rq (if cpu_home is no longer in the
+     * mask), update mask, then re-enqueue via the regular pick path.
+     * The task itself may be currently running — in that case the
+     * mask only takes effect on the next schedule() that visits it,
+     * which is fine. */
+    int old_cpu = t->cpu_home;
+    int needs_migration =
+        (old_cpu >= 0) && ((mask & (1u << old_cpu)) == 0);
+
+    if (needs_migration && t->state == TASK_RUNNABLE && !t->is_idle) {
+        struct percpu* old_rq = percpu_at(old_cpu);
+        if (old_rq) {
+            uint32_t fl = spin_lock_irqsave(&old_rq->rq_lock);
+            rq_remove_locked(old_rq, t);
+            spin_unlock_irqrestore(&old_rq->rq_lock, fl);
+        }
+        t->cpu_mask = mask;
+        t->cpu_home = -1;
+        task_enqueue(t);
+        return 0;
+    }
+
+    t->cpu_mask = mask;
+    return 0;
+}
+
+uint32_t task_get_affinity(const struct task* t) {
+    return t ? t->cpu_mask : 0;
 }

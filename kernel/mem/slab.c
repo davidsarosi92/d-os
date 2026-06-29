@@ -56,6 +56,14 @@
 #define MAG_CAPACITY     32             /* max objects per per-CPU magazine */
 #define MAG_BATCH        16             /* refill/flush batch size */
 
+/* M19.5.2 — empty-slab cache.  Each cache keeps up to this many fully
+ * empty slabs around before releasing surplus to the buddy.  Trade-off:
+ * higher = less buddy thrash on bursty workloads, more retained memory.
+ * 4 is a small, fixed pick — well below typical kmalloc working sets
+ * (kmalloc-16 ⇒ 250+ objects/slab, so 4 cached slabs are 16 KiB of
+ * retention per cache, 128 KiB total across our 8 caches). */
+#define EMPTY_SLAB_MAX   4
+
 /* -------------------------------------------------------------------------- */
 /* On-page slab header.  Sized to 32 bytes so the first slot starts on
  * an 8-byte aligned offset for every object size we care about.  We
@@ -91,7 +99,12 @@ struct slab_cache {
     uint16_t     payload_offset; /* byte offset of slot 0 from page base */
     struct slab* slabs_partial;  /* slabs with at least one free slot */
     struct slab* slabs_full;     /* slabs with no free slots */
-    uint32_t     slabs;          /* count of pages owned (partial + full) */
+    /* M19.5.2 — empty-slab LIFO.  Slabs whose in_use dropped to 0 go
+     * here instead of straight to the buddy, up to EMPTY_SLAB_MAX.
+     * Refill prefers popping from here (no buddy round-trip). */
+    struct slab* slabs_empty;
+    uint16_t     empty_count;
+    uint32_t     slabs;          /* count of pages owned (partial + full + empty) */
     uint32_t     in_use_total;   /* sum of in_use across all slabs */
     spinlock_t   lock;
     struct mag   mag[ACPI_MAX_CPUS];
@@ -175,11 +188,32 @@ static void list_remove(struct slab** head, struct slab* s) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Acquire a brand-new slab page from the buddy and wire its header.          */
-/* Caller does NOT hold the lock — page_alloc has its own.  Returns NULL      */
-/* on OOM.                                                                    */
+/* Acquire a slab page.  Caller HOLDS c->lock (we may pop from           */
+/* slabs_empty under it).  Returns NULL on OOM.                                */
+/*                                                                            */
+/* M19.5.2 — prefer the cached empty slab LIFO over a fresh page_alloc.       */
+/* page_alloc has to be done with the cache lock dropped (it has its own      */
+/* zone locks); we release+reacquire and return NULL to signal "retry from    */
+/* the slow path with cache lock dropped" — but in our refill loop we don't   */
+/* need that complication.  Cleaner: split into "pop_cached" (lock-held)      */
+/* and "alloc_fresh" (lock-dropped) so the caller drives the protocol.        */
 /* -------------------------------------------------------------------------- */
-static struct slab* slab_grow(struct slab_cache* c) {
+static struct slab* slab_pop_cached_locked(struct slab_cache* c) {
+    if (!c->slabs_empty) return NULL;
+    struct slab* s = c->slabs_empty;
+    c->slabs_empty = s->next;
+    if (s->next) s->next->prev = NULL;
+    s->next = NULL;
+    s->prev = NULL;
+    if (c->empty_count > 0) c->empty_count--;
+    /* Cached slab keeps magic + cache pointer.  Re-init its freelist
+     * so it presents as fully free. */
+    slab_init_freelist(s, c);
+    s->in_use = 0;
+    return s;
+}
+
+static struct slab* slab_alloc_fresh(struct slab_cache* c) {
     uint32_t phys = page_alloc(0, ZONE_DEFAULT);
     if (!phys) return NULL;
 
@@ -194,10 +228,25 @@ static struct slab* slab_grow(struct slab_cache* c) {
     return s;
 }
 
-/* Release an empty slab back to the buddy.  Caller holds c->lock and
- * has already removed s from any list.  Wipes magic to make
- * accidental access loud. */
-static void slab_release(struct slab* s) {
+/* Release a slab.  M19.5.2: cache up to EMPTY_SLAB_MAX empty slabs per
+ * cache; return surplus to the buddy.  Caller holds c->lock and has
+ * already removed s from any list AND decremented c->slabs.  If we
+ * cache the slab, re-increment c->slabs to keep the "pages owned"
+ * count accurate; if we release it, the decrement stands.
+ *
+ * When pushed onto the empty cache, `next`/`prev` are reused for the
+ * empty-cache LIFO link.  Wipes magic only on actual buddy release so
+ * cached slabs keep their identity. */
+static void slab_release(struct slab_cache* c, struct slab* s) {
+    if (c->empty_count < EMPTY_SLAB_MAX) {
+        s->next = c->slabs_empty;
+        s->prev = NULL;
+        if (c->slabs_empty) c->slabs_empty->prev = s;
+        c->slabs_empty = s;
+        c->empty_count++;
+        c->slabs++;          /* offset the caller's pre-decrement */
+        return;
+    }
     s->magic = 0;
     page_free((uint32_t)(uintptr_t)s, 0);
 }
@@ -218,17 +267,21 @@ static int mag_refill(struct slab_cache* c) {
     while (target > 0) {
         struct slab* s = c->slabs_partial;
         if (!s) {
-            spin_unlock_irqrestore(&c->lock, fl);
-
-            /* Allocate a fresh slab outside the lock to keep the
-             * critical section short.  Re-acquire and push it. */
-            struct slab* fresh = slab_grow(c);
-            fl = spin_lock_irqsave(&c->lock);
-            if (!fresh) break;
-
-            list_push(&c->slabs_partial, fresh);
-            c->slabs++;
-            s = fresh;
+            /* M19.5.2 — try the empty-slab cache before going to the
+             * buddy.  Both paths are under the cache lock, but a
+             * page_alloc must NOT be held — release+retake. */
+            s = slab_pop_cached_locked(c);
+            if (!s) {
+                spin_unlock_irqrestore(&c->lock, fl);
+                struct slab* fresh = slab_alloc_fresh(c);
+                fl = spin_lock_irqsave(&c->lock);
+                if (!fresh) break;
+                c->slabs++;        /* fresh page from buddy */
+                s = fresh;
+            }
+            /* Cached pop kept c->slabs (it was already counted on
+             * release).  Either way push onto partial list. */
+            list_push(&c->slabs_partial, s);
         }
 
         /* Pop a slot. */
@@ -301,12 +354,14 @@ static void mag_flush(struct slab_cache* c) {
             list_push(&c->slabs_partial, s);
         }
         if (s->in_use == 0) {
-            /* Reclaim empty slab.  Keep one cached if you want lower
-             * thrash; for now release straight back to the buddy so
-             * the memory is visible in pmm stats. */
+            /* Reclaim empty slab.  M19.5.2 — slab_release decides
+             * whether to cache (up to EMPTY_SLAB_MAX) or return to
+             * the buddy.  We pre-decrement c->slabs as "removed
+             * from active list"; slab_release re-increments if it
+             * keeps the page cached. */
             list_remove(&c->slabs_partial, s);
             c->slabs--;
-            slab_release(s);
+            slab_release(c, s);
         }
     }
 
@@ -387,6 +442,8 @@ void slab_init(void) {
         spin_lock_init(&c->lock);
         c->slabs_partial = NULL;
         c->slabs_full    = NULL;
+        c->slabs_empty   = NULL;
+        c->empty_count   = 0;
         c->slabs         = 0;
         c->in_use_total  = 0;
         for (int cpu = 0; cpu < ACPI_MAX_CPUS; cpu++) {
@@ -415,14 +472,20 @@ void slab_cache_get_stats(int idx, struct slab_stats* out) {
         mag_total += c->mag[cpu].count;
     }
 
-    uint32_t total_slots = c->slabs * c->capacity;
-    out->name        = c->name;
-    out->obj_size    = c->obj_size;
-    out->slot_size   = c->slot_size;
-    out->slabs       = c->slabs;
-    out->in_use_objs = c->in_use_total;
-    out->free_objs   = total_slots - c->in_use_total;
-    out->mag_total   = mag_total;
+    /* total_slots counts active slots only — cached empty slabs hold
+     * no allocations and contribute to neither in_use_objs nor
+     * free_objs (a kfree on a cached slab is impossible).  c->slabs
+     * itself does count them (= "pages owned"). */
+    uint32_t active_slabs = c->slabs - c->empty_count;
+    uint32_t total_slots = active_slabs * c->capacity;
+    out->name         = c->name;
+    out->obj_size     = c->obj_size;
+    out->slot_size    = c->slot_size;
+    out->slabs        = c->slabs;
+    out->in_use_objs  = c->in_use_total;
+    out->free_objs    = total_slots - c->in_use_total;
+    out->mag_total    = mag_total;
+    out->cached_empty = c->empty_count;
 
     spin_unlock_irqrestore(&c->lock, fl);
 }

@@ -105,7 +105,7 @@ static void cmd_help(void) {
                   "  config, getconf <key>, setconf <key> <value>, saveconf\n"
                   "  ringtest, ps, spawn, yield, loop\n"
                   "  pane, pane split horizontal|vertical\n"
-                  "  lslayout, setlayout <us|hu|...>, lscpu\n"
+                  "  lslayout, setlayout <us|hu|...>, lscpu, taskset <pid> <mask>\n"
                   "  slabinfo, buddyinfo\n"
                   "  shutdown, reboot\n");
 }
@@ -366,15 +366,93 @@ static void cmd_setlayout(const char* name) {
 static void cmd_lscpu(void) {
     int n = smp_ncpus();
     int me = this_cpu_id();
-    kprintf("CPU  APIC_ID  STATE%s\n", "");
+    kprintf("CPU  APIC_ID  STATE   RQ\n");
     for (int i = 0; i < n; i++) {
         struct percpu* p = percpu_at(i);
         if (!p) continue;
-        kprintf("%d    %u        %s%s\n",
+        kprintf("%d    %u        %s   %d%s\n",
                 i, p->apic_id,
-                p->online ? "online" : "offline",
+                p->online ? "online " : "offline",
+                p->rq_count,
                 (i == me) ? " <this>" : "");
     }
+}
+
+/* `taskset <pid> <hex_mask>` — pin task to a CPU set (M18.6.3).
+ * Mask is parsed as hex (with or without 0x prefix).  0xFF = any of
+ * CPUs 0..7.  Errors print but never crash. */
+static int parse_hex(const char* s, uint32_t* out) {
+    if (!s || !*s) return -1;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    uint32_t v = 0;
+    int any = 0;
+    while (*s) {
+        int d;
+        if      (*s >= '0' && *s <= '9') d = *s - '0';
+        else if (*s >= 'a' && *s <= 'f') d = 10 + (*s - 'a');
+        else if (*s >= 'A' && *s <= 'F') d = 10 + (*s - 'A');
+        else return -1;
+        v = (v << 4) | (uint32_t)d;
+        any = 1;
+        s++;
+    }
+    if (!any) return -1;
+    *out = v;
+    return 0;
+}
+
+static int parse_uint(const char* s, uint32_t* out) {
+    if (!s || !*s) return -1;
+    uint32_t v = 0;
+    int any = 0;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10 + (uint32_t)(*s - '0');
+        any = 1;
+        s++;
+    }
+    if (!any || *s != 0) return -1;
+    *out = v;
+    return 0;
+}
+
+static void cmd_taskset(const char* args) {
+    if (!args || !*args) {
+        console_write("taskset: usage: taskset <pid> <hex-mask>  (e.g. taskset 5 0x2)\n");
+        return;
+    }
+    /* Parse pid (decimal), then mask (hex, may have 0x prefix). */
+    char pid_buf[16];
+    int pi = 0;
+    while (*args && *args != ' ' && pi < (int)sizeof pid_buf - 1) {
+        pid_buf[pi++] = *args++;
+    }
+    pid_buf[pi] = 0;
+    while (*args == ' ') args++;
+    if (!*args) {
+        console_write("taskset: missing mask\n");
+        return;
+    }
+    uint32_t pid;
+    if (parse_uint(pid_buf, &pid) != 0) {
+        kprintf("taskset: bad pid '%s'\n", pid_buf);
+        return;
+    }
+    uint32_t mask;
+    if (parse_hex(args, &mask) != 0) {
+        kprintf("taskset: bad mask '%s'\n", args);
+        return;
+    }
+    struct task* t = task_find((int)pid);
+    if (!t) {
+        kprintf("taskset: no task with pid %u\n", pid);
+        return;
+    }
+    if (task_set_affinity(t, mask) != 0) {
+        kprintf("taskset: rejected (mask=0 is not allowed)\n");
+        return;
+    }
+    kprintf("taskset: pid %u mask now 0x%x (home cpu=%d)\n",
+            pid, mask, t->cpu_home);
 }
 
 /* -------------------------------------------------------------------- */
@@ -383,13 +461,14 @@ static void cmd_lscpu(void) {
 
 static void cmd_slabinfo(void) {
     int n = slab_cache_count();
-    kprintf("NAME           OBJSZ  SLOT  SLABS  IN_USE  FREE  MAG\n");
+    kprintf("NAME           OBJSZ  SLOT  SLABS  IN_USE  FREE  MAG  CACHED-EMPTY\n");
     for (int i = 0; i < n; i++) {
         struct slab_stats s;
         slab_cache_get_stats(i, &s);
-        kprintf("%s  %u  %u  %u  %u  %u  %u\n",
+        kprintf("%s  %u  %u  %u  %u  %u  %u  %u\n",
                 s.name, (unsigned)s.obj_size, (unsigned)s.slot_size,
-                s.slabs, s.in_use_objs, s.free_objs, s.mag_total);
+                s.slabs, s.in_use_objs, s.free_objs, s.mag_total,
+                s.cached_empty);
     }
 }
 
@@ -688,6 +767,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "lslayout"))       { cmd_lslayout();             return; }
     if (starts_with(line, "setlayout ")) { cmd_setlayout(line + 10); return; }
     if (streq(line, "lscpu"))          { cmd_lscpu();                return; }
+    if (starts_with(line, "taskset "))  { cmd_taskset(line + 8);     return; }
     if (streq(line, "slabinfo"))       { cmd_slabinfo();             return; }
     if (streq(line, "buddyinfo"))      { cmd_buddyinfo();            return; }
     if (streq(line, "saveconf"))       {

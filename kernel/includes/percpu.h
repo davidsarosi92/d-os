@@ -20,6 +20,7 @@
 #define PERCPU_H
 
 #include <stdint.h>
+#include "lock.h"
 
 struct task;   /* fwd; defined in task.h */
 
@@ -33,6 +34,29 @@ struct percpu {
     struct task* current;          /* M18 — per-CPU current-task pointer */
     struct task* idle;             /* per-CPU idle task; never DEAD */
     uint64_t     ticks;            /* CPU-local tick counter (diagnostics) */
+    /* M18.6.2 — per-CPU preemption counter.  The global preempt_count
+     * (used pre-M18.6) was incorrect on SMP: disabling on CPU A would
+     * ALSO suppress preemption on CPU B, which both starves B and
+     * masks legitimate races.  preempt_count must be local to "do not
+     * reschedule on THIS CPU."  Accessed only from this_cpu()'s slot,
+     * so no atomics needed — IRQ-off bracketing in the accessors keeps
+     * the read-modify-write coherent against the local timer IRQ. */
+    int          preempt_count;    /* M18.6.2 */
+    /* M18.6.1 — per-CPU runqueue (intrusive doubly-linked list of
+     * RUNNABLE non-idle tasks plus their head).  Each CPU picks from
+     * its own queue; the load balancer steals across queues every N
+     * ticks.  `rq_count` excludes idle.  All access under rq_lock
+     * (per-CPU). */
+    struct task* rq_head;          /* first task in this CPU's runqueue, NULL = empty */
+    int          rq_count;         /* count of non-idle RUNNABLE tasks queued here */
+    spinlock_t   rq_lock;          /* protects rq_head + rq_count + member rq_next/rq_prev */
+    /* M18.6.1 — per-CPU deferred-reschedule flag.  Set by the local
+     * timer IRQ handler and by cross-CPU preempt IPI (vector 0x41
+     * handler in idt.c calls schedule_request, which now writes the
+     * receiving CPU's slot).  Read+cleared by schedule_check on this
+     * CPU only.  Pre-M18.6.1 this was a single global, which got
+     * raced under SMP. */
+    volatile int need_resched;
 };
 
 /* Bring up the per-CPU table on the BSP.  Records the BSP's APIC ID

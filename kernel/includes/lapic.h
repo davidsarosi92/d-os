@@ -23,8 +23,12 @@
 /* Map the LAPIC's MMIO window at `phys` and enable the local unit
  * (SIVR.APIC_EN = 1).  Must be called once on the BSP before IOAPIC
  * routing is activated.  Idempotent across CPUs — APs call the
- * "enable-only" variant once they're up. */
-int  lapic_init_bsp(uint32_t phys);
+ * "enable-only" variant once they're up.
+ *
+ * `phys` is `uintptr_t` so platforms that relocate the xAPIC window
+ * above 4 GiB (rare but legal on x86_64) can be expressed without a
+ * source change.  QEMU's default is 0xFEE00000 on both archs. */
+int  lapic_init_bsp(uintptr_t phys);
 
 /* Per-CPU APIC-enable for an AP (assumes lapic_init_bsp already
  * mapped the MMIO window).  Sets SIVR.APIC_EN, masks LVT lines. */
@@ -44,6 +48,15 @@ void lapic_send_init(uint8_t target_apic_id);
  * physical address: trampoline must be at (vector << 12).  Used twice
  * per AP per the Intel-recommended SIPI sequence. */
 void lapic_send_sipi(uint8_t target_apic_id, uint8_t vector);
+
+/* M18.6.4 — generic fixed-delivery IPI.  Targets a specific CPU's
+ * LAPIC ID; vectors `vector` into the IDT on that CPU.  Caller owns
+ * IDT gate installation for `vector`.  Self-IPI is no-op'd internally
+ * (callers wanting local reschedule use schedule_request instead).
+ *
+ * Primary user today: cross-CPU preempt — `smp_send_reschedule` writes
+ * vector 0x41, whose handler runs schedule_check on the target. */
+void lapic_send_ipi(uint8_t target_apic_id, uint8_t vector);
 
 /* ---------------------------------------------------------------------------
  * LAPIC timer (M18.5).

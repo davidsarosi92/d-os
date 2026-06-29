@@ -69,6 +69,14 @@ void spin_unlock_irqrestore(spinlock_t* l, uint32_t flags);
  * caller. */
 void spin_unlock(spinlock_t* l);
 
+/* Plain acquire — spin until we win the test-and-set, do NOT touch
+ * IRQ state.  Caller is responsible for IRQ-disabling first.  Used
+ * by code paths that already hold IRQs off via an outer save (e.g.
+ * load_balance_pull from schedule(): the outer caller holds the
+ * IRQ-off invariant and we're temporarily dropping a lock to take
+ * peers' locks). */
+void spin_lock(spinlock_t* l);
+
 /* ---------------------------------------------------------------------------
  * preempt_disable / preempt_enable
  *
@@ -82,8 +90,11 @@ void spin_unlock(spinlock_t* l);
  * need IRQs masked (e.g. you're walking a tree and an IRQ taking a snapshot
  * is fine, but a context switch mid-walk would corrupt your state).
  *
- * Today `preempt_count` is a single global because we're UP.  On SMP it
- * moves to a per-CPU slot. */
+ * M18.6.2 — preempt_count is per-CPU.  Each CPU's count lives in its
+ * `struct percpu` slot; preempt_disable on CPU A does NOT block
+ * preemption on CPU B.  The accessors bracket the RMW in IRQ-save so
+ * the local timer can't observe a half-update or migrate us between
+ * load and store. */
 void preempt_disable(void);
 void preempt_enable(void);
 int  preempt_count(void);

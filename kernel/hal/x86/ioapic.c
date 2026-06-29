@@ -63,12 +63,12 @@ static void io_w(uint32_t reg, uint32_t v) {
     *(volatile uint32_t*)(g_ioapic_mmio + IOAPIC_OFF_IOWIN) = v;
 }
 
-int ioapic_init(uint32_t phys, uint32_t gsi_base) {
-    uint32_t aligned = phys & ~0xFFFu;
+int ioapic_init(uintptr_t phys, uint32_t gsi_base) {
+    uintptr_t aligned = phys & ~((uintptr_t)0xFFFu);
     if (vmm_map(aligned, aligned, VMM_WRITABLE | VMM_CACHE_DIS) != 0) {
         /* Probably already mapped — proceed. */
     }
-    g_ioapic_mmio = (volatile uint8_t*)(uintptr_t)phys;
+    g_ioapic_mmio = (volatile uint8_t*)phys;
     g_gsi_base    = gsi_base;
 
     uint32_t ver = io_r(IOAPIC_REG_VERSION);

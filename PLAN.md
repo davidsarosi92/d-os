@@ -39,7 +39,11 @@
 | §M18 | SMP (APIC, AP boot, per-CPU, locks) | 774 |
 | §M19 | Memory at scale (slab, huge pages) | 804 |
 | §M20 | x64 (long mode) port | 836 |
-| §M21 | ARM (aarch64) port | 867 |
+| §M20.5 | x64 SMP + APIC + ring-3 (int 0x80) | ~1033 |
+| §M18.6 | SMP polish (carry-overs from M18.5) | ~1100 |
+| §M19.5 | Memory polish (carry-overs from M19) | ~1150 |
+| §M20.6 | x86_64 closure (SYSCALL/SYSRET, USB/blk DMA) | ~1200 |
+| §M21 | ARM (aarch64) port | ~1260 |
 | §M22 | GUI infrastructure (+ Wayland reuse if viable) | 894 |
 | §M23 | Audio subsystem | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) | ~1080 |
@@ -151,7 +155,11 @@ what); a session can pick a theme and push on it.
 | M17 | Portability cut — extract `hal_api.h`           | Architecture     | ✅ DOCS §4.X (partial — see notes) |
 | M18 | SMP support — APIC, AP boot, per-CPU, locking   | Concurrency      | ✅ DOCS §4.X |
 | M19 | Memory at scale — slab, huge pages, near-NUMA   | Memory           | ✅ DOCS §4.8, §4.10 |
-| M20 | x64 (long mode) port (UP)                       | Architecture     | ✅ DOCS §4.X (M20.5 closes SMP + SYSCALL) |
+| M18.6 | SMP polish — per-CPU runqueue + load balancer ✅, preempt_count ✅, taskset ✅, cross-CPU IPI ✅, MSI/MSI-X (open) | Concurrency | §M18.6 |
+| M19.5 | Memory polish — HIGHMEM (open), empty-slab caching ✅, SRAT/NUMA (open) | Memory | §M19.5 |
+| M20 | x64 (long mode) port (UP)                       | Architecture     | ✅ DOCS §4.X (closed by §M20.5) |
+| M20.5 | x64 SMP + APIC + ring-3 (int 0x80) — Phase A/B/C | Architecture | ✅ §M20.5 |
+| M20.6 | x86_64 closure — SYSCALL/SYSRET, xHCI + virtio-blk 64-bit DMA | Architecture | §M20.6 |
 | M21 | ARM (aarch64 generic / RPi) port                | Architecture     | §M21    |
 | M22 | GUI infrastructure (+ Wayland reuse if viable)  | UX               | §M22    |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
@@ -1029,61 +1037,336 @@ unchanged, shell prompt running on `qemu-system-x86_64 -m 256M`.
 the 8259 PIC for UP IRQ delivery and uses `int 0x80` (currently
 stubbed) for the eventual syscall path.
 
-## §M20.5 — x86_64 SMP + APIC + SYSCALL/SYSRET
+## §M20.5 — x86_64 SMP + APIC + ring-3 — ✅ shipped (Phase A+B+C)
 
-**Why now:** closes the x86_64 port.  M20's UP slice proves the HAL
-boundary is sound; M20.5 brings the SMP machinery (M18) and ring-3
-machinery (M6) across.
+**Shipped 2026-06-29 in three phases.**  x86_64 reached parity with
+i386 for SMP + APIC + ring-3.  See DOCS.md change-log entries
+"2026-06-29 — M20.5 Phase A / Phase B / Phase C" for the as-built
+details.  Highlights:
 
-**Design — outline only.**
+- **Phase A:** LAPIC + IOAPIC compile for x86_64 (`kernel/hal/x86/
+  lapic.c` + `ioapic.c` shared across archs).  `kernel.c` arch-gates
+  removed.  `kprintf` length modifiers (`%l`, `%ll`, `%z`) +
+  uintptr_t-wide `%p`.
+- **Phase B:** x86_64 SMP AP bring-up.  New `kernel/hal/x86_64/
+  ap_trampoline.s` (16→32→64-bit chain with inline trampoline GDT;
+  far-rets into the kernel GDT for the final CS reload) + new
+  `kernel/hal/x86_64/smp.c`.  `-smp 4` brings up all 4 CPUs.
+- **Phase C:** x86_64 ring-3 via `int 0x80`.  New `kernel/hal/x86_64/
+  usermode.s` (5-quadword iretq frame + SYS_EXIT teleport) + new
+  `kernel/hal/x86_64/syscall.c` (rax/rbx-field dispatcher).  Moved
+  the old `kernel/core/syscall.c` to `kernel/hal/x86/syscall.c` —
+  this closes one of the M17 deferred items.
 
-- **AP trampoline:** rewrite for 16-bit real → 32-bit protected →
-  64-bit long mode transition.  Each AP needs its own PML4 ptr in
-  CR3 before far-jmping into 64-bit code.  Reuse the BSP's PML4
-  (single shared page hierarchy across all CPUs).
-- **LAPIC / IOAPIC:** mostly MMIO copy from the i386 driver; the
-  vmm.h widening already lets us map MMIO above 4 GiB without
-  source change.  Watch for any `uint32_t` cast lurking in
-  `kernel/hal/x86/lapic.c` / `ioapic.c` and widen.
-- **smp_boot_aps:** retarget to the new x86_64 trampoline.  Per-CPU
-  init (LAPIC enable, IDT load, idle task install, LAPIC timer
-  arm) carries over.
-- **SYSCALL/SYSRET:** MSR setup (IA32_STAR, IA32_LSTAR, IA32_FMASK,
-  IA32_KERNEL_GS_BASE).  New asm entry stub: swapgs → save user
-  context → call C dispatcher → restore → swapgs → sysretq.
-- **Ring-3 wrap:** new `enter_user_mode_wrap` in
-  `kernel/hal/x86_64/usermode.s` building a 5-quadword iretq frame
-  (ss, rsp, rflags, cs, rip).
-- **Drop the M20 stubs as the real impls land** (`m20_stubs.c`
-  shrinks; delete it when empty).
+`m20_stubs.c` shrank from 9 symbols at M20-ship to just `xhci_poll`.
 
-**Definition of done:**
-- `qemu-system-x86_64 -smp 4` boots cleanly, parallel self-test
-  PASSes (both hogs make progress on different CPUs).
-- shell `ringtest` command runs a ring-3 program that returns via
-  SYSCALL/SYSRET.
-- DOCS.md §4.X (Supported architectures) updated to reflect SMP
-  + ring-3 status.
+**SYSCALL/SYSRET instruction path NOT shipped in this milestone.**
+The SYSRET selector-arithmetic convention (user CS =
+STAR[63:48] + 16, user SS = STAR[63:48] + 8) doesn't fit our
+current GDT slot layout (user CS at 0x18, user DS at 0x20 — no
+STAR[63:48] satisfies both).  Adding it requires either a GDT
+reorg (touching i386 + x86_64 + usermode.s + trampoline) or
+duplicate SYSRET-compatible descriptors after the TSS.  Tracked
+as a polish item, not blocking — `int 0x80` covers every current
+ring-3 need on both archs.
 
-**Lesson learned (M20):**
-- Multiboot2 framebuffer-request tag (type 5 in the header) is
-  mandatory.  Without it GRUB doesn't deliver a runtime FB tag and
-  `fb_terminal` stays inert.
-- `objcopy --input-target=binary` symbol names track the input
-  filename — keep blob `.bin` artefacts at source-relative paths
-  even when other build artefacts move into `build/$(ARCH)/`.
-- `kprintf` has no `%l` prefix.  Either cast 64-bit args to
-  uint32_t and use `%x`, or land the printf rewrite from the
-  polish backlog.
-- x86_64 `rdmsr` can't use the `=A` GCC asm constraint (legacy
-  edx:eax-as-pair); use two `=a` / `=d` outputs and recombine
-  in C.
-- IDTR is per-CPU even though IDT data is shared.  Long mode
-  GDTR is 10 bytes (vs. 6 in 32-bit); the 6-byte form's base
-  zero-extends across the long-mode entry far-jmp, so the same
-  pointer remains valid.
-- Long-mode code descriptor MUST set L=1 AND clear D=0.
-  Both set or D=1 #GPs on the far-jmp.
+**Lessons learned (filed in source comments and DOCS.md change-log):**
+- `lapic.c` / `ioapic.c` are arch-family-shared, not "x86-only" —
+  pure MMIO + MSR (`rdmsr`/`wrmsr`/`pause` encode identically in
+  32-bit and 64-bit mode).  They keep living under `kernel/hal/x86/`
+  for historical reasons but participate in both arch builds.
+- A self-contained trampoline GDT is the right shape for an
+  x86_64 AP bring-up trampoline: `lgdt` in 16-bit real mode reads
+  m16:24, but the long-mode kernel GDT pointer is m16:64.  The
+  trampoline carries its own 32+64-bit code/data descriptors,
+  transitions to 64-bit, then `lgdt`s the kernel GDT and far-rets
+  to reload CS atomically.
+- On x86_64 long mode, EVERY level of the 4-level page-table walk
+  checks the US bit, not just the leaf PT entry.  boot.s built
+  PML4[0] / PDPT[0] / PD[i] with US=0; the first user mapping
+  under that subtree #PFs with err=5 (P+U set) because PML4[0]'s
+  US=0 is the binding constraint.  Fix: walk_to_pt OR's US into
+  existing intermediate entries when the caller's flags request
+  it.  Permissions can only widen, never tighten — safe under any
+  caller mix.
+
+**Polish carried forward — filed as their own milestones below:**
+- §M18.6 — SMP polish (per-CPU runqueue, preempt_count, taskset,
+  cross-CPU IPI sender, MSI/MSI-X).
+- §M19.5 — Memory polish (HIGHMEM, empty-slab caching, SRAT/NUMA).
+- §M20.6 — x86_64 closure (SYSCALL/SYSRET instruction path; xHCI
+  + virtio-blk 64-bit DMA audit).
+
+None of these blocks M21+ — they're orthogonal to picking up the
+next big milestone.  But they're tracked work, not "someday" items.
+
+---
+
+## §M18.6 — SMP polish (carry-overs from M18.5)
+
+**Status: 4/5 sub-items shipped 2026-06-29** (.1 per-CPU runqueue
++ load balancer, .2 per-CPU preempt_count, .3 taskset, .4 cross-CPU
+IPI sender).  See DOCS.md change-log entry for the 2026-06-29
+polish round.  Remaining: **§M18.6.5 — MSI/MSI-X** (still open;
+not blocking — IOAPIC still routes legacy IRQs).
+
+**Why now:** The M18.5 ship-now / fix-later list collected real
+work that the scheduler will eventually need.  None of it blocks
+shell-level functionality (M18.5 already gets RUNNABLE tasks onto
+APs and scheduled in parallel), but the current design has
+known-quadratic costs and missing capabilities that will hurt
+once ncpus grows past ~8 or once real userspace lands.
+
+**Design — outline.**
+
+### §M18.6.1 — Per-CPU runqueue + load balancer
+
+**Status quo:** one global `task_table[]` walked by every CPU on
+every schedule-pick.  `task_running_elsewhere` is an O(ncpus) scan
+to avoid double-running.  Each pick is therefore O(ntasks + ncpus)
+under the global runqueue lock — a lock that every preempt-tick
+contends.
+
+**Design:**
+- One `struct runqueue { struct spinlock lock; struct task* head; ... }`
+  per CPU, embedded in `struct percpu`.
+- `task_spawn` enqueues to the current CPU's runqueue (or a
+  caller-specified one if affinity is set).
+- `schedule()` looks at this_cpu's local rq only; idle fallback
+  if it's empty.
+- Periodic load-balance pass (every N ticks on tick handler) steals
+  tasks from the heaviest queue to the lightest.  Cheap heuristic:
+  count of non-idle RUNNABLE entries per rq.
+
+**Files:** `kernel/core/task.c`, `kernel/includes/percpu.h`.
+
+### §M18.6.2 — Per-CPU `preempt_count`
+
+**Status quo:** today we toggle preempt via a global `preempt_off`
+flag.  Disabling on one CPU "globally" gates preemption for ALL
+CPUs, which is incorrect on SMP.
+
+**Design:**
+- `struct percpu` gains `int preempt_count`.
+- `preempt_disable()` increments the current CPU's count;
+  `preempt_enable()` decrements.  Schedule check fires only when
+  count drops to 0.
+- IRQ entry increments to gate nested rescheduling; IRQ exit
+  decrements + checks for a pending reschedule.
+
+**Files:** `kernel/core/task.c`, `kernel/core/lock.c`, the IRQ
+entry stubs.
+
+### §M18.6.3 — Task affinity / `taskset`
+
+**Design:** add `cpuset_t mask` to `struct task`.  scheduler picks
+only tasks whose mask includes this_cpu_id.  Shell command
+`taskset <pid> <cpuid>` (or hex mask) sets it.
+
+**Files:** `kernel/core/task.c`, `kernel/core/shell.c`.
+
+### §M18.6.4 — Cross-CPU preempt IPI sender
+
+**Status quo:** vector 0x41 is reserved in IDT setup on both
+archs but no code ever sends an IPI to it.  Means we can't force
+a remote CPU to re-evaluate its runqueue (it'll only do so on the
+next local tick — up to 10 ms latency).
+
+**Design:** `smp_send_reschedule(int cpu)` writes LAPIC ICR with
+delivery-mode=Fixed, vector=0x41, destination=that CPU's APIC id.
+The 0x41 handler (already wired) just calls `schedule_check()`.
+Use in: `task_set_runnable` when target task's home CPU isn't
+this_cpu.
+
+**Files:** `kernel/hal/x86/lapic.c` (new `lapic_send_ipi` helper),
+`kernel/core/task.c`.
+
+### §M18.6.5 — MSI / MSI-X
+
+**Status quo:** IOAPIC routes legacy IRQs (PIT, PS/2, virtio-blk
+INTx).  Modern PCIe devices want MSI for direct-to-CPU delivery
+without the IOAPIC pin bottleneck.  Required if we ever add a
+high-rate device (NIC, NVMe).
+
+**Design:** scan PCI capabilities for MSI (0x05) or MSI-X (0x11)
+capability; allocate a free IDT vector; program MSI address (=
+LAPIC base | apic_id) + data (= vector) in the device's
+capability registers.  Provide `pci_alloc_msi(dev, handler)`.
+
+**Files:** `kernel/hal/x86/pci.c`, `kernel/hal/x86/lapic.c`.
+
+**Definition of done (whole §M18.6):**
+- 16-CPU `qemu -smp 16` boots cleanly; load-balance test (many
+  CPU-bound tasks) shows roughly equal distribution.
+- `taskset 5 0x2` pins task 5 to CPU 1, observable on `procfs`
+  `last_cpu` field.
+- A virtio-blk driver patch that uses MSI shows IRQ delivery
+  going to the configured CPU.
+
+---
+
+## §M19.5 — Memory polish (carry-overs from M19)
+
+**Status: 1/3 sub-items shipped 2026-06-29** (.2 empty-slab caching).
+See DOCS.md change-log entry for the 2026-06-29 polish round.
+Remaining: **§M19.5.1 — HIGHMEM zone population + kmap** and
+**§M19.5.3 — ACPI SRAT → per-NUMA-node zones**.  Neither blocks
+shell-level functionality on ≤ 1 GiB / single-socket QEMU; both
+become required once real hardware is targeted.
+
+**Why now:** M19 shipped a per-zone buddy + slab + per-CPU
+magazines, but three items were filed as "later if needed."  All
+become required once we move from "single board, few GiB" to
+real hardware.
+
+### §M19.5.1 — HIGHMEM zone population + kmap
+
+**Status quo:** `ZONE_HIGHMEM` is reserved in pmm.c but
+unpopulated.  All physical memory above the kernel's identity
+map sits unused.  On i386 this caps usable RAM at 1 GiB (size of
+identity map); on x86_64 at 1 GiB (boot-time identity map size).
+
+**Design:** populate ZONE_HIGHMEM with pfns above the identity
+range.  For free-list link storage (which today lives INSIDE the
+free page), allocate a kmap-style temporary mapping per access.
+On x86_64 the natural choice is to extend the identity map to
+cover all of RAM at boot — long mode has plenty of virtual
+address space.  On i386 the kmap dance is unavoidable.
+
+**Files:** `kernel/mem/pmm.c`, `kernel/hal/<arch>/vmm.c`.
+
+### §M19.5.2 — Empty-slab caching
+
+**Status quo:** every slab page becomes empty → returned to the
+buddy.  Bursty allocators get hit by the round-trip.
+
+**Design:** each `slab_cache` keeps up to N empty slabs in a per-
+cache LIFO; only release excess to the buddy.  N tuned per-cache
+(small objects benefit more from caching since their slab is more
+likely to refill).
+
+**Files:** `kernel/mem/slab.c`.
+
+### §M19.5.3 — ACPI SRAT parsing → per-NUMA-node zones
+
+**Status quo:** PMM has one set of zones (DMA / NORMAL / HIGHMEM)
+shared across the whole system.  On a multi-socket NUMA machine,
+this means cross-socket memory traffic.
+
+**Design:** parse SRAT (System Resource Affinity Table) from ACPI;
+build `pmm_node[]` with per-node zones.  `pmm_alloc_frame()`
+takes a node hint (default: this_cpu's home node).  Slab too,
+ideally, but that's a deeper refactor.
+
+**Files:** `kernel/acpi/acpi.c` (SRAT walker), `kernel/mem/pmm.c`
+(per-node zones), `kernel/core/percpu.h` (cpu → node map).
+
+**Definition of done (whole §M19.5):**
+- `meminfo` shows HIGHMEM with actual frames managed (non-zero).
+- `slabinfo` reports cached-empty-slab count per cache.
+- On a `-numa node,nodeid=0/1` QEMU launch, `procfs` exposes
+  per-node free-frame counts.
+
+---
+
+## §M20.6 — x86_64 closure (SYSCALL/SYSRET, USB+block DMA)
+
+**Why now:** three concrete x86_64-specific limitations carried
+over from M20.5.  None blocks shell parity (which §M20.5 already
+delivered via `int 0x80` ring-3 and APIC + SMP), but they each
+prevent a real-world workload from running on x86_64.
+
+### §M20.6.1 — SYSCALL/SYSRET instruction path
+
+**Status quo:** ring 3 reaches the kernel via `int 0x80` only.
+Modern x86_64 userspace prefers the `syscall` instruction (lower
+latency, no IDT round-trip).  Linux phased out int 0x80 from
+glibc decades ago.
+
+**Design:**
+- **GDT reorganization.**  SYSRET (64-bit) demands a specific
+  layout: starting from selector S = STAR[63:48], the CPU loads
+  user CS = (S + 16) | 3, user SS = (S + 8) | 3.  Our current
+  GDT slots are 0 null / 1 kernel-CS64 / 2 kernel-DS / 3
+  user-CS64 / 4 user-DS / 5+6 TSS.  No value of S satisfies both
+  user CS at slot 3 and user DS at slot 4.  Two options:
+  a) Reorder the GDT to Linux's pattern (null / kernel-CS32 unused
+     / kernel-CS64 / kernel-DS / user-CS32 unused / user-DS /
+     user-CS64 / TSS).  Touches gdt.c, gdt.h, usermode.s,
+     ap_trampoline.s, isr_stubs.s.  Most invasive but cleanest.
+  b) Duplicate SYSRET-compatible user descriptors AFTER the TSS
+     (slots 7+8).  No churn on existing selectors; SYSRET reads
+     a parallel set.  Cheaper but uglier (two definitions of
+     "user CS").
+  Recommend (a) for long-term cleanliness; bundle with M20.6 ship.
+- **MSR setup.**  At `hal_arch_early_init` (after gdt_init):
+  - IA32_EFER (0xC0000080): set bit 0 (SCE).
+  - IA32_STAR (0xC0000081): kernel base in [47:32], user base in [63:48].
+  - IA32_LSTAR (0xC0000082): physical address of the syscall entry stub.
+  - IA32_FMASK (0xC0000084): RFLAGS bits to clear on entry (typically IF, TF).
+  - IA32_KERNEL_GS_BASE (0xC0000102): per-CPU struct pointer (so swapgs gets us to per-CPU data).
+- **Entry stub** (new `kernel/hal/x86_64/syscall_entry.s`):
+  - swapgs (kernel GS active)
+  - save user rsp via gs:offset, load kernel rsp
+  - push rcx (= user RIP) + r11 (= user RFLAGS) onto kernel stack
+  - construct an int_frame compatible with the int 0x80 path
+  - call syscall_dispatch
+  - restore
+  - swapgs back
+  - sysretq
+- **Ringtest update:** add a SYSCALL variant alongside the int 0x80
+  variant.  Hand-coded bytes: `0F 05` = `syscall`.
+
+**Files:** `kernel/hal/x86_64/gdt.{c,h}`, `kernel/hal/x86_64/syscall_entry.s`
+(new), `kernel/hal/x86_64/hal_arch.c` (MSR init), `kernel/core/shell.c`
+(ringtest variant), possibly `kernel/hal/x86_64/usermode.s` (selector
+constants change if GDT reorg).
+
+### §M20.6.2 — xHCI 64-bit DMA audit
+
+**Status quo:** `kernel/drivers/usb/xhci.c` is compiled out of
+the x86_64 build.  The driver was written assuming all DMA
+buffers and ring pointers fit in 32 bits.  Once the kernel runs
+with >4 GiB RAM and the buddy allocator hands out a frame above
+4 GiB, the driver would silently write a truncated address to
+xHCI's MMIO registers.
+
+**Design:**
+- Audit every `(uint32_t)` cast on a buffer/ring pointer in xhci.c.
+- Switch to `uint64_t` where the spec says 64-bit (most xHCI
+  registers ARE 64-bit, accessed as two 32-bit halves on i386 but
+  natively on x86_64).
+- For allocations that MUST be in low memory (no good reason today
+  but some xHCI controllers have a 32-bit DMA mask): use a new
+  `pmm_alloc_frame_zone(ZONE_DMA)` to force <4 GiB.
+- Add a sentinel: if any DMA pointer above the controller's
+  declared DMA mask is passed in, panic loudly.
+
+**Files:** `kernel/drivers/usb/xhci.c`, `kernel/mem/pmm.c` (zone-
+hint API).
+
+### §M20.6.3 — virtio-blk + exFAT 64-bit DMA audit
+
+**Status quo:** same as xHCI but for `kernel/drivers/block/virtio_blk.c`.
+virtio rings and descriptor tables use 64-bit phys addrs in the
+spec; the i386 driver squeezes everything into 32-bit.
+
+**Design:** parallel to §M20.6.2.  Audit casts, widen, use
+ZONE_DMA hint where needed.  exFAT itself is fs-layer code — it
+doesn't see DMA directly — but verify no shortcut casts.
+
+**Files:** `kernel/drivers/block/virtio_blk.c`, `kernel/fs/exfat.c`.
+
+**Definition of done (whole §M20.6):**
+- `qemu-system-x86_64 -m 8G` boots; `meminfo` reports the full
+  range as managed.
+- ringtest's SYSCALL variant prints "hello from ring 3!" and
+  returns — same DoD as the int 0x80 variant on i386.
+- `qemu-system-x86_64 -drive if=virtio,...` + `qemu-system-x86_64
+  -device qemu-xhci ...`: serial log shows the drivers register
+  and a smoke test (block dd, USB enumeration) runs.
+
+---
 
 ---
 

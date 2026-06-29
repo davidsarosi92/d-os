@@ -190,3 +190,23 @@ int smp_boot_aps(void) {
     return started;
 }
 
+/* ---------------------------------------------------------------------------
+ * M18.6.4 — cross-CPU preempt IPI wrapper.
+ *
+ * Translates a logical CPU index into the target CPU's APIC ID and
+ * fires LAPIC fixed-delivery IPI on vector 0x41.  Falls through for
+ * self / invalid index — see smp.h for rationale.
+ *
+ * Vector 0x41 is reserved at IDT-init time in idt.c; its handler
+ * (in isr_handler) calls schedule_check() on the receiving CPU.
+ * --------------------------------------------------------------------------- */
+#define PREEMPT_IPI_VECTOR  0x41
+
+void smp_send_reschedule(int cpu_index) {
+    if (cpu_index < 0 || cpu_index >= smp_ncpus()) return;
+    struct percpu* p = percpu_at(cpu_index);
+    if (!p || !p->online) return;
+    if (cpu_index == this_cpu_id()) return;
+    lapic_send_ipi(p->apic_id, PREEMPT_IPI_VECTOR);
+}
+

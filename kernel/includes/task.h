@@ -52,7 +52,11 @@ struct task {
     enum task_state state;
     uintptr_t esp;                      /* saved kernel-stack pointer (HAL-typed) */
     void*    kstack_base;               /* kmalloc'd; freed at reap */
-    struct task* next;                  /* circular run-queue link */
+    /* Master-list link (circular SLL of every alive task).  Walked by
+     * ps / task_for_each / task_find.  Pre-M18.6.1 the scheduler
+     * also walked this list; now per-CPU runqueues take that role and
+     * `next` is purely diagnostic. */
+    struct task* next;
     /* M14: optional per-task output binding.  When non-NULL, console.c
      * routes the running task's console_putchar bytes here instead of
      * (or in addition to) the global sinks.  Opaque `void*` so task.h
@@ -63,6 +67,23 @@ struct task {
      * runnable on this CPU.  Set via task_become_idle() (current task)
      * or by task_install_ap_idle() (AP bootstrap). */
     int      is_idle;
+    /* M18.6.3 — CPU affinity mask.  Bit i set => task may run on CPU i.
+     * Default 0xFFFFFFFF (any CPU; capped at ACPI_MAX_CPUS=32 today —
+     * widening to a real cpuset_t is straightforward once we have
+     * boards with >32 cores).  Scheduler skips tasks whose mask
+     * excludes this_cpu_id; load balancer also skips them at steal
+     * time so a pinned task never migrates off its allowed set. */
+    uint32_t cpu_mask;
+    /* M18.6.1 — per-CPU runqueue links.  When state==RUNNABLE and the
+     * task is NOT the current of any CPU, it lives on cpu_home's
+     * runqueue.  Idle tasks never live on a runqueue — they're picked
+     * via percpu->idle directly.
+     *   cpu_home   : which CPU's rq this task lives on (or -1).
+     *   rq_next/rq_prev : doubly-linked list rooted at percpu->rq_head.
+     */
+    int      cpu_home;
+    struct task* rq_next;
+    struct task* rq_prev;
 };
 
 /* Set up the scheduler and convert the current `kernel_main` context
@@ -140,5 +161,18 @@ int  task_count(void);
  * currently scheduled task.  Used by procfs to render `/proc/tasks`. */
 typedef void (*task_iter_fn)(const struct task* t, int is_current, void* ctx);
 void task_for_each(task_iter_fn fn, void* ctx);
+
+/* M18.6.3 — find a task by pid.  Returns NULL if no live task carries
+ * that pid.  Used by `taskset` and a future `kill`.  Walks the global
+ * task list under the master scheduler lock. */
+struct task* task_find(int pid);
+
+/* M18.6.3 — set / get task affinity.  Mask of allowed CPU bits;
+ * passing 0 is rejected (would mean "may run nowhere").  If the
+ * caller restricts a task off its current home CPU, the scheduler
+ * naturally re-homes it on the next pick (the load-balancer steal
+ * path respects affinity). */
+int      task_set_affinity(struct task* t, uint32_t mask);
+uint32_t task_get_affinity(const struct task* t);
 
 #endif

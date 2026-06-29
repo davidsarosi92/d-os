@@ -30,4 +30,23 @@ int smp_boot_aps(void);
 #include <stdint.h>
 void smp_set_lapic_timer_count(uint32_t count);
 
+/* M18.6.4 — cross-CPU "please reschedule" request.
+ *
+ * Sends LAPIC IPI vector 0x41 to the target CPU's LAPIC.  The IDT
+ * handler for 0x41 calls schedule_check() on receipt, so the target
+ * picks any newly-runnable task without waiting up to ~10 ms for its
+ * own LAPIC timer to tick.
+ *
+ * No-ops if `cpu_index` is THIS CPU (we'd just delay our own
+ * scheduling — schedule_request() is the right local primitive) or
+ * out of range.  Safe to call from IRQ context; the LAPIC ICR write
+ * doesn't block on the receiver.
+ *
+ * Use cases:
+ *   - task_set_runnable on a task whose home CPU isn't us — wake the
+ *     target so it sees the work right away.
+ *   - load_balance result: kick a CPU that just received a stolen
+ *     task. */
+void smp_send_reschedule(int cpu_index);
+
 #endif
