@@ -151,7 +151,7 @@ what); a session can pick a theme and push on it.
 | M17 | Portability cut — extract `hal_api.h`           | Architecture     | ✅ DOCS §4.X (partial — see notes) |
 | M18 | SMP support — APIC, AP boot, per-CPU, locking   | Concurrency      | ✅ DOCS §4.X |
 | M19 | Memory at scale — slab, huge pages, near-NUMA   | Memory           | ✅ DOCS §4.8, §4.10 |
-| M20 | x64 (long mode) port                            | Architecture     | §M20    |
+| M20 | x64 (long mode) port (UP)                       | Architecture     | ✅ DOCS §4.X (M20.5 closes SMP + SYSCALL) |
 | M21 | ARM (aarch64 generic / RPi) port                | Architecture     | §M21    |
 | M22 | GUI infrastructure (+ Wayland reuse if viable)  | UX               | §M22    |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
@@ -1016,34 +1016,74 @@ Highlights of what landed:
 
 ---
 
-## §M20 — x64 (long mode) port
+## §M20 — x64 (long mode) port — ✅ shipped (UP only)
 
-**Why now:** the second arch is the test of §M17.  Going x86 → x64
-shares enough that we shouldn't rip up the design, but enough must
-change (4-level page tables, syscall instruction, REX prefixes, RIP-
-relative addressing in ABI) that the HAL boundary really gets
-exercised.
+Shipped, see **DOCS.md §4.X "Supported architectures"** for the
+as-built shape — multi-arch build matrix (`make ARCH=i386|x86_64`),
+`kernel/hal/x86_64/` tree, multiboot2 + 32→64 long-mode entry,
+4-level paging behind a `uintptr_t`-widened `vmm.h`, mb2→mb1 tag
+translator that keeps `pmm.c` / `fb_terminal.c` / `mboot_print_*`
+unchanged, shell prompt running on `qemu-system-x86_64 -m 256M`.
 
-**Design.**
+**SMP, USB, block, ring-3 deferred to §M20.5.**  x86_64 stays on
+the 8259 PIC for UP IRQ delivery and uses `int 0x80` (currently
+stubbed) for the eventual syscall path.
 
-- **Boot:** multiboot2 (since multiboot1 doesn't support 64-bit).
-  Or eventual UEFI bootloader.
-- **Long mode entry:** 32-bit stub sets up CR0.PE, page tables, then
-  jumps to 64-bit code.
-- **Page tables:** 4-level (PML4 → PDPT → PD → PT).  HAL's
-  `hal_map` already takes `uint64_t`.
-- **GDT / IDT:** 64-bit gate descriptors.  TSS layout differs.
-- **Calling convention:** System V x86_64 ABI (args in registers).
-  Asm helpers (context_switch, enter_user_mode_wrap) get a 64-bit
-  twin.
-- **Syscall mechanism:** `syscall`/`sysret` instructions instead of
-  `int 0x80`.  IDT vector 0x80 stays as a fallback.
+## §M20.5 — x86_64 SMP + APIC + SYSCALL/SYSRET
+
+**Why now:** closes the x86_64 port.  M20's UP slice proves the HAL
+boundary is sound; M20.5 brings the SMP machinery (M18) and ring-3
+machinery (M6) across.
+
+**Design — outline only.**
+
+- **AP trampoline:** rewrite for 16-bit real → 32-bit protected →
+  64-bit long mode transition.  Each AP needs its own PML4 ptr in
+  CR3 before far-jmping into 64-bit code.  Reuse the BSP's PML4
+  (single shared page hierarchy across all CPUs).
+- **LAPIC / IOAPIC:** mostly MMIO copy from the i386 driver; the
+  vmm.h widening already lets us map MMIO above 4 GiB without
+  source change.  Watch for any `uint32_t` cast lurking in
+  `kernel/hal/x86/lapic.c` / `ioapic.c` and widen.
+- **smp_boot_aps:** retarget to the new x86_64 trampoline.  Per-CPU
+  init (LAPIC enable, IDT load, idle task install, LAPIC timer
+  arm) carries over.
+- **SYSCALL/SYSRET:** MSR setup (IA32_STAR, IA32_LSTAR, IA32_FMASK,
+  IA32_KERNEL_GS_BASE).  New asm entry stub: swapgs → save user
+  context → call C dispatcher → restore → swapgs → sysretq.
+- **Ring-3 wrap:** new `enter_user_mode_wrap` in
+  `kernel/hal/x86_64/usermode.s` building a 5-quadword iretq frame
+  (ss, rsp, rflags, cs, rip).
+- **Drop the M20 stubs as the real impls land** (`m20_stubs.c`
+  shrinks; delete it when empty).
 
 **Definition of done:**
-- `make ARCH=x86_64` builds a separate kernel.bin64.
-- Boots in QEMU `qemu-system-x86_64`.
-- All shell commands work.
-- DOCS.md gains a "supported architectures" section.
+- `qemu-system-x86_64 -smp 4` boots cleanly, parallel self-test
+  PASSes (both hogs make progress on different CPUs).
+- shell `ringtest` command runs a ring-3 program that returns via
+  SYSCALL/SYSRET.
+- DOCS.md §4.X (Supported architectures) updated to reflect SMP
+  + ring-3 status.
+
+**Lesson learned (M20):**
+- Multiboot2 framebuffer-request tag (type 5 in the header) is
+  mandatory.  Without it GRUB doesn't deliver a runtime FB tag and
+  `fb_terminal` stays inert.
+- `objcopy --input-target=binary` symbol names track the input
+  filename — keep blob `.bin` artefacts at source-relative paths
+  even when other build artefacts move into `build/$(ARCH)/`.
+- `kprintf` has no `%l` prefix.  Either cast 64-bit args to
+  uint32_t and use `%x`, or land the printf rewrite from the
+  polish backlog.
+- x86_64 `rdmsr` can't use the `=A` GCC asm constraint (legacy
+  edx:eax-as-pair); use two `=a` / `=d` outputs and recombine
+  in C.
+- IDTR is per-CPU even though IDT data is shared.  Long mode
+  GDTR is 10 bytes (vs. 6 in 32-bit); the 6-byte form's base
+  zero-extends across the long-mode entry far-jmp, so the same
+  pointer remains valid.
+- Long-mode code descriptor MUST set L=1 AND clear D=0.
+  Both set or D=1 #GPs on the far-jmp.
 
 ---
 

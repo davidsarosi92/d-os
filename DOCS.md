@@ -37,6 +37,7 @@ when sections are added.)
 | 4.X | USB host stack — xHCI + HID (M15) | ~750 |
 | 4.X | Virtual consoles / pane split (M14) | ~840 |
 | 4.X | Ring 3 / user mode | ~925 |
+| 4.X | Supported architectures — i386 + x86_64 (M20) | ~1365 |
 | 4.X | Block layer + virtio-blk (M11) | 490 |
 | 4.X | procfs | 542 |
 | 4.X | devfs | 573 |
@@ -60,9 +61,11 @@ when sections are added.)
 ```
 d-os/
 ├── Dockerfile                 # Ubuntu 22.04 + cross-tools (amd64 forced)
-├── Makefile                   # build glue: compile, link, iso
-├── linker.ld                  # kernel link script (ENTRY=_start, load at 1 MiB)
-├── boot/grub/grub.cfg         # GRUB menu entry, loads kernel via multiboot1
+├── Makefile                   # build glue: compile, link, iso (ARCH=i386|x86_64)
+├── linker-i386.ld             # i386 link script (ELF32, ENTRY=_start, load at 1 MiB)
+├── linker-x86_64.ld           # x86_64 link script (ELF64, same load addr)
+├── boot/grub/grub.cfg         # GRUB menu entry — i386 multiboot1
+├── boot/grub/grub-x86_64.cfg  # GRUB menu entry — x86_64 multiboot2
 ├── scripts/
 │   ├── build.sh               # docker build + make iso
 │   └── run_qemu.sh            # prefers host qemu, falls back to docker
@@ -1362,6 +1365,107 @@ from Linux's exfatprogs after each write.
   UART is present (a dead transmitter would spin forever waiting for
   THR-empty).  Fine on QEMU; add a probe before using on real hardware.
 
+### 4.X Supported architectures — i386 + x86_64 (M20)
+
+d-os builds on two arches today; a third (aarch64) is the next
+portability stress test on the roadmap.
+
+| Arch    | Status                              | Boot path                            |
+|---------|-------------------------------------|--------------------------------------|
+| i386    | Full — reference port               | Multiboot1 + 32-bit ELF              |
+| x86_64  | UP only; SMP + SYSCALL pending M20.5 | Multiboot2 + 64-bit ELF, long mode  |
+| aarch64 | Planned (M21)                       | UEFI / U-Boot, EL1 entry             |
+
+**Per-arch source tree:**
+- `kernel/hal/x86/`    — i386 HAL (boot.s, gdt, idt, tss, isr_stubs,
+  switch, usermode, task_arch, hal_arch, vmm, io, lapic, ioapic,
+  smp, pci, ap_trampoline).
+- `kernel/hal/x86_64/` — x86_64 HAL (boot.s, gdt, idt, tss,
+  isr_stubs, switch, task_arch, hal_arch, vmm, io, mb2, main_entry,
+  m20_stubs).  No usermode.s, no lapic/ioapic/smp/ap_trampoline
+  yet — those land in M20.5.
+
+**x86_64 boot path:**
+1. GRUB parses the multiboot2 header in `boot.s` (`.multiboot`
+   section) and loads the ELF64 kernel at 1 MiB.  Entry is in
+   32-bit protected mode (mb2 §3.1.5 default).
+2. `_start` (32-bit code in `boot.s`) stashes the loader magic +
+   info pointer, runs a CPUID long-mode check, then builds an
+   identity-mapped page hierarchy: PML4[0] → PDPT[0] → PD[0..511]
+   as 2 MiB large pages (PS=1), covering the first 1 GiB.  Three
+   .bss-allocated 4 KiB frames total.
+3. Intel SDM Vol 3A §9.8.5 long-mode entry sequence:
+   CR4.PAE → CR3 = pml4 → EFER.LME → CR0.PG.  CPU is now in
+   long-mode compatibility submode (32-bit code with 64-bit paging).
+4. Far-jmp through a tiny 64-bit GDT into `long_mode_entry` (true
+   64-bit code).  Reload data segs, print
+   "Hello from x86_64 long mode\r\n" via polled COM1 as a sentinel,
+   call `x86_64_main_entry(magic, info)`.
+5. `x86_64_main_entry` (in `main_entry.c`) validates the mb2 magic
+   (0x36d76289) and translates the mb2 tag stream into a static
+   `struct mboot_info` (mb1 shape) via `mb2_translate_to_mb1`.
+   Then calls `kernel_main(MULTIBOOT_BOOTLOADER_MAGIC, mb1_ptr)` —
+   so the rest of the kernel (pmm.c, fb_terminal.c, mboot_print_*,
+   ...) sees the familiar mb1 layout regardless of how we booted.
+6. `kernel_main` runs the standard boot sequence.  Two arch-gated
+   blocks:
+   - APIC bring-up + LAPIC-timer programming + smp_boot_aps under
+     `#if defined(__i386__)`.  x86_64 stays on the 8259 PIC for UP
+     IRQ delivery; an `apic: x86_64 SMP/APIC bring-up deferred
+     (M20.5)` line lands on the serial log.
+   - Ring-3 paths (shell `ringtest` command, syscall_dispatch from
+     IDT vector 0x80) are not wired — they reach UP-only stubs in
+     `m20_stubs.c` that hard-halt if invoked.
+
+**HAL API status — vmm.h widening:**
+- `vmm_map / vmm_map_4mib / vmm_unmap / vmm_translate /
+  vmm_kernel_pd_phys` all take `uintptr_t` for virt/phys/return
+  types so the same prototype serves both archs.  i386 callers
+  see no source change (uintptr_t = uint32_t there).
+- `vmm_map_4mib` semantics: on i386 it's literally a 4 MiB PSE PDE;
+  on x86_64 it installs TWO adjacent 2 MiB large PD entries to
+  preserve the 4 MiB contract for callers like fb_terminal.c and
+  xhci.c.
+
+**HAL API status — idt.h, tss.h, multiboot.h:**
+- `struct int_frame` (in idt.h) is `#if defined(__x86_64__)`-gated:
+  i386 layout pushes ds/es/fs/gs + pusha + iret frame; x86_64
+  layout pushes 15 GPRs + always-5-quadword iretq frame.  Field
+  names int_no / err_code identical across archs so portable IRQ
+  handlers (pit_irq, keyboard_irq) compile for both.
+- `tss_set_kernel_stack`, `tss_get_addr` take/return `uintptr_t`
+  (i386: 32-bit ESP, x86_64: 64-bit RSP).
+- `mboot_init`, `kernel_main` take `uintptr_t info_ptr`.  Boot.s
+  on each arch passes the appropriate value.
+
+**What's deferred (M20.5):**
+- x86_64 SMP: AP trampoline rewrite for 16-bit real → 32-bit prot
+  → 64-bit long mode, LAPIC + IOAPIC port (mostly MMIO copy, but
+  vmm_map widening means the existing i386 lapic.c may be reusable
+  with minor cast cleanup), `smp_boot_aps` adapt to call the new
+  trampoline.
+- SYSCALL/SYSRET on x86_64: MSR setup (STAR, LSTAR, SFMASK), new
+  entry stub in asm with swapgs + register-restore.  `int 0x80`
+  gate remains for compatibility.
+- USB host (xHCI) and block layer (virtio-blk + exFAT) for x86_64:
+  drivers currently compiled out of the x86_64 build because their
+  DMA paths assume <4 GiB phys addressing and need a 64-bit revisit.
+
+**Lessons learned (filed in source comments + the M18.5 / M19 /
+M20 change-log entries):**
+- Multiboot2 framebuffer-request tag (type 5 in the header) is
+  mandatory to get GRUB to deliver a runtime framebuffer info tag.
+  Without it, fb_terminal stays inert and `vc_init` bails.
+- `objcopy --input-target=binary` mints symbol names from the
+  input filename — keep `.bin` artifacts at their source-relative
+  paths so the symbols smp.c references remain stable across
+  ARCH-specific build trees.
+- IDTR is per-CPU even though the IDT data is shared; each AP
+  (and the x86_64 BSP) must run its own `lidt`.
+- kprintf in `kernel/core/printf.c` has no `%l` prefix.  Use `%x`
+  + manual 64-bit-to-32-bit casts until the polish-backlog printf
+  rewrite lands.
+
 ### 4.12 ACPI (`kernel/acpi/acpi.c`)
 - **Purpose:** discover ACPI tables at boot, parse `_S5_` from DSDT, enable
   proper `hal_shutdown` on real hardware.
@@ -1386,18 +1490,33 @@ from Linux's exfatprogs after each write.
 ## 5. Build & run
 
 ```sh
-./scripts/build.sh      # docker build + make iso → build/d-os.iso
-./scripts/run_qemu.sh   # launches qemu-system-i386 -cdrom build/d-os.iso
+./scripts/build.sh                    # default: ARCH=i386 → build/i386/d-os.iso
+./scripts/run_qemu.sh                 # qemu-system-i386 -cdrom build/i386/d-os.iso
+
+ARCH=x86_64 ./scripts/build.sh        # → build/x86_64/d-os.iso
+ARCH=x86_64 ./scripts/run_qemu.sh     # qemu-system-x86_64 ...
 ```
+
+Each ARCH gets its own object tree under `build/$(ARCH)/`, so the two
+builds never collide and you can ping-pong between them without `make
+clean`.  `make clean` wipes only the current ARCH; `make clean-all`
+wipes both.
 
 Host needs Docker (the build is done inside a pinned `ubuntu:22.04 amd64`
 container to avoid arm64 Mac package availability issues). Host can
-optionally have a native `qemu-system-i386` (e.g. `brew install qemu`) for
-running with a graphical window; otherwise `run_qemu.sh` falls back to
-headless qemu inside the Docker image.
+optionally have a native `qemu-system-i386` / `qemu-system-x86_64`
+(e.g. `brew install qemu`) for running with a graphical window;
+otherwise `run_qemu.sh` falls back to headless qemu inside the Docker
+image.
+
+The Makefile has no header-dependency tracking — after editing a
+shared header (e.g., `hal_api.h`, `vmm.h`, `idt.h`), run `make clean
+ARCH=<arch>` to force a rebuild.  Auto-generated `.d` files via `gcc
+-MMD` are on the polish backlog.
 
 ## 6. Compiler flags
 
+i386:
 ```
 -m32                      i386 code generation
 -ffreestanding            no hosted environment, no libc
@@ -1407,8 +1526,17 @@ headless qemu inside the Docker image.
 -Wall -Wextra             noisy diagnostics
 -std=c11                  stable dialect
 ```
+Linker: `ld -m elf_i386 -T linker-i386.ld -nostdlib`.
 
-Linker: `ld -m elf_i386 -T linker.ld -nostdlib`.
+x86_64 (additions / changes from i386):
+```
+-m64                      long-mode code generation
+-mno-red-zone             kernel: IRQs share rsp, red zone unsafe
+-mno-mmx -mno-sse{,2,3}   no SIMD (FPU/XMM not init'd in our entry)
+-mno-3dnow                no 3DNow (very old AMD)
+-mcmodel=large            link kernel anywhere in 64-bit address space
+```
+Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`.
 
 ---
 
@@ -1428,6 +1556,65 @@ Linker: `ld -m elf_i386 -T linker.ld -nostdlib`.
 ---
 
 ## 8. Change log
+
+- **2026-06-29 — M20: x86_64 (long mode) port — UP, shell prompt up.**
+  Second-arch shakedown of the M17 HAL boundary.  Multi-arch build
+  matrix (`make ARCH=i386|x86_64`, default i386), separate output
+  trees under `build/$(ARCH)/`.  New `kernel/hal/x86_64/`:
+  `boot.s` (multiboot2 header + 32→64 long-mode entry per Intel SDM
+  Vol 3A §9.8.5: CR4.PAE → CR3 → EFER.LME → CR0.PG → far-jmp into
+  L=1 code segment), `vmm.c` (4-level paging behind the same vmm.h
+  API as i386, inheriting boot.s's PML4/PDPT/PD), `gdt.c` (7-slot
+  GDT including a 16-byte / 2-slot long-mode TSS descriptor),
+  `idt.c` (16-byte gates, 64-bit offset split across 3 fields),
+  `isr_stubs.s` (uniform 5-quadword CPU push + 15 GPR save, no
+  segment-reg dance because long mode largely ignores ds/es/fs/gs),
+  `switch.s` (System V x86_64 callee-saved set: rbx, rbp, r12-r15),
+  `task_arch.c` (matching 64-bit first-switch frame), `tss.c`
+  (packed 104-byte 64-bit TSS with RSP0 at offset 4), `hal_arch.c`,
+  `io.c`, `mb2.c` (multiboot2 → mb1 tag-stream translator so
+  pmm/fb_terminal/mboot_print etc. stay unchanged), `main_entry.c`
+  (the bridge from boot.s long_mode_entry into kernel_main),
+  `m20_stubs.c` (UP no-op returns for lapic_*/ioapic_*/smp_*/
+  syscall_dispatch/enter_user_mode_wrap/xhci_poll — shrinks as
+  M20.5 / Phase 7 land real impls).  Arch-conditionals: `struct
+  int_frame` (in `idt.h`) is `#if defined(__x86_64__)`-gated;
+  `vmm.h` API widened to `uintptr_t` so source-compatible on i386;
+  `kernel_main` and `mboot_init` take `uintptr_t info_ptr`; APIC
+  bring-up + LAPIC timer + `smp_boot_aps` blocks in `kernel.c`
+  gated under `#if defined(__i386__)` (x86_64 stays on the 8259
+  for UP IRQ delivery — PIT IRQ0 works fine via legacy path).
+  Multiboot2 header includes the type-5 framebuffer-request tag
+  (1024x768x32), without which GRUB doesn't deliver a runtime
+  framebuffer tag and `fb_terminal` stays inert.  i386 `vmm.c`
+  moved from `kernel/mem/vmm.c` to `kernel/hal/x86/vmm.c` to
+  reflect its arch-specificity.  Verified UP on QEMU
+  `qemu-system-x86_64 -m 256M`: shell prompt up, all M19+M18.5
+  self-tests PASS (preempt_test ~52M hog ticks in 500 ms, vmm
+  round-trip, kmalloc reuse, microbench 10 ms / 10k iterations,
+  4-level paging confirmed via `vmm_print_status` MSR readback of
+  EFER.LMA).  i386 baseline unchanged: same shell, same self-tests.
+  Pitfalls codified: (1) long-mode code descriptor MUST have L=1
+  AND D=0 — both set or D=1 #GPs on the far-jmp; (2) lgdt operand
+  is 6 bytes in 32-bit and 10 bytes in 64-bit, but the 6-byte
+  form's base is zero-extended on long-mode entry so the same
+  pointer remains valid as long as the GDT lives in the low 4
+  GiB; (3) mb2 framebuffer-request tag is mandatory for FB
+  delivery (no GRUB-side default); (4) `objcopy --input-target=
+  binary` symbol names depend on the input filename — keep
+  `ap_trampoline.bin` at its source-relative path even when other
+  build artefacts move into `build/$(ARCH)/`; (5) `kprintf` has
+  no `%l` prefix and the `default:` case echoes `%l` verbatim
+  without consuming a va_arg, so passing 64-bit args under `%lx`
+  silently corrupts the subsequent arg slots; (6) x86_64 `rdmsr`
+  can't use the `=A` GCC asm constraint (that means the
+  edx:eax-as-64-bit-pair legacy form, not long-mode's
+  zero-extended rax/rdx); use two `=a` / `=d` outputs and
+  recombine in C.  Deferred to M20.5: SMP on x86_64 (AP
+  trampoline 16→32→64), LAPIC/IOAPIC port, SYSCALL/SYSRET (`int
+  0x80` retained as compatibility gate), USB host (xHCI DMA
+  needs 64-bit revisit), virtio-blk + exFAT (block layer DMA
+  same).
 
 - **2026-06-28 — M18.5: APs scheduling (LAPIC timer per-CPU +
   per-CPU idle + scheduler idle-fallback policy).**  Closed the M18

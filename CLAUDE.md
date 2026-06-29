@@ -18,27 +18,33 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
-✅ **M1 – M19 + M18.5** shipped.  Highlights so far: VFS + ramfs +
+✅ **M1 – M20 + M18.5** shipped.  Highlights so far: VFS + ramfs +
 exFAT on virtio-blk, devfs + procfs, preemptive scheduler with
 lock-handoff, multi-pane shell, xHCI USB + HID, keyboard layouts,
-HAL cut (`hal_api.h`), SMP (APIC + IOAPIC + INIT/SIPI APs + per-CPU
-current + real cmpxchg spinlocks), memory at scale (per-zone buddy
-PMM + slab + per-CPU magazines), **APs scheduling — LAPIC timer
-per-CPU (100 Hz, calibrated against PIT), per-CPU idle tasks,
-scheduler idle-fallback policy; verified on `-smp 4`: two CPU-bound
-hogs run concurrently (PASS)**.
+HAL cut (`hal_api.h`), SMP on i386 (APIC + IOAPIC + INIT/SIPI APs
++ per-CPU current + real cmpxchg spinlocks), memory at scale (per-
+zone buddy PMM + slab + per-CPU magazines), APs scheduling (LAPIC
+timer per-CPU, per-CPU idle tasks, scheduler idle-fallback policy),
+**x86_64 (long mode) UP port — multiboot2 + 32→64 entry, 4-level
+paging, 64-bit GDT/IDT/TSS/ISR stubs, vmm.h API widened to
+uintptr_t, full kernel_main runs to the same shell prompt as i386;
+SMP + SYSCALL/SYSRET on x86_64 deferred to M20.5**.
 
 🔲 **Next options** (pick one):
 
-- **M20** — x64 (long mode) port.  Tests the HAL boundary (M17).
-- **M21** — aarch64 port.
+- **M20.5** — x86_64 SMP + APIC + SYSCALL/SYSRET (closes the
+  x86_64 port).
+- **M21** — aarch64 port.  Third arch, real torture test of HAL
+  portability (no port I/O, GIC instead of APIC, EL1/EL0 instead
+  of rings).
 - **M22** — GUI infrastructure (compositor + windows; Wayland-reuse
   evaluation phase per §M22).
 - **M23** — Audio (AC97 → HDA → I2S).
 - **M24** — Network (NIC → IP/UDP/TCP → sockets).
 - **Polish backlog** (smaller, can interleave): per-CPU runqueue +
   load balancer, per-CPU `preempt_count`, task affinity / taskset,
-  cross-CPU preempt IPI (vector 0x41 reserved), MSI/MSI-X.
+  cross-CPU preempt IPI (vector 0x41 reserved), MSI/MSI-X,
+  printf rewrite to support %l (M20 lesson: blocked us briefly).
 
 🔲 **PLAN extensions (placeholders, design only):**
 - §M22 — GUI includes a Wayland-reuse evaluation phase
@@ -82,16 +88,24 @@ hogs run concurrently (PASS)**.
 ## Build / run
 
 ```sh
-./scripts/build.sh          # docker build + iso → build/d-os.iso
-./scripts/run_qemu.sh       # GUI window, NO disk attached
+./scripts/build.sh                    # default ARCH=i386 → build/i386/d-os.iso
+./scripts/run_qemu.sh                 # i386 GUI window, NO disk attached
+
+ARCH=x86_64 ./scripts/build.sh        # → build/x86_64/d-os.iso
+ARCH=x86_64 ./scripts/run_qemu.sh     # x86_64 in qemu-system-x86_64
 ```
+
+`make clean` wipes the current ARCH only; `make clean-all` wipes all
+builds.  No header dependencies (yet) — after editing a shared
+header (e.g., `hal_api.h`, `vmm.h`, `idt.h`), run `make clean
+ARCH=<arch>` to force a rebuild.
 
 For block-layer / future-fs testing, the disk image must be attached
 manually (the script intentionally doesn't add `-drive`):
 
 ```sh
 dd if=/dev/zero of=build/test.img bs=1M count=4   # once
-qemu-system-i386 -cdrom build/d-os.iso \
+qemu-system-i386 -cdrom build/i386/d-os.iso \
     -drive if=virtio,file=build/test.img,format=raw
 ```
 
@@ -100,9 +114,12 @@ For headless / automated testing (capture serial log):
 ```sh
 qemu-system-i386 -display none -no-reboot \
     -serial file:/tmp/serial.log -monitor stdio \
-    -m 256M -cdrom build/d-os.iso \
+    -m 256M -cdrom build/i386/d-os.iso \
     -drive if=virtio,file=build/test.img,format=raw
 ```
+
+Block / USB drivers are i386-only today; x86_64 boots without them
+(virtio-blk + xhci need a 64-bit DMA-path revisit — M20.5+).
 
 ## Session etiquette
 
