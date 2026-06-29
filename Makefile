@@ -92,7 +92,10 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/idt.c \
       kernel/hal/x86_64/tss.c \
       kernel/hal/x86_64/vmm.c \
-      kernel/hal/x86_64/task_arch.c
+      kernel/hal/x86_64/task_arch.c \
+      kernel/hal/x86_64/mb2.c \
+      kernel/hal/x86_64/main_entry.c \
+      kernel/hal/x86_64/m20_stubs.c
 
   ARCH_ASM_SRCS := \
       kernel/hal/x86_64/boot.s \
@@ -155,8 +158,42 @@ CORE_C_SRCS := \
     kernel/mem/kmalloc.c \
     kernel/mem/slab.c
 else
-# Phase 1 of M20: x86_64 path links only boot.s; no core sources yet.
-CORE_C_SRCS :=
+# Phase 5 of M20: x86_64 path now links the full kernel core.  SMP-
+# only and ring-3-only files (smp.c, lapic.c, ioapic.c, pci.c,
+# syscall.c) are excluded — they're brought up in M20.5 (SMP on
+# x86_64) and Phase 7 (SYSCALL/SYSRET).  kernel_main has #ifdef
+# guards around the blocks that call those subsystems.
+CORE_C_SRCS := \
+    kernel/core/kernel.c \
+    kernel/core/shell.c \
+    kernel/core/printf.c \
+    kernel/core/multiboot.c \
+    kernel/core/console.c \
+    kernel/core/module.c \
+    kernel/core/driver.c \
+    kernel/core/config.c \
+    kernel/core/task.c \
+    kernel/core/block.c \
+    kernel/core/block_cache.c \
+    kernel/core/lock.c \
+    kernel/core/vc.c \
+    kernel/core/keymap.c \
+    kernel/core/layouts.c \
+    kernel/core/percpu.c \
+    kernel/drivers/serial/serial.c \
+    kernel/drivers/terminal/fb_terminal.c \
+    kernel/drivers/terminal/vga_terminal.c \
+    kernel/drivers/keyboard/ps2_keyboard.c \
+    kernel/drivers/timer/pit.c \
+    kernel/drivers/null/null.c \
+    kernel/acpi/acpi.c \
+    kernel/fs/vfs.c \
+    kernel/fs/ramfs.c \
+    kernel/fs/devfs.c \
+    kernel/fs/procfs.c \
+    kernel/mem/pmm.c \
+    kernel/mem/kmalloc.c \
+    kernel/mem/slab.c
 endif
 
 C_SRCS   := $(CORE_C_SRCS) $(ARCH_C_SRCS)

@@ -84,8 +84,13 @@ struct mboot_mmap_entry {
 } __attribute__((packed));
 
 /* Validate and cache the info pointer for later queries.  Returns 0 on
- * success, -1 if the magic is wrong or the pointer is obviously bogus. */
-int mboot_init(uint32_t magic, uint32_t info_ptr);
+ * success, -1 if the magic is wrong or the pointer is obviously bogus.
+ *
+ * `info_ptr` is uintptr_t so the same prototype works on both 32-bit
+ * (where the bootloader hands us a low-memory address) and 64-bit
+ * arches (where the address could in principle be higher, though in
+ * QEMU it isn't). */
+int mboot_init(uint32_t magic, uintptr_t info_ptr);
 
 /* Return the cached info pointer so other subsystems (PMM, VBE) can walk
  * the same data without re-validating.  NULL if `mboot_init` failed. */

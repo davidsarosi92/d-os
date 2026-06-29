@@ -65,7 +65,7 @@
 
 #define MULTIBOOT1_BOOTLOADER_MAGIC 0x2BADB002
 
-void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
+void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     /* Earliest debug output.  Sets up the UART and registers the serial
      * console sink — every kprintf below this line lands on COM1. */
     serial_module_init();
@@ -143,7 +143,12 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
     /* APIC bring-up (M18).  If ACPI gave us a MADT with a LAPIC + at
      * least one IOAPIC, switch IRQ routing from the 8259 to APIC.
      * `idt_use_apic` re-routes the already-installed PIT (IRQ0) and
-     * PS/2 keyboard (IRQ1) handlers and masks both 8259s. */
+     * PS/2 keyboard (IRQ1) handlers and masks both 8259s.
+     *
+     * Gated on i386 only for M20 — the x86_64 LAPIC/IOAPIC port lands
+     * in M20.5 along with SMP.  Until then x86_64 stays on the 8259
+     * (which still works fine on QEMU's q35/pc machines for UP). */
+#if defined(__i386__)
     if (acpi_lapic_phys() && acpi_ioapic_phys() && acpi_ncpus() > 0) {
         lapic_init_bsp(acpi_lapic_phys());
         ioapic_init(acpi_ioapic_phys(), acpi_ioapic_gsi_base());
@@ -154,6 +159,9 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
     } else {
         kprintf("apic: not available, staying on 8259\n");
     }
+#else
+    kprintf("apic: x86_64 SMP/APIC bring-up deferred (M20.5)\n");
+#endif
 
     /* IRQs on.  PIT is already firing through IOAPIC at this point
      * (idt_use_apic re-routed it).  We need IRQs for both the LAPIC
@@ -164,7 +172,11 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
     /* LAPIC timer (M18.5) — per-CPU preempt source.  Calibrate once
      * on the BSP and stash the count so every AP can program its own
      * timer with the same value (LAPICs in one package share the bus
-     * clock).  100 Hz target tick = 10 ms quantum upper bound. */
+     * clock).  100 Hz target tick = 10 ms quantum upper bound.
+     *
+     * i386-only for M20 (matches the APIC bring-up gate above).  On
+     * x86_64 the PIT continues delivering IRQ0 via the 8259 path. */
+#if defined(__i386__)
     if (acpi_lapic_phys()) {
         uint32_t lapic_count = lapic_timer_calibrate(100);
         smp_set_lapic_timer_count(lapic_count);
@@ -178,6 +190,7 @@ void kernel_main(uint32_t mb_magic, uint32_t mb_info) {
     if (smp_ncpus() > 1) {
         smp_boot_aps();
     }
+#endif
 
     /* Two-level paging path round-trip. */
     {

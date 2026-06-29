@@ -40,10 +40,10 @@ static void print_u64_hex(uint64_t v) {
     else    kprintf("%x", lo);
 }
 
-int mboot_init(uint32_t magic, uint32_t info_ptr) {
+int mboot_init(uint32_t magic, uintptr_t info_ptr) {
     if (magic != MULTIBOOT_BOOTLOADER_MAGIC) return -1;
     if (info_ptr == 0) return -1;
-    g_mbi = (const struct mboot_info*)(uintptr_t)info_ptr;
+    g_mbi = (const struct mboot_info*)info_ptr;
     return 0;
 }
 

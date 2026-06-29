@@ -36,10 +36,10 @@ unchanged through every phase.
 | 2 | boot.s: multiboot2 header + 32→64 long-mode entry + early serial "hello" print + halt | ✅ shipped | (this commit) |
 | 3 | hal/x86_64 stubs: hal_arch.c, gdt.c, idt.c, tss.c, task_arch.c, switch.s, isr_stubs.s (compile-only; usermode.s deferred to M20.5) | ✅ shipped | (this commit) |
 | 4 | hal/x86_64/vmm.c (4-level paging behind vmm.h API), widen vmm.h to uintptr_t | ✅ shipped | (this commit) |
-| 5 | Full kernel_main link + boot; fix driver compile issues on 64-bit | 🔲 pending |  |
-| 6 | IDT + PIT IRQ + scheduler + shell prompt up | 🔲 pending |  |
-| 7 | SYSCALL/SYSRET (can defer to M20.5) | 🔲 deferable |  |
-| 8 | Docs: DOCS.md §arch, PLAN.md ✅ flip, CLAUDE.md status | 🔲 pending |  |
+| 5 | Full kernel_main link + boot; mb2 shim; SMP/syscall stubs; gated APIC init — shell prompt up | ✅ shipped | (this commit) |
+| 6 | IDT + PIT IRQ + scheduler + shell prompt up | ✅ folded into Phase 5 | — |
+| 7 | SYSCALL/SYSRET | 🔲 deferred to M20.5 | — |
+| 8 | Docs: DOCS.md §arch, PLAN.md ✅ flip, CLAUDE.md status, delete M20-PROGRESS.md | 🔲 next | — |
 
 ---
 
@@ -129,6 +129,38 @@ qemu-system-x86_64 -smp 4 ...
   per-arch build tree.  See Makefile rule for
   `ap_trampoline_blob.o`.
 
+**Phase 5:**
+- Multiboot2 → mb1 shim (`kernel/hal/x86_64/mb2.c`) keeps the rest
+  of the kernel unchanged.  Tag types we translate: 4 (basic mem),
+  6 (memory map — repacked into mb1's size-prefixed format),
+  8 (framebuffer).  Unknown tags are skipped silently.
+- Multiboot2 header must explicitly REQUEST the framebuffer via a
+  type-5 header tag (`width`, `height`, `depth`).  Without it GRUB
+  doesn't deliver a framebuffer tag at runtime and fb_terminal stays
+  inert.  The i386 multiboot1 equivalent was `flags |= bit 2` plus
+  mode_type/width/height/depth fields in the same header.
+- Bridge `x86_64_main_entry` in `kernel/hal/x86_64/main_entry.c` is
+  called from boot.s's long_mode_entry.  It does the mb2 translation
+  and then calls `kernel_main(MULTIBOOT_BOOTLOADER_MAGIC, mb1_ptr)`,
+  so kernel.c stays arch-independent.
+- `kernel_main`'s `mb_info` arg widened from `uint32_t` to
+  `uintptr_t`; no caller change needed on i386 (uintptr_t = uint32_t).
+- SMP/APIC init blocks in kernel.c gated under
+  `#if defined(__i386__)` — x86_64 stays on the 8259 PIC for UP IRQs
+  (PIT works fine via legacy delivery).  LAPIC/IOAPIC/SMP x86_64
+  port lands in M20.5.
+- `m20_stubs.c` provides UP-friendly no-op implementations for the
+  symbols kernel core/drivers reference unconditionally
+  (lapic_*, ioapic_*, smp_*, syscall_dispatch, enter_user_mode_wrap,
+  xhci_poll).  Lives in kernel/hal/x86_64/; shrinks as later phases
+  add real impls.
+- `kprintf` supports only `%x %u %d %s %c %p %%` — no `%l` prefix.
+  Passing `%lx` for a `uint64_t` arg corrupts the va_arg sequence
+  (the `default:` case echoes "%l" verbatim without consuming an
+  arg, so every subsequent format reads the wrong slot).  Workaround:
+  cast 64-bit values to uint32_t and use `%x`, or split into hi/lo
+  pairs.  Real fix (a printf rewrite) is a post-M20 polish item.
+
 **Phase 4:**
 - `vmm.h` API widened to `uintptr_t` for virt/phys/return types
   (vmm_map, vmm_map_4mib, vmm_unmap, vmm_translate,
@@ -205,57 +237,16 @@ qemu-system-x86_64 -smp 4 ...
 
 ## Next concrete action
 
-Phase 5.  Link the full kernel against the x86_64 HAL and reach
-kernel_main.  This phase is the riskiest of M20 — every core .c file
-must compile under -m64 -mcmodel=large.  Expect to spot-fix:
-
-1. **CORE_C_SRCS for x86_64**: in the Makefile, set CORE_C_SRCS to
-   the same list i386 uses, MINUS smp.c/lapic.c/ioapic.c/pci.c
-   (SMP is M20.5; LAPIC/IOAPIC need MMIO + we have no x86_64
-   trampoline yet).  Probably also need to skip syscall.c (no
-   ring-3 path until Phase 7).
-
-2. **boot.s entry → kernel_main**: replace the current "print +
-   halt" tail in long_mode_entry with `call kernel_main`.  Pass
-   the multiboot magic + info pointer from r12/r13 into rdi/rsi
-   (System V ABI first args).
-
-3. **kernel.c entry signature**: kernel_main(uint32_t magic,
-   uint32_t info_ptr) needs to widen info_ptr to uintptr_t (the
-   multiboot info struct could in principle live > 4 GiB on
-   real hardware; in QEMU it doesn't, but the type should be
-   correct).
-
-4. **multiboot1 vs multiboot2 parsing**: i386 uses multiboot1
-   (magic 0x2BADB002).  x86_64 uses multiboot2 (magic 0x36d76289)
-   with a tag-based info structure.  Options:
-   a. Write a multiboot2 shim that translates into the existing
-      multiboot1 `struct multiboot_info`.
-   b. Generalise multiboot.c into a tag-based parser supporting
-      both.
-   Probably (a) is fastest — the existing pmm.c, fb_terminal.c
-   etc. all read multiboot1 fields, we don't want to churn them.
-
-5. **Compile-error cleanup**: every C file in CORE_C_SRCS gets
-   compiled with -m64 for the first time.  Likely issues:
-   - `printf` %x for pointers — needs %p or %lx for 64-bit
-   - implicit int↔ptr conversions
-   - `sizeof(long)` differences
-   - alignment of packed structs
-
-6. **Conditional-compile SMP init in kernel.c**: any direct call
-   to lapic_init_*, ioapic_init, smp_boot_aps should be gated with
-   `#if defined(__i386__)` for now.  Similarly for any ring-3
-   self-test (the ring 3 path is i386-only until Phase 7).
-
-7. **Test**: ARCH=x86_64 produces a kernel that runs through
-   kernel_main, prints the boot banner via serial, and halts at
-   the (synthesised) BSP idle task.  PIT IRQ doesn't fire yet —
-   that's Phase 6.
-
-DoD for Phase 5: `make ARCH=x86_64 iso` succeeds with no
-unresolved symbols.  Serial log shows the boot banner + module
-init + driver init messages.
+Phase 8 (docs + final commit).
+- DOCS.md gains §arch / "Supported architectures" section pointing
+  out i386 (full) and x86_64 (UP-only, SMP/SYSCALL deferred to M20.5).
+  Change-log entry for M20.
+- PLAN.md M20 row flipped to ✅, condensed to "Shipped, see DOCS.md
+  §arch" pointer.
+- CLAUDE.md status snapshot bumped to "M1–M20 + M18.5", with M20.5
+  / M21 / M22 / M23 / M24 left as next options.
+- Delete this M20-PROGRESS.md file — DOCS.md + PLAN.md hold the
+  long-term record from here.
 
 ---
 

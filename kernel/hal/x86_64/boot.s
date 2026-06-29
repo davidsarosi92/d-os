@@ -54,6 +54,27 @@ header_start:
     dd header_end - header_start
     dd 0x100000000 - (MB2_MAGIC + MB2_ARCH + (header_end - header_start))
 
+    ; Framebuffer-request tag (type=5).  Asks GRUB to switch the display
+    ; to a graphics mode of the given preferred size and hand us the
+    ; framebuffer info via a type-8 reply tag at runtime.  The mb1
+    ; equivalent was the (flags bit 2 + mode_type/width/height/depth)
+    ; fields in the original boot.s header.
+    ;
+    ; Layout (mb2 §3.1.10):
+    ;   u16 type   = 5
+    ;   u16 flags  = 0      (must be honored)
+    ;   u32 size   = 20
+    ;   u32 width  preferred  pixels
+    ;   u32 height preferred  pixels
+    ;   u32 depth  preferred  bits-per-pixel  (0 = "I don't care")
+    align 8
+    dw 5            ; type: framebuffer
+    dw 0            ; flags
+    dd 20           ; size
+    dd 1024         ; width
+    dd 768          ; height
+    dd 32           ; depth
+
     ; End tag — required terminator.  type=0, flags=0, size=8.
     align 8
     dw 0
@@ -146,6 +167,7 @@ no_lm_msg:
 
 section .text
 global _start
+extern x86_64_main_entry
 
 _start:
     ; -------------------------------------------------------------------------
@@ -325,27 +347,40 @@ long_mode_entry:
     mov gs, ax
     mov ss, ax
 
-    ; Recover multiboot2 hand-off for future use.  r12 = magic,
-    ; r13 = info ptr.  Both are callee-saved in System V ABI so will
-    ; survive any further calls Phase 3 lands.
-    mov eax, [mb2_magic]                      ; zero-extends to rax
-    mov r12, rax
-    mov eax, [mb2_info]
-    mov r13, rax
-
-    ; Print the hello message via COM1, char-by-char.
+    ; Print the hello message via COM1 as a "we made it" signal.
+    ; This is harmless to leave in — gives us a sentinel line in the
+    ; serial log that long-mode bring-up succeeded before we hand
+    ; off to the C-level boot path.
     lea rsi, [rel hello_msg]
 .hello_loop:
     mov al, [rsi]
     test al, al
-    jz .done
+    jz .hello_done
     call print_byte_64
     inc rsi
     jmp .hello_loop
 
-.done:
-    cli
+.hello_done:
+    ; Pass multiboot2 hand-off (saved by 32-bit _start in .bss) into
+    ; the System V x86_64 first-arg registers.  rdi = uint32_t magic
+    ; (zero-extended from eax-load); rsi = uintptr_t info pointer.
+    ;
+    ; The kernel was loaded by GRUB into low memory, so mb2_info fits
+    ; in 32 bits — we just zero-extend.
+    xor edi, edi
+    mov edi, [mb2_magic]
+    xor esi, esi
+    mov esi, [mb2_info]
+
+    ; Stack must be 16-byte aligned just before `call` per System V
+    ; ABI.  stack_top is .bss-aligned to 16, and we haven't pushed
+    ; anything on the long-mode side, so we're good.
+    call x86_64_main_entry
+
+    ; x86_64_main_entry is marked noreturn — if we ever come back
+    ; here something went very wrong.  Halt.
 .hang64:
+    cli
     hlt
     jmp .hang64
 
