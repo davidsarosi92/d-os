@@ -366,12 +366,12 @@ static void cmd_setlayout(const char* name) {
 static void cmd_lscpu(void) {
     int n = smp_ncpus();
     int me = this_cpu_id();
-    kprintf("CPU  APIC_ID  STATE   RQ\n");
+    kprintf("CPU  APIC_ID  NODE  STATE   RQ\n");
     for (int i = 0; i < n; i++) {
         struct percpu* p = percpu_at(i);
         if (!p) continue;
-        kprintf("%d    %u        %s   %d%s\n",
-                i, p->apic_id,
+        kprintf("%d    %u        %d     %s   %d%s\n",
+                i, p->apic_id, p->numa_node,
                 p->online ? "online " : "offline",
                 p->rq_count,
                 (i == me) ? " <this>" : "");

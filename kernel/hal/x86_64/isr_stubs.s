@@ -137,10 +137,14 @@ ISR_NOERR 46
 ISR_NOERR 47
 
 ; -----------------------------------------------------------------------------
-; LAPIC vectors + syscall (same numbering as i386).
+; LAPIC vectors + MSI pool + syscall (same numbering as i386).
 ; -----------------------------------------------------------------------------
 ISR_NOERR 64
 ISR_NOERR 65
+ISR_NOERR 80
+ISR_NOERR 81
+ISR_NOERR 82
+ISR_NOERR 83
 ISR_NOERR 128
 
 ; -----------------------------------------------------------------------------

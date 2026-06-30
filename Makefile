@@ -84,6 +84,8 @@ else ifeq ($(ARCH),x86_64)
   # x86_64 HAL implementation.  Phase A of M20.5 reuses the i386
   # lapic.c + ioapic.c verbatim (both files are pure MMIO + MSR with
   # no port I/O), widening their `phys` params to uintptr_t.
+  # M20.6.2/3 added pci.c (also a port-I/O-only file, identically
+  # encoded on both archs) so xHCI + virtio-blk can compile here.
   #
   # Phase 3 of M20 adds the GDT/IDT/TSS
   # + context-switch + isr stubs needed for kernel_main to link (the
@@ -104,7 +106,8 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/smp.c \
       kernel/hal/x86_64/syscall.c \
       kernel/hal/x86/lapic.c \
-      kernel/hal/x86/ioapic.c
+      kernel/hal/x86/ioapic.c \
+      kernel/hal/x86/pci.c
 
   ARCH_ASM_SRCS := \
       kernel/hal/x86_64/boot.s \
@@ -167,11 +170,14 @@ CORE_C_SRCS := \
     kernel/mem/kmalloc.c \
     kernel/mem/slab.c
 else
-# Phase 5 of M20: x86_64 path now links the full kernel core.  SMP-
-# only and ring-3-only files (smp.c, lapic.c, ioapic.c, pci.c,
-# syscall.c) are excluded — they're brought up in M20.5 (SMP on
-# x86_64) and Phase 7 (SYSCALL/SYSRET).  kernel_main has #ifdef
-# guards around the blocks that call those subsystems.
+# Phase 5 of M20: x86_64 path now links the full kernel core.  M20.6.2/3
+# enabled the device drivers (virtio-blk, xHCI, USB HID) and exFAT;
+# these were i386-only until then because the i386 driver code assumed
+# <4 GiB DMA.  The audit found the assumption holds today (PMM only
+# manages low memory, well below 4 GiB), so the drivers compile here
+# unchanged.  Real high-memory DMA support is gated on M19.5.1 (HIGHMEM
+# zone population + kmap) plus widening the `phys` fields to uintptr_t
+# in xhci.c/virtio_blk.c — both deferred.
 CORE_C_SRCS := \
     kernel/core/kernel.c \
     kernel/core/shell.c \
@@ -195,11 +201,15 @@ CORE_C_SRCS := \
     kernel/drivers/keyboard/ps2_keyboard.c \
     kernel/drivers/timer/pit.c \
     kernel/drivers/null/null.c \
+    kernel/drivers/block/virtio_blk.c \
+    kernel/drivers/usb/xhci.c \
+    kernel/drivers/usb/usb_hid.c \
     kernel/acpi/acpi.c \
     kernel/fs/vfs.c \
     kernel/fs/ramfs.c \
     kernel/fs/devfs.c \
     kernel/fs/procfs.c \
+    kernel/fs/exfat.c \
     kernel/mem/pmm.c \
     kernel/mem/kmalloc.c \
     kernel/mem/slab.c

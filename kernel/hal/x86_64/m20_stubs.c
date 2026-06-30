@@ -1,5 +1,5 @@
 /* =============================================================================
- * m20_stubs.c — last residual stubs for symbols still missing on x86_64.
+ * m20_stubs.c — empty after M20.6.2/3.
  *
  * History (each phase shrinks this file):
  *   - M20 Phase 5: stubbed lapic_*, ioapic_*, smp_*, syscall_dispatch,
@@ -10,17 +10,14 @@
  *     (real impl in kernel/hal/x86_64/smp.c).
  *   - M20.5 Phase C: syscall_dispatch + enter_user_mode_wrap dropped
  *     (real impl in kernel/hal/x86_64/syscall.c + usermode.s).
+ *   - M20.6.2/3: xhci_poll dropped (the i386 xHCI driver now compiles
+ *     for x86_64 — see Makefile + DOCS.md §8 change log).  Same audit
+ *     applied to virtio_blk; both DMAs stay <4 GiB until M19.5.1
+ *     populates HIGHMEM.
  *
- * Only `xhci_poll` remains — the i386 xHCI driver assumes <4 GiB DMA
- * and isn't ported yet.  pit_irq still calls xhci_poll unconditionally.
- * When the xHCI driver is ported, delete this file (and remove it from
- * the Makefile).
+ * The file is kept as a placeholder so future ports have a single
+ * known location to graveyard arch-bring-up stubs.  Delete when the
+ * project gains a sustained period without bring-up stubs.
  * ============================================================================= */
 
-/* ---------------------------------------------------------------------------
- * USB host (M15) — xhci_poll is called from pit_irq.  We have no
- * xHCI driver on x86_64 yet (the i386 driver assumes MMIO + DMA in
- * the low 4 GiB; needs a 64-bit revisit).  No-op until then.
- * --------------------------------------------------------------------------- */
-
-void xhci_poll(void) { /* no USB on x86_64 yet */ }
+/* Intentionally empty. */

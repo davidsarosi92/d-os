@@ -82,4 +82,63 @@ int  pci_find_device(uint16_t vendor, uint16_t device, struct pci_device* out);
  * 0 if `bar` is a memory-space BAR or unpopulated. */
 uint16_t pci_bar_io_base(uint32_t bar);
 
+/* ---------------------------------------------------------------------------
+ * Capability list (M18.6.5).
+ *
+ * PCI devices may carry a linked list of extra capability blocks beyond
+ * the standard 64-byte header.  The list is enabled by bit 4 of the
+ * PCI_STATUS register; the head pointer is at offset 0x34 (PCI_CAP_PTR).
+ * Each entry is at least 2 bytes:
+ *   byte +0: capability ID
+ *   byte +1: next pointer (offset in config space, 0 = end)
+ *
+ * Common cap IDs:
+ *   0x05 — MSI (Message-Signaled Interrupts)
+ *   0x09 — Vendor Specific (used by virtio-PCI for legacy cfg)
+ *   0x10 — PCI Express
+ *   0x11 — MSI-X
+ *
+ * `pci_find_cap` walks the list and returns the offset of the first
+ * entry matching `cap_id`, or 0 if not found.
+ * --------------------------------------------------------------------------- */
+#define PCI_CAP_PTR         0x34    /* uint8 — head of capability list */
+#define PCI_STATUS_CAPLIST  (1u << 4)
+
+#define PCI_CAP_ID_MSI      0x05
+#define PCI_CAP_ID_MSIX     0x11
+
+uint8_t pci_find_cap(uint8_t bus, uint8_t slot, uint8_t func, uint8_t cap_id);
+
+/* ---------------------------------------------------------------------------
+ * MSI vector allocator + setup (M18.6.5).
+ *
+ * Strategy: a small static pool of IDT vectors (4 of them, 0x50..0x53),
+ * each with a dedicated isr stub.  Allocator hands one out per
+ * `pci_alloc_msi` and never releases (no driver lifecycle to release on
+ * today).  4 vectors is plenty for our use case (xHCI + virtio-blk +
+ * one slack); more is just more stubs.
+ *
+ * MSI address format on x86 (Intel SDM Vol 3 §10.11.1):
+ *   address bits  31..20 = 0xFEE  (LAPIC base)
+ *   address bits  19..12 = destination APIC ID
+ *   address bits  11..8  = 0 (redirection hint, dest mode = physical)
+ *   address bits   1..0  = 0
+ *
+ * MSI data format:
+ *   data bits 7..0  = vector
+ *   data bit 14     = trigger mode (1 = level, 0 = edge — we use edge)
+ *
+ * On success, returns the allocated vector (0x50..0x53).  Returns 0 if
+ * the device has no MSI cap or if the pool is exhausted.  Handler is
+ * called from the IRQ context with no arguments; caller must do its
+ * own EOI via lapic_eoi (matching the 0x40 path).
+ *
+ * Today: MSI only (single-vector); MSI-X support would extend this with
+ * pci_find_cap(MSI_X) and a different table-based config.  No driver
+ * uses MSI yet — the framework ships so converting xHCI is a one-line
+ * change in its bring-up. */
+typedef void (*pci_msi_handler_fn)(void);
+int pci_alloc_msi(uint8_t bus, uint8_t slot, uint8_t func,
+                  pci_msi_handler_fn handler);
+
 #endif

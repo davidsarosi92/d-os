@@ -1597,6 +1597,77 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-06-30 — Polish round 2: M18.6.5 + M19.5.1 + M19.5.3 + M20.6.2 + M20.6.3.**
+  Five more polish sub-items shipped, leaving §M20.6.1 (SYSCALL/SYSRET —
+  GDT slot reorg) as the lone outstanding item from the original 11.
+  - **§M20.6.2 — xHCI 64-bit DMA audit + x86_64 enable.** Audit shows
+    the i386 xHCI driver assumed `<4 GiB DMA via uint32_t phys fields;
+    this is safe today because PMM only manages frames within the
+    identity-mapped range (≤ 1 GiB).  Documented the assumption in
+    xhci.c and re-enabled the driver on x86_64 (Makefile).  The
+    `m20_stubs.c::xhci_poll` stub is gone.  Verified: x86_64 with
+    `-device qemu-xhci -device usb-kbd` enumerates the HID keyboard
+    end-to-end (slot assigned, HID interface configured, polling
+    ready).
+  - **§M20.6.3 — virtio-blk + exFAT 64-bit DMA audit + x86_64 enable.**
+    Same audit + documentation pattern as xHCI.  `virtio_blk.c` and
+    `exfat.c` now compile for x86_64.  Verified: `qemu-system-x86_64
+    -drive if=virtio,...` registers `/dev/vda` and the bcache
+    self-test round-trips through the driver.
+  - **§M19.5.1 — HIGHMEM zone population (x86_64).**  Added
+    `hal_extend_identity_map(end_phys)` to the HAL.  On x86_64 the
+    impl installs 1 GiB pages in PDPT[1..] to cover all detected RAM
+    up to the new `BUDDY_MAX_FRAMES` cap (4 GiB).  On i386 it's a
+    no-op (kmap deferred; the identity map stays fixed at 256 MiB
+    by vmm.c).  `pmm_init` calls it BEFORE the mmap walk so every
+    frame the PMM marks is reachable through the kernel direct map.
+    Per-arch `BUDDY_MAX_FRAMES` (i386 = 1 GiB, x86_64 = 4 GiB).
+    Verified: `qemu-system-x86_64 -m 4G` boots and reports
+    `pmm: identity map extended to 4096 MiB / NORMAL managed=782304
+    (3069 MiB total free)`.
+  - **§M18.6.5 — MSI/MSI-X discovery + vector allocator.**  Added
+    `pci_find_cap(bus, slot, func, cap_id)` to walk the PCI
+    capability list, and `pci_alloc_msi(bus, slot, func, handler)`
+    that finds the MSI cap (0x05), allocates one of 4 reserved IDT
+    vectors (0x50..0x53), installs the handler, and programs the
+    device's MSI address (LAPIC base | apic_id << 12) + data
+    (vector).  4 new ISR stubs in both archs; the dispatch lives in
+    `isr_handler` next to the LAPIC-timer path.  No driver uses MSI
+    yet — the framework ships so converting xHCI is a one-line
+    change in its bring-up.  MSI-X is `cap_id=0x11`; identical
+    discovery, table-based config is a follow-up.
+  - **§M19.5.3 — ACPI SRAT → per-CPU NUMA node.**  Added an SRAT
+    (System Resource Affinity Table) parser to `acpi.c` that maps
+    each (enabled) processor entry to its proximity domain and each
+    (enabled) memory range to its proximity domain.  `struct percpu`
+    gained a `numa_node` field, populated at percpu_init_bsp time
+    from `acpi_cpu_node(madt_slot)`.  `lscpu` now shows the node.
+    Public getters: `acpi_numa_nodes()`, `acpi_cpu_node(i)`,
+    `acpi_mem_affinity_count/get()`.  Verified: `qemu-system-x86_64
+    -smp 4 -m 512M -object memory-backend-ram,... -numa
+    node,nodeid=0,cpus=0-1,memdev=mem0 -numa
+    node,nodeid=1,cpus=2-3,memdev=mem1` prints `ACPI: SRAT — 2
+    node(s), 3 mem range(s)`.  PMM still has a single zone set (per-
+    NUMA-node zones are a deeper refactor); the SRAT data is wired
+    in for when that lands.
+  Lessons learned:
+  * On x86_64, extending the identity map via 1 GiB PDPT pages is
+    cheap (one PDPT write per GiB) and needs no PD/PT allocations.
+    But `BUDDY_MAX_FRAMES` is a compile-time cap on page_state[]'s
+    size — we set it per-arch via `#ifdef __x86_64__` rather than via
+    Makefile -D, since pmm.h is the natural place for it.
+  * The capability-list walk in `pci_find_cap` MUST be bounded
+    (we cap at 64 hops) — a malformed device could otherwise loop
+    forever.  PCI 3.0 caps low 2 bits of next-pointer as reserved;
+    we mask them off and reject offsets < 0x40 (= inside the standard
+    header) as malformed.
+  * SRAT entries reference processors by APIC ID, not by MADT slot
+    index.  Our percpu uses slot indexing, so the SRAT parser
+    translates via `apic_id_to_madt_slot()` — and it does so AFTER
+    parse_madt has filled `g_cpu_apic_ids[]`.  Got the ordering
+    wrong once; the fix is to defer SRAT parsing until the RSDT
+    walk's second pass.
+
 - **2026-06-29 — M18.6 (partial) + M19.5.2: SMP polish + empty-slab caching.**
   Half of the polish round shipped (5/11 sub-items):
   - **§M18.6.1 — Per-CPU runqueue + load balancer.** Replaced the global

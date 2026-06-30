@@ -159,7 +159,16 @@ struct virtio_blk {
 
     /* Queue memory.  `queue_phys` is the page-aligned physical address
      * we hand to QUEUE_PFN.  Since paging is identity-mapped for the
-     * region the PMM allocates from, queue_phys == queue_virt. */
+     * region the PMM allocates from, queue_phys == queue_virt.
+     *
+     * M20.6.3 audit (2026-06-30): stays uint32_t while the PMM is low-mem
+     * only.  Legacy virtio writes the queue location as a PAGE FRAME
+     * NUMBER (PFN = phys >> 12) via outl, so the 32-bit field gives 12
+     * bits of headroom (up to ~16 TiB phys is addressable).  But the
+     * descriptor->addr fields below are 64-bit in the spec — we still
+     * pass uint32_t physical pointers there via vmm_translate, which
+     * truncates to 32 bits.  Real >4 GiB DMA needs vmm_translate +
+     * descriptor->addr widened to uint64_t. */
     uint32_t queue_phys;
     struct virtq_desc*  desc;
     struct virtq_avail* avail;

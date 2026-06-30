@@ -26,6 +26,7 @@
 #include "task.h"
 #include "lapic.h"
 #include "ioapic.h"
+#include "pci.h"
 #include <stdint.h>
 
 /* --------------------------------------------------------------------------
@@ -87,6 +88,10 @@ extern void isr40(void); extern void isr41(void); extern void isr42(void); exter
 extern void isr44(void); extern void isr45(void); extern void isr46(void); extern void isr47(void);
 extern void isr64(void);                           /* LAPIC timer (M18.5) */
 extern void isr65(void);                           /* reserved: cross-CPU preempt IPI */
+extern void isr80(void);                           /* MSI pool (M18.6.5) */
+extern void isr81(void);
+extern void isr82(void);
+extern void isr83(void);
 extern void isr128(void);                          /* int 0x80 — syscall */
 
 static void (*const isr_table[48])(void) = {
@@ -180,6 +185,12 @@ void idt_init(void) {
     set_gate(0x40, isr64, 0x8E);
     set_gate(0x41, isr65, 0x8E);
 
+    /* MSI pool (M18.6.5). */
+    set_gate(0x50, isr80, 0x8E);
+    set_gate(0x51, isr81, 0x8E);
+    set_gate(0x52, isr82, 0x8E);
+    set_gate(0x53, isr83, 0x8E);
+
     /* Syscall: DPL=3 so ring 3 can invoke via int 0x80.  On x86_64 we
      * also plan to add a SYSCALL/SYSRET path in Phase 7; the IDT
      * gate stays as a fallback. */
@@ -252,6 +263,16 @@ void isr_handler(struct int_frame* f) {
 
     if (f->int_no == 0x40 || f->int_no == 0x41) {
         if (f->int_no == 0x40) schedule_request();
+        lapic_eoi();
+        schedule_check();
+        return;
+    }
+
+    /* MSI pool (M18.6.5). */
+    if (f->int_no >= 0x50 && f->int_no <= 0x53) {
+        extern pci_msi_handler_fn pci_msi_handlers[4];
+        unsigned idx = (unsigned)(f->int_no - 0x50);
+        if (pci_msi_handlers[idx]) pci_msi_handlers[idx]();
         lapic_eoi();
         schedule_check();
         return;

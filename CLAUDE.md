@@ -18,15 +18,18 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
-✅ **M1 – M20 + M18.5 + M20.5 + M18.6 (4/5) + M19.5.2** shipped.
+✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5** shipped (10/11 polish
+sub-items; the lone outstanding one is §M20.6.1 SYSCALL/SYSRET).
 Highlights so far: VFS + ramfs + exFAT on virtio-blk, devfs +
 procfs, preemptive scheduler, multi-pane shell, xHCI USB + HID,
 keyboard layouts, HAL cut (`hal_api.h`), **SMP on i386 + x86_64**
 with per-CPU runqueue + load balancer + per-CPU preempt_count + task
-affinity (`taskset`) + cross-CPU preempt IPI, memory at scale (per-
-zone buddy PMM + slab + per-CPU magazines + empty-slab caching),
-APs scheduling, **x86_64 (long mode) — full parity with i386**.
-m20_stubs.c down to just `xhci_poll`.
+affinity (`taskset`) + cross-CPU preempt IPI + MSI/MSI-X allocator,
+memory at scale (per-zone buddy PMM + slab + per-CPU magazines +
+empty-slab caching + x86_64 HIGHMEM via 1 GiB-page identity-map
+extension + ACPI SRAT-derived per-CPU NUMA nodes), APs scheduling,
+**x86_64 (long mode) — full parity with i386 INCLUDING xHCI USB +
+virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
 🔲 **Next options** (pick one):
 
@@ -37,13 +40,13 @@ m20_stubs.c down to just `xhci_poll`.
   evaluation phase per §M22).
 - **M23** — Audio (AC97 → HDA → I2S).
 - **M24** — Network (NIC → IP/UDP/TCP → sockets).
-- **§M18.6.5** — MSI/MSI-X discovery + vector allocator (remaining
-  M18.6 sub-item; not blocking — IOAPIC routes legacy IRQs fine).
-- **§M19.5.1** — HIGHMEM zone population + kmap (i386) /
-  identity-map extension (x86_64).
-- **§M19.5.3** — ACPI SRAT → per-NUMA-node zones.
-- **§M20.6** — x86_64 closure: SYSCALL/SYSRET instruction path
-  (needs GDT slot reorg), xHCI + virtio-blk 64-bit DMA audit.
+- **§M19.5.1 i386 kmap** — the deferred half of HIGHMEM: real
+  kmap-style temp mappings so i386 can manage > 256 MiB of RAM.
+- **§M19.5.3 per-NUMA-node PMM zones** — the deferred deeper half
+  of SRAT integration; today the parser populates per-CPU node IDs
+  but PMM still has a single zone set.
+- **§M20.6.1** — SYSCALL/SYSRET instruction path (needs GDT slot
+  reorg to satisfy SYSRET's selector arithmetic).
 
 🔲 **PLAN extensions (placeholders, design only):**
 - §M22 — GUI includes a Wayland-reuse evaluation phase

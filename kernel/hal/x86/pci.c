@@ -141,3 +141,105 @@ uint16_t pci_bar_io_base(uint32_t bar) {
     if ((bar & 0x1) == 0) return 0;             /* memory-space BAR */
     return (uint16_t)(bar & ~0x3u);
 }
+
+/* ----------------------------------------------------------------------- */
+/* M18.6.5 — capability list walk + MSI setup.                             */
+/* ----------------------------------------------------------------------- */
+
+uint8_t pci_find_cap(uint8_t bus, uint8_t slot, uint8_t func, uint8_t cap_id) {
+    uint16_t status = pci_read16(bus, slot, func, PCI_STATUS);
+    if (!(status & PCI_STATUS_CAPLIST)) return 0;
+
+    uint8_t off = pci_read8(bus, slot, func, PCI_CAP_PTR);
+    /* Bounded walk: 64 hops is more than the entire config space; defends
+     * against a malformed device with a circular list. */
+    for (int hops = 0; hops < 64 && off != 0; hops++) {
+        off &= 0xFC;                  /* low 2 bits reserved per PCI spec */
+        if (off < 0x40) break;        /* below header end — malformed */
+        uint8_t id   = pci_read8(bus, slot, func, off);
+        uint8_t next = pci_read8(bus, slot, func, off + 1);
+        if (id == cap_id) return off;
+        off = next;
+    }
+    return 0;
+}
+
+/* MSI capability register layout (PCI 3.0 §6.8.1):
+ *   off+0  CAP_ID   = 0x05
+ *   off+1  NEXT_PTR
+ *   off+2  MSG_CTRL — bit 0 = enable, bits 4:1 = MMC, bits 7 = 64-bit cap
+ *   off+4  MSG_ADDR_LO
+ *   off+8  MSG_ADDR_HI (only if 64-bit cap bit set)
+ *   off+C  MSG_DATA (offset 8 if 32-bit only)
+ */
+#define MSI_MSGCTRL_OFF     0x02
+#define MSI_MSGCTRL_ENABLE  (1u << 0)
+#define MSI_MSGCTRL_64BIT   (1u << 7)
+#define MSI_MSGADDR_LO_OFF  0x04
+#define MSI_MSGADDR_HI_OFF  0x08
+
+/* ----- vector pool ----- */
+#define MSI_VEC_BASE   0x50u
+#define MSI_VEC_COUNT  4
+
+extern void isr80(void);    /* 0x50 — added in isr_stubs.s for M18.6.5 */
+extern void isr81(void);    /* 0x51 */
+extern void isr82(void);    /* 0x52 */
+extern void isr83(void);    /* 0x53 */
+
+/* These pointers + table are consumed by isr_handler in idt.c to
+ * dispatch MSI vectors to driver-supplied handlers. */
+pci_msi_handler_fn pci_msi_handlers[MSI_VEC_COUNT] = { 0 };
+static int msi_alloc_idx = 0;   /* next free slot */
+
+/* Wire MSI handlers into the IDT.  Called from idt_init via
+ * pci_msi_install_gates(); we expose the per-vector stubs to the
+ * IDT layer so this file owns the vector → handler mapping. */
+void (*const pci_msi_stubs[MSI_VEC_COUNT])(void) = {
+    isr80, isr81, isr82, isr83
+};
+
+int pci_alloc_msi(uint8_t bus, uint8_t slot, uint8_t func,
+                  pci_msi_handler_fn handler) {
+    if (!handler) return 0;
+    uint8_t cap = pci_find_cap(bus, slot, func, PCI_CAP_ID_MSI);
+    if (!cap) return 0;
+    if (msi_alloc_idx >= MSI_VEC_COUNT) return 0;
+
+    int slot_idx = msi_alloc_idx++;
+    uint8_t vector = (uint8_t)(MSI_VEC_BASE + slot_idx);
+    pci_msi_handlers[slot_idx] = handler;
+
+    /* Look up the BSP's APIC ID — we direct every MSI to the BSP for
+     * simplicity.  M18.6 follow-up could spread MSI delivery across
+     * CPUs using the per-CPU runqueue load.  For now: cheap and
+     * correct. */
+    extern uint8_t lapic_id(void);
+    uint32_t apic_id = lapic_id();
+
+    /* Program MSI address + data + enable. */
+    uint16_t msgctrl = pci_read16(bus, slot, func, cap + MSI_MSGCTRL_OFF);
+
+    /* Address: 0xFEE00000 | (apic_id << 12) | (RH=0 << 3) | (DM=0 << 2) */
+    uint32_t addr_lo = 0xFEE00000u | (apic_id << 12);
+    pci_write32(bus, slot, func, cap + MSI_MSGADDR_LO_OFF, addr_lo);
+
+    uint8_t data_off;
+    if (msgctrl & MSI_MSGCTRL_64BIT) {
+        pci_write32(bus, slot, func, cap + MSI_MSGADDR_HI_OFF, 0);
+        data_off = 0x0C;
+    } else {
+        data_off = 0x08;
+    }
+    /* Data: trigger=edge (bit 14=0), delivery=fixed (bits 8..10=0),
+     * vector in low 8 bits. */
+    pci_write16(bus, slot, func, cap + data_off, (uint16_t)vector);
+
+    /* Force MMC = 0 (1 message requested) — bits 4..6 of MSG_CTRL.
+     * Then enable. */
+    msgctrl &= ~(0x70u);
+    msgctrl |= MSI_MSGCTRL_ENABLE;
+    pci_write16(bus, slot, func, cap + MSI_MSGCTRL_OFF, msgctrl);
+
+    return (int)vector;
+}

@@ -102,6 +102,27 @@ void hal_arch_early_init(void);
 uintptr_t hal_task_init_stack(void* stack_top, void (*entry)(void));
 
 /* ---------------------------------------------------------------------------
+ * Identity-map extension (M19.5.1).
+ *
+ * Extend the kernel's physical → virtual identity map to cover at least
+ * the given physical end address.  Called from pmm_init BEFORE the
+ * mmap walk so the PMM can dereference (zero, free-list-thread) any
+ * frame it manages.
+ *
+ * Returns the new physical end address actually covered (rounded up to
+ * the arch's page-table granularity).  May be LESS than the requested
+ * end if the arch cannot extend further (e.g. i386 today: identity is
+ * fixed at 256 MiB by boot.s + linker layout; kmap is the right answer
+ * but isn't shipped yet, so the i386 impl returns the existing cap and
+ * pmm_init caps managed memory there).
+ *
+ * Today:
+ *   - x86_64: uses 1 GiB pages in PDPT[1..] up to BUDDY_MAX_FRAMES.
+ *   - i386:   returns IDENTITY_MAP_MIB << 20 (no-op).
+ * --------------------------------------------------------------------------- */
+uintptr_t hal_extend_identity_map(uintptr_t end_phys);
+
+/* ---------------------------------------------------------------------------
  * Syscall epilogue helper.
  *
  * SYS_EXIT bypasses the normal iret-back-to-ring-3 path: it restores a

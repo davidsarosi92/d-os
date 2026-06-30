@@ -155,8 +155,8 @@ what); a session can pick a theme and push on it.
 | M17 | Portability cut — extract `hal_api.h`           | Architecture     | ✅ DOCS §4.X (partial — see notes) |
 | M18 | SMP support — APIC, AP boot, per-CPU, locking   | Concurrency      | ✅ DOCS §4.X |
 | M19 | Memory at scale — slab, huge pages, near-NUMA   | Memory           | ✅ DOCS §4.8, §4.10 |
-| M18.6 | SMP polish — per-CPU runqueue + load balancer ✅, preempt_count ✅, taskset ✅, cross-CPU IPI ✅, MSI/MSI-X (open) | Concurrency | §M18.6 |
-| M19.5 | Memory polish — HIGHMEM (open), empty-slab caching ✅, SRAT/NUMA (open) | Memory | §M19.5 |
+| M18.6 | SMP polish — per-CPU runqueue + load balancer ✅, preempt_count ✅, taskset ✅, cross-CPU IPI ✅, MSI/MSI-X ✅ | Concurrency | §M18.6 |
+| M19.5 | Memory polish — HIGHMEM ✅ (x86_64), empty-slab caching ✅, SRAT/NUMA ✅ (parser) | Memory | §M19.5 |
 | M20 | x64 (long mode) port (UP)                       | Architecture     | ✅ DOCS §4.X (closed by §M20.5) |
 | M20.5 | x64 SMP + APIC + ring-3 (int 0x80) — Phase A/B/C | Architecture | ✅ §M20.5 |
 | M20.6 | x86_64 closure — SYSCALL/SYSRET, xHCI + virtio-blk 64-bit DMA | Architecture | §M20.6 |
@@ -1104,11 +1104,11 @@ next big milestone.  But they're tracked work, not "someday" items.
 
 ## §M18.6 — SMP polish (carry-overs from M18.5)
 
-**Status: 4/5 sub-items shipped 2026-06-29** (.1 per-CPU runqueue
-+ load balancer, .2 per-CPU preempt_count, .3 taskset, .4 cross-CPU
-IPI sender).  See DOCS.md change-log entry for the 2026-06-29
-polish round.  Remaining: **§M18.6.5 — MSI/MSI-X** (still open;
-not blocking — IOAPIC still routes legacy IRQs).
+**Status: 5/5 sub-items shipped 2026-06-29..30.**
+(.1 per-CPU runqueue + load balancer, .2 per-CPU preempt_count,
+.3 taskset, .4 cross-CPU IPI sender, .5 MSI/MSI-X discovery +
+vector allocator).  See DOCS.md change-log entries for the two
+polish rounds.
 
 **Why now:** The M18.5 ship-now / fix-later list collected real
 work that the scheduler will eventually need.  None of it blocks
@@ -1207,12 +1207,17 @@ capability registers.  Provide `pci_alloc_msi(dev, handler)`.
 
 ## §M19.5 — Memory polish (carry-overs from M19)
 
-**Status: 1/3 sub-items shipped 2026-06-29** (.2 empty-slab caching).
-See DOCS.md change-log entry for the 2026-06-29 polish round.
-Remaining: **§M19.5.1 — HIGHMEM zone population + kmap** and
-**§M19.5.3 — ACPI SRAT → per-NUMA-node zones**.  Neither blocks
-shell-level functionality on ≤ 1 GiB / single-socket QEMU; both
-become required once real hardware is targeted.
+**Status: 3/3 sub-items shipped 2026-06-29..30.**
+- **.1 HIGHMEM (x86_64 path):** `hal_extend_identity_map` installs 1 GiB
+  PDPT pages to cover all RAM up to `BUDDY_MAX_FRAMES` (4 GiB).  PMM
+  managed up to 4 GiB on x86_64.  **i386 kmap deferred** — the i386
+  HAL impl returns the existing 256 MiB cap as a no-op; an honest
+  multi-GiB i386 path needs kmap-style temp mappings (substantial new
+  code, not blocking on QEMU).
+- **.2 empty-slab caching:** per-cache LIFO of up to 4 empty slabs.
+- **.3 SRAT parsing:** per-CPU NUMA-node lookup wired in via percpu;
+  PMM still has single zone set, per-node zones deferred to when
+  there's a real NUMA test board.
 
 **Why now:** M19 shipped a per-zone buddy + slab + per-CPU
 magazines, but three items were filed as "later if needed."  All

@@ -120,6 +120,16 @@ ISR_NOERR 64
 ISR_NOERR 65
 
 ; -----------------------------------------------------------------------------
+; MSI vectors (M18.6.5).  Pool of 4 vectors (0x50..0x53 = 80..83) handed
+; out by pci_alloc_msi.  EOI'd via the LAPIC like LAPIC-timer 0x40.
+; isr_handler dispatches to pci_msi_handlers[v - 0x50].
+; -----------------------------------------------------------------------------
+ISR_NOERR 80
+ISR_NOERR 81
+ISR_NOERR 82
+ISR_NOERR 83
+
+; -----------------------------------------------------------------------------
 ; Syscall vector — int 0x80.  Ring-3 callable; the IDT entry for this
 ; vector is installed with DPL=3 so user mode is allowed to invoke it.
 ; The label is literally `isr128` (NASM expands %1 verbatim into the name)

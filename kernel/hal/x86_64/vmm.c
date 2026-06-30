@@ -89,6 +89,44 @@ uintptr_t vmm_kernel_pd_phys(void) {
     return (uintptr_t)pml4;
 }
 
+/* M19.5.1 — extend the identity map past the boot-time 1 GiB cap.
+ *
+ * Strategy: 1 GiB pages in PDPT[1..].  Long mode allows PS=1 at the
+ * PDPT level to mean "1 GiB page" (AMD64 APM Vol 2 §5.3.7).  Every
+ * x86_64 CPU since K10 / Nehalem supports it; QEMU TCG supports it
+ * unconditionally.  If a CPU ever didn't, we'd get #GP on the first
+ * access — fall-back is to drop down to 2 MiB pages (more PD frames,
+ * not implemented today).
+ *
+ * Each PDPT entry covers 1 GiB.  We add entries for [1 GiB, end_phys),
+ * leaving PDPT[0] (which boot.s set up via 2 MiB pages) untouched.
+ * No TLB flush needed — we're adding mappings, not changing existing
+ * ones.  Returns the new physical extent actually covered (rounded up
+ * to 1 GiB granularity, capped at 512 GiB — PDPT capacity).
+ *
+ * Caller (pmm_init) is expected to clamp this to BUDDY_MAX_FRAMES.
+ * We don't do that capping here so the HAL stays single-purpose. */
+uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
+    /* Round up to 1 GiB boundary. */
+    const uintptr_t GIB = (uintptr_t)1 << 30;
+    uintptr_t end = (end_phys + GIB - 1) & ~(GIB - 1);
+    /* boot.s gave us PDPT[0] = first 1 GiB.  Nothing to do if request
+     * fits in there. */
+    if (end <= GIB) return GIB;
+    /* PDPT cap: 512 entries × 1 GiB = 512 GiB.  We won't hit this
+     * any time soon. */
+    if (end > GIB * 512) end = GIB * 512;
+
+    uint64_t* pdpt_tbl = (uint64_t*)pdpt;
+    for (uintptr_t addr = GIB; addr < end; addr += GIB) {
+        unsigned idx = (unsigned)((addr >> 30) & 0x1FF);
+        if (pdpt_tbl[idx] & PTE_P) continue;        /* already mapped */
+        pdpt_tbl[idx] = ((uint64_t)addr & PAGE_MASK_4K)
+                      | PTE_P | PTE_RW | PTE_PS;
+    }
+    return end;
+}
+
 /* -----------------------------------------------------------------------------
  * Page-table walker.
  *

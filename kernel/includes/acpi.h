@@ -62,4 +62,28 @@ uint32_t acpi_ioapic_gsi_base(void);
  * applies). */
 int acpi_irq_override(int isa_irq, uint32_t* out_gsi, uint16_t* out_flags);
 
+/* ---------------------------------------------------------------------------
+ * SRAT-derived NUMA topology (M19.5.3).
+ *
+ * Valid after acpi_init() returns 0.  When SRAT is absent (most QEMU
+ * configurations without `-numa`), `acpi_numa_nodes()` returns 0 and
+ * `acpi_cpu_node(i)` returns 0 (treat as single-node).
+ * --------------------------------------------------------------------------- */
+
+/* Number of distinct proximity domains seen in SRAT.  Returns 0 if no
+ * SRAT was found. */
+int acpi_numa_nodes(void);
+
+/* NUMA node ID for the i-th MADT CPU (same indexing as
+ * acpi_cpu_apic_id).  Returns 0 if SRAT didn't claim this CPU. */
+int acpi_cpu_node(int madt_slot);
+
+/* Iterate memory affinity ranges.  Returns count; fills `*out_node`,
+ * `*out_base`, `*out_length` for entries [0, count).  Used by a future
+ * PMM that wants per-node zones; today the PMM ignores SRAT (single
+ * zone set, all nodes share). */
+int acpi_mem_affinity_count(void);
+int acpi_mem_affinity_get(int idx, uint32_t* out_node,
+                          uint64_t* out_base, uint64_t* out_length);
+
 #endif

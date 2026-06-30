@@ -40,9 +40,20 @@
 
 /* Buddy allocator parameters.  See pmm.c file header for the rationale
  * behind each cap.  Bumping BUDDY_MAX_FRAMES raises the supported
- * physical-memory ceiling (it's a .bss cost: 1 byte per frame). */
+ * physical-memory ceiling (it's a .bss cost: 1 byte per frame).
+ *
+ * M19.5.1 — per-arch cap.  i386 stays at 1 GiB (identity map is fixed
+ * at 256 MiB by vmm.c; the cap is generous since the mmap caps it
+ * further if RAM is smaller).  x86_64 bumps to 4 GiB because
+ * hal_extend_identity_map can grow the identity map to that range
+ * cheaply via 1 GiB PDPT pages.  Real >4 GiB systems would bump
+ * further; the page_state[] cost is 1 MiB at 4 GiB, 4 MiB at 16 GiB. */
 #define BUDDY_MAX_ORDER     10
-#define BUDDY_MAX_FRAMES    (1u << 18)      /* 1 GiB cap, 256 KiB metadata */
+#if defined(__x86_64__)
+#  define BUDDY_MAX_FRAMES  (1u << 20)      /* 4 GiB cap, 1 MiB metadata */
+#else
+#  define BUDDY_MAX_FRAMES  (1u << 18)      /* 1 GiB cap, 256 KiB metadata */
+#endif
 
 /* Zone identifiers.  Allocators that don't care should pass
  * ZONE_DEFAULT — which falls back NORMAL → DMA → fail. */

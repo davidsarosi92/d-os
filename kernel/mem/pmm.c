@@ -61,6 +61,7 @@
 #include "pmm.h"
 #include "lock.h"
 #include "multiboot.h"
+#include "hal_api.h"
 #include "printf.h"
 #include <stdint.h>
 
@@ -237,8 +238,49 @@ void pmm_init(void) {
         return;
     }
 
+    /* M19.5.1 — find the highest physical address among AVAILABLE
+     * regions, then ask the HAL to extend its identity map there.
+     * On x86_64 this installs 1 GiB pages in PDPT for memory above the
+     * boot-time 1 GiB cap; on i386 it's a no-op (kmap deferred).
+     *
+     * We do this BEFORE the marking pass below so that all frames we
+     * subsequently dereference (zero, free-list-link) are reachable
+     * through the kernel virtual address space. */
+    uintptr_t max_phys = 0;
+    {
+        uintptr_t wp = mbi->mmap_addr;
+        uintptr_t wend = mbi->mmap_addr + mbi->mmap_length;
+        int wb = 64;
+        while (wp < wend && wb-- > 0) {
+            const struct mboot_mmap_entry* e = (const struct mboot_mmap_entry*)wp;
+            if (e->type == MMAP_TYPE_AVAILABLE) {
+                uint64_t hi = e->base + e->length;
+                /* Cap at the buddy's static metadata range — we won't
+                 * manage anything above that. */
+                uint64_t cap = (uint64_t)BUDDY_MAX_FRAMES * PMM_FRAME_SIZE;
+                if (hi > cap) hi = cap;
+                if ((uintptr_t)hi > max_phys) max_phys = (uintptr_t)hi;
+            }
+            wp += e->size + 4;
+        }
+    }
+    uintptr_t covered = hal_extend_identity_map(max_phys);
+    if (covered < max_phys) {
+        kprintf("pmm: identity map caps at %u MiB (RAM goes up to %u MiB) — "
+                "HIGHMEM frames will be skipped\n",
+                (unsigned)(covered >> 20), (unsigned)(max_phys >> 20));
+    } else if (covered > (uintptr_t)1 * 1024 * 1024 * 1024) {
+        kprintf("pmm: identity map extended to %u MiB\n",
+                (unsigned)(covered >> 20));
+    }
+
     /* Pass 1: tag AVAILABLE frames as PS_USED.  Anything outside an
-     * AVAILABLE region stays PS_NONE. */
+     * AVAILABLE region stays PS_NONE.  Cap at `covered` so we never
+     * try to dereference a frame the HAL didn't make reachable (i386:
+     * stuck at 256 MiB until kmap lands; x86_64: extended above). */
+    uint32_t cover_frames = (uint32_t)(covered / PMM_FRAME_SIZE);
+    if (cover_frames > BUDDY_MAX_FRAMES) cover_frames = BUDDY_MAX_FRAMES;
+
     uintptr_t p   = mbi->mmap_addr;
     uintptr_t end = mbi->mmap_addr + mbi->mmap_length;
     int entry_budget = 64;
@@ -248,12 +290,14 @@ void pmm_init(void) {
             uint64_t base = e->base;
             uint64_t len  = e->length;
 
-            if (base >= 0x100000000ull) { p += e->size + 4; continue; }
-            if (base + len > 0x100000000ull) len = 0x100000000ull - base;
+            /* Don't even consider regions starting above the identity
+             * cap — we can't address them. */
+            if (base >= (uint64_t)covered) { p += e->size + 4; continue; }
+            if (base + len > (uint64_t)covered) len = (uint64_t)covered - base;
 
             uint32_t first = (uint32_t)((base + PMM_FRAME_SIZE - 1) / PMM_FRAME_SIZE);
             uint32_t last  = (uint32_t)((base + len) / PMM_FRAME_SIZE);
-            if (last > BUDDY_MAX_FRAMES) last = BUDDY_MAX_FRAMES;
+            if (last > cover_frames) last = cover_frames;
             for (uint32_t i = first; i < last; i++) seed_mark_available(i);
         }
         p += e->size + 4;

@@ -24,6 +24,7 @@
 #include "task.h"
 #include "lapic.h"
 #include "ioapic.h"
+#include "pci.h"
 #include <stdint.h>
 
 /* --------------------------------------------------------------------------
@@ -89,6 +90,10 @@ extern void isr40(void); extern void isr41(void); extern void isr42(void); exter
 extern void isr44(void); extern void isr45(void); extern void isr46(void); extern void isr47(void);
 extern void isr64(void);                           /* LAPIC timer (M18.5) */
 extern void isr65(void);                           /* reserved: cross-CPU preempt IPI */
+extern void isr80(void);                           /* MSI pool (M18.6.5) */
+extern void isr81(void);
+extern void isr82(void);
+extern void isr83(void);
 extern void isr128(void);                          /* int 0x80 — syscall */
 
 static void (*const isr_table[48])(void) = {
@@ -203,6 +208,13 @@ void idt_init(void) {
     set_gate(0x40, isr64, 0x8E);
     set_gate(0x41, isr65, 0x8E);
 
+    /* MSI pool (M18.6.5).  4 vectors handed out by pci_alloc_msi.
+     * EOI'd via lapic_eoi like other APIC vectors. */
+    set_gate(0x50, isr80, 0x8E);
+    set_gate(0x51, isr81, 0x8E);
+    set_gate(0x52, isr82, 0x8E);
+    set_gate(0x53, isr83, 0x8E);
+
     /* Vector 0x80 (syscall): installed with DPL=3 so ring 3 can `int 0x80`
      * without the CPU raising #GP.  0xEE = P=1, DPL=3, 32-bit interrupt
      * gate. */
@@ -305,6 +317,18 @@ void isr_handler(struct int_frame* f) {
      * honors it on the right core. */
     if (f->int_no == 0x40 || f->int_no == 0x41) {
         if (f->int_no == 0x40) schedule_request();
+        lapic_eoi();
+        schedule_check();
+        return;
+    }
+
+    /* MSI pool (M18.6.5).  Dispatch to driver handler installed via
+     * pci_alloc_msi.  Handler must NOT block; runs with IRQs masked.
+     * Same lapic_eoi + schedule_check as a LAPIC IRQ. */
+    if (f->int_no >= 0x50 && f->int_no <= 0x53) {
+        extern pci_msi_handler_fn pci_msi_handlers[4];
+        unsigned idx = (unsigned)(f->int_no - 0x50);
+        if (pci_msi_handlers[idx]) pci_msi_handlers[idx]();
         lapic_eoi();
         schedule_check();
         return;

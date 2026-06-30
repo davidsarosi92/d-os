@@ -30,6 +30,7 @@ struct task;   /* fwd; defined in task.h */
 struct percpu {
     uint8_t      apic_id;          /* this CPU's LAPIC ID */
     int          cpu_index;        /* same as the array index */
+    int          numa_node;        /* M19.5.3 — NUMA node from SRAT (0 if no SRAT) */
     int          online;           /* 1 once the CPU has finished its init */
     struct task* current;          /* M18 — per-CPU current-task pointer */
     struct task* idle;             /* per-CPU idle task; never DEAD */

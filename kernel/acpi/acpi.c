@@ -142,6 +142,65 @@ struct madt_iso {                       /* Interrupt Source Override */
 } __attribute__((packed));
 
 /* ------------------------------------------------------------------------- */
+/* SRAT — System Resource Affinity Table (M19.5.3).                           */
+/*                                                                            */
+/* Optional ACPI table that declares NUMA topology: which CPUs belong to     */
+/* which proximity domain (= NUMA node) and which memory ranges belong to    */
+/* which domain.  ACPI 6.5 §5.2.16.                                          */
+/*                                                                            */
+/* On QEMU you only see SRAT entries when launched with `-numa node,...`     */
+/* args.  Without those, SRAT is absent and the SMP system runs as a single  */
+/* node from a memory-allocation perspective.                                */
+/*                                                                            */
+/* Entry types we care about (others ignored via length):                    */
+/*   0 — Processor LAPIC/SAPIC Affinity                                       */
+/*   1 — Memory Affinity                                                      */
+/*   2 — Processor x2APIC Affinity                                            */
+/* ------------------------------------------------------------------------- */
+
+#define SRAT_TYPE_LAPIC_AFFINITY    0
+#define SRAT_TYPE_MEMORY_AFFINITY   1
+#define SRAT_TYPE_X2APIC_AFFINITY   2
+
+struct srat {
+    struct sdt_header header;
+    uint32_t reserved1;                  /* must be 1 */
+    uint64_t reserved2;
+    /* entries follow */
+} __attribute__((packed));
+
+struct srat_lapic_affinity {
+    struct madt_entry_header h;          /* type=0, length=16 */
+    uint8_t  proximity_domain_low;       /* low 8 bits of domain */
+    uint8_t  apic_id;
+    uint32_t flags;                      /* bit 0 = enabled */
+    uint8_t  local_sapic_eid;
+    uint8_t  proximity_domain_hi[3];     /* high 24 bits of domain */
+    uint32_t clock_domain;
+} __attribute__((packed));
+
+struct srat_memory_affinity {
+    struct madt_entry_header h;          /* type=1, length=40 */
+    uint32_t proximity_domain;
+    uint16_t reserved1;
+    uint64_t base;
+    uint64_t length;
+    uint32_t reserved2;
+    uint32_t flags;                      /* bit 0 = enabled, bit 1 = hot-pluggable */
+    uint64_t reserved3;
+} __attribute__((packed));
+
+struct srat_x2apic_affinity {
+    struct madt_entry_header h;          /* type=2, length=24 */
+    uint16_t reserved1;
+    uint32_t proximity_domain;
+    uint32_t x2apic_id;
+    uint32_t flags;
+    uint32_t clock_domain;
+    uint32_t reserved2;
+} __attribute__((packed));
+
+/* ------------------------------------------------------------------------- */
 /* Cached state filled by acpi_init and consumed by acpi_shutdown.           */
 /* ------------------------------------------------------------------------- */
 
@@ -169,6 +228,27 @@ struct iso_override {
 };
 static struct iso_override g_iso[ACPI_MAX_ISO];
 static int                 g_iso_n = 0;
+
+/* SRAT-derived (M19.5.3).  We track:
+ *   - per-CPU node ID (mapped by APIC ID; -1 = unknown / single-node)
+ *   - per-memory-range node ID (up to ACPI_MAX_MEM_AFFINITY ranges)
+ *
+ * If no SRAT exists, everything reports node 0 (single-node system —
+ * the natural fall-through for UMA boards). */
+#define ACPI_MAX_NUMA_NODES   8
+#define ACPI_MAX_MEM_AFFINITY 16
+
+struct mem_affinity {
+    uint32_t node;
+    uint64_t base;
+    uint64_t length;
+};
+
+static int8_t   g_cpu_node[ACPI_MAX_CPUS];    /* indexed by ACPI-MADT slot, -1 unknown */
+static struct mem_affinity g_mem_aff[ACPI_MAX_MEM_AFFINITY];
+static int      g_mem_aff_n = 0;
+static int      g_numa_nodes = 0;             /* count of distinct nodes seen */
+static int      g_have_srat = 0;
 
 /* ------------------------------------------------------------------------- */
 /* Helpers.                                                                  */
@@ -333,6 +413,85 @@ static void parse_madt(const struct madt* m) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* SRAT parser (M19.5.3).                                                    */
+/*                                                                            */
+/* Maps each (enabled) processor entry to its proximity domain, and each      */
+/* (enabled) memory range to its proximity domain.  We resolve CPU records   */
+/* by APIC ID — translating to MADT slot index — so the percpu layer can     */
+/* look up "what NUMA node is CPU X on".                                     */
+/* ------------------------------------------------------------------------- */
+
+static int apic_id_to_madt_slot(uint8_t apic_id) {
+    for (int i = 0; i < g_ncpus; i++) {
+        if (g_cpu_apic_ids[i] == apic_id) return i;
+    }
+    return -1;
+}
+
+static void note_node(uint32_t node) {
+    if ((int)node + 1 > g_numa_nodes) g_numa_nodes = (int)node + 1;
+}
+
+static void parse_srat(const struct srat* s) {
+    g_have_srat = 1;
+    const uint8_t* p   = (const uint8_t*)(s + 1);
+    const uint8_t* end = (const uint8_t*)s + s->header.length;
+
+    while (p + sizeof(struct madt_entry_header) <= end) {
+        const struct madt_entry_header* h = (const struct madt_entry_header*)p;
+        if (h->length < 2 || p + h->length > end) break;
+
+        switch (h->type) {
+            case SRAT_TYPE_LAPIC_AFFINITY: {
+                const struct srat_lapic_affinity* a = (const struct srat_lapic_affinity*)p;
+                if (a->flags & 0x1) {
+                    uint32_t node = a->proximity_domain_low
+                                  | ((uint32_t)a->proximity_domain_hi[0] << 8)
+                                  | ((uint32_t)a->proximity_domain_hi[1] << 16)
+                                  | ((uint32_t)a->proximity_domain_hi[2] << 24);
+                    int slot = apic_id_to_madt_slot(a->apic_id);
+                    if (slot >= 0 && slot < ACPI_MAX_CPUS && node < 128) {
+                        g_cpu_node[slot] = (int8_t)node;
+                        note_node(node);
+                    }
+                }
+                break;
+            }
+            case SRAT_TYPE_X2APIC_AFFINITY: {
+                const struct srat_x2apic_affinity* a = (const struct srat_x2apic_affinity*)p;
+                if (a->flags & 0x1) {
+                    /* x2APIC IDs can exceed 255; we only cap by ACPI_MAX_CPUS.
+                     * Match by low byte against our 8-bit APIC ID table — works
+                     * for the QEMU configs we test against (≤32 CPUs). */
+                    if (a->x2apic_id <= 0xFF) {
+                        int slot = apic_id_to_madt_slot((uint8_t)a->x2apic_id);
+                        if (slot >= 0 && a->proximity_domain < 128) {
+                            g_cpu_node[slot] = (int8_t)a->proximity_domain;
+                            note_node(a->proximity_domain);
+                        }
+                    }
+                }
+                break;
+            }
+            case SRAT_TYPE_MEMORY_AFFINITY: {
+                const struct srat_memory_affinity* a = (const struct srat_memory_affinity*)p;
+                if ((a->flags & 0x1) && g_mem_aff_n < ACPI_MAX_MEM_AFFINITY) {
+                    g_mem_aff[g_mem_aff_n].node   = a->proximity_domain;
+                    g_mem_aff[g_mem_aff_n].base   = a->base;
+                    g_mem_aff[g_mem_aff_n].length = a->length;
+                    g_mem_aff_n++;
+                    note_node(a->proximity_domain);
+                }
+                break;
+            }
+            default:
+                break;
+        }
+        p += h->length;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 /* Public interface.                                                         */
 /* ------------------------------------------------------------------------- */
 
@@ -355,16 +514,25 @@ int acpi_init(void) {
     /* RSDT payload is an array of 32-bit physical pointers, one per table.
      * Count = (table length − header length) / 4.  M18: scan the same
      * list for both FACP (shutdown) and APIC (= MADT, SMP topology). */
+    /* Default per-CPU node to "unknown" (-1) — SRAT may fill in. */
+    for (int i = 0; i < ACPI_MAX_CPUS; i++) g_cpu_node[i] = -1;
+
     uint32_t n = (rsdt->length - sizeof(struct sdt_header)) / 4;
     const uint32_t* entries = (const uint32_t*)(rsdt + 1);
+    const struct sdt_header* srat_tbl = 0;
     for (uint32_t i = 0; i < n; i++) {
         const struct sdt_header* h = (const struct sdt_header*)entries[i];
         if (sig4(h->signature, "FACP") && checksum_ok(h, h->length)) {
             g_fadt = (const struct fadt*)h;
         } else if (sig4(h->signature, "APIC") && checksum_ok(h, h->length)) {
             parse_madt((const struct madt*)h);
+        } else if (sig4(h->signature, "SRAT") && checksum_ok(h, h->length)) {
+            /* Defer parsing until AFTER MADT — SRAT lookups translate
+             * APIC ID to MADT slot, which needs the MADT cache filled. */
+            srat_tbl = h;
         }
     }
+    if (srat_tbl) parse_srat((const struct srat*)srat_tbl);
     if (!g_fadt) {
         kprintf("ACPI: FADT not found\n");
         return -1;
@@ -395,6 +563,11 @@ int acpi_init(void) {
     if (g_ncpus > 0 || g_ioapic_phys) {
         kprintf("ACPI: MADT — %d CPU(s), lapic=%p ioapic=%p\n",
                 g_ncpus, (void*)g_lapic_phys, (void*)g_ioapic_phys);
+    }
+    /* M19.5.3 — log SRAT (NUMA) topology summary if one was found. */
+    if (g_have_srat) {
+        kprintf("ACPI: SRAT — %d node(s), %d mem range(s)\n",
+                g_numa_nodes, g_mem_aff_n);
     }
 
     return 0;
@@ -445,5 +618,28 @@ int acpi_irq_override(int isa_irq, uint32_t* out_gsi, uint16_t* out_flags) {
             return 1;
         }
     }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* SRAT-derived NUMA getters (M19.5.3).                                      */
+/* ------------------------------------------------------------------------- */
+
+int acpi_numa_nodes(void) { return g_numa_nodes; }
+
+int acpi_cpu_node(int slot) {
+    if (slot < 0 || slot >= ACPI_MAX_CPUS) return 0;
+    int n = g_cpu_node[slot];
+    return (n < 0) ? 0 : n;     /* SRAT didn't claim → default node 0 */
+}
+
+int acpi_mem_affinity_count(void) { return g_mem_aff_n; }
+
+int acpi_mem_affinity_get(int idx, uint32_t* out_node,
+                          uint64_t* out_base, uint64_t* out_length) {
+    if (idx < 0 || idx >= g_mem_aff_n) return -1;
+    if (out_node)   *out_node   = g_mem_aff[idx].node;
+    if (out_base)   *out_base   = g_mem_aff[idx].base;
+    if (out_length) *out_length = g_mem_aff[idx].length;
     return 0;
 }

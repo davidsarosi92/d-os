@@ -44,6 +44,8 @@ void percpu_init_bsp(void) {
         uint8_t aid = acpi_cpu_apic_id(i);
         percpu_table[i].apic_id   = aid;
         percpu_table[i].cpu_index = i;
+        /* M19.5.3 — record the SRAT-derived NUMA node (0 if no SRAT). */
+        percpu_table[i].numa_node = acpi_cpu_node(i);
         /* DO NOT zero `current` / `online` / `ticks` here.  task_init
          * runs BEFORE percpu_init_bsp in the boot order and has
          * already stamped slot 0's current with pid 0 (via the

@@ -163,7 +163,16 @@ struct xhci_trb {
     uint32_t control;
 } __attribute__((packed));
 
-/* Ring state — applies to Command Ring, Transfer Rings, and Event Ring. */
+/* Ring state — applies to Command Ring, Transfer Rings, and Event Ring.
+ *
+ * M20.6.2 audit (2026-06-30): `phys` stays uint32_t because PMM only
+ * manages low memory (BUDDY_MAX_FRAMES * 4 KiB ≤ 1 GiB today on both
+ * archs).  When §M19.5.1 populates HIGHMEM the field needs to widen
+ * to uint64_t and the `_HI` MMIO writes (currently constant-zero in
+ * evt_drain, init_minimum, address_device, etc.) need to carry the
+ * actual high 32 bits.  The spec already supports 64-bit DMA (xHCI
+ * 1.2 §5.4.2 "DCBAAP", §5.5.2.3.3 "ERDP", etc.) — we're just opting
+ * into <4 GiB DMA on day one to keep the diff small. */
 struct xhci_ring {
     struct xhci_trb* trbs;          /* virt = phys (identity-mapped frame) */
     uint32_t         phys;
