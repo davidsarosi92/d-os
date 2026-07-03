@@ -18,8 +18,11 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
-✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5** shipped (10/11 polish
-sub-items; the lone outstanding one is §M20.6.1 SYSCALL/SYSRET).
+✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M22** shipped (10/11
+polish sub-items; the lone outstanding one is §M20.6.1
+SYSCALL/SYSRET).  M22 (2026-07-03): GUI — gfx surfaces + compositor
++ window manager + terminal windows (`kernel/gui/`), PS/2 mouse
+(IRQ12), `gui` shell command; both archs; widget toolkit deferred.
 Highlights so far: VFS + ramfs + exFAT on virtio-blk, devfs +
 procfs, preemptive scheduler, multi-pane shell, xHCI USB + HID,
 keyboard layouts, HAL cut (`hal_api.h`), **SMP on i386 + x86_64**
@@ -36,8 +39,6 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 - **M21** — aarch64 port.  Third arch, real torture test of HAL
   portability (no port I/O, GIC instead of APIC, EL1/EL0 instead
   of rings).
-- **M22** — GUI infrastructure (compositor + windows; Wayland-reuse
-  evaluation phase per §M22).
 - **M23** — Audio (AC97 → HDA → I2S).
 - **M24** — Network (NIC → IP/UDP/TCP → sockets).
 - **§M19.5.1 i386 kmap** — the deferred half of HIGHMEM: real
@@ -47,12 +48,17 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   but PMM still has a single zone set.
 - **§M20.6.1** — SYSCALL/SYSRET instruction path (needs GDT slot
   reorg to satisfy SYSRET's selector arithmetic).
+- **§M22 stage 6** — widget toolkit (buttons, labels, text input);
+  deferred until a non-terminal GUI client needs it.
 
 🔲 **PLAN extensions (placeholders, design only):**
-- §M22 — GUI includes a Wayland-reuse evaluation phase
-  (libwayland-server port vs. custom protocol).
 - §M23 — Audio subsystem (AC97 → HDA → I2S).
 - §M24 — Network stack (virtio-net → IP/UDP/TCP → sockets).
+- §M25 — Userland foundation (per-process VMM, ELF loader, fd
+  table, unix sockets + fd passing, mmap, mini-libc) — the
+  Wayland prerequisites.
+- §M26 — Wayland server (wire protocol over M22 compositor +
+  M25 substrate; depends on both).
 
 ## Hard conventions (do NOT deviate without asking)
 

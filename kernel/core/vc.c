@@ -88,6 +88,10 @@ static struct vc*      vcs[VC_MAX];
 static int             vc_n      = 0;
 static int             next_id   = 1;
 
+/* M22: while non-zero, leaf VCs skip FB rendering and Alt-N focus
+ * switching is disabled — the GUI compositor owns the screen. */
+static volatile int    screen_suppressed = 0;
+
 /* ---------------------------------------------------------------------------
  * Layout pass — recursively assign rects to every node.
  *
@@ -150,7 +154,15 @@ static void repaint_all(void) {
  * --------------------------------------------------------------------------- */
 
 void vc_putchar(struct vc* v, char c) {
-    if (!v || !v->leaf) return;
+    if (!v) return;
+    /* M22: offscreen VCs render through their emit hook (GUI terminal
+     * window), never through the FB cell grid. */
+    if (v->emit) { v->emit(v->emit_ctx, c); return; }
+    if (!v->leaf) return;
+    /* While the GUI compositor owns the screen, leaf VCs go dark: their
+     * shells keep running (output is simply dropped) but they must not
+     * paint over the windows. */
+    if (screen_suppressed) return;
     struct vc_node* n = v->leaf;
 
     if (c == '\n') {
@@ -182,7 +194,10 @@ void vc_putchar(struct vc* v, char c) {
 }
 
 void vc_clear(struct vc* v) {
-    if (!v || !v->leaf) return;
+    if (!v) return;
+    if (v->emit) { v->emit(v->emit_ctx, '\f'); return; }   /* GUI: form feed */
+    if (!v->leaf) return;
+    if (screen_suppressed) return;
     struct vc_node* n = v->leaf;
     fb_clear_cells(n->x, n->y, n->w, n->h, v->bg);
     v->cur_col = 0;
@@ -270,6 +285,9 @@ void vc_focus(struct vc* v) {
 }
 
 int vc_focus_by_id(int n) {
+    /* Alt-N pane hotkeys are meaningless (and confusing — keys would
+     * flow to an invisible pane) while the GUI owns the screen. */
+    if (screen_suppressed) return -1;
     for (int i = 0; i < vc_n; i++) {
         if (vcs[i] && vcs[i]->id == n) {
             vc_focus(vcs[i]);
@@ -389,3 +407,20 @@ int vc_get_rect(const struct vc* v, int* x, int* y, int* w, int* h) {
     if (h) *h = v->leaf->h;
     return 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * M22 GUI hooks.
+ * --------------------------------------------------------------------------- */
+
+struct vc* vc_create_offscreen(void (*emit)(void* ctx, char c), void* ctx) {
+    struct vc* v = vc_alloc_new();
+    if (!v) return NULL;
+    v->emit     = emit;
+    v->emit_ctx = ctx;
+    /* No leaf: this VC lives outside the split tree.  vc_kbd_push and
+     * vc_getchar work unchanged because they only touch the ring. */
+    return v;
+}
+
+void vc_screen_suppress(int on) { screen_suppressed = on ? 1 : 0; }
+int  vc_screen_suppressed(void) { return screen_suppressed; }

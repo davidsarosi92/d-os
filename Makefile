@@ -148,6 +148,9 @@ CORE_C_SRCS := \
     kernel/core/block_cache.c \
     kernel/core/lock.c \
     kernel/core/vc.c \
+    kernel/gui/gfx.c \
+    kernel/gui/gui.c \
+    kernel/drivers/mouse/ps2_mouse.c \
     kernel/core/keymap.c \
     kernel/core/layouts.c \
     kernel/core/percpu.c \
@@ -192,6 +195,9 @@ CORE_C_SRCS := \
     kernel/core/block_cache.c \
     kernel/core/lock.c \
     kernel/core/vc.c \
+    kernel/gui/gfx.c \
+    kernel/gui/gui.c \
+    kernel/drivers/mouse/ps2_mouse.c \
     kernel/core/keymap.c \
     kernel/core/layouts.c \
     kernel/core/percpu.c \

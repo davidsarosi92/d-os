@@ -32,6 +32,7 @@
 #include "keymap.h"
 #include "percpu.h"
 #include "slab.h"
+#include "gui.h"
 
 #define LINE_MAX        128             /* max accepted bytes per command line */
 #define DEFAULT_PROMPT  "d-os> "        /* fallback when config is unavailable */
@@ -105,6 +106,7 @@ static void cmd_help(void) {
                   "  config, getconf <key>, setconf <key> <value>, saveconf\n"
                   "  ringtest, ps, spawn, yield, loop\n"
                   "  pane, pane split horizontal|vertical\n"
+                  "  gui (compositor + mouse-driven shell windows)\n"
                   "  lslayout, setlayout <us|hu|...>, lscpu, taskset <pid> <mask>\n"
                   "  slabinfo, buddyinfo\n"
                   "  shutdown, reboot\n");
@@ -362,6 +364,18 @@ static void cmd_setlayout(const char* name) {
 /* -------------------------------------------------------------------- */
 /* CPU topology — `lscpu` (M18).                                         */
 /* -------------------------------------------------------------------- */
+
+/* `gui` — start the M22 compositor.  The calling shell keeps running in
+ * its (now invisible) pane; two fresh shells come up in windows.  A
+ * second invocation is a no-op — the compositor is a singleton. */
+static void cmd_gui(void) {
+    if (gui_is_active()) {
+        console_write("gui: already running\n");
+        return;
+    }
+    if (gui_start() != 0)
+        console_write("gui: start failed (no framebuffer?)\n");
+}
 
 static void cmd_lscpu(void) {
     int n = smp_ncpus();
@@ -736,7 +750,12 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (line[0] == '\0')       return;                  /* empty line → no-op */
 
     if (streq(line, "help"))   { cmd_help();       return; }
-    if (streq(line, "clear"))  { console_clear(); return; }
+    /* M22: clear OUR VC, not the global sinks — after vc_init the fb
+     * sink is inactive, so console_clear() had no visible effect in a
+     * pane anyway; vc_clear also reaches GUI windows via the emit hook. */
+    if (streq(line, "clear"))  { vc_clear(my_vc);  return; }
+    /* M22: bring up the compositor + two shell windows.  Idempotent. */
+    if (streq(line, "gui"))    { cmd_gui();        return; }
     if (streq(line, "about"))  { cmd_about();      return; }
     if (streq(line, "lsmod"))  { module_list();    return; }
     if (streq(line, "lsdrv"))  { driver_list();    return; }

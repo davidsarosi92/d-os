@@ -61,6 +61,13 @@ struct vc {
     volatile uint32_t in_tail;
     /* Shell task bound to this VC (NULL until spawned). */
     struct task*      task;
+    /* M22: optional output override.  When non-NULL, vc_putchar hands
+     * every byte to this hook instead of rendering into the FB cell
+     * grid — that's how a GUI terminal window reuses the whole shell +
+     * console plumbing without owning a pane.  `vc_clear` sends '\f'
+     * through the same hook.  Offscreen VCs have leaf == NULL. */
+    void (*emit)(void* ctx, char c);
+    void*             emit_ctx;
 };
 
 /* Bring up the VC subsystem.  Creates the root VC covering the whole FB,
@@ -112,5 +119,20 @@ int  vc_count(void);
 /* Read the cell-rect of `v`'s current leaf.  Any out pointer may be NULL.
  * Returns 0 on success, -1 if v has no leaf bound. */
 int  vc_get_rect(const struct vc* v, int* x, int* y, int* w, int* h);
+
+/* ---- M22 GUI hooks ------------------------------------------------------- */
+
+/* Create a VC that is NOT part of the split tree: no leaf, no rect —
+ * all output flows through `emit(ctx, c)`.  Input still uses the normal
+ * ring (vc_getchar / vc_kbd_push), so a shell task binds to it exactly
+ * like to a pane VC.  Returns NULL when VC_MAX is exhausted. */
+struct vc* vc_create_offscreen(void (*emit)(void* ctx, char c), void* ctx);
+
+/* Screen suppression: while on, leaf VCs stop painting the framebuffer
+ * (their input rings and shells keep working) and Alt-N pane switching
+ * is ignored.  The GUI turns this on when the compositor owns the
+ * screen, so background pane output can't scribble over windows. */
+void vc_screen_suppress(int on);
+int  vc_screen_suppressed(void);
 
 #endif

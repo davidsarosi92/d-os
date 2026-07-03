@@ -295,6 +295,30 @@ void fb_scroll_cells_up(int col, int row, int w, int h, uint32_t bg) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* M22 exports — the GUI's gfx layer needs raw framebuffer access and the    */
+/* embedded font.  Kept as plain accessors so the dependency stays one-way    */
+/* (this driver knows nothing about surfaces or windows).                     */
+/* -------------------------------------------------------------------------- */
+
+/* Fill out the framebuffer geometry.  Returns 0 on success, -1 if no
+ * usable 32-bpp FB was mapped (VGA text fallback boot). */
+int fb_get_info(volatile uint32_t** px, uint32_t* w, uint32_t* h,
+                uint32_t* pitch_bytes) {
+    if (!fb_pixels) return -1;
+    if (px)          *px          = fb_pixels;
+    if (w)           *w           = fb_width;
+    if (h)           *h           = fb_height;
+    if (pitch_bytes) *pitch_bytes = fb_pitch_bytes;
+    return 0;
+}
+
+/* One glyph = 8 bytes, row-major, MSB = leftmost pixel.  Out-of-range
+ * characters land on the 0x7F fallback block, same as draw_glyph. */
+const uint8_t* fb_font_glyph(unsigned char ch) {
+    return font8x8[ch < 128 ? ch : 0x7F];
+}
+
+/* -------------------------------------------------------------------------- */
 /* Public entry points (legacy whole-screen API).                             */
 /* -------------------------------------------------------------------------- */
 

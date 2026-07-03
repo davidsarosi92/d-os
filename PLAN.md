@@ -44,9 +44,11 @@
 | §M19.5 | Memory polish (carry-overs from M19) | ~1150 |
 | §M20.6 | x86_64 closure (SYSCALL/SYSRET, USB/blk DMA) | ~1200 |
 | §M21 | ARM (aarch64) port | ~1260 |
-| §M22 | GUI infrastructure (+ Wayland reuse if viable) | 894 |
+| §M22 | GUI infrastructure — ✅ shipped (see DOCS §4.13) | ~1405 |
 | §M23 | Audio subsystem | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) | ~1080 |
+| §M25 | Userland foundation (Wayland prerequisites) | ~1545 |
+| §M26 | Wayland server (wire protocol on M22 + M25) | ~1615 |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -161,9 +163,11 @@ what); a session can pick a theme and push on it.
 | M20.5 | x64 SMP + APIC + ring-3 (int 0x80) — Phase A/B/C | Architecture | ✅ §M20.5 |
 | M20.6 | x86_64 closure — SYSCALL/SYSRET, xHCI + virtio-blk 64-bit DMA | Architecture | §M20.6 |
 | M21 | ARM (aarch64 generic / RPi) port                | Architecture     | §M21    |
-| M22 | GUI infrastructure (+ Wayland reuse if viable)  | UX               | §M22    |
+| M22 | GUI infrastructure — compositor, windows, mouse (widget toolkit deferred) | UX | ✅ DOCS §4.13 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
+| M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | §M25 |
+| M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | §M26 |
 
 ### Cross-cutting constraints
 
@@ -1402,67 +1406,49 @@ so it's the real torture test of HAL portability.
 
 ---
 
-## §M22 — GUI infrastructure (compositor + windows)
+## §M22 — GUI infrastructure (compositor + windows) — ✅ shipped
 
-**Why now:** beyond text, into a windowed UI.  The framebuffer +
-font work from M6 is the seed; this milestone grows it into a real
-display server.
+Shipped 2026-07-03.  See **DOCS.md §4.13** for the as-built shape:
+gfx primitives + surfaces (`kernel/gui/gfx.c`), compositor + window
+manager + terminal windows (`kernel/gui/gui.c`), PS/2 aux mouse
+driver (IRQ12), `gui` shell command.  Works on i386 AND x86_64.
 
-**Design — staged subsystems.**
+**Wayland evaluation outcome (the mandated sub-phase, 2026-07-03):**
+libwayland-server / upstream clients hard-depend on a POSIX substrate
+d-os lacks (per-process address spaces, fd table, unix sockets with
+fd passing, mmap, ELF loader, libc) — far beyond the ≤ 50% overhead
+rule.  Per the fallback clause we shipped a custom in-kernel protocol
+with Wayland-shaped objects (surface + damage/commit + seat focus
+model); the wire protocol is §M26, its prerequisites are §M25.
 
-1. **Drawing primitives:** rect, line, blit, alpha-blend.
-2. **Surface abstraction:** off-screen framebuffer that can be
-   composed onto the main display.
-3. **Compositor:** maintains a list of windows, recomposes on
-   damage.
-4. **Window manager:** position, focus, decorations.
-5. **Event system:** keyboard / mouse routed to focused window.
-6. **Widget toolkit:** buttons, labels, text input, lists.
-7. **Display server protocol** — IPC for client apps to ask the
-   compositor to draw, similar to Wayland's design (Linux divergence:
-   we'd skip X11's complexity entirely).
+**DOD status:** two windows each with its own shell ✅ · mouse cursor
++ click-to-focus ✅ · drag-resize ✅ (wireframe + realloc on release) ·
+DOCS GUI chapter ✅ · Wayland eval recorded ✅.  **Stage 6 (widget
+toolkit) deferred** — first needed by a non-terminal client.
 
-**Wayland reuse — investigate, adopt if it doesn't pull focus.**
+**Lessons learned:**
 
-A custom protocol is straightforward, but Wayland's wire format is
-small, well-documented, and has a mature client ecosystem (GTK,
-weston-utils, Qt, Firefox).  Spend an explicit sub-phase at the
-START of M22 evaluating:
+- *Reuse the VC, not the shell.*  One `emit` hook on `struct vc`
+  (`vc_create_offscreen`) let windows host completely stock shell
+  tasks — shell.c did not change at all.  The alternative (a parallel
+  "window terminal" type) would have duplicated the input-ring +
+  binding logic.
+- *Hidden panes must be actively muted.*  After the compositor takes
+  the screen, background pane shells still print (prompt redraws,
+  `loop` tasks).  Without `vc_screen_suppress` they scribble straight
+  over the windows — the GUI cannot only *own* the screen, it must
+  also *revoke* it.
+- *Never kmalloc/kfree in the pointer IRQ.*  Live resize reallocs
+  surfaces; doing that in IRQ context races the compositor's blit
+  (use-after-free).  Wireframe resize + realloc-on-release on the
+  compositor task is both safer and the classic UX.
+- *8042 ACK ordering.*  Device ACKs (0xFA) must be eaten synchronously
+  before `irq_install(12)` — 0xFA passes the packet sync check
+  (bit 3 set) and would shift every packet by one byte.
 
-- *Surface of wayland-protocols we'd actually need:* wl_compositor,
-  wl_shm, xdg_shell, wl_seat (keyboard + pointer).  That's a small
-  subset; we don't need the colour-management / DMA-BUF / explicit
-  sync extensions.
-- *Implementation cost vs. custom protocol:* libwayland-server is
-  ~3 KLOC of C; reimplementing the marshalling is the bulk.  Could
-  port libwayland-server itself (it's clean C, no Linux-specific
-  syscalls beyond epoll which we can shim) or write a minimal subset
-  in-tree.
-- *Client testing path:* one upstream `weston-terminal` running
-  unchanged against our compositor is a much sharper DOD than any
-  in-tree window.
-
-**Decision rule:** if the evaluation shows we can ship a minimal
-Wayland-compatible compositor in roughly the same effort as the
-custom protocol (estimate ≤ 50% overhead), do Wayland.  If it
-balloons, ship a custom protocol that uses the same shapes
-(surface + buffer + commit) so a Wayland port stays achievable
-later.  In either case, document the call in the M22 change-log.
-
-**Pre-requisites.**
-
-- USB or PS/2 mouse driver.
-- Better font rendering — likely a TrueType / FreeType-shaped layer
-  for resolution-independent text.
-- IPC primitives — shared memory between processes (depends on
-  per-task VMM space, §M11/§M19 dependency).
-
-**Definition of done:**
-- Two windows on screen, each with its own shell.
-- Mouse moves a cursor, clicks focus windows.
-- Drag-resize works.
-- DOCS.md gains a "GUI" chapter.
-- Wayland evaluation outcome recorded.
+**Deferred follow-ups:** widget toolkit (stage 6); window close /
+minimize; per-window damage rects (today: full recompose per damage
+flag); Alt-Tab; USB HID mouse; TrueType-ish font layer.
 
 ---
 
@@ -1542,6 +1528,92 @@ of scope.
 
 ---
 
+## §M25 — Userland foundation (Wayland prerequisites)
+
+**Why:** the M22 Wayland evaluation (2026-07-03) concluded that the
+real cost of Wayland compatibility is not the wire protocol (~3 KLOC
+of marshalling) but the missing POSIX substrate underneath it: d-os
+today has kernel threads sharing one page directory, a 2-entry
+syscall table (SYS_PRINT / SYS_EXIT), and no fd concept at all.
+This milestone builds that substrate.  It is worth doing regardless
+of Wayland — it is what turns d-os tasks into real user processes.
+
+**Design — staged subsystems.**
+
+1. **Per-process address spaces** — `struct task` gains the
+   `struct vmm_space*` that task.h has anticipated since M13;
+   context_switch loads CR3/PML4 per process; kernel stays mapped
+   in the upper half of every space.
+2. **ELF loader** — load a static ELF from the VFS (ramfs or
+   exFAT), map segments into a fresh vmm_space, enter at ring 3.
+3. **Per-process fd table** — fds as indexes into a table of VFS
+   file objects; syscall surface grows `open / read / write /
+   close / lseek`.
+4. **mmap + shared memory** — anonymous mappings plus memfd-style
+   fd-backed shared memory objects (the wl_shm building block).
+5. **Unix domain sockets with fd passing** — SOCK_STREAM semantics
+   plus SCM_RIGHTS-style fd transfer.  This is the hard Wayland
+   dependency; shm pools and keymaps travel as fds.
+6. **Readiness API** — poll/epoll-shaped "wait for any of these
+   fds" syscall (epoll is the only libwayland dependency that is
+   trivially shimmable, but we need *some* multiplexing primitive).
+7. **Minimal libc** — in-tree static libc (string, malloc over
+   mmap, printf, syscall wrappers) sufficient to link test clients.
+
+**Definition of done:**
+- A static ELF binary loaded from disk runs in ring 3 in its own
+  address space and prints via `write(1, …)`.
+- Two user processes: A creates a shared-memory fd, passes it to B
+  over a unix socket; B mmaps it and reads what A wrote.
+- A poll/epoll-style wait unblocks on socket readability.
+- DOCS.md gains a "Userland" chapter.
+
+**Out of scope:** fork/exec fidelity (spawn-style API is fine),
+signals, dynamic linking, user-space threads, job control.
+
+---
+
+## §M26 — Wayland server implementation
+
+**Why:** with the M22 compositor speaking a Wayland-shaped internal
+object model (surface + buffer + attach/damage/commit + seat) and
+the M25 substrate providing unix sockets + fd passing + mmap, wire
+compatibility becomes the thin remaining layer — exactly the
+sequencing the M22 evaluation recommended.
+
+**Depends on:** §M22 (compositor internals), §M25 (userland
+substrate).
+
+**Design — staged.**
+
+1. **Port-vs-reimplement decision** — re-run the libwayland-server
+   port assessment against M25's actual API surface (epoll shim,
+   socket semantics).  If the port fights our libc, write the
+   marshalling in-tree; the wire format is small and stable.
+2. **Core globals:** `wl_display`, `wl_registry`, `wl_compositor`,
+   `wl_shm`, `wl_seat` (keyboard + pointer), and `xdg_shell`
+   (`xdg_wm_base` / `xdg_surface` / `xdg_toplevel`).
+3. **Compositor bridge:** `wl_surface` attach/damage/commit maps
+   1:1 onto the M22 internal surface API — no compositor rewrite.
+4. **Keymap delivery:** `wl_keyboard` sends the keymap as an fd;
+   generate an xkb-format blob from our M16 layout tables (or ship
+   a fixed per-layout blob first).
+5. **Client path:** first an in-tree static test client speaking
+   raw wire bytes; then upstream `weston-simple-shm`
+   cross-compiled statically as the stretch target.
+
+**Definition of done:**
+- An in-tree Wayland client connects over a unix socket, creates a
+  wl_shm buffer, and its window appears composited on screen.
+- Keyboard + pointer input reaches the focused client via wl_seat.
+- Stretch: unmodified `weston-simple-shm` (static build) runs.
+- DOCS.md "GUI" chapter gains a Wayland-protocol section.
+
+**Out of scope:** DMA-BUF, explicit sync, colour management,
+subsurfaces beyond the minimum xdg_shell needs, XWayland.
+
+---
+
 ## How to use this document
 
 - **Start of every session:** open `PLAN.md`, find the first non-✅
@@ -1559,6 +1631,18 @@ of scope.
 
 ## Change log
 
+- **2026-07-03** — §M22 shipped (compositor, window manager, terminal
+  windows, PS/2 mouse; widget toolkit deferred).  Section condensed
+  to a pointer at DOCS.md §4.13 + lessons learned.
+- **2026-07-03** — Wayland path split out.  M22's Wayland-reuse
+  evaluation ran: the wire protocol is cheap, but libwayland-server
+  and any upstream client hard-depend on a POSIX substrate d-os
+  lacks (per-process address spaces, fd table, unix sockets with
+  fd passing, mmap, ELF loader, libc).  Decision per §M22's rule:
+  M22 ships a custom in-kernel protocol with Wayland-shaped objects
+  (surface + buffer + commit + seat).  Added §M25 (userland
+  foundation = the prerequisites) and §M26 (Wayland server proper,
+  on top of M22 + M25).  No code changed.
 - **2026-04-27** — Roadmap expanded.  Added 15 new milestones
   (§G + §M8–§M22) covering driver lifecycle, devfs, procfs, block
   layer, exFAT (+future FAT/NTFS), preemptive scheduling, multi-

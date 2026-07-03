@@ -49,6 +49,7 @@ when sections are added.)
 | 4.10 | Kernel heap (M19: slab + per-CPU mag + page_alloc) | ~1255 |
 | 4.11 | Serial debug (COM1) | 687 |
 | 4.12 | ACPI (shutdown) | 701 |
+| 4.13 | GUI — compositor + windows + mouse (M22) | ~1530 |
 | 5 | Build & run | 722 |
 | 6 | Compiler flags | 735 |
 | 7 | Roadmap | 751 |
@@ -1527,6 +1528,65 @@ M20 change-log entries):**
 
 ---
 
+### 4.13 GUI — compositor, window manager, terminal windows (M22)
+
+Files: `kernel/gui/gfx.c` + `gfx.h` (primitives + surfaces),
+`kernel/gui/gui.c` + `gui.h` (compositor + WM + terminal windows),
+`kernel/drivers/mouse/ps2_mouse.c` + `mouse.h` (pointer input).
+Arch-independent (pure C on the 32-bpp linear FB); works on i386 and
+x86_64.  Started from any shell with the `gui` command.
+
+- **Object model is Wayland-shaped by design** (per the 2026-07-03
+  §M22 evaluation): a window owns an off-screen content *surface*,
+  output is *committed* by marking damage, input follows a *seat*
+  model (keyboard → focused window, pointer → hit-tested window).
+  §M26 can put the real wire protocol on top without a rewrite.
+- **gfx layer:** `struct gfx_surface` = w/h/stride + ARGB pixel
+  buffer, either wrapping the framebuffer (`gfx_fb_surface`) or
+  kmalloc-backed off-screen (`gfx_surface_init`).  Primitives (all
+  clipped): `gfx_fill`, `gfx_line` (Bresenham), `gfx_blit`,
+  `gfx_blend_fill` (src-over alpha — used for window drop shadows),
+  `gfx_vgradient`, `gfx_text` (8×8 font re-exported from fb_terminal
+  via `fb_font_glyph`).
+- **Terminal windows reuse the whole shell stack.**  `struct vc` grew
+  an optional `emit` hook: `vc_create_offscreen(emit, ctx)` returns a
+  VC outside the split tree whose output bytes flow to the hook
+  instead of the FB cell grid.  A window's hook ("gterm") renders
+  glyphs into the content surface with its own cursor/scroll state.
+  Shell tasks are spawned exactly like `pane split` does —
+  `task_spawn(shell_task_entry)` + `task_set_out_console` — so
+  shell.c needed zero changes for windows to host shells.
+- **Compositor task** ("compositor" in `ps`): sleeps on
+  `hal_cpu_idle + task_yield`, wakes on the `need_frame` damage flag,
+  recomposes wallpaper → windows (bottom→top: shadow, frame, title
+  gradient, content blit, resize grip) → cursor sprite into a
+  backbuffer, then pushes one full-screen blit to the FB (no flicker,
+  no save-under).
+- **Window manager (in the mouse IRQ path):** click = focus + raise +
+  `vc_focus` (keyboard follows); title-bar drag = move; bottom-right
+  grip drag = wireframe (rubber-band) resize — the surface is
+  reallocated once on release, on the compositor task, never in IRQ
+  context.  Content is not preserved across resize (same policy as
+  pane splits).
+- **Locking:** `state_lock` (WM geometry/z-order/drag — IRQ writer,
+  compositor snapshots under irqsave) and per-window `win->lock`
+  (surface pixels + pointer — shell emit vs. compositor blit vs.
+  resize swap).  The two never nest across actors in opposite order.
+- **Pane interaction:** `vc_screen_suppress(1)` — while the GUI owns
+  the screen, leaf VCs drop their FB rendering (their shells keep
+  running) and Alt-N pane switching is disabled.
+- **PS/2 mouse:** 8042 aux port, IRQ12, 3-byte packets with bit-3
+  sync check, sign extension from byte 0, Y-axis flipped to screen
+  convention.  Listener interface (`mouse_set_listener`) mirrors the
+  keyboard pipeline so a USB HID mouse can slot in later.
+- **Known limits (deferred):** widget toolkit (buttons/labels — PLAN
+  §M22 stage 6) not started; no window close / minimize; no per-window
+  damage rects (full recompose per frame); resized windows stay blank
+  until the shell prints again; no Alt-Tab; cursor is IRQ-latency
+  bound (one tick worst case).
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -1597,6 +1657,24 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-03 — M22: GUI infrastructure — compositor + windows + mouse.**
+  New `kernel/gui/` subsystem (gfx primitives + surfaces, compositor,
+  window manager, terminal windows) and a PS/2 aux-port mouse driver
+  (IRQ12).  `gui` shell command starts a compositor task, two shell
+  windows on a gradient wallpaper with drop shadows; mouse click
+  focuses + raises, title-bar drag moves, grip drag resizes
+  (wireframe + realloc on release); keyboard follows focus via the
+  existing VC rings.  `struct vc` gained an `emit` hook
+  (`vc_create_offscreen`) so windows host stock shell tasks with zero
+  shell.c changes, and `vc_screen_suppress` keeps hidden panes from
+  painting over the scene.  The Wayland-reuse evaluation ran first
+  (see PLAN change log 2026-07-03): custom in-kernel protocol with
+  Wayland-shaped objects now, wire protocol deferred to §M26 behind
+  the §M25 userland substrate.  Verified on i386 AND x86_64 in QEMU
+  via monitor-scripted sendkey/mouse_move + screendump (both archs:
+  windows, focus click, drag; i386 additionally: typing into focused
+  window, drag-move, rubber-band resize).  Deferred: widget toolkit
+  (§M22 stage 6), window close, per-window damage rects.
 - **2026-06-30 — Polish round 2: M18.6.5 + M19.5.1 + M19.5.3 + M20.6.2 + M20.6.3.**
   Five more polish sub-items shipped, leaving §M20.6.1 (SYSCALL/SYSRET —
   GDT slot reorg) as the lone outstanding item from the original 11.
