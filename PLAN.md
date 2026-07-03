@@ -45,6 +45,8 @@
 | §M20.6 | x86_64 closure (SYSCALL/SYSRET, USB/blk DMA) | ~1200 |
 | §M21 | ARM (aarch64) port | ~1260 |
 | §M22 | GUI infrastructure — ✅ shipped (see DOCS §4.13) | ~1405 |
+| §M22.2 | GUI modularity — desktop-shell interface, app registry, docs | ~1475 |
+| §M22.3 | Desktop polish — task manager, task_kill, minimize, Alt-Tab | ~1545 |
 | §M23 | Audio subsystem | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) | ~1080 |
 | §M25 | Userland foundation (Wayland prerequisites) | ~1545 |
@@ -164,6 +166,8 @@ what); a session can pick a theme and push on it.
 | M20.6 | x86_64 closure — SYSCALL/SYSRET, xHCI + virtio-blk 64-bit DMA | Architecture | §M20.6 |
 | M21 | ARM (aarch64 generic / RPi) port                | Architecture     | §M21    |
 | M22 | GUI infrastructure — compositor, windows, mouse, widgets, taskbar, file manager | UX | ✅ DOCS §4.13 |
+| M22.2 | GUI modularity — swappable desktop shell + app registry + GUI dev docs | UX | §M22.2 |
+| M22.3 | Desktop polish — task manager, task_kill, term-window close, minimize, Alt-Tab, damage rects | UX | §M22.3 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | §M25 |
@@ -1453,10 +1457,107 @@ backing store), file manager (browse/MkDir/Touch/Del/View —
   before `irq_install(12)` — 0xFA passes the packet sync check
   (bit 3 set) and would shift every packet by one byte.
 
-**Deferred follow-ups:** window minimize; terminal-window close
-(needs task kill); per-window damage rects (today: full recompose per
-damage flag); Alt-Tab; USB HID mouse; TrueType-ish font layer; widget
-nesting/containers.
+**Deferred follow-ups:** → collected into §M22.2 (modularity + docs)
+and §M22.3 (desktop polish + task manager); USB HID mouse and the
+TrueType-ish font layer remain free-floating follow-ups.
+
+---
+
+## §M22.2 — GUI modularity: desktop-shell interface + app registry + docs
+
+**Why:** M22/M22.1 shipped as a monolith — the taskbar, Start menu
+and app launch paths are welded into gui.c (hardcoded action enum,
+`extern fileman_open()`).  That violates two of our own north-star
+rules: #2 (components self-register, nothing is hand-wired into a
+core file) and #5 (stable interfaces from day one).  The goal is the
+Linux shape: the desktop (à la Cinnamon/Xfce) and the apps (file
+manager, etc.) are REPLACEABLE registrations, not compositor
+internals.  Cut the interfaces now, while there are two apps — not
+after ten.
+
+**Design — staged.**
+
+1. **`GUI_APP(name, launch_fn)` registry** — linker-section
+   self-registration, same pattern as `MODULE()` (section
+   `gui_apps`, boundary symbols, natural alignment — reuse the
+   MODULE lesson about section stride).  The Start menu enumerates
+   the section instead of the hardcoded enum; fileman.c becomes
+   `GUI_APP("File Manager", fileman_open)`.  Swapping the file
+   manager = linking a different .c that registers the same name.
+   "New Shell" becomes a registered app too; only the power actions
+   (Reboot / Shut Down) stay system menu items.
+2. **`struct desktop_shell` interface** — name + callbacks:
+   `init(w,h)`, `work_area(out rect)`, `draw_chrome(backbuffer)`,
+   `click(x,y) → consumed`, `pointer_moved(x,y)` (hover),
+   `second_tick()` (clock).  Registered via a `DESKTOP_SHELL()`
+   macro; the active one is picked by the `gui.shell` config key
+   (config store + `setconf` already exist).  The current Vista-like
+   taskbar/menu moves out of gui.c into `kernel/gui/shell_vista.c`
+   as the default registration.
+3. **File split** so the layers are visible in the tree:
+   gui.c keeps compositor + WM core (windows, z-order, input
+   routing, damage); shell_vista.c is chrome; widget.c / gfx.c
+   unchanged; apps under kernel/gui/apps/.
+4. **Prove the swap** — a second, minimal `shell_bare` registration
+   (wallpaper only, no chrome; apps launchable via a new `launch
+   <app>` shell command that walks the registry).  DoD is the swap
+   actually happening, not the interface existing.
+5. **Documentation** — new DOCS.md section "GUI architecture &
+   writing apps/shells": layer diagram, the IRQ-vs-compositor-task
+   threading rules, a 10-line hello-world app walkthrough, a
+   desktop-shell how-to.
+
+**Definition of done:**
+- fileman launches from the registry; gui.c has no `extern` to any
+  app and no app enum.
+- `setconf gui.shell bare` + `gui` boots the bare shell;
+  default stays vista.
+- A sample hello app registers itself and appears in the Start menu
+  with zero gui.c changes.
+- DOCS.md gains the GUI-development chapter.
+
+## §M22.3 — Desktop polish: task manager + window lifecycle
+
+**Why:** the M22.1 deferred list, promoted to a proper milestone,
+plus the first "real" system app (task manager).  The common
+prerequisite is task lifecycle support in the scheduler.
+
+**Design — staged.**
+
+1. **`task_kill(pid)` (scheduler prereq)** — first cut restricted to
+   tasks parked in an interruptible wait (the vc_getchar/hlt+yield
+   loop): mark DEAD, remove from runqueue, reap kstack + unbind
+   VC/out_console from a reaper pass.  Killing a lock-holder is out
+   of scope — document the restriction.
+2. **Per-task CPU accounting** — `task->cpu_ms` bumped by the
+   scheduler on switch-out; feeds the task manager's CPU column
+   (and `ps` for free).
+3. **Task manager app** (`GUI_APP`) — listview of pid / state / CPU
+   time / name via task_for_each, auto-refresh on the shell's
+   second-tick, "End task" button → task_kill with a guard list
+   (pid 0, idle, compositor).
+4. **Terminal-window close** — X button on terminal windows too:
+   task_kill the shell, free the VC slot (needs `vc_destroy`; the
+   VC table currently never frees), then normal window teardown.
+5. **Minimize** — window `hidden` flag skipped by compositor +
+   hit-test; the taskbar button toggles restore.
+6. **Alt-Tab** — needs a keycode-level intercept: today's pipeline
+   delivers ASCII only, so extend the keyboard path to expose
+   modifier+key combos to the GUI hook before keymap translation.
+7. **Per-window damage rects** — compositor keeps a dirty-rect
+   union per frame and recomposes only that region; add a debug
+   counter (full vs. partial frames) to prove it works.
+8. **Widget containers (stretch)** — a simple vbox/hbox layout
+   helper if the task manager layout code gets ugly without it.
+
+**Definition of done:**
+- Task manager lists live tasks with CPU time and successfully
+  kills a `loop` hog; guarded tasks refuse politely.
+- Terminal window X closes the window AND its shell task; the VC
+  slot is reusable afterwards.
+- Minimize/restore via taskbar works; Alt-Tab cycles windows.
+- Damage-rect counter shows partial frames dominating during
+  typing.
 
 ---
 
@@ -1639,6 +1740,14 @@ subsurfaces beyond the minimum xdg_shell needs, XWayland.
 
 ## Change log
 
+- **2026-07-04** — Modularity review of the GUI: gfx/widget/fileman
+  are clean layers, but the desktop chrome + app launching are welded
+  into gui.c (hardcoded menu enum, extern fileman_open) — violates
+  north-star #2/#5.  Added §M22.2 (swappable desktop-shell interface
+  + GUI_APP registry + GUI dev docs) and §M22.3 (desktop polish:
+  task manager + task_kill + per-task CPU accounting, terminal-window
+  close + vc_destroy, minimize, Alt-Tab, damage rects — the M22.1
+  deferred list promoted to a milestone).  No code changed.
 - **2026-07-04** — §M22 stage 6 closed (M22.1): widget toolkit,
   Vista-shaped taskbar (Start menu / window buttons / RTC clock),
   file manager, content-preserving resize, `vfs_unlink`, 1280×800.

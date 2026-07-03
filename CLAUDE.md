@@ -50,6 +50,12 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   but PMM still has a single zone set.
 - **§M20.6.1** — SYSCALL/SYSRET instruction path (needs GDT slot
   reorg to satisfy SYSRET's selector arithmetic).
+- **§M22.2** — GUI modularity: swappable desktop shell (à la
+  Cinnamon/Xfce) via `DESKTOP_SHELL()` + `GUI_APP()` registries
+  (MODULE() pattern), gui.c split, GUI dev docs chapter.
+- **§M22.3** — Desktop polish: task manager app, task_kill +
+  per-task CPU accounting, terminal-window close (vc_destroy),
+  minimize, Alt-Tab, per-window damage rects.
 
 🔲 **PLAN extensions (placeholders, design only):**
 - §M23 — Audio subsystem (AC97 → HDA → I2S).
