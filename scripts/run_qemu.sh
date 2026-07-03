@@ -24,7 +24,15 @@ if [ ! -f "$ISO" ]; then
 fi
 
 if command -v "$QEMU" >/dev/null 2>&1; then
-    exec "$QEMU" -cdrom "$ISO"
+    # -rtc base=localtime: the GUI taskbar clock reads the CMOS RTC;
+    #   without this QEMU feeds it UTC.
+    # cocoa,zoom-to-fit (macOS): make the guest display scale with the
+    #   window — on a Retina panel the raw 1280x800 window is tiny.
+    EXTRA=""
+    if [ "$(uname -s)" = "Darwin" ]; then
+        EXTRA="-display cocoa,zoom-to-fit=on"
+    fi
+    exec "$QEMU" -rtc base=localtime $EXTRA -cdrom "$ISO"
 fi
 
 echo "$QEMU not found on host; running headless inside Docker." >&2

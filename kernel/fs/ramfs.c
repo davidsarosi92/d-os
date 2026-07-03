@@ -104,11 +104,26 @@ static int rfs_mkdir_op(struct inode* dir, const char* name,
     return 0;
 }
 
+static int rfs_unlink_op(struct inode* dir, const char* name,
+                         struct inode* child) {
+    (void)dir; (void)name;           /* emptiness checked by vfs_unlink */
+    if (!child) return -1;
+    if (child->type == INODE_FILE) {
+        struct ramfs_file* rf = (struct ramfs_file*)child->private;
+        if (rf) {
+            if (rf->data) kfree(rf->data);
+            kfree(rf);
+        }
+    }
+    kfree(child);
+    return 0;
+}
+
 static const struct inode_ops ramfs_inode_ops = {
     .lookup = NULL,                  /* eager tree */
     .create = rfs_create_op,
     .mkdir  = rfs_mkdir_op,
-    .unlink = NULL,                  /* not yet — VFS doesn't expose it */
+    .unlink = rfs_unlink_op,         /* M22.1 — file manager Delete */
 };
 
 /* ------------------------------------------------------------------- */

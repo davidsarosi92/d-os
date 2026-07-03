@@ -360,7 +360,13 @@ struct vc* vc_split(struct vc* v, enum vc_split_dir dir) {
  * Input ring.
  * --------------------------------------------------------------------------- */
 
+/* M22.1: optional IRQ-side intercept — see vc.h. */
+static int (*kbd_hook)(char c) = NULL;
+
+void vc_set_kbd_hook(int (*fn)(char c)) { kbd_hook = fn; }
+
 void vc_kbd_push(char c) {
+    if (kbd_hook && kbd_hook(c)) return;        /* consumed by the GUI */
     struct vc* v = focused;             /* snapshot — pointer-sized atomic */
     if (!v) return;
     uint32_t next = (v->in_head + 1) & VC_INBUF_MASK;

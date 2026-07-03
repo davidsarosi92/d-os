@@ -369,3 +369,33 @@ static int vfs_mutator(const char* path, int is_dir) {
 
 int vfs_create(const char* path) { return vfs_mutator(path, 0); }
 int vfs_mkdir (const char* path) { return vfs_mutator(path, 1); }
+
+/* Remove `path` (file or empty dir).  The fs op frees the inode; we
+ * then detach + free the dentry.  Mount roots refuse removal because
+ * their parent belongs to a different fs (dir_ops mismatch would
+ * corrupt the foreign inode's accounting). */
+int vfs_unlink(const char* path) {
+    char buf[256];
+    const char* last;
+    if (split_parent(path, buf, sizeof buf, &last) != 0) return -1;
+    if (!*last) return -1;
+
+    struct dentry* parent = resolve_path(buf, NULL, NULL);
+    if (!parent || !parent->inode || parent->inode->type != INODE_DIR) return -1;
+    if (!parent->inode->dir_ops || !parent->inode->dir_ops->unlink)    return -1;
+
+    /* Find the child dentry + keep the link BEFORE it for splicing. */
+    struct dentry** link = &parent->children;
+    struct dentry*  d    = parent->children;
+    while (d && !streq(d->name, last)) { link = &d->sibling; d = d->sibling; }
+    if (!d || !d->inode) return -1;
+    if (d->inode->type == INODE_DIR && d->children) return -2;   /* not empty */
+    if (d->inode->type == INODE_DEVICE) return -1;               /* devfs nodes */
+
+    int r = parent->inode->dir_ops->unlink(parent->inode, last, d->inode);
+    if (r != 0) return r;
+
+    *link = d->sibling;                          /* splice out of the tree */
+    kfree(d);
+    return 0;
+}

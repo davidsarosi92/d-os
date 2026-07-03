@@ -71,8 +71,8 @@ header_start:
     dw 5            ; type: framebuffer
     dw 0            ; flags
     dd 20           ; size
-    dd 1024         ; width
-    dd 768          ; height
+    dd 1280         ; width
+    dd 800          ; height
     dd 32           ; depth
 
     ; End tag — required terminator.  type=0, flags=0, size=8.

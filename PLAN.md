@@ -163,7 +163,7 @@ what); a session can pick a theme and push on it.
 | M20.5 | x64 SMP + APIC + ring-3 (int 0x80) — Phase A/B/C | Architecture | ✅ §M20.5 |
 | M20.6 | x86_64 closure — SYSCALL/SYSRET, xHCI + virtio-blk 64-bit DMA | Architecture | §M20.6 |
 | M21 | ARM (aarch64 generic / RPi) port                | Architecture     | §M21    |
-| M22 | GUI infrastructure — compositor, windows, mouse (widget toolkit deferred) | UX | ✅ DOCS §4.13 |
+| M22 | GUI infrastructure — compositor, windows, mouse, widgets, taskbar, file manager | UX | ✅ DOCS §4.13 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | §M25 |
@@ -1423,8 +1423,15 @@ model); the wire protocol is §M26, its prerequisites are §M25.
 
 **DOD status:** two windows each with its own shell ✅ · mouse cursor
 + click-to-focus ✅ · drag-resize ✅ (wireframe + realloc on release) ·
-DOCS GUI chapter ✅ · Wayland eval recorded ✅.  **Stage 6 (widget
-toolkit) deferred** — first needed by a non-terminal client.
+DOCS GUI chapter ✅ · Wayland eval recorded ✅ · **stage 6 widget
+toolkit ✅ (M22.1, 2026-07-04)** — label/button/listview/textinput,
+IRQ→task event dispatch, first client = the file manager.
+
+**M22.1 follow-up (shipped 2026-07-04, see DOCS §4.13):** Vista-shaped
+taskbar (Start menu, per-window buttons, CMOS-RTC clock), APP window
+kind with close button, content-preserving resize (terminal char
+backing store), file manager (browse/MkDir/Touch/Del/View —
+`vfs_unlink` + ramfs unlink landed for Del), 1280×800 FB.
 
 **Lessons learned:**
 
@@ -1446,9 +1453,10 @@ toolkit) deferred** — first needed by a non-terminal client.
   before `irq_install(12)` — 0xFA passes the packet sync check
   (bit 3 set) and would shift every packet by one byte.
 
-**Deferred follow-ups:** widget toolkit (stage 6); window close /
-minimize; per-window damage rects (today: full recompose per damage
-flag); Alt-Tab; USB HID mouse; TrueType-ish font layer.
+**Deferred follow-ups:** window minimize; terminal-window close
+(needs task kill); per-window damage rects (today: full recompose per
+damage flag); Alt-Tab; USB HID mouse; TrueType-ish font layer; widget
+nesting/containers.
 
 ---
 
@@ -1631,6 +1639,10 @@ subsurfaces beyond the minimum xdg_shell needs, XWayland.
 
 ## Change log
 
+- **2026-07-04** — §M22 stage 6 closed (M22.1): widget toolkit,
+  Vista-shaped taskbar (Start menu / window buttons / RTC clock),
+  file manager, content-preserving resize, `vfs_unlink`, 1280×800.
+  See DOCS.md §4.13 + change log.
 - **2026-07-03** — §M22 shipped (compositor, window manager, terminal
   windows, PS/2 mouse; widget toolkit deferred).  Section condensed
   to a pointer at DOCS.md §4.13 + lessons learned.

@@ -135,4 +135,11 @@ struct vc* vc_create_offscreen(void (*emit)(void* ctx, char c), void* ctx);
 void vc_screen_suppress(int on);
 int  vc_screen_suppressed(void);
 
+/* Keyboard intercept (M22.1).  Both keyboard drivers (PS/2, USB HID)
+ * funnel decoded chars through vc_kbd_push; when a hook is installed
+ * and returns non-zero, the byte is consumed BEFORE reaching the
+ * focused VC's ring.  The GUI uses this to route typing to widget
+ * (non-terminal) windows.  Runs in IRQ context — keep it short. */
+void vc_set_kbd_hook(int (*fn)(char c));
+
 #endif

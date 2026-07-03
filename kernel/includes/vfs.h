@@ -118,7 +118,12 @@ struct inode_ops {
     int (*lookup)(struct inode* dir, const char* name, struct inode** out);
     int (*create)(struct inode* dir, const char* name, struct inode** out);
     int (*mkdir) (struct inode* dir, const char* name, struct inode** out);
-    int (*unlink)(struct inode* dir, const char* name);
+    /* `child` is the inode being removed — passed in because eager-tree
+     * filesystems (ramfs) have no private name index to look it up by;
+     * the VFS resolves the dentry anyway.  The fs frees its private
+     * data + the inode; the VFS frees the dentry.  (Signature fixed in
+     * M22.1 when the first implementation landed.) */
+    int (*unlink)(struct inode* dir, const char* name, struct inode* child);
 };
 
 /* Inode — owned by the fs that created it.  `private` is fs-defined. */
@@ -191,6 +196,12 @@ int     vfs_readdir(struct file* f, struct dirent* out);
  * They dispatch through `parent_inode->dir_ops`. */
 int  vfs_mkdir(const char* path);
 int  vfs_create(const char* path);          /* zero-byte regular file */
+
+/* Remove a regular file or an EMPTY directory.  Returns 0 on success,
+ * -1 on resolve/ops failure, -2 if the directory is not empty.
+ * Caveat (single-user teaching kernel): open file handles to the
+ * removed inode are NOT tracked — close them first. */
+int  vfs_unlink(const char* path);
 
 /* Internal helper exposed for filesystems implementing `mount` and
  * lazy `lookup`: attach a freshly-allocated dentry+inode pair under an

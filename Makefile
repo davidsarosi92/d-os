@@ -150,6 +150,9 @@ CORE_C_SRCS := \
     kernel/core/vc.c \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
+    kernel/gui/widget.c \
+    kernel/gui/fileman.c \
+    kernel/drivers/rtc/cmos_rtc.c \
     kernel/drivers/mouse/ps2_mouse.c \
     kernel/core/keymap.c \
     kernel/core/layouts.c \
@@ -197,6 +200,9 @@ CORE_C_SRCS := \
     kernel/core/vc.c \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
+    kernel/gui/widget.c \
+    kernel/gui/fileman.c \
+    kernel/drivers/rtc/cmos_rtc.c \
     kernel/drivers/mouse/ps2_mouse.c \
     kernel/core/keymap.c \
     kernel/core/layouts.c \

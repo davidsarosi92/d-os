@@ -1528,13 +1528,17 @@ M20 change-log entries):**
 
 ---
 
-### 4.13 GUI — compositor, window manager, terminal windows (M22)
+### 4.13 GUI — compositor, WM, taskbar, widgets, file manager (M22 + M22.1)
 
 Files: `kernel/gui/gfx.c` + `gfx.h` (primitives + surfaces),
-`kernel/gui/gui.c` + `gui.h` (compositor + WM + terminal windows),
-`kernel/drivers/mouse/ps2_mouse.c` + `mouse.h` (pointer input).
+`kernel/gui/gui.c` + `gui.h` (compositor + WM + taskbar + windows),
+`kernel/gui/widget.c` + `widget.h` (widget toolkit),
+`kernel/gui/fileman.c` (file manager app),
+`kernel/drivers/mouse/ps2_mouse.c` + `mouse.h` (pointer input),
+`kernel/drivers/rtc/cmos_rtc.c` + `rtc.h` (taskbar clock source).
 Arch-independent (pure C on the 32-bpp linear FB); works on i386 and
-x86_64.  Started from any shell with the `gui` command.
+x86_64 at 1280×800 (requested via the multiboot headers).  Started
+from any shell with the `gui` command.
 
 - **Object model is Wayland-shaped by design** (per the 2026-07-03
   §M22 evaluation): a window owns an off-screen content *surface*,
@@ -1579,11 +1583,48 @@ x86_64.  Started from any shell with the `gui` command.
   sync check, sign extension from byte 0, Y-axis flipped to screen
   convention.  Listener interface (`mouse_set_listener`) mirrors the
   keyboard pipeline so a USB HID mouse can slot in later.
-- **Known limits (deferred):** widget toolkit (buttons/labels — PLAN
-  §M22 stage 6) not started; no window close / minimize; no per-window
-  damage rects (full recompose per frame); resized windows stay blank
-  until the shell prints again; no Alt-Tab; cursor is IRQ-latency
-  bound (one tick worst case).
+- **Widget toolkit (M22.1, PLAN §M22 stage 6):** flat per-window
+  widget list, each widget a struct with `struct widget` as first
+  member (label, button, listview with scroll strip + selection +
+  double-click activate, single-line textinput with caret + Enter
+  submit).  Callbacks run on the COMPOSITOR task, never in IRQ: the
+  mouse IRQ enqueues content-relative click events (SPSC ring) and
+  the keyboard hook (`vc_set_kbd_hook`) diverts typing to a key queue
+  whenever the focused window is an APP window — so widget code may
+  freely use the VFS, kmalloc, or open new windows.
+- **Two window kinds:** TERMINAL (shell via offscreen VC) and APP
+  (widgets; gets a close X button — teardown runs on the compositor
+  task, freeing widgets + surface + app ctx, with an optional
+  on_close hook for app singletons).
+- **Taskbar (Vista-shaped, M22.1):** 34 px strip always on top —
+  green Start button, one button per open window (click = focus +
+  raise; focused one highlighted), RTC clock (HH:MM:SS) on the right
+  that repaints once per second.  The Start menu (File Manager / New
+  Shell / About d-os / Reboot / Shut Down) is a compositor-drawn
+  overlay with hover tracking; item clicks are queued as actions and
+  executed on the compositor task (reboot/shutdown call the same HAL
+  entries as the shell commands).
+- **Content-preserving resize (M22.1):** terminal windows keep a
+  character backing store (`cells[]`, sized for the largest grid) and
+  re-render it into the new surface on resize — if the grid shrinks
+  below the cursor row the store scrolls so the tail stays visible.
+  App windows re-run their `on_layout` + widget redraw.  Resize stays
+  wireframe-style (rubber band, one realloc on release).
+- **File manager (`fileman.c`):** singleton app window — path label,
+  Up / MkDir / Touch / Del / View buttons, directory listview
+  (single-click select, double-click descend/open), name textinput
+  (Enter = create file), status line.  Del uses `vfs_unlink` (new in
+  M22.1: VFS-level unlink + ramfs implementation, files and empty
+  dirs; exFAT still refuses).  View opens a read-only viewer window
+  (first 8 KiB, line-split into a listview).
+- **CMOS RTC (`cmos_rtc.c`):** MC146818 read with update-in-progress
+  double-read guard, BCD + 12h handling.  QEMU is fed
+  `-rtc base=localtime` by run_qemu.sh so the clock matches the host.
+- **Known limits (deferred):** no window minimize; no per-window
+  damage rects (full recompose per frame); no Alt-Tab; no widget
+  nesting/containers; terminal windows have no close button (their
+  shell task would leak — needs task kill support); cursor is
+  IRQ-latency bound (one tick worst case).
 
 ---
 
@@ -1657,6 +1698,25 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-04 — M22.1: widget toolkit + taskbar + file manager + resize fix.**
+  PLAN §M22 stage 6 closed plus a Vista-shaped desktop shell.  New:
+  `kernel/gui/widget.c` (label/button/listview/textinput; callbacks
+  dispatched on the compositor task via IRQ→task event/key/action
+  queues), APP window kind with close button + teardown, taskbar
+  (Start menu, per-window buttons, RTC clock via new
+  `kernel/drivers/rtc/cmos_rtc.c`), file manager
+  (`kernel/gui/fileman.c`: browse / Up / MkDir / Touch / Del / View
+  with read-only viewer), content-preserving resize (terminal char
+  backing store re-rendered into the new surface; app windows
+  re-layout), `vfs_unlink` + ramfs unlink (inode_ops.unlink signature
+  gained the child inode), `vc_set_kbd_hook` keyboard intercept,
+  1280×800 framebuffer (multiboot headers) + run_qemu.sh
+  `-rtc base=localtime` and macOS `zoom-to-fit` so the QEMU window is
+  usable on Retina.  Verified in QEMU i386 (9-step scripted run:
+  taskbar focus, typing, content-preserving resize, Start menu, file
+  create + delete, close via X) and x86_64 (Start menu → File
+  Manager).  Deferred: minimize, Alt-Tab, per-window damage rects,
+  terminal-window close (needs task kill).
 - **2026-07-03 — M22: GUI infrastructure — compositor + windows + mouse.**
   New `kernel/gui/` subsystem (gfx primitives + surfaces, compositor,
   window manager, terminal windows) and a PS/2 aux-port mouse driver
