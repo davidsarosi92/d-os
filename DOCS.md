@@ -1656,6 +1656,34 @@ from any shell with the `gui` command.
   the new gui_window_set_tick hook, "End task" button → task_kill
   (compositor guarded by name; pid 0 + idles refused by task_kill).
   CLI siblings: `kill <pid>`, and `ps` grew a CPUMS column.
+- **Compositor smoothness (M22.4):** three stacked artifacts fixed /
+  bounded.  (1) *Cursor-damage race:* compose() snapshots the damage
+  rect BEFORE the WM state, so an IRQ-submitted cursor rect could be
+  older than the cursor position actually drawn — erase and redraw
+  landed in different frames (flicker/ghosting on glide).  Now the
+  compositor keeps `last_cur_x/y` (where it LAST DREW the sprite) and
+  unions both the previous and the fresh cursor rects into the clip
+  region itself; a pointer glide from the IRQ is a bare `need_frame`
+  wake with no rects.  (2) *Drag damage:* a DRAG_MOVE motion damages
+  only old-rect ∪ new-rect (with the shadow margin) instead of
+  `gui_damage_all()` per motion event — dragging stays on the
+  partial-frame path (verified: 52 partial / 5 full over a scripted
+  glide+drag).  Press/release and the resize rubber band keep the
+  full recompose (rare, z-order/focus changes).  (3) *Tearing:*
+  QEMU std-VGA has no vblank/present boundary, so a large blit can
+  shear mid-scanout — not fixable on this device, but (1)+(2) shrink
+  typical blits below perception.  A real fix is a flush-capable
+  display (virtio-gpu, candidate post-M24).
+- **Task lifecycle → Task Manager (M22.4):** `task_set_change_hook`
+  (task.h) fires on spawn/kill/exit/reap; the GUI installs a hook
+  that makes the compositor run every window's on_tick immediately,
+  so a closed/killed program leaves the Task Manager list within one
+  frame instead of at the next 1 Hz beat.  Each taskman refresh also
+  starts with an opportunistic reap pass: DEAD tasks not bound to any
+  VC (`vc_task_bound`) are `task_reap`ed, so closed programs drop off
+  the list instead of accumulating as DEAD rows.  VC-bound DEAD tasks
+  (a pane shell killed by hand) stay listed on purpose — their
+  vc->task pointer is still owned by the pane/window teardown path.
 - **Known limits (deferred):** no widget nesting/containers; killing
   a CPU-bound kernel thread requires it to poll task_should_stop()
   (the kthread contract — forced kill needs ring-3 processes, §M25);
@@ -1790,6 +1818,21 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-04 — M22.4: compositor smoothness + instant Task Manager.**
+  Cursor flicker/ghosting fixed by moving cursor damage bookkeeping
+  into compose() itself (`last_cur_x/y`; the mouse-IRQ glide path is a
+  bare need_frame wake — lesson learned: the damage snapshot happens
+  before the WM snapshot, so IRQ-side cursor rects can be stale).
+  Window drags damage old∪new rect per motion instead of full-screen
+  recompose (drag stays partial-frame dominated: 52:5 in the scripted
+  test); tearing documented as std-VGA-inherent (no vblank; virtio-gpu
+  flush is the post-M24 answer).  New `task_set_change_hook` fires on
+  spawn/kill/exit/reap → the compositor runs window on_ticks
+  immediately, so closed programs leave the Task Manager within one
+  frame; taskman refresh opportunistically task_reap()s DEAD tasks not
+  bound to a VC (new `vc_task_bound`), so DEAD rows no longer
+  accumulate.  Verified in QEMU i386 (scripted glide + drag +
+  `gui stats`); x86_64 builds clean.
 - **2026-07-04 — M22.3: task manager + window lifecycle + damage rects.**
   Scheduler: task_kill/task_should_stop/task_reap (cooperative
   kthread_stop contract — spinlocks don't disable preemption here, so

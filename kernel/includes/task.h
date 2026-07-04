@@ -195,6 +195,15 @@ int  task_should_stop(void);
  * yet, or still current on some CPU (caller retries later). */
 int  task_reap(int pid);
 
+/* M22.4 — task-lifecycle change notification.  The hook fires (from
+ * whatever context mutated the task set: spawn, kill, exit, reap —
+ * possibly IRQ or the dying task itself) whenever the task list or a
+ * task's liveness changed.  Keep it trivial: set a flag, wake a
+ * consumer.  One consumer today: the GUI compositor uses it to refresh
+ * the Task Manager within one frame of a program closing instead of
+ * waiting for the 1 Hz tick.  Pass NULL to uninstall. */
+void task_set_change_hook(void (*fn)(void));
+
 /* M18.6.3 — set / get task affinity.  Mask of allowed CPU bits;
  * passing 0 is rejected (would mean "may run nowhere").  If the
  * caller restricts a task off its current home CPU, the scheduler

@@ -111,6 +111,13 @@ char vc_getchar(struct vc* v);
  * if no VC is focused or the ring is full.  Lock-free under SPSC. */
 void vc_kbd_push(char c);
 
+/* M22.4 — non-zero if any VC (pane or offscreen) has a shell task with
+ * this pid bound to it.  The GUI task manager consults this before
+ * opportunistically task_reap()ing a DEAD task: a VC-bound task struct
+ * is still referenced by its window/pane teardown path (vc->task), so
+ * reaping it here would leave a dangling pointer behind. */
+int  vc_task_bound(int pid);
+
 /* Iterate every leaf VC.  Used by the `pane` shell command. */
 typedef void (*vc_iter_fn)(struct vc* v, void* ctx);
 void vc_for_each(vc_iter_fn fn, void* ctx);

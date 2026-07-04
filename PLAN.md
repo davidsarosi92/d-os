@@ -170,7 +170,7 @@ what); a session can pick a theme and push on it.
 | M22 | GUI infrastructure — compositor, windows, mouse, widgets, taskbar, file manager | UX | ✅ DOCS §4.13 |
 | M22.2 | GUI modularity — swappable desktop shell + app registry + GUI dev docs | UX | ✅ DOCS §4.14 |
 | M22.3 | Desktop polish — task manager, task_kill, term-window close, minimize, Alt-Tab, damage rects | UX | ✅ DOCS §4.13 |
-| M22.4 | Compositor smoothness — cursor-damage race, rect-bounded drag, tearing mitigation | UX | §M22.4 |
+| M22.4 | Compositor smoothness — cursor-damage race, rect-bounded drag, tearing mitigation | UX | ✅ DOCS §4.13 |
 | M22.5 | Desktop apps — text editor, BASIC interpreter, file manager 2.0, maximize/restore | UX | §M22.5 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
@@ -1538,52 +1538,21 @@ manual layout stayed readable without them).
 
 ## §M22.4 — Compositor smoothness: cursor race, drag damage, tearing
 
-**Why:** live use shows the scene "swimming" during drags and the
-cursor flickering/ghosting when glided over contrasting objects.
-Diagnosed 2026-07-04; three stacked causes, two of them ours.
+**Shipped 2026-07-04, see DOCS.md §4.13.**  Cursor-damage race fixed
+with compositor-side cursor bookkeeping (compose() unions the
+last-drawn + fresh cursor rects itself; IRQ glide = bare need_frame
+wake); DRAG_MOVE damages old∪new rect per motion (drag stays
+partial-frame dominated, 52:5 in the scripted test); tearing noted as
+std-VGA-inherent (virtio-gpu flush = post-M24 option); program close
+propagates to the Task Manager within one frame (task_set_change_hook
+→ immediate on_tick) and taskman opportunistically reaps DEAD tasks
+not bound to a VC (vc_task_bound).
 
-**Design — three fixes, in impact order.**
-
-1. **Cursor-damage race (the flicker).**  compose() snapshots the
-   damage rect BEFORE the WM state, so the cursor-position snapshot
-   can be newer than the damaged region — the cursor gets erased at
-   its old spot but clipped away at its new one for that frame.
-   Fix: the compositor keeps `last_drawn_cursor_x/y` and always
-   unions BOTH the previously-drawn and the freshly-snapshotted
-   cursor rects into the clip region.  Erase + redraw then happen in
-   the same frame with one consistent position, independent of
-   IRQ-side damage timing.  The IRQ's pointer-glide path shrinks to
-   a bare wake (need_frame) — no more cursor rects from IRQ context.
-2. **Rect-bounded drag damage (the swimming).**  DRAG_MOVE currently
-   raises gui_damage_all() on EVERY motion event — a full 1280×800
-   recompose + ~4 MB unsynced blit per event.  Fix: damage only
-   old-rect ∪ new-rect (with the +5 shadow margin) per motion;
-   press/release keep damage_all (z-order/focus changes are rare).
-   DRAG_RESIZE may keep damage_all first (rubber band is thin but
-   spans the window; optimize only if still visible).
-3. **Tearing (the residue).**  QEMU's std-VGA has no vblank to sync
-   against, so large blits can shear mid-scanout.  Not fully fixable
-   on this device; fixes 1–2 shrink the blits enough that it should
-   drop below perception.  Note the option for later: virtio-gpu
-   with explicit flush gives a real present boundary (candidate for
-   a post-M24 driver).
-4. **Program close propagates to the Task Manager immediately
-   (user report, 2026-07-04).**  Today a closed/killed program only
-   shows up at the next 1 Hz tick, and DEAD entries linger forever
-   unless a window teardown reaps them.  Fix: (a) window close /
-   task_kill raises an immediate taskman refresh (event, not tick);
-   (b) the task manager opportunistically task_reap()s DEAD tasks
-   that are safe to collect (not current on any CPU, not owned by a
-   live window), so closed programs DROP OFF the list instead of
-   accumulating as DEAD rows.
-
-**Definition of done:**
-- Gliding the cursor across window chrome shows no flicker/ghosting
-  (visual check in a live QEMU window, not screendumps).
-- Dragging a window keeps `gui stats` partial-frame dominated.
-- Closing a window updates the Task Manager list within one frame;
-  DEAD entries of closed programs disappear from it.
-- Lessons learned recorded (compose snapshot ordering).
+**Lesson learned:** compose() snapshots the damage rect BEFORE the WM
+state — any IRQ-supplied rect describing "where a moving thing was"
+can be stale by snapshot time.  Damage for compositor-owned artifacts
+(the cursor sprite) must be derived from what the compositor actually
+drew last frame, not from what the IRQ saw.
 
 ## §M22.5 — Desktop apps: editor, BASIC, file manager 2.0, maximize
 

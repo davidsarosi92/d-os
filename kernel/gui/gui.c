@@ -150,6 +150,17 @@ static int gmax_cols = 0, gmax_rows = 0;
 static volatile int need_frame = 0;
 static int gui_active = 0;
 
+/* M22.4 — set by the task-lifecycle hook (any context) and consumed by
+ * the compositor loop: run every window's on_tick NOW instead of at
+ * the next 1 Hz beat, so a closed/killed program vanishes from the
+ * Task Manager within one frame. */
+static volatile int tasks_changed = 0;
+
+static void gui_task_change_hook(void) {
+    tasks_changed = 1;
+    need_frame = 1;
+}
+
 /* M22.3 — damage tracking.  The dirty rect accumulates under
  * damage_lock (nested inside state_lock on the mouse path — never the
  * other way around) and is snapshotted + cleared by compose().  The
@@ -589,6 +600,37 @@ static void draw_cursor(struct gfx_surface* s, int cx, int cy) {
 /* Composition.                                                                */
 /* -------------------------------------------------------------------------- */
 
+/* M22.4 — compositor-side cursor bookkeeping.  Where the cursor was
+ * LAST DRAWN, updated only by compose().  Lesson learned (2026-07-04):
+ * compose() snapshots the damage rect BEFORE the WM state, so an
+ * IRQ-supplied cursor rect can describe an OLDER position than the
+ * (cx,cy) we end up drawing — the cursor got erased at its old spot
+ * but clipped away at its new one for that frame (visible flicker /
+ * ghosting when gliding over contrasting chrome).  The fix: the mouse
+ * IRQ never submits cursor rects at all (a glide is a bare need_frame
+ * wake); compose() itself unions the previously-drawn and the freshly
+ * snapshotted cursor rects into the clip region, so erase + redraw
+ * always happen in the same frame with one consistent position. */
+static int last_cur_x = -100, last_cur_y = -100;
+
+/* Cursor sprite is 11x17 px; ±1 px margin, matching draw position. */
+#define CUR_DMG_X(cx)  ((cx) - 1)
+#define CUR_DMG_Y(cy)  ((cy) - 1)
+#define CUR_DMG_W      14
+#define CUR_DMG_H      20
+
+static void rect_union(int* x0, int* y0, int* x1, int* y1,
+                       int ax0, int ay0, int ax1, int ay1) {
+    if (*x1 <= *x0) {                           /* empty → replace */
+        *x0 = ax0; *y0 = ay0; *x1 = ax1; *y1 = ay1;
+        return;
+    }
+    if (ax0 < *x0) *x0 = ax0;
+    if (ay0 < *y0) *y0 = ay0;
+    if (ax1 > *x1) *x1 = ax1;
+    if (ay1 > *y1) *y1 = ay1;
+}
+
 static void compose(void) {
     /* Snapshot + clear the damage rect first: anything damaged while
      * we paint lands in the NEXT frame. */
@@ -599,14 +641,6 @@ static void compose(void) {
         dmg_x0 = dmg_y0 = dmg_x1 = dmg_y1 = 0;
         spin_unlock_irqrestore(&damage_lock, dfl);
     }
-    if (rx0 < 0) rx0 = 0;
-    if (ry0 < 0) ry0 = 0;
-    if (rx1 > fbsurf.w) rx1 = fbsurf.w;
-    if (ry1 > fbsurf.h) ry1 = fbsurf.h;
-    if (rx1 <= rx0 || ry1 <= ry0) return;       /* spurious wake */
-    int full_frame = (rx0 == 0 && ry0 == 0 &&
-                      rx1 == fbsurf.w && ry1 == fbsurf.h);
-    if (full_frame) frames_full++; else frames_partial++;
 
     struct gui_window* zsnap[GUI_MAX_WINDOWS];
     int   zn;
@@ -632,6 +666,32 @@ static void compose(void) {
     if (dwin) { rx = dwin->x; ry = dwin->y; }
     fsnap = focused_win;
     spin_unlock_irqrestore(&state_lock, fl);
+
+    /* M22.4 — cursor rects come from HERE, not from the IRQ: union the
+     * previously-drawn and the just-snapshotted cursor positions so the
+     * erase and the redraw are guaranteed to land in the same frame. */
+    int cur_moved = (cx != last_cur_x || cy != last_cur_y);
+    if (rx1 <= rx0 && !cur_moved) return;       /* spurious wake */
+    if (cur_moved || rx1 > rx0) {
+        rect_union(&rx0, &ry0, &rx1, &ry1,
+                   CUR_DMG_X(last_cur_x), CUR_DMG_Y(last_cur_y),
+                   CUR_DMG_X(last_cur_x) + CUR_DMG_W,
+                   CUR_DMG_Y(last_cur_y) + CUR_DMG_H);
+        rect_union(&rx0, &ry0, &rx1, &ry1,
+                   CUR_DMG_X(cx), CUR_DMG_Y(cy),
+                   CUR_DMG_X(cx) + CUR_DMG_W,
+                   CUR_DMG_Y(cy) + CUR_DMG_H);
+    }
+    last_cur_x = cx;  last_cur_y = cy;
+
+    if (rx0 < 0) rx0 = 0;
+    if (ry0 < 0) ry0 = 0;
+    if (rx1 > fbsurf.w) rx1 = fbsurf.w;
+    if (ry1 > fbsurf.h) ry1 = fbsurf.h;
+    if (rx1 <= rx0 || ry1 <= ry0) return;       /* off-screen cursor twitch */
+    int full_frame = (rx0 == 0 && ry0 == 0 &&
+                      rx1 == fbsurf.w && ry1 == fbsurf.h);
+    if (full_frame) frames_full++; else frames_partial++;
 
     /* Everything below is confined to the dirty rect by the clip box —
      * a partial frame only touches (and finally blits) that region. */
@@ -689,6 +749,13 @@ static void compose(void) {
 
     draw_cursor(&backsurf, cx, cy);
     gfx_clear_clip(&backsurf);
+    /* M22.4 tearing note: QEMU's std-VGA exposes no vblank / present
+     * boundary, so this blit can shear mid-scanout when it is large.
+     * Not fully fixable on this device — the cursor + drag damage fixes
+     * shrink the typical blit far enough that the residue sits below
+     * perception.  A real fix needs a flush-capable display (virtio-gpu
+     * with explicit VIRTIO_GPU_CMD_RESOURCE_FLUSH is the candidate,
+     * post-M24). */
     gfx_blit(&fbsurf, rx0, ry0, &backsurf, rx0, ry0, rx1 - rx0, ry1 - ry0);
 }
 
@@ -837,6 +904,16 @@ static void gui_compositor_main(void) {
                     windows[i].on_tick(&windows[i]);
         }
 
+        /* M22.4: task set changed (spawn/kill/exit/reap) → fire the
+         * on_tick refreshes immediately, don't wait for the 1 Hz beat.
+         * Ticks are idempotent refreshes, so an early call is safe. */
+        if (tasks_changed) {
+            tasks_changed = 0;
+            for (int i = 0; i < GUI_MAX_WINDOWS; i++)
+                if (windows[i].used && windows[i].on_tick)
+                    windows[i].on_tick(&windows[i]);
+        }
+
         if (need_frame) {
             need_frame = 0;
             compose();
@@ -869,9 +946,15 @@ static void raise_window(struct gui_window* win) {
 }
 
 static void gui_mouse(int dx, int dy, unsigned buttons) {
+    /* M22.4 — per-motion drag damage bookkeeping (filled under the
+     * lock, consumed after unlock so gui_damage isn't nested deeper
+     * than it has to be). */
+    int drag_moved = 0;
+    int drag_old_x = 0, drag_old_y = 0, drag_old_w = 0, drag_old_h = 0;
+    int drag_new_x = 0, drag_new_y = 0;
+
     spin_lock(&state_lock);
 
-    int omx = mx, omy = my;                     /* for cursor damage */
     mx += dx;  my += dy;
     if (mx < 0) mx = 0;
     if (my < 0) my = 0;
@@ -939,12 +1022,21 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
 
 drag_update:
     if (drag == DRAG_MOVE && drag_win) {
+        /* M22.4 — rect-bounded drag damage: remember the old outer rect
+         * so the post-unlock path can damage old ∪ new instead of the
+         * whole screen.  Before this fix every motion event during a
+         * drag raised gui_damage_all() — a full 1280×800 recompose +
+         * ~4 MB blit per event, which made the scene "swim". */
+        drag_old_x = drag_win->x;  drag_old_y = drag_win->y;
+        drag_old_w = drag_win->w;  drag_old_h = drag_win->h;
         drag_win->x = mx - grab_dx;
         drag_win->y = my - grab_dy;
         if (drag_win->x < -(drag_win->w - 40)) drag_win->x = -(drag_win->w - 40);
         if (drag_win->x > fbsurf.w - 40)       drag_win->x = fbsurf.w - 40;
         if (drag_win->y < 0)                   drag_win->y = 0;
         if (drag_win->y > work_h - TITLE_H)    drag_win->y = work_h - TITLE_H;
+        drag_new_x = drag_win->x;  drag_new_y = drag_win->y;
+        drag_moved = (drag_new_x != drag_old_x || drag_new_y != drag_old_y);
     } else if (drag == DRAG_RESIZE && drag_win) {
         rubber_w = mx - drag_win->x + 2;
         rubber_h = my - drag_win->y + 2;
@@ -964,15 +1056,24 @@ drag_update:
         drag_win = NULL;
     }
 
-    int structural = (pressed || released || drag != DRAG_NONE);
+    /* M22.4 — damage policy: full recompose only for the RARE events
+     * (press/release change focus/z-order; the resize rubber band is
+     * thin but spans the window).  A DRAG_MOVE motion damages just
+     * old-rect ∪ new-rect; a pure pointer glide is a bare wake — the
+     * compositor adds the cursor rects itself (see compose()). */
+    int structural = (pressed || released || drag == DRAG_RESIZE);
     spin_unlock(&state_lock);
 
     if (structural) {
-        gui_damage_all();                       /* focus/z/drag changes */
+        gui_damage_all();                       /* focus/z/rubber changes */
+    } else if (drag_moved) {
+        /* Same margins as gui_damage_win (+5 shadow, +2 safety). */
+        gui_damage(drag_old_x - 2, drag_old_y - 2,
+                   drag_old_w + 9, drag_old_h + 9);
+        gui_damage(drag_new_x - 2, drag_new_y - 2,
+                   drag_old_w + 9, drag_old_h + 9);
     } else {
-        /* Pointer glide: only the cursor sprite areas are dirty. */
-        gui_damage(omx - 1, omy - 1, 14, 20);
-        gui_damage(mx - 1,  my - 1,  14, 20);
+        need_frame = 1;                         /* cursor glide only */
     }
 }
 
@@ -1167,12 +1268,14 @@ int gui_start(void) {
     mouse_set_listener(gui_mouse);
     vc_set_kbd_hook(gui_kbd_hook);
     vc_set_raw_kbd_hook(gui_raw_key);       /* Alt-Tab */
+    task_set_change_hook(gui_task_change_hook);  /* M22.4: taskman refresh */
     gui_damage_all();
 
     if (!task_spawn("compositor", gui_compositor_main)) {
         kprintf("gui: FATAL — compositor spawn failed\n");
         vc_set_kbd_hook(NULL);
         vc_set_raw_kbd_hook(NULL);
+        task_set_change_hook(NULL);
         mouse_set_listener(NULL);
         vc_screen_suppress(0);
         gui_active = 0;

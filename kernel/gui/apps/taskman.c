@@ -10,9 +10,17 @@
  * idle tasks are refused by task_kill itself; the compositor is
  * refused here by name (killing it would freeze the GUI).  Killing a
  * window's shell is allowed — the window's X button is the graceful
- * path, this is the hammer; the DEAD entry stays listed until reaped
- * by its window teardown (visible state is a feature in a teaching
- * kernel).
+ * path, this is the hammer.
+ *
+ * M22.4 — DEAD rows no longer accumulate: every refresh starts with an
+ * opportunistic reap pass that task_reap()s DEAD tasks NOT bound to a
+ * VC (a window/pane teardown still holds vc->task and must do its own
+ * kill+reap; reaping those here would leave dangling pointers).  A
+ * VC-bound DEAD task (e.g. a pane shell killed with End task) stays
+ * listed — visible state is a feature in a teaching kernel.  Refreshes
+ * are also event-driven now: the compositor fires on_tick immediately
+ * on any task-set change (task_set_change_hook), so a closed program
+ * drops off the list within one frame instead of at the next 1 Hz beat.
  *
  * All callbacks (tick, button, listview) run on the compositor task,
  * so widget state needs no extra locking.
@@ -22,6 +30,7 @@
 #include "gui_app.h"
 #include "widget.h"
 #include "task.h"
+#include "vc.h"
 #include "kmalloc.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -87,9 +96,36 @@ static void tm_iter(const struct task* t, int is_current, void* ctx) {
     if (idx >= 0 && t->pid == c->selpid) lv->sel = idx;
 }
 
+/* M22.4 — opportunistic reap: collect DEAD pids first (task_for_each
+ * holds the master lock, and task_reap takes it too — reaping inside
+ * the iteration would self-deadlock), then reap the ones not owned by
+ * a live window/pane.  task_reap itself refuses tasks still current on
+ * some CPU, so a task mid-death is simply retried on the next refresh. */
+
+struct tm_dead_scan {
+    int pids[WLIST_MAX_ITEMS];
+    int n;
+};
+
+static void tm_dead_iter(const struct task* t, int is_current, void* ctx) {
+    struct tm_dead_scan* s = (struct tm_dead_scan*)ctx;
+    if (is_current || t->state != TASK_DEAD) return;
+    if (s->n < WLIST_MAX_ITEMS) s->pids[s->n++] = t->pid;
+}
+
+static void tm_reap_dead(void) {
+    struct tm_dead_scan s = { .n = 0 };
+    task_for_each(tm_dead_iter, &s);
+    for (int i = 0; i < s.n; i++)
+        if (!vc_task_bound(s.pids[i]))
+            task_reap(s.pids[i]);
+}
+
 static void tm_refresh(struct gui_window* win) {
     struct taskman* tm = (struct taskman*)gui_window_ctx(win);
     if (!tm || !tm->lv) return;
+
+    tm_reap_dead();
 
     struct tm_iter_ctx c = { tm, -1 };
     if (tm->lv->sel >= 0 && tm->lv->sel < tm->lv->count)

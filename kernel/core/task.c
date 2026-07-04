@@ -334,6 +334,23 @@ void task_become_idle(void) {
 }
 
 /* ------------------------------------------------------------------- */
+/* Task-lifecycle change hook (M22.4 — see task.h).                     */
+/* ------------------------------------------------------------------- */
+
+/* Single consumer slot; the write is atomic on both target archs
+ * (aligned pointer).  Fired on spawn / kill / exit / reap. */
+static void (*task_change_hook)(void) = NULL;
+
+void task_set_change_hook(void (*fn)(void)) {
+    task_change_hook = fn;
+}
+
+static void task_notify_change(void) {
+    void (*fn)(void) = task_change_hook;
+    if (fn) fn();
+}
+
+/* ------------------------------------------------------------------- */
 /* Spawn.                                                               */
 /* ------------------------------------------------------------------- */
 
@@ -360,6 +377,7 @@ struct task* task_spawn(const char* name, void (*entry)(void)) {
     /* Pick a CPU and enqueue.  task_enqueue does the affinity-respecting
      * lightest-load selection. */
     task_enqueue(t);
+    task_notify_change();                    /* M22.4 — new task appeared */
     return t;
 }
 
@@ -606,6 +624,7 @@ int task_kill(int pid) {
     struct task* t = task_find(pid);
     if (!t || t->is_idle || t->state == TASK_DEAD) return -1;
     t->kill_pending = 1;
+    task_notify_change();                    /* M22.4 — liveness will change */
     return 0;
 }
 
@@ -638,6 +657,7 @@ int task_reap(int pid) {
 
     if (t->kstack_base) kfree(t->kstack_base);
     kfree(t);
+    task_notify_change();                    /* M22.4 — task disappeared */
     return 0;
 }
 
@@ -671,6 +691,8 @@ void task_exit(void) {
     uint32_t mfl = spin_lock_irqsave(&master_lock);
     self->state = TASK_DEAD;
     spin_unlock_irqrestore(&master_lock, mfl);
+
+    task_notify_change();                    /* M22.4 — went DEAD */
 
     /* Remove from this CPU's rq so the next pick doesn't keep
      * tripping over a DEAD entry.  (M18.6.1 — pre-refactor, DEAD

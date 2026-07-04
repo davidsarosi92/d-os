@@ -414,6 +414,17 @@ void vc_for_each(vc_iter_fn fn, void* ctx) {
 
 int vc_count(void) { return vc_n; }
 
+/* M22.4 — is a task with this pid bound to any VC (see vc.h)?  Reads
+ * vc->task->pid without a lock: callers only use this as an advisory
+ * "don't reap" filter on the compositor task, and the bound task
+ * pointer is only cleared/reassigned on that same task (window close)
+ * or at pane creation. */
+int vc_task_bound(int pid) {
+    for (int i = 0; i < vc_n; i++)
+        if (vcs[i] && vcs[i]->task && vcs[i]->task->pid == pid) return 1;
+    return 0;
+}
+
 int vc_get_rect(const struct vc* v, int* x, int* y, int* w, int* h) {
     if (!v || !v->leaf) return -1;
     if (x) *x = v->leaf->x;
