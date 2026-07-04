@@ -178,6 +178,8 @@ static void keyboard_irq(struct int_frame* f) {
     /* Hardware → universal keycode → ASCII via the active layout. */
     uint8_t keycode = sc1_to_hid[sc & 0x7F];
     if (!keycode) return;
+    /* M22.3: raw-keycode consumers (GUI Alt-Tab) get first refusal. */
+    if (vc_raw_kbd_dispatch(keycode, mods)) return;
     char c = keymap_translate(keycode, mods);
     if (!c) return;
 

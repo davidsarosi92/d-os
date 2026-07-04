@@ -77,6 +77,7 @@
 #include "hal_api.h"
 #include "percpu.h"
 #include "smp.h"
+#include "timer.h"          /* M22.3: per-task CPU-time accounting */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -559,6 +560,14 @@ static void schedule_locked(struct percpu* me) {
 
     if (next == prev) return;
 
+    /* M22.3 — CPU-time accounting at the switch boundary.  Cheap: one
+     * timer read + two u64 ops per context switch. */
+    {
+        uint64_t now = timer_ticks_ms();
+        prev->cpu_ms += now - prev->sched_in_ms;
+        next->sched_in_ms = now;
+    }
+
     me->current = next;
     context_switch(&prev->esp, next->esp);
     /* Resumes here when `prev` is scheduled back in by SOME CPU. */
@@ -577,7 +586,59 @@ void schedule(void) {
 }
 
 void task_yield(void) {
+    /* M22.3 — cooperative kill lands here: every voluntary yield point
+     * (vc_getchar, keyboard_getchar, ...) funnels through task_yield,
+     * and by convention no spinlocks are held across a yield, so
+     * exiting is safe.  The IRQ preemption path (schedule_check) must
+     * NOT do this — a preempted task may hold a window/surface lock. */
+    struct task* self = task_current();
+    if (self && self->kill_pending && !self->is_idle) task_exit();
     schedule();
+}
+
+int task_should_stop(void) {
+    struct task* self = task_current();
+    return self ? self->kill_pending : 0;
+}
+
+int task_kill(int pid) {
+    if (pid == 0) return -1;                 /* pid 0 = kernel/BSP idle */
+    struct task* t = task_find(pid);
+    if (!t || t->is_idle || t->state == TASK_DEAD) return -1;
+    t->kill_pending = 1;
+    return 0;
+}
+
+int task_reap(int pid) {
+    if (!master_head) return -1;
+
+    /* Refuse while the victim is still current anywhere — DEAD is set
+     * just before its final context_switch, so there is a short window
+     * where the stack is still in use.  Caller retries. */
+    struct task* t = task_find(pid);
+    if (!t || t->state != TASK_DEAD) return -1;
+    int n = smp_ncpus();
+    for (int i = 0; i < n; i++)
+        if (percpu_at(i) && percpu_at(i)->current == t) return -1;
+
+    /* Unlink from the master ring (circular SLL — walk for the prev). */
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    struct task* prev = master_head;
+    while (prev->next != t && prev->next != master_head) prev = prev->next;
+    if (prev->next != t) {                   /* raced away — bail */
+        spin_unlock_irqrestore(&master_lock, fl);
+        return -1;
+    }
+    if (t->next == t) master_head = NULL;    /* last task (can't happen) */
+    else {
+        prev->next = t->next;
+        if (master_head == t) master_head = t->next;
+    }
+    spin_unlock_irqrestore(&master_lock, fl);
+
+    if (t->kstack_base) kfree(t->kstack_base);
+    kfree(t);
+    return 0;
 }
 
 /* ------------------------------------------------------------------- */
@@ -655,7 +716,7 @@ void schedule_check(void) {
 
 void task_list(void) {
     if (!master_head) { kprintf("ps: no tasks\n"); return; }
-    kprintf("PID  STATE  CPU  NAME\n");
+    kprintf("PID  STATE  CPU  CPUMS  NAME\n");
     uint32_t fl = spin_lock_irqsave(&master_lock);
     struct task* t = master_head;
     do {
@@ -664,8 +725,9 @@ void task_list(void) {
         for (int i = 0; i < n; i++) {
             if (percpu_at(i) && percpu_at(i)->current == t) { running = 1; break; }
         }
-        kprintf("%d   %s    %d   %s%s\n",
+        kprintf("%d   %s    %d   %u   %s%s\n",
                 t->pid, state_name(t->state), t->cpu_home,
+                (unsigned)t->cpu_ms,        /* truncates past ~49 days — fine */
                 t->name, running ? " (running)" : "");
         t = t->next;
     } while (t != master_head);

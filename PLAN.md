@@ -167,7 +167,7 @@ what); a session can pick a theme and push on it.
 | M21 | ARM (aarch64 generic / RPi) port                | Architecture     | §M21    |
 | M22 | GUI infrastructure — compositor, windows, mouse, widgets, taskbar, file manager | UX | ✅ DOCS §4.13 |
 | M22.2 | GUI modularity — swappable desktop shell + app registry + GUI dev docs | UX | ✅ DOCS §4.14 |
-| M22.3 | Desktop polish — task manager, task_kill, term-window close, minimize, Alt-Tab, damage rects | UX | §M22.3 |
+| M22.3 | Desktop polish — task manager, task_kill, term-window close, minimize, Alt-Tab, damage rects | UX | ✅ DOCS §4.13 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | §M25 |
@@ -1499,50 +1499,38 @@ in the menu with zero core changes ✅ · docs chapter ✅.
   clicks; menu-open-but-clicked-elsewhere closes the menu and lets
   the click fall through — matching real desktop behaviour.
 
-## §M22.3 — Desktop polish: task manager + window lifecycle
+## §M22.3 — Desktop polish: task manager + window lifecycle — ✅ shipped
 
-**Why:** the M22.1 deferred list, promoted to a proper milestone,
-plus the first "real" system app (task manager).  The common
-prerequisite is task lifecycle support in the scheduler.
+Shipped 2026-07-04.  See **DOCS.md §4.13 + change log** for the
+as-built shape: task_kill / task_should_stop / task_reap (cooperative
+kthread_stop contract), per-task cpu_ms, `kill` + `ps` CPUMS, Task
+Manager app (tick-driven refresh, End task), minimize + close on all
+windows (terminal close = kill→reap→vc_destroy state machine),
+Windows-style taskbar buttons, Alt-Tab (raw-keycode hook), dirty-rect
+composition with `gui stats` counters (typing runs ~20:1
+partial:full).
 
-**Design — staged.**
+**Lessons learned:**
+- *No forced kill without user processes.*  Our spinlocks don't
+  disable preemption, so a task interrupted at an arbitrary point may
+  hold a lock — killing it there deadlocks the compositor.  The
+  honest contract is Linux's kthread rule: kill lands at voluntary
+  yield points, CPU-bound workers poll task_should_stop().  Forced
+  termination becomes possible with ring-3 processes (§M25).
+- *Alt-Tab must demote the top VISIBLE window.*  Minimized windows
+  park at the top of the z-order; rotating the raw top stalls the
+  cycle without changing focus.
+- *Partial compose is only cheap if EVERY 1 Hz source is partial.*
+  The clock initially requested full frames — one full recompose per
+  second dwarfed the typing savings.  Damaging just the chrome strip
+  fixed the ratio.
+- *Terminal close is a retried state machine, not a blocking wait.*
+  The compositor polls kill→DEAD→reap across its loop passes; a
+  blocking wait would freeze rendering for a tick (or forever, if
+  the shell never yields).
 
-1. **`task_kill(pid)` (scheduler prereq)** — first cut restricted to
-   tasks parked in an interruptible wait (the vc_getchar/hlt+yield
-   loop): mark DEAD, remove from runqueue, reap kstack + unbind
-   VC/out_console from a reaper pass.  Killing a lock-holder is out
-   of scope — document the restriction.
-2. **Per-task CPU accounting** — `task->cpu_ms` bumped by the
-   scheduler on switch-out; feeds the task manager's CPU column
-   (and `ps` for free).
-3. **Task manager app** (`GUI_APP`) — listview of pid / state / CPU
-   time / name via task_for_each, auto-refresh on the shell's
-   second-tick, "End task" button → task_kill with a guard list
-   (pid 0, idle, compositor).
-4. **Terminal-window close** — X button on terminal windows too:
-   task_kill the shell, free the VC slot (needs `vc_destroy`; the
-   VC table currently never frees), then normal window teardown.
-5. **Minimize** — window `hidden` flag skipped by compositor +
-   hit-test; the taskbar button toggles restore.
-6. **Alt-Tab** — needs a keycode-level intercept: today's pipeline
-   delivers ASCII only, so extend the keyboard path to expose
-   modifier+key combos to the GUI hook before keymap translation.
-7. **Per-window damage rects** — compositor keeps a dirty-rect
-   union per frame and recomposes only that region; add a debug
-   counter (full vs. partial frames) to prove it works.
-8. **Widget containers (stretch)** — a simple vbox/hbox layout
-   helper if the task manager layout code gets ugly without it.
-
-**Definition of done:**
-- Task manager lists live tasks with CPU time and successfully
-  kills a `loop` hog; guarded tasks refuse politely.
-- Terminal window X closes the window AND its shell task; the VC
-  slot is reusable afterwards.
-- Minimize/restore via taskbar works; Alt-Tab cycles windows.
-- Damage-rect counter shows partial frames dominating during
-  typing.
-
----
+**Deferred:** widget containers (vbox/hbox — the task manager's
+manual layout stayed readable without them).
 
 ## §M23 — Audio subsystem
 
@@ -1723,6 +1711,10 @@ subsurfaces beyond the minimum xdg_shell needs, XWayland.
 
 ## Change log
 
+- **2026-07-04** — §M22.3 shipped: task manager + cooperative
+  task_kill (kthread contract) + cpu_ms accounting + terminal-window
+  close (vc_destroy) + minimize + Alt-Tab + dirty-rect composition.
+  Section condensed; lessons learned recorded.
 - **2026-07-04** — §S.1 shipped: SHELL_PROVIDER() registry closes the
   provider half of §S (the M14 checkmark had overstated it) — boot /
   pane / GUI-window shells resolve via the `shell.provider` config

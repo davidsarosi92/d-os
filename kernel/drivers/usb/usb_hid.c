@@ -63,6 +63,9 @@ void usb_hid_kbd_handle_report(const uint8_t* report) {
             continue;
         }
 
+        /* M22.3: raw-keycode consumers (GUI Alt-Tab) get first refusal. */
+        if (vc_raw_kbd_dispatch(k, mods)) continue;
+
         /* Universal keycode = HID usage; pass through unchanged. */
         char c = keymap_translate(k, mods);
         if (c) vc_kbd_push(c);

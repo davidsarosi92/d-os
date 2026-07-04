@@ -129,9 +129,10 @@ static void vista_draw(struct gfx_surface* back) {
     struct gui_window* focused = gui_wm_focused();
     for (int i = 0; i < n; i++) {
         int f = (slots[i] == focused);
+        int m = gui_window_minimized(slots[i]);
         gfx_vgradient(back, x, ty + 5, bw, TASKBAR_H - 10,
-                      f ? COL_TBTN_F_TOP : COL_TBTN_TOP,
-                      f ? COL_TBTN_F_BOT : COL_TBTN_BOT);
+                      f ? COL_TBTN_F_TOP : (m ? COL_TB_BOT : COL_TBTN_TOP),
+                      f ? COL_TBTN_F_BOT : (m ? COL_TB_BOT : COL_TBTN_BOT));
         gfx_fill(back, x, ty + 5, bw, 1, COL_TBTN_EDGE);
         gfx_fill(back, x, ty + TASKBAR_H - 6, bw, 1, COL_TBTN_EDGE);
         gfx_fill(back, x, ty + 5, 1, TASKBAR_H - 10, COL_TBTN_EDGE);
@@ -187,11 +188,16 @@ static void vista_draw(struct gfx_surface* back) {
 static void vista_motion(int x, int y) {
     if (!menu_open) return;
     int myy = menu_top();
+    int nh;
     if (x >= 4 && x < 4 + SM_W &&
         y >= myy + 6 && y < myy + 6 + menu_rows() * SM_ITEM_H)
-        menu_hover = (y - myy - 6) / SM_ITEM_H;
+        nh = (y - myy - 6) / SM_ITEM_H;
     else
-        menu_hover = -1;
+        nh = -1;
+    if (nh != menu_hover) {
+        menu_hover = nh;
+        gui_request_frame();                    /* repaint the highlight */
+    }
 }
 
 static int vista_click(int x, int y) {
@@ -234,7 +240,7 @@ static int vista_click(int x, int y) {
     int bx = START_W + 12;
     for (int i = 0; i < n; i++) {
         if (x >= bx && x < bx + bw) {
-            gui_wm_focus_raise_locked(slots[i]);
+            gui_wm_taskbar_activate_locked(slots[i]);   /* M22.3 */
             return 1;
         }
         bx += bw + 6;

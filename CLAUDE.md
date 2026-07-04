@@ -8,7 +8,7 @@
 ## What this is
 
 Hobby / teaching i386 OS kernel.  Boots from GRUB → installs its own
-GDT / IDT / paging → talks to a 1024×768 framebuffer with an embedded
+GDT / IDT / paging → talks to a 1280×800 framebuffer with an embedded
 8×8 bitmap font → IRQ-driven PS/2 keyboard + xHCI USB host with
 boot-HID keyboards → ramfs + devfs + procfs mounted at
 `/`, `/dev`, `/proc` → preemptive round-robin scheduler with ring-3
@@ -23,10 +23,14 @@ polish sub-items; the lone outstanding one is §M20.6.1
 SYSCALL/SYSRET).  M22 + M22.1 + M22.2 (2026-07-04): GUI — gfx
 surfaces + compositor + WM core + widget toolkit + file manager,
 PS/2 mouse (IRQ12), CMOS RTC, `vfs_unlink`, 1280×800 FB; desktop
-shells + apps are REGISTRY-swappable (`DESKTOP_SHELL()` /
-`GUI_APP()` linker sections, `gui.shell` config key, vista + bare
-shells, apps under `kernel/gui/apps/`, `launch` command); GUI dev
-guide in DOCS §4.14; both archs.
+shells + apps + command shells are REGISTRY-swappable
+(`DESKTOP_SHELL()` / `GUI_APP()` / `SHELL_PROVIDER()` linker
+sections; `gui.shell` + `shell.provider` config keys; vista + bare
+desktops, d-os + rescue shells, apps under `kernel/gui/apps/`,
+`launch` command); GUI dev guide in DOCS §4.14.  M22.3: task
+manager app, cooperative task_kill/reap (kthread contract) +
+cpu_ms, terminal-window close, minimize, Alt-Tab, dirty-rect
+composition (`gui stats`).  All on both archs.
 Highlights so far: VFS + ramfs + exFAT on virtio-blk, devfs +
 procfs, preemptive scheduler, multi-pane shell, xHCI USB + HID,
 keyboard layouts, HAL cut (`hal_api.h`), **SMP on i386 + x86_64**
@@ -52,9 +56,6 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   but PMM still has a single zone set.
 - **§M20.6.1** — SYSCALL/SYSRET instruction path (needs GDT slot
   reorg to satisfy SYSRET's selector arithmetic).
-- **§M22.3** — Desktop polish: task manager app, task_kill +
-  per-task CPU accounting, terminal-window close (vc_destroy),
-  minimize, Alt-Tab, per-window damage rects.
 
 🔲 **PLAN extensions (placeholders, design only):**
 - §M23 — Audio subsystem (AC97 → HDA → I2S).

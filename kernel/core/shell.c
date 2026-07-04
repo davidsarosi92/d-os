@@ -106,9 +106,9 @@ static void cmd_help(void) {
                   "  ls <path>, cat <path>, mkdir <path>, touch <path>,\n"
                   "  write <path> <text>, mount <fs> <path> [dev]\n"
                   "  config, getconf <key>, setconf <key> <value>, saveconf\n"
-                  "  ringtest, ps, spawn, yield, loop\n"
+                  "  ringtest, ps, spawn, yield, loop, kill <pid>\n"
                   "  pane, pane split horizontal|vertical\n"
-                  "  gui (compositor + desktop), launch [app]\n"
+                  "  gui (compositor + desktop), gui stats, launch [app]\n"
                   "  lslayout, setlayout <us|hu|...>, lscpu, taskset <pid> <mask>\n"
                   "  slabinfo, buddyinfo\n"
                   "  shutdown, reboot\n");
@@ -260,10 +260,31 @@ static volatile int loop_stop_flag = 0;
 
 static void loop_hog_main(void) {
     volatile uint32_t counter = 0;
-    while (!loop_stop_flag) {
+    /* Deliberately no yield (that is the point of the preemption test),
+     * but M22.3 adds the kthread contract: CPU-bound kernel threads
+     * MUST poll task_should_stop() so `kill` / the task manager can
+     * terminate them — same rule as Linux kthread_should_stop(). */
+    while (!loop_stop_flag && !task_should_stop()) {
         counter++;
-        /* Deliberately no yield: this is the whole point of the test. */
     }
+}
+
+/* `kill <pid>` — cooperative task termination (M22.3).  The victim
+ * dies at its next yield point / task_should_stop() poll; reaping is
+ * lazy (the GUI window teardown reaps its own shells; CLI kills stay
+ * as DEAD entries in `ps` until something reaps them — good enough
+ * for a teaching kernel, and visible state is a feature here). */
+static void cmd_kill(const char* args) {
+    int pid = 0, any = 0;
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) { pid = pid * 10 + (*args - '0'); any = 1; }
+    if (!any) { console_write("kill: usage: kill <pid>\n"); return; }
+    if (task_current() && task_current()->pid == pid) {
+        console_write("kill: refusing to kill the calling shell\n");
+        return;
+    }
+    if (task_kill(pid) == 0) kprintf("kill: pid %d flagged (dies at next yield)\n", pid);
+    else                     kprintf("kill: pid %d not found or protected\n", pid);
 }
 
 static void cmd_loop(void) {
@@ -386,6 +407,14 @@ static void cmd_launch(const char* args) {
     const struct gui_app_def* app = gui_app_find(args);
     if (!app) { kprintf("launch: no app matching '%s'\n", args); return; }
     app->launch();
+}
+
+/* `gui stats` — damage-rect effectiveness counters (M22.3). */
+static void cmd_gui_stats(void) {
+    if (!gui_is_active()) { console_write("gui stats: GUI not running\n"); return; }
+    unsigned full = 0, partial = 0;
+    gui_get_stats(&full, &partial);
+    kprintf("frames: %u full, %u partial (dirty-rect)\n", full, partial);
 }
 
 /* `gui` — start the M22 compositor.  The calling shell keeps running in
@@ -778,7 +807,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
      * pane anyway; vc_clear also reaches GUI windows via the emit hook. */
     if (streq(line, "clear"))  { vc_clear(my_vc);  return; }
     /* M22: bring up the compositor + two shell windows.  Idempotent. */
-    if (streq(line, "gui"))    { cmd_gui();        return; }
+    if (streq(line, "gui"))       { cmd_gui();       return; }
+    if (streq(line, "gui stats")) { cmd_gui_stats(); return; }
     /* M22.2: GUI app registry access from any shell. */
     if (streq(line, "launch"))          { cmd_launch("");        return; }
     if (starts_with(line, "launch "))   { cmd_launch(line + 7);  return; }
@@ -804,6 +834,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "bctest"))         { cmd_bctest();   return; }
     if (streq(line, "lsblk"))          { blk_list();     return; }
     if (streq(line, "ps"))             { task_list();    return; }
+    if (starts_with(line, "kill "))    { cmd_kill(line + 5); return; }
     if (streq(line, "spawn"))          { cmd_spawn();    return; }
     if (streq(line, "yield"))          { task_yield();   return; }
     if (streq(line, "loop"))           { cmd_loop();     return; }

@@ -38,6 +38,14 @@ const char*        gui_window_title(struct gui_window* w);
 /* Focus + raise (taskbar button click).  WM lock must be held. */
 void gui_wm_focus_raise_locked(struct gui_window* w);
 
+/* M22.3 — Windows-style taskbar button semantics: minimized →
+ * restore+focus, focused → minimize, else → focus+raise.  WM lock
+ * must be held (click callback). */
+void gui_wm_taskbar_activate_locked(struct gui_window* w);
+
+/* Non-zero if the window is minimized (dim its taskbar button). */
+int  gui_window_minimized(struct gui_window* w);
+
 /* Queue an app launch / power action; executed on the compositor task
  * on the next loop pass.  Safe from IRQ context. */
 void gui_queue_launch(const struct gui_app_def* app);

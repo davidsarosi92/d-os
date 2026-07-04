@@ -33,6 +33,7 @@ int gfx_surface_init(struct gfx_surface* s, int w, int h) {
     s->w = w; s->h = h; s->stride = w;
     s->px = px;
     s->owns_px = 1;
+    gfx_clear_clip(s);
     return 0;
 }
 
@@ -56,6 +57,7 @@ int gfx_fb_surface(struct gfx_surface* out) {
      * the screen, and the final blit is a plain streaming copy. */
     out->px = (uint32_t*)(uintptr_t)px;
     out->owns_px = 0;
+    gfx_clear_clip(out);
     return 0;
 }
 
@@ -64,11 +66,35 @@ int gfx_fb_surface(struct gfx_surface* out) {
 /* if nothing remains.                                                         */
 /* -------------------------------------------------------------------------- */
 
+void gfx_set_clip(struct gfx_surface* s, int x, int y, int w, int h) {
+    if (!s) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    s->clip_x0 = x;
+    s->clip_y0 = y;
+    s->clip_x1 = (x + w > s->w) ? s->w : x + w;
+    s->clip_y1 = (y + h > s->h) ? s->h : y + h;
+}
+
+void gfx_clear_clip(struct gfx_surface* s) {
+    if (!s) return;
+    s->clip_x0 = 0;
+    s->clip_y0 = 0;
+    s->clip_x1 = s->w;
+    s->clip_y1 = s->h;
+}
+
+/* Point-inside-clip test for the per-pixel primitives (line, text). */
+static inline int in_clip(const struct gfx_surface* s, int x, int y) {
+    return x >= s->clip_x0 && x < s->clip_x1 &&
+           y >= s->clip_y0 && y < s->clip_y1;
+}
+
 static int clip_rect(const struct gfx_surface* s, int* x, int* y, int* w, int* h) {
-    if (*x < 0) { *w += *x; *x = 0; }
-    if (*y < 0) { *h += *y; *y = 0; }
-    if (*x + *w > s->w) *w = s->w - *x;
-    if (*y + *h > s->h) *h = s->h - *y;
+    if (*x < s->clip_x0) { *w += *x - s->clip_x0; *x = s->clip_x0; }
+    if (*y < s->clip_y0) { *h += *y - s->clip_y0; *y = s->clip_y0; }
+    if (*x + *w > s->clip_x1) *w = s->clip_x1 - *x;
+    if (*y + *h > s->clip_y1) *h = s->clip_y1 - *y;
     return (*w > 0 && *h > 0);
 }
 
@@ -96,7 +122,7 @@ void gfx_line(struct gfx_surface* s, int x0, int y0, int x1, int y1, uint32_t co
     int sy = y0 < y1 ? 1 : -1;
     int err = dx - dy;
     for (;;) {
-        if (x0 >= 0 && x0 < s->w && y0 >= 0 && y0 < s->h)
+        if (in_clip(s, x0, y0))
             s->px[(size_t)y0 * s->stride + x0] = color;
         if (x0 == x1 && y0 == y1) break;
         int e2 = err * 2;
@@ -115,10 +141,10 @@ void gfx_blit(struct gfx_surface* dst, int dx, int dy,
     if (sy < 0) { h += sy; dy -= sy; sy = 0; }
     if (sx + w > src->w) w = src->w - sx;
     if (sy + h > src->h) h = src->h - sy;
-    if (dx < 0) { w += dx; sx -= dx; dx = 0; }
-    if (dy < 0) { h += dy; sy -= dy; dy = 0; }
-    if (dx + w > dst->w) w = dst->w - dx;
-    if (dy + h > dst->h) h = dst->h - dy;
+    if (dx < dst->clip_x0) { int d = dst->clip_x0 - dx; w -= d; sx += d; dx = dst->clip_x0; }
+    if (dy < dst->clip_y0) { int d = dst->clip_y0 - dy; h -= d; sy += d; dy = dst->clip_y0; }
+    if (dx + w > dst->clip_x1) w = dst->clip_x1 - dx;
+    if (dy + h > dst->clip_y1) h = dst->clip_y1 - dy;
     if (w <= 0 || h <= 0) return;
 
     const uint32_t* sp = src->px + (size_t)sy * src->stride + sx;
@@ -196,7 +222,7 @@ void gfx_text(struct gfx_surface* s, int x, int y, const char* str, uint32_t fg)
             for (int px = 0; px < GFX_GLYPH_W; px++) {
                 if (!(bits & (0x80u >> px))) continue;
                 int xx = x + px;
-                if (xx < 0 || xx >= s->w) continue;
+                if (!in_clip(s, xx, yy)) continue;
                 s->px[(size_t)yy * s->stride + xx] = fg;
             }
         }

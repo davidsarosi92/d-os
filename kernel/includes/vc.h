@@ -135,11 +135,26 @@ struct vc* vc_create_offscreen(void (*emit)(void* ctx, char c), void* ctx);
 void vc_screen_suppress(int on);
 int  vc_screen_suppressed(void);
 
+/* Destroy an OFFSCREEN vc (M22.3 — terminal-window close).  Only for
+ * VCs created by vc_create_offscreen: pane VCs live in the split tree
+ * and are never destroyed today.  The caller must guarantee the owning
+ * shell task is DEAD first (its vc_getchar must never run again).
+ * Frees the slot in the VC table so window close/open cycles don't
+ * exhaust VC_MAX. */
+void vc_destroy(struct vc* v);
+
 /* Keyboard intercept (M22.1).  Both keyboard drivers (PS/2, USB HID)
  * funnel decoded chars through vc_kbd_push; when a hook is installed
  * and returns non-zero, the byte is consumed BEFORE reaching the
  * focused VC's ring.  The GUI uses this to route typing to widget
  * (non-terminal) windows.  Runs in IRQ context — keep it short. */
 void vc_set_kbd_hook(int (*fn)(char c));
+
+/* Raw keycode intercept (M22.3 — Alt-Tab & friends).  Keyboard drivers
+ * call vc_raw_kbd_dispatch(usage, mods) BEFORE keymap translation;
+ * a hook returning non-zero consumes the keystroke entirely.  Runs in
+ * IRQ context. */
+void vc_set_raw_kbd_hook(int (*fn)(uint8_t keycode, uint8_t mods));
+int  vc_raw_kbd_dispatch(uint8_t keycode, uint8_t mods);
 
 #endif

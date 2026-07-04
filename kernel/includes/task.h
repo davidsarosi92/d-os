@@ -84,6 +84,17 @@ struct task {
     int      cpu_home;
     struct task* rq_next;
     struct task* rq_prev;
+    /* M22.3 — cooperative kill (the Linux kthread_stop contract: all
+     * tasks are kernel threads today, so forced termination at an
+     * arbitrary preemption point is unsafe — the victim might hold a
+     * spinlock.  task_kill sets the flag; the task dies at its next
+     * task_yield; CPU-bound workers poll task_should_stop()). */
+    volatile int kill_pending;
+    /* M22.3 — CPU time accounting: ms actually spent on a CPU.
+     * `sched_in_ms` stamps switch-in; switch-out accumulates into
+     * `cpu_ms`.  Feeds `ps` and the GUI task manager. */
+    uint64_t cpu_ms;
+    uint64_t sched_in_ms;
 };
 
 /* Set up the scheduler and convert the current `kernel_main` context
@@ -166,6 +177,23 @@ void task_for_each(task_iter_fn fn, void* ctx);
  * that pid.  Used by `taskset` and a future `kill`.  Walks the global
  * task list under the master scheduler lock. */
 struct task* task_find(int pid);
+
+/* M22.3 — request cooperative termination of `pid`.  Returns 0 if the
+ * flag was set, -1 if no such task or it is protected (pid 0, idle
+ * tasks).  The task exits at its next voluntary yield point — tasks
+ * parked in vc_getchar/keyboard_getchar die within one timer tick;
+ * CPU-bound kernel threads must poll task_should_stop() (the kthread
+ * rule).  Pair with task_reap() to reclaim struct + stack. */
+int  task_kill(int pid);
+
+/* For CPU-bound kernel threads: non-zero once task_kill was called on
+ * the calling task — poll it in long-running loops and return/exit. */
+int  task_should_stop(void);
+
+/* Reclaim a DEAD task: unlink from the master ring, free kstack +
+ * struct.  Returns 0 on success, -1 if the pid is missing, not DEAD
+ * yet, or still current on some CPU (caller retries later). */
+int  task_reap(int pid);
 
 /* M18.6.3 — set / get task affinity.  Mask of allowed CPU bits;
  * passing 0 is rejected (would mean "may run nowhere").  If the

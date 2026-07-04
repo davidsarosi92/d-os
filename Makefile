@@ -158,6 +158,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/about.c \
     kernel/gui/apps/newshell.c \
     kernel/gui/apps/hello.c \
+    kernel/gui/apps/taskman.c \
     kernel/drivers/rtc/cmos_rtc.c \
     kernel/drivers/mouse/ps2_mouse.c \
     kernel/core/keymap.c \
@@ -214,6 +215,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/about.c \
     kernel/gui/apps/newshell.c \
     kernel/gui/apps/hello.c \
+    kernel/gui/apps/taskman.c \
     kernel/drivers/rtc/cmos_rtc.c \
     kernel/drivers/mouse/ps2_mouse.c \
     kernel/core/keymap.c \

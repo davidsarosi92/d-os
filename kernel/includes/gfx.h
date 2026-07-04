@@ -27,7 +27,16 @@ struct gfx_surface {
     int       stride;      /* pixels (NOT bytes) per scanline */
     uint32_t* px;          /* top-left pixel */
     int       owns_px;     /* 1 = kmalloc'd by gfx_surface_init, freeable */
+    /* Clip box (M22.3 — damage-rect composition): every primitive
+     * refuses to touch pixels outside [clip_x0,clip_x1)×[clip_y0,
+     * clip_y1).  Constructors set it to the full surface; the
+     * compositor narrows it to the dirty rect for partial frames. */
+    int       clip_x0, clip_y0, clip_x1, clip_y1;
 };
+
+/* Narrow / reset the clip box (clamped to the surface). */
+void gfx_set_clip(struct gfx_surface* s, int x, int y, int w, int h);
+void gfx_clear_clip(struct gfx_surface* s);
 
 /* Allocate an off-screen w×h surface (contents undefined).  Returns 0
  * on success, -1 on OOM / bad size. */

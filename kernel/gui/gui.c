@@ -41,6 +41,7 @@
 #include "mouse.h"
 #include "timer.h"
 #include "config.h"
+#include "keymap.h"          /* M22.3: Alt-Tab raw keycodes */
 #include "kmalloc.h"
 #include "printf.h"
 #include "hal.h"
@@ -110,6 +111,10 @@ struct gui_window {
     void (*on_close) (struct gui_window*);
     void* app_ctx;
 
+    /* M22.3 */
+    int  minimized;                     /* skipped by compose + hit-test  */
+    void (*on_tick)(struct gui_window*);/* APP: ~1 Hz on compositor task  */
+
     /* IRQ → compositor handoff (state_lock). */
     int  pending_w, pending_h;
     volatile int want_close;
@@ -144,6 +149,50 @@ static int gmax_cols = 0, gmax_rows = 0;
 
 static volatile int need_frame = 0;
 static int gui_active = 0;
+
+/* M22.3 — damage tracking.  The dirty rect accumulates under
+ * damage_lock (nested inside state_lock on the mouse path — never the
+ * other way around) and is snapshotted + cleared by compose().  The
+ * full/partial counters back the `gui stats` shell command. */
+static spinlock_t damage_lock;
+static int dmg_x0, dmg_y0, dmg_x1, dmg_y1;      /* empty when x1 <= x0 */
+static uint32_t frames_full = 0, frames_partial = 0;
+
+static void damage_add_locked(int x0, int y0, int x1, int y1) {
+    if (dmg_x1 <= dmg_x0) {                     /* empty → replace */
+        dmg_x0 = x0; dmg_y0 = y0; dmg_x1 = x1; dmg_y1 = y1;
+    } else {
+        if (x0 < dmg_x0) dmg_x0 = x0;
+        if (y0 < dmg_y0) dmg_y0 = y0;
+        if (x1 > dmg_x1) dmg_x1 = x1;
+        if (y1 > dmg_y1) dmg_y1 = y1;
+    }
+}
+
+void gui_damage(int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    uint32_t fl = spin_lock_irqsave(&damage_lock);
+    damage_add_locked(x, y, x + w, y + h);
+    spin_unlock_irqrestore(&damage_lock, fl);
+    need_frame = 1;
+}
+
+void gui_damage_all(void) {
+    uint32_t fl = spin_lock_irqsave(&damage_lock);
+    damage_add_locked(0, 0, fbsurf.w, fbsurf.h);
+    spin_unlock_irqrestore(&damage_lock, fl);
+    need_frame = 1;
+}
+
+/* Window rect + margin for border/shadow (+5 shadow, +2 safety). */
+static void gui_damage_win(struct gui_window* w) {
+    gui_damage(w->x - 2, w->y - 2, w->w + 9, w->h + 9);
+}
+
+void gui_get_stats(uint32_t* full, uint32_t* partial) {
+    if (full)    *full    = frames_full;
+    if (partial) *partial = frames_partial;
+}
 
 /* Active desktop shell (chosen once at gui_start). */
 static const struct desktop_shell* shell = NULL;
@@ -245,7 +294,7 @@ void gui_queue_power(int reboot) {
     need_frame = 1;
 }
 
-void gui_request_frame(void) { need_frame = 1; }
+void gui_request_frame(void) { gui_damage_all(); }
 
 int gui_screen_w(void) { return fbsurf.w; }
 int gui_screen_h(void) { return fbsurf.h; }
@@ -328,7 +377,7 @@ static void gterm_emit(void* ctx, char c) {
     }
 
     spin_unlock(&win->lock);
-    need_frame = 1;
+    gui_damage_win(win);
 }
 
 static void gterm_rerender_locked(struct gui_window* win) {
@@ -349,7 +398,7 @@ static void app_redraw(struct gui_window* win) {
     gfx_fill(&win->surf, 0, 0, win->surf.w, win->surf.h, COL_WIN_BG);
     widget_draw_all(win->widgets, &win->surf);
     spin_unlock(&win->lock);
-    need_frame = 1;
+    gui_damage_win(win);
 }
 
 static int window_set_size(struct gui_window* win, int outer_w, int outer_h) {
@@ -442,10 +491,19 @@ void gui_window_set_on_close(struct gui_window* win,
 }
 
 void gui_window_close(struct gui_window* win) {
-    if (win && win->used && win->kind == WIN_APP) {
+    if (win && win->used) {                 /* M22.3: TERM windows too */
         win->want_close = 1;
         need_frame = 1;
     }
+}
+
+void gui_window_set_tick(struct gui_window* win,
+                         void (*fn)(struct gui_window*)) {
+    if (win) win->on_tick = fn;
+}
+
+int gui_window_minimized(struct gui_window* w) {
+    return w ? w->minimized : 0;
 }
 
 static void raise_window(struct gui_window* win);
@@ -457,14 +515,38 @@ void gui_window_raise(struct gui_window* win) {
     focused_win = win;
     spin_unlock_irqrestore(&state_lock, fl);
     if (win->kind == WIN_TERM) vc_focus(win->vc);
-    need_frame = 1;
+    gui_damage_all();
 }
 
 void gui_wm_focus_raise_locked(struct gui_window* w) {
     if (!w || !w->used) return;
+    w->minimized = 0;                       /* activating always restores */
     raise_window(w);
     focused_win = w;
     if (w->kind == WIN_TERM) vc_focus(w->vc);
+}
+
+/* Topmost non-minimized window — focus fallback. */
+static struct gui_window* top_visible_locked(void) {
+    for (int i = zcount - 1; i >= 0; i--)
+        if (!zorder[i]->minimized) return zorder[i];
+    return NULL;
+}
+
+/* Taskbar-button semantics (Windows-style): minimized → restore +
+ * focus; focused → minimize; else → focus + raise.  WM lock held. */
+void gui_wm_taskbar_activate_locked(struct gui_window* w) {
+    if (!w || !w->used) return;
+    if (w->minimized) {
+        gui_wm_focus_raise_locked(w);
+    } else if (focused_win == w) {
+        w->minimized = 1;
+        struct gui_window* nf = top_visible_locked();
+        focused_win = nf;
+        if (nf && nf->kind == WIN_TERM) vc_focus(nf->vc);
+    } else {
+        gui_wm_focus_raise_locked(w);
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -508,6 +590,24 @@ static void draw_cursor(struct gfx_surface* s, int cx, int cy) {
 /* -------------------------------------------------------------------------- */
 
 static void compose(void) {
+    /* Snapshot + clear the damage rect first: anything damaged while
+     * we paint lands in the NEXT frame. */
+    int rx0, ry0, rx1, ry1;
+    {
+        uint32_t dfl = spin_lock_irqsave(&damage_lock);
+        rx0 = dmg_x0; ry0 = dmg_y0; rx1 = dmg_x1; ry1 = dmg_y1;
+        dmg_x0 = dmg_y0 = dmg_x1 = dmg_y1 = 0;
+        spin_unlock_irqrestore(&damage_lock, dfl);
+    }
+    if (rx0 < 0) rx0 = 0;
+    if (ry0 < 0) ry0 = 0;
+    if (rx1 > fbsurf.w) rx1 = fbsurf.w;
+    if (ry1 > fbsurf.h) ry1 = fbsurf.h;
+    if (rx1 <= rx0 || ry1 <= ry0) return;       /* spurious wake */
+    int full_frame = (rx0 == 0 && ry0 == 0 &&
+                      rx1 == fbsurf.w && ry1 == fbsurf.h);
+    if (full_frame) frames_full++; else frames_partial++;
+
     struct gui_window* zsnap[GUI_MAX_WINDOWS];
     int   zn;
     int   cx, cy;
@@ -519,17 +619,23 @@ static void compose(void) {
           ww[GUI_MAX_WINDOWS], wh[GUI_MAX_WINDOWS];
 
     uint32_t fl = spin_lock_irqsave(&state_lock);
-    zn = zcount;
-    for (int i = 0; i < zn; i++) {
-        zsnap[i] = zorder[i];
-        wx[i] = zorder[i]->x;  wy[i] = zorder[i]->y;
-        ww[i] = zorder[i]->w;  wh[i] = zorder[i]->h;
+    zn = 0;
+    for (int i = 0; i < zcount; i++) {
+        if (zorder[i]->minimized) continue;     /* M22.3 */
+        zsnap[zn] = zorder[i];
+        wx[zn] = zorder[i]->x;  wy[zn] = zorder[i]->y;
+        ww[zn] = zorder[i]->w;  wh[zn] = zorder[i]->h;
+        zn++;
     }
     cx = mx; cy = my;
     dsnap = drag; dwin = drag_win; rw = rubber_w; rh = rubber_h;
     if (dwin) { rx = dwin->x; ry = dwin->y; }
     fsnap = focused_win;
     spin_unlock_irqrestore(&state_lock, fl);
+
+    /* Everything below is confined to the dirty rect by the clip box —
+     * a partial frame only touches (and finally blits) that region. */
+    gfx_set_clip(&backsurf, rx0, ry0, rx1 - rx0, ry1 - ry0);
 
     gfx_blit(&backsurf, 0, 0, &wallsurf, 0, 0, wallsurf.w, wallsurf.h);
 
@@ -548,12 +654,17 @@ static void compose(void) {
         gfx_text(&backsurf, x + 8, y + (TITLE_H - GFX_GLYPH_H + BORDER) / 2,
                  win->title, COL_TITLE_TEXT);
 
-        if (win->kind == WIN_APP) {
+        /* M22.3: every window gets minimize (_) + close (x). */
+        {
             int bx = x + w - BORDER - CLOSE_W - 3;
             int by = y + 4;
             gfx_fill(&backsurf, bx, by, CLOSE_W, CLOSE_H, COL_CLOSE_BG);
             gfx_text(&backsurf, bx + (CLOSE_W - GFX_GLYPH_W) / 2, by + 2, "x",
                      COL_CLOSE_FG);
+            int mx2 = bx - CLOSE_W - 3;
+            gfx_fill(&backsurf, mx2, by, CLOSE_W, CLOSE_H, 0xFF3A4A5Eu);
+            gfx_fill(&backsurf, mx2 + 3, by + CLOSE_H - 4, CLOSE_W - 6, 2,
+                     COL_TITLE_TEXT);
         }
 
         spin_lock(&win->lock);
@@ -577,7 +688,8 @@ static void compose(void) {
     if (shell && shell->draw) shell->draw(&backsurf);
 
     draw_cursor(&backsurf, cx, cy);
-    gfx_blit(&fbsurf, 0, 0, &backsurf, 0, 0, backsurf.w, backsurf.h);
+    gfx_clear_clip(&backsurf);
+    gfx_blit(&fbsurf, rx0, ry0, &backsurf, rx0, ry0, rx1 - rx0, ry1 - ry0);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -596,7 +708,7 @@ static void destroy_window(struct gui_window* win) {
     }
     if (drag_win == win) { drag = DRAG_NONE; drag_win = NULL; }
     struct gui_window* newfocus =
-        (focused_win == win) ? (zcount ? zorder[zcount - 1] : NULL) : focused_win;
+        (focused_win == win) ? top_visible_locked() : focused_win;
     focused_win = newfocus;
     spin_unlock_irqrestore(&state_lock, fl);
 
@@ -610,7 +722,7 @@ static void destroy_window(struct gui_window* win) {
     if (win->cells)   { kfree(win->cells); win->cells = NULL; }
     if (win->app_ctx) { kfree(win->app_ctx); win->app_ctx = NULL; }
     win->used = 0;
-    need_frame = 1;
+    gui_damage_all();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -661,7 +773,25 @@ static void apply_pending(void) {
         struct gui_window* win = &windows[i];
         if (!win->used) continue;
 
-        if (win->want_close) { win->want_close = 0; destroy_window(win); continue; }
+        if (win->want_close) {
+            if (win->kind == WIN_TERM && win->vc && win->vc->task) {
+                /* Kill the hosted shell first (cooperative — it dies at
+                 * its next vc_getchar yield), then reap; retry on the
+                 * next compositor pass until the reap succeeds.  Only
+                 * then is it safe to free the VC and the surface. */
+                struct task* t = win->vc->task;
+                task_kill(t->pid);
+                if (task_reap(t->pid) != 0) continue;   /* not DEAD yet */
+                win->vc->task = NULL;
+            }
+            if (win->kind == WIN_TERM && win->vc) {
+                vc_destroy(win->vc);
+                win->vc = NULL;
+            }
+            win->want_close = 0;
+            destroy_window(win);
+            continue;
+        }
 
         int nw = 0, nh = 0;
         uint32_t fl = spin_lock_irqsave(&state_lock);
@@ -693,8 +823,18 @@ static void gui_compositor_main(void) {
         uint64_t now = timer_ticks_ms();
         if (now - last_tick >= 500) {
             last_tick = now;
-            if (shell && shell->second_tick && shell->second_tick())
-                need_frame = 1;
+            if (shell && shell->second_tick && shell->second_tick()) {
+                /* Clock repaint only dirties the chrome strip — keeps
+                 * the 1 Hz tick on the cheap partial-frame path. */
+                if (work_h < fbsurf.h)
+                    gui_damage(0, work_h, fbsurf.w, fbsurf.h - work_h);
+                else
+                    gui_damage_all();
+            }
+            /* M22.3: per-window ~1 Hz ticks (task manager refresh). */
+            for (int i = 0; i < GUI_MAX_WINDOWS; i++)
+                if (windows[i].used && windows[i].on_tick)
+                    windows[i].on_tick(&windows[i]);
         }
 
         if (need_frame) {
@@ -713,6 +853,7 @@ static void gui_compositor_main(void) {
 static struct gui_window* topmost_at(int px, int py) {
     for (int i = zcount - 1; i >= 0; i--) {
         struct gui_window* w = zorder[i];
+        if (w->minimized) continue;             /* M22.3 */
         if (px >= w->x && px < w->x + w->w && py >= w->y && py < w->y + w->h)
             return w;
     }
@@ -730,6 +871,7 @@ static void raise_window(struct gui_window* win) {
 static void gui_mouse(int dx, int dy, unsigned buttons) {
     spin_lock(&state_lock);
 
+    int omx = mx, omy = my;                     /* for cursor damage */
     mx += dx;  my += dy;
     if (mx < 0) mx = 0;
     if (my < 0) my = 0;
@@ -754,13 +896,20 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
         if (win) {
             gui_wm_focus_raise_locked(win);
 
-            int in_close = (win->kind == WIN_APP &&
-                            mx >= win->x + win->w - BORDER - CLOSE_W - 3 &&
-                            mx <  win->x + win->w - BORDER - 3 &&
-                            my >= win->y + 4 &&
-                            my <  win->y + 4 + CLOSE_H);
+            int bx1 = win->x + win->w - BORDER - 3;          /* close right edge */
+            int in_btn_row = (my >= win->y + 4 && my < win->y + 4 + CLOSE_H);
+            int in_close = (in_btn_row &&
+                            mx >= bx1 - CLOSE_W && mx < bx1);
+            int in_min   = (in_btn_row &&
+                            mx >= bx1 - 2 * CLOSE_W - 3 &&
+                            mx <  bx1 - CLOSE_W - 3);
             if (in_close) {
                 win->want_close = 1;
+            } else if (in_min) {
+                win->minimized = 1;
+                struct gui_window* nf = top_visible_locked();
+                focused_win = nf;
+                if (nf && nf->kind == WIN_TERM) vc_focus(nf->vc);
             } else if (my < win->y + TITLE_H) {
                 drag     = DRAG_MOVE;
                 drag_win = win;
@@ -815,8 +964,44 @@ drag_update:
         drag_win = NULL;
     }
 
+    int structural = (pressed || released || drag != DRAG_NONE);
     spin_unlock(&state_lock);
-    need_frame = 1;
+
+    if (structural) {
+        gui_damage_all();                       /* focus/z/drag changes */
+    } else {
+        /* Pointer glide: only the cursor sprite areas are dirty. */
+        gui_damage(omx - 1, omy - 1, 14, 20);
+        gui_damage(mx - 1,  my - 1,  14, 20);
+    }
+}
+
+/* M22.3 — Alt-Tab.  Raw keycode hook, runs in the keyboard IRQ before
+ * keymap translation.  Rotate the top window to the bottom, then
+ * activate the new top visible window — repeated presses cycle. */
+static int gui_raw_key(uint8_t keycode, uint8_t mods) {
+    if (!gui_active) return 0;
+    if (keycode != KC_TAB || !(mods & KBD_MOD_LALT)) return 0;
+    spin_lock(&state_lock);
+    if (zcount >= 2) {
+        /* Demote the currently ACTIVE (top visible) window to the
+         * bottom, then activate the next visible one — repeated
+         * presses walk the whole visible set.  Rotating the raw top
+         * would stall on minimized windows parked at the top of the
+         * z-order. */
+        struct gui_window* cur = top_visible_locked();
+        if (cur) {
+            int i;
+            for (i = 0; i < zcount && zorder[i] != cur; i++) ;
+            for (; i > 0; i--) zorder[i] = zorder[i - 1];
+            zorder[0] = cur;
+            struct gui_window* nf = top_visible_locked();
+            if (nf) gui_wm_focus_raise_locked(nf);
+        }
+    }
+    spin_unlock(&state_lock);
+    gui_damage_all();
+    return 1;
 }
 
 static int gui_kbd_hook(char c) {
@@ -852,6 +1037,7 @@ static struct gui_window* window_alloc(const char* title, enum win_kind kind,
     win->widgets = NULL;  win->focusw = NULL;
     win->on_layout = NULL; win->on_close = NULL; win->app_ctx = NULL;
     win->cells = NULL; win->vc = NULL;
+    win->minimized = 0; win->on_tick = NULL;
     win->ccol = win->crow = win->cols = win->rows = 0;
     win->surf.px = NULL; win->surf.owns_px = 0;
     spin_lock_init(&win->lock);
@@ -866,7 +1052,7 @@ static void window_show(struct gui_window* win) {
     focused_win = win;
     spin_unlock_irqrestore(&state_lock, fl);
     if (win->kind == WIN_TERM) vc_focus(win->vc);
-    need_frame = 1;
+    gui_damage_all();
 }
 
 struct gui_window* gui_window_create(const char* title, int x, int y, int w, int h) {
@@ -968,6 +1154,7 @@ int gui_start(void) {
              work_h - GFX_GLYPH_H - 8, "d-os M22", 0xFF9FB6C9u);
 
     spin_lock_init(&state_lock);
+    spin_lock_init(&damage_lock);
     mx = fbsurf.w / 2;
     my = fbsurf.h / 2;
 
@@ -979,10 +1166,13 @@ int gui_start(void) {
 
     mouse_set_listener(gui_mouse);
     vc_set_kbd_hook(gui_kbd_hook);
+    vc_set_raw_kbd_hook(gui_raw_key);       /* Alt-Tab */
+    gui_damage_all();
 
     if (!task_spawn("compositor", gui_compositor_main)) {
         kprintf("gui: FATAL — compositor spawn failed\n");
         vc_set_kbd_hook(NULL);
+        vc_set_raw_kbd_hook(NULL);
         mouse_set_listener(NULL);
         vc_screen_suppress(0);
         gui_active = 0;

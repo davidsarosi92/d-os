@@ -1632,11 +1632,34 @@ from any shell with the `gui` command.
 - **CMOS RTC (`cmos_rtc.c`):** MC146818 read with update-in-progress
   double-read guard, BCD + 12h handling.  QEMU is fed
   `-rtc base=localtime` by run_qemu.sh so the clock matches the host.
-- **Known limits (deferred):** no window minimize; no per-window
-  damage rects (full recompose per frame); no Alt-Tab; no widget
-  nesting/containers; terminal windows have no close button (their
-  shell task would leak — needs task kill support); cursor is
-  IRQ-latency bound (one tick worst case).
+- **Window lifecycle (M22.3):** every window has minimize (_) and
+  close (x) buttons.  Closing a TERMINAL window is a retried state
+  machine on the compositor: task_kill the hosted shell (cooperative,
+  kthread_stop-style — see task.h), wait for DEAD, task_reap (stack +
+  struct reclaimed), vc_destroy (VC slot reusable), then normal
+  teardown.  Taskbar buttons follow Windows semantics via
+  gui_wm_taskbar_activate_locked (minimized→restore, focused→
+  minimize, else→raise); Alt-Tab (raw-keycode hook
+  vc_set_raw_kbd_hook, pre-keymap dispatch from both keyboard
+  drivers) demotes the active window and activates the next visible
+  one.
+- **Damage-rect composition (M22.3):** gfx surfaces gained a clip
+  box; the compositor accumulates a dirty rect (typing damages one
+  window, pointer glides damage two cursor-sized rects, the clock
+  damages the chrome strip) and recomposes ONLY that region — correct
+  because the backbuffer persists between frames.  `gui stats`
+  prints the full/partial frame counters (typing: partial dominates,
+  e.g. 1 full / 20 partial).
+- **Task manager (`apps/taskman.c`):** GUI_APP singleton; lists every
+  task (pid, state, CPU ms — per-task accounting added to the
+  scheduler at the context-switch boundary), ~1 Hz auto-refresh via
+  the new gui_window_set_tick hook, "End task" button → task_kill
+  (compositor guarded by name; pid 0 + idles refused by task_kill).
+  CLI siblings: `kill <pid>`, and `ps` grew a CPUMS column.
+- **Known limits (deferred):** no widget nesting/containers; killing
+  a CPU-bound kernel thread requires it to poll task_should_stop()
+  (the kthread contract — forced kill needs ring-3 processes, §M25);
+  cursor is IRQ-latency bound (one tick worst case).
 
 ---
 
@@ -1767,6 +1790,22 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-04 — M22.3: task manager + window lifecycle + damage rects.**
+  Scheduler: task_kill/task_should_stop/task_reap (cooperative
+  kthread_stop contract — spinlocks don't disable preemption here, so
+  arbitrary-point kills are unsafe by design; kill lands at
+  task_yield, CPU hogs must poll), per-task cpu_ms accounting at the
+  switch boundary, `kill` command, `ps` CPUMS column.  vc_destroy
+  frees offscreen VC slots.  GUI: minimize + close on every window
+  (terminal close = kill→wait-DEAD→reap→vc_destroy state machine on
+  the compositor), Windows-style taskbar button semantics, Alt-Tab
+  via a raw-keycode hook dispatched pre-keymap from both keyboard
+  drivers, per-window ~1 Hz tick hook, and dirty-rect composition
+  (gfx clip boxes + damage accumulation; `gui stats` counters — 
+  typing runs 20:1 partial:full).  New Task Manager app (list, CPU
+  time, End task).  Verified in QEMU i386 (7-step scripted run) +
+  x86_64 build.  Deferred: widget containers; forced kill (needs
+  M25 user processes).
 - **2026-07-04 — §S.1: command-shell provider registry.**
   Third registry after GUI_APP/DESKTOP_SHELL: `SHELL_PROVIDER(name,
   entry)` (shell_provider.h + `shell_providers` linker section).  The

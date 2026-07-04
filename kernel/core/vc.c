@@ -365,6 +365,15 @@ static int (*kbd_hook)(char c) = NULL;
 
 void vc_set_kbd_hook(int (*fn)(char c)) { kbd_hook = fn; }
 
+/* M22.3: raw keycode intercept, pre-translation (Alt-Tab). */
+static int (*raw_kbd_hook)(uint8_t, uint8_t) = NULL;
+
+void vc_set_raw_kbd_hook(int (*fn)(uint8_t, uint8_t)) { raw_kbd_hook = fn; }
+
+int vc_raw_kbd_dispatch(uint8_t keycode, uint8_t mods) {
+    return raw_kbd_hook ? raw_kbd_hook(keycode, mods) : 0;
+}
+
 void vc_kbd_push(char c) {
     if (kbd_hook && kbd_hook(c)) return;        /* consumed by the GUI */
     struct vc* v = focused;             /* snapshot — pointer-sized atomic */
@@ -430,3 +439,22 @@ struct vc* vc_create_offscreen(void (*emit)(void* ctx, char c), void* ctx) {
 
 void vc_screen_suppress(int on) { screen_suppressed = on ? 1 : 0; }
 int  vc_screen_suppressed(void) { return screen_suppressed; }
+
+void vc_destroy(struct vc* v) {
+    if (!v || v->leaf) return;              /* pane VCs are not destroyable */
+    /* Keep the IRQ side (vc_kbd_push / vc_focus_by_id) from touching a
+     * dying VC: fix `focused` first, then compact the table.  Same
+     * preempt_disable discipline as the split-tree mutations; the
+     * pointer writes themselves are atomic. */
+    preempt_disable();
+    if (focused == v) focused = NULL;       /* GUI refocuses explicitly */
+    for (int i = 0; i < vc_n; i++) {
+        if (vcs[i] == v) {
+            for (; i < vc_n - 1; i++) vcs[i] = vcs[i + 1];
+            vcs[--vc_n] = NULL;
+            break;
+        }
+    }
+    preempt_enable();
+    kfree(v);
+}

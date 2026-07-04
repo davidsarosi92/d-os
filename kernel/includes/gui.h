@@ -83,4 +83,20 @@ void* gui_window_ctx(struct gui_window* win);
  * dispatch redraws automatically). */
 void gui_window_request_redraw(struct gui_window* win);
 
+/* M22.3 — ~1 Hz callback on the compositor task (task-manager style
+ * auto-refresh).  NULL to disable. */
+void gui_window_set_tick(struct gui_window* win,
+                         void (*fn)(struct gui_window*));
+
+/* M22.3 — damage interface.  gui_damage marks a screen rect dirty;
+ * the compositor recomposes ONLY the accumulated dirty region
+ * (clip-box composition).  Most callers want the window helpers /
+ * gui_request_frame instead; these are for advanced users. */
+void gui_damage(int x, int y, int w, int h);
+void gui_damage_all(void);
+
+/* Frame counters since gui_start: full-screen vs. partial (dirty-rect)
+ * recomposes.  Backs the `gui stats` shell command. */
+void gui_get_stats(unsigned* full, unsigned* partial);
+
 #endif
