@@ -1565,11 +1565,22 @@ Diagnosed 2026-07-04; three stacked causes, two of them ours.
    drop below perception.  Note the option for later: virtio-gpu
    with explicit flush gives a real present boundary (candidate for
    a post-M24 driver).
+4. **Program close propagates to the Task Manager immediately
+   (user report, 2026-07-04).**  Today a closed/killed program only
+   shows up at the next 1 Hz tick, and DEAD entries linger forever
+   unless a window teardown reaps them.  Fix: (a) window close /
+   task_kill raises an immediate taskman refresh (event, not tick);
+   (b) the task manager opportunistically task_reap()s DEAD tasks
+   that are safe to collect (not current on any CPU, not owned by a
+   live window), so closed programs DROP OFF the list instead of
+   accumulating as DEAD rows.
 
 **Definition of done:**
 - Gliding the cursor across window chrome shows no flicker/ghosting
   (visual check in a live QEMU window, not screendumps).
 - Dragging a window keeps `gui stats` partial-frame dominated.
+- Closing a window updates the Task Manager list within one frame;
+  DEAD entries of closed programs disappear from it.
 - Lessons learned recorded (compose snapshot ordering).
 
 ## §M23 — Audio subsystem
