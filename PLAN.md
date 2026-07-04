@@ -48,6 +48,7 @@
 | §M22.2 | GUI modularity — desktop-shell interface, app registry, docs | ~1475 |
 | §M22.3 | Desktop polish — task manager, task_kill, minimize, Alt-Tab | ~1545 |
 | §M22.4 | Compositor smoothness — cursor race, drag damage, tearing | ~1580 |
+| §M22.5 | Desktop apps — editor, BASIC, file manager 2.0, maximize | ~1620 |
 | §M23 | Audio subsystem | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) | ~1080 |
 | §M25 | Userland foundation (Wayland prerequisites) | ~1545 |
@@ -170,6 +171,7 @@ what); a session can pick a theme and push on it.
 | M22.2 | GUI modularity — swappable desktop shell + app registry + GUI dev docs | UX | ✅ DOCS §4.14 |
 | M22.3 | Desktop polish — task manager, task_kill, term-window close, minimize, Alt-Tab, damage rects | UX | ✅ DOCS §4.13 |
 | M22.4 | Compositor smoothness — cursor-damage race, rect-bounded drag, tearing mitigation | UX | §M22.4 |
+| M22.5 | Desktop apps — text editor, BASIC interpreter, file manager 2.0, maximize/restore | UX | §M22.5 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | §M25 |
@@ -1583,6 +1585,52 @@ Diagnosed 2026-07-04; three stacked causes, two of them ours.
   DEAD entries of closed programs disappear from it.
 - Lessons learned recorded (compose snapshot ordering).
 
+## §M22.5 — Desktop apps: editor, BASIC, file manager 2.0, maximize
+
+**Why:** turn the desktop from a demo into a place where you can DO
+something: write a program on d-os, run it on d-os.  List agreed
+2026-07-04.
+
+**Design — staged.**
+
+1. **Navigation keys end-to-end (prerequisite).**  Arrows, Home/End,
+   Delete, PgUp/PgDn currently die in the keyboard pipeline (ASCII
+   only).  Extend the key path so widgets receive keycode-level
+   events (reuse the raw-hook shape, but routed to the focused
+   widget like chars are); listviews gain keyboard navigation.
+2. **Multiline editor widget** (widget toolkit): scrollable text
+   buffer, cursor movement, insert/delete, viewport tracking.  The
+   single biggest chunk — build it as a widget so any app can embed
+   it.
+3. **Clipboard:** kernel-global text clipboard + Ctrl+C/X/V in the
+   editor widget and textinput.
+4. **Text editor app** (`GUI_APP`): open / save / save-as via VFS on
+   top of the editor widget.
+5. **BASIC interpreter** (`run` app + shell command): Tiny-BASIC
+   dialect, runs as a kernel task under the kthread contract (Task
+   Manager can stop it), output in its own window.  Interpreter, not
+   native codegen — ring-0 codegen is a footgun and M25 userland
+   will give the real compile story; keep a compile-to-bytecode
+   extension point.
+6. **File manager 2.0 (Windows/Linux-like):** VFS grows
+   `vfs_rename` + copy + recursive delete; UI grows size/type
+   columns, sorting, editable path bar, keyboard navigation, and
+   double-click file-type association (extension → app registry;
+   .txt/.bas open in the editor).
+7. **Maximize / restore:** title-bar max button + double-click on
+   the title bar; saved normal geometry; work-area aware (respects
+   the taskbar strip).
+
+**Definition of done — one connected story:** write a small BASIC
+program in the editor, save it to /mnt, double-click it in the file
+manager, its output appears in its own window; maximize the editor
+and restore it.  Plus: rename + copy + delete a file in the file
+manager; arrows/Home/End work in the editor and listviews.
+
+**Out of scope (tracked separately):** terminal scrollback, icon /
+tree views in the file manager, clipboard history, native code
+generation (post-M25).
+
 ## §M23 — Audio subsystem
 
 **Why now:** after GUI infrastructure (M22), sound is the natural
@@ -1762,6 +1810,13 @@ subsurfaces beyond the minimum xdg_shell needs, XWayland.
 
 ## Change log
 
+- **2026-07-04** — Added §M22.5 (desktop apps): text editor (multiline
+  editor widget + clipboard + navigation keys as prerequisites),
+  Tiny-BASIC interpreter (kthread contract; interpreter over ring-0
+  codegen by design), file manager 2.0 (vfs_rename/copy/recursive
+  delete, columns, sorting, file-type association), window
+  maximize/restore.  DoD is one connected story: write BASIC in the
+  editor, run from the file manager, output in a window.
 - **2026-07-04** — Added §M22.4 (compositor smoothness): diagnosed
   the drag "swimming" + cursor ghosting — (1) compose() snapshots
   damage before the cursor position, so fast pointer motion clips

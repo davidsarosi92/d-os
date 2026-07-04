@@ -58,7 +58,11 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   reorg to satisfy SYSRET's selector arithmetic).
 - **§M22.4** — Compositor smoothness: cursor-damage race fix
   (compositor-side cursor bookkeeping), rect-bounded drag damage,
-  tearing notes.  Small; diagnosed 2026-07-04.
+  tearing notes + immediate Task Manager refresh on program close.
+  Small; diagnosed 2026-07-04.
+- **§M22.5** — Desktop apps: text editor (multiline widget +
+  clipboard + nav keys), Tiny-BASIC interpreter, file manager 2.0
+  (vfs_rename/copy, associations), maximize/restore.
 
 🔲 **PLAN extensions (placeholders, design only):**
 - §M23 — Audio subsystem (AC97 → HDA → I2S).
