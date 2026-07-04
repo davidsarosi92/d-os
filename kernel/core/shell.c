@@ -34,6 +34,7 @@
 #include "slab.h"
 #include "gui.h"
 #include "gui_app.h"
+#include "shell_provider.h"
 
 #define LINE_MAX        128             /* max accepted bytes per command line */
 #define DEFAULT_PROMPT  "d-os> "        /* fallback when config is unavailable */
@@ -318,7 +319,7 @@ static void cmd_pane_split(struct vc* my_vc, enum vc_split_dir dir) {
      * runqueue can pick it (preempt_disable) so the task's first
      * kprintf already routes through vc_putchar(nv, ...). */
     preempt_disable();
-    struct task* t = task_spawn("shell", shell_task_entry);
+    struct task* t = task_spawn("shell", shell_provider_active()->entry);
     if (t) {
         task_set_out_console(t, nv);
         nv->task = t;
@@ -878,6 +879,23 @@ void shell_run(struct vc* v) {
 /* Task entry-point wrapper.  task_spawn doesn't pass arguments, so we
  * read the bound VC out of our own task->out_console (set by the spawner
  * under preempt_disable before we were first scheduled). */
+/* §S.1 — this full-featured shell is just one registered provider.
+ * Alternatives (rescue_shell.c) register the same way; spawn sites
+ * pick via shell_provider_active(). */
+SHELL_PROVIDER("d-os", shell_task_entry);
+
+const struct shell_provider* shell_provider_active(void) {
+    const char* want = config_get("shell.provider", "d-os");
+    for (int pass = 0; pass < 2; pass++) {
+        const char* name = pass == 0 ? want : "d-os";
+        for (int i = 0; i < shell_provider_count(); i++) {
+            const struct shell_provider* p = shell_provider_at(i);
+            if (streq(p->name, name)) return p;
+        }
+    }
+    return shell_provider_at(0);        /* shell.c is linked → never NULL */
+}
+
 void shell_task_entry(void) {
     struct task* me = task_current();
     struct vc*   v  = me ? (struct vc*)me->out_console : NULL;

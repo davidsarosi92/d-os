@@ -1767,6 +1767,16 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-04 — §S.1: command-shell provider registry.**
+  Third registry after GUI_APP/DESKTOP_SHELL: `SHELL_PROVIDER(name,
+  entry)` (shell_provider.h + `shell_providers` linker section).  The
+  full shell registers as "d-os"; new `kernel/core/rescue_shell.c`
+  ("rescue", 3 commands) proves the swap.  All three spawn sites
+  (kernel.c boot shell, `pane split`, GUI terminal windows) resolve
+  via `shell_provider_active()` — the `shell.provider` config key —
+  instead of `extern shell_task_entry`.  Verified in QEMU i386:
+  `setconf shell.provider rescue` + `gui` → both terminal windows run
+  the rescue prompt, `help` answers.
 - **2026-07-04 — M22.2: GUI modularity — swappable desktop shells + app registry + dev docs.**
   The desktop chrome and app launching moved out of the compositor
   core behind two linker-section registries (MODULE() pattern):

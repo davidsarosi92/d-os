@@ -261,14 +261,24 @@ int      hal_meminfo(struct hal_mem_region* out, int max);
 
 ---
 
-## §S — Shell as swappable console provider — **shipped with M14**
+## §S — Shell as swappable console provider — **shipped: M14 + §S.1**
 
-The console abstraction landed in M14 as `struct vc` (virtual
-console) — a leaf in the FB split tree.  Each shell runs as its own
-task bound to its own `vc`; `kprintf` routing happens through
-console.c's per-task emit hook installed by vc_init.  See DOCS.md
-§4.X (Virtual consoles / pane split) for the as-built shape.  The
-notes below survive only as the design-time rationale.
+The CONSOLE half landed in M14 as `struct vc` (virtual console) —
+each shell runs as its own task bound to its own `vc`, `kprintf`
+routing via console.c's per-task emit hook.  The PROVIDER half (the
+`shell_provider` sketch below) was only finished in **§S.1
+(2026-07-04)**, prompted by the M22.2 modularity review: until then
+all three spawn sites hard-wired `extern shell_task_entry`.
+
+**§S.1 as built:** `SHELL_PROVIDER(name, entry)` linker-section
+registry (shell_provider.h, same pattern as MODULE()/GUI_APP());
+the full shell registers as "d-os", `kernel/core/rescue_shell.c`
+registers "rescue" (3-command proof-of-swap); boot shell, `pane
+split` and GUI terminal windows all resolve through
+`shell_provider_active()` = the `shell.provider` config key.
+Verified in QEMU: `setconf shell.provider rescue` + `gui` → both
+terminal windows run the rescue prompt.  The notes below survive
+only as the design-time rationale.
 
 **Goal:** the shell is not a special kernel function but a registered
 "console provider" that runs against an abstract `console` instance.
@@ -1713,6 +1723,10 @@ subsurfaces beyond the minimum xdg_shell needs, XWayland.
 
 ## Change log
 
+- **2026-07-04** — §S.1 shipped: SHELL_PROVIDER() registry closes the
+  provider half of §S (the M14 checkmark had overstated it) — boot /
+  pane / GUI-window shells resolve via the `shell.provider` config
+  key; rescue_shell.c is the swap proof.
 - **2026-07-04** — §M22.2 shipped: GUI_APP() + DESKTOP_SHELL()
   registries, shell_vista/shell_bare, apps under kernel/gui/apps/,
   `launch` command, DOCS §4.14 dev guide.  Section condensed.

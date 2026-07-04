@@ -137,6 +137,7 @@ ifeq ($(ARCH),i386)
 CORE_C_SRCS := \
     kernel/core/kernel.c \
     kernel/core/shell.c \
+    kernel/core/rescue_shell.c \
     kernel/core/printf.c \
     kernel/core/multiboot.c \
     kernel/core/console.c \
@@ -192,6 +193,7 @@ else
 CORE_C_SRCS := \
     kernel/core/kernel.c \
     kernel/core/shell.c \
+    kernel/core/rescue_shell.c \
     kernel/core/printf.c \
     kernel/core/multiboot.c \
     kernel/core/console.c \

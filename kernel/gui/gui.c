@@ -48,8 +48,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* shell.c export — same task entry the pane-split path spawns. */
-extern void shell_task_entry(void);
+/* S.1: terminal windows spawn the ACTIVE shell provider — no direct
+ * symbol reference to any particular shell implementation. */
+#include "shell_provider.h"
 
 /* -------------------------------------------------------------------------- */
 /* Metrics + palette (window chrome only — desktop chrome is the shell's).    */
@@ -890,7 +891,7 @@ struct gui_window* gui_window_create(const char* title, int x, int y, int w, int
     }
 
     preempt_disable();
-    struct task* t = task_spawn("shell", shell_task_entry);
+    struct task* t = task_spawn("shell", shell_provider_active()->entry);
     if (t) {
         task_set_out_console(t, win->vc);
         win->vc->task = t;

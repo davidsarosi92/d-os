@@ -35,6 +35,7 @@
 
 #include "console.h"
 #include "shell.h"
+#include "shell_provider.h"
 #include "printf.h"
 #include "acpi.h"
 #include "hal_api.h"
@@ -394,13 +395,15 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      *                    very first kprintf already routes into its VC.
      * ----------------------------------------------------------------- */
     {
-        extern void shell_task_entry(void);
-
+        /* S.1: the boot shell is whatever provider shell.provider
+         * selects (config may already be loaded from /etc at this
+         * point); default is the full "d-os" shell. */
         vc_init();
         struct vc* root_vc = vc_root();
         if (root_vc) {
             preempt_disable();
-            struct task* shell0 = task_spawn("shell", shell_task_entry);
+            struct task* shell0 =
+                task_spawn("shell", shell_provider_active()->entry);
             if (shell0) {
                 task_set_out_console(shell0, root_vc);
                 root_vc->task = shell0;

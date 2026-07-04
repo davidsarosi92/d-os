@@ -66,6 +66,15 @@ SECTIONS
         __stop_desktop_shells = .;
     }
 
+    /* Command-shell provider registry (S.1) — SHELL_PROVIDER() entries;
+     * spawn sites resolve the active one via the shell.provider key. */
+    .shell_providers : ALIGN(4)
+    {
+        __start_shell_providers = .;
+        KEEP(*(shell_providers))
+        __stop_shell_providers = .;
+    }
+
     .data BLOCK(4K) : ALIGN(4K)
     {
         *(.data)
