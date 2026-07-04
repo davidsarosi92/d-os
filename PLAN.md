@@ -47,6 +47,7 @@
 | §M22 | GUI infrastructure — ✅ shipped (see DOCS §4.13) | ~1405 |
 | §M22.2 | GUI modularity — desktop-shell interface, app registry, docs | ~1475 |
 | §M22.3 | Desktop polish — task manager, task_kill, minimize, Alt-Tab | ~1545 |
+| §M22.4 | Compositor smoothness — cursor race, drag damage, tearing | ~1580 |
 | §M23 | Audio subsystem | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) | ~1080 |
 | §M25 | Userland foundation (Wayland prerequisites) | ~1545 |
@@ -168,6 +169,7 @@ what); a session can pick a theme and push on it.
 | M22 | GUI infrastructure — compositor, windows, mouse, widgets, taskbar, file manager | UX | ✅ DOCS §4.13 |
 | M22.2 | GUI modularity — swappable desktop shell + app registry + GUI dev docs | UX | ✅ DOCS §4.14 |
 | M22.3 | Desktop polish — task manager, task_kill, term-window close, minimize, Alt-Tab, damage rects | UX | ✅ DOCS §4.13 |
+| M22.4 | Compositor smoothness — cursor-damage race, rect-bounded drag, tearing mitigation | UX | §M22.4 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | §M25 |
@@ -1532,6 +1534,44 @@ partial:full).
 **Deferred:** widget containers (vbox/hbox — the task manager's
 manual layout stayed readable without them).
 
+## §M22.4 — Compositor smoothness: cursor race, drag damage, tearing
+
+**Why:** live use shows the scene "swimming" during drags and the
+cursor flickering/ghosting when glided over contrasting objects.
+Diagnosed 2026-07-04; three stacked causes, two of them ours.
+
+**Design — three fixes, in impact order.**
+
+1. **Cursor-damage race (the flicker).**  compose() snapshots the
+   damage rect BEFORE the WM state, so the cursor-position snapshot
+   can be newer than the damaged region — the cursor gets erased at
+   its old spot but clipped away at its new one for that frame.
+   Fix: the compositor keeps `last_drawn_cursor_x/y` and always
+   unions BOTH the previously-drawn and the freshly-snapshotted
+   cursor rects into the clip region.  Erase + redraw then happen in
+   the same frame with one consistent position, independent of
+   IRQ-side damage timing.  The IRQ's pointer-glide path shrinks to
+   a bare wake (need_frame) — no more cursor rects from IRQ context.
+2. **Rect-bounded drag damage (the swimming).**  DRAG_MOVE currently
+   raises gui_damage_all() on EVERY motion event — a full 1280×800
+   recompose + ~4 MB unsynced blit per event.  Fix: damage only
+   old-rect ∪ new-rect (with the +5 shadow margin) per motion;
+   press/release keep damage_all (z-order/focus changes are rare).
+   DRAG_RESIZE may keep damage_all first (rubber band is thin but
+   spans the window; optimize only if still visible).
+3. **Tearing (the residue).**  QEMU's std-VGA has no vblank to sync
+   against, so large blits can shear mid-scanout.  Not fully fixable
+   on this device; fixes 1–2 shrink the blits enough that it should
+   drop below perception.  Note the option for later: virtio-gpu
+   with explicit flush gives a real present boundary (candidate for
+   a post-M24 driver).
+
+**Definition of done:**
+- Gliding the cursor across window chrome shows no flicker/ghosting
+  (visual check in a live QEMU window, not screendumps).
+- Dragging a window keeps `gui stats` partial-frame dominated.
+- Lessons learned recorded (compose snapshot ordering).
+
 ## §M23 — Audio subsystem
 
 **Why now:** after GUI infrastructure (M22), sound is the natural
@@ -1711,6 +1751,12 @@ subsurfaces beyond the minimum xdg_shell needs, XWayland.
 
 ## Change log
 
+- **2026-07-04** — Added §M22.4 (compositor smoothness): diagnosed
+  the drag "swimming" + cursor ghosting — (1) compose() snapshots
+  damage before the cursor position, so fast pointer motion clips
+  the cursor out of its own frame; (2) DRAG_MOVE raises full-screen
+  damage per motion event; (3) no vblank on QEMU std-VGA.  Fix plan
+  recorded, not yet implemented.
 - **2026-07-04** — §M22.3 shipped: task manager + cooperative
   task_kill (kthread contract) + cpu_ms accounting + terminal-window
   close (vc_destroy) + minimize + Alt-Tab + dirty-rect composition.
