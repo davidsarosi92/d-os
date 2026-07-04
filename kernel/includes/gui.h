@@ -41,6 +41,17 @@ int  gui_is_active(void);
  * geometry in pixels, including decorations. */
 struct gui_window* gui_window_create(const char* title, int x, int y, int w, int h);
 
+/* M22.5 — terminal window hosting a CUSTOM task instead of a shell
+ * (the BASIC interpreter uses this).  The task's kprintf output lands
+ * in the window (out_console = the window's offscreen VC), keyboard
+ * input reaches it via vc_getchar on that VC, and closing the window
+ * kills + reaps it under the kthread contract — so the entry MUST hit
+ * task_yield / vc_getchar / task_should_stop regularly. */
+struct gui_window* gui_window_create_task(const char* title, int x, int y,
+                                          int w, int h,
+                                          const char* task_name,
+                                          void (*entry)(void));
+
 /* Create an APP (widget) window.  `on_layout` is called with the
  * window whenever the content size is (re)established — create widgets
  * in your builder AFTER this call returns, position them in on_layout.
@@ -57,6 +68,9 @@ void gui_window_close(struct gui_window* win);
 
 /* Raise + focus a window (used by singleton apps on re-launch). */
 void gui_window_raise(struct gui_window* win);
+
+/* M22.5 — retitle a window (editor shows the open file's name). */
+void gui_window_set_title(struct gui_window* win, const char* title);
 
 /* Optional close notification (runs on the compositor task, before the
  * widgets/ctx are freed).  Apps use it to drop their singletons. */

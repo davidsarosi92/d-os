@@ -124,6 +124,14 @@ struct inode_ops {
      * data + the inode; the VFS frees the dentry.  (Signature fixed in
      * M22.1 when the first implementation landed.) */
     int (*unlink)(struct inode* dir, const char* name, struct inode* child);
+    /* M22.5 — rename `child` from oldname to newname INSIDE `dir`
+     * (same-directory only; cross-directory moves are a later
+     * milestone).  The fs updates whatever private naming state it
+     * keeps (ramfs: nothing — names live in VFS dentries); the VFS
+     * rewrites the dentry on success.  NULL = unsupported (exFAT
+     * would need a directory-entry rewrite — deferred). */
+    int (*rename)(struct inode* dir, const char* oldname,
+                  const char* newname, struct inode* child);
 };
 
 /* Inode — owned by the fs that created it.  `private` is fs-defined. */
@@ -202,6 +210,19 @@ int  vfs_create(const char* path);          /* zero-byte regular file */
  * Caveat (single-user teaching kernel): open file handles to the
  * removed inode are NOT tracked — close them first. */
 int  vfs_unlink(const char* path);
+
+/* M22.5 — rename WITHIN one directory: both paths must share the same
+ * parent.  Returns 0, -1 on failure (unsupported fs, missing source),
+ * -2 if the new name already exists. */
+int  vfs_rename(const char* oldpath, const char* newpath);
+
+/* M22.5 — copy a regular file (read/write loop through the fs ops;
+ * dst is created/truncated).  Returns 0 / -1. */
+int  vfs_copy(const char* src, const char* dst);
+
+/* M22.5 — remove a file or a directory TREE (depth-limited to 8).
+ * Returns 0 on success; on failure the tree may be partially removed. */
+int  vfs_unlink_recursive(const char* path);
 
 /* Internal helper exposed for filesystems implementing `mount` and
  * lazy `lookup`: attach a freshly-allocated dentry+inode pair under an

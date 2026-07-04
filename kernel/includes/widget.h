@@ -31,6 +31,15 @@ struct widget_ops {
     /* (lx,ly) relative to the widget; kind: 0 = click, 1 = double. */
     void (*mouse)(struct widget* w, int lx, int ly, int kind);
     void (*key)  (struct widget* w, char c);
+    /* M22.5 — raw keycode event (KC_* from keymap.h + modifier mask).
+     * Delivered to the FOCUSED widget for keys that produce no
+     * character (arrows, Home/End, Delete, PgUp/PgDn) and for
+     * Ctrl+letter shortcuts (clipboard, save).  NULL = ignored. */
+    void (*keycode)(struct widget* w, uint8_t kc, uint8_t mods);
+    /* M22.5 — optional destructor for widget-owned heap objects (the
+     * editor's text buffer).  Runs on the compositor task during
+     * window teardown, BEFORE the widget struct itself is kfree'd. */
+    void (*destroy)(struct widget* w);
 };
 
 struct widget {
@@ -93,6 +102,34 @@ struct w_textinput {
 struct w_textinput* w_textinput_create(struct gui_window* win, int x, int y,
                                        int w, void* ctx);
 void w_textinput_set(struct w_textinput* t, const char* text);
+
+/* ---- Multiline text editor (M22.5, w_editor.c) -------------------------------
+ * Scrollable text buffer with cursor, selection (Shift+arrows),
+ * clipboard (Ctrl+C/X/V), viewport tracking.  The buffer is
+ * kmalloc'd and grows on demand; `len` is authoritative (the buffer
+ * is kept NUL-terminated as a convenience for w_editor_text). */
+#define WED_ROW_H  10                   /* 8 px glyph + 2 px leading */
+
+struct w_editor {
+    struct widget base;
+    char* buf;                          /* cap bytes, buf[len] == 0     */
+    int   cap, len;
+    int   cursor;                       /* byte offset, 0..len          */
+    int   anchor;                       /* selection anchor, -1 = none  */
+    int   scroll_line, scroll_col;      /* viewport origin (line, col)  */
+    int   pref_col;                     /* sticky column for up/down    */
+    int   modified;                     /* dirty flag (apps clear it)   */
+    /* Ctrl+letter combos the widget itself doesn't consume (C/X/V/A
+     * are handled internally) are forwarded here — the editor app
+     * binds Ctrl+S to save through this. */
+    void (*on_shortcut)(struct w_editor* e, uint8_t kc, void* ctx);
+};
+struct w_editor* w_editor_create(struct gui_window* win, int x, int y,
+                                 int w, int h, void* ctx);
+/* Replace the whole content (len < 0 → strlen).  Returns 0 / -1 (OOM). */
+int  w_editor_set_text(struct w_editor* e, const char* text, int len);
+/* NUL-terminated view of the content; *out_len = e->len if non-NULL. */
+const char* w_editor_text(struct w_editor* e, int* out_len);
 
 /* ---- Generic helpers (used by gui.c) ----------------------------------------- */
 void widget_draw_all(struct widget* head, struct gfx_surface* s);

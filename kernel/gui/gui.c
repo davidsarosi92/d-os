@@ -115,6 +115,13 @@ struct gui_window {
     int  minimized;                     /* skipped by compose + hit-test  */
     void (*on_tick)(struct gui_window*);/* APP: ~1 Hz on compositor task  */
 
+    /* M22.5 — maximize/restore.  `maximized` windows fill the work
+     * area (screen minus the shell's bottom reserve); the pre-maximize
+     * outer rect is stashed for restore.  Move/resize are disabled
+     * while maximized. */
+    int  maximized;
+    int  sav_x, sav_y, sav_w, sav_h;
+
     /* IRQ → compositor handoff (state_lock). */
     int  pending_w, pending_h;
     volatile int want_close;
@@ -223,6 +230,13 @@ static volatile uint32_t evq_h = 0, evq_t = 0;
 static volatile char     keyq[KEYQ_SZ];
 static volatile uint32_t keyq_h = 0, keyq_t = 0;
 
+/* M22.5 — raw keycode queue (nav/editing keys + Ctrl shortcuts for the
+ * focused APP window).  Entry: kc | mods << 8.  Same SPSC shape as
+ * keyq: keyboard IRQ produces, compositor consumes. */
+#define KCQ_SZ 32
+static volatile uint16_t kcq[KCQ_SZ];
+static volatile uint32_t kcq_h = 0, kcq_t = 0;
+
 /* App-launch queue + power request (shell chrome → compositor task). */
 #define LQ_SZ 8
 static const struct gui_app_def* volatile launchq[LQ_SZ];
@@ -264,6 +278,33 @@ const struct gui_app_def* gui_app_find(const char* name) {
             while (*a && *b && lower(*a) == lower(*b)) { a++; b++; }
             if (*b == 0 && (pass == 1 || *a == 0))
                 return &__start_gui_apps[i];
+        }
+    }
+    return NULL;
+}
+
+/* M22.5 — extension → app association (see gui_app.h). */
+const struct gui_app_def* gui_app_for_path(const char* path) {
+    if (!path) return NULL;
+    const char* ext = NULL;                     /* after the last '.' */
+    for (const char* p = path; *p; p++) {
+        if (*p == '.')      ext = p + 1;
+        else if (*p == '/') ext = NULL;         /* dot belonged to a dir */
+    }
+    if (!ext || !*ext) return NULL;
+
+    for (int i = 0; i < gui_app_count(); i++) {
+        const char* list = __start_gui_apps[i].extensions;
+        if (!list || !__start_gui_apps[i].open_path) continue;
+        const char* p = list;
+        while (*p) {
+            while (*p == ' ') p++;
+            const char* a = p;                  /* one list entry */
+            const char* b = ext;
+            while (*a && *a != ' ' && *b && lower(*a) == lower(*b)) { a++; b++; }
+            if ((*a == 0 || *a == ' ') && *b == 0)
+                return &__start_gui_apps[i];
+            while (*p && *p != ' ') p++;
         }
     }
     return NULL;
@@ -529,6 +570,13 @@ void gui_window_raise(struct gui_window* win) {
     gui_damage_all();
 }
 
+void gui_window_set_title(struct gui_window* win, const char* title) {
+    if (!win || !win->used || !title) return;
+    str_copy(win->title, title, (int)sizeof(win->title));
+    gui_damage_win(win);                    /* repaint chrome (and taskbar
+                                             * on the next full frame) */
+}
+
 void gui_wm_focus_raise_locked(struct gui_window* w) {
     if (!w || !w->used) return;
     w->minimized = 0;                       /* activating always restores */
@@ -542,6 +590,28 @@ static struct gui_window* top_visible_locked(void) {
     for (int i = zcount - 1; i >= 0; i--)
         if (!zorder[i]->minimized) return zorder[i];
     return NULL;
+}
+
+/* M22.5 — maximize/restore toggle.  WM lock held (mouse IRQ).  The
+ * geometry change goes through the pending-resize handoff so the
+ * surface realloc happens on the compositor task, exactly like a
+ * grip-resize release. */
+static void toggle_maximize_locked(struct gui_window* w) {
+    if (!w || !w->used) return;
+    if (!w->maximized) {
+        w->sav_x = w->x;  w->sav_y = w->y;
+        w->sav_w = w->w;  w->sav_h = w->h;
+        w->x = 0;  w->y = 0;
+        w->pending_w = fbsurf.w;                /* work-area aware: height */
+        w->pending_h = work_h;                  /* stops above the taskbar */
+        w->maximized = 1;
+    } else {
+        w->x = w->sav_x;  w->y = w->sav_y;
+        w->pending_w = w->sav_w;
+        w->pending_h = w->sav_h;
+        w->maximized = 0;
+    }
+    need_frame = 1;
 }
 
 /* Taskbar-button semantics (Windows-style): minimized → restore +
@@ -714,14 +784,26 @@ static void compose(void) {
         gfx_text(&backsurf, x + 8, y + (TITLE_H - GFX_GLYPH_H + BORDER) / 2,
                  win->title, COL_TITLE_TEXT);
 
-        /* M22.3: every window gets minimize (_) + close (x). */
+        /* M22.3: minimize (_) + close (x); M22.5 adds maximize (□)
+         * between them.  Right→left: close, max, min. */
         {
             int bx = x + w - BORDER - CLOSE_W - 3;
             int by = y + 4;
             gfx_fill(&backsurf, bx, by, CLOSE_W, CLOSE_H, COL_CLOSE_BG);
             gfx_text(&backsurf, bx + (CLOSE_W - GFX_GLYPH_W) / 2, by + 2, "x",
                      COL_CLOSE_FG);
-            int mx2 = bx - CLOSE_W - 3;
+            int xx = bx - CLOSE_W - 3;          /* maximize / restore */
+            gfx_fill(&backsurf, xx, by, CLOSE_W, CLOSE_H, 0xFF3A4A5Eu);
+            if (win->maximized) {               /* restore: two nested boxes */
+                draw_rect_outline(&backsurf, xx + 5, by + 2, CLOSE_W - 8,
+                                  CLOSE_H - 6, 1, COL_TITLE_TEXT);
+                draw_rect_outline(&backsurf, xx + 3, by + 4, CLOSE_W - 8,
+                                  CLOSE_H - 6, 1, COL_TITLE_TEXT);
+            } else {                            /* maximize: one box */
+                draw_rect_outline(&backsurf, xx + 3, by + 2, CLOSE_W - 6,
+                                  CLOSE_H - 4, 1, COL_TITLE_TEXT);
+            }
+            int mx2 = xx - CLOSE_W - 3;
             gfx_fill(&backsurf, mx2, by, CLOSE_W, CLOSE_H, 0xFF3A4A5Eu);
             gfx_fill(&backsurf, mx2 + 3, by + CLOSE_H - 4, CLOSE_W - 6, 2,
                      COL_TITLE_TEXT);
@@ -782,7 +864,12 @@ static void destroy_window(struct gui_window* win) {
     if (newfocus && newfocus->kind == WIN_TERM) vc_focus(newfocus->vc);
 
     struct widget* w = win->widgets;
-    while (w) { struct widget* nx = w->next; kfree(w); w = nx; }
+    while (w) {
+        struct widget* nx = w->next;
+        if (w->ops && w->ops->destroy) w->ops->destroy(w);  /* M22.5 */
+        kfree(w);
+        w = nx;
+    }
     win->widgets = NULL;
     win->focusw  = NULL;
     gfx_surface_free(&win->surf);
@@ -830,6 +917,23 @@ static void dispatch_keys(void) {
         struct widget* w = win->focusw;
         if (w && w->ops && w->ops->key) {
             w->ops->key(w, c);
+            app_redraw(win);
+        }
+    }
+}
+
+/* M22.5 — raw keycode events to the focused widget (see widget.h). */
+static void dispatch_keycodes(void) {
+    while (kcq_t != kcq_h) {
+        uint16_t e = kcq[kcq_t];
+        kcq_t = (kcq_t + 1) % KCQ_SZ;
+        uint32_t fl = spin_lock_irqsave(&state_lock);
+        struct gui_window* win = focused_win;
+        spin_unlock_irqrestore(&state_lock, fl);
+        if (!win || !win->used || win->kind != WIN_APP) continue;
+        struct widget* w = win->focusw;
+        if (w && w->ops && w->ops->keycode) {
+            w->ops->keycode(w, (uint8_t)(e & 0xFF), (uint8_t)(e >> 8));
             app_redraw(win);
         }
     }
@@ -883,6 +987,7 @@ static void gui_compositor_main(void) {
         dispatch_launches();
         dispatch_events();
         dispatch_keys();
+        dispatch_keycodes();
         apply_pending();
 
         /* ~1 Hz shell housekeeping (clock).  Rate-limited here so a
@@ -983,22 +1088,43 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
             int in_btn_row = (my >= win->y + 4 && my < win->y + 4 + CLOSE_H);
             int in_close = (in_btn_row &&
                             mx >= bx1 - CLOSE_W && mx < bx1);
-            int in_min   = (in_btn_row &&
+            int in_max   = (in_btn_row &&                    /* M22.5 */
                             mx >= bx1 - 2 * CLOSE_W - 3 &&
                             mx <  bx1 - CLOSE_W - 3);
+            int in_min   = (in_btn_row &&
+                            mx >= bx1 - 3 * CLOSE_W - 6 &&
+                            mx <  bx1 - 2 * CLOSE_W - 6);
             if (in_close) {
                 win->want_close = 1;
+            } else if (in_max) {
+                toggle_maximize_locked(win);                 /* M22.5 */
             } else if (in_min) {
                 win->minimized = 1;
                 struct gui_window* nf = top_visible_locked();
                 focused_win = nf;
                 if (nf && nf->kind == WIN_TERM) vc_focus(nf->vc);
             } else if (my < win->y + TITLE_H) {
-                drag     = DRAG_MOVE;
-                drag_win = win;
-                grab_dx  = mx - win->x;
-                grab_dy  = my - win->y;
-            } else if (mx >= win->x + win->w - GRIP &&
+                /* M22.5 — double-click on the title bar toggles
+                 * maximize; a single click starts a drag (disabled
+                 * while maximized). */
+                uint64_t now = timer_ticks_ms();
+                int dbl = (win == lastclick_win &&
+                           now - lastclick_ms < 400 &&
+                           mx - lastclick_x < 6 && lastclick_x - mx < 6 &&
+                           my - lastclick_y < 6 && lastclick_y - my < 6);
+                lastclick_ms = now;
+                lastclick_x = mx; lastclick_y = my;
+                lastclick_win = win;
+                if (dbl) {
+                    toggle_maximize_locked(win);
+                } else if (!win->maximized) {
+                    drag     = DRAG_MOVE;
+                    drag_win = win;
+                    grab_dx  = mx - win->x;
+                    grab_dy  = my - win->y;
+                }
+            } else if (!win->maximized &&
+                       mx >= win->x + win->w - GRIP &&
                        my >= win->y + win->h - GRIP) {
                 drag     = DRAG_RESIZE;
                 drag_win = win;
@@ -1079,10 +1205,38 @@ drag_update:
 
 /* M22.3 — Alt-Tab.  Raw keycode hook, runs in the keyboard IRQ before
  * keymap translation.  Rotate the top window to the bottom, then
- * activate the new top visible window — repeated presses cycle. */
+ * activate the new top visible window — repeated presses cycle.
+ *
+ * M22.5 — the same hook also feeds the widget layer: navigation /
+ * editing keys (arrows, Home/End, Delete, PgUp/PgDn, Insert) and
+ * Ctrl+letter shortcuts are consumed here and queued as raw keycode
+ * events whenever the focused window is an APP window.  TERMINAL
+ * windows are untouched (their shells are char-based; unmapped
+ * keycodes keep dying in keymap_translate as before). */
+static int kc_is_nav(uint8_t kc) {
+    return kc >= KC_INSERT && kc <= KC_UP;      /* 0x49..0x52 block */
+}
+
 static int gui_raw_key(uint8_t keycode, uint8_t mods) {
     if (!gui_active) return 0;
-    if (keycode != KC_TAB || !(mods & KBD_MOD_LALT)) return 0;
+    if (keycode != KC_TAB || !(mods & KBD_MOD_LALT)) {
+        /* Widget-bound keycodes?  focused_win is an atomic pointer
+         * read; kind/used are stable for live windows. */
+        struct gui_window* win = focused_win;
+        if (win && win->used && win->kind == WIN_APP &&
+            (kc_is_nav(keycode) ||
+             ((mods & KBD_MOD_CTRL_MASK) &&
+              keycode >= KC_A && keycode <= KC_Z))) {
+            uint32_t n = (kcq_h + 1) % KCQ_SZ;
+            if (n != kcq_t) {
+                kcq[kcq_h] = (uint16_t)(keycode | ((uint16_t)mods << 8));
+                kcq_h = n;
+            }
+            need_frame = 1;
+            return 1;
+        }
+        return 0;
+    }
     spin_lock(&state_lock);
     if (zcount >= 2) {
         /* Demote the currently ACTIVE (top visible) window to the
@@ -1139,6 +1293,8 @@ static struct gui_window* window_alloc(const char* title, enum win_kind kind,
     win->on_layout = NULL; win->on_close = NULL; win->app_ctx = NULL;
     win->cells = NULL; win->vc = NULL;
     win->minimized = 0; win->on_tick = NULL;
+    win->maximized = 0;
+    win->sav_x = win->sav_y = win->sav_w = win->sav_h = 0;
     win->ccol = win->crow = win->cols = win->rows = 0;
     win->surf.px = NULL; win->surf.owns_px = 0;
     spin_lock_init(&win->lock);
@@ -1156,7 +1312,14 @@ static void window_show(struct gui_window* win) {
     gui_damage_all();
 }
 
-struct gui_window* gui_window_create(const char* title, int x, int y, int w, int h) {
+/* Shared body of gui_window_create / gui_window_create_task: a
+ * terminal window whose hosted task is the caller's choice.  The task
+ * gets the window's offscreen VC as its output console and is owned by
+ * the window (vc->task — the close path kills + reaps it). */
+static struct gui_window* term_window_create(const char* title,
+                                             int x, int y, int w, int h,
+                                             const char* task_name,
+                                             void (*entry)(void)) {
     struct gui_window* win = window_alloc(title, WIN_TERM, x, y, w, h);
     if (!win) return NULL;
 
@@ -1178,16 +1341,29 @@ struct gui_window* gui_window_create(const char* title, int x, int y, int w, int
     }
 
     preempt_disable();
-    struct task* t = task_spawn("shell", shell_provider_active()->entry);
+    struct task* t = task_spawn(task_name, entry);
     if (t) {
         task_set_out_console(t, win->vc);
         win->vc->task = t;
     }
     preempt_enable();
-    if (!t) kprintf("gui: shell spawn failed for '%s'\n", win->title);
+    if (!t) kprintf("gui: task spawn failed for '%s'\n", win->title);
 
     window_show(win);
     return win;
+}
+
+struct gui_window* gui_window_create(const char* title, int x, int y, int w, int h) {
+    /* S.1: terminal windows spawn the ACTIVE shell provider. */
+    return term_window_create(title, x, y, w, h, "shell",
+                              shell_provider_active()->entry);
+}
+
+struct gui_window* gui_window_create_task(const char* title, int x, int y,
+                                          int w, int h,
+                                          const char* task_name,
+                                          void (*entry)(void)) {
+    return term_window_create(title, x, y, w, h, task_name, entry);
 }
 
 struct gui_window* gui_app_window_create(const char* title, int x, int y,

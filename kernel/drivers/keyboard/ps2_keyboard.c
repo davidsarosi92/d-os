@@ -150,7 +150,33 @@ static void keyboard_irq(struct int_frame* f) {
         if (sc == 0xB8) { mods &= ~KBD_MOD_RALT;  return; }
         if (sc == 0x1D) { mods |=  KBD_MOD_RCTRL; return; }
         if (sc == 0x9D) { mods &= ~KBD_MOD_RCTRL; return; }
-        /* All other extended keys: drop for M16 (cursor keys, etc). */
+        if (sc & 0x80) return;                      /* extended break */
+
+        /* M22.5 — cursor/editing cluster (E0-prefixed makes).  Mapped
+         * to HID usages and pushed through the same raw-dispatch +
+         * keymap path as everything else; no layout maps them to a
+         * character, so they only matter to raw-keycode consumers
+         * (GUI widget navigation). */
+        uint8_t ext = 0;
+        switch (sc) {
+        case 0x48: ext = KC_UP;     break;
+        case 0x50: ext = KC_DOWN;   break;
+        case 0x4B: ext = KC_LEFT;   break;
+        case 0x4D: ext = KC_RIGHT;  break;
+        case 0x47: ext = KC_HOME;   break;
+        case 0x4F: ext = KC_END;    break;
+        case 0x49: ext = KC_PGUP;   break;
+        case 0x51: ext = KC_PGDN;   break;
+        case 0x52: ext = KC_INSERT; break;
+        case 0x53: ext = KC_DELETE; break;
+        case 0x1C: ext = KC_ENTER;  break;          /* keypad Enter */
+        default:   return;                          /* other E0: drop */
+        }
+        if (vc_raw_kbd_dispatch(ext, mods)) return;
+        char ec = keymap_translate(ext, mods);      /* keypad Enter → '\n' */
+        if (!ec) return;
+        if (vc_focused()) vc_kbd_push(ec);
+        else              kbd_push(ec);
         return;
     }
     if (sc == 0x2A) { mods |=  KBD_MOD_LSHIFT; return; }

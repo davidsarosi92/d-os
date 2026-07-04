@@ -45,6 +45,12 @@
  * Listed in usage-ID order so a glance at the file is enough to remind
  * yourself which keycode is which. */
 #define KC_A             0x04
+#define KC_C             0x06
+#define KC_N             0x11
+#define KC_O             0x12
+#define KC_S             0x16
+#define KC_V             0x19
+#define KC_X             0x1B
 #define KC_Z             0x1D
 #define KC_1             0x1E
 #define KC_9             0x26
@@ -54,6 +60,18 @@
 #define KC_BACKSPACE     0x2A
 #define KC_TAB           0x2B
 #define KC_SPACE         0x2C
+/* Navigation / editing cluster (M22.5 — flows to widgets as raw
+ * keycode events; layouts map none of these to a character). */
+#define KC_INSERT        0x49
+#define KC_HOME          0x4A
+#define KC_PGUP          0x4B
+#define KC_DELETE        0x4C
+#define KC_END           0x4D
+#define KC_PGDN          0x4E
+#define KC_RIGHT         0x4F
+#define KC_LEFT          0x50
+#define KC_DOWN          0x51
+#define KC_UP            0x52
 #define KC_NONUS_BSLASH  0x64    /* the 102-key "extra" key between LSHIFT and Z */
 
 /* Modifier bitmask bits — match HID layout for cheap pass-through. */

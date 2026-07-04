@@ -9,6 +9,8 @@
 #include "widget.h"
 #include "gui.h"
 #include "gfx.h"
+#include "keymap.h"          /* M22.5: KC_* keycodes for navigation */
+#include "clipboard.h"       /* M22.5: Ctrl+C/V in textinput */
 #include "kmalloc.h"
 #include <stddef.h>
 
@@ -75,7 +77,8 @@ static void label_draw(struct widget* w, struct gfx_surface* s) {
     gfx_text(s, w->x, w->y + (w->h - GFX_GLYPH_H) / 2, l->text, l->color);
 }
 
-static const struct widget_ops label_ops = { label_draw, NULL, NULL };
+static const struct widget_ops label_ops =
+    { label_draw, NULL, NULL, NULL, NULL };
 
 struct w_label* w_label_create(struct gui_window* win, int x, int y, int w,
                                const char* text) {
@@ -112,7 +115,8 @@ static void button_mouse(struct widget* w, int lx, int ly, int kind) {
     if (b->on_click) b->on_click(b, w->ctx);
 }
 
-static const struct widget_ops button_ops = { button_draw, button_mouse, NULL };
+static const struct widget_ops button_ops =
+    { button_draw, button_mouse, NULL, NULL, NULL };
 
 struct w_button* w_button_create(struct gui_window* win, int x, int y,
                                  int w, int h, const char* text,
@@ -173,6 +177,8 @@ static void listview_mouse(struct widget* w, int lx, int ly, int kind) {
     struct w_listview* lv = (struct w_listview*)w;
     int rows = lv_visible_rows(lv);
 
+    gui_window_focus_widget(w->win, w);         /* M22.5: keyboard nav */
+
     if (lx >= w->w - LV_ARROW_W) {              /* scroll strip */
         if (ly < w->h / 2) { if (lv->scroll > 0) lv->scroll--; }
         else               { if (lv->scroll + rows < lv->count) lv->scroll++; }
@@ -191,13 +197,55 @@ static void listview_mouse(struct widget* w, int lx, int ly, int kind) {
     }
 }
 
-static const struct widget_ops listview_ops = { listview_draw, listview_mouse, NULL };
+/* M22.5 — keep the selected row inside the viewport. */
+static void lv_scroll_to_sel(struct w_listview* lv) {
+    int rows = lv_visible_rows(lv);
+    if (lv->sel < lv->scroll) lv->scroll = lv->sel;
+    if (lv->sel >= lv->scroll + rows) lv->scroll = lv->sel - rows + 1;
+    if (lv->scroll < 0) lv->scroll = 0;
+}
+
+/* M22.5 — keyboard navigation: arrows / PgUp / PgDn / Home / End move
+ * the selection (firing on_select like a click does). */
+static void listview_keycode(struct widget* w, uint8_t kc, uint8_t mods) {
+    (void)mods;
+    struct w_listview* lv = (struct w_listview*)w;
+    if (lv->count == 0) return;
+    int rows = lv_visible_rows(lv);
+    int sel = lv->sel < 0 ? 0 : lv->sel;
+
+    switch (kc) {
+    case KC_UP:    sel--;        break;
+    case KC_DOWN:  sel++;        break;
+    case KC_PGUP:  sel -= rows;  break;
+    case KC_PGDN:  sel += rows;  break;
+    case KC_HOME:  sel = 0;      break;
+    case KC_END:   sel = lv->count - 1; break;
+    default: return;
+    }
+    if (sel < 0) sel = 0;
+    if (sel >= lv->count) sel = lv->count - 1;
+    if (sel == lv->sel) return;
+    lv->sel = sel;
+    lv_scroll_to_sel(lv);
+    if (lv->on_select) lv->on_select(lv, sel, w->ctx);
+}
+
+/* M22.5 — Enter activates the selection (same as double-click). */
+static void listview_key(struct widget* w, char c) {
+    struct w_listview* lv = (struct w_listview*)w;
+    if (c != '\n' || lv->sel < 0 || lv->sel >= lv->count) return;
+    if (lv->on_activate) lv->on_activate(lv, lv->sel, w->ctx);
+}
+
+static const struct widget_ops listview_ops =
+    { listview_draw, listview_mouse, listview_key, listview_keycode, NULL };
 
 struct w_listview* w_listview_create(struct gui_window* win, int x, int y,
                                      int w, int h, void* ctx) {
     struct w_listview* lv = (struct w_listview*)kcalloc(1, sizeof(*lv));
     if (!lv) return NULL;
-    base_init(&lv->base, win, x, y, w, h, &listview_ops, ctx, 0);
+    base_init(&lv->base, win, x, y, w, h, &listview_ops, ctx, 1);
     lv->sel = -1;
     return lv;
 }
@@ -261,8 +309,28 @@ static void textinput_key(struct widget* w, char c) {
     }
 }
 
+/* M22.5 — clipboard shortcuts.  No in-line cursor (the caret sits at
+ * the end by design), so copy/cut act on the whole content. */
+static void textinput_keycode(struct widget* w, uint8_t kc, uint8_t mods) {
+    struct w_textinput* t = (struct w_textinput*)w;
+    if (!(mods & KBD_MOD_CTRL_MASK)) return;
+    if (kc == KC_C || kc == KC_X) {
+        clipboard_set(t->buf, t->len);
+        if (kc == KC_X) { t->len = 0; t->buf[0] = 0; }
+    } else if (kc == KC_V) {
+        char tmp[sizeof t->buf];
+        int n = clipboard_get(tmp, (int)sizeof tmp);
+        for (int i = 0; i < n && t->len < (int)sizeof(t->buf) - 1; i++) {
+            char c = tmp[i];
+            if (c < 0x20 || c > 0x7E) continue;     /* single-line box */
+            t->buf[t->len++] = c;
+        }
+        t->buf[t->len] = 0;
+    }
+}
+
 static const struct widget_ops textinput_ops =
-    { textinput_draw, textinput_mouse, textinput_key };
+    { textinput_draw, textinput_mouse, textinput_key, textinput_keycode, NULL };
 
 struct w_textinput* w_textinput_create(struct gui_window* win, int x, int y,
                                        int w, void* ctx) {

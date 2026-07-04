@@ -18,8 +18,8 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
-✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M22** shipped (10/11
-polish sub-items; the lone outstanding one is §M20.6.1
+✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M22 – M22.5** shipped
+(10/11 polish sub-items; the lone outstanding one is §M20.6.1
 SYSCALL/SYSRET).  M22 + M22.1 + M22.2 (2026-07-04): GUI — gfx
 surfaces + compositor + WM core + widget toolkit + file manager,
 PS/2 mouse (IRQ12), CMOS RTC, `vfs_unlink`, 1280×800 FB; desktop
@@ -30,7 +30,17 @@ desktops, d-os + rescue shells, apps under `kernel/gui/apps/`,
 `launch` command); GUI dev guide in DOCS §4.14.  M22.3: task
 manager app, cooperative task_kill/reap (kthread contract) +
 cpu_ms, terminal-window close, minimize, Alt-Tab, dirty-rect
-composition (`gui stats`).  All on both archs.
+composition (`gui stats`).  M22.4 (2026-07-04): compositor
+smoothness — cursor-damage race fix (compositor-side bookkeeping),
+rect-bounded drag damage, tearing notes; instant Task Manager
+(task_set_change_hook + DEAD reaping via vc_task_bound).  M22.5
+(2026-07-04): desktop apps — nav keys end-to-end (PS/2 E0 → HID →
+widget keycode events), multiline editor widget + kernel clipboard,
+Editor app, Tiny-BASIC (`core/basic.c`, BASIC window via
+gui_window_create_task, `run <path>` cmd), file manager 2.0 (path
+bar, sorting, Ren/Copy/recursive-Del, GUI_APP_ASSOC extension
+associations, vfs_rename/vfs_copy/vfs_unlink_recursive),
+maximize/restore.  All on both archs.
 Highlights so far: VFS + ramfs + exFAT on virtio-blk, devfs +
 procfs, preemptive scheduler, multi-pane shell, xHCI USB + HID,
 keyboard layouts, HAL cut (`hal_api.h`), **SMP on i386 + x86_64**
@@ -56,13 +66,6 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   but PMM still has a single zone set.
 - **§M20.6.1** — SYSCALL/SYSRET instruction path (needs GDT slot
   reorg to satisfy SYSRET's selector arithmetic).
-- **§M22.4** — Compositor smoothness: cursor-damage race fix
-  (compositor-side cursor bookkeeping), rect-bounded drag damage,
-  tearing notes + immediate Task Manager refresh on program close.
-  Small; diagnosed 2026-07-04.
-- **§M22.5** — Desktop apps: text editor (multiline widget +
-  clipboard + nav keys), Tiny-BASIC interpreter, file manager 2.0
-  (vfs_rename/copy, associations), maximize/restore.
 
 🔲 **PLAN extensions (placeholders, design only):**
 - §M23 — Audio subsystem (AC97 → HDA → I2S).
@@ -138,6 +141,11 @@ qemu-system-i386 -display none -no-reboot \
     -m 256M -cdrom build/i386/d-os.iso \
     -drive if=virtio,file=build/test.img,format=raw
 ```
+
+NB: a FORMATTED image (e.g. `build/exfat.img`, mkfs.exfat'd in the
+Docker container) carries a boot signature — add `-boot d` or SeaBIOS
+boots the empty disk instead of the CD and hangs with no serial
+output at all.
 
 Block / USB drivers are i386-only today; x86_64 boots without them
 (virtio-blk + xhci need a 64-bit DMA-path revisit — M20.5+).

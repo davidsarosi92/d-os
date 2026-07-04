@@ -119,11 +119,20 @@ static int rfs_unlink_op(struct inode* dir, const char* name,
     return 0;
 }
 
+static int rfs_rename_op(struct inode* dir, const char* oldname,
+                         const char* newname, struct inode* child) {
+    (void)dir; (void)oldname; (void)newname;
+    /* ramfs keeps no private name index — names live in the VFS
+     * dentry tree, which vfs_rename rewrites after we say yes. */
+    return child ? 0 : -1;
+}
+
 static const struct inode_ops ramfs_inode_ops = {
     .lookup = NULL,                  /* eager tree */
     .create = rfs_create_op,
     .mkdir  = rfs_mkdir_op,
     .unlink = rfs_unlink_op,         /* M22.1 — file manager Delete */
+    .rename = rfs_rename_op,         /* M22.5 — file manager Rename */
 };
 
 /* ------------------------------------------------------------------- */

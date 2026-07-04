@@ -399,3 +399,126 @@ int vfs_unlink(const char* path) {
     kfree(d);
     return 0;
 }
+
+/* ------------------------------------------------------------------- */
+/* M22.5 — rename / copy / recursive delete.                            */
+/* ------------------------------------------------------------------- */
+
+int vfs_rename(const char* oldpath, const char* newpath) {
+    char obuf[256], nbuf[256];
+    const char *olast, *nlast;
+    if (split_parent(oldpath, obuf, sizeof obuf, &olast) != 0) return -1;
+    if (split_parent(newpath, nbuf, sizeof nbuf, &nlast) != 0) return -1;
+    if (!*olast || !*nlast) return -1;
+
+    struct dentry* oparent = resolve_path(obuf, NULL, NULL);
+    struct dentry* nparent = resolve_path(nbuf, NULL, NULL);
+    if (!oparent || oparent != nparent) return -1;   /* same-dir only */
+    if (!oparent->inode || oparent->inode->type != INODE_DIR) return -1;
+    if (!oparent->inode->dir_ops || !oparent->inode->dir_ops->rename) return -1;
+    if (strlen_(nlast) > VFS_NAME_MAX) return -1;
+
+    struct dentry* d = NULL;
+    for (struct dentry* c = oparent->children; c; c = c->sibling) {
+        if (streq(c->name, nlast)) return -2;        /* target exists */
+        if (streq(c->name, olast)) d = c;
+    }
+    if (!d || !d->inode) return -1;
+    if (d->inode->type == INODE_DEVICE) return -1;
+
+    int r = oparent->inode->dir_ops->rename(oparent->inode, olast, nlast,
+                                            d->inode);
+    if (r != 0) return r;
+
+    /* The fs said yes — rewrite the dentry (the VFS owns names). */
+    size_t i = 0;
+    for (; nlast[i] && i < sizeof(d->name) - 1; i++) d->name[i] = nlast[i];
+    d->name[i] = 0;
+    return 0;
+}
+
+int vfs_copy(const char* src, const char* dst) {
+    struct file* in = vfs_open(src, VFS_RDONLY);
+    if (!in) return -1;
+    if (!in->inode || in->inode->type != INODE_FILE) {
+        vfs_close(in);
+        return -1;                                   /* files only */
+    }
+    /* Self-copy guard: opening dst with TRUNC would empty the SOURCE
+     * if both paths resolve to the same inode.  Probe without TRUNC
+     * first and compare. */
+    struct file* probe = vfs_open(dst, VFS_RDONLY);
+    if (probe) {
+        int same = (probe->inode == in->inode);
+        vfs_close(probe);
+        if (same) { vfs_close(in); return -1; }
+    }
+
+    struct file* out = vfs_open(dst, VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+    if (!out) { vfs_close(in); return -1; }
+
+    /* Bounce buffer on the heap — kernel task stacks are 4 KiB. */
+    char* buf = (char*)kmalloc(4096);
+    if (!buf) { vfs_close(in); vfs_close(out); return -1; }
+
+    int err = 0;
+    for (;;) {
+        ssize_t r = vfs_read(in, buf, 4096);
+        if (r < 0) { err = 1; break; }
+        if (r == 0) break;
+        ssize_t off = 0;
+        while (off < r) {
+            ssize_t w = vfs_write(out, buf + off, (size_t)(r - off));
+            if (w <= 0) { err = 1; break; }
+            off += w;
+        }
+        if (err) break;
+    }
+    kfree(buf);
+    vfs_close(in);
+    vfs_close(out);
+    return err ? -1 : 0;
+}
+
+/* Depth-limited tree delete.  The path buffer is SHARED across the
+ * recursion (append child / recurse / truncate back) so the stack cost
+ * per frame stays at a few dozen bytes — kernel stacks are 4 KiB.
+ * Deleting while iterating: each round re-reads the directory's FIRST
+ * entry (f->pos reset), so no iterator is held across an unlink. */
+static int unlink_rec(char* path, size_t cap, int depth) {
+    struct file* f = vfs_open(path, VFS_RDONLY);
+    if (!f) return -1;
+    int is_dir = f->inode && f->inode->type == INODE_DIR;
+
+    if (is_dir) {
+        if (depth >= 8) { vfs_close(f); return -1; }
+        for (;;) {
+            struct dirent de;
+            f->pos = 0;                          /* rewind: first entry */
+            int n = vfs_readdir(f, &de);
+            if (n <= 0) break;                   /* empty (or error) */
+
+            size_t plen = strlen_(path);
+            size_t nlen = strlen_(de.name);
+            /* "path" + "/" + name + NUL must fit. */
+            if (plen + 1 + nlen + 1 > cap) { vfs_close(f); return -1; }
+            size_t p = plen;
+            if (!(plen == 1 && path[0] == '/')) path[p++] = '/';
+            for (size_t i = 0; i <= nlen; i++) path[p + i] = de.name[i];
+
+            int r = unlink_rec(path, cap, depth + 1);
+            path[plen] = 0;                      /* truncate back */
+            if (r != 0) { vfs_close(f); return r; }
+        }
+    }
+    vfs_close(f);
+    return vfs_unlink(path);
+}
+
+int vfs_unlink_recursive(const char* path) {
+    char buf[256];
+    size_t len = strlen_(path);
+    if (len == 0 || len >= sizeof buf) return -1;
+    memcpy_(buf, path, len + 1);
+    return unlink_rec(buf, sizeof buf, 0);
+}

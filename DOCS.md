@@ -49,8 +49,8 @@ when sections are added.)
 | 4.10 | Kernel heap (M19: slab + per-CPU mag + page_alloc) | ~1255 |
 | 4.11 | Serial debug (COM1) | 687 |
 | 4.12 | ACPI (shutdown) | 701 |
-| 4.13 | GUI — compositor + windows + mouse (M22) | ~1530 |
-| 4.14 | GUI development — apps, desktop shells (M22.2) | ~1610 |
+| 4.13 | GUI — compositor, WM, widgets, apps (M22 – M22.5) | ~1532 |
+| 4.14 | GUI development — apps, desktop shells (M22.2+) | ~1752 |
 | 5 | Build & run | 722 |
 | 6 | Compiler flags | 735 |
 | 7 | Roadmap | 751 |
@@ -1529,7 +1529,7 @@ M20 change-log entries):**
 
 ---
 
-### 4.13 GUI — compositor, WM, taskbar, widgets, file manager (M22 + M22.1)
+### 4.13 GUI — compositor, WM, widgets, apps (M22 – M22.5)
 
 Files: `kernel/gui/gfx.c` + `gfx.h` (primitives + surfaces),
 `kernel/gui/gui.c` + `gui.h` (compositor + WM + taskbar + windows),
@@ -1684,10 +1684,68 @@ from any shell with the `gui` command.
   the list instead of accumulating as DEAD rows.  VC-bound DEAD tasks
   (a pane shell killed by hand) stay listed on purpose — their
   vc->task pointer is still owned by the pane/window teardown path.
+- **Navigation keys end-to-end (M22.5):** the PS/2 driver now decodes
+  the E0-prefixed cursor cluster (arrows, Home/End, PgUp/PgDn,
+  Insert/Delete, keypad Enter) into HID usages — same wire format the
+  USB HID driver already produced.  The GUI's raw-keycode hook
+  (the Alt-Tab hook) consumes them (plus Ctrl+letter combos) whenever
+  the focused window is an APP window and queues them to the
+  compositor, which delivers them to the focused widget through the
+  new `widget_ops.keycode(w, kc, mods)` callback.  Widgets also
+  gained an optional `destroy` op (free owned heap objects at window
+  teardown).  Listviews take keyboard focus on click and navigate
+  with arrows/PgUp/PgDn/Home/End; Enter activates like double-click.
+- **Multiline editor widget (M22.5, `w_editor.c`):** contiguous
+  grow-by-doubling text buffer, implicit '\n' lines, byte-offset
+  cursor + selection anchor (Shift+movement extends, unshifted drops),
+  sticky preferred column for vertical motion, viewport tracking with
+  horizontal scroll (no wrapping), mouse click-to-position.
+  Ctrl+C/X/V talk to the kernel clipboard (no selection = whole
+  line), Ctrl+A selects all; unclaimed Ctrl+letters forward to the
+  app via `on_shortcut`.  O(len) line math — fine at teaching-kernel
+  file sizes; gap buffer is the known upgrade path.
+- **Kernel clipboard (M22.5, `clipboard.c`):** one global text slot
+  (spinlocked, 64 KiB cap) behind clipboard_set/get/len — used by the
+  editor widget and the single-line textinput (Ctrl+C/X/V).
+- **Editor app (M22.5, `apps/editor.c`):** path bar + Open/Save
+  buttons around a w_editor; Ctrl+S saves, Ctrl+O loads; save-as =
+  edit the path, then Save (vfs_open with CREATE|TRUNC).  NOT a
+  singleton — two files edit side by side.  Retitles its window to
+  the open file (new `gui_window_set_title`).
+- **Tiny-BASIC (M22.5, `kernel/core/basic.c` + `apps/basic.c`):**
+  line-numbered dialect (PRINT/INPUT/LET/IF..THEN/GOTO/GOSUB/RETURN/
+  FOR..NEXT/REM/CLS/END, integer vars A–Z, RND/ABS), recursive-descent
+  expressions, REPL with RUN/LIST/NEW/LOAD/SAVE/BYE.  The GUI app is
+  a TERMINAL window hosting the interpreter task instead of a shell
+  (new `gui_window_create_task`) — output/input reuse the whole gterm
+  + VC plumbing, closing the window kills the interpreter under the
+  kthread contract (basic_run polls task_should_stop + yields every
+  64 statements).  CLI sibling: `run <path.bas>`.  Interpreter, not
+  codegen — the compile story arrives with §M25 userland.
+- **File manager 2.0 (M22.5):** editable path bar (Enter navigates),
+  size column + dirs-first name-sorted listing, keyboard navigation,
+  Ren/Copy buttons (new `vfs_rename` — same-directory, inode_ops
+  `rename` op, ramfs implements, exFAT defers; `vfs_copy` with a
+  self-copy guard), Del deletes files immediately and arms a two-step
+  confirm for non-empty directories (second press within 8 s runs the
+  new `vfs_unlink_recursive`, depth-capped at 8 with a shared path
+  buffer).  Double-click/Enter consults the file-type association
+  registry: `GUI_APP_ASSOC(name, launch, open_path, "ext ext ...")`
+  extends GUI_APP; `gui_app_for_path` matches the extension —
+  .txt/.conf/.md/.cfg/.log open in the Editor, .bas in BASIC,
+  unclaimed types fall back to the read-only viewer.
+- **Maximize/restore (M22.5):** third title-bar button (□ between _
+  and x) or double-click on the title bar; saved normal geometry,
+  work-area aware (fills the screen minus the shell's bottom
+  reserve); move/resize disabled while maximized; the geometry change
+  rides the pending-resize handoff so the surface realloc stays on
+  the compositor task.
 - **Known limits (deferred):** no widget nesting/containers; killing
   a CPU-bound kernel thread requires it to poll task_should_stop()
   (the kthread contract — forced kill needs ring-3 processes, §M25);
-  cursor is IRQ-latency bound (one tick worst case).
+  cursor is IRQ-latency bound (one tick worst case); textinput has no
+  in-line cursor (caret at end); exFAT lacks rename/unlink; terminal
+  scrollback and fileman icon/tree views tracked separately.
 
 ---
 
@@ -1730,6 +1788,24 @@ replaceable registrations, mirroring the driver framework:
   to clear app singletons (see fileman.c / about.c).
 - `on_layout` repositions widgets from
   `gui_window_content_size(win, &w, &h)` after every resize.
+- **File-type association (M22.5):** register with
+  `GUI_APP_ASSOC("Label", launch_fn, open_path_fn, "txt md")` instead
+  — the file manager double-click resolves extensions through
+  `gui_app_for_path()` and calls your `open_path(abs_path)` (runs on
+  the compositor task, VFS is fine).  See apps/editor.c.
+- **Keyboard (M22.5):** printable chars arrive at the focused
+  widget's `key` op; arrows/Home/End/PgUp/PgDn/Delete + Ctrl+letter
+  combos arrive at the `keycode(w, kc, mods)` op (KC_* from
+  keymap.h).  A widget owning heap memory frees it in the `destroy`
+  op.  For a text area, embed `w_editor_create` (see apps/editor.c —
+  selection/clipboard/scrolling come for free; app-level shortcuts
+  like Ctrl+S via `on_shortcut`).
+- **Terminal-style apps (M22.5):** `gui_window_create_task(title,
+  x, y, w, h, task_name, entry)` gives you a terminal window running
+  YOUR task instead of a shell: kprintf lands in the window, read
+  keys with `vc_getchar(task_current()->out_console)`, poll
+  `task_should_stop()` in loops (window close kills you
+  cooperatively).  See apps/basic.c.
 
 **Writing a desktop shell** (template: `shell_bare.c`):
 1. `#include "desktop.h"`, `"gui_internal.h"`, `"gui_app.h"`.
@@ -1818,6 +1894,31 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-04 — M22.5: desktop apps — editor, Tiny-BASIC, file manager 2.0, maximize.**
+  The desktop becomes a place to DO something: write BASIC on d-os,
+  run it on d-os.  Input: PS/2 E0 cursor cluster decoded to HID
+  usages; widget layer gained keycode events (`widget_ops.keycode`)
+  + per-widget destructors; listviews got keyboard nav + Enter
+  activation.  New: multiline editor widget (`w_editor.c` —
+  selection, clipboard, viewport), kernel clipboard (`clipboard.c`),
+  Editor app (open/save/Ctrl+S, retitle via gui_window_set_title,
+  non-singleton), Tiny-BASIC interpreter (`core/basic.c`, kthread
+  contract; GUI window via new gui_window_create_task + `run <path>`
+  shell command), file manager 2.0 (editable path bar, size column +
+  sorting, Ren/Copy/recursive-Del with two-step confirm, extension →
+  app associations via GUI_APP_ASSOC/gui_app_for_path), VFS grew
+  vfs_rename (same-dir; ramfs) / vfs_copy (self-copy guard) /
+  vfs_unlink_recursive, maximize/restore (title-bar □ + dbl-click,
+  work-area aware).  Verified in QEMU i386 with a scripted end-to-end
+  story — type program in Editor → Ctrl+S to /mnt (exFAT!) → fileman
+  keyboard-nav + Enter → BASIC window LOADs + RUNs it → maximize/
+  restore → rename/copy/recursive-delete on ramfs — 7/7 checks green;
+  x86_64 boots the same GUI (editor + select-all verified).
+  Lessons: gui_app_def grew and STALE .o FILES kept the old struct
+  size — mixed 8/16-byte registry entries broke the section walk
+  (the no-header-deps pitfall, now with a concrete symptom); a
+  formatted disk image carries a boot signature, so QEMU needs
+  `-boot d` or SeaBIOS boots the empty disk instead of the CD.
 - **2026-07-04 — M22.4: compositor smoothness + instant Task Manager.**
   Cursor flicker/ghosting fixed by moving cursor damage bookkeeping
   into compose() itself (`last_cur_x/y`; the mouse-IRQ glide path is a

@@ -35,6 +35,7 @@
 #include "gui.h"
 #include "gui_app.h"
 #include "shell_provider.h"
+#include "basic.h"
 
 #define LINE_MAX        128             /* max accepted bytes per command line */
 #define DEFAULT_PROMPT  "d-os> "        /* fallback when config is unavailable */
@@ -109,6 +110,7 @@ static void cmd_help(void) {
                   "  ringtest, ps, spawn, yield, loop, kill <pid>\n"
                   "  pane, pane split horizontal|vertical\n"
                   "  gui (compositor + desktop), gui stats, launch [app]\n"
+                  "  run <path.bas> (Tiny-BASIC)\n"
                   "  lslayout, setlayout <us|hu|...>, lscpu, taskset <pid> <mask>\n"
                   "  slabinfo, buddyinfo\n"
                   "  shutdown, reboot\n");
@@ -407,6 +409,24 @@ static void cmd_launch(const char* args) {
     const struct gui_app_def* app = gui_app_find(args);
     if (!app) { kprintf("launch: no app matching '%s'\n", args); return; }
     app->launch();
+}
+
+/* `run <path>` — batch-run a Tiny-BASIC program on this shell's VC
+ * (M22.5).  The interpreter state is ~22 KiB, so it lives on the heap
+ * — never on the 4 KiB task stack.  If the shell is killed mid-run
+ * the block leaks; acceptable for a hand-driven command (the GUI
+ * BASIC window uses a static instance instead). */
+static void cmd_run(struct vc* my_vc, const char* path) {
+    while (*path == ' ') path++;
+    if (!*path) { kprintf("run: usage: run <path.bas>\n"); return; }
+    struct basic* b = (struct basic*)kmalloc(sizeof *b);
+    if (!b) { kprintf("run: OOM\n"); return; }
+    basic_init(b, my_vc);
+    if (basic_load(b, path) != 0)
+        kprintf("run: cannot load %s (missing? unnumbered lines?)\n", path);
+    else
+        basic_run(b);
+    kfree(b);
 }
 
 /* `gui stats` — damage-rect effectiveness counters (M22.3). */
@@ -838,6 +858,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "spawn"))          { cmd_spawn();    return; }
     if (streq(line, "yield"))          { task_yield();   return; }
     if (streq(line, "loop"))           { cmd_loop();     return; }
+    if (starts_with(line, "run "))     { cmd_run(my_vc, line + 4); return; }
     if (streq(line, "pane"))           { cmd_pane(my_vc, "");      return; }
     if (starts_with(line, "pane "))    { cmd_pane(my_vc, line + 5); return; }
     if (streq(line, "lslayout"))       { cmd_lslayout();             return; }

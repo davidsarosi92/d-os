@@ -47,8 +47,8 @@
 | §M22 | GUI infrastructure — ✅ shipped (see DOCS §4.13) | ~1405 |
 | §M22.2 | GUI modularity — desktop-shell interface, app registry, docs | ~1475 |
 | §M22.3 | Desktop polish — task manager, task_kill, minimize, Alt-Tab | ~1545 |
-| §M22.4 | Compositor smoothness — cursor race, drag damage, tearing | ~1580 |
-| §M22.5 | Desktop apps — editor, BASIC, file manager 2.0, maximize | ~1620 |
+| §M22.4 | Compositor smoothness — cursor race, drag damage, tearing | ~1539 |
+| §M22.5 | Desktop apps — editor, BASIC, file manager 2.0, maximize | ~1557 |
 | §M23 | Audio subsystem | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) | ~1080 |
 | §M25 | Userland foundation (Wayland prerequisites) | ~1545 |
@@ -171,7 +171,7 @@ what); a session can pick a theme and push on it.
 | M22.2 | GUI modularity — swappable desktop shell + app registry + GUI dev docs | UX | ✅ DOCS §4.14 |
 | M22.3 | Desktop polish — task manager, task_kill, term-window close, minimize, Alt-Tab, damage rects | UX | ✅ DOCS §4.13 |
 | M22.4 | Compositor smoothness — cursor-damage race, rect-bounded drag, tearing mitigation | UX | ✅ DOCS §4.13 |
-| M22.5 | Desktop apps — text editor, BASIC interpreter, file manager 2.0, maximize/restore | UX | §M22.5 |
+| M22.5 | Desktop apps — text editor, BASIC interpreter, file manager 2.0, maximize/restore | UX | ✅ DOCS §4.13 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | §M25 |
@@ -1556,49 +1556,33 @@ drew last frame, not from what the IRQ saw.
 
 ## §M22.5 — Desktop apps: editor, BASIC, file manager 2.0, maximize
 
-**Why:** turn the desktop from a demo into a place where you can DO
-something: write a program on d-os, run it on d-os.  List agreed
-2026-07-04.
+**Shipped 2026-07-04, see DOCS.md §4.13.**  All seven stages landed:
+nav keys end-to-end (PS/2 E0 cluster → HID usages → widget keycode
+events), multiline editor widget (selection + clipboard + viewport),
+kernel clipboard, Editor app (open/save/Ctrl+S), Tiny-BASIC
+(interpreter core + REPL window via gui_window_create_task + `run`
+command), file manager 2.0 (path bar, columns+sorting, Ren/Copy/
+recursive-Del, GUI_APP_ASSOC extension associations, vfs_rename/
+vfs_copy/vfs_unlink_recursive), maximize/restore.  The definition-of-
+done story runs scripted in QEMU: Editor → save to /mnt (exFAT) →
+fileman keyboard nav + Enter → BASIC window LOADs + RUNs → maximize/
+restore → rename/copy/delete on ramfs.
 
-**Design — staged.**
-
-1. **Navigation keys end-to-end (prerequisite).**  Arrows, Home/End,
-   Delete, PgUp/PgDn currently die in the keyboard pipeline (ASCII
-   only).  Extend the key path so widgets receive keycode-level
-   events (reuse the raw-hook shape, but routed to the focused
-   widget like chars are); listviews gain keyboard navigation.
-2. **Multiline editor widget** (widget toolkit): scrollable text
-   buffer, cursor movement, insert/delete, viewport tracking.  The
-   single biggest chunk — build it as a widget so any app can embed
-   it.
-3. **Clipboard:** kernel-global text clipboard + Ctrl+C/X/V in the
-   editor widget and textinput.
-4. **Text editor app** (`GUI_APP`): open / save / save-as via VFS on
-   top of the editor widget.
-5. **BASIC interpreter** (`run` app + shell command): Tiny-BASIC
-   dialect, runs as a kernel task under the kthread contract (Task
-   Manager can stop it), output in its own window.  Interpreter, not
-   native codegen — ring-0 codegen is a footgun and M25 userland
-   will give the real compile story; keep a compile-to-bytecode
-   extension point.
-6. **File manager 2.0 (Windows/Linux-like):** VFS grows
-   `vfs_rename` + copy + recursive delete; UI grows size/type
-   columns, sorting, editable path bar, keyboard navigation, and
-   double-click file-type association (extension → app registry;
-   .txt/.bas open in the editor).
-7. **Maximize / restore:** title-bar max button + double-click on
-   the title bar; saved normal geometry; work-area aware (respects
-   the taskbar strip).
-
-**Definition of done — one connected story:** write a small BASIC
-program in the editor, save it to /mnt, double-click it in the file
-manager, its output appears in its own window; maximize the editor
-and restore it.  Plus: rename + copy + delete a file in the file
-manager; arrows/Home/End work in the editor and listviews.
-
-**Out of scope (tracked separately):** terminal scrollback, icon /
-tree views in the file manager, clipboard history, native code
-generation (post-M25).
+**Lessons learned:**
+- *Growing a linker-section registry struct invalidates every stale
+  .o that embeds it.*  gui_app_def gained two fields; without header
+  dependencies the old app objects kept the 8-byte layout while new
+  ones used 16 — the section walk then miscounted (5 apps instead
+  of 7).  Symptom to remember: section size not divisible by the new
+  sizeof, mixed entry sizes in `objdump -t`.  `make clean` after any
+  shared-struct change (CLAUDE.md pitfall, now with teeth).
+- *A formatted disk image carries a boot signature.*  SeaBIOS then
+  prefers the disk over the CD and hangs in the empty exFAT boot
+  sector — QEMU test invocations with an attached formatted image
+  need `-boot d`.
+- *Copy-to-self is a truncation footgun.*  vfs_copy opens dst with
+  TRUNC; if src == dst that empties the source before the first
+  read.  Guard: probe dst without TRUNC and compare inodes.
 
 ## §M23 — Audio subsystem
 
