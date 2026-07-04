@@ -25,6 +25,7 @@
  * ============================================================================= */
 
 #include "gui.h"
+#include "gui_app.h"
 #include "widget.h"
 #include "vfs.h"
 #include "kmalloc.h"
@@ -336,3 +337,7 @@ void fileman_open(void) {
     fm_refresh(fm);
     gui_window_request_redraw(win);
 }
+
+/* Self-registration (M22.2): the Start menu and the `launch` command
+ * find us here — nothing references fileman_open by symbol anymore. */
+GUI_APP("File Manager", fileman_open);

@@ -166,7 +166,7 @@ what); a session can pick a theme and push on it.
 | M20.6 | x86_64 closure — SYSCALL/SYSRET, xHCI + virtio-blk 64-bit DMA | Architecture | §M20.6 |
 | M21 | ARM (aarch64 generic / RPi) port                | Architecture     | §M21    |
 | M22 | GUI infrastructure — compositor, windows, mouse, widgets, taskbar, file manager | UX | ✅ DOCS §4.13 |
-| M22.2 | GUI modularity — swappable desktop shell + app registry + GUI dev docs | UX | §M22.2 |
+| M22.2 | GUI modularity — swappable desktop shell + app registry + GUI dev docs | UX | ✅ DOCS §4.14 |
 | M22.3 | Desktop polish — task manager, task_kill, term-window close, minimize, Alt-Tab, damage rects | UX | §M22.3 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
@@ -1463,58 +1463,31 @@ TrueType-ish font layer remain free-floating follow-ups.
 
 ---
 
-## §M22.2 — GUI modularity: desktop-shell interface + app registry + docs
+## §M22.2 — GUI modularity: desktop-shell interface + app registry + docs — ✅ shipped
 
-**Why:** M22/M22.1 shipped as a monolith — the taskbar, Start menu
-and app launch paths are welded into gui.c (hardcoded action enum,
-`extern fileman_open()`).  That violates two of our own north-star
-rules: #2 (components self-register, nothing is hand-wired into a
-core file) and #5 (stable interfaces from day one).  The goal is the
-Linux shape: the desktop (à la Cinnamon/Xfce) and the apps (file
-manager, etc.) are REPLACEABLE registrations, not compositor
-internals.  Cut the interfaces now, while there are two apps — not
-after ten.
+Shipped 2026-07-04.  See **DOCS.md §4.13 + §4.14** for the as-built
+shape: `GUI_APP()` + `DESKTOP_SHELL()` linker-section registries
+(gui_app.h / desktop.h), gui.c reduced to compositor + WM core,
+`shell_vista.c` (default chrome) + `shell_bare.c` (swap proof, chosen
+via `setconf gui.shell bare`), apps under kernel/gui/apps/ (fileman,
+about, newshell, hello), `launch [app]` shell command, gui_internal.h
+WM services with an explicit IRQ-vs-task calling convention, and the
+DOCS §4.14 GUI development guide.
 
-**Design — staged.**
+**All DoD items met:** registry-launched fileman (no app symbols in
+gui.c) ✅ · bare shell boots via config key ✅ · hello sample appears
+in the menu with zero core changes ✅ · docs chapter ✅.
 
-1. **`GUI_APP(name, launch_fn)` registry** — linker-section
-   self-registration, same pattern as `MODULE()` (section
-   `gui_apps`, boundary symbols, natural alignment — reuse the
-   MODULE lesson about section stride).  The Start menu enumerates
-   the section instead of the hardcoded enum; fileman.c becomes
-   `GUI_APP("File Manager", fileman_open)`.  Swapping the file
-   manager = linking a different .c that registers the same name.
-   "New Shell" becomes a registered app too; only the power actions
-   (Reboot / Shut Down) stay system menu items.
-2. **`struct desktop_shell` interface** — name + callbacks:
-   `init(w,h)`, `work_area(out rect)`, `draw_chrome(backbuffer)`,
-   `click(x,y) → consumed`, `pointer_moved(x,y)` (hover),
-   `second_tick()` (clock).  Registered via a `DESKTOP_SHELL()`
-   macro; the active one is picked by the `gui.shell` config key
-   (config store + `setconf` already exist).  The current Vista-like
-   taskbar/menu moves out of gui.c into `kernel/gui/shell_vista.c`
-   as the default registration.
-3. **File split** so the layers are visible in the tree:
-   gui.c keeps compositor + WM core (windows, z-order, input
-   routing, damage); shell_vista.c is chrome; widget.c / gfx.c
-   unchanged; apps under kernel/gui/apps/.
-4. **Prove the swap** — a second, minimal `shell_bare` registration
-   (wallpaper only, no chrome; apps launchable via a new `launch
-   <app>` shell command that walks the registry).  DoD is the swap
-   actually happening, not the interface existing.
-5. **Documentation** — new DOCS.md section "GUI architecture &
-   writing apps/shells": layer diagram, the IRQ-vs-compositor-task
-   threading rules, a 10-line hello-world app walkthrough, a
-   desktop-shell how-to.
-
-**Definition of done:**
-- fileman launches from the registry; gui.c has no `extern` to any
-  app and no app enum.
-- `setconf gui.shell bare` + `gui` boots the bare shell;
-  default stays vista.
-- A sample hello app registers itself and appears in the Start menu
-  with zero gui.c changes.
-- DOCS.md gains the GUI-development chapter.
+**Lessons learned:**
+- *The IRQ/task split must be part of the interface.*  Handing shells
+  raw callbacks without the `*_locked` naming convention +
+  `gui_queue_*` indirection would invite chrome code to call app
+  launches (kmalloc, VFS) from the mouse IRQ.  Encoding the contract
+  in gui_internal.h's names makes the wrong thing look wrong.
+- *Chrome clicks need "first refusal" routing.*  The shell's click
+  callback runs before window hit-testing and consumes chrome
+  clicks; menu-open-but-clicked-elsewhere closes the menu and lets
+  the click fall through — matching real desktop behaviour.
 
 ## §M22.3 — Desktop polish: task manager + window lifecycle
 
@@ -1740,6 +1713,9 @@ subsurfaces beyond the minimum xdg_shell needs, XWayland.
 
 ## Change log
 
+- **2026-07-04** — §M22.2 shipped: GUI_APP() + DESKTOP_SHELL()
+  registries, shell_vista/shell_bare, apps under kernel/gui/apps/,
+  `launch` command, DOCS §4.14 dev guide.  Section condensed.
 - **2026-07-04** — Modularity review of the GUI: gfx/widget/fileman
   are clean layers, but the desktop chrome + app launching are welded
   into gui.c (hardcoded menu enum, extern fileman_open) — violates

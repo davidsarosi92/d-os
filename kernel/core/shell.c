@@ -33,6 +33,7 @@
 #include "percpu.h"
 #include "slab.h"
 #include "gui.h"
+#include "gui_app.h"
 
 #define LINE_MAX        128             /* max accepted bytes per command line */
 #define DEFAULT_PROMPT  "d-os> "        /* fallback when config is unavailable */
@@ -106,7 +107,7 @@ static void cmd_help(void) {
                   "  config, getconf <key>, setconf <key> <value>, saveconf\n"
                   "  ringtest, ps, spawn, yield, loop\n"
                   "  pane, pane split horizontal|vertical\n"
-                  "  gui (compositor + mouse-driven shell windows)\n"
+                  "  gui (compositor + desktop), launch [app]\n"
                   "  lslayout, setlayout <us|hu|...>, lscpu, taskset <pid> <mask>\n"
                   "  slabinfo, buddyinfo\n"
                   "  shutdown, reboot\n");
@@ -364,6 +365,27 @@ static void cmd_setlayout(const char* name) {
 /* -------------------------------------------------------------------- */
 /* CPU topology — `lscpu` (M18).                                         */
 /* -------------------------------------------------------------------- */
+
+/* `launch [app]` — walk the GUI_APP registry (M22.2).  Without an
+ * argument it lists the registered apps; with one it launches the
+ * (case-insensitive, prefix-matched) app.  This is how apps start
+ * under chromeless desktop shells (gui.shell=bare), and it runs the
+ * app on THIS shell task — the gui/widget APIs are task-agnostic. */
+static void cmd_launch(const char* args) {
+    if (!gui_is_active()) {
+        console_write("launch: GUI not running (start it with 'gui')\n");
+        return;
+    }
+    if (!args || !*args) {
+        kprintf("registered GUI apps (%d):\n", gui_app_count());
+        for (int i = 0; i < gui_app_count(); i++)
+            kprintf("  %s\n", gui_app_at(i)->name);
+        return;
+    }
+    const struct gui_app_def* app = gui_app_find(args);
+    if (!app) { kprintf("launch: no app matching '%s'\n", args); return; }
+    app->launch();
+}
 
 /* `gui` — start the M22 compositor.  The calling shell keeps running in
  * its (now invisible) pane; two fresh shells come up in windows.  A
@@ -756,6 +778,9 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "clear"))  { vc_clear(my_vc);  return; }
     /* M22: bring up the compositor + two shell windows.  Idempotent. */
     if (streq(line, "gui"))    { cmd_gui();        return; }
+    /* M22.2: GUI app registry access from any shell. */
+    if (streq(line, "launch"))          { cmd_launch("");        return; }
+    if (starts_with(line, "launch "))   { cmd_launch(line + 7);  return; }
     if (streq(line, "about"))  { cmd_about();      return; }
     if (streq(line, "lsmod"))  { module_list();    return; }
     if (streq(line, "lsdrv"))  { driver_list();    return; }

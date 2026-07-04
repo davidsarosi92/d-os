@@ -47,6 +47,25 @@ SECTIONS
         __stop_drivers = .;
     }
 
+    /* GUI app registry (M22.2) — GUI_APP() drops a `struct gui_app_def`
+     * here; the Start menu + the `launch` shell command walk it.  Same
+     * KEEP() + alignment discipline as .modules. */
+    .gui_apps : ALIGN(4)
+    {
+        __start_gui_apps = .;
+        KEEP(*(gui_apps))
+        __stop_gui_apps = .;
+    }
+
+    /* Desktop shell registry (M22.2) — DESKTOP_SHELL() instances; the
+     * compositor picks the active one by the `gui.shell` config key. */
+    .desktop_shells : ALIGN(4)
+    {
+        __start_desktop_shells = .;
+        KEEP(*(desktop_shells))
+        __stop_desktop_shells = .;
+    }
+
     .data BLOCK(4K) : ALIGN(4K)
     {
         *(.data)

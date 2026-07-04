@@ -151,7 +151,12 @@ CORE_C_SRCS := \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
     kernel/gui/widget.c \
-    kernel/gui/fileman.c \
+    kernel/gui/shell_vista.c \
+    kernel/gui/shell_bare.c \
+    kernel/gui/apps/fileman.c \
+    kernel/gui/apps/about.c \
+    kernel/gui/apps/newshell.c \
+    kernel/gui/apps/hello.c \
     kernel/drivers/rtc/cmos_rtc.c \
     kernel/drivers/mouse/ps2_mouse.c \
     kernel/core/keymap.c \
@@ -201,7 +206,12 @@ CORE_C_SRCS := \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
     kernel/gui/widget.c \
-    kernel/gui/fileman.c \
+    kernel/gui/shell_vista.c \
+    kernel/gui/shell_bare.c \
+    kernel/gui/apps/fileman.c \
+    kernel/gui/apps/about.c \
+    kernel/gui/apps/newshell.c \
+    kernel/gui/apps/hello.c \
     kernel/drivers/rtc/cmos_rtc.c \
     kernel/drivers/mouse/ps2_mouse.c \
     kernel/core/keymap.c \

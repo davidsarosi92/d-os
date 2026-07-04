@@ -50,6 +50,7 @@ when sections are added.)
 | 4.11 | Serial debug (COM1) | 687 |
 | 4.12 | ACPI (shutdown) | 701 |
 | 4.13 | GUI — compositor + windows + mouse (M22) | ~1530 |
+| 4.14 | GUI development — apps, desktop shells (M22.2) | ~1610 |
 | 5 | Build & run | 722 |
 | 6 | Compiler flags | 735 |
 | 7 | Roadmap | 751 |
@@ -1596,21 +1597,32 @@ from any shell with the `gui` command.
   (widgets; gets a close X button — teardown runs on the compositor
   task, freeing widgets + surface + app ctx, with an optional
   on_close hook for app singletons).
-- **Taskbar (Vista-shaped, M22.1):** 34 px strip always on top —
-  green Start button, one button per open window (click = focus +
-  raise; focused one highlighted), RTC clock (HH:MM:SS) on the right
-  that repaints once per second.  The Start menu (File Manager / New
-  Shell / About d-os / Reboot / Shut Down) is a compositor-drawn
-  overlay with hover tracking; item clicks are queued as actions and
-  executed on the compositor task (reboot/shutdown call the same HAL
-  entries as the shell commands).
+- **Desktop shells are swappable (M22.2):** the chrome (taskbar,
+  launcher menu, clock, wallpaper hints) lives behind
+  `struct desktop_shell` (desktop.h), registered via
+  `DESKTOP_SHELL()` into a linker section and selected by the
+  `gui.shell` config key at `gui` time.  Two registrations today:
+  **vista** (`shell_vista.c`, default — 34 px taskbar with green
+  Start button + menu, one button per open window, RTC clock
+  repainting once per second) and **bare** (`shell_bare.c` — no
+  chrome at all; apps start via the `launch` shell command).  The
+  Start menu is built from the GUI_APP registry — the shell names no
+  app; power items (Reboot/Shut Down) are fixed tail entries that
+  queue to the same HAL calls the shell commands use.
 - **Content-preserving resize (M22.1):** terminal windows keep a
   character backing store (`cells[]`, sized for the largest grid) and
   re-render it into the new surface on resize — if the grid shrinks
   below the cursor row the store scrolls so the tail stays visible.
   App windows re-run their `on_layout` + widget redraw.  Resize stays
   wireframe-style (rubber band, one realloc on release).
-- **File manager (`fileman.c`):** singleton app window — path label,
+- **Apps self-register (M22.2):** `GUI_APP("Name", launch_fn)` drops
+  an entry into the `gui_apps` linker section (same pattern as
+  MODULE()/DRIVER()); the Start menu and the `launch [app]` shell
+  command walk it.  gui.c references no app by symbol — swapping the
+  file manager for another implementation is a Makefile-only change.
+  Registered today: File Manager, About d-os, New Shell, Hello
+  (the documented sample), all under `kernel/gui/apps/`.
+- **File manager (`apps/fileman.c`):** singleton app window — path label,
   Up / MkDir / Touch / Del / View buttons, directory listview
   (single-click select, double-click descend/open), name textinput
   (Enter = create file), status line.  Del uses `vfs_unlink` (new in
@@ -1625,6 +1637,63 @@ from any shell with the `gui` command.
   nesting/containers; terminal windows have no close button (their
   shell task would leak — needs task kill support); cursor is
   IRQ-latency bound (one tick worst case).
+
+---
+
+### 4.14 GUI development — writing apps and desktop shells (M22.2)
+
+The GUI is layered so both the desktop and the applications are
+replaceable registrations, mirroring the driver framework:
+
+```
+  apps (kernel/gui/apps/*)        desktop shells (shell_vista/bare)
+      │  GUI_APP() registry            │  DESKTOP_SHELL() registry
+      ▼                                ▼
+  gui.h + widget.h  ◄──────────  desktop.h + gui_internal.h
+      │                                │
+      └───────────►  gui.c — compositor + WM core  ◄───────────┘
+                          │
+                     gfx.h (surfaces + primitives)
+```
+
+**Threading rules (memorize these three):**
+1. Widget callbacks (`on_click`, `on_activate`, `on_submit`, key
+   handlers) and app `launch` functions run on a normal TASK (the
+   compositor, or a shell task via `launch`).  VFS, kmalloc and
+   window creation are all fine there.
+2. Desktop-shell `click`/`motion` run in the MOUSE IRQ with the WM
+   lock held: shell-local state + `*_locked` services +
+   `gui_queue_*` only — never allocate, never call an app.
+3. Shell `draw`/`second_tick` run on the compositor task; slow I/O
+   (RTC ports) belongs in `second_tick`.
+
+**Writing an app** (the complete `apps/hello.c` pattern):
+1. `#include "gui.h"`, `"gui_app.h"`, `"widget.h"`.
+2. A launch function: `gui_app_window_create(title, x, y, w, h,
+   on_layout_or_NULL, ctx_or_NULL)` + `w_label_create` /
+   `w_button_create` / `w_listview_create` / `w_textinput_create`
+   + `gui_window_request_redraw(win)`.
+3. `GUI_APP("Menu Label", launch_fn);` at the bottom.  Add the .c to
+   the Makefile — done: it appears in the Start menu and `launch`.
+- The window kfree's `ctx` on close; use `gui_window_set_on_close`
+  to clear app singletons (see fileman.c / about.c).
+- `on_layout` repositions widgets from
+  `gui_window_content_size(win, &w, &h)` after every resize.
+
+**Writing a desktop shell** (template: `shell_bare.c`):
+1. `#include "desktop.h"`, `"gui_internal.h"`, `"gui_app.h"`.
+2. Fill a `struct desktop_shell` (any callback may be NULL) and
+   register with `DESKTOP_SHELL(name) = { ... };`.
+3. `bottom_reserve()` carves the work area; `draw(back)` paints
+   chrome after the windows, below the cursor; `click(x,y)` returns
+   non-zero to consume; build launchers from `gui_app_count()` /
+   `gui_app_at()` and start them with `gui_queue_launch()`.
+4. Select with `setconf gui.shell <name>` before `gui` (persist via
+   `saveconf`).
+
+**Testing:** the QEMU-monitor pattern from §5 (sendkey / mouse_move /
+mouse_button / screendump) drives the whole GUI headlessly — see the
+M22 change-log entries for the exact scripts used.
 
 ---
 
@@ -1698,6 +1767,22 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-04 — M22.2: GUI modularity — swappable desktop shells + app registry + dev docs.**
+  The desktop chrome and app launching moved out of the compositor
+  core behind two linker-section registries (MODULE() pattern):
+  `DESKTOP_SHELL()` (desktop.h; `shell_vista.c` extracted from gui.c
+  as the default, new minimal `shell_bare.c` proves the swap — chosen
+  via the `gui.shell` config key) and `GUI_APP()` (gui_app.h; the
+  Start menu + new `launch [app]` shell command walk it).  Apps moved
+  to kernel/gui/apps/ (fileman, about — extracted from gui.c,
+  newshell — was a hardcoded menu action, hello — documented sample).
+  gui.c now references no app or chrome by symbol; shells talk to the
+  WM through gui_internal.h services with an explicit IRQ-vs-task
+  calling convention.  New DOCS §4.14 (GUI development guide).
+  Verified in QEMU i386: vista Start menu lists all 4 registry apps +
+  power tail, Hello launches and its button counts clicks;
+  `setconf gui.shell bare` + `gui` boots chromeless and `launch file`
+  opens the file manager from a terminal.  x86_64 builds clean.
 - **2026-07-04 — M22.1: widget toolkit + taskbar + file manager + resize fix.**
   PLAN §M22 stage 6 closed plus a Vista-shaped desktop shell.  New:
   `kernel/gui/widget.c` (label/button/listview/textinput; callbacks

@@ -63,6 +63,22 @@ SECTIONS
         __stop_drivers = .;
     }
 
+    /* GUI app + desktop shell registries (M22.2) — same KEEP()
+     * discipline; alignment 8 for the 64-bit struct stride. */
+    .gui_apps : ALIGN(8)
+    {
+        __start_gui_apps = .;
+        KEEP(*(gui_apps))
+        __stop_gui_apps = .;
+    }
+
+    .desktop_shells : ALIGN(8)
+    {
+        __start_desktop_shells = .;
+        KEEP(*(desktop_shells))
+        __stop_desktop_shells = .;
+    }
+
     .data BLOCK(4K) : ALIGN(4K)
     {
         *(.data)
