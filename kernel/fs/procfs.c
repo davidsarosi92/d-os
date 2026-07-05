@@ -275,14 +275,15 @@ static const char* state_name(enum task_state s) {
 }
 static void cb_task(const struct task* t, int is_current, void* ctx) {
     struct procfs_writer* w = (struct procfs_writer*)ctx;
-    pw_put_uint(w, (unsigned)t->pid); pw_putc(w, '\t');
+    pw_put_uint(w, (unsigned)t->pid);  pw_putc(w, '\t');
+    pw_put_uint(w, (unsigned)t->ppid); pw_putc(w, '\t');   /* M27 */
     pw_puts(w, state_name(t->state));  pw_putc(w, '\t');
     pw_puts(w, t->name);
     if (is_current) pw_puts(w, " (running)");
     pw_putc(w, '\n');
 }
 static void gen_tasks(struct procfs_writer* w) {
-    pw_puts(w, "# pid  state  name\n");
+    pw_puts(w, "# pid  ppid  state  name\n");
     task_for_each(cb_task, w);
 }
 

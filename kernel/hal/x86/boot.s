@@ -54,8 +54,8 @@ align 4
     dd 0                                        ; entry_addr
     ; Fields for flag bit 2:
     dd 0                                        ; mode_type: 0 = linear graphics
-    dd 1280                                     ; preferred width  (pixels)
-    dd 800                                      ; preferred height (pixels)
+    dd 1920                                     ; preferred width  (pixels)
+    dd 1200                                     ; preferred height (pixels)
     dd 32                                       ; preferred depth  (bits per pixel)
 
 ; -----------------------------------------------------------------------------

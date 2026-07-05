@@ -30,6 +30,7 @@
 #include "printf.h"
 #include "console.h"
 #include "module.h"
+#include "hal.h"                                  /* inw/outw for DISPI flip */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -41,6 +42,7 @@ static volatile uint32_t* fb_pixels = 0;        /* pointer into the mapped FB */
 static uint32_t fb_width  = 0;                  /* pixels per row */
 static uint32_t fb_height = 0;                  /* pixel rows */
 static uint32_t fb_pitch_bytes = 0;             /* bytes per pixel row */
+static uint32_t fb_phys_base = 0;               /* physical FB base (VRAM BAR) */
 
 #define GLYPH_W 8
 #define GLYPH_H 8
@@ -319,6 +321,89 @@ const uint8_t* fb_font_glyph(unsigned char ch) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* M22.6 — tear-free presentation via a Bochs-VBE double buffer.               */
+/*                                                                             */
+/* QEMU's std-VGA (and Bochs) expose the "DISPI" interface: an index/data      */
+/* register pair (ports 0x1CE/0x1CF) that, among other things, lets us set a   */
+/* VIRTUAL framebuffer taller than the visible one and PAN the visible window  */
+/* within it via a Y-offset.  That is a hardware page flip: compose the whole  */
+/* next frame into the hidden half, then move the scanout origin to it in one  */
+/* register write.  QEMU always reads a consistent buffer, so there is no      */
+/* mid-scanout shear — no vblank interrupt required.                           */
+/*                                                                             */
+/* This only works on the Bochs-VBE device (the ID register reads 0xB0Cx).     */
+/* On anything else fb_flip_init() returns non-zero and the compositor keeps    */
+/* its single-buffer direct blit.                                              */
+/* -------------------------------------------------------------------------- */
+
+#define VBE_DISPI_IOPORT_INDEX      0x01CE
+#define VBE_DISPI_IOPORT_DATA       0x01CF
+#define VBE_DISPI_INDEX_ID          0x0
+#define VBE_DISPI_INDEX_VIRT_HEIGHT 0x7
+#define VBE_DISPI_INDEX_Y_OFFSET    0x9
+
+static int fb_flip_ok = 0;
+
+static inline uint16_t dispi_read(uint16_t idx) {
+    outw(VBE_DISPI_IOPORT_INDEX, idx);
+    return inw(VBE_DISPI_IOPORT_DATA);
+}
+static inline void dispi_write(uint16_t idx, uint16_t val) {
+    outw(VBE_DISPI_IOPORT_INDEX, idx);
+    outw(VBE_DISPI_IOPORT_DATA, val);
+}
+
+/* Probe for the Bochs-VBE device, reserve a second frame's worth of VRAM by
+ * doubling the virtual height, and map that second buffer.  On success both
+ * `*buf0`/`*buf1` point at the two frame buffers (buf0 == the visible one at
+ * boot) and 0 is returned; the compositor drives fb_flip_to() thereafter.
+ * Any failure (not Bochs VBE, VRAM too small, map error) returns non-zero and
+ * leaves the single-buffer path untouched. */
+int fb_flip_init(volatile uint32_t** buf0, volatile uint32_t** buf1) {
+    if (!fb_pixels) return -1;
+
+    /* DISPI ID: 0xB0C0..0xB0C5 across Bochs/QEMU revisions. */
+    uint16_t id = dispi_read(VBE_DISPI_INDEX_ID);
+    if (id < 0xB0C0 || id > 0xB0C5) return -2;      /* not a Bochs-VBE device */
+
+    uint32_t fb_size = fb_pitch_bytes * fb_height;  /* one frame, bytes */
+
+    /* Ask the device for a virtual framebuffer twice as tall.  If VRAM is
+     * too small the device clamps VIRT_HEIGHT — re-read and bail if it did
+     * not take, so we never pan into unbacked memory. */
+    dispi_write(VBE_DISPI_INDEX_VIRT_HEIGHT, (uint16_t)(fb_height * 2));
+    if (dispi_read(VBE_DISPI_INDEX_VIRT_HEIGHT) < fb_height * 2) return -3;
+
+    /* Map the second buffer.  It sits immediately after the first in the same
+     * linear VRAM BAR.  Re-mapping the boundary 4 MiB PDE (shared with the
+     * first buffer's tail) is idempotent on both arches — same phys, same
+     * flags. */
+    uint32_t base_aligned = fb_phys_base & 0xFFC00000u;
+    uint32_t end          = fb_phys_base + fb_size * 2;
+    for (uint32_t a = base_aligned; a < end; a += 0x00400000u) {
+        int r = vmm_map_4mib(a, a, VMM_WRITABLE);
+        if (r != 0 && r != -2) {
+            /* Roll back the virtual height so scanout stays inside buffer 0. */
+            dispi_write(VBE_DISPI_INDEX_VIRT_HEIGHT, (uint16_t)fb_height);
+            return -4;
+        }
+    }
+
+    dispi_write(VBE_DISPI_INDEX_Y_OFFSET, 0);       /* start on buffer 0 */
+    fb_flip_ok = 1;
+    if (buf0) *buf0 = fb_pixels;
+    if (buf1) *buf1 = (volatile uint32_t*)((uintptr_t)fb_pixels + fb_size);
+    return 0;
+}
+
+/* Make buffer `idx` (0 or 1) the visible one by panning the scanout origin.
+ * A single register write; takes effect on QEMU's next host redraw. */
+void fb_flip_to(int idx) {
+    if (!fb_flip_ok) return;
+    dispi_write(VBE_DISPI_INDEX_Y_OFFSET, idx ? (uint16_t)fb_height : 0);
+}
+
+/* -------------------------------------------------------------------------- */
 /* Public entry points (legacy whole-screen API).                             */
 /* -------------------------------------------------------------------------- */
 
@@ -353,6 +438,7 @@ int fb_term_init_if_available(const struct mboot_info* mbi) {
     }
 
     fb_pixels      = (volatile uint32_t*)(uintptr_t)fb_phys;
+    fb_phys_base   = fb_phys;
     fb_width       = mbi->framebuffer_width;
     fb_height      = mbi->framebuffer_height;
     fb_pitch_bytes = mbi->framebuffer_pitch;

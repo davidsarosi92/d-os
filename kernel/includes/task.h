@@ -49,6 +49,17 @@ enum task_state {
 struct task {
     char     name[TASK_NAME_MAX + 1];
     int      pid;
+    /* M27 — process model.  `ppid` is the parent's pid (a stable int, not
+     * a pointer, so it never dangles when the parent is reaped).  On the
+     * parent's reap its surviving children are re-parented to init
+     * (task_reaper_pid()).  `exit_code` is recorded by task_exit_code();
+     * `reap_owned` marks a task whose reap is owned by a subsystem (the
+     * GUI reaps its window shells itself) — init's universal reaper skips
+     * those so it never races the owner for the same struct. */
+    int      ppid;
+    int      exit_code;
+    int      reap_owned;
+    void*    start_arg;                 /* M22.7 — entry arg (task_start_arg) */
     enum task_state state;
     uintptr_t esp;                      /* saved kernel-stack pointer (HAL-typed) */
     void*    kstack_base;               /* kmalloc'd; freed at reap */
@@ -117,8 +128,27 @@ void task_become_idle(void);
 
 /* Create a new kernel-mode task.  `entry` runs on its own stack.  Args
  * are not passed (the entry function may consult globals / config).
- * Returns the new task (RUNNABLE in the queue) or NULL on OOM. */
+ * Returns the new task (RUNNABLE in the queue) or NULL on OOM.  The new
+ * task's parent (ppid) is the caller — it joins the caller's subtree. */
 struct task* task_spawn(const char* name, void (*entry)(void));
+
+/* M27 — like task_spawn, but the new task is INDEPENDENT: its parent is
+ * init, not the caller.  Use it for daemons / background workers that must
+ * outlive whoever started them and must NOT be swept up by a kill_tree on
+ * the caller.  (The building block for M29 services.) */
+struct task* task_spawn_detached(const char* name, void (*entry)(void));
+
+/* M22.7 — spawn with a start argument, retrievable by the entry through
+ * task_start_arg().  The arg is set before the task is enqueued, so it is
+ * safe even if another CPU runs the task immediately.  The GUI uses it to
+ * hand each per-app "host" task the window/app it should drive. */
+struct task* task_spawn_arg(const char* name, void (*entry)(void), void* arg);
+void* task_start_arg(void);
+
+/* M22.7 — spawn with an explicit parent pid (>= 0), or the caller (< 0).
+ * The GUI uses it to parent a launched terminal's shell to the desktop
+ * session instead of the transient launcher task. */
+struct task* task_spawn_under(const char* name, void (*entry)(void), int ppid);
 
 /* Cooperative yield.  No-op if we're the only runnable task.  Returns
  * when this task is scheduled again. */
@@ -142,8 +172,30 @@ void task_set_out_console(struct task* t, void* console);
 void task_finish_first_switch(void);
 
 /* Mark the current task DEAD and never return — the scheduler picks the
- * next runnable task on the next yield cycle. */
+ * next runnable task on the next yield cycle.  task_exit() is exit code 0;
+ * task_exit_code() records a code first (shown by ps, logged by init). */
 void task_exit(void) __attribute__((noreturn));
+void task_exit_code(int code) __attribute__((noreturn));
+
+/* M27 — process model.
+ *
+ * task_start_init() spawns the init task (the always-on reaper + orphan
+ * adopter).  Call once from kernel_main after task_init + SMP are up; its
+ * pid becomes task_reaper_pid().  init reaps every DEAD task that is not
+ * reap_owned, so an exited kernel thread never leaks as a zombie the way
+ * it could before (reaping used to depend on the Task Manager being open).
+ *
+ * task_kill_tree() cooperatively kills `pid` AND all its descendants (the
+ * kthread contract still holds — each victim dies at its next yield).  Use
+ * it when a subtree should go down together (e.g. closing a shell window
+ * takes anything that shell spawned with it).
+ *
+ * task_set_reap_owned() lets a subsystem claim a task's reap so init keeps
+ * its hands off it. */
+void task_start_init(void);
+int  task_reaper_pid(void);
+int  task_kill_tree(int pid);
+void task_set_reap_owned(struct task* t, int owned);
 
 /* Internal scheduler entry — pick next RUNNABLE task and context_switch
  * to it.  Both task_yield and the IRQ-driven preemption path call this.

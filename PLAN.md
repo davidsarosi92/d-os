@@ -49,10 +49,18 @@
 | §M22.3 | Desktop polish — task manager, task_kill, minimize, Alt-Tab | ~1545 |
 | §M22.4 | Compositor smoothness — cursor race, drag damage, tearing | ~1539 |
 | §M22.5 | Desktop apps — editor, BASIC, file manager 2.0, maximize | ~1557 |
+| §M22.6 | Tear-free present (page flip) + display scaling | ~1587 |
+| §M22.7 | Per-task GUI apps + panel-as-task — ✅ shipped | ~1660 |
 | §M23 | Audio subsystem | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) | ~1080 |
 | §M25 | Userland foundation (Wayland prerequisites) | ~1545 |
 | §M26 | Wayland server (wire protocol on M22 + M25) | ~1615 |
+| §M27 | Process model — init, hierarchy, reaper, kill-tree — ✅ shipped | ~1818 |
+| §M28 | System log (klog ring buffer + dmesg) | ~1860 |
+| §M29 | Services / daemons — supervisor + SERVICE() registry | ~1895 |
+| §M30 | Task scheduling — cron service | ~1935 |
+| §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) | ~1960 |
+| §M32 | Multi-user — identity, login, file perms, isolation | ~2160 |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -172,10 +180,18 @@ what); a session can pick a theme and push on it.
 | M22.3 | Desktop polish — task manager, task_kill, term-window close, minimize, Alt-Tab, damage rects | UX | ✅ DOCS §4.13 |
 | M22.4 | Compositor smoothness — cursor-damage race, rect-bounded drag, tearing mitigation | UX | ✅ DOCS §4.13 |
 | M22.5 | Desktop apps — text editor, BASIC interpreter, file manager 2.0, maximize/restore | UX | ✅ DOCS §4.13 |
+| M22.6 | Tear-free present — Bochs-VBE page flip + display-scaling fix | UX | ✅ DOCS §4.13 |
+| M22.7 | Per-task GUI apps (each WIN_APP on its own task) + panel-as-task | UX | ✅ DOCS §4.16 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | §M25 |
 | M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | §M26 |
+| M27 | Process model — init, parent/child hierarchy, always-on reaper, kill-tree | Concurrency | ✅ DOCS §4.15 |
+| M28 | System log — klog ring buffer, severity levels, /proc/kmsg, dmesg | Observability | §M28 |
+| M29 | Services / daemons — SERVICE() registry + supervisor (autostart, restart policy) | Architecture | §M29 |
+| M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | §M30 |
+| M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | §M31 |
+| M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation | Security | §M32 |
 
 ### Cross-cutting constraints
 
@@ -1542,8 +1558,10 @@ manual layout stayed readable without them).
 with compositor-side cursor bookkeeping (compose() unions the
 last-drawn + fresh cursor rects itself; IRQ glide = bare need_frame
 wake); DRAG_MOVE damages old∪new rect per motion (drag stays
-partial-frame dominated, 52:5 in the scripted test); tearing noted as
-std-VGA-inherent (virtio-gpu flush = post-M24 option); program close
+partial-frame dominated, 52:5 in the scripted test); tearing then
+noted as std-VGA-inherent — **that call was wrong, see §M22.6**: the
+Bochs-VBE DISPI Y_OFFSET pan register IS a present boundary, so a
+page flip fixes it without virtio-gpu; program close
 propagates to the Task Manager within one frame (task_set_change_hook
 → immediate on_tick) and taskman opportunistically reaps DEAD tasks
 not bound to a VC (vc_task_bound).
@@ -1583,6 +1601,214 @@ restore → rename/copy/delete on ramfs.
 - *Copy-to-self is a truncation footgun.*  vfs_copy opens dst with
   TRUNC; if src == dst that empties the source before the first
   read.  Guard: probe dst without TRUNC and compare inodes.
+
+## §M22.6 — Tear-free presentation (page flip) + display scaling — ✅ shipped
+
+**Shipped 2026-07-04, see DOCS.md §4.13.**  Triggered by the user
+report "the picture still wiggles on mouse move, are we synced?".  The
+investigation separated two conflated symptoms:
+
+1. **Host-side scaling shimmer (the visible one).**  `run_qemu.sh` ran
+   `-display cocoa,zoom-to-fit=on`, which bilinearly rescales the
+   1280×800 guest onto a non-integer Retina window.  Every small screen
+   update re-presents the whole scaled frame, and the interpolation
+   nudges static edges ±1 px → a continuous shimmer that *tracks mouse
+   motion* and reads exactly like tearing.  It is NOT the compositor: a
+   pointer glide only re-blits the ~14×20 cursor rect; the rest of VRAM
+   is byte-identical, so static edges physically cannot move on screen.
+   Fix: `zoom-to-fit=off` (crisp 1:1).  Comment in the script points at
+   raising the guest resolution if a bigger-yet-crisp window is wanted
+   (never re-enable non-integer zoom).
+
+2. **Real compositor tearing.**  The final present was a direct blit
+   into the LIVE scanout buffer.  Fixed with a hardware page flip on
+   the Bochs-VBE device (QEMU `-vga std`; DISPI ID 0xB0Cx): reserve a
+   second VRAM frame (DISPI VIRT_HEIGHT = 2×H, ~4 MiB extra, fits the
+   16 MiB default), compose into the hidden buffer, then pan the
+   scanout origin (DISPI Y_OFFSET) in one register write.  No vblank
+   IRQ is needed — QEMU only ever scans out a fully-composed buffer.
+   Buffer age is 2 (ping-pong), so each present copies `dirty_N ∪
+   prev_dmg` from `backsurf` (kept a complete correct frame by the
+   damage-rect optimisation).  Graceful fallback to the single-buffer
+   direct blit on non-Bochs displays (`fb_flip_init` fails).  API:
+   `fb_flip_init` / `fb_flip_to` in fb_terminal.c.
+
+**Same-session follow-ups (all shipped, both archs):**
+
+3. **1920×1200 desktop.**  Multiboot header raised to 1920×1200×32
+   (both `boot.s`).  Forced two infra fixes: (a) VRAM — the double
+   buffer is ~18.4 MiB, over std-VGA's 16 MiB default, so the run
+   script uses `-vga none -device VGA,vgamem_mb=32` (`-global
+   VGA.vgamem_mb=` is ignored — wrong device name); (b) heap — a
+   9.2 MiB full-screen surface exceeded `BUDDY_MAX_ORDER` 10 (4 MiB
+   max contiguous), so it went to 12 (16 MiB).  Also `-m 256M`.
+
+4. **Terminal windows auto-close when their hosted task dies.**  A
+   shell killed via Task Manager / CLI `kill` / by returning from its
+   entry used to leave its dead, un-typeable window on screen.  The
+   compositor now flags such a WIN_TERM window for its normal close
+   teardown as soon as the hosted task hits TASK_DEAD — reaping it,
+   so it also drops off the Task Manager.  Keyed on *actual death*,
+   not the kill request, so a task flagged-but-still-running keeps its
+   window (the "stop instruction vs stopped" distinction the request
+   called out).
+
+**Verified:** i386 + x86_64 both log "gui: page-flip present enabled"
+at 1920×1200; 80-event mouse-move stress composed+flipped with no
+fault; `kill <windowed-shell-pid>` produced "gui: window '…'
+auto-closing (hosted pid N died)" and a clean teardown.
+
+**Lesson learned:** "no vblank" ≠ "no present boundary".  A pan/flip
+register (DISPI Y_OFFSET, or a virtio-gpu flush) gives tear-free
+presentation even without a scanout-completion interrupt, because the
+device reads a whole consistent buffer between your composes.  M22.4's
+"not fixable on std-VGA" was too quick — the fix was a $0 register
+write, not a new display device.  Second lesson: when a user reports a
+visual artifact, rule out the *host* display path (scaling, filtering,
+compositor of the emulator's own window) before blaming the guest —
+here the dominant symptom was entirely host-side.
+
+## §M22.7 — Per-task GUI apps + panel-as-task
+
+**Why:** the compositor used to run every WIN_APP's callbacks (widget
+hit-test, key/mouse handlers, ~1 Hz tick, redraw) on ITS OWN task.  Two
+costs: apps were not processes (invisible in the Task Manager, not
+independently killable), and a slow/blocking app handler froze the
+WHOLE GUI (cursor, other windows — everything).  Making each app its own
+task fixes both and is the natural stepping stone to the Wayland client
+model (M26): the compositor becomes a pure surface-compositor + input
+router, and every UI surface is drawn by its own task.
+
+### Stage A — per-task apps — ✅ shipped (2026-07-05, DOCS §4.16)
+
+Each WIN_APP window is driven by a dedicated **app-host task**
+(`app_host_main`).  Mechanism:
+- `task_spawn_arg()` (task.c) hands the host its app's open fn via
+  `start_arg`; the host runs it (creating the window + widgets ON the
+  host task) then services the window(s) it owns.
+- Input: the compositor no longer touches widgets — it routes each event
+  into the window's per-window queue (`win->aq`); the host does the
+  hit-test + widget dispatch + `app_redraw` off the compositor.  The
+  compositor still composites `win->surf` under `win->lock` (unchanged).
+- `on_tick`/`on_layout` become `tick_pending`/`layout_pending` flags the
+  compositor sets and the host acts on.
+- Teardown (two-actor dance): on want_close the host runs on_close +
+  frees widgets + sets `host_released`; the compositor then disposes the
+  window struct and reaps the host (reap_owned, so init keeps off it; a
+  no-window singleton host is caught by a sweep).  An externally-killed
+  host is detected (host_task DEAD) and the compositor does the cleanup.
+- `window_alloc` now claims its slot under `state_lock` (hosts create
+  windows concurrently); the `launch` command + taskbar both go through
+  `gui_queue_launch` → the compositor spawns the host (never call the
+  open fn on the caller's task).
+
+**Verified (i386 + x86_64):** About / Task Manager / File Manager each
+come up as `app:<name>` tasks and render (Task Manager list showed 641
+white text pixels — the tick ran on the host; File Manager showed its
+VFS directory listing); the X button closes a window (host cleanup +
+reap, "app window '…' closed" log); no fault.  Apps now appear in the
+Task Manager as real tasks.
+
+### Stage B — panel / desktop shell as its own task — ✅ shipped (2026-07-05)
+
+The desktop shell (taskbar/launcher/clock) now runs on its own
+**`desktop` task** and renders into a full-screen **`panelsurf`** at
+screen coordinates — so shell_vista's draw/click/motion/second_tick
+code is *unchanged*, it just runs on the panel task.  The compositor
+composites only the OPAQUE parts of panelsurf on top of the windows:
+the taskbar strip (always) and the launcher popup rect (while open), so
+the rest never occludes.  The shell publishes its popup extent via
+`gui_panel_set_popup`; the compositor uses it both to composite the
+popup and to route clicks (`in_panel_region`).  Panel-region input goes
+to a `pevq` the desktop task drains, running shell->click/motion under
+state_lock (their old IRQ-held contract).  The clock's `second_tick`
+(RTC I/O) and all chrome redraws happen on the desktop task; the
+compositor no longer calls the shell at all.
+
+**Verified (i386 + x86_64):** `gui: desktop shell up on pid 8`; the
+taskbar renders (gradient + Start text); the Start button opens the
+launcher (popup composited — menu-bg pixels present); clicking a menu
+item closes the popup AND launches the app as its own `app:<name>`
+host; no fault.  End-state reached: **the compositor is now a pure
+surface-compositor + input router; every UI surface (windows, apps,
+panel) is drawn by its own task** — the M26 Wayland shape, with the
+internal API instead of the wire protocol.
+
+**Lessons learned:**
+- *A popup that overlays windows can't live in a bottom-strip surface.*
+  The Start menu pops up above the taskbar over the work area, so the
+  panel surface is full-screen and the compositor composites explicit
+  opaque rects (taskbar + published popup) rather than a fixed strip —
+  the rest of the surface is never blitted, so it doesn't occlude.
+- *Moving IRQ-contract callbacks to a task means the task must honour
+  the contract.*  shell->click/motion assumed the WM lock was held (old
+  IRQ path); the desktop task acquires state_lock around them, so the
+  shell code didn't change.
+- *`bare` shell regressed cosmetically* (bottom_reserve=0 → nothing
+  composited from its panel → its hint line is invisible).  Acceptable
+  for a rescue shell; a shell with real chrome must reserve a strip.
+
+### Post-ship refinements (2026-07-05)
+
+- **Latency.**  Every task loop `hal_cpu_idle()`d (halt a full tick)
+  each pass, so with the extra always-runnable tasks (desktop +
+  app-hosts) the compositor's turn came around only every N ticks —
+  the lag reported with the menu / Task Manager open.  Fix: halt ONLY
+  when idle (`if (need_frame) compose(); else hal_cpu_idle();`), in the
+  compositor, desktop, and app-host loops.  Plus vista_motion no longer
+  full-recomposes per hover (`gui_panel_dirty` = chrome-only): measured
+  2 full frames over 50 menu-hover motions vs one full each before.
+  (A proper block/wake primitive would beat polling+hlt entirely — a
+  candidate for the M27 scheduler line later.)
+- **Parentage.**  App launches moved from the compositor to the desktop
+  task, so a launched app is a child of the **desktop/session**, not
+  the display server (`ps`: `app:File Manager` under `desktop`).  The
+  display server owning the apps was the wrong shape — apps belong to
+  the session/launcher (the Wayland/X model).
+- **Panel memory.**  `panelsurf` dropped from a full-screen 9.2 MiB
+  surface to just the bottom strip (taskbar reserve + `PANEL_POPUP_MAX`)
+  — screen-addressed via an offset `px` + clip, so the shell code stays
+  screen-coordinate.  ~5 MiB saved.
+- **Damage rect LIST (cursor-hitch fix).**  Damage was a single bounding
+  box, so a Task Manager refresh in one corner + the cursor in another
+  merged into a huge diagonal blit every refresh → the cursor stuttered.
+  Now damage is a LIST of ≤16 disjoint rects; `compose()` snapshots the
+  WM state once and paints + presents each rect separately, and the page
+  flip replays a per-rect `prev_dmg` list.  Measured with TM + cursor:
+  ~630 KB/frame vs the old union's ~2.4–5.3 MB — hitch gone.  Verified
+  (renders correctly; drag leaves no trail).
+- **Precise structural damage + listview-only refresh (the two
+  follow-ups).**  A window click used to `gui_damage_all()` (full 9 MB
+  frame) for the focus/z change; now `gui_mouse` damages only the two
+  affected windows (old focus un-highlights, clicked window raises +
+  highlights) — geometry changes (resize apply, maximize) still take the
+  full path.  And the Task Manager repaints only its listview rect via
+  the new `gui_window_request_redraw_rect` (its CPU-ms column ticks every
+  second; the title/buttons/status don't), not the whole window.
+  Verified on both archs: raising a covered window renders correctly (its
+  focused title now paints over the overlap); the TM list updates with
+  the chrome intact; no fault.
+- **Session vs detached shells.**  A GUI-launched terminal used to
+  orphan to init (the transient launcher app-host created the WIN_TERM
+  then exited).  New `task_spawn_under(name, entry, ppid)` parents the
+  shell explicitly: **"New Shell"** = SESSION (child of `desktop`, dies
+  with a `kill_tree(desktop)`), **"Detached Shell"** = child of init
+  (outlives the session; window persists while the compositor runs — the
+  nohup/tmux-detach idea in a GUI).  gui.c tracks `desktop_pid`.  The two
+  modes map straight onto M27's `task_spawn` vs `task_spawn_detached`
+  primitives.  Verified: `ps` shows the session shell under `desktop`,
+  the detached one under `init`.
+- **GUI session root + clean-desktop start.**  `gui_start` now spawns
+  the `desktop` task FIRST and parents the compositor + the (formerly
+  auto-started) shells UNDER it via `task_spawn_under`, so the whole GUI
+  is one session subtree (`boot-shell → desktop → {compositor,
+  windows/apps}`) instead of scattered under the boot shell — a
+  `kill_tree(desktop)` closes the session.  And the two starter shells
+  are gone: the GUI boots as a bare desktop (wallpaper + taskbar, 0
+  windows; focus NULL until one opens) and the user launches terminals
+  from Start ("New Shell" / "Detached Shell").  (Still under the boot
+  shell: the desktop itself — the boot shell is the launcher.  A
+  dedicated login/session-manager root is §M32 territory.)
 
 ## §M23 — Audio subsystem
 
@@ -1746,6 +1972,311 @@ subsurfaces beyond the minimum xdg_shell needs, XWayland.
 
 ---
 
+## §M27 — Process model: init, hierarchy, reaper, kill-tree — ✅ shipped
+
+**Shipped 2026-07-04, see DOCS.md §4.15.**  `struct task` gained
+`ppid` + `exit_code` + `reap_owned`; parent = the spawner (pid 0 very
+early).  An always-on **init task** (the first thing kernel_main
+spawns) is the *universal reaper*: it sweeps DEAD tasks that are not
+`reap_owned` at ~100 Hz (the compositor idle pattern), closing the old
+"exited task leaks as DEAD unless the Task Manager is open" gap.
+`task_kill_tree()` cooperatively kills a pid + all descendants
+(fixpoint subtree collection under master_lock, flagged after
+release); the GUI window close uses it so a shell window takes anything
+it spawned down with it.  On reap a task's surviving children
+re-parent to init (never a dangling ppid).  Visibility: `ps` and
+`/proc/tasks` grew a PPID column; the Task Manager renders a real
+process **tree** (children indented under parents).  pid 0 (the boot
+"swapper") and init are guarded against reaping.
+
+**Verified (i386 + x86_64):** init reaps a leaked boot self-test task;
+`ps` shows correct ppid; a `spawn`ed child under a GUI shell is taken
+down + re-parented + reaped when its window is closed
+("auto-closing … pid N", "init: reaped 'ticker' (…ppid→init…)"); no
+fault; pid 0 survives.
+
+**Lessons learned:**
+- *The reaper eagerly ate pid 0.*  kernel_main task_exit()s after boot,
+  so pid 0 goes DEAD — and a universal reaper will happily reap it
+  (memory-safe: its stack is the un-owned boot stack).  Alarming in
+  the log and against the "swapper is permanent" convention, so pid 0
+  (and init itself) are explicitly skipped.
+- *Reap ownership must be explicit, not GUI-coupled.*  Core task.c
+  must not call into the GUI to ask "is this task window-bound?"  A
+  plain `reap_owned` flag on the task decouples it: the GUI sets it on
+  its window shells and keeps reaping them; init skips them.  This
+  replaced the taskman's old `vc_task_bound()` reap gate.
+- *Death goes down, notification goes up.*  kill-tree propagates
+  termination to descendants; a child dying does NOT kill its parent —
+  the parent is meant to be NOTIFIED and apply policy.  That upward
+  half (wait/supervision + freeze watchdog) is deferred to §M29 and a
+  new §M31; see those.
+
+---
+
+## §M28 — System log (klog ring buffer + dmesg)
+
+**Why now:** small and independent, but the service supervisor (M29)
+and cron (M30) both want somewhere structured to log.  Today
+`kprintf` goes straight to serial + console with no levels, no
+history, no per-source tagging.
+
+**Design — staged.**
+
+1. **klog core (`kernel/core/klog.c`)** — a fixed ring buffer of
+   records: monotonic seq, timestamp (`timer_ticks_ms`, plus CMOS RTC
+   wall-clock at boot for absolute time), severity (EMERG…DEBUG,
+   printk-style), a short source tag, and the message.  Lock-light
+   (per-record, SMP-safe).
+2. **`kprintf` tees into it** — existing call sites keep working; a
+   new `klog(level, tag, fmt, …)` is the richer entry point.  Serial
+   output stays (it is the boot-time lifeline).
+3. **Read path** — `/proc/kmsg` (or `/dev/klog`) exposes the ring;
+   `dmesg [-l level]` shell command formats + filters it.
+4. **Persistence (optional follow-up)** — flush to `/var/log/messages`
+   on exFAT once mounted; ring stays the source of truth.
+
+**Definition of done:**
+- `dmesg` shows timestamped, levelled boot + runtime messages.
+- A driver / subsystem can `klog(KLOG_WARN, "xhci", …)` and it is
+  tagged + filterable.
+- DOCS.md gains an "Observability / klog" chapter.
+
+**Out of scope:** structured/binary journald-style records, log
+rotation, remote syslog, rate-limiting (noted for later).
+
+---
+
+## §M29 — Services / daemons: supervisor + SERVICE() registry
+
+**Why now:** gives the OS a "systemd-lite / SMF-lite" — long-lived
+supervised workloads with a real lifecycle.  Follows the established
+registry pattern (`DRIVER()`, `GUI_APP()`, `SHELL_PROVIDER()`), so it
+is idiomatic d-os rather than a new subsystem style.
+
+**This is the "upward" answer to child death.**  M27 propagates
+termination *downward* (kill-tree) but deliberately does NOT let a
+child's death kill its parent.  The established convention for "what
+happens up the tree" is a **supervisor** (Erlang/OTP supervision trees,
+systemd, runit, s6, daemontools): the parent is *notified* of a child's
+exit and applies a *restart policy* — it does not simply die too.  M29
+is exactly that supervisor.  The clean primitive it wants from M27 is a
+`task_wait(pid, &code)` (M27 shipped the pieces — exit_code + the change
+hook — but a blocking wait was left for here, since the supervisor is
+its first real user).
+
+**Depends on:** §M27 (parentage, exit codes, kill-tree, detached spawn
+for the supervised children; the supervisor uses task_spawn_detached so
+services aren't tied to whoever ran `service start`), §M28 (log there).
+
+**Design — staged.**
+
+1. **`SERVICE()` linker section** — `struct service { name, entry,
+   autostart, restart }` where `restart ∈ {no, on-failure, always}`.
+   Same self-registration story as drivers; no `kernel_main` edits.
+2. **Supervisor task** — could be init itself or a child of it.  At
+   boot it starts every `autostart` service, records the child pid,
+   and on the `task_set_change_hook` notices a service task went DEAD
+   and restarts it per policy (with a simple backoff so a crash-loop
+   does not spin a core).
+3. **Control surface** — `service list|start|stop|restart|status
+   <name>`; `/proc/services` (name, state, pid, restarts); enable /
+   disable via `/etc/d-os.conf` keys (or an `/etc/services.d`).
+4. **First services** — trivial demonstrators (a heartbeat logger, a
+   procfs stats sampler) proving autostart + restart-on-crash; cron
+   (M30) becomes the first *real* service.
+
+**Definition of done:**
+- An `always`-restart service killed by hand comes back on its own,
+  and the restart is visible in `dmesg` + `/proc/services`.
+- `service list` reflects live state; disabling in config keeps it
+  down across boots.
+- DOCS.md gains a "Services" chapter.
+
+**Out of scope:** dependency ordering / socket activation, resource
+limits (cgroup-style), user/permission separation (no userland yet),
+D-Bus-style IPC.
+
+---
+
+## §M30 — Task scheduling: cron service
+
+**Why now:** the natural capstone of the cluster — a scheduler for
+*work over time*, and the first genuinely useful service.  Small once
+M27–M29 exist, because cron is literally a service that spawns
+(and owns → reaps) child tasks on a schedule.
+
+**Depends on:** §M29 (cron is a service), §M27 (it parents/reaps its
+jobs), §M28 (it logs runs).  Time source already exists (CMOS RTC +
+`timer_ticks_ms`).
+
+**Design — staged.**
+
+1. **Crontab** — `/etc/crontab` parsed into a table of
+   `{schedule, command}`.  Start with interval schedules
+   (`every N s/min`) plus a minimal cron-field form; wall-clock
+   alignment via the RTC.
+2. **cron service** — a timer loop that, each tick, spawns the due
+   jobs as its own children and logs start/exit (+ exit code) to
+   klog.  Missed-tick policy: run-once-on-catch-up, not backfill.
+3. **Job as task** — a job is a kernel task (or, post-M25, a spawned
+   program); cron reaps it and records the result.
+4. **Control** — `crontab -l` to list, `cron status` for the next
+   due times; reload on `/etc/crontab` change.
+
+**Definition of done:**
+- A `every 5s` job fires on schedule and its runs appear in `dmesg`.
+- cron shows up under `service list` and survives a restart.
+- DOCS.md "Services" chapter gains a cron section.
+
+**Out of scope:** at/batch one-shots (could be a thin follow-up),
+per-user crontabs, timezone handling beyond the RTC's wall clock,
+persistence of last-run state across reboot.
+
+---
+
+## §M31 — Watchdog: heartbeat-based freeze detection
+
+**Why:** M27 handles a task that *dies*; this handles a task that is
+alive but *wedged* (an infinite loop that never yields, a deadlock, a
+livelock).  Death and freeze are different failure modes and need
+different machinery — you cannot reap what has not exited.  "Is a
+program frozen?" is genuinely a *global* problem with three layers.
+
+**Design — three layers, small.**
+
+1. **Per-task heartbeat (the systemd `WatchdogSec=` model).**  A
+   supervised task (M29 service, or any opt-in worker) periodically
+   "pets" its watchdog — `watchdog_kick()` — which stamps a last-seen
+   time.  A watchdog sweep (init, or a dedicated task) flags any task
+   that missed its deadline as hung and applies policy: log, then
+   kill_tree + restart (M29).  Opt-in: a task that never registers is
+   never watched (a legitimately long compute is not a freeze).
+2. **Per-CPU softlockup detector.**  A low-frequency check that each
+   CPU is still taking timer ticks / making scheduler progress (a
+   per-CPU "still alive" counter the tick bumps; a peer notices if it
+   stops).  Catches a core wedged in an IRQ storm or a spinlock
+   deadlock — the thing a per-task heartbeat can't see because the
+   watchdog sweep itself may be starved.
+3. **Hardware watchdog (last resort).**  Arm an emulated/real watchdog
+   timer (QEMU `-watchdog`), pet it from a healthy path; if the whole
+   box wedges, it resets.  The only recovery when software is too dead
+   to help itself.
+
+**The hard truth (cooperative-kill model).**  We can *detect* a freeze
+at any layer, but we cannot always safely *force-kill* a wedged kernel
+thread — it may hold a spinlock (the very reason M22.3 made kill
+cooperative).  So layer 1's "kill + restart" only works if the frozen
+task reaches a yield/poll point.  A truly wedged kthread that never
+yields is only recoverable by layers 2–3 (or a reboot).  This gets
+clean once **§M25** gives real user processes: a frozen *user* process
+can be force-killed at any instruction and its address space + fds
+reclaimed by the kernel, because its failure can't corrupt kernel
+state.  So: heartbeat + restart for services now (M31), genuine
+force-kill of frozen tasks later (M25 userland).
+
+**Definition of done:**
+- A service that stops petting its watchdog is detected + restarted;
+  the event shows in `dmesg` (M28) and `/proc/services` (M29).
+- A wedged CPU is reported (softlockup warning) rather than silently
+  hanging the box.
+
+**Out of scope:** NMI-based hardlockup detection, lockdep-style
+deadlock prediction, per-task CPU-time rlimits.
+
+**Depends on:** §M28 (log the warnings), §M29 (restart policy +
+`/proc/services`); the hardware layer is independent.
+
+---
+
+## §M32 — Multi-user: identity, login, file permissions, isolation
+
+**Why:** turn d-os from a single-operator machine into a real
+multi-user system — several users on it at once, each with their own
+identity, home, and processes, unable to read or kill each other's
+work.  This is the security spine the OS has lacked.
+
+**The hard dependency — §M25.**  *Real* isolation needs per-process
+address spaces: today every task is a ring-0 kernel thread sharing the
+kernel's address space, so any thread can read any memory and "users"
+could only ever be advisory.  Enforcement (one user can't touch
+another's memory) lands only once §M25 (userland foundation:
+per-process VMM, ring-3 processes, ELF loader, fd table) exists.
+Identity + the user DB + file ownership can land earlier as advisory
+metadata and gain teeth when M25 arrives.  Also builds on §M27
+(process hierarchy → sessions) and the VFS.
+
+**Design — staged.**
+
+1. **Credentials on tasks.**  `struct cred { uid, gid, groups[]; }` on
+   `struct task`, inherited across spawn (a child gets its parent's
+   creds).  uid 0 = root.  `getuid`/`setuid`-style accessors; privilege
+   *drop* on login.  Cheap; the identity half can precede M25.
+2. **User database.**  A `/etc/passwd`-shaped text store (name, uid,
+   gid, home, shell, password hash) + `/etc/group`.  Text files, not a
+   binary blob (same anti-registry stance as §M-registry).  A
+   `user_lookup(name)` / `user_by_uid(uid)` API.
+3. **Authentication + login.**  A `login` flow: read username +
+   password, verify against the hash, then establish a **session** with
+   that user's creds — cwd = home, `$USER`, and the user's shell,
+   under a session-leader task (ties into the §M22.7 "GUI session"
+   idea: one session per logged-in user).  A password *hash* placeholder
+   with an explicit "NOT production crypto until a real primitive lands"
+   caveat.
+4. **File ownership + permissions.**  VFS inodes gain `owner_uid` /
+   `owner_gid` / `mode` (rwx user/group/other); `vfs_open` / `unlink` /
+   `rename` / `mkdir` check them against the caller's creds.  ramfs
+   stores them; procfs synthesises (a `/proc/<pid>` is owned by the
+   task's user); devfs nodes get sane defaults; exFAT (no Unix perms on
+   disk) maps to a mount-wide default owner.  `chmod` / `chown`
+   commands, gated on ownership / root.
+5. **Privilege gating.**  Privileged operations — mount, reboot/shutdown,
+   killing another user's process, writing another user's files, binding
+   system resources — require uid 0 (start root-vs-not; a Linux-style
+   capability set is the later refinement, not pure root).  `task_kill`
+   / `task_kill_tree` reject a target owned by a different non-root user.
+6. **Per-user isolation (the teeth — needs M25).**  Each user process in
+   its own address space, so cross-user memory reads are impossible.
+   procfs lists all pids but hides another user's cmdline/fds; a user
+   sees + signals only their own processes (root sees all).  Optional:
+   per-user resource caps.
+7. **Simultaneous sessions.**  Several users logged in at once — GUI
+   sessions and/or shell panes, each with its own creds + home +
+   process subtree (session-leader per user, owned by that uid).  A
+   `ps` USER column; `whoami` / `id` / `su` / `login` commands.
+
+**Definition of done:**
+- Two users log in (different panes or GUI sessions); each gets a shell
+  running as their uid with their home; `ps` shows the USER column.
+- User A cannot read user B's `0600` file; root can.  `chmod`/`chown`
+  enforced.
+- A non-root user cannot reboot or kill root's / another user's process.
+- **(Post-M25)** user A's process cannot read user B's address space.
+- DOCS.md gains a "Users & permissions" chapter.
+
+**Out of scope (initially):** POSIX ACLs beyond rwx, PAM-style pluggable
+auth, network identity (NIS/LDAP), SELinux/AppArmor-style mandatory
+access control, disk quotas, real password KDF (scrypt/argon2) until a
+crypto primitive exists, namespaces/containers.
+
+**Depends on:** §M25 (hard, for real isolation), §M27 (sessions), VFS;
+the GUI multi-session piece leans on the §M22.7 "GUI session" model.
+
+---
+
+## §M-registry (parked) — hierarchical config store
+
+**Status:** intentionally NOT scheduled.  A Windows-style registry
+(monolithic, opaque, corruption-prone) is exactly the "accidental
+history" the project rejects (see CLAUDE.md #6).  The Unix answer to
+the same need already exists here: `/etc` text configs + the config
+subsystem + procfs.  If a concrete need for *hierarchical,
+runtime-tunable, persisted* settings appears, the direction is a
+sysfs-style tunables tree (procfs write-handlers + save-to-`/etc`),
+not a binary registry.  Revisit only with a specific use case.
+
+---
+
 ## How to use this document
 
 - **Start of every session:** open `PLAN.md`, find the first non-✅
@@ -1763,6 +2294,49 @@ subsurfaces beyond the minimum xdg_shell needs, XWayland.
 
 ## Change log
 
+- **2026-07-05** — Added §M32 (multi-user): credentials on tasks, a
+  `/etc/passwd`-style user DB, login/sessions, file ownership +
+  rwx permissions in the VFS, privilege gating (root vs not), and
+  per-user process isolation.  Hard-depends on §M25 for *real*
+  isolation (ring-0 kthreads share one address space today, so users
+  would be advisory until per-process VMM lands); identity + user DB +
+  file ownership can precede it.  Leans on §M27 (sessions) + the
+  §M22.7 "GUI session" idea (one session per logged-in user).
+- **2026-07-04** — §M27 shipped (process model): `struct task` gained
+  ppid/exit_code/reap_owned; an always-on **init** task universally
+  reaps DEAD non-owned tasks (closes the zombie-leak gap);
+  `task_kill_tree()` takes a subtree down cooperatively (GUI window
+  close uses it); orphans re-parent to init on reap; ps / /proc/tasks
+  grew a PPID column and the Task Manager shows a process tree; pid 0 +
+  init are reap-guarded.  Also added `task_spawn_detached()` (parent =
+  init, so a spawn can be independent of its caller — the daemon
+  pattern, and the substrate for M29 services).  Verified i386 +
+  x86_64.  Design follow-ups this surfaced: the *upward* half —
+  supervision/wait on child death (§M29) and freeze detection via a
+  heartbeat watchdog (new §M31).
+- **2026-07-04** — Added the workload-management cluster (design only,
+  placeholders): §M27 process model (init/pid 1 + parent-child
+  hierarchy + always-on reaper + kill-tree — also closes the current
+  "DEAD tasks leak with no Task Manager open" gap), §M28 system log
+  (klog ring buffer + levels + dmesg), §M29 services/daemons
+  (SERVICE() registry + supervisor with restart policy), §M30 task
+  scheduling (cron as the first real service).  Dependency order is
+  M27 → M28 → M29 → M30; all independent of the M23/M24/M25 line and a
+  good pre-M25 foundation.  A Windows-style registry was explicitly
+  parked (§M-registry) as "accidental history" — the /etc + procfs
+  model already covers the need.
+- **2026-07-04** — §M22.6 shipped (tear-free present + display
+  scaling): diagnosed the "picture wiggles on mouse move" report as
+  two things — host-side `zoom-to-fit=on` bilinear rescale shimmer
+  (fixed 1:1) plus real compositor tearing (direct blit into the live
+  scanout).  Killed the tearing with a Bochs-VBE hardware page flip
+  (DISPI VIRT_HEIGHT double buffer + Y_OFFSET pan; buffer-age-2
+  `dirty_N ∪ prev_dmg` copy from backsurf; graceful fallback).
+  Verified on i386 + x86_64.  Corrected M22.4's "not fixable on
+  std-VGA" note.  Same session: 1920×1200 desktop (VGA vgamem 32,
+  BUDDY_MAX_ORDER 10→12, -m 256M) and terminal-window auto-close on
+  hosted-task death (flagged at TASK_DEAD → reused close teardown →
+  also leaves the Task Manager list).
 - **2026-07-04** — Added §M22.5 (desktop apps): text editor (multiline
   editor widget + clipboard + navigation keys as prerequisites),
   Tiny-BASIC interpreter (kthread contract; interpreter over ring-0

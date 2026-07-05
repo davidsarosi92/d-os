@@ -91,6 +91,10 @@ static struct task* master_head = NULL;   /* circular SLL of all alive tasks */
 static int          next_pid    = 0;
 static spinlock_t   master_lock = SPINLOCK_INIT;
 
+/* M27 — pid of the init/reaper task (0 until task_start_init runs).
+ * Orphans re-parent here; the reaper loop runs under this pid. */
+static int          g_init_pid  = 0;
+
 /* ------------------------------------------------------------------- */
 /* Helpers.                                                             */
 /* ------------------------------------------------------------------- */
@@ -354,15 +358,30 @@ static void task_notify_change(void) {
 /* Spawn.                                                               */
 /* ------------------------------------------------------------------- */
 
-struct task* task_spawn(const char* name, void (*entry)(void)) {
+/* M27 — shared spawn body.  `ppid_override >= 0` forces the parent pid
+ * (task_spawn_detached uses init); < 0 means "the caller is the parent".
+ * M22.7 — `arg` is stashed in t->start_arg BEFORE the task is enqueued
+ * (so it is visible even if another CPU picks the task up immediately),
+ * readable by the entry via task_start_arg(). */
+static struct task* spawn_common(const char* name, void (*entry)(void),
+                                 int ppid_override, void* arg) {
     struct task* t = (struct task*)kcalloc(1, sizeof(struct task));
     if (!t) return NULL;
 
     void* stack = kmalloc(TASK_KSTACK_SZ);
     if (!stack) { kfree(t); return NULL; }
+    t->start_arg = arg;
 
     str_copy_n(t->name, name, sizeof t->name);
     t->pid         = next_pid++;
+    /* M27 — parent: an explicit override (detached → init), else whoever
+     * called (or pid 0 very early in boot, before there is a `current`). */
+    if (ppid_override >= 0) {
+        t->ppid    = ppid_override;
+    } else {
+        struct task* cur = task_current();
+        t->ppid    = cur ? cur->pid : 0;
+    }
     t->state       = TASK_RUNNABLE;
     t->esp         = hal_task_init_stack((char*)stack + TASK_KSTACK_SZ, entry);
     t->kstack_base = stack;
@@ -379,6 +398,38 @@ struct task* task_spawn(const char* name, void (*entry)(void)) {
     task_enqueue(t);
     task_notify_change();                    /* M22.4 — new task appeared */
     return t;
+}
+
+struct task* task_spawn(const char* name, void (*entry)(void)) {
+    return spawn_common(name, entry, -1, NULL);  /* parent = caller */
+}
+
+/* M22.7 — spawn with a start argument (read via task_start_arg in the
+ * entry).  Parent = caller.  Used by the GUI to hand each app-host task
+ * the app it should run. */
+struct task* task_spawn_arg(const char* name, void (*entry)(void), void* arg) {
+    return spawn_common(name, entry, -1, arg);
+}
+
+void* task_start_arg(void) {
+    struct task* self = task_current();
+    return self ? self->start_arg : NULL;
+}
+
+/* M27 — spawn an INDEPENDENT task: its parent is init, not the caller, so
+ * it is not part of the caller's subtree, survives the caller's death, and
+ * is never taken down by a kill_tree on the caller (the daemon pattern).
+ * Before init exists (g_init_pid == 0) it falls back to pid 0 (kernel),
+ * which is also a permanent root — still detached from the caller. */
+struct task* task_spawn_detached(const char* name, void (*entry)(void)) {
+    return spawn_common(name, entry, g_init_pid, NULL);
+}
+
+/* M22.7 — spawn with an EXPLICIT parent pid (>= 0), or the caller when
+ * ppid < 0.  Lets the GUI parent a launched terminal's shell to the desktop
+ * (session) rather than to the transient launcher task that created it. */
+struct task* task_spawn_under(const char* name, void (*entry)(void), int ppid) {
+    return spawn_common(name, entry, ppid, NULL);
 }
 
 /* ------------------------------------------------------------------- */
@@ -642,6 +693,18 @@ int task_reap(int pid) {
 
     /* Unlink from the master ring (circular SLL — walk for the prev). */
     uint32_t fl = spin_lock_irqsave(&master_lock);
+
+    /* M27 — re-parent any surviving children to init before this pid
+     * disappears, so their ppid never dangles on a freed/re-used pid.
+     * (Walk the whole ring; task counts are small.) */
+    if (master_head) {
+        struct task* c = master_head;
+        do {
+            if (c->ppid == t->pid && c != t) c->ppid = g_init_pid;
+            c = c->next;
+        } while (c != master_head);
+    }
+
     struct task* prev = master_head;
     while (prev->next != t && prev->next != master_head) prev = prev->next;
     if (prev->next != t) {                   /* raced away — bail */
@@ -659,6 +722,110 @@ int task_reap(int pid) {
     kfree(t);
     task_notify_change();                    /* M22.4 — task disappeared */
     return 0;
+}
+
+/* ------------------------------------------------------------------- */
+/* M27 — process model: init/reaper, kill-tree, parentage helpers.     */
+/* ------------------------------------------------------------------- */
+
+int task_reaper_pid(void) { return g_init_pid; }
+
+void task_set_reap_owned(struct task* t, int owned) {
+    if (t) t->reap_owned = owned ? 1 : 0;
+}
+
+/* Cooperatively kill `pid` and every descendant.  Two phases so we never
+ * call task_kill (which takes master_lock) while holding it: collect the
+ * subtree's pids under the lock, then flag them after releasing it.  The
+ * subtree is grown to a fixpoint — each pass adopts tasks whose parent is
+ * already marked — which handles arbitrary depth in a few cheap passes. */
+#define KILLTREE_MAX 64
+int task_kill_tree(int pid) {
+    if (pid <= 0) return -1;
+    int ids[KILLTREE_MAX];
+    int n = 0;
+    ids[n++] = pid;
+
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    int changed = 1;
+    while (changed && n < KILLTREE_MAX) {
+        changed = 0;
+        if (!master_head) break;
+        struct task* t = master_head;
+        do {
+            /* Already collected?  Skip. */
+            int seen = 0;
+            for (int i = 0; i < n; i++) if (ids[i] == t->pid) { seen = 1; break; }
+            if (!seen) {
+                for (int i = 0; i < n; i++) {
+                    if (t->ppid == ids[i]) {
+                        if (n < KILLTREE_MAX) { ids[n++] = t->pid; changed = 1; }
+                        break;
+                    }
+                }
+            }
+            t = t->next;
+        } while (t != master_head);
+    }
+    spin_unlock_irqrestore(&master_lock, fl);
+
+    int killed = 0;
+    for (int i = 0; i < n; i++)
+        if (task_kill(ids[i]) == 0) killed++;
+    return killed;
+}
+
+/* ---- init / reaper task --------------------------------------------- */
+
+/* Scan for DEAD tasks that are NOT reap_owned (a subsystem that owns its
+ * own reap — e.g. the GUI window teardown) and NOT still current on some
+ * CPU, then reap them.  Two phases for the same lock reason as kill-tree:
+ * task_for_each holds master_lock, task_reap takes it. */
+struct reap_scan { int pids[KILLTREE_MAX]; int n; };
+
+static void reap_collect(const struct task* t, int is_current, void* ctx) {
+    struct reap_scan* s = (struct reap_scan*)ctx;
+    if (is_current || t->state != TASK_DEAD || t->reap_owned) return;
+    /* Never reap pid 0 (the boot/"swapper" thread — task_exit'd after boot
+     * but kept as the conventional permanent root) or init itself. */
+    if (t->pid == 0 || t->pid == g_init_pid) return;
+    if (s->n < KILLTREE_MAX) s->pids[s->n++] = t->pid;
+}
+
+static void reaper_pass(void) {
+    struct reap_scan s = { .n = 0 };
+    task_for_each(reap_collect, &s);
+    for (int i = 0; i < s.n; i++) {
+        struct task* t = task_find(s.pids[i]);
+        if (!t) continue;
+        char nm[TASK_NAME_MAX + 1];
+        str_copy_n(nm, t->name, sizeof nm);
+        int ppid = t->ppid, code = t->exit_code;
+        if (task_reap(s.pids[i]) == 0)
+            kprintf("init: reaped '%s' (pid %d, ppid %d, code %d)\n",
+                    nm, s.pids[i], ppid, code);
+    }
+}
+
+static void init_entry(void) {
+    kprintf("init: up as pid %d — universal reaper + orphan adopter\n",
+            task_current() ? task_current()->pid : -1);
+    for (;;) {
+        reaper_pass();
+        /* Poll at the timer's pace: hlt until the next IRQ, then yield.
+         * DEAD tasks are rare events, so a ~100 Hz sweep is effectively
+         * event-driven while costing nothing when the system is quiet
+         * (mirrors the compositor's idle loop). */
+        hal_cpu_idle();
+        task_yield();
+    }
+}
+
+void task_start_init(void) {
+    if (g_init_pid) return;                  /* singleton */
+    struct task* t = task_spawn("init", init_entry);
+    if (!t) { kprintf("task: FATAL — init spawn failed\n"); return; }
+    g_init_pid = t->pid;
 }
 
 /* ------------------------------------------------------------------- */
@@ -683,12 +850,15 @@ void task_finish_first_switch(void) {
     spin_unlock(&this_cpu()->rq_lock);
 }
 
-void task_exit(void) {
+void task_exit(void) { task_exit_code(0); }
+
+void task_exit_code(int code) {
     struct percpu* me = this_cpu();
     struct task* self = me->current;
 
     /* Mark DEAD under master_lock so iterators see a consistent state. */
     uint32_t mfl = spin_lock_irqsave(&master_lock);
+    self->exit_code = code;                  /* M27 — recorded for reap/ps */
     self->state = TASK_DEAD;
     spin_unlock_irqrestore(&master_lock, mfl);
 
@@ -738,7 +908,7 @@ void schedule_check(void) {
 
 void task_list(void) {
     if (!master_head) { kprintf("ps: no tasks\n"); return; }
-    kprintf("PID  STATE  CPU  CPUMS  NAME\n");
+    kprintf("PID  PPID  STATE  CPU  CPUMS  NAME\n");
     uint32_t fl = spin_lock_irqsave(&master_lock);
     struct task* t = master_head;
     do {
@@ -747,8 +917,8 @@ void task_list(void) {
         for (int i = 0; i < n; i++) {
             if (percpu_at(i) && percpu_at(i)->current == t) { running = 1; break; }
         }
-        kprintf("%d   %s    %d   %u   %s%s\n",
-                t->pid, state_name(t->state), t->cpu_home,
+        kprintf("%d   %d   %s    %d   %u   %s%s\n",
+                t->pid, t->ppid, state_name(t->state), t->cpu_home,
                 (unsigned)t->cpu_ms,        /* truncates past ~49 days — fine */
                 t->name, running ? " (running)" : "");
         t = t->next;

@@ -37,9 +37,23 @@ int  gui_start(void);
 /* Non-zero once gui_start succeeded. */
 int  gui_is_active(void);
 
+/* Queue an app launch onto the compositor.  The compositor spawns a
+ * dedicated "app-host" task that runs the app (M22.7), so launching must
+ * NOT call the app's open fn directly — that would run it on the caller's
+ * task with no event loop.  Used by the taskbar and the `launch` command. */
+struct gui_app_def;
+void gui_queue_launch(const struct gui_app_def* app);
+
 /* Create a terminal window (spawns a shell task on it).  Outer
- * geometry in pixels, including decorations. */
+ * geometry in pixels, including decorations.  M22.7 — the shell is a child
+ * of the desktop SESSION (a kill_tree of the desktop takes it with it). */
 struct gui_window* gui_window_create(const char* title, int x, int y, int w, int h);
+
+/* M22.7 — like gui_window_create but the shell is DETACHED (parented to
+ * init), so it outlives the desktop session; its window stays composited as
+ * long as the compositor runs.  The "detached terminal" mode. */
+struct gui_window* gui_window_create_detached(const char* title,
+                                              int x, int y, int w, int h);
 
 /* M22.5 — terminal window hosting a CUSTOM task instead of a shell
  * (the BASIC interpreter uses this).  The task's kprintf output lands
@@ -97,6 +111,12 @@ void* gui_window_ctx(struct gui_window* win);
  * dispatch redraws automatically). */
 void gui_window_request_redraw(struct gui_window* win);
 
+/* M22.7 — repaint + damage only a CONTENT sub-rect (widget-local coords),
+ * for a frequently-updating region (e.g. a listview) so the whole window
+ * chrome isn't re-blitted every refresh. */
+void gui_window_request_redraw_rect(struct gui_window* win,
+                                    int cx, int cy, int cw, int ch);
+
 /* M22.3 — ~1 Hz callback on the compositor task (task-manager style
  * auto-refresh).  NULL to disable. */
 void gui_window_set_tick(struct gui_window* win,
@@ -111,6 +131,6 @@ void gui_damage_all(void);
 
 /* Frame counters since gui_start: full-screen vs. partial (dirty-rect)
  * recomposes.  Backs the `gui stats` shell command. */
-void gui_get_stats(unsigned* full, unsigned* partial);
+void gui_get_stats(unsigned* full, unsigned* partial, unsigned* avg_kb);
 
 #endif

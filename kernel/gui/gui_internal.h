@@ -54,6 +54,16 @@ void gui_queue_power(int reboot);               /* 1 = reboot, 0 = shutdown */
 /* Ask for a recompose (shells call it after mutating visual state). */
 void gui_request_frame(void);
 
+/* M22.7-B — publish the shell's launcher-popup extent to the compositor.
+ * `on`=1 with the popup's screen rect while the menu is open; `on`=0 to
+ * hide it.  The compositor composites this rect (on top of the windows)
+ * only while open, and routes clicks inside it to the desktop task. */
+void gui_panel_set_popup(int on, int x, int y, int w, int h);
+
+/* M22.7 — request a chrome-only repaint (taskbar + open popup) without a
+ * full-screen recompose.  Shells use it for cheap visual changes (hover). */
+void gui_panel_dirty(void);
+
 /* Screen geometry (constant after gui_start). */
 int  gui_screen_w(void);
 int  gui_screen_h(void);
