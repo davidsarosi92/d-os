@@ -394,6 +394,12 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      *   2. preempt_disable + spawn + bind + enable — so the new task's
      *                    very first kprintf already routes into its VC.
      * ----------------------------------------------------------------- */
+    /* M27 — spawn the init/reaper task before the shell so every task
+     * that follows (the shell and anything it launches, GUI windows, …)
+     * has a universal reaper: exited kernel threads no longer leak as
+     * zombies, and orphans re-parent to init instead of dangling. */
+    task_start_init();
+
     {
         /* S.1: the boot shell is whatever provider shell.provider
          * selects (config may already be loaded from /etc at this

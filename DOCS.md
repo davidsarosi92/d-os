@@ -1671,9 +1671,65 @@ from any shell with the `gui` command.
   glide+drag).  Press/release and the resize rubber band keep the
   full recompose (rare, z-order/focus changes).  (3) *Tearing:*
   QEMU std-VGA has no vblank/present boundary, so a large blit can
-  shear mid-scanout — not fixable on this device, but (1)+(2) shrink
-  typical blits below perception.  A real fix is a flush-capable
-  display (virtio-gpu, candidate post-M24).
+  shear mid-scanout — (1)+(2) shrink typical blits below perception.
+  **Superseded by M22.6** (page-flip double buffer) — the residual
+  shear is gone; see below.
+- **Tear-free presentation + display scaling (M22.6):** two separate
+  things were conflated under "the picture wiggles".  (a) *Host-side
+  scaling shimmer* — `run_qemu.sh` used `-display cocoa,zoom-to-fit=on`,
+  which bilinearly rescales the 1280×800 guest onto a non-integer
+  Retina window; every small screen update re-presents the whole
+  scaled frame and the interpolation nudges static edges ±1 px, a
+  continuous shimmer that tracks mouse motion (NOT compositor tearing:
+  a pointer glide only re-blits the ~14×20 cursor rect, the rest of
+  VRAM is untouched and cannot move).  Fixed by `zoom-to-fit=off`
+  (crisp 1:1).  (b) *Real compositor tearing* — the final present was a
+  direct blit into the LIVE scanout buffer.  Now, when the display is
+  the Bochs-VBE device (QEMU `-vga std`; DISPI ID 0xB0Cx), the driver
+  reserves a second frame's worth of VRAM (DISPI VIRT_HEIGHT = 2×H,
+  ~4 MiB extra, fits the 16 MiB default) and the compositor composes
+  into the hidden buffer, then pans the scanout origin to it in one
+  register write (DISPI Y_OFFSET) — a hardware page flip, no vblank
+  IRQ needed, QEMU only ever scans out a complete buffer.  The
+  page-flip has *buffer age 2* (ping-pong), so each present copies
+  `dirty_N ∪ prev_dmg` from `backsurf` (always a complete frame) into
+  the hidden buffer to keep it consistent.  Graceful fallback: on a
+  non-Bochs display (real hardware / plain VESA) `fb_flip_init` fails
+  and the compositor keeps the single-buffer direct blit.  API:
+  `fb_flip_init` / `fb_flip_to` (fb_terminal.c); enable log line
+  `gui: page-flip present enabled`.
+- **1920×1200 desktop (M22.6).**  The multiboot header (both
+  `kernel/hal/x86*/boot.s`) now requests 1920×1200×32.  Two knock-on
+  requirements: (a) *VRAM* — two 1920×1200 frames are ~18.4 MiB, over
+  the std-VGA 16 MiB default, so `run_qemu.sh` creates the display with
+  `-vga none -device VGA,vgamem_mb=32` (note: `-global VGA.vgamem_mb=`
+  is silently ignored — it does not match the auto-created device).
+  Without the bump `fb_flip_init` clamps and falls back to the tearing
+  single-buffer path.  (b) *Heap* — a full-screen surface is 9.2 MiB,
+  and `gfx_surface_init` needs it contiguous.  `BUDDY_MAX_ORDER` was 10
+  (4 MiB max single alloc), so it is raised to 12 (16 MiB).  Power-of-2
+  rounding then wastes up to ~7 MiB per full-screen surface — fine for
+  the handful of them (backbuffer + wallpaper + maybe one maximized
+  window); a vmalloc-style scatter map would remove the waste (noted in
+  pmm.h).  `run_qemu.sh` also sets `-m 256M` (past QEMU's 128 MiB i386
+  default once these surfaces are allocated).
+- **Terminal window auto-close on hosted-task death (M22.6).**  A
+  WIN_TERM window hosts a task via `win->vc->task` (shell, or a
+  `gui_window_create_task` app like BASIC).  Previously only the X
+  button tore the window down; a shell killed *externally* (Task
+  Manager "End task", CLI `kill`, or the task returning from its entry)
+  died but left its inert, un-typeable window on screen.  Now the
+  compositor's `apply_pending` flags such a window for close as soon as
+  its hosted task reaches **TASK_DEAD** — reusing the existing
+  want_close teardown (kill+reap+vc_destroy+destroy_window).  The
+  trigger is *actual death*, not the kill request: a task merely FLAGGED
+  to stop (kill_pending set, still RUNNABLE until its next yield) keeps
+  its window until it truly terminates — the "instruction to stop" vs
+  "has stopped" distinction.  Because the teardown reaps the task, the
+  row also drops off the Task Manager within a frame (the taskman's own
+  reap pass still skips vc_task_bound tasks so it never races the
+  window teardown for the same pid).  Log line: `gui: window '…'
+  auto-closing (hosted pid N died)`.
 - **Task lifecycle → Task Manager (M22.4):** `task_set_change_hook`
   (task.h) fires on spawn/kill/exit/reap; the GUI installs a hook
   that makes the compositor run every window's on_tick immediately,
@@ -1824,6 +1880,143 @@ M22 change-log entries for the exact scripts used.
 
 ---
 
+### 4.15 Process model — init, hierarchy, reaper, kill-tree (M27)
+
+Before M27 tasks were a flat set with no parentage, and a DEAD task was
+only reclaimed if the Task Manager happened to be open (its refresh
+reaped) or a GUI window tore down its own shell — an exited background
+kernel thread otherwise leaked as a permanent DEAD entry.  M27 gives
+tasks a real parent/child model and a universal reaper.
+
+**`struct task` additions.**
+- `ppid` — parent pid (a stable int, never a dangling pointer).  Set at
+  spawn to the caller's pid (or 0 very early in boot).
+- `exit_code` — recorded by `task_exit_code(int)`; `task_exit()` is the
+  code-0 wrapper.  Shown by `ps` / logged by init on reap.
+- `reap_owned` — "a subsystem owns this task's reap; init keep out."
+  The GUI sets it on window shells (it reaps them in its own teardown);
+  init's universal reaper skips them so the two never race for the same
+  struct.  Replaced the taskman's old `vc_task_bound()` reap gate.
+
+**init — the universal reaper (`task_start_init`, called from
+kernel_main before the shell).**  A tiny always-on task (the first thing
+kernel_main spawns) that sweeps DEAD, non-`reap_owned` tasks at ~100 Hz
+(hlt-then-yield, the same idle-loop shape as the compositor — cheap when
+quiet, effectively event-driven since DEAD tasks are rare).  On each
+reap the victim's surviving children re-parent to init (in `task_reap`,
+under master_lock, before the struct is freed) so no ppid dangles.
+**pid 0 (the boot "swapper" — kernel_main task_exit()s after boot) and
+init itself are explicitly skipped**, matching the Unix convention that
+those roots are permanent (and avoiding an alarming "reaped kernel" log).
+
+**`task_kill_tree(pid)`** — cooperative termination of a pid *and all
+descendants*.  The subtree is grown to a fixpoint under master_lock
+(each pass adopts tasks whose parent is already marked), then the pids
+are flagged after the lock is released (task_kill takes master_lock, so
+flagging under it would self-deadlock).  Still the kthread contract:
+each victim dies at its next yield.  The GUI window close uses kill-tree,
+so closing a shell window takes anything that shell `spawn`ed down with
+it instead of orphaning it.
+
+**`task_spawn_detached()`** — like `task_spawn` but parents the new task
+to **init**, not the caller.  An independent/daemon task: not in the
+caller's subtree, survives the caller's death, immune to a kill_tree on
+the caller.  (The substrate for M29 services; unused until then.)
+
+**Visibility.**  `ps` and `/proc/tasks` grew a **PPID** column; the Task
+Manager renders a real process **tree** (children indented under their
+parent — a heap-side snapshot walked into tree order, so it never nests
+`task_for_each` under the master lock, and the 96-row buffer lives in
+the taskman struct, not on the compositor's 4 KiB stack).
+
+**Scope note — death goes down, notification goes up.**  kill-tree
+propagates termination downward; a child dying does NOT kill its parent.
+The *upward* half (a parent being notified + applying policy on child
+death — the supervision-tree / `wait()` pattern) and *freeze detection*
+(a heartbeat watchdog for a task that is alive but wedged) are separate
+problems, deferred to §M29 (services supervisor) and §M31 (watchdog).
+
+---
+
+### 4.16 Per-task GUI apps (M22.7 Stage A)
+
+Before M22.7 the compositor ran every APP window's callbacks — widget
+hit-test, key/mouse handlers, the ~1 Hz tick, and the redraw — on its
+OWN task.  So apps were not processes (invisible in the Task Manager,
+not independently killable) and a slow app handler (a big directory
+read, say) froze the entire GUI.  M22.7 gives each WIN_APP window its
+own **app-host task**; the compositor becomes a surface-compositor +
+input router.
+
+**Launch → host.**  The taskbar and the `launch` command both enqueue
+via `gui_queue_launch`; the compositor's `dispatch_launches` spawns an
+`app:<name>` task (`task_spawn_arg`, passing the app's open fn through
+`start_arg`) and marks it `reap_owned`.  `app_host_main` reads the open
+fn, runs it (so the window + widgets are created ON the host task), then
+loops over the window(s) that task owns.  Calling the open fn on the
+caller (the old path) would run it with no event loop — hence the
+`launch` command had to switch from `app->launch()` to the queue.
+
+**Input + render off the compositor.**  `dispatch_events/keys/keycodes`
+no longer touch widgets; they push into the target window's per-window
+ring `win->aq` (SPSC: compositor produces, host consumes).  The host
+does the widget hit-test + dispatch (`app_dispatch_event`) and
+`app_redraw` (widgets → `win->surf` under `win->lock`).  The compositor
+still blits `win->surf` under the same lock — unchanged.  `on_tick` /
+`on_layout` are now `tick_pending` / `layout_pending` flags the
+compositor raises and the host consumes (so a slow tick can't stall
+compositing).
+
+**Teardown — a two-actor dance.**  On `want_close` the host runs
+on_close, frees its widgets + app_ctx (`app_widgets_free`), and sets
+`host_released`; the compositor then disposes the window struct
+(`destroy_window` skips the on_close/widget-free it already did) and
+reaps the host once its last window is gone (`reap_gui_host`).  Because
+the host is `reap_owned`, init leaves it to the compositor.  Edge cases:
+a host killed externally (host_task DEAD without releasing) → the
+compositor does the cleanup itself; a singleton whose open fn only
+raised an existing window creates nothing and exits immediately → a
+`reap_dead_gui_hosts` sweep (on task-set change) reaps it.
+
+**Concurrency.**  `window_alloc` now claims its pool slot under
+`state_lock` (multiple hosts create windows concurrently); all fields
+are set before `used = 1` (the last store — x86 TSO needs no barrier).
+Widgets are touched ONLY by the owning host, so no widget lock is needed
+— `win->lock` guards just the surface, shared with the compositor's
+blit.  A multi-window app (File Manager + its viewer) is one host
+driving several windows; it exits when they all close.
+
+**Verified (i386 + x86_64):** About / Task Manager / File Manager launch
+as `app:<name>` tasks and render off the compositor (the Task Manager
+tick populated its list — text rendered; the File Manager showed its
+directory listing); the X button tears a window down cleanly (host
+cleanup + reap, no fault); apps now show in the Task Manager as tasks.
+
+**Stage B — the desktop shell / taskbar as its own task.**  The
+`desktop_shell` (taskbar, launcher, clock) used to run on the
+compositor: it drew chrome onto the backbuffer and its
+click/motion/second_tick ran there.  It now runs on a dedicated
+**`desktop` task** that renders into a full-screen **`panelsurf`** at
+screen coordinates — so shell_vista's draw/click/motion code is
+*unchanged*.  The compositor composites only the OPAQUE parts of
+panelsurf on top of the windows: the taskbar strip (always) plus the
+launcher popup rect while open (the rest never occludes).  The shell
+publishes its popup extent through `gui_panel_set_popup`; the
+compositor uses it to composite the popup *and* to route input
+(`in_panel_region`).  Clicks/motion over the chrome go to a `pevq` the
+desktop task drains, running shell->click/motion under `state_lock`
+(their old IRQ-held contract, now honoured by the panel task).  The
+clock (RTC `second_tick`) and every chrome redraw happen on the desktop
+task; the compositor no longer calls the shell.  Result: **the
+compositor is a pure surface-compositor + input router; windows, apps,
+and the panel are each drawn by their own task** — the M26 Wayland
+shape with the internal API.  (Caveat: the `bare` shell reserves no
+strip, so its hint line is no longer composited — fine for a rescue
+shell.)  Verified i386 + x86_64: taskbar + Start menu render, a menu
+item launches an app as its own host, no fault.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -1894,6 +2087,147 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-05 — M22.7: damage as a rect LIST (cursor-hitch fix).**  The
+  compositor tracked damage as a single bounding box, so a Task Manager
+  refresh in one corner and the cursor in another merged into their
+  bounding box — the compositor re-blitted a huge diagonal region every
+  refresh and the cursor visibly stuttered (~1 Hz).  Damage is now a LIST
+  of up to 16 disjoint rects (`struct rect dmg_list[]`; new rects merge
+  only into an overlapping one).  `compose()` snapshots the WM state once
+  (`struct scene_snapshot`) and paints + presents EACH rect separately
+  (`draw_scene_rect`), so two far-apart updates stay two small blits.
+  The page flip's buffer-age-2 replay became a per-rect `prev_dmg` list.
+  `gui stats` gained "avg KB blitted/frame".  Measured: with Task Manager
+  refreshing + cursor moving, ~630 KB/frame vs the old union's
+  ~2.4–5.3 MB/frame — the hitch is gone.  Verified i386 + x86_64 (scenes
+  render correctly; window drag leaves no trail → flip replay correct;
+  no fault).
+- **2026-07-05 — M22.7: precise structural damage + listview-only refresh.**
+  Two follow-ups to the damage list.  (1) A window click no longer
+  `gui_damage_all()`s the screen for the focus/z change — `gui_mouse`
+  damages only the two affected windows (old focus + raised/clicked one);
+  resize-apply and maximize still take the full path (geometry grows the
+  window).  (2) The Task Manager repaints only its listview via the new
+  `gui_window_request_redraw_rect(win, cx, cy, cw, ch)` (widget-local
+  rect → clipped redraw + damage of just that screen area), not the whole
+  window each second.  Verified i386 + x86_64 (raising a covered window
+  paints its focused title over the overlap correctly; TM list updates,
+  chrome intact; no fault).
+- **2026-07-05 — M22.7: GUI session root + clean-desktop start.**  The
+  GUI is now its own SESSION: `gui_start` spawns the `desktop` task
+  first and parents the compositor + windows UNDER it
+  (`task_spawn_under`), so the whole GUI hangs off one session root
+  instead of scattered under the shell that ran `gui` — a
+  `kill_tree(desktop)` closes the session cleanly.  And no shells are
+  auto-started: the GUI comes up as a bare desktop (wallpaper + taskbar,
+  0 windows — a supported state, focus NULL until a window opens); the
+  user opens terminals/apps from Start.  `ps` tree: `boot-shell →
+  desktop → {compositor, launched windows/apps}`.  Verified i386 +
+  x86_64 (empty desktop boots; Start-menu launch works).
+- **2026-07-05 — M22.7: session vs detached GUI shells.**  A terminal
+  launched from the taskbar used to orphan to init (its transient
+  launcher app-host created the WIN_TERM then exited, since the host only
+  manages WIN_APP windows).  Now the shell task is parented explicitly
+  via the new `task_spawn_under(name, entry, ppid)`: **"New Shell"** =
+  SESSION mode, child of the `desktop` task (a `kill_tree(desktop)` takes
+  it with the session); **"Detached Shell"** = child of init, so it
+  outlives the desktop session and its window stays while the compositor
+  runs (the nohup/tmux-detach idea, in a GUI).  gui.c tracks `desktop_pid`
+  and `gui_window_create`/`gui_window_create_detached` pick the parent;
+  the initial two shells (created before the desktop exists) stay under
+  the shell that ran `gui`.  Verified i386 + x86_64 (`ps`: session shell
+  under `desktop`, detached shell under `init`).  See §4.15/§4.16.
+- **2026-07-05 — M22.7 refinements: latency, parentage, panel memory.**
+  Four follow-ups after the per-task cut.  (1) *Latency:* the compositor /
+  desktop / app-host loops used to `hal_cpu_idle()` (halt a whole timer
+  tick) every iteration, so with several always-runnable tasks the
+  compositor's turn came around only every N ticks — visible cursor lag
+  with the menu or Task Manager open.  Now each loop halts ONLY when it
+  has nothing to do (`if (need_frame) compose(); else hal_cpu_idle();`),
+  so it spins through the scheduler under load and still idles at rest.
+  (2) *Menu lag:* vista_motion did a full-screen recompose per hover
+  change (`gui_request_frame`); it now asks for a chrome-only repaint
+  (`gui_panel_dirty`) — measured 2 full frames over 50 menu-hover motions
+  vs one full recompose each before.  (3) *Parentage:* app launches moved
+  from the compositor to the desktop task, so a launched app is a child
+  of the desktop/session, not the display server (`ps` shows
+  `app:File Manager` under `desktop`, not `compositor`).  (4) *Memory:*
+  `panelsurf` is no longer a full-screen 9.2 MiB surface — only the bottom
+  strip (taskbar reserve + `PANEL_POPUP_MAX`) is backed, addressed in
+  screen coords via an offset `px` + clip (~5 MiB saved).  Also the
+  `bare` shell reserves a thin strip so its hint line composites again.
+  Verified i386 + x86_64.
+- **2026-07-05 — M22.7 Stage B: desktop shell / taskbar as its own task.**
+  The `desktop_shell` (taskbar, launcher, clock) now runs on a dedicated
+  `desktop` task rendering into a full-screen `panelsurf`; the compositor
+  composites only its opaque parts (taskbar strip always + launcher popup
+  while open) on top of the windows, routes chrome input to the panel's
+  `pevq`, and no longer calls the shell.  Completes the M22.7 goal: the
+  compositor is now a pure surface-compositor + input router, and every
+  UI surface (windows, apps, panel) is drawn by its own task — the M26
+  Wayland shape with the internal API.  shell_vista is unchanged bar
+  publishing its popup rect (`gui_panel_set_popup`).  Verified i386 +
+  x86_64 (taskbar + Start menu render; a menu item launches an app as
+  its own host; no fault).  See §4.16.
+- **2026-07-05 — M22.7 Stage A: per-task GUI apps.**  Each WIN_APP window
+  now runs on its own `app:<name>` task (`app_host_main` + the new
+  `task_spawn_arg`) instead of on the compositor.  The compositor is now
+  a surface-compositor + input router: it pushes input into a per-window
+  ring (`win->aq`); the host does widget hit-test + dispatch + redraw and
+  runs on_tick/on_layout off the compositor.  Two wins: apps are real
+  processes (visible/killable in the Task Manager) and a slow app handler
+  no longer freezes the whole GUI.  Teardown is a host↔compositor dance
+  (host frees widgets + on_close + `host_released`; compositor disposes
+  the struct + reaps the `reap_owned` host; sweeps catch no-window
+  singletons + externally-killed hosts).  `window_alloc` now locks its
+  slot claim (concurrent host creation); `launch` routes through
+  `gui_queue_launch`.  Verified i386 + x86_64 (apps render off the
+  compositor, close cleanly, no fault).  See §4.16.  Stage B (taskbar as
+  its own panel task) pending — see PLAN §M22.7.
+- **2026-07-04 — M27: process model — init, hierarchy, reaper, kill-tree.**
+  Tasks gained `ppid` + `exit_code` + `reap_owned`.  An always-on
+  **init** task (spawned by kernel_main before the shell) is the
+  universal reaper: it sweeps DEAD, non-owned tasks at ~100 Hz, closing
+  the old "exited kernel thread leaks as DEAD unless the Task Manager is
+  open" gap; on reap it re-parents the victim's children to init.
+  `task_kill_tree()` cooperatively takes a pid + its whole subtree down
+  (the GUI window close uses it, so closing a shell window kills what it
+  spawned); `task_spawn_detached()` parents to init for daemons.
+  pid 0 (boot swapper) + init are reap-guarded.  `ps` / `/proc/tasks`
+  grew a PPID column; the Task Manager shows a process tree.  The GUI's
+  window-shell reaping now coordinates with init via the `reap_owned`
+  flag (replacing the taskman's `vc_task_bound` reap gate).  Verified on
+  i386 + x86_64 (init reaps a leaked self-test task; a `spawn`ed child
+  under a GUI shell is killed + re-parented + reaped when its window
+  closes; ps shows correct ppid; pid 0 survives; no fault).  See §4.15.
+  The *upward* half (supervision on child death, freeze watchdog) is
+  deferred to §M29 / §M31.
+- **2026-07-04 — M22.6: tear-free presentation (page flip) + display scaling.**
+  Chased down "the picture still wiggles on mouse move".  Root cause
+  was two things wearing one coat.  (1) The visible whole-screen edge
+  shimmer was host-side: `run_qemu.sh` scaled the guest with
+  `-display cocoa,zoom-to-fit=on` (bilinear, non-integer on Retina), so
+  every screen update re-sampled the frame and jittered static edges —
+  switched to `zoom-to-fit=off` (crisp 1:1).  (2) The compositor's real
+  tearing (direct blit into the live scanout) is now eliminated on the
+  Bochs-VBE device via a hardware page flip: reserve a second VRAM
+  frame (DISPI VIRT_HEIGHT = 2×H), compose into the hidden buffer, pan
+  the scanout origin (DISPI Y_OFFSET) in one write.  Buffer-age-2
+  ping-pong: each present copies `dirty_N ∪ prev_dmg` from the always-
+  complete `backsurf`.  Graceful fallback to the single-buffer blit on
+  non-Bochs displays.  New API `fb_flip_init`/`fb_flip_to`
+  (fb_terminal.c); verified on i386 + x86_64 (log line "gui: page-flip
+  present enabled", mouse-move stress, no fault).  Corrects the M22.4
+  "not fixable on this device" note (DISPI panning IS a present
+  boundary — virtio-gpu is no longer required for this).  Same session
+  also: **1920×1200 desktop** (multiboot header both arches; needs
+  `-device VGA,vgamem_mb=32` for the double buffer's ~18.4 MiB VRAM,
+  `BUDDY_MAX_ORDER` 10→12 for the 9.2 MiB contiguous surfaces, and
+  `-m 256M`), and **terminal windows auto-close when their hosted task
+  dies** (End task / `kill` / natural exit) — flagged at TASK_DEAD so a
+  merely-flagged-to-stop task keeps its window until it actually stops;
+  the teardown reaps the task so it also leaves the Task Manager list.
+  Verified on i386 + x86_64.  See §4.13.
 - **2026-07-04 — M22.5: desktop apps — editor, Tiny-BASIC, file manager 2.0, maximize.**
   The desktop becomes a place to DO something: write BASIC on d-os,
   run it on d-os.  Input: PS/2 E0 cursor cluster decoded to HID

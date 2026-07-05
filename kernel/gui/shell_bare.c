@@ -20,10 +20,16 @@ static void bare_init(int w, int h) {
     scr_h = h;
 }
 
-static int bare_bottom_reserve(void) { return 0; }   /* whole screen is ours */
+/* M22.7-B — reserve a thin bottom strip for the hint line.  With the shell
+ * now rendering into panelsurf (only the reserved strip is composited), a
+ * 0-reserve shell would draw a hint no one ever sees; give it just enough
+ * height for one text row. */
+#define BARE_STRIP_H (GFX_GLYPH_H + 12)
+static int bare_bottom_reserve(void) { return BARE_STRIP_H; }
 
 static void bare_draw(struct gfx_surface* back) {
     /* One hint line so a user isn't stranded without a launcher. */
+    gfx_fill(back, 0, scr_h - BARE_STRIP_H, back->w, BARE_STRIP_H, 0xFF141B26u);
     gfx_text(back, 8, scr_h - GFX_GLYPH_H - 6,
              "bare shell - use 'launch <app>' in a terminal",
              0xFF7E93A8u);

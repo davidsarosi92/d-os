@@ -408,7 +408,10 @@ static void cmd_launch(const char* args) {
     }
     const struct gui_app_def* app = gui_app_find(args);
     if (!app) { kprintf("launch: no app matching '%s'\n", args); return; }
-    app->launch();
+    /* M22.7 — hand it to the compositor, which spawns the app-host task.
+     * Calling app->launch() here would run the app on this shell's task
+     * with no event loop. */
+    gui_queue_launch(app);
 }
 
 /* `run <path>` — batch-run a Tiny-BASIC program on this shell's VC
@@ -432,9 +435,10 @@ static void cmd_run(struct vc* my_vc, const char* path) {
 /* `gui stats` — damage-rect effectiveness counters (M22.3). */
 static void cmd_gui_stats(void) {
     if (!gui_is_active()) { console_write("gui stats: GUI not running\n"); return; }
-    unsigned full = 0, partial = 0;
-    gui_get_stats(&full, &partial);
-    kprintf("frames: %u full, %u partial (dirty-rect)\n", full, partial);
+    unsigned full = 0, partial = 0, avg_kb = 0;
+    gui_get_stats(&full, &partial, &avg_kb);
+    kprintf("frames: %u full, %u partial (dirty-rect), avg %u KB blitted/frame\n",
+            full, partial, avg_kb);
 }
 
 /* `gui` — start the M22 compositor.  The calling shell keeps running in

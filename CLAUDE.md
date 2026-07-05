@@ -18,7 +18,7 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
-✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M22 – M22.5** shipped
+✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M22 – M22.7 + M27** shipped
 (10/11 polish sub-items; the lone outstanding one is §M20.6.1
 SYSCALL/SYSRET).  M22 + M22.1 + M22.2 (2026-07-04): GUI — gfx
 surfaces + compositor + WM core + widget toolkit + file manager,
@@ -40,7 +40,52 @@ Editor app, Tiny-BASIC (`core/basic.c`, BASIC window via
 gui_window_create_task, `run <path>` cmd), file manager 2.0 (path
 bar, sorting, Ren/Copy/recursive-Del, GUI_APP_ASSOC extension
 associations, vfs_rename/vfs_copy/vfs_unlink_recursive),
-maximize/restore.  All on both archs.
+maximize/restore.  M22.6 (2026-07-04): tear-free presentation —
+Bochs-VBE hardware page flip (DISPI VIRT_HEIGHT double buffer +
+Y_OFFSET pan; buffer-age-2 dirty∪prev copy; graceful fallback to
+single-buffer blit), plus the QEMU display-scaling fix
+(zoom-to-fit=off); corrects M22.4's "not fixable" tearing note.
+Same session: 1920×1200 desktop (needs `-device VGA,vgamem_mb=32`
+for the double buffer + `BUDDY_MAX_ORDER` 10→12 for 9.2 MiB
+contiguous surfaces + `-m 256M`), and terminal-window auto-close
+when its hosted task dies (flagged at TASK_DEAD → reused close
+teardown → also leaves the Task Manager list).  M27 (2026-07-04):
+process model — `struct task` gains ppid/exit_code/reap_owned; an
+always-on **init** task universally reaps DEAD non-owned tasks
+(closes the zombie-leak gap) + re-parents orphans; `task_kill_tree`
+takes a subtree down (GUI window close uses it); `task_spawn_detached`
+(parent=init) for daemons; ps + /proc/tasks grow PPID, Task Manager
+shows a process tree; pid 0 + init reap-guarded.  M22.7-A (2026-07-05):
+per-task GUI apps — every WIN_APP window runs on its own `app:<name>`
+task (`app_host_main` + `task_spawn_arg`); compositor = surface-
+compositor + input router (per-window `aq` queue, host does widget
+dispatch + render + tick); host↔compositor teardown dance; apps now
+visible/killable in the Task Manager, a slow app no longer freezes the
+GUI.  M22.7-B: the desktop shell/taskbar runs on its own `desktop` task
+too (full-screen `panelsurf`; compositor composites taskbar strip +
+launcher popup on top; input via `pevq`).  **Net: the compositor is now
+a pure surface-compositor + input router; windows, apps AND the panel
+are each their own task (the M26 Wayland shape, internal API).**
+M22.7 refinements (2026-07-05): idle loops halt only when idle (was:
+every iteration → cursor lag with menu/taskman open); vista_motion is
+chrome-only repaint not full recompose; **app launches moved to the
+desktop task → launched apps are children of `desktop`, not the
+compositor**; `panelsurf` is a bottom strip not full-screen (~5 MiB
+saved); bare shell reserves a hint strip.  Session vs detached GUI
+shells: `task_spawn_under(name,entry,ppid)` parents a launched terminal
+to the desktop ("New Shell" = session, dies with the desktop) or to
+init ("Detached Shell" = outlives the session — nohup/tmux-detach in a
+GUI).  GUI session root: `gui_start` spawns `desktop` first, parents
+compositor + windows under it (`boot-shell → desktop → {compositor,
+apps}`); no auto-started shells — the GUI boots as a bare desktop
+(wallpaper + taskbar), user launches from Start.  Damage is now a LIST
+of disjoint rects (was a single bounding box) — `compose()` paints +
+presents each rect separately, so a Task Manager refresh + a far-away
+cursor stay two small blits instead of one huge union (fixed the
+cursor stutter: ~630 KB/frame vs ~2.4–5.3 MB).  Plus: a window click
+damages only the two affected windows (was a full 9 MB frame), and the
+Task Manager repaints only its listview (`gui_window_request_redraw_rect`).
+All on both archs.
 Highlights so far: VFS + ramfs + exFAT on virtio-blk, devfs +
 procfs, preemptive scheduler, multi-pane shell, xHCI USB + HID,
 keyboard layouts, HAL cut (`hal_api.h`), **SMP on i386 + x86_64**
@@ -75,6 +120,26 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   Wayland prerequisites.
 - §M26 — Wayland server (wire protocol over M22 compositor +
   M25 substrate; depends on both).
+- **Workload-management cluster** (order M27→M30, independent of the
+  M23/M24/M25 line):
+  - §M27 — ✅ SHIPPED (DOCS §4.15): init + parent/child hierarchy +
+    universal reaper + kill-tree + task_spawn_detached + ps/procfs
+    PPID + Task Manager tree.
+  - §M28 — System log: klog ring buffer + severity levels +
+    /proc/kmsg + `dmesg`.
+  - §M29 — Services/daemons: `SERVICE()` registry + supervisor
+    (autostart + restart policy) — systemd-lite.  The "upward" answer
+    to child-death (supervision/wait).
+  - §M30 — Task scheduling: cron as the first real service.
+  - §M31 — Watchdog: heartbeat-based freeze detection (per-task /
+    per-CPU softlockup / hardware) — the other half of "is it hung?".
+- **§M32 — Multi-user** (design only): credentials (uid/gid) on tasks,
+  `/etc/passwd`-style user DB, login/sessions, VFS file ownership +
+  rwx perms, privilege gating, per-user process isolation.  Hard-depends
+  on §M25 (real isolation needs per-process address spaces; today's
+  ring-0 kthreads share one, so users would be advisory until then).
+- **§M-registry** — Windows-style registry PARKED (accidental history;
+  /etc + procfs already covers it).
 
 ## Hard conventions (do NOT deviate without asking)
 

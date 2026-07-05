@@ -48,7 +48,15 @@
  * hal_extend_identity_map can grow the identity map to that range
  * cheaply via 1 GiB PDPT pages.  Real >4 GiB systems would bump
  * further; the page_state[] cost is 1 MiB at 4 GiB, 4 MiB at 16 GiB. */
-#define BUDDY_MAX_ORDER     10
+/* Order 12 = a single contiguous alloc up to 2^12 pages = 16 MiB.  Order
+ * 10 (4 MiB) capped surfaces at 1024×1024-ish; the M22.6 move to a
+ * 1920×1200 desktop needs 9.2 MiB per full-screen surface (backbuffer +
+ * wallpaper), so the compositor's gfx_surface_init must be able to get a
+ * >4 MiB contiguous block.  Cost of the bump: two extra free-list heads
+ * per zone, and page-alloc's power-of-2 rounding wastes up to ~7 MiB on a
+ * 9.2 MiB surface — acceptable for a handful of full-screen surfaces (a
+ * vmalloc-style scatter mapping would remove the waste; noted for later). */
+#define BUDDY_MAX_ORDER     12
 #if defined(__x86_64__)
 #  define BUDDY_MAX_FRAMES  (1u << 20)      /* 4 GiB cap, 1 MiB metadata */
 #else

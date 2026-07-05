@@ -71,6 +71,13 @@ static int menu_rows(void) {
 static int menu_h(void)   { return menu_rows() * SM_ITEM_H + 12; }
 static int menu_top(void) { return scr_h - TASKBAR_H - menu_h(); }
 
+/* M22.7-B — tell the compositor the popup's on-screen rect so it composites
+ * (and hit-routes) it while open.  Called whenever menu_open changes. */
+static void publish_popup(void) {
+    if (menu_open) gui_panel_set_popup(1, 4, menu_top(), SM_W, menu_h());
+    else           gui_panel_set_popup(0, 0, 0, 0, 0);
+}
+
 static int tbtn_width(int nslots) {
     int avail = scr_w - (START_W + 12) - CLOCK_W - 8;
     if (nslots <= 0) return TBTN_W;
@@ -101,6 +108,7 @@ static void vista_init(int w, int h) {
     menu_open = 0;
     menu_hover = -1;
     clock_str[0] = 0;
+    publish_popup();
 }
 
 static int vista_bottom_reserve(void) { return TASKBAR_H; }
@@ -196,7 +204,8 @@ static void vista_motion(int x, int y) {
         nh = -1;
     if (nh != menu_hover) {
         menu_hover = nh;
-        gui_request_frame();                    /* repaint the highlight */
+        gui_panel_dirty();          /* chrome-only repaint (M22.7 — was a
+                                     * full recompose per motion: the lag) */
     }
 }
 
@@ -217,10 +226,12 @@ static int vista_click(int x, int y) {
             else if (idx == apps + 1)
                 gui_queue_power(0);
             menu_open = 0;
+            publish_popup();
             return 1;
         }
         /* Click elsewhere just closes the menu; windows still get it. */
         menu_open = 0;
+        publish_popup();
         gui_request_frame();
     }
 
@@ -230,6 +241,7 @@ static int vista_click(int x, int y) {
     if (x >= 4 && x < 4 + START_W) {
         menu_open = !menu_open;
         menu_hover = -1;
+        publish_popup();
         return 1;
     }
 

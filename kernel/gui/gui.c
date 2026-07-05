@@ -90,6 +90,19 @@
 
 enum win_kind { WIN_TERM, WIN_APP };
 
+/* M22.7 — per-window input event (compositor produces, the window's app-host
+ * task consumes).  Widget hit-testing + dispatch happens on the host, not the
+ * compositor, so a slow app handler can no longer stall the whole GUI. */
+enum ae_type { AE_MOUSE, AE_KEY, AE_KEYCODE };
+struct app_event {
+    uint8_t type;
+    int16_t x, y;                       /* AE_MOUSE: content-relative     */
+    uint8_t dbl;
+    char    c;                          /* AE_KEY                         */
+    uint8_t kc, mods;                   /* AE_KEYCODE                     */
+};
+#define AQ_SZ 32
+
 struct gui_window {
     int  used;
     enum win_kind kind;
@@ -110,6 +123,20 @@ struct gui_window {
     void (*on_layout)(struct gui_window*);
     void (*on_close) (struct gui_window*);
     void* app_ctx;
+
+    /* M22.7 — per-task app.  Every WIN_APP window is driven by its own
+     * "app-host" task: it creates the widgets, drains this window's event
+     * queue, runs on_tick/on_layout, and renders into `surf` — all off the
+     * compositor.  The compositor only composites `surf` (under `lock`) and
+     * routes input into `aq`.  Teardown: on want_close the host frees the
+     * widgets + calls on_close + sets host_released; the compositor then
+     * disposes the window struct (see apply_pending / destroy_window). */
+    struct task* host_task;
+    struct app_event aq[AQ_SZ];
+    volatile uint32_t aq_h, aq_t;
+    volatile int tick_pending;          /* compositor asks host to on_tick */
+    volatile int layout_pending;        /* compositor asks host to on_layout */
+    volatile int host_released;         /* host cleaned up; compositor may free */
 
     /* M22.3 */
     int  minimized;                     /* skipped by compose + hit-test  */
@@ -154,8 +181,69 @@ static struct gfx_surface fbsurf, backsurf, wallsurf;
 static int work_h = 0;                  /* screen minus shell chrome     */
 static int gmax_cols = 0, gmax_rows = 0;
 
+/* M22.6 — tear-free presentation via a Bochs-VBE double buffer (see
+ * fb_terminal.c).  When `flip_ok`, compose() copies the dirty region from
+ * backsurf into the currently HIDDEN scanout buffer and pans to it, instead
+ * of blitting straight into the live scanout.  QEMU then never reads a
+ * half-updated frame — no mid-scanout shear.  flip_ok==0 keeps the legacy
+ * single-buffer direct blit (real hardware / non-Bochs display). */
+extern int  fb_flip_init(volatile uint32_t** buf0, volatile uint32_t** buf1);
+extern void fb_flip_to(int idx);
+
+/* M22.7 — a damage rectangle (used by both the damage list and the page
+ * flip's previous-frame list). */
+struct rect { int x0, y0, x1, y1; };
+#define DMG_MAX 16
+
+static int flip_ok = 0;
+static struct gfx_surface flipbuf[2];   /* alias the two scanout buffers  */
+static int flip_front = 0;              /* buffer index currently visible */
+/* Last present's dirty rects.  A page flip has buffer-age 2: the hidden
+ * buffer is stale outside the regions touched in the last TWO presents, so
+ * each present copies this frame's rects ∪ last frame's rects. */
+static struct rect prev_dmg[DMG_MAX + 2];       /* +2 for the cursor rects   */
+static int         prev_dmg_n = 0;
+
 static volatile int need_frame = 0;
 static int gui_active = 0;
+
+/* M22.7-B — the desktop shell (taskbar/launcher/clock) runs on its OWN
+ * "desktop" task and renders into a full-screen `panelsurf` at screen
+ * coordinates (so the shell's draw code is unchanged).  The compositor
+ * composites only the OPAQUE parts of it — the taskbar strip (always) and
+ * the launcher popup rect (when open) — on top of the windows, so the rest
+ * of panelsurf never occludes anything.  Input in those regions is routed
+ * to the panel task's queue; the shell's click/motion run there (under
+ * state_lock, which they assume held) instead of in the mouse IRQ. */
+/* panelsurf is addressed in SCREEN coordinates (so the shell's draw code is
+ * unchanged) but only the bottom `strip` is actually backed by memory: the
+ * taskbar reserve + PANEL_POPUP_MAX for the launcher.  `px` points
+ * `panel_strip_top` rows "before" the real allocation so screen-row Y lands
+ * on backed row Y-strip_top; the clip keeps draws inside the strip.  Saves
+ * ~5 MiB versus a full-screen panel at 1920×1200. */
+#define PANEL_POPUP_MAX 480
+static struct gfx_surface panelsurf;
+static uint32_t*    panel_buf = NULL;           /* real allocation base      */
+static int          panel_strip_top = 0;        /* first backed screen row   */
+static int          panel_ready = 0;
+static spinlock_t   panel_lock;
+/* pid of the desktop task (0 until spawned).  Launched session terminals
+ * are parented here so they belong to the desktop session (M22.7). */
+static int          desktop_pid = 0;
+static volatile int panel_dirty = 1;            /* shell needs a redraw     */
+static volatile int panel_gen = 0;              /* bumped on WM changes     */
+/* Published launcher-popup extent (set by the shell via gui_panel_set_popup)
+ * — read by the compositor (what to composite) and input routing. */
+static volatile int pnl_pop_on = 0;
+static volatile int pnl_pop_x = 0, pnl_pop_y = 0, pnl_pop_w = 0, pnl_pop_h = 0;
+
+/* Panel input queue (compositor/IRQ produces, panel task consumes). */
+struct pev { uint8_t type; int16_t x, y; };
+#define PEV_CLICK  0
+#define PEV_MOTION 1
+#define PEVQ_SZ 32
+static struct pev        pevq[PEVQ_SZ];
+static volatile uint32_t pevq_h = 0, pevq_t = 0;
 
 /* M22.4 — set by the task-lifecycle hook (any context) and consumed by
  * the compositor loop: run every window's on_tick NOW instead of at
@@ -168,23 +256,55 @@ static void gui_task_change_hook(void) {
     need_frame = 1;
 }
 
-/* M22.3 — damage tracking.  The dirty rect accumulates under
- * damage_lock (nested inside state_lock on the mouse path — never the
- * other way around) and is snapshotted + cleared by compose().  The
- * full/partial counters back the `gui stats` shell command. */
+/* M22.7 — damage tracking as a LIST of disjoint rects (was a single
+ * bounding box).  A single box merged far-apart damages — a Task Manager
+ * refresh in one corner and the cursor in another — into their bounding
+ * box, so the compositor re-blitted a huge diagonal region every refresh
+ * and the cursor visibly stuttered.  A list composites each small rect on
+ * its own, so two disjoint updates stay two small blits.  Rects accumulate
+ * under damage_lock (nested inside state_lock on the mouse path — never the
+ * other way).  full/partial counters back the `gui stats` command. */
 static spinlock_t damage_lock;
-static int dmg_x0, dmg_y0, dmg_x1, dmg_y1;      /* empty when x1 <= x0 */
+static struct rect dmg_list[DMG_MAX];
+static int         dmg_n = 0;
 static uint32_t frames_full = 0, frames_partial = 0;
+static uint64_t total_blit_px = 0;              /* M22.7 — avg damage/frame */
 
+static int rects_overlap(const struct rect* r, int x0, int y0, int x1, int y1) {
+    return !(x0 >= r->x1 || x1 <= r->x0 || y0 >= r->y1 || y1 <= r->y0);
+}
+static void rect_grow(struct rect* r, int x0, int y0, int x1, int y1) {
+    if (x0 < r->x0) r->x0 = x0;
+    if (y0 < r->y0) r->y0 = y0;
+    if (x1 > r->x1) r->x1 = x1;
+    if (y1 > r->y1) r->y1 = y1;
+}
+static long rect_area(const struct rect* r) {
+    return (long)(r->x1 - r->x0) * (r->y1 - r->y0);
+}
+
+/* Add a damage rect: merge into an OVERLAPPING existing rect (so we never
+ * composite the same pixels twice), else append; if the list is full, fold
+ * it into the rect whose area grows least (bounded degradation). */
 static void damage_add_locked(int x0, int y0, int x1, int y1) {
-    if (dmg_x1 <= dmg_x0) {                     /* empty → replace */
-        dmg_x0 = x0; dmg_y0 = y0; dmg_x1 = x1; dmg_y1 = y1;
-    } else {
-        if (x0 < dmg_x0) dmg_x0 = x0;
-        if (y0 < dmg_y0) dmg_y0 = y0;
-        if (x1 > dmg_x1) dmg_x1 = x1;
-        if (y1 > dmg_y1) dmg_y1 = y1;
+    if (x1 <= x0 || y1 <= y0) return;
+    for (int i = 0; i < dmg_n; i++)
+        if (rects_overlap(&dmg_list[i], x0, y0, x1, y1)) {
+            rect_grow(&dmg_list[i], x0, y0, x1, y1);
+            return;
+        }
+    if (dmg_n < DMG_MAX) {
+        dmg_list[dmg_n++] = (struct rect){ x0, y0, x1, y1 };
+        return;
     }
+    int best = 0; long best_cost = -1;
+    for (int i = 0; i < dmg_n; i++) {
+        struct rect g = dmg_list[i];
+        rect_grow(&g, x0, y0, x1, y1);
+        long cost = rect_area(&g) - rect_area(&dmg_list[i]);
+        if (best_cost < 0 || cost < best_cost) { best_cost = cost; best = i; }
+    }
+    rect_grow(&dmg_list[best], x0, y0, x1, y1);
 }
 
 void gui_damage(int x, int y, int w, int h) {
@@ -197,9 +317,11 @@ void gui_damage(int x, int y, int w, int h) {
 
 void gui_damage_all(void) {
     uint32_t fl = spin_lock_irqsave(&damage_lock);
+    dmg_n = 0;                                  /* collapse to one full rect */
     damage_add_locked(0, 0, fbsurf.w, fbsurf.h);
     spin_unlock_irqrestore(&damage_lock, fl);
     need_frame = 1;
+    panel_gen++;            /* M22.7-B — WM-ish change; nudge the taskbar */
 }
 
 /* Window rect + margin for border/shadow (+5 shadow, +2 safety). */
@@ -207,9 +329,13 @@ static void gui_damage_win(struct gui_window* w) {
     gui_damage(w->x - 2, w->y - 2, w->w + 9, w->h + 9);
 }
 
-void gui_get_stats(uint32_t* full, uint32_t* partial) {
+void gui_get_stats(uint32_t* full, uint32_t* partial, uint32_t* avg_kb) {
     if (full)    *full    = frames_full;
     if (partial) *partial = frames_partial;
+    if (avg_kb) {
+        uint32_t frames = frames_full + frames_partial;
+        *avg_kb = frames ? (uint32_t)(total_blit_px * 4 / 1024 / frames) : 0;
+    }
 }
 
 /* Active desktop shell (chosen once at gui_start). */
@@ -453,6 +579,105 @@ static void app_redraw(struct gui_window* win) {
     gui_damage_win(win);
 }
 
+/* -------------------------------------------------------------------------- */
+/* M22.7 — per-task app host.  Each WIN_APP window runs on its own task; the   */
+/* compositor routes input into win->aq and this loop consumes it, so a slow   */
+/* app handler never stalls compositing.                                       */
+/* -------------------------------------------------------------------------- */
+
+/* Compositor/IRQ → host handoff (SPSC; the host is the sole consumer). */
+static void aq_push(struct gui_window* w, struct app_event e) {
+    if (!w) return;
+    uint32_t n = (w->aq_h + 1) % AQ_SZ;
+    if (n == w->aq_t) return;                   /* full — drop (input flood) */
+    w->aq[w->aq_h] = e;
+    w->aq_h = n;
+}
+
+/* Free a WIN_APP window's widget list + app_ctx.  Runs on the owning host
+ * (teardown) — the compositor never touches widgets once a host exists. */
+static void app_widgets_free(struct gui_window* win) {
+    struct widget* w = win->widgets;
+    while (w) {
+        struct widget* nx = w->next;
+        if (w->ops && w->ops->destroy) w->ops->destroy(w);
+        kfree(w);
+        w = nx;
+    }
+    win->widgets = NULL;
+    win->focusw  = NULL;
+    if (win->app_ctx) { kfree(win->app_ctx); win->app_ctx = NULL; }
+}
+
+static void app_dispatch_event(struct gui_window* win, const struct app_event* e) {
+    if (e->type == AE_MOUSE) {
+        struct widget* w = widget_at(win->widgets, e->x, e->y);
+        if (w && w->ops && w->ops->mouse)
+            w->ops->mouse(w, e->x - w->x, e->y - w->y, e->dbl);
+    } else if (e->type == AE_KEY) {
+        struct widget* w = win->focusw;
+        if (w && w->ops && w->ops->key) w->ops->key(w, e->c);
+    } else if (e->type == AE_KEYCODE) {
+        struct widget* w = win->focusw;
+        if (w && w->ops && w->ops->keycode) w->ops->keycode(w, e->kc, e->mods);
+    }
+}
+
+/* The app-host task entry.  start_arg is the app's launch (open) function;
+ * it runs HERE (creating the window(s) + widgets on this task), then this
+ * loop services every window the app owns until they all close. */
+static void app_host_main(void) {
+    void (*open_fn)(void) = (void (*)(void))task_start_arg();
+    struct task* self = task_current();
+    kprintf("gui: app-host '%s' up (pid %d)\n",
+            self ? self->name : "?", self ? self->pid : -1);
+    if (open_fn) open_fn();                     /* creates windows on this task */
+
+    for (;;) {
+        int live = 0, busy = 0;
+        for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+            struct gui_window* win = &windows[i];
+            if (!win->used || win->kind != WIN_APP || win->host_task != self)
+                continue;
+            if (win->host_released) continue;   /* handed to the compositor */
+
+            if (win->want_close) {              /* graceful, on the host */
+                if (win->on_close) win->on_close(win);
+                app_widgets_free(win);
+                win->host_released = 1;         /* compositor disposes the struct */
+                need_frame = 1;
+                busy = 1;
+                continue;                       /* not live anymore */
+            }
+            live++;
+
+            int worked = 0;
+            while (win->aq_t != win->aq_h) {
+                struct app_event e = win->aq[win->aq_t];
+                win->aq_t = (win->aq_t + 1) % AQ_SZ;
+                app_dispatch_event(win, &e);
+                worked = 1;
+            }
+            if (win->layout_pending) {
+                win->layout_pending = 0;
+                if (win->on_layout) win->on_layout(win);
+                worked = 1;
+            }
+            if (win->tick_pending) {
+                win->tick_pending = 0;
+                if (win->on_tick) win->on_tick(win);
+                worked = 1;               /* on_tick usually requests its own redraw */
+            }
+            if (worked) { app_redraw(win); busy = 1; }
+        }
+        if (live == 0) break;             /* all my windows closed → exit */
+        if (!busy) hal_cpu_idle();        /* M22.7 — halt only when idle */
+        task_yield();
+    }
+    /* Host exits; init reaps it (not reap_owned).  Any windows it released
+     * are disposed by the compositor's apply_pending. */
+}
+
 static int window_set_size(struct gui_window* win, int outer_w, int outer_h) {
     int cw = outer_w - 2 * BORDER;
     int ch = outer_h - TITLE_H - BORDER;
@@ -495,10 +720,11 @@ static int window_set_size(struct gui_window* win, int outer_w, int outer_h) {
 
     gfx_surface_free(&old);
 
-    if (win->kind == WIN_APP) {
-        if (win->on_layout) win->on_layout(win);
-        app_redraw(win);
-    }
+    /* M22.7 — the app-host owns widget layout + drawing; ask it to re-layout
+     * (it runs on_layout + app_redraw next loop).  Set even at creation time:
+     * the host processes it once the open fn has created the widgets. */
+    if (win->kind == WIN_APP)
+        win->layout_pending = 1;
     return 0;
 }
 
@@ -535,6 +761,24 @@ void* gui_window_ctx(struct gui_window* win) {
 
 void gui_window_request_redraw(struct gui_window* win) {
     if (win && win->used && win->kind == WIN_APP) app_redraw(win);
+}
+
+/* M22.7 — redraw + damage only a CONTENT sub-rect (widget-local coords), not
+ * the whole window.  A frequently-refreshing app (the Task Manager) uses it
+ * to repaint just its listview each second instead of the entire window
+ * chrome — the widget clip confines the draw, and only that screen rect is
+ * damaged. */
+void gui_window_request_redraw_rect(struct gui_window* win,
+                                    int cx, int cy, int cw, int ch) {
+    if (!win || !win->used || win->kind != WIN_APP) return;
+    if (cw <= 0 || ch <= 0) return;
+    spin_lock(&win->lock);
+    gfx_set_clip(&win->surf, cx, cy, cw, ch);
+    gfx_fill(&win->surf, cx, cy, cw, ch, COL_WIN_BG);
+    widget_draw_all(win->widgets, &win->surf);  /* clip keeps it to the rect */
+    gfx_clear_clip(&win->surf);
+    spin_unlock(&win->lock);
+    gui_damage(win->x + BORDER + cx, win->y + TITLE_H + cy, cw, ch);
 }
 
 void gui_window_set_on_close(struct gui_window* win,
@@ -689,90 +933,128 @@ static int last_cur_x = -100, last_cur_y = -100;
 #define CUR_DMG_W      14
 #define CUR_DMG_H      20
 
-static void rect_union(int* x0, int* y0, int* x1, int* y1,
-                       int ax0, int ay0, int ax1, int ay1) {
-    if (*x1 <= *x0) {                           /* empty → replace */
-        *x0 = ax0; *y0 = ay0; *x1 = ax1; *y1 = ay1;
-        return;
-    }
-    if (ax0 < *x0) *x0 = ax0;
-    if (ay0 < *y0) *y0 = ay0;
-    if (ax1 > *x1) *x1 = ax1;
-    if (ay1 > *y1) *y1 = ay1;
+/* -------------------------------------------------------------------------- */
+/* M22.7-B — desktop shell / panel task.                                       */
+/* -------------------------------------------------------------------------- */
+
+static void pevq_push(uint8_t type, int x, int y) {
+    uint32_t n = (pevq_h + 1) % PEVQ_SZ;
+    if (n == pevq_t) return;
+    pevq[pevq_h].type = type;
+    pevq[pevq_h].x = (int16_t)x;
+    pevq[pevq_h].y = (int16_t)y;
+    pevq_h = n;
+    need_frame = 1;
 }
 
-static void compose(void) {
-    /* Snapshot + clear the damage rect first: anything damaged while
-     * we paint lands in the NEXT frame. */
-    int rx0, ry0, rx1, ry1;
-    {
-        uint32_t dfl = spin_lock_irqsave(&damage_lock);
-        rx0 = dmg_x0; ry0 = dmg_y0; rx1 = dmg_x1; ry1 = dmg_y1;
-        dmg_x0 = dmg_y0 = dmg_x1 = dmg_y1 = 0;
-        spin_unlock_irqrestore(&damage_lock, dfl);
-    }
+/* The active shell publishes its launcher-popup extent here (0 = closed).
+ * The compositor composites this rect on top of the windows while open, and
+ * the mouse IRQ routes clicks inside it to the panel. */
+void gui_panel_set_popup(int on, int x, int y, int w, int h) {
+    pnl_pop_x = x; pnl_pop_y = y; pnl_pop_w = w; pnl_pop_h = h;
+    pnl_pop_on = on ? 1 : 0;
+    panel_dirty = 1;
+    need_frame = 1;
+}
 
+/* M22.7 — the shell asks for a chrome-only repaint (taskbar + open popup),
+ * NOT a full-screen recompose.  vista_motion uses this for menu-hover
+ * changes so gliding over the open menu doesn't repaint the whole 1920×1200
+ * screen per motion event (the old gui_request_frame path — the menu lag). */
+void gui_panel_dirty(void) {
+    panel_dirty = 1;
+    need_frame = 1;
+}
+
+/* Is (x,y) over the shell's chrome — the taskbar strip or the open popup? */
+static int in_panel_region(int x, int y) {
+    if (y >= work_h) return 1;                  /* taskbar strip (bottom_reserve) */
+    if (pnl_pop_on && x >= pnl_pop_x && x < pnl_pop_x + pnl_pop_w &&
+        y >= pnl_pop_y && y < pnl_pop_y + pnl_pop_h) return 1;
+    return 0;
+}
+
+/* The desktop-shell task: renders the chrome into panelsurf and services
+ * its input off the compositor.  shell->click/motion assume the WM lock is
+ * held (their old IRQ contract), so we hold state_lock across them. */
+static void dispatch_launches(void);            /* defined below; run by desktop */
+
+static void desktop_main(void) {
+    kprintf("gui: desktop shell up on pid %d (shell '%s')\n",
+            task_current() ? task_current()->pid : -1, shell ? shell->name : "none");
+    uint64_t last_tick = 0;
+    int gen_seen = -1;
+    for (;;) {
+        int busy = 0;
+
+        /* M22.7 — launches run HERE now: an app spawned from the taskbar (or
+         * the `launch` command's queue) becomes a child of the desktop/
+         * session, not of the display server (compositor). */
+        dispatch_launches();
+
+        while (pevq_t != pevq_h) {
+            struct pev e = pevq[pevq_t];
+            pevq_t = (pevq_t + 1) % PEVQ_SZ;
+            uint32_t fl = spin_lock_irqsave(&state_lock);
+            if (e.type == PEV_CLICK)  { if (shell && shell->click)  shell->click(e.x, e.y); }
+            else                      { if (shell && shell->motion) shell->motion(e.x, e.y); }
+            spin_unlock_irqrestore(&state_lock, fl);
+            /* Clicks change chrome state (menu, focus) → always repaint.
+             * Motion is frequent; let the shell request a repaint itself
+             * (vista only does so when the hover row changes) so a mouse
+             * drag across the open menu doesn't repaint the chrome on every
+             * event. */
+            if (e.type == PEV_CLICK) panel_dirty = 1;
+            busy = 1;
+        }
+
+        uint64_t now = timer_ticks_ms();
+        if (now - last_tick >= 500) {
+            last_tick = now;
+            if (shell && shell->second_tick && shell->second_tick()) panel_dirty = 1;
+        }
+        if (panel_gen != gen_seen) { gen_seen = panel_gen; panel_dirty = 1; }
+
+        if (panel_dirty) {
+            panel_dirty = 0;
+            busy = 1;
+            spin_lock(&panel_lock);
+            if (shell && shell->draw) shell->draw(&panelsurf);
+            spin_unlock(&panel_lock);
+            gui_damage(0, work_h, fbsurf.w, fbsurf.h - work_h);   /* taskbar */
+            if (pnl_pop_on)
+                gui_damage(pnl_pop_x, pnl_pop_y, pnl_pop_w, pnl_pop_h);
+        }
+        if (!busy) hal_cpu_idle();       /* halt only when idle (see compositor) */
+        task_yield();
+    }
+}
+
+/* One-frame snapshot of the WM state, shared by every damage rect's draw. */
+struct scene_snapshot {
     struct gui_window* zsnap[GUI_MAX_WINDOWS];
-    int   zn;
-    int   cx, cy;
-    enum drag_mode dsnap;
-    struct gui_window* dwin;
-    int   rw, rh, rx = 0, ry = 0;
-    struct gui_window* fsnap;
     int   wx[GUI_MAX_WINDOWS], wy[GUI_MAX_WINDOWS],
           ww[GUI_MAX_WINDOWS], wh[GUI_MAX_WINDOWS];
+    int   zn;
+    int   cx, cy;                       /* cursor */
+    enum  drag_mode dsnap;
+    struct gui_window* dwin;
+    int   rw, rh, rrx, rry;             /* resize rubber band */
+    struct gui_window* fsnap;
+};
 
-    uint32_t fl = spin_lock_irqsave(&state_lock);
-    zn = 0;
-    for (int i = 0; i < zcount; i++) {
-        if (zorder[i]->minimized) continue;     /* M22.3 */
-        zsnap[zn] = zorder[i];
-        wx[zn] = zorder[i]->x;  wy[zn] = zorder[i]->y;
-        ww[zn] = zorder[i]->w;  wh[zn] = zorder[i]->h;
-        zn++;
-    }
-    cx = mx; cy = my;
-    dsnap = drag; dwin = drag_win; rw = rubber_w; rh = rubber_h;
-    if (dwin) { rx = dwin->x; ry = dwin->y; }
-    fsnap = focused_win;
-    spin_unlock_irqrestore(&state_lock, fl);
-
-    /* M22.4 — cursor rects come from HERE, not from the IRQ: union the
-     * previously-drawn and the just-snapshotted cursor positions so the
-     * erase and the redraw are guaranteed to land in the same frame. */
-    int cur_moved = (cx != last_cur_x || cy != last_cur_y);
-    if (rx1 <= rx0 && !cur_moved) return;       /* spurious wake */
-    if (cur_moved || rx1 > rx0) {
-        rect_union(&rx0, &ry0, &rx1, &ry1,
-                   CUR_DMG_X(last_cur_x), CUR_DMG_Y(last_cur_y),
-                   CUR_DMG_X(last_cur_x) + CUR_DMG_W,
-                   CUR_DMG_Y(last_cur_y) + CUR_DMG_H);
-        rect_union(&rx0, &ry0, &rx1, &ry1,
-                   CUR_DMG_X(cx), CUR_DMG_Y(cy),
-                   CUR_DMG_X(cx) + CUR_DMG_W,
-                   CUR_DMG_Y(cy) + CUR_DMG_H);
-    }
-    last_cur_x = cx;  last_cur_y = cy;
-
-    if (rx0 < 0) rx0 = 0;
-    if (ry0 < 0) ry0 = 0;
-    if (rx1 > fbsurf.w) rx1 = fbsurf.w;
-    if (ry1 > fbsurf.h) ry1 = fbsurf.h;
-    if (rx1 <= rx0 || ry1 <= ry0) return;       /* off-screen cursor twitch */
-    int full_frame = (rx0 == 0 && ry0 == 0 &&
-                      rx1 == fbsurf.w && ry1 == fbsurf.h);
-    if (full_frame) frames_full++; else frames_partial++;
-
-    /* Everything below is confined to the dirty rect by the clip box —
-     * a partial frame only touches (and finally blits) that region. */
+/* Paint the whole scene (wallpaper → windows → rubber → panel → cursor)
+ * into backsurf, clipped to one damage rect.  Called once per rect. */
+static void draw_scene_rect(const struct scene_snapshot* s,
+                            int rx0, int ry0, int rx1, int ry1) {
     gfx_set_clip(&backsurf, rx0, ry0, rx1 - rx0, ry1 - ry0);
 
     gfx_blit(&backsurf, 0, 0, &wallsurf, 0, 0, wallsurf.w, wallsurf.h);
 
-    for (int i = 0; i < zn; i++) {
-        struct gui_window* win = zsnap[i];
-        int x = wx[i], y = wy[i], w = ww[i], h = wh[i];
-        int focused = (win == fsnap);
+    for (int i = 0; i < s->zn; i++) {
+        struct gui_window* win = s->zsnap[i];
+        int x = s->wx[i], y = s->wy[i], w = s->ww[i], h = s->wh[i];
+        int focused = (win == s->fsnap);
 
         gfx_blend_fill(&backsurf, x + 5, y + 5, w, h, COL_SHADOW);
         draw_rect_outline(&backsurf, x, y, w, h, BORDER,
@@ -784,8 +1066,6 @@ static void compose(void) {
         gfx_text(&backsurf, x + 8, y + (TITLE_H - GFX_GLYPH_H + BORDER) / 2,
                  win->title, COL_TITLE_TEXT);
 
-        /* M22.3: minimize (_) + close (x); M22.5 adds maximize (□)
-         * between them.  Right→left: close, max, min. */
         {
             int bx = x + w - BORDER - CLOSE_W - 3;
             int by = y + 4;
@@ -794,12 +1074,12 @@ static void compose(void) {
                      COL_CLOSE_FG);
             int xx = bx - CLOSE_W - 3;          /* maximize / restore */
             gfx_fill(&backsurf, xx, by, CLOSE_W, CLOSE_H, 0xFF3A4A5Eu);
-            if (win->maximized) {               /* restore: two nested boxes */
+            if (win->maximized) {
                 draw_rect_outline(&backsurf, xx + 5, by + 2, CLOSE_W - 8,
                                   CLOSE_H - 6, 1, COL_TITLE_TEXT);
                 draw_rect_outline(&backsurf, xx + 3, by + 4, CLOSE_W - 8,
                                   CLOSE_H - 6, 1, COL_TITLE_TEXT);
-            } else {                            /* maximize: one box */
+            } else {
                 draw_rect_outline(&backsurf, xx + 3, by + 2, CLOSE_W - 6,
                                   CLOSE_H - 4, 1, COL_TITLE_TEXT);
             }
@@ -822,23 +1102,117 @@ static void compose(void) {
         }
     }
 
-    if (dsnap == DRAG_RESIZE && dwin)
-        draw_rect_outline(&backsurf, rx, ry, rw, rh, 2, COL_RUBBER);
+    if (s->dsnap == DRAG_RESIZE && s->dwin)
+        draw_rect_outline(&backsurf, s->rrx, s->rry, s->rw, s->rh, 2, COL_RUBBER);
 
-    /* Desktop chrome (taskbar, launcher, clock — whatever the active
-     * shell wants), then the cursor on the very top. */
-    if (shell && shell->draw) shell->draw(&backsurf);
+    /* M22.7-B — desktop chrome (taskbar always + open popup) from panelsurf. */
+    if (panel_ready) {
+        spin_lock(&panel_lock);
+        gfx_blit(&backsurf, 0, work_h, &panelsurf, 0, work_h,
+                 fbsurf.w, fbsurf.h - work_h);
+        if (pnl_pop_on) {
+            int py = pnl_pop_y, ph = pnl_pop_h;
+            if (py < panel_strip_top) { ph -= panel_strip_top - py; py = panel_strip_top; }
+            if (ph > 0)
+                gfx_blit(&backsurf, pnl_pop_x, py, &panelsurf,
+                         pnl_pop_x, py, pnl_pop_w, ph);
+        }
+        spin_unlock(&panel_lock);
+    }
 
-    draw_cursor(&backsurf, cx, cy);
+    draw_cursor(&backsurf, s->cx, s->cy);
+}
+
+static void compose(void) {
+    /* 1. Snapshot + clear the damage LIST: anything damaged while we paint
+     *    lands in the next frame. */
+    struct rect rl[DMG_MAX + 2];
+    int rn;
+    {
+        uint32_t dfl = spin_lock_irqsave(&damage_lock);
+        rn = dmg_n;
+        for (int i = 0; i < rn; i++) rl[i] = dmg_list[i];
+        dmg_n = 0;
+        spin_unlock_irqrestore(&damage_lock, dfl);
+    }
+
+    /* 2. Snapshot the WM state (shared across all rects). */
+    struct scene_snapshot s;
+    uint32_t fl = spin_lock_irqsave(&state_lock);
+    s.zn = 0;
+    for (int i = 0; i < zcount; i++) {
+        if (zorder[i]->minimized) continue;     /* M22.3 */
+        s.zsnap[s.zn] = zorder[i];
+        s.wx[s.zn] = zorder[i]->x;  s.wy[s.zn] = zorder[i]->y;
+        s.ww[s.zn] = zorder[i]->w;  s.wh[s.zn] = zorder[i]->h;
+        s.zn++;
+    }
+    s.cx = mx; s.cy = my;
+    s.dsnap = drag; s.dwin = drag_win; s.rw = rubber_w; s.rh = rubber_h;
+    s.rrx = s.rry = 0;
+    if (s.dwin) { s.rrx = s.dwin->x; s.rry = s.dwin->y; }
+    s.fsnap = focused_win;
+    spin_unlock_irqrestore(&state_lock, fl);
+
+    /* 3. Cursor damage from HERE (M22.4): erase the last-drawn sprite and
+     *    draw the fresh one — two SEPARATE small rects, appended to the
+     *    list (not unioned with far-away window damage). */
+    int cur_moved = (s.cx != last_cur_x || s.cy != last_cur_y);
+    if (rn == 0 && !cur_moved) return;          /* spurious wake */
+    if (cur_moved && rn < DMG_MAX + 2)
+        rl[rn++] = (struct rect){ CUR_DMG_X(last_cur_x), CUR_DMG_Y(last_cur_y),
+                                  CUR_DMG_X(last_cur_x) + CUR_DMG_W,
+                                  CUR_DMG_Y(last_cur_y) + CUR_DMG_H };
+    if (cur_moved && rn < DMG_MAX + 2)
+        rl[rn++] = (struct rect){ CUR_DMG_X(s.cx), CUR_DMG_Y(s.cy),
+                                  CUR_DMG_X(s.cx) + CUR_DMG_W,
+                                  CUR_DMG_Y(s.cy) + CUR_DMG_H };
+    last_cur_x = s.cx;  last_cur_y = s.cy;
+
+    /* 4. Clamp each rect to the screen; drop empties. */
+    struct rect fr[DMG_MAX + 2];
+    int fn = 0, any_full = 0;
+    for (int i = 0; i < rn; i++) {
+        int x0 = rl[i].x0, y0 = rl[i].y0, x1 = rl[i].x1, y1 = rl[i].y1;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > fbsurf.w) x1 = fbsurf.w;
+        if (y1 > fbsurf.h) y1 = fbsurf.h;
+        if (x1 <= x0 || y1 <= y0) continue;
+        fr[fn++] = (struct rect){ x0, y0, x1, y1 };
+        if (x0 == 0 && y0 == 0 && x1 == fbsurf.w && y1 == fbsurf.h) any_full = 1;
+    }
+    if (fn == 0) return;
+    if (any_full) frames_full++; else frames_partial++;
+    for (int k = 0; k < fn; k++)                 /* actual damage this frame */
+        total_blit_px += (uint64_t)(fr[k].x1 - fr[k].x0) * (fr[k].y1 - fr[k].y0);
+
+    /* 5. Draw pass — paint each rect into backsurf. */
+    for (int k = 0; k < fn; k++)
+        draw_scene_rect(&s, fr[k].x0, fr[k].y0, fr[k].x1, fr[k].y1);
     gfx_clear_clip(&backsurf);
-    /* M22.4 tearing note: QEMU's std-VGA exposes no vblank / present
-     * boundary, so this blit can shear mid-scanout when it is large.
-     * Not fully fixable on this device — the cursor + drag damage fixes
-     * shrink the typical blit far enough that the residue sits below
-     * perception.  A real fix needs a flush-capable display (virtio-gpu
-     * with explicit VIRTIO_GPU_CMD_RESOURCE_FLUSH is the candidate,
-     * post-M24). */
-    gfx_blit(&fbsurf, rx0, ry0, &backsurf, rx0, ry0, rx1 - rx0, ry1 - ry0);
+
+    /* 6. Present — blit each rect (M22.6 flip has buffer-age 2, so it also
+     *    replays LAST frame's rects into the hidden buffer to complete it). */
+    if (flip_ok) {
+        int hidden = flip_front ^ 1;
+        for (int k = 0; k < fn; k++)
+            gfx_blit(&flipbuf[hidden], fr[k].x0, fr[k].y0, &backsurf,
+                     fr[k].x0, fr[k].y0, fr[k].x1 - fr[k].x0, fr[k].y1 - fr[k].y0);
+        for (int k = 0; k < prev_dmg_n; k++)
+            gfx_blit(&flipbuf[hidden], prev_dmg[k].x0, prev_dmg[k].y0, &backsurf,
+                     prev_dmg[k].x0, prev_dmg[k].y0,
+                     prev_dmg[k].x1 - prev_dmg[k].x0,
+                     prev_dmg[k].y1 - prev_dmg[k].y0);
+        fb_flip_to(hidden);
+        flip_front = hidden;
+        prev_dmg_n = fn;
+        for (int k = 0; k < fn; k++) prev_dmg[k] = fr[k];
+    } else {
+        for (int k = 0; k < fn; k++)
+            gfx_blit(&fbsurf, fr[k].x0, fr[k].y0, &backsurf,
+                     fr[k].x0, fr[k].y0, fr[k].x1 - fr[k].x0, fr[k].y1 - fr[k].y0);
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -846,7 +1220,9 @@ static void compose(void) {
 /* -------------------------------------------------------------------------- */
 
 static void destroy_window(struct gui_window* win) {
-    if (win->on_close) win->on_close(win);
+    /* M22.7 — a released WIN_APP already ran on_close + freed its widgets on
+     * its host task; don't repeat it here.  WIN_TERM keeps the old path. */
+    if (win->on_close && !win->host_released) win->on_close(win);
 
     uint32_t fl = spin_lock_irqsave(&state_lock);
     int i;
@@ -887,22 +1263,41 @@ static void dispatch_launches(void) {
     while (lq_t != lq_h) {
         const struct gui_app_def* app = launchq[lq_t];
         lq_t = (lq_t + 1) % LQ_SZ;
-        if (app && app->launch) app->launch();
+        if (!app || !app->launch) continue;
+        /* M22.7 — each app runs on its OWN task.  Spawn an app-host and hand
+         * it the launch fn via start_arg; the host runs it (creating the
+         * window(s) + widgets on that task) then services them.  A singleton
+         * app whose open fn just raises an existing window creates nothing,
+         * so its host exits immediately (init reaps it). */
+        char nm[TASK_NAME_MAX + 1] = "app:";
+        int p = 4;
+        for (const char* s = app->name; s && *s && p < TASK_NAME_MAX; s++)
+            nm[p++] = *s;
+        nm[p] = 0;
+        struct task* host =
+            task_spawn_arg(nm, app_host_main, (void*)(uintptr_t)app->launch);
+        if (!host) { kprintf("gui: app-host spawn failed for '%s'\n", app->name); continue; }
+        /* The compositor owns the host's reap (window-teardown ordering) —
+         * keep init off it, same contract as WIN_TERM shells. */
+        task_set_reap_owned(host, 1);
     }
     if (power_req == 1) hal_reboot();
     if (power_req == 2) hal_shutdown();
 }
 
+/* M22.7 — the compositor no longer touches widgets: it drains the IRQ-fed
+ * global queues and re-routes each event into the target window's per-window
+ * queue (aq).  The owning app-host does the widget hit-test + dispatch +
+ * redraw off the compositor. */
 static void dispatch_events(void) {
     while (evq_t != evq_h) {
         struct gev e = evq[evq_t];
         evq_t = (evq_t + 1) % EVQ_SZ;
         struct gui_window* win = e.win;
         if (!win || !win->used || win->kind != WIN_APP) continue;
-        struct widget* w = widget_at(win->widgets, e.x, e.y);
-        if (w && w->ops && w->ops->mouse)
-            w->ops->mouse(w, e.x - w->x, e.y - w->y, e.dbl);
-        if (win->used) app_redraw(win);
+        struct app_event ae = { .type = AE_MOUSE, .x = e.x, .y = e.y,
+                                .dbl = e.dbl };
+        aq_push(win, ae);
     }
 }
 
@@ -914,11 +1309,8 @@ static void dispatch_keys(void) {
         struct gui_window* win = focused_win;
         spin_unlock_irqrestore(&state_lock, fl);
         if (!win || !win->used || win->kind != WIN_APP) continue;
-        struct widget* w = win->focusw;
-        if (w && w->ops && w->ops->key) {
-            w->ops->key(w, c);
-            app_redraw(win);
-        }
+        struct app_event ae = { .type = AE_KEY, .c = c };
+        aq_push(win, ae);
     }
 }
 
@@ -931,11 +1323,49 @@ static void dispatch_keycodes(void) {
         struct gui_window* win = focused_win;
         spin_unlock_irqrestore(&state_lock, fl);
         if (!win || !win->used || win->kind != WIN_APP) continue;
-        struct widget* w = win->focusw;
-        if (w && w->ops && w->ops->keycode) {
-            w->ops->keycode(w, (uint8_t)(e & 0xFF), (uint8_t)(e >> 8));
-            app_redraw(win);
-        }
+        struct app_event ae = { .type = AE_KEYCODE, .kc = (uint8_t)(e & 0xFF),
+                                .mods = (uint8_t)(e >> 8) };
+        aq_push(win, ae);
+    }
+}
+
+/* M22.7 — is `t` still referenced by any live window (app-host or the
+ * terminal-shell task)?  Used to decide when an app-host can be reaped. */
+static int gui_task_referenced(struct task* t) {
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+        struct gui_window* w = &windows[i];
+        if (!w->used) continue;
+        if (w->host_task == t) return 1;
+        if (w->kind == WIN_TERM && w->vc && w->vc->task == t) return 1;
+    }
+    return 0;
+}
+
+/* Reap an app-host once it is DEAD and owns no more windows.  The host is
+ * reap_owned (init won't touch it), so the compositor is its sole reaper. */
+static void reap_gui_host(struct task* host) {
+    if (!host || host->state != TASK_DEAD) return;
+    if (gui_task_referenced(host)) return;
+    task_reap(host->pid);
+}
+
+/* Sweep for DEAD reap_owned tasks no window references — catches a
+ * singleton app whose open fn only raised an existing window (its host
+ * created nothing and exited immediately).  Run on task-set changes.
+ * A terminal shell mid-teardown is still referenced (win->vc->task), so
+ * this never races the WIN_TERM reap path. */
+struct gui_host_scan { int pids[GUI_MAX_WINDOWS * 2]; int n; };
+static void gui_host_scan_cb(const struct task* t, int is_current, void* ctx) {
+    struct gui_host_scan* s = (struct gui_host_scan*)ctx;
+    if (is_current || t->state != TASK_DEAD || !t->reap_owned) return;
+    if (s->n < (int)(sizeof s->pids / sizeof s->pids[0])) s->pids[s->n++] = t->pid;
+}
+static void reap_dead_gui_hosts(void) {
+    struct gui_host_scan s = { .n = 0 };
+    task_for_each(gui_host_scan_cb, &s);
+    for (int i = 0; i < s.n; i++) {
+        struct task* t = task_find(s.pids[i]);
+        if (t && !gui_task_referenced(t)) task_reap(t->pid);
     }
 }
 
@@ -944,14 +1374,75 @@ static void apply_pending(void) {
         struct gui_window* win = &windows[i];
         if (!win->used) continue;
 
+        /* M22.6 — auto-close a terminal window whose hosted task has died
+         * by ANY route: the window's own X button (want_close, below),
+         * the Task Manager's "End task", a CLI `kill`, or the task simply
+         * returning from its entry.  Without this, an externally-killed
+         * shell left its (now inert, un-typeable) window on screen.
+         *
+         * The trigger is TASK_DEAD — the task has ACTUALLY stopped.  A
+         * task merely FLAGGED to stop (task_kill sets kill_pending; a
+         * kthread only dies at its next yield / task_should_stop poll) is
+         * still RUNNABLE, so its window stays until it truly terminates —
+         * that is the "instruction to stop" vs "has stopped" distinction.
+         *
+         * Safe pointer: a VC-bound DEAD task is reaped ONLY by the
+         * want_close path below (which nulls win->vc->task); the Task
+         * Manager's reap pass skips vc_task_bound tasks.  So win->vc->task
+         * stays valid here until we tear it down. */
+        if (!win->want_close && win->kind == WIN_TERM &&
+            win->vc && win->vc->task &&
+            win->vc->task->state == TASK_DEAD) {
+            kprintf("gui: window '%s' auto-closing (hosted pid %d died)\n",
+                    win->title, win->vc->task->pid);
+            win->want_close = 1;
+        }
+
+        /* M22.7 — same for a WIN_APP whose host task died (e.g. End task /
+         * CLI kill of the app-host).  host_task is reap_owned, so it stays
+         * valid until WE reap it below — the ->state read is safe. */
+        if (!win->want_close && win->kind == WIN_APP &&
+            win->host_task && win->host_task->state == TASK_DEAD &&
+            !win->host_released) {
+            win->want_close = 1;
+        }
+
+        /* M22.7 — WIN_APP teardown is a two-actor dance.  Normally the host
+         * sees want_close, runs on_close + frees its widgets, and sets
+         * host_released; we then dispose the struct.  If the host died
+         * WITHOUT releasing (it was killed), we do that cleanup here since
+         * the host can no longer touch the widgets. */
+        if (win->want_close && win->kind == WIN_APP) {
+            if (!win->host_released) {
+                int host_dead = win->host_task &&
+                                win->host_task->state == TASK_DEAD;
+                if (!host_dead) continue;       /* host still cleaning up */
+                if (win->on_close) win->on_close(win);
+                app_widgets_free(win);
+                win->host_released = 1;
+            }
+            struct task* host = win->host_task;
+            kprintf("gui: app window '%s' closed (host pid %d)\n",
+                    win->title, host ? host->pid : -1);
+            win->want_close = 0;
+            destroy_window(win);
+            reap_gui_host(host);                /* reap once its last window is gone */
+            continue;
+        }
+
         if (win->want_close) {
             if (win->kind == WIN_TERM && win->vc && win->vc->task) {
                 /* Kill the hosted shell first (cooperative — it dies at
                  * its next vc_getchar yield), then reap; retry on the
                  * next compositor pass until the reap succeeds.  Only
-                 * then is it safe to free the VC and the surface. */
+                 * then is it safe to free the VC and the surface.
+                 *
+                 * M27 — kill the whole SUBTREE: anything the shell spawned
+                 * (e.g. `spawn`) dies with the window instead of orphaning.
+                 * The shell itself is reap_owned, so WE reap it here; its
+                 * (non-owned) children are reaped by init once they die. */
                 struct task* t = win->vc->task;
-                task_kill(t->pid);
+                task_kill_tree(t->pid);
                 if (task_reap(t->pid) != 0) continue;   /* not DEAD yet */
                 win->vc->task = NULL;
             }
@@ -984,46 +1475,50 @@ static void gui_compositor_main(void) {
             shell ? shell->name : "none");
     uint64_t last_tick = 0;
     for (;;) {
-        dispatch_launches();
+        /* M22.7 — app launches moved to the desktop task (so launched apps
+         * are children of the desktop/session, not the display server). */
         dispatch_events();
         dispatch_keys();
         dispatch_keycodes();
         apply_pending();
 
-        /* ~1 Hz shell housekeeping (clock).  Rate-limited here so a
-         * shell can just do the slow thing (RTC port I/O) in its tick. */
+        /* ~1 Hz per-window housekeeping.  (The shell clock moved to the
+         * desktop task in M22.7-B; the compositor no longer runs it.) */
         uint64_t now = timer_ticks_ms();
         if (now - last_tick >= 500) {
             last_tick = now;
-            if (shell && shell->second_tick && shell->second_tick()) {
-                /* Clock repaint only dirties the chrome strip — keeps
-                 * the 1 Hz tick on the cheap partial-frame path. */
-                if (work_h < fbsurf.h)
-                    gui_damage(0, work_h, fbsurf.w, fbsurf.h - work_h);
-                else
-                    gui_damage_all();
-            }
-            /* M22.3: per-window ~1 Hz ticks (task manager refresh). */
+            /* M22.3/M22.7: per-window ~1 Hz ticks (e.g. task manager
+             * refresh) — signal the owning app-host, which runs on_tick on
+             * its own task rather than blocking the compositor here. */
             for (int i = 0; i < GUI_MAX_WINDOWS; i++)
                 if (windows[i].used && windows[i].on_tick)
-                    windows[i].on_tick(&windows[i]);
+                    windows[i].tick_pending = 1;
         }
 
-        /* M22.4: task set changed (spawn/kill/exit/reap) → fire the
-         * on_tick refreshes immediately, don't wait for the 1 Hz beat.
-         * Ticks are idempotent refreshes, so an early call is safe. */
+        /* M22.4: task set changed (spawn/kill/exit/reap) → nudge the tick
+         * refreshes immediately, don't wait for the 1 Hz beat.  Ticks are
+         * idempotent refreshes, so an early one is safe. */
         if (tasks_changed) {
             tasks_changed = 0;
             for (int i = 0; i < GUI_MAX_WINDOWS; i++)
                 if (windows[i].used && windows[i].on_tick)
-                    windows[i].on_tick(&windows[i]);
+                    windows[i].tick_pending = 1;
+            reap_dead_gui_hosts();          /* M22.7 — sweep exited app-hosts */
         }
 
+        /* M22.7 — latency fix: halt the CPU only when there is NOTHING to
+         * compose.  The old unconditional hal_cpu_idle() slept a whole timer
+         * tick every iteration, so with several always-runnable tasks
+         * (compositor + desktop + app-hosts) the compositor's turn came
+         * around only every N ticks — visible cursor lag with the menu or
+         * Task Manager open.  Under load need_frame stays set, so we spin
+         * through the scheduler (fast); when truly idle we hlt (power save). */
         if (need_frame) {
             need_frame = 0;
             compose();
+        } else {
+            hal_cpu_idle();
         }
-        hal_cpu_idle();
         task_yield();
     }
 }
@@ -1057,8 +1552,14 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
     int drag_moved = 0;
     int drag_old_x = 0, drag_old_y = 0, drag_old_w = 0, drag_old_h = 0;
     int drag_new_x = 0, drag_new_y = 0;
+    /* M22.7 — precise structural damage: the windows whose look changed
+     * (focus highlight, z-order raise, minimize) instead of the whole
+     * screen.  Captured under the lock, damaged after unlock. */
+    struct gui_window* clicked = NULL;
+    int force_full = 0;                          /* geometry change → full damage */
 
     spin_lock(&state_lock);
+    struct gui_window* old_focus = focused_win;
 
     mx += dx;  my += dy;
     if (mx < 0) mx = 0;
@@ -1070,17 +1571,24 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
     unsigned released = ~buttons &  btn_prev;
     btn_prev = buttons;
 
-    /* Chrome hover (launcher-menu highlight etc.). */
-    if (shell && shell->motion) shell->motion(mx, my);
+    /* M22.7-B — chrome hover (launcher highlight): only meaningful while the
+     * popup is open; route it to the desktop task instead of running the
+     * shell in the IRQ. */
+    if (pnl_pop_on) pevq_push(PEV_MOTION, mx, my);
 
     if (pressed & MOUSE_BTN_LEFT) {
-        /* The desktop shell gets first refusal (taskbar, menus).  If it
-         * consumes the click, the windows below never see it. */
-        if (shell && shell->click && shell->click(mx, my)) {
+        /* Desktop chrome gets first refusal.  A click over the taskbar or
+         * the open popup is consumed and handed to the desktop task; a click
+         * elsewhere while the popup is open also goes there (to dismiss the
+         * menu) but still falls through to the windows below. */
+        if (in_panel_region(mx, my)) {
+            pevq_push(PEV_CLICK, mx, my);
             goto drag_update;
         }
+        if (pnl_pop_on) pevq_push(PEV_CLICK, mx, my);   /* dismiss, then windows */
 
         struct gui_window* win = topmost_at(mx, my);
+        clicked = win;                          /* for precise structural damage */
         if (win) {
             gui_wm_focus_raise_locked(win);
 
@@ -1098,6 +1606,7 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
                 win->want_close = 1;
             } else if (in_max) {
                 toggle_maximize_locked(win);                 /* M22.5 */
+                force_full = 1;                              /* geometry change */
             } else if (in_min) {
                 win->minimized = 1;
                 struct gui_window* nf = top_visible_locked();
@@ -1117,6 +1626,7 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
                 lastclick_win = win;
                 if (dbl) {
                     toggle_maximize_locked(win);
+                    force_full = 1;                          /* geometry change */
                 } else if (!win->maximized) {
                     drag     = DRAG_MOVE;
                     drag_win = win;
@@ -1173,6 +1683,7 @@ drag_update:
     }
 
     if (released & MOUSE_BTN_LEFT) {
+        if (drag == DRAG_RESIZE) force_full = 1;       /* geometry changes */
         if (drag == DRAG_RESIZE && drag_win &&
             (rubber_w != drag_win->w || rubber_h != drag_win->h)) {
             drag_win->pending_w = rubber_w;
@@ -1182,16 +1693,29 @@ drag_update:
         drag_win = NULL;
     }
 
-    /* M22.4 — damage policy: full recompose only for the RARE events
-     * (press/release change focus/z-order; the resize rubber band is
-     * thin but spans the window).  A DRAG_MOVE motion damages just
-     * old-rect ∪ new-rect; a pure pointer glide is a bare wake — the
-     * compositor adds the cursor rects itself (see compose()). */
-    int structural = (pressed || released || drag == DRAG_RESIZE);
+    /* M22.7 — damage policy.  A resize rubber band spans the window and
+     * shrinks/grows, so it keeps the full recompose (rare — only while
+     * dragging the grip).  A press/release only changes focus + z-order:
+     * damage just the affected windows (old focus un-highlights, the
+     * clicked window raises + highlights) instead of the whole 9 MB
+     * screen.  DRAG_MOVE damages old∪new; a pure glide is a bare wake. */
+    struct gui_window* new_focus = focused_win;
+    int resizing   = (drag == DRAG_RESIZE);
+    int structural = (pressed || released) && !resizing && !force_full;
     spin_unlock(&state_lock);
 
-    if (structural) {
-        gui_damage_all();                       /* focus/z/rubber changes */
+    if (resizing || force_full) {
+        gui_damage_all();                       /* rubber band / geometry apply */
+    } else if (structural) {
+        int hit = 0;
+        if (old_focus && old_focus->used) { gui_damage_win(old_focus); hit = 1; }
+        if (new_focus && new_focus != old_focus && new_focus->used) {
+            gui_damage_win(new_focus); hit = 1;
+        }
+        if (clicked && clicked != old_focus && clicked != new_focus &&
+            clicked->used) { gui_damage_win(clicked); hit = 1; }
+        panel_gen++;                            /* taskbar buttons may change */
+        if (!hit) need_frame = 1;               /* click on empty desktop */
     } else if (drag_moved) {
         /* Same margins as gui_damage_win (+5 shadow, +2 safety). */
         gui_damage(drag_old_x - 2, drag_old_y - 2,
@@ -1277,13 +1801,24 @@ static int gui_kbd_hook(char c) {
 
 static struct gui_window* window_alloc(const char* title, enum win_kind kind,
                                        int x, int y, int w, int h) {
-    struct gui_window* win = NULL;
-    for (int i = 0; i < GUI_MAX_WINDOWS; i++)
-        if (!windows[i].used) { win = &windows[i]; break; }
-    if (!win) { kprintf("gui: window pool exhausted\n"); return NULL; }
     if (w < MIN_W) w = MIN_W;
     if (h < MIN_H) h = MIN_H;
     if (h > work_h) h = work_h;
+
+    /* M22.7 — the slot scan + claim runs under state_lock: app-host tasks
+     * now create windows concurrently, so an unlocked "find !used then set
+     * used=1" would hand the same slot to two apps.  All fields are set
+     * before used=1 (the last store), so a compositor pass that observes
+     * used==1 sees a fully-initialised window (x86 TSO — no barrier). */
+    uint32_t fl = spin_lock_irqsave(&state_lock);
+    struct gui_window* win = NULL;
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++)
+        if (!windows[i].used) { win = &windows[i]; break; }
+    if (!win) {
+        spin_unlock_irqrestore(&state_lock, fl);
+        kprintf("gui: window pool exhausted\n");
+        return NULL;
+    }
 
     win->kind = kind;
     win->x = x;  win->y = y;  win->w = w;  win->h = h;
@@ -1297,9 +1832,14 @@ static struct gui_window* window_alloc(const char* title, enum win_kind kind,
     win->sav_x = win->sav_y = win->sav_w = win->sav_h = 0;
     win->ccol = win->crow = win->cols = win->rows = 0;
     win->surf.px = NULL; win->surf.owns_px = 0;
+    /* M22.7 — per-task app fields. */
+    win->host_task = NULL;
+    win->aq_h = win->aq_t = 0;
+    win->tick_pending = win->layout_pending = win->host_released = 0;
     spin_lock_init(&win->lock);
     str_copy(win->title, title, (int)sizeof(win->title));
     win->used = 1;
+    spin_unlock_irqrestore(&state_lock, fl);
     return win;
 }
 
@@ -1319,7 +1859,8 @@ static void window_show(struct gui_window* win) {
 static struct gui_window* term_window_create(const char* title,
                                              int x, int y, int w, int h,
                                              const char* task_name,
-                                             void (*entry)(void)) {
+                                             void (*entry)(void),
+                                             int shell_ppid) {
     struct gui_window* win = window_alloc(title, WIN_TERM, x, y, w, h);
     if (!win) return NULL;
 
@@ -1341,10 +1882,20 @@ static struct gui_window* term_window_create(const char* title,
     }
 
     preempt_disable();
-    struct task* t = task_spawn(task_name, entry);
+    /* M22.7 — parent the shell as requested: the desktop/session (session
+     * shells, so a kill_tree(desktop) takes them with it), init (detached
+     * shells, which outlive the session), or the caller (< 0).  Without this
+     * a shell launched from the taskbar orphaned to init when its transient
+     * launcher app-host exited. */
+    struct task* t = task_spawn_under(task_name, entry, shell_ppid);
     if (t) {
         task_set_out_console(t, win->vc);
         win->vc->task = t;
+        /* M27 — this window owns its shell's reap (the close teardown
+         * kills + reaps it and nulls the pointer).  Tell init's universal
+         * reaper to keep its hands off, so the two never race for the
+         * same struct. */
+        task_set_reap_owned(t, 1);
     }
     preempt_enable();
     if (!t) kprintf("gui: task spawn failed for '%s'\n", win->title);
@@ -1354,16 +1905,32 @@ static struct gui_window* term_window_create(const char* title,
 }
 
 struct gui_window* gui_window_create(const char* title, int x, int y, int w, int h) {
-    /* S.1: terminal windows spawn the ACTIVE shell provider. */
+    /* S.1: terminal windows spawn the ACTIVE shell provider.
+     * M22.7 — SESSION mode: parent the shell to the desktop (once it exists;
+     * the initial two shells are created before it and stay under whoever
+     * ran `gui`).  A kill_tree(desktop) then takes session shells with it. */
     return term_window_create(title, x, y, w, h, "shell",
-                              shell_provider_active()->entry);
+                              shell_provider_active()->entry,
+                              desktop_pid > 0 ? desktop_pid : -1);
+}
+
+/* M22.7 — DETACHED mode: the shell is parented to init, so it OUTLIVES the
+ * desktop session (a kill_tree(desktop) does not reach it).  Its window
+ * stays composited as long as the compositor runs — a "detached terminal". */
+struct gui_window* gui_window_create_detached(const char* title,
+                                              int x, int y, int w, int h) {
+    return term_window_create(title, x, y, w, h, "shell",
+                              shell_provider_active()->entry,
+                              task_reaper_pid());
 }
 
 struct gui_window* gui_window_create_task(const char* title, int x, int y,
                                           int w, int h,
                                           const char* task_name,
                                           void (*entry)(void)) {
-    return term_window_create(title, x, y, w, h, task_name, entry);
+    /* Custom-task terminals (e.g. BASIC) — parent to the desktop session too. */
+    return term_window_create(title, x, y, w, h, task_name, entry,
+                              desktop_pid > 0 ? desktop_pid : -1);
 }
 
 struct gui_window* gui_app_window_create(const char* title, int x, int y,
@@ -1374,6 +1941,10 @@ struct gui_window* gui_app_window_create(const char* title, int x, int y,
     if (!win) return NULL;
     win->on_layout = on_layout;
     win->app_ctx   = app_ctx;
+    /* M22.7 — bind the window to the app-host that is creating it (this runs
+     * inside the app's open fn, which the host task invokes).  The host's
+     * loop then owns this window's events + rendering + teardown. */
+    win->host_task = task_current();
 
     if (window_set_size(win, win->w, win->h) != 0) {
         win->used = 0;
@@ -1417,6 +1988,29 @@ int gui_start(void) {
         return -1;
     }
 
+    /* M22.6 — try to stand up the Bochs-VBE double buffer.  On success both
+     * scanout buffers alias the same geometry as fbsurf; the first compose
+     * is a full-frame damage (gui_damage_all below), so both buffers get a
+     * complete paint within the first two frames — the buffer-age-2 present
+     * is consistent from then on.  Any failure leaves flip_ok==0 and the
+     * compositor keeps its single-buffer path. */
+    {
+        volatile uint32_t *b0, *b1;
+        if (fb_flip_init(&b0, &b1) == 0) {
+            for (int i = 0; i < 2; i++) {
+                flipbuf[i] = fbsurf;                /* copy w/h/stride */
+                flipbuf[i].owns_px = 0;
+            }
+            flipbuf[0].px = (uint32_t*)(uintptr_t)b0;
+            flipbuf[1].px = (uint32_t*)(uintptr_t)b1;
+            flip_front = 0;
+            flip_ok = 1;
+            kprintf("gui: page-flip present enabled (Bochs-VBE double buffer)\n");
+        } else {
+            kprintf("gui: no page flip — single-buffer present (may shear)\n");
+        }
+    }
+
     shell = pick_shell();
     if (shell && shell->init) shell->init(fbsurf.w, fbsurf.h);
     work_h = fbsurf.h -
@@ -1430,6 +2024,33 @@ int gui_start(void) {
     gfx_text(&wallsurf, wallsurf.w - 8 * GFX_GLYPH_W - 12,
              work_h - GFX_GLYPH_H - 8, "d-os M22", 0xFF9FB6C9u);
 
+    /* M22.7-B — panel surface: screen-addressed, but only the bottom strip
+     * (taskbar reserve + popup headroom) is backed (see PANEL_POPUP_MAX).
+     * The desktop task renders chrome into it; only the taskbar strip + open
+     * popup are ever composited from it.  If it OOMs we run without a panel. */
+    spin_lock_init(&panel_lock);
+    {
+        int reserve = fbsurf.h - work_h;                    /* bottom_reserve */
+        int strip_h = reserve + PANEL_POPUP_MAX;
+        if (strip_h > fbsurf.h) strip_h = fbsurf.h;
+        panel_strip_top = fbsurf.h - strip_h;
+        panel_buf = (uint32_t*)kmalloc((size_t)fbsurf.w * strip_h * 4);
+        if (panel_buf) {
+            panelsurf.w      = fbsurf.w;                    /* pretend full-screen */
+            panelsurf.h      = fbsurf.h;
+            panelsurf.stride = fbsurf.w;
+            panelsurf.px     = panel_buf -
+                               (size_t)panel_strip_top * fbsurf.w;
+            panelsurf.owns_px = 0;                          /* panel_buf is the base */
+            gfx_set_clip(&panelsurf, 0, panel_strip_top, fbsurf.w, strip_h);
+            gfx_fill(&panelsurf, 0, panel_strip_top, fbsurf.w, strip_h,
+                     COL_WALL_BOT);
+            panel_ready = 1;
+        } else {
+            kprintf("gui: panel surface OOM — taskbar disabled\n");
+        }
+    }
+
     spin_lock_init(&state_lock);
     spin_lock_init(&damage_lock);
     mx = fbsurf.w / 2;
@@ -1438,16 +2059,26 @@ int gui_start(void) {
     gui_active = 1;
     vc_screen_suppress(1);
 
-    gui_window_create("shell 1", 110,  80, 560, 360);
-    gui_window_create("shell 2", 430, 300, 560, 360);
-
+    /* Input hooks first, so the compositor + desktop see events immediately. */
     mouse_set_listener(gui_mouse);
     vc_set_kbd_hook(gui_kbd_hook);
     vc_set_raw_kbd_hook(gui_raw_key);       /* Alt-Tab */
     task_set_change_hook(gui_task_change_hook);  /* M22.4: taskman refresh */
-    gui_damage_all();
 
-    if (!task_spawn("compositor", gui_compositor_main)) {
+    /* M22.7 — the GUI is its own SESSION.  The `desktop` task is the session
+     * root; the compositor and the two starter shells hang UNDER it, not
+     * under whatever shell happened to run `gui`.  So spawn the desktop
+     * first, record its pid, and parent the rest to it — a kill_tree of the
+     * desktop then cleanly closes the whole GUI session.  (The boot shell
+     * remains only the launcher that started the session.) */
+    if (panel_ready) {
+        struct task* dt = task_spawn("desktop", desktop_main);
+        if (dt) desktop_pid = dt->pid;
+        else    kprintf("gui: desktop task spawn failed — taskbar static\n");
+    }
+
+    int sess = desktop_pid > 0 ? desktop_pid : -1;   /* session parent, or caller */
+    if (!task_spawn_under("compositor", gui_compositor_main, sess)) {
         kprintf("gui: FATAL — compositor spawn failed\n");
         vc_set_kbd_hook(NULL);
         vc_set_raw_kbd_hook(NULL);
@@ -1457,6 +2088,12 @@ int gui_start(void) {
         gui_active = 0;
         return -1;
     }
+
+    /* M22.7 — no auto-started shells: the GUI comes up as a clean desktop
+     * (wallpaper + taskbar).  The user opens a terminal when they want one,
+     * from Start → "New Shell" (session) or "Detached Shell".  Zero windows
+     * is a supported state — focus is simply NULL until one is opened. */
+    gui_damage_all();
 
     kprintf("gui: up — %dx%d, %d windows, shell '%s', %d apps registered\n",
             fbsurf.w, fbsurf.h, zcount,
