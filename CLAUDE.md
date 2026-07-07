@@ -101,7 +101,37 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
 - **M21** — aarch64 port.  Third arch, real torture test of HAL
   portability (no port I/O, GIC instead of APIC, EL1/EL0 instead
-  of rings).
+  of rings).  🚧 **Phase A–H shipped** (2026-07-07, DOCS §4.17) —
+  boot→shell + ramfs + SMP + virtio-blk + exFAT + DTB on ARM64:
+  A = raw-ELF boot on QEMU `-M virt` (no GRUB/multiboot), EL2→EL1 drop,
+  PL011 UART, EL1 exception vectors, MMU identity map on;
+  B = GICv2 (GICD 0x08000000 / GICC 0x08010000) + ARM generic timer
+  (CNTP, INTID 30) + IRQ dispatch API;
+  C = context switch (switch.S over x19–x30) + full hal_arch.c
+  (DAIF/wfi) + PMM/kmalloc (stock pmm/slab/kmalloc; synthesised RAM map;
+  BUDDY_MAX_FRAMES 4 GiB cap) + PL011 console sink + the stock
+  preemptive scheduler (task/percpu/lock with UP stubs);
+  D = interactive serial shell (`serial_shell.c` REPL on a scheduler
+  task, PL011 RX poll+yield) + VFS + ramfs (stock vfs/ramfs/block/module)
+  — ls/cat/mkdir/write/rm/ps/meminfo work over the UART;
+  E = SMP via PSCI (`smp.c` + `smp_entry.S`) — secondary cores join the
+  STOCK per-CPU runqueue + load balancer (percpu topology hook =
+  MPIDR.Aff0; per-CPU mmu/gic/timer bring-up); verified two hogs running
+  on two cores in parallel (`AARCH64_MAX_CPUS`+`-smp`, shipped at 2);
+  F = virtio-MMIO block driver (`virtio_mmio_blk.c`, modern/version-2
+  transport) → `/dev/vda` on the stock block layer; write→read self-test
+  + shell `blk` command (needs `-global virtio-mmio.force-legacy=false`);
+  G = exFAT at /mnt off /dev/vda — the STOCK block_cache.c + exfat.c link
+  unchanged (arch-independent); shell ls/cat/write/rm hit persistent disk,
+  writes survive a reboot;
+  H = device-tree (FDT/DTB) parsing (`dtb.c`) — discovers RAM size + CPU
+  count, sizes the PMM to the actual `-m` (DTB loaded at 0x48000000 via
+  `-device loader`; falls back to defaults).  aarch64 runs its OWN
+  `main_entry.c` bring-up (NOT the x86-coupled kernel_main) and links only
+  the portable core slice.  Builds via a separate `Dockerfile.aarch64`
+  (cross toolchain conflicts with gcc-multilib).  Next (Phase I+): the
+  *same* framebuffer shell.c — needs the VC/framebuffer + GUI + block/USB +
+  usermode ports — plus EL0/userspace, GUI.
 - **M23** — Audio (AC97 → HDA → I2S).
 - **M24** — Network (NIC → IP/UDP/TCP → sockets).
 - **§M19.5.1 i386 kmap** — the deferred half of HIGHMEM: real

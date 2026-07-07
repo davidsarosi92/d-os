@@ -2017,6 +2017,247 @@ item launches an app as its own host, no fault.
 
 ---
 
+### 4.17 ARM64 (AArch64) port — Phase A bring-up (M21)
+
+The third architecture, and the real HAL-portability torture test: no
+port I/O (every device is MMIO), a GIC instead of the APIC, and
+exception levels (EL1 kernel / EL0 user) instead of privilege rings.
+Like the x86_64 port (M20 → M20.6), it lands in phases; **Phase A** is
+the boot + arch-essentials foundation.
+
+**Boot model — nothing like the x86 ports.**  There is no GRUB and no
+multiboot.  QEMU's `-M virt` machine loads the raw kernel ELF via
+`-kernel`, copies its PT_LOAD segments to physical RAM (`virt` RAM base
+= 0x40000000), and jumps to the ELF entry with the MMU off, caches
+cold, at EL1 (or EL2 with `virtualization=on`).  `linker-aarch64.ld`
+links at **0x40080000** (just above the RAM base; the low 512 KiB is
+left for QEMU's boot shim + DTB) and exports `__bss_start/__bss_end`
+and `__stack_top` for the assembler.
+
+**Files (`kernel/hal/aarch64/`):**
+
+| File | Role |
+|------|------|
+| `boot.S` | Reset entry `_start`.  Reads `CurrentEL`; if EL2, sets `HCR_EL2.RW`=1 (EL1 is AArch64), grants EL1 the arch timer (`CNTHCTL_EL2` bits 0–1, `CNTVOFF_EL2`=0), loads an MMU-off `SCTLR_EL1` (0x30d00800, RES1 bits set), and `eret`s to EL1h.  Then SP←`__stack_top`, zeroes `.bss`, `bl aarch64_main_entry(dtb)`. |
+| `uart.c` | PL011 UART at MMIO 0x09000000 — dependency-free polled console (ARM analogue of the x86 boot.s inline COM1 print).  `uart_early_{putc,puts,puthex}`.  No baud/line-control setup — QEMU's chardev ignores it, same as the x86 COM1 trick. |
+| `vectors.S` | The architecturally-fixed EL1 vector table: one 2 KiB-aligned block of 16 × 128-byte slots (4 groups {Sync,IRQ,FIQ,SError} × {SP0, SPx, lower-EL64, lower-EL32}).  Each slot saves a 272-byte trapframe (x0–x30 + ELR_EL1 + SPSR_EL1) and tail-calls the C dispatcher. |
+| `exceptions.c` | Installs the table into `VBAR_EL1`; the dispatcher dumps ESR_EL1/FAR_EL1/ELR + halts on Sync/SError, and routes IRQ to a **weak** `aarch64_irq_dispatch` hook (Phase B fills it in). |
+| `mmu.c` | Stage-1 identity map.  4 KiB granule, 39-bit VA (`TCR_EL1.T0SZ`=25) so the TTBR0 walk starts at level 1, where each entry is a **1 GiB block** — a single 512-entry L1 table maps everything with no lower levels.  Index 0 = Device-nGnRnE (peripheral window: UART + GIC), 1..3 = Normal WB inner-shareable RAM.  `MAIR_EL1` slot 0 = 0x00 (device), slot 1 = 0xFF (normal WB).  Then `SCTLR_EL1.{M,C,I}` turn the MMU + caches on. |
+| `gic.c` | **(Phase B)** GICv2 driver — distributor (GICD @0x08000000) + CPU interface (GICC @0x08010000).  `gic_init`, `gic_enable_irq`, `gic_register_handler`, and the strong `aarch64_irq_dispatch` (ack→dispatch→EOI).  The ARM half of the IRQ-install API (replaces the x86 IOAPIC routing). |
+| `timer.c` | **(Phase B)** ARM architected generic timer — the non-secure EL1 physical timer (CNTP_*), INTID 30 on `virt`.  `timer_init(hz)` arms + starts it; the ISR re-arms per interrupt (no auto-reload reg) and bumps a monotonic tick.  `timer_ticks{,_ms}()`, `timer_raw_count()` (CNTPCT — the TSC analogue). |
+| `switch.S` | **(Phase C)** `context_switch(save_sp, new_sp)` — pushes the 12 AAPCS64 callee-saved regs (x19–x30), swaps SP, pops, `ret` to the restored LR.  The ARM analogue of the x86 switch.s. |
+| `task_arch.c` | **(Phase C)** `hal_task_init_stack` — synthesises a brand-new task's stack frame (LR = `task_trampoline`, x19 = entry) matching switch.S's layout; the trampoline recovers x19, releases the first-switch lock, unmasks IRQs, runs entry. |
+| `hal_arch.c` | **(Phase C)** the arch-independent HAL (hal_api.h): `hal_intr_*` via PSTATE.DAIF, `hal_cpu_*` via wfi/yield, `hal_arch_early_init` (= exceptions + MMU), `hal_extend_identity_map`, `hal_syscall_exit_to_kernel` placeholder. |
+| `stubs.c` | **(Phase C)** UP glue so the stock core links: single-CPU `lapic_id`/`acpi_*`/`smp_*` stubs, a synthesised `struct mboot_info` + AVAILABLE mmap entry for the `virt` RAM (so pmm.c's mmap walk works), and the PL011 `console_sink` registration (kprintf → serial). |
+| `lib.c` | **(Phase C)** freestanding `mem{set,cpy,move,cmp}` (gcc emits calls to these on ARM) + a `__getauxval` stub for libgcc's LSE-atomics init. |
+| `serial_shell.c` | **(Phase D)** the interactive REPL — runs as a scheduler task, reads lines from the PL011 (poll + task_yield), and drives the portable services: help/echo/clear, meminfo/free (PMM), uptime, ps, and the ramfs (ls/cat/mkdir/write/rm). |
+| `smp.c` + `smp_entry.S` | **(Phase E)** SMP via PSCI — `PSCI_CPU_ON` HVC starts each secondary core (`smp_entry.S` trampoline → `smp_secondary_main`: MMU on, VBAR, `gic_cpu_init`, `percpu_init_ap`, `task_install_ap_idle`, own timer).  Provides the percpu.c topology hooks (`lapic_id` = MPIDR.Aff0) + a GIC-SGI `smp_send_reschedule`. |
+| `virtio_mmio_blk.c` | **(Phase F)** virtio-blk over the virtio-MMIO transport (modern/version-2): slot scan, feature negotiation, one split virtqueue, polled 512-byte sector read/write; registers `/dev/vda` with the stock block layer.  The ARM counterpart of the PCI `virtio_blk.c` (no port I/O). |
+| *(no new arch file)* | **(Phase G)** exFAT — the stock `block_cache.c` + `fs/exfat.c` link + run unchanged (arch-independent); `main_entry` runs `bcache_init()` + `vfs_mount("exfat", "/mnt", "vda")`.  The shell's ls/cat/write/rm then hit real, persistent disk under /mnt. |
+| `dtb.c` | **(Phase H)** minimal big-endian FDT/device-tree parser — locates the DTB (x0 → fixed load addr → RAM scan) and extracts the `/memory` reg (RAM base+size) + `/cpus/cpu@*` count.  `dtb_ram_size()` then drives the PMM map size (stubs.c) instead of a hard-coded constant. |
+| `main_entry.c` | Own bring-up (aarch64 does NOT share the x86-coupled `kernel_main`): banner + EL report, `hal_arch_early_init()` **(A)**, serial console + PMM + kmalloc + `task_init()` **(C)**, `gic_init()` + `timer_init(100)` **(B)**, a quick preemption check **(C)**, then `vfs_init()` + `module_init_all()` (ramfs at /) and spawns the serial shell **(D)**; pid 0 → idle. |
+
+**Build.**  A separate `Dockerfile.aarch64` image carries the
+`aarch64-linux-gnu` cross toolchain — Ubuntu's cross gcc declares a
+hard `Conflicts:` against `gcc-multilib` (needed for the i386 `-m32`
+build), so the two cannot share one image.  The Makefile `ARCH=aarch64`
+branch uses the cross gcc/ld, `-mgeneral-regs-only` (no FP/NEON — we
+don't save the SIMD file, mirroring x86_64 `-mno-sse`), and assembles
+`.S` through the C compiler (cpp + gas, no nasm).  `scripts/build.sh`
+picks the aarch64 image + the `kernel` target (raw ELF, no ISO);
+`scripts/run_qemu.sh` boots `-M virt -cpu cortex-a72 -nographic
+-kernel build/aarch64/kernel.bin`.
+
+**Phase B — interrupt controller + periodic timer.**  The ARM analogue
+of the x86 IOAPIC + PIT/LAPIC-timer:
+- **`gic.c` — GICv2.**  Two banks: the global *distributor* (enable /
+  priority / CPU-target / config per INTID) and the per-CPU *CPU
+  interface* (priority mask + the IAR/EOIR ack handshake).  INTID
+  ranges: 0–15 SGIs (IPIs), 16–31 PPIs (per-CPU, banked), 32+ SPIs
+  (shared).  `gic_init` enables the CPU-IF (PMR=0xF0 all-pass) + the
+  distributor; `gic_enable_irq(intid)` unmasks a line; the strong
+  `aarch64_irq_dispatch` reads GICC_IAR → runs the handler → writes
+  GICC_EOIR.  This is the ARM half of the "IRQ install API".
+- **`timer.c` — generic timer.**  System-register timer (no MMIO):
+  CNTFRQ_EL0 (rate, 62.5 MHz on `virt`), CNTPCT_EL0 (free-running
+  counter), CNTP_TVAL_EL0 (down-counter, fires at 0), CNTP_CTL_EL0
+  (enable/mask).  We use the NS EL1 physical timer → `virt` PPI 14 =
+  INTID 30 (EL1 access was granted in boot.S).  No auto-reload register,
+  so the ISR rearms TVAL each interrupt — the standard architected-timer
+  tick.  A monotonic `tick_count` is the Phase-C scheduler quantum base.
+- **IRQ unmask** = `msr daifclr, #2` (the `sti` analogue).
+- **`run_qemu.sh`** pins `-M virt,gic-version=2` so the hard-coded GIC
+  MMIO layout always matches (newer QEMU may default the board to v3).
+
+**Verified (serial log):**
+```
+=== d-os AArch64 (M21 Phase A+B) ===
+aarch64: booted at EL1
+aarch64: exception vectors installed (VBAR_EL1)
+aarch64: MMU + caches enabled (identity map)
+aarch64: RAM read-back = 0xd05cafe5d05cafe5  [OK]
+aarch64: GICv2 initialised (GICD @0x08000000, GICC @0x08010000)
+aarch64: generic timer armed (CNTP, INTID 30)
+aarch64: timer tick milestone = 0x...0064   (1 s)
+aarch64: timer tick milestone = 0x...00c8   (2 s)
+aarch64: timer tick milestone = 0x...012c   (3 s)
+aarch64: timer self-test PASS (300 periodic IRQs).
+```
+The post-MMU read-back proves the identity map + cache attributes; the
+tick milestones prove the full IRQ path (GIC delivery → EL1 IRQ vector
+→ dispatcher → timer ISR → EOI) fires periodically with no fault.
+
+**Phase C — preemptive scheduler + memory manager.**  The kernel's heart
+on ARM.  aarch64 runs its OWN bring-up (`main_entry.c`) rather than the
+x86-coupled shared `kernel_main`, calling the *portable* core directly:
+- **Context switch** (`switch.S` + `task_arch.c`) over the 12 AAPCS64
+  callee-saved registers; a brand-new task's frame carries LR =
+  `task_trampoline`, x19 = entry.
+- **Full HAL** (`hal_arch.c`) — DAIF-based interrupt masking, wfi/yield
+  CPU control, identity-map hook.
+- **Memory** — the stock `pmm.c`/`slab.c`/`kmalloc.c` run unchanged, on
+  two enablers: `BUDDY_MAX_FRAMES` at the 4 GiB cap for aarch64 (RAM is
+  at pfn 0x40000, past the 1 GiB cap) and a synthesised multiboot mmap
+  (`stubs.c`) for the `virt` RAM so the mmap-walking pmm needs no ARM
+  awareness.
+- **Scheduler** — the stock `task.c`/`percpu.c`/`lock.c` link with UP
+  stubs (`lapic_id`→0, `acpi_*`→1-CPU, `smp_*`→no-op).  The timer ISR
+  calls `schedule_request`; the GIC IRQ-exit calls `schedule_check`.
+- **Freestanding libc** (`lib.c`) — `mem*` + `__getauxval`; built with
+  `-mno-outline-atomics -fno-tree-loop-distribute-patterns`.
+
+**Verified (serial log):**
+```
+pmm: buddy ready — ... NORMAL managed=64976 free=64976 (253 MiB total free)
+kmalloc: slab + page_alloc backend ready
+aarch64: kmalloc self-test a=0x402b03e8 b=0x402b03a8 c=0x402b03e8 [reuse=yes]
+task: pid 0 (kernel) installed
+aarch64: spawning two never-yielding hog tasks...
+aarch64: hogA=501036773 hogB=509458588
+aarch64: scheduler self-test PASS (both tasks ran — timer preemption works).
+```
+Both never-yielding hogs making ≈equal progress proves the timer IRQ
+preempts and the context switch is correct.
+
+**Phase D — interactive serial shell + filesystem.**  The x86 `shell.c`
+reads from a framebuffer VC and its commands are welded to x86-only /
+not-yet-ported subsystems (GUI/VC, ring-3 usermode, vmm.c, block/USB),
+so a dedicated **serial shell** is brought up instead:
+- **`uart.c` `uart_early_getchar`** — non-blocking PL011 RX; the shell
+  polls + `task_yield()`s while idle (timer preemption stays live).
+- **`serial_shell.c`** — a REPL on an ordinary scheduler task driving the
+  portable services: `help`/`echo`/`clear`, `meminfo`/`free` (PMM stats),
+  `uptime`, `ps` (task_for_each), and the ramfs (`ls`/`cat`/`mkdir`/
+  `write`/`rm`).
+- **VFS + ramfs** — the stock `vfs.c` + `ramfs.c` (+ `block.c` for symbol
+  closure, `module.c` for the registry) link unchanged; `vfs_init()` +
+  `module_init_all()` mount ramfs at `/`.
+
+**Verified (scripted REPL over the UART):**
+```
+d-os> ls /
+  mnt/  proc/  tmp/  dev/  etc/
+d-os> mkdir /foo → write /foo/a.txt hello-from-arm64 → ls /foo
+  a.txt
+d-os> cat /foo/a.txt
+hello-from-arm64
+d-os> ps        (shell = current pid, + idle + kernel)
+d-os> meminfo   memory: ... free 259856 KiB
+```
+
+**Phase E — SMP via PSCI.**  The torture test of the "SMP-ready on UP"
+abstraction on a third arch: the STOCK per-CPU runqueue + load balancer +
+`percpu.c` now drive secondary cores on ARM.
+- **`smp.c`** — `PSCI_CPU_ON` (HVC to QEMU's emulated PSCI) starts each
+  secondary vCPU; no INIT-SIPI-SIPI / no low-memory trampoline.  Provides
+  the percpu.c topology hooks (`lapic_id` = MPIDR.Aff0, linear ACPI
+  topology) so the stock apic_id→index map works, and a GIC-SGI
+  `smp_send_reschedule`.
+- **`smp_entry.S`** — the secondary entry: MMU-off SCTLR, per-CPU stack
+  from `ap_sp[]`, call `smp_secondary_main(cpu)`.
+- **`smp_secondary_main`** — MMU on FIRST (cache coherency before any
+  lock), VBAR, `gic_cpu_init` (banked GICC + PPIs are per-CPU),
+  `percpu_init_ap` + `task_install_ap_idle`, own generic timer.
+- Enablers: `mmu.c` split into build-once + `mmu_enable_this_cpu`; `gic.c`
+  split out `gic_cpu_init`.  Configurable via `AARCH64_MAX_CPUS` + `-smp`.
+
+**Verified (serial log):**
+```
+percpu: 2 CPUs known, BSP at slot 0 (apic_id=0)
+aarch64: secondary CPU 1 online
+aarch64: SMP — 2 CPU(s) online
+aarch64: preemption OK (hogA=... on CPU1, hogB=... on CPU0)
+aarch64: parallelism PASS (2 CPUs online; hogs on CPU1 + CPU0)
+```
+Two never-yielding hogs ending up on two DIFFERENT cores proves genuine
+parallel execution driven by the stock load balancer.
+
+**Phase F — virtio-MMIO block device.**  The ARM proof of "every device is
+MMIO": the PCI `virtio_blk.c` is meaningless here, so `virtio_mmio_blk.c` is
+a fresh driver for QEMU `virt`'s virtio-MMIO transport (32 slots at
+0x0a00_0000).  It runs the modern (version-2) init handshake, sets up one
+split virtqueue (desc/avail/used via the Desc/Driver/Device Low/High
+registers), and does polled synchronous 512-byte sector read/write
+(3-descriptor requests).  Registers `/dev/vda` with the stock block layer,
+so nothing downstream knows the transport is MMIO.  Requires
+`-global virtio-mmio.force-legacy=false` (QEMU `virt` defaults to legacy) +
+a `-device virtio-blk-device`.
+
+**Verified (serial log):** `/dev/vda ready (8192 sectors, 4 MiB)`; a
+write→read round-trip PASSes on sector 100; the shell's `blk 0` hexdumps the
+on-disk bytes:
+```
+  00: 00 00 00 44 2d 4f 53 2d 41 52 4d 36 34 2d 44 49  ...D-OS-ARM64-DI
+  10: 53 4b 2d 53 45 43 54 4f 52 30 2d 48 45 4c 4c 4f  SK-SECTOR0-HELLO
+```
+
+**Phase G — exFAT on /dev/vda (persistent storage).**  The stock
+`block_cache.c` + `fs/exfat.c` are arch-independent (exfat.c carries its own
+`memcpy_`/`memset_`; no RTC/port-I/O), so they link + run unchanged — the
+payoff of a portable fs layer.  `main_entry` runs `bcache_init()` +
+`vfs_mount("exfat", "/mnt", "vda")`; the serial shell's ls/cat/write/rm then
+operate on real disk under `/mnt`.  Test images are `mkfs.exfat`'d in the x86
+build image (exfatprogs) and attached as the virtio-blk disk — no `-boot d`
+gotcha, since the ARM `-kernel` path is not BIOS-based.
+
+**Verified (serial log + reboot):**
+```
+exfat: mounted dev=vda clusters=7680 bps=512 spc=8 root=5 bitmap=2
+d-os> write /mnt/hello.txt hi-from-arm-exfat   → wrote 18 bytes
+d-os> ls /mnt                                  →  hello.txt
+d-os> cat /mnt/hello.txt                        → hi-from-arm-exfat
+--- fresh boot, same disk ---
+d-os> cat /mnt/hello.txt                        → hi-from-arm-exfat   (persisted!)
+```
+Full chain end-to-end: virtio-MMIO → block cache → exFAT → VFS → shell, with
+writes surviving a reboot.
+
+**Phase H — device-tree (FDT/DTB) discovery.**  ARM has no BIOS/ACPI
+enumeration; firmware hands over a device tree.  `dtb.c` is a minimal
+big-endian FDT parser that walks the structure block for the `/memory` node's
+`reg` (RAM base + size) and counts `/cpus/cpu@*` nodes.  QEMU's direct-ELF
+`-kernel` entry provides neither an x0 pointer nor an in-memory DTB, so the
+run script loads one at a fixed address (`-device loader,addr=0x48000000`,
+generated per config via `-machine dumpdtb`); `fdt_find` checks x0 → that
+address → a RAM scan.  `aarch64_boot_meminfo_init` then sizes the PMM map to
+the DTB-discovered RAM instead of the baked-in 256 MiB, with a fallback.
+
+**Verified (serial log):** with `-m 512M -smp 4` + the loaded DTB:
+```
+dtb: found @ 0x48000000 — RAM 512 MiB @ 0x40000000, 4 CPU(s)
+pmm: buddy ready — ... 509 MiB total free
+```
+vs. no DTB → `dtb: no device tree found (using built-in defaults)` → 253 MiB.
+The kernel adapts to the actual machine config.
+
+**Not yet (Phase I+):** the *same* framebuffer `shell.c` + same commands
+(needs the VC/framebuffer + GUI + block/USB + usermode ports), EL0 userspace,
+GUI.  The aarch64 build links only the portable slice it needs so far
+(printf/console, lock/percpu, pmm/slab/kmalloc, task, module, block,
+block_cache, vfs, ramfs, exfat, + the arch drivers).
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -2086,6 +2327,127 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 ---
 
 ## 8. Change log
+
+- **2026-07-07 — M21 Phase H: device-tree (FDT/DTB) discovery on ARM64.**
+  The kernel now discovers the machine instead of hard-coding it.  `dtb.c` is
+  a minimal big-endian FDT parser: it locates the DTB (x0 → a fixed load
+  address → RAM scan) and extracts the `/memory` reg (RAM base + size) + a
+  `/cpus/cpu@*` count.  `aarch64_boot_meminfo_init` (stubs.c) then sizes the
+  PMM map to the discovered RAM instead of the baked-in 256 MiB.  QEMU's
+  direct-ELF `-kernel` entry passes no DTB, so run_qemu.sh loads one at
+  0x48000000 (`-device loader`, generated per config via `-machine dumpdtb`).
+  Verified: with `-m 512M -smp 4` + DTB, `dtb: found ... RAM 512 MiB ... 4
+  CPU(s)` and the PMM comes up with 509 MiB free; without a DTB it falls back
+  to 253 MiB.  See §4.17.
+
+- **2026-07-07 — M21 Phase G: exFAT persistent storage on ARM64.**  The stock
+  `block_cache.c` + `fs/exfat.c` link + run unchanged on aarch64 (both are
+  arch-independent — exfat.c even carries its own mem helpers), so mounting a
+  real filesystem on the virtio-blk disk needed no new arch code: `main_entry`
+  calls `bcache_init()` + `vfs_mount("exfat", "/mnt", "vda")`.  The serial
+  shell's ls/cat/write/rm then operate on real disk under /mnt.  Verified:
+  `exfat: mounted dev=vda clusters=7680`; `write /mnt/hello.txt` → `ls /mnt`
+  shows it → `cat` reads it; and on a FRESH boot with the same disk image
+  `cat /mnt/hello.txt` still returns the content — the write persisted across
+  a reboot.  Full chain: virtio-MMIO → block cache → exFAT → VFS → shell.  Test
+  images are mkfs.exfat'd in the x86 build image (exfatprogs).  See §4.17.
+
+- **2026-07-07 — M21 Phase F: virtio-MMIO block device on ARM64.**  A real
+  disk on `/dev/vda`.  The PCI `virtio_blk.c` speaks virtio over port I/O
+  (meaningless on ARM), so `virtio_mmio_blk.c` is a fresh driver for QEMU
+  `virt`'s virtio-MMIO transport: scan the 32 slots (0x0a00_0000) for a block
+  device, run the modern version-2 init handshake, set up one split virtqueue
+  (Desc/Driver/Device Low/High registers), and do polled 512-byte sector
+  read/write (3-descriptor requests).  Registers with the stock block layer so
+  vfs/exfat/the shell see a normal device.  `main_entry` runs a write→read
+  self-test; the serial shell gains `blk [lba]` (sector hexdump).  Needs
+  `-global virtio-mmio.force-legacy=false` (QEMU `virt` defaults its
+  virtio-mmio to legacy/v1) + `-device virtio-blk-device` (wired into
+  run_qemu.sh, disk optional).  Verified: `/dev/vda ready (8192 sectors)`,
+  write→read self-test PASS on sector 100, and `blk 0` hexdumps the on-disk
+  string — real DMA end-to-end.  See §4.17.
+
+- **2026-07-07 — M21 Phase E: SMP via PSCI on ARM64.**  The stock per-CPU
+  runqueue + load balancer + percpu.c now drive secondary cores on a third
+  arch.  `smp.c` starts each secondary with a `PSCI_CPU_ON` HVC (QEMU's
+  emulated PSCI) — no INIT-SIPI-SIPI, no low-memory trampoline; `smp_entry.S`
+  is the MMU-off entry (per-CPU stack from `ap_sp[]` → `smp_secondary_main`),
+  which turns the MMU on first (coherency), sets VBAR, brings up the per-CPU
+  GIC interface + timer, and joins the scheduler as its core's idle task.
+  `mmu.c`/`gic.c` gained per-CPU `mmu_enable_this_cpu`/`gic_cpu_init` helpers;
+  percpu topology hooks map `lapic_id` → MPIDR.Aff0; cross-CPU kick is a GIC
+  SGI.  Verified: `percpu: 2 CPUs known`, `secondary CPU 1 online`, and two
+  never-yielding hog tasks run on CPU1 + CPU0 in parallel (`parallelism
+  PASS`).  Configurable via `AARCH64_MAX_CPUS` + `-smp` (shipped at 2).
+  See §4.17.
+
+- **2026-07-07 — M21 Phase D: interactive serial shell + ramfs on ARM64.**
+  An interactive REPL with a real filesystem now runs on aarch64.  The x86
+  `shell.c` is welded to the framebuffer VC + GUI + block/USB + ring-3
+  usermode (all x86-only or not-yet-ported), so a dedicated serial shell is
+  brought up: `uart.c` gains a non-blocking PL011 RX (`uart_early_getchar`);
+  `serial_shell.c` is a REPL on an ordinary scheduler task (poll + task_yield
+  for input) driving the portable services — help/echo/clear, meminfo/free,
+  uptime, ps, and the ramfs (ls/cat/mkdir/write/rm).  The stock
+  `vfs.c`/`ramfs.c` (+ `block.c`/`module.c`) link unchanged; `vfs_init()` +
+  `module_init_all()` mount ramfs at `/`.  Verified over the UART: `ls /`
+  shows the ramfs skeleton, mkdir/write/ls/cat/rm round-trip a file, `ps`
+  lists the tasks, `meminfo` reports 253 MiB free — no fault.  (Reaching the
+  *same* framebuffer shell.c is Phase E+, gated on the VC/GUI/driver ports.)
+  See §4.17.
+
+- **2026-07-07 — M21 Phase C: preemptive scheduler + memory manager on
+  ARM64.**  The kernel's heart comes up on aarch64.  Rather than porting
+  the x86-coupled shared `kernel_main`, aarch64 runs its own bring-up
+  (`main_entry.c`) calling the portable core directly.  New arch files:
+  `switch.S` (context switch over x19–x30), `task_arch.c`
+  (`hal_task_init_stack` + trampoline), `hal_arch.c` (full hal_api:
+  DAIF interrupt masking, wfi/yield, identity-map hook), `stubs.c`
+  (single-CPU lapic/acpi/smp stubs + a synthesised multiboot RAM map +
+  PL011 console-sink registration), `lib.c` (freestanding mem* +
+  `__getauxval`).  The stock `pmm.c`/`slab.c`/`kmalloc.c`/`task.c`/
+  `percpu.c`/`lock.c`/`console.c`/`printf.c` now link + run unchanged;
+  `BUDDY_MAX_FRAMES` gained the 4 GiB cap for aarch64 (RAM at pfn
+  0x40000).  The timer ISR drives preemption (schedule_request →
+  gic schedule_check → schedule → context_switch).  Build: aarch64
+  CFLAGS gained `-mno-outline-atomics -fno-tree-loop-distribute-patterns`.
+  Verified on serial: 253 MiB RAM managed, kmalloc reuse works, two
+  never-yielding hog tasks BOTH progress (≈501M vs ≈509M) — timer
+  preemption + context switch correct, PASS, no fault.  See §4.17.
+
+- **2026-07-07 — M21 Phase B: GICv2 + ARM generic timer.**  The ARM
+  interrupt path — analogue of the x86 IOAPIC + PIT.  `gic.c` drives the
+  GICv2 distributor (0x08000000) + CPU interface (0x08010000):
+  `gic_init` / `gic_enable_irq` / `gic_register_handler`, and the strong
+  `aarch64_irq_dispatch` (override of the Phase-A weak stub) does the
+  GICC_IAR→handler→GICC_EOIR handshake.  `timer.c` drives the NS EL1
+  physical generic timer (CNTP_*, INTID 30 on `virt`): arm TVAL, enable
+  CTL, re-arm per IRQ (no auto-reload), monotonic `tick_count` +
+  `timer_ticks_ms()` + CNTPCT raw counter.  IRQs unmasked with `msr
+  daifclr,#2`.  `run_qemu.sh` pins `-M virt,gic-version=2`.  Verified on
+  serial: GIC init + timer arm, 1/2/3 s tick milestones, PASS after 300
+  periodic IRQs — full path with no fault.  See §4.17.
+
+- **2026-07-07 — M21 Phase A: ARM64 (AArch64) boot bring-up.**  The
+  third architecture starts landing, phased like x86_64 (M20 → M20.6).
+  Phase A is the foundation: raw-ELF boot on `qemu-system-aarch64 -M
+  virt -cpu cortex-a72` (no GRUB / no multiboot — QEMU's `-kernel`
+  loads the ELF at the `virt` RAM base 0x40000000, linked at
+  0x40080000).  `boot.S` drops EL2→EL1 if needed, sets SP, zeroes
+  `.bss`, calls C.  A PL011 UART (`uart.c`, MMIO 0x09000000) is the
+  early console; the EL1 exception vector table (`vectors.S` +
+  `exceptions.c`) goes into VBAR_EL1 (trapframe save + ESR/FAR dump on
+  faults, weak IRQ hook for Phase B); `mmu.c` turns the MMU + caches on
+  with a coarse 1 GiB-block identity map (device window + Normal RAM).
+  Build: separate `Dockerfile.aarch64` (the cross toolchain conflicts
+  with gcc-multilib), Makefile `ARCH=aarch64` branch (GNU-as `.S` via
+  the cross gcc, no nasm), aarch64 paths in `scripts/{build,run_qemu}.sh`.
+  Verified on serial: boots at EL1, installs VBAR_EL1, enables the MMU,
+  post-MMU Normal-cached RAM read-back returns the sentinel.  Bug hit +
+  fixed during bring-up: `exceptions.c` and the original `exceptions.S`
+  both produced `exceptions.o` (mirror-path object tree) → the asm
+  object was overwritten and `vector_table` went undefined at link; the
+  assembler half is now `vectors.S`.  See §4.17.
 
 - **2026-07-05 — M22.7: damage as a rect LIST (cursor-hitch fix).**  The
   compositor tracked damage as a single bounding box, so a Task Manager

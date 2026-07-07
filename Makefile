@@ -117,8 +117,62 @@ else ifeq ($(ARCH),x86_64)
 
   ARCH_EXTRA_OBJS := kernel/hal/x86_64/ap_trampoline_blob.o
 
+else ifeq ($(ARCH),aarch64)
+  # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
+  # device is MMIO), GIC instead of APIC, exception levels (EL1/EL0) instead
+  # of rings, and a raw-ELF boot handed straight to QEMU `-M virt -kernel`
+  # (no GRUB / no multiboot).  Uses the aarch64-linux-gnu cross toolchain
+  # from the Dockerfile; assembly is GNU `as` syntax (.S, run through the C
+  # compiler for cpp + gas), NOT nasm.
+  #
+  # -mgeneral-regs-only: never emit FP/NEON — we do not save the SIMD/FP
+  #   register file on exception entry or context switch (mirrors the x86_64
+  #   -mno-sse decision).
+  CROSS   := aarch64-linux-gnu-
+  CC      := $(CROSS)gcc
+  LD      := $(CROSS)ld
+  # -mno-outline-atomics: emit atomics inline instead of via libgcc's runtime
+  #   LSE-detection helpers, which pull in glibc's __getauxval (unavailable
+  #   freestanding).
+  # -fno-tree-loop-distribute-patterns: stop gcc turning the hand-written
+  #   memset/memcpy loops in lib.c into calls to themselves (infinite
+  #   recursion) — the standard freestanding-libc footgun.
+  CFLAGS  := -mgeneral-regs-only -mno-outline-atomics \
+             -fno-tree-loop-distribute-patterns $(COMMON_CFLAGS)
+  LINKER_SCRIPT := linker-aarch64.ld
+  LDFLAGS := -T $(LINKER_SCRIPT) -nostdlib
+  LIBGCC  := $(shell $(CC) -print-libgcc-file-name)
+  QEMU    := qemu-system-aarch64
+
+  # AArch64 HAL implementation.  Phase A = boot + UART + exception vectors +
+  # MMU identity map (enough to reach a C entry with the MMU on).  Later
+  # phases add the GIC, generic timer, context switch, and the console/shell.
+  ARCH_C_SRCS := \
+      kernel/hal/aarch64/uart.c \
+      kernel/hal/aarch64/exceptions.c \
+      kernel/hal/aarch64/mmu.c \
+      kernel/hal/aarch64/gic.c \
+      kernel/hal/aarch64/timer.c \
+      kernel/hal/aarch64/hal_arch.c \
+      kernel/hal/aarch64/task_arch.c \
+      kernel/hal/aarch64/stubs.c \
+      kernel/hal/aarch64/lib.c \
+      kernel/hal/aarch64/smp.c \
+      kernel/hal/aarch64/virtio_mmio_blk.c \
+      kernel/hal/aarch64/dtb.c \
+      kernel/hal/aarch64/serial_shell.c \
+      kernel/hal/aarch64/main_entry.c
+
+  ARCH_ASM_SRCS := \
+      kernel/hal/aarch64/boot.S \
+      kernel/hal/aarch64/vectors.S \
+      kernel/hal/aarch64/switch.S \
+      kernel/hal/aarch64/smp_entry.S
+
+  ARCH_EXTRA_OBJS :=
+
 else
-  $(error Unsupported ARCH "$(ARCH)" — supported: i386, x86_64)
+  $(error Unsupported ARCH "$(ARCH)" — supported: i386, x86_64, aarch64)
 endif
 
 # -----------------------------------------------------------------------------
@@ -187,6 +241,31 @@ CORE_C_SRCS := \
     kernel/mem/pmm.c \
     kernel/mem/kmalloc.c \
     kernel/mem/slab.c
+else ifeq ($(ARCH),aarch64)
+# M21 Phase C+D: the AArch64 build links the PORTABLE slice of the core it
+# needs — printf/console (serial out), spinlocks + per-CPU, the PMM/slab/
+# kmalloc heap, the preemptive scheduler (C), and the module registry + VFS +
+# ramfs for the interactive serial shell (D).  It deliberately does NOT pull
+# the x86-coupled shell.c (welded to the framebuffer VC + GUI + block/USB +
+# usermode) or the x86-coupled kernel_main; aarch64/main_entry.c runs its own
+# bring-up and aarch64/serial_shell.c is the REPL.  This list grows as later
+# phases port more of the core.
+CORE_C_SRCS := \
+    kernel/core/printf.c \
+    kernel/core/console.c \
+    kernel/core/lock.c \
+    kernel/core/percpu.c \
+    kernel/core/multiboot.c \
+    kernel/core/module.c \
+    kernel/core/block.c \
+    kernel/core/task.c \
+    kernel/core/block_cache.c \
+    kernel/mem/pmm.c \
+    kernel/mem/slab.c \
+    kernel/mem/kmalloc.c \
+    kernel/fs/vfs.c \
+    kernel/fs/ramfs.c \
+    kernel/fs/exfat.c
 else
 # Phase 5 of M20: x86_64 path now links the full kernel core.  M20.6.2/3
 # enabled the device drivers (virtio-blk, xHCI, USB HID) and exFAT;
@@ -260,7 +339,9 @@ ASM_SRCS := $(ARCH_ASM_SRCS)
 # clearer when every object's path is obvious.
 BUILD_DIR := build/$(ARCH)
 OBJ_DIR   := $(BUILD_DIR)/obj
-OBJS      := $(addprefix $(OBJ_DIR)/,$(C_SRCS:.c=.o) $(ASM_SRCS:.s=.o)) \
+# ASM sources may be nasm `.s` (x86) or GNU-as `.S` (aarch64); map both to .o.
+ASM_OBJS  := $(patsubst %.s,%.o,$(patsubst %.S,%.o,$(ASM_SRCS)))
+OBJS      := $(addprefix $(OBJ_DIR)/,$(C_SRCS:.c=.o) $(ASM_OBJS)) \
              $(addprefix $(OBJ_DIR)/,$(ARCH_EXTRA_OBJS))
 
 KERNEL_BIN := $(BUILD_DIR)/kernel.bin
@@ -283,6 +364,12 @@ $(OBJ_DIR)/%.o: %.c
 $(OBJ_DIR)/%.o: %.s
 	@mkdir -p $(@D)
 	$(AS) $(ASFLAGS) $< -o $@
+
+# GNU-as assembly (.S) — used by the aarch64 port.  Run through the C
+# compiler so the C preprocessor + gas both apply; $(CC) is the cross gcc.
+$(OBJ_DIR)/%.o: %.S
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 # AP boot trampoline — assembled as a flat binary so `org 0x8000` works,
 # then wrapped in an ELF object via objcopy.  Each arch has its own

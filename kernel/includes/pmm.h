@@ -57,7 +57,11 @@
  * 9.2 MiB surface — acceptable for a handful of full-screen surfaces (a
  * vmalloc-style scatter mapping would remove the waste; noted for later). */
 #define BUDDY_MAX_ORDER     12
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__aarch64__)
+/* aarch64: the QEMU `virt` board places RAM at physical 0x4000_0000, so the
+ * frame descriptor array must be indexable up past pfn 0x40000 (1 GiB) — the
+ * 1 GiB cap would leave every RAM frame out of range.  The 4 GiB cap (1 MiB
+ * of page_state metadata) covers the device window + several GiB of RAM. */
 #  define BUDDY_MAX_FRAMES  (1u << 20)      /* 4 GiB cap, 1 MiB metadata */
 #else
 #  define BUDDY_MAX_FRAMES  (1u << 18)      /* 1 GiB cap, 256 KiB metadata */
