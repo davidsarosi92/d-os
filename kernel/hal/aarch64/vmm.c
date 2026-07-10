@@ -145,3 +145,116 @@ int vmm_map_4mib(uint32_t va, uint32_t pa, int flags) {
     (void)va; (void)pa; (void)flags;
     return 0;
 }
+
+/* ===========================================================================
+ * Portable per-process address-space API (M25 stage 1).
+ *
+ * aarch64 already had per-process EL0 spaces (aarch64_vmm_create / _map_user
+ * / _switch); this exposes them under the arch-neutral vmm.h names so core
+ * code (task.c scheduler, shell.c self-test, the coming ELF loader) is
+ * identical across arches.  A space is a private TTBR0 L1 table sharing the
+ * kernel's low-4-GiB identity blocks (l1[0..3]) and owning the user region
+ * at VA >= 4 GiB (l1[4..]).
+ * =========================================================================== */
+
+/* Mirrors of vmm.h's flag bits (this file can't include vmm.h — its
+ * vmm_map_4mib signature intentionally diverges from the header). */
+#define VMM_EXEC_BIT    0x200u
+#define VMM_SHARED_BIT  0x400u
+/* Descriptor software-use bit (IGNORED by the hardware walk) marking a
+ * BORROWED page — vmm_space_destroy leaves those frames for their owner. */
+#define PTE_SW_SHARED   (1ULL << 55)
+
+/* Walk the KERNEL table (mmu_kernel_l1) for `va`; return phys or 0.  Handles
+ * 1 GiB / 2 MiB block descriptors and 4 KiB pages.  Used by the isolation
+ * self-test to confirm a user VA is NOT visible in the kernel space. */
+uintptr_t vmm_translate(uintptr_t va) {
+    uint64_t* l1 = mmu_kernel_l1();
+    uint64_t e1 = l1[(va >> 30) & 0x1FF];
+    if (!(e1 & PTE_VALID)) return 0;
+    if (!(e1 & PTE_TABLE))                          /* 1 GiB block */
+        return (uintptr_t)((e1 & PTE_ADDR_MASK & ~0x3FFFFFFFULL) | (va & 0x3FFFFFFF));
+    uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+    uint64_t e2 = l2[(va >> 21) & 0x1FF];
+    if (!(e2 & PTE_VALID)) return 0;
+    if (!(e2 & PTE_TABLE))                          /* 2 MiB block */
+        return (uintptr_t)((e2 & PTE_ADDR_MASK & ~0x1FFFFFULL) | (va & 0x1FFFFF));
+    uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+    uint64_t e3 = l3[(va >> 12) & 0x1FF];
+    if (!(e3 & PTE_VALID)) return 0;
+    return (uintptr_t)((e3 & PTE_ADDR_MASK) | (va & 0xFFF));
+}
+
+uintptr_t vmm_user_base(void) { return 0x100000000ULL; }   /* 4 GiB */
+
+struct vmm_space* vmm_space_create(void) { return aarch64_vmm_create(); }
+
+/* Free the user-region tables (l1[4..]) + their frames; kernel-shared
+ * blocks (l1[0..3]) are left alone. */
+static void free_l2_subtree(uint64_t* l2) {
+    for (int i = 0; i < 512; i++) {
+        uint64_t e = l2[i];
+        if ((e & PTE_VALID) && (e & PTE_TABLE)) {
+            uint64_t* l3 = (uint64_t*)(uintptr_t)(e & PTE_ADDR_MASK);
+            for (int j = 0; j < 512; j++)
+                if ((l3[j] & PTE_VALID) && !(l3[j] & PTE_SW_SHARED))
+                    pmm_free_frame((uint32_t)(l3[j] & PTE_ADDR_MASK));  /* owned page */
+            pmm_free_frame((uint32_t)(e & PTE_ADDR_MASK));              /* L3 table */
+        }
+    }
+}
+void vmm_space_destroy(struct vmm_space* s) {
+    if (!s) return;
+    for (int i = 4; i < 512; i++) {                 /* user region = VA >= 4 GiB */
+        uint64_t e = s->l1[i];
+        if ((e & PTE_VALID) && (e & PTE_TABLE)) {
+            uint64_t* l2 = (uint64_t*)(uintptr_t)(e & PTE_ADDR_MASK);
+            free_l2_subtree(l2);
+            pmm_free_frame((uint32_t)(e & PTE_ADDR_MASK));             /* L2 table */
+        }
+    }
+    pmm_free_frame((uint32_t)(uintptr_t)s->l1);                        /* L1 table */
+    kfree(s);
+}
+
+int vmm_space_map(struct vmm_space* s, uintptr_t va, uintptr_t pa, uint32_t flags) {
+    if (!s) return -1;                              /* kernel space not user-mappable */
+    int rc = aarch64_vmm_map_user(s, va, pa, 4096, (flags & VMM_EXEC_BIT) ? 1 : 0);
+    if (rc == 0 && (flags & VMM_SHARED_BIT)) {      /* tag borrowed frame in L3 */
+        uint64_t e1 = s->l1[(va >> 30) & 0x1FF];
+        uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+        uint64_t e2 = l2[(va >> 21) & 0x1FF];
+        uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+        l3[(va >> 12) & 0x1FF] |= PTE_SW_SHARED;
+    }
+    return rc;
+}
+
+void vmm_space_unmap(struct vmm_space* s, uintptr_t va) {
+    if (!s) return;
+    uint64_t e1 = s->l1[(va >> 30) & 0x1FF];
+    if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) return;
+    uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+    uint64_t e2 = l2[(va >> 21) & 0x1FF];
+    if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) return;
+    uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+    l3[(va >> 12) & 0x1FF] = 0;
+    __asm__ volatile ("dsb ish\ntlbi vmalle1\ndsb ish\nisb" ::: "memory");
+}
+
+uintptr_t vmm_space_pd_phys(struct vmm_space* s) {
+    return (uintptr_t)(s ? s->l1 : mmu_kernel_l1());
+}
+
+void vmm_space_switch(struct vmm_space* s) {
+    uint64_t target = (uint64_t)(uintptr_t)(s ? s->l1 : mmu_kernel_l1());
+    uint64_t cur;
+    __asm__ volatile ("mrs %0, ttbr0_el1" : "=r"(cur));
+    /* Skip the (expensive) TTBR0 reload + full TLBI when the space is
+     * already active — kernel-thread → kernel-thread switches cost nothing. */
+    if ((cur & PTE_ADDR_MASK) == (target & PTE_ADDR_MASK)) return;
+    __asm__ volatile (
+        "msr ttbr0_el1, %0\n"
+        "dsb ish\ntlbi vmalle1\ndsb ish\nisb\n"
+        :: "r"(target) : "memory");
+}

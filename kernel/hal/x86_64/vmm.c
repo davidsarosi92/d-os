@@ -33,7 +33,9 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "printf.h"
+#include "kmalloc.h"
 #include <stdint.h>
+#include <stddef.h>
 
 /* Page-table entry bit positions.  Intel kept the low 12 bits compatible
  * with i386 PDEs, so VMM_WRITABLE/USER/WRITE_THRU/CACHE_DIS flow through
@@ -139,8 +141,9 @@ uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
  * mainly so the USER bit propagates up the chain (without USER on
  * every parent, ring-3 code can't reach the PT).
  * ----------------------------------------------------------------------------- */
-static uint64_t* walk_to_pt(uintptr_t virt, int create, uint32_t parent_flags) {
-    uint64_t* tbl = (uint64_t*)pml4;
+static uint64_t* walk_to_pt_root(uint64_t* root, uintptr_t virt, int create,
+                                 uint32_t parent_flags) {
+    uint64_t* tbl = root;
     int shifts[3] = { 39, 30, 21 };          /* PML4, PDPT, PD */
 
     for (int level = 0; level < 3; level++) {
@@ -198,6 +201,11 @@ static uint64_t* walk_to_pt(uintptr_t virt, int create, uint32_t parent_flags) {
     }
 
     return tbl;       /* PT */
+}
+
+/* Kernel-space walker — the original signature, rooted at the boot PML4. */
+static uint64_t* walk_to_pt(uintptr_t virt, int create, uint32_t parent_flags) {
+    return walk_to_pt_root((uint64_t*)pml4, virt, create, parent_flags);
 }
 
 /* -----------------------------------------------------------------------------
@@ -318,3 +326,130 @@ void vmm_print_status(void) {
             (efer & (1u << 10)) ? "on" : "off",      /* LMA */
             (cr4 & (1u << 5))   ? "on" : "off");     /* PAE */
 }
+
+/* ===========================================================================
+ * Per-process address spaces (M25 stage 1).
+ *
+ * The x86_64 twist vs i386: the *entire* kernel address space lives under
+ * PML4[0] (everything the kernel touches is below 512 GiB), so a bare PML4
+ * copy would share the whole low-512-GiB subtree — including the user
+ * region — and user mappings would pollute the kernel.  To keep the user
+ * region PRIVATE while the kernel stays mapped, a new space gets its own
+ * copy of PML4 AND its own copy of the PDPT under PML4[0]; that private
+ * PDPT shares the kernel's PD subtrees (identity, framebuffer, …) BY
+ * POINTER but owns the currently-empty slots the user region falls into
+ * (user VA 0x40000000 = PDPT[1], empty on our ≤1 GiB-RAM configs).  User
+ * page tables created under it are therefore invisible to the kernel and
+ * to other spaces.  Same boot-time-mappings-only caveat as vmm.h notes.
+ * =========================================================================== */
+
+struct vmm_space {
+    uint64_t* pml4;         /* process PML4 (identity: virt == phys) */
+    uintptr_t pml4_phys;
+};
+
+static inline uint64_t read_cr3(void) {
+    uint64_t v; __asm__ volatile ("mov %%cr3, %0" : "=r"(v)); return v;
+}
+static inline void write_cr3(uint64_t v) {
+    __asm__ volatile ("mov %0, %%cr3" : : "r"(v) : "memory");
+}
+
+struct vmm_space* vmm_space_create(void) {
+    struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
+    if (!s) return NULL;
+
+    uint32_t pml4_phys = pmm_alloc_frame();
+    if (!pml4_phys) { kfree(s); return NULL; }
+    s->pml4      = (uint64_t*)(uintptr_t)pml4_phys;
+    s->pml4_phys = pml4_phys;
+
+    /* Snapshot the kernel PML4 (mostly just [0]). */
+    uint64_t* kpml4 = (uint64_t*)pml4;
+    for (int i = 0; i < 512; i++) s->pml4[i] = kpml4[i];
+
+    /* Give PML4[0] a PRIVATE PDPT so the user region under it doesn't write
+     * into the shared kernel PDPT.  Copy the kernel PDPT entries (sharing
+     * the kernel PD subtrees by pointer); the empty user slot stays empty
+     * and becomes private on first map. */
+    uint64_t k0 = kpml4[0];
+    if (k0 & PTE_P) {
+        uint32_t pdpt_phys = pmm_alloc_frame();
+        if (!pdpt_phys) { pmm_free_frame(pml4_phys); kfree(s); return NULL; }
+        uint64_t* kpdpt = table_at((uintptr_t)k0);
+        uint64_t* npdpt = (uint64_t*)(uintptr_t)pdpt_phys;
+        for (int i = 0; i < 512; i++) npdpt[i] = kpdpt[i];
+        /* Point PML4[0] at the private PDPT; keep P+RW, USER widened lazily
+         * by walk_to_pt_root when the first user page is mapped. */
+        s->pml4[0] = ((uint64_t)pdpt_phys & PAGE_MASK_4K) | PTE_P | PTE_RW;
+    }
+    return s;
+}
+
+/* Free the tables a space added on top of the kernel snapshot, one level
+ * at a time: a table entry still equal to the kernel's is shared and left
+ * alone; anything else that this space introduced is freed (deepest
+ * first).  `depth` 0=PML4 1=PDPT 2=PD; PTs (depth 3) hold user frames. */
+static void free_subtree(uint64_t* tbl, uint64_t* ktbl, int depth) {
+    for (int i = 0; i < 512; i++) {
+        uint64_t e = tbl[i];
+        if (!(e & PTE_P)) continue;
+        if (ktbl && e == ktbl[i]) continue;          /* shared with kernel */
+        if (depth >= 1 && (e & PTE_PS)) continue;    /* large page, not ours to free */
+
+        uint64_t* child  = table_at((uintptr_t)e);
+        uint64_t* kchild = (ktbl && (ktbl[i] & PTE_P) && !(ktbl[i] & PTE_PS))
+                         ? table_at((uintptr_t)ktbl[i]) : NULL;
+        if (depth < 3) {
+            free_subtree(child, kchild, depth + 1);
+            pmm_free_frame((uint32_t)((uintptr_t)e & PAGE_MASK_4K));
+        } else {
+            /* depth 3 = PT: user pages.  Skip VMM_SHARED (borrowed) ones —
+             * their owner (e.g. a shm object) frees them. */
+            if (!(e & VMM_SHARED))
+                pmm_free_frame((uint32_t)((uintptr_t)e & PAGE_MASK_4K));
+        }
+    }
+}
+
+void vmm_space_destroy(struct vmm_space* s) {
+    if (!s) return;
+    free_subtree(s->pml4, (uint64_t*)pml4, 0);
+    pmm_free_frame((uint32_t)s->pml4_phys);
+    kfree(s);
+}
+
+int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
+                  uint32_t flags) {
+    if (!s) return vmm_map(virt, phys, flags);
+    uint64_t* pt = walk_to_pt_root(s->pml4, virt, /*create*/1, flags);
+    if (!pt) return -1;
+    /* VMM_SHARED (0x400) rides in PTE bit 10 (OS-available) so
+     * free_subtree can skip borrowed frames it doesn't own. */
+    pt[IDX_PT(virt)] = ((uint64_t)phys & PAGE_MASK_4K)
+                     | PTE_P | ((uint64_t)flags & (PTE_RW | PTE_US | VMM_SHARED));
+    invlpg(virt);
+    return 0;
+}
+
+void vmm_space_unmap(struct vmm_space* s, uintptr_t virt) {
+    if (!s) { vmm_unmap(virt); return; }
+    uint64_t* pt = walk_to_pt_root(s->pml4, virt, /*create*/0, 0);
+    if (!pt) return;
+    pt[IDX_PT(virt)] = 0;
+    invlpg(virt);
+}
+
+uintptr_t vmm_space_pd_phys(struct vmm_space* s) {
+    return s ? s->pml4_phys : (uintptr_t)pml4;
+}
+
+void vmm_space_switch(struct vmm_space* s) {
+    uint64_t target = s ? (uint64_t)s->pml4_phys : (uint64_t)(uintptr_t)pml4;
+    if (read_cr3() != target) write_cr3(target);
+}
+
+/* User region base: 1 GiB (PDPT[1]), above the boot-time 1 GiB identity
+ * map.  Valid while RAM ≤ 1 GiB (our configs); a larger identity map would
+ * push this higher — revisit with the ELF loader if we run big-RAM guests. */
+uintptr_t vmm_user_base(void) { return 0x40000000u; }

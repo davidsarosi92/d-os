@@ -19,11 +19,25 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 ## Status (update when a milestone ships)
 
 ✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M21 (full ARM parity) +
-M22 – M22.7 + M27 + M28** shipped
+M22 – M22.7 + M27 + M28 + M25** shipped
 (10/11 polish sub-items; the lone outstanding one is §M20.6.1
 SYSCALL/SYSRET).  M28 (2026-07-10): system log — klog static ring
 + `kprintf` auto-tee + `klog(level,tag,…)` + `dmesg [-l level]` +
-`/proc/kmsg` (DOCS §4.18).  M22 + M22.1 + M22.2 (2026-07-04): GUI — gfx
+`/proc/kmsg` (DOCS §4.18).  M25 (2026-07-10): userland foundation
+stages 1–7 (DOCS §4.19) — per-process address spaces (`vmm_space` +
+`task.mm`, scheduler CR3/TTBR0 switch), ELF loader (`elf.c`) + run
+(`proc_exec_elf`, ring3/EL0 excursion), fd table + `write/read/open/
+close/lseek/mmap/memfd/socketpair/send/recv/poll` (generic `struct
+ofile`), memfd shared memory (`VMM_SHARED` PTE bit), unix socketpair +
+SCM_RIGHTS fd passing (`usock.c`), poll, in-tree libc (`user/`,
+compiled-C runs in ring 3 — i386 blob).  All on 3 arches (libc: i386).
+**Ring model LOCKED: only ring 0/3 (EL1/EL0) — rings 1/2 never
+(paging is binary → no isolation; security axis = address spaces +
+capabilities, not ring count).**  Deferred tail: concurrent preemptible
+user *processes* (per-task TSS.esp0/SP_EL1, SYS_EXIT→task_exit, blocking
+syscalls) + x86_64/aarch64 libc port — today one user program at a time
+as a synchronous excursion.  Self-tests: `userrun/fdtest/shmtest/
+socktest/polltest/libctest`.  M22 + M22.1 + M22.2 (2026-07-04): GUI — gfx
 surfaces + compositor + WM core + widget toolkit + file manager,
 PS/2 mouse (IRQ12), CMOS RTC, `vfs_unlink`, 1280×800 FB; desktop
 shells + apps + command shells are REGISTRY-swappable
@@ -174,9 +188,11 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 🔲 **PLAN extensions (placeholders, design only):**
 - §M23 — Audio subsystem (AC97 → HDA → I2S).
 - §M24 — Network stack (virtio-net → IP/UDP/TCP → sockets).
-- §M25 — Userland foundation (per-process VMM, ELF loader, fd
-  table, unix sockets + fd passing, mmap, mini-libc) — the
-  Wayland prerequisites.
+- §M25 — ✅ SHIPPED stages 1–7 (DOCS §4.19): per-process VMM, ELF
+  loader + exec, fd table, mmap + memfd shm, unix sockets + fd
+  passing, poll, in-tree libc.  Wayland prerequisites in place.
+  Deferred tail: concurrent preemptible user processes + x86_64/
+  aarch64 libc port.
 - §M26 — Wayland server (wire protocol over M22 compositor +
   M25 substrate; depends on both).
 - **Workload-management cluster** (order M27→M30, independent of the

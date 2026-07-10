@@ -37,6 +37,9 @@
 #include "shell_provider.h"
 #include "basic.h"
 #include "klog.h"
+#include "elf.h"
+#include "proc.h"
+#include "syscall.h"
 
 #define LINE_MAX        128             /* max accepted bytes per command line */
 #define DEFAULT_PROMPT  "d-os> "        /* fallback when config is unavailable */
@@ -727,6 +730,309 @@ static void cmd_bctest(void) {
  * arch_ringtest implementations); shell.c just invokes it. */
 static void cmd_ringtest(void) { arch_ringtest(); }
 
+/* M25 stage 1 — per-process address space self-test.  Creates a fresh
+ * vmm_space, maps one user page carrying a sentinel, switches this CPU to
+ * that space, reads the page back, then switches to the kernel space and
+ * proves the mapping is PRIVATE (not visible in the kernel directory).
+ * IRQs are held off across the CR3 excursion so no reschedule ever runs
+ * with our non-standard address space loaded (the scheduler doesn't switch
+ * CR3 yet — that's the next stage-1 step). */
+static void cmd_mmtest(void) {
+    struct vmm_space* s = vmm_space_create();
+    if (!s) { console_write("mmtest: vmm_space_create failed\n"); return; }
+
+    uint32_t frame = pmm_alloc_frame();          /* backing for the user page */
+    if (!frame) { console_write("mmtest: no frame\n"); vmm_space_destroy(s); return; }
+
+    /* Seed the sentinel through the identity map (frame < 256 MiB). */
+    *(volatile uint32_t*)(uintptr_t)frame = 0xC0FFEE42u;
+
+    const uintptr_t UVA = vmm_user_base();        /* arch's user-region base */
+    if (vmm_space_map(s, UVA, frame, VMM_WRITABLE | VMM_USER) != 0) {
+        console_write("mmtest: vmm_space_map failed\n");
+        pmm_free_frame(frame); vmm_space_destroy(s); return;
+    }
+
+    spinlock_t lk = SPINLOCK_INIT;
+    uint32_t flags = spin_lock_irqsave(&lk);
+    vmm_space_switch(s);
+    uint32_t got = *(volatile uint32_t*)UVA;      /* read via the space's map */
+    vmm_space_switch(NULL);                        /* back to kernel space */
+    spin_unlock_irqrestore(&lk, flags);
+
+    uintptr_t kview = vmm_translate(UVA);          /* kernel-space view of UVA */
+
+    kprintf("mmtest: read 0x%x @ %p (want 0xc0ffee42) -> %s; "
+            "kernel translate(UVA)=%p (want 0x0, private) -> %s\n",
+            got, (void*)UVA, got == 0xC0FFEE42u ? "PASS" : "FAIL",
+            (void*)kview, kview == 0 ? "PASS" : "FAIL");
+
+    vmm_space_destroy(s);                          /* frees PT + user frame + PD */
+}
+
+/* M25 stage 2a — ELF loader self-test.  Synthesises a minimal static ELF of
+ * this arch's native class (one PT_LOAD segment carrying a known payload at
+ * the user-region base), loads it into a fresh vmm_space via elf_load(), then
+ * switches to that space to confirm the segment bytes + entry landed where the
+ * program headers said — and that the mapping is PRIVATE (invisible to the
+ * kernel space).  This exercises the loader end-to-end without needing a
+ * userland toolchain in the tree yet; actually *running* the loaded image in
+ * ring 3 is stage 2b. */
+static void cmd_elftest(void) {
+    const uintptr_t base = vmm_user_base();
+    const char payload[] = "ELF-LOAD-OK";           /* the segment's contents */
+
+    static uint8_t image[2 * 4096];                 /* scratch ELF image */
+    size_t ilen = elf_build_selftest(image, sizeof image, base,
+                                     payload, sizeof payload);
+    if (!ilen) { console_write("elftest: build failed\n"); return; }
+
+    struct vmm_space* s = vmm_space_create();
+    if (!s) { console_write("elftest: vmm_space_create failed\n"); return; }
+
+    uintptr_t entry = 0;
+    int rc = elf_load(s, image, ilen, &entry);
+    if (rc != ELF_OK) {
+        kprintf("elftest: elf_load failed (%d)\n", rc);
+        vmm_space_destroy(s); return;
+    }
+
+    /* Switch into the space, read the loaded payload back at its vaddr. */
+    char got[sizeof payload];
+    spinlock_t lk = SPINLOCK_INIT;
+    uint32_t flags = spin_lock_irqsave(&lk);
+    vmm_space_switch(s);
+    for (size_t i = 0; i < sizeof payload; i++)
+        got[i] = ((volatile char*)base)[i];
+    vmm_space_switch(NULL);
+    spin_unlock_irqrestore(&lk, flags);
+
+    int match = 1;
+    for (size_t i = 0; i < sizeof payload; i++)
+        if (got[i] != payload[i]) { match = 0; break; }
+
+    uintptr_t kview = vmm_translate(base);          /* kernel-space view */
+
+    kprintf("elftest: loaded, entry=%p (want %p) -> %s; segment='%s' -> %s; "
+            "kernel translate(base)=%p -> %s\n",
+            (void*)entry, (void*)base, entry == base ? "PASS" : "FAIL",
+            got, match ? "PASS" : "FAIL",
+            (void*)kview, kview == 0 ? "PASS" : "FAIL");
+
+    vmm_space_destroy(s);
+}
+
+/* M25 stage 2b — build the arch's hello program, wrap it in a static ELF, and
+ * actually RUN it in ring 3 / EL0 in its own address space via proc_exec_elf.
+ * The program SYS_PRINTs a greeting then SYS_EXITs (returning here).  This is
+ * the ELF-loader path's payoff: a loaded-from-image user program executing,
+ * isolated in a private space — not hand-poked machine code in the shared
+ * kernel map (that's the older `ringtest`). */
+static void cmd_userrun(void) {
+    const uintptr_t base = vmm_user_base();
+
+    static uint8_t payload[512];
+    size_t plen = arch_user_hello(payload, sizeof payload, base);
+    if (!plen) { console_write("userrun: hello build failed\n"); return; }
+
+    static uint8_t image[3 * 4096];
+    size_t ilen = elf_build_selftest(image, sizeof image, base, payload, plen);
+    if (!ilen) { console_write("userrun: elf build failed\n"); return; }
+
+    console_write("userrun: exec'ing user ELF...\n");
+    int rc = proc_exec_elf(image, ilen);
+    kprintf("userrun: returned from user program (rc=%d)\n", rc);
+}
+
+/* M25 stage 3 — per-process fd table + open/read/write/close/lseek.  Drives
+ * the SAME sys_* handlers the ring-3 syscall dispatchers call: create a ramfs
+ * file, then open/read/lseek/close it through the fd layer and echo it via
+ * sys_write(1, …).  (userrun already proves the ring-3 → syscall trap; this
+ * validates the fd-table semantics directly.) */
+static void cmd_fdtest(void) {
+    const char* path    = "/fdtest.txt";
+    const char* content = "M25 fd table works";
+    size_t clen = 0; while (content[clen]) clen++;
+
+    struct file* wf = vfs_open(path, VFS_WRONLY | VFS_CREATE);
+    if (!wf) { console_write("fdtest: create failed\n"); return; }
+    vfs_write(wf, content, clen);
+    vfs_close(wf);
+
+    int fd = sys_open(path, VFS_RDONLY);
+    if (fd < 0) { console_write("fdtest: sys_open failed\n"); return; }
+
+    char buf[64];
+    long n = sys_read(fd, buf, sizeof buf - 1);
+    if (n < 0) n = 0;
+    buf[n] = 0;
+    int read_ok = ((size_t)n == clen);
+    for (long i = 0; i < n; i++) if (buf[i] != content[i]) read_ok = 0;
+
+    long pos = sys_lseek(fd, 0, SEEK_SET);          /* rewind */
+    char b2[4];
+    long n2 = sys_read(fd, b2, 3);
+    int seek_ok = (pos == 0 && n2 == 3 && b2[0] == content[0]);
+
+    console_write("fdtest: sys_write(1) echo: ");
+    sys_write(1, content, clen);
+    console_putchar('\n');
+
+    int close_ok = (sys_close(fd) == 0);
+    int reuse    = sys_open(path, VFS_RDONLY);      /* freed slot reused? */
+    int reuse_ok = (reuse == fd);
+    if (reuse >= 0) sys_close(reuse);
+
+    kprintf("fdtest: open=%d read=%s(%ld) lseek=%s close=%s reuse=%s\n",
+            fd, read_ok ? "PASS" : "FAIL", n, seek_ok ? "PASS" : "FAIL",
+            close_ok ? "PASS" : "FAIL", reuse_ok ? "PASS" : "FAIL");
+}
+
+/* M25 stage 4 — anonymous mmap + memfd shared memory.  Borrows a private
+ * address space (like proc_exec_elf) so sys_mmap has a user space to map
+ * into, then: (1) mmaps an anonymous region and read/writes it; (2) creates a
+ * memfd and mmaps it TWICE — a write through one mapping is visible through
+ * the other, proving one backing frame set behind two VAs (the shm-sharing
+ * mechanism; cross-process sharing is stage 5).  VMM_SHARED keeps the space
+ * teardown from double-freeing the shm frames. */
+static void cmd_shmtest(void) {
+    struct task* me = task_current();
+    struct vmm_space* s = vmm_space_create();
+    if (!s) { console_write("shmtest: no space\n"); return; }
+    struct vmm_space* prev = me->mm;
+    me->mm = s; me->mmap_cursor = 0;
+    vmm_space_switch(s);
+
+    long a = sys_mmap(8192, -1);                     /* anonymous, 2 pages */
+    int anon_ok = 0;
+    if (a > 0) {
+        volatile uint32_t* p = (volatile uint32_t*)(uintptr_t)a;
+        p[0] = 0xABCD1234u; p[1500] = 0x5678u;       /* touch both pages */
+        anon_ok = (p[0] == 0xABCD1234u && p[1500] == 0x5678u);
+    }
+
+    int  fd = sys_memfd(4096);
+    long m1 = (fd >= 0) ? sys_mmap(4096, fd) : -1;
+    long m2 = (fd >= 0) ? sys_mmap(4096, fd) : -1;   /* second mapping, same object */
+    int shm_ok = 0;
+    if (m1 > 0 && m2 > 0 && m1 != m2) {
+        *(volatile uint32_t*)(uintptr_t)m1 = 0xFEEDFACEu;
+        shm_ok = (*(volatile uint32_t*)(uintptr_t)m2 == 0xFEEDFACEu);
+    }
+    if (fd >= 0) sys_close(fd);                       /* frees shm frames once */
+
+    vmm_space_switch(prev);
+    me->mm = prev; me->mmap_cursor = 0;
+    vmm_space_destroy(s);                             /* frees anon; skips shm */
+
+    kprintf("shmtest: anon-mmap=%s shm-shared=%s (a=%p m1=%p m2=%p)\n",
+            anon_ok ? "PASS" : "FAIL", shm_ok ? "PASS" : "FAIL",
+            (void*)(uintptr_t)a, (void*)(uintptr_t)m1, (void*)(uintptr_t)m2);
+}
+
+/* M25 stage 5 — unix socketpair + fd passing (SCM_RIGHTS).  Creates a
+ * connected pair, sends bytes one way and receives them the other, then the
+ * payoff: creates a memfd, writes a sentinel through a mapping, PASSES the fd
+ * across the socket, and on the receiving side maps the received fd and reads
+ * the sentinel back — one shm object reached via a descriptor that travelled
+ * over a socket (the Wayland wl_shm / keymap handover).  Borrows a private
+ * space so mmap has somewhere to map. */
+static void cmd_socktest(void) {
+    struct task* me = task_current();
+    struct vmm_space* s = vmm_space_create();
+    if (!s) { console_write("socktest: no space\n"); return; }
+    struct vmm_space* prev = me->mm;
+    me->mm = s; me->mmap_cursor = 0;
+    vmm_space_switch(s);
+
+    int fds[2] = { -1, -1 };
+    int sp = sys_socketpair(fds);
+
+    /* byte stream one way */
+    long sent = sys_send(fds[0], "ping", 4, -1);
+    char rb[8]; int pf = -2;
+    long got = sys_recv(fds[1], rb, sizeof rb, &pf);
+    int data_ok = (sp == 0 && sent == 4 && got == 4 &&
+                   rb[0] == 'p' && rb[3] == 'g' && pf == -1);
+
+    /* fd passing → shared memory across the socket */
+    int  fdshm = sys_memfd(4096);
+    long m1 = (fdshm >= 0) ? sys_mmap(4096, fdshm) : -1;
+    if (m1 > 0) *(volatile uint32_t*)(uintptr_t)m1 = 0xCAFEBABEu;
+
+    long sent2 = sys_send(fds[0], "fd", 2, fdshm);      /* pass the memfd */
+    char rb2[8]; int passed = -2;
+    long got2 = sys_recv(fds[1], rb2, sizeof rb2, &passed);   /* receive new fd */
+
+    int m2_ok = 0;
+    if (passed >= 3) {
+        long m2 = sys_mmap(4096, passed);
+        if (m2 > 0) m2_ok = (*(volatile uint32_t*)(uintptr_t)m2 == 0xCAFEBABEu);
+        sys_close(passed);
+    }
+    int pass_ok = (sent2 == 2 && got2 == 2 && passed >= 3 && m2_ok);
+
+    if (fdshm >= 0) sys_close(fdshm);
+    if (fds[0] >= 0) sys_close(fds[0]);
+    if (fds[1] >= 0) sys_close(fds[1]);
+
+    vmm_space_switch(prev);
+    me->mm = prev; me->mmap_cursor = 0;
+    vmm_space_destroy(s);
+
+    kprintf("socktest: pair+data=%s fd-passing(shared mem)=%s (passed fd=%d)\n",
+            data_ok ? "PASS" : "FAIL", pass_ok ? "PASS" : "FAIL", passed);
+}
+
+/* M25 stage 6 — poll readiness.  On a socketpair: poll reports NOT-readable
+ * before a send, readable after, and NOT-readable again once drained.  (This
+ * is the non-blocking readiness snapshot; true sleep-until-ready arrives with
+ * the concurrent-process scheduler.) */
+static void cmd_polltest(void) {
+    int fds[2] = { -1, -1 };
+    if (sys_socketpair(fds) != 0) { console_write("polltest: pair failed\n"); return; }
+
+    struct pollfd pf = { .fd = fds[1], .events = POLLIN, .revents = 0 };
+    int r_before = sys_poll(&pf, 1, 0);
+    int before_ok = (r_before == 0 && !(pf.revents & POLLIN));
+
+    sys_send(fds[0], "x", 1, -1);
+    pf.revents = 0;
+    int r_after = sys_poll(&pf, 1, 0);
+    int after_ok = (r_after == 1 && (pf.revents & POLLIN));
+
+    char c; sys_recv(fds[1], &c, 1, NULL);          /* drain */
+    pf.revents = 0;
+    int r_drain = sys_poll(&pf, 1, 0);
+    int drain_ok = (r_drain == 0);
+
+    sys_close(fds[0]); sys_close(fds[1]);
+
+    kprintf("polltest: before-send=%s after-send=%s after-drain=%s\n",
+            before_ok ? "PASS" : "FAIL", after_ok ? "PASS" : "FAIL",
+            drain_ok ? "PASS" : "FAIL");
+}
+
+/* M25 stage 7 — run the in-tree-libc compiled-C user program embedded as a
+ * blob (user/hello.c → static ELF → objcopy).  Weak symbols so the command
+ * still links on arches that don't embed the blob yet (i386 is the reference
+ * port today). */
+extern const unsigned char _binary_user_hello_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_hello_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_libctest(void) {
+    const unsigned char* start = _binary_user_hello_i386_elf_start;
+    const unsigned char* end   = _binary_user_hello_i386_elf_end;
+    if (!start || !end) {
+        console_write("libctest: no user ELF embedded for this arch (i386 only today)\n");
+        return;
+    }
+    size_t len = (size_t)(end - start);
+    console_write("libctest: exec'ing compiled-C user ELF (in-tree libc)...\n");
+    int rc = proc_exec_elf(start, len);
+    kprintf("libctest: returned (rc=%d, %u bytes)\n", rc, (unsigned)len);
+}
+
 /* -------------------------------------------------------------------- */
 /* Configuration commands.                                              */
 /* -------------------------------------------------------------------- */
@@ -873,6 +1179,14 @@ static void dispatch(struct vc* my_vc, const char* line) {
     /* Config commands. */
     if (streq(line, "config"))         { config_dump(); return; }
     if (streq(line, "ringtest"))       { cmd_ringtest(); return; }
+    if (streq(line, "mmtest"))         { cmd_mmtest();   return; }
+    if (streq(line, "elftest"))        { cmd_elftest();  return; }
+    if (streq(line, "userrun"))        { cmd_userrun();  return; }
+    if (streq(line, "fdtest"))         { cmd_fdtest();   return; }
+    if (streq(line, "shmtest"))        { cmd_shmtest();  return; }
+    if (streq(line, "socktest"))       { cmd_socktest(); return; }
+    if (streq(line, "polltest"))       { cmd_polltest(); return; }
+    if (streq(line, "libctest"))       { cmd_libctest(); return; }
     if (streq(line, "blktest"))        { cmd_blktest();  return; }
     if (streq(line, "bctest"))         { cmd_bctest();   return; }
     if (streq(line, "lsblk"))          { blk_list();     return; }

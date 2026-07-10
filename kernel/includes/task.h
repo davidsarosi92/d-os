@@ -8,9 +8,11 @@
  *   - state (RUNNABLE / SLEEPING / DEAD)
  *   - run-queue link (intrusive singly-linked circular list)
  *
- * All tasks share the kernel page directory today — they're "kernel
- * threads", not full processes.  When per-process VMM contexts arrive,
- * `struct task` gains a `struct vmm_space*`.
+ * As of M25 stage 1 a task MAY carry a private address space (`mm`, a
+ * `struct vmm_space*`).  `mm == NULL` means "kernel thread": it runs in the
+ * shared kernel page directory, exactly as every task did before M25.  A
+ * user process sets `mm` to its own space; the scheduler loads that space's
+ * CR3/TTBR0 on switch-in (and the kernel space on switch-out).
  *
  * Switching uses `context_switch` in switch.s (callee-saved push, swap
  * ESP, callee-saved pop, ret).  For a brand-new task, `task_spawn`
@@ -37,7 +39,14 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Per-process address space (M25).  Opaque here — see vmm.h.  Forward
+ * declared so `struct task` can hold one without pulling in the VMM. */
+struct vmm_space;
+/* Generic open-file object behind a descriptor (M25 stage 3/4) — see fd.h. */
+struct ofile;
+
 #define TASK_NAME_MAX  31
+#define TASK_MAX_FDS   32       /* per-process file descriptors (0/1/2 = console) */
 #define TASK_KSTACK_SZ 4096
 
 enum task_state {
@@ -63,6 +72,17 @@ struct task {
     enum task_state state;
     uintptr_t esp;                      /* saved kernel-stack pointer (HAL-typed) */
     void*    kstack_base;               /* kmalloc'd; freed at reap */
+    /* M25 — private address space, or NULL for a kernel thread (shared
+     * kernel page directory).  Zero-initialised by kcalloc at spawn, so
+     * every task defaults to a kernel thread until a loader sets it. */
+    struct vmm_space* mm;
+    /* M25 stage 3/4 — per-process file-descriptor table.  Index → generic
+     * open-file object (VFS file / shm / socket); fds 0/1/2 are the implicit
+     * console (no object, handled in usyscall.c).  Zero-init by kcalloc. */
+    struct ofile* fds[TASK_MAX_FDS];
+    /* M25 stage 4 — bump cursor for anonymous / shm mmap VAs in this task's
+     * user space.  Reset by the exec path; grows upward per mmap. */
+    uintptr_t     mmap_cursor;
     /* Master-list link (circular SLL of every alive task).  Walked by
      * ps / task_for_each / task_find.  Pre-M18.6.1 the scheduler
      * also walked this list; now per-CPU runqueues take that role and

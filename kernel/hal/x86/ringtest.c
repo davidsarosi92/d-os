@@ -18,6 +18,41 @@
 #include "usermode.h"
 #include "syscall.h"
 #include <stdint.h>
+#include <stddef.h>
+
+/* Emit the tiny i386 ring-3 program used by the M25 exec path: code at
+ * offset 0, message at offset 0x100.  The program issues
+ * `write(1, msg, len)` (M25 stage-3 fd syscall) then `exit` — exercising the
+ * ring-3 → fd path end-to-end.  `base` is the VA the image loads at, so the
+ * absolute message pointer is base + 0x100.  Returns the payload length.  The
+ * encoding runs in both the 32-bit and (compat) 64-bit ring-3 paths. */
+static size_t build_hello(uint8_t* code, uintptr_t base) {
+    const char* src = "hello from ring 3 (ELF, write syscall)!\n";
+    uint32_t len = 0;
+    while (src[len]) len++;
+    uint32_t msg_va = (uint32_t)base + 0x100;
+
+    int o = 0;
+    code[o++] = 0xBB; *(uint32_t*)&code[o] = 1;         o += 4;  /* mov ebx, 1 (fd) */
+    code[o++] = 0xB9; *(uint32_t*)&code[o] = msg_va;    o += 4;  /* mov ecx, msg    */
+    code[o++] = 0xBA; *(uint32_t*)&code[o] = len;       o += 4;  /* mov edx, len    */
+    code[o++] = 0xB8; *(uint32_t*)&code[o] = SYS_WRITE; o += 4;  /* mov eax, WRITE  */
+    code[o++] = 0xCD; code[o++] = 0x80;                          /* int 0x80        */
+    code[o++] = 0xB8; *(uint32_t*)&code[o] = SYS_EXIT;  o += 4;  /* mov eax, EXIT   */
+    code[o++] = 0xCD; code[o++] = 0x80;                          /* int 0x80        */
+    code[o++] = 0xEB; code[o++] = 0xFE;                          /* jmp $           */
+
+    uint8_t* msg = code + 0x100;
+    for (uint32_t i = 0; i < len; i++) msg[i] = (uint8_t)src[i];
+    msg[len] = 0;
+    return 0x100 + len + 1;                                      /* code + gap + msg */
+}
+
+/* usermode.h — arch hook for the portable exec path (proc.c). */
+size_t arch_user_hello(uint8_t* buf, size_t cap, uintptr_t base) {
+    if (cap < 0x100 + 48) return 0;
+    return build_hello(buf, base);
+}
 
 int arch_ringtest(void) {
     uint32_t code_phys  = pmm_alloc_frame();

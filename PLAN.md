@@ -53,7 +53,7 @@
 | §M22.7 | Per-task GUI apps + panel-as-task — ✅ shipped | ~1660 |
 | §M23 | Audio subsystem | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) | ~1080 |
-| §M25 | Userland foundation (Wayland prerequisites) | ~1545 |
+| §M25 | Userland foundation (Wayland prerequisites) — ✅ stages 1–7 (libc: i386; concurrent-process tail deferred) | ~1545 |
 | §M26 | Wayland server (wire protocol on M22 + M25) | ~1615 |
 | §M27 | Process model — init, hierarchy, reaper, kill-tree — ✅ shipped | ~1818 |
 | §M28 | System log (klog ring buffer + dmesg) — ✅ shipped | ~1860 |
@@ -185,7 +185,7 @@ what); a session can pick a theme and push on it.
 | M22.7 | Per-task GUI apps (each WIN_APP on its own task) + panel-as-task | UX | ✅ DOCS §4.16 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
-| M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | §M25 |
+| M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | ✅ §M25 (stages 1–7; libc i386; concurrent-process tail deferred) |
 | M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | §M26 |
 | M27 | Process model — init, parent/child hierarchy, always-on reaper, kill-tree | Concurrency | ✅ DOCS §4.15 |
 | M28 | System log — klog ring buffer, severity levels, /proc/kmsg, dmesg | Observability | ✅ DOCS §4.18 |
@@ -2195,27 +2195,131 @@ M25-readiness matrix in DOCS.md §4.17.  So stage 1 below can start on
 any arch.  (Older deferred items — §M20.6.1 SYSCALL/SYSRET, §M19.5.1
 i386 kmap — are optimisations, NOT M25 blockers, and stay deferred.)
 
+**North-star decision — two privilege levels only, forever (2026-07-10).**
+d-os uses exactly **ring 0 + ring 3** (EL1 + EL0 on ARM); rings 1 and 2
+are deliberately never used.  The reasoning, so it is not re-litigated:
+(a) x86 *paging* is binary — the page U/S bit only distinguishes
+supervisor (rings 0/1/2) from user (ring 3), so a "ring 1 driver" has
+*full kernel memory access* and gains **no memory isolation**, which is
+the entire point of userland; (b) x86_64 long mode + `SYSCALL`/`SYSRET`
+are built around CPL 0/3 and made rings 1/2 vestigial (the one real user,
+32-bit Xen's ring-1 guest kernel, was dropped for exactly this reason);
+(c) aarch64 has no rings at all and no intermediate EL for drivers, so a
+ring-1/2 design would be non-portable (violates convention #3).  **The
+principle:** the security model's axis is *address spaces + capabilities*,
+NOT the count of CPU privilege levels — every arch usefully offers two
+(kernel/user), and every richer trust tier (isolated drivers, sandboxes)
+is built in *software* on top of address spaces, never by consuming more
+rings.  So the M33 "intermediate tier" is a ring-3 process with a
+restricted capability set (I/O-bitmap port grants, syscall filtering,
+IOMMU-bounded DMA) — not a middle ring.  This milestone builds exactly
+that 0/3 + per-process-address-space substrate, uniform across arches.
+
 **Design — staged subsystems.**
 
-1. **Per-process address spaces** — `struct task` gains the
-   `struct vmm_space*` that task.h has anticipated since M13;
-   context_switch loads CR3/PML4 per process; kernel stays mapped
-   in the upper half of every space.
+1. **Per-process address spaces — ✅ shipped (2026-07-10, all 3 arches).**
+   A portable `vmm_space` handle (vmm.h): `vmm_space_create/destroy/map/
+   unmap/pd_phys/switch` + `vmm_user_base()` + `VMM_EXEC`.  `struct task`
+   gained `mm` (NULL = kernel thread, shared kernel table); the scheduler
+   calls `vmm_space_switch(next->mm)` before `context_switch`, reloading
+   CR3/TTBR0 **only when it changes** (kernel-thread → kernel-thread stays
+   free — no TLB flush).  A new space snapshots the kernel's top-level
+   table so the kernel stays mapped after a switch, then owns a private
+   user region.  Self-test `mmtest` (shell): create a space, map a user
+   page carrying a sentinel, switch to it + read it back, then confirm the
+   mapping is invisible in the kernel table — **PASS on i386, x86_64,
+   aarch64** (`read 0xc0ffee42 → PASS; kernel translate(UVA)=0 → PASS`),
+   no boot regression, SMP self-test still green.
+   **Lessons:** (a) *x86_64 needs a private PDPT, not just a PML4 copy* —
+   the whole kernel lives under PML4[0], so a bare PML4 copy would share
+   the user region too; the space gets its own PDPT under PML4[0] (kernel
+   PD subtrees shared by pointer, user PDPT[1] private) or isolation
+   silently fails (the mmtest `translate=0` check catches it).  (b) *The
+   CR3/TTBR0 reload MUST be skipped when unchanged* — doing it every switch
+   would TLB-flush on every kernel-thread hop (esp. aarch64's `tlbi
+   vmalle1`), a severe perf regression.  (c) *User-VA base is arch-specific*
+   (i386/x86_64 = 1 GiB, aarch64 = 4 GiB above its identity map), hence
+   `vmm_user_base()`.  (d) Stage-1 limitation: a kernel mapping *added*
+   after a space is created won't propagate into it — fine today (all
+   kernel high-mappings are boot-time); the fix (shared kernel PT pages /
+   generation counter) is deferred.
 2. **ELF loader** — load a static ELF from the VFS (ramfs or
    exFAT), map segments into a fresh vmm_space, enter at ring 3.
-3. **Per-process fd table** — fds as indexes into a table of VFS
-   file objects; syscall surface grows `open / read / write /
-   close / lseek`.
-4. **mmap + shared memory** — anonymous mappings plus memfd-style
-   fd-backed shared memory objects (the wl_shm building block).
-5. **Unix domain sockets with fd passing** — SOCK_STREAM semantics
-   plus SCM_RIGHTS-style fd transfer.  This is the hard Wayland
-   dependency; shm pools and keymaps travel as fds.
-6. **Readiness API** — poll/epoll-shaped "wait for any of these
-   fds" syscall (epoll is the only libwayland dependency that is
-   trivially shimmable, but we need *some* multiplexing primitive).
-7. **Minimal libc** — in-tree static libc (string, malloc over
-   mmap, printf, syscall wrappers) sufficient to link test clients.
+   - **Stage 2a — ✅ shipped (2026-07-10, all 3 arches): the loader.**
+     Portable `kernel/core/elf.c` (`elf_load(space, image, len, &entry)`):
+     understands BOTH ELF classes at runtime (ELFCLASS32 for i386,
+     ELFCLASS64 for x86_64 / aarch64 — decoded into width-normalised
+     header views so one map-loop serves both, no arch #ifdef); for each
+     PT_LOAD it allocates frames, copies the file image, zero-fills the
+     BSS tail, and maps the pages into the space with the segment's R/W/X
+     (via `VMM_EXEC`).  Static executables only — no interp/dynamic/reloc
+     (M25 scope).  Self-test `elftest` (shell): synthesise a native-class
+     ELF with one PT_LOAD carrying a known payload at `vmm_user_base()`,
+     `elf_load` it, switch into the space and confirm the segment bytes +
+     entry landed correctly AND the mapping is private to the space —
+     **PASS on i386 (ELF32), x86_64 + aarch64 (ELF64)**.
+   - **Stage 2b — ✅ shipped (2026-07-10, all 3 arches): run a loaded ELF.**
+     Portable `kernel/core/proc.c` `proc_exec_elf(image, len)`: create a
+     space, `elf_load` it, map a user stack (1 MiB above the image base),
+     bind the space to the calling task (`task->mm = s`, so the scheduler
+     maintains CR3/TTBR0 across any preemption), switch to it, and drop to
+     ring 3 / EL0 at `e_entry` via the existing `enter_user_mode_wrap` —
+     returning on SYS_EXIT, then unbinding + destroying the space.  Two
+     arch seams: `enter_user_mode_wrap` (x86 had it; aarch64 got a wrapper
+     onto `aarch64_enter_user`) and `arch_user_hello(buf, cap, base)` —
+     the per-arch hello payload (x86 the i386 SYS_PRINT/SYS_EXIT encoding
+     with an absolute msg ptr; aarch64 the PIC `user_stub`).  Shell
+     `userrun` builds a hello ELF and execs it: **i386, x86_64 and aarch64
+     all print the greeting from ring 3 / EL0 and return rc=0**, program
+     loaded-from-ELF-image, isolated in its own space (vs the older
+     `ringtest`, which hand-pokes code into the shared kernel map).
+     Excursion model — the hello is short enough that no tick lands
+     mid-user; fully independent, long-running, preemptible user processes
+     (per-task TSS.esp0, robust IRQ-from-user) come with the scheduling
+     work in stage 3+.
+3. **Per-process fd table — ✅ shipped (2026-07-10, all 3 arches).**
+   `struct task` gained `fds[32]`; syscalls `write/read/open/close/lseek`
+   (portable handlers in `kernel/core/usyscall.c`, each arch dispatcher
+   just extracts args); fds 0/1/2 are the implicit console.  Shell `fdtest`
+   + `userrun` (now `write(1,…)` from ring 3): PASS ×3.
+4. **mmap + shared memory — ✅ shipped (2026-07-10, all 3 arches).**
+   A generic **`struct ofile`** (fd.h/fd.c: VFS file / shm / socket, refcounted)
+   replaced the raw `struct file*` in the fd table; `memfd` shm objects +
+   `mmap` (anonymous and shm-backed).  A **`VMM_SHARED`** PTE bit (x86 bit 10
+   / aarch64 sw-bit 55) marks BORROWED frames so `vmm_space_destroy` drops
+   the mapping without freeing the owner's frames (no double-free).  Shell
+   `shmtest` (one memfd mapped at two VAs shares one frame set): PASS ×3.
+5. **Unix domain sockets with fd passing — ✅ shipped (2026-07-10, all 3
+   arches).**  `kernel/core/usock.c`: connected `socketpair` (each endpoint a
+   receive ring + a passed-fd queue) + `send`/`recv` with SCM_RIGHTS — a
+   sender queues a fresh `ofile` reference on the peer, the receiver installs
+   it as a new fd.  Shell `socktest`: byte stream both ways + a memfd passed
+   over the socket → mapped on the far side → the sentinel reads back (one
+   shm object reached via a travelled descriptor — the wl_shm handover):
+   PASS ×3.
+6. **Readiness API — ✅ shipped (2026-07-10, all 3 arches).**  `poll(2)`
+   (`struct pollfd` + POLLIN/POLLOUT); non-blocking readiness snapshot
+   (socket readable iff buffered bytes, writable iff peer + space; VFS always
+   ready).  Shell `polltest` (not-ready → send → ready → drain → not-ready):
+   PASS ×3.  True *sleep-until-ready* blocking waits on the concurrent-
+   process scheduler (deferred, see note below).
+7. **Minimal libc — ✅ shipped i386 (2026-07-10); x86_64/aarch64 port
+   pending.**  In-tree `user/` libc (`crt0.s` + `libc.c`: `int 0x80` syscall
+   wrappers, string/mem, `malloc` over `mmap`, `printf`/`puts`) + a real
+   compiled-C `hello.c`, linked static at 0x40000000 and embedded as a blob
+   the kernel loads via `proc_exec_elf`.  Shell `libctest`: the compiled-C
+   program runs in ring 3 and prints via `printf`, uses `malloc`+`memcpy`,
+   returns rc=0.  The libc C is arch-neutral; the x86_64/aarch64 port needs
+   only a per-arch crt0 + user link + blob rule (the command links on all
+   arches via weak symbols and reports "not built" where absent).
+
+**Deferred (M25 tail → later):** the *synchronous-excursion* model runs one
+user program at a time on the calling task.  Fully independent, long-running,
+preemptible, concurrently-scheduled user *processes* — per-task TSS.esp0 /
+SP_EL1, a user-task trampoline, SYS_EXIT→task_exit, and blocking syscalls
+(read/poll that sleep on a wait queue) — are the remaining substrate, plus
+the x86_64/aarch64 libc port.  The APIs above are all in their final shape,
+so that work slots in under them without reshaping the ABI.
 
 **Definition of done:**
 - A static ELF binary loaded from disk runs in ring 3 in its own

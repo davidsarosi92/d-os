@@ -66,7 +66,7 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/usermode.s \
       kernel/hal/x86/switch.s
 
-  ARCH_EXTRA_OBJS := kernel/hal/x86/ap_trampoline_blob.o
+  ARCH_EXTRA_OBJS := kernel/hal/x86/ap_trampoline_blob.o user/hello_blob.o
 
 else ifeq ($(ARCH),x86_64)
   # mcmodel=large: kernel can be linked anywhere in 64-bit address space.
@@ -205,6 +205,11 @@ CORE_C_SRCS := \
     kernel/core/rescue_shell.c \
     kernel/core/printf.c \
     kernel/core/klog.c \
+    kernel/core/elf.c \
+    kernel/core/proc.c \
+    kernel/core/usyscall.c \
+    kernel/core/fd.c \
+    kernel/core/usock.c \
     kernel/core/multiboot.c \
     kernel/core/console.c \
     kernel/core/module.c \
@@ -267,6 +272,11 @@ else ifeq ($(ARCH),aarch64)
 CORE_C_SRCS := \
     kernel/core/printf.c \
     kernel/core/klog.c \
+    kernel/core/elf.c \
+    kernel/core/proc.c \
+    kernel/core/usyscall.c \
+    kernel/core/fd.c \
+    kernel/core/usock.c \
     kernel/core/console.c \
     kernel/core/lock.c \
     kernel/core/percpu.c \
@@ -321,6 +331,11 @@ CORE_C_SRCS := \
     kernel/core/rescue_shell.c \
     kernel/core/printf.c \
     kernel/core/klog.c \
+    kernel/core/elf.c \
+    kernel/core/proc.c \
+    kernel/core/usyscall.c \
+    kernel/core/fd.c \
+    kernel/core/usock.c \
     kernel/core/multiboot.c \
     kernel/core/console.c \
     kernel/core/module.c \
@@ -439,6 +454,27 @@ $(OBJ_DIR)/kernel/hal/x86_64/ap_trampoline_blob.o: kernel/hal/x86_64/ap_trampoli
 	objcopy --input-target=binary --output-target=elf64-x86-64 \
 	         --binary-architecture=i386:x86-64 \
 	         $< $@
+
+# M25 stage 7 — in-tree user libc + a compiled-C test program (user/hello.c),
+# linked as a static ELF at the user base (0x40000000) and wrapped as a binary
+# blob the kernel loads via proc_exec_elf.  i386 reference port; other arches
+# reuse the same C once their crt0 + user link land.  OMAGIC (-N) keeps it to
+# one RWX PT_LOAD segment, which elf.c's loader maps directly.
+USER_CFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -fno-builtin \
+               -nostdlib -Os -Wall -std=c11 -Iuser
+
+user/hello_i386.elf: user/crt0.s user/libc.c user/hello.c
+	@mkdir -p $(OBJ_DIR)/user
+	nasm -f elf32 user/crt0.s -o $(OBJ_DIR)/user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/libc.c  -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/hello.c -o $(OBJ_DIR)/user/hello.o
+	$(LD) -m elf_i386 -N -Ttext 0x40000000 -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/hello.o $(OBJ_DIR)/user/libc.o
+
+$(OBJ_DIR)/user/hello_blob.o: user/hello_i386.elf
+	@mkdir -p $(@D)
+	objcopy --input-target=binary --output-target=elf32-i386 \
+	         --binary-architecture=i386 $< $@
 
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
