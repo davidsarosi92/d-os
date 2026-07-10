@@ -57,11 +57,11 @@
 | §M26 | Wayland server (wire protocol on M22 + M25) | ~1615 |
 | §M27 | Process model — init, hierarchy, reaper, kill-tree — ✅ shipped | ~1818 |
 | §M28 | System log (klog ring buffer + dmesg) | ~1860 |
-| §M29 | Services / daemons — supervisor + SERVICE() registry | ~1895 |
+| §M29 | Services / daemons — supervisor + SERVICE() registry + service bus (endpoint/contract/transport) | ~1895 |
 | §M30 | Task scheduling — cron service | ~1935 |
 | §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) | ~1960 |
 | §M32 | Multi-user — identity, login, file perms, isolation | ~2160 |
-| §M33 | Switchable driver placement — fault-tolerant → user-mode isolation | ~2265 |
+| §M33 | Execution domains — where a service runs (kernel / user / isolated); driver placement is the flagship case | ~2265 |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -189,11 +189,11 @@ what); a session can pick a theme and push on it.
 | M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | §M26 |
 | M27 | Process model — init, parent/child hierarchy, always-on reaper, kill-tree | Concurrency | ✅ DOCS §4.15 |
 | M28 | System log — klog ring buffer, severity levels, /proc/kmsg, dmesg | Observability | §M28 |
-| M29 | Services / daemons — SERVICE() registry + supervisor (autostart, restart policy) | Architecture | §M29 |
+| M29 | Services / daemons — SERVICE() registry + supervisor (autostart, restart policy) + service bus (endpoint / contract / transport, location-independent binding) | Architecture | §M29 |
 | M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | §M30 |
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | §M31 |
 | M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation | Security | §M32 |
-| M33 | Switchable driver placement — fault-tolerant hosting → user-mode driver isolation (hybrid kernel) | Reliability | §M33 |
+| M33 | Execution domains — a service's run location (kernel / user / isolated) as a declared capability + config choice; driver placement (fault-tolerant → user-mode isolation) is the flagship case | Reliability | §M33 |
 
 ### Cross-cutting constraints
 
@@ -2176,6 +2176,15 @@ syscall table (SYS_PRINT / SYS_EXIT), and no fd concept at all.
 This milestone builds that substrate.  It is worth doing regardless
 of Wayland — it is what turns d-os tasks into real user processes.
 
+**Also the unlock for the M29/M33 service model.**  The service bus's
+non-local transports (`IPC` / `SharedMemory`, §M29) and the `USER` /
+`ISOLATED` execution domains (§M33) are *defined now but reserved* —
+they are real only once this milestone's per-process address spaces +
+fd passing + shared memory exist.  M25 is therefore the gate that turns
+"a service can be configured to run in its own isolated process" from
+design into a working config flip.  Design M25's fd/IPC/shm APIs with
+that consumer in mind (they are what the bus transports bind to).
+
 **Prerequisites — ✅ ready on all three arches (2026-07-10).**  The
 arch substrate M25 builds on is now present and verified uniformly:
 each of i386 / x86_64 / aarch64 can enter user mode (ring 3 / EL0),
@@ -2337,12 +2346,23 @@ rotation, remote syslog, rate-limiting (noted for later).
 
 ---
 
-## §M29 — Services / daemons: supervisor + SERVICE() registry
+## §M29 — Services / daemons: supervisor + SERVICE() registry + service bus
+
+**Two halves.**  (a) A **supervisor** (systemd-lite / SMF-lite) — the
+lifecycle answer to child death (stages 1–4 below).  (b) A **service
+bus** — the *discovery + binding* answer to "how do services find and
+call each other" (endpoint / contract / transport, the subsection after
+the supervisor).  Both follow the established registry pattern
+(`DRIVER()`, `GUI_APP()`, `SHELL_PROVIDER()`), so this is idiomatic d-os,
+not a new subsystem style.  The bus is what turns the supervisor from a
+"process babysitter" into a **service broker**: it doesn't just keep a
+service alive, it publishes the service's endpoint and wires callers to
+it over the right transport — which is what makes §M33's execution
+domains (where a service runs) a pure config decision instead of a code
+decision.
 
 **Why now:** gives the OS a "systemd-lite / SMF-lite" — long-lived
-supervised workloads with a real lifecycle.  Follows the established
-registry pattern (`DRIVER()`, `GUI_APP()`, `SHELL_PROVIDER()`), so it
-is idiomatic d-os rather than a new subsystem style.
+supervised workloads with a real lifecycle.
 
 **This is the "upward" answer to child death.**  M27 propagates
 termination *downward* (kill-tree) but deliberately does NOT let a
@@ -2358,6 +2378,8 @@ its first real user).
 **Depends on:** §M27 (parentage, exit codes, kill-tree, detached spawn
 for the supervised children; the supervisor uses task_spawn_detached so
 services aren't tied to whoever ran `service start`), §M28 (log there).
+
+### Supervisor — the lifecycle half
 
 **Design — staged.**
 
@@ -2376,16 +2398,109 @@ services aren't tied to whoever ran `service start`), §M28 (log there).
    procfs stats sampler) proving autostart + restart-on-crash; cron
    (M30) becomes the first *real* service.
 
+### Service bus — the discovery + binding half
+
+**Why:** today a caller reaches a subsystem by *hard-linking* to its
+symbols (call `net_send()` directly).  That couples the caller to *this*
+implementation, in *this* address space.  The bus replaces the hard link
+with a **named, versioned, transport-abstracted binding** — the QNX
+resource-manager / Fuchsia FIDL / Android-Binder shape, sized down for a
+teaching OS.  The three concepts (deliberately mirroring how `hal_api.h`
+already versions an interface):
+
+- **Endpoint** — a name in a flat namespace (`net.default`, `net.eth0`,
+  `block.vda`).  *Discovery*: a caller resolves an endpoint to a
+  binding; it never names an implementation or an address space.  This
+  is the same idea as the `shell.provider` / `gui.shell` config keys,
+  generalised into a runtime registry.
+- **Contract** — a *versioned interface* identified by `(name,
+  version)`, e.g. `NetworkDevice v1`.  Concretely a versioned
+  struct-of-function-pointers (exactly `hal_api.h`'s shape).  **No IDL /
+  codegen** — hand-written C interface structs stay readable and are the
+  right altitude for this OS.
+- **Transport** — *how* a binding is invoked.  `LocalCall` (direct
+  function call, same address space — the only real one until §M25);
+  `SharedMemory` and `IPC` are defined now but reserved (they need
+  §M25's per-process spaces + fd passing).
+
+**Binding resolution.**  A caller asks the broker for
+`(endpoint, contract@version)`; the broker finds the provider, checks
+the transport is valid for the provider's **execution domain** (§M33 —
+a KERNEL-domain provider can serve `LocalCall`; a USER-domain provider
+needs `IPC`/`SharedMemory`), and returns a handle the caller invokes
+transport-agnostically.  This is where location-independence *comes
+from*: the caller's code is identical whether the service is in-kernel
+or in a ring-3 process — only the transport differs, and the broker
+picks it.
+
+**Contract-versioning policy — decided (2026-07-10).**  Strict and
+adapter-shim are *not* competing options; they live in different layers,
+so we take both:
+
+- The broker is **always strict on the wire**: it binds only an *exact*
+  `contract@version` match.  Deterministic, debug-friendly, no silent
+  adaptation.
+- **Compatibility is an opt-in mechanism, not a policy branch:** an
+  `ADAPTER(from = NetworkDevice v1, to = NetworkDevice v2)` registry
+  entry (same self-registration story as everything else).  When a
+  strict bind for `v1` misses but a `v2` provider exists, the broker —
+  *iff* the `allow-adaptation` config bit is set — inserts the registered
+  shim, which synthesises a `v1` endpoint over the `v2` provider.
+- **"Backward-compatible" is then just a special case:** a provider that
+  implements several versions registers as its *own* multi-version
+  adapter.  No separate policy code path.
+- **Boilerplate only where it's real:** a shim is written only for the
+  version pair that actually needs bridging — not paid by every service.
+  The config knob is a single `allow-adaptation` bit (off = pure strict,
+  deterministic; on = registered bridges live), *not* a global
+  Strict-vs-Backward toggle.
+
+**Marshalling discipline — the crux, enforce it from day one.**
+`LocalCall` passes a pointer and calls a function; `IPC`/`SharedMemory`
+must *serialise* arguments.  A contract that is designed for pointer
+passing **cannot** later move to a non-local transport without breaking.
+So — per convention #5 — contracts are designed **as if marshalled even
+while only `LocalCall` exists**: arguments are handles + copied/shared
+buffers, never freely-shared raw kernel pointers.  Get this wrong and a
+`v1` contract is stuck in-kernel forever; get it right and moving a
+service to a USER domain (§M33) is a config flip, not a rewrite.
+
+**Design — staged.**
+
+5. **Registry + resolver (LocalCall only).**  `SERVICE()` grows
+   `endpoint` + `contract` (name+version); a `bus_bind(endpoint,
+   contract)` resolver returns a `LocalCall` handle; `/proc/bus` lists
+   endpoints (name, contract\@ver, domain, transport, provider pid).
+   Arch-independent, buildable *now* — the immediate win is services
+   finding each other by endpoint instead of hard-linking.
+6. **Contract discipline + adapters.**  Define the first real contracts
+   (`NetworkDevice`, `BlockDevice`) marshalling-shaped; add the
+   `ADAPTER()` section + `allow-adaptation` resolution path.
+7. **Non-local transports (design now, land with §M25).**  The `IPC` /
+   `SharedMemory` transport backends — reserved interface today, real
+   once §M25 ships unix sockets + fd passing + shared memory.  This is
+   the same waist §M33's driver-runtime API needs; build it once, share
+   it.
+
 **Definition of done:**
-- An `always`-restart service killed by hand comes back on its own,
-  and the restart is visible in `dmesg` + `/proc/services`.
-- `service list` reflects live state; disabling in config keeps it
-  down across boots.
-- DOCS.md gains a "Services" chapter.
+- *Supervisor:* an `always`-restart service killed by hand comes back on
+  its own, visible in `dmesg` + `/proc/services`; `service list`
+  reflects live state; disabling in config keeps it down across boots.
+- *Bus:* a caller binds `net.default` / `NetworkDevice v1` and calls it
+  with no compile-time link to the provider; `/proc/bus` shows the
+  endpoint, its contract version, domain, and transport.
+- *Versioning:* with only a `v2` provider registered, a strict `v1` bind
+  fails cleanly with `allow-adaptation` off, and succeeds via the
+  registered `v1→v2` shim with it on.
+- DOCS.md gains a "Services & the service bus" chapter.
 
 **Out of scope:** dependency ordering / socket activation, resource
-limits (cgroup-style), user/permission separation (no userland yet),
-D-Bus-style IPC.
+limits (cgroup-style), user/permission separation (no userland yet); the
+non-local (`IPC`/`SharedMemory`) transports are *designed* here but only
+land with §M25; remote/networked endpoints (a service on another host
+over §M24) are the logical extreme of location-independence but stay an
+explicit non-goal — do not let them pull the transport abstraction into
+premature generality.
 
 ---
 
@@ -2554,18 +2669,53 @@ the GUI multi-session piece leans on the §M22.7 "GUI session" model.
 
 ---
 
-## §M33 — Switchable driver placement: fault-tolerant hosting → user-mode driver isolation
+## §M33 — Execution domains: where a service runs (kernel / user / isolated)
 
-**Why:** today every driver runs in ring 0 in the single shared kernel
-address space (the `DRIVER()` registry links them in at boot).  A buggy
-driver can corrupt any memory, and a fault panics the whole system — the
-Windows 9x / VxD failure mode.  This milestone gives drivers *fault
+**The generalisation.**  Don't hard-code "kernel vs user" as a binary
+baked into each subsystem.  Instead make the **execution domain** a
+first-class, *declared* property of a service (§M29), chosen by config:
+
+- `DOMAIN_KERNEL` — ring 0 / EL1, shared kernel address space; the
+  bus's `LocalCall` transport works directly; monolithic, zero IPC cost.
+- `DOMAIN_USER` — ring 3 / EL0, its own address space; needs a non-local
+  transport (`IPC` / `SharedMemory`); real memory isolation.
+- `DOMAIN_ISOLATED` — a USER domain plus a restricted capability set
+  (granted ports / MMIO / IRQs only); the sandboxed extreme.
+
+**Domain = declared capability, config *chooses* — not arbitrary.**  A
+service declares which domains it *can* run in
+(`.domains = DOMAIN_KERNEL | DOMAIN_USER`, default KERNEL-only) — that's
+a capability of the code.  Config then picks *among the declared set*;
+the broker (§M29) resolves it at bind time and selects a transport valid
+for the chosen domain.  So domain and transport are coupled: **choosing a
+domain constrains the valid transports** (KERNEL → LocalCall; USER /
+ISOLATED → IPC / SharedMemory).  This is the config-driven, user-tunable
+"where does it run" the discussion asked for — a deployment decision, not
+a code decision, made honest by the capability declaration.
+
+**Honesty gate — no advisory isolation that pretends to be real.**  Today
+*every* task is a ring-0 kthread in one shared address space, so only
+`DOMAIN_KERNEL` + `LocalCall` is *actually* real.  `DOMAIN_USER` /
+`DOMAIN_ISOLATED` are **defined now but reserved**, and become real only
+once §M25 (per-process VMM, ring-3 processes, fd table, IPC) ships —
+exactly like §M32's "advisory until M25" stance.  The domain field
+accepts `KERNEL` today; `USER` / `ISOLATED` are refused (loudly) until
+the substrate exists, so we never ship isolation theatre.
+
+**The flagship case — driver placement (a driver is a service).**  Every
+driver runs today in ring 0 in the single shared address space (the
+`DRIVER()` registry links them in at boot).  A buggy driver can corrupt
+any memory, and a fault panics the whole system — the Windows 9x / VxD
+failure mode.  Applying execution domains to drivers gives them *fault
 tolerance* and, on top of §M25, *real isolation*: a driver can crash and
 be **restarted without taking the system down**, and selected drivers can
-be moved out of the kernel into their own ring-3 process.  The knob is
-**per-driver** and config-driven (a desktop keeps drivers in-kernel for
-speed; a server profile isolates them), applied at restart — a **hybrid
-kernel** (NT / XNU-shaped), not a wholesale micro-vs-monolith flip.
+be moved into their own ring-3 process.  The knob is **per-driver** and
+config-driven (a desktop keeps drivers in KERNEL for speed; a server
+profile moves them to USER), applied at restart — a **hybrid kernel**
+(NT / XNU-shaped), not a wholesale micro-vs-monolith flip.  The staged
+plan below is written in driver terms because drivers are the first and
+hardest domain-switchable service; the same machinery serves any §M29
+service.
 
 **The key architectural idea — one narrow waist, two backends.**  A
 driver is written against a *driver-runtime API* (`drv_port_out`,
@@ -2583,6 +2733,17 @@ The API must be IPC-/capability-shaped **from day one** even while only the
 in-kernel backend exists (convention #5), or the second backend will not
 fit later.
 
+**This waist *is* §M29's transport abstraction — build it once.**  "One
+API, an in-kernel backend and a user-mode backend" is exactly the bus's
+"one Contract, invoked over `LocalCall` or over `IPC`/`SharedMemory`."
+The driver-runtime API is a Contract; its two backends are two
+Transports; the per-driver domain flag is the config choice the broker
+resolves.  Don't design a second, parallel marshalling boundary for
+drivers — the same marshalling discipline (handles + copied/shared
+buffers, no free pointers) and the same `IPC`/`SharedMemory` transport
+backends serve both.  M33 is the *policy + capability + recovery* layer
+on top of the M29 *binding* layer.
+
 **Design — staged (climb, don't jump).**
 
 1. **Tier 0 — fault-tolerant in-kernel hosting (no §M25 needed).**  Wrap
@@ -2599,22 +2760,24 @@ fit later.
 2. **The runtime-API waist (design at §M25 time).**  Define the
    driver-runtime API in its final IPC-shaped form; implement only the
    in-kernel backend first.  Add a per-driver capability flag to the
-   registry: `.placements = PLACE_KERNEL | PLACE_USER` (default
-   KERNEL-only).  **Boot-critical** drivers (console / framebuffer, timer,
-   interrupt controller, boot storage) are pinned PLACE_KERNEL — they come
-   up *before* the process / IPC substrate exists (chicken-and-egg) and
+   registry: `.domains = DOMAIN_KERNEL | DOMAIN_USER` (default
+   KERNEL-only) — the same declared-capability field the intro defines.
+   **Boot-critical** drivers (console / framebuffer, timer, interrupt
+   controller, boot storage) are pinned DOMAIN_KERNEL — they come up
+   *before* the process / IPC substrate exists (chicken-and-egg) and
    never appear in the toggle list.
 3. **Tier 1 — user-mode isolation for non-DMA drivers (needs §M25).**
    Implement the user-mode backend and move a first *non-DMA* driver (PS/2
    keyboard or serial) into a ring-3 process, proving the same source runs
    both ways (rump-style demo).  Full memory isolation + real restart, no
    IOMMU required (no DMA to constrain).
-4. **Placement list + config surface.**  Config keys mirror the existing
+4. **Domain list + config surface.**  Config keys mirror the existing
    pattern (`gui.shell`, `shell.provider`): `driver.profile =
-   desktop|server` plus per-driver `driver.<name>.placement = kernel|user`
-   overrides.  A `/proc/drivers` live view (name, placement, pid if
-   user-mode, isolation = full/advisory/none, restart count) and a `driver
-   list | set <name> kernel|user` command.  **Restart-to-apply** is the v1
+   desktop|server` plus per-driver `driver.<name>.domain =
+   kernel|user|isolated` overrides.  A `/proc/drivers` live view (name,
+   domain, transport, pid if user-mode, isolation = full/advisory/none,
+   restart count) and a `driver list | set <name> kernel|user` command.
+   **Restart-to-apply** is the v1
    semantics — changing where a driver runs re-plumbs its bring-up, and
    live re-placement is the hard live-update problem; `driver set` writes
    config and reports "restart required".  (Live re-placement falls out
@@ -2642,11 +2805,11 @@ fit later.
   supervisor instead of panicking; visible in `dmesg` + the
   `/proc/drivers` restart count.
 - Tier 1: `driver set ps2kbd user` + restart brings the keyboard up in a
-  ring-3 process (`/proc/drivers` shows placement=user, a pid,
+  ring-3 process (`/proc/drivers` shows domain=user, a pid,
   isolation=full); killing that process restarts it, the keyboard keeps
   working, and the kernel does not fault.
-- The same driver source, unchanged, runs in both placements.
-- DOCS.md gains a "Driver placement / isolation" chapter.
+- The same driver source, unchanged, runs in both domains.
+- DOCS.md gains an "Execution domains / driver isolation" chapter.
 
 **Out of scope (initially):** live (no-restart) re-placement; Tier 2
 without an IOMMU; GPU / NIC isolation (arrive with their own drivers);
@@ -2654,9 +2817,12 @@ driver-to-driver dependency ordering across the boundary; per-driver
 resource quotas.
 
 **Depends on:** §M27 (lifecycle + kill-tree + change-hook — shipped) for
-Tier 0; §M25 (ring 3 + per-process address spaces + IPC) for the
-user-mode backend (Tier 1+); §M29 (supervisor) + §M31 (watchdog) for the
-detect-and-restart half; an IOMMU driver for *safe* Tier 2.  **Philosophy
+Tier 0; §M29 for the *binding* substrate this builds on — the service bus
+(endpoint / contract / transport) + the domain-declaration field + the
+broker that resolves a domain to a transport, plus the supervisor for the
+restart half; §M25 (ring 3 + per-process address spaces + IPC) for the
+user-mode backend / non-local transports (Tier 1+); §M31 (watchdog) for
+the detect-hang half; an IOMMU driver for *safe* Tier 2.  **Philosophy
 note:** Tier 0–1 fit the Linux-inspired monolith (CLAUDE.md #6); Tier 2
 (user-mode DMA drivers) leans microkernel — a deliberate identity choice,
 hence gated behind the IOMMU and treated as a north star, not a default.

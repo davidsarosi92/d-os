@@ -185,8 +185,16 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   - §M28 — System log: klog ring buffer + severity levels +
     /proc/kmsg + `dmesg`.
   - §M29 — Services/daemons: `SERVICE()` registry + supervisor
-    (autostart + restart policy) — systemd-lite.  The "upward" answer
-    to child-death (supervision/wait).
+    (autostart + restart policy) — systemd-lite, the "upward" answer
+    to child-death (supervision/wait) — PLUS a **service bus**
+    (endpoint / contract\@version / transport) so services find + call
+    each other by name, not hard-link (QNX/FIDL-shaped).  Broker is
+    strict on exact contract match; compat is an opt-in `ADAPTER()`
+    shim gated by an `allow-adaptation` config bit.  Contracts designed
+    marshalling-shaped (handles + copied buffers, no free pointers)
+    from day one so a `LocalCall` service can later move to
+    IPC/SharedMemory.  The bus makes §M33 execution domains a config
+    (not code) decision.
   - §M30 — Task scheduling: cron as the first real service.
   - §M31 — Watchdog: heartbeat-based freeze detection (per-task /
     per-CPU softlockup / hardware) — the other half of "is it hung?".
@@ -195,6 +203,17 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   rwx perms, privilege gating, per-user process isolation.  Hard-depends
   on §M25 (real isolation needs per-process address spaces; today's
   ring-0 kthreads share one, so users would be advisory until then).
+- **§M33 — Execution domains** (design only): a service's run location
+  (`DOMAIN_KERNEL` / `USER` / `ISOLATED`) is a *declared capability*
+  (`.domains` field), config *chooses* among the declared set; the §M29
+  broker resolves domain → transport at bind.  Domain constrains
+  transport (KERNEL→LocalCall, USER/ISOLATED→IPC/SharedMemory).  Only
+  `KERNEL`+LocalCall is real today; `USER`/`ISOLATED` reserved until
+  §M25 (no isolation theatre).  Flagship case = switchable **driver
+  placement** (Tier 0 fault-tolerant in-kernel hosting → Tier 1
+  user-mode non-DMA → Tier 2 DMA+IOMMU); the driver-runtime "narrow
+  waist, two backends" IS the M29 transport abstraction.  Hybrid kernel
+  (NT/XNU), not a micro-vs-monolith flip.
 - **§M-registry** — Windows-style registry PARKED (accidental history;
   /etc + procfs already covers it).
 
