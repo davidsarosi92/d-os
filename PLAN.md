@@ -57,6 +57,7 @@
 | §M26 | Wayland server (wire protocol on M22 + M25) | ~1615 |
 | §M27 | Process model — init, hierarchy, reaper, kill-tree — ✅ shipped | ~1818 |
 | §M28 | System log (klog ring buffer + dmesg) — ✅ shipped | ~1860 |
+| Tier A | Blocking primitives — wait-queue + task_wait + blocking IPC — ✅ shipped (DOCS §4.20) | — |
 | §M29 | Services / daemons — supervisor + SERVICE() registry + service bus (endpoint/contract/transport) | ~1895 |
 | §M30 | Task scheduling — cron service | ~1935 |
 | §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) | ~1960 |
@@ -189,6 +190,7 @@ what); a session can pick a theme and push on it.
 | M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | §M26 |
 | M27 | Process model — init, parent/child hierarchy, always-on reaper, kill-tree | Concurrency | ✅ DOCS §4.15 |
 | M28 | System log — klog ring buffer, severity levels, /proc/kmsg, dmesg | Observability | ✅ DOCS §4.18 |
+| Tier A | Blocking primitives — wait-queue (block/wake), task_wait, blocking socket read + poll | Concurrency | ✅ DOCS §4.20 |
 | M29 | Services / daemons — SERVICE() registry + supervisor (autostart, restart policy) + service bus (endpoint / contract / transport, location-independent binding) | Architecture | §M29 |
 | M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | §M30 |
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | §M31 |

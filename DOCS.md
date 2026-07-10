@@ -2500,6 +2500,63 @@ ring 3).  All green on i386 + x86_64 + aarch64 (libctest: i386).
 
 ---
 
+### 4.20 Blocking primitives — wait-queue, task_wait, blocking IPC (Tier A)
+
+**What it is.**  The primitive that was missing under M25: a way for a task to
+sleep *until an event*, not just round-robin-yield (`task_yield`) or die
+(`task_exit`).  Before this, `TASK_SLEEPING` was an inert enum value and every
+"blocking"-looking path polled (the init reaper hlt+yield loop, a would-be
+blocking socket read).  Tier A makes `TASK_SLEEPING` real and builds three
+things on it: `task_wait`, blocking socket `read`/`recv`, and blocking `poll`.
+
+**Wait-queue (`waitq.h`, implemented in `task.c`).**  `struct waitq { spinlock
+lock; struct task* head; }` — an intrusive queue (tasks link via
+`task.wq_next`).  API: `waitq_lock/unlock`, `waitq_block` (park the caller),
+`waitq_wake_one/all`.  A parked task is fully off every runqueue (zero CPU),
+`TASK_SLEEPING`; a wake sets it `RUNNABLE` and re-enqueues it via the normal
+scheduler pick (affinity-aware CPU choice + a reschedule IPI if it lands on
+another core — so **cross-CPU wake works**).  Parking mirrors `task_exit`'s
+lock-handoff discipline: register on the queue + flip to `SLEEPING` while
+holding the queue lock, detach from the runqueue, then drop the lock and
+`schedule()` away.
+
+**Lost-wakeup safety.**  The queue's own lock IS the condition lock
+(pthread_cond_wait discipline): the consumer holds it across check-then-block,
+the producer across mutate-then-wake, so a wake can never slip between "saw not
+ready" and "parked".  `waitq_block` atomically parks + drops the lock and
+re-acquires it before returning — always loop on the condition
+(`while (!cond) waitq_block(&wq);`), a spurious wake just re-blocks.  Interrupts
+are held off across the tiny unlock→context-switch window; a remote waker there
+just leaves the task `RUNNABLE` on a runqueue (re-picked, not lost).
+
+**`task_wait(pid, &code)` (`task.c`).**  POSIX-waitpid-shaped: block until a
+child (specific pid, or any child when `pid <= 0`) is DEAD, record its exit
+code, reap it, return its pid; `-1` if there is no matching child.  Parked on a
+global `child_exit_wq` that `task_exit_code` wakes **after** marking itself DEAD
+(set-condition-before-signal-lock → race-free).  Contract: a parent that will
+`task_wait` a child claims its reap with `task_set_reap_owned(child, 1)` at
+spawn, so init's universal reaper leaves the DEAD struct for `task_wait` to
+harvest instead of freeing it first.  This is M29's supervisor building block.
+
+**Blocking IPC (`usock.c`, `usyscall.c`).**  Each socket endpoint gained a
+per-endpoint read wait-queue (which now also serialises its receive ring, so
+two tasks may safely share a pair).  A blocking `usock_recv` on an empty
+endpoint parks until the peer's `usock_send` (fills the ring + wakes) or
+`usock_close` (wakes → EOF).  `read(2)`/`recv(2)` block by default; the
+non-blocking snapshot path (`block == 0`) is kept for poll's drain.  `poll`
+with `timeout < 0` blocks on a global readiness wait-queue that the socket
+layer raises via `fd_readiness_signal`; `timeout == 0` is the old snapshot;
+a finite positive `timeout` is still a snapshot (a *timed* wakeup is deferred
+with cron/watchdog's timed-sleep).
+
+**Self-test.**  `waittest`: (1) `task_wait` blocks on a child that burns CPU
+then exits 42 — verifies block + code; (2) a producer task sends to a socket
+the shell task blocks reading — verifies cross-task blocking recv; (3) closing
+the peer of a blocked reader returns 0 (EOF).  All three green on i386 +
+x86_64 + aarch64.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -2570,6 +2627,21 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-10 — Tier A: blocking primitives (wait-queue + task_wait + blocking
+  IPC).**  Makes `TASK_SLEEPING` real — the missing "sleep until an event"
+  primitive under M25.  (1) **Wait-queue** (`waitq.h`, impl in `task.c`):
+  `struct waitq` + `waitq_block`/`waitq_wake_one`/`waitq_wake_all`, lost-wakeup-
+  free via the pthread_cond_wait discipline (queue lock = condition lock), a
+  parked task off every runqueue, SMP cross-CPU wake (re-enqueue + reschedule
+  IPI).  (2) **`task_wait(pid,&code)`** — parent blocks until a child exits,
+  gets its code, reaps it; woken by `task_exit_code`; the reap-ownership
+  contract (`task_set_reap_owned`) keeps init from harvesting a waited child.
+  (3) **Blocking IPC** — per-endpoint socket read wait-queue (also serialises
+  the ring for two-task use), blocking `read`/`recv` (empty → sleep; peer send
+  wakes; peer close → EOF), blocking `poll(timeout<0)` on a global readiness
+  queue raised by `fd_readiness_signal`.  Self-test `waittest` green on i386 /
+  x86_64 / aarch64; socktest/polltest/fdtest/shmtest regression-clean.  Tier A
+  is the foundation the M29 service supervisor + M30/M31 build on.  See §4.20.
 - **2026-07-10 — M25: userland foundation (stages 1–7).**  The substrate that
   turns d-os kernel threads into real user processes, built + verified on
   i386 / x86_64 / aarch64 (libc: i386 reference).  (1) **Per-process address

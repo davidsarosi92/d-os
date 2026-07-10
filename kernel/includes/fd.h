@@ -61,9 +61,21 @@ void        shm_unref (struct shm* s);   /* frees frames at refcount 0 */
 
 int  usock_pair (struct usock** a, struct usock** b);
 long usock_send (struct usock* s, const void* buf, size_t n, struct ofile* passfile);
-long usock_recv (struct usock* s, void* buf, size_t n, struct ofile** passfile_out);
+/* Tier A.3 — `block`: when non-zero and the endpoint has nothing to receive
+ * (no bytes, no passed fd) but the peer is still open, park the caller on the
+ * endpoint's read wait-queue until usock_send/usock_close wakes it, then
+ * re-drain.  block == 0 keeps the original non-blocking snapshot behaviour
+ * (poll's drain path, single-task self-tests). */
+long usock_recv (struct usock* s, void* buf, size_t n, int block,
+                 struct ofile** passfile_out);
 void usock_close(struct usock* s);
 int  usock_can_read (struct usock* s);   /* bytes buffered? (poll POLLIN)  */
 int  usock_can_write(struct usock* s);   /* peer open + space? (POLLOUT)   */
+
+/* Tier A.3 — poll readiness signal.  usock_send / usock_close call this
+ * after changing an fd's readiness so a task blocked in a (timeout < 0)
+ * poll() wakes and re-scans.  Defined in usyscall.c (owns the global
+ * readiness wait-queue); declared here so the socket layer can raise it. */
+void fd_readiness_signal(void);
 
 #endif

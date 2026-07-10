@@ -22,6 +22,7 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "console.h"
+#include "waitq.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -66,7 +67,9 @@ long sys_read(int fd, void* buf, size_t n) {
     struct ofile* o = fd_lookup(fd);
     if (!o) return -1;
     if (o->kind == FD_VFS)  return (long)vfs_read(o->file, buf, n);
-    if (o->kind == FD_SOCK) return usock_recv(o->sock, buf, n, NULL);
+    /* Sockets read(2) with POSIX blocking semantics (block == 1): an empty
+     * read waits for the peer to send (or close → 0/EOF). */
+    if (o->kind == FD_SOCK) return usock_recv(o->sock, buf, n, 1, NULL);
     return -1;
 }
 
@@ -197,7 +200,9 @@ long sys_recv(int fd, void* buf, size_t n, int* passfd_out) {
     if (!o || o->kind != FD_SOCK) { if (passfd_out) *passfd_out = -1; return -1; }
 
     struct ofile* passed = NULL;
-    long r = usock_recv(o->sock, buf, n, &passed);
+    /* recv(2) blocks like read(2) when the endpoint is empty and the peer is
+     * still open (block == 1). */
+    long r = usock_recv(o->sock, buf, n, 1, &passed);
 
     if (passfd_out) {
         *passfd_out = -1;
@@ -214,16 +219,24 @@ long sys_recv(int fd, void* buf, size_t n, int* passfd_out) {
     return r;
 }
 
-/* ---- poll / readiness (stage 6) ------------------------------------------- */
+/* ---- poll / readiness (stage 6 + Tier A.3 blocking) ----------------------- */
 
-/* Non-blocking poll: fill each pollfd's revents with the currently-ready
- * events and return the number of fds with any event set.  A `timeout` other
- * than 0 is accepted but not honoured yet — true blocking (sleep until an fd
- * becomes ready) arrives with the concurrent-process scheduler; today this is
- * the readiness snapshot Wayland's event loop polls each iteration. */
-int sys_poll(struct pollfd* pfds, int nfds, int timeout) {
-    (void)timeout;
-    if (!pfds || nfds < 0) return -1;
+/* Global "some fd's readiness changed" wait-queue.  A task blocked in a
+ * (timeout < 0) poll parks here; the socket layer raises fd_readiness_signal
+ * after a send/close so the poller wakes and re-scans.  One shared queue (not
+ * per-fd) keeps poll's multi-fd wait simple — a woken poller just re-snapshots
+ * all its fds, which is what a level-triggered poll does anyway. */
+static struct waitq readiness_wq = WAITQ_INIT;
+
+void fd_readiness_signal(void) {
+    uint32_t f = waitq_lock(&readiness_wq);
+    waitq_wake_all(&readiness_wq);
+    waitq_unlock(&readiness_wq, f);
+}
+
+/* Fill each pollfd's revents with the currently-ready events; return the
+ * number of fds with any requested event set (the readiness snapshot). */
+static int poll_snapshot(struct pollfd* pfds, int nfds) {
     int ready = 0;
     for (int i = 0; i < nfds; i++) {
         struct pollfd* pf = &pfds[i];
@@ -247,6 +260,30 @@ int sys_poll(struct pollfd* pfds, int nfds, int timeout) {
         if (pf->revents) ready++;
     }
     return ready;
+}
+
+/* poll(2).  timeout == 0: non-blocking snapshot (the Wayland event-loop tick).
+ * timeout  < 0: block until at least one fd is ready (the classic "wait for an
+ * event" loop).  timeout  > 0: a finite millisecond wait is not honoured yet
+ * (needs a timed wakeup — deferred with cron/watchdog's timed-sleep); treated
+ * as a snapshot so it never blocks past the caller's intent. */
+int sys_poll(struct pollfd* pfds, int nfds, int timeout) {
+    if (!pfds || nfds < 0) return -1;
+
+    for (;;) {
+        int ready = poll_snapshot(pfds, nfds);
+        if (ready > 0 || timeout >= 0) return ready;   /* ready, or non-blocking */
+
+        /* timeout < 0 → block until readiness changes, then re-scan.  Re-check
+         * under the queue lock so a signal that races our snapshot isn't lost:
+         * the socket layer makes an fd ready BEFORE it takes readiness_wq to
+         * signal, so if we hold the lock and still see nothing ready, a wake
+         * can only arrive after we park. */
+        uint32_t f = waitq_lock(&readiness_wq);
+        if (poll_snapshot(pfds, nfds) > 0) { waitq_unlock(&readiness_wq, f); continue; }
+        waitq_block(&readiness_wq);
+        waitq_unlock(&readiness_wq, f);
+    }
 }
 
 void fd_close_all(void) {

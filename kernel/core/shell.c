@@ -40,6 +40,7 @@
 #include "elf.h"
 #include "proc.h"
 #include "syscall.h"
+#include "fd.h"
 
 #define LINE_MAX        128             /* max accepted bytes per command line */
 #define DEFAULT_PROMPT  "d-os> "        /* fallback when config is unavailable */
@@ -1013,6 +1014,70 @@ static void cmd_polltest(void) {
             drain_ok ? "PASS" : "FAIL");
 }
 
+/* ---- Tier A: wait-queue / task_wait / blocking read self-test ------------- */
+
+/* Part 1 — task_wait.  The child burns a little CPU (so the parent reaches
+ * task_wait and truly BLOCKS before the child exits — exercising the sleep
+ * path, not a fast-path pickup), stamps a marker, then exits with code 42. */
+static volatile int g_waitkid_marker;
+static void waitkid_entry(void) {
+    for (volatile int i = 0; i < 3000000; i++) { }
+    g_waitkid_marker = 0x1234;
+    task_exit_code(42);
+}
+
+/* Part 2 — blocking socket read across two tasks.  The producer runs on its
+ * own task; the shell task is the consumer and does a BLOCKING usock_recv on
+ * the empty endpoint, so it parks on the socket's read wait-queue until the
+ * producer's send wakes it.  Raw usock_* (not fds) because fd numbers are
+ * per-task — the shared object is the endpoint pointer. */
+static struct usock*    g_bt_prod_ep;
+static void blockprod_entry(void) {
+    for (volatile int i = 0; i < 4000000; i++) { }   /* let the consumer block first */
+    usock_send(g_bt_prod_ep, "PONG", 4, NULL);
+    task_exit();
+}
+
+static void cmd_waittest(void) {
+    /* --- Part 1: task_wait blocks until the child exits, returns its code. */
+    g_waitkid_marker = 0;
+    struct task* c = task_spawn("waitkid", waitkid_entry);
+    if (!c) { console_write("waittest: spawn failed\n"); return; }
+    int kpid = c->pid;
+    task_set_reap_owned(c, 1);         /* claim the reap so init won't harvest first */
+    int code = -1;
+    int r = task_wait(kpid, &code);
+    int wait_ok = (r == kpid && code == 42 && g_waitkid_marker == 0x1234);
+
+    /* --- Part 2: blocking recv parks until a producer task sends. */
+    struct usock *a = NULL, *b = NULL;
+    int read_ok = 0, eof_ok = 0;
+    if (usock_pair(&a, &b) == 0) {
+        g_bt_prod_ep = a;              /* producer sends on a → fills b's ring */
+        struct task* p = task_spawn("blockprod", blockprod_entry);
+        int ppid = p ? p->pid : -1;
+        if (p) task_set_reap_owned(p, 1);
+
+        char rb[8];
+        long got = usock_recv(b, rb, sizeof rb, 1, NULL);   /* BLOCKS until send */
+        read_ok = (got == 4 && rb[0] == 'P' && rb[1] == 'O' &&
+                   rb[2] == 'N' && rb[3] == 'G');
+
+        if (ppid >= 0) task_wait(ppid, NULL);               /* reap the producer */
+
+        /* Blocking recv on a now-empty endpoint whose peer we close returns
+         * 0 (EOF) rather than hanging — the close wakes the reader. */
+        usock_close(a);                                     /* peer of b closes */
+        long eof = usock_recv(b, rb, sizeof rb, 1, NULL);
+        eof_ok = (eof == 0);
+        usock_close(b);
+    }
+
+    kprintf("waittest: task_wait(block+code)=%s blocking-recv=%s peer-close-EOF=%s\n",
+            wait_ok ? "PASS" : "FAIL", read_ok ? "PASS" : "FAIL",
+            eof_ok ? "PASS" : "FAIL");
+}
+
 /* M25 stage 7 — run the in-tree-libc compiled-C user program embedded as a
  * blob (user/hello.c → static ELF → objcopy).  Weak symbols so the command
  * still links on arches that don't embed the blob yet (i386 is the reference
@@ -1187,6 +1252,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "socktest"))       { cmd_socktest(); return; }
     if (streq(line, "polltest"))       { cmd_polltest(); return; }
     if (streq(line, "libctest"))       { cmd_libctest(); return; }
+    if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "blktest"))        { cmd_blktest();  return; }
     if (streq(line, "bctest"))         { cmd_bctest();   return; }
     if (streq(line, "lsblk"))          { blk_list();     return; }

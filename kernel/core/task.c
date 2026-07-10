@@ -79,6 +79,7 @@
 #include "smp.h"
 #include "timer.h"          /* M22.3: per-task CPU-time accounting */
 #include "vmm.h"            /* M25: per-process address-space switch */
+#include "waitq.h"          /* Tier A.1: block/wake wait-queue primitive */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -95,6 +96,14 @@ static spinlock_t   master_lock = SPINLOCK_INIT;
 /* M27 — pid of the init/reaper task (0 until task_start_init runs).
  * Orphans re-parent here; the reaper loop runs under this pid. */
 static int          g_init_pid  = 0;
+
+/* Tier A.2 — child-exit wait-queue.  A task blocked in task_wait() parks
+ * here; task_exit_code() wakes every waiter after marking itself DEAD, so a
+ * parent notices a child's death without polling.  One global queue (not
+ * per-parent) keeps it simple — a waiter just re-scans its own children on
+ * wake, which is cheap (task counts are small) and correct (a spurious wake
+ * from an unrelated exit just re-blocks). */
+static struct waitq child_exit_wq = WAITQ_INIT;
 
 /* ------------------------------------------------------------------- */
 /* Helpers.                                                             */
@@ -836,6 +845,76 @@ void task_start_init(void) {
     g_init_pid = t->pid;
 }
 
+/* ---- task_wait (Tier A.2) ------------------------------------------- */
+
+/* Scan the master list for a child of `parent_pid` matching `want` (>0 a
+ * specific pid, <=0 any child).  Caller holds child_exit_wq's lock (so the
+ * scan is serialized against a concurrent exit's wake — see task_wait).
+ * Reports, via out-params: whether any matching child is still alive, and
+ * the pid+exit_code of the first DEAD match found (dead_pid = -1 if none).
+ *
+ * Contract note: a parent that intends to task_wait a child should claim its
+ * reap with task_set_reap_owned(child, 1) at spawn time, so init's universal
+ * reaper leaves the DEAD struct in place for task_wait to harvest (otherwise
+ * init may reap-and-free it first, and this scan would report "no such child").
+ * task_wait IS that owning reaper, so — unlike the GUI's own-reap case — it
+ * deliberately harvests reap_owned children here.  Runs under master_lock
+ * (nested inside the queue lock; safe because task_exit_code never holds both
+ * at once — it releases master_lock before taking the queue lock). */
+static void wait_scan_locked(int parent_pid, int want,
+                             int* any_alive, int* dead_pid, int* dead_code) {
+    *any_alive = 0;
+    *dead_pid  = -1;
+    *dead_code = 0;
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    if (master_head) {
+        struct task* c = master_head;
+        do {
+            if (c->ppid == parent_pid && (want <= 0 || c->pid == want)) {
+                if (c->state == TASK_DEAD) {
+                    if (*dead_pid < 0) { *dead_pid = c->pid; *dead_code = c->exit_code; }
+                } else {
+                    *any_alive = 1;
+                }
+            }
+            c = c->next;
+        } while (c != master_head);
+    }
+    spin_unlock_irqrestore(&master_lock, fl);
+}
+
+int task_wait(int pid, int* code) {
+    struct task* self = task_current();
+    if (!self) return -1;
+    int me = self->pid;
+
+    uint32_t f = waitq_lock(&child_exit_wq);
+    for (;;) {
+        int any_alive, dead_pid, dead_code;
+        wait_scan_locked(me, pid, &any_alive, &dead_pid, &dead_code);
+
+        if (dead_pid >= 0) {
+            /* Found a dead child.  Capture the code now (under the queue
+             * lock, before anyone can reap the struct), then release the
+             * lock and reap outside it.  init's universal reaper may race
+             * us for the struct — whoever loses gets task_reap() == -1,
+             * but we already hold the exit code, so we still return it. */
+            waitq_unlock(&child_exit_wq, f);
+            if (code) *code = dead_code;
+            task_reap(dead_pid);
+            return dead_pid;
+        }
+        if (!any_alive) {
+            /* No matching child, alive or dead — nothing to wait for. */
+            waitq_unlock(&child_exit_wq, f);
+            return -1;
+        }
+        /* A matching child is alive but not yet dead — park until some
+         * task exits and wakes us, then re-scan. */
+        waitq_block(&child_exit_wq);
+    }
+}
+
 /* ------------------------------------------------------------------- */
 /* Per-task accessors (M14).                                            */
 /* ------------------------------------------------------------------- */
@@ -872,6 +951,18 @@ void task_exit_code(int code) {
 
     task_notify_change();                    /* M22.4 — went DEAD */
 
+    /* Tier A.2 — wake any parent parked in task_wait().  DEAD is already
+     * set (and master_lock released), so a waiter that acquires the queue
+     * lock after us is guaranteed to see this task dead on its re-scan —
+     * that ordering (set-condition BEFORE signal-lock) is what makes the
+     * wait/exit handshake lost-wakeup-free.  We wake ALL waiters and let
+     * each re-scan; only the real parent will match. */
+    {
+        uint32_t wf = waitq_lock(&child_exit_wq);
+        waitq_wake_all(&child_exit_wq);
+        waitq_unlock(&child_exit_wq, wf);
+    }
+
     /* Remove from this CPU's rq so the next pick doesn't keep
      * tripping over a DEAD entry.  (M18.6.1 — pre-refactor, DEAD
      * tasks were left in the ring and skipped by the state check;
@@ -889,6 +980,106 @@ void task_exit_code(int code) {
      * only if literally nothing else can run. */
     for (;;) { hal_intr_disable(); hal_cpu_halt(); }
 }
+
+/* ------------------------------------------------------------------- */
+/* Wait-queue: race-free block / wake (Tier A.1 — see waitq.h).         */
+/*                                                                       */
+/* Lives here (not in its own .c) because parking a task reaches deep    */
+/* into scheduler internals: this_cpu(), the per-CPU runqueue remove     */
+/* path, and schedule().  The public shape is in waitq.h.                */
+/* ------------------------------------------------------------------- */
+
+void waitq_init(struct waitq* wq) {
+    if (!wq) return;
+    spin_lock_init(&wq->lock);
+    wq->head = NULL;
+}
+
+uint32_t waitq_lock(struct waitq* wq) {
+    return spin_lock_irqsave(&wq->lock);
+}
+
+void waitq_unlock(struct waitq* wq, uint32_t flags) {
+    spin_unlock_irqrestore(&wq->lock, flags);
+}
+
+/* Park the current task on `wq`.  Called with wq->lock held + IRQs off
+ * (the flags saved by waitq_lock).  Mirrors task_exit's discipline —
+ * detach from the runqueue, then hand the CPU off — but with SLEEPING
+ * (resumable) instead of DEAD.
+ *
+ * Ordering that makes this lost-wakeup-free: we register on the queue
+ * AND flip to SLEEPING while STILL holding wq->lock, so any waker (which
+ * must also take wq->lock, by the condvar convention) either runs before
+ * us and finds nothing to check-then-block, or runs after us and finds a
+ * fully-parked task.  We drop wq->lock only once committed to sleeping.
+ *
+ * The unlock->schedule window: a remote waker there pops us, sets
+ * RUNNABLE and re-enqueues us on some CPU's rq while we are still
+ * `current` here.  That is not a lost wakeup — we are RUNNABLE on a rq;
+ * schedule() below either keeps running us (next==prev, we fall through
+ * and recheck) or switches away and we get picked again.  IRQs are off,
+ * so a same-CPU timer cannot preempt the window. */
+void waitq_block(struct waitq* wq) {
+    struct task* self = task_current();
+    if (!self || self->is_idle) {            /* defensive: never park idle/pid-less */
+        return;
+    }
+
+    /* Register + mark SLEEPING under wq->lock. */
+    self->wq_next = wq->head;
+    wq->head      = self;
+    self->state   = TASK_SLEEPING;
+
+    /* Detach from this CPU's runqueue so schedule() won't pick us. */
+    struct percpu* me = this_cpu();
+    spin_lock(&me->rq_lock);
+    if (self->cpu_home == this_cpu_id()) {
+        rq_remove_locked(me, self);
+    }
+    spin_unlock(&me->rq_lock);
+
+    /* Commit to sleeping: release the condition lock (a waker may run
+     * now) and switch away.  We are SLEEPING + off every rq, so no CPU
+     * will pick us until a waker makes us RUNNABLE again. */
+    spin_unlock(&wq->lock);
+    schedule();
+
+    /* Woken.  Re-acquire the condition lock for the caller's recheck
+     * loop.  IRQs are still off (schedule restored them to entry state).*/
+    spin_lock(&wq->lock);
+}
+
+/* Wake helper — caller holds wq->lock.  `all` drains the whole queue;
+ * otherwise just the head is released. */
+static void wq_wake_locked(struct waitq* wq, int all) {
+    struct task* t = wq->head;
+    if (!t) return;
+
+    if (all) {
+        wq->head = NULL;
+    } else {
+        wq->head    = t->wq_next;
+        t->wq_next  = NULL;
+    }
+
+    for (;;) {
+        struct task* nxt = all ? t->wq_next : NULL;
+        t->wq_next = NULL;
+        if (t->state == TASK_SLEEPING) {
+            t->state = TASK_RUNNABLE;
+            /* task_enqueue picks an affinity-legal CPU, inserts on its rq,
+             * and sends a reschedule IPI if that CPU isn't us — so a wake
+             * from another core lands the task promptly. */
+            task_enqueue(t);
+        }
+        if (!all || !nxt) break;
+        t = nxt;
+    }
+}
+
+void waitq_wake_one(struct waitq* wq) { wq_wake_locked(wq, 0); }
+void waitq_wake_all(struct waitq* wq) { wq_wake_locked(wq, 1); }
 
 /* ------------------------------------------------------------------- */
 /* Preemption hooks.                                                    */

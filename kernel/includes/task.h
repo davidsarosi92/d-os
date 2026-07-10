@@ -115,6 +115,11 @@ struct task {
     int      cpu_home;
     struct task* rq_next;
     struct task* rq_prev;
+    /* Tier A.1 — wait-queue link.  When state==TASK_SLEEPING because the
+     * task parked itself on a `struct waitq`, it hangs off that queue's
+     * singly-linked list through `wq_next` (a task can be blocked on at
+     * most one waitq at a time).  NULL otherwise.  See waitq.h. */
+    struct task* wq_next;
     /* M22.3 — cooperative kill (the Linux kthread_stop contract: all
      * tasks are kernel threads today, so forced termination at an
      * arbitrary preemption point is unsafe — the victim might hold a
@@ -216,6 +221,19 @@ void task_start_init(void);
 int  task_reaper_pid(void);
 int  task_kill_tree(int pid);
 void task_set_reap_owned(struct task* t, int owned);
+
+/* Tier A.2 — block until a child exits, POSIX waitpid-shaped.
+ *
+ *   pid > 0  : wait for that specific child (must be a direct child).
+ *   pid <= 0 : wait for ANY direct child.
+ *
+ * Blocks (on the internal child-exit wait-queue) until a matching child is
+ * DEAD, then records its exit code in *code (if non-NULL), reaps it, and
+ * returns its pid.  Returns -1 immediately if the caller has no matching
+ * live-or-dead child to wait for.  This is the "downward" answer to child
+ * death — the building block M29's service supervisor uses to notice a
+ * service crash and restart it.  Woken by task_exit_code. */
+int task_wait(int pid, int* code);
 
 /* Internal scheduler entry — pick next RUNNABLE task and context_switch
  * to it.  Both task_yield and the IRQ-driven preemption path call this.
