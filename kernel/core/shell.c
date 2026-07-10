@@ -1120,6 +1120,11 @@ static void cmd_service(const char* args) {
 extern void svc_demo_bustest(void);
 static void cmd_bustest(void) { svc_demo_bustest(); }
 
+/* `wdtest` — watchdog self-test: a task that stops petting its heartbeat is
+ * detected + killed by the M31 watchdog. */
+extern void svc_demo_wdtest(void);
+static void cmd_wdtest(void) { svc_demo_wdtest(); }
+
 /* M25 stage 7 — run the in-tree-libc compiled-C user program embedded as a
  * blob (user/hello.c → static ELF → objcopy).  Weak symbols so the command
  * still links on arches that don't embed the blob yet (i386 is the reference
@@ -1298,6 +1303,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }
     if (streq(line, "bustest"))        { cmd_bustest(); return; }
+    if (streq(line, "wdtest"))         { cmd_wdtest(); return; }
     if (streq(line, "blktest"))        { cmd_blktest();  return; }
     if (streq(line, "bctest"))         { cmd_bctest();   return; }
     if (streq(line, "lsblk"))          { blk_list();     return; }

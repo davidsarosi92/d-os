@@ -42,6 +42,7 @@
 #include "shell_provider.h"
 #include "service.h"
 #include "bus.h"
+#include "watchdog.h"
 #include "lock.h"
 #include <stdint.h>
 
@@ -284,6 +285,7 @@ void aarch64_main_entry(uint64_t dtb) {
     service_init();
     bus_init();
     service_start_supervisor();
+    watchdog_init();                        /* M31 — freeze detection */
 
     /* Idle loop.  With a framebuffer we also drain virtio-input here (polled),
      * so keyboard + mouse events are serviced whenever the CPU is otherwise

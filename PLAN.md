@@ -60,7 +60,7 @@
 | Tier A | Blocking primitives — wait-queue + task_wait + blocking IPC — ✅ shipped (DOCS §4.20) | — |
 | §M29 | Services / daemons — supervisor + SERVICE() registry + service bus (endpoint/contract/transport) — ✅ shipped (DOCS §4.21) | ~1895 |
 | §M30 | Task scheduling — cron service | ~1935 |
-| §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) | ~1960 |
+| §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) — ✅ shipped L1+L2 (DOCS §4.22; L3 HW deferred) | ~1960 |
 | §M32 | Multi-user — identity, login, file perms, isolation | ~2160 |
 | §M33 | Execution domains — where a service runs (kernel / user / isolated); driver placement is the flagship case | ~2265 |
 | How to use this document | Workflow rules | 930 |
@@ -193,7 +193,7 @@ what); a session can pick a theme and push on it.
 | Tier A | Blocking primitives — wait-queue (block/wake), task_wait, blocking socket read + poll | Concurrency | ✅ DOCS §4.20 |
 | M29 | Services / daemons — SERVICE() registry + supervisor (autostart, restart policy) + service bus (endpoint / contract / transport, location-independent binding) | Architecture | ✅ DOCS §4.21 |
 | M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | §M30 |
-| M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | §M31 |
+| M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | ✅ DOCS §4.22 (L1+L2; L3 HW deferred) |
 | M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation | Security | §M32 |
 | M33 | Execution domains — a service's run location (kernel / user / isolated) as a declared capability + config choice; driver placement (fault-tolerant → user-mode isolation) is the flagship case | Reliability | §M33 |
 
@@ -2654,6 +2654,14 @@ persistence of last-run state across reboot.
 ---
 
 ## §M31 — Watchdog: heartbeat-based freeze detection
+
+> ✅ **SHIPPED L1+L2 (2026-07-10) — see DOCS.md §4.22.**  Per-task heartbeat
+> (`watchdog_register`/`watchdog_kick` → missed-deadline detect + kill-tree +
+> M29-supervisor restart) and per-CPU softlockup (a `percpu.ticks` counter the
+> timer bumps; a stalled CPU is warned) both landed on i386 / x86_64 / aarch64
+> with `/proc/watchdog` + a `wdtest` self-test.  Layer 3 (hardware watchdog
+> timer — i6300esb / SP805) is deferred: it needs a per-platform device driver.
+> Design retained below.
 
 **Why:** M27 handles a task that *dies*; this handles a task that is
 alive but *wedged* (an infinite loop that never yields, a deadlock, a

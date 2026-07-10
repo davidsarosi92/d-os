@@ -1098,7 +1098,14 @@ void schedule_request(void) {
     /* Per-CPU flag (M18.6.1).  Timer IRQ on CPU N sets CPU N's bit;
      * IRQ exit on CPU N consumes it.  Cross-CPU preempt IPI (vector
      * 0x41) sets the receiver's bit before schedule_check runs. */
-    this_cpu()->need_resched = 1;
+    struct percpu* me = this_cpu();
+    me->need_resched = 1;
+    /* M31 — per-CPU liveness heartbeat for the softlockup detector.  This
+     * runs from the timer IRQ, so it advances once per tick on every CPU
+     * that is still taking ticks; a CPU wedged with IRQs off (spinlock
+     * deadlock, IRQ storm) stops advancing it and the watchdog sweep on a
+     * healthy CPU notices.  Just a monotonic counter — no lock needed. */
+    me->ticks++;
 }
 
 void schedule_check(void) {

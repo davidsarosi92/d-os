@@ -29,6 +29,8 @@
 #include "klog.h"
 #include "printf.h"
 #include "config.h"
+#include "watchdog.h"
+#include "timer.h"
 #include <stddef.h>
 
 /* ------------------------------------------------------------------- */
@@ -50,6 +52,24 @@ static void crasher_entry(void) {
     task_exit_code(1);              /* … then "crash" so on-failure restarts it */
 }
 SERVICE("crasher", crasher_entry, 0, SVC_RESTART_ON_FAILURE);
+
+/* M31 demo — a supervised service that "hangs" (stops petting its watchdog).
+ * It registers a heartbeat, pets it for the first 3s, then stops (a stuck
+ * state machine that still yields).  The watchdog detects the missed deadline,
+ * kill-trees it, and the supervisor (restart=always) brings it back — the
+ * M31↔M29 composition.  Manual start (`service start wd-hang`) to avoid a
+ * permanent restart loop at boot. */
+static void wdhang_entry(void) {
+    watchdog_register(1500);                    /* 1.5s heartbeat deadline */
+    uint64_t start = timer_ticks_ms();
+    for (;;) {
+        if (task_should_stop()) task_exit();    /* let the watchdog kill land */
+        if (timer_ticks_ms() - start < 3000)    /* pet for the first 3s only */
+            watchdog_kick();
+        task_msleep(300);                        /* yields (kill can land) but stops kicking */
+    }
+}
+SERVICE("wd-hang", wdhang_entry, 0, SVC_RESTART_ALWAYS);
 
 /* ------------------------------------------------------------------- */
 /* Demo bus contract: Greeter v1 / v2 + a 1→2 adapter.                  */
@@ -125,4 +145,35 @@ void svc_demo_bustest(void) {
     kprintf("bustest: exact-v2=%s strict-v1-miss=%s adapted-v1->v2=%s\n",
             v2_ok ? "PASS" : "FAIL", strict_ok ? "PASS" : "FAIL",
             adapt_ok ? "PASS" : "FAIL");
+}
+
+/* ------------------------------------------------------------------- */
+/* Watchdog self-test (shell `wdtest`).                                 */
+/* ------------------------------------------------------------------- */
+
+/* A task that opts into a short heartbeat and then never pets it (but keeps
+ * yielding, so a cooperative kill can land) — the watchdog should detect the
+ * missed deadline and kill it. */
+static void wd_hang_task(void) {
+    watchdog_register(600);
+    for (;;) {
+        if (task_should_stop()) task_exit();   /* watchdog's kill lands here */
+        task_msleep(200);                        /* yields but never kicks */
+    }
+}
+
+void svc_demo_wdtest(void) {
+    struct task* t = task_spawn("wd-victim", wd_hang_task);
+    if (!t) { kprintf("wdtest: spawn failed\n"); return; }
+    int pid = t->pid;
+
+    /* Wait up to ~4s for the watchdog sweep to notice + kill it. */
+    int killed = 0;
+    for (int i = 0; i < 40; i++) {
+        task_msleep(100);
+        struct task* f = task_find(pid);
+        if (!f || f->state == TASK_DEAD) { killed = 1; break; }
+    }
+    kprintf("wdtest: hung task pid=%d detected+killed=%s\n",
+            pid, killed ? "PASS" : "FAIL");
 }

@@ -2618,6 +2618,47 @@ the built-ins like x86.
 
 ---
 
+### 4.22 Watchdog — freeze detection (M31)
+
+**What it is.**  M27 handles a task that *dies*; the watchdog handles one that
+is alive but *wedged*.  A single sweep task (child of init, `watchdog.c`) runs
+two detectors every 500 ms:
+
+- **Layer 1 — per-task heartbeat (opt-in).**  A task calls
+  `watchdog_register(timeout_ms)` and periodically `watchdog_kick()`s.  The
+  sweep flags any registered task past its deadline: logs a `KLOG_ERR` and
+  `task_kill_tree`s it.  Because a supervised M29 service is a supervisor
+  child, the watchdog kill triggers the supervisor's `task_wait` → **restart** —
+  the two subsystems compose (verified: `wd-hang` service killed by the
+  watchdog, restarted by the supervisor).  Opt-in, so a legitimately long
+  compute that never registers is never watched.
+- **Layer 2 — per-CPU softlockup.**  Each CPU's timer tick bumps
+  `percpu.ticks` (in `schedule_request`).  The sweep snapshots every online
+  CPU's counter and warns about any that stopped advancing — a core wedged with
+  IRQs off (spinlock deadlock / IRQ storm), which a per-task heartbeat can't
+  see because the sweep itself may be starved there.  Limitation: the single
+  sweep runs on one CPU, so a wedge on *that* CPU can starve it; on a 1–2 CPU
+  box the common cross-core case is caught.
+- **Layer 3 — hardware watchdog: deferred.**  Arming a real/emulated watchdog
+  timer (i6300esb / SP805) that resets the box when everything wedges needs a
+  per-platform device driver; left as future work — layers 1–2 are the
+  detection substrate.
+
+**The cooperative-kill truth (§M22.3).**  The watchdog can *detect* a freeze
+but can only *force-kill* a kthread that reaches a yield point (it may hold a
+spinlock).  So layer-1 kill+restart works for a task that yields but stopped
+kicking (a stuck state machine); a truly wedged kthread that never yields needs
+layer 3 / a reboot.  Genuine force-kill of any frozen task arrives with §M25
+user processes.
+
+**Introspection + self-test.**  `/proc/watchdog` shows the sweep period, hang /
+softlockup event counts, and the watched-task table.  `wdtest` spawns a task
+that registers a 600 ms heartbeat then stops kicking; the watchdog detects +
+kills it (PASS).  All green on i386 + x86_64 + aarch64 with zero softlockup
+false-positives during normal operation.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -2688,6 +2729,15 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-10 — M31: watchdog (freeze detection).**  A sweep task (child of
+  init, `watchdog.c`) runs every 500 ms: **layer 1** per-task heartbeat
+  (`watchdog_register`/`watchdog_kick`; a missed deadline → `KLOG_ERR` +
+  `task_kill_tree`, and a supervised M29 service is then restarted by its
+  supervisor — the two compose), **layer 2** per-CPU softlockup (a
+  `percpu.ticks` counter bumped in `schedule_request`; a CPU whose counter
+  stalls is warned).  Layer 3 (hardware watchdog) deferred — needs a
+  per-platform device driver.  `/proc/watchdog` + `wdtest` self-test green on
+  i386 / x86_64 / aarch64, zero softlockup false-positives.  See §4.22.
 - **2026-07-10 — M29: services + service bus.**  Two self-registered halves on
   Tier A.  (1) **Supervisor** (`service.h`/`service.c`) — `SERVICE(name, entry,
   autostart, restart{no|on-failure|always})`; one supervisor task (child of

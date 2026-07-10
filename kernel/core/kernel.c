@@ -38,6 +38,7 @@
 #include "shell_provider.h"
 #include "service.h"
 #include "bus.h"
+#include "watchdog.h"
 #include "printf.h"
 #include "acpi.h"
 #include "hal_api.h"
@@ -409,6 +410,10 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     service_init();
     bus_init();
     service_start_supervisor();
+
+    /* M31 — watchdog: /proc/watchdog + the sweep task (per-task heartbeat +
+     * per-CPU softlockup detection).  After init (spawns a detached task). */
+    watchdog_init();
 
     {
         /* S.1: the boot shell is whatever provider shell.provider
