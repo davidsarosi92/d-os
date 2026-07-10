@@ -2423,6 +2423,83 @@ take the address of a `va_list` parameter.
 
 ---
 
+### 4.19 Userland foundation — processes, fds, IPC, libc (M25)
+
+**What it is.**  The layer that makes a d-os task a real *user process*: its
+own address space, a file-descriptor table, a POSIX-ish syscall surface, shared
+memory, unix-socket IPC with fd passing, poll, and an in-tree libc — the
+Wayland prerequisites, useful in their own right.  Built stage by stage; each
+stage has a self-test shell command.
+
+**Address spaces (`vmm.h` `vmm_space_*`).**  A `vmm_space` is a private
+top-level page table that keeps the kernel mapped (so ring-0 code + stacks
+survive a CR3/TTBR0 switch) but owns a private user region.  `struct task.mm`
+points to it (NULL = kernel thread); the scheduler calls `vmm_space_switch`
+before `context_switch`, reloading the hardware register **only when it
+changes** (kernel-thread → kernel-thread is free).  `vmm_user_base()` gives the
+arch's user-region base (1 GiB on x86, 4 GiB on aarch64).  **x86_64 subtlety:**
+the whole kernel lives under PML4[0], so a space gets a *private PDPT* under
+PML4[0] (kernel PD subtrees shared by pointer, user region private) — a bare
+PML4 copy would leak the user region into the shared kernel table.
+
+**Loading + running ELFs (`elf.c`, `proc.c`).**  `elf_load` parses either ELF
+class at runtime and maps PT_LOAD segments into a space with R/W/X.
+`proc_exec_elf` loads an image, maps a user stack, binds the space to the
+calling task, and drops to ring 3 / EL0 at `e_entry` via `enter_user_mode_wrap`
+(x86) / `aarch64_enter_user`.  Today this is a **synchronous excursion** on the
+caller's task — the program runs to its SYS_EXIT and control returns; fully
+independent, preemptible, concurrently-scheduled processes are the deferred
+tail (needs per-task TSS.esp0 / SP_EL1, SYS_EXIT→task_exit, blocking syscalls).
+
+**Descriptors (`fd.h`/`fd.c`, `usyscall.c`).**  `struct task.fds[32]` holds
+`struct ofile*` — a refcounted tagged handle over a VFS file, a shm object, or
+a socket.  fds 0/1/2 are the implicit console.  Portable syscall handlers live
+in `usyscall.c`; each arch's dispatcher (`kernel/hal/<arch>/syscall.c`) only
+pulls the number + args out of its trapframe (int 0x80 EBX/ECX/EDX/ESI, svc
+x0..x3).  Syscalls: `print, exit, write, read, open, close, lseek, mmap,
+memfd, socketpair, send, recv, poll`.
+
+**Shared memory (`fd.c` shm).**  `memfd` creates a frame-set object behind an
+fd; `mmap` maps it (or fresh anonymous frames) into the space.  A frame that
+is *borrowed* (a shm frame mapped into a space that doesn't own it) is tagged
+with the **`VMM_SHARED`** PTE bit (x86 bit 10 / aarch64 software bit 55) so
+`vmm_space_destroy` drops the mapping without freeing the owner's frame — the
+shm object frees its frames once, at its own refcount 0.
+
+**Unix sockets + fd passing (`usock.c`).**  `socketpair` makes two connected
+endpoints, each with a receive ring + a passed-fd queue.  `send`/`recv` move
+bytes (to the peer's ring) and, SCM_RIGHTS-style, a *file descriptor*: the
+sender queues a fresh `ofile` reference on the peer, the receiver installs it
+as a new fd.  Because the reference travels, the underlying object (a shm
+buffer, a keymap file) outlives the sender's fd — exactly the wl_shm / xkb
+handover Wayland needs.  `poll` reports non-blocking readiness (socket
+readable iff buffered; writable iff peer + space).
+
+**In-tree libc (`user/`).**  `crt0.s` (calls `main`, then SYS_EXIT) + `libc.c`
+(`int 0x80` wrappers, `strlen/memset/memcpy`, `malloc` as a bump allocator over
+`mmap`, `puts`/`printf`).  A real compiled-C `hello.c` links against it into a
+static ELF at 0x40000000 (`ld -N`, one RWX PT_LOAD), which the Makefile wraps
+as a binary blob (`objcopy`) linked into the i386 kernel; `libctest` loads it
+via `proc_exec_elf`.  The libc C is arch-neutral — the x86_64/aarch64 port needs
+only a per-arch crt0 + link + blob rule (the shell command links everywhere via
+weak blob symbols, reporting "not built" where absent).
+
+**Privilege model (north-star, locked M25).**  d-os uses exactly **ring 0 +
+ring 3** (EL1 + EL0); rings 1/2 are never used.  Paging's U/S bit is binary, so
+a "ring-1 driver" would have full kernel-memory access — no isolation; x86_64
+made rings 1/2 vestigial; aarch64 has no rings.  The security axis is *address
+spaces + capabilities*, not the count of CPU privilege levels — every richer
+trust tier (M33 isolated drivers) is a ring-3 process with a restricted
+capability set, not a middle ring.
+
+**Self-tests.**  `userrun` (loaded ELF prints via `write(1)`), `fdtest`
+(open/read/lseek/close/reuse), `shmtest` (one memfd, two mappings, shared),
+`socktest` (bytes + a memfd passed over a socket → shared on the far side),
+`polltest` (readiness transitions), `libctest` (compiled-C libc program in
+ring 3).  All green on i386 + x86_64 + aarch64 (libctest: i386).
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -2492,6 +2569,37 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 ---
 
 ## 8. Change log
+
+- **2026-07-10 — M25: userland foundation (stages 1–7).**  The substrate that
+  turns d-os kernel threads into real user processes, built + verified on
+  i386 / x86_64 / aarch64 (libc: i386 reference).  (1) **Per-process address
+  spaces** — a portable `vmm_space` (create/destroy/map/unmap/switch +
+  `vmm_user_base`); `struct task.mm`; the scheduler loads CR3/TTBR0 on switch,
+  reloading only on change.  (2) **ELF loader** (`elf.c`) — both classes at
+  runtime, maps PT_LOAD segments into a space.  (2b) **Run a loaded ELF**
+  (`proc.c` `proc_exec_elf`) — ring-3/EL0 drop at `e_entry`, isolated space.
+  (3) **fd table** — `write/read/open/close/lseek` over `task->fds`.  (4)
+  **mmap + memfd shared memory** — generic `struct ofile` (VFS/shm/socket,
+  refcounted) + a `VMM_SHARED` PTE bit so borrowed frames aren't double-freed
+  at space teardown.  (5) **unix `socketpair` + fd passing** (`usock.c`) —
+  SCM_RIGHTS: a descriptor (e.g. a memfd) travels across the socket and lands
+  in the receiver's fd table.  (6) **`poll`** — non-blocking readiness.  (7)
+  **in-tree libc** (`user/`) — `int 0x80` wrappers + string/malloc(over
+  mmap)/printf, linked with a compiled-C `hello.c` into a static ELF embedded
+  as a blob; `libctest` runs real C in ring 3.  Self-test shell commands:
+  `userrun / fdtest / shmtest / socktest / polltest / libctest`.  **Design
+  fork recorded:** exactly two privilege levels (ring 0/3, EL1/EL0) forever —
+  paging is binary so a "ring 1 driver" gets no memory isolation, x86_64 made
+  rings 1/2 vestigial, and ARM has no rings; the security axis is address
+  spaces + capabilities, not CPU ring count.  **Pitfalls:** x86_64 needs a
+  *private PDPT* under PML4[0] (a bare PML4 copy shares the user region →
+  isolation silently fails); the CR3/TTBR0 reload MUST be skipped when
+  unchanged (else a full TLB flush every context switch); user-VA base is
+  arch-specific (`vmm_user_base()`).  **Deferred tail:** fully independent,
+  preemptible, concurrently-scheduled user processes (per-task TSS.esp0 /
+  SP_EL1, SYS_EXIT→task_exit, blocking syscalls) + the x86_64/aarch64 libc
+  port — today a user program runs as a synchronous excursion on the calling
+  task.  See §4.19.
 
 - **2026-07-10 — M28: system log (klog ring buffer + `dmesg` + `/proc/kmsg`).**
   The kernel gained a structured, reviewable log.  New `kernel/core/klog.c`: a

@@ -43,7 +43,9 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "printf.h"
+#include "kmalloc.h"
 #include <stdint.h>
+#include <stddef.h>
 
 /* ------------------------------------------------------------------------- */
 /* Bit helpers and macros.                                                   */
@@ -146,14 +148,14 @@ void vmm_init(void) {
 /* Mapping operations.                                                       */
 /* ------------------------------------------------------------------------- */
 
-int vmm_map(uintptr_t virt32, uintptr_t phys32, uint32_t flags) {
-    /* On i386 uintptr_t == uint32_t so the casts are no-ops; making them
-     * explicit keeps the arch-portable interface obvious. */
-    uint32_t virt = (uint32_t)virt32;
-    uint32_t phys = (uint32_t)phys32;
+/* Core 4 KiB map, parameterised by the target page directory.  Both the
+ * kernel PD (vmm_map) and a per-process space's PD (vmm_space_map, M25)
+ * share this exact walk.  `pd` points at a 1024-entry PDE array reachable
+ * through the identity map (every PD we allocate lives below 256 MiB). */
+static int map_in_pd(uint32_t* pd, uint32_t virt, uint32_t phys, uint32_t flags) {
     uint32_t pdi = PD_IDX(virt);
     uint32_t pti = PT_IDX(virt);
-    uint32_t pde = kernel_pd[pdi];
+    uint32_t pde = pd[pdi];
 
     /* Refuse to punch a 4 KiB hole through a 4 MiB PSE entry.  A future
      * milestone could split the PSE into a regular PT on demand. */
@@ -172,14 +174,36 @@ int vmm_map(uintptr_t virt32, uintptr_t phys32, uint32_t flags) {
 
         /* PDE points at PT; USER bit on the PDE propagates from the
          * caller's flags so a user mapping stays user-accessible. */
-        kernel_pd[pdi] = pt_phys | PDE_P | PDE_RW | (flags & PDE_US);
+        pd[pdi] = pt_phys | PDE_P | PDE_RW | (flags & PDE_US);
     } else {
         pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
     }
 
-    pt[pti] = (phys & PAGE_MASK) | PTE_P | (flags & (PTE_RW | PTE_US));
+    /* VMM_SHARED (0x400) rides along in PTE bit 10 (OS-available) so
+     * vmm_space_destroy can tell borrowed frames from owned ones. */
+    pt[pti] = (phys & PAGE_MASK) | PTE_P | (flags & (PTE_RW | PTE_US | VMM_SHARED));
     invlpg(virt);
     return 0;
+}
+
+/* Core unmap, parameterised by the target page directory. */
+static void unmap_in_pd(uint32_t* pd, uint32_t virt) {
+    uint32_t pdi = PD_IDX(virt);
+    uint32_t pti = PT_IDX(virt);
+    uint32_t pde = pd[pdi];
+
+    if ((pde & PDE_P) == 0) return;             /* already unmapped */
+    if (pde & PDE_PS) return;                   /* PSE region — refuse */
+
+    uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
+    pt[pti] = 0;
+    invlpg(virt);
+}
+
+int vmm_map(uintptr_t virt32, uintptr_t phys32, uint32_t flags) {
+    /* On i386 uintptr_t == uint32_t so the casts are no-ops; making them
+     * explicit keeps the arch-portable interface obvious. */
+    return map_in_pd(kernel_pd, (uint32_t)virt32, (uint32_t)phys32, flags);
 }
 
 int vmm_map_4mib(uintptr_t virt32, uintptr_t phys32, uint32_t flags) {
@@ -204,17 +228,7 @@ int vmm_map_4mib(uintptr_t virt32, uintptr_t phys32, uint32_t flags) {
 }
 
 void vmm_unmap(uintptr_t virt32) {
-    uint32_t virt = (uint32_t)virt32;
-    uint32_t pdi = PD_IDX(virt);
-    uint32_t pti = PT_IDX(virt);
-    uint32_t pde = kernel_pd[pdi];
-
-    if ((pde & PDE_P) == 0) return;             /* already unmapped */
-    if (pde & PDE_PS) return;                   /* PSE region — refuse */
-
-    uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
-    pt[pti] = 0;
-    invlpg(virt);
+    unmap_in_pd(kernel_pd, (uint32_t)virt32);
 }
 
 uintptr_t vmm_translate(uintptr_t virt32) {
@@ -244,3 +258,100 @@ void vmm_print_status(void) {
             (cr0 & 0x80000000u) ? "on" : "off",
             (cr4 & (1u << 4))   ? "on" : "off");
 }
+
+/* ===========================================================================
+ * Per-process address spaces (M25 stage 1).
+ *
+ * On i386 a `vmm_space` is a private 1024-entry page directory.  It is
+ * created by *snapshotting* the kernel PD (so the identity map + every
+ * boot-time kernel high-mapping stays reachable after a CR3 switch — the
+ * kernel code and stack keep resolving) and then receives the process's
+ * own user-region PTs on top.  Because the kernel region below 256 MiB is
+ * PSE leaves (no shared PT pages) and the high mappings are static and
+ * boot-time, the snapshot copy is sufficient — see the vmm.h note on the
+ * stage-1 kernel-mapping limitation.
+ * =========================================================================== */
+
+struct vmm_space {
+    uint32_t* pd;           /* 4 KiB page directory (identity: virt == phys) */
+    uint32_t  pd_phys;      /* == (uint32_t)pd, cached for CR3 loads */
+};
+
+static inline uint32_t read_cr3(void) {
+    uint32_t v; __asm__ volatile ("mov %%cr3, %0" : "=r"(v)); return v;
+}
+
+/* Is PDE index `i` part of the shared kernel region?  A user space only
+ * ever adds mappings whose PDE differs from the kernel snapshot; anything
+ * still identical to kernel_pd[i] is shared kernel and must not be freed. */
+static int pde_is_kernel_shared(struct vmm_space* s, uint32_t i) {
+    return s->pd[i] == kernel_pd[i];
+}
+
+struct vmm_space* vmm_space_create(void) {
+    struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
+    if (!s) return NULL;
+
+    uint32_t pd_phys = pmm_alloc_frame();       /* one 4 KiB frame = 1024 PDEs */
+    if (!pd_phys) { kfree(s); return NULL; }
+
+    s->pd      = (uint32_t*)(uintptr_t)pd_phys; /* reachable via identity map */
+    s->pd_phys = pd_phys;
+
+    /* Snapshot the kernel directory: identity map + all boot-time high
+     * mappings.  The private user region (high PDEs) is 0 in kernel_pd,
+     * so it starts empty here too. */
+    for (int i = 0; i < 1024; i++) s->pd[i] = kernel_pd[i];
+    return s;
+}
+
+void vmm_space_destroy(struct vmm_space* s) {
+    if (!s) return;
+
+    /* Free every page table + user frame this space added on top of the
+     * kernel snapshot.  Kernel-shared PDEs (identical to kernel_pd) and
+     * PSE leaves are left alone. */
+    for (uint32_t i = 0; i < 1024; i++) {
+        uint32_t pde = s->pd[i];
+        if ((pde & PDE_P) == 0) continue;
+        if (pde & PDE_PS)            continue;  /* PSE leaf — never ours */
+        if (pde_is_kernel_shared(s, i)) continue;  /* shared kernel PT */
+
+        uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
+        for (int j = 0; j < 1024; j++) {
+            uint32_t pte = pt[j];
+            /* Skip VMM_SHARED (borrowed) frames — their owner frees them. */
+            if ((pte & PTE_P) && !(pte & VMM_SHARED))
+                pmm_free_frame(pte & PAGE_MASK);   /* owned user page */
+        }
+        pmm_free_frame(pde & PAGE_MASK);        /* the page table itself */
+    }
+    pmm_free_frame(s->pd_phys);                 /* the directory */
+    kfree(s);
+}
+
+int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
+                  uint32_t flags) {
+    if (!s) return vmm_map(virt, phys, flags); /* NULL == kernel space */
+    return map_in_pd(s->pd, (uint32_t)virt, (uint32_t)phys, flags);
+}
+
+void vmm_space_unmap(struct vmm_space* s, uintptr_t virt) {
+    if (!s) { vmm_unmap(virt); return; }
+    unmap_in_pd(s->pd, (uint32_t)virt);
+}
+
+uintptr_t vmm_space_pd_phys(struct vmm_space* s) {
+    return s ? (uintptr_t)s->pd_phys : (uintptr_t)&kernel_pd[0];
+}
+
+void vmm_space_switch(struct vmm_space* s) {
+    uint32_t target = s ? s->pd_phys : (uint32_t)(uintptr_t)&kernel_pd[0];
+    /* Reload CR3 only on an actual change — switching between kernel
+     * threads (all target == kernel_pd) costs nothing and avoids a
+     * needless TLB flush. */
+    if (read_cr3() != target) load_cr3(target);
+}
+
+/* User region base: 1 GiB, comfortably above the 256 MiB identity map. */
+uintptr_t vmm_user_base(void) { return 0x40000000u; }

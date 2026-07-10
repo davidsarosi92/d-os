@@ -78,6 +78,7 @@
 #include "percpu.h"
 #include "smp.h"
 #include "timer.h"          /* M22.3: per-task CPU-time accounting */
+#include "vmm.h"            /* M25: per-process address-space switch */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -638,6 +639,13 @@ static void schedule_locked(struct percpu* me) {
     }
 
     me->current = next;
+    /* M25 — switch to next's address space before swapping stacks.  For a
+     * kernel thread (mm == NULL) this targets the shared kernel directory,
+     * and vmm_space_switch skips the CR3 reload when it's already loaded —
+     * so kernel-thread → kernel-thread switches stay free (no TLB flush).
+     * Both stacks live in the kernel identity map, which every space keeps
+     * mapped, so doing this before context_switch is safe. */
+    vmm_space_switch(next->mm);
     context_switch(&prev->esp, next->esp);
     /* Resumes here when `prev` is scheduled back in by SOME CPU. */
 }

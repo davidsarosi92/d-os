@@ -37,6 +37,7 @@
 #include "printf.h"
 #include "hal_api.h"
 #include <stdint.h>
+#include <stddef.h>
 
 /* Imports from kernel/hal/x86_64/usermode.s — the saved kernel context
  * that lets SYS_EXIT teleport back. */
@@ -67,6 +68,46 @@ void syscall_dispatch(struct int_frame* f) {
             hal_syscall_exit_to_kernel((uintptr_t)saved_rsp,
                                        (uintptr_t)saved_rip);
         }
+
+        /* M25 stage 3 — fd syscalls.  RBX/RCX/RDX = arg0/arg1/arg2. */
+        case SYS_WRITE:
+            f->rax = (uint64_t)sys_write((int)f->rbx, (const void*)(uintptr_t)f->rcx,
+                                         (size_t)f->rdx);
+            return;
+        case SYS_READ:
+            f->rax = (uint64_t)sys_read((int)f->rbx, (void*)(uintptr_t)f->rcx,
+                                        (size_t)f->rdx);
+            return;
+        case SYS_OPEN:
+            f->rax = (uint64_t)sys_open((const char*)(uintptr_t)f->rbx, (int)f->rcx);
+            return;
+        case SYS_CLOSE:
+            f->rax = (uint64_t)sys_close((int)f->rbx);
+            return;
+        case SYS_LSEEK:
+            f->rax = (uint64_t)sys_lseek((int)f->rbx, (long)f->rcx, (int)f->rdx);
+            return;
+        case SYS_MMAP:
+            f->rax = (uint64_t)sys_mmap((size_t)f->rbx, (int)f->rcx);
+            return;
+        case SYS_MEMFD:
+            f->rax = (uint64_t)sys_memfd((size_t)f->rbx);
+            return;
+        case SYS_SOCKETPAIR:
+            f->rax = (uint64_t)sys_socketpair((int*)(uintptr_t)f->rbx);
+            return;
+        case SYS_SEND:
+            f->rax = (uint64_t)sys_send((int)f->rbx, (const void*)(uintptr_t)f->rcx,
+                                        (size_t)f->rdx, (int)f->rsi);
+            return;
+        case SYS_RECV:
+            f->rax = (uint64_t)sys_recv((int)f->rbx, (void*)(uintptr_t)f->rcx,
+                                        (size_t)f->rdx, (int*)(uintptr_t)f->rsi);
+            return;
+        case SYS_POLL:
+            f->rax = (uint64_t)sys_poll((struct pollfd*)(uintptr_t)f->rbx,
+                                        (int)f->rcx, (int)f->rdx);
+            return;
 
         default:
             kprintf("syscall: unknown number %lu\n",

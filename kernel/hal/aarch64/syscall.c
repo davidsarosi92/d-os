@@ -20,6 +20,7 @@
 #include "console.h"
 #include "printf.h"
 #include "pmm.h"
+#include "usermode.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -55,6 +56,49 @@ void aarch64_syscall(struct trapframe* tf) {
         case SYS_EXIT:
             aarch64_user_exit();        /* does not return */
             break;                      /* unreachable */
+
+        /* M25 stage 3 — fd syscalls.  x0/x1/x2 = arg0/arg1/arg2. */
+        case SYS_WRITE:
+            tf->x[0] = (uint64_t)sys_write((int)tf->x[0],
+                          (const void*)(uintptr_t)tf->x[1], (size_t)tf->x[2]);
+            break;
+        case SYS_READ:
+            tf->x[0] = (uint64_t)sys_read((int)tf->x[0],
+                          (void*)(uintptr_t)tf->x[1], (size_t)tf->x[2]);
+            break;
+        case SYS_OPEN:
+            tf->x[0] = (uint64_t)sys_open((const char*)(uintptr_t)tf->x[0],
+                          (int)tf->x[1]);
+            break;
+        case SYS_CLOSE:
+            tf->x[0] = (uint64_t)sys_close((int)tf->x[0]);
+            break;
+        case SYS_LSEEK:
+            tf->x[0] = (uint64_t)sys_lseek((int)tf->x[0], (long)tf->x[1],
+                          (int)tf->x[2]);
+            break;
+        case SYS_MMAP:
+            tf->x[0] = (uint64_t)sys_mmap((size_t)tf->x[0], (int)tf->x[1]);
+            break;
+        case SYS_MEMFD:
+            tf->x[0] = (uint64_t)sys_memfd((size_t)tf->x[0]);
+            break;
+        case SYS_SOCKETPAIR:
+            tf->x[0] = (uint64_t)sys_socketpair((int*)(uintptr_t)tf->x[0]);
+            break;
+        case SYS_SEND:
+            tf->x[0] = (uint64_t)sys_send((int)tf->x[0], (const void*)(uintptr_t)tf->x[1],
+                          (size_t)tf->x[2], (int)tf->x[3]);
+            break;
+        case SYS_RECV:
+            tf->x[0] = (uint64_t)sys_recv((int)tf->x[0], (void*)(uintptr_t)tf->x[1],
+                          (size_t)tf->x[2], (int*)(uintptr_t)tf->x[3]);
+            break;
+        case SYS_POLL:
+            tf->x[0] = (uint64_t)sys_poll((struct pollfd*)(uintptr_t)tf->x[0],
+                          (int)tf->x[1], (int)tf->x[2]);
+            break;
+
         default:
             kprintf("syscall: unknown number %lu\n", (unsigned long)num);
             tf->x[0] = (uint64_t)-1;
@@ -107,3 +151,22 @@ int aarch64_usertest(void) {
 
 /* Portable `ringtest` shell-command hook (usermode.h) — aarch64 drops to EL0. */
 int arch_ringtest(void) { return aarch64_usertest(); }
+
+/* usermode.h — arch hook for the portable M25 exec path (proc.c).  The EL0
+ * hello program is the position-independent `user_stub` blob (usermode.S);
+ * copy it verbatim (its message is embedded + PC-relative), so `base` is
+ * irrelevant.  Entry is at offset 0 → e_entry = base. */
+size_t arch_user_hello(uint8_t* buf, size_t cap, uintptr_t base) {
+    (void)base;
+    extern char user_stub_start[], user_stub_end[];
+    size_t sz = (size_t)(user_stub_end - user_stub_start);
+    if (cap < sz) return 0;
+    for (size_t i = 0; i < sz; i++) buf[i] = ((uint8_t*)user_stub_start)[i];
+    return sz;
+}
+
+/* Portable ring-3/EL0 entry name (usermode.h): x86 provides its own
+ * enter_user_mode_wrap; on aarch64 it maps onto the EL0 drop. */
+void enter_user_mode_wrap(uintptr_t ip, uintptr_t sp) {
+    aarch64_enter_user((uint64_t)ip, (uint64_t)sp);
+}

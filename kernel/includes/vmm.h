@@ -42,6 +42,16 @@
 #define VMM_USER         0x004
 #define VMM_WRITE_THRU   0x008
 #define VMM_CACHE_DIS    0x010
+/* M25 — request an executable mapping.  Enforced where the arch has an
+ * execute-permission bit (aarch64 UXN); on x86 today (no NX yet) pages are
+ * executable regardless, so this is advisory there.  Sits in an
+ * OS-available PTE bit on x86, masked out of the hardware entry. */
+#define VMM_EXEC         0x200
+/* M25 — a BORROWED mapping: the frame is owned by someone else (a shm object
+ * shared between processes), so vmm_space_destroy must NOT free it — only
+ * drop the mapping.  Stored in an OS-available PTE bit (x86 bit 10 / aarch64
+ * software bit 55), invisible to the hardware walk. */
+#define VMM_SHARED       0x400
 
 /* Turn on paging + identity-map the kernel region.  On i386 this builds
  * the page directory and turns on CR0.PG; on x86_64 paging is already
@@ -82,5 +92,60 @@ uintptr_t vmm_translate(uintptr_t virt);
 
 /* One-line diagnostics. */
 void vmm_print_status(void);
+
+/* ===========================================================================
+ * Per-process address spaces (M25 stage 1).
+ *
+ * Until M25 every task shared the single kernel address space (one page
+ * directory / PML4).  A `vmm_space` is a *separate* top-level page table
+ * that keeps the kernel mapped in every space (so ring-0 code + the kernel
+ * stack keep working after a CR3/TTBR switch) but owns a private *user*
+ * region for a process's code / data / stack.
+ *
+ * Portability: opaque handle, uintptr_t physical addresses — the i386,
+ * x86_64 and aarch64 backends each implement it over their own table
+ * format.  `NULL` denotes "the kernel space" everywhere (a kernel thread
+ * has no private user mappings), so `vmm_space_switch(NULL)` returns the
+ * CPU to the shared kernel table.
+ *
+ * Kernel-mapping model (stage 1): a freshly created space snapshots the
+ * kernel's top-level entries at creation time.  All kernel MMIO / high
+ * mappings are established at boot, before any user process exists, so the
+ * snapshot is complete.  (A kernel mapping *added* after a space is created
+ * would not propagate into it — a known stage-1 limitation; the eventual
+ * fix is shared kernel page-table pages / a PDE generation counter.  Not
+ * needed while all high mappings are boot-time.)
+ * =========================================================================== */
+
+struct vmm_space;
+
+/* Create a new user address space (kernel mapped, user region empty).
+ * Returns NULL on OOM. */
+struct vmm_space* vmm_space_create(void);
+
+/* Free a space: its user page tables + the top-level table.  Must NOT be
+ * the currently-loaded space on any CPU.  NULL is a no-op. */
+void vmm_space_destroy(struct vmm_space* space);
+
+/* Map / unmap a page in a *specific* space's user region.  Same flag
+ * semantics as vmm_map (pass VMM_USER for a ring-3-accessible page). */
+int  vmm_space_map(struct vmm_space* space, uintptr_t virt, uintptr_t phys,
+                   uint32_t flags);
+void vmm_space_unmap(struct vmm_space* space, uintptr_t virt);
+
+/* Physical address of the space's top-level table (CR3 / PML4 / TTBR0). */
+uintptr_t vmm_space_pd_phys(struct vmm_space* space);
+
+/* Make `space` (NULL = kernel space) the active address space on this CPU.
+ * Loads CR3 (x86) / TTBR0 (aarch64) only when it actually changes, so
+ * switching between kernel threads is free. */
+void vmm_space_switch(struct vmm_space* space);
+
+/* Base virtual address of the per-process user region on this arch — the
+ * first address a loader/self-test may hand to vmm_space_map for VMM_USER
+ * pages.  It is chosen to sit clear of the kernel's identity map: i386 /
+ * x86_64 return 1 GiB (0x40000000); aarch64 returns 4 GiB (its identity
+ * map covers the low 4 GiB). */
+uintptr_t vmm_user_base(void);
 
 #endif

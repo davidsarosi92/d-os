@@ -61,6 +61,44 @@ void syscall_dispatch(struct int_frame* f) {
             hal_syscall_exit_to_kernel(saved_esp, saved_eip);
         }
 
+        /* M25 stage 3 — fd syscalls.  EBX/ECX/EDX = arg0/arg1/arg2. */
+        case SYS_WRITE:
+            f->eax = (uint32_t)sys_write((int)f->ebx, (const void*)f->ecx, f->edx);
+            return;
+        case SYS_READ:
+            f->eax = (uint32_t)sys_read((int)f->ebx, (void*)f->ecx, f->edx);
+            return;
+        case SYS_OPEN:
+            f->eax = (uint32_t)sys_open((const char*)f->ebx, (int)f->ecx);
+            return;
+        case SYS_CLOSE:
+            f->eax = (uint32_t)sys_close((int)f->ebx);
+            return;
+        case SYS_LSEEK:
+            f->eax = (uint32_t)sys_lseek((int)f->ebx, (long)f->ecx, (int)f->edx);
+            return;
+        case SYS_MMAP:
+            f->eax = (uint32_t)sys_mmap((size_t)f->ebx, (int)f->ecx);
+            return;
+        case SYS_MEMFD:
+            f->eax = (uint32_t)sys_memfd((size_t)f->ebx);
+            return;
+        case SYS_SOCKETPAIR:
+            f->eax = (uint32_t)sys_socketpair((int*)f->ebx);
+            return;
+        case SYS_SEND:
+            f->eax = (uint32_t)sys_send((int)f->ebx, (const void*)f->ecx,
+                                        f->edx, (int)f->esi);
+            return;
+        case SYS_RECV:
+            f->eax = (uint32_t)sys_recv((int)f->ebx, (void*)f->ecx,
+                                        f->edx, (int*)f->esi);
+            return;
+        case SYS_POLL:
+            f->eax = (uint32_t)sys_poll((struct pollfd*)f->ebx, (int)f->ecx,
+                                        (int)f->edx);
+            return;
+
         default:
             kprintf("syscall: unknown number %u\n", f->eax);
             f->eax = (uint32_t)-1;
