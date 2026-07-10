@@ -61,6 +61,7 @@
 | §M30 | Task scheduling — cron service | ~1935 |
 | §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) | ~1960 |
 | §M32 | Multi-user — identity, login, file perms, isolation | ~2160 |
+| §M33 | Switchable driver placement — fault-tolerant → user-mode isolation | ~2265 |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -174,7 +175,7 @@ what); a session can pick a theme and push on it.
 | M20 | x64 (long mode) port (UP)                       | Architecture     | ✅ DOCS §4.X (closed by §M20.5) |
 | M20.5 | x64 SMP + APIC + ring-3 (int 0x80) — Phase A/B/C | Architecture | ✅ §M20.5 |
 | M20.6 | x86_64 closure — SYSCALL/SYSRET, xHCI + virtio-blk 64-bit DMA | Architecture | §M20.6 |
-| M21 | ARM (aarch64 generic / RPi) port                | Architecture     | §M21    |
+| M21 | ARM (aarch64 generic / RPi) port                | Architecture     | ✅ Phase A–M — **full x86 parity**: boot + SMP + virtio-blk + exFAT + DTB + framebuffer + EL0 userspace + full shell.c + M22 GUI (virtio-input kbd/mouse, PL031 clock) + **USB (xHCI + HID over PCIe ECAM)** on ARM64 (DOCS §4.17) — §M21 |
 | M22 | GUI infrastructure — compositor, windows, mouse, widgets, taskbar, file manager | UX | ✅ DOCS §4.13 |
 | M22.2 | GUI modularity — swappable desktop shell + app registry + GUI dev docs | UX | ✅ DOCS §4.14 |
 | M22.3 | Desktop polish — task manager, task_kill, term-window close, minimize, Alt-Tab, damage rects | UX | ✅ DOCS §4.13 |
@@ -192,6 +193,7 @@ what); a session can pick a theme and push on it.
 | M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | §M30 |
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | §M31 |
 | M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation | Security | §M32 |
+| M33 | Switchable driver placement — fault-tolerant hosting → user-mode driver isolation (hybrid kernel) | Reliability | §M33 |
 
 ### Cross-cutting constraints
 
@@ -1419,24 +1421,302 @@ doesn't see DMA directly — but verify no shortcut casts.
 port I/O, GIC instead of APIC, exception levels instead of rings)
 so it's the real torture test of HAL portability.
 
-**Design — outline only; details when we get closer.**
+**Phased like the x86_64 port was (M20 → M20.6)** — a full boot-to-
+shell bring-up of a novel arch is not one landing.  Phase breakdown:
 
-- **Boot:** UEFI on most aarch64 boards, U-Boot on Raspberry Pi.
-  Both can hand off to a kernel via a generic protocol.
-- **Exception levels:** EL1 = kernel, EL0 = user.  Maps onto our
-  ring 0 / ring 3 abstraction without too much pain.
-- **MMU:** 4-level page tables with granule (4 KiB) and ASIDs.
-- **Interrupt controller:** GICv3 (modern) or GICv2 (older).  IRQ
-  install API stays.
-- **Timer:** ARM generic timer (system counter + per-CPU timer
-  interrupt).  Replaces PIT.
-- **No port I/O at all** — every device is MMIO.  Drivers that
-  currently use `inb`/`outb` need MMIO equivalents.
+| Phase | Scope | Status |
+|-------|-------|--------|
+| **A** | Toolchain + build + boot (EL2→EL1) + PL011 UART + exception vectors + MMU identity map | ✅ **shipped** (2026-07-07, DOCS §4.17) |
+| **B** | GICv2 distributor/CPU-IF + ARM generic timer (per-CPU tick, replaces PIT) + IRQ install API | ✅ **shipped** (2026-07-07, DOCS §4.17) |
+| **C** | Context switch + `hal_task_init_stack` + full HAL (hal_arch.c) + PMM/kmalloc on the aarch64 map + serial console sink + preemptive scheduler | ✅ **shipped** (2026-07-07, DOCS §4.17) |
+| **D** | Interactive serial shell (UART RX + REPL, on the scheduler) + VFS + ramfs — an interactive shell with a real filesystem on ARM64 | ✅ **shipped** (2026-07-07, DOCS §4.17) |
+| **E** | SMP via PSCI — secondary cores join the stock per-CPU runqueue + load balancer; two tasks run on two cores in parallel | ✅ **shipped** (2026-07-07, DOCS §4.17) |
+| **F** | virtio-MMIO block device (modern transport) registered as /dev/vda with the stock block layer; write→read self-test + `blk` shell command | ✅ **shipped** (2026-07-07, DOCS §4.17) |
+| **G** | exFAT on /dev/vda (stock block_cache.c + exfat.c) mounted at /mnt — persistent storage; files written from the shell survive a reboot | ✅ **shipped** (2026-07-07, DOCS §4.17) |
+| **H** | Device-tree (FDT/DTB) parsing — the kernel discovers RAM size + CPU count from the DTB and sizes the PMM to the actual `-m`, with a fallback | ✅ **shipped** (2026-07-07, DOCS §4.17) |
+| **I** | virtio-gpu framebuffer — the SAME portable `fb_terminal.c` renders the boot log + interactive shell graphically (fb_present backend abstraction; x86 DISPI flip hoisted out) | ✅ **shipped** (2026-07-09, DOCS §4.17) |
+| **L** | EL0 userspace substrate (M25 prerequisite) — per-process VMM (`vmm.c`) + EL0 entry + SVC syscall (`usermode.S`/`syscall.c`); a user program runs at EL0 and services SYS_PRINT/SYS_EXIT.  Brings ARM to the x86 M6/M20.5 baseline → all 3 arches M25-ready | ✅ **shipped** (2026-07-10, DOCS §4.17) |
+| **J / K** | The *same* full `shell.c` on a virtual console + the M22 GUI (compositor + taskbar + PL031 clock + windows), driven by virtio-input keyboard/mouse over the virtio-gpu framebuffer.  Portability shims (`arch_ringtest`, PSCI reboot/shutdown, `pl031_rtc`, `fb_present_flush`, `virtio_input`) + a scheduler idle-loop IRQ-enable fix.  **M22 arch parity.** | ✅ **shipped** (2026-07-10, DOCS §4.17) |
+| **M** | USB (M15 arch port) — new PCIe-ECAM layer (`pci.c`: config via MMIO + BAR assignment, no firmware) → the stock xhci.c + usb_hid.c link + run (MMIO, polled from the timer ISR); USB HID keyboard drives the shell.  **Full x86 parity.** | ✅ **shipped** (2026-07-10, DOCS §4.17) |
 
-**Definition of done:**
-- Boots on QEMU `-machine virt -cpu cortex-a72` (or RPi simulation).
-- Same shell, same commands.
-- DOCS.md gains arch-specific notes.
+### Phase A — ✅ shipped (2026-07-07, DOCS §4.17)
+
+Boots on `qemu-system-aarch64 -M virt -cpu cortex-a72 -nographic
+-kernel build/aarch64/kernel.bin`.  As-built:
+- **Raw-ELF boot, no GRUB / no multiboot** — QEMU's `virt` loader
+  reads the PT_LOAD segments and jumps to `_start` (linker-aarch64.ld
+  links at 0x40080000, just above the `virt` RAM base 0x40000000).
+- **boot.S**: reads `CurrentEL`; if we woke in EL2 (`virtualization=on`)
+  it configures `HCR_EL2.RW`, the EL1 timer access (`CNTHCTL_EL2`,
+  `CNTVOFF_EL2`), a sane MMU-off `SCTLR_EL1`, and `eret`s down to EL1h;
+  then sets SP, zeroes `.bss`, and calls `aarch64_main_entry(dtb)`.
+- **PL011 UART** (`uart.c`) at MMIO 0x09000000 — the dependency-free
+  early console (ARM analogue of the x86 boot.s inline COM1 print).
+- **Exception vectors** (`vectors.S` + `exceptions.c`): the fixed
+  16-entry, 2 KiB-aligned EL1 table into `VBAR_EL1`; each slot saves a
+  272-byte trapframe and calls a C dispatcher (SYNC/SError → ESR/FAR
+  dump + halt; IRQ → weak hook for Phase B).
+- **MMU** (`mmu.c`): 4 KiB granule, 39-bit VA, a single level-1 table
+  using 1 GiB *block* descriptors — index 0 = Device-nGnRnE (peripheral
+  window: UART + GIC), indices 1..3 = Normal WB inner-shareable RAM.
+  MAIR/TCR/TTBR0 set, then `SCTLR_EL1.{M,C,I}` flip the MMU + caches on.
+- **Build**: separate `Dockerfile.aarch64` (the aarch64 cross toolchain
+  `Conflicts:` gcc-multilib, so it can't share the x86 image);
+  Makefile `ARCH=aarch64` branch (GNU-as `.S` via the cross gcc, no
+  nasm); `scripts/{build,run_qemu}.sh` grew an aarch64 path.
+
+**Verified on serial:** boots at EL1, installs VBAR_EL1, enables the
+MMU, and a post-MMU Normal-cached RAM read-back returns the sentinel
+(proves the identity map + cache attributes are correct).
+
+**Lesson learned:** `exceptions.c` + `exceptions.S` both compile to
+`exceptions.o` under the mirror-path object tree → the second silently
+overwrote the first and `vector_table` went undefined at link.  The
+assembler half is `vectors.S`.  (No header deps here, but the same
+"same basename, different ext" footgun as any C/asm pair.)
+
+### Phase B — ✅ shipped (2026-07-07, DOCS §4.17)
+
+The interrupt controller + periodic tick — the ARM equivalent of the
+x86 IOAPIC + PIT/LAPIC-timer.  As-built:
+- **GICv2** (`gic.c`): distributor (GICD @0x08000000) + CPU interface
+  (GICC @0x08010000).  `gic_init` enables the CPU-IF with an all-pass
+  priority mask + the distributor; `gic_enable_irq(intid)` unmasks one
+  line (priority + CPU-0 target for SPIs); `gic_register_handler` binds
+  a C handler.  The strong `aarch64_irq_dispatch` overrides the Phase-A
+  weak stub and runs the ack→dispatch→EOI handshake (GICC_IAR →
+  handler → GICC_EOIR).  This is the ARM half of the "IRQ install API".
+- **Generic timer** (`timer.c`): the non-secure EL1 physical timer
+  (CNTP_*), whose `virt` interrupt is PPI 14 → GIC INTID 30 (EL1 access
+  was granted in boot.S via CNTHCTL_EL2).  `timer_init(hz)` arms
+  CNTP_TVAL for one interval + enables CNTP_CTL; the ISR re-arms TVAL +
+  bumps a monotonic `tick_count` (no auto-reload register on ARM — the
+  standard rearm-per-IRQ pattern).  Exposes `timer_ticks()` /
+  `timer_ticks_ms()` / `timer_raw_count()` (CNTPCT, the TSC analogue)
+  for Phase C's scheduler quantum.
+- **IRQ unmask**: `msr daifclr, #2` (the `sti` analogue) — boot.S left
+  DAIF fully masked after the EL2→EL1 eret.
+- **run_qemu.sh** pins `-M virt,gic-version=2` so the hard-coded GIC
+  MMIO layout always matches (newer QEMU may default the board to v3).
+
+**Verified on serial:** GIC init + timer arm, then 1 s / 2 s / 3 s tick
+milestones (0x64 / 0xc8 / 0x12c) and a PASS after 300 periodic IRQs —
+the full path GIC delivery → EL1 IRQ vector → dispatcher → timer ISR →
+EOI, repeatedly, with no fault.
+
+### Phase C — ✅ shipped (2026-07-07, DOCS §4.17)
+
+The kernel's heart on ARM — preemptive multitasking + the memory manager.
+Rather than porting the heavily x86-coupled shared `kernel_main`
+(multiboot/ACPI/LAPIC/PIT) up front, aarch64 runs its OWN bring-up in
+`main_entry.c` and calls the *portable* core subsystems directly.  As-built:
+- **Context switch** (`switch.S`): saves/restores the 12 AAPCS64 callee-saved
+  regs (x19–x30) across a stack swap; `ret` branches to the restored LR.
+  `task_arch.c` synthesises a brand-new task's frame (LR = `task_trampoline`,
+  x19 = entry) — the ARM analogue of the x86 ebx/rbx trick.
+- **Full HAL** (`hal_arch.c`): `hal_intr_{enable,disable,save,restore}` via
+  PSTATE.DAIF (`msr daifset/clr, #2` = cli/sti), `hal_cpu_{halt,pause,idle}`
+  (wfi/yield), `hal_arch_early_init` (= exceptions + MMU),
+  `hal_extend_identity_map`, and a `hal_syscall_exit_to_kernel` placeholder.
+- **Memory** — the stock `pmm.c` + `slab.c` + `kmalloc.c` link and run
+  unchanged.  Two enablers: `BUDDY_MAX_FRAMES` bumped to the 4 GiB cap for
+  aarch64 (RAM sits at pfn 0x40000, past the old 1 GiB cap), and `stubs.c`
+  synthesises a `struct mboot_info` + AVAILABLE mmap entry for the `virt`
+  RAM (0x4000_0000, 256 MiB) so the mmap-walking pmm needs no ARM awareness.
+- **Serial console sink** (`stubs.c`): registers the PL011 as a `console_sink`
+  so `kprintf()` reaches the serial log.
+- **Scheduler**: the stock `task.c` + `percpu.c` + `lock.c` link with a
+  handful of UP stubs (`lapic_id`→0, `acpi_*`→1-CPU, `smp_*`→no-op; percpu
+  stays in not-ready/CPU-0 mode).  The timer ISR calls `schedule_request`;
+  the GIC IRQ-exit calls `schedule_check` → `schedule()` → `context_switch`.
+- **Freestanding libc** (`lib.c`): `mem{set,cpy,move,cmp}` (gcc emits calls to
+  these on ARM) + a `__getauxval` stub (libgcc's LSE-atomics init needs it);
+  built with `-mno-outline-atomics` + `-fno-tree-loop-distribute-patterns`.
+
+**Verified on serial:** pmm reports 253 MiB free RAM managed at 0x4000_0000;
+kmalloc self-test reuses a freed slot (heap in RAM); pid 0 installed; then two
+never-yielding hog tasks BOTH make ~equal progress (hogA≈501M, hogB≈509M) —
+proving the timer IRQ preempts and the context switch is correct — PASS, no
+fault.
+
+### Phase D — ✅ shipped (2026-07-07, DOCS §4.17)
+
+An interactive shell with a real filesystem on ARM64.  The x86 `shell.c`
+reads from a framebuffer-backed VC and its command set is welded to
+subsystems still x86-only on ARM (the GUI/VC, ring-3 usermode, vmm.c, the
+block/USB drivers) — reaching it verbatim is gated on those ports (Phase E+).
+So Phase D brings up a genuine REPL over the UART instead:
+- **UART RX** (`uart.c` `uart_early_getchar`): non-blocking PL011 receive; the
+  shell polls it and `task_yield()`s while idle (the timer keeps preempting
+  underneath, so no CPU is hogged).  (A PL011 RX IRQ would let it block
+  instead of poll — deferred; polling is simple and correct.)
+- **Serial shell** (`serial_shell.c`): a REPL that runs as an ordinary
+  scheduler task and drives the PORTABLE services already up — `help`, `echo`,
+  `meminfo`/`free` (PMM stats), `uptime`, `ps` (task_for_each), and the ramfs:
+  `ls`, `cat`, `mkdir`, `write`, `rm`, plus `clear`.
+- **VFS + ramfs**: the stock `vfs.c` + `ramfs.c` (+ `block.c` for vfs's
+  symbol closure, `module.c` for the registry) link unchanged; `vfs_init()` +
+  `module_init_all()` register + mount ramfs at `/`.
+
+**Verified on serial (scripted REPL):** `ls /` shows the ramfs skeleton
+(mnt/ proc/ tmp/ dev/ etc/); `mkdir /foo` → `write /foo/a.txt hello-from-arm64`
+→ `ls /foo` shows `a.txt` → `cat` returns the content → `rm` → `ls` empty
+again; `ps` lists the shell (current) + idle + kernel; `meminfo` = 253 MiB
+free; no fault.
+
+### Phase E — ✅ shipped (2026-07-07, DOCS §4.17)
+
+SMP on the third arch — the real torture test of the "SMP-ready on UP"
+abstraction: the STOCK per-CPU runqueue + load balancer + percpu.c table
+(the same core the x86 SMP port drives) now run secondary cores on ARM via a
+completely different mechanism.  As-built:
+- **PSCI** (`smp.c`): no INIT-SIPI-SIPI / no low-memory trampoline — a
+  `PSCI_CPU_ON` HVC (QEMU's emulated PSCI, HVC conduit at EL1) releases each
+  secondary vCPU at a physical entry with the MMU off.
+- **Secondary trampoline** (`smp_entry.S`): sets an MMU-off SCTLR, derives the
+  core index from MPIDR.Aff0, loads its private stack from `ap_sp[]`, and calls
+  `smp_secondary_main`.
+- **Per-CPU bring-up** (`smp_secondary_main`): turns the MMU on FIRST (so the
+  core is cache-coherent with the others before any lock), sets VBAR, brings up
+  its GIC CPU interface (`gic_cpu_init` — the banked GICC + PPIs are per-CPU),
+  `percpu_init_ap` + `task_install_ap_idle`, then arms its OWN generic timer so
+  its tick drives local preemption.
+- **Enablers**: `mmu.c` split into build-once + `mmu_enable_this_cpu`; `gic.c`
+  split out `gic_cpu_init`; `smp.c` provides the percpu.c topology hooks
+  (`lapic_id` = MPIDR.Aff0, linear ACPI topology) so the stock percpu apic_id→
+  index map works; cross-CPU kick is a GIC SGI (`smp_send_reschedule`).
+
+**Verified on serial:** `percpu: 2 CPUs known`; `secondary CPU 1 online`;
+`SMP — 2 CPU(s) online`; then two never-yielding hog tasks run on **CPU1 and
+CPU0** (`parallelism PASS`) — genuine parallel execution across cores driven by
+the load balancer.  Configurable via `AARCH64_MAX_CPUS` + `-smp` (shipped at 2).
+
+### Phase F — ✅ shipped (2026-07-07, DOCS §4.17)
+
+The ARM proof of "every device is MMIO": a real disk on `/dev/vda` over the
+virtio-MMIO transport.  The existing `virtio_blk.c` speaks virtio over PCI
+(port I/O) — meaningless on ARM — so a fresh, self-contained driver:
+- **`virtio_mmio_blk.c`**: scans QEMU `virt`'s 32 virtio-MMIO slots
+  (0x0a00_0000, stride 0x200) for a block device, runs the modern
+  (version-2) init handshake (reset → ACK → DRIVER → feature-OK →
+  DRIVER_OK), sets up one split virtqueue (desc/avail/used programmed via
+  the Desc/Driver/Device Low/High registers), and does POLLED synchronous
+  512-byte sector read/write (3-descriptor requests: header + data +
+  status).  Registers with the STOCK block layer (`blk_register`) as
+  `/dev/vda`, so nothing else needs to know the transport is MMIO.
+- **`main_entry.c`**: a write→read round-trip self-test on a scratch sector.
+- **`serial_shell.c`**: a `blk [lba]` command that hexdumps a sector.
+- **Run**: `-global virtio-mmio.force-legacy=false` (QEMU `virt` defaults its
+  virtio-mmio slots to legacy/version-1; we want modern) + `-drive ...
+  -device virtio-blk-device` (wired into run_qemu.sh, disk optional).
+
+**Verified on serial:** `/dev/vda ready (8192 sectors, 4 MiB)`; the
+write→read self-test PASSes on sector 100; `blk 0` from the shell hexdumps
+the on-disk bytes (`...D-OS-ARM64-DISK-SECTOR0-HELLO`) — real DMA read/write
+end-to-end.
+
+### Phase G — ✅ shipped (2026-07-07, DOCS §4.17)
+
+Persistent storage on ARM64: a real exFAT filesystem on the virtio-blk disk.
+The stock `block_cache.c` + `exfat.c` are arch-independent (exfat.c even
+carries its own `memcpy_`/`memset_`, no RTC/port-I/O), so they link + run
+unchanged — the payoff of keeping the fs layer portable.
+- **`main_entry.c`**: after the block device is up, `bcache_init()` then
+  `vfs_mount("exfat", "/mnt", "vda")`.
+- The serial shell's existing `ls`/`cat`/`write`/`rm` (which go through the
+  VFS) now operate on real disk under `/mnt`.
+- **Test**: an exFAT image is `mkfs.exfat`'d in the x86 build image (which
+  carries exfatprogs) and attached as the virtio-blk disk.  (No `-boot d`
+  gotcha here — the ARM `-kernel` path is not BIOS-based, so the disk's boot
+  signature is irrelevant.)
+
+**Verified on serial:** `exfat: mounted dev=vda clusters=7680 ...`; from the
+shell, `write /mnt/hello.txt hi-from-arm-exfat` → `ls /mnt` shows `hello.txt`
+→ `cat` returns the content; and — the key proof — on a FRESH boot with the
+same disk, `cat /mnt/hello.txt` still returns it: the write persisted to the
+exFAT volume across a reboot.  Full chain end-to-end: virtio-MMIO → block
+cache → exFAT → VFS → shell.
+
+### Phase H — ✅ shipped (2026-07-07, DOCS §4.17)
+
+The kernel discovers the machine instead of hard-coding it.  On ARM there is
+no BIOS/ACPI enumeration — firmware hands over a **device tree** (FDT/DTB).
+- **`dtb.c`**: a minimal big-endian FDT parser — walks the structure block for
+  the `/memory` node's `reg` (base + size) and counts `/cpus/cpu@*` nodes.
+- **Finding the blob**: QEMU's direct-ELF `-kernel` entry passes no x0 pointer
+  and places no DTB in RAM, so the run script loads one at a fixed address
+  (`-device loader,addr=0x48000000`); `fdt_find` checks x0, then that address,
+  then scans low RAM.  Generated per machine config via `-machine dumpdtb`.
+- **Payoff**: `aarch64_boot_meminfo_init` (stubs.c) now sizes the PMM map to
+  the DTB-discovered RAM window instead of the baked-in 256 MiB, with a clean
+  fallback to the default when no DTB is present.
+
+**Verified on serial:** with `-m 512M -smp 4` + the loaded DTB,
+`dtb: found @ 0x48000000 — RAM 512 MiB @ 0x40000000, 4 CPU(s)` and the PMM
+comes up with **509 MiB free** (vs. the 253 MiB the hard-coded 256 MiB gave);
+without a DTB, `dtb: no device tree found (using built-in defaults)` and the
+PMM falls back to 253 MiB — the kernel adapts to the actual machine.
+
+### Phase I — ✅ shipped (2026-07-09, DOCS §4.17)
+
+The framebuffer on the third arch, running the *same* portable console x86 uses.
+QEMU `virt` has no VGA/Bochs-VBE and no linear-VRAM BAR — the display is a
+virtio-gpu device on a virtio-MMIO slot, and it is a COMMAND device (guest RAM
+buffer → host resource backing → scanout → per-update transfer+flush), not a
+plain framebuffer.  As-built:
+- **`fb_present.h` backend cut** — the one x86-only part of `fb_terminal.c` (the
+  Bochs-VBE port I/O + the vmm identity map) moved behind a two-call interface:
+  `fb_present_map(phys,size)` (x86: 4 MiB PSE map; ARM: no-op, RAM already
+  mapped) and `fb_present_flush(x,y,w,h)` (x86: no-op, the linear FB *is* the
+  scanout; ARM: virtio-gpu transfer+flush).  The M22.6 double-buffer page flip
+  (`fb_flip_init`/`fb_flip_to`) moved verbatim from `fb_terminal.c` to
+  `kernel/hal/x86/fb_present.c`; gui.c is unchanged.  `fb_terminal.c` is now
+  arch-portable and self-flushes each render primitive's dirty rect.
+- **`virtio_gpu.c`** — modern virtio-MMIO handshake (reused from Phase F) +
+  control virtqueue; RESOURCE_CREATE_2D → ATTACH_BACKING (a contiguous ~4 MiB
+  `pmm_alloc_contiguous` framebuffer) → SET_SCANOUT for a 1280×800 B8G8R8X8
+  display; then `fb_term_init_direct()` hands the buffer to the console.
+- **`main_entry.c`** brings the GPU up right after kmalloc, so most of the boot
+  log renders graphically (and still to the serial log).
+
+**Verified (QEMU screendump, `-device virtio-gpu-device`):** the boot log
+renders at 1280×800 (160×100 grid) and `help`/`ls /`/`meminfo` show crisp output
+on the framebuffer; the i386 GUI compositor page-flip (now via the moved
+`fb_present.c`) is regression-free.  **Lesson learned:** on SMP the serial-shell
+banner interleaved character-by-character with pid 0's hand-off line on the
+shared console — harmless byte-mixing on serial, but it corrupts the shared
+cursor on the framebuffer.  Fixed by printing the hand-off line *before*
+spawning the shell (pid 0 then only idles); the general fix — console output
+serialization — is deferred to when a second concurrent FB writer actually
+needs it (Phase J's VC panes).
+
+### Phase L — ✅ shipped (2026-07-10, DOCS §4.17)
+
+EL0 userspace on the third arch — the prerequisite that makes **M25 startable on
+all three architectures**.  x86 has had ring 3 + `int 0x80` since M6/M20.5;
+this brings aarch64 to the same baseline.  As-built:
+- **`vmm.c`** — per-process TTBR0 address spaces: `aarch64_vmm_create` allocates a
+  private L1 table and copies the kernel's low-4-GiB identity blocks into it (so
+  the kernel + peripherals stay mapped in every space, as on x86); page-granular
+  `aarch64_vmm_map_user` (EL0-accessible, AP=01 + PXN, UXN cleared only for code)
+  at VA ≥ 4 GiB; `aarch64_vmm_switch` (load TTBR0 + `tlbi`).
+- **`usermode.S` + `syscall.c`** — `aarch64_enter_user` `eret`s to EL0 (SP_EL0 +
+  ELR + SPSR); a `svc #0` traps to the EL0 sync vector, `exceptions.c` decodes
+  ESR.EC==0x15 and dispatches (x8=number, x0..x5=args; shared `syscall.h`);
+  SYS_EXIT teleports back via `aarch64_user_exit`.  No TSS analogue needed — the
+  CPU auto-selects SP_EL1 on the EL0→EL1 exception.
+
+**Verified (serial):** `usertest: dropping to EL0 …` → `hello from EL0 (aarch64
+userspace)!` (printed by the EL0 program via `svc`) → `…back at EL1 (SYS_EXIT
+teleport OK)`.  i386 + x86_64 `ringtest` re-verified identical.  **Lesson
+learned:** user VA must clear the kernel's 1 GiB identity blocks — placing user
+pages at ≥ 4 GiB (L1 index ≥ 4) keeps `aarch64_vmm_map_user` from ever trying to
+split a kernel *block* descriptor into a table.
+
+**Remaining DoD (Phase J / K — NOT M25 prerequisites):** the *same* framebuffer
+`shell.c` (VC panes + input routing; today ARM uses `serial_shell.c` over the
+UART) and the GUI compositor.  These are ARM ports of M22/M15, independent of the
+userland (M25) line, and can follow at any time.
 
 ---
 
@@ -1896,6 +2176,16 @@ syscall table (SYS_PRINT / SYS_EXIT), and no fd concept at all.
 This milestone builds that substrate.  It is worth doing regardless
 of Wayland — it is what turns d-os tasks into real user processes.
 
+**Prerequisites — ✅ ready on all three arches (2026-07-10).**  The
+arch substrate M25 builds on is now present and verified uniformly:
+each of i386 / x86_64 / aarch64 can enter user mode (ring 3 / EL0),
+service a syscall (`int 0x80` / `svc`), and map EL0-accessible user
+pages (i386/x86_64 `vmm_map(…, VMM_USER)`; aarch64 `vmm.c`
+`aarch64_vmm_map_user` + per-process `aarch64_vmm_create`).  See the
+M25-readiness matrix in DOCS.md §4.17.  So stage 1 below can start on
+any arch.  (Older deferred items — §M20.6.1 SYSCALL/SYSRET, §M19.5.1
+i386 kmap — are optimisations, NOT M25 blockers, and stay deferred.)
+
 **Design — staged subsystems.**
 
 1. **Per-process address spaces** — `struct task` gains the
@@ -2264,6 +2554,115 @@ the GUI multi-session piece leans on the §M22.7 "GUI session" model.
 
 ---
 
+## §M33 — Switchable driver placement: fault-tolerant hosting → user-mode driver isolation
+
+**Why:** today every driver runs in ring 0 in the single shared kernel
+address space (the `DRIVER()` registry links them in at boot).  A buggy
+driver can corrupt any memory, and a fault panics the whole system — the
+Windows 9x / VxD failure mode.  This milestone gives drivers *fault
+tolerance* and, on top of §M25, *real isolation*: a driver can crash and
+be **restarted without taking the system down**, and selected drivers can
+be moved out of the kernel into their own ring-3 process.  The knob is
+**per-driver** and config-driven (a desktop keeps drivers in-kernel for
+speed; a server profile isolates them), applied at restart — a **hybrid
+kernel** (NT / XNU-shaped), not a wholesale micro-vs-monolith flip.
+
+**The key architectural idea — one narrow waist, two backends.**  A
+driver is written against a *driver-runtime API* (`drv_port_out`,
+`drv_mmio_map`, `drv_irq_wait`, `drv_dma_alloc`, `drv_send_to_client`)
+instead of calling `outb` / `kmalloc` / `register_irq` directly.  That API
+has two implementations, chosen per driver:
+- **in-kernel backend** — direct calls (`outb`, plain function call);
+  zero IPC overhead; monolithic.
+- **user-mode backend** — IO-bitmap port grants, VMM-mapped MMIO, the IRQ
+  forwarded to a "wait-for-IRQ" syscall, IPC messages to clients;
+  isolated; microkernel-shaped.
+
+The *same* driver source runs either way — the NetBSD rump-kernel model.
+The API must be IPC-/capability-shaped **from day one** even while only the
+in-kernel backend exists (convention #5), or the second backend will not
+fit later.
+
+**Design — staged (climb, don't jump).**
+
+1. **Tier 0 — fault-tolerant in-kernel hosting (no §M25 needed).**  Wrap
+   driver entry points (init, IRQ handler) so a fault (#PF/#GP/#DE) whose
+   faulting IP lies in a driver traps to a per-driver recovery path
+   instead of a global panic: mark the driver DEAD, run its existing
+   `DRIVER()` `shutdown`, and let the supervisor (§M29) restart it per
+   policy; the watchdog (§M31) catches *hung* (non-faulting) drivers into
+   the same restart path.  **Honest limit:** this is *not* memory
+   isolation — a wild write has already happened before the trap; it
+   converts the common trap-style faults + hangs from panic into restart,
+   covering a large fraction of crash modes cheaply, and fits the
+   monolithic philosophy (drivers stay ring 0).
+2. **The runtime-API waist (design at §M25 time).**  Define the
+   driver-runtime API in its final IPC-shaped form; implement only the
+   in-kernel backend first.  Add a per-driver capability flag to the
+   registry: `.placements = PLACE_KERNEL | PLACE_USER` (default
+   KERNEL-only).  **Boot-critical** drivers (console / framebuffer, timer,
+   interrupt controller, boot storage) are pinned PLACE_KERNEL — they come
+   up *before* the process / IPC substrate exists (chicken-and-egg) and
+   never appear in the toggle list.
+3. **Tier 1 — user-mode isolation for non-DMA drivers (needs §M25).**
+   Implement the user-mode backend and move a first *non-DMA* driver (PS/2
+   keyboard or serial) into a ring-3 process, proving the same source runs
+   both ways (rump-style demo).  Full memory isolation + real restart, no
+   IOMMU required (no DMA to constrain).
+4. **Placement list + config surface.**  Config keys mirror the existing
+   pattern (`gui.shell`, `shell.provider`): `driver.profile =
+   desktop|server` plus per-driver `driver.<name>.placement = kernel|user`
+   overrides.  A `/proc/drivers` live view (name, placement, pid if
+   user-mode, isolation = full/advisory/none, restart count) and a `driver
+   list | set <name> kernel|user` command.  **Restart-to-apply** is the v1
+   semantics — changing where a driver runs re-plumbs its bring-up, and
+   live re-placement is the hard live-update problem; `driver set` writes
+   config and reports "restart required".  (Live re-placement falls out
+   for free later, once Tier 2's teardown + re-init + client-reconnect
+   machinery exists.)
+5. **IOMMU driver (VT-d / AMD-Vi) — its own, boundable piece.**  A
+   DMA-capable driver moved to user-mode is *not* isolated without an
+   IOMMU: the device can still DMA over kernel memory (kernel-bypass /
+   DPDK is the proof that userspace ≠ isolated).  An IOMMU driver
+   constrains device DMA to the driver's granted regions.  Until it
+   exists, toggling a `.needs_dma` driver to user-mode is `ISOLATION:
+   ADVISORY(!)` — allowed but loudly flagged, or refused under a strict
+   profile.
+6. **Tier 2 — DMA-driver isolation (needs §M25 + IOMMU) — the north
+   star.**  virtio-blk / xHCI (later NIC / GPU) in ring 3 with
+   IOMMU-constrained DMA + the full recovery discipline: clean resource
+   teardown (MMIO unmap, IRQ release, DMA free, port revoke), device
+   re-init from scratch, and **client reconnection** — the block layer /
+   input subsystem must tolerate a driver vanishing and returning
+   (idempotent / replayable requests).  This client-reconnect interface
+   discipline is the genuinely hard, pervasive part.
+
+**Definition of done:**
+- Tier 0: a driver made to fault on command is restarted by the
+  supervisor instead of panicking; visible in `dmesg` + the
+  `/proc/drivers` restart count.
+- Tier 1: `driver set ps2kbd user` + restart brings the keyboard up in a
+  ring-3 process (`/proc/drivers` shows placement=user, a pid,
+  isolation=full); killing that process restarts it, the keyboard keeps
+  working, and the kernel does not fault.
+- The same driver source, unchanged, runs in both placements.
+- DOCS.md gains a "Driver placement / isolation" chapter.
+
+**Out of scope (initially):** live (no-restart) re-placement; Tier 2
+without an IOMMU; GPU / NIC isolation (arrive with their own drivers);
+driver-to-driver dependency ordering across the boundary; per-driver
+resource quotas.
+
+**Depends on:** §M27 (lifecycle + kill-tree + change-hook — shipped) for
+Tier 0; §M25 (ring 3 + per-process address spaces + IPC) for the
+user-mode backend (Tier 1+); §M29 (supervisor) + §M31 (watchdog) for the
+detect-and-restart half; an IOMMU driver for *safe* Tier 2.  **Philosophy
+note:** Tier 0–1 fit the Linux-inspired monolith (CLAUDE.md #6); Tier 2
+(user-mode DMA drivers) leans microkernel — a deliberate identity choice,
+hence gated behind the IOMMU and treated as a north star, not a default.
+
+---
+
 ## §M-registry (parked) — hierarchical config store
 
 **Status:** intentionally NOT scheduled.  A Windows-style registry
@@ -2294,6 +2693,18 @@ not a binary registry.  Revisit only with a specific use case.
 
 ## Change log
 
+- **2026-07-06** — Added §M33 (switchable driver placement): a
+  driver-runtime API "narrow waist" with two backends (in-kernel
+  direct-call / user-mode IPC), so the *same* driver source runs either
+  linked in ring 0 or isolated in a ring-3 process (NetBSD rump-kernel
+  model) — a **hybrid kernel**, per-driver, config-driven
+  (`driver.<name>.placement`), applied at restart.  Staged: Tier 0
+  (fault-tolerant in-kernel hosting, no §M25) → Tier 1 (non-DMA driver in
+  user-mode, needs §M25) → IOMMU driver → Tier 2 (DMA-driver isolation,
+  the north star).  Captures the "userspace ≠ automatically isolated"
+  (kernel-bypass / DMA) and DMA/IOMMU-wall reasoning.  Depends on §M25
+  (user-mode backend) + §M29/§M31 (detect + restart); Tier 0 leans only
+  on shipped §M27.  No code changed.
 - **2026-07-05** — Added §M32 (multi-user): credentials on tasks, a
   `/etc/passwd`-style user DB, login/sessions, file ownership +
   rwx permissions in the VFS, privilege gating (root vs not), and

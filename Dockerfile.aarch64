@@ -1,0 +1,20 @@
+# =============================================================================
+# Dockerfile.aarch64 — build toolchain for the ARM64 (M21) port.
+#
+# Kept SEPARATE from the main Dockerfile because Ubuntu's `gcc-multilib`
+# (needed by the i386 `-m32` build) declares a hard Conflicts: against
+# `gcc-11-aarch64-linux-gnu`, so the two cross toolchains cannot coexist in
+# one image.  The AArch64 port needs neither multilib nor nasm/grub — it is a
+# raw-ELF build booted by QEMU `-M virt -kernel` — so this image is minimal:
+# just the aarch64 cross gcc/binutils, make, and qemu-system-arm for booting.
+# =============================================================================
+
+FROM --platform=linux/amd64 ubuntu:22.04
+
+RUN apt update && apt install -y \
+    make \
+    gcc-aarch64-linux-gnu \
+    binutils-aarch64-linux-gnu \
+    qemu-system-arm
+
+WORKDIR /src

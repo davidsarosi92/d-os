@@ -26,11 +26,10 @@
  * ============================================================================= */
 
 #include "multiboot.h"
-#include "vmm.h"
 #include "printf.h"
 #include "console.h"
 #include "module.h"
-#include "hal.h"                                  /* inw/outw for DISPI flip */
+#include "fb_present.h"                           /* map + flush backend */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -42,7 +41,6 @@ static volatile uint32_t* fb_pixels = 0;        /* pointer into the mapped FB */
 static uint32_t fb_width  = 0;                  /* pixels per row */
 static uint32_t fb_height = 0;                  /* pixel rows */
 static uint32_t fb_pitch_bytes = 0;             /* bytes per pixel row */
-static uint32_t fb_phys_base = 0;               /* physical FB base (VRAM BAR) */
 
 #define GLYPH_W 8
 #define GLYPH_H 8
@@ -178,6 +176,7 @@ static void fb_fill_bg(void) {
     for (uint32_t y = 0; y < fb_height; y++) {
         for (uint32_t x = 0; x < fb_width; x++) fb_pixels[y * stride + x] = BG_COLOR;
     }
+    fb_present_flush(0, 0, fb_width, fb_height);
 }
 
 /* Render one glyph at cell (col, row).  Characters outside 0..127 land on
@@ -193,6 +192,7 @@ static void draw_glyph(unsigned char ch, uint32_t col, uint32_t row) {
             put_pixel(ox + px, oy + py, color);
         }
     }
+    fb_present_flush(ox, oy, GLYPH_W, GLYPH_H);
 }
 
 /* Shift the framebuffer up by one character row and clear the new bottom
@@ -213,6 +213,7 @@ static void scroll_one_row(void) {
     for (uint32_t y = fb_height - GLYPH_H; y < fb_height; y++) {
         for (uint32_t x = 0; x < fb_width; x++) fb_pixels[y * stride + x] = BG_COLOR;
     }
+    fb_present_flush(0, 0, fb_width, fb_height);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -248,6 +249,7 @@ void fb_clear_cells(int col, int row, int w, int h, uint32_t bg) {
     for (uint32_t y = py0; y < pyN; y++) {
         for (uint32_t x = px0; x < pxN; x++) fb_pixels[y * stride + x] = bg;
     }
+    fb_present_flush(px0, py0, pxN - px0, pyN - py0);
 }
 
 /* Render glyph `ch` at cell (col,row) using fg/bg colors. */
@@ -264,6 +266,7 @@ void fb_draw_glyph_at(int col, int row, char ch, uint32_t fg, uint32_t bg) {
             put_pixel(ox + px, oy + py, color);
         }
     }
+    fb_present_flush(ox, oy, GLYPH_W, GLYPH_H);
 }
 
 /* Scroll a cell rect up by ONE cell row.  The bottom cell row is cleared
@@ -294,6 +297,7 @@ void fb_scroll_cells_up(int col, int row, int w, int h, uint32_t bg) {
     for (uint32_t y = pyN - GLYPH_H; y < pyN; y++) {
         for (uint32_t x = px0; x < pxN; x++) fb_pixels[y * stride + x] = bg;
     }
+    fb_present_flush(px0, py0, pxN - px0, pyN - py0);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -320,88 +324,10 @@ const uint8_t* fb_font_glyph(unsigned char ch) {
     return font8x8[ch < 128 ? ch : 0x7F];
 }
 
-/* -------------------------------------------------------------------------- */
-/* M22.6 — tear-free presentation via a Bochs-VBE double buffer.               */
-/*                                                                             */
-/* QEMU's std-VGA (and Bochs) expose the "DISPI" interface: an index/data      */
-/* register pair (ports 0x1CE/0x1CF) that, among other things, lets us set a   */
-/* VIRTUAL framebuffer taller than the visible one and PAN the visible window  */
-/* within it via a Y-offset.  That is a hardware page flip: compose the whole  */
-/* next frame into the hidden half, then move the scanout origin to it in one  */
-/* register write.  QEMU always reads a consistent buffer, so there is no      */
-/* mid-scanout shear — no vblank interrupt required.                           */
-/*                                                                             */
-/* This only works on the Bochs-VBE device (the ID register reads 0xB0Cx).     */
-/* On anything else fb_flip_init() returns non-zero and the compositor keeps    */
-/* its single-buffer direct blit.                                              */
-/* -------------------------------------------------------------------------- */
-
-#define VBE_DISPI_IOPORT_INDEX      0x01CE
-#define VBE_DISPI_IOPORT_DATA       0x01CF
-#define VBE_DISPI_INDEX_ID          0x0
-#define VBE_DISPI_INDEX_VIRT_HEIGHT 0x7
-#define VBE_DISPI_INDEX_Y_OFFSET    0x9
-
-static int fb_flip_ok = 0;
-
-static inline uint16_t dispi_read(uint16_t idx) {
-    outw(VBE_DISPI_IOPORT_INDEX, idx);
-    return inw(VBE_DISPI_IOPORT_DATA);
-}
-static inline void dispi_write(uint16_t idx, uint16_t val) {
-    outw(VBE_DISPI_IOPORT_INDEX, idx);
-    outw(VBE_DISPI_IOPORT_DATA, val);
-}
-
-/* Probe for the Bochs-VBE device, reserve a second frame's worth of VRAM by
- * doubling the virtual height, and map that second buffer.  On success both
- * `*buf0`/`*buf1` point at the two frame buffers (buf0 == the visible one at
- * boot) and 0 is returned; the compositor drives fb_flip_to() thereafter.
- * Any failure (not Bochs VBE, VRAM too small, map error) returns non-zero and
- * leaves the single-buffer path untouched. */
-int fb_flip_init(volatile uint32_t** buf0, volatile uint32_t** buf1) {
-    if (!fb_pixels) return -1;
-
-    /* DISPI ID: 0xB0C0..0xB0C5 across Bochs/QEMU revisions. */
-    uint16_t id = dispi_read(VBE_DISPI_INDEX_ID);
-    if (id < 0xB0C0 || id > 0xB0C5) return -2;      /* not a Bochs-VBE device */
-
-    uint32_t fb_size = fb_pitch_bytes * fb_height;  /* one frame, bytes */
-
-    /* Ask the device for a virtual framebuffer twice as tall.  If VRAM is
-     * too small the device clamps VIRT_HEIGHT — re-read and bail if it did
-     * not take, so we never pan into unbacked memory. */
-    dispi_write(VBE_DISPI_INDEX_VIRT_HEIGHT, (uint16_t)(fb_height * 2));
-    if (dispi_read(VBE_DISPI_INDEX_VIRT_HEIGHT) < fb_height * 2) return -3;
-
-    /* Map the second buffer.  It sits immediately after the first in the same
-     * linear VRAM BAR.  Re-mapping the boundary 4 MiB PDE (shared with the
-     * first buffer's tail) is idempotent on both arches — same phys, same
-     * flags. */
-    uint32_t base_aligned = fb_phys_base & 0xFFC00000u;
-    uint32_t end          = fb_phys_base + fb_size * 2;
-    for (uint32_t a = base_aligned; a < end; a += 0x00400000u) {
-        int r = vmm_map_4mib(a, a, VMM_WRITABLE);
-        if (r != 0 && r != -2) {
-            /* Roll back the virtual height so scanout stays inside buffer 0. */
-            dispi_write(VBE_DISPI_INDEX_VIRT_HEIGHT, (uint16_t)fb_height);
-            return -4;
-        }
-    }
-
-    dispi_write(VBE_DISPI_INDEX_Y_OFFSET, 0);       /* start on buffer 0 */
-    fb_flip_ok = 1;
-    if (buf0) *buf0 = fb_pixels;
-    if (buf1) *buf1 = (volatile uint32_t*)((uintptr_t)fb_pixels + fb_size);
-    return 0;
-}
-
-/* Make buffer `idx` (0 or 1) the visible one by panning the scanout origin.
- * A single register write; takes effect on QEMU's next host redraw. */
-void fb_flip_to(int idx) {
-    if (!fb_flip_ok) return;
-    dispi_write(VBE_DISPI_INDEX_Y_OFFSET, idx ? (uint16_t)fb_height : 0);
-}
+/* NB: the Bochs-VBE double-buffer page flip (fb_flip_init / fb_flip_to) and the
+ * FB mapping now live behind the fb_present backend — x86 in
+ * kernel/hal/x86/fb_present.c, aarch64 in kernel/hal/aarch64/virtio_gpu.c — so
+ * this renderer is arch-portable (M21 Phase I). */
 
 /* -------------------------------------------------------------------------- */
 /* Public entry points (legacy whole-screen API).                             */
@@ -422,23 +348,10 @@ int fb_term_init_if_available(const struct mboot_info* mbi) {
     uint32_t fb_phys = (uint32_t)mbi->framebuffer_addr;
     uint32_t fb_size = (uint32_t)mbi->framebuffer_pitch * mbi->framebuffer_height;
 
-    /* Identity-map the FB window with 4 MiB PSE PDEs.  The region is
-     * usually a few MiB and aligned to 4 MiB, so one or two PDEs cover it. */
-    uint32_t base_aligned = fb_phys & 0xFFC00000u;
-    uint32_t end          = fb_phys + fb_size;
-    for (uint32_t a = base_aligned; a < end; a += 0x00400000u) {
-        int r = vmm_map_4mib(a, a, VMM_WRITABLE);
-        /* r == -2 means a regular PT is already there — skip and hope the
-         * mapping is already present (will be the case if FB overlaps the
-         * initial 256 MiB identity range, which it doesn't on QEMU). */
-        if (r != 0 && r != -2) {
-            kprintf("fb: vmm_map_4mib(%p) failed: %d\n", (void*)a, r);
-            return -5;
-        }
-    }
+    /* Map the FB window writable (x86: 4 MiB PSE identity map via the vmm). */
+    if (fb_present_map(fb_phys, fb_size) != 0) return -5;
 
     fb_pixels      = (volatile uint32_t*)(uintptr_t)fb_phys;
-    fb_phys_base   = fb_phys;
     fb_width       = mbi->framebuffer_width;
     fb_height      = mbi->framebuffer_height;
     fb_pitch_bytes = mbi->framebuffer_pitch;
@@ -451,7 +364,7 @@ int fb_term_init_if_available(const struct mboot_info* mbi) {
     fb_fill_bg();
 
     kprintf("fb: %dx%d@%dbpp mapped at %p, grid %dx%d cells\n",
-            fb_width, fb_height, mbi->framebuffer_bpp, (void*)fb_phys,
+            fb_width, fb_height, mbi->framebuffer_bpp, (void*)(uintptr_t)fb_phys,
             cell_cols, cell_rows);
     return 0;
 }
@@ -525,6 +438,36 @@ static int fb_module_init(void) {
  * console_putchar sends each shell-task's output into its bound VC. */
 void fb_sink_disable(void) {
     fb_sink.active = 0;
+}
+
+/* M21 Phase I: bring the framebuffer terminal up from explicit geometry rather
+ * than a multiboot handoff.  On aarch64 there is no bootloader-provided FB —
+ * virtio_gpu.c allocates a RAM-backed framebuffer, sets up the scanout, then
+ * calls this with the buffer's physical base + dimensions.  Registers and
+ * activates the console sink (idempotent, so it is safe whether or not the
+ * MODULE init already ran).  Returns 0 on success. */
+int fb_term_init_direct(uint64_t phys, uint32_t width, uint32_t height,
+                        uint32_t pitch_bytes) {
+    if (fb_present_map(phys, (uint64_t)pitch_bytes * height) != 0) return -1;
+
+    fb_pixels      = (volatile uint32_t*)(uintptr_t)phys;
+    fb_width       = width;
+    fb_height      = height;
+    fb_pitch_bytes = pitch_bytes;
+
+    cell_cols = fb_width  / GLYPH_W;
+    cell_rows = fb_height / GLYPH_H;
+    cur_col   = 0;
+    cur_row   = 0;
+
+    fb_fill_bg();
+
+    console_sink_register(&fb_sink);
+    fb_sink.active = 1;
+
+    kprintf("fb: %ux%u@32bpp direct at %p, grid %ux%u cells\n",
+            fb_width, fb_height, (void*)(uintptr_t)phys, cell_cols, cell_rows);
+    return 0;
 }
 
 MODULE("vesa-fb", "console", fb_module_init);

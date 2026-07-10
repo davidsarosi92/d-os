@@ -20,4 +20,10 @@
 
 void enter_user_mode_wrap(uintptr_t user_ip, uintptr_t user_sp);
 
+/* Arch-portable ring-3/EL0 self-test — the `ringtest` shell command.  Each
+ * arch implements it (x86: kernel/hal/x86/ringtest.c hand-codes an i386 ring-3
+ * program; aarch64: kernel/hal/aarch64/syscall.c drops to EL0).  Returns 0 on
+ * success.  This keeps shell.c free of arch-specific user-mode plumbing. */
+int arch_ringtest(void);
+
 #endif

@@ -18,7 +18,8 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
-✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M22 – M22.7 + M27** shipped
+✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M21 (full ARM parity) +
+M22 – M22.7 + M27** shipped
 (10/11 polish sub-items; the lone outstanding one is §M20.6.1
 SYSCALL/SYSRET).  M22 + M22.1 + M22.2 (2026-07-04): GUI — gfx
 surfaces + compositor + WM core + widget toolkit + file manager,
@@ -101,7 +102,63 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
 - **M21** — aarch64 port.  Third arch, real torture test of HAL
   portability (no port I/O, GIC instead of APIC, EL1/EL0 instead
-  of rings).
+  of rings).  ✅ **Phase A–M shipped — FULL x86 parity** (2026-07-07..10,
+  DOCS §4.17) — boot + SMP + virtio-blk + exFAT + DTB + framebuffer +
+  EL0 userspace + **full shell.c + M22 GUI** (kbd/mouse) + **USB (xHCI+HID
+  over PCIe ECAM)** on ARM64:
+  A = raw-ELF boot on QEMU `-M virt` (no GRUB/multiboot), EL2→EL1 drop,
+  PL011 UART, EL1 exception vectors, MMU identity map on;
+  B = GICv2 (GICD 0x08000000 / GICC 0x08010000) + ARM generic timer
+  (CNTP, INTID 30) + IRQ dispatch API;
+  C = context switch (switch.S over x19–x30) + full hal_arch.c
+  (DAIF/wfi) + PMM/kmalloc (stock pmm/slab/kmalloc; synthesised RAM map;
+  BUDDY_MAX_FRAMES 4 GiB cap) + PL011 console sink + the stock
+  preemptive scheduler (task/percpu/lock with UP stubs);
+  D = interactive serial shell (`serial_shell.c` REPL on a scheduler
+  task, PL011 RX poll+yield) + VFS + ramfs (stock vfs/ramfs/block/module)
+  — ls/cat/mkdir/write/rm/ps/meminfo work over the UART;
+  E = SMP via PSCI (`smp.c` + `smp_entry.S`) — secondary cores join the
+  STOCK per-CPU runqueue + load balancer (percpu topology hook =
+  MPIDR.Aff0; per-CPU mmu/gic/timer bring-up); verified two hogs running
+  on two cores in parallel (`AARCH64_MAX_CPUS`+`-smp`, shipped at 2);
+  F = virtio-MMIO block driver (`virtio_mmio_blk.c`, modern/version-2
+  transport) → `/dev/vda` on the stock block layer; write→read self-test
+  + shell `blk` command (needs `-global virtio-mmio.force-legacy=false`);
+  G = exFAT at /mnt off /dev/vda — the STOCK block_cache.c + exfat.c link
+  unchanged (arch-independent); shell ls/cat/write/rm hit persistent disk,
+  writes survive a reboot;
+  H = device-tree (FDT/DTB) parsing (`dtb.c`) — discovers RAM size + CPU
+  count, sizes the PMM to the actual `-m` (DTB loaded at 0x48000000 via
+  `-device loader`; falls back to defaults);
+  I = virtio-gpu framebuffer (`virtio_gpu.c`) — QEMU `virt` has no
+  VGA/Bochs-VBE, so the display is a virtio-gpu on a virtio-MMIO slot; a
+  1280×800 2D scanout backed by a contiguous RAM framebuffer runs the *same*
+  portable `fb_terminal.c` x86 uses (boot log + shell render graphically).
+  The one x86-only bit of fb_terminal (Bochs-VBE port I/O + vmm map) was
+  hoisted behind `fb_present.h` — `fb_present_map` + `fb_present_flush`
+  (x86: no-op, linear FB is the scanout; ARM: virtio-gpu transfer+flush) —
+  and the M22.6 page flip moved to `kernel/hal/x86/fb_present.c` (gui.c
+  unchanged); i386 GUI re-verified regression-free;
+  L = EL0 userspace substrate (`vmm.c` per-process TTBR0 spaces + EL0-page
+  mappings; `usermode.S` `eret`-to-EL0 + SYS_EXIT teleport; `syscall.c` SVC
+  dispatcher, x8=num/x0..x5=args, shared `syscall.h`; ESR.EC==0x15 decode in
+  `exceptions.c`).  `usertest` runs a program at EL0 → SYS_PRINT/SYS_EXIT.
+  This is the ARM analogue of x86 M6/M20.5 ring-3+`int 0x80` → **all 3
+  arches are now M25-ready** (each can enter user mode + service a syscall);
+  J/K = the *same* full `shell.c` on a VC + the **M22 GUI** (compositor +
+  taskbar + PL031 clock + windows) driven by **virtio-input** kbd/mouse over
+  the virtio-gpu framebuffer.  Portability shims: `arch_ringtest()`, PSCI
+  `hal_shutdown/reboot`, `pl031_rtc.c`, `fb_present_flush()` in gui.c's present
+  path, `virtio_input.c`.  **Scheduler lesson:** pid 0's idle loop must
+  `hal_intr_enable()` each pass (like `cpu_idle_entry`) — a bare `for(;;)
+  hal_cpu_halt()` wedges the CPU if DAIF masks IRQs (wfi wakes but won't take a
+  masked IRQ) → its timer stops → it stops scheduling → CPU-homed tasks starve.
+  aarch64 runs its OWN `main_entry.c` (NOT the x86-coupled kernel_main), builds
+  via a separate `Dockerfile.aarch64`.  M = USB: a new PCIe-ECAM layer
+  (`kernel/hal/aarch64/pci.c` — config via MMIO at 0x40_1000_0000 + BAR
+  assignment, no firmware) lets the stock `xhci.c` + `usb_hid.c` link + run
+  (MMIO, polled from the timer ISR); a USB HID keyboard drives the shell.
+  **aarch64 now has full x86 parity** — M21 complete.
 - **M23** — Audio (AC97 → HDA → I2S).
 - **M24** — Network (NIC → IP/UDP/TCP → sockets).
 - **§M19.5.1 i386 kmap** — the deferred half of HIGHMEM: real
@@ -182,6 +239,11 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
 ARCH=x86_64 ./scripts/build.sh        # → build/x86_64/d-os.iso
 ARCH=x86_64 ./scripts/run_qemu.sh     # x86_64 in qemu-system-x86_64
+
+# Per-arch convenience wrappers (thin shims over the ARCH= scripts above):
+./scripts/build-i386.sh   ./scripts/run-i386.sh
+./scripts/build-x86_64.sh ./scripts/run-x86_64.sh
+./scripts/build-aarch64.sh ./scripts/run-aarch64.sh   # ARM64 (raw ELF on -M virt)
 ```
 
 `make clean` wipes the current ARCH only; `make clean-all` wipes all

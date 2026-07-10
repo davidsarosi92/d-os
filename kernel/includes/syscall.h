@@ -1,13 +1,13 @@
 /* =============================================================================
  * syscall.h — minimal syscall ABI.
  *
- * Calling convention (i386):
- *   syscall number → EAX
- *   arg 0          → EBX
- *   arg 1          → ECX
- *   arg 2          → EDX
- *   trigger        → int 0x80
- *   return value   → EAX (on iret-back)
+ * Calling convention — arch-specific registers, shared numbers:
+ *   i386 / x86_64:  number → EAX/RAX, args → EBX/RBX.., trigger `int 0x80`,
+ *                   return → EAX/RAX (on iret-back).
+ *   aarch64:        number → x8, args → x0..x5, trigger `svc #0`,
+ *                   return → x0 (on eret-back).
+ * Each arch has its own dispatcher (kernel/hal/<arch>/syscall.c) that reads its
+ * trapframe; only the numbers below are shared.
  *
  * Syscall numbers (kept tiny on purpose; this is a teaching set):
  *   0  SYS_PRINT  EBX = const char* — print null-terminated string to console

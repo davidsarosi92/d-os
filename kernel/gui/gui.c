@@ -34,6 +34,7 @@
 #include "desktop.h"
 #include "gui_internal.h"
 #include "gfx.h"
+#include "fb_present.h"                 /* fb_present_flush — virtio-gpu scanout push (M21) */
 #include "widget.h"
 #include "vc.h"
 #include "task.h"
@@ -1209,9 +1210,15 @@ static void compose(void) {
         prev_dmg_n = fn;
         for (int k = 0; k < fn; k++) prev_dmg[k] = fr[k];
     } else {
-        for (int k = 0; k < fn; k++)
+        for (int k = 0; k < fn; k++) {
             gfx_blit(&fbsurf, fr[k].x0, fr[k].y0, &backsurf,
                      fr[k].x0, fr[k].y0, fr[k].x1 - fr[k].x0, fr[k].y1 - fr[k].y0);
+            /* Push the freshly-blitted rect to the scanout.  No-op on x86 (the
+             * linear FB is the scanout); on aarch64 this is the virtio-gpu
+             * transfer+flush that makes the compositor visible. */
+            fb_present_flush(fr[k].x0, fr[k].y0,
+                             fr[k].x1 - fr[k].x0, fr[k].y1 - fr[k].y0);
+        }
     }
 }
 

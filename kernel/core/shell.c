@@ -721,54 +721,9 @@ static void cmd_bctest(void) {
 /* via the SYS_EXIT teleport in usermode.s when the program is done.    */
 /* -------------------------------------------------------------------- */
 
-#include "syscall.h"
-
-static void cmd_ringtest(void) {
-    uint32_t code_phys  = pmm_alloc_frame();
-    uint32_t stack_phys = pmm_alloc_frame();
-    if (!code_phys || !stack_phys) {
-        console_write("ringtest: pmm OOM\n");
-        if (code_phys)  pmm_free_frame(code_phys);
-        if (stack_phys) pmm_free_frame(stack_phys);
-        return;
-    }
-    if (vmm_map(0x40000000, code_phys,  VMM_WRITABLE | VMM_USER) != 0 ||
-        vmm_map(0x40001000, stack_phys, VMM_WRITABLE | VMM_USER) != 0) {
-        console_write("ringtest: vmm_map failed\n");
-        return;
-    }
-
-    /* Build the user program.  Layout:
-     *   0x40000000 [21B]  code: mov ebx,msg; mov eax,SYS_PRINT; int 0x80;
-     *                           mov eax,SYS_EXIT; int 0x80; jmp $
-     *   0x40000100        msg:  "hello from ring 3!\n\0"
-     */
-    uint8_t* code = (uint8_t*)0x40000000;
-    code[0]  = 0xBB;                              /* mov ebx, imm32 */
-    *(uint32_t*)&code[1]  = 0x40000100u;          /* msg address */
-    code[5]  = 0xB8;                              /* mov eax, imm32 */
-    *(uint32_t*)&code[6]  = SYS_PRINT;
-    code[10] = 0xCD; code[11] = 0x80;             /* int 0x80 */
-    code[12] = 0xB8;                              /* mov eax, imm32 */
-    *(uint32_t*)&code[13] = SYS_EXIT;
-    code[17] = 0xCD; code[18] = 0x80;             /* int 0x80 */
-    code[19] = 0xEB; code[20] = 0xFE;             /* jmp $ */
-
-    char* msg = (char*)0x40000100;
-    const char* src = "hello from ring 3!\n";
-    int i = 0;
-    while (src[i]) { msg[i] = src[i]; i++; }
-    msg[i] = 0;
-
-    /* Drop to ring 3.  Stack top is 0x40002000 (top of stack frame). */
-    console_write("ringtest: dropping to ring 3...\n");
-    enter_user_mode_wrap(0x40000000u, 0x40002000u);
-    console_write("ringtest: back in ring 0\n");
-
-    /* Cleanup. */
-    vmm_unmap(0x40000000); pmm_free_frame(code_phys);
-    vmm_unmap(0x40001000); pmm_free_frame(stack_phys);
-}
+/* The ring-3/EL0 self-test is arch-specific (see usermode.h / the per-arch
+ * arch_ringtest implementations); shell.c just invokes it. */
+static void cmd_ringtest(void) { arch_ringtest(); }
 
 /* -------------------------------------------------------------------- */
 /* Configuration commands.                                              */
