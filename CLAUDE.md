@@ -260,6 +260,33 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   user-mode non-DMA → Tier 2 DMA+IOMMU); the driver-runtime "narrow
   waist, two backends" IS the M29 transport abstraction.  Hybrid kernel
   (NT/XNU), not a micro-vs-monolith flip.
+- **§M35.5 — Package manager & isolation** (design only, PLAN.md): a hard
+  **gate before any porting** — a **content-addressed store** (Nix/Guix-
+  shaped, NOT dpkg/apt; convention #6): immutable `/store/<hash>-name-ver/`
+  paths, pinned dependency closures (versions coexist, no global `/lib`
+  soup), hermetic §M33-sandboxed builds, symlink-profile + GC (no cruft,
+  rollback), text recipes.  Two-level isolation: §M37 RPATH (load) +
+  §M25/§M33/§M32 FS-view (run).  Gates §M36–§M42 (every port installs into
+  the store, never the global FS).  Satisfies: isolate ports, no clutter,
+  minimal version coupling.
+- **Userland maturation §M34–§M42** (design only, PLAN.md): **the goal is
+  the POSIX platform, NOT a browser** — each milestone is independently
+  necessary and valuable (unblocks shells, build tools, servers, native
+  apps, language runtimes); §M42 (browser) is only the *completeness
+  proof / bonus*, not the driver.  §M34 POSIX process & signals
+  (fork/execve-argv/waitpid/pipes/job-control/signals — the general POSIX
+  abstraction layer) → §M35 threads & futex (clone/TLS/pthreads/futex on
+  the SMP scheduler) → §M35.5 pkg store → §M36 POSIX syscall breadth +
+  native libc (musl port) → §M37 dynamic linking (ld.so/`.so`/dlopen) →
+  §M38 C++ runtime + support libs (libc++/unwind, zlib, freetype, ICU,
+  harfbuzz, Skia…); side-branches §M39 crypto+entropy+TLS+DNS (`/dev/
+  urandom`, mbedTLS/BoringSSL, getaddrinfo — needs §M24) and §M40 client
+  graphics (libwayland-client + Mesa `llvmpipe` EGL/GL + Skia — needs
+  §M26); §M41 optional Linux syscall ABI shim (binary-compat accelerator,
+  useful on its own).  §M42 validation target only: NetSurf (realistic
+  first) → WPE-WebKit → Firefox/Chromium (multi-year north star).
+  Hard-depends on §M25; target x86_64/aarch64 (i386 out of scope for the
+  heavy ports).
 - **§M-registry** — Windows-style registry PARKED (accidental history;
   /etc + procfs already covers it).
 

@@ -63,6 +63,16 @@
 | §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) — ✅ shipped L1+L2 (DOCS §4.22; L3 HW deferred) | ~1960 |
 | §M32 | Multi-user — identity, login, file perms, isolation | ~2160 |
 | §M33 | Execution domains — where a service runs (kernel / user / isolated); driver placement is the flagship case | ~2265 |
+| §M34 | POSIX process & signals — fork/execve(argv,env)/waitpid/pipes/job-control/signals | — |
+| §M35 | Threads & futex — clone / TLS / pthreads / futex | — |
+| §M35.5 | Package manager & isolation — content-addressed store (Nix-shaped); gates every port | — |
+| §M36 | POSIX syscall breadth + native libc (musl port) | — |
+| §M37 | Dynamic linking — ld.so / `.so` / dlopen | — |
+| §M38 | C++ runtime + support libs (libc++/unwind, zlib, freetype, ICU, harfbuzz…) | — |
+| §M39 | Crypto + entropy + TLS + DNS resolver | — |
+| §M40 | Client graphics stack — Wayland client + EGL/GL (Mesa swrast) + Skia | — |
+| §M41 | Linux syscall ABI shim — optional binary-compat accelerator | — |
+| §M42 | Web browser bring-up — NetSurf → WebKit → Firefox/Chromium (north star) | — |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -2956,6 +2966,660 @@ hence gated behind the IOMMU and treated as a north star, not a default.
 
 ---
 
+## Userland maturation (§M34–§M42) — a real POSIX platform
+
+**The goal is the platform, not the browser.**  Read this cluster as
+"grow d-os into a real POSIX userland," *not* "build toward a browser."
+Every milestone here — a process/signal model, threads, a full C library,
+a package manager, a dynamic linker, a C++ runtime + support libraries,
+TLS + DNS, a client graphics stack — is **independently necessary and
+independently valuable**: each one unblocks a whole class of software
+(shells, build tools, servers, native d-os apps, language runtimes), not
+just one program.  The objective is simply *to have these capabilities*.
+A browser (§M42) is included as the **proof / possible end-product**: if
+all the pieces exist, running one becomes possible — a welcome *validation
+that the platform is complete*, and a bonus, **not the driver of the
+work**.  Nothing here is justified by "the browser needs it"; each stands
+on its own.
+
+**Why the browser is a good completeness test.**  It is the single
+heaviest POSIX consumer we know of — it exercises the process model,
+threads, the full libc, dynamic linking, the C++ runtime, TLS, and the
+graphics stack all at once.  So "a browser can run" is a convenient
+*shorthand for* "the userland is genuinely complete," which is why §M42
+stays on the list as a validation target rather than being dropped.
+
+**Honesty note on that test.**  A native Firefox/Chromium port is a
+multi-year effort (each assumes the Linux syscall ABI + tens of millions
+of lines of C++), so §M42 is staged around a *realistic* first browser
+(NetSurf: own layout engine, framebuffer target, minimal deps — the path
+SerenityOS/ToaruOS took), with WPE-WebKit as the mid target and
+Firefox/Chromium as an acknowledged **north star**, not a scheduled
+deliverable.  §M41 (Linux ABI shim) is the pragmatic accelerator — and is
+itself broadly useful (run prebuilt Linux tooling), independent of any
+browser.  Primary arch target is **x86_64** (then aarch64); i386 is out
+of scope for the heavier ports (address-space + no upstream support).
+
+**The porting discipline gate — §M35.5.**  Before pulling in *any*
+foreign code (musl §M36 onward), a **package manager + isolation
+substrate** must exist, or the ports pollute the system, breed version
+conflicts, and rot.  §M35.5 is that gate: a **content-addressed store**
+(Nix/Guix-shaped, *not* dpkg/apt) where every port lives in an immutable,
+hash-named, per-version path with an explicit pinned dependency closure —
+so the system stays uncluttered, apps depend on exactly their declared
+deps (no global `/lib` soup), and multiple versions coexist.  **Every
+milestone from §M36 on installs into the store, never the global FS.**
+The runtime-isolation half is co-designed with §M37 (RPATH to exact
+store paths = the loader-level isolation) and §M33/§M32 (capability- +
+user-scoped FS view per app).
+
+**Critical path (each `→` = hard dependency):**
+
+```
+§M25 userland ─► §M34 process/signals ─► §M35 threads/futex ─► §M35.5 pkg/store ─► §M36 POSIX libc
+                                                                                        │
+                          ┌──────────────────────────────────────────────────────────────┤
+                          ▼                                                               ▼
+                   §M37 dynamic link ─► §M38 C++/support libs ─► §M40 client GFX ─► §M42 browser
+                                                                     ▲                  ▲
+§M24 network ─► §M39 crypto/TLS/DNS ─────────────────────────────────┼──────────────────┤
+§M26 Wayland ────────────────────────────────────────────────────────┘                  │
+§M23 audio (soft, media only) ───────────────────────────────────────────────────────────┤
+§M41 Linux ABI shim (optional; can substitute for parts of M36–M38 by emulation) ─────────┘
+```
+
+(§M35.5 gates every porting milestone — §M36–§M42 all install into its
+store.)  Each milestone below restates its own **Depends on** line so it
+is self-contained when read in isolation.
+
+---
+
+## §M34 — POSIX process & signals layer
+
+**Why:** the single largest gap between today's userland (§M25) and any
+real POSIX program.  Browsers — Chromium especially, with its
+multi-process sandbox — assume `fork`/`exec`, argv/env, `waitpid`,
+pipes, and signals.  Today `enter_user_mode` is one-way with no argv,
+and there is no signal infrastructure at all.  This layer is a
+**general POSIX abstraction** — it unblocks shells, build tools, and
+essentially every future port, not just the browser.
+
+**Design — staged.**
+1. **`execve(path, argv, envp)`** — replace the current image in a task's
+   address space, build a System V initial stack (argc / argv / envp /
+   **auxv** — `AT_PHDR`, `AT_ENTRY`, `AT_PAGESZ`, `AT_RANDOM`, …), enter
+   at the ELF entry.  Extends §M25's `proc_exec_elf` from "hello excursion"
+   to a real program launch.
+2. **`fork` / `vfork`** — duplicate the calling process: clone the
+   `vmm_space` **copy-on-write** (a new `VMM_COW` PTE bit + a #PF/permission
+   fault handler that copies the page and drops COW), dup the fd table
+   (shared `ofile` refs), copy creds/cwd.  COW is the hard part and the
+   reason this is post-§M25 (needs per-process address spaces + a fault
+   path).  `posix_spawn` offered as the cheaper primary API; `fork` for
+   compatibility.
+3. **`waitpid` / exit status** — expose §M27's reaper to userland: a
+   parent blocks (Tier A wait-queue) on a child's death and reads
+   `WIFEXITED`/`WEXITSTATUS`/`WIFSIGNALED`.
+4. **Pipes + fd plumbing** — `pipe`/`pipe2`, `dup`/`dup2`/`dup3`,
+   `O_CLOEXEC`, `fcntl(F_GETFD/F_SETFD/F_GETFL/F_SETFL)`.  Pipes reuse the
+   §M25 `ofile` ring machinery.
+5. **Signals** — `struct sigaction`, `kill`/`tgkill`/`raise`,
+   `sigprocmask`, delivery on return-to-user (per-task pending mask +
+   handler trampoline pushing a `ucontext`, `sigreturn`), default actions
+   (term/core/ignore/stop), `SIGSEGV`/`SIGCHLD`/`SIGPIPE`/`SIGINT`.
+   Arch seam: the return-to-user path (already per-arch) grows a
+   "deliver pending signal" hook.
+6. **Sessions / process groups / job control** — `setsid`, `setpgid`,
+   controlling terminal, `SIGINT`/`SIGTSTP` from the console, foreground
+   pgrp — so a real shell (bash) and Ctrl-C work.
+7. **Device nodes programs assume** — `/dev/null`, `/dev/zero`,
+   `/dev/full`, `/dev/tty` (§M39 adds `/dev/urandom`).
+
+**Definition of done:**
+- A ring-3 program `fork`s, the child `execve`s `/bin/echo hi` with argv,
+  the parent `waitpid`s and reads exit code 0.
+- A pipeline `a | b` runs: `a`'s stdout is `b`'s stdin via `pipe`+`dup2`.
+- Ctrl-C sends `SIGINT` to the foreground pgrp; a handler catches it.
+- DOCS.md gains a "POSIX process model" chapter.
+
+**Out of scope:** `clone` thread flags (→ §M35), real-time signals depth,
+`ptrace`, namespaces/cgroups, `io_uring`.
+
+**Depends on:** §M25 (per-process address spaces, ELF loader, fd table,
+`ofile`), §M27 (init + reaper + hierarchy + kill-tree), Tier A
+(blocking wait-queue for `waitpid`).  COW needs a new fault-handler path
+on each arch.
+
+---
+
+## §M35 — Threads & futex
+
+**Why:** browsers are massively multi-threaded (compositor, network, GC,
+worker pools); today there are **no user-space threads at all**.  Also a
+prerequisite for a real libc's `pthread`/TLS and for `std::thread`.
+
+**Design.**
+1. **`clone`-style thread creation** — a thread = a task sharing its
+   parent's `vmm_space` + fd table (`CLONE_VM|CLONE_FS|CLONE_FILES|
+   CLONE_THREAD`) but with its own user stack + kernel stack + TID.
+   Reuses the SMP scheduler already in place (threads land on per-CPU
+   runqueues, load-balanced) — the kernel side is largely present; the
+   new work is the *shared-address-space task* semantics + thread-group
+   exit (`exit_group` kills all threads).
+2. **Thread-local storage** — set the arch TLS base per thread:
+   `arch_prctl(ARCH_SET_FS)` (x86_64), `set_thread_area`/`GDT` entry
+   (i386), `TPIDR_EL0` (aarch64); a `__tls` block laid out per the ELF
+   TLS ABI (`.tdata`/`.tbss`, initialised at thread start).
+3. **`futex`** — the one syscall every modern threading library needs:
+   `FUTEX_WAIT`/`FUTEX_WAKE` (+ `_BITSET`, `_REQUEUE`, `PRIVATE`) over a
+   hashed wait-queue keyed by physical address, built on Tier A's
+   block/wake.  This is what mutexes/condvars/`std::atomic` waits sit on.
+4. **Thread-group signal + exit semantics** — signals target a thread
+   group; `exit`/`exit_group` distinction; `gettid` vs `getpid`.
+
+**Definition of done:**
+- A program spawns 4 threads that increment a shared counter under a
+  futex-backed mutex to the correct total; runs correctly on SMP (≥2 CPUs).
+- TLS: each thread reads its own `__thread` variable.
+- DOCS.md "Threads & futex" chapter.
+
+**Out of scope:** priority inheritance / PI-futexes, robust-list depth,
+NPTL cancellation edge cases, per-thread scheduling policies beyond the
+current scheduler.
+
+**Depends on:** §M25 (address spaces), §M34 (process model, exit/signal
+semantics threads extend), Tier A (block/wake under futex), the existing
+SMP per-CPU scheduler.  Per-arch TLS-base seam.
+
+---
+
+## §M35.5 — Package manager & isolation (the substrate for every port)
+
+**Why — a gate, not an afterthought.**  Everything from §M36 on brings in
+*foreign* code (musl, then dozens of libraries, then a browser).  Without
+a discipline enforced *before* the first port, the system fills with
+untracked files, breeds version conflicts ("dependency hell"), and
+becomes impossible to clean or reproduce.  The three stated requirements —
+**isolation**, **no clutter**, **minimal version coupling** — are exactly
+what a content-addressed store solves, so this milestone must land before
+§M36.  It is also generally valuable: the same store manages *native*
+d-os software, not only ports.
+
+**Linux-inspired, not Linux-bound (convention #6).**  We **reject**
+dpkg/rpm/apt — their model is a *mutable global `/usr` + `/lib`*, which is
+the direct cause of version conflicts, "cannot safely remove X", and
+scriptlets mutating the system as root.  That is accidental history.  We
+**adopt the content-addressed store** (Nix / Guix) because it solves the
+three requirements structurally rather than by convention.
+
+**Design.**
+1. **Content-addressed store** — `/store/<hash>-<name>-<version>/`,
+   **immutable** after build.  The hash covers the build inputs (source +
+   recipe + the store paths of its dependencies).  Consequence: **many
+   versions/variants coexist** with zero conflict; nothing ever writes
+   into a shared global `/lib` or `/bin`.  → satisfies "no clutter" +
+   "multiple versions."
+2. **Explicit, pinned dependency closure** — each package declares its
+   dependencies by **exact store path**; there is no ambient global search
+   path.  A package's runtime closure *is* its declared graph, pinned by
+   hash.  → satisfies "don't depend on other versions more than
+   necessary": the coupling is exactly what you wrote down, and it is
+   reproducible.
+3. **Two-level isolation** (where it binds to d-os primitives):
+   - **Load-time:** RPATH baked to exact store paths → a binary resolves
+     *only* its declared dependencies, no global `/lib` soup.  This is the
+     isolation mechanism of §M37 (dynamic linker) — **co-design the two**.
+   - **Run-time:** each app runs in its own §M25 address space with a
+     §M33-capability- and §M32-user-scoped **FS view** — it sees its own
+     store closure + its data directory, not the whole system
+     ("container-lite" over the VFS: a bind/overlay-style restricted mount
+     namespace, no full container runtime).
+4. **Hermetic builds** — a builder runs in a **sandboxed execution domain
+   (§M33)**: no network except a pinned-hash fetch phase, only the declared
+   inputs visible, a fixed environment → **reproducible** and
+   host-contamination-free.  This stops "garbage" leaking in from the
+   build side.
+5. **Profiles + garbage collection** — "installed" = a **symlink forest /
+   generated view** selecting which store paths appear on `PATH` / in the
+   library search.  Uninstall = drop from the profile; unreferenced store
+   paths are reclaimed by a **GC** (mark from the live profiles/roots).
+   Old generations are kept for **rollback**.  → the system never silently
+   accumulates cruft.
+6. **Text recipes, not binary metadata** — a package is a **text recipe**
+   (name, version, source URL + hash, dependency list, build steps) — the
+   same anti-binary-blob stance as §M-registry.  A `pkg
+   build/install/remove/gc/list/why` command; store metadata browsable via
+   procfs.
+7. **Bootstrap** — a seed toolchain (cross-built musl + compiler, brought
+   in once) breaks the chicken-and-egg; from there everything is built
+   *in* the store.  (Later: signed packages once §M39 crypto exists;
+   binary substitution/cache is a further follow-up.)
+
+**Implementation sketch (concrete shapes).**
+
+*On-disk layout* (the store is the source of truth; everything else is a
+view over it):
+
+```
+/store/<hash>-<name>-<version>/         immutable, read-only after seal
+                              bin/  lib/  include/  share/
+/store/.meta/<hash>.recipe              the exact text recipe that built it
+/store/.meta/<hash>.closure             newline list of dep store paths (pinned graph)
+/etc/pkg/recipes/<name>.recipe          source recipes (text, version-controlled)
+/etc/pkg/profiles/<name>/               symlink forest → the active PATH/lib view
+/etc/pkg/profiles/<name>.gen/<N>/       numbered generations (rollback)
+/var/pkg/roots/                         GC roots: live profiles + running-process pins
+```
+
+*Store-path hash* = `H(recipe-text ‖ source-content-hash ‖ each-dep's-store-hash)`.
+Deterministic → identical inputs yield the identical path (reproducibility
++ safe coexistence); changing any input forks a new path, so old consumers
+are untouched.
+
+*Recipe format* (text, declarative — the anti-blob stance):
+
+```
+name     zlib
+version  1.3.1
+source   https://zlib.net/zlib-1.3.1.tar.gz
+sha256   9855b6d802d7fe5b7bd5b196a2271655...
+deps     musl
+build    ./configure --prefix=$OUT
+         make
+         make install
+```
+
+`$OUT` = the assigned store path (known before the build); `deps` resolve
+to store paths and are the *only* things visible in the build sandbox.
+
+*`pkg` command surface* (a shell command first; later an §M29 service so
+installs/GC can run supervised):
+
+| command | effect |
+|---------|--------|
+| `pkg build <recipe>` | resolve deps → fetch+verify source → hermetic build → **seal** store path (make ro) |
+| `pkg install <name> [-p profile]` | build if absent, add symlink to profile, bump generation |
+| `pkg remove <name>` | drop from profile → new generation (store path survives until GC) |
+| `pkg rollback [-p profile]` | point the profile at the previous generation |
+| `pkg gc` | mark from roots (profiles + running pins), sweep unreferenced store paths |
+| `pkg why <name>` / `pkg closure <name>` | print the pinned dependency closure (introspection) |
+| `pkg list [-p profile]` | what each profile currently exposes |
+
+*RPATH isolation (co-design with §M37).*  At seal time, patch every ELF's
+`DT_RUNPATH` to the **exact** store `lib/` paths of its declared deps.
+Then `ld.so` (§M37) never consults a global `/lib`; each binary loads
+precisely its closure.  No `LD_LIBRARY_PATH`, no version soup.  (Seed
+toolchain: the cross-linker sets it; in-store builds: a `pkg`-side
+patch step.)
+
+*Build sandbox (a §M33 execution domain).*  A builder is a child process
+(§M34) run in an isolated domain: FS view = only the deps' store paths + a
+fresh `$OUT` + a private `/tmp` (a restricted mount view over the VFS); **no
+network capability** except the dedicated content-verified fetch step; a
+fixed environment (`PATH` = deps only, stable `TZ`/locale, no host
+leakage).  On success `$OUT` is sealed read-only and hashed; on failure it
+is discarded — the live system is never touched mid-build.
+
+*Runtime app isolation.*  Launching an app = spawn (§M34) into a §M25
+address space whose FS view is scoped (§M33 capability + §M32 user) to its
+store closure + a per-app data dir — it cannot see other store paths or
+other users' data.  "Container-lite": a restricted mount view, not a full
+container runtime.
+
+*Garbage collection.*  Roots = every still-referenced profile generation +
+every running process's pinned closure (a process pins its closure for its
+lifetime).  Mark-sweep over `/store`; unreferenced paths deleted.
+Immutability makes this safe — nothing ever mutates a store path in place,
+so a path is either wholly live or wholly dead.
+
+*Bootstrap.*  Import a prebuilt **seed** (cross-built musl + a C/C++
+toolchain) into the store by hash, once — the single clearly-marked
+non-reproducible step (Guix's "bootstrap seed" model).  Everything after is
+built in-store from recipes.
+
+*Procfs introspection.*  `/proc/pkg/store` (paths + sizes),
+`/proc/pkg/profiles/<p>` (current generation + contents) — store state
+inspectable the Unix way, no binary registry.
+
+*Staging within the milestone (build order):*
+1. Store layout + recipe parser + `pkg build` (sandbox can start loose,
+   tighten later).
+2. Profiles + `install`/`remove` + generations + `rollback`.
+3. RPATH sealing (lands with §M37) → real load-time isolation.
+4. §M33 build sandbox + §M25/§M32/§M33 runtime FS-view → real isolation.
+5. GC + procfs + `why`/`closure`.
+
+**Definition of done:**
+- Two versions of a library coexist in the store; two apps each link their
+  own version by RPATH and both run.
+- `pkg install` then `pkg remove` + `pkg gc` leaves **zero residue**
+  outside the store; nothing was written to a global `/lib`/`/bin`.
+- At runtime an app can reach only its dependency closure + its data
+  directory, not the rest of the FS.
+- Rebuilding a package from the same pinned inputs yields the **same store
+  hash** (reproducible).
+- DOCS.md gains a "Package manager & isolation" chapter.
+
+**Out of scope (initially):** a binary substituter / cache server,
+distributed builds, a full Nix-style pure-functional language (a simpler
+declarative recipe format suffices), cross-store trust/signing until §M39
+crypto lands, full container/namespace runtime (only the FS-view slice
+needed for app isolation).
+
+**Depends on:** §M34 (process model — run builders/installers as child
+processes), VFS + a writable FS for the store (ramfs/exFAT); **co-designed
+with §M37** (dynamic-linker RPATH is the load-time isolation mechanism);
+leans on §M33 (execution domains / capabilities for the build + run
+sandbox) and §M32 (per-user profiles + FS-view scoping).  **Gates
+§M36–§M42** — every milestone that ports foreign code installs into this
+store, never the global filesystem.
+
+---
+
+## §M36 — POSIX syscall breadth + native libc (musl port)
+
+**Why:** the in-tree libc is ~120 lines (`write/read/open/mmap/malloc/
+printf`).  A browser (and its build tools) needs a full libc and the
+several-hundred-syscall surface it sits on.  Porting **musl** (small,
+clean, static-friendly, permissive licence) as the native libc is the
+target — it defines exactly which syscalls must exist.
+
+**Design.**
+1. **Syscall surface expansion** — bring the table from §M25's handful to
+   the musl-required set: `stat`/`fstat`/`lstat`/`fstatat`, `getdents64`,
+   `mprotect`/`madvise`/`brk`/`mremap`, `clock_gettime`/`clock_nanosleep`/
+   `gettimeofday`/`nanosleep`, `readv`/`writev`/`pread`/`pwrite`,
+   `getcwd`/`chdir`/`mkdir`/`unlink`/`rename`/`symlink`/`readlink`,
+   `epoll_create1`/`epoll_ctl`/`epoll_wait`, `eventfd2`, `timerfd`,
+   `uname`, `sysinfo`, `getrandom` (→ §M39), `fcntl`, `poll`/`ppoll`
+   (§M25 has `poll`), the AF_INET/AF_UNIX `socket`/`bind`/`connect`/
+   `accept`/`listen` family (AF_INET via §M24), plus `sysconf` inputs.
+   Each is a portable handler in `usyscall.c`; arch dispatchers only
+   marshal args.
+2. **`errno` discipline** — negative-return convention from the kernel,
+   `errno` set in the libc wrapper (musl already does this — the kernel
+   just needs consistent `-E*` returns).
+3. **musl integration** — cross-compile musl against d-os's syscall
+   numbers (a d-os `arch/` under musl, or a thin Linux-number alias if
+   §M41 lands first), replacing `user/libc.c`.  Keep the tiny in-tree
+   libc for the self-test programs.
+4. **A `/bin` + `/lib`** convention on ramfs/exFAT so programs and (later)
+   shared objects have a home; a minimal coreutils (`sh`, `ls`, `cat`,
+   `echo`, `env`) as the first musl-linked programs.
+
+**Definition of done:**
+- A musl-linked `sh` runs interactively in ring 3, forks/execs coreutils,
+  pipes work, exit codes propagate.
+- `stat`/`getdents` back a real `ls -l`; `clock_gettime` returns monotonic
+  + realtime.
+- DOCS.md "libc & syscall surface" chapter with the supported-syscall list.
+
+**Out of scope:** glibc-specific extensions, NSS plugins, iconv beyond
+UTF-8, full locale database (`C`/`C.UTF-8` only until §M38's ICU),
+`io_uring`, `inotify`.
+
+**Depends on:** §M35.5 (the store — musl is the *first* port and installs
+into it, establishing the pattern), §M34 (process model — musl assumes
+fork/exec/signals), §M35 (threads — musl's pthread), §M24 (AF_INET
+syscalls), §M25 (fd/mmap substrate).
+
+---
+
+## §M37 — Dynamic linking (ld.so / `.so` / dlopen)
+
+**Why:** browsers and their libraries ship as shared objects; static
+linking a whole browser is often infeasible (size, `dlopen` plugins,
+GL driver loading).  Today the ELF loader (§M25) handles *static*
+executables only — no interpreter, no runtime relocations.
+
+**Design.**
+1. **PIE / PIC executables** — load `ET_DYN` main objects at a base,
+   apply `R_*_RELATIVE` relocations.
+2. **`PT_INTERP` handling in `execve`** — when present, map the requested
+   dynamic linker and hand it control with the correct auxv (`AT_PHDR`/
+   `AT_PHNUM`/`AT_BASE`/`AT_ENTRY`); musl's `ld-musl` is the interpreter.
+3. **Shared objects** — parse `PT_DYNAMIC`, `DT_NEEDED` search
+   (`/lib`, `DT_RPATH`/`RUNPATH`, `LD_LIBRARY_PATH`), symbol resolution
+   (`.dynsym`/`.hash`/`.gnu.hash`), `GLOB_DAT`/`JMP_SLOT` relocations,
+   lazy vs `BIND_NOW` (start with `BIND_NOW` — simpler), `DT_INIT_ARRAY`
+   ordering.
+4. **TLS relocations** — the general-dynamic/local-dynamic TLS model
+   (`__tls_get_addr`, `DTPMOD`/`DTPOFF`/`TPOFF`) so `__thread` works
+   across shared objects (ties to §M35 TLS).
+5. **`dlopen`/`dlsym`/`dlclose`** on top.
+
+**Definition of done:**
+- A dynamically-linked `hello` (`ld-musl` interp, `libc.so`) runs.
+- A program `dlopen`s a `.so` and calls a symbol from it.
+- `__thread` variables resolve correctly in a shared library on a thread.
+- DOCS.md "Dynamic linking" chapter.
+
+**Out of scope:** symbol interposition/`LD_PRELOAD` subtleties, lazy PLT
+(defer to `BIND_NOW`), `STB_GNU_UNIQUE`, prelink, `ifunc` beyond a basic
+resolver.
+
+**Depends on:** §M36 (musl + the syscall surface `ld.so` uses: `mmap`/
+`mprotect`/`open`/`read`), §M35 (TLS model), §M25 (ELF loader to extend).
+
+---
+
+## §M38 — C++ runtime + support libraries
+
+**Why:** browsers are C++; and even NetSurf/WebKit pull a stack of C
+libraries.  This milestone ports the runtime + the "everybody needs
+these" libraries so higher milestones (and any future C++/graphics app)
+have them.
+
+**Design — port, in dependency order:**
+1. **C++ runtime** — `libc++` + `libc++abi` + `libunwind` (LLVM, matches
+   musl cleanly), or `libstdc++` + `libgcc_s`.  Needs working **DWARF
+   exception unwinding** (`.eh_frame` + `_Unwind_*`), RTTI, thread-safe
+   statics (`__cxa_guard_*` → futex), `__cxa_atexit`.  This is the item
+   that most exercises §M37 (unwinding across shared objects) + §M35
+   (thread-safe init).
+2. **Compression / image** — `zlib`, `libpng`, `libjpeg-turbo`,
+   `brotli` (HTTP content-encoding).
+3. **Text / fonts** — `freetype` (glyph rasterisation) + `fontconfig`
+   (font discovery; needs a `/usr/share/fonts` + a couple of TTFs) +
+   `harfbuzz` (shaping) + **ICU** (Unicode segmentation/normalisation —
+   large, but browsers hard-depend on it).
+4. **2D primitives** — `pixman`, and `cairo`/`Skia`'s software path
+   (Skia bundled with the browser; cairo for NetSurf/GTK targets).
+5. **Parsing / misc** — `expat`/`libxml2`, `sqlite` (browser storage),
+   `nghttp2` (HTTP/2, over §M39 TLS).
+
+**Definition of done:**
+- A C++ program that throws + catches across a `.so` boundary runs
+  correctly (unwinding works).
+- A test renders a UTF-8 string with freetype+harfbuzz to a bitmap.
+- `zlib`/`png`/`jpeg`/`sqlite` self-tests pass in ring 3.
+- DOCS.md "C++ runtime & support libraries" chapter listing ported libs +
+  versions.
+
+**Out of scope:** GTK/Qt full toolkits (only what NetSurf/WebKit's chosen
+frontend needs), OpenMP, Fortran runtime, the browser itself (→ §M42).
+
+**Depends on:** §M36 (libc), §M37 (dynamic linking — these ship as `.so`s
+and unwinding crosses them), §M35 (thread-safe statics).
+
+---
+
+## §M39 — Crypto, entropy, TLS, and DNS
+
+**Why:** no modern site loads over plain HTTP — **HTTPS is mandatory**,
+and HTTPS needs a TLS stack, which needs entropy.  §M24 gives raw
+TCP; this makes it usable.  Also a general capability (SSH, package
+signing, `/etc/shadow` KDF for §M32 all want it).
+
+**Design.**
+1. **Entropy** — a kernel CSPRNG seeded from hardware (`RDRAND`/`RDSEED`
+   on x86, `RNDR` on aarch64 where present) + timing/IRQ jitter; exposed
+   as `/dev/urandom`, `/dev/random`, and the `getrandom` syscall + auxv
+   `AT_RANDOM`.  (This is the honest gate — §M32 noted "NOT production
+   crypto until a real primitive lands"; this milestone is that primitive.)
+2. **Crypto library** — port **mbedTLS** (small, self-contained — good
+   first target) and/or **BoringSSL** (what Chromium expects).  Provides
+   AEAD/ECC/RSA/hashing.
+3. **TLS integration** — TLS 1.2/1.3 client over §M24 sockets; a CA trust
+   store at `/etc/ssl/certs` (bundle Mozilla's CA set); certificate +
+   hostname verification.
+4. **DNS resolver** — `getaddrinfo`/`getnameinfo` (in libc/musl) over a
+   UDP/TCP stub resolver; `/etc/resolv.conf` populated by the §M24 DHCP
+   client; `/etc/hosts`.
+
+**Definition of done:**
+- `getrandom` + `/dev/urandom` return non-repeating, well-distributed
+  bytes; `AT_RANDOM` populated per exec.
+- `wget https://<host>/` fetches a page over verified TLS 1.3 (cert +
+  hostname checked against the CA store).
+- `getaddrinfo("example.com")` resolves via DNS.
+- DOCS.md "Crypto, entropy & TLS" chapter.
+
+**Out of scope:** a hardware TRNG driver beyond `RDRAND`/`RNDR`, TLS
+*server* role, QUIC/HTTP-3 (later), FIPS modes, smartcard/PKCS#11.
+
+**Depends on:** §M24 (TCP/UDP sockets + DHCP for `resolv.conf`), §M36
+(libc — `getaddrinfo`, and mbedTLS/BoringSSL link against it), §M37 (they
+ship as `.so`).
+
+---
+
+## §M40 — Client graphics stack (Wayland client + GL + Skia)
+
+**Why:** a browser does not draw to the framebuffer directly — it talks
+to a **display server** and renders through a GL/2D stack.  §M26 provides
+the Wayland *server*; this milestone provides the *client* side plus the
+rendering path the browser plugs into.
+
+**Design.**
+1. **Wayland client** — `libwayland-client` over the §M25 unix-socket +
+   fd-passing + mmap substrate (the same primitives §M26's server uses);
+   `xkbcommon` for keymap handling; `wayland-protocols` (xdg-shell) so a
+   real client's surface/seat/keyboard/pointer wiring works.
+2. **Software GL** — **Mesa's software rasteriser** (`llvmpipe`/`swrast`)
+   exposing EGL + GLES2/GL3, running purely on the CPU (no GPU driver
+   needed — the pragmatic path; hardware GL is a much later, per-GPU
+   effort).  EGL platform = Wayland.
+3. **Skia software backend** — Chromium/Flutter-style rendering; Skia is
+   bundled with the browser but needs EGL/GL or its CPU raster backend
+   wired to a Wayland buffer.
+4. **Frontend toolkit (target-dependent)** — NetSurf's own framebuffer/
+   Wayland frontend, or WPE-WebKit's `WPEBackend` (designed for exactly
+   this minimal EGL-on-Wayland embedded case) — chosen in §M42.
+
+**Definition of done:**
+- A `weston-terminal`-class Wayland client (or `wpe`'s test app) runs
+  against the §M26 server: draws, takes keyboard + pointer input.
+- An EGL+GLES2 program clears + draws a triangle via `llvmpipe`, presented
+  through a Wayland buffer.
+- DOCS.md "Client graphics stack" chapter.
+
+**Out of scope:** hardware GPU acceleration (per-GPU drivers — a north
+star of its own), Vulkan, X11/XWayland, DMA-BUF zero-copy (software
+buffers via shm are fine to start).
+
+**Depends on:** §M26 (Wayland server — the thing the client talks to),
+§M36 (libc), §M37 (Mesa/Wayland ship as `.so`), §M38 (C++ for
+Skia/Mesa + pixman/freetype).  Soft: §M23 (audio) for `<video>`/WebRTC.
+
+---
+
+## §M41 — Linux syscall ABI shim (optional binary-compat accelerator)
+
+**Why:** the pragmatic alternative to porting every library.  Rather than
+recompiling the whole browser + its deps against d-os, implement enough
+of the **Linux** syscall ABI (numbers + struct layouts + semantics) that
+*unmodified* Linux ELF binaries run — the FreeBSD-Linuxulator / WSL1
+model.  This can substitute for large parts of §M36–§M38's "port it"
+work by *emulation* instead, and is broadly useful (run prebuilt Linux
+tooling).  Marked **optional** because it is a strategy choice, not a
+strict dependency of §M42 — either "native musl ports" (§M36–M38) *or*
+"Linux ABI + prebuilt binaries" (this) can feed the browser.
+
+**Design.**
+1. **A per-process "Linux personality"** — a flag on `execve` (from ELF
+   `EI_OSABI` / an `.note.ABI-tag`, or a launcher) selecting the Linux
+   syscall dispatch table.
+2. **Syscall translation** — map Linux x86_64/aarch64 syscall numbers to
+   d-os primitives; translate struct layouts (`struct stat`, `iovec`,
+   `sigaction`, `termios`, `epoll_event`, `sockaddr`) between Linux and
+   native shapes.  Reuses §M34–M36 mechanisms underneath — the shim is a
+   *translation* layer, not a second kernel.
+3. **`/proc` + `/sys` shims** — the subset Linux programs actually read
+   (`/proc/self/maps`, `/proc/cpuinfo`, `/proc/self/auxv`, `/sys/...`
+   device probes) synthesised from d-os state.
+4. **vDSO** — a Linux-shaped vDSO for `clock_gettime`/`getcpu` fast paths
+   many binaries expect via auxv `AT_SYSINFO_EHDR`.
+
+**Definition of done:**
+- An unmodified prebuilt Linux `busybox` (static, then dynamic with a
+  Linux `ld-musl`/`ld-linux`) runs under the personality: `ls`, `cat`,
+  `sh` work.
+- A prebuilt Linux `curl https://…` works end-to-end (exercises the shim
+  + §M24 + §M39).
+- DOCS.md "Linux ABI compatibility" chapter documenting covered syscalls +
+  known gaps.
+
+**Out of scope:** 100 % Linux ABI (only the browser-relevant subset),
+`io_uring`/`bpf`/`seccomp` deep fidelity, cgroup/namespace emulation,
+running Linux *kernel* modules.
+
+**Depends on:** §M34 (process/signals — the shim maps onto them), §M35
+(threads/futex — Linux `clone`/`futex` semantics), §M36 (the native
+syscall surface it translates to), §M37 (to run dynamic Linux binaries).
+
+---
+
+## §M42 — Web browser bring-up (validation target, not the goal)
+
+**Why:** *not* a goal in itself — the **completeness proof** for §M34–§M41.
+A browser is the heaviest POSIX consumer we know of, so getting one to
+render a real page demonstrates, in one shot, that the process model,
+threads, libc, package store, dynamic linker, C++ runtime, TLS and
+graphics stack are all genuinely done.  It is included as that
+validation + a welcome bonus, **not as the objective driving the earlier
+milestones** — each of those stands on its own and would be built anyway.
+
+**Design — staged by browser, easiest first (the honest ordering):**
+1. **Tier 1 — NetSurf.**  Own compact layout engine, C, minimal deps,
+   a **framebuffer / Wayland frontend**, no GPU/JS-heavy requirement
+   (its JS is optional/limited).  The realistic first "it renders a web
+   page" — the SerenityOS/ToaruOS-class achievement.  Needs §M36 libc +
+   §M38 (freetype/png/jpeg/curl) + §M39 (TLS) + a frontend (§M40 or raw
+   framebuffer).
+2. **Tier 2 — WPE-WebKit.**  A real, standards-compliant engine
+   (WebKit) with a full JS engine (JavaScriptCore), explicitly designed
+   for embedded EGL-on-Wayland with a minimal backend (`WPEBackend-fdo`).
+   Needs the full §M38 stack + §M40 (EGL/GL + Wayland client) + §M35
+   threads.  This is "a modern site mostly works."
+3. **North star — Firefox / Chromium.**  Multi-process sandbox
+   architecture: hard-depends on §M34 (`fork`/`exec` + the sandbox's
+   `seccomp`-style filtering), §M35 (heavy threading), §M39 (TLS/crypto),
+   §M40 (GL), the complete §M38 support stack, and realistically §M41
+   (the build/runtime assumes so much Linux ABI that emulation is easier
+   than a full native port).  Acknowledged as a **multi-year north
+   star**, not a scheduled deliverable — documented so the ambition and
+   its true cost are both explicit.
+
+**Definition of done (staged):**
+- Tier 1: NetSurf loads `https://example.com` over TLS and renders the
+  page (text + images + layout) into a window on the §M22/§M26 desktop;
+  links are clickable.
+- Tier 2: WPE-WebKit renders a JS-driven page; input works.
+- North star: documented feasibility + gap analysis; not required to ship.
+- DOCS.md "Web browser" chapter.
+
+**Out of scope (per tier):** GPU-accelerated compositing (software GL is
+the baseline), WebRTC/full media (needs §M23 audio + codecs), extensions,
+DRM/EME, the Chromium sandbox's full Linux-namespace isolation.
+
+**Depends on:** §M36 + §M38 + §M39 (all tiers); §M40 + §M26 (graphical
+frontend, Tier 2+); §M34 + §M35 (Tier 2 threads, Tier 3 multi-process);
+§M41 (pragmatically, Tier 3); §M23 (soft — media only).  In short: the
+capstone of the entire cluster.
+
+---
+
 ## §M-registry (parked) — hierarchical config store
 
 **Status:** intentionally NOT scheduled.  A Windows-style registry
@@ -2986,6 +3650,53 @@ not a binary registry.  Revisit only with a specific use case.
 
 ## Change log
 
+- **2026-07-11** — **Reframed the §M34–§M42 cluster + fleshed out §M35.5.**
+  (1) Renamed "the browser cluster" → **"Userland maturation — a real
+  POSIX platform."**  The goal is the *platform capabilities* (each
+  milestone independently necessary + valuable — shells, build tools,
+  servers, native apps, runtimes); §M42 (browser) recast as the
+  **completeness proof / bonus**, explicitly *not* the driver of the
+  earlier work.  §M42's "Why" rewritten accordingly (validation target,
+  not the goal).  (2) Added an **implementation sketch** to §M35.5:
+  on-disk store layout, store-path hash formula, text recipe format, the
+  `pkg build/install/remove/rollback/gc/why/list` command surface, RPATH
+  sealing (co-design with §M37), the §M33 build sandbox, runtime FS-view
+  isolation, mark-sweep GC, bootstrap seed, procfs introspection, and a
+  5-step staging order.  No code changed.
+- **2026-07-11** — Added **§M35.5 (package manager & isolation)** as a
+  hard gate *before* the porting milestones, per the requirement: isolate
+  ports, keep the system uncluttered, minimise version coupling.  Answer =
+  a **content-addressed store** (Nix/Guix-shaped, explicitly *not*
+  dpkg/apt's mutable-global-`/usr` model — convention #6): immutable
+  `/store/<hash>-name-version/` paths, pinned dependency closures (many
+  versions coexist, no global `/lib` soup), hermetic sandboxed builds
+  (§M33 domain), symlink-forest profiles + GC (no cruft, rollback), text
+  recipes (anti-blob), two-level isolation (§M37 RPATH at load time +
+  §M25/§M33/§M32 FS-view at run time).  Gates §M36–§M42 — every port
+  installs into the store, never the global FS.  Updated the cluster
+  critical path (`…§M35 → §M35.5 → §M36 …`).  No code changed.
+- **2026-07-11** — Added the **browser cluster (§M34–§M42)**, design only,
+  answering "after §M24 (network), what is still missing to run
+  Firefox/WebKit/Chromium?".  The finding: a browser assumes a whole
+  POSIX userland, of which §M24 is ~10 %.  New milestones, each useful on
+  its own and with dependencies marked: §M34 POSIX process & signals
+  (fork/execve-argv/waitpid/pipes/job-control/signals — the general POSIX
+  abstraction layer, needed far beyond the browser), §M35 threads & futex
+  (clone/TLS/pthreads/futex on the existing SMP scheduler), §M36 POSIX
+  syscall breadth + native libc (musl port), §M37 dynamic linking
+  (ld.so/`.so`/dlopen), §M38 C++ runtime + support libs (libc++/unwind,
+  zlib, freetype, ICU, harfbuzz, Skia/pixman, sqlite…), §M39 crypto +
+  entropy + TLS + DNS (`/dev/urandom`+getrandom, mbedTLS/BoringSSL, CA
+  store, getaddrinfo), §M40 client graphics stack (libwayland-client +
+  xkbcommon + Mesa `llvmpipe` EGL/GLES + Skia software), §M41 optional
+  Linux syscall ABI shim (Linuxulator/WSL1-style binary compat — the
+  pragmatic accelerator that can substitute emulation for parts of the
+  native ports), and §M42 the browser capstone staged NetSurf (realistic
+  first) → WPE-WebKit → Firefox/Chromium (multi-year north star).
+  Critical path documented (`§M25→M34→M35→M36→{M37→M38}→M40→M42`, with
+  §M24→M39 and §M26→M40 side-branches, §M23 soft for media).  Target arch
+  x86_64 (then aarch64); i386 out of scope for a modern browser.  No code
+  changed.
 - **2026-07-06** — Added §M33 (switchable driver placement): a
   driver-runtime API "narrow waist" with two backends (in-kernel
   direct-call / user-mode IPC), so the *same* driver source runs either
