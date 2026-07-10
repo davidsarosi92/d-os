@@ -179,6 +179,15 @@ struct task* task_spawn_under(const char* name, void (*entry)(void), int ppid);
  * when this task is scheduled again. */
 void task_yield(void);
 
+/* Cooperative millisecond sleep — yields (hlt-until-IRQ + task_yield) until
+ * `ms` of wall time has elapsed on the timer, so other tasks run and the CPU
+ * idles low-power.  NOT a precise timer wakeup (it polls timer_ticks_ms at the
+ * tick granularity) and returns early if task_should_stop() fires, so a long
+ * sleep still honours the kthread kill contract.  Used by services (M29),
+ * cron (M30) and the watchdog (M31); a true timed blocking-sleep can replace
+ * the internals later without changing callers. */
+void task_msleep(uint32_t ms);
+
 /* The currently scheduled task (or NULL very early in boot, before
  * task_init has run).  Read-only view; do not retain across blocking
  * calls — the next yield may change `current`. */

@@ -75,6 +75,31 @@ SECTIONS
         __stop_shell_providers = .;
     }
 
+    /* Service registry (M29) — SERVICE() drops a `struct service` here; the
+     * supervisor walks it at boot to autostart services.  Same KEEP() +
+     * ALIGN(4) discipline. */
+    .services : ALIGN(4)
+    {
+        __start_services = .;
+        KEEP(*(services))
+        __stop_services = .;
+    }
+
+    /* Service-bus provider + adapter registries (M29) — BUS_PROVIDER() and
+     * BUS_ADAPTER() entries; the broker walks them at bind time. */
+    .bus_providers : ALIGN(4)
+    {
+        __start_bus_providers = .;
+        KEEP(*(bus_providers))
+        __stop_bus_providers = .;
+    }
+    .bus_adapters : ALIGN(4)
+    {
+        __start_bus_adapters = .;
+        KEEP(*(bus_adapters))
+        __stop_bus_adapters = .;
+    }
+
     .data BLOCK(4K) : ALIGN(4K)
     {
         *(.data)

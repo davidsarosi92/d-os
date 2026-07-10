@@ -36,6 +36,8 @@
 #include "console.h"
 #include "shell.h"
 #include "shell_provider.h"
+#include "service.h"
+#include "bus.h"
 #include "printf.h"
 #include "acpi.h"
 #include "hal_api.h"
@@ -399,6 +401,14 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * has a universal reaper: exited kernel threads no longer leak as
      * zombies, and orphans re-parent to init instead of dangling. */
     task_start_init();
+
+    /* M29 — services + service bus.  Register /proc/services + /proc/bus
+     * (queues if procfs isn't up yet), then spawn the supervisor as a child
+     * of init: it autostarts the enabled services and supervises restarts.
+     * After init so the supervisor's parent already exists. */
+    service_init();
+    bus_init();
+    service_start_supervisor();
 
     {
         /* S.1: the boot shell is whatever provider shell.provider

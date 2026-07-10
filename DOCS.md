@@ -2557,6 +2557,67 @@ x86_64 + aarch64.
 
 ---
 
+### 4.21 Services & the service bus (M29)
+
+**What it is.**  Two self-registered halves (same linker-section story as
+DRIVER() / GUI_APP()): a **supervisor** — the "upward" answer to child death
+(systemd-lite) — and a **service bus** — named, versioned, transport-abstracted
+bindings so subsystems find + call each other without hard-linking.  Built on
+Tier A's `task_wait`.
+
+**Supervisor (`service.h`/`service.c`, `svc_demo.c`).**  `SERVICE(name, entry,
+autostart, restart)` registers a service; `restart ∈ {no, on-failure, always}`.
+One supervisor task (a child of init) owns every service task: it autostarts
+enabled services (config gate `service.<name>.disabled=1`), then loops on
+`task_wait(-1)` — blocking with zero CPU until a service child exits — and
+applies the policy.  It claims each child's reap (`task_set_reap_owned`) so
+init's universal reaper leaves the exit for `task_wait` to harvest, making the
+exit code authoritative.  A hand-issued `service stop` sets a `stopping` flag
+before the kill so a deliberate stop is never "restarted"; a service that dies
+quickly after start is backed off (crash-loop guard) before the restart.
+Control surface: `service list|start|stop|restart|status <name>`;
+`/proc/services` (name, state, pid, restarts, autostart, policy).
+
+**Service bus (`bus.h`/`bus.c`).**  Three concepts (mirroring `hal_api.h`'s
+versioned interface): **endpoint** (a flat-namespace name — `greeter.default`),
+**contract** (a versioned struct-of-fn-pointers — `Greeter v1`; no IDL),
+**transport** (`LocalCall` real; `SharedMemory`/`IPC` reserved for M25).
+`BUS_PROVIDER()` publishes a provider at an endpoint with a declared execution
+domain (§M33 axis); `bus_bind(endpoint, contract, version, &binding)` resolves
+it.  Resolution is **strict on the wire** (exact contract@version).  The
+domain↔transport rule is enforced: only a KERNEL/LocalCall provider is
+invokable today; a USER/ISOLATED provider fails cleanly (needs M25's non-local
+transports) rather than pretending.  `/proc/bus` lists endpoints + adapters.
+
+**Contract versioning (decided 2026-07-10).**  Strict + adapter-shim live in
+different layers, so both: the broker only binds an exact match; compatibility
+is an opt-in *mechanism* — a `BUS_ADAPTER(contract, from, to)` entry that
+synthesises a `from`-shaped iface over a higher-version provider, inserted by
+the broker **iff** the `bus.allow-adaptation` config bit is set.  A provider
+speaking several versions just registers as its own multi-version adapter —
+"backward-compatible" is that special case, no extra policy branch.
+
+**Marshalling discipline (convention #5).**  Contracts are designed as if
+marshalled even while only LocalCall exists — arguments are handles / copied
+buffers, never freely-shared raw kernel pointers — so a contract can later move
+to a USER domain (§M33) by a config flip, not a rewrite.  The demo `Greeter`
+passes/returns copied C strings.
+
+**Demonstrators (`svc_demo.c`).**  Services: `heartbeat` (autostart,
+restart=always — logs only on start/stop, so a restart shows as a fresh "up"
+line + bumped restart count) and `crasher` (manual, restart=on-failure — exits
+1 shortly after start, showing supervised restart + backoff).  Bus: a `Greeter`
+v2 provider at `greeter.default` + a `Greeter 1→2` adapter.  `bustest` binds v2
+exactly, shows a strict v1 bind MISSING with adaptation off and SUCCEEDING via
+the shim with it on — all green on i386 + x86_64 + aarch64.
+
+**aarch64 parity note.**  The minimal aarch64 port had skipped procfs; M29
+added `procfs.c` to its build + a `procfs_init()` call (ramfs already
+bootstraps `/proc`), so aarch64 now exposes `/proc/services` + `/proc/bus` +
+the built-ins like x86.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -2627,6 +2688,21 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-10 — M29: services + service bus.**  Two self-registered halves on
+  Tier A.  (1) **Supervisor** (`service.h`/`service.c`) — `SERVICE(name, entry,
+  autostart, restart{no|on-failure|always})`; one supervisor task (child of
+  init) autostarts enabled services (config gate `service.<name>.disabled`),
+  loops on `task_wait(-1)`, restarts per policy with a crash-loop backoff; a
+  `stopping` flag distinguishes a hand stop from a crash; `service
+  list|start|stop|restart|status` + `/proc/services`.  (2) **Service bus**
+  (`bus.h`/`bus.c`) — endpoint / contract@version / transport; `bus_bind`
+  strict-on-the-wire, domain↔transport enforced (only KERNEL/LocalCall real,
+  USER/ISOLATED reserved for M25); opt-in `BUS_ADAPTER` shim gated by
+  `bus.allow-adaptation`; `/proc/bus`.  Demonstrators (`svc_demo.c`): heartbeat
+  (always) + crasher (on-failure) services; a Greeter v2 provider + 1→2 adapter.
+  `bustest` (exact-v2 / strict-v1-miss / adapted-v1→v2) green on i386 / x86_64 /
+  aarch64.  Also added `task_msleep` (cooperative sleep) and brought procfs to
+  the aarch64 build (`/proc` parity).  See §4.21.
 - **2026-07-10 — Tier A: blocking primitives (wait-queue + task_wait + blocking
   IPC).**  Makes `TASK_SLEEPING` real — the missing "sleep until an event"
   primitive under M25.  (1) **Wait-queue** (`waitq.h`, impl in `task.c`):

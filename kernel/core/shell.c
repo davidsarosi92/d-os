@@ -41,6 +41,7 @@
 #include "proc.h"
 #include "syscall.h"
 #include "fd.h"
+#include "service.h"
 
 #define LINE_MAX        128             /* max accepted bytes per command line */
 #define DEFAULT_PROMPT  "d-os> "        /* fallback when config is unavailable */
@@ -1078,6 +1079,47 @@ static void cmd_waittest(void) {
             eof_ok ? "PASS" : "FAIL");
 }
 
+/* ---- M29: services + service bus -------------------------------------- */
+
+/* `service [list | start|stop|restart|status <name>]` — supervisor control. */
+static void cmd_service(const char* args) {
+    if (!args || !*args || starts_with(args, "list")) { service_list(); return; }
+
+    char sub[16]; int i = 0;
+    while (args[i] && args[i] != ' ' && i < 15) { sub[i] = args[i]; i++; }
+    sub[i] = 0;
+    const char* name = args + i;
+    while (*name == ' ') name++;
+
+    if (streq(sub, "status")) {
+        if (*name) service_status(name);
+        else console_write("service: usage: service status <name>\n");
+        return;
+    }
+    if (streq(sub, "start")) {
+        int r = service_start(name);
+        kprintf("service start %s: %s\n", name,
+                r == 0 ? "ok" : (r == -2 ? "already running" : "no such service"));
+        return;
+    }
+    if (streq(sub, "stop")) {
+        int r = service_stop(name);
+        kprintf("service stop %s: %s\n", name,
+                r == 0 ? "ok" : (r == -2 ? "not running" : "no such service"));
+        return;
+    }
+    if (streq(sub, "restart")) {
+        int r = service_restart(name);
+        kprintf("service restart %s: %s\n", name, r == 0 ? "ok" : "no such service");
+        return;
+    }
+    console_write("service: usage: service [list | start|stop|restart|status <name>]\n");
+}
+
+/* `bustest` — service-bus self-test: exact bind, strict miss, adapted bind. */
+extern void svc_demo_bustest(void);
+static void cmd_bustest(void) { svc_demo_bustest(); }
+
 /* M25 stage 7 — run the in-tree-libc compiled-C user program embedded as a
  * blob (user/hello.c → static ELF → objcopy).  Weak symbols so the command
  * still links on arches that don't embed the blob yet (i386 is the reference
@@ -1253,6 +1295,9 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "polltest"))       { cmd_polltest(); return; }
     if (streq(line, "libctest"))       { cmd_libctest(); return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
+    if (streq(line, "service"))        { cmd_service("");        return; }
+    if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }
+    if (streq(line, "bustest"))        { cmd_bustest(); return; }
     if (streq(line, "blktest"))        { cmd_blktest();  return; }
     if (streq(line, "bctest"))         { cmd_bctest();   return; }
     if (streq(line, "lsblk"))          { blk_list();     return; }

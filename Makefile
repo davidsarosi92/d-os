@@ -210,6 +210,9 @@ CORE_C_SRCS := \
     kernel/core/usyscall.c \
     kernel/core/fd.c \
     kernel/core/usock.c \
+    kernel/core/service.c \
+    kernel/core/bus.c \
+    kernel/core/svc_demo.c \
     kernel/core/multiboot.c \
     kernel/core/console.c \
     kernel/core/module.c \
@@ -277,6 +280,9 @@ CORE_C_SRCS := \
     kernel/core/usyscall.c \
     kernel/core/fd.c \
     kernel/core/usock.c \
+    kernel/core/service.c \
+    kernel/core/bus.c \
+    kernel/core/svc_demo.c \
     kernel/core/console.c \
     kernel/core/lock.c \
     kernel/core/percpu.c \
@@ -315,6 +321,7 @@ CORE_C_SRCS := \
     kernel/mem/kmalloc.c \
     kernel/fs/vfs.c \
     kernel/fs/ramfs.c \
+    kernel/fs/procfs.c \
     kernel/fs/exfat.c
 else
 # Phase 5 of M20: x86_64 path now links the full kernel core.  M20.6.2/3
@@ -336,6 +343,9 @@ CORE_C_SRCS := \
     kernel/core/usyscall.c \
     kernel/core/fd.c \
     kernel/core/usock.c \
+    kernel/core/service.c \
+    kernel/core/bus.c \
+    kernel/core/svc_demo.c \
     kernel/core/multiboot.c \
     kernel/core/console.c \
     kernel/core/module.c \

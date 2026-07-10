@@ -32,6 +32,7 @@
 #include "task.h"
 #include "hal_api.h"
 #include "vfs.h"
+#include "procfs.h"
 #include "module.h"
 #include "percpu.h"
 #include "smp.h"
@@ -39,6 +40,8 @@
 #include "block_cache.h"
 #include "vc.h"
 #include "shell_provider.h"
+#include "service.h"
+#include "bus.h"
 #include "lock.h"
 #include <stdint.h>
 
@@ -193,6 +196,10 @@ void aarch64_main_entry(uint64_t dtb) {
     module_init_all();
     kprintf("aarch64: VFS up — ramfs mounted at /\n");
 
+    /* procfs (M29 parity): ramfs bootstraps /proc, so populate it — gives
+     * aarch64 /proc/services + /proc/bus (and the built-ins) like x86. */
+    procfs_init();
+
     /* Probe DRIVER()s (M15 USB: xHCI over the PCIe ECAM bus).  A no-op if no
      * xHCI controller is attached (`-device qemu-xhci`); when present it
      * enumerates the bus, assigns BARs, brings the controller up, and its
@@ -271,6 +278,12 @@ void aarch64_main_entry(uint64_t dtb) {
         if (!task_spawn("shell", serial_shell_entry))
             kprintf("aarch64: FATAL — failed to spawn serial shell\n");
     }
+
+    /* M29 — services + service bus (init exists now, in either branch above).
+     * Register /proc/services + /proc/bus and spawn the supervisor. */
+    service_init();
+    bus_init();
+    service_start_supervisor();
 
     /* Idle loop.  With a framebuffer we also drain virtio-input here (polled),
      * so keyboard + mouse events are serviced whenever the CPU is otherwise

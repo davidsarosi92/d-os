@@ -88,6 +88,26 @@ SECTIONS
         __stop_shell_providers = .;
     }
 
+    /* Service registry + service-bus provider/adapter registries (M29). */
+    .services : ALIGN(8)
+    {
+        __start_services = .;
+        KEEP(*(services))
+        __stop_services = .;
+    }
+    .bus_providers : ALIGN(8)
+    {
+        __start_bus_providers = .;
+        KEEP(*(bus_providers))
+        __stop_bus_providers = .;
+    }
+    .bus_adapters : ALIGN(8)
+    {
+        __start_bus_adapters = .;
+        KEEP(*(bus_adapters))
+        __stop_bus_adapters = .;
+    }
+
     .data BLOCK(4K) : ALIGN(4K)
     {
         *(.data)

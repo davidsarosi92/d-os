@@ -687,6 +687,15 @@ int task_should_stop(void) {
     return self ? self->kill_pending : 0;
 }
 
+void task_msleep(uint32_t ms) {
+    uint64_t end = timer_ticks_ms() + (uint64_t)ms;
+    while (timer_ticks_ms() < end) {
+        if (task_should_stop()) return;     /* let a kill land promptly */
+        hal_cpu_idle();                     /* hlt until the next IRQ (low power) */
+        task_yield();
+    }
+}
+
 int task_kill(int pid) {
     if (pid == 0) return -1;                 /* pid 0 = kernel/BSP idle */
     struct task* t = task_find(pid);
