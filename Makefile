@@ -164,6 +164,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/smp.c \
       kernel/hal/aarch64/vmm.c \
       kernel/hal/aarch64/syscall.c \
+      kernel/hal/aarch64/pci.c \
       kernel/hal/aarch64/virtio_mmio_blk.c \
       kernel/hal/aarch64/virtio_gpu.c \
       kernel/hal/aarch64/virtio_input.c \
@@ -281,6 +282,8 @@ CORE_C_SRCS := \
     kernel/core/rescue_shell.c \
     kernel/core/basic.c \
     kernel/drivers/terminal/fb_terminal.c \
+    kernel/drivers/usb/xhci.c \
+    kernel/drivers/usb/usb_hid.c \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
     kernel/gui/widget.c \

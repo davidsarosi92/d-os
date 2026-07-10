@@ -2017,7 +2017,7 @@ item launches an app as its own host, no fault.
 
 ---
 
-### 4.17 ARM64 (AArch64) port — Phases A–L (M21)
+### 4.17 ARM64 (AArch64) port — Phases A–M (M21, full x86 parity)
 
 The third architecture, and the real HAL-portability torture test: no
 port I/O (every device is MMIO), a GIC instead of the APIC, and
@@ -2055,6 +2055,7 @@ and `__stack_top` for the assembler.
 | `virtio_mmio_blk.c` | **(Phase F)** virtio-blk over the virtio-MMIO transport (modern/version-2): slot scan, feature negotiation, one split virtqueue, polled 512-byte sector read/write; registers `/dev/vda` with the stock block layer.  The ARM counterpart of the PCI `virtio_blk.c` (no port I/O). |
 | *(no new arch file)* | **(Phase G)** exFAT — the stock `block_cache.c` + `fs/exfat.c` link + run unchanged (arch-independent); `main_entry` runs `bcache_init()` + `vfs_mount("exfat", "/mnt", "vda")`.  The shell's ls/cat/write/rm then hit real, persistent disk under /mnt. |
 | `dtb.c` | **(Phase H)** minimal big-endian FDT/device-tree parser — locates the DTB (x0 → fixed load addr → RAM scan) and extracts the `/memory` reg (RAM base+size) + `/cpus/cpu@*` count.  `dtb_ram_size()` then drives the PMM map size (stubs.c) instead of a hard-coded constant. |
+| `pci.c` | **(Phase M)** PCIe access via ECAM (config space at MMIO 0x40_1000_0000) — `pci_read/write*` + `pci_scan` with BAR assignment from the 32-bit MMIO window (no firmware on the raw `-kernel` boot).  Same pci.h API as x86 pci.c, so the stock `xhci.c` (MMIO + polled from the timer ISR) + `usb_hid.c` link unchanged → USB HID keyboard on `-device qemu-xhci -device usb-kbd`. |
 | `virtio_input.c` + `pl031_rtc.c` | **(Phase J/K)** GUI input + clock.  `virtio_input.c`: keyboard (evdev keycode → HID usage → shared keymap → `vc_kbd_push`) + mouse (REL deltas + buttons → `mouse_set_listener`, the seam gui.c registers on) over virtio-MMIO input devices; drained by a poll task.  `pl031_rtc.c`: the ARM PL031 RTC (`rtc_read`, epoch-seconds → civil date) for the taskbar clock (QEMU `virt` has no CMOS).  With these the portable `vc.c` + `shell.c` + the whole M22 `gui.c`/widgets/apps link and run on ARM (the `gui` command). |
 | `vmm.c` + `usermode.S` + `syscall.c` | **(Phase L)** EL0 userspace substrate — the M25 prerequisite.  `vmm.c`: per-process TTBR0 address spaces (private L1 table with the kernel's low-4-GiB identity blocks copied in) + page-granular EL0 mappings (`aarch64_vmm_map_user`, AP=01 + PXN, UXN cleared only for code) + `aarch64_vmm_switch`.  `usermode.S`: `aarch64_enter_user` (stash kernel SP/LR → set SP_EL0/ELR/SPSR → `eret` to EL0) + the SYS_EXIT teleport `aarch64_user_exit` + a PC-relative `user_stub`.  `syscall.c`: the SVC dispatcher (x8=number, x0..x5=args, shared `syscall.h` numbers) servicing SYS_PRINT/SYS_EXIT + the `usertest` self-test.  The ARM analogue of x86's M6/M20.5 ring-3 + `int 0x80`. |
 | `virtio_gpu.c` | **(Phase I)** virtio-gpu (2D) over the virtio-MMIO transport — the ARM framebuffer (QEMU `virt` has no VGA/Bochs-VBE/VRAM BAR).  Same modern-transport handshake + control virtqueue as the blk driver; brings up a 1280×800 B8G8R8X8 scanout backed by a contiguous RAM framebuffer (`pmm_alloc_contiguous`), then hands it to the PORTABLE `fb_terminal.c` via `fb_term_init_direct()`.  Implements the `fb_present` backend: `fb_present_map` = no-op (RAM already mapped), `fb_present_flush` = `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH` of the dirty rect.  Net: the same 8×8-font console x86 uses now renders the boot log + interactive shell graphically on ARM. |
@@ -2332,9 +2333,14 @@ task homed on that CPU (the input poll task) starves.  This was the flaky
 "renders on -smp 2 but not -smp 1 / no keyboard" symptom; the fix makes both
 deterministic.
 
-**Not yet:** USB (M15 — xHCI needs PCIe ECAM enumeration on `virt`) and EL0
-multitasking beyond the self-test.  The aarch64 build now links the framebuffer
-+ VC + full GUI/shell slice on top of the earlier portable core.
+**Phase M — USB (2026-07-10).**  xHCI + USB HID keyboard over a new PCIe-ECAM
+layer (`pci.c`; see the change-log entry) — full x86 feature parity.
+
+**Net:** aarch64 now covers the same ground as the x86 ports (boot → SMP →
+virtio-blk → exFAT → framebuffer → VC → full shell.c → M22 GUI → EL0 userspace →
+USB HID), minus x86-only accidents (PS/2, legacy PIC/PIT, multiboot).  Remaining
+ARM-specific follow-ups are open-ended (EL0 multitasking beyond the self-test,
+per-process context_switch — the M25 line).
 
 #### M25-readiness matrix (2026-07-10)
 
@@ -2421,6 +2427,24 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 ---
 
 ## 8. Change log
+
+- **2026-07-10 — M21 Phase M: USB (xHCI + USB HID) on ARM64 — full x86 feature
+  parity.**  QEMU `virt` exposes USB as an xHCI controller on its PCIe host
+  bridge, so this needed a PCI layer first.  New `kernel/hal/aarch64/pci.c`:
+  ECAM config access (config space is MMIO at 0x40_1000_0000, not the x86
+  0xCF8/0xCFC ports) + `pci_scan` with **BAR assignment** — booting raw via
+  `-kernel` there is no firmware to program the BARs, so we size each memory BAR
+  and assign it from the board's 32-bit MMIO window (0x1000_0000, already
+  Device-mapped by mmu.c) + enable memory/bus-master.  Exposes the same pci.h
+  API x86 pci.c does, so the stock `xhci.c` + `usb_hid.c` link and run unchanged
+  (xHCI is MMIO + POLLED — `xhci_poll()` runs from the generic-timer ISR on the
+  BSP, the ARM analogue of the x86 PIT tick; no MSI/INTx wiring).  A
+  `vmm_map_4mib` no-op (the BAR window is pre-mapped) + `mmu_map_device_1gib`
+  (reach the ECAM window) round it out.  Verified: `-device qemu-xhci -device
+  usb-kbd` → `xhci: HID kbd … ready` and `help` typed on the USB keyboard drives
+  the shell.  **aarch64 now has full parity with x86** (boot → SMP → storage →
+  framebuffer → GUI → EL0 userspace → USB), all three arches build clean.  See
+  §4.17.
 
 - **2026-07-10 — M21 Phase J + K: the framebuffer shell.c + the M22 GUI on
   ARM64 (M22 arch parity).**  The *same* full `shell.c` the x86 ports run now

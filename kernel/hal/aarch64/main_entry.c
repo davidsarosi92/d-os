@@ -56,6 +56,8 @@ int      virtio_mmio_blk_init(void); /* virtio_mmio_blk.c — Phase F disk      
 int      virtio_gpu_init(void);      /* virtio_gpu.c — Phase I framebuffer     */
 int      virtio_input_init(void);    /* virtio_input.c — Phase J kbd + mouse   */
 void     keymap_init(void);          /* keymap.c — select the default layout   */
+void     driver_init_all(void);      /* driver.c — probe DRIVER()s (xHCI)       */
+void     xhci_poll(void);            /* xhci.c — poll the USB event/HID rings   */
 int      aarch64_usertest(void);     /* syscall.c — Phase L EL0 userspace test */
 void     dtb_init(uint64_t x0);      /* dtb.c — Phase H device-tree discovery  */
 
@@ -190,6 +192,12 @@ void aarch64_main_entry(uint64_t dtb) {
     vfs_init();
     module_init_all();
     kprintf("aarch64: VFS up — ramfs mounted at /\n");
+
+    /* Probe DRIVER()s (M15 USB: xHCI over the PCIe ECAM bus).  A no-op if no
+     * xHCI controller is attached (`-device qemu-xhci`); when present it
+     * enumerates the bus, assigns BARs, brings the controller up, and its
+     * interrupt-IN HID endpoint is then polled from the generic-timer ISR. */
+    driver_init_all();
 
     /* -----------------------------------------------------------------------
      * Phase L — EL0 userspace self-test (M25 prerequisite).  Create a private

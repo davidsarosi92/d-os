@@ -18,7 +18,8 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
-✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M22 – M22.7 + M27** shipped
+✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M21 (full ARM parity) +
+M22 – M22.7 + M27** shipped
 (10/11 polish sub-items; the lone outstanding one is §M20.6.1
 SYSCALL/SYSRET).  M22 + M22.1 + M22.2 (2026-07-04): GUI — gfx
 surfaces + compositor + WM core + widget toolkit + file manager,
@@ -101,9 +102,10 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
 - **M21** — aarch64 port.  Third arch, real torture test of HAL
   portability (no port I/O, GIC instead of APIC, EL1/EL0 instead
-  of rings).  🚧 **Phase A–L shipped** (2026-07-07..10, DOCS §4.17) —
-  boot + SMP + virtio-blk + exFAT + DTB + framebuffer + EL0 userspace +
-  **full shell.c + M22 GUI** (kbd/mouse) on ARM64:
+  of rings).  ✅ **Phase A–M shipped — FULL x86 parity** (2026-07-07..10,
+  DOCS §4.17) — boot + SMP + virtio-blk + exFAT + DTB + framebuffer +
+  EL0 userspace + **full shell.c + M22 GUI** (kbd/mouse) + **USB (xHCI+HID
+  over PCIe ECAM)** on ARM64:
   A = raw-ELF boot on QEMU `-M virt` (no GRUB/multiboot), EL2→EL1 drop,
   PL011 UART, EL1 exception vectors, MMU identity map on;
   B = GICv2 (GICD 0x08000000 / GICC 0x08010000) + ARM generic timer
@@ -152,8 +154,11 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   hal_cpu_halt()` wedges the CPU if DAIF masks IRQs (wfi wakes but won't take a
   masked IRQ) → its timer stops → it stops scheduling → CPU-homed tasks starve.
   aarch64 runs its OWN `main_entry.c` (NOT the x86-coupled kernel_main), builds
-  via a separate `Dockerfile.aarch64`.  **Only M15 USB (xHCI + PCIe ECAM on
-  `virt`) remains** for full ARM parity.
+  via a separate `Dockerfile.aarch64`.  M = USB: a new PCIe-ECAM layer
+  (`kernel/hal/aarch64/pci.c` — config via MMIO at 0x40_1000_0000 + BAR
+  assignment, no firmware) lets the stock `xhci.c` + `usb_hid.c` link + run
+  (MMIO, polled from the timer ISR); a USB HID keyboard drives the shell.
+  **aarch64 now has full x86 parity** — M21 complete.
 - **M23** — Audio (AC97 → HDA → I2S).
 - **M24** — Network (NIC → IP/UDP/TCP → sockets).
 - **§M19.5.1 i386 kmap** — the deferred half of HIGHMEM: real

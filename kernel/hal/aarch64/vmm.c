@@ -136,3 +136,12 @@ void vmm_print_status(void) {
     kprintf("aarch64 MMU: 4 KiB granule, 39-bit VA; kernel = TTBR0 identity "
             "(1 GiB blocks); per-process EL0 spaces via vmm.c (VA >= 4 GiB)\n");
 }
+
+/* x86 drivers (xhci.c) call vmm_map_4mib to identity-map an MMIO BAR window.
+ * On aarch64 the PCIe 32-bit MMIO window (where pci.c assigns BARs, 0x1000_0000)
+ * is already covered by the low-1-GiB Device block in mmu.c's identity map, so
+ * this is a no-op that reports success.  Kept so xhci.c links unchanged. */
+int vmm_map_4mib(uint32_t va, uint32_t pa, int flags) {
+    (void)va; (void)pa; (void)flags;
+    return 0;
+}

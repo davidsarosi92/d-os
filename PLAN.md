@@ -175,7 +175,7 @@ what); a session can pick a theme and push on it.
 | M20 | x64 (long mode) port (UP)                       | Architecture     | ✅ DOCS §4.X (closed by §M20.5) |
 | M20.5 | x64 SMP + APIC + ring-3 (int 0x80) — Phase A/B/C | Architecture | ✅ §M20.5 |
 | M20.6 | x86_64 closure — SYSCALL/SYSRET, xHCI + virtio-blk 64-bit DMA | Architecture | §M20.6 |
-| M21 | ARM (aarch64 generic / RPi) port                | Architecture     | 🚧 Phase A–L ✅ — boot + SMP + virtio-blk + exFAT + DTB + framebuffer + **EL0 userspace** + **full shell.c + M22 GUI** (kbd/mouse via virtio-input, PL031 clock) on ARM64 (DOCS §4.17); all 3 arches M25-ready + GUI parity; only USB (M15) pending — §M21 |
+| M21 | ARM (aarch64 generic / RPi) port                | Architecture     | ✅ Phase A–M — **full x86 parity**: boot + SMP + virtio-blk + exFAT + DTB + framebuffer + EL0 userspace + full shell.c + M22 GUI (virtio-input kbd/mouse, PL031 clock) + **USB (xHCI + HID over PCIe ECAM)** on ARM64 (DOCS §4.17) — §M21 |
 | M22 | GUI infrastructure — compositor, windows, mouse, widgets, taskbar, file manager | UX | ✅ DOCS §4.13 |
 | M22.2 | GUI modularity — swappable desktop shell + app registry + GUI dev docs | UX | ✅ DOCS §4.14 |
 | M22.3 | Desktop polish — task manager, task_kill, term-window close, minimize, Alt-Tab, damage rects | UX | ✅ DOCS §4.13 |
@@ -1437,7 +1437,7 @@ shell bring-up of a novel arch is not one landing.  Phase breakdown:
 | **I** | virtio-gpu framebuffer — the SAME portable `fb_terminal.c` renders the boot log + interactive shell graphically (fb_present backend abstraction; x86 DISPI flip hoisted out) | ✅ **shipped** (2026-07-09, DOCS §4.17) |
 | **L** | EL0 userspace substrate (M25 prerequisite) — per-process VMM (`vmm.c`) + EL0 entry + SVC syscall (`usermode.S`/`syscall.c`); a user program runs at EL0 and services SYS_PRINT/SYS_EXIT.  Brings ARM to the x86 M6/M20.5 baseline → all 3 arches M25-ready | ✅ **shipped** (2026-07-10, DOCS §4.17) |
 | **J / K** | The *same* full `shell.c` on a virtual console + the M22 GUI (compositor + taskbar + PL031 clock + windows), driven by virtio-input keyboard/mouse over the virtio-gpu framebuffer.  Portability shims (`arch_ringtest`, PSCI reboot/shutdown, `pl031_rtc`, `fb_present_flush`, `virtio_input`) + a scheduler idle-loop IRQ-enable fix.  **M22 arch parity.** | ✅ **shipped** (2026-07-10, DOCS §4.17) |
-| M | USB (M15 arch port) — xHCI needs PCIe ECAM enumeration on `virt` + HID | 🔲 |
+| **M** | USB (M15 arch port) — new PCIe-ECAM layer (`pci.c`: config via MMIO + BAR assignment, no firmware) → the stock xhci.c + usb_hid.c link + run (MMIO, polled from the timer ISR); USB HID keyboard drives the shell.  **Full x86 parity.** | ✅ **shipped** (2026-07-10, DOCS §4.17) |
 
 ### Phase A — ✅ shipped (2026-07-07, DOCS §4.17)
 

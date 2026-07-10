@@ -48,6 +48,11 @@ if [ "$ARCH" = "aarch64" ]; then
     #   input path (virtio_input.c) — keyboard → VC/shell, relative mouse → the
     #   GUI compositor.  QEMU `virt` has no PS/2.
     # -rtc base=localtime: PL031 RTC values match the host clock (taskbar clock).
+    # USB (M21 Phase M) is exercised separately to avoid double-typing with the
+    # virtio keyboard; test it with:
+    #   ... -device qemu-xhci -device usb-kbd    (drop virtio-keyboard-device)
+    # The xHCI comes up over the PCIe ECAM bus (pci.c) and the HID keyboard
+    # drives the shell.
     QEMU_MACHINE="-M virt,gic-version=2 -cpu cortex-a72 -smp 2 -m 256M \
         -serial mon:stdio -rtc base=localtime \
         -device virtio-gpu-device -device virtio-keyboard-device \

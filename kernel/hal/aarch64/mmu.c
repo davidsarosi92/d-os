@@ -96,6 +96,16 @@ void mmu_enable_this_cpu(void) {
  * these blocks. */
 uint64_t* mmu_kernel_l1(void) { return l1_table; }
 
+/* Map the 1 GiB Device-nGnRnE block that contains `va` into the kernel identity
+ * map (identity: PA == VA).  Used to reach MMIO windows outside the initial
+ * low-4-GiB map — e.g. the PCIe ECAM config space at 0x40_1000_0000 (M15 USB).
+ * Idempotent; TLBI so the new block is visible immediately. */
+void mmu_map_device_1gib(uint64_t va) {
+    uint64_t idx = (va >> 30) & 0x1FF;          /* level-1 index (39-bit VA) */
+    l1_table[idx] = (idx << 30) | DESC_BLOCK | DESC_AF | DESC_ATTR(ATTR_DEVICE);
+    __asm__ volatile ("dsb ish\ntlbi vmalle1\ndsb ish\nisb" ::: "memory");
+}
+
 void mmu_init(void) {
     /* index 0 → device window (peripherals + GIC + UART). */
     l1_table[0] = (0x00000000ULL)

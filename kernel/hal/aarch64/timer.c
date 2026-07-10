@@ -34,6 +34,14 @@ void gic_enable_irq(uint32_t intid);
  * the IRQ-exit path (gic.c) acts on it. */
 void schedule_request(void) __attribute__((weak));
 
+/* USB xHCI event/HID-report poll (xhci.c) — the ARM equivalent of the x86 PIT
+ * tick calling xhci_poll().  Weak so builds without the USB stack still link.
+ * Driven on the BSP only (see timer_isr) so the two CPUs' ticks don't race on
+ * the controller's rings. */
+void xhci_poll(void) __attribute__((weak));
+void xhci_poll(void) { }
+int  this_cpu_id(void);                 /* percpu.c */
+
 /* GIC INTID of the non-secure EL1 physical timer on QEMU `virt` (PPI 14). */
 #define TIMER_INTID 30
 
@@ -64,6 +72,8 @@ static void timer_isr(uint32_t intid) {
     (void)intid;
     tick_count++;
     write_cntp_tval(interval);          /* schedule the next interrupt        */
+
+    if (this_cpu_id() == 0) xhci_poll();   /* service USB (BSP only)          */
 
     /* Drive preemption: flag a reschedule on this CPU.  gic.c runs the
      * actual schedule_check() after EOI (so the timer keeps firing on
