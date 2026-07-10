@@ -42,6 +42,15 @@ void uart_early_puthex(uint64_t v);
 void aarch64_irq_dispatch(void) __attribute__((weak));
 void aarch64_irq_dispatch(void) { }
 
+/* SVC syscall dispatcher (syscall.c).  Weak so the early Phase-A/B builds
+ * (before the userspace slice is linked) still resolve; the strong definition
+ * decodes x8 and services SYS_PRINT/SYS_EXIT. */
+void aarch64_syscall(struct trapframe* tf) __attribute__((weak));
+void aarch64_syscall(struct trapframe* tf) { (void)tf; }
+
+/* ESR_EL1.EC value for "SVC instruction executed in AArch64 state". */
+#define EC_SVC64  0x15
+
 static void dump_and_halt(const char* what, struct trapframe* tf) {
     uint64_t esr, far;
     __asm__ volatile ("mrs %0, esr_el1"  : "=r"(esr));
@@ -76,7 +85,16 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
         case EXC_SERROR:
             dump_and_halt("SError (async abort)", tf);
             break;
-        case EXC_SYNC:
+        case EXC_SYNC: {
+            uint64_t esr;
+            __asm__ volatile ("mrs %0, esr_el1" : "=r"(esr));
+            if ((esr >> 26) == EC_SVC64) {   /* EL0/EL1 `svc` → syscall path */
+                aarch64_syscall(tf);
+                return;                       /* → RESTORE_TRAPFRAME → eret to EL0 */
+            }
+            dump_and_halt("synchronous", tf);
+            break;
+        }
         default:
             dump_and_halt("synchronous", tf);
             break;

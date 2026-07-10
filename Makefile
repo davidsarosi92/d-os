@@ -50,6 +50,8 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/idt.c \
       kernel/hal/x86/tss.c \
       kernel/hal/x86/vmm.c \
+      kernel/hal/x86/fb_present.c \
+      kernel/hal/x86/ringtest.c \
       kernel/hal/x86/pci.c \
       kernel/hal/x86/hal_arch.c \
       kernel/hal/x86/task_arch.c \
@@ -107,7 +109,9 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/syscall.c \
       kernel/hal/x86/lapic.c \
       kernel/hal/x86/ioapic.c \
-      kernel/hal/x86/pci.c
+      kernel/hal/x86/pci.c \
+      kernel/hal/x86/fb_present.c \
+      kernel/hal/x86/ringtest.c
 
   ARCH_ASM_SRCS := \
       kernel/hal/x86_64/boot.s \
@@ -158,7 +162,12 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/stubs.c \
       kernel/hal/aarch64/lib.c \
       kernel/hal/aarch64/smp.c \
+      kernel/hal/aarch64/vmm.c \
+      kernel/hal/aarch64/syscall.c \
       kernel/hal/aarch64/virtio_mmio_blk.c \
+      kernel/hal/aarch64/virtio_gpu.c \
+      kernel/hal/aarch64/virtio_input.c \
+      kernel/hal/aarch64/pl031_rtc.c \
       kernel/hal/aarch64/dtb.c \
       kernel/hal/aarch64/serial_shell.c \
       kernel/hal/aarch64/main_entry.c
@@ -167,7 +176,8 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/boot.S \
       kernel/hal/aarch64/vectors.S \
       kernel/hal/aarch64/switch.S \
-      kernel/hal/aarch64/smp_entry.S
+      kernel/hal/aarch64/smp_entry.S \
+      kernel/hal/aarch64/usermode.S
 
   ARCH_EXTRA_OBJS :=
 
@@ -249,7 +259,9 @@ else ifeq ($(ARCH),aarch64)
 # the x86-coupled shell.c (welded to the framebuffer VC + GUI + block/USB +
 # usermode) or the x86-coupled kernel_main; aarch64/main_entry.c runs its own
 # bring-up and aarch64/serial_shell.c is the REPL.  This list grows as later
-# phases port more of the core.
+# phases port more of the core.  M21 Phase I adds the PORTABLE framebuffer
+# terminal (fb_terminal.c) — the same 8x8-font renderer x86 uses — driven by
+# the aarch64 virtio-gpu present backend (kernel/hal/aarch64/virtio_gpu.c).
 CORE_C_SRCS := \
     kernel/core/printf.c \
     kernel/core/console.c \
@@ -260,6 +272,29 @@ CORE_C_SRCS := \
     kernel/core/block.c \
     kernel/core/task.c \
     kernel/core/block_cache.c \
+    kernel/core/config.c \
+    kernel/core/driver.c \
+    kernel/core/keymap.c \
+    kernel/core/layouts.c \
+    kernel/core/vc.c \
+    kernel/core/shell.c \
+    kernel/core/rescue_shell.c \
+    kernel/core/basic.c \
+    kernel/drivers/terminal/fb_terminal.c \
+    kernel/gui/gfx.c \
+    kernel/gui/gui.c \
+    kernel/gui/widget.c \
+    kernel/gui/w_editor.c \
+    kernel/gui/clipboard.c \
+    kernel/gui/shell_vista.c \
+    kernel/gui/shell_bare.c \
+    kernel/gui/apps/fileman.c \
+    kernel/gui/apps/about.c \
+    kernel/gui/apps/newshell.c \
+    kernel/gui/apps/hello.c \
+    kernel/gui/apps/taskman.c \
+    kernel/gui/apps/editor.c \
+    kernel/gui/apps/basic.c \
     kernel/mem/pmm.c \
     kernel/mem/slab.c \
     kernel/mem/kmalloc.c \

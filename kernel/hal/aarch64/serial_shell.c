@@ -90,8 +90,14 @@ static void cmd_help(void) {
             "  write <path> <t>  create <path> and write <t>\n"
             "  rm <path>         remove a file\n"
             "  blk [lba]         hexdump a sector of /dev/vda\n"
+            "  usertest          drop to EL0 and run a userspace program\n"
             "  clear             clear the screen\n");
 }
+
+/* Phase L — the EL0/userspace self-test (syscall.c), the ARM analogue of the
+ * x86 shell's `ringtest`.  Runs a tiny program at EL0 that SYS_PRINTs + SYS_EXITs. */
+int aarch64_usertest(void);
+static void cmd_usertest(void) { aarch64_usertest(); }
 
 static void cmd_meminfo(void) {
     uint32_t managed = pmm_managed_frames();
@@ -243,6 +249,7 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "write"))  cmd_write(args);
         else if (s_eq(cmd, "rm"))     cmd_rm(args);
         else if (s_eq(cmd, "blk"))    cmd_blk(args);
+        else if (s_eq(cmd, "usertest")) cmd_usertest();
         else if (s_eq(cmd, "clear"))  kprintf("\033[2J\033[H");
         else kprintf("unknown command '%s' (try 'help')\n", cmd);
     }

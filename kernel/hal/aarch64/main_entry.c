@@ -37,6 +37,9 @@
 #include "smp.h"
 #include "block.h"
 #include "block_cache.h"
+#include "vc.h"
+#include "shell_provider.h"
+#include "lock.h"
 #include <stdint.h>
 
 /* Early UART + arch bring-up (uart.c / hal_arch.c / gic.c / timer.c / stubs.c). */
@@ -50,6 +53,10 @@ void     aarch64_boot_meminfo_init(void);
 void     aarch64_serial_console_init(void);
 void     serial_shell_entry(void);   /* serial_shell.c — the Phase D REPL     */
 int      virtio_mmio_blk_init(void); /* virtio_mmio_blk.c — Phase F disk       */
+int      virtio_gpu_init(void);      /* virtio_gpu.c — Phase I framebuffer     */
+int      virtio_input_init(void);    /* virtio_input.c — Phase J kbd + mouse   */
+void     keymap_init(void);          /* keymap.c — select the default layout   */
+int      aarch64_usertest(void);     /* syscall.c — Phase L EL0 userspace test */
 void     dtb_init(uint64_t x0);      /* dtb.c — Phase H device-tree discovery  */
 
 static uint64_t current_el(void) {
@@ -112,6 +119,20 @@ void aarch64_main_entry(uint64_t dtb) {
         kfree(b); kfree(c);
     }
 
+    /* -----------------------------------------------------------------------
+     * Phase I — virtio-gpu framebuffer.  Probe the virtio-MMIO slots for a GPU;
+     * if present, allocate a RAM framebuffer, stand up a 2D scanout, and route
+     * the PORTABLE fb_terminal console onto it (the same renderer x86 uses).
+     * From here the boot log renders graphically as well as to the serial log.
+     * A no-op if no GPU is attached (`-nographic` without a virtio-gpu device),
+     * in which case the serial console stays the only sink.
+     * ----------------------------------------------------------------------- */
+    int have_fb = (virtio_gpu_init() == 0);
+    if (have_fb)
+        kprintf("aarch64: virtio-gpu framebuffer console up\n");
+    else
+        kprintf("aarch64: no virtio-gpu device — serial console only\n");
+
     /* Scheduler (Phase C): synthesise pid 0 from this context + an idle task. */
     task_init();
 
@@ -171,6 +192,15 @@ void aarch64_main_entry(uint64_t dtb) {
     kprintf("aarch64: VFS up — ramfs mounted at /\n");
 
     /* -----------------------------------------------------------------------
+     * Phase L — EL0 userspace self-test (M25 prerequisite).  Create a private
+     * address space, map an EL0 code + stack page, drop to EL0, run a tiny user
+     * program that issues SYS_PRINT + SYS_EXIT via `svc`, and teleport back.
+     * Proves the ring-3/EL0 substrate M25 will build real user processes on is
+     * live — the ARM equivalent of the x86 `ringtest`.
+     * ----------------------------------------------------------------------- */
+    aarch64_usertest();
+
+    /* -----------------------------------------------------------------------
      * Phase F — virtio-MMIO block device.  Probe the QEMU `virt` virtio-MMIO
      * slots for an attached disk; if present, register it as /dev/vda and run
      * a write→read round-trip on a scratch sector to prove real disk DMA.
@@ -199,10 +229,52 @@ void aarch64_main_entry(uint64_t dtb) {
             kprintf("aarch64: /dev/vda has no exFAT volume (skipping /mnt mount)\n");
     }
 
-    struct task* sh = task_spawn("shell", serial_shell_entry);
-    if (!sh) kprintf("aarch64: FATAL — failed to spawn serial shell\n");
-    kprintf("aarch64: Phase D — interactive serial shell running "
-            "(pid 0 → idle).\n");
+    /* -----------------------------------------------------------------------
+     * Shell.  With a framebuffer (virtio-gpu) present we run the SAME full
+     * shell.c the x86 ports use, on a virtual console, with virtio-input
+     * keyboard + mouse (M21 Phase J) — `gui` then launches the M22 desktop
+     * (Phase K).  Mirrors kernel.c's startup: init/reaper first, then vc_init
+     * (paints over the boot log + installs per-task console routing), then the
+     * shell provider on the root VC.  With no framebuffer we fall back to the
+     * UART serial shell (Phase D).
+     * ----------------------------------------------------------------------- */
+    keymap_init();                              /* select the keyboard layout (default "us") */
 
-    for (;;) hal_cpu_halt();
+    if (have_fb) {
+        /* vc_init FIRST: it paints over the boot log and disables the global fb
+         * console sink, switching to per-task routing.  Everything spawned
+         * afterwards (init, the input task) has no bound console, so its output
+         * goes to the SERIAL log only — the framebuffer then shows just the
+         * shell's VC, with no multi-task console-race garble on screen. */
+        vc_init();
+        task_start_init();                      /* M27 reaper (prints to serial) */
+        virtio_input_init();                    /* keyboard + mouse (prints to serial) */
+        struct vc* root = vc_root();
+        if (root) {
+            struct task* sh = task_spawn("shell", shell_provider_active()->entry);
+            if (sh) { task_set_out_console(sh, root); root->task = sh; }
+            if (!sh) kprintf("aarch64: FATAL — failed to spawn framebuffer shell\n");
+        } else {
+            kprintf("aarch64: FATAL — no root VC (framebuffer init failed)\n");
+        }
+    } else {
+        task_start_init();                      /* M27 universal reaper */
+        kprintf("aarch64: no framebuffer — UART serial shell (pid 0 → idle).\n");
+        if (!task_spawn("shell", serial_shell_entry))
+            kprintf("aarch64: FATAL — failed to spawn serial shell\n");
+    }
+
+    /* Idle loop.  With a framebuffer we also drain virtio-input here (polled),
+     * so keyboard + mouse events are serviced whenever the CPU is otherwise
+     * idle (the shell blocked in vc_getchar, the compositor waiting).  Do NOT
+     * halt in that case — halting would stall input until the next timer IRQ. */
+    /* Mark pid 0 as THE idle task (like x86 kernel_main): idle tasks are off the
+     * runqueue and only picked as a fallback, so the shell + init + apps are no
+     * longer starved by pid 0 competing round-robin with them.  Then idle —
+     * re-enabling IRQs each pass (as cpu_idle_entry does): `wfi` wakes on a
+     * masked IRQ but does NOT take it, so if DAIF ever left IRQs masked here the
+     * timer tick would never be serviced and this CPU would stop scheduling
+     * (starving every task homed on it — e.g. the input poll task). */
+    task_become_idle();
+    for (;;) { hal_intr_enable(); hal_cpu_halt(); }
 }

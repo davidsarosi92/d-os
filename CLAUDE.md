@@ -101,8 +101,9 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
 - **M21** — aarch64 port.  Third arch, real torture test of HAL
   portability (no port I/O, GIC instead of APIC, EL1/EL0 instead
-  of rings).  🚧 **Phase A–H shipped** (2026-07-07, DOCS §4.17) —
-  boot→shell + ramfs + SMP + virtio-blk + exFAT + DTB on ARM64:
+  of rings).  🚧 **Phase A–L shipped** (2026-07-07..10, DOCS §4.17) —
+  boot + SMP + virtio-blk + exFAT + DTB + framebuffer + EL0 userspace +
+  **full shell.c + M22 GUI** (kbd/mouse) on ARM64:
   A = raw-ELF boot on QEMU `-M virt` (no GRUB/multiboot), EL2→EL1 drop,
   PL011 UART, EL1 exception vectors, MMU identity map on;
   B = GICv2 (GICD 0x08000000 / GICC 0x08010000) + ARM generic timer
@@ -126,12 +127,33 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   writes survive a reboot;
   H = device-tree (FDT/DTB) parsing (`dtb.c`) — discovers RAM size + CPU
   count, sizes the PMM to the actual `-m` (DTB loaded at 0x48000000 via
-  `-device loader`; falls back to defaults).  aarch64 runs its OWN
-  `main_entry.c` bring-up (NOT the x86-coupled kernel_main) and links only
-  the portable core slice.  Builds via a separate `Dockerfile.aarch64`
-  (cross toolchain conflicts with gcc-multilib).  Next (Phase I+): the
-  *same* framebuffer shell.c — needs the VC/framebuffer + GUI + block/USB +
-  usermode ports — plus EL0/userspace, GUI.
+  `-device loader`; falls back to defaults);
+  I = virtio-gpu framebuffer (`virtio_gpu.c`) — QEMU `virt` has no
+  VGA/Bochs-VBE, so the display is a virtio-gpu on a virtio-MMIO slot; a
+  1280×800 2D scanout backed by a contiguous RAM framebuffer runs the *same*
+  portable `fb_terminal.c` x86 uses (boot log + shell render graphically).
+  The one x86-only bit of fb_terminal (Bochs-VBE port I/O + vmm map) was
+  hoisted behind `fb_present.h` — `fb_present_map` + `fb_present_flush`
+  (x86: no-op, linear FB is the scanout; ARM: virtio-gpu transfer+flush) —
+  and the M22.6 page flip moved to `kernel/hal/x86/fb_present.c` (gui.c
+  unchanged); i386 GUI re-verified regression-free;
+  L = EL0 userspace substrate (`vmm.c` per-process TTBR0 spaces + EL0-page
+  mappings; `usermode.S` `eret`-to-EL0 + SYS_EXIT teleport; `syscall.c` SVC
+  dispatcher, x8=num/x0..x5=args, shared `syscall.h`; ESR.EC==0x15 decode in
+  `exceptions.c`).  `usertest` runs a program at EL0 → SYS_PRINT/SYS_EXIT.
+  This is the ARM analogue of x86 M6/M20.5 ring-3+`int 0x80` → **all 3
+  arches are now M25-ready** (each can enter user mode + service a syscall);
+  J/K = the *same* full `shell.c` on a VC + the **M22 GUI** (compositor +
+  taskbar + PL031 clock + windows) driven by **virtio-input** kbd/mouse over
+  the virtio-gpu framebuffer.  Portability shims: `arch_ringtest()`, PSCI
+  `hal_shutdown/reboot`, `pl031_rtc.c`, `fb_present_flush()` in gui.c's present
+  path, `virtio_input.c`.  **Scheduler lesson:** pid 0's idle loop must
+  `hal_intr_enable()` each pass (like `cpu_idle_entry`) — a bare `for(;;)
+  hal_cpu_halt()` wedges the CPU if DAIF masks IRQs (wfi wakes but won't take a
+  masked IRQ) → its timer stops → it stops scheduling → CPU-homed tasks starve.
+  aarch64 runs its OWN `main_entry.c` (NOT the x86-coupled kernel_main), builds
+  via a separate `Dockerfile.aarch64`.  **Only M15 USB (xHCI + PCIe ECAM on
+  `virt`) remains** for full ARM parity.
 - **M23** — Audio (AC97 → HDA → I2S).
 - **M24** — Network (NIC → IP/UDP/TCP → sockets).
 - **§M19.5.1 i386 kmap** — the deferred half of HIGHMEM: real
@@ -212,6 +234,11 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
 ARCH=x86_64 ./scripts/build.sh        # → build/x86_64/d-os.iso
 ARCH=x86_64 ./scripts/run_qemu.sh     # x86_64 in qemu-system-x86_64
+
+# Per-arch convenience wrappers (thin shims over the ARCH= scripts above):
+./scripts/build-i386.sh   ./scripts/run-i386.sh
+./scripts/build-x86_64.sh ./scripts/run-x86_64.sh
+./scripts/build-aarch64.sh ./scripts/run-aarch64.sh   # ARM64 (raw ELF on -M virt)
 ```
 
 `make clean` wipes the current ARCH only; `make clean-all` wipes all

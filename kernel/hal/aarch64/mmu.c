@@ -88,6 +88,14 @@ void mmu_enable_this_cpu(void) {
     __asm__ volatile ("msr sctlr_el1, %0\nisb" :: "r"(sctlr));
 }
 
+/* Expose the shared kernel level-1 table so the per-process VMM (vmm.c) can
+ * copy the kernel/device identity blocks (entries 0..3) into every user address
+ * space — the kernel stays mapped in the low 4 GiB of every TTBR0, exactly as
+ * the x86 ports keep the kernel mapped in every process's page directory.  User
+ * mappings then live at VA >= 4 GiB (L1 index >= 4), which never collide with
+ * these blocks. */
+uint64_t* mmu_kernel_l1(void) { return l1_table; }
+
 void mmu_init(void) {
     /* index 0 → device window (peripherals + GIC + UART). */
     l1_table[0] = (0x00000000ULL)

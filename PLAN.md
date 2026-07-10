@@ -175,7 +175,7 @@ what); a session can pick a theme and push on it.
 | M20 | x64 (long mode) port (UP)                       | Architecture     | ✅ DOCS §4.X (closed by §M20.5) |
 | M20.5 | x64 SMP + APIC + ring-3 (int 0x80) — Phase A/B/C | Architecture | ✅ §M20.5 |
 | M20.6 | x86_64 closure — SYSCALL/SYSRET, xHCI + virtio-blk 64-bit DMA | Architecture | §M20.6 |
-| M21 | ARM (aarch64 generic / RPi) port                | Architecture     | 🚧 Phase A–H ✅ — boot→shell + ramfs + SMP + virtio-blk + exFAT + DTB on ARM64 (DOCS §4.17); I+ (full shell.c/GUI/userspace) pending — §M21 |
+| M21 | ARM (aarch64 generic / RPi) port                | Architecture     | 🚧 Phase A–L ✅ — boot + SMP + virtio-blk + exFAT + DTB + framebuffer + **EL0 userspace** + **full shell.c + M22 GUI** (kbd/mouse via virtio-input, PL031 clock) on ARM64 (DOCS §4.17); all 3 arches M25-ready + GUI parity; only USB (M15) pending — §M21 |
 | M22 | GUI infrastructure — compositor, windows, mouse, widgets, taskbar, file manager | UX | ✅ DOCS §4.13 |
 | M22.2 | GUI modularity — swappable desktop shell + app registry + GUI dev docs | UX | ✅ DOCS §4.14 |
 | M22.3 | Desktop polish — task manager, task_kill, term-window close, minimize, Alt-Tab, damage rects | UX | ✅ DOCS §4.13 |
@@ -1434,7 +1434,10 @@ shell bring-up of a novel arch is not one landing.  Phase breakdown:
 | **F** | virtio-MMIO block device (modern transport) registered as /dev/vda with the stock block layer; write→read self-test + `blk` shell command | ✅ **shipped** (2026-07-07, DOCS §4.17) |
 | **G** | exFAT on /dev/vda (stock block_cache.c + exfat.c) mounted at /mnt — persistent storage; files written from the shell survive a reboot | ✅ **shipped** (2026-07-07, DOCS §4.17) |
 | **H** | Device-tree (FDT/DTB) parsing — the kernel discovers RAM size + CPU count from the DTB and sizes the PMM to the actual `-m`, with a fallback | ✅ **shipped** (2026-07-07, DOCS §4.17) |
-| I+ | Full-parity shell.c (needs the framebuffer/VC + GUI + block/USB + usermode ports), EL0/userspace, GUI | 🔲 |
+| **I** | virtio-gpu framebuffer — the SAME portable `fb_terminal.c` renders the boot log + interactive shell graphically (fb_present backend abstraction; x86 DISPI flip hoisted out) | ✅ **shipped** (2026-07-09, DOCS §4.17) |
+| **L** | EL0 userspace substrate (M25 prerequisite) — per-process VMM (`vmm.c`) + EL0 entry + SVC syscall (`usermode.S`/`syscall.c`); a user program runs at EL0 and services SYS_PRINT/SYS_EXIT.  Brings ARM to the x86 M6/M20.5 baseline → all 3 arches M25-ready | ✅ **shipped** (2026-07-10, DOCS §4.17) |
+| **J / K** | The *same* full `shell.c` on a virtual console + the M22 GUI (compositor + taskbar + PL031 clock + windows), driven by virtio-input keyboard/mouse over the virtio-gpu framebuffer.  Portability shims (`arch_ringtest`, PSCI reboot/shutdown, `pl031_rtc`, `fb_present_flush`, `virtio_input`) + a scheduler idle-loop IRQ-enable fix.  **M22 arch parity.** | ✅ **shipped** (2026-07-10, DOCS §4.17) |
+| M | USB (M15 arch port) — xHCI needs PCIe ECAM enumeration on `virt` + HID | 🔲 |
 
 ### Phase A — ✅ shipped (2026-07-07, DOCS §4.17)
 
@@ -1654,9 +1657,66 @@ comes up with **509 MiB free** (vs. the 253 MiB the hard-coded 256 MiB gave);
 without a DTB, `dtb: no device tree found (using built-in defaults)` and the
 PMM falls back to 253 MiB — the kernel adapts to the actual machine.
 
-**Remaining DoD (Phase I+):** the *same* framebuffer shell.c + same commands
-(needs the VC/framebuffer + GUI + block/USB + usermode ports); EL0 userspace;
-GUI.
+### Phase I — ✅ shipped (2026-07-09, DOCS §4.17)
+
+The framebuffer on the third arch, running the *same* portable console x86 uses.
+QEMU `virt` has no VGA/Bochs-VBE and no linear-VRAM BAR — the display is a
+virtio-gpu device on a virtio-MMIO slot, and it is a COMMAND device (guest RAM
+buffer → host resource backing → scanout → per-update transfer+flush), not a
+plain framebuffer.  As-built:
+- **`fb_present.h` backend cut** — the one x86-only part of `fb_terminal.c` (the
+  Bochs-VBE port I/O + the vmm identity map) moved behind a two-call interface:
+  `fb_present_map(phys,size)` (x86: 4 MiB PSE map; ARM: no-op, RAM already
+  mapped) and `fb_present_flush(x,y,w,h)` (x86: no-op, the linear FB *is* the
+  scanout; ARM: virtio-gpu transfer+flush).  The M22.6 double-buffer page flip
+  (`fb_flip_init`/`fb_flip_to`) moved verbatim from `fb_terminal.c` to
+  `kernel/hal/x86/fb_present.c`; gui.c is unchanged.  `fb_terminal.c` is now
+  arch-portable and self-flushes each render primitive's dirty rect.
+- **`virtio_gpu.c`** — modern virtio-MMIO handshake (reused from Phase F) +
+  control virtqueue; RESOURCE_CREATE_2D → ATTACH_BACKING (a contiguous ~4 MiB
+  `pmm_alloc_contiguous` framebuffer) → SET_SCANOUT for a 1280×800 B8G8R8X8
+  display; then `fb_term_init_direct()` hands the buffer to the console.
+- **`main_entry.c`** brings the GPU up right after kmalloc, so most of the boot
+  log renders graphically (and still to the serial log).
+
+**Verified (QEMU screendump, `-device virtio-gpu-device`):** the boot log
+renders at 1280×800 (160×100 grid) and `help`/`ls /`/`meminfo` show crisp output
+on the framebuffer; the i386 GUI compositor page-flip (now via the moved
+`fb_present.c`) is regression-free.  **Lesson learned:** on SMP the serial-shell
+banner interleaved character-by-character with pid 0's hand-off line on the
+shared console — harmless byte-mixing on serial, but it corrupts the shared
+cursor on the framebuffer.  Fixed by printing the hand-off line *before*
+spawning the shell (pid 0 then only idles); the general fix — console output
+serialization — is deferred to when a second concurrent FB writer actually
+needs it (Phase J's VC panes).
+
+### Phase L — ✅ shipped (2026-07-10, DOCS §4.17)
+
+EL0 userspace on the third arch — the prerequisite that makes **M25 startable on
+all three architectures**.  x86 has had ring 3 + `int 0x80` since M6/M20.5;
+this brings aarch64 to the same baseline.  As-built:
+- **`vmm.c`** — per-process TTBR0 address spaces: `aarch64_vmm_create` allocates a
+  private L1 table and copies the kernel's low-4-GiB identity blocks into it (so
+  the kernel + peripherals stay mapped in every space, as on x86); page-granular
+  `aarch64_vmm_map_user` (EL0-accessible, AP=01 + PXN, UXN cleared only for code)
+  at VA ≥ 4 GiB; `aarch64_vmm_switch` (load TTBR0 + `tlbi`).
+- **`usermode.S` + `syscall.c`** — `aarch64_enter_user` `eret`s to EL0 (SP_EL0 +
+  ELR + SPSR); a `svc #0` traps to the EL0 sync vector, `exceptions.c` decodes
+  ESR.EC==0x15 and dispatches (x8=number, x0..x5=args; shared `syscall.h`);
+  SYS_EXIT teleports back via `aarch64_user_exit`.  No TSS analogue needed — the
+  CPU auto-selects SP_EL1 on the EL0→EL1 exception.
+
+**Verified (serial):** `usertest: dropping to EL0 …` → `hello from EL0 (aarch64
+userspace)!` (printed by the EL0 program via `svc`) → `…back at EL1 (SYS_EXIT
+teleport OK)`.  i386 + x86_64 `ringtest` re-verified identical.  **Lesson
+learned:** user VA must clear the kernel's 1 GiB identity blocks — placing user
+pages at ≥ 4 GiB (L1 index ≥ 4) keeps `aarch64_vmm_map_user` from ever trying to
+split a kernel *block* descriptor into a table.
+
+**Remaining DoD (Phase J / K — NOT M25 prerequisites):** the *same* framebuffer
+`shell.c` (VC panes + input routing; today ARM uses `serial_shell.c` over the
+UART) and the GUI compositor.  These are ARM ports of M22/M15, independent of the
+userland (M25) line, and can follow at any time.
 
 ---
 
@@ -2115,6 +2175,16 @@ today has kernel threads sharing one page directory, a 2-entry
 syscall table (SYS_PRINT / SYS_EXIT), and no fd concept at all.
 This milestone builds that substrate.  It is worth doing regardless
 of Wayland — it is what turns d-os tasks into real user processes.
+
+**Prerequisites — ✅ ready on all three arches (2026-07-10).**  The
+arch substrate M25 builds on is now present and verified uniformly:
+each of i386 / x86_64 / aarch64 can enter user mode (ring 3 / EL0),
+service a syscall (`int 0x80` / `svc`), and map EL0-accessible user
+pages (i386/x86_64 `vmm_map(…, VMM_USER)`; aarch64 `vmm.c`
+`aarch64_vmm_map_user` + per-process `aarch64_vmm_create`).  See the
+M25-readiness matrix in DOCS.md §4.17.  So stage 1 below can start on
+any arch.  (Older deferred items — §M20.6.1 SYSCALL/SYSRET, §M19.5.1
+i386 kmap — are optimisations, NOT M25 blockers, and stay deferred.)
 
 **Design — staged subsystems.**
 

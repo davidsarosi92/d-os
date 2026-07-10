@@ -28,6 +28,20 @@ void hal_cpu_halt(void) {
     __asm__ volatile ("wfi");
 }
 
+/* Power off / reboot via PSCI (same HVC conduit smp.c uses for CPU_ON).  The
+ * x86 ports poke ACPI / the keyboard controller; on QEMU `virt` firmware
+ * exposes PSCI SYSTEM_OFF (0x84000008) and SYSTEM_RESET (0x84000009). */
+void hal_shutdown(void) {
+    register uint64_t x0 __asm__("x0") = 0x84000008;   /* PSCI_SYSTEM_OFF */
+    __asm__ volatile ("hvc #0" : "+r"(x0) :: "memory");
+    for (;;) __asm__ volatile ("wfi");
+}
+void hal_reboot(void) {
+    register uint64_t x0 __asm__("x0") = 0x84000009;   /* PSCI_SYSTEM_RESET */
+    __asm__ volatile ("hvc #0" : "+r"(x0) :: "memory");
+    for (;;) __asm__ volatile ("wfi");
+}
+
 /* Busy-wait relax hint — ARM `yield` (the x86 `pause` analogue). */
 void hal_cpu_pause(void) {
     __asm__ volatile ("yield");
@@ -85,11 +99,16 @@ uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
     return end_phys < covered ? end_phys : covered;
 }
 
-/* ---- syscall epilogue (EL0 userspace — future phase) ----------------------- */
+/* ---- syscall epilogue (EL0 userspace) -------------------------------------- */
 
-/* No ring-3/EL0 path yet on aarch64; SYS_EXIT's fast return is unused.
- * Provide the symbol so the core links; trap loudly if ever called. */
+/* SYS_EXIT's fast return to the kernel (M21 Phase L).  x86 passes the saved
+ * kernel SP/PC as arguments; on AArch64 aarch64_enter_user stashes them in
+ * usermode.S globals, so this HAL entry just delegates to the teleport helper
+ * (the args are accepted for a uniform HAL signature but unused here).  Kept so
+ * the portable syscall shape is identical across the three arches. */
+void aarch64_user_exit(void);
 void hal_syscall_exit_to_kernel(uintptr_t saved_sp, uintptr_t saved_pc) {
     (void)saved_sp; (void)saved_pc;
-    for (;;) __asm__ volatile ("wfe");
+    aarch64_user_exit();                 /* does not return */
+    __builtin_unreachable();
 }

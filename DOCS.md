@@ -2017,7 +2017,7 @@ item launches an app as its own host, no fault.
 
 ---
 
-### 4.17 ARM64 (AArch64) port — Phase A bring-up (M21)
+### 4.17 ARM64 (AArch64) port — Phases A–L (M21)
 
 The third architecture, and the real HAL-portability torture test: no
 port I/O (every device is MMIO), a GIC instead of the APIC, and
@@ -2055,7 +2055,10 @@ and `__stack_top` for the assembler.
 | `virtio_mmio_blk.c` | **(Phase F)** virtio-blk over the virtio-MMIO transport (modern/version-2): slot scan, feature negotiation, one split virtqueue, polled 512-byte sector read/write; registers `/dev/vda` with the stock block layer.  The ARM counterpart of the PCI `virtio_blk.c` (no port I/O). |
 | *(no new arch file)* | **(Phase G)** exFAT — the stock `block_cache.c` + `fs/exfat.c` link + run unchanged (arch-independent); `main_entry` runs `bcache_init()` + `vfs_mount("exfat", "/mnt", "vda")`.  The shell's ls/cat/write/rm then hit real, persistent disk under /mnt. |
 | `dtb.c` | **(Phase H)** minimal big-endian FDT/device-tree parser — locates the DTB (x0 → fixed load addr → RAM scan) and extracts the `/memory` reg (RAM base+size) + `/cpus/cpu@*` count.  `dtb_ram_size()` then drives the PMM map size (stubs.c) instead of a hard-coded constant. |
-| `main_entry.c` | Own bring-up (aarch64 does NOT share the x86-coupled `kernel_main`): banner + EL report, `hal_arch_early_init()` **(A)**, serial console + PMM + kmalloc + `task_init()` **(C)**, `gic_init()` + `timer_init(100)` **(B)**, a quick preemption check **(C)**, then `vfs_init()` + `module_init_all()` (ramfs at /) and spawns the serial shell **(D)**; pid 0 → idle. |
+| `virtio_input.c` + `pl031_rtc.c` | **(Phase J/K)** GUI input + clock.  `virtio_input.c`: keyboard (evdev keycode → HID usage → shared keymap → `vc_kbd_push`) + mouse (REL deltas + buttons → `mouse_set_listener`, the seam gui.c registers on) over virtio-MMIO input devices; drained by a poll task.  `pl031_rtc.c`: the ARM PL031 RTC (`rtc_read`, epoch-seconds → civil date) for the taskbar clock (QEMU `virt` has no CMOS).  With these the portable `vc.c` + `shell.c` + the whole M22 `gui.c`/widgets/apps link and run on ARM (the `gui` command). |
+| `vmm.c` + `usermode.S` + `syscall.c` | **(Phase L)** EL0 userspace substrate — the M25 prerequisite.  `vmm.c`: per-process TTBR0 address spaces (private L1 table with the kernel's low-4-GiB identity blocks copied in) + page-granular EL0 mappings (`aarch64_vmm_map_user`, AP=01 + PXN, UXN cleared only for code) + `aarch64_vmm_switch`.  `usermode.S`: `aarch64_enter_user` (stash kernel SP/LR → set SP_EL0/ELR/SPSR → `eret` to EL0) + the SYS_EXIT teleport `aarch64_user_exit` + a PC-relative `user_stub`.  `syscall.c`: the SVC dispatcher (x8=number, x0..x5=args, shared `syscall.h` numbers) servicing SYS_PRINT/SYS_EXIT + the `usertest` self-test.  The ARM analogue of x86's M6/M20.5 ring-3 + `int 0x80`. |
+| `virtio_gpu.c` | **(Phase I)** virtio-gpu (2D) over the virtio-MMIO transport — the ARM framebuffer (QEMU `virt` has no VGA/Bochs-VBE/VRAM BAR).  Same modern-transport handshake + control virtqueue as the blk driver; brings up a 1280×800 B8G8R8X8 scanout backed by a contiguous RAM framebuffer (`pmm_alloc_contiguous`), then hands it to the PORTABLE `fb_terminal.c` via `fb_term_init_direct()`.  Implements the `fb_present` backend: `fb_present_map` = no-op (RAM already mapped), `fb_present_flush` = `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH` of the dirty rect.  Net: the same 8×8-font console x86 uses now renders the boot log + interactive shell graphically on ARM. |
+| `main_entry.c` | Own bring-up (aarch64 does NOT share the x86-coupled `kernel_main`): banner + EL report, `hal_arch_early_init()` **(A)**, serial console + PMM + kmalloc **(C)**, `virtio_gpu_init()` (framebuffer console) **(I)**, `task_init()` **(C)**, `gic_init()` + `timer_init(100)` **(B)**, a quick preemption check **(C)**, `vfs_init()` + `module_init_all()` (ramfs at /) then the EL0 `aarch64_usertest()` **(L)**, and spawns the serial shell **(D)**; pid 0 → idle. |
 
 **Build.**  A separate `Dockerfile.aarch64` image carries the
 `aarch64-linux-gnu` cross toolchain — Ubuntu's cross gcc declares a
@@ -2250,11 +2253,102 @@ pmm: buddy ready — ... 509 MiB total free
 vs. no DTB → `dtb: no device tree found (using built-in defaults)` → 253 MiB.
 The kernel adapts to the actual machine config.
 
-**Not yet (Phase I+):** the *same* framebuffer `shell.c` + same commands
-(needs the VC/framebuffer + GUI + block/USB + usermode ports), EL0 userspace,
-GUI.  The aarch64 build links only the portable slice it needs so far
-(printf/console, lock/percpu, pmm/slab/kmalloc, task, module, block,
-block_cache, vfs, ramfs, exfat, + the arch drivers).
+**Phase I — virtio-gpu framebuffer (the SAME fb_terminal renderer).**  QEMU's
+`virt` board has no VGA/Bochs-VBE and no linear-VRAM BAR — the display is a
+virtio-gpu device on a virtio-MMIO slot.  Unlike a plain framebuffer it is a
+COMMAND device: the guest owns a RAM buffer, tells the host to treat it as a
+2D resource's backing store, binds it to a scanout, and then — per update —
+issues `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH`.  To reuse the portable 8×8
+console rather than fork it, the one x86-only part of `fb_terminal.c` (the
+Bochs-VBE port I/O + the vmm identity map) was hoisted behind a tiny
+presentation backend, `fb_present.h`:
+  - `fb_present_map(phys, size)` — x86: 4 MiB PSE identity map via the vmm;
+    aarch64: no-op (the RAM-backed buffer is already mapped Normal-WB).
+  - `fb_present_flush(x, y, w, h)` — x86: no-op (linear FB is the scanout);
+    aarch64: the virtio-gpu transfer + flush of that rect.
+  - the Bochs-VBE double-buffer page flip (`fb_flip_init`/`fb_flip_to`, used by
+    the M22.6 compositor) moved from `fb_terminal.c` to
+    `kernel/hal/x86/fb_present.c` unchanged — `gui.c` needs no edit.
+`fb_terminal.c` is now arch-portable and every render primitive self-flushes
+its dirty rect.  On aarch64, `virtio_gpu.c` allocates a contiguous 1280×800
+framebuffer (`pmm_alloc_contiguous`, ~4 MiB), stands up the scanout, and calls
+`fb_term_init_direct()`.
+
+**Verified (QEMU screendump, `-device virtio-gpu-device`):** the boot log
+renders graphically at 1280×800 (grid 160×100) AND to the serial log; typing
+`help` / `ls /` / `meminfo` into the shell shows crisp command output on the
+framebuffer.  The i386 GUI (compositor page-flip through the moved
+`fb_present.c`) was re-verified regression-free — the desktop, taskbar, clock
+and cursor compose correctly.  (Bring-up lesson: on SMP the serial-shell banner
+raced pid 0's hand-off line on the shared console — visible as cursor corruption
+on the FB; fixed by printing the hand-off line *before* spawning the shell so
+pid 0 then only idles.)
+
+**Phase L — EL0 userspace substrate (the M25 prerequisite).**  Everything so
+far ran at EL1 (the ARM analogue of ring 0).  M25 (userland foundation) needs to
+run code at EL0 in its own address space and take syscalls — the capability the
+x86 ports have had since M6/M20.5 (ring 3 + `int 0x80`).  This phase brings
+aarch64 to that same baseline:
+- **Per-process VMM (`vmm.c`).**  `mmu.c`'s coarse identity map (1 GiB blocks,
+  EL1-only) is what turns the MMU on; `vmm.c` adds page-granular, EL0-accessible
+  mappings in a private TTBR0 table.  `aarch64_vmm_create()` allocates a level-1
+  table and copies the kernel's low-4-GiB identity blocks into it (so the kernel
+  + peripherals stay reachable at EL1 in every space — the syscall handler runs
+  at EL1 with the process's TTBR0 still loaded).  `aarch64_vmm_map_user()` maps
+  4 KiB pages at VA ≥ 4 GiB (never colliding with the kernel blocks) with AP=01
+  (EL0+EL1 RW) + PXN, UXN cleared only for code.  `aarch64_vmm_switch()` loads
+  TTBR0 + `tlbi vmalle1` — the primitive M25's context_switch will call per task.
+- **EL0 entry + SVC syscall (`usermode.S` + `syscall.c`).**  `aarch64_enter_user`
+  stashes the kernel SP/LR, sets SP_EL0 + ELR_EL1 + SPSR_EL1 (=0 → EL0t, IRQs on)
+  and `eret`s to EL0.  A `svc #0` traps to the EL0 synchronous vector; `exceptions.c`
+  decodes ESR_EL1.EC == 0x15 and calls the dispatcher (x8=number, x0..x5=args,
+  return in x0; numbers shared via `syscall.h`).  SYS_EXIT teleports back to the
+  kernel via `aarch64_user_exit` (restore stashed SP/LR + `ret`), mirroring the
+  x86 SYS_EXIT trick — no TSS needed because the CPU auto-selects SP_EL1 on an
+  EL0→EL1 exception.
+- **Self-test (`usertest`).**  `aarch64_usertest()` (run at boot + as a serial-
+  shell command) creates a space, maps a code + stack page, copies in the
+  position-independent `user_stub`, drops to EL0, and the stub SYS_PRINTs then
+  SYS_EXITs.
+
+**Verified (serial):** `usertest: dropping to EL0 at 0x100000000...` →
+`hello from EL0 (aarch64 userspace)!` (printed by the EL0 program via `svc`) →
+`usertest: back at EL1 (SYS_EXIT teleport OK)`.  The x86 `ringtest` (ring 3 +
+`int 0x80`) was re-verified identical on i386 and x86_64 — **all three arches
+now run a user program and service a syscall, the baseline M25 builds on.**
+
+**Phase J + K — the framebuffer shell.c + the M22 GUI (2026-07-10).**  With a
+framebuffer present (virtio-gpu), aarch64 now runs the *same* full `shell.c` the
+x86 ports run, on a virtual console (`vc.c`), with virtio-input keyboard + mouse
+— and the `gui` command brings up the M22 desktop (compositor + taskbar + PL031
+clock + windows).  The whole GUI+shell bundle links via a handful of portability
+shims (see the change-log entry): `arch_ringtest()`, PSCI `hal_shutdown/reboot`,
+`pl031_rtc.c`, `fb_flip_*` stubs + `fb_present_flush()` in `gui.c`'s present
+path, and `virtio_input.c`.  **Lesson learned:** pid 0's idle loop must
+`hal_intr_enable()` each pass (as `cpu_idle_entry` does) — a bare `for(;;)
+hal_cpu_halt()` leaves the CPU wedged if DAIF ever masks IRQs (wfi wakes but does
+not take a masked IRQ), so its timer tick stops, it stops scheduling, and every
+task homed on that CPU (the input poll task) starves.  This was the flaky
+"renders on -smp 2 but not -smp 1 / no keyboard" symptom; the fix makes both
+deterministic.
+
+**Not yet:** USB (M15 — xHCI needs PCIe ECAM enumeration on `virt`) and EL0
+multitasking beyond the self-test.  The aarch64 build now links the framebuffer
++ VC + full GUI/shell slice on top of the earlier portable core.
+
+#### M25-readiness matrix (2026-07-10)
+
+| Capability                        | i386 | x86_64 | aarch64 |
+|-----------------------------------|:----:|:------:|:-------:|
+| User mode (ring 3 / EL0)          | ✅ M6 | ✅ M20.5 | ✅ M21-L |
+| Syscall entry (`int 0x80` / `svc`)| ✅   | ✅     | ✅ (SVC) |
+| Shared syscall table (PRINT/EXIT) | ✅   | ✅     | ✅ |
+| User-page mapping primitive       | ✅ `vmm_map(USER)` | ✅ | ✅ `aarch64_vmm_map_user` |
+| Per-process address space create  | (M25 stage 1) | (M25 stage 1) | ✅ `aarch64_vmm_create` |
+| `usertest`/`ringtest` self-test   | ✅   | ✅     | ✅ |
+
+All three architectures can enter user mode and service a syscall — **M25
+(per-process spaces, ELF loader, fd table, …) can begin on any of them.**
 
 ---
 
@@ -2327,6 +2421,59 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 ---
 
 ## 8. Change log
+
+- **2026-07-10 — M21 Phase J + K: the framebuffer shell.c + the M22 GUI on
+  ARM64 (M22 arch parity).**  The *same* full `shell.c` the x86 ports run now
+  runs on a virtual console on aarch64, and the `gui` command brings up the M22
+  desktop — compositor, taskbar, clock, windows — driven by virtio-input
+  keyboard + mouse and the virtio-gpu framebuffer.  The entire GUI+shell bundle
+  (gfx/gui/widget/apps, shell.c, vc.c, core/basic.c, config/keymap/layouts) now
+  compiles + links on aarch64; portability shims: `arch_ringtest()` (moved the
+  x86 ring-3 demo out of shell.c → `kernel/hal/x86/ringtest.c`), `hal_shutdown`/
+  `hal_reboot` via PSCI, a **PL031 RTC** (`pl031_rtc.c`) for the taskbar clock,
+  `fb_flip_*` stubs + `fb_present_flush()` in the compositor's single-buffer
+  present path (virtio-gpu scanout push), and a `virtio_input.c` driver
+  (evdev→HID→keymap→vc_kbd_push; REL/BTN→mouse listener).  **Scheduler bug
+  fixed:** pid 0's aarch64 idle loop didn't re-enable IRQs, so if DAIF ever left
+  IRQs masked the CPU stopped taking timer ticks → stopped scheduling → every
+  task homed on it (e.g. the input poll task) was starved; `for(;;){
+  hal_intr_enable(); hal_cpu_halt(); }` (matching cpu_idle_entry) fixes it on
+  both -smp 1 and -smp 2.  Verified via QEMU screendump: `help` shows the full
+  shell command set; `gui` shows the desktop + Start + live clock + mouse
+  cursor.  i386 + x86_64 GUI/ringtest re-verified regression-free.  See §4.17.
+
+- **2026-07-10 — M21 Phase L: EL0 userspace substrate on ARM64 + all-arch M25
+  readiness.**  Brings aarch64 to the x86 M6/M20.5 baseline so the userland
+  milestone (M25) can begin on all three arches.  New `kernel/hal/aarch64/`:
+  `vmm.c` (per-process TTBR0 address spaces — private L1 with the kernel's
+  low-4-GiB identity blocks copied in — + page-granular EL0 mappings, AP=01 +
+  PXN/UXN, + TTBR0 switch), `usermode.S` (`aarch64_enter_user` `eret` to EL0 +
+  the SYS_EXIT teleport + a PC-relative user stub), `syscall.c` (SVC dispatcher:
+  x8=number, x0..x5=args, shared `syscall.h` numbers; SYS_PRINT/SYS_EXIT + the
+  `usertest` self-test).  `exceptions.c` decodes ESR_EL1.EC==0x15 (SVC) on the
+  EL0 sync vector; `hal_syscall_exit_to_kernel` now delegates to the teleport.
+  Also: separate per-arch convenience scripts `scripts/build-{i386,x86_64,
+  aarch64}.sh` + `run-{i386,x86_64,aarch64}.sh` (thin wrappers over the ARCH=
+  generic scripts).  Verified: aarch64 `usertest` prints `hello from EL0` via
+  `svc` and teleports back; i386 + x86_64 `ringtest` re-verified identical.  All
+  three arches now run a user program + service a syscall.  See §4.17.
+
+- **2026-07-09 — M21 Phase I: virtio-gpu framebuffer on ARM64 (the SAME
+  fb_terminal renderer).**  QEMU `virt` has no VGA/Bochs-VBE and no linear-VRAM
+  BAR, so the display is a virtio-gpu device on a virtio-MMIO slot.  New
+  `kernel/hal/aarch64/virtio_gpu.c` runs the modern-transport handshake (reused
+  from the Phase-F blk driver), stands up a 1280×800 B8G8R8X8 2D scanout backed
+  by a contiguous RAM framebuffer, and hands it to the PORTABLE `fb_terminal.c`.
+  To reuse that 8×8-font console rather than fork it, its one x86-only part (the
+  Bochs-VBE port I/O + vmm identity map) was hoisted behind a new `fb_present.h`
+  backend: `fb_present_map` (x86: 4 MiB PSE map; ARM: no-op) + `fb_present_flush`
+  (x86: no-op; ARM: virtio-gpu `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH` of the
+  dirty rect), with the M22.6 double-buffer page flip moved verbatim from
+  `fb_terminal.c` to `kernel/hal/x86/fb_present.c` (gui.c unchanged).  Net: the
+  ARM boot log + interactive shell now render graphically, on the same renderer
+  x86 uses.  Verified via QEMU screendump on aarch64 (boot log + help/ls/meminfo
+  at 1280×800) and re-verified the i386 GUI compositor page-flip regression-free.
+  See §4.17.
 
 - **2026-07-07 — M21 Phase H: device-tree (FDT/DTB) discovery on ARM64.**
   The kernel now discovers the machine instead of hard-coding it.  `dtb.c` is

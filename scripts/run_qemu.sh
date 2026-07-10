@@ -31,13 +31,27 @@ if [ "$ARCH" = "aarch64" ]; then
     #   the board to GICv3, whose programming model is different.
     # -cpu cortex-a72: a widely-available AArch64 core with a stable feature
     #   set (matches the milestone's DoD target).
-    # -nographic: route the PL011 UART to stdin/stdout (Ctrl-A X to quit).
+    # -device virtio-gpu-device: the M21 Phase-I framebuffer.  QEMU `virt` has no
+    #   VGA/Bochs-VBE and no linear-VRAM BAR, so the display is a virtio-gpu on a
+    #   virtio-mmio slot; the kernel drives it with a 2D scanout and renders the
+    #   boot log / shell into a RAM framebuffer.  QEMU opens a graphical window
+    #   for it (the default host display).
+    # -serial mon:stdio: route the PL011 UART + the QEMU monitor to the terminal
+    #   (Ctrl-A C toggles between them, Ctrl-A X quits) now that we no longer use
+    #   -nographic (which would suppress the graphical window).
     # -smp 2: the M21 Phase-E SMP bring-up starts the secondary core via PSCI.
     #   Keep this in sync with AARCH64_MAX_CPUS in kernel/hal/aarch64/smp.c.
-    # -global virtio-mmio.force-legacy=false: the M21 Phase-F virtio-blk driver
-    #   speaks the MODERN (version 2) virtio-MMIO transport; QEMU `virt`
-    #   defaults its virtio-mmio slots to legacy (version 1), so force modern.
-    QEMU_MACHINE="-M virt,gic-version=2 -cpu cortex-a72 -smp 2 -m 256M -nographic \
+    # -global virtio-mmio.force-legacy=false: the M21 virtio-mmio drivers (blk +
+    #   gpu + input) speak the MODERN (version 2) transport; QEMU `virt` defaults
+    #   its virtio-mmio slots to legacy (version 1), so force modern.
+    # -device virtio-keyboard-device / virtio-mouse-device: the M21 Phase-J/K
+    #   input path (virtio_input.c) — keyboard → VC/shell, relative mouse → the
+    #   GUI compositor.  QEMU `virt` has no PS/2.
+    # -rtc base=localtime: PL031 RTC values match the host clock (taskbar clock).
+    QEMU_MACHINE="-M virt,gic-version=2 -cpu cortex-a72 -smp 2 -m 256M \
+        -serial mon:stdio -rtc base=localtime \
+        -device virtio-gpu-device -device virtio-keyboard-device \
+        -device virtio-mouse-device \
         -global virtio-mmio.force-legacy=false"
 
     # Attach a virtio-blk disk if build/aarch64/disk.img exists (create one with
