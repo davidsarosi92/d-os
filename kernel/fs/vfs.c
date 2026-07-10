@@ -27,6 +27,7 @@
 #include "block.h"
 #include "kmalloc.h"
 #include "printf.h"
+#include "klog.h"
 #include <stddef.h>
 
 /* ------------------------------------------------------------------- */
@@ -217,7 +218,7 @@ int vfs_mount(const char* fs_name, const char* path, const char* dev_name) {
     if (dev_name) {
         bdev = blk_find(dev_name);
         if (!bdev) {
-            kprintf("vfs_mount: block device %s not found\n", dev_name);
+            klog(KLOG_WARN, "vfs", "mount: block device %s not found\n", dev_name);
             return -5;
         }
     }

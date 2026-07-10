@@ -19,9 +19,11 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 ## Status (update when a milestone ships)
 
 ✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M21 (full ARM parity) +
-M22 – M22.7 + M27** shipped
+M22 – M22.7 + M27 + M28** shipped
 (10/11 polish sub-items; the lone outstanding one is §M20.6.1
-SYSCALL/SYSRET).  M22 + M22.1 + M22.2 (2026-07-04): GUI — gfx
+SYSCALL/SYSRET).  M28 (2026-07-10): system log — klog static ring
++ `kprintf` auto-tee + `klog(level,tag,…)` + `dmesg [-l level]` +
+`/proc/kmsg` (DOCS §4.18).  M22 + M22.1 + M22.2 (2026-07-04): GUI — gfx
 surfaces + compositor + WM core + widget toolkit + file manager,
 PS/2 mouse (IRQ12), CMOS RTC, `vfs_unlink`, 1280×800 FB; desktop
 shells + apps + command shells are REGISTRY-swappable
@@ -182,8 +184,11 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   - §M27 — ✅ SHIPPED (DOCS §4.15): init + parent/child hierarchy +
     universal reaper + kill-tree + task_spawn_detached + ps/procfs
     PPID + Task Manager tree.
-  - §M28 — System log: klog ring buffer + severity levels +
-    /proc/kmsg + `dmesg`.
+  - §M28 — ✅ SHIPPED (DOCS §4.18): klog static ring (seq + ms + printk
+    severity + tag + msg); `kprintf` auto-tees via `emit`→`klog_feed_char`;
+    `klog(level,tag,fmt,…)` structured entry; `dmesg [-l level]` +
+    `/proc/kmsg`.  (Pitfall: `va_list` is an array type on x86_64 — forward
+    it by `va_copy`, never `&`-a-parameter; see the §M28 lesson.)
   - §M29 — Services/daemons: `SERVICE()` registry + supervisor
     (autostart + restart policy) — systemd-lite, the "upward" answer
     to child-death (supervision/wait) — PLUS a **service bus**

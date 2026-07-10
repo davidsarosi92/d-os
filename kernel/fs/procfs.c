@@ -26,6 +26,7 @@
 #include "console.h"
 #include "config.h"
 #include "timer.h"
+#include "klog.h"
 #include "pmm.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -295,6 +296,26 @@ static void gen_config(struct procfs_writer* w) {
     config_for_each(cb_config, w);
 }
 
+/* M28: the klog ring, rendered dmesg-style: `[    sec.mmm] LEVEL tag: msg`.
+ * One source of truth — the `dmesg` shell command formats the same ring. */
+static void cb_kmsg(const struct klog_record* r, void* ctx) {
+    struct procfs_writer* w = (struct procfs_writer*)ctx;
+    unsigned sec = (unsigned)(r->t_ms / 1000);
+    unsigned ms  = (unsigned)(r->t_ms % 1000);
+    pw_putc(w, '[');
+    pw_put_uint(w, sec); pw_putc(w, '.');
+    if (ms < 100) pw_putc(w, '0');
+    if (ms <  10) pw_putc(w, '0');
+    pw_put_uint(w, ms);
+    pw_puts(w, "] ");
+    pw_puts(w, klog_level_name(r->level)); pw_putc(w, ' ');
+    pw_puts(w, r->tag); pw_puts(w, ": ");
+    pw_puts(w, r->msg); pw_putc(w, '\n');
+}
+static void gen_kmsg(struct procfs_writer* w) {
+    klog_for_each(cb_kmsg, w);
+}
+
 /* ---------------------------------------------------------------------- */
 /* Built-in node table — declared static so they live forever.            */
 /* ---------------------------------------------------------------------- */
@@ -307,6 +328,7 @@ static struct procfs_node nd_drivers = { .name = "drivers", .gen = gen_drivers }
 static struct procfs_node nd_console = { .name = "console", .gen = gen_console };
 static struct procfs_node nd_tasks   = { .name = "tasks",   .gen = gen_tasks   };
 static struct procfs_node nd_config  = { .name = "config",  .gen = gen_config  };
+static struct procfs_node nd_kmsg    = { .name = "kmsg",    .gen = gen_kmsg    };
 
 /* ---------------------------------------------------------------------- */
 /* Init.                                                                  */
@@ -329,6 +351,7 @@ void procfs_init(void) {
     attach_node(&nd_console);
     attach_node(&nd_tasks);
     attach_node(&nd_config);
+    attach_node(&nd_kmsg);
 
     int flushed = 0;
     while (pending_head) {
@@ -337,6 +360,6 @@ void procfs_init(void) {
         n->_next = NULL;
         if (attach_node(n) == 0) flushed++;
     }
-    kprintf("procfs: ready, /proc populated (%d external + 8 built-ins)\n",
+    kprintf("procfs: ready, /proc populated (%d external + 9 built-ins)\n",
             flushed);
 }

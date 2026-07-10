@@ -32,6 +32,7 @@
 
 #include "printf.h"
 #include "console.h"
+#include "klog.h"
 #include <stdarg.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -39,9 +40,14 @@
 /* All output goes through the console sink registry.  Each registered +
  * active sink receives every byte; this is how a single kprintf can land
  * on the framebuffer AND on the serial debug port simultaneously.  See
- * kernel/core/console.c. */
+ * kernel/core/console.c.
+ *
+ * M28: every byte is also teed into the klog ring buffer, which assembles
+ * lines and commits records on '\n'.  This is how boot + runtime kprintf
+ * output shows up in `dmesg` / `/proc/kmsg` without touching call sites. */
 static void emit(char c) {
     console_putchar(c);
+    klog_feed_char(c);
 }
 
 /* Write a non-negative decimal integer.  Build digits right-to-left into
@@ -102,9 +108,18 @@ static int64_t fetch_signed(va_list* ap, enum length_mod lm) {
     return 0;
 }
 
-void kprintf(const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
+/* va_list core.  kprintf is a thin variadic wrapper; klog() calls this
+ * directly with its own forwarded va_list so structured log lines run
+ * through the identical formatter (and thus the same console + klog tee). */
+void kvprintf(const char* fmt, va_list ap) {
+    /* Work on a private copy.  On x86_64 the SysV ABI makes `va_list` an
+     * array type, so a `va_list` *parameter* decays to a pointer — which
+     * means `&ap` would be a pointer-to-pointer, the wrong type for the
+     * `va_list*`-taking fetch_* helpers below (i386's scalar va_list hid
+     * this).  `va_copy` into a genuine local array gives `&aq` the correct
+     * pointer-to-array type on both arches.  We own `aq`, so we va_end it. */
+    va_list aq;
+    va_copy(aq, ap);
 
     for (; *fmt; fmt++) {
         if (*fmt != '%') {
@@ -128,7 +143,7 @@ void kprintf(const char* fmt, ...) {
 
         switch (*fmt) {
             case 's': {
-                const char* s = va_arg(ap, const char*);
+                const char* s = va_arg(aq, const char*);
                 if (!s) s = "(null)";
                 while (*s) emit(*s++);
                 break;
@@ -136,20 +151,20 @@ void kprintf(const char* fmt, ...) {
             case 'c':
                 /* char arg is promoted to int by the variadic ABI; any
                  * length modifier is meaningless here but harmless. */
-                emit((char)va_arg(ap, int));
+                emit((char)va_arg(aq, int));
                 break;
             case 'd':
             case 'i': {
-                int64_t v = fetch_signed(&ap, lm);
+                int64_t v = fetch_signed(&aq, lm);
                 if (v < 0) { emit('-'); put_dec((uint64_t)(-v)); }
                 else       put_dec((uint64_t)v);
                 break;
             }
             case 'u':
-                put_dec(fetch_unsigned(&ap, lm));
+                put_dec(fetch_unsigned(&aq, lm));
                 break;
             case 'x':
-                put_hex(fetch_unsigned(&ap, lm), 0);
+                put_hex(fetch_unsigned(&aq, lm), 0);
                 break;
             case 'p': {
                 /* Print pointer as 0x + uintptr_t-width hex digits so
@@ -157,7 +172,7 @@ void kprintf(const char* fmt, ...) {
                  * 8 digits, x86_64: 16 digits. */
                 emit('0');
                 emit('x');
-                uintptr_t v = (uintptr_t)va_arg(ap, void*);
+                uintptr_t v = (uintptr_t)va_arg(aq, void*);
                 put_hex((uint64_t)v, (int)(sizeof(uintptr_t) * 2));
                 break;
             }
@@ -166,7 +181,7 @@ void kprintf(const char* fmt, ...) {
                 break;
             case 0:
                 /* Trailing lone '%' — bail out cleanly. */
-                va_end(ap);
+                va_end(aq);
                 return;
             default:
                 /* Unknown specifier: echo it verbatim so bugs are visible. */
@@ -175,6 +190,13 @@ void kprintf(const char* fmt, ...) {
                 break;
         }
     }
+    va_end(aq);
+}
 
+/* Variadic wrapper — owns the va_list, delegates the work to kvprintf. */
+void kprintf(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    kvprintf(fmt, ap);
     va_end(ap);
 }

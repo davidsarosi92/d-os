@@ -8,6 +8,13 @@
 #ifndef PRINTF_H
 #define PRINTF_H
 
+#include <stdarg.h>
+
 void kprintf(const char* fmt, ...);
+
+/* va_list form of kprintf — same formatting + console/klog teeing.
+ * Used by klog() (klog.c) so structured log lines format through the
+ * one and only formatter. */
+void kvprintf(const char* fmt, va_list ap);
 
 #endif

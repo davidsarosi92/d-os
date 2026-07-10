@@ -1091,6 +1091,7 @@ each task its own VMM context.
 | `/proc/console`  | console_sink registry with active flag         |
 | `/proc/tasks`    | task list with pid/state/name                  |
 | `/proc/config`   | full key/value cache                           |
+| `/proc/kmsg`     | klog ring, `[  sec.mmm] LEVEL tag: msg` (M28)  |
 
 - **New iterators added for procfs's sake:**
   - `console_for_each(fn, ctx)` in `console.c`
@@ -2358,6 +2359,70 @@ All three architectures can enter user mode and service a syscall — **M25
 
 ---
 
+### 4.18 System log — klog ring buffer + dmesg (`kernel/core/klog.c`, M28)
+
+**What it is.**  A structured, in-memory kernel log with severity levels,
+source tags, and history — the thing you review after a boot with `dmesg`.
+Before M28 every diagnostic went straight out through `kprintf` to the
+console sinks (serial + framebuffer) with no levels, no tags, and no
+history: once a line scrolled off it was gone.
+
+**Ring.**  `klog.c` owns a *static* array of 512 `struct klog_record`
+(`seq`, boot-relative `t_ms`, `level`, `tag[16]`, `msg[200]`).  Static so
+it works from the very first boot `kprintf`, long before the heap exists;
+circular so it self-trims.  Timestamps are monotonic ms since boot
+(`timer_ticks_ms`), rendered dmesg-style as `[  sec.mmm]`.  (Absolute
+CMOS-RTC wall-clock stamping is a noted follow-up, not needed for v1.)
+
+**Two ways in.**
+- **Automatic tee.**  `printf.c`'s `emit()` calls `klog_feed_char` for
+  every output byte.  That assembles a line in a staging buffer and, on
+  the terminating `\n`, commits a record.  So *all* existing `kprintf`
+  output is captured with zero call-site changes, at the default level
+  `KLOG_INFO` / tag `"kernel"`.  Blank lines are skipped.
+- **Structured.**  `klog(level, tag, fmt, …)` sets the pending level+tag,
+  then formats through the *same* `kvprintf` machinery (so the message
+  still reaches the console), and the trailing `\n` commits the record
+  with that severity + tag.  Levels are printk/syslog-ordered
+  (`KLOG_EMERG`=0 … `KLOG_DEBUG`=7; smaller = more severe).
+
+**Read paths.**  `klog_for_each(fn, ctx)` snapshots the live range and
+replays each record oldest→newest, copying one slot at a time under the
+ring lock and calling `fn` with the lock *released* (so a callback may
+re-enter `kprintf`→klog without deadlocking).  Two consumers:
+- `dmesg [-l <level>]` (shell) — renders `[  sec.mmm] LEVEL tag: msg`,
+  filtering to records at least as severe as the threshold (level name
+  `emerg…debug` or digit `0…7`).  It renders via `console_*` **not**
+  `kprintf` on purpose — printing the log through the tee would append
+  every rendered line back into the ring and evict the boot messages.
+- `/proc/kmsg` (procfs) — the same rendering as a readable file.
+
+**Concurrency.**  Lock-light and SMP-safe at *record* granularity: the
+commit (slot write + seq bump) and the read (slot copy-out) run under one
+spinlock.  The staging buffer + pending level/tag are single-writer state
+carrying the same non-reentrancy caveat `kprintf` already documents —
+concurrent emitters can interleave a line exactly as they can already
+interleave console output.
+
+**Portability.**  Entirely arch-independent core; links on all three
+arches (`klog.c` in every `CORE_C_SRCS`).  `dmesg` works wherever `shell.c`
+links (incl. aarch64); `/proc/kmsg` appears wherever procfs links
+(i386/x86_64 — aarch64 has no procfs yet).
+
+**Pitfall (recorded for posterity).**  Extracting a `kvprintf(const char*,
+va_list)` core out of `kprintf` corrupted *all* formatted output on
+x86_64 while i386 stayed fine.  Cause: the x86_64 SysV ABI makes `va_list`
+an *array* type, so a `va_list` **parameter** decays to a pointer — making
+`&ap` a pointer-to-pointer, the wrong type for the `va_list*`-taking
+`fetch_signed`/`fetch_unsigned` helpers.  i386's scalar `va_list` has no
+such decay, so it masked the bug.  Fix: `va_copy` the incoming list into a
+genuine local array and format off that (`&aq` is then correctly a
+pointer-to-array on both arches).  Lesson: any helper that forwards a
+`va_list` by pointer must own a real `va_list` local (via `va_copy`), never
+take the address of a `va_list` parameter.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -2427,6 +2492,29 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 ---
 
 ## 8. Change log
+
+- **2026-07-10 — M28: system log (klog ring buffer + `dmesg` + `/proc/kmsg`).**
+  The kernel gained a structured, reviewable log.  New `kernel/core/klog.c`: a
+  static 512-record ring (usable from the very first boot kprintf — no heap),
+  each record carrying a monotonic seq, a boot-relative ms timestamp, a
+  printk-style severity (EMERG…DEBUG), a short source tag, and the message.
+  `printf.c`'s `emit()` **tees every byte** into `klog_feed_char`, which
+  assembles lines and commits a record on `\n` — so all existing `kprintf`
+  boot/runtime output is captured automatically (level INFO, tag "kernel") with
+  zero call-site churn.  The richer `klog(level, tag, fmt, …)` stamps a record's
+  severity + tag while still reaching the console.  Read paths: the `dmesg
+  [-l <level>]` shell command (renders `[  sec.mmm] LEVEL tag: msg`, filters by
+  severity) and a `/proc/kmsg` procfs node (same format).  Two genuine boot
+  lines were reclassified to exercise the structured path (`config` missing →
+  NOTICE, `vfs` no-vda → WARN).  **Pitfall fixed en route:** extracting a
+  `kvprintf(fmt, va_list)` core out of `kprintf` silently corrupted *all*
+  formatted output on **x86_64** — the SysV ABI makes `va_list` an array type,
+  so a `va_list` parameter decays to a pointer and `&ap` became a
+  pointer-to-pointer (wrong type for the `va_list*`-taking `fetch_*` helpers);
+  i386's scalar `va_list` masked it.  Fix: `va_copy` into a genuine local array
+  and format off that.  Verified on i386 **and** x86_64: full levelled boot log
+  via `dmesg`, `dmesg -l warn` shows only the WARN line (NOTICE/INFO filtered),
+  `cat /proc/kmsg` renders the ring, no boot regression.  See §4.18.
 
 - **2026-07-10 — M21 Phase M: USB (xHCI + USB HID) on ARM64 — full x86 feature
   parity.**  QEMU `virt` exposes USB as an xHCI controller on its PCIe host

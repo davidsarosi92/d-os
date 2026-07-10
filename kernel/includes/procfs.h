@@ -57,8 +57,8 @@ struct procfs_node {
 int  procfs_register(struct procfs_node* n);
 
 /* Resolves /proc, attaches all built-in nodes (version, uptime,
- * meminfo, modules, drivers, console, tasks, config), then flushes the
- * pre-init queue.  Must run after the FS is up. */
+ * meminfo, modules, drivers, console, tasks, config, kmsg), then flushes
+ * the pre-init queue.  Must run after the FS is up. */
 void procfs_init(void);
 
 #endif

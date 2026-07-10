@@ -36,6 +36,7 @@
 #include "gui_app.h"
 #include "shell_provider.h"
 #include "basic.h"
+#include "klog.h"
 
 #define LINE_MAX        128             /* max accepted bytes per command line */
 #define DEFAULT_PROMPT  "d-os> "        /* fallback when config is unavailable */
@@ -104,6 +105,7 @@ static void cmd_help(void) {
     console_write("commands:\n"
                   "  help, clear, echo <text>, about, uptime\n"
                   "  meminfo, lsmod, lsdrv, lsconsole, lsblk, blktest, bctest\n"
+                  "  dmesg [-l <level>] (kernel log)\n"
                   "  ls <path>, cat <path>, mkdir <path>, touch <path>,\n"
                   "  write <path> <text>, mount <fs> <path> [dev]\n"
                   "  config, getconf <key>, setconf <key> <value>, saveconf\n"
@@ -771,6 +773,66 @@ static void cmd_about(void) {
     console_write("d-os — toy x86 kernel. multiboot1, polled PS/2, VGA text mode.\n");
 }
 
+/* M28 — dmesg: dump the klog ring, oldest → newest.  We render straight
+ * to the console (NOT via kprintf) on purpose: kprintf tees into klog, so
+ * printing the log with it would append every rendered line back into the
+ * ring and evict the very boot messages we came to read. */
+static void dmesg_put_uint(unsigned v) {
+    char b[12];
+    int n = 0;
+    if (v == 0) { console_putchar('0'); return; }
+    while (v) { b[n++] = (char)('0' + (v % 10)); v /= 10; }
+    while (n--) console_putchar(b[n]);
+}
+
+struct dmesg_ctx { int max_level; };
+
+static void dmesg_line(const struct klog_record* r, void* ctx) {
+    struct dmesg_ctx* d = (struct dmesg_ctx*)ctx;
+    if ((int)r->level > d->max_level) return;          /* severity filter */
+    unsigned sec = (unsigned)(r->t_ms / 1000);
+    unsigned ms  = (unsigned)(r->t_ms % 1000);
+    console_putchar('[');
+    dmesg_put_uint(sec); console_putchar('.');
+    if (ms < 100) console_putchar('0');
+    if (ms <  10) console_putchar('0');
+    dmesg_put_uint(ms);
+    console_write("] ");
+    console_write(klog_level_name(r->level)); console_putchar(' ');
+    console_write(r->tag); console_write(": ");
+    console_write(r->msg); console_putchar('\n');
+}
+
+/* Accept a level as a name (emerg..debug) or a digit (0..7). -1 = bad. */
+static int dmesg_parse_level(const char* s) {
+    static const char* const names[KLOG_NLEVELS] = {
+        "emerg", "alert", "crit", "err", "warn", "notice", "info", "debug"
+    };
+    if (s[0] >= '0' && s[0] <= '7' && s[1] == '\0') return s[0] - '0';
+    for (int i = 0; i < KLOG_NLEVELS; i++)
+        if (streq(s, names[i])) return i;
+    return -1;
+}
+
+static void cmd_dmesg(const char* args) {
+    struct dmesg_ctx d = { .max_level = KLOG_DEBUG };  /* show everything */
+    if (args && *args) {
+        if (starts_with(args, "-l ")) {
+            int lv = dmesg_parse_level(args + 3);
+            if (lv < 0) {
+                kprintf("dmesg: unknown level '%s' (emerg..debug or 0..7)\n",
+                        args + 3);
+                return;
+            }
+            d.max_level = lv;                          /* show <= this severity */
+        } else {
+            kprintf("usage: dmesg [-l <level>]   level: emerg..debug or 0..7\n");
+            return;
+        }
+    }
+    klog_for_each(dmesg_line, &d);
+}
+
 /* Dispatch a parsed line.  Each branch handles its own echo / newline —
  * there is no implicit trailing newline so commands like `echo` with no
  * argument can control output precisely.
@@ -796,6 +858,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "lsdrv"))  { driver_list();    return; }
     if (streq(line, "lsconsole")) { console_list(); return; }
     if (streq(line, "uptime")) { cmd_uptime();      return; }
+    if (streq(line, "dmesg"))         { cmd_dmesg("");         return; }
+    if (starts_with(line, "dmesg "))  { cmd_dmesg(line + 6);   return; }
 
     /* Filesystem commands — single-token first, then prefix matches. */
     if (streq(line, "ls"))     { cmd_ls("/");       return; }
