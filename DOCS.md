@@ -2692,6 +2692,57 @@ crontabs, at/batch one-shots, last-run persistence across reboot.
 
 ---
 
+### 4.24 Concurrent user processes + full-arch libc (Tier B — M25 tail)
+
+**What it is.**  The deferred tail of M25: an ELF now runs as an *independent,
+preemptible* user process on its own task — several at once, each in its own
+address space, each exiting on its own — instead of the single synchronous
+"excursion" on the caller's task.  Plus the in-tree libc now builds for all
+three arches.
+
+**Per-task privilege-transition stack.**  When a ring-3/EL0 task takes a
+syscall or interrupt the CPU switches to a kernel stack: TSS.esp0/rsp0 on x86,
+SP_EL1 on aarch64.  With multiple user tasks preemptible at once that stack must
+be *per-task*.  The scheduler sets it on every switch-in via a new
+`hal_set_kernel_stack(top)` hook: `top = task's kstack top` for an independent
+user task, `top = 0` (arch default fixed syscall stack) for kernel threads and
+the excursion-model self-tests.  **aarch64** needs no work here — SP_EL1 is the
+ordinary EL1 stack pointer that `context_switch` already saves/restores per
+task, so it tracks automatically; the hook is a no-op there.
+
+**User task lifecycle (`proc_spawn`, proc.c).**  `proc_spawn(name, image, len)`
+loads the ELF into a fresh space, maps a user stack, and spawns a task whose
+bootstrap binds the space, marks itself `user_task` (routing ring-3→ring-0 to
+its own kstack + making SYS_EXIT terminal), and drops **one-way** to ring 3/EL0
+via `enter_user_mode` (a no-save variant of the excursion's
+`enter_user_mode_wrap`/`aarch64_enter_user`).  `SYS_EXIT` for a user task closes
+its fds and `task_exit`s; init reaps it and `task_reap` frees its address space
+(safe there — the space is loaded on no CPU).  The excursion model
+(`proc_exec_elf`, teleport-back on the fixed syscall stack) is kept intact for
+the `userrun`/`libctest` self-tests, distinguished by the `user_task` flag.
+
+**Full-arch libc (`user/`).**  `libc.c`'s single arch-conditional `syscall3`
+(x86 `int 0x80`, aarch64 `svc #0`) + a per-arch `crt0` (`crt0.s` / `crt0_x86_64.s`
+/ `crt0_aarch64.S`, each calling `main` then `SYS_EXIT` with the return code) let
+the *same* `hello.c` / `spin.c` compile for i386 / x86_64 / aarch64.  The Makefile
+gained per-arch USER_* knobs (compile flags, link emulation + base — 1 GiB on
+x86, 4 GiB on aarch64 — and blob objcopy targets); each program links as a static
+ELF at the arch's user base and is wrapped as a binary blob with per-arch symbols
+(`_binary_user_<prog>_<arch>_elf_*`), which shell.c selects at runtime.  New
+syscall: `SYS_GETPID`.
+
+**Self-tests.**  `procspawn` launches two copies of `spin` (a getpid + print/burn
+loop) as independent user processes; their line-interleaved output + independent
+reaps prove concurrent, scheduler-time-sliced ring-3/EL0 processes.  `libctest`
+runs the compiled-C `hello` in ring 3/EL0.  Both green on **i386 + x86_64 +
+aarch64** (libc now all three, not just i386).
+
+**Still deferred:** force-killing a *wedged* ring-3 task (needs the M25/§M33
+isolation guarantees — a pure-ring3 loop never reaches a cooperative-kill yield
+point); argv/env/argc; demand paging / COW fork.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -2762,6 +2813,19 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-10 — Tier B: concurrent user processes + full-arch libc (M25
+  tail).**  An ELF now runs as an independent, preemptible user process
+  (`proc_spawn`) on its own task — several at once, each in its own address
+  space, each ending via SYS_EXIT → task_exit (init reaps + frees the space) —
+  not just the single synchronous excursion.  Per-task ring-3→ring-0 stack via a
+  new `hal_set_kernel_stack` hook the scheduler drives (TSS.esp0/rsp0 on x86;
+  no-op on aarch64 where SP_EL1 tracks via context_switch); a one-way
+  `enter_user_mode`; a `user_task` flag distinguishing user tasks from the
+  kept excursion self-tests.  The in-tree libc now builds for all three arches
+  (arch-conditional `syscall3` + per-arch `crt0` + per-arch Makefile USER_*
+  knobs + per-arch blob symbols); new `SYS_GETPID`.  `procspawn` (two
+  interleaving `spin` processes) + `libctest` (compiled-C `hello` in ring 3/EL0)
+  green on i386 / x86_64 / aarch64.  See §4.24.
 - **2026-07-10 — M30: cron (time-based scheduling).**  The first real service
   (`cron.c`): cron is itself an M29 service (autostart, restart=always), loops
   on `task_msleep`, and spawns each due `CRON_JOB(name, fn, every_ms)` as a

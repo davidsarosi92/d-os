@@ -13,8 +13,8 @@ extern main
 
 _start:
     call main
-    mov  eax, 1                 ; SYS_EXIT
-    mov  ebx, 0                 ; (exit code — the kernel ignores it today)
+    mov  ebx, eax              ; exit code = main's return (SYS_EXIT reads EBX)
+    mov  eax, 1                ; SYS_EXIT
     int  0x80
 .hang:
     jmp  .hang                  ; unreachable

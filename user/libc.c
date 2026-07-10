@@ -15,13 +15,30 @@
 #define SYS_OPEN   4
 #define SYS_CLOSE  5
 #define SYS_MMAP   7
+#define SYS_GETPID 13
 
+/* One syscall path, three arches.  x86 (i386 + x86_64) trap via `int 0x80`
+ * (rax/eax = number, rbx/ecx/edx = args); aarch64 traps via `svc #0` with the
+ * kernel's x8 = number, x0..x2 = args ABI.  The kernel dispatchers read exactly
+ * these registers. */
 static long syscall3(long n, long a, long b, long c) {
     long r;
+#if defined(__aarch64__)
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    __asm__ volatile ("svc #0"
+                      : "+r"(x0)
+                      : "r"(x8), "r"(x1), "r"(x2)
+                      : "memory");
+    r = x0;
+#else   /* i386 + x86_64: int 0x80, num in (r/e)ax, args in (r/e)bx/cx/dx */
     __asm__ volatile ("int $0x80"
                       : "=a"(r)
                       : "a"(n), "b"(a), "c"(b), "d"(c)
                       : "memory");
+#endif
     return r;
 }
 
@@ -32,6 +49,7 @@ int   close(int fd)                            { return (int)syscall3(SYS_CLOSE,
 void  exit (int code)                          { syscall3(SYS_EXIT, code, 0, 0); for (;;) {} }
 void* mmap (size_t len, int fd)                { long r = syscall3(SYS_MMAP, (long)len, fd, 0);
                                                  return (r <= 0) ? (void*)0 : (void*)r; }
+int   getpid(void)                             { return (int)syscall3(SYS_GETPID, 0, 0, 0); }
 
 size_t strlen(const char* s) { size_t i = 0; while (s[i]) i++; return i; }
 

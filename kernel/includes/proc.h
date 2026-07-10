@@ -24,4 +24,11 @@
  * negative code if loading / setup failed. */
 int proc_exec_elf(const void* image, size_t len);
 
+/* Tier B — spawn `image` as an INDEPENDENT, preemptible user process on its own
+ * task, named `name`.  Returns immediately with the new task's pid (or negative
+ * on failure); the program runs concurrently at ring 3/EL0 until it SYS_EXITs
+ * (→ task_exit), and init reaps it (freeing its address space).  Several may
+ * run at once.  The caller can task_wait(pid) to await completion. */
+int proc_spawn(const char* name, const void* image, size_t len);
+
 #endif

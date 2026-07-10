@@ -21,6 +21,14 @@
 
 void enter_user_mode_wrap(uintptr_t user_ip, uintptr_t user_sp);
 
+/* Tier B — ONE-WAY drop to ring 3 / EL0 for an independent user process.
+ * Unlike enter_user_mode_wrap it saves no kernel resume context: the calling
+ * user-task bootstrap never returns; the task re-enters the kernel only via
+ * syscalls/IRQs (on its own per-task kernel stack) and ends via task_exit at
+ * SYS_EXIT.  Each arch implements it (x86: usermode.s; aarch64: usermode.S). */
+void enter_user_mode(uintptr_t user_ip, uintptr_t user_sp)
+    __attribute__((noreturn));
+
 /* Arch-portable ring-3/EL0 self-test — the `ringtest` shell command.  Each
  * arch implements it (x86: kernel/hal/x86/ringtest.c hand-codes an i386 ring-3
  * program; aarch64: kernel/hal/aarch64/syscall.c drops to EL0).  Returns 0 on

@@ -66,7 +66,16 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/usermode.s \
       kernel/hal/x86/switch.s
 
-  ARCH_EXTRA_OBJS := kernel/hal/x86/ap_trampoline_blob.o user/hello_blob.o
+  ARCH_EXTRA_OBJS := kernel/hal/x86/ap_trampoline_blob.o user/hello_blob.o \
+                     user/spin_blob.o
+
+  # Tier B — in-tree user libc build knobs (i386 reference).
+  USER_CFLAGS   := -m32 -ffreestanding -fno-pie -fno-stack-protector \
+                   -fno-builtin -nostdlib -Os -Wall -std=c11 -Iuser
+  USER_LDEMU    := -m elf_i386
+  USER_BASE     := 0x40000000
+  USER_OCARGS   := --output-target=elf32-i386 --binary-architecture=i386
+  USER_CRT0_BUILD = nasm -f elf32 user/crt0.s -o $(OBJ_DIR)/user/crt0.o
 
 else ifeq ($(ARCH),x86_64)
   # mcmodel=large: kernel can be linked anywhere in 64-bit address space.
@@ -119,7 +128,18 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/switch.s \
       kernel/hal/x86_64/usermode.s
 
-  ARCH_EXTRA_OBJS := kernel/hal/x86_64/ap_trampoline_blob.o
+  ARCH_EXTRA_OBJS := kernel/hal/x86_64/ap_trampoline_blob.o \
+                     user/hello_blob.o user/spin_blob.o
+
+  # Tier B — in-tree user libc build knobs (x86_64).  -mno-sse* because the
+  # kernel does not init/save FPU/XMM state for user tasks.
+  USER_CFLAGS   := -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mno-sse3 \
+                   -ffreestanding -fno-pie -fno-stack-protector -fno-builtin \
+                   -nostdlib -Os -Wall -std=c11 -Iuser
+  USER_LDEMU    := -m elf_x86_64
+  USER_BASE     := 0x40000000
+  USER_OCARGS   := --output-target=elf64-x86-64 --binary-architecture=i386
+  USER_CRT0_BUILD = nasm -f elf64 user/crt0_x86_64.s -o $(OBJ_DIR)/user/crt0.o
 
 else ifeq ($(ARCH),aarch64)
   # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
@@ -180,7 +200,18 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/smp_entry.S \
       kernel/hal/aarch64/usermode.S
 
-  ARCH_EXTRA_OBJS :=
+  ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o
+
+  # Tier B — in-tree user libc build knobs (aarch64).  Uses the cross toolchain
+  # ($(CC)/$(LD)/$(CROSS)objcopy); user base is 4 GiB (above the identity map).
+  USER_CFLAGS   := -mgeneral-regs-only -ffreestanding -fno-pie \
+                   -fno-stack-protector -fno-builtin -nostdlib -Os -Wall \
+                   -std=c11 -Iuser
+  USER_LDEMU    :=
+  USER_BASE     := 0x100000000
+  USER_OCARGS   := --output-target=elf64-littleaarch64 --binary-architecture=aarch64
+  USER_OBJCOPY  := $(CROSS)objcopy
+  USER_CRT0_BUILD = $(CC) $(USER_CFLAGS) -c user/crt0_aarch64.S -o $(OBJ_DIR)/user/crt0.o
 
 else
   $(error Unsupported ARCH "$(ARCH)" — supported: i386, x86_64, aarch64)
@@ -471,26 +502,39 @@ $(OBJ_DIR)/kernel/hal/x86_64/ap_trampoline_blob.o: kernel/hal/x86_64/ap_trampoli
 	         --binary-architecture=i386:x86-64 \
 	         $< $@
 
-# M25 stage 7 — in-tree user libc + a compiled-C test program (user/hello.c),
-# linked as a static ELF at the user base (0x40000000) and wrapped as a binary
-# blob the kernel loads via proc_exec_elf.  i386 reference port; other arches
-# reuse the same C once their crt0 + user link land.  OMAGIC (-N) keeps it to
-# one RWX PT_LOAD segment, which elf.c's loader maps directly.
-USER_CFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -fno-builtin \
-               -nostdlib -Os -Wall -std=c11 -Iuser
+# M25 stage 7 + Tier B — in-tree user libc + compiled-C programs (hello, spin),
+# built PER ARCH from the USER_* knobs set in the ifeq block above: crt0
+# ($(USER_CRT0_BUILD)), compile flags ($(USER_CFLAGS)), link emulation
+# ($(USER_LDEMU)) + base ($(USER_BASE)), and blob objcopy target ($(USER_OCARGS)
+# via $(USER_OBJCOPY)).  Each program links as a static ELF at USER_BASE with
+# OMAGIC (-N) → one RWX PT_LOAD the elf.c loader maps directly, then is wrapped
+# as a binary blob.  Per-arch ELF names (user/<prog>_$(ARCH).elf) yield per-arch
+# blob symbols (_binary_user_<prog>_<arch>_elf_*); shell.c picks the live one.
+USER_OBJCOPY ?= objcopy
 
-user/hello_i386.elf: user/crt0.s user/libc.c user/hello.c
+user/hello_$(ARCH).elf: user/libc.c user/hello.c user/libc.h
 	@mkdir -p $(OBJ_DIR)/user
-	nasm -f elf32 user/crt0.s -o $(OBJ_DIR)/user/crt0.o
+	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c  -o $(OBJ_DIR)/user/libc.o
 	$(CC) $(USER_CFLAGS) -c user/hello.c -o $(OBJ_DIR)/user/hello.o
-	$(LD) -m elf_i386 -N -Ttext 0x40000000 -e _start -o $@ \
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/hello.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/hello_blob.o: user/hello_i386.elf
+$(OBJ_DIR)/user/hello_blob.o: user/hello_$(ARCH).elf
 	@mkdir -p $(@D)
-	objcopy --input-target=binary --output-target=elf32-i386 \
-	         --binary-architecture=i386 $< $@
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+user/spin_$(ARCH).elf: user/libc.c user/spin.c user/libc.h
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/spin.c -o $(OBJ_DIR)/user/spin.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/spin.o $(OBJ_DIR)/user/libc.o
+
+$(OBJ_DIR)/user/spin_blob.o: user/spin_$(ARCH).elf
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)

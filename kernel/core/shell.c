@@ -1138,20 +1138,68 @@ static void cmd_cron(const char* args) {
  * blob (user/hello.c → static ELF → objcopy).  Weak symbols so the command
  * still links on arches that don't embed the blob yet (i386 is the reference
  * port today). */
-extern const unsigned char _binary_user_hello_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_hello_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_hello_i386_elf_start[]    __attribute__((weak));
+extern const unsigned char _binary_user_hello_i386_elf_end[]      __attribute__((weak));
+extern const unsigned char _binary_user_hello_x86_64_elf_start[]  __attribute__((weak));
+extern const unsigned char _binary_user_hello_x86_64_elf_end[]    __attribute__((weak));
+extern const unsigned char _binary_user_hello_aarch64_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_hello_aarch64_elf_end[]   __attribute__((weak));
+
+static const unsigned char* hello_blob(size_t* len) {
+    const unsigned char *s = 0, *e = 0;
+    if (_binary_user_hello_i386_elf_start)    { s = _binary_user_hello_i386_elf_start;    e = _binary_user_hello_i386_elf_end; }
+    else if (_binary_user_hello_x86_64_elf_start)  { s = _binary_user_hello_x86_64_elf_start;  e = _binary_user_hello_x86_64_elf_end; }
+    else if (_binary_user_hello_aarch64_elf_start) { s = _binary_user_hello_aarch64_elf_start; e = _binary_user_hello_aarch64_elf_end; }
+    if (!s || !e) return 0;
+    *len = (size_t)(e - s);
+    return s;
+}
 
 static void cmd_libctest(void) {
-    const unsigned char* start = _binary_user_hello_i386_elf_start;
-    const unsigned char* end   = _binary_user_hello_i386_elf_end;
-    if (!start || !end) {
-        console_write("libctest: no user ELF embedded for this arch (i386 only today)\n");
+    size_t len = 0;
+    const unsigned char* start = hello_blob(&len);
+    if (!start) {
+        console_write("libctest: no user ELF embedded for this arch\n");
         return;
     }
-    size_t len = (size_t)(end - start);
     console_write("libctest: exec'ing compiled-C user ELF (in-tree libc)...\n");
     int rc = proc_exec_elf(start, len);
     kprintf("libctest: returned (rc=%d, %u bytes)\n", rc, (unsigned)len);
+}
+
+/* Tier B — `procspawn`: launch TWO copies of the spin demo as independent,
+ * preemptible user processes; their interleaved output proves concurrent
+ * ring-3 tasks time-sliced by the scheduler, each exiting on its own SYS_EXIT. */
+extern const unsigned char _binary_user_spin_i386_elf_start[]    __attribute__((weak));
+extern const unsigned char _binary_user_spin_i386_elf_end[]      __attribute__((weak));
+extern const unsigned char _binary_user_spin_x86_64_elf_start[]  __attribute__((weak));
+extern const unsigned char _binary_user_spin_x86_64_elf_end[]    __attribute__((weak));
+extern const unsigned char _binary_user_spin_aarch64_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_spin_aarch64_elf_end[]   __attribute__((weak));
+
+/* Pick this arch's embedded spin blob (only one arch's is linked into the
+ * image; the other weak symbols resolve to NULL). */
+static const unsigned char* spin_blob(size_t* len) {
+    const unsigned char *s = 0, *e = 0;
+    if (_binary_user_spin_i386_elf_start)    { s = _binary_user_spin_i386_elf_start;    e = _binary_user_spin_i386_elf_end; }
+    else if (_binary_user_spin_x86_64_elf_start)  { s = _binary_user_spin_x86_64_elf_start;  e = _binary_user_spin_x86_64_elf_end; }
+    else if (_binary_user_spin_aarch64_elf_start) { s = _binary_user_spin_aarch64_elf_start; e = _binary_user_spin_aarch64_elf_end; }
+    if (!s || !e) return 0;
+    *len = (size_t)(e - s);
+    return s;
+}
+
+static void cmd_procspawn(void) {
+    size_t len = 0;
+    const unsigned char* start = spin_blob(&len);
+    if (!start) {
+        console_write("procspawn: no spin ELF embedded for this arch\n");
+        return;
+    }
+    int a = proc_spawn("spin-a", start, len);
+    int b = proc_spawn("spin-b", start, len);
+    kprintf("procspawn: launched two user processes (pids %d, %d) — watch them interleave\n",
+            a, b);
 }
 
 /* -------------------------------------------------------------------- */
@@ -1308,6 +1356,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "socktest"))       { cmd_socktest(); return; }
     if (streq(line, "polltest"))       { cmd_polltest(); return; }
     if (streq(line, "libctest"))       { cmd_libctest(); return; }
+    if (streq(line, "procspawn"))      { cmd_procspawn(); return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }

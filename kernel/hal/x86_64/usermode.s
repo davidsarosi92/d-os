@@ -25,6 +25,7 @@ bits 64
 section .text
 
 global enter_user_mode_wrap
+global enter_user_mode
 global saved_rsp
 global saved_rip
 
@@ -85,3 +86,17 @@ enter_user_mode_wrap:
     pop rbp
     pop rbx
     ret
+
+; -----------------------------------------------------------------------------
+; void enter_user_mode(uintptr_t user_rip, uintptr_t user_rsp);  — Tier B, ONE-WAY.
+;   System V AMD64: rdi = user_rip, rsi = user_rsp.  Saves no resume context;
+;   the user-task bootstrap never returns (ends via SYS_EXIT → task_exit).
+; -----------------------------------------------------------------------------
+enter_user_mode:
+    push qword 0x23                    ; SS3  (user DS, RPL 3)
+    push rsi                           ; RSP3 (user stack)
+    pushfq                             ; RFLAGS
+    or qword [rsp], 0x200              ; IF=1 so timer IRQs preempt ring 3
+    push qword 0x1B                    ; CS3  (user code, RPL 3)
+    push rdi                           ; RIP3 (user entry)
+    iretq                              ; → ring 3, never returns here

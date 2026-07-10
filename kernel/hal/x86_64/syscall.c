@@ -36,6 +36,7 @@
 #include "console.h"
 #include "printf.h"
 #include "hal_api.h"
+#include "task.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -60,14 +61,22 @@ void syscall_dispatch(struct int_frame* f) {
         }
 
         case SYS_EXIT: {
-            /* Restore the kernel SP / PC saved by usermode.s and resume
-             * there.  Bypasses the iretq-back-to-ring-3 path; the
-             * interrupt frame on the (syscall) stack is abandoned, and
-             * the next ring-3 → ring-0 transition will start fresh
-             * from TSS.RSP0.  Noreturn. */
+            /* Tier B — an independent user task ends for good: close fds (still
+             * current) + task_exit(); init reaps it (frees its address space). */
+            struct task* cur = task_current();
+            if (cur && cur->user_task) {
+                fd_close_all();
+                task_exit_code((int)f->rbx);
+            }
+            /* Excursion-model self-tests: teleport back to enter_user_mode_wrap's
+             * saved kernel context. */
             hal_syscall_exit_to_kernel((uintptr_t)saved_rsp,
                                        (uintptr_t)saved_rip);
         }
+
+        case SYS_GETPID:
+            f->rax = (uint64_t)(task_current() ? task_current()->pid : -1);
+            return;
 
         /* M25 stage 3 — fd syscalls.  RBX/RCX/RDX = arg0/arg1/arg2. */
         case SYS_WRITE:

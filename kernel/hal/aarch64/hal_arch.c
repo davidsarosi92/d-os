@@ -112,3 +112,12 @@ void hal_syscall_exit_to_kernel(uintptr_t saved_sp, uintptr_t saved_pc) {
     aarch64_user_exit();                 /* does not return */
     __builtin_unreachable();
 }
+
+/* Tier B — per-task ring-3/EL0 → kernel stack.  On aarch64 the exception-entry
+ * stack is SP_EL1, the ordinary EL1 stack pointer that context_switch already
+ * saves/restores per task, so it tracks the current task automatically — no TSS
+ * equivalent to set.  This hook is therefore a no-op here (it exists for x86,
+ * which needs TSS.esp0/rsp0 written on every switch-in). */
+void hal_set_kernel_stack(uintptr_t top) {
+    (void)top;
+}

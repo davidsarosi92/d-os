@@ -21,6 +21,7 @@
 #include "printf.h"
 #include "pmm.h"
 #include "usermode.h"
+#include "task.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -53,9 +54,23 @@ void aarch64_syscall(struct trapframe* tf) {
             tf->x[0] = 0;               /* return value */
             break;
         }
-        case SYS_EXIT:
-            aarch64_user_exit();        /* does not return */
+        case SYS_EXIT: {
+            /* Tier B — an independent user task ends for good: close fds (still
+             * current) + task_exit(); init reaps it (frees its address space).
+             * SP_EL1 is this task's own kernel stack, so no TSS-equivalent
+             * plumbing is needed — context_switch already tracks it. */
+            struct task* cur = task_current();
+            if (cur && cur->user_task) {
+                fd_close_all();
+                task_exit_code((int)tf->x[0]);
+            }
+            aarch64_user_exit();        /* excursion self-tests: teleport back */
             break;                      /* unreachable */
+        }
+
+        case SYS_GETPID:
+            tf->x[0] = (uint64_t)(task_current() ? task_current()->pid : -1);
+            break;
 
         /* M25 stage 3 — fd syscalls.  x0/x1/x2 = arg0/arg1/arg2. */
         case SYS_WRITE:

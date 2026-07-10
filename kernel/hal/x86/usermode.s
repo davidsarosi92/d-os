@@ -28,6 +28,7 @@ bits 32
 section .text
 
 global enter_user_mode_wrap
+global enter_user_mode
 global saved_esp
 global saved_eip
 
@@ -83,3 +84,34 @@ enter_user_mode_wrap:
 
     popad
     ret
+
+; -----------------------------------------------------------------------------
+; void enter_user_mode(uint32_t eip, uint32_t esp);  — Tier B, ONE-WAY.
+;
+; The concurrent-user-process entry: unlike enter_user_mode_wrap it saves NO
+; kernel resume context — the caller (a user-task bootstrap) never returns to
+; kernel C code.  The task lives at ring 3; it re-enters the kernel only via
+; syscalls/IRQs (on its own kstack, selected by TSS.esp0 the scheduler set),
+; and SYS_EXIT ends the task via task_exit() rather than teleporting back.
+;
+; Stack on entry: [esp+0]=ret_addr, [esp+4]=eip, [esp+8]=esp(user)
+; -----------------------------------------------------------------------------
+enter_user_mode:
+    mov eax, [esp + 4]                          ; eip (user entry)
+    mov ebx, [esp + 8]                          ; esp (user stack)
+
+    mov cx, 0x23                                ; GDT_USER_DS | RPL 3
+    mov ds, cx
+    mov es, cx
+    mov fs, cx
+    mov gs, cx
+
+    push 0x23                                   ; SS3
+    push ebx                                    ; ESP3 (user stack)
+    pushfd
+    pop ecx
+    or ecx, 0x200                               ; IF=1 so IRQs preempt ring 3
+    push ecx                                    ; EFLAGS
+    push 0x1B                                   ; CS3 = GDT_USER_CS | RPL 3
+    push eax                                    ; EIP3 (user entry)
+    iret                                        ; → ring 3, never returns here

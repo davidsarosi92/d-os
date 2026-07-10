@@ -648,6 +648,15 @@ static void schedule_locked(struct percpu* me) {
     }
 
     me->current = next;
+    /* Tier B — set the per-task ring-3→ring-0 kernel stack (TSS.esp0 on x86).
+     * An independent user task uses its own kstack top; anything else restores
+     * the arch default (fixed syscall stack / excursion model).  No-op on
+     * aarch64 (SP_EL1 tracks via context_switch).  Must happen before the CR3
+     * switch + context_switch so a ring-3 entry after this uses the right
+     * stack. */
+    hal_set_kernel_stack((next->user_task && next->kstack_base)
+                         ? (uintptr_t)next->kstack_base + TASK_KSTACK_SZ
+                         : 0);
     /* M25 — switch to next's address space before swapping stacks.  For a
      * kernel thread (mm == NULL) this targets the shared kernel directory,
      * and vmm_space_switch skips the CR3 reload when it's already loaded —
@@ -743,6 +752,16 @@ int task_reap(int pid) {
         if (master_head == t) master_head = t->next;
     }
     spin_unlock_irqrestore(&master_lock, fl);
+
+    /* Tier B — free an independent user task's address space now.  Safe here:
+     * the task is DEAD and confirmed not current on any CPU (checked above),
+     * so its vmm_space is loaded nowhere and can be torn down.  (Its fds were
+     * closed at SYS_EXIT while it was still current.)  A kernel thread's mm is
+     * NULL / borrowed, so only user_task owns one to free. */
+    if (t->user_task && t->mm) {
+        vmm_space_destroy(t->mm);
+        t->mm = NULL;
+    }
 
     if (t->kstack_base) kfree(t->kstack_base);
     kfree(t);

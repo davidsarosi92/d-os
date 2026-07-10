@@ -30,6 +30,7 @@
 #include "console.h"
 #include "printf.h"
 #include "hal_api.h"
+#include "task.h"
 #include <stdint.h>
 
 /* Imports from usermode.s — the saved kernel context that lets SYS_EXIT
@@ -52,14 +53,24 @@ void syscall_dispatch(struct int_frame* f) {
         }
 
         case SYS_EXIT: {
-            /* Restore the kernel SP / PC saved by the arch's
-             * `enter_user_mode_wrap` and resume there.  Bypasses the
-             * normal iret-back-to-ring-3 path; the interrupt frame on
-             * this (syscall) stack is simply abandoned, which is fine
-             * because the arch's ring-3 → ring-0 transition (e.g. TSS.
-             * esp0 on x86) resets it for the next transition.  Noreturn. */
+            /* Tier B — an INDEPENDENT user task ends here for good: close its
+             * fds (it is still current) and task_exit(), so the scheduler moves
+             * on and init reaps it (freeing its address space).  Never returns. */
+            struct task* cur = task_current();
+            if (cur && cur->user_task) {
+                fd_close_all();
+                task_exit_code((int)f->ebx);
+            }
+            /* Excursion-model self-tests: restore the kernel SP / PC saved by
+             * `enter_user_mode_wrap` and resume there (teleport-back).  Bypasses
+             * the iret-back-to-ring-3 path; the syscall-stack frame is abandoned,
+             * fine because TSS.esp0 resets it for the next transition. */
             hal_syscall_exit_to_kernel(saved_esp, saved_eip);
         }
+
+        case SYS_GETPID:
+            f->eax = (uint32_t)(task_current() ? task_current()->pid : -1);
+            return;
 
         /* M25 stage 3 — fd syscalls.  EBX/ECX/EDX = arg0/arg1/arg2. */
         case SYS_WRITE:

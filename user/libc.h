@@ -19,6 +19,7 @@ int   open (const char* path, int flags);
 int   close(int fd);
 void  exit (int code);
 void* mmap (size_t len, int fd);            /* fd<0 = anonymous */
+int   getpid(void);
 
 /* String / memory. */
 size_t strlen(const char* s);

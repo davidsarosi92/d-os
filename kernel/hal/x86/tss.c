@@ -17,6 +17,7 @@
 
 #include "tss.h"
 #include "gdt.h"
+#include "hal_api.h"
 #include <stdint.h>
 
 /* Full 32-bit TSS layout per the SDM.  `__attribute__((packed))` is
@@ -65,6 +66,15 @@ void tss_init(void) {
 
 void tss_set_kernel_stack(uintptr_t esp) {
     tss.esp0 = (uint32_t)esp;
+}
+
+/* Tier B — per-task ring-3→ring-0 stack.  `top != 0` selects an independent
+ * user task's own kernel-stack top; `top == 0` restores the dedicated fixed
+ * syscall stack (kernel threads + the excursion-model self-tests, which saved
+ * a resume context on their own kstack and must not have it trampled). */
+void hal_set_kernel_stack(uintptr_t top) {
+    tss.esp0 = top ? (uint32_t)top
+                   : (uint32_t)(uintptr_t)(syscall_stack + KSTACK_SIZE);
 }
 
 uintptr_t tss_get_addr(void)  { return (uintptr_t)&tss; }

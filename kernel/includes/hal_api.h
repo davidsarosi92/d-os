@@ -137,4 +137,23 @@ uintptr_t hal_extend_identity_map(uintptr_t end_phys);
 void hal_syscall_exit_to_kernel(uintptr_t saved_sp, uintptr_t saved_pc)
     __attribute__((noreturn));
 
+/* ---------------------------------------------------------------------------
+ * Per-task privilege-transition stack (Tier B — concurrent user processes).
+ *
+ * When a ring-3 / EL0 task takes a syscall or interrupt, the CPU switches to a
+ * kernel stack: TSS.esp0/rsp0 on x86, SP_EL1 on aarch64.  With several user
+ * tasks preemptible at once, that stack must be PER-TASK, so the scheduler sets
+ * it on every switch-in via this hook:
+ *
+ *   - `top != 0`  → this is an independent user task; use its own kernel-stack
+ *                   top (one past the end) for the next ring-3→ring-0 entry.
+ *   - `top == 0`  → a kernel thread (or the excursion-model self-tests, which
+ *                   rely on a dedicated fixed syscall stack); restore the arch
+ *                   default.
+ *
+ * x86 (i386/x86_64): writes TSS.esp0/rsp0.  aarch64: a no-op — SP_EL1 is the
+ * ordinary EL1 stack pointer, which context_switch already saves/restores per
+ * task, so it tracks automatically. */
+void hal_set_kernel_stack(uintptr_t top);
+
 #endif

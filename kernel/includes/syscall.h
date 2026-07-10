@@ -38,6 +38,7 @@
 #define SYS_SEND   10       /* (fd, buf, n, passfd) → bytes / -1  (passfd<0=none) */
 #define SYS_RECV   11       /* (fd, buf, n, int* passfd_out) → bytes / -1      */
 #define SYS_POLL   12       /* (struct pollfd*, nfds, timeout) → #ready        */
+#define SYS_GETPID 13       /* () → calling task's pid (Tier B)                */
 
 /* poll(2) events (Linux values). */
 #define POLLIN      0x001   /* readable                                        */

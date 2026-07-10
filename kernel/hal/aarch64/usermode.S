@@ -62,6 +62,26 @@ aarch64_user_exit:
     ret
 
 /* -----------------------------------------------------------------------------
+ * void enter_user_mode(uint64_t entry_va, uint64_t user_sp);  — Tier B, ONE-WAY.
+ *
+ * The concurrent-user-process EL0 entry: unlike aarch64_enter_user it saves NO
+ * kernel resume context (no uk_sp/uk_lr, which are shared globals unsafe under
+ * concurrency).  The user-task bootstrap never returns; the task re-enters the
+ * kernel only via svc/IRQ (on its own SP_EL1 = its kernel stack, tracked by
+ * context_switch), and SYS_EXIT ends the task via task_exit().
+ *
+ *   x0 = entry_va, x1 = user_sp  (AAPCS64)
+ * --------------------------------------------------------------------------- */
+.global enter_user_mode
+enter_user_mode:
+    msr     sp_el0,  x1                 /* user stack           */
+    msr     elr_el1, x0                 /* user entry PC        */
+    mov     x2, #0                      /* SPSR = EL0t, DAIF clear (IRQs on) */
+    msr     spsr_el1, x2
+    isb
+    eret                                /* → EL0, never returns here */
+
+/* -----------------------------------------------------------------------------
  * user_stub — a tiny position-independent EL0 program (copied into a user page
  * by the syscall.c self-test).  It prints a message via SYS_PRINT (x8=0, x0=str)
  * then exits via SYS_EXIT (x8=1).  PC-relative `adr` makes it runnable at any

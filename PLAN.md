@@ -53,7 +53,7 @@
 | §M22.7 | Per-task GUI apps + panel-as-task — ✅ shipped | ~1660 |
 | §M23 | Audio subsystem | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) | ~1080 |
-| §M25 | Userland foundation (Wayland prerequisites) — ✅ stages 1–7 (libc: i386; concurrent-process tail deferred) | ~1545 |
+| §M25 | Userland foundation (Wayland prerequisites) — ✅ stages 1–7 + Tier B tail (concurrent user processes + full-arch libc; DOCS §4.24) | ~1545 |
 | §M26 | Wayland server (wire protocol on M22 + M25) | ~1615 |
 | §M27 | Process model — init, hierarchy, reaper, kill-tree — ✅ shipped | ~1818 |
 | §M28 | System log (klog ring buffer + dmesg) — ✅ shipped | ~1860 |
@@ -186,7 +186,7 @@ what); a session can pick a theme and push on it.
 | M22.7 | Per-task GUI apps (each WIN_APP on its own task) + panel-as-task | UX | ✅ DOCS §4.16 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
-| M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | ✅ §M25 (stages 1–7; libc i386; concurrent-process tail deferred) |
+| M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | ✅ §M25 (stages 1–7) + Tier B (concurrent user processes + full-arch libc, DOCS §4.24) |
 | M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | §M26 |
 | M27 | Process model — init, parent/child hierarchy, always-on reaper, kill-tree | Concurrency | ✅ DOCS §4.15 |
 | M28 | System log — klog ring buffer, severity levels, /proc/kmsg, dmesg | Observability | ✅ DOCS §4.18 |
