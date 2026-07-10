@@ -56,7 +56,7 @@
 | §M25 | Userland foundation (Wayland prerequisites) | ~1545 |
 | §M26 | Wayland server (wire protocol on M22 + M25) | ~1615 |
 | §M27 | Process model — init, hierarchy, reaper, kill-tree — ✅ shipped | ~1818 |
-| §M28 | System log (klog ring buffer + dmesg) | ~1860 |
+| §M28 | System log (klog ring buffer + dmesg) — ✅ shipped | ~1860 |
 | §M29 | Services / daemons — supervisor + SERVICE() registry + service bus (endpoint/contract/transport) | ~1895 |
 | §M30 | Task scheduling — cron service | ~1935 |
 | §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) | ~1960 |
@@ -188,7 +188,7 @@ what); a session can pick a theme and push on it.
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | §M25 |
 | M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | §M26 |
 | M27 | Process model — init, parent/child hierarchy, always-on reaper, kill-tree | Concurrency | ✅ DOCS §4.15 |
-| M28 | System log — klog ring buffer, severity levels, /proc/kmsg, dmesg | Observability | §M28 |
+| M28 | System log — klog ring buffer, severity levels, /proc/kmsg, dmesg | Observability | ✅ DOCS §4.18 |
 | M29 | Services / daemons — SERVICE() registry + supervisor (autostart, restart policy) + service bus (endpoint / contract / transport, location-independent binding) | Architecture | §M29 |
 | M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | §M30 |
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | §M31 |
@@ -2313,36 +2313,34 @@ fault; pid 0 survives.
 
 ---
 
-## §M28 — System log (klog ring buffer + dmesg)
+## §M28 — System log (klog ring buffer + dmesg) — ✅ shipped
 
-**Why now:** small and independent, but the service supervisor (M29)
-and cron (M30) both want somewhere structured to log.  Today
-`kprintf` goes straight to serial + console with no levels, no
-history, no per-source tagging.
+**Shipped 2026-07-10, see DOCS.md §4.18.**  `kernel/core/klog.c` — a
+static 512-record ring (usable from the first boot kprintf, no heap):
+monotonic seq + boot-relative ms timestamp + printk severity
+(EMERG…DEBUG) + source tag + message.  `printf.c`'s `emit()` tees every
+byte into `klog_feed_char`, which line-assembles and commits on `\n`, so
+all existing `kprintf` output is captured automatically (INFO/"kernel")
+with zero call-site churn; `klog(level, tag, fmt, …)` is the structured
+entry point (formats through the shared `kvprintf`, so it still hits the
+console).  Read paths: `dmesg [-l <level>]` (severity-filtered, rendered
+`[  sec.mmm] LEVEL tag: msg`, via `console_*` so it doesn't re-log
+itself) + a `/proc/kmsg` procfs node.  Verified on i386 + x86_64.
 
-**Design — staged.**
+**Lesson learned — the `va_list` array-type trap.**  Factoring a
+`kvprintf(fmt, va_list)` core out of `kprintf` corrupted *all* formatted
+output on x86_64 while i386 was fine.  On the x86_64 SysV ABI `va_list` is
+an *array* type, so a `va_list` **parameter** decays to a pointer and
+`&ap` becomes a pointer-to-pointer — the wrong type for the
+`va_list*`-taking `fetch_*` helpers; i386's scalar `va_list` hid it.  Fix:
+`va_copy` into a genuine local array and format off that.  Rule: a helper
+that forwards a `va_list` by pointer must own a real `va_list` local (via
+`va_copy`), never `&`-a-`va_list`-parameter.
 
-1. **klog core (`kernel/core/klog.c`)** — a fixed ring buffer of
-   records: monotonic seq, timestamp (`timer_ticks_ms`, plus CMOS RTC
-   wall-clock at boot for absolute time), severity (EMERG…DEBUG,
-   printk-style), a short source tag, and the message.  Lock-light
-   (per-record, SMP-safe).
-2. **`kprintf` tees into it** — existing call sites keep working; a
-   new `klog(level, tag, fmt, …)` is the richer entry point.  Serial
-   output stays (it is the boot-time lifeline).
-3. **Read path** — `/proc/kmsg` (or `/dev/klog`) exposes the ring;
-   `dmesg [-l level]` shell command formats + filters it.
-4. **Persistence (optional follow-up)** — flush to `/var/log/messages`
-   on exFAT once mounted; ring stays the source of truth.
-
-**Definition of done:**
-- `dmesg` shows timestamped, levelled boot + runtime messages.
-- A driver / subsystem can `klog(KLOG_WARN, "xhci", …)` and it is
-  tagged + filterable.
-- DOCS.md gains an "Observability / klog" chapter.
-
-**Out of scope:** structured/binary journald-style records, log
-rotation, remote syslog, rate-limiting (noted for later).
+**Deferred follow-ups (out of scope, as planned):** CMOS-RTC absolute
+wall-clock stamping (v1 is monotonic-since-boot), persistence to
+`/var/log/messages` on exFAT, journald-style binary records, log
+rotation, remote syslog, rate-limiting.
 
 ---
 

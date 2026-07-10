@@ -19,6 +19,7 @@
 #include "vfs.h"
 #include "kmalloc.h"
 #include "printf.h"
+#include "klog.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -186,7 +187,7 @@ void config_init(void) {
     if (config_load() == 0) {
         kprintf("config: loaded %s\n", CONF_PATH);
     } else {
-        kprintf("config: %s missing — using defaults\n", CONF_PATH);
+        klog(KLOG_NOTICE, "config", "%s missing — using defaults\n", CONF_PATH);
     }
 }
 

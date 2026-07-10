@@ -204,6 +204,7 @@ CORE_C_SRCS := \
     kernel/core/shell.c \
     kernel/core/rescue_shell.c \
     kernel/core/printf.c \
+    kernel/core/klog.c \
     kernel/core/multiboot.c \
     kernel/core/console.c \
     kernel/core/module.c \
@@ -265,6 +266,7 @@ else ifeq ($(ARCH),aarch64)
 # the aarch64 virtio-gpu present backend (kernel/hal/aarch64/virtio_gpu.c).
 CORE_C_SRCS := \
     kernel/core/printf.c \
+    kernel/core/klog.c \
     kernel/core/console.c \
     kernel/core/lock.c \
     kernel/core/percpu.c \
@@ -318,6 +320,7 @@ CORE_C_SRCS := \
     kernel/core/shell.c \
     kernel/core/rescue_shell.c \
     kernel/core/printf.c \
+    kernel/core/klog.c \
     kernel/core/multiboot.c \
     kernel/core/console.c \
     kernel/core/module.c \
