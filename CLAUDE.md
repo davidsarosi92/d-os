@@ -19,9 +19,29 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 ## Status (update when a milestone ships)
 
 ✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M21 (full ARM parity) +
-M22 – M22.7 + M27 + M28 + M25** shipped
+M22 – M22.7 + M27 + M28 + M25 (incl. Tier B tail) + Tier A + M29 + M30 +
+M31** shipped
 (10/11 polish sub-items; the lone outstanding one is §M20.6.1
-SYSCALL/SYSRET).  M28 (2026-07-10): system log — klog static ring
+SYSCALL/SYSRET).  **Tier A** (2026-07-10, DOCS §4.20): blocking
+primitives — `waitq` (block/wake, lost-wakeup-free, SMP cross-CPU wake;
+`TASK_SLEEPING` now real), `task_wait(pid,&code)`, blocking socket
+read + `poll(timeout<0)`, `task_msleep`.  **M29** (DOCS §4.21):
+services — supervisor (`SERVICE()` + `task_wait` restart w/ backoff +
+config gate + `service` cmd + `/proc/services`) + service bus
+(endpoint/contract\@ver/transport, strict bind + opt-in `BUS_ADAPTER`
+gated by `bus.allow-adaptation` + `/proc/bus`).  **M31** (DOCS §4.22):
+watchdog — L1 per-task heartbeat (`watchdog_register/kick` → detect +
+kill-tree + M29 restart) + L2 per-CPU softlockup (`percpu.ticks`);
+`/proc/watchdog` + `wdtest`; L3 HW watchdog deferred.  **M30** (DOCS
+§4.23): cron — itself an M29 service; `CRON_JOB()` registry + interval
+schedules (`/etc/crontab` / config) + `/proc/cron`.  **M25 Tier B tail**
+(DOCS §4.24): concurrent preemptible user processes (`proc_spawn`,
+per-task TSS.esp0/rsp0 via `hal_set_kernel_stack`; SP_EL1 auto on ARM;
+one-way `enter_user_mode`; SYS_EXIT→task_exit; `user_task` flag) +
+**full-arch libc** (arch-cond `syscall3` + per-arch crt0 + Makefile
+USER_* knobs; `hello`/`spin` build on all 3; `SYS_GETPID`); tests
+`procspawn`/`libctest` green on i386/x86_64/aarch64.  M28 (2026-07-10):
+system log — klog static ring
 + `kprintf` auto-tee + `klog(level,tag,…)` + `dmesg [-l level]` +
 `/proc/kmsg` (DOCS §4.18).  M25 (2026-07-10): userland foundation
 stages 1–7 (DOCS §4.19) — per-process address spaces (`vmm_space` +
@@ -30,14 +50,16 @@ stages 1–7 (DOCS §4.19) — per-process address spaces (`vmm_space` +
 close/lseek/mmap/memfd/socketpair/send/recv/poll` (generic `struct
 ofile`), memfd shared memory (`VMM_SHARED` PTE bit), unix socketpair +
 SCM_RIGHTS fd passing (`usock.c`), poll, in-tree libc (`user/`,
-compiled-C runs in ring 3 — i386 blob).  All on 3 arches (libc: i386).
+compiled-C runs in ring 3).  All on 3 arches (libc now all 3 via Tier B).
 **Ring model LOCKED: only ring 0/3 (EL1/EL0) — rings 1/2 never
 (paging is binary → no isolation; security axis = address spaces +
-capabilities, not ring count).**  Deferred tail: concurrent preemptible
-user *processes* (per-task TSS.esp0/SP_EL1, SYS_EXIT→task_exit, blocking
-syscalls) + x86_64/aarch64 libc port — today one user program at a time
-as a synchronous excursion.  Self-tests: `userrun/fdtest/shmtest/
-socktest/polltest/libctest`.  M22 + M22.1 + M22.2 (2026-07-04): GUI — gfx
+capabilities, not ring count).**  The former deferred tail (concurrent
+preemptible user processes + x86_64/aarch64 libc) SHIPPED as Tier B
+(DOCS §4.24) — `proc_spawn` runs many at once; the synchronous excursion
+(`proc_exec_elf`) is kept for the self-tests.  Self-tests: `userrun/
+fdtest/shmtest/socktest/polltest/libctest/waittest/procspawn`.  Still
+open: force-kill of a wedged pure-ring3 task (needs M25/§M33 isolation),
+argv/env, fork/COW.  M22 + M22.1 + M22.2 (2026-07-04): GUI — gfx
 surfaces + compositor + WM core + widget toolkit + file manager,
 PS/2 mouse (IRQ12), CMOS RTC, `vfs_unlink`, 1280×800 FB; desktop
 shells + apps + command shells are REGISTRY-swappable
@@ -188,15 +210,16 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 🔲 **PLAN extensions (placeholders, design only):**
 - §M23 — Audio subsystem (AC97 → HDA → I2S).
 - §M24 — Network stack (virtio-net → IP/UDP/TCP → sockets).
-- §M25 — ✅ SHIPPED stages 1–7 (DOCS §4.19): per-process VMM, ELF
-  loader + exec, fd table, mmap + memfd shm, unix sockets + fd
-  passing, poll, in-tree libc.  Wayland prerequisites in place.
-  Deferred tail: concurrent preemptible user processes + x86_64/
-  aarch64 libc port.
+- §M25 — ✅ SHIPPED stages 1–7 (DOCS §4.19) + Tier B tail (DOCS §4.24,
+  concurrent preemptible user processes + full-arch libc): per-process
+  VMM, ELF loader + exec, fd table, mmap + memfd shm, unix sockets + fd
+  passing, poll, in-tree libc (all 3 arches), `proc_spawn`.  Wayland
+  prerequisites in place.  Blocking primitives (Tier A, DOCS §4.20:
+  waitq / task_wait / blocking read+poll / task_msleep) also shipped.
 - §M26 — Wayland server (wire protocol over M22 compositor +
-  M25 substrate; depends on both).
-- **Workload-management cluster** (order M27→M30, independent of the
-  M23/M24/M25 line):
+  M25 substrate; depends on both).  **Now the next natural target — its
+  M25 + M22.7 prerequisites are all in place.**
+- **Workload-management cluster** (order M27→M30 — ✅ ALL SHIPPED):
   - §M27 — ✅ SHIPPED (DOCS §4.15): init + parent/child hierarchy +
     universal reaper + kill-tree + task_spawn_detached + ps/procfs
     PPID + Task Manager tree.
@@ -205,20 +228,22 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
     `klog(level,tag,fmt,…)` structured entry; `dmesg [-l level]` +
     `/proc/kmsg`.  (Pitfall: `va_list` is an array type on x86_64 — forward
     it by `va_copy`, never `&`-a-parameter; see the §M28 lesson.)
-  - §M29 — Services/daemons: `SERVICE()` registry + supervisor
-    (autostart + restart policy) — systemd-lite, the "upward" answer
-    to child-death (supervision/wait) — PLUS a **service bus**
-    (endpoint / contract\@version / transport) so services find + call
-    each other by name, not hard-link (QNX/FIDL-shaped).  Broker is
-    strict on exact contract match; compat is an opt-in `ADAPTER()`
-    shim gated by an `allow-adaptation` config bit.  Contracts designed
-    marshalling-shaped (handles + copied buffers, no free pointers)
-    from day one so a `LocalCall` service can later move to
+  - §M29 — ✅ SHIPPED (DOCS §4.21): `SERVICE()` registry + supervisor
+    (autostart + restart policy w/ crash-loop backoff, `task_wait`-driven,
+    config gate, `/proc/services`) — systemd-lite — PLUS the **service
+    bus** (endpoint / contract\@version / transport; strict bind + opt-in
+    `BUS_ADAPTER` gated by `bus.allow-adaptation`; `/proc/bus`).  Contracts
+    marshalling-shaped so a `LocalCall` service can later move to
     IPC/SharedMemory.  The bus makes §M33 execution domains a config
-    (not code) decision.
-  - §M30 — Task scheduling: cron as the first real service.
-  - §M31 — Watchdog: heartbeat-based freeze detection (per-task /
-    per-CPU softlockup / hardware) — the other half of "is it hung?".
+    (not code) decision.  Non-local transports still reserved for real
+    isolation.
+  - §M30 — ✅ SHIPPED (DOCS §4.23): cron — itself an M29 service;
+    `CRON_JOB()` registry + interval schedules (`/etc/crontab` / config,
+    run-once-no-backfill) + `crontab -l` / `/proc/cron`.
+  - §M31 — ✅ SHIPPED L1+L2 (DOCS §4.22): watchdog — per-task heartbeat
+    (detect + kill-tree + M29 restart) + per-CPU softlockup; `/proc/
+    watchdog` + `wdtest`.  L3 (HW watchdog device) deferred.  Blocking
+    substrate = Tier A (DOCS §4.20).
 - **§M32 — Multi-user** (design only): credentials (uid/gid) on tasks,
   `/etc/passwd`-style user DB, login/sessions, VFS file ownership +
   rwx perms, privilege gating, per-user process isolation.  Hard-depends
