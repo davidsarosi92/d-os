@@ -59,7 +59,7 @@
 | §M28 | System log (klog ring buffer + dmesg) — ✅ shipped | ~1860 |
 | Tier A | Blocking primitives — wait-queue + task_wait + blocking IPC — ✅ shipped (DOCS §4.20) | — |
 | §M29 | Services / daemons — supervisor + SERVICE() registry + service bus (endpoint/contract/transport) — ✅ shipped (DOCS §4.21) | ~1895 |
-| §M30 | Task scheduling — cron service | ~1935 |
+| §M30 | Task scheduling — cron service — ✅ shipped (DOCS §4.23) | ~1935 |
 | §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) — ✅ shipped L1+L2 (DOCS §4.22; L3 HW deferred) | ~1960 |
 | §M32 | Multi-user — identity, login, file perms, isolation | ~2160 |
 | §M33 | Execution domains — where a service runs (kernel / user / isolated); driver placement is the flagship case | ~2265 |
@@ -192,7 +192,7 @@ what); a session can pick a theme and push on it.
 | M28 | System log — klog ring buffer, severity levels, /proc/kmsg, dmesg | Observability | ✅ DOCS §4.18 |
 | Tier A | Blocking primitives — wait-queue (block/wake), task_wait, blocking socket read + poll | Concurrency | ✅ DOCS §4.20 |
 | M29 | Services / daemons — SERVICE() registry + supervisor (autostart, restart policy) + service bus (endpoint / contract / transport, location-independent binding) | Architecture | ✅ DOCS §4.21 |
-| M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | §M30 |
+| M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | ✅ DOCS §4.23 |
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | ✅ DOCS §4.22 (L1+L2; L3 HW deferred) |
 | M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation | Security | §M32 |
 | M33 | Execution domains — a service's run location (kernel / user / isolated) as a declared capability + config choice; driver placement (fault-tolerant → user-mode isolation) is the flagship case | Reliability | §M33 |
@@ -2618,6 +2618,12 @@ premature generality.
 ---
 
 ## §M30 — Task scheduling: cron service
+
+> ✅ **SHIPPED (2026-07-10) — see DOCS.md §4.23.**  cron is itself an M29
+> service (autostart, restart=always); a `CRON_JOB()` registry + interval
+> schedules (registered default / `/etc/crontab` / config) + run-once-no-
+> backfill; `crontab -l` / `cron reload` + `/proc/cron`.  A `tick-log` demo job
+> (every 5s) fires + logs on i386 / x86_64 / aarch64.  Design retained below.
 
 **Why now:** the natural capstone of the cluster — a scheduler for
 *work over time*, and the first genuinely useful service.  Small once

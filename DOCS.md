@@ -2659,6 +2659,39 @@ false-positives during normal operation.
 
 ---
 
+### 4.23 cron — time-based task scheduling (M30)
+
+**What it is.**  The capstone of the M27–M29 cluster and the first genuinely
+useful service: a scheduler for *work over time*.  cron (`cron.c`) is **itself
+an M29 service** (autostart, restart=always) — it appears in `service list`, is
+supervised, and comes back if it dies — whose entry loops on `task_msleep` and,
+each 500 ms tick, spawns every due job as one of its children (init reaps them)
+and logs the run.  Small because M27 (parent/reap), M28 (klog), M29 (services)
+and Tier A (`task_msleep`) already exist.
+
+**Jobs.**  A job is a self-registered `CRON_JOB(name, fn, default_every_ms)`
+entry (linker-section registry, like SERVICE()/DRIVER()).  Interval resolution,
+lowest priority first: the registered default → an `/etc/crontab` line (`every
+<N> <s|m|h> <name>`) → config keys (`cron.<name>.every_ms`,
+`cron.<name>.disabled`).  `/etc/crontab` is optional — absent, the defaults
+fire, so a job works out of the box.  Missed-tick policy: run-once-on-catch-up
+(next-due = now + interval after a fire), never backfill — a starved cron
+doesn't stampede.
+
+**Control + introspection.**  `crontab -l` / `cron list|status` shows each job's
+interval, ms-until-next, run count, and enabled/disabled state; `cron reload`
+re-reads `/etc/crontab` + config; `/proc/cron` renders the same table.
+
+**Demonstrator + DoD.**  A `tick-log` job (`CRON_JOB`, every 5 s) klogs
+"scheduled job fired" — verified firing on schedule on i386 + x86_64 + aarch64
+(dmesg shows `cron: run 'tick-log'` + the job line + init reaping the job task),
+with cron itself listed under `service list` as `running / always`.
+
+**Out of scope (PLAN §M30):** wall-clock cron fields beyond intervals, per-user
+crontabs, at/batch one-shots, last-run persistence across reboot.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -2729,6 +2762,13 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-10 — M30: cron (time-based scheduling).**  The first real service
+  (`cron.c`): cron is itself an M29 service (autostart, restart=always), loops
+  on `task_msleep`, and spawns each due `CRON_JOB(name, fn, every_ms)` as a
+  child (init reaps).  Interval from registered default → `/etc/crontab` (`every
+  N s|m|h name`) → config; missed-tick = run-once-no-backfill.  `crontab -l` /
+  `cron list|reload` + `/proc/cron`.  Demo `tick-log` (every 5 s) fires + logs
+  on i386 / x86_64 / aarch64; cron shows under `service list`.  See §4.23.
 - **2026-07-10 — M31: watchdog (freeze detection).**  A sweep task (child of
   init, `watchdog.c`) runs every 500 ms: **layer 1** per-task heartbeat
   (`watchdog_register`/`watchdog_kick`; a missed deadline → `KLOG_ERR` +

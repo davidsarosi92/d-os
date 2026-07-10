@@ -214,6 +214,7 @@ CORE_C_SRCS := \
     kernel/core/bus.c \
     kernel/core/svc_demo.c \
     kernel/core/watchdog.c \
+    kernel/core/cron.c \
     kernel/core/multiboot.c \
     kernel/core/console.c \
     kernel/core/module.c \
@@ -285,6 +286,7 @@ CORE_C_SRCS := \
     kernel/core/bus.c \
     kernel/core/svc_demo.c \
     kernel/core/watchdog.c \
+    kernel/core/cron.c \
     kernel/core/console.c \
     kernel/core/lock.c \
     kernel/core/percpu.c \
@@ -349,6 +351,7 @@ CORE_C_SRCS := \
     kernel/core/bus.c \
     kernel/core/svc_demo.c \
     kernel/core/watchdog.c \
+    kernel/core/cron.c \
     kernel/core/multiboot.c \
     kernel/core/console.c \
     kernel/core/module.c \

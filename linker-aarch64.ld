@@ -110,6 +110,14 @@ SECTIONS
         __stop_bus_adapters = .;
     }
 
+    /* Cron job registry (M30) — CRON_JOB() entries; the cron service walks it. */
+    .cron_jobs : ALIGN(8)
+    {
+        __start_cron_jobs = .;
+        KEEP(*(cron_jobs))
+        __stop_cron_jobs = .;
+    }
+
     .data : ALIGN(4K)
     {
         *(.data)

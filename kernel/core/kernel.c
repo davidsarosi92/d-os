@@ -39,6 +39,7 @@
 #include "service.h"
 #include "bus.h"
 #include "watchdog.h"
+#include "cron.h"
 #include "printf.h"
 #include "acpi.h"
 #include "hal_api.h"
@@ -409,6 +410,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * After init so the supervisor's parent already exists. */
     service_init();
     bus_init();
+    cron_init();                 /* M30 — /proc/cron (cron autostarts as a service) */
     service_start_supervisor();
 
     /* M31 — watchdog: /proc/watchdog + the sweep task (per-task heartbeat +

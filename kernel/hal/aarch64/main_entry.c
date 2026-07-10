@@ -43,6 +43,7 @@
 #include "service.h"
 #include "bus.h"
 #include "watchdog.h"
+#include "cron.h"
 #include "lock.h"
 #include <stdint.h>
 
@@ -284,6 +285,7 @@ void aarch64_main_entry(uint64_t dtb) {
      * Register /proc/services + /proc/bus and spawn the supervisor. */
     service_init();
     bus_init();
+    cron_init();                            /* M30 — /proc/cron */
     service_start_supervisor();
     watchdog_init();                        /* M31 — freeze detection */
 

@@ -42,6 +42,7 @@
 #include "syscall.h"
 #include "fd.h"
 #include "service.h"
+#include "cron.h"
 
 #define LINE_MAX        128             /* max accepted bytes per command line */
 #define DEFAULT_PROMPT  "d-os> "        /* fallback when config is unavailable */
@@ -1125,6 +1126,14 @@ static void cmd_bustest(void) { svc_demo_bustest(); }
 extern void svc_demo_wdtest(void);
 static void cmd_wdtest(void) { svc_demo_wdtest(); }
 
+/* `crontab -l` / `cron [list|status|reload]` — M30 cron control. */
+static void cmd_cron(const char* args) {
+    if (!args || !*args || starts_with(args, "list") || starts_with(args, "status"))
+        { cron_list(); return; }
+    if (starts_with(args, "reload")) { cron_reload(); console_write("cron: reloaded\n"); return; }
+    console_write("cron: usage: cron [list|status|reload]\n");
+}
+
 /* M25 stage 7 — run the in-tree-libc compiled-C user program embedded as a
  * blob (user/hello.c → static ELF → objcopy).  Weak symbols so the command
  * still links on arches that don't embed the blob yet (i386 is the reference
@@ -1304,6 +1313,10 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }
     if (streq(line, "bustest"))        { cmd_bustest(); return; }
     if (streq(line, "wdtest"))         { cmd_wdtest(); return; }
+    if (streq(line, "cron"))           { cmd_cron("");         return; }
+    if (starts_with(line, "cron "))    { cmd_cron(line + 5);   return; }
+    if (streq(line, "crontab"))        { cron_list();          return; }
+    if (starts_with(line, "crontab ")) { cron_list();          return; }  /* -l */
     if (streq(line, "blktest"))        { cmd_blktest();  return; }
     if (streq(line, "bctest"))         { cmd_bctest();   return; }
     if (streq(line, "lsblk"))          { blk_list();     return; }
