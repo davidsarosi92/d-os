@@ -3079,6 +3079,39 @@ substituter/cache; package signing (needs §M39 crypto); `/proc/pkg`.
 
 ---
 
+### 4.30 POSIX syscall breadth + libc growth (M36 stage 1, i386)
+
+**Files:** `kernel/core/usyscall.c` (handlers), `kernel/includes/syscall.h`
+(numbers + shared structs), `user/libc.c`/`libc.h`, `user/posixtest.c`.  Shell:
+`posixtest`.
+
+Stage 1 of the native-libc milestone: broaden the syscall surface a real libc
+sits on, and grow the in-tree libc toward it.  New syscalls 30–35:
+- `stat`/`fstat` → `struct kstat {size, type, mode}` from the VFS inode
+  (type 0=file/1=dir/2=device; mode 0644/0755).
+- `getdents` → packed `[reclen(2)|type(1)|name\0]` records read from a VFS
+  directory handle (`vfs_readdir`).
+- `uname` → `struct kutsname` (d-os / 0.1 / i386).
+- `clock_gettime(CLOCK_REALTIME|MONOTONIC)` → RTC epoch (`rtc_read` →
+  days-since-1970) / timer uptime (`timer_ticks_ms`).
+- `nanosleep_ms` → `task_msleep`.
+The libc grows the matching structs + wrappers, an **`errno`** (wrappers set it
+on a negative kernel return), and a `%o` printf conversion.
+
+**Boot-tested (i386):** `posixtest` prints `uname`, `stat /bin/args`
+(size/type/mode 644), a `getdents` listing of `/bin` (hello, args),
+`clock_gettime` realtime + monotonic, and a `nanosleep` — all from ring 3.
+
+**Stage 2 (the actual musl port) — deferred, external-toolchain infrastructure:**
+cross-compile **musl** against the d-os syscall numbers (a d-os `arch/` under
+musl, or a Linux-number alias) as the native libc replacing `user/libc.c`; a
+`/bin` + `/lib` convention; a minimal coreutils (`sh`/`ls`/`cat`/`echo`/`env`)
+as the first musl-linked programs — all installed into the §M35.5 store.  Also
+later: `getcwd`/`chdir` (needs a per-task cwd), `brk`/`mremap`, `epoll`/
+`eventfd`/`timerfd`, `getrandom` (§M39), full `struct sockaddr`.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -3149,6 +3182,14 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-11 — M36 stage 1: POSIX syscall breadth + libc growth, i386.**  The
+  surface a real libc sits on (DOCS §4.30): syscalls 30–35 — stat/fstat (kstat
+  from the VFS inode), getdents (packed dir records), uname, clock_gettime
+  (RTC epoch / timer uptime), nanosleep; libc grows the structs + wrappers +
+  errno + a %o printf.  `posixtest` from ring 3: uname, stat /bin/args,
+  getdents /bin, realtime+monotonic clock, nanosleep.  Stage 2 (cross-compiling
+  musl as the native libc + coreutils into the §M35.5 store) is external-
+  toolchain infrastructure, deferred.  See PLAN.md §M36.
 - **2026-07-11 — M35.5: content-addressed package store (first slice), i386.**
   The porting-discipline gate before foreign code (DOCS §4.29): a Nix/Guix-shaped
   store on the VFS (`kernel/core/pkg.c`) — content-addressed

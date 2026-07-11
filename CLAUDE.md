@@ -165,18 +165,21 @@ extension + ACPI SRAT-derived per-CPU NUMA nodes), APs scheduling,
 **x86_64 (long mode) — full parity with i386 INCLUDING xHCI USB +
 virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
-▶️ **DECIDED NEXT (2026-07-11): §M36 — POSIX syscall breadth + native libc (musl port).**
-§M35.5's **content-addressed store SHIPPED** (i386, DOCS §4.29): `/store/<hash>-
-name-version/` immutable paths, version coexistence, pinned closures, symlink-
-free profile, mark-sweep GC (`pkg …`/`pkgtest`).  That's the porting-discipline
-gate; now **§M36 — port musl as the native libc** (expand the syscall surface
-to the musl-required set — stat/getdents/mprotect/clock_gettime/etc.; a d-os
-arch under musl; a `/bin` + `/lib` convention; a minimal coreutils `sh`/`ls`/
-`cat` as the first musl-linked programs — all installed into the §M35.5 store,
-never the global FS).  §M35 (threads/futex/TLS/per-CPU TSS) is COMPLETE (UP +
-SMP, DOCS §4.28).  Also shipped this session: §M34 POSIX (§4.27), §M24 sockets
-(§4.25).  **§M26 Wayland stays deferred until POSIX + libc exist.**  §M35.5 on
-branch `m35_5-pkg`; check git for merge state.
+▶️ **DECIDED NEXT (2026-07-11): §M36 stage 2 — the musl cross-compile (infra-heavy).**
+§M36 **stage 1 SHIPPED** (i386, DOCS §4.30): broadened the syscall surface
+(stat/fstat/getdents/uname/clock_gettime/nanosleep, syscalls 30–35) + `errno` +
+`%o` printf + `posixtest`.  **Stage 2 is the actual musl port** — an
+external-toolchain effort: fetch musl source + extend the Docker build env,
+cross-compile musl against the d-os syscall numbers as the native libc (a d-os
+`arch/` under musl or a Linux-number alias), a `/bin`+`/lib` convention, and a
+minimal coreutils (`sh`/`ls`/`cat`/`echo`/`env`) as the first musl-linked
+programs — all installed into the §M35.5 store.  **Flag to the user that stage 2
+needs the build environment extended** (musl source + Dockerfile), so it's a
+bigger, multi-step setup than the in-kernel milestones.  Then §M37 dynamic
+linker → §M38 C++/support libs → …  Shipped this session (userland-maturation):
+§M34 POSIX (§4.27), §M24 sockets (§4.25), §M35 threads/futex/TLS/per-CPU-TSS
+(§4.28), §M35.5 store (§4.29), §M36 stage 1 (§4.30).  **§M26 Wayland deferred
+until POSIX + libc exist.**  §M36 stage 1 on branch `m36-libc`; check git.
 
 🔲 **Other options** (was "pick one"; superseded by the decision above):
 
