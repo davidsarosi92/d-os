@@ -20,9 +20,20 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M21 (full ARM parity) +
 M22 – M22.7 + M27 + M28 + M25 (incl. Tier B tail) + Tier A + M29 + M30 +
-M31** shipped
+M31 + M24 (net, stages 1–3, i386) + M23 (audio, stage 1, i386)** shipped
 (10/11 polish sub-items; the lone outstanding one is §M20.6.1
-SYSCALL/SYSRET).  **Tier A** (2026-07-10, DOCS §4.20): blocking
+SYSCALL/SYSRET).  **M23** (2026-07-11, DOCS §4.26): audio (i386) — `audio_dev`
+registry + AC97 codec driver (BDL bus-master DMA, 48 kHz 16-bit stereo out) +
+square-wave tone generator; shell `lsaudio`/`beep`/`tone`; boot-tested via QEMU
+`-audiodev wav` (440 Hz ±8000 square wave captured).  Open: `play <path>` WAV
+player, `/dev/dsp`, mixer/multi-stream, input, Intel HDA, x86_64/aarch64.
+**M24** (2026-07-11, DOCS §4.25): network stack (i386) —
+virtio-net driver + `net_device` registry + arch-independent
+Ethernet/ARP/IPv4/ICMP/UDP/TCP + DNS stub resolver; shell
+`lsnic`/`ping`/`arp`/`nslookup`/`wget`/`nettest`; boot-tested through QEMU
+SLIRP (ICMP 3/3, DNS example.com, TCP `HTTP/1.1 200 OK`).  RX polled from the
+calling task (no IRQ/lock yet); TCP client-only, no retransmit/congestion;
+socket *syscall* API to userland still open.  **Tier A** (2026-07-10, DOCS §4.20): blocking
 primitives — `waitq` (block/wake, lost-wakeup-free, SMP cross-CPU wake;
 `TASK_SLEEPING` now real), `task_wait(pid,&code)`, blocking socket
 read + `poll(timeout<0)`, `task_msleep`.  **M29** (DOCS §4.21):
@@ -197,8 +208,12 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
   assignment, no firmware) lets the stock `xhci.c` + `usb_hid.c` link + run
   (MMIO, polled from the timer ISR); a USB HID keyboard drives the shell.
   **aarch64 now has full x86 parity** — M21 complete.
-- **M23** — Audio (AC97 → HDA → I2S).
-- **M24** — Network (NIC → IP/UDP/TCP → sockets).
+- **M23** — Audio — ✅ stage 1 shipped (i386, DOCS §4.26): AC97 PCM output +
+  tone (`lsaudio`/`beep`/`tone`).  Open: WAV player, /dev/dsp, mixer, input,
+  HDA, x86_64/aarch64.
+- **M24** — Network — ✅ stages 1–3 shipped (i386, DOCS §4.25): virtio-net +
+  ARP/IPv4/ICMP/UDP/TCP + DNS + ping/nslookup/wget.  Open: socket syscall API
+  to userland, IRQ RX, TCP timers/server, DHCP, IPv6, x86_64/aarch64.
 - **§M19.5.1 i386 kmap** — the deferred half of HIGHMEM: real
   kmap-style temp mappings so i386 can manage > 256 MiB of RAM.
 - **§M19.5.3 per-NUMA-node PMM zones** — the deferred deeper half
@@ -209,7 +224,8 @@ virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
 🔲 **PLAN extensions (placeholders, design only):**
 - §M23 — Audio subsystem (AC97 → HDA → I2S).
-- §M24 — Network stack (virtio-net → IP/UDP/TCP → sockets).
+- §M24 — Network stack — ✅ stages 1–3 shipped (i386, DOCS §4.25); socket
+  syscall API + DHCP + IPv6 + x86_64/aarch64 still open.
 - §M25 — ✅ SHIPPED stages 1–7 (DOCS §4.19) + Tier B tail (DOCS §4.24,
   concurrent preemptible user processes + full-arch libc): per-process
   VMM, ELF loader + exec, fd table, mmap + memfd shm, unix sockets + fd
