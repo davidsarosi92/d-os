@@ -165,19 +165,18 @@ extension + ACPI SRAT-derived per-CPU NUMA nodes), APs scheduling,
 **x86_64 (long mode) — full parity with i386 INCLUDING xHCI USB +
 virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
-▶️ **DECIDED NEXT (2026-07-11): §M35.5 — package manager & isolation.**
-§M35 (threads & futex + **TLS** + per-CPU TSS) is COMPLETE on i386, verified UP
-AND `-smp 2` (DOCS §4.28): `proc_clone`/`futex`/`thread_create` (20000/20000,
-truly parallel), `%gs` thread-local storage (`tlstest`: each thread reads only
-its own id, 0 mismatches), and the per-CPU TSS fix that unblocked all ring-3
-userland on APs.  **The agreed next target is §M35.5 — the package manager +
-isolation substrate** (content-addressed store, Nix/Guix-shaped — see PLAN.md
-§M35.5's implementation sketch): the porting-discipline gate that must land
-before pulling in foreign code (musl §M36 onward).  Then §M36 libc (musl port)
-→ … (the "Userland maturation" cluster critical path).  Also shipped this
-session: §M34 POSIX (DOCS §4.27), §M24 stage-6 sockets (DOCS §4.25).  **§M26
-Wayland stays deferred until POSIX + libc exist.**  §M35 TLS on branch
-`m35-tls`; check git for merge state.
+▶️ **DECIDED NEXT (2026-07-11): §M36 — POSIX syscall breadth + native libc (musl port).**
+§M35.5's **content-addressed store SHIPPED** (i386, DOCS §4.29): `/store/<hash>-
+name-version/` immutable paths, version coexistence, pinned closures, symlink-
+free profile, mark-sweep GC (`pkg …`/`pkgtest`).  That's the porting-discipline
+gate; now **§M36 — port musl as the native libc** (expand the syscall surface
+to the musl-required set — stat/getdents/mprotect/clock_gettime/etc.; a d-os
+arch under musl; a `/bin` + `/lib` convention; a minimal coreutils `sh`/`ls`/
+`cat` as the first musl-linked programs — all installed into the §M35.5 store,
+never the global FS).  §M35 (threads/futex/TLS/per-CPU TSS) is COMPLETE (UP +
+SMP, DOCS §4.28).  Also shipped this session: §M34 POSIX (§4.27), §M24 sockets
+(§4.25).  **§M26 Wayland stays deferred until POSIX + libc exist.**  §M35.5 on
+branch `m35_5-pkg`; check git for merge state.
 
 🔲 **Other options** (was "pick one"; superseded by the decision above):
 
@@ -308,8 +307,10 @@ Wayland stays deferred until POSIX + libc exist.**  §M35 TLS on branch
   user-mode non-DMA → Tier 2 DMA+IOMMU); the driver-runtime "narrow
   waist, two backends" IS the M29 transport abstraction.  Hybrid kernel
   (NT/XNU), not a micro-vs-monolith flip.
-- **§M35.5 — Package manager & isolation** (design only, PLAN.md): a hard
-  **gate before any porting** — a **content-addressed store** (Nix/Guix-
+- **§M35.5 — Package manager & isolation** — ✅ **store slice shipped** (i386,
+  DOCS §4.29): content-addressed `/store/<hash>-name-ver/` + profiles + GC
+  (`pkg …`/`pkgtest`).  Design (rest still open) — a hard **gate before any
+  porting** — a **content-addressed store** (Nix/Guix-
   shaped, NOT dpkg/apt; convention #6): immutable `/store/<hash>-name-ver/`
   paths, pinned dependency closures (versions coexist, no global `/lib`
   soup), hermetic §M33-sandboxed builds, symlink-profile + GC (no cruft,
