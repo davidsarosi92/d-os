@@ -23,6 +23,7 @@
 #define SYSCALL_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Syscall numbers (shared across arches; each arch reads its own trapframe). */
 #define SYS_PRINT   0       /* legacy M6: arg0 = char* → console (kept)        */
@@ -47,6 +48,16 @@
 #define SYS_KILL   19       /* (pid, sig) → 0 / -1  (M34)                      */
 #define SYS_SIGACTION 20    /* (sig, handler, restorer) → old handler          */
 #define SYS_SIGRETURN 21    /* () — restore context after a signal handler     */
+#define SYS_SOCKET 22       /* (domain, type, proto) → fd  (M24 socket API)    */
+#define SYS_CONNECT 23      /* (fd, ip, port) → 0    (TCP — next slice)        */
+#define SYS_SENDTO 24       /* (fd, buf, n, ip, port) → bytes / -1  (UDP)      */
+#define SYS_RECVFROM 25     /* (fd, buf, n, u32* ip, int* port) → bytes / -1   */
+#define SYS_BIND   26       /* (fd, port) → 0 / -1                             */
+
+/* socket() domain / type (M24). */
+#define AF_INET      2
+#define SOCK_STREAM  1
+#define SOCK_DGRAM   2
 
 /* Signals (M34) — a small POSIX-shaped set. */
 #define NSIG       32
@@ -91,6 +102,11 @@ int  sys_pipe(int* fds);                /* fds[0]=read, fds[1]=write            
 int  sys_dup2(int oldfd, int newfd);    /* redirect a descriptor               */
 int  sys_kill(int pid, int sig);        /* post a signal to a task             */
 long sys_sigaction(int sig, long handler, long restorer);  /* → old handler    */
+int  sys_socket(int domain, int type, int proto);          /* M24 socket API   */
+int  sys_bind(int fd, int port);
+int  sys_connect(int fd, uint32_t ip, int port);           /* TCP handshake    */
+long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port);
+long sys_recvfrom(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out);
 long sys_send (int fd, const void* buf, size_t n, int passfd);
 long sys_recv (int fd, void* buf, size_t n, int* passfd_out);
 struct pollfd;

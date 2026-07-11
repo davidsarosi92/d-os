@@ -23,6 +23,9 @@
 #include "pmm.h"
 #include "console.h"
 #include "waitq.h"
+#include "net.h"
+#include "hal_api.h"
+#include "kmalloc.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -47,6 +50,10 @@ static int fd_install(struct ofile* o) {
     return -1;
 }
 
+/* Forward decls — FD_NETSOCK stream I/O (defined with the socket layer below). */
+static long netsock_write(struct netsock* ns, const void* buf, size_t n);
+static long netsock_read (struct netsock* ns, void* buf, size_t n);
+
 long sys_write(int fd, const void* buf, size_t n) {
     if (fd == 1 || fd == 2) {                 /* stdout / stderr → console */
         const char* s = (const char*)buf;
@@ -58,6 +65,7 @@ long sys_write(int fd, const void* buf, size_t n) {
     if (!o) return -1;
     if (o->kind == FD_VFS)  return (long)vfs_write(o->file, buf, n);
     if (o->kind == FD_SOCK) return usock_send(o->sock, buf, n, NULL);
+    if (o->kind == FD_NETSOCK) return netsock_write(o->nsock, buf, n);
     return -1;                                 /* shm: not write(2)-able */
 }
 
@@ -70,6 +78,7 @@ long sys_read(int fd, void* buf, size_t n) {
     /* Sockets read(2) with POSIX blocking semantics (block == 1): an empty
      * read waits for the peer to send (or close → 0/EOF). */
     if (o->kind == FD_SOCK) return usock_recv(o->sock, buf, n, 1, NULL);
+    if (o->kind == FD_NETSOCK) return netsock_read(o->nsock, buf, n);
     return -1;
 }
 
@@ -336,4 +345,148 @@ void fd_close_all(void) {
         if (t->fds[fd]) { ofile_unref(t->fds[fd]); t->fds[fd] = NULL; }
     }
     t->mmap_cursor = 0;
+}
+
+/* ---- network sockets (M24 socket API — AF_INET) --------------------------- */
+/*
+ * A minimal BSD-sockets surface over the in-kernel net stack (net.c).  Slice 1:
+ * SOCK_DGRAM (UDP).  A netsock owns a local UDP port and a small ring of
+ * received datagrams; net.c's per-port binding pushes arriving datagrams into
+ * the ring (in the receiving task's context — RX is polled, so no locking).
+ *
+ * Addresses are passed as a host-order IPv4 + a port integer rather than a
+ * `struct sockaddr_in` — a deliberate simplification for the teaching ABI; a
+ * sockaddr marshalling layer is a later refinement (§M36 libc / §M39).
+ * (AF_INET / SOCK_* come from syscall.h.)
+ */
+#define NS_RXSLOTS   4
+#define NS_DGRAM_MAX 1500
+
+struct ns_dgram {
+    uint32_t src_ip; uint16_t src_port; uint16_t len; uint8_t data[NS_DGRAM_MAX];
+};
+struct netsock {
+    int      type;
+    uint16_t local_port;
+    int      bound;
+    struct ns_dgram rx[NS_RXSLOTS];
+    volatile int rx_head, rx_tail;      /* head = produce, tail = consume */
+    /* SOCK_STREAM (TCP) state. */
+    int      connected;
+    uint32_t peer_ip; uint16_t peer_port;
+};
+
+static uint16_t g_ephem_port = 0xC000;
+
+/* net.c UDP-binding callback: enqueue an arriving datagram (drop if the ring
+ * is full).  Runs in the receiver's task context (RX polled). */
+static void ns_udp_cb(uint32_t src_ip, uint16_t src_port,
+                      const uint8_t* data, uint32_t len, void* ctx) {
+    struct netsock* ns = (struct netsock*)ctx;
+    int nx = (ns->rx_head + 1) % NS_RXSLOTS;
+    if (nx == ns->rx_tail) return;      /* full → drop */
+    struct ns_dgram* d = &ns->rx[ns->rx_head];
+    uint32_t n = len > NS_DGRAM_MAX ? NS_DGRAM_MAX : len;
+    for (uint32_t i = 0; i < n; i++) d->data[i] = data[i];
+    d->src_ip = src_ip; d->src_port = src_port; d->len = (uint16_t)n;
+    ns->rx_head = nx;
+}
+
+/* Called from ofile_unref (fd.c) when the last descriptor closes. */
+void netsock_close(struct netsock* ns) {
+    if (!ns) return;
+    if (ns->bound) net_udp_unbind(ns->local_port);
+    if (ns->type == SOCK_STREAM && ns->connected) {
+        struct net_device* dev = net_primary();
+        if (dev) net_tcp_close(dev);
+    }
+    kfree(ns);
+}
+
+static int ns_ensure_bound(struct netsock* ns, uint16_t port) {
+    if (ns->bound) return 0;
+    ns->local_port = port ? port : g_ephem_port++;
+    if (net_udp_bind(ns->local_port, ns_udp_cb, ns) != 0) return -1;
+    ns->bound = 1;
+    return 0;
+}
+
+int sys_socket(int domain, int type, int proto) {
+    (void)proto;
+    if (domain != AF_INET)  return -1;
+    if (type != SOCK_DGRAM && type != SOCK_STREAM) return -1;
+    struct netsock* ns = (struct netsock*)kcalloc(1, sizeof *ns);
+    if (!ns) return -1;
+    ns->type = type;
+    struct ofile* o = ofile_from_netsock(ns);
+    if (!o) { kfree(ns); return -1; }
+    int fd = fd_install(o);
+    if (fd < 0) { ofile_unref(o); return -1; }
+    return fd;
+}
+
+int sys_bind(int fd, int port) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETSOCK) return -1;
+    return ns_ensure_bound(o->nsock, (uint16_t)port);
+}
+
+/* M24 — connect(fd, ip, port): TCP handshake for a SOCK_STREAM socket. */
+int sys_connect(int fd, uint32_t ip, int port) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETSOCK) return -1;
+    struct netsock* ns = o->nsock;
+    if (ns->type != SOCK_STREAM) return -1;
+    struct net_device* dev = net_primary();
+    if (!dev) return -1;
+    if (net_tcp_connect(dev, ip, (uint16_t)port) != 0) return -1;
+    ns->connected = 1; ns->peer_ip = ip; ns->peer_port = (uint16_t)port;
+    return 0;
+}
+
+/* Stream read/write over a connected SOCK_STREAM socket (called by
+ * sys_read/sys_write when the fd is FD_NETSOCK). */
+static long netsock_write(struct netsock* ns, const void* buf, size_t n) {
+    if (ns->type != SOCK_STREAM || !ns->connected) return -1;
+    struct net_device* dev = net_primary();
+    return dev ? net_tcp_send(dev, buf, (uint32_t)n) : -1;
+}
+static long netsock_read(struct netsock* ns, void* buf, size_t n) {
+    if (ns->type != SOCK_STREAM || !ns->connected) return -1;
+    struct net_device* dev = net_primary();
+    return dev ? net_tcp_recv(dev, buf, (uint32_t)n) : -1;
+}
+
+long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETSOCK) return -1;
+    struct netsock* ns = o->nsock;
+    if (ns_ensure_bound(ns, 0) != 0) return -1;
+    struct net_device* dev = net_primary();
+    if (!dev) return -1;
+    if (net_udp_send(dev, ip, ns->local_port, (uint16_t)port, buf, n) != 0) return -1;
+    return (long)n;
+}
+
+long sys_recvfrom(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETSOCK) return -1;
+    struct netsock* ns = o->nsock;
+    struct net_device* dev = net_primary();
+    if (!dev) return -1;
+    /* Poll the RX ring until a datagram lands (bounded — no IRQ RX yet). */
+    for (uint32_t spins = 0; spins < 40000000u; spins++) {
+        if (ns->rx_head != ns->rx_tail) break;
+        if (dev->poll) dev->poll(dev);
+        hal_cpu_pause();
+    }
+    if (ns->rx_head == ns->rx_tail) return -1;     /* timeout */
+    struct ns_dgram* d = &ns->rx[ns->rx_tail];
+    uint32_t cnt = (d->len < n) ? d->len : (uint32_t)n;
+    uint8_t* out = (uint8_t*)buf;
+    for (uint32_t i = 0; i < cnt; i++) out[i] = d->data[i];
+    if (ip_out)   *ip_out   = d->src_ip;
+    if (port_out) *port_out = d->src_port;
+    ns->rx_tail = (ns->rx_tail + 1) % NS_RXSLOTS;
+    return (long)cnt;
 }

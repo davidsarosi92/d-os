@@ -2148,16 +2148,20 @@ synthesis, surround, ALSA-compat layer.
 
 ## §M24 — Network stack (NIC → TCP/IP → sockets) — ✅ stages 1–3 shipped (i386)
 
-**Status (2026-07-11): §M24.1–.3 SHIPPED on i386 — see DOCS.md §4.25.**
-virtio-net driver + `net_device` registry + Ethernet/ARP/IPv4/ICMP/UDP/TCP +
-a DNS stub resolver, all arch-independent in `kernel/core/net.c`.  Boot-tested
-end-to-end through QEMU SLIRP: `nettest` → ICMP ping (3/3), DNS (example.com),
-TCP `HTTP/1.1 200 OK`.  Shell: `lsnic`/`ping`/`arp`/`nslookup`/`wget`/`nettest`.
-RX is polled from the calling task (no IRQ/lock yet).  **Still open** (the
-design below stays as the roadmap for these): the BSD socket *syscall* API to
-userland (stage 6 — today's stack is in-kernel, the shell commands are the
-clients), IRQ-driven RX + a `netd` task, TCP retransmit/congestion + a server
-role, DHCP (stage 7), IPv6, `/proc/net`, x86_64/aarch64 ports.
+**Status (2026-07-11): §M24.1–.3 + stage 6 (sockets) SHIPPED on i386 — see
+DOCS.md §4.25.**  virtio-net driver + `net_device` registry + Ethernet/ARP/
+IPv4/ICMP/UDP/TCP + a DNS stub resolver, all arch-independent in
+`kernel/core/net.c`.  **Plus the BSD socket syscall API to userland** (stage 6):
+`FD_NETSOCK` + `struct netsock` back `socket`/`bind`/`connect`/`sendto`/
+`recvfrom` (syscalls 22–26) — UDP + a single-connection TCP.  Boot-tested
+end-to-end through QEMU SLIRP: `nettest` (kernel: ICMP 3/3, DNS, TCP 200 OK)
+*and from ring 3* `dnstest` (UDP-socket DNS → example.com) + `httptest`
+(UDP DNS + TCP socket → `HTTP/1.1 200 OK`, 829 B).  Shell: `lsnic`/`ping`/`arp`/
+`nslookup`/`wget`/`nettest`/`dnstest`/`httptest`.  RX is polled from the calling
+task (no IRQ/lock yet).  **Still open** (design below is the roadmap): a `struct
+sockaddr` layer + multiple concurrent TCP conns + TX segmentation; IRQ-driven RX
++ a `netd` task; TCP retransmit/congestion + a server role; DHCP (stage 7);
+IPv6; `/proc/net`; x86_64/aarch64 ports.
 
 **Why now:** after SMP and (probably) the x64 port, when the kernel
 can usefully share state across cores and a real network workload
@@ -3071,10 +3075,10 @@ is self-contained when read in isolation.
 > **Still open** (design below is the roadmap): EINTR / sigprocmask; user #PF →
 > SIGSEGV (a user fault still panics); `vfork`/`posix_spawn`; job control /
 > sessions / controlling tty; x86_64/aarch64 (the fork/signal register-restore is
-> i386 asm).  **Next per the agreed sequencing:** the net socket syscall API
-> (open §M24 tail — `socket`/`bind`/`connect`/`send`/`recv` to userland, the
-> §M39 TLS bridge) → §M35 threads → §M35.5 pkg → §M36 libc → …; §M26 Wayland
-> still deferred until POSIX + libc exist.
+> i386 asm).  **The net socket syscall API (§M24 stage 6) also shipped
+> 2026-07-11** — ring-3 UDP+TCP sockets (see §M24).  **Next per the agreed
+> sequencing:** §M35 threads → §M35.5 pkg → §M36 libc → …; §M26 Wayland still
+> deferred until POSIX + libc exist.
 
 **Why:** the single largest gap between today's userland (§M25) and any
 real POSIX program.  Browsers — Chromium especially, with its
@@ -3690,6 +3694,15 @@ not a binary registry.  Revisit only with a specific use case.
 
 ## Change log
 
+- **2026-07-11** — **§M24 stage 6 shipped: BSD socket API to userland (i386).**
+  Ring-3 networking over the in-kernel stack: `FD_NETSOCK` ofile + `struct
+  netsock` back `socket`/`bind`/`connect`/`sendto`/`recvfrom` (syscalls 22–26).
+  UDP via a per-socket datagram RX ring on net.c's port bindings; TCP via
+  `net_tcp_connect`/`send`/`recv`/`close` (read/write on the fd, one connection
+  at a time).  Host-order IPv4 + port ints (no sockaddr yet).  Boot-tested from
+  ring 3: `dnstest` (UDP-socket DNS → example.com) + `httptest` (UDP DNS + TCP
+  socket → `HTTP/1.1 200 OK`, 829 B).  The §M39 TLS bridge (swap TCP for TLS →
+  HTTPS).  Next: §M35 threads.  See DOCS.md §4.25.
 - **2026-07-11** — **§M34 shipped (POSIX process model, i386).**  The classic
   Unix process API on the M25 userland (DOCS §4.27): SysV initial stack
   (argc/argv/envp/auxv); **copy-on-write fork** (`vmm_space_clone` shares

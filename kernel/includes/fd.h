@@ -20,7 +20,9 @@ struct file;                    /* vfs.h  */
 struct shm;                     /* below  */
 struct usock;                   /* unix socket endpoint (stage 5)          */
 
-enum fd_kind { FD_VFS, FD_SHM, FD_SOCK };
+enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK };
+
+struct netsock;                 /* network (AF_INET) socket — usyscall.c        */
 
 struct ofile {
     enum fd_kind kind;
@@ -28,12 +30,14 @@ struct ofile {
     struct file* file;          /* FD_VFS  */
     struct shm*  shm;           /* FD_SHM  */
     struct usock* sock;         /* FD_SOCK */
+    struct netsock* nsock;      /* FD_NETSOCK (M24 socket API) */
 };
 
 /* Wrap a resource in a fresh ofile (refcount 1), or NULL on OOM. */
 struct ofile* ofile_from_file(struct file* f);
 struct ofile* ofile_from_shm (struct shm* s);
 struct ofile* ofile_from_sock(struct usock* s);
+struct ofile* ofile_from_netsock(struct netsock* s);
 
 /* Refcount management.  ofile_unref drops the last reference → closes the
  * wrapped resource + frees the ofile. */

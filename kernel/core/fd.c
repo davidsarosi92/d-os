@@ -16,6 +16,11 @@
 void usock_close(struct usock* s) __attribute__((weak));
 void usock_close(struct usock* s) { (void)s; }
 
+/* network-socket teardown lives in usyscall.c (M24 socket API); weak here so
+ * FD_NETSOCK unref links even in builds that don't pull it in. */
+void netsock_close(struct netsock* s) __attribute__((weak));
+void netsock_close(struct netsock* s) { (void)s; }
+
 /* ---- ofile ---------------------------------------------------------------- */
 
 static struct ofile* ofile_alloc(enum fd_kind k) {
@@ -43,6 +48,11 @@ struct ofile* ofile_from_sock(struct usock* s) {
     if (o) o->sock = s;
     return o;
 }
+struct ofile* ofile_from_netsock(struct netsock* s) {
+    struct ofile* o = ofile_alloc(FD_NETSOCK);
+    if (o) o->nsock = s;
+    return o;
+}
 
 struct ofile* ofile_ref(struct ofile* o) {
     if (o) o->refcount++;
@@ -56,6 +66,7 @@ void ofile_unref(struct ofile* o) {
         case FD_VFS:  if (o->file) vfs_close(o->file);   break;
         case FD_SHM:  if (o->shm)  shm_unref(o->shm);    break;
         case FD_SOCK: if (o->sock) usock_close(o->sock); break;
+        case FD_NETSOCK: if (o->nsock) netsock_close(o->nsock); break;
     }
     kfree(o);
 }

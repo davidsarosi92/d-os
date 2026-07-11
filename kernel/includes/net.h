@@ -167,6 +167,13 @@ int net_http_get(struct net_device* dev, uint32_t ip, uint16_t port,
  * `wget` command to print).  Returns the buffer; *len_out gets its length. */
 const uint8_t* net_http_body(uint32_t* len_out);
 
+/* General TCP client API (M24 socket API) — one connection at a time, over the
+ * same single g_tcp engine as net_http_get.  Back SOCK_STREAM sockets. */
+int  net_tcp_connect(struct net_device* dev, uint32_t ip, uint16_t port);
+int  net_tcp_send(struct net_device* dev, const void* buf, uint32_t len);
+int  net_tcp_recv(struct net_device* dev, void* buf, uint32_t len);   /* 0 = EOF */
+void net_tcp_close(struct net_device* dev);
+
 /* ----------------------- ICMP echo (ping) --------------------------------- */
 
 /* Send `count` ICMP echo requests to `ip`, polling for replies.  Prints a

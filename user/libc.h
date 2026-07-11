@@ -39,6 +39,18 @@ int   raise (int sig);
 #define SIGTERM 15
 #define SIGCHLD 17
 
+/* Network sockets (M24).  Addresses are host-order IPv4 + port ints (no
+ * struct sockaddr yet — a teaching-ABI simplification). */
+#define AF_INET     2
+#define SOCK_STREAM 1
+#define SOCK_DGRAM  2
+int   socket(int domain, int type, int proto);
+int   bind_port(int fd, int port);          /* bind a local UDP port */
+int   connect_ip(int fd, unsigned ip, int port);  /* TCP connect (host-order ip) */
+long  sendto(int fd, const void* buf, size_t n, unsigned ip, int port);
+long  recvfrom(int fd, void* buf, size_t n, unsigned* ip, int* port);
+#define IPV4(a,b,c,d) (((unsigned)(a)<<24)|((unsigned)(b)<<16)|((unsigned)(c)<<8)|(unsigned)(d))
+
 /* String / memory. */
 size_t strlen(const char* s);
 void*  memset(void* d, int c, size_t n);
