@@ -1544,6 +1544,22 @@ static void cmd_tlstest(void) {
     kprintf("tlstest: returned rc=%d\n", rc);
 }
 
+/* M36 — `posixtest`: broader POSIX syscalls (uname/stat/getdents/clock) from ring 3. */
+extern const unsigned char _binary_user_posixtest_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_posixtest_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_posixtest(void) {
+    if (!_binary_user_posixtest_i386_elf_start) {
+        console_write("posixtest: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_posixtest_i386_elf_end -
+                          _binary_user_posixtest_i386_elf_start);
+    console_write("posixtest: exec'ing POSIX-surface program...\n");
+    int rc = proc_exec_elf(_binary_user_posixtest_i386_elf_start, len);
+    kprintf("posixtest: returned rc=%d\n", rc);
+}
+
 /* §M35.5 — content-addressed package store. */
 static void cmd_pkg(const char* args) {
     if (starts_with(args, "build "))   { pkg_build(args + 6);   return; }
@@ -1738,6 +1754,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "pkg"))            { cmd_pkg("");        return; }
     if (starts_with(line, "pkg "))     { cmd_pkg(line + 4);  return; }
     if (streq(line, "pkgtest"))        { cmd_pkgtest();      return; }
+    if (streq(line, "posixtest"))      { cmd_posixtest();    return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }

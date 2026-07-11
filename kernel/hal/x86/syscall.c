@@ -159,6 +159,26 @@ void syscall_dispatch(struct int_frame* f) {
             f->eax = gdt_tls_selector();
             return;
         }
+
+        /* M36 — POSIX syscall breadth. */
+        case SYS_STAT:
+            f->eax = (uint32_t)sys_stat((const char*)f->ebx, (struct kstat*)f->ecx);
+            return;
+        case SYS_FSTAT:
+            f->eax = (uint32_t)sys_fstat((int)f->ebx, (struct kstat*)f->ecx);
+            return;
+        case SYS_GETDENTS:
+            f->eax = (uint32_t)sys_getdents((int)f->ebx, (void*)f->ecx, f->edx);
+            return;
+        case SYS_UNAME:
+            f->eax = (uint32_t)sys_uname((struct kutsname*)f->ebx);
+            return;
+        case SYS_CLOCK_GETTIME:
+            f->eax = (uint32_t)sys_clock_gettime((int)f->ebx, (struct ktimespec*)f->ecx);
+            return;
+        case SYS_NANOSLEEP:
+            f->eax = (uint32_t)sys_nanosleep((unsigned)f->ebx);
+            return;
         case SYS_SENDTO:
             f->eax = (uint32_t)sys_sendto((int)f->ebx, (const void*)f->ecx,
                                           f->edx, (uint32_t)f->esi, (int)f->edi);

@@ -35,6 +35,21 @@ int   futex(int* uaddr, int op, int val);
  * ABI layering lands with the libc port).  */
 void set_tls(void* tp);
 static inline int tls_load4(void) { int v; __asm__ volatile ("movl %%gs:4, %0" : "=r"(v)); return v; }
+
+/* POSIX syscall breadth (M36).  These structs match the kernel's kstat /
+ * kutsname / ktimespec (syscall.h). */
+struct stat    { unsigned size; int type; int mode; };   /* type 0=file,1=dir,2=dev */
+struct utsname { char sysname[65], nodename[65], release[65], version[65], machine[65]; };
+struct timespec { unsigned sec; unsigned nsec; };
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
+int  stat (const char* path, struct stat* out);
+int  fstat(int fd, struct stat* out);
+long getdents(int fd, void* buf, unsigned cap);
+int  uname(struct utsname* out);
+int  clock_gettime(int which, struct timespec* out);
+int  nanosleep_ms(unsigned ms);
+extern int errno;
 int   execv (const char* path, char* const argv[]);  /* replace image; no return on success */
 int   pipe  (int fds[2]);                   /* fds[0]=read, fds[1]=write */
 int   dup2  (int oldfd, int newfd);         /* redirect a descriptor */
