@@ -41,6 +41,7 @@
 #define SYS_GETPID 13       /* () → calling task's pid (Tier B)                */
 #define SYS_FORK   14       /* () → child pid in parent, 0 in child (M34)      */
 #define SYS_WAITPID 15      /* (pid, int* status) → reaped pid / -1  (M34)     */
+#define SYS_EXECVE 16       /* (path, argv) → replaces image; -1 on failure    */
 
 /* poll(2) events (Linux values). */
 #define POLLIN      0x001   /* readable                                        */

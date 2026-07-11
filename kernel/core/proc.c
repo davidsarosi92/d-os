@@ -17,6 +17,7 @@
 #include "syscall.h"
 #include "kmalloc.h"
 #include "hal_api.h"
+#include "vfs.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -133,6 +134,83 @@ int proc_exec_elf(const void* image, size_t len) {
 int proc_exec_elf_argv(const void* image, size_t len,
                        int argc, const char* const argv[]) {
     return proc_exec_common(image, len, argc, argv);
+}
+
+/* ---------------------------------------------------------------------------
+ * M34 — execve(path, argv): replace the calling user process's image.
+ *
+ * Loads the ELF at `path` from the VFS into a *fresh* address space, builds a
+ * new initial stack from `argv` (marshalled out of the OLD space first, since
+ * the pointers die when we swap), atomically swaps the task's `mm` to the new
+ * space (freeing the old), and resumes ring 3 at the new entry — one way, like
+ * a freshly spawned process.  fds survive the exec (POSIX; no O_CLOEXEC yet).
+ *
+ * Returns -1 (image intact) on any failure up to the commit point; on success
+ * it does not return (enter_user_mode).  Portable: only reached via the i386
+ * syscall dispatcher today, but the body uses portable primitives.
+ * --------------------------------------------------------------------------- */
+#define EXECVE_ARGBUF 2048u
+
+int proc_execve(const char* path, char* const uargv[]) {
+    struct task* me = task_current();
+    if (!me || !me->mm) return -1;           /* only a user process can exec  */
+
+    /* 1. Marshal argv into kernel memory while the OLD space is still active
+     *    (user pointers valid).  argv[i] strings are copied into strbuf. */
+    const char* kargv[PROC_MAX_ARGV];
+    char* strbuf = (char*)kmalloc(EXECVE_ARGBUF);
+    if (!strbuf) return -1;
+    int argc = 0; uint32_t soff = 0;
+    if (uargv) {
+        for (argc = 0; argc < PROC_MAX_ARGV && uargv[argc]; argc++) {
+            const char* s = uargv[argc];
+            uint32_t l = u_strlen(s) + 1;
+            if (soff + l > EXECVE_ARGBUF) break;
+            for (uint32_t j = 0; j < l; j++) strbuf[soff + j] = s[j];
+            kargv[argc] = &strbuf[soff];
+            soff += l;
+        }
+    }
+
+    /* 2. Read the ELF file into a kernel buffer. */
+    struct file* f = vfs_open(path, VFS_RDONLY);
+    if (!f) { kfree(strbuf); return -1; }
+    size_t sz = f->inode ? (size_t)f->inode->size : 0;
+    if (sz == 0 || sz > (16u << 20)) { vfs_close(f); kfree(strbuf); return -1; }
+    uint8_t* img = (uint8_t*)kmalloc(sz);
+    if (!img) { vfs_close(f); kfree(strbuf); return -1; }
+    ssize_t rd = vfs_read(f, img, sz);
+    vfs_close(f);
+    if (rd < (ssize_t)sz) { kfree(img); kfree(strbuf); return -1; }
+
+    /* 3. Build the new address space + initial stack. */
+    struct vmm_space* ns = vmm_space_create();
+    if (!ns) { kfree(img); kfree(strbuf); return -1; }
+    uintptr_t entry = 0;
+    if (elf_load(ns, img, sz, &entry) != ELF_OK) {
+        vmm_space_destroy(ns); kfree(img); kfree(strbuf); return -1;
+    }
+    uint32_t stk = pmm_alloc_frame();
+    if (!stk) { vmm_space_destroy(ns); kfree(img); kfree(strbuf); return -1; }
+    uintptr_t stack_va = vmm_user_base() + PROC_STACK_OFFSET;
+    if (vmm_space_map(ns, stack_va, stk, VMM_USER | VMM_WRITABLE) != 0) {
+        pmm_free_frame(stk); vmm_space_destroy(ns);
+        kfree(img); kfree(strbuf); return -1;
+    }
+    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, kargv);
+
+    /* 4. Commit: swap to the new space, free the old one + scratch. */
+    struct vmm_space* old = me->mm;
+    me->mm = ns;
+    me->mmap_cursor = 0;
+    vmm_space_switch(ns);
+    if (old) vmm_space_destroy(old);
+    kfree(img);
+    kfree(strbuf);
+
+    /* 5. Resume in ring 3 at the new entry (one-way). */
+    enter_user_mode(entry, user_sp);
+    return 0;                                /* unreachable */
 }
 
 /* ---------------------------------------------------------------------------

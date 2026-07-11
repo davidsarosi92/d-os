@@ -1408,6 +1408,45 @@ static void cmd_forktest(void) {
     kprintf("forktest: returned rc=%d\n", rc);
 }
 
+/* M34 slice C — install the embedded user ELFs into the ramfs as /bin/<name>
+ * so execve(path) can load them via the VFS.  Idempotent; called once from the
+ * shell entry.  (The first real step toward a populated /bin.) */
+static void bin_install_one(const char* path, const unsigned char* s,
+                            const unsigned char* e) {
+    if (!s || !e || e <= s) return;
+    struct file* f = vfs_open(path, VFS_WRONLY | VFS_CREATE);
+    if (!f) return;
+    vfs_write(f, s, (size_t)(e - s));
+    vfs_close(f);
+}
+
+void bin_install(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    vfs_mkdir("/bin");
+    bin_install_one("/bin/args",  _binary_user_args_i386_elf_start,
+                                  _binary_user_args_i386_elf_end);
+    bin_install_one("/bin/hello", _binary_user_hello_i386_elf_start,
+                                  _binary_user_hello_i386_elf_end);
+}
+
+/* M34 slice C — `forkexec`: fork()+execv(/bin/args)+waitpid() from ring 3. */
+extern const unsigned char _binary_user_forkexec_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_forkexec_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_forkexec(void) {
+    if (!_binary_user_forkexec_i386_elf_start) {
+        console_write("forkexec: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_forkexec_i386_elf_end -
+                          _binary_user_forkexec_i386_elf_start);
+    console_write("forkexec: exec'ing fork()+execv()+waitpid() program...\n");
+    int rc = proc_exec_elf(_binary_user_forkexec_i386_elf_start, len);
+    kprintf("forkexec: returned rc=%d\n", rc);
+}
+
 /* -------------------------------------------------------------------- */
 /* Configuration commands.                                              */
 /* -------------------------------------------------------------------- */
@@ -1566,6 +1605,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "runargs"))        { cmd_runargs(""); return; }
     if (starts_with(line, "runargs ")) { cmd_runargs(line + 8); return; }
     if (streq(line, "forktest"))       { cmd_forktest(); return; }
+    if (streq(line, "forkexec"))       { cmd_forkexec(); return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }
@@ -1650,8 +1690,11 @@ static void dispatch(struct vc* my_vc, const char* line) {
  *
  * The first prompt that prints is the user's only signal that the new
  * pane is alive, so we print it before any blocking read. */
+void bin_install(void);   /* defined above — installs the /bin entries */
+
 void shell_run(struct vc* v) {
     char line[LINE_MAX];
+    bin_install();                       /* M34 — populate /bin for execve() */
     /* Announce ourselves once in case this pane was just spawned. */
     kprintf("[pane %d ready, pid %d]\n",
             v->id, task_current() ? task_current()->pid : -1);

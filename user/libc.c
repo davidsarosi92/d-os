@@ -18,6 +18,7 @@
 #define SYS_GETPID 13
 #define SYS_FORK   14
 #define SYS_WAITPID 15
+#define SYS_EXECVE 16
 
 /* One syscall path, three arches.  x86 (i386 + x86_64) trap via `int 0x80`
  * (rax/eax = number, rbx/ecx/edx = args); aarch64 traps via `svc #0` with the
@@ -54,6 +55,7 @@ void* mmap (size_t len, int fd)                { long r = syscall3(SYS_MMAP, (lo
 int   getpid(void)                             { return (int)syscall3(SYS_GETPID, 0, 0, 0); }
 int   fork  (void)                             { return (int)syscall3(SYS_FORK, 0, 0, 0); }
 int   waitpid(int pid, int* status)            { return (int)syscall3(SYS_WAITPID, pid, (long)status, 0); }
+int   execv (const char* path, char* const argv[]) { return (int)syscall3(SYS_EXECVE, (long)path, (long)argv, 0); }
 
 size_t strlen(const char* s) { size_t i = 0; while (s[i]) i++; return i; }
 

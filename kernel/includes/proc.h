@@ -46,4 +46,9 @@ int proc_spawn(const char* name, const void* image, size_t len);
 struct user_regs;
 int proc_fork(struct user_regs* parent_regs);
 
+/* M34 — execve(path, argv): replace the calling user process's image with the
+ * ELF at `path` (loaded from the VFS), passing `argv`.  fds survive.  Returns
+ * -1 (image intact) on failure; does not return on success. */
+int proc_execve(const char* path, char* const argv[]);
+
 #endif

@@ -97,6 +97,14 @@ void syscall_dispatch(struct int_frame* f) {
             return;
         }
 
+        /* M34 — execve(path, argv): replace this process's image.  On success
+         * proc_execve does not return (it iret's into the new program); on
+         * failure it returns -1 and the old image continues. */
+        case SYS_EXECVE:
+            f->eax = (uint32_t)proc_execve((const char*)f->ebx,
+                                           (char* const*)f->ecx);
+            return;
+
         /* M25 stage 3 — fd syscalls.  EBX/ECX/EDX = arg0/arg1/arg2. */
         case SYS_WRITE:
             f->eax = (uint32_t)sys_write((int)f->ebx, (const void*)f->ecx, f->edx);

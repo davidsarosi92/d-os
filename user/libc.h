@@ -22,6 +22,7 @@ void* mmap (size_t len, int fd);            /* fd<0 = anonymous */
 int   getpid(void);
 int   fork  (void);                         /* → child pid in parent, 0 in child */
 int   waitpid(int pid, int* status);        /* block for a child; → reaped pid */
+int   execv (const char* path, char* const argv[]);  /* replace image; no return on success */
 
 /* String / memory. */
 size_t strlen(const char* s);

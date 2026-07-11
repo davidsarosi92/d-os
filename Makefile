@@ -68,7 +68,8 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/switch.s
 
   ARCH_EXTRA_OBJS := kernel/hal/x86/ap_trampoline_blob.o user/hello_blob.o \
-                     user/spin_blob.o user/args_blob.o user/forktest_blob.o
+                     user/spin_blob.o user/args_blob.o user/forktest_blob.o \
+                     user/forkexec_blob.o
 
   # Tier B — in-tree user libc build knobs (i386 reference).
   USER_CFLAGS   := -m32 -ffreestanding -fno-pie -fno-stack-protector \
@@ -562,6 +563,18 @@ user/forktest_$(ARCH).elf: user/libc.c user/forktest.c user/libc.h
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/forktest.o $(OBJ_DIR)/user/libc.o
 
 $(OBJ_DIR)/user/forktest_blob.o: user/forktest_$(ARCH).elf
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+user/forkexec_$(ARCH).elf: user/libc.c user/forkexec.c user/libc.h
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c     -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/forkexec.c -o $(OBJ_DIR)/user/forkexec.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/forkexec.o $(OBJ_DIR)/user/libc.o
+
+$(OBJ_DIR)/user/forkexec_blob.o: user/forkexec_$(ARCH).elf
 	@mkdir -p $(@D)
 	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
