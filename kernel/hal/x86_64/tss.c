@@ -87,5 +87,8 @@ void hal_set_kernel_stack(uintptr_t top) {
                    : (uint64_t)(uintptr_t)(syscall_stack + KSTACK_SIZE);
 }
 
+/* M35 TLS — stub for now (x86_64 TLS uses the FS.base MSR; a later port). */
+void hal_set_tls_base(uintptr_t base) { (void)base; }
+
 uintptr_t tss_get_addr(void)  { return (uintptr_t)&tss; }
 uint32_t  tss_get_limit(void) { return sizeof(tss) - 1; }

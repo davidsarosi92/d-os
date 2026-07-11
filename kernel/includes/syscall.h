@@ -55,6 +55,7 @@
 #define SYS_BIND   26       /* (fd, port) → 0 / -1                             */
 #define SYS_CLONE  27       /* (entry, stack) → tid  (M35 thread)              */
 #define SYS_FUTEX  28       /* (uaddr, op, val) → 0 / -1  (M35)                */
+#define SYS_SET_TLS 29      /* (base) → %gs selector  (M35 thread-local storage) */
 
 /* futex ops (M35). */
 #define FUTEX_WAIT  0       /* block iff *uaddr == val                         */

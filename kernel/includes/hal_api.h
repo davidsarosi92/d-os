@@ -156,4 +156,12 @@ void hal_syscall_exit_to_kernel(uintptr_t saved_sp, uintptr_t saved_pc)
  * task, so it tracks automatically. */
 void hal_set_kernel_stack(uintptr_t top);
 
+/* M35 TLS — set the base of the running CPU's user thread-local-storage
+ * segment (the segment a ring-3 `__thread` access reads through: %gs on i386).
+ * The scheduler calls this on switch-in to a thread that set a TLS pointer.
+ * i386 rewrites this CPU's user-TLS GDT descriptor's base; other arches that
+ * lack a segmented TLS model provide a stub (they'll use a register-based
+ * thread pointer when their libc port lands). */
+void hal_set_tls_base(uintptr_t base);
+
 #endif

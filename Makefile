@@ -72,7 +72,8 @@ ifeq ($(ARCH),i386)
                      user/spin_blob.o user/args_blob.o user/forktest_blob.o \
                      user/forkexec_blob.o user/pipetest_blob.o \
                      user/sigtest_blob.o user/dnstest_blob.o \
-                     user/httptest_blob.o user/threadtest_blob.o
+                     user/httptest_blob.o user/threadtest_blob.o \
+                     user/tlstest_blob.o
 
   # Tier B — in-tree user libc build knobs (i386 reference).
   USER_CFLAGS   := -m32 -ffreestanding -fno-pie -fno-stack-protector \
@@ -639,6 +640,18 @@ user/threadtest_$(ARCH).elf: user/libc.c user/threadtest.c user/libc.h
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/threadtest.o $(OBJ_DIR)/user/libc.o
 
 $(OBJ_DIR)/user/threadtest_blob.o: user/threadtest_$(ARCH).elf
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+user/tlstest_$(ARCH).elf: user/libc.c user/tlstest.c user/libc.h
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c    -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/tlstest.c -o $(OBJ_DIR)/user/tlstest.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/tlstest.o $(OBJ_DIR)/user/libc.o
+
+$(OBJ_DIR)/user/tlstest_blob.o: user/tlstest_$(ARCH).elf
 	@mkdir -p $(@D)
 	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 

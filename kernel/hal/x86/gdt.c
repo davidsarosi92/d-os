@@ -72,10 +72,14 @@ struct gdt_ptr {
 } __attribute__((packed));
 
 /* Fixed entries: null, kernel CS, kernel DS, user CS, user DS (0..4), then one
- * TSS descriptor PER CPU starting at index GDT_TSS_BASE (SMP — each CPU loads
- * TR with its own).  Selector for CPU c is (GDT_TSS_BASE + c) << 3. */
+ * TSS descriptor PER CPU at GDT_TSS_BASE.. (SMP — each CPU loads TR with its
+ * own; selector for CPU c = (GDT_TSS_BASE + c) << 3), then one user-TLS
+ * descriptor PER CPU at GDT_TLS_BASE.. (M35 — a ring-3 %gs segment whose base
+ * the scheduler swaps to the running thread's TLS pointer; selector for CPU c
+ * = (GDT_TLS_BASE + c) << 3 | 3). */
 #define GDT_TSS_BASE  5
-#define GDT_ENTRIES   (GDT_TSS_BASE + ACPI_MAX_CPUS)
+#define GDT_TLS_BASE  (GDT_TSS_BASE + ACPI_MAX_CPUS)
+#define GDT_ENTRIES   (GDT_TLS_BASE + ACPI_MAX_CPUS)
 static struct gdt_entry gdt[GDT_ENTRIES];
 static struct gdt_ptr   gdtr;
 
@@ -150,6 +154,12 @@ void gdt_init(void) {
         set_entry(GDT_TSS_BASE + c, (uint32_t)tss_get_addr_cpu(c),
                   tss_get_limit(), 0x89, 0x0);
 
+    /* Per-CPU user-TLS descriptors: a flat 4 GiB ring-3 data segment
+     * (access 0xF2 = P=1, DPL=3, S=1, Type=0010, same as user DS) whose base
+     * starts at 0 and is rewritten per-thread by hal_set_tls_base. */
+    for (int c = 0; c < tss_max_cpus(); c++)
+        set_entry(GDT_TLS_BASE + c, 0, 0xFFFFF, 0xF2, 0xC);
+
     gdtr.limit = sizeof(gdt) - 1;
     gdtr.base  = (uint32_t)(uintptr_t)&gdt[0];
 
@@ -170,4 +180,19 @@ void gdt_init(void) {
 void gdt_load_cpu_tss(void) {
     uint16_t sel = (uint16_t)((GDT_TSS_BASE + this_cpu_id()) << 3);
     __asm__ volatile ("ltr %0" : : "r"(sel));
+}
+
+/* M35 TLS — the ring-3 selector a thread on THIS CPU loads into %gs to reach
+ * its thread-local block (RPL 3).  Returned by sys_set_tls. */
+uint16_t gdt_tls_selector(void) {
+    return (uint16_t)(((GDT_TLS_BASE + this_cpu_id()) << 3) | 3);
+}
+
+/* M35 TLS — rewrite THIS CPU's user-TLS descriptor base.  The CPU caches a
+ * descriptor in the hidden part of %gs, so the new base takes effect only when
+ * %gs is next (re)loaded — which happens naturally on the return-to-ring-3 path
+ * (isr_common pops %gs before iret).  Called by the scheduler on switch-in and
+ * by sys_set_tls. */
+void hal_set_tls_base(uintptr_t base) {
+    set_entry(GDT_TLS_BASE + this_cpu_id(), (uint32_t)base, 0xFFFFF, 0xF2, 0xC);
 }

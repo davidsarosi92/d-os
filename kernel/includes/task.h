@@ -94,6 +94,12 @@ struct task {
      * reap must NOT destroy the address space (the thread group still uses it).
      * 0 for a process that owns its mm; 1 for a cloned thread. */
     int           mm_shared;
+    /* M35 TLS — user thread-local-storage pointer.  `has_tls` set once the
+     * thread calls set_thread_area; `tls_base` is its %gs segment base (the
+     * thread pointer).  The scheduler reloads this CPU's user-TLS descriptor
+     * from `tls_base` on switch-in.  A TLS thread is pinned to its CPU. */
+    int           has_tls;
+    uintptr_t     tls_base;
     /* Master-list link (circular SLL of every alive task).  Walked by
      * ps / task_for_each / task_find.  Pre-M18.6.1 the scheduler
      * also walked this list; now per-CPU runqueues take that role and

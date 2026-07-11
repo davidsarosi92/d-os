@@ -657,6 +657,11 @@ static void schedule_locked(struct percpu* me) {
     hal_set_kernel_stack((next->user_task && next->kstack_base)
                          ? (uintptr_t)next->kstack_base + TASK_KSTACK_SZ
                          : 0);
+    /* M35 TLS — point this CPU's user-TLS segment base at the incoming
+     * thread's thread-pointer, so its %gs-relative __thread accesses resolve
+     * to its own block.  No-op if the task set no TLS.  (TLS threads are
+     * pinned to their CPU, so `this_cpu` here is always their home CPU.) */
+    if (next->has_tls) hal_set_tls_base(next->tls_base);
     /* M25 — switch to next's address space before swapping stacks.  For a
      * kernel thread (mm == NULL) this targets the shared kernel directory,
      * and vmm_space_switch skips the CR3 reload when it's already loaded —

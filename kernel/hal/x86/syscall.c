@@ -33,6 +33,8 @@
 #include "task.h"
 #include "proc.h"
 #include "usermode.h"
+#include "gdt.h"
+#include "percpu.h"
 #include <stdint.h>
 
 /* Imports from usermode.s — the saved kernel context that lets SYS_EXIT
@@ -143,6 +145,20 @@ void syscall_dispatch(struct int_frame* f) {
         case SYS_FUTEX:
             f->eax = (uint32_t)sys_futex((int*)f->ebx, (int)f->ecx, (int)f->edx);
             return;
+
+        /* M35 TLS — set_thread_area(base): record the caller's TLS pointer,
+         * pin it to this CPU (its %gs selector is per-CPU), load this CPU's
+         * user-TLS descriptor base, and return the ring-3 %gs selector. */
+        case SYS_SET_TLS: {
+            struct task* t = task_current();
+            if (!t) { f->eax = 0; return; }
+            t->tls_base = (uintptr_t)f->ebx;
+            t->has_tls  = 1;
+            task_set_affinity(t, 1u << this_cpu_id());
+            hal_set_tls_base(t->tls_base);
+            f->eax = gdt_tls_selector();
+            return;
+        }
         case SYS_SENDTO:
             f->eax = (uint32_t)sys_sendto((int)f->ebx, (const void*)f->ecx,
                                           f->edx, (uint32_t)f->esi, (int)f->edi);
