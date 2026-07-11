@@ -3014,8 +3014,26 @@ TSS descriptor per CPU at `GDT_TSS_BASE..`; each CPU LTRs its own via
 ring-3 tasks on APs — `procspawn`'s two user processes now run + reap on
 `-smp 2`, not just threads.
 
-**Still deferred (later §M35):** thread-local storage (`__thread` /
-`set_thread_area` — a GDT entry per thread); priority inheritance / robust
+**Thread-local storage (`%gs`).**  i386 reads a `__thread` variable through
+`%gs`, whose base comes from a GDT descriptor.  To give each thread its own
+base we keep **one user-TLS descriptor per CPU** in the GDT (`GDT_TLS_BASE..`,
+files `gdt.c`); the scheduler reloads *this CPU's* descriptor base to the
+incoming thread's TLS pointer on switch-in (`hal_set_tls_base`, a HAL hook so
+`task.c` stays portable — x86_64/aarch64 stub it, to use `FS.base`/`TPIDR_EL0`
+later).  `set_thread_area` (SYS_SET_TLS) records the base, **pins the thread to
+its CPU** (its `%gs` selector is per-CPU), programs the descriptor and returns
+the ring-3 `%gs` selector; libc `set_tls()` loads `%gs` with it.  A descriptor
+edit is picked up on the next `%gs` reload — which the return-to-ring-3 path
+(`isr_common` pops `%gs`) does for free.  **Boot-tested UP and `-smp 2`:**
+`tlstest`'s 4 threads each read only their **own** id back through `%gs` (0
+mismatches over 50000 iterations) — the per-thread base is maintained across
+context switches on both.  Scope: this proves the `%gs` mechanism; the
+compiler's full `__thread` ABI (a PT_TLS template + variant-II layout, set up
+by the runtime) layers on with the libc port (§M36).
+
+**Still deferred (later §M35 / §M36):** the compiler `__thread` ABI runtime
+(above); migration-safe TLS threads (today they are pinned to their CPU — a
+truly migratable `%gs` needs a per-CPU GDT); priority inheritance / robust
 futexes; `gettid`; per-thread signal masks; x86_64/aarch64.
 
 ---
@@ -3098,11 +3116,14 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   FUTEX_WAIT parks iff `*uaddr==val` (lost-wakeup-free under the Tier-A queue
   lock) / FUTEX_WAKE, hashed by physical address.  `threadtest` (3-state
   Drepper mutex): 4 threads × 5000 shared-counter increments = 20000/20000
-  PASS on **both UP and `-smp 2`**.  Also fixed a pre-existing gap it exposed —
-  ring-3 tasks didn't run on APs (single global TSS + no per-CPU LTR): now a
-  **per-CPU TSS** (array in tss.c + one GDT descriptor per CPU + each CPU LTRs
-  its own in gdt_init/ap_main), so procspawn's user processes run on `-smp 2`
-  too.  See PLAN.md §M35.
+  PASS on **both UP and `-smp 2`**.  Plus **thread-local storage** via `%gs`
+  (per-CPU GDT TLS descriptors + `hal_set_tls_base` on switch-in + SYS_SET_TLS +
+  libc `set_tls`): `tlstest`'s 4 threads each read only their own id through
+  `%gs` (0 mismatches, UP + `-smp 2`).  Also fixed a pre-existing gap it
+  exposed — ring-3 tasks didn't run on APs (single global TSS + no per-CPU LTR):
+  now a **per-CPU TSS** (array in tss.c + one GDT descriptor per CPU + each CPU
+  LTRs its own in gdt_init/ap_main), so procspawn's user processes run on
+  `-smp 2` too.  See PLAN.md §M35.
 - **2026-07-11 — M24 stage 6: BSD socket API to userland, i386.**  Ring-3
   networking over the in-kernel stack (DOCS §4.25): a new `FD_NETSOCK` ofile +
   `struct netsock` back `socket`/`bind`/`connect`/`sendto`/`recvfrom` (syscalls
