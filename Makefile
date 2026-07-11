@@ -60,7 +60,8 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/smp.c \
       kernel/hal/x86/syscall.c \
       kernel/hal/x86/fork.c \
-      kernel/hal/x86/signal.c
+      kernel/hal/x86/signal.c \
+      kernel/hal/x86/linux_abi.c
 
   ARCH_ASM_SRCS := \
       kernel/hal/x86/boot.s \
@@ -73,7 +74,7 @@ ifeq ($(ARCH),i386)
                      user/forkexec_blob.o user/pipetest_blob.o \
                      user/sigtest_blob.o user/dnstest_blob.o \
                      user/httptest_blob.o user/threadtest_blob.o \
-                     user/tlstest_blob.o
+                     user/tlstest_blob.o user/linuxhello_blob.o
 
   # Tier B — in-tree user libc build knobs (i386 reference).
   USER_CFLAGS   := -m32 -ffreestanding -fno-pie -fno-stack-protector \
@@ -653,6 +654,17 @@ user/tlstest_$(ARCH).elf: user/libc.c user/tlstest.c user/libc.h
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/tlstest.o $(OBJ_DIR)/user/libc.o
 
 $(OBJ_DIR)/user/tlstest_blob.o: user/tlstest_$(ARCH).elf
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+# Standalone Linux-ABI test program — NO d-os crt0/libc (entry = _start), uses
+# Linux syscall numbers directly.  Run under the Linux personality.
+user/linuxhello_$(ARCH).elf: user/linuxhello.c
+	@mkdir -p $(OBJ_DIR)/user
+	$(CC) $(USER_CFLAGS) -c user/linuxhello.c -o $(OBJ_DIR)/user/linuxhello.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ $(OBJ_DIR)/user/linuxhello.o
+
+$(OBJ_DIR)/user/linuxhello_blob.o: user/linuxhello_$(ARCH).elf
 	@mkdir -p $(@D)
 	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 

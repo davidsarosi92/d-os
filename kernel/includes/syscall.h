@@ -133,4 +133,8 @@ void syscall_dispatch(struct int_frame* f);
 void signal_deliver(struct int_frame* f);
 void signal_sigreturn(struct int_frame* f);
 
+/* M36 / §M41 — Linux i386 syscall-ABI dispatch (hal/x86/linux_abi.c).  The
+ * native dispatcher routes here for a process with the Linux personality. */
+void linux_syscall_dispatch(struct int_frame* f);
+
 #endif

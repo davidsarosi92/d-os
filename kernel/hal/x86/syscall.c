@@ -43,6 +43,12 @@ extern uint32_t saved_esp;
 extern uint32_t saved_eip;
 
 void syscall_dispatch(struct int_frame* f) {
+    /* M36 / §M41 — route a Linux-personality process to the Linux i386 ABI
+     * translator (a separate, isolated module); native d-os programs fall
+     * through to the switch below. */
+    struct task* cur = task_current();
+    if (cur && cur->linux_abi) { linux_syscall_dispatch(f); return; }
+
     switch (f->eax) {
         case SYS_PRINT: {
             /* EBX = const char* user pointer.  Walk it directly; our
