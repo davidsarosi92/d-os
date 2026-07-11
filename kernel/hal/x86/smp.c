@@ -109,6 +109,10 @@ static void ap_main(void) {
     lapic_init_ap();
     percpu_init_ap();
     idt_load();
+    /* SMP userland: point this CPU's TR at its own TSS so ring-3 → ring-0
+     * traps (syscalls/IRQs from a user task scheduled here) land on a valid
+     * per-CPU kernel stack.  After percpu_init_ap so this_cpu_id() is valid. */
+    gdt_load_cpu_tss();
 
     /* Announce ourselves on serial — once per boot per AP. */
     kprintf("ap: cpu %d (apic_id=%u) online\n",

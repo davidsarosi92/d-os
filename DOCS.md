@@ -2996,25 +2996,27 @@ bucket and every waiter re-checks its own `*uaddr` and re-parks if unchanged
 (Drepper) futex mutex — the uncontended path is a single atomic op with no
 syscall; the kernel is only entered on contention.
 
-**Boot-tested (i386, UP):** 4 threads × 5000 increments of one shared counter
-under the futex mutex = **20000/20000 PASS** — proving the shared address space,
-the mutex's correctness, and `thread_join`.  The threads/futex code is SMP-safe
-(locked `xchg` in the mutex + spinlock-guarded wait-queues in the kernel).
+**Boot-tested — UP *and* SMP.**  4 threads × 5000 increments of one shared
+counter under the futex mutex = **20000/20000 PASS** on both `-smp 1` and
+`-smp 2` (truly parallel on two CPUs), proving the shared address space, the
+mutex's correctness, `thread_join`, and SMP safety (locked `xchg` in the mutex +
+spinlock-guarded kernel wait-queues).
 
-**Known gap — ring-3 tasks do not run on APs (pre-existing, surfaced here).**
-`threadtest` (and, it turns out, `procspawn`) *hang* under `-smp 2`.  Cause:
-`tss.c` has a **single global TSS** shared by all CPUs, and the APs never `LTR`
-their own — so a ring-3 → ring-0 transition (syscall/IRQ) on an AP has no valid
-per-CPU kernel stack.  This was never caught because user tasks had only ever
-been exercised on `-smp 1`.  The fix is **per-CPU TSS + per-CPU `LTR`** (a GDT
-TSS descriptor per CPU + each CPU loading its own; `hal_set_kernel_stack` writes
-`tss[this_cpu].esp0`) — a self-contained SMP-userland infrastructure change that
-unblocks *all* ring-3 tasks on APs, not just threads.  Until then, userland runs
-on the BSP.
+**SMP userland fix — per-CPU TSS (done as part of this milestone).**  Bringing
+threads up on `-smp 2` first exposed a *pre-existing* gap: `tss.c` had a **single
+global TSS** and the APs never `LTR`'d one, so a ring-3 → ring-0 trap on an AP
+had no valid per-CPU kernel stack — `threadtest` **and** `procspawn` hung on
+`-smp 2` (never caught before: user tasks had only run on `-smp 1`).  Fixed with
+a **per-CPU TSS** (an array in `tss.c`, one dedicated syscall stack each; one GDT
+TSS descriptor per CPU at `GDT_TSS_BASE..`; each CPU LTRs its own via
+`gdt_load_cpu_tss()` — the BSP from `gdt_init`, each AP from `ap_main`;
+`hal_set_kernel_stack` writes `tss[this_cpu_id()].esp0`).  This unblocked **all**
+ring-3 tasks on APs — `procspawn`'s two user processes now run + reap on
+`-smp 2`, not just threads.
 
-**Still deferred (later §M35):** the per-CPU TSS fix (above); thread-local
-storage (`__thread` / `set_thread_area` — a GDT entry per thread); priority
-inheritance / robust futexes; `gettid`; per-thread signal masks; x86_64/aarch64.
+**Still deferred (later §M35):** thread-local storage (`__thread` /
+`set_thread_area` — a GDT entry per thread); priority inheritance / robust
+futexes; `gettid`; per-thread signal masks; x86_64/aarch64.
 
 ---
 
@@ -3096,9 +3098,11 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   FUTEX_WAIT parks iff `*uaddr==val` (lost-wakeup-free under the Tier-A queue
   lock) / FUTEX_WAKE, hashed by physical address.  `threadtest` (3-state
   Drepper mutex): 4 threads × 5000 shared-counter increments = 20000/20000
-  PASS on UP.  **Known pre-existing gap:** ring-3 tasks don't run on APs (single
-  global TSS + no per-CPU LTR) — threadtest AND procspawn hang on `-smp 2`; fix
-  = per-CPU TSS.  See PLAN.md §M35.
+  PASS on **both UP and `-smp 2`**.  Also fixed a pre-existing gap it exposed —
+  ring-3 tasks didn't run on APs (single global TSS + no per-CPU LTR): now a
+  **per-CPU TSS** (array in tss.c + one GDT descriptor per CPU + each CPU LTRs
+  its own in gdt_init/ap_main), so procspawn's user processes run on `-smp 2`
+  too.  See PLAN.md §M35.
 - **2026-07-11 — M24 stage 6: BSD socket API to userland, i386.**  Ring-3
   networking over the in-kernel stack (DOCS §4.25): a new `FD_NETSOCK` ofile +
   `struct netsock` back `socket`/`bind`/`connect`/`sendto`/`recvfrom` (syscalls

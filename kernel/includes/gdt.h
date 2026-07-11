@@ -29,4 +29,10 @@ void gdt_init(void);
  * the AP boot trampoline (M18) so the AP can lgdt the same table. */
 void* gdt_get_ptr_struct(void);
 
+/* Load the running CPU's task register with its own per-CPU TSS descriptor
+ * (SMP).  The BSP calls this from gdt_init; each AP calls it from ap_main
+ * once percpu is up.  Without it, a ring-3 → ring-0 trap on that CPU has no
+ * valid kernel stack. */
+void gdt_load_cpu_tss(void);
+
 #endif

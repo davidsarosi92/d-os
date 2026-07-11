@@ -51,6 +51,8 @@
 #include "gdt.h"
 #include "printf.h"
 #include "tss.h"
+#include "acpi.h"          /* ACPI_MAX_CPUS */
+#include "percpu.h"        /* this_cpu_id  */
 #include <stdint.h>
 
 /* One GDT entry, packed because the CPU reads it byte-for-byte. */
@@ -69,8 +71,11 @@ struct gdt_ptr {
     uint32_t base;                  /* linear address of the GDT */
 } __attribute__((packed));
 
-/* 6 entries: null, kernel CS, kernel DS, user CS, user DS, TSS */
-#define GDT_ENTRIES 6
+/* Fixed entries: null, kernel CS, kernel DS, user CS, user DS (0..4), then one
+ * TSS descriptor PER CPU starting at index GDT_TSS_BASE (SMP — each CPU loads
+ * TR with its own).  Selector for CPU c is (GDT_TSS_BASE + c) << 3. */
+#define GDT_TSS_BASE  5
+#define GDT_ENTRIES   (GDT_TSS_BASE + ACPI_MAX_CPUS)
 static struct gdt_entry gdt[GDT_ENTRIES];
 static struct gdt_ptr   gdtr;
 
@@ -137,23 +142,32 @@ void gdt_init(void) {
      * Access byte: P=1, DPL=3, S=1, Type=0010 → 0xF2. */
     set_entry(4, 0, 0xFFFFF, 0xF2, 0xC);
 
-    /* Entry 5: TSS descriptor — base + limit point at our static TSS in
-     * tss.c.  Access type 0x9 = "32-bit available TSS" with S=0 (system).
-     * Full access byte: P=1, DPL=0, S=0, Type=1001 → 0x89.  Flags 0x0
-     * (no granularity, single TSS).  `tss_get_addr()` returns the
-     * struct's linear address; `tss_get_limit` returns sizeof(tss)-1. */
-    set_entry(5, tss_get_addr(), tss_get_limit(), 0x89, 0x0);
+    /* Entries GDT_TSS_BASE..: one 32-bit-available-TSS descriptor per CPU
+     * (access 0x89 = P=1, DPL=0, S=0, Type=1001; flags 0x0).  Each points at
+     * that CPU's own TSS in tss.c so a ring-3 → ring-0 trap on any core lands
+     * on its own kernel stack. */
+    for (int c = 0; c < tss_max_cpus(); c++)
+        set_entry(GDT_TSS_BASE + c, (uint32_t)tss_get_addr_cpu(c),
+                  tss_get_limit(), 0x89, 0x0);
 
     gdtr.limit = sizeof(gdt) - 1;
     gdtr.base  = (uint32_t)(uintptr_t)&gdt[0];
 
     gdt_load();
 
-    /* Load TR (task register) so the CPU starts using our TSS for ring
-     * transitions.  Must come AFTER lgdt because TR loading reads the
-     * GDT to validate the descriptor. */
-    __asm__ volatile ("ltr %%ax" : : "a"((uint16_t)GDT_TSS));
+    /* Load TR for the running CPU (the BSP, logical 0 at this point).  Must
+     * come AFTER lgdt because TR loading reads the GDT to validate. */
+    gdt_load_cpu_tss();
 
-    kprintf("GDT: %d entries @ %p (incl. user CS/DS + TSS)\n",
-            GDT_ENTRIES, (void*)gdtr.base);
+    kprintf("GDT: %d entries @ %p (%d per-CPU TSS)\n",
+            GDT_ENTRIES, (void*)gdtr.base, tss_max_cpus());
+}
+
+/* Load this CPU's task register with its own per-CPU TSS descriptor.  Called
+ * by the BSP from gdt_init and by each AP from ap_main (after percpu is up so
+ * this_cpu_id() is valid).  The GDT itself is shared, so the AP just needs to
+ * point TR at its slot. */
+void gdt_load_cpu_tss(void) {
+    uint16_t sel = (uint16_t)((GDT_TSS_BASE + this_cpu_id()) << 3);
+    __asm__ volatile ("ltr %0" : : "r"(sel));
 }

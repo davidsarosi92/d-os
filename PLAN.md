@@ -64,7 +64,7 @@
 | §M32 | Multi-user — identity, login, file perms, isolation | ~2160 |
 | §M33 | Execution domains — where a service runs (kernel / user / isolated); driver placement is the flagship case | ~2265 |
 | §M34 | POSIX process & signals — ✅ shipped (i386): fork(COW)/execve/waitpid/pipe/dup2/signals (DOCS §4.27) | — |
-| §M35 | Threads & futex — ✅ shipped (i386, UP): clone/futex/thread_create (DOCS §4.28; SMP blocked on per-CPU TSS) | — |
+| §M35 | Threads & futex — ✅ shipped (i386, UP + SMP): clone/futex/thread_create + per-CPU TSS (DOCS §4.28) | — |
 | §M35.5 | Package manager & isolation — content-addressed store (Nix-shaped); gates every port | — |
 | §M36 | POSIX syscall breadth + native libc (musl port) | — |
 | §M37 | Dynamic linking — ld.so / `.so` / dlopen | — |
@@ -3136,7 +3136,7 @@ on each arch.
 
 ---
 
-## §M35 — Threads & futex — ✅ shipped (i386, UP)
+## §M35 — Threads & futex — ✅ shipped (i386, UP + SMP)
 
 > ✅ **SHIPPED (2026-07-11, i386) — see DOCS.md §4.28.**  `proc_clone`
 > (SYS_CLONE) creates a thread that SHARES the creator's address space
@@ -3144,14 +3144,15 @@ on each arch.
 > entering ring 3 at a given entry/stack; `futex` (SYS_FUTEX, `futex.c`):
 > FUTEX_WAIT parks iff `*uaddr==val` (lost-wakeup-free over the Tier-A
 > wait-queue) / FUTEX_WAKE, hashed by physical address; libc `thread_create`/
-> `thread_join`/`futex` + a 3-state Drepper mutex in `threadtest`.  **UP-tested:
-> 4 threads × 5000 shared-counter increments = 20000/20000 PASS.**  **Known
-> pre-existing gap:** ring-3 tasks don't run on APs (a single global TSS in
-> `tss.c` + no per-CPU `LTR`), so `threadtest` AND `procspawn` hang on `-smp 2`
-> — the fix is **per-CPU TSS + per-AP LTR** (a self-contained SMP-userland infra
-> change; the threads/futex code itself is SMP-safe).  **Still open:** that
-> per-CPU TSS fix; TLS (`__thread`/`set_thread_area`); PI/robust futexes;
-> `gettid`; per-thread signal masks; x86_64/aarch64.
+> `thread_join`/`futex` + a 3-state Drepper mutex in `threadtest`.  **Tested on
+> UP *and* `-smp 2`: 4 threads × 5000 shared-counter increments = 20000/20000
+> PASS** (truly parallel).  Bringing this up on SMP also fixed a pre-existing
+> gap — ring-3 tasks didn't run on APs (single global TSS + no per-CPU `LTR`) —
+> via a **per-CPU TSS** (array in `tss.c`, one GDT descriptor per CPU, each CPU
+> LTRs its own in `gdt_init`/`ap_main`), which unblocked *all* ring-3 tasks on
+> APs (`procspawn` now runs on `-smp 2` too).  **Still open:** TLS
+> (`__thread`/`set_thread_area`); PI/robust futexes; `gettid`; per-thread signal
+> masks; x86_64/aarch64.
 
 **Why:** browsers are massively multi-threaded (compositor, network, GC,
 worker pools); today there are **no user-space threads at all**.  Also a
@@ -3713,11 +3714,12 @@ not a binary registry.  Revisit only with a specific use case.
   (SYS_CLONE) = a task sharing the creator's address space (`mm_shared`) + fds,
   at a ring-3 entry/stack; `futex` (SYS_FUTEX) FUTEX_WAIT/WAKE over hashed
   Tier-A wait-queues (lost-wakeup-free); libc `thread_create`/`thread_join` +
-  a 3-state Drepper mutex.  UP-tested: 4 threads × 5000 increments = 20000/20000.
-  **Discovered a pre-existing gap:** ring-3 tasks don't run on APs (single global
-  TSS + no per-CPU LTR) — threadtest AND procspawn hang on `-smp 2`; fix =
-  per-CPU TSS (self-contained SMP-userland infra, unblocks all ring-3-on-AP).
-  Next: per-CPU TSS → TLS → §M35.5 pkg.  See DOCS.md §4.28.
+  a 3-state Drepper mutex.  Tested on UP AND `-smp 2`: 4 threads × 5000 increments = 20000/20000.
+  Bringing it up on SMP also fixed a pre-existing gap — ring-3 tasks didn't run
+  on APs (single global TSS + no per-CPU LTR) — via a **per-CPU TSS** (array in
+  tss.c + one GDT descriptor per CPU + each CPU LTRs its own); this unblocked all
+  ring-3-on-AP (procspawn now runs on `-smp 2` too).  Next: TLS → §M35.5 pkg.
+  See DOCS.md §4.28.
 - **2026-07-11** — **§M24 stage 6 shipped: BSD socket API to userland (i386).**
   Ring-3 networking over the in-kernel stack: `FD_NETSOCK` ofile + `struct
   netsock` back `socket`/`bind`/`connect`/`sendto`/`recvfrom` (syscalls 22–26).
