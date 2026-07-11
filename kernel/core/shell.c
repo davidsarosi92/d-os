@@ -29,6 +29,7 @@
 #include "block_cache.h"
 #include "net.h"
 #include "audio.h"
+#include "pkg.h"
 #include "vc.h"
 #include "lock.h"
 #include "keymap.h"
@@ -1543,6 +1544,32 @@ static void cmd_tlstest(void) {
     kprintf("tlstest: returned rc=%d\n", rc);
 }
 
+/* §M35.5 — content-addressed package store. */
+static void cmd_pkg(const char* args) {
+    if (starts_with(args, "build "))   { pkg_build(args + 6);   return; }
+    if (starts_with(args, "install ")) { pkg_install(args + 8); return; }
+    if (starts_with(args, "remove "))  { pkg_remove(args + 7);  return; }
+    if (starts_with(args, "why "))     { pkg_why(args + 4);     return; }
+    if (streq(args, "gc"))             { pkg_gc();              return; }
+    if (streq(args, "list") || !*args) { pkg_list();            return; }
+    console_write("usage: pkg build|install|remove|why <id> | list | gc\n");
+}
+
+/* §M35.5 — scripted demo: two hello versions coexist, install hello-2 + args
+ * (deps hello-2), gc reclaims the unreferenced hello-1. */
+static void cmd_pkgtest(void) {
+    console_write("pkgtest: content-addressed store demo\n");
+    pkg_build("hello-1");                /* hello 1.0 */
+    pkg_build("hello-2");                /* hello 2.0 — coexists (distinct hash) */
+    pkg_install("hello-2");
+    pkg_install("args");                 /* deps hello-2 → pinned closure */
+    console_write("--- store before gc ---\n");
+    pkg_list();
+    pkg_gc();                            /* reclaims hello-1 (not in any closure) */
+    console_write("--- store after gc (hello-1 gone; hello-2 + args kept) ---\n");
+    pkg_list();
+}
+
 /* -------------------------------------------------------------------- */
 /* Configuration commands.                                              */
 /* -------------------------------------------------------------------- */
@@ -1708,6 +1735,9 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "httptest"))       { cmd_httptest(); return; }
     if (streq(line, "threadtest"))     { cmd_threadtest(); return; }
     if (streq(line, "tlstest"))        { cmd_tlstest(); return; }
+    if (streq(line, "pkg"))            { cmd_pkg("");        return; }
+    if (starts_with(line, "pkg "))     { cmd_pkg(line + 4);  return; }
+    if (streq(line, "pkgtest"))        { cmd_pkgtest();      return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }
@@ -1797,6 +1827,7 @@ void bin_install(void);   /* defined above — installs the /bin entries */
 void shell_run(struct vc* v) {
     char line[LINE_MAX];
     bin_install();                       /* M34 — populate /bin for execve() */
+    { static int pkg_ready = 0; if (!pkg_ready) { pkg_ready = 1; pkg_init(); } }  /* §M35.5 store */
     /* Announce ourselves once in case this pane was just spawned. */
     kprintf("[pane %d ready, pid %d]\n",
             v->id, task_current() ? task_current()->pid : -1);

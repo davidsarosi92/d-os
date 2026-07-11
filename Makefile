@@ -292,6 +292,7 @@ CORE_C_SRCS := \
     kernel/drivers/net/virtio_net.c \
     kernel/core/net.c \
     kernel/core/futex.c \
+    kernel/core/pkg.c \
     kernel/drivers/audio/ac97.c \
     kernel/core/audio.c \
     kernel/drivers/usb/xhci.c \
