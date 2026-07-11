@@ -44,6 +44,21 @@
 #define SYS_EXECVE 16       /* (path, argv) → replaces image; -1 on failure    */
 #define SYS_PIPE   17       /* (int fds[2]) → 0; fds[0]=read end, fds[1]=write */
 #define SYS_DUP2   18       /* (oldfd, newfd) → newfd / -1                     */
+#define SYS_KILL   19       /* (pid, sig) → 0 / -1  (M34)                      */
+#define SYS_SIGACTION 20    /* (sig, handler, restorer) → old handler          */
+#define SYS_SIGRETURN 21    /* () — restore context after a signal handler     */
+
+/* Signals (M34) — a small POSIX-shaped set. */
+#define NSIG       32
+#define SIGINT     2
+#define SIGKILL    9
+#define SIGUSR1    10
+#define SIGSEGV    11
+#define SIGUSR2    12
+#define SIGTERM    15
+#define SIGCHLD    17
+#define SIG_DFL    0        /* default action (terminate or ignore)            */
+#define SIG_IGN    1        /* ignore                                          */
 
 /* poll(2) events (Linux values). */
 #define POLLIN      0x001   /* readable                                        */
@@ -74,6 +89,8 @@ int  sys_memfd(size_t size);            /* create a shared-memory fd           *
 int  sys_socketpair(int* fds);          /* fds[0],fds[1] = connected unix pair */
 int  sys_pipe(int* fds);                /* fds[0]=read, fds[1]=write            */
 int  sys_dup2(int oldfd, int newfd);    /* redirect a descriptor               */
+int  sys_kill(int pid, int sig);        /* post a signal to a task             */
+long sys_sigaction(int sig, long handler, long restorer);  /* → old handler    */
 long sys_send (int fd, const void* buf, size_t n, int passfd);
 long sys_recv (int fd, void* buf, size_t n, int* passfd_out);
 struct pollfd;
@@ -85,5 +102,11 @@ void fd_close_all(void);
 
 struct int_frame;
 void syscall_dispatch(struct int_frame* f);
+
+/* M34 signals (arch — hal/x86/signal.c).  signal_deliver runs on the
+ * return-to-user path after each syscall; signal_sigreturn restores the
+ * pre-handler context for SYS_SIGRETURN. */
+void signal_deliver(struct int_frame* f);
+void signal_sigreturn(struct int_frame* f);
 
 #endif

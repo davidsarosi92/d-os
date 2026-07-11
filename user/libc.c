@@ -21,6 +21,8 @@
 #define SYS_EXECVE 16
 #define SYS_PIPE   17
 #define SYS_DUP2   18
+#define SYS_KILL   19
+#define SYS_SIGACTION 20
 
 /* One syscall path, three arches.  x86 (i386 + x86_64) trap via `int 0x80`
  * (rax/eax = number, rbx/ecx/edx = args); aarch64 traps via `svc #0` with the
@@ -60,6 +62,13 @@ int   waitpid(int pid, int* status)            { return (int)syscall3(SYS_WAITPI
 int   execv (const char* path, char* const argv[]) { return (int)syscall3(SYS_EXECVE, (long)path, (long)argv, 0); }
 int   pipe  (int fds[2])                       { return (int)syscall3(SYS_PIPE, (long)fds, 0, 0); }
 int   dup2  (int oldfd, int newfd)             { return (int)syscall3(SYS_DUP2, oldfd, newfd, 0); }
+
+extern void __sig_trampoline(void);            /* crt0.s */
+sighandler_t signal(int sig, sighandler_t h) {
+    return (sighandler_t)syscall3(SYS_SIGACTION, sig, (long)h, (long)__sig_trampoline);
+}
+int   kill  (int pid, int sig)                 { return (int)syscall3(SYS_KILL, pid, sig, 0); }
+int   raise (int sig)                          { return kill(getpid(), sig); }
 
 size_t strlen(const char* s) { size_t i = 0; while (s[i]) i++; return i; }
 

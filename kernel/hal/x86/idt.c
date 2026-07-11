@@ -337,6 +337,9 @@ void isr_handler(struct int_frame* f) {
     if (f->int_no == 0x80) {
         /* Syscall from ring 3 (or ring 0 — we don't restrict). */
         syscall_dispatch(f);
+        /* M34 — deliver a pending signal on the way back to ring 3 (rewrites
+         * the trapframe to enter the handler; no-op in kernel mode). */
+        signal_deliver(f);
         return;
     }
 

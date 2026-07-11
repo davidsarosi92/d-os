@@ -112,6 +112,19 @@ void syscall_dispatch(struct int_frame* f) {
             f->eax = (uint32_t)sys_dup2((int)f->ebx, (int)f->ecx);
             return;
 
+        /* M34 signals. */
+        case SYS_KILL:
+            f->eax = (uint32_t)sys_kill((int)f->ebx, (int)f->ecx);
+            return;
+        case SYS_SIGACTION:
+            f->eax = (uint32_t)sys_sigaction((int)f->ebx, (long)f->ecx, (long)f->edx);
+            return;
+        case SYS_SIGRETURN:
+            /* Restore the pre-handler context; do NOT touch f->eax afterwards
+             * (signal_sigreturn set it to the interrupted syscall's result). */
+            signal_sigreturn(f);
+            return;
+
         /* M25 stage 3 — fd syscalls.  EBX/ECX/EDX = arg0/arg1/arg2. */
         case SYS_WRITE:
             f->eax = (uint32_t)sys_write((int)f->ebx, (const void*)f->ecx, f->edx);

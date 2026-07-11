@@ -15,7 +15,17 @@
 bits 32
 section .text
 global _start
+global __sig_trampoline
 extern main
+
+; M34 — signal-return trampoline.  The kernel makes a signal handler `ret` here
+; (it pushes this address as the handler's return address); we then issue
+; SYS_SIGRETURN so the kernel restores the pre-signal context.  NO prologue —
+; esp must be exactly what the kernel expects (pointing at the sig argument, with
+; the saved context just above) when `int 0x80` fires.
+__sig_trampoline:
+    mov  eax, 21               ; SYS_SIGRETURN
+    int  0x80
 
 _start:
     mov  eax, [esp]            ; argc

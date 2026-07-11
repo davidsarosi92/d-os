@@ -26,6 +26,19 @@ int   execv (const char* path, char* const argv[]);  /* replace image; no return
 int   pipe  (int fds[2]);                   /* fds[0]=read, fds[1]=write */
 int   dup2  (int oldfd, int newfd);         /* redirect a descriptor */
 
+/* Signals (M34). */
+typedef void (*sighandler_t)(int);
+sighandler_t signal(int sig, sighandler_t handler);
+int   kill  (int pid, int sig);
+int   raise (int sig);
+#define SIGINT  2
+#define SIGKILL 9
+#define SIGUSR1 10
+#define SIGSEGV 11
+#define SIGUSR2 12
+#define SIGTERM 15
+#define SIGCHLD 17
+
 /* String / memory. */
 size_t strlen(const char* s);
 void*  memset(void* d, int c, size_t n);

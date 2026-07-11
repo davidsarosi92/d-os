@@ -25,6 +25,7 @@
 #include "fd.h"
 #include "kmalloc.h"
 #include "hal_api.h"
+#include "syscall.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -83,6 +84,10 @@ int proc_fork(struct user_regs* parent_regs) {
         vmm_space_destroy(child_space);
         return -1;
     }
+    /* Inherit the parent's signal dispositions (POSIX: fork keeps handlers). */
+    for (int i = 0; i < NSIG; i++) child->sig_handler[i] = parent->sig_handler[i];
+    child->sig_restorer = parent->sig_restorer;
+
     /* Claim the reap so the M27 universal reaper (init) keeps its hands off:
      * the child becomes a POSIX zombie held for the parent's waitpid()
      * (task_wait), which reaps it and collects the exit code.  Without this,

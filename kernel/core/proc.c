@@ -199,7 +199,11 @@ int proc_execve(const char* path, char* const uargv[]) {
     }
     uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, kargv);
 
-    /* 4. Commit: swap to the new space, free the old one + scratch. */
+    /* 4. Commit: swap to the new space, free the old one + scratch.  execve
+     *    resets signal dispositions to default (custom handlers pointed into
+     *    the old image); the restorer is re-registered by the new program. */
+    for (int i = 0; i < NSIG; i++) me->sig_handler[i] = SIG_DFL;
+    me->sig_pending = 0;
     struct vmm_space* old = me->mm;
     me->mm = ns;
     me->mmap_cursor = 0;

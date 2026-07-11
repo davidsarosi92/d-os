@@ -209,6 +209,28 @@ int sys_dup2(int oldfd, int newfd) {
     return newfd;
 }
 
+/* M34 — kill(pid, sig): post `sig` to task `pid`.  Delivery happens when that
+ * task next returns to user mode (hal/x86/signal.c).  A task blocked in a
+ * syscall won't notice until it returns (no EINTR yet — a follow-up). */
+int sys_kill(int pid, int sig) {
+    if (sig <= 0 || sig >= NSIG) return -1;
+    struct task* t = task_find(pid);
+    if (!t) return -1;
+    t->sig_pending |= (1u << sig);
+    return 0;
+}
+
+/* M34 — sigaction(sig, handler, restorer): set the disposition of `sig` and
+ * remember the libc SYS_SIGRETURN trampoline.  Returns the previous handler. */
+long sys_sigaction(int sig, long handler, long restorer) {
+    struct task* t = task_current();
+    if (!t || sig <= 0 || sig >= NSIG) return -1;
+    long old = (long)t->sig_handler[sig];
+    t->sig_handler[sig] = (uintptr_t)handler;
+    if (restorer) t->sig_restorer = (uintptr_t)restorer;
+    return old;
+}
+
 long sys_send(int fd, const void* buf, size_t n, int passfd) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_SOCK) return -1;

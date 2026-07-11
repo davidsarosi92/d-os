@@ -138,6 +138,14 @@ struct task {
      * `cpu_ms`.  Feeds `ps` and the GUI task manager. */
     uint64_t cpu_ms;
     uint64_t sched_in_ms;
+    /* M34 — POSIX signals.  `sig_pending` is a bitmask of posted signals;
+     * `sig_handler[sig]` is SIG_DFL(0) / SIG_IGN(1) / a ring-3 handler address;
+     * `sig_restorer` is the libc trampoline that issues SYS_SIGRETURN after a
+     * handler returns.  Delivered on the return-to-user path (hal/x86/signal.c).
+     * Zero-initialised by kcalloc → every task starts with default dispositions. */
+    uint32_t  sig_pending;
+    uintptr_t sig_handler[32];          /* NSIG (syscall.h) */
+    uintptr_t sig_restorer;
 };
 
 /* Set up the scheduler and convert the current `kernel_main` context

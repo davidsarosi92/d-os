@@ -1463,6 +1463,22 @@ static void cmd_pipetest(void) {
     kprintf("pipetest: returned rc=%d\n", rc);
 }
 
+/* M34 slice E — `sigtest`: signal()+raise()+handler from ring 3. */
+extern const unsigned char _binary_user_sigtest_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_sigtest_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_sigtest(void) {
+    if (!_binary_user_sigtest_i386_elf_start) {
+        console_write("sigtest: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_sigtest_i386_elf_end -
+                          _binary_user_sigtest_i386_elf_start);
+    console_write("sigtest: exec'ing signal()+raise() program...\n");
+    int rc = proc_exec_elf(_binary_user_sigtest_i386_elf_start, len);
+    kprintf("sigtest: returned rc=%d\n", rc);
+}
+
 /* -------------------------------------------------------------------- */
 /* Configuration commands.                                              */
 /* -------------------------------------------------------------------- */
@@ -1623,6 +1639,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "forktest"))       { cmd_forktest(); return; }
     if (streq(line, "forkexec"))       { cmd_forkexec(); return; }
     if (streq(line, "pipetest"))       { cmd_pipetest(); return; }
+    if (streq(line, "sigtest"))        { cmd_sigtest(); return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }
