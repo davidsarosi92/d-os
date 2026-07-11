@@ -1495,6 +1495,22 @@ static void cmd_dnstest(void) {
     kprintf("dnstest: returned rc=%d\n", rc);
 }
 
+/* M24 socket API — `httptest`: DNS + TCP-socket HTTP GET from ring 3. */
+extern const unsigned char _binary_user_httptest_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_httptest_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_httptest(void) {
+    if (!_binary_user_httptest_i386_elf_start) {
+        console_write("httptest: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_httptest_i386_elf_end -
+                          _binary_user_httptest_i386_elf_start);
+    console_write("httptest: exec'ing TCP-socket HTTP client...\n");
+    int rc = proc_exec_elf(_binary_user_httptest_i386_elf_start, len);
+    kprintf("httptest: returned rc=%d\n", rc);
+}
+
 /* -------------------------------------------------------------------- */
 /* Configuration commands.                                              */
 /* -------------------------------------------------------------------- */
@@ -1657,6 +1673,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "pipetest"))       { cmd_pipetest(); return; }
     if (streq(line, "sigtest"))        { cmd_sigtest(); return; }
     if (streq(line, "dnstest"))        { cmd_dnstest(); return; }
+    if (streq(line, "httptest"))       { cmd_httptest(); return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }

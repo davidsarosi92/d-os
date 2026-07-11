@@ -132,6 +132,9 @@ void syscall_dispatch(struct int_frame* f) {
         case SYS_BIND:
             f->eax = (uint32_t)sys_bind((int)f->ebx, (int)f->ecx);
             return;
+        case SYS_CONNECT:
+            f->eax = (uint32_t)sys_connect((int)f->ebx, (uint32_t)f->ecx, (int)f->edx);
+            return;
         case SYS_SENDTO:
             f->eax = (uint32_t)sys_sendto((int)f->ebx, (const void*)f->ecx,
                                           f->edx, (uint32_t)f->esi, (int)f->edi);

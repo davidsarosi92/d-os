@@ -521,6 +521,7 @@ static struct {
 #define TCP_RX_CAP 16384
 static uint8_t         g_tcp_rx[TCP_RX_CAP];
 static volatile uint32_t g_tcp_rxlen;
+static uint32_t          g_tcp_rxconsumed;   /* net_tcp_recv read cursor */
 
 /* TCP checksum: pseudo-header (src, dst, proto, tcp-len) + segment.  Mandatory
  * (unlike UDP), so we always compute it.  `src_ip`/`dst_ip` are host order. */
@@ -674,6 +675,67 @@ int net_http_get(struct net_device* dev, uint32_t ip, uint16_t port,
     g_tcp.state = TCP_ST_CLOSED;
 
     return (int)g_tcp_rxlen;
+}
+
+/* ---- general TCP client API (M24 socket API) -----------------------------
+ * A minimal connect/send/recv/close over the same single-connection g_tcp
+ * engine (one TCP socket at a time).  Backs SOCK_STREAM sockets in
+ * usyscall.c.  Data is delivered in-order; recv drains the accumulation
+ * buffer (blocking-poll until data or peer FIN). */
+
+int net_tcp_connect(struct net_device* dev, uint32_t ip, uint16_t port) {
+    g_tcp.state       = TCP_ST_SYN_SENT;
+    g_tcp.peer_ip     = ip;
+    g_tcp.peer_port   = port;
+    g_tcp.local_port  = 0xE000 + (g_tcp.local_port & 0x0FFF) + 1;
+    g_tcp.snd_nxt     = 0x2000;
+    g_tcp.rcv_nxt     = 0;
+    g_tcp.established  = 0;
+    g_tcp.peer_fin     = 0;
+    g_tcp_rxlen        = 0;
+    g_tcp_rxconsumed   = 0;
+
+    tcp_send_seg(dev, TCP_SYN, NULL, 0);
+    g_tcp.snd_nxt += 1;
+    if (!tcp_poll_until(dev, &g_tcp.established, 20000000u)) {
+        g_tcp.state = TCP_ST_CLOSED;
+        return -1;
+    }
+    return 0;
+}
+
+int net_tcp_send(struct net_device* dev, const void* buf, uint32_t len) {
+    if (g_tcp.state != TCP_ST_ESTABLISHED && g_tcp.state != TCP_ST_CLOSING) return -1;
+    /* One segment (callers send small requests; segmentation is a follow-up). */
+    if (len > ETH_MTU - 40) len = ETH_MTU - 40;
+    tcp_send_seg(dev, TCP_PSH | TCP_ACK, buf, len);
+    g_tcp.snd_nxt += len;
+    return (int)len;
+}
+
+int net_tcp_recv(struct net_device* dev, void* buf, uint32_t len) {
+    /* Block-poll until unconsumed data is available or the peer closes. */
+    for (uint32_t s = 0; s < 60000000u; s++) {
+        if (g_tcp_rxconsumed < g_tcp_rxlen) break;
+        if (g_tcp.peer_fin) break;
+        if (dev->poll) dev->poll(dev);
+        hal_cpu_pause();
+    }
+    uint32_t avail = g_tcp_rxlen - g_tcp_rxconsumed;
+    if (avail == 0) return 0;                    /* EOF (peer FIN, drained) */
+    uint32_t cnt = avail < len ? avail : len;
+    uint8_t* out = (uint8_t*)buf;
+    for (uint32_t i = 0; i < cnt; i++) out[i] = g_tcp_rx[g_tcp_rxconsumed + i];
+    g_tcp_rxconsumed += cnt;
+    return (int)cnt;
+}
+
+void net_tcp_close(struct net_device* dev) {
+    if (g_tcp.state == TCP_ST_CLOSED) return;
+    tcp_send_seg(dev, TCP_FIN | TCP_ACK, NULL, 0);
+    g_tcp.snd_nxt += 1;
+    tcp_poll_until(dev, &g_tcp.peer_fin, 4000000u);
+    g_tcp.state = TCP_ST_CLOSED;
 }
 
 /* Expose the accumulated response so the shell `wget` command can print it. */

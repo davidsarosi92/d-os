@@ -50,6 +50,10 @@ static int fd_install(struct ofile* o) {
     return -1;
 }
 
+/* Forward decls — FD_NETSOCK stream I/O (defined with the socket layer below). */
+static long netsock_write(struct netsock* ns, const void* buf, size_t n);
+static long netsock_read (struct netsock* ns, void* buf, size_t n);
+
 long sys_write(int fd, const void* buf, size_t n) {
     if (fd == 1 || fd == 2) {                 /* stdout / stderr → console */
         const char* s = (const char*)buf;
@@ -61,6 +65,7 @@ long sys_write(int fd, const void* buf, size_t n) {
     if (!o) return -1;
     if (o->kind == FD_VFS)  return (long)vfs_write(o->file, buf, n);
     if (o->kind == FD_SOCK) return usock_send(o->sock, buf, n, NULL);
+    if (o->kind == FD_NETSOCK) return netsock_write(o->nsock, buf, n);
     return -1;                                 /* shm: not write(2)-able */
 }
 
@@ -73,6 +78,7 @@ long sys_read(int fd, void* buf, size_t n) {
     /* Sockets read(2) with POSIX blocking semantics (block == 1): an empty
      * read waits for the peer to send (or close → 0/EOF). */
     if (o->kind == FD_SOCK) return usock_recv(o->sock, buf, n, 1, NULL);
+    if (o->kind == FD_NETSOCK) return netsock_read(o->nsock, buf, n);
     return -1;
 }
 
@@ -365,6 +371,9 @@ struct netsock {
     int      bound;
     struct ns_dgram rx[NS_RXSLOTS];
     volatile int rx_head, rx_tail;      /* head = produce, tail = consume */
+    /* SOCK_STREAM (TCP) state. */
+    int      connected;
+    uint32_t peer_ip; uint16_t peer_port;
 };
 
 static uint16_t g_ephem_port = 0xC000;
@@ -387,6 +396,10 @@ static void ns_udp_cb(uint32_t src_ip, uint16_t src_port,
 void netsock_close(struct netsock* ns) {
     if (!ns) return;
     if (ns->bound) net_udp_unbind(ns->local_port);
+    if (ns->type == SOCK_STREAM && ns->connected) {
+        struct net_device* dev = net_primary();
+        if (dev) net_tcp_close(dev);
+    }
     kfree(ns);
 }
 
@@ -401,7 +414,7 @@ static int ns_ensure_bound(struct netsock* ns, uint16_t port) {
 int sys_socket(int domain, int type, int proto) {
     (void)proto;
     if (domain != AF_INET)  return -1;
-    if (type != SOCK_DGRAM) return -1;    /* SOCK_STREAM (TCP) = the next slice */
+    if (type != SOCK_DGRAM && type != SOCK_STREAM) return -1;
     struct netsock* ns = (struct netsock*)kcalloc(1, sizeof *ns);
     if (!ns) return -1;
     ns->type = type;
@@ -416,6 +429,32 @@ int sys_bind(int fd, int port) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_NETSOCK) return -1;
     return ns_ensure_bound(o->nsock, (uint16_t)port);
+}
+
+/* M24 — connect(fd, ip, port): TCP handshake for a SOCK_STREAM socket. */
+int sys_connect(int fd, uint32_t ip, int port) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETSOCK) return -1;
+    struct netsock* ns = o->nsock;
+    if (ns->type != SOCK_STREAM) return -1;
+    struct net_device* dev = net_primary();
+    if (!dev) return -1;
+    if (net_tcp_connect(dev, ip, (uint16_t)port) != 0) return -1;
+    ns->connected = 1; ns->peer_ip = ip; ns->peer_port = (uint16_t)port;
+    return 0;
+}
+
+/* Stream read/write over a connected SOCK_STREAM socket (called by
+ * sys_read/sys_write when the fd is FD_NETSOCK). */
+static long netsock_write(struct netsock* ns, const void* buf, size_t n) {
+    if (ns->type != SOCK_STREAM || !ns->connected) return -1;
+    struct net_device* dev = net_primary();
+    return dev ? net_tcp_send(dev, buf, (uint32_t)n) : -1;
+}
+static long netsock_read(struct netsock* ns, void* buf, size_t n) {
+    if (ns->type != SOCK_STREAM || !ns->connected) return -1;
+    struct net_device* dev = net_primary();
+    return dev ? net_tcp_recv(dev, buf, (uint32_t)n) : -1;
 }
 
 long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port) {

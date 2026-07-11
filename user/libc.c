@@ -24,6 +24,7 @@
 #define SYS_KILL   19
 #define SYS_SIGACTION 20
 #define SYS_SOCKET 22
+#define SYS_CONNECT 23
 #define SYS_SENDTO 24
 #define SYS_RECVFROM 25
 #define SYS_BIND   26
@@ -101,6 +102,7 @@ int   raise (int sig)                          { return kill(getpid(), sig); }
 
 int   socket(int domain, int type, int proto)  { return (int)syscall3(SYS_SOCKET, domain, type, proto); }
 int   bind_port(int fd, int port)              { return (int)syscall3(SYS_BIND, fd, port, 0); }
+int   connect_ip(int fd, unsigned ip, int port) { return (int)syscall3(SYS_CONNECT, fd, (long)ip, port); }
 long  sendto(int fd, const void* buf, size_t n, unsigned ip, int port) {
     return syscall5(SYS_SENDTO, fd, (long)buf, (long)n, (long)ip, port);
 }

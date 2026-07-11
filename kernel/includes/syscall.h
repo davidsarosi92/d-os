@@ -104,6 +104,7 @@ int  sys_kill(int pid, int sig);        /* post a signal to a task             *
 long sys_sigaction(int sig, long handler, long restorer);  /* → old handler    */
 int  sys_socket(int domain, int type, int proto);          /* M24 socket API   */
 int  sys_bind(int fd, int port);
+int  sys_connect(int fd, uint32_t ip, int port);           /* TCP handshake    */
 long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port);
 long sys_recvfrom(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out);
 long sys_send (int fd, const void* buf, size_t n, int passfd);
