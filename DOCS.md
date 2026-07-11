@@ -2811,11 +2811,29 @@ nettest: PASS tcp  (828 bytes, "HTTP/1.1 200 OK")   ← TCP handshake + HTTP GET
   pseudo-header (src/dst/proto/len); a zero or header-only checksum makes the
   peer/SLIRP drop the segment and the handshake never completes.
 
-**Still deferred (later §M24 stages / §M25):** IRQ-driven RX + `netd` task;
-the BSD socket *syscall* API (`socket`/`bind`/`connect`/`send`/`recv`) exposed
-to userland (today the stack is in-kernel; the shell commands are the clients);
-TCP retransmit timers + congestion control + a real state machine; a listening
-(server) role; DHCP; IPv6; `/proc/net/*`; x86_64/aarch64 ports.
+**Socket API to userland (stage 6 — shipped 2026-07-11).**  A BSD-sockets
+surface over the in-kernel stack lets **ring-3** programs do networking.  A new
+`FD_NETSOCK` ofile kind (fd.c) + a `struct netsock` (usyscall.c) back the fds;
+syscalls `socket`(22)/`connect`(23)/`sendto`(24)/`recvfrom`(25)/`bind`(26)
+(libc `socket`/`connect_ip`/`sendto`/`recvfrom`/`bind_port`, + a 5-arg
+`syscall5`).  Addresses are host-order IPv4 + port ints (no `struct sockaddr`
+yet — a teaching-ABI simplification for §M36/§M39).
+- **SOCK_DGRAM (UDP):** the netsock owns a local port + a 4-slot datagram RX
+  ring fed by net.c's per-port binding callback; `sendto`/`recvfrom`.  Tested:
+  `dnstest` resolves example.com from ring 3 (socket → sendto 10.0.2.3:53 →
+  recvfrom → parse A = 104.20.23.154).
+- **SOCK_STREAM (TCP):** `connect` runs the handshake (`net_tcp_connect`); plain
+  `read`/`write` on the fd map to `net_tcp_recv`/`net_tcp_send` (blocking recv,
+  0 = EOF at peer FIN).  One connection at a time (shared `g_tcp`).  Tested:
+  `httptest` resolves example.com (UDP socket), opens a TCP socket, connects
+  :80, `write`s an HTTP GET and `read`s "HTTP/1.1 200 OK" (829 bytes) — full
+  userland networking, the §M39 TLS bridge target.
+
+**Still deferred (later §M24 stages / §M35):** IRQ-driven RX + `netd` task;
+a `struct sockaddr` layer + multiple concurrent TCP connections + TX
+segmentation; TCP retransmit timers + congestion control + a real state
+machine; a listening (server) role; DHCP; IPv6; `/proc/net/*`;
+x86_64/aarch64 ports.
 
 ---
 
@@ -3022,6 +3040,17 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-11 — M24 stage 6: BSD socket API to userland, i386.**  Ring-3
+  networking over the in-kernel stack (DOCS §4.25): a new `FD_NETSOCK` ofile +
+  `struct netsock` back `socket`/`bind`/`connect`/`sendto`/`recvfrom` (syscalls
+  22–26) — UDP via a per-socket datagram RX ring on net.c's port bindings, TCP
+  via `net_tcp_connect`/`send`/`recv`/`close` (read/write on the fd, one
+  connection at a time).  Addresses are host-order IPv4 + port ints (no
+  sockaddr yet).  Boot-tested i386 (-device virtio-net): `dnstest` resolves
+  example.com over a UDP socket from ring 3; `httptest` resolves + TCP-connects
+  :80 + GETs "HTTP/1.1 200 OK" (829 B) — full userland networking, the §M39 TLS
+  bridge.  Deferred: sockaddr, multiple TCP conns, retransmit/server, DHCP,
+  IPv6.  See PLAN.md §M24.
 - **2026-07-11 — M34: POSIX process model (fork/exec/wait/pipe/signals), i386.**
   The classic Unix process API on the M25 userland (DOCS §4.27): a System V
   initial stack (argc/argv/envp/auxv, crt0 reads it); **copy-on-write fork**

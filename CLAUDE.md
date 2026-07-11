@@ -40,8 +40,11 @@ virtio-net driver + `net_device` registry + arch-independent
 Ethernet/ARP/IPv4/ICMP/UDP/TCP + DNS stub resolver; shell
 `lsnic`/`ping`/`arp`/`nslookup`/`wget`/`nettest`; boot-tested through QEMU
 SLIRP (ICMP 3/3, DNS example.com, TCP `HTTP/1.1 200 OK`).  RX polled from the
-calling task (no IRQ/lock yet); TCP client-only, no retransmit/congestion;
-socket *syscall* API to userland still open.  **Tier A** (2026-07-10, DOCS §4.20): blocking
+calling task (no IRQ/lock yet); TCP client-only, no retransmit/congestion.
+**Stage 6 (2026-07-11): BSD socket API to userland** — `FD_NETSOCK` +
+`socket`/`bind`/`connect`/`sendto`/`recvfrom` (syscalls 22–26), ring-3 UDP+TCP;
+`dnstest`/`httptest` resolve + fetch a page from ring 3.  Open: sockaddr,
+multiple TCP conns, IRQ RX, DHCP, IPv6.  **Tier A** (2026-07-10, DOCS §4.20): blocking
 primitives — `waitq` (block/wake, lost-wakeup-free, SMP cross-CPU wake;
 `TASK_SLEEPING` now real), `task_wait(pid,&code)`, blocking socket
 read + `poll(timeout<0)`, `task_msleep`.  **M29** (DOCS §4.21):
@@ -155,16 +158,16 @@ extension + ACPI SRAT-derived per-CPU NUMA nodes), APs scheduling,
 **x86_64 (long mode) — full parity with i386 INCLUDING xHCI USB +
 virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
-▶️ **DECIDED NEXT (2026-07-11): the net socket syscall API.**  §M34 (POSIX
-process model) is now SHIPPED (i386, DOCS §4.27) — fork(COW)/execve/waitpid/
-pipe/dup2/signals.  The agreed next target is the **net socket syscall API**:
-the open §M24 tail — expose `socket`/`bind`/`connect`/`send`/`recv` to userland
-(small; rides on §M34's process/fd model, and is the §M39 TLS bridge).  Then
-**§M35 threads → §M35.5 pkg → §M36 libc → …** (the "Userland maturation"
-cluster critical path).  **§M26 Wayland stays deferred until POSIX + libc
-exist** (its prereqs are done, but a server is near-useless without real
-clients, which need the POSIX userland first).  §M34 lives on branch
-`m34-posix-process` (unmerged); M24/M23 already merged to main.
+▶️ **DECIDED NEXT (2026-07-11): §M35 — threads & futex.**  §M34 (POSIX process
+model) SHIPPED (i386, DOCS §4.27) — fork(COW)/execve/waitpid/pipe/dup2/signals;
+**and the net socket syscall API (§M24 stage 6) SHIPPED** (i386, DOCS §4.25) —
+ring-3 UDP+TCP sockets (`socket`/`bind`/`connect`/`sendto`/`recvfrom`, syscalls
+22–26; `dnstest`/`httptest` resolve + fetch from ring 3).  The agreed next
+target is **§M35 threads & futex** (clone/TLS/pthreads/futex on the SMP
+scheduler) → §M35.5 pkg → §M36 libc → … (the "Userland maturation" cluster
+critical path).  **§M26 Wayland stays deferred until POSIX + libc exist.**  §M34
++ sockets live on branch `m24-sockets` / `m34-posix-process` (check git);
+earlier M24/M23 merged to main.
 
 🔲 **Other options** (was "pick one"; superseded by the decision above):
 
