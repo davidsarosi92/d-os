@@ -45,4 +45,9 @@ void      tss_set_kernel_stack(uintptr_t sp);
 uintptr_t tss_get_addr(void);
 uint32_t  tss_get_limit(void);
 
+/* Per-CPU TSS (i386 SMP): the linear address of CPU `cpu`'s TSS + the number
+ * of per-CPU TSSes gdt.c should build descriptors for.  i386-only. */
+uintptr_t tss_get_addr_cpu(int cpu);
+int       tss_max_cpus(void);
+
 #endif
