@@ -56,6 +56,30 @@
 #define SYS_CLONE  27       /* (entry, stack) → tid  (M35 thread)              */
 #define SYS_FUTEX  28       /* (uaddr, op, val) → 0 / -1  (M35)                */
 #define SYS_SET_TLS 29      /* (base) → %gs selector  (M35 thread-local storage) */
+/* M36 — POSIX syscall breadth (the surface a real libc sits on). */
+#define SYS_STAT   30       /* (path, struct kstat*) → 0 / -1                  */
+#define SYS_FSTAT  31       /* (fd, struct kstat*)   → 0 / -1                  */
+#define SYS_GETDENTS 32     /* (fd, buf, cap) → bytes of packed dir records    */
+#define SYS_UNAME  33       /* (struct kutsname*) → 0                          */
+#define SYS_CLOCK_GETTIME 34/* (which, struct ktimespec*) → 0                  */
+#define SYS_NANOSLEEP 35    /* (ms) → 0  (millisecond sleep, simplified)       */
+
+/* M36 shared structs (kernel + libc agree on the layout). */
+struct kstat {
+    uint32_t size;
+    int      type;          /* 0=file, 1=dir, 2=device (matches inode_type)    */
+    int      mode;          /* rwx bits placeholder (0644/0755)                */
+};
+struct kutsname {
+    char sysname[65], nodename[65], release[65], version[65], machine[65];
+};
+struct ktimespec { uint32_t sec; uint32_t nsec; };
+#define CLOCK_REALTIME  0   /* wall clock (from the RTC)                       */
+#define CLOCK_MONOTONIC 1   /* since boot (from the timer)                     */
+
+/* A getdents record: reclen(2) + type(1) + NUL-terminated name.  Iterate by
+ * advancing `off` by reclen. */
+struct kdirent { uint16_t reclen; uint8_t type; char name[]; };
 
 /* futex ops (M35). */
 #define FUTEX_WAIT  0       /* block iff *uaddr == val                         */
@@ -113,6 +137,13 @@ int  sys_socket(int domain, int type, int proto);          /* M24 socket API   *
 int  sys_bind(int fd, int port);
 int  sys_connect(int fd, uint32_t ip, int port);           /* TCP handshake    */
 long sys_futex(int* uaddr, int op, int val);               /* M35              */
+struct kstat; struct kutsname; struct ktimespec;
+int  sys_stat(const char* path, struct kstat* out);        /* M36              */
+int  sys_fstat(int fd, struct kstat* out);
+long sys_getdents(int fd, void* buf, size_t cap);
+int  sys_uname(struct kutsname* out);
+int  sys_clock_gettime(int which, struct ktimespec* out);
+int  sys_nanosleep(unsigned ms);
 long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port);
 long sys_recvfrom(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out);
 long sys_send (int fd, const void* buf, size_t n, int passfd);

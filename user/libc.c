@@ -21,6 +21,12 @@
 #define SYS_CLONE  27
 #define SYS_FUTEX  28
 #define SYS_SET_TLS 29
+#define SYS_STAT   30
+#define SYS_FSTAT  31
+#define SYS_GETDENTS 32
+#define SYS_UNAME  33
+#define SYS_CLOCK_GETTIME 34
+#define SYS_NANOSLEEP 35
 #define SYS_EXECVE 16
 #define SYS_PIPE   17
 #define SYS_DUP2   18
@@ -131,6 +137,21 @@ void set_tls(void* tp) {
     __asm__ volatile ("movw %w0, %%gs" : : "r"(sel));
 }
 
+/* ---- POSIX breadth (M36) -------------------------------------------------- */
+int errno = 0;
+/* errno-setting wrapper: the kernel returns a negative value on error. */
+static long scall(long n, long a, long b, long c) {
+    long r = syscall3(n, a, b, c);
+    if (r < 0) errno = (int)-r;
+    return r;
+}
+int  stat (const char* path, struct stat* out) { return (int)scall(SYS_STAT, (long)path, (long)out, 0); }
+int  fstat(int fd, struct stat* out)           { return (int)scall(SYS_FSTAT, fd, (long)out, 0); }
+long getdents(int fd, void* buf, unsigned cap) { return scall(SYS_GETDENTS, fd, (long)buf, (long)cap); }
+int  uname(struct utsname* out)                { return (int)scall(SYS_UNAME, (long)out, 0, 0); }
+int  clock_gettime(int which, struct timespec* out) { return (int)scall(SYS_CLOCK_GETTIME, which, (long)out, 0); }
+int  nanosleep_ms(unsigned ms)                 { return (int)scall(SYS_NANOSLEEP, (long)ms, 0, 0); }
+
 long  sendto(int fd, const void* buf, size_t n, unsigned ip, int port) {
     return syscall5(SYS_SENDTO, fd, (long)buf, (long)n, (long)ip, port);
 }
@@ -187,6 +208,12 @@ static void put_hex(unsigned long v) {
     while (v) { b[i++] = hx[v & 0xF]; v >>= 4; }
     while (i--) write(1, &b[i], 1);
 }
+static void put_oct(unsigned long v) {
+    char b[24]; int i = 0;
+    if (v == 0) { write(1, "0", 1); return; }
+    while (v) { b[i++] = (char)('0' + (v & 7)); v >>= 3; }
+    while (i--) write(1, &b[i], 1);
+}
 
 int puts(const char* s) { write(1, s, strlen(s)); write(1, "\n", 1); return 0; }
 
@@ -200,6 +227,7 @@ int printf(const char* fmt, ...) {
             case 'd': case 'i': put_int(va_arg(ap, int)); break;
             case 'u': put_uint(va_arg(ap, unsigned int)); break;
             case 'x': put_hex(va_arg(ap, unsigned int)); break;
+            case 'o': put_oct(va_arg(ap, unsigned int)); break;
             case 'c': { char c = (char)va_arg(ap, int); write(1, &c, 1); break; }
             case '%': write(1, "%", 1); break;
             default:  write(1, fmt, 1); break;

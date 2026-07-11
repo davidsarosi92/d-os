@@ -66,7 +66,7 @@
 | §M34 | POSIX process & signals — ✅ shipped (i386): fork(COW)/execve/waitpid/pipe/dup2/signals (DOCS §4.27) | — |
 | §M35 | Threads & futex — ✅ shipped (i386, UP + SMP): clone/futex/thread_create + per-CPU TSS (DOCS §4.28) | — |
 | §M35.5 | Package manager & isolation — ✅ store shipped (i386): content-addressed /store + profiles + GC (DOCS §4.29); gates every port | — |
-| §M36 | POSIX syscall breadth + native libc (musl port) | — |
+| §M36 | POSIX syscall breadth + native libc — ◐ stage 1 (i386): stat/getdents/uname/clock/nanosleep + errno (DOCS §4.30); musl port = stage 2 | — |
 | §M37 | Dynamic linking — ld.so / `.so` / dlopen | — |
 | §M38 | C++ runtime + support libs (libc++/unwind, zlib, freetype, ICU, harfbuzz…) | — |
 | §M39 | Crypto + entropy + TLS + DNS resolver | — |
@@ -3393,7 +3393,18 @@ store, never the global filesystem.
 
 ---
 
-## §M36 — POSIX syscall breadth + native libc (musl port)
+## §M36 — POSIX syscall breadth + native libc (musl port) — ◐ stage 1 shipped (i386)
+
+> ◐ **STAGE 1 SHIPPED (2026-07-11, i386) — see DOCS.md §4.30.**  Broadened the
+> syscall surface + grew the in-tree libc toward the musl-required set: syscalls
+> 30–35 (`stat`/`fstat`/`getdents`/`uname`/`clock_gettime`/`nanosleep`) + `errno`
+> + a `%o` printf; `posixtest` exercises them from ring 3 (uname, stat, a
+> `/bin` getdents listing, realtime+monotonic clock, nanosleep).  **Stage 2 (the
+> actual musl port) is deferred** — external-toolchain infrastructure:
+> cross-compile musl against the d-os syscall numbers as the native libc + a
+> minimal coreutils, all installed into the §M35.5 store.  Also still open:
+> `getcwd`/`chdir` (per-task cwd), `brk`, epoll/eventfd/timerfd, `getrandom`
+> (§M39), full `struct sockaddr`.
 
 **Why:** the in-tree libc is ~120 lines (`write/read/open/mmap/malloc/
 printf`).  A browser (and its build tools) needs a full libc and the
@@ -3727,6 +3738,12 @@ not a binary registry.  Revisit only with a specific use case.
 
 ## Change log
 
+- **2026-07-11** — **§M36 stage 1 shipped (POSIX syscall breadth, i386).**
+  Syscalls 30–35 (`stat`/`fstat`/`getdents`/`uname`/`clock_gettime`/`nanosleep`)
+  + `errno` + a `%o` printf; the in-tree libc grew the matching structs +
+  wrappers.  `posixtest` exercises them from ring 3.  Stage 2 — the actual musl
+  cross-compile as the native libc + coreutils into the §M35.5 store — is
+  external-toolchain infra, deferred.  See DOCS.md §4.30.
 - **2026-07-11** — **§M35.5 store slice shipped (package manager, i386).**  A
   content-addressed store on the VFS (`kernel/core/pkg.c`): immutable
   `/store/<hash>-name-version/` paths (hash folds in recipe + each dep's

@@ -26,6 +26,8 @@
 #include "net.h"
 #include "hal_api.h"
 #include "kmalloc.h"
+#include "rtc.h"
+#include "timer.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -238,6 +240,104 @@ long sys_sigaction(int sig, long handler, long restorer) {
     t->sig_handler[sig] = (uintptr_t)handler;
     if (restorer) t->sig_restorer = (uintptr_t)restorer;
     return old;
+}
+
+/* ---- POSIX syscall breadth (M36) — the surface a real libc needs ---------- */
+
+int sys_stat(const char* path, struct kstat* out) {
+    if (!path || !out) return -1;
+    struct file* f = vfs_open(path, VFS_RDONLY);
+    if (!f) return -1;
+    if (f->inode) {
+        out->size = (uint32_t)f->inode->size;
+        out->type = (int)f->inode->type;
+        out->mode = (f->inode->type == INODE_DIR) ? 0755 : 0644;
+    } else { out->size = 0; out->type = 0; out->mode = 0644; }
+    vfs_close(f);
+    return 0;
+}
+
+int sys_fstat(int fd, struct kstat* out) {
+    if (!out) return -1;
+    struct ofile* o = fd_lookup(fd);
+    if (!o) return -1;
+    if (o->kind == FD_VFS && o->file && o->file->inode) {
+        out->size = (uint32_t)o->file->inode->size;
+        out->type = (int)o->file->inode->type;
+        out->mode = (o->file->inode->type == INODE_DIR) ? 0755 : 0644;
+    } else { out->size = 0; out->type = 0; out->mode = 0644; }
+    return 0;
+}
+
+/* Pack directory entries into `buf` as [reclen(2) | type(1) | name\0] records. */
+long sys_getdents(int fd, void* buf, size_t cap) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_VFS || !o->file) return -1;
+    uint8_t* out = (uint8_t*)buf;
+    size_t used = 0;
+    struct dirent de;
+    while (vfs_readdir(o->file, &de) > 0) {
+        int nlen = 0; while (de.name[nlen]) nlen++;
+        size_t reclen = 2 + 1 + (size_t)nlen + 1;
+        if (used + reclen > cap) break;
+        out[used]     = (uint8_t)(reclen & 0xFF);
+        out[used + 1] = (uint8_t)(reclen >> 8);
+        out[used + 2] = (uint8_t)de.type;
+        for (int i = 0; i < nlen; i++) out[used + 3 + i] = (uint8_t)de.name[i];
+        out[used + 3 + nlen] = 0;
+        used += reclen;
+    }
+    return (long)used;
+}
+
+static void ustr(char* d, const char* s) {
+    int i = 0; while (s[i] && i < 64) { d[i] = s[i]; i++; } d[i] = 0;
+}
+int sys_uname(struct kutsname* out) {
+    if (!out) return -1;
+    ustr(out->sysname,  "d-os");
+    ustr(out->nodename, "d-os");
+    ustr(out->release,  "0.1");
+    ustr(out->version,  "M36 userland");
+    ustr(out->machine,  "i386");        /* i386-first; arch string later */
+    return 0;
+}
+
+static uint32_t rtc_to_epoch(const struct rtc_time* t) {
+    static const int mdays[] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    long days = 0;
+    for (int y = 1970; y < (int)t->year; y++) {
+        days += 365;
+        if ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) days += 1;
+    }
+    for (int m = 1; m < (int)t->month; m++) {
+        days += mdays[m - 1];
+        if (m == 2 && (((int)t->year % 4 == 0 && (int)t->year % 100 != 0) ||
+                       (int)t->year % 400 == 0)) days += 1;
+    }
+    days += (int)t->day - 1;
+    return (uint32_t)(days * 86400L + (long)t->hour * 3600L +
+                      (long)t->min * 60L + (long)t->sec);
+}
+
+int sys_clock_gettime(int which, struct ktimespec* out) {
+    if (!out) return -1;
+    if (which == CLOCK_MONOTONIC) {
+        uint64_t ms = timer_ticks_ms();
+        out->sec  = (uint32_t)(ms / 1000);
+        out->nsec = (uint32_t)((ms % 1000) * 1000000u);
+        return 0;
+    }
+    struct rtc_time t;
+    if (rtc_read(&t) != 0) { out->sec = 0; out->nsec = 0; return 0; }
+    out->sec  = rtc_to_epoch(&t);
+    out->nsec = 0;
+    return 0;
+}
+
+int sys_nanosleep(unsigned ms) {
+    task_msleep(ms);
+    return 0;
 }
 
 long sys_send(int fd, const void* buf, size_t n, int passfd) {
