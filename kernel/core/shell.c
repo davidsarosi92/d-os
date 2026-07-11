@@ -1479,6 +1479,22 @@ static void cmd_sigtest(void) {
     kprintf("sigtest: returned rc=%d\n", rc);
 }
 
+/* M24 socket API — `dnstest`: resolve a hostname over a UDP socket from ring 3. */
+extern const unsigned char _binary_user_dnstest_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_dnstest_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_dnstest(void) {
+    if (!_binary_user_dnstest_i386_elf_start) {
+        console_write("dnstest: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_dnstest_i386_elf_end -
+                          _binary_user_dnstest_i386_elf_start);
+    console_write("dnstest: exec'ing UDP-socket DNS resolver...\n");
+    int rc = proc_exec_elf(_binary_user_dnstest_i386_elf_start, len);
+    kprintf("dnstest: returned rc=%d\n", rc);
+}
+
 /* -------------------------------------------------------------------- */
 /* Configuration commands.                                              */
 /* -------------------------------------------------------------------- */
@@ -1640,6 +1656,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "forkexec"))       { cmd_forkexec(); return; }
     if (streq(line, "pipetest"))       { cmd_pipetest(); return; }
     if (streq(line, "sigtest"))        { cmd_sigtest(); return; }
+    if (streq(line, "dnstest"))        { cmd_dnstest(); return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }

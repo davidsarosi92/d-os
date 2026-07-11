@@ -125,6 +125,22 @@ void syscall_dispatch(struct int_frame* f) {
             signal_sigreturn(f);
             return;
 
+        /* M24 — network sockets (AF_INET). */
+        case SYS_SOCKET:
+            f->eax = (uint32_t)sys_socket((int)f->ebx, (int)f->ecx, (int)f->edx);
+            return;
+        case SYS_BIND:
+            f->eax = (uint32_t)sys_bind((int)f->ebx, (int)f->ecx);
+            return;
+        case SYS_SENDTO:
+            f->eax = (uint32_t)sys_sendto((int)f->ebx, (const void*)f->ecx,
+                                          f->edx, (uint32_t)f->esi, (int)f->edi);
+            return;
+        case SYS_RECVFROM:
+            f->eax = (uint32_t)sys_recvfrom((int)f->ebx, (void*)f->ecx, f->edx,
+                                            (uint32_t*)f->esi, (int*)f->edi);
+            return;
+
         /* M25 stage 3 — fd syscalls.  EBX/ECX/EDX = arg0/arg1/arg2. */
         case SYS_WRITE:
             f->eax = (uint32_t)sys_write((int)f->ebx, (const void*)f->ecx, f->edx);

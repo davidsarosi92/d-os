@@ -23,6 +23,10 @@
 #define SYS_DUP2   18
 #define SYS_KILL   19
 #define SYS_SIGACTION 20
+#define SYS_SOCKET 22
+#define SYS_SENDTO 24
+#define SYS_RECVFROM 25
+#define SYS_BIND   26
 
 /* One syscall path, three arches.  x86 (i386 + x86_64) trap via `int 0x80`
  * (rax/eax = number, rbx/ecx/edx = args); aarch64 traps via `svc #0` with the
@@ -49,6 +53,31 @@ static long syscall3(long n, long a, long b, long c) {
     return r;
 }
 
+/* Five-argument syscall (sendto/recvfrom).  Same trap paths as syscall3, with
+ * two more argument registers (x86: esi/edi; aarch64: x3/x4). */
+static long syscall5(long n, long a, long b, long c, long d, long e) {
+    long r;
+#if defined(__aarch64__)
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    register long x4 __asm__("x4") = e;
+    __asm__ volatile ("svc #0"
+                      : "+r"(x0)
+                      : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4)
+                      : "memory");
+    r = x0;
+#else
+    __asm__ volatile ("int $0x80"
+                      : "=a"(r)
+                      : "a"(n), "b"(a), "c"(b), "d"(c), "S"(d), "D"(e)
+                      : "memory");
+#endif
+    return r;
+}
+
 long  write(int fd, const void* buf, size_t n) { return syscall3(SYS_WRITE, fd, (long)buf, (long)n); }
 long  read (int fd, void* buf, size_t n)       { return syscall3(SYS_READ,  fd, (long)buf, (long)n); }
 int   open (const char* path, int flags)       { return (int)syscall3(SYS_OPEN, (long)path, flags, 0); }
@@ -69,6 +98,15 @@ sighandler_t signal(int sig, sighandler_t h) {
 }
 int   kill  (int pid, int sig)                 { return (int)syscall3(SYS_KILL, pid, sig, 0); }
 int   raise (int sig)                          { return kill(getpid(), sig); }
+
+int   socket(int domain, int type, int proto)  { return (int)syscall3(SYS_SOCKET, domain, type, proto); }
+int   bind_port(int fd, int port)              { return (int)syscall3(SYS_BIND, fd, port, 0); }
+long  sendto(int fd, const void* buf, size_t n, unsigned ip, int port) {
+    return syscall5(SYS_SENDTO, fd, (long)buf, (long)n, (long)ip, port);
+}
+long  recvfrom(int fd, void* buf, size_t n, unsigned* ip, int* port) {
+    return syscall5(SYS_RECVFROM, fd, (long)buf, (long)n, (long)ip, (long)port);
+}
 
 size_t strlen(const char* s) { size_t i = 0; while (s[i]) i++; return i; }
 
