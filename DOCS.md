@@ -3038,6 +3038,47 @@ futexes; `gettid`; per-thread signal masks; x86_64/aarch64.
 
 ---
 
+### 4.29 Package manager — content-addressed store (M35.5, first slice)
+
+**Files:** `kernel/core/pkg.c`, `kernel/includes/pkg.h`.  Shell: `pkg
+build|install|remove|why|list|gc`, `pkgtest`.
+
+The porting-discipline **gate** that must exist before pulling in foreign code
+(musl §M36 onward): a **content-addressed store** on the VFS, Nix/Guix-shaped —
+*not* dpkg/apt's mutable global `/usr` (the "accidental history" the project
+rejects, convention #6).  So the system stays uncluttered, versions coexist
+without conflict, and a package depends on exactly its declared deps.
+
+**Store model (implemented):**
+- **Content-addressing.**  A package materialises at
+  `/store/<hash>-<name>-<version>/`, where the hash folds in the recipe id +
+  version + **each dependency's recursive hash** — so a version bump or any
+  transitive-dep change yields a *new*, immutable path.
+- **Version coexistence.**  Distinct hashes ⇒ distinct paths side by side
+  (`hello` 1.0 and 2.0 both in `/store`).
+- **Pinned closure.**  Each path carries `.recipe` (text) + `.closure` (its dep
+  store dirs).
+- **Profile.**  `/etc/pkg/profile` — a symlink-free text "installed view";
+  `install` adds a store dir, `remove` drops it (the path survives until GC).
+- **Mark-sweep GC.**  Reclaims every `/store` path not reachable from the
+  profile's transitive closure.
+- Built-in recipes (`hello` 1.0/2.0, `args` deps `hello-2`) carry the embedded
+  user ELFs as payload; a text recipe format + source fetch are follow-ups.
+
+**Boot-tested (i386):** `pkgtest` builds both `hello` versions (they coexist
+under distinct hashes), installs `hello-2` + `args` (pinning `hello-2` in
+`args`'s closure), then `pkg gc` reclaims the unreferenced `hello-1.0` and keeps
+`hello-2` + `args`.  (Bring-up bug: `vfs_readdir` returns **>0** per entry, not
+0.)
+
+**Still deferred (later §M35.5 / cross-milestone):** hermetic builds from source
+(fetch + verify + a §M33-sandboxed compile — needs the §M36 toolchain);
+**load-time RPATH isolation** (co-designed with §M37's dynamic linker) +
+run-time FS-view isolation (§M25/§M32/§M33); rollback generations; a binary
+substituter/cache; package signing (needs §M39 crypto); `/proc/pkg`.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -3108,6 +3149,16 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-11 — M35.5: content-addressed package store (first slice), i386.**
+  The porting-discipline gate before foreign code (DOCS §4.29): a Nix/Guix-shaped
+  store on the VFS (`kernel/core/pkg.c`) — content-addressed
+  `/store/<hash>-name-version/` paths (hash folds in the recipe + each dep's
+  recursive hash), version coexistence, pinned `.closure`, a symlink-free
+  `/etc/pkg/profile`, and mark-sweep GC.  Shell `pkg build|install|remove|why|
+  list|gc` + `pkgtest`.  Boot-tested: two `hello` versions coexist, install
+  `hello-2` + `args`, `pkg gc` reclaims the unreferenced `hello-1.0`.  Deferred:
+  hermetic source builds (§M36 toolchain), RPATH isolation (§M37), sandbox
+  (§M33), signing (§M39).  See PLAN.md §M35.5.
 - **2026-07-11 — M35: threads + futex, i386.**  Kernel-scheduled threads on
   the M34 process model (DOCS §4.28): `proc_clone` (SYS_CLONE) makes a task that
   SHARES its creator's address space (`mm_shared` flag stops the reap from

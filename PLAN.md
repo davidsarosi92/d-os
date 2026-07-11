@@ -65,7 +65,7 @@
 | §M33 | Execution domains — where a service runs (kernel / user / isolated); driver placement is the flagship case | ~2265 |
 | §M34 | POSIX process & signals — ✅ shipped (i386): fork(COW)/execve/waitpid/pipe/dup2/signals (DOCS §4.27) | — |
 | §M35 | Threads & futex — ✅ shipped (i386, UP + SMP): clone/futex/thread_create + per-CPU TSS (DOCS §4.28) | — |
-| §M35.5 | Package manager & isolation — content-addressed store (Nix-shaped); gates every port | — |
+| §M35.5 | Package manager & isolation — ✅ store shipped (i386): content-addressed /store + profiles + GC (DOCS §4.29); gates every port | — |
 | §M36 | POSIX syscall breadth + native libc (musl port) | — |
 | §M37 | Dynamic linking — ld.so / `.so` / dlopen | — |
 | §M38 | C++ runtime + support libs (libc++/unwind, zlib, freetype, ICU, harfbuzz…) | — |
@@ -3198,7 +3198,19 @@ SMP per-CPU scheduler.  Per-arch TLS-base seam.
 
 ---
 
-## §M35.5 — Package manager & isolation (the substrate for every port)
+## §M35.5 — Package manager & isolation (the substrate for every port) — ✅ store shipped (i386)
+
+> ✅ **STORE SLICE SHIPPED (2026-07-11, i386) — see DOCS.md §4.29.**  A
+> content-addressed store on the VFS (`kernel/core/pkg.c`): `/store/<hash>-name-
+> version/` immutable paths (hash folds in the recipe + each dep's recursive
+> hash), version coexistence, pinned `.closure`, a symlink-free `/etc/pkg/
+> profile`, and mark-sweep GC.  Shell `pkg build|install|remove|why|list|gc` +
+> `pkgtest` (two `hello` versions coexist; install `hello-2` + `args`; `pkg gc`
+> reclaims the unreferenced `hello-1.0`).  **Still open** (design below is the
+> roadmap): hermetic source builds (fetch + a §M33 sandbox — needs the §M36
+> toolchain); load-time RPATH isolation (co-designed with §M37) + run-time
+> FS-view isolation; rollback generations; a binary substituter; package signing
+> (§M39); `/proc/pkg`; a text recipe format.
 
 **Why — a gate, not an afterthought.**  Everything from §M36 on brings in
 *foreign* code (musl, then dozens of libraries, then a browser).  Without
@@ -3715,6 +3727,15 @@ not a binary registry.  Revisit only with a specific use case.
 
 ## Change log
 
+- **2026-07-11** — **§M35.5 store slice shipped (package manager, i386).**  A
+  content-addressed store on the VFS (`kernel/core/pkg.c`): immutable
+  `/store/<hash>-name-version/` paths (hash folds in recipe + each dep's
+  recursive hash), version coexistence, pinned `.closure`, symlink-free
+  `/etc/pkg/profile`, mark-sweep GC.  Shell `pkg …` + `pkgtest`.  Boot-tested:
+  two `hello` versions coexist, install `hello-2` + `args`, gc reclaims
+  `hello-1.0`.  The porting gate before musl (§M36).  Deferred: hermetic source
+  builds (§M36 toolchain), RPATH isolation (§M37), sandbox (§M33), signing
+  (§M39).  Next: §M36 libc (musl port).  See DOCS.md §4.29.
 - **2026-07-11** — **§M35 TLS + per-CPU TSS (i386, UP + SMP).**  Thread-local
   storage via `%gs`: per-CPU GDT TLS descriptors whose base the scheduler
   reloads on switch-in (`hal_set_tls_base`), `set_thread_area` (SYS_SET_TLS) +
