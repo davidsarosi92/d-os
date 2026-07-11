@@ -18,6 +18,7 @@
 #include "kmalloc.h"
 #include "hal_api.h"
 #include "vfs.h"
+#include "fd.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -251,6 +252,70 @@ static void user_task_bootstrap(void) {
         hal_set_kernel_stack((uintptr_t)me->kstack_base + TASK_KSTACK_SZ);
 
     enter_user_mode(entry, sp);        /* one-way; ends via SYS_EXIT → task_exit */
+}
+
+/* ---------------------------------------------------------------------------
+ * M35 — proc_clone: create a THREAD (clone) that shares the caller's address
+ * space and fd table, starting in ring 3 at `entry` with stack `stack`.
+ *
+ * Unlike fork, the address space is SHARED (not copied): both the caller and
+ * the new thread see the same memory (that is what makes it a thread).  The
+ * thread is marked mm_shared so its reap does not tear the space down; the
+ * thread group's owner (the process that created the mm) frees it.  The thread
+ * is a child of the caller, reap_owned, so the caller joins it with waitpid().
+ *
+ * `entry`/`stack` come from the libc (which mmaps the stack and lays out the
+ * thread fn's argument + a return-to-exit trampoline before calling clone).
+ * --------------------------------------------------------------------------- */
+struct clone_boot {
+    struct vmm_space* space;
+    uintptr_t         entry;
+    uintptr_t         user_sp;
+    uintptr_t         mmap_cursor;
+    struct ofile*     fds[TASK_MAX_FDS];
+};
+
+static void clone_bootstrap(void) {
+    struct clone_boot* b = (struct clone_boot*)task_start_arg();
+    struct task* me = task_current();
+
+    me->mm          = b->space;      /* SHARED with the creator */
+    me->mm_shared   = 1;
+    me->user_task   = 1;
+    me->mmap_cursor = b->mmap_cursor;
+    for (int i = 0; i < TASK_MAX_FDS; i++) me->fds[i] = b->fds[i];
+
+    uintptr_t entry = b->entry, sp = b->user_sp;
+    kfree(b);
+
+    vmm_space_switch(me->mm);
+    if (me->kstack_base)
+        hal_set_kernel_stack((uintptr_t)me->kstack_base + TASK_KSTACK_SZ);
+    enter_user_mode(entry, sp);      /* → ring 3 at the thread fn; no return */
+}
+
+int proc_clone(uintptr_t entry, uintptr_t stack) {
+    struct task* parent = task_current();
+    if (!parent || !parent->mm) return -1;
+
+    struct clone_boot* b = (struct clone_boot*)kmalloc(sizeof *b);
+    if (!b) return -1;
+    b->space       = parent->mm;    /* share, don't clone */
+    b->entry       = entry;
+    b->user_sp     = stack;
+    b->mmap_cursor = parent->mmap_cursor;
+    for (int i = 0; i < TASK_MAX_FDS; i++)
+        b->fds[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
+
+    struct task* t = task_spawn_arg("thread", clone_bootstrap, b);
+    if (!t) {
+        for (int i = 0; i < TASK_MAX_FDS; i++) if (b->fds[i]) ofile_unref(b->fds[i]);
+        kfree(b);
+        return -1;
+    }
+    t->mm_shared = 1;               /* set early too (before it may run) */
+    task_set_reap_owned(t, 1);      /* the creator joins it with waitpid() */
+    return t->pid;
 }
 
 int proc_spawn(const char* name, const void* image, size_t len) {

@@ -135,6 +135,14 @@ void syscall_dispatch(struct int_frame* f) {
         case SYS_CONNECT:
             f->eax = (uint32_t)sys_connect((int)f->ebx, (uint32_t)f->ecx, (int)f->edx);
             return;
+
+        /* M35 — threads. */
+        case SYS_CLONE:
+            f->eax = (uint32_t)proc_clone((uintptr_t)f->ebx, (uintptr_t)f->ecx);
+            return;
+        case SYS_FUTEX:
+            f->eax = (uint32_t)sys_futex((int*)f->ebx, (int)f->ecx, (int)f->edx);
+            return;
         case SYS_SENDTO:
             f->eax = (uint32_t)sys_sendto((int)f->ebx, (const void*)f->ecx,
                                           f->edx, (uint32_t)f->esi, (int)f->edi);

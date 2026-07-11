@@ -18,6 +18,8 @@
 #define SYS_GETPID 13
 #define SYS_FORK   14
 #define SYS_WAITPID 15
+#define SYS_CLONE  27
+#define SYS_FUTEX  28
 #define SYS_EXECVE 16
 #define SYS_PIPE   17
 #define SYS_DUP2   18
@@ -103,6 +105,23 @@ int   raise (int sig)                          { return kill(getpid(), sig); }
 int   socket(int domain, int type, int proto)  { return (int)syscall3(SYS_SOCKET, domain, type, proto); }
 int   bind_port(int fd, int port)              { return (int)syscall3(SYS_BIND, fd, port, 0); }
 int   connect_ip(int fd, unsigned ip, int port) { return (int)syscall3(SYS_CONNECT, fd, (long)ip, port); }
+
+/* ---- threads (M35) -------------------------------------------------------- */
+extern void __thread_exit_tramp(void);          /* crt0.s */
+int futex(int* uaddr, int op, int val)          { return (int)syscall3(SYS_FUTEX, (long)uaddr, op, val); }
+
+/* Create a thread running fn(arg) on a fresh 64 KiB stack.  We lay out the
+ * initial stack so fn sees `arg` at [esp+4] and returns into the exit
+ * trampoline at [esp]; then clone() enters ring 3 at fn with that stack. */
+int thread_create(int (*fn)(void*), void* arg) {
+    char* base = (char*)mmap(65536, -1);
+    if (!base) return -1;
+    unsigned long* sp = (unsigned long*)(base + 65536);
+    *--sp = (unsigned long)arg;                  /* fn's argument ([esp+4]) */
+    *--sp = (unsigned long)__thread_exit_tramp;  /* fn's return address ([esp]) */
+    return (int)syscall3(SYS_CLONE, (long)fn, (long)sp, 0);
+}
+int thread_join(int tid) { return waitpid(tid, 0); }
 long  sendto(int fd, const void* buf, size_t n, unsigned ip, int port) {
     return syscall5(SYS_SENDTO, fd, (long)buf, (long)n, (long)ip, port);
 }

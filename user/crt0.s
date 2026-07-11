@@ -16,6 +16,7 @@ bits 32
 section .text
 global _start
 global __sig_trampoline
+global __thread_exit_tramp
 extern main
 
 ; M34 — signal-return trampoline.  The kernel makes a signal handler `ret` here
@@ -25,6 +26,14 @@ extern main
 ; the saved context just above) when `int 0x80` fires.
 __sig_trampoline:
     mov  eax, 21               ; SYS_SIGRETURN
+    int  0x80
+
+; M35 — thread-exit trampoline.  A cloned thread's fn `ret`s here (the kernel
+; laid this address on the thread stack as fn's return address); exit the
+; thread with fn's return value (in eax) as the code.
+__thread_exit_tramp:
+    mov  ebx, eax             ; exit code = thread fn's return value
+    mov  eax, 1               ; SYS_EXIT (ends this task via task_exit)
     int  0x80
 
 _start:

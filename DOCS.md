@@ -2970,6 +2970,54 @@ still panics); x86_64/aarch64 (the fork/signal register-restore is i386 asm).
 
 ---
 
+### 4.28 Threads + futex (M35, i386)
+
+**Files:** `kernel/core/proc.c` (`proc_clone`), `kernel/core/futex.c`,
+`kernel/hal/x86/syscall.c`, `user/threadtest.c`.  Shell: `threadtest`.
+
+Kernel-scheduled threads on the M34 process model.  A **thread is a task that
+shares its creator's address space** (`mm`) — that is what makes several threads
+see the same memory — plus a duplicated fd table, starting at a ring-3 entry
+with its own stack.  `proc_clone(entry, stack)` (SYS_CLONE) creates it; a new
+`task->mm_shared` flag stops `task_reap` from destroying the shared space (the
+thread-group owner frees it).  The thread is a `reap_owned` child, joined with
+`waitpid` (libc `thread_join`).  libc `thread_create(fn, arg)` mmaps a 64 KiB
+stack, lays out `fn`'s argument + a return-to-`__sig`/`__thread_exit_tramp`
+(crt0.s) address, then clones.
+
+**futex** (`futex.c`, SYS_FUTEX): the one primitive a threading library needs.
+`FUTEX_WAIT(uaddr, val)` parks the caller **iff `*uaddr == val`**, re-checked
+under the wait-queue lock so a concurrent wake can't be lost (the Tier-A
+block/wake contract); `FUTEX_WAKE` wakes waiters.  Waiters hash (by the physical
+address of `uaddr`, via `vmm_translate`) into a small set of Tier-A wait-queues;
+distinct addresses may collide into one bucket, so `FUTEX_WAKE` wakes the whole
+bucket and every waiter re-checks its own `*uaddr` and re-parks if unchanged
+(standard futex spurious-wakeup semantics).  `threadtest` uses a 3-state
+(Drepper) futex mutex — the uncontended path is a single atomic op with no
+syscall; the kernel is only entered on contention.
+
+**Boot-tested (i386, UP):** 4 threads × 5000 increments of one shared counter
+under the futex mutex = **20000/20000 PASS** — proving the shared address space,
+the mutex's correctness, and `thread_join`.  The threads/futex code is SMP-safe
+(locked `xchg` in the mutex + spinlock-guarded wait-queues in the kernel).
+
+**Known gap — ring-3 tasks do not run on APs (pre-existing, surfaced here).**
+`threadtest` (and, it turns out, `procspawn`) *hang* under `-smp 2`.  Cause:
+`tss.c` has a **single global TSS** shared by all CPUs, and the APs never `LTR`
+their own — so a ring-3 → ring-0 transition (syscall/IRQ) on an AP has no valid
+per-CPU kernel stack.  This was never caught because user tasks had only ever
+been exercised on `-smp 1`.  The fix is **per-CPU TSS + per-CPU `LTR`** (a GDT
+TSS descriptor per CPU + each CPU loading its own; `hal_set_kernel_stack` writes
+`tss[this_cpu].esp0`) — a self-contained SMP-userland infrastructure change that
+unblocks *all* ring-3 tasks on APs, not just threads.  Until then, userland runs
+on the BSP.
+
+**Still deferred (later §M35):** the per-CPU TSS fix (above); thread-local
+storage (`__thread` / `set_thread_area` — a GDT entry per thread); priority
+inheritance / robust futexes; `gettid`; per-thread signal masks; x86_64/aarch64.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -3040,6 +3088,17 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-11 — M35: threads + futex, i386.**  Kernel-scheduled threads on
+  the M34 process model (DOCS §4.28): `proc_clone` (SYS_CLONE) makes a task that
+  SHARES its creator's address space (`mm_shared` flag stops the reap from
+  freeing it) + dups the fd table, starting at a ring-3 entry/stack; libc
+  `thread_create`/`thread_join`.  `futex` (SYS_FUTEX, `kernel/core/futex.c`):
+  FUTEX_WAIT parks iff `*uaddr==val` (lost-wakeup-free under the Tier-A queue
+  lock) / FUTEX_WAKE, hashed by physical address.  `threadtest` (3-state
+  Drepper mutex): 4 threads × 5000 shared-counter increments = 20000/20000
+  PASS on UP.  **Known pre-existing gap:** ring-3 tasks don't run on APs (single
+  global TSS + no per-CPU LTR) — threadtest AND procspawn hang on `-smp 2`; fix
+  = per-CPU TSS.  See PLAN.md §M35.
 - **2026-07-11 — M24 stage 6: BSD socket API to userland, i386.**  Ring-3
   networking over the in-kernel stack (DOCS §4.25): a new `FD_NETSOCK` ofile +
   `struct netsock` back `socket`/`bind`/`connect`/`sendto`/`recvfrom` (syscalls

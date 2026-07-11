@@ -90,6 +90,10 @@ struct task {
      * for kernel threads AND the excursion-model self-tests (proc_exec_elf),
      * which keep the fixed syscall stack + teleport-back. */
     int           user_task;
+    /* M35 — thread: this task SHARES its `mm` with its creator (clone), so its
+     * reap must NOT destroy the address space (the thread group still uses it).
+     * 0 for a process that owns its mm; 1 for a cloned thread. */
+    int           mm_shared;
     /* Master-list link (circular SLL of every alive task).  Walked by
      * ps / task_for_each / task_find.  Pre-M18.6.1 the scheduler
      * also walked this list; now per-CPU runqueues take that role and

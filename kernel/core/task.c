@@ -758,7 +758,7 @@ int task_reap(int pid) {
      * so its vmm_space is loaded nowhere and can be torn down.  (Its fds were
      * closed at SYS_EXIT while it was still current.)  A kernel thread's mm is
      * NULL / borrowed, so only user_task owns one to free. */
-    if (t->user_task && t->mm) {
+    if (t->user_task && t->mm && !t->mm_shared) {
         vmm_space_destroy(t->mm);
         t->mm = NULL;
     }
