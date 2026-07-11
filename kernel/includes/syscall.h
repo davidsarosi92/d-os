@@ -53,6 +53,12 @@
 #define SYS_SENDTO 24       /* (fd, buf, n, ip, port) → bytes / -1  (UDP)      */
 #define SYS_RECVFROM 25     /* (fd, buf, n, u32* ip, int* port) → bytes / -1   */
 #define SYS_BIND   26       /* (fd, port) → 0 / -1                             */
+#define SYS_CLONE  27       /* (entry, stack) → tid  (M35 thread)              */
+#define SYS_FUTEX  28       /* (uaddr, op, val) → 0 / -1  (M35)                */
+
+/* futex ops (M35). */
+#define FUTEX_WAIT  0       /* block iff *uaddr == val                         */
+#define FUTEX_WAKE  1       /* wake waiters on uaddr                           */
 
 /* socket() domain / type (M24). */
 #define AF_INET      2
@@ -105,6 +111,7 @@ long sys_sigaction(int sig, long handler, long restorer);  /* → old handler   
 int  sys_socket(int domain, int type, int proto);          /* M24 socket API   */
 int  sys_bind(int fd, int port);
 int  sys_connect(int fd, uint32_t ip, int port);           /* TCP handshake    */
+long sys_futex(int* uaddr, int op, int val);               /* M35              */
 long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port);
 long sys_recvfrom(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out);
 long sys_send (int fd, const void* buf, size_t n, int passfd);

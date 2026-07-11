@@ -18,6 +18,7 @@
 #define PROC_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Load `image` (`len` bytes, a static ELF) and run it in ring 3 / EL0 in a
  * fresh private address space; returns 0 once the program SYS_EXITs, or a
@@ -50,5 +51,10 @@ int proc_fork(struct user_regs* parent_regs);
  * ELF at `path` (loaded from the VFS), passing `argv`.  fds survive.  Returns
  * -1 (image intact) on failure; does not return on success. */
 int proc_execve(const char* path, char* const argv[]);
+
+/* M35 — clone(): create a thread sharing the caller's address space + fds,
+ * starting at ring-3 `entry` with `stack`.  Returns the new thread's tid (a
+ * pid) to the caller, or -1.  The caller joins it with waitpid(tid). */
+int proc_clone(uintptr_t entry, uintptr_t stack);
 
 #endif

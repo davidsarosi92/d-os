@@ -22,6 +22,13 @@ void* mmap (size_t len, int fd);            /* fd<0 = anonymous */
 int   getpid(void);
 int   fork  (void);                         /* → child pid in parent, 0 in child */
 int   waitpid(int pid, int* status);        /* block for a child; → reaped pid */
+
+/* Threads (M35). */
+int   thread_create(int (*fn)(void*), void* arg);   /* → tid */
+int   thread_join(int tid);                         /* waitpid the thread */
+int   futex(int* uaddr, int op, int val);
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
 int   execv (const char* path, char* const argv[]);  /* replace image; no return on success */
 int   pipe  (int fds[2]);                   /* fds[0]=read, fds[1]=write */
 int   dup2  (int oldfd, int newfd);         /* redirect a descriptor */
