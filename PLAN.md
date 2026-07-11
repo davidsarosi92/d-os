@@ -3393,16 +3393,19 @@ store, never the global filesystem.
 
 ---
 
-## §M36 — POSIX syscall breadth + native libc (musl port) — ◐ stage 1 shipped (i386)
+## §M36 — POSIX syscall breadth + native libc (musl port) — ◐ in progress (i386)
 
-> ◐ **STAGE 1 SHIPPED (2026-07-11, i386) — see DOCS.md §4.30.**  Broadened the
-> syscall surface + grew the in-tree libc toward the musl-required set: syscalls
-> 30–35 (`stat`/`fstat`/`getdents`/`uname`/`clock_gettime`/`nanosleep`) + `errno`
-> + a `%o` printf; `posixtest` exercises them from ring 3 (uname, stat, a
-> `/bin` getdents listing, realtime+monotonic clock, nanosleep).  **Stage 2 (the
-> actual musl port) is deferred** — external-toolchain infrastructure:
-> cross-compile musl against the d-os syscall numbers as the native libc + a
-> minimal coreutils, all installed into the §M35.5 store.  Also still open:
+> ◐ **IN PROGRESS (2026-07-11, i386).**  **Stage 1 SHIPPED** (DOCS §4.30): the
+> syscall surface a real libc sits on — 30–35 (`stat`/`fstat`/`getdents`/`uname`/
+> `clock_gettime`/`nanosleep`) + `errno` + a `%o` printf; `posixtest` exercises
+> them from ring 3.  **Stage 2 foundation SHIPPED** (DOCS §4.31): the **modular
+> Linux i386 syscall-ABI compat layer** — keep musl PRISTINE (vendored,
+> `scripts/fetch-musl.sh`) and have d-os provide the Linux ABI via an isolated
+> `linux_abi.c` + a `task->linux_abi` personality (`linuxtest` runs a Linux-ABI
+> program end-to-end; doubles as §M41).  **Still open:** vendor+build musl
+> (`make musl`), grow `linux_abi.c` to musl's startup set (chiefly
+> `set_thread_area`/auxv — see `third_party/MUSL.md`), then run a static musl
+> `hello` + coreutils, `pkg install`-ed into the §M35.5 store.  Also later:
 > `getcwd`/`chdir` (per-task cwd), `brk`, epoll/eventfd/timerfd, `getrandom`
 > (§M39), full `struct sockaddr`.
 

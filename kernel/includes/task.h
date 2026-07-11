@@ -100,6 +100,12 @@ struct task {
      * from `tls_base` on switch-in.  A TLS thread is pinned to its CPU. */
     int           has_tls;
     uintptr_t     tls_base;
+    /* M36 — execution personality.  0 = d-os-native syscall ABI; 1 = Linux i386
+     * ABI (the process traps `int 0x80` with LINUX syscall numbers + struct
+     * layouts).  Selected at exec time so an unmodified Linux/musl binary runs
+     * alongside d-os-native programs.  The kernel routes syscall dispatch by
+     * this flag (kernel/hal/x86/linux_abi.c).  Inherited across fork/clone. */
+    int           linux_abi;
     /* Master-list link (circular SLL of every alive task).  Walked by
      * ps / task_for_each / task_find.  Pre-M18.6.1 the scheduler
      * also walked this list; now per-CPU runqueues take that role and

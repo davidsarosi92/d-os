@@ -3108,7 +3108,51 @@ musl, or a Linux-number alias) as the native libc replacing `user/libc.c`; a
 `/bin` + `/lib` convention; a minimal coreutils (`sh`/`ls`/`cat`/`echo`/`env`)
 as the first musl-linked programs — all installed into the §M35.5 store.  Also
 later: `getcwd`/`chdir` (needs a per-task cwd), `brk`/`mremap`, `epoll`/
-`eventfd`/`timerfd`, `getrandom` (§M39), full `struct sockaddr`.
+`eventfd`/`timerfd`, `getrandom` (§M39), full `struct sockaddr`.  (Stage 2's
+approach — a modular Linux-ABI layer rather than forking musl — is §4.31.)
+
+---
+
+### 4.31 Linux i386 syscall-ABI compat layer (M36 stage 2 / §M41, i386)
+
+**Files:** `kernel/hal/x86/linux_abi.c`, `kernel/includes/task.h`
+(`linux_abi`), `user/linuxhello.c`, `third_party/MUSL.md`,
+`scripts/fetch-musl.sh`.  Shell: `linuxtest`.
+
+The **modular** foundation for running an unmodified **musl** (or any prebuilt
+Linux i386) binary: rather than fork musl to d-os's syscall numbers, keep musl a
+pristine external dependency and have d-os provide the **Linux i386 syscall ABI**
+it already targets.
+
+- **Personality.**  `task->linux_abi` (set at exec time, inherited across
+  fork/clone) marks a process that traps `int 0x80` with *Linux* syscall numbers
+  + struct layouts.  `syscall_dispatch` (hal/x86/syscall.c) routes such a
+  process to the Linux translator; the native d-os switch is untouched, so the
+  two ABIs coexist.
+- **Translator (`linux_abi.c`).**  An *isolated* module mapping Linux i386
+  numbers to d-os primitives — `exit`/`exit_group`, `read`/`write`/`writev`,
+  `open`/`close`, `getpid`, `mmap2`, `brk`, `set_thread_area` — extensible
+  toward the musl-required set; an unknown number logs once and returns
+  `-ENOSYS`.  This is the single place the Linux number space + struct
+  translations live.
+- **musl vendoring.**  `scripts/fetch-musl.sh` clones a *pinned*, unmodified
+  musl into `third_party/musl` (gitignored — fetched, not committed);
+  `third_party/MUSL.md` documents the build (`configure`+`make` for i386),
+  static link (crt1 + libc.a), and the run path.
+
+**Boot-tested (i386):** `linuxtest` runs `user/linuxhello.c` — a freestanding
+program using the Linux ABI directly (`write`=4, `exit`=1; no d-os libc/crt0) —
+under the Linux personality: it prints via Linux `write` and exits via Linux
+`exit`, all routed through `linux_abi.c`.  The compat layer works end-to-end
+**without musl built yet**.
+
+**Next (to run real musl) — see `third_party/MUSL.md`:** grow `linux_abi.c` to
+cover musl's startup + runtime — chiefly **`set_thread_area`** (TLS is
+mandatory; translate the Linux `user_desc` onto the §M35 per-CPU `%gs` GDT-TLS
+mechanism — the biggest blocker), a proper **`auxv`** on the initial stack
+(`AT_RANDOM`/`AT_PAGESZ`/…), then `rt_sigprocmask`/`ioctl`/`stat64` as musl
+demands them (each surfaces via the `-ENOSYS` log).  Then link a static musl
+`hello`, a minimal coreutils, and `pkg install` them into the §M35.5 store.
 
 ---
 
@@ -3182,14 +3226,22 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-11 — M36 stage 2: modular Linux i386 syscall-ABI compat layer, i386.**
+  The foundation for running an unmodified (vendored, pristine) musl (DOCS §4.31,
+  also §M41): a `task->linux_abi` personality + an isolated Linux-i386 syscall
+  translator (`kernel/hal/x86/linux_abi.c`) mapping Linux numbers → d-os
+  primitives; `syscall_dispatch` routes a Linux-personality process there, the
+  native ABI untouched.  `scripts/fetch-musl.sh` pins + fetches musl (gitignored,
+  not forked); `third_party/MUSL.md` has the build/link/run plan + the
+  Linux-ABI checklist musl needs (set_thread_area/auxv/…).  Boot-tested:
+  `linuxtest` runs a freestanding Linux-ABI program (write=4/exit=1) end-to-end
+  without musl yet.  See PLAN.md §M36.
 - **2026-07-11 — M36 stage 1: POSIX syscall breadth + libc growth, i386.**  The
   surface a real libc sits on (DOCS §4.30): syscalls 30–35 — stat/fstat (kstat
   from the VFS inode), getdents (packed dir records), uname, clock_gettime
   (RTC epoch / timer uptime), nanosleep; libc grows the structs + wrappers +
   errno + a %o printf.  `posixtest` from ring 3: uname, stat /bin/args,
-  getdents /bin, realtime+monotonic clock, nanosleep.  Stage 2 (cross-compiling
-  musl as the native libc + coreutils into the §M35.5 store) is external-
-  toolchain infrastructure, deferred.  See PLAN.md §M36.
+  getdents /bin, realtime+monotonic clock, nanosleep.  See PLAN.md §M36.
 - **2026-07-11 — M35.5: content-addressed package store (first slice), i386.**
   The porting-discipline gate before foreign code (DOCS §4.29): a Nix/Guix-shaped
   store on the VFS (`kernel/core/pkg.c`) — content-addressed
