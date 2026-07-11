@@ -29,6 +29,7 @@ section .text
 
 global enter_user_mode_wrap
 global enter_user_mode
+global enter_user_mode_regs
 global saved_esp
 global saved_eip
 
@@ -115,3 +116,38 @@ enter_user_mode:
     push 0x1B                                   ; CS3 = GDT_USER_CS | RPL 3
     push eax                                    ; EIP3 (user entry)
     iret                                        ; → ring 3, never returns here
+
+; -----------------------------------------------------------------------------
+; void enter_user_mode_regs(struct user_regs* r);  — M34 fork child resume.
+;
+; Resume ring 3 with the FULL parent register set captured at fork's int 0x80,
+; but with eax = r->eax (0 for the child).  struct user_regs offsets (uintptr_t
+; = 4 bytes on i386): eax 0, ebx 4, ecx 8, edx 12, esi 16, edi 20, ebp 24,
+; eip 28, eflags 32, user_sp 36.  Never returns.
+; -----------------------------------------------------------------------------
+enter_user_mode_regs:
+    mov eax, [esp + 4]                          ; r (struct pointer)
+
+    mov cx, 0x23                                ; user data segments
+    mov ds, cx
+    mov es, cx
+    mov fs, cx
+    mov gs, cx
+
+    push 0x23                                   ; SS3
+    push dword [eax + 36]                       ; ESP3 = r->user_sp
+    mov ecx, [eax + 32]                         ; r->eflags
+    or  ecx, 0x200                              ; force IF=1
+    push ecx                                    ; EFLAGS
+    push 0x1B                                   ; CS3
+    push dword [eax + 28]                       ; EIP3 = r->eip
+
+    ; Load the general regs (eax LAST — it holds the struct pointer until now).
+    mov ebx, [eax + 4]
+    mov ecx, [eax + 8]
+    mov edx, [eax + 12]
+    mov esi, [eax + 16]
+    mov edi, [eax + 20]
+    mov ebp, [eax + 24]
+    mov eax, [eax + 0]                          ; r->eax (child sees fork()==0)
+    iret                                        ; → ring 3 at the fork point

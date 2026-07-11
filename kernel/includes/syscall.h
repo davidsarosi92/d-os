@@ -39,6 +39,8 @@
 #define SYS_RECV   11       /* (fd, buf, n, int* passfd_out) → bytes / -1      */
 #define SYS_POLL   12       /* (struct pollfd*, nfds, timeout) → #ready        */
 #define SYS_GETPID 13       /* () → calling task's pid (Tier B)                */
+#define SYS_FORK   14       /* () → child pid in parent, 0 in child (M34)      */
+#define SYS_WAITPID 15      /* (pid, int* status) → reaped pid / -1  (M34)     */
 
 /* poll(2) events (Linux values). */
 #define POLLIN      0x001   /* readable                                        */

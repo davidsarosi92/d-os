@@ -127,6 +127,12 @@ struct vmm_space* vmm_space_create(void);
  * the currently-loaded space on any CPU.  NULL is a no-op. */
 void vmm_space_destroy(struct vmm_space* space);
 
+/* M34 — clone a space for fork(): every private user page is EAGERLY copied
+ * into a fresh space with the same VA + flags (VMM_SHARED pages are shared,
+ * not copied — they are borrowed shm frames).  Returns NULL on OOM.  (Eager
+ * copy first; copy-on-write is a later optimisation.)  i386 impl today. */
+struct vmm_space* vmm_space_clone(struct vmm_space* parent);
+
 /* Map / unmap a page in a *specific* space's user region.  Same flag
  * semantics as vmm_map (pass VMM_USER for a ring-3-accessible page). */
 int  vmm_space_map(struct vmm_space* space, uintptr_t virt, uintptr_t phys,

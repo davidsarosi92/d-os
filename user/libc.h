@@ -20,6 +20,8 @@ int   close(int fd);
 void  exit (int code);
 void* mmap (size_t len, int fd);            /* fd<0 = anonymous */
 int   getpid(void);
+int   fork  (void);                         /* → child pid in parent, 0 in child */
+int   waitpid(int pid, int* status);        /* block for a child; → reaped pid */
 
 /* String / memory. */
 size_t strlen(const char* s);

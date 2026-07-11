@@ -31,6 +31,8 @@
 #include "printf.h"
 #include "hal_api.h"
 #include "task.h"
+#include "proc.h"
+#include "usermode.h"
 #include <stdint.h>
 
 /* Imports from usermode.s — the saved kernel context that lets SYS_EXIT
@@ -71,6 +73,29 @@ void syscall_dispatch(struct int_frame* f) {
         case SYS_GETPID:
             f->eax = (uint32_t)(task_current() ? task_current()->pid : -1);
             return;
+
+        /* M34 — fork(): snapshot the caller's user registers from the trapframe
+         * and hand them to the portable-ish orchestrator.  The parent returns
+         * here with the child's pid; the child starts on its own task. */
+        case SYS_FORK: {
+            struct user_regs r;
+            r.eax = 0;
+            r.ebx = f->ebx; r.ecx = f->ecx; r.edx = f->edx;
+            r.esi = f->esi; r.edi = f->edi; r.ebp = f->ebp;
+            r.eip = f->eip; r.eflags = f->eflags; r.user_sp = f->user_esp;
+            f->eax = (uint32_t)proc_fork(&r);
+            return;
+        }
+
+        /* M34 — waitpid(pid, int* status): block on the child-exit wait queue
+         * (task_wait), then write the exit code to the user status pointer. */
+        case SYS_WAITPID: {
+            int status = 0;
+            int pid = task_wait((int)f->ebx, &status);
+            if (f->ecx) *(int*)f->ecx = status;
+            f->eax = (uint32_t)pid;
+            return;
+        }
 
         /* M25 stage 3 — fd syscalls.  EBX/ECX/EDX = arg0/arg1/arg2. */
         case SYS_WRITE:

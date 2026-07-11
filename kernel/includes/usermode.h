@@ -29,6 +29,16 @@ void enter_user_mode_wrap(uintptr_t user_ip, uintptr_t user_sp);
 void enter_user_mode(uintptr_t user_ip, uintptr_t user_sp)
     __attribute__((noreturn));
 
+/* M34 — resume a full user register set in ring 3 (used by fork() to start the
+ * child at the parent's post-`int 0x80` point with eax = 0).  Field order +
+ * widths match the i386 usermode.s reader (offsets 0,4,8,...).  Never returns
+ * (iret into ring 3).  i386 today; other arches provide their own. */
+struct user_regs {
+    uintptr_t eax, ebx, ecx, edx, esi, edi, ebp;   /* GP regs (eax = return)   */
+    uintptr_t eip, eflags, user_sp;                /* iret frame               */
+};
+void enter_user_mode_regs(struct user_regs* r) __attribute__((noreturn));
+
 /* Arch-portable ring-3/EL0 self-test — the `ringtest` shell command.  Each
  * arch implements it (x86: kernel/hal/x86/ringtest.c hand-codes an i386 ring-3
  * program; aarch64: kernel/hal/aarch64/syscall.c drops to EL0).  Returns 0 on

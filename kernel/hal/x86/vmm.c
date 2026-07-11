@@ -330,6 +330,46 @@ void vmm_space_destroy(struct vmm_space* s) {
     kfree(s);
 }
 
+struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
+    if (!parent) return NULL;
+    struct vmm_space* child = vmm_space_create();     /* kernel snapshot only */
+    if (!child) return NULL;
+
+    /* Walk the parent's private user mappings (the same filter as destroy:
+     * present, non-PSE, not kernel-shared) and reproduce each in the child. */
+    for (uint32_t i = 0; i < 1024; i++) {
+        uint32_t pde = parent->pd[i];
+        if ((pde & PDE_P) == 0)          continue;
+        if (pde & PDE_PS)                continue;   /* PSE leaf — kernel      */
+        if (pde_is_kernel_shared(parent, i)) continue;
+
+        uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
+        for (uint32_t j = 0; j < 1024; j++) {
+            uint32_t pte = pt[j];
+            if ((pte & PTE_P) == 0) continue;
+            uint32_t virt  = (i << 22) | (j << 12);
+            uint32_t flags = pte & (VMM_WRITABLE | VMM_USER | VMM_SHARED);
+
+            if (pte & VMM_SHARED) {
+                /* Borrowed shm frame — share it (don't copy, don't own). */
+                if (map_in_pd(child->pd, virt, pte & PAGE_MASK, flags) != 0) {
+                    vmm_space_destroy(child); return NULL;
+                }
+            } else {
+                uint32_t nf = pmm_alloc_frame();
+                if (!nf) { vmm_space_destroy(child); return NULL; }
+                const uint32_t* src = (const uint32_t*)(uintptr_t)(pte & PAGE_MASK);
+                uint32_t* dst = (uint32_t*)(uintptr_t)nf;
+                for (int k = 0; k < 1024; k++) dst[k] = src[k];   /* copy page */
+                if (map_in_pd(child->pd, virt, nf, flags) != 0) {
+                    pmm_free_frame(nf); vmm_space_destroy(child); return NULL;
+                }
+            }
+        }
+    }
+    return child;
+}
+
 int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
                   uint32_t flags) {
     if (!s) return vmm_map(virt, phys, flags); /* NULL == kernel space */

@@ -38,4 +38,12 @@ int proc_exec_elf_argv(const void* image, size_t len,
  * run at once.  The caller can task_wait(pid) to await completion. */
 int proc_spawn(const char* name, const void* image, size_t len);
 
+/* M34 — fork() orchestration (i386): clone the caller's address space + fd
+ * table into a child task that resumes in ring 3 at the parent's fork point
+ * with eax=0.  `parent_regs` is the caller's user register snapshot (filled by
+ * the arch syscall dispatcher from its trapframe).  Returns the child pid to
+ * the parent, or -1 on failure.  (The child never returns through here.) */
+struct user_regs;
+int proc_fork(struct user_regs* parent_regs);
+
 #endif

@@ -1391,6 +1391,23 @@ static void cmd_runargs(const char* line) {
     kprintf("runargs: returned rc=%d\n", rc);
 }
 
+/* M34 slice B — `forktest`: exec a user program that fork()s, the child exits
+ * with a code, and the parent waitpid()s for it. */
+extern const unsigned char _binary_user_forktest_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_forktest_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_forktest(void) {
+    if (!_binary_user_forktest_i386_elf_start) {
+        console_write("forktest: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_forktest_i386_elf_end -
+                          _binary_user_forktest_i386_elf_start);
+    console_write("forktest: exec'ing fork()+waitpid() program...\n");
+    int rc = proc_exec_elf(_binary_user_forktest_i386_elf_start, len);
+    kprintf("forktest: returned rc=%d\n", rc);
+}
+
 /* -------------------------------------------------------------------- */
 /* Configuration commands.                                              */
 /* -------------------------------------------------------------------- */
@@ -1548,6 +1565,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "procspawn"))      { cmd_procspawn(); return; }
     if (streq(line, "runargs"))        { cmd_runargs(""); return; }
     if (starts_with(line, "runargs ")) { cmd_runargs(line + 8); return; }
+    if (streq(line, "forktest"))       { cmd_forktest(); return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }
