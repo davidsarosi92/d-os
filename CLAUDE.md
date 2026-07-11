@@ -44,7 +44,11 @@ calling task (no IRQ/lock yet); TCP client-only, no retransmit/congestion.
 **Stage 6 (2026-07-11): BSD socket API to userland** — `FD_NETSOCK` +
 `socket`/`bind`/`connect`/`sendto`/`recvfrom` (syscalls 22–26), ring-3 UDP+TCP;
 `dnstest`/`httptest` resolve + fetch a page from ring 3.  Open: sockaddr,
-multiple TCP conns, IRQ RX, DHCP, IPv6.  **Tier A** (2026-07-10, DOCS §4.20): blocking
+multiple TCP conns, IRQ RX, DHCP, IPv6.  **M35** (2026-07-11, DOCS §4.28):
+threads + futex (i386, UP) — `proc_clone` (shared address space, `mm_shared`) +
+`futex` (SYS_CLONE/SYS_FUTEX) + libc `thread_create`/`thread_join`; UP-tested
+20000/20000.  Pre-existing gap surfaced: ring-3 tasks don't run on APs (single
+global TSS) — `-smp 2` hangs; fix = per-CPU TSS (the next task).  **Tier A** (2026-07-10, DOCS §4.20): blocking
 primitives — `waitq` (block/wake, lost-wakeup-free, SMP cross-CPU wake;
 `TASK_SLEEPING` now real), `task_wait(pid,&code)`, blocking socket
 read + `poll(timeout<0)`, `task_msleep`.  **M29** (DOCS §4.21):
@@ -158,16 +162,18 @@ extension + ACPI SRAT-derived per-CPU NUMA nodes), APs scheduling,
 **x86_64 (long mode) — full parity with i386 INCLUDING xHCI USB +
 virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
-▶️ **DECIDED NEXT (2026-07-11): §M35 — threads & futex.**  §M34 (POSIX process
-model) SHIPPED (i386, DOCS §4.27) — fork(COW)/execve/waitpid/pipe/dup2/signals;
-**and the net socket syscall API (§M24 stage 6) SHIPPED** (i386, DOCS §4.25) —
-ring-3 UDP+TCP sockets (`socket`/`bind`/`connect`/`sendto`/`recvfrom`, syscalls
-22–26; `dnstest`/`httptest` resolve + fetch from ring 3).  The agreed next
-target is **§M35 threads & futex** (clone/TLS/pthreads/futex on the SMP
-scheduler) → §M35.5 pkg → §M36 libc → … (the "Userland maturation" cluster
-critical path).  **§M26 Wayland stays deferred until POSIX + libc exist.**  §M34
-+ sockets live on branch `m24-sockets` / `m34-posix-process` (check git);
-earlier M24/M23 merged to main.
+▶️ **DECIDED NEXT (2026-07-11): per-CPU TSS (unblock SMP userland), then TLS.**
+§M35 (threads & futex) SHIPPED on i386/UP (DOCS §4.28) — `proc_clone`/`futex`/
+`thread_create`; UP-tested 20000/20000.  **But it surfaced a pre-existing gap:
+ring-3 tasks don't run on APs** — `tss.c` has a single global TSS + APs never
+`LTR` their own, so `threadtest` AND `procspawn` hang on `-smp 2`.  **The
+immediate next task is the per-CPU TSS fix** (a GDT TSS descriptor per CPU +
+each CPU LTRs its own + `hal_set_kernel_stack` writes `tss[this_cpu].esp0`) — a
+self-contained SMP-userland infra change that unblocks *all* ring-3 tasks on
+APs.  Then **TLS** (`__thread`/`set_thread_area`) → §M35.5 pkg → §M36 libc → …
+Also shipped this session: §M34 POSIX (DOCS §4.27), §M24 stage-6 sockets (DOCS
+§4.25).  **§M26 Wayland stays deferred until POSIX + libc exist.**  §M35 on
+branch `m35-threads`; check git for merge state.
 
 🔲 **Other options** (was "pick one"; superseded by the decision above):
 
