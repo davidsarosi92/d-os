@@ -63,7 +63,7 @@
 | §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) — ✅ shipped L1+L2 (DOCS §4.22; L3 HW deferred) | ~1960 |
 | §M32 | Multi-user — identity, login, file perms, isolation | ~2160 |
 | §M33 | Execution domains — where a service runs (kernel / user / isolated); driver placement is the flagship case | ~2265 |
-| §M34 | POSIX process & signals — fork/execve(argv,env)/waitpid/pipes/job-control/signals | — |
+| §M34 | POSIX process & signals — ✅ shipped (i386): fork(COW)/execve/waitpid/pipe/dup2/signals (DOCS §4.27) | — |
 | §M35 | Threads & futex — clone / TLS / pthreads / futex | — |
 | §M35.5 | Package manager & isolation — content-addressed store (Nix-shaped); gates every port | — |
 | §M36 | POSIX syscall breadth + native libc (musl port) | — |
@@ -3059,17 +3059,22 @@ is self-contained when read in isolation.
 
 ---
 
-## §M34 — POSIX process & signals layer
+## §M34 — POSIX process & signals layer — ✅ shipped (i386)
 
-> ▶️ **DECIDED NEXT (2026-07-11).**  Chosen as the next milestone after M24/M23.
-> Agreed sequencing: **§M34 → the net socket syscall API** (the open §M24 tail:
-> `socket`/`bind`/`connect`/`send`/`recv` exposed to userland — small, rides on
-> §M34's process/fd model, and the §M39 TLS bridge) **→ §M35 threads → §M35.5
-> pkg → §M36 libc → …**.  §M26 Wayland deferred until POSIX + libc exist (its
-> prereqs are done, but a server needs real clients, which need the POSIX
-> userland first).  Start with the fork/execve slice (argv/env/auxv + COW
-> address-space clone + waitpid on the Tier-A wait-queue); boot-test i386 with a
-> sendkey-driven shell command over serial (the M24/M23 method).
+> ✅ **SHIPPED (2026-07-11, i386) — see DOCS.md §4.27.**  All slices done +
+> boot-tested: SysV initial stack (argc/argv/envp/auxv); **copy-on-write fork**
+> (`vmm_space_clone` + `vmm_cow_fault` on the #PF path + `enter_user_mode_regs`);
+> `waitpid` (Tier-A wait-queue); `execve` loading `/bin/*` from the VFS
+> (`bin_install`); `pipe`+`dup2` (usock ring); **signals** (sigaction/kill/raise,
+> return-to-user delivery + `__sig_trampoline`→SYS_SIGRETURN, default-terminate).
+> Syscalls 14–21; shell `runargs`/`forktest`/`forkexec`/`pipetest`/`sigtest`.
+> **Still open** (design below is the roadmap): EINTR / sigprocmask; user #PF →
+> SIGSEGV (a user fault still panics); `vfork`/`posix_spawn`; job control /
+> sessions / controlling tty; x86_64/aarch64 (the fork/signal register-restore is
+> i386 asm).  **Next per the agreed sequencing:** the net socket syscall API
+> (open §M24 tail — `socket`/`bind`/`connect`/`send`/`recv` to userland, the
+> §M39 TLS bridge) → §M35 threads → §M35.5 pkg → §M36 libc → …; §M26 Wayland
+> still deferred until POSIX + libc exist.
 
 **Why:** the single largest gap between today's userland (§M25) and any
 real POSIX program.  Browsers — Chromium especially, with its
@@ -3685,6 +3690,20 @@ not a binary registry.  Revisit only with a specific use case.
 
 ## Change log
 
+- **2026-07-11** — **§M34 shipped (POSIX process model, i386).**  The classic
+  Unix process API on the M25 userland (DOCS §4.27): SysV initial stack
+  (argc/argv/envp/auxv); **copy-on-write fork** (`vmm_space_clone` shares
+  writable pages read-only+COW ref-counted, `vmm_cow_fault` resolves writes on
+  the #PF path, `enter_user_mode_regs` resumes the child at the fork point with
+  eax=0); `waitpid` (Tier-A wait-queue); `execve` loading `/bin/*` from the VFS
+  (`bin_install` populates `/bin`); `pipe`+`dup2` (usock ring); **signals**
+  (sigaction/kill/raise, return-to-user delivery with a user-stack signal frame
+  + `__sig_trampoline`→SYS_SIGRETURN, default-terminate on INT/TERM/KILL/SEGV).
+  Syscalls 14–21; shell runargs/forktest/forkexec/pipetest/sigtest, all
+  boot-tested (forktest proves COW isolation).  Fork/signal register-restore is
+  i386 asm → i386-only for now.  Open: EINTR, sigprocmask, user #PF→SIGSEGV,
+  vfork/posix_spawn, job control, x86_64/aarch64.  Next: net socket syscall API
+  → §M35 threads.  See DOCS.md §4.27.
 - **2026-07-11** — **§M23 stage 1 shipped (audio, i386).**  An `audio_dev`
   registry (block/net-shaped) + an AC97 codec driver (PCI 0x8086:0x2415, NAM
   mixer + NABM bus-master, PCM output via a Buffer Descriptor List over a

@@ -188,6 +188,49 @@ int sys_socketpair(int* fds) {
     return 0;
 }
 
+/* M34 — pipe(fds): a connected byte channel.  Backed by the same usock ring
+ * as socketpair (bidirectional under the hood); fds[0] is the read end and
+ * fds[1] the write end by convention.  Inherited across fork (ofile refs),
+ * so the classic "child writes, parent reads" works. */
+int sys_pipe(int* fds) {
+    return sys_socketpair(fds);
+}
+
+/* M34 — dup2(oldfd, newfd): make newfd refer to oldfd's object (closing any
+ * prior newfd).  Real fds only (>= 3); the std streams have no ofile yet. */
+int sys_dup2(int oldfd, int newfd) {
+    struct ofile* o = fd_lookup(oldfd);
+    if (!o) return -1;
+    if (oldfd == newfd) return newfd;
+    if (newfd < 3 || newfd >= TASK_MAX_FDS) return -1;
+    struct task* t = task_current();
+    if (t->fds[newfd]) { ofile_unref(t->fds[newfd]); t->fds[newfd] = NULL; }
+    t->fds[newfd] = ofile_ref(o);
+    return newfd;
+}
+
+/* M34 — kill(pid, sig): post `sig` to task `pid`.  Delivery happens when that
+ * task next returns to user mode (hal/x86/signal.c).  A task blocked in a
+ * syscall won't notice until it returns (no EINTR yet — a follow-up). */
+int sys_kill(int pid, int sig) {
+    if (sig <= 0 || sig >= NSIG) return -1;
+    struct task* t = task_find(pid);
+    if (!t) return -1;
+    t->sig_pending |= (1u << sig);
+    return 0;
+}
+
+/* M34 — sigaction(sig, handler, restorer): set the disposition of `sig` and
+ * remember the libc SYS_SIGRETURN trampoline.  Returns the previous handler. */
+long sys_sigaction(int sig, long handler, long restorer) {
+    struct task* t = task_current();
+    if (!t || sig <= 0 || sig >= NSIG) return -1;
+    long old = (long)t->sig_handler[sig];
+    t->sig_handler[sig] = (uintptr_t)handler;
+    if (restorer) t->sig_restorer = (uintptr_t)restorer;
+    return old;
+}
+
 long sys_send(int fd, const void* buf, size_t n, int passfd) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_SOCK) return -1;

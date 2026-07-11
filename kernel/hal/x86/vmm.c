@@ -44,6 +44,7 @@
 #include "pmm.h"
 #include "printf.h"
 #include "kmalloc.h"
+#include "task.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -179,9 +180,9 @@ static int map_in_pd(uint32_t* pd, uint32_t virt, uint32_t phys, uint32_t flags)
         pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
     }
 
-    /* VMM_SHARED (0x400) rides along in PTE bit 10 (OS-available) so
-     * vmm_space_destroy can tell borrowed frames from owned ones. */
-    pt[pti] = (phys & PAGE_MASK) | PTE_P | (flags & (PTE_RW | PTE_US | VMM_SHARED));
+    /* VMM_SHARED (0x400) / VMM_COW (0x800) ride along in PTE OS-available bits
+     * 10/11 so vmm_space_destroy + the COW fault path can classify the frame. */
+    pt[pti] = (phys & PAGE_MASK) | PTE_P | (flags & (PTE_RW | PTE_US | VMM_SHARED | VMM_COW));
     invlpg(virt);
     return 0;
 }
@@ -305,6 +306,18 @@ struct vmm_space* vmm_space_create(void) {
     return s;
 }
 
+/* M34 — per-frame COW reference counts, indexed by frame number (phys >> 12).
+ * Covers the i386 low-memory region the PMM allocates user pages from (256 MiB
+ * → 64 Ki frames).  A count of 0 means "not COW-shared" (a normally-owned page
+ * freed by its single owner); a page made COW by fork starts at 2. */
+#define COW_MAX_FRAMES  (256u * 1024u * 1024u / 4096u)   /* 65536 */
+static uint16_t g_cow_ref[COW_MAX_FRAMES];
+
+static inline uint16_t* cow_slot(uint32_t phys) {
+    uint32_t fn = phys >> 12;
+    return (fn < COW_MAX_FRAMES) ? &g_cow_ref[fn] : NULL;
+}
+
 void vmm_space_destroy(struct vmm_space* s) {
     if (!s) return;
 
@@ -320,14 +333,105 @@ void vmm_space_destroy(struct vmm_space* s) {
         uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
         for (int j = 0; j < 1024; j++) {
             uint32_t pte = pt[j];
-            /* Skip VMM_SHARED (borrowed) frames — their owner frees them. */
-            if ((pte & PTE_P) && !(pte & VMM_SHARED))
-                pmm_free_frame(pte & PAGE_MASK);   /* owned user page */
+            if (!(pte & PTE_P))   continue;
+            if (pte & VMM_SHARED) continue;     /* borrowed shm — owner frees   */
+            if (pte & VMM_COW) {
+                /* COW-shared: free the frame only when the last owner leaves. */
+                uint16_t* rc = cow_slot(pte & PAGE_MASK);
+                if (rc && *rc > 1) { (*rc)--; continue; }
+                if (rc) *rc = 0;
+            }
+            pmm_free_frame(pte & PAGE_MASK);     /* owned user page */
         }
         pmm_free_frame(pde & PAGE_MASK);        /* the page table itself */
     }
     pmm_free_frame(s->pd_phys);                 /* the directory */
     kfree(s);
+}
+
+struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
+    if (!parent) return NULL;
+    struct vmm_space* child = vmm_space_create();     /* kernel snapshot only */
+    if (!child) return NULL;
+
+    /* Walk the parent's private user mappings.  WRITABLE pages become
+     * copy-on-write (shared read-only in BOTH spaces, ref-counted); read-only
+     * pages (code) are eagerly copied; borrowed shm pages stay shared. */
+    for (uint32_t i = 0; i < 1024; i++) {
+        uint32_t pde = parent->pd[i];
+        if ((pde & PDE_P) == 0)          continue;
+        if (pde & PDE_PS)                continue;   /* PSE leaf — kernel      */
+        if (pde_is_kernel_shared(parent, i)) continue;
+
+        uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
+        for (uint32_t j = 0; j < 1024; j++) {
+            uint32_t pte = pt[j];
+            if ((pte & PTE_P) == 0) continue;
+            uint32_t virt  = (i << 22) | (j << 12);
+            uint32_t frame = pte & PAGE_MASK;
+
+            if (pte & VMM_SHARED) {
+                /* Borrowed shm frame — share it verbatim (don't own/copy). */
+                uint32_t fl = VMM_USER | VMM_SHARED | (pte & PTE_RW ? VMM_WRITABLE : 0);
+                if (map_in_pd(child->pd, virt, frame, fl) != 0) {
+                    vmm_space_destroy(child); return NULL;
+                }
+            } else if (pte & PTE_RW) {
+                /* Writable → COW: share the frame read-only in both spaces. */
+                uint16_t* rc = cow_slot(frame);
+                if (rc) { *rc = (*rc == 0) ? 2 : (uint16_t)(*rc + 1); }
+                map_in_pd(parent->pd, virt, frame, VMM_USER | VMM_COW);  /* parent RO+COW */
+                if (map_in_pd(child->pd, virt, frame, VMM_USER | VMM_COW) != 0) {
+                    vmm_space_destroy(child); return NULL;
+                }
+            } else {
+                /* Read-only (code) → eager private copy (cheap, rarely large). */
+                uint32_t nf = pmm_alloc_frame();
+                if (!nf) { vmm_space_destroy(child); return NULL; }
+                const uint32_t* src = (const uint32_t*)(uintptr_t)frame;
+                uint32_t* dst = (uint32_t*)(uintptr_t)nf;
+                for (int k = 0; k < 1024; k++) dst[k] = src[k];
+                if (map_in_pd(child->pd, virt, nf, VMM_USER) != 0) {
+                    pmm_free_frame(nf); vmm_space_destroy(child); return NULL;
+                }
+            }
+        }
+    }
+    return child;
+}
+
+int vmm_cow_fault(uintptr_t fault_va) {
+    struct task* t = task_current();
+    if (!t || !t->mm) return 0;
+    struct vmm_space* s = t->mm;
+
+    uint32_t va  = (uint32_t)fault_va;
+    uint32_t pdi = PD_IDX(va), pti = PT_IDX(va);
+    uint32_t pde = s->pd[pdi];
+    if (!(pde & PDE_P) || (pde & PDE_PS)) return 0;
+
+    uint32_t* pt  = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
+    uint32_t  pte = pt[pti];
+    if (!(pte & PTE_P) || !(pte & VMM_COW)) return 0;   /* not a COW page → real fault */
+
+    uint32_t old = pte & PAGE_MASK;
+    uint16_t* rc = cow_slot(old);
+
+    if (!rc || *rc <= 1) {
+        /* Last (or untracked) sharer — just make it writable in place. */
+        pt[pti] = old | PTE_P | PTE_US | PTE_RW;
+        if (rc) *rc = 0;
+    } else {
+        (*rc)--;                                        /* one fewer sharer   */
+        uint32_t nf = pmm_alloc_frame();
+        if (!nf) { (*rc)++; return 0; }                 /* OOM → real fault    */
+        const uint32_t* src = (const uint32_t*)(uintptr_t)old;
+        uint32_t* dst = (uint32_t*)(uintptr_t)nf;
+        for (int k = 0; k < 1024; k++) dst[k] = src[k];
+        pt[pti] = (nf & PAGE_MASK) | PTE_P | PTE_US | PTE_RW;
+    }
+    invlpg(va & PAGE_MASK);
+    return 1;
 }
 
 int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,

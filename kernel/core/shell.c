@@ -1354,6 +1354,131 @@ static void cmd_procspawn(void) {
             a, b);
 }
 
+/* M34 slice A — `runargs [a b c ...]`: exec the args test program with an
+ * argv built by the kernel; it prints argc + each argv from ring 3. */
+extern const unsigned char _binary_user_args_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_args_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_runargs(const char* line) {
+    if (!_binary_user_args_i386_elf_start) {
+        console_write("runargs: args ELF not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_args_i386_elf_end - _binary_user_args_i386_elf_start);
+
+    /* Split `line` into up to 15 whitespace-separated argv strings, in place
+     * (a scratch copy).  argv[0] is the program name. */
+    static char scratch[256];
+    const char* argv[16];
+    int argc = 0;
+    argv[argc++] = "args";               /* argv[0] */
+
+    int n = 0;
+    while (line[n] && n < 255) { scratch[n] = line[n]; n++; }
+    scratch[n] = '\0';
+    int i = 0;
+    while (scratch[i] && argc < 16) {
+        while (scratch[i] == ' ') i++;
+        if (!scratch[i]) break;
+        argv[argc++] = &scratch[i];
+        while (scratch[i] && scratch[i] != ' ') i++;
+        if (scratch[i]) scratch[i++] = '\0';
+    }
+
+    kprintf("runargs: exec'ing args program with %d argv...\n", argc);
+    int rc = proc_exec_elf_argv(_binary_user_args_i386_elf_start, len,
+                                argc, (const char* const*)argv);
+    kprintf("runargs: returned rc=%d\n", rc);
+}
+
+/* M34 slice B — `forktest`: exec a user program that fork()s, the child exits
+ * with a code, and the parent waitpid()s for it. */
+extern const unsigned char _binary_user_forktest_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_forktest_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_forktest(void) {
+    if (!_binary_user_forktest_i386_elf_start) {
+        console_write("forktest: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_forktest_i386_elf_end -
+                          _binary_user_forktest_i386_elf_start);
+    console_write("forktest: exec'ing fork()+waitpid() program...\n");
+    int rc = proc_exec_elf(_binary_user_forktest_i386_elf_start, len);
+    kprintf("forktest: returned rc=%d\n", rc);
+}
+
+/* M34 slice C — install the embedded user ELFs into the ramfs as /bin/<name>
+ * so execve(path) can load them via the VFS.  Idempotent; called once from the
+ * shell entry.  (The first real step toward a populated /bin.) */
+static void bin_install_one(const char* path, const unsigned char* s,
+                            const unsigned char* e) {
+    if (!s || !e || e <= s) return;
+    struct file* f = vfs_open(path, VFS_WRONLY | VFS_CREATE);
+    if (!f) return;
+    vfs_write(f, s, (size_t)(e - s));
+    vfs_close(f);
+}
+
+void bin_install(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    vfs_mkdir("/bin");
+    bin_install_one("/bin/args",  _binary_user_args_i386_elf_start,
+                                  _binary_user_args_i386_elf_end);
+    bin_install_one("/bin/hello", _binary_user_hello_i386_elf_start,
+                                  _binary_user_hello_i386_elf_end);
+}
+
+/* M34 slice C — `forkexec`: fork()+execv(/bin/args)+waitpid() from ring 3. */
+extern const unsigned char _binary_user_forkexec_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_forkexec_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_forkexec(void) {
+    if (!_binary_user_forkexec_i386_elf_start) {
+        console_write("forkexec: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_forkexec_i386_elf_end -
+                          _binary_user_forkexec_i386_elf_start);
+    console_write("forkexec: exec'ing fork()+execv()+waitpid() program...\n");
+    int rc = proc_exec_elf(_binary_user_forkexec_i386_elf_start, len);
+    kprintf("forkexec: returned rc=%d\n", rc);
+}
+
+/* M34 slice D — `pipetest`: pipe()+dup2()+fork() from ring 3. */
+extern const unsigned char _binary_user_pipetest_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_pipetest_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_pipetest(void) {
+    if (!_binary_user_pipetest_i386_elf_start) {
+        console_write("pipetest: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_pipetest_i386_elf_end -
+                          _binary_user_pipetest_i386_elf_start);
+    console_write("pipetest: exec'ing pipe()+dup2()+fork() program...\n");
+    int rc = proc_exec_elf(_binary_user_pipetest_i386_elf_start, len);
+    kprintf("pipetest: returned rc=%d\n", rc);
+}
+
+/* M34 slice E — `sigtest`: signal()+raise()+handler from ring 3. */
+extern const unsigned char _binary_user_sigtest_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_sigtest_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_sigtest(void) {
+    if (!_binary_user_sigtest_i386_elf_start) {
+        console_write("sigtest: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_sigtest_i386_elf_end -
+                          _binary_user_sigtest_i386_elf_start);
+    console_write("sigtest: exec'ing signal()+raise() program...\n");
+    int rc = proc_exec_elf(_binary_user_sigtest_i386_elf_start, len);
+    kprintf("sigtest: returned rc=%d\n", rc);
+}
+
 /* -------------------------------------------------------------------- */
 /* Configuration commands.                                              */
 /* -------------------------------------------------------------------- */
@@ -1509,6 +1634,12 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "polltest"))       { cmd_polltest(); return; }
     if (streq(line, "libctest"))       { cmd_libctest(); return; }
     if (streq(line, "procspawn"))      { cmd_procspawn(); return; }
+    if (streq(line, "runargs"))        { cmd_runargs(""); return; }
+    if (starts_with(line, "runargs ")) { cmd_runargs(line + 8); return; }
+    if (streq(line, "forktest"))       { cmd_forktest(); return; }
+    if (streq(line, "forkexec"))       { cmd_forkexec(); return; }
+    if (streq(line, "pipetest"))       { cmd_pipetest(); return; }
+    if (streq(line, "sigtest"))        { cmd_sigtest(); return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }
@@ -1593,8 +1724,11 @@ static void dispatch(struct vc* my_vc, const char* line) {
  *
  * The first prompt that prints is the user's only signal that the new
  * pane is alive, so we print it before any blocking read. */
+void bin_install(void);   /* defined above — installs the /bin entries */
+
 void shell_run(struct vc* v) {
     char line[LINE_MAX];
+    bin_install();                       /* M34 — populate /bin for execve() */
     /* Announce ourselves once in case this pane was just spawned. */
     kprintf("[pane %d ready, pid %d]\n",
             v->id, task_current() ? task_current()->pid : -1);

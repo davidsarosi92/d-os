@@ -16,6 +16,13 @@
 #define SYS_CLOSE  5
 #define SYS_MMAP   7
 #define SYS_GETPID 13
+#define SYS_FORK   14
+#define SYS_WAITPID 15
+#define SYS_EXECVE 16
+#define SYS_PIPE   17
+#define SYS_DUP2   18
+#define SYS_KILL   19
+#define SYS_SIGACTION 20
 
 /* One syscall path, three arches.  x86 (i386 + x86_64) trap via `int 0x80`
  * (rax/eax = number, rbx/ecx/edx = args); aarch64 traps via `svc #0` with the
@@ -50,6 +57,18 @@ void  exit (int code)                          { syscall3(SYS_EXIT, code, 0, 0);
 void* mmap (size_t len, int fd)                { long r = syscall3(SYS_MMAP, (long)len, fd, 0);
                                                  return (r <= 0) ? (void*)0 : (void*)r; }
 int   getpid(void)                             { return (int)syscall3(SYS_GETPID, 0, 0, 0); }
+int   fork  (void)                             { return (int)syscall3(SYS_FORK, 0, 0, 0); }
+int   waitpid(int pid, int* status)            { return (int)syscall3(SYS_WAITPID, pid, (long)status, 0); }
+int   execv (const char* path, char* const argv[]) { return (int)syscall3(SYS_EXECVE, (long)path, (long)argv, 0); }
+int   pipe  (int fds[2])                       { return (int)syscall3(SYS_PIPE, (long)fds, 0, 0); }
+int   dup2  (int oldfd, int newfd)             { return (int)syscall3(SYS_DUP2, oldfd, newfd, 0); }
+
+extern void __sig_trampoline(void);            /* crt0.s */
+sighandler_t signal(int sig, sighandler_t h) {
+    return (sighandler_t)syscall3(SYS_SIGACTION, sig, (long)h, (long)__sig_trampoline);
+}
+int   kill  (int pid, int sig)                 { return (int)syscall3(SYS_KILL, pid, sig, 0); }
+int   raise (int sig)                          { return kill(getpid(), sig); }
 
 size_t strlen(const char* s) { size_t i = 0; while (s[i]) i++; return i; }
 

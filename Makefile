@@ -58,7 +58,9 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/lapic.c \
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/smp.c \
-      kernel/hal/x86/syscall.c
+      kernel/hal/x86/syscall.c \
+      kernel/hal/x86/fork.c \
+      kernel/hal/x86/signal.c
 
   ARCH_ASM_SRCS := \
       kernel/hal/x86/boot.s \
@@ -67,7 +69,9 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/switch.s
 
   ARCH_EXTRA_OBJS := kernel/hal/x86/ap_trampoline_blob.o user/hello_blob.o \
-                     user/spin_blob.o
+                     user/spin_blob.o user/args_blob.o user/forktest_blob.o \
+                     user/forkexec_blob.o user/pipetest_blob.o \
+                     user/sigtest_blob.o
 
   # Tier B — in-tree user libc build knobs (i386 reference).
   USER_CFLAGS   := -m32 -ffreestanding -fno-pie -fno-stack-protector \
@@ -537,6 +541,66 @@ user/spin_$(ARCH).elf: user/libc.c user/spin.c user/libc.h
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/spin.o $(OBJ_DIR)/user/libc.o
 
 $(OBJ_DIR)/user/spin_blob.o: user/spin_$(ARCH).elf
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+user/args_$(ARCH).elf: user/libc.c user/args.c user/libc.h
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/args.c -o $(OBJ_DIR)/user/args.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/args.o $(OBJ_DIR)/user/libc.o
+
+$(OBJ_DIR)/user/args_blob.o: user/args_$(ARCH).elf
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+user/forktest_$(ARCH).elf: user/libc.c user/forktest.c user/libc.h
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c     -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/forktest.c -o $(OBJ_DIR)/user/forktest.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/forktest.o $(OBJ_DIR)/user/libc.o
+
+$(OBJ_DIR)/user/forktest_blob.o: user/forktest_$(ARCH).elf
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+user/forkexec_$(ARCH).elf: user/libc.c user/forkexec.c user/libc.h
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c     -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/forkexec.c -o $(OBJ_DIR)/user/forkexec.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/forkexec.o $(OBJ_DIR)/user/libc.o
+
+$(OBJ_DIR)/user/forkexec_blob.o: user/forkexec_$(ARCH).elf
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+user/pipetest_$(ARCH).elf: user/libc.c user/pipetest.c user/libc.h
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c     -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/pipetest.c -o $(OBJ_DIR)/user/pipetest.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/pipetest.o $(OBJ_DIR)/user/libc.o
+
+$(OBJ_DIR)/user/pipetest_blob.o: user/pipetest_$(ARCH).elf
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+user/sigtest_$(ARCH).elf: user/libc.c user/sigtest.c user/libc.h
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c    -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/sigtest.c -o $(OBJ_DIR)/user/sigtest.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/sigtest.o $(OBJ_DIR)/user/libc.o
+
+$(OBJ_DIR)/user/sigtest_blob.o: user/sigtest_$(ARCH).elf
 	@mkdir -p $(@D)
 	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 

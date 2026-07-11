@@ -20,9 +20,17 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M21 (full ARM parity) +
 M22 – M22.7 + M27 + M28 + M25 (incl. Tier B tail) + Tier A + M29 + M30 +
-M31 + M24 (net, stages 1–3, i386) + M23 (audio, stage 1, i386)** shipped
+M31 + M24 (net, stages 1–3, i386) + M23 (audio, stage 1, i386) + M34 (POSIX
+process model, i386)** shipped
 (10/11 polish sub-items; the lone outstanding one is §M20.6.1
-SYSCALL/SYSRET).  **M23** (2026-07-11, DOCS §4.26): audio (i386) — `audio_dev`
+SYSCALL/SYSRET).  **M34** (2026-07-11, DOCS §4.27): POSIX process model (i386)
+— SysV argv/env/auxv initial stack; **copy-on-write fork** (`vmm_space_clone` +
+`vmm_cow_fault` on #PF + `enter_user_mode_regs`); `waitpid` (Tier-A); `execve`
+loading `/bin/*` from the VFS; `pipe`+`dup2`; **signals** (sigaction/kill/raise,
+return-to-user delivery + `__sig_trampoline`→SYS_SIGRETURN).  Syscalls 14–21;
+shell runargs/forktest/forkexec/pipetest/sigtest.  Open: EINTR, sigprocmask,
+user #PF→SIGSEGV, x86_64/aarch64.  Next: net socket syscall API → §M35 threads.
+**M23** (2026-07-11, DOCS §4.26): audio (i386) — `audio_dev`
 registry + AC97 codec driver (BDL bus-master DMA, 48 kHz 16-bit stereo out) +
 square-wave tone generator; shell `lsaudio`/`beep`/`tone`; boot-tested via QEMU
 `-audiodev wav` (440 Hz ±8000 square wave captured).  Open: `play <path>` WAV
@@ -147,18 +155,16 @@ extension + ACPI SRAT-derived per-CPU NUMA nodes), APs scheduling,
 **x86_64 (long mode) — full parity with i386 INCLUDING xHCI USB +
 virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
-▶️ **DECIDED NEXT (2026-07-11): §M34 — POSIX process & signals.**  After M24
-net + M23 audio shipped, the agreed next target is the POSIX process layer
-(`fork`/`execve`-argv/`waitpid`/pipes/job-control/signals) — the root of the
-userland-maturation critical path ("the goal is the platform, not the
-browser").  Agreed sequencing: **§M34 → the net socket syscall API** (the open
-§M24 tail: `socket`/`bind`/`connect`/`send`/`recv` to userland — small, rides
-on §M34's process/fd model, and the §M39 TLS bridge) **→ §M35 threads → §M35.5
-pkg → §M36 libc → …**.  **§M26 Wayland is deferred until POSIX + libc exist**
-(its prereqs are done, so it's buildable now, but a server is near-useless
-without real clients, which need the POSIX userland first).  See PLAN.md §M34 +
-the "Userland maturation" cluster; the `m24-m23-net-audio` branch (commit
-491430c) holds M24/M23 and is **not yet merged to main**.
+▶️ **DECIDED NEXT (2026-07-11): the net socket syscall API.**  §M34 (POSIX
+process model) is now SHIPPED (i386, DOCS §4.27) — fork(COW)/execve/waitpid/
+pipe/dup2/signals.  The agreed next target is the **net socket syscall API**:
+the open §M24 tail — expose `socket`/`bind`/`connect`/`send`/`recv` to userland
+(small; rides on §M34's process/fd model, and is the §M39 TLS bridge).  Then
+**§M35 threads → §M35.5 pkg → §M36 libc → …** (the "Userland maturation"
+cluster critical path).  **§M26 Wayland stays deferred until POSIX + libc
+exist** (its prereqs are done, but a server is near-useless without real
+clients, which need the POSIX userland first).  §M34 lives on branch
+`m34-posix-process` (unmerged); M24/M23 already merged to main.
 
 🔲 **Other options** (was "pick one"; superseded by the decision above):
 
