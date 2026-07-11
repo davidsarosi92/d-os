@@ -3393,7 +3393,17 @@ store, never the global filesystem.
 
 ---
 
-## §M36 — POSIX syscall breadth + native libc (musl port)
+## §M36 — POSIX syscall breadth + native libc (musl port) — ◐ in progress (i386)
+
+> ◐ **IN PROGRESS (2026-07-11, i386).**  Stage 1 (syscall breadth: stat/getdents/
+> uname/clock_gettime/nanosleep + errno; branch `m36-libc`, DOCS §4.30).  Stage 2
+> foundation (branch `m36-musl`, DOCS §4.31): the **modular Linux i386 syscall-ABI
+> compat layer** — keep musl PRISTINE (vendored, `scripts/fetch-musl.sh`) and have
+> d-os provide the Linux ABI via an isolated `linux_abi.c` + a `task->linux_abi`
+> personality (`linuxtest` runs a Linux-ABI program end-to-end; doubles as §M41).
+> **Still open:** vendor+build musl (`make musl`), grow `linux_abi.c` to musl's
+> startup set (chiefly `set_thread_area`/auxv — see `third_party/MUSL.md`), then
+> run a static musl `hello` + coreutils, `pkg install`-ed into the §M35.5 store.
 
 **Why:** the in-tree libc is ~120 lines (`write/read/open/mmap/malloc/
 printf`).  A browser (and its build tools) needs a full libc and the

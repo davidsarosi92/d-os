@@ -165,18 +165,23 @@ extension + ACPI SRAT-derived per-CPU NUMA nodes), APs scheduling,
 **x86_64 (long mode) — full parity with i386 INCLUDING xHCI USB +
 virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
-▶️ **DECIDED NEXT (2026-07-11): §M36 — POSIX syscall breadth + native libc (musl port).**
-§M35.5's **content-addressed store SHIPPED** (i386, DOCS §4.29): `/store/<hash>-
-name-version/` immutable paths, version coexistence, pinned closures, symlink-
-free profile, mark-sweep GC (`pkg …`/`pkgtest`).  That's the porting-discipline
-gate; now **§M36 — port musl as the native libc** (expand the syscall surface
-to the musl-required set — stat/getdents/mprotect/clock_gettime/etc.; a d-os
-arch under musl; a `/bin` + `/lib` convention; a minimal coreutils `sh`/`ls`/
-`cat` as the first musl-linked programs — all installed into the §M35.5 store,
-never the global FS).  §M35 (threads/futex/TLS/per-CPU TSS) is COMPLETE (UP +
-SMP, DOCS §4.28).  Also shipped this session: §M34 POSIX (§4.27), §M24 sockets
-(§4.25).  **§M26 Wayland stays deferred until POSIX + libc exist.**  §M35.5 on
-branch `m35_5-pkg`; check git for merge state.
+▶️ **DECIDED NEXT (2026-07-11): grow linux_abi.c for musl startup, then build musl.**
+§M36 is IN PROGRESS.  **Stage 1** (syscall breadth: stat/fstat/getdents/uname/
+clock_gettime/nanosleep + errno; DOCS §4.30) on branch `m36-libc`.  **Stage-2
+FOUNDATION** (DOCS §4.31, branch `m36-musl`): a **modular Linux i386 syscall-ABI
+compat layer** — the chosen approach is to keep **musl PRISTINE** (vendored via
+`scripts/fetch-musl.sh`, *not* forked to d-os numbers) and have d-os provide the
+Linux ABI via an isolated `kernel/hal/x86/linux_abi.c` + a `task->linux_abi`
+personality; `linuxtest` runs a hand-written Linux-ABI program (write=4/exit=1)
+end-to-end.  Doubles as §M41.  **Next: grow `linux_abi.c` to musl's startup set**
+— chiefly `set_thread_area` (translate the Linux `user_desc` onto the §M35
+per-CPU `%gs` GDT-TLS mechanism — the biggest blocker) + an `auxv` on the initial
+stack; then `make musl` (fetch+build), link a static musl `hello`, `pkg install`
+it + coreutils into the §M35.5 store.  **Checklist in `third_party/MUSL.md`.**
+§M35 (threads/futex/TLS/per-CPU TSS) is COMPLETE (UP+SMP, §4.28); also shipped:
+§M34 POSIX (§4.27), §M24 sockets (§4.25), §M35.5 store (§4.29).  **§M26 Wayland
+deferred until POSIX + libc exist.**  ⚠️ **Git:** stage-1 (`m36-libc`) + stage-2
+(`m36-musl`) are BOTH main-based + unmerged — merge both (additive).
 
 🔲 **Other options** (was "pick one"; superseded by the decision above):
 

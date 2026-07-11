@@ -62,3 +62,6 @@ fb.bin
 mbi.bin
 test.img
 disk.img
+
+# Vendored (fetched, pristine) musl source — see scripts/fetch-musl.sh
+third_party/musl/
