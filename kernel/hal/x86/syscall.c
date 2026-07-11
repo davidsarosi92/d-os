@@ -105,6 +105,13 @@ void syscall_dispatch(struct int_frame* f) {
                                            (char* const*)f->ecx);
             return;
 
+        case SYS_PIPE:
+            f->eax = (uint32_t)sys_pipe((int*)f->ebx);
+            return;
+        case SYS_DUP2:
+            f->eax = (uint32_t)sys_dup2((int)f->ebx, (int)f->ecx);
+            return;
+
         /* M25 stage 3 — fd syscalls.  EBX/ECX/EDX = arg0/arg1/arg2. */
         case SYS_WRITE:
             f->eax = (uint32_t)sys_write((int)f->ebx, (const void*)f->ecx, f->edx);

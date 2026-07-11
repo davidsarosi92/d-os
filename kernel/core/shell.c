@@ -1447,6 +1447,22 @@ static void cmd_forkexec(void) {
     kprintf("forkexec: returned rc=%d\n", rc);
 }
 
+/* M34 slice D — `pipetest`: pipe()+dup2()+fork() from ring 3. */
+extern const unsigned char _binary_user_pipetest_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_pipetest_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_pipetest(void) {
+    if (!_binary_user_pipetest_i386_elf_start) {
+        console_write("pipetest: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_pipetest_i386_elf_end -
+                          _binary_user_pipetest_i386_elf_start);
+    console_write("pipetest: exec'ing pipe()+dup2()+fork() program...\n");
+    int rc = proc_exec_elf(_binary_user_pipetest_i386_elf_start, len);
+    kprintf("pipetest: returned rc=%d\n", rc);
+}
+
 /* -------------------------------------------------------------------- */
 /* Configuration commands.                                              */
 /* -------------------------------------------------------------------- */
@@ -1606,6 +1622,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "runargs ")) { cmd_runargs(line + 8); return; }
     if (streq(line, "forktest"))       { cmd_forktest(); return; }
     if (streq(line, "forkexec"))       { cmd_forkexec(); return; }
+    if (streq(line, "pipetest"))       { cmd_pipetest(); return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }

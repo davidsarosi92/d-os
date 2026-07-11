@@ -23,6 +23,8 @@ int   getpid(void);
 int   fork  (void);                         /* → child pid in parent, 0 in child */
 int   waitpid(int pid, int* status);        /* block for a child; → reaped pid */
 int   execv (const char* path, char* const argv[]);  /* replace image; no return on success */
+int   pipe  (int fds[2]);                   /* fds[0]=read, fds[1]=write */
+int   dup2  (int oldfd, int newfd);         /* redirect a descriptor */
 
 /* String / memory. */
 size_t strlen(const char* s);

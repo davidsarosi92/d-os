@@ -19,6 +19,8 @@
 #define SYS_FORK   14
 #define SYS_WAITPID 15
 #define SYS_EXECVE 16
+#define SYS_PIPE   17
+#define SYS_DUP2   18
 
 /* One syscall path, three arches.  x86 (i386 + x86_64) trap via `int 0x80`
  * (rax/eax = number, rbx/ecx/edx = args); aarch64 traps via `svc #0` with the
@@ -56,6 +58,8 @@ int   getpid(void)                             { return (int)syscall3(SYS_GETPID
 int   fork  (void)                             { return (int)syscall3(SYS_FORK, 0, 0, 0); }
 int   waitpid(int pid, int* status)            { return (int)syscall3(SYS_WAITPID, pid, (long)status, 0); }
 int   execv (const char* path, char* const argv[]) { return (int)syscall3(SYS_EXECVE, (long)path, (long)argv, 0); }
+int   pipe  (int fds[2])                       { return (int)syscall3(SYS_PIPE, (long)fds, 0, 0); }
+int   dup2  (int oldfd, int newfd)             { return (int)syscall3(SYS_DUP2, oldfd, newfd, 0); }
 
 size_t strlen(const char* s) { size_t i = 0; while (s[i]) i++; return i; }
 

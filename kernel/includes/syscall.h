@@ -42,6 +42,8 @@
 #define SYS_FORK   14       /* () → child pid in parent, 0 in child (M34)      */
 #define SYS_WAITPID 15      /* (pid, int* status) → reaped pid / -1  (M34)     */
 #define SYS_EXECVE 16       /* (path, argv) → replaces image; -1 on failure    */
+#define SYS_PIPE   17       /* (int fds[2]) → 0; fds[0]=read end, fds[1]=write */
+#define SYS_DUP2   18       /* (oldfd, newfd) → newfd / -1                     */
 
 /* poll(2) events (Linux values). */
 #define POLLIN      0x001   /* readable                                        */
@@ -70,6 +72,8 @@ long sys_lseek(int fd, long off, int whence);
 long sys_mmap (size_t len, int fd);     /* map anon (fd<0) or a memfd's frames */
 int  sys_memfd(size_t size);            /* create a shared-memory fd           */
 int  sys_socketpair(int* fds);          /* fds[0],fds[1] = connected unix pair */
+int  sys_pipe(int* fds);                /* fds[0]=read, fds[1]=write            */
+int  sys_dup2(int oldfd, int newfd);    /* redirect a descriptor               */
 long sys_send (int fd, const void* buf, size_t n, int passfd);
 long sys_recv (int fd, void* buf, size_t n, int* passfd_out);
 struct pollfd;
