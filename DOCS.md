@@ -2743,6 +2743,130 @@ point); argv/env/argc; demand paging / COW fork.
 
 ---
 
+### 4.25 Networking — virtio-net + TCP/IP stack (M24, i386)
+
+**Files:** `kernel/includes/net.h`, `kernel/core/net.c` (portable stack),
+`kernel/drivers/net/virtio_net.c` (NIC driver).  Shell: `lsnic`, `ping`,
+`arp`, `nslookup`, `wget`, `nettest`.
+
+A from-scratch IPv4 stack, layered like the block layer: a NIC driver
+registers a `struct net_device` (MAC + `transmit` + `poll` callbacks) and the
+arch-independent stack (Ethernet → ARP / IPv4 / ICMP / UDP / TCP) sits on top,
+coupled to the driver only through `net_register()` + `net_rx()`.  Shipped
+i386-only (mirrors the block/USB "i386 first, 64-bit DMA later" rule).
+
+**RX model — poll from the calling task.**  There is no IRQ path yet: the
+driver's `dev->poll()` drains the RX ring into `net_rx()`, and the blocking
+helpers (ARP resolve, ping, DNS, HTTP) call it in a bounded spin loop.  So
+every request runs entirely in one task context → **no locking**.  IRQ-driven
+RX + a background `netd` poll task are the documented follow-up; the interface
+(`net_rx` callable from an ISR) is already shaped for it.
+
+**Layers (all in `net.c`, well-sectioned):**
+- **virtio-net driver** (`virtio_net.c`) — legacy PCI transport (vendor 0x1AF4,
+  device 0x1000), *same* virtqueue layout as virtio_blk but with **two queues**
+  (0 = receiveq, 1 = transmitq) and **pre-posted RX buffers** (32 device-
+  writable frames, recycled after consumption).  Each frame carries a 10-byte
+  `virtio_net_hdr` (MRG_RXBUF not negotiated) that TX zeroes and RX skips.
+  Negotiates only `VIRTIO_NET_F_MAC`.  DMA memory from the PMM (phys == virt in
+  the identity map), exactly like virtio_blk.  Registers `eth0` with the QEMU
+  SLIRP defaults (10.0.2.15/24, gw 10.0.2.2).
+- **Ethernet** — frame parse/build + demux by EtherType (ARP / IPv4); accepts
+  frames addressed to us or broadcast.
+- **ARP** — an 8-entry cache; resolves an IP by broadcasting a request and
+  polling for the reply, answers requests for our own IP, learns every sender.
+- **IPv4** — header build/parse + RFC 1071 checksum; next-hop = destination if
+  on-subnet, else the gateway.  `Don't Fragment`, TTL 64.
+- **ICMP** — echo reply (answers pings to us) + echo request (`ping`), matching
+  replies by id/seq.
+- **UDP** — datagram send (checksum omitted, legal for IPv4) + an 8-slot
+  port-binding table for receive; backs the DNS resolver.
+- **DNS** — a stub resolver: builds an A-query, sends to the SLIRP DNS proxy
+  (10.0.2.3:53) over UDP, parses the answer (handles name-compression
+  pointers).  The precursor to `getaddrinfo` (§M39).
+- **TCP** — a client-only, single-connection implementation: SYN/SYN-ACK/ACK
+  handshake, in-order data with ACKs, FIN close, mandatory pseudo-header
+  checksum.  **Simplified for the lossless SLIRP link**: no congestion control,
+  no retransmit timers, in-order only.  Backs `net_http_get` (HTTP/1.0 GET →
+  streams the response → closes) and the `wget` command.
+
+**Boot-tested (i386, QEMU `-netdev user -device virtio-net-pci,disable-modern=on`):**
+`nettest` drives all three transports end-to-end to the real internet through
+SLIRP:
+```
+nettest: PASS icmp (3/3 echo replies)          ← ARP + ICMP to the gateway
+nettest: PASS dns  (example.com -> 172.66.147.243)  ← UDP + DNS
+nettest: PASS tcp  (828 bytes, "HTTP/1.1 200 OK")   ← TCP handshake + HTTP GET
+```
+
+**Lessons learned:**
+- *The kernel `kprintf` has no width/zero-pad* — `%02x` prints the specifier
+  literally AND desyncs the varargs (the next `%s` then eats a byte as a
+  pointer).  Format MACs/IPs to a string first (`net_fmt_mac` / `net_fmt_ip`)
+  and print with `%s`.  (Same class of bug as the §M28 `va_list` note.)
+- *virtio-net needs RX buffers posted before it will ever deliver a frame* —
+  unlike blk (which posts per-request), the NIC fills a standing pool; forget
+  to refill after consuming and RX silently stalls after the pool drains.
+- *TCP checksum is mandatory* (unlike UDP's optional one) — it covers a
+  pseudo-header (src/dst/proto/len); a zero or header-only checksum makes the
+  peer/SLIRP drop the segment and the handshake never completes.
+
+**Still deferred (later §M24 stages / §M25):** IRQ-driven RX + `netd` task;
+the BSD socket *syscall* API (`socket`/`bind`/`connect`/`send`/`recv`) exposed
+to userland (today the stack is in-kernel; the shell commands are the clients);
+TCP retransmit timers + congestion control + a real state machine; a listening
+(server) role; DHCP; IPv6; `/proc/net/*`; x86_64/aarch64 ports.
+
+---
+
+### 4.26 Audio — AC97 codec + PCM output (M23, i386)
+
+**Files:** `kernel/includes/audio.h`, `kernel/core/audio.c` (portable core),
+`kernel/drivers/audio/ac97.c` (codec driver).  Shell: `lsaudio`, `beep`,
+`tone`.
+
+An audio subsystem shaped exactly like the block/net layers: a codec driver
+registers a `struct audio_dev` (native `rate` + `channels` + a `play` callback
+for 16-bit stereo PCM frames), and the arch-independent core (a square-wave
+tone generator + `lsaudio`) sits on top, coupled to the driver only through
+`audio_register()`.  Shipped i386-only (PCI bus-master DMA, same "i386 first"
+rule as block/net/USB).
+
+**AC97 driver** (`ac97.c`, PCI vendor 0x8086 device 0x2415, QEMU `-device
+AC97`): the classic two-BAR PC codec — **BAR0 = NAM** (mixer: reset, master +
+PCM volume, VRA sample rate) and **BAR1 = NABM** (bus-master DMA engine +
+global control).  PCM **output** only (§M23 scope).  Bring-up: enable PCI
+I/O + bus-master, deassert the AC-link cold reset, reset the codec + the
+PCM-out box, unmute + full volume, set the DAC to 48 kHz via variable-rate
+audio.  Playback feeds the engine a **Buffer Descriptor List** (BDL): one
+entry pointing at a 128 KB PMM-backed DMA buffer (phys == virt in the identity
+map), length in 16-bit samples, `IOC|BUP` so the engine halts cleanly at the
+end; the driver polls `PO_SR.DCH` (DMA halted) until playback drains at
+real-time rate.
+
+**Portable core** (`audio.c`): `audio_play_tone(freq, ms)` renders a square
+wave (±8000 amplitude, half-period toggling) into a static scratch buffer and
+hands it to `dev->play`, which copies it into the driver's DMA region.
+
+**Boot-tested (i386, QEMU `-audiodev wav,path=out.wav -device AC97,audiodev=snd`):**
+`beep` plays 440 Hz for 400 ms; the captured WAV, analysed as raw S16LE
+stereo, is a clean square wave — left channel **min −8000 / max +8000** (the
+generated amplitude), every sample non-zero, ~444 Hz by zero-crossing count
+(≈ the requested 440).  So the whole path — tone → `audio_dev` → AC97 BDL DMA
+→ QEMU backend — is verified end-to-end.  (Note: killing QEMU via the monitor
+`quit` leaves the WAV's RIFF/`data` size fields un-backpatched at 0, so a
+strict WAV parser rejects the header even though the PCM payload is perfect;
+read it as raw PCM to verify.)
+
+**Still deferred (later §M23 / follow-ups):** a `play <path>` WAV-file player
+(the tone is the smoke test that proves the DMA path; a WAV parser + streaming
+across multiple BDL buffers is the remaining stage), a `/dev/dsp` char device
+for raw PCM writes, a mixer (per-stream volume) + multiple concurrent streams
++ resampling, PCM **input** (mic/line), Intel HDA (the heavier modern codec),
+IRQ-driven buffer completion (today playback polls `DCH`), x86_64/aarch64.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -2813,6 +2937,34 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-11 — M23: audio subsystem (AC97 + PCM output), i386.**  An
+  `audio_dev` registry shaped like the block/net layers (DOCS §4.26) + an AC97
+  codec driver (PCI 0x8086:0x2415, two BARs — NAM mixer + NABM bus-master) doing
+  PCM output via a Buffer Descriptor List over a 128 KB PMM-backed DMA buffer +
+  a portable square-wave tone generator.  Shell: `lsaudio`, `beep`, `tone`.
+  **Boot-tested through QEMU's `-audiodev wav` backend:** `beep` (440 Hz, 400 ms)
+  produced a clean square wave in the captured WAV — left channel min −8000 /
+  max +8000, all samples non-zero, ~444 Hz by zero-crossing — verifying the
+  tone → audio_dev → AC97 BDL DMA → backend path end to end.  Deferred: a `play
+  <path>` WAV player, `/dev/dsp`, mixer/multi-stream, input, Intel HDA, IRQ
+  completion, x86_64/aarch64.  See PLAN.md §M23.
+- **2026-07-11 — M24: network stack (virtio-net + TCP/IP), i386.**  A
+  from-scratch IPv4 stack (DOCS §4.25): a `struct net_device` registry mirroring
+  the block layer, a legacy virtio-net PCI driver (two queues + pre-posted RX
+  buffers, same virtqueue layout as virtio_blk), and the arch-independent stack
+  — Ethernet demux → ARP (cache + resolve + reply) → IPv4 (+ RFC 1071 checksum)
+  → ICMP (ping) → UDP (+ an 8-slot port-bind table) → a DNS stub resolver → a
+  client-only TCP (handshake / in-order data + ACK / FIN close / pseudo-header
+  checksum) backing `net_http_get`.  Shell: `lsnic`, `ping`, `arp`, `nslookup`,
+  `wget`, `nettest`.  RX is polled from the calling task (no IRQ, no lock yet).
+  **Boot-tested end-to-end through QEMU SLIRP to the real internet:** `nettest`
+  → ICMP 3/3 replies from the gateway, DNS resolves example.com, TCP fetches
+  `HTTP/1.1 200 OK` (828 bytes).  Lessons: kernel `kprintf` has no width/pad
+  (`%02x` corrupts varargs — format MAC/IP to a string, print `%s`); virtio-net
+  needs RX buffers pre-posted + refilled or RX stalls; TCP checksum is mandatory
+  (pseudo-header) where UDP's is optional.  Deferred: IRQ RX + `netd`, the BSD
+  socket *syscall* API to userland, TCP retransmit/congestion + server role,
+  DHCP, IPv6, x86_64/aarch64.  See PLAN.md §M24.
 - **2026-07-10 — Tier B: concurrent user processes + full-arch libc (M25
   tail).**  An ELF now runs as an independent, preemptible user process
   (`proc_spawn`) on its own task — several at once, each in its own address

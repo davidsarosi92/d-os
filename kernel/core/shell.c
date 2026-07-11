@@ -27,6 +27,8 @@
 #include "task.h"
 #include "block.h"
 #include "block_cache.h"
+#include "net.h"
+#include "audio.h"
 #include "vc.h"
 #include "lock.h"
 #include "keymap.h"
@@ -617,6 +619,156 @@ static void cmd_pane(struct vc* my_vc, const char* args) {
 /* /dev/vda, reads it back, prints a verdict.  Sector 0 is left alone   */
 /* so we don't trample a future partition table or MBR.                  */
 /* -------------------------------------------------------------------- */
+
+/* ----------------------- §M24.1 network commands -------------------------- */
+
+/* `ping <ip> [count]` — ARP-resolve then ICMP-echo the target. */
+static void cmd_ping(const char* args) {
+    struct net_device* dev = net_primary();
+    if (!dev) { console_write("ping: no network device (no virtio-net?)\n"); return; }
+
+    /* Parse "<ip>" and an optional trailing count. */
+    char ipbuf[32]; int i = 0;
+    while (args[i] && args[i] != ' ' && i < 31) { ipbuf[i] = args[i]; i++; }
+    ipbuf[i] = '\0';
+    if (i == 0) { console_write("usage: ping <ip> [count]\n"); return; }
+
+    uint32_t ip;
+    if (net_parse_ip(ipbuf, &ip) != 0) { console_write("ping: bad IP\n"); return; }
+
+    int count = 3;
+    while (args[i] == ' ') i++;
+    if (args[i]) {
+        int c = 0; for (int j = i; args[j] >= '0' && args[j] <= '9'; j++) c = c * 10 + (args[j] - '0');
+        if (c > 0 && c <= 16) count = c;
+    }
+    net_ping(dev, ip, count);
+}
+
+/* `arp <ip>` — resolve and print the MAC. */
+static void cmd_arp(const char* args) {
+    struct net_device* dev = net_primary();
+    if (!dev) { console_write("arp: no network device\n"); return; }
+    uint32_t ip;
+    if (net_parse_ip(args, &ip) != 0) { console_write("usage: arp <ip>\n"); return; }
+    uint8_t mac[6];
+    if (net_arp_resolve(dev, ip, mac) == 0) {
+        char ipb[16], macb[18]; net_fmt_ip(ip, ipb); net_fmt_mac(mac, macb);
+        kprintf("%s is at %s\n", ipb, macb);
+    } else {
+        console_write("arp: no reply (timeout)\n");
+    }
+}
+
+/* `nslookup <host>` — resolve a hostname to an IPv4 via the SLIRP DNS proxy. */
+static void cmd_dns(const char* args) {
+    struct net_device* dev = net_primary();
+    if (!dev) { console_write("nslookup: no network device\n"); return; }
+    if (!args[0]) { console_write("usage: nslookup <hostname>\n"); return; }
+    uint32_t ip;
+    if (net_dns_query(dev, args, &ip) == 0) {
+        char ipb[16]; net_fmt_ip(ip, ipb);
+        kprintf("%s has address %s\n", args, ipb);
+    } else {
+        kprintf("nslookup: could not resolve %s\n", args);
+    }
+}
+
+/* `wget http://host[/path]` — fetch a URL over TCP (§M24.3) and print it. */
+static void cmd_wget(const char* url) {
+    struct net_device* dev = net_primary();
+    if (!dev) { console_write("wget: no network device\n"); return; }
+
+    /* Strip an optional "http://" scheme. */
+    const char* p = url;
+    if (starts_with(p, "http://")) p += 7;
+
+    /* Split host[:port] and path. */
+    char host[128]; int hi = 0;
+    while (*p && *p != '/' && *p != ':' && hi < 127) host[hi++] = *p++;
+    host[hi] = '\0';
+    uint16_t port = 80;
+    if (*p == ':') { p++; int v = 0; while (*p >= '0' && *p <= '9') v = v*10 + (*p++ - '0'); port = (uint16_t)v; }
+    const char* path = (*p == '/') ? p : "/";
+    if (hi == 0) { console_write("usage: wget http://host[:port][/path]\n"); return; }
+
+    /* Resolve host: accept a literal dotted-quad, else DNS. */
+    uint32_t ip;
+    if (net_parse_ip(host, &ip) != 0) {
+        if (net_dns_query(dev, host, &ip) != 0) { kprintf("wget: cannot resolve %s\n", host); return; }
+    }
+    char ipb[16]; net_fmt_ip(ip, ipb);
+    kprintf("wget: connecting to %s (%s):%u ...\n", host, ipb, port);
+
+    int n = net_http_get(dev, ip, port, host, path);
+    if (n < 0) { console_write("wget: connection failed\n"); return; }
+
+    uint32_t blen; const uint8_t* body = net_http_body(&blen);
+    /* Print up to ~1 KiB of the response so a big page doesn't flood. */
+    uint32_t show = blen < 1024 ? blen : 1024;
+    for (uint32_t i = 0; i < show; i++) console_putchar((char)body[i]);
+    if (show < blen) kprintf("\n... [%u bytes total]\n", blen);
+    else             kprintf("\n[%u bytes]\n", blen);
+}
+
+/* `nettest` — self-contained §M24 check: ARP + ping the SLIRP gateway (§M24.1),
+ * a DNS resolve over UDP (§M24.2), and an HTTP GET over TCP (§M24.3).  Prints
+ * PASS/FAIL lines so a headless boot can grep the serial log. */
+static void cmd_nettest(void) {
+    struct net_device* dev = net_primary();
+    if (!dev) { console_write("nettest: FAIL (no net device)\n"); return; }
+    uint32_t gw = dev->gateway;
+    uint8_t mac[6];
+    if (net_arp_resolve(dev, gw, mac) != 0) { console_write("nettest: FAIL (ARP)\n"); return; }
+    int got = net_ping(dev, gw, 3);
+    if (got > 0) kprintf("nettest: PASS icmp (%d/3 echo replies)\n", got);
+    else         console_write("nettest: FAIL (no echo reply)\n");
+
+    /* §M24.2 — resolve a well-known name over UDP/DNS. */
+    uint32_t ip = 0;
+    if (net_dns_query(dev, "example.com", &ip) == 0) {
+        char ipb[16]; net_fmt_ip(ip, ipb);
+        kprintf("nettest: PASS dns (example.com -> %s)\n", ipb);
+    } else {
+        console_write("nettest: FAIL (dns)\n");
+    }
+
+    /* §M24.3 — HTTP GET over TCP to the resolved address. */
+    if (ip) {
+        int n = net_http_get(dev, ip, 80, "example.com", "/");
+        if (n > 0) {
+            uint32_t blen; const uint8_t* body = net_http_body(&blen);
+            /* Show just the status line. */
+            char status[64]; int si = 0;
+            for (uint32_t i = 0; i < blen && body[i] != '\r' && body[i] != '\n' && si < 63; i++)
+                status[si++] = (char)body[i];
+            status[si] = '\0';
+            kprintf("nettest: PASS tcp (%d bytes, \"%s\")\n", n, status);
+        } else {
+            console_write("nettest: FAIL (tcp)\n");
+        }
+    }
+}
+
+/* ----------------------- §M23 audio commands ------------------------------ */
+
+/* `beep` — play a short 440 Hz tone (the §M23 smoke test). */
+static void cmd_beep(void) {
+    if (!audio_primary()) { console_write("beep: no audio device (no AC97?)\n"); return; }
+    audio_play_tone(440, 400);
+}
+
+/* `tone <freq> <ms>` — play an arbitrary square-wave tone. */
+static void cmd_tone(const char* args) {
+    if (!audio_primary()) { console_write("tone: no audio device\n"); return; }
+    int freq = 0, ms = 0, i = 0;
+    while (args[i] >= '0' && args[i] <= '9') freq = freq*10 + (args[i++] - '0');
+    while (args[i] == ' ') i++;
+    while (args[i] >= '0' && args[i] <= '9') ms = ms*10 + (args[i++] - '0');
+    if (freq <= 0) freq = 440;
+    if (ms   <= 0) ms   = 400;
+    audio_play_tone((uint32_t)freq, (uint32_t)ms);
+}
 
 static void cmd_blktest(void) {
     struct block_device* dev = blk_find("vda");
@@ -1369,6 +1521,15 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "blktest"))        { cmd_blktest();  return; }
     if (streq(line, "bctest"))         { cmd_bctest();   return; }
     if (streq(line, "lsblk"))          { blk_list();     return; }
+    if (streq(line, "lsnic"))          { net_list();     return; }
+    if (starts_with(line, "ping "))    { cmd_ping(line + 5); return; }
+    if (starts_with(line, "arp "))     { cmd_arp(line + 4);  return; }
+    if (starts_with(line, "nslookup ")){ cmd_dns(line + 9);  return; }
+    if (starts_with(line, "wget "))    { cmd_wget(line + 5); return; }
+    if (streq(line, "nettest"))        { cmd_nettest();  return; }
+    if (streq(line, "lsaudio"))        { audio_list();   return; }
+    if (streq(line, "beep"))           { cmd_beep();     return; }
+    if (starts_with(line, "tone "))    { cmd_tone(line + 5); return; }
     if (streq(line, "ps"))             { task_list();    return; }
     if (starts_with(line, "kill "))    { cmd_kill(line + 5); return; }
     if (streq(line, "spawn"))          { cmd_spawn();    return; }

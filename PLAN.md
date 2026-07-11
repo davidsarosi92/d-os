@@ -51,8 +51,8 @@
 | §M22.5 | Desktop apps — editor, BASIC, file manager 2.0, maximize | ~1557 |
 | §M22.6 | Tear-free present (page flip) + display scaling | ~1587 |
 | §M22.7 | Per-task GUI apps + panel-as-task — ✅ shipped | ~1660 |
-| §M23 | Audio subsystem | ~1040 |
-| §M24 | Network stack (Ethernet → TCP/IP → sockets) | ~1080 |
+| §M23 | Audio subsystem — ✅ stage 1 (i386): AC97 PCM output + tone (DOCS §4.26) | ~1040 |
+| §M24 | Network stack (Ethernet → TCP/IP → sockets) — ✅ stages 1–3 (i386): virtio-net + ARP/IPv4/ICMP/UDP/TCP + DNS + ping/wget (DOCS §4.25) | ~1080 |
 | §M25 | Userland foundation (Wayland prerequisites) — ✅ stages 1–7 + Tier B tail (concurrent user processes + full-arch libc; DOCS §4.24) | ~1545 |
 | §M26 | Wayland server (wire protocol on M22 + M25) | ~1615 |
 | §M27 | Process model — init, hierarchy, reaper, kill-tree — ✅ shipped | ~1818 |
@@ -2102,7 +2102,17 @@ internal API instead of the wire protocol.
   shell: the desktop itself — the boot shell is the launcher.  A
   dedicated login/session-manager root is §M32 territory.)
 
-## §M23 — Audio subsystem
+## §M23 — Audio subsystem — ✅ stage 1 shipped (AC97 PCM output, i386)
+
+**Status (2026-07-11): AC97 PCM output SHIPPED on i386 — see DOCS.md §4.26.**
+`audio_dev` registry (block/net-shaped) + an AC97 codec driver (BDL bus-master
+DMA, 48 kHz 16-bit stereo out) + a square-wave tone generator.  Shell
+`lsaudio`/`beep`/`tone`.  Boot-tested via QEMU's `-audiodev wav` backend: a
+440 Hz beep captured as a clean ±8000 square wave (~444 Hz by zero-crossing) —
+the tone → audio_dev → AC97 DMA → backend path verified end-to-end.  **Still
+open** (design below is the roadmap): a `play <path>` WAV-file player (stage 4
+— tone is the smoke test proving the path), `/dev/dsp` (stage 3), mixer /
+multi-stream / resampling, PCM input, Intel HDA, IRQ completion, x86_64/aarch64.
 
 **Why now:** after GUI infrastructure (M22), sound is the natural
 follow-up for "the OS feels alive."  Decoupled enough from the rest
@@ -2125,16 +2135,29 @@ that it can also land earlier if a driver project pulls it in.
 4. **WAV player shell command** (`play <path>`) as the smoke test.
 
 **Definition of done:**
-- `play /test.wav` produces audible PCM on QEMU's audio backend.
-- `lsaudio` lists registered audio devices.
-- DOCS.md gains a "Audio" chapter.
+- ✅ Audible PCM on QEMU's audio backend.  (Shipped as `beep`/`tone` — a
+  square wave DMA'd through AC97, captured + verified in the `-audiodev wav`
+  output; the `play /test.wav` file player is the remaining stage 4.)
+- ✅ `lsaudio` lists registered audio devices.
+- ✅ DOCS.md §4.26 "Audio" chapter.
 
 **Out of scope:** mixer / multiple streams / resampling, MIDI,
 synthesis, surround, ALSA-compat layer.
 
 ---
 
-## §M24 — Network stack (NIC → TCP/IP → sockets)
+## §M24 — Network stack (NIC → TCP/IP → sockets) — ✅ stages 1–3 shipped (i386)
+
+**Status (2026-07-11): §M24.1–.3 SHIPPED on i386 — see DOCS.md §4.25.**
+virtio-net driver + `net_device` registry + Ethernet/ARP/IPv4/ICMP/UDP/TCP +
+a DNS stub resolver, all arch-independent in `kernel/core/net.c`.  Boot-tested
+end-to-end through QEMU SLIRP: `nettest` → ICMP ping (3/3), DNS (example.com),
+TCP `HTTP/1.1 200 OK`.  Shell: `lsnic`/`ping`/`arp`/`nslookup`/`wget`/`nettest`.
+RX is polled from the calling task (no IRQ/lock yet).  **Still open** (the
+design below stays as the roadmap for these): the BSD socket *syscall* API to
+userland (stage 6 — today's stack is in-kernel, the shell commands are the
+clients), IRQ-driven RX + a `netd` task, TCP retransmit/congestion + a server
+role, DHCP (stage 7), IPv6, `/proc/net`, x86_64/aarch64 ports.
 
 **Why now:** after SMP and (probably) the x64 port, when the kernel
 can usefully share state across cores and a real network workload
@@ -2160,10 +2183,12 @@ has the headroom to make sense.
    API is up.
 
 **Definition of done (staged):**
-- §M24.1 — `lsnic` shows the virtio-net device; `ping <host>`
-  works from the shell (uses raw socket internally).
-- §M24.2 — `nc -u <host> <port>` (UDP) works.
-- §M24.3 — `wget http://host/path` returns a response over TCP.
+- ✅ §M24.1 — `lsnic` shows the virtio-net device; `ping <host>` works from
+  the shell.  (Shipped: ARP + ICMP echo to the SLIRP gateway.)
+- ✅ §M24.2 — UDP works.  (Shipped as a DNS resolver + `nslookup` rather than
+  `nc -u`: a UDP datagram round-trip to the SLIRP DNS proxy, name resolved.)
+- ✅ §M24.3 — `wget http://host/path` returns a response over TCP.  (Shipped:
+  handshake + HTTP/1.0 GET + `HTTP/1.1 200 OK` from example.com.)
 
 **Out of scope of this milestone (later work):**
 - IPv6, multicast, IPsec.
@@ -3036,6 +3061,16 @@ is self-contained when read in isolation.
 
 ## §M34 — POSIX process & signals layer
 
+> ▶️ **DECIDED NEXT (2026-07-11).**  Chosen as the next milestone after M24/M23.
+> Agreed sequencing: **§M34 → the net socket syscall API** (the open §M24 tail:
+> `socket`/`bind`/`connect`/`send`/`recv` exposed to userland — small, rides on
+> §M34's process/fd model, and the §M39 TLS bridge) **→ §M35 threads → §M35.5
+> pkg → §M36 libc → …**.  §M26 Wayland deferred until POSIX + libc exist (its
+> prereqs are done, but a server needs real clients, which need the POSIX
+> userland first).  Start with the fork/execve slice (argv/env/auxv + COW
+> address-space clone + waitpid on the Tier-A wait-queue); boot-test i386 with a
+> sendkey-driven shell command over serial (the M24/M23 method).
+
 **Why:** the single largest gap between today's userland (§M25) and any
 real POSIX program.  Browsers — Chromium especially, with its
 multi-process sandbox — assume `fork`/`exec`, argv/env, `waitpid`,
@@ -3650,6 +3685,25 @@ not a binary registry.  Revisit only with a specific use case.
 
 ## Change log
 
+- **2026-07-11** — **§M23 stage 1 shipped (audio, i386).**  An `audio_dev`
+  registry (block/net-shaped) + an AC97 codec driver (PCI 0x8086:0x2415, NAM
+  mixer + NABM bus-master, PCM output via a Buffer Descriptor List over a
+  128 KB PMM DMA buffer) + a portable square-wave tone generator.  Shell
+  `lsaudio`/`beep`/`tone`.  Boot-tested via QEMU `-audiodev wav`: a 440 Hz beep
+  captured as a clean ±8000 square wave (~444 Hz).  Open: `play <path>` WAV
+  player (stage 4), `/dev/dsp`, mixer/multi-stream, input, Intel HDA, IRQ
+  completion, x86_64/aarch64.  See DOCS.md §4.26.
+- **2026-07-11** — **§M24 stages 1–3 shipped (network stack, i386).**  A
+  from-scratch IPv4 stack: virtio-net driver (legacy PCI, two queues +
+  pre-posted RX buffers) + a `net_device` registry mirroring the block layer +
+  the arch-independent stack in `kernel/core/net.c` (Ethernet → ARP → IPv4 →
+  ICMP → UDP → TCP) + a DNS stub resolver.  Shell `lsnic`/`ping`/`arp`/
+  `nslookup`/`wget`/`nettest`.  Boot-tested through QEMU SLIRP to the real
+  internet: ICMP ping 3/3, DNS resolves example.com, TCP fetches `HTTP/1.1 200
+  OK`.  RX polled from the calling task (no IRQ/lock yet); TCP is client-only,
+  no retransmit/congestion (safe on the lossless SLIRP link).  Still open: the
+  socket *syscall* API to userland (stage 6), IRQ RX + `netd`, TCP timers +
+  server role, DHCP (stage 7), IPv6, x86_64/aarch64.  See DOCS.md §4.25.
 - **2026-07-11** — **Reframed the §M34–§M42 cluster + fleshed out §M35.5.**
   (1) Renamed "the browser cluster" → **"Userland maturation — a real
   POSIX platform."**  The goal is the *platform capabilities* (each
