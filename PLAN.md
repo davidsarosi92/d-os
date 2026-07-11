@@ -3061,6 +3061,16 @@ is self-contained when read in isolation.
 
 ## §M34 — POSIX process & signals layer
 
+> ▶️ **DECIDED NEXT (2026-07-11).**  Chosen as the next milestone after M24/M23.
+> Agreed sequencing: **§M34 → the net socket syscall API** (the open §M24 tail:
+> `socket`/`bind`/`connect`/`send`/`recv` exposed to userland — small, rides on
+> §M34's process/fd model, and the §M39 TLS bridge) **→ §M35 threads → §M35.5
+> pkg → §M36 libc → …**.  §M26 Wayland deferred until POSIX + libc exist (its
+> prereqs are done, but a server needs real clients, which need the POSIX
+> userland first).  Start with the fork/execve slice (argv/env/auxv + COW
+> address-space clone + waitpid on the Tier-A wait-queue); boot-test i386 with a
+> sendkey-driven shell command over serial (the M24/M23 method).
+
 **Why:** the single largest gap between today's userland (§M25) and any
 real POSIX program.  Browsers — Chromium especially, with its
 multi-process sandbox — assume `fork`/`exec`, argv/env, `waitpid`,

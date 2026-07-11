@@ -147,7 +147,20 @@ extension + ACPI SRAT-derived per-CPU NUMA nodes), APs scheduling,
 **x86_64 (long mode) — full parity with i386 INCLUDING xHCI USB +
 virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
-🔲 **Next options** (pick one):
+▶️ **DECIDED NEXT (2026-07-11): §M34 — POSIX process & signals.**  After M24
+net + M23 audio shipped, the agreed next target is the POSIX process layer
+(`fork`/`execve`-argv/`waitpid`/pipes/job-control/signals) — the root of the
+userland-maturation critical path ("the goal is the platform, not the
+browser").  Agreed sequencing: **§M34 → the net socket syscall API** (the open
+§M24 tail: `socket`/`bind`/`connect`/`send`/`recv` to userland — small, rides
+on §M34's process/fd model, and the §M39 TLS bridge) **→ §M35 threads → §M35.5
+pkg → §M36 libc → …**.  **§M26 Wayland is deferred until POSIX + libc exist**
+(its prereqs are done, so it's buildable now, but a server is near-useless
+without real clients, which need the POSIX userland first).  See PLAN.md §M34 +
+the "Userland maturation" cluster; the `m24-m23-net-audio` branch (commit
+491430c) holds M24/M23 and is **not yet merged to main**.
+
+🔲 **Other options** (was "pick one"; superseded by the decision above):
 
 - **M21** — aarch64 port.  Third arch, real torture test of HAL
   portability (no port I/O, GIC instead of APIC, EL1/EL0 instead
