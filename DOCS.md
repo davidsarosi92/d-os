@@ -2867,6 +2867,91 @@ IRQ-driven buffer completion (today playback polls `DCH`), x86_64/aarch64.
 
 ---
 
+### 4.27 POSIX process model — fork/exec/wait/pipe/signals (M34, i386)
+
+**Files:** `kernel/core/proc.c` (argv stack, execve), `kernel/hal/x86/fork.c`
+(fork), `kernel/hal/x86/signal.c` (signal delivery), `kernel/hal/x86/vmm.c`
+(COW clone + fault), `kernel/core/usyscall.c` (pipe/dup2/kill/sigaction),
+`kernel/hal/x86/syscall.c` (dispatch), `user/*.c` + `user/crt0.s`.  Shell:
+`runargs`, `forktest`, `forkexec`, `pipetest`, `sigtest`.
+
+The classic Unix process API on top of the M25 userland (per-process address
+spaces, ELF loader, fd table).  i386-first (the fork/signal mechanisms restore
+a full register set via `iret`, which is arch-specific); the orchestration is
+mostly portable.  New syscalls 14–21: FORK, WAITPID, EXECVE, PIPE, DUP2, KILL,
+SIGACTION, SIGRETURN.
+
+**Initial stack (argv/env/auxv).**  `build_initial_stack` (proc.c) lays out the
+System V initial process stack — `argc`, `argv[]`, NULL, empty `envp`, an
+`AT_NULL` auxv — with argv pointers as user VAs, written through the stack
+frame's identity mapping.  Every launch path (`proc_exec_elf`, `proc_spawn`,
+`proc_exec_elf_argv`, execve) builds it; the i386 crt0 reads argc/argv off the
+stack into `main`.  Slots are `uintptr_t`-wide so the shape is valid on all
+arches (only i386 crt0 reads it today).
+
+**fork() — copy-on-write.**  `proc_fork` (fork.c) clones the caller's address
+space with `vmm_space_clone` (writable pages shared **read-only + COW** and
+ref-counted; read-only code eagerly copied; shm pages shared), duplicates the
+fd table (`ofile_ref`), copies signal dispositions, and starts a child task
+whose first act (`enter_user_mode_regs`, usermode.s) is to `iret` into ring 3
+at the parent's post-`int 0x80` point with **eax = 0**.  The parent gets the
+child pid.  The child is `reap_owned` so the M27 universal reaper leaves it for
+the parent's `waitpid`.  A write to a COW page faults; `vmm_cow_fault` (vmm.c,
+hooked in idt.c's #PF path) hands the writer a private copy (or makes the page
+writable in place if it is the last sharer); `vmm_space_destroy` frees a COW
+frame only via its last owner.
+
+**waitpid()** = `task_wait` (the Tier A child-exit wait-queue), writing the
+exit code to the user status pointer.
+
+**execve()** — `proc_execve` (proc.c) marshals argv out of the old space, loads
+the ELF at `path` **from the VFS** into a fresh space, builds the initial
+stack, atomically swaps the task's `mm` (freeing the old space) and resumes
+ring 3 at the new entry (one-way); fds survive, signal handlers reset to
+default.  The embedded user ELFs are installed into the ramfs as `/bin/args`,
+`/bin/hello` at shell start (`bin_install`) — the first populated `/bin`.  Note:
+execve must be called from a *forked* task, not the synchronous exec excursion
+(which would double-free the old space on its own cleanup) — i.e. the standard
+fork+exec pattern.
+
+**pipe() + dup2()** — `sys_pipe` makes a connected byte channel (over the usock
+ring, like socketpair; fds[0]=read, fds[1]=write), inherited across fork;
+`sys_dup2` redirects a real fd (≥ 3).
+
+**Signals.**  Per-task state (`task.h`): `sig_pending` bitmask,
+`sig_handler[NSIG]` (SIG_DFL / SIG_IGN / a ring-3 handler), `sig_restorer`.
+`kill`/`sigaction` just set state.  Delivery is on the **return-to-user path**:
+`signal_deliver` (signal.c, called from idt.c after each syscall) pushes a
+signal frame on the user stack (saved context + the sig argument + a trampoline
+return address) and rewrites the trapframe to `iret` into the handler; the
+handler `ret`s into `__sig_trampoline` (crt0.s) which issues `SYS_SIGRETURN`, and
+`signal_sigreturn` restores the pre-signal context.  `SIG_DFL` of
+INT/TERM/KILL/SEGV terminates the task.
+
+**Boot-tested (i386, sendkey + serial):**
+- `runargs ab cd` → `argc=3, argv={args,ab,cd}` from ring 3.
+- `forktest` → child `fork()==0` in a COW-isolated space (its `secret=222`
+  leaves the parent's 111 untouched), `waitpid` status=7.
+- `forkexec` → child `execv("/bin/args", {args, via-execve})` from the VFS,
+  argc=2, exit status 2 to the parent.
+- `pipetest` → child writes a pipe; parent `dup2`s the read end to fd 9 and
+  reads "hello-through-pipe" back through a blocking read.
+- `sigtest` → a SIGUSR1 handler runs in ring 3 on `raise()` and control resumes
+  after it via sigreturn.
+
+**Lesson learned:** adding fields to `struct task` needs a full `make clean`
+(the project has no header dependencies) — a stale `task.c` kept the old struct
+size, so out-of-struct `sig_handler[]` writes corrupted the heap and delivery
+jumped to a garbage handler (#PF).  Same class as the M28 `va_list` note.
+
+**Still deferred (later §M34 / §M35):** EINTR (a signal doesn't yet interrupt a
+blocked syscall — delivered on the *next* return-to-user); `sigprocmask` /
+signal blocking; real-time signals; `vfork`/`posix_spawn`; job control /
+sessions / controlling tty; turning a user #PF into SIGSEGV (today a user fault
+still panics); x86_64/aarch64 (the fork/signal register-restore is i386 asm).
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -2937,6 +3022,21 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-11 — M34: POSIX process model (fork/exec/wait/pipe/signals), i386.**
+  The classic Unix process API on the M25 userland (DOCS §4.27): a System V
+  initial stack (argc/argv/envp/auxv, crt0 reads it); **copy-on-write fork**
+  (`vmm_space_clone` shares writable pages read-only+COW ref-counted,
+  `vmm_cow_fault` resolves writes via the #PF path; `enter_user_mode_regs`
+  resumes the child at the fork point with eax=0); `waitpid` on the Tier-A
+  wait-queue; `execve` loading `/bin/*` from the VFS (bin_install populates
+  `/bin`); `pipe`+`dup2` over the usock ring; and **signals** (sigaction/kill/
+  raise, delivery on the return-to-user path with a user-stack signal frame +
+  `__sig_trampoline`→SYS_SIGRETURN, default-terminate on INT/TERM/KILL/SEGV).
+  Syscalls 14–21.  Boot-tested i386: runargs/forktest(COW isolation)/forkexec/
+  pipetest/sigtest all green.  Lesson: `struct task` field additions need
+  `make clean` (no header deps) or stale object files corrupt the heap.
+  Deferred: EINTR, sigprocmask, user #PF→SIGSEGV, x86_64/aarch64.  See PLAN.md
+  §M34.
 - **2026-07-11 — M23: audio subsystem (AC97 + PCM output), i386.**  An
   `audio_dev` registry shaped like the block/net layers (DOCS §4.26) + an AC97
   codec driver (PCI 0x8086:0x2415, two BARs — NAM mixer + NABM bus-master) doing
