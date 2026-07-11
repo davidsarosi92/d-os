@@ -22,8 +22,75 @@
 
 #define PAGE_SIZE          4096u
 #define PROC_STACK_OFFSET  0x00100000u   /* user stack 1 MiB above the image */
+#define PROC_MAX_ARGV      16
 
-int proc_exec_elf(const void* image, size_t len) {
+/* ---------------------------------------------------------------------------
+ * M34 — build the System V initial process stack in a freshly-allocated user
+ * stack frame.
+ *
+ * At program entry the stack pointer must point at `argc`, laid out (growing
+ * UP from the SP) as:
+ *
+ *     [ argc ]                        <- returned user SP
+ *     [ argv[0] ] .. [ argv[argc-1] ]
+ *     [ NULL ]                        (argv terminator)
+ *     [ envp... ] [ NULL ]            (empty env for now)
+ *     [ auxv: AT_NULL(0,0) ]          (minimal; AT_PHDR/AT_RANDOM come with §M37/§M39)
+ *     ...
+ *     [ argument strings ]            (at the top of the page)
+ *
+ * The pointer values stored in argv[] are USER virtual addresses (into this
+ * same stack page); we write through the frame's kernel (identity) mapping but
+ * compute pointers relative to `stack_va`.  Slots are `uintptr_t`-wide, so the
+ * *shape* is correct on all three arches; only the i386 crt0 reads argv today
+ * (x86_64/aarch64 crt0 still call main() with no args — a valid stack either
+ * way).  Returns the user-VA stack pointer to enter at.
+ * --------------------------------------------------------------------------- */
+static uint32_t u_strlen(const char* s) { uint32_t n = 0; while (s[n]) n++; return n; }
+
+static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
+                                     int argc, const char* const argv[]) {
+    if (argc < 0) argc = 0;
+    if (argc > PROC_MAX_ARGV) argc = PROC_MAX_ARGV;
+
+    uint8_t* base = (uint8_t*)(uintptr_t)frame_phys;   /* kernel identity view  */
+    for (uint32_t i = 0; i < PAGE_SIZE; i++) base[i] = 0;
+
+    /* 1. Copy the argument strings to the top of the page, recording each
+     *    string's USER virtual address. */
+    uintptr_t argv_uva[PROC_MAX_ARGV];
+    uintptr_t koff = PAGE_SIZE;
+    for (int i = argc - 1; i >= 0; i--) {
+        uint32_t l = u_strlen(argv[i]) + 1;
+        koff -= l;
+        for (uint32_t j = 0; j < l; j++) base[koff + j] = (uint8_t)argv[i][j];
+        argv_uva[i] = stack_va + koff;
+    }
+
+    /* 2. Lay out the pointer table below the strings, keeping the final SP
+     *    16-byte aligned.  Slot count: argc + argv[argc] + NULL + envp-NULL +
+     *    auxv{type,val}. */
+    uintptr_t slot = sizeof(uintptr_t);
+    uintptr_t nslots = 1 + (uintptr_t)argc + 1 + 1 + 2;
+    koff -= nslots * slot;
+    koff &= ~(uintptr_t)0xF;                          /* 16-byte align the SP  */
+
+    uintptr_t* w = (uintptr_t*)(base + koff);
+    uintptr_t k = 0;
+    w[k++] = (uintptr_t)argc;
+    for (int i = 0; i < argc; i++) w[k++] = argv_uva[i];
+    w[k++] = 0;                                       /* argv terminator       */
+    w[k++] = 0;                                       /* envp terminator       */
+    w[k++] = 0;                                       /* auxv AT_NULL type     */
+    w[k++] = 0;                                       /* auxv AT_NULL value    */
+    return stack_va + koff;
+}
+
+/* Shared exec path: load `image` into a fresh space, map a user stack carrying
+ * the SysV initial stack (argc/argv/envp/auxv), and run it to SYS_EXIT as a
+ * synchronous excursion on the calling task.  argc<=0 → an empty argv. */
+static int proc_exec_common(const void* image, size_t len,
+                            int argc, const char* const argv[]) {
     struct vmm_space* s = vmm_space_create();
     if (!s) return -1;
 
@@ -40,6 +107,7 @@ int proc_exec_elf(const void* image, size_t len) {
         vmm_space_destroy(s);
         return -1;
     }
+    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, argv);
 
     /* Bind the space to this task so the scheduler maintains CR3/TTBR0 across
      * any preemption during the excursion, activate it, then drop to user
@@ -49,13 +117,22 @@ int proc_exec_elf(const void* image, size_t len) {
     if (me) { me->mm = s; me->mmap_cursor = 0; }   /* fresh mmap region */
     vmm_space_switch(s);
 
-    enter_user_mode_wrap(entry, stack_va + PAGE_SIZE);   /* stack grows down */
+    enter_user_mode_wrap(entry, user_sp);
 
     fd_close_all();                    /* reclaim any fds the program opened */
     vmm_space_switch(prev);
     if (me) me->mm = prev;
     vmm_space_destroy(s);
     return 0;
+}
+
+int proc_exec_elf(const void* image, size_t len) {
+    return proc_exec_common(image, len, 0, NULL);
+}
+
+int proc_exec_elf_argv(const void* image, size_t len,
+                       int argc, const char* const argv[]) {
+    return proc_exec_common(image, len, argc, argv);
 }
 
 /* ---------------------------------------------------------------------------
@@ -115,7 +192,7 @@ int proc_spawn(const char* name, const void* image, size_t len) {
     if (!b) { vmm_space_destroy(s); return -1; }
     b->space   = s;
     b->entry   = entry;
-    b->user_sp = stack_va + PAGE_SIZE;         /* stack grows down from the top */
+    b->user_sp = build_initial_stack(stk, stack_va, 0, NULL);  /* argc=0 stack */
 
     struct task* t = task_spawn_arg(name, user_task_bootstrap, b);
     if (!t) { kfree(b); vmm_space_destroy(s); return -1; }

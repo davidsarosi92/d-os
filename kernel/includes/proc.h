@@ -24,6 +24,13 @@
  * negative code if loading / setup failed. */
 int proc_exec_elf(const void* image, size_t len);
 
+/* M34 — like proc_exec_elf, but builds a System V initial stack carrying
+ * argc/argv (+ empty envp + AT_NULL auxv) that the program's crt0 reads.
+ * `argv` holds `argc` NUL-terminated strings.  Same synchronous-excursion
+ * model + return contract as proc_exec_elf. */
+int proc_exec_elf_argv(const void* image, size_t len,
+                       int argc, const char* const argv[]);
+
 /* Tier B — spawn `image` as an INDEPENDENT, preemptible user process on its own
  * task, named `name`.  Returns immediately with the new task's pid (or negative
  * on failure); the program runs concurrently at ring 3/EL0 until it SYS_EXITs

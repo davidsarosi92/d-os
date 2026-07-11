@@ -1354,6 +1354,43 @@ static void cmd_procspawn(void) {
             a, b);
 }
 
+/* M34 slice A — `runargs [a b c ...]`: exec the args test program with an
+ * argv built by the kernel; it prints argc + each argv from ring 3. */
+extern const unsigned char _binary_user_args_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_args_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_runargs(const char* line) {
+    if (!_binary_user_args_i386_elf_start) {
+        console_write("runargs: args ELF not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_args_i386_elf_end - _binary_user_args_i386_elf_start);
+
+    /* Split `line` into up to 15 whitespace-separated argv strings, in place
+     * (a scratch copy).  argv[0] is the program name. */
+    static char scratch[256];
+    const char* argv[16];
+    int argc = 0;
+    argv[argc++] = "args";               /* argv[0] */
+
+    int n = 0;
+    while (line[n] && n < 255) { scratch[n] = line[n]; n++; }
+    scratch[n] = '\0';
+    int i = 0;
+    while (scratch[i] && argc < 16) {
+        while (scratch[i] == ' ') i++;
+        if (!scratch[i]) break;
+        argv[argc++] = &scratch[i];
+        while (scratch[i] && scratch[i] != ' ') i++;
+        if (scratch[i]) scratch[i++] = '\0';
+    }
+
+    kprintf("runargs: exec'ing args program with %d argv...\n", argc);
+    int rc = proc_exec_elf_argv(_binary_user_args_i386_elf_start, len,
+                                argc, (const char* const*)argv);
+    kprintf("runargs: returned rc=%d\n", rc);
+}
+
 /* -------------------------------------------------------------------- */
 /* Configuration commands.                                              */
 /* -------------------------------------------------------------------- */
@@ -1509,6 +1546,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "polltest"))       { cmd_polltest(); return; }
     if (streq(line, "libctest"))       { cmd_libctest(); return; }
     if (streq(line, "procspawn"))      { cmd_procspawn(); return; }
+    if (streq(line, "runargs"))        { cmd_runargs(""); return; }
+    if (starts_with(line, "runargs ")) { cmd_runargs(line + 8); return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }
