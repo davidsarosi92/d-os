@@ -22,6 +22,7 @@
 #include "gdt.h"
 #include "syscall.h"
 #include "task.h"
+#include "vmm.h"
 #include "lapic.h"
 #include "ioapic.h"
 #include "pci.h"
@@ -286,6 +287,14 @@ void idt_use_apic(uint8_t bsp_apic_id) {
  * -------------------------------------------------------------------------- */
 void isr_handler(struct int_frame* f) {
     if (f->int_no < 32) {
+        /* M34 — copy-on-write page fault: a write to a fork-shared page.  Try
+         * to resolve it (private copy) and retry; only if that declines is it a
+         * real fault. */
+        if (f->int_no == 14) {
+            uint32_t cr2;
+            __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+            if (vmm_cow_fault(cr2)) return;
+        }
         /* CPU exception.  Without a working fault recovery path, the only
          * safe move is to dump what we know and halt forever. */
         kprintf("\n!! EXCEPTION %d (%s) at cs:eip=%x:%p err=%x\n",

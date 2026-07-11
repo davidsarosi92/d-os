@@ -52,6 +52,11 @@
  * drop the mapping.  Stored in an OS-available PTE bit (x86 bit 10 / aarch64
  * software bit 55), invisible to the hardware walk. */
 #define VMM_SHARED       0x400
+/* M34 — a COPY-ON-WRITE mapping: the page is shared read-only between spaces
+ * after fork; a write faults and vmm_cow_fault() gives the writer a private
+ * copy.  Stored in PTE bit 11 (OS-available).  A per-frame refcount tracks how
+ * many spaces still share it so the frame is freed only by the last owner. */
+#define VMM_COW          0x800
 
 /* Turn on paging + identity-map the kernel region.  On i386 this builds
  * the page directory and turns on CR0.PG; on x86_64 paging is already
@@ -132,6 +137,13 @@ void vmm_space_destroy(struct vmm_space* space);
  * not copied — they are borrowed shm frames).  Returns NULL on OOM.  (Eager
  * copy first; copy-on-write is a later optimisation.)  i386 impl today. */
 struct vmm_space* vmm_space_clone(struct vmm_space* parent);
+
+/* M34 — copy-on-write page-fault handler.  Called from the #PF path (idt.c)
+ * with the faulting virtual address.  If it names a COW page in the current
+ * task's space, resolve it (give the writer a private, writable copy — or make
+ * the page writable in place if it is the last sharer) and return 1 (retry the
+ * instruction); return 0 if it is not a COW fault (→ a real fault). */
+int vmm_cow_fault(uintptr_t fault_va);
 
 /* Map / unmap a page in a *specific* space's user region.  Same flag
  * semantics as vmm_map (pass VMM_USER for a ring-3-accessible page). */
