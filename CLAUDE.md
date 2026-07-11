@@ -45,12 +45,13 @@ calling task (no IRQ/lock yet); TCP client-only, no retransmit/congestion.
 `socket`/`bind`/`connect`/`sendto`/`recvfrom` (syscalls 22–26), ring-3 UDP+TCP;
 `dnstest`/`httptest` resolve + fetch a page from ring 3.  Open: sockaddr,
 multiple TCP conns, IRQ RX, DHCP, IPv6.  **M35** (2026-07-11, DOCS §4.28):
-threads + futex (i386) — `proc_clone` (shared address space, `mm_shared`) +
-`futex` (SYS_CLONE/SYS_FUTEX) + libc `thread_create`/`thread_join`; tested
-20000/20000 on **UP and `-smp 2`**.  Also fixed a pre-existing gap it exposed
-(ring-3 tasks didn't run on APs) with a **per-CPU TSS** (array in tss.c + one
-GDT descriptor per CPU + each CPU LTRs its own) — unblocks all ring-3-on-AP.
-**Tier A** (2026-07-10, DOCS §4.20): blocking
+threads + futex + TLS (i386) — `proc_clone` (shared address space, `mm_shared`)
++ `futex` (SYS_CLONE/SYS_FUTEX) + libc `thread_create`/`thread_join` + `%gs`
+thread-local storage (SYS_SET_TLS, per-CPU GDT TLS descriptors); tested
+20000/20000 (threadtest) + tlstest 0-mismatch on **UP and `-smp 2`**.  Also
+fixed a pre-existing gap it exposed (ring-3 tasks didn't run on APs) with a
+**per-CPU TSS** (array in tss.c + one GDT descriptor per CPU + each CPU LTRs its
+own) — unblocks all ring-3-on-AP.  **Tier A** (2026-07-10, DOCS §4.20): blocking
 primitives — `waitq` (block/wake, lost-wakeup-free, SMP cross-CPU wake;
 `TASK_SLEEPING` now real), `task_wait(pid,&code)`, blocking socket
 read + `poll(timeout<0)`, `task_msleep`.  **M29** (DOCS §4.21):
@@ -164,18 +165,19 @@ extension + ACPI SRAT-derived per-CPU NUMA nodes), APs scheduling,
 **x86_64 (long mode) — full parity with i386 INCLUDING xHCI USB +
 virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
-▶️ **DECIDED NEXT (2026-07-11): TLS (thread-local storage), then §M35.5 pkg.**
-§M35 (threads & futex) SHIPPED on i386 (DOCS §4.28) — `proc_clone`/`futex`/
-`thread_create`; **verified on UP AND `-smp 2` (20000/20000, truly parallel)**.
-Bringing threads up on SMP also fixed a pre-existing gap (ring-3 tasks didn't run
-on APs) via a **per-CPU TSS** (array in `tss.c` + one GDT descriptor per CPU +
-each CPU LTRs its own) — this unblocked *all* ring-3 userland on APs (procspawn
-runs on `-smp 2` too).  **The immediate next task is TLS** (`__thread` /
-`set_thread_area` — a per-thread GDT entry so `%gs`-relative access works;
-needed by a real libc's pthread + `errno`), then §M35.5 pkg store → §M36 libc → …
-Also shipped this session: §M34 POSIX (DOCS §4.27), §M24 stage-6 sockets (DOCS
-§4.25).  **§M26 Wayland stays deferred until POSIX + libc exist.**  Per-CPU TSS
-+ §M35 on branch `percpu-tss`; check git for merge state.
+▶️ **DECIDED NEXT (2026-07-11): §M35.5 — package manager & isolation.**
+§M35 (threads & futex + **TLS** + per-CPU TSS) is COMPLETE on i386, verified UP
+AND `-smp 2` (DOCS §4.28): `proc_clone`/`futex`/`thread_create` (20000/20000,
+truly parallel), `%gs` thread-local storage (`tlstest`: each thread reads only
+its own id, 0 mismatches), and the per-CPU TSS fix that unblocked all ring-3
+userland on APs.  **The agreed next target is §M35.5 — the package manager +
+isolation substrate** (content-addressed store, Nix/Guix-shaped — see PLAN.md
+§M35.5's implementation sketch): the porting-discipline gate that must land
+before pulling in foreign code (musl §M36 onward).  Then §M36 libc (musl port)
+→ … (the "Userland maturation" cluster critical path).  Also shipped this
+session: §M34 POSIX (DOCS §4.27), §M24 stage-6 sockets (DOCS §4.25).  **§M26
+Wayland stays deferred until POSIX + libc exist.**  §M35 TLS on branch
+`m35-tls`; check git for merge state.
 
 🔲 **Other options** (was "pick one"; superseded by the decision above):
 

@@ -3150,9 +3150,14 @@ on each arch.
 > gap — ring-3 tasks didn't run on APs (single global TSS + no per-CPU `LTR`) —
 > via a **per-CPU TSS** (array in `tss.c`, one GDT descriptor per CPU, each CPU
 > LTRs its own in `gdt_init`/`ap_main`), which unblocked *all* ring-3 tasks on
-> APs (`procspawn` now runs on `-smp 2` too).  **Still open:** TLS
-> (`__thread`/`set_thread_area`); PI/robust futexes; `gettid`; per-thread signal
-> masks; x86_64/aarch64.
+> APs (`procspawn` now runs on `-smp 2` too).  **Plus thread-local storage** via
+> `%gs`: per-CPU GDT TLS descriptors + `hal_set_tls_base` (scheduler switch-in
+> hook) + `set_thread_area` (SYS_SET_TLS) + libc `set_tls`; `tlstest`'s 4 threads
+> each read only their own id through `%gs` (0 mismatches on UP + `-smp 2`).
+> **Still open:** the compiler `__thread` ABI runtime (PT_TLS template; lands
+> with the §M36 libc); migration-safe TLS (threads are CPU-pinned today — needs
+> a per-CPU GDT); PI/robust futexes; `gettid`; per-thread signal masks;
+> x86_64/aarch64.
 
 **Why:** browsers are massively multi-threaded (compositor, network, GC,
 worker pools); today there are **no user-space threads at all**.  Also a
@@ -3710,6 +3715,15 @@ not a binary registry.  Revisit only with a specific use case.
 
 ## Change log
 
+- **2026-07-11** — **§M35 TLS + per-CPU TSS (i386, UP + SMP).**  Thread-local
+  storage via `%gs`: per-CPU GDT TLS descriptors whose base the scheduler
+  reloads on switch-in (`hal_set_tls_base`), `set_thread_area` (SYS_SET_TLS) +
+  libc `set_tls`; `tlstest`'s 4 threads each read only their own id (0
+  mismatches, UP + `-smp 2`).  Also the per-CPU TSS fix (see below) that
+  unblocked all ring-3 tasks on APs.  §M35 is now UP + SMP + TLS complete on
+  i386.  Next: §M35.5 pkg store → §M36 libc.  (TLS threads are CPU-pinned;
+  migration-safe TLS + the compiler `__thread` runtime are follow-ups.)  See
+  DOCS.md §4.28.
 - **2026-07-11** — **§M35 shipped (threads + futex, i386, UP).**  `proc_clone`
   (SYS_CLONE) = a task sharing the creator's address space (`mm_shared`) + fds,
   at a ring-3 entry/stack; `futex` (SYS_FUTEX) FUTEX_WAIT/WAKE over hashed

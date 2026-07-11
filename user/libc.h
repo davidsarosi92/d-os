@@ -29,6 +29,12 @@ int   thread_join(int tid);                         /* waitpid the thread */
 int   futex(int* uaddr, int op, int val);
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
+
+/* Thread-local storage (M35).  set_tls() points %gs at a per-thread block;
+ * tls_load4 reads the int at %gs:4 (a demo accessor — the compiler's __thread
+ * ABI layering lands with the libc port).  */
+void set_tls(void* tp);
+static inline int tls_load4(void) { int v; __asm__ volatile ("movl %%gs:4, %0" : "=r"(v)); return v; }
 int   execv (const char* path, char* const argv[]);  /* replace image; no return on success */
 int   pipe  (int fds[2]);                   /* fds[0]=read, fds[1]=write */
 int   dup2  (int oldfd, int newfd);         /* redirect a descriptor */

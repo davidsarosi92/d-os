@@ -1527,6 +1527,22 @@ static void cmd_threadtest(void) {
     kprintf("threadtest: returned rc=%d\n", rc);
 }
 
+/* M35 — `tlstest`: thread-local storage via %gs from ring 3. */
+extern const unsigned char _binary_user_tlstest_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_tlstest_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_tlstest(void) {
+    if (!_binary_user_tlstest_i386_elf_start) {
+        console_write("tlstest: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_tlstest_i386_elf_end -
+                          _binary_user_tlstest_i386_elf_start);
+    console_write("tlstest: exec'ing thread-local-storage program...\n");
+    int rc = proc_exec_elf(_binary_user_tlstest_i386_elf_start, len);
+    kprintf("tlstest: returned rc=%d\n", rc);
+}
+
 /* -------------------------------------------------------------------- */
 /* Configuration commands.                                              */
 /* -------------------------------------------------------------------- */
@@ -1691,6 +1707,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "dnstest"))        { cmd_dnstest(); return; }
     if (streq(line, "httptest"))       { cmd_httptest(); return; }
     if (streq(line, "threadtest"))     { cmd_threadtest(); return; }
+    if (streq(line, "tlstest"))        { cmd_tlstest(); return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }

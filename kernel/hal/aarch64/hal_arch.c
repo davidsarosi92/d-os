@@ -121,3 +121,6 @@ void hal_syscall_exit_to_kernel(uintptr_t saved_sp, uintptr_t saved_pc) {
 void hal_set_kernel_stack(uintptr_t top) {
     (void)top;
 }
+
+/* M35 TLS — stub (aarch64 TLS uses the TPIDR_EL0 register; a later port). */
+void hal_set_tls_base(uintptr_t base) { (void)base; }

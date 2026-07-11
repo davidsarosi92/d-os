@@ -12,6 +12,8 @@
 #ifndef GDT_H
 #define GDT_H
 
+#include <stdint.h>
+
 /* Segment selectors.  Low two bits are the Requested Privilege Level.
  * The index into the GDT is (selector >> 3). */
 #define GDT_KERNEL_CS   0x08        /* entry 1 — kernel code, RPL 0 */
@@ -34,5 +36,9 @@ void* gdt_get_ptr_struct(void);
  * once percpu is up.  Without it, a ring-3 → ring-0 trap on that CPU has no
  * valid kernel stack. */
 void gdt_load_cpu_tss(void);
+
+/* M35 TLS — the ring-3 %gs selector for the running CPU's user-TLS descriptor
+ * (RPL 3).  `hal_set_tls_base` (hal_api.h) rewrites that descriptor's base. */
+uint16_t gdt_tls_selector(void);
 
 #endif

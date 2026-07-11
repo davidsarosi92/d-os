@@ -20,6 +20,7 @@
 #define SYS_WAITPID 15
 #define SYS_CLONE  27
 #define SYS_FUTEX  28
+#define SYS_SET_TLS 29
 #define SYS_EXECVE 16
 #define SYS_PIPE   17
 #define SYS_DUP2   18
@@ -122,6 +123,14 @@ int thread_create(int (*fn)(void*), void* arg) {
     return (int)syscall3(SYS_CLONE, (long)fn, (long)sp, 0);
 }
 int thread_join(int tid) { return waitpid(tid, 0); }
+
+/* M35 TLS — set this thread's thread-pointer (base of its %gs segment) to `tp`,
+ * then load %gs with the returned selector so `%gs:off` reaches the block. */
+void set_tls(void* tp) {
+    unsigned sel = (unsigned)syscall3(SYS_SET_TLS, (long)tp, 0, 0);
+    __asm__ volatile ("movw %w0, %%gs" : : "r"(sel));
+}
+
 long  sendto(int fd, const void* buf, size_t n, unsigned ip, int port) {
     return syscall5(SYS_SENDTO, fd, (long)buf, (long)n, (long)ip, port);
 }
