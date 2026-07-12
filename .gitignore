@@ -65,3 +65,7 @@ disk.img
 
 # Vendored (fetched, pristine) musl source — see scripts/fetch-musl.sh
 third_party/musl/
+# Built static i386 musl (make musl) — a build product, rebuilt on demand
+third_party/musl-i386/
+# musl-linked test ELFs (build products)
+user/muslhello_i386.elf

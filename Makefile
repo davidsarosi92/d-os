@@ -77,6 +77,13 @@ ifeq ($(ARCH),i386)
                      user/tlstest_blob.o user/posixtest_blob.o \
                      user/linuxhello_blob.o
 
+  # A REAL musl-linked hello is embedded ONLY when musl has been built
+  # (`make musl`); otherwise the kernel builds without it.  This keeps the
+  # default build independent of the (fetched, on-demand) musl toolchain.
+  ifneq ($(wildcard third_party/musl-i386/lib/libc.a),)
+    ARCH_EXTRA_OBJS += user/muslhello_blob.o
+  endif
+
   # Tier B — in-tree user libc build knobs (i386 reference).
   USER_CFLAGS   := -m32 -ffreestanding -fno-pie -fno-stack-protector \
                    -fno-builtin -nostdlib -Os -Wall -std=c11 -Iuser
@@ -465,9 +472,40 @@ KERNEL_BIN := $(BUILD_DIR)/kernel.bin
 ISO_DIR    := $(BUILD_DIR)/iso
 ISO        := $(BUILD_DIR)/d-os.iso
 
-.PHONY: all kernel iso run clean clean-all
+.PHONY: all kernel iso run clean clean-all musl musl-clean
 
 all: $(KERNEL_BIN)
+
+# -----------------------------------------------------------------------------
+# musl (§M36 stage 2) — build the vendored, PRISTINE musl as a static i386 libc.
+#
+# musl is fetched (not committed) by scripts/fetch-musl.sh into third_party/musl
+# and built here into third_party/musl-i386/ (also gitignored).  We do NOT patch
+# musl — d-os provides the Linux i386 syscall ABI it targets (linux_abi.c).  Run
+# this INSIDE the build container (gcc-multilib), e.g.:
+#     docker run --rm --platform=linux/amd64 -v "$PWD":/src d-os-build make musl
+# Produces third_party/musl-i386/lib/{libc.a,crt1.o,crti.o,crtn.o} + include/.
+# -----------------------------------------------------------------------------
+MUSL_SRC    := third_party/musl
+MUSL_PREFIX := third_party/musl-i386
+MUSL_LIBC   := $(MUSL_PREFIX)/lib/libc.a
+
+musl: $(MUSL_LIBC)
+
+$(MUSL_LIBC):
+	@test -f $(MUSL_SRC)/configure || { \
+	  echo "musl source missing — run ./scripts/fetch-musl.sh first"; exit 1; }
+	cd $(MUSL_SRC) && CC='gcc -m32' ./configure \
+	    --target=i386 --disable-shared --prefix=$(CURDIR)/$(MUSL_PREFIX) \
+	    AR=ar RANLIB=ranlib
+
+	$(MAKE) -C $(MUSL_SRC) -j
+	$(MAKE) -C $(MUSL_SRC) install
+	@echo "musl static i386 libc built → $(MUSL_PREFIX)/lib/"
+
+musl-clean:
+	-$(MAKE) -C $(MUSL_SRC) clean 2>/dev/null || true
+	rm -rf $(MUSL_PREFIX)
 
 kernel: $(KERNEL_BIN)
 
@@ -680,6 +718,27 @@ user/linuxhello_$(ARCH).elf: user/linuxhello.c
 $(OBJ_DIR)/user/linuxhello_blob.o: user/linuxhello_$(ARCH).elf
 	@mkdir -p $(@D)
 	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+# muslhello — a NORMAL C program linked against REAL, pristine musl (needs
+# `make musl` first; the blob is only wired in when musl-i386/lib/libc.a exists,
+# see the ifneq in the i386 block).  Compiled with musl's headers, statically
+# linked with musl crt1/crti/libc.a/crtn (a stock Linux i386 ELF), run under the
+# Linux personality.  Linked directly with `ld` (no gcc PIE/spec interference).
+user/muslhello_i386.elf: user/muslhello.c $(MUSL_LIBC)
+	@mkdir -p $(OBJ_DIR)/user
+	gcc -m32 -static -fno-pie -Os -c user/muslhello.c \
+	    -I$(MUSL_PREFIX)/include -o $(OBJ_DIR)/user/muslhello.o
+	ld -m elf_i386 -static -Ttext-segment=$(USER_BASE) -e _start -o $@ \
+	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
+	    $(OBJ_DIR)/user/muslhello.o \
+	    --start-group $(MUSL_PREFIX)/lib/libc.a \
+	    `gcc -m32 -print-libgcc-file-name` --end-group \
+	    $(MUSL_PREFIX)/lib/crtn.o
+
+$(OBJ_DIR)/user/muslhello_blob.o: user/muslhello_i386.elf
+	@mkdir -p $(@D)
+	objcopy --input-target=binary --output-target=elf32-i386 \
+	    --binary-architecture=i386 $< $@
 
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)

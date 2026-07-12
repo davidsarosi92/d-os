@@ -165,21 +165,26 @@ extension + ACPI SRAT-derived per-CPU NUMA nodes), APs scheduling,
 **x86_64 (long mode) — full parity with i386 INCLUDING xHCI USB +
 virtio-blk + exFAT**.  `m20_stubs.c` is empty.
 
-▶️ **DECIDED NEXT (2026-07-11): grow linux_abi.c for musl startup, then build musl.**
-§M36 is IN PROGRESS (stage 1 + stage-2 foundation both merged to main).
-**Stage 1** (syscall breadth: stat/fstat/getdents/uname/clock_gettime/nanosleep +
-errno; DOCS §4.30).  **Stage-2 FOUNDATION** (DOCS §4.31): a **modular Linux i386
-syscall-ABI compat layer** — the chosen approach is to keep **musl PRISTINE**
-(vendored via `scripts/fetch-musl.sh`, *not* forked to d-os numbers) and have
-d-os provide the Linux ABI via an isolated `kernel/hal/x86/linux_abi.c` + a
-`task->linux_abi` personality; `linuxtest` runs a hand-written Linux-ABI program
-(write=4/exit=1) end-to-end.  Doubles as §M41.  **Next: grow `linux_abi.c` to
-musl's startup set** — chiefly `set_thread_area` (translate the Linux
-`user_desc` onto the §M35 per-CPU `%gs` GDT-TLS mechanism — the biggest blocker)
-+ an `auxv` on the initial stack; then `make musl` (fetch+build), link a static
-musl `hello`, `pkg install` it + coreutils into the §M35.5 store.  **Checklist in
-`third_party/MUSL.md`.**  §M35 (threads/futex/TLS/per-CPU TSS) is COMPLETE
-(UP+SMP, §4.28); also shipped: §M34 POSIX (§4.27), §M24 sockets (§4.25), §M35.5
+▶️ **DECIDED NEXT (2026-07-12): REAL musl RUNS → coreutils → §M35.5 store next.**
+§M36 IN PROGRESS.  **Stage 1** (syscall breadth: stat/fstat/getdents/uname/
+clock_gettime/nanosleep + errno; DOCS §4.30).  **Stage 2 = "two brothers"**
+(design settled; parked own-libc debate in `NATIVE_LIBC.md`): Role B (ecosystem
+libc) via TWO peers onto the SAME kernel primitives — (a) **Linux-ABI peer**:
+PRISTINE vendored musl → Linux numbers → isolated `kernel/hal/x86/linux_abi.c` +
+`task->linux_abi` personality (doubles as §M41); (b) **native musl-fork peer**:
+a light `arch/dos/` musl fork → d-os numbers → native `syscall.c` (store
+default).  **Linux-ABI peer GOAL ACHIEVED (DOCS §4.31): an unmodified static
+musl binary runs on d-os** — `make musl` builds static i386 musl
+(`third_party/musl-i386/`), `user/muslhello.c` (stdio/printf) links against
+musl crt1/libc.a into a stock Linux ELF (`-Ttext-segment=0x40000000` + libgcc),
+run by the **`musltest`** cmd under the personality; prints via real musl
+`printf`, rc=0, ZERO unhandled syscalls.  Startup welds that got it there:
+`set_thread_area` (→§M35 `%gs` GDT-TLS), `auxv` (`AT_PAGESZ/CLKTCK/RANDOM/
+SECURE` in `build_initial_stack`), `set_tid_address`, `ioctl`→ENOTTY.  **Next:
+minimal coreutils (`sh`/`ls`/`cat`/`echo`/`env`) `pkg install`ed into the §M35.5
+store + exec'd from `/store` (not blobs); then the native musl-fork peer.**
+**Checklist in `third_party/MUSL.md`.**  §M35 (threads/futex/TLS/per-CPU TSS)
+COMPLETE (UP+SMP, §4.28); also: §M34 POSIX (§4.27), §M24 sockets (§4.25), §M35.5
 store (§4.29).  **§M26 Wayland deferred until POSIX + libc exist.**
 
 🔲 **Other options** (was "pick one"; superseded by the decision above):

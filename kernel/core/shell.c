@@ -1581,6 +1581,27 @@ static void cmd_linuxtest(void) {
     kprintf("linuxtest: returned rc=%d\n", rc);
 }
 
+/* M36 stage 2 — `musltest`: run a REAL, unmodified musl-linked ELF under the
+ * Linux personality.  Embedded only when `make musl` produced the binary. */
+extern const unsigned char _binary_user_muslhello_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_muslhello_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_musltest(void) {
+    if (!_binary_user_muslhello_i386_elf_start) {
+        console_write("musltest: not embedded — run `make musl` then rebuild\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_muslhello_i386_elf_end -
+                          _binary_user_muslhello_i386_elf_start);
+    console_write("musltest: exec'ing a REAL musl binary (Linux personality)...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(_binary_user_muslhello_i386_elf_start, len);
+    if (me) me->linux_abi = prev;
+    kprintf("musltest: returned rc=%d\n", rc);
+}
+
 /* §M35.5 — content-addressed package store. */
 static void cmd_pkg(const char* args) {
     if (starts_with(args, "build "))   { pkg_build(args + 6);   return; }
@@ -1773,6 +1794,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "threadtest"))     { cmd_threadtest(); return; }
     if (streq(line, "tlstest"))        { cmd_tlstest(); return; }
     if (streq(line, "linuxtest"))      { cmd_linuxtest(); return; }
+    if (streq(line, "musltest"))       { cmd_musltest(); return; }
     if (streq(line, "pkg"))            { cmd_pkg("");        return; }
     if (starts_with(line, "pkg "))     { cmd_pkg(line + 4);  return; }
     if (streq(line, "pkgtest"))        { cmd_pkgtest();      return; }

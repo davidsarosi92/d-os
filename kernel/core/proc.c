@@ -37,9 +37,16 @@
  *     [ argv[0] ] .. [ argv[argc-1] ]
  *     [ NULL ]                        (argv terminator)
  *     [ envp... ] [ NULL ]            (empty env for now)
- *     [ auxv: AT_NULL(0,0) ]          (minimal; AT_PHDR/AT_RANDOM come with §M37/§M39)
+ *     [ auxv pairs ] [ AT_NULL(0,0) ] (AT_PAGESZ/AT_CLKTCK/AT_RANDOM/AT_SECURE;
+ *                                      AT_PHDR/AT_ENTRY come with §M37)
  *     ...
+ *     [ 16 AT_RANDOM bytes ]          (near the top of the page)
  *     [ argument strings ]            (at the top of the page)
+ *
+ * The auxv is what a real libc's startup reads: musl needs AT_PAGESZ (its
+ * page-size global) and AT_RANDOM (16 bytes seeding the stack-guard canary +
+ * malloc) or it faults / runs with a zero page size.  A minimal-but-real auxv
+ * is therefore a hard prerequisite for running an unmodified musl binary.
  *
  * The pointer values stored in argv[] are USER virtual addresses (into this
  * same stack page); we write through the frame's kernel (identity) mapping but
@@ -49,6 +56,27 @@
  * way).  Returns the user-VA stack pointer to enter at.
  * --------------------------------------------------------------------------- */
 static uint32_t u_strlen(const char* s) { uint32_t n = 0; while (s[n]) n++; return n; }
+
+/* SysV auxiliary-vector types a static musl reads at startup. */
+#define AT_NULL    0
+#define AT_CLKTCK  17
+#define AT_PAGESZ  6
+#define AT_RANDOM  25
+#define AT_SECURE  23
+
+/* A non-cryptographic 16-byte seed for AT_RANDOM: musl only needs it to be
+ * non-zero + varied (stack-guard canary / malloc), not secure.  We mix the
+ * frame address, the stack VA and a per-call counter.  (§M39 replaces this
+ * with real entropy once /dev/urandom exists.) */
+static void fill_at_random(uint8_t out[16], uint32_t frame_phys, uintptr_t stack_va) {
+    static uint32_t ctr = 0x9E3779B9u;              /* golden-ratio odd start */
+    ctr += 0x6D2B79F5u;
+    uint32_t x = frame_phys ^ (uint32_t)stack_va ^ ctr;
+    for (int i = 0; i < 16; i++) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;    /* xorshift32            */
+        out[i] = (uint8_t)(x >> (8 * (i & 3)));
+    }
+}
 
 static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
                                      int argc, const char* const argv[]) {
@@ -69,11 +97,18 @@ static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
         argv_uva[i] = stack_va + koff;
     }
 
+    /* 1b. Reserve + fill the 16 AT_RANDOM bytes just below the strings and
+     *     record their user VA (kept 4-byte aligned). */
+    koff -= 16;
+    koff &= ~(uintptr_t)0x3;
+    fill_at_random(base + koff, frame_phys, stack_va);
+    uintptr_t at_random_uva = stack_va + koff;
+
     /* 2. Lay out the pointer table below the strings, keeping the final SP
-     *    16-byte aligned.  Slot count: argc + argv[argc] + NULL + envp-NULL +
-     *    auxv{type,val}. */
+     *    16-byte aligned.  Slots: argc + argv[argc] + argv-NULL + envp-NULL +
+     *    auxv{ PAGESZ, CLKTCK, RANDOM, SECURE, NULL } = 5 pairs = 10 words. */
     uintptr_t slot = sizeof(uintptr_t);
-    uintptr_t nslots = 1 + (uintptr_t)argc + 1 + 1 + 2;
+    uintptr_t nslots = 1 + (uintptr_t)argc + 1 + 1 + (5 * 2);
     koff -= nslots * slot;
     koff &= ~(uintptr_t)0xF;                          /* 16-byte align the SP  */
 
@@ -83,8 +118,11 @@ static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
     for (int i = 0; i < argc; i++) w[k++] = argv_uva[i];
     w[k++] = 0;                                       /* argv terminator       */
     w[k++] = 0;                                       /* envp terminator       */
-    w[k++] = 0;                                       /* auxv AT_NULL type     */
-    w[k++] = 0;                                       /* auxv AT_NULL value    */
+    w[k++] = AT_PAGESZ; w[k++] = PAGE_SIZE;           /* auxv: page size       */
+    w[k++] = AT_CLKTCK; w[k++] = 100;                 /* auxv: HZ (100 ticks/s)*/
+    w[k++] = AT_RANDOM; w[k++] = at_random_uva;       /* auxv: 16 random bytes */
+    w[k++] = AT_SECURE; w[k++] = 0;                   /* auxv: not setuid      */
+    w[k++] = AT_NULL;   w[k++] = 0;                   /* auxv terminator       */
     return stack_va + koff;
 }
 

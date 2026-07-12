@@ -3140,19 +3140,53 @@ it already targets.
   `third_party/MUSL.md` documents the build (`configure`+`make` for i386),
   static link (crt1 + libc.a), and the run path.
 
-**Boot-tested (i386):** `linuxtest` runs `user/linuxhello.c` — a freestanding
-program using the Linux ABI directly (`write`=4, `exit`=1; no d-os libc/crt0) —
-under the Linux personality: it prints via Linux `write` and exits via Linux
-`exit`, all routed through `linux_abi.c`.  The compat layer works end-to-end
-**without musl built yet**.
+**`set_thread_area` (TLS) — the #1 musl-startup blocker — DONE.**  The Linux
+`set_thread_area(struct user_desc*)` is translated onto the §M35 per-CPU `%gs`
+GDT-TLS mechanism (identical to native `SYS_SET_TLS`): record `base_addr` as the
+thread's `%gs` base, pin the thread to this CPU (its selector is per-CPU), load
+the descriptor base via `hal_set_tls_base`, then **write the allocated GDT index
+back into `user_desc.entry_number`** so Linux userland's `%gs = (entry_number
+<<3)|3` reconstructs our selector exactly.  `struct lnx_user_desc` is the single
+place that layout lives.
 
-**Next (to run real musl) — see `third_party/MUSL.md`:** grow `linux_abi.c` to
-cover musl's startup + runtime — chiefly **`set_thread_area`** (TLS is
-mandatory; translate the Linux `user_desc` onto the §M35 per-CPU `%gs` GDT-TLS
-mechanism — the biggest blocker), a proper **`auxv`** on the initial stack
-(`AT_RANDOM`/`AT_PAGESZ`/…), then `rt_sigprocmask`/`ioctl`/`stat64` as musl
-demands them (each surfaces via the `-ENOSYS` log).  Then link a static musl
-`hello`, a minimal coreutils, and `pkg install` them into the §M35.5 store.
+**`auxv` on the initial stack — the 2nd musl-startup blocker — DONE.**  The
+SysV initial stack (`build_initial_stack` in `kernel/core/proc.c`, shared by
+*all* processes — native + Linux) now carries a real auxiliary vector, not just
+`AT_NULL`: **`AT_PAGESZ`** (4096 — musl's page-size global), **`AT_CLKTCK`**
+(100), **`AT_RANDOM`** (a pointer to 16 non-zero seed bytes — musl's stack-guard
+canary + malloc; non-crypto xorshift for now, §M39 swaps in `/dev/urandom`), and
+**`AT_SECURE`** (0).  The native i386 crt0 ignores auxv (reads only argc/argv),
+so this is regression-free for native programs.
+
+**Boot-tested (i386):** `linuxtest` runs `user/linuxhello.c` — a freestanding
+program using the Linux ABI directly (no d-os libc/crt0) under the Linux
+personality.  Its asm `_start` captures the SysV entry `%esp` (→ `argc`), then
+it (1) prints via Linux `write`=4, (2) calls `set_thread_area`=243, loads `%gs`
+from the written-back index and reads its TLS word back through `%gs:0`
+(→ `set_thread_area TLS via %gs:0 OK`), (3) walks the stack the way musl's
+`__init_libc` does and verifies `AT_PAGESZ==4096` + a non-zero `AT_RANDOM`
+(→ `auxv AT_PAGESZ=4096 + AT_RANDOM OK`), then exits via Linux `exit`=1 — all
+routed through `linux_abi.c`.  **Both musl-startup blockers (TLS + auxv) now
+work end-to-end without musl built yet.**  Regression-checked:
+`runargs`/`posixtest`/`forktest`/`libctest` (native, same initial stack) green.
+
+**REAL musl runs (i386) — the Linux-ABI peer's goal, ACHIEVED.**  `make musl`
+builds a static i386 musl (`third_party/musl-i386/`, see `third_party/MUSL.md`);
+`user/muslhello.c` — an ordinary `#include <stdio.h>` / `printf` program — links
+statically against musl's crt1/crti/libc.a/crtn into a stock Linux i386 ELF
+(relocated to 0x40000000 via `-Ttext-segment`, + libgcc for musl's 64-bit
+`__udivmoddi4`), embedded as a blob and run by the **`musltest`** shell command
+under the Linux personality.  It prints via real musl `printf` (`%d`+`%s`) and
+returns 0 with **zero unhandled syscalls** — after the compat layer picked up
+the last two musl-startup demands: `set_tid_address` (258 → returns the tid) and
+`ioctl` (54 → `ENOTTY`, so musl's `isatty()` reports "not a terminal").  An
+unmodified, pristine musl binary now runs on d-os.
+
+**Next — see `third_party/MUSL.md`:** a minimal coreutils (`sh`/`ls`/`cat`/
+`echo`/`env`) `pkg install`ed into the §M35.5 store, exec'd from `/store` rather
+than embedded as blobs.  The **native musl-fork peer** (`arch/dos/`, d-os
+syscall numbers — the store's default libc) is the twin track; the own-libc
+question is parked in `NATIVE_LIBC.md`.
 
 ---
 
@@ -3226,6 +3260,32 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-12 — M36 stage 2: REAL, unmodified musl runs on d-os, i386.**  The
+  Linux-ABI peer's goal (DOCS §4.31).  `make musl` builds a static i386 musl
+  (`third_party/musl-i386/`; fetch-musl.sh pins v1.2.5); `user/muslhello.c` (an
+  ordinary stdio/printf program) links against musl's crt1/libc.a into a stock
+  Linux ELF (`-Ttext-segment=0x40000000` + libgcc), embedded + run by the
+  `musltest` command under `task->linux_abi`.  Prints via real musl `printf`,
+  returns 0, **zero unhandled syscalls** — the compat layer picked up the last
+  startup demands: `set_tid_address` (258) + `ioctl`→ENOTTY (54, isatty).  See
+  `third_party/MUSL.md`.  Next: coreutils → §M35.5 store; native musl-fork peer.
+- **2026-07-11 — M36 stage 2 (cont.): `auxv` on the initial stack — the 2nd
+  musl-startup blocker — DONE, i386.**  `build_initial_stack` (proc.c, shared by
+  all processes) now emits a real auxv: `AT_PAGESZ`=4096, `AT_CLKTCK`=100,
+  `AT_RANDOM`→16 seed bytes, `AT_SECURE`=0 (was just `AT_NULL`).  Native crt0
+  ignores auxv → regression-free.  `linuxtest` now walks the stack like musl's
+  `__init_libc` and verifies `AT_PAGESZ`+`AT_RANDOM` (→ `auxv … OK`).  Both musl
+  startup blockers (TLS + auxv) done; next is `make musl`.  Also: parked the
+  own-libc debate in `NATIVE_LIBC.md`; §M36 stage 2 reframed as the "two
+  brothers" (Linux-ABI peer + native musl-fork peer).  DOCS §4.31.
+- **2026-07-11 — M36 stage 2 (cont.): `set_thread_area` TLS — the #1 musl-startup
+  blocker — DONE, i386.**  The Linux `set_thread_area(struct user_desc*)` is
+  translated onto the §M35 per-CPU `%gs` GDT-TLS mechanism (DOCS §4.31): record
+  the base, pin the thread to its CPU, load the descriptor base, and write the
+  allocated GDT index back into `user_desc.entry_number` so Linux userland's
+  `%gs=(entry_number<<3)|3` reconstructs our selector.  Boot-tested: `linuxtest`
+  now calls `set_thread_area` + reads its TLS word back through `%gs:0` (→ `TLS
+  via %gs:0 OK`).  Remaining musl-startup weld: `auxv` on the initial stack.
 - **2026-07-11 — M36 stage 2: modular Linux i386 syscall-ABI compat layer, i386.**
   The foundation for running an unmodified (vendored, pristine) musl (DOCS §4.31,
   also §M41): a `task->linux_abi` personality + an isolated Linux-i386 syscall

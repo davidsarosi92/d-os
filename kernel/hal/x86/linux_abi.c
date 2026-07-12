@@ -23,6 +23,8 @@
 #include "task.h"
 #include "printf.h"
 #include "hal_api.h"
+#include "gdt.h"          /* gdt_tls_selector — the ring-3 %gs selector */
+#include "percpu.h"       /* this_cpu_id — TLS descriptor is per-CPU     */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -38,16 +40,30 @@ extern uint32_t saved_eip;
 #define LNX_open             5
 #define LNX_close            6
 #define LNX_getpid          20
+#define LNX_ioctl           54
 #define LNX_brk             45
 #define LNX_writev         146
 #define LNX_mmap2          192
 #define LNX_set_thread_area 243
 #define LNX_exit_group     252
+#define LNX_set_tid_address 258
 
 #define LNX_ENOSYS  38
+#define LNX_ENOTTY  25
 
 /* Linux i386 struct iovec (for writev). */
 struct lnx_iovec { void* iov_base; uint32_t iov_len; };
+
+/* Linux i386 `struct user_desc` (arch/x86/include/asm/ldt.h), the argument to
+ * set_thread_area.  We only consume entry_number (write-back) + base_addr; the
+ * segment attributes are fixed by our GDT-TLS descriptor, so limit/flags are
+ * accepted and ignored. */
+struct lnx_user_desc {
+    uint32_t entry_number;   /* -1 on input => "allocate one, write it back" */
+    uint32_t base_addr;      /* the thread's TLS pointer                     */
+    uint32_t limit;
+    uint32_t flags;          /* seg_32bit/contents/… bitfield word           */
+};
 
 /* End a Linux process/excursion: an independent user task exits for good;
  * an excursion teleports back to proc_exec_*'s caller (identical to the native
@@ -100,6 +116,19 @@ void linux_syscall_dispatch(struct int_frame* f) {
             f->eax = (uint32_t)(task_current() ? task_current()->pid : -1);
             return;
 
+        case LNX_set_tid_address:
+            /* musl records the clear-child-tid address for thread cleanup and
+             * uses the return as its initial TID; hand back our pid. */
+            f->eax = (uint32_t)(task_current() ? task_current()->pid : 0);
+            return;
+
+        case LNX_ioctl:
+            /* No TTY ioctls yet.  Returning ENOTTY (not ENOSYS) makes musl's
+             * isatty() correctly report "not a terminal" (→ fully-buffered
+             * stdio) instead of logging an unhandled syscall. */
+            f->eax = (uint32_t)-LNX_ENOTTY;
+            return;
+
         case LNX_mmap2: {
             /* mmap2(addr, len, prot, flags, fd, pgoff).  We support anonymous
              * (fd == -1) mappings; the d-os mmap bump-allocates a user VA. */
@@ -116,11 +145,23 @@ void linux_syscall_dispatch(struct int_frame* f) {
             f->eax = 0;
             return;
 
-        case LNX_set_thread_area:
-            /* TLS: Linux user_desc setup — stubbed for now (the native
-             * SYS_SET_TLS path exists; wiring musl's TLS is a follow-up). */
-            f->eax = (uint32_t)-LNX_ENOSYS;
+        case LNX_set_thread_area: {
+            /* musl's THE startup blocker.  Translate Linux user_desc onto the
+             * §M35 per-CPU %gs GDT-TLS mechanism (identical to the native
+             * SYS_SET_TLS), then hand musl back a GDT *index* it can turn into
+             * a %gs selector: Linux userland loads %gs = (entry_number<<3)|3,
+             * so entry_number = our selector >> 3 round-trips exactly. */
+            struct lnx_user_desc* u = (struct lnx_user_desc*)f->ebx;
+            struct task* t = task_current();
+            if (!u || !t) { f->eax = (uint32_t)-14 /*EFAULT*/; return; }
+            t->tls_base = (uintptr_t)u->base_addr;
+            t->has_tls  = 1;
+            task_set_affinity(t, 1u << this_cpu_id());  /* per-CPU selector */
+            hal_set_tls_base(t->tls_base);
+            u->entry_number = (uint32_t)(gdt_tls_selector() >> 3);
+            f->eax = 0;
             return;
+        }
 
         default:
             kprintf("linux-abi: unhandled syscall %u (returning -ENOSYS)\n", f->eax);
