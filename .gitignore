@@ -67,5 +67,5 @@ disk.img
 third_party/musl/
 # Built static i386 musl (make musl) — a build product, rebuilt on demand
 third_party/musl-i386/
-# musl-linked test ELFs (build products)
-user/muslhello_i386.elf
+# musl-linked ELFs (build products)
+user/*.muslelf

@@ -30,10 +30,15 @@ prebuilt Linux i386 binary, not just musl.
   `-Ttext-segment`), embedded as a blob, run by the `musltest` shell command
   under the Linux personality.  Prints via real musl `printf` (`%d`+`%s`),
   returns 0, **zero unhandled syscalls**.
-- 🔲 **Minimal coreutils** (`sh`/`ls`/`cat`/`echo`/`env`), `pkg install`ed into
-  the §M35.5 store — the next step.
+- ◐ **Minimal coreutils in the store** — `echo` + `cat` DONE (musl-linked via
+  the generic `user/%.muslelf` pattern; add one via `MUSL_COREUTILS` + a recipe):
+  `pkg install`ed into the §M35.5 store, run FROM `/store` by `pkgrun <name>
+  [args]`.  ABI is data-driven — each package declares `.abi` and `pkg_run` maps
+  it to the personality in ONE place (`abi_to_personality`).  Still: `ls`/`env`
+  and a real `sh`.
 - 🔲 **Native musl-fork peer** (`arch/dos/`, d-os syscall numbers) — the twin
-  track (store's default libc); own-libc debate parked in `NATIVE_LIBC.md`.
+  track (store's default libc) + the SECOND ABI backend that validates the
+  `abi_to_personality` seam; own-libc debate parked in `NATIVE_LIBC.md`.
 
 ## Build (inside the build container)
 

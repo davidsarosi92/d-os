@@ -77,11 +77,15 @@ ifeq ($(ARCH),i386)
                      user/tlstest_blob.o user/posixtest_blob.o \
                      user/linuxhello_blob.o
 
-  # A REAL musl-linked hello is embedded ONLY when musl has been built
-  # (`make musl`); otherwise the kernel builds without it.  This keeps the
+  # REAL musl-linked programs are embedded ONLY when musl has been built
+  # (`make musl`); otherwise the kernel builds without them.  This keeps the
   # default build independent of the (fetched, on-demand) musl toolchain.
+  # MUSL_COREUTILS is the modular list — add a coreutil by adding its name here
+  # (+ a user/<name>.c) and a recipe in pkg.c; the build + blob are generic.
+  MUSL_COREUTILS := echo cat
   ifneq ($(wildcard third_party/musl-i386/lib/libc.a),)
-    ARCH_EXTRA_OBJS += user/muslhello_blob.o
+    ARCH_EXTRA_OBJS += user/muslhello_muslblob.o \
+                       $(patsubst %,user/%_muslblob.o,$(MUSL_COREUTILS))
   endif
 
   # Tier B — in-tree user libc build knobs (i386 reference).
@@ -719,23 +723,28 @@ $(OBJ_DIR)/user/linuxhello_blob.o: user/linuxhello_$(ARCH).elf
 	@mkdir -p $(@D)
 	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
-# muslhello — a NORMAL C program linked against REAL, pristine musl (needs
-# `make musl` first; the blob is only wired in when musl-i386/lib/libc.a exists,
-# see the ifneq in the i386 block).  Compiled with musl's headers, statically
-# linked with musl crt1/crti/libc.a/crtn (a stock Linux i386 ELF), run under the
-# Linux personality.  Linked directly with `ld` (no gcc PIE/spec interference).
-user/muslhello_i386.elf: user/muslhello.c $(MUSL_LIBC)
+# NORMAL C programs linked against REAL, pristine musl (need `make musl` first;
+# blobs wired in only when musl-i386/lib/libc.a exists, see the i386 block).
+# Compiled with musl's headers, statically linked with musl crt1/crti/libc.a/
+# crtn into a stock Linux i386 ELF, relocated to the d-os user base via
+# -Ttext-segment (moves the ELF headers too → one contiguous image below the
+# user stack) + libgcc (musl printf pulls in the 64-bit __udivmoddi4 helper).
+# Linked with `ld` directly (no gcc PIE/spec interference).  Generic pattern:
+# any user/<name>.c → user/<name>.muslelf → <name>_muslblob.o (symbol
+# _binary_user_<name>_muslelf_start).  Add coreutils via MUSL_COREUTILS above.
+MUSL_CC_FLAGS := -m32 -static -fno-pie -Os -Wall
+user/%.muslelf: user/%.c $(MUSL_LIBC)
 	@mkdir -p $(OBJ_DIR)/user
-	gcc -m32 -static -fno-pie -Os -c user/muslhello.c \
-	    -I$(MUSL_PREFIX)/include -o $(OBJ_DIR)/user/muslhello.o
+	gcc $(MUSL_CC_FLAGS) -c user/$*.c -I$(MUSL_PREFIX)/include \
+	    -o $(OBJ_DIR)/user/$*.muslo
 	ld -m elf_i386 -static -Ttext-segment=$(USER_BASE) -e _start -o $@ \
 	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
-	    $(OBJ_DIR)/user/muslhello.o \
+	    $(OBJ_DIR)/user/$*.muslo \
 	    --start-group $(MUSL_PREFIX)/lib/libc.a \
 	    `gcc -m32 -print-libgcc-file-name` --end-group \
 	    $(MUSL_PREFIX)/lib/crtn.o
 
-$(OBJ_DIR)/user/muslhello_blob.o: user/muslhello_i386.elf
+$(OBJ_DIR)/user/%_muslblob.o: user/%.muslelf
 	@mkdir -p $(@D)
 	objcopy --input-target=binary --output-target=elf32-i386 \
 	    --binary-architecture=i386 $< $@

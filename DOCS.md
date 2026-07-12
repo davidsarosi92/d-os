@@ -3182,11 +3182,31 @@ the last two musl-startup demands: `set_tid_address` (258 → returns the tid) a
 `ioctl` (54 → `ENOTTY`, so musl's `isatty()` reports "not a terminal").  An
 unmodified, pristine musl binary now runs on d-os.
 
-**Next — see `third_party/MUSL.md`:** a minimal coreutils (`sh`/`ls`/`cat`/
-`echo`/`env`) `pkg install`ed into the §M35.5 store, exec'd from `/store` rather
-than embedded as blobs.  The **native musl-fork peer** (`arch/dos/`, d-os
-syscall numbers — the store's default libc) is the twin track; the own-libc
-question is parked in `NATIVE_LIBC.md`.
+**musl coreutils in the store — DONE (i386).**  `echo` and `cat`
+(`user/echo.c`, `user/cat.c` — ordinary C, musl-linked via the generic
+`user/%.muslelf` Makefile pattern; add one by listing it in `MUSL_COREUTILS`)
+are `pkg install`ed into the §M35.5 content-addressed store and run FROM
+`/store` by the **`pkgrun <name> [args…]`** shell command — not as embedded
+blobs.  `pkgrun echo store coreutils work` → prints the argv; `pkgrun cat
+/etc/pkg/profile` → real musl buffered file I/O (fopen/fread/fclose) prints the
+file.  **The ABI is data-driven (the swappable seam):** each package DECLARES
+its ABI in a `<store>/.abi` file (`pkg_recipe.abi`; "linux" for the musl
+coreutils, "native" for the d-os-libc demos), and `pkg_run` maps that string to
+the exec personality in ONE place (`abi_to_personality`) — call sites never
+hardcode "musl"/"linux", so a second backend (BSD, the native musl-fork) is
+additive.  Growing `linux_abi.c` for the coreutils added: Linux→VFS **open-flag
+translation** (`linux_open_flags` — Linux `O_*` ≠ d-os `VFS_*`; musl opens with
+`O_LARGEFILE|O_CLOEXEC`), `openat`(295, `AT_FDCWD`), `readv`(145), `mprotect`
+(125, no-op), `munmap`(91, no-op), and a **fix to the `mmap2` register decode**
+(len=ecx/fd=edi, was edx/esi → any malloc-driven mmap had failed; latent until a
+program actually `malloc`ed, which `muslhello` never did but `cat`'s `fopen`
+does).
+
+**Next — see `third_party/MUSL.md`:** more coreutils (`ls`/`env`/`sh`); a real
+`sh`; then the **native musl-fork peer** (`arch/dos/`, d-os syscall numbers —
+the store's default libc, the second "brother"), which is also the second ABI
+backend that validates the `abi_to_personality` seam.  Own-libc question parked
+in `NATIVE_LIBC.md`.
 
 ---
 
@@ -3260,6 +3280,16 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-12 — M36/M35.5: musl coreutils run FROM the store, data-driven ABI,
+  i386.**  `echo`+`cat` (musl-linked, generic `user/%.muslelf` pattern) are
+  `pkg install`ed into the content-addressed store and exec'd from `/store` by
+  `pkgrun <name> [args]` (DOCS §4.31).  **Swappable seam:** each package declares
+  its ABI (`pkg_recipe.abi` → `<store>/.abi`); `pkg_run` maps it to the exec
+  personality in ONE place (`abi_to_personality`) — no hardcoded "musl"/"linux".
+  `linux_abi.c` grew: open-flag translation (Linux `O_*`→`VFS_*`), openat/readv/
+  mprotect/munmap, + an `mmap2` register-decode fix (len=ecx/fd=edi — latent
+  until a program malloc'd). Regression-checked musltest/posixtest/forktest/
+  pkgtest green.
 - **2026-07-12 — M36 stage 2: REAL, unmodified musl runs on d-os, i386.**  The
   Linux-ABI peer's goal (DOCS §4.31).  `make musl` builds a static i386 musl
   (`third_party/musl-i386/`; fetch-musl.sh pins v1.2.5); `user/muslhello.c` (an

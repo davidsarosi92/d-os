@@ -178,14 +178,22 @@ musl binary runs on d-os** — `make musl` builds static i386 musl
 (`third_party/musl-i386/`), `user/muslhello.c` (stdio/printf) links against
 musl crt1/libc.a into a stock Linux ELF (`-Ttext-segment=0x40000000` + libgcc),
 run by the **`musltest`** cmd under the personality; prints via real musl
-`printf`, rc=0, ZERO unhandled syscalls.  Startup welds that got it there:
-`set_thread_area` (→§M35 `%gs` GDT-TLS), `auxv` (`AT_PAGESZ/CLKTCK/RANDOM/
-SECURE` in `build_initial_stack`), `set_tid_address`, `ioctl`→ENOTTY.  **Next:
-minimal coreutils (`sh`/`ls`/`cat`/`echo`/`env`) `pkg install`ed into the §M35.5
-store + exec'd from `/store` (not blobs); then the native musl-fork peer.**
-**Checklist in `third_party/MUSL.md`.**  §M35 (threads/futex/TLS/per-CPU TSS)
-COMPLETE (UP+SMP, §4.28); also: §M34 POSIX (§4.27), §M24 sockets (§4.25), §M35.5
-store (§4.29).  **§M26 Wayland deferred until POSIX + libc exist.**
+`printf`, rc=0, ZERO unhandled syscalls.  Startup welds: `set_thread_area`
+(→§M35 `%gs` GDT-TLS), `auxv` (`AT_PAGESZ/CLKTCK/RANDOM/SECURE` in
+`build_initial_stack`), `set_tid_address`, `ioctl`→ENOTTY.  **musl COREUTILS in
+the store — DONE (§4.31):** `echo`+`cat` (generic `user/%.muslelf` pattern) are
+`pkg install`ed into the §M35.5 store + run FROM `/store` by `pkgrun <name>
+[args]` — real argv + musl file I/O.  **The ABI is DATA-DRIVEN (the swappable
+seam the user demanded): a package declares `.abi` (`pkg_recipe.abi`), `pkg_run`
+maps it → personality in ONE place (`abi_to_personality`) — no hardcoded
+"musl"/"linux"** (see memory [[feedback-dos-swappable-layers]] + `NATIVE_LIBC.md`).
+`linux_abi.c` grew open-flag xlat/openat/readv/mprotect/munmap + an `mmap2`
+decode fix.  **Next: more coreutils (`ls`/`env`) + a real `sh`; then the native
+musl-fork peer (`arch/dos/`) — which doubles as the SECOND ABI backend that
+validates the `abi_to_personality` seam.**  **Checklist in `third_party/MUSL.md`.**
+§M35 (threads/futex/TLS/per-CPU TSS) COMPLETE (UP+SMP, §4.28); also: §M34 POSIX
+(§4.27), §M24 sockets (§4.25), §M35.5 store (§4.29).  **§M26 Wayland deferred
+until POSIX + libc exist.**
 
 🔲 **Other options** (was "pick one"; superseded by the decision above):
 

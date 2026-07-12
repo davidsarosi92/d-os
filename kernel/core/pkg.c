@@ -11,6 +11,9 @@
 #include "pkg.h"
 #include "vfs.h"
 #include "printf.h"
+#include "kmalloc.h"
+#include "proc.h"
+#include "task.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -30,6 +33,7 @@ static int streq(const char* a, const char* b) {
     while (*a && *a == *b) { a++; b++; }
     return *a == *b;
 }
+static unsigned strlen_local(const char* s) { unsigned n = 0; while (s && s[n]) n++; return n; }
 
 /* ----------------------- recipe registry ---------------------------------- */
 
@@ -171,6 +175,14 @@ int pkg_build(const char* id) {
     char rp[192]; int rpp = sappend(rp, sizeof rp, 0, path);
     sappend(rp, sizeof rp, rpp, "/.recipe");
     write_file(rp, meta, (unsigned)m);
+
+    /* .abi — the declared ABI/personality (defaults to "native").  The runner
+     * (pkg_run) reads this to pick the exec personality, so the store path is
+     * self-describing and the choice stays data-driven. */
+    const char* abi = r->abi ? r->abi : "native";
+    char ap[192]; int app = sappend(ap, sizeof ap, 0, path);
+    sappend(ap, sizeof ap, app, "/.abi");
+    write_file(ap, abi, (unsigned)strlen_local(abi));
 
     /* .closure (direct dep store dirnames). */
     char clo[1024]; struct cloctx cc = { clo, sizeof clo, 0 }; clo[0] = '\0';
@@ -346,6 +358,72 @@ void pkg_why(const char* id) {
     for (int i = 0; i < rs.n; i++) kprintf("  /store/%s\n", rs.names[i]);
 }
 
+/* ----------------------- run (exec from the store) ------------------------ */
+
+/* THE swappable seam: map a declared ABI name to a kernel personality.  Every
+ * future backend (a BSD personality, a native musl-fork, …) is added HERE and
+ * only here — call sites never hardcode "musl"/"linux".  Returns the value for
+ * task->linux_abi (0 = d-os native ABI, 1 = Linux ABI). */
+static int abi_to_personality(const char* abi) {
+    if (abi && streq(abi, "linux")) return 1;
+    return 0;                                   /* "native"/unknown → d-os ABI */
+}
+
+/* Find an INSTALLED recipe by program name (first match whose store dir is in
+ * the profile).  Returns NULL if not installed. */
+static struct pkg_recipe* find_installed_by_name(const char* name) {
+    for (struct pkg_recipe* r = g_recipes; r; r = r->next) {
+        if (!streq(r->name, name)) continue;
+        char dn[96]; store_dirname_r(r, dn, sizeof dn);
+        if (profile_has(dn)) return r;
+    }
+    return NULL;
+}
+
+#define PKG_MAX_IMAGE  (256 * 1024)             /* generous cap for a static musl ELF */
+
+int pkg_run(int argc, const char* const argv[]) {
+    if (argc < 1 || !argv || !argv[0]) return -1;
+    const char* name = argv[0];
+
+    struct pkg_recipe* r = find_installed_by_name(name);
+    if (!r) { kprintf("pkgrun: '%s' is not installed\n", name); return -1; }
+
+    char dn[96]; store_dirname_r(r, dn, sizeof dn);
+
+    /* <store>/<dn>/bin/<name> — the immutable payload we exec from the store. */
+    char binp[224]; int bp = sappend(binp, sizeof binp, 0, "/store/");
+    bp = sappend(binp, sizeof binp, bp, dn);
+    bp = sappend(binp, sizeof binp, bp, "/bin/");
+    sappend(binp, sizeof binp, bp, name);
+
+    /* <store>/<dn>/.abi → personality (data-driven, self-describing store). */
+    char abip[224]; int ap = sappend(abip, sizeof abip, 0, "/store/");
+    ap = sappend(abip, sizeof abip, ap, dn);
+    sappend(abip, sizeof abip, ap, "/.abi");
+    char abi[32];
+    if (read_file(abip, abi, sizeof abi) < 0) abi[0] = '\0';
+    for (int i = 0; i < (int)sizeof abi && abi[i]; i++)   /* strip trailing newline */
+        if (abi[i] == '\n') { abi[i] = '\0'; break; }
+    int personality = abi_to_personality(abi);
+
+    /* Read the ELF from the store into a kernel buffer. */
+    char* img = (char*)kmalloc(PKG_MAX_IMAGE);
+    if (!img) { kprintf("pkgrun: out of memory\n"); return -1; }
+    int len = read_file(binp, img, PKG_MAX_IMAGE);
+    if (len <= 0) { kprintf("pkgrun: cannot read %s\n", binp); kfree(img); return -1; }
+
+    /* Run it as a synchronous excursion with the declared personality. */
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = personality;
+    int rc = proc_exec_elf_argv(img, (size_t)len, argc, argv);
+    if (me) me->linux_abi = prev;
+
+    kfree(img);
+    return rc;
+}
+
 /* ----------------------- built-in recipes + init -------------------------- */
 
 /* Payload for the demo packages = the embedded user ELFs (weak — present on
@@ -356,25 +434,53 @@ extern const unsigned char _binary_user_hello_i386_elf_end[]   __attribute__((we
 extern const unsigned char _binary_user_args_i386_elf_start[]  __attribute__((weak));
 extern const unsigned char _binary_user_args_i386_elf_end[]    __attribute__((weak));
 
-static struct pkg_recipe rc_hello1, rc_hello2, rc_args;
+/* musl-linked coreutils (Linux personality) — present only when musl was built
+ * (`make musl`); weak so the kernel links without them otherwise. */
+extern const unsigned char _binary_user_echo_muslelf_start[]   __attribute__((weak));
+extern const unsigned char _binary_user_echo_muslelf_end[]     __attribute__((weak));
+extern const unsigned char _binary_user_cat_muslelf_start[]    __attribute__((weak));
+extern const unsigned char _binary_user_cat_muslelf_end[]      __attribute__((weak));
+
+static struct pkg_recipe rc_hello1, rc_hello2, rc_args, rc_echo, rc_cat;
+
+static unsigned blob_len(const unsigned char* s, const unsigned char* e) {
+    return s ? (unsigned)(e - s) : 0;
+}
 
 void pkg_init(void) {
     vfs_mkdir("/store");
     vfs_mkdir("/etc"); vfs_mkdir("/etc/pkg");
 
-    unsigned hlen = _binary_user_hello_i386_elf_start
-        ? (unsigned)(_binary_user_hello_i386_elf_end - _binary_user_hello_i386_elf_start) : 0;
-    unsigned alen = _binary_user_args_i386_elf_start
-        ? (unsigned)(_binary_user_args_i386_elf_end - _binary_user_args_i386_elf_start) : 0;
-
-    rc_hello1 = (struct pkg_recipe){ "hello-1", "hello", "1.0", "",
-        _binary_user_hello_i386_elf_start, hlen, NULL };
-    rc_hello2 = (struct pkg_recipe){ "hello-2", "hello", "2.0", "",
-        _binary_user_hello_i386_elf_start, hlen, NULL };
-    rc_args   = (struct pkg_recipe){ "args", "args", "1.0", "hello-2",
-        _binary_user_args_i386_elf_start, alen, NULL };
-
+    /* Native (d-os libc) demo packages. */
+    rc_hello1 = (struct pkg_recipe){ .id="hello-1", .name="hello", .version="1.0",
+        .deps="", .content=_binary_user_hello_i386_elf_start,
+        .content_len=blob_len(_binary_user_hello_i386_elf_start, _binary_user_hello_i386_elf_end),
+        .abi="native" };
+    rc_hello2 = (struct pkg_recipe){ .id="hello-2", .name="hello", .version="2.0",
+        .deps="", .content=_binary_user_hello_i386_elf_start,
+        .content_len=blob_len(_binary_user_hello_i386_elf_start, _binary_user_hello_i386_elf_end),
+        .abi="native" };
+    rc_args   = (struct pkg_recipe){ .id="args", .name="args", .version="1.0",
+        .deps="hello-2", .content=_binary_user_args_i386_elf_start,
+        .content_len=blob_len(_binary_user_args_i386_elf_start, _binary_user_args_i386_elf_end),
+        .abi="native" };
     pkg_register(&rc_hello1);
     pkg_register(&rc_hello2);
     pkg_register(&rc_args);
+
+    /* musl-linked coreutils (Linux ABI) — registered only when embedded. */
+    if (_binary_user_echo_muslelf_start) {
+        rc_echo = (struct pkg_recipe){ .id="echo", .name="echo", .version="1.0",
+            .deps="", .content=_binary_user_echo_muslelf_start,
+            .content_len=blob_len(_binary_user_echo_muslelf_start, _binary_user_echo_muslelf_end),
+            .abi="linux" };
+        pkg_register(&rc_echo);
+    }
+    if (_binary_user_cat_muslelf_start) {
+        rc_cat = (struct pkg_recipe){ .id="cat", .name="cat", .version="1.0",
+            .deps="", .content=_binary_user_cat_muslelf_start,
+            .content_len=blob_len(_binary_user_cat_muslelf_start, _binary_user_cat_muslelf_end),
+            .abi="linux" };
+        pkg_register(&rc_cat);
+    }
 }

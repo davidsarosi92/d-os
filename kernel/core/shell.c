@@ -1583,23 +1583,49 @@ static void cmd_linuxtest(void) {
 
 /* M36 stage 2 — `musltest`: run a REAL, unmodified musl-linked ELF under the
  * Linux personality.  Embedded only when `make musl` produced the binary. */
-extern const unsigned char _binary_user_muslhello_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_muslhello_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_muslhello_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_muslhello_muslelf_end[]   __attribute__((weak));
 
 static void cmd_musltest(void) {
-    if (!_binary_user_muslhello_i386_elf_start) {
+    if (!_binary_user_muslhello_muslelf_start) {
         console_write("musltest: not embedded — run `make musl` then rebuild\n");
         return;
     }
-    size_t len = (size_t)(_binary_user_muslhello_i386_elf_end -
-                          _binary_user_muslhello_i386_elf_start);
+    size_t len = (size_t)(_binary_user_muslhello_muslelf_end -
+                          _binary_user_muslhello_muslelf_start);
     console_write("musltest: exec'ing a REAL musl binary (Linux personality)...\n");
     struct task* me = task_current();
     int prev = me ? me->linux_abi : 0;
     if (me) me->linux_abi = 1;
-    int rc = proc_exec_elf(_binary_user_muslhello_i386_elf_start, len);
+    int rc = proc_exec_elf(_binary_user_muslhello_muslelf_start, len);
     if (me) me->linux_abi = prev;
     kprintf("musltest: returned rc=%d\n", rc);
+}
+
+/* §M35.5 + §M36 — `pkgrun <name> [args...]`: exec an INSTALLED package's binary
+ * from the /store, with argv.  The package's declared .abi picks the exec
+ * personality (pkg_run), so a musl/Linux coreutil and a native program run the
+ * same way — the ABI is data, not a special case here. */
+static void cmd_pkgrun(const char* line) {
+    static char scratch[256];
+    const char* argv[16];
+    int argc = 0;
+
+    int n = 0;
+    while (line[n] && n < 255) { scratch[n] = line[n]; n++; }
+    scratch[n] = '\0';
+    int i = 0;
+    while (scratch[i] && argc < 16) {
+        while (scratch[i] == ' ') i++;
+        if (!scratch[i]) break;
+        argv[argc++] = &scratch[i];
+        while (scratch[i] && scratch[i] != ' ') i++;
+        if (scratch[i]) scratch[i++] = '\0';
+    }
+    if (argc == 0) { console_write("usage: pkgrun <name> [args...]\n"); return; }
+
+    int rc = pkg_run(argc, (const char* const*)argv);
+    kprintf("pkgrun: '%s' returned rc=%d\n", argv[0], rc);
 }
 
 /* §M35.5 — content-addressed package store. */
@@ -1798,6 +1824,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "pkg"))            { cmd_pkg("");        return; }
     if (starts_with(line, "pkg "))     { cmd_pkg(line + 4);  return; }
     if (streq(line, "pkgtest"))        { cmd_pkgtest();      return; }
+    if (starts_with(line, "pkgrun "))  { cmd_pkgrun(line + 7); return; }
     if (streq(line, "posixtest"))      { cmd_posixtest();    return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }

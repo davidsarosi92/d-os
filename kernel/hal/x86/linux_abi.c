@@ -25,6 +25,7 @@
 #include "hal_api.h"
 #include "gdt.h"          /* gdt_tls_selector — the ring-3 %gs selector */
 #include "percpu.h"       /* this_cpu_id — TLS descriptor is per-CPU     */
+#include "vfs.h"          /* VFS_* open flags — target of the translation */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -42,14 +43,43 @@ extern uint32_t saved_eip;
 #define LNX_getpid          20
 #define LNX_ioctl           54
 #define LNX_brk             45
+#define LNX_munmap          91
+#define LNX_mprotect       125
+#define LNX_readv          145
 #define LNX_writev         146
 #define LNX_mmap2          192
 #define LNX_set_thread_area 243
 #define LNX_exit_group     252
 #define LNX_set_tid_address 258
+#define LNX_openat         295
 
 #define LNX_ENOSYS  38
 #define LNX_ENOTTY  25
+
+/* Linux i386 O_* open flags (asm-generic/fcntl.h).  These do NOT match d-os's
+ * VFS_* bits, so LNX_open/openat must TRANSLATE, not pass raw — musl opens with
+ * O_LARGEFILE|O_CLOEXEC set, which as raw VFS bits would mean create/truncate. */
+#define LO_WRONLY   00000001
+#define LO_RDWR     00000002
+#define LO_CREAT    00000100
+#define LO_TRUNC    00001000
+#define LO_ACCMODE  00000003
+#define LAT_FDCWD   (-100)
+
+/* Map Linux open flags → d-os VFS_* flags (isolated here — the ONE place the
+ * two flag namespaces are reconciled).  O_APPEND/O_LARGEFILE/O_CLOEXEC/… have
+ * no d-os equivalent yet and are simply dropped. */
+static int linux_open_flags(int lf) {
+    int vf;
+    switch (lf & LO_ACCMODE) {
+        case LO_WRONLY: vf = VFS_WRONLY; break;
+        case LO_RDWR:   vf = VFS_RDWR;   break;
+        default:        vf = VFS_RDONLY; break;   /* O_RDONLY == 0 → VFS_RDONLY */
+    }
+    if (lf & LO_CREAT) vf |= VFS_CREATE;
+    if (lf & LO_TRUNC) vf |= VFS_TRUNC;
+    return vf;
+}
 
 /* Linux i386 struct iovec (for writev). */
 struct lnx_iovec { void* iov_base; uint32_t iov_len; };
@@ -105,10 +135,50 @@ void linux_syscall_dispatch(struct int_frame* f) {
             return;
         }
 
-        case LNX_open:
-            /* Linux open(path, flags, mode) — ignore mode; map flags loosely. */
-            f->eax = (uint32_t)sys_open((const char*)f->ebx, (int)f->ecx);
+        case LNX_readv: {
+            /* readv(fd=ebx, iov=ecx, cnt=edx) — musl's buffered fread uses it.
+             * Read each iovec; stop on error or a short read (EOF). */
+            const struct lnx_iovec* iov = (const struct lnx_iovec*)f->ecx;
+            int cnt = (int)f->edx;
+            long total = 0;
+            for (int i = 0; i < cnt && iov; i++) {
+                long r = sys_read((int)f->ebx, iov[i].iov_base, iov[i].iov_len);
+                if (r < 0) { total = (total ? total : r); break; }
+                total += r;
+                if ((uint32_t)r < iov[i].iov_len) break;   /* short read → done */
+            }
+            f->eax = (uint32_t)total;
             return;
+        }
+
+        case LNX_mprotect:
+            /* We don't enforce page protections on the anonymous mappings musl
+             * allocates (mallocng calls mprotect) — accept as a no-op. */
+            f->eax = 0;
+            return;
+
+        case LNX_munmap:
+            /* The d-os user mmap bump-allocates and does not reclaim yet, so
+             * unmap is a no-op (a small leak).  Real reclaim is a follow-up. */
+            f->eax = 0;
+            return;
+
+        case LNX_open:
+            /* open(path=ebx, flags=ecx, mode=edx) — translate flags, ignore mode. */
+            f->eax = (uint32_t)sys_open((const char*)f->ebx,
+                                        linux_open_flags((int)f->ecx));
+            return;
+
+        case LNX_openat: {
+            /* openat(dirfd=ebx, path=ecx, flags=edx, mode=esi).  We support the
+             * AT_FDCWD form (absolute paths / cwd-relative), which is what musl
+             * uses for open(); a real dirfd is a follow-up. */
+            int dirfd = (int)f->ebx;
+            if (dirfd != LAT_FDCWD) { f->eax = (uint32_t)-LNX_ENOSYS; return; }
+            f->eax = (uint32_t)sys_open((const char*)f->ecx,
+                                        linux_open_flags((int)f->edx));
+            return;
+        }
         case LNX_close:
             f->eax = (uint32_t)sys_close((int)f->ebx);
             return;
@@ -130,10 +200,13 @@ void linux_syscall_dispatch(struct int_frame* f) {
             return;
 
         case LNX_mmap2: {
-            /* mmap2(addr, len, prot, flags, fd, pgoff).  We support anonymous
-             * (fd == -1) mappings; the d-os mmap bump-allocates a user VA. */
-            uint32_t len = f->edx;
-            int fd = (int)f->esi;
+            /* i386 mmap2(addr=ebx, len=ecx, prot=edx, flags=esi, fd=edi,
+             * pgoff=ebp).  We support anonymous (fd == -1) mappings — musl's
+             * malloc uses MAP_ANONYMOUS|MAP_PRIVATE, fd=-1 — and the d-os mmap
+             * bump-allocates a user VA.  (Earlier this misread len from edx /
+             * fd from esi — prot/flags — so any malloc-driven mmap failed.) */
+            uint32_t len = f->ecx;
+            int fd = (int)f->edi;
             long r = sys_mmap((size_t)len, fd < 0 ? -1 : fd);
             f->eax = (r <= 0) ? (uint32_t)-12 /*ENOMEM*/ : (uint32_t)r;
             return;

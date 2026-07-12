@@ -39,6 +39,12 @@ struct pkg_recipe {
     const char* deps;
     const void* content;            /* payload written to bin/<name>, or NULL */
     unsigned    content_len;
+    /* The ABI/personality the payload targets ("native" | "linux" | future
+     * "bsd"/…).  Written to <store>/.abi at build; the runner maps it to a
+     * kernel personality at exec — the single swappable seam (see pkg_run).
+     * NULL ⇒ "native".  This keeps the libc/ABI choice DATA-DRIVEN: a package
+     * DECLARES its ABI; the exec path never hardcodes "musl"/"linux". */
+    const char* abi;
     struct pkg_recipe* next;        /* registry link */
 };
 
@@ -55,6 +61,12 @@ int  pkg_build(const char* id);
 
 /* Build then add to the profile ("install" into the visible view). */
 int  pkg_install(const char* id);
+
+/* Execute an INSTALLED package's binary from the store, argv[0] = program
+ * name (resolved to a store path via the profile), passing argc/argv through.
+ * The package's declared ABI (its <store>/.abi) selects the exec personality.
+ * Returns the program's exit code, or negative on failure. */
+int  pkg_run(int argc, const char* const argv[]);
 
 /* Drop from the profile (the store path survives until pkg_gc). */
 int  pkg_remove(const char* id);
