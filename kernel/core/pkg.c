@@ -440,11 +440,24 @@ extern const unsigned char _binary_user_echo_muslelf_start[]   __attribute__((we
 extern const unsigned char _binary_user_echo_muslelf_end[]     __attribute__((weak));
 extern const unsigned char _binary_user_cat_muslelf_start[]    __attribute__((weak));
 extern const unsigned char _binary_user_cat_muslelf_end[]      __attribute__((weak));
+extern const unsigned char _binary_user_ls_muslelf_start[]     __attribute__((weak));
+extern const unsigned char _binary_user_ls_muslelf_end[]       __attribute__((weak));
+extern const unsigned char _binary_user_env_muslelf_start[]    __attribute__((weak));
+extern const unsigned char _binary_user_env_muslelf_end[]      __attribute__((weak));
 
-static struct pkg_recipe rc_hello1, rc_hello2, rc_args, rc_echo, rc_cat;
+static struct pkg_recipe rc_hello1, rc_hello2, rc_args, rc_echo, rc_cat, rc_ls, rc_env;
 
 static unsigned blob_len(const unsigned char* s, const unsigned char* e) {
     return s ? (unsigned)(e - s) : 0;
+}
+
+/* Register one musl coreutil recipe if its blob is embedded (abi="linux"). */
+static void register_coreutil(struct pkg_recipe* rc, const char* name,
+                              const unsigned char* s, const unsigned char* e) {
+    if (!s) return;
+    *rc = (struct pkg_recipe){ .id = name, .name = name, .version = "1.0",
+        .deps = "", .content = s, .content_len = blob_len(s, e), .abi = "linux" };
+    pkg_register(rc);
 }
 
 void pkg_init(void) {
@@ -469,18 +482,8 @@ void pkg_init(void) {
     pkg_register(&rc_args);
 
     /* musl-linked coreutils (Linux ABI) — registered only when embedded. */
-    if (_binary_user_echo_muslelf_start) {
-        rc_echo = (struct pkg_recipe){ .id="echo", .name="echo", .version="1.0",
-            .deps="", .content=_binary_user_echo_muslelf_start,
-            .content_len=blob_len(_binary_user_echo_muslelf_start, _binary_user_echo_muslelf_end),
-            .abi="linux" };
-        pkg_register(&rc_echo);
-    }
-    if (_binary_user_cat_muslelf_start) {
-        rc_cat = (struct pkg_recipe){ .id="cat", .name="cat", .version="1.0",
-            .deps="", .content=_binary_user_cat_muslelf_start,
-            .content_len=blob_len(_binary_user_cat_muslelf_start, _binary_user_cat_muslelf_end),
-            .abi="linux" };
-        pkg_register(&rc_cat);
-    }
+    register_coreutil(&rc_echo, "echo", _binary_user_echo_muslelf_start, _binary_user_echo_muslelf_end);
+    register_coreutil(&rc_cat,  "cat",  _binary_user_cat_muslelf_start,  _binary_user_cat_muslelf_end);
+    register_coreutil(&rc_ls,   "ls",   _binary_user_ls_muslelf_start,   _binary_user_ls_muslelf_end);
+    register_coreutil(&rc_env,  "env",  _binary_user_env_muslelf_start,  _binary_user_env_muslelf_end);
 }

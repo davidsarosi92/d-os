@@ -3182,14 +3182,19 @@ the last two musl-startup demands: `set_tid_address` (258 → returns the tid) a
 `ioctl` (54 → `ENOTTY`, so musl's `isatty()` reports "not a terminal").  An
 unmodified, pristine musl binary now runs on d-os.
 
-**musl coreutils in the store — DONE (i386).**  `echo` and `cat`
-(`user/echo.c`, `user/cat.c` — ordinary C, musl-linked via the generic
-`user/%.muslelf` Makefile pattern; add one by listing it in `MUSL_COREUTILS`)
-are `pkg install`ed into the §M35.5 content-addressed store and run FROM
-`/store` by the **`pkgrun <name> [args…]`** shell command — not as embedded
-blobs.  `pkgrun echo store coreutils work` → prints the argv; `pkgrun cat
-/etc/pkg/profile` → real musl buffered file I/O (fopen/fread/fclose) prints the
-file.  **The ABI is data-driven (the swappable seam):** each package DECLARES
+**musl coreutils in the store — DONE (i386): `echo`, `cat`, `ls`, `env`.**
+Ordinary C programs (`user/echo.c` etc.), musl-linked via the generic
+`user/%.muslelf` Makefile pattern (add one by listing it in `MUSL_COREUTILS` +
+a `register_coreutil` line in pkg.c), `pkg install`ed into the §M35.5
+content-addressed store and run FROM `/store` by the **`pkgrun <name> [args…]`**
+shell command — not embedded blobs.  `pkgrun echo store coreutils work` → prints
+argv; `pkgrun cat /etc/pkg/profile` → real musl buffered file I/O
+(fopen/fread/fclose); `pkgrun ls /store` → readdir via `getdents64` lists the
+store; `pkgrun env` → prints the process environment.  The kernel side that
+grew: `sys_getdents64` (Linux `dirent64` layout, in usyscall.c) + `getdents64`
+(220)/`fcntl64` (221, CLOEXEC no-op) in `linux_abi.c`, and a minimal default
+**environment** on the SysV stack (`build_initial_stack`: `PATH=/store`,
+`HOME=/`, `TERM=d-os` — native crt0 ignores envp, musl exposes it as `environ`).  **The ABI is data-driven (the swappable seam):** each package DECLARES
 its ABI in a `<store>/.abi` file (`pkg_recipe.abi`; "linux" for the musl
 coreutils, "native" for the d-os-libc demos), and `pkg_run` maps that string to
 the exec personality in ONE place (`abi_to_personality`) — call sites never
@@ -3280,6 +3285,11 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-12 — M36: `ls` + `env` musl coreutils, i386.**  `ls` (readdir via a
+  new `sys_getdents64` = Linux `dirent64` layout + `getdents64`/`fcntl64` in
+  linux_abi) and `env` (a minimal default environment — `PATH`/`HOME`/`TERM` —
+  now on the SysV initial stack, `build_initial_stack`).  `pkgrun ls /store` +
+  `pkgrun env` clean (0 unhandled).  DOCS §4.31.
 - **2026-07-12 — M36/M35.5: musl coreutils run FROM the store, data-driven ABI,
   i386.**  `echo`+`cat` (musl-linked, generic `user/%.muslelf` pattern) are
   `pkg install`ed into the content-addressed store and exec'd from `/store` by

@@ -50,6 +50,8 @@ extern uint32_t saved_eip;
 #define LNX_mmap2          192
 #define LNX_set_thread_area 243
 #define LNX_exit_group     252
+#define LNX_getdents64     220
+#define LNX_fcntl64        221
 #define LNX_set_tid_address 258
 #define LNX_openat         295
 
@@ -182,6 +184,11 @@ void linux_syscall_dispatch(struct int_frame* f) {
         case LNX_close:
             f->eax = (uint32_t)sys_close((int)f->ebx);
             return;
+
+        case LNX_getdents64:
+            /* readdir — musl packs the Linux dirent64 layout (sys_getdents64). */
+            f->eax = (uint32_t)sys_getdents64((int)f->ebx, (void*)f->ecx, (size_t)f->edx);
+            return;
         case LNX_getpid:
             f->eax = (uint32_t)(task_current() ? task_current()->pid : -1);
             return;
@@ -197,6 +204,14 @@ void linux_syscall_dispatch(struct int_frame* f) {
              * isatty() correctly report "not a terminal" (→ fully-buffered
              * stdio) instead of logging an unhandled syscall. */
             f->eax = (uint32_t)-LNX_ENOTTY;
+            return;
+
+        case LNX_fcntl64:
+            /* musl's opendir() sets FD_CLOEXEC via fcntl.  We don't track the
+             * CLOEXEC/status flags yet; report success (0) so descriptor setup
+             * proceeds.  F_DUPFD would need real work, but musl's dir/stdio
+             * paths only use the flag-setting/getting commands. */
+            f->eax = 0;
             return;
 
         case LNX_mmap2: {

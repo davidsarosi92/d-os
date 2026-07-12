@@ -97,6 +97,19 @@ static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
         argv_uva[i] = stack_va + koff;
     }
 
+    /* 1a. Copy a minimal default ENVIRONMENT below the args (a real per-exec
+     *     env is a follow-up; this makes getenv()/`env` meaningful).  Native
+     *     crt0 ignores envp; musl reads it. */
+    static const char* const default_env[] = { "PATH=/store", "HOME=/", "TERM=d-os" };
+    const int nenv = (int)(sizeof default_env / sizeof default_env[0]);
+    uintptr_t env_uva[8];
+    for (int i = nenv - 1; i >= 0; i--) {
+        uint32_t l = u_strlen(default_env[i]) + 1;
+        koff -= l;
+        for (uint32_t j = 0; j < l; j++) base[koff + j] = (uint8_t)default_env[i][j];
+        env_uva[i] = stack_va + koff;
+    }
+
     /* 1b. Reserve + fill the 16 AT_RANDOM bytes just below the strings and
      *     record their user VA (kept 4-byte aligned). */
     koff -= 16;
@@ -105,10 +118,10 @@ static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
     uintptr_t at_random_uva = stack_va + koff;
 
     /* 2. Lay out the pointer table below the strings, keeping the final SP
-     *    16-byte aligned.  Slots: argc + argv[argc] + argv-NULL + envp-NULL +
-     *    auxv{ PAGESZ, CLKTCK, RANDOM, SECURE, NULL } = 5 pairs = 10 words. */
+     *    16-byte aligned.  Slots: argc + argv[argc] + argv-NULL + envp[nenv] +
+     *    envp-NULL + auxv{ PAGESZ, CLKTCK, RANDOM, SECURE, NULL } = 5 pairs. */
     uintptr_t slot = sizeof(uintptr_t);
-    uintptr_t nslots = 1 + (uintptr_t)argc + 1 + 1 + (5 * 2);
+    uintptr_t nslots = 1 + (uintptr_t)argc + 1 + (uintptr_t)nenv + 1 + (5 * 2);
     koff -= nslots * slot;
     koff &= ~(uintptr_t)0xF;                          /* 16-byte align the SP  */
 
@@ -117,6 +130,7 @@ static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
     w[k++] = (uintptr_t)argc;
     for (int i = 0; i < argc; i++) w[k++] = argv_uva[i];
     w[k++] = 0;                                       /* argv terminator       */
+    for (int i = 0; i < nenv; i++) w[k++] = env_uva[i];
     w[k++] = 0;                                       /* envp terminator       */
     w[k++] = AT_PAGESZ; w[k++] = PAGE_SIZE;           /* auxv: page size       */
     w[k++] = AT_CLKTCK; w[k++] = 100;                 /* auxv: HZ (100 ticks/s)*/

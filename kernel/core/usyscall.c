@@ -290,6 +290,39 @@ long sys_getdents(int fd, void* buf, size_t cap) {
     return (long)used;
 }
 
+/* Linux getdents64 packing (for the Linux-ABI backend, kernel/hal/x86/
+ * linux_abi.c — musl's readdir uses SYS_getdents64).  Same VFS iteration as
+ * sys_getdents, but emits the Linux `struct linux_dirent64` layout:
+ *   u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[] (NUL-term).
+ * Records are 8-byte aligned; d_type uses the Linux DT_* values. */
+long sys_getdents64(int fd, void* buf, size_t cap) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_VFS || !o->file) return -1;
+    uint8_t* out = (uint8_t*)buf;
+    size_t used = 0;
+    uint64_t ino = 1;
+    struct dirent de;
+    while (vfs_readdir(o->file, &de) > 0) {
+        int nlen = 0; while (de.name[nlen]) nlen++;
+        size_t reclen = 19 + (size_t)nlen + 1;
+        reclen = (reclen + 7) & ~(size_t)7;                 /* 8-byte align */
+        if (used + reclen > cap) break;
+        uint8_t* r = out + used;
+        for (int i = 0; i < 8; i++) r[i]     = (uint8_t)(ino >> (8 * i));       /* d_ino  */
+        uint64_t off = used + reclen;
+        for (int i = 0; i < 8; i++) r[8 + i] = (uint8_t)(off >> (8 * i));       /* d_off  */
+        r[16] = (uint8_t)(reclen & 0xFF);                                        /* d_reclen */
+        r[17] = (uint8_t)(reclen >> 8);
+        r[18] = (de.type == INODE_DIR) ? 4 :                                     /* DT_DIR  */
+                (de.type == INODE_DEVICE) ? 2 : 8;                               /* DT_CHR/DT_REG */
+        for (int i = 0; i < nlen; i++) r[19 + i] = (uint8_t)de.name[i];          /* d_name  */
+        r[19 + nlen] = 0;
+        used += reclen;
+        ino++;
+    }
+    return (long)used;
+}
+
 static void ustr(char* d, const char* s) {
     int i = 0; while (s[i] && i < 64) { d[i] = s[i]; i++; } d[i] = 0;
 }

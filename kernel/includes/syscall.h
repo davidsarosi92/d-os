@@ -141,6 +141,7 @@ struct kstat; struct kutsname; struct ktimespec;
 int  sys_stat(const char* path, struct kstat* out);        /* M36              */
 int  sys_fstat(int fd, struct kstat* out);
 long sys_getdents(int fd, void* buf, size_t cap);
+long sys_getdents64(int fd, void* buf, size_t cap);   /* Linux dirent64 (linux_abi) */
 int  sys_uname(struct kutsname* out);
 int  sys_clock_gettime(int which, struct ktimespec* out);
 int  sys_nanosleep(unsigned ms);
