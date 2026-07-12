@@ -30,6 +30,7 @@
 #include "net.h"
 #include "audio.h"
 #include "pkg.h"
+#include "wayland.h"
 #include "vc.h"
 #include "lock.h"
 #include "keymap.h"
@@ -1827,6 +1828,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "pkg"))            { cmd_pkg("");        return; }
     if (starts_with(line, "pkg "))     { cmd_pkg(line + 4);  return; }
     if (streq(line, "pkgtest"))        { cmd_pkgtest();      return; }
+    if (streq(line, "waytest"))        { wl_selftest();      return; }
     if (starts_with(line, "pkgrun "))  { cmd_pkgrun(line + 7); return; }
     if (streq(line, "posixtest"))      { cmd_posixtest();    return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }

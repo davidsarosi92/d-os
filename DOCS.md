@@ -3255,6 +3255,42 @@ coreutils.
 
 ---
 
+### 4.32 Wayland display server (M26, stage 1 — wire protocol + handshake)
+
+Wayland is a wire protocol spoken over a unix socket; the client and server
+exchange messages `[object_id:u32][ (size<<16)|opcode :u32 ][args…]` (little-
+endian; u32/int/object/new_id are one word, strings are a u32 length + bytes
+padded to 4, fds travel out-of-band via SCM_RIGHTS).  **Stage 1** (i386 today,
+arch-independent) implements the transport + the core objects — **wl_display,
+wl_registry, wl_callback** — enough for the canonical handshake:
+
+- `wl_display.get_registry(new_id)` → the server advertises its **globals** via
+  `wl_registry.global(name, interface, version)` (currently `wl_compositor` v4,
+  `wl_shm` v1, `xdg_wm_base` v2);
+- `wl_display.sync(new_id)` → the server answers `wl_callback.done(serial)` then
+  `wl_display.delete_id`.
+
+It is the **real** Wayland wire format (a real libwayland client would speak the
+same bytes), but there is no libwayland on d-os yet, so `wl_selftest` (shell
+`waytest`) drives a **hand-marshalled client** over a `usock_pair` against the
+server dispatch — the analogue of `user/linuxhello.c` proving the Linux ABI
+before real musl.  Boot-tested: get_registry → 3 globals received, sync →
+`callback.done(serial=0)` + `delete_id(3)`.  Lesson: opcode 0 is ambiguous
+(both `wl_registry.global` and `wl_callback.done`), so a client MUST dispatch by
+the object's *interface*, not the opcode alone.
+
+The whole thing sits on the **M25 substrate** (unix sockets + fd passing + memfd
+shm) and the **M22.7 compositor**, which was deliberately built
+surface-compositor-shaped so `wl_surface` maps onto a `gui_window`'s
+`gfx_surface` 1:1.  `kernel/gui/wayland.c` + `kernel/includes/wayland.h`.
+
+**Next stages:** `wl_registry.bind`; `wl_shm` + `wl_shm_pool` (client memfd
+passed by SCM_RIGHTS) + `wl_buffer`; `wl_surface.attach`/`commit` bridged onto a
+`gui_window` + `gui_damage`; then `xdg_shell` for real top-level windows; then a
+real user-space client (and eventually libwayland-client, §M40).
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -3325,6 +3361,14 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-12 — M26 stage 1: Wayland display server — wire protocol + handshake,
+  i386.**  The real Wayland wire format over a unix socket (`kernel/gui/
+  wayland.c`): wl_display + wl_registry + wl_callback, enough for the canonical
+  handshake — `get_registry` → advertise globals (wl_compositor/wl_shm/
+  xdg_wm_base), `sync` → `wl_callback.done` + `delete_id`.  Shell `waytest`
+  drives a hand-marshalled client over a usock_pair (à la linuxhello); on the
+  M25 socket/shm substrate + the M22.7 surface-compositor.  DOCS §4.32.  Next:
+  wl_shm buffers + wl_surface bridged to a gui_window, then xdg_shell.
 - **2026-07-12 — M36: the two-brothers ABI seam proven with a native backend,
   i386.**  `pkg_run` now prints the selected backend; `pkgrun hello` (in-tree
   d-os libc, `abi=native`) routes to the native syscall path and `pkgrun echo`

@@ -278,6 +278,7 @@ CORE_C_SRCS := \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
     kernel/gui/widget.c \
+    kernel/gui/wayland.c \
     kernel/gui/w_editor.c \
     kernel/gui/clipboard.c \
     kernel/gui/shell_vista.c \
@@ -365,6 +366,7 @@ CORE_C_SRCS := \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
     kernel/gui/widget.c \
+    kernel/gui/wayland.c \
     kernel/gui/w_editor.c \
     kernel/gui/clipboard.c \
     kernel/gui/shell_vista.c \
@@ -421,6 +423,7 @@ CORE_C_SRCS := \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
     kernel/gui/widget.c \
+    kernel/gui/wayland.c \
     kernel/gui/w_editor.c \
     kernel/gui/clipboard.c \
     kernel/gui/shell_vista.c \
