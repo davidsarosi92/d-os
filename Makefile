@@ -448,6 +448,10 @@ CORE_C_SRCS := \
     kernel/drivers/timer/pit.c \
     kernel/drivers/null/null.c \
     kernel/drivers/block/virtio_blk.c \
+    kernel/core/net.c \
+    kernel/core/audio.c \
+    kernel/core/futex.c \
+    kernel/core/pkg.c \
     kernel/drivers/usb/xhci.c \
     kernel/drivers/usb/usb_hid.c \
     kernel/acpi/acpi.c \

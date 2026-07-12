@@ -3361,6 +3361,16 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-13 — x86_64 build parity restored.**  The shared `user/libc.c` +
+  `kernel/core/shell.c` had accreted i386-only dependencies (M34/M35 signal +
+  thread trampolines; M23/M24/M35/M35.5 audio/net/futex/pkg) that broke the
+  x86_64 link.  Fixed by stubbing `__sig_trampoline`/`__thread_exit_tramp` in
+  `crt0_x86_64.s` (features are i386-only, but the symbols must resolve) and
+  adding the portable cores `net.c`/`audio.c`/`futex.c`/`pkg.c` to the x86_64
+  build (the *drivers* stay i386-only → `net_primary`/`audio_primary` return
+  NULL and the shell commands report "no device").  x86_64 boots to the shell
+  and runs `waytest` (the M26 Wayland handshake) — the stage-1 server is
+  arch-independent.  (aarch64 shell has the same latent gap — a follow-up.)
 - **2026-07-12 — M26 stage 1: Wayland display server — wire protocol + handshake,
   i386.**  The real Wayland wire format over a unix socket (`kernel/gui/
   wayland.c`): wl_display + wl_registry + wl_callback, enough for the canonical
