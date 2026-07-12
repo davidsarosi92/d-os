@@ -3234,11 +3234,24 @@ the exit code re-encoded into the Linux wait-status layout), `rt_sigprocmask`
   the parent's page stays COW between forks — but the bug is generic, not
   musl-specific.)  Interactive REPL mode (blocking stdin) is the next `sh` step.
 
+**The two-brothers seam, proven with a native backend.**  `pkg_run` prints the
+backend it selects, and the SAME `pkgrun` over the SAME store now routes to TWO
+real ABI backends by the package's declared `.abi`:
+
+```
+pkgrun: hello  [abi=native → d-os native backend]   # in-tree d-os libc, native syscall.c
+pkgrun: echo   [abi=linux  → linux-abi backend]     # musl, via linux_abi translator
+```
+
+So the minimal "second brother" exists today: the small **in-tree d-os libc**
+(`user/libc.c`) is a native-ABI libc that runs with `linux_abi` bypassed.  A
+*full* native libc — the musl `arch/dos` fork — is deliberately deferred: the
+native ABI is a different *shape* (bare-base `SYS_SET_TLS`, `(len,fd)` mmap,
+`kstat`), so it needs musl `src/` patches, not a clean `arch/` add; low
+functional value, real fork cost.  Parked in `NATIVE_LIBC.md`.
+
 **Next — see `third_party/MUSL.md`:** interactive `sh` (blocking stdin) + more
-coreutils; then the **native musl-fork peer** (`arch/dos/`, d-os syscall numbers
-— the store's default libc, the second "brother"), which is also the second ABI
-backend that validates the `abi_to_personality` seam.  Own-libc question parked
-in `NATIVE_LIBC.md`.
+coreutils.
 
 ---
 
@@ -3312,6 +3325,14 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-12 — M36: the two-brothers ABI seam proven with a native backend,
+  i386.**  `pkg_run` now prints the selected backend; `pkgrun hello` (in-tree
+  d-os libc, `abi=native`) routes to the native syscall path and `pkgrun echo`
+  (musl, `abi=linux`) to the `linux_abi` translator — same store, same pkgrun,
+  two real ABI backends chosen by data (DOCS §4.31).  The minimal "second
+  brother" is the in-tree native libc; the full native musl (`arch/dos` fork) is
+  parked (`NATIVE_LIBC.md`) — it needs musl `src/` shape patches, not just a
+  renumbered `arch/`, so it is a separate project.
 - **2026-07-12 — M36: a real (non-interactive) musl `sh` — the process model,
   i386.**  `user/sh.c` runs `sh -c "cmd; cmd"` via fork()+execvp()+waitpid() — a
   musl process spawning musl coreutils from `/bin` (DOCS §4.31).  linux_abi

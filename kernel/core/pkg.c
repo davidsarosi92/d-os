@@ -429,7 +429,15 @@ int pkg_run(int argc, const char* const argv[]) {
     if (read_file(abip, abi, sizeof abi) < 0) abi[0] = '\0';
     for (int i = 0; i < (int)sizeof abi && abi[i]; i++)   /* strip trailing newline */
         if (abi[i] == '\n') { abi[i] = '\0'; break; }
+    if (!abi[0]) { abi[0] = 'n'; abi[1] = 'a'; abi[2] = 't'; abi[3] = 'i';
+                   abi[4] = 'v'; abi[5] = 'e'; abi[6] = '\0'; }   /* default */
     int personality = abi_to_personality(abi);
+
+    /* Show which ABI backend the seam selected — the "two brothers" made
+     * visible: abi="linux" → the linux_abi translator; abi="native" → the
+     * d-os native syscall path (linux_abi bypassed). */
+    kprintf("pkgrun: %s  [abi=%s → %s backend]\n", name, abi,
+            personality ? "linux-abi" : "d-os native");
 
     /* Read the ELF from the store into a kernel buffer. */
     char* img = (char*)kmalloc(PKG_MAX_IMAGE);

@@ -195,9 +195,15 @@ linux_abi; `pkg install` exposes `/bin/<name>` + `PATH=/bin`).  Forced two
 fixes: **TLS-after-fork** (proc_fork inherits has_tls/tls_base; child %gs=TLS
 selector via g_entry_gs) + a **pre-existing COW double-fork bug** in
 vmm_space_clone (already-COW page misclassified as RO code → fixed by routing
-VMM_COW through the COW branch).  **Next: the native musl-fork peer (`arch/dos/`)
-— the 2nd ABI backend that validates the `abi_to_personality` seam; also
-interactive `sh` (blocking stdin).**  **Checklist in `third_party/MUSL.md`.**
+VMM_COW through the COW branch).  **Two-brothers SEAM PROVEN with a native
+backend:** `pkg_run` logs the backend; `pkgrun hello` (in-tree d-os libc,
+`abi=native`) → native syscall path, `pkgrun echo` (musl, `abi=linux`) →
+linux_abi — same store, two real backends by data.  The minimal 2nd brother =
+the in-tree native libc; the **full native musl (`arch/dos` fork) is PARKED**
+(`NATIVE_LIBC.md`) — it needs musl `src/` shape patches (bare-base SYS_SET_TLS,
+`(len,fd)` mmap, `kstat`), not a clean `arch/` add → a separate project.
+**Next: interactive `sh` (blocking stdin) + more coreutils.**
+**Checklist in `third_party/MUSL.md`.**
 §M35 (threads/futex/TLS/per-CPU TSS) COMPLETE (UP+SMP, §4.28); also: §M34 POSIX
 (§4.27), §M24 sockets (§4.25), §M35.5 store (§4.29).  **§M26 Wayland deferred
 until POSIX + libc exist.**

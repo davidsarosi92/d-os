@@ -6,6 +6,38 @@
 > against a working ecosystem rather than in the abstract. Nothing here is
 > scheduled. It exists so the argument is not lost.
 
+## Update (2026-07-12): the two-brothers SEAM is proven; the full native musl is the parked project
+
+The `abi_to_personality` seam now routes `pkgrun` to **two real ABI backends**
+by the package's declared `.abi`, visibly:
+
+```
+pkgrun: hello  [abi=native → d-os native backend]   # in-tree d-os libc, native syscall.c
+pkgrun: echo   [abi=linux  → linux-abi backend]     # musl, via linux_abi translator
+```
+
+So the *minimal* "second brother" exists today: the small **in-tree d-os libc**
+(`user/libc.c`) IS a native-ABI libc, and it runs through the native syscall
+path with `linux_abi` bypassed. What is PARKED (this doc) is a **full, complete
+libc on the native ABI** — and the concrete shape it would take, a musl
+`arch/dos` fork, has a precisely-identified blocker set:
+
+- **The native d-os ABI is a different SHAPE, not just different numbers.**
+  `SYS_SET_TLS`(29) takes a bare base (not a Linux `user_desc`); `SYS_MMAP`(7)
+  is `(len, fd)` (not the 6-arg Linux `mmap`); `SYS_STAT`(30) fills `kstat`
+  (not Linux `struct stat`).  So a native musl is NOT "pristine musl with a
+  renumbered `bits/syscall.h`" — it needs musl `src/` patches (chiefly
+  `src/thread/i386/__set_thread_area.s` → `SYS_SET_TLS`, plus stat/mmap
+  wrappers), i.e. a genuine fork, not a clean `arch/` addition.
+- That is exactly why it is the "other project": low functional value (it does
+  what the Linux-ABI brother already does, with different numbers) and real
+  fork-maintenance cost.  Its worth is architectural (a 2nd real backend) —
+  already delivered in minimal form by the in-tree libc above.
+
+When the full native libc is pursued, this is the starting point: either
+(a) fork musl with `arch/dos` + the `src/` shape patches, or (b) grow a
+non-musl native libc (newlib/picolibc/own) — see below.
+
 ## The question that produced this doc
 
 "Should d-os have its *own* libc (a 'saját musl') instead of leaning on musl?"
