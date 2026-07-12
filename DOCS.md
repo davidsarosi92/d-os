@@ -3207,9 +3207,36 @@ translation** (`linux_open_flags` — Linux `O_*` ≠ d-os `VFS_*`; musl opens w
 program actually `malloc`ed, which `muslhello` never did but `cat`'s `fopen`
 does).
 
-**Next — see `third_party/MUSL.md`:** more coreutils (`ls`/`env`/`sh`); a real
-`sh`; then the **native musl-fork peer** (`arch/dos/`, d-os syscall numbers —
-the store's default libc, the second "brother"), which is also the second ABI
+**A real (non-interactive) `sh` — DONE (i386): the process model, proven.**
+`user/sh.c` (musl-linked) runs `sh -c "cmd1 args; cmd2 args"`: it splits on `;`,
+tokenises each command, and runs it with the classic **fork() + execvp() +
+waitpid()** dance — a musl process spawning *other* musl processes.  This is the
+proof that d-os hosts a genuine Unix process model, not just single-shot
+programs: `pkgrun sh -c "echo hello from sh; echo second; ls /store"` forks
+three children, each execve's a coreutil from `/bin`, prints in order, rc=0.
+`pkg install` now also exposes each binary at `/bin/<name>` (the "profile view";
+a copy — ramfs has no symlinks yet), and `PATH=/bin` lets musl's `execvp`
+resolve bare names.  What it took in `linux_abi.c`: `fork`(2), `execve`(11),
+`waitpid`(7)/`wait4`(114) (mapped to `proc_fork`/`proc_execve`/`task_wait`, with
+the exit code re-encoded into the Linux wait-status layout), `rt_sigprocmask`
+(175, no-op — musl brackets fork with it).  Two deeper fixes it forced:
+- **TLS after fork.**  `proc_fork` now inherits `has_tls`/`tls_base`, and the
+  child's ring-3 `%gs` is set to the per-CPU TLS selector on resume
+  (`fork_child_bootstrap` → `g_entry_gs` → `enter_user_mode_regs`) — musl
+  touches thread-local state (errno, the pthread self pointer) immediately after
+  fork, so without this the child faulted.
+- **A pre-existing COW double-fork bug** (in `vmm_space_clone`): a page already
+  COW from a prior fork has `RW=0`, so the clone misclassified it as read-only
+  *code* and eager-copied it read-only; a second fork whose parent had not yet
+  resolved the page handed the child a non-COW read-only copy that faulted hard
+  on write.  Fixed by routing `VMM_COW` pages through the COW branch too.  (This
+  bit musl because its `fork` writes the pthread struct only in the *child*, so
+  the parent's page stays COW between forks — but the bug is generic, not
+  musl-specific.)  Interactive REPL mode (blocking stdin) is the next `sh` step.
+
+**Next — see `third_party/MUSL.md`:** interactive `sh` (blocking stdin) + more
+coreutils; then the **native musl-fork peer** (`arch/dos/`, d-os syscall numbers
+— the store's default libc, the second "brother"), which is also the second ABI
 backend that validates the `abi_to_personality` seam.  Own-libc question parked
 in `NATIVE_LIBC.md`.
 
@@ -3285,6 +3312,17 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-12 — M36: a real (non-interactive) musl `sh` — the process model,
+  i386.**  `user/sh.c` runs `sh -c "cmd; cmd"` via fork()+execvp()+waitpid() — a
+  musl process spawning musl coreutils from `/bin` (DOCS §4.31).  linux_abi
+  gained fork(2)/execve(11)/waitpid(7)/wait4(114)/rt_sigprocmask(175); `pkg
+  install` exposes binaries at `/bin/<name>` + `PATH=/bin`.  Two deeper fixes:
+  **TLS-after-fork** (proc_fork inherits has_tls/tls_base; child's %gs = TLS
+  selector via g_entry_gs/enter_user_mode_regs) and a **pre-existing COW
+  double-fork bug** in vmm_space_clone (a page already COW from a prior fork was
+  misclassified as read-only code and eager-copied RO → hard fault on the second
+  fork; fixed by routing VMM_COW pages through the COW branch).  Regression:
+  forktest/forkexec/musltest/threadtest(20000)/tlstest green.
 - **2026-07-12 — M36: `ls` + `env` musl coreutils, i386.**  `ls` (readdir via a
   new `sys_getdents64` = Linux `dirent64` layout + `getdents64`/`fcntl64` in
   linux_abi) and `env` (a minimal default environment — `PATH`/`HOME`/`TERM` —

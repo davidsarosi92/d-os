@@ -35,6 +35,8 @@ static int streq(const char* a, const char* b) {
 }
 static unsigned strlen_local(const char* s) { unsigned n = 0; while (s && s[n]) n++; return n; }
 
+#define PKG_MAX_IMAGE  (256 * 1024)   /* generous cap for a static musl ELF */
+
 /* ----------------------- recipe registry ---------------------------------- */
 
 static struct pkg_recipe* g_recipes = NULL;
@@ -249,12 +251,36 @@ static void profile_remove(const char* dirname) {
 
 /* ----------------------- install / remove --------------------------------- */
 
+/* Expose the installed binary by name under /bin (the "profile view") so it is
+ * runnable via a PATH lookup (a musl `sh`'s execvp).  d-os ramfs has no
+ * symlinks yet, so this copies the payload — the moral equivalent of Nix's
+ * profile symlink; a symlink-based view is a follow-up. */
+static void profile_bin_expose(struct pkg_recipe* r) {
+    char dn[96]; store_dirname_r(r, dn, sizeof dn);
+    char src[224]; int p = sappend(src, sizeof src, 0, "/store/");
+    p = sappend(src, sizeof src, p, dn);
+    p = sappend(src, sizeof src, p, "/bin/");
+    sappend(src, sizeof src, p, r->name);
+
+    char* buf = (char*)kmalloc(PKG_MAX_IMAGE);
+    if (!buf) return;
+    int n = read_file(src, buf, PKG_MAX_IMAGE);
+    if (n > 0) {
+        vfs_mkdir("/bin");
+        char dst[96]; int dp = sappend(dst, sizeof dst, 0, "/bin/");
+        sappend(dst, sizeof dst, dp, r->name);
+        write_file(dst, buf, (unsigned)n);
+    }
+    kfree(buf);
+}
+
 int pkg_install(const char* id) {
     struct pkg_recipe* r = find_recipe(id);
     if (!r) { kprintf("pkg: no recipe '%s'\n", id); return -1; }
     if (pkg_build(id) != 0) return -1;
     char dn[96]; store_dirname_r(r, dn, sizeof dn);
     profile_add(dn);
+    profile_bin_expose(r);                       /* make it runnable by name */
     kprintf("pkg: installed %s (%s)\n", r->name, dn);
     return 0;
 }
@@ -380,8 +406,6 @@ static struct pkg_recipe* find_installed_by_name(const char* name) {
     return NULL;
 }
 
-#define PKG_MAX_IMAGE  (256 * 1024)             /* generous cap for a static musl ELF */
-
 int pkg_run(int argc, const char* const argv[]) {
     if (argc < 1 || !argv || !argv[0]) return -1;
     const char* name = argv[0];
@@ -444,8 +468,10 @@ extern const unsigned char _binary_user_ls_muslelf_start[]     __attribute__((we
 extern const unsigned char _binary_user_ls_muslelf_end[]       __attribute__((weak));
 extern const unsigned char _binary_user_env_muslelf_start[]    __attribute__((weak));
 extern const unsigned char _binary_user_env_muslelf_end[]      __attribute__((weak));
+extern const unsigned char _binary_user_sh_muslelf_start[]     __attribute__((weak));
+extern const unsigned char _binary_user_sh_muslelf_end[]       __attribute__((weak));
 
-static struct pkg_recipe rc_hello1, rc_hello2, rc_args, rc_echo, rc_cat, rc_ls, rc_env;
+static struct pkg_recipe rc_hello1, rc_hello2, rc_args, rc_echo, rc_cat, rc_ls, rc_env, rc_sh;
 
 static unsigned blob_len(const unsigned char* s, const unsigned char* e) {
     return s ? (unsigned)(e - s) : 0;
@@ -486,4 +512,5 @@ void pkg_init(void) {
     register_coreutil(&rc_cat,  "cat",  _binary_user_cat_muslelf_start,  _binary_user_cat_muslelf_end);
     register_coreutil(&rc_ls,   "ls",   _binary_user_ls_muslelf_start,   _binary_user_ls_muslelf_end);
     register_coreutil(&rc_env,  "env",  _binary_user_env_muslelf_start,  _binary_user_env_muslelf_end);
+    register_coreutil(&rc_sh,   "sh",   _binary_user_sh_muslelf_start,   _binary_user_sh_muslelf_end);
 }

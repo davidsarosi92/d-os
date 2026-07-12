@@ -82,7 +82,7 @@ ifeq ($(ARCH),i386)
   # default build independent of the (fetched, on-demand) musl toolchain.
   # MUSL_COREUTILS is the modular list — add a coreutil by adding its name here
   # (+ a user/<name>.c) and a recipe in pkg.c; the build + blob are generic.
-  MUSL_COREUTILS := echo cat ls env
+  MUSL_COREUTILS := echo cat ls env sh
   ifneq ($(wildcard third_party/musl-i386/lib/libc.a),)
     ARCH_EXTRA_OBJS += user/muslhello_muslblob.o \
                        $(patsubst %,user/%_muslblob.o,$(MUSL_COREUTILS))

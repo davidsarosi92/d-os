@@ -26,6 +26,8 @@
 #include "gdt.h"          /* gdt_tls_selector — the ring-3 %gs selector */
 #include "percpu.h"       /* this_cpu_id — TLS descriptor is per-CPU     */
 #include "vfs.h"          /* VFS_* open flags — target of the translation */
+#include "proc.h"         /* proc_fork / proc_execve                      */
+#include "usermode.h"     /* struct user_regs (fork)                      */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -36,10 +38,14 @@ extern uint32_t saved_eip;
 /* Linux i386 syscall numbers we understand (grows toward the musl-required
  * set).  Anything else returns -ENOSYS and is logged once. */
 #define LNX_exit             1
+#define LNX_fork             2
 #define LNX_read             3
 #define LNX_write            4
 #define LNX_open             5
 #define LNX_close            6
+#define LNX_waitpid          7
+#define LNX_execve          11
+#define LNX_wait4          114
 #define LNX_getpid          20
 #define LNX_ioctl           54
 #define LNX_brk             45
@@ -47,6 +53,7 @@ extern uint32_t saved_eip;
 #define LNX_mprotect       125
 #define LNX_readv          145
 #define LNX_writev         146
+#define LNX_rt_sigprocmask 175
 #define LNX_mmap2          192
 #define LNX_set_thread_area 243
 #define LNX_exit_group     252
@@ -159,6 +166,14 @@ void linux_syscall_dispatch(struct int_frame* f) {
             f->eax = 0;
             return;
 
+        case LNX_rt_sigprocmask:
+            /* musl brackets fork() (and other paths) with signal-mask changes.
+             * We don't implement a per-task blocked-signal mask yet; report
+             * success so those paths proceed (signals themselves are best-effort
+             * here anyway). */
+            f->eax = 0;
+            return;
+
         case LNX_munmap:
             /* The d-os user mmap bump-allocates and does not reclaim yet, so
              * unmap is a no-op (a small leak).  Real reclaim is a follow-up. */
@@ -192,6 +207,39 @@ void linux_syscall_dispatch(struct int_frame* f) {
         case LNX_getpid:
             f->eax = (uint32_t)(task_current() ? task_current()->pid : -1);
             return;
+
+        case LNX_fork: {
+            /* Same as the native SYS_FORK: snapshot the user frame (child gets
+             * eax=0) and clone.  proc_fork copies task->linux_abi to the child,
+             * so a musl shell's children are serviced here too. */
+            struct user_regs r;
+            r.eax = 0;
+            r.ebx = f->ebx; r.ecx = f->ecx; r.edx = f->edx;
+            r.esi = f->esi; r.edi = f->edi; r.ebp = f->ebp;
+            r.eip = f->eip; r.eflags = f->eflags; r.user_sp = f->user_esp;
+            f->eax = (uint32_t)proc_fork(&r);
+            return;
+        }
+
+        case LNX_execve:
+            /* execve(path=ebx, argv=ecx, envp=edx) — envp ignored for now (the
+             * child keeps the default env).  Replaces the image; on failure the
+             * old image continues. */
+            f->eax = (uint32_t)proc_execve((const char*)f->ebx, (char* const*)f->ecx);
+            return;
+
+        case LNX_waitpid:
+        case LNX_wait4: {
+            /* waitpid(pid=ebx, status=ecx, options=edx[, rusage=esi]).  d-os
+             * task_wait returns the raw exit code; re-encode it into the Linux
+             * wait-status layout (WIFEXITED: code in bits 8..15) so musl's
+             * WEXITSTATUS() reads it correctly. */
+            int code = 0;
+            int pid = task_wait((int)f->ebx, &code);
+            if (f->ecx) *(int*)f->ecx = (code & 0xFF) << 8;
+            f->eax = (uint32_t)pid;
+            return;
+        }
 
         case LNX_set_tid_address:
             /* musl records the clear-child-tid address for thread cleanup and

@@ -40,6 +40,8 @@ section .data
 align 4
 saved_esp: dd 0
 saved_eip: dd 0
+global g_entry_gs
+g_entry_gs: dw 0x23                              ; ring-3 %gs for enter_user_mode_regs
 
 section .text
 
@@ -132,7 +134,9 @@ enter_user_mode_regs:
     mov ds, cx
     mov es, cx
     mov fs, cx
-    mov gs, cx
+    mov gs, [g_entry_gs]                         ; %gs = TLS selector for a musl
+                                                ; fork child (set by fork.c),
+                                                ; else 0x23
 
     push 0x23                                   ; SS3
     push dword [eax + 36]                       ; ESP3 = r->user_sp

@@ -100,7 +100,7 @@ static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
     /* 1a. Copy a minimal default ENVIRONMENT below the args (a real per-exec
      *     env is a follow-up; this makes getenv()/`env` meaningful).  Native
      *     crt0 ignores envp; musl reads it. */
-    static const char* const default_env[] = { "PATH=/store", "HOME=/", "TERM=d-os" };
+    static const char* const default_env[] = { "PATH=/bin", "HOME=/", "TERM=d-os" };
     const int nenv = (int)(sizeof default_env / sizeof default_env[0]);
     uintptr_t env_uva[8];
     for (int i = nenv - 1; i >= 0; i--) {

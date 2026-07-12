@@ -26,8 +26,17 @@
 #include "kmalloc.h"
 #include "hal_api.h"
 #include "syscall.h"
+#include "gdt.h"          /* gdt_tls_selector — child's ring-3 %gs */
+#include "percpu.h"       /* this_cpu_id                          */
 #include <stdint.h>
 #include <stddef.h>
+
+/* The ring-3 %gs selector enter_user_mode_regs loads (usermode.s).  Default is
+ * the plain user-data selector (0x23); fork_child_bootstrap raises it to the
+ * per-CPU TLS selector when the child has TLS, so musl's post-fork thread-local
+ * accesses resolve.  (Global → UP-correct; SMP concurrent forks want this
+ * per-CPU / passed-in — a follow-up.) */
+extern uint16_t g_entry_gs;
 
 /* Handed to the child task's bootstrap (heap-allocated, freed by the child). */
 struct fork_boot {
@@ -56,6 +65,17 @@ static void fork_child_bootstrap(void) {
     vmm_space_switch(space);
     if (me->kstack_base)
         hal_set_kernel_stack((uintptr_t)me->kstack_base + TASK_KSTACK_SZ);
+
+    /* Re-establish TLS for the child: pin to this CPU (its %gs selector is
+     * per-CPU), load this CPU's TLS descriptor base, and tell the resume path
+     * to enter ring 3 with the TLS selector rather than plain user data. */
+    if (me->has_tls) {
+        task_set_affinity(me, 1u << this_cpu_id());
+        hal_set_tls_base(me->tls_base);
+        g_entry_gs = gdt_tls_selector();
+    } else {
+        g_entry_gs = 0x23;
+    }
 
     enter_user_mode_regs(&regs);            /* → ring 3 at the fork point; no return */
 }
@@ -87,6 +107,17 @@ int proc_fork(struct user_regs* parent_regs) {
     /* Inherit the parent's signal dispositions (POSIX: fork keeps handlers). */
     for (int i = 0; i < NSIG; i++) child->sig_handler[i] = parent->sig_handler[i];
     child->sig_restorer = parent->sig_restorer;
+
+    /* Inherit the ABI personality: a fork()ing Linux/musl process (a shell)
+     * must produce Linux-personality children so its execve'd programs are
+     * serviced by linux_abi.c too. */
+    child->linux_abi = parent->linux_abi;
+
+    /* Inherit TLS: musl touches thread-local state (errno, the pthread self
+     * pointer) immediately after fork, so the child needs the same %gs base.
+     * The child's %gs selector is (re)established in fork_child_bootstrap. */
+    child->has_tls  = parent->has_tls;
+    child->tls_base = parent->tls_base;
 
     /* Claim the reap so the M27 universal reaper (init) keeps its hands off:
      * the child becomes a POSIX zombie held for the parent's waitpid()

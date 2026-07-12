@@ -1618,8 +1618,11 @@ static void cmd_pkgrun(const char* line) {
     while (scratch[i] && argc < 16) {
         while (scratch[i] == ' ') i++;
         if (!scratch[i]) break;
+        char q = 0;
+        if (scratch[i] == '"' || scratch[i] == '\'') { q = scratch[i]; i++; }
         argv[argc++] = &scratch[i];
-        while (scratch[i] && scratch[i] != ' ') i++;
+        if (q) { while (scratch[i] && scratch[i] != q) i++; }   /* quoted arg */
+        else   { while (scratch[i] && scratch[i] != ' ') i++; }
         if (scratch[i]) scratch[i++] = '\0';
     }
     if (argc == 0) { console_write("usage: pkgrun <name> [args...]\n"); return; }

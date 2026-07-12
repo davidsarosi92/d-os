@@ -297,9 +297,13 @@ void isr_handler(struct int_frame* f) {
         }
         /* CPU exception.  Without a working fault recovery path, the only
          * safe move is to dump what we know and halt forever. */
-        kprintf("\n!! EXCEPTION %d (%s) at cs:eip=%x:%p err=%x\n",
-                f->int_no, exception_name[f->int_no],
-                f->cs, (void*)f->eip, f->err_code);
+        {
+            uint32_t _cr2 = 0;
+            if (f->int_no == 14) __asm__ volatile ("mov %%cr2, %0" : "=r"(_cr2));
+            kprintf("\n!! EXCEPTION %d (%s) at cs:eip=%x:%p err=%x cr2=%p\n",
+                    f->int_no, exception_name[f->int_no],
+                    f->cs, (void*)f->eip, f->err_code, (void*)_cr2);
+        }
         for (;;) __asm__ volatile ("cli; hlt");
     }
 

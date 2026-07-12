@@ -376,8 +376,14 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
                 if (map_in_pd(child->pd, virt, frame, fl) != 0) {
                     vmm_space_destroy(child); return NULL;
                 }
-            } else if (pte & PTE_RW) {
-                /* Writable → COW: share the frame read-only in both spaces. */
+            } else if ((pte & PTE_RW) || (pte & VMM_COW)) {
+                /* Writable → COW.  This MUST also catch a page that is already
+                 * COW from a PRIOR fork (RW=0 but VMM_COW set): such a page is
+                 * logically writable-shared, not read-only code, so it must be
+                 * re-shared COW (ref bumped), never eager-copied as RO — else a
+                 * second fork whose parent hasn't yet resolved the page would
+                 * hand the child a read-only copy that faults hard on write.
+                 * Share the frame read-only in both spaces. */
                 uint16_t* rc = cow_slot(frame);
                 if (rc) { *rc = (*rc == 0) ? 2 : (uint16_t)(*rc + 1); }
                 map_in_pd(parent->pd, virt, frame, VMM_USER | VMM_COW);  /* parent RO+COW */

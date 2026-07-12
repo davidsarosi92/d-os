@@ -188,9 +188,16 @@ seam the user demanded): a package declares `.abi` (`pkg_recipe.abi`), `pkg_run`
 maps it → personality in ONE place (`abi_to_personality`) — no hardcoded
 "musl"/"linux"** (see memory [[feedback-dos-swappable-layers]] + `NATIVE_LIBC.md`).
 `linux_abi.c` grew open-flag xlat/openat/readv/mprotect/munmap + an `mmap2`
-decode fix.  **Next: more coreutils (`ls`/`env`) + a real `sh`; then the native
-musl-fork peer (`arch/dos/`) — which doubles as the SECOND ABI backend that
-validates the `abi_to_personality` seam.**  **Checklist in `third_party/MUSL.md`.**
+decode fix.  **Coreutils `echo`/`cat`/`ls`/`env` + a real (non-interactive)
+`sh` DONE:** `pkgrun sh -c "echo a; echo b; ls /store"` forks 3 children, each
+execve's a coreutil from `/bin` (fork/execve/waitpid/rt_sigprocmask in
+linux_abi; `pkg install` exposes `/bin/<name>` + `PATH=/bin`).  Forced two
+fixes: **TLS-after-fork** (proc_fork inherits has_tls/tls_base; child %gs=TLS
+selector via g_entry_gs) + a **pre-existing COW double-fork bug** in
+vmm_space_clone (already-COW page misclassified as RO code → fixed by routing
+VMM_COW through the COW branch).  **Next: the native musl-fork peer (`arch/dos/`)
+— the 2nd ABI backend that validates the `abi_to_personality` seam; also
+interactive `sh` (blocking stdin).**  **Checklist in `third_party/MUSL.md`.**
 §M35 (threads/futex/TLS/per-CPU TSS) COMPLETE (UP+SMP, §4.28); also: §M34 POSIX
 (§4.27), §M24 sockets (§4.25), §M35.5 store (§4.29).  **§M26 Wayland deferred
 until POSIX + libc exist.**
