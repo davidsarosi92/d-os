@@ -3315,10 +3315,19 @@ server sends the initial **configure** pair (`xdg_toplevel.configure(w,h,states)
 `ack_configure(serial)`s.  Boot-tested via `waytest`: configure round-trip +
 `set_title("d-os window")` + ack, end to end.
 
-**Next stages:** `gfx_blit` the committed buffer into a real `gui_window` +
-`gui_damage` (the *visible* window — needs GUI mode); input
-(`wl_seat`/`wl_keyboard`/`wl_pointer` off the M22.7 input router); a real
-user-space client (and eventually libwayland-client, §M40).
+**The compositor bridge — a wl_surface's pixels reach the screen — DONE.**  A
+`wl_conn` may carry a `target` `gfx_surface` (+ a blit origin); when set,
+`wl_surface.commit` paints the committed buffer's pixels straight onto it.
+Shell `waydemo` wires the target to the **live framebuffer** (`gfx_fb_surface`)
+and commits a 32×32 gradient `wl_shm` buffer at (200,150); the framebuffer
+readback confirms `fb[200,150]` == the buffer's top-left (`VISIBLE OK`) — the
+full path client shm buffer → SCM_RIGHTS → server read → composite → **on-screen
+pixels** works, and is arch-independent (i386 + x86_64).
+
+**Next stages:** paint into a proper WM-managed `gui_window` (chrome + move/
+resize — run the server as a compositor-hosted task, `target` = the window's
+content surface); input (`wl_seat`/`wl_keyboard`/`wl_pointer` off the M22.7 input
+router); a real user-space client (and eventually libwayland-client, §M40).
 
 ---
 
@@ -3392,6 +3401,14 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-13 — M26: Wayland compositor bridge — a wl_surface reaches the
+  screen, i386+x86_64.**  `wl_conn.target` (a `gfx_surface` + blit origin); when
+  set, `wl_surface.commit` paints the committed buffer's pixels onto it (DOCS
+  §4.32).  Shell `waydemo` targets the **live framebuffer** and commits a 32×32
+  gradient `wl_shm` buffer at (200,150); the framebuffer readback confirms the
+  pixels landed (`VISIBLE OK`).  The full path — client shm buffer → SCM_RIGHTS
+  → server read → composite → on-screen pixel — works.  Next: a WM-managed
+  `gui_window` target + `wl_seat` input.
 - **2026-07-13 — M36: interactive `sh` (cooked stdin), i386.**  `sh` with no `-c`
   runs a REPL (prompt → fork/exec → repeat → `exit`).  `sys_read(fd 0)` now reads
   a cooked line from the focused vc (`vc_focused`/`vc_getchar`, echo + backspace)

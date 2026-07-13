@@ -30,6 +30,7 @@
 
 struct usock;
 struct shm;
+struct gfx_surface;
 
 /* The fixed object-id of wl_display (the protocol root). */
 #define WL_DISPLAY_ID  1u
@@ -53,6 +54,12 @@ struct wl_conn {
     /* Stage 3 — xdg_shell top-level role. */
     uint32_t      xdg_surface_id;       /* xdg_surface wrapping the wl_surface  */
     uint32_t      xdg_toplevel_id;      /* xdg_toplevel role                    */
+
+    /* Compositor bridge: when set, wl_surface.commit blits the buffer's pixels
+     * into `target` at (blit_x, blit_y) — the surface's contents become visible
+     * pixels.  NULL = headless (commit only reads/logs the buffer). */
+    struct gfx_surface* target;
+    int           blit_x, blit_y;
 };
 
 /* Initialise a connection over `sock` (registers wl_display as object 1). */
@@ -66,5 +73,10 @@ int  wl_conn_dispatch(struct wl_conn* c);
 /* Self-test entry (shell `waytest`): drive a client handshake over a
  * usock_pair against wl_conn_dispatch and log the exchange. */
 void wl_selftest(void);
+
+/* Visible demo (shell `waydemo`): a client commits a colour buffer to a
+ * surface whose server side is bridged to the framebuffer, so the pixels land
+ * on screen; then reads a framebuffer pixel back as proof. */
+void wl_visible_demo(void);
 
 #endif /* WAYLAND_H */

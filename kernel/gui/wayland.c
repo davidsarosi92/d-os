@@ -19,6 +19,7 @@
 
 #include "wayland.h"
 #include "fd.h"          /* usock_pair/send/recv/close/can_read */
+#include "gfx.h"         /* gfx_surface / gfx_fb_surface — the compositor bridge */
 #include "printf.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -173,6 +174,8 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock) {
     c->surface_id = c->buffer_id = 0;
     c->buf_off = c->buf_w = c->buf_h = c->buf_stride = 0;
     c->xdg_surface_id = c->xdg_toplevel_id = 0;
+    c->target = NULL;
+    c->blit_x = c->blit_y = 0;
 }
 
 /* wl_surface.commit — the moment the client's frame becomes current.  Read the
@@ -183,6 +186,7 @@ static void wl_surface_commit(struct wl_conn* c) {
     struct shm* s = c->pool_shm;
     if (!s || !c->buf_w || !c->buf_h) { kprintf("wayland: commit with no buffer\n"); return; }
 
+    struct gfx_surface* t = c->target;      /* NULL = headless (read/log only) */
     uint32_t topleft = 0, sum = 0;
     for (uint32_t y = 0; y < c->buf_h; y++) {
         for (uint32_t x = 0; x < c->buf_w; x++) {
@@ -192,10 +196,18 @@ static void wl_surface_commit(struct wl_conn* c) {
             uint32_t px = *(volatile uint32_t*)(uintptr_t)(s->frames[fi] + fo);
             if (x == 0 && y == 0) topleft = px;
             sum += px;
+            /* Bridge: paint the client's pixel onto the target (framebuffer /
+             * a gui_window surface) — the surface becomes visible. */
+            if (t) {
+                int dx = c->blit_x + (int)x, dy = c->blit_y + (int)y;
+                if (dx >= 0 && dx < t->w && dy >= 0 && dy < t->h)
+                    t->px[dy * t->stride + dx] = px;
+            }
         }
     }
-    kprintf("wayland: COMMIT surface %u: %ux%u buffer, top-left=%x checksum=%x\n",
-            c->surface_id, c->buf_w, c->buf_h, topleft, sum);
+    kprintf("wayland: COMMIT surface %u: %ux%u buffer, top-left=%x checksum=%x%s\n",
+            c->surface_id, c->buf_w, c->buf_h, topleft, sum,
+            t ? " (blitted to screen)" : "");
     send_buffer_release(c, c->buffer_id);
 }
 
@@ -502,6 +514,64 @@ void wl_selftest(void) {
       client_msg(cli, WLC_XDG_SURFACE, XDG_SURFACE_REQ_ACK_CONFIGURE, a, 1, NULL); }
     wl_conn_dispatch(&conn);
     kprintf("waytest: xdg top-level configured, titled + acked\n");
+
+    usock_close(cli);
+    usock_close(srv);
+}
+
+/* ---- visible demo: a wl_shm buffer painted onto the framebuffer ----------- */
+
+void wl_visible_demo(void) {
+    struct gfx_surface fb;
+    if (gfx_fb_surface(&fb) != 0) { kprintf("waydemo: no framebuffer (text mode?)\n"); return; }
+
+    const uint32_t W = 32, H = 32, STRIDE = W * 4;
+    const int BX = 200, BY = 150;                /* where on screen to paint */
+
+    struct shm* buf = shm_create((size_t)STRIDE * H);
+    if (!buf) { kprintf("waydemo: shm alloc failed\n"); return; }
+    volatile uint32_t* px = (volatile uint32_t*)(uintptr_t)buf->frames[0];
+    for (uint32_t y = 0; y < H; y++)             /* a little gradient */
+        for (uint32_t x = 0; x < W; x++)
+            px[y * W + x] = 0xFF000000u | ((x * 8u) << 16) | ((y * 8u) << 8) | 0x40u;
+    uint32_t topleft = px[0];
+    struct ofile* buf_of = ofile_from_shm(buf);
+
+    struct usock *cli, *srv;
+    if (usock_pair(&cli, &srv) != 0) { kprintf("waydemo: usock_pair failed\n"); return; }
+    struct wl_conn conn;
+    wl_conn_init(&conn, srv);
+    conn.target = &fb; conn.blit_x = BX; conn.blit_y = BY;   /* bridge to the FB */
+
+    kprintf("waydemo: committing a %ux%u wl_shm buffer to the framebuffer at (%d,%d)\n",
+            W, H, BX, BY);
+    client_send1(cli, WL_DISPLAY_REQ_GET_REGISTRY, WLC_REGISTRY);   /* registry first */
+    wl_conn_dispatch(&conn);
+    client_drain(cli);
+    client_bind(cli, 1, "wl_compositor", 4, WLC_COMPOSITOR);
+    client_bind(cli, 2, "wl_shm",        1, WLC_SHM);
+    wl_conn_dispatch(&conn); wl_conn_dispatch(&conn); client_drain(cli);
+
+    { uint32_t a[] = { WLC_SURFACE };
+      client_msg(cli, WLC_COMPOSITOR, WL_COMPOSITOR_REQ_CREATE_SURFACE, a, 1, NULL); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_POOL, STRIDE * H };
+      client_msg(cli, WLC_SHM, WL_SHM_REQ_CREATE_POOL, a, 2, buf_of); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_BUFFER, 0, W, H, STRIDE, WL_SHM_FORMAT_ARGB8888 };
+      client_msg(cli, WLC_POOL, WL_SHM_POOL_REQ_CREATE_BUFFER, a, 6, NULL); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_BUFFER, 0, 0 };
+      client_msg(cli, WLC_SURFACE, WL_SURFACE_REQ_ATTACH, a, 3, NULL); }
+    wl_conn_dispatch(&conn);
+    client_msg(cli, WLC_SURFACE, WL_SURFACE_REQ_COMMIT, NULL, 0, NULL);
+    wl_conn_dispatch(&conn);                      /* commit → blit onto the FB */
+
+    /* Read the framebuffer back at the paint origin as proof the client's
+     * pixels reached the screen. */
+    uint32_t got = fb.px[BY * fb.stride + BX];
+    kprintf("waydemo: framebuffer[%d,%d]=%x (buffer top-left=%x) -> %s\n",
+            BX, BY, got, topleft, got == topleft ? "VISIBLE OK" : "MISMATCH");
 
     usock_close(cli);
     usock_close(srv);

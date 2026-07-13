@@ -213,10 +213,14 @@ create_buffer + attach + commit → the server reads the client's pixels back
 → ack_configure).**  Also this session: **interactive `sh`** (cooked stdin via
 `vc_focused`/`vc_getchar` — `pkgrun sh` → `d-os$` REPL) and **x86_64 build parity
 restored** (trampoline stubs + net/audio/futex/pkg cores; Wayland runs on x86_64
-too).  **Next Wayland: `gfx_blit` the committed buffer into a real `gui_window`
-(the VISIBLE window) — needs GUI-mode boot + framebuffer-capture testing, a
-focused follow-up — then `wl_seat` input.**  Also open: more coreutils, tty
-line-editing/`isatty`.
+too).  **Compositor bridge DONE (`waydemo`): a `wl_conn.target` gfx_surface + blit
+origin; `wl_surface.commit` paints the buffer's pixels onto it → `waydemo` blits
+a committed 32×32 `wl_shm` buffer to the LIVE framebuffer, FB readback confirms
+`VISIBLE OK`.  So the full path — client shm buffer → SCM_RIGHTS → server read →
+composite → on-screen pixel — works (i386+x86_64).  Next Wayland: a WM-managed
+`gui_window` target (chrome/move; run the server as a compositor-hosted task) +
+`wl_seat` input + a real user-space client (§M40 libwayland).**  Also open: more
+coreutils, tty line-editing/`isatty`.
 §M35 (threads/futex/TLS/per-CPU TSS) COMPLETE (UP+SMP, §4.28); also: §M34 POSIX
 (§4.27), §M24 sockets (§4.25), §M35.5 store (§4.29).  **§M26 Wayland deferred
 until POSIX + libc exist.**
