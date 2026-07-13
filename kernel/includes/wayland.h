@@ -29,6 +29,7 @@
 #include <stddef.h>
 
 struct usock;
+struct shm;
 
 /* The fixed object-id of wl_display (the protocol root). */
 #define WL_DISPLAY_ID  1u
@@ -40,6 +41,14 @@ struct wl_conn {
     uint8_t       obj_iface[WL_MAX_OBJECTS];  /* object id → WLI_* (0 = unused) */
     uint32_t      registry_id;          /* client's wl_registry object (0 = none) */
     uint32_t      serial;               /* monotonically increasing event tag  */
+
+    /* Stage 2 — a single-surface buffer path (multi-surface is a follow-up):
+     * the client's wl_shm_pool frames + the geometry of the wl_buffer it
+     * attaches to its wl_surface, so `commit` can read the pixels. */
+    struct shm*   pool_shm;             /* wl_shm_pool's shared frames         */
+    uint32_t      surface_id;           /* the wl_surface object               */
+    uint32_t      buffer_id;            /* the wl_buffer object                */
+    uint32_t      buf_off, buf_w, buf_h, buf_stride;   /* wl_buffer geometry   */
 };
 
 /* Initialise a connection over `sock` (registers wl_display as object 1). */

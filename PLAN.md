@@ -54,7 +54,7 @@
 | §M23 | Audio subsystem — ✅ stage 1 (i386): AC97 PCM output + tone (DOCS §4.26) | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) — ✅ stages 1–3 (i386): virtio-net + ARP/IPv4/ICMP/UDP/TCP + DNS + ping/wget (DOCS §4.25) | ~1080 |
 | §M25 | Userland foundation (Wayland prerequisites) — ✅ stages 1–7 + Tier B tail (concurrent user processes + full-arch libc; DOCS §4.24) | ~1545 |
-| §M26 | Wayland server (wire protocol on M22 + M25) — ◐ stage 1 (i386): wire protocol + wl_display/wl_registry/wl_callback handshake (`waytest`, DOCS §4.32); wl_shm/wl_surface bridge + xdg_shell TODO | ~1615 |
+| §M26 | Wayland server (wire protocol on M22 + M25) — ◐ stage 1+2 (i386+x86_64): wire protocol + handshake, AND the shm buffer path (bind/wl_shm/create_pool via SCM_RIGHTS fd-passing/create_buffer/attach/commit → server reads the pixels) (`waytest`, DOCS §4.32); visible gui_window blit + xdg_shell TODO | ~1615 |
 | §M27 | Process model — init, hierarchy, reaper, kill-tree — ✅ shipped | ~1818 |
 | §M28 | System log (klog ring buffer + dmesg) — ✅ shipped | ~1860 |
 | Tier A | Blocking primitives — wait-queue + task_wait + blocking IPC — ✅ shipped (DOCS §4.20) | — |

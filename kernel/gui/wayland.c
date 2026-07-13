@@ -24,17 +24,26 @@
 #include <stddef.h>
 
 /* Interface tags stored in wl_conn.obj_iface[]. */
-enum { WLI_NONE = 0, WLI_DISPLAY, WLI_REGISTRY, WLI_CALLBACK };
+enum { WLI_NONE = 0, WLI_DISPLAY, WLI_REGISTRY, WLI_CALLBACK,
+       WLI_COMPOSITOR, WLI_SHM, WLI_SHM_POOL, WLI_BUFFER, WLI_SURFACE };
 
-/* wl_display opcodes (request = client→server, event = server→client). */
+/* Real Wayland opcodes (from wayland.xml).  request = client→server. */
 enum { WL_DISPLAY_REQ_SYNC = 0, WL_DISPLAY_REQ_GET_REGISTRY = 1 };
 enum { WL_DISPLAY_EVT_ERROR = 0, WL_DISPLAY_EVT_DELETE_ID = 1 };
-/* wl_registry event / wl_callback event. */
+enum { WL_REGISTRY_REQ_BIND = 0 };
 enum { WL_REGISTRY_EVT_GLOBAL = 0 };
 enum { WL_CALLBACK_EVT_DONE = 0 };
+enum { WL_COMPOSITOR_REQ_CREATE_SURFACE = 0 };
+enum { WL_SHM_REQ_CREATE_POOL = 0 };
+enum { WL_SHM_EVT_FORMAT = 0 };
+enum { WL_SHM_POOL_REQ_CREATE_BUFFER = 0 };
+enum { WL_BUFFER_EVT_RELEASE = 0 };
+enum { WL_SURFACE_REQ_ATTACH = 1, WL_SURFACE_REQ_COMMIT = 6 };
 
-/* The globals this server advertises (name is the registry handle a client
- * would bind()).  Only advertised in stage 1; bind() lands in stage 2. */
+/* wl_shm pixel formats (subset). */
+enum { WL_SHM_FORMAT_ARGB8888 = 0, WL_SHM_FORMAT_XRGB8888 = 1 };
+
+/* The globals this server advertises (name = the bind() handle). */
 struct wl_global { uint32_t name; const char* iface; uint32_t version; };
 static const struct wl_global g_globals[] = {
     { 1, "wl_compositor", 4 },
@@ -105,6 +114,24 @@ static void send_delete_id(struct wl_conn* c, uint32_t id) {
     usock_send(c->sock, msg, 12, NULL);
 }
 
+/* Emit wl_shm.format(format) on the client's wl_shm object. */
+static void send_shm_format(struct wl_conn* c, uint32_t shm_id, uint32_t fmt) {
+    uint8_t msg[12];
+    put32(msg + 0, shm_id);
+    put32(msg + 4, (12u << 16) | WL_SHM_EVT_FORMAT);
+    put32(msg + 8, fmt);
+    usock_send(c->sock, msg, 12, NULL);
+}
+
+/* Emit wl_buffer.release(buffer) — the server is done reading the buffer, so
+ * the client may reuse it. */
+static void send_buffer_release(struct wl_conn* c, uint32_t buffer_id) {
+    uint8_t msg[8];
+    put32(msg + 0, buffer_id);
+    put32(msg + 4, (8u << 16) | WL_BUFFER_EVT_RELEASE);
+    usock_send(c->sock, msg, 8, NULL);
+}
+
 /* ---- connection + dispatch ----------------------------------------------- */
 
 void wl_conn_init(struct wl_conn* c, struct usock* sock) {
@@ -113,6 +140,33 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock) {
     c->obj_iface[WL_DISPLAY_ID] = WLI_DISPLAY;   /* object 1 is always wl_display */
     c->registry_id = 0;
     c->serial = 0;
+    c->pool_shm = NULL;
+    c->surface_id = c->buffer_id = 0;
+    c->buf_off = c->buf_w = c->buf_h = c->buf_stride = 0;
+}
+
+/* wl_surface.commit — the moment the client's frame becomes current.  Read the
+ * attached wl_buffer's pixels out of the wl_shm_pool's frames (via the kernel
+ * identity map, like fd.c) and log proof they crossed the wire + the SCM_RIGHTS
+ * fd passing intact.  Stage 3 gfx_blits these into a gui_window + gui_damage. */
+static void wl_surface_commit(struct wl_conn* c) {
+    struct shm* s = c->pool_shm;
+    if (!s || !c->buf_w || !c->buf_h) { kprintf("wayland: commit with no buffer\n"); return; }
+
+    uint32_t topleft = 0, sum = 0;
+    for (uint32_t y = 0; y < c->buf_h; y++) {
+        for (uint32_t x = 0; x < c->buf_w; x++) {
+            uint32_t bo = c->buf_off + y * c->buf_stride + x * 4;
+            uint32_t fi = bo / 4096, fo = bo % 4096;
+            if ((int)fi >= s->nframes) continue;
+            uint32_t px = *(volatile uint32_t*)(uintptr_t)(s->frames[fi] + fo);
+            if (x == 0 && y == 0) topleft = px;
+            sum += px;
+        }
+    }
+    kprintf("wayland: COMMIT surface %u: %ux%u buffer, top-left=%x checksum=%x\n",
+            c->surface_id, c->buf_w, c->buf_h, topleft, sum);
+    send_buffer_release(c, c->buffer_id);
 }
 
 int wl_conn_dispatch(struct wl_conn* c) {
@@ -130,25 +184,70 @@ int wl_conn_dispatch(struct wl_conn* c) {
     if (blen > sizeof body) blen = sizeof body;
     if (blen && recv_exact(c->sock, body, (long)blen) != (long)blen) return -1;
 
-    if (obj == WL_DISPLAY_ID && c->obj_iface[obj] == WLI_DISPLAY) {
-        if (op == WL_DISPLAY_REQ_GET_REGISTRY && blen >= 4) {
-            uint32_t reg = get32(body);
-            if (reg < WL_MAX_OBJECTS) c->obj_iface[reg] = WLI_REGISTRY;
-            c->registry_id = reg;
-            kprintf("wayland: get_registry(id=%u) -> advertising %d globals\n",
-                    reg, WL_NGLOBALS);
-            for (int i = 0; i < WL_NGLOBALS; i++) send_global(c, &g_globals[i]);
-        } else if (op == WL_DISPLAY_REQ_SYNC && blen >= 4) {
-            uint32_t cb = get32(body);
-            kprintf("wayland: sync(callback=%u) -> done + delete_id\n", cb);
-            send_callback_done(c, cb, c->serial++);
-            send_delete_id(c, cb);
-        } else {
-            kprintf("wayland: wl_display: unhandled opcode %u\n", op);
+    uint8_t iface = (obj < WL_MAX_OBJECTS) ? c->obj_iface[obj] : WLI_NONE;
+
+    if (iface == WLI_DISPLAY && op == WL_DISPLAY_REQ_GET_REGISTRY && blen >= 4) {
+        uint32_t reg = get32(body);
+        if (reg < WL_MAX_OBJECTS) c->obj_iface[reg] = WLI_REGISTRY;
+        c->registry_id = reg;
+        kprintf("wayland: get_registry(id=%u) -> advertising %d globals\n", reg, WL_NGLOBALS);
+        for (int i = 0; i < WL_NGLOBALS; i++) send_global(c, &g_globals[i]);
+
+    } else if (iface == WLI_DISPLAY && op == WL_DISPLAY_REQ_SYNC && blen >= 4) {
+        uint32_t cb = get32(body);
+        kprintf("wayland: sync(callback=%u) -> done + delete_id\n", cb);
+        send_callback_done(c, cb, c->serial++);
+        send_delete_id(c, cb);
+
+    } else if (iface == WLI_REGISTRY && op == WL_REGISTRY_REQ_BIND && blen >= 12) {
+        /* bind(name:uint, interface:string, version:uint, id:new_id). */
+        uint32_t name = get32(body);
+        uint32_t slen = get32(body + 4);
+        uint32_t o = 8 + align4(slen);
+        uint32_t new_id = get32(body + o + 4);           /* after version */
+        uint8_t bi = (name == 1) ? WLI_COMPOSITOR : (name == 2) ? WLI_SHM : WLI_NONE;
+        if (new_id < WL_MAX_OBJECTS) c->obj_iface[new_id] = bi;
+        kprintf("wayland: bind(name=%u) -> object %u\n", name, new_id);
+        if (bi == WLI_SHM) {                             /* advertise formats */
+            send_shm_format(c, new_id, WL_SHM_FORMAT_ARGB8888);
+            send_shm_format(c, new_id, WL_SHM_FORMAT_XRGB8888);
         }
+
+    } else if (iface == WLI_COMPOSITOR && op == WL_COMPOSITOR_REQ_CREATE_SURFACE && blen >= 4) {
+        uint32_t nid = get32(body);
+        if (nid < WL_MAX_OBJECTS) c->obj_iface[nid] = WLI_SURFACE;
+        c->surface_id = nid;
+        kprintf("wayland: create_surface -> object %u\n", nid);
+
+    } else if (iface == WLI_SHM && op == WL_SHM_REQ_CREATE_POOL && blen >= 8) {
+        /* create_pool(id:new_id, fd, size) — fd is out-of-band (no wire word). */
+        uint32_t nid  = get32(body);
+        uint32_t psize = get32(body + 4);
+        struct ofile* pf = NULL; uint8_t d;
+        usock_recv(c->sock, &d, 0, 0, &pf);              /* dequeue the passed fd */
+        if (nid < WL_MAX_OBJECTS) c->obj_iface[nid] = WLI_SHM_POOL;
+        c->pool_shm = (pf && pf->kind == FD_SHM) ? pf->shm : NULL;
+        kprintf("wayland: create_pool(id=%u,size=%u) shm-fd=%s\n",
+                nid, psize, c->pool_shm ? "received" : "MISSING");
+
+    } else if (iface == WLI_SHM_POOL && op == WL_SHM_POOL_REQ_CREATE_BUFFER && blen >= 24) {
+        /* create_buffer(id, offset, width, height, stride, format). */
+        uint32_t nid = get32(body);
+        c->buffer_id = nid;
+        c->buf_off = get32(body + 4);  c->buf_w = get32(body + 8);
+        c->buf_h   = get32(body + 12); c->buf_stride = get32(body + 16);
+        if (nid < WL_MAX_OBJECTS) c->obj_iface[nid] = WLI_BUFFER;
+        kprintf("wayland: create_buffer(id=%u) %ux%u stride=%u\n",
+                nid, c->buf_w, c->buf_h, c->buf_stride);
+
+    } else if (iface == WLI_SURFACE && op == WL_SURFACE_REQ_ATTACH && blen >= 4) {
+        kprintf("wayland: surface %u attach buffer %u\n", obj, get32(body));
+
+    } else if (iface == WLI_SURFACE && op == WL_SURFACE_REQ_COMMIT) {
+        wl_surface_commit(c);
+
     } else {
-        kprintf("wayland: request for object %u (iface %u) opcode %u — unhandled\n",
-                obj, obj < WL_MAX_OBJECTS ? c->obj_iface[obj] : 0, op);
+        kprintf("wayland: object %u (iface %u) opcode %u — unhandled\n", obj, iface, op);
     }
     return 1;
 }
@@ -158,8 +257,13 @@ int wl_conn_dispatch(struct wl_conn* c) {
 /* The object ids this test client allocates (a real client tracks each object's
  * interface itself; opcode 0 alone is ambiguous — it is both wl_registry.global
  * and wl_callback.done — so the DISPATCH MUST key on the object's interface). */
-#define WLC_REGISTRY 2u
-#define WLC_CALLBACK 3u
+#define WLC_REGISTRY   2u
+#define WLC_CALLBACK   3u
+#define WLC_COMPOSITOR 4u
+#define WLC_SHM        5u
+#define WLC_SURFACE    6u
+#define WLC_POOL       7u
+#define WLC_BUFFER     8u
 
 /* Drain + decode every event the server has queued back to the client end. */
 static void client_drain(struct usock* cli) {
@@ -188,6 +292,10 @@ static void client_drain(struct usock* cli) {
             kprintf("  client: callback.done(serial=%u)\n", get32(body));
         } else if (obj == WL_DISPLAY_ID && op == WL_DISPLAY_EVT_DELETE_ID) {
             kprintf("  client: delete_id(%u)\n", get32(body));
+        } else if (obj == WLC_SHM && op == WL_SHM_EVT_FORMAT) {
+            kprintf("  client: shm format=%u supported\n", get32(body));
+        } else if (obj == WLC_BUFFER && op == WL_BUFFER_EVT_RELEASE) {
+            kprintf("  client: buffer released\n");
         } else {
             kprintf("  client: event obj=%u op=%u\n", obj, op);
         }
@@ -203,6 +311,36 @@ static void client_send1(struct usock* cli, uint32_t opcode, uint32_t new_id) {
     usock_send(cli, msg, 12, NULL);
 }
 
+/* Marshal a generic request: header + n u32 args (+ an optional passed fd). */
+static void client_msg(struct usock* cli, uint32_t obj, uint32_t opcode,
+                       const uint32_t* args, int n, struct ofile* passfd) {
+    uint8_t msg[64];
+    uint32_t size = 8 + (uint32_t)n * 4;
+    put32(msg + 0, obj);
+    put32(msg + 4, (size << 16) | opcode);
+    for (int i = 0; i < n; i++) put32(msg + 8 + i * 4, args[i]);
+    usock_send(cli, msg, size, passfd);
+}
+
+/* Marshal wl_registry.bind(name, interface, version, new_id). */
+static void client_bind(struct usock* cli, uint32_t name, const char* iface,
+                        uint32_t version, uint32_t new_id) {
+    uint8_t msg[64];
+    uint32_t slen = cstrlen(iface) + 1;
+    uint32_t size = 8 + 4 + 4 + align4(slen) + 4 + 4;
+    put32(msg + 0, WLC_REGISTRY);
+    put32(msg + 4, (size << 16) | WL_REGISTRY_REQ_BIND);
+    put32(msg + 8, name);
+    put32(msg + 12, slen);
+    uint32_t o = 16;
+    for (uint32_t i = 0; i < slen; i++) msg[o + i] = (uint8_t)iface[i];
+    for (uint32_t i = slen; i < align4(slen); i++) msg[o + i] = 0;
+    o += align4(slen);
+    put32(msg + o, version); o += 4;
+    put32(msg + o, new_id);
+    usock_send(cli, msg, size, NULL);
+}
+
 void wl_selftest(void) {
     struct usock *cli, *srv;
     if (usock_pair(&cli, &srv) != 0) { kprintf("waytest: usock_pair failed\n"); return; }
@@ -211,17 +349,54 @@ void wl_selftest(void) {
     wl_conn_init(&conn, srv);
     kprintf("waytest: Wayland wire handshake over a unix socket\n");
 
-    /* 1. wl_display.get_registry(new_id = 2) → globals. */
-    client_send1(cli, WL_DISPLAY_REQ_GET_REGISTRY, 2);
+    /* Stage 1 — get_registry → globals; sync → callback.done + delete_id. */
+    client_send1(cli, WL_DISPLAY_REQ_GET_REGISTRY, WLC_REGISTRY);
     wl_conn_dispatch(&conn);
     client_drain(cli);
-
-    /* 2. wl_display.sync(new_id = 3) → wl_callback.done + delete_id. */
-    client_send1(cli, WL_DISPLAY_REQ_SYNC, 3);
+    client_send1(cli, WL_DISPLAY_REQ_SYNC, WLC_CALLBACK);
     wl_conn_dispatch(&conn);
     client_drain(cli);
-
     kprintf("waytest: handshake complete\n");
+
+    /* Stage 2 — bind + a shm buffer committed to a surface. -------------------
+     * Build a 4x4 ARGB pixel buffer in SHARED memory, hand its fd to the server
+     * over the socket (SCM_RIGHTS), and drive create_surface → create_pool →
+     * create_buffer → attach → commit; the server reads the pixels back. */
+    const uint32_t W = 4, H = 4, STRIDE = W * 4, COLOR = 0x3366CCFFu;
+    struct shm* buf = shm_create((size_t)STRIDE * H);
+    if (buf) {
+        volatile uint32_t* px = (volatile uint32_t*)(uintptr_t)buf->frames[0];
+        for (uint32_t i = 0; i < W * H; i++) px[i] = COLOR;
+    }
+    struct ofile* buf_of = buf ? ofile_from_shm(buf) : NULL;
+
+    kprintf("waytest: stage 2 — shm buffer -> surface commit (fill=%x)\n", COLOR);
+    client_bind(cli, 1, "wl_compositor", 4, WLC_COMPOSITOR);
+    client_bind(cli, 2, "wl_shm",        1, WLC_SHM);
+    wl_conn_dispatch(&conn); wl_conn_dispatch(&conn);
+    client_drain(cli);
+
+    { uint32_t a[] = { WLC_SURFACE };
+      client_msg(cli, WLC_COMPOSITOR, WL_COMPOSITOR_REQ_CREATE_SURFACE, a, 1, NULL); }
+    wl_conn_dispatch(&conn);
+
+    { uint32_t a[] = { WLC_POOL, STRIDE * H };
+      client_msg(cli, WLC_SHM, WL_SHM_REQ_CREATE_POOL, a, 2, buf_of); }
+    wl_conn_dispatch(&conn);
+
+    { uint32_t a[] = { WLC_BUFFER, 0, W, H, STRIDE, WL_SHM_FORMAT_ARGB8888 };
+      client_msg(cli, WLC_POOL, WL_SHM_POOL_REQ_CREATE_BUFFER, a, 6, NULL); }
+    wl_conn_dispatch(&conn);
+
+    { uint32_t a[] = { WLC_BUFFER, 0, 0 };
+      client_msg(cli, WLC_SURFACE, WL_SURFACE_REQ_ATTACH, a, 3, NULL); }
+    wl_conn_dispatch(&conn);
+
+    client_msg(cli, WLC_SURFACE, WL_SURFACE_REQ_COMMIT, NULL, 0, NULL);
+    wl_conn_dispatch(&conn);
+    client_drain(cli);
+
+    kprintf("waytest: done (server should have read top-left=%x)\n", COLOR);
     usock_close(cli);
     usock_close(srv);
 }

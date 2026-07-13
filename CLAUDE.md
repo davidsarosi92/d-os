@@ -202,11 +202,16 @@ linux_abi — same store, two real backends by data.  The minimal 2nd brother =
 the in-tree native libc; the **full native musl (`arch/dos` fork) is PARKED**
 (`NATIVE_LIBC.md`) — it needs musl `src/` shape patches (bare-base SYS_SET_TLS,
 `(len,fd)` mmap, `kstat`), not a clean `arch/` add → a separate project.
-**Checklist in `third_party/MUSL.md`.**  **§M26 Wayland STARTED — stage 1 (DOCS
-§4.32): the real Wayland wire protocol + wl_display/wl_registry/wl_callback
-handshake over a usock (`kernel/gui/wayland.c`, shell `waytest`; hand-marshalled
-client à la linuxhello).**  **Next: M26 wl_shm buffers + wl_surface bridged to a
-`gui_window` + xdg_shell; or interactive `sh` (blocking stdin) + more coreutils.**
+**Checklist in `third_party/MUSL.md`.**  **§M26 Wayland STARTED — stage 1+2 (DOCS
+§4.32, i386+x86_64, `kernel/gui/wayland.c`, shell `waytest`; hand-marshalled
+client à la linuxhello): stage 1 = real wire protocol + wl_display/wl_registry/
+wl_callback handshake; stage 2 = the SHM BUFFER PATH — bind + wl_shm(formats) +
+create_surface + create_pool (client memfd passed OUT-OF-BAND via SCM_RIGHTS) +
+create_buffer + attach + commit → the server reads the client's pixels back
+(4×4 0x3366CCFF → top-left+checksum verified).**  **Next: `gfx_blit` the
+committed buffer into a real `gui_window` + `gui_damage` (the VISIBLE window,
+needs GUI mode), then `xdg_shell`; or interactive `sh` (blocking stdin) + more
+coreutils.**
 §M35 (threads/futex/TLS/per-CPU TSS) COMPLETE (UP+SMP, §4.28); also: §M34 POSIX
 (§4.27), §M24 sockets (§4.25), §M35.5 store (§4.29).  **§M26 Wayland deferred
 until POSIX + libc exist.**

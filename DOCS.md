@@ -3284,10 +3284,24 @@ shm) and the **M22.7 compositor**, which was deliberately built
 surface-compositor-shaped so `wl_surface` maps onto a `gui_window`'s
 `gfx_surface` 1:1.  `kernel/gui/wayland.c` + `kernel/includes/wayland.h`.
 
-**Next stages:** `wl_registry.bind`; `wl_shm` + `wl_shm_pool` (client memfd
-passed by SCM_RIGHTS) + `wl_buffer`; `wl_surface.attach`/`commit` bridged onto a
-`gui_window` + `gui_damage`; then `xdg_shell` for real top-level windows; then a
-real user-space client (and eventually libwayland-client, §M40).
+**Stage 2 — the shm buffer path — DONE (i386 + x86_64).**  The hard part of
+Wayland (a client sharing pixel memory with the server): `wl_registry.bind`
+(registry → `wl_compositor` + `wl_shm`; `wl_shm` then advertises its
+`format`s), `wl_compositor.create_surface`, `wl_shm.create_pool` — the client's
+shared-memory **fd travels out-of-band via SCM_RIGHTS** (`usock_send`'s
+passfile; the server dequeues it with `usock_recv`'s `passfile_out`) —
+`wl_shm_pool.create_buffer` (offset/w/h/stride/format), `wl_surface.attach` +
+`wl_surface.commit`.  On commit the server reads the buffer's pixels straight
+out of the pool's `struct shm` frames (via the kernel identity map, like fd.c)
+and logs proof.  Boot-tested: a client fills a 4×4 ARGB buffer with `0x3366CCFF`,
+and the server's commit reads back `top-left=3366ccff` + `checksum=366ccff0`
+(= 16 × the colour) — the pixels crossed the wire + the fd passing intact — then
+sends `wl_buffer.release`.
+
+**Next stages:** `gfx_blit` the committed buffer into a real `gui_window` +
+`gui_damage` (the *visible* window — needs GUI mode); `xdg_shell` for top-level
+windows + input (`wl_seat`/`wl_keyboard`/`wl_pointer` off the M22.7 input
+router); a real user-space client (and eventually libwayland-client, §M40).
 
 ---
 
@@ -3361,6 +3375,15 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-13 — M26 stage 2: Wayland shm buffer path — the shared-memory frame,
+  i386.**  The hard part of Wayland (DOCS §4.32): `wl_registry.bind` + `wl_shm`
+  (format events) + `wl_compositor.create_surface` + `wl_shm.create_pool` (the
+  client's memfd passed **out-of-band via SCM_RIGHTS** — `usock_send` passfile →
+  `usock_recv` passfile_out) + `wl_shm_pool.create_buffer` + `wl_surface.attach`/
+  `commit`.  On commit the server reads the buffer's pixels from the pool's
+  `struct shm` frames (identity map).  `waytest`: a 4×4 `0x3366CCFF` buffer →
+  server reads `top-left=3366ccff` + matching checksum → `wl_buffer.release`.
+  Next: `gfx_blit` to a `gui_window` (visible), then `xdg_shell`.
 - **2026-07-13 — x86_64 build parity restored.**  The shared `user/libc.c` +
   `kernel/core/shell.c` had accreted i386-only dependencies (M34/M35 signal +
   thread trampolines; M23/M24/M35/M35.5 audio/net/futex/pkg) that broke the
