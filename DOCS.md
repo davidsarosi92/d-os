@@ -3232,7 +3232,16 @@ the exit code re-encoded into the Linux wait-status layout), `rt_sigprocmask`
   on write.  Fixed by routing `VMM_COW` pages through the COW branch too.  (This
   bit musl because its `fork` writes the pthread struct only in the *child*, so
   the parent's page stays COW between forks — but the bug is generic, not
-  musl-specific.)  Interactive REPL mode (blocking stdin) is the next `sh` step.
+  musl-specific.)
+
+**Interactive `sh` — DONE.**  `sh` with no `-c` runs a REPL: prompt → read a
+line → fork/exec → repeat → `exit`.  This needed a real **cooked stdin**: the
+old `sys_read(fd 0)` returned EOF ("no tty"); it now reads a line from the
+**focused virtual console** (`vc_focused()` + `vc_getchar`, the same input ring
+the kernel shell reads) with echo + backspace, returning the line incl. `\n`, so
+a musl program blocks on the keyboard through fd 0.  Boot-tested: `pkgrun sh` →
+`d-os$ ` prompt, `echo hi` runs and prints, `exit` leaves.  (Next tty work: line
+editing beyond backspace, `isatty`, job control / signals.)
 
 **The two-brothers seam, proven with a native backend.**  `pkg_run` prints the
 backend it selects, and the SAME `pkgrun` over the SAME store now routes to TWO
@@ -3375,6 +3384,11 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-13 — M36: interactive `sh` (cooked stdin), i386.**  `sh` with no `-c`
+  runs a REPL (prompt → fork/exec → repeat → `exit`).  `sys_read(fd 0)` now reads
+  a cooked line from the focused vc (`vc_focused`/`vc_getchar`, echo + backspace)
+  instead of returning EOF, so a musl program blocks on the keyboard.  DOCS
+  §4.31.  Boot-tested: `pkgrun sh` → `d-os$` prompt runs `echo`, `exit` leaves.
 - **2026-07-13 — M26 stage 2: Wayland shm buffer path — the shared-memory frame,
   i386.**  The hard part of Wayland (DOCS §4.32): `wl_registry.bind` + `wl_shm`
   (format events) + `wl_compositor.create_surface` + `wl_shm.create_pool` (the

@@ -22,6 +22,7 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "console.h"
+#include "vc.h"
 #include "waitq.h"
 #include "net.h"
 #include "hal_api.h"
@@ -71,8 +72,31 @@ long sys_write(int fd, const void* buf, size_t n) {
     return -1;                                 /* shm: not write(2)-able */
 }
 
+/* Cooked line read from the focused virtual console — a minimal line-discipline
+ * stdin (echo + backspace) so an interactive program (a musl `sh`) can read a
+ * line from the keyboard.  Blocks on the vc input ring (vc_getchar) until Enter;
+ * returns the line INCLUDING the trailing '\n', up to `cap` bytes. */
+static long stdin_read_line(char* buf, size_t cap) {
+    struct vc* v = vc_focused();
+    if (!v || cap == 0) return 0;
+    size_t len = 0;
+    for (;;) {
+        char c = vc_getchar(v);
+        if (c == '\n') {
+            vc_putchar(v, '\n');
+            if (len < cap) buf[len++] = '\n';
+            return (long)len;
+        }
+        if (c == '\b' || c == 127) {            /* backspace / DEL */
+            if (len > 0) { len--; vc_putchar(v, '\b'); }
+            continue;
+        }
+        if (len < cap) { buf[len++] = c; vc_putchar(v, c); }
+    }
+}
+
 long sys_read(int fd, void* buf, size_t n) {
-    if (fd == 0) return 0;                      /* stdin: EOF for now (no tty) */
+    if (fd == 0) return stdin_read_line((char*)buf, n);   /* cooked stdin */
     if (fd == 1 || fd == 2) return -1;
     struct ofile* o = fd_lookup(fd);
     if (!o) return -1;

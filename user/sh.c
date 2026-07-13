@@ -64,6 +64,18 @@ int main(int argc, char** argv) {
         run_line(argv[2]);
         return 0;
     }
-    fprintf(stderr, "usage: sh -c \"cmd1 args; cmd2 args\"\n");
-    return 1;
+
+    /* Interactive REPL — reads a line from the cooked stdin (the kernel's
+     * vc line-discipline), runs it, repeats.  `exit`/`quit` (or EOF) leaves. */
+    char line[256];
+    for (;;) {
+        fputs("d-os$ ", stdout);
+        fflush(stdout);
+        if (!fgets(line, sizeof line, stdin)) break;          /* EOF */
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+        if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) break;
+        if (line[0]) run_line(line);
+    }
+    return 0;
 }
