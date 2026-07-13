@@ -3307,10 +3307,18 @@ and the server's commit reads back `top-left=3366ccff` + `checksum=366ccff0`
 (= 16 × the colour) — the pixels crossed the wire + the fd passing intact — then
 sends `wl_buffer.release`.
 
+**Stage 3 — xdg_shell top-level role — DONE (protocol).**  The modern window
+protocol: `wl_registry.bind`(`xdg_wm_base`) → `xdg_wm_base.get_xdg_surface`
+(wrapping the `wl_surface`) → `xdg_surface.get_toplevel`, at which point the
+server sends the initial **configure** pair (`xdg_toplevel.configure(w,h,states)`
++ `xdg_surface.configure(serial)`); the client then `set_title`s and
+`ack_configure(serial)`s.  Boot-tested via `waytest`: configure round-trip +
+`set_title("d-os window")` + ack, end to end.
+
 **Next stages:** `gfx_blit` the committed buffer into a real `gui_window` +
-`gui_damage` (the *visible* window — needs GUI mode); `xdg_shell` for top-level
-windows + input (`wl_seat`/`wl_keyboard`/`wl_pointer` off the M22.7 input
-router); a real user-space client (and eventually libwayland-client, §M40).
+`gui_damage` (the *visible* window — needs GUI mode); input
+(`wl_seat`/`wl_keyboard`/`wl_pointer` off the M22.7 input router); a real
+user-space client (and eventually libwayland-client, §M40).
 
 ---
 

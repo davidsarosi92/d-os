@@ -25,7 +25,8 @@
 
 /* Interface tags stored in wl_conn.obj_iface[]. */
 enum { WLI_NONE = 0, WLI_DISPLAY, WLI_REGISTRY, WLI_CALLBACK,
-       WLI_COMPOSITOR, WLI_SHM, WLI_SHM_POOL, WLI_BUFFER, WLI_SURFACE };
+       WLI_COMPOSITOR, WLI_SHM, WLI_SHM_POOL, WLI_BUFFER, WLI_SURFACE,
+       WLI_XDG_WM_BASE, WLI_XDG_SURFACE, WLI_XDG_TOPLEVEL };
 
 /* Real Wayland opcodes (from wayland.xml).  request = client→server. */
 enum { WL_DISPLAY_REQ_SYNC = 0, WL_DISPLAY_REQ_GET_REGISTRY = 1 };
@@ -39,6 +40,12 @@ enum { WL_SHM_EVT_FORMAT = 0 };
 enum { WL_SHM_POOL_REQ_CREATE_BUFFER = 0 };
 enum { WL_BUFFER_EVT_RELEASE = 0 };
 enum { WL_SURFACE_REQ_ATTACH = 1, WL_SURFACE_REQ_COMMIT = 6 };
+/* xdg_shell (the modern window role protocol). */
+enum { XDG_WM_BASE_REQ_GET_XDG_SURFACE = 2 };
+enum { XDG_SURFACE_REQ_GET_TOPLEVEL = 1, XDG_SURFACE_REQ_ACK_CONFIGURE = 4 };
+enum { XDG_SURFACE_EVT_CONFIGURE = 0 };
+enum { XDG_TOPLEVEL_REQ_SET_TITLE = 2 };
+enum { XDG_TOPLEVEL_EVT_CONFIGURE = 0, XDG_TOPLEVEL_EVT_CLOSE = 1 };
 
 /* wl_shm pixel formats (subset). */
 enum { WL_SHM_FORMAT_ARGB8888 = 0, WL_SHM_FORMAT_XRGB8888 = 1 };
@@ -132,6 +139,28 @@ static void send_buffer_release(struct wl_conn* c, uint32_t buffer_id) {
     usock_send(c->sock, msg, 8, NULL);
 }
 
+/* Emit xdg_toplevel.configure(width, height, states[]) — an empty state array
+ * + 0×0 lets the client pick its own size. */
+static void send_xdg_toplevel_configure(struct wl_conn* c, uint32_t tl,
+                                        uint32_t w, uint32_t h) {
+    uint8_t msg[20];
+    put32(msg + 0, tl);
+    put32(msg + 4, (20u << 16) | XDG_TOPLEVEL_EVT_CONFIGURE);
+    put32(msg + 8, w);
+    put32(msg + 12, h);
+    put32(msg + 16, 0);                          /* states: array of length 0  */
+    usock_send(c->sock, msg, 20, NULL);
+}
+
+/* Emit xdg_surface.configure(serial) — the client must ack_configure(serial). */
+static void send_xdg_surface_configure(struct wl_conn* c, uint32_t xs, uint32_t serial) {
+    uint8_t msg[12];
+    put32(msg + 0, xs);
+    put32(msg + 4, (12u << 16) | XDG_SURFACE_EVT_CONFIGURE);
+    put32(msg + 8, serial);
+    usock_send(c->sock, msg, 12, NULL);
+}
+
 /* ---- connection + dispatch ----------------------------------------------- */
 
 void wl_conn_init(struct wl_conn* c, struct usock* sock) {
@@ -143,6 +172,7 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock) {
     c->pool_shm = NULL;
     c->surface_id = c->buffer_id = 0;
     c->buf_off = c->buf_w = c->buf_h = c->buf_stride = 0;
+    c->xdg_surface_id = c->xdg_toplevel_id = 0;
 }
 
 /* wl_surface.commit — the moment the client's frame becomes current.  Read the
@@ -205,7 +235,9 @@ int wl_conn_dispatch(struct wl_conn* c) {
         uint32_t slen = get32(body + 4);
         uint32_t o = 8 + align4(slen);
         uint32_t new_id = get32(body + o + 4);           /* after version */
-        uint8_t bi = (name == 1) ? WLI_COMPOSITOR : (name == 2) ? WLI_SHM : WLI_NONE;
+        uint8_t bi = (name == 1) ? WLI_COMPOSITOR :
+                     (name == 2) ? WLI_SHM :
+                     (name == 3) ? WLI_XDG_WM_BASE : WLI_NONE;
         if (new_id < WL_MAX_OBJECTS) c->obj_iface[new_id] = bi;
         kprintf("wayland: bind(name=%u) -> object %u\n", name, new_id);
         if (bi == WLI_SHM) {                             /* advertise formats */
@@ -246,6 +278,33 @@ int wl_conn_dispatch(struct wl_conn* c) {
     } else if (iface == WLI_SURFACE && op == WL_SURFACE_REQ_COMMIT) {
         wl_surface_commit(c);
 
+    } else if (iface == WLI_XDG_WM_BASE && op == XDG_WM_BASE_REQ_GET_XDG_SURFACE && blen >= 8) {
+        /* get_xdg_surface(new_id, wl_surface). */
+        uint32_t nid = get32(body);
+        if (nid < WL_MAX_OBJECTS) c->obj_iface[nid] = WLI_XDG_SURFACE;
+        c->xdg_surface_id = nid;
+        kprintf("wayland: get_xdg_surface -> object %u (surface %u)\n", nid, get32(body + 4));
+
+    } else if (iface == WLI_XDG_SURFACE && op == XDG_SURFACE_REQ_GET_TOPLEVEL && blen >= 4) {
+        /* get_toplevel(new_id) → the window becomes a top-level; send the
+         * initial configure pair (toplevel size + surface serial to ack). */
+        uint32_t nid = get32(body);
+        if (nid < WL_MAX_OBJECTS) c->obj_iface[nid] = WLI_XDG_TOPLEVEL;
+        c->xdg_toplevel_id = nid;
+        kprintf("wayland: get_toplevel -> object %u; sending configure\n", nid);
+        send_xdg_toplevel_configure(c, nid, 0, 0);       /* client picks a size */
+        send_xdg_surface_configure(c, c->xdg_surface_id, ++c->serial);
+
+    } else if (iface == WLI_XDG_TOPLEVEL && op == XDG_TOPLEVEL_REQ_SET_TITLE && blen >= 4) {
+        uint32_t slen = get32(body);
+        char t[64]; uint32_t k = 0;
+        for (; k + 1 < slen && k < sizeof t - 1; k++) t[k] = (char)body[4 + k];
+        t[k] = 0;
+        kprintf("wayland: xdg_toplevel set_title(\"%s\")\n", t);
+
+    } else if (iface == WLI_XDG_SURFACE && op == XDG_SURFACE_REQ_ACK_CONFIGURE && blen >= 4) {
+        kprintf("wayland: xdg_surface ack_configure(serial=%u)\n", get32(body));
+
     } else {
         kprintf("wayland: object %u (iface %u) opcode %u — unhandled\n", obj, iface, op);
     }
@@ -257,13 +316,19 @@ int wl_conn_dispatch(struct wl_conn* c) {
 /* The object ids this test client allocates (a real client tracks each object's
  * interface itself; opcode 0 alone is ambiguous — it is both wl_registry.global
  * and wl_callback.done — so the DISPATCH MUST key on the object's interface). */
-#define WLC_REGISTRY   2u
-#define WLC_CALLBACK   3u
-#define WLC_COMPOSITOR 4u
-#define WLC_SHM        5u
-#define WLC_SURFACE    6u
-#define WLC_POOL       7u
-#define WLC_BUFFER     8u
+#define WLC_REGISTRY     2u
+#define WLC_CALLBACK     3u
+#define WLC_COMPOSITOR   4u
+#define WLC_SHM          5u
+#define WLC_SURFACE      6u
+#define WLC_POOL         7u
+#define WLC_BUFFER       8u
+#define WLC_XDG_WM_BASE  9u
+#define WLC_XDG_SURFACE 10u
+#define WLC_XDG_TOPLEVEL 11u
+
+/* The last xdg_surface.configure serial the client saw (to ack_configure). */
+static uint32_t g_config_serial = 0;
 
 /* Drain + decode every event the server has queued back to the client end. */
 static void client_drain(struct usock* cli) {
@@ -296,6 +361,11 @@ static void client_drain(struct usock* cli) {
             kprintf("  client: shm format=%u supported\n", get32(body));
         } else if (obj == WLC_BUFFER && op == WL_BUFFER_EVT_RELEASE) {
             kprintf("  client: buffer released\n");
+        } else if (obj == WLC_XDG_SURFACE && op == XDG_SURFACE_EVT_CONFIGURE) {
+            g_config_serial = get32(body);
+            kprintf("  client: xdg_surface.configure(serial=%u)\n", g_config_serial);
+        } else if (obj == WLC_XDG_TOPLEVEL && op == XDG_TOPLEVEL_EVT_CONFIGURE) {
+            kprintf("  client: xdg_toplevel.configure(%ux%u)\n", get32(body), get32(body + 4));
         } else {
             kprintf("  client: event obj=%u op=%u\n", obj, op);
         }
@@ -338,6 +408,20 @@ static void client_bind(struct usock* cli, uint32_t name, const char* iface,
     o += align4(slen);
     put32(msg + o, version); o += 4;
     put32(msg + o, new_id);
+    usock_send(cli, msg, size, NULL);
+}
+
+/* Marshal a request with a single string arg (xdg_toplevel.set_title). */
+static void client_msg_str(struct usock* cli, uint32_t obj, uint32_t opcode, const char* s) {
+    uint8_t msg[80];
+    uint32_t slen = cstrlen(s) + 1;
+    uint32_t size = 8 + 4 + align4(slen);
+    put32(msg + 0, obj);
+    put32(msg + 4, (size << 16) | opcode);
+    put32(msg + 8, slen);
+    uint32_t o = 12;
+    for (uint32_t i = 0; i < slen; i++) msg[o + i] = (uint8_t)s[i];
+    for (uint32_t i = slen; i < align4(slen); i++) msg[o + i] = 0;
     usock_send(cli, msg, size, NULL);
 }
 
@@ -397,6 +481,28 @@ void wl_selftest(void) {
     client_drain(cli);
 
     kprintf("waytest: done (server should have read top-left=%x)\n", COLOR);
+
+    /* Stage 3 — give the surface an xdg_shell top-level role. -----------------
+     * bind xdg_wm_base → get_xdg_surface(surface) → get_toplevel → the server
+     * sends the initial configure pair → set_title → ack_configure. */
+    kprintf("waytest: stage 3 — xdg_shell top-level role\n");
+    client_bind(cli, 3, "xdg_wm_base", 2, WLC_XDG_WM_BASE);
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_XDG_SURFACE, WLC_SURFACE };
+      client_msg(cli, WLC_XDG_WM_BASE, XDG_WM_BASE_REQ_GET_XDG_SURFACE, a, 2, NULL); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_XDG_TOPLEVEL };
+      client_msg(cli, WLC_XDG_SURFACE, XDG_SURFACE_REQ_GET_TOPLEVEL, a, 1, NULL); }
+    wl_conn_dispatch(&conn);
+    client_drain(cli);                           /* toplevel + surface configure */
+
+    client_msg_str(cli, WLC_XDG_TOPLEVEL, XDG_TOPLEVEL_REQ_SET_TITLE, "d-os window");
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { g_config_serial };
+      client_msg(cli, WLC_XDG_SURFACE, XDG_SURFACE_REQ_ACK_CONFIGURE, a, 1, NULL); }
+    wl_conn_dispatch(&conn);
+    kprintf("waytest: xdg top-level configured, titled + acked\n");
+
     usock_close(cli);
     usock_close(srv);
 }

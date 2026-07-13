@@ -49,6 +49,10 @@ struct wl_conn {
     uint32_t      surface_id;           /* the wl_surface object               */
     uint32_t      buffer_id;            /* the wl_buffer object                */
     uint32_t      buf_off, buf_w, buf_h, buf_stride;   /* wl_buffer geometry   */
+
+    /* Stage 3 — xdg_shell top-level role. */
+    uint32_t      xdg_surface_id;       /* xdg_surface wrapping the wl_surface  */
+    uint32_t      xdg_toplevel_id;      /* xdg_toplevel role                    */
 };
 
 /* Initialise a connection over `sock` (registers wl_display as object 1). */
