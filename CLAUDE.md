@@ -208,10 +208,15 @@ client à la linuxhello): stage 1 = real wire protocol + wl_display/wl_registry/
 wl_callback handshake; stage 2 = the SHM BUFFER PATH — bind + wl_shm(formats) +
 create_surface + create_pool (client memfd passed OUT-OF-BAND via SCM_RIGHTS) +
 create_buffer + attach + commit → the server reads the client's pixels back
-(4×4 0x3366CCFF → top-left+checksum verified).**  **Next: `gfx_blit` the
-committed buffer into a real `gui_window` + `gui_damage` (the VISIBLE window,
-needs GUI mode), then `xdg_shell`; or interactive `sh` (blocking stdin) + more
-coreutils.**
+(4×4 0x3366CCFF → top-left+checksum verified); stage 3 = xdg_shell top-level
+(bind xdg_wm_base → get_xdg_surface → get_toplevel → configure pair → set_title
+→ ack_configure).**  Also this session: **interactive `sh`** (cooked stdin via
+`vc_focused`/`vc_getchar` — `pkgrun sh` → `d-os$` REPL) and **x86_64 build parity
+restored** (trampoline stubs + net/audio/futex/pkg cores; Wayland runs on x86_64
+too).  **Next Wayland: `gfx_blit` the committed buffer into a real `gui_window`
+(the VISIBLE window) — needs GUI-mode boot + framebuffer-capture testing, a
+focused follow-up — then `wl_seat` input.**  Also open: more coreutils, tty
+line-editing/`isatty`.
 §M35 (threads/futex/TLS/per-CPU TSS) COMPLETE (UP+SMP, §4.28); also: §M34 POSIX
 (§4.27), §M24 sockets (§4.25), §M35.5 store (§4.29).  **§M26 Wayland deferred
 until POSIX + libc exist.**
