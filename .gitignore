@@ -69,3 +69,6 @@ third_party/musl/
 third_party/musl-i386/
 # musl-linked ELFs (build products)
 user/*.muslelf
+# §M37 dynamic-linking build products (PIE ELFs + shared objects)
+user/*.dynelf
+user/*.so

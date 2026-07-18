@@ -23,7 +23,12 @@
 #include <stddef.h>
 
 #define PAGE_SIZE          4096u
-#define PROC_STACK_OFFSET  0x00100000u   /* user stack 1 MiB above the image */
+#define PROC_STACK_OFFSET  0x00100000u   /* user stack 1 MiB above the image  */
+#define PROC_INTERP_OFFSET 0x00200000u   /* §M37 dynamic-linker load base:    */
+                                         /*   2 MiB above the image — above    */
+                                         /*   the stack (1 MiB), below the     */
+                                         /*   mmap region (4 MiB) so ld.so's   */
+                                         /*   own mmaps never overlap it.      */
 #define PROC_MAX_ARGV      16
 
 /* ---------------------------------------------------------------------------
@@ -57,12 +62,28 @@
  * --------------------------------------------------------------------------- */
 static uint32_t u_strlen(const char* s) { uint32_t n = 0; while (s[n]) n++; return n; }
 
-/* SysV auxiliary-vector types a static musl reads at startup. */
+/* SysV auxiliary-vector types.  The first group a static musl reads; the
+ * second group (§M37) is what the DYNAMIC linker (ld.so) reads to find and
+ * relocate the main object + itself. */
 #define AT_NULL    0
-#define AT_CLKTCK  17
+#define AT_PHDR    3       /* program header table VA of the main object       */
+#define AT_PHENT   4       /* size of one program header entry                 */
+#define AT_PHNUM   5       /* number of program headers                        */
 #define AT_PAGESZ  6
-#define AT_RANDOM  25
+#define AT_BASE    7       /* load base of the interpreter (0 if none)         */
+#define AT_ENTRY   9       /* entry point of the MAIN object (not the interp)  */
+#define AT_CLKTCK  17
 #define AT_SECURE  23
+#define AT_RANDOM  25
+
+/* §M37 — a loaded program image: the main object (for the auxv the dynamic
+ * linker reads) plus, if PT_INTERP was present, the load base of the mapped
+ * interpreter and the entry point to actually start at (the interpreter's). */
+struct loaded_prog {
+    uintptr_t             entry;        /* where to begin (interp entry if dyn) */
+    struct elf_load_info  main;         /* the main object's load info          */
+    uintptr_t             interp_base;  /* AT_BASE (0 if statically linked)     */
+};
 
 /* A non-cryptographic 16-byte seed for AT_RANDOM: musl only needs it to be
  * non-zero + varied (stack-guard canary / malloc), not secure.  We mix the
@@ -79,7 +100,8 @@ static void fill_at_random(uint8_t out[16], uint32_t frame_phys, uintptr_t stack
 }
 
 static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
-                                     int argc, const char* const argv[]) {
+                                     int argc, const char* const argv[],
+                                     const struct loaded_prog* lp) {
     if (argc < 0) argc = 0;
     if (argc > PROC_MAX_ARGV) argc = PROC_MAX_ARGV;
 
@@ -119,9 +141,10 @@ static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
 
     /* 2. Lay out the pointer table below the strings, keeping the final SP
      *    16-byte aligned.  Slots: argc + argv[argc] + argv-NULL + envp[nenv] +
-     *    envp-NULL + auxv{ PAGESZ, CLKTCK, RANDOM, SECURE, NULL } = 5 pairs. */
+     *    envp-NULL + auxv{ PAGESZ, CLKTCK, RANDOM, SECURE,
+     *    PHDR, PHENT, PHNUM, BASE, ENTRY, NULL } = 10 pairs. */
     uintptr_t slot = sizeof(uintptr_t);
-    uintptr_t nslots = 1 + (uintptr_t)argc + 1 + (uintptr_t)nenv + 1 + (5 * 2);
+    uintptr_t nslots = 1 + (uintptr_t)argc + 1 + (uintptr_t)nenv + 1 + (10 * 2);
     koff -= nslots * slot;
     koff &= ~(uintptr_t)0xF;                          /* 16-byte align the SP  */
 
@@ -136,8 +159,57 @@ static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
     w[k++] = AT_CLKTCK; w[k++] = 100;                 /* auxv: HZ (100 ticks/s)*/
     w[k++] = AT_RANDOM; w[k++] = at_random_uva;       /* auxv: 16 random bytes */
     w[k++] = AT_SECURE; w[k++] = 0;                   /* auxv: not setuid      */
-    w[k++] = AT_NULL;   w[k++] = 0;                   /* auxv terminator       */
+    /* §M37: what ld.so needs to locate + relocate the main object and itself.
+     *  Harmless for static programs (their crt0 ignores these; AT_BASE=0). */
+    w[k++] = AT_PHDR;  w[k++] = lp ? lp->main.phdr_uva  : 0;
+    w[k++] = AT_PHENT; w[k++] = lp ? lp->main.phentsize : 0;
+    w[k++] = AT_PHNUM; w[k++] = lp ? lp->main.phnum     : 0;
+    w[k++] = AT_BASE;  w[k++] = lp ? lp->interp_base    : 0;
+    w[k++] = AT_ENTRY; w[k++] = lp ? lp->main.entry     : 0;
+    w[k++] = AT_NULL;  w[k++] = 0;                     /* auxv terminator       */
     return stack_va + koff;
+}
+
+/* ---------------------------------------------------------------------------
+ * §M37 — load a program image into `s`: map the main object at the user base,
+ * and — if it carries a PT_INTERP — read the named interpreter (musl's ld.so)
+ * from the VFS and map it clear of the main object.  Returns where to begin
+ * execution (the interpreter entry for a dynamic program, the main entry for a
+ * static one) via lp->entry, plus the auxv info in lp->main / lp->interp_base.
+ *
+ * The kernel performs NO relocation or symbol resolution: for a dynamic binary
+ * it simply hands control to ld.so (in ring 3) with a correct auxv, and ld.so
+ * does the rest.  vmm_space_map works on the (possibly inactive) target space,
+ * and the interpreter file is read through the global VFS into a kernel buffer,
+ * so this is safe to call before switching to `s`.
+ * --------------------------------------------------------------------------- */
+static int load_program(struct vmm_space* s, const void* image, size_t len,
+                        struct loaded_prog* lp) {
+    int rc = elf_load_ex(s, image, len, vmm_user_base(), &lp->main);
+    if (rc != ELF_OK) return rc;
+    lp->entry       = lp->main.entry;
+    lp->interp_base = 0;
+
+    if (lp->main.has_interp) {
+        struct file* f = vfs_open(lp->main.interp, VFS_RDONLY);
+        if (!f) return ELF_ENOLOAD;                   /* interpreter missing   */
+        size_t isz = f->inode ? (size_t)f->inode->size : 0;
+        if (isz == 0 || isz > (16u << 20)) { vfs_close(f); return ELF_ENOLOAD; }
+        uint8_t* iimg = (uint8_t*)kmalloc(isz);
+        if (!iimg) { vfs_close(f); return ELF_ENOMEM; }
+        ssize_t ird = vfs_read(f, iimg, isz);
+        vfs_close(f);
+        if (ird < (ssize_t)isz) { kfree(iimg); return ELF_ENOLOAD; }
+
+        struct elf_load_info ii;
+        rc = elf_load_ex(s, iimg, isz,
+                         vmm_user_base() + PROC_INTERP_OFFSET, &ii);
+        kfree(iimg);
+        if (rc != ELF_OK) return rc;
+        lp->interp_base = ii.load_bias;               /* AT_BASE               */
+        lp->entry       = ii.entry;                   /* start in ld.so        */
+    }
+    return ELF_OK;
 }
 
 /* Shared exec path: load `image` into a fresh space, map a user stack carrying
@@ -148,8 +220,8 @@ static int proc_exec_common(const void* image, size_t len,
     struct vmm_space* s = vmm_space_create();
     if (!s) return -1;
 
-    uintptr_t entry = 0;
-    int rc = elf_load(s, image, len, &entry);
+    struct loaded_prog lp;
+    int rc = load_program(s, image, len, &lp);
     if (rc != ELF_OK) { vmm_space_destroy(s); return rc; }
 
     /* One-page user stack, mapped clear of the loaded image. */
@@ -161,7 +233,7 @@ static int proc_exec_common(const void* image, size_t len,
         vmm_space_destroy(s);
         return -1;
     }
-    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, argv);
+    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, argv, &lp);
 
     /* Bind the space to this task so the scheduler maintains CR3/TTBR0 across
      * any preemption during the excursion, activate it, then drop to user
@@ -171,7 +243,7 @@ static int proc_exec_common(const void* image, size_t len,
     if (me) { me->mm = s; me->mmap_cursor = 0; }   /* fresh mmap region */
     vmm_space_switch(s);
 
-    enter_user_mode_wrap(entry, user_sp);
+    enter_user_mode_wrap(lp.entry, user_sp);
 
     fd_close_all();                    /* reclaim any fds the program opened */
     vmm_space_switch(prev);
@@ -239,8 +311,8 @@ int proc_execve(const char* path, char* const uargv[]) {
     /* 3. Build the new address space + initial stack. */
     struct vmm_space* ns = vmm_space_create();
     if (!ns) { kfree(img); kfree(strbuf); return -1; }
-    uintptr_t entry = 0;
-    if (elf_load(ns, img, sz, &entry) != ELF_OK) {
+    struct loaded_prog lp;
+    if (load_program(ns, img, sz, &lp) != ELF_OK) {
         vmm_space_destroy(ns); kfree(img); kfree(strbuf); return -1;
     }
     uint32_t stk = pmm_alloc_frame();
@@ -250,7 +322,7 @@ int proc_execve(const char* path, char* const uargv[]) {
         pmm_free_frame(stk); vmm_space_destroy(ns);
         kfree(img); kfree(strbuf); return -1;
     }
-    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, kargv);
+    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, kargv, &lp);
 
     /* 4. Commit: swap to the new space, free the old one + scratch.  execve
      *    resets signal dispositions to default (custom handlers pointed into
@@ -265,8 +337,9 @@ int proc_execve(const char* path, char* const uargv[]) {
     kfree(img);
     kfree(strbuf);
 
-    /* 5. Resume in ring 3 at the new entry (one-way). */
-    enter_user_mode(entry, user_sp);
+    /* 5. Resume in ring 3 at the new entry (one-way).  For a dynamic binary
+     *    this is the interpreter's entry; ld.so then jumps to the program. */
+    enter_user_mode(lp.entry, user_sp);
     return 0;                                /* unreachable */
 }
 
@@ -374,8 +447,8 @@ int proc_spawn(const char* name, const void* image, size_t len) {
     struct vmm_space* s = vmm_space_create();
     if (!s) return -1;
 
-    uintptr_t entry = 0;
-    int rc = elf_load(s, image, len, &entry);
+    struct loaded_prog lp;
+    int rc = load_program(s, image, len, &lp);
     if (rc != ELF_OK) { vmm_space_destroy(s); return rc; }
 
     uint32_t stk = pmm_alloc_frame();
@@ -390,8 +463,8 @@ int proc_spawn(const char* name, const void* image, size_t len) {
     struct user_boot* b = (struct user_boot*)kmalloc(sizeof *b);
     if (!b) { vmm_space_destroy(s); return -1; }
     b->space   = s;
-    b->entry   = entry;
-    b->user_sp = build_initial_stack(stk, stack_va, 0, NULL);  /* argc=0 stack */
+    b->entry   = lp.entry;
+    b->user_sp = build_initial_stack(stk, stack_va, 0, NULL, &lp);  /* argc=0 */
 
     struct task* t = task_spawn_arg(name, user_task_bootstrap, b);
     if (!t) { kfree(b); vmm_space_destroy(s); return -1; }

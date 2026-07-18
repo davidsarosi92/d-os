@@ -67,12 +67,15 @@
 | §M35 | Threads & futex — ✅ shipped (i386, UP + SMP): clone/futex/thread_create + per-CPU TSS (DOCS §4.28) | — |
 | §M35.5 | Package manager & isolation — ✅ store shipped (i386): content-addressed /store + profiles + GC (DOCS §4.29); gates every port | — |
 | §M36 | POSIX syscall breadth + native libc — ◐ stage 1 (i386, DOCS §4.30) + stage 2 "two brothers": **Linux-ABI peer runs real musl + coreutils (`echo`/`cat`/`ls`/`env`) + a real `sh -c` (fork/execve/waitpid) FROM the store via `pkgrun`, data-driven `.abi` seam (DOCS §4.31)**; native musl-fork peer TODO (= 2nd ABI backend). Own-libc PARKED → `NATIVE_LIBC.md` | — |
-| §M37 | Dynamic linking — ld.so / `.so` / dlopen | — |
+| §M37 | Dynamic linking — ld.so / `.so` / dlopen — ✅ shipped (i386, DOCS §4.33): shared musl (libc.so=ld.so) + ET_DYN/PIE loader + PT_INTERP + full auxv + full mmap2/mprotect/fstat64; dynamic hello, separate .so (DT_NEEDED + .so __thread), dlopen all green | — |
 | §M38 | C++ runtime + support libs (libc++/unwind, zlib, freetype, ICU, harfbuzz…) | — |
 | §M39 | Crypto + entropy + TLS + DNS resolver | — |
 | §M40 | Client graphics stack — Wayland client + EGL/GL (Mesa swrast) + Skia | — |
 | §M41 | Linux syscall ABI shim — optional binary-compat accelerator | — |
 | §M42 | Web browser bring-up — NetSurf → WebKit → Firefox/Chromium (north star) | — |
+| §M43 | Native developer toolchain (self-hosting) — a compiler + binutils + make RUN on d-os; first store packages, so we develop on d-os, in d-os | — |
+| §M44 | Language ecosystems — Rust / C++ / .NET (NativeAOT→CoreCLR) / Java (JVM); run cross-built musl binaries, then per-runtime ports | — |
+| §M45 | Package manager frontend + GUI installer — apt-like UX + wizard over the §M35.5 store; remote repo over §M39 TLS; driver/module hot-swap via §M33 | — |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -3739,8 +3742,131 @@ not a binary registry.  Revisit only with a specific use case.
 
 ---
 
+## §M43 — Native developer toolchain (self-hosting)
+
+**Why:** the goal is to **develop d-os on d-os, in d-os** — stop needing a
+Linux host + a Docker cross-toolchain to build software for the system.  The
+**first packages installed into the §M35.5 store are the developer tools
+themselves** (compiler, assembler/linker, `make`), so from then on new
+software (and eventually d-os userland itself) can be built natively.
+
+**Design.**
+1. **Compiler** — port **clang/LLVM** (more portable than GCC; LLVM is the
+   common backend for Rust/Swift/.NET-AOT too, so one port pays off widely) OR
+   GCC.  Both are large C++ programs → **hard-depends on §M37 (dynamic
+   linking) + §M38 (C++ runtime + support libs)**; they ship as `.so`s and
+   assume a broad POSIX surface (fork/exec/pipes/files/mmap — mostly present).
+2. **binutils** — assembler + linker (`as`, `ld`) — or LLVM's `lld`/
+   integrated assembler, avoiding a separate binutils port.
+3. **make / a build driver** — `make` (small C program) so existing Makefiles
+   run; later `ninja`/`cmake` (C++, needs §M38).
+4. **Headers + a native libc dev package** — the musl headers + `libc.so`/
+   `libc.a` packaged in the store as a normal dependency closure.
+
+**Definition of done:** `cc hello.c -o hello && ./hello` works **on d-os**,
+the toolchain living in `/store`; a small multi-file program builds via a
+Makefile.  Stretch: rebuild a piece of d-os userland natively.
+
+**Key levers / notes.**
+- **Cross-compile on the host stays valid and cheap** — self-hosting is the
+  *bonus*, not a prerequisite for running compiled programs.  Effort is
+  dominated by the **compiler being a huge C++ program**, i.e. by §M38, not by
+  anything toolchain-specific.
+- Distinguish **running a compiled binary** (works today for C via musl; §M38
+  adds C++) from **running the compiler itself on d-os** (this milestone).
+
+**Depends on:** §M37, §M38 (the compiler + its libs are dynamically-linked
+C++), §M35.5 (installs into the store).  Primary arch: x86_64.
+
+---
+
+## §M44 — Language ecosystems (Rust / C++ / .NET / Java)
+
+**Why:** broaden the platform beyond C.  Analysis (2026-07-18): the effort is
+dominated by **(a) the language's runtime port and (b) syscall/ABI breadth —
+NOT by the compiler** (cross-compiling on the host is free).  A second lever:
+because the **Linux-ABI personality** (§M36/§M41) runs unmodified musl Linux
+binaries, **any language that emits a static/dynamic musl Linux ELF (C, C++,
+Rust, Go, Zig, .NET NativeAOT) can run with "just" syscall breadth — no
+per-language runtime port.**  Only JIT/VM languages need the VM itself ported.
+
+**Effort ranking (running cross-built binaries on d-os):**
+| Lang | Path | Depends | Effort |
+|------|------|---------|--------|
+| C | musl ELF | — | trivial — **done** (static + §M37 dynamic) |
+| **Rust** | `i686/x86_64-unknown-linux-musl` static | syscall breadth (std) | **low–medium** — it's just a musl ELF; a good early win after §M36 breadth |
+| C++ | musl + C++ runtime | §M38 | medium |
+| .NET **NativeAOT** | AOT → native musl ELF | §M38 + AOT runtime + GC | medium–high (sidesteps the JIT) |
+| Java (JVM) | full OpenJDK port | §M38 + threads + JIT (W^X mmap) + GC + class lib | **high (months)** |
+| .NET **CoreCLR** (JIT) | full CoreCLR port | as JVM | high |
+
+**Guidance.** Order Rust → C++ (falls out of §M38) → .NET NativeAOT → then the
+JIT/VM heavyweights.  A **"Rust hello world"** is a cheap, motivating target
+soon after §M37 + §M36 breadth.  For .NET, prefer **NativeAOT** over porting
+CoreCLR's JIT.  All of this is a strong argument for investing in **§M41 (the
+Linux ABI shim)** — the universal "run any Linux binary" accelerator.
+
+**Depends on:** §M36 (syscall breadth), §M37, §M38 (C++-runtime consumers),
+§M41 (accelerator).  Primary arch: x86_64.
+
+---
+
+## §M45 — Package manager frontend + GUI installer
+
+**Why:** the §M35.5 **store is the storage model** (content-addressed,
+Nix/Guix-shaped — atomic, rollbackable, no dependency hell); this milestone is
+the **user-facing experience on top of it**: an apt-like install/update/search
+flow plus a graphical installer wizard, extended to **drivers and modules**,
+ideally swappable **without interrupting running user processes**.
+
+**Design.**
+1. **apt-like CLI** — `pkg install/update/search/remove/rollback` fetching from
+   a **remote repo** and realizing a pinned closure into the store + a profile
+   generation.  Remote fetch must be **secure → depends on §M39 (TLS) + signed
+   packages**; the local realize/rollback mechanics already exist (§M35.5).
+2. **GUI installer wizard** — an "InstallShield-style" friendly flow on the M22
+   toolkit.  **Design tension to preserve:** InstallShield = imperative
+   per-app installer *scripts* (Windows model); the store is **declarative**
+   (install = realize a store path + flip a profile symlink, no arbitrary
+   scripts).  The wizard is a friendly front over the **declarative**
+   `pkg install` — NOT per-app scripts.  Keeps the "no clutter / reproducible /
+   swappable" guarantees.
+3. **Driver / module hot-swap** — NOTE: this is really **§M33 (execution
+   domains)**, not the package manager.  The clean path is **user-mode
+   drivers**: a driver as a userland process, replaced by an M29-supervisor
+   restart; the M29 **service bus** (`contract@version` + transport
+   indirection) is designed for transparent reconnect → swap a driver while
+   clients keep running.  In-kernel LKM-style hot-load (relocatable kernel
+   objects + kernel-side symbol resolution) is the harder, riskier alternative
+   and is not the default.
+
+**First content:** the **§M43 developer toolchain** — dogfooding the installer
+by using it to bring up the self-hosting dev environment.
+
+**Definition of done:** `pkg install <tool>` fetches + installs from a repo, a
+GUI wizard drives the same flow, and a user-mode driver is replaced live
+without killing its clients (the last item may land with §M33).
+
+**Depends on:** §M35.5 (store), §M39 (secure remote fetch), §M22 (GUI toolkit),
+§M33 (driver/module hot-swap).
+
+---
+
 ## Change log
 
+- **2026-07-18** — Roadmap expanded (design only, no code): added **§M43**
+  (native self-hosting toolchain — dev tools become the first store packages so
+  we build d-os on d-os), **§M44** (language ecosystems — Rust/C++/.NET/Java
+  effort analysis; the Linux-ABI personality lets any musl-ELF-emitting language
+  run with just syscall breadth, JIT/VM langs need the VM ported), and **§M45**
+  (apt-like package-manager frontend + GUI installer over the §M35.5 store +
+  driver/module hot-swap, which is really §M33 user-mode drivers).  Separately,
+  **§M37 dynamic linking SHIPPED (i386, DOCS §4.33)**: shared musl (libc.so is
+  the dynamic linker), ET_DYN/PIE loader + PT_INTERP + full auxv, and the real
+  syscall surface ld.so needs (full mmap2, real mprotect, fstat64).  Verified:
+  `musldyntest` (PIE hello), `solibtest` (a separate libgreet.so via DT_NEEDED
+  incl. a `.so` `__thread`), `dlopentest` (dlopen/dlsym/dlclose); static musl
+  regression-free.
 - **2026-07-11** — **§M36 stage 1 shipped (POSIX syscall breadth, i386).**
   Syscalls 30–35 (`stat`/`fstat`/`getdents`/`uname`/`clock_gettime`/`nanosleep`)
   + `errno` + a `%o` printf; the in-tree libc grew the matching structs +

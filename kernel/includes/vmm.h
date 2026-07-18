@@ -151,6 +151,11 @@ int  vmm_space_map(struct vmm_space* space, uintptr_t virt, uintptr_t phys,
                    uint32_t flags);
 void vmm_space_unmap(struct vmm_space* space, uintptr_t virt);
 
+/* §M37 — change protection of an already-mapped page (the mprotect primitive),
+ * keeping its frame.  Same flag semantics as vmm_space_map.  Returns 0, or -1
+ * if the page is not mapped. */
+int  vmm_space_protect(struct vmm_space* space, uintptr_t virt, uint32_t flags);
+
 /* Physical address of the space's top-level table (CR3 / PML4 / TTBR0). */
 uintptr_t vmm_space_pd_phys(struct vmm_space* space);
 

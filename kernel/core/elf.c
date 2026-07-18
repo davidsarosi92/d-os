@@ -24,7 +24,10 @@
 #define ELFCLASS64     2
 #define ELFDATA2LSB    1
 #define ET_EXEC        2
+#define ET_DYN         3
 #define PT_LOAD        1
+#define PT_INTERP      3
+#define PT_PHDR        6
 #define PF_X           0x1
 #define PF_W           0x2
 #define PF_R           0x4
@@ -59,7 +62,7 @@ struct elf64_phdr {
 } __attribute__((packed));
 
 /* ---- width-normalised views ----------------------------------------------- */
-struct ehdr_norm { uintptr_t entry, phoff; uint16_t phnum, phentsize; };
+struct ehdr_norm { uintptr_t entry, phoff; uint16_t type, phnum, phentsize; };
 struct phdr_norm { uint32_t type, flags; uintptr_t offset, vaddr, filesz, memsz; };
 
 /* ---- loader --------------------------------------------------------------- */
@@ -74,7 +77,7 @@ static void copy_bytes(uint8_t* dst, const uint8_t* src, size_t n) {
  * constraint; true for our static images).  BSS (memsz > filesz) is covered
  * by the zeroing. */
 static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len,
-                       const struct phdr_norm* p) {
+                       const struct phdr_norm* p, uintptr_t bias) {
     if (p->offset + p->filesz < p->offset) return ELF_ESEGBOUND;   /* overflow */
     if (p->offset + p->filesz > len)       return ELF_ESEGBOUND;
 
@@ -82,8 +85,8 @@ static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len
     if (p->flags & PF_W) flags |= VMM_WRITABLE;
     if (p->flags & PF_X) flags |= VMM_EXEC;
 
-    uintptr_t va_base = p->vaddr & PAGE_MASK;
-    uintptr_t page_off = p->vaddr - va_base;      /* usually 0 */
+    uintptr_t va_base = (p->vaddr + bias) & PAGE_MASK;
+    uintptr_t page_off = (p->vaddr + bias) - va_base;   /* usually 0 */
     uintptr_t span = page_off + p->memsz;
 
     for (uintptr_t off = 0; off < span; off += PAGE_SIZE) {
@@ -113,8 +116,8 @@ static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len
     return ELF_OK;
 }
 
-int elf_load(struct vmm_space* space, const void* image_v, size_t len,
-             uintptr_t* entry) {
+int elf_load_ex(struct vmm_space* space, const void* image_v, size_t len,
+                uintptr_t load_bias, struct elf_load_info* out) {
     const uint8_t* image = (const uint8_t*)image_v;
     if (len < EI_NIDENT) return ELF_EBADMAG;
     if (image[0] != 0x7F || image[1] != 'E' || image[2] != 'L' || image[3] != 'F')
@@ -125,23 +128,36 @@ int elf_load(struct vmm_space* space, const void* image_v, size_t len,
     if (cls == ELFCLASS32) {
         if (len < sizeof(struct elf32_ehdr)) return ELF_EBADHDR;
         const struct elf32_ehdr* e = (const struct elf32_ehdr*)image;
-        eh.entry = e->e_entry; eh.phoff = e->e_phoff;
+        eh.type = e->e_type; eh.entry = e->e_entry; eh.phoff = e->e_phoff;
         eh.phnum = e->e_phnum; eh.phentsize = e->e_phentsize;
     } else if (cls == ELFCLASS64) {
         if (len < sizeof(struct elf64_ehdr)) return ELF_EBADHDR;
         const struct elf64_ehdr* e = (const struct elf64_ehdr*)image;
-        eh.entry = (uintptr_t)e->e_entry; eh.phoff = (uintptr_t)e->e_phoff;
+        eh.type = e->e_type; eh.entry = (uintptr_t)e->e_entry;
+        eh.phoff = (uintptr_t)e->e_phoff;
         eh.phnum = e->e_phnum; eh.phentsize = e->e_phentsize;
     } else {
         return ELF_EBADCLASS;
     }
+
+    /* Bias applies only to position-independent (ET_DYN) images; a fixed
+     * ET_EXEC always loads at its own p_vaddr. */
+    uintptr_t bias = (eh.type == ET_DYN) ? load_bias : 0;
 
     /* Program-header table must lie fully within the image. */
     if (eh.phoff + (uintptr_t)eh.phnum * eh.phentsize > len ||
         eh.phoff + (uintptr_t)eh.phnum * eh.phentsize < eh.phoff)
         return ELF_EBADHDR;
 
+    if (out) {
+        out->entry = 0; out->load_bias = bias; out->phdr_uva = 0;
+        out->phnum = eh.phnum; out->phentsize = eh.phentsize;
+        out->has_interp = 0; out->interp[0] = '\0';
+    }
+
     int loaded = 0;
+    uintptr_t phdr_from_pt = 0;                   /* PT_PHDR vaddr, if present */
+    uintptr_t phdr_from_load = 0;                 /* derived from covering LOAD */
     for (uint16_t i = 0; i < eh.phnum; i++) {
         uintptr_t off = eh.phoff + (uintptr_t)i * eh.phentsize;
         struct phdr_norm p;
@@ -156,16 +172,53 @@ int elf_load(struct vmm_space* space, const void* image_v, size_t len,
             p.offset = (uintptr_t)ph->p_offset; p.vaddr = (uintptr_t)ph->p_vaddr;
             p.filesz = (uintptr_t)ph->p_filesz; p.memsz = (uintptr_t)ph->p_memsz;
         }
+
+        if (p.type == PT_PHDR) {
+            phdr_from_pt = p.vaddr + bias;        /* linker-provided phdr VA   */
+            continue;
+        }
+        if (p.type == PT_INTERP && out) {
+            /* Copy the interpreter path (bounded, NUL-terminated). */
+            if (p.offset + p.filesz > len) return ELF_ESEGBOUND;
+            uintptr_t n = p.filesz;
+            if (n >= sizeof out->interp) n = sizeof out->interp - 1;
+            for (uintptr_t j = 0; j < n; j++) out->interp[j] = (char)image[p.offset + j];
+            out->interp[n] = '\0';
+            out->has_interp = 1;
+            continue;
+        }
         if (p.type != PT_LOAD || p.memsz == 0) continue;
 
-        int rc = map_segment(space, image, len, &p);
+        /* If this LOAD segment's file range covers the program-header table
+         * (file offset e_phoff), the phdr's mapped VA is derivable from it.
+         * This is how AT_PHDR is found for images without a PT_PHDR (our
+         * static ET_EXEC binaries); PIE/musl carry an authoritative PT_PHDR. */
+        if (!phdr_from_load && p.offset <= eh.phoff &&
+            eh.phoff < p.offset + p.filesz)
+            phdr_from_load = p.vaddr + bias + (eh.phoff - p.offset);
+
+        int rc = map_segment(space, image, len, &p, bias);
         if (rc != ELF_OK) return rc;
         loaded++;
     }
     if (!loaded) return ELF_ENOLOAD;
 
-    if (entry) *entry = eh.entry;
+    if (out) {
+        out->entry = eh.entry + bias;
+        /* AT_PHDR: prefer the authoritative PT_PHDR VA, else the VA derived
+         * from whichever PT_LOAD maps the header table.  Both are real user
+         * virtual addresses (unlike the raw file offset e_phoff). */
+        out->phdr_uva = phdr_from_pt ? phdr_from_pt : phdr_from_load;
+    }
     return ELF_OK;
+}
+
+int elf_load(struct vmm_space* space, const void* image, size_t len,
+             uintptr_t* entry) {
+    struct elf_load_info info;
+    int rc = elf_load_ex(space, image, len, 0, &info);
+    if (rc == ELF_OK && entry) *entry = info.entry;
+    return rc;
 }
 
 /* ---- self-test image builder (native class) ------------------------------- */

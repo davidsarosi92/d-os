@@ -201,6 +201,25 @@ static void unmap_in_pd(uint32_t* pd, uint32_t virt) {
     invlpg(virt);
 }
 
+/* Change the protection of an already-mapped page WITHOUT touching its frame
+ * (the mprotect primitive — §M37: musl's mallocng maps a PROT_NONE reservation
+ * then mprotects the used part to R/W, and ld.so tightens RELRO to read-only).
+ * Preserves the OS-available SHARED/COW bits.  Returns 0, or -1 if unmapped. */
+static int protect_in_pd(uint32_t* pd, uint32_t virt, uint32_t flags) {
+    uint32_t pdi = PD_IDX(virt);
+    uint32_t pti = PT_IDX(virt);
+    uint32_t pde = pd[pdi];
+    if ((pde & PDE_P) == 0) return -1;          /* no table → not mapped */
+    if (pde & PDE_PS) return -1;                /* PSE region — refuse */
+    uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
+    uint32_t pte = pt[pti];
+    if ((pte & PTE_P) == 0) return -1;          /* not present */
+    pt[pti] = (pte & PAGE_MASK) | PTE_P |
+              (flags & (PTE_RW | PTE_US)) | (pte & (VMM_SHARED | VMM_COW));
+    invlpg(virt);
+    return 0;
+}
+
 int vmm_map(uintptr_t virt32, uintptr_t phys32, uint32_t flags) {
     /* On i386 uintptr_t == uint32_t so the casts are no-ops; making them
      * explicit keeps the arch-portable interface obvious. */
@@ -449,6 +468,11 @@ int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
 void vmm_space_unmap(struct vmm_space* s, uintptr_t virt) {
     if (!s) { vmm_unmap(virt); return; }
     unmap_in_pd(s->pd, (uint32_t)virt);
+}
+
+int vmm_space_protect(struct vmm_space* s, uintptr_t virt, uint32_t flags) {
+    uint32_t* pd = s ? s->pd : kernel_pd;
+    return protect_in_pd(pd, (uint32_t)virt, flags);
 }
 
 uintptr_t vmm_space_pd_phys(struct vmm_space* s) {

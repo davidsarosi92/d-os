@@ -9,7 +9,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M26"                 /* latest shipped: §M26 Wayland */
+#define DOS_MILESTONE  "M37"                 /* latest shipped: §M37 dynamic linking */
 #define DOS_LABEL      "d-os " DOS_MILESTONE
 
 #endif /* VERSION_H */

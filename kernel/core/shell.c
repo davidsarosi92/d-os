@@ -1603,6 +1603,73 @@ static void cmd_musltest(void) {
     kprintf("musltest: returned rc=%d\n", rc);
 }
 
+/* §M37 — `musldyntest`: run a DYNAMICALLY-linked musl ELF (PT_INTERP set) under
+ * the Linux personality.  proc_exec_elf → load_program maps the PIE main + the
+ * interpreter (/lib/ld-musl-i386.so.1, provisioned by pkg_init) and starts in
+ * ld.so, which relocates + resolves symbols in ring 3 before calling main.
+ * If this prints, the whole dynamic-linking path works. */
+extern const unsigned char _binary_user_muslhellodyn_dynelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_muslhellodyn_dynelf_end[]   __attribute__((weak));
+
+static void cmd_musldyntest(void) {
+    if (!_binary_user_muslhellodyn_dynelf_start) {
+        console_write("musldyntest: not embedded — run `make musl` then rebuild\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_muslhellodyn_dynelf_end -
+                          _binary_user_muslhellodyn_dynelf_start);
+    console_write("musldyntest: exec'ing a DYNAMICALLY-linked musl binary...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(_binary_user_muslhellodyn_dynelf_start, len);
+    if (me) me->linux_abi = prev;
+    kprintf("musldyntest: returned rc=%d\n", rc);
+}
+
+/* §M37 stage 5 — `solibtest`: run a program that links against a SEPARATE
+ * shared library (libgreet.so, at /lib).  Exercises ld.so's real work: locate
+ * a genuinely separate .so via the search path and resolve symbols across
+ * three objects (main → libgreet → libc). */
+extern const unsigned char _binary_user_solibtest_dynelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_solibtest_dynelf_end[]   __attribute__((weak));
+
+static void cmd_solibtest(void) {
+    if (!_binary_user_solibtest_dynelf_start) {
+        console_write("solibtest: not embedded — run `make musl` then rebuild\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_solibtest_dynelf_end -
+                          _binary_user_solibtest_dynelf_start);
+    console_write("solibtest: exec'ing a program that needs a separate .so...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(_binary_user_solibtest_dynelf_start, len);
+    if (me) me->linux_abi = prev;
+    kprintf("solibtest: returned rc=%d\n", rc);
+}
+
+/* §M37 stage 7 — `dlopentest`: runtime dlopen/dlsym/dlclose of /lib/libgreet.so. */
+extern const unsigned char _binary_user_dlopentest_dynelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_dlopentest_dynelf_end[]   __attribute__((weak));
+
+static void cmd_dlopentest(void) {
+    if (!_binary_user_dlopentest_dynelf_start) {
+        console_write("dlopentest: not embedded — run `make musl` then rebuild\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_dlopentest_dynelf_end -
+                          _binary_user_dlopentest_dynelf_start);
+    console_write("dlopentest: exec'ing a program that dlopen's a .so...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(_binary_user_dlopentest_dynelf_start, len);
+    if (me) me->linux_abi = prev;
+    kprintf("dlopentest: returned rc=%d\n", rc);
+}
+
 /* §M26 — `wayclient`: a REAL ring-3 Wayland client.  Set up a usock_pair, hand
  * one end to a spawned server task (wl_conn_serve) and install the other as the
  * shell's fd 3, then exec user/wlclient.c — which speaks the Wayland wire
@@ -1870,6 +1937,9 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "tlstest"))        { cmd_tlstest(); return; }
     if (streq(line, "linuxtest"))      { cmd_linuxtest(); return; }
     if (streq(line, "musltest"))       { cmd_musltest(); return; }
+    if (streq(line, "musldyntest"))    { cmd_musldyntest(); return; }
+    if (streq(line, "solibtest"))      { cmd_solibtest(); return; }
+    if (streq(line, "dlopentest"))     { cmd_dlopentest(); return; }
     if (streq(line, "pkg"))            { cmd_pkg("");        return; }
     if (starts_with(line, "pkg "))     { cmd_pkg(line + 4);  return; }
     if (streq(line, "pkgtest"))        { cmd_pkgtest();      return; }

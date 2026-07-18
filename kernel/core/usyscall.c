@@ -188,6 +188,93 @@ long sys_mmap(size_t len, int fd) {
     return (long)va;
 }
 
+/* §M37 — full mmap for the Linux ABI (what musl's ld.so needs to load a .so):
+ * honors `addr`+MAP_FIXED, maps file-backed regions (reads `len` bytes from the
+ * VFS fd starting at `offset`), and translates prot → VMM flags so a text
+ * segment is mapped executable.  Anonymous (fd<0 or MAP_ANONYMOUS) works too.
+ * Returns the mapped user VA or -1.  (mprotect is a no-op elsewhere, which is
+ * fine: every PT_LOAD is mapped here with its own prot; mprotect only tightens
+ * RELRO afterwards.) */
+#define PROT_READ   0x1
+#define PROT_WRITE  0x2
+#define PROT_EXEC   0x4
+#define MAP_FIXED       0x10
+#define MAP_ANONYMOUS   0x20
+
+long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
+                   int fd, uint64_t offset) {
+    struct task* t = task_current();
+    if (!t || !t->mm) return -1;
+
+    int n = (int)((len + PAGE_SIZE - 1) / PAGE_SIZE);
+    if (n <= 0) n = 1;
+
+    uint32_t vf = VMM_USER;
+    if (prot & PROT_WRITE) vf |= VMM_WRITABLE;
+    if (prot & PROT_EXEC)  vf |= VMM_EXEC;
+
+    /* Target VA: MAP_FIXED honors the caller's addr; else bump-allocate. */
+    uintptr_t va;
+    if ((flags & MAP_FIXED) && addr) {
+        va = addr & ~(uintptr_t)(PAGE_SIZE - 1);
+    } else {
+        if (t->mmap_cursor == 0)
+            t->mmap_cursor = vmm_user_base() + MMAP_BASE_OFFSET;
+        va = t->mmap_cursor;
+        t->mmap_cursor += (uintptr_t)n * PAGE_SIZE;
+    }
+
+    /* File to read from for a file-backed mapping (else anonymous zero-fill). */
+    struct file* file = NULL;
+    if (fd >= 0 && !(flags & MAP_ANONYMOUS)) {
+        struct ofile* o = fd_lookup(fd);
+        if (!o || o->kind != FD_VFS || !o->file) return -1;
+        file = o->file;
+    }
+
+    for (int i = 0; i < n; i++) {
+        uintptr_t page_va = va + (uintptr_t)i * PAGE_SIZE;
+        /* MAP_FIXED may overlay an earlier reservation — drop the old PTE so
+         * the fresh frame maps cleanly. */
+        if (flags & MAP_FIXED) vmm_space_unmap(t->mm, page_va);
+
+        uint32_t fr = pmm_alloc_frame();
+        if (!fr) return -1;
+        uint8_t* p = (uint8_t*)(uintptr_t)fr;         /* kernel identity view  */
+        for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = 0;
+
+        if (file) {
+            /* Positioned read; restore the fd cursor (musl owns it). */
+            uint64_t save = file->pos;
+            file->pos = offset + (uint64_t)i * PAGE_SIZE;
+            vfs_read(file, p, PAGE_SIZE);             /* short tail → stays 0  */
+            file->pos = save;
+        }
+
+        if (vmm_space_map(t->mm, page_va, fr, vf) != 0) {
+            pmm_free_frame(fr);
+            return -1;
+        }
+    }
+    return (long)va;
+}
+
+/* §M37 — mprotect(addr,len,prot): change protection of already-mapped user
+ * pages (musl's mallocng maps PROT_NONE then mprotects to R/W; ld.so tightens
+ * RELRO to read-only after relocation).  Pages not mapped are skipped. */
+long sys_mprotect(uintptr_t addr, size_t len, int prot) {
+    struct task* t = task_current();
+    if (!t || !t->mm) return -1;
+    uintptr_t start = addr & ~(uintptr_t)(PAGE_SIZE - 1);
+    uintptr_t end   = (addr + len + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
+    uint32_t vf = VMM_USER;                        /* user pages stay user */
+    if (prot & PROT_WRITE) vf |= VMM_WRITABLE;
+    if (prot & PROT_EXEC)  vf |= VMM_EXEC;
+    for (uintptr_t va = start; va < end; va += PAGE_SIZE)
+        vmm_space_protect(t->mm, va, vf);          /* ignore unmapped pages */
+    return 0;
+}
+
 int sys_memfd(size_t size) {
     struct shm* s = shm_create(size);
     if (!s) return -1;

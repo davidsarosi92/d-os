@@ -127,6 +127,11 @@ int  sys_open (const char* path, int flags);
 int  sys_close(int fd);
 long sys_lseek(int fd, long off, int whence);
 long sys_mmap (size_t len, int fd);     /* map anon (fd<0) or a memfd's frames */
+/* §M37 — full mmap (addr+MAP_FIXED, prot→VMM flags, file-backed at offset) for
+ * the Linux ABI / ld.so loading shared objects. */
+long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
+                   int fd, uint64_t offset);
+long sys_mprotect(uintptr_t addr, size_t len, int prot);  /* §M37 */
 int  sys_memfd(size_t size);            /* create a shared-memory fd           */
 int  sys_socketpair(int* fds);          /* fds[0],fds[1] = connected unix pair */
 int  sys_pipe(int* fds);                /* fds[0]=read, fds[1]=write            */

@@ -3370,6 +3370,70 @@ client's window is created + fed automatically (not just in `waycomp`).
 
 ---
 
+### 4.33 Dynamic linking — ld.so / .so / dlopen (M37, i386)
+
+Extends the M25 static ELF loader to run **dynamically-linked** programs.  The
+elegant part: the kernel does **no relocation or symbol resolution** — that is
+the interpreter's (musl's `ld.so`) job in ring 3.  The kernel only maps the
+main object + the interpreter and hands over a correct auxv.
+
+**Build (`make musl`).**  musl is now built **shared as well as static**
+(dropped `--disable-shared`): `libc.so` **is** the dynamic linker (the
+interpreter `/lib/ld-musl-i386.so.1` is a symlink to it).  A dynamically-linked
+program is compiled `-fPIC` and linked `-pie -dynamic-linker
+/lib/ld-musl-i386.so.1` against `libc.so` by name (so its `DT_NEEDED` records
+the clean soname `libc.so`, not a build path).  Generic Makefile patterns:
+`user/%.dynelf` (a PIE program) and a `.so` rule; `libc.so` + `libgreet.so` are
+embedded as blobs and written into the VFS at boot by `pkg.c`'s
+`ldso_provision()` (`/lib/ld-musl-i386.so.1`, `/lib/libc.so`, `/lib/libgreet.so`).
+
+**Loader (`elf.c`).**  `elf_load_ex()` adds ET_DYN/PIE support: it applies a
+caller-supplied load bias to every `p_vaddr`, captures the `PT_INTERP` path,
+and reports the in-memory program-header address (from `PT_PHDR`, or derived
+from the covering `PT_LOAD` for static images — AT_PHDR must be a real VA, not a
+file offset).  `elf_load()` stays as the pre-M37 static wrapper.
+
+**Exec paths (`proc.c`).**  `load_program()` maps the main object at the user
+base and, if `PT_INTERP` is present, reads the interpreter from the VFS and maps
+it at `user_base + 0x200000` (between the stack and the mmap region, so ld.so's
+own mmaps never overlap), then starts execution at the interpreter's entry.
+`build_initial_stack()` now emits the full SysV auxv the linker reads:
+`AT_PHDR/AT_PHENT/AT_PHNUM/AT_BASE/AT_ENTRY` (plus the existing
+`AT_PAGESZ/CLKTCK/RANDOM/SECURE`).  All three exec paths (excursion / execve /
+spawn) share it.
+
+**Syscall surface ld.so needs (`usyscall.c` + `linux_abi.c`).**  A separate `.so`
+(not the libc-is-interpreter shortcut) forced three real additions:
+- **full `mmap2`** (`sys_mmap_full`) — honors `addr`+`MAP_FIXED`, `prot`→VMM
+  flags (a text segment maps executable), and **file-backed** mappings (reads
+  `len` bytes from the fd at `offset`); the old `sys_mmap` only did anonymous /
+  memfd regions.
+- **real `mprotect`** (`sys_mprotect` + `vmm_space_protect`) — was a no-op;
+  musl's mallocng maps a `PROT_NONE` reservation then mprotects it to R/W, and
+  ld.so tightens RELRO to read-only, so it must actually change PTE perms.
+- **`fstat64`** — `ld.so`'s `map_library` fstats a `.so` for its size before
+  mmapping it; translated to the Linux i386 `struct stat64`.  Also: `open`/
+  `openat` now return `-ENOENT` (not a generic `-1`) on failure, or musl's
+  library-search loop aborts instead of trying the next path.  (`statx` (383)
+  is left ENOSYS — musl falls back to `fstat64`.)
+
+**Verified (boot, i386):** `musldyntest` (a PIE musl hello — ld.so
+self-relocates, resolves `printf`, calls `main`, rc=0); `solibtest` (links a
+separate `libgreet.so` via `DT_NEEDED`: `greet_add(40,2)=42` main→lib JMP_SLOT,
+`greet_msg` lib→libc snprintf, `greet_tag` GLOB_DAT, and a `.so` `__thread`
+bumps `101,102,103` — the general-dynamic TLS path `__tls_get_addr` +
+DTPMOD/DTPOFF on the §M35 `%gs` pointer); `dlopentest` (`dlopen`/`dlsym`/
+`dlclose` of `/lib/libgreet.so` at runtime).  Static musl (`musltest`) stays
+regression-free (the AT_PHDR fix: musl reads AT_PHDR even for static binaries to
+find `PT_TLS`).
+
+**Open:** x86_64/aarch64; a real `brk` heap (mallocng falls back to mmap today);
+mmap reclaim on munmap; pthreads under the Linux ABI (needs `clone` wired in —
+the TLS *relocation* model is proven, but multi-thread `__thread` awaits §M44's
+musl pthread path); lazy PLT resolution (BIND_NOW-style works today).
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -3440,6 +3504,23 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-18 — M37: dynamic linking (ld.so / .so / dlopen), i386 (DOCS §4.33).**
+  An unmodified musl program now runs **dynamically linked**: the kernel maps the
+  PIE main object + the interpreter (`/lib/ld-musl-i386.so.1`) with a full SysV
+  auxv (`AT_PHDR/PHENT/PHNUM/BASE/ENTRY`) and hands control to musl's `ld.so`,
+  which self-relocates and resolves symbols in ring 3.  `make musl` now builds
+  musl **shared** too (`libc.so` == the dynamic linker).  ELF loader gained
+  ET_DYN/PIE support (`elf_load_ex`, load bias + `PT_INTERP` + `PT_PHDR`); the
+  exec paths gained `load_program` (main + interpreter).  A genuinely separate
+  `.so` forced a real syscall surface: **full `mmap2`** (`sys_mmap_full`:
+  addr+`MAP_FIXED`, prot→VMM flags, file-backed at offset), **real `mprotect`**
+  (`sys_mprotect` + `vmm_space_protect` — was a no-op; mallocng + RELRO need it),
+  **`fstat64`**, and `open`→`-ENOENT` (so musl's library search advances).
+  Verified on i386 (boot): `musldyntest` (PIE hello), `solibtest` (separate
+  `libgreet.so` via `DT_NEEDED` — cross-object JMP_SLOT/GLOB_DAT + a `.so`
+  `__thread` via the general-dynamic TLS path 101,102,103), `dlopentest`
+  (`dlopen`/`dlsym`/`dlclose`); static `musltest` regression-free.  Open:
+  x86_64/aarch64, real `brk`, mmap reclaim, pthreads under the Linux ABI.
 - **2026-07-18 — M26: Wayland compositor integration + a client library.**  Three
   remaining points closed (DOCS §4.32): (1) **server-per-surface** —
   `wl_conn.wm_mode` makes `xdg get_toplevel` spawn a real `gui_window` for the

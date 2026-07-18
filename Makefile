@@ -88,6 +88,16 @@ ifeq ($(ARCH),i386)
                        $(patsubst %,user/%_muslblob.o,$(MUSL_COREUTILS))
   endif
 
+  # §M37: dynamic-linking artifacts need the SHARED musl (libc.so, produced by
+  # the same `make musl`).  ldmusl = the dynamic linker itself (embedded so the
+  # kernel can install it at /lib/ld-musl-i386.so.1); muslhellodyn = a
+  # dynamically-linked test program (PT_INTERP set, PIE main).
+  ifneq ($(wildcard third_party/musl-i386/lib/libc.so),)
+    ARCH_EXTRA_OBJS += user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
+                       user/libgreet_blob.o user/solibtest_dynblob.o \
+                       user/dlopentest_dynblob.o
+  endif
+
   # Tier B — in-tree user libc build knobs (i386 reference).
   USER_CFLAGS   := -m32 -ffreestanding -fno-pie -fno-stack-protector \
                    -fno-builtin -nostdlib -Os -Wall -std=c11 -Iuser
@@ -488,31 +498,47 @@ ISO        := $(BUILD_DIR)/d-os.iso
 all: $(KERNEL_BIN)
 
 # -----------------------------------------------------------------------------
-# musl (§M36 stage 2) — build the vendored, PRISTINE musl as a static i386 libc.
+# musl (§M36 stage 2 + §M37) — build the vendored, PRISTINE musl as an i386 libc,
+# BOTH static (libc.a) AND shared (libc.so).
 #
 # musl is fetched (not committed) by scripts/fetch-musl.sh into third_party/musl
 # and built here into third_party/musl-i386/ (also gitignored).  We do NOT patch
 # musl — d-os provides the Linux i386 syscall ABI it targets (linux_abi.c).  Run
 # this INSIDE the build container (gcc-multilib), e.g.:
 #     docker run --rm --platform=linux/amd64 -v "$PWD":/src d-os-build make musl
-# Produces third_party/musl-i386/lib/{libc.a,crt1.o,crti.o,crtn.o} + include/.
+#
+# §M36 needs the static libc.a (statically-linked musl programs — muslhello,
+# coreutils).  §M37 (dynamic linking) additionally needs the SHARED build:
+# musl's libc.so IS the dynamic linker (the interpreter /lib/ld-musl-i386.so.1
+# is a symlink to libc.so), so `--enable-shared` (musl's default — we simply
+# stopped passing --disable-shared) yields both:
+#   lib/libc.a               — static archive (§M36)
+#   lib/libc.so              — shared library == the dynamic linker (§M37)
+#   lib/ld-musl-i386.so.1    — symlink → libc.so (the PT_INTERP target)
+# Produces third_party/musl-i386/lib/{libc.a,libc.so,crt1.o,Scrt1.o,crti.o,
+# crtn.o} + include/.
 # -----------------------------------------------------------------------------
 MUSL_SRC    := third_party/musl
 MUSL_PREFIX := third_party/musl-i386
 MUSL_LIBC   := $(MUSL_PREFIX)/lib/libc.a
+MUSL_LIBSO  := $(MUSL_PREFIX)/lib/libc.so
 
-musl: $(MUSL_LIBC)
+musl: $(MUSL_LIBSO)
+
+# The shared library is the newer artifact; depending on it (and having its
+# recipe also produce libc.a) makes `make musl` build both in one configure.
+$(MUSL_LIBSO): $(MUSL_LIBC)
 
 $(MUSL_LIBC):
 	@test -f $(MUSL_SRC)/configure || { \
 	  echo "musl source missing — run ./scripts/fetch-musl.sh first"; exit 1; }
 	cd $(MUSL_SRC) && CC='gcc -m32' ./configure \
-	    --target=i386 --disable-shared --prefix=$(CURDIR)/$(MUSL_PREFIX) \
+	    --target=i386 --prefix=$(CURDIR)/$(MUSL_PREFIX) \
 	    AR=ar RANLIB=ranlib
 
 	$(MAKE) -C $(MUSL_SRC) -j
 	$(MAKE) -C $(MUSL_SRC) install
-	@echo "musl static i386 libc built → $(MUSL_PREFIX)/lib/"
+	@echo "musl i386 libc (static + shared) built → $(MUSL_PREFIX)/lib/"
 
 musl-clean:
 	-$(MAKE) -C $(MUSL_SRC) clean 2>/dev/null || true
@@ -778,6 +804,75 @@ $(OBJ_DIR)/user/%_muslblob.o: user/%.muslelf
 	@mkdir -p $(@D)
 	objcopy --input-target=binary --output-target=elf32-i386 \
 	    --binary-architecture=i386 $< $@
+
+# §M37 — DYNAMICALLY-linked musl programs.  Same compile, but linked as a PIE
+# (-pie) against the SHARED libc.so with the musl dynamic linker as PT_INTERP
+# (/lib/ld-musl-i386.so.1).  Scrt1.o is the PIC/PIE crt0.  We link libc by name
+# (-L…lib -lc) NOT by full path, so DT_NEEDED records "libc.so" (a clean soname
+# the on-target ld.so can resolve), not a build path.  The kernel loads the main
+# object at the user base and the interpreter clear of it, then jumps to ld.so
+# (see proc.c) — ld.so does all relocation + symbol resolution in ring 3.
+# Generic: user/<name>.c → user/<name>.dynelf → <name>_dynblob.o
+# (symbol _binary_user_<name>_dynelf_start).
+MUSL_DYN_CFLAGS := $(MUSL_CC_FLAGS:-static=) -fPIC -fno-stack-protector
+user/%.dynelf: user/%.c $(MUSL_LIBSO)
+	@mkdir -p $(OBJ_DIR)/user
+	gcc $(MUSL_DYN_CFLAGS) -c user/$*.c -I$(MUSL_PREFIX)/include \
+	    -o $(OBJ_DIR)/user/$*.dyno
+	ld -m elf_i386 -pie -dynamic-linker /lib/ld-musl-i386.so.1 -e _start -o $@ \
+	    $(MUSL_PREFIX)/lib/Scrt1.o $(MUSL_PREFIX)/lib/crti.o \
+	    $(OBJ_DIR)/user/$*.dyno \
+	    -L$(MUSL_PREFIX)/lib --start-group -lc \
+	    `gcc -m32 -print-libgcc-file-name` --end-group \
+	    $(MUSL_PREFIX)/lib/crtn.o
+
+$(OBJ_DIR)/user/%_dynblob.o: user/%.dynelf
+	@mkdir -p $(@D)
+	objcopy --input-target=binary --output-target=elf32-i386 \
+	    --binary-architecture=i386 $< $@
+
+# §M37 — the musl dynamic linker == the shared libc.so, embedded so the kernel
+# can install it at /lib/ld-musl-i386.so.1 at boot (pkg.c ldso_provision).  We
+# stage a copy named `ldmusl.so` so objcopy derives the clean symbol
+# _binary_user_ldmusl_so_start (path-based naming) — matching pkg.c's externs.
+$(OBJ_DIR)/user/ldmusl_blob.o: $(MUSL_LIBSO)
+	@mkdir -p $(@D)
+	cp $(MUSL_LIBSO) user/ldmusl.so
+	objcopy --input-target=binary --output-target=elf32-i386 \
+	    --binary-architecture=i386 user/ldmusl.so $@
+	rm -f user/ldmusl.so
+
+# §M37 stage 5 — a genuinely SEPARATE shared library (libgreet.so) + a program
+# that links against it by name.  libgreet.so is embedded as a blob (installed
+# at /lib/libgreet.so by pkg.c) so ld.so can resolve the program's DT_NEEDED
+# "libgreet.so" via the /lib search path at runtime.
+user/libgreet.so: user/libgreet.c $(MUSL_LIBSO)
+	@mkdir -p $(OBJ_DIR)/user
+	gcc -m32 -fPIC -Os -Wall -c user/libgreet.c -I$(MUSL_PREFIX)/include \
+	    -o $(OBJ_DIR)/user/libgreet.o
+	ld -m elf_i386 -shared -soname libgreet.so -o $@ \
+	    $(OBJ_DIR)/user/libgreet.o \
+	    -L$(MUSL_PREFIX)/lib --start-group -lc \
+	    `gcc -m32 -print-libgcc-file-name` --end-group
+
+$(OBJ_DIR)/user/libgreet_blob.o: user/libgreet.so
+	@mkdir -p $(@D)
+	objcopy --input-target=binary --output-target=elf32-i386 \
+	    --binary-architecture=i386 $< $@
+
+# solibtest overrides the generic %.dynelf rule to also link -lgreet (its
+# DT_NEEDED then lists libgreet.so + libc.so).
+user/solibtest.dynelf: user/solibtest.c user/libgreet.so $(MUSL_LIBSO)
+	@mkdir -p $(OBJ_DIR)/user
+	gcc $(MUSL_DYN_CFLAGS) -c user/solibtest.c \
+	    -I$(MUSL_PREFIX)/include -o $(OBJ_DIR)/user/solibtest.dyno
+	ld -m elf_i386 -pie -dynamic-linker /lib/ld-musl-i386.so.1 -e _start -o $@ \
+	    $(MUSL_PREFIX)/lib/Scrt1.o $(MUSL_PREFIX)/lib/crti.o \
+	    $(OBJ_DIR)/user/solibtest.dyno \
+	    -L$(OBJ_DIR)/user -Luser -lgreet \
+	    -L$(MUSL_PREFIX)/lib --start-group -lc \
+	    `gcc -m32 -print-libgcc-file-name` --end-group \
+	    $(MUSL_PREFIX)/lib/crtn.o
 
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)

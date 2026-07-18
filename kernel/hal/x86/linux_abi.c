@@ -55,6 +55,7 @@ extern uint32_t saved_eip;
 #define LNX_writev         146
 #define LNX_rt_sigprocmask 175
 #define LNX_mmap2          192
+#define LNX_fstat64        197
 #define LNX_set_thread_area 243
 #define LNX_exit_group     252
 #define LNX_getdents64     220
@@ -64,6 +65,7 @@ extern uint32_t saved_eip;
 
 #define LNX_ENOSYS  38
 #define LNX_ENOTTY  25
+#define LNX_ENOENT   2
 
 /* Linux i386 O_* open flags (asm-generic/fcntl.h).  These do NOT match d-os's
  * VFS_* bits, so LNX_open/openat must TRANSLATE, not pass raw — musl opens with
@@ -92,6 +94,38 @@ static int linux_open_flags(int lf) {
 
 /* Linux i386 struct iovec (for writev). */
 struct lnx_iovec { void* iov_base; uint32_t iov_len; };
+
+/* Linux i386 `struct stat64` (asm/stat.h) — the layout SYS_fstat64 fills and
+ * musl copies from.  ld.so's map_library fstats a .so to learn its size before
+ * mmapping it, so st_size (offset 44) is the field that matters; st_mode marks
+ * it a regular file, st_dev/st_ino let musl dedup already-loaded objects. */
+struct lnx_stat64 {
+    uint64_t st_dev;        uint32_t __pad0;
+    uint32_t __st_ino;      uint32_t st_mode;      uint32_t st_nlink;
+    uint32_t st_uid;        uint32_t st_gid;
+    uint64_t st_rdev;       uint32_t __pad3;
+    int64_t  st_size;       uint32_t st_blksize;   uint64_t st_blocks;
+    uint32_t st_atime;      uint32_t st_atime_nsec;
+    uint32_t st_mtime;      uint32_t st_mtime_nsec;
+    uint32_t st_ctime;      uint32_t st_ctime_nsec;
+    uint64_t st_ino;
+} __attribute__((packed));
+
+#define LNX_S_IFREG 0100000u
+#define LNX_S_IFDIR 0040000u
+
+/* Fill a Linux stat64 from d-os's kstat (translated in one place). */
+static void fill_stat64(struct lnx_stat64* s, const struct kstat* k) {
+    for (unsigned i = 0; i < sizeof *s; i++) ((uint8_t*)s)[i] = 0;
+    s->st_mode    = (k->type == 1 /*INODE_DIR*/ ? LNX_S_IFDIR : LNX_S_IFREG) | 0755u;
+    s->st_nlink   = 1;
+    s->st_size    = (int64_t)(uint32_t)k->size;
+    s->st_blksize = 4096;
+    s->st_blocks  = ((uint64_t)(uint32_t)k->size + 511) / 512;
+    s->st_dev     = 1;
+    s->__st_ino   = (uint32_t)k->size + 1;   /* crude but stable-per-file id */
+    s->st_ino     = s->__st_ino;
+}
 
 /* Linux i386 `struct user_desc` (arch/x86/include/asm/ldt.h), the argument to
  * set_thread_area.  We only consume entry_number (write-back) + base_addr; the
@@ -161,9 +195,10 @@ void linux_syscall_dispatch(struct int_frame* f) {
         }
 
         case LNX_mprotect:
-            /* We don't enforce page protections on the anonymous mappings musl
-             * allocates (mallocng calls mprotect) — accept as a no-op. */
-            f->eax = 0;
+            /* §M37: real mprotect(addr=ebx, len=ecx, prot=edx).  mallocng maps a
+             * PROT_NONE reservation then mprotects the used part to R/W; ld.so
+             * tightens RELRO to read-only.  Must actually change PTE perms. */
+            f->eax = (uint32_t)sys_mprotect(f->ebx, (size_t)f->ecx, (int)f->edx);
             return;
 
         case LNX_rt_sigprocmask:
@@ -180,11 +215,15 @@ void linux_syscall_dispatch(struct int_frame* f) {
             f->eax = 0;
             return;
 
-        case LNX_open:
-            /* open(path=ebx, flags=ecx, mode=edx) — translate flags, ignore mode. */
-            f->eax = (uint32_t)sys_open((const char*)f->ebx,
-                                        linux_open_flags((int)f->ecx));
+        case LNX_open: {
+            /* open(path=ebx, flags=ecx, mode=edx) — translate flags, ignore mode.
+             * On failure return -ENOENT (not a generic -1): musl's library search
+             * loop only advances to the next candidate path on ENOENT-class
+             * errors, so a generic error would abort the search. */
+            long r = sys_open((const char*)f->ebx, linux_open_flags((int)f->ecx));
+            f->eax = (r < 0) ? (uint32_t)-LNX_ENOENT : (uint32_t)r;
             return;
+        }
 
         case LNX_openat: {
             /* openat(dirfd=ebx, path=ecx, flags=edx, mode=esi).  We support the
@@ -192,13 +231,24 @@ void linux_syscall_dispatch(struct int_frame* f) {
              * uses for open(); a real dirfd is a follow-up. */
             int dirfd = (int)f->ebx;
             if (dirfd != LAT_FDCWD) { f->eax = (uint32_t)-LNX_ENOSYS; return; }
-            f->eax = (uint32_t)sys_open((const char*)f->ecx,
-                                        linux_open_flags((int)f->edx));
+            long r = sys_open((const char*)f->ecx, linux_open_flags((int)f->edx));
+            f->eax = (r < 0) ? (uint32_t)-LNX_ENOENT : (uint32_t)r;
             return;
         }
         case LNX_close:
             f->eax = (uint32_t)sys_close((int)f->ebx);
             return;
+
+        case LNX_fstat64: {
+            /* fstat64(fd=ebx, statbuf=ecx).  ld.so's map_library fstats a .so to
+             * learn its size before mmapping it.  Translate d-os kstat → Linux
+             * stat64.  (statx (383) is left ENOSYS; musl falls back to this.) */
+            struct kstat k;
+            if (sys_fstat((int)f->ebx, &k) != 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
+            fill_stat64((struct lnx_stat64*)f->ecx, &k);
+            f->eax = 0;
+            return;
+        }
 
         case LNX_getdents64:
             /* readdir — musl packs the Linux dirent64 layout (sys_getdents64). */
@@ -264,13 +314,16 @@ void linux_syscall_dispatch(struct int_frame* f) {
 
         case LNX_mmap2: {
             /* i386 mmap2(addr=ebx, len=ecx, prot=edx, flags=esi, fd=edi,
-             * pgoff=ebp).  We support anonymous (fd == -1) mappings — musl's
-             * malloc uses MAP_ANONYMOUS|MAP_PRIVATE, fd=-1 — and the d-os mmap
-             * bump-allocates a user VA.  (Earlier this misread len from edx /
-             * fd from esi — prot/flags — so any malloc-driven mmap failed.) */
-            uint32_t len = f->ecx;
-            int fd = (int)f->edi;
-            long r = sys_mmap((size_t)len, fd < 0 ? -1 : fd);
+             * pgoff=ebp) — pgoff is in PAGES.  §M37: full mmap so musl's ld.so
+             * can load shared objects (file-backed segments at an offset, some
+             * MAP_FIXED over a reservation) — not just anonymous malloc pages. */
+            uintptr_t addr = f->ebx;
+            uint32_t  len  = f->ecx;
+            int       prot = (int)f->edx;
+            int       flags = (int)f->esi;
+            int       fd   = (int)f->edi;
+            uint64_t  off  = (uint64_t)f->ebp * 4096u;   /* pgoff → byte offset */
+            long r = sys_mmap_full(addr, (size_t)len, prot, flags, fd, off);
             f->eax = (r <= 0) ? (uint32_t)-12 /*ENOMEM*/ : (uint32_t)r;
             return;
         }

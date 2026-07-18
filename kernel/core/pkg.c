@@ -479,6 +479,16 @@ extern const unsigned char _binary_user_env_muslelf_end[]      __attribute__((we
 extern const unsigned char _binary_user_sh_muslelf_start[]     __attribute__((weak));
 extern const unsigned char _binary_user_sh_muslelf_end[]       __attribute__((weak));
 
+/* §M37: the musl dynamic linker (== the shared libc.so, embedded as a blob when
+ * `make musl` built the shared library).  Weak so the kernel links without it. */
+extern const unsigned char _binary_user_ldmusl_so_start[]      __attribute__((weak));
+extern const unsigned char _binary_user_ldmusl_so_end[]        __attribute__((weak));
+
+/* §M37 stage 5: a separate shared library, provisioned at /lib/libgreet.so so
+ * ld.so can resolve a program's DT_NEEDED "libgreet.so" via the search path. */
+extern const unsigned char _binary_user_libgreet_so_start[]    __attribute__((weak));
+extern const unsigned char _binary_user_libgreet_so_end[]      __attribute__((weak));
+
 static struct pkg_recipe rc_hello1, rc_hello2, rc_args, rc_echo, rc_cat, rc_ls, rc_env, rc_sh;
 
 static unsigned blob_len(const unsigned char* s, const unsigned char* e) {
@@ -494,9 +504,29 @@ static void register_coreutil(struct pkg_recipe* rc, const char* name,
     pkg_register(rc);
 }
 
+/* §M37: place the musl dynamic linker in the VFS at the canonical interpreter
+ * path a dynamically-linked musl binary carries in its PT_INTERP
+ * (/lib/ld-musl-i386.so.1).  When execve loads such a binary, the kernel reads
+ * this file to load the interpreter (see proc.c).  Also exposed at /lib/libc.so
+ * so ld.so can resolve a DT_NEEDED "libc.so" by the usual search path. */
+static void ldso_provision(void) {
+    if (!_binary_user_ldmusl_so_start) return;      /* musl shared not built */
+    unsigned len = blob_len(_binary_user_ldmusl_so_start, _binary_user_ldmusl_so_end);
+    vfs_mkdir("/lib");
+    write_file("/lib/ld-musl-i386.so.1", _binary_user_ldmusl_so_start, len);
+    write_file("/lib/libc.so",           _binary_user_ldmusl_so_start, len);
+
+    /* A separate shared library for the DT_NEEDED search-path test (stage 5). */
+    if (_binary_user_libgreet_so_start)
+        write_file("/lib/libgreet.so", _binary_user_libgreet_so_start,
+                   blob_len(_binary_user_libgreet_so_start,
+                            _binary_user_libgreet_so_end));
+}
+
 void pkg_init(void) {
     vfs_mkdir("/store");
     vfs_mkdir("/etc"); vfs_mkdir("/etc/pkg");
+    ldso_provision();
 
     /* Native (d-os libc) demo packages. */
     rc_hello1 = (struct pkg_recipe){ .id="hello-1", .name="hello", .version="1.0",
