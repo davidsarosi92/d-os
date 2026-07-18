@@ -1603,6 +1603,39 @@ static void cmd_musltest(void) {
     kprintf("musltest: returned rc=%d\n", rc);
 }
 
+/* §M26 — `wayclient`: a REAL ring-3 Wayland client.  Set up a usock_pair, hand
+ * one end to a spawned server task (wl_conn_serve) and install the other as the
+ * shell's fd 3, then exec user/wlclient.c — which speaks the Wayland wire
+ * protocol over fd 3 from user space.  The client blocks on read(3), the server
+ * task runs concurrently and answers; on exit fd_close_all() closes fd 3 and the
+ * server sees EOF + tears down. */
+extern const unsigned char _binary_user_wlclient_i386_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_wlclient_i386_elf_end[]   __attribute__((weak));
+
+static void cmd_wayclient(void) {
+    if (!_binary_user_wlclient_i386_elf_start) { console_write("wayclient: not embedded\n"); return; }
+    struct task* me = task_current();
+    if (me->fds[3]) { console_write("wayclient: fd 3 already in use\n"); return; }
+
+    struct usock *srv, *cli;
+    if (usock_pair(&srv, &cli) != 0) { console_write("wayclient: usock_pair failed\n"); return; }
+    struct ofile* cli_of = ofile_from_sock(cli);
+    struct wl_conn* conn = (struct wl_conn*)kmalloc(sizeof *conn);
+    if (!cli_of || !conn) { console_write("wayclient: out of memory\n");
+        if (cli_of) ofile_unref(cli_of); else usock_close(cli);
+        usock_close(srv); return; }
+
+    me->fds[3] = cli_of;                          /* client socket = fd 3 */
+    wl_conn_init(conn, srv);
+    task_spawn_arg("wl-server", wl_server_task, conn);   /* server on its own task */
+
+    console_write("wayclient: launching a ring-3 Wayland client (fd 3)...\n");
+    size_t len = (size_t)(_binary_user_wlclient_i386_elf_end -
+                          _binary_user_wlclient_i386_elf_start);
+    int rc = proc_exec_elf(_binary_user_wlclient_i386_elf_start, len);
+    kprintf("wayclient: client exited rc=%d\n", rc);   /* fd 3 auto-closed → server tears down */
+}
+
 /* §M35.5 + §M36 — `pkgrun <name> [args...]`: exec an INSTALLED package's binary
  * from the /store, with argv.  The package's declared .abi picks the exec
  * personality (pkg_run), so a musl/Linux coreutil and a native program run the
@@ -1832,6 +1865,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "waydemo"))        { wl_visible_demo();  return; }
     if (streq(line, "waywin"))         { wl_window_demo();   return; }
     if (streq(line, "wayinput"))       { wl_input_demo();    return; }
+    if (streq(line, "wayclient"))      { cmd_wayclient();    return; }
     if (starts_with(line, "pkgrun "))  { cmd_pkgrun(line + 7); return; }
     if (streq(line, "posixtest"))      { cmd_posixtest();    return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }

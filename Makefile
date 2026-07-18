@@ -75,7 +75,7 @@ ifeq ($(ARCH),i386)
                      user/sigtest_blob.o user/dnstest_blob.o \
                      user/httptest_blob.o user/threadtest_blob.o \
                      user/tlstest_blob.o user/posixtest_blob.o \
-                     user/linuxhello_blob.o
+                     user/linuxhello_blob.o user/wlclient_blob.o
 
   # REAL musl-linked programs are embedded ONLY when musl has been built
   # (`make musl`); otherwise the kernel builds without them.  This keeps the
@@ -727,6 +727,17 @@ user/linuxhello_$(ARCH).elf: user/linuxhello.c
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ $(OBJ_DIR)/user/linuxhello.o
 
 $(OBJ_DIR)/user/linuxhello_blob.o: user/linuxhello_$(ARCH).elf
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+# wlclient — a freestanding NATIVE-ABI ring-3 Wayland client (int 0x80 with d-os
+# syscall numbers, no libc); speaks the Wayland wire protocol over fd 3.
+user/wlclient_$(ARCH).elf: user/wlclient.c
+	@mkdir -p $(OBJ_DIR)/user
+	$(CC) $(USER_CFLAGS) -c user/wlclient.c -o $(OBJ_DIR)/user/wlclient.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ $(OBJ_DIR)/user/wlclient.o
+
+$(OBJ_DIR)/user/wlclient_blob.o: user/wlclient_$(ARCH).elf
 	@mkdir -p $(@D)
 	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 

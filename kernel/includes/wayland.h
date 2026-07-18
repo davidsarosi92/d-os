@@ -78,6 +78,15 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock);
  * handled (0 if none were buffered), or -1 if the peer closed / errored. */
 int  wl_conn_dispatch(struct wl_conn* c);
 
+/* Blocking server loop (for a dedicated server task): process requests as they
+ * arrive until the client closes the socket, then return. */
+void wl_conn_serve(struct wl_conn* c);
+
+/* Server-task entry (task_spawn_arg): serves a heap wl_conn passed as the task
+ * arg, then closes the socket + frees the conn.  Used by the `wayclient` demo
+ * to run the server concurrently with a ring-3 client. */
+void wl_server_task(void);
+
 /* Self-test entry (shell `waytest`): drive a client handshake over a
  * usock_pair against wl_conn_dispatch and log the exchange. */
 void wl_selftest(void);

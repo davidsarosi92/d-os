@@ -213,14 +213,16 @@ create_buffer + attach + commit → the server reads the client's pixels back
 → ack_configure).**  Also this session: **interactive `sh`** (cooked stdin via
 `vc_focused`/`vc_getchar` — `pkgrun sh` → `d-os$` REPL) and **x86_64 build parity
 restored** (trampoline stubs + net/audio/futex/pkg cores; Wayland runs on x86_64
-too).  **Compositor bridge DONE (`waydemo`): a `wl_conn.target` gfx_surface + blit
-origin; `wl_surface.commit` paints the buffer's pixels onto it → `waydemo` blits
-a committed 32×32 `wl_shm` buffer to the LIVE framebuffer, FB readback confirms
-`VISIBLE OK`.  So the full path — client shm buffer → SCM_RIGHTS → server read →
-composite → on-screen pixel — works (i386+x86_64).  Next Wayland: a WM-managed
-`gui_window` target (chrome/move; run the server as a compositor-hosted task) +
-`wl_seat` input + a real user-space client (§M40 libwayland).**  Also open: more
-coreutils, tty line-editing/`isatty`.
+too).  **§M26 CORE COMPLETE (i386+x86_64): wire handshake + shm buffers
+(SCM_RIGHTS) + xdg_shell + framebuffer bridge (`waydemo` VISIBLE OK) + a
+WM-managed `gui_window` target (`gui_window_blit`; `waywin` IN-WINDOW OK) +
+`wl_seat` input (`wl_send_key`/`wl_send_motion`; `wayinput`) + a REAL ring-3
+client (`user/wlclient.c` speaks the wire protocol over an inherited fd 3, server
+runs on its own `wl_conn_serve` task; `wayclient` parses 4 globals from user
+space).  Next: a server-per-surface compositor task, route the M22.7 input into
+`wl_send_*`, port libwayland-client (§M40) for unmodified Wayland apps.**  The
+desktop label is now dynamic (`kernel/includes/version.h` `DOS_MILESTONE` — bump
+it when a milestone ships).  Also open: more coreutils, tty line-editing/`isatty`.
 §M35 (threads/futex/TLS/per-CPU TSS) COMPLETE (UP+SMP, §4.28); also: §M34 POSIX
 (§4.27), §M24 sockets (§4.25), §M35.5 store (§4.29).  **§M26 Wayland deferred
 until POSIX + libc exist.**

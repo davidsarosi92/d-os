@@ -3324,10 +3324,29 @@ readback confirms `fb[200,150]` == the buffer's top-left (`VISIBLE OK`) — the
 full path client shm buffer → SCM_RIGHTS → server read → composite → **on-screen
 pixels** works, and is arch-independent (i386 + x86_64).
 
-**Next stages:** paint into a proper WM-managed `gui_window` (chrome + move/
-resize — run the server as a compositor-hosted task, `target` = the window's
-content surface); input (`wl_seat`/`wl_keyboard`/`wl_pointer` off the M22.7 input
-router); a real user-space client (and eventually libwayland-client, §M40).
+**WM-managed window, input, and a real ring-3 client — DONE.**
+- **`gui_window` target** (`waywin`): `gui_window_blit` paints a raw pixel block
+  into a window's content surface (under `win->lock`) + composites it; a
+  `wl_conn.window` makes `wl_surface.commit` blit the buffer into a real
+  WM-managed window (chrome + move/resize free from the M22 WM).  `gui_window_
+  pixel` reads it back: `window[0,0]` == the committed buffer → `IN-WINDOW OK`.
+- **`wl_seat` input** (`wayinput`): the server advertises `wl_seat` (v5), sends
+  `capabilities(pointer|keyboard)`, and `wl_send_key`/`wl_send_motion` push
+  `wl_keyboard.key` / `wl_pointer.motion` events to the client — the hooks the
+  M22.7 input router calls to forward real input.
+- **A real ring-3 client** (`wayclient`): `user/wlclient.c` is a freestanding
+  native-ABI program that speaks the Wayland wire protocol over an inherited
+  socket fd (fd 3); the shell hands one end of a `usock_pair` to a spawned
+  server task (`wl_conn_serve`) and installs the other as the client's fd 3, then
+  execs it.  The client blocks on `read(3)`, the server task answers
+  concurrently; the client parses the 4 globals + `wl_callback.done` from user
+  space and reports `handshake OK`.  A genuine client/server split over a unix
+  socket.
+
+**Next:** run the server as a proper compositor-hosted task per surface (so a
+client's window is a first-class desktop window); route the M22.7 input events
+into `wl_send_key`/`wl_send_motion`; port libwayland-client (§M40) so unmodified
+Wayland apps run.
 
 ---
 
@@ -3401,6 +3420,17 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-18 — M26: Wayland WM window + wl_seat input + a real ring-3 client.**
+  Three points close the core (DOCS §4.32): (1) `gui_window_blit`/`gui_window_
+  pixel` + `wl_conn.window` → a committed `wl_shm` buffer becomes a real
+  WM-managed window's contents (`waywin` → `IN-WINDOW OK`); (2) `wl_seat` (v5) +
+  `wl_send_key`/`wl_send_motion` → keyboard/pointer events to the client
+  (`wayinput`); (3) `user/wlclient.c` — a freestanding native-ABI **ring-3**
+  Wayland client speaking the wire protocol over an inherited fd 3, served by a
+  spawned `wl_conn_serve` task (`wayclient` → 4 globals parsed from user space).
+  Also: the desktop label is now dynamic (`version.h` `DOS_MILESTONE`, shows the
+  latest shipped M).  Next: server-per-surface compositor task, route M22.7
+  input, port libwayland (§M40).
 - **2026-07-13 — M26: Wayland compositor bridge — a wl_surface reaches the
   screen, i386+x86_64.**  `wl_conn.target` (a `gfx_surface` + blit origin); when
   set, `wl_surface.commit` paints the committed buffer's pixels onto it (DOCS

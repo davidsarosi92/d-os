@@ -54,7 +54,7 @@
 | §M23 | Audio subsystem — ✅ stage 1 (i386): AC97 PCM output + tone (DOCS §4.26) | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) — ✅ stages 1–3 (i386): virtio-net + ARP/IPv4/ICMP/UDP/TCP + DNS + ping/wget (DOCS §4.25) | ~1080 |
 | §M25 | Userland foundation (Wayland prerequisites) — ✅ stages 1–7 + Tier B tail (concurrent user processes + full-arch libc; DOCS §4.24) | ~1545 |
-| §M26 | Wayland server (wire protocol on M22 + M25) — ◐ stages 1-3 (i386+x86_64, DOCS §4.32): wire handshake + shm buffers via SCM_RIGHTS + xdg_shell top-level (`waytest`), AND the compositor bridge — `waydemo` blits a committed `wl_shm` buffer to the framebuffer (VISIBLE OK). TODO: WM-managed gui_window target + wl_seat input + real user client | ~1615 |
+| §M26 | Wayland server (wire protocol on M22 + M25) — ◐ nearly complete (i386+x86_64, DOCS §4.32): wire handshake + shm buffers (SCM_RIGHTS) + xdg_shell + framebuffer bridge, PLUS a WM-managed gui_window target (`waywin`, IN-WINDOW OK), wl_seat input (`wayinput`), and a REAL ring-3 client (`wayclient`, server on its own task). TODO: server-per-surface compositor task, route M22.7 input, port libwayland (§M40) | ~1615 |
 | §M27 | Process model — init, hierarchy, reaper, kill-tree — ✅ shipped | ~1818 |
 | §M28 | System log (klog ring buffer + dmesg) — ✅ shipped | ~1860 |
 | Tier A | Blocking primitives — wait-queue + task_wait + blocking IPC — ✅ shipped (DOCS §4.20) | — |

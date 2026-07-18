@@ -21,7 +21,8 @@
 #include "fd.h"          /* usock_pair/send/recv/close/can_read */
 #include "gfx.h"         /* gfx_surface / gfx_fb_surface — the compositor bridge */
 #include "gui.h"         /* gui_window_blit — the WM-managed window target      */
-#include "task.h"        /* task_msleep — let the compositor come up            */
+#include "task.h"        /* task_msleep / task_start_arg                        */
+#include "kmalloc.h"     /* the per-connection wl_conn for a server task        */
 #include "printf.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -266,11 +267,8 @@ static void wl_surface_commit(struct wl_conn* c) {
     send_buffer_release(c, c->buffer_id);
 }
 
-int wl_conn_dispatch(struct wl_conn* c) {
-    if (!usock_can_read(c->sock)) return 0;
-
-    uint8_t hdr[8];
-    if (recv_exact(c->sock, hdr, 8) != 8) return -1;     /* peer closed */
+/* Process one request whose 8-byte header has already been read. */
+static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
     uint32_t obj  = get32(hdr);
     uint32_t w2   = get32(hdr + 4);
     uint32_t size = w2 >> 16;
@@ -391,6 +389,33 @@ int wl_conn_dispatch(struct wl_conn* c) {
         kprintf("wayland: object %u (iface %u) opcode %u — unhandled\n", obj, iface, op);
     }
     return 1;
+}
+
+int wl_conn_dispatch(struct wl_conn* c) {
+    if (!usock_can_read(c->sock)) return 0;         /* non-blocking snapshot */
+    uint8_t hdr[8];
+    if (recv_exact(c->sock, hdr, 8) != 8) return -1;
+    return wl_process(c, hdr);
+}
+
+/* Blocking server loop for a dedicated server task: process requests as they
+ * arrive (recv_exact blocks) until the client closes the socket. */
+void wl_conn_serve(struct wl_conn* c) {
+    for (;;) {
+        uint8_t hdr[8];
+        if (recv_exact(c->sock, hdr, 8) != 8) break;   /* peer closed */
+        if (wl_process(c, hdr) < 0) break;
+    }
+}
+
+/* Server-task entry: the arg is a heap wl_conn (bound to the server socket).
+ * Serve the client until it closes, then tear the connection down. */
+void wl_server_task(void) {
+    struct wl_conn* conn = (struct wl_conn*)task_start_arg();
+    if (!conn) return;
+    wl_conn_serve(conn);
+    usock_close(conn->sock);
+    kfree(conn);
 }
 
 /* ---- self-test: a hand-marshalled client over a usock_pair ---------------- */
