@@ -29,7 +29,8 @@
 /* Interface tags stored in wl_conn.obj_iface[]. */
 enum { WLI_NONE = 0, WLI_DISPLAY, WLI_REGISTRY, WLI_CALLBACK,
        WLI_COMPOSITOR, WLI_SHM, WLI_SHM_POOL, WLI_BUFFER, WLI_SURFACE,
-       WLI_XDG_WM_BASE, WLI_XDG_SURFACE, WLI_XDG_TOPLEVEL };
+       WLI_XDG_WM_BASE, WLI_XDG_SURFACE, WLI_XDG_TOPLEVEL,
+       WLI_SEAT, WLI_POINTER, WLI_KEYBOARD };
 
 /* Real Wayland opcodes (from wayland.xml).  request = client→server. */
 enum { WL_DISPLAY_REQ_SYNC = 0, WL_DISPLAY_REQ_GET_REGISTRY = 1 };
@@ -49,6 +50,13 @@ enum { XDG_SURFACE_REQ_GET_TOPLEVEL = 1, XDG_SURFACE_REQ_ACK_CONFIGURE = 4 };
 enum { XDG_SURFACE_EVT_CONFIGURE = 0 };
 enum { XDG_TOPLEVEL_REQ_SET_TITLE = 2 };
 enum { XDG_TOPLEVEL_EVT_CONFIGURE = 0, XDG_TOPLEVEL_EVT_CLOSE = 1 };
+/* wl_seat / wl_pointer / wl_keyboard (input). */
+enum { WL_SEAT_REQ_GET_POINTER = 0, WL_SEAT_REQ_GET_KEYBOARD = 1 };
+enum { WL_SEAT_EVT_CAPABILITIES = 0 };
+enum { WL_SEAT_CAP_POINTER = 1, WL_SEAT_CAP_KEYBOARD = 2 };
+enum { WL_POINTER_EVT_MOTION = 2, WL_POINTER_EVT_BUTTON = 3 };
+enum { WL_KEYBOARD_EVT_KEY = 3 };
+enum { WL_KEY_RELEASED = 0, WL_KEY_PRESSED = 1 };
 
 /* wl_shm pixel formats (subset). */
 enum { WL_SHM_FORMAT_ARGB8888 = 0, WL_SHM_FORMAT_XRGB8888 = 1 };
@@ -59,6 +67,7 @@ static const struct wl_global g_globals[] = {
     { 1, "wl_compositor", 4 },
     { 2, "wl_shm",        1 },
     { 3, "xdg_wm_base",   2 },
+    { 4, "wl_seat",       5 },
 };
 #define WL_NGLOBALS (int)(sizeof g_globals / sizeof g_globals[0])
 
@@ -164,6 +173,40 @@ static void send_xdg_surface_configure(struct wl_conn* c, uint32_t xs, uint32_t 
     usock_send(c->sock, msg, 12, NULL);
 }
 
+/* Emit wl_seat.capabilities(caps) — a bitmask of WL_SEAT_CAP_*. */
+static void send_seat_capabilities(struct wl_conn* c, uint32_t seat, uint32_t caps) {
+    uint8_t msg[12];
+    put32(msg + 0, seat);
+    put32(msg + 4, (12u << 16) | WL_SEAT_EVT_CAPABILITIES);
+    put32(msg + 8, caps);
+    usock_send(c->sock, msg, 12, NULL);
+}
+
+/* Emit wl_keyboard.key(serial, time, key, state). */
+void wl_send_key(struct wl_conn* c, uint32_t key, int pressed) {
+    if (!c->keyboard_id) return;
+    uint8_t msg[24];
+    put32(msg + 0, c->keyboard_id);
+    put32(msg + 4, (24u << 16) | WL_KEYBOARD_EVT_KEY);
+    put32(msg + 8, ++c->serial);                 /* serial */
+    put32(msg + 12, 0);                          /* time   */
+    put32(msg + 16, key);
+    put32(msg + 20, pressed ? WL_KEY_PRESSED : WL_KEY_RELEASED);
+    usock_send(c->sock, msg, 24, NULL);
+}
+
+/* Emit wl_pointer.motion(time, x, y) — coordinates are 24.8 fixed-point. */
+void wl_send_motion(struct wl_conn* c, int x, int y) {
+    if (!c->pointer_id) return;
+    uint8_t msg[20];
+    put32(msg + 0, c->pointer_id);
+    put32(msg + 4, (20u << 16) | WL_POINTER_EVT_MOTION);
+    put32(msg + 8, 0);                            /* time            */
+    put32(msg + 12, (uint32_t)(x << 8));          /* surface_x fixed */
+    put32(msg + 16, (uint32_t)(y << 8));          /* surface_y fixed */
+    usock_send(c->sock, msg, 20, NULL);
+}
+
 /* ---- connection + dispatch ----------------------------------------------- */
 
 void wl_conn_init(struct wl_conn* c, struct usock* sock) {
@@ -176,6 +219,7 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock) {
     c->surface_id = c->buffer_id = 0;
     c->buf_off = c->buf_w = c->buf_h = c->buf_stride = 0;
     c->xdg_surface_id = c->xdg_toplevel_id = 0;
+    c->pointer_id = c->keyboard_id = 0;
     c->target = NULL;
     c->blit_x = c->blit_y = 0;
     c->window = NULL;
@@ -260,12 +304,15 @@ int wl_conn_dispatch(struct wl_conn* c) {
         uint32_t new_id = get32(body + o + 4);           /* after version */
         uint8_t bi = (name == 1) ? WLI_COMPOSITOR :
                      (name == 2) ? WLI_SHM :
-                     (name == 3) ? WLI_XDG_WM_BASE : WLI_NONE;
+                     (name == 3) ? WLI_XDG_WM_BASE :
+                     (name == 4) ? WLI_SEAT : WLI_NONE;
         if (new_id < WL_MAX_OBJECTS) c->obj_iface[new_id] = bi;
         kprintf("wayland: bind(name=%u) -> object %u\n", name, new_id);
         if (bi == WLI_SHM) {                             /* advertise formats */
             send_shm_format(c, new_id, WL_SHM_FORMAT_ARGB8888);
             send_shm_format(c, new_id, WL_SHM_FORMAT_XRGB8888);
+        } else if (bi == WLI_SEAT) {                     /* advertise input caps */
+            send_seat_capabilities(c, new_id, WL_SEAT_CAP_POINTER | WL_SEAT_CAP_KEYBOARD);
         }
 
     } else if (iface == WLI_COMPOSITOR && op == WL_COMPOSITOR_REQ_CREATE_SURFACE && blen >= 4) {
@@ -328,6 +375,18 @@ int wl_conn_dispatch(struct wl_conn* c) {
     } else if (iface == WLI_XDG_SURFACE && op == XDG_SURFACE_REQ_ACK_CONFIGURE && blen >= 4) {
         kprintf("wayland: xdg_surface ack_configure(serial=%u)\n", get32(body));
 
+    } else if (iface == WLI_SEAT && op == WL_SEAT_REQ_GET_POINTER && blen >= 4) {
+        uint32_t nid = get32(body);
+        if (nid < WL_MAX_OBJECTS) c->obj_iface[nid] = WLI_POINTER;
+        c->pointer_id = nid;
+        kprintf("wayland: get_pointer -> object %u\n", nid);
+
+    } else if (iface == WLI_SEAT && op == WL_SEAT_REQ_GET_KEYBOARD && blen >= 4) {
+        uint32_t nid = get32(body);
+        if (nid < WL_MAX_OBJECTS) c->obj_iface[nid] = WLI_KEYBOARD;
+        c->keyboard_id = nid;
+        kprintf("wayland: get_keyboard -> object %u\n", nid);
+
     } else {
         kprintf("wayland: object %u (iface %u) opcode %u — unhandled\n", obj, iface, op);
     }
@@ -349,6 +408,9 @@ int wl_conn_dispatch(struct wl_conn* c) {
 #define WLC_XDG_WM_BASE  9u
 #define WLC_XDG_SURFACE 10u
 #define WLC_XDG_TOPLEVEL 11u
+#define WLC_SEAT        12u
+#define WLC_POINTER     13u
+#define WLC_KEYBOARD    14u
 
 /* The last xdg_surface.configure serial the client saw (to ack_configure). */
 static uint32_t g_config_serial = 0;
@@ -389,6 +451,17 @@ static void client_drain(struct usock* cli) {
             kprintf("  client: xdg_surface.configure(serial=%u)\n", g_config_serial);
         } else if (obj == WLC_XDG_TOPLEVEL && op == XDG_TOPLEVEL_EVT_CONFIGURE) {
             kprintf("  client: xdg_toplevel.configure(%ux%u)\n", get32(body), get32(body + 4));
+        } else if (obj == WLC_SEAT && op == WL_SEAT_EVT_CAPABILITIES) {
+            uint32_t caps = get32(body);
+            kprintf("  client: seat capabilities=%x (%s%s)\n", caps,
+                    (caps & WL_SEAT_CAP_POINTER) ? "pointer " : "",
+                    (caps & WL_SEAT_CAP_KEYBOARD) ? "keyboard" : "");
+        } else if (obj == WLC_POINTER && op == WL_POINTER_EVT_MOTION) {
+            kprintf("  client: pointer motion (%d,%d)\n",
+                    (int)get32(body + 4) >> 8, (int)get32(body + 8) >> 8);
+        } else if (obj == WLC_KEYBOARD && op == WL_KEYBOARD_EVT_KEY) {
+            kprintf("  client: key %u %s\n", get32(body + 8),
+                    get32(body + 12) == WL_KEY_PRESSED ? "pressed" : "released");
         } else {
             kprintf("  client: event obj=%u op=%u\n", obj, op);
         }
@@ -638,6 +711,40 @@ void wl_window_demo(void) {
     uint32_t got = gui_window_pixel(win, 0, 0);
     kprintf("waywin: window[0,0]=%x (buffer top-left=%x) -> %s\n",
             got, topleft, got == topleft ? "IN-WINDOW OK" : "MISMATCH");
+
+    usock_close(cli);
+    usock_close(srv);
+}
+
+/* ---- input demo: wl_seat / wl_keyboard / wl_pointer ----------------------- */
+
+void wl_input_demo(void) {
+    struct usock *cli, *srv;
+    if (usock_pair(&cli, &srv) != 0) { kprintf("wayinput: usock_pair failed\n"); return; }
+    struct wl_conn conn;
+    wl_conn_init(&conn, srv);
+    kprintf("wayinput: wl_seat — keyboard + pointer\n");
+
+    client_send1(cli, WL_DISPLAY_REQ_GET_REGISTRY, WLC_REGISTRY);
+    wl_conn_dispatch(&conn); client_drain(cli);
+
+    client_bind(cli, 4, "wl_seat", 5, WLC_SEAT);
+    wl_conn_dispatch(&conn); client_drain(cli);            /* capabilities */
+
+    { uint32_t a[] = { WLC_POINTER };
+      client_msg(cli, WLC_SEAT, WL_SEAT_REQ_GET_POINTER, a, 1, NULL); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_KEYBOARD };
+      client_msg(cli, WLC_SEAT, WL_SEAT_REQ_GET_KEYBOARD, a, 1, NULL); }
+    wl_conn_dispatch(&conn);
+
+    /* The server side forwards input (here: synthetic; the M22.7 router feeds
+     * real events the same way). */
+    kprintf("wayinput: server forwarding key 30 ('a') + pointer motion (120,80)\n");
+    wl_send_key(&conn, 30, 1);                             /* evdev keycode 30 = 'a' */
+    wl_send_key(&conn, 30, 0);
+    wl_send_motion(&conn, 120, 80);
+    client_drain(cli);
 
     usock_close(cli);
     usock_close(srv);

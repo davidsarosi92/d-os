@@ -56,6 +56,10 @@ struct wl_conn {
     uint32_t      xdg_surface_id;       /* xdg_surface wrapping the wl_surface  */
     uint32_t      xdg_toplevel_id;      /* xdg_toplevel role                    */
 
+    /* wl_seat — the input objects the client created (0 = none). */
+    uint32_t      pointer_id;
+    uint32_t      keyboard_id;
+
     /* Compositor bridge: when set, wl_surface.commit blits the buffer's pixels
      * into `target` at (blit_x, blit_y) — the surface's contents become visible
      * pixels.  NULL = headless (commit only reads/logs the buffer). */
@@ -86,5 +90,12 @@ void wl_visible_demo(void);
 /* Windowed demo (shell `waywin`, GUI mode): the surface is backed by a real
  * WM-managed gui_window; the committed buffer becomes the window's contents. */
 void wl_window_demo(void);
+
+/* wl_seat input: send a wl_keyboard.key / wl_pointer.motion event to the client.
+ * The M22.7 input router will call these to forward real keyboard/mouse input;
+ * `wl_input_demo` (shell `wayinput`) injects synthetic events as a self-test. */
+void wl_send_key   (struct wl_conn* c, uint32_t key, int pressed);
+void wl_send_motion(struct wl_conn* c, int x, int y);
+void wl_input_demo (void);
 
 #endif /* WAYLAND_H */
