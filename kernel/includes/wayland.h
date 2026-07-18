@@ -31,6 +31,7 @@
 struct usock;
 struct shm;
 struct gfx_surface;
+struct gui_window;
 
 /* The fixed object-id of wl_display (the protocol root). */
 #define WL_DISPLAY_ID  1u
@@ -60,6 +61,9 @@ struct wl_conn {
      * pixels.  NULL = headless (commit only reads/logs the buffer). */
     struct gfx_surface* target;
     int           blit_x, blit_y;
+    /* Alternatively, a WM-managed window whose content IS the surface: commit
+     * blits the buffer into it (chrome + move/resize come free from the WM). */
+    struct gui_window*  window;
 };
 
 /* Initialise a connection over `sock` (registers wl_display as object 1). */
@@ -78,5 +82,9 @@ void wl_selftest(void);
  * surface whose server side is bridged to the framebuffer, so the pixels land
  * on screen; then reads a framebuffer pixel back as proof. */
 void wl_visible_demo(void);
+
+/* Windowed demo (shell `waywin`, GUI mode): the surface is backed by a real
+ * WM-managed gui_window; the committed buffer becomes the window's contents. */
+void wl_window_demo(void);
 
 #endif /* WAYLAND_H */

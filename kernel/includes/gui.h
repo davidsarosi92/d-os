@@ -24,6 +24,8 @@
 #ifndef GUI_H
 #define GUI_H
 
+#include <stdint.h>
+
 struct gui_window;                     /* opaque outside kernel/gui/ */
 struct widget;
 
@@ -102,6 +104,14 @@ int  gui_widget_focused(struct widget* w);      /* is w the focused one? */
 
 /* Content-area size in pixels (excludes decorations). */
 int  gui_window_content_size(struct gui_window* win, int* w, int* h);
+
+/* §M26 — paint a raw ARGB pixel block into a window's content surface (at
+ * content-relative x,y) and composite it.  The Wayland server uses this to turn
+ * a committed wl_shm buffer into a real window's contents.  `gui_window_pixel`
+ * reads a content pixel back (self-tests). */
+void     gui_window_blit(struct gui_window* win, int x, int y,
+                         const uint32_t* px, int w, int h, int stride);
+uint32_t gui_window_pixel(struct gui_window* win, int x, int y);
 
 /* App context accessor (the pointer passed to gui_app_window_create). */
 void* gui_window_ctx(struct gui_window* win);

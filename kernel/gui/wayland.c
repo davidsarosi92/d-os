@@ -20,6 +20,8 @@
 #include "wayland.h"
 #include "fd.h"          /* usock_pair/send/recv/close/can_read */
 #include "gfx.h"         /* gfx_surface / gfx_fb_surface — the compositor bridge */
+#include "gui.h"         /* gui_window_blit — the WM-managed window target      */
+#include "task.h"        /* task_msleep — let the compositor come up            */
 #include "printf.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -176,6 +178,7 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock) {
     c->xdg_surface_id = c->xdg_toplevel_id = 0;
     c->target = NULL;
     c->blit_x = c->blit_y = 0;
+    c->window = NULL;
 }
 
 /* wl_surface.commit — the moment the client's frame becomes current.  Read the
@@ -205,9 +208,17 @@ static void wl_surface_commit(struct wl_conn* c) {
             }
         }
     }
+    /* WM-managed window target: the buffer becomes the window's contents.
+     * (Single-frame buffers: the pixels are contiguous in frames[0].) */
+    if (c->window && s->nframes >= 1) {
+        gui_window_blit(c->window, 0, 0,
+                        (const uint32_t*)(uintptr_t)s->frames[0] + c->buf_off / 4,
+                        (int)c->buf_w, (int)c->buf_h, (int)(c->buf_stride / 4));
+    }
+
     kprintf("wayland: COMMIT surface %u: %ux%u buffer, top-left=%x checksum=%x%s\n",
             c->surface_id, c->buf_w, c->buf_h, topleft, sum,
-            t ? " (blitted to screen)" : "");
+            c->window ? " (blitted to window)" : t ? " (blitted to screen)" : "");
     send_buffer_release(c, c->buffer_id);
 }
 
@@ -572,6 +583,61 @@ void wl_visible_demo(void) {
     uint32_t got = fb.px[BY * fb.stride + BX];
     kprintf("waydemo: framebuffer[%d,%d]=%x (buffer top-left=%x) -> %s\n",
             BX, BY, got, topleft, got == topleft ? "VISIBLE OK" : "MISMATCH");
+
+    usock_close(cli);
+    usock_close(srv);
+}
+
+/* ---- windowed demo: a wl_surface backed by a WM-managed gui_window --------- */
+
+void wl_window_demo(void) {
+    gui_start();                 /* bring up the compositor if it isn't already */
+    task_msleep(300);            /* let the desktop/compositor task initialise   */
+
+    struct gui_window* win = gui_app_window_create("Wayland surface", 320, 200,
+                                                   200, 160, NULL, NULL);
+    if (!win) { kprintf("waywin: could not create a window\n"); return; }
+
+    const uint32_t W = 32, H = 32, STRIDE = W * 4;
+    struct shm* buf = shm_create((size_t)STRIDE * H);
+    if (!buf) { kprintf("waywin: shm alloc failed\n"); return; }
+    volatile uint32_t* px = (volatile uint32_t*)(uintptr_t)buf->frames[0];
+    for (uint32_t y = 0; y < H; y++)
+        for (uint32_t x = 0; x < W; x++)
+            px[y * W + x] = 0xFF000000u | ((x * 8u) << 16) | ((y * 8u) << 8) | 0x40u;
+    uint32_t topleft = px[0];
+    struct ofile* buf_of = ofile_from_shm(buf);
+
+    struct usock *cli, *srv;
+    if (usock_pair(&cli, &srv) != 0) { kprintf("waywin: usock_pair failed\n"); return; }
+    struct wl_conn conn;
+    wl_conn_init(&conn, srv);
+    conn.window = win;                            /* bridge to a real window */
+
+    kprintf("waywin: committing a %ux%u wl_shm buffer into a gui_window\n", W, H);
+    client_send1(cli, WL_DISPLAY_REQ_GET_REGISTRY, WLC_REGISTRY);
+    wl_conn_dispatch(&conn); client_drain(cli);
+    client_bind(cli, 1, "wl_compositor", 4, WLC_COMPOSITOR);
+    client_bind(cli, 2, "wl_shm",        1, WLC_SHM);
+    wl_conn_dispatch(&conn); wl_conn_dispatch(&conn); client_drain(cli);
+    { uint32_t a[] = { WLC_SURFACE };
+      client_msg(cli, WLC_COMPOSITOR, WL_COMPOSITOR_REQ_CREATE_SURFACE, a, 1, NULL); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_POOL, STRIDE * H };
+      client_msg(cli, WLC_SHM, WL_SHM_REQ_CREATE_POOL, a, 2, buf_of); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_BUFFER, 0, W, H, STRIDE, WL_SHM_FORMAT_ARGB8888 };
+      client_msg(cli, WLC_POOL, WL_SHM_POOL_REQ_CREATE_BUFFER, a, 6, NULL); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_BUFFER, 0, 0 };
+      client_msg(cli, WLC_SURFACE, WL_SURFACE_REQ_ATTACH, a, 3, NULL); }
+    wl_conn_dispatch(&conn);
+    client_msg(cli, WLC_SURFACE, WL_SURFACE_REQ_COMMIT, NULL, 0, NULL);
+    wl_conn_dispatch(&conn);                      /* commit → blit into the window */
+
+    uint32_t got = gui_window_pixel(win, 0, 0);
+    kprintf("waywin: window[0,0]=%x (buffer top-left=%x) -> %s\n",
+            got, topleft, got == topleft ? "IN-WINDOW OK" : "MISMATCH");
 
     usock_close(cli);
     usock_close(srv);

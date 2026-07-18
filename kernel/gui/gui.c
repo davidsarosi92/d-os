@@ -783,6 +783,28 @@ void gui_window_request_redraw_rect(struct gui_window* win,
     gui_damage(win->x + BORDER + cx, win->y + TITLE_H + cy, cw, ch);
 }
 
+/* §M26 — paint a raw pixel block into a window's content surface + composite it
+ * (the Wayland compositor bridge: a wl_surface's committed buffer becomes a real
+ * window's contents).  Coords are content-relative (exclude the chrome). */
+void gui_window_blit(struct gui_window* win, int x, int y,
+                     const uint32_t* px, int w, int h, int stride) {
+    if (!win || !win->used || win->kind != WIN_APP || !px || w <= 0 || h <= 0) return;
+    struct gfx_surface src;
+    src.w = w; src.h = h; src.stride = stride; src.px = (uint32_t*)px; src.owns_px = 0;
+    gfx_clear_clip(&src);
+    spin_lock(&win->lock);
+    gfx_blit(&win->surf, x, y, &src, 0, 0, w, h);
+    spin_unlock(&win->lock);
+    gui_damage(win->x + BORDER + x, win->y + TITLE_H + y, w, h);
+}
+
+/* Read a content-surface pixel back (for self-tests). */
+uint32_t gui_window_pixel(struct gui_window* win, int x, int y) {
+    if (!win || !win->used || x < 0 || y < 0 ||
+        x >= win->surf.w || y >= win->surf.h) return 0;
+    return win->surf.px[y * win->surf.stride + x];
+}
+
 void gui_window_set_on_close(struct gui_window* win,
                              void (*fn)(struct gui_window*)) {
     if (win) win->on_close = fn;

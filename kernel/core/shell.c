@@ -1830,6 +1830,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "pkgtest"))        { cmd_pkgtest();      return; }
     if (streq(line, "waytest"))        { wl_selftest();      return; }
     if (streq(line, "waydemo"))        { wl_visible_demo();  return; }
+    if (streq(line, "waywin"))         { wl_window_demo();   return; }
     if (starts_with(line, "pkgrun "))  { cmd_pkgrun(line + 7); return; }
     if (streq(line, "posixtest"))      { cmd_posixtest();    return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
