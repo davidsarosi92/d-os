@@ -98,6 +98,11 @@ ifeq ($(ARCH),i386)
                        user/dlopentest_dynblob.o
   endif
 
+  # §M39 stage 2: crypttest links against the ported Mbed TLS (make mbedtls).
+  ifneq ($(wildcard third_party/mbedtls-i686/lib/libmbedcrypto.a),)
+    ARCH_EXTRA_OBJS += user/crypttest_muslblob.o
+  endif
+
   # Tier B — in-tree user libc build knobs (i386 reference).
   USER_CFLAGS   := -m32 -ffreestanding -fno-pie -fno-stack-protector \
                    -fno-builtin -nostdlib -Os -Wall -std=c11 -Iuser
@@ -495,7 +500,7 @@ ISO_DIR    := $(BUILD_DIR)/iso
 ISO        := $(BUILD_DIR)/d-os.iso
 
 .PHONY: all kernel iso run clean clean-all musl musl-clean \
-        musl-cross-i686 musl-cross-x86_64
+        musl-cross-i686 musl-cross-x86_64 mbedtls
 
 all: $(KERNEL_BIN)
 
@@ -578,6 +583,32 @@ musl-cross-i686:
 
 musl-cross-x86_64:
 	$(call MUSL_CROSS_BUILD,x86_64-linux-musl,x86_64)
+
+# -----------------------------------------------------------------------------
+# Mbed TLS (§M39 stage 2) — build the vendored crypto/TLS library for i686-musl.
+# Pure C: compiled with the host gcc -m32 + our musl headers (same path as the
+# musl coreutils), NOT the C++ toolchain.  Built on the container-local fs (the
+# PSA driver-wrapper generation writes many files; keep it off the slow mount).
+# The image must have python3-jsonschema/jinja2 (Dockerfile, §M39) for the PSA
+# wrapper generation.  Produces third_party/mbedtls-i686/{lib,include}.
+#     docker run --rm --platform=linux/amd64 -v "$PWD":/src d-os-build make mbedtls
+# -----------------------------------------------------------------------------
+MBEDTLS_DIR    := third_party/mbedtls
+MBEDTLS_PREFIX := third_party/mbedtls-i686
+MBEDTLS_CFLAGS := -I$(CURDIR)/$(MUSL_PREFIX)/include -Os -fno-stack-protector -w
+
+mbedtls:
+	@test -f $(MBEDTLS_DIR)/Makefile || { \
+	  echo "Mbed TLS missing — run ./scripts/fetch-mbedtls.sh first"; exit 1; }
+	rm -rf /tmp/mb && cp -a $(MBEDTLS_DIR) /tmp/mb
+	$(MAKE) -C /tmp/mb/library CC='gcc -m32' CFLAGS='$(MBEDTLS_CFLAGS)' \
+	    libmbedcrypto.a libmbedx509.a libmbedtls.a
+	rm -rf $(MBEDTLS_PREFIX)
+	mkdir -p $(MBEDTLS_PREFIX)/lib
+	cp /tmp/mb/library/lib*.a $(MBEDTLS_PREFIX)/lib/
+	cp -a /tmp/mb/include $(MBEDTLS_PREFIX)/include
+	rm -rf /tmp/mb
+	@echo "Mbed TLS i686 libs → $(MBEDTLS_PREFIX)/lib/"
 
 kernel: $(KERNEL_BIN)
 
@@ -832,6 +863,23 @@ user/%.muslelf: user/%.c $(MUSL_LIBC)
 	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
 	    $(OBJ_DIR)/user/$*.muslo \
 	    --start-group $(MUSL_PREFIX)/lib/libc.a \
+	    `gcc -m32 -print-libgcc-file-name` --end-group \
+	    $(MUSL_PREFIX)/lib/crtn.o
+
+# §M39 stage 2 — crypttest overrides the generic %.muslelf rule to ALSO compile
+# with Mbed TLS's headers and link its static libs (libmbedcrypto for the
+# crypto primitives; x509+tls linked too so the same rule serves stage 3).
+user/crypttest.muslelf: user/crypttest.c $(MUSL_LIBC)
+	@mkdir -p $(OBJ_DIR)/user
+	gcc $(MUSL_CC_FLAGS) -c user/crypttest.c \
+	    -I$(MUSL_PREFIX)/include -I$(MBEDTLS_PREFIX)/include \
+	    -o $(OBJ_DIR)/user/crypttest.muslo
+	ld -m elf_i386 -static -Ttext-segment=$(USER_BASE) -e _start -o $@ \
+	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
+	    $(OBJ_DIR)/user/crypttest.muslo \
+	    --start-group \
+	    $(MBEDTLS_PREFIX)/lib/libmbedtls.a $(MBEDTLS_PREFIX)/lib/libmbedx509.a \
+	    $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a $(MUSL_PREFIX)/lib/libc.a \
 	    `gcc -m32 -print-libgcc-file-name` --end-group \
 	    $(MUSL_PREFIX)/lib/crtn.o
 

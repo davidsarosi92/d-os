@@ -1652,6 +1652,28 @@ static void cmd_randtest(void) {
     console_write("\n");
 }
 
+/* §M39 stage 2 — `crypttest`: run the Mbed TLS crypto self-test (SHA-256 KAT +
+ * AES-256-GCM round-trip) in ring 3 under the Linux personality.  Embedded only
+ * when `make mbedtls` + a rebuild produced it. */
+extern const unsigned char _binary_user_crypttest_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_crypttest_muslelf_end[]   __attribute__((weak));
+
+static void cmd_crypttest(void) {
+    if (!_binary_user_crypttest_muslelf_start) {
+        console_write("crypttest: not embedded — run `make mbedtls` then rebuild\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_crypttest_muslelf_end -
+                          _binary_user_crypttest_muslelf_start);
+    console_write("crypttest: exec'ing the Mbed TLS crypto self-test...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(_binary_user_crypttest_muslelf_start, len);
+    if (me) me->linux_abi = prev;
+    kprintf("crypttest: returned rc=%d\n", rc);
+}
+
 /* §M37 stage 5 — `solibtest`: run a program that links against a SEPARATE
  * shared library (libgreet.so, at /lib).  Exercises ld.so's real work: locate
  * a genuinely separate .so via the search path and resolve symbols across
@@ -1964,6 +1986,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "musltest"))       { cmd_musltest(); return; }
     if (streq(line, "musldyntest"))    { cmd_musldyntest(); return; }
     if (streq(line, "randtest"))       { cmd_randtest(); return; }
+    if (streq(line, "crypttest"))      { cmd_crypttest(); return; }
     if (streq(line, "solibtest"))      { cmd_solibtest(); return; }
     if (streq(line, "dlopentest"))     { cmd_dlopentest(); return; }
     if (streq(line, "pkg"))            { cmd_pkg("");        return; }
