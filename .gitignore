@@ -72,3 +72,9 @@ user/*.muslelf
 # §M37 dynamic-linking build products (PIE ELFs + shared objects)
 user/*.dynelf
 user/*.so
+# §M38 musl C++ cross-toolchain (build input + product)
+third_party/musl-cross-make/
+third_party/musl-cross-*/
+# §M39 Mbed TLS (vendored crypto dep + build product)
+third_party/mbedtls/
+third_party/mbedtls-i686/

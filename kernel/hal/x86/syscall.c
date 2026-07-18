@@ -185,6 +185,9 @@ void syscall_dispatch(struct int_frame* f) {
         case SYS_NANOSLEEP:
             f->eax = (uint32_t)sys_nanosleep((unsigned)f->ebx);
             return;
+        case SYS_GETRANDOM:
+            f->eax = (uint32_t)sys_getrandom((void*)f->ebx, f->ecx, (unsigned)f->edx);
+            return;
         case SYS_SENDTO:
             f->eax = (uint32_t)sys_sendto((int)f->ebx, (const void*)f->ecx,
                                           f->edx, (uint32_t)f->esi, (int)f->edi);

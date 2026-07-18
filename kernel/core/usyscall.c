@@ -29,6 +29,7 @@
 #include "kmalloc.h"
 #include "rtc.h"
 #include "timer.h"
+#include "random.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -482,6 +483,15 @@ int sys_clock_gettime(int which, struct ktimespec* out) {
 int sys_nanosleep(unsigned ms) {
     task_msleep(ms);
     return 0;
+}
+
+/* §M39 — getrandom(buf, n, flags): fill `buf` with CSPRNG bytes.  Never blocks
+ * (our pool is seeded at boot); flags (GRND_NONBLOCK/GRND_RANDOM) are ignored. */
+long sys_getrandom(void* buf, size_t n, unsigned flags) {
+    (void)flags;
+    if (!buf) return -1;
+    random_bytes(buf, n);
+    return (long)n;
 }
 
 long sys_send(int fd, const void* buf, size_t n, int passfd) {

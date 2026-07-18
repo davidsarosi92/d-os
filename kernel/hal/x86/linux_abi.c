@@ -57,6 +57,7 @@ extern uint32_t saved_eip;
 #define LNX_mmap2          192
 #define LNX_fstat64        197
 #define LNX_set_thread_area 243
+#define LNX_getrandom      355
 #define LNX_exit_group     252
 #define LNX_getdents64     220
 #define LNX_fcntl64        221
@@ -237,6 +238,13 @@ void linux_syscall_dispatch(struct int_frame* f) {
         }
         case LNX_close:
             f->eax = (uint32_t)sys_close((int)f->ebx);
+            return;
+
+        case LNX_getrandom:
+            /* getrandom(buf=ebx, len=ecx, flags=edx) → the §M39 CSPRNG.  musl's
+             * arc4random / TLS seeding uses it. */
+            f->eax = (uint32_t)sys_getrandom((void*)f->ebx, (size_t)f->ecx,
+                                             (unsigned)f->edx);
             return;
 
         case LNX_fstat64: {

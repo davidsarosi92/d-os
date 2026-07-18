@@ -124,3 +124,30 @@ void hal_syscall_exit_to_kernel(uintptr_t saved_sp, uintptr_t saved_pc) {
     );
     __builtin_unreachable();
 }
+
+/* ---------------------------------------------------------------------------
+ * §M39 — hardware RNG (RDRAND).  CPUID.01H:ECX bit 30 advertises RDRAND; if
+ * present we retry a few times (the instruction can transiently fail) before
+ * giving up.  On a CPU/QEMU without it we return 0 and the CSPRNG falls back
+ * to timing jitter.
+ * --------------------------------------------------------------------------- */
+static int cpu_has_rdrand(void) {
+    uint32_t eax, ebx, ecx, edx;
+    __asm__ volatile ("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(1U), "c"(0U));
+    return (ecx >> 30) & 1U;
+}
+
+int hal_hw_random(uint32_t* out) {
+    static int checked = 0, have = 0;
+    if (!checked) { have = cpu_has_rdrand(); checked = 1; }
+    if (!have) return 0;
+    for (int retry = 0; retry < 10; retry++) {
+        uint32_t val;
+        unsigned char ok;
+        __asm__ volatile ("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
+        if (ok) { *out = val; return 1; }
+    }
+    return 0;
+}

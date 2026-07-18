@@ -22,6 +22,7 @@
 #include "driver.h"
 #include "timer.h"
 #include "vfs.h"
+#include "random.h"
 #include "config.h"
 #include "usermode.h"
 #include "task.h"
@@ -1627,6 +1628,30 @@ static void cmd_musldyntest(void) {
     kprintf("musldyntest: returned rc=%d\n", rc);
 }
 
+/* §M39 stage 1 — `randtest`: exercise the kernel CSPRNG + /dev/urandom.  Prints
+ * two 16-byte draws (must differ) and reads /dev/urandom through the VFS. */
+static void cmd_randtest(void) {
+    uint8_t a[16], b[16];
+    random_bytes(a, sizeof a);
+    random_bytes(b, sizeof b);
+    int differ = 0;
+    for (int i = 0; i < 16; i++) if (a[i] != b[i]) { differ = 1; break; }
+    console_write("randtest: draw1 =");
+    for (int i = 0; i < 16; i++) kprintf(" %x", a[i]);
+    console_write("\nrandtest: draw2 =");
+    for (int i = 0; i < 16; i++) kprintf(" %x", b[i]);
+    kprintf("\nrandtest: two draws %s\n", differ ? "DIFFER (ok)" : "MATCH (BAD)");
+
+    struct file* f = vfs_open("/dev/urandom", VFS_RDONLY);
+    if (!f) { console_write("randtest: /dev/urandom open FAILED\n"); return; }
+    uint8_t c[8];
+    ssize_t r = vfs_read(f, c, sizeof c);
+    vfs_close(f);
+    kprintf("randtest: /dev/urandom read %d bytes:", (int)r);
+    for (int i = 0; i < (int)r && i < 8; i++) kprintf(" %x", c[i]);
+    console_write("\n");
+}
+
 /* §M37 stage 5 — `solibtest`: run a program that links against a SEPARATE
  * shared library (libgreet.so, at /lib).  Exercises ld.so's real work: locate
  * a genuinely separate .so via the search path and resolve symbols across
@@ -1938,6 +1963,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "linuxtest"))      { cmd_linuxtest(); return; }
     if (streq(line, "musltest"))       { cmd_musltest(); return; }
     if (streq(line, "musldyntest"))    { cmd_musldyntest(); return; }
+    if (streq(line, "randtest"))       { cmd_randtest(); return; }
     if (streq(line, "solibtest"))      { cmd_solibtest(); return; }
     if (streq(line, "dlopentest"))     { cmd_dlopentest(); return; }
     if (streq(line, "pkg"))            { cmd_pkg("");        return; }

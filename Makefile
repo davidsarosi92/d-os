@@ -329,7 +329,8 @@ CORE_C_SRCS := \
     kernel/fs/exfat.c \
     kernel/mem/pmm.c \
     kernel/mem/kmalloc.c \
-    kernel/mem/slab.c
+    kernel/mem/slab.c \
+    kernel/core/random.c
 else ifeq ($(ARCH),aarch64)
 # M21 Phase C+D: the AArch64 build links the PORTABLE slice of the core it
 # needs — printf/console (serial out), spinlocks + per-CPU, the PMM/slab/
@@ -493,7 +494,8 @@ KERNEL_BIN := $(BUILD_DIR)/kernel.bin
 ISO_DIR    := $(BUILD_DIR)/iso
 ISO        := $(BUILD_DIR)/d-os.iso
 
-.PHONY: all kernel iso run clean clean-all musl musl-clean
+.PHONY: all kernel iso run clean clean-all musl musl-clean \
+        musl-cross-i686 musl-cross-x86_64
 
 all: $(KERNEL_BIN)
 
@@ -543,6 +545,39 @@ $(MUSL_LIBC):
 musl-clean:
 	-$(MAKE) -C $(MUSL_SRC) clean 2>/dev/null || true
 	rm -rf $(MUSL_PREFIX)
+
+# -----------------------------------------------------------------------------
+# musl C++ cross-toolchain (§M38) — build a from-source gcc/g++ + binutils +
+# musl that TARGETS musl, so we get a musl libstdc++ + libgcc (with DWARF
+# exception unwinding) for d-os.  Fetched by scripts/fetch-musl-cross.sh; built
+# INSIDE the container (needs network + wget to pull gcc/binutils sources):
+#     docker run --rm --platform=linux/amd64 -v "$PWD":/src d-os-build make musl-cross-i686
+# Produces third_party/musl-cross-i686/bin/i686-linux-musl-{gcc,g++,...} and a
+# musl sysroot with libstdc++.so.6 + libgcc_s.so.1.  Long build (gcc from src).
+# -----------------------------------------------------------------------------
+# NB: gcc is built on the CONTAINER's native filesystem (/tmp), NOT on the
+# Docker-mounted host volume.  Two reasons: (1) tar's directory-metadata restore
+# fails on the macOS virtiofs mount ("Directory renamed before its status could
+# be extracted") when extracting the linux-headers tarball; (2) a mounted-volume
+# gcc build is painfully slow.  We copy the (fetched, source-cached) tree to
+# /tmp, build there, then copy just the finished toolchain back to the mount.
+MCM_DIR := third_party/musl-cross-make
+define MUSL_CROSS_BUILD
+	@test -f $(MCM_DIR)/Makefile || { \
+	  echo "musl-cross-make missing — run ./scripts/fetch-musl-cross.sh first"; exit 1; }
+	rm -rf /tmp/mcm && cp -a $(MCM_DIR) /tmp/mcm
+	$(MAKE) -C /tmp/mcm TARGET=$(1) OUTPUT=/tmp/mcm/out install
+	rm -rf third_party/musl-cross-$(2)
+	cp -a /tmp/mcm/out third_party/musl-cross-$(2)
+	rm -rf /tmp/mcm
+	@echo "$(2) musl C++ toolchain → third_party/musl-cross-$(2)/bin/"
+endef
+
+musl-cross-i686:
+	$(call MUSL_CROSS_BUILD,i686-linux-musl,i686)
+
+musl-cross-x86_64:
+	$(call MUSL_CROSS_BUILD,x86_64-linux-musl,x86_64)
 
 kernel: $(KERNEL_BIN)
 

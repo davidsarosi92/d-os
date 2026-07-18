@@ -164,4 +164,10 @@ void hal_set_kernel_stack(uintptr_t top);
  * thread pointer when their libc port lands). */
 void hal_set_tls_base(uintptr_t base);
 
+/* §M39 — optional hardware RNG seed source.  Write one random 32-bit word to
+ * *out and return 1, or return 0 if no hardware RNG is available.  x86 uses
+ * RDRAND (CPUID-gated); arches without one leave the weak no-op in random.c
+ * (the CSPRNG then seeds from timing jitter only). */
+int hal_hw_random(uint32_t* out);
+
 #endif

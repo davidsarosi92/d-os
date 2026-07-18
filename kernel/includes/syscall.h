@@ -63,6 +63,7 @@
 #define SYS_UNAME  33       /* (struct kutsname*) → 0                          */
 #define SYS_CLOCK_GETTIME 34/* (which, struct ktimespec*) → 0                  */
 #define SYS_NANOSLEEP 35    /* (ms) → 0  (millisecond sleep, simplified)       */
+#define SYS_GETRANDOM 36    /* (buf, n, flags) → bytes  (§M39 CSPRNG)          */
 
 /* M36 shared structs (kernel + libc agree on the layout). */
 struct kstat {
@@ -150,6 +151,7 @@ long sys_getdents64(int fd, void* buf, size_t cap);   /* Linux dirent64 (linux_a
 int  sys_uname(struct kutsname* out);
 int  sys_clock_gettime(int which, struct ktimespec* out);
 int  sys_nanosleep(unsigned ms);
+long sys_getrandom(void* buf, size_t n, unsigned flags);   /* §M39 */
 long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port);
 long sys_recvfrom(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out);
 long sys_send (int fd, const void* buf, size_t n, int passfd);

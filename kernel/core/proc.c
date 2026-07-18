@@ -19,6 +19,7 @@
 #include "hal_api.h"
 #include "vfs.h"
 #include "fd.h"
+#include "random.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -85,18 +86,12 @@ struct loaded_prog {
     uintptr_t             interp_base;  /* AT_BASE (0 if statically linked)     */
 };
 
-/* A non-cryptographic 16-byte seed for AT_RANDOM: musl only needs it to be
- * non-zero + varied (stack-guard canary / malloc), not secure.  We mix the
- * frame address, the stack VA and a per-call counter.  (§M39 replaces this
- * with real entropy once /dev/urandom exists.) */
+/* The 16 AT_RANDOM bytes musl reads at startup (stack-guard canary + malloc /
+ * arc4random seed).  §M39: draw them from the kernel CSPRNG so every exec gets
+ * cryptographically-strong, non-repeating values (was a weak xorshift). */
 static void fill_at_random(uint8_t out[16], uint32_t frame_phys, uintptr_t stack_va) {
-    static uint32_t ctr = 0x9E3779B9u;              /* golden-ratio odd start */
-    ctr += 0x6D2B79F5u;
-    uint32_t x = frame_phys ^ (uint32_t)stack_va ^ ctr;
-    for (int i = 0; i < 16; i++) {
-        x ^= x << 13; x ^= x >> 17; x ^= x << 5;    /* xorshift32            */
-        out[i] = (uint8_t)(x >> (8 * (i & 3)));
-    }
+    (void)frame_phys; (void)stack_va;
+    random_bytes(out, 16);
 }
 
 static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,

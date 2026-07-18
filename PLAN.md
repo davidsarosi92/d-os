@@ -3601,6 +3601,24 @@ rendering path the browser plugs into.
    Wayland frontend, or WPE-WebKit's `WPEBackend` (designed for exactly
    this minimal EGL-on-Wayland embedded case) — chosen in §M42.
 
+   **Toolkit dependency profiles (a client is a Wayland client either way):**
+   | Toolkit | Lang | Wayland client | Renderer | Needs Mesa? | Needs C++ (§M38)? |
+   |---------|------|----------------|----------|-------------|-------------------|
+   | SDL2 | C | libwayland-client (C) | `wl_shm` sw / GL | no (sw) | no |
+   | GTK | C+GObject | libwayland-client | cairo/pixman | no | yes (deps) |
+   | Qt | C++ | libwayland-client (QtWayland) | own / GL | opt | yes |
+   | **iced** | **Rust** | **native Rust `wayland-client` crate** | **`tiny-skia` (pure-Rust CPU) or wgpu** | **no (tiny-skia)** | **no** |
+
+   **iced is the interesting outlier:** pure Rust, its winit/`smithay-client-
+   toolkit` stack speaks the Wayland wire protocol from Rust (NO upstream
+   libwayland C port), and its `tiny-skia` backend is a pure-Rust CPU
+   rasteriser (NO Mesa/GL).  So iced's path is **§M44 Rust std-on-musl + our
+   §M26 server**, sidestepping libwayland-C, Mesa AND the C++ runtime — a
+   genuinely lighter route to a real GUI app than the C/C++ toolkits.  The
+   cost moves to: Rust std working on musl (syscall breadth) + winit's Wayland
+   backend needing the protocol set we advertise (xdg-shell we have; it also
+   wants seat/output/maybe xdg-decoration).
+
 **Definition of done:**
 - A `weston-terminal`-class Wayland client (or `wpe`'s test app) runs
   against the §M26 server: draws, takes keyboard + pointer input.
@@ -3805,6 +3823,14 @@ JIT/VM heavyweights.  A **"Rust hello world"** is a cheap, motivating target
 soon after §M37 + §M36 breadth.  For .NET, prefer **NativeAOT** over porting
 CoreCLR's JIT.  All of this is a strong argument for investing in **§M41 (the
 Linux ABI shim)** — the universal "run any Linux binary" accelerator.
+
+**Rust's GUI payoff = `iced` (§M40 table).**  Once Rust std runs on musl, `iced`
+(Elm-style, pure Rust) reaches a real windowed GUI app with a *lighter* stack
+than the C/C++ toolkits: its `tiny-skia` backend is a pure-Rust CPU rasteriser
+(no Mesa) and its winit/`smithay-client-toolkit` layer speaks Wayland from Rust
+(no upstream libwayland-C port, no C++ runtime).  So a compelling milestone is
+"an `iced` window on the §M26 server", gated mainly on Rust-on-musl + our
+compositor advertising the protocols winit needs.
 
 **Depends on:** §M36 (syscall breadth), §M37, §M38 (C++-runtime consumers),
 §M41 (accelerator).  Primary arch: x86_64.

@@ -57,6 +57,7 @@
 #include "driver.h"
 #include "vfs.h"
 #include "devfs.h"
+#include "random.h"
 #include "procfs.h"
 #include "block_cache.h"
 #include "block.h"
@@ -113,6 +114,10 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * (ramfs created /dev) and after module/driver init (so all
      * registrations are queued). */
     devfs_init();
+
+    /* §M39 — kernel CSPRNG + /dev/urandom + /dev/random (after devfs so the
+     * nodes attach live; seeds from the hardware RNG + boot jitter). */
+    random_init();
 
     /* procfs (M10) — synthetic /proc files exposing kernel state. */
     procfs_init();
