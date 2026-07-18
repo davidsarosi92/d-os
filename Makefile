@@ -75,7 +75,7 @@ ifeq ($(ARCH),i386)
                      user/sigtest_blob.o user/dnstest_blob.o \
                      user/httptest_blob.o user/threadtest_blob.o \
                      user/tlstest_blob.o user/posixtest_blob.o \
-                     user/linuxhello_blob.o user/wlclient_blob.o
+                     user/linuxhello_blob.o user/wlclient_blob.o user/wlapp_blob.o
 
   # REAL musl-linked programs are embedded ONLY when musl has been built
   # (`make musl`); otherwise the kernel builds without them.  This keeps the
@@ -738,6 +738,18 @@ user/wlclient_$(ARCH).elf: user/wlclient.c
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ $(OBJ_DIR)/user/wlclient.o
 
 $(OBJ_DIR)/user/wlclient_blob.o: user/wlclient_$(ARCH).elf
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+# wlapp — a ring-3 app that speaks Wayland via the libwl client library.
+user/wlapp_$(ARCH).elf: user/wlapp.c user/libwl.c user/libwl.h
+	@mkdir -p $(OBJ_DIR)/user
+	$(CC) $(USER_CFLAGS) -c user/wlapp.c -o $(OBJ_DIR)/user/wlapp.o
+	$(CC) $(USER_CFLAGS) -c user/libwl.c -o $(OBJ_DIR)/user/libwl.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/wlapp.o $(OBJ_DIR)/user/libwl.o
+
+$(OBJ_DIR)/user/wlapp_blob.o: user/wlapp_$(ARCH).elf
 	@mkdir -p $(@D)
 	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 

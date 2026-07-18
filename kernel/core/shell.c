@@ -1611,17 +1611,22 @@ static void cmd_musltest(void) {
  * server sees EOF + tears down. */
 extern const unsigned char _binary_user_wlclient_i386_elf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_wlclient_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_wlapp_i386_elf_start[]    __attribute__((weak));
+extern const unsigned char _binary_user_wlapp_i386_elf_end[]      __attribute__((weak));
 
-static void cmd_wayclient(void) {
-    if (!_binary_user_wlclient_i386_elf_start) { console_write("wayclient: not embedded\n"); return; }
+/* Run a ring-3 Wayland client blob: hand it fd 3 = one end of a usock_pair, run
+ * the server on its own task on the other end, exec the client. */
+static void run_wayland_client(const char* what, const unsigned char* s,
+                               const unsigned char* e) {
+    if (!s) { console_write("wayland: client not embedded\n"); return; }
     struct task* me = task_current();
-    if (me->fds[3]) { console_write("wayclient: fd 3 already in use\n"); return; }
+    if (me->fds[3]) { console_write("wayland: fd 3 already in use\n"); return; }
 
     struct usock *srv, *cli;
-    if (usock_pair(&srv, &cli) != 0) { console_write("wayclient: usock_pair failed\n"); return; }
+    if (usock_pair(&srv, &cli) != 0) { console_write("wayland: usock_pair failed\n"); return; }
     struct ofile* cli_of = ofile_from_sock(cli);
     struct wl_conn* conn = (struct wl_conn*)kmalloc(sizeof *conn);
-    if (!cli_of || !conn) { console_write("wayclient: out of memory\n");
+    if (!cli_of || !conn) { console_write("wayland: out of memory\n");
         if (cli_of) ofile_unref(cli_of); else usock_close(cli);
         usock_close(srv); return; }
 
@@ -1629,11 +1634,18 @@ static void cmd_wayclient(void) {
     wl_conn_init(conn, srv);
     task_spawn_arg("wl-server", wl_server_task, conn);   /* server on its own task */
 
-    console_write("wayclient: launching a ring-3 Wayland client (fd 3)...\n");
-    size_t len = (size_t)(_binary_user_wlclient_i386_elf_end -
-                          _binary_user_wlclient_i386_elf_start);
-    int rc = proc_exec_elf(_binary_user_wlclient_i386_elf_start, len);
-    kprintf("wayclient: client exited rc=%d\n", rc);   /* fd 3 auto-closed → server tears down */
+    kprintf("%s: launching a ring-3 Wayland client (fd 3)...\n", what);
+    int rc = proc_exec_elf(s, (size_t)(e - s));
+    kprintf("%s: client exited rc=%d\n", what, rc);      /* fd 3 auto-closed → server tears down */
+}
+
+static void cmd_wayclient(void) {
+    run_wayland_client("wayclient", _binary_user_wlclient_i386_elf_start,
+                       _binary_user_wlclient_i386_elf_end);
+}
+static void cmd_wayapp(void) {
+    run_wayland_client("wayapp", _binary_user_wlapp_i386_elf_start,
+                       _binary_user_wlapp_i386_elf_end);
 }
 
 /* §M35.5 + §M36 — `pkgrun <name> [args...]`: exec an INSTALLED package's binary
@@ -1866,6 +1878,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "waywin"))         { wl_window_demo();   return; }
     if (streq(line, "wayinput"))       { wl_input_demo();    return; }
     if (streq(line, "wayclient"))      { cmd_wayclient();    return; }
+    if (streq(line, "wayapp"))         { cmd_wayapp();       return; }
     if (streq(line, "waycomp"))        { wl_compositor_demo(); return; }
     if (starts_with(line, "pkgrun "))  { cmd_pkgrun(line + 7); return; }
     if (streq(line, "posixtest"))      { cmd_posixtest();    return; }

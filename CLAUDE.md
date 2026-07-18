@@ -219,8 +219,13 @@ WM-managed `gui_window` target (`gui_window_blit`; `waywin` IN-WINDOW OK) +
 `wl_seat` input (`wl_send_key`/`wl_send_motion`; `wayinput`) + a REAL ring-3
 client (`user/wlclient.c` speaks the wire protocol over an inherited fd 3, server
 runs on its own `wl_conn_serve` task; `wayclient` parses 4 globals from user
-space).  Next: a server-per-surface compositor task, route the M22.7 input into
-`wl_send_*`, port libwayland-client (§M40) for unmodified Wayland apps.**  The
+space) + **server-per-surface** (`wl_conn.wm_mode`: `xdg get_toplevel` spawns a
+`gui_window`, commits fill it, input routed to the client's wl_seat via
+`gui_window_set_input_hook`; `waycomp` = SURFACE-IN-WINDOW OK + key/motion) + a
+**mini-libwayland client library** (`user/libwl` + `user/wlapp.c`; `wayapp`).
+Only the UPSTREAM libwayland port (unmodified GTK/Qt/SDL apps) is left → §M40
+(needs wayland-scanner + protocol XML → generated proxies, a musl library
+build).**  The
 desktop label is now dynamic (`kernel/includes/version.h` `DOS_MILESTONE` — bump
 it when a milestone ships).  Also open: more coreutils, tty line-editing/`isatty`.
 §M35 (threads/futex/TLS/per-CPU TSS) COMPLETE (UP+SMP, §4.28); also: §M34 POSIX

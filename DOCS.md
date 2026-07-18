@@ -3354,12 +3354,19 @@ OK`), and delivered input (key 30, motion 50,40) arrives at the client's
 `wl_keyboard`/`wl_pointer`.  The M22.7 "wl_surface = gui_window, input = wl_seat"
 design closes cleanly.
 
-**Next:** run the server's connection loop as a compositor-hosted task (so a
-real ring-3 client's window is created + fed automatically, not just in
-`waycomp`); a reusable client library (`user/libwl` — a mini-libwayland) so
-d-os apps speak Wayland without hand-marshalling; then port the upstream
-libwayland-client (§M40, needs `wayland-scanner` + the protocol XML → generated
-proxies, a musl-linked library build) so *unmodified* Wayland apps run.
+**A reusable client library — `user/libwl` (mini-libwayland) — DONE.**  So an
+app calls `wl_*` instead of hand-marshalling the wire protocol: `wl_connect(fd)`,
+`wl_alloc_id`, `wl_registry_roundtrip` (get_registry + sync, framing partial
+reads, recording each global's registry name).  `user/wlapp.c` links it and,
+over the inherited fd 3, discovers `wl_compositor`/`wl_shm`/`xdg_wm_base`/
+`wl_seat` from ring 3 (shell `wayapp`).  This is the "app links a Wayland client
+library" shape; it is NOT upstream libwayland.
+
+**Next (§M40):** port the **upstream libwayland-client** — it needs
+`wayland-scanner` + the protocol XML → generated proxies, built as a
+musl-linked library — so *unmodified* Wayland apps (GTK/Qt/SDL clients) run.
+Also: run the server connection loop as a compositor-hosted task so a real
+client's window is created + fed automatically (not just in `waycomp`).
 
 ---
 
@@ -3433,6 +3440,16 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-18 — M26: Wayland compositor integration + a client library.**  Three
+  remaining points closed (DOCS §4.32): (1) **server-per-surface** —
+  `wl_conn.wm_mode` makes `xdg get_toplevel` spawn a real `gui_window` for the
+  surface, commits fill it; (2) **input routing** — `gui_window_set_input_hook`
+  forwards a window's keyboard/pointer input to the client's `wl_seat`
+  (`wl_send_key`/`wl_send_motion`); `waycomp` shows both (`SURFACE-IN-WINDOW OK`
+  + key/motion delivered).  (3) **`user/libwl`** — a reusable mini-libwayland
+  client library (`wl_connect`/`wl_registry_roundtrip`); `user/wlapp.c` uses it
+  to discover the globals from ring 3 (`wayapp`).  Upstream libwayland (unmodified
+  Wayland apps) is §M40.
 - **2026-07-18 — M26: Wayland WM window + wl_seat input + a real ring-3 client.**
   Three points close the core (DOCS §4.32): (1) `gui_window_blit`/`gui_window_
   pixel` + `wl_conn.window` → a committed `wl_shm` buffer becomes a real
