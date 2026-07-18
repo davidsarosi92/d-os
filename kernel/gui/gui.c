@@ -126,6 +126,11 @@ struct gui_window {
     void (*on_close) (struct gui_window*);
     void* app_ctx;
 
+    /* §M26 — optional input sink: when set, window input is forwarded here
+     * (instead of the widgets) — the Wayland server routes it to wl_seat. */
+    void (*input_hook)(struct gui_window*, const struct gui_input*, void*);
+    void* input_ctx;
+
     /* M22.7 — per-task app.  Every WIN_APP window is driven by its own
      * "app-host" task: it creates the widgets, drains this window's event
      * queue, runs on_tick/on_layout, and renders into `surf` — all off the
@@ -612,6 +617,16 @@ static void app_widgets_free(struct gui_window* win) {
 }
 
 static void app_dispatch_event(struct gui_window* win, const struct app_event* e) {
+    /* §M26 — a Wayland-backed window forwards input to its client instead of
+     * to widgets. */
+    if (win->input_hook) {
+        struct gui_input gi = {0};
+        if (e->type == AE_MOUSE)        { gi.type = GUI_INPUT_MOTION; gi.x = e->x; gi.y = e->y; }
+        else if (e->type == AE_KEYCODE) { gi.type = GUI_INPUT_KEY; gi.keycode = e->kc; gi.pressed = 1; }
+        else return;                    /* AE_KEY (cooked char) — ignored here */
+        win->input_hook(win, &gi, win->input_ctx);
+        return;
+    }
     if (e->type == AE_MOUSE) {
         struct widget* w = widget_at(win->widgets, e->x, e->y);
         if (w && w->ops && w->ops->mouse)
@@ -803,6 +818,14 @@ uint32_t gui_window_pixel(struct gui_window* win, int x, int y) {
     if (!win || !win->used || x < 0 || y < 0 ||
         x >= win->surf.w || y >= win->surf.h) return 0;
     return win->surf.px[y * win->surf.stride + x];
+}
+
+/* §M26 — set the input sink (see gui.h). */
+void gui_window_set_input_hook(struct gui_window* win,
+        void (*fn)(struct gui_window*, const struct gui_input*, void*), void* ctx) {
+    if (!win) return;
+    win->input_hook = fn;
+    win->input_ctx  = ctx;
 }
 
 void gui_window_set_on_close(struct gui_window* win,

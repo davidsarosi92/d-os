@@ -224,6 +224,16 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock) {
     c->target = NULL;
     c->blit_x = c->blit_y = 0;
     c->window = NULL;
+    c->wm_mode = 0;
+}
+
+/* §M26 — forward a WM-managed window's input to the Wayland client (wl_seat).
+ * Registered as the window's input hook when wm_mode creates it. */
+static void wl_window_input(struct gui_window* win, const struct gui_input* gi, void* ctx) {
+    (void)win;
+    struct wl_conn* c = (struct wl_conn*)ctx;
+    if (gi->type == GUI_INPUT_KEY)         wl_send_key(c, (uint32_t)gi->keycode, gi->pressed);
+    else if (gi->type == GUI_INPUT_MOTION) wl_send_motion(c, gi->x, gi->y);
 }
 
 /* wl_surface.commit — the moment the client's frame becomes current.  Read the
@@ -360,6 +370,16 @@ static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
         if (nid < WL_MAX_OBJECTS) c->obj_iface[nid] = WLI_XDG_TOPLEVEL;
         c->xdg_toplevel_id = nid;
         kprintf("wayland: get_toplevel -> object %u; sending configure\n", nid);
+        /* Server-per-surface: a top-level maps to a real desktop window.  Its
+         * committed buffers become the window's contents (wl_conn.window) and
+         * its input is routed to this client's wl_seat (input hook). */
+        if (c->wm_mode && !c->window) {
+            c->window = gui_app_window_create("Wayland client", 340, 220, 260, 200, NULL, NULL);
+            if (c->window) {
+                gui_window_set_input_hook(c->window, wl_window_input, c);
+                kprintf("wayland: created a WM window for the surface\n");
+            }
+        }
         send_xdg_toplevel_configure(c, nid, 0, 0);       /* client picks a size */
         send_xdg_surface_configure(c, c->xdg_surface_id, ++c->serial);
 
@@ -770,6 +790,80 @@ void wl_input_demo(void) {
     wl_send_key(&conn, 30, 0);
     wl_send_motion(&conn, 120, 80);
     client_drain(cli);
+
+    usock_close(cli);
+    usock_close(srv);
+}
+
+/* ---- compositor integration: a surface IS a desktop window (+ input) ------ */
+
+void wl_compositor_demo(void) {
+    gui_start(); task_msleep(300);
+    struct usock *cli, *srv;
+    if (usock_pair(&cli, &srv) != 0) { kprintf("waycomp: usock_pair failed\n"); return; }
+    struct wl_conn conn;
+    wl_conn_init(&conn, srv);
+    conn.wm_mode = 1;                                 /* server-per-surface */
+
+    const uint32_t W = 32, H = 32, STRIDE = W * 4;
+    struct shm* buf = shm_create((size_t)STRIDE * H);
+    if (!buf) { kprintf("waycomp: shm failed\n"); return; }
+    volatile uint32_t* px = (volatile uint32_t*)(uintptr_t)buf->frames[0];
+    for (uint32_t y = 0; y < H; y++)
+        for (uint32_t x = 0; x < W; x++)
+            px[y * W + x] = 0xFF000000u | ((x * 8u) << 16) | ((y * 8u) << 8) | 0x40u;
+    uint32_t topleft = px[0];
+    struct ofile* buf_of = ofile_from_shm(buf);
+
+    kprintf("waycomp: a Wayland client's surface becomes a desktop window\n");
+    client_send1(cli, WL_DISPLAY_REQ_GET_REGISTRY, WLC_REGISTRY);
+    wl_conn_dispatch(&conn); client_drain(cli);
+    client_bind(cli, 1, "wl_compositor", 4, WLC_COMPOSITOR);
+    client_bind(cli, 2, "wl_shm",        1, WLC_SHM);
+    client_bind(cli, 3, "xdg_wm_base",   2, WLC_XDG_WM_BASE);
+    client_bind(cli, 4, "wl_seat",       5, WLC_SEAT);
+    for (int i = 0; i < 4; i++) wl_conn_dispatch(&conn);
+    client_drain(cli);
+
+    { uint32_t a[] = { WLC_POINTER };  client_msg(cli, WLC_SEAT, WL_SEAT_REQ_GET_POINTER, a, 1, NULL); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_KEYBOARD }; client_msg(cli, WLC_SEAT, WL_SEAT_REQ_GET_KEYBOARD, a, 1, NULL); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_SURFACE };  client_msg(cli, WLC_COMPOSITOR, WL_COMPOSITOR_REQ_CREATE_SURFACE, a, 1, NULL); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_XDG_SURFACE, WLC_SURFACE };
+      client_msg(cli, WLC_XDG_WM_BASE, XDG_WM_BASE_REQ_GET_XDG_SURFACE, a, 2, NULL); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_XDG_TOPLEVEL };
+      client_msg(cli, WLC_XDG_SURFACE, XDG_SURFACE_REQ_GET_TOPLEVEL, a, 1, NULL); }
+    wl_conn_dispatch(&conn);                          /* → server creates the window */
+    client_drain(cli);
+
+    { uint32_t a[] = { WLC_POOL, STRIDE * H };
+      client_msg(cli, WLC_SHM, WL_SHM_REQ_CREATE_POOL, a, 2, buf_of); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_BUFFER, 0, W, H, STRIDE, WL_SHM_FORMAT_ARGB8888 };
+      client_msg(cli, WLC_POOL, WL_SHM_POOL_REQ_CREATE_BUFFER, a, 6, NULL); }
+    wl_conn_dispatch(&conn);
+    { uint32_t a[] = { WLC_BUFFER, 0, 0 };
+      client_msg(cli, WLC_SURFACE, WL_SURFACE_REQ_ATTACH, a, 3, NULL); }
+    wl_conn_dispatch(&conn);
+    client_msg(cli, WLC_SURFACE, WL_SURFACE_REQ_COMMIT, NULL, 0, NULL);
+    wl_conn_dispatch(&conn);                          /* → blit into the window */
+
+    uint32_t got = conn.window ? gui_window_pixel(conn.window, 0, 0) : 0;
+    kprintf("waycomp: window[0,0]=%x (buffer=%x) -> %s\n", got, topleft,
+            (conn.window && got == topleft) ? "SURFACE-IN-WINDOW OK" : "no window");
+
+    /* Input routing: simulate the compositor delivering input to the window;
+     * the hook forwards it to the client's wl_seat. */
+    if (conn.window) {
+        struct gui_input k = { .type = GUI_INPUT_KEY, .keycode = 30, .pressed = 1, .x = 0, .y = 0 };
+        wl_window_input(conn.window, &k, &conn);
+        struct gui_input m = { .type = GUI_INPUT_MOTION, .keycode = 0, .pressed = 0, .x = 50, .y = 40 };
+        wl_window_input(conn.window, &m, &conn);
+        client_drain(cli);
+    }
 
     usock_close(cli);
     usock_close(srv);

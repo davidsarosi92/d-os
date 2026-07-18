@@ -68,6 +68,7 @@ struct wl_conn {
     /* Alternatively, a WM-managed window whose content IS the surface: commit
      * blits the buffer into it (chrome + move/resize come free from the WM). */
     struct gui_window*  window;
+    int                 wm_mode;        /* create a gui_window per xdg_toplevel */
 };
 
 /* Initialise a connection over `sock` (registers wl_display as object 1). */
@@ -106,5 +107,10 @@ void wl_window_demo(void);
 void wl_send_key   (struct wl_conn* c, uint32_t key, int pressed);
 void wl_send_motion(struct wl_conn* c, int x, int y);
 void wl_input_demo (void);
+
+/* Compositor integration (shell `waycomp`, GUI mode): a client's xdg_toplevel
+ * becomes a real desktop window (server-per-surface); its committed buffers are
+ * the window's contents and its window input is routed to the client's wl_seat. */
+void wl_compositor_demo(void);
 
 #endif /* WAYLAND_H */

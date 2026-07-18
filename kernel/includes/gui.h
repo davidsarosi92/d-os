@@ -113,6 +113,18 @@ void     gui_window_blit(struct gui_window* win, int x, int y,
                          const uint32_t* px, int w, int h, int stride);
 uint32_t gui_window_pixel(struct gui_window* win, int x, int y);
 
+/* §M26 — input forwarding.  When a hook is set, the window's keyboard/pointer
+ * input is delivered here (instead of to widgets) — the Wayland server routes
+ * it to wl_keyboard/wl_pointer.  `keycode` is a raw scancode; `pressed` = down. */
+enum gui_input_type { GUI_INPUT_KEY, GUI_INPUT_MOTION };
+struct gui_input {
+    enum gui_input_type type;
+    int keycode, pressed;               /* GUI_INPUT_KEY    */
+    int x, y;                           /* GUI_INPUT_MOTION (content-relative) */
+};
+void gui_window_set_input_hook(struct gui_window* win,
+        void (*fn)(struct gui_window*, const struct gui_input*, void*), void* ctx);
+
 /* App context accessor (the pointer passed to gui_app_window_create). */
 void* gui_window_ctx(struct gui_window* win);
 

@@ -3343,10 +3343,23 @@ pixels** works, and is arch-independent (i386 + x86_64).
   space and reports `handshake OK`.  A genuine client/server split over a unix
   socket.
 
-**Next:** run the server as a proper compositor-hosted task per surface (so a
-client's window is a first-class desktop window); route the M22.7 input events
-into `wl_send_key`/`wl_send_motion`; port libwayland-client (§M40) so unmodified
-Wayland apps run.
+**Server-per-surface + input routing — DONE (`waycomp`).**  With `wl_conn.wm_mode`
+set, `xdg_surface.get_toplevel` creates a real WM-managed `gui_window` for the
+surface (a client's top-level IS a first-class desktop window); the surface's
+committed buffers become the window's contents, and the window's input is routed
+to the client via a `gui_window_set_input_hook` that calls `wl_send_key`/
+`wl_send_motion`.  Boot-tested: a client binds compositor/shm/xdg/seat, its
+`get_toplevel` spawns a desktop window, `commit` fills it (`SURFACE-IN-WINDOW
+OK`), and delivered input (key 30, motion 50,40) arrives at the client's
+`wl_keyboard`/`wl_pointer`.  The M22.7 "wl_surface = gui_window, input = wl_seat"
+design closes cleanly.
+
+**Next:** run the server's connection loop as a compositor-hosted task (so a
+real ring-3 client's window is created + fed automatically, not just in
+`waycomp`); a reusable client library (`user/libwl` — a mini-libwayland) so
+d-os apps speak Wayland without hand-marshalling; then port the upstream
+libwayland-client (§M40, needs `wayland-scanner` + the protocol XML → generated
+proxies, a musl-linked library build) so *unmodified* Wayland apps run.
 
 ---
 
