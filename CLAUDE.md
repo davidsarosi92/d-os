@@ -473,6 +473,8 @@ Block / USB drivers are i386-only today; x86_64 boots without them
   - Add a change-log entry to DOCS.md (`## 8. Change log`).
   - Flip the PLAN.md status table row to ✅ and condense the design
     section to a one-paragraph "Shipped, see DOCS.md §…" pointer.
+  - Bump `DOS_MILESTONE` in `kernel/includes/version.h` to the new M number
+    (the desktop wallpaper draws it — always show the latest shipped milestone).
 - **Boot-test in QEMU** before claiming done.  For most milestones a
   sendkey-driven script + `-serial file:` capture is enough; for the
   framebuffer text path, `pmemsave 0xb8000` + a small Python script

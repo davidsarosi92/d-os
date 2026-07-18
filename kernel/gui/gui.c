@@ -43,6 +43,7 @@
 #include "timer.h"
 #include "config.h"
 #include "keymap.h"          /* M22.3: Alt-Tab raw keycodes */
+#include "version.h"         /* DOS_LABEL — the desktop milestone label */
 #include "kmalloc.h"
 #include "printf.h"
 #include "hal.h"
@@ -2028,8 +2029,11 @@ int gui_start(void) {
 
     gfx_vgradient(&wallsurf, 0, 0, wallsurf.w, wallsurf.h,
                   COL_WALL_TOP, COL_WALL_BOT);
-    gfx_text(&wallsurf, wallsurf.w - 8 * GFX_GLYPH_W - 12,
-             work_h - GFX_GLYPH_H - 8, "d-os M22", 0xFF9FB6C9u);
+    /* Desktop milestone label — sizes itself to the string so any DOS_MILESTONE
+     * length stays right-aligned (see kernel/includes/version.h). */
+    int lbl_w = 0; for (const char* p = DOS_LABEL; *p; p++) lbl_w++;
+    gfx_text(&wallsurf, wallsurf.w - lbl_w * GFX_GLYPH_W - 12,
+             work_h - GFX_GLYPH_H - 8, DOS_LABEL, 0xFF9FB6C9u);
 
     /* M22.7-B — panel surface: screen-addressed, but only the bottom strip
      * (taskbar reserve + popup headroom) is backed (see PANEL_POPUP_MAX).
