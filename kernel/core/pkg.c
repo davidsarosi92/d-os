@@ -751,6 +751,22 @@ static void ldso_provision(void) {
     }
 }
 
+/* ----------------------- pluggable backend (see pkg.h) -------------------- */
+
+/* The content-addressed store IS the default backend: its ops just point at the
+ * store_* implementations above (their public names, kept for direct/bootstrap
+ * use).  A different pkg manager registers its own struct pkg_ops. */
+static const struct pkg_ops store_ops = {
+    .name = "store", .version = "1",
+    .build = pkg_build, .install = pkg_install, .remove = pkg_remove,
+    .run = pkg_run, .gc = pkg_gc, .list = pkg_list, .why = pkg_why,
+    .libc_use = pkg_libc_use,
+};
+static const struct pkg_ops* g_pkg_backend = &store_ops;
+
+void pkg_backend_register(const struct pkg_ops* ops) { if (ops) g_pkg_backend = ops; }
+const struct pkg_ops* pkg_backend_active(void) { return g_pkg_backend; }
+
 void pkg_init(void) {
     /* Idempotent: pkg_init may be reached from more than one path (the x86_64
      * boot self-test provisions early; shell_run also calls it lazily).  The
@@ -760,6 +776,11 @@ void pkg_init(void) {
     static int inited = 0;
     if (inited) return;
     inited = 1;
+
+    /* Announce the active package-manager backend (swappable component). */
+    pkg_backend_register(&store_ops);
+    kprintf("pkg: backend '%s' v%s active\n",
+            g_pkg_backend->name, g_pkg_backend->version);
 
     vfs_mkdir("/store");
     vfs_mkdir("/etc"); vfs_mkdir("/etc/pkg");

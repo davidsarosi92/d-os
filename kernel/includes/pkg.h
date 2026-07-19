@@ -65,6 +65,32 @@ struct pkg_recipe {
  * between them — the swappable/updatable-libc seam the store model gives us. */
 int  pkg_libc_use(const char* id);
 
+/* ---------------------------------------------------------------------------
+ * Pluggable package-manager BACKEND.  The package manager is itself a modular,
+ * swappable component (same philosophy as DRIVER()/SERVICE()/SHELL_PROVIDER()):
+ * a stable `struct pkg_ops` contract with the content-addressed store as the
+ * DEFAULT backend.  A different implementation (e.g. a remote/apt-style or a
+ * networked backend) registers its own ops and becomes active; the user-facing
+ * `pkg`/`pkgrun` commands dispatch through `pkg_backend_active()`.  `version`
+ * versions the BACKEND itself (everything is versioned so it can be updated).
+ * --------------------------------------------------------------------------- */
+struct pkg_ops {
+    const char* name;
+    const char* version;
+    int  (*build)(const char* id);
+    int  (*install)(const char* id);
+    int  (*remove)(const char* id);
+    int  (*run)(int argc, const char* const argv[]);
+    int  (*gc)(void);
+    void (*list)(void);
+    void (*why)(const char* id);
+    int  (*libc_use)(const char* id);
+};
+/* Register a backend and make it the active one (last registration wins; a
+ * `pkg.backend` config key can select among registered backends by name). */
+void pkg_backend_register(const struct pkg_ops* ops);
+const struct pkg_ops* pkg_backend_active(void);
+
 /* Register a recipe (called from pkg_init for the built-ins). */
 void pkg_register(struct pkg_recipe* r);
 

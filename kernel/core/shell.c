@@ -1832,7 +1832,7 @@ static void cmd_pkgrun(const char* line) {
     }
     if (argc == 0) { console_write("usage: pkgrun <name> [args...]\n"); return; }
 
-    int rc = pkg_run(argc, (const char* const*)argv);
+    int rc = pkg_backend_active()->run(argc, (const char* const*)argv);
     kprintf("pkgrun: '%s' returned rc=%d\n", argv[0], rc);
 }
 
@@ -1939,15 +1939,22 @@ int dos_run_elf_cap(const char* path, char* cap, int caplen) {
 
 int dos_run_elf(const char* path) { return dos_run_elf_cap(path, NULL, 0); }
 
-/* §M35.5 — content-addressed package store. */
+/* §M35.5 — package manager.  Dispatches through the ACTIVE, swappable backend
+ * (pkg_backend_active) rather than the store functions directly, so a different
+ * pkg-manager implementation transparently serves the same commands. */
 static void cmd_pkg(const char* args) {
-    if (starts_with(args, "build "))   { pkg_build(args + 6);   return; }
-    if (starts_with(args, "install ")) { pkg_install(args + 8); return; }
-    if (starts_with(args, "remove "))  { pkg_remove(args + 7);  return; }
-    if (starts_with(args, "why "))     { pkg_why(args + 4);     return; }
-    if (streq(args, "gc"))             { pkg_gc();              return; }
-    if (streq(args, "list") || !*args) { pkg_list();            return; }
-    console_write("usage: pkg build|install|remove|why <id> | list | gc\n");
+    const struct pkg_ops* b = pkg_backend_active();
+    if (starts_with(args, "build "))   { b->build(args + 6);   return; }
+    if (starts_with(args, "install ")) { b->install(args + 8); return; }
+    if (starts_with(args, "remove "))  { b->remove(args + 7);  return; }
+    if (starts_with(args, "why "))     { b->why(args + 4);     return; }
+    if (streq(args, "gc"))             { b->gc();              return; }
+    if (streq(args, "list") || !*args) { b->list();            return; }
+    if (streq(args, "backend")) {
+        kprintf("pkg: active backend '%s' v%s\n", b->name, b->version);
+        return;
+    }
+    console_write("usage: pkg build|install|remove|why <id> | list | gc | backend\n");
 }
 
 /* §M35.5 — scripted demo: two hello versions coexist, install hello-2 + args
