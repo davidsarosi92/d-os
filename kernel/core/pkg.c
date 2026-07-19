@@ -560,6 +560,11 @@ extern const unsigned char _binary_user_ldmusl_so_end[]        __attribute__((we
 extern const unsigned char _binary_user_libgreet_so_start[]    __attribute__((weak));
 extern const unsigned char _binary_user_libgreet_so_end[]      __attribute__((weak));
 
+/* §M38 support libs (toward NetSurf): zlib, cross-built + embedded, installed
+ * as a versioned store package (soname libz.so.1). */
+extern const unsigned char _binary_user_libz_so_1_start[]      __attribute__((weak));
+extern const unsigned char _binary_user_libz_so_1_end[]        __attribute__((weak));
+
 /* §M38: the C++ runtime .so's (from the musl C++ toolchain) + the demo C++
  * library, provisioned into /lib so ld.so resolves a C++ program's DT_NEEDED
  * libstdc++.so.6 / libgcc_s.so.1 / libcpplib.so.  Weak — present only when the
@@ -573,6 +578,7 @@ extern const unsigned char _binary_user_libcpplib_so_end[]     __attribute__((we
 
 static struct pkg_recipe rc_hello1, rc_hello2, rc_args, rc_echo, rc_cat, rc_ls, rc_env, rc_sh;
 static struct pkg_recipe rc_musl;
+static struct pkg_recipe rc_zlib;
 
 /* The version string of the embedded runtime musl — arch-specific (the i386
  * build fetches+builds musl 1.2.5; the x86_64 prebuilt musl.cc sysroot ships
@@ -682,6 +688,19 @@ static void ldso_provision(void) {
     if (_binary_user_libcpplib_so_start)
         write_file("/lib/libcpplib.so", _binary_user_libcpplib_so_start,
                    blob_len(_binary_user_libcpplib_so_start, _binary_user_libcpplib_so_end));
+
+    /* §M38 support libs — zlib as a proper versioned store package (same path
+     * as musl: a `soname` lib recipe → /store → profile view → /lib/libz.so.1).
+     * The first of the NetSurf support-lib closure; freetype/harfbuzz/… follow
+     * the identical pattern. */
+    if (_binary_user_libz_so_1_start) {
+        rc_zlib = (struct pkg_recipe){ .id="zlib", .name="zlib", .version="1.3.1",
+            .deps="", .content=_binary_user_libz_so_1_start,
+            .content_len=blob_len(_binary_user_libz_so_1_start, _binary_user_libz_so_1_end),
+            .abi="native", .soname="libz.so.1", .is_libc=0 };
+        pkg_register(&rc_zlib);
+        pkg_install("zlib");
+    }
 }
 
 void pkg_init(void) {

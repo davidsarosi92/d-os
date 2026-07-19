@@ -445,6 +445,8 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
         extern const unsigned char _binary_user_cpptest_cxxelf_end[]         __attribute__((weak));
         extern const unsigned char _binary_user_forktest64_muslelf_start[]   __attribute__((weak));
         extern const unsigned char _binary_user_forktest64_muslelf_end[]     __attribute__((weak));
+        extern const unsigned char _binary_user_ztest_dynelf_start[]         __attribute__((weak));
+        extern const unsigned char _binary_user_ztest_dynelf_end[]           __attribute__((weak));
         struct { const char* name; const unsigned char* s; const unsigned char* e; } tests[] = {
             { "muslhello (static)", _binary_user_muslhello_muslelf_start,   _binary_user_muslhello_muslelf_end   },
             { "muslhellodyn (dyn)", _binary_user_muslhellodyn_dynelf_start, _binary_user_muslhellodyn_dynelf_end },
@@ -452,6 +454,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
             { "dlopentest",         _binary_user_dlopentest_dynelf_start,   _binary_user_dlopentest_dynelf_end   },
             { "cpptest (C++)",      _binary_user_cpptest_cxxelf_start,      _binary_user_cpptest_cxxelf_end      },
             { "forktest64 (fork)",  _binary_user_forktest64_muslelf_start,  _binary_user_forktest64_muslelf_end  },
+            { "ztest (zlib .so)",   _binary_user_ztest_dynelf_start,        _binary_user_ztest_dynelf_end        },
         };
         pkg_init();                    /* provision /lib ld.so + .so's up front */
         /* Provision an execve target for forktest64: write the muslhello blob

@@ -86,3 +86,4 @@ third_party/tinycc-i686/
 # §M43 on-device compiler build products
 user/rootfs.bin
 user/dostcc
+third_party/zlib/
