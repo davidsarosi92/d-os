@@ -303,6 +303,34 @@ static void profile_bin_expose(struct pkg_recipe* r) {
  * (/lib/ld-musl-<arch>.so.1) so a dynamic binary's interpreter resolves.  ramfs
  * has no symlinks, so this copies — the moral equivalent of a Nix profile link;
  * "switching" libc versions = re-run this from a different store path. */
+/* Stream-copy src → dst in fixed chunks (no whole-file buffer), so provisioning
+ * scales to a 17 MiB libstdc++ without a giant contiguous kmalloc.  Returns
+ * total bytes copied, or -1. */
+static long copy_file(const char* src, const char* dst) {
+    struct file* in = vfs_open(src, VFS_RDONLY);
+    if (!in) return -1;
+    vfs_unlink(dst);
+    struct file* out = vfs_open(dst, VFS_WRONLY | VFS_CREATE);
+    if (!out) { vfs_close(in); return -1; }
+    enum { CHUNK = 65536 };
+    char* buf = (char*)kmalloc(CHUNK);
+    long total = 0; int ok = (buf != 0);
+    while (ok) {
+        ssize_t r = vfs_read(in, buf, CHUNK);
+        if (r <= 0) break;
+        ssize_t off = 0;
+        while (off < r) {
+            ssize_t w = vfs_write(out, buf + off, (size_t)(r - off));
+            if (w <= 0) { ok = 0; break; }
+            off += w;
+        }
+        total += off;
+    }
+    if (buf) kfree(buf);
+    vfs_close(in); vfs_close(out);
+    return ok ? total : -1;
+}
+
 static void profile_lib_expose(struct pkg_recipe* r) {
     if (!r->soname) return;
     char dn[96]; store_dirname_r(r, dn, sizeof dn);
@@ -311,21 +339,17 @@ static void profile_lib_expose(struct pkg_recipe* r) {
     p = sappend(src, sizeof src, p, "/lib/");
     sappend(src, sizeof src, p, r->soname);
 
-    char* buf = (char*)kmalloc(PKG_MAX_IMAGE);
-    if (!buf) return;
-    int n = read_file(src, buf, PKG_MAX_IMAGE);
+    vfs_mkdir("/lib");
+    char dst[96]; int dp = sappend(dst, sizeof dst, 0, "/lib/");
+    sappend(dst, sizeof dst, dp, r->soname);
+    long n = copy_file(src, dst);                     /* streamed → scales big */
     if (n > 0) {
-        vfs_mkdir("/lib");
-        char dst[96]; int dp = sappend(dst, sizeof dst, 0, "/lib/");
-        sappend(dst, sizeof dst, dp, r->soname);
-        write_file(dst, buf, (unsigned)n);
         if (r->is_libc) {
-            write_file(DOS_LDSO_PATH, buf, (unsigned)n);  /* PT_INTERP alias */
+            copy_file(src, DOS_LDSO_PATH);            /* PT_INTERP alias */
             kprintf("libc: active = %s %s (%s) → /lib/%s + %s\n",
                     r->name, r->version, dn, r->soname, DOS_LDSO_PATH);
         }
     }
-    kfree(buf);
 }
 
 int pkg_install(const char* id) {
@@ -588,6 +612,8 @@ static struct pkg_recipe rc_zlib;
 static struct pkg_recipe rc_libpng;
 static struct pkg_recipe rc_freetype;
 static struct pkg_recipe rc_harfbuzz;
+static struct pkg_recipe rc_libgcc;
+static struct pkg_recipe rc_libstdcxx;
 
 /* The version string of the embedded runtime musl — arch-specific (the i386
  * build fetches+builds musl 1.2.5; the x86_64 prebuilt musl.cc sysroot ships
@@ -687,13 +713,28 @@ static void ldso_provision(void) {
                    blob_len(_binary_user_libgreet_so_start,
                             _binary_user_libgreet_so_end));
 
-    /* §M38 — the C++ runtime + demo library at the sonames C++ ELFs need. */
-    if (_binary_user_libstdcxx_so_start)
-        write_file("/lib/libstdc++.so.6", _binary_user_libstdcxx_so_start,
-                   blob_len(_binary_user_libstdcxx_so_start, _binary_user_libstdcxx_so_end));
-    if (_binary_user_libgccs_so_start)
-        write_file("/lib/libgcc_s.so.1", _binary_user_libgccs_so_start,
-                   blob_len(_binary_user_libgccs_so_start, _binary_user_libgccs_so_end));
+    /* §M38 — the C++ runtime as versioned store packages too (libgcc_s first,
+     * then libstdc++ which depends on it).  libstdc++.so.6 is ~17 MiB — the
+     * store→/lib provisioning STREAMS (copy_file), so no giant contiguous
+     * buffer.  The libcpplib demo .so stays a direct /lib write (a test
+     * artifact, not a real component). */
+    if (_binary_user_libgccs_so_start) {
+        rc_libgcc = (struct pkg_recipe){ .id="libgcc", .name="libgcc", .version="11.2.0",
+            .deps="", .content=_binary_user_libgccs_so_start,
+            .content_len=blob_len(_binary_user_libgccs_so_start, _binary_user_libgccs_so_end),
+            .abi="native", .soname="libgcc_s.so.1", .is_libc=0 };
+        pkg_register(&rc_libgcc);
+        pkg_install("libgcc");
+    }
+    if (_binary_user_libstdcxx_so_start) {
+        rc_libstdcxx = (struct pkg_recipe){ .id="libstdc++", .name="libstdc++",
+            .version="11.2.0", .deps="libgcc",
+            .content=_binary_user_libstdcxx_so_start,
+            .content_len=blob_len(_binary_user_libstdcxx_so_start, _binary_user_libstdcxx_so_end),
+            .abi="native", .soname="libstdc++.so.6", .is_libc=0 };
+        pkg_register(&rc_libstdcxx);
+        pkg_install("libstdc++");
+    }
     if (_binary_user_libcpplib_so_start)
         write_file("/lib/libcpplib.so", _binary_user_libcpplib_so_start,
                    blob_len(_binary_user_libcpplib_so_start, _binary_user_libcpplib_so_end));
