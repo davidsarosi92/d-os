@@ -1898,6 +1898,47 @@ static void cmd_exec(const char* path) {
     kprintf("exec: '%s' returned rc=%d\n", path, rc);
 }
 
+/* §M43 — reusable compile+run engine (devtools.h), shared with the GUI editor's
+ * "Compile & Run" button.  Runs the embedded tcc / loads a VFS ELF, both under
+ * the Linux personality. */
+int dos_tcc_available(void) { return _binary_user_dostcc_start != 0; }
+
+int dos_tcc_compile(const char* src, const char* out) {
+    if (!_binary_user_dostcc_start) return -1;
+    const char* argv[5] = { "tcc", "-B/usr/lib/tcc", src, "-o", out };
+    size_t len = (size_t)(_binary_user_dostcc_end - _binary_user_dostcc_start);
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    proc_exec_elf_argv(_binary_user_dostcc_start, len, 5, (const char* const*)argv);
+    if (me) me->linux_abi = prev;
+    /* Success proxy: tcc produced a non-empty output file. */
+    struct file* f = vfs_open(out, VFS_RDONLY);
+    if (!f) return -1;
+    int ok = (f->inode && f->inode->size > 0) ? 0 : -1;
+    vfs_close(f);
+    return ok;
+}
+
+int dos_run_elf(const char* path) {
+    struct file* f = vfs_open(path, VFS_RDONLY);
+    if (!f) return -1;
+    size_t sz = f->inode ? (size_t)f->inode->size : 0;
+    if (sz == 0 || sz > (16u << 20)) { vfs_close(f); return -1; }
+    uint8_t* img = (uint8_t*)kmalloc(sz);
+    if (!img) { vfs_close(f); return -1; }
+    ssize_t rd = vfs_read(f, img, sz);
+    vfs_close(f);
+    if (rd < (ssize_t)sz) { kfree(img); return -1; }
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(img, sz);
+    if (me) me->linux_abi = prev;
+    kfree(img);
+    return rc;
+}
+
 /* §M35.5 — content-addressed package store. */
 static void cmd_pkg(const char* args) {
     if (starts_with(args, "build "))   { pkg_build(args + 6);   return; }

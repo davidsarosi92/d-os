@@ -29,6 +29,7 @@
 #include "keymap.h"
 #include "vfs.h"
 #include "kmalloc.h"
+#include "devtools.h"          /* §M43 — Compile & Run */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -135,7 +136,34 @@ static void ed_save(struct edapp* a) {
     }
 }
 
+/* §M43 — Compile & Run: save the buffer (must be a .c path), compile it with
+ * the on-device tcc, and run the result.  The program's own output goes to the
+ * console; the status line reports compile/run success + exit code. */
+static void ed_run(struct edapp* a) {
+    if (!dos_tcc_available()) { w_label_set(a->status, "tcc not built (make tcc)"); return; }
+    if (a->path_in->len == 0) { w_label_set(a->status, "type a .c path first"); return; }
+    ed_save(a);                                  /* persist the buffer first */
+    w_label_set(a->status, "compiling...");
+    if (dos_tcc_compile(a->path_in->buf, "/tmp.run.elf") != 0) {
+        w_label_set(a->status, "compile FAILED (see console)");
+        return;
+    }
+    int rc = dos_run_elf("/tmp.run.elf");
+    char st[48] = "compiled OK — ran, rc=";
+    int p = 22, v = rc < 0 ? -rc : rc;           /* small-int formatter */
+    char tmp[12]; int d = 0;
+    if (rc < 0) st[p++] = '-';
+    do { tmp[d++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (d) st[p++] = tmp[--d];
+    st[p] = 0;
+    w_label_set(a->status, st);
+}
+
 /* ---- callbacks ---------------------------------------------------------------- */
+
+static void ed_run_click(struct w_button* b, void* ctx) {
+    (void)b; ed_run((struct edapp*)ctx);
+}
 
 static void ed_open_click(struct w_button* b, void* ctx) {
     (void)b; ed_load((struct edapp*)ctx);
@@ -153,6 +181,7 @@ static void ed_shortcut(struct w_editor* e, uint8_t kc, void* ctx) {
     (void)e;
     if (kc == KC_S) ed_save((struct edapp*)ctx);  /* Ctrl+S */
     if (kc == KC_O) ed_load((struct edapp*)ctx);  /* Ctrl+O */
+    /* (Compile & Run is the "Run" button; no Ctrl shortcut — KC_R unmapped.) */
 }
 
 /* ---- layout + lifetime --------------------------------------------------------- */
@@ -164,7 +193,7 @@ static void ed_layout(struct gui_window* win) {
     gui_window_content_size(win, &cw, &ch);
 
     a->path_in->base.x = 8;   a->path_in->base.y = 6;
-    a->path_in->base.w = cw - 16 - 2 * 58;
+    a->path_in->base.w = cw - 16 - 3 * 58;      /* room for Run/Open/Save */
 
     a->ed->base.x = 8;   a->ed->base.y = 30;
     a->ed->base.w = cw - 16;
@@ -177,6 +206,7 @@ static void ed_layout(struct gui_window* win) {
 /* The two buttons need layout too — stash them in the ctx. */
 struct edapp_full {
     struct edapp a;
+    struct w_button* run_btn;
     struct w_button* open_btn;
     struct w_button* save_btn;
 };
@@ -188,7 +218,8 @@ static void ed_layout_full(struct gui_window* win) {
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
     (void)ch;
-    af->open_btn->base.x = cw - 8 - 2 * 54 - 4;  af->open_btn->base.y = 5;
+    af->run_btn->base.x  = cw - 8 - 3 * 54 - 12; af->run_btn->base.y  = 5;
+    af->open_btn->base.x = cw - 8 - 2 * 54 - 6;  af->open_btn->base.y = 5;
     af->save_btn->base.x = cw - 8 - 54;          af->save_btn->base.y = 5;
 }
 
@@ -201,7 +232,9 @@ static void editor_open_with(const char* path) {
     if (!win) { kfree(af); return; }
     af->a.win = win;
 
-    af->a.path_in = w_textinput_create(win, 8, 6, 460, af);
+    af->a.path_in = w_textinput_create(win, 8, 6, 400, af);
+    af->run_btn   = w_button_create(win, 420, 5, 54, 18, "Run",
+                                    ed_run_click, &af->a);
     af->open_btn  = w_button_create(win, 480, 5, 54, 18, "Open",
                                     ed_open_click, &af->a);
     af->save_btn  = w_button_create(win, 540, 5, 54, 18, "Save",
@@ -209,7 +242,7 @@ static void editor_open_with(const char* path) {
     af->a.ed      = w_editor_create(win, 8, 30, 588, 380, &af->a);
     af->a.status  = w_label_create(win, 8, 424, 588, "new buffer");
 
-    if (!af->a.path_in || !af->open_btn || !af->save_btn ||
+    if (!af->a.path_in || !af->run_btn || !af->open_btn || !af->save_btn ||
         !af->a.ed || !af->a.status) {
         gui_window_close(win);                  /* frees af as app_ctx */
         return;
