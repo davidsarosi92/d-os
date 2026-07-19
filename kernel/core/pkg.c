@@ -568,6 +568,8 @@ extern const unsigned char _binary_user_libpng16_so_16_start[] __attribute__((we
 extern const unsigned char _binary_user_libpng16_so_16_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_libfreetype_so_6_start[] __attribute__((weak));
 extern const unsigned char _binary_user_libfreetype_so_6_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_libharfbuzz_so_0_start[] __attribute__((weak));
+extern const unsigned char _binary_user_libharfbuzz_so_0_end[]   __attribute__((weak));
 
 /* §M38: the C++ runtime .so's (from the musl C++ toolchain) + the demo C++
  * library, provisioned into /lib so ld.so resolves a C++ program's DT_NEEDED
@@ -585,6 +587,7 @@ static struct pkg_recipe rc_musl;
 static struct pkg_recipe rc_zlib;
 static struct pkg_recipe rc_libpng;
 static struct pkg_recipe rc_freetype;
+static struct pkg_recipe rc_harfbuzz;
 
 /* The version string of the embedded runtime musl — arch-specific (the i386
  * build fetches+builds musl 1.2.5; the x86_64 prebuilt musl.cc sysroot ships
@@ -731,9 +734,33 @@ static void ldso_provision(void) {
         pkg_register(&rc_freetype);
         pkg_install("freetype");
     }
+
+    /* harfbuzz — text shaping (a C++ .so; its DT_NEEDED pulls libstdc++.so.6,
+     * still direct-provisioned, so deps="" for the store closure today; the
+     * logical harfbuzz→freetype+libstdc++ deps become real store deps once
+     * hb-ft + a libstdc++ package land). */
+    if (_binary_user_libharfbuzz_so_0_start) {
+        rc_harfbuzz = (struct pkg_recipe){ .id="harfbuzz", .name="harfbuzz",
+            .version="8.5.0", .deps="",
+            .content=_binary_user_libharfbuzz_so_0_start,
+            .content_len=blob_len(_binary_user_libharfbuzz_so_0_start,
+                                  _binary_user_libharfbuzz_so_0_end),
+            .abi="native", .soname="libharfbuzz.so.0", .is_libc=0 };
+        pkg_register(&rc_harfbuzz);
+        pkg_install("harfbuzz");
+    }
 }
 
 void pkg_init(void) {
+    /* Idempotent: pkg_init may be reached from more than one path (the x86_64
+     * boot self-test provisions early; shell_run also calls it lazily).  The
+     * built-in recipes are file-scope statics linked into the registry, so a
+     * second run would re-register the SAME structs and cycle the list.  Guard
+     * against that. */
+    static int inited = 0;
+    if (inited) return;
+    inited = 1;
+
     vfs_mkdir("/store");
     vfs_mkdir("/etc"); vfs_mkdir("/etc/pkg");
     ldso_provision();

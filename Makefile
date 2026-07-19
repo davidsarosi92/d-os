@@ -239,6 +239,11 @@ else ifeq ($(ARCH),x86_64)
   ifneq ($(wildcard user/libfreetype.so.6),)
     ARCH_EXTRA_OBJS += user/libfreetype6_blob.o user/fttest_dynblob.o
   endif
+  # harfbuzz → a big C++ store package (libharfbuzz.so.0, DT_NEEDED
+  # libstdc++.so.6).  Prebuilt-.so guard, same slow-C++-build reasoning.
+  ifneq ($(wildcard user/libharfbuzz.so.0),)
+    ARCH_EXTRA_OBJS += user/libharfbuzz0_blob.o user/hbtest_dynblob.o
+  endif
 
 else ifeq ($(ARCH),aarch64)
   # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
@@ -1281,6 +1286,29 @@ user/fttest.dynelf: user/fttest.c user/libfreetype.so.6
 	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(FT_DIR)/include \
 	    -Wl,-dynamic-linker,$(DOS_LDSO) user/fttest.c \
 	    user/libfreetype.so.6 user/libz.so.1 -o $@
+
+# harfbuzz — text shaping, soname libharfbuzz.so.0.  Built from the single
+# amalgamated C++ TU (src/harfbuzz.cc); a C++ .so so its closure pins
+# libstdc++.so.6.  Own target (slow C++ compile under emulation).
+HB_DIR := third_party/harfbuzz
+
+.PHONY: harfbuzz
+harfbuzz: user/libharfbuzz.so.0
+
+user/libharfbuzz.so.0: $(HB_DIR)/src/harfbuzz.cc
+	$(MUSL_ELF_CXX) -shared -fPIC -Os -std=c++11 -DHB_NO_MT \
+	    -fno-exceptions -fno-rtti -I$(HB_DIR)/src \
+	    -Wl,-soname,libharfbuzz.so.0 -o $@ $(HB_DIR)/src/harfbuzz.cc
+
+$(OBJ_DIR)/user/libharfbuzz0_blob.o: user/libharfbuzz.so.0
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+user/hbtest.dynelf: user/hbtest.c user/libharfbuzz.so.0
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(HB_DIR)/src \
+	    -Wl,-dynamic-linker,$(DOS_LDSO) user/hbtest.c \
+	    user/libharfbuzz.so.0 -o $@
 
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
