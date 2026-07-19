@@ -1835,6 +1835,69 @@ static void cmd_pkgrun(const char* line) {
     kprintf("pkgrun: '%s' returned rc=%d\n", argv[0], rc);
 }
 
+/* §M43 — `tcc <args>`: the on-device C compiler.  Runs the embedded tcc binary
+ * (a musl ELF, under the Linux personality) with the shell args as argv, e.g.
+ * `tcc /tmp/hello.c -o /tmp/hello`.  tcc reads the source + headers (/usr/
+ * include, /usr/lib/tcc/include) and writes a runnable ELF, all on the VFS. */
+extern const unsigned char _binary_user_dostcc_start[] __attribute__((weak));
+extern const unsigned char _binary_user_dostcc_end[]   __attribute__((weak));
+
+static void cmd_tcc(const char* args) {
+    if (!_binary_user_dostcc_start) {
+        console_write("tcc: not embedded — run `make tcc` then rebuild\n");
+        return;
+    }
+    static char scratch[256];
+    const char* argv[18];
+    int argc = 0;
+    argv[argc++] = "tcc";                        /* argv[0] */
+    /* -B sets tcc's base dir explicitly: we run tcc from an embedded blob with
+     * argv[0]="tcc" (no path), so tcc can't derive its dir → point it at where
+     * pkg.c provisioned libtcc1.a + tcc's own headers. */
+    argv[argc++] = "-B/usr/lib/tcc";
+    int n = 0;
+    while (args[n] && n < 255) { scratch[n] = args[n]; n++; }
+    scratch[n] = '\0';
+    int i = 0;
+    while (scratch[i] && argc < 16) {
+        while (scratch[i] == ' ') i++;
+        if (!scratch[i]) break;
+        argv[argc++] = &scratch[i];
+        while (scratch[i] && scratch[i] != ' ') i++;
+        if (scratch[i]) scratch[i++] = '\0';
+    }
+    size_t len = (size_t)(_binary_user_dostcc_end - _binary_user_dostcc_start);
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf_argv(_binary_user_dostcc_start, len, argc,
+                                (const char* const*)argv);
+    if (me) me->linux_abi = prev;
+    kprintf("tcc: returned rc=%d\n", rc);
+}
+
+/* §M43 — `exec <path>`: load + run an ELF from the VFS (e.g. one tcc just
+ * produced) under the Linux personality, as an excursion that returns to the
+ * shell.  This is what closes the "compile → run" loop on d-os. */
+static void cmd_exec(const char* path) {
+    struct file* f = vfs_open(path, VFS_RDONLY);
+    if (!f) { kprintf("exec: '%s' not found\n", path); return; }
+    size_t sz = f->inode ? (size_t)f->inode->size : 0;
+    if (sz == 0 || sz > (16u << 20)) { vfs_close(f); kprintf("exec: bad size\n"); return; }
+    uint8_t* img = (uint8_t*)kmalloc(sz);
+    if (!img) { vfs_close(f); return; }
+    ssize_t rd = vfs_read(f, img, sz);
+    vfs_close(f);
+    if (rd < (ssize_t)sz) { kfree(img); kprintf("exec: read failed\n"); return; }
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;               /* tcc output is a musl (Linux-ABI) ELF */
+    int rc = proc_exec_elf(img, sz);
+    if (me) me->linux_abi = prev;
+    kfree(img);
+    kprintf("exec: '%s' returned rc=%d\n", path, rc);
+}
+
 /* §M35.5 — content-addressed package store. */
 static void cmd_pkg(const char* args) {
     if (starts_with(args, "build "))   { pkg_build(args + 6);   return; }
@@ -2046,6 +2109,9 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "wayapp"))         { cmd_wayapp();       return; }
     if (streq(line, "waycomp"))        { wl_compositor_demo(); return; }
     if (starts_with(line, "pkgrun "))  { cmd_pkgrun(line + 7); return; }
+    if (starts_with(line, "tcc "))     { cmd_tcc(line + 4); return; }
+    if (starts_with(line, "exec "))    { cmd_exec(line + 5); return; }
+    if (streq(line, "tcc"))            { console_write("usage: tcc <src.c> -o <out> [args]\n"); return; }
     if (streq(line, "posixtest"))      { cmd_posixtest();    return; }
     if (streq(line, "waittest"))       { cmd_waittest(); return; }
     if (streq(line, "service"))        { cmd_service("");        return; }

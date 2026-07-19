@@ -83,3 +83,6 @@ user/*.cxxelf
 # §M43 TinyCC (on-device C compiler — vendored build input + product)
 third_party/tinycc/
 third_party/tinycc-i686/
+# §M43 on-device compiler build products
+user/rootfs.bin
+user/dostcc

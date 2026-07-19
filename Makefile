@@ -111,6 +111,12 @@ ifeq ($(ARCH),i386)
                        user/libstdcxx_blob.o user/libgccs_blob.o
   endif
 
+  # §M43: the on-device C compiler (make tcc) — the tcc binary + a rootfs
+  # archive (tcc/musl headers + crt) unpacked into the VFS at boot.
+  ifneq ($(wildcard third_party/tinycc-i686/bin/tcc),)
+    ARCH_EXTRA_OBJS += user/dostcc_blob.o user/rootfs_blob.o
+  endif
+
   # Tier B — in-tree user libc build knobs (i386 reference).
   USER_CFLAGS   := -m32 -ffreestanding -fno-pie -fno-stack-protector \
                    -fno-builtin -nostdlib -Os -Wall -std=c11 -Iuser
@@ -636,14 +642,21 @@ tcc:
 	@test -x $(MUSL_CXX_DIR)/bin/i686-linux-musl-gcc || { \
 	  echo "musl toolchain missing — run make musl-cross-i686 first"; exit 1; }
 	cp $(MUSL_CXX_DIR)/i686-linux-musl/lib/libc.so /lib/ld-musl-i386.so.1
+	# Clean musl headers at /usr/include so tcc (built here, run under qemu-i386)
+	# can compile libtcc1.a — the host's glibc /usr/include otherwise conflicts.
+	# (The musl-cross gcc is unaffected: it uses its own sysroot.)
+	rm -rf /usr/include && cp -a $(CURDIR)/$(MUSL_PREFIX)/include /usr/include
 	rm -rf /tmp/tcc && cp -a $(TINYCC_DIR) /tmp/tcc
 	cd /tmp/tcc && PATH=$(CURDIR)/$(MUSL_CXX_DIR)/bin:$$PATH \
-	    CC=i686-linux-musl-gcc ./configure --cpu=i386 \
-	      --elfinterp=/lib/ld-musl-i386.so.1 --crtprefix=/lib --libpaths=/lib \
-	      --sysincludepaths="{B}/include:/usr/include" --prefix=/usr
-	cd /tmp/tcc && PATH=$(CURDIR)/$(MUSL_CXX_DIR)/bin:$$PATH $(MAKE) tcc
-	rm -rf third_party/tinycc-i686 && mkdir -p third_party/tinycc-i686/bin
+	    CC=i686-linux-musl-gcc ./configure --cpu=i386 --config-musl \
+	      --elfinterp=/lib/ld-musl-i386.so.1 --crtprefix=/lib --libpaths="{B}:/lib" \
+	      --sysincludepaths="{B}/include:/usr/include" --prefix=/usr \
+	      --extra-cflags="-fPIE" --extra-ldflags="-pie" --config-pie \
+	      --config-bcheck=no --config-backtrace=no
+	cd /tmp/tcc && PATH=$(CURDIR)/$(MUSL_CXX_DIR)/bin:$$PATH $(MAKE) tcc libtcc1.a
+	rm -rf third_party/tinycc-i686 && mkdir -p third_party/tinycc-i686/bin third_party/tinycc-i686/lib
 	cp /tmp/tcc/tcc third_party/tinycc-i686/bin/tcc
+	cp /tmp/tcc/libtcc1.a third_party/tinycc-i686/lib/libtcc1.a
 	cp -a /tmp/tcc/include third_party/tinycc-i686/include
 	rm -rf /tmp/tcc
 	@echo "tcc (on-device C compiler) → third_party/tinycc-i686/bin/tcc"
@@ -1028,6 +1041,32 @@ $(OBJ_DIR)/user/ldmusl_blob.o: $(MUSL_LIBSO)
 	objcopy --input-target=binary --output-target=elf32-i386 \
 	    --binary-architecture=i386 user/ldmusl.so $@
 	rm -f user/ldmusl.so
+
+# §M43 — the on-device C compiler: embed the tcc binary + a rootfs archive
+# (tcc's own headers → /usr/lib/tcc/include, musl headers → /usr/include, musl
+# crt → /lib) that pkg.c unpacks into the VFS at boot, so `tcc hello.c -o hello`
+# can compile + link a full libc program ON d-os.
+$(OBJ_DIR)/user/dostcc_blob.o: third_party/tinycc-i686/bin/tcc
+	@mkdir -p $(@D)
+	cp third_party/tinycc-i686/bin/tcc user/dostcc
+	objcopy --input-target=binary --output-target=elf32-i386 \
+	    --binary-architecture=i386 user/dostcc $@
+	rm -f user/dostcc
+
+user/rootfs.bin: third_party/tinycc-i686/bin/tcc $(MUSL_LIBC) user/tcc_hello.c
+	python3 scripts/pack-rootfs.py $@ \
+	    third_party/tinycc-i686/include:/usr/lib/tcc/include \
+	    third_party/tinycc-i686/lib/libtcc1.a:/usr/lib/tcc/libtcc1.a \
+	    $(MUSL_PREFIX)/include:/usr/include \
+	    $(MUSL_PREFIX)/lib/crt1.o:/lib/crt1.o \
+	    $(MUSL_PREFIX)/lib/crti.o:/lib/crti.o \
+	    $(MUSL_PREFIX)/lib/crtn.o:/lib/crtn.o \
+	    user/tcc_hello.c:/hello.c
+
+$(OBJ_DIR)/user/rootfs_blob.o: user/rootfs.bin
+	@mkdir -p $(@D)
+	objcopy --input-target=binary --output-target=elf32-i386 \
+	    --binary-architecture=i386 user/rootfs.bin $@
 
 # §M37 stage 5 — a genuinely SEPARATE shared library (libgreet.so) + a program
 # that links against it by name.  libgreet.so is embedded as a blob (installed

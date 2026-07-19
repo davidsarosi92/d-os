@@ -515,6 +515,48 @@ static void register_coreutil(struct pkg_recipe* rc, const char* name,
     pkg_register(rc);
 }
 
+/* §M43 — a flat rootfs archive (scripts/pack-rootfs.py) unpacked into the VFS
+ * at boot: the on-device compiler's headers/crt/libs (too many files to embed
+ * one-by-one).  Format: repeated [u32 pathlen|path|u32 datalen|data], 0-len
+ * pathlen terminates.  Weak — present only when `make tcc` produced it. */
+extern const unsigned char _binary_user_rootfs_bin_start[] __attribute__((weak));
+extern const unsigned char _binary_user_rootfs_bin_end[]   __attribute__((weak));
+
+static uint32_t rf_rd32(const unsigned char* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* mkdir -p every parent directory of `path`. */
+static void mkdir_parents(const char* path) {
+    char buf[256];
+    int n = 0;
+    for (int i = 0; path[i] && n < (int)sizeof buf - 1; i++) {
+        buf[n++] = path[i];
+        if (path[i] == '/' && n > 1) { buf[n - 1] = '\0'; vfs_mkdir(buf); buf[n - 1] = '/'; }
+    }
+}
+
+static void rootfs_unpack(void) {
+    const unsigned char* p   = _binary_user_rootfs_bin_start;
+    const unsigned char* end = _binary_user_rootfs_bin_end;
+    if (!p) return;
+    while (p + 4 <= end) {
+        uint32_t plen = rf_rd32(p); p += 4;
+        if (plen == 0 || p + plen + 4 > end) break;
+        char path[256];
+        uint32_t pl = plen < sizeof path - 1 ? plen : sizeof path - 1;
+        for (uint32_t i = 0; i < pl; i++) path[i] = (char)p[i];
+        path[pl] = '\0';
+        p += plen;
+        uint32_t dlen = rf_rd32(p); p += 4;
+        if (p + dlen > end) break;
+        mkdir_parents(path);
+        write_file(path, p, dlen);
+        p += dlen;
+    }
+}
+
 /* §M37: place the musl dynamic linker in the VFS at the canonical interpreter
  * path a dynamically-linked musl binary carries in its PT_INTERP
  * (/lib/ld-musl-i386.so.1).  When execve loads such a binary, the kernel reads
@@ -549,6 +591,7 @@ void pkg_init(void) {
     vfs_mkdir("/store");
     vfs_mkdir("/etc"); vfs_mkdir("/etc/pkg");
     ldso_provision();
+    rootfs_unpack();                 /* §M43 — tcc headers/crt/libs into the VFS */
 
     /* Native (d-os libc) demo packages. */
     rc_hello1 = (struct pkg_recipe){ .id="hello-1", .name="hello", .version="1.0",

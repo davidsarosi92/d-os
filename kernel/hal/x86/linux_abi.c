@@ -57,6 +57,9 @@ extern uint32_t saved_eip;
 #define LNX_mmap2          192
 #define LNX_fstat64        197
 #define LNX_set_thread_area 243
+#define LNX_unlink          10
+#define LNX_lseek           19
+#define LNX__llseek        140
 #define LNX_time            13
 #define LNX_gettimeofday    78
 #define LNX_clock_gettime  265
@@ -270,6 +273,26 @@ void linux_syscall_dispatch(struct int_frame* f) {
             sys_clock_gettime(CLOCK_REALTIME, &ts);
             uint32_t* p = (uint32_t*)f->ebx;
             if (p) { p[0] = ts.sec; p[1] = ts.nsec / 1000; }
+            f->eax = 0;
+            return;
+        }
+        case LNX_unlink:
+            /* unlink(path=ebx) — tcc removes the output file before writing. */
+            f->eax = (uint32_t)vfs_unlink((const char*)f->ebx);
+            return;
+        case LNX_lseek:
+            /* lseek(fd=ebx, offset=ecx, whence=edx) → new offset. */
+            f->eax = (uint32_t)sys_lseek((int)f->ebx, (long)f->ecx, (int)f->edx);
+            return;
+        case LNX__llseek: {
+            /* _llseek(fd=ebx, off_hi=ecx, off_lo=edx, loff_t* result=esi,
+             * whence=edi) → 0 + *result.  tcc seeks in object files with this;
+             * without it tcc misreads a .o as "invalid object file".  32-bit
+             * files: the low word is the offset. */
+            long r = sys_lseek((int)f->ebx, (long)f->edx, (int)f->edi);
+            if (r < 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
+            long long* result = (long long*)f->esi;
+            if (result) *result = (long long)r;
             f->eax = 0;
             return;
         }
