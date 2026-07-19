@@ -24,12 +24,19 @@
 #include <stddef.h>
 
 #define PAGE_SIZE          4096u
-#define PROC_STACK_OFFSET  0x00100000u   /* user stack 1 MiB above the image  */
-#define PROC_INTERP_OFFSET 0x00200000u   /* §M37 dynamic-linker load base:    */
-                                         /*   2 MiB above the image — above    */
-                                         /*   the stack (1 MiB), below the     */
-                                         /*   mmap region (4 MiB) so ld.so's   */
-                                         /*   own mmaps never overlap it.      */
+/* Per-process user address-space layout (offsets from vmm_user_base()).  Chosen
+ * with generous, non-overlapping regions so large programs (a static mbedTLS
+ * binary, a C++ program) fit and the DOWN-growing stack never runs into the
+ * image (the M25 single-page stack at +1 MiB overflowed into the image — a real
+ * TLS handshake needs far more than one page):
+ *     +0            image (PIE bias / ET_EXEC vaddr)      up to ~64 MiB
+ *     +0x04000000   interpreter (ld.so), dynamic only     ~16 MiB
+ *     +0x06000000   stack TOP (grows DOWN), PROC_STACK_PAGES pages
+ *     +0x08000000   mmap region (grows UP)                (see usyscall.c)
+ */
+#define PROC_INTERP_OFFSET 0x04000000u   /* §M37 dynamic linker load base      */
+#define PROC_STACK_TOP     0x06000000u   /* one past the highest stack page    */
+#define PROC_STACK_PAGES   256u          /* 1 MiB user stack                   */
 #define PROC_MAX_ARGV      16
 
 /* ---------------------------------------------------------------------------
@@ -207,6 +214,29 @@ static int load_program(struct vmm_space* s, const void* image, size_t len,
     return ELF_OK;
 }
 
+/* Map the PROC_STACK_PAGES-page user stack (grows down from PROC_STACK_TOP).
+ * Returns the TOP page's frame (for build_initial_stack, which writes argc/
+ * argv/envp/auxv there) and its VA via *stack_va_out; the pages below it are
+ * zeroed scratch for stack growth.  Returns 0 on failure. */
+static uint32_t map_user_stack(struct vmm_space* s, uintptr_t* stack_va_out) {
+    uintptr_t top_page = vmm_user_base() + PROC_STACK_TOP - PAGE_SIZE;
+    uint32_t top_frame = 0;
+    for (uint32_t i = 0; i < PROC_STACK_PAGES; i++) {
+        uintptr_t va = top_page - (uintptr_t)i * PAGE_SIZE;
+        uint32_t fr = pmm_alloc_frame();
+        if (!fr) return 0;
+        uint8_t* p = (uint8_t*)(uintptr_t)fr;
+        for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = 0;
+        if (vmm_space_map(s, va, fr, VMM_USER | VMM_WRITABLE) != 0) {
+            pmm_free_frame(fr);
+            return 0;
+        }
+        if (i == 0) top_frame = fr;
+    }
+    *stack_va_out = top_page;
+    return top_frame;
+}
+
 /* Shared exec path: load `image` into a fresh space, map a user stack carrying
  * the SysV initial stack (argc/argv/envp/auxv), and run it to SYS_EXIT as a
  * synchronous excursion on the calling task.  argc<=0 → an empty argv. */
@@ -219,15 +249,10 @@ static int proc_exec_common(const void* image, size_t len,
     int rc = load_program(s, image, len, &lp);
     if (rc != ELF_OK) { vmm_space_destroy(s); return rc; }
 
-    /* One-page user stack, mapped clear of the loaded image. */
-    uint32_t stk = pmm_alloc_frame();
+    /* Multi-page user stack (grows down), clear of the loaded image. */
+    uintptr_t stack_va;
+    uint32_t stk = map_user_stack(s, &stack_va);
     if (!stk) { vmm_space_destroy(s); return -1; }
-    uintptr_t stack_va = vmm_user_base() + PROC_STACK_OFFSET;
-    if (vmm_space_map(s, stack_va, stk, VMM_USER | VMM_WRITABLE) != 0) {
-        pmm_free_frame(stk);
-        vmm_space_destroy(s);
-        return -1;
-    }
     uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, argv, &lp);
 
     /* Bind the space to this task so the scheduler maintains CR3/TTBR0 across
@@ -310,13 +335,9 @@ int proc_execve(const char* path, char* const uargv[]) {
     if (load_program(ns, img, sz, &lp) != ELF_OK) {
         vmm_space_destroy(ns); kfree(img); kfree(strbuf); return -1;
     }
-    uint32_t stk = pmm_alloc_frame();
+    uintptr_t stack_va;
+    uint32_t stk = map_user_stack(ns, &stack_va);
     if (!stk) { vmm_space_destroy(ns); kfree(img); kfree(strbuf); return -1; }
-    uintptr_t stack_va = vmm_user_base() + PROC_STACK_OFFSET;
-    if (vmm_space_map(ns, stack_va, stk, VMM_USER | VMM_WRITABLE) != 0) {
-        pmm_free_frame(stk); vmm_space_destroy(ns);
-        kfree(img); kfree(strbuf); return -1;
-    }
     uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, kargv, &lp);
 
     /* 4. Commit: swap to the new space, free the old one + scratch.  execve
@@ -446,14 +467,9 @@ int proc_spawn(const char* name, const void* image, size_t len) {
     int rc = load_program(s, image, len, &lp);
     if (rc != ELF_OK) { vmm_space_destroy(s); return rc; }
 
-    uint32_t stk = pmm_alloc_frame();
+    uintptr_t stack_va;
+    uint32_t stk = map_user_stack(s, &stack_va);
     if (!stk) { vmm_space_destroy(s); return -1; }
-    uintptr_t stack_va = vmm_user_base() + PROC_STACK_OFFSET;
-    if (vmm_space_map(s, stack_va, stk, VMM_USER | VMM_WRITABLE) != 0) {
-        pmm_free_frame(stk);
-        vmm_space_destroy(s);
-        return -1;
-    }
 
     struct user_boot* b = (struct user_boot*)kmalloc(sizeof *b);
     if (!b) { vmm_space_destroy(s); return -1; }

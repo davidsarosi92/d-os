@@ -57,6 +57,10 @@ extern uint32_t saved_eip;
 #define LNX_mmap2          192
 #define LNX_fstat64        197
 #define LNX_set_thread_area 243
+#define LNX_time            13
+#define LNX_gettimeofday    78
+#define LNX_clock_gettime  265
+#define LNX_clock_gettime64 403
 #define LNX_getrandom      355
 #define LNX_exit_group     252
 #define LNX_getdents64     220
@@ -239,6 +243,44 @@ void linux_syscall_dispatch(struct int_frame* f) {
         case LNX_close:
             f->eax = (uint32_t)sys_close((int)f->ebx);
             return;
+
+        case LNX_clock_gettime64: {
+            /* clock_gettime64(clockid=ebx, __kernel_timespec*=ecx): s64 tv_sec@0,
+             * s64 tv_nsec@8.  musl on i386 (time64) routes time()/gettimeofday
+             * here — without it mbedTLS's x509 date check fatals (gmtime bad). */
+            struct ktimespec ts;
+            sys_clock_gettime((int)f->ebx, &ts);
+            uint32_t* p = (uint32_t*)f->ecx;
+            if (p) { p[0] = ts.sec; p[1] = 0; p[2] = ts.nsec; p[3] = 0; }
+            f->eax = 0;
+            return;
+        }
+        case LNX_clock_gettime: {
+            /* 32-bit timespec { long tv_sec; long tv_nsec; }. */
+            struct ktimespec ts;
+            sys_clock_gettime((int)f->ebx, &ts);
+            uint32_t* p = (uint32_t*)f->ecx;
+            if (p) { p[0] = ts.sec; p[1] = ts.nsec; }
+            f->eax = 0;
+            return;
+        }
+        case LNX_gettimeofday: {
+            /* struct timeval { long tv_sec; long tv_usec; } at ebx. */
+            struct ktimespec ts;
+            sys_clock_gettime(CLOCK_REALTIME, &ts);
+            uint32_t* p = (uint32_t*)f->ebx;
+            if (p) { p[0] = ts.sec; p[1] = ts.nsec / 1000; }
+            f->eax = 0;
+            return;
+        }
+        case LNX_time: {
+            /* time(time_t* t) → seconds; also writes *t if non-NULL. */
+            struct ktimespec ts;
+            sys_clock_gettime(CLOCK_REALTIME, &ts);
+            if (f->ebx) *(uint32_t*)f->ebx = ts.sec;
+            f->eax = ts.sec;
+            return;
+        }
 
         case LNX_getrandom:
             /* getrandom(buf=ebx, len=ecx, flags=edx) → the §M39 CSPRNG.  musl's

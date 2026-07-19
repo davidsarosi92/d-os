@@ -34,7 +34,8 @@
 #include <stdint.h>
 
 #define PAGE_SIZE          4096u
-#define MMAP_BASE_OFFSET   0x00400000u   /* mmap region: 4 MiB above the image */
+#define MMAP_BASE_OFFSET   0x08000000u   /* mmap region: base+128 MiB (above the
+                                          * image/interp/stack; see proc.c layout) */
 
 /* Resolve a real fd (>= 3) to its ofile, or NULL if out of range / not open. */
 static struct ofile* fd_lookup(int fd) {

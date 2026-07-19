@@ -98,9 +98,9 @@ ifeq ($(ARCH),i386)
                        user/dlopentest_dynblob.o
   endif
 
-  # §M39 stage 2: crypttest links against the ported Mbed TLS (make mbedtls).
+  # §M39 stage 2+3: crypttest + ssltest link against the ported Mbed TLS.
   ifneq ($(wildcard third_party/mbedtls-i686/lib/libmbedcrypto.a),)
-    ARCH_EXTRA_OBJS += user/crypttest_muslblob.o
+    ARCH_EXTRA_OBJS += user/crypttest_muslblob.o user/ssltest_muslblob.o
   endif
 
   # §M38: C++ runtime artifacts, present only once the musl C++ toolchain was
@@ -885,6 +885,22 @@ user/crypttest.muslelf: user/crypttest.c $(MUSL_LIBC)
 	ld -m elf_i386 -static -Ttext-segment=$(USER_BASE) -e _start -o $@ \
 	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
 	    $(OBJ_DIR)/user/crypttest.muslo \
+	    --start-group \
+	    $(MBEDTLS_PREFIX)/lib/libmbedtls.a $(MBEDTLS_PREFIX)/lib/libmbedx509.a \
+	    $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a $(MUSL_PREFIX)/lib/libc.a \
+	    `gcc -m32 -print-libgcc-file-name` --end-group \
+	    $(MUSL_PREFIX)/lib/crtn.o
+
+# §M39 stage 3 — ssltest: same mbedTLS static link (SSL/x509/crypto), in-memory
+# TLS handshake.  (Own rule so it also pulls the SSL + x509 objects.)
+user/ssltest.muslelf: user/ssltest.c $(MUSL_LIBC)
+	@mkdir -p $(OBJ_DIR)/user
+	gcc $(MUSL_CC_FLAGS) -c user/ssltest.c \
+	    -I$(MUSL_PREFIX)/include -I$(MBEDTLS_PREFIX)/include \
+	    -o $(OBJ_DIR)/user/ssltest.muslo
+	ld -m elf_i386 -static -Ttext-segment=$(USER_BASE) -e _start -o $@ \
+	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
+	    $(OBJ_DIR)/user/ssltest.muslo \
 	    --start-group \
 	    $(MBEDTLS_PREFIX)/lib/libmbedtls.a $(MBEDTLS_PREFIX)/lib/libmbedx509.a \
 	    $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a $(MUSL_PREFIX)/lib/libc.a \
