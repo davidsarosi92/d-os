@@ -1,5 +1,9 @@
 FROM --platform=linux/amd64 ubuntu:22.04
 
+# Non-interactive apt: python3-jsonschema pulls in tzdata, whose postinst
+# otherwise prompts for a timezone and hangs `docker build` (no tty).
+ENV DEBIAN_FRONTEND=noninteractive
+
 RUN apt update && apt install -y \
     build-essential \
     gcc-multilib \

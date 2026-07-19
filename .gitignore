@@ -78,3 +78,5 @@ third_party/musl-cross-*/
 # §M39 Mbed TLS (vendored crypto dep + build product)
 third_party/mbedtls/
 third_party/mbedtls-i686/
+# §M38 C++ build products
+user/*.cxxelf

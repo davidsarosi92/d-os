@@ -1652,6 +1652,29 @@ static void cmd_randtest(void) {
     console_write("\n");
 }
 
+/* §M38 — `cpptest`: run a DYNAMICALLY-linked C++ program (libstdc++ + libgcc_s)
+ * that throws + catches an exception across a .so boundary (libcpplib.so) — the
+ * M38 definition-of-done.  Embedded only when the musl C++ toolchain was built
+ * (make musl-cross-i686) + a rebuild. */
+extern const unsigned char _binary_user_cpptest_cxxelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_cpptest_cxxelf_end[]   __attribute__((weak));
+
+static void cmd_cpptest(void) {
+    if (!_binary_user_cpptest_cxxelf_start) {
+        console_write("cpptest: not embedded — run `make musl-cross-i686` then rebuild\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_cpptest_cxxelf_end -
+                          _binary_user_cpptest_cxxelf_start);
+    console_write("cpptest: exec'ing a C++ program (exceptions across a .so)...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(_binary_user_cpptest_cxxelf_start, len);
+    if (me) me->linux_abi = prev;
+    kprintf("cpptest: returned rc=%d\n", rc);
+}
+
 /* §M39 stage 2 — `crypttest`: run the Mbed TLS crypto self-test (SHA-256 KAT +
  * AES-256-GCM round-trip) in ring 3 under the Linux personality.  Embedded only
  * when `make mbedtls` + a rebuild produced it. */
@@ -1987,6 +2010,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "musldyntest"))    { cmd_musldyntest(); return; }
     if (streq(line, "randtest"))       { cmd_randtest(); return; }
     if (streq(line, "crypttest"))      { cmd_crypttest(); return; }
+    if (streq(line, "cpptest"))        { cmd_cpptest(); return; }
     if (streq(line, "solibtest"))      { cmd_solibtest(); return; }
     if (streq(line, "dlopentest"))     { cmd_dlopentest(); return; }
     if (streq(line, "pkg"))            { cmd_pkg("");        return; }

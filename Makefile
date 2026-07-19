@@ -103,6 +103,14 @@ ifeq ($(ARCH),i386)
     ARCH_EXTRA_OBJS += user/crypttest_muslblob.o
   endif
 
+  # §M38: C++ runtime artifacts, present only once the musl C++ toolchain was
+  # built (make musl-cross-i686).  cpptest = the DoD (exceptions across a .so);
+  # libcpplib/libstdcxx/libgccs are the .so's provisioned into /lib at boot.
+  ifneq ($(wildcard third_party/musl-cross-i686/bin/i686-linux-musl-g++),)
+    ARCH_EXTRA_OBJS += user/cpptest_cxxblob.o user/libcpplib_blob.o \
+                       user/libstdcxx_blob.o user/libgccs_blob.o
+  endif
+
   # Tier B — in-tree user libc build knobs (i386 reference).
   USER_CFLAGS   := -m32 -ffreestanding -fno-pie -fno-stack-protector \
                    -fno-builtin -nostdlib -Os -Wall -std=c11 -Iuser
@@ -910,6 +918,56 @@ user/%.dynelf: user/%.c $(MUSL_LIBSO)
 	    $(MUSL_PREFIX)/lib/crtn.o
 
 $(OBJ_DIR)/user/%_dynblob.o: user/%.dynelf
+	@mkdir -p $(@D)
+	objcopy --input-target=binary --output-target=elf32-i386 \
+	    --binary-architecture=i386 $< $@
+
+# -----------------------------------------------------------------------------
+# §M38 — C++ programs, built with the musl C++ cross-toolchain (g++ 11.2.0).
+# Compiled -fPIE and linked -pie so they are ET_DYN, which the §M37 loader
+# relocates to the user base (a non-PIE EXEC would land at 0x08048000, inside
+# the kernel region).  PT_INTERP = /lib/ld-musl-i386.so.1 (our provisioned
+# musl); DT_NEEDED = libstdc++.so.6 + libgcc_s.so.1 + libc.so (+ any app .so),
+# which ld.so resolves from /lib (pkg.c provisions them there at boot).
+# -----------------------------------------------------------------------------
+MUSL_CXX_DIR    := third_party/musl-cross-i686
+MUSL_CXX        := $(MUSL_CXX_DIR)/bin/i686-linux-musl-g++
+MUSL_CXX_STRIP  := $(MUSL_CXX_DIR)/bin/i686-linux-musl-strip
+MUSL_CXX_SYSLIB := $(MUSL_CXX_DIR)/i686-linux-musl/lib
+CXXFLAGS_DOS    := -Os -fPIC
+
+# The C++ shared library that throws (libcpplib.so → /lib).
+user/libcpplib.so: user/cpplib.cpp $(MUSL_CXX)
+	$(MUSL_CXX) $(CXXFLAGS_DOS) -shared -o $@ user/cpplib.cpp
+	-$(MUSL_CXX_STRIP) $@
+
+# The C++ test program (PIE, links libcpplib by name → DT_NEEDED libcpplib.so).
+user/cpptest.cxxelf: user/cpptest.cpp user/libcpplib.so $(MUSL_CXX)
+	$(MUSL_CXX) -Os -fPIE -pie -o $@ user/cpptest.cpp -Luser -lcpplib
+	-$(MUSL_CXX_STRIP) $@
+
+# Stage stripped copies of the runtime .so's with clean names for objcopy
+# (→ _binary_user_libstdcxx_so_start / _binary_user_libgccs_so_start).
+user/libstdcxx.so: $(MUSL_CXX)
+	cp $(MUSL_CXX_SYSLIB)/libstdc++.so.6 $@
+	-$(MUSL_CXX_STRIP) $@
+user/libgccs.so: $(MUSL_CXX)
+	cp $(MUSL_CXX_SYSLIB)/libgcc_s.so.1 $@
+	-$(MUSL_CXX_STRIP) $@
+
+$(OBJ_DIR)/user/cpptest_cxxblob.o: user/cpptest.cxxelf
+	@mkdir -p $(@D)
+	objcopy --input-target=binary --output-target=elf32-i386 \
+	    --binary-architecture=i386 $< $@
+$(OBJ_DIR)/user/libcpplib_blob.o: user/libcpplib.so
+	@mkdir -p $(@D)
+	objcopy --input-target=binary --output-target=elf32-i386 \
+	    --binary-architecture=i386 $< $@
+$(OBJ_DIR)/user/libstdcxx_blob.o: user/libstdcxx.so
+	@mkdir -p $(@D)
+	objcopy --input-target=binary --output-target=elf32-i386 \
+	    --binary-architecture=i386 $< $@
+$(OBJ_DIR)/user/libgccs_blob.o: user/libgccs.so
 	@mkdir -p $(@D)
 	objcopy --input-target=binary --output-target=elf32-i386 \
 	    --binary-architecture=i386 $< $@

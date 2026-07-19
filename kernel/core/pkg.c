@@ -489,6 +489,17 @@ extern const unsigned char _binary_user_ldmusl_so_end[]        __attribute__((we
 extern const unsigned char _binary_user_libgreet_so_start[]    __attribute__((weak));
 extern const unsigned char _binary_user_libgreet_so_end[]      __attribute__((weak));
 
+/* §M38: the C++ runtime .so's (from the musl C++ toolchain) + the demo C++
+ * library, provisioned into /lib so ld.so resolves a C++ program's DT_NEEDED
+ * libstdc++.so.6 / libgcc_s.so.1 / libcpplib.so.  Weak — present only when the
+ * toolchain was built. */
+extern const unsigned char _binary_user_libstdcxx_so_start[]   __attribute__((weak));
+extern const unsigned char _binary_user_libstdcxx_so_end[]     __attribute__((weak));
+extern const unsigned char _binary_user_libgccs_so_start[]     __attribute__((weak));
+extern const unsigned char _binary_user_libgccs_so_end[]       __attribute__((weak));
+extern const unsigned char _binary_user_libcpplib_so_start[]   __attribute__((weak));
+extern const unsigned char _binary_user_libcpplib_so_end[]     __attribute__((weak));
+
 static struct pkg_recipe rc_hello1, rc_hello2, rc_args, rc_echo, rc_cat, rc_ls, rc_env, rc_sh;
 
 static unsigned blob_len(const unsigned char* s, const unsigned char* e) {
@@ -521,6 +532,17 @@ static void ldso_provision(void) {
         write_file("/lib/libgreet.so", _binary_user_libgreet_so_start,
                    blob_len(_binary_user_libgreet_so_start,
                             _binary_user_libgreet_so_end));
+
+    /* §M38 — the C++ runtime + demo library at the sonames C++ ELFs need. */
+    if (_binary_user_libstdcxx_so_start)
+        write_file("/lib/libstdc++.so.6", _binary_user_libstdcxx_so_start,
+                   blob_len(_binary_user_libstdcxx_so_start, _binary_user_libstdcxx_so_end));
+    if (_binary_user_libgccs_so_start)
+        write_file("/lib/libgcc_s.so.1", _binary_user_libgccs_so_start,
+                   blob_len(_binary_user_libgccs_so_start, _binary_user_libgccs_so_end));
+    if (_binary_user_libcpplib_so_start)
+        write_file("/lib/libcpplib.so", _binary_user_libcpplib_so_start,
+                   blob_len(_binary_user_libcpplib_so_start, _binary_user_libcpplib_so_end));
 }
 
 void pkg_init(void) {
