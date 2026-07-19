@@ -3620,6 +3620,28 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-19 — x86_64 userland port: unmodified musl runs on x86_64.**  Full
+  parity with i386's musl userland (bar signal delivery).  Six x86_64 boot
+  self-tests green: static hello, dynamic linking (ld.so), a DT_NEEDED `.so`,
+  dlopen, C++ (STL + an exception thrown+caught across a `.so`, DWARF unwind via
+  libgcc_s), and fork+execve+pipe.  Landed the long-deferred **§M20.6.1
+  fast-syscall path**: x86_64 musl issues the `syscall` instruction, so
+  `kernel/hal/x86_64/syscall_entry.s` is the `LSTAR` entry — and it RETURNS via
+  `iretq` (fabricating an `int 0x80`-shaped frame + falling into the shared
+  `isr_common` tail) rather than `SYSRET`, which sidesteps SYSRET's selector
+  arithmetic so NO GDT reorg was needed (the reason it stayed deferred).
+  `syscall_init_64()` arms EFER.SCE/STAR/LSTAR/FMASK; int_no sentinel `0x81`
+  routes to a new x86_64 `linux_abi.c` (Linux `unistd_64` numbers, SysV arg
+  regs, x86_64 `struct stat`, byte-offset `mmap`, `arch_prctl(ARCH_SET_FS)` →
+  the FS.base MSR for TLS, `pread64`, fork/execve/wait4/pipe/dup2/kill/futex).
+  Also: `enable_sse()` (SSE2 is baseline on x86_64 — musl emits it), `fork.c`
+  (x86_64) + `enter_user_mode_regs` + an EAGER `vmm_space_clone` (COW is a
+  follow-up).  **Runtime musl is now a versioned, swappable, pkg-managed store
+  package** (`pkg_recipe.soname`/`is_libc`, `pkg_libc_use`) — uniform on i386
+  (musl 1.2.5) + x86_64 (musl 1.2.2), aarch64 inherits it when its userland
+  lands.  Open: signal delivery to musl handlers (needs the Linux `rt_sigframe`
+  layout); x86_64 interactive shell (no VC bound at boot → the self-test runs
+  from `kernel_main`); aarch64 userland.
 - **2026-07-19 — M43 slice: on-device C compiler (TinyCC), i386 (DOCS §4.36).**
   `tcc /hello.c -o /hello` compiles + links a full stdio C program ON d-os and
   `exec /hello` runs it — the first self-hosting slice.  tcc cross-built PIE

@@ -1204,6 +1204,13 @@ run: $(ISO)
 # without disturbing a working i386 build).  `clean-all` wipes both.
 clean:
 	rm -rf $(BUILD_DIR)
+	# User-space build artifacts live in user/ with arch-agnostic names (their
+	# blob symbol names derive from the path), so a stale i386 .dynelf/.so can
+	# shadow an x86_64 rebuild (and vice versa).  Wipe them on clean so an
+	# ARCH switch always rebuilds them for the right target.
+	rm -f user/*.muslelf user/*.dynelf user/*.cxxelf \
+	      user/libgreet.so user/libcpplib.so user/libstdcxx.so \
+	      user/libgccs.so user/ldmusl.so user/rootfs.bin
 
 clean-all:
 	rm -rf build

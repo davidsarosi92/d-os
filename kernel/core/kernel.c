@@ -425,10 +425,13 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     watchdog_init();
 
 #if defined(__x86_64__)
-    /* TEMP (x86_64 userland bring-up) — run the embedded static musl binary
-     * directly at boot to validate the SYSCALL-instruction path + linux_abi_64,
-     * since x86_64 boots to a bare GUI desktop (no VC-bound text shell to type
-     * `musltest` into).  Remove once the shell/VC path is fixed. */
+    /* x86_64 userland self-test — runs the embedded musl programs at boot to
+     * exercise the SYSCALL path + linux_abi_64 + dynamic linking + C++ + fork.
+     * It lives here (rather than as a shell `musltest`/`pkgrun` command like
+     * i386) because the x86_64 text shell does not yet bind to a VC at boot
+     * ("shell_task_entry: no VC bound" — a known follow-up), so there is no
+     * interactive prompt to type into.  Same spirit as the vmm/kmalloc/preempt
+     * boot self-tests above. */
     {
         extern const unsigned char _binary_user_muslhello_muslelf_start[]    __attribute__((weak));
         extern const unsigned char _binary_user_muslhello_muslelf_end[]      __attribute__((weak));
