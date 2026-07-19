@@ -167,6 +167,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/smp.c \
       kernel/hal/x86_64/syscall.c \
       kernel/hal/x86_64/linux_abi.c \
+      kernel/hal/x86_64/fork.c \
       kernel/hal/x86/lapic.c \
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/pci.c \
@@ -204,7 +205,7 @@ else ifeq ($(ARCH),x86_64)
   # provisions the ld.so (== libc.so) there at boot.
   DOS_LDSO     := /lib/ld-musl-x86_64.so.1
   ifneq ($(wildcard $(MUSL_SYSROOT)/lib/libc.a),)
-    ARCH_EXTRA_OBJS += user/muslhello_muslblob.o
+    ARCH_EXTRA_OBJS += user/muslhello_muslblob.o user/forktest64_muslblob.o
   endif
   # §M37 dynamic-linking artifacts (x86_64): the shared libc.so=ld.so blob +
   # dynamically-linked test programs.  The prebuilt sysroot's libc.so IS the

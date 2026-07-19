@@ -440,14 +440,29 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
         extern const unsigned char _binary_user_dlopentest_dynelf_end[]      __attribute__((weak));
         extern const unsigned char _binary_user_cpptest_cxxelf_start[]       __attribute__((weak));
         extern const unsigned char _binary_user_cpptest_cxxelf_end[]         __attribute__((weak));
+        extern const unsigned char _binary_user_forktest64_muslelf_start[]   __attribute__((weak));
+        extern const unsigned char _binary_user_forktest64_muslelf_end[]     __attribute__((weak));
         struct { const char* name; const unsigned char* s; const unsigned char* e; } tests[] = {
             { "muslhello (static)", _binary_user_muslhello_muslelf_start,   _binary_user_muslhello_muslelf_end   },
             { "muslhellodyn (dyn)", _binary_user_muslhellodyn_dynelf_start, _binary_user_muslhellodyn_dynelf_end },
             { "solibtest (dso)",    _binary_user_solibtest_dynelf_start,    _binary_user_solibtest_dynelf_end    },
             { "dlopentest",         _binary_user_dlopentest_dynelf_start,   _binary_user_dlopentest_dynelf_end   },
             { "cpptest (C++)",      _binary_user_cpptest_cxxelf_start,      _binary_user_cpptest_cxxelf_end      },
+            { "forktest64 (fork)",  _binary_user_forktest64_muslelf_start,  _binary_user_forktest64_muslelf_end  },
         };
         pkg_init();                    /* provision /lib ld.so + .so's up front */
+        /* Provision an execve target for forktest64: write the muslhello blob
+         * to /bin/hello64 so the forked child can exec a real program. */
+        if (_binary_user_muslhello_muslelf_start) {
+            vfs_mkdir("/bin");
+            struct file* wf = vfs_open("/bin/hello64", VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+            if (wf) {
+                vfs_write(wf, _binary_user_muslhello_muslelf_start,
+                          (size_t)(_binary_user_muslhello_muslelf_end -
+                                   _binary_user_muslhello_muslelf_start));
+                vfs_close(wf);
+            }
+        }
         struct task* me = task_current();
         int prev = me ? me->linux_abi : 0;
         if (me) me->linux_abi = 1;

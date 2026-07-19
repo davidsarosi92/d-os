@@ -31,6 +31,8 @@
 #include "printf.h"
 #include "hal_api.h"
 #include "vfs.h"
+#include "proc.h"          /* proc_fork / proc_execve / proc_clone */
+#include "usermode.h"      /* struct user_regs (fork snapshot)     */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -59,6 +61,7 @@ extern uint64_t saved_rip;
 #define LNX_writev           20
 #define LNX_pipe             22
 #define LNX_dup2             33
+#define LNX_pipe2           293
 #define LNX_getpid           39
 #define LNX_socket           41
 #define LNX_connect          42
@@ -371,23 +374,61 @@ void linux_syscall_dispatch(struct int_frame* f) {
             f->rax = (uint64_t)sys_uname((struct kutsname*)a0);
             return;
 
-        /* ---- Deferred to x86_64 Phase 3 (fork/execve/signals live in the
-         * arch-specific fork.c / signal.c, which are i386-only for now).  A
-         * static musl program never hits these; a shell (fork/exec) will once
-         * Phase 3 ports enter_user_mode_regs + proc_fork to x86_64. */
-        case LNX_fork:
-        case LNX_clone:
+        /* ---- Phase 3: process model (fork/execve/waitpid/pipe/dup2) ------- */
+        case LNX_fork: {
+            /* Snapshot the full user register file; the child resumes here with
+             * rax = 0 (proc_fork sets it) via enter_user_mode_regs.  musl's
+             * fork() on x86_64 uses SYS_fork directly. */
+            struct user_regs r;
+            r.rax = 0;
+            r.rbx = f->rbx; r.rcx = f->rcx; r.rdx = f->rdx;
+            r.rsi = f->rsi; r.rdi = f->rdi; r.rbp = f->rbp;
+            r.r8 = f->r8; r.r9 = f->r9; r.r10 = f->r10; r.r11 = f->r11;
+            r.r12 = f->r12; r.r13 = f->r13; r.r14 = f->r14; r.r15 = f->r15;
+            r.rip = f->rip; r.rflags = f->rflags; r.user_sp = f->rsp;
+            f->rax = (uint64_t)proc_fork(&r);
+            return;
+        }
         case LNX_execve:
-        case LNX_wait4:
-        case LNX_kill:
+            /* execve(path=rdi, argv=rsi, envp=rdx) — envp ignored (child keeps
+             * the default env).  On success does not return (iretq into the new
+             * image); on failure the old image continues. */
+            f->rax = (uint64_t)proc_execve((const char*)a0, (char* const*)a1);
+            return;
+        case LNX_wait4: {
+            int code = 0;
+            int pid = task_wait((int)a0, &code);
+            if (a1) *(int*)a1 = (code & 0xFF) << 8;   /* WIFEXITED: code in 8..15 */
+            f->rax = (uint64_t)pid;
+            return;
+        }
         case LNX_pipe:
+        case LNX_pipe2:
+            /* pipe(fds=rdi) / pipe2(fds=rdi, flags=rsi) — flags (CLOEXEC/
+             * NONBLOCK) not tracked yet; the fd pair is what matters. */
+            f->rax = (uint64_t)sys_pipe((int*)a0);
+            return;
         case LNX_dup2:
+            f->rax = (uint64_t)sys_dup2((int)a0, (int)a1);
+            return;
+        case LNX_kill:
+            /* Posts the signal (sys_kill sets sig_pending); actual delivery to
+             * user handlers on x86_64 is a follow-up (needs the Linux rt_sigframe
+             * / ucontext layout).  Enough for waitpid-based job control. */
+            f->rax = (uint64_t)sys_kill((int)a0, (int)a1);
+            return;
         case LNX_futex:
+            f->rax = (uint64_t)sys_futex((int*)a0, (int)a1, (int)a2);
+            return;
+
+        /* ---- Still deferred (not needed by sh/coreutils): threads (clone with
+         * CLONE_VM), and the BSD socket calls (a separate net-syscall port). */
+        case LNX_clone:
         case LNX_socket:
         case LNX_connect:
         case LNX_sendto:
         case LNX_recvfrom:
-            kprintf("linux-abi64: syscall %lu not yet ported (x86_64 Phase 3)\n",
+            kprintf("linux-abi64: syscall %lu not yet ported (x86_64)\n",
                     (unsigned long)f->rax);
             f->rax = (uint64_t)-LNX_ENOSYS;
             return;

@@ -33,10 +33,21 @@ void enter_user_mode(uintptr_t user_ip, uintptr_t user_sp)
  * child at the parent's post-`int 0x80` point with eax = 0).  Field order +
  * widths match the i386 usermode.s reader (offsets 0,4,8,...).  Never returns
  * (iret into ring 3).  i386 today; other arches provide their own. */
+#if defined(__x86_64__)
+/* x86_64: a full GPR set for fork() to resume the child at the parent's post-
+ * `syscall` point with rax = 0.  Field order matches the reader in
+ * kernel/hal/x86_64/usermode.s (enter_user_mode_regs). */
+struct user_regs {
+    uintptr_t rax, rbx, rcx, rdx, rsi, rdi, rbp;
+    uintptr_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uintptr_t rip, rflags, user_sp;                /* iretq frame              */
+};
+#else
 struct user_regs {
     uintptr_t eax, ebx, ecx, edx, esi, edi, ebp;   /* GP regs (eax = return)   */
     uintptr_t eip, eflags, user_sp;                /* iret frame               */
 };
+#endif
 void enter_user_mode_regs(struct user_regs* r) __attribute__((noreturn));
 
 /* Arch-portable ring-3/EL0 self-test — the `ringtest` shell command.  Each

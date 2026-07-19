@@ -100,3 +100,45 @@ enter_user_mode:
     push qword 0x1B                    ; CS3  (user code, RPL 3)
     push rdi                           ; RIP3 (user entry)
     iretq                              ; → ring 3, never returns here
+
+; -----------------------------------------------------------------------------
+; void enter_user_mode_regs(struct user_regs* r);  — M34 fork(), x86_64, ONE-WAY.
+;   rdi = pointer to a full GPR snapshot (usermode.h layout).  Resume the child
+;   in ring 3 at the parent's post-`syscall` point with the given register file
+;   (rax already 0 → the child sees fork() == 0).  Never returns.
+;
+; struct user_regs offsets (8 bytes each):
+;   0 rax  8 rbx  16 rcx  24 rdx  32 rsi  40 rdi  48 rbp
+;   56 r8  64 r9  72 r10  80 r11  88 r12  96 r13  104 r14  112 r15
+;   120 rip  128 rflags  136 user_sp
+; -----------------------------------------------------------------------------
+global enter_user_mode_regs
+enter_user_mode_regs:
+    ; Build the iretq frame first, using rax as scratch (restored below).
+    mov rax, [rdi + 136]              ; user_sp
+    push qword 0x23                   ; SS3
+    push rax                          ; RSP3
+    mov rax, [rdi + 128]              ; rflags
+    or  rax, 0x200                    ; force IF=1
+    push rax                          ; RFLAGS
+    push qword 0x1B                   ; CS3
+    mov rax, [rdi + 120]              ; rip
+    push rax                          ; RIP3
+
+    ; Restore GPRs from the snapshot.  rax + rdi (our base pointer) come last.
+    mov rbx, [rdi + 8]
+    mov rcx, [rdi + 16]
+    mov rdx, [rdi + 24]
+    mov rsi, [rdi + 32]
+    mov rbp, [rdi + 48]
+    mov r8,  [rdi + 56]
+    mov r9,  [rdi + 64]
+    mov r10, [rdi + 72]
+    mov r11, [rdi + 80]
+    mov r12, [rdi + 88]
+    mov r13, [rdi + 96]
+    mov r14, [rdi + 104]
+    mov r15, [rdi + 112]
+    mov rax, [rdi + 0]                ; child fork() return value (0)
+    mov rdi, [rdi + 40]              ; rdi LAST (frees the base pointer)
+    iretq                             ; → ring 3 at the fork point

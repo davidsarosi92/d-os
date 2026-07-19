@@ -419,6 +419,79 @@ void vmm_space_destroy(struct vmm_space* s) {
     kfree(s);
 }
 
+/* Recursively clone one page-table level for fork() (M34, x86_64).  EAGER copy
+ * (no COW yet on x86_64 — a follow-up): kernel-shared entries (== the kernel
+ * table's) and large pages are copied by pointer/value; private sub-tables are
+ * cloned into fresh frames; leaf (depth 3) user pages are DEEP-COPIED into new
+ * frames, except VMM_SHARED ones (shm/memfd — shared by pointer, their owner
+ * frees them).  `depth`: 1=PDPT 2=PD 3=PT.  Returns the child table's phys, or
+ * 0 on OOM.  Flags on each entry are preserved. */
+static uintptr_t clone_subtree(uint64_t* ptbl, uint64_t* ktbl, int depth) {
+    uint32_t phys = pmm_alloc_frame();
+    if (!phys) return 0;
+    uint64_t* ntbl = (uint64_t*)(uintptr_t)phys;
+    for (int i = 0; i < 512; i++) {
+        uint64_t e = ptbl[i];
+        if (!(e & PTE_P))              { ntbl[i] = 0; continue; }
+        if (ktbl && e == ktbl[i])      { ntbl[i] = e; continue; }  /* kernel-shared */
+        if (depth >= 1 && (e & PTE_PS)){ ntbl[i] = e; continue; }  /* large page */
+
+        if (depth < 3) {
+            uint64_t* pchild = table_at((uintptr_t)e);
+            uint64_t* kchild = (ktbl && (ktbl[i] & PTE_P) && !(ktbl[i] & PTE_PS))
+                             ? table_at((uintptr_t)ktbl[i]) : NULL;
+            uintptr_t cphys = clone_subtree(pchild, kchild, depth + 1);
+            if (!cphys) return 0;                 /* OOM — caller unwinds via destroy */
+            ntbl[i] = ((uint64_t)cphys & PAGE_MASK_4K) | (e & ~PAGE_MASK_4K);
+        } else {
+            /* Leaf user page. */
+            if (e & VMM_SHARED) { ntbl[i] = e; continue; }
+            uint32_t fphys = pmm_alloc_frame();
+            if (!fphys) return 0;
+            const uint8_t* src = (const uint8_t*)(uintptr_t)(e & PAGE_MASK_4K);
+            uint8_t* dst = (uint8_t*)(uintptr_t)fphys;
+            for (int b = 0; b < 4096; b++) dst[b] = src[b];
+            ntbl[i] = ((uint64_t)fphys & PAGE_MASK_4K) | (e & ~PAGE_MASK_4K);
+        }
+    }
+    return phys;
+}
+
+/* fork() address-space duplication (x86_64).  Snapshot the kernel PML4, then
+ * eager-clone the parent's private PML4[0] subtree (which holds the user region
+ * under PDPT[1]).  The child gets its own copy of every private user page. */
+struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
+    if (!parent) return NULL;
+    struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
+    if (!s) return NULL;
+    uint32_t pml4_phys = pmm_alloc_frame();
+    if (!pml4_phys) { kfree(s); return NULL; }
+    s->pml4      = (uint64_t*)(uintptr_t)pml4_phys;
+    s->pml4_phys = pml4_phys;
+
+    uint64_t* kpml4 = (uint64_t*)pml4;
+    for (int i = 0; i < 512; i++) s->pml4[i] = kpml4[i];   /* kernel snapshot */
+
+    uint64_t p0 = parent->pml4[0];
+    if (p0 & PTE_P) {
+        uint64_t* pdpt_parent = table_at((uintptr_t)p0);
+        uint64_t* pdpt_kernel = (kpml4[0] & PTE_P) ? table_at((uintptr_t)kpml4[0]) : NULL;
+        uintptr_t cphys = clone_subtree(pdpt_parent, pdpt_kernel, /*depth PDPT*/1);
+        if (!cphys) { vmm_space_destroy(s); return NULL; }
+        /* Preserve the parent's PML4[0] flags — crucially the US bit, which
+         * walk_to_pt_root widened in when user pages were first mapped.  A
+         * hardcoded PTE_P|PTE_RW (no US) would make every user access in the
+         * child fault (#PF err=5: present, user, protection). */
+        s->pml4[0] = ((uint64_t)cphys & PAGE_MASK_4K) | (p0 & ~PAGE_MASK_4K);
+    }
+    return s;
+}
+
+/* No COW on x86_64 yet (fork does eager copy) — the #PF handler never invokes
+ * this.  Present so the arch-generic vmm.h contract links; returns "not a COW
+ * fault" so any accidental caller falls through to the fault path. */
+int vmm_cow_fault(uintptr_t fault_va) { (void)fault_va; return -1; }
+
 int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
                   uint32_t flags) {
     if (!s) return vmm_map(virt, phys, flags);
