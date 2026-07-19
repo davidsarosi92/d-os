@@ -80,3 +80,6 @@ third_party/mbedtls/
 third_party/mbedtls-i686/
 # §M38 C++ build products
 user/*.cxxelf
+# §M43 TinyCC (on-device C compiler — vendored build input + product)
+third_party/tinycc/
+third_party/tinycc-i686/

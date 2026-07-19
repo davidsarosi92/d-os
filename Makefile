@@ -508,7 +508,7 @@ ISO_DIR    := $(BUILD_DIR)/iso
 ISO        := $(BUILD_DIR)/d-os.iso
 
 .PHONY: all kernel iso run clean clean-all musl musl-clean \
-        musl-cross-i686 musl-cross-x86_64 mbedtls
+        musl-cross-i686 musl-cross-x86_64 mbedtls tcc
 
 all: $(KERNEL_BIN)
 
@@ -617,6 +617,36 @@ mbedtls:
 	cp -a /tmp/mb/include $(MBEDTLS_PREFIX)/include
 	rm -rf /tmp/mb
 	@echo "Mbed TLS i686 libs → $(MBEDTLS_PREFIX)/lib/"
+
+# -----------------------------------------------------------------------------
+# TinyCC (§M43) — an on-device C compiler.  Cross-built with the musl C++
+# toolchain so the `tcc` binary is an i686-musl ELF that RUNS on d-os (under
+# §M37) and compiles C → runnable ELF on d-os.  Built on the container-local fs;
+# the interpreter is provisioned into the build container's /lib so qemu-i386
+# binfmt can run the musl build helpers.  PROVEN: `make tcc` builds the compiler
+# and it compiles a .c to a valid i386 .o under emulation.  (libtcc1.a + the
+# on-d-os provisioning of headers/crt/libc + a `tcc` shell command + the Editor
+# "Compile & Run" button are the remaining §M43 steps — see fetch-tinycc.sh.)
+#     docker run --rm --platform=linux/amd64 -v "$PWD":/src d-os-build make tcc
+# -----------------------------------------------------------------------------
+TINYCC_DIR := third_party/tinycc
+tcc:
+	@test -f $(TINYCC_DIR)/configure || { \
+	  echo "TinyCC missing — run ./scripts/fetch-tinycc.sh first"; exit 1; }
+	@test -x $(MUSL_CXX_DIR)/bin/i686-linux-musl-gcc || { \
+	  echo "musl toolchain missing — run make musl-cross-i686 first"; exit 1; }
+	cp $(MUSL_CXX_DIR)/i686-linux-musl/lib/libc.so /lib/ld-musl-i386.so.1
+	rm -rf /tmp/tcc && cp -a $(TINYCC_DIR) /tmp/tcc
+	cd /tmp/tcc && PATH=$(CURDIR)/$(MUSL_CXX_DIR)/bin:$$PATH \
+	    CC=i686-linux-musl-gcc ./configure --cpu=i386 \
+	      --elfinterp=/lib/ld-musl-i386.so.1 --crtprefix=/lib --libpaths=/lib \
+	      --sysincludepaths="{B}/include:/usr/include" --prefix=/usr
+	cd /tmp/tcc && PATH=$(CURDIR)/$(MUSL_CXX_DIR)/bin:$$PATH $(MAKE) tcc
+	rm -rf third_party/tinycc-i686 && mkdir -p third_party/tinycc-i686/bin
+	cp /tmp/tcc/tcc third_party/tinycc-i686/bin/tcc
+	cp -a /tmp/tcc/include third_party/tinycc-i686/include
+	rm -rf /tmp/tcc
+	@echo "tcc (on-device C compiler) → third_party/tinycc-i686/bin/tcc"
 
 kernel: $(KERNEL_BIN)
 
