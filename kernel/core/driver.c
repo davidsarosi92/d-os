@@ -101,9 +101,10 @@ void driver_list(void) {
     kprintf("drivers (%u registered):\n", driver_count);
     for (uint32_t i = 0; i < driver_count; i++) {
         struct driver* d = &__start_drivers[i];
-        kprintf("  [%s] %s — %s\n",
+        kprintf("  [%s] %s v%s — %s\n",
                 d->class ? d->class : "?",
                 d->name  ? d->name  : "(unnamed)",
+                d->version ? d->version : "?",
                 state_label(driver_state_arr ? driver_state_arr[i] : 0));
     }
 }

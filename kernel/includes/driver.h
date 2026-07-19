@@ -29,6 +29,7 @@
 #define DRIVER_H
 
 #include <stdint.h>
+#include "version.h"        /* DOS_VERSION — the default per-driver version */
 
 /* Per-driver lifecycle hooks.  All can be NULL — a missing probe means
  * "always present", a missing init means "nothing to initialize", a
@@ -50,6 +51,7 @@ struct driver {
     const char*              class;         /* "char", "block", "input", ... */
     const struct driver_ops* ops;
     void*                    ctx;
+    const char*              version;       /* defaults to DOS_VERSION (see DRIVER) */
 };
 
 /* Boundary symbols emitted by linker.ld around the `drivers` section. */
@@ -81,10 +83,11 @@ uint8_t driver_state(const struct driver* d);
     static const struct driver                                            \
     __attribute__((used, section("drivers"), aligned(4)))                 \
     __drv_def_##_name = {                                                 \
-        .name  = #_name,                                                  \
-        .class = (_class),                                                \
-        .ops   = (_ops_ptr),                                              \
-        .ctx   = (_ctx_ptr),                                              \
+        .name    = #_name,                                                \
+        .class   = (_class),                                              \
+        .ops     = (_ops_ptr),                                            \
+        .ctx     = (_ctx_ptr),                                            \
+        .version = DOS_VERSION,                                           \
     }
 
 #endif

@@ -306,13 +306,14 @@ int service_status(const char* name) {
 /* ------------------------------------------------------------------- */
 
 static void gen_services(struct procfs_writer* w) {
-    pw_puts(w, "# name  state  pid  restarts  autostart  policy\n");
+    pw_puts(w, "# name  version  state  pid  restarts  autostart  policy\n");
     int n = service_count();
     for (int i = 0; i < n && i < SVC_MAX; i++) {
         const struct service* s = service_at(i);
         const char* pol = s->restart == SVC_RESTART_ALWAYS ? "always" :
                           s->restart == SVC_RESTART_ON_FAILURE ? "on-failure" : "no";
         pw_puts(w, s->name);            pw_putc(w, ' ');
+        pw_puts(w, s->version ? s->version : "?"); pw_putc(w, ' ');
         pw_puts(w, state_name(rt[i].state)); pw_putc(w, ' ');
         pw_put_uint(w, (unsigned)(rt[i].pid < 0 ? 0 : rt[i].pid)); pw_putc(w, ' ');
         pw_put_uint(w, (unsigned)rt[i].restarts); pw_putc(w, ' ');

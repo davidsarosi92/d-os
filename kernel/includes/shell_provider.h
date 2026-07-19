@@ -18,9 +18,12 @@
 #ifndef SHELL_PROVIDER_H
 #define SHELL_PROVIDER_H
 
+#include "version.h"        /* DOS_VERSION — the default per-provider version */
+
 struct shell_provider {
     const char* name;               /* config value, e.g. "d-os", "rescue" */
     void      (*entry)(void);       /* task entry — never returns          */
+    const char* version;            /* defaults to DOS_VERSION (see SHELL_PROVIDER) */
 };
 
 extern struct shell_provider __start_shell_providers[];
@@ -30,8 +33,9 @@ extern struct shell_provider __stop_shell_providers[];
     static const struct shell_provider                                   \
     __attribute__((used, section("shell_providers"), aligned(4)))        \
     __shell_provider_##_entryfn = {                                      \
-        .name  = (_name),                                                \
-        .entry = (_entryfn),                                             \
+        .name    = (_name),                                              \
+        .entry   = (_entryfn),                                           \
+        .version = DOS_VERSION,                                          \
     }
 
 /* Registry walk (trivial inlines — boundary arithmetic in one place). */

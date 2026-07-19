@@ -28,6 +28,8 @@
 #ifndef SERVICE_H
 #define SERVICE_H
 
+#include "version.h"        /* DOS_VERSION — the default per-service version */
+
 enum svc_restart {
     SVC_RESTART_NO,          /* run to completion; never restart              */
     SVC_RESTART_ON_FAILURE,  /* restart only if the exit code is non-zero     */
@@ -39,6 +41,7 @@ struct service {
     void           (*entry)(void);/* task entry — kthread contract (§M22.3)   */
     int              autostart;   /* start at boot unless config-disabled     */
     enum svc_restart restart;     /* what to do when it exits                 */
+    const char*      version;     /* defaults to DOS_VERSION (see SERVICE)    */
 };
 
 extern struct service __start_services[];
@@ -53,6 +56,7 @@ extern struct service __stop_services[];
         .entry     = (_entryfn),                                         \
         .autostart = (_autostart),                                       \
         .restart   = (_restart),                                         \
+        .version   = DOS_VERSION,                                        \
     }
 
 /* Registry walk (boundary arithmetic in one place). */

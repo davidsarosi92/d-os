@@ -33,6 +33,7 @@ void module_list(void) {
     kprintf("registered modules (%d total):\n",
             (int)(__stop_modules - __start_modules));
     for (struct module_def* m = __start_modules; m < __stop_modules; m++) {
-        kprintf("  [%s] %s\n", m->class ? m->class : "?", m->name);
+        kprintf("  [%s] %s v%s\n", m->class ? m->class : "?", m->name,
+                m->version ? m->version : "?");
     }
 }

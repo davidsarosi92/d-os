@@ -25,11 +25,13 @@
 #define MODULE_H
 
 #include <stdint.h>
+#include "version.h"        /* DOS_VERSION — the default per-module version */
 
 struct module_def {
     const char* name;           /* short identifier, e.g. "vesa-fb" */
     const char* class;          /* "console", "input", "fs", "shell", "core" */
     int       (*init)(void);    /* return 0 on success */
+    const char* version;        /* defaults to DOS_VERSION (see MODULE) */
 };
 
 /* Boundary symbols emitted by linker.ld around the modules section. */
@@ -55,19 +57,20 @@ void module_list(void);
  *     stride.
  *   - `_initfn` (not `_class`) is concatenated into the symbol name so
  *     two modules in the same class don't collide in the same TU. */
-/* aligned(4) (not 8) is critical here: `sizeof(struct module_def) == 12`
- * on 32-bit, and the kernel iterates the section with a `++` of stride
- * `sizeof(*m)`.  An `aligned(8)` would round each entry up to 16 bytes
- * in the section — and the iterator would walk 12, then read garbage at
- * an unaligned offset, then page-fault.  Keep the natural 4-byte
- * alignment so stride and sizeof agree. */
+/* aligned(4) (not 8) is critical here: the kernel iterates the section with a
+ * `++` of stride `sizeof(*m)`, so the alignment must not exceed the natural
+ * size (an `aligned(8)` would pad each entry and the iterator would read
+ * garbage at an unaligned offset, then page-fault).  `sizeof(struct
+ * module_def)` is 16 on 32-bit now (4 pointers, incl. `version`); 16 % 4 == 0
+ * so stride and sizeof still agree.  Keep the natural 4-byte alignment. */
 #define MODULE(_name, _class, _initfn)                                  \
     static const struct module_def                                      \
     __attribute__((used, section("modules"), aligned(4)))               \
     __module_def_##_initfn = {                                          \
-        .name  = (_name),                                               \
-        .class = (_class),                                              \
-        .init  = (_initfn),                                             \
+        .name    = (_name),                                             \
+        .class   = (_class),                                            \
+        .init    = (_initfn),                                           \
+        .version = DOS_VERSION,                                         \
     }
 
 #endif
