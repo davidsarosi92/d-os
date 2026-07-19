@@ -214,6 +214,13 @@ else ifeq ($(ARCH),x86_64)
                        user/libgreet_blob.o user/solibtest_dynblob.o \
                        user/dlopentest_dynblob.o
   endif
+  # §M38 C++ runtime (x86_64) — the prebuilt sysroot ships a musl libstdc++.so.6
+  # + libgcc_s.so.1, so cpptest (exceptions across a .so) works once the g++
+  # driver exists.  Same artifacts as i386.
+  ifneq ($(wildcard $(MUSL_ELF_CXX)),)
+    ARCH_EXTRA_OBJS += user/cpptest_cxxblob.o user/libcpplib_blob.o \
+                       user/libstdcxx_blob.o user/libgccs_blob.o
+  endif
 
 else ifeq ($(ARCH),aarch64)
   # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
@@ -1033,20 +1040,28 @@ $(OBJ_DIR)/user/%_dynblob.o: user/%.dynelf
 # musl); DT_NEEDED = libstdc++.so.6 + libgcc_s.so.1 + libc.so (+ any app .so),
 # which ld.so resolves from /lib (pkg.c provisions them there at boot).
 # -----------------------------------------------------------------------------
+ifeq ($(ARCH),x86_64)
+MUSL_CXX        := $(MUSL_ELF_CXX)
+MUSL_CXX_STRIP  := third_party/musl-cross-x86_64/bin/x86_64-linux-musl-strip
+MUSL_CXX_SYSLIB := $(MUSL_SYSROOT)/lib
+else
 MUSL_CXX_DIR    := third_party/musl-cross-i686
 MUSL_CXX        := $(MUSL_CXX_DIR)/bin/i686-linux-musl-g++
 MUSL_CXX_STRIP  := $(MUSL_CXX_DIR)/bin/i686-linux-musl-strip
 MUSL_CXX_SYSLIB := $(MUSL_CXX_DIR)/i686-linux-musl/lib
+endif
 CXXFLAGS_DOS    := -Os -fPIC
 
 # The C++ shared library that throws (libcpplib.so → /lib).
 user/libcpplib.so: user/cpplib.cpp $(MUSL_CXX)
-	$(MUSL_CXX) $(CXXFLAGS_DOS) -shared -o $@ user/cpplib.cpp
+	$(MUSL_CXX) $(CXXFLAGS_DOS) -shared -Wl,-soname,libcpplib.so -o $@ user/cpplib.cpp
 	-$(MUSL_CXX_STRIP) $@
 
 # The C++ test program (PIE, links libcpplib by name → DT_NEEDED libcpplib.so).
+# PT_INTERP is stamped explicitly to the arch's provisioned musl ld.so.
 user/cpptest.cxxelf: user/cpptest.cpp user/libcpplib.so $(MUSL_CXX)
-	$(MUSL_CXX) -Os -fPIE -pie -o $@ user/cpptest.cpp -Luser -lcpplib
+	$(MUSL_CXX) -Os -fPIE -pie -Wl,-dynamic-linker,$(DOS_LDSO) \
+	    -o $@ user/cpptest.cpp -Luser -lcpplib
 	-$(MUSL_CXX_STRIP) $@
 
 # Stage stripped copies of the runtime .so's with clean names for objcopy
@@ -1060,20 +1075,16 @@ user/libgccs.so: $(MUSL_CXX)
 
 $(OBJ_DIR)/user/cpptest_cxxblob.o: user/cpptest.cxxelf
 	@mkdir -p $(@D)
-	objcopy --input-target=binary --output-target=elf32-i386 \
-	    --binary-architecture=i386 $< $@
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
 $(OBJ_DIR)/user/libcpplib_blob.o: user/libcpplib.so
 	@mkdir -p $(@D)
-	objcopy --input-target=binary --output-target=elf32-i386 \
-	    --binary-architecture=i386 $< $@
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
 $(OBJ_DIR)/user/libstdcxx_blob.o: user/libstdcxx.so
 	@mkdir -p $(@D)
-	objcopy --input-target=binary --output-target=elf32-i386 \
-	    --binary-architecture=i386 $< $@
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
 $(OBJ_DIR)/user/libgccs_blob.o: user/libgccs.so
 	@mkdir -p $(@D)
-	objcopy --input-target=binary --output-target=elf32-i386 \
-	    --binary-architecture=i386 $< $@
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
 
 # §M37 — the musl dynamic linker == the shared libc.so, embedded so the kernel
 # can install it at $(DOS_LDSO) at boot (pkg.c ldso_provision).  We stage a copy
