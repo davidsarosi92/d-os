@@ -613,7 +613,6 @@ static struct pkg_recipe rc_libpng;
 static struct pkg_recipe rc_freetype;
 static struct pkg_recipe rc_harfbuzz;
 static struct pkg_recipe rc_libgcc;
-static struct pkg_recipe rc_libstdcxx;
 
 /* The version string of the embedded runtime musl — arch-specific (the i386
  * build fetches+builds musl 1.2.5; the x86_64 prebuilt musl.cc sysroot ships
@@ -713,11 +712,15 @@ static void ldso_provision(void) {
                    blob_len(_binary_user_libgreet_so_start,
                             _binary_user_libgreet_so_end));
 
-    /* §M38 — the C++ runtime as versioned store packages too (libgcc_s first,
-     * then libstdc++ which depends on it).  libstdc++.so.6 is ~17 MiB — the
-     * store→/lib provisioning STREAMS (copy_file), so no giant contiguous
-     * buffer.  The libcpplib demo .so stays a direct /lib write (a test
-     * artifact, not a real component). */
+    /* §M38 — the C++ runtime.  libgcc_s.so.1 (~100 KiB) becomes a proper
+     * versioned store package.  libstdc++.so.6 is ~17 MiB, though: making it a
+     * store package would keep TWO copies in the ramfs (the immutable /store
+     * copy + the /lib profile-view copy), and ramfs backs each file with one
+     * contiguous, doubling-on-grow buffer — 2×~32 MiB overwhelms i386's memory
+     * (it faulted).  Until the /lib view can POINT at the store path (ramfs
+     * symlinks, or a store-aware /lib search — a follow-up) rather than copy,
+     * libstdc++ stays a direct single /lib write (no duplication).  Same on
+     * both arches for consistency.  (libcpplib is a test artifact — direct.) */
     if (_binary_user_libgccs_so_start) {
         rc_libgcc = (struct pkg_recipe){ .id="libgcc", .name="libgcc", .version="11.2.0",
             .deps="", .content=_binary_user_libgccs_so_start,
@@ -726,15 +729,9 @@ static void ldso_provision(void) {
         pkg_register(&rc_libgcc);
         pkg_install("libgcc");
     }
-    if (_binary_user_libstdcxx_so_start) {
-        rc_libstdcxx = (struct pkg_recipe){ .id="libstdc++", .name="libstdc++",
-            .version="11.2.0", .deps="libgcc",
-            .content=_binary_user_libstdcxx_so_start,
-            .content_len=blob_len(_binary_user_libstdcxx_so_start, _binary_user_libstdcxx_so_end),
-            .abi="native", .soname="libstdc++.so.6", .is_libc=0 };
-        pkg_register(&rc_libstdcxx);
-        pkg_install("libstdc++");
-    }
+    if (_binary_user_libstdcxx_so_start)
+        write_file("/lib/libstdc++.so.6", _binary_user_libstdcxx_so_start,
+                   blob_len(_binary_user_libstdcxx_so_start, _binary_user_libstdcxx_so_end));
     if (_binary_user_libcpplib_so_start)
         write_file("/lib/libcpplib.so", _binary_user_libcpplib_so_start,
                    blob_len(_binary_user_libcpplib_so_start, _binary_user_libcpplib_so_end));
