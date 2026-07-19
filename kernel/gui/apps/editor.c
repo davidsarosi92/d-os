@@ -136,9 +136,32 @@ static void ed_save(struct edapp* a) {
     }
 }
 
+/* A read-only "Output" window showing a run's captured stdout (§M43). */
+struct outwin { struct w_editor* ed; };
+static void outwin_layout(struct gui_window* win) {
+    struct outwin* o = (struct outwin*)gui_window_ctx(win);
+    if (!o || !o->ed) return;
+    int cw, ch;
+    gui_window_content_size(win, &cw, &ch);
+    o->ed->base.x = 6; o->ed->base.y = 6;
+    o->ed->base.w = cw - 12; o->ed->base.h = ch - 12;
+}
+static void show_output(const char* text) {
+    int len = 0; while (text[len]) len++;
+    struct outwin* o = (struct outwin*)kcalloc(1, sizeof *o);
+    if (!o) return;
+    struct gui_window* win =
+        gui_app_window_create("Output", 250, 150, 460, 280, outwin_layout, o);
+    if (!win) { kfree(o); return; }
+    o->ed = w_editor_create(win, 6, 6, 448, 268, o);
+    if (!o->ed) { gui_window_close(win); return; }
+    w_editor_set_text(o->ed, text, len);
+    outwin_layout(win);
+}
+
 /* §M43 — Compile & Run: save the buffer (must be a .c path), compile it with
- * the on-device tcc, and run the result.  The program's own output goes to the
- * console; the status line reports compile/run success + exit code. */
+ * the on-device tcc, run the result, and show the program's captured output in
+ * an "Output" window.  The status line reports compile/run success + exit code. */
 static void ed_run(struct edapp* a) {
     if (!dos_tcc_available()) { w_label_set(a->status, "tcc not built (make tcc)"); return; }
     if (a->path_in->len == 0) { w_label_set(a->status, "type a .c path first"); return; }
@@ -148,7 +171,10 @@ static void ed_run(struct edapp* a) {
         w_label_set(a->status, "compile FAILED (see console)");
         return;
     }
-    int rc = dos_run_elf("/tmp.run.elf");
+    char* cap = (char*)kcalloc(1, 8192);
+    int rc = dos_run_elf_cap("/tmp.run.elf", cap, cap ? 8192 : 0);
+    if (cap) { show_output(cap); kfree(cap); }   /* w_editor_set_text copies it */
+
     char st[48] = "compiled OK — ran, rc=";
     int p = 22, v = rc < 0 ? -rc : rc;           /* small-int formatter */
     char tmp[12]; int d = 0;

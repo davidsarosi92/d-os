@@ -3535,15 +3535,18 @@ hello, compiled on d-os by tcc!     # ...and it runs
 ```
 
 The **Editor** (M22.5) gains a **"Run" button** that saves the buffer, compiles
-it with tcc, and runs the result (`devtools.h`: `dos_tcc_compile`/`dos_run_elf`
-— the shared engine).
+it with tcc, runs the result, and shows the program's **captured stdout in an
+"Output" window** (`devtools.h`: `dos_tcc_compile`/`dos_run_elf_cap` — the shared
+engine).  Capture is a per-task buffer (`task->cap_buf`): `sys_write(1/2)` also
+appends to it when set (bounded, NUL-terminated) while still echoing to the
+console.  The shell `exec` reports `[captured N bytes]`.
 
 **Needed (all help every musl program):** Linux-ABI `_llseek`(140) (tcc seeks
 in `.o` files — else "invalid object file"), `lseek`(19), `unlink`(10).
 
-**Open:** capture the program's stdout into an editor result pane (it goes to
-the console today); a bigger compiler (gcc/clang) for full self-hosting; more
-Linux ABI breadth; x86_64/aarch64.
+**Open:** a bigger compiler (gcc/clang) for full self-hosting; capture compile
+diagnostics too (only run output is captured today); more Linux ABI breadth;
+x86_64/aarch64.
 
 ---
 

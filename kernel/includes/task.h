@@ -106,6 +106,13 @@ struct task {
      * alongside d-os-native programs.  The kernel routes syscall dispatch by
      * this flag (kernel/hal/x86/linux_abi.c).  Inherited across fork/clone. */
     int           linux_abi;
+    /* §M43 — stdout capture: when cap_buf is set, sys_write(1/2) appends the
+     * bytes here (bounded by cap_cap, NUL-terminated) in addition to the
+     * console, so the Editor's "Compile & Run" can show a program's output.
+     * Per-task (the run is a synchronous excursion on this task). */
+    char*         cap_buf;
+    int           cap_len;
+    int           cap_cap;
     /* Master-list link (circular SLL of every alive task).  Walked by
      * ps / task_for_each / task_find.  Pre-M18.6.1 the scheduler
      * also walked this list; now per-CPU runqueues take that role and

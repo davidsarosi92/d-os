@@ -1053,7 +1053,7 @@ $(OBJ_DIR)/user/dostcc_blob.o: third_party/tinycc-i686/bin/tcc
 	    --binary-architecture=i386 user/dostcc $@
 	rm -f user/dostcc
 
-user/rootfs.bin: third_party/tinycc-i686/bin/tcc $(MUSL_LIBC) user/tcc_hello.c
+user/rootfs.bin: third_party/tinycc-i686/bin/tcc $(MUSL_LIBC) user/tcc_hello.c user/hi.c
 	python3 scripts/pack-rootfs.py $@ \
 	    third_party/tinycc-i686/include:/usr/lib/tcc/include \
 	    third_party/tinycc-i686/lib/libtcc1.a:/usr/lib/tcc/libtcc1.a \
@@ -1061,7 +1061,8 @@ user/rootfs.bin: third_party/tinycc-i686/bin/tcc $(MUSL_LIBC) user/tcc_hello.c
 	    $(MUSL_PREFIX)/lib/crt1.o:/lib/crt1.o \
 	    $(MUSL_PREFIX)/lib/crti.o:/lib/crti.o \
 	    $(MUSL_PREFIX)/lib/crtn.o:/lib/crtn.o \
-	    user/tcc_hello.c:/hello.c
+	    user/tcc_hello.c:/hello.c \
+	    user/hi.c:/hi.c
 
 $(OBJ_DIR)/user/rootfs_blob.o: user/rootfs.bin
 	@mkdir -p $(@D)

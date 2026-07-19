@@ -18,6 +18,11 @@ int dos_tcc_compile(const char* src, const char* out);
  * the program's result, or -1 if it couldn't be loaded. */
 int dos_run_elf(const char* path);
 
+/* As dos_run_elf, but also capture the program's stdout/stderr into `cap`
+ * (NUL-terminated, bounded by caplen) — the Editor shows this in an Output
+ * window.  Output still echoes to the console. */
+int dos_run_elf_cap(const char* path, char* cap, int caplen);
+
 /* True if the on-device tcc is embedded in this build. */
 int dos_tcc_available(void);
 

@@ -62,7 +62,16 @@ static long netsock_read (struct netsock* ns, void* buf, size_t n);
 long sys_write(int fd, const void* buf, size_t n) {
     if (fd == 1 || fd == 2) {                 /* stdout / stderr → console */
         const char* s = (const char*)buf;
-        for (size_t i = 0; i < n; i++) console_putchar(s[i]);
+        /* §M43: also capture into the task's buffer if one is set (Editor
+         * "Compile & Run" reads it back), leaving room for a NUL terminator. */
+        struct task* me = task_current();
+        for (size_t i = 0; i < n; i++) {
+            if (me && me->cap_buf && me->cap_len < me->cap_cap - 1)
+                me->cap_buf[me->cap_len++] = s[i];
+            console_putchar(s[i]);
+        }
+        if (me && me->cap_buf && me->cap_len < me->cap_cap)
+            me->cap_buf[me->cap_len] = '\0';
         return (long)n;
     }
     if (fd == 0) return -1;                    /* can't write stdin */

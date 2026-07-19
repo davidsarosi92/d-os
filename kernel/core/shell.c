@@ -23,6 +23,7 @@
 #include "timer.h"
 #include "vfs.h"
 #include "random.h"
+#include "devtools.h"
 #include "config.h"
 #include "usermode.h"
 #include "task.h"
@@ -1880,22 +1881,15 @@ static void cmd_tcc(const char* args) {
  * produced) under the Linux personality, as an excursion that returns to the
  * shell.  This is what closes the "compile → run" loop on d-os. */
 static void cmd_exec(const char* path) {
-    struct file* f = vfs_open(path, VFS_RDONLY);
-    if (!f) { kprintf("exec: '%s' not found\n", path); return; }
-    size_t sz = f->inode ? (size_t)f->inode->size : 0;
-    if (sz == 0 || sz > (16u << 20)) { vfs_close(f); kprintf("exec: bad size\n"); return; }
-    uint8_t* img = (uint8_t*)kmalloc(sz);
-    if (!img) { vfs_close(f); return; }
-    ssize_t rd = vfs_read(f, img, sz);
-    vfs_close(f);
-    if (rd < (ssize_t)sz) { kfree(img); kprintf("exec: read failed\n"); return; }
-    struct task* me = task_current();
-    int prev = me ? me->linux_abi : 0;
-    if (me) me->linux_abi = 1;               /* tcc output is a musl (Linux-ABI) ELF */
-    int rc = proc_exec_elf(img, sz);
-    if (me) me->linux_abi = prev;
-    kfree(img);
-    kprintf("exec: '%s' returned rc=%d\n", path, rc);
+    /* Run via the capturing engine (which opens/reads the ELF itself) so we can
+     * also report the byte count — exercising the §M43 stdout-capture path the
+     * editor's Output window uses.  Output still echoes to the console. */
+    static char cap[4096];
+    cap[0] = '\0';
+    int rc = dos_run_elf_cap(path, cap, sizeof cap);
+    if (rc == -1 && cap[0] == '\0') { kprintf("exec: '%s' not runnable\n", path); return; }
+    int caplen = 0; while (cap[caplen]) caplen++;
+    kprintf("exec: '%s' returned rc=%d [captured %d bytes]\n", path, rc, caplen);
 }
 
 /* §M43 — reusable compile+run engine (devtools.h), shared with the GUI editor's
@@ -1920,7 +1914,7 @@ int dos_tcc_compile(const char* src, const char* out) {
     return ok;
 }
 
-int dos_run_elf(const char* path) {
+int dos_run_elf_cap(const char* path, char* cap, int caplen) {
     struct file* f = vfs_open(path, VFS_RDONLY);
     if (!f) return -1;
     size_t sz = f->inode ? (size_t)f->inode->size : 0;
@@ -1933,11 +1927,17 @@ int dos_run_elf(const char* path) {
     struct task* me = task_current();
     int prev = me ? me->linux_abi : 0;
     if (me) me->linux_abi = 1;
+    if (me && cap && caplen > 0) {            /* §M43 capture stdout */
+        cap[0] = '\0';
+        me->cap_buf = cap; me->cap_len = 0; me->cap_cap = caplen;
+    }
     int rc = proc_exec_elf(img, sz);
-    if (me) me->linux_abi = prev;
+    if (me) { me->cap_buf = NULL; me->cap_len = me->cap_cap = 0; me->linux_abi = prev; }
     kfree(img);
     return rc;
 }
+
+int dos_run_elf(const char* path) { return dos_run_elf_cap(path, NULL, 0); }
 
 /* §M35.5 — content-addressed package store. */
 static void cmd_pkg(const char* args) {
