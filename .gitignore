@@ -1,90 +1,80 @@
-# =============================================================================
-# .gitignore — what NOT to track in d-os.
-#
-# Goal: a clean checkout has only sources, build scripts, and docs.  Everything
-# the build / dev workflow generates lives in /build/ and stays out of git.
-#
-# When adding a new ignore: prefer a pattern that's narrow (e.g. only the file
-# extensions actually produced) over a blanket directory ignore that could
-# accidentally hide a real source file.
-# =============================================================================
 
+#
 # --- Build outputs --------------------------------------------------------
-# Everything the Makefile + Docker emit lands here.  Includes kernel.bin,
-# d-os.iso, and the iso/ staging tree.
-/build/
-
-# Object files emitted next to .c sources by the in-tree compile rule.
-# Match anywhere (e.g. kernel/core/foo.o, kernel/hal/x86/io.o).
-*.o
-
-# Final binary / ISO / debug artifacts at any depth — defensive, in case
-# someone drops one outside /build/ during ad-hoc work.
-*.bin
-*.iso
-*.elf
-*.map
-*.lst
-
 # --- Editor / OS noise ----------------------------------------------------
-# macOS Finder metadata, recursive.
-.DS_Store
-**/.DS_Store
-
-# Vim swap files.
-*.sw[ponm]
-*~
-
+# --- Local debug / test artifacts ----------------------------------------
+# .gitignore — what NOT to track in d-os.
+# =============================================================================
+# Built static i386 musl (make musl) — a build product, rebuilt on demand
+# Claude Code local settings (per-machine permission allowlist).
 # Emacs autosave / backup.
-*#
-.\#*
-
+# Everything the Makefile + Docker emit lands here.  Includes kernel.bin,
+# Files our smoke-test scripts and pmemsave tricks dump locally.  They live
+# Final binary / ISO / debug artifacts at any depth — defensive, in case
+# Goal: a clean checkout has only sources, build scripts, and docs.  Everything
 # JetBrains, VS Code, Sublime, Xcode local config.
-.idea/
-.vscode/
-*.sublime-workspace
+# Match anywhere (e.g. kernel/core/foo.o, kernel/hal/x86/io.o).
+# Object files emitted next to .c sources by the in-tree compile rule.
+# Vendored (fetched, pristine) musl source — see scripts/fetch-musl.sh
+# Vim swap files.
+# When adding a new ignore: prefer a pattern that's narrow (e.g. only the file
+# accidentally hide a real source file.
+# d-os.iso, and the iso/ staging tree.
+# extensions actually produced) over a blanket directory ignore that could
+# macOS Finder metadata, recursive.
+# musl-linked ELFs (build products)
+# root by mistake.
+# someone drops one outside /build/ during ad-hoc work.
+# the build / dev workflow generates lives in /build/ and stays out of git.
+# under /tmp normally but a developer occasionally lands them at the repo
+# §M37 dynamic-linking build products (PIE ELFs + shared objects)
+# §M38 C++ build products
+# §M38 musl C++ cross-toolchain (build input + product)
+# §M39 Mbed TLS (vendored crypto dep + build product)
+# §M43 TinyCC (on-device C compiler — vendored build input + product)
+# §M43 on-device compiler build products
+*#
+**/.DS_Store
+*.bin
+*.elf
+*.iso
+*.log
+*.lst
+*.map
+*.o
 *.sublime-project
+*.sublime-workspace
+*.sw[ponm]
 *.xcodeproj/
 *.xcuserdatad/
-
-# Claude Code local settings (per-machine permission allowlist).
+*~
+.DS_Store
+.\#*
 .claude/
-
-# --- Local debug / test artifacts ----------------------------------------
-# Files our smoke-test scripts and pmemsave tricks dump locally.  They live
-# under /tmp normally but a developer occasionally lands them at the repo
-# root by mistake.
-*.log
-serial.log
-qemu.log
-vga.bin
+.idea/
+.vscode/
+/build/
+disk.img
 fb.bin
 mbi.bin
+qemu.log
+serial.log
 test.img
-disk.img
-
-# Vendored (fetched, pristine) musl source — see scripts/fetch-musl.sh
-third_party/musl/
-# Built static i386 musl (make musl) — a build product, rebuilt on demand
-third_party/musl-i386/
-# musl-linked ELFs (build products)
-user/*.muslelf
-# §M37 dynamic-linking build products (PIE ELFs + shared objects)
-user/*.dynelf
-user/*.so
-# §M38 musl C++ cross-toolchain (build input + product)
-third_party/musl-cross-make/
-third_party/musl-cross-*/
-# §M39 Mbed TLS (vendored crypto dep + build product)
-third_party/mbedtls/
-third_party/mbedtls-i686/
-# §M38 C++ build products
-user/*.cxxelf
-# §M43 TinyCC (on-device C compiler — vendored build input + product)
-third_party/tinycc/
-third_party/tinycc-i686/
-# §M43 on-device compiler build products
-user/rootfs.bin
-user/dostcc
-third_party/zlib/
+third_party/freetype/
 third_party/libpng/
+third_party/mbedtls-i686/
+third_party/mbedtls/
+third_party/musl-cross-*/
+third_party/musl-cross-make/
+third_party/musl-i386/
+third_party/musl/
+third_party/tinycc-i686/
+third_party/tinycc/
+third_party/zlib/
+user/*.cxxelf
+user/*.dynelf
+user/*.muslelf
+user/*.so
+user/dostcc
+user/rootfs.bin
+vga.bin

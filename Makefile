@@ -232,6 +232,13 @@ else ifeq ($(ARCH),x86_64)
   ifneq ($(wildcard third_party/libpng/png.h),)
     ARCH_EXTRA_OBJS += user/libpng16_blob.o user/pngtest_dynblob.o
   endif
+  # freetype → a store package (libfreetype.so.6).  Guarded on the PREBUILT .so
+  # (not the source) because compiling FreeType's ~40 amalgamated modules under
+  # amd64 emulation is minutes-long — build it once with `make freetype`, then
+  # it is embedded; a plain build never triggers the slow compile.
+  ifneq ($(wildcard user/libfreetype.so.6),)
+    ARCH_EXTRA_OBJS += user/libfreetype6_blob.o user/fttest_dynblob.o
+  endif
 
 else ifeq ($(ARCH),aarch64)
   # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
@@ -1244,6 +1251,36 @@ user/pngtest.dynelf: user/pngtest.c user/libpng16.so.16
 	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(LIBPNG_DIR) -I$(ZLIB_DIR) \
 	    -Wl,-dynamic-linker,$(DOS_LDSO) user/pngtest.c \
 	    user/libpng16.so.16 user/libz.so.1 -o $@
+
+# freetype — the font rasteriser, soname libfreetype.so.6, depends on zlib.
+# Built from ~40 amalgamated module sources (slow under emulation → its own
+# target, not part of a normal build; the blob guard keys on the output .so).
+FT_DIR   := third_party/freetype
+FT_BASE  := ftsystem ftinit ftdebug ftbase ftbbox ftbitmap ftglyph ftmm ftpfr \
+            ftstroke ftsynth fttype1 ftwinfnt ftgasp ftfstype ftcid ftbdf
+FT_MODS  := autofit/autofit bdf/bdf cache/ftcache cff/cff cid/type1cid \
+            gzip/ftgzip lzw/ftlzw pcf/pcf pfr/pfr psaux/psaux pshinter/pshinter \
+            psnames/psnames raster/raster sfnt/sfnt smooth/smooth \
+            truetype/truetype type1/type1 type42/type42 winfonts/winfnt sdf/sdf svg/svg
+FT_SRCS  := $(addprefix $(FT_DIR)/src/base/,$(addsuffix .c,$(FT_BASE))) \
+            $(addprefix $(FT_DIR)/src/,$(addsuffix .c,$(FT_MODS)))
+
+.PHONY: freetype
+freetype: user/libfreetype.so.6
+
+user/libfreetype.so.6: $(FT_DIR)/include/ft2build.h user/libz.so.1
+	$(MUSL_ELF_CC) -shared -fPIC -Os -DFT2_BUILD_LIBRARY -I$(FT_DIR)/include \
+	    -I$(ZLIB_DIR) -Wl,-soname,libfreetype.so.6 -o $@ $(FT_SRCS) user/libz.so.1
+
+$(OBJ_DIR)/user/libfreetype6_blob.o: user/libfreetype.so.6
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+user/fttest.dynelf: user/fttest.c user/libfreetype.so.6
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(FT_DIR)/include \
+	    -Wl,-dynamic-linker,$(DOS_LDSO) user/fttest.c \
+	    user/libfreetype.so.6 user/libz.so.1 -o $@
 
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
