@@ -68,8 +68,8 @@
 | §M35.5 | Package manager & isolation — ✅ store shipped (i386): content-addressed /store + profiles + GC (DOCS §4.29); gates every port | — |
 | §M36 | POSIX syscall breadth + native libc — ◐ stage 1 (i386, DOCS §4.30) + stage 2 "two brothers": **Linux-ABI peer runs real musl + coreutils (`echo`/`cat`/`ls`/`env`) + a real `sh -c` (fork/execve/waitpid) FROM the store via `pkgrun`, data-driven `.abi` seam (DOCS §4.31)**; native musl-fork peer TODO (= 2nd ABI backend). Own-libc PARKED → `NATIVE_LIBC.md` | — |
 | §M37 | Dynamic linking — ld.so / `.so` / dlopen — ✅ shipped (i386, DOCS §4.33): shared musl (libc.so=ld.so) + ET_DYN/PIE loader + PT_INTERP + full auxv + full mmap2/mprotect/fstat64; dynamic hello, separate .so (DT_NEEDED + .so __thread), dlopen all green | — |
-| §M38 | C++ runtime + support libs (libc++/unwind, zlib, freetype, ICU, harfbuzz…) | — |
-| §M39 | Crypto + entropy + TLS + DNS resolver | — |
+| §M38 | C++ runtime + support libs — ◐ runtime shipped (i386, DOCS §4.34): musl-cross-make g++ 11.2.0 + libstdc++; `cpptest` throws+catches across a `.so` (DWARF unwind) + STL, dynamically linked.  Support libs (zlib/freetype/harfbuzz/ICU/Skia) still open | — |
+| §M39 | Crypto + entropy + TLS + DNS — ◐ stages 1–3 shipped (i386, DOCS §4.35): ChaCha20 CSPRNG + /dev/urandom + getrandom (arch-generic); Mbed TLS v3.6.2 (`crypttest` SHA-256+AES-GCM); **verified TLS 1.3** handshake + app data (`ssltest`).  Open: `wget https` over real sockets (3b), DNS/resolv.conf | — |
 | §M40 | Client graphics stack — Wayland client + EGL/GL (Mesa swrast) + Skia | — |
 | §M41 | Linux syscall ABI shim — optional binary-compat accelerator | — |
 | §M42 | Web browser bring-up — NetSurf → WebKit → Firefox/Chromium (north star) | — |
@@ -3880,6 +3880,16 @@ without killing its clients (the last item may land with §M33).
 
 ## Change log
 
+- **2026-07-19** — **§M38 C++ runtime + §M39 stages 1–3 shipped (i386).**  M38
+  (DOCS §4.34): a from-source musl C++ toolchain (musl-cross-make g++ 11.2.0) +
+  libstdc++; `cpptest` throws+catches an exception across a `.so` boundary
+  (DWARF unwinding) with the STL, dynamically linked.  M39 (DOCS §4.35): a
+  ChaCha20 CSPRNG (arch-generic) + `/dev/urandom`/`getrandom` (stage 1); Mbed
+  TLS v3.6.2 crypto (stage 2, `crypttest`); a verified TLS 1.3 handshake +
+  encrypted app data (stage 3, `ssltest`).  Also wired the Linux-ABI time
+  syscalls (mbedTLS x509 needs a clock) and grew the user stack to a 1 MiB
+  multi-page region.  `DOS_MILESTONE=M39`.  Toolchains built under amd64
+  emulation on an Apple-Silicon Mac (~10 h one-time for gcc).  Branch `m38-m39`.
 - **2026-07-18** — Roadmap expanded (design only, no code): added **§M43**
   (native self-hosting toolchain — dev tools become the first store packages so
   we build d-os on d-os), **§M44** (language ecosystems — Rust/C++/.NET/Java

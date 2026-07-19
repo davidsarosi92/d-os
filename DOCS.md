@@ -3434,6 +3434,82 @@ musl pthread path); lazy PLT resolution (BIND_NOW-style works today).
 
 ---
 
+### 4.34 C++ runtime — libstdc++ + exceptions (M38, i386)
+
+Runs unmodified C++ programs with exceptions, RTTI, and the STL, dynamically
+linked against a real musl libstdc++.
+
+**Toolchain (`make musl-cross-i686`).**  A from-source musl C++ cross-toolchain
+built with **musl-cross-make** (gcc/g++ 11.2.0 + binutils + musl 1.2.3): it
+produces `i686-linux-musl-g++` plus `libstdc++.so.6` + `libgcc_s.so.1` in a musl
+sysroot.  Built on the container-local fs (the macOS Docker mount breaks tar's
+directory-metadata restore — `--delay-directory-restore`; and the build is
+slow under amd64 emulation).  Fetched by `scripts/fetch-musl-cross.sh`.
+
+**Building C++ for d-os.**  Programs compile `-fPIE` and link `-pie` → ET_DYN,
+so the §M37 loader relocates them to the user base (a non-PIE EXEC would land
+at 0x08048000, inside the kernel region).  PT_INTERP = `/lib/ld-musl-i386.so.1`;
+DT_NEEDED = `libstdc++.so.6` + `libgcc_s.so.1` + `libc.so` (+ app `.so`s).  The
+runtime `.so`s (stripped: libstdc++ ~2.1 MB, libgcc_s ~112 KB) are embedded as
+blobs and provisioned into `/lib` at boot (`pkg.c`), so `ld.so` resolves them.
+
+**Verified (boot, i386):** `cpptest` — a dynamically-linked C++ PIE — runs under
+the Linux personality: `std::vector<std::string>` + `std::sort` work; an
+exception THROWN in `libcpplib.so` is CAUGHT in `main` **across the `.so`
+boundary** (DWARF unwinding via `.eh_frame`/`_Unwind_*` crosses shared objects —
+the M38 definition-of-done); a thread-safe local static in the `.so`
+(`__cxa_guard_*`) works.
+
+**Open:** x86_64/aarch64; the heavy support libs (zlib/freetype/harfbuzz/ICU/
+Skia — §M38 continued); `libc++` as an alternative to libstdc++.
+
+---
+
+### 4.35 Crypto, entropy & TLS (M39, i386)
+
+**Stage 1 — entropy (`kernel/core/random.c`, arch-generic).**  A ChaCha20
+CSPRNG (RFC 8439) with **fast key erasure** (the key is overwritten with fresh
+never-output keystream after each request → forward secrecy, like Linux's
+`get_random_bytes`), seeded from a hardware RNG where present + boot/timing
+jitter.  Exposed as `/dev/urandom` + `/dev/random`, the `getrandom` syscall
+(native SYS 36 / Linux 355), and the per-exec `AT_RANDOM` auxv.  The only
+arch-specific bit is `hal_hw_random` (RDRAND on x86, CPUID-gated; a weak no-op
+elsewhere).  Verified: `randtest` (two draws differ, `/dev/urandom` via VFS;
+`-cpu max` exercises the RDRAND seed path).
+
+**Stage 2 — crypto library (Mbed TLS v3.6.2).**  Ported pristine (`make
+mbedtls`, C, built against our musl); `libmbed{crypto,x509,tls}.a`.  Verified:
+`crypttest` passes a SHA-256 known-answer test + an AES-256-GCM encrypt→decrypt
+round-trip in ring 3.
+
+**Stage 3 — TLS (`ssltest`).**  A full **verified TLS 1.3** handshake between an
+in-process client and server completes, then encrypted application data is
+exchanged:
+
+```
+handshake OK — TLSv1.3 / TLS1-3-CHACHA20-POLY1305-SHA256
+cert verify flags = 0x0 (trusted)      <- real X.509 verification vs the CA
+app data over TLS: "hello over TLS from d-os" (match)
+```
+
+Exercises ECDHE + ChaCha20-Poly1305 AEAD + ECDSA CertVerify + X.509 chain
+verification + the record layer, all seeded from the stage-1 CSPRNG
+(`mbedtls_entropy` → `getrandom`).  The two BIO callbacks ferry bytes through
+ring buffers; the same `mbedtls_ssl_set_bio` seam takes real M24-socket
+send/recv for a network client (stage 3b).  Getting verified TLS working forced
+wiring the **Linux-ABI time syscalls** — `time`(13)/`gettimeofday`(78)/
+`clock_gettime`(265)/`clock_gettime64`(403) → `sys_clock_gettime` — because
+mbedTLS's x509 date check fatals without a working clock (and this benefits
+every musl program).  The M25 single-page user stack also had to grow (the TLS
+handshake overflowed it): the per-process layout is now image / interp (+64 MiB)
+/ stack (+96 MiB, grows down, 1 MiB) / mmap (+128 MiB), non-overlapping.
+
+**Open:** stage 3b `wget https://` to a real server over the M24 sockets (needs
+a net-enabled boot + the Mozilla CA bundle at `/etc/ssl/certs`); DNS
+`getaddrinfo` + `/etc/resolv.conf`; x86_64/aarch64.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -3504,6 +3580,23 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-19 — M38 (C++ runtime) + M39 stages 1–3 (crypto/entropy/TLS), i386
+  (DOCS §4.34, §4.35).**  **M38:** a from-source musl C++ toolchain (musl-cross-
+  make, g++ 11.2.0) + libstdc++; `cpptest` throws an exception in a `.so` and
+  catches it in `main` across the boundary (DWARF unwinding across shared
+  objects) + STL, dynamically linked (libstdc++.so.6/libgcc_s.so.1 provisioned
+  to `/lib`).  **M39.1:** a ChaCha20 CSPRNG (`random.c`, arch-generic) →
+  `/dev/urandom`+`/dev/random`+`getrandom`+`AT_RANDOM` (RDRAND seed on x86).
+  **M39.2:** Mbed TLS v3.6.2 ported; `crypttest` passes SHA-256 + AES-256-GCM.
+  **M39.3:** `ssltest` completes a **verified TLS 1.3** handshake (ECDHE +
+  ChaCha20-Poly1305 + ECDSA CertVerify + X.509 verify, `flags=0x0`) and exchanges
+  encrypted app data, seeded from the CSPRNG.  Needed: Linux-ABI time syscalls
+  (`time`/`gettimeofday`/`clock_gettime`/`clock_gettime64`) — without a clock
+  mbedTLS's x509 date check fatals — and a bigger multi-page user stack (the M25
+  single page overflowed during the handshake; new non-overlapping layout:
+  image / interp+64M / stack+96M / mmap+128M).  `DOS_MILESTONE=M39`.  Open:
+  `wget https` over real sockets (stage 3b), x86_64/aarch64, the §M38 support-lib
+  stack (freetype/harfbuzz/ICU/Skia).
 - **2026-07-18 — M37: dynamic linking (ld.so / .so / dlopen), i386 (DOCS §4.33).**
   An unmodified musl program now runs **dynamically linked**: the kernel maps the
   PIE main object + the interpreter (`/lib/ld-musl-i386.so.1`) with a full SysV
