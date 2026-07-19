@@ -35,7 +35,20 @@ static int streq(const char* a, const char* b) {
 }
 static unsigned strlen_local(const char* s) { unsigned n = 0; while (s && s[n]) n++; return n; }
 
-#define PKG_MAX_IMAGE  (256 * 1024)   /* generous cap for a static musl ELF */
+/* Cap for reading a package payload back out of the store (bin exec image or a
+ * shared-library profile-expose).  Must fit the largest payload we copy this
+ * way — the x86_64 musl libc.so (== the dynamic linker) is ~750 KiB, so 256 KiB
+ * would silently TRUNCATE it into a broken ld.so.  2 MiB gives headroom. */
+#define PKG_MAX_IMAGE  (2 * 1024 * 1024)
+
+/* The canonical PT_INTERP path the arch's musl dynamic binaries carry (matches
+ * the Makefile's $(DOS_LDSO) + the -dynamic-linker the .dynelf/.cxxelf rules
+ * stamp in).  The active libc package's profile view writes its libc.so here. */
+#if defined(__x86_64__)
+#define DOS_LDSO_PATH "/lib/ld-musl-x86_64.so.1"
+#else
+#define DOS_LDSO_PATH "/lib/ld-musl-i386.so.1"
+#endif
 
 /* ----------------------- recipe registry ---------------------------------- */
 
@@ -159,14 +172,24 @@ int pkg_build(const char* id) {
     vfs_mkdir("/store");
     if (vfs_mkdir(path) != 0) { kprintf("pkg: mkdir %s failed\n", path); return -1; }
 
-    /* Payload → <path>/bin/<name>. */
+    /* Payload → <path>/bin/<name> for a program, or <path>/lib/<soname> for a
+     * shared-library package (the runtime libc goes this route). */
     char binp[224];
-    int p = sappend(binp, sizeof binp, 0, path);
-    p = sappend(binp, sizeof binp, p, "/bin");
-    vfs_mkdir(binp);
-    p = sappend(binp, sizeof binp, p, "/");
-    sappend(binp, sizeof binp, p, r->name);
-    write_file(binp, r->content, r->content_len);
+    if (r->soname) {
+        int p = sappend(binp, sizeof binp, 0, path);
+        p = sappend(binp, sizeof binp, p, "/lib");
+        vfs_mkdir(binp);
+        p = sappend(binp, sizeof binp, p, "/");
+        sappend(binp, sizeof binp, p, r->soname);
+        write_file(binp, r->content, r->content_len);
+    } else {
+        int p = sappend(binp, sizeof binp, 0, path);
+        p = sappend(binp, sizeof binp, p, "/bin");
+        vfs_mkdir(binp);
+        p = sappend(binp, sizeof binp, p, "/");
+        sappend(binp, sizeof binp, p, r->name);
+        write_file(binp, r->content, r->content_len);
+    }
 
     /* .recipe (text). */
     char meta[512]; int m = 0;
@@ -274,14 +297,62 @@ static void profile_bin_expose(struct pkg_recipe* r) {
     kfree(buf);
 }
 
+/* Expose a shared-library package into /lib (the "profile view" for libraries,
+ * analogous to profile_bin_expose for programs).  Copies <store>/lib/<soname>
+ * → /lib/<soname>; for the C library it also writes the fixed PT_INTERP alias
+ * (/lib/ld-musl-<arch>.so.1) so a dynamic binary's interpreter resolves.  ramfs
+ * has no symlinks, so this copies — the moral equivalent of a Nix profile link;
+ * "switching" libc versions = re-run this from a different store path. */
+static void profile_lib_expose(struct pkg_recipe* r) {
+    if (!r->soname) return;
+    char dn[96]; store_dirname_r(r, dn, sizeof dn);
+    char src[224]; int p = sappend(src, sizeof src, 0, "/store/");
+    p = sappend(src, sizeof src, p, dn);
+    p = sappend(src, sizeof src, p, "/lib/");
+    sappend(src, sizeof src, p, r->soname);
+
+    char* buf = (char*)kmalloc(PKG_MAX_IMAGE);
+    if (!buf) return;
+    int n = read_file(src, buf, PKG_MAX_IMAGE);
+    if (n > 0) {
+        vfs_mkdir("/lib");
+        char dst[96]; int dp = sappend(dst, sizeof dst, 0, "/lib/");
+        sappend(dst, sizeof dst, dp, r->soname);
+        write_file(dst, buf, (unsigned)n);
+        if (r->is_libc) {
+            write_file(DOS_LDSO_PATH, buf, (unsigned)n);  /* PT_INTERP alias */
+            kprintf("libc: active = %s %s (%s) → /lib/%s + %s\n",
+                    r->name, r->version, dn, r->soname, DOS_LDSO_PATH);
+        }
+    }
+    kfree(buf);
+}
+
 int pkg_install(const char* id) {
     struct pkg_recipe* r = find_recipe(id);
     if (!r) { kprintf("pkg: no recipe '%s'\n", id); return -1; }
     if (pkg_build(id) != 0) return -1;
     char dn[96]; store_dirname_r(r, dn, sizeof dn);
     profile_add(dn);
-    profile_bin_expose(r);                       /* make it runnable by name */
+    if (r->soname) profile_lib_expose(r);        /* library → /lib/<soname> */
+    else           profile_bin_expose(r);        /* program → runnable by name */
     kprintf("pkg: installed %s (%s)\n", r->name, dn);
+    return 0;
+}
+
+/* Switch the active C library (see pkg.h): (re)build+install the named libc
+ * package and re-point /lib at it.  With two musl versions registered + built,
+ * this flips /lib between them — they coexist in the store untouched. */
+int pkg_libc_use(const char* id) {
+    struct pkg_recipe* r = find_recipe(id);
+    if (!r || !r->soname || !r->is_libc) {
+        kprintf("pkg: '%s' is not a C-library package\n", id ? id : "(null)");
+        return -1;
+    }
+    if (pkg_build(id) != 0) return -1;
+    char dn[96]; store_dirname_r(r, dn, sizeof dn);
+    profile_add(dn);
+    profile_lib_expose(r);
     return 0;
 }
 
@@ -501,6 +572,17 @@ extern const unsigned char _binary_user_libcpplib_so_start[]   __attribute__((we
 extern const unsigned char _binary_user_libcpplib_so_end[]     __attribute__((weak));
 
 static struct pkg_recipe rc_hello1, rc_hello2, rc_args, rc_echo, rc_cat, rc_ls, rc_env, rc_sh;
+static struct pkg_recipe rc_musl;
+
+/* The version string of the embedded runtime musl — arch-specific (the i386
+ * build fetches+builds musl 1.2.5; the x86_64 prebuilt musl.cc sysroot ships
+ * 1.2.2).  It names the musl STORE PACKAGE, so a newer musl = a new recipe with
+ * a new version = a new /store path that coexists with the old one. */
+#if defined(__x86_64__)
+#define DOS_MUSL_VERSION "1.2.2"
+#else
+#define DOS_MUSL_VERSION "1.2.5"
+#endif
 
 static unsigned blob_len(const unsigned char* s, const unsigned char* e) {
     return s ? (unsigned)(e - s) : 0;
@@ -557,27 +639,33 @@ static void rootfs_unpack(void) {
     }
 }
 
-/* §M37: place the musl dynamic linker in the VFS at the canonical interpreter
- * path a dynamically-linked musl binary carries in its PT_INTERP
- * (/lib/ld-musl-i386.so.1).  When execve loads such a binary, the kernel reads
- * this file to load the interpreter (see proc.c).  Also exposed at /lib/libc.so
- * so ld.so can resolve a DT_NEEDED "libc.so" by the usual search path. */
-/* The canonical PT_INTERP path the arch's musl dynamic binaries carry.  Must
- * match the Makefile's $(DOS_LDSO) and the -dynamic-linker the .dynelf/.cxxelf
- * rules stamp in. */
-#if defined(__x86_64__)
-#define DOS_LDSO_PATH "/lib/ld-musl-x86_64.so.1"
-#else
-#define DOS_LDSO_PATH "/lib/ld-musl-i386.so.1"
-#endif
-
 static void ldso_provision(void) {
     if (!_binary_user_ldmusl_so_start) return;      /* musl shared not built */
     unsigned len = blob_len(_binary_user_ldmusl_so_start, _binary_user_ldmusl_so_end);
-    vfs_mkdir("/lib");
-    write_file(DOS_LDSO_PATH,   _binary_user_ldmusl_so_start, len);
-    write_file("/lib/libc.so",  _binary_user_ldmusl_so_start, len);
 
+    /* The runtime C library is a first-class STORE PACKAGE, not a hardcoded
+     * global-/lib blob: register musl as a versioned, content-addressed recipe,
+     * build+install it into /store, and let the profile view expose it to /lib
+     * (libc.so + the PT_INTERP alias).  This makes musl swappable + updatable
+     * via the package manager and lets multiple libc versions coexist — swap =
+     * `pkg_libc_use("musl-<other>")`, update = `pkg install` a newer recipe.
+     * (The interp path stays the fixed musl soname; the STORE is where the
+     * version lives.)  See [[feedback-dos-swappable-layers]] + pkg_libc_use. */
+    rc_musl = (struct pkg_recipe){ .id="musl", .name="musl", .version=DOS_MUSL_VERSION,
+        .deps="", .content=_binary_user_ldmusl_so_start, .content_len=len,
+        .abi="native", .soname="libc.so", .is_libc=1 };
+    pkg_register(&rc_musl);
+    vfs_mkdir("/lib");
+    if (pkg_install("musl") != 0) {
+        /* Store path failed — fall back to a direct /lib write so a dynamic
+         * program can still run (degraded: no version management). */
+        write_file(DOS_LDSO_PATH,  _binary_user_ldmusl_so_start, len);
+        write_file("/lib/libc.so", _binary_user_ldmusl_so_start, len);
+    }
+
+    /* Aux runtime libraries (the DT_NEEDED search-path test lib + the C++
+     * runtime) are still provisioned directly to /lib for now; folding them
+     * into store packages the same way is a follow-up. */
     /* A separate shared library for the DT_NEEDED search-path test (stage 5). */
     if (_binary_user_libgreet_so_start)
         write_file("/lib/libgreet.so", _binary_user_libgreet_so_start,

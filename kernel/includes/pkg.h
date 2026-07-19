@@ -45,8 +45,25 @@ struct pkg_recipe {
      * NULL ⇒ "native".  This keeps the libc/ABI choice DATA-DRIVEN: a package
      * DECLARES its ABI; the exec path never hardcodes "musl"/"linux". */
     const char* abi;
+    /* If non-NULL, this package is a SHARED LIBRARY, not a program: its payload
+     * materialises at <store>/lib/<soname> and the "profile view" exposes it to
+     * /lib/<soname> (not /bin/<name>).  This is how the runtime C library
+     * (musl) itself becomes a versioned, content-addressed, pkg-managed package
+     * — multiple libc versions coexist in the store, switching = re-point the
+     * active view, updating = `pkg install` a newer recipe.  See
+     * pkg_activate_libc + [[feedback-dos-swappable-layers]]. */
+    const char* soname;
+    /* If non-zero, this library is the C library / dynamic linker: activating
+     * it ALSO writes the fixed PT_INTERP alias (/lib/ld-musl-<arch>.so.1). */
+    int         is_libc;
     struct pkg_recipe* next;        /* registry link */
 };
+
+/* Switch the ACTIVE C library to an installed musl (or other libc) package:
+ * re-provisions /lib/libc.so + the PT_INTERP alias FROM that store path.  With
+ * two libc versions installed (coexisting in the store) this is how you switch
+ * between them — the swappable/updatable-libc seam the store model gives us. */
+int  pkg_libc_use(const char* id);
 
 /* Register a recipe (called from pkg_init for the built-ins). */
 void pkg_register(struct pkg_recipe* r);
