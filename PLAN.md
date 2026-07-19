@@ -73,7 +73,7 @@
 | §M40 | Client graphics stack — Wayland client + EGL/GL (Mesa swrast) + Skia | — |
 | §M41 | Linux syscall ABI shim — optional binary-compat accelerator | — |
 | §M42 | Web browser bring-up — NetSurf → WebKit → Firefox/Chromium (north star) | — |
-| §M43 | Native developer toolchain (self-hosting) — a compiler + binutils + make RUN on d-os; first store packages, so we develop on d-os, in d-os | — |
+| §M43 | Native developer toolchain (self-hosting) — ◐ first slice shipped (i386, DOCS §4.36): **TinyCC compiles + runs C ON d-os** (`tcc`/`exec` shell cmds + Editor "Run" button).  Full gcc/clang self-hosting + binutils/make still open | — |
 | §M44 | Language ecosystems — Rust / C++ / .NET (NativeAOT→CoreCLR) / Java (JVM); run cross-built musl binaries, then per-runtime ports | — |
 | §M45 | Package manager frontend + GUI installer — apt-like UX + wizard over the §M35.5 store; remote repo over §M39 TLS; driver/module hot-swap via §M33 | — |
 | How to use this document | Workflow rules | 930 |
@@ -3880,6 +3880,12 @@ without killing its clients (the last item may land with §M33).
 
 ## Change log
 
+- **2026-07-19** — **§M43 first slice: on-device C compiler (TinyCC) shipped
+  (i386, DOCS §4.36).**  `tcc /hello.c -o /hello` + `exec /hello` compile and run
+  C ON d-os; the M22.5 Editor gains a "Run" button (compile+run the buffer).
+  TinyCC cross-built PIE with the musl toolchain (`--config-musl/pie`),
+  provisioned via a rootfs archive.  Chose TinyCC over gcc/clang (too big to run
+  on d-os yet); full gcc self-hosting remains the §M43 goal.  `DOS_MILESTONE=M43`.
 - **2026-07-19** — **§M38 C++ runtime + §M39 stages 1–3 shipped (i386).**  M38
   (DOCS §4.34): a from-source musl C++ toolchain (musl-cross-make g++ 11.2.0) +
   libstdc++; `cpptest` throws+catches an exception across a `.so` boundary

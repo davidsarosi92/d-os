@@ -3510,6 +3510,43 @@ a net-enabled boot + the Mozilla CA bundle at `/etc/ssl/certs`); DNS
 
 ---
 
+### 4.36 On-device C compiler — TinyCC (M43 slice, i386)
+
+Compile + run C **on d-os** — the first slice of §M43 (self-hosting: develop on
+d-os, in d-os).  gcc/clang are too big to run on d-os; TinyCC (tcc) is a tiny,
+single-pass C compiler that emits runnable ELFs with its own linker.
+
+**Build (`make tcc`).**  tcc is cross-built with the musl C++ toolchain into a
+PIE i686-musl binary that runs on d-os under §M37, configured with d-os target
+paths (`--elfinterp=/lib/ld-musl-i386.so.1`, `--crtprefix=/lib`,
+`--libpaths="{B}:/lib"`, `--sysincludepaths="{B}/include:/usr/include"`,
+`--config-musl --config-pie --config-bcheck=no --config-backtrace=no`).  A flat
+rootfs archive (`scripts/pack-rootfs.py`, unpacked by `pkg.c`'s
+`rootfs_unpack`) provisions the compile inputs into the VFS: tcc's own headers +
+`libtcc1.a` at `/usr/lib/tcc`, musl headers at `/usr/include`, crt at `/lib`.
+
+**Use.**  `tcc <args>` runs the embedded tcc (Linux personality, `-B/usr/lib/tcc`)
+with the shell args; `exec <path>` loads + runs a VFS ELF.  Verified (boot):
+
+```
+d-os$ tcc /hello.c -o /hello        # compile + link a full stdio program
+d-os$ exec /hello
+hello, compiled on d-os by tcc!     # ...and it runs
+```
+
+The **Editor** (M22.5) gains a **"Run" button** that saves the buffer, compiles
+it with tcc, and runs the result (`devtools.h`: `dos_tcc_compile`/`dos_run_elf`
+— the shared engine).
+
+**Needed (all help every musl program):** Linux-ABI `_llseek`(140) (tcc seeks
+in `.o` files — else "invalid object file"), `lseek`(19), `unlink`(10).
+
+**Open:** capture the program's stdout into an editor result pane (it goes to
+the console today); a bigger compiler (gcc/clang) for full self-hosting; more
+Linux ABI breadth; x86_64/aarch64.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -3580,6 +3617,13 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-19 — M43 slice: on-device C compiler (TinyCC), i386 (DOCS §4.36).**
+  `tcc /hello.c -o /hello` compiles + links a full stdio C program ON d-os and
+  `exec /hello` runs it — the first self-hosting slice.  tcc cross-built PIE
+  (musl toolchain, `--config-musl/pie`), provisioned with a rootfs archive
+  (tcc/musl headers + crt + libtcc1.a) via `pack-rootfs.py`/`rootfs_unpack`.
+  Shell `tcc`/`exec`; Editor "Run" button (`devtools.h`).  Needed Linux-ABI
+  `_llseek`/`lseek`/`unlink`.  `DOS_MILESTONE=M43`.
 - **2026-07-19 — M38 (C++ runtime) + M39 stages 1–3 (crypto/entropy/TLS), i386
   (DOCS §4.34, §4.35).**  **M38:** a from-source musl C++ toolchain (musl-cross-
   make, g++ 11.2.0) + libstdc++; `cpptest` throws an exception in a `.so` and

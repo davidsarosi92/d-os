@@ -9,7 +9,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M39"                 /* latest shipped: §M38 C++ + §M39 crypto/TLS */
+#define DOS_MILESTONE  "M43"                 /* latest shipped: §M43 on-device tcc compiler */
 #define DOS_LABEL      "d-os " DOS_MILESTONE
 
 #endif /* VERSION_H */
