@@ -564,6 +564,8 @@ extern const unsigned char _binary_user_libgreet_so_end[]      __attribute__((we
  * as a versioned store package (soname libz.so.1). */
 extern const unsigned char _binary_user_libz_so_1_start[]      __attribute__((weak));
 extern const unsigned char _binary_user_libz_so_1_end[]        __attribute__((weak));
+extern const unsigned char _binary_user_libpng16_so_16_start[] __attribute__((weak));
+extern const unsigned char _binary_user_libpng16_so_16_end[]   __attribute__((weak));
 
 /* §M38: the C++ runtime .so's (from the musl C++ toolchain) + the demo C++
  * library, provisioned into /lib so ld.so resolves a C++ program's DT_NEEDED
@@ -579,6 +581,7 @@ extern const unsigned char _binary_user_libcpplib_so_end[]     __attribute__((we
 static struct pkg_recipe rc_hello1, rc_hello2, rc_args, rc_echo, rc_cat, rc_ls, rc_env, rc_sh;
 static struct pkg_recipe rc_musl;
 static struct pkg_recipe rc_zlib;
+static struct pkg_recipe rc_libpng;
 
 /* The version string of the embedded runtime musl — arch-specific (the i386
  * build fetches+builds musl 1.2.5; the x86_64 prebuilt musl.cc sysroot ships
@@ -700,6 +703,18 @@ static void ldso_provision(void) {
             .abi="native", .soname="libz.so.1", .is_libc=0 };
         pkg_register(&rc_zlib);
         pkg_install("zlib");
+    }
+
+    /* libpng — depends on zlib; deps="zlib" makes the store closure pin it
+     * (the recipe hash folds in zlib's hash → real content-addressing). */
+    if (_binary_user_libpng16_so_16_start) {
+        rc_libpng = (struct pkg_recipe){ .id="libpng", .name="libpng", .version="1.6.43",
+            .deps="zlib", .content=_binary_user_libpng16_so_16_start,
+            .content_len=blob_len(_binary_user_libpng16_so_16_start,
+                                  _binary_user_libpng16_so_16_end),
+            .abi="native", .soname="libpng16.so.16", .is_libc=0 };
+        pkg_register(&rc_libpng);
+        pkg_install("libpng");
     }
 }
 

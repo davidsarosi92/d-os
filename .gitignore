@@ -87,3 +87,4 @@ third_party/tinycc-i686/
 user/rootfs.bin
 user/dostcc
 third_party/zlib/
+third_party/libpng/

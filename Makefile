@@ -228,6 +228,10 @@ else ifeq ($(ARCH),x86_64)
   ifneq ($(wildcard third_party/zlib/zlib.h),)
     ARCH_EXTRA_OBJS += user/libz_blob.o user/ztest_dynblob.o
   endif
+  # libpng → a store package (libpng16.so.16) whose closure pins zlib.
+  ifneq ($(wildcard third_party/libpng/png.h),)
+    ARCH_EXTRA_OBJS += user/libpng16_blob.o user/pngtest_dynblob.o
+  endif
 
 else ifeq ($(ARCH),aarch64)
   # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
@@ -1215,6 +1219,32 @@ user/ztest.dynelf: user/ztest.c user/libz.so.1
 	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(ZLIB_DIR) \
 	    -Wl,-dynamic-linker,$(DOS_LDSO) user/ztest.c user/libz.so.1 -o $@
 
+# libpng — the PNG codec, soname libpng16.so.16, depends on zlib (links libz.so.1
+# → DT_NEEDED libz.so.1, so its store package's closure pins zlib).
+LIBPNG_DIR  := third_party/libpng
+LIBPNG_SRCS := png.c pngerror.c pngget.c pngmem.c pngpread.c pngread.c pngrio.c \
+               pngrtran.c pngrutil.c pngset.c pngtrans.c pngwio.c pngwrite.c \
+               pngwtran.c pngwutil.c
+
+.PHONY: libpng
+libpng: user/libpng16.so.16
+
+user/libpng16.so.16: $(LIBPNG_DIR)/png.h user/libz.so.1
+	@[ -f $(LIBPNG_DIR)/pnglibconf.h ] || cp $(LIBPNG_DIR)/scripts/pnglibconf.h.prebuilt $(LIBPNG_DIR)/pnglibconf.h
+	$(MUSL_ELF_CC) -shared -fPIC -Os -I$(LIBPNG_DIR) -I$(ZLIB_DIR) \
+	    -Wl,-soname,libpng16.so.16 -o $@ \
+	    $(addprefix $(LIBPNG_DIR)/,$(LIBPNG_SRCS)) user/libz.so.1
+
+$(OBJ_DIR)/user/libpng16_blob.o: user/libpng16.so.16
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+user/pngtest.dynelf: user/pngtest.c user/libpng16.so.16
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(LIBPNG_DIR) -I$(ZLIB_DIR) \
+	    -Wl,-dynamic-linker,$(DOS_LDSO) user/pngtest.c \
+	    user/libpng16.so.16 user/libz.so.1 -o $@
+
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LIBGCC)
@@ -1249,7 +1279,8 @@ clean:
 	# ARCH switch always rebuilds them for the right target.
 	rm -f user/*.muslelf user/*.dynelf user/*.cxxelf \
 	      user/libgreet.so user/libcpplib.so user/libstdcxx.so \
-	      user/libgccs.so user/ldmusl.so user/rootfs.bin user/libz.so.1
+	      user/libgccs.so user/ldmusl.so user/rootfs.bin user/libz.so.1 \
+	      user/libpng16.so.16
 
 clean-all:
 	rm -rf build
