@@ -64,6 +64,7 @@
 #include "config.h"
 #include "task.h"
 #include "proc.h"                /* proc_exec_elf — x86_64 musl boot self-test */
+#include "pkg.h"                 /* pkg_init — provision ld.so for the x86_64 test hook */
 #include "timer.h"
 #include "vc.h"
 #include "lock.h"
@@ -429,19 +430,34 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * since x86_64 boots to a bare GUI desktop (no VC-bound text shell to type
      * `musltest` into).  Remove once the shell/VC path is fixed. */
     {
-        extern const unsigned char _binary_user_muslhello_muslelf_start[] __attribute__((weak));
-        extern const unsigned char _binary_user_muslhello_muslelf_end[]   __attribute__((weak));
-        if (_binary_user_muslhello_muslelf_start) {
-            unsigned long len = (unsigned long)(_binary_user_muslhello_muslelf_end -
-                                                _binary_user_muslhello_muslelf_start);
-            struct task* me = task_current();
-            int prev = me ? me->linux_abi : 0;
-            if (me) me->linux_abi = 1;
-            kprintf("x64-musltest: exec'ing a REAL static musl binary...\n");
-            int rc = proc_exec_elf(_binary_user_muslhello_muslelf_start, (size_t)len);
-            if (me) me->linux_abi = prev;
-            kprintf("x64-musltest: returned rc=%d\n", rc);
+        extern const unsigned char _binary_user_muslhello_muslelf_start[]    __attribute__((weak));
+        extern const unsigned char _binary_user_muslhello_muslelf_end[]      __attribute__((weak));
+        extern const unsigned char _binary_user_muslhellodyn_dynelf_start[]  __attribute__((weak));
+        extern const unsigned char _binary_user_muslhellodyn_dynelf_end[]    __attribute__((weak));
+        extern const unsigned char _binary_user_solibtest_dynelf_start[]     __attribute__((weak));
+        extern const unsigned char _binary_user_solibtest_dynelf_end[]       __attribute__((weak));
+        extern const unsigned char _binary_user_dlopentest_dynelf_start[]    __attribute__((weak));
+        extern const unsigned char _binary_user_dlopentest_dynelf_end[]      __attribute__((weak));
+        extern const unsigned char _binary_user_cpptest_cxxelf_start[]       __attribute__((weak));
+        extern const unsigned char _binary_user_cpptest_cxxelf_end[]         __attribute__((weak));
+        struct { const char* name; const unsigned char* s; const unsigned char* e; } tests[] = {
+            { "muslhello (static)", _binary_user_muslhello_muslelf_start,   _binary_user_muslhello_muslelf_end   },
+            { "muslhellodyn (dyn)", _binary_user_muslhellodyn_dynelf_start, _binary_user_muslhellodyn_dynelf_end },
+            { "solibtest (dso)",    _binary_user_solibtest_dynelf_start,    _binary_user_solibtest_dynelf_end    },
+            { "dlopentest",         _binary_user_dlopentest_dynelf_start,   _binary_user_dlopentest_dynelf_end   },
+            { "cpptest (C++)",      _binary_user_cpptest_cxxelf_start,      _binary_user_cpptest_cxxelf_end      },
+        };
+        pkg_init();                    /* provision /lib ld.so + .so's up front */
+        struct task* me = task_current();
+        int prev = me ? me->linux_abi : 0;
+        if (me) me->linux_abi = 1;
+        for (unsigned i = 0; i < sizeof(tests)/sizeof(tests[0]); i++) {
+            if (!tests[i].s) continue;
+            kprintf("x64-musltest[%s]: exec...\n", tests[i].name);
+            int rc = proc_exec_elf(tests[i].s, (size_t)(tests[i].e - tests[i].s));
+            kprintf("x64-musltest[%s]: rc=%d\n", tests[i].name, rc);
         }
+        if (me) me->linux_abi = prev;
     }
 #endif
 

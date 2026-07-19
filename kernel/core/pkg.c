@@ -562,12 +562,21 @@ static void rootfs_unpack(void) {
  * (/lib/ld-musl-i386.so.1).  When execve loads such a binary, the kernel reads
  * this file to load the interpreter (see proc.c).  Also exposed at /lib/libc.so
  * so ld.so can resolve a DT_NEEDED "libc.so" by the usual search path. */
+/* The canonical PT_INTERP path the arch's musl dynamic binaries carry.  Must
+ * match the Makefile's $(DOS_LDSO) and the -dynamic-linker the .dynelf/.cxxelf
+ * rules stamp in. */
+#if defined(__x86_64__)
+#define DOS_LDSO_PATH "/lib/ld-musl-x86_64.so.1"
+#else
+#define DOS_LDSO_PATH "/lib/ld-musl-i386.so.1"
+#endif
+
 static void ldso_provision(void) {
     if (!_binary_user_ldmusl_so_start) return;      /* musl shared not built */
     unsigned len = blob_len(_binary_user_ldmusl_so_start, _binary_user_ldmusl_so_end);
     vfs_mkdir("/lib");
-    write_file("/lib/ld-musl-i386.so.1", _binary_user_ldmusl_so_start, len);
-    write_file("/lib/libc.so",           _binary_user_ldmusl_so_start, len);
+    write_file(DOS_LDSO_PATH,   _binary_user_ldmusl_so_start, len);
+    write_file("/lib/libc.so",  _binary_user_ldmusl_so_start, len);
 
     /* A separate shared library for the DT_NEEDED search-path test (stage 5). */
     if (_binary_user_libgreet_so_start)

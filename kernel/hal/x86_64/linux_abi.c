@@ -46,6 +46,8 @@ extern uint64_t saved_rip;
 #define LNX_stat              4
 #define LNX_fstat             5
 #define LNX_lseek             8
+#define LNX_pread64          17
+#define LNX_pwrite64         18
 #define LNX_mmap              9
 #define LNX_mprotect         10
 #define LNX_munmap           11
@@ -87,6 +89,7 @@ extern uint64_t saved_rip;
 #define LNX_openat          257
 #define LNX_set_robust_list 273
 #define LNX_getrandom       318
+#define LNX_membarrier      324
 
 #define LNX_ENOSYS  38
 #define LNX_ENOTTY  25
@@ -231,6 +234,28 @@ void linux_syscall_dispatch(struct int_frame* f) {
         case LNX_lseek:
             f->rax = (uint64_t)sys_lseek((int)a0, (long)a1, (int)a2);
             return;
+
+        case LNX_pread64: {
+            /* pread64(fd, buf, count, offset) — positioned read that must NOT
+             * disturb the fd offset (musl's ld.so dlopen path reads .so headers
+             * this way).  Save/seek/read/restore around the plain fd cursor. */
+            int fd = (int)a0;
+            long cur = sys_lseek(fd, 0, 1 /*SEEK_CUR*/);
+            sys_lseek(fd, (long)a3, 0 /*SEEK_SET*/);
+            long r = sys_read(fd, (void*)a1, (size_t)a2);
+            if (cur >= 0) sys_lseek(fd, cur, 0 /*SEEK_SET*/);
+            f->rax = (uint64_t)r;
+            return;
+        }
+        case LNX_pwrite64: {
+            int fd = (int)a0;
+            long cur = sys_lseek(fd, 0, 1);
+            sys_lseek(fd, (long)a3, 0);
+            long r = sys_write(fd, (const void*)a1, (size_t)a2);
+            if (cur >= 0) sys_lseek(fd, cur, 0);
+            f->rax = (uint64_t)r;
+            return;
+        }
         case LNX_unlink:
             f->rax = (uint64_t)vfs_unlink((const char*)a0);
             return;
@@ -283,6 +308,7 @@ void linux_syscall_dispatch(struct int_frame* f) {
         case LNX_set_robust_list:
         case LNX_rt_sigprocmask:
         case LNX_rt_sigaction:
+        case LNX_membarrier:               /* UP + no reordering we care about */
         case LNX_fcntl:
             /* Best-effort success: no per-task signal mask / robust futex list /
              * fd flags tracked yet, but musl's startup + stdio paths only need
