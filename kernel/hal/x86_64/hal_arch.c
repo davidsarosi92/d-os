@@ -72,10 +72,36 @@ void hal_intr_restore(uint32_t cookie) {
  * i386, for the same reason: GDT needs the TSS address baked in.
  * --------------------------------------------------------------------------- */
 
+/* Arm the SYSCALL/SYSRET fast-syscall path (kernel/hal/x86_64/syscall.c) so
+ * `syscall` from ring 3 (x86_64 musl / Linux-ABI) reaches the kernel. */
+extern void syscall_init_64(void);
+
+/* Enable SSE/SSE2.  On x86_64 SSE2 is BASELINE — gcc (and therefore every musl/
+ * Linux binary the cross-toolchain produces) emits SSE for floating point AND
+ * for bulk memory ops, so ring-3 code faults with #UD unless the OS turns the
+ * unit on.  The kernel itself is built -mno-sse and never touches XMM, so we do
+ * NOT yet FXSAVE/FXRSTOR the XMM file across context switches — safe as long as
+ * at most one SSE-using user task runs at a time (today's excursion model).
+ * Concurrent SSE user tasks need per-task FXSAVE state — a follow-up.
+ *   CR0: clear EM (bit 2, "emulate FPU"), set MP (bit 1, "monitor coproc").
+ *   CR4: set OSFXSR (bit 9) + OSXMMEXCPT (bit 10). */
+static void enable_sse(void) {
+    uint64_t cr0, cr4;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1ull << 2);
+    cr0 |=  (1ull << 1);
+    __asm__ volatile ("mov %0, %%cr0" :: "r"(cr0));
+    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1ull << 9) | (1ull << 10);
+    __asm__ volatile ("mov %0, %%cr4" :: "r"(cr4));
+}
+
 void hal_arch_early_init(void) {
     tss_init();
     gdt_init();
     idt_init();
+    enable_sse();
+    syscall_init_64();
 }
 
 /* ---------------------------------------------------------------------------

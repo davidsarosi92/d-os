@@ -63,6 +63,7 @@
 #include "block.h"
 #include "config.h"
 #include "task.h"
+#include "proc.h"                /* proc_exec_elf — x86_64 musl boot self-test */
 #include "timer.h"
 #include "vc.h"
 #include "lock.h"
@@ -421,6 +422,28 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     /* M31 — watchdog: /proc/watchdog + the sweep task (per-task heartbeat +
      * per-CPU softlockup detection).  After init (spawns a detached task). */
     watchdog_init();
+
+#if defined(__x86_64__)
+    /* TEMP (x86_64 userland bring-up) — run the embedded static musl binary
+     * directly at boot to validate the SYSCALL-instruction path + linux_abi_64,
+     * since x86_64 boots to a bare GUI desktop (no VC-bound text shell to type
+     * `musltest` into).  Remove once the shell/VC path is fixed. */
+    {
+        extern const unsigned char _binary_user_muslhello_muslelf_start[] __attribute__((weak));
+        extern const unsigned char _binary_user_muslhello_muslelf_end[]   __attribute__((weak));
+        if (_binary_user_muslhello_muslelf_start) {
+            unsigned long len = (unsigned long)(_binary_user_muslhello_muslelf_end -
+                                                _binary_user_muslhello_muslelf_start);
+            struct task* me = task_current();
+            int prev = me ? me->linux_abi : 0;
+            if (me) me->linux_abi = 1;
+            kprintf("x64-musltest: exec'ing a REAL static musl binary...\n");
+            int rc = proc_exec_elf(_binary_user_muslhello_muslelf_start, (size_t)len);
+            if (me) me->linux_abi = prev;
+            kprintf("x64-musltest: returned rc=%d\n", rc);
+        }
+    }
+#endif
 
     {
         /* S.1: the boot shell is whatever provider shell.provider

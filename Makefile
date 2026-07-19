@@ -164,6 +164,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/m20_stubs.c \
       kernel/hal/x86_64/smp.c \
       kernel/hal/x86_64/syscall.c \
+      kernel/hal/x86_64/linux_abi.c \
       kernel/hal/x86/lapic.c \
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/pci.c \
@@ -174,7 +175,8 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/boot.s \
       kernel/hal/x86_64/isr_stubs.s \
       kernel/hal/x86_64/switch.s \
-      kernel/hal/x86_64/usermode.s
+      kernel/hal/x86_64/usermode.s \
+      kernel/hal/x86_64/syscall_entry.s
 
   ARCH_EXTRA_OBJS := kernel/hal/x86_64/ap_trampoline_blob.o \
                      user/hello_blob.o user/spin_blob.o
@@ -188,6 +190,17 @@ else ifeq ($(ARCH),x86_64)
   USER_BASE     := 0x40000000
   USER_OCARGS   := --output-target=elf64-x86-64 --binary-architecture=i386
   USER_CRT0_BUILD = nasm -f elf64 user/crt0_x86_64.s -o $(OBJ_DIR)/user/crt0.o
+
+  # §M36/§M37 (x86_64) — the musl userland for x86_64 comes from the PREBUILT
+  # musl.cc cross-toolchain (third_party/musl-cross-x86_64), whose sysroot IS a
+  # complete x86_64 musl (static libc.a + shared libc.so=ld.so + crt + a musl
+  # libstdc++).  No separate `make musl` needed — the prebuilt sysroot is it.
+  MUSL_SYSROOT := third_party/musl-cross-x86_64/x86_64-linux-musl
+  MUSL_ELF_CC  := third_party/musl-cross-x86_64/bin/x86_64-linux-musl-gcc
+  MUSL_ELF_CXX := third_party/musl-cross-x86_64/bin/x86_64-linux-musl-g++
+  ifneq ($(wildcard $(MUSL_SYSROOT)/lib/libc.a),)
+    ARCH_EXTRA_OBJS += user/muslhello_muslblob.o
+  endif
 
 else ifeq ($(ARCH),aarch64)
   # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
@@ -492,7 +505,8 @@ CORE_C_SRCS := \
     kernel/fs/exfat.c \
     kernel/mem/pmm.c \
     kernel/mem/kmalloc.c \
-    kernel/mem/slab.c
+    kernel/mem/slab.c \
+    kernel/core/random.c
 endif
 
 C_SRCS   := $(CORE_C_SRCS) $(ARCH_C_SRCS)
@@ -906,6 +920,15 @@ $(OBJ_DIR)/user/wlapp_blob.o: user/wlapp_$(ARCH).elf
 # any user/<name>.c → user/<name>.muslelf → <name>_muslblob.o (symbol
 # _binary_user_<name>_muslelf_start).  Add coreutils via MUSL_COREUTILS above.
 MUSL_CC_FLAGS := -m32 -static -fno-pie -Os -Wall
+ifeq ($(ARCH),x86_64)
+# x86_64: the prebuilt musl.cc cross-gcc driver links crt1/crti/libc.a/libgcc/
+# crtn itself; -static -no-pie + -Wl,-Ttext-segment relocates the whole image
+# (ELF headers included) to the d-os user base — same trick the i386 rule uses.
+user/%.muslelf: user/%.c $(MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -static -no-pie -Os -Wall \
+	    -Wl,-Ttext-segment=$(USER_BASE) $< -o $@
+else
 user/%.muslelf: user/%.c $(MUSL_LIBC)
 	@mkdir -p $(OBJ_DIR)/user
 	gcc $(MUSL_CC_FLAGS) -c user/$*.c -I$(MUSL_PREFIX)/include \
@@ -916,6 +939,7 @@ user/%.muslelf: user/%.c $(MUSL_LIBC)
 	    --start-group $(MUSL_PREFIX)/lib/libc.a \
 	    `gcc -m32 -print-libgcc-file-name` --end-group \
 	    $(MUSL_PREFIX)/lib/crtn.o
+endif
 
 # §M39 stage 2 — crypttest overrides the generic %.muslelf rule to ALSO compile
 # with Mbed TLS's headers and link its static libs (libmbedcrypto for the
@@ -952,8 +976,7 @@ user/ssltest.muslelf: user/ssltest.c $(MUSL_LIBC)
 
 $(OBJ_DIR)/user/%_muslblob.o: user/%.muslelf
 	@mkdir -p $(@D)
-	objcopy --input-target=binary --output-target=elf32-i386 \
-	    --binary-architecture=i386 $< $@
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
 
 # §M37 — DYNAMICALLY-linked musl programs.  Same compile, but linked as a PIE
 # (-pie) against the SHARED libc.so with the musl dynamic linker as PT_INTERP

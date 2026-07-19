@@ -53,6 +53,12 @@ struct tss64 {
 
 static struct tss64 tss;
 
+/* Mirror of tss.rsp0 read by the SYSCALL-instruction entry stub
+ * (syscall_entry.s): `syscall` does not switch stacks the way an int-gate
+ * does, so the stub loads the kernel stack from here.  Kept in lock-step with
+ * tss.rsp0 by tss_init / hal_set_kernel_stack below. */
+extern uint64_t syscall_kernel_rsp;
+
 /* Dedicated kernel stack used for ring-3 → ring-0 transitions, mirror
  * of the i386 syscall_stack.  4 KiB is plenty for a syscall handler;
  * deeper paths (nested IRQs etc.) use the regular kernel stack via
@@ -68,6 +74,7 @@ void tss_init(void) {
     for (uint32_t i = 0; i < sizeof(tss); i++) b[i] = 0;
 
     tss.rsp0 = (uint64_t)(uintptr_t)(syscall_stack + KSTACK_SIZE);
+    syscall_kernel_rsp = tss.rsp0;
 
     /* iomap_base == sizeof(tss) means "no I/O permission bitmap" —
      * any ring-3 IN/OUT traps with #GP (which is what we want; user
@@ -85,10 +92,22 @@ void tss_set_kernel_stack(uintptr_t sp) {
 void hal_set_kernel_stack(uintptr_t top) {
     tss.rsp0 = top ? (uint64_t)top
                    : (uint64_t)(uintptr_t)(syscall_stack + KSTACK_SIZE);
+    syscall_kernel_rsp = tss.rsp0;
 }
 
-/* M35 TLS — stub for now (x86_64 TLS uses the FS.base MSR; a later port). */
-void hal_set_tls_base(uintptr_t base) { (void)base; }
+/* M35 TLS (x86_64) — set the thread pointer.  On x86_64, thread-local storage
+ * lives at %fs (musl's __init_tls + arch_prctl(ARCH_SET_FS, p)), unlike i386's
+ * %gs GDT descriptor.  We program the FS.base MSR directly.  The scheduler
+ * calls this for the incoming task on every switch (task.c: `if (has_tls)
+ * hal_set_tls_base(tls_base)`), so per-task FS bases are restored for free —
+ * no per-CPU GDT descriptor juggling like i386 needs. */
+#define MSR_FS_BASE 0xC0000100u
+void hal_set_tls_base(uintptr_t base) {
+    __asm__ volatile ("wrmsr"
+                      :: "c"(MSR_FS_BASE),
+                         "a"((uint32_t)(uint64_t)base),
+                         "d"((uint32_t)((uint64_t)base >> 32)));
+}
 
 uintptr_t tss_get_addr(void)  { return (uintptr_t)&tss; }
 uint32_t  tss_get_limit(void) { return sizeof(tss) - 1; }

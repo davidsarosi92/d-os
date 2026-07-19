@@ -283,6 +283,15 @@ void isr_handler(struct int_frame* f) {
         return;
     }
 
+    /* int_no 0x81 is the sentinel the SYSCALL-instruction entry stub
+     * (syscall_entry.s) fabricates: a ring-3 x86_64 musl/Linux binary reached
+     * the kernel via `syscall`, so route straight to the Linux-ABI x86_64
+     * translator (SysV register convention: rax=num, rdi/rsi/rdx/r10/r8/r9). */
+    if (f->int_no == 0x81) {
+        linux_syscall_dispatch(f);
+        return;
+    }
+
     kprintf("unexpected vector %u at %p\n",
             (unsigned)f->int_no, (void*)(uintptr_t)f->rip);
 }

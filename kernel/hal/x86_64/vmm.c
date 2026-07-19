@@ -440,6 +440,23 @@ void vmm_space_unmap(struct vmm_space* s, uintptr_t virt) {
     invlpg(virt);
 }
 
+/* Change the protection of an already-mapped page WITHOUT touching its frame
+ * (the mprotect primitive — §M37: musl's mallocng maps a PROT_NONE reservation
+ * then mprotects the used part to R/W, and ld.so tightens RELRO to read-only).
+ * Preserves the OS-available SHARED bit.  Returns 0, or -1 if unmapped. */
+int vmm_space_protect(struct vmm_space* s, uintptr_t virt, uint32_t flags) {
+    uint64_t* pt = s ? walk_to_pt_root(s->pml4, virt, /*create*/0, 0)
+                     : walk_to_pt(virt, /*create*/0, 0);
+    if (!pt) return -1;
+    uint64_t pte = pt[IDX_PT(virt)];
+    if ((pte & PTE_P) == 0) return -1;             /* not present */
+    pt[IDX_PT(virt)] = (pte & PAGE_MASK_4K) | PTE_P
+                     | ((uint64_t)flags & (PTE_RW | PTE_US))
+                     | (pte & VMM_SHARED);
+    invlpg(virt);
+    return 0;
+}
+
 uintptr_t vmm_space_pd_phys(struct vmm_space* s) {
     return s ? s->pml4_phys : (uintptr_t)pml4;
 }

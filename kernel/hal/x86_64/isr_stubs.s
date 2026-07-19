@@ -148,8 +148,11 @@ ISR_NOERR 83
 ISR_NOERR 128
 
 ; -----------------------------------------------------------------------------
-; Common continuation.
+; Common continuation.  `global` so the SYSCALL-instruction entry stub
+; (syscall_entry.s) can fabricate an int-0x80-shaped frame and fall into this
+; shared GPR-save + isr_handler + iretq tail.
 ; -----------------------------------------------------------------------------
+global isr_common
 isr_common:
     push rax
     push rcx

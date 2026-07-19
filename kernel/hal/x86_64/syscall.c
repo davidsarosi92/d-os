@@ -45,6 +45,51 @@
 extern uint64_t saved_rsp;
 extern uint64_t saved_rip;
 
+/* The SYSCALL-instruction entry point (syscall_entry.s) — installed into the
+ * IA32_LSTAR MSR so `syscall` from ring 3 lands there. */
+extern void syscall_entry_64(void);
+
+/* ---- MSR helpers + fast-syscall (SYSCALL/SYSRET) bring-up (§M20.6.1) -------
+ *
+ * x86_64 musl issues `syscall` (not int 0x80), so a Linux-ABI process reaches
+ * the kernel through the SYSCALL instruction.  We arm it here: enable SCE in
+ * EFER, point LSTAR at our entry stub, set STAR's kernel selectors, and mask
+ * the dangerous RFLAGS bits (notably IF) on entry.  We RETURN via iretq (see
+ * syscall_entry.s), so STAR's user half (used only by SYSRET) is set to a sane
+ * value but never actually consumed. */
+#define MSR_EFER   0xC0000080u
+#define MSR_STAR   0xC0000081u
+#define MSR_LSTAR  0xC0000082u
+#define MSR_FMASK  0xC0000084u
+
+static inline void wrmsr(uint32_t msr, uint64_t val) {
+    __asm__ volatile ("wrmsr"
+                      :: "c"(msr), "a"((uint32_t)val), "d"((uint32_t)(val >> 32)));
+}
+static inline uint64_t rdmsr(uint32_t msr) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+void syscall_init_64(void) {
+    /* EFER.SCE (bit 0) — arm the SYSCALL/SYSRET instructions. */
+    wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1u);
+
+    /* STAR[47:32] = kernel CS (0x08): SYSCALL loads CS=0x08, SS=0x10.
+     * STAR[63:48] = user base for SYSRET; we iretq back so it is unused, but
+     * set it to 0x1B so a future SYSRET path would find sane user selectors. */
+    wrmsr(MSR_STAR, ((uint64_t)0x1Bu << 48) | ((uint64_t)0x08u << 32));
+
+    /* LSTAR = 64-bit entry RIP. */
+    wrmsr(MSR_LSTAR, (uint64_t)(uintptr_t)syscall_entry_64);
+
+    /* FMASK — RFLAGS bits cleared on entry.  IF(0x200) so interrupts are off
+     * (matching the int-0x80 interrupt gate); plus TF/DF/NT/AC/direction, the
+     * standard Linux mask (0x47700). */
+    wrmsr(MSR_FMASK, 0x47700u);
+}
+
 void syscall_dispatch(struct int_frame* f) {
     switch (f->rax) {
         case SYS_PRINT: {
