@@ -264,6 +264,10 @@ else ifeq ($(ARCH),x86_64)
   ifneq ($(wildcard user/libcss.so.0),)
     ARCH_EXTRA_OBJS += user/libcss0_blob.o user/csstest_dynblob.o
   endif
+  # libdom — DOM (deps wapcaplet+hubbub+parserutils); 97 TUs → prebuilt-.so guard.
+  ifneq ($(wildcard user/libdom.so.0),)
+    ARCH_EXTRA_OBJS += user/libdom0_blob.o user/domtest_dynblob.o
+  endif
 
 else ifeq ($(ARCH),aarch64)
   # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
@@ -1441,6 +1445,29 @@ user/csstest.dynelf: user/csstest.c user/libcss.so.0
 	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(LCSS_DIR)/include -I$(LWC_DIR)/include \
 	    -Wl,-dynamic-linker,$(DOS_LDSO) user/csstest.c \
 	    user/libcss.so.0 user/libwapcaplet.so.0 user/libparserutils.so.0 -o $@
+
+# libdom — the DOM; deps libwapcaplet + libhubbub + libparserutils.  Compiles
+# src/ + the hubbub binding (bindings/hubbub, HTML→DOM).  97 TUs → own target.
+LDOM_DIR := third_party/libdom
+.PHONY: libdom
+libdom: user/libdom.so.0
+user/libdom.so.0: $(LDOM_DIR)/Makefile user/libwapcaplet.so.0 user/libhubbub.so.0 user/libparserutils.so.0
+	$(MUSL_ELF_CC) -shared $(NSLIB_CFLAGS) -I$(LDOM_DIR)/include -I$(LDOM_DIR)/src \
+	    -I$(LDOM_DIR)/bindings -I$(LWC_DIR)/include -I$(LPU_DIR)/include \
+	    -I$(LHB_DIR)/include -Wl,-soname,libdom.so.0 -o $@ \
+	    $$(find $(LDOM_DIR)/src $(LDOM_DIR)/bindings/hubbub -name '*.c') \
+	    user/libwapcaplet.so.0 user/libhubbub.so.0 user/libparserutils.so.0
+
+$(OBJ_DIR)/user/libdom0_blob.o: user/libdom.so.0
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+user/domtest.dynelf: user/domtest.c user/libdom.so.0
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(LDOM_DIR)/include -I$(LWC_DIR)/include \
+	    -Wl,-dynamic-linker,$(DOS_LDSO) user/domtest.c \
+	    user/libdom.so.0 user/libhubbub.so.0 user/libwapcaplet.so.0 \
+	    user/libparserutils.so.0 -o $@
 
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)

@@ -463,6 +463,8 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
         extern const unsigned char _binary_user_gtest_dynelf_end[]           __attribute__((weak));
         extern const unsigned char _binary_user_csstest_dynelf_start[]       __attribute__((weak));
         extern const unsigned char _binary_user_csstest_dynelf_end[]         __attribute__((weak));
+        extern const unsigned char _binary_user_domtest_dynelf_start[]       __attribute__((weak));
+        extern const unsigned char _binary_user_domtest_dynelf_end[]         __attribute__((weak));
         struct { const char* name; const unsigned char* s; const unsigned char* e; } tests[] = {
             { "muslhello (static)", _binary_user_muslhello_muslelf_start,   _binary_user_muslhello_muslelf_end   },
             { "muslhellodyn (dyn)", _binary_user_muslhellodyn_dynelf_start, _binary_user_muslhellodyn_dynelf_end },
@@ -479,6 +481,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
             { "hbbtest (libhubbub)",_binary_user_hbbtest_dynelf_start,      _binary_user_hbbtest_dynelf_end      },
             { "gtest (libnsgif)",   _binary_user_gtest_dynelf_start,        _binary_user_gtest_dynelf_end        },
             { "csstest (libcss)",   _binary_user_csstest_dynelf_start,      _binary_user_csstest_dynelf_end      },
+            { "domtest (libdom)",   _binary_user_domtest_dynelf_start,      _binary_user_domtest_dynelf_end      },
         };
         pkg_init();                    /* provision /lib ld.so + .so's up front */
         /* Provision an execve target for forktest64: write the muslhello blob
