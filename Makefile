@@ -244,6 +244,11 @@ else ifeq ($(ARCH),x86_64)
   ifneq ($(wildcard user/libharfbuzz.so.0),)
     ARCH_EXTRA_OBJS += user/libharfbuzz0_blob.o user/hbtest_dynblob.o
   endif
+  # §M42 — NetSurf's own component libraries, each a store package (built from
+  # git.netsurf-browser.org sources; scripts/fetch-netsurf-libs.sh).
+  ifneq ($(wildcard third_party/libwapcaplet/src/libwapcaplet.c),)
+    ARCH_EXTRA_OBJS += user/libwapcaplet0_blob.o user/wctest_dynblob.o
+  endif
 
 else ifeq ($(ARCH),aarch64)
   # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
@@ -1310,6 +1315,28 @@ user/hbtest.dynelf: user/hbtest.c user/libharfbuzz.so.0
 	    -Wl,-dynamic-linker,$(DOS_LDSO) user/hbtest.c \
 	    user/libharfbuzz.so.0 -o $@
 
+# -----------------------------------------------------------------------------
+# §M42 — NetSurf's own component libraries (store packages).  Built straight
+# from the sources (their netsurf-buildsystem is bypassed — we just compile the
+# .c set into a .so), cross-linked against musl + their pinned deps by path.
+# -----------------------------------------------------------------------------
+NSLIB_CFLAGS := -fPIC -Os -w -DNDEBUG
+
+# libwapcaplet — string interning (single TU), no deps.
+user/libwapcaplet.so.0: third_party/libwapcaplet/src/libwapcaplet.c
+	$(MUSL_ELF_CC) -shared $(NSLIB_CFLAGS) -Ithird_party/libwapcaplet/include \
+	    -Wl,-soname,libwapcaplet.so.0 -o $@ third_party/libwapcaplet/src/libwapcaplet.c
+
+$(OBJ_DIR)/user/libwapcaplet0_blob.o: user/libwapcaplet.so.0
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+user/wctest.dynelf: user/wctest.c user/libwapcaplet.so.0
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -Ithird_party/libwapcaplet/include \
+	    -Wl,-dynamic-linker,$(DOS_LDSO) user/wctest.c \
+	    user/libwapcaplet.so.0 -o $@
+
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LIBGCC)
@@ -1345,7 +1372,7 @@ clean:
 	rm -f user/*.muslelf user/*.dynelf user/*.cxxelf \
 	      user/libgreet.so user/libcpplib.so user/libstdcxx.so \
 	      user/libgccs.so user/ldmusl.so user/rootfs.bin user/libz.so.1 \
-	      user/libpng16.so.16
+	      user/libpng16.so.16 user/libwapcaplet.so.0
 
 clean-all:
 	rm -rf build
