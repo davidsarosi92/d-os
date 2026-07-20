@@ -255,6 +255,9 @@ else ifeq ($(ARCH),x86_64)
   ifneq ($(wildcard third_party/libhubbub/Makefile),)
     ARCH_EXTRA_OBJS += user/libhubbub0_blob.o user/hbbtest_dynblob.o
   endif
+  ifneq ($(wildcard third_party/libnsgif/src/gif.c),)
+    ARCH_EXTRA_OBJS += user/libnsgif0_blob.o user/gtest_dynblob.o
+  endif
 
 else ifeq ($(ARCH),aarch64)
   # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
@@ -1386,6 +1389,22 @@ user/hbbtest.dynelf: user/hbbtest.c user/libhubbub.so.0
 	    -Wl,-dynamic-linker,$(DOS_LDSO) user/hbbtest.c \
 	    user/libhubbub.so.0 user/libparserutils.so.0 -o $@
 
+# libnsgif — GIF decoder (lzw + gif), no deps.
+LNG_DIR := third_party/libnsgif
+user/libnsgif.so.0: $(LNG_DIR)/src/gif.c
+	$(MUSL_ELF_CC) -shared $(NSLIB_CFLAGS) -I$(LNG_DIR)/include -I$(LNG_DIR)/src \
+	    -Wl,-soname,libnsgif.so.0 -o $@ $(shell find $(LNG_DIR)/src -name '*.c')
+
+$(OBJ_DIR)/user/libnsgif0_blob.o: user/libnsgif.so.0
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+user/gtest.dynelf: user/gtest.c user/libnsgif.so.0
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(LNG_DIR)/include \
+	    -Wl,-dynamic-linker,$(DOS_LDSO) user/gtest.c \
+	    user/libnsgif.so.0 -o $@
+
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LIBGCC)
@@ -1422,7 +1441,7 @@ clean:
 	      user/libgreet.so user/libcpplib.so user/libstdcxx.so \
 	      user/libgccs.so user/ldmusl.so user/rootfs.bin user/libz.so.1 \
 	      user/libpng16.so.16 user/libwapcaplet.so.0 user/libparserutils.so.0 \
-	      user/libhubbub.so.0
+	      user/libhubbub.so.0 user/libnsgif.so.0
 
 clean-all:
 	rm -rf build
