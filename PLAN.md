@@ -3778,6 +3778,30 @@ frontend, Tier 2+); §M34 + §M35 (Tier 2 threads, Tier 3 multi-process);
 §M41 (pragmatically, Tier 3); §M23 (soft — media only).  In short: the
 capstone of the entire cluster.
 
+**Current state (2026-07-20) — Tier 1 component libs COMPLETE (x86_64).**  The
+NetSurf core library set is ported + running as store packages, each with a
+ring-3 dyn-musl smoke test at boot (gated behind `x86_64.boot-selftest`):
+libwapcaplet (string intern), libparserutils, **libhubbub** (HTML5 parse),
+**libcss** (CSS), **libdom** (DOM), **libnsgif** (GIF) and **libnsbmp** (BMP/ICO)
+— the last added this session; libnsutils is fetched.  Support libs from §M38/§M39
+(zlib, libpng, freetype, harfbuzz, mbedTLS) are also in the store.  **Next
+concrete steps for the browser binary (Tier 1 bring-up, its own multi-session
+push):**
+1. Fetch the remaining NetSurf deps: `libnsutils` (fetched), `libnslog`,
+   `libjpeg-turbo` (JPEG), and decide the fetcher — NetSurf can use its own
+   `fetch` over our M24/§M39 TLS, or a curl shim.
+2. Pick the frontend.  Two options: (a) **libnsfb framebuffer frontend** — port
+   `libnsfb` with a new surface backend targeting our linear framebuffer (or a
+   `gui_window` blit, like the Wayland bridge); simplest, no §M40.  (b) **Wayland
+   frontend** over §M26 — needs the upstream libwayland-client port (§M40), so
+   heavier.  Recommendation: start with (a) libnsfb → framebuffer.
+3. Fetch the `netsurf` app source; build the framebuffer frontend against the
+   store libs + freetype fonts (provision a TTF); resolve its remaining core-lib
+   API glue.
+4. DoD: `netsurf https://example.com` renders text+layout into a `gui_window`;
+   links clickable.  Start headless (render to a memory surface, dump), then wire
+   to the desktop.
+
 ---
 
 ## §M-registry (parked) — hierarchical config store

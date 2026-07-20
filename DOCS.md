@@ -3671,6 +3671,16 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-20 — §M42: libnsbmp (x86_64) — the BMP/ICO decoder — store package.**
+  Completes the NetSurf image-decoder set alongside libnsgif.  Ported pristine
+  from git.netsurf-browser.org, cross-built vs musl into a versioned store
+  package (`/store/…-libnsbmp-1.0.0`, soname `libnsbmp.so.0`), provisioned by
+  `pkg_init`.  Boot self-test `btest` (dyn-musl, gated behind
+  `x86_64.boot-selftest`): `bmp_analyse` + `bmp_decode` a tiny embedded 1×1
+  24-bit BMP → 1×1, `BMP_OK`.  Same session also fetched `libnsutils`.  With this
+  the Tier-1 NetSurf core libs (wapcaplet/parserutils/hubbub/css/dom/nsgif/nsbmp)
+  are all ported + running; PLAN.md §M42 has the concrete next steps toward the
+  browser binary (frontend = libnsfb→framebuffer recommended).
 - **2026-07-20 — x86_64 boots to an interactive shell (VC-bind confirmed).**  The
   arch-generic VC + shell spawn in `kernel_main` already binds the boot shell to
   the root framebuffer VC and takes keyboard input on x86_64 — verified by boot

@@ -606,6 +606,8 @@ extern const unsigned char _binary_user_libcss_so_0_start[]         __attribute_
 extern const unsigned char _binary_user_libcss_so_0_end[]           __attribute__((weak));
 extern const unsigned char _binary_user_libdom_so_0_start[]         __attribute__((weak));
 extern const unsigned char _binary_user_libdom_so_0_end[]           __attribute__((weak));
+extern const unsigned char _binary_user_libnsbmp_so_0_start[]       __attribute__((weak));
+extern const unsigned char _binary_user_libnsbmp_so_0_end[]         __attribute__((weak));
 
 /* §M38: the C++ runtime .so's (from the musl C++ toolchain) + the demo C++
  * library, provisioned into /lib so ld.so resolves a C++ program's DT_NEEDED
@@ -631,6 +633,7 @@ static struct pkg_recipe rc_hubbub;
 static struct pkg_recipe rc_nsgif;
 static struct pkg_recipe rc_libcss;
 static struct pkg_recipe rc_libdom;
+static struct pkg_recipe rc_nsbmp;
 
 /* The version string of the embedded runtime musl — arch-specific (the i386
  * build fetches+builds musl 1.2.5; the x86_64 prebuilt musl.cc sysroot ships
@@ -866,6 +869,16 @@ static void ldso_provision(void) {
             .abi="native", .soname="libdom.so.0", .is_libc=0 };
         pkg_register(&rc_libdom);
         pkg_install("libdom");
+    }
+    if (_binary_user_libnsbmp_so_0_start) {
+        rc_nsbmp = (struct pkg_recipe){ .id="libnsbmp", .name="libnsbmp",
+            .version="1.0.0", .deps="",
+            .content=_binary_user_libnsbmp_so_0_start,
+            .content_len=blob_len(_binary_user_libnsbmp_so_0_start,
+                                  _binary_user_libnsbmp_so_0_end),
+            .abi="native", .soname="libnsbmp.so.0", .is_libc=0 };
+        pkg_register(&rc_nsbmp);
+        pkg_install("libnsbmp");
     }
 }
 

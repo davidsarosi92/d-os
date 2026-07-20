@@ -264,6 +264,9 @@ else ifeq ($(ARCH),x86_64)
   ifneq ($(wildcard third_party/libnsgif/src/gif.c),)
     ARCH_EXTRA_OBJS += user/libnsgif0_blob.o user/gtest_dynblob.o
   endif
+  ifneq ($(wildcard third_party/libnsbmp/src/libnsbmp.c),)
+    ARCH_EXTRA_OBJS += user/libnsbmp0_blob.o user/btest_dynblob.o
+  endif
   # libcss — CSS engine; heavy codegen (gen_parser host tool + per-property
   # parsers + python select generator) → slow, guarded on the PREBUILT .so
   # (run `make libcss`).
@@ -1464,6 +1467,22 @@ user/gtest.dynelf: user/gtest.c user/libnsgif.so.0
 	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(LNG_DIR)/include \
 	    -Wl,-dynamic-linker,$(DOS_LDSO) user/gtest.c \
 	    user/libnsgif.so.0 -o $@
+
+# libnsbmp — BMP/ICO decoder, no deps (completes the NetSurf image-decoder set).
+LNB_DIR := third_party/libnsbmp
+user/libnsbmp.so.0: $(LNB_DIR)/src/libnsbmp.c
+	$(MUSL_ELF_CC) -shared $(NSLIB_CFLAGS) -I$(LNB_DIR)/include -I$(LNB_DIR)/src \
+	    -Wl,-soname,libnsbmp.so.0 -o $@ $(shell find $(LNB_DIR)/src -name '*.c')
+
+$(OBJ_DIR)/user/libnsbmp0_blob.o: user/libnsbmp.so.0
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+user/btest.dynelf: user/btest.c user/libnsbmp.so.0
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(LNB_DIR)/include \
+	    -Wl,-dynamic-linker,$(DOS_LDSO) user/btest.c \
+	    user/libnsbmp.so.0 -o $@
 
 # libcss — the CSS parser/selection engine.  Deps libwapcaplet + libparserutils.
 # Heavy codegen first (own target, minutes under emulation): a host gen_parser
