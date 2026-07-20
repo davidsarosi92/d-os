@@ -3620,6 +3620,23 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-20 — §M42 NetSurf libraries: all six core libs run on x86_64.**  The
+  browser's parsing/DOM/CSS/image foundation, each a versioned content-addressed
+  STORE PACKAGE with a correct dependency closure, cross-built vs musl from
+  git.netsurf-browser.org sources (`scripts/fetch-netsurf-libs.sh`), bypassing
+  the netsurf-buildsystem (compile the `.c` set into a `.so`): libwapcaplet
+  0.4.3, libparserutils 0.2.5 (perl-generated charset table), libhubbub 0.3.8
+  →parserutils (perl entities + gperf element-type; Dockerfile gained gperf),
+  libnsgif 1.0.0, libcss 0.9.2 →wapcaplet+parserutils (a host `gen_parser`
+  builds 119 per-property parsers + a python select generator; `-fcommon`),
+  libdom 0.4.2 →wapcaplet+hubbub+parserutils.  Self-tests (wctest/putest/hbbtest/
+  gtest/csstest/domtest) parse real HTML, resolve charsets, decode a GIF, parse
+  a stylesheet, and build DOM strings — sixteen x86_64 boot self-tests green.
+  The heavy libs (libcss/libdom/…) are `make <lib>` targets, blob-guarded on
+  the prebuilt `.so`.  Also this session (§4 refs pending): the x86_64 userland
+  port, runtime musl + support libs as store packages, a modular pkg backend,
+  and universal component versioning.
+
 - **2026-07-19 — x86_64 userland port: unmodified musl runs on x86_64.**  Full
   parity with i386's musl userland (bar signal delivery).  Six x86_64 boot
   self-tests green: static hello, dynamic linking (ld.so), a DT_NEEDED `.so`,
