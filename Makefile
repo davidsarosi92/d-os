@@ -103,7 +103,7 @@ ifeq ($(ARCH),i386)
   # (third_party/cacert.pem, provisioned to /etc/ssl/cert.pem at boot).
   ifneq ($(wildcard third_party/mbedtls-i686/lib/libmbedcrypto.a),)
     ARCH_EXTRA_OBJS += user/crypttest_muslblob.o user/ssltest_muslblob.o \
-                       user/httpstest_muslblob.o
+                       user/httpstest_muslblob.o user/wget_muslblob.o
     ifneq ($(wildcard third_party/cacert.pem),)
       ARCH_EXTRA_OBJS += third_party/cacert_blob.o
     endif
@@ -1058,6 +1058,23 @@ user/httpstest.muslelf: user/httpstest.c $(MUSL_LIBC)
 	ld -m elf_i386 -static -Ttext-segment=$(USER_BASE) -e _start -o $@ \
 	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
 	    $(OBJ_DIR)/user/httpstest.muslo \
+	    --start-group \
+	    $(MBEDTLS_PREFIX)/lib/libmbedtls.a $(MBEDTLS_PREFIX)/lib/libmbedx509.a \
+	    $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a $(MUSL_PREFIX)/lib/libc.a \
+	    `gcc -m32 -print-libgcc-file-name` --end-group \
+	    $(MUSL_PREFIX)/lib/crtn.o
+
+# §M39 — wget: the HTTP/HTTPS download front-end.  Same mbedTLS static link as
+# httpstest (TLS over a live M24 socket + the CA bundle), URL + optional file
+# from argv.
+user/wget.muslelf: user/wget.c $(MUSL_LIBC)
+	@mkdir -p $(OBJ_DIR)/user
+	gcc $(MUSL_CC_FLAGS) -c user/wget.c \
+	    -I$(MUSL_PREFIX)/include -I$(MBEDTLS_PREFIX)/include \
+	    -o $(OBJ_DIR)/user/wget.muslo
+	ld -m elf_i386 -static -Ttext-segment=$(USER_BASE) -e _start -o $@ \
+	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
+	    $(OBJ_DIR)/user/wget.muslo \
 	    --start-group \
 	    $(MBEDTLS_PREFIX)/lib/libmbedtls.a $(MBEDTLS_PREFIX)/lib/libmbedx509.a \
 	    $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a $(MUSL_PREFIX)/lib/libc.a \

@@ -70,6 +70,8 @@ extern uint32_t saved_eip;
 #define LNX_fcntl64        221
 #define LNX_set_tid_address 258
 #define LNX_openat         295
+#define LNX_poll           168   /* musl's DNS resolver waits on the UDP socket
+                                  * with poll(); i386 struct pollfd == ours.    */
 #define LNX_socketcall     102   /* §M39 3b: musl i386 routes ALL BSD-socket
                                   * ops through this multiplexer (SYS_SOCKET…). */
 /* Direct i386 socket syscalls (Linux 4.3+).  musl PREFERS these and only falls
@@ -83,7 +85,9 @@ extern uint32_t saved_eip;
 #define LNX_getsockname    367
 #define LNX_getpeername    368
 #define LNX_sendto         369
+#define LNX_sendmsg        370
 #define LNX_recvfrom       371
+#define LNX_recvmsg        372
 #define LNX_shutdown       373
 
 #define LNX_ENOSYS  38
@@ -149,6 +153,21 @@ static int linux_open_flags(int lf) {
 
 /* Linux i386 struct iovec (for writev). */
 struct lnx_iovec { void* iov_base; uint32_t iov_len; };
+
+/* Linux i386 `struct msghdr` (bits/socket.h) — the argument sendmsg()/recvmsg()
+ * hand us.  musl's DNS resolver (__res_msend) receives every answer via
+ * recvmsg() (single-iovec, msg_name = the source sockaddr it verifies the reply
+ * came from), so getaddrinfo() cannot work without this.  All fields are 32-bit
+ * on i386 (pointers + size_t). */
+struct lnx_msghdr {
+    void*             msg_name;        /* optional source/dest sockaddr        */
+    uint32_t          msg_namelen;     /* in: room; out: actual addr length    */
+    struct lnx_iovec* msg_iov;         /* scatter/gather buffers               */
+    uint32_t          msg_iovlen;      /* iovec count                          */
+    void*             msg_control;     /* ancillary data (unused here)         */
+    uint32_t          msg_controllen;
+    int               msg_flags;       /* out: MSG_TRUNC/… (we report 0)       */
+};
 
 /* Linux i386 `struct stat64` (asm/stat.h) — the layout SYS_fstat64 fills and
  * musl copies from.  ld.so's map_library fstats a .so to learn its size before
@@ -227,6 +246,51 @@ static void hostorder_to_sockaddr(struct lnx_sockaddr_in* sa, uint32_t* addrlen,
     if (addrlen) *addrlen = (uint32_t)sizeof tmp;
 }
 
+/* recvmsg(fd, msg, flags) — the resolver's receive path.  A UDP datagram is
+ * delivered into the first iovec (musl's __res_msend uses a single iovec sized
+ * >= 512); sys_recvfrom pump-polls the RX ring.  Crucially we fill msg_name with
+ * the datagram's source sockaddr: musl DROPS any reply whose source doesn't
+ * match a nameserver it queried, so an unfilled msg_name would fail resolution
+ * silently.  MSG_TRUNC is never reported (we deliver whole datagrams). */
+static long linux_recvmsg(int fd, struct lnx_msghdr* mh, int flags) {
+    (void)flags;
+    if (!mh || !mh->msg_iov || mh->msg_iovlen == 0) return -LNX_EOPNOTSUPP;
+    struct lnx_iovec* iov = &mh->msg_iov[0];
+    uint32_t ip = 0; int port = 0;
+    long n = sys_recvfrom(fd, iov->iov_base, iov->iov_len, &ip, &port);
+    if (n < 0) return n;
+    if (mh->msg_name) {
+        uint32_t namelen = mh->msg_namelen;
+        hostorder_to_sockaddr((struct lnx_sockaddr_in*)mh->msg_name, &namelen, ip, port);
+        mh->msg_namelen = namelen;
+    }
+    mh->msg_flags = 0;
+    return n;
+}
+
+/* sendmsg(fd, msg, flags) — gather the iovecs and send as one message.  Used by
+ * musl's TCP-fallback DNS path (2-byte length prefix + query); a connected
+ * stream (no msg_name) rides sys_write, an explicit peer rides sys_sendto. */
+static long linux_sendmsg(int fd, const struct lnx_msghdr* mh, int flags) {
+    (void)flags;
+    if (!mh || !mh->msg_iov) return -LNX_EOPNOTSUPP;
+    uint8_t buf[1024];
+    size_t total = 0;
+    for (uint32_t i = 0; i < mh->msg_iovlen; i++) {
+        const struct lnx_iovec* v = &mh->msg_iov[i];
+        const uint8_t* p = (const uint8_t*)v->iov_base;
+        for (uint32_t k = 0; k < v->iov_len && total < sizeof buf; k++)
+            buf[total++] = p[k];
+    }
+    if (mh->msg_name) {                              /* datagram to a peer */
+        uint32_t ip; int port;
+        if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)mh->msg_name, &ip, &port) != 0)
+            return -LNX_EAFNOSUPPORT;
+        return sys_sendto(fd, buf, total, ip, port);
+    }
+    return sys_write(fd, buf, total);                /* connected stream */
+}
+
 /* §M39 3b — Linux socketcall(call, args[]) demultiplexer.  musl on i386 funnels
  * socket()/connect()/sendto()/recv()… through syscall 102, passing the call
  * number in ebx and a pointer to an array of the call's word-sized args in ecx.
@@ -283,6 +347,10 @@ static long linux_socketcall(int call, uint32_t* a) {
             if (n >= 0 && src) hostorder_to_sockaddr(src, addrlen, ip, port);
             return n;
         }
+        case LSOC_SENDMSG:
+            return linux_sendmsg((int)a[0], (const struct lnx_msghdr*)a[1], (int)a[2]);
+        case LSOC_RECVMSG:
+            return linux_recvmsg((int)a[0], (struct lnx_msghdr*)a[1], (int)a[2]);
         case LSOC_SHUTDOWN:
             return 0;                              /* close() does the teardown */
         case LSOC_SETSOCKOPT:
@@ -523,6 +591,15 @@ void linux_syscall_dispatch(struct int_frame* f) {
             f->eax = (uint32_t)(task_current() ? task_current()->pid : 0);
             return;
 
+        case LNX_poll:
+            /* poll(fds=ebx, nfds=ecx, timeout_ms=edx).  The Linux i386 struct
+             * pollfd is byte-identical to ours and POLLIN/POLLOUT share values,
+             * so hand the array straight to sys_poll.  musl's resolver polls the
+             * UDP socket here; sys_poll reports a netsock ready and recvmsg then
+             * pump-reads the datagram. */
+            f->eax = (uint32_t)sys_poll((struct pollfd*)f->ebx, (int)f->ecx, (int)f->edx);
+            return;
+
         case LNX_socketcall:
             /* socketcall(call=ebx, args=ecx) — see linux_socketcall(). */
             f->eax = (uint32_t)linux_socketcall((int)f->ebx, (uint32_t*)f->ecx);
@@ -533,6 +610,7 @@ void linux_syscall_dispatch(struct int_frame* f) {
         case LNX_socket:      case LNX_bind:       case LNX_connect:
         case LNX_getsockopt:  case LNX_setsockopt: case LNX_getsockname:
         case LNX_getpeername: case LNX_sendto:     case LNX_recvfrom:
+        case LNX_sendmsg:     case LNX_recvmsg:
         case LNX_shutdown: {
             static const struct { uint32_t nr; int call; } map[] = {
                 { LNX_socket,      LSOC_SOCKET      },
@@ -544,6 +622,8 @@ void linux_syscall_dispatch(struct int_frame* f) {
                 { LNX_getpeername, LSOC_GETPEERNAME },
                 { LNX_sendto,      LSOC_SENDTO      },
                 { LNX_recvfrom,    LSOC_RECVFROM    },
+                { LNX_sendmsg,     LSOC_SENDMSG     },
+                { LNX_recvmsg,     LSOC_RECVMSG     },
                 { LNX_shutdown,    LSOC_SHUTDOWN    },
             };
             uint32_t args[6] = { f->ebx, f->ecx, f->edx, f->esi, f->edi, f->ebp };

@@ -20,6 +20,8 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 #include <mbedtls/ssl.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
@@ -30,54 +32,6 @@
 #define HOST "example.com"
 #define PORT 443
 #define CA_PATH "/etc/ssl/cert.pem"
-
-/* ---- manual DNS (same wire format as netmusl.c) -------------------------- */
-static int dns_name(const char *host, unsigned char *out) {
-    int op = 0, lp = 0, ls = 0;
-    out[op++] = 0;
-    for (const char *c = host;; c++) {
-        if (*c == '.' || *c == '\0') {
-            out[ls] = (unsigned char)lp; lp = 0; ls = op;
-            if (*c == '\0') break;
-            out[op++] = 0;
-        } else { out[op++] = (unsigned char)*c; lp++; }
-    }
-    out[op++] = 0;
-    return op;
-}
-static unsigned rd16(const unsigned char *p) { return (unsigned)((p[0] << 8) | p[1]); }
-
-static unsigned resolve(const char *host) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return 0;
-    unsigned char q[512]; int o = 0;
-    q[o++] = 0x12; q[o++] = 0x34; q[o++] = 0x01; q[o++] = 0x00;
-    q[o++] = 0; q[o++] = 1; q[o++] = 0; q[o++] = 0; q[o++] = 0; q[o++] = 0; q[o++] = 0; q[o++] = 0;
-    o += dns_name(host, q + o);
-    q[o++] = 0; q[o++] = 1; q[o++] = 0; q[o++] = 1;
-    struct sockaddr_in ns;
-    memset(&ns, 0, sizeof ns);
-    ns.sin_family = AF_INET;
-    ns.sin_port = htons(53);
-    ns.sin_addr.s_addr = htonl((10u << 24) | (2u << 8) | 3u);   /* 10.0.2.3 */
-    if (sendto(fd, q, (size_t)o, 0, (struct sockaddr *)&ns, sizeof ns) < 0) { close(fd); return 0; }
-    unsigned char r[512];
-    long n = recvfrom(fd, r, sizeof r, 0, NULL, NULL);
-    close(fd);
-    if (n <= 0) return 0;
-    int off = 12; while (off < n && r[off]) off += 1 + r[off]; off += 1 + 4;
-    unsigned anc = rd16(r + 6);
-    for (unsigned i = 0; i < anc && off + 12 <= n; i++) {
-        if ((r[off] & 0xC0) == 0xC0) off += 2;
-        else { while (off < n && r[off]) off += 1 + r[off]; off += 1; }
-        unsigned type = rd16(r + off), rdl = rd16(r + off + 8); off += 10;
-        if (type == 1 && rdl == 4)
-            return ((unsigned)r[off] << 24) | ((unsigned)r[off + 1] << 16) |
-                   ((unsigned)r[off + 2] << 8) | (unsigned)r[off + 3];
-        off += rdl;
-    }
-    return 0;
-}
 
 /* ---- a blocking BIO over an M24 TCP socket ------------------------------- */
 /* net_sockets.h (with its MBEDTLS_ERR_NET_*) is not part of this build; any
@@ -94,21 +48,31 @@ static int bio_recv(void *ctx, unsigned char *b, size_t n) {
 }
 
 int main(void) {
-    unsigned ip = resolve(HOST);
-    if (!ip) { printf("https: DNS resolve failed\n"); return 1; }
+    /* Resolve the hostname through musl's OWN getaddrinfo() — the resolver
+     * reads /etc/resolv.conf (provisioned to nameserver 10.0.2.3, the SLIRP
+     * stub), sends its A query over a UDP socket and parses the reply, all via
+     * the Linux-ABI socket path (sendto + recvmsg + poll → linux_abi.c).  No
+     * hand-rolled DNS anymore.  We pin AF_INET (no AAAA) since the stack is
+     * IPv4-only. */
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    int gai = getaddrinfo(HOST, "443", &hints, &res);
+    if (gai != 0 || !res) {
+        printf("https: getaddrinfo(%s) failed (%d)\n", HOST, gai); return 1;
+    }
+    struct sockaddr_in *ra = (struct sockaddr_in *)res->ai_addr;
+    unsigned ip = ntohl(ra->sin_addr.s_addr);
     printf("https: %s = %u.%u.%u.%u\n", HOST,
            (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255);
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { printf("https: socket() failed\n"); return 1; }
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(PORT);
-    sa.sin_addr.s_addr = htonl(ip);
-    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
-        printf("https: connect(:%d) failed\n", PORT); close(fd); return 1;
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { printf("https: socket() failed\n"); freeaddrinfo(res); return 1; }
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        printf("https: connect(:%d) failed\n", PORT); close(fd); freeaddrinfo(res); return 1;
     }
+    freeaddrinfo(res);
     printf("https: TCP connected to :%d\n", PORT);
 
     psa_crypto_init();

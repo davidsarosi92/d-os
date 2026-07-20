@@ -678,8 +678,43 @@ static void cmd_dns(const char* args) {
     }
 }
 
-/* `wget http://host[/path]` — fetch a URL over TCP (§M24.3) and print it. */
-static void cmd_wget(const char* url) {
+/* §M39 — the userland musl+mbedTLS `wget` (URL + optional outfile from argv).
+ * When embedded it handles BOTH http:// and https:// (real TLS + CA verify); the
+ * kernel HTTP-only path below is kept as a fallback for builds without musl. */
+extern const unsigned char _binary_user_wget_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_wget_muslelf_end[]   __attribute__((weak));
+
+/* `wget <url> [outfile]` — download over HTTP/HTTPS. */
+static void cmd_wget(const char* args) {
+    /* Prefer the userland musl wget (does TLS); fall back to kernel HTTP. */
+    if (_binary_user_wget_muslelf_start) {
+        /* Tokenize "<url> [outfile]" into an argv the program's crt0 reads. */
+        static char abuf[512];
+        int n = 0; while (args[n] && n < (int)sizeof abuf - 1) { abuf[n] = args[n]; n++; }
+        abuf[n] = '\0';
+        const char* argv[4]; int argc = 0;
+        argv[argc++] = "wget";
+        char* q = abuf;
+        while (*q && argc < 4) {
+            while (*q == ' ') q++;
+            if (!*q) break;
+            argv[argc++] = q;
+            while (*q && *q != ' ') q++;
+            if (*q) *q++ = '\0';
+        }
+        if (argc < 2) { console_write("usage: wget <url> [outfile]\n"); return; }
+        size_t len = (size_t)(_binary_user_wget_muslelf_end -
+                              _binary_user_wget_muslelf_start);
+        struct task* me = task_current();
+        int prev = me ? me->linux_abi : 0;
+        if (me) me->linux_abi = 1;
+        int rc = proc_exec_elf_argv(_binary_user_wget_muslelf_start, len, argc, argv);
+        if (me) me->linux_abi = prev;
+        kprintf("\nwget: exit rc=%d\n", rc);
+        return;
+    }
+
+    const char* url = args;
     struct net_device* dev = net_primary();
     if (!dev) { console_write("wget: no network device\n"); return; }
 

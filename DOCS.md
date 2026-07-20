@@ -3540,9 +3540,24 @@ store already does large ramfs writes (the ~750 KiB musl `libc.so`); doing the
 buddy corruption (PLAN.md §M39 "Lesson learned"; diagnostic: `pmm_validate()` +
 the `memcheck` shell command).  QEMU needs `-netdev user -device virtio-net`.
 
-**Open:** musl `getaddrinfo` (the resolver reading `/etc/resolv.conf` — the file
-is provisioned, but `httpstest` still does DNS by hand); a `wget` front-end;
-DHCP-populated `resolv.conf`; x86_64/aarch64 (no mbedTLS/M24 there yet).
+**Stage 3c — musl `getaddrinfo` + a real `wget`.**  musl's OWN resolver now runs
+on d-os: getaddrinfo() reads `/etc/resolv.conf`, sends its A query via
+sendto()/recvmsg() and waits on poll() — three Linux-ABI ops that were missing
+(`recvmsg`/`sendmsg` sub-calls + direct syscalls 372/370, and `poll` = 168) are
+now translated in `linux_abi.c` onto the M24 socket API.  The recvmsg path is
+the subtle one: musl DROPS any DNS reply whose source sockaddr doesn't match a
+nameserver it queried, so `linux_recvmsg` fills `msg_name` from the datagram's
+source (via the same host-order⇄sockaddr_in site).  `httpstest` dropped its
+hand-rolled DNS for a plain `getaddrinfo("example.com","443",…)`.  On top of that
+a userland **`wget`** (`user/wget.c`, musl + mbedTLS) fetches `http://` *and*
+`https://` URLs from argv — real TLS + CA verify for https — streaming the body
+(headers stripped) to stdout or a file; the shell `wget <url> [outfile]` command
+execs it under the Linux personality (kernel HTTP-only path kept as a fallback).
+Boot-tested: `wget https://example.com/` → getaddrinfo → TLS handshake → the
+Example Domain HTML (571 body bytes), and the same over plain http.
+
+**Open:** DHCP-populated `resolv.conf`; `/etc/hosts`; IPv6/AAAA; x86_64/aarch64
+(no mbedTLS/M24 there yet).
 
 ---
 
@@ -3656,6 +3671,35 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-20 — x86_64 boots to an interactive shell (VC-bind confirmed).**  The
+  arch-generic VC + shell spawn in `kernel_main` already binds the boot shell to
+  the root framebuffer VC and takes keyboard input on x86_64 — verified by boot
+  test (`vc: ready, root VC = 240x150 cells`, `d-os>` prompt, a typed `ps` runs).
+  The stale "no VC bound at boot" comment is corrected, and the x86_64 musl/
+  dynlink/C++/NetSurf-lib boot self-test suite is now gated behind
+  `x86_64.boot-selftest` (config, default off) — so x86_64 boots straight to the
+  prompt like i386 instead of dumping a wall of self-test output.  `pkg_init()`
+  stays unconditional (userland provisioning).  `kernel/core/kernel.c`.
+  **Build note (§M42 follow-up):** the x86_64 rebuild currently trips a stale
+  `user/libdom.so.0` recompile that fails (`HUBBUB_OK` undeclared in libdom's
+  `bindings/hubbub/parser.c`, even though `-Ithird_party/libhubbub/include` is on
+  the line and the header defines it) whenever `libhubbub.so.0` is rebuilt newer.
+  The committed `.so` is known-good (domtest passes), so this session unblocked by
+  refreshing its mtime; a real fix (why the one-shot 97-TU libdom compile loses
+  the libhubbub include on rebuild) belongs to §M42.
+- **2026-07-20 — §M39 stage 3c: musl `getaddrinfo` + a real `wget` (i386).**
+  musl's own DNS resolver now runs on d-os — the three Linux-ABI ops it needed
+  are translated in `linux_abi.c`: `recvmsg`/`sendmsg` (socketcall 17/16 + direct
+  372/370) and `poll` (168), onto the M24 socket API.  `linux_recvmsg` fills
+  `msg_name` with the datagram source so musl doesn't drop the reply (it verifies
+  the answer came from a queried nameserver).  `httpstest` now calls plain
+  `getaddrinfo("example.com","443",…)` instead of hand-rolled DNS.  New userland
+  **`wget`** (`user/wget.c`, musl + mbedTLS) fetches `http://`/`https://` URLs from
+  argv (real TLS + CA verify for https), streaming the body to stdout or a file;
+  shell `wget <url> [outfile]` execs it under the Linux personality (kernel
+  HTTP-only path kept as fallback).  Boot-tested: `wget https://example.com/` →
+  getaddrinfo → TLS 1.3 handshake → Example Domain HTML (571 body bytes), 0
+  unhandled syscalls; same over plain http.  DOCS §4.35.
 - **2026-07-20 — §M39 stage 3b: REAL HTTPS from an unmodified musl binary
   (i386).**  musl BSD sockets now work in ring 3: `linux_abi.c` gained the Linux
   `socketcall` multiplexer (102) + the direct socket syscalls (359–373), both
