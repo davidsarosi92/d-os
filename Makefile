@@ -1500,8 +1500,8 @@ LDOM_DIR := third_party/libdom
 libdom: user/libdom.so.0
 user/libdom.so.0: $(LDOM_DIR)/Makefile user/libwapcaplet.so.0 user/libhubbub.so.0 user/libparserutils.so.0
 	$(MUSL_ELF_CC) -shared $(NSLIB_CFLAGS) -I$(LDOM_DIR)/include -I$(LDOM_DIR)/src \
-	    -I$(LDOM_DIR)/bindings -I$(LWC_DIR)/include -I$(LPU_DIR)/include \
-	    -I$(LHB_DIR)/include -Wl,-soname,libdom.so.0 -o $@ \
+	    -I$(LHB_DIR)/include -I$(LWC_DIR)/include -I$(LPU_DIR)/include \
+	    -I$(LDOM_DIR)/bindings -Wl,-soname,libdom.so.0 -o $@ \
 	    $$(find $(LDOM_DIR)/src $(LDOM_DIR)/bindings/hubbub -name '*.c') \
 	    user/libwapcaplet.so.0 user/libhubbub.so.0 user/libparserutils.so.0
 

@@ -3680,13 +3680,13 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   `x86_64.boot-selftest` (config, default off) — so x86_64 boots straight to the
   prompt like i386 instead of dumping a wall of self-test output.  `pkg_init()`
   stays unconditional (userland provisioning).  `kernel/core/kernel.c`.
-  **Build note (§M42 follow-up):** the x86_64 rebuild currently trips a stale
-  `user/libdom.so.0` recompile that fails (`HUBBUB_OK` undeclared in libdom's
-  `bindings/hubbub/parser.c`, even though `-Ithird_party/libhubbub/include` is on
-  the line and the header defines it) whenever `libhubbub.so.0` is rebuilt newer.
-  The committed `.so` is known-good (domtest passes), so this session unblocked by
-  refreshing its mtime; a real fix (why the one-shot 97-TU libdom compile loses
-  the libhubbub include on rebuild) belongs to §M42.
+- **2026-07-20 — libdom (x86_64) rebuild fix.**  The libdom `.so` rule failed on
+  a clean rebuild — `HUBBUB_OK` undeclared in `bindings/hubbub/parser.c` — because
+  `-Ithird_party/libdom/bindings` preceded `-Ithird_party/libhubbub/include`, so
+  `#include <hubbub/errors.h>` resolved to libdom's OWN binding header (which
+  defines `DOM_HUBBUB_OK`, not `HUBBUB_OK`) instead of libhubbub's.  Reordered the
+  library includes before `-I.../bindings`; libdom rebuilds clean and the x86_64
+  ISO no longer needs the mtime workaround.  `Makefile`.
 - **2026-07-20 — §M39 stage 3c: musl `getaddrinfo` + a real `wget` (i386).**
   musl's own DNS resolver now runs on d-os — the three Linux-ABI ops it needed
   are translated in `linux_abi.c`: `recvmsg`/`sendmsg` (socketcall 17/16 + direct
