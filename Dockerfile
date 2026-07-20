@@ -20,12 +20,15 @@ RUN apt update && apt install -y \
 # its own gmp/mpfr/mpc, so no -dev packages needed.)
 # §M39 — Mbed TLS's build generates PSA driver wrappers with Python
 # (jsonschema + jinja2); python3/perl are already present via build-essential.
+# §M42 — NetSurf's libhubbub/libcss/libdom generate perfect-hash tables with
+# gperf at build time.
 RUN apt update && apt install -y \
     git \
     wget \
     bison \
     flex \
     texinfo \
+    gperf \
     python3-jsonschema \
     python3-jinja2
 
