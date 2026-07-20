@@ -425,13 +425,15 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     watchdog_init();
 
 #if defined(__x86_64__)
-    /* x86_64 userland self-test — runs the embedded musl programs at boot to
-     * exercise the SYSCALL path + linux_abi_64 + dynamic linking + C++ + fork.
-     * It lives here (rather than as a shell `musltest`/`pkgrun` command like
-     * i386) because the x86_64 text shell does not yet bind to a VC at boot
-     * ("shell_task_entry: no VC bound" — a known follow-up), so there is no
-     * interactive prompt to type into.  Same spirit as the vmm/kmalloc/preempt
-     * boot self-tests above. */
+    /* x86_64 userland self-test — runs the embedded musl programs to exercise
+     * the SYSCALL path + linux_abi_64 + dynamic linking + C++ + fork + the
+     * NetSurf libs.  Historically it ran unconditionally at boot because the
+     * x86_64 text shell did not bind to a VC; it now DOES (the VC/shell spawn
+     * below is arch-generic and interactive on x86_64 — proven: root VC ready,
+     * prompt, keyboard input), so the suite is gated behind
+     * `x86_64.boot-selftest` (default off) and the boot goes straight to the
+     * shell.  pkg_init() below is kept unconditional — it provisions the
+     * userland (/lib ld.so + .so's) the interactive shell may need. */
     {
         extern const unsigned char _binary_user_muslhello_muslelf_start[]    __attribute__((weak));
         extern const unsigned char _binary_user_muslhello_muslelf_end[]      __attribute__((weak));
@@ -484,28 +486,39 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
             { "domtest (libdom)",   _binary_user_domtest_dynelf_start,      _binary_user_domtest_dynelf_end      },
         };
         pkg_init();                    /* provision /lib ld.so + .so's up front */
-        /* Provision an execve target for forktest64: write the muslhello blob
-         * to /bin/hello64 so the forked child can exec a real program. */
-        if (_binary_user_muslhello_muslelf_start) {
-            vfs_mkdir("/bin");
-            struct file* wf = vfs_open("/bin/hello64", VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
-            if (wf) {
-                vfs_write(wf, _binary_user_muslhello_muslelf_start,
-                          (size_t)(_binary_user_muslhello_muslelf_end -
-                                   _binary_user_muslhello_muslelf_start));
-                vfs_close(wf);
+
+        /* The x86_64 text shell now binds to the root VC and takes keyboard
+         * input just like i386 (see the VC/shell spawn below), so the boot is an
+         * interactive prompt — NOT the place to dump a wall of self-test output.
+         * The musl/dynlink/C++/NetSurf-lib suite therefore runs only when opted
+         * in via `x86_64.boot-selftest=1` (config); by default x86_64 boots
+         * straight to `d-os>`.  (The suite is also reachable per-test through the
+         * usual shell commands.) */
+        const char* st = config_get("x86_64.boot-selftest", "0");
+        if (st && (st[0] == '1' || st[0] == 'y' || st[0] == 't')) {
+            /* Provision an execve target for forktest64: write the muslhello
+             * blob to /bin/hello64 so the forked child can exec a real program. */
+            if (_binary_user_muslhello_muslelf_start) {
+                vfs_mkdir("/bin");
+                struct file* wf = vfs_open("/bin/hello64", VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+                if (wf) {
+                    vfs_write(wf, _binary_user_muslhello_muslelf_start,
+                              (size_t)(_binary_user_muslhello_muslelf_end -
+                                       _binary_user_muslhello_muslelf_start));
+                    vfs_close(wf);
+                }
             }
+            struct task* me = task_current();
+            int prev = me ? me->linux_abi : 0;
+            if (me) me->linux_abi = 1;
+            for (unsigned i = 0; i < sizeof(tests)/sizeof(tests[0]); i++) {
+                if (!tests[i].s) continue;
+                kprintf("x64-musltest[%s]: exec...\n", tests[i].name);
+                int rc = proc_exec_elf(tests[i].s, (size_t)(tests[i].e - tests[i].s));
+                kprintf("x64-musltest[%s]: rc=%d\n", tests[i].name, rc);
+            }
+            if (me) me->linux_abi = prev;
         }
-        struct task* me = task_current();
-        int prev = me ? me->linux_abi : 0;
-        if (me) me->linux_abi = 1;
-        for (unsigned i = 0; i < sizeof(tests)/sizeof(tests[0]); i++) {
-            if (!tests[i].s) continue;
-            kprintf("x64-musltest[%s]: exec...\n", tests[i].name);
-            int rc = proc_exec_elf(tests[i].s, (size_t)(tests[i].e - tests[i].s));
-            kprintf("x64-musltest[%s]: rc=%d\n", tests[i].name, rc);
-        }
-        if (me) me->linux_abi = prev;
     }
 #endif
 
