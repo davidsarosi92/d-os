@@ -455,6 +455,8 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
         extern const unsigned char _binary_user_hbtest_dynelf_end[]          __attribute__((weak));
         extern const unsigned char _binary_user_wctest_dynelf_start[]        __attribute__((weak));
         extern const unsigned char _binary_user_wctest_dynelf_end[]          __attribute__((weak));
+        extern const unsigned char _binary_user_putest_dynelf_start[]        __attribute__((weak));
+        extern const unsigned char _binary_user_putest_dynelf_end[]          __attribute__((weak));
         struct { const char* name; const unsigned char* s; const unsigned char* e; } tests[] = {
             { "muslhello (static)", _binary_user_muslhello_muslelf_start,   _binary_user_muslhello_muslelf_end   },
             { "muslhellodyn (dyn)", _binary_user_muslhellodyn_dynelf_start, _binary_user_muslhellodyn_dynelf_end },
@@ -467,6 +469,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
             { "fttest (freetype)",  _binary_user_fttest_dynelf_start,       _binary_user_fttest_dynelf_end       },
             { "hbtest (harfbuzz)",  _binary_user_hbtest_dynelf_start,       _binary_user_hbtest_dynelf_end       },
             { "wctest (wapcaplet)", _binary_user_wctest_dynelf_start,       _binary_user_wctest_dynelf_end       },
+            { "putest (parserutil)",_binary_user_putest_dynelf_start,       _binary_user_putest_dynelf_end       },
         };
         pkg_init();                    /* provision /lib ld.so + .so's up front */
         /* Provision an execve target for forktest64: write the muslhello blob

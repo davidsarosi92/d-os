@@ -249,6 +249,9 @@ else ifeq ($(ARCH),x86_64)
   ifneq ($(wildcard third_party/libwapcaplet/src/libwapcaplet.c),)
     ARCH_EXTRA_OBJS += user/libwapcaplet0_blob.o user/wctest_dynblob.o
   endif
+  ifneq ($(wildcard third_party/libparserutils/Makefile),)
+    ARCH_EXTRA_OBJS += user/libparserutils0_blob.o user/putest_dynblob.o
+  endif
 
 else ifeq ($(ARCH),aarch64)
   # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
@@ -1337,6 +1340,25 @@ user/wctest.dynelf: user/wctest.c user/libwapcaplet.so.0
 	    -Wl,-dynamic-linker,$(DOS_LDSO) user/wctest.c \
 	    user/libwapcaplet.so.0 -o $@
 
+# libparserutils — parsing building blocks (input streams, buffers, charset
+# codecs), no deps.  The charset alias table (src/charset/aliases.inc) is
+# perl-generated from build/Aliases first; then compile the whole src tree.
+LPU_DIR := third_party/libparserutils
+user/libparserutils.so.0: $(LPU_DIR)/Makefile
+	@[ -f $(LPU_DIR)/src/charset/aliases.inc ] || ( cd $(LPU_DIR) && perl build/make-aliases.pl )
+	$(MUSL_ELF_CC) -shared $(NSLIB_CFLAGS) -I$(LPU_DIR)/include -I$(LPU_DIR)/src \
+	    -Wl,-soname,libparserutils.so.0 -o $@ $(shell find $(LPU_DIR)/src -name '*.c')
+
+$(OBJ_DIR)/user/libparserutils0_blob.o: user/libparserutils.so.0
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+user/putest.dynelf: user/putest.c user/libparserutils.so.0
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(LPU_DIR)/include \
+	    -Wl,-dynamic-linker,$(DOS_LDSO) user/putest.c \
+	    user/libparserutils.so.0 -o $@
+
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LIBGCC)
@@ -1372,7 +1394,7 @@ clean:
 	rm -f user/*.muslelf user/*.dynelf user/*.cxxelf \
 	      user/libgreet.so user/libcpplib.so user/libstdcxx.so \
 	      user/libgccs.so user/ldmusl.so user/rootfs.bin user/libz.so.1 \
-	      user/libpng16.so.16 user/libwapcaplet.so.0
+	      user/libpng16.so.16 user/libwapcaplet.so.0 user/libparserutils.so.0
 
 clean-all:
 	rm -rf build

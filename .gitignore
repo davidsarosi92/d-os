@@ -80,3 +80,4 @@ user/rootfs.bin
 vga.bin
 third_party/harfbuzz/
 third_party/libwapcaplet/
+third_party/libparserutils/
