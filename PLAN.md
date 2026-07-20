@@ -3603,10 +3603,26 @@ delay does **not** → not pure timing; (4) it is **boot-phase-dependent**: the
 identical large ramfs write done later, in `pkg_init` (where the store already
 writes the ~750 KiB musl `libc.so`), is fine.  **Workaround (shipped):** do all
 large system provisioning from `pkg_init`, not the early self-test window.
-**Root cause: still open** — a real fix wants a minimal in-kernel reproducer
-(single early order-6 `page_alloc`) and a look at what the early phase leaves in
-an inconsistent state.  Diagnostic left in tree: `pmm_validate()` + the
-`memcheck` shell command.
+**Update (2026-07-20) — the buddy allocator is EXONERATED.**  Built the minimal
+reproducer the earlier note asked for: an early (right after `procfs_init`, so
+the victim `nd_*` `.data` pointers already exist) sweep of forced big allocations
+— 24 blocks at order 6/7/8 (256 KiB / 512 KiB / 1 MiB) marched *down* memory with
+no free, plus the exact `kmalloc(256K)+kfree` "no touch" shape.  Findings on the
+current tree: (a) every big block comes off the TOP of RAM (`0x0ff00000` first),
+**never overlapping** the kernel image `[0x100000,0x941040)`; (b) a new invariant
+guard in `link_store` — which fires if the intrusive free-list link is ever
+written into `[kernel_start,kernel_end)` — **stays completely silent**; (c) no
+crash.  This is structural, not luck: the carve pass (`carve_out_range` over the
+kernel image + low mem + mbi + AP trampoline) marks those frames `PS_NONE`, the
+seed loop only releases `PS_USED` frames, and coalesce refuses a buddy whose
+`page_state` isn't a matching free order (guarded further by `zone_remove`
+failing), so a kernel-image frame can never enter the pool.  Therefore the old
+`.data` smash (`cs:eip=8:0x0015202x`, inside the image) was **not** a
+"buddy hands out a kernel frame" bug and no longer reproduces via early large
+allocs — it was a wild write from some other early-boot interaction that the
+`pkg_init`-late-provisioning workaround already sidesteps.  **Root cause of the
+original smash: unreproducible / moot**; the `link_store` guard now stays in tree
+as a cheap permanent regression detector (alongside `pmm_validate()`/`memcheck`).
 
 ---
 

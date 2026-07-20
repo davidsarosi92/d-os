@@ -133,6 +133,22 @@ static inline uint32_t link_load(uint32_t phys) {
     return *(volatile uint32_t*)(uintptr_t)phys;
 }
 static inline void link_store(uint32_t phys, uint32_t next) {
+    /* Invariant guard (cheap, permanent).  The intrusive free-list link is
+     * written INTO the freed page, so a free frame must NEVER alias the live
+     * kernel image.  If this ever fires, the buddy pool wrongly contains a
+     * kernel-image frame (a coalesce-across-carve / missing-reservation bug) and
+     * this very write is what would smash a .data pointer — catch it loudly at
+     * the write site (with the caller) instead of chasing a delayed #PF.
+     * (§M39 buddy-corruption investigation: with the current tree this stays
+     * silent even under forced early order-6..8 allocation sweeps — the carve
+     * pass provably excludes the image, so the buddy is exonerated.  The guard
+     * remains as a regression detector.) */
+    uintptr_t ks = (uintptr_t)kernel_start, ke = (uintptr_t)kernel_end;
+    if ((uintptr_t)phys >= ks && (uintptr_t)phys < ke) {
+        kprintf("PMM-GUARD: link_store 0x%x INTO kernel image [0x%x,0x%x) "
+                "pfn=%u caller=%p\n", phys, (uint32_t)ks, (uint32_t)ke,
+                phys >> PMM_FRAME_SHIFT, __builtin_return_address(0));
+    }
     *(volatile uint32_t*)(uintptr_t)phys = next;
 }
 
