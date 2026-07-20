@@ -905,6 +905,29 @@ void pkg_init(void) {
     ldso_provision();
     rootfs_unpack();                 /* §M43 — tcc headers/crt/libs into the VFS */
 
+    /* §M39 3b — network/TLS system files at the standard paths so ring-3 TLS
+     * clients (musl httpstest, a future wget) find them:
+     *   /etc/resolv.conf  — the SLIRP stub resolver (10.0.2.3);
+     *   /etc/ssl/cert.pem — the embedded CA trust bundle (weak: linked only on
+     *                       arches that embed third_party/cacert_blob.o).
+     * Provisioned HERE (not in an early kernel_main self-test) deliberately:
+     * this runs in the same late boot phase as the store's own large ramfs
+     * writes (e.g. the ~750 KiB musl libc.so), which is a well-exercised path;
+     * a large ramfs write during the earliest boot phase trips a latent
+     * large-order buddy corruption (see PLAN.md §M39 "Lesson learned"). */
+    {
+        extern const unsigned char _binary_third_party_cacert_pem_start[] __attribute__((weak));
+        extern const unsigned char _binary_third_party_cacert_pem_end[]   __attribute__((weak));
+        write_file("/etc/resolv.conf", "nameserver 10.0.2.3\n", 20);
+        if (_binary_third_party_cacert_pem_start) {
+            vfs_mkdir("/etc/ssl");
+            unsigned n = blob_len(_binary_third_party_cacert_pem_start,
+                                  _binary_third_party_cacert_pem_end);
+            write_file("/etc/ssl/cert.pem", _binary_third_party_cacert_pem_start, n);
+            kprintf("net: provisioned /etc/ssl/cert.pem (%u bytes) + /etc/resolv.conf\n", n);
+        }
+    }
+
     /* Native (d-os libc) demo packages. */
     rc_hello1 = (struct pkg_recipe){ .id="hello-1", .name="hello", .version="1.0",
         .deps="", .content=_binary_user_hello_i386_elf_start,

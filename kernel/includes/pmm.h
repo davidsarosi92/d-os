@@ -116,5 +116,6 @@ void pmm_zone_stats(int zone, uint32_t* out_free_per_order, uint32_t* out_manage
 
 /* Human-readable one-line dump.  Used by `meminfo`. */
 void pmm_print_stats(void);
+void pmm_validate(const char* tag);   /* DEBUG: free-list integrity walk */
 
 #endif

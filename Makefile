@@ -99,8 +99,14 @@ ifeq ($(ARCH),i386)
   endif
 
   # §M39 stage 2+3: crypttest + ssltest link against the ported Mbed TLS.
+  # stage 3b: httpstest = real HTTPS over an M24 socket + the CA bundle
+  # (third_party/cacert.pem, provisioned to /etc/ssl/cert.pem at boot).
   ifneq ($(wildcard third_party/mbedtls-i686/lib/libmbedcrypto.a),)
-    ARCH_EXTRA_OBJS += user/crypttest_muslblob.o user/ssltest_muslblob.o
+    ARCH_EXTRA_OBJS += user/crypttest_muslblob.o user/ssltest_muslblob.o \
+                       user/httpstest_muslblob.o
+    ifneq ($(wildcard third_party/cacert.pem),)
+      ARCH_EXTRA_OBJS += third_party/cacert_blob.o
+    endif
   endif
 
   # §M38: C++ runtime artifacts, present only once the musl C++ toolchain was
@@ -1040,6 +1046,30 @@ user/ssltest.muslelf: user/ssltest.c $(MUSL_LIBC)
 	    $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a $(MUSL_PREFIX)/lib/libc.a \
 	    `gcc -m32 -print-libgcc-file-name` --end-group \
 	    $(MUSL_PREFIX)/lib/crtn.o
+
+# §M39 stage 3b — httpstest: REAL HTTPS.  Same mbedTLS static link as ssltest,
+# but the BIO rides a live M24 socket (send/recv) and the trust store is the
+# provisioned CA bundle — an actual network TLS client, not an in-memory one.
+user/httpstest.muslelf: user/httpstest.c $(MUSL_LIBC)
+	@mkdir -p $(OBJ_DIR)/user
+	gcc $(MUSL_CC_FLAGS) -c user/httpstest.c \
+	    -I$(MUSL_PREFIX)/include -I$(MBEDTLS_PREFIX)/include \
+	    -o $(OBJ_DIR)/user/httpstest.muslo
+	ld -m elf_i386 -static -Ttext-segment=$(USER_BASE) -e _start -o $@ \
+	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
+	    $(OBJ_DIR)/user/httpstest.muslo \
+	    --start-group \
+	    $(MBEDTLS_PREFIX)/lib/libmbedtls.a $(MBEDTLS_PREFIX)/lib/libmbedx509.a \
+	    $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a $(MUSL_PREFIX)/lib/libc.a \
+	    `gcc -m32 -print-libgcc-file-name` --end-group \
+	    $(MUSL_PREFIX)/lib/crtn.o
+
+# The CA trust bundle, embedded verbatim.  objcopy derives the symbol from the
+# input path: _binary_third_party_cacert_pem_{start,end}.  Provisioned into the
+# VFS at /etc/ssl/cert.pem during boot (kernel.c).
+$(OBJ_DIR)/third_party/cacert_blob.o: third_party/cacert.pem
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) third_party/cacert.pem $@
 
 $(OBJ_DIR)/user/%_muslblob.o: user/%.muslelf
 	@mkdir -p $(@D)

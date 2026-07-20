@@ -521,6 +521,50 @@ void pmm_zone_stats(int zone, uint32_t* out_free_per_order, uint32_t* out_manage
     }
 }
 
+/* DEBUG — walk every zone's free lists following the intrusive links and
+ * assert each node is frame-aligned, in-range, and page_state-tagged with its
+ * order.  Prints the first anomaly (a corrupted link => a bad split/coalesce).
+ * Compares the walked count against nr_at_order.  Bounded so a cyclic/garbage
+ * chain can't loop forever. */
+void pmm_validate(const char* tag) {
+    for (int zi = 0; zi < NR_ZONES; zi++) {
+        struct zone* z = &zones[zi];
+        for (int o = 0; o <= BUDDY_MAX_ORDER; o++) {
+            uint32_t cur = z->free_lists[o];
+            uint32_t walked = 0;
+            uint32_t guard = z->nr_at_order[o] + 4;
+            while (cur) {
+                if (cur & (PMM_FRAME_SIZE - 1)) {
+                    kprintf("PMMCHK[%s]: z%d o%d node phys=%x NOT frame-aligned\n", tag, zi, o, cur);
+                    return;
+                }
+                uint32_t pfn = phys_to_pfn(cur);
+                if (pfn >= BUDDY_MAX_FRAMES) {
+                    kprintf("PMMCHK[%s]: z%d o%d node pfn=%x OUT OF RANGE (phys=%x)\n", tag, zi, o, pfn, cur);
+                    return;
+                }
+                if (page_state[pfn] != (uint8_t)o) {
+                    kprintf("PMMCHK[%s]: z%d o%d node pfn=%x state=%u (expected %d)\n",
+                            tag, zi, o, pfn, page_state[pfn], o);
+                    return;
+                }
+                cur = link_load(cur);
+                if (++walked > guard) {
+                    kprintf("PMMCHK[%s]: z%d o%d chain OVERRUNS nr_at_order=%u (cycle?)\n",
+                            tag, zi, o, z->nr_at_order[o]);
+                    return;
+                }
+            }
+            if (walked != z->nr_at_order[o]) {
+                kprintf("PMMCHK[%s]: z%d o%d walked=%u != nr_at_order=%u\n",
+                        tag, zi, o, walked, z->nr_at_order[o]);
+                return;
+            }
+        }
+    }
+    kprintf("PMMCHK[%s]: all free lists consistent\n", tag);
+}
+
 void pmm_print_stats(void) {
     uint32_t total_mgr  = pmm_managed_frames();
     uint32_t total_free = pmm_free_frames();

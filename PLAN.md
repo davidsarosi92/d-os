@@ -69,7 +69,7 @@
 | §M36 | POSIX syscall breadth + native libc — ◐ stage 1 (i386, DOCS §4.30) + stage 2 "two brothers": **Linux-ABI peer runs real musl + coreutils (`echo`/`cat`/`ls`/`env`) + a real `sh -c` (fork/execve/waitpid) FROM the store via `pkgrun`, data-driven `.abi` seam (DOCS §4.31)**; native musl-fork peer TODO (= 2nd ABI backend). Own-libc PARKED → `NATIVE_LIBC.md` | — |
 | §M37 | Dynamic linking — ld.so / `.so` / dlopen — ✅ shipped (i386, DOCS §4.33): shared musl (libc.so=ld.so) + ET_DYN/PIE loader + PT_INTERP + full auxv + full mmap2/mprotect/fstat64; dynamic hello, separate .so (DT_NEEDED + .so __thread), dlopen all green | — |
 | §M38 | C++ runtime + support libs — ◐ runtime shipped (i386, DOCS §4.34): musl-cross-make g++ 11.2.0 + libstdc++; `cpptest` throws+catches across a `.so` (DWARF unwind) + STL, dynamically linked.  Support libs (zlib/freetype/harfbuzz/ICU/Skia) still open | — |
-| §M39 | Crypto + entropy + TLS + DNS — ◐ stages 1–3 shipped (i386, DOCS §4.35): ChaCha20 CSPRNG + /dev/urandom + getrandom (arch-generic); Mbed TLS v3.6.2 (`crypttest` SHA-256+AES-GCM); **verified TLS 1.3** handshake + app data (`ssltest`).  Open: `wget https` over real sockets (3b), DNS/resolv.conf | — |
+| §M39 | Crypto + entropy + TLS + DNS — ◐ stages 1–3b shipped (i386, DOCS §4.35): ChaCha20 CSPRNG + /dev/urandom + getrandom (arch-generic); Mbed TLS v3.6.2 (`crypttest` SHA-256+AES-GCM); **verified TLS 1.3** handshake (`ssltest`); **stage 3b = REAL HTTPS** — musl `socketcall`→M24 sockets (`netmusl`), `httpstest` = DNS→TCP:443→TLS 1.3 handshake→Mozilla CA bundle at /etc/ssl/cert.pem→VERIFY_REQUIRED (flags 0x0)→HTTP 200.  Open: musl `getaddrinfo`, `wget` front-end, DHCP resolv.conf, x86_64/aarch64 | — |
 | §M40 | Client graphics stack — Wayland client + EGL/GL (Mesa swrast) + Skia | — |
 | §M41 | Linux syscall ABI shim — optional binary-compat accelerator | — |
 | §M42 | Web browser bring-up — NetSurf → WebKit → Firefox/Chromium (north star) | — |
@@ -3575,6 +3575,38 @@ signing, `/etc/shadow` KDF for §M32 all want it).
 **Depends on:** §M24 (TCP/UDP sockets + DHCP for `resolv.conf`), §M36
 (libc — `getaddrinfo`, and mbedTLS/BoringSSL link against it), §M37 (they
 ship as `.so`).
+
+**Stage 3b SHIPPED (i386, real HTTPS)** — see DOCS.md §4.35.  An unmodified
+musl binary does networking from ring 3: musl's `socketcall` (+ the direct
+i386 socket syscalls 359–373) is translated in `linux_abi.c` onto the M24 BSD-
+socket API (single `sockaddr_in` ⇄ host-order (ip,port) site).  `netmusl`
+resolves + fetches over plain TCP; **`httpstest` does REAL HTTPS**: DNS → TCP
+:443 → mbedTLS handshake with the BIO on a live socket → the Mozilla CA bundle
+(`third_party/cacert.pem`, provisioned to `/etc/ssl/cert.pem`) as the trust
+store → **`VERIFY_REQUIRED`, verify flags 0x0 (chain + hostname trusted)** →
+HTTP/1.1 200 OK over TLS 1.3.  Boot-tested over QEMU SLIRP.  Still open:
+musl `getaddrinfo` (needs the resolver to read `/etc/resolv.conf` — provisioned,
+but `httpstest` currently does DNS by hand), a `wget` front-end, DHCP-populated
+`resolv.conf`, x86_64/aarch64 (no mbedTLS/M24 there yet).
+
+**Lesson learned — a latent large-order buddy corruption, exposed by an early
+big allocation.**  Provisioning the 333 KiB CA bundle as one ramfs file forces
+a single ≥256 KiB `kmalloc` (one order-6+ `page_alloc`).  Done from an *early*
+`kernel_main` self-test that trips a deterministic fault ~1 s later: a fixed
+`.data` function pointer (a procfs `nd_*` node) is smashed → the CPU calls it
+and executes into `.data` (`cs:eip=8:0x0015202x`, garbage `cr2`).  Findings
+from bisection: (1) it's the *allocation*, not the write — `kmalloc(256K)` +
+immediate `kfree`, no touch, still faults; (2) the free-list metadata stays
+*consistent* across the alloc (`pmm_validate` passes); (3) merely read-walking
+every free page (the same `pmm_validate`) *masks* it, while an equal-time dummy
+delay does **not** → not pure timing; (4) it is **boot-phase-dependent**: the
+identical large ramfs write done later, in `pkg_init` (where the store already
+writes the ~750 KiB musl `libc.so`), is fine.  **Workaround (shipped):** do all
+large system provisioning from `pkg_init`, not the early self-test window.
+**Root cause: still open** — a real fix wants a minimal in-kernel reproducer
+(single early order-6 `page_alloc`) and a look at what the early phase leaves in
+an inconsistent state.  Diagnostic left in tree: `pmm_validate()` + the
+`memcheck` shell command.
 
 ---
 

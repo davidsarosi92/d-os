@@ -1719,6 +1719,29 @@ static void cmd_ssltest(void) {
     kprintf("ssltest: returned rc=%d\n", rc);
 }
 
+/* §M39 stage 3b — `httpstest`: REAL HTTPS from an unmodified musl binary.
+ * DNS + TCP :443 + a full mbedTLS handshake over the live socket, verified
+ * against the provisioned CA bundle (/etc/ssl/cert.pem), then an HTTP GET over
+ * TLS.  Needs QEMU user networking. */
+extern const unsigned char _binary_user_httpstest_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_httpstest_muslelf_end[]   __attribute__((weak));
+
+static void cmd_httpstest(void) {
+    if (!_binary_user_httpstest_muslelf_start) {
+        console_write("httpstest: not embedded — run `make mbedtls` + `make musl` then rebuild\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_httpstest_muslelf_end -
+                          _binary_user_httpstest_muslelf_start);
+    console_write("httpstest: exec'ing a musl HTTPS fetch w/ CA verify (needs QEMU net)...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(_binary_user_httpstest_muslelf_start, len);
+    if (me) me->linux_abi = prev;
+    kprintf("httpstest: returned rc=%d\n", rc);
+}
+
 /* §M39 stage 3b — `netmusl`: ring-3 networking from an UNMODIFIED musl binary.
  * DNS-resolves example.com over a UDP socket then fetches "/" over TCP — the
  * whole BSD-sockets surface driven through musl's socketcall path (translated
@@ -2167,6 +2190,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "crypttest"))      { cmd_crypttest(); return; }
     if (streq(line, "ssltest"))        { cmd_ssltest(); return; }
     if (streq(line, "netmusl"))        { cmd_netmusl(); return; }
+    if (streq(line, "httpstest"))      { cmd_httpstest(); return; }
     if (streq(line, "cpptest"))        { cmd_cpptest(); return; }
     if (streq(line, "solibtest"))      { cmd_solibtest(); return; }
     if (streq(line, "dlopentest"))     { cmd_dlopentest(); return; }
@@ -2227,6 +2251,13 @@ static void dispatch(struct vc* my_vc, const char* line) {
     }
     if (starts_with(line, "getconf ")) { cmd_getconf(line + 8); return; }
     if (starts_with(line, "setconf ")) { cmd_setconf(line + 8); return; }
+    if (streq(line, "memcheck")){
+        /* Walk every buddy free list and report the first inconsistency —
+         * a diagnostic for the latent large-order corruption noted in
+         * PLAN.md §M39.  "consistent" = links + page_state all agree. */
+        pmm_validate("memcheck");
+        return;
+    }
     if (streq(line, "meminfo")){
         mboot_print_meminfo();
         pmm_print_stats();

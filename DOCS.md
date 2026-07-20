@@ -3504,9 +3504,45 @@ every musl program).  The M25 single-page user stack also had to grow (the TLS
 handshake overflowed it): the per-process layout is now image / interp (+64 MiB)
 / stack (+96 MiB, grows down, 1 MiB) / mmap (+128 MiB), non-overlapping.
 
-**Open:** stage 3b `wget https://` to a real server over the M24 sockets (needs
-a net-enabled boot + the Mozilla CA bundle at `/etc/ssl/certs`); DNS
-`getaddrinfo` + `/etc/resolv.conf`; x86_64/aarch64.
+**Stage 3b — REAL HTTPS over the network (`netmusl`, `httpstest`).**  An
+unmodified musl binary now does ring-3 networking.  musl on i386 funnels every
+BSD-socket op through the Linux `socketcall` multiplexer (syscall 102) and
+*prefers* the direct socket syscalls (359 socket … 373 shutdown, falling back
+to socketcall on ENOSYS); `kernel/hal/x86/linux_abi.c` handles **both**, routing
+them through one `linux_socketcall()` translator onto the M24 BSD-socket API
+(`sys_socket`/`connect`/`sendto`/`recvfrom`; TCP payload rides `sys_write`/
+`sys_read`).  A single `sockaddr_in` ⇄ host-order (ip,port) conversion site
+keeps all `ntoh`/`hton` in one place (byte-order is a Linux-ABI concern, not an
+M24-stack one).
+
+- `netmusl` — the musl counterpart of `httptest.c`: DNS-resolve example.com over
+  a UDP socket, then TCP `connect`/`write`/`read` an HTTP GET → `HTTP/1.1 200 OK`.
+- `httpstest` — **real HTTPS with genuine certificate verification**: DNS → TCP
+  `:443` → an mbedTLS handshake with the BIO wired to the live socket → the
+  Mozilla CA bundle (`third_party/cacert.pem`, 128 roots) provisioned to
+  `/etc/ssl/cert.pem` as the trust store → `MBEDTLS_SSL_VERIFY_REQUIRED` with SNI
+  + hostname check → an HTTP GET over TLS.  Boot-tested over QEMU SLIRP:
+
+  ```
+  https: example.com = 172.66.147.243
+  https: TCP connected to :443
+  https: CA bundle parsed (0 certs rejected)
+  https: handshake OK — TLSv1.3 / TLS1-3-CHACHA20-POLY1305-SHA256
+  https: cert verify flags = 0x0 (0 = chain + hostname trusted)
+  https: HTTP status over TLS: HTTP/1.1 200 OK
+  https: HTTPS PASS
+  ```
+
+The CA bundle + `/etc/resolv.conf` (`nameserver 10.0.2.3`, the SLIRP resolver)
+are provisioned from `pkg_init()` — deliberately the *late* boot phase where the
+store already does large ramfs writes (the ~750 KiB musl `libc.so`); doing the
+333 KiB write from an early `kernel_main` self-test tripped a latent large-order
+buddy corruption (PLAN.md §M39 "Lesson learned"; diagnostic: `pmm_validate()` +
+the `memcheck` shell command).  QEMU needs `-netdev user -device virtio-net`.
+
+**Open:** musl `getaddrinfo` (the resolver reading `/etc/resolv.conf` — the file
+is provisioned, but `httpstest` still does DNS by hand); a `wget` front-end;
+DHCP-populated `resolv.conf`; x86_64/aarch64 (no mbedTLS/M24 there yet).
 
 ---
 
@@ -3620,6 +3656,20 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-20 — §M39 stage 3b: REAL HTTPS from an unmodified musl binary
+  (i386).**  musl BSD sockets now work in ring 3: `linux_abi.c` gained the Linux
+  `socketcall` multiplexer (102) + the direct socket syscalls (359–373), both
+  routed through one translator onto the M24 socket API with a single
+  `sockaddr_in` ⇄ host-order (ip,port) site.  `netmusl` fetches over plain TCP;
+  **`httpstest` does real HTTPS** — DNS → TCP :443 → mbedTLS handshake on a live
+  socket → the Mozilla CA bundle (`third_party/cacert.pem` → `/etc/ssl/cert.pem`)
+  as the trust store → `VERIFY_REQUIRED`, verify flags 0x0 (chain + hostname
+  trusted) → HTTP/1.1 200 OK over TLS 1.3.  CA bundle + `/etc/resolv.conf`
+  provisioned from `pkg_init()`.  New: `scripts/fetch-cacert.sh`, `user/netmusl.c`,
+  `user/httpstest.c`, shell `netmusl`/`httpstest`; a `pmm_validate()` free-list
+  checker + `memcheck` command (diagnostic for a latent early large-order buddy
+  corruption, documented in PLAN.md §M39 — worked around by provisioning large
+  files from the late `pkg_init` phase).  DOCS §4.35.
 - **2026-07-20 — §M42 NetSurf libraries: all six core libs run on x86_64.**  The
   browser's parsing/DOM/CSS/image foundation, each a versioned content-addressed
   STORE PACKAGE with a correct dependency closure, cross-built vs musl from
