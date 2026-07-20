@@ -86,3 +86,5 @@ third_party/libnsgif/
 third_party/libcss/
 third_party/buildsystem/
 third_party/libdom/
+third_party/libnsbmp/
+third_party/libnsutils/
