@@ -1719,6 +1719,29 @@ static void cmd_ssltest(void) {
     kprintf("ssltest: returned rc=%d\n", rc);
 }
 
+/* §M39 stage 3b — `netmusl`: ring-3 networking from an UNMODIFIED musl binary.
+ * DNS-resolves example.com over a UDP socket then fetches "/" over TCP — the
+ * whole BSD-sockets surface driven through musl's socketcall path (translated
+ * by linux_abi.c onto the M24 stack).  Needs QEMU user networking. */
+extern const unsigned char _binary_user_netmusl_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_netmusl_muslelf_end[]   __attribute__((weak));
+
+static void cmd_netmusl(void) {
+    if (!_binary_user_netmusl_muslelf_start) {
+        console_write("netmusl: not embedded — run `make musl` then rebuild\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_netmusl_muslelf_end -
+                          _binary_user_netmusl_muslelf_start);
+    console_write("netmusl: exec'ing a musl ring-3 HTTP fetch (needs QEMU net)...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(_binary_user_netmusl_muslelf_start, len);
+    if (me) me->linux_abi = prev;
+    kprintf("netmusl: returned rc=%d\n", rc);
+}
+
 /* §M37 stage 5 — `solibtest`: run a program that links against a SEPARATE
  * shared library (libgreet.so, at /lib).  Exercises ld.so's real work: locate
  * a genuinely separate .so via the search path and resolve symbols across
@@ -2143,6 +2166,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "randtest"))       { cmd_randtest(); return; }
     if (streq(line, "crypttest"))      { cmd_crypttest(); return; }
     if (streq(line, "ssltest"))        { cmd_ssltest(); return; }
+    if (streq(line, "netmusl"))        { cmd_netmusl(); return; }
     if (streq(line, "cpptest"))        { cmd_cpptest(); return; }
     if (streq(line, "solibtest"))      { cmd_solibtest(); return; }
     if (streq(line, "dlopentest"))     { cmd_dlopentest(); return; }

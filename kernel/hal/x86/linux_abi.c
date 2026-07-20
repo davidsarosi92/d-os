@@ -70,10 +70,57 @@ extern uint32_t saved_eip;
 #define LNX_fcntl64        221
 #define LNX_set_tid_address 258
 #define LNX_openat         295
+#define LNX_socketcall     102   /* §M39 3b: musl i386 routes ALL BSD-socket
+                                  * ops through this multiplexer (SYS_SOCKET…). */
+/* Direct i386 socket syscalls (Linux 4.3+).  musl PREFERS these and only falls
+ * back to socketcall on -ENOSYS, so handling them avoids a wasted failing
+ * syscall (and a misleading "unhandled" log line) per socket op. */
+#define LNX_socket         359
+#define LNX_bind           361
+#define LNX_connect        362
+#define LNX_getsockopt     365
+#define LNX_setsockopt     366
+#define LNX_getsockname    367
+#define LNX_getpeername    368
+#define LNX_sendto         369
+#define LNX_recvfrom       371
+#define LNX_shutdown       373
 
 #define LNX_ENOSYS  38
 #define LNX_ENOTTY  25
 #define LNX_ENOENT   2
+#define LNX_EAFNOSUPPORT 97
+#define LNX_EOPNOTSUPP   95
+
+/* Linux socketcall sub-call numbers (linux/net.h). */
+#define LSOC_SOCKET      1
+#define LSOC_BIND        2
+#define LSOC_CONNECT     3
+#define LSOC_LISTEN      4
+#define LSOC_ACCEPT      5
+#define LSOC_GETSOCKNAME 6
+#define LSOC_GETPEERNAME 7
+#define LSOC_SOCKETPAIR  8
+#define LSOC_SEND        9
+#define LSOC_RECV        10
+#define LSOC_SENDTO      11
+#define LSOC_RECVFROM    12
+#define LSOC_SHUTDOWN    13
+#define LSOC_SETSOCKOPT  14
+#define LSOC_GETSOCKOPT  15
+#define LSOC_SENDMSG     16
+#define LSOC_RECVMSG     17
+
+/* Linux `struct sockaddr_in` (netinet/in.h) — the layout musl hands to
+ * connect()/sendto().  sin_addr + sin_port are in NETWORK byte order, whereas
+ * the M24 socket API takes a HOST-order IPv4 int + a host-order port int, so
+ * this is the single place the two representations are reconciled. */
+struct lnx_sockaddr_in {
+    uint16_t sin_family;     /* AF_INET == 2 */
+    uint16_t sin_port;       /* network byte order */
+    uint32_t sin_addr;       /* network byte order */
+    uint8_t  sin_zero[8];
+};
 
 /* Linux i386 O_* open flags (asm-generic/fcntl.h).  These do NOT match d-os's
  * VFS_* bits, so LNX_open/openat must TRANSLATE, not pass raw — musl opens with
@@ -145,6 +192,112 @@ struct lnx_user_desc {
     uint32_t limit;
     uint32_t flags;          /* seg_32bit/contents/… bitfield word           */
 };
+
+/* Pull a host-order (ip, port) pair out of a Linux sockaddr_in.  Returns 0 on
+ * success, -1 if the address is missing / not AF_INET.  ntoh conversions live
+ * ONLY here (byte-order is a Linux-ABI concern, not an M24-stack concern). */
+static int sockaddr_to_hostorder(const struct lnx_sockaddr_in* sa,
+                                 uint32_t* ip_out, int* port_out) {
+    if (!sa || sa->sin_family != AF_INET) return -1;
+    const uint8_t* a = (const uint8_t*)&sa->sin_addr;   /* network order bytes */
+    const uint8_t* p = (const uint8_t*)&sa->sin_port;
+    *ip_out   = ((uint32_t)a[0] << 24) | ((uint32_t)a[1] << 16) |
+                ((uint32_t)a[2] << 8)  |  (uint32_t)a[3];
+    *port_out = ((int)p[0] << 8) | (int)p[1];
+    return 0;
+}
+
+/* Fill a Linux sockaddr_in (network order) from a host-order (ip, port), used
+ * by recvfrom to report the datagram's source.  Honours the caller's addrlen. */
+static void hostorder_to_sockaddr(struct lnx_sockaddr_in* sa, uint32_t* addrlen,
+                                  uint32_t ip, int port) {
+    if (!sa) return;
+    struct lnx_sockaddr_in tmp;
+    tmp.sin_family = AF_INET;
+    ((uint8_t*)&tmp.sin_port)[0] = (uint8_t)(port >> 8);
+    ((uint8_t*)&tmp.sin_port)[1] = (uint8_t)port;
+    ((uint8_t*)&tmp.sin_addr)[0] = (uint8_t)(ip >> 24);
+    ((uint8_t*)&tmp.sin_addr)[1] = (uint8_t)(ip >> 16);
+    ((uint8_t*)&tmp.sin_addr)[2] = (uint8_t)(ip >> 8);
+    ((uint8_t*)&tmp.sin_addr)[3] = (uint8_t)ip;
+    for (int i = 0; i < 8; i++) tmp.sin_zero[i] = 0;
+    uint32_t room = addrlen ? *addrlen : (uint32_t)sizeof tmp;
+    uint32_t cnt  = room < sizeof tmp ? room : (uint32_t)sizeof tmp;
+    for (uint32_t i = 0; i < cnt; i++) ((uint8_t*)sa)[i] = ((uint8_t*)&tmp)[i];
+    if (addrlen) *addrlen = (uint32_t)sizeof tmp;
+}
+
+/* §M39 3b — Linux socketcall(call, args[]) demultiplexer.  musl on i386 funnels
+ * socket()/connect()/sendto()/recv()… through syscall 102, passing the call
+ * number in ebx and a pointer to an array of the call's word-sized args in ecx.
+ * Each sub-call is translated to the M24 BSD-socket primitives (usyscall.c),
+ * with sockaddr_in ⇄ host-order (ip,port) conversion done here.  TCP payload
+ * (send/recv on a connected stream) rides sys_write/sys_read, which already
+ * route FD_NETSOCK to the TCP engine. */
+static long linux_socketcall(int call, uint32_t* a) {
+    switch (call) {
+        case LSOC_SOCKET: {
+            int domain = (int)a[0];
+            int type   = (int)a[1] & 0xFF;      /* strip SOCK_CLOEXEC/NONBLOCK */
+            int proto  = (int)a[2];
+            if (domain != AF_INET) return -LNX_EAFNOSUPPORT;
+            int fd = sys_socket(domain, type, proto);
+            return (fd < 0) ? -LNX_EOPNOTSUPP : fd;
+        }
+        case LSOC_BIND: {
+            int fd = (int)a[0];
+            uint32_t ip; int port;
+            if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)a[1], &ip, &port) != 0)
+                return -LNX_EAFNOSUPPORT;
+            return sys_bind(fd, port) == 0 ? 0 : -1;
+        }
+        case LSOC_CONNECT: {
+            int fd = (int)a[0];
+            uint32_t ip; int port;
+            if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)a[1], &ip, &port) != 0)
+                return -LNX_EAFNOSUPPORT;
+            return sys_connect(fd, ip, port) == 0 ? 0 : -1;
+        }
+        case LSOC_SEND:                            /* send == sendto(NULL dest) */
+            return sys_write((int)a[0], (const void*)a[1], (size_t)a[2]);
+        case LSOC_RECV:                            /* recv == recvfrom(NULL src) */
+            return sys_read((int)a[0], (void*)a[1], (size_t)a[2]);
+        case LSOC_SENDTO: {
+            int fd = (int)a[0];
+            const void* buf = (const void*)a[1];
+            size_t len = (size_t)a[2];
+            const struct lnx_sockaddr_in* dst = (const struct lnx_sockaddr_in*)a[4];
+            if (!dst) return sys_write(fd, buf, len);   /* connected stream */
+            uint32_t ip; int port;
+            if (sockaddr_to_hostorder(dst, &ip, &port) != 0) return -LNX_EAFNOSUPPORT;
+            return sys_sendto(fd, buf, len, ip, port);
+        }
+        case LSOC_RECVFROM: {
+            int fd = (int)a[0];
+            void* buf = (void*)a[1];
+            size_t len = (size_t)a[2];
+            struct lnx_sockaddr_in* src = (struct lnx_sockaddr_in*)a[4];
+            uint32_t* addrlen = (uint32_t*)a[5];
+            uint32_t ip = 0; int port = 0;
+            long n = sys_recvfrom(fd, buf, len, &ip, &port);
+            if (n >= 0 && src) hostorder_to_sockaddr(src, addrlen, ip, port);
+            return n;
+        }
+        case LSOC_SHUTDOWN:
+            return 0;                              /* close() does the teardown */
+        case LSOC_SETSOCKOPT:
+        case LSOC_GETSOCKOPT:
+            /* No socket options are honoured yet; report success so musl's
+             * getaddrinfo/TLS setup (SO_RCVTIMEO, TCP_NODELAY…) proceeds. */
+            return 0;
+        case LSOC_GETSOCKNAME:
+        case LSOC_GETPEERNAME:
+            return -LNX_EOPNOTSUPP;
+        default:
+            kprintf("linux-abi: unhandled socketcall %d\n", call);
+            return -LNX_ENOSYS;
+    }
+}
 
 /* End a Linux process/excursion: an independent user task exits for good;
  * an excursion teleports back to proc_exec_*'s caller (identical to the native
@@ -369,6 +522,37 @@ void linux_syscall_dispatch(struct int_frame* f) {
              * uses the return as its initial TID; hand back our pid. */
             f->eax = (uint32_t)(task_current() ? task_current()->pid : 0);
             return;
+
+        case LNX_socketcall:
+            /* socketcall(call=ebx, args=ecx) — see linux_socketcall(). */
+            f->eax = (uint32_t)linux_socketcall((int)f->ebx, (uint32_t*)f->ecx);
+            return;
+
+        /* Direct socket syscalls: repack the register args into the socketcall
+         * array shape and reuse the ONE translator (ebx/ecx/edx/esi/edi/ebp). */
+        case LNX_socket:      case LNX_bind:       case LNX_connect:
+        case LNX_getsockopt:  case LNX_setsockopt: case LNX_getsockname:
+        case LNX_getpeername: case LNX_sendto:     case LNX_recvfrom:
+        case LNX_shutdown: {
+            static const struct { uint32_t nr; int call; } map[] = {
+                { LNX_socket,      LSOC_SOCKET      },
+                { LNX_bind,        LSOC_BIND        },
+                { LNX_connect,     LSOC_CONNECT     },
+                { LNX_getsockopt,  LSOC_GETSOCKOPT  },
+                { LNX_setsockopt,  LSOC_SETSOCKOPT  },
+                { LNX_getsockname, LSOC_GETSOCKNAME },
+                { LNX_getpeername, LSOC_GETPEERNAME },
+                { LNX_sendto,      LSOC_SENDTO      },
+                { LNX_recvfrom,    LSOC_RECVFROM    },
+                { LNX_shutdown,    LSOC_SHUTDOWN    },
+            };
+            uint32_t args[6] = { f->ebx, f->ecx, f->edx, f->esi, f->edi, f->ebp };
+            int call = -1;
+            for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+                if (map[i].nr == f->eax) { call = map[i].call; break; }
+            f->eax = (uint32_t)linux_socketcall(call, args);
+            return;
+        }
 
         case LNX_ioctl:
             /* No TTY ioctls yet.  Returning ENOTTY (not ENOSYS) makes musl's

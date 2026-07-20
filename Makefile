@@ -84,7 +84,7 @@ ifeq ($(ARCH),i386)
   # (+ a user/<name>.c) and a recipe in pkg.c; the build + blob are generic.
   MUSL_COREUTILS := echo cat ls env sh
   ifneq ($(wildcard third_party/musl-i386/lib/libc.a),)
-    ARCH_EXTRA_OBJS += user/muslhello_muslblob.o \
+    ARCH_EXTRA_OBJS += user/muslhello_muslblob.o user/netmusl_muslblob.o \
                        $(patsubst %,user/%_muslblob.o,$(MUSL_COREUTILS))
   endif
 
