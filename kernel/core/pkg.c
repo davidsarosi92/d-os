@@ -602,6 +602,8 @@ extern const unsigned char _binary_user_libhubbub_so_0_start[]      __attribute_
 extern const unsigned char _binary_user_libhubbub_so_0_end[]        __attribute__((weak));
 extern const unsigned char _binary_user_libnsgif_so_0_start[]       __attribute__((weak));
 extern const unsigned char _binary_user_libnsgif_so_0_end[]         __attribute__((weak));
+extern const unsigned char _binary_user_libcss_so_0_start[]         __attribute__((weak));
+extern const unsigned char _binary_user_libcss_so_0_end[]           __attribute__((weak));
 
 /* §M38: the C++ runtime .so's (from the musl C++ toolchain) + the demo C++
  * library, provisioned into /lib so ld.so resolves a C++ program's DT_NEEDED
@@ -625,6 +627,7 @@ static struct pkg_recipe rc_wapcaplet;
 static struct pkg_recipe rc_parserutils;
 static struct pkg_recipe rc_hubbub;
 static struct pkg_recipe rc_nsgif;
+static struct pkg_recipe rc_libcss;
 
 /* The version string of the embedded runtime musl — arch-specific (the i386
  * build fetches+builds musl 1.2.5; the x86_64 prebuilt musl.cc sysroot ships
@@ -840,6 +843,16 @@ static void ldso_provision(void) {
             .abi="native", .soname="libnsgif.so.0", .is_libc=0 };
         pkg_register(&rc_nsgif);
         pkg_install("libnsgif");
+    }
+    if (_binary_user_libcss_so_0_start) {
+        rc_libcss = (struct pkg_recipe){ .id="libcss", .name="libcss",
+            .version="0.9.2", .deps="libwapcaplet libparserutils",
+            .content=_binary_user_libcss_so_0_start,
+            .content_len=blob_len(_binary_user_libcss_so_0_start,
+                                  _binary_user_libcss_so_0_end),
+            .abi="native", .soname="libcss.so.0", .is_libc=0 };
+        pkg_register(&rc_libcss);
+        pkg_install("libcss");
     }
 }
 

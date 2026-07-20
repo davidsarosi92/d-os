@@ -83,3 +83,5 @@ third_party/libwapcaplet/
 third_party/libparserutils/
 third_party/libhubbub/
 third_party/libnsgif/
+third_party/libcss/
+third_party/buildsystem/
