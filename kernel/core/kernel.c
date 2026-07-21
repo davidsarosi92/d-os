@@ -563,6 +563,15 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
         }
     }
 
+    /* Provision the package store on the BOOT task (big stack) before spawning
+     * the shell.  The shell would otherwise run pkg_init() lazily on its own
+     * (smaller) task stack — and with the browser embedded, provisioning the
+     * store (unpacking the ~9 MiB /res archive + copying the .so closure) has a
+     * deep VFS call chain that overflowed that stack, corrupting memory and
+     * triple-faulting shortly after the prompt (i386, 256 MiB).  Idempotent, so
+     * the shell's own call becomes a no-op. */
+    pkg_init();
+
     {
         /* S.1: the boot shell is whatever provider shell.provider
          * selects (config may already be loaded from /etc at this
