@@ -840,6 +840,30 @@ void gui_window_close(struct gui_window* win) {
     }
 }
 
+/* §M42 — a CLIENT-MANAGED WIN_APP window (the dosgui bridge for a ring-3 client
+ * like NetSurf).  Sever the host_task binding: the client is a DETACHED task
+ * reaped by init, not a compositor-owned app-host, so the compositor must NOT
+ * read host_task->state or reap it (that races init → task-table corruption →
+ * GUI wedge on the next open).  With host_task == NULL, apply_pending's WIN_APP
+ * teardown never observes the task's death — disposal is driven only by the
+ * client's explicit release below. */
+void gui_window_set_client_managed(struct gui_window* win) {
+    if (win) win->host_task = NULL;
+}
+
+/* §M42 — the client (dosgui_destroy, from dos_finalise) says it is finished with
+ * the window and will not touch it again.  Mark it disposable: want_close makes
+ * apply_pending pick it up; host_released makes it skip the host-coordination /
+ * host_task->state read and dispose immediately (reap_gui_host(NULL) is a
+ * no-op), so no init-owned task struct is ever touched. */
+void gui_window_client_release(struct gui_window* win) {
+    if (win && win->used) {
+        win->host_released = 1;
+        win->want_close    = 1;
+        need_frame         = 1;
+    }
+}
+
 void gui_window_set_tick(struct gui_window* win,
                          void (*fn)(struct gui_window*)) {
     if (win) win->on_tick = fn;

@@ -13,7 +13,6 @@
  * ============================================================================= */
 #include "dosgui.h"
 #include "gui.h"
-#include "task.h"
 #include "lock.h"
 #include <stddef.h>
 
@@ -71,20 +70,21 @@ int dosgui_create(int w, int h, const char* title) {
     spin_lock_init(&d->lock);
     gui_window_set_input_hook(d->win, dosgui_input_cb, d);
 
-    /* gui_app_window_create bound the window to THIS task (the ring-3 client
-     * that issued the DOSGUI_CREATE syscall) as its host_task.  The compositor's
-     * WIN_APP teardown (apply_pending) assumes a window's host_task is
-     * reap_owned — it reads host_task->state after the task dies and then reaps
-     * it, on the premise that init won't reap it out from under the compositor.
-     * A dosgui client (e.g. NetSurf), however, is a DETACHED task (parent=init),
-     * so WITHOUT this init's universal reaper races the compositor for the reap:
-     * init frees/recycles the task struct, the compositor then reads a stale
-     * host_task->state (never sees TASK_DEAD → the window leaks used=1) and/or
-     * double-reaps a recycled pid → task-table corruption → the whole GUI wedges
-     * on the NEXT open.  Claim the reap for the compositor (matching the pattern
-     * dispatch_launches uses for in-kernel app-hosts) so it is the SOLE reaper. */
-    struct task* client = task_current();
-    if (client) task_set_reap_owned(client, 1);
+    /* Detach the window from the app-host reap machinery.  gui_app_window_create
+     * bound the window to THIS task (the ring-3 client that issued DOSGUI_CREATE)
+     * as its host_task, and the compositor's WIN_APP teardown (apply_pending)
+     * would then read host_task->state after the task dies and reap it — on the
+     * premise (true for in-kernel app-hosts) that the host is reap_owned so init
+     * won't touch it.  A dosgui client (NetSurf) is a DETACHED task reaped by
+     * init, so that premise is FALSE: init frees/recycles the struct while the
+     * compositor still reads host_task->state and reap_gui_host()s a now-stale /
+     * recycled pid → task-table corruption → the GUI wedges on the NEXT open.
+     *
+     * Instead this is a CLIENT-MANAGED window: host_task is cleared so the
+     * compositor never reads or reaps the client task (init owns that), and the
+     * disposal is driven purely by the client's DOSGUI_DESTROY (dosgui_destroy →
+     * gui_window_client_release), never by observing the task's death. */
+    gui_window_set_client_managed(d->win);
 
     d->used = 1;
     return handle;
@@ -122,7 +122,11 @@ int dosgui_poll(int handle, struct dosgui_event* out) {
 void dosgui_destroy(int handle) {
     if (handle < 0 || handle >= DOSGUI_MAX || !g_dg[handle].used) return;
     struct dosgui_win* d = &g_dg[handle];
-    if (d->win) gui_window_close(d->win);
+    /* The client is done with the window (this is its last dosgui call, from
+     * dos_finalise just before it exits).  Release it to the compositor for
+     * disposal — client_release marks want_close + host_released so apply_pending
+     * tears it down WITHOUT touching the (init-owned) client task struct. */
+    if (d->win) gui_window_client_release(d->win);
     d->win = NULL;
     d->used = 0;
 }
