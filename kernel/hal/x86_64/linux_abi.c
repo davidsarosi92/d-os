@@ -95,6 +95,12 @@ extern uint64_t saved_rip;
 #define LNX_membarrier      324
 
 #define LNX_ENOSYS  38
+#define LNX_EINVAL  22
+#define LNX_readlink         89
+#define LNX_readlinkat      267
+#define LNX_access           21
+#define LNX_faccessat       269
+#define LNX_madvise          28
 #define LNX_ENOTTY  25
 #define LNX_ENOENT   2
 #define LNX_EFAULT  14
@@ -367,6 +373,39 @@ void linux_syscall_dispatch(struct int_frame* f) {
             f->rax = 0;
             return;
         }
+        case LNX_readlink:
+        case LNX_readlinkat: {
+            /* readlink(path, buf, sz) / readlinkat(dirfd, path, buf, sz).  The
+             * d-os VFS has no symlinks, so for an existing path return -EINVAL
+             * ("not a symbolic link") and -ENOENT for a missing one.  musl's
+             * realpath() reads this exactly: -EINVAL → treat the component as a
+             * real file/dir and keep going; -ENOENT → fail.  This unblocks the
+             * realpath()-based resource + font path resolution NetSurf does. */
+            const char* path = (f->rax == LNX_readlink)
+                                   ? (const char*)a0    /* readlink: path=rdi */
+                                   : (const char*)a1;   /* readlinkat: path=rsi */
+            struct kstat k;
+            f->rax = (sys_stat(path, &k) != 0) ? (uint64_t)-LNX_ENOENT
+                                               : (uint64_t)-LNX_EINVAL;
+            return;
+        }
+        case LNX_access:
+        case LNX_faccessat: {
+            /* access(path, mode) / faccessat(dirfd, path, mode, flags).  We do
+             * not track per-file permissions yet, so treat it as an existence
+             * check: 0 if the path stats OK, -ENOENT otherwise.  NetSurf probes
+             * resource/font paths with access() before opening them. */
+            const char* path = (f->rax == LNX_access)
+                                   ? (const char*)a0    /* access: path=rdi */
+                                   : (const char*)a1;   /* faccessat: path=rsi */
+            struct kstat k;
+            f->rax = (sys_stat(path, &k) != 0) ? (uint64_t)-LNX_ENOENT : 0;
+            return;
+        }
+        case LNX_madvise:
+            /* Purely advisory (MADV_*) — safe to accept and ignore. */
+            f->rax = 0;
+            return;
         case LNX_getdents64:
             f->rax = (uint64_t)sys_getdents64((int)a0, (void*)a1, (size_t)a2);
             return;
