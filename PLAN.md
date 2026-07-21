@@ -76,6 +76,7 @@
 | §M43 | Native developer toolchain (self-hosting) — ◐ first slice shipped (i386, DOCS §4.36): **TinyCC compiles + runs C ON d-os** (`tcc`/`exec` shell cmds + Editor "Run" button).  Full gcc/clang self-hosting + binutils/make still open | — |
 | §M44 | Language ecosystems — Rust / C++ / .NET (NativeAOT→CoreCLR) / Java (JVM); run cross-built musl binaries, then per-runtime ports | — |
 | §M45 | Package manager frontend + GUI installer — apt-like UX + wizard over the §M35.5 store; remote repo over §M39 TLS; driver/module hot-swap via §M33 | — |
+| **§M46** | **Resilient control plane — secure-attention hotkeys + force-kill** — Ctrl+Alt+Del ⇒ always-live high-priority Task Manager; Ctrl+Alt+X ⇒ close the last user-opened (or frozen) app; window chrome (close/min/restore) stays live even when the owning app is wedged (close ⇒ force-kill after grace); Task Manager gains a force End-task; the enabler is a real force-kill of a wedged ring-3 process (now buildable post-§M25/§M34). Depends on §M22.3 + §M31 + §M27 | — |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -209,6 +210,7 @@ what); a session can pick a theme and push on it.
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | ✅ DOCS §4.22 (L1+L2; L3 HW deferred) |
 | M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation | Security | §M32 |
 | M33 | Execution domains — a service's run location (kernel / user / isolated) as a declared capability + config choice; driver placement (fault-tolerant → user-mode isolation) is the flagship case | Reliability | §M33 |
+| **M46** | **Resilient control plane — SAK hotkeys + force-kill** — Ctrl+Alt+Del = always-live Task Manager, Ctrl+Alt+X = kill last/frozen app, window chrome (close/min/restore) works even when the app is wedged (close ⇒ force-kill), Task Manager force-quit; the enabler is a real force-kill of a wedged ring-3 process | Reliability / UX | §M46 |
 
 ### Cross-cutting constraints
 
@@ -4008,6 +4010,94 @@ without killing its clients (the last item may land with §M33).
 
 **Depends on:** §M35.5 (store), §M39 (secure remote fetch), §M22 (GUI toolkit),
 §M33 (driver/module hot-swap).
+
+---
+
+## §M46 — Resilient control plane: secure-attention hotkeys + force-kill
+
+**Why (user priority — "fontos dolgok nagyon"):** processes are now separated
+(per-process address spaces, §M25) and a watchdog exists (§M31), so the desktop
+must gain the *always-available escape hatches* every real OS has: a way to
+reach the Task Manager and to kill a runaway/frozen program that NEVER depends
+on the misbehaving program cooperating.  The window chrome must stay a reliable
+kill switch even when the app behind it is wedged.
+
+**The four requirements (all must hold under load AND when an app is frozen):**
+
+1. **A always-live Task Manager hotkey — `Ctrl+Alt+Del`.**
+   A *secure-attention key* (SAK): trapped in the low-level keyboard input path
+   (the IRQ / input router), BEFORE per-window focus routing, so no app can
+   swallow it and a wedged compositor path can't block it.  It raises (or
+   spawns) the Task Manager, which runs at an **elevated scheduling priority**
+   so it stays responsive even while other tasks peg the CPU.  "Always works" is
+   the contract — verify it while a busy-loop app is running.
+
+2. **A "close last / frozen app" hotkey — `Ctrl+Alt+X`.**
+   Closes the **most-recently-opened *user-launched* window** (track a launch
+   order / "user-opened" stack — exclude system tasks), OR, if the target is
+   detected frozen, **force-kills** it.  Graceful first (want_close + short
+   grace), force-kill on timeout or when already flagged frozen by §M31.
+
+3. **Window chrome stays live even when the owning app is wedged.**
+   Close / minimize / restore(previous-size) hit-testing + drawing already run
+   on the **compositor**, not the app (M22.7), so they are inherently
+   independent — the gap is only the **close semantics**: today close sets
+   `want_close` and *waits* for the app to quit, which never happens if it is
+   frozen.  Fix: close does graceful-then-**force-kill** (grace timer, or
+   immediate force-kill if §M31 already flagged the window's task frozen).
+   Minimize/restore must keep working regardless (pure compositor state).
+
+4. **Task Manager force End-task.**
+   The Task Manager's "End task" must offer a **forced** kill (not only the
+   cooperative kthread contract), for a wedged pure-ring-3 process.
+
+**The key enabler — real force-kill of a wedged ring-3 process.**
+The M22.3/M27 `task_kill` is *cooperative* (a kthread only dies at its next
+`task_should_stop`/yield; the M25 note "force-kill of a wedged pure-ring3 task
+(needs M25/§M33 isolation)" was the open item).  It is now buildable: a ring-3
+app in a userland infinite loop is **preemptible** (the timer IRQ always
+regains control) and holds **no kernel locks** while spinning, so the kernel can
+forcibly reclaim it —
+  * on next preemption of a force-killed task: mark `TASK_DEAD`, remove from all
+    runqueues, never reschedule;
+  * tear down its resources off a safe context (the reaper / compositor, not the
+    victim): address space (`vmm_space` free), fd table, futexes, **its GUI
+    windows** (dosgui client-managed release path), then reap;
+  * kill the whole **subtree** (`task_kill_tree`, M27) so children/helpers go
+    too.
+  A task wedged *inside a syscall holding a kernel lock* is the hard residual
+  case (can't be yanked mid-critical-section) — bound it with §M31 detection +
+  a "kill on return to userland" pending flag; document what is and isn't
+  force-killable (mirrors real kernels' "uninterruptible sleep").
+
+**Design notes / where things plug in.**
+- SAK trap: `kernel/drivers/keyboard/*` (+ USB HID) → a new input-router hook
+  checked before `keyq`/window routing; keep it arch-independent (the combo is
+  decoded from keycodes, not scancodes).  Make the two combos **config-keyed**
+  (`hotkey.taskmgr`, `hotkey.killapp`) per convention #5 (swappable from day 1).
+- Priority: needs a minimal **scheduling-priority tier** (the round-robin
+  scheduler currently has none) OR a "boosted" flag the SAK sets on the Task
+  Manager task — smallest viable change first.
+- "Last user-opened" tracking: a launch-order stack maintained where windows are
+  created (`gui_app_window_create` / the desktop launch path), tagged
+  user-vs-system.
+- Frozen detection: reuse §M31 L1 per-task heartbeat / an input-ack timeout on
+  the window's app-host queue; the window gains a `frozen` flag the chrome reads.
+
+**Dependencies:** §M22.3 (Task Manager + chrome + `task_kill`), §M31 (watchdog /
+frozen detection), §M27 (kill-tree + reaper), §M25/§M34 (per-process address
+spaces make force-kill safe).  All shipped → this milestone is unblocked.
+
+**Definition of done:**
+- `Ctrl+Alt+Del` raises the Task Manager within a frame even while a ring-3 app
+  busy-loops on the CPU; the Task Manager stays interactive.
+- `Ctrl+Alt+X` closes the last user-opened app; against a deliberately-frozen
+  app it force-kills it and disposes its window.
+- A frozen app's title-bar **X** force-kills it (window gone, task reaped, tree
+  cleaned); minimize/restore still work on it beforehand.
+- Task Manager "End task (force)" kills a wedged pure-ring-3 process.
+- Boot-tested in QEMU with a purpose-built "hang" test app (spin in userland /
+  spin in a syscall) proving each path, on i386 (then x86_64/aarch64).
 
 ---
 

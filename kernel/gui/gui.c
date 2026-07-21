@@ -1030,21 +1030,14 @@ static void pevq_push(uint8_t type, int x, int y) {
  * The compositor composites this rect on top of the windows while open, and
  * the mouse IRQ routes clicks inside it to the panel. */
 void gui_panel_set_popup(int on, int x, int y, int w, int h) {
-    /* Damage the pixels the popup is LEAVING (its old extent) and/or ENTERING
-     * (its new extent).  compose() only repaints the damage list, so without
-     * this, closing the launcher menu from a path that does not otherwise
-     * damage the screen (e.g. vista_click's app-launch branch, which just sets
-     * menu_open=0 + publish_popup) leaves the popup's stale pixels on screen —
-     * the menu "won't disappear" and the frame looks like it fell apart.  Damage
-     * the OLD rect before overwriting pnl_pop_*, then the NEW rect if opening. */
-    if (pnl_pop_on && pnl_pop_w > 0 && pnl_pop_h > 0)
-        gui_damage(pnl_pop_x, pnl_pop_y, pnl_pop_w, pnl_pop_h);
-    if (on && w > 0 && h > 0)
-        gui_damage(x, y, w, h);
     pnl_pop_x = x; pnl_pop_y = y; pnl_pop_w = w; pnl_pop_h = h;
     pnl_pop_on = on ? 1 : 0;
     panel_dirty = 1;
     need_frame = 1;
+    /* The actual repaint (including the OLD extent when the menu closes) is
+     * issued by desktop_main's panel-repaint block, OUTSIDE state_lock — this
+     * setter can be called from vista_click with state_lock held, so it must
+     * not touch the damage list itself. */
 }
 
 /* M22.7 — the shell asks for a chrome-only repaint (taskbar + open popup),
@@ -1074,6 +1067,9 @@ static void desktop_main(void) {
             task_current() ? task_current()->pid : -1, shell ? shell->name : "none");
     uint64_t last_tick = 0;
     int gen_seen = -1;
+    /* Previous launcher-popup extent — so when the menu closes we can repaint
+     * the pixels it used to cover (compose only repaints the damage list). */
+    int last_pop_on = 0, last_pop_x = 0, last_pop_y = 0, last_pop_w = 0, last_pop_h = 0;
     for (;;) {
         int busy = 0;
 
@@ -1112,8 +1108,21 @@ static void desktop_main(void) {
             if (shell && shell->draw) shell->draw(&panelsurf);
             spin_unlock(&panel_lock);
             gui_damage(0, work_h, fbsurf.w, fbsurf.h - work_h);   /* taskbar */
+            /* Repaint the popup's CURRENT extent (if open) AND the extent it
+             * had LAST frame (if it just closed or moved).  Without the "last"
+             * rect a launcher menu that closes via the app-launch path — which
+             * doesn't otherwise damage the screen — leaves its stale pixels on
+             * screen ("the menu won't disappear").  This runs OUTSIDE state_lock
+             * (gui_damage takes damage_lock), so no lock nesting. */
             if (pnl_pop_on)
                 gui_damage(pnl_pop_x, pnl_pop_y, pnl_pop_w, pnl_pop_h);
+            if (last_pop_on &&
+                (!pnl_pop_on || last_pop_x != pnl_pop_x || last_pop_y != pnl_pop_y ||
+                 last_pop_w != pnl_pop_w || last_pop_h != pnl_pop_h))
+                gui_damage(last_pop_x, last_pop_y, last_pop_w, last_pop_h);
+            last_pop_on = pnl_pop_on;
+            last_pop_x = pnl_pop_x; last_pop_y = pnl_pop_y;
+            last_pop_w = pnl_pop_w; last_pop_h = pnl_pop_h;
         }
         if (!busy) hal_cpu_idle();       /* halt only when idle (see compositor) */
         task_yield();
