@@ -1030,6 +1030,17 @@ static void pevq_push(uint8_t type, int x, int y) {
  * The compositor composites this rect on top of the windows while open, and
  * the mouse IRQ routes clicks inside it to the panel. */
 void gui_panel_set_popup(int on, int x, int y, int w, int h) {
+    /* Damage the pixels the popup is LEAVING (its old extent) and/or ENTERING
+     * (its new extent).  compose() only repaints the damage list, so without
+     * this, closing the launcher menu from a path that does not otherwise
+     * damage the screen (e.g. vista_click's app-launch branch, which just sets
+     * menu_open=0 + publish_popup) leaves the popup's stale pixels on screen —
+     * the menu "won't disappear" and the frame looks like it fell apart.  Damage
+     * the OLD rect before overwriting pnl_pop_*, then the NEW rect if opening. */
+    if (pnl_pop_on && pnl_pop_w > 0 && pnl_pop_h > 0)
+        gui_damage(pnl_pop_x, pnl_pop_y, pnl_pop_w, pnl_pop_h);
+    if (on && w > 0 && h > 0)
+        gui_damage(x, y, w, h);
     pnl_pop_x = x; pnl_pop_y = y; pnl_pop_w = w; pnl_pop_h = h;
     pnl_pop_on = on ? 1 : 0;
     panel_dirty = 1;
