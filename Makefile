@@ -768,7 +768,11 @@ define MUSL_CROSS_BUILD
 	@test -f $(MCM_DIR)/Makefile || { \
 	  echo "musl-cross-make missing — run ./scripts/fetch-musl-cross.sh first"; exit 1; }
 	rm -rf /tmp/mcm && cp -a $(MCM_DIR) /tmp/mcm
-	$(MAKE) -C /tmp/mcm TARGET=$(1) OUTPUT=/tmp/mcm/out install
+	# MUSL_VER=1.2.5: pin the toolchain's musl to match the runtime musl the
+	# kernel provisions (make musl → third_party/musl-i386, 1.2.5) so an i386
+	# musl-cross build and the /lib ld.so are the SAME version — the §M42
+	# browser stack builds and runs on one musl (was a 1.2.3/1.2.5 split).
+	$(MAKE) -C /tmp/mcm TARGET=$(1) OUTPUT=/tmp/mcm/out MUSL_VER=1.2.5 install
 	rm -rf third_party/musl-cross-$(2)
 	cp -a /tmp/mcm/out third_party/musl-cross-$(2)
 	rm -rf /tmp/mcm
