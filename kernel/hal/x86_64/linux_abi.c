@@ -102,6 +102,9 @@ extern uint64_t saved_rip;
 #define LNX_access           21
 #define LNX_faccessat       269
 #define LNX_madvise          28
+#define LNX_nanosleep        35
+#define LNX_clock_nanosleep 230
+#define LNX_sched_yield      24
 /* §M42 d-os display-bridge syscalls (well above the Linux range, so no clash). */
 #define LNX_DOSGUI_CREATE  0xD050
 #define LNX_DOSGUI_PRESENT 0xD051
@@ -410,6 +413,23 @@ void linux_syscall_dispatch(struct int_frame* f) {
         }
         case LNX_madvise:
             /* Purely advisory (MADV_*) — safe to accept and ignore. */
+            f->rax = 0;
+            return;
+        case LNX_nanosleep:
+        case LNX_clock_nanosleep: {
+            /* Yield for the requested time — NetSurf's fb event loop sleeps here
+             * when idle (else it busy-spins and starves the compositor).
+             * timespec {s64 tv_sec; s64 tv_nsec}: nanosleep req = rdi,
+             * clock_nanosleep req = rdx (after clockid + flags). */
+            const int64_t* req = (f->rax == LNX_nanosleep)
+                                   ? (const int64_t*)a0 : (const int64_t*)a2;
+            long ms = req ? (long)(req[0] * 1000 + req[1] / 1000000) : 0;
+            task_msleep(ms > 0 ? (uint32_t)ms : 1u);
+            f->rax = 0;
+            return;
+        }
+        case LNX_sched_yield:
+            task_msleep(1);                          /* cooperative yield */
             f->rax = 0;
             return;
 

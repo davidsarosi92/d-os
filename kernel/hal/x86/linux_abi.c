@@ -103,6 +103,9 @@ extern uint32_t saved_eip;
 #define LNX_readlink        85
 #define LNX_readlinkat     305
 #define LNX_madvise        219
+#define LNX_nanosleep      162
+#define LNX_clock_nanosleep 267
+#define LNX_sched_yield    158
 #define LNX_stat64         195
 #define LNX_lstat64        196
 #define LNX_fstatat64      300
@@ -773,6 +776,25 @@ void linux_syscall_dispatch(struct int_frame* f) {
         }
         case LNX_madvise:
             f->eax = 0;                              /* advisory — accept + ignore */
+            return;
+
+        case LNX_nanosleep:
+        case LNX_clock_nanosleep: {
+            /* Yield the CPU for the requested duration.  NetSurf's fb event loop
+             * sleeps here when idle; without it the browser busy-spins and
+             * starves the compositor (the desktop appears frozen).  timespec =
+             * {long tv_sec; long tv_nsec}; nanosleep's req is arg0 (ebx),
+             * clock_nanosleep's is arg2 (edx, after clockid + flags). */
+            const int32_t* req = (f->eax == LNX_nanosleep)
+                                   ? (const int32_t*)f->ebx : (const int32_t*)f->edx;
+            long ms = req ? ((long)req[0] * 1000 + req[1] / 1000000) : 0;
+            task_msleep(ms > 0 ? (uint32_t)ms : 1u);
+            f->eax = 0;
+            return;
+        }
+        case LNX_sched_yield:
+            task_msleep(1);                          /* cooperative yield */
+            f->eax = 0;
             return;
 
         /* §M42 display bridge — a ring-3 client (NetSurf's libnsfb "dos" surface)

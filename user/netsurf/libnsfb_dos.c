@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <time.h>       /* nanosleep — yield when idle so we don't busy-spin */
 
 #include "libnsfb.h"
 #include "libnsfb_plot.h"
@@ -108,13 +109,23 @@ static int dos_finalise(nsfb_t *nsfb)
 
 static bool dos_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
 {
-    (void)nsfb; (void)timeout;
+    (void)nsfb;
     if (dos_handle < 0)
         return false;
     struct dos_event de;
     long r = syscall(DOSGUI_POLL, (long)dos_handle, (long)&de);
-    if (r != 1)
+    if (r != 1) {
+        /* No event.  The frontend expects us to WAIT up to `timeout` ms — if we
+         * returned immediately its run loop would busy-spin and starve the
+         * compositor (the desktop looks frozen).  Sleep a short slice (capped so
+         * input stays responsive), yielding the CPU to the other tasks. */
+        if (timeout != 0) {
+            long ms = (timeout < 0 || timeout > 15) ? 15 : timeout;
+            struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
+            nanosleep(&ts, NULL);
+        }
         return false;
+    }
     if (de.type == 0) {                 /* key */
         event->type = de.pressed ? NSFB_EVENT_KEY_DOWN : NSFB_EVENT_KEY_UP;
         event->value.keycode = (enum nsfb_key_code_e)de.keycode;
