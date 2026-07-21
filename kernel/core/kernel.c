@@ -528,6 +528,28 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
             }
             if (me) me->linux_abi = prev;
         }
+
+        /* §M42 — deterministic NetSurf render smoke test.  With
+         * `x86_64.netsurf-test=1` the browser is launched at boot (before the
+         * interactive shell) so its init + render pipeline is captured on the
+         * serial log without depending on sendkey timing.  It enters the fbtk
+         * event loop and does not return (headless), so this is a dead-end boot
+         * used only for the render proof. */
+        const char* nt = config_get("x86_64.netsurf-test", "0");
+        if (nt && (nt[0] == '1' || nt[0] == 'y' || nt[0] == 't')) {
+            extern const unsigned char _binary_user_netsurf_dynelf_start[] __attribute__((weak));
+            extern const unsigned char _binary_user_netsurf_dynelf_end[]   __attribute__((weak));
+            if (_binary_user_netsurf_dynelf_start) {
+                struct task* me = task_current();
+                if (me) me->linux_abi = 1;
+                const char* argv[] = { "netsurf", "about:welcome" };
+                kprintf("netsurf-test: launching about:welcome...\n");
+                proc_exec_elf_argv(_binary_user_netsurf_dynelf_start,
+                    (size_t)(_binary_user_netsurf_dynelf_end -
+                             _binary_user_netsurf_dynelf_start), 2, argv);
+                kprintf("netsurf-test: returned\n");
+            }
+        }
     }
 #endif
 

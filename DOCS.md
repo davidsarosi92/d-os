@@ -3671,6 +3671,25 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-21 — §M42: the NetSurf browser BINARY compiles, links AND runs
+  (x86_64).**  The whole browser builds via `scripts/build-netsurf.sh`
+  (`make ARCH=x86_64 netsurf`): a curated ~147-TU set (core + framebuffer
+  frontend + fbtk, JS = the `none` stubs, no curl/PDF/SVG/JPEG/WebP) links a
+  915 KB musl dynamic PIE against the store `.so`s.  It is embedded + provisioned
+  (binary blob run by the `netsurf [url]` shell command under the linux-abi
+  personality; a `/res` archive — resources + English `Messages` + DejaVu TTFs —
+  unpacked into the VFS at boot).  **It RUNS:** `netsurf about:blank` takes the
+  browser through complete init (musl ld.so pulls the 14 store libs, `/res`
+  resources + fonts load, freetype comes up, the browser window is created, the
+  page is processed) and into the fbtk event loop with **zero unhandled
+  syscalls** — confirmed both interactively and via a boot-time autorun
+  (`x86_64.netsurf-test`, which shows the launch reaching the event loop with no
+  fault/return).  Running it grew the linux-abi surface by three syscalls
+  (`readlink`/`access`/`madvise`).  **Not yet visible:** the fb frontend renders
+  into a RAM surface headless; making it appear needs the display bridge (a d-os
+  `libnsfb` surface backend + a present-to-`gui_window` syscall, reusing the
+  Wayland `gui_window_blit` path) + a Start-menu `GUI_APP` launcher — the next
+  step.  See PLAN.md §M42.
 - **2026-07-21 — §M42: browser-runway libs (x86_64) — libnsutils / libnslog /
   libnspsl / libnsfb — store packages.**  The utility + framebuffer-surface deps
   that sit between the NetSurf parsing/DOM/decoder core and the browser *binary*.

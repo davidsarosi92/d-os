@@ -1670,6 +1670,7 @@ $(OBJ_DIR)/user/netsurf_dynblob.o: user/netsurf.dynelf
 # that pkg.c unpacks into the VFS at boot (same format as the §M43 tcc rootfs).
 user/netsurf_res.bin: user/netsurf.dynelf scripts/pack-rootfs.py
 	@mkdir -p build/netsurf
+	rm -f build/netsurf/Messages          # split-messages.pl opens O_EXCL
 	perl third_party/netsurf/tools/split-messages.pl -l en -p any -f messages \
 	    -o build/netsurf/Messages -i third_party/netsurf/resources/FatMessages
 	python3 scripts/pack-rootfs.py $@ \

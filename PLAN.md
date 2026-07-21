@@ -72,7 +72,7 @@
 | §M39 | Crypto + entropy + TLS + DNS — ◐ stages 1–3b shipped (i386, DOCS §4.35): ChaCha20 CSPRNG + /dev/urandom + getrandom (arch-generic); Mbed TLS v3.6.2 (`crypttest` SHA-256+AES-GCM); **verified TLS 1.3** handshake (`ssltest`); **stage 3b = REAL HTTPS** — musl `socketcall`→M24 sockets (`netmusl`), `httpstest` = DNS→TCP:443→TLS 1.3 handshake→Mozilla CA bundle at /etc/ssl/cert.pem→VERIFY_REQUIRED (flags 0x0)→HTTP 200.  **stage 3c** = musl `getaddrinfo` runs natively (recvmsg/sendmsg/poll in linux_abi → `httpstest` resolves via real musl resolver) + a userland `wget` (http+https over mbedTLS, argv URL).  Open: DHCP resolv.conf, x86_64/aarch64 | — |
 | §M40 | Client graphics stack — Wayland client + EGL/GL (Mesa swrast) + Skia | — |
 | §M41 | Linux syscall ABI shim — optional binary-compat accelerator | — |
-| §M42 | Web browser bring-up — NetSurf → WebKit → Firefox/Chromium (north star) — ◐ IN PROGRESS (x86_64): Tier-1 NetSurf component libs (wapcaplet/parserutils/hubbub/css/dom/nsgif/nsbmp) + runway libs (nsutils/nslog/nspsl/**nsfb** framebuffer surface) all ported + running as store pkgs; **the NetSurf BINARY now compiles + links** — a 915 KB musl dynamic PIE (`scripts/build-netsurf.sh` / `make netsurf`), DT_NEEDED = the store .so's.  Left: provision binary + `/res` (resources+TTF) into the ISO, a `netsurf` shell cmd + Start-menu launcher, first run (grow linux_abi), render → gui_window | — |
+| §M42 | Web browser bring-up — NetSurf → WebKit → Firefox/Chromium (north star) — ◐ IN PROGRESS (x86_64): Tier-1 NetSurf component libs (wapcaplet/parserutils/hubbub/css/dom/nsgif/nsbmp) + runway libs (nsutils/nslog/nspsl/**nsfb** framebuffer surface) all ported + running as store pkgs; **the NetSurf BINARY compiles + links + RUNS** — a 915 KB musl dynamic PIE (`make netsurf`); `netsurf [url]` shell cmd execs it under linux-abi, `/res` (resources+TTF+Messages) provisioned at boot; `netsurf about:blank` inits fully (ld.so + resources + freetype + browser window) into the fbtk event loop with ZERO unhandled syscalls (grew linux_abi by readlink/access/madvise).  Left: the DISPLAY BRIDGE (d-os libnsfb surface backend + present-to-gui_window syscall) + Start-menu launcher → visible render | — |
 | §M43 | Native developer toolchain (self-hosting) — ◐ first slice shipped (i386, DOCS §4.36): **TinyCC compiles + runs C ON d-os** (`tcc`/`exec` shell cmds + Editor "Run" button).  Full gcc/clang self-hosting + binutils/make still open | — |
 | §M44 | Language ecosystems — Rust / C++ / .NET (NativeAOT→CoreCLR) / Java (JVM); run cross-built musl binaries, then per-runtime ports | — |
 | §M45 | Package manager frontend + GUI installer — apt-like UX + wizard over the §M35.5 store; remote repo over §M39 TLS; driver/module hot-swap via §M33 | — |
@@ -3778,24 +3778,36 @@ frontend, Tier 2+); §M34 + §M35 (Tier 2 threads, Tier 3 multi-process);
 §M41 (pragmatically, Tier 3); §M23 (soft — media only).  In short: the
 capstone of the entire cluster.
 
-**Current state (2026-07-21) — the NetSurf BINARY compiles + links (x86_64).**
-The whole browser is built by `scripts/build-netsurf.sh` (`make ARCH=x86_64
-netsurf`): a curated ~146-TU set (core content/desktop/utils/handlers + the
-framebuffer frontend + fbtk, JS via the `none` stub set, no curl/PDF/SVG/JPEG/
-WebP) compiles clean on the musl cross-toolchain and links into a **915 KB musl
-dynamic PIE** (`user/netsurf.dynelf`, interp `/lib/ld-musl-x86_64.so.1`) whose
-DT_NEEDED is exactly our store `.so`s (libcss/dom/hubbub/wapcaplet/parserutils/
-nsutils/nslog/nspsl/nsgif/nsbmp/nsfb + png/z/freetype + libc).  Their recursive
-buildsystem is bypassed; a forced prelude header supplies the config macros and
-`_GNU_SOURCE`, `testament.h` is synthesised, and two header-shadow traps were
-solved (system `<time.h>` vs `utils/time.h`; libhubbub's `hubbub/errors.h` vs
-libdom's binding one) by curating the `-I` order.  `user/netsurf/dos_image_data.c`
-provides ABI-stubs for the built-in toolbar/cursor/throbber bitmaps (upstream
-`convert_image` output; off the first-render path).  **Left: provision the
-binary + `/res` (resources + DejaVu TTFs, staged) into the ISO, a `netsurf` shell
-command running it under the linux-abi personality, then the first run — expect
-to grow linux_abi's syscall surface — → headless render dump → blit the RAM
-surface into a `gui_window` + a Start-menu `GUI_APP("NetSurf")` launcher.**
+**Current state (2026-07-21) — the NetSurf BINARY compiles + links + RUNS
+(x86_64).**  The whole browser is built by `scripts/build-netsurf.sh` (`make
+ARCH=x86_64 netsurf`): a curated ~147-TU set (core content/desktop/utils/handlers
++ the framebuffer frontend + fbtk, JS via the `none` stub set, no curl/PDF/SVG/
+JPEG/WebP) compiles clean and links into a **915 KB musl dynamic PIE**
+(`user/netsurf.dynelf`, interp `/lib/ld-musl-x86_64.so.1`) whose DT_NEEDED is
+exactly our store `.so`s.  Their buildsystem is bypassed (forced prelude header
+for config macros + `_GNU_SOURCE`, synthesised `testament.h`, two `-I`-order
+header-shadow fixes, `dos_image_data.c` chrome-bitmap stubs).  The binary is
+embedded as a blob run by a **`netsurf [url]` shell command** under the linux-abi
+personality, and a `/res` archive (fb resources + English `Messages` +
+8 DejaVu TTFs) is unpacked into the VFS at boot.  **It RUNS:** `netsurf
+about:blank` goes through complete init — musl ld.so loads the 14 store libs,
+`/res` resources + fonts load, freetype initialises, the browser window is
+created, the page is processed — and enters the fbtk event loop with **zero
+unhandled syscalls** (confirmed interactively and via a boot autorun gated on
+`x86_64.netsurf-test`; no fault, no early return).  Running it grew linux_abi by
+`readlink`/`access`/`madvise`.
+
+**THE NEXT STEP — the display bridge (makes it visible).**  The fb frontend
+renders into a `libnsfb` RAM surface headless; nothing presents it.  Plan:
+(1) add a **d-os `libnsfb` surface backend** (like `ram.c` but backed by a
+`gui_window`) selected with `netsurf -f dos`; (2) new syscalls
+`gui_window_create` / `gui_window_present(buffer,w,h,stride)` / poll-input —
+`present` reuses the kernel's `gui_window_blit` (the exact primitive the §M26
+Wayland bridge uses at `wayland.c:269` to blit a client buffer into a WM window),
+input feeds the surface's `nsfb` event queue; (3) a Start-menu
+`GUI_APP("NetSurf")` launcher spawns the browser targeting a new `gui_window`.
+DoD: `netsurf https://example.com` renders text+layout into a desktop window,
+links clickable (network fetch = the custom `dos` fetcher over M24+mbedTLS).
 
 **Earlier this session — Tier 1 component libs + browser-runway libs COMPLETE
 (x86_64).**  The NetSurf core library set is ported + running as store
