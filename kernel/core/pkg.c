@@ -690,9 +690,7 @@ static void mkdir_parents(const char* path) {
     }
 }
 
-static void rootfs_unpack(void) {
-    const unsigned char* p   = _binary_user_rootfs_bin_start;
-    const unsigned char* end = _binary_user_rootfs_bin_end;
+static void rootfs_unpack_blob(const unsigned char* p, const unsigned char* end) {
     if (!p) return;
     while (p + 4 <= end) {
         uint32_t plen = rf_rd32(p); p += 4;
@@ -708,6 +706,16 @@ static void rootfs_unpack(void) {
         write_file(path, p, dlen);
         p += dlen;
     }
+}
+
+/* §M43 tcc rootfs + §M42 NetSurf resources — both use the same flat-archive
+ * format; unpack whichever blobs are embedded. */
+extern const unsigned char _binary_user_netsurf_res_bin_start[] __attribute__((weak));
+extern const unsigned char _binary_user_netsurf_res_bin_end[]   __attribute__((weak));
+
+static void rootfs_unpack(void) {
+    rootfs_unpack_blob(_binary_user_rootfs_bin_start, _binary_user_rootfs_bin_end);
+    rootfs_unpack_blob(_binary_user_netsurf_res_bin_start, _binary_user_netsurf_res_bin_end);
 }
 
 static void ldso_provision(void) {

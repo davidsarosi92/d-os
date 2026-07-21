@@ -27,9 +27,15 @@ def main():
         for spec in specs:
             src, dst = spec.split(':', 1)
             if os.path.isdir(src):
-                for root, _, files in os.walk(src):
+                # followlinks=True so a directory tree of symlinks (e.g. NetSurf's
+                # frontend res/ points at the shared resources/ + en/Messages) is
+                # walked through; broken symlinks are skipped with a warning.
+                for root, _, files in os.walk(src, followlinks=True):
                     for fn in files:
                         full = os.path.join(root, fn)
+                        if not os.path.exists(full):        # broken symlink
+                            sys.stderr.write(f"pack-rootfs: skip broken {full}\n")
+                            continue
                         rel = os.path.relpath(full, src)
                         dest = dst.rstrip('/') + '/' + rel.replace(os.sep, '/')
                         with open(full, 'rb') as f:

@@ -684,6 +684,41 @@ static void cmd_dns(const char* args) {
 extern const unsigned char _binary_user_wget_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_wget_muslelf_end[]   __attribute__((weak));
 
+extern const unsigned char _binary_user_netsurf_dynelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_netsurf_dynelf_end[]   __attribute__((weak));
+
+/* `netsurf [url]` — the NetSurf web browser (§M42).  Execs the musl dynamic PIE
+ * in ring 3 under the linux-abi personality (like wget); ld.so resolves its
+ * DT_NEEDED store .so's from /lib, and its runtime resources come from /res
+ * (provisioned into the VFS at boot).  With no argument it opens about:welcome. */
+static void cmd_netsurf(const char* args) {
+    if (!_binary_user_netsurf_dynelf_start) {
+        console_write("netsurf: not built — run `make ARCH=x86_64 netsurf`\n");
+        return;
+    }
+    static char abuf[512];
+    int n = 0; while (args[n] && n < (int)sizeof abuf - 1) { abuf[n] = args[n]; n++; }
+    abuf[n] = '\0';
+    const char* argv[8]; int argc = 0;
+    argv[argc++] = "netsurf";
+    char* q = abuf;
+    while (*q && argc < 7) {
+        while (*q == ' ') q++;
+        if (!*q) break;
+        argv[argc++] = q;
+        while (*q && *q != ' ') q++;
+        if (*q) *q++ = '\0';
+    }
+    size_t len = (size_t)(_binary_user_netsurf_dynelf_end -
+                          _binary_user_netsurf_dynelf_start);
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf_argv(_binary_user_netsurf_dynelf_start, len, argc, argv);
+    if (me) me->linux_abi = prev;
+    kprintf("\nnetsurf: exit rc=%d\n", rc);
+}
+
 /* `wget <url> [outfile]` — download over HTTP/HTTPS. */
 static void cmd_wget(const char* args) {
     /* Prefer the userland musl wget (does TLS); fall back to kernel HTTP. */
@@ -2261,6 +2296,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "arp "))     { cmd_arp(line + 4);  return; }
     if (starts_with(line, "nslookup ")){ cmd_dns(line + 9);  return; }
     if (starts_with(line, "wget "))    { cmd_wget(line + 5); return; }
+    if (streq(line, "netsurf"))        { cmd_netsurf(""); return; }
+    if (starts_with(line, "netsurf ")) { cmd_netsurf(line + 8); return; }
     if (streq(line, "nettest"))        { cmd_nettest();  return; }
     if (streq(line, "lsaudio"))        { audio_list();   return; }
     if (streq(line, "beep"))           { cmd_beep();     return; }

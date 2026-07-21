@@ -298,6 +298,12 @@ else ifeq ($(ARCH),x86_64)
   ifneq ($(wildcard third_party/libnsfb/src/libnsfb.c),)
     ARCH_EXTRA_OBJS += user/libnsfb0_blob.o user/nsfbtest_dynblob.o
   endif
+  # §M42 the NetSurf browser binary + its resources — slow (~147 TUs) → guarded
+  # on the prebuilt binary (run `make ARCH=x86_64 netsurf`).  Embeds the binary
+  # (exec'd by the `netsurf` shell cmd) + a /res archive (unpacked by pkg.c).
+  ifneq ($(wildcard user/netsurf.dynelf),)
+    ARCH_EXTRA_OBJS += user/netsurf_dynblob.o user/netsurf_res_blob.o
+  endif
 
 else ifeq ($(ARCH),aarch64)
   # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
@@ -1651,6 +1657,29 @@ user/netsurf.dynelf: user/libcss.so.0 user/libdom.so.0 user/libnsfb.so.0 \
                      user/libnsutils.so.0 user/libnslog.so.0 user/libnspsl.so.0 \
                      user/netsurf/dos_image_data.c
 	sh scripts/build-netsurf.sh
+
+# The browser binary itself, embedded as a blob so the `netsurf` shell command
+# execs it in ring 3 under the linux-abi personality (like wget) — it is a
+# dynamic PIE, so ld.so loads its DT_NEEDED store .so's from /lib at run time.
+$(OBJ_DIR)/user/netsurf_dynblob.o: user/netsurf.dynelf
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+# Its runtime resources: the fb frontend's res tree (css / Messages / welcome.html
+# / icons …) at /res + the DejaVu TTFs at /res/fonts.  Packed into a flat archive
+# that pkg.c unpacks into the VFS at boot (same format as the §M43 tcc rootfs).
+user/netsurf_res.bin: user/netsurf.dynelf scripts/pack-rootfs.py
+	@mkdir -p build/netsurf
+	perl third_party/netsurf/tools/split-messages.pl -l en -p any -f messages \
+	    -o build/netsurf/Messages -i third_party/netsurf/resources/FatMessages
+	python3 scripts/pack-rootfs.py $@ \
+	    third_party/netsurf/frontends/framebuffer/res:/res \
+	    build/netsurf/Messages:/res/Messages \
+	    user/netsurf/fonts:/res/fonts
+
+$(OBJ_DIR)/user/netsurf_res_blob.o: user/netsurf_res.bin
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
 
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
