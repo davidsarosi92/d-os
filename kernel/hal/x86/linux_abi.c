@@ -28,6 +28,7 @@
 #include "vfs.h"          /* VFS_* open flags — target of the translation */
 #include "proc.h"         /* proc_fork / proc_execve                      */
 #include "usermode.h"     /* struct user_regs (fork)                      */
+#include "dosgui.h"       /* §M42 display bridge (create/present/poll)    */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -93,7 +94,25 @@ extern uint32_t saved_eip;
 #define LNX_ENOSYS  38
 #define LNX_ENOTTY  25
 #define LNX_ENOENT   2
+#define LNX_EINVAL  22
 #define LNX_EAFNOSUPPORT 97
+/* §M42 — resource/font path resolution + the display bridge (see the x86_64
+ * twin for the rationale).  i386 syscall numbers + custom DOSGUI numbers. */
+#define LNX_access          33
+#define LNX_faccessat      307
+#define LNX_readlink        85
+#define LNX_readlinkat     305
+#define LNX_madvise        219
+#define LNX_stat64         195
+#define LNX_lstat64        196
+#define LNX_fstatat64      300
+#define LNX_statx          383
+#define LNX_newuname       122
+#define LNX_rt_sigaction   174
+#define LNX_DOSGUI_CREATE  0xD050
+#define LNX_DOSGUI_PRESENT 0xD051
+#define LNX_DOSGUI_POLL    0xD052
+#define LNX_DOSGUI_DESTROY 0xD053
 #define LNX_EOPNOTSUPP   95
 
 /* Linux socketcall sub-call numbers (linux/net.h). */
@@ -200,6 +219,7 @@ static void fill_stat64(struct lnx_stat64* s, const struct kstat* k) {
     s->__st_ino   = (uint32_t)k->size + 1;   /* crude but stable-per-file id */
     s->st_ino     = s->__st_ino;
 }
+
 
 /* Linux i386 `struct user_desc` (arch/x86/include/asm/ldt.h), the argument to
  * set_thread_area.  We only consume entry_number (write-back) + base_addr; the
@@ -544,6 +564,45 @@ void linux_syscall_dispatch(struct int_frame* f) {
             return;
         }
 
+        case LNX_stat64:
+        case LNX_lstat64: {
+            /* stat64/lstat64(path=ebx, statbuf=ecx) — path-based; musl falls back
+             * to these when statx (383) returns ENOSYS.  No symlinks, so lstat
+             * == stat.  NetSurf stats its resource + font files. */
+            struct kstat k;
+            if (sys_stat((const char*)f->ebx, &k) != 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
+            fill_stat64((struct lnx_stat64*)f->ecx, &k);
+            f->eax = 0;
+            return;
+        }
+        case LNX_fstatat64: {
+            /* fstatat64(dirfd=ebx, path=ecx, statbuf=edx, flags=esi) — AT_FDCWD
+             * only (absolute/relative-to-cwd paths, which is all NetSurf uses). */
+            struct kstat k;
+            if (sys_stat((const char*)f->ecx, &k) != 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
+            fill_stat64((struct lnx_stat64*)f->edx, &k);
+            f->eax = 0;
+            return;
+        }
+        case LNX_statx:
+            /* Deliberately ENOSYS: musl (incl. ld.so's library dedup) falls back
+             * to stat64, which we implement correctly.  A hand-rolled statx
+             * struct is error-prone (its dev/ino feed ld.so's already-loaded
+             * dedup — a wrong one makes ld.so reject valid libraries), so we do
+             * NOT return synthetic statx data.  The one-per-stat probe is cheap
+             * and silent (no log line here). */
+            f->eax = (uint32_t)-LNX_ENOSYS;
+            return;
+        case LNX_newuname:
+            /* uname(buf=ebx) — NetSurf builds its User-Agent from it. */
+            f->eax = (uint32_t)sys_uname((struct kutsname*)f->ebx);
+            return;
+        case LNX_rt_sigaction:
+            /* Accept + ignore: NetSurf installs SIGCHLD/SIGPIPE handlers it never
+             * needs headless.  Real delivery is a later item (as on x86_64). */
+            f->eax = 0;
+            return;
+
         case LNX_getdents64:
             /* readdir — musl packs the Linux dirent64 layout (sys_getdents64). */
             f->eax = (uint32_t)sys_getdents64((int)f->ebx, (void*)f->ecx, (size_t)f->edx);
@@ -688,6 +747,52 @@ void linux_syscall_dispatch(struct int_frame* f) {
             f->eax = 0;
             return;
         }
+
+        case LNX_readlink:
+        case LNX_readlinkat: {
+            /* No symlinks in the VFS → -EINVAL for an existing path (musl
+             * realpath() treats it as "use as-is"), -ENOENT if missing.
+             * Unblocks NetSurf's realpath()-based resource/font lookup. */
+            const char* path = (f->eax == LNX_readlink)
+                                   ? (const char*)f->ebx    /* readlink: path=ebx */
+                                   : (const char*)f->ecx;   /* readlinkat: path=ecx */
+            struct kstat k;
+            f->eax = (sys_stat(path, &k) != 0) ? (uint32_t)-LNX_ENOENT
+                                               : (uint32_t)-LNX_EINVAL;
+            return;
+        }
+        case LNX_access:
+        case LNX_faccessat: {
+            /* Existence check (no per-file perms yet): 0 if it stats OK. */
+            const char* path = (f->eax == LNX_access)
+                                   ? (const char*)f->ebx    /* access: path=ebx */
+                                   : (const char*)f->ecx;   /* faccessat: path=ecx */
+            struct kstat k;
+            f->eax = (sys_stat(path, &k) != 0) ? (uint32_t)-LNX_ENOENT : 0;
+            return;
+        }
+        case LNX_madvise:
+            f->eax = 0;                              /* advisory — accept + ignore */
+            return;
+
+        /* §M42 display bridge — a ring-3 client (NetSurf's libnsfb "dos" surface)
+         * drives a WM window.  Buffer/event pointers are in the caller's address
+         * space (active now).  See kernel/gui/dosgui.c. */
+        case LNX_DOSGUI_CREATE:
+            f->eax = (uint32_t)dosgui_create((int)f->ebx, (int)f->ecx,
+                                             (const char*)f->edx);
+            return;
+        case LNX_DOSGUI_PRESENT:
+            f->eax = (uint32_t)dosgui_present((int)f->ebx, (const uint32_t*)f->ecx,
+                                              (int)f->edx, (int)f->esi, (int)f->edi);
+            return;
+        case LNX_DOSGUI_POLL:
+            f->eax = (uint32_t)dosgui_poll((int)f->ebx, (struct dosgui_event*)f->ecx);
+            return;
+        case LNX_DOSGUI_DESTROY:
+            dosgui_destroy((int)f->ebx);
+            f->eax = 0;
+            return;
 
         default:
             kprintf("linux-abi: unhandled syscall %u (returning -ENOSYS)\n", f->eax);

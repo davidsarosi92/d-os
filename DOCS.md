@@ -3671,6 +3671,25 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-21 — §M42: NetSurf ported to i386 — renders in a desktop window on
+  BOTH x86 arches.**  The whole browser stack was rebuilt for i386 with the
+  musl-cross-i686 toolchain (`MUSL_ELF_CC` defined for i386; the support +
+  component + runway libs and the ~147-TU binary link as ELF32; harfbuzz is
+  skipped — freetype is built without it and NetSurf does not link it).  The
+  arch-independent display bridge (`dosgui.c` + the libnsfb `dos` surface)
+  needed no changes; the i386 linux-abi grew the syscalls NetSurf makes —
+  `readlink`/`readlinkat`, `access`/`faccessat`, `madvise`, `stat64`/`lstat64`/
+  `fstatat64`, `newuname`, `rt_sigaction`, and the `DOSGUI_CREATE`/`PRESENT`/
+  `POLL` bridge calls via `int 0x80`.  `about:welcome` renders identically to
+  x86_64 (screendump-verified).  Bring-up lessons: (1) the boot render-autorun
+  must call `pkg_init()` itself — on i386 the shell provisions `/lib` only
+  later, so the browser's DT_NEEDED store `.so`s must be planted first; (2)
+  **`statx` must return `-ENOSYS`, not synthetic data** — musl's ld.so uses
+  statx's dev/ino to dedup already-loaded libraries, and a hand-rolled statx
+  struct made ld.so wrongly reject valid `.so`s ("No such file"), while the
+  ENOSYS path (musl falls back to the correct `stat64`) works.  Open: the i386
+  toolchain musl (1.2.3) vs runtime musl (1.2.5) split is forward-compatible but
+  not yet unified.
 - **2026-07-21 — §M42: the NetSurf browser BINARY compiles, links AND runs
   (x86_64).**  The whole browser builds via `scripts/build-netsurf.sh`
   (`make ARCH=x86_64 netsurf`): a curated ~147-TU set (core + framebuffer

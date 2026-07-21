@@ -17,12 +17,16 @@
 # support libs (.so) already built.
 # =============================================================================
 set -u
-CC=/src/third_party/musl-cross-x86_64/bin/x86_64-linux-musl-gcc
+# Toolchain + dynamic-linker are arch-parameterised (the Makefile `netsurf`
+# target passes NS_CC/NS_LDSO per ARCH); default to x86_64.
+CC=${NS_CC:-/src/third_party/musl-cross-x86_64/bin/x86_64-linux-musl-gcc}
+LDSO=${NS_LDSO:-/lib/ld-musl-x86_64.so.1}
 NS=/src/third_party/netsurf
 TP=/src/third_party
 OUT=/src/build/netsurf
 U=/src/user
 mkdir -p "$OUT"
+rm -f "$OUT"/*.o           # arch-clean: never mix objects across toolchains
 
 # --- generated testament.h (git version info the build normally derives) ------
 cat > "$OUT/testament.h" <<'EOF'
@@ -164,7 +168,7 @@ echo "netsurf: compiled OK=$OK FAIL=$FAIL"
 
 # --- link: musl dynamic PIE against the store .so's (by path) -----------------
 $CC -pie -o "$OUT/netsurf.dynelf" "$OUT"/*.o \
-    -Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 -Wl,-rpath-link,"$U" \
+    -Wl,-dynamic-linker,"$LDSO" -Wl,-rpath-link,"$U" \
     "$U/libcss.so.0" "$U/libdom.so.0" "$U/libhubbub.so.0" \
     "$U/libwapcaplet.so.0" "$U/libparserutils.so.0" \
     "$U/libnsutils.so.0" "$U/libnslog.so.0" "$U/libnspsl.so.0" \

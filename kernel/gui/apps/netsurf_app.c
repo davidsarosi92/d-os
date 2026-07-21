@@ -9,9 +9,9 @@
  * a normal desktop window.  The binary is embedded as a blob and is x86_64-only
  * (the extern is weak); on arches without it the launcher just reports so.
  * ============================================================================= */
-/* NetSurf is x86_64-only (the binary is a 64-bit musl PIE); compile this whole
- * launcher to nothing on the other arches so no dead Start-menu entry appears. */
-#if defined(__x86_64__)
+/* NetSurf is ported to the x86 arches (the binary is a musl PIE); compile this
+ * launcher to nothing on aarch64 so no dead Start-menu entry appears there. */
+#if defined(__i386__) || defined(__x86_64__)
 
 #include "gui.h"
 #include "gui_app.h"

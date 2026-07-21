@@ -528,19 +528,27 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
             }
             if (me) me->linux_abi = prev;
         }
+    }
+#endif
 
-        /* §M42 — deterministic NetSurf render smoke test.  With
-         * `x86_64.netsurf-test=1` the browser is launched at boot (before the
-         * interactive shell) so its init + render pipeline is captured on the
-         * serial log without depending on sendkey timing.  It enters the fbtk
-         * event loop and does not return (headless), so this is a dead-end boot
-         * used only for the render proof. */
-        const char* nt = config_get("x86_64.netsurf-test", "0");
+    /* §M42 — deterministic NetSurf render smoke test (arch-generic; the browser
+     * is on i386 + x86_64).  With `netsurf.autostart=1` the browser is launched
+     * at boot before the interactive shell, so its init + render pipeline is
+     * captured on the serial log without depending on sendkey timing.  It enters
+     * the fbtk event loop and does not return (headless) — a dead-end boot used
+     * only for the render proof. */
+    {
+        const char* nt = config_get("netsurf.autostart", "0");
         if (nt && (nt[0] == '1' || nt[0] == 'y' || nt[0] == 't')) {
             extern const unsigned char _binary_user_netsurf_dynelf_start[] __attribute__((weak));
             extern const unsigned char _binary_user_netsurf_dynelf_end[]   __attribute__((weak));
             if (_binary_user_netsurf_dynelf_start) {
                 extern int gui_start(void);
+                pkg_init();                /* provision /lib ld.so + store .so's
+                                            * (idempotent; on i386 the shell
+                                            * would otherwise run it only later,
+                                            * so the browser's DT_NEEDED libs must
+                                            * be planted before we exec it) */
                 gui_start();               /* bring up the compositor */
                 task_msleep(400);          /* let it become ready (à la wayland) */
                 struct task* me = task_current();
@@ -554,7 +562,6 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
             }
         }
     }
-#endif
 
     {
         /* S.1: the boot shell is whatever provider shell.provider

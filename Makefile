@@ -123,6 +123,58 @@ ifeq ($(ARCH),i386)
     ARCH_EXTRA_OBJS += user/dostcc_blob.o user/rootfs_blob.o
   endif
 
+  # §M42 (i386) — the NetSurf browser stack, mirroring the x86_64 block below.
+  # All guards are shared-path wildcards (source or prebuilt .so), so the same
+  # conditions select the i386 builds; build.sh wipes user/*.so on arch switch,
+  # so the prebuilt-.so guards only fire once each is rebuilt for i386.  NB:
+  # NetSurf does NOT link harfbuzz directly (freetype is built without it), so
+  # the slow C++ harfbuzz build is not required here.
+  ifneq ($(wildcard third_party/zlib/zlib.h),)
+    ARCH_EXTRA_OBJS += user/libz_blob.o
+  endif
+  ifneq ($(wildcard third_party/libpng/png.h),)
+    ARCH_EXTRA_OBJS += user/libpng16_blob.o
+  endif
+  ifneq ($(wildcard user/libfreetype.so.6),)
+    ARCH_EXTRA_OBJS += user/libfreetype6_blob.o
+  endif
+  ifneq ($(wildcard third_party/libwapcaplet/src/libwapcaplet.c),)
+    ARCH_EXTRA_OBJS += user/libwapcaplet0_blob.o
+  endif
+  ifneq ($(wildcard third_party/libparserutils/Makefile),)
+    ARCH_EXTRA_OBJS += user/libparserutils0_blob.o
+  endif
+  ifneq ($(wildcard third_party/libhubbub/Makefile),)
+    ARCH_EXTRA_OBJS += user/libhubbub0_blob.o
+  endif
+  ifneq ($(wildcard third_party/libnsgif/src/gif.c),)
+    ARCH_EXTRA_OBJS += user/libnsgif0_blob.o
+  endif
+  ifneq ($(wildcard third_party/libnsbmp/src/libnsbmp.c),)
+    ARCH_EXTRA_OBJS += user/libnsbmp0_blob.o
+  endif
+  ifneq ($(wildcard user/libcss.so.0),)
+    ARCH_EXTRA_OBJS += user/libcss0_blob.o
+  endif
+  ifneq ($(wildcard user/libdom.so.0),)
+    ARCH_EXTRA_OBJS += user/libdom0_blob.o
+  endif
+  ifneq ($(wildcard third_party/libnsutils/src/base64.c),)
+    ARCH_EXTRA_OBJS += user/libnsutils0_blob.o
+  endif
+  ifneq ($(wildcard third_party/libnslog/src/core.c),)
+    ARCH_EXTRA_OBJS += user/libnslog0_blob.o
+  endif
+  ifneq ($(wildcard third_party/libnspsl/src/nspsl.c),)
+    ARCH_EXTRA_OBJS += user/libnspsl0_blob.o
+  endif
+  ifneq ($(wildcard third_party/libnsfb/src/libnsfb.c),)
+    ARCH_EXTRA_OBJS += user/libnsfb0_blob.o
+  endif
+  ifneq ($(wildcard user/netsurf.dynelf),)
+    ARCH_EXTRA_OBJS += user/netsurf_dynblob.o user/netsurf_res_blob.o
+  endif
+
   # Tier B — in-tree user libc build knobs (i386 reference).
   USER_CFLAGS   := -m32 -ffreestanding -fno-pie -fno-stack-protector \
                    -fno-builtin -nostdlib -Os -Wall -std=c11 -Iuser
@@ -132,6 +184,14 @@ ifeq ($(ARCH),i386)
   USER_CRT0_BUILD = nasm -f elf32 user/crt0.s -o $(OBJ_DIR)/user/crt0.o
   # The canonical PT_INTERP path an i386 musl dynamic binary carries.
   DOS_LDSO      := /lib/ld-musl-i386.so.1
+
+  # §M42 i386 — the musl cross toolchain that builds the store .so's + the
+  # NetSurf binary (same one §M38's C++ uses).  Only defined when it's present
+  # (make musl-cross-i686); its musl is ABI-compatible with the provisioned
+  # /lib/ld-musl-i386.so.1, so binaries built here run on it (as libstdc++ does).
+  MUSL_ELF_CC   := third_party/musl-cross-i686/bin/i686-linux-musl-gcc
+  MUSL_ELF_CXX  := third_party/musl-cross-i686/bin/i686-linux-musl-g++
+  MUSL_SYSROOT  := third_party/musl-cross-i686/i686-linux-musl
 
 else ifeq ($(ARCH),x86_64)
   # mcmodel=large: kernel can be linked anywhere in 64-bit address space.
@@ -1663,7 +1723,7 @@ netsurf: user/netsurf.dynelf
 user/netsurf.dynelf: user/libcss.so.0 user/libdom.so.0 user/libnsfb.so.0 \
                      user/libnsutils.so.0 user/libnslog.so.0 user/libnspsl.so.0 \
                      user/netsurf/dos_image_data.c
-	sh scripts/build-netsurf.sh
+	NS_CC=/src/$(MUSL_ELF_CC) NS_LDSO=$(DOS_LDSO) sh scripts/build-netsurf.sh
 
 # The browser binary itself, embedded as a blob so the `netsurf` shell command
 # execs it in ring 3 under the linux-abi personality (like wget) — it is a
