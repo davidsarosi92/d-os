@@ -422,6 +422,7 @@ CORE_C_SRCS := \
     kernel/core/vc.c \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
+    kernel/gui/dosgui.c \
     kernel/gui/widget.c \
     kernel/gui/wayland.c \
     kernel/gui/w_editor.c \
@@ -435,6 +436,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/taskman.c \
     kernel/gui/apps/editor.c \
     kernel/gui/apps/basic.c \
+    kernel/gui/apps/netsurf_app.c \
     kernel/core/basic.c \
     kernel/drivers/rtc/cmos_rtc.c \
     kernel/drivers/mouse/ps2_mouse.c \
@@ -511,6 +513,7 @@ CORE_C_SRCS := \
     kernel/drivers/usb/usb_hid.c \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
+    kernel/gui/dosgui.c \
     kernel/gui/widget.c \
     kernel/gui/wayland.c \
     kernel/gui/w_editor.c \
@@ -524,6 +527,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/taskman.c \
     kernel/gui/apps/editor.c \
     kernel/gui/apps/basic.c \
+    kernel/gui/apps/netsurf_app.c \
     kernel/mem/pmm.c \
     kernel/mem/slab.c \
     kernel/mem/kmalloc.c \
@@ -568,6 +572,7 @@ CORE_C_SRCS := \
     kernel/core/vc.c \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
+    kernel/gui/dosgui.c \
     kernel/gui/widget.c \
     kernel/gui/wayland.c \
     kernel/gui/w_editor.c \
@@ -581,6 +586,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/taskman.c \
     kernel/gui/apps/editor.c \
     kernel/gui/apps/basic.c \
+    kernel/gui/apps/netsurf_app.c \
     kernel/core/basic.c \
     kernel/drivers/rtc/cmos_rtc.c \
     kernel/drivers/mouse/ps2_mouse.c \
@@ -1627,11 +1633,12 @@ LNFB_SRCS := \
     $(LNFB_DIR)/src/libnsfb.c $(LNFB_DIR)/src/dump.c \
     $(LNFB_DIR)/src/cursor.c $(LNFB_DIR)/src/palette.c \
     $(LNFB_DIR)/src/surface/surface.c $(LNFB_DIR)/src/surface/ram.c \
+    user/netsurf/libnsfb_dos.c \
     $(LNFB_DIR)/src/plot/api.c $(LNFB_DIR)/src/plot/util.c \
     $(LNFB_DIR)/src/plot/generic.c $(LNFB_DIR)/src/plot/32bpp-xrgb8888.c \
     $(LNFB_DIR)/src/plot/32bpp-xbgr8888.c $(LNFB_DIR)/src/plot/16bpp.c \
     $(LNFB_DIR)/src/plot/8bpp.c
-user/libnsfb.so.0: $(LNFB_DIR)/src/libnsfb.c
+user/libnsfb.so.0: $(LNFB_DIR)/src/libnsfb.c user/netsurf/libnsfb_dos.c
 	$(MUSL_ELF_CC) -shared $(NSLIB_CFLAGS) -I$(LNFB_DIR)/include -I$(LNFB_DIR)/src \
 	    -Wl,-soname,libnsfb.so.0 -o $@ $(LNFB_SRCS)
 

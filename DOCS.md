@@ -3685,11 +3685,19 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   syscalls** — confirmed both interactively and via a boot-time autorun
   (`x86_64.netsurf-test`, which shows the launch reaching the event loop with no
   fault/return).  Running it grew the linux-abi surface by three syscalls
-  (`readlink`/`access`/`madvise`).  **Not yet visible:** the fb frontend renders
-  into a RAM surface headless; making it appear needs the display bridge (a d-os
-  `libnsfb` surface backend + a present-to-`gui_window` syscall, reusing the
-  Wayland `gui_window_blit` path) + a Start-menu `GUI_APP` launcher — the next
-  step.  See PLAN.md §M42.
+  (`readlink`/`access`/`madvise`).  **AND IT IS VISIBLE:** a **display bridge**
+  (`kernel/gui/dosgui.c` + a libnsfb `dos` surface backend, `user/netsurf/
+  libnsfb_dos.c`) lets the ring-3 browser drive a real WM window — three custom
+  linux-abi syscalls (`DOSGUI_CREATE`/`PRESENT`/`POLL`, 0xD050–52) create a
+  `gui_app_window`, blit each rendered frame into it with `gui_window_blit` (the
+  exact primitive the §M26 Wayland bridge uses), and hand input back from the
+  window's hook.  `netsurf -f dos about:welcome` renders the Welcome page —
+  heading, nav links, body text, a search box, link lists, DejaVu-freetype
+  fonts, correct colours — into a titled desktop window with a URL bar; a
+  **Start-menu `GUI_APP("NetSurf")`** launcher (`kernel/gui/apps/netsurf_app.c`)
+  opens it, and the `netsurf` shell command brings the compositor up itself.
+  Verified by a framebuffer screendump.  Left: a `dos` fetcher over M24+mbedTLS
+  for `https://` pages, and input/scroll polish.  See PLAN.md §M42.
 - **2026-07-21 — §M42: browser-runway libs (x86_64) — libnsutils / libnslog /
   libnspsl / libnsfb — store packages.**  The utility + framebuffer-surface deps
   that sit between the NetSurf parsing/DOM/decoder core and the browser *binary*.

@@ -540,13 +540,16 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
             extern const unsigned char _binary_user_netsurf_dynelf_start[] __attribute__((weak));
             extern const unsigned char _binary_user_netsurf_dynelf_end[]   __attribute__((weak));
             if (_binary_user_netsurf_dynelf_start) {
+                extern int gui_start(void);
+                gui_start();               /* bring up the compositor */
+                task_msleep(400);          /* let it become ready (à la wayland) */
                 struct task* me = task_current();
                 if (me) me->linux_abi = 1;
-                const char* argv[] = { "netsurf", "about:welcome" };
+                const char* argv[] = { "netsurf", "-f", "dos", "about:welcome" };
                 kprintf("netsurf-test: launching about:welcome...\n");
                 proc_exec_elf_argv(_binary_user_netsurf_dynelf_start,
                     (size_t)(_binary_user_netsurf_dynelf_end -
-                             _binary_user_netsurf_dynelf_start), 2, argv);
+                             _binary_user_netsurf_dynelf_start), 4, argv);
                 kprintf("netsurf-test: returned\n");
             }
         }

@@ -33,6 +33,7 @@
 #include "vfs.h"
 #include "proc.h"          /* proc_fork / proc_execve / proc_clone */
 #include "usermode.h"      /* struct user_regs (fork snapshot)     */
+#include "dosgui.h"        /* §M42 display bridge (create/present/poll)  */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -101,6 +102,11 @@ extern uint64_t saved_rip;
 #define LNX_access           21
 #define LNX_faccessat       269
 #define LNX_madvise          28
+/* §M42 d-os display-bridge syscalls (well above the Linux range, so no clash). */
+#define LNX_DOSGUI_CREATE  0xD050
+#define LNX_DOSGUI_PRESENT 0xD051
+#define LNX_DOSGUI_POLL    0xD052
+#define LNX_DOSGUI_DESTROY 0xD053
 #define LNX_ENOTTY  25
 #define LNX_ENOENT   2
 #define LNX_EFAULT  14
@@ -404,6 +410,25 @@ void linux_syscall_dispatch(struct int_frame* f) {
         }
         case LNX_madvise:
             /* Purely advisory (MADV_*) — safe to accept and ignore. */
+            f->rax = 0;
+            return;
+
+        /* §M42 display bridge — a ring-3 graphical client (NetSurf's libnsfb
+         * "dos" surface) drives a WM window through these.  Buffer/event
+         * pointers are in the caller's address space (active now), read/written
+         * directly.  See kernel/gui/dosgui.c. */
+        case LNX_DOSGUI_CREATE:
+            f->rax = (uint64_t)(int64_t)dosgui_create((int)a0, (int)a1, (const char*)a2);
+            return;
+        case LNX_DOSGUI_PRESENT:
+            f->rax = (uint64_t)(int64_t)dosgui_present((int)a0, (const uint32_t*)a1,
+                                                       (int)a2, (int)a3, (int)a4);
+            return;
+        case LNX_DOSGUI_POLL:
+            f->rax = (uint64_t)(int64_t)dosgui_poll((int)a0, (struct dosgui_event*)a1);
+            return;
+        case LNX_DOSGUI_DESTROY:
+            dosgui_destroy((int)a0);
             f->rax = 0;
             return;
         case LNX_getdents64:

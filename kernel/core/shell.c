@@ -696,13 +696,19 @@ static void cmd_netsurf(const char* args) {
         console_write("netsurf: not built — run `make ARCH=x86_64 netsurf`\n");
         return;
     }
+    /* The libnsfb "dos" surface needs the compositor; bring it up if the user
+     * hasn't run `gui` yet (idempotent), then give it a moment to be ready. */
+    gui_start();
+    task_msleep(300);
     static char abuf[512];
     int n = 0; while (args[n] && n < (int)sizeof abuf - 1) { abuf[n] = args[n]; n++; }
     abuf[n] = '\0';
-    const char* argv[8]; int argc = 0;
+    const char* argv[10]; int argc = 0;
     argv[argc++] = "netsurf";
+    argv[argc++] = "-f";            /* select the d-os windowed surface backend */
+    argv[argc++] = "dos";
     char* q = abuf;
-    while (*q && argc < 7) {
+    while (*q && argc < 9) {
         while (*q == ' ') q++;
         if (!*q) break;
         argv[argc++] = q;
