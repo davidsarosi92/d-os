@@ -3814,6 +3814,19 @@ multi-session push):**
    resources (`resources/`: default.css, Messages, favicon, ca-bundle) + a TTF
    font to the VFS (`NETSURF_FB_RESPATH`/`NETSURF_FB_FONTPATH`).  Resolve the
    remaining core-lib API glue against our store `.so`s.
+   *Recon done 2026-07-21 (no fundamental blocker — it's a flag-reconstruction
+   job):* `utils/messages.c` + `content/content.c` already compile clean against
+   the store-lib headers with `-std=gnu99 -Dnsframebuffer -Dsmall` + `-I{.,include,
+   content,content/handlers,utils,frontends,frontends/framebuffer}` + each store
+   lib's `include/` + `-I../zlib -I../freetype/include`.  Two concrete next
+   blockers seen: (a) `desktop/browser.c` wants `content/handlers/` on the include
+   path (the css/html handlers live there, not the old `render/`); (b)
+   `frontends/framebuffer/gui.c` needs the config `-D` macro set the buildsystem
+   normally supplies — `NETSURF_HOMEPAGE`, the version defines, and the
+   `NETSURF_FB_RESPATH`/`_FONTPATH`/`_FONT_*` paths (see
+   `frontends/framebuffer/Makefile.defaults`).  So the task is: assemble the TU
+   list (core + fb, minus js/curl/pdf/svg), the full `-I` set, and the `-D`
+   config batch — then write the `dos` fetcher and provision resources+font.
 4. **DoD:** `netsurf https://example.com` renders text+layout into a
    `gui_window`; links clickable.  Stage it: render `file:`/`about:blank` to a
    RAM surface and dump headless first, then wire the surface to the desktop and
