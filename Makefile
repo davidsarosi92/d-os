@@ -1639,6 +1639,19 @@ user/nsfbtest.dynelf: user/nsfbtest.c user/libnsfb.so.0
 	    -Wl,-dynamic-linker,$(DOS_LDSO) user/nsfbtest.c \
 	    user/libnsfb.so.0 -o $@
 
+# §M42 — the NetSurf browser BINARY.  scripts/build-netsurf.sh compiles the
+# curated core+fb TU set and links a musl dynamic PIE against the store .so's
+# (see that script for the whole story).  Slow (~146 TUs under emulation) →
+# its own PHONY target, guarded on the prebuilt binary like libcss/libdom.
+# Needs the NetSurf source (scripts/fetch-netsurf-libs.sh netsurf) + all the
+# store libs' .so + the DejaVu TTFs staged under the fb res/fonts dir.
+.PHONY: netsurf
+netsurf: user/netsurf.dynelf
+user/netsurf.dynelf: user/libcss.so.0 user/libdom.so.0 user/libnsfb.so.0 \
+                     user/libnsutils.so.0 user/libnslog.so.0 user/libnspsl.so.0 \
+                     user/netsurf/dos_image_data.c
+	sh scripts/build-netsurf.sh
+
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LIBGCC)

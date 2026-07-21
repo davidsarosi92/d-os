@@ -69,10 +69,10 @@
 | §M36 | POSIX syscall breadth + native libc — ◐ stage 1 (i386, DOCS §4.30) + stage 2 "two brothers": **Linux-ABI peer runs real musl + coreutils (`echo`/`cat`/`ls`/`env`) + a real `sh -c` (fork/execve/waitpid) FROM the store via `pkgrun`, data-driven `.abi` seam (DOCS §4.31)**; native musl-fork peer TODO (= 2nd ABI backend). Own-libc PARKED → `NATIVE_LIBC.md` | — |
 | §M37 | Dynamic linking — ld.so / `.so` / dlopen — ✅ shipped (i386, DOCS §4.33): shared musl (libc.so=ld.so) + ET_DYN/PIE loader + PT_INTERP + full auxv + full mmap2/mprotect/fstat64; dynamic hello, separate .so (DT_NEEDED + .so __thread), dlopen all green | — |
 | §M38 | C++ runtime + support libs — ◐ runtime shipped (i386, DOCS §4.34): musl-cross-make g++ 11.2.0 + libstdc++; `cpptest` throws+catches across a `.so` (DWARF unwind) + STL, dynamically linked.  Support libs (zlib/freetype/harfbuzz/ICU/Skia) still open | — |
-| §M39 | Crypto + entropy + TLS + DNS — ◐ stages 1–3b shipped (i386, DOCS §4.35): ChaCha20 CSPRNG + /dev/urandom + getrandom (arch-generic); Mbed TLS v3.6.2 (`crypttest` SHA-256+AES-GCM); **verified TLS 1.3** handshake (`ssltest`); **stage 3b = REAL HTTPS** — musl `socketcall`→M24 sockets (`netmusl`), `httpstest` = DNS→TCP:443→TLS 1.3 handshake→Mozilla CA bundle at /etc/ssl/cert.pem→VERIFY_REQUIRED (flags 0x0)→HTTP 200.  Open: musl `getaddrinfo`, `wget` front-end, DHCP resolv.conf, x86_64/aarch64 | — |
+| §M39 | Crypto + entropy + TLS + DNS — ◐ stages 1–3b shipped (i386, DOCS §4.35): ChaCha20 CSPRNG + /dev/urandom + getrandom (arch-generic); Mbed TLS v3.6.2 (`crypttest` SHA-256+AES-GCM); **verified TLS 1.3** handshake (`ssltest`); **stage 3b = REAL HTTPS** — musl `socketcall`→M24 sockets (`netmusl`), `httpstest` = DNS→TCP:443→TLS 1.3 handshake→Mozilla CA bundle at /etc/ssl/cert.pem→VERIFY_REQUIRED (flags 0x0)→HTTP 200.  **stage 3c** = musl `getaddrinfo` runs natively (recvmsg/sendmsg/poll in linux_abi → `httpstest` resolves via real musl resolver) + a userland `wget` (http+https over mbedTLS, argv URL).  Open: DHCP resolv.conf, x86_64/aarch64 | — |
 | §M40 | Client graphics stack — Wayland client + EGL/GL (Mesa swrast) + Skia | — |
 | §M41 | Linux syscall ABI shim — optional binary-compat accelerator | — |
-| §M42 | Web browser bring-up — NetSurf → WebKit → Firefox/Chromium (north star) | — |
+| §M42 | Web browser bring-up — NetSurf → WebKit → Firefox/Chromium (north star) — ◐ IN PROGRESS (x86_64): Tier-1 NetSurf component libs (wapcaplet/parserutils/hubbub/css/dom/nsgif/nsbmp) + runway libs (nsutils/nslog/nspsl/**nsfb** framebuffer surface) all ported + running as store pkgs; **the NetSurf BINARY now compiles + links** — a 915 KB musl dynamic PIE (`scripts/build-netsurf.sh` / `make netsurf`), DT_NEEDED = the store .so's.  Left: provision binary + `/res` (resources+TTF) into the ISO, a `netsurf` shell cmd + Start-menu launcher, first run (grow linux_abi), render → gui_window | — |
 | §M43 | Native developer toolchain (self-hosting) — ◐ first slice shipped (i386, DOCS §4.36): **TinyCC compiles + runs C ON d-os** (`tcc`/`exec` shell cmds + Editor "Run" button).  Full gcc/clang self-hosting + binutils/make still open | — |
 | §M44 | Language ecosystems — Rust / C++ / .NET (NativeAOT→CoreCLR) / Java (JVM); run cross-built musl binaries, then per-runtime ports | — |
 | §M45 | Package manager frontend + GUI installer — apt-like UX + wizard over the §M35.5 store; remote repo over §M39 TLS; driver/module hot-swap via §M33 | — |
@@ -3778,8 +3778,27 @@ frontend, Tier 2+); §M34 + §M35 (Tier 2 threads, Tier 3 multi-process);
 §M41 (pragmatically, Tier 3); §M23 (soft — media only).  In short: the
 capstone of the entire cluster.
 
-**Current state (2026-07-21) — Tier 1 component libs + browser-runway libs
-COMPLETE (x86_64).**  The NetSurf core library set is ported + running as store
+**Current state (2026-07-21) — the NetSurf BINARY compiles + links (x86_64).**
+The whole browser is built by `scripts/build-netsurf.sh` (`make ARCH=x86_64
+netsurf`): a curated ~146-TU set (core content/desktop/utils/handlers + the
+framebuffer frontend + fbtk, JS via the `none` stub set, no curl/PDF/SVG/JPEG/
+WebP) compiles clean on the musl cross-toolchain and links into a **915 KB musl
+dynamic PIE** (`user/netsurf.dynelf`, interp `/lib/ld-musl-x86_64.so.1`) whose
+DT_NEEDED is exactly our store `.so`s (libcss/dom/hubbub/wapcaplet/parserutils/
+nsutils/nslog/nspsl/nsgif/nsbmp/nsfb + png/z/freetype + libc).  Their recursive
+buildsystem is bypassed; a forced prelude header supplies the config macros and
+`_GNU_SOURCE`, `testament.h` is synthesised, and two header-shadow traps were
+solved (system `<time.h>` vs `utils/time.h`; libhubbub's `hubbub/errors.h` vs
+libdom's binding one) by curating the `-I` order.  `user/netsurf/dos_image_data.c`
+provides ABI-stubs for the built-in toolbar/cursor/throbber bitmaps (upstream
+`convert_image` output; off the first-render path).  **Left: provision the
+binary + `/res` (resources + DejaVu TTFs, staged) into the ISO, a `netsurf` shell
+command running it under the linux-abi personality, then the first run — expect
+to grow linux_abi's syscall surface — → headless render dump → blit the RAM
+surface into a `gui_window` + a Start-menu `GUI_APP("NetSurf")` launcher.**
+
+**Earlier this session — Tier 1 component libs + browser-runway libs COMPLETE
+(x86_64).**  The NetSurf core library set is ported + running as store
 packages, each with a ring-3 dyn-musl smoke test at boot (gated behind
 `x86_64.boot-selftest`): libwapcaplet (string intern), libparserutils,
 **libhubbub** (HTML5 parse), **libcss** (CSS), **libdom** (DOM), **libnsgif**
@@ -3982,6 +4001,25 @@ without killing its clients (the last item may land with §M33).
 
 ## Change log
 
+- **2026-07-21** — **§M42 NetSurf: runway libs + the browser BINARY compiles +
+  links (x86_64).**  Ported the last framework deps as store packages —
+  libnsutils (base64/time/unistd), libnslog (logging + a flex/bison filter),
+  libnspsl (public-suffix list) and **libnsfb** (the framebuffer surface, RAM
+  backend) — each with a dyn-musl boot self-test (`nsutest`, `nsfbtest` PASS).
+  Then built the **NetSurf binary itself**: `scripts/build-netsurf.sh` /
+  `make ARCH=x86_64 netsurf` compiles a curated ~146-TU set (core + fb frontend +
+  fbtk, JS = the `none` stubs, no curl/PDF/SVG/JPEG/WebP) and links a **915 KB
+  musl dynamic PIE** against the store `.so`s.  Their buildsystem is bypassed
+  (forced prelude header for config macros + `_GNU_SOURCE`, synthesised
+  `testament.h`, `dos_image_data.c` chrome-bitmap stubs); the two header-shadow
+  traps (`<time.h>` vs `utils/time.h`; libhubbub vs libdom `hubbub/errors.h`)
+  were solved via `-I` ordering.  Also earlier this session: musl `getaddrinfo`
+  runs natively + a userland `wget` (§M39 stage 3c), x86_64 interactive shell
+  confirmed, the buddy-bug exonerated + a permanent PMM invariant guard, and the
+  libdom clean-rebuild include fix.  Left toward the DoD: provision the binary +
+  `/res` (resources + DejaVu TTFs) into the ISO, a `netsurf` shell cmd +
+  Start-menu `GUI_APP` launcher, first run (grow linux_abi's syscall surface),
+  render → `gui_window`.
 - **2026-07-19** — **§M43 first slice: on-device C compiler (TinyCC) shipped
   (i386, DOCS §4.36).**  `tcc /hello.c -o /hello` + `exec /hello` compile and run
   C ON d-os; the M22.5 Editor gains a "Run" button (compile+run the buffer).
