@@ -277,6 +277,27 @@ else ifeq ($(ARCH),x86_64)
   ifneq ($(wildcard user/libdom.so.0),)
     ARCH_EXTRA_OBJS += user/libdom0_blob.o user/domtest_dynblob.o
   endif
+  # §M42 browser-runway libs: the utility + framebuffer-surface deps the NetSurf
+  # *binary* needs on top of the parsing/DOM/decoder core above.
+  # libnsutils — base64/time/unistd helpers (no deps); nsutest = base64 round-trip.
+  ifneq ($(wildcard third_party/libnsutils/src/base64.c),)
+    ARCH_EXTRA_OBJS += user/libnsutils0_blob.o user/nsutest_dynblob.o
+  endif
+  # libnslog — logging + flex/bison filter (no deps); provisioned only (used by
+  # NetSurf's utils/log.c NSLOG macros).
+  ifneq ($(wildcard third_party/libnslog/src/core.c),)
+    ARCH_EXTRA_OBJS += user/libnslog0_blob.o
+  endif
+  # libnspsl — public-suffix list (pre-generated psl.inc, no deps); provisioned.
+  ifneq ($(wildcard third_party/libnspsl/src/nspsl.c),)
+    ARCH_EXTRA_OBJS += user/libnspsl0_blob.o
+  endif
+  # libnsfb — the framebuffer-surface library = the fb frontend's render target.
+  # Only the RAM surface is built (sdl/x/vnc/wld need host libs); nsfbtest plots
+  # into a RAM surface and reads a pixel back (proves the frontend surface path).
+  ifneq ($(wildcard third_party/libnsfb/src/libnsfb.c),)
+    ARCH_EXTRA_OBJS += user/libnsfb0_blob.o user/nsfbtest_dynblob.o
+  endif
 
 else ifeq ($(ARCH),aarch64)
   # ARM64 port (M21).  Fundamentally different from x86: no port I/O (every
@@ -1534,6 +1555,89 @@ user/domtest.dynelf: user/domtest.c user/libdom.so.0
 	    -Wl,-dynamic-linker,$(DOS_LDSO) user/domtest.c \
 	    user/libdom.so.0 user/libhubbub.so.0 user/libwapcaplet.so.0 \
 	    user/libparserutils.so.0 -o $@
+
+# -----------------------------------------------------------------------------
+# §M42 browser-runway libs — libnsutils / libnslog / libnspsl / libnsfb.
+# These sit between the NetSurf core (parsers/DOM/decoders, above) and the
+# actual browser binary: utility helpers, logging, the public-suffix list, and
+# the framebuffer *surface* the fb frontend renders into.  Same "bypass their
+# buildsystem, just compile the .c set into a .so" pattern as above.
+# -----------------------------------------------------------------------------
+
+# libnsutils — base64 / time / unistd helpers, no deps.
+LNU_DIR := third_party/libnsutils
+user/libnsutils.so.0: $(LNU_DIR)/src/base64.c
+	$(MUSL_ELF_CC) -shared $(NSLIB_CFLAGS) -I$(LNU_DIR)/include \
+	    -Wl,-soname,libnsutils.so.0 -o $@ $(shell find $(LNU_DIR)/src -name '*.c')
+
+$(OBJ_DIR)/user/libnsutils0_blob.o: user/libnsutils.so.0
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+user/nsutest.dynelf: user/nsutest.c user/libnsutils.so.0
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(LNU_DIR)/include \
+	    -Wl,-dynamic-linker,$(DOS_LDSO) user/nsutest.c \
+	    user/libnsutils.so.0 -o $@
+
+# libnslog — logging with a flex/bison filter language, no deps.  Generate the
+# parser (bison 3.x → braced api.prefix) + lexer (flex, wrapped by filter-lexer.c)
+# into src/ first, then compile core.c + filter.c + the two generated TUs.
+LNL_DIR := third_party/libnslog
+user/libnslog.so.0: $(LNL_DIR)/src/core.c
+	@[ -f $(LNL_DIR)/src/filter-parser.c ] || ( cd $(LNL_DIR)/src && \
+	    bison -d -t --define=api.prefix={filter_} \
+	        --output=filter-parser.c --defines=filter-parser.h filter-parser.y )
+	@[ -f $(LNL_DIR)/src/filter-lexer.c ] || ( cd $(LNL_DIR)/src && \
+	    flex --outfile=filter-lexer.inc --header-file=filter-lexer.h filter-lexer.l && \
+	    printf '#ifndef __clang_analyzer__\n#include "filter-lexer.inc"\n#endif\n' > filter-lexer.c )
+	$(MUSL_ELF_CC) -shared $(NSLIB_CFLAGS) -I$(LNL_DIR)/include -I$(LNL_DIR)/src \
+	    -Wl,-soname,libnslog.so.0 -o $@ \
+	    $(LNL_DIR)/src/core.c $(LNL_DIR)/src/filter.c \
+	    $(LNL_DIR)/src/filter-parser.c $(LNL_DIR)/src/filter-lexer.c
+
+$(OBJ_DIR)/user/libnslog0_blob.o: user/libnslog.so.0
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+# libnspsl — public-suffix list lookup; psl.inc ships pre-generated, no deps.
+LNP_DIR := third_party/libnspsl
+user/libnspsl.so.0: $(LNP_DIR)/src/nspsl.c
+	$(MUSL_ELF_CC) -shared $(NSLIB_CFLAGS) -I$(LNP_DIR)/include -I$(LNP_DIR)/src \
+	    -Wl,-soname,libnspsl.so.0 -o $@ $(LNP_DIR)/src/nspsl.c
+
+$(OBJ_DIR)/user/libnspsl0_blob.o: user/libnspsl.so.0
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+# libnsfb — framebuffer surface + plotters.  The source list mirrors the lib's
+# own per-dir Makefiles: the plot/*-common.c files are #include TEMPLATES (a
+# concrete bpp TU includes them with macros set), NOT standalone TUs, and only
+# the default plotters/surface are built.  The RAM surface renders into a
+# caller-supplied buffer → exactly what we blit into a gui_window later.
+# Surfaces self-register via a __constructor__ (runs under musl ld.so).
+LNFB_DIR := third_party/libnsfb
+LNFB_SRCS := \
+    $(LNFB_DIR)/src/libnsfb.c $(LNFB_DIR)/src/dump.c \
+    $(LNFB_DIR)/src/cursor.c $(LNFB_DIR)/src/palette.c \
+    $(LNFB_DIR)/src/surface/surface.c $(LNFB_DIR)/src/surface/ram.c \
+    $(LNFB_DIR)/src/plot/api.c $(LNFB_DIR)/src/plot/util.c \
+    $(LNFB_DIR)/src/plot/generic.c $(LNFB_DIR)/src/plot/32bpp-xrgb8888.c \
+    $(LNFB_DIR)/src/plot/32bpp-xbgr8888.c $(LNFB_DIR)/src/plot/16bpp.c \
+    $(LNFB_DIR)/src/plot/8bpp.c
+user/libnsfb.so.0: $(LNFB_DIR)/src/libnsfb.c
+	$(MUSL_ELF_CC) -shared $(NSLIB_CFLAGS) -I$(LNFB_DIR)/include -I$(LNFB_DIR)/src \
+	    -Wl,-soname,libnsfb.so.0 -o $@ $(LNFB_SRCS)
+
+$(OBJ_DIR)/user/libnsfb0_blob.o: user/libnsfb.so.0
+	@mkdir -p $(@D)
+	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+user/nsfbtest.dynelf: user/nsfbtest.c user/libnsfb.so.0
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -I$(LNFB_DIR)/include \
+	    -Wl,-dynamic-linker,$(DOS_LDSO) user/nsfbtest.c \
+	    user/libnsfb.so.0 -o $@
 
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)

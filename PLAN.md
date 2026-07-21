@@ -3778,29 +3778,46 @@ frontend, Tier 2+); §M34 + §M35 (Tier 2 threads, Tier 3 multi-process);
 §M41 (pragmatically, Tier 3); §M23 (soft — media only).  In short: the
 capstone of the entire cluster.
 
-**Current state (2026-07-20) — Tier 1 component libs COMPLETE (x86_64).**  The
-NetSurf core library set is ported + running as store packages, each with a
-ring-3 dyn-musl smoke test at boot (gated behind `x86_64.boot-selftest`):
-libwapcaplet (string intern), libparserutils, **libhubbub** (HTML5 parse),
-**libcss** (CSS), **libdom** (DOM), **libnsgif** (GIF) and **libnsbmp** (BMP/ICO)
-— the last added this session; libnsutils is fetched.  Support libs from §M38/§M39
-(zlib, libpng, freetype, harfbuzz, mbedTLS) are also in the store.  **Next
-concrete steps for the browser binary (Tier 1 bring-up, its own multi-session
-push):**
-1. Fetch the remaining NetSurf deps: `libnsutils` (fetched), `libnslog`,
-   `libjpeg-turbo` (JPEG), and decide the fetcher — NetSurf can use its own
-   `fetch` over our M24/§M39 TLS, or a curl shim.
-2. Pick the frontend.  Two options: (a) **libnsfb framebuffer frontend** — port
-   `libnsfb` with a new surface backend targeting our linear framebuffer (or a
-   `gui_window` blit, like the Wayland bridge); simplest, no §M40.  (b) **Wayland
-   frontend** over §M26 — needs the upstream libwayland-client port (§M40), so
-   heavier.  Recommendation: start with (a) libnsfb → framebuffer.
-3. Fetch the `netsurf` app source; build the framebuffer frontend against the
-   store libs + freetype fonts (provision a TTF); resolve its remaining core-lib
-   API glue.
-4. DoD: `netsurf https://example.com` renders text+layout into a `gui_window`;
-   links clickable.  Start headless (render to a memory surface, dump), then wire
-   to the desktop.
+**Current state (2026-07-21) — Tier 1 component libs + browser-runway libs
+COMPLETE (x86_64).**  The NetSurf core library set is ported + running as store
+packages, each with a ring-3 dyn-musl smoke test at boot (gated behind
+`x86_64.boot-selftest`): libwapcaplet (string intern), libparserutils,
+**libhubbub** (HTML5 parse), **libcss** (CSS), **libdom** (DOM), **libnsgif**
+(GIF) and **libnsbmp** (BMP/ICO).  This session added the **runway libs** that
+sit between the parsing/DOM core and the browser *binary*: **libnsutils**
+(base64/time/unistd — hard dep; `nsutest` base64 round-trip PASS), **libnslog**
+(logging + a flex/bison filter language — used by NetSurf's `utils/log.c`),
+**libnspsl** (public-suffix list, pre-generated `psl.inc`), and **libnsfb** (the
+framebuffer *surface* the fb frontend renders into — RAM surface only;
+`nsfbtest` plots a grey rect + reads the pixel back, PASS).  All four install
+into the store + soname into `/lib` for ld.so.  The `netsurf` app source is
+fetched (`third_party/netsurf/`, gitignored).  Support libs from §M38/§M39
+(zlib, libpng, freetype, harfbuzz, mbedTLS) are also in the store.
+
+**Next concrete steps for the browser binary (Tier 1 bring-up, its own
+multi-session push):**
+1. **Frontend = libnsfb → framebuffer, DECIDED.**  The RAM surface is built and
+   proven (`nsfbtest`); its buffer is exactly what we blit into a `gui_window`
+   (like the Wayland bridge).  No §M40 needed.  The fb frontend also pulls in
+   NetSurf's own `fbtk` widget toolkit + `font_freetype` (we have freetype).
+2. **Fetcher = a custom NetSurf fetcher over M24 + §M39 mbedTLS, DECIDED (do NOT
+   port libcurl).**  NetSurf's fetch layer is a scheme→`fetcher_operation_table`
+   (`initialise/setup/start/poll/finalise`); the `curl.c` fetcher is one impl,
+   gated by `NETSURF_USE_CURL`.  We already fetch https in ring 3 with
+   `user/wget.c` (getaddrinfo + connect + mbedTLS CA-verify) — so write a `dos`
+   fetcher that reuses that path, registered via `fetch_add_fetcher`.  Start
+   with the built-in `data:`/`file:`/`about:`/`resource:` fetchers (no network)
+   to bring layout+render up headless first, then add the network fetcher.
+3. **Build the netsurf binary (~161 core+fb TUs).**  Bypass their buildsystem
+   like the libs; disable JS (no Duktape/nsgenbind) and PDF/SVG.  Codegen needed:
+   `split-messages.pl` (perl) for the i18n Messages only.  Provision the runtime
+   resources (`resources/`: default.css, Messages, favicon, ca-bundle) + a TTF
+   font to the VFS (`NETSURF_FB_RESPATH`/`NETSURF_FB_FONTPATH`).  Resolve the
+   remaining core-lib API glue against our store `.so`s.
+4. **DoD:** `netsurf https://example.com` renders text+layout into a
+   `gui_window`; links clickable.  Stage it: render `file:`/`about:blank` to a
+   RAM surface and dump headless first, then wire the surface to the desktop and
+   add the network fetcher.
 
 ---
 

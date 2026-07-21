@@ -88,3 +88,7 @@ third_party/buildsystem/
 third_party/libdom/
 third_party/libnsbmp/
 third_party/libnsutils/
+third_party/libnslog/
+third_party/libnspsl/
+third_party/libnsfb/
+third_party/netsurf/

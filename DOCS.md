@@ -3671,6 +3671,25 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-07-21 — §M42: browser-runway libs (x86_64) — libnsutils / libnslog /
+  libnspsl / libnsfb — store packages.**  The utility + framebuffer-surface deps
+  that sit between the NetSurf parsing/DOM/decoder core and the browser *binary*.
+  Ported pristine from git.netsurf-browser.org, cross-built vs musl into
+  versioned store packages (soname'd into `/lib` for ld.so), provisioned by
+  `pkg_init`.  **libnsutils** (base64/time/unistd — a hard NetSurf dep),
+  **libnslog** (logging + a flex/bison filter language, generated into `src/` at
+  build; used by NetSurf's `utils/log.c`), **libnspsl** (public-suffix list,
+  pre-generated `psl.inc`), **libnsfb** (the framebuffer surface the fb frontend
+  renders into — only the RAM surface + default plotters are built; the SDL/X/
+  VNC/Wayland surfaces need host libs).  Two boot self-tests (dyn-musl, gated
+  behind `x86_64.boot-selftest`): `nsutest` (base64 encode→decode round-trip,
+  PASS) and `nsfbtest` (create a RAM surface, `nsfb_plot_rectangle_fill` a grey
+  rect, read the pixel back = `0x00777777`, PASS — the exact render path the fb
+  frontend uses).  The `netsurf` app source is now fetched (gitignored).  PLAN.md
+  §M42 records the two now-DECIDED bring-up choices for the binary: frontend =
+  libnsfb→framebuffer (blit the RAM surface into a `gui_window`), fetcher = a
+  custom NetSurf fetcher over M24 + mbedTLS (reuse `user/wget.c`'s path, NOT a
+  libcurl port).
 - **2026-07-20 — §M42: libnsbmp (x86_64) — the BMP/ICO decoder — store package.**
   Completes the NetSurf image-decoder set alongside libnsgif.  Ported pristine
   from git.netsurf-browser.org, cross-built vs musl into a versioned store

@@ -608,6 +608,15 @@ extern const unsigned char _binary_user_libdom_so_0_start[]         __attribute_
 extern const unsigned char _binary_user_libdom_so_0_end[]           __attribute__((weak));
 extern const unsigned char _binary_user_libnsbmp_so_0_start[]       __attribute__((weak));
 extern const unsigned char _binary_user_libnsbmp_so_0_end[]         __attribute__((weak));
+/* §M42 browser-runway libs (utility + framebuffer surface, toward the binary). */
+extern const unsigned char _binary_user_libnsutils_so_0_start[]     __attribute__((weak));
+extern const unsigned char _binary_user_libnsutils_so_0_end[]       __attribute__((weak));
+extern const unsigned char _binary_user_libnslog_so_0_start[]       __attribute__((weak));
+extern const unsigned char _binary_user_libnslog_so_0_end[]         __attribute__((weak));
+extern const unsigned char _binary_user_libnspsl_so_0_start[]       __attribute__((weak));
+extern const unsigned char _binary_user_libnspsl_so_0_end[]         __attribute__((weak));
+extern const unsigned char _binary_user_libnsfb_so_0_start[]        __attribute__((weak));
+extern const unsigned char _binary_user_libnsfb_so_0_end[]          __attribute__((weak));
 
 /* §M38: the C++ runtime .so's (from the musl C++ toolchain) + the demo C++
  * library, provisioned into /lib so ld.so resolves a C++ program's DT_NEEDED
@@ -634,6 +643,7 @@ static struct pkg_recipe rc_nsgif;
 static struct pkg_recipe rc_libcss;
 static struct pkg_recipe rc_libdom;
 static struct pkg_recipe rc_nsbmp;
+static struct pkg_recipe rc_nsutils, rc_nslog, rc_nspsl, rc_nsfb;
 
 /* The version string of the embedded runtime musl — arch-specific (the i386
  * build fetches+builds musl 1.2.5; the x86_64 prebuilt musl.cc sysroot ships
@@ -879,6 +889,49 @@ static void ldso_provision(void) {
             .abi="native", .soname="libnsbmp.so.0", .is_libc=0 };
         pkg_register(&rc_nsbmp);
         pkg_install("libnsbmp");
+    }
+    /* §M42 browser-runway libs — utility helpers + the framebuffer surface the
+     * NetSurf binary links against (installed into /store + soname'd into /lib
+     * so ld.so resolves them for the eventual browser). */
+    if (_binary_user_libnsutils_so_0_start) {
+        rc_nsutils = (struct pkg_recipe){ .id="libnsutils", .name="libnsutils",
+            .version="1.0.0", .deps="",
+            .content=_binary_user_libnsutils_so_0_start,
+            .content_len=blob_len(_binary_user_libnsutils_so_0_start,
+                                  _binary_user_libnsutils_so_0_end),
+            .abi="native", .soname="libnsutils.so.0", .is_libc=0 };
+        pkg_register(&rc_nsutils);
+        pkg_install("libnsutils");
+    }
+    if (_binary_user_libnslog_so_0_start) {
+        rc_nslog = (struct pkg_recipe){ .id="libnslog", .name="libnslog",
+            .version="1.0.0", .deps="",
+            .content=_binary_user_libnslog_so_0_start,
+            .content_len=blob_len(_binary_user_libnslog_so_0_start,
+                                  _binary_user_libnslog_so_0_end),
+            .abi="native", .soname="libnslog.so.0", .is_libc=0 };
+        pkg_register(&rc_nslog);
+        pkg_install("libnslog");
+    }
+    if (_binary_user_libnspsl_so_0_start) {
+        rc_nspsl = (struct pkg_recipe){ .id="libnspsl", .name="libnspsl",
+            .version="1.0.0", .deps="",
+            .content=_binary_user_libnspsl_so_0_start,
+            .content_len=blob_len(_binary_user_libnspsl_so_0_start,
+                                  _binary_user_libnspsl_so_0_end),
+            .abi="native", .soname="libnspsl.so.0", .is_libc=0 };
+        pkg_register(&rc_nspsl);
+        pkg_install("libnspsl");
+    }
+    if (_binary_user_libnsfb_so_0_start) {
+        rc_nsfb = (struct pkg_recipe){ .id="libnsfb", .name="libnsfb",
+            .version="0.2.2", .deps="",
+            .content=_binary_user_libnsfb_so_0_start,
+            .content_len=blob_len(_binary_user_libnsfb_so_0_start,
+                                  _binary_user_libnsfb_so_0_end),
+            .abi="native", .soname="libnsfb.so.0", .is_libc=0 };
+        pkg_register(&rc_nsfb);
+        pkg_install("libnsfb");
     }
 }
 
