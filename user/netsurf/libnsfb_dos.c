@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <time.h>       /* nanosleep — yield when idle so we don't busy-spin */
+#include <sched.h>      /* sched_yield — surrender a slice on non-blocking polls */
 
 #include "libnsfb.h"
 #include "libnsfb_plot.h"
@@ -115,14 +116,22 @@ static bool dos_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
     struct dos_event de;
     long r = syscall(DOSGUI_POLL, (long)dos_handle, (long)&de);
     if (r != 1) {
-        /* No event.  The frontend expects us to WAIT up to `timeout` ms — if we
-         * returned immediately its run loop would busy-spin and starve the
-         * compositor (the desktop looks frozen).  Sleep a short slice (capped so
-         * input stays responsive), yielding the CPU to the other tasks. */
+        /* No event pending.  We must surrender the CPU in BOTH cases, otherwise
+         * the fb run loop starves the compositor on a UP scheduler and the whole
+         * desktop looks frozen while NetSurf is open.  Note the framebuffer
+         * frontend passes timeout==0 on EVERY iteration where a redraw is pending
+         * (framebuffer/gui.c: `if (fbtk_get_redraw_pending) timeout = 0;`), so the
+         * timeout==0 path is the hot one — it must yield too, not spin.
+         *   - timeout != 0 : a real wait — sleep a short, capped slice.
+         *   - timeout == 0 : a non-blocking poll — still give up one scheduler
+         *                    slice so the compositor/cursor stays live; we come
+         *                    right back to redraw, so this adds no visible lag. */
         if (timeout != 0) {
             long ms = (timeout < 0 || timeout > 15) ? 15 : timeout;
             struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
             nanosleep(&ts, NULL);
+        } else {
+            sched_yield();
         }
         return false;
     }

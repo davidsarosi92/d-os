@@ -47,7 +47,13 @@ struct ofile;
 
 #define TASK_NAME_MAX  31
 #define TASK_MAX_FDS   32       /* per-process file descriptors (0/1/2 = console) */
-#define TASK_KSTACK_SZ 4096
+/* Per-task kernel stack.  4 KiB was too small once ring-3 programs make
+ * deep-call syscalls: a NetSurf launched from the Start menu runs on a spawned
+ * task, and its DOSGUI_PRESENT → gui_window_blit → gfx_blit (a full-window
+ * composite) + the ELF/ld.so exec path overflowed a 4 KiB stack and corrupted
+ * memory (the desktop froze).  16 KiB matches the headroom the boot task's
+ * stack has (where the same browser ran fine). */
+#define TASK_KSTACK_SZ 16384
 
 enum task_state {
     TASK_RUNNABLE,
