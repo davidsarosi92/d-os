@@ -93,3 +93,5 @@ third_party/libnspsl/
 third_party/libnsfb/
 third_party/netsurf/
 user/*.so.*
+third_party/.musl123-backup/
+scratchpad_*.sh
