@@ -126,7 +126,10 @@ static bool dos_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
         }
         return false;
     }
-    if (de.type == 0) {                 /* key */
+    if (de.type == 2) {                 /* window closed (title-bar X) */
+        event->type = NSFB_EVENT_CONTROL;
+        event->value.controlcode = NSFB_CONTROL_QUIT;
+    } else if (de.type == 0) {          /* key */
         event->type = de.pressed ? NSFB_EVENT_KEY_DOWN : NSFB_EVENT_KEY_UP;
         event->value.keycode = (enum nsfb_key_code_e)de.keycode;
     } else {                            /* motion */

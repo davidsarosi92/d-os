@@ -82,6 +82,10 @@ struct gui_window* gui_app_window_create(const char* title, int x, int y,
  * Actual teardown happens on the compositor task. */
 void gui_window_close(struct gui_window* win);
 
+/* §M42 — poll whether the X button has been clicked (want_close).  A self-
+ * driven WIN_APP (NetSurf via the dosgui bridge) checks this to quit itself. */
+int  gui_window_want_close(struct gui_window* win);
+
 /* Raise + focus a window (used by singleton apps on re-launch). */
 void gui_window_raise(struct gui_window* win);
 

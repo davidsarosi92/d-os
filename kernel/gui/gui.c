@@ -849,6 +849,14 @@ int gui_window_minimized(struct gui_window* w) {
     return w ? w->minimized : 0;
 }
 
+/* §M42 — has the window been asked to close (its X button was clicked)?  A
+ * WIN_APP that drives itself (NetSurf, via the dosgui bridge) isn't running the
+ * app-host loop that would normally see want_close, so it polls this and quits
+ * on its own; the compositor then disposes the window when the task dies. */
+int gui_window_want_close(struct gui_window* w) {
+    return (w && w->used) ? w->want_close : 0;
+}
+
 static void raise_window(struct gui_window* win);
 
 void gui_window_raise(struct gui_window* win) {

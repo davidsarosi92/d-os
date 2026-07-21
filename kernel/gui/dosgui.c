@@ -85,6 +85,12 @@ int dosgui_present(int handle, const uint32_t* px, int w, int h, int stride) {
 int dosgui_poll(int handle, struct dosgui_event* out) {
     if (handle < 0 || handle >= DOSGUI_MAX || !g_dg[handle].used || !out) return -1;
     struct dosgui_win* d = &g_dg[handle];
+    /* Title-bar X clicked?  Report a close event so the client quits itself;
+     * once its task dies the compositor disposes the window (M22.7). */
+    if (d->win && gui_window_want_close(d->win)) {
+        out->type = 2; out->keycode = 0; out->pressed = 0; out->x = 0; out->y = 0;
+        return 1;
+    }
     int got = 0;
     spin_lock(&d->lock);
     if (d->head != d->tail) {
