@@ -39,6 +39,10 @@ int  gui_start(void);
 /* Non-zero once gui_start succeeded. */
 int  gui_is_active(void);
 
+/* §M42 — pid of the desktop/session task (0 before gui_start).  Taskbar-launched
+ * apps parent under this so they appear under the desktop in the process tree. */
+int  gui_desktop_pid(void);
+
 /* Queue an app launch onto the compositor.  The compositor spawns a
  * dedicated "app-host" task that runs the app (M22.7), so launching must
  * NOT call the app's open fn directly — that would run it on the caller's

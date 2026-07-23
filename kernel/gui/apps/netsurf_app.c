@@ -39,9 +39,14 @@ static void netsurf_launch(void) {
         kprintf("netsurf: not built into this image (x86_64 only)\n");
         return;
     }
-    /* Detached so the browser outlives the launcher click; it manages its own
-     * window through the display bridge. */
-    task_spawn_detached("netsurf", netsurf_task);
+    /* Parent the browser under the desktop/session task so it shows up under the
+     * GUI session in the process tree (ps / Task Manager), not as an init-owned
+     * detached task.  It still manages its own window through the display bridge,
+     * and init remains its universal reaper (parentage does not change reaping).
+     * Fall back to a detached task if the GUI is somehow not up yet. */
+    int sess = gui_desktop_pid();
+    if (sess > 0) task_spawn_under("netsurf", netsurf_task, sess);
+    else          task_spawn_detached("netsurf", netsurf_task);
 }
 
 GUI_APP("NetSurf", netsurf_launch);

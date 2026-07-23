@@ -2061,6 +2061,12 @@ struct gui_window* gui_app_window_create(const char* title, int x, int y,
 
 int gui_is_active(void) { return gui_active; }
 
+/* §M42 — the desktop/session task pid (0 until gui_start spawns it).  A GUI app
+ * launched from the taskbar should parent under this so it shows up under the
+ * desktop session in the process tree (and dies with the session), rather than
+ * being an init-owned detached task. */
+int gui_desktop_pid(void) { return desktop_pid; }
+
 /* Pick the desktop shell: `gui.shell` config value, matched against the
  * registry; falls back to "vista", then to the first registration. */
 static const struct desktop_shell* pick_shell(void) {

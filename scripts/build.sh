@@ -11,23 +11,29 @@ cd "$(dirname "$0")/.."
 
 ARCH=${ARCH:-i386}
 
-# Cross-arch artifact hygiene: the user-space programs built for BOTH x86 arches
-# (user/*.{muslelf,dynelf,cxxelf} + the C++/dynamic .so's) are arch-AGNOSTIC
-# paths — their objcopy blob symbol names derive from the path — so building
-# x86_64 overwrites them and a later i386 build would otherwise embed the
-# wrong-arch binary (e.g. an x86_64 cpptest in an i386 kernel → ELF load fail).
-# When the ARCH changes from the last build, wipe just those shared artifacts
-# (NOT the per-arch build/<arch> objects, which never conflict), so they
-# rebuild for the right target.  The x86_64-ONLY support libs (libz/libpng16/
-# libfreetype/libharfbuzz) are deliberately EXCLUDED: only x86_64 builds them
-# (so no cross-arch staleness), and freetype/harfbuzz are minutes-long compiles
-# guarded on the prebuilt .so — wiping them would silently drop the feature.
+# Cross-arch artifact hygiene: every user-space artifact lives at an ARCH-AGNOSTIC
+# path (user/*.{muslelf,dynelf,cxxelf,so,so.N}) — its objcopy blob symbol name
+# derives from the path — so an i386 build and an x86_64 build overwrite each
+# other, and using a stale wrong-arch one fails ("file in wrong format" at link,
+# or an ELF-load failure at boot).  Multi-arch rule: 32-bit runs ONLY 32-bit,
+# 64-bit runs 64- (and later 32-)bit, so a program's 32- vs 64-bit build MUST be
+# kept distinct.  Until the store is arch-tagged, we wipe the shared artifacts on
+# every ARCH change so they rebuild for the target.  (Per-arch build/<arch>/
+# objects never conflict and are kept.)
+#
+# NOTE: the §M42 NetSurf binary + its lib stack + freetype are gated by
+# PARSE-TIME `ifneq ($(wildcard user/…),)` guards (the browser + the slow
+# freetype compile are only embedded when their prebuilt artifact is present).
+# So after wiping them we must REBUILD them for the new arch in a SEPARATE make
+# BEFORE the `iso` make parses — otherwise the guards see them absent and the
+# feature is silently dropped from the image (browser missing / no fonts).
 STAMP=build/.last_arch
+ARCH_CHANGED=0
 if [ -f "$STAMP" ] && [ "$(cat "$STAMP" 2>/dev/null)" != "$ARCH" ]; then
     echo "build: ARCH changed ($(cat "$STAMP") → $ARCH) — clearing shared user/ artifacts"
-    rm -f user/*.muslelf user/*.dynelf user/*.cxxelf \
-          user/libgreet.so user/libcpplib.so user/libstdcxx.so \
-          user/libgccs.so user/ldmusl.so user/rootfs.bin 2>/dev/null || true
+    rm -f user/*.muslelf user/*.dynelf user/*.cxxelf user/*.so user/*.so.* \
+          user/ldmusl.so user/rootfs.bin 2>/dev/null || true
+    ARCH_CHANGED=1
 fi
 mkdir -p build
 printf '%s\n' "$ARCH" > "$STAMP"
@@ -50,4 +56,21 @@ case "$ARCH" in
 esac
 
 docker build --platform=linux/amd64 -f "$DOCKERFILE" -t "$IMAGE" .
+
+# On an ARCH change, rebuild the PARSE-TIME-guarded slow artifacts for the new
+# arch BEFORE the main `iso` make (see the hygiene note above).  x86 only — the
+# NetSurf/freetype stack is not built on aarch64.  Guarded on the source trees so
+# a checkout without them just skips (no browser, but a clean build).
+if [ "$ARCH_CHANGED" = 1 ] && [ "$TARGET" = iso ]; then
+    if [ -f third_party/freetype/include/ft2build.h ]; then
+        echo "build: rebuilding freetype for $ARCH (font support)"
+        docker run --rm --platform=linux/amd64 -v "$PWD":/src "$IMAGE" make ARCH="$ARCH" freetype
+    fi
+    if [ -f third_party/netsurf/Makefile ] || [ -d third_party/netsurf ]; then
+        echo "build: rebuilding NetSurf for $ARCH (browser)"
+        docker run --rm --platform=linux/amd64 -v "$PWD":/src "$IMAGE" make ARCH="$ARCH" netsurf || \
+            echo "build: NetSurf rebuild skipped/failed — image will build without the browser"
+    fi
+fi
+
 docker run --rm --platform=linux/amd64 -v "$PWD":/src "$IMAGE" make ARCH="$ARCH" "$TARGET"
