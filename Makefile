@@ -1724,8 +1724,15 @@ user/nsfbtest.dynelf: user/nsfbtest.c user/libnsfb.so.0
 # store libs' .so + the DejaVu TTFs staged under the fb res/fonts dir.
 .PHONY: netsurf
 netsurf: user/netsurf.dynelf
-user/netsurf.dynelf: user/libcss.so.0 user/libdom.so.0 user/libnsfb.so.0 \
+# Prerequisites MUST list every .so scripts/build-netsurf.sh links against (its
+# full DT_NEEDED closure) — otherwise `make netsurf` on a clean tree fails to
+# find libs that only `make iso`'s blob targets would otherwise have built (this
+# bit the cross-arch rebuild: `ld: cannot find user/libnsgif.so.0`).
+user/netsurf.dynelf: user/libcss.so.0 user/libdom.so.0 user/libhubbub.so.0 \
+                     user/libwapcaplet.so.0 user/libparserutils.so.0 \
                      user/libnsutils.so.0 user/libnslog.so.0 user/libnspsl.so.0 \
+                     user/libnsgif.so.0 user/libnsbmp.so.0 user/libnsfb.so.0 \
+                     user/libpng16.so.16 user/libz.so.1 user/libfreetype.so.6 \
                      user/netsurf/dos_image_data.c
 	NS_CC=/src/$(MUSL_ELF_CC) NS_LDSO=$(DOS_LDSO) sh scripts/build-netsurf.sh
 
