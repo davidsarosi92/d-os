@@ -13,6 +13,7 @@
  * ============================================================================= */
 #include "dosgui.h"
 #include "gui.h"
+#include "task.h"
 #include "lock.h"
 #include <stddef.h>
 
@@ -84,7 +85,7 @@ int dosgui_create(int w, int h, const char* title) {
      * compositor never reads or reaps the client task (init owns that), and the
      * disposal is driven purely by the client's DOSGUI_DESTROY (dosgui_destroy →
      * gui_window_client_release), never by observing the task's death. */
-    gui_window_set_client_managed(d->win);
+    gui_window_set_client_managed(d->win, task_current() ? task_current()->pid : 0);
 
     d->used = 1;
     return handle;

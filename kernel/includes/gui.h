@@ -94,7 +94,7 @@ int  gui_window_want_close(struct gui_window* win);
  * client is a detached, init-reaped ring-3 task, NOT a compositor app-host:
  *   set_client_managed — sever host_task so the compositor never reads/reaps it;
  *   client_release      — client is finished; mark the window disposable. */
-void gui_window_set_client_managed(struct gui_window* win);
+void gui_window_set_client_managed(struct gui_window* win, int client_pid);
 void gui_window_client_release(struct gui_window* win);
 
 /* Raise + focus a window (used by singleton apps on re-launch). */

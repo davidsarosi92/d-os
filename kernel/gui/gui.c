@@ -139,6 +139,11 @@ struct gui_window {
      * widgets + calls on_close + sets host_released; the compositor then
      * disposes the window struct (see apply_pending / destroy_window). */
     struct task* host_task;
+    /* §M42/§M46 — a CLIENT-MANAGED window (dosgui bridge) has host_task == NULL
+     * and instead records its ring-3 client's pid here, so the compositor can
+     * dispose the window if that client dies WITHOUT a clean DOSGUI_DESTROY
+     * (force-kill / crash).  0 for a normal app-host window. */
+    int  client_pid;
     struct app_event aq[AQ_SZ];
     volatile uint32_t aq_h, aq_t;
     volatile int tick_pending;          /* compositor asks host to on_tick */
@@ -847,8 +852,8 @@ void gui_window_close(struct gui_window* win) {
  * GUI wedge on the next open).  With host_task == NULL, apply_pending's WIN_APP
  * teardown never observes the task's death — disposal is driven only by the
  * client's explicit release below. */
-void gui_window_set_client_managed(struct gui_window* win) {
-    if (win) win->host_task = NULL;
+void gui_window_set_client_managed(struct gui_window* win, int client_pid) {
+    if (win) { win->host_task = NULL; win->client_pid = client_pid; }
 }
 
 /* §M42 — the client (dosgui_destroy, from dos_finalise) says it is finished with
@@ -1512,6 +1517,22 @@ static void apply_pending(void) {
             win->want_close = 1;
         }
 
+        /* §M46 — a CLIENT-MANAGED window (dosgui bridge, host_task == NULL) whose
+         * ring-3 client died WITHOUT a clean DOSGUI_DESTROY (force-kill / crash):
+         * the client can no longer release the window, so the compositor does it.
+         * task_find(NULL/DEAD) = the client is gone → mark disposable.  (init is
+         * the client's reaper; we only dispose the window.) */
+        if (!win->want_close && win->kind == WIN_APP && !win->host_released &&
+            win->host_task == NULL && win->client_pid > 0) {
+            struct task* ct = task_find(win->client_pid);
+            if (!ct || ct->state == TASK_DEAD) {
+                kprintf("gui: client-managed window '%s' orphaned (pid %d gone) — disposing\n",
+                        win->title, win->client_pid);
+                win->host_released = 1;   /* client gone; nothing to coordinate */
+                win->want_close    = 1;   /* teardown below disposes it */
+            }
+        }
+
         /* M22.7 — WIN_APP teardown is a two-actor dance.  Normally the host
          * sees want_close, runs on_close + frees its widgets, and sets
          * host_released; we then dispose the struct.  If the host died
@@ -1939,6 +1960,9 @@ static struct gui_window* window_alloc(const char* title, enum win_kind kind,
     win->surf.px = NULL; win->surf.owns_px = 0;
     /* M22.7 — per-task app fields. */
     win->host_task = NULL;
+    win->client_pid = 0;                /* §M46 — clear stale client on reuse */
+    win->input_hook = NULL;             /* dosgui/wayland re-arm per window     */
+    win->input_ctx  = NULL;
     win->aq_h = win->aq_t = 0;
     win->tick_pending = win->layout_pending = win->host_released = 0;
     spin_lock_init(&win->lock);
