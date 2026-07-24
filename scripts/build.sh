@@ -57,20 +57,37 @@ esac
 
 docker build --platform=linux/amd64 -f "$DOCKERFILE" -t "$IMAGE" .
 
-# On an ARCH change, rebuild the PARSE-TIME-guarded slow artifacts for the new
-# arch BEFORE the main `iso` make (see the hygiene note above).  x86 only — the
-# NetSurf/freetype stack is not built on aarch64.  Guarded on the source trees so
-# a checkout without them just skips (no browser, but a clean build).
-if [ "$ARCH_CHANGED" = 1 ] && [ "$TARGET" = iso ]; then
-    if [ -f third_party/freetype/include/ft2build.h ]; then
-        echo "build: rebuilding freetype for $ARCH (font support)"
+# Rebuild the PARSE-TIME-guarded slow artifacts (freetype, NetSurf) BEFORE the
+# main `iso` make (see the hygiene note above), whenever they are MISSING or the
+# ARCH changed.  The `iso`/kernel guards embed the browser only if its prebuilt
+# artifact is present, so a plain build after they were wiped (a prior arch
+# switch, a `make clean`, an interrupted build) would SILENTLY ship without the
+# browser — the Start-menu entry (a static GUI_APP registration) would still show
+# but clicking it does nothing.  Rebuilding-if-missing makes every build
+# self-healing.  x86 only — the NetSurf/freetype stack is not built on aarch64.
+if [ "$TARGET" = iso ]; then
+    if [ -f third_party/freetype/include/ft2build.h ] && \
+       { [ "$ARCH_CHANGED" = 1 ] || [ ! -f user/libfreetype.so.6 ]; }; then
+        echo "build: (re)building freetype for $ARCH (font support)"
         docker run --rm --platform=linux/amd64 -v "$PWD":/src "$IMAGE" make ARCH="$ARCH" freetype
     fi
-    if [ -f third_party/netsurf/Makefile ] || [ -d third_party/netsurf ]; then
-        echo "build: rebuilding NetSurf for $ARCH (browser)"
+    if [ -d third_party/netsurf ] && \
+       { [ "$ARCH_CHANGED" = 1 ] || [ ! -f user/netsurf.dynelf ]; }; then
+        echo "build: (re)building NetSurf for $ARCH (browser)"
         docker run --rm --platform=linux/amd64 -v "$PWD":/src "$IMAGE" make ARCH="$ARCH" netsurf || \
-            echo "build: NetSurf rebuild skipped/failed — image will build without the browser"
+            echo "build: WARNING — NetSurf rebuild failed; image will build WITHOUT the browser"
     fi
 fi
 
 docker run --rm --platform=linux/amd64 -v "$PWD":/src "$IMAGE" make ARCH="$ARCH" "$TARGET"
+
+# Sanity: the NetSurf Start-menu entry is a static registration that shows even
+# when the browser blob is absent — so a missing binary is otherwise invisible
+# until you click it and nothing happens.  Flag it loudly here.
+if [ "$TARGET" = iso ] && [ -d third_party/netsurf ] && [ ! -f user/netsurf.dynelf ]; then
+    echo ""
+    echo "build: !! NetSurf is NOT in this image (user/netsurf.dynelf missing) —"
+    echo "build:    the Start-menu 'NetSurf' entry will do nothing.  Fix with:"
+    echo "build:      docker run --rm --platform=linux/amd64 -v \"\$PWD\":/src $IMAGE make ARCH=$ARCH netsurf"
+    echo "build:    then re-run this script."
+fi
