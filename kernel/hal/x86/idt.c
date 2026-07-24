@@ -315,6 +315,10 @@ void isr_handler(struct int_frame* f) {
          * dispatch path arch-agnostic. */
         if (g_apic_mode) lapic_eoi();
         else             pic_eoi(irq);
+        /* §M46 — force-kill safe point: if the interrupted task was in ring 3
+         * (f->cs low 2 bits == 3) it holds no kernel locks, so a pending forced
+         * kill can tear it down here (does not return for that task). */
+        task_force_kill_point((f->cs & 3) == 3);
         /* Preemption point (M13): if the PIT (or any other handler) set
          * the deferred-reschedule flag, honor it now — AFTER the EOI so
          * the interrupt controller will keep delivering ticks to
@@ -331,6 +335,7 @@ void isr_handler(struct int_frame* f) {
     if (f->int_no == 0x40 || f->int_no == 0x41) {
         if (f->int_no == 0x40) schedule_request();
         lapic_eoi();
+        task_force_kill_point((f->cs & 3) == 3);   /* §M46 — see IRQ block above */
         schedule_check();
         return;
     }

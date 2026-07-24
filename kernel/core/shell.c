@@ -303,6 +303,39 @@ static void cmd_kill(const char* args) {
     else                     kprintf("kill: pid %d not found or protected\n", pid);
 }
 
+/* §M46 — force-kill: reclaims a WEDGED ring-3 task (one spinning in userland
+ * that never reaches a cooperative yield, so plain `kill` can't touch it).  It
+ * dies at its next timer preemption in user mode. */
+static void cmd_fkill(const char* args) {
+    int pid = 0, any = 0;
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) { pid = pid * 10 + (*args - '0'); any = 1; }
+    if (!any) { console_write("fkill: usage: fkill <pid>\n"); return; }
+    if (task_current() && task_current()->pid == pid) {
+        console_write("fkill: refusing to kill the calling shell\n");
+        return;
+    }
+    if (task_force_kill(pid) == 0) kprintf("fkill: pid %d force-killed\n", pid);
+    else                          kprintf("fkill: pid %d not found or protected\n", pid);
+}
+
+/* §M46 — spawn the WEDGE test app: a ring-3 task that spins forever without ever
+ * yielding.  `kill` (cooperative) cannot reclaim it; `fkill` (force) can. */
+extern const unsigned char _binary_user_wedge_i386_elf_start[]   __attribute__((weak));
+extern const unsigned char _binary_user_wedge_i386_elf_end[]     __attribute__((weak));
+extern const unsigned char _binary_user_wedge_x86_64_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_wedge_x86_64_elf_end[]   __attribute__((weak));
+static void cmd_wedge(void) {
+    const unsigned char *s = 0, *e = 0;
+    if (_binary_user_wedge_i386_elf_start)        { s = _binary_user_wedge_i386_elf_start;   e = _binary_user_wedge_i386_elf_end; }
+    else if (_binary_user_wedge_x86_64_elf_start) { s = _binary_user_wedge_x86_64_elf_start; e = _binary_user_wedge_x86_64_elf_end; }
+    if (!s || !e) { console_write("wedge: no wedge ELF embedded for this arch\n"); return; }
+    int pid = proc_spawn("wedge", s, (size_t)(e - s));
+    if (pid < 0) console_write("wedge: spawn failed\n");
+    else kprintf("wedge: spawned a WEDGED ring-3 task (pid %d) — `kill %d` can't stop it, `fkill %d` can\n",
+                 pid, pid, pid);
+}
+
 static void cmd_loop(void) {
     loop_stop_flag = 0;
     struct task* t = task_spawn("cpu-hog", loop_hog_main);
@@ -2310,6 +2343,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "tone "))    { cmd_tone(line + 5); return; }
     if (streq(line, "ps"))             { task_list();    return; }
     if (starts_with(line, "kill "))    { cmd_kill(line + 5); return; }
+    if (starts_with(line, "fkill "))   { cmd_fkill(line + 6); return; }
+    if (streq(line, "wedge"))          { cmd_wedge();     return; }
     if (streq(line, "spawn"))          { cmd_spawn();    return; }
     if (streq(line, "yield"))          { task_yield();   return; }
     if (streq(line, "loop"))           { cmd_loop();     return; }

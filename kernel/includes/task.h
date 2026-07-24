@@ -162,6 +162,14 @@ struct task {
      * spinlock.  task_kill sets the flag; the task dies at its next
      * task_yield; CPU-bound workers poll task_should_stop()). */
     volatile int kill_pending;
+    /* §M46 — FORCED kill: unlike the cooperative kthread contract above, a
+     * force-killed task is torn down without its cooperation.  Safe ONLY when
+     * the task is caught in RING 3 (userland holds no kernel locks): the IRQ
+     * force-kill point (task_force_kill_point, called from the timer ISR with
+     * "was interrupted in user mode") task_exit()s it there.  A task force-killed
+     * while in a syscall dies at its next return-to-user / cooperative yield
+     * instead.  Used to reclaim a wedged ring-3 app (e.g. a frozen browser). */
+    volatile int kill_forced;
     /* M22.3 — CPU time accounting: ms actually spent on a CPU.
      * `sched_in_ms` stamps switch-in; switch-out accumulates into
      * `cpu_ms`.  Feeds `ps` and the GUI task manager. */
@@ -332,6 +340,20 @@ int  task_kill(int pid);
 /* For CPU-bound kernel threads: non-zero once task_kill was called on
  * the calling task — poll it in long-running loops and return/exit. */
 int  task_should_stop(void);
+
+/* §M46 — FORCE-kill `pid`: cooperative kill_pending PLUS the kill_forced flag,
+ * so a wedged RING-3 task (which never reaches a cooperative yield) is torn down
+ * at its next timer preemption if it is caught in user mode.  Returns 0 / -1 as
+ * task_kill.  Meant for a frozen user app (browser) — do NOT force-kill kernel
+ * threads (they may hold locks); those still use the cooperative task_kill. */
+int  task_force_kill(int pid);
+
+/* §M46 — the arch IRQ layer calls this at the timer preemption point with
+ * `from_user` = "the interrupted context was in ring 3".  If the current task is
+ * force-killed AND was in userland (holds no kernel locks), it task_exit()s here
+ * — the safe point the cooperative path could never reach for a busy-looping
+ * ring-3 task. */
+void task_force_kill_point(int from_user);
 
 /* Reclaim a DEAD task: unlink from the master ring, free kstack +
  * struct.  Returns 0 on success, -1 if the pid is missing, not DEAD

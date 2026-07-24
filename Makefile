@@ -70,7 +70,7 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/switch.s
 
   ARCH_EXTRA_OBJS := kernel/hal/x86/ap_trampoline_blob.o user/hello_blob.o \
-                     user/spin_blob.o user/args_blob.o user/forktest_blob.o \
+                     user/spin_blob.o user/wedge_blob.o user/args_blob.o user/forktest_blob.o \
                      user/forkexec_blob.o user/pipetest_blob.o \
                      user/sigtest_blob.o user/dnstest_blob.o \
                      user/httptest_blob.o user/threadtest_blob.o \
@@ -248,7 +248,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/syscall_entry.s
 
   ARCH_EXTRA_OBJS := kernel/hal/x86_64/ap_trampoline_blob.o \
-                     user/hello_blob.o user/spin_blob.o
+                     user/hello_blob.o user/spin_blob.o user/wedge_blob.o
 
   # Tier B — in-tree user libc build knobs (x86_64).  -mno-sse* because the
   # kernel does not init/save FPU/XMM state for user tasks.
@@ -424,7 +424,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/smp_entry.S \
       kernel/hal/aarch64/usermode.S
 
-  ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o
+  ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o
 
   # Tier B — in-tree user libc build knobs (aarch64).  Uses the cross toolchain
   # ($(CC)/$(LD)/$(CROSS)objcopy); user base is 4 GiB (above the identity map).
@@ -926,6 +926,20 @@ user/spin_$(ARCH).elf: user/libc.c user/spin.c user/libc.h
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/spin.o $(OBJ_DIR)/user/libc.o
 
 $(OBJ_DIR)/user/spin_blob.o: user/spin_$(ARCH).elf
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+
+# §M46 — wedge: a forever-spinning ring-3 program (frozen-app stand-in) to test
+# force-kill.  Same build shape as spin.
+user/wedge_$(ARCH).elf: user/libc.c user/wedge.c user/libc.h
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/wedge.c -o $(OBJ_DIR)/user/wedge.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/wedge.o $(OBJ_DIR)/user/libc.o
+
+$(OBJ_DIR)/user/wedge_blob.o: user/wedge_$(ARCH).elf
 	@mkdir -p $(@D)
 	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 

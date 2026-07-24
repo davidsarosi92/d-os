@@ -719,6 +719,33 @@ int task_kill(int pid) {
     return 0;
 }
 
+/* §M46 — force-kill: cooperative flag PLUS the forced flag so a wedged ring-3
+ * task is reclaimed at its next timer preemption in user mode (see
+ * task_force_kill_point).  Same protections as task_kill (no pid 0 / idle). */
+int task_force_kill(int pid) {
+    if (pid == 0) return -1;
+    struct task* t = task_find(pid);
+    if (!t || t->is_idle || t->state == TASK_DEAD) return -1;
+    t->kill_pending = 1;
+    t->kill_forced  = 1;
+    task_notify_change();
+    return 0;
+}
+
+/* §M46 — the force-kill safe point, called from the arch timer ISR at the
+ * preemption boundary with `from_user` = the interrupted context was in ring 3.
+ * A ring-3 task holds no kernel locks, so tearing it down here is safe — this is
+ * the point a busy-looping user task (frozen browser) can never reach through
+ * the cooperative task_yield path.  A task force-killed while in a syscall is
+ * left for its return-to-user / next cooperative yield instead. */
+void task_force_kill_point(int from_user) {
+    if (!from_user) return;
+    struct task* self = task_current();
+    if (self && self->kill_forced && !self->is_idle && self->state != TASK_DEAD) {
+        task_exit_code(137);                 /* 128 + SIGKILL, conventional */
+    }
+}
+
 int task_reap(int pid) {
     if (!master_head) return -1;
 
