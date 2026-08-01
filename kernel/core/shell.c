@@ -124,6 +124,7 @@ static void cmd_help(void) {
                   "  config, getconf <key>, setconf <key> <value>, saveconf\n"
                   "  ringtest, ps, spawn, yield, loop, kill <pid>, fkill <pid>\n"
                   "  wedge (runaway ring-3 task), faulttest (bad user pointers)\n"
+                  "  fputest (per-task FP/SIMD register file)\n"
                   "  pane, pane split horizontal|vertical\n"
                   "  gui (compositor + desktop), gui stats, launch [app]\n"
                   "  run <path.bas> (Tiny-BASIC)\n"
@@ -400,6 +401,64 @@ static void cmd_faulttest(void) {
             w_ok, w_strad, cp_partial, partial_ok,
             (w_ok == 5 && w_strad < 0 && cp_partial < 0 && partial_ok) ? "PASS" : "FAIL");
     console_write("faulttest: the box is still running — that IS the test.\n");
+}
+
+/* ---------------------------------------------------------------------------
+ * `fputest` — prove the FP/SIMD register file is PER-TASK.
+ *
+ * Two kernel tasks each stamp a different pattern into a live FP register, then
+ * spend a few thousand yields checking it is still theirs.  Without per-task
+ * FXSAVE/FXRSTOR the two tasks share one physical register file, so each sees
+ * the other's value within a yield or two and the mismatch counters explode —
+ * i.e. this test FAILS on the code that existed before the fix, which is the
+ * only kind of regression test worth having.
+ *
+ * The patterns are exactly-representable doubles on purpose: i386 holds the
+ * value in an 80-bit x87 register and converts back on read, so an arbitrary
+ * bit pattern (an SNaN, say) would not survive the round trip and the test
+ * would report a corruption that never happened.
+ * --------------------------------------------------------------------------- */
+#define FPUTEST_ROUNDS 3000
+static volatile uint64_t g_fpu_mismatch[2];
+static volatile int      g_fpu_done[2];
+
+static void fputest_worker(void) {
+    int slot = (int)(uintptr_t)task_start_arg();
+    uint64_t pattern = slot ? 0x4004000000000000ull    /* 2.5 */
+                            : 0x3FF8000000000000ull;   /* 1.5 */
+    uint64_t bad = 0;
+    hal_fpu_test_stamp(pattern);
+    for (int i = 0; i < FPUTEST_ROUNDS; i++) {
+        task_yield();
+        if (hal_fpu_test_read() != pattern) bad++;
+    }
+    g_fpu_mismatch[slot] = bad;
+    g_fpu_done[slot] = 1;
+}
+
+static void cmd_fputest(void) {
+    if (!hal_fpu_present()) {
+        console_write("fputest: SKIP — this arch has no reachable FP unit "
+                      "(see kernel/hal/aarch64/fpu.c)\n");
+        return;
+    }
+    g_fpu_mismatch[0] = g_fpu_mismatch[1] = 0;
+    g_fpu_done[0] = g_fpu_done[1] = 0;
+
+    task_spawn_arg("fpu-a", fputest_worker, (void*)(uintptr_t)0);
+    task_spawn_arg("fpu-b", fputest_worker, (void*)(uintptr_t)1);
+
+    /* Wait for both, bounded so a wedged worker cannot hang the shell. */
+    for (int spins = 0; spins < 200000 && !(g_fpu_done[0] && g_fpu_done[1]); spins++)
+        task_yield();
+
+    if (!(g_fpu_done[0] && g_fpu_done[1])) {
+        console_write("fputest: workers did not finish\n");
+        return;
+    }
+    kprintf("fputest: %d rounds x 2 tasks — mismatches a=%u b=%u -> %s\n",
+            FPUTEST_ROUNDS, (unsigned)g_fpu_mismatch[0], (unsigned)g_fpu_mismatch[1],
+            (g_fpu_mismatch[0] == 0 && g_fpu_mismatch[1] == 0) ? "PASS" : "FAIL");
 }
 
 /* §M46 — spawn the WEDGE test app: a ring-3 task that spins forever without ever
@@ -2417,6 +2476,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }
     if (streq(line, "bustest"))        { cmd_bustest(); return; }
     if (streq(line, "faulttest"))     { cmd_faulttest(); return; }
+    if (streq(line, "fputest"))       { cmd_fputest(); return; }
     if (streq(line, "wdtest"))         { cmd_wdtest(); return; }
     if (streq(line, "cron"))           { cmd_cron("");         return; }
     if (starts_with(line, "cron "))    { cmd_cron(line + 5);   return; }

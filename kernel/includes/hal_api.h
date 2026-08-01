@@ -170,4 +170,46 @@ void hal_set_tls_base(uintptr_t base);
  * (the CSPRNG then seeds from timing jitter only). */
 int hal_hw_random(uint32_t* out);
 
+/* ---------------------------------------------------------------------------
+ * Per-task FPU / SIMD state (2026-08-01).
+ *
+ * The floating-point and vector register file is NOT part of the integer
+ * context `context_switch` swaps, so without this the register file is simply
+ * whatever the previous task left behind.  Two ring-3 programs doing FP work
+ * then silently corrupt each other's arithmetic — and on SMP a task migrated to
+ * another core resumes on that core's register file, which is worse because it
+ * is timing-dependent and unreproducible.
+ *
+ * The scheduler calls save(prev) + restore(next) around every context switch.
+ * The state blob is an opaque, arch-sized byte array carried inside struct task
+ * (see HAL_FPU_STATE_SIZE); the HAL aligns inside the blob, so the core does not
+ * need to know an arch's alignment rule — it just hands over the array.
+ *
+ * hal_fpu_init_state MUST be called once per task before its first restore: a
+ * zero-filled blob is NOT a valid FPU image on x86 (it would restore an all-zero
+ * MXCSR, i.e. every SIMD exception UNMASKED, and #XF on the first FP operation).
+ *
+ * Sizing: 512 B is the x86 FXSAVE area, 528 B covers AArch64's 32×16-byte
+ * vector registers plus FPCR/FPSR.  The extra slack lets the HAL align the
+ * start of the area within the blob without a separate allocation.
+ * ------------------------------------------------------------------------- */
+#define HAL_FPU_STATE_SIZE   576
+
+void hal_fpu_init_state(void* blob);   /* make `blob` a valid initial image  */
+void hal_fpu_save(void* blob);         /* current CPU state → blob            */
+void hal_fpu_restore(void* blob);      /* blob → current CPU state            */
+
+/* Self-test support for `fputest`.  stamp() puts a 64-bit pattern into a LIVE
+ * FP/SIMD register and read() reads that same register back, so a test can
+ * prove the register file really is per-task by holding a value across many
+ * yields while another task holds a different one.  Keeping the register poke
+ * behind the HAL is what lets the test itself live in core code (no __asm__
+ * outside kernel/hal/).  hal_fpu_present() reports 0 on an arch whose FP unit
+ * is unreachable (aarch64 today), so the test SKIPs instead of lying.
+ * Pass a bit pattern that is a well-behaved double — i386 holds it in an x87
+ * register, where a NaN payload would not survive the round trip. */
+int      hal_fpu_present(void);
+void     hal_fpu_test_stamp(uint64_t v);
+uint64_t hal_fpu_test_read(void);
+
 #endif

@@ -119,6 +119,15 @@ int proc_fork(struct user_regs* parent_regs) {
     child->has_tls  = parent->has_tls;
     child->tls_base = parent->tls_base;
 
+    /* Inherit the FP/SIMD register file (POSIX: the child continues with the
+     * parent's floating-point state).  The parent's LIVE state is in the CPU
+     * right now — its blob only holds what it had at its last switch-out — so
+     * snapshot it before copying, or the child would resume with stale
+     * registers the parent has since overwritten. */
+    hal_fpu_save(parent->fpu_state);
+    for (unsigned i = 0; i < HAL_FPU_STATE_SIZE; i++)
+        child->fpu_state[i] = parent->fpu_state[i];
+
     /* Claim the reap so the M27 universal reaper (init) keeps its hands off:
      * the child becomes a POSIX zombie held for the parent's waitpid()
      * (task_wait), which reaps it and collects the exit code.  Without this,

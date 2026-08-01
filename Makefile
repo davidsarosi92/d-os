@@ -49,6 +49,7 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/gdt.c \
       kernel/hal/x86/idt.c \
       kernel/hal/x86/tss.c \
+      kernel/hal/x86/fpu.c \
       kernel/hal/x86/vmm.c \
       kernel/hal/x86/fb_present.c \
       kernel/hal/x86/ringtest.c \
@@ -226,6 +227,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/gdt.c \
       kernel/hal/x86_64/idt.c \
       kernel/hal/x86_64/tss.c \
+      kernel/hal/x86_64/fpu.c \
       kernel/hal/x86_64/vmm.c \
       kernel/hal/x86_64/task_arch.c \
       kernel/hal/x86_64/mb2.c \
@@ -411,6 +413,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/vmm.c \
       kernel/hal/aarch64/syscall.c \
       kernel/hal/aarch64/uaccess.c \
+      kernel/hal/aarch64/fpu.c \
       kernel/hal/aarch64/pci.c \
       kernel/hal/aarch64/virtio_mmio_blk.c \
       kernel/hal/aarch64/virtio_gpu.c \

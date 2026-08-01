@@ -3780,6 +3780,44 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-08-01 — Per-task FPU/SIMD state (FXSAVE/FXRSTOR on context switch).**
+  `context_switch` swapped the INTEGER context only, so the x87/MMX/XMM register
+  file was simply whatever the previously-running task left in it.  Two tasks
+  doing floating-point work silently corrupted each other's arithmetic — no
+  fault, no log line, just wrong numbers — and on SMP a task migrated to another
+  core resumed on THAT core's register file, making it timing-dependent and
+  unreproducible.  This had been a known, commented gap since SSE was first
+  enabled; it stopped being theoretical once x86_64 ring-3 started running on
+  APs, because SSE2 is baseline in the AMD64 ABI (the compiler emits XMM for FP
+  *and* for ordinary memory copies), so every musl binary is an FP user.
+  New HAL contract in `hal_api.h`: `hal_fpu_init_state` / `hal_fpu_save` /
+  `hal_fpu_restore` over an opaque `HAL_FPU_STATE_SIZE` blob carried in `struct
+  task`.  The scheduler saves `prev` and restores `next` around every switch
+  (eager, not lazy: at 100 Hz the cost is noise, and CR0.TS + #NM lazy switching
+  is a classic source of cross-task — and on SMP cross-core — state leaks).
+  `fork` snapshots the parent's LIVE state before copying it to the child, since
+  the parent's blob only holds what it had at its last switch-out.
+  **Two traps worth remembering.** (1) A zero-filled blob is NOT a valid x86 FPU
+  image: `fxrstor` would load MXCSR = 0, i.e. every SIMD exception UNMASKED, and
+  the task takes #XF on its first FP instruction — so `hal_fpu_init_state`
+  writes the architectural reset values (FCW = 0x037F, MXCSR = 0x1F80) and is
+  called at all four task-creation sites, not left to `kcalloc`.  (2) FXSAVE
+  needs 16-byte alignment or it #GPs; `struct task` is `kcalloc`'d, so the blob
+  is oversized and the HAL aligns *inside* it — the arch rule stays in the arch.
+  aarch64 is a deliberate no-op with the reasoning written down: CPACR_EL1.FPEN
+  is never set, and both the kernel and its user libc build
+  `-mgeneral-regs-only`, so the vector registers are unreachable and there is no
+  state to lose.  Enabling FP there later means doing BOTH halves (set FPEN per
+  CPU *and* fill in the save/restore) — enabling only the first is the dangerous
+  combination.
+  New self-test `fputest`: two kernel tasks each hold a different pattern in a
+  live FP register across 3000 yields.  It was validated by temporarily removing
+  the fix — it reports `mismatches a=3000 b=0` without it and `a=0 b=0` with it,
+  so it is a real regression test rather than a tautology.
+  Verified on i386 and x86_64, `-smp 2`: `fputest` PASS, plus `faulttest`,
+  `fdtest`, `socktest`, `polltest`, `forktest`, `threadtest`, `musltest` and
+  NetSurf rendering on both.  aarch64 builds clean.
+
 - **2026-08-01 — SMP: x86_64 ring-3 works on an AP (per-CPU TSS + SSE +
   SYSCALL MSRs).**  x86_64 `-smp 2` triple-faulted as soon as a ring-3 task was
   load-balanced onto the AP — reliably reproducible by launching NetSurf, which

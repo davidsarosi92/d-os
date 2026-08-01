@@ -1004,6 +1004,18 @@ in parallel with BSP."
   hog and idle every quantum, killing throughput.  Fix:
   `pick_next_locked` skips `is_idle` tasks; only the no-work
   fallback path picks idle.
+- *(added 2026-08-01)*  **A context switch that only swaps the integer
+  registers is not a context switch.**  The FP/SIMD register file was
+  left shared between tasks — silent wrong answers rather than a crash,
+  which is why it survived so long.  Fixed with per-task
+  FXSAVE/FXRSTOR (`hal_fpu_*`).  Two traps for anyone re-treading it:
+  a zero-filled FXSAVE image is INVALID (MXCSR = 0 unmasks every SIMD
+  exception → #XF on the first FP op), and FXSAVE #GPs unless the area
+  is 16-byte aligned — so the state blob is oversized and the HAL
+  aligns inside it rather than the core depending on kmalloc.  Also:
+  a self-test for silent corruption is only worth having if you have
+  SEEN it fail — `fputest` was validated by temporarily removing the
+  fix (`a=3000 b=0` without, `a=0 b=0` with).
 - *(added 2026-08-01)*  **Anything in a control register or an MSR is
   PER-CPU by definition.**  This is now the third instance of the same
   omission (per-CPU IDTR in M18.5, per-CPU TSS on i386 in M35, and on

@@ -253,6 +253,7 @@ void task_init(void) {
     t0->cpu_mask    = 0xFFFFFFFFu;
     t0->cpu_home    = 0;                /* BSP */
     t0->rq_next = t0->rq_prev = NULL;
+    hal_fpu_init_state(t0->fpu_state);  /* valid image before the first restore */
 
     /* Insert into master list. */
     uint32_t fl = spin_lock_irqsave(&master_lock);
@@ -290,6 +291,7 @@ void task_init(void) {
         bsp_idle->cpu_mask    = 1u << 0;        /* pinned to BSP */
         bsp_idle->cpu_home    = 0;
         bsp_idle->rq_next = bsp_idle->rq_prev = NULL;
+        hal_fpu_init_state(bsp_idle->fpu_state);
 
         uint32_t fl2 = spin_lock_irqsave(&master_lock);
         master_insert_locked(bsp_idle);
@@ -327,6 +329,7 @@ void task_install_ap_idle(void) {
     idle->cpu_mask    = 1u << cpu;  /* pinned to this AP */
     idle->cpu_home    = cpu;
     idle->rq_next = idle->rq_prev = NULL;
+    hal_fpu_init_state(idle->fpu_state);
 
     uint32_t fl = spin_lock_irqsave(&master_lock);
     master_insert_locked(idle);
@@ -404,6 +407,10 @@ static struct task* spawn_common(const char* name, void (*entry)(void),
     t->cpu_mask    = 0xFFFFFFFFu;
     t->cpu_home    = -1;
     t->rq_next = t->rq_prev = NULL;
+    /* A fresh, VALID FPU/SIMD image.  kcalloc's zeroing is not enough — an
+     * all-zero x86 FXSAVE image restores MXCSR = 0, i.e. every SIMD exception
+     * unmasked, and the task would take #XF on its first FP instruction. */
+    hal_fpu_init_state(t->fpu_state);
 
     uint32_t fl = spin_lock_irqsave(&master_lock);
     master_insert_locked(t);
@@ -683,6 +690,17 @@ static void schedule_locked(struct percpu* me) {
      * so kernel-thread → kernel-thread switches stay free (no TLB flush).
      * Both stacks live in the kernel identity map, which every space keeps
      * mapped, so doing this before context_switch is safe. */
+    /* Per-task FPU/SIMD register file.  context_switch swaps the INTEGER
+     * context only, so the FP/vector registers have to be moved explicitly —
+     * otherwise `next` inherits whatever `prev` left in them.  Two FP-using
+     * ring-3 tasks would silently corrupt each other's arithmetic (no fault,
+     * no log, just wrong numbers), and on SMP a task migrated to another core
+     * would resume on THAT core's register file.  Eager save/restore on every
+     * switch: at a 100 Hz tick the cost is noise, and lazy (CR0.TS + #NM)
+     * switching is a classic source of subtle cross-task state leaks.  Arches
+     * with no reachable FP unit implement these as no-ops (see aarch64). */
+    hal_fpu_save(prev->fpu_state);
+    hal_fpu_restore(next->fpu_state);
     vmm_space_switch(next->mm);
     context_switch(&prev->esp, next->esp);
     /* Resumes here when `prev` is scheduled back in by SOME CPU. */

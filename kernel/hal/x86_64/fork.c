@@ -98,6 +98,16 @@ int proc_fork(struct user_regs* parent_regs) {
     child->has_tls   = parent->has_tls;
     child->tls_base  = parent->tls_base;
 
+    /* Inherit the FP/SIMD register file (POSIX: the child continues with the
+     * parent's floating-point state).  The parent's LIVE state is in the CPU
+     * right now — its blob only holds what it had at its last switch-out — so
+     * snapshot it before copying, or the child would resume with stale
+     * registers the parent has since overwritten.  Matters more here than on
+     * i386: SSE2 is baseline on x86_64, so every musl child is an FP user. */
+    hal_fpu_save(parent->fpu_state);
+    for (unsigned i = 0; i < HAL_FPU_STATE_SIZE; i++)
+        child->fpu_state[i] = parent->fpu_state[i];
+
     /* Claim the reap so init leaves the child as a POSIX zombie for the
      * parent's waitpid() (task_wait). */
     task_set_reap_owned(child, 1);

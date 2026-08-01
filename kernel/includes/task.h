@@ -38,6 +38,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "hal_api.h"       /* HAL_FPU_STATE_SIZE — per-task FPU/SIMD blob */
 
 /* Per-process address space (M25).  Opaque here — see vmm.h.  Forward
  * declared so `struct task` can hold one without pulling in the VMM. */
@@ -211,6 +212,14 @@ struct task {
     uint32_t  sig_pending;
     uintptr_t sig_handler[32];          /* NSIG (syscall.h) */
     uintptr_t sig_restorer;
+    /* Per-task FPU / SIMD register file (2026-08-01).  The integer context
+     * switch does not touch the FP/vector registers, so without this two tasks
+     * doing FP work overwrite each other's registers — and on SMP a migrated
+     * task resumes on a DIFFERENT core's register file.  Opaque to the core:
+     * only hal_fpu_{init_state,save,restore} interpret it, and they align
+     * inside the blob so this needs no special alignment here (struct task is
+     * kcalloc'd, whose alignment we do not want to depend on).  See hal_api.h. */
+    uint8_t   fpu_state[HAL_FPU_STATE_SIZE];
 };
 
 /* Set up the scheduler and convert the current `kernel_main` context
