@@ -28,10 +28,14 @@ recovery via the ib700 HW watchdog (logs the stuck EIP lock-free to COM1, kills
 a ring-3 lockup, reboots a kernel one) + spinlock-deadlock reporting +
 `scripts/dos-dump.sh` for a frozen guest.  **Chrome works while an app is
 frozen:** Ctrl+Alt+Del / Ctrl+Alt+X trapped in the keyboard IRQ, window X
-force-kills an unresponsive client.  **Ring-3 pointer boundary in two layers:**
-a per-syscall gate (`task->in_user_syscall` + `vmm_user_access_ok`) AND a real
+force-kills an unresponsive client.  **Ring-3 pointer boundary in THREE layers:**
+a per-syscall gate (`task->in_user_syscall` + `vmm_user_access_ok`), a real
 exception table (`.ex_table` + `uaccess_*` — a fault DURING a copy returns
--EFAULT instead of panicking); `faulttest` proves both.  Also: dosgui handles
+-EFAULT instead of panicking), and **bounce buffers** (2026-08-01) so the bulk
+payloads never reach the VFS/socket/console layers as ring-3 pointers — those
+dereference deep inside their own call chains where no fixup entry covers them
+(`sys_*_k` cores + a gated staging wrapper); `faulttest` proves all three.
+Also: dosgui handles
 owner-bound + blits range-checked, sigreturn EFLAGS sanitised, `sys_kill`
 restricted to the caller's subtree, **x86_64 real COW**, ACPI tables above the
 identity map mapped on demand (i386 boots with `-m 512M` again).

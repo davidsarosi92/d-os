@@ -323,10 +323,10 @@ static long linux_recvmsg(int fd, struct lnx_msghdr* mh, int flags) {
     if (!lnx_r_ok((uintptr_t)mh->msg_iov, sizeof(struct lnx_iovec))) return -LNX_EFAULT;
     struct lnx_iovec* iov = &mh->msg_iov[0];
     uint32_t ip = 0; int port = 0;
-    if (iov->iov_len && !vmm_user_access_ok((uintptr_t)iov->iov_base,
-                                            (uintptr_t)iov->iov_len, 1))
-        return -LNX_EFAULT;                     /* §1.1 — validate the client buf */
-    long n = sys_recvfrom_k(fd, iov->iov_base, iov->iov_len, &ip, &port);
+    /* Payload lands in the CLIENT's iovec, source address in our kernel locals
+     * (we marshal it into the client's sockaddr below) — sys_recvfrom_u is
+     * exactly that split, and bounce-buffers the payload for us. */
+    long n = sys_recvfrom_u(fd, (uintptr_t)iov->iov_base, iov->iov_len, &ip, &port);
     if (n < 0) return n;
     if (mh->msg_name) {
         uint32_t namelen = mh->msg_namelen;
@@ -361,9 +361,12 @@ static long linux_sendmsg(int fd, const struct lnx_msghdr* mh, int flags) {
         uint32_t ip; int port;
         if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)mh->msg_name, &ip, &port) != 0)
             return -LNX_EAFNOSUPPORT;
-        return sys_sendto(fd, buf, total, ip, port);
+        return sys_sendto_k(fd, buf, total, ip, port);
     }
-    return sys_write(fd, buf, total);                /* connected stream */
+    /* `buf` is our KERNEL gather buffer, so call the kernel-pointer cores — the
+     * gated sys_write/sys_sendto would (correctly) reject a kernel address while
+     * task->in_user_syscall is set. */
+    return sys_write_k(fd, buf, total);              /* connected stream */
 }
 
 /* §M39 3b — Linux socketcall(call, args[]) demultiplexer.  musl on i386 funnels
@@ -428,9 +431,7 @@ static long linux_socketcall(int call, uint32_t* a) {
             struct lnx_sockaddr_in* src = (struct lnx_sockaddr_in*)a[4];
             uint32_t* addrlen = (uint32_t*)a[5];
             uint32_t ip = 0; int port = 0;
-            if (len && !vmm_user_access_ok((uintptr_t)buf, (uintptr_t)len, 1))
-                return -LNX_EFAULT;             /* §1.1 — validate the client buf */
-            long n = sys_recvfrom_k(fd, buf, len, &ip, &port);
+            long n = sys_recvfrom_u(fd, (uintptr_t)buf, len, &ip, &port);
             if (n >= 0 && src) hostorder_to_sockaddr(src, addrlen, ip, port);
             return n;
         }

@@ -356,6 +356,36 @@ static void cmd_faulttest(void) {
     int  cp_out   = uaccess_copy_out((uintptr_t)(vmm_user_base() + 0x456000u), buf, sizeof buf);
     long str_in   = uaccess_str_in(buf, (uintptr_t)(vmm_user_base() + 0x456000u), sizeof buf);
 
+    /* (c) BOUNCE (§1.1 layer 3).  Map exactly ONE user page, so the page right
+     *     after it is guaranteed unmapped.  Two things get proven here:
+     *       - a valid ring-3 payload still round-trips correctly through the
+     *         kernel staging chunk (`sys_write` of "bnce" prints it), and
+     *       - the TOCTOU the pre-check CANNOT catch: a copy whose range goes bad
+     *         PART-WAY THROUGH.  Straddling the page boundary reproduces exactly
+     *         that — the first bytes copy, then the next page faults.  We call
+     *         uaccess_copy_in directly (no pre-check in the way) so the only
+     *         thing standing between us and a ring-0 #PF is the exception table.
+     *         Before bounce buffers, this shape reached the VFS/socket layers as
+     *         a raw pointer, where no fixup entry covers the dereference. */
+    long upage = sys_mmap(4096, -1);
+    long w_ok = -1, w_strad = 0, cp_partial = 0; int partial_ok = 0;
+    if (upage > 0) {
+        char* up = (char*)(uintptr_t)upage;
+        up[0] = 'b'; up[1] = 'n'; up[2] = 'c'; up[3] = 'e'; up[4] = ' ';
+        for (int i = 4088; i < 4096; i++) up[i] = (char)0xA5;   /* tail pattern */
+
+        me->in_user_syscall = 1;
+        w_ok    = sys_write(1, (const void*)(uintptr_t)upage, 5);        /* valid  */
+        w_strad = sys_write(1, (const void*)(uintptr_t)(upage + 4088), 32); /* runs off */
+        me->in_user_syscall = prev_gate;
+
+        /* Mid-copy fault: 8 good bytes then unmapped memory. */
+        uint8_t k[16];
+        for (int i = 0; i < 16; i++) k[i] = 0;
+        cp_partial = uaccess_copy_in(k, (uintptr_t)upage + 4088, 16);
+        partial_ok = (k[0] == 0xA5 && k[7] == 0xA5);   /* the good half DID land */
+    }
+
     vmm_space_switch(prev);
     me->mm = prev; me->mmap_cursor = 0;
     vmm_space_destroy(s);
@@ -366,6 +396,9 @@ static void cmd_faulttest(void) {
     kprintf("faulttest: fixup  copy_in=%d copy_out=%d str_in=%ld -> %s\n",
             cp_in, cp_out, str_in,
             (cp_in < 0 && cp_out < 0 && str_in < 0) ? "PASS" : "FAIL");
+    kprintf("faulttest: bounce write(valid)=%ld write(straddle)=%ld mid-copy=%d partial=%d -> %s\n",
+            w_ok, w_strad, cp_partial, partial_ok,
+            (w_ok == 5 && w_strad < 0 && cp_partial < 0 && partial_ok) ? "PASS" : "FAIL");
     console_write("faulttest: the box is still running — that IS the test.\n");
 }
 

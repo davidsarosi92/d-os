@@ -3704,9 +3704,9 @@ each table's pages on demand before they are dereferenced.
 **Config:** `kernel.fault_policy` (halt|reboot|kill), `kernel.hw_watchdog`,
 `package.auto_fkill_ms`, `package.<name>.auto_fkill_ms`.
 
-**Open:** bounce buffers for the large read/write payloads handed straight to the
-VFS/socket layers (they still rely on the pre-check alone); a hardware watchdog
-on aarch64 (no ib700 on `virt`); credentials-based `sys_kill` once §M32 lands.
+**Open:** a hardware watchdog on aarch64 (no ib700 on `virt`); credentials-based
+`sys_kill` once §M32 lands.  (Bounce buffers for the bulk payloads — the third
+layer — landed 2026-08-01, see the change-log entry below.)
 
 ---
 
@@ -3780,6 +3780,43 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-08-01 — §1.1 layer 3: bounce buffers close the last ring-3 pointer
+  hole.**  M46 shipped two layers — a per-syscall gate and an exception table —
+  but the BULK payloads (`read`/`write`/`send`/`recv`/`sendto`/`recvfrom`/
+  `getdents`/`getdents64`/`poll`/`getrandom`) were still handed to the VFS,
+  socket and console layers as raw ring-3 pointers.  Those layers dereference
+  the buffer deep inside their own call chains, far from any instruction
+  registered in `.ex_table`, so layer 2 could not cover them: a range that went
+  bad mid-transfer (a concurrent `munmap`, a revoked COW page — genuinely
+  reachable now that a second thread can run on another CPU) still took a ring-0
+  #PF and, with the default `kernel.fault_policy = halt`, killed the box.  That
+  contradicted M46's headline claim, so it is now fixed rather than documented.
+  Each of those handlers is split into a `*_k` core that only ever sees kernel
+  memory plus a gated wrapper that stages the payload through a kernel chunk
+  (`struct bounce`: ≤192 B on the stack, otherwise a kmalloc'd chunk capped at
+  4 KiB and looped, so asking to read 64 MiB does not allocate 64 MiB).  The
+  staging copies themselves are layer-2 protected, so a range going bad becomes
+  a short count or -EFAULT.  Semantics preserved deliberately: stream writes
+  loop and honour short writes; reads loop only for a regular VFS file (a short
+  read IS the right answer on a socket/pipe/stdin, and looping would block a
+  caller that offered a big buffer — hence `read_may_loop`); a UDP datagram is
+  atomic so `sendto` stages it whole or fails, bounded by `UDP_MAX_PAYLOAD`.
+  `sys_recvfrom_u` is the split a foreign personality needs — ring-3 payload,
+  kernel (ip, port) out-params.  `faulttest` grew a third case that proves both
+  halves: a valid ring-3 payload still round-trips, and a copy straddling into
+  an unmapped page fails AFTER partially succeeding (`partial=1`) — the exact
+  TOCTOU shape a pre-check cannot catch.
+  **Found while doing it:** `linux_abi`'s `sendmsg` gathers the client's iovecs
+  into a KERNEL buffer and then called the gated `sys_write`/`sys_sendto` — which
+  by M46's own rules must reject a kernel address while `in_user_syscall` is set.
+  So musl's TCP-fallback DNS path had been silently broken since M46.  It now
+  calls the `*_k` cores.  Same dual-use trap as the original M46 lesson, one
+  layer up: introducing a gated wrapper means auditing every in-kernel caller of
+  the function you just wrapped.
+  Verified on i386 and x86_64: `faulttest` (all three cases PASS), `fdtest`,
+  `socktest`, `polltest`, `solibtest`, `musltest`, `dnstest`, `httptest`
+  (`HTTP/1.1 200 OK`), the musl coreutils from the store (`echo`/`ls`/`cat` and
+  `sh -c`), and NetSurf rendering — i386 with `-smp 2`.
 - **2026-08-01 — SMP: i386 `-smp N` boots again (AP trampoline GDTR
   truncation).**  Passing `-smp 2` to the i386 build killed the machine during
   AP bring-up.  It looked like a silent hang, but it was a **triple fault** —

@@ -21,9 +21,16 @@
  *      exception table — so even a range that becomes invalid BETWEEN the check
  *      and the copy (a concurrent munmap, a revoked COW page) returns -EFAULT
  *      instead of taking a ring-0 page fault.
- * Still on the pre-check alone (not yet bounce-buffered): the large read/write
- * payloads handed straight to the VFS / socket layers, which dereference them
- * deep inside their own call chains.
+ *   3. BOUNCE BUFFERS: the bulk payloads (read/write/send/recv/getdents/poll/
+ *      getrandom) are never handed to the VFS / socket / console layers as raw
+ *      ring-3 pointers.  Those layers dereference the buffer deep inside their
+ *      own call chains — far away from any exception-table-registered
+ *      instruction — so layer 2 could not cover them: a range that went bad
+ *      mid-transfer would still take a ring-0 #PF and (with the default
+ *      kernel.fault_policy = halt) kill the box.  The gated wrapper now copies
+ *      through a kernel chunk in both directions and calls a *_k core that only
+ *      ever sees kernel memory.  The copies themselves are layer-2 protected,
+ *      so a concurrent munmap turns into a short count or -EFAULT.
  * ============================================================================= */
 
 #include "syscall.h"
@@ -118,6 +125,60 @@ int copy_str_from_user(char* dst, uintptr_t user_src, uintptr_t max) {
     return strncpy_from_user(dst, (const char*)user_src, (size_t)max);
 }
 
+/* ---------------------------------------------------------------------------
+ * BOUNCE BUFFERS (§1.1 layer 3 — see the file header).
+ *
+ * A kernel staging chunk for one bulk transfer.  Small transfers (the common
+ * case: a printf, a 2-byte DNS length prefix, a one-line read) use an on-stack
+ * array so the hot path never touches the allocator; anything bigger takes a
+ * kmalloc'd chunk that is released by bounce_fini.  The chunk is deliberately
+ * capped: a program asking to read 64 MiB must not make the kernel allocate
+ * 64 MiB, so the wrapper loops over BOUNCE_CHUNK-sized pieces instead.
+ *
+ * Kernel stacks here are small, so BOUNCE_SMALL stays well under a page.
+ * --------------------------------------------------------------------------- */
+#define BOUNCE_CHUNK   4096u        /* max kernel staging chunk per iteration  */
+#define BOUNCE_SMALL   192u         /* <= this rides the stack, no kmalloc     */
+
+struct bounce {
+    uint8_t  inln[BOUNCE_SMALL];
+    uint8_t* buf;                   /* points at inln or at the kmalloc'd area */
+    size_t   cap;
+    int      heap;                  /* 1 → buf must be kfree'd                 */
+};
+
+/* Size the chunk for a transfer of `want` bytes.  Never fails: if kmalloc
+ * cannot satisfy the request we fall back to the inline buffer and the caller
+ * simply performs more (smaller) iterations. */
+static void bounce_init(struct bounce* b, size_t want) {
+    size_t cap = (want > BOUNCE_CHUNK) ? BOUNCE_CHUNK : want;
+    if (cap <= BOUNCE_SMALL) {
+        b->buf = b->inln; b->cap = (cap ? cap : 1); b->heap = 0;
+        return;
+    }
+    void* p = kmalloc(cap);
+    if (p) { b->buf = (uint8_t*)p; b->cap = cap; b->heap = 1; }
+    else   { b->buf = b->inln;     b->cap = BOUNCE_SMALL; b->heap = 0; }
+}
+static void bounce_fini(struct bounce* b) {
+    if (b->heap && b->buf) kfree(b->buf);
+    b->buf = NULL; b->heap = 0;
+}
+
+/* May the read side keep looping to fill the caller's whole buffer?
+ *
+ * Only for a regular VFS file: those never block, so looping just returns more
+ * data.  For a socket / pipe / stdin a short read is the CORRECT answer — the
+ * first chunk is what was available — and looping for more would block a caller
+ * that asked for a big buffer but only expected whatever had arrived.  That
+ * distinction is why this is a per-fd question and not a global policy. */
+static struct ofile* fd_lookup(int fd);        /* defined with the fd table below */
+static int read_may_loop(int fd) {
+    if (fd < 3) return 0;                       /* stdin is line-oriented       */
+    struct ofile* o = fd_lookup(fd);
+    return (o && o->kind == FD_VFS);
+}
+
 /* SYS_PRINT — write a NUL-terminated RING-3 string to the console.
  *
  * §1.1: every arch dispatcher used to walk the raw user pointer ("the identity
@@ -164,8 +225,8 @@ static int fd_install(struct ofile* o) {
 static long netsock_write(struct netsock* ns, const void* buf, size_t n);
 static long netsock_read (struct netsock* ns, void* buf, size_t n);
 
-long sys_write(int fd, const void* buf, size_t n) {
-    if (n && !user_r(buf, n)) return -1;      /* §1.1 — validate the user buffer */
+/* Core: `buf` is always KERNEL memory (see the *_k note in syscall.h). */
+long sys_write_k(int fd, const void* buf, size_t n) {
     if (fd == 1 || fd == 2) {                 /* stdout / stderr → console */
         const char* s = (const char*)buf;
         /* §M43: also capture into the task's buffer if one is set (Editor
@@ -187,6 +248,34 @@ long sys_write(int fd, const void* buf, size_t n) {
     if (o->kind == FD_SOCK) return usock_send(o->sock, buf, n, NULL);
     if (o->kind == FD_NETSOCK) return netsock_write(o->nsock, buf, n);
     return -1;                                 /* shm: not write(2)-able */
+}
+
+/* write(2) from a RING-3 buffer.  Stages the payload through a kernel chunk so
+ * the console / VFS / socket sinks below only ever dereference kernel memory.
+ * Short writes are honoured: if the sink takes less than we offered, that is
+ * the caller's return value and we stop — exactly what write(2) promises. */
+long sys_write(int fd, const void* buf, size_t n) {
+    if (!user_ptr_gate_armed()) return sys_write_k(fd, buf, n);   /* kernel caller */
+    if (n && !user_r(buf, n)) return -1;      /* §1.1 — validate the user buffer */
+    if (n == 0) return sys_write_k(fd, buf, 0);
+
+    struct bounce b; bounce_init(&b, n);
+    uintptr_t src = (uintptr_t)buf;
+    size_t done = 0;
+    long rc = 0;
+    while (done < n) {
+        size_t chunk = n - done;
+        if (chunk > b.cap) chunk = b.cap;
+        /* Fault-safe copy: a range that went bad since the pre-check (a
+         * concurrent munmap on another CPU) returns an error, not a #PF. */
+        if (copy_from_user(b.buf, src + done, chunk) != 0) { rc = -1; break; }
+        long w = sys_write_k(fd, b.buf, chunk);
+        if (w < 0) { rc = w; break; }
+        done += (size_t)w;
+        if ((size_t)w < chunk) break;          /* sink took less → short write */
+    }
+    bounce_fini(&b);
+    return done ? (long)done : rc;             /* partial progress wins over the error */
 }
 
 /* Cooked line read from the focused virtual console — a minimal line-discipline
@@ -215,8 +304,8 @@ static long stdin_read_line(char* buf, size_t cap) {
     }
 }
 
-long sys_read(int fd, void* buf, size_t n) {
-    if (n && !user_w(buf, n)) return -1;      /* §1.1 — validate the user buffer */
+/* Core: `buf` is always KERNEL memory (see the *_k note in syscall.h). */
+long sys_read_k(int fd, void* buf, size_t n) {
     if (fd == 0) return stdin_read_line((char*)buf, n);   /* cooked stdin */
     if (fd == 1 || fd == 2) return -1;
     struct ofile* o = fd_lookup(fd);
@@ -227,6 +316,35 @@ long sys_read(int fd, void* buf, size_t n) {
     if (o->kind == FD_SOCK) return usock_recv(o->sock, buf, n, 1, NULL);
     if (o->kind == FD_NETSOCK) return netsock_read(o->nsock, buf, n);
     return -1;
+}
+
+/* read(2) into a RING-3 buffer — the mirror image of sys_write above.  The
+ * source fills a kernel chunk, which is then copied out.  If the copy-out
+ * fails after some bytes have already been delivered we return the short count
+ * rather than -EFAULT: the data is gone from the file/socket either way, and a
+ * short read is a result the caller must already handle. */
+long sys_read(int fd, void* buf, size_t n) {
+    if (!user_ptr_gate_armed()) return sys_read_k(fd, buf, n);    /* kernel caller */
+    if (n && !user_w(buf, n)) return -1;      /* §1.1 — validate the user buffer */
+    if (n == 0) return 0;
+
+    int loop = read_may_loop(fd);
+    struct bounce b; bounce_init(&b, n);
+    uintptr_t dst = (uintptr_t)buf;
+    size_t done = 0;
+    long rc = 0;
+    do {
+        size_t chunk = n - done;
+        if (chunk > b.cap) chunk = b.cap;
+        long r = sys_read_k(fd, b.buf, chunk);
+        if (r < 0) { rc = r; break; }
+        if (r == 0) break;                                  /* EOF */
+        if (copy_to_user(dst + done, b.buf, (size_t)r) != 0) { rc = -1; break; }
+        done += (size_t)r;
+        if ((size_t)r < chunk) break;                        /* short read → done */
+    } while (loop && done < n);
+    bounce_fini(&b);
+    return done ? (long)done : rc;
 }
 
 int sys_open(const char* path, int flags) {
@@ -551,9 +669,9 @@ int sys_fstat(int fd, struct kstat* out) {
     return sys_fstat_k(fd, out);
 }
 
-/* Pack directory entries into `buf` as [reclen(2) | type(1) | name\0] records. */
-long sys_getdents(int fd, void* buf, size_t cap) {
-    if (!buf || !cap || !user_w(buf, cap)) return -1;   /* §1.1/4.4 */
+/* Pack directory entries into `buf` as [reclen(2) | type(1) | name\0] records.
+ * Core: `buf` is always KERNEL memory. */
+long sys_getdents_k(int fd, void* buf, size_t cap) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_VFS || !o->file) return -1;
     uint8_t* out = (uint8_t*)buf;
@@ -573,13 +691,36 @@ long sys_getdents(int fd, void* buf, size_t cap) {
     return (long)used;
 }
 
+/* getdents(2)/getdents64(2) into a RING-3 buffer.
+ *
+ * Records are packed into a kernel chunk and copied out in one go.  A caller
+ * offering more than BOUNCE_CHUNK simply gets the entries that fit in the
+ * chunk — legal for both calls, and the caller is already looping until the
+ * result is 0.  Directory position has advanced by then, so a failed copy-out
+ * costs those entries; that is the -EFAULT case and the program is buggy. */
+static long getdents_bounced(int fd, void* buf, size_t cap,
+                             long (*core)(int, void*, size_t)) {
+    if (!buf || !cap) return -1;
+    if (!user_ptr_gate_armed()) return core(fd, buf, cap);        /* kernel caller */
+    if (!user_w(buf, cap)) return -1;                             /* §1.1/4.4 */
+
+    struct bounce b; bounce_init(&b, cap);
+    long used = core(fd, b.buf, b.cap);
+    if (used > 0 && copy_to_user((uintptr_t)buf, b.buf, (size_t)used) != 0) used = -1;
+    bounce_fini(&b);
+    return used;
+}
+
+long sys_getdents(int fd, void* buf, size_t cap) {
+    return getdents_bounced(fd, buf, cap, sys_getdents_k);
+}
+
 /* Linux getdents64 packing (for the Linux-ABI backend, kernel/hal/x86/
  * linux_abi.c — musl's readdir uses SYS_getdents64).  Same VFS iteration as
  * sys_getdents, but emits the Linux `struct linux_dirent64` layout:
  *   u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[] (NUL-term).
  * Records are 8-byte aligned; d_type uses the Linux DT_* values. */
-long sys_getdents64(int fd, void* buf, size_t cap) {
-    if (!buf || !cap || !user_w(buf, cap)) return -1;   /* §1.1/4.4 */
+long sys_getdents64_k(int fd, void* buf, size_t cap) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_VFS || !o->file) return -1;
     uint8_t* out = (uint8_t*)buf;
@@ -605,6 +746,10 @@ long sys_getdents64(int fd, void* buf, size_t cap) {
         ino++;
     }
     return (long)used;
+}
+
+long sys_getdents64(int fd, void* buf, size_t cap) {
+    return getdents_bounced(fd, buf, cap, sys_getdents64_k);
 }
 
 static void ustr(char* d, const char* s) {
@@ -666,22 +811,60 @@ int sys_nanosleep(unsigned ms) {
  * (our pool is seeded at boot); flags (GRND_NONBLOCK/GRND_RANDOM) are ignored. */
 long sys_getrandom(void* buf, size_t n, unsigned flags) {
     (void)flags;
-    if (!buf || !user_w(buf, n)) return -1;   /* §1.1 */
-    random_bytes(buf, n);
-    return (long)n;
+    if (!buf) return -1;
+    if (!user_ptr_gate_armed()) { random_bytes(buf, n); return (long)n; }
+    if (!user_w(buf, n)) return -1;   /* §1.1 */
+
+    /* Generate into a kernel chunk and copy out — random_bytes() writes through
+     * the pointer itself, so a ring-3 buffer must never reach it. */
+    struct bounce b; bounce_init(&b, n);
+    size_t done = 0;
+    long rc = 0;
+    while (done < n) {
+        size_t chunk = n - done;
+        if (chunk > b.cap) chunk = b.cap;
+        random_bytes(b.buf, chunk);
+        if (copy_to_user((uintptr_t)buf + done, b.buf, chunk) != 0) { rc = -1; break; }
+        done += chunk;
+    }
+    bounce_fini(&b);
+    return done ? (long)done : rc;
 }
 
-long sys_send(int fd, const void* buf, size_t n, int passfd) {
-    if (n && !user_r(buf, n)) return -1;   /* §1.1 */
+/* Core: `buf` is always KERNEL memory (see the *_k note in syscall.h). */
+long sys_send_k(int fd, const void* buf, size_t n, int passfd) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_SOCK) return -1;
     struct ofile* pf = (passfd >= 0) ? fd_lookup(passfd) : NULL;
     return usock_send(o->sock, buf, n, pf);
 }
 
-long sys_recv(int fd, void* buf, size_t n, int* passfd_out) {
-    if (n && !user_w(buf, n)) return -1;   /* §1.1 */
-    if (passfd_out && !user_w(passfd_out, sizeof(int))) return -1;
+/* send(2) on a unix socket from a RING-3 buffer.  Unlike write(2) this carries
+ * an optional passed fd, which belongs to the FIRST chunk only — so once a
+ * chunk has gone out the descriptor must not travel again. */
+long sys_send(int fd, const void* buf, size_t n, int passfd) {
+    if (!user_ptr_gate_armed()) return sys_send_k(fd, buf, n, passfd);
+    if (n && !user_r(buf, n)) return -1;   /* §1.1 */
+    if (n == 0) return sys_send_k(fd, buf, 0, passfd);
+
+    struct bounce b; bounce_init(&b, n);
+    size_t done = 0;
+    long rc = 0;
+    while (done < n) {
+        size_t chunk = n - done;
+        if (chunk > b.cap) chunk = b.cap;
+        if (copy_from_user(b.buf, (uintptr_t)buf + done, chunk) != 0) { rc = -1; break; }
+        long w = sys_send_k(fd, b.buf, chunk, done ? -1 : passfd);
+        if (w < 0) { rc = w; break; }
+        done += (size_t)w;
+        if ((size_t)w < chunk) break;
+    }
+    bounce_fini(&b);
+    return done ? (long)done : rc;
+}
+
+/* Core: `buf` is always KERNEL memory (see the *_k note in syscall.h). */
+long sys_recv_k(int fd, void* buf, size_t n, int* passfd_out) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_SOCK) { if (passfd_out) *passfd_out = -1; return -1; }
 
@@ -702,6 +885,25 @@ long sys_recv(int fd, void* buf, size_t n, int* passfd_out) {
     } else if (passed) {
         ofile_unref(passed);                   /* caller didn't want it */
     }
+    return r;
+}
+
+/* recv(2) on a unix socket into a RING-3 buffer.  A single chunk only: what the
+ * endpoint had is the right answer for a datagram-ish socket, and looping would
+ * block a caller that offered a big buffer.  The passed-fd out-parameter is a
+ * kernel local here and copied out after the payload. */
+long sys_recv(int fd, void* buf, size_t n, int* passfd_out) {
+    if (!user_ptr_gate_armed()) return sys_recv_k(fd, buf, n, passfd_out);
+    if (n && !user_w(buf, n)) return -1;   /* §1.1 */
+    if (passfd_out && !user_w(passfd_out, sizeof(int))) return -1;
+
+    struct bounce b; bounce_init(&b, n ? n : 1);
+    size_t chunk = (n > b.cap) ? b.cap : n;
+    int kpass = -1;
+    long r = sys_recv_k(fd, b.buf, chunk, passfd_out ? &kpass : NULL);
+    if (r > 0 && copy_to_user((uintptr_t)buf, b.buf, (size_t)r) != 0) r = -1;
+    bounce_fini(&b);
+    if (passfd_out) copy_to_user((uintptr_t)passfd_out, &kpass, sizeof kpass);
     return r;
 }
 
@@ -753,10 +955,8 @@ static int poll_snapshot(struct pollfd* pfds, int nfds) {
  * event" loop).  timeout  > 0: a finite millisecond wait is not honoured yet
  * (needs a timed wakeup — deferred with cron/watchdog's timed-sleep); treated
  * as a snapshot so it never blocks past the caller's intent. */
-int sys_poll(struct pollfd* pfds, int nfds, int timeout) {
-    if (!pfds || nfds < 0 || nfds > 1024) return -1;          /* §1.1 + bound */
-    if (!user_w(pfds, (uintptr_t)nfds * sizeof(*pfds))) return -1;
-
+/* Core: `pfds` is always KERNEL memory (see the *_k note in syscall.h). */
+int sys_poll_k(struct pollfd* pfds, int nfds, int timeout) {
     for (;;) {
         int ready = poll_snapshot(pfds, nfds);
         if (ready > 0 || timeout >= 0) return ready;   /* ready, or non-blocking */
@@ -771,6 +971,30 @@ int sys_poll(struct pollfd* pfds, int nfds, int timeout) {
         waitq_block(&readiness_wq);
         waitq_unlock(&readiness_wq, f);
     }
+}
+
+/* poll(2) over a RING-3 pollfd array.  The array is read-modify-write, so it is
+ * copied in, worked on as kernel memory (poll_snapshot writes revents on every
+ * pass, and a blocking poll parks between passes — with a raw user pointer the
+ * kernel would be writing to ring-3 memory across a scheduling point), and
+ * copied back out once. */
+int sys_poll(struct pollfd* pfds, int nfds, int timeout) {
+    if (!pfds || nfds < 0 || nfds > 1024) return -1;          /* §1.1 + bound */
+    if (!user_ptr_gate_armed()) return sys_poll_k(pfds, nfds, timeout);
+    if (nfds == 0) return 0;
+
+    uintptr_t bytes = (uintptr_t)nfds * sizeof(*pfds);
+    if (!user_w(pfds, bytes)) return -1;
+
+    struct pollfd* k = (struct pollfd*)kmalloc((size_t)bytes);
+    if (!k) return -1;
+    int r = -1;
+    if (copy_from_user(k, (uintptr_t)pfds, bytes) == 0) {
+        r = sys_poll_k(k, nfds, timeout);
+        if (copy_to_user((uintptr_t)pfds, k, (size_t)bytes) != 0) r = -1;
+    }
+    kfree(k);
+    return r;
 }
 
 void fd_close_all(void) {
@@ -892,8 +1116,8 @@ static long netsock_read(struct netsock* ns, void* buf, size_t n) {
     return dev ? net_tcp_recv(dev, buf, (uint32_t)n) : -1;
 }
 
-long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port) {
-    if (n && !user_r(buf, n)) return -1;   /* §1.1 */
+/* Core: `buf` is always KERNEL memory (see the *_k note in syscall.h). */
+long sys_sendto_k(int fd, const void* buf, size_t n, uint32_t ip, int port) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_NETSOCK) return -1;
     struct netsock* ns = o->nsock;
@@ -904,9 +1128,29 @@ long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port) {
     return (long)n;
 }
 
-/* Core: `buf` may be a user buffer the CALLER has already validated (the Linux
- * personality hands us the client's iovec), `ip_out`/`port_out` are the
- * dispatcher's kernel locals — see the *_k note above. */
+/* sendto(2) from a RING-3 buffer.  A datagram is ATOMIC — it must go out as one
+ * packet — so unlike the stream paths this cannot be chunked: the payload is
+ * staged whole or the call fails.  UDP_MAX_PAYLOAD bounds what a program can
+ * make the kernel allocate in one call. */
+#define UDP_MAX_PAYLOAD  65507u
+
+long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port) {
+    if (!user_ptr_gate_armed()) return sys_sendto_k(fd, buf, n, ip, port);
+    if (n > UDP_MAX_PAYLOAD) return -1;
+    if (n && !user_r(buf, n)) return -1;   /* §1.1 */
+    if (n == 0) return sys_sendto_k(fd, buf, 0, ip, port);
+
+    void* k = kmalloc(n);
+    if (!k) return -1;
+    long rc = (copy_from_user(k, (uintptr_t)buf, n) == 0)
+              ? sys_sendto_k(fd, k, n, ip, port) : -1;
+    kfree(k);
+    return rc;
+}
+
+/* Core: every pointer is KERNEL memory — `buf` included (it used to accept a
+ * caller-validated user buffer; that is now the job of sys_recvfrom_u, so the
+ * datagram copy below can never touch ring-3 memory). */
 long sys_recvfrom_k(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_NETSOCK) return -1;
@@ -930,9 +1174,35 @@ long sys_recvfrom_k(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out
     return (long)cnt;
 }
 
+/* recvfrom into a RING-3 payload buffer, with the source address landing in the
+ * caller's KERNEL locals.  That split is what the Linux personality needs: it
+ * marshals (ip, port) into the client's `struct sockaddr_in` itself, but the
+ * payload pointer is the client's.  sys_recvfrom (the d-os-native entry) is a
+ * thin wrapper that also copies the address out to ring 3. */
+long sys_recvfrom_u(int fd, uintptr_t ubuf, size_t n, uint32_t* ip_out, int* port_out) {
+    if (n > UDP_MAX_PAYLOAD) n = UDP_MAX_PAYLOAD;
+    if (n && !vmm_user_access_ok(ubuf, n, 1)) return -1;   /* §1.1 */
+    if (n == 0) return sys_recvfrom_k(fd, NULL, 0, ip_out, port_out);
+
+    void* k = kmalloc(n);
+    if (!k) return -1;
+    long r = sys_recvfrom_k(fd, k, n, ip_out, port_out);
+    if (r > 0 && copy_to_user(ubuf, k, (size_t)r) != 0) r = -1;
+    kfree(k);
+    return r;
+}
+
 long sys_recvfrom(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out) {
-    if (n && !user_w(buf, n)) return -1;   /* §1.1 */
+    if (!user_ptr_gate_armed())
+        return sys_recvfrom_k(fd, buf, n, ip_out, port_out);   /* kernel caller */
     if (ip_out && !user_w(ip_out, sizeof(*ip_out))) return -1;
     if (port_out && !user_w(port_out, sizeof(*port_out))) return -1;
-    return sys_recvfrom_k(fd, buf, n, ip_out, port_out);
+
+    uint32_t kip = 0; int kport = 0;
+    long r = sys_recvfrom_u(fd, (uintptr_t)buf, n, &kip, &kport);
+    if (r >= 0) {
+        if (ip_out   && copy_to_user((uintptr_t)ip_out,   &kip,   sizeof kip)   != 0) return -1;
+        if (port_out && copy_to_user((uintptr_t)port_out, &kport, sizeof kport) != 0) return -1;
+    }
+    return r;
 }

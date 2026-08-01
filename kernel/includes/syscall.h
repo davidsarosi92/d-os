@@ -177,6 +177,25 @@ int  sys_fstat_k(int fd, struct kstat* out);
 int  sys_clock_gettime_k(int which, struct ktimespec* out);
 long sys_recvfrom_k(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out);
 
+/* Bulk-payload cores (§1.1 layer 3).  The gated wrappers above stage ring-3
+ * payloads through a kernel chunk and then call these, so the VFS / socket /
+ * console layers below never dereference a user pointer.  Call them directly
+ * only with KERNEL buffers — e.g. the Linux personality's sendmsg, which
+ * gathers the client's iovecs into a kernel array first. */
+long sys_write_k(int fd, const void* buf, size_t n);
+long sys_read_k (int fd, void* buf, size_t n);
+long sys_send_k (int fd, const void* buf, size_t n, int passfd);
+long sys_recv_k (int fd, void* buf, size_t n, int* passfd_out);
+long sys_sendto_k(int fd, const void* buf, size_t n, uint32_t ip, int port);
+long sys_getdents_k  (int fd, void* buf, size_t cap);
+long sys_getdents64_k(int fd, void* buf, size_t cap);
+int  sys_poll_k(struct pollfd* fds, int nfds, int timeout);
+
+/* recvfrom with a RING-3 payload buffer but KERNEL (ip, port) out-parameters —
+ * the shape a foreign personality needs when it marshals the source address
+ * into its own sockaddr layout.  Validates + bounces the payload itself. */
+long sys_recvfrom_u(int fd, uintptr_t ubuf, size_t n, uint32_t* ip_out, int* port_out);
+
 /* Close every user fd (>= 3) the current task opened — the exec path calls it
  * when a user program returns so open files don't leak onto the host task. */
 void fd_close_all(void);
