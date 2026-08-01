@@ -42,7 +42,24 @@ ap_trampoline_start:
     mov sp, 0x7000              ; temporary real-mode stack (below trampoline)
 
     ; Load the GDT pointer the BSP planted at AP_INFO_ADDR + 12.
-    lgdt [AP_INFO_ADDR + 12]
+    ;
+    ; The `o32` prefix is NOT cosmetic — it is load-bearing.  With the default
+    ; 16-bit operand size, `lgdt m16&32` loads only the LOW 24 BITS of the base
+    ; and forces bits 31:24 to zero (Intel SDM Vol 2A, LGDT: "the operand-size
+    ; attribute determines whether a 16-bit or 32-bit base is loaded; with a
+    ; 16-bit operand size the upper byte of the base is not loaded").  The
+    ; 32-bit operand size loads the full 32-bit base.
+    ;
+    ; This was a silent time bomb: it worked for years because the kernel's
+    ; .bss (where `gdt[]` lives) sat below 16 MiB, so the truncated byte was
+    ; zero anyway.  Once the image grew past 16 MiB (embedded font + NetSurf /
+    ; freetype blobs), `gdt` moved to ~0x014f61a0, the AP loaded GDTR base
+    ; 0x004f61a0 instead, and the very next instruction that needs a descriptor
+    ; — the far jump to selector 0x08 — took a #GP.  With no IDT yet that
+    ; escalated #GP → #DF → triple fault, i.e. the whole box died the moment
+    ; you passed `-smp 2`.  Symptom to remember: an AP that dies EXACTLY at the
+    ; protected-mode far jump usually means a bad GDTR, not a bad descriptor.
+    o32 lgdt [AP_INFO_ADDR + 12]
 
     ; Enable protected mode: CR0.PE = 1.
     mov eax, cr0

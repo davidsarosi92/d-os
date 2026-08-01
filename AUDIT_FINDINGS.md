@@ -49,6 +49,7 @@ DOCS.md §4.37; the milestone is §M46.
 |---------|--------|
 | ACPI tables sit at the TOP of low RAM, above the i386 256 MiB identity map → the first table read is an unmapped kernel access → **silent boot freeze with `-m 512M`** | ✅ **FIXED** — `acpi_reach()` identity-maps each table on demand |
 | The `sys_*` layer is dual-use (ring-3 dispatchers + in-kernel callers); gating inside it broke `linux_abi`'s kernel-buffer calls → ld.so could not `fstat` any `.so` → **NetSurf stopped starting on both x86 arches**, plus `fdtest`/`socktest`/`polltest` | ✅ **FIXED** — gate keyed on `task->in_user_syscall`; kernel-destination calls use `sys_*_k` cores |
+| i386 `-smp 2` **triple-faulted the box during AP bring-up** (QEMU exits under `-no-reboot`, so it looked like a silent hang).  The AP trampoline's 16-bit `lgdt` loads only the low 24 bits of the GDT base; once the kernel image grew past 16 MiB, `gdt[]` moved to `0x014f61a0` and the AP loaded `0x004f61a0` → #GP on the very next far jump → #DF → triple fault | ✅ **FIXED** — `o32 lgdt` in `kernel/hal/x86/ap_trampoline.s`; verified `-smp 2` and `-smp 4` (all APs online, parallel + thread + TLS + fork tests green, GUI and NetSurf render) |
 
 ---
 

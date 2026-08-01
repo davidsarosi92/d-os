@@ -1004,6 +1004,22 @@ in parallel with BSP."
   hog and idle every quantum, killing throughput.  Fix:
   `pick_next_locked` skips `is_idle` tasks; only the no-work
   fallback path picks idle.
+- *(added 2026-08-01, found long after M18.5 shipped)*  **A 16-bit
+  `lgdt` truncates the GDT base to 24 bits.**  The AP trampoline runs
+  in real mode, so `lgdt m16&32` at the default operand size drops
+  bits 31:24 of the base; the `o32` prefix is mandatory, not
+  cosmetic.  This lay dormant for months because `gdt[]` happened to
+  live below 16 MiB — then the kernel image grew past that (embedded
+  font + NetSurf/freetype blobs), `gdt` moved to `0x014f61a0`, the AP
+  loaded `0x004f61a0`, and the far jump to selector 0x08 #GP'd → #DF
+  → **triple fault on every `-smp N` boot**.  Two transferable
+  lessons: (1) a "hang" where QEMU itself *exits* under `-no-reboot`
+  is a triple fault — go straight to `-d cpu_reset,int`; (2) boot
+  code written in 16-bit mode encodes silent assumptions about how
+  big the image is, so every address it touches deserves a comment
+  stating the assumption.  Fixed in `ap_trampoline.s`; x86_64 was
+  immune (inline low-memory GDT first, kernel GDT only re-loaded in
+  long mode).
 
 **Still deferred (genuine M19/later work):**
 

@@ -3780,6 +3780,35 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-08-01 — SMP: i386 `-smp N` boots again (AP trampoline GDTR
+  truncation).**  Passing `-smp 2` to the i386 build killed the machine during
+  AP bring-up.  It looked like a silent hang, but it was a **triple fault** —
+  QEMU simply exits under `-no-reboot`, which is why nothing appeared on serial
+  past `lapic: timer calibrated`.  Root cause: the AP trampoline runs in 16-bit
+  real mode, and `lgdt m16&32` with a 16-bit operand size loads only the **low
+  24 bits** of the GDT base (Intel SDM Vol 2A).  This was harmless for years
+  because `gdt[]` lived below 16 MiB — but the kernel image grew past that
+  (embedded font + NetSurf/freetype blobs), `gdt` moved to `0x014f61a0`, and the
+  AP loaded GDTR base `0x004f61a0`.  The very next instruction that needs a
+  descriptor — the far jump to selector `0x08` — took a #GP; with no IDT loaded
+  yet that escalated #GP → #DF → triple fault.  Fix: an `o32` prefix on the
+  trampoline's `lgdt` (`kernel/hal/x86/ap_trampoline.s`) so the full 32-bit base
+  is loaded.  x86_64 was never affected: its trampoline first loads a small
+  inline GDT that lives below 64 KiB, and only re-loads the kernel GDT once it
+  is already in long mode, where `lgdt` takes the 10-byte form.
+  **Lessons learned.** (1) A hang that leaves QEMU *dead* rather than spinning
+  is a triple fault — reach for `-d cpu_reset,int` first; the exception log
+  names the faulting instruction and error code in one shot.  (2) An AP that
+  dies exactly at the protected-mode far jump means a bad **GDTR**, not a bad
+  descriptor; compare the GDTR base in the QEMU dump against `nm kernel.bin |
+  grep gdt` — here the two differed by exactly the truncated top byte.  (3) This
+  is a class of bug where *growing the image* breaks boot code written when the
+  image was small; any 16-bit-mode address handling deserves a comment saying
+  what it silently assumes.
+  Verified: i386 `-smp 2` and `-smp 4` (every AP online, parallel/preempt
+  self-tests PASS), `faulttest`/`fdtest`/`socktest`/`threadtest`/`tlstest`/
+  `forktest` green on two CPUs, GUI desktop and NetSurf both render; x86_64
+  `-smp 2` unchanged and still green.
 - **2026-08-01 — M46: resilience — a program can no longer freeze the box
   (DOCS §4.37).**  Ring-3 faults kill just the process on all three arches;
   force-kill reclaims a wedged ring-3 task at the timer preemption boundary
