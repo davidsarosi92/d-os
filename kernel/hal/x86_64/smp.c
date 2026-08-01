@@ -114,10 +114,18 @@ static void copy_trampoline(void) {
  *   4. Start LAPIC timer in periodic mode at the BSP-calibrated count.
  *   5. Enable interrupts, enter idle loop.
  * --------------------------------------------------------------------------- */
+/* Per-CPU x86_64 bring-up (TR + SSE + SYSCALL MSRs) — the single list lives in
+ * hal_arch.c, which documents what each item costs if it is skipped. */
+extern void hal_arch_init_this_cpu(void);
+
 static void ap_main(void) {
     lapic_init_ap();
     percpu_init_ap();
     idt_load();
+
+    /* SMP userland: TR, the SSE control bits and the SYSCALL MSRs are all
+     * per-CPU.  Must come after percpu_init_ap so this_cpu_id() is valid. */
+    hal_arch_init_this_cpu();
 
     kprintf("ap: cpu %d (apic_id=%u) online\n",
             this_cpu_id(), lapic_id());

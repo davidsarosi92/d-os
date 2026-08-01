@@ -3780,6 +3780,46 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-08-01 — SMP: x86_64 ring-3 works on an AP (per-CPU TSS + SSE +
+  SYSCALL MSRs).**  x86_64 `-smp 2` triple-faulted as soon as a ring-3 task was
+  load-balanced onto the AP — reliably reproducible by launching NetSurf, which
+  runs long enough to migrate.  Three pieces of x86_64 CPU state that are
+  PER-CPU were being programmed only on the BSP:
+    1. **TR** (`ltr`) — the AP ran with TR = 0, so a trap taken while it
+       executed ring-3 code had no RSP0 to switch to → #DF → triple fault, with
+       no chance for the kernel to report anything.  Worse, there was only ONE
+       TSS descriptor in the GDT, so even LTR-ing it would have made both cores
+       share one RSP0.
+    2. **CR0.EM/MP + CR4.OSFXSR/OSXMMEXCPT** (`enable_sse`) — SSE2 is baseline
+       on x86_64, so without it every musl binary #UDs on its first SSE
+       instruction.
+    3. **EFER.SCE + STAR/LSTAR/FMASK** (`syscall_init_64`) — without them the
+       `syscall` instruction is not enabled on that core, so every libc syscall
+       from a ring-3 task there raises #UD.
+  Fixed by giving x86_64 the per-CPU TSS shape i386 got in M35 (an array in
+  `tss.c`, two GDT slots per CPU since a long-mode TSS descriptor is 16 bytes,
+  `gdt_load_cpu_tss()`), and by collecting all three into one
+  `hal_arch_init_this_cpu()` that `ap_main` calls after `percpu_init_ap()`.
+  **Lessons learned.** (1) The diagnostic ladder that found this in minutes:
+  QEMU exiting under `-no-reboot` ⇒ triple fault ⇒ `-d cpu_reset,int` ⇒ the
+  exception chain named it (#UD at CPL=3, then #SS delivering it).  (2) The
+  register dump answered "why" without reading any source: `TR=0000` and
+  `EFER=…500` on the faulting CPU versus `…501` on the BSP, `CR4=0x20` versus
+  `0x620` — **diff the two CPUs' control registers; every difference is a
+  per-CPU init you forgot.**  (3) The general rule this is the third instance
+  of (after M35's i386 TSS and M18.5's per-CPU IDTR): *anything held in a
+  control register or MSR is per-CPU by definition* — so the per-CPU bring-up
+  list belongs in ONE function, which is what `hal_arch_init_this_cpu` now is.
+  Verified: x86_64 `-smp 2` and `-smp 4` (all APs online, parallel self-test
+  PASS), `faulttest`/`fdtest`/`socktest`/`polltest`/`musltest` green on 2 CPUs,
+  NetSurf renders on `-smp 2`; UP unchanged and still green.
+  **Known gap this exposes (NOT fixed here, pre-existing):** the x87/SSE
+  register file is not saved across a context switch (see the comment on
+  `enable_sse` in `hal/x86_64/hal_arch.c`).  On UP that already meant two
+  concurrent SSE-using ring-3 tasks clobber each other; on SMP a task migrating
+  between cores also resumes on a different XMM file.  A proper fix is
+  per-task FXSAVE/FXRSTOR state (with a valid initial image, since `fxrstor` of
+  a garbage MXCSR faults) — a follow-up in its own right.
 - **2026-08-01 — §1.1 layer 3: bounce buffers close the last ring-3 pointer
   hole.**  M46 shipped two layers — a per-syscall gate and an exception table —
   but the BULK payloads (`read`/`write`/`send`/`recv`/`sendto`/`recvfrom`/

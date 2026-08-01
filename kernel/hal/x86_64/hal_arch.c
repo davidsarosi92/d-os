@@ -96,9 +96,33 @@ static void enable_sse(void) {
     __asm__ volatile ("mov %0, %%cr4" :: "r"(cr4));
 }
 
+/* Everything on x86_64 that lives in a PER-CPU register or MSR and therefore
+ * has to be programmed again on every core that comes up.  Keeping the list in
+ * ONE function is the point: an AP that misses any of these dies in a way that
+ * looks nothing like the omission.
+ *
+ *   gdt_load_cpu_tss()  TR is per-CPU.  TR = 0 → a ring-3 trap has no RSP0 to
+ *                       switch to → #DF → triple fault, with no chance for the
+ *                       kernel to report anything.
+ *   enable_sse()        CR0.EM/MP and CR4.OSFXSR/OSXMMEXCPT are per-CPU.  SSE2
+ *                       is BASELINE on x86_64, so without this every musl
+ *                       binary #UDs on its first SSE instruction.
+ *   syscall_init_64()   EFER.SCE + STAR/LSTAR/FMASK are per-CPU MSRs.  Without
+ *                       them the `syscall` instruction is not enabled on this
+ *                       core at all → #UD on every libc syscall.
+ *
+ * Call AFTER percpu_init_ap() so this_cpu_id() is valid.  (All three were
+ * BSP-only until 2026-08-01, which is why x86_64 `-smp 2` collapsed the moment
+ * a ring-3 task was load-balanced onto the AP — see DOCS §8.) */
+void hal_arch_init_this_cpu(void) {
+    gdt_load_cpu_tss();
+    enable_sse();
+    syscall_init_64();
+}
+
 void hal_arch_early_init(void) {
     tss_init();
-    gdt_init();
+    gdt_init();          /* also LTRs the BSP's own TSS */
     idt_init();
     enable_sse();
     syscall_init_64();

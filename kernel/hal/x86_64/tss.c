@@ -1,5 +1,16 @@
 /* =============================================================================
- * tss.c — single static Task State Segment for the kernel (x86_64).
+ * tss.c — per-CPU Task State Segments for the kernel (x86_64).
+ *
+ * SMP (2026-08-01): there is one TSS PER CPU, not one for the machine.  The TSS
+ * holds RSP0 — the stack the CPU switches to on a ring-3 → ring-0 transition —
+ * and TR is a per-CPU register, so two CPUs sharing one TSS would land ring-3
+ * traps from both cores on the SAME kernel stack and corrupt each other.  Worse,
+ * an AP that never executes `ltr` has TR = 0: the first interrupt or exception
+ * taken while it runs a ring-3 task cannot find a stack at all, which escalates
+ * straight to #DF and then a triple fault (this is exactly how x86_64 `-smp 2`
+ * died as soon as NetSurf got load-balanced onto the AP — see DOCS §8).  Mirrors
+ * what M35 did for i386: an array here, one GDT descriptor per CPU in gdt.c, and
+ * every CPU LTRs its own via gdt_load_cpu_tss().
  *
  * The 64-bit TSS is laid out very differently from the 32-bit one:
  *
@@ -31,6 +42,8 @@
 #include "tss.h"
 #include "gdt.h"
 #include "hal_api.h"
+#include "acpi.h"          /* ACPI_MAX_CPUS — sizes the per-CPU array */
+#include "percpu.h"        /* this_cpu_id                              */
 #include <stdint.h>
 
 struct tss64 {
@@ -51,48 +64,60 @@ struct tss64 {
     uint16_t iomap_base;            /* 0x66 */
 } __attribute__((packed));
 
-static struct tss64 tss;
+#define TSS_MAX_CPUS ACPI_MAX_CPUS
+static struct tss64 tss[TSS_MAX_CPUS];
 
-/* Mirror of tss.rsp0 read by the SYSCALL-instruction entry stub
- * (syscall_entry.s): `syscall` does not switch stacks the way an int-gate
+/* Mirror of the RUNNING CPU's tss.rsp0, read by the SYSCALL-instruction entry
+ * stub (syscall_entry.s): `syscall` does not switch stacks the way an int-gate
  * does, so the stub loads the kernel stack from here.  Kept in lock-step with
- * tss.rsp0 by tss_init / hal_set_kernel_stack below. */
+ * tss[this_cpu].rsp0 by tss_init / hal_set_kernel_stack below.
+ *
+ * NOTE (SMP): this single mirror is correct only because it is rewritten on
+ * every context switch by hal_set_kernel_stack — the scheduler sets it for the
+ * task about to run on THIS CPU.  If SYSCALL entry ever needs to work without
+ * that guarantee it must become per-CPU (e.g. via %gs and swapgs). */
 extern uint64_t syscall_kernel_rsp;
 
 /* Dedicated kernel stack used for ring-3 → ring-0 transitions, mirror
  * of the i386 syscall_stack.  4 KiB is plenty for a syscall handler;
  * deeper paths (nested IRQs etc.) use the regular kernel stack via
  * IST entries instead.  Aligned to 16 bytes to satisfy System V's
- * stack-alignment requirement on call. */
+ * stack-alignment requirement on call.  ONE PER CPU — two cores taking a
+ * ring-3 trap at the same time must not share it. */
 #define KSTACK_SIZE 4096
-static uint8_t syscall_stack[KSTACK_SIZE] __attribute__((aligned(16)));
+static uint8_t syscall_stack[TSS_MAX_CPUS][KSTACK_SIZE] __attribute__((aligned(16)));
+
+static inline uint64_t default_rsp0(int cpu) {
+    return (uint64_t)(uintptr_t)(syscall_stack[cpu] + KSTACK_SIZE);
+}
 
 void tss_init(void) {
     /* Zero everything — the per-CPU init code below sets the slots we
-     * actually use. */
-    uint8_t* b = (uint8_t*)&tss;
-    for (uint32_t i = 0; i < sizeof(tss); i++) b[i] = 0;
-
-    tss.rsp0 = (uint64_t)(uintptr_t)(syscall_stack + KSTACK_SIZE);
-    syscall_kernel_rsp = tss.rsp0;
-
-    /* iomap_base == sizeof(tss) means "no I/O permission bitmap" —
-     * any ring-3 IN/OUT traps with #GP (which is what we want; user
-     * mode has no business doing port I/O). */
-    tss.iomap_base = sizeof(tss);
+     * actually use.  Every CPU's TSS is prepared up front so an AP only has to
+     * `ltr` its own selector (gdt_load_cpu_tss) with nothing left to allocate. */
+    for (int c = 0; c < TSS_MAX_CPUS; c++) {
+        uint8_t* b = (uint8_t*)&tss[c];
+        for (uint32_t i = 0; i < sizeof(struct tss64); i++) b[i] = 0;
+        tss[c].rsp0 = default_rsp0(c);
+        /* iomap_base == sizeof(tss) means "no I/O permission bitmap" —
+         * any ring-3 IN/OUT traps with #GP (which is what we want; user
+         * mode has no business doing port I/O). */
+        tss[c].iomap_base = sizeof(struct tss64);
+    }
+    syscall_kernel_rsp = tss[0].rsp0;      /* BSP; APs refresh it on entry */
 }
 
 void tss_set_kernel_stack(uintptr_t sp) {
-    tss.rsp0 = (uint64_t)sp;
+    tss[this_cpu_id()].rsp0 = (uint64_t)sp;
 }
 
 /* Tier B — per-task ring-3→ring-0 stack.  `top != 0` = an independent user
- * task's own kernel-stack top; `top == 0` restores the fixed syscall stack
- * (kernel threads + the excursion-model self-tests). */
+ * task's own kernel-stack top; `top == 0` restores this CPU's fixed syscall
+ * stack (kernel threads + the excursion-model self-tests). */
 void hal_set_kernel_stack(uintptr_t top) {
-    tss.rsp0 = top ? (uint64_t)top
-                   : (uint64_t)(uintptr_t)(syscall_stack + KSTACK_SIZE);
-    syscall_kernel_rsp = tss.rsp0;
+    int c = this_cpu_id();
+    tss[c].rsp0 = top ? (uint64_t)top : default_rsp0(c);
+    syscall_kernel_rsp = tss[c].rsp0;
 }
 
 /* M35 TLS (x86_64) — set the thread pointer.  On x86_64, thread-local storage
@@ -109,5 +134,7 @@ void hal_set_tls_base(uintptr_t base) {
                          "d"((uint32_t)((uint64_t)base >> 32)));
 }
 
-uintptr_t tss_get_addr(void)  { return (uintptr_t)&tss; }
-uint32_t  tss_get_limit(void) { return sizeof(tss) - 1; }
+uintptr_t tss_get_addr(void)        { return (uintptr_t)&tss[0]; }
+uintptr_t tss_get_addr_cpu(int cpu) { return (uintptr_t)&tss[cpu]; }
+uint32_t  tss_get_limit(void)       { return sizeof(struct tss64) - 1; }
+int       tss_max_cpus(void)        { return TSS_MAX_CPUS; }

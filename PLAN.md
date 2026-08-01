@@ -1004,6 +1004,17 @@ in parallel with BSP."
   hog and idle every quantum, killing throughput.  Fix:
   `pick_next_locked` skips `is_idle` tasks; only the no-work
   fallback path picks idle.
+- *(added 2026-08-01)*  **Anything in a control register or an MSR is
+  PER-CPU by definition.**  This is now the third instance of the same
+  omission (per-CPU IDTR in M18.5, per-CPU TSS on i386 in M35, and on
+  x86_64 here): the AP was missing TR, the CR0/CR4 SSE enable bits AND
+  the EFER.SCE/STAR/LSTAR MSRs, so x86_64 `-smp N` triple-faulted the
+  instant a ring-3 task migrated onto it.  The per-CPU bring-up list
+  therefore lives in ONE function (`hal_arch_init_this_cpu`) instead of
+  being scattered across the BSP boot path.  Debugging shortcut worth
+  keeping: **diff the two CPUs' control registers in the QEMU dump** —
+  `TR=0000` vs a real selector, `EFER=…500` vs `…501`, `CR4=0x20` vs
+  `0x620` named all three gaps before any source was read.
 - *(added 2026-08-01, found long after M18.5 shipped)*  **A 16-bit
   `lgdt` truncates the GDT base to 24 bits.**  The AP trampoline runs
   in real mode, so `lgdt m16&32` at the default operand size drops
