@@ -28,7 +28,14 @@
 #include "syscall.h"
 #include "idt.h"
 #include "task.h"
+#include "vmm.h"                 /* §audit#3 — validate the sigreturn user stack */
 #include <stdint.h>
+
+/* §audit#3 — the ONLY EFLAGS bits ring-3 may set via sigreturn: the arithmetic
+ * + direction flags (CF PF AF ZF SF DF OF).  IF, IOPL, NT, TF and reserved bits
+ * are kept from the kernel's current trapframe, so a signal handler can't
+ * disable interrupts / raise its privilege by returning a crafted EFLAGS. */
+#define EFLAGS_USER_MASK 0x00000CD5u
 
 /* saved context slot order pushed below the sig arg. */
 enum { S_EAX, S_EBX, S_ECX, S_EDX, S_ESI, S_EDI, S_EBP, S_EIP, S_EFLAGS, S_ESP, S_N };
@@ -56,6 +63,16 @@ void signal_deliver(struct int_frame* f) {
         if (h == SIG_IGN)      continue;
         if (!t->sig_restorer)  continue;        /* no trampoline → cannot deliver */
 
+        /* §1.4 — the frame is written onto the process's OWN stack; if that
+         * stack pointer is bad/exhausted, the kernel-mode stores would #PF in
+         * ring 0 (→ halt).  Validate the whole frame range is user-writable
+         * first; if not, terminate the process (SIGSEGV) rather than fault. */
+        uintptr_t frame_lo = (uintptr_t)f->user_esp - (uintptr_t)(S_N * 4 + 8);
+        if (!vmm_user_access_ok(frame_lo, (uintptr_t)(S_N * 4 + 8), 1)) {
+            if (t->user_task) { fd_close_all(); task_exit_code(128 + SIGSEGV); }
+            continue;
+        }
+
         /* Build the signal frame on the user stack. */
         uint32_t sp = (uint32_t)f->user_esp;
 
@@ -77,8 +94,20 @@ void signal_deliver(struct int_frame* f) {
 void signal_sigreturn(struct int_frame* f) {
     /* On entry (the trampoline's int 0x80) user_esp points just below the sig
      * argument; the saved context sits right above it (see the layout above). */
-    uint32_t* sv = (uint32_t*)((uint32_t)f->user_esp + 4);
+    uintptr_t frame = (uintptr_t)((uint32_t)f->user_esp + 4);
+    /* §audit#3 — the saved context lives on the UNTRUSTED user stack.  Validate
+     * it is mapped + user-readable before touching it, so a crafted user_esp
+     * can't fault the kernel (→ halt); a bad frame kills the process instead. */
+    if (!vmm_user_access_ok(frame, (uintptr_t)S_N * 4, 0)) {
+        struct task* t = task_current();
+        if (t && t->user_task) task_exit_code(139);   /* 128 + SIGSEGV */
+        return;
+    }
+    uint32_t* sv = (uint32_t*)frame;
     f->eax = sv[S_EAX]; f->ebx = sv[S_EBX]; f->ecx = sv[S_ECX]; f->edx = sv[S_EDX];
     f->esi = sv[S_ESI]; f->edi = sv[S_EDI]; f->ebp = sv[S_EBP];
-    f->eip = sv[S_EIP]; f->eflags = sv[S_EFLAGS]; f->user_esp = sv[S_ESP];
+    f->eip = sv[S_EIP]; f->user_esp = sv[S_ESP];
+    /* §audit#3 — restore ONLY the user-settable EFLAGS bits; keep IF/IOPL/etc.
+     * from the kernel's current (safe) trapframe. */
+    f->eflags = (f->eflags & ~EFLAGS_USER_MASK) | (sv[S_EFLAGS] & EFLAGS_USER_MASK);
 }

@@ -118,6 +118,17 @@ SECTIONS
         __stop_cron_jobs = .;
     }
 
+    /* §1.1 — user-access exception table.  Each entry (insn, fixup) is emitted
+     * by the inline asm in kernel/hal/aarch64/uaccess.c; the EL1 abort handler
+     * looks the faulting ELR up here and resumes at the fixup instead of
+     * halting, so an EL0 pointer that goes bad DURING a copy returns -EFAULT. */
+    .ex_table : ALIGN(8)
+    {
+        __start_ex_table = .;
+        KEEP(*(ex_table))
+        __stop_ex_table = .;
+    }
+
     .data : ALIGN(4K)
     {
         *(.data)

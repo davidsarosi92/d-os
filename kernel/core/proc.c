@@ -70,6 +70,23 @@
  * --------------------------------------------------------------------------- */
 static uint32_t u_strlen(const char* s) { uint32_t n = 0; while (s[n]) n++; return n; }
 
+/* §1.1 — copy a NUL-terminated string from the USER pointer `us` into `dst`
+ * (≤ max, always NUL-terminated), validating each page so a bad execve argv
+ * string can't fault the kernel.  Returns the length, or -1 on a bad pointer. */
+static int u_strcopy(char* dst, const char* us, uint32_t max) {
+    if (max == 0) return -1;
+    uintptr_t base = (uintptr_t)us, last = ~(uintptr_t)0;
+    for (uint32_t i = 0; i + 1 < max; i++) {
+        uintptr_t pg = (base + i) & ~(uintptr_t)0xFFF;
+        if (pg != last) { if (!vmm_user_access_ok(pg, 1, 0)) return -1; last = pg; }
+        char c = *(const volatile char*)(uintptr_t)(base + i);
+        dst[i] = c;
+        if (c == 0) return (int)i;
+    }
+    dst[max - 1] = 0;
+    return (int)(max - 1);
+}
+
 /* SysV auxiliary-vector types.  The first group a static musl reads; the
  * second group (§M37) is what the DYNAMIC linker (ld.so) reads to find and
  * relocate the main object + itself. */
@@ -265,6 +282,12 @@ static int proc_exec_common(const void* image, size_t len,
 
     enter_user_mode_wrap(lp.entry, user_sp);
 
+    /* §1.1 — the excursion left ring 3 through the SYS_EXIT teleport, which does
+     * NOT unwind the dispatcher, so clear the "arguments are user pointers" flag
+     * by hand.  Otherwise this kernel task would keep it set and every later
+     * in-kernel sys_* call (the shell's own self-tests) would be gated. */
+    if (me) me->in_user_syscall = 0;
+
     fd_close_all();                    /* reclaim any fds the program opened */
     vmm_space_switch(prev);
     if (me) me->mm = prev;
@@ -306,19 +329,25 @@ int proc_execve(const char* path, char* const uargv[]) {
     char* strbuf = (char*)kmalloc(EXECVE_ARGBUF);
     if (!strbuf) return -1;
     int argc = 0; uint32_t soff = 0;
-    if (uargv) {
-        for (argc = 0; argc < PROC_MAX_ARGV && uargv[argc]; argc++) {
+    if (uargv && vmm_user_access_ok((uintptr_t)uargv, sizeof(char*), 0)) {
+        for (argc = 0; argc < PROC_MAX_ARGV; argc++) {
+            /* §1.1 — validate the argv[] slot, then copy the string safely. */
+            if (!vmm_user_access_ok((uintptr_t)&uargv[argc], sizeof(char*), 0)) break;
             const char* s = uargv[argc];
-            uint32_t l = u_strlen(s) + 1;
-            if (soff + l > EXECVE_ARGBUF) break;
-            for (uint32_t j = 0; j < l; j++) strbuf[soff + j] = s[j];
+            if (!s) break;
+            if (soff >= EXECVE_ARGBUF) break;
+            int l = u_strcopy(&strbuf[soff], s, EXECVE_ARGBUF - soff);
+            if (l < 0) { kfree(strbuf); return -1; }
             kargv[argc] = &strbuf[soff];
-            soff += l;
+            soff += (uint32_t)l + 1;
         }
     }
 
-    /* 2. Read the ELF file into a kernel buffer. */
-    struct file* f = vfs_open(path, VFS_RDONLY);
+    /* 2. Read the ELF file into a kernel buffer.  §1.1 — `path` is the calling
+     *    program's pointer, so copy it in (validated) before the VFS sees it. */
+    char kpath[256];
+    if (u_strcopy(kpath, path, sizeof kpath) < 0) { kfree(strbuf); return -1; }
+    struct file* f = vfs_open(kpath, VFS_RDONLY);
     if (!f) { kfree(strbuf); return -1; }
     size_t sz = f->inode ? (size_t)f->inode->size : 0;
     if (sz == 0 || sz > (16u << 20)) { vfs_close(f); kfree(strbuf); return -1; }
@@ -374,6 +403,7 @@ struct user_boot {
     struct vmm_space* space;
     uintptr_t         entry;
     uintptr_t         user_sp;
+    int               linux_abi;   /* run under the Linux-ABI personality?     */
 };
 
 static void user_task_bootstrap(void) {
@@ -384,6 +414,7 @@ static void user_task_bootstrap(void) {
     me->mm          = b->space;
     me->mmap_cursor = 0;
     me->user_task   = 1;
+    me->linux_abi   = b->linux_abi;   /* a musl/Linux-ABI package (e.g. NetSurf) */
     kfree(b);
 
     vmm_space_switch(me->mm);
@@ -459,7 +490,17 @@ int proc_clone(uintptr_t entry, uintptr_t stack) {
     return t->pid;
 }
 
-int proc_spawn(const char* name, const void* image, size_t len) {
+/* Full form: run an ELF as an independent, preemptible user task with an
+ * argv and an optional Linux-ABI personality.  This is the vehicle a GUI
+ * "package" (e.g. NetSurf) launches through — NOT the synchronous excursion
+ * (proc_exec_*), which nests the ring-3 run inside the caller's kernel task
+ * and is reserved for the self-tests.  Running as a real user_task is what
+ * makes a faulting/wedged package terminate cleanly (isr_handler kills the
+ * *task*, the reaper frees its space) and force-killable (M46), instead of
+ * taking down the shell/desktop task the excursion would have run on. */
+int proc_spawn_argv_under(const char* name, const void* image, size_t len,
+                          int argc, const char* const argv[], int linux_abi,
+                          int ppid) {
     struct vmm_space* s = vmm_space_create();
     if (!s) return -1;
 
@@ -473,11 +514,24 @@ int proc_spawn(const char* name, const void* image, size_t len) {
 
     struct user_boot* b = (struct user_boot*)kmalloc(sizeof *b);
     if (!b) { vmm_space_destroy(s); return -1; }
-    b->space   = s;
-    b->entry   = lp.entry;
-    b->user_sp = build_initial_stack(stk, stack_va, 0, NULL, &lp);  /* argc=0 */
+    b->space     = s;
+    b->entry     = lp.entry;
+    b->user_sp   = build_initial_stack(stk, stack_va, argc, argv, &lp);
+    b->linux_abi = linux_abi;
 
-    struct task* t = task_spawn_arg(name, user_task_bootstrap, b);
+    /* ppid >= 0 parents the package explicitly (a GUI launcher passes the
+     * desktop pid so the browser groups under the GUI session, not init);
+     * ppid < 0 falls back to the caller. */
+    struct task* t = task_spawn_arg_under(name, user_task_bootstrap, b, ppid);
     if (!t) { kfree(b); vmm_space_destroy(s); return -1; }
     return t->pid;
+}
+
+int proc_spawn_argv(const char* name, const void* image, size_t len,
+                    int argc, const char* const argv[], int linux_abi) {
+    return proc_spawn_argv_under(name, image, len, argc, argv, linux_abi, -1);
+}
+
+int proc_spawn(const char* name, const void* image, size_t len) {
+    return proc_spawn_argv_under(name, image, len, 0, NULL, 0, -1);
 }

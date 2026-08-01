@@ -38,6 +38,8 @@
 #include "acpi.h"
 #include "hal.h"
 #include "printf.h"
+#include "vmm.h"        /* §1.1/freeze — map ACPI tables that sit above the
+                         * boot identity window (see acpi_reach below) */
 #include <stdint.h>
 
 /* ------------------------------------------------------------------------- */
@@ -257,6 +259,36 @@ static int      g_have_srat = 0;
 /* ACPI tables carry a checksum byte such that the entire table sums to
  * zero modulo 256.  A mismatch means either corruption or we picked up
  * garbage at a wrong address, and we must reject the table. */
+/* Make a physical ACPI range readable before we dereference it.
+ *
+ * The tables are read through RAW PHYSICAL pointers, which only works while
+ * they fall inside the boot identity map.  Firmware places them at the TOP of
+ * low RAM, so on a machine with more memory than the identity window covers
+ * (i386 maps 256 MiB; QEMU with `-m 512M` puts the RSDT at ~0x1FFE0000) the
+ * very first table read is an unmapped KERNEL access — a ring-0 #PF during
+ * boot, i.e. the box dies before the shell with no way to diagnose it.  That is
+ * a freeze-class bug, so map on demand: identity-map any page of the range that
+ * is not mapped yet.  The addresses are far below the user base, so an identity
+ * mapping here can never collide with a user address space.  Kernel-only
+ * (no VMM_USER), read/write because parse_* only reads but the mapper needs a
+ * concrete flag set. */
+static void acpi_reach(uintptr_t phys, uint32_t len) {
+    if (!phys || !len) return;
+    for (uintptr_t p = phys & ~(uintptr_t)0xFFF; p < phys + len; p += 0x1000) {
+        if (vmm_translate(p) == 0) vmm_map(p, p, VMM_WRITABLE);
+    }
+}
+
+/* Reach a table whose length is in its own header: map the header first, then
+ * the full length it declares.  Returns the (now readable) header pointer. */
+static const struct sdt_header* acpi_reach_table(uint32_t phys) {
+    if (!phys) return 0;
+    acpi_reach(phys, sizeof(struct sdt_header));
+    const struct sdt_header* h = (const struct sdt_header*)(uintptr_t)phys;
+    acpi_reach(phys, h->length);
+    return h;
+}
+
 static int checksum_ok(const void* p, uint32_t len) {
     const uint8_t* b = (const uint8_t*)p;
     uint8_t sum = 0;
@@ -505,8 +537,8 @@ int acpi_init(void) {
         return -1;
     }
 
-    const struct sdt_header* rsdt = (const struct sdt_header*)rsdp->rsdt_address;
-    if (!sig4(rsdt->signature, "RSDT") || !checksum_ok(rsdt, rsdt->length)) {
+    const struct sdt_header* rsdt = acpi_reach_table(rsdp->rsdt_address);
+    if (!rsdt || !sig4(rsdt->signature, "RSDT") || !checksum_ok(rsdt, rsdt->length)) {
         kprintf("ACPI: bad RSDT at %p\n", (void*)rsdt);
         return -1;
     }
@@ -521,7 +553,8 @@ int acpi_init(void) {
     const uint32_t* entries = (const uint32_t*)(rsdt + 1);
     const struct sdt_header* srat_tbl = 0;
     for (uint32_t i = 0; i < n; i++) {
-        const struct sdt_header* h = (const struct sdt_header*)entries[i];
+        const struct sdt_header* h = acpi_reach_table(entries[i]);
+        if (!h) continue;
         if (sig4(h->signature, "FACP") && checksum_ok(h, h->length)) {
             g_fadt = (const struct fadt*)h;
         } else if (sig4(h->signature, "APIC") && checksum_ok(h, h->length)) {
@@ -543,8 +576,8 @@ int acpi_init(void) {
     g_pm1a_cnt = (uint16_t)g_fadt->pm1a_control_block;
     g_pm1b_cnt = (uint16_t)g_fadt->pm1b_control_block;
 
-    const struct sdt_header* dsdt = (const struct sdt_header*)g_fadt->dsdt;
-    if (!sig4(dsdt->signature, "DSDT") || !checksum_ok(dsdt, dsdt->length)) {
+    const struct sdt_header* dsdt = acpi_reach_table(g_fadt->dsdt);
+    if (!dsdt || !sig4(dsdt->signature, "DSDT") || !checksum_ok(dsdt, dsdt->length)) {
         kprintf("ACPI: bad DSDT at %p\n", (void*)dsdt);
         return -1;
     }

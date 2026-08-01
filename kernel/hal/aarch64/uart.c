@@ -75,3 +75,16 @@ void uart_early_puthex(uint64_t v) {
         uart_early_putc(digits[(v >> shift) & 0xf]);
     }
 }
+
+/* -------------------------------------------------------------------------
+ * Emergency console contract (§M46).  The portable panic-class paths — the
+ * spinlock deadlock reporter (core/lock.c), the NMI/fault dumps, the
+ * "no runnable task" fallback — write diagnostics with serial_write() /
+ * serial_putchar(): a LOCK-FREE sink that still works when the console stack
+ * is wedged or IRQs are off.  On x86 that is the 16550 COM1 driver; on this
+ * board it is the PL011 we already talk to, so the contract is satisfied by
+ * forwarding to the early-UART primitives above.  (Without these the portable
+ * core simply does not link on aarch64 — that is how this gap surfaced.)
+ * ------------------------------------------------------------------------- */
+void serial_putchar(char c) { uart_early_putc(c); }
+void serial_write(const char* s) { uart_early_puts(s); }

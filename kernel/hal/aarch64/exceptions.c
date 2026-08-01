@@ -15,6 +15,8 @@
  * ============================================================================= */
 
 #include <stdint.h>
+#include "uaccess.h"      /* §1.1 — fault-fixup table for EL0 memory copies */
+#include "task.h"         /* §M46 — force-kill safe point + fault-policy kill */
 
 /* Matches the trapframe laid down by exceptions.S (17 register-pairs). */
 struct trapframe {
@@ -68,6 +70,29 @@ static void dump_and_halt(const char* what, struct trapframe* tf) {
     uart_early_puthex(tf->x[1]); uart_early_puts(" ");
     uart_early_puthex(tf->x[2]); uart_early_puts(" ");
     uart_early_puthex(tf->x[3]);
+    /* §3.1 — ring-0 (EL1) fault policy parity with x86: kernel.fault_policy=reboot
+     * restarts the machine (PSCI) instead of halting forever.  Default = halt. */
+    {
+        extern const char* config_get(const char* key, const char* def);
+        extern void hal_reboot(void);
+        const char* pol = config_get("kernel.fault_policy", "halt");
+        if (pol && (pol[0] == 'r' || pol[0] == 'R')) {
+            uart_early_puts("\n  kernel.fault_policy=reboot — restarting.\n");
+            hal_reboot();
+        } else if (pol && (pol[0] == 'k' || pol[0] == 'K')) {
+            /* §3.1 — parity with the x86 ring0_fault_policy "kill" option:
+             * terminate just the faulting kernel thread and keep the machine
+             * running (an M29-supervised service is then restarted).  Same
+             * caveat as x86: best-effort — a kthread may have held a lock. */
+            struct task* t = task_current();
+            if (t && !t->is_idle && t->pid != 0) {
+                uart_early_puts("\n  kernel.fault_policy=kill — terminating the "
+                                "faulting kernel task (best-effort).\n");
+                task_exit_code(139);          /* 128 + SIGSEGV; noreturn */
+            }
+            uart_early_puts("\n  kill policy: idle/pid0 context, not killable — halting.\n");
+        }
+    }
     uart_early_puts("\n  system halted.\n");
 
     for (;;) __asm__ volatile ("wfe");
@@ -77,6 +102,11 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
     switch (type) {
         case EXC_IRQ:
             aarch64_irq_dispatch();
+            /* §M46 — force-kill safe point (parity with the x86 IRQ path): a
+             * task interrupted in EL0 holds no kernel locks, so a pending forced
+             * kill (a wedged ring-3 package that never yields) is torn down
+             * right here.  SPSR_EL1.M[3:0]==0 means "came from EL0". */
+            task_force_kill_point((tf->spsr & 0xF) == 0);
             return;                       /* return → RESTORE_TRAPFRAME → eret */
         case EXC_FIQ:
             /* We route everything through IRQ; a real FIQ is unexpected. */
@@ -91,6 +121,31 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
             if ((esr >> 26) == EC_SVC64) {   /* EL0/EL1 `svc` → syscall path */
                 aarch64_syscall(tf);
                 return;                       /* → RESTORE_TRAPFRAME → eret to EL0 */
+            }
+            /* §1.1 — user-access exception table (parity with x86): an EL1
+             * abort inside a uaccess primitive (an EL0 pointer that went bad
+             * DURING the copy) resumes at its fixup, so the copy returns -EFAULT
+             * instead of halting the machine.  Checked before any policy. */
+            if ((tf->spsr & 0xF) != 0) {           /* came from EL1 (kernel) */
+                uintptr_t pc = (uintptr_t)tf->elr;
+                if (uaccess_fixup_lookup(&pc)) { tf->elr = (uint64_t)pc; return; }
+            }
+            /* §M46 — a fault taken FROM EL0 (user mode) must NEVER halt the box:
+             * terminate the offending process and let the scheduler continue,
+             * exactly like the x86 ring-3 fault-kill.  SPSR_EL1.M[3:0]==0b0000
+             * (EL0t) is the "came from EL0" marker; a user thread holds no kernel
+             * locks at a fault, so task_exit_code here is safe (reschedules; the
+             * reaper frees its address space).  An EL1 (kernel) fault falls
+             * through to dump_and_halt, which applies kernel.fault_policy
+             * (halt / reboot / kill) — same knob as x86. */
+            if ((tf->spsr & 0xF) == 0) {
+                extern void task_exit_code(int) __attribute__((noreturn));
+                uint64_t far; __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
+                uart_early_puts("\nfault: EL0 user exception elr=");
+                uart_early_puthex(tf->elr);
+                uart_early_puts(" far="); uart_early_puthex(far);
+                uart_early_puts(" — killing process\n");
+                task_exit_code(139);          /* 128 + SIGSEGV */
             }
             dump_and_halt("synchronous", tf);
             break;

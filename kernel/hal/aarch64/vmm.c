@@ -32,6 +32,11 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Portable VMM entry points implemented lower in this file / used by
+ * vmm_user_access_ok before their definition. */
+uintptr_t vmm_user_base(void);
+int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write);
+
 uint64_t* mmu_kernel_l1(void);          /* mmu.c — shared kernel L1 table */
 
 /* ---- descriptor bit fields (stage-1, 4 KiB granule) ------------------------ */
@@ -70,6 +75,38 @@ static uint64_t* next_table(uint64_t* tbl, uint64_t idx) {
         tbl[idx] = ((uint64_t)(uintptr_t)nt) | PTE_VALID | PTE_TABLE;
     }
     return (uint64_t*)(uintptr_t)(tbl[idx] & PTE_ADDR_MASK);
+}
+
+/* §M46/security — is [va, va+len) fully mapped + EL0-accessible in the ACTIVE
+ * TTBR0 space (loaded during a syscall)?  The ARM twin of the x86 checks: walks
+ * L1(>>30)→L2(>>21)→L3(>>12), requiring PTE_VALID + PTE_AP_EL0 (AP[1], EL0 can
+ * access) at the leaf; want_write also requires AP[2]==0 (bit 7 clear = writable).
+ * A leaf can be an L2 2 MiB block or an L3 page.  Tables are identity-reachable. */
+int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
+    if (len == 0) return 1;
+    if (va < vmm_user_base()) return 0;
+    if (va + len < va)        return 0;
+    uint64_t ttbr0;
+    __asm__ volatile ("mrs %0, ttbr0_el1" : "=r"(ttbr0));
+    uint64_t* l1 = (uint64_t*)(uintptr_t)(ttbr0 & PTE_ADDR_MASK);
+    for (uintptr_t p = va & ~0xFFFUL; p < va + len; p += 0x1000) {
+        uint64_t e1 = l1[(p >> 30) & 0x1FF];
+        if (!(e1 & PTE_VALID) || !(e1 & PTE_TABLE)) return 0;
+        uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+        uint64_t e2 = l2[(p >> 21) & 0x1FF];
+        if (!(e2 & PTE_VALID)) return 0;
+        uint64_t leaf;
+        if (!(e2 & PTE_TABLE)) {                       /* 2 MiB block at L2 */
+            leaf = e2;
+        } else {
+            uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+            leaf = l3[(p >> 12) & 0x1FF];
+            if (!(leaf & PTE_VALID)) return 0;
+        }
+        if (!(leaf & PTE_AP_EL0)) return 0;            /* not EL0-accessible */
+        if (want_write && (leaf & (1ULL << 7))) return 0;   /* AP[2]=1 → read-only */
+    }
+    return 1;
 }
 
 /* Create a fresh address space: private L1 table with the kernel's identity
@@ -159,8 +196,9 @@ int vmm_map_4mib(uint32_t va, uint32_t pa, int flags) {
 
 /* Mirrors of vmm.h's flag bits (this file can't include vmm.h — its
  * vmm_map_4mib signature intentionally diverges from the header). */
-#define VMM_EXEC_BIT    0x200u
-#define VMM_SHARED_BIT  0x400u
+#define VMM_EXEC_BIT      0x200u
+#define VMM_SHARED_BIT    0x400u
+#define VMM_WRITABLE_BIT  0x002u
 /* Descriptor software-use bit (IGNORED by the hardware walk) marking a
  * BORROWED page — vmm_space_destroy leaves those frames for their owner. */
 #define PTE_SW_SHARED   (1ULL << 55)
@@ -240,6 +278,37 @@ void vmm_space_unmap(struct vmm_space* s, uintptr_t va) {
     uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
     l3[(va >> 12) & 0x1FF] = 0;
     __asm__ volatile ("dsb ish\ntlbi vmalle1\ndsb ish\nisb" ::: "memory");
+}
+
+/* Change the permissions of an already-mapped user page (the arch half of
+ * mprotect; §M37 needs it so ld.so can flip a relocated segment back to
+ * read-only).  AArch64 encodes write permission in AP[2] (bit 7): 0 = RW,
+ * 1 = read-only; execute permission is the UXN bit.  Returns 0 on success, -1
+ * if the page is not mapped.  (This was simply missing on aarch64, so the
+ * portable core did not link here — the same class of gap as the emergency
+ * serial sink.) */
+#define PTE_AP_RO   (1ULL << 7)
+
+int vmm_space_protect(struct vmm_space* s, uintptr_t va, uint32_t flags) {
+    uint64_t* l1 = s ? s->l1 : (uint64_t*)(uintptr_t)mmu_kernel_l1();
+    if (!l1) return -1;
+    uint64_t e1 = l1[(va >> 30) & 0x1FF];
+    if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) return -1;
+    uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+    uint64_t e2 = l2[(va >> 21) & 0x1FF];
+    if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) return -1;
+    uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+    unsigned i = (unsigned)((va >> 12) & 0x1FF);
+    uint64_t e3 = l3[i];
+    if (!(e3 & PTE_VALID)) return -1;
+
+    if (flags & VMM_WRITABLE_BIT) e3 &= ~PTE_AP_RO;  /* writable  */
+    else                      e3 |=  PTE_AP_RO;      /* read-only */
+    if (flags & VMM_EXEC_BIT) e3 &= ~PTE_UXN;        /* EL0-executable */
+    else                      e3 |=  PTE_UXN;
+    l3[i] = e3;
+    __asm__ volatile ("dsb ish\ntlbi vmalle1\ndsb ish\nisb" ::: "memory");
+    return 0;
 }
 
 uintptr_t vmm_space_pd_phys(struct vmm_space* s) {

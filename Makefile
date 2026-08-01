@@ -59,6 +59,7 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/smp.c \
       kernel/hal/x86/syscall.c \
+      kernel/hal/x86/uaccess.c \
       kernel/hal/x86/fork.c \
       kernel/hal/x86/signal.c \
       kernel/hal/x86/linux_abi.c
@@ -232,6 +233,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/m20_stubs.c \
       kernel/hal/x86_64/smp.c \
       kernel/hal/x86_64/syscall.c \
+      kernel/hal/x86_64/uaccess.c \
       kernel/hal/x86_64/linux_abi.c \
       kernel/hal/x86_64/fork.c \
       kernel/hal/x86/lapic.c \
@@ -408,6 +410,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/smp.c \
       kernel/hal/aarch64/vmm.c \
       kernel/hal/aarch64/syscall.c \
+      kernel/hal/aarch64/uaccess.c \
       kernel/hal/aarch64/pci.c \
       kernel/hal/aarch64/virtio_mmio_blk.c \
       kernel/hal/aarch64/virtio_gpu.c \
@@ -463,6 +466,7 @@ CORE_C_SRCS := \
     kernel/core/elf.c \
     kernel/core/proc.c \
     kernel/core/usyscall.c \
+    kernel/core/uaccess.c \
     kernel/core/fd.c \
     kernel/core/usock.c \
     kernel/core/service.c \
@@ -508,6 +512,7 @@ CORE_C_SRCS := \
     kernel/drivers/terminal/vga_terminal.c \
     kernel/drivers/keyboard/ps2_keyboard.c \
     kernel/drivers/timer/pit.c \
+    kernel/drivers/watchdog/ib700.c \
     kernel/drivers/null/null.c \
     kernel/drivers/block/virtio_blk.c \
     kernel/drivers/net/virtio_net.c \
@@ -545,6 +550,12 @@ CORE_C_SRCS := \
     kernel/core/elf.c \
     kernel/core/proc.c \
     kernel/core/usyscall.c \
+    kernel/core/uaccess.c \
+    kernel/core/pkg.c \
+    kernel/core/futex.c \
+    kernel/core/net.c \
+    kernel/core/audio.c \
+    kernel/core/random.c \
     kernel/core/fd.c \
     kernel/core/usock.c \
     kernel/core/service.c \
@@ -594,6 +605,7 @@ CORE_C_SRCS := \
     kernel/fs/vfs.c \
     kernel/fs/ramfs.c \
     kernel/fs/procfs.c \
+    kernel/fs/devfs.c \
     kernel/fs/exfat.c
 else
 # Phase 5 of M20: x86_64 path now links the full kernel core.  M20.6.2/3
@@ -613,6 +625,7 @@ CORE_C_SRCS := \
     kernel/core/elf.c \
     kernel/core/proc.c \
     kernel/core/usyscall.c \
+    kernel/core/uaccess.c \
     kernel/core/fd.c \
     kernel/core/usock.c \
     kernel/core/service.c \
@@ -658,6 +671,7 @@ CORE_C_SRCS := \
     kernel/drivers/terminal/vga_terminal.c \
     kernel/drivers/keyboard/ps2_keyboard.c \
     kernel/drivers/timer/pit.c \
+    kernel/drivers/watchdog/ib700.c \
     kernel/drivers/null/null.c \
     kernel/drivers/block/virtio_blk.c \
     kernel/core/net.c \
@@ -1806,6 +1820,10 @@ clean:
 	# blob symbol names derive from the path), so a stale i386 .dynelf/.so can
 	# shadow an x86_64 rebuild (and vice versa).  Wipe them on clean so an
 	# ARCH switch always rebuilds them for the right target.
+	# NOTE: scripts/build.sh keeps a PER-ARCH copy in build/.userartifacts/,
+	# which this does NOT touch (it lives outside build/$(ARCH)) — so the next
+	# build restores them instead of re-compiling the NetSurf/freetype stack.
+	# `make clean-all` drops the cache too.
 	rm -f user/*.muslelf user/*.dynelf user/*.cxxelf \
 	      user/libgreet.so user/libcpplib.so user/libstdcxx.so \
 	      user/libgccs.so user/ldmusl.so user/rootfs.bin user/libz.so.1 \

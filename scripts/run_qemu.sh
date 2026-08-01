@@ -128,7 +128,29 @@ if command -v "$QEMU" >/dev/null 2>&1; then
     if [ "$(uname -s)" = "Darwin" ]; then
         EXTRA="$EXTRA -display cocoa,zoom-to-fit=off"
     fi
-    exec "$QEMU" -rtc base=localtime $EXTRA -cdrom "$ISO"
+    # Capture COM1 to a file so kernel diagnostics survive a freeze/panic (the
+    # SPINLOCK-STUCK deadlock report, exception dumps, klog).  After a hang, read
+    # the tail of this file to see where the kernel got stuck.
+    SERLOG="${DOS_SERIAL:-/tmp/dos-serial.log}"
+    # Expose the QEMU monitor on a unix socket so a FROZEN guest can be probed
+    # from outside: `scripts/dos-dump.sh` connects and dumps `info registers`
+    # (EIP + EFLAGS.IF) for every vCPU — the definitive way to locate a silent
+    # HALTED freeze (0% CPU, IRQs off), which the in-guest diagnostics can't
+    # report because nothing runs.
+    MONSOCK="${DOS_MONITOR:-/tmp/dos-monitor.sock}"
+    rm -f "$MONSOCK"
+    echo "run: serial log -> $SERLOG ; monitor -> $MONSOCK (probe with scripts/dos-dump.sh)" >&2
+    # §M31 L3 — hardware watchdog: the ib700 ISA device counts independently of
+    # the CPU; if the kernel stops petting it (a HARD lockup: spinning / hlt with
+    # IRQs off — the one hang the task-based watchdog can't catch), it fires an
+    # NMI (~4 s).  The NMI handler (idt.c) LOGS the stuck EIP to the serial file,
+    # then recovers: a ring-3 lockup is force-killed in place; a ring-0 (kernel)
+    # lockup reboots.  So a wedged package no longer freezes the box AND we get
+    # the exact hang location for a targeted fix.  (Delivery works now that LVT
+    # LINT1 is set to NMI mode — lapic.c.)  Map a logged eip with scripts/dos-sym.sh.
+    exec "$QEMU" -rtc base=localtime $EXTRA -serial "file:$SERLOG" \
+         -monitor "unix:$MONSOCK,server,nowait" \
+         -device ib700 -action watchdog=inject-nmi -cdrom "$ISO"
 fi
 
 echo "$QEMU not found on host; running headless inside Docker." >&2

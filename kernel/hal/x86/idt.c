@@ -26,6 +26,8 @@
 #include "lapic.h"
 #include "ioapic.h"
 #include "pci.h"
+#include "config.h"
+#include "uaccess.h"   /* §1.1 — fault-fixup table for user copies */
 #include <stdint.h>
 
 /* --------------------------------------------------------------------------
@@ -281,11 +283,117 @@ void idt_use_apic(uint8_t bsp_apic_id) {
             bsp_apic_id);
 }
 
+/* Map a CPU exception vector to the POSIX signal whose DEFAULT action is what
+ * a faulting user process should get.  The exit code we terminate with is
+ * 128+signal (the shell convention), so `ps` / the Task Manager show *why* a
+ * package died.  SIGILL=4, SIGBUS=7, SIGFPE=8, SIGSEGV=11 (not all are in
+ * syscall.h yet, hence the literals). */
+static int fault_signal(int vec) {
+    switch (vec) {
+        case 0:  return 8;    /* #DE divide error        -> SIGFPE  */
+        case 6:  return 4;    /* #UD invalid opcode      -> SIGILL  */
+        case 13: return 11;   /* #GP general protection  -> SIGSEGV */
+        case 14: return 11;   /* #PF page fault          -> SIGSEGV */
+        case 16: return 8;    /* #MF x87 FPU error       -> SIGFPE  */
+        case 19: return 8;    /* #XM SIMD FP error       -> SIGFPE  */
+        default: return 11;   /* anything else           -> SIGSEGV */
+    }
+}
+
+/* Lock-free hex writer to the serial port — usable from the NMI / fault paths
+ * where taking the console lock could itself deadlock. */
+static void ser_hex(uint32_t v) {
+    extern void serial_write(const char* s);
+    extern void serial_putchar(char c);
+    serial_write("0x");
+    for (int i = 7; i >= 0; i--) {
+        int nyb = (int)((v >> (i * 4)) & 0xF);
+        serial_putchar(nyb < 10 ? (char)('0' + nyb) : (char)('a' + nyb - 10));
+    }
+}
+
+/* Ring-0 (kernel) fault policy — the user-configurable answer to "don't halt
+ * the whole box just because one thing faulted".  `kernel.fault_policy`:
+ *   halt   (default) — dump + stop this CPU forever (safest; state may be bad).
+ *   reboot            — auto-restart the machine (panic=reboot style recovery).
+ *   kill              — best-effort terminate just the faulting kernel thread
+ *                       and keep running; if it was an M29-supervised service
+ *                       the supervisor restarts it (that is the "auto-restart").
+ *                       RISK: a kthread can hold a lock, so continuing may
+ *                       deadlock — opt-in, off by default.
+ * Never returns. */
+static void ring0_fault_policy(int sig) __attribute__((noreturn));
+static void ring0_fault_policy(int sig) {
+    const char* pol = config_get("kernel.fault_policy", "halt");
+    if (pol && (pol[0] == 'r' || pol[0] == 'R')) {
+        kprintf("fault: kernel.fault_policy=reboot — restarting the machine\n");
+        hal_reboot();                       /* if it returns, fall through to halt */
+    } else if (pol && (pol[0] == 'k' || pol[0] == 'K')) {
+        struct task* t = task_current();
+        if (t && !t->is_idle && t->pid != 0) {
+            kprintf("fault: kernel.fault_policy=kill — terminating kthread '%s' pid %d "
+                    "(best-effort; may deadlock if it held a lock; M29 restarts a service)\n",
+                    t->name, t->pid);
+            task_exit_code(128 + sig);       /* noreturn: reschedules to another task */
+        }
+        kprintf("fault: kill policy — faulting context is idle/pid0, not killable; halting\n");
+    }
+    for (;;) __asm__ volatile ("cli; hlt");
+}
+
 /* --------------------------------------------------------------------------
  * C-side dispatch.  Called from the common asm stub with a pointer to the
  * frame on the kernel stack.
  * -------------------------------------------------------------------------- */
 void isr_handler(struct int_frame* f) {
+    /* §M31 L3 — NMI (vector 2) is our HARD-LOCKUP alarm: the ib700 hardware
+     * watchdog fires it (via QEMU `-action watchdog=inject-nmi`) when the kernel
+     * stops petting it — i.e. it's wedged spinning or hlt'ing with IRQs OFF, the
+     * one failure the task-based watchdog layers can't see.  NMI is delivered
+     * even with IRQs masked, so this handler runs in the frozen context.  Tiered
+     * recovery (the user's choice): (1) LOG the stuck EIP/EFLAGS to the serial
+     * port — lock-free, so it works in a deadlock — pinning the culprit; (2) try
+     * to KILL the wedged task and re-enable IRQs on return so a halted CPU un-
+     * sticks and the scheduler can reap it; (3) if the alarm keeps firing (the
+     * kill/recover didn't take), REBOOT.  Do this before the generic exception
+     * path, which would otherwise treat NMI as a fatal fault. */
+    if (f->int_no == 2) {
+        extern void serial_write(const char* s);
+        extern volatile uint32_t g_nmi_lockups;
+        g_nmi_lockups++;
+        struct task* cur = task_current();
+        serial_write("\n!! NMI HARD-LOCKUP eip=");
+        ser_hex(f->eip);
+        serial_write(" cs="); ser_hex(f->cs);
+        serial_write("\n");
+
+        /* Decide recovery.  A lockup in RING 3 (a user task, cs low bits == 3)
+         * holds no kernel locks, so force-killing it is safe and likely to work
+         * → try that in place.  A lockup in RING 0 is a KERNEL deadlock: killing
+         * the current kernel task can't be done safely (it may hold locks /
+         * corrupt state), and re-enabling IRQs won't un-wedge a real deadlock —
+         * so the only reliable recovery is a reboot.  Also reboot if a ring-3
+         * attempt already failed once (g_nmi_lockups >= 2 — the counter is reset
+         * to 0 by the watchdog task whenever the system is healthy). */
+        int from_user = (f->cs & 3) == 3;
+        if (!from_user || g_nmi_lockups >= 2) {
+            serial_write("!! NMI HARD-LOCKUP: kernel-mode or persistent — rebooting\n");
+            hal_reboot();
+            for (;;) __asm__ volatile ("hlt");      /* if reboot is a no-op */
+        }
+        /* Ring-3 lockup, first alarm: flag the wedged task for force-kill (plain
+         * writes, NMI-safe) + re-enable IRQs on iret so the scheduler runs and
+         * reaps it at its next preemption; re-arm the watchdog so a failure
+         * escalates to the reboot above. */
+        if (cur && !cur->is_idle && cur->pid != 0) {
+            cur->kill_forced  = 1;
+            cur->kill_pending = 1;
+        }
+        f->eflags |= (1u << 9);                     /* set IF → iret enables IRQs */
+        { extern void hw_watchdog_pet(void); hw_watchdog_pet(); }
+        return;
+    }
+
     if (f->int_no < 32) {
         /* M34 — copy-on-write page fault: a write to a fork-shared page.  Try
          * to resolve it (private copy) and retry; only if that declines is it a
@@ -295,16 +403,49 @@ void isr_handler(struct int_frame* f) {
             __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
             if (vmm_cow_fault(cr2)) return;
         }
-        /* CPU exception.  Without a working fault recovery path, the only
-         * safe move is to dump what we know and halt forever. */
-        {
-            uint32_t _cr2 = 0;
-            if (f->int_no == 14) __asm__ volatile ("mov %%cr2, %0" : "=r"(_cr2));
-            kprintf("\n!! EXCEPTION %d (%s) at cs:eip=%x:%p err=%x cr2=%p\n",
-                    f->int_no, exception_name[f->int_no],
-                    f->cs, (void*)f->eip, f->err_code, (void*)_cr2);
+
+        uint32_t _cr2 = 0;
+        if (f->int_no == 14) __asm__ volatile ("mov %%cr2, %0" : "=r"(_cr2));
+
+        /* §1.1 — user-access exception table.  If this KERNEL-mode fault came
+         * from an instruction inside a uaccess primitive (a user pointer that
+         * went bad DURING the copy — unmapped by another thread, a revoked COW
+         * page — the window a pre-check can never close), resume at its fixup:
+         * the copy returns -1 and the syscall reports -EFAULT.  Checked before
+         * any fault policy, so this class can never halt the box. */
+        if ((f->cs & 3) == 0) {
+            uintptr_t pc = (uintptr_t)f->eip;
+            if (uaccess_fixup_lookup(&pc)) { f->eip = (uint32_t)pc; return; }
         }
-        for (;;) __asm__ volatile ("cli; hlt");
+
+        /* §M46/M34 — a fault that happened in RING 3 (CS low 2 bits == 3) must
+         * NEVER wedge the kernel.  This is the root cause of "a package froze
+         * the whole system": previously ANY user fault fell through to the
+         * cli;hlt below, killing the timer/IRQs on this CPU — so the cursor,
+         * the scheduler AND the watchdog's own sweep timer all died with it.
+         *
+         * A user thread holds no kernel locks at a fault, so we can terminate
+         * just that process here (its default fatal-signal action) and let the
+         * scheduler pick someone else — exactly like the M46 force-kill safe
+         * point, but triggered by a crash instead of a manual fkill.  The rest
+         * of the system keeps running; init reaps the corpse and frees its
+         * address space.  Only a ring-0 fault is genuinely unrecoverable. */
+        if ((f->cs & 3) == 3 && task_current()) {
+            struct task* t = task_current();
+            int sig = fault_signal((int)f->int_no);
+            kprintf("\nfault: user EXCEPTION %d (%s) pid %d '%s' "
+                    "cs:eip=%x:%p err=%x cr2=%p — killing process\n",
+                    f->int_no, exception_name[f->int_no], t->pid, t->name,
+                    f->cs, (void*)f->eip, f->err_code, (void*)_cr2);
+            task_exit_code(128 + sig);   /* noreturn: reschedules; reaper frees mm */
+        }
+
+        /* Ring-0 (kernel) exception.  Dump, then apply the configured policy
+         * (halt / reboot / kill — see ring0_fault_policy). */
+        kprintf("\n!! EXCEPTION %d (%s) at cs:eip=%x:%p err=%x cr2=%p\n",
+                f->int_no, exception_name[f->int_no],
+                f->cs, (void*)f->eip, f->err_code, (void*)_cr2);
+        ring0_fault_policy(fault_signal((int)f->int_no));
     }
 
     if (f->int_no >= 32 && f->int_no < 48) {

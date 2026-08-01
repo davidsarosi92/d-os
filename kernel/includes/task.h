@@ -74,6 +74,22 @@ struct task {
     int      ppid;
     int      exit_code;
     int      reap_owned;
+    /* Process-model policy: when a task dies it takes its subtree down (its
+     * children are killed), UNLESS the child set survives_parent — a daemon /
+     * detached task (task_spawn_detached) that outlives its launcher and is
+     * instead re-parented to init.  This is why a GUI-launched app dies with the
+     * desktop, while a "Detached Shell" keeps running.  Default 0 (mortal). */
+    int      survives_parent;
+    /* §M46 — per-package RUNAWAY auto-kill.  auto_fkill_ms > 0 opts a user task
+     * in: if it hogs the CPU for that long WITHOUT ever voluntarily yielding /
+     * blocking (a frozen browser stuck in a ring-3 loop does no syscalls, so it
+     * never yields), the watchdog auto-force-kills it.  0 = disabled (default;
+     * the chrome/Task-Manager manual force-kill still applies).  last_yield_ms /
+     * cpu_ms_at_yield are stamped at every voluntary yield/block and let the
+     * detector tell a real hog (CPU actually grew) from a merely-starved task. */
+    uint32_t auto_fkill_ms;
+    uint64_t last_yield_ms;
+    uint64_t cpu_ms_at_yield;
     void*    start_arg;                 /* M22.7 — entry arg (task_start_arg) */
     enum task_state state;
     uintptr_t esp;                      /* saved kernel-stack pointer (HAL-typed) */
@@ -96,6 +112,18 @@ struct task {
      * for kernel threads AND the excursion-model self-tests (proc_exec_elf),
      * which keep the fixed syscall stack + teleport-back. */
     int           user_task;
+    /* §1.1 — set while this task is INSIDE a syscall entered from ring 3, i.e.
+     * while its pointer arguments are USER pointers.  The sys_* handlers are
+     * dual-use (an arch dispatcher calls them with ring-3 pointers, in-kernel
+     * code — the shell self-tests, drivers — calls the same functions with
+     * KERNEL buffers), and only the dispatcher knows which it is: it sets this
+     * on entry and clears it on the way out.  usyscall.c validates a pointer
+     * argument only while it is set, so a bad ring-3 pointer returns an error
+     * instead of faulting the kernel, and an in-kernel caller is not rejected.
+     * (An excursion — proc_exec_* on a kernel task — is covered too: its
+     * syscalls arrive through the same dispatcher; proc.c clears the flag when
+     * the excursion returns.) */
+    int           in_user_syscall;
     /* M35 — thread: this task SHARES its `mm` with its creator (clone), so its
      * reap must NOT destroy the address space (the thread group still uses it).
      * 0 for a process that owns its mm; 1 for a cloned thread. */
@@ -222,6 +250,12 @@ struct task* task_spawn_detached(const char* name, void (*entry)(void));
 struct task* task_spawn_arg(const char* name, void (*entry)(void), void* arg);
 void* task_start_arg(void);
 
+/* task_spawn_arg + an explicit parent pid (>= 0), or the caller (< 0).  Lets a
+ * GUI launcher parent a spawned package to the long-lived desktop task rather
+ * than the transient app-host that ran the launch fn. */
+struct task* task_spawn_arg_under(const char* name, void (*entry)(void),
+                                  void* arg, int ppid);
+
 /* M22.7 — spawn with an explicit parent pid (>= 0), or the caller (< 0).
  * The GUI uses it to parent a launched terminal's shell to the desktop
  * session instead of the transient launcher task. */
@@ -347,6 +381,10 @@ int  task_should_stop(void);
  * task_kill.  Meant for a frozen user app (browser) — do NOT force-kill kernel
  * threads (they may hold locks); those still use the cooperative task_kill. */
 int  task_force_kill(int pid);
+
+/* §M46 — opt a user task (pid) into runaway auto-force-kill after `ms` of CPU
+ * hogging with no voluntary yield (0 disables).  Set by a launcher per package. */
+int  task_set_auto_fkill(int pid, uint32_t ms);
 
 /* §M46 — the arch IRQ layer calls this at the timer preemption point with
  * `from_user` = "the interrupted context was in ring 3".  If the current task is

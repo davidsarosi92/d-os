@@ -45,15 +45,27 @@ void aarch64_vmm_switch(struct vmm_space* s);
 void aarch64_vmm_kernel_switch(void);
 
 /* SVC dispatcher.  Called from aarch64_exception_handler for EC == 0x15. */
+static void aarch64_syscall_body(struct trapframe* tf);
+
+/* §1.1 — see the x86 twins: flag the task while servicing an SVC from EL0 so
+ * usyscall.c gates the frame's pointer arguments as USER pointers. */
 void aarch64_syscall(struct trapframe* tf) {
+    struct task* me = task_current();
+    int prev = me ? me->in_user_syscall : 0;
+    if (me) me->in_user_syscall = 1;
+    aarch64_syscall_body(tf);
+    if (me) me->in_user_syscall = prev;
+}
+
+static void aarch64_syscall_body(struct trapframe* tf) {
     uint64_t num = tf->x[8];
     switch (num) {
-        case SYS_PRINT: {
-            const char* s = (const char*)(uintptr_t)tf->x[0];
-            console_write(s);           /* the user page is EL1-readable */
-            tf->x[0] = 0;               /* return value */
+        case SYS_PRINT:
+            /* x0 = const char* user pointer.  §1.1 — validated copy-in (see
+             * sys_print); an unmapped/kernel address returns -1 instead of
+             * taking an EL1 data abort. */
+            tf->x[0] = (uint64_t)sys_print((const char*)(uintptr_t)tf->x[0]);
             break;
-        }
         case SYS_EXIT: {
             /* Tier B — an independent user task ends for good: close fds (still
              * current) + task_exit(); init reaps it (frees its address space).

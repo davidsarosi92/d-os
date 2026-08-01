@@ -57,4 +57,16 @@ void watchdog_kick(void);
 /* Stop watching the calling task (e.g. before a long legitimate block). */
 void watchdog_unregister(void);
 
+/* §M31 L3 — hardware watchdog (ib700.c).  A device that counts independently of
+ * the CPU: if the kernel stops petting it (hard lockup — spinning / hlt with IRQs
+ * off, which the task-based L1/L2 can't catch), it fires an NMI.  init arms it,
+ * the watchdog task pets it; the NMI lockup handler (idt.c) logs + recovers. */
+void hw_watchdog_init(void);
+void hw_watchdog_pet(void);
+void hw_watchdog_disable(void);
+
+/* NMI lockup escalation counter, shared with the arch NMI handler (idt.c) so a
+ * repeated fire (recovery failed) can escalate to reboot.  Defined in watchdog.c. */
+extern volatile uint32_t g_nmi_lockups;
+
 #endif

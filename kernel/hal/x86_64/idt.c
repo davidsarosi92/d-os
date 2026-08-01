@@ -27,6 +27,9 @@
 #include "lapic.h"
 #include "ioapic.h"
 #include "pci.h"
+#include "config.h"
+#include "uaccess.h"   /* §1.1 — fault-fixup table for user copies */
+#include "vmm.h"       /* M34 — vmm_cow_fault on a write to a fork-shared page */
 #include <stdint.h>
 
 /* --------------------------------------------------------------------------
@@ -243,13 +246,116 @@ void idt_use_apic(uint8_t bsp_apic_id) {
  * C-side dispatch.  Same logic as i386, with field-name updates for
  * the 64-bit int_frame (rip vs eip, etc.).
  * -------------------------------------------------------------------------- */
+/* Map a CPU exception vector to the signal a faulting user process should get;
+ * we terminate with exit code 128+signal.  See the i386 twin for the rationale.
+ * SIGILL=4, SIGFPE=8, SIGSEGV=11. */
+static int fault_signal(int vec) {
+    switch (vec) {
+        case 0:  return 8;    /* #DE -> SIGFPE  */
+        case 6:  return 4;    /* #UD -> SIGILL  */
+        case 13: return 11;   /* #GP -> SIGSEGV */
+        case 14: return 11;   /* #PF -> SIGSEGV */
+        case 16: return 8;    /* #MF -> SIGFPE  */
+        case 19: return 8;    /* #XM -> SIGFPE  */
+        default: return 11;
+    }
+}
+
+/* Lock-free 64-bit hex writer to serial — usable from the NMI / fault paths. */
+static void ser_hex64(uint64_t v) {
+    extern void serial_write(const char* s);
+    extern void serial_putchar(char c);
+    serial_write("0x");
+    for (int i = 15; i >= 0; i--) {
+        int nyb = (int)((v >> (i * 4)) & 0xF);
+        serial_putchar(nyb < 10 ? (char)('0' + nyb) : (char)('a' + nyb - 10));
+    }
+}
+
+/* Ring-0 fault policy (halt / reboot / kill) — see the i386 twin for the full
+ * rationale.  `kernel.fault_policy`; default halt.  Never returns. */
+static void ring0_fault_policy(int sig) __attribute__((noreturn));
+static void ring0_fault_policy(int sig) {
+    const char* pol = config_get("kernel.fault_policy", "halt");
+    if (pol && (pol[0] == 'r' || pol[0] == 'R')) {
+        kprintf("fault: kernel.fault_policy=reboot — restarting the machine\n");
+        hal_reboot();
+    } else if (pol && (pol[0] == 'k' || pol[0] == 'K')) {
+        struct task* t = task_current();
+        if (t && !t->is_idle && t->pid != 0) {
+            kprintf("fault: kernel.fault_policy=kill — terminating kthread '%s' pid %d "
+                    "(best-effort; may deadlock if it held a lock; M29 restarts a service)\n",
+                    t->name, t->pid);
+            task_exit_code(128 + sig);
+        }
+        kprintf("fault: kill policy — faulting context is idle/pid0, not killable; halting\n");
+    }
+    for (;;) __asm__ volatile ("cli; hlt");
+}
+
 void isr_handler(struct int_frame* f) {
+    /* §M31 L3 — NMI (vector 2) hard-lockup alarm from the ib700 watchdog; parity
+     * with the i386 handler.  Log the stuck RIP, then recover: a ring-3 lockup is
+     * force-killed in place + IRQs re-enabled; a ring-0 (kernel) or persistent
+     * lockup reboots.  Delivered even with IRQs off (LVT LINT1 = NMI). */
+    if (f->int_no == 2) {
+        extern void serial_write(const char* s);
+        extern volatile uint32_t g_nmi_lockups;
+        g_nmi_lockups++;
+        struct task* cur = task_current();
+        serial_write("\n!! NMI HARD-LOCKUP rip=");
+        ser_hex64(f->rip);
+        serial_write(" cs="); ser_hex64(f->cs);
+        serial_write("\n");
+        int from_user = (f->cs & 3) == 3;
+        if (!from_user || g_nmi_lockups >= 2) {
+            serial_write("!! NMI HARD-LOCKUP: kernel-mode or persistent — rebooting\n");
+            hal_reboot();
+            for (;;) __asm__ volatile ("hlt");
+        }
+        if (cur && !cur->is_idle && cur->pid != 0) {
+            cur->kill_forced  = 1;
+            cur->kill_pending = 1;
+        }
+        f->rflags |= (1ull << 9);                   /* set IF → iret enables IRQs */
+        { extern void hw_watchdog_pet(void); hw_watchdog_pet(); }
+        return;
+    }
+
     if (f->int_no < 32) {
+        /* M34/§3.1 — copy-on-write page fault (parity with i386): a write to a
+         * fork-shared page is resolved into a private copy and retried; only if
+         * the resolver declines is it a real fault. */
+        if (f->int_no == 14) {
+            uint64_t cr2;
+            __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+            if (vmm_cow_fault((uintptr_t)cr2)) return;
+        }
+        /* §1.1 — user-access exception table (see the i386 twin): a kernel-mode
+         * fault inside a uaccess primitive resumes at its fixup, so a user
+         * pointer that goes bad mid-copy returns -EFAULT instead of halting. */
+        if ((f->cs & 3) == 0) {
+            uintptr_t pc = (uintptr_t)f->rip;
+            if (uaccess_fixup_lookup(&pc)) { f->rip = (uint64_t)pc; return; }
+        }
+        /* §M46/M34 — a ring-3 fault must never wedge the kernel; terminate the
+         * offending process and reschedule (see the i386 twin for the full
+         * rationale).  Only a ring-0 fault halts the box. */
+        if ((f->cs & 3) == 3 && task_current()) {
+            struct task* t = task_current();
+            int sig = fault_signal((int)f->int_no);
+            kprintf("\nfault: user EXCEPTION %u (%s) pid %d '%s' "
+                    "cs:rip=%lx:%p err=%lx — killing process\n",
+                    (unsigned)f->int_no, exception_name[f->int_no], t->pid, t->name,
+                    (unsigned long)f->cs, (void*)(uintptr_t)f->rip,
+                    (unsigned long)f->err_code);
+            task_exit_code(128 + sig);   /* noreturn */
+        }
         kprintf("\n!! EXCEPTION %u (%s) at cs:rip=%lx:%p err=%lx\n",
                 (unsigned)f->int_no, exception_name[f->int_no],
                 (unsigned long)f->cs, (void*)(uintptr_t)f->rip,
                 (unsigned long)f->err_code);
-        for (;;) __asm__ volatile ("cli; hlt");
+        ring0_fault_policy(fault_signal((int)f->int_no));
     }
 
     if (f->int_no >= 32 && f->int_no < 48) {
@@ -257,6 +363,10 @@ void isr_handler(struct int_frame* f) {
         if (irq_handlers[irq]) irq_handlers[irq](f);
         if (g_apic_mode) lapic_eoi();
         else             pic_eoi(irq);
+        /* §M46 parity with i386 — force-kill safe point: if we interrupted ring 3
+         * (holds no kernel locks) a pending forced kill tears the task down here,
+         * so a wedged busy-looping ring-3 program is force-killable on x86_64. */
+        task_force_kill_point((f->cs & 3) == 3);
         schedule_check();
         return;
     }
@@ -264,6 +374,7 @@ void isr_handler(struct int_frame* f) {
     if (f->int_no == 0x40 || f->int_no == 0x41) {
         if (f->int_no == 0x40) schedule_request();
         lapic_eoi();
+        task_force_kill_point((f->cs & 3) == 3);   /* §M46 — see IRQ block above */
         schedule_check();
         return;
     }

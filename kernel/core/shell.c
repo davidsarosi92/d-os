@@ -39,6 +39,7 @@
 #include "percpu.h"
 #include "slab.h"
 #include "gui.h"
+#include "uaccess.h"   /* §1.1 — faulttest exercises the exception table */
 #include "gui_app.h"
 #include "shell_provider.h"
 #include "basic.h"
@@ -121,7 +122,8 @@ static void cmd_help(void) {
                   "  ls <path>, cat <path>, mkdir <path>, touch <path>,\n"
                   "  write <path> <text>, mount <fs> <path> [dev]\n"
                   "  config, getconf <key>, setconf <key> <value>, saveconf\n"
-                  "  ringtest, ps, spawn, yield, loop, kill <pid>\n"
+                  "  ringtest, ps, spawn, yield, loop, kill <pid>, fkill <pid>\n"
+                  "  wedge (runaway ring-3 task), faulttest (bad user pointers)\n"
                   "  pane, pane split horizontal|vertical\n"
                   "  gui (compositor + desktop), gui stats, launch [app]\n"
                   "  run <path.bas> (Tiny-BASIC)\n"
@@ -319,6 +321,54 @@ static void cmd_fkill(const char* args) {
     else                          kprintf("fkill: pid %d not found or protected\n", pid);
 }
 
+/* §1.1 — `faulttest`: prove that a BAD user pointer can no longer take the box
+ * down.  Two layers are checked:
+ *   (a) the GATE — a syscall handed a kernel/unmapped address must return an
+ *       error (the address never gets dereferenced at all);
+ *   (b) the FAULT FIXUP — the uaccess primitive is called DIRECTLY on unmapped
+ *       memory, bypassing the pre-check, so the copy really does fault in ring 0.
+ *       The exception table must catch it and return -1.  Before this existed,
+ *       (b) was a kernel #PF → halt policy → the whole machine froze.
+ * Borrows a private address space so the "in a user syscall" gate is realistic. */
+static void cmd_faulttest(void) {
+    struct task* me = task_current();
+    if (!me) return;
+    struct vmm_space* s = vmm_space_create();
+    if (!s) { console_write("faulttest: no space\n"); return; }
+    struct vmm_space* prev = me->mm;
+    int prev_gate = me->in_user_syscall;
+    me->mm = s; me->mmap_cursor = 0;
+    vmm_space_switch(s);
+    me->in_user_syscall = 1;                 /* pretend we came from ring 3 */
+
+    /* (a) gate: a kernel address and an unmapped user address as syscall args. */
+    long w_kern   = sys_write(1, (const void*)(uintptr_t)0x00100000u, 8);   /* kernel text */
+    int  o_unmap  = sys_open((const char*)(uintptr_t)(vmm_user_base() + 0x123000u), 0);
+    struct kstat st;
+    int  s_unmap  = sys_stat((const char*)(uintptr_t)(vmm_user_base() + 0x123000u), &st);
+
+    me->in_user_syscall = prev_gate;
+
+    /* (b) fixup: unmapped, checked by nothing — only the exception table can
+     *     save us here.  If the table were missing this line would panic. */
+    char buf[8];
+    int  cp_in    = uaccess_copy_in(buf, (uintptr_t)(vmm_user_base() + 0x456000u), sizeof buf);
+    int  cp_out   = uaccess_copy_out((uintptr_t)(vmm_user_base() + 0x456000u), buf, sizeof buf);
+    long str_in   = uaccess_str_in(buf, (uintptr_t)(vmm_user_base() + 0x456000u), sizeof buf);
+
+    vmm_space_switch(prev);
+    me->mm = prev; me->mmap_cursor = 0;
+    vmm_space_destroy(s);
+
+    kprintf("faulttest: gate   write(kernel ptr)=%ld open(unmapped)=%d stat(unmapped)=%d -> %s\n",
+            w_kern, o_unmap, s_unmap,
+            (w_kern < 0 && o_unmap < 0 && s_unmap < 0) ? "PASS" : "FAIL");
+    kprintf("faulttest: fixup  copy_in=%d copy_out=%d str_in=%ld -> %s\n",
+            cp_in, cp_out, str_in,
+            (cp_in < 0 && cp_out < 0 && str_in < 0) ? "PASS" : "FAIL");
+    console_write("faulttest: the box is still running — that IS the test.\n");
+}
+
 /* §M46 — spawn the WEDGE test app: a ring-3 task that spins forever without ever
  * yielding.  `kill` (cooperative) cannot reclaim it; `fkill` (force) can. */
 extern const unsigned char _binary_user_wedge_i386_elf_start[]   __attribute__((weak));
@@ -331,9 +381,15 @@ static void cmd_wedge(void) {
     else if (_binary_user_wedge_x86_64_elf_start) { s = _binary_user_wedge_x86_64_elf_start; e = _binary_user_wedge_x86_64_elf_end; }
     if (!s || !e) { console_write("wedge: no wedge ELF embedded for this arch\n"); return; }
     int pid = proc_spawn("wedge", s, (size_t)(e - s));
-    if (pid < 0) console_write("wedge: spawn failed\n");
-    else kprintf("wedge: spawned a WEDGED ring-3 task (pid %d) — `kill %d` can't stop it, `fkill %d` can\n",
-                 pid, pid, pid);
+    if (pid < 0) { console_write("wedge: spawn failed\n"); return; }
+    /* §M46 — apply the runaway auto-fkill policy (off unless configured), so a
+     * `package.auto_fkill_ms` setting makes the watchdog reclaim this hog on its
+     * own; with no config it stays wedged for manual `fkill` testing. */
+    long ms = config_get_long("package.wedge.auto_fkill_ms",
+                              config_get_long("package.auto_fkill_ms", 0));
+    if (ms > 0) task_set_auto_fkill(pid, (uint32_t)ms);
+    kprintf("wedge: spawned a WEDGED ring-3 task (pid %d) — `kill %d` can't stop it, `fkill %d` can%s\n",
+            pid, pid, pid, ms > 0 ? " (auto-fkill armed)" : "");
 }
 
 static void cmd_loop(void) {
@@ -750,12 +806,17 @@ static void cmd_netsurf(const char* args) {
     }
     size_t len = (size_t)(_binary_user_netsurf_dynelf_end -
                           _binary_user_netsurf_dynelf_start);
-    struct task* me = task_current();
-    int prev = me ? me->linux_abi : 0;
-    if (me) me->linux_abi = 1;
-    int rc = proc_exec_elf_argv(_binary_user_netsurf_dynelf_start, len, argc, argv);
-    if (me) me->linux_abi = prev;
-    kprintf("\nnetsurf: exit rc=%d\n", rc);
+    /* Spawn as an independent Linux-ABI user task (like the Start-menu launcher),
+     * NOT a synchronous excursion on the shell task — so a browser crash/wedge is
+     * torn down on its own and never takes down this shell. */
+    int pid = proc_spawn_argv("netsurf", _binary_user_netsurf_dynelf_start, len,
+                              argc, argv, 1 /* linux_abi */);
+    if (pid < 0) { kprintf("netsurf: failed to spawn (rc=%d)\n", pid); return; }
+    /* §M46 — per-package runaway auto-fkill policy (see netsurf_app.c). */
+    long ms = config_get_long("package.netsurf.auto_fkill_ms",
+                              config_get_long("package.auto_fkill_ms", 0));
+    if (ms > 0) task_set_auto_fkill(pid, (uint32_t)ms);
+    kprintf("netsurf: started as pid %d\n", pid);
 }
 
 /* `wget <url> [outfile]` — download over HTTP/HTTPS. */
@@ -2322,6 +2383,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "service"))        { cmd_service("");        return; }
     if (starts_with(line, "service ")) { cmd_service(line + 8);  return; }
     if (streq(line, "bustest"))        { cmd_bustest(); return; }
+    if (streq(line, "faulttest"))     { cmd_faulttest(); return; }
     if (streq(line, "wdtest"))         { cmd_wdtest(); return; }
     if (streq(line, "cron"))           { cmd_cron("");         return; }
     if (starts_with(line, "cron "))    { cmd_cron(line + 5);   return; }

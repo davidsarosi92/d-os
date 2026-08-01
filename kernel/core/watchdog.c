@@ -20,8 +20,21 @@
 #include "timer.h"
 #include "percpu.h"
 #include "procfs.h"
+#include "config.h"
 #include <stddef.h>
 #include <stdint.h>
+
+/* §M31 L3 — NMI hard-lockup escalation counter (see idt.c NMI handler). */
+volatile uint32_t g_nmi_lockups = 0;
+
+/* Hardware-watchdog contract, WEAK + no-op by default: a board that has one
+ * (x86 + `-device ib700`, kernel/drivers/watchdog/ib700.c) provides the strong
+ * definitions via its DRIVER() module and they win at link time.  A board that
+ * has none (QEMU `virt` on aarch64) simply keeps these stubs, so the portable
+ * watchdog links and runs everywhere — layers L1/L2 still apply, only the
+ * hard-lockup net is absent.  (Convention 3: no arch #ifdef in core code.) */
+__attribute__((weak)) void hw_watchdog_init(void) { }
+__attribute__((weak)) void hw_watchdog_pet(void)  { }
 
 #define WD_MAX        32       /* opt-in per-task heartbeat slots        */
 #define WD_SWEEP_MS   500      /* how often the sweep runs               */
@@ -43,6 +56,7 @@ static uint64_t cpu_tick_seen[WD_MAX_CPUS];
 /* Counters for /proc/watchdog. */
 static volatile uint32_t g_hang_events;
 static volatile uint32_t g_softlockup_events;
+static volatile uint32_t g_runaway_events;
 
 /* ------------------------------------------------------------------- */
 /* Registration API (runs on the watched task).                         */
@@ -150,13 +164,66 @@ static void sweep_softlockup(void) {
     }
 }
 
+/* Layer 3 (§M46): RUNAWAY user tasks.  A ring-3 package that opted in
+ * (auto_fkill_ms > 0) but hogs the CPU that long WITHOUT voluntarily yielding /
+ * blocking — a frozen browser stuck in a loop does no syscalls, so it never
+ * yields — is auto-force-killed.  The cpu-delta check (it actually consumed the
+ * CPU, not merely sat RUNNABLE while starved) avoids false positives.  Pids are
+ * collected under the master lock (task_for_each), killed after — task_force_kill
+ * re-takes that lock. */
+#define WD_RUNAWAY_MAX 16
+struct runaway_scan { int pids[WD_RUNAWAY_MAX]; int n; uint64_t now; };
+
+static void runaway_collect(const struct task* t, int is_current, void* ctx) {
+    (void)is_current;
+    struct runaway_scan* rs = (struct runaway_scan*)ctx;
+    if (rs->n >= WD_RUNAWAY_MAX) return;
+    if (!t->user_task || t->auto_fkill_ms == 0) return;
+    if (t->state == TASK_DEAD || t->state == TASK_SLEEPING) return;
+    uint64_t idle_for = rs->now - t->last_yield_ms;       /* since last yield  */
+    uint64_t cpu_used = t->cpu_ms - t->cpu_ms_at_yield;   /* CPU in that window */
+    if (idle_for > t->auto_fkill_ms && cpu_used > (t->auto_fkill_ms / 2))
+        rs->pids[rs->n++] = t->pid;
+}
+
+static void sweep_runaway(void) {
+    struct runaway_scan rs;
+    rs.n = 0;
+    rs.now = timer_ticks_ms();
+    task_for_each(runaway_collect, &rs);
+    for (int i = 0; i < rs.n; i++) {
+        g_runaway_events++;
+        klog(KLOG_ERR, "watchdog",
+             "runaway user task pid %d — hogged CPU with no yield — auto force-killing\n",
+             rs.pids[i]);
+        task_force_kill(rs.pids[i]);
+    }
+}
+
 static void watchdog_entry(void) {
     klog(KLOG_INFO, "watchdog", "up as pid %d (sweep %ums)\n",
          task_current() ? task_current()->pid : -1, (unsigned)WD_SWEEP_MS);
+    /* §M31 L3 — arm the hardware watchdog (if enabled).  From here we MUST pet
+     * it every loop, or it fires an NMI (the hard-lockup safety net).  With no
+     * `-device ib700` present the port writes are harmless no-ops. */
+    int hw = 0;
+    {
+        const char* v = config_get("kernel.hw_watchdog", "1");
+        hw = v && (v[0] == '1' || v[0] == 'y' || v[0] == 't');
+    }
+    if (hw) { hw_watchdog_init(); klog(KLOG_INFO, "watchdog", "HW watchdog armed (ib700)\n"); }
+
     for (;;) {
+        if (hw) hw_watchdog_pet();     /* pet FIRST — a slow sweep must not lapse */
+        /* This task running at all proves the scheduler is healthy → clear the
+         * NMI hard-lockup escalation counter, so a past (recovered) lockup does
+         * not make a future, unrelated one reboot on its first alarm. */
+        g_nmi_lockups = 0;
         task_msleep(WD_SWEEP_MS);
+        if (hw) hw_watchdog_pet();
         sweep_heartbeats();
         sweep_softlockup();
+        sweep_runaway();
     }
 }
 
@@ -168,6 +235,8 @@ static void gen_watchdog(struct procfs_writer* w) {
     pw_puts(w, "sweep_ms "); pw_put_uint(w, (unsigned)WD_SWEEP_MS); pw_putc(w, '\n');
     pw_puts(w, "hang_events "); pw_put_uint(w, (unsigned)g_hang_events); pw_putc(w, '\n');
     pw_puts(w, "softlockup_events "); pw_put_uint(w, (unsigned)g_softlockup_events);
+    pw_putc(w, '\n');
+    pw_puts(w, "runaway_events "); pw_put_uint(w, (unsigned)g_runaway_events);
     pw_putc(w, '\n');
     pw_puts(w, "# watched tasks (pid  timeout_ms  ms_since_kick  hung)\n");
     uint64_t now = timer_ticks_ms();

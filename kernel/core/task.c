@@ -384,15 +384,21 @@ static struct task* spawn_common(const char* name, void (*entry)(void),
 
     str_copy_n(t->name, name, sizeof t->name);
     t->pid         = next_pid++;
+    if (next_pid <= 0) next_pid = 1;        /* §4.6 — never wrap to a negative pid */
     /* M27 — parent: an explicit override (detached → init), else whoever
      * called (or pid 0 very early in boot, before there is a `current`). */
     if (ppid_override >= 0) {
         t->ppid    = ppid_override;
+        /* Explicitly parented to init = a detached daemon (task_spawn_detached,
+         * or a "Detached Shell" via task_spawn_under(...,init)): it outlives its
+         * launcher, so it must NOT be taken down as part of a parent's subtree. */
+        if (g_init_pid > 0 && ppid_override == g_init_pid) t->survives_parent = 1;
     } else {
         struct task* cur = task_current();
         t->ppid    = cur ? cur->pid : 0;
     }
     t->state       = TASK_RUNNABLE;
+    t->last_yield_ms = timer_ticks_ms();     /* §M46 runaway detector baseline */
     t->esp         = hal_task_init_stack((char*)stack + TASK_KSTACK_SZ, entry);
     t->kstack_base = stack;
     t->cpu_mask    = 0xFFFFFFFFu;
@@ -419,6 +425,15 @@ struct task* task_spawn(const char* name, void (*entry)(void)) {
  * the app it should run. */
 struct task* task_spawn_arg(const char* name, void (*entry)(void), void* arg) {
     return spawn_common(name, entry, -1, arg);
+}
+
+/* Like task_spawn_arg, but with an EXPLICIT parent pid (>= 0), or the caller
+ * when ppid < 0.  Lets a GUI launcher parent a spawned package to the long-lived
+ * desktop/session task instead of the transient app-host that created it (which
+ * exits immediately → M27 would otherwise re-parent the package to init). */
+struct task* task_spawn_arg_under(const char* name, void (*entry)(void),
+                                  void* arg, int ppid) {
+    return spawn_common(name, entry, ppid, arg);
 }
 
 void* task_start_arg(void) {
@@ -693,6 +708,10 @@ void task_yield(void) {
      * NOT do this — a preempted task may hold a window/surface lock. */
     struct task* self = task_current();
     if (self && self->kill_pending && !self->is_idle) task_exit();
+    if (self) {                              /* §M46 — voluntary yield: not a runaway */
+        self->last_yield_ms   = timer_ticks_ms();
+        self->cpu_ms_at_yield = self->cpu_ms;
+    }
     schedule();
 }
 
@@ -716,6 +735,17 @@ int task_kill(int pid) {
     if (!t || t->is_idle || t->state == TASK_DEAD) return -1;
     t->kill_pending = 1;
     task_notify_change();                    /* M22.4 — liveness will change */
+    return 0;
+}
+
+/* §M46 — opt a user task into runaway auto-force-kill (ms > 0), or disable it
+ * (ms == 0).  A launcher sets this per package right after proc_spawn. */
+int task_set_auto_fkill(int pid, uint32_t ms) {
+    struct task* t = task_find(pid);
+    if (!t) return -1;
+    t->auto_fkill_ms  = ms;
+    t->last_yield_ms  = timer_ticks_ms();    /* fresh baseline from now */
+    t->cpu_ms_at_yield = t->cpu_ms;
     return 0;
 }
 
@@ -1023,6 +1053,49 @@ void task_exit_code(int code) {
         waitq_unlock(&child_exit_wq, wf);
     }
 
+    /* Process model — a dying task takes its subtree DOWN with it (the user's
+     * rule: "parent dies, its children go too").  Every direct child that did
+     * NOT opt to survive (survives_parent — a detached daemon / shell) is
+     * killed; survivors are re-parented to init so they outlive us.  Each killed
+     * child runs this same pass when it exits, so the whole subtree unwinds —
+     * e.g. the desktop crashing takes the compositor + every launched app
+     * (NetSurf) with it, instead of leaving a windowless orphan under init.
+     *
+     * A ring-3 child (user_task) may be wedged (a frozen browser) and never
+     * honour the cooperative kill, so force it; kernel threads take the
+     * cooperative kill (they may hold locks — never force those).  Pids are
+     * collected under master_lock, then killed after releasing it (task_kill /
+     * task_force_kill re-acquire master_lock). */
+    /* pid 0 is the permanent boot/"swapper" root: kernel_main task_exit()s it at
+     * the end of boot, but it is NOT really dying — it becomes the BSP idle task,
+     * and init + the early system daemons are parented to it.  So pid 0's "exit"
+     * must NOT take its subtree down (that would kill init and stop all reaping).
+     * Likewise never let the idle task's teardown run.  Every other task applies
+     * the "parent dies → subtree dies" rule. */
+    if (self->pid != 0 && !self->is_idle) {
+        int kids[KILLTREE_MAX]; char kforce[KILLTREE_MAX]; int nk = 0;
+        uint32_t f2 = spin_lock_irqsave(&master_lock);
+        if (master_head) {
+            struct task* c = master_head;
+            do {
+                if (c->ppid == self->pid && c != self && c->state != TASK_DEAD) {
+                    if (c->survives_parent) {
+                        c->ppid = g_init_pid;              /* detached: outlives us */
+                    } else if (nk < KILLTREE_MAX) {
+                        kforce[nk] = (char)(c->user_task ? 1 : 0);
+                        kids[nk++] = c->pid;
+                    }
+                }
+                c = c->next;
+            } while (c != master_head);
+        }
+        spin_unlock_irqrestore(&master_lock, f2);
+        for (int i = 0; i < nk; i++) {
+            if (kforce[i]) task_force_kill(kids[i]);
+            else           task_kill(kids[i]);
+        }
+    }
+
     /* Remove from this CPU's rq so the next pick doesn't keep
      * tripping over a DEAD entry.  (M18.6.1 — pre-refactor, DEAD
      * tasks were left in the ring and skipped by the state check;
@@ -1036,9 +1109,18 @@ void task_exit_code(int code) {
     schedule_locked(me);
     spin_unlock_irqrestore(&me->rq_lock, rfl);
 
-    /* Unreachable if any other task exists.  Halt-forever fallback
-     * only if literally nothing else can run. */
-    for (;;) { hal_intr_disable(); hal_cpu_halt(); }
+    /* Should be unreachable: idle is always runnable, so schedule_locked above
+     * never returns for a DEAD task.  If we DO get here, do NOT freeze the box
+     * with IRQs off (a silent 0%-CPU hang — impossible to diagnose).  Report it
+     * to the serial port (lock-free) and idle with IRQs ENABLED (sti;hlt), re-
+     * running the scheduler on each wake so a task that becomes runnable (a
+     * device IRQ waking a blocked one) can still be picked up. */
+    {
+        extern void serial_write(const char* s);
+        serial_write("\n!! task_exit_code: no runnable task after exit "
+                     "(idle missing?) — idling with IRQs on, NOT a hard freeze\n");
+    }
+    for (;;) { hal_cpu_idle(); schedule(); }
 }
 
 /* ------------------------------------------------------------------- */
@@ -1090,6 +1172,8 @@ void waitq_block(struct waitq* wq) {
     self->wq_next = wq->head;
     wq->head      = self;
     self->state   = TASK_SLEEPING;
+    self->last_yield_ms   = timer_ticks_ms();   /* §M46 — blocking = responsive */
+    self->cpu_ms_at_yield = self->cpu_ms;
 
     /* Detach from this CPU's runqueue so schedule() won't pick us. */
     struct percpu* me = this_cpu();

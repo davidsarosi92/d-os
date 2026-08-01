@@ -9,6 +9,26 @@
 
 .section .text
 .global _start
+.global __sig_trampoline
+.global __thread_exit_tramp
+
+/* Signals (M34) and threads (M35) are i386-only today, so these trampolines are
+ * never actually invoked here — but the shared user/libc.c references them (a
+ * sigaction restorer / a thread function's return address), so the symbols must
+ * exist for the AArch64 user ELFs to link at all.  They mirror the x86 versions
+ * with the AArch64 SVC convention (x8 = number, x0 = arg0), so they are already
+ * correct if those features are brought to this arch. */
+__sig_trampoline:
+    mov     x8, #21             /* SYS_SIGRETURN */
+    svc     #0
+1:  b       1b                  /* unreachable */
+
+__thread_exit_tramp:
+    mov     x8, #1              /* SYS_EXIT — the thread fn's return value is
+                                 * already in x0, i.e. the exit code */
+    svc     #0
+2:  b       2b                  /* unreachable */
+
 _start:
     bl      main                /* main() → return value in x0 (= exit code) */
     mov     x8, #1              /* SYS_EXIT */

@@ -182,6 +182,14 @@ static enum drag_mode      drag = DRAG_NONE;
 static struct gui_window*  drag_win = NULL;
 static int grab_dx, grab_dy;
 static int rubber_w, rubber_h;
+/* §perf — DRAG_MOVE recompose throttle.  Opaque window move re-blits the whole
+ * (possibly large) window every mouse packet; a fast drag of a big window (e.g.
+ * NetSurf) then floods the single CPU with multi-MB blits and starves everything
+ * else (cursor, cron, the app itself) — the "drag froze the system" the user hit.
+ * Cap the WINDOW move+damage to ~33 fps; skipped motions still move the cursor
+ * (cheap), so the pointer stays smooth while the window follows at a sane rate. */
+#define DRAG_FRAME_MS 30
+static uint64_t last_drag_frame_ms = 0;
 
 /* Double-click tracking (IRQ only). */
 static uint64_t lastclick_ms = 0;
@@ -192,6 +200,8 @@ static struct gui_window* lastclick_win = NULL;
 static struct gfx_surface fbsurf, backsurf, wallsurf;
 static int work_h = 0;                  /* screen minus shell chrome     */
 static int gmax_cols = 0, gmax_rows = 0;
+/* §M46 — see gui_start: X on a package window force-kills a wedged client. */
+static int close_forces_kill = 1;
 
 /* M22.6 — tear-free presentation via a Bochs-VBE double buffer (see
  * fb_terminal.c).  When `flip_ok`, compose() copies the dirty region from
@@ -380,6 +390,7 @@ static volatile uint32_t kcq_h = 0, kcq_t = 0;
 static const struct gui_app_def* volatile launchq[LQ_SZ];
 static volatile uint32_t lq_h = 0, lq_t = 0;
 static volatile int power_req = 0;      /* 0 none / 1 reboot / 2 shutdown */
+static volatile int sak_close_req = 0;  /* §M46 Ctrl+Alt+X — close/force top app */
 
 static void evq_push(struct gui_window* w, int cx, int cy, int dbl) {
     uint32_t n = (evq_h + 1) % EVQ_SZ;
@@ -476,6 +487,15 @@ void gui_queue_launch(const struct gui_app_def* app) {
     if (n == lq_t) return;
     launchq[lq_h] = app;
     lq_h = n;
+    need_frame = 1;
+}
+
+/* §M46 — Ctrl+Alt+X: request the compositor close the top-most app window.  Set
+ * from the keyboard IRQ (secure-attention key), acted on by the compositor task
+ * (never the possibly-frozen app), so the combo works even when an app is wedged.
+ * IRQ-safe: a single volatile store, no lock/alloc. */
+void gui_request_close_last(void) {
+    sak_close_req = 1;
     need_frame = 1;
 }
 
@@ -1369,7 +1389,25 @@ static void destroy_window(struct gui_window* win) {
 /* Queue dispatch — runs on the compositor task.                               */
 /* -------------------------------------------------------------------------- */
 
+/* §M46 Ctrl+Alt+X — close the top-most user app window.  A client-managed
+ * (package) window's want_close makes apply_pending force-kill the client, so it
+ * works even when the app is frozen; a normal app-host window gets a graceful
+ * want_close.  Runs on the compositor task, so taking state_lock is safe. */
+static void sak_close_top_app(void) {
+    struct gui_window* target = NULL;
+    uint32_t fl = spin_lock_irqsave(&state_lock);
+    for (int i = zcount - 1; i >= 0; i--) {
+        struct gui_window* w = zorder[i];
+        if (w && w->used && w->kind == WIN_APP && !w->minimized) { target = w; break; }
+    }
+    if (target) target->want_close = 1;
+    spin_unlock_irqrestore(&state_lock, fl);
+    if (target) kprintf("gui: Ctrl+Alt+X — closing top app '%s'\n", target->title);
+    else        kprintf("gui: Ctrl+Alt+X — no app window to close\n");
+}
+
 static void dispatch_launches(void) {
+    if (sak_close_req) { sak_close_req = 0; sak_close_top_app(); }
     while (lq_t != lq_h) {
         const struct gui_app_def* app = launchq[lq_t];
         lq_t = (lq_t + 1) % LQ_SZ;
@@ -1530,6 +1568,30 @@ static void apply_pending(void) {
                         win->title, win->client_pid);
                 win->host_released = 1;   /* client gone; nothing to coordinate */
                 win->want_close    = 1;   /* teardown below disposes it */
+            }
+        }
+
+        /* §M46 — a client-managed (package) window whose X button was clicked
+         * (want_close).  A dosgui client is expected to poll the close event and
+         * quit itself, but a WEDGED client (frozen browser) never will, so its
+         * window could otherwise never close — "the chrome doesn't work when the
+         * app is frozen".  Handle it on the compositor task (outside state_lock —
+         * task_find/task_force_kill take the scheduler lock, which must not nest
+         * under state_lock):
+         *   - client already gone → mark host_released so the teardown disposes;
+         *   - client still alive + close_forces_kill → force-kill it (M46), then
+         *     wait for it to die (the next passes fall into the "gone" branch).
+         * The X button thus ALWAYS closes the window.  With close_forces_kill off
+         * the window waits for a cooperative quit instead (classic behaviour). */
+        if (win->want_close && win->kind == WIN_APP && !win->host_released &&
+            win->host_task == NULL && win->client_pid > 0) {
+            struct task* ct = task_find(win->client_pid);
+            if (!ct || ct->state == TASK_DEAD) {
+                win->host_released = 1;              /* nothing left to coordinate */
+            } else if (close_forces_kill && !ct->kill_forced) {
+                kprintf("gui: close '%s' → force-killing client pid %d\n",
+                        win->title, win->client_pid);
+                task_force_kill(win->client_pid);
             }
         }
 
@@ -1788,17 +1850,30 @@ drag_update:
          * so the post-unlock path can damage old ∪ new instead of the
          * whole screen.  Before this fix every motion event during a
          * drag raised gui_damage_all() — a full 1280×800 recompose +
-         * ~4 MB blit per event, which made the scene "swim". */
-        drag_old_x = drag_win->x;  drag_old_y = drag_win->y;
-        drag_old_w = drag_win->w;  drag_old_h = drag_win->h;
-        drag_win->x = mx - grab_dx;
-        drag_win->y = my - grab_dy;
-        if (drag_win->x < -(drag_win->w - 40)) drag_win->x = -(drag_win->w - 40);
-        if (drag_win->x > fbsurf.w - 40)       drag_win->x = fbsurf.w - 40;
-        if (drag_win->y < 0)                   drag_win->y = 0;
-        if (drag_win->y > work_h - TITLE_H)    drag_win->y = work_h - TITLE_H;
-        drag_new_x = drag_win->x;  drag_new_y = drag_win->y;
-        drag_moved = (drag_new_x != drag_old_x || drag_new_y != drag_old_y);
+         * ~4 MB blit per event, which made the scene "swim".
+         *
+         * §perf — THROTTLE: only actually move + damage the window every
+         * DRAG_FRAME_MS; intermediate motions just advance the cursor (the
+         * post-unlock `else` branch sets need_frame for a cheap cursor-only
+         * recompose).  This caps the big per-move blit to ~33 fps so a fast
+         * drag of a large window can't monopolise the CPU. */
+        int tgt_x = mx - grab_dx, tgt_y = my - grab_dy;
+        if (tgt_x < -(drag_win->w - 40)) tgt_x = -(drag_win->w - 40);
+        if (tgt_x > fbsurf.w - 40)       tgt_x = fbsurf.w - 40;
+        if (tgt_y < 0)                   tgt_y = 0;
+        if (tgt_y > work_h - TITLE_H)    tgt_y = work_h - TITLE_H;
+        uint64_t now = timer_ticks_ms();
+        if ((tgt_x != drag_win->x || tgt_y != drag_win->y) &&
+            (uint64_t)(now - last_drag_frame_ms) >= DRAG_FRAME_MS) {
+            last_drag_frame_ms = now;
+            drag_old_x = drag_win->x;  drag_old_y = drag_win->y;
+            drag_old_w = drag_win->w;  drag_old_h = drag_win->h;
+            drag_win->x = tgt_x;  drag_win->y = tgt_y;
+            drag_new_x = tgt_x;   drag_new_y = tgt_y;
+            drag_moved = 1;
+        }
+        /* else: coalesce — the window catches up on the next allowed frame;
+         * the cursor still glides (need_frame set below). */
     } else if (drag == DRAG_RESIZE && drag_win) {
         rubber_w = mx - drag_win->x + 2;
         rubber_h = my - drag_win->y + 2;
@@ -2113,6 +2188,16 @@ static const struct desktop_shell* pick_shell(void) {
 int gui_start(void) {
     if (gui_active) return 0;
 
+    /* §M46 — whether the X button on a client-managed (package) window
+     * force-kills a wedged client instead of only requesting a cooperative
+     * close (default on: the chrome must keep working when the app is frozen).
+     * A future refinement makes this a per-package policy; for now it is a
+     * single global gate so it is configurable rather than hard-coded. */
+    {
+        const char* v = config_get("gui.close_forces_kill", "1");
+        close_forces_kill = (v && (v[0]=='1'||v[0]=='y'||v[0]=='t'||v[0]=='Y'));
+    }
+
     if (gfx_fb_surface(&fbsurf) != 0) {
         kprintf("gui: no 32-bpp framebuffer — GUI unavailable\n");
         return -1;
@@ -2210,7 +2295,13 @@ int gui_start(void) {
      * desktop then cleanly closes the whole GUI session.  (The boot shell
      * remains only the launcher that started the session.) */
     if (panel_ready) {
-        struct task* dt = task_spawn("desktop", desktop_main);
+        /* The desktop is the GUI SESSION ROOT — detached (parented to init), so
+         * it survives whatever transient task ran `gui` / gui_start (the boot
+         * worker, a shell): a launcher's exit must not take the whole session
+         * down.  The session still tears down top-down — a kill_tree / crash of
+         * the desktop takes the compositor + every app with it (they hang UNDER
+         * the desktop), which is the "parent dies → children die" rule. */
+        struct task* dt = task_spawn_detached("desktop", desktop_main);
         if (dt) desktop_pid = dt->pid;
         else    kprintf("gui: desktop task spawn failed — taskbar static\n");
     }

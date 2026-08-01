@@ -39,6 +39,21 @@ int proc_exec_elf_argv(const void* image, size_t len,
  * run at once.  The caller can task_wait(pid) to await completion. */
 int proc_spawn(const char* name, const void* image, size_t len);
 
+/* Full form of proc_spawn: pass an argv and (linux_abi != 0) run the task under
+ * the Linux-ABI personality.  This is how a GUI package (NetSurf) is launched —
+ * a real, preemptible, force-killable user task rather than a synchronous
+ * excursion nested on the launcher's task. */
+int proc_spawn_argv(const char* name, const void* image, size_t len,
+                    int argc, const char* const argv[], int linux_abi);
+
+/* proc_spawn_argv + an explicit parent pid (>= 0), or the caller (< 0).  A GUI
+ * launcher passes the desktop pid (gui_desktop_pid()) so the package groups
+ * under the GUI session in the process tree instead of being re-parented to init
+ * when the transient app-host that launched it exits. */
+int proc_spawn_argv_under(const char* name, const void* image, size_t len,
+                          int argc, const char* const argv[], int linux_abi,
+                          int ppid);
+
 /* M34 — fork() orchestration (i386): clone the caller's address space + fd
  * table into a child task that resumes in ring 3 at the parent's fork point
  * with eax=0.  `parent_regs` is the caller's user register snapshot (filled by

@@ -9,7 +9,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M43"                 /* latest shipped: §M43 on-device tcc compiler */
+#define DOS_MILESTONE  "M46"                 /* latest shipped: §M46 resilience — no user program can freeze the box */
 #define DOS_LABEL      "d-os " DOS_MILESTONE
 
 /* Semantic kernel version — the single source of truth for "which build am I".
@@ -19,6 +19,6 @@
  * the milestone; bump the patch for sub-milestone builds.
  * (Swappable units — packages, the runtime libc, the pkg backend — carry their
  * OWN versions; this is the baseline for the non-swappable core.) */
-#define DOS_VERSION    "0.43.0"
+#define DOS_VERSION    "0.46.0"
 
 #endif /* VERSION_H */

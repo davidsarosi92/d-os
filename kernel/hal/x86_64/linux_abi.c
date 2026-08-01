@@ -31,6 +31,7 @@
 #include "printf.h"
 #include "hal_api.h"
 #include "vfs.h"
+#include "vmm.h"      /* §1.1 — vmm_user_access_ok / copy_str_from_user */
 #include "proc.h"          /* proc_fork / proc_execve / proc_clone */
 #include "usermode.h"      /* struct user_regs (fork snapshot)     */
 #include "dosgui.h"        /* §M42 display bridge (create/present/poll)  */
@@ -179,6 +180,29 @@ static void fill_stat(struct lnx_stat* s, const struct kstat* k) {
     s->st_ino     = (uint64_t)(uint32_t)k->size + 1;   /* crude stable-per-file id */
 }
 
+/* --------------------------------------------------------------------------
+ * User-pointer discipline in this dispatcher (§1.1) — see the i386 twin.
+ * The portable sys_* handlers gate their own ring-3 pointers; this file also
+ * marshals results into the Linux layout, so it calls the ungated sys_*_k cores
+ * with KERNEL structs and validates the ring-3 destinations itself.
+ * ------------------------------------------------------------------------ */
+static int lnx_w_ok(uintptr_t uptr, uintptr_t len) {   /* ring-3 write target */
+    return uptr && vmm_user_access_ok(uptr, len, 1);
+}
+static int lnx_r_ok(uintptr_t uptr, uintptr_t len) {   /* ring-3 read source  */
+    return uptr && vmm_user_access_ok(uptr, len, 0);
+}
+static int lnx_stat_upath(uintptr_t upath, struct kstat* out) {
+    char kp[256];
+    if (copy_str_from_user(kp, upath, sizeof kp) < 0) return -1;
+    return sys_stat_k(kp, out);
+}
+static int lnx_put_stat(uintptr_t ustat, const struct kstat* k) {
+    if (!lnx_w_ok(ustat, sizeof(struct lnx_stat))) return -1;
+    fill_stat((struct lnx_stat*)ustat, k);
+    return 0;
+}
+
 /* End a Linux process/excursion (identical flow to the native SYS_EXIT). */
 static void linux_exit(struct int_frame* f, int code) {
     struct task* cur = task_current();
@@ -274,9 +298,15 @@ void linux_syscall_dispatch(struct int_frame* f) {
             f->rax = (uint64_t)r;
             return;
         }
-        case LNX_unlink:
-            f->rax = (uint64_t)vfs_unlink((const char*)a0);
+        case LNX_unlink: {
+            /* §1.1 — copy the client path in before the VFS sees it. */
+            char kp[256];
+            if (copy_str_from_user(kp, a0, sizeof kp) < 0) {
+                f->rax = (uint64_t)-LNX_EFAULT; return;
+            }
+            f->rax = (uint64_t)vfs_unlink(kp);
             return;
+        }
 
         case LNX_mmap: {
             /* x86_64 mmap(addr, len, prot, flags, fd, offset) — offset is in
@@ -309,7 +339,12 @@ void linux_syscall_dispatch(struct int_frame* f) {
                 hal_set_tls_base((uintptr_t)a1);
                 f->rax = 0;
             } else if ((int)a0 == ARCH_GET_FS) {
-                if (a1) *(uint64_t*)a1 = t ? (uint64_t)t->tls_base : 0;
+                if (a1) {                       /* §1.1 — client out-slot */
+                    if (!lnx_w_ok(a1, sizeof(uint64_t))) {
+                        f->rax = (uint64_t)-LNX_EFAULT; return;
+                    }
+                    *(uint64_t*)a1 = t ? (uint64_t)t->tls_base : 0;
+                }
                 f->rax = 0;
             } else {
                 f->rax = (uint64_t)-LNX_ENOSYS;      /* GS unused by musl TLS */
@@ -353,32 +388,34 @@ void linux_syscall_dispatch(struct int_frame* f) {
         case LNX_clock_gettime: {
             /* x86_64 timespec { long tv_sec; long tv_nsec; } (both 64-bit). */
             struct ktimespec ts;
-            sys_clock_gettime((int)a0, &ts);
+            sys_clock_gettime_k((int)a0, &ts);
+            if (!lnx_w_ok(a1, 16)) { f->rax = (uint64_t)-LNX_EFAULT; return; }
             uint64_t* p = (uint64_t*)a1;
-            if (p) { p[0] = ts.sec; p[1] = ts.nsec; }
+            p[0] = ts.sec; p[1] = ts.nsec;
             f->rax = 0;
             return;
         }
         case LNX_gettimeofday: {
             struct ktimespec ts;
-            sys_clock_gettime(CLOCK_REALTIME, &ts);
+            sys_clock_gettime_k(CLOCK_REALTIME, &ts);
+            if (!lnx_w_ok(a0, 16)) { f->rax = (uint64_t)-LNX_EFAULT; return; }
             uint64_t* p = (uint64_t*)a0;             /* {tv_sec; tv_usec} */
-            if (p) { p[0] = ts.sec; p[1] = ts.nsec / 1000; }
+            p[0] = ts.sec; p[1] = ts.nsec / 1000;
             f->rax = 0;
             return;
         }
 
         case LNX_fstat: {
             struct kstat k;
-            if (sys_fstat((int)a0, &k) != 0) { f->rax = (uint64_t)-LNX_ENOENT; return; }
-            fill_stat((struct lnx_stat*)a1, &k);
+            if (sys_fstat_k((int)a0, &k) != 0) { f->rax = (uint64_t)-LNX_ENOENT; return; }
+            if (lnx_put_stat(a1, &k) != 0) { f->rax = (uint64_t)-LNX_EFAULT; return; }
             f->rax = 0;
             return;
         }
         case LNX_stat: {
             struct kstat k;
-            if (sys_stat((const char*)a0, &k) != 0) { f->rax = (uint64_t)-LNX_ENOENT; return; }
-            fill_stat((struct lnx_stat*)a1, &k);
+            if (lnx_stat_upath(a0, &k) != 0) { f->rax = (uint64_t)-LNX_ENOENT; return; }
+            if (lnx_put_stat(a1, &k) != 0) { f->rax = (uint64_t)-LNX_EFAULT; return; }
             f->rax = 0;
             return;
         }
@@ -394,8 +431,8 @@ void linux_syscall_dispatch(struct int_frame* f) {
                                    ? (const char*)a0    /* readlink: path=rdi */
                                    : (const char*)a1;   /* readlinkat: path=rsi */
             struct kstat k;
-            f->rax = (sys_stat(path, &k) != 0) ? (uint64_t)-LNX_ENOENT
-                                               : (uint64_t)-LNX_EINVAL;
+            f->rax = (lnx_stat_upath((uintptr_t)path, &k) != 0) ? (uint64_t)-LNX_ENOENT
+                                                                : (uint64_t)-LNX_EINVAL;
             return;
         }
         case LNX_access:
@@ -408,7 +445,7 @@ void linux_syscall_dispatch(struct int_frame* f) {
                                    ? (const char*)a0    /* access: path=rdi */
                                    : (const char*)a1;   /* faccessat: path=rsi */
             struct kstat k;
-            f->rax = (sys_stat(path, &k) != 0) ? (uint64_t)-LNX_ENOENT : 0;
+            f->rax = (lnx_stat_upath((uintptr_t)path, &k) != 0) ? (uint64_t)-LNX_ENOENT : 0;
             return;
         }
         case LNX_madvise:
@@ -421,8 +458,11 @@ void linux_syscall_dispatch(struct int_frame* f) {
              * when idle (else it busy-spins and starves the compositor).
              * timespec {s64 tv_sec; s64 tv_nsec}: nanosleep req = rdi,
              * clock_nanosleep req = rdx (after clockid + flags). */
-            const int64_t* req = (f->rax == LNX_nanosleep)
-                                   ? (const int64_t*)a0 : (const int64_t*)a2;
+            uintptr_t ureq = (f->rax == LNX_nanosleep) ? a0 : a2;
+            if (ureq && !lnx_r_ok(ureq, 2 * sizeof(int64_t))) {   /* §1.1 */
+                f->rax = (uint64_t)-LNX_EFAULT; return;
+            }
+            const int64_t* req = (const int64_t*)ureq;
             long ms = req ? (long)(req[0] * 1000 + req[1] / 1000000) : 0;
             task_msleep(ms > 0 ? (uint32_t)ms : 1u);
             f->rax = 0;
@@ -438,7 +478,11 @@ void linux_syscall_dispatch(struct int_frame* f) {
          * pointers are in the caller's address space (active now), read/written
          * directly.  See kernel/gui/dosgui.c. */
         case LNX_DOSGUI_CREATE:
-            f->rax = (uint64_t)(int64_t)dosgui_create((int)a0, (int)a1, (const char*)a2);
+            {   /* §1.1 — copy the client's window title in. */
+                char title[64];
+                if (copy_str_from_user(title, a2, sizeof title) < 0) title[0] = 0;
+                f->rax = (uint64_t)(int64_t)dosgui_create((int)a0, (int)a1, title);
+            }
             return;
         case LNX_DOSGUI_PRESENT:
             f->rax = (uint64_t)(int64_t)dosgui_present((int)a0, (const uint32_t*)a1,
@@ -482,7 +526,10 @@ void linux_syscall_dispatch(struct int_frame* f) {
         case LNX_wait4: {
             int code = 0;
             int pid = task_wait((int)a0, &code);
-            if (a1) *(int*)a1 = (code & 0xFF) << 8;   /* WIFEXITED: code in 8..15 */
+            if (a1) {                            /* §1.1 — client status slot */
+                if (!lnx_w_ok(a1, sizeof(int))) { f->rax = (uint64_t)-LNX_EFAULT; return; }
+                *(int*)a1 = (code & 0xFF) << 8;  /* WIFEXITED: code in 8..15 */
+            }
             f->rax = (uint64_t)pid;
             return;
         }

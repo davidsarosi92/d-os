@@ -42,7 +42,24 @@
 extern uint32_t saved_esp;
 extern uint32_t saved_eip;
 
+static void syscall_dispatch_body(struct int_frame* f);
+
+/* §1.1 — a syscall entered here came from a ring-3 trap, so every pointer
+ * argument in the frame is a USER pointer.  Flag the task for the duration:
+ * usyscall.c validates a pointer argument only while the flag is set, which
+ * keeps the ring-3 boundary closed WITHOUT rejecting in-kernel callers of the
+ * same sys_* helpers (the shell self-tests pass kernel buffers).  The SYS_EXIT
+ * teleport does not return through here — proc.c clears the flag when the
+ * excursion lands back in the kernel. */
 void syscall_dispatch(struct int_frame* f) {
+    struct task* me = task_current();
+    int prev = me ? me->in_user_syscall : 0;
+    if (me) me->in_user_syscall = 1;
+    syscall_dispatch_body(f);
+    if (me) me->in_user_syscall = prev;
+}
+
+static void syscall_dispatch_body(struct int_frame* f) {
     /* M36 / §M41 — route a Linux-personality process to the Linux i386 ABI
      * translator (a separate, isolated module); native d-os programs fall
      * through to the switch below. */
@@ -50,17 +67,12 @@ void syscall_dispatch(struct int_frame* f) {
     if (cur && cur->linux_abi) { linux_syscall_dispatch(f); return; }
 
     switch (f->eax) {
-        case SYS_PRINT: {
-            /* EBX = const char* user pointer.  Walk it directly; our
-             * identity map covers all of physical memory the user could
-             * possibly hand us (their pages live below 256 MiB). */
-            const char* s = (const char*)f->ebx;
-            if (s) {
-                while (*s) console_putchar(*s++);
-            }
-            f->eax = 0;
+        case SYS_PRINT:
+            /* EBX = const char* user pointer.  §1.1 — copied in through the
+             * validated path (sys_print), never walked in place: a bad pointer
+             * returns -1 instead of faulting the kernel. */
+            f->eax = (uint32_t)sys_print((const char*)f->ebx);
             return;
-        }
 
         case SYS_EXIT: {
             /* Tier B — an INDEPENDENT user task ends here for good: close its

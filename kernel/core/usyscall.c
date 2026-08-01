@@ -9,10 +9,21 @@
  * the implicit console stdin/stdout/stderr; fds >= 3 index task->fds (generic
  * ofile objects: VFS file / shm / socket).
  *
- * User-pointer note: the dispatcher runs with the user's address space loaded
- * (its pages supervisor-readable) and the kernel mapped in every space, so a
- * direct dereference works.  A hardened copy_from/to_user is a later
- * refinement.
+ * USER-POINTER DISCIPLINE (§1.1) — two layers, both required:
+ *   1. GATE: while a task is inside a syscall entered from ring 3
+ *      (task->in_user_syscall, set by the arch dispatcher) every pointer
+ *      argument is checked with vmm_user_access_ok before use, so a bad pointer
+ *      returns an error instead of faulting the kernel or reaching kernel
+ *      memory.  In-kernel callers of the same handlers (the shell self-tests)
+ *      are not gated — see user_ptr_gate_armed below.
+ *   2. FAULT FIXUP: the copies themselves run through the uaccess primitives
+ *      (kernel/hal/<arch>/uaccess.c), whose instructions are registered in the
+ *      exception table — so even a range that becomes invalid BETWEEN the check
+ *      and the copy (a concurrent munmap, a revoked COW page) returns -EFAULT
+ *      instead of taking a ring-0 page fault.
+ * Still on the pre-check alone (not yet bounce-buffered): the large read/write
+ * payloads handed straight to the VFS / socket layers, which dereference them
+ * deep inside their own call chains.
  * ============================================================================= */
 
 #include "syscall.h"
@@ -20,6 +31,7 @@
 #include "vfs.h"
 #include "fd.h"
 #include "vmm.h"
+#include "uaccess.h"   /* §1.1 — fault-safe user copies (exception table) */
 #include "pmm.h"
 #include "console.h"
 #include "vc.h"
@@ -36,6 +48,99 @@
 #define PAGE_SIZE          4096u
 #define MMAP_BASE_OFFSET   0x08000000u   /* mmap region: base+128 MiB (above the
                                           * image/interp/stack; see proc.c layout) */
+
+/* §M46/security — validated user<->kernel copies (see vmm.h).  Gate every ring-3
+ * pointer through these so a bad pointer returns -1 (→ -EFAULT) instead of a
+ * kernel-mode #PF (which the fault policy would turn into a whole-box halt — a
+ * package freezing the system) or a read/write of kernel memory. */
+int copy_from_user(void* dst, uintptr_t user_src, uintptr_t len) {
+    if (!vmm_user_access_ok(user_src, len, 0)) return -1;   /* cheap pre-check */
+    return uaccess_copy_in(dst, user_src, (size_t)len);     /* fault-safe copy */
+}
+int copy_to_user(uintptr_t user_dst, const void* src, uintptr_t len) {
+    if (!vmm_user_access_ok(user_dst, len, 1)) return -1;
+    return uaccess_copy_out(user_dst, src, (size_t)len);
+}
+
+/* Is the current caller's pointer argument a RING-3 pointer at all?
+ *
+ * The sys_* helpers below are DUAL-USE: an arch dispatcher calls them with raw
+ * ring-3 pointers, but in-kernel code (the shell's self-tests, and drivers that
+ * reuse the fd/socket layer) calls the very same functions with KERNEL buffers.
+ * Only the dispatcher knows which case it is — it entered from a ring-3 trap —
+ * so it flags the task for the duration (task->in_user_syscall) and we validate
+ * only then.  Gating unconditionally rejected every in-kernel caller, which is
+ * what broke fdtest/socktest/polltest and — through ld.so's fstat of each
+ * shared object — NetSurf.  Kernel-pointer arguments coming FROM a dispatcher
+ * that also handles user pointers (e.g. fstat into a kernel `struct kstat`) use
+ * the explicit *_k cores instead. */
+static inline int user_ptr_gate_armed(void) {
+    struct task* t = task_current();
+    return t && t->in_user_syscall;
+}
+
+/* Convenience predicates for gating a syscall's user pointer(s). */
+static inline int user_r(const void* p, uintptr_t len) {
+    if (!user_ptr_gate_armed()) return 1;
+    return vmm_user_access_ok((uintptr_t)p, len, 0);
+}
+static inline int user_w(const void* p, uintptr_t len) {
+    if (!user_ptr_gate_armed()) return 1;
+    return vmm_user_access_ok((uintptr_t)p, len, 1);
+}
+
+/* Copy a NUL-terminated string from a user pointer into a kernel buffer, at most
+ * `max` bytes (always NUL-terminates).  Validates page-by-page so a bad/unmapped
+ * string can't fault the kernel.  Returns the length copied, or -1 on a bad
+ * pointer.  Used for path arguments before handing them to the VFS. */
+static int strncpy_from_user(char* dst, const char* uptr, size_t max) {
+    if (max == 0 || !uptr) return -1;
+    uintptr_t base = (uintptr_t)uptr;
+    if (!user_ptr_gate_armed()) {              /* kernel caller → plain copy */
+        size_t i = 0;
+        for (; i + 1 < max && uptr[i]; i++) dst[i] = uptr[i];
+        dst[i] = 0;
+        return (int)i;
+    }
+    /* Cheap pre-check on the first page (rejects the obvious bad pointer with a
+     * clean error), then the FAULT-SAFE walk: uaccess_str_in stops at the NUL
+     * and survives an unmapped page mid-string via the exception table, so a
+     * string that straddles into unmapped memory returns -1 instead of faulting
+     * the kernel — no need to pre-walk every page here. */
+    if (!vmm_user_access_ok(base & ~(uintptr_t)0xFFF, 1, 0)) return -1;
+    long n = uaccess_str_in(dst, base, max);
+    return (n < 0) ? -1 : (int)n;
+}
+
+/* Public form of the above, for an arch dispatcher that must turn a ring-3 path
+ * argument into a kernel string before calling a *_k core (see below). */
+int copy_str_from_user(char* dst, uintptr_t user_src, uintptr_t max) {
+    return strncpy_from_user(dst, (const char*)user_src, (size_t)max);
+}
+
+/* SYS_PRINT — write a NUL-terminated RING-3 string to the console.
+ *
+ * §1.1: every arch dispatcher used to walk the raw user pointer ("the identity
+ * map covers everything the user could hand us") — which is exactly how a
+ * program passes an unmapped/kernel address and takes the whole box down with a
+ * ring-0 #PF.  Copy it in through the validated string copy instead, in chunks
+ * so an arbitrarily long string still works, with a hard cap so a non-NUL-
+ * terminated one cannot spin forever.  Returns 0, or -1 on a bad pointer. */
+long sys_print(const char* user_str) {
+    if (!user_str) return -1;
+    char buf[128];
+    uintptr_t p = (uintptr_t)user_str;
+    for (int chunk = 0; chunk < 1024; chunk++) {      /* ≤ 128 KiB of text */
+        int n = strncpy_from_user(buf, (const char*)p, sizeof buf);
+        if (n < 0) return -1;
+        for (int i = 0; i < n; i++) console_putchar(buf[i]);
+        /* strncpy_from_user returns the index of the NUL it found (< max-1), or
+         * max-1 when it filled the buffer without seeing one → keep going. */
+        if (n < (int)sizeof buf - 1) return 0;
+        p += (uintptr_t)n;
+    }
+    return 0;
+}
 
 /* Resolve a real fd (>= 3) to its ofile, or NULL if out of range / not open. */
 static struct ofile* fd_lookup(int fd) {
@@ -60,6 +165,7 @@ static long netsock_write(struct netsock* ns, const void* buf, size_t n);
 static long netsock_read (struct netsock* ns, void* buf, size_t n);
 
 long sys_write(int fd, const void* buf, size_t n) {
+    if (n && !user_r(buf, n)) return -1;      /* §1.1 — validate the user buffer */
     if (fd == 1 || fd == 2) {                 /* stdout / stderr → console */
         const char* s = (const char*)buf;
         /* §M43: also capture into the task's buffer if one is set (Editor
@@ -92,6 +198,9 @@ static long stdin_read_line(char* buf, size_t cap) {
     if (!v || cap == 0) return 0;
     size_t len = 0;
     for (;;) {
+        /* §1.5 — honour a pending kill so a process blocked in read(0) is
+         * force-killable (End-task) even if no line ever arrives. */
+        if (task_should_stop()) return (long)len;
         char c = vc_getchar(v);
         if (c == '\n') {
             vc_putchar(v, '\n');
@@ -107,6 +216,7 @@ static long stdin_read_line(char* buf, size_t cap) {
 }
 
 long sys_read(int fd, void* buf, size_t n) {
+    if (n && !user_w(buf, n)) return -1;      /* §1.1 — validate the user buffer */
     if (fd == 0) return stdin_read_line((char*)buf, n);   /* cooked stdin */
     if (fd == 1 || fd == 2) return -1;
     struct ofile* o = fd_lookup(fd);
@@ -121,7 +231,9 @@ long sys_read(int fd, void* buf, size_t n) {
 
 int sys_open(const char* path, int flags) {
     if (!path) return -1;
-    struct file* f = vfs_open(path, flags ? flags : VFS_RDONLY);
+    char kpath[256];                                        /* §1.1 */
+    if (strncpy_from_user(kpath, path, sizeof kpath) < 0) return -1;
+    struct file* f = vfs_open(kpath, flags ? flags : VFS_RDONLY);
     if (!f) return -1;
     struct ofile* o = ofile_from_file(f);
     if (!o) { vfs_close(f); return -1; }
@@ -216,6 +328,7 @@ long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
                    int fd, uint64_t offset) {
     struct task* t = task_current();
     if (!t || !t->mm) return -1;
+    if (len > (256u << 20)) return -1;         /* §4.5 — cap a single mapping   */
 
     int n = (int)((len + PAGE_SIZE - 1) / PAGE_SIZE);
     if (n <= 0) n = 1;
@@ -228,6 +341,10 @@ long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
     uintptr_t va;
     if ((flags & MAP_FIXED) && addr) {
         va = addr & ~(uintptr_t)(PAGE_SIZE - 1);
+        /* §2.5 — a fixed mapping must stay inside the user address range and
+         * not wrap; the target space is the task's own, so this only guards
+         * against a garbage/kernel addr, not against self-overwrite. */
+        if (va < vmm_user_base() || va + (uintptr_t)n * PAGE_SIZE < va) return -1;
     } else {
         if (t->mmap_cursor == 0)
             t->mmap_cursor = vmm_user_base() + MMAP_BASE_OFFSET;
@@ -300,7 +417,7 @@ int sys_memfd(size_t size) {
 /* ---- unix sockets + fd passing (stage 5) ---------------------------------- */
 
 int sys_socketpair(int* fds) {
-    if (!fds) return -1;
+    if (!fds || !user_w(fds, 2 * sizeof(int))) return -1;   /* §1.1/2.4 */
     struct usock *ua, *ub;
     if (usock_pair(&ua, &ub) != 0) return -1;
 
@@ -349,6 +466,24 @@ int sys_kill(int pid, int sig) {
     if (sig <= 0 || sig >= NSIG) return -1;
     struct task* t = task_find(pid);
     if (!t) return -1;
+    /* §audit#6 — credential rule (pre-§M32, no uid/gid yet): a ring-3 caller may
+     * only signal a USER task that is itself or one of its descendants — never a
+     * kernel thread, pid 0, or init.  Without this, any package could kill the
+     * system's daemons (or another package) by pid. */
+    struct task* me = task_current();
+    if (me && me->user_task) {
+        if (!t->user_task || t->pid == 0 || t->pid == task_reaper_pid()) return -1;
+        if (t != me) {
+            int p = t->ppid, ok = 0;
+            for (int i = 0; i < 64 && p > 0; i++) {   /* walk t's ppid chain up */
+                if (p == me->pid) { ok = 1; break; }
+                struct task* pt = task_find(p);
+                if (!pt) break;
+                p = pt->ppid;
+            }
+            if (!ok) return -1;
+        }
+    }
     t->sig_pending |= (1u << sig);
     return 0;
 }
@@ -366,9 +501,21 @@ long sys_sigaction(int sig, long handler, long restorer) {
 
 /* ---- POSIX syscall breadth (M36) — the surface a real libc needs ---------- */
 
-int sys_stat(const char* path, struct kstat* out) {
-    if (!path || !out) return -1;
-    struct file* f = vfs_open(path, VFS_RDONLY);
+/* ---------------------------------------------------------------------------
+ * *_k cores — KERNEL-pointer entry points.
+ *
+ * A dispatcher that translates a d-os result into a foreign ABI layout (the
+ * Linux personality: kstat → struct stat64, ktimespec → timespec/timeval,
+ * source ip/port → sockaddr_in) fills a KERNEL struct first and marshals it out
+ * itself.  Those calls must NOT be gated as ring-3 pointers — but the gated
+ * wrapper is still the only thing a real user program can reach, so the ring-3
+ * boundary stays closed.  The wrappers below are the ring-3 entry points; these
+ * cores are the in-kernel API.  (`kpath` is likewise a kernel string — the
+ * caller copies the user path in with copy_str_from_user first.)
+ * ------------------------------------------------------------------------- */
+int sys_stat_k(const char* kpath, struct kstat* out) {
+    if (!kpath || !out) return -1;
+    struct file* f = vfs_open(kpath, VFS_RDONLY);
     if (!f) return -1;
     if (f->inode) {
         out->size = (uint32_t)f->inode->size;
@@ -379,7 +526,7 @@ int sys_stat(const char* path, struct kstat* out) {
     return 0;
 }
 
-int sys_fstat(int fd, struct kstat* out) {
+int sys_fstat_k(int fd, struct kstat* out) {
     if (!out) return -1;
     struct ofile* o = fd_lookup(fd);
     if (!o) return -1;
@@ -391,8 +538,22 @@ int sys_fstat(int fd, struct kstat* out) {
     return 0;
 }
 
+/* Ring-3 entry points: gate the user pointers, then run the core. */
+int sys_stat(const char* path, struct kstat* out) {
+    if (!path || !out || !user_w(out, sizeof(*out))) return -1;   /* §1.1 */
+    char kpath[256];
+    if (strncpy_from_user(kpath, path, sizeof kpath) < 0) return -1;
+    return sys_stat_k(kpath, out);
+}
+
+int sys_fstat(int fd, struct kstat* out) {
+    if (!out || !user_w(out, sizeof(*out))) return -1;   /* §1.1 */
+    return sys_fstat_k(fd, out);
+}
+
 /* Pack directory entries into `buf` as [reclen(2) | type(1) | name\0] records. */
 long sys_getdents(int fd, void* buf, size_t cap) {
+    if (!buf || !cap || !user_w(buf, cap)) return -1;   /* §1.1/4.4 */
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_VFS || !o->file) return -1;
     uint8_t* out = (uint8_t*)buf;
@@ -418,6 +579,7 @@ long sys_getdents(int fd, void* buf, size_t cap) {
  *   u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[] (NUL-term).
  * Records are 8-byte aligned; d_type uses the Linux DT_* values. */
 long sys_getdents64(int fd, void* buf, size_t cap) {
+    if (!buf || !cap || !user_w(buf, cap)) return -1;   /* §1.1/4.4 */
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_VFS || !o->file) return -1;
     uint8_t* out = (uint8_t*)buf;
@@ -449,7 +611,7 @@ static void ustr(char* d, const char* s) {
     int i = 0; while (s[i] && i < 64) { d[i] = s[i]; i++; } d[i] = 0;
 }
 int sys_uname(struct kutsname* out) {
-    if (!out) return -1;
+    if (!out || !user_w(out, sizeof(*out))) return -1;   /* §1.1 */
     ustr(out->sysname,  "d-os");
     ustr(out->nodename, "d-os");
     ustr(out->release,  "0.1");
@@ -475,7 +637,7 @@ static uint32_t rtc_to_epoch(const struct rtc_time* t) {
                       (long)t->min * 60L + (long)t->sec);
 }
 
-int sys_clock_gettime(int which, struct ktimespec* out) {
+int sys_clock_gettime_k(int which, struct ktimespec* out) {
     if (!out) return -1;
     if (which == CLOCK_MONOTONIC) {
         uint64_t ms = timer_ticks_ms();
@@ -490,6 +652,11 @@ int sys_clock_gettime(int which, struct ktimespec* out) {
     return 0;
 }
 
+int sys_clock_gettime(int which, struct ktimespec* out) {
+    if (!out || !user_w(out, sizeof(*out))) return -1;   /* §1.1 */
+    return sys_clock_gettime_k(which, out);
+}
+
 int sys_nanosleep(unsigned ms) {
     task_msleep(ms);
     return 0;
@@ -499,12 +666,13 @@ int sys_nanosleep(unsigned ms) {
  * (our pool is seeded at boot); flags (GRND_NONBLOCK/GRND_RANDOM) are ignored. */
 long sys_getrandom(void* buf, size_t n, unsigned flags) {
     (void)flags;
-    if (!buf) return -1;
+    if (!buf || !user_w(buf, n)) return -1;   /* §1.1 */
     random_bytes(buf, n);
     return (long)n;
 }
 
 long sys_send(int fd, const void* buf, size_t n, int passfd) {
+    if (n && !user_r(buf, n)) return -1;   /* §1.1 */
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_SOCK) return -1;
     struct ofile* pf = (passfd >= 0) ? fd_lookup(passfd) : NULL;
@@ -512,6 +680,8 @@ long sys_send(int fd, const void* buf, size_t n, int passfd) {
 }
 
 long sys_recv(int fd, void* buf, size_t n, int* passfd_out) {
+    if (n && !user_w(buf, n)) return -1;   /* §1.1 */
+    if (passfd_out && !user_w(passfd_out, sizeof(int))) return -1;
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_SOCK) { if (passfd_out) *passfd_out = -1; return -1; }
 
@@ -584,7 +754,8 @@ static int poll_snapshot(struct pollfd* pfds, int nfds) {
  * (needs a timed wakeup — deferred with cron/watchdog's timed-sleep); treated
  * as a snapshot so it never blocks past the caller's intent. */
 int sys_poll(struct pollfd* pfds, int nfds, int timeout) {
-    if (!pfds || nfds < 0) return -1;
+    if (!pfds || nfds < 0 || nfds > 1024) return -1;          /* §1.1 + bound */
+    if (!user_w(pfds, (uintptr_t)nfds * sizeof(*pfds))) return -1;
 
     for (;;) {
         int ready = poll_snapshot(pfds, nfds);
@@ -722,6 +893,7 @@ static long netsock_read(struct netsock* ns, void* buf, size_t n) {
 }
 
 long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port) {
+    if (n && !user_r(buf, n)) return -1;   /* §1.1 */
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_NETSOCK) return -1;
     struct netsock* ns = o->nsock;
@@ -732,7 +904,10 @@ long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port) {
     return (long)n;
 }
 
-long sys_recvfrom(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out) {
+/* Core: `buf` may be a user buffer the CALLER has already validated (the Linux
+ * personality hands us the client's iovec), `ip_out`/`port_out` are the
+ * dispatcher's kernel locals — see the *_k note above. */
+long sys_recvfrom_k(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_NETSOCK) return -1;
     struct netsock* ns = o->nsock;
@@ -753,4 +928,11 @@ long sys_recvfrom(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out) 
     if (port_out) *port_out = d->src_port;
     ns->rx_tail = (ns->rx_tail + 1) % NS_RXSLOTS;
     return (long)cnt;
+}
+
+long sys_recvfrom(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out) {
+    if (n && !user_w(buf, n)) return -1;   /* §1.1 */
+    if (ip_out && !user_w(ip_out, sizeof(*ip_out))) return -1;
+    if (port_out && !user_w(port_out, sizeof(*port_out))) return -1;
+    return sys_recvfrom_k(fd, buf, n, ip_out, port_out);
 }

@@ -24,6 +24,8 @@
 #include "devfs.h"
 #include "vc.h"
 #include "keymap.h"
+#include "gui.h"                            /* §M46 SAK: gui_queue_launch etc. */
+#include "gui_app.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -94,6 +96,28 @@ static uint8_t mods = 0;
  * Enter, etc. — for M16 we only care about RAlt. */
 static int e0_pending = 0;
 
+/* §M46 SAK — secure-attention hotkeys, trapped in the raw input path BEFORE any
+ * window/shell routing so they work even when the focused app is frozen (the
+ * compositor, not the app, acts on them).  `sc` is a MAKE scancode: 0x53 = Del
+ * (main "Delete" via E0, or keypad '.'); 0x2D = X.  Requires Ctrl+Alt held.
+ * Returns 1 if consumed.  Config-rebindable combos are a future refinement
+ * (hotkey.taskmgr / hotkey.killapp). */
+static int sak_try(uint8_t sc) {
+    int ctrl_alt = (mods & (KBD_MOD_LCTRL | KBD_MOD_RCTRL)) &&
+                   (mods & (KBD_MOD_LALT  | KBD_MOD_RALT));
+    if (!ctrl_alt) return 0;
+    if (sc == 0x53) {                       /* Ctrl+Alt+Del → Task Manager */
+        const struct gui_app_def* tm = gui_app_find("Task Manager");
+        if (tm) gui_queue_launch(tm);
+        return 1;
+    }
+    if (sc == 0x2D) {                       /* Ctrl+Alt+X → close/force top app */
+        gui_request_close_last();
+        return 1;
+    }
+    return 0;
+}
+
 /* --------------------------------------------------------------------------
  * Input ring buffer shared between the ISR (producer) and the shell
  * (consumer).  Power-of-two size so (index mod SIZE) is a cheap `& MASK`
@@ -152,6 +176,9 @@ static void keyboard_irq(struct int_frame* f) {
         if (sc == 0x9D) { mods &= ~KBD_MOD_RCTRL; return; }
         if (sc & 0x80) return;                      /* extended break */
 
+        /* §M46 SAK — main "Delete" arrives here as E0 0x53. */
+        if (sak_try(sc)) return;
+
         /* M22.5 — cursor/editing cluster (E0-prefixed makes).  Mapped
          * to HID usages and pushed through the same raw-dispatch +
          * keymap path as everything else; no layout maps them to a
@@ -189,6 +216,9 @@ static void keyboard_irq(struct int_frame* f) {
     if (sc == 0xB8) { mods &= ~KBD_MOD_LALT;   return; }
 
     if (sc & 0x80) return;                                      /* other break */
+
+    /* §M46 SAK — Ctrl+Alt+Del (keypad '.') / Ctrl+Alt+X, before any routing. */
+    if (sak_try(sc)) return;
 
     /* M14: LAlt+1..9 switches focus to the Nth VC.  Scancodes (set 1)
      * for the digit row: '1' = 0x02 .. '9' = 0x0A.  Intercept BEFORE

@@ -76,7 +76,7 @@
 | §M43 | Native developer toolchain (self-hosting) — ◐ first slice shipped (i386, DOCS §4.36): **TinyCC compiles + runs C ON d-os** (`tcc`/`exec` shell cmds + Editor "Run" button).  Full gcc/clang self-hosting + binutils/make still open | — |
 | §M44 | Language ecosystems — Rust / C++ / .NET (NativeAOT→CoreCLR) / Java (JVM); run cross-built musl binaries, then per-runtime ports | — |
 | §M45 | Package manager frontend + GUI installer — apt-like UX + wizard over the §M35.5 store; remote repo over §M39 TLS; driver/module hot-swap via §M33 | — |
-| **§M46** | **Resilient control plane — secure-attention hotkeys + force-kill** — Ctrl+Alt+Del ⇒ always-live high-priority Task Manager; Ctrl+Alt+X ⇒ close the last user-opened (or frozen) app; window chrome (close/min/restore) stays live even when the owning app is wedged (close ⇒ force-kill after grace); Task Manager gains a force End-task; the enabler is a real force-kill of a wedged ring-3 process (now buildable post-§M25/§M34). Depends on §M22.3 + §M31 + §M27 | — |
+| **§M46** | **Resilient control plane + freeze-freeness** — ✅ **SHIPPED** (i386 + x86_64, aarch64 parity; DOCS §4.37): ring-3 fault ⇒ kill just the process (all 3 arches); real force-kill of a WEDGED ring-3 task at the timer preemption boundary (`fkill`, Task Manager "Force kill", opt-in `package.auto_fkill_ms` runaway policy); ib700 HW watchdog + NMI hard-lockup recovery + deadlock reporting on COM1; Ctrl+Alt+Del / Ctrl+Alt+X trapped in the keyboard IRQ (work while an app is frozen), window X force-kills an unresponsive client; the ring-3 pointer boundary closed with a per-syscall gate **and** a real exception table (`.ex_table` + `uaccess_*`, `faulttest`); dosgui handles owner-bound + blits range-checked; sigreturn EFLAGS sanitised; `sys_kill` restricted to the caller's subtree; x86_64 real COW; ACPI tables above the identity map mapped on demand | — |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -4014,6 +4014,25 @@ without killing its clients (the last item may land with §M33).
 ---
 
 ## §M46 — Resilient control plane: secure-attention hotkeys + force-kill
+
+> ✅ **SHIPPED (2026-08-01) — see DOCS.md §4.37.**  All four requirements below
+> hold, plus the audit-driven hardening that turned "the control plane survives"
+> into "nothing a user program does can take the box down": ring-3 fault ⇒ kill
+> the process (3 arches), force-kill at the preemption boundary, NMI hard-lockup
+> recovery, SAK hotkeys in the keyboard IRQ, chrome-force-kill, the two-layer
+> user-pointer boundary (gate + `.ex_table` fault fixup), owner-bound dosgui
+> handles, sanitised sigreturn, subtree-restricted `sys_kill`, x86_64 COW.
+> **Lesson learned:** the `sys_*` handlers are DUAL-USE (ring-3 dispatchers AND
+> in-kernel callers).  Putting the user-pointer check inside them rejected every
+> kernel caller — `linux_abi`'s `fstat(fd, &kernel_kstat)` returned -1, so musl's
+> ld.so failed to load EVERY shared object and NetSurf stopped starting on both
+> x86 arches.  A pointer check belongs where the pointer's ORIGIN is known: the
+> dispatcher marks the task (`in_user_syscall`), and kernel-destination calls go
+> to explicit `*_k` cores.  Second lesson: a validity CHECK is not a guarantee —
+> only the exception table makes a copy survive a range going bad mid-flight.
+> Third: firmware tables (ACPI) live at the top of RAM, so any "the identity map
+> covers everything" assumption breaks the moment the box has more memory than
+> the map — it cost a silent boot-time freeze at `-m 512M`.
 
 **Why (user priority — "fontos dolgok nagyon"):** processes are now separated
 (per-process address spaces, §M25) and a watchdog exists (§M31), so the desktop

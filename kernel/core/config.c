@@ -66,7 +66,7 @@ static const struct config_default builtin_defaults[] = {
     { "console.bg_color", "0x101828" },
     { "shell.prompt",     "d-os> "   },
     { "shell.motd",       "welcome." },
-    { "keyboard.layout",  "us"       },     /* M16 — consumed by keymap_init */
+    { "keyboard.layout",  "us"       },
     { NULL, NULL }
 };
 
@@ -80,6 +80,21 @@ const char* config_get(const char* key, const char* default_value) {
         if (streq(e->key, key)) return e->value;
     }
     return default_value;
+}
+
+/* Parse a config value as a base-10 (long) integer, returning `def` when the
+ * key is missing or the value is not a valid number.  Leading spaces and an
+ * optional sign are accepted; parsing stops at the first non-digit. */
+long config_get_long(const char* key, long def) {
+    const char* s = config_get(key, (const char*)0);
+    if (!s) return def;
+    while (*s == ' ' || *s == '\t') s++;
+    int neg = 0;
+    if (*s == '+' || *s == '-') { neg = (*s == '-'); s++; }
+    if (*s < '0' || *s > '9') return def;            /* no digits → default */
+    long v = 0;
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
+    return neg ? -v : v;
 }
 
 int config_set(const char* key, const char* value) {

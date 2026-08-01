@@ -534,9 +534,11 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     /* §M42 — deterministic NetSurf render smoke test (arch-generic; the browser
      * is on i386 + x86_64).  With `netsurf.autostart=1` the browser is launched
      * at boot before the interactive shell, so its init + render pipeline is
-     * captured on the serial log without depending on sendkey timing.  It enters
-     * the fbtk event loop and does not return (headless) — a dead-end boot used
-     * only for the render proof. */
+     * captured on the serial log without depending on sendkey timing.  It runs as
+     * an INDEPENDENT user task (proc_spawn_argv) exactly as the Start-menu
+     * launcher does — so the boot continues to the shell, and a browser crash is
+     * confined to the browser task (isr_handler kills it, the box stays up)
+     * rather than wedging the boot task. */
     {
         const char* nt = config_get("netsurf.autostart", "0");
         if (nt && (nt[0] == '1' || nt[0] == 'y' || nt[0] == 't')) {
@@ -544,6 +546,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
             extern const unsigned char _binary_user_netsurf_dynelf_end[]   __attribute__((weak));
             if (_binary_user_netsurf_dynelf_start) {
                 extern int gui_start(void);
+                extern int gui_desktop_pid(void);
                 pkg_init();                /* provision /lib ld.so + store .so's
                                             * (idempotent; on i386 the shell
                                             * would otherwise run it only later,
@@ -551,14 +554,18 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
                                             * be planted before we exec it) */
                 gui_start();               /* bring up the compositor */
                 task_msleep(400);          /* let it become ready (à la wayland) */
-                struct task* me = task_current();
-                if (me) me->linux_abi = 1;
                 const char* argv[] = { "netsurf", "-f", "dos", "about:welcome" };
                 kprintf("netsurf-test: launching about:welcome...\n");
-                proc_exec_elf_argv(_binary_user_netsurf_dynelf_start,
+                /* Parent under the (detached, surviving) desktop, not this boot
+                 * worker which task_exit()s below — else the subtree teardown
+                 * would kill the browser the moment boot finishes. */
+                int sess = gui_desktop_pid();
+                int pid = proc_spawn_argv_under("netsurf",
+                    _binary_user_netsurf_dynelf_start,
                     (size_t)(_binary_user_netsurf_dynelf_end -
-                             _binary_user_netsurf_dynelf_start), 4, argv);
-                kprintf("netsurf-test: returned\n");
+                             _binary_user_netsurf_dynelf_start), 4, argv, 1,
+                    sess > 0 ? sess : -1);
+                kprintf("netsurf-test: spawned pid %d\n", pid);
             }
         }
     }
@@ -580,8 +587,15 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
         struct vc* root_vc = vc_root();
         if (root_vc) {
             preempt_disable();
+            /* The boot shell is a SESSION ROOT: spawn it detached (parented to
+             * init), NOT as a child of this transient boot worker — kernel_main
+             * task_exit()s right after setup, and with the "parent dies → its
+             * subtree dies" rule a caller-parented shell would be killed the
+             * instant boot finished.  Detached, it (and the GUI session it may
+             * later start) outlives the boot task. */
             struct task* shell0 =
-                task_spawn("shell", shell_provider_active()->entry);
+                task_spawn_under("shell", shell_provider_active()->entry,
+                                 task_reaper_pid());
             if (shell0) {
                 task_set_out_console(shell0, root_vc);
                 root_vc->task = shell0;

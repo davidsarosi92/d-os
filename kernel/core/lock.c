@@ -46,6 +46,49 @@
  * put back not only IF but also any flag a debugger / instrumentation
  * might have changed.
  * -------------------------------------------------------------------------- */
+/* --------------------------------------------------------------------------
+ * Deadlock observability.  A plain spinlock that spins for an absurd number of
+ * iterations is almost certainly deadlocked (on UP: a lock held by a task that
+ * was preempted, spun on from a context that can't yield — an IRQ-off critical
+ * section — so the holder never runs again).  Such a hang used to be totally
+ * silent (the box just freezes).  Now, past a threshold WAY above any legitimate
+ * contention, we emit the lock address + the caller's return address straight to
+ * the serial port — lock-free port I/O that works even with IRQs disabled — so a
+ * capture pins the exact lock + site.  We keep spinning afterwards (re-arming so
+ * it re-prints), so this only ever adds output; it never changes behaviour on a
+ * healthy system.
+ * -------------------------------------------------------------------------- */
+/* ~1–2 s of pure spinning on a slow TCG CPU — far above any legitimate UP
+ * contention (a lock held across a few quanta is ≲ tens of millions of spins),
+ * but low enough to log BEFORE the ~4 s hardware-watchdog reset fires. */
+#define SPIN_STUCK_THRESHOLD 400000000UL
+
+extern void serial_putchar(char c);
+extern void serial_write(const char* s);
+
+static void spin_serial_hex(uintptr_t v) {
+    serial_write("0x");
+    for (int i = (int)(sizeof(v) * 2) - 1; i >= 0; i--) {
+        int nyb = (int)((v >> (i * 4)) & 0xF);
+        serial_putchar(nyb < 10 ? (char)('0' + nyb) : (char)('a' + nyb - 10));
+    }
+}
+
+static inline void spin_acquire(spinlock_t* l, void* caller) {
+    unsigned long spins = 0;
+    while (!atomic_cmpxchg(&l->locked, 0, 1)) {
+        hal_cpu_pause();
+        if (++spins >= SPIN_STUCK_THRESHOLD) {
+            serial_write("\n!! SPINLOCK STUCK lock=");
+            spin_serial_hex((uintptr_t)l);
+            serial_write(" caller=");
+            spin_serial_hex((uintptr_t)caller);
+            serial_write(" — probable deadlock\n");
+            spins = 0;                       /* re-arm: keep reporting while stuck */
+        }
+    }
+}
+
 uint32_t spin_lock_irqsave(spinlock_t* l) {
     /* IRQs off on THIS CPU first — prevents the timer IRQ from yanking
      * the CPU away from us mid-lock and creating a hold time so long
@@ -53,15 +96,7 @@ uint32_t spin_lock_irqsave(spinlock_t* l) {
      * only protection we need; on SMP the cmpxchg below picks up
      * cross-CPU contention. */
     uint32_t fl = hal_intr_save();
-
-    /* Spin until we win the test-and-set.  `hal_cpu_pause` (= x86
-     * `pause`) drops the CPU out of speculation-heavy mode and avoids
-     * starving the lock holder on the other core.  M18 follow-up:
-     * exponential backoff + queued ticket lock if we ever measure
-     * pathological contention. */
-    while (!atomic_cmpxchg(&l->locked, 0, 1)) {
-        hal_cpu_pause();
-    }
+    spin_acquire(l, __builtin_return_address(0));
     return fl;
 }
 
@@ -80,9 +115,7 @@ void spin_unlock(spinlock_t* l) {
 
 void spin_lock(spinlock_t* l) {
     /* Plain acquire — see lock.h.  Caller is responsible for IRQ-off. */
-    while (!atomic_cmpxchg(&l->locked, 0, 1)) {
-        hal_cpu_pause();
-    }
+    spin_acquire(l, __builtin_return_address(0));
 }
 
 /* --------------------------------------------------------------------------

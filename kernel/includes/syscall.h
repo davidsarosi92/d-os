@@ -122,6 +122,7 @@ struct pollfd {
  * pulls the number + args out of its trapframe and calls these; they operate
  * on the current task's per-process fd table (task->fds).  fds 0/1/2 are the
  * implicit console stdin/stdout/stderr. */
+long sys_print(const char* user_str);   /* SYS_PRINT — validated user string */
 long sys_write(int fd, const void* buf, size_t n);
 long sys_read (int fd, void* buf, size_t n);
 int  sys_open (const char* path, int flags);
@@ -158,6 +159,23 @@ long sys_send (int fd, const void* buf, size_t n, int passfd);
 long sys_recv (int fd, void* buf, size_t n, int* passfd_out);
 struct pollfd;
 int  sys_poll (struct pollfd* fds, int nfds, int timeout);
+
+/* ---------------------------------------------------------------------------
+ * *_k cores — the KERNEL-pointer entry points of the handlers above.
+ *
+ * The sys_* functions gate every pointer argument as a RING-3 pointer (§1.1:
+ * a bad user pointer must return an error, never fault the kernel).  A few
+ * handlers are also called from inside the kernel with KERNEL destinations —
+ * the Linux personality fills a d-os struct and marshals it into the foreign
+ * layout itself (kstat → stat64, ktimespec → timespec, ip/port → sockaddr_in).
+ * Those callers use these ungated cores; anything reachable from ring 3 keeps
+ * going through the gated wrapper.  `kpath` is a KERNEL string — copy a user
+ * path in with copy_str_from_user first.
+ * ------------------------------------------------------------------------- */
+int  sys_stat_k(const char* kpath, struct kstat* out);
+int  sys_fstat_k(int fd, struct kstat* out);
+int  sys_clock_gettime_k(int which, struct ktimespec* out);
+long sys_recvfrom_k(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out);
 
 /* Close every user fd (>= 3) the current task opened — the exec path calls it
  * when a user program returns so open files don't leak onto the host task. */

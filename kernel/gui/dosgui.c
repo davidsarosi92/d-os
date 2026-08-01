@@ -15,7 +15,9 @@
 #include "gui.h"
 #include "task.h"
 #include "lock.h"
+#include "vmm.h"                 /* vmm_user_access_ok — validate the client px */
 #include <stddef.h>
+#include <stdint.h>
 
 /* A handful of concurrent bridge windows is plenty (one per browser). */
 #define DOSGUI_MAX      4
@@ -23,6 +25,7 @@
 
 struct dosgui_win {
     int                used;
+    int                owner_pid;   /* the ring-3 client that created it (§audit#4) */
     struct gui_window* win;
     /* Input ring (single-producer compositor, single-consumer client). */
     struct dosgui_event evq[DOSGUI_EVQ];
@@ -31,6 +34,16 @@ struct dosgui_win {
 };
 
 static struct dosgui_win g_dg[DOSGUI_MAX];
+
+/* §audit#4 — a handle may only be used by the process that created it, so one
+ * package can't blit into / poll / destroy another's window via its handle.
+ * Returns the window iff `handle` is valid AND owned by the caller, else NULL. */
+static struct dosgui_win* dosgui_owned(int handle) {
+    if (handle < 0 || handle >= DOSGUI_MAX || !g_dg[handle].used) return NULL;
+    struct task* me = task_current();
+    if (!me || g_dg[handle].owner_pid != me->pid) return NULL;
+    return &g_dg[handle];
+}
 
 /* Compositor-side input sink: translate a gui_input into a dosgui_event and
  * enqueue it (dropping the oldest if the ring is full). */
@@ -87,22 +100,36 @@ int dosgui_create(int w, int h, const char* title) {
      * gui_window_client_release), never by observing the task's death. */
     gui_window_set_client_managed(d->win, task_current() ? task_current()->pid : 0);
 
+    d->owner_pid = task_current() ? task_current()->pid : 0;
     d->used = 1;
     return handle;
 }
 
 int dosgui_present(int handle, const uint32_t* px, int w, int h, int stride) {
-    if (handle < 0 || handle >= DOSGUI_MAX || !g_dg[handle].used) return -1;
-    if (!px || w <= 0 || h <= 0) return -1;
-    /* px lives in the caller's (ring-3) address space, which is active during
-     * the syscall — gui_window_blit reads it straight through. */
-    gui_window_blit(g_dg[handle].win, 0, 0, px, w, h, stride);
+    struct dosgui_win* d = dosgui_owned(handle);      /* §audit#4 — ownership */
+    if (!d) return -1;
+    /* §audit#5 — the client controls px/w/h/stride; gui_window_blit reads
+     * [px .. px + ((h-1)*stride + w) pixels].  Bound the geometry to sane
+     * limits and VALIDATE the whole source range is mapped + user-readable in
+     * the caller's address space BEFORE the compositor reads it — otherwise an
+     * oversized stride/h reads far past the client buffer into unmapped memory
+     * (a ring-0 #PF → whole-box halt) or kernel memory (info leak). */
+    if (!px || w <= 0 || h <= 0 || stride < w) return -1;
+    if (w > 8192 || h > 8192 || stride > 16384) return -1;
+    uintptr_t bytes = ((uintptr_t)(h - 1) * (uintptr_t)stride + (uintptr_t)w)
+                      * sizeof(uint32_t);
+    if (!vmm_user_access_ok((uintptr_t)px, bytes, 0)) return -1;
+    gui_window_blit(d->win, 0, 0, px, w, h, stride);
     return 0;
 }
 
 int dosgui_poll(int handle, struct dosgui_event* out) {
-    if (handle < 0 || handle >= DOSGUI_MAX || !g_dg[handle].used || !out) return -1;
-    struct dosgui_win* d = &g_dg[handle];
+    struct dosgui_win* d = dosgui_owned(handle);      /* §audit#4 — ownership */
+    if (!d || !out) return -1;
+    /* §audit#5 — `out` is the client's ring-3 pointer we write the event into;
+     * validate it's mapped + user-WRITABLE before dereferencing (else a bad
+     * pointer faults the kernel / clobbers kernel memory). */
+    if (!vmm_user_access_ok((uintptr_t)out, sizeof(*out), 1)) return -1;
     /* Title-bar X clicked?  Report a close event so the client quits itself;
      * once its task dies the compositor disposes the window (M22.7). */
     if (d->win && gui_window_want_close(d->win)) {
@@ -121,8 +148,8 @@ int dosgui_poll(int handle, struct dosgui_event* out) {
 }
 
 void dosgui_destroy(int handle) {
-    if (handle < 0 || handle >= DOSGUI_MAX || !g_dg[handle].used) return;
-    struct dosgui_win* d = &g_dg[handle];
+    struct dosgui_win* d = dosgui_owned(handle);      /* §audit#4 — ownership */
+    if (!d) return;
     /* The client is done with the window (this is its last dosgui call, from
      * dos_finalise just before it exits).  Release it to the compositor for
      * disposal — client_release marks want_close + host_released so apply_pending

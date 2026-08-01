@@ -34,6 +34,7 @@
 #include "pmm.h"
 #include "printf.h"
 #include "kmalloc.h"
+#include "task.h"      /* task_current — COW resolves in the current space */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -141,6 +142,34 @@ uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
  * mainly so the USER bit propagates up the chain (without USER on
  * every parent, ring-3 code can't reach the PT).
  * ----------------------------------------------------------------------------- */
+/* §M46/security — is [va, va+len) fully mapped + USER-accessible in the ACTIVE
+ * address space (process CR3, live during a syscall)?  The 64-bit twin of the
+ * i386 check: walks PML4→PDPT→PD→PT via CR3, requiring P + U/S at every level
+ * (and R/W too if want_write) so a syscall can safely touch a ring-3 pointer.
+ * Every page table lives in the identity-mapped physical region. */
+int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
+    if (len == 0) return 1;
+    if (va < vmm_user_base()) return 0;
+    if (va + len < va)        return 0;                 /* overflow */
+    const uint64_t AMASK = 0x000FFFFFFFFFF000ULL;       /* phys addr bits 51:12 */
+    uint64_t cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    const int shifts[4] = { 39, 30, 21, 12 };
+    for (uintptr_t p = va & ~0xFFFUL; p < va + len; p += 0x1000) {
+        uint64_t* tbl = (uint64_t*)(uintptr_t)(cr3 & AMASK);
+        int mapped = 0;
+        for (int level = 0; level < 4; level++) {
+            uint64_t e = tbl[((unsigned)(p >> shifts[level])) & 0x1FFu];
+            if (!(e & PTE_P) || !(e & PTE_US)) return 0;
+            if (want_write && !(e & PTE_RW))   return 0;
+            if (level == 3 || (level >= 1 && (e & PTE_PS))) { mapped = 1; break; }
+            tbl = (uint64_t*)(uintptr_t)(e & AMASK);
+        }
+        if (!mapped) return 0;
+    }
+    return 1;
+}
+
 static uint64_t* walk_to_pt_root(uint64_t* root, uintptr_t virt, int create,
                                  uint32_t parent_flags) {
     uint64_t* tbl = root;
@@ -386,6 +415,21 @@ struct vmm_space* vmm_space_create(void) {
     return s;
 }
 
+/* M34/§3.1 — per-frame COW reference counts, indexed by frame number.  Mirrors
+ * the i386 table; sized for the first 1 GiB of physical memory, which is where
+ * the PMM hands out user pages on the machines we run.  A frame OUTSIDE that
+ * range is "untracked": cow_slot returns NULL and the resolver then always makes
+ * a PRIVATE COPY (never "grant write in place", which would silently hand two
+ * processes the same writable page).  Untracked frames therefore cost a little
+ * memory, never correctness. */
+#define COW_MAX_FRAMES  (1024u * 1024u * 1024u / 4096u)   /* 262144 = 512 KiB */
+static uint16_t g_cow_ref[COW_MAX_FRAMES];
+
+static uint16_t* cow_slot(uintptr_t phys) {
+    uintptr_t fn = phys >> 12;
+    return (fn < COW_MAX_FRAMES) ? &g_cow_ref[fn] : NULL;
+}
+
 /* Free the tables a space added on top of the kernel snapshot, one level
  * at a time: a table entry still equal to the kernel's is shared and left
  * alone; anything else that this space introduced is freed (deepest
@@ -405,9 +449,16 @@ static void free_subtree(uint64_t* tbl, uint64_t* ktbl, int depth) {
             pmm_free_frame((uint32_t)((uintptr_t)e & PAGE_MASK_4K));
         } else {
             /* depth 3 = PT: user pages.  Skip VMM_SHARED (borrowed) ones —
-             * their owner (e.g. a shm object) frees them. */
-            if (!(e & VMM_SHARED))
-                pmm_free_frame((uint32_t)((uintptr_t)e & PAGE_MASK_4K));
+             * their owner (e.g. a shm object) frees them.  A COW-shared frame
+             * is freed only by its LAST owner (refcount). */
+            if (e & VMM_SHARED) continue;
+            uintptr_t fphys = (uintptr_t)e & PAGE_MASK_4K;
+            if (e & VMM_COW) {
+                uint16_t* rc = cow_slot(fphys);
+                if (rc && *rc > 1) { (*rc)--; continue; }
+                if (rc) *rc = 0;
+            }
+            pmm_free_frame((uint32_t)fphys);
         }
     }
 }
@@ -419,14 +470,24 @@ void vmm_space_destroy(struct vmm_space* s) {
     kfree(s);
 }
 
-/* Recursively clone one page-table level for fork() (M34, x86_64).  EAGER copy
- * (no COW yet on x86_64 — a follow-up): kernel-shared entries (== the kernel
- * table's) and large pages are copied by pointer/value; private sub-tables are
- * cloned into fresh frames; leaf (depth 3) user pages are DEEP-COPIED into new
- * frames, except VMM_SHARED ones (shm/memfd — shared by pointer, their owner
- * frees them).  `depth`: 1=PDPT 2=PD 3=PT.  Returns the child table's phys, or
- * 0 on OOM.  Flags on each entry are preserved. */
-static uintptr_t clone_subtree(uint64_t* ptbl, uint64_t* ktbl, int depth) {
+/* Recursively clone one page-table level for fork() (M34, x86_64) — now with
+ * real COPY-ON-WRITE (§3.1 parity with i386; it used to eager-copy every page).
+ * Kernel-shared entries (== the kernel table's) and large pages are carried by
+ * value; private sub-tables are cloned into fresh frames; at the leaf (depth 3):
+ *   - VMM_SHARED (shm/memfd)      → shared verbatim, owner frees it;
+ *   - writable, or already COW    → COW: refcount++, and BOTH parent and child
+ *                                  map it read-only + VMM_COW.  (Catching the
+ *                                  already-COW case matters: a second fork must
+ *                                  re-share, not mistake it for read-only code —
+ *                                  the same bug that was fixed on i386.)
+ *   - read-only (code)            → eager private copy (cheap, rarely large).
+ * `va` is the virtual base this table covers, threaded down so the PARENT's
+ * newly read-only entries can be invalidated (its CR3 is live during fork).
+ * `depth`: 1=PDPT 2=PD 3=PT.  Returns the child table's phys, or 0 on OOM. */
+static const int shift_for_depth[4] = { 39, 30, 21, 12 };
+
+static uintptr_t clone_subtree(uint64_t* ptbl, uint64_t* ktbl, int depth,
+                               uintptr_t va) {
     uint32_t phys = pmm_alloc_frame();
     if (!phys) return 0;
     uint64_t* ntbl = (uint64_t*)(uintptr_t)phys;
@@ -436,19 +497,34 @@ static uintptr_t clone_subtree(uint64_t* ptbl, uint64_t* ktbl, int depth) {
         if (ktbl && e == ktbl[i])      { ntbl[i] = e; continue; }  /* kernel-shared */
         if (depth >= 1 && (e & PTE_PS)){ ntbl[i] = e; continue; }  /* large page */
 
+        uintptr_t entry_va = va + ((uintptr_t)i << shift_for_depth[depth]);
+
         if (depth < 3) {
             uint64_t* pchild = table_at((uintptr_t)e);
             uint64_t* kchild = (ktbl && (ktbl[i] & PTE_P) && !(ktbl[i] & PTE_PS))
                              ? table_at((uintptr_t)ktbl[i]) : NULL;
-            uintptr_t cphys = clone_subtree(pchild, kchild, depth + 1);
+            uintptr_t cphys = clone_subtree(pchild, kchild, depth + 1, entry_va);
             if (!cphys) return 0;                 /* OOM — caller unwinds via destroy */
             ntbl[i] = ((uint64_t)cphys & PAGE_MASK_4K) | (e & ~PAGE_MASK_4K);
         } else {
             /* Leaf user page. */
             if (e & VMM_SHARED) { ntbl[i] = e; continue; }
+            uintptr_t fphys_old = (uintptr_t)e & PAGE_MASK_4K;
+
+            if ((e & PTE_RW) || (e & VMM_COW)) {
+                /* → copy-on-write in BOTH spaces (read-only + VMM_COW). */
+                uint16_t* rc = cow_slot(fphys_old);
+                if (rc) *rc = (*rc == 0) ? 2 : (uint16_t)(*rc + 1);
+                uint64_t cow_e = (e & ~(uint64_t)PTE_RW) | VMM_COW;
+                ptbl[i] = cow_e;                  /* parent loses write access  */
+                ntbl[i] = cow_e;                  /* child shares it read-only  */
+                invlpg(entry_va);                 /* parent's CR3 is live NOW    */
+                continue;
+            }
+            /* Read-only (code) → eager private copy. */
             uint32_t fphys = pmm_alloc_frame();
             if (!fphys) return 0;
-            const uint8_t* src = (const uint8_t*)(uintptr_t)(e & PAGE_MASK_4K);
+            const uint8_t* src = (const uint8_t*)fphys_old;
             uint8_t* dst = (uint8_t*)(uintptr_t)fphys;
             for (int b = 0; b < 4096; b++) dst[b] = src[b];
             ntbl[i] = ((uint64_t)fphys & PAGE_MASK_4K) | (e & ~PAGE_MASK_4K);
@@ -476,7 +552,7 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     if (p0 & PTE_P) {
         uint64_t* pdpt_parent = table_at((uintptr_t)p0);
         uint64_t* pdpt_kernel = (kpml4[0] & PTE_P) ? table_at((uintptr_t)kpml4[0]) : NULL;
-        uintptr_t cphys = clone_subtree(pdpt_parent, pdpt_kernel, /*depth PDPT*/1);
+        uintptr_t cphys = clone_subtree(pdpt_parent, pdpt_kernel, /*depth PDPT*/1, 0);
         if (!cphys) { vmm_space_destroy(s); return NULL; }
         /* Preserve the parent's PML4[0] flags — crucially the US bit, which
          * walk_to_pt_root widened in when user pages were first mapped.  A
@@ -487,10 +563,51 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     return s;
 }
 
-/* No COW on x86_64 yet (fork does eager copy) — the #PF handler never invokes
- * this.  Present so the arch-generic vmm.h contract links; returns "not a COW
- * fault" so any accidental caller falls through to the fault path. */
-int vmm_cow_fault(uintptr_t fault_va) { (void)fault_va; return -1; }
+/* Resolve a copy-on-write page fault in the CURRENT address space (x86_64 twin
+ * of the i386 resolver).  Returns 1 if the fault was a COW page we privatised
+ * (the faulting instruction is simply retried), 0 if it is a real fault the
+ * caller must handle.  Walks PML4→PDPT→PD→PT of task->mm; every table is
+ * reachable through the identity map. */
+int vmm_cow_fault(uintptr_t fault_va) {
+    struct task* t = task_current();
+    if (!t || !t->mm) return 0;
+    uint64_t* pml4t = t->mm->pml4;
+    if (!pml4t) return 0;
+
+    uint64_t e = pml4t[(fault_va >> 39) & 0x1FF];
+    if (!(e & PTE_P)) return 0;
+    uint64_t* pdpt = table_at((uintptr_t)e);
+    e = pdpt[(fault_va >> 30) & 0x1FF];
+    if (!(e & PTE_P) || (e & PTE_PS)) return 0;
+    uint64_t* pd = table_at((uintptr_t)e);
+    e = pd[(fault_va >> 21) & 0x1FF];
+    if (!(e & PTE_P) || (e & PTE_PS)) return 0;
+    uint64_t* pt = table_at((uintptr_t)e);
+    unsigned pti = (unsigned)((fault_va >> 12) & 0x1FF);
+    uint64_t pte = pt[pti];
+    if (!(pte & PTE_P) || !(pte & VMM_COW)) return 0;   /* not a COW page */
+
+    uintptr_t old = (uintptr_t)pte & PAGE_MASK_4K;
+    uint16_t* rc = cow_slot(old);
+
+    if (rc && *rc <= 1) {
+        /* Last tracked sharer — grant write in place, no copy needed. */
+        pt[pti] = (pte | PTE_RW) & ~(uint64_t)VMM_COW;
+        *rc = 0;
+    } else {
+        /* Shared (or untracked → always copy, see cow_slot): private copy. */
+        uint32_t nf = pmm_alloc_frame();
+        if (!nf) return 0;                          /* OOM → treat as real fault */
+        const uint8_t* src = (const uint8_t*)old;
+        uint8_t* dst = (uint8_t*)(uintptr_t)nf;
+        for (int b = 0; b < 4096; b++) dst[b] = src[b];
+        if (rc) (*rc)--;
+        pt[pti] = ((uint64_t)nf & PAGE_MASK_4K)
+                | ((((pte & ~PAGE_MASK_4K) | PTE_RW) & ~(uint64_t)VMM_COW));
+    }
+    invlpg(fault_va & ~(uintptr_t)0xFFF);
+    return 1;
+}
 
 int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
                   uint32_t flags) {

@@ -95,6 +95,29 @@ void vmm_unmap(uintptr_t virt);
  * with the low 12 bits copied from `virt`.  Returns 0 if unmapped. */
 uintptr_t vmm_translate(uintptr_t virt);
 
+/* §M46/security — is [va, va+len) fully mapped + USER-accessible in the ACTIVE
+ * address space (the process CR3, live during a syscall)?  A syscall must gate
+ * every ring-3 pointer through this before the kernel touches it, so a bad
+ * pointer returns an error instead of faulting the kernel (freeze) or reaching
+ * kernel memory.  want_write also requires the page be writable.  Arch-specific
+ * (walks the active page tables).  See copy_from_user / copy_to_user. */
+int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write);
+
+/* Copy `len` bytes to/from a ring-3 pointer, validating it first with
+ * vmm_user_access_ok.  Return 0 on success, -1 if the user range is not safe
+ * (unmapped / kernel / wrong permission) — the caller returns -EFAULT instead
+ * of faulting the kernel.  (TOCTOU note: a concurrent thread could unmap between
+ * the check and the copy; a fault-fixup path is the full hardening — see
+ * usyscall.c.) */
+int copy_from_user(void* dst, uintptr_t user_src, uintptr_t len);
+int copy_to_user(uintptr_t user_dst, const void* src, uintptr_t len);
+
+/* Copy a NUL-terminated string from ring 3 into `dst` (≤ max, always
+ * NUL-terminated), validating page by page.  Returns the length, or -1 on a bad
+ * pointer.  An arch dispatcher uses it to turn a user path argument into a
+ * kernel string before calling a sys_*_k core (see syscall.h). */
+int copy_str_from_user(char* dst, uintptr_t user_src, uintptr_t max);
+
 /* One-line diagnostics. */
 void vmm_print_status(void);
 

@@ -74,6 +74,10 @@
 
 /* LVT bits. */
 #define LAPIC_LVT_MASKED    (1u << 16)
+/* §M31 L3 — LVT delivery mode NMI (bits 8..10 = 0b100): route an external NMI
+ * (LINT1, where the ib700 hardware watchdog / QEMU inject-nmi arrive) to vector 2
+ * so the hard-lockup NMI handler actually runs.  Left MASKED it is dropped. */
+#define LAPIC_LVT_NMI       (4u << 8)
 
 /* ICR delivery modes (bits 8..10). */
 #define LAPIC_DM_FIXED      (0u << 8)
@@ -137,7 +141,7 @@ int lapic_init_bsp(uintptr_t phys) {
      * #1 cause of "system works for 200 ms and dies" bring-up bugs. */
     lapic_w(LAPIC_REG_LVT_TIMER, LAPIC_LVT_MASKED);
     lapic_w(LAPIC_REG_LVT_LINT0, LAPIC_LVT_MASKED);
-    lapic_w(LAPIC_REG_LVT_LINT1, LAPIC_LVT_MASKED);
+    lapic_w(LAPIC_REG_LVT_LINT1, LAPIC_LVT_NMI);    /* §M31 L3 — NMI watchdog */
     lapic_w(LAPIC_REG_LVT_ERROR, LAPIC_LVT_MASKED);
 
     /* Task priority 0 = accept any vector. */
@@ -156,7 +160,7 @@ void lapic_init_ap(void) {
     lapic_w(LAPIC_REG_SIVR, LAPIC_SIVR_ENABLE | LAPIC_SIVR_SPURIOUS);
     lapic_w(LAPIC_REG_LVT_TIMER, LAPIC_LVT_MASKED);
     lapic_w(LAPIC_REG_LVT_LINT0, LAPIC_LVT_MASKED);
-    lapic_w(LAPIC_REG_LVT_LINT1, LAPIC_LVT_MASKED);
+    lapic_w(LAPIC_REG_LVT_LINT1, LAPIC_LVT_NMI);    /* §M31 L3 — NMI watchdog */
     lapic_w(LAPIC_REG_LVT_ERROR, LAPIC_LVT_MASKED);
     lapic_w(LAPIC_REG_TPR, 0);
 }

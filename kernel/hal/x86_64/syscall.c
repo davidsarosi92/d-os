@@ -90,20 +90,25 @@ void syscall_init_64(void) {
     wrmsr(MSR_FMASK, 0x47700u);
 }
 
+static void syscall_dispatch_body(struct int_frame* f);
+
+/* §1.1 — see the i386 twin: flag the task while servicing a ring-3 trap so
+ * usyscall.c gates the frame's pointer arguments as USER pointers. */
 void syscall_dispatch(struct int_frame* f) {
+    struct task* me = task_current();
+    int prev = me ? me->in_user_syscall : 0;
+    if (me) me->in_user_syscall = 1;
+    syscall_dispatch_body(f);
+    if (me) me->in_user_syscall = prev;
+}
+
+static void syscall_dispatch_body(struct int_frame* f) {
     switch (f->rax) {
-        case SYS_PRINT: {
-            /* RBX = const char* user pointer.  Walk it directly; the
-             * boot-built identity map covers the first 1 GiB of phys
-             * memory, which spans every page a user process could
-             * reference today (their pages live below 256 MiB). */
-            const char* s = (const char*)(uintptr_t)f->rbx;
-            if (s) {
-                while (*s) console_putchar(*s++);
-            }
-            f->rax = 0;
+        case SYS_PRINT:
+            /* RBX = const char* user pointer.  §1.1 — validated copy-in (see
+             * sys_print); never dereferenced in place. */
+            f->rax = (uint64_t)sys_print((const char*)(uintptr_t)f->rbx);
             return;
-        }
 
         case SYS_EXIT: {
             /* Tier B — an independent user task ends for good: close fds (still

@@ -3601,6 +3601,115 @@ x86_64/aarch64.
 
 ---
 
+### 4.37 Resilience & the ring-3 boundary (M46 + kernel audit)
+
+The design rule this milestone enforces: **nothing a user program does may take
+the machine down.**  A crash, a wedge, a bad pointer, a runaway loop — each must
+cost exactly one process.  The work came out of a full `kernel/` audit
+(`AUDIT_FINDINGS.md`), whose findings are cross-referenced below as §x.y.
+
+**1. A ring-3 fault kills the process, not the box** (`hal/x86/idt.c`,
+`hal/x86_64/idt.c`, `hal/aarch64/exceptions.c`).  Any CPU exception taken with
+`CS & 3 == 3` (x86) / `SPSR_EL1.M[3:0] == 0` (EL0) terminates the current task
+with `128 + signal` (`#DE`→SIGFPE, `#UD`→SIGILL, `#GP`/`#PF`→SIGSEGV) and
+reschedules; init reaps it and frees its address space.  Previously ANY fault
+fell through to `cli; hlt`, which killed the timer, scheduler, cursor and the
+watchdog itself on that CPU (§1.2 on ARM).  A ring-0 fault applies
+`kernel.fault_policy`: `halt` (default) / `reboot` / `kill` (terminate just the
+faulting kernel thread — best-effort, an M29 service is then restarted).
+
+**2. Force-kill of a WEDGED ring-3 task.**  A program spinning in userland never
+yields, so the cooperative `task_kill` can never land.  `task_force_kill(pid)`
+sets a forced flag that `task_force_kill_point()` acts on at the IRQ/timer exit
+path — where the interrupted task provably holds no kernel locks.  Wired on all
+three arches (i386, x86_64, aarch64).  Shell: `fkill <pid>`, `wedge` spawns a
+test hog.  Opt-in automatic reclaim: `task_set_auto_fkill(pid, ms)` +
+`package[.<name>].auto_fkill_ms` (off by default) — the watchdog force-kills a
+task that burned that much CPU with no voluntary yield (`last_yield_ms` /
+`cpu_ms_at_yield` distinguish a real hog from a merely starved task).
+
+**3. Hard-lockup detection (§M31 L3).**  `-device ib700` +
+`-action watchdog=inject-nmi`: the watchdog task pets the chip every sweep; if
+the kernel stops petting (spinning or halted with IRQs OFF — the one hang the
+task-based layers cannot see) the chip raises an **NMI**, which is delivered
+even with IRQs masked (LVT LINT1 = NMI mode, `lapic.c`).  The handler logs the
+stuck EIP/RIP lock-free to COM1, then recovers: a ring-3 lockup is force-killed
+in place and IRQs re-enabled on iret; a ring-0 or repeat lockup reboots.
+`spin_lock` also reports a probable deadlock (lock + caller address) to COM1
+after an absurd spin count, and `scripts/dos-dump.sh` dumps every vCPU's
+registers from the QEMU monitor of a frozen guest.
+
+**4. The chrome works when the app is frozen.**  Ctrl+Alt+Del (Task Manager) and
+Ctrl+Alt+X (close top app) are trapped in the raw keyboard IRQ (`ps2_keyboard.c`
+`sak_try`) BEFORE any window routing, and acted on by the compositor — never by
+the possibly-wedged app.  A package window's X button force-kills a client that
+does not respond (`gui.c` `apply_pending`), so the button always closes the
+window.  The Task Manager gained a **Force kill** button next to End task.
+
+**5. The user-pointer boundary (§1.1) — two layers.**
+   - *Gate*: while a task is inside a syscall entered from ring 3
+     (`task->in_user_syscall`, set by each arch dispatcher) every pointer
+     argument is checked with `vmm_user_access_ok()` (range + present + U/S +
+     R/W in the ACTIVE page tables).  The flag matters: the `sys_*` handlers are
+     dual-use — in-kernel callers (the shell self-tests) pass KERNEL buffers and
+     must not be gated.  Kernel-pointer arguments from a dispatcher that also
+     handles user pointers use the explicit `sys_*_k` cores.
+   - *Fault fixup*: the copies run through `uaccess_copy_in/out/str_in`
+     (`hal/<arch>/uaccess.c`), whose user-touching instructions are registered in
+     the `.ex_table` linker section.  A kernel-mode fault at such an instruction
+     resumes at its fixup (`uaccess_fixup_lookup`), so even a range that becomes
+     invalid BETWEEN the check and the copy returns `-EFAULT` instead of
+     panicking.  `faulttest` proves both layers (it calls the primitives on
+     deliberately unmapped memory).
+   Everything reachable from ring 3 was routed through this: `SYS_PRINT` (all
+   three arches — it used to walk the raw pointer), the whole `linux_abi`
+   surface (stat64/fstat/clock_gettime/gettimeofday/time, iovecs, socketcall
+   argument arrays, sockaddr, msghdr, set_thread_area, `_llseek`, waitpid
+   status, nanosleep, unlink + execve paths, the dosgui window title).
+
+**6. Cross-process integrity in the display bridge** (§2.1/§2.2, `dosgui.c`).  A
+handle now records its owner pid and every call rejects a handle it does not own
+(no blitting into, polling or destroying another package's window).
+`dosgui_present` clamps `w`/`h`/`stride` and validates the whole source range in
+the caller's address space before the compositor reads it.
+
+**7. Signals (§1.3/§1.4, `hal/x86/signal.c`).**  `sigreturn` validates the saved
+context on the untrusted user stack and restores **only** the user-settable
+EFLAGS bits (`0xCD5`: CF PF AF ZF SF DF OF) — IF/IOPL/NT/TF stay the kernel's.
+Delivery validates the user stack frame first and SIGSEGVs the process instead
+of faulting the kernel on a smashed `%esp`.  `sys_kill` (§2.3) now only lets a
+ring-3 caller signal itself or its descendants — never a kernel thread, pid 0 or
+init.
+
+**8. Process-model rule.**  A dying task takes its subtree with it (children are
+killed — ring-3 children forcibly, kernel threads cooperatively), unless a child
+set `survives_parent` (a detached daemon), in which case it is re-parented to
+init.  This is why a GUI-launched app dies with the desktop while a "Detached
+Shell" outlives it.  pid 0 and idle are excluded (pid 0's exit is just the boot
+task becoming idle — taking its subtree down would kill init).
+
+**9. Arch parity.**  x86_64 gained the force-kill safe point, the NMI handler and
+**real copy-on-write** (`vmm_space_clone` marks writable pages COW + refcounts
+them; `vmm_cow_fault` privatises on write) — it used to eager-copy every page on
+fork.  aarch64 gained the EL0-fault-kill, the `kernel.fault_policy` knob and the
+force-kill safe point.
+
+**10. Boot with more than the identity window** (`acpi/acpi.c`).  Firmware puts
+the ACPI tables at the top of low RAM, which on i386 with `-m 512M` is ABOVE the
+256 MiB identity map — the first table read was an unmapped kernel access, i.e.
+the box died during boot with no diagnostics.  `acpi_reach()` now identity-maps
+each table's pages on demand before they are dereferenced.
+
+**Shell:** `fkill`, `wedge`, `faulttest`; `/proc/watchdog` grew `runaway_events`.
+**Config:** `kernel.fault_policy` (halt|reboot|kill), `kernel.hw_watchdog`,
+`package.auto_fkill_ms`, `package.<name>.auto_fkill_ms`.
+
+**Open:** bounce buffers for the large read/write payloads handed straight to the
+VFS/socket layers (they still rely on the pre-check alone); a hardware watchdog
+on aarch64 (no ib700 on `virt`); credentials-based `sys_kill` once §M32 lands.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -3670,6 +3779,53 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 ---
 
 ## 8. Change log
+
+- **2026-08-01 — M46: resilience — a program can no longer freeze the box
+  (DOCS §4.37).**  Ring-3 faults kill just the process on all three arches;
+  force-kill reclaims a wedged ring-3 task at the timer preemption boundary
+  (`fkill`, Task Manager "Force kill", opt-in `package.auto_fkill_ms` runaway
+  policy); an ib700 hardware watchdog + NMI catches a hard lockup (IRQs-off
+  spin/halt), logs the stuck EIP and recovers or reboots; Ctrl+Alt+Del /
+  Ctrl+Alt+X are trapped in the keyboard IRQ so the chrome works while an app is
+  frozen, and a package window's X force-kills an unresponsive client.  The
+  ring-3 pointer boundary is closed in two layers — a per-syscall gate
+  (`task->in_user_syscall` + `vmm_user_access_ok`) and a real **exception table**
+  (`.ex_table` + `uaccess_*`, so a fault DURING a copy returns -EFAULT instead of
+  panicking); `faulttest` proves both.  dosgui handles are owner-bound and its
+  blits range-checked; sigreturn sanitises EFLAGS; `sys_kill` is restricted to
+  the caller's subtree.  x86_64 gained real COW + the force-kill point, aarch64
+  the EL0-fault-kill + fault policy.  ACPI tables above the identity map are now
+  mapped on demand (i386 boots with `-m 512M` again).
+  **Lesson learned (cost a full NetSurf debugging session):** the `sys_*` layer
+  is DUAL-USE — the same functions serve ring-3 dispatchers and in-kernel
+  callers.  Validating user pointers *inside* them broke every kernel caller:
+  `linux_abi`'s `fstat(fd, &kernel_kstat)` started returning -1, so musl's ld.so
+  failed `load_library()` for every `.so` ("No such file or directory") and
+  NetSurf could not start on either x86 arch — with `fdtest`/`socktest`/
+  `polltest` collateral.  A pointer check must live where the pointer's ORIGIN
+  is known: the dispatcher flags the task, and kernel-destination calls use the
+  explicit `*_k` cores.
+- **2026-08-01 — aarch64: the ARM kernel links again + parity fixes.**  The
+  third arch had drifted out of buildability while x86 features landed: the
+  shared user libc did an unguarded `movw %gs` (i386-only) and its crt0 lacked
+  the `__sig_trampoline`/`__thread_exit_tramp` symbols libc.c references; the
+  kernel source list was missing `pkg.c`/`futex.c`/`net.c`/`audio.c`/`random.c`/
+  `devfs.c` that shell.c now calls; `vmm_space_protect` (mprotect's arch half)
+  was never implemented; and the new panic-class diagnostics call
+  `serial_write`/`serial_putchar`, which had no aarch64 implementation.  Fixed
+  by arch-guarding the TLS selector load, adding the AArch64 trampolines,
+  completing the source list, implementing `vmm_space_protect` (AP[2]/UXN), and
+  forwarding the emergency-serial contract to the PL011.  The hardware-watchdog
+  entry points are now **weak no-ops** in the portable watchdog, so a board
+  without one (QEMU `virt`) links and runs with L1/L2 only — no arch #ifdef in
+  core code (convention 3).
+- **2026-08-01 — build: per-arch user/ artifact cache
+  (`build/.userartifacts/<arch>/`).**  Switching ARCH (or any `make clean`) used
+  to wipe `user/*.so|dynelf|…` and re-compile the whole NetSurf + freetype stack
+  (~25 min).  `scripts/build.sh` now parks the outgoing arch's artifacts and
+  restores the incoming arch's, so a flip is instant; the artifact PATHS stay
+  arch-agnostic (their objcopy blob symbol names derive from them).
+  `DOS_ARTIFACT_CACHE=0` opts out.
 
 - **2026-07-21 — §M42: NetSurf ported to i386 — renders in a desktop window on
   BOTH x86 arches.**  The whole browser stack was rebuilt for i386 with the

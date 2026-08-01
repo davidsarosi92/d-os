@@ -147,6 +147,37 @@ void vmm_init(void) {
 
 /* ------------------------------------------------------------------------- */
 /* Mapping operations.                                                       */
+/* §M46/security — is the user range [va, va+len) fully mapped AND user-
+ * accessible in the CURRENTLY ACTIVE address space (the process's own CR3, which
+ * is loaded during a syscall)?  This is the guard a syscall must apply before
+ * the kernel dereferences a ring-3 pointer: without it a bad pointer causes a
+ * kernel-mode #PF (→ the fault policy halts the box — a package freezing the
+ * whole system) or lets a program read/write kernel memory (the U/S bit check
+ * rejects kernel mappings).  Walks the active PD via CR3 (every PD/PT lives in
+ * the identity-mapped low region).  `want_write` also requires the R/W bit.
+ * Returns 1 if the whole range is safe, 0 otherwise. */
+int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
+    if (len == 0) return 1;
+    if (va < vmm_user_base()) return 0;             /* reject kernel/low addrs */
+    if (va + len < va)        return 0;             /* overflow */
+    uint32_t cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    uint32_t* pd = (uint32_t*)(uintptr_t)(cr3 & PAGE_MASK);
+    for (uintptr_t p = va & ~0xFFFu; p < va + len; p += 0x1000) {
+        uint32_t pde = pd[PD_IDX(p)];
+        if (!(pde & PDE_P) || !(pde & PTE_US)) return 0;     /* absent / kernel */
+        if (pde & PDE_PS) {                                   /* 4 MiB page */
+            if (want_write && !(pde & PDE_RW)) return 0;
+            continue;
+        }
+        uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
+        uint32_t pte = pt[PT_IDX(p)];
+        if (!(pte & PTE_P) || !(pte & PTE_US)) return 0;
+        if (want_write && !(pte & PTE_RW)) return 0;
+    }
+    return 1;
+}
+
 /* ------------------------------------------------------------------------- */
 
 /* Core 4 KiB map, parameterised by the target page directory.  Both the

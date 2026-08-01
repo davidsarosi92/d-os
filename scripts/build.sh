@@ -27,15 +27,64 @@ ARCH=${ARCH:-i386}
 # So after wiping them we must REBUILD them for the new arch in a SEPARATE make
 # BEFORE the `iso` make parses — otherwise the guards see them absent and the
 # feature is silently dropped from the image (browser missing / no fonts).
+#
+# PER-ARCH ARTIFACT CACHE.  Wiping on every ARCH switch meant flipping i386 ↔
+# x86_64 (or any `make clean`, which also wipes user/) re-compiled the whole
+# NetSurf + freetype stack — ~25 minutes of rebuild for artifacts that were
+# perfectly good and merely belonged to the OTHER arch.  So instead of deleting
+# them we PARK them: `build/.userartifacts/<arch>/` holds each arch's set, we
+# stash the outgoing arch's files there on a switch and restore the incoming
+# arch's.  The `user/` paths themselves stay arch-agnostic (their objcopy blob
+# symbol names derive from the path, so renaming them would ripple through the
+# kernel sources) — the cache is what makes them per-arch.  The cache lives
+# under build/ but NOT under build/<arch>, so `make clean` (which removes only
+# build/<arch>) leaves it intact; `make clean-all` drops everything, as intended.
+# Set DOS_ARTIFACT_CACHE=0 to opt out and rebuild from scratch.
+CACHE=build/.userartifacts
+ART_GLOBS='user/*.muslelf user/*.dynelf user/*.cxxelf user/*.so user/*.so.* user/*.bin user/ldmusl.so'
+
+stash_artifacts() {          # $1 = arch whose artifacts are currently in user/
+    [ "${DOS_ARTIFACT_CACHE:-1}" = 1 ] || return 0
+    mkdir -p "$CACHE/$1"
+    for f in $ART_GLOBS; do
+        if [ -e "$f" ]; then mv -f "$f" "$CACHE/$1/" 2>/dev/null || true; fi
+    done
+}
+restore_artifacts() {        # $1 = arch to restore INTO user/ (missing files only)
+    [ "${DOS_ARTIFACT_CACHE:-1}" = 1 ] || return 0
+    [ -d "$CACHE/$1" ] || return 0
+    for f in "$CACHE/$1"/*; do
+        if [ -e "$f" ] && [ ! -e "user/$(basename "$f")" ]; then
+            cp -p "$f" user/ 2>/dev/null || true
+        fi
+    done
+}
+refresh_cache() {            # $1 = arch — keep the cache in step after a build
+    [ "${DOS_ARTIFACT_CACHE:-1}" = 1 ] || return 0
+    mkdir -p "$CACHE/$1"
+    for f in $ART_GLOBS; do
+        if [ -e "$f" ]; then cp -p "$f" "$CACHE/$1/" 2>/dev/null || true; fi
+    done
+}
+
+mkdir -p build user
 STAMP=build/.last_arch
 ARCH_CHANGED=0
-if [ -f "$STAMP" ] && [ "$(cat "$STAMP" 2>/dev/null)" != "$ARCH" ]; then
-    echo "build: ARCH changed ($(cat "$STAMP") → $ARCH) — clearing shared user/ artifacts"
-    rm -f user/*.muslelf user/*.dynelf user/*.cxxelf user/*.so user/*.so.* \
-          user/ldmusl.so user/rootfs.bin 2>/dev/null || true
+PREV_ARCH=""
+[ -f "$STAMP" ] && PREV_ARCH=$(cat "$STAMP" 2>/dev/null)
+if [ -n "$PREV_ARCH" ] && [ "$PREV_ARCH" != "$ARCH" ]; then
+    echo "build: ARCH changed ($PREV_ARCH → $ARCH) — parking $PREV_ARCH user/ artifacts in $CACHE"
+    stash_artifacts "$PREV_ARCH"
     ARCH_CHANGED=1
 fi
-mkdir -p build
+# Restore whatever this arch has cached (also covers a plain `make clean`, which
+# wipes user/ but leaves the cache) — never overwrites a file already present.
+restore_artifacts "$ARCH"
+# A restored set means nothing has to be rebuilt after all.
+if [ "$ARCH_CHANGED" = 1 ] && [ -f user/netsurf.dynelf ] && [ -f user/libfreetype.so.6 ]; then
+    echo "build: restored $ARCH artifacts from the cache — no NetSurf/freetype rebuild needed"
+    ARCH_CHANGED=0
+fi
 printf '%s\n' "$ARCH" > "$STAMP"
 
 # The AArch64 cross toolchain conflicts with gcc-multilib (i386 -m32), so it
@@ -80,6 +129,10 @@ if [ "$TARGET" = iso ]; then
 fi
 
 docker run --rm --platform=linux/amd64 -v "$PWD":/src "$IMAGE" make ARCH="$ARCH" "$TARGET"
+
+# Keep this arch's cache in step with what we just built, so the NEXT ARCH
+# switch can restore it instead of recompiling the stack.
+refresh_cache "$ARCH"
 
 # Sanity: the NetSurf Start-menu entry is a static registration that shows even
 # when the browser blob is absent — so a missing binary is otherwise invisible

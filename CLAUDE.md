@@ -18,6 +18,33 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M46 — RESILIENCE / freeze-freeness (2026-08-01, DOCS §4.37, i386 + x86_64,
+aarch64 parity).**  The rule now enforced: *nothing a user program does can take
+the machine down.*  Ring-3 fault ⇒ kill only that process (all 3 arches; ring-0
+follows `kernel.fault_policy` halt|reboot|kill).  **Force-kill of a WEDGED ring-3
+task** at the timer-preemption safe point (`fkill`, Task Manager "Force kill",
+opt-in `package[.<name>].auto_fkill_ms` runaway auto-kill).  **NMI hard-lockup**
+recovery via the ib700 HW watchdog (logs the stuck EIP lock-free to COM1, kills
+a ring-3 lockup, reboots a kernel one) + spinlock-deadlock reporting +
+`scripts/dos-dump.sh` for a frozen guest.  **Chrome works while an app is
+frozen:** Ctrl+Alt+Del / Ctrl+Alt+X trapped in the keyboard IRQ, window X
+force-kills an unresponsive client.  **Ring-3 pointer boundary in two layers:**
+a per-syscall gate (`task->in_user_syscall` + `vmm_user_access_ok`) AND a real
+exception table (`.ex_table` + `uaccess_*` — a fault DURING a copy returns
+-EFAULT instead of panicking); `faulttest` proves both.  Also: dosgui handles
+owner-bound + blits range-checked, sigreturn EFLAGS sanitised, `sys_kill`
+restricted to the caller's subtree, **x86_64 real COW**, ACPI tables above the
+identity map mapped on demand (i386 boots with `-m 512M` again).
+**Two lessons worth keeping:** (1) the `sys_*` layer is DUAL-USE (ring-3
+dispatchers *and* in-kernel callers) — putting the user-pointer check inside it
+broke every kernel caller, so ld.so's `fstat` of each `.so` failed and NetSurf
+stopped starting on both x86 arches; a check belongs where the pointer's ORIGIN
+is known (`in_user_syscall` + `sys_*_k` cores).  (2) A validity CHECK is not a
+guarantee — only the exception table survives a range going bad mid-copy.
+Build: `scripts/build.sh` now keeps a **per-arch `user/` artifact cache**
+(`build/.userartifacts/<arch>/`), so an ARCH flip no longer re-compiles the
+NetSurf + freetype stack (~25 min → instant).
+
 ✅ **M1 – M20 + M18.5 + M20.5 + M18.6 + M19.5 + M21 (full ARM parity) +
 M22 – M22.7 + M27 + M28 + M25 (incl. Tier B tail) + Tier A + M29 + M30 +
 M31 + M24 (net, stages 1–3, i386) + M23 (audio, stage 1, i386) + M34 (POSIX

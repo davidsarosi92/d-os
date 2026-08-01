@@ -27,6 +27,7 @@
 #include "percpu.h"       /* this_cpu_id — TLS descriptor is per-CPU     */
 #include "vfs.h"          /* VFS_* open flags — target of the translation */
 #include "proc.h"         /* proc_fork / proc_execve                      */
+#include "vmm.h"          /* §1.1 — vmm_user_access_ok for the iovec array */
 #include "usermode.h"     /* struct user_regs (fork)                      */
 #include "dosgui.h"       /* §M42 display bridge (create/present/poll)    */
 #include <stdint.h>
@@ -92,6 +93,7 @@ extern uint32_t saved_eip;
 #define LNX_shutdown       373
 
 #define LNX_ENOSYS  38
+#define LNX_EFAULT  14
 #define LNX_ENOTTY  25
 #define LNX_ENOENT   2
 #define LNX_EINVAL  22
@@ -223,6 +225,37 @@ static void fill_stat64(struct lnx_stat64* s, const struct kstat* k) {
     s->st_ino     = s->__st_ino;
 }
 
+/* --------------------------------------------------------------------------
+ * User-pointer discipline in this dispatcher (§1.1).
+ *
+ * The portable sys_* handlers gate their own ring-3 pointers, but THIS file
+ * also marshals results into the foreign (Linux) layout: it fills a KERNEL
+ * struct and writes it out itself.  So it must (a) call the ungated sys_*_k
+ * cores with those kernel structs — passing a kernel pointer to the gated
+ * wrapper would be rejected as "not a user pointer" — and (b) validate every
+ * ring-3 destination it writes to on its own, or a bad pointer faults the
+ * kernel (→ the fault policy halts the box).  These three helpers are that
+ * discipline in one place.
+ * ------------------------------------------------------------------------ */
+static int lnx_w_ok(uintptr_t uptr, uintptr_t len) {   /* ring-3 write target */
+    return uptr && vmm_user_access_ok(uptr, len, 1);
+}
+static int lnx_r_ok(uintptr_t uptr, uintptr_t len) {   /* ring-3 read source  */
+    return uptr && vmm_user_access_ok(uptr, len, 0);
+}
+/* stat() a ring-3 path: copy the string in (validated), then run the core. */
+static int lnx_stat_upath(uintptr_t upath, struct kstat* out) {
+    char kp[256];
+    if (copy_str_from_user(kp, upath, sizeof kp) < 0) return -1;
+    return sys_stat_k(kp, out);
+}
+/* Write a kstat out as a Linux stat64 at a validated ring-3 address. */
+static int lnx_put_stat64(uintptr_t ustat, const struct kstat* k) {
+    if (!lnx_w_ok(ustat, sizeof(struct lnx_stat64))) return -1;
+    fill_stat64((struct lnx_stat64*)ustat, k);
+    return 0;
+}
+
 
 /* Linux i386 `struct user_desc` (arch/x86/include/asm/ldt.h), the argument to
  * set_thread_area.  We only consume entry_number (write-back) + base_addr; the
@@ -240,7 +273,9 @@ struct lnx_user_desc {
  * ONLY here (byte-order is a Linux-ABI concern, not an M24-stack concern). */
 static int sockaddr_to_hostorder(const struct lnx_sockaddr_in* sa,
                                  uint32_t* ip_out, int* port_out) {
-    if (!sa || sa->sin_family != AF_INET) return -1;
+    /* §1.1 — `sa` is the client's pointer; validate before reading it. */
+    if (!lnx_r_ok((uintptr_t)sa, sizeof *sa)) return -1;
+    if (sa->sin_family != AF_INET) return -1;
     const uint8_t* a = (const uint8_t*)&sa->sin_addr;   /* network order bytes */
     const uint8_t* p = (const uint8_t*)&sa->sin_port;
     *ip_out   = ((uint32_t)a[0] << 24) | ((uint32_t)a[1] << 16) |
@@ -253,7 +288,11 @@ static int sockaddr_to_hostorder(const struct lnx_sockaddr_in* sa,
  * by recvfrom to report the datagram's source.  Honours the caller's addrlen. */
 static void hostorder_to_sockaddr(struct lnx_sockaddr_in* sa, uint32_t* addrlen,
                                   uint32_t ip, int port) {
-    if (!sa) return;
+    /* §1.1 — both `sa` and the in/out `addrlen` are client pointers.  Validate
+     * addrlen first (it decides how much of `sa` we may touch), then exactly the
+     * bytes we are going to write — requiring the FULL struct would wrongly
+     * reject a caller that legitimately passed a shorter buffer. */
+    if (addrlen && !lnx_w_ok((uintptr_t)addrlen, sizeof *addrlen)) return;
     struct lnx_sockaddr_in tmp;
     tmp.sin_family = AF_INET;
     ((uint8_t*)&tmp.sin_port)[0] = (uint8_t)(port >> 8);
@@ -265,6 +304,7 @@ static void hostorder_to_sockaddr(struct lnx_sockaddr_in* sa, uint32_t* addrlen,
     for (int i = 0; i < 8; i++) tmp.sin_zero[i] = 0;
     uint32_t room = addrlen ? *addrlen : (uint32_t)sizeof tmp;
     uint32_t cnt  = room < sizeof tmp ? room : (uint32_t)sizeof tmp;
+    if (cnt && !lnx_w_ok((uintptr_t)sa, cnt)) return;
     for (uint32_t i = 0; i < cnt; i++) ((uint8_t*)sa)[i] = ((uint8_t*)&tmp)[i];
     if (addrlen) *addrlen = (uint32_t)sizeof tmp;
 }
@@ -277,10 +317,16 @@ static void hostorder_to_sockaddr(struct lnx_sockaddr_in* sa, uint32_t* addrlen,
  * silently.  MSG_TRUNC is never reported (we deliver whole datagrams). */
 static long linux_recvmsg(int fd, struct lnx_msghdr* mh, int flags) {
     (void)flags;
-    if (!mh || !mh->msg_iov || mh->msg_iovlen == 0) return -LNX_EOPNOTSUPP;
+    /* §1.1 — the msghdr itself and its iovec array are client memory. */
+    if (!lnx_w_ok((uintptr_t)mh, sizeof *mh)) return -LNX_EFAULT;
+    if (!mh->msg_iov || mh->msg_iovlen == 0) return -LNX_EOPNOTSUPP;
+    if (!lnx_r_ok((uintptr_t)mh->msg_iov, sizeof(struct lnx_iovec))) return -LNX_EFAULT;
     struct lnx_iovec* iov = &mh->msg_iov[0];
     uint32_t ip = 0; int port = 0;
-    long n = sys_recvfrom(fd, iov->iov_base, iov->iov_len, &ip, &port);
+    if (iov->iov_len && !vmm_user_access_ok((uintptr_t)iov->iov_base,
+                                            (uintptr_t)iov->iov_len, 1))
+        return -LNX_EFAULT;                     /* §1.1 — validate the client buf */
+    long n = sys_recvfrom_k(fd, iov->iov_base, iov->iov_len, &ip, &port);
     if (n < 0) return n;
     if (mh->msg_name) {
         uint32_t namelen = mh->msg_namelen;
@@ -296,12 +342,18 @@ static long linux_recvmsg(int fd, struct lnx_msghdr* mh, int flags) {
  * stream (no msg_name) rides sys_write, an explicit peer rides sys_sendto. */
 static long linux_sendmsg(int fd, const struct lnx_msghdr* mh, int flags) {
     (void)flags;
-    if (!mh || !mh->msg_iov) return -LNX_EOPNOTSUPP;
+    /* §1.1 — msghdr + iovec array + every iov_base are client pointers. */
+    if (!lnx_r_ok((uintptr_t)mh, sizeof *mh)) return -LNX_EFAULT;
+    if (!mh->msg_iov || mh->msg_iovlen > 1024) return -LNX_EOPNOTSUPP;
+    if (!lnx_r_ok((uintptr_t)mh->msg_iov,
+                  (uintptr_t)mh->msg_iovlen * sizeof(struct lnx_iovec)))
+        return -LNX_EFAULT;
     uint8_t buf[1024];
     size_t total = 0;
     for (uint32_t i = 0; i < mh->msg_iovlen; i++) {
         const struct lnx_iovec* v = &mh->msg_iov[i];
         const uint8_t* p = (const uint8_t*)v->iov_base;
+        if (v->iov_len && !lnx_r_ok((uintptr_t)p, v->iov_len)) return -LNX_EFAULT;
         for (uint32_t k = 0; k < v->iov_len && total < sizeof buf; k++)
             buf[total++] = p[k];
     }
@@ -322,6 +374,16 @@ static long linux_sendmsg(int fd, const struct lnx_msghdr* mh, int flags) {
  * (send/recv on a connected stream) rides sys_write/sys_read, which already
  * route FD_NETSOCK to the TCP engine. */
 static long linux_socketcall(int call, uint32_t* a) {
+    /* §1.1 — `a` is the client's argument ARRAY (Linux passes socket args
+     * through memory here).  Each sub-call has a fixed arg count; validate
+     * exactly that many words before touching them, so a short/bad array can
+     * neither fault the kernel nor leak adjacent memory. */
+    static const uint8_t nargs[] = {
+        0, 3, 3, 3, 2, 3, 3, 3, 4, 4, 4, 6, 6, 2, 5, 5, 3, 3
+    };
+    if (call < 0 || call >= (int)(sizeof nargs / sizeof nargs[0])) return -LNX_EINVAL;
+    if (!lnx_r_ok((uintptr_t)a, (uintptr_t)nargs[call] * sizeof(uint32_t)))
+        return -LNX_EFAULT;
     switch (call) {
         case LSOC_SOCKET: {
             int domain = (int)a[0];
@@ -366,7 +428,9 @@ static long linux_socketcall(int call, uint32_t* a) {
             struct lnx_sockaddr_in* src = (struct lnx_sockaddr_in*)a[4];
             uint32_t* addrlen = (uint32_t*)a[5];
             uint32_t ip = 0; int port = 0;
-            long n = sys_recvfrom(fd, buf, len, &ip, &port);
+            if (len && !vmm_user_access_ok((uintptr_t)buf, (uintptr_t)len, 1))
+                return -LNX_EFAULT;             /* §1.1 — validate the client buf */
+            long n = sys_recvfrom_k(fd, buf, len, &ip, &port);
             if (n >= 0 && src) hostorder_to_sockaddr(src, addrlen, ip, port);
             return n;
         }
@@ -420,6 +484,12 @@ void linux_syscall_dispatch(struct int_frame* f) {
         case LNX_writev: {
             const struct lnx_iovec* iov = (const struct lnx_iovec*)f->ecx;
             int cnt = (int)f->edx;
+            /* §1.1 — validate the iovec ARRAY (each iov_base is re-checked by
+             * sys_write); reject an out-of-range count or a bad array pointer. */
+            if (cnt < 0 || cnt > 1024 ||
+                !vmm_user_access_ok((uintptr_t)iov, (uintptr_t)cnt * sizeof(*iov), 0)) {
+                f->eax = (uint32_t)-LNX_EFAULT; return;
+            }
             long total = 0;
             for (int i = 0; i < cnt && iov; i++) {
                 long w = sys_write((int)f->ebx, iov[i].iov_base, iov[i].iov_len);
@@ -435,6 +505,10 @@ void linux_syscall_dispatch(struct int_frame* f) {
              * Read each iovec; stop on error or a short read (EOF). */
             const struct lnx_iovec* iov = (const struct lnx_iovec*)f->ecx;
             int cnt = (int)f->edx;
+            if (cnt < 0 || cnt > 1024 ||        /* §1.1 — validate iovec array */
+                !vmm_user_access_ok((uintptr_t)iov, (uintptr_t)cnt * sizeof(*iov), 0)) {
+                f->eax = (uint32_t)-LNX_EFAULT; return;
+            }
             long total = 0;
             for (int i = 0; i < cnt && iov; i++) {
                 long r = sys_read((int)f->ebx, iov[i].iov_base, iov[i].iov_len);
@@ -496,33 +570,43 @@ void linux_syscall_dispatch(struct int_frame* f) {
              * s64 tv_nsec@8.  musl on i386 (time64) routes time()/gettimeofday
              * here — without it mbedTLS's x509 date check fatals (gmtime bad). */
             struct ktimespec ts;
-            sys_clock_gettime((int)f->ebx, &ts);
+            sys_clock_gettime_k((int)f->ebx, &ts);
+            if (!lnx_w_ok(f->ecx, 16)) { f->eax = (uint32_t)-LNX_EFAULT; return; }
             uint32_t* p = (uint32_t*)f->ecx;
-            if (p) { p[0] = ts.sec; p[1] = 0; p[2] = ts.nsec; p[3] = 0; }
+            p[0] = ts.sec; p[1] = 0; p[2] = ts.nsec; p[3] = 0;
             f->eax = 0;
             return;
         }
         case LNX_clock_gettime: {
             /* 32-bit timespec { long tv_sec; long tv_nsec; }. */
             struct ktimespec ts;
-            sys_clock_gettime((int)f->ebx, &ts);
+            sys_clock_gettime_k((int)f->ebx, &ts);
+            if (!lnx_w_ok(f->ecx, 8)) { f->eax = (uint32_t)-LNX_EFAULT; return; }
             uint32_t* p = (uint32_t*)f->ecx;
-            if (p) { p[0] = ts.sec; p[1] = ts.nsec; }
+            p[0] = ts.sec; p[1] = ts.nsec;
             f->eax = 0;
             return;
         }
         case LNX_gettimeofday: {
             /* struct timeval { long tv_sec; long tv_usec; } at ebx. */
             struct ktimespec ts;
-            sys_clock_gettime(CLOCK_REALTIME, &ts);
+            sys_clock_gettime_k(CLOCK_REALTIME, &ts);
+            if (!lnx_w_ok(f->ebx, 8)) { f->eax = (uint32_t)-LNX_EFAULT; return; }
             uint32_t* p = (uint32_t*)f->ebx;
-            if (p) { p[0] = ts.sec; p[1] = ts.nsec / 1000; }
+            p[0] = ts.sec; p[1] = ts.nsec / 1000;
             f->eax = 0;
             return;
         }
         case LNX_unlink:
-            /* unlink(path=ebx) — tcc removes the output file before writing. */
-            f->eax = (uint32_t)vfs_unlink((const char*)f->ebx);
+            /* unlink(path=ebx) — tcc removes the output file before writing.
+             * §1.1 — copy the client path into the kernel before the VFS sees it. */
+            {
+                char kp[256];
+                if (copy_str_from_user(kp, f->ebx, sizeof kp) < 0) {
+                    f->eax = (uint32_t)-LNX_EFAULT; return;
+                }
+                f->eax = (uint32_t)vfs_unlink(kp);
+            }
             return;
         case LNX_lseek:
             /* lseek(fd=ebx, offset=ecx, whence=edx) → new offset. */
@@ -535,16 +619,23 @@ void linux_syscall_dispatch(struct int_frame* f) {
              * files: the low word is the offset. */
             long r = sys_lseek((int)f->ebx, (long)f->edx, (int)f->edi);
             if (r < 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
-            long long* result = (long long*)f->esi;
-            if (result) *result = (long long)r;
+            if (f->esi) {                       /* §1.1 — client result slot */
+                if (!lnx_w_ok(f->esi, sizeof(long long))) {
+                    f->eax = (uint32_t)-LNX_EFAULT; return;
+                }
+                *(long long*)f->esi = (long long)r;
+            }
             f->eax = 0;
             return;
         }
         case LNX_time: {
             /* time(time_t* t) → seconds; also writes *t if non-NULL. */
             struct ktimespec ts;
-            sys_clock_gettime(CLOCK_REALTIME, &ts);
-            if (f->ebx) *(uint32_t*)f->ebx = ts.sec;
+            sys_clock_gettime_k(CLOCK_REALTIME, &ts);
+            if (f->ebx) {
+                if (!lnx_w_ok(f->ebx, 4)) { f->eax = (uint32_t)-LNX_EFAULT; return; }
+                *(uint32_t*)f->ebx = ts.sec;
+            }
             f->eax = ts.sec;
             return;
         }
@@ -561,8 +652,8 @@ void linux_syscall_dispatch(struct int_frame* f) {
              * learn its size before mmapping it.  Translate d-os kstat → Linux
              * stat64.  (statx (383) is left ENOSYS; musl falls back to this.) */
             struct kstat k;
-            if (sys_fstat((int)f->ebx, &k) != 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
-            fill_stat64((struct lnx_stat64*)f->ecx, &k);
+            if (sys_fstat_k((int)f->ebx, &k) != 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
+            if (lnx_put_stat64(f->ecx, &k) != 0) { f->eax = (uint32_t)-LNX_EFAULT; return; }
             f->eax = 0;
             return;
         }
@@ -573,8 +664,8 @@ void linux_syscall_dispatch(struct int_frame* f) {
              * to these when statx (383) returns ENOSYS.  No symlinks, so lstat
              * == stat.  NetSurf stats its resource + font files. */
             struct kstat k;
-            if (sys_stat((const char*)f->ebx, &k) != 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
-            fill_stat64((struct lnx_stat64*)f->ecx, &k);
+            if (lnx_stat_upath(f->ebx, &k) != 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
+            if (lnx_put_stat64(f->ecx, &k) != 0) { f->eax = (uint32_t)-LNX_EFAULT; return; }
             f->eax = 0;
             return;
         }
@@ -582,8 +673,8 @@ void linux_syscall_dispatch(struct int_frame* f) {
             /* fstatat64(dirfd=ebx, path=ecx, statbuf=edx, flags=esi) — AT_FDCWD
              * only (absolute/relative-to-cwd paths, which is all NetSurf uses). */
             struct kstat k;
-            if (sys_stat((const char*)f->ecx, &k) != 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
-            fill_stat64((struct lnx_stat64*)f->edx, &k);
+            if (lnx_stat_upath(f->ecx, &k) != 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
+            if (lnx_put_stat64(f->edx, &k) != 0) { f->eax = (uint32_t)-LNX_EFAULT; return; }
             f->eax = 0;
             return;
         }
@@ -642,7 +733,10 @@ void linux_syscall_dispatch(struct int_frame* f) {
              * WEXITSTATUS() reads it correctly. */
             int code = 0;
             int pid = task_wait((int)f->ebx, &code);
-            if (f->ecx) *(int*)f->ecx = (code & 0xFF) << 8;
+            if (f->ecx) {                       /* §1.1 — client status slot */
+                if (!lnx_w_ok(f->ecx, sizeof(int))) { f->eax = (uint32_t)-LNX_EFAULT; return; }
+                *(int*)f->ecx = (code & 0xFF) << 8;
+            }
             f->eax = (uint32_t)pid;
             return;
         }
@@ -741,7 +835,9 @@ void linux_syscall_dispatch(struct int_frame* f) {
              * so entry_number = our selector >> 3 round-trips exactly. */
             struct lnx_user_desc* u = (struct lnx_user_desc*)f->ebx;
             struct task* t = task_current();
-            if (!u || !t) { f->eax = (uint32_t)-14 /*EFAULT*/; return; }
+            /* §1.1 — read base_addr from and write entry_number back to client
+             * memory: require the whole struct be user-writable. */
+            if (!t || !lnx_w_ok(f->ebx, sizeof *u)) { f->eax = (uint32_t)-LNX_EFAULT; return; }
             t->tls_base = (uintptr_t)u->base_addr;
             t->has_tls  = 1;
             task_set_affinity(t, 1u << this_cpu_id());  /* per-CPU selector */
@@ -760,8 +856,8 @@ void linux_syscall_dispatch(struct int_frame* f) {
                                    ? (const char*)f->ebx    /* readlink: path=ebx */
                                    : (const char*)f->ecx;   /* readlinkat: path=ecx */
             struct kstat k;
-            f->eax = (sys_stat(path, &k) != 0) ? (uint32_t)-LNX_ENOENT
-                                               : (uint32_t)-LNX_EINVAL;
+            f->eax = (lnx_stat_upath((uintptr_t)path, &k) != 0) ? (uint32_t)-LNX_ENOENT
+                                                                : (uint32_t)-LNX_EINVAL;
             return;
         }
         case LNX_access:
@@ -771,7 +867,7 @@ void linux_syscall_dispatch(struct int_frame* f) {
                                    ? (const char*)f->ebx    /* access: path=ebx */
                                    : (const char*)f->ecx;   /* faccessat: path=ecx */
             struct kstat k;
-            f->eax = (sys_stat(path, &k) != 0) ? (uint32_t)-LNX_ENOENT : 0;
+            f->eax = (lnx_stat_upath((uintptr_t)path, &k) != 0) ? (uint32_t)-LNX_ENOENT : 0;
             return;
         }
         case LNX_madvise:
@@ -785,8 +881,11 @@ void linux_syscall_dispatch(struct int_frame* f) {
              * starves the compositor (the desktop appears frozen).  timespec =
              * {long tv_sec; long tv_nsec}; nanosleep's req is arg0 (ebx),
              * clock_nanosleep's is arg2 (edx, after clockid + flags). */
-            const int32_t* req = (f->eax == LNX_nanosleep)
-                                   ? (const int32_t*)f->ebx : (const int32_t*)f->edx;
+            uintptr_t ureq = (f->eax == LNX_nanosleep) ? f->ebx : f->edx;
+            if (ureq && !lnx_r_ok(ureq, 2 * sizeof(int32_t))) {   /* §1.1 */
+                f->eax = (uint32_t)-LNX_EFAULT; return;
+            }
+            const int32_t* req = (const int32_t*)ureq;
             long ms = req ? ((long)req[0] * 1000 + req[1] / 1000000) : 0;
             task_msleep(ms > 0 ? (uint32_t)ms : 1u);
             f->eax = 0;
@@ -800,10 +899,14 @@ void linux_syscall_dispatch(struct int_frame* f) {
         /* §M42 display bridge — a ring-3 client (NetSurf's libnsfb "dos" surface)
          * drives a WM window.  Buffer/event pointers are in the caller's address
          * space (active now).  See kernel/gui/dosgui.c. */
-        case LNX_DOSGUI_CREATE:
-            f->eax = (uint32_t)dosgui_create((int)f->ebx, (int)f->ecx,
-                                             (const char*)f->edx);
+        case LNX_DOSGUI_CREATE: {
+            /* §1.1 — the title is a client string; copy it in before the
+             * compositor stores/draws it. */
+            char title[64];
+            if (copy_str_from_user(title, f->edx, sizeof title) < 0) title[0] = 0;
+            f->eax = (uint32_t)dosgui_create((int)f->ebx, (int)f->ecx, title);
             return;
+        }
         case LNX_DOSGUI_PRESENT:
             f->eax = (uint32_t)dosgui_present((int)f->ebx, (const uint32_t*)f->ecx,
                                               (int)f->edx, (int)f->esi, (int)f->edi);

@@ -134,7 +134,16 @@ int thread_join(int tid) { return waitpid(tid, 0); }
  * then load %gs with the returned selector so `%gs:off` reaches the block. */
 void set_tls(void* tp) {
     unsigned sel = (unsigned)syscall3(SYS_SET_TLS, (long)tp, 0, 0);
+#if defined(__i386__)
+    /* i386 only: the thread pointer lives in a GDT segment, so userland must
+     * load the selector the kernel just allocated.  On the other arches the
+     * kernel writes the thread-pointer REGISTER itself (x86_64 FS.base,
+     * aarch64 TPIDR_EL0) and there is no selector to load — the unguarded
+     * `movw %gs` here broke the aarch64 user-libc build outright. */
     __asm__ volatile ("movw %w0, %%gs" : : "r"(sel));
+#else
+    (void)sel;
+#endif
 }
 
 /* ---- POSIX breadth (M36) -------------------------------------------------- */

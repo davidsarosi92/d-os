@@ -46,6 +46,8 @@ struct tm_row {
 struct taskman {
     struct w_listview* lv;
     struct w_label*    status;
+    struct w_button*   btn_end;            /* cooperative kill (End task)      */
+    struct w_button*   btn_fkill;          /* §M46 force kill                  */
     int row_pids[WLIST_MAX_ITEMS];
     struct tm_row rows[WLIST_MAX_ITEMS];   /* M27 — tree snapshot */
     int  nrows;
@@ -177,22 +179,49 @@ static int str_eq(const char* a, const char* b) {
     return *a == 0 && *b == 0;
 }
 
-static void tm_kill(struct w_button* b, void* ctx) {
-    (void)b; (void)ctx;
-    struct taskman* tm = (struct taskman*)gui_window_ctx(tm_win);
-    if (!tm) return;
+/* Resolve the selected pid, applying the shared guards (a selection must
+ * exist; the compositor is refused — killing it would freeze the GUI).
+ * Returns the pid, or -1 after setting an explanatory status message. */
+static int tm_selected_pid(struct taskman* tm) {
     if (tm->lv->sel < 0 || tm->lv->sel >= tm->lv->count) {
         w_label_set(tm->status, "select a task first");
-        return;
+        return -1;
     }
     int pid = tm->row_pids[tm->lv->sel];
     struct task* t = task_find(pid);
     if (t && str_eq(t->name, "compositor")) {
         w_label_set(tm->status, "refusing: that would freeze the GUI");
-        return;
+        return -1;
     }
+    return pid;
+}
+
+/* "End task" — the cooperative kill (kthread contract): the victim dies at its
+ * next yield / task_should_stop() poll.  Cannot reclaim a wedged ring-3 task. */
+static void tm_kill(struct w_button* b, void* ctx) {
+    (void)b; (void)ctx;
+    struct taskman* tm = (struct taskman*)gui_window_ctx(tm_win);
+    if (!tm) return;
+    int pid = tm_selected_pid(tm);
+    if (pid < 0) return;
     if (task_kill(pid) == 0)
         w_label_set(tm->status, "flagged - dies at next yield");
+    else
+        w_label_set(tm->status, "not found or protected (pid 0 / idle)");
+    tm_refresh(tm_win);
+}
+
+/* §M46 "Force kill" — the hammer: sets the forced flag so a WEDGED ring-3 task
+ * (a frozen browser that never yields) is torn down at its next timer
+ * preemption in user mode, where task_kill's cooperative poll can never land. */
+static void tm_kill_force(struct w_button* b, void* ctx) {
+    (void)b; (void)ctx;
+    struct taskman* tm = (struct taskman*)gui_window_ctx(tm_win);
+    if (!tm) return;
+    int pid = tm_selected_pid(tm);
+    if (pid < 0) return;
+    if (task_force_kill(pid) == 0)
+        w_label_set(tm->status, "force-killed (dies at next preemption)");
     else
         w_label_set(tm->status, "not found or protected (pid 0 / idle)");
     tm_refresh(tm_win);
@@ -207,10 +236,25 @@ static void tm_layout(struct gui_window* win) {
     if (!tm || !tm->lv) return;
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
+    /* Bottom band, top → bottom: [ button row (18) ][ status label (16) ].
+     * The listview fills the rest below the header. */
+    const int BTN_H = 18, BTN_W = 100, GAP = 8;
+    int status_y = ch - 14;
+    int btn_y    = status_y - BTN_H - 4;
     tm->lv->base.x = 8;   tm->lv->base.y = 26;
     tm->lv->base.w = cw - 16;
-    tm->lv->base.h = ch - 26 - 30;
-    tm->status->base.x = 8;  tm->status->base.y = ch - 16;
+    tm->lv->base.h = (btn_y - 4) - 26;
+    if (tm->lv->base.h < 20) tm->lv->base.h = 20;
+    /* Two action buttons below the list: End task (cooperative) + Force kill. */
+    if (tm->btn_end) {
+        tm->btn_end->base.x = 8;              tm->btn_end->base.y = btn_y;
+        tm->btn_end->base.w = BTN_W;          tm->btn_end->base.h = BTN_H;
+    }
+    if (tm->btn_fkill) {
+        tm->btn_fkill->base.x = 8 + BTN_W + GAP; tm->btn_fkill->base.y = btn_y;
+        tm->btn_fkill->base.w = BTN_W;           tm->btn_fkill->base.h = BTN_H;
+    }
+    tm->status->base.x = 8;  tm->status->base.y = status_y;
     tm->status->base.w = cw - 16;
 }
 
@@ -232,10 +276,17 @@ static void taskman_open(void) {
     gui_window_set_on_close(win, tm_on_close);
 
     w_label_create(win, 8, 3, 300, "PID ST    CPU  NAME (tree)");
-    w_button_create(win, 330, 2, 100, 18, "End task", tm_kill, tm);
-    tm->lv     = w_listview_create(win, 8, 26, 440, 300, tm);
+    tm->lv     = w_listview_create(win, 8, 26, 440, 290, tm);
+    /* Two action buttons below the list (positioned by tm_layout): the
+     * cooperative "End task" and the §M46 "Force kill" hammer. */
+    tm->btn_end   = w_button_create(win, 8,   316, 100, 18, "End task",
+                                    tm_kill, tm);
+    tm->btn_fkill = w_button_create(win, 116, 316, 100, 18, "Force kill",
+                                    tm_kill_force, tm);
     tm->status = w_label_create(win, 8, 340, 440, "");
-    if (!tm->lv || !tm->status) { gui_window_close(win); return; }
+    if (!tm->lv || !tm->status || !tm->btn_end || !tm->btn_fkill) {
+        gui_window_close(win); return;
+    }
     tm->status->color = 0xFF8C9AAAu;
 
     gui_window_set_tick(win, tm_tick);

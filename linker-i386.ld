@@ -108,6 +108,19 @@ SECTIONS
         __stop_cron_jobs = .;
     }
 
+    /* §1.1 — user-access exception table.  Each entry (insn, fixup) is emitted
+     * by the inline asm in kernel/hal/<arch>/uaccess.c; the page-fault handler
+     * looks the faulting kernel EIP up here and resumes at the fixup instead of
+     * panicking, so a user pointer that goes bad DURING a copy returns -EFAULT
+     * rather than freezing the box.  KEEP() — nothing references the entries by
+     * name, they are found only through these bounds. */
+    .ex_table : ALIGN(4)
+    {
+        __start_ex_table = .;
+        KEEP(*(ex_table))
+        __stop_ex_table = .;
+    }
+
     .data BLOCK(4K) : ALIGN(4K)
     {
         *(.data)

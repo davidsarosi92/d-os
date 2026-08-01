@@ -38,6 +38,9 @@ void config_init(void);
  * not modify or free) or `default_value` if no entry exists. */
 const char* config_get(const char* key, const char* default_value);
 
+/* Parse a config value as a base-10 integer (missing/invalid → `def`). */
+long config_get_long(const char* key, long def);
+
 /* Set or replace a key.  Strings are copied (cache owns them). */
 int  config_set(const char* key, const char* value);
 

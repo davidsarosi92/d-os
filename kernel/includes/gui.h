@@ -50,6 +50,11 @@ int  gui_desktop_pid(void);
 struct gui_app_def;
 void gui_queue_launch(const struct gui_app_def* app);
 
+/* §M46 secure-attention key (Ctrl+Alt+X): request the compositor close/force the
+ * top-most app window.  Safe to call from the keyboard IRQ (single volatile
+ * store); the compositor — never the frozen app — performs the close. */
+void gui_request_close_last(void);
+
 /* Create a terminal window (spawns a shell task on it).  Outer
  * geometry in pixels, including decorations.  M22.7 — the shell is a child
  * of the desktop SESSION (a kill_tree of the desktop takes it with it). */
