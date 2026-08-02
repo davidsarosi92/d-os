@@ -59,10 +59,16 @@
  * it re-prints), so this only ever adds output; it never changes behaviour on a
  * healthy system.
  * -------------------------------------------------------------------------- */
-/* ~1–2 s of pure spinning on a slow TCG CPU — far above any legitimate UP
- * contention (a lock held across a few quanta is ≲ tens of millions of spins),
- * but low enough to log BEFORE the ~4 s hardware-watchdog reset fires. */
-#define SPIN_STUCK_THRESHOLD 400000000UL
+/* The threshold has ONE hard requirement: it must fire before the ~4 s hardware
+ * watchdog resets the box, or the most useful message in the system never gets
+ * printed.  400000000 was calibrated on i386 and MISSED that deadline on
+ * x86_64 (slower per-iteration under TCG): a real GUI deadlock rebooted the
+ * machine with `SPINLOCK STUCK` never appearing, which is exactly the "it just
+ * froze and restarted" experience this detector exists to explain.  Measured
+ * 2026-08-02: at 20000000 the report lands well inside the watchdog window on
+ * x86_64, and a false positive costs only a log line (we keep spinning either
+ * way — the detector never changes behaviour). */
+#define SPIN_STUCK_THRESHOLD 20000000UL
 
 extern void serial_putchar(char c);
 extern void serial_write(const char* s);
