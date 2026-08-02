@@ -79,7 +79,8 @@
 #include "smp.h"
 #include "timer.h"          /* M22.3: per-task CPU-time accounting */
 #include "vmm.h"            /* M25: per-process address-space switch */
-#include "waitq.h"          /* Tier A.1: block/wake wait-queue primitive */
+#include "waitq.h"
+#include "crash.h"      /* §M47 — record a forced kill */          /* Tier A.1: block/wake wait-queue primitive */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -790,6 +791,11 @@ void task_force_kill_point(int from_user) {
     if (!from_user) return;
     struct task* self = task_current();
     if (self && self->kill_forced && !self->is_idle && self->state != TASK_DEAD) {
+        /* §M47 — a task reclaimed by force is a failure worth reporting: from
+         * the user's side the app "stopped responding", and they should be able
+         * to see that afterwards rather than just watching it vanish. */
+        crash_report(CRASH_FORCED_KILL, self->pid, self->name, 0, 0, 137,
+                     "unresponsive task reclaimed by force");
         task_exit_code(137);                 /* 128 + SIGKILL, conventional */
     }
 }

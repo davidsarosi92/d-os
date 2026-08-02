@@ -12,6 +12,7 @@
  * ============================================================================= */
 
 #include "hal_api.h"
+#include "hal.h"         /* inb/outb — CMOS NVRAM scratch (§M47) */
 #include "gdt.h"
 #include "idt.h"
 #include "tss.h"
@@ -162,4 +163,35 @@ const char* hal_arch_name(void) { return "i386"; }
  * protected mode; a 64-bit image is not merely unsupported, it is unrunnable. */
 int hal_elf_can_exec(unsigned cls, unsigned machine) {
     return cls == 1 /*ELFCLASS32*/ && machine == 3 /*EM_386*/;
+}
+
+/* ---------------------------------------------------------------------------
+ * NVRAM scratch (§M47) — the battery-backed CMOS bytes behind the RTC.
+ *
+ * Indices 0x0E..0x7F are general-purpose RAM on an MC146818; the BIOS uses the
+ * low part for its own configuration + checksum, so callers should stay in the
+ * upper region.  We do not touch the BIOS checksum, which means a machine that
+ * validates it may complain about "CMOS settings" — acceptable for a scratch
+ * byte whose whole job is to survive events nothing else can.
+ *
+ * NMI note: bit 7 of port 0x70 disables NMI while set.  We deliberately keep it
+ * CLEAR so the hardware watchdog's NMI (§M31 L3) is never masked by a crash
+ * bookkeeping write — masking the lockup detector inside the crash reporter
+ * would be a fine way to lose exactly the events we are trying to record.
+ * --------------------------------------------------------------------------- */
+#define CMOS_INDEX_PORT 0x70
+#define CMOS_DATA_PORT  0x71
+
+int hal_nvram_read(unsigned idx, uint8_t* out) {
+    if (!out || idx > 0x7F) return 0;
+    outb(CMOS_INDEX_PORT, (uint8_t)(idx & 0x7F));
+    *out = inb(CMOS_DATA_PORT);
+    return 1;
+}
+
+int hal_nvram_write(unsigned idx, uint8_t val) {
+    if (idx > 0x7F) return 0;
+    outb(CMOS_INDEX_PORT, (uint8_t)(idx & 0x7F));
+    outb(CMOS_DATA_PORT, val);
+    return 1;
 }

@@ -1004,6 +1004,25 @@ in parallel with BSP."
   hog and idle every quantum, killing throughput.  Fix:
   `pick_next_locked` skips `is_idle` tasks; only the no-work
   fallback path picks idle.
+- *(added 2026-08-02)*  **The guarantee "a bad program cannot take the
+  box down" needs TWO things, and M46 only had one.**  M46 made every
+  fault handler kill just the process — but it assumed the handler
+  RUNS.  The x86_64 SMP crash proved otherwise: with TR = 0 on the AP
+  there was no stack to deliver the trap on, so the machine triple-
+  faulted with no message, no log line, nothing.  Two consequences now
+  baked in: (1) per-CPU bring-up state is part of the safety story, not
+  just of correctness (see the control-register lesson below); (2) a
+  system that can die without saying anything needs an out-of-band
+  marker — hence §M47's NVRAM unclean-shutdown flag, which is the only
+  channel through which such an event can ever reach the user.
+- *(added 2026-08-02)*  **Capture and delivery of a crash report have
+  opposite constraints, so they must be separate phases.**  Capture
+  happens in the worst context in the system (exception/NMI, IRQs off,
+  possibly a broken stack) and may not allocate, lock or format —
+  taking a lock there can deadlock against the very fault being
+  recorded.  Delivery can do all of that, from an ordinary task.  Once
+  split, adding a popup / file / network reporter is just registering
+  a sink, and no fault path is ever touched again.
 - *(added 2026-08-01)*  **A loader that accepts a foreign binary is not
   being permissive, it is deferring the error.**  `elf_load_ex` took
   any ELF class and ignored `e_machine`; a wrong-arch image mapped

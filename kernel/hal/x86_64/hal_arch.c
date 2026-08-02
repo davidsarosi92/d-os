@@ -17,6 +17,7 @@
  * ============================================================================= */
 
 #include "hal_api.h"
+#include "hal.h"         /* inb/outb — CMOS NVRAM scratch (§M47) */
 #include "gdt.h"
 #include "idt.h"
 #include "tss.h"
@@ -166,4 +167,26 @@ const char* hal_arch_name(void) { return "x86_64"; }
  * hal_api.h: this function is the single place that changes when they land. */
 int hal_elf_can_exec(unsigned cls, unsigned machine) {
     return cls == 2 /*ELFCLASS64*/ && machine == 62 /*EM_X86_64*/;
+}
+
+/* ---------------------------------------------------------------------------
+ * NVRAM scratch (§M47) — battery-backed CMOS bytes behind the RTC.  Identical
+ * to the i386 twin; see kernel/hal/x86/hal_arch.c for why bit 7 of the index
+ * port (the NMI mask) is deliberately left clear.
+ * --------------------------------------------------------------------------- */
+#define CMOS_INDEX_PORT 0x70
+#define CMOS_DATA_PORT  0x71
+
+int hal_nvram_read(unsigned idx, uint8_t* out) {
+    if (!out || idx > 0x7F) return 0;
+    outb(CMOS_INDEX_PORT, (uint8_t)(idx & 0x7F));
+    *out = inb(CMOS_DATA_PORT);
+    return 1;
+}
+
+int hal_nvram_write(unsigned idx, uint8_t val) {
+    if (idx > 0x7F) return 0;
+    outb(CMOS_INDEX_PORT, (uint8_t)(idx & 0x7F));
+    outb(CMOS_DATA_PORT, val);
+    return 1;
 }

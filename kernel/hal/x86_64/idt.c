@@ -24,6 +24,7 @@
 #include "gdt.h"
 #include "syscall.h"
 #include "task.h"
+#include "crash.h"      /* §M47 — record every fault */
 #include "lapic.h"
 #include "ioapic.h"
 #include "pci.h"
@@ -349,12 +350,22 @@ void isr_handler(struct int_frame* f) {
                     (unsigned)f->int_no, exception_name[f->int_no], t->pid, t->name,
                     (unsigned long)f->cs, (void*)(uintptr_t)f->rip,
                     (unsigned long)f->err_code);
+            /* §M47 — record it for the reporting sinks (see the i386 twin). */
+            crash_report(CRASH_USER_FAULT, t->pid, t->name,
+                         (uintptr_t)f->rip, 0, sig, exception_name[f->int_no]);
             task_exit_code(128 + sig);   /* noreturn */
         }
         kprintf("\n!! EXCEPTION %u (%s) at cs:rip=%lx:%p err=%lx\n",
                 (unsigned)f->int_no, exception_name[f->int_no],
                 (unsigned long)f->cs, (void*)(uintptr_t)f->rip,
                 (unsigned long)f->err_code);
+        /* §M47 — capture BEFORE the policy: halt and reboot both never return. */
+        {
+            struct task* ct = task_current();
+            crash_report(CRASH_KERNEL_FAULT, ct ? ct->pid : -1,
+                         ct ? ct->name : "kernel", (uintptr_t)f->rip, 0,
+                         fault_signal((int)f->int_no), exception_name[f->int_no]);
+        }
         ring0_fault_policy(fault_signal((int)f->int_no));
     }
 

@@ -27,6 +27,7 @@
  * ============================================================================= */
 
 #include "lock.h"
+#include "crash.h"      /* §M47 — record a probable deadlock */
 #include "hal_api.h"
 #include "atomic.h"
 #include "percpu.h"
@@ -84,6 +85,11 @@ static inline void spin_acquire(spinlock_t* l, void* caller) {
             serial_write(" caller=");
             spin_serial_hex((uintptr_t)caller);
             serial_write(" — probable deadlock\n");
+            /* §M47 — also record it.  The serial line above is lock-free and
+             * always works; the record is what a GUI/file/network sink can
+             * surface to the user later. */
+            crash_report(CRASH_DEADLOCK, -1, "spinlock", (uintptr_t)caller,
+                         (uintptr_t)l, 0, "spinlock spun past the sanity limit");
             spins = 0;                       /* re-arm: keep reporting while stuck */
         }
     }

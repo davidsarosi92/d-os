@@ -470,6 +470,7 @@ CORE_C_SRCS := \
     kernel/core/proc.c \
     kernel/core/usyscall.c \
     kernel/core/uaccess.c \
+      kernel/core/crash.c \
     kernel/core/fd.c \
     kernel/core/usock.c \
     kernel/core/service.c \
@@ -554,6 +555,7 @@ CORE_C_SRCS := \
     kernel/core/proc.c \
     kernel/core/usyscall.c \
     kernel/core/uaccess.c \
+      kernel/core/crash.c \
     kernel/core/pkg.c \
     kernel/core/futex.c \
     kernel/core/net.c \
@@ -629,6 +631,7 @@ CORE_C_SRCS := \
     kernel/core/proc.c \
     kernel/core/usyscall.c \
     kernel/core/uaccess.c \
+      kernel/core/crash.c \
     kernel/core/fd.c \
     kernel/core/usock.c \
     kernel/core/service.c \

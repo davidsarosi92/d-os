@@ -16,7 +16,8 @@
 
 #include <stdint.h>
 #include "uaccess.h"      /* §1.1 — fault-fixup table for EL0 memory copies */
-#include "task.h"         /* §M46 — force-kill safe point + fault-policy kill */
+#include "task.h"
+#include "crash.h"      /* §M47 — record every fault */
 
 /* Matches the trapframe laid down by exceptions.S (17 register-pairs). */
 struct trapframe {
@@ -70,6 +71,14 @@ static void dump_and_halt(const char* what, struct trapframe* tf) {
     uart_early_puthex(tf->x[1]); uart_early_puts(" ");
     uart_early_puthex(tf->x[2]); uart_early_puts(" ");
     uart_early_puthex(tf->x[3]);
+    /* §M47 — record it BEFORE applying the policy: halt and reboot both never
+     * return, so a record written afterwards would never exist. */
+    {
+        struct task* ct = task_current();
+        crash_report(CRASH_KERNEL_FAULT, ct ? ct->pid : -1,
+                     ct ? ct->name : "kernel",
+                     (uintptr_t)tf->elr, (uintptr_t)far, 11, what);
+    }
     /* §3.1 — ring-0 (EL1) fault policy parity with x86: kernel.fault_policy=reboot
      * restarts the machine (PSCI) instead of halting forever.  Default = halt. */
     {
@@ -145,6 +154,12 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                 uart_early_puthex(tf->elr);
                 uart_early_puts(" far="); uart_early_puthex(far);
                 uart_early_puts(" — killing process\n");
+                {   /* §M47 — record it for the reporting sinks. */
+                    struct task* ct = task_current();
+                    crash_report(CRASH_USER_FAULT, ct ? ct->pid : -1,
+                                 ct ? ct->name : "?", (uintptr_t)tf->elr,
+                                 (uintptr_t)far, 11, "EL0 synchronous exception");
+                }
                 task_exit_code(139);          /* 128 + SIGSEGV */
             }
             dump_and_halt("synchronous", tf);

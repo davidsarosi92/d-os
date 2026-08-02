@@ -22,6 +22,7 @@
 #include "gdt.h"
 #include "syscall.h"
 #include "task.h"
+#include "crash.h"      /* §M47 — record every fault */
 #include "vmm.h"
 #include "lapic.h"
 #include "ioapic.h"
@@ -362,6 +363,14 @@ void isr_handler(struct int_frame* f) {
         extern volatile uint32_t g_nmi_lockups;
         g_nmi_lockups++;
         struct task* cur = task_current();
+        /* §M47 — a hard lockup is precisely the failure the user would
+         * otherwise experience as "it just froze": record it so the reason
+         * survives the recovery (kill or reboot). */
+        crash_report(CRASH_HARD_LOCKUP, cur ? cur->pid : -1,
+                     cur ? cur->name : "?", (uintptr_t)f->eip, 0,
+                     (int)((f->cs & 3) == 3),
+                     ((f->cs & 3) == 3) ? "NMI lockup in ring 3"
+                                        : "NMI lockup in the kernel");
         serial_write("\n!! NMI HARD-LOCKUP eip=");
         ser_hex(f->eip);
         serial_write(" cs="); ser_hex(f->cs);
@@ -437,6 +446,11 @@ void isr_handler(struct int_frame* f) {
                     "cs:eip=%x:%p err=%x cr2=%p — killing process\n",
                     f->int_no, exception_name[f->int_no], t->pid, t->name,
                     f->cs, (void*)f->eip, f->err_code, (void*)_cr2);
+            /* §M47 — record it so the user can be told, now or later, by
+             * whatever reporting sink happens to be armed. */
+            crash_report(CRASH_USER_FAULT, t->pid, t->name,
+                         (uintptr_t)f->eip, (uintptr_t)_cr2, sig,
+                         exception_name[f->int_no]);
             task_exit_code(128 + sig);   /* noreturn: reschedules; reaper frees mm */
         }
 
@@ -445,6 +459,18 @@ void isr_handler(struct int_frame* f) {
         kprintf("\n!! EXCEPTION %d (%s) at cs:eip=%x:%p err=%x cr2=%p\n",
                 f->int_no, exception_name[f->int_no],
                 f->cs, (void*)f->eip, f->err_code, (void*)_cr2);
+        /* §M47 — capture BEFORE applying the policy: halt and reboot both mean
+         * this function never returns, so a record written afterwards would
+         * never exist.  On the reboot path the marker in NVRAM is what carries
+         * the news across; on the halt path the record is in the ring for
+         * whoever inspects the frozen guest. */
+        {
+            struct task* ct = task_current();
+            crash_report(CRASH_KERNEL_FAULT, ct ? ct->pid : -1,
+                         ct ? ct->name : "kernel",
+                         (uintptr_t)f->eip, (uintptr_t)_cr2,
+                         fault_signal((int)f->int_no), exception_name[f->int_no]);
+        }
         ring0_fault_policy(fault_signal((int)f->int_no));
     }
 

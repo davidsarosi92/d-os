@@ -3783,6 +3783,51 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-08-02 — §M47 stage 1: crash records + pluggable reporting sinks.**
+  The standing requirement is that a faulty program must never take the machine
+  down — and that when something *does* go wrong, the system says so instead of
+  the event existing only as a line on a serial console nobody was watching.
+  M46 delivered the first half wherever a fault handler still runs.  This adds
+  the reporting half, built so that ANY notification mechanism can be armed
+  later without touching a fault path again.
+  **Two phases, deliberately separated,** because they have opposite
+  constraints.  *Capture* (`crash_report`) runs in the worst context in the
+  system — inside an exception or NMI handler, IRQs off, possibly on a broken
+  stack — so it only copies a fixed-size record into a static ring and bumps a
+  counter: no allocation, no locks, no formatting, no I/O.  A lock there could
+  deadlock against the very fault being recorded, so a simultaneous double
+  report may overwrite a slot; losing one record beats hanging.  *Delivery*
+  (`crash_drain`, called from the watchdog sweep task) runs in ordinary context,
+  where a sink may allocate, block, open a file or draw a window.  That split is
+  the whole design: a GUI popup sink is ordinary GUI code precisely because it
+  never runs in fault context.
+  Sinks register with `CRASH_SINK()` (linker section, same pattern as
+  `DRIVER()`/`SERVICE()`); the built-in klog sink is always present so nothing
+  goes unrecorded even before any richer reporter exists.  Wired in: ring-3
+  faults, ring-0 faults (captured BEFORE the policy runs, since halt and reboot
+  both never return), NMI hard lockups, watchdog task hangs, spinlock deadlocks
+  and forced kills — on i386, x86_64 and aarch64.  Surfaced by the new `crash`
+  command.
+  **The failure this cannot capture, and the answer to it.**  A triple fault, a
+  hardware reset or a power loss resets the CPU with no handler running at all —
+  by definition nothing in the guest can log it.  That case is covered from the
+  other side: `crash_boot_begin` arms a marker in battery-backed CMOS NVRAM
+  (new HAL contract `hal_nvram_read/write`) and `crash_boot_clean` disarms it on
+  an orderly shutdown, so finding it still armed means the previous boot died
+  where nothing could report it.  NVRAM rather than a file on purpose: the
+  marker must survive exactly the events during which no filesystem write can be
+  trusted.  aarch64 on QEMU `virt` has no such storage and says so out loud
+  rather than silently concluding every boot was clean.
+  Verified on i386 and x86_64 by causing both kinds of event: `wedge` + `fkill`
+  produces a `forced-kill` record (klog line + `crash` listing), and a
+  `system_reset` issued from the QEMU monitor — an event no in-guest code can
+  log — is reported on the next boot as *"previous boot ended without a clean
+  shutdown"*.  Regression: `faulttest`, `fputest`, `archtest`, `fdtest`,
+  `solibtest`, `musltest` green on both arches at `-smp 2`.
+  **Still open (stage 2):** `/proc/crash`; a GUI popup sink; persisting records
+  to a file so they survive to the next boot (the NVRAM marker carries only the
+  fact, not the detail); crash reasons for the reset path.
+
 - **2026-08-01 — Architecture identity: the ELF loader, the store and `uname`
   all know what machine this is.**  Three related gaps, all of which showed up
   as confusing multi-arch failures rather than clear errors:

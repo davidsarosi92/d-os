@@ -85,6 +85,18 @@ SECTIONS
         __stop_services = .;
     }
 
+    /* Crash-sink registry (§M47) — CRASH_SINK() drops a `struct crash_sink`
+     * here; crash_drain() walks it to deliver each record.  Same KEEP() +
+     * ALIGN(4) discipline as the driver/service registries: KEEP is required
+     * because nothing REFERENCES these objects by name, so --gc-sections would
+     * otherwise drop every crash reporter in the build. */
+    .crashsinks : ALIGN(4)
+    {
+        __start_crashsinks = .;
+        KEEP(*(crashsinks))
+        __stop_crashsinks = .;
+    }
+
     /* Service-bus provider + adapter registries (M29) — BUS_PROVIDER() and
      * BUS_ADAPTER() entries; the broker walks them at bind time. */
     .bus_providers : ALIGN(4)

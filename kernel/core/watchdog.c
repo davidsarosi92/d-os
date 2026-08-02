@@ -14,6 +14,7 @@
  * ============================================================================= */
 
 #include "watchdog.h"
+#include "crash.h"      /* §M47 — record a hung task */
 #include "task.h"
 #include "lock.h"
 #include "klog.h"
@@ -138,6 +139,8 @@ static void sweep_heartbeats(void) {
             klog(KLOG_ERR, "watchdog",
                  "task '%s' (pid %d) missed heartbeat (%ums > %ums) — killing tree\n",
                  t->name, pid, (unsigned)(now - last), (unsigned)timeout);
+            crash_report(CRASH_TASK_HANG, pid, t->name, 0, 0,
+                         (int)(now - last), "missed its watchdog heartbeat");
             uint32_t f3 = spin_lock_irqsave(&wd_lock);
             if (wd[i].pid == pid) wd[i].hung_reported = 1;
             spin_unlock_irqrestore(&wd_lock, f3);
@@ -222,6 +225,11 @@ static void watchdog_entry(void) {
         task_msleep(WD_SWEEP_MS);
         if (hw) hw_watchdog_pet();
         sweep_heartbeats();
+        /* §M47 — deliver captured crash records to their sinks.  Done HERE, on
+         * an ordinary task, because a sink may allocate, block, open a file or
+         * draw a window — none of which is legal in the fault context that
+         * captured the record.  See the two-phase note in crash.h. */
+        crash_drain();
         sweep_softlockup();
         sweep_runaway();
     }

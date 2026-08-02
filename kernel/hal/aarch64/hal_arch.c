@@ -135,3 +135,13 @@ const char* hal_arch_name(void) { return "aarch64"; }
 int hal_elf_can_exec(unsigned cls, unsigned machine) {
     return cls == 2 /*ELFCLASS64*/ && machine == 183 /*EM_AARCH64*/;
 }
+
+/* NVRAM scratch (§M47) — QEMU `virt` exposes no battery-backed scratch RAM
+ * (the PL031 RTC has no NVRAM behind it), so we report "unavailable" rather
+ * than faking success.  The caller (crash.c) then says out loud that
+ * unclean-shutdown detection is off on this platform instead of quietly
+ * concluding that every boot was clean — a silent false "all fine" would be
+ * worse than no feature at all.  A board with real NVRAM (or a reserved
+ * always-on RAM region) fills these in. */
+int hal_nvram_read(unsigned idx, uint8_t* out) { (void)idx; (void)out; return 0; }
+int hal_nvram_write(unsigned idx, uint8_t val) { (void)idx; (void)val; return 0; }

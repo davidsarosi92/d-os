@@ -240,4 +240,21 @@ const char* hal_arch_name(void);
  * changes. */
 int hal_elf_can_exec(unsigned cls, unsigned machine);
 
+/* ---------------------------------------------------------------------------
+ * Small non-volatile scratch (§M47).
+ *
+ * A handful of bytes that survive a RESET — including the resets nothing can be
+ * logged through: a triple fault, a hardware reset, a power loss.  That is the
+ * entire point: an "unclean shutdown" marker written here is the only way such
+ * an event can ever be reported to the user, because by definition no code runs
+ * at the moment it happens (see crash.h).
+ *
+ * x86 uses the battery-backed CMOS NVRAM behind the RTC.  Return 0 from both if
+ * the platform has none — the caller then loses this one capability and says
+ * so, rather than silently believing every boot was clean.
+ * `idx` is a small byte index; the caller owns its own slot allocation.
+ * ------------------------------------------------------------------------- */
+int hal_nvram_read(unsigned idx, uint8_t* out);   /* 1 = read, 0 = unavailable */
+int hal_nvram_write(unsigned idx, uint8_t val);   /* 1 = written               */
+
 #endif

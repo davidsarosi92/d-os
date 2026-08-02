@@ -62,6 +62,7 @@
 #include "block_cache.h"
 #include "block.h"
 #include "config.h"
+#include "crash.h"     /* §M47 — unclean-shutdown marker */
 #include "task.h"
 #include "proc.h"                /* proc_exec_elf — x86_64 musl boot self-test */
 #include "pkg.h"                 /* pkg_init — provision ld.so for the x86_64 test hook */
@@ -136,6 +137,12 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     /* Configuration store: defaults + overlay from /etc/d-os.conf if
      * present.  Must run after the fs is mounted (module_init_all). */
     config_init();
+
+    /* §M47 — arm the unclean-shutdown marker, and report if the PREVIOUS boot
+     * never cleared it.  Must come after config (so the report is loggable) but
+     * as early as possible: a crash between here and the marker being armed is
+     * the one window this cannot cover. */
+    crash_boot_begin();
 
     /* Keyboard layout (M16) — reads `keyboard.layout` from config and
      * activates one of the built-in layouts (us, hu).  Must run after

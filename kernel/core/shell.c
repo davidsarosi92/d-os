@@ -45,6 +45,7 @@
 #include "basic.h"
 #include "klog.h"
 #include "elf.h"
+#include "crash.h"     /* §M47 — the `crash` report list */
 #include "proc.h"
 #include "syscall.h"
 #include "fd.h"
@@ -125,7 +126,7 @@ static void cmd_help(void) {
                   "  ringtest, ps, spawn, yield, loop, kill <pid>, fkill <pid>\n"
                   "  wedge (runaway ring-3 task), faulttest (bad user pointers)\n"
                   "  fputest (per-task FP/SIMD register file)\n"
-                  "  archtest (ELF arch gate)\n"
+                  "  archtest (ELF arch gate), crash (what has gone wrong)\n"
                   "  pane, pane split horizontal|vertical\n"
                   "  gui (compositor + desktop), gui stats, launch [app]\n"
                   "  run <path.bas> (Tiny-BASIC)\n"
@@ -404,6 +405,33 @@ static void cmd_faulttest(void) {
     console_write("faulttest: the box is still running — that IS the test.\n");
 }
 
+
+/* ---------------------------------------------------------------------------
+ * `crash` — what has gone wrong on this machine (§M47).
+ *
+ * Every fault, lockup, hang, forced kill and unclean shutdown lands in the
+ * crash ring; this prints it newest-first.  The point is that a user who saw
+ * something misbehave can find out WHAT afterwards, instead of the event
+ * existing only as a line that scrolled past on a serial console they were not
+ * watching.
+ * --------------------------------------------------------------------------- */
+static void cmd_crash(void) {
+    int n = crash_count();
+    if (n == 0) {
+        console_write("crash: no crashes recorded on this boot\n");
+        return;
+    }
+    kprintf("%d crash record(s), newest first:\n", n);
+    kprintf("  UPTIME    KIND          CPU  PID  NAME              DETAIL\n");
+    for (int i = 0; i < n; i++) {
+        const struct crash_record* r = crash_at(i);
+        if (!r) break;
+        kprintf("  %us  %s  %u  %d  %s  pc=%p addr=%p code=%d %s\n",
+                (unsigned)(r->ms / 1000), crash_kind_name(r->kind),
+                (unsigned)r->cpu, r->pid, r->comm,
+                (void*)r->pc, (void*)r->addr, r->code, r->what);
+    }
+}
 /* ---------------------------------------------------------------------------
  * `archtest` — prove the ELF loader refuses a FOREIGN-architecture image.
  *
@@ -2530,6 +2558,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "faulttest"))     { cmd_faulttest(); return; }
     if (streq(line, "fputest"))       { cmd_fputest(); return; }
     if (streq(line, "archtest"))      { cmd_archtest(); return; }
+    if (streq(line, "crash"))         { cmd_crash(); return; }
     if (streq(line, "wdtest"))         { cmd_wdtest(); return; }
     if (streq(line, "cron"))           { cmd_cron("");         return; }
     if (starts_with(line, "cron "))    { cmd_cron(line + 5);   return; }
@@ -2593,11 +2622,13 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "echo"))   { console_putchar('\n'); return; }   /* bare `echo` */
     if (streq(line, "shutdown")) {
         console_write("shutting down...\n");
+        crash_boot_clean();     /* §M47 — an orderly exit: disarm the marker */
         hal_shutdown();                                 /* normally never returns */
         return;
     }
     if (streq(line, "reboot")) {
         console_write("rebooting...\n");
+        crash_boot_clean();     /* §M47 — an orderly exit: disarm the marker */
         hal_reboot();                                   /* normally never returns */
         return;
     }
