@@ -52,8 +52,18 @@ the field sits at 8); virtio-net + AC97 were absent from the x86_64 source list.
 argument array as a USER pointer, but the direct socket syscalls (359+) hand it a
 KERNEL array → every direct call -EFAULT and musl doesn't fall back on -EFAULT,
 so `socket()` failed.  Split into `linux_socketcall_k` + a gated wrapper.
-**Still open: musl `getaddrinfo` on i386** (sendmsg/recvmsg resolver path);
-x86_64 resolves fine.
+**musl `getaddrinfo` FIXED (2026-08-03, both arches, was pre-existing).**  Two
+defects: (1) `SOCK_NONBLOCK` was discarded — musl drains its resolver socket with
+`while (recvmsg(...) >= 0)` and needs the EAGAIN only a non-blocking socket
+gives, so we sat in a 40M-iteration spin (minutes on emulated i386 → looked
+arch-specific); sockets now carry `nonblock`, honoured by the recv paths and by
+`SOCK_NONBLOCK` + `fcntl(F_SETFL)` in both Linux-ABI layers.  (2)
+`hostorder_to_sockaddr` validated a KERNEL word (`msg_namelen` from an
+already-checked msghdr) as a ring-3 pointer → returned without writing
+`msg_name`, and **musl drops any DNS reply whose source doesn't match a queried
+nameserver**, so every answer was silently discarded.  **Third instance of the
+same lesson** (after `sys_*_k` and `linux_sendmsg`): the user-pointer check
+belongs where the pointer's ORIGIN is known, never in a shared helper.
 
 ✅ **§M46 — RESILIENCE / freeze-freeness (2026-08-01, DOCS §4.37, i386 + x86_64,
 aarch64 parity).**  The rule now enforced: *nothing a user program does can take

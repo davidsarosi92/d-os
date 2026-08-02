@@ -1031,6 +1031,7 @@ struct netsock {
     int      type;
     uint16_t local_port;
     int      bound;
+    int      nonblock;                  /* SOCK_NONBLOCK / O_NONBLOCK        */
     struct ns_dgram rx[NS_RXSLOTS];
     volatile int rx_head, rx_tail;      /* head = produce, tail = consume */
     /* SOCK_STREAM (TCP) state. */
@@ -1087,6 +1088,29 @@ int sys_socket(int domain, int type, int proto) {
     return fd;
 }
 
+/* ---------------------------------------------------------------------------
+ * O_NONBLOCK on a socket.
+ *
+ * This is not a nicety.  musl's DNS resolver opens its socket with
+ * SOCK_NONBLOCK and then drains it with `while (recvmsg(...) >= 0)` — it relies
+ * on the SECOND call failing with EAGAIN to know the burst is over.  A blocking
+ * socket therefore does not merely stall that one call: getaddrinfo never
+ * returns, so every musl program that resolves a name hangs.  Honouring the
+ * flag is what makes the recv loop terminate.
+ * ------------------------------------------------------------------------- */
+int sys_socket_setnonblock(int fd, int on) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETSOCK) return -1;
+    o->nsock->nonblock = on ? 1 : 0;
+    return 0;
+}
+
+int sys_socket_getnonblock(int fd) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETSOCK) return -1;
+    return o->nsock->nonblock;
+}
+
 int sys_bind(int fd, int port) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_NETSOCK) return -1;
@@ -1116,7 +1140,13 @@ static long netsock_write(struct netsock* ns, const void* buf, size_t n) {
 static long netsock_read(struct netsock* ns, void* buf, size_t n) {
     if (ns->type != SOCK_STREAM || !ns->connected) return -1;
     struct net_device* dev = net_primary();
-    return dev ? net_tcp_recv(dev, buf, (uint32_t)n) : -1;
+    if (!dev) return -1;
+    long r = net_tcp_recv(dev, buf, (uint32_t)n);
+    /* Same contract as the datagram path: a non-blocking stream reports EAGAIN
+     * rather than "connection produced nothing", so a caller's drain loop can
+     * tell "no data right now" from "error". */
+    if (r <= 0 && ns->nonblock) return -SOCK_EAGAIN;
+    return r;
 }
 
 /* Core: `buf` is always KERNEL memory (see the *_k note in syscall.h). */
@@ -1160,13 +1190,26 @@ long sys_recvfrom_k(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out
     struct netsock* ns = o->nsock;
     struct net_device* dev = net_primary();
     if (!dev) return -1;
-    /* Poll the RX ring until a datagram lands (bounded — no IRQ RX yet). */
-    for (uint32_t spins = 0; spins < 40000000u; spins++) {
-        if (ns->rx_head != ns->rx_tail) break;
-        if (dev->poll) dev->poll(dev);
-        hal_cpu_pause();
+    /* Poll the RX ring until a datagram lands (bounded — no IRQ RX yet).
+     *
+     * A NON-BLOCKING socket gets exactly one pump of the device — enough to
+     * pick up anything already on the wire, which is what a real IRQ-driven
+     * driver would have done for us — and then reports EAGAIN instead of
+     * spinning.  Without that distinction the bounded spin still "returns", but
+     * only after tens of millions of iterations: on emulated i386 that is
+     * minutes, which is indistinguishable from a hang and is exactly how this
+     * broke musl's resolver. */
+    if (ns->nonblock) {
+        if (ns->rx_head == ns->rx_tail && dev->poll) dev->poll(dev);
+        if (ns->rx_head == ns->rx_tail) return -SOCK_EAGAIN;
+    } else {
+        for (uint32_t spins = 0; spins < 40000000u; spins++) {
+            if (ns->rx_head != ns->rx_tail) break;
+            if (dev->poll) dev->poll(dev);
+            hal_cpu_pause();
+        }
+        if (ns->rx_head == ns->rx_tail) return -1;     /* timeout */
     }
-    if (ns->rx_head == ns->rx_tail) return -1;     /* timeout */
     struct ns_dgram* d = &ns->rx[ns->rx_tail];
     uint32_t cnt = (d->len < n) ? d->len : (uint32_t)n;
     uint8_t* out = (uint8_t*)buf;

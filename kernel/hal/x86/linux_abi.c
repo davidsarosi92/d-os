@@ -286,13 +286,23 @@ static int sockaddr_to_hostorder(const struct lnx_sockaddr_in* sa,
 
 /* Fill a Linux sockaddr_in (network order) from a host-order (ip, port), used
  * by recvfrom to report the datagram's source.  Honours the caller's addrlen. */
+/* `addrlen` is an in/out KERNEL word: in = how much room the client gave us,
+ * out = the length we would have written.  It is deliberately NOT a client
+ * pointer, because this helper has callers with both origins — recvfrom hands
+ * us the client's socklen_t, recvmsg hands us msg_namelen lifted out of an
+ * already-validated msghdr.  Validating it here as a ring-3 pointer therefore
+ * made the recvmsg path bail out silently, leaving msg_name untouched: musl's
+ * resolver then compared the (still zeroed) source address against its
+ * nameserver list, decided the reply came from a stranger and dropped every
+ * single DNS answer.  Same lesson as the sys_*_k cores — check where the
+ * pointer's ORIGIN is known.  `sa` itself IS a client pointer and is still
+ * validated below. */
 static void hostorder_to_sockaddr(struct lnx_sockaddr_in* sa, uint32_t* addrlen,
                                   uint32_t ip, int port) {
     /* §1.1 — both `sa` and the in/out `addrlen` are client pointers.  Validate
      * addrlen first (it decides how much of `sa` we may touch), then exactly the
      * bytes we are going to write — requiring the FULL struct would wrongly
      * reject a caller that legitimately passed a shorter buffer. */
-    if (addrlen && !lnx_w_ok((uintptr_t)addrlen, sizeof *addrlen)) return;
     struct lnx_sockaddr_in tmp;
     tmp.sin_family = AF_INET;
     ((uint8_t*)&tmp.sin_port)[0] = (uint8_t)(port >> 8);
@@ -440,10 +450,20 @@ static long linux_socketcall_k(int call, const uint32_t* a) {
             void* buf = (void*)a[1];
             size_t len = (size_t)a[2];
             struct lnx_sockaddr_in* src = (struct lnx_sockaddr_in*)a[4];
-            uint32_t* addrlen = (uint32_t*)a[5];
+            uint32_t* uaddrlen = (uint32_t*)a[5];
             uint32_t ip = 0; int port = 0;
             long n = sys_recvfrom_u(fd, (uintptr_t)buf, len, &ip, &port);
-            if (n >= 0 && src) hostorder_to_sockaddr(src, addrlen, ip, port);
+            if (n >= 0 && src) {
+                /* HERE the socklen_t is the CLIENT's, so it is validated here —
+                 * the helper itself takes a kernel word (see its header). */
+                uint32_t room = (uint32_t)sizeof(struct lnx_sockaddr_in);
+                if (uaddrlen) {
+                    if (!lnx_w_ok((uintptr_t)uaddrlen, sizeof *uaddrlen)) return -LNX_EFAULT;
+                    room = *uaddrlen;
+                }
+                hostorder_to_sockaddr(src, &room, ip, port);
+                if (uaddrlen) *uaddrlen = room;
+            }
             return n;
         }
         case LSOC_SENDMSG:

@@ -3847,10 +3847,36 @@ all pass; `pkgrun sh -c "echo hi; ls /store"` forks children that execve real
 musl coreutils; `tcc /hello.c -o /myprog` compiles and the result runs.  i386
 regression re-run green; aarch64 builds clean.
 
-**Open:** musl's `getaddrinfo` still fails on **i386** (native sockets, musl
-`socket`/`sendto`/`recvfrom` and the whole x86_64 path are fine) — the remaining
-break is in the i386 sendmsg/recvmsg/poll resolver path.  Pre-existing, and
-confirmed pre-existing by rebuilding the previous commit.
+**musl `getaddrinfo` — fixed (was broken on i386, pre-existing).**  Two
+independent defects, both pre-existing, both found by tracing what musl's
+resolver actually did rather than by reading the code:
+
+1. **`SOCK_NONBLOCK` was discarded.**  musl opens its resolver socket
+   non-blocking and drains it with `while (recvmsg(...) >= 0)` — it relies on
+   the *second* call failing with EAGAIN to know the burst is over.  Our sockets
+   were always blocking, so `sys_recvfrom_k` sat in its 40-million-iteration
+   bounded spin: on emulated i386 that is minutes, indistinguishable from a
+   hang, while on x86_64 it happened to finish inside musl's own timeout — which
+   is precisely why the bug looked arch-specific.  `struct netsock` now carries
+   a `nonblock` flag (`sys_socket_setnonblock` / `sys_socket_getnonblock`), the
+   datagram and stream receive paths return `-SOCK_EAGAIN`, and both Linux-ABI
+   layers honour `SOCK_NONBLOCK` on `socket()` **and** `fcntl(F_SETFL/F_GETFL)`.
+
+2. **`hostorder_to_sockaddr` validated a KERNEL word as a ring-3 pointer.**
+   Its `addrlen` argument is a client `socklen_t` when called from `recvfrom`,
+   but `msg_namelen` lifted out of an already-validated `msghdr` when called
+   from `recvmsg`.  The user-pointer check made the recvmsg path return without
+   writing anything, so `msg_name` stayed zeroed — and musl *drops any DNS reply
+   whose source address does not match a nameserver it queried*.  Every answer
+   was silently discarded; the query just retried until it gave up.  The helper
+   now takes a kernel in/out word and the recvfrom call sites validate the
+   client's `socklen_t` themselves.  **Third instance of the same lesson** (after
+   the `sys_*_k` cores and `linux_sendmsg`): the user-pointer check belongs where
+   the pointer's ORIGIN is known, never inside a shared helper.
+
+Verified on **both** arches: `httpstest` completes a real TLSv1.3 handshake with
+CA verification, `wget http://example.com` downloads 571 body bytes, and
+`netmusl` fetches over plain HTTP.
 
 ---
 
@@ -3968,6 +3994,21 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   `httptest` (`HTTP/1.1 200 OK`) and `pkgrun sh -c` all green; aarch64 builds
   clean.
 
+- **2026-08-03 — musl `getaddrinfo` fixed (DOCS §4.39).**  Two pre-existing
+  defects, found by tracing what musl's resolver actually did.  (1) We discarded
+  `SOCK_NONBLOCK`; musl drains its socket with `while (recvmsg(...) >= 0)` and
+  needs the EAGAIN a non-blocking socket produces, so the blocking path sat in
+  its 40M-iteration bounded spin — minutes on emulated i386, which is why the
+  bug looked arch-specific.  Sockets now carry a `nonblock` flag honoured by the
+  datagram + stream receive paths and by both Linux-ABI layers (`SOCK_NONBLOCK`
+  and `fcntl(F_SETFL/F_GETFL)`).  (2) `hostorder_to_sockaddr` validated its
+  `addrlen` as a ring-3 pointer, but the recvmsg caller passes a kernel word —
+  so it returned without writing `msg_name`, and musl DROPS any DNS reply whose
+  source address does not match a queried nameserver.  Every answer was
+  discarded silently.  Third instance of the same lesson as the `sys_*_k` cores
+  and `linux_sendmsg`.  Verified on both arches: TLSv1.3 + CA verification,
+  `wget` downloading a real page, `netmusl` over plain HTTP.
+
 - **2026-08-02 — x86_64 userland parity (DOCS §4.39).**  x86_64 now runs the
   same userland i386 does: musl coreutils + a real `sh`, ring-3 BSD sockets,
   threads/TLS/signals, Mbed TLS (crypto + TLSv1.3 + HTTPS with CA verification +
@@ -3988,8 +4029,7 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   does not fall back on -EFAULT, so `socket()` failed outright.  Split into a
   `_k` core + a gated wrapper (same lesson as the `sys_*_k` cores).  Verified by
   boot-testing both arches; the previous commit was rebuilt to confirm the
-  socketcall break predated this work.  Still open: musl `getaddrinfo` on i386
-  (its sendmsg/recvmsg resolver path) — x86_64 resolves fine.
+  socketcall break predated this work.
 
 - **2026-08-02 — §M47 stage 2: `/proc/crash`, the GUI report window, a wider
   breadcrumb (DOCS §4.38).**  Stage 1 built the seam; this is the proof that

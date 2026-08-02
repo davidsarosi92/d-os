@@ -142,6 +142,12 @@ int  sys_kill(int pid, int sig);        /* post a signal to a task             *
 long sys_sigaction(int sig, long handler, long restorer);  /* → old handler    */
 int  sys_socket(int domain, int type, int proto);          /* M24 socket API   */
 int  sys_bind(int fd, int port);
+/* O_NONBLOCK on a socket.  The value a non-blocking recv returns when there is
+ * nothing to read: Linux's EAGAIN, so a personality layer can pass it straight
+ * through to its client.  (The native d-os libc only ever tests for < 0.) */
+#define SOCK_EAGAIN 11
+int  sys_socket_setnonblock(int fd, int on);
+int  sys_socket_getnonblock(int fd);          /* → 0/1, or -1 if not a socket */
 int  sys_connect(int fd, uint32_t ip, int port);           /* TCP handshake    */
 long sys_futex(int* uaddr, int op, int val);               /* M35              */
 struct kstat; struct kutsname; struct ktimespec;

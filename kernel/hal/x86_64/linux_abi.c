@@ -166,6 +166,9 @@ struct lnx_iovec { void* iov_base; uint64_t iov_len; };
  * that wrong reads msg_iov out of the padding and fails silently, so the layout
  * is spelled out with its offsets rather than copied from the i386 twin. */
 #define AF_INET_LNX      2
+/* Type-bits Linux ORs into socket()'s `type` argument. */
+#define LSOCK_NONBLOCK  0x800
+#define LSOCK_CLOEXEC   0x80000
 #define LNX_EAFNOSUPPORT 97
 #define LNX_EOPNOTSUPP   95
 
@@ -253,9 +256,19 @@ static int sockaddr_to_hostorder(const struct lnx_sockaddr_in* sa,
 /* Fill a Linux sockaddr_in (network order) from a host-order (ip, port).
  * Honours the caller's addrlen: requiring the full struct would wrongly reject
  * a caller that legitimately passed a shorter buffer. */
+/* `addrlen` is an in/out KERNEL word: in = how much room the client gave us,
+ * out = the length we would have written.  It is deliberately NOT a client
+ * pointer, because this helper has callers with both origins — recvfrom hands
+ * us the client's socklen_t, recvmsg hands us msg_namelen lifted out of an
+ * already-validated msghdr.  Validating it here as a ring-3 pointer therefore
+ * made the recvmsg path bail out silently, leaving msg_name untouched: musl's
+ * resolver then compared the (still zeroed) source address against its
+ * nameserver list, decided the reply came from a stranger and dropped every
+ * single DNS answer.  Same lesson as the sys_*_k cores — check where the
+ * pointer's ORIGIN is known.  `sa` itself IS a client pointer and is still
+ * validated below. */
 static void hostorder_to_sockaddr(struct lnx_sockaddr_in* sa, uint32_t* addrlen,
                                   uint32_t ip, int port) {
-    if (addrlen && !lnx_w_ok((uintptr_t)addrlen, sizeof *addrlen)) return;
     struct lnx_sockaddr_in tmp;
     tmp.sin_family = AF_INET_LNX;
     ((uint8_t*)&tmp.sin_port)[0] = (uint8_t)(port >> 8);
@@ -325,6 +338,23 @@ static long linux_sendmsg(int fd, const struct lnx_msghdr* mh, int flags) {
         return sys_sendto_k(fd, buf, total, ip, port);
     }
     return sys_write_k(fd, buf, total);              /* connected stream */
+}
+
+/* fcntl(fd, cmd, arg) — only the status-flag commands do real work. */
+#define LNX_F_GETFL    3
+#define LNX_F_SETFL    4
+#define LNX_O_NONBLOCK 04000
+
+static long linux_fcntl(int fd, int cmd, long arg) {
+    if (cmd == LNX_F_SETFL) {
+        sys_socket_setnonblock(fd, (arg & LNX_O_NONBLOCK) ? 1 : 0);
+        return 0;                          /* not a socket → accept and ignore */
+    }
+    if (cmd == LNX_F_GETFL) {
+        int nb = sys_socket_getnonblock(fd);
+        return (nb > 0) ? LNX_O_NONBLOCK : 0;
+    }
+    return 0;                              /* CLOEXEC etc: accepted, untracked */
 }
 
 static int lnx_stat_upath(uintptr_t upath, struct kstat* out) {
@@ -498,10 +528,12 @@ void linux_syscall_dispatch(struct int_frame* f) {
         case LNX_rt_sigaction:
         case LNX_membarrier:               /* UP + no reordering we care about */
         case LNX_fcntl:
-            /* Best-effort success: no per-task signal mask / robust futex list /
-             * fd flags tracked yet, but musl's startup + stdio paths only need
-             * these to "not fail". */
-            f->rax = 0;
+            /* Best-effort success: no per-task CLOEXEC / robust futex list / fd
+             * flags tracked yet, but musl's startup + stdio paths only need
+             * these to "not fail".  O_NONBLOCK is the exception — it changes
+             * real behaviour (see sys_socket_setnonblock), so F_SETFL/F_GETFL
+             * are honoured for sockets. */
+            f->rax = (uint64_t)linux_fcntl((int)a0, (int)a1, (long)a2);
             return;
 
         case LNX_getuid:
@@ -704,7 +736,12 @@ void linux_syscall_dispatch(struct int_frame* f) {
             int type   = (int)a1 & 0xFF;      /* strip SOCK_CLOEXEC/NONBLOCK */
             if (domain != AF_INET_LNX) { f->rax = (uint64_t)-LNX_EAFNOSUPPORT; return; }
             int fd = sys_socket(domain, type, (int)a2);
-            f->rax = (uint64_t)(long)(fd < 0 ? -LNX_EOPNOTSUPP : fd);
+            if (fd < 0) { f->rax = (uint64_t)-LNX_EOPNOTSUPP; return; }
+            /* SOCK_NONBLOCK is NOT decoration: musl's resolver drains its
+             * socket with `while (recvmsg(...) >= 0)` and needs the EAGAIN that
+             * only a non-blocking socket produces. */
+            if ((int)a1 & LSOCK_NONBLOCK) sys_socket_setnonblock(fd, 1);
+            f->rax = (uint64_t)fd;
             return;
         }
         case LNX_bind: {
@@ -738,10 +775,22 @@ void linux_syscall_dispatch(struct int_frame* f) {
         }
         case LNX_recvfrom: {
             struct lnx_sockaddr_in* src = (struct lnx_sockaddr_in*)a4;
-            uint32_t* addrlen = (uint32_t*)a5;
+            uint32_t* uaddrlen = (uint32_t*)a5;
             uint32_t ip = 0; int port = 0;
             long n = sys_recvfrom_u((int)a0, a1, (size_t)a2, &ip, &port);
-            if (n >= 0 && src) hostorder_to_sockaddr(src, addrlen, ip, port);
+            if (n >= 0 && src) {
+                /* HERE the socklen_t is the CLIENT's, so it is validated here —
+                 * the helper itself takes a kernel word (see its header). */
+                uint32_t room = (uint32_t)sizeof(struct lnx_sockaddr_in);
+                if (uaddrlen) {
+                    if (!lnx_w_ok((uintptr_t)uaddrlen, sizeof *uaddrlen)) {
+                        f->rax = (uint64_t)-LNX_EFAULT; return;
+                    }
+                    room = *uaddrlen;
+                }
+                hostorder_to_sockaddr(src, &room, ip, port);
+                if (uaddrlen) *uaddrlen = room;
+            }
             f->rax = (uint64_t)n;
             return;
         }

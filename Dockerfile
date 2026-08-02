@@ -32,4 +32,17 @@ RUN apt update && apt install -y \
     python3-jsonschema \
     python3-jinja2
 
+# §M40 — upstream libwayland.  wayland-scanner is a HOST tool: it turns the
+# protocol XML into C, which we then cross-compile with the musl toolchain.
+# Taking it (and the protocol XMLs) from apt avoids building expat + a second
+# native wayland just to run the generator.  libffi is needed because
+# libwayland-client dispatches events through wl_closure_invoke -> ffi_call; the
+# TARGET libffi is cross-built separately (scripts/fetch-wayland.sh), this one
+# is only for host-side configure checks.
+RUN apt update && apt install -y \
+    libwayland-dev \
+    libwayland-bin \
+    wayland-protocols \
+    libffi-dev
+
 WORKDIR /src
