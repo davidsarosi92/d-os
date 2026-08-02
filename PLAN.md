@@ -1004,6 +1004,17 @@ in parallel with BSP."
   hog and idle every quantum, killing throughput.  Fix:
   `pick_next_locked` skips `is_idle` tasks; only the no-work
   fallback path picks idle.
+- *(added 2026-08-01)*  **A loader that accepts a foreign binary is not
+  being permissive, it is deferring the error.**  `elf_load_ex` took
+  any ELF class and ignored `e_machine`; a wrong-arch image mapped
+  cleanly and then died somewhere unrelated (or, 64-bit-on-32-bit, had
+  its `p_vaddr` truncated and mapped at the wrong addresses in
+  silence).  Generalisation worth keeping: when a check is cheap and
+  the failure without it is *displaced* rather than absent, do the
+  check.  Related: an architecture should have exactly ONE spelling in
+  the system — `hal_arch_name()` now feeds the store's package hash,
+  the `.arch` metadata and `uname -m`, which had drifted to a
+  hardcoded "i386".
 - *(added 2026-08-01)*  **A context switch that only swaps the integer
   registers is not a context switch.**  The FP/SIMD register file was
   left shared between tasks — silent wrong answers rather than a crash,

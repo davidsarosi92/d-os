@@ -9,6 +9,7 @@
  * ============================================================================= */
 
 #include "pkg.h"
+#include "hal_api.h"   /* hal_arch_name — arch is part of package identity */
 #include "vfs.h"
 #include "printf.h"
 #include "kmalloc.h"
@@ -43,12 +44,22 @@ static unsigned strlen_local(const char* s) { unsigned n = 0; while (s && s[n]) 
 
 /* The canonical PT_INTERP path the arch's musl dynamic binaries carry (matches
  * the Makefile's $(DOS_LDSO) + the -dynamic-linker the .dynelf/.cxxelf rules
- * stamp in).  The active libc package's profile view writes its libc.so here. */
-#if defined(__x86_64__)
-#define DOS_LDSO_PATH "/lib/ld-musl-x86_64.so.1"
-#else
-#define DOS_LDSO_PATH "/lib/ld-musl-i386.so.1"
-#endif
+ * stamp in).  The active libc package's profile view writes its libc.so here.
+ *
+ * Built from hal_arch_name() rather than an #if on the compiler's arch macros:
+ * this is core code (convention 3), and there should be exactly ONE spelling of
+ * an architecture in the system — the same string the store folds into a
+ * package hash and `uname -m` reports.  A third arch then needs no edit here. */
+static const char* dos_ldso_path(void) {
+    static char p[48];
+    if (!p[0]) {
+        int n = sappend(p, sizeof p, 0, "/lib/ld-musl-");
+        n = sappend(p, sizeof p, n, hal_arch_name());
+        sappend(p, sizeof p, n, ".so.1");
+    }
+    return p;
+}
+#define DOS_LDSO_PATH  dos_ldso_path()
 
 /* ----------------------- recipe registry ---------------------------------- */
 
@@ -93,10 +104,19 @@ static void fold_dep_hash(const char* id, void* ctx) {
 }
 /* Folds id + version + each dep's recursive hash, so any change to a transitive
  * dependency yields a new store path (real content-addressing). */
+/* The architecture a recipe targets: an explicit `.arch`, else "this kernel". */
+static const char* recipe_arch(const struct pkg_recipe* r) {
+    return (r && r->arch) ? r->arch : hal_arch_name();
+}
+
 static uint32_t recipe_hash(const struct pkg_recipe* r) {
     uint32_t h = 2166136261u;
     h = fnv(r->id, h);       h = fnv(":", h);
     h = fnv(r->version, h);  h = fnv(":", h);
+    /* ARCH is part of the identity, not metadata: the same name+version is a
+     * DIFFERENT artifact per architecture, so folding it in gives each arch its
+     * own store path and neither can shadow the other. */
+    h = fnv(recipe_arch(r), h);  h = fnv(":", h);
     struct hashctx hc = { h };
     for_each_dep(r->deps, fold_dep_hash, &hc);
     return hc.h;
@@ -208,6 +228,14 @@ int pkg_build(const char* id) {
     char ap[192]; int app = sappend(ap, sizeof ap, 0, path);
     sappend(ap, sizeof ap, app, "/.abi");
     write_file(ap, abi, (unsigned)strlen_local(abi));
+
+    /* .arch — the architecture the payload was built for.  Same idea as .abi:
+     * the store entry describes itself, so the runner can refuse a foreign
+     * binary by DATA rather than by guessing from the ELF header. */
+    const char* parch = recipe_arch(r);
+    char arp[192]; int arpp = sappend(arp, sizeof arp, 0, path);
+    sappend(arp, sizeof arp, arpp, "/.arch");
+    write_file(arp, parch, (unsigned)strlen_local(parch));
 
     /* .closure (direct dep store dirnames). */
     char clo[1024]; struct cloctx cc = { clo, sizeof clo, 0 }; clo[0] = '\0';
@@ -527,6 +555,25 @@ int pkg_run(int argc, const char* const argv[]) {
     if (!abi[0]) { abi[0] = 'n'; abi[1] = 'a'; abi[2] = 't'; abi[3] = 'i';
                    abi[4] = 'v'; abi[5] = 'e'; abi[6] = '\0'; }   /* default */
     int personality = abi_to_personality(abi);
+
+    /* <store>/<dn>/.arch → refuse a package built for another machine BEFORE
+     * exec.  The ELF loader would catch it too (hal_elf_can_exec), but only
+     * after the image has been read and only as a numeric code; naming both
+     * arches here is the difference between "cannot exec" and an answer the
+     * user can act on.  A missing .arch means an entry written by an older
+     * build — treat it as native rather than refusing to run it. */
+    char archp[224]; int arp2 = sappend(archp, sizeof archp, 0, "/store/");
+    arp2 = sappend(archp, sizeof archp, arp2, dn);
+    sappend(archp, sizeof archp, arp2, "/.arch");
+    char parch[24];
+    if (read_file(archp, parch, sizeof parch) < 0) parch[0] = '\0';
+    for (int i = 0; i < (int)sizeof parch && parch[i]; i++)
+        if (parch[i] == '\n') { parch[i] = '\0'; break; }
+    if (parch[0] && !streq(parch, hal_arch_name())) {
+        kprintf("pkgrun: '%s' is built for %s, this kernel is %s\n",
+                name, parch, hal_arch_name());
+        return -1;
+    }
 
     /* Show which ABI backend the seam selected — the "two brothers" made
      * visible: abi="linux" → the linux_abi translator; abi="native" → the

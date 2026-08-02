@@ -212,4 +212,32 @@ int      hal_fpu_present(void);
 void     hal_fpu_test_stamp(uint64_t v);
 uint64_t hal_fpu_test_read(void);
 
+/* ---------------------------------------------------------------------------
+ * Architecture identity (2026-08-01).
+ *
+ * The short name of the architecture this kernel was built for: "i386",
+ * "x86_64", "aarch64".  It is the SAME string a package uses to declare which
+ * build of itself a payload is (pkg_recipe.arch) and the one `uname` reports,
+ * so there is exactly one spelling of an arch in the system.
+ * ------------------------------------------------------------------------- */
+const char* hal_arch_name(void);
+
+/* Can this kernel EXECUTE an ELF with this word size and machine type?
+ * `cls` is EI_CLASS (1 = 32-bit, 2 = 64-bit), `machine` is e_machine
+ * (3 = EM_386, 62 = EM_X86_64, 183 = EM_AARCH64).
+ *
+ * This is a real question, not a formality: nothing about loading a foreign
+ * ELF fails on its own.  The loader will happily map a 32-bit image on a
+ * 64-bit kernel and jump into it, and the CPU then executes 32-bit encodings
+ * in 64-bit mode — undefined behaviour that surfaces as an unrelated-looking
+ * fault far from the cause.  Asking the arch up front turns that into one
+ * clear error.
+ *
+ * A 64-bit kernel COULD gain the ability to run 32-bit binaries, but it needs
+ * more than a permissive check here (a compat syscall entry, 32-bit user
+ * segments, a 32-bit ABI personality), so today each arch answers only for its
+ * own native pair.  When that work lands, this function is the one place that
+ * changes. */
+int hal_elf_can_exec(unsigned cls, unsigned machine);
+
 #endif

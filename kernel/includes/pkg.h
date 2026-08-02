@@ -45,6 +45,24 @@ struct pkg_recipe {
      * NULL ⇒ "native".  This keeps the libc/ABI choice DATA-DRIVEN: a package
      * DECLARES its ABI; the exec path never hardcodes "musl"/"linux". */
     const char* abi;
+    /* The ARCHITECTURE this payload was built for ("i386" | "x86_64" |
+     * "aarch64"), in the same spelling hal_arch_name() returns.  NULL ⇒ "the
+     * architecture this kernel runs", which is what every in-kernel-embedded
+     * recipe means (its blob was compiled by the same build).
+     *
+     * Why it is part of the package IDENTITY and not just metadata: the same
+     * name+version of a program is a DIFFERENT artifact per architecture, so
+     * the two must not share a store path.  The arch is folded into the
+     * content hash, giving /store/<hash>-<name>-<ver> entries that differ
+     * across arches — the store can hold an i386 and an x86_64 build of the
+     * same package side by side without either shadowing the other.  (Today
+     * /store lives in ramfs and is rebuilt per boot, so a collision needs a
+     * persistent store to bite — but the identity has to be right BEFORE that
+     * lands, not after it corrupts something.)
+     *
+     * pkg_run checks it before exec so a wrong-arch package fails with one
+     * clear line instead of a mystery fault from the ELF loader. */
+    const char* arch;
     /* If non-NULL, this package is a SHARED LIBRARY, not a program: its payload
      * materialises at <store>/lib/<soname> and the "profile view" exposes it to
      * /lib/<soname> (not /bin/<name>).  This is how the runtime C library

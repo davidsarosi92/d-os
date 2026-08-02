@@ -761,7 +761,10 @@ int sys_uname(struct kutsname* out) {
     ustr(out->nodename, "d-os");
     ustr(out->release,  "0.1");
     ustr(out->version,  "M36 userland");
-    ustr(out->machine,  "i386");        /* i386-first; arch string later */
+    /* The REAL architecture, from the one place that knows it.  This used to be
+     * hardcoded "i386", so `uname -m` lied on x86_64 and aarch64 — and a libc
+     * or build script that branches on it would have made the wrong choice. */
+    ustr(out->machine,  hal_arch_name());
     return 0;
 }
 

@@ -13,6 +13,7 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "printf.h"
+#include "hal_api.h"   /* hal_elf_can_exec — "is this image for this machine?" */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -125,20 +126,37 @@ int elf_load_ex(struct vmm_space* space, const void* image_v, size_t len,
 
     struct ehdr_norm eh;
     unsigned cls = image[EI_CLASS];
+    unsigned mach = 0;
     if (cls == ELFCLASS32) {
         if (len < sizeof(struct elf32_ehdr)) return ELF_EBADHDR;
         const struct elf32_ehdr* e = (const struct elf32_ehdr*)image;
         eh.type = e->e_type; eh.entry = e->e_entry; eh.phoff = e->e_phoff;
         eh.phnum = e->e_phnum; eh.phentsize = e->e_phentsize;
+        mach = e->e_machine;
     } else if (cls == ELFCLASS64) {
         if (len < sizeof(struct elf64_ehdr)) return ELF_EBADHDR;
         const struct elf64_ehdr* e = (const struct elf64_ehdr*)image;
         eh.type = e->e_type; eh.entry = (uintptr_t)e->e_entry;
         eh.phoff = (uintptr_t)e->e_phoff;
         eh.phnum = e->e_phnum; eh.phentsize = e->e_phentsize;
+        mach = e->e_machine;
     } else {
         return ELF_EBADCLASS;
     }
+
+    /* Is this image built for the machine we are running on?
+     *
+     * Nothing later in this function would fail on its own if it is not: the
+     * segments map fine and we hand the entry point to the CPU, which then
+     * executes foreign instruction encodings and dies somewhere unrelated —
+     * a 32-bit image on a 64-bit kernel is the classic case.  Worse on the
+     * other side: a 64-bit image loaded by the 32-bit kernel has its p_vaddr
+     * fields truncated to 32 bits by the normalisation above, so the loader
+     * silently maps segments at the WRONG addresses.  Checking here turns a
+     * whole class of confusing multi-arch failures into one clear error.
+     * The arch answers for itself (hal_elf_can_exec) — this file must not
+     * grow a list of machine types. */
+    if (!hal_elf_can_exec(cls, mach)) return ELF_EBADARCH;
 
     /* Bias applies only to position-independent (ET_DYN) images; a fixed
      * ET_EXEC always loads at its own p_vaddr. */

@@ -125,6 +125,7 @@ static void cmd_help(void) {
                   "  ringtest, ps, spawn, yield, loop, kill <pid>, fkill <pid>\n"
                   "  wedge (runaway ring-3 task), faulttest (bad user pointers)\n"
                   "  fputest (per-task FP/SIMD register file)\n"
+                  "  archtest (ELF arch gate)\n"
                   "  pane, pane split horizontal|vertical\n"
                   "  gui (compositor + desktop), gui stats, launch [app]\n"
                   "  run <path.bas> (Tiny-BASIC)\n"
@@ -401,6 +402,57 @@ static void cmd_faulttest(void) {
             w_ok, w_strad, cp_partial, partial_ok,
             (w_ok == 5 && w_strad < 0 && cp_partial < 0 && partial_ok) ? "PASS" : "FAIL");
     console_write("faulttest: the box is still running — that IS the test.\n");
+}
+
+/* ---------------------------------------------------------------------------
+ * `archtest` — prove the ELF loader refuses a FOREIGN-architecture image.
+ *
+ * Before this check existed, a wrong-arch binary loaded "successfully": the
+ * segments mapped and the CPU was handed an entry point full of foreign
+ * instruction encodings, so the failure surfaced later as an unrelated-looking
+ * fault (and on a 32-bit kernel, a 64-bit image had its p_vaddr fields silently
+ * truncated, mapping segments at the wrong addresses entirely).
+ *
+ * The test synthesises bare ELF headers — no address space needed, because both
+ * outcomes are decided in the header:
+ *   - a foreign (class, machine) pair must be rejected with ELF_EBADARCH;
+ *   - the NATIVE pair must get PAST the arch gate, which we observe as the next
+ *     error along (ELF_ENOLOAD — the synthetic header has no PT_LOAD).  That
+ *     second half is the important one: it proves the gate is discriminating
+ *     rather than just refusing everything.
+ * --------------------------------------------------------------------------- */
+static void put16le(uint8_t* p, unsigned v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+
+static void make_ehdr(uint8_t* b, unsigned cls, unsigned machine) {
+    for (int i = 0; i < 64; i++) b[i] = 0;
+    b[0] = 0x7F; b[1] = 'E'; b[2] = 'L'; b[3] = 'F';
+    b[4] = (uint8_t)cls;            /* EI_CLASS  */
+    b[5] = 1;                       /* EI_DATA = little-endian */
+    b[6] = 1;                       /* EI_VERSION */
+    put16le(b + 16, 2);             /* e_type = ET_EXEC */
+    put16le(b + 18, machine);       /* e_machine */
+    /* e_phnum stays 0 → a native header falls through to ELF_ENOLOAD. */
+}
+
+static void cmd_archtest(void) {
+    uint8_t hdr[64];
+    /* Two foreign shapes: the "other" word size and a plainly alien machine. */
+    int is64 = (sizeof(void*) == 8);
+    make_ehdr(hdr, is64 ? 1u : 2u, is64 ? 3u : 62u);      /* other class+machine */
+    int foreign_other = elf_load_ex(NULL, hdr, sizeof hdr, 0, NULL);
+
+    make_ehdr(hdr, is64 ? 2u : 1u, 183u);                 /* EM_AARCH64 */
+    int foreign_arm = elf_load_ex(NULL, hdr, sizeof hdr, 0, NULL);
+
+    /* Native class+machine — must pass the gate and fail for the NEXT reason. */
+    make_ehdr(hdr, is64 ? 2u : 1u, is64 ? 62u : 3u);
+    int native = elf_load_ex(NULL, hdr, sizeof hdr, 0, NULL);
+
+    kprintf("archtest: arch=%s foreign=%d/%d (want %d) native=%d (want %d) -> %s\n",
+            hal_arch_name(), foreign_other, foreign_arm, ELF_EBADARCH,
+            native, ELF_ENOLOAD,
+            (foreign_other == ELF_EBADARCH && foreign_arm == ELF_EBADARCH &&
+             native == ELF_ENOLOAD) ? "PASS" : "FAIL");
 }
 
 /* ---------------------------------------------------------------------------
@@ -2477,6 +2529,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "bustest"))        { cmd_bustest(); return; }
     if (streq(line, "faulttest"))     { cmd_faulttest(); return; }
     if (streq(line, "fputest"))       { cmd_fputest(); return; }
+    if (streq(line, "archtest"))      { cmd_archtest(); return; }
     if (streq(line, "wdtest"))         { cmd_wdtest(); return; }
     if (streq(line, "cron"))           { cmd_cron("");         return; }
     if (starts_with(line, "cron "))    { cmd_cron(line + 5);   return; }

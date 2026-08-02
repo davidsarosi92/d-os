@@ -152,3 +152,18 @@ void hal_syscall_exit_to_kernel(uintptr_t saved_sp, uintptr_t saved_pc) {
     );
     __builtin_unreachable();
 }
+
+/* ---------------------------------------------------------------------------
+ * Architecture identity (see hal_api.h).
+ * --------------------------------------------------------------------------- */
+const char* hal_arch_name(void) { return "x86_64"; }
+
+/* Native 64-bit x86 only, for now.  The CPU could execute 32-bit binaries in
+ * compatibility mode, but that needs a 32-bit user code/data descriptor pair,
+ * a compat syscall entry (int 0x80 with 32-bit argument registers) and a
+ * 32-bit ABI personality — until those exist, accepting an EM_386 image here
+ * would just move the failure somewhere less obvious.  See the note in
+ * hal_api.h: this function is the single place that changes when they land. */
+int hal_elf_can_exec(unsigned cls, unsigned machine) {
+    return cls == 2 /*ELFCLASS64*/ && machine == 62 /*EM_X86_64*/;
+}

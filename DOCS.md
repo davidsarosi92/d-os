@@ -3780,6 +3780,48 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-08-01 — Architecture identity: the ELF loader, the store and `uname`
+  all know what machine this is.**  Three related gaps, all of which showed up
+  as confusing multi-arch failures rather than clear errors:
+    1. **The ELF loader accepted any word size and never looked at
+       `e_machine`.**  Nothing downstream fails on its own — a 32-bit image on
+       a 64-bit kernel maps fine and the CPU is then handed an entry point full
+       of foreign instruction encodings, so the failure surfaced far from the
+       cause.  The other direction was worse: a 64-bit image loaded by the
+       32-bit kernel had its `p_vaddr` fields truncated by header
+       normalisation, so segments mapped at the WRONG addresses silently.
+       `elf_load_ex` now asks the arch (`hal_elf_can_exec`) and returns
+       `ELF_EBADARCH`.
+    2. **The store had no notion of architecture.**  A package's identity was
+       id+version+deps, so the same name/version on two arches hashes to the
+       same `/store` path — fine while `/store` lives in ramfs and is rebuilt
+       per boot, but wrong the moment it persists.  `pkg_recipe.arch` (NULL ⇒
+       this kernel's) is now folded into the content hash and written as
+       `<store>/<dn>/.arch`, so the two builds get different paths and neither
+       shadows the other.  `pkg_run` reads it back and refuses a foreign package
+       by DATA, naming both arches, instead of letting the loader fail later.
+       Same data-driven seam as `.abi`.
+    3. **`uname` hardcoded `"i386"`** — it lied on x86_64 and aarch64, and a
+       libc or build script branching on it would have made the wrong choice.
+  New HAL contract: `hal_arch_name()` (one spelling of an arch in the whole
+  system — the store hash, `.arch`, and `uname -m` all use it) and
+  `hal_elf_can_exec(cls, machine)`.  Each arch answers only for its own native
+  pair; a 64-bit kernel *could* run 32-bit binaries, but that needs a compat
+  syscall entry, 32-bit user segments and a 32-bit personality, so accepting
+  them here would just relocate the failure.  When that lands,
+  `hal_elf_can_exec` is the single place that changes.  Also removed the
+  `#if defined(__x86_64__)` that built the `ld-musl-<arch>.so.1` interpreter
+  path inside `pkg.c` — core code now derives it from `hal_arch_name()`
+  (convention 3), so a third arch needs no edit there.
+  New self-test `archtest`: two foreign header shapes must be rejected with
+  `ELF_EBADARCH` **and** the native shape must get past the gate (observed as
+  the next error along, `ELF_ENOLOAD`) — the second half is what proves the
+  gate discriminates rather than refusing everything.
+  Verified on i386 and x86_64, `-smp 2`: `archtest` PASS on both (reporting the
+  correct `arch=` string), `fputest`, `faulttest`, `solibtest`, `musltest`,
+  `pkgtest` and `pkgrun` from the re-hashed store all green, NetSurf renders on
+  both.  aarch64 builds clean.
+
 - **2026-08-01 — Per-task FPU/SIMD state (FXSAVE/FXRSTOR on context switch).**
   `context_switch` swapped the INTEGER context only, so the x87/MMX/XMM register
   file was simply whatever the previously-running task left in it.  Two tasks

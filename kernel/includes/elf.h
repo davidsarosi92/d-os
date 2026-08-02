@@ -42,6 +42,7 @@ struct vmm_space;
 #define ELF_ENOLOAD    -4       /* no PT_LOAD segment                        */
 #define ELF_ESEGBOUND  -5       /* a segment's file range exceeds the image  */
 #define ELF_ENOMEM     -6       /* PMM/map allocation failed                 */
+#define ELF_EBADARCH   -7       /* built for a DIFFERENT machine/word size   */
 
 /* Rich load result (§M37).  All addresses are USER virtual addresses in the
  * target space; `load_bias` is what was added to each p_vaddr (0 for ET_EXEC,

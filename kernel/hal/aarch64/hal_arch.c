@@ -124,3 +124,14 @@ void hal_set_kernel_stack(uintptr_t top) {
 
 /* M35 TLS — stub (aarch64 TLS uses the TPIDR_EL0 register; a later port). */
 void hal_set_tls_base(uintptr_t base) { (void)base; }
+
+/* ---------------------------------------------------------------------------
+ * Architecture identity (see hal_api.h).
+ * --------------------------------------------------------------------------- */
+const char* hal_arch_name(void) { return "aarch64"; }
+
+/* AArch64 EL0 only.  (AArch32 EL0 is an optional CPU feature and QEMU `virt`
+ * with a modern -cpu does not provide it, so there is nothing to fall back to.) */
+int hal_elf_can_exec(unsigned cls, unsigned machine) {
+    return cls == 2 /*ELFCLASS64*/ && machine == 183 /*EM_AARCH64*/;
+}

@@ -151,3 +151,15 @@ int hal_hw_random(uint32_t* out) {
     }
     return 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * Architecture identity (see hal_api.h).
+ * --------------------------------------------------------------------------- */
+const char* hal_arch_name(void) { return "i386"; }
+
+/* A 32-bit kernel runs 32-bit x86 binaries and nothing else.  Note there is no
+ * "run a 64-bit binary" option to be permissive about — the CPU is in 32-bit
+ * protected mode; a 64-bit image is not merely unsupported, it is unrunnable. */
+int hal_elf_can_exec(unsigned cls, unsigned machine) {
+    return cls == 1 /*ELFCLASS32*/ && machine == 3 /*EM_386*/;
+}
