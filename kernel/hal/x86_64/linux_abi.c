@@ -65,10 +65,22 @@ extern uint64_t saved_rip;
 #define LNX_dup2             33
 #define LNX_pipe2           293
 #define LNX_getpid           39
+#define LNX_poll              7   /* musl's DNS resolver waits on the UDP socket
+                                   * with poll(); struct pollfd is byte-identical
+                                   * to ours on both arches.                     */
 #define LNX_socket           41
 #define LNX_connect          42
 #define LNX_sendto           44
 #define LNX_recvfrom         45
+#define LNX_sendmsg          46
+#define LNX_recvmsg          47
+#define LNX_shutdown         48
+#define LNX_bind             49
+#define LNX_listen           50
+#define LNX_getsockname      51
+#define LNX_getpeername      52
+#define LNX_setsockopt       54
+#define LNX_getsockopt       55
 #define LNX_clone            56
 #define LNX_fork             57
 #define LNX_execve           59
@@ -145,6 +157,37 @@ static int linux_open_flags(int lf) {
 /* x86_64 iovec — 64-bit base + length. */
 struct lnx_iovec { void* iov_base; uint64_t iov_len; };
 
+/* ---- BSD sockets (Linux x86_64 gives each call its own syscall number, unlike
+ * i386's single multiplexed socketcall) --------------------------------------
+ *
+ * sockaddr_in is a WIRE structure — identical 16 bytes on both arches — but
+ * `struct msghdr` is not: its length fields are size_t/socklen_t, so the amd64
+ * layout has 64-bit iovlen/controllen and padding after msg_namelen.  Getting
+ * that wrong reads msg_iov out of the padding and fails silently, so the layout
+ * is spelled out with its offsets rather than copied from the i386 twin. */
+#define AF_INET_LNX      2
+#define LNX_EAFNOSUPPORT 97
+#define LNX_EOPNOTSUPP   95
+
+struct lnx_sockaddr_in {
+    uint16_t sin_family;     /* AF_INET == 2 */
+    uint16_t sin_port;       /* network byte order */
+    uint32_t sin_addr;       /* network byte order */
+    uint8_t  sin_zero[8];
+};
+
+struct lnx_msghdr {          /* amd64: 56 bytes */
+    void*             msg_name;        /*  0: optional source/dest sockaddr   */
+    uint32_t          msg_namelen;     /*  8: in room / out actual (+4 pad)   */
+    uint32_t          _pad0;
+    struct lnx_iovec* msg_iov;         /* 16: scatter/gather buffers          */
+    uint64_t          msg_iovlen;      /* 24: iovec count (size_t!)           */
+    void*             msg_control;     /* 32: ancillary data (unused here)    */
+    uint64_t          msg_controllen;  /* 40 */
+    int               msg_flags;       /* 48: out — we report 0               */
+    uint32_t          _pad1;
+};
+
 /* Linux x86_64 `struct stat` (asm/stat.h).  Note the field order differs from
  * i386's stat64: st_nlink precedes st_mode, and every slot is 64-bit.  ld.so's
  * map_library fstats a .so to learn st_size before mmapping it. */
@@ -192,6 +235,98 @@ static int lnx_w_ok(uintptr_t uptr, uintptr_t len) {   /* ring-3 write target */
 static int lnx_r_ok(uintptr_t uptr, uintptr_t len) {   /* ring-3 read source  */
     return uptr && vmm_user_access_ok(uptr, len, 0);
 }
+/* ---- sockaddr marshalling (twin of the i386 helpers) -----------------------
+ * Byte-order conversion lives ONLY here: it is a Linux-ABI concern, not
+ * something the M24 stack should know about. */
+static int sockaddr_to_hostorder(const struct lnx_sockaddr_in* sa,
+                                 uint32_t* ip_out, int* port_out) {
+    if (!lnx_r_ok((uintptr_t)sa, sizeof *sa)) return -1;
+    if (sa->sin_family != AF_INET_LNX) return -1;
+    const uint8_t* a = (const uint8_t*)&sa->sin_addr;   /* network order bytes */
+    const uint8_t* p = (const uint8_t*)&sa->sin_port;
+    *ip_out   = ((uint32_t)a[0] << 24) | ((uint32_t)a[1] << 16) |
+                ((uint32_t)a[2] << 8)  |  (uint32_t)a[3];
+    *port_out = ((int)p[0] << 8) | (int)p[1];
+    return 0;
+}
+
+/* Fill a Linux sockaddr_in (network order) from a host-order (ip, port).
+ * Honours the caller's addrlen: requiring the full struct would wrongly reject
+ * a caller that legitimately passed a shorter buffer. */
+static void hostorder_to_sockaddr(struct lnx_sockaddr_in* sa, uint32_t* addrlen,
+                                  uint32_t ip, int port) {
+    if (addrlen && !lnx_w_ok((uintptr_t)addrlen, sizeof *addrlen)) return;
+    struct lnx_sockaddr_in tmp;
+    tmp.sin_family = AF_INET_LNX;
+    ((uint8_t*)&tmp.sin_port)[0] = (uint8_t)(port >> 8);
+    ((uint8_t*)&tmp.sin_port)[1] = (uint8_t)port;
+    ((uint8_t*)&tmp.sin_addr)[0] = (uint8_t)(ip >> 24);
+    ((uint8_t*)&tmp.sin_addr)[1] = (uint8_t)(ip >> 16);
+    ((uint8_t*)&tmp.sin_addr)[2] = (uint8_t)(ip >> 8);
+    ((uint8_t*)&tmp.sin_addr)[3] = (uint8_t)ip;
+    for (int i = 0; i < 8; i++) tmp.sin_zero[i] = 0;
+    uint32_t room = addrlen ? *addrlen : (uint32_t)sizeof tmp;
+    uint32_t cnt  = room < sizeof tmp ? room : (uint32_t)sizeof tmp;
+    if (cnt && !lnx_w_ok((uintptr_t)sa, cnt)) return;
+    for (uint32_t i = 0; i < cnt; i++) ((uint8_t*)sa)[i] = ((uint8_t*)&tmp)[i];
+    if (addrlen) *addrlen = (uint32_t)sizeof tmp;
+}
+
+/* recvmsg(fd, msg, flags) — the resolver's receive path.  musl's __res_msend
+ * receives every DNS answer here and DROPS any reply whose source address does
+ * not match a nameserver it queried, so filling msg_name is not optional:
+ * leaving it alone makes getaddrinfo fail silently. */
+static long linux_recvmsg(int fd, struct lnx_msghdr* mh, int flags) {
+    (void)flags;
+    if (!lnx_w_ok((uintptr_t)mh, sizeof *mh)) return -LNX_EFAULT;
+    if (!mh->msg_iov || mh->msg_iovlen == 0) return -LNX_EOPNOTSUPP;
+    if (!lnx_r_ok((uintptr_t)mh->msg_iov, sizeof(struct lnx_iovec))) return -LNX_EFAULT;
+    struct lnx_iovec* iov = &mh->msg_iov[0];
+    uint32_t ip = 0; int port = 0;
+    /* Payload lands in the CLIENT's iovec, source address in kernel locals —
+     * sys_recvfrom_u is exactly that split and bounce-buffers the payload. */
+    long n = sys_recvfrom_u(fd, (uintptr_t)iov->iov_base, (size_t)iov->iov_len,
+                            &ip, &port);
+    if (n < 0) return n;
+    if (mh->msg_name) {
+        uint32_t namelen = mh->msg_namelen;
+        hostorder_to_sockaddr((struct lnx_sockaddr_in*)mh->msg_name, &namelen, ip, port);
+        mh->msg_namelen = namelen;
+    }
+    mh->msg_flags = 0;
+    return n;
+}
+
+/* sendmsg(fd, msg, flags) — gather the iovecs and send as one message.  Used by
+ * musl's TCP-fallback DNS path.  `buf` is a KERNEL gather buffer, so this calls
+ * the *_k cores: the gated sys_write/sys_sendto would (correctly) reject a
+ * kernel address while task->in_user_syscall is set. */
+static long linux_sendmsg(int fd, const struct lnx_msghdr* mh, int flags) {
+    (void)flags;
+    if (!lnx_r_ok((uintptr_t)mh, sizeof *mh)) return -LNX_EFAULT;
+    if (!mh->msg_iov || mh->msg_iovlen > 1024) return -LNX_EOPNOTSUPP;
+    if (!lnx_r_ok((uintptr_t)mh->msg_iov,
+                  (uintptr_t)mh->msg_iovlen * sizeof(struct lnx_iovec)))
+        return -LNX_EFAULT;
+    uint8_t buf[1024];
+    size_t total = 0;
+    for (uint64_t i = 0; i < mh->msg_iovlen; i++) {
+        const struct lnx_iovec* v = &mh->msg_iov[i];
+        const uint8_t* p = (const uint8_t*)v->iov_base;
+        if (v->iov_len && !lnx_r_ok((uintptr_t)p, v->iov_len)) return -LNX_EFAULT;
+        for (uint64_t k = 0; k < v->iov_len && total < sizeof buf; k++)
+            buf[total++] = p[k];
+    }
+    if (mh->msg_name) {                              /* datagram to a peer */
+        uint32_t ip; int port;
+        if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)mh->msg_name,
+                                  &ip, &port) != 0)
+            return -LNX_EAFNOSUPPORT;
+        return sys_sendto_k(fd, buf, total, ip, port);
+    }
+    return sys_write_k(fd, buf, total);              /* connected stream */
+}
+
 static int lnx_stat_upath(uintptr_t upath, struct kstat* out) {
     char kp[256];
     if (copy_str_from_user(kp, upath, sizeof kp) < 0) return -1;
@@ -552,13 +687,88 @@ void linux_syscall_dispatch(struct int_frame* f) {
             f->rax = (uint64_t)sys_futex((int*)a0, (int)a1, (int)a2);
             return;
 
-        /* ---- Still deferred (not needed by sh/coreutils): threads (clone with
-         * CLONE_VM), and the BSD socket calls (a separate net-syscall port). */
+        case LNX_poll:
+            /* poll(fds=rdi, nfds=rsi, timeout_ms=rdx).  Linux's struct pollfd is
+             * byte-identical to ours and POLLIN/POLLOUT share values, so the
+             * array goes straight to sys_poll.  Without this musl's resolver
+             * spun on -ENOSYS and getaddrinfo never completed. */
+            f->rax = (uint64_t)sys_poll((struct pollfd*)a0, (int)a1, (int)a2);
+            return;
+
+        /* ---- BSD sockets.  Unlike i386 (one multiplexed socketcall), amd64
+         * Linux gives each call its own number, so these translate directly to
+         * the M24 primitives.  Byte order is converted in the sockaddr helpers
+         * above — the M24 stack only ever sees host order. */
+        case LNX_socket: {
+            int domain = (int)a0;
+            int type   = (int)a1 & 0xFF;      /* strip SOCK_CLOEXEC/NONBLOCK */
+            if (domain != AF_INET_LNX) { f->rax = (uint64_t)-LNX_EAFNOSUPPORT; return; }
+            int fd = sys_socket(domain, type, (int)a2);
+            f->rax = (uint64_t)(long)(fd < 0 ? -LNX_EOPNOTSUPP : fd);
+            return;
+        }
+        case LNX_bind: {
+            uint32_t ip; int port;
+            if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)a1, &ip, &port) != 0) {
+                f->rax = (uint64_t)-LNX_EAFNOSUPPORT; return;
+            }
+            f->rax = (uint64_t)(long)(sys_bind((int)a0, port) == 0 ? 0 : -1);
+            return;
+        }
+        case LNX_connect: {
+            uint32_t ip; int port;
+            if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)a1, &ip, &port) != 0) {
+                f->rax = (uint64_t)-LNX_EAFNOSUPPORT; return;
+            }
+            f->rax = (uint64_t)(long)(sys_connect((int)a0, ip, port) == 0 ? 0 : -1);
+            return;
+        }
+        case LNX_sendto: {
+            const struct lnx_sockaddr_in* dst = (const struct lnx_sockaddr_in*)a4;
+            if (!dst) {                       /* connected stream → plain write */
+                f->rax = (uint64_t)sys_write((int)a0, (const void*)a1, (size_t)a2);
+                return;
+            }
+            uint32_t ip; int port;
+            if (sockaddr_to_hostorder(dst, &ip, &port) != 0) {
+                f->rax = (uint64_t)-LNX_EAFNOSUPPORT; return;
+            }
+            f->rax = (uint64_t)sys_sendto((int)a0, (const void*)a1, (size_t)a2, ip, port);
+            return;
+        }
+        case LNX_recvfrom: {
+            struct lnx_sockaddr_in* src = (struct lnx_sockaddr_in*)a4;
+            uint32_t* addrlen = (uint32_t*)a5;
+            uint32_t ip = 0; int port = 0;
+            long n = sys_recvfrom_u((int)a0, a1, (size_t)a2, &ip, &port);
+            if (n >= 0 && src) hostorder_to_sockaddr(src, addrlen, ip, port);
+            f->rax = (uint64_t)n;
+            return;
+        }
+        case LNX_sendmsg:
+            f->rax = (uint64_t)linux_sendmsg((int)a0, (const struct lnx_msghdr*)a1,
+                                             (int)a2);
+            return;
+        case LNX_recvmsg:
+            f->rax = (uint64_t)linux_recvmsg((int)a0, (struct lnx_msghdr*)a1, (int)a2);
+            return;
+        case LNX_shutdown:
+            f->rax = 0;                       /* close() does the teardown */
+            return;
+        case LNX_setsockopt:
+        case LNX_getsockopt:
+            /* No socket options are honoured yet; report success so musl's
+             * getaddrinfo/TLS setup (SO_RCVTIMEO, TCP_NODELAY…) proceeds. */
+            f->rax = 0;
+            return;
+        case LNX_listen:
+        case LNX_getsockname:
+        case LNX_getpeername:
+            f->rax = (uint64_t)-LNX_EOPNOTSUPP;
+            return;
+
+        /* ---- Still deferred: threads (clone with CLONE_VM). */
         case LNX_clone:
-        case LNX_socket:
-        case LNX_connect:
-        case LNX_sendto:
-        case LNX_recvfrom:
             kprintf("linux-abi64: syscall %lu not yet ported (x86_64)\n",
                     (unsigned long)f->rax);
             f->rax = (uint64_t)-LNX_ENOSYS;

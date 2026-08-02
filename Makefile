@@ -216,6 +216,15 @@ ifeq ($(ARCH),i386)
   USER_CRT0_BUILD = nasm -f elf32 $(USER_CRT0_SRC) -o $(OBJ_DIR)/user/crt0.o
   # The canonical PT_INTERP path an i386 musl dynamic binary carries.
   DOS_LDSO      := /lib/ld-musl-i386.so.1
+  # Where this arch's musl headers + crt objects live (the §M43 rootfs archive
+  # ships them to the on-device compiler).  i386 builds its own musl; x86_64
+  # uses the prebuilt cross sysroot — same files, different home.
+  MUSL_HDR_DIR  := third_party/musl-i386/include
+  MUSL_CRT_DIR  := third_party/musl-i386/lib
+  # TinyCC cross-build knobs (see the `tcc` target).
+  TCC_CPU       := i386
+  TCC_CC        := i686-linux-musl-gcc
+  TCC_TOOLCHAIN := third_party/musl-cross-i686
 
   # §M42 i386 — the musl cross toolchain that builds the store .so's + the
   # NetSurf binary (same one §M38's C++ uses).  Only defined when it's present
@@ -305,6 +314,11 @@ else ifeq ($(ARCH),x86_64)
   # The canonical PT_INTERP path an x86_64 musl dynamic binary carries; pkg.c
   # provisions the ld.so (== libc.so) there at boot.
   DOS_LDSO     := /lib/ld-musl-x86_64.so.1
+  MUSL_HDR_DIR := $(MUSL_SYSROOT)/include
+  MUSL_CRT_DIR := $(MUSL_SYSROOT)/lib
+  TCC_CPU       := x86_64
+  TCC_CC        := x86_64-linux-musl-gcc
+  TCC_TOOLCHAIN := third_party/musl-cross-x86_64
   # The SAME musl programs i386 embeds — coreutils + `sh` + the socket probes —
   # plus forktest64, which is x86_64-only (it checks the 64-bit fork/COW path).
   # The %.muslelf rule already has an x86_64 branch driving the cross gcc, so
@@ -909,27 +923,27 @@ TINYCC_DIR := third_party/tinycc
 tcc:
 	@test -f $(TINYCC_DIR)/configure || { \
 	  echo "TinyCC missing — run ./scripts/fetch-tinycc.sh first"; exit 1; }
-	@test -x $(MUSL_CXX_DIR)/bin/i686-linux-musl-gcc || { \
-	  echo "musl toolchain missing — run make musl-cross-i686 first"; exit 1; }
-	cp $(MUSL_CXX_DIR)/i686-linux-musl/lib/libc.so /lib/ld-musl-i386.so.1
-	# Clean musl headers at /usr/include so tcc (built here, run under qemu-i386)
-	# can compile libtcc1.a — the host's glibc /usr/include otherwise conflicts.
-	# (The musl-cross gcc is unaffected: it uses its own sysroot.)
-	rm -rf /usr/include && cp -a $(CURDIR)/$(MUSL_PREFIX)/include /usr/include
+	@test -x $(TCC_TOOLCHAIN)/bin/$(TCC_CC) || { \
+	  echo "musl toolchain for $(ARCH) missing ($(TCC_TOOLCHAIN)/bin/$(TCC_CC))"; exit 1; }
+	cp $(TCC_TOOLCHAIN)/$(subst -gcc,,$(TCC_CC))/lib/libc.so $(DOS_LDSO)
+	# Clean musl headers at /usr/include so tcc (built here, then RUN here to
+	# compile libtcc1.a) sees a musl world — the host's glibc /usr/include
+	# otherwise conflicts.  (The musl-cross gcc is unaffected: own sysroot.)
+	rm -rf /usr/include && cp -a $(CURDIR)/$(MUSL_HDR_DIR) /usr/include
 	rm -rf /tmp/tcc && cp -a $(TINYCC_DIR) /tmp/tcc
-	cd /tmp/tcc && PATH=$(CURDIR)/$(MUSL_CXX_DIR)/bin:$$PATH \
-	    CC=i686-linux-musl-gcc ./configure --cpu=i386 --config-musl \
-	      --elfinterp=/lib/ld-musl-i386.so.1 --crtprefix=/lib --libpaths="{B}:/lib" \
+	cd /tmp/tcc && PATH=$(CURDIR)/$(TCC_TOOLCHAIN)/bin:$$PATH \
+	    CC=$(TCC_CC) ./configure --cpu=$(TCC_CPU) --config-musl \
+	      --elfinterp=$(DOS_LDSO) --crtprefix=/lib --libpaths="{B}:/lib" \
 	      --sysincludepaths="{B}/include:/usr/include" --prefix=/usr \
 	      --extra-cflags="-fPIE" --extra-ldflags="-pie" --config-pie \
 	      --config-bcheck=no --config-backtrace=no
-	cd /tmp/tcc && PATH=$(CURDIR)/$(MUSL_CXX_DIR)/bin:$$PATH $(MAKE) tcc libtcc1.a
-	rm -rf third_party/tinycc-i686 && mkdir -p third_party/tinycc-i686/bin third_party/tinycc-i686/lib
-	cp /tmp/tcc/tcc third_party/tinycc-i686/bin/tcc
-	cp /tmp/tcc/libtcc1.a third_party/tinycc-i686/lib/libtcc1.a
-	cp -a /tmp/tcc/include third_party/tinycc-i686/include
+	cd /tmp/tcc && PATH=$(CURDIR)/$(TCC_TOOLCHAIN)/bin:$$PATH $(MAKE) tcc libtcc1.a
+	rm -rf $(TINYCC_PREFIX) && mkdir -p $(TINYCC_PREFIX)/bin $(TINYCC_PREFIX)/lib
+	cp /tmp/tcc/tcc $(TINYCC_PREFIX)/bin/tcc
+	cp /tmp/tcc/libtcc1.a $(TINYCC_PREFIX)/lib/libtcc1.a
+	cp -a /tmp/tcc/include $(TINYCC_PREFIX)/include
 	rm -rf /tmp/tcc
-	@echo "tcc (on-device C compiler) → third_party/tinycc-i686/bin/tcc"
+	@echo "tcc (on-device C compiler, $(ARCH)) → $(TINYCC_PREFIX)/bin/tcc"
 
 kernel: $(KERNEL_BIN)
 
@@ -1356,28 +1370,26 @@ $(OBJ_DIR)/user/ldmusl_blob.o: $(LDSO_SRC)
 # (tcc's own headers → /usr/lib/tcc/include, musl headers → /usr/include, musl
 # crt → /lib) that pkg.c unpacks into the VFS at boot, so `tcc hello.c -o hello`
 # can compile + link a full libc program ON d-os.
-$(OBJ_DIR)/user/dostcc_blob.o: third_party/tinycc-i686/bin/tcc
+$(OBJ_DIR)/user/dostcc_blob.o: $(TINYCC_PREFIX)/bin/tcc
 	@mkdir -p $(@D)
-	cp third_party/tinycc-i686/bin/tcc user/dostcc
-	objcopy --input-target=binary --output-target=elf32-i386 \
-	    --binary-architecture=i386 user/dostcc $@
+	cp $(TINYCC_PREFIX)/bin/tcc user/dostcc
+	objcopy --input-target=binary $(USER_OCARGS) user/dostcc $@
 	rm -f user/dostcc
 
-user/rootfs.bin: third_party/tinycc-i686/bin/tcc $(MUSL_LIBC) user/tcc_hello.c user/hi.c
+user/rootfs.bin: $(TINYCC_PREFIX)/bin/tcc user/tcc_hello.c user/hi.c
 	python3 scripts/pack-rootfs.py $@ \
-	    third_party/tinycc-i686/include:/usr/lib/tcc/include \
-	    third_party/tinycc-i686/lib/libtcc1.a:/usr/lib/tcc/libtcc1.a \
-	    $(MUSL_PREFIX)/include:/usr/include \
-	    $(MUSL_PREFIX)/lib/crt1.o:/lib/crt1.o \
-	    $(MUSL_PREFIX)/lib/crti.o:/lib/crti.o \
-	    $(MUSL_PREFIX)/lib/crtn.o:/lib/crtn.o \
+	    $(TINYCC_PREFIX)/include:/usr/lib/tcc/include \
+	    $(TINYCC_PREFIX)/lib/libtcc1.a:/usr/lib/tcc/libtcc1.a \
+	    $(MUSL_HDR_DIR):/usr/include \
+	    $(MUSL_CRT_DIR)/crt1.o:/lib/crt1.o \
+	    $(MUSL_CRT_DIR)/crti.o:/lib/crti.o \
+	    $(MUSL_CRT_DIR)/crtn.o:/lib/crtn.o \
 	    user/tcc_hello.c:/hello.c \
 	    user/hi.c:/hi.c
 
 $(OBJ_DIR)/user/rootfs_blob.o: user/rootfs.bin
 	@mkdir -p $(@D)
-	objcopy --input-target=binary --output-target=elf32-i386 \
-	    --binary-architecture=i386 user/rootfs.bin $@
+	objcopy --input-target=binary $(USER_OCARGS) user/rootfs.bin $@
 
 # §M37 stage 5 — a genuinely SEPARATE shared library (libgreet.so) + a program
 # that links against it by name.  libgreet.so is embedded as a blob (installed

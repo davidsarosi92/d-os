@@ -35,6 +35,26 @@ breadcrumb** (kind/cpu/pid/pc/addr/code/uptime/comm).  Also: taskbar clock shows
 the ISO date + keyboard layout, wallpaper label carries the arch
 (`d-os M47  x32`/`x64`/`arm64`).
 
+✅ **x86_64 USERLAND PARITY (2026-08-02, DOCS §4.39).**  x86_64 now runs the same
+userland i386 does: musl coreutils + `sh`, ring-3 sockets, threads/TLS/signals,
+Mbed TLS (crypto + TLSv1.3 + HTTPS w/ CA verify + `wget`), and on-device TinyCC.
+The gap was **duplication, not missing kernel support**: objcopy blob symbols
+carried the arch in their NAME (`_binary_user_X_i386_elf_start`) so every in-tree
+program was i386-only by construction; the program lists were written twice; the
+x86_64 dispatcher stopped at M25.  Fixed with one blob pattern rule +
+`--redefine-sym`, shared lists above the arch branches, the missing dispatcher
+cases and `hal/x86_64/signal.c`.  **Four 32-bit assumptions** surfaced: crt0
+never read argc/argv; `thread_create` passed its arg the cdecl way (amd64 wants
+RDI); `tls_load4` hard-coded `%gs` AND a literal offset 4 (x86_64 = FS.base, and
+the field sits at 8); virtio-net + AC97 were absent from the x86_64 source list.
+`make mbedtls` / `make tcc` are arch-aware (`third_party/{mbedtls,tinycc}-<arch>`).
+**Pre-existing i386 bug fixed on the way:** `linux_socketcall` validated its
+argument array as a USER pointer, but the direct socket syscalls (359+) hand it a
+KERNEL array → every direct call -EFAULT and musl doesn't fall back on -EFAULT,
+so `socket()` failed.  Split into `linux_socketcall_k` + a gated wrapper.
+**Still open: musl `getaddrinfo` on i386** (sendmsg/recvmsg resolver path);
+x86_64 resolves fine.
+
 ✅ **§M46 — RESILIENCE / freeze-freeness (2026-08-01, DOCS §4.37, i386 + x86_64,
 aarch64 parity).**  The rule now enforced: *nothing a user program does can take
 the machine down.*  Ring-3 fault ⇒ kill only that process (all 3 arches; ring-0

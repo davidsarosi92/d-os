@@ -3782,6 +3782,78 @@ sink, and per-kind filtering of what opens the window.
 
 ---
 
+### 4.39 x86_64 userland parity (M47.5)
+
+Until this point x86_64 ran a visibly smaller userland than i386 — no coreutils,
+no `sh`, no sockets from ring 3, no on-device compiler.  **None of that was
+missing kernel support.**  It was three pieces of duplication, each of which had
+quietly fallen behind its i386 twin.
+
+**1. The blob symbol carried the architecture.**  Every in-tree ring-3 program is
+embedded from `user/<name>_<arch>.elf`, and objcopy mints its symbols from that
+filename — so the kernel spelled out `_binary_user_forktest_i386_elf_start` and
+every program was i386-only *by construction*: the blob linked fine on x86_64 and
+the shell still reported "not embedded for this arch".  One pattern rule now
+embeds them all, and `--redefine-sym` strips the arch back out, so the kernel
+refers to *the embedded forktest program* and the build decides which
+architecture that is.  Sixteen identical rules collapsed into one.
+
+**2. The program lists were written twice.**  `X86_USER_BLOBS`,
+`MUSL_COREUTILS`, `MUSL_PROG_BLOBS`, `MUSL_DYN_BLOBS`, `CXX_RUNTIME_BLOBS` and
+`MBEDTLS_PROG_BLOBS` are now defined once above the arch branches, so parity is a
+property of the build rather than a promise.  (`linuxhello` stays i386-only on
+purpose — it hard-codes the 32-bit Linux syscall numbers, which is the point of
+that program.)
+
+**3. The x86_64 syscall dispatcher stopped at M25.**  `fork`, `waitpid`,
+`execve`, `pipe`, `dup2`, `kill`, `sigaction`, `sigreturn`, `socket`, `bind`,
+`connect`, `sendto`, `recvfrom`, `clone`, `futex`, `set_tls`, `stat`, `fstat`,
+`getdents`, `uname`, `clock_gettime`, `nanosleep` and `getrandom` all call the
+SAME portable cores i386 calls; only reading the arguments out of the frame is
+arch-specific.  New: `hal/x86_64/signal.c` (delivery + sigreturn) — amd64 passes
+the signal number in RDI, so its sigreturn frame layout differs from i386's, and
+getting that wrong would be silent (the handler runs, the restore brings back
+garbage).  The Linux-ABI translator gained `poll` and the amd64 BSD-socket
+numbers (41–55), including an amd64 `struct msghdr` whose 64-bit `msg_iovlen`
+and post-`msg_namelen` padding are spelled out rather than copied from i386.
+
+Four bugs surfaced, all the same shape — code that assumed 32 bits:
+
+| where | what | how it showed up |
+|-------|------|------------------|
+| `crt0_x86_64.s` | called `main()` without reading argc/argv | every argv-using program read a pointer as argc |
+| `libc.c thread_create` | pushed the thread argument on the stack (i386 cdecl); amd64 passes it in RDI | threads ran with a garbage argument — no crash, wrong data |
+| `libc.h tls_load4` | hard-coded `%gs` *and* a literal field offset of 4 | x86_64's thread pointer is FS.base, and `self` is a pointer so the id sits at 8 |
+| Makefile | virtio-net + AC97 absent from the x86_64 source list | the network stack linked with no NIC under it |
+
+**Toolchains made arch-aware:** `make mbedtls` and `make tcc` now build into
+`third_party/mbedtls-<arch>` / `third_party/tinycc-<arch>`, driven by per-arch
+`MUSL_HDR_DIR` / `MUSL_CRT_DIR` / `TCC_CPU` / `TCC_CC` / `TCC_TOOLCHAIN`, and the
+four copy-pasted Mbed TLS link rules became one canned recipe per arch.
+
+**Also fixed (pre-existing, i386):** `linux_socketcall` validated its argument
+array as a *user* pointer, but the direct socket syscalls (359+) repack CPU
+registers into a *kernel* array — so every direct call returned -EFAULT, and musl
+only falls back to socketcall on -ENOSYS, meaning `socket()` simply failed.  Split
+into `linux_socketcall_k` (kernel array) + a gated wrapper, the same lesson as
+the `sys_*_k` cores: **the user-pointer check belongs where the pointer's ORIGIN
+is known, not in a shared core.**
+
+**Verified on x86_64:** runargs / forkexec / pipetest / sigtest / threadtest /
+tlstest / posixtest / faulttest / fputest / archtest green; `lsnic` finds eth0;
+dnstest resolves and httptest fetches `HTTP/1.1 200 OK`; crypttest + ssltest
+(TLSv1.3) + httpstest (HTTPS with CA verification) + `wget http://example.com`
+all pass; `pkgrun sh -c "echo hi; ls /store"` forks children that execve real
+musl coreutils; `tcc /hello.c -o /myprog` compiles and the result runs.  i386
+regression re-run green; aarch64 builds clean.
+
+**Open:** musl's `getaddrinfo` still fails on **i386** (native sockets, musl
+`socket`/`sendto`/`recvfrom` and the whole x86_64 path are fine) — the remaining
+break is in the i386 sendmsg/recvmsg/poll resolver path.  Pre-existing, and
+confirmed pre-existing by rebuilding the previous commit.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -3895,6 +3967,29 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   `polltest`, `solibtest`, `forktest`, `threadtest`, `musltest`, `dnstest`,
   `httptest` (`HTTP/1.1 200 OK`) and `pkgrun sh -c` all green; aarch64 builds
   clean.
+
+- **2026-08-02 — x86_64 userland parity (DOCS §4.39).**  x86_64 now runs the
+  same userland i386 does: musl coreutils + a real `sh`, ring-3 BSD sockets,
+  threads/TLS/signals, Mbed TLS (crypto + TLSv1.3 + HTTPS with CA verification +
+  `wget`), and the on-device TinyCC compiler.  The gap was never missing kernel
+  support — it was duplication that had fallen behind: the objcopy blob symbols
+  carried the arch in their NAME (so every in-tree program was i386-only by
+  construction, linking fine on x86_64 while the shell said "not embedded for
+  this arch"), the program lists were written out twice, and the x86_64 syscall
+  dispatcher stopped at M25.  One pattern rule + `--redefine-sym` + shared lists
+  + the missing dispatcher cases fix all three, and `hal/x86_64/signal.c` fills
+  in delivery/sigreturn.  Four 32-bit assumptions surfaced and were fixed:
+  crt0 never read argc/argv, `thread_create` passed its argument the cdecl way,
+  `tls_load4` hard-coded both `%gs` and a 4-byte field offset, and virtio-net +
+  AC97 were missing from the x86_64 source list.  `make mbedtls` / `make tcc`
+  are now arch-aware.  **Also fixed, pre-existing on i386:** `linux_socketcall`
+  validated its argument array as a user pointer while the direct socket
+  syscalls hand it a kernel array — every direct call returned -EFAULT and musl
+  does not fall back on -EFAULT, so `socket()` failed outright.  Split into a
+  `_k` core + a gated wrapper (same lesson as the `sys_*_k` cores).  Verified by
+  boot-testing both arches; the previous commit was rebuilt to confirm the
+  socketcall break predated this work.  Still open: musl `getaddrinfo` on i386
+  (its sendmsg/recvmsg resolver path) — x86_64 resolves fine.
 
 - **2026-08-02 — §M47 stage 2: `/proc/crash`, the GUI report window, a wider
   breadcrumb (DOCS §4.38).**  Stage 1 built the seam; this is the proof that

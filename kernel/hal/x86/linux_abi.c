@@ -376,17 +376,28 @@ static long linux_sendmsg(int fd, const struct lnx_msghdr* mh, int flags) {
  * with sockaddr_in ⇄ host-order (ip,port) conversion done here.  TCP payload
  * (send/recv on a connected stream) rides sys_write/sys_read, which already
  * route FD_NETSOCK to the TCP engine. */
-static long linux_socketcall(int call, uint32_t* a) {
-    /* §1.1 — `a` is the client's argument ARRAY (Linux passes socket args
-     * through memory here).  Each sub-call has a fixed arg count; validate
-     * exactly that many words before touching them, so a short/bad array can
-     * neither fault the kernel nor leak adjacent memory. */
-    static const uint8_t nargs[] = {
-        0, 3, 3, 3, 2, 3, 3, 3, 4, 4, 4, 6, 6, 2, 5, 5, 3, 3
-    };
-    if (call < 0 || call >= (int)(sizeof nargs / sizeof nargs[0])) return -LNX_EINVAL;
-    if (!lnx_r_ok((uintptr_t)a, (uintptr_t)nargs[call] * sizeof(uint32_t)))
-        return -LNX_EFAULT;
+
+/* How many argument words each sub-call consumes — used to validate exactly the
+ * words we are about to read out of the client's array. */
+static const uint8_t socketcall_nargs[] = {
+    0, 3, 3, 3, 2, 3, 3, 3, 4, 4, 4, 6, 6, 2, 5, 5, 3, 3
+};
+
+/* The CORE.  `a` is a KERNEL array of already-fetched argument words; the
+ * pointer arguments INSIDE it are still client pointers and are validated
+ * individually below (sockaddr_to_hostorder, the sys_* gates).
+ *
+ * The split matters: this function has two callers with opposite pointer
+ * origins — the socketcall(102) multiplexer, whose array lives in ring 3, and
+ * the DIRECT socket syscalls (359+), which repack CPU registers into a kernel
+ * array.  Validating the array here as a user pointer therefore rejected every
+ * direct call with -EFAULT, and musl only falls back to socketcall on -ENOSYS,
+ * so `socket()` simply failed and DNS died with it.  Same lesson as the
+ * sys_*_k cores and linux_sendmsg (see DOCS §4.37): the user-pointer check
+ * belongs where the pointer's ORIGIN is known, not in the shared core. */
+static long linux_socketcall_k(int call, const uint32_t* a) {
+    if (call < 0 || call >= (int)(sizeof socketcall_nargs / sizeof socketcall_nargs[0]))
+        return -LNX_EINVAL;
     switch (call) {
         case LSOC_SOCKET: {
             int domain = (int)a[0];
@@ -453,6 +464,20 @@ static long linux_socketcall(int call, uint32_t* a) {
             kprintf("linux-abi: unhandled socketcall %d\n", call);
             return -LNX_ENOSYS;
     }
+}
+
+/* The GATED entry: socketcall(call, args) from ring 3.  Validates the client's
+ * argument array, copies it into kernel memory, then runs the core above. */
+static long linux_socketcall(int call, const uint32_t* uargs) {
+    if (call < 0 || call >= (int)(sizeof socketcall_nargs / sizeof socketcall_nargs[0]))
+        return -LNX_EINVAL;
+    uint32_t n = socketcall_nargs[call];
+    if (!lnx_r_ok((uintptr_t)uargs, (uintptr_t)n * sizeof(uint32_t)))
+        return -LNX_EFAULT;
+    uint32_t a[8];
+    for (uint32_t i = 0; i < n && i < 8; i++) a[i] = uargs[i];
+    for (uint32_t i = n; i < 8; i++) a[i] = 0;
+    return linux_socketcall_k(call, a);
 }
 
 /* End a Linux process/excursion: an independent user task exits for good;
@@ -759,7 +784,7 @@ void linux_syscall_dispatch(struct int_frame* f) {
 
         case LNX_socketcall:
             /* socketcall(call=ebx, args=ecx) — see linux_socketcall(). */
-            f->eax = (uint32_t)linux_socketcall((int)f->ebx, (uint32_t*)f->ecx);
+            f->eax = (uint32_t)linux_socketcall((int)f->ebx, (const uint32_t*)f->ecx);
             return;
 
         /* Direct socket syscalls: repack the register args into the socketcall
@@ -787,7 +812,9 @@ void linux_syscall_dispatch(struct int_frame* f) {
             int call = -1;
             for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
                 if (map[i].nr == f->eax) { call = map[i].call; break; }
-            f->eax = (uint32_t)linux_socketcall(call, args);
+            /* `args` is OUR array (built from registers), so the core is the
+             * right entry — the gated wrapper would reject a kernel pointer. */
+            f->eax = (uint32_t)linux_socketcall_k(call, args);
             return;
         }
 

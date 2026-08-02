@@ -62,13 +62,13 @@ serial.log
 test.img
 third_party/freetype/
 third_party/libpng/
-third_party/mbedtls-i686/
+third_party/mbedtls-*/
 third_party/mbedtls/
 third_party/musl-cross-*/
 third_party/musl-cross-make/
 third_party/musl-i386/
 third_party/musl/
-third_party/tinycc-i686/
+third_party/tinycc-*/
 third_party/tinycc/
 third_party/zlib/
 user/*.cxxelf
