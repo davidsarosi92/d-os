@@ -3427,10 +3427,13 @@ DTPMOD/DTPOFF on the §M35 `%gs` pointer); `dlopentest` (`dlopen`/`dlsym`/
 regression-free (the AT_PHDR fix: musl reads AT_PHDR even for static binaries to
 find `PT_TLS`).
 
-**Open:** x86_64/aarch64; a real `brk` heap (mallocng falls back to mmap today);
-mmap reclaim on munmap; pthreads under the Linux ABI (needs `clone` wired in —
-the TLS *relocation* model is proven, but multi-thread `__thread` awaits §M44's
-musl pthread path); lazy PLT resolution (BIND_NOW-style works today).
+**Open:** ~~x86_64~~ — **dynamic linking works on x86_64 too** (verified
+2026-08-01: `solibtest` and `dlopentest` both green there, and NetSurf is itself
+a dynamic musl binary on that arch); aarch64 is still open.  A real `brk` heap
+(mallocng falls back to mmap today); mmap reclaim on munmap; pthreads under the
+Linux ABI (needs `clone` wired in — the TLS *relocation* model is proven, but
+multi-thread `__thread` awaits §M44's musl pthread path); lazy PLT resolution
+(BIND_NOW-style works today).
 
 ---
 

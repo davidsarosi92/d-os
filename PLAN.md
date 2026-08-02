@@ -189,7 +189,7 @@ what); a session can pick a theme and push on it.
 | M19.5 | Memory polish — HIGHMEM ✅ (x86_64), empty-slab caching ✅, SRAT/NUMA ✅ (parser) | Memory | §M19.5 |
 | M20 | x64 (long mode) port (UP)                       | Architecture     | ✅ DOCS §4.X (closed by §M20.5) |
 | M20.5 | x64 SMP + APIC + ring-3 (int 0x80) — Phase A/B/C | Architecture | ✅ §M20.5 |
-| M20.6 | x86_64 closure — SYSCALL/SYSRET, xHCI + virtio-blk 64-bit DMA | Architecture | §M20.6 |
+| M20.6 | x86_64 closure — SYSCALL/SYSRET, xHCI + virtio-blk 64-bit DMA | Architecture | ✅ SYSCALL entry + USB/blk DMA shipped (SYSRET-out not used — we `iretq` back, so the GDT reorder was never needed) — §M20.6 |
 | M21 | ARM (aarch64 generic / RPi) port                | Architecture     | ✅ Phase A–M — **full x86 parity**: boot + SMP + virtio-blk + exFAT + DTB + framebuffer + EL0 userspace + full shell.c + M22 GUI (virtio-input kbd/mouse, PL031 clock) + **USB (xHCI + HID over PCIe ECAM)** on ARM64 (DOCS §4.17) — §M21 |
 | M22 | GUI infrastructure — compositor, windows, mouse, widgets, taskbar, file manager | UX | ✅ DOCS §4.13 |
 | M22.2 | GUI modularity — swappable desktop shell + app registry + GUI dev docs | UX | ✅ DOCS §4.14 |
@@ -210,7 +210,7 @@ what); a session can pick a theme and push on it.
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | ✅ DOCS §4.22 (L1+L2; L3 HW deferred) |
 | M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation | Security | §M32 |
 | M33 | Execution domains — a service's run location (kernel / user / isolated) as a declared capability + config choice; driver placement (fault-tolerant → user-mode isolation) is the flagship case | Reliability | §M33 |
-| **M46** | **Resilient control plane — SAK hotkeys + force-kill** — Ctrl+Alt+Del = always-live Task Manager, Ctrl+Alt+X = kill last/frozen app, window chrome (close/min/restore) works even when the app is wedged (close ⇒ force-kill), Task Manager force-quit; the enabler is a real force-kill of a wedged ring-3 process | Reliability / UX | §M46 |
+| **M46** | **Resilient control plane — SAK hotkeys + force-kill** — Ctrl+Alt+Del = always-live Task Manager, Ctrl+Alt+X = kill last/frozen app, window chrome (close/min/restore) works even when the app is wedged (close ⇒ force-kill), Task Manager force-quit; the enabler is a real force-kill of a wedged ring-3 process | Reliability / UX | ✅ DOCS §4.37 |
 
 ### Cross-cutting constraints
 
@@ -1390,8 +1390,23 @@ prevent a real-world workload from running on x86_64.
 
 ### §M20.6.1 — SYSCALL/SYSRET instruction path
 
-**Status quo:** ring 3 reaches the kernel via `int 0x80` only.
-Modern x86_64 userspace prefers the `syscall` instruction (lower
+> **✅ SHIPPED (the entry half).**  `kernel/hal/x86_64/syscall_entry.s` +
+> `syscall_init_64()` arm EFER.SCE / STAR / LSTAR / FMASK, and x86_64 musl
+> binaries reach the kernel through the `syscall` instruction today — that is
+> the live path for every Linux-personality program on this arch.  The RETURN
+> half deliberately stayed on `iretq`, which is why **the GDT reorganisation
+> described below was never needed**: SYSRET is the instruction with the rigid
+> selector arithmetic, and we do not use it.  Left open: SYSRET-out (a latency
+> optimisation, not a capability) and `IA32_KERNEL_GS_BASE`/`swapgs` per-CPU
+> data.  *Lesson: the requirement that made this milestone look expensive
+> belonged to only one half of it.*
+>
+> Per-CPU footnote learned the hard way (2026-08-01): these MSRs are PER-CPU.
+> An AP that never runs `syscall_init_64()` raises #UD on every libc syscall —
+> see the SMP change-log entry in DOCS §8.
+
+**Status quo (at planning time):** ring 3 reaches the kernel via `int 0x80`
+only.  Modern x86_64 userspace prefers the `syscall` instruction (lower
 latency, no IDT round-trip).  Linux phased out int 0x80 from
 glibc decades ago.
 
