@@ -18,6 +18,23 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M47 — CRASH RECORDS & REPORTING (2026-08-02, DOCS §4.38, all 3 arches).**
+M46 stopped the box from dying; M47 makes sure that when something *does* go
+wrong the system SAYS SO.  Two phases on purpose: **capture** (`crash_report`)
+runs in fault/NMI context so it only copies a fixed record into a static ring —
+no locks, no alloc, no I/O; **delivery** (`crash_drain`, watchdog task) runs
+ordinary so a sink may allocate, block or draw.  New destinations register with
+`CRASH_SINK()` — **a reporting mechanism can be armed at any time WITHOUT
+touching a fault path again.**  Sinks: `klog` (always) + `gui-report` (the Crash
+Reports window, `gui/apps/crashapp.c`, gated by `crash.report`, opens itself when
+a record is delivered).  Surfaces: `crash`, **`/proc/crash`**, klog, the GUI
+window — one record, several views; the window is never the storage.  The one
+event nothing in the guest can log (triple fault / reset / power loss) is
+reported on the NEXT boot from a CMOS NVRAM marker + a **40-byte checksummed
+breadcrumb** (kind/cpu/pid/pc/addr/code/uptime/comm).  Also: taskbar clock shows
+the ISO date + keyboard layout, wallpaper label carries the arch
+(`d-os M47  x32`/`x64`/`arm64`).
+
 ✅ **§M46 — RESILIENCE / freeze-freeness (2026-08-01, DOCS §4.37, i386 + x86_64,
 aarch64 parity).**  The rule now enforced: *nothing a user program does can take
 the machine down.*  Ring-3 fault ⇒ kill only that process (all 3 arches; ring-0

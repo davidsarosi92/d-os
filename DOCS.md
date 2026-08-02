@@ -3713,6 +3713,75 @@ layer — landed 2026-08-01, see the change-log entry below.)
 
 ---
 
+### 4.38 Crash records & reporting (M47)
+
+M46 made sure a faulty program cannot take the machine down.  M47 answers the
+other half of the same requirement: **when something does go wrong, the system
+must say so** — recorded now, surfaced to the user later or immediately, through
+whatever mechanism happens to be armed.
+
+**Two phases, on purpose** (`core/crash.c`, `includes/crash.h`).  *Capture*
+(`crash_report`) runs in the worst context in the system — inside an exception
+or NMI handler, IRQs off, possibly on a broken stack — so it does the absolute
+minimum: copy a fixed-size `struct crash_record` into a static 32-entry ring and
+bump a counter.  No allocation, no locks, no formatting, no I/O; a lock there
+could deadlock against the very fault being recorded.  *Delivery*
+(`crash_drain`, called from the watchdog sweep) runs on an ordinary task, where
+a sink may allocate, block, open a file or draw a window.  That split is the
+whole design.
+
+**Sinks** register with `CRASH_SINK(name, fn)` (linker section, same pattern as
+`DRIVER()`/`SERVICE()`).  Two ship today:
+
+| sink | where it lives | what it does |
+|------|----------------|--------------|
+| `klog` | `core/crash.c` | always present — the baseline guarantee that nothing goes unrecorded |
+| `gui-report` | `gui/apps/crashapp.c` | queues the "Crash Reports" window onto the compositor |
+
+Adding "report over the network" or "append to a file" later is one more file
+and one more `CRASH_SINK()` — **no fault path is ever touched again.**
+
+**Surfaces.**  A record has one representation and several views: `crash`
+(console), **`/proc/crash`** (machine-readable — the header lists `captured`,
+`ring` and every registered sink, then one line per record newest-first), the
+system log, and under a GUI the **Crash Reports** window (Start menu, or opened
+by itself when a record is delivered).  The window is a *view*, never the
+storage: turning it off leaves the record fully captured everywhere else.
+
+Kinds: `user-fault`, `kernel-fault`, `hard-lockup`, `task-hang`, `deadlock`,
+`forced-kill`, `unclean-boot`.  Wired into the ring-3 fault path, the ring-0
+fault path (captured BEFORE the policy runs — halt and reboot never return), the
+NMI watchdog, the L1 task-hang detector, the spinlock deadlock detector and the
+forced-kill safe point, on all three arches.
+
+**The failure nothing in the guest can log.**  A triple fault, a hardware reset
+or a power loss resets the CPU with no handler running.  That case is covered
+from the other side: `crash_boot_begin` arms a marker in battery-backed CMOS
+NVRAM (HAL contract `hal_nvram_read/write`) and `crash_boot_clean` disarms it on
+an orderly shutdown, so finding it still armed means the previous boot died
+where nothing could report it.  Alongside the marker sits a **40-byte checksummed
+breadcrumb** of the most recent record (kind, cpu, pid, pc, addr, code, uptime,
+comm), rewritten on every capture — so the next boot reports not just *"the last
+boot died"* but *"…after a forced-kill in 'wedge' (pid 25) at pc=…, 44 s into
+that boot"*, which is usually the whole diagnosis.  NVRAM rather than a file on
+purpose: it must survive exactly the events during which no filesystem write can
+be trusted.  aarch64 on QEMU `virt` has no such storage and says so out loud
+rather than silently concluding every boot was clean.
+
+**Config:** `crash.report` (on|off, default on) — gates the GUI report window
+only, read on every record so it can be armed or silenced at any time without a
+reboot.
+
+**Desktop chrome, same session:** the taskbar clock grew the ISO date and the
+active keyboard layout code (`2026-08-02  20:18:16  US`), and the wallpaper
+label carries the architecture next to the milestone (`d-os M47  x32` /
+`x64` / `arm64`) — so a screenshot in a bug report identifies its own build.
+
+**Open:** persisting records across a *clean* reboot (a store file), a network
+sink, and per-kind filtering of what opens the window.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -3826,6 +3895,41 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   `polltest`, `solibtest`, `forktest`, `threadtest`, `musltest`, `dnstest`,
   `httptest` (`HTTP/1.1 200 OK`) and `pkgrun sh -c` all green; aarch64 builds
   clean.
+
+- **2026-08-02 — §M47 stage 2: `/proc/crash`, the GUI report window, a wider
+  breadcrumb (DOCS §4.38).**  Stage 1 built the seam; this is the proof that
+  adding a destination costs one file and zero fault-path edits.
+  **`/proc/crash`** renders the ring machine-readably — `captured`, `ring`, one
+  `sink` line per registered sink, then one line per record newest-first.  Read
+  without a lock, exactly like the capture side and for the same reason: a
+  reader able to block a fault handler would invert the priority this subsystem
+  exists to protect.
+  **The Crash Reports window** (`gui/apps/crashapp.c`) is a completely ordinary
+  GUI app — listview, 1 Hz tick, click a row for the full detail — plus eight
+  lines of `CRASH_SINK("gui-report", …)`.  The sink runs on the watchdog task,
+  so it must not build a window itself; it pushes an app launch onto the
+  compositor's lock-free queue and the compositor opens it on its own schedule,
+  which also means a wedged compositor cannot be made worse by a crash report.
+  Gated by `crash.report` (default on), read per-record so the window can be
+  armed or silenced at any time without a reboot.  **Naming note:** it is a
+  *report*, not a "popup" — a record has one representation and the surface is a
+  detail; the window is a view, never the storage, and switching it off silences
+  the interruption, never the recording.
+  **The NVRAM breadcrumb grew 24 → 40 bytes**, adding the faulting address, the
+  signal/exception code and the uptime at capture, so a boot that died where
+  nothing could log it is reconstructed as a first-class record instead of a
+  bare "something happened".
+  Verified on i386 and x86_64: `cat /proc/crash` lists both sinks and the
+  record; `wedge` + `fkill` inside a GUI terminal makes the Crash Reports window
+  **open by itself** (screenshot, both arches — nobody clicked it); a
+  `system_reset` from the QEMU monitor is reported on the next boot as
+  *"…last recorded event was forced-kill in 'wedge' (pid 16) at pc=… code=137,
+  44 s into that boot"*.  aarch64 builds clean.
+  Same session, desktop chrome: the taskbar clock now shows the **ISO date and
+  the active keyboard layout** (`2026-08-02  20:18:16  US`) and the wallpaper
+  label carries the **architecture** next to the milestone (`d-os M47  x32` /
+  `x64` / `arm64`), so a screenshot identifies its own build.  `DOS_MILESTONE`
+  → M47, `DOS_VERSION` → 0.47.0.
 
 - **2026-08-02 — §M47 stage 1: crash records + pluggable reporting sinks.**
   The standing requirement is that a faulty program must never take the machine

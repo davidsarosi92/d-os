@@ -15,6 +15,7 @@
 #include "klog.h"
 #include "timer.h"
 #include "percpu.h"
+#include "procfs.h"
 #include "hal_api.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -157,21 +158,28 @@ CRASH_SINK("klog", klog_sink);
  * went wrong was a page fault in 'netsurf' at this address" — which is usually
  * the whole diagnosis.
  *
- * Layout at CRASH_NV_BASE (all little-endian, 24 bytes):
+ * Layout at CRASH_NV_BASE (all little-endian, 40 bytes):
  *   +0  magic  (1)   0x5A — distinguishes a real record from uninitialised CMOS
  *   +1  kind   (1)
  *   +2  cpu    (1)
- *   +3  sum    (1)   XOR of bytes 0..2 and 4..23, so garbage is not believed
+ *   +3  sum    (1)   XOR of every other byte, so garbage is not believed
  *   +4  pid    (4)
  *   +8  pc     (8)
- *   +16 comm   (8)   truncated task name — enough to recognise the program
+ *   +16 addr   (8)   faulting address — with `pc`, the actual diagnosis
+ *   +24 code   (2)   signal / exception number
+ *   +26 upsec  (2)   uptime in seconds at capture, saturated (how far it got)
+ *   +28 comm   (12)  truncated task name — enough to recognise the program
  *
  * Writing happens in fault context, so it is port I/O only: no locks, no
- * allocation.  CMOS is byte-at-a-time and slow-ish, but 24 bytes on a path that
+ * allocation.  CMOS is byte-at-a-time and slow-ish, but 40 bytes on a path that
  * only runs when something already went wrong is a bargain for the diagnosis.
+ *
+ * Size ceiling: the HAL exposes indices 0..0x7F, so this block must end at or
+ * before 0x7F — 0x51 + 40 = 0x79 leaves a little headroom and stays clear of
+ * the RTC/status registers in the low bytes.
  * --------------------------------------------------------------------------- */
 #define CRASH_NV_BASE   0x51
-#define CRASH_NV_LEN    24
+#define CRASH_NV_LEN    40
 #define CRASH_NV_MAGIC  0x5A
 
 static void nv_put(int off, uint8_t v) { hal_nvram_write(CRASH_NV_BASE + off, v); }
@@ -185,9 +193,16 @@ static void crash_nv_store(const struct crash_record* r) {
     b[0] = CRASH_NV_MAGIC;
     b[1] = r->kind;
     b[2] = r->cpu;
-    for (int i = 0; i < 4; i++) b[4 + i]  = (uint8_t)((uint32_t)r->pid >> (8 * i));
-    for (int i = 0; i < 8; i++) b[8 + i]  = (uint8_t)((uint64_t)r->pc  >> (8 * i));
-    for (int i = 0; i < 8; i++) b[16 + i] = (uint8_t)r->comm[i];
+    for (int i = 0; i < 4; i++) b[4 + i]  = (uint8_t)((uint32_t)r->pid  >> (8 * i));
+    for (int i = 0; i < 8; i++) b[8 + i]  = (uint8_t)((uint64_t)r->pc   >> (8 * i));
+    for (int i = 0; i < 8; i++) b[16 + i] = (uint8_t)((uint64_t)r->addr >> (8 * i));
+    b[24] = (uint8_t)r->code; b[25] = (uint8_t)((unsigned)r->code >> 8);
+    /* Saturate rather than wrap: "65535 s" reading as "0 s" would suggest the
+     * machine died during boot when it had in fact been up for hours. */
+    uint64_t secs = r->ms / 1000;
+    if (secs > 0xFFFFu) secs = 0xFFFFu;
+    b[26] = (uint8_t)secs; b[27] = (uint8_t)(secs >> 8);
+    for (int i = 0; i < 12; i++) b[28 + i] = (uint8_t)r->comm[i];
     uint8_t sum = 0;
     for (int i = 0; i < CRASH_NV_LEN; i++) if (i != 3) sum ^= b[i];
     b[3] = sum;
@@ -197,23 +212,35 @@ static void crash_nv_store(const struct crash_record* r) {
 /* Read the breadcrumb back.  Returns 0 unless the magic AND the checksum agree
  * — uninitialised CMOS is full of plausible-looking bytes, and inventing a
  * crash that never happened would be worse than reporting nothing. */
-static int crash_nv_load(int* kind, int* pid, uintptr_t* pc, char* comm, int commcap) {
+struct crash_crumb {
+    int       kind, pid, code;
+    uintptr_t pc, addr;
+    unsigned  upsec;
+    char      comm[13];
+};
+
+static int crash_nv_load(struct crash_crumb* c) {
     uint8_t b[CRASH_NV_LEN];
     for (int i = 0; i < CRASH_NV_LEN; i++) b[i] = nv_get(i);
     if (b[0] != CRASH_NV_MAGIC) return 0;
     uint8_t sum = 0;
     for (int i = 0; i < CRASH_NV_LEN; i++) if (i != 3) sum ^= b[i];
     if (sum != b[3]) return 0;
-    *kind = b[1];
+    c->kind = b[1];
     uint32_t p = 0;
     for (int i = 0; i < 4; i++) p |= (uint32_t)b[4 + i] << (8 * i);
-    *pid = (int)p;
+    c->pid = (int)p;
     uint64_t v = 0;
     for (int i = 0; i < 8; i++) v |= (uint64_t)b[8 + i] << (8 * i);
-    *pc = (uintptr_t)v;
+    c->pc = (uintptr_t)v;
+    v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)b[16 + i] << (8 * i);
+    c->addr  = (uintptr_t)v;
+    c->code  = (int)((unsigned)b[24] | ((unsigned)b[25] << 8));
+    c->upsec = (unsigned)b[26] | ((unsigned)b[27] << 8);
     int n = 0;
-    while (n < 8 && n < commcap - 1 && b[16 + n]) { comm[n] = (char)b[16 + n]; n++; }
-    comm[n] = '\0';
+    while (n < 12 && b[28 + n]) { c->comm[n] = (char)b[28 + n]; n++; }
+    c->comm[n] = '\0';
     return 1;
 }
 
@@ -223,20 +250,25 @@ void crash_boot_begin(void) {
     if (have && prev == CRASH_MARK_ARMED) {
         /* The previous boot armed the marker and never cleared it.  Pull the
          * breadcrumb too, so the report names what was going wrong last. */
-        int kind = 0, pid = -1; uintptr_t pc = 0; char comm[16] = "";
+        struct crash_crumb c;
         char what[CRASH_WHAT_MAX];
-        if (crash_nv_load(&kind, &pid, &pc, comm, (int)sizeof comm)) {
+        if (crash_nv_load(&c)) {
             copy_str(what, "previous boot died after: ", CRASH_WHAT_MAX);
             /* Append the kind name by hand — no snprintf in this file. */
             int n = 0; while (what[n]) n++;
-            const char* k = crash_kind_name(kind);
+            const char* k = crash_kind_name(c.kind);
             while (*k && n < CRASH_WHAT_MAX - 1) what[n++] = *k++;
             what[n] = '\0';
-            crash_report(CRASH_UNCLEAN_BOOT, pid, comm[0] ? comm : "system",
-                         pc, 0, kind, what);
+            /* Re-report the breadcrumb as a first-class record: `addr` and
+             * `code` come across too, so the reconstructed entry is as usable
+             * as one captured live — the point of widening the crumb. */
+            crash_report(CRASH_UNCLEAN_BOOT, c.pid, c.comm[0] ? c.comm : "system",
+                         c.pc, c.addr, c.code, what);
             kprintf("crash: PREVIOUS BOOT ENDED UNCLEANLY — last recorded event was "
-                    "%s in '%s' (pid %d) at pc=%p — see `crash`\n",
-                    crash_kind_name(kind), comm[0] ? comm : "?", pid, (void*)pc);
+                    "%s in '%s' (pid %d) at pc=%p addr=%p code=%d, %us into that "
+                    "boot — see `crash`\n",
+                    crash_kind_name(c.kind), c.comm[0] ? c.comm : "?", c.pid,
+                    (void*)c.pc, (void*)c.addr, c.code, c.upsec);
         } else {
             crash_report(CRASH_UNCLEAN_BOOT, -1, "system", 0, 0, 0,
                          "previous boot ended without a clean shutdown");
@@ -251,4 +283,58 @@ void crash_boot_begin(void) {
 
 void crash_boot_clean(void) {
     hal_nvram_write(CRASH_NVRAM_SLOT, CRASH_MARK_CLEAN);
+}
+
+/* ---------------------------------------------------------------------------
+ * /proc/crash — the machine-readable face of the ring (§M47 stage 2).
+ *
+ * The `crash` command is for a human at a console; this node is for everything
+ * else: a script, a log shipper, a future GUI panel, a `cat /proc/crash` over a
+ * serial capture.  Same records, one line each, whitespace-separated with a
+ * header comment naming the columns — the shape the rest of /proc already uses.
+ *
+ * It reads the ring WITHOUT a lock, exactly like the capture side and for the
+ * same reason: a reader that could block a fault handler would invert the
+ * priority this whole subsystem exists to protect.  A torn read of a record
+ * being overwritten right now is possible in principle and harmless in practice
+ * — the ring is 32 deep and only a crash storm could reach the entry a reader
+ * is on.
+ * --------------------------------------------------------------------------- */
+static void pw_put_ptr(struct procfs_writer* w, uintptr_t v) {
+    pw_puts(w, "0x");
+    if (sizeof(uintptr_t) > 4) pw_put_hex(w, (unsigned)((uint64_t)v >> 32), 8);
+    pw_put_hex(w, (unsigned)(v & 0xFFFFFFFFu), 8);
+}
+
+static void gen_crash(struct procfs_writer* w) {
+    pw_puts(w, "captured "); pw_put_uint(w, (unsigned)g_captured); pw_putc(w, '\n');
+    pw_puts(w, "ring "); pw_put_uint(w, (unsigned)CRASH_RING); pw_putc(w, '\n');
+    pw_puts(w, "sinks ");
+    pw_put_uint(w, (unsigned)(__stop_crashsinks - __start_crashsinks));
+    pw_putc(w, '\n');
+    for (struct crash_sink* s = __start_crashsinks; s < __stop_crashsinks; s++) {
+        pw_puts(w, "sink "); pw_puts(w, s->name ? s->name : "?"); pw_putc(w, '\n');
+    }
+    pw_puts(w, "# records, newest first: "
+               "seq uptime_ms kind cpu pid comm pc addr code what\n");
+    for (int i = 0; i < CRASH_RING; i++) {
+        const struct crash_record* r = crash_at(i);
+        if (!r) break;
+        pw_put_uint(w, (unsigned)r->seq);            pw_putc(w, ' ');
+        pw_put_uint(w, (unsigned)r->ms);             pw_putc(w, ' ');
+        pw_puts(w, crash_kind_name(r->kind));        pw_putc(w, ' ');
+        pw_put_uint(w, (unsigned)r->cpu);            pw_putc(w, ' ');
+        pw_put_uint(w, (unsigned)r->pid);            pw_putc(w, ' ');
+        pw_puts(w, r->comm[0] ? r->comm : "?");      pw_putc(w, ' ');
+        pw_put_ptr(w, r->pc);                        pw_putc(w, ' ');
+        pw_put_ptr(w, r->addr);                      pw_putc(w, ' ');
+        pw_put_uint(w, (unsigned)r->code);           pw_putc(w, ' ');
+        pw_puts(w, r->what[0] ? r->what : "-");      pw_putc(w, '\n');
+    }
+}
+
+static struct procfs_node nd_crash = { .name = "crash", .gen = gen_crash };
+
+void crash_init(void) {
+    procfs_register(&nd_crash);
 }

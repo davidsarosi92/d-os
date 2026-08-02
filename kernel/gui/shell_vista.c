@@ -17,13 +17,18 @@
 #include "gui_internal.h"
 #include "gfx.h"
 #include "rtc.h"
+#include "keymap.h"
 #include <stdint.h>
 #include <stddef.h>
 
 #define TASKBAR_H   34
 #define START_W     74
 #define TBTN_W      150
-#define CLOCK_W     78
+/* Clock panel: "YYYY-MM-DD  HH:MM:SS  XX" = 24 glyphs + padding.  The date and
+ * the active keyboard layout live here because both are things you check by
+ * glancing at the corner, not by running a command — and a wrong layout is the
+ * single most confusing thing that can happen while typing. */
+#define CLOCK_W     212
 #define SM_W        210
 #define SM_ITEM_H   26
 #define SM_MAX_APPS 10                  /* menu rows before the power tail */
@@ -55,8 +60,10 @@ static int scr_w = 0, scr_h = 0;
 static int menu_open  = 0;
 static int menu_hover = -1;
 
-/* Clock cache — compositor-owned (second_tick + draw). */
-static char clock_str[12] = "";
+/* Clock cache — compositor-owned (second_tick + draw).  Holds the whole
+ * "date  time  layout" string, so draw() stays a single gfx_text call. */
+#define CLOCK_STR_MAX 32
+static char clock_str[CLOCK_STR_MAX] = "";
 
 /* -------------------------------------------------------------------------- */
 /* Geometry helpers shared by draw + hit-test.                                 */
@@ -260,20 +267,46 @@ static int vista_click(int x, int y) {
     return 1;                           /* dead taskbar area still consumed */
 }
 
+/* Two digits, zero-padded, at s[p]; returns the next write position. */
+static int put2(char* s, int p, unsigned v) {
+    s[p]     = (char)('0' + (v / 10) % 10);
+    s[p + 1] = (char)('0' + v % 10);
+    return p + 2;
+}
+
 static int vista_second_tick(void) {
     struct rtc_time t;
     if (rtc_read(&t) != 0) return 0;
-    char s[12];
-    s[0] = (char)('0' + t.hour / 10);  s[1] = (char)('0' + t.hour % 10);
-    s[2] = ':';
-    s[3] = (char)('0' + t.min / 10);   s[4] = (char)('0' + t.min % 10);
-    s[5] = ':';
-    s[6] = (char)('0' + t.sec / 10);   s[7] = (char)('0' + t.sec % 10);
-    s[8] = 0;
-    for (int i = 0; i < 9; i++) {
+
+    /* "YYYY-MM-DD  HH:MM:SS  XX" — ISO date (unambiguous in every locale),
+     * wall clock, then the active keyboard layout as an upper-case ISO code. */
+    char s[CLOCK_STR_MAX];
+    int p = 0;
+    p = put2(s, p, (unsigned)(t.year / 100));
+    p = put2(s, p, (unsigned)(t.year % 100));
+    s[p++] = '-'; p = put2(s, p, t.month);
+    s[p++] = '-'; p = put2(s, p, t.day);
+    s[p++] = ' '; s[p++] = ' ';
+    p = put2(s, p, t.hour); s[p++] = ':';
+    p = put2(s, p, t.min);  s[p++] = ':';
+    p = put2(s, p, t.sec);
+
+    const char* kb = keymap_current();
+    if (kb && kb[0]) {
+        s[p++] = ' '; s[p++] = ' ';
+        for (int i = 0; kb[i] && p < CLOCK_STR_MAX - 1; i++) {
+            char c = kb[i];
+            s[p++] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+        }
+    }
+    s[p] = 0;
+
+    /* Repaint only on an actual change — the tick fires every second but the
+     * layout (and, most seconds, the date) has not moved. */
+    for (int i = 0; i <= p; i++) {
         if (clock_str[i] != s[i]) {
-            for (int j = 0; j < 9; j++) clock_str[j] = s[j];
-            return 1;                   /* changed → repaint */
+            for (int j = 0; j <= p; j++) clock_str[j] = s[j];
+            return 1;
         }
     }
     return 0;

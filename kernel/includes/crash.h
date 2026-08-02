@@ -109,6 +109,7 @@ int  crash_drain(void);
 /* ---------------------------------------------------------------------------
  * Introspection — the `crash` shell command and /proc/crash read these.
  * ------------------------------------------------------------------------- */
+void crash_init(void);                               /* registers /proc/crash */
 int  crash_count(void);                              /* records captured ever */
 const struct crash_record* crash_at(int i);          /* newest-first, or NULL */
 const char* crash_kind_name(int kind);

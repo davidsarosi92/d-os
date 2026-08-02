@@ -502,6 +502,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/newshell.c \
     kernel/gui/apps/hello.c \
     kernel/gui/apps/taskman.c \
+    kernel/gui/apps/crashapp.c \
     kernel/gui/apps/editor.c \
     kernel/gui/apps/basic.c \
     kernel/gui/apps/netsurf_app.c \
@@ -601,6 +602,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/newshell.c \
     kernel/gui/apps/hello.c \
     kernel/gui/apps/taskman.c \
+    kernel/gui/apps/crashapp.c \
     kernel/gui/apps/editor.c \
     kernel/gui/apps/basic.c \
     kernel/gui/apps/netsurf_app.c \
@@ -663,6 +665,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/newshell.c \
     kernel/gui/apps/hello.c \
     kernel/gui/apps/taskman.c \
+    kernel/gui/apps/crashapp.c \
     kernel/gui/apps/editor.c \
     kernel/gui/apps/basic.c \
     kernel/gui/apps/netsurf_app.c \

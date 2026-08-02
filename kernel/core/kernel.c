@@ -143,6 +143,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * as early as possible: a crash between here and the marker being armed is
      * the one window this cannot cover. */
     crash_boot_begin();
+    crash_init();                    /* /proc/crash — procfs is already up */
 
     /* Keyboard layout (M16) — reads `keyboard.layout` from config and
      * activates one of the built-in layouts (us, hu).  Must run after
