@@ -3783,6 +3783,50 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 
 ## 8. Change log
 
+- **2026-08-02 — FIX: a syscall now runs with interrupts ENABLED (the freeze +
+  reboot when launching NetSurf from the desktop).**  Reported symptom: start
+  the GUI, launch NetSurf from the Start menu, the window appears — then the
+  machine freezes and reboots.  Reproduced by driving the Start menu from the
+  QEMU monitor's mouse, and diagnosed to a single call chain:
+  `linux_syscall_dispatch → dosgui_present → gui_window_blit → spin_lock` on
+  `windows[0].lock`, spinning forever.
+  **Root cause, and it was never really about the GUI.**  Both x86 syscall entry
+  paths arrive with IF clear — i386 through an interrupt gate (0xEE), x86_64
+  because `IA32_FMASK` clears IF on `SYSCALL` — and nothing re-enabled it.  So
+  every system call ran non-preemptibly from start to finish.  That is not just
+  a latency issue but a correctness one: a `spin_lock` taken inside a syscall
+  can NEVER be resolved on a uniprocessor, because the task holding the lock
+  cannot be scheduled while we spin with interrupts off.  Any contention on any
+  lock, in any syscall, was a guaranteed hard lockup; NetSurf's present syscall
+  contending with the compositor on a window lock is simply the first path that
+  hit it in practice.  The ~4 s ib700 watchdog then fired an NMI, classified it
+  as a kernel-mode lockup and rebooted — hence "freeze *and* restart".
+  Fixed identically on all three arches (`hal_intr_enable()` before the syscall
+  dispatch in `hal/x86/idt.c`, `hal/x86_64/idt.c` for both the `int 0x80` and
+  the `SYSCALL` sentinel, and `hal/aarch64/exceptions.c` for `svc`) — the bug
+  was arch-independent even though it surfaced on x86_64 first, so the treatment
+  is deliberately the same everywhere rather than a targeted patch on the arch
+  that happened to show it.  Safe because every user task has had its own kernel
+  stack since Tier B (being preempted mid-syscall just parks that stack), and
+  the force-kill safe point only fires for contexts interrupted in ring 3, so a
+  task inside a syscall is never torn down half-way through one.
+  **Why it stayed hidden, and the tooling fix that follows from it.**  The
+  kernel already had a deadlock detector that prints the lock address and the
+  caller — but its threshold (400M spins) was calibrated on i386 and did not
+  fire within the ~4 s watchdog window on x86_64.  The system knew exactly what
+  was wrong and never got to say it.  Lowered to 20M (measured to land well
+  inside the window); a false positive costs only a log line, since the detector
+  never changes behaviour.  With the watchdog removed from the QEMU command line
+  the same run printed the diagnosis immediately — *if a diagnostic can lose a
+  race with a recovery mechanism, it will.*
+  Verified: the exact reproduction (GUI → Start → NetSurf) now goes from
+  `NMI HARD-LOCKUP: 2, rebooting: 1, booted: 2` to all-zero and a single boot,
+  on **both** i386 and x86_64, with the browser rendering.  Regression at
+  `-smp 2`: `faulttest`, `fputest`, `archtest`, `fdtest`, `socktest`,
+  `polltest`, `solibtest`, `forktest`, `threadtest`, `musltest`, `dnstest`,
+  `httptest` (`HTTP/1.1 200 OK`) and `pkgrun sh -c` all green; aarch64 builds
+  clean.
+
 - **2026-08-02 — §M47 stage 1: crash records + pluggable reporting sinks.**
   The standing requirement is that a faulty program must never take the machine
   down — and that when something *does* go wrong, the system says so instead of

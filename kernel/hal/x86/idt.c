@@ -521,6 +521,24 @@ void isr_handler(struct int_frame* f) {
 
     if (f->int_no == 0x80) {
         /* Syscall from ring 3 (or ring 0 — we don't restrict). */
+    /* A syscall is an ORDINARY kernel context, so run it with interrupts
+     * ENABLED.  Both x86 entry paths arrive with IF clear — i386 through an
+     * interrupt gate (0xEE), x86_64 because IA32_FMASK clears IF on SYSCALL —
+     * and leaving it that way makes the kernel non-preemptible for the whole
+     * duration of every system call.  That is not just a latency problem, it is
+     * a correctness one: a `spin_lock` inside a syscall can then NEVER be
+     * resolved on a uniprocessor, because the task holding the lock cannot be
+     * scheduled while we spin with IRQs off.  That is a guaranteed hard lockup,
+     * and it is exactly what froze the machine when NetSurf's dosgui present
+     * syscall contended with the compositor on a window lock (see DOCS §8,
+     * 2026-08-02).  Identical treatment on both arches on purpose — the failure
+     * was arch-independent even though it only showed up on x86_64 first.
+     *
+     * Safe because every user task has had its own kernel stack since Tier B,
+     * so being preempted mid-syscall just parks this stack; and the force-kill
+     * safe point only fires for contexts interrupted in ring 3, so a task in a
+     * syscall is never torn down half-way through one. */
+        hal_intr_enable();
         syscall_dispatch(f);
         /* M34 — deliver a pending signal on the way back to ring 3 (rewrites
          * the trapframe to enter the handler; no-op in kernel mode). */

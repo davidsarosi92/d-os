@@ -1004,6 +1004,24 @@ in parallel with BSP."
   hog and idle every quantum, killing throughput.  Fix:
   `pick_next_locked` skips `is_idle` tasks; only the no-work
   fallback path picks idle.
+- *(added 2026-08-02)*  **A syscall must run preemptibly.**  Both x86
+  entry paths (interrupt gate on i386, FMASK on x86_64 SYSCALL) and the
+  AArch64 SVC vector all arrive with interrupts masked, and nothing
+  re-enabled them — so every system call was non-preemptible end to
+  end.  On a uniprocessor that turns ANY spinlock contention inside a
+  syscall into a guaranteed hard lockup: the holder can never be
+  scheduled while the spinner spins with IRQs off.  It presented as a
+  GUI bug (NetSurf's present syscall vs the compositor) but was
+  arch-independent and had nothing to do with the GUI.  Generalisation:
+  *whenever a context masks interrupts, ask what happens if code in it
+  waits for another task.*
+- *(added 2026-08-02)*  **If a diagnostic can lose a race with a
+  recovery mechanism, it will.**  The deadlock detector's threshold was
+  calibrated on i386 and did not fire inside the ~4 s hardware-watchdog
+  window on x86_64 — so the kernel knew exactly which lock and which
+  caller were stuck, and rebooted before it could say so.  Any
+  detector that competes with a watchdog/reset must be budgeted against
+  it explicitly, on the SLOWEST target.
 - *(added 2026-08-02)*  **The guarantee "a bad program cannot take the
   box down" needs TWO things, and M46 only had one.**  M46 made every
   fault handler kill just the process — but it assumed the handler

@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include "uaccess.h"      /* §1.1 — fault-fixup table for EL0 memory copies */
 #include "task.h"
+#include "hal_api.h"
 #include "crash.h"      /* §M47 — record every fault */
 
 /* Matches the trapframe laid down by exceptions.S (17 register-pairs). */
@@ -128,6 +129,17 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
             uint64_t esr;
             __asm__ volatile ("mrs %0, esr_el1" : "=r"(esr));
             if ((esr >> 26) == EC_SVC64) {   /* EL0/EL1 `svc` → syscall path */
+                /* Run the syscall with interrupts ENABLED — identical treatment
+                 * to the x86 `int 0x80` / SYSCALL branches, and for the same
+                 * reason: taking an exception masks DAIF, so a syscall would
+                 * otherwise run non-preemptibly from start to finish.  A
+                 * `spin_lock` inside one could then never be resolved on a
+                 * uniprocessor (the lock holder cannot be scheduled while we
+                 * spin with IRQs masked) — a guaranteed hard lockup.  See the
+                 * x86 twins and DOCS §8 (2026-08-02) for the failure this
+                 * actually caused.  `eret` restores PSTATE from SPSR_EL1, so
+                 * unmasking here does not disturb the return to EL0. */
+                hal_intr_enable();
                 aarch64_syscall(tf);
                 return;                       /* → RESTORE_TRAPFRAME → eret to EL0 */
             }
