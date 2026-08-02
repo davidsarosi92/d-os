@@ -600,13 +600,16 @@ int pkg_run(int argc, const char* const argv[]) {
 
 /* ----------------------- built-in recipes + init -------------------------- */
 
-/* Payload for the demo packages = the embedded user ELFs (weak — present on
- * the i386 build).  Two "hello" versions demonstrate coexistence; "args"
+/* Payload for the demo packages = the embedded user ELFs.  Weak, so the kernel
+ * links whether or not a given program was built into this image.  The symbol
+ * names are ARCH-NEUTRAL on purpose (the Makefile's --redefine-sym does that):
+ * the kernel refers to "the embedded hello program" and the build decides which
+ * architecture it is.  Two "hello" versions demonstrate coexistence; "args"
  * depends on hello-2 to demonstrate a pinned closure. */
-extern const unsigned char _binary_user_hello_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_hello_i386_elf_end[]   __attribute__((weak));
-extern const unsigned char _binary_user_args_i386_elf_start[]  __attribute__((weak));
-extern const unsigned char _binary_user_args_i386_elf_end[]    __attribute__((weak));
+extern const unsigned char _binary_user_hello_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_hello_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_args_elf_start[]  __attribute__((weak));
+extern const unsigned char _binary_user_args_elf_end[]    __attribute__((weak));
 
 /* musl-linked coreutils (Linux personality) — present only when musl was built
  * (`make musl`); weak so the kernel links without them otherwise. */
@@ -1051,16 +1054,16 @@ void pkg_init(void) {
 
     /* Native (d-os libc) demo packages. */
     rc_hello1 = (struct pkg_recipe){ .id="hello-1", .name="hello", .version="1.0",
-        .deps="", .content=_binary_user_hello_i386_elf_start,
-        .content_len=blob_len(_binary_user_hello_i386_elf_start, _binary_user_hello_i386_elf_end),
+        .deps="", .content=_binary_user_hello_elf_start,
+        .content_len=blob_len(_binary_user_hello_elf_start, _binary_user_hello_elf_end),
         .abi="native" };
     rc_hello2 = (struct pkg_recipe){ .id="hello-2", .name="hello", .version="2.0",
-        .deps="", .content=_binary_user_hello_i386_elf_start,
-        .content_len=blob_len(_binary_user_hello_i386_elf_start, _binary_user_hello_i386_elf_end),
+        .deps="", .content=_binary_user_hello_elf_start,
+        .content_len=blob_len(_binary_user_hello_elf_start, _binary_user_hello_elf_end),
         .abi="native" };
     rc_args   = (struct pkg_recipe){ .id="args", .name="args", .version="1.0",
-        .deps="hello-2", .content=_binary_user_args_i386_elf_start,
-        .content_len=blob_len(_binary_user_args_i386_elf_start, _binary_user_args_i386_elf_end),
+        .deps="hello-2", .content=_binary_user_args_elf_start,
+        .content_len=blob_len(_binary_user_args_elf_start, _binary_user_args_elf_end),
         .abi="native" };
     pkg_register(&rc_hello1);
     pkg_register(&rc_hello2);

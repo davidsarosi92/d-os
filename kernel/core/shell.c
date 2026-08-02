@@ -543,13 +543,13 @@ static void cmd_fputest(void) {
 
 /* §M46 — spawn the WEDGE test app: a ring-3 task that spins forever without ever
  * yielding.  `kill` (cooperative) cannot reclaim it; `fkill` (force) can. */
-extern const unsigned char _binary_user_wedge_i386_elf_start[]   __attribute__((weak));
-extern const unsigned char _binary_user_wedge_i386_elf_end[]     __attribute__((weak));
+extern const unsigned char _binary_user_wedge_elf_start[]   __attribute__((weak));
+extern const unsigned char _binary_user_wedge_elf_end[]     __attribute__((weak));
 extern const unsigned char _binary_user_wedge_x86_64_elf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_wedge_x86_64_elf_end[]   __attribute__((weak));
 static void cmd_wedge(void) {
     const unsigned char *s = 0, *e = 0;
-    if (_binary_user_wedge_i386_elf_start)        { s = _binary_user_wedge_i386_elf_start;   e = _binary_user_wedge_i386_elf_end; }
+    if (_binary_user_wedge_elf_start)        { s = _binary_user_wedge_elf_start;   e = _binary_user_wedge_elf_end; }
     else if (_binary_user_wedge_x86_64_elf_start) { s = _binary_user_wedge_x86_64_elf_start; e = _binary_user_wedge_x86_64_elf_end; }
     if (!s || !e) { console_write("wedge: no wedge ELF embedded for this arch\n"); return; }
     int pid = proc_spawn("wedge", s, (size_t)(e - s));
@@ -1636,8 +1636,8 @@ static void cmd_cron(const char* args) {
  * blob (user/hello.c → static ELF → objcopy).  Weak symbols so the command
  * still links on arches that don't embed the blob yet (i386 is the reference
  * port today). */
-extern const unsigned char _binary_user_hello_i386_elf_start[]    __attribute__((weak));
-extern const unsigned char _binary_user_hello_i386_elf_end[]      __attribute__((weak));
+extern const unsigned char _binary_user_hello_elf_start[]    __attribute__((weak));
+extern const unsigned char _binary_user_hello_elf_end[]      __attribute__((weak));
 extern const unsigned char _binary_user_hello_x86_64_elf_start[]  __attribute__((weak));
 extern const unsigned char _binary_user_hello_x86_64_elf_end[]    __attribute__((weak));
 extern const unsigned char _binary_user_hello_aarch64_elf_start[] __attribute__((weak));
@@ -1645,7 +1645,7 @@ extern const unsigned char _binary_user_hello_aarch64_elf_end[]   __attribute__(
 
 static const unsigned char* hello_blob(size_t* len) {
     const unsigned char *s = 0, *e = 0;
-    if (_binary_user_hello_i386_elf_start)    { s = _binary_user_hello_i386_elf_start;    e = _binary_user_hello_i386_elf_end; }
+    if (_binary_user_hello_elf_start)    { s = _binary_user_hello_elf_start;    e = _binary_user_hello_elf_end; }
     else if (_binary_user_hello_x86_64_elf_start)  { s = _binary_user_hello_x86_64_elf_start;  e = _binary_user_hello_x86_64_elf_end; }
     else if (_binary_user_hello_aarch64_elf_start) { s = _binary_user_hello_aarch64_elf_start; e = _binary_user_hello_aarch64_elf_end; }
     if (!s || !e) return 0;
@@ -1668,8 +1668,8 @@ static void cmd_libctest(void) {
 /* Tier B — `procspawn`: launch TWO copies of the spin demo as independent,
  * preemptible user processes; their interleaved output proves concurrent
  * ring-3 tasks time-sliced by the scheduler, each exiting on its own SYS_EXIT. */
-extern const unsigned char _binary_user_spin_i386_elf_start[]    __attribute__((weak));
-extern const unsigned char _binary_user_spin_i386_elf_end[]      __attribute__((weak));
+extern const unsigned char _binary_user_spin_elf_start[]    __attribute__((weak));
+extern const unsigned char _binary_user_spin_elf_end[]      __attribute__((weak));
 extern const unsigned char _binary_user_spin_x86_64_elf_start[]  __attribute__((weak));
 extern const unsigned char _binary_user_spin_x86_64_elf_end[]    __attribute__((weak));
 extern const unsigned char _binary_user_spin_aarch64_elf_start[] __attribute__((weak));
@@ -1679,7 +1679,7 @@ extern const unsigned char _binary_user_spin_aarch64_elf_end[]   __attribute__((
  * image; the other weak symbols resolve to NULL). */
 static const unsigned char* spin_blob(size_t* len) {
     const unsigned char *s = 0, *e = 0;
-    if (_binary_user_spin_i386_elf_start)    { s = _binary_user_spin_i386_elf_start;    e = _binary_user_spin_i386_elf_end; }
+    if (_binary_user_spin_elf_start)    { s = _binary_user_spin_elf_start;    e = _binary_user_spin_elf_end; }
     else if (_binary_user_spin_x86_64_elf_start)  { s = _binary_user_spin_x86_64_elf_start;  e = _binary_user_spin_x86_64_elf_end; }
     else if (_binary_user_spin_aarch64_elf_start) { s = _binary_user_spin_aarch64_elf_start; e = _binary_user_spin_aarch64_elf_end; }
     if (!s || !e) return 0;
@@ -1702,15 +1702,15 @@ static void cmd_procspawn(void) {
 
 /* M34 slice A — `runargs [a b c ...]`: exec the args test program with an
  * argv built by the kernel; it prints argc + each argv from ring 3. */
-extern const unsigned char _binary_user_args_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_args_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_args_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_args_elf_end[]   __attribute__((weak));
 
 static void cmd_runargs(const char* line) {
-    if (!_binary_user_args_i386_elf_start) {
+    if (!_binary_user_args_elf_start) {
         console_write("runargs: args ELF not embedded for this arch\n");
         return;
     }
-    size_t len = (size_t)(_binary_user_args_i386_elf_end - _binary_user_args_i386_elf_start);
+    size_t len = (size_t)(_binary_user_args_elf_end - _binary_user_args_elf_start);
 
     /* Split `line` into up to 15 whitespace-separated argv strings, in place
      * (a scratch copy).  argv[0] is the program name. */
@@ -1732,25 +1732,25 @@ static void cmd_runargs(const char* line) {
     }
 
     kprintf("runargs: exec'ing args program with %d argv...\n", argc);
-    int rc = proc_exec_elf_argv(_binary_user_args_i386_elf_start, len,
+    int rc = proc_exec_elf_argv(_binary_user_args_elf_start, len,
                                 argc, (const char* const*)argv);
     kprintf("runargs: returned rc=%d\n", rc);
 }
 
 /* M34 slice B — `forktest`: exec a user program that fork()s, the child exits
  * with a code, and the parent waitpid()s for it. */
-extern const unsigned char _binary_user_forktest_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_forktest_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_forktest_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_forktest_elf_end[]   __attribute__((weak));
 
 static void cmd_forktest(void) {
-    if (!_binary_user_forktest_i386_elf_start) {
+    if (!_binary_user_forktest_elf_start) {
         console_write("forktest: not embedded for this arch\n");
         return;
     }
-    size_t len = (size_t)(_binary_user_forktest_i386_elf_end -
-                          _binary_user_forktest_i386_elf_start);
+    size_t len = (size_t)(_binary_user_forktest_elf_end -
+                          _binary_user_forktest_elf_start);
     console_write("forktest: exec'ing fork()+waitpid() program...\n");
-    int rc = proc_exec_elf(_binary_user_forktest_i386_elf_start, len);
+    int rc = proc_exec_elf(_binary_user_forktest_elf_start, len);
     kprintf("forktest: returned rc=%d\n", rc);
 }
 
@@ -1771,157 +1771,157 @@ void bin_install(void) {
     if (done) return;
     done = 1;
     vfs_mkdir("/bin");
-    bin_install_one("/bin/args",  _binary_user_args_i386_elf_start,
-                                  _binary_user_args_i386_elf_end);
-    bin_install_one("/bin/hello", _binary_user_hello_i386_elf_start,
-                                  _binary_user_hello_i386_elf_end);
+    bin_install_one("/bin/args",  _binary_user_args_elf_start,
+                                  _binary_user_args_elf_end);
+    bin_install_one("/bin/hello", _binary_user_hello_elf_start,
+                                  _binary_user_hello_elf_end);
 }
 
 /* M34 slice C — `forkexec`: fork()+execv(/bin/args)+waitpid() from ring 3. */
-extern const unsigned char _binary_user_forkexec_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_forkexec_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_forkexec_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_forkexec_elf_end[]   __attribute__((weak));
 
 static void cmd_forkexec(void) {
-    if (!_binary_user_forkexec_i386_elf_start) {
+    if (!_binary_user_forkexec_elf_start) {
         console_write("forkexec: not embedded for this arch\n");
         return;
     }
-    size_t len = (size_t)(_binary_user_forkexec_i386_elf_end -
-                          _binary_user_forkexec_i386_elf_start);
+    size_t len = (size_t)(_binary_user_forkexec_elf_end -
+                          _binary_user_forkexec_elf_start);
     console_write("forkexec: exec'ing fork()+execv()+waitpid() program...\n");
-    int rc = proc_exec_elf(_binary_user_forkexec_i386_elf_start, len);
+    int rc = proc_exec_elf(_binary_user_forkexec_elf_start, len);
     kprintf("forkexec: returned rc=%d\n", rc);
 }
 
 /* M34 slice D — `pipetest`: pipe()+dup2()+fork() from ring 3. */
-extern const unsigned char _binary_user_pipetest_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_pipetest_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_pipetest_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_pipetest_elf_end[]   __attribute__((weak));
 
 static void cmd_pipetest(void) {
-    if (!_binary_user_pipetest_i386_elf_start) {
+    if (!_binary_user_pipetest_elf_start) {
         console_write("pipetest: not embedded for this arch\n");
         return;
     }
-    size_t len = (size_t)(_binary_user_pipetest_i386_elf_end -
-                          _binary_user_pipetest_i386_elf_start);
+    size_t len = (size_t)(_binary_user_pipetest_elf_end -
+                          _binary_user_pipetest_elf_start);
     console_write("pipetest: exec'ing pipe()+dup2()+fork() program...\n");
-    int rc = proc_exec_elf(_binary_user_pipetest_i386_elf_start, len);
+    int rc = proc_exec_elf(_binary_user_pipetest_elf_start, len);
     kprintf("pipetest: returned rc=%d\n", rc);
 }
 
 /* M34 slice E — `sigtest`: signal()+raise()+handler from ring 3. */
-extern const unsigned char _binary_user_sigtest_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_sigtest_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_sigtest_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_sigtest_elf_end[]   __attribute__((weak));
 
 static void cmd_sigtest(void) {
-    if (!_binary_user_sigtest_i386_elf_start) {
+    if (!_binary_user_sigtest_elf_start) {
         console_write("sigtest: not embedded for this arch\n");
         return;
     }
-    size_t len = (size_t)(_binary_user_sigtest_i386_elf_end -
-                          _binary_user_sigtest_i386_elf_start);
+    size_t len = (size_t)(_binary_user_sigtest_elf_end -
+                          _binary_user_sigtest_elf_start);
     console_write("sigtest: exec'ing signal()+raise() program...\n");
-    int rc = proc_exec_elf(_binary_user_sigtest_i386_elf_start, len);
+    int rc = proc_exec_elf(_binary_user_sigtest_elf_start, len);
     kprintf("sigtest: returned rc=%d\n", rc);
 }
 
 /* M24 socket API — `dnstest`: resolve a hostname over a UDP socket from ring 3. */
-extern const unsigned char _binary_user_dnstest_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_dnstest_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_dnstest_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_dnstest_elf_end[]   __attribute__((weak));
 
 static void cmd_dnstest(void) {
-    if (!_binary_user_dnstest_i386_elf_start) {
+    if (!_binary_user_dnstest_elf_start) {
         console_write("dnstest: not embedded for this arch\n");
         return;
     }
-    size_t len = (size_t)(_binary_user_dnstest_i386_elf_end -
-                          _binary_user_dnstest_i386_elf_start);
+    size_t len = (size_t)(_binary_user_dnstest_elf_end -
+                          _binary_user_dnstest_elf_start);
     console_write("dnstest: exec'ing UDP-socket DNS resolver...\n");
-    int rc = proc_exec_elf(_binary_user_dnstest_i386_elf_start, len);
+    int rc = proc_exec_elf(_binary_user_dnstest_elf_start, len);
     kprintf("dnstest: returned rc=%d\n", rc);
 }
 
 /* M24 socket API — `httptest`: DNS + TCP-socket HTTP GET from ring 3. */
-extern const unsigned char _binary_user_httptest_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_httptest_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_httptest_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_httptest_elf_end[]   __attribute__((weak));
 
 static void cmd_httptest(void) {
-    if (!_binary_user_httptest_i386_elf_start) {
+    if (!_binary_user_httptest_elf_start) {
         console_write("httptest: not embedded for this arch\n");
         return;
     }
-    size_t len = (size_t)(_binary_user_httptest_i386_elf_end -
-                          _binary_user_httptest_i386_elf_start);
+    size_t len = (size_t)(_binary_user_httptest_elf_end -
+                          _binary_user_httptest_elf_start);
     console_write("httptest: exec'ing TCP-socket HTTP client...\n");
-    int rc = proc_exec_elf(_binary_user_httptest_i386_elf_start, len);
+    int rc = proc_exec_elf(_binary_user_httptest_elf_start, len);
     kprintf("httptest: returned rc=%d\n", rc);
 }
 
 /* M35 — `threadtest`: threads + a futex mutex from ring 3. */
-extern const unsigned char _binary_user_threadtest_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_threadtest_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_threadtest_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_threadtest_elf_end[]   __attribute__((weak));
 
 static void cmd_threadtest(void) {
-    if (!_binary_user_threadtest_i386_elf_start) {
+    if (!_binary_user_threadtest_elf_start) {
         console_write("threadtest: not embedded for this arch\n");
         return;
     }
-    size_t len = (size_t)(_binary_user_threadtest_i386_elf_end -
-                          _binary_user_threadtest_i386_elf_start);
+    size_t len = (size_t)(_binary_user_threadtest_elf_end -
+                          _binary_user_threadtest_elf_start);
     console_write("threadtest: exec'ing threads + futex-mutex program...\n");
-    int rc = proc_exec_elf(_binary_user_threadtest_i386_elf_start, len);
+    int rc = proc_exec_elf(_binary_user_threadtest_elf_start, len);
     kprintf("threadtest: returned rc=%d\n", rc);
 }
 
 /* M35 — `tlstest`: thread-local storage via %gs from ring 3. */
-extern const unsigned char _binary_user_tlstest_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_tlstest_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_tlstest_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_tlstest_elf_end[]   __attribute__((weak));
 
 static void cmd_tlstest(void) {
-    if (!_binary_user_tlstest_i386_elf_start) {
+    if (!_binary_user_tlstest_elf_start) {
         console_write("tlstest: not embedded for this arch\n");
         return;
     }
-    size_t len = (size_t)(_binary_user_tlstest_i386_elf_end -
-                          _binary_user_tlstest_i386_elf_start);
+    size_t len = (size_t)(_binary_user_tlstest_elf_end -
+                          _binary_user_tlstest_elf_start);
     console_write("tlstest: exec'ing thread-local-storage program...\n");
-    int rc = proc_exec_elf(_binary_user_tlstest_i386_elf_start, len);
+    int rc = proc_exec_elf(_binary_user_tlstest_elf_start, len);
     kprintf("tlstest: returned rc=%d\n", rc);
 }
 
 /* M36 — `posixtest`: broader POSIX syscalls (uname/stat/getdents/clock) from ring 3. */
-extern const unsigned char _binary_user_posixtest_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_posixtest_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_posixtest_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_posixtest_elf_end[]   __attribute__((weak));
 
 static void cmd_posixtest(void) {
-    if (!_binary_user_posixtest_i386_elf_start) {
+    if (!_binary_user_posixtest_elf_start) {
         console_write("posixtest: not embedded for this arch\n");
         return;
     }
-    size_t len = (size_t)(_binary_user_posixtest_i386_elf_end -
-                          _binary_user_posixtest_i386_elf_start);
+    size_t len = (size_t)(_binary_user_posixtest_elf_end -
+                          _binary_user_posixtest_elf_start);
     console_write("posixtest: exec'ing POSIX-surface program...\n");
-    int rc = proc_exec_elf(_binary_user_posixtest_i386_elf_start, len);
+    int rc = proc_exec_elf(_binary_user_posixtest_elf_start, len);
     kprintf("posixtest: returned rc=%d\n", rc);
 }
 
 /* M36 — `linuxtest`: run a Linux-ABI program under the Linux personality
  * (task->linux_abi), routing its syscalls through the linux_abi translator. */
-extern const unsigned char _binary_user_linuxhello_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_linuxhello_i386_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_linuxhello_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_linuxhello_elf_end[]   __attribute__((weak));
 
 static void cmd_linuxtest(void) {
-    if (!_binary_user_linuxhello_i386_elf_start) {
+    if (!_binary_user_linuxhello_elf_start) {
         console_write("linuxtest: not embedded for this arch\n");
         return;
     }
-    size_t len = (size_t)(_binary_user_linuxhello_i386_elf_end -
-                          _binary_user_linuxhello_i386_elf_start);
+    size_t len = (size_t)(_binary_user_linuxhello_elf_end -
+                          _binary_user_linuxhello_elf_start);
     console_write("linuxtest: exec'ing a Linux-ABI program (Linux personality)...\n");
     struct task* me = task_current();
     int prev = me ? me->linux_abi : 0;
     if (me) me->linux_abi = 1;                 /* Linux syscall ABI for the excursion */
-    int rc = proc_exec_elf(_binary_user_linuxhello_i386_elf_start, len);
+    int rc = proc_exec_elf(_binary_user_linuxhello_elf_start, len);
     if (me) me->linux_abi = prev;
     kprintf("linuxtest: returned rc=%d\n", rc);
 }
@@ -2156,10 +2156,10 @@ static void cmd_dlopentest(void) {
  * protocol over fd 3 from user space.  The client blocks on read(3), the server
  * task runs concurrently and answers; on exit fd_close_all() closes fd 3 and the
  * server sees EOF + tears down. */
-extern const unsigned char _binary_user_wlclient_i386_elf_start[] __attribute__((weak));
-extern const unsigned char _binary_user_wlclient_i386_elf_end[]   __attribute__((weak));
-extern const unsigned char _binary_user_wlapp_i386_elf_start[]    __attribute__((weak));
-extern const unsigned char _binary_user_wlapp_i386_elf_end[]      __attribute__((weak));
+extern const unsigned char _binary_user_wlclient_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_wlclient_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_wlapp_elf_start[]    __attribute__((weak));
+extern const unsigned char _binary_user_wlapp_elf_end[]      __attribute__((weak));
 
 /* Run a ring-3 Wayland client blob: hand it fd 3 = one end of a usock_pair, run
  * the server on its own task on the other end, exec the client. */
@@ -2187,12 +2187,12 @@ static void run_wayland_client(const char* what, const unsigned char* s,
 }
 
 static void cmd_wayclient(void) {
-    run_wayland_client("wayclient", _binary_user_wlclient_i386_elf_start,
-                       _binary_user_wlclient_i386_elf_end);
+    run_wayland_client("wayclient", _binary_user_wlclient_elf_start,
+                       _binary_user_wlclient_elf_end);
 }
 static void cmd_wayapp(void) {
-    run_wayland_client("wayapp", _binary_user_wlapp_i386_elf_start,
-                       _binary_user_wlapp_i386_elf_end);
+    run_wayland_client("wayapp", _binary_user_wlapp_elf_start,
+                       _binary_user_wlapp_elf_end);
 }
 
 /* §M35.5 + §M36 — `pkgrun <name> [args...]`: exec an INSTALLED package's binary

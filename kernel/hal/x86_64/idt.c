@@ -420,6 +420,9 @@ void isr_handler(struct int_frame* f) {
      * syscall is never torn down half-way through one. */
         hal_intr_enable();
         syscall_dispatch(f);
+        /* M34 — deliver a pending signal on the way back to ring 3 (rewrites
+         * the trapframe to enter the handler; no-op in kernel mode). */
+        signal_deliver(f);
         return;
     }
 
@@ -430,6 +433,7 @@ void isr_handler(struct int_frame* f) {
     if (f->int_no == 0x81) {
         hal_intr_enable();          /* same reasoning as the 0x80 branch above */
         linux_syscall_dispatch(f);
+        signal_deliver(f);          /* same return-to-ring-3 hook as int 0x80 */
         return;
     }
 

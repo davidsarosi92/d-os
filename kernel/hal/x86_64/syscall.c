@@ -37,6 +37,9 @@
 #include "printf.h"
 #include "hal_api.h"
 #include "task.h"
+#include "proc.h"
+#include "usermode.h"
+#include "percpu.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -166,6 +169,139 @@ static void syscall_dispatch_body(struct int_frame* f) {
         case SYS_POLL:
             f->rax = (uint64_t)sys_poll((struct pollfd*)(uintptr_t)f->rbx,
                                         (int)f->rcx, (int)f->rdx);
+            return;
+
+        /* ------------------------------------------------------------------
+         * M34/M35/M36 — the rest of the native ABI.
+         *
+         * Every case below calls the SAME portable core the i386 dispatcher
+         * calls; the only arch-specific part is reading the arguments out of
+         * this frame.  They were missing here for no deeper reason than that
+         * this file was written before them, which is what made x86_64's
+         * userland look far smaller than i386's: the programs linked fine and
+         * then died on "syscall: unknown number".
+         * ------------------------------------------------------------------ */
+
+        /* M34 — fork(): snapshot the caller's ring-3 register state so the
+         * child can be resumed with RAX = 0 (see hal/x86_64/fork.c). */
+        case SYS_FORK: {
+            struct user_regs r;
+            r.rax = 0;
+            r.rbx = f->rbx; r.rcx = f->rcx; r.rdx = f->rdx;
+            r.rsi = f->rsi; r.rdi = f->rdi; r.rbp = f->rbp;
+            r.r8  = f->r8;  r.r9  = f->r9;  r.r10 = f->r10; r.r11 = f->r11;
+            r.r12 = f->r12; r.r13 = f->r13; r.r14 = f->r14; r.r15 = f->r15;
+            r.rip = f->rip; r.rflags = f->rflags; r.user_sp = f->rsp;
+            f->rax = (uint64_t)proc_fork(&r);
+            return;
+        }
+
+        /* M34 — waitpid(pid, int* status). */
+        case SYS_WAITPID: {
+            int status = 0;
+            int pid = task_wait((int)f->rbx, &status);
+            if (f->rcx) *(int*)(uintptr_t)f->rcx = status;
+            f->rax = (uint64_t)pid;
+            return;
+        }
+
+        /* M34 — execve(path, argv): on success it does not return. */
+        case SYS_EXECVE:
+            f->rax = (uint64_t)proc_execve((const char*)(uintptr_t)f->rbx,
+                                           (char* const*)(uintptr_t)f->rcx);
+            return;
+
+        case SYS_PIPE:
+            f->rax = (uint64_t)sys_pipe((int*)(uintptr_t)f->rbx);
+            return;
+        case SYS_DUP2:
+            f->rax = (uint64_t)sys_dup2((int)f->rbx, (int)f->rcx);
+            return;
+
+        /* M34 signals. */
+        case SYS_KILL:
+            f->rax = (uint64_t)sys_kill((int)f->rbx, (int)f->rcx);
+            return;
+        case SYS_SIGACTION:
+            f->rax = (uint64_t)sys_sigaction((int)f->rbx, (long)f->rcx, (long)f->rdx);
+            return;
+        case SYS_SIGRETURN:
+            /* Restores the pre-handler context; do NOT touch f->rax afterwards
+             * (signal_sigreturn set it to the interrupted syscall's result). */
+            signal_sigreturn(f);
+            return;
+
+        /* M24 — network sockets (AF_INET). */
+        case SYS_SOCKET:
+            f->rax = (uint64_t)sys_socket((int)f->rbx, (int)f->rcx, (int)f->rdx);
+            return;
+        case SYS_BIND:
+            f->rax = (uint64_t)sys_bind((int)f->rbx, (int)f->rcx);
+            return;
+        case SYS_CONNECT:
+            f->rax = (uint64_t)sys_connect((int)f->rbx, (uint32_t)f->rcx, (int)f->rdx);
+            return;
+        case SYS_SENDTO:
+            f->rax = (uint64_t)sys_sendto((int)f->rbx, (const void*)(uintptr_t)f->rcx,
+                                          (size_t)f->rdx, (uint32_t)f->rsi, (int)f->rdi);
+            return;
+        case SYS_RECVFROM:
+            f->rax = (uint64_t)sys_recvfrom((int)f->rbx, (void*)(uintptr_t)f->rcx,
+                                            (size_t)f->rdx,
+                                            (uint32_t*)(uintptr_t)f->rsi,
+                                            (int*)(uintptr_t)f->rdi);
+            return;
+
+        /* M35 — threads. */
+        case SYS_CLONE:
+            f->rax = (uint64_t)proc_clone((uintptr_t)f->rbx, (uintptr_t)f->rcx);
+            return;
+        case SYS_FUTEX:
+            f->rax = (uint64_t)sys_futex((int*)(uintptr_t)f->rbx, (int)f->rcx,
+                                         (int)f->rdx);
+            return;
+
+        /* M35 TLS — unlike i386 (where the thread pointer lives in a per-CPU
+         * GDT segment and userland must load the returned selector), x86_64
+         * puts it in the FS.base MSR, which the kernel writes itself.  There is
+         * therefore NO selector to hand back and no need to pin the task to a
+         * CPU: the base is restored on every context switch (see tss.c).  We
+         * return 0 and user/libc.c's set_tls ignores it on non-i386. */
+        case SYS_SET_TLS: {
+            struct task* t = task_current();
+            if (!t) { f->rax = 0; return; }
+            t->tls_base = (uintptr_t)f->rbx;
+            t->has_tls  = 1;
+            hal_set_tls_base(t->tls_base);
+            f->rax = 0;
+            return;
+        }
+
+        /* M36 — POSIX syscall breadth. */
+        case SYS_STAT:
+            f->rax = (uint64_t)sys_stat((const char*)(uintptr_t)f->rbx,
+                                        (struct kstat*)(uintptr_t)f->rcx);
+            return;
+        case SYS_FSTAT:
+            f->rax = (uint64_t)sys_fstat((int)f->rbx, (struct kstat*)(uintptr_t)f->rcx);
+            return;
+        case SYS_GETDENTS:
+            f->rax = (uint64_t)sys_getdents((int)f->rbx, (void*)(uintptr_t)f->rcx,
+                                            (size_t)f->rdx);
+            return;
+        case SYS_UNAME:
+            f->rax = (uint64_t)sys_uname((struct kutsname*)(uintptr_t)f->rbx);
+            return;
+        case SYS_CLOCK_GETTIME:
+            f->rax = (uint64_t)sys_clock_gettime((int)f->rbx,
+                                                 (struct ktimespec*)(uintptr_t)f->rcx);
+            return;
+        case SYS_NANOSLEEP:
+            f->rax = (uint64_t)sys_nanosleep((unsigned)f->rbx);
+            return;
+        case SYS_GETRANDOM:
+            f->rax = (uint64_t)sys_getrandom((void*)(uintptr_t)f->rbx, (size_t)f->rcx,
+                                             (unsigned)f->rdx);
             return;
 
         default:

@@ -35,6 +35,46 @@ COMMON_CFLAGS := -ffreestanding -fno-stack-protector -fno-pie -nostdlib \
 # the corresponding ARCH branch.
 # -----------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------------
+# Userland lists shared by the two x86 arches.
+#
+# WHY THESE ARE SHARED AND NOT COPIED PER ARCH: every build rule below is
+# already $(ARCH)-parameterised, so the only thing that ever made x86_64's
+# userland smaller than i386's was these lists being written out twice and one
+# copy falling behind.  Keeping them in ONE place is what turns "x86_64 has
+# parity" from a claim into a property of the build.
+#
+# Ring-3 programs built against the IN-TREE libc (user/libc.c), whose syscall
+# shim covers all three arches.
+X86_USER_BLOBS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
+                  user/args_blob.o user/forktest_blob.o user/forkexec_blob.o \
+                  user/pipetest_blob.o user/sigtest_blob.o \
+                  user/dnstest_blob.o user/httptest_blob.o \
+                  user/threadtest_blob.o user/tlstest_blob.o \
+                  user/posixtest_blob.o \
+                  user/wlclient_blob.o user/wlapp_blob.o
+# NB: linuxhello is deliberately NOT here — it hard-codes the i386 Linux syscall
+# numbers and `int 0x80`, which is the whole point of that program (it mimics an
+# unmodified 32-bit Linux binary).  The x86_64 equivalent would be a separate
+# source using the SYSCALL instruction and the amd64 numbers.
+
+# Coreutils linked against REAL musl.  The list is the modular seam: add a name
+# here + a user/<name>.c + a recipe in pkg.c and both arches pick it up.
+MUSL_COREUTILS := echo cat ls env sh
+MUSL_COREUTIL_BLOBS := $(patsubst %,user/%_muslblob.o,$(MUSL_COREUTILS))
+# Other musl-linked programs that are not coreutils (socket/network probes).
+MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o
+# §M37 dynamic-linking artifacts — the ld.so blob + the dynamically linked tests.
+MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
+                   user/libgreet_blob.o user/solibtest_dynblob.o \
+                   user/dlopentest_dynblob.o
+# §M38 C++ runtime artifacts (cpptest = exceptions across a .so + the .so's).
+CXX_RUNTIME_BLOBS := user/cpptest_cxxblob.o user/libcpplib_blob.o \
+                     user/libstdcxx_blob.o user/libgccs_blob.o
+# §M39 TLS test programs (link against the ported Mbed TLS).
+MBEDTLS_PROG_BLOBS := user/crypttest_muslblob.o user/ssltest_muslblob.o \
+                      user/httpstest_muslblob.o user/wget_muslblob.o
+
 ifeq ($(ARCH),i386)
   CFLAGS  := -m32 $(COMMON_CFLAGS)
   ASFLAGS := -f elf32
@@ -71,23 +111,14 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/usermode.s \
       kernel/hal/x86/switch.s
 
-  ARCH_EXTRA_OBJS := kernel/hal/x86/ap_trampoline_blob.o user/hello_blob.o \
-                     user/spin_blob.o user/wedge_blob.o user/args_blob.o user/forktest_blob.o \
-                     user/forkexec_blob.o user/pipetest_blob.o \
-                     user/sigtest_blob.o user/dnstest_blob.o \
-                     user/httptest_blob.o user/threadtest_blob.o \
-                     user/tlstest_blob.o user/posixtest_blob.o \
-                     user/linuxhello_blob.o user/wlclient_blob.o user/wlapp_blob.o
+  ARCH_EXTRA_OBJS := kernel/hal/x86/ap_trampoline_blob.o $(X86_USER_BLOBS) \
+                     user/linuxhello_blob.o
 
   # REAL musl-linked programs are embedded ONLY when musl has been built
   # (`make musl`); otherwise the kernel builds without them.  This keeps the
   # default build independent of the (fetched, on-demand) musl toolchain.
-  # MUSL_COREUTILS is the modular list — add a coreutil by adding its name here
-  # (+ a user/<name>.c) and a recipe in pkg.c; the build + blob are generic.
-  MUSL_COREUTILS := echo cat ls env sh
   ifneq ($(wildcard third_party/musl-i386/lib/libc.a),)
-    ARCH_EXTRA_OBJS += user/muslhello_muslblob.o user/netmusl_muslblob.o \
-                       $(patsubst %,user/%_muslblob.o,$(MUSL_COREUTILS))
+    ARCH_EXTRA_OBJS += $(MUSL_PROG_BLOBS) $(MUSL_COREUTIL_BLOBS)
   endif
 
   # §M37: dynamic-linking artifacts need the SHARED musl (libc.so, produced by
@@ -95,17 +126,15 @@ ifeq ($(ARCH),i386)
   # kernel can install it at /lib/ld-musl-i386.so.1); muslhellodyn = a
   # dynamically-linked test program (PT_INTERP set, PIE main).
   ifneq ($(wildcard third_party/musl-i386/lib/libc.so),)
-    ARCH_EXTRA_OBJS += user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
-                       user/libgreet_blob.o user/solibtest_dynblob.o \
-                       user/dlopentest_dynblob.o
+    ARCH_EXTRA_OBJS += $(MUSL_DYN_BLOBS)
   endif
 
   # §M39 stage 2+3: crypttest + ssltest link against the ported Mbed TLS.
   # stage 3b: httpstest = real HTTPS over an M24 socket + the CA bundle
   # (third_party/cacert.pem, provisioned to /etc/ssl/cert.pem at boot).
-  ifneq ($(wildcard third_party/mbedtls-i686/lib/libmbedcrypto.a),)
-    ARCH_EXTRA_OBJS += user/crypttest_muslblob.o user/ssltest_muslblob.o \
-                       user/httpstest_muslblob.o user/wget_muslblob.o
+  MBEDTLS_PREFIX := third_party/mbedtls-i686
+  ifneq ($(wildcard $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a),)
+    ARCH_EXTRA_OBJS += $(MBEDTLS_PROG_BLOBS)
     ifneq ($(wildcard third_party/cacert.pem),)
       ARCH_EXTRA_OBJS += third_party/cacert_blob.o
     endif
@@ -115,13 +144,13 @@ ifeq ($(ARCH),i386)
   # built (make musl-cross-i686).  cpptest = the DoD (exceptions across a .so);
   # libcpplib/libstdcxx/libgccs are the .so's provisioned into /lib at boot.
   ifneq ($(wildcard third_party/musl-cross-i686/bin/i686-linux-musl-g++),)
-    ARCH_EXTRA_OBJS += user/cpptest_cxxblob.o user/libcpplib_blob.o \
-                       user/libstdcxx_blob.o user/libgccs_blob.o
+    ARCH_EXTRA_OBJS += $(CXX_RUNTIME_BLOBS)
   endif
 
   # §M43: the on-device C compiler (make tcc) — the tcc binary + a rootfs
   # archive (tcc/musl headers + crt) unpacked into the VFS at boot.
-  ifneq ($(wildcard third_party/tinycc-i686/bin/tcc),)
+  TINYCC_PREFIX := third_party/tinycc-i686
+  ifneq ($(wildcard $(TINYCC_PREFIX)/bin/tcc),)
     ARCH_EXTRA_OBJS += user/dostcc_blob.o user/rootfs_blob.o
   endif
 
@@ -183,7 +212,8 @@ ifeq ($(ARCH),i386)
   USER_LDEMU    := -m elf_i386
   USER_BASE     := 0x40000000
   USER_OCARGS   := --output-target=elf32-i386 --binary-architecture=i386
-  USER_CRT0_BUILD = nasm -f elf32 user/crt0.s -o $(OBJ_DIR)/user/crt0.o
+  USER_CRT0_SRC   = user/crt0.s
+  USER_CRT0_BUILD = nasm -f elf32 $(USER_CRT0_SRC) -o $(OBJ_DIR)/user/crt0.o
   # The canonical PT_INTERP path an i386 musl dynamic binary carries.
   DOS_LDSO      := /lib/ld-musl-i386.so.1
 
@@ -238,6 +268,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/uaccess.c \
       kernel/hal/x86_64/linux_abi.c \
       kernel/hal/x86_64/fork.c \
+      kernel/hal/x86_64/signal.c \
       kernel/hal/x86/lapic.c \
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/pci.c \
@@ -251,8 +282,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/usermode.s \
       kernel/hal/x86_64/syscall_entry.s
 
-  ARCH_EXTRA_OBJS := kernel/hal/x86_64/ap_trampoline_blob.o \
-                     user/hello_blob.o user/spin_blob.o user/wedge_blob.o
+  ARCH_EXTRA_OBJS := kernel/hal/x86_64/ap_trampoline_blob.o $(X86_USER_BLOBS)
 
   # Tier B — in-tree user libc build knobs (x86_64).  -mno-sse* because the
   # kernel does not init/save FPU/XMM state for user tasks.
@@ -262,7 +292,8 @@ else ifeq ($(ARCH),x86_64)
   USER_LDEMU    := -m elf_x86_64
   USER_BASE     := 0x40000000
   USER_OCARGS   := --output-target=elf64-x86-64 --binary-architecture=i386
-  USER_CRT0_BUILD = nasm -f elf64 user/crt0_x86_64.s -o $(OBJ_DIR)/user/crt0.o
+  USER_CRT0_SRC   = user/crt0_x86_64.s
+  USER_CRT0_BUILD = nasm -f elf64 $(USER_CRT0_SRC) -o $(OBJ_DIR)/user/crt0.o
 
   # §M36/§M37 (x86_64) — the musl userland for x86_64 comes from the PREBUILT
   # musl.cc cross-toolchain (third_party/musl-cross-x86_64), whose sysroot IS a
@@ -274,23 +305,40 @@ else ifeq ($(ARCH),x86_64)
   # The canonical PT_INTERP path an x86_64 musl dynamic binary carries; pkg.c
   # provisions the ld.so (== libc.so) there at boot.
   DOS_LDSO     := /lib/ld-musl-x86_64.so.1
+  # The SAME musl programs i386 embeds — coreutils + `sh` + the socket probes —
+  # plus forktest64, which is x86_64-only (it checks the 64-bit fork/COW path).
+  # The %.muslelf rule already has an x86_64 branch driving the cross gcc, so
+  # nothing but this list was ever missing.
   ifneq ($(wildcard $(MUSL_SYSROOT)/lib/libc.a),)
-    ARCH_EXTRA_OBJS += user/muslhello_muslblob.o user/forktest64_muslblob.o
+    ARCH_EXTRA_OBJS += $(MUSL_PROG_BLOBS) $(MUSL_COREUTIL_BLOBS) \
+                       user/forktest64_muslblob.o
   endif
   # §M37 dynamic-linking artifacts (x86_64): the shared libc.so=ld.so blob +
   # dynamically-linked test programs.  The prebuilt sysroot's libc.so IS the
   # dynamic linker, so the same wildcard gate as the static libc.a applies.
   ifneq ($(wildcard $(MUSL_SYSROOT)/lib/libc.so),)
-    ARCH_EXTRA_OBJS += user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
-                       user/libgreet_blob.o user/solibtest_dynblob.o \
-                       user/dlopentest_dynblob.o
+    ARCH_EXTRA_OBJS += $(MUSL_DYN_BLOBS)
   endif
   # §M38 C++ runtime (x86_64) — the prebuilt sysroot ships a musl libstdc++.so.6
   # + libgcc_s.so.1, so cpptest (exceptions across a .so) works once the g++
   # driver exists.  Same artifacts as i386.
   ifneq ($(wildcard $(MUSL_ELF_CXX)),)
-    ARCH_EXTRA_OBJS += user/cpptest_cxxblob.o user/libcpplib_blob.o \
-                       user/libstdcxx_blob.o user/libgccs_blob.o
+    ARCH_EXTRA_OBJS += $(CXX_RUNTIME_BLOBS)
+  endif
+  # §M39 (x86_64) — Mbed TLS built against the same cross sysroot as the rest of
+  # the x86_64 userland (`make mbedtls ARCH=x86_64`), so crypttest/ssltest/
+  # httpstest/wget are the same four programs i386 has.
+  MBEDTLS_PREFIX := third_party/mbedtls-x86_64
+  ifneq ($(wildcard $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a),)
+    ARCH_EXTRA_OBJS += $(MBEDTLS_PROG_BLOBS)
+    ifneq ($(wildcard third_party/cacert.pem),)
+      ARCH_EXTRA_OBJS += third_party/cacert_blob.o
+    endif
+  endif
+  # §M43 (x86_64) — the on-device C compiler (`make tcc ARCH=x86_64`).
+  TINYCC_PREFIX := third_party/tinycc-x86_64
+  ifneq ($(wildcard $(TINYCC_PREFIX)/bin/tcc),)
+    ARCH_EXTRA_OBJS += user/dostcc_blob.o user/rootfs_blob.o
   endif
   # §M38 support libs (toward NetSurf), x86_64.  zlib → a store package
   # (libz.so.1) + a dyn test.  Present only once the vendored source is fetched
@@ -441,7 +489,8 @@ else ifeq ($(ARCH),aarch64)
   USER_BASE     := 0x100000000
   USER_OCARGS   := --output-target=elf64-littleaarch64 --binary-architecture=aarch64
   USER_OBJCOPY  := $(CROSS)objcopy
-  USER_CRT0_BUILD = $(CC) $(USER_CFLAGS) -c user/crt0_aarch64.S -o $(OBJ_DIR)/user/crt0.o
+  USER_CRT0_SRC   = user/crt0_aarch64.S
+  USER_CRT0_BUILD = $(CC) $(USER_CFLAGS) -c $(USER_CRT0_SRC) -o $(OBJ_DIR)/user/crt0.o
 
 else
   $(error Unsupported ARCH "$(ARCH)" — supported: i386, x86_64, aarch64)
@@ -683,7 +732,9 @@ CORE_C_SRCS := \
     kernel/drivers/watchdog/ib700.c \
     kernel/drivers/null/null.c \
     kernel/drivers/block/virtio_blk.c \
+    kernel/drivers/net/virtio_net.c \
     kernel/core/net.c \
+    kernel/drivers/audio/ac97.c \
     kernel/core/audio.c \
     kernel/core/futex.c \
     kernel/core/pkg.c \
@@ -809,30 +860,39 @@ musl-cross-x86_64:
 	$(call MUSL_CROSS_BUILD,x86_64-linux-musl,x86_64)
 
 # -----------------------------------------------------------------------------
-# Mbed TLS (§M39 stage 2) — build the vendored crypto/TLS library for i686-musl.
-# Pure C: compiled with the host gcc -m32 + our musl headers (same path as the
-# musl coreutils), NOT the C++ toolchain.  Built on the container-local fs (the
-# PSA driver-wrapper generation writes many files; keep it off the slow mount).
-# The image must have python3-jsonschema/jinja2 (Dockerfile, §M39) for the PSA
-# wrapper generation.  Produces third_party/mbedtls-i686/{lib,include}.
+# Mbed TLS (§M39 stage 2) — build the vendored crypto/TLS library for the musl
+# userland of the CURRENT ARCH.  Pure C, so the only per-arch difference is which
+# compiler + headers are used:
+#   i386   — host gcc -m32 with our own musl headers (same path as the coreutils)
+#   x86_64 — the prebuilt musl.cc cross gcc, which carries its own sysroot
+# Built on the container-local fs (the PSA driver-wrapper generation writes many
+# files; keep it off the slow mount).  The image must have
+# python3-jsonschema/jinja2 (Dockerfile, §M39) for the PSA wrapper generation.
+# Produces third_party/mbedtls-<arch>/{lib,include}.
 #     docker run --rm --platform=linux/amd64 -v "$PWD":/src d-os-build make mbedtls
+#     ... ARCH=x86_64 make mbedtls
 # -----------------------------------------------------------------------------
 MBEDTLS_DIR    := third_party/mbedtls
-MBEDTLS_PREFIX := third_party/mbedtls-i686
-MBEDTLS_CFLAGS := -I$(CURDIR)/$(MUSL_PREFIX)/include -Os -fno-stack-protector -w
+ifeq ($(ARCH),x86_64)
+  MBEDTLS_CC     := $(CURDIR)/$(MUSL_ELF_CC)
+  MBEDTLS_CFLAGS := -Os -fno-stack-protector -w
+else
+  MBEDTLS_CC     := gcc -m32
+  MBEDTLS_CFLAGS := -I$(CURDIR)/$(MUSL_PREFIX)/include -Os -fno-stack-protector -w
+endif
 
 mbedtls:
 	@test -f $(MBEDTLS_DIR)/Makefile || { \
 	  echo "Mbed TLS missing — run ./scripts/fetch-mbedtls.sh first"; exit 1; }
 	rm -rf /tmp/mb && cp -a $(MBEDTLS_DIR) /tmp/mb
-	$(MAKE) -C /tmp/mb/library CC='gcc -m32' CFLAGS='$(MBEDTLS_CFLAGS)' \
+	$(MAKE) -C /tmp/mb/library CC='$(MBEDTLS_CC)' CFLAGS='$(MBEDTLS_CFLAGS)' \
 	    libmbedcrypto.a libmbedx509.a libmbedtls.a
 	rm -rf $(MBEDTLS_PREFIX)
 	mkdir -p $(MBEDTLS_PREFIX)/lib
 	cp /tmp/mb/library/lib*.a $(MBEDTLS_PREFIX)/lib/
 	cp -a /tmp/mb/include $(MBEDTLS_PREFIX)/include
 	rm -rf /tmp/mb
-	@echo "Mbed TLS i686 libs → $(MBEDTLS_PREFIX)/lib/"
+	@echo "Mbed TLS $(ARCH) libs → $(MBEDTLS_PREFIX)/lib/"
 
 # -----------------------------------------------------------------------------
 # TinyCC (§M43) — an on-device C compiler.  Cross-built with the musl C++
@@ -928,7 +988,7 @@ $(OBJ_DIR)/kernel/hal/x86_64/ap_trampoline_blob.o: kernel/hal/x86_64/ap_trampoli
 # blob symbols (_binary_user_<prog>_<arch>_elf_*); shell.c picks the live one.
 USER_OBJCOPY ?= objcopy
 
-user/hello_$(ARCH).elf: user/libc.c user/hello.c user/libc.h
+user/hello_$(ARCH).elf: user/libc.c user/hello.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c  -o $(OBJ_DIR)/user/libc.o
@@ -936,11 +996,8 @@ user/hello_$(ARCH).elf: user/libc.c user/hello.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/hello.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/hello_blob.o: user/hello_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
-user/spin_$(ARCH).elf: user/libc.c user/spin.c user/libc.h
+user/spin_$(ARCH).elf: user/libc.c user/spin.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c -o $(OBJ_DIR)/user/libc.o
@@ -948,13 +1005,10 @@ user/spin_$(ARCH).elf: user/libc.c user/spin.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/spin.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/spin_blob.o: user/spin_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
 # §M46 — wedge: a forever-spinning ring-3 program (frozen-app stand-in) to test
 # force-kill.  Same build shape as spin.
-user/wedge_$(ARCH).elf: user/libc.c user/wedge.c user/libc.h
+user/wedge_$(ARCH).elf: user/libc.c user/wedge.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c -o $(OBJ_DIR)/user/libc.o
@@ -962,11 +1016,8 @@ user/wedge_$(ARCH).elf: user/libc.c user/wedge.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/wedge.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/wedge_blob.o: user/wedge_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
-user/args_$(ARCH).elf: user/libc.c user/args.c user/libc.h
+user/args_$(ARCH).elf: user/libc.c user/args.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c -o $(OBJ_DIR)/user/libc.o
@@ -974,11 +1025,8 @@ user/args_$(ARCH).elf: user/libc.c user/args.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/args.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/args_blob.o: user/args_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
-user/forktest_$(ARCH).elf: user/libc.c user/forktest.c user/libc.h
+user/forktest_$(ARCH).elf: user/libc.c user/forktest.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c     -o $(OBJ_DIR)/user/libc.o
@@ -986,11 +1034,8 @@ user/forktest_$(ARCH).elf: user/libc.c user/forktest.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/forktest.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/forktest_blob.o: user/forktest_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
-user/forkexec_$(ARCH).elf: user/libc.c user/forkexec.c user/libc.h
+user/forkexec_$(ARCH).elf: user/libc.c user/forkexec.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c     -o $(OBJ_DIR)/user/libc.o
@@ -998,11 +1043,8 @@ user/forkexec_$(ARCH).elf: user/libc.c user/forkexec.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/forkexec.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/forkexec_blob.o: user/forkexec_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
-user/pipetest_$(ARCH).elf: user/libc.c user/pipetest.c user/libc.h
+user/pipetest_$(ARCH).elf: user/libc.c user/pipetest.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c     -o $(OBJ_DIR)/user/libc.o
@@ -1010,11 +1052,8 @@ user/pipetest_$(ARCH).elf: user/libc.c user/pipetest.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/pipetest.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/pipetest_blob.o: user/pipetest_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
-user/sigtest_$(ARCH).elf: user/libc.c user/sigtest.c user/libc.h
+user/sigtest_$(ARCH).elf: user/libc.c user/sigtest.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c    -o $(OBJ_DIR)/user/libc.o
@@ -1022,11 +1061,8 @@ user/sigtest_$(ARCH).elf: user/libc.c user/sigtest.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/sigtest.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/sigtest_blob.o: user/sigtest_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
-user/dnstest_$(ARCH).elf: user/libc.c user/dnstest.c user/libc.h
+user/dnstest_$(ARCH).elf: user/libc.c user/dnstest.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c    -o $(OBJ_DIR)/user/libc.o
@@ -1034,11 +1070,8 @@ user/dnstest_$(ARCH).elf: user/libc.c user/dnstest.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/dnstest.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/dnstest_blob.o: user/dnstest_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
-user/httptest_$(ARCH).elf: user/libc.c user/httptest.c user/libc.h
+user/httptest_$(ARCH).elf: user/libc.c user/httptest.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c     -o $(OBJ_DIR)/user/libc.o
@@ -1046,11 +1079,8 @@ user/httptest_$(ARCH).elf: user/libc.c user/httptest.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/httptest.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/httptest_blob.o: user/httptest_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
-user/threadtest_$(ARCH).elf: user/libc.c user/threadtest.c user/libc.h
+user/threadtest_$(ARCH).elf: user/libc.c user/threadtest.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c       -o $(OBJ_DIR)/user/libc.o
@@ -1058,11 +1088,8 @@ user/threadtest_$(ARCH).elf: user/libc.c user/threadtest.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/threadtest.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/threadtest_blob.o: user/threadtest_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
-user/tlstest_$(ARCH).elf: user/libc.c user/tlstest.c user/libc.h
+user/tlstest_$(ARCH).elf: user/libc.c user/tlstest.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c    -o $(OBJ_DIR)/user/libc.o
@@ -1070,11 +1097,8 @@ user/tlstest_$(ARCH).elf: user/libc.c user/tlstest.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/tlstest.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/tlstest_blob.o: user/tlstest_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
-user/posixtest_$(ARCH).elf: user/libc.c user/posixtest.c user/libc.h
+user/posixtest_$(ARCH).elf: user/libc.c user/posixtest.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(USER_CRT0_BUILD)
 	$(CC) $(USER_CFLAGS) -c user/libc.c      -o $(OBJ_DIR)/user/libc.o
@@ -1082,43 +1106,55 @@ user/posixtest_$(ARCH).elf: user/libc.c user/posixtest.c user/libc.h
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/posixtest.o $(OBJ_DIR)/user/libc.o
 
-$(OBJ_DIR)/user/posixtest_blob.o: user/posixtest_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
 # Standalone Linux-ABI test program — NO d-os crt0/libc (entry = _start), uses
 # Linux syscall numbers directly.  Run under the Linux personality.
-user/linuxhello_$(ARCH).elf: user/linuxhello.c
+user/linuxhello_$(ARCH).elf: user/linuxhello.c $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(CC) $(USER_CFLAGS) -c user/linuxhello.c -o $(OBJ_DIR)/user/linuxhello.o
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ $(OBJ_DIR)/user/linuxhello.o
 
-$(OBJ_DIR)/user/linuxhello_blob.o: user/linuxhello_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
 # wlclient — a freestanding NATIVE-ABI ring-3 Wayland client (int 0x80 with d-os
 # syscall numbers, no libc); speaks the Wayland wire protocol over fd 3.
-user/wlclient_$(ARCH).elf: user/wlclient.c
+user/wlclient_$(ARCH).elf: user/wlclient.c $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(CC) $(USER_CFLAGS) -c user/wlclient.c -o $(OBJ_DIR)/user/wlclient.o
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ $(OBJ_DIR)/user/wlclient.o
 
-$(OBJ_DIR)/user/wlclient_blob.o: user/wlclient_$(ARCH).elf
-	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
 # wlapp — a ring-3 app that speaks Wayland via the libwl client library.
-user/wlapp_$(ARCH).elf: user/wlapp.c user/libwl.c user/libwl.h
+user/wlapp_$(ARCH).elf: user/wlapp.c user/libwl.c user/libwl.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
 	$(CC) $(USER_CFLAGS) -c user/wlapp.c -o $(OBJ_DIR)/user/wlapp.o
 	$(CC) $(USER_CFLAGS) -c user/libwl.c -o $(OBJ_DIR)/user/libwl.o
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/wlapp.o $(OBJ_DIR)/user/libwl.o
 
-$(OBJ_DIR)/user/wlapp_blob.o: user/wlapp_$(ARCH).elf
+# -----------------------------------------------------------------------------
+# One rule embeds EVERY in-tree ring-3 program.
+#
+# The intermediate ELF carries the arch in its FILENAME (user/<name>_<arch>.elf)
+# so an ARCH flip can never link a stale foreign-arch image.  objcopy mints its
+# symbols from that filename, which used to leak the arch into the SYMBOL name
+# too (`_binary_user_forktest_i386_elf_start`) — and since the kernel spelled
+# those names out, every program was silently i386-only: the blob linked fine on
+# x86_64 and the shell still reported "not embedded for this arch".  That is the
+# actual reason x86_64's userland lagged behind, not any missing kernel support.
+#
+# --redefine-sym strips the arch back out, so the kernel refers to "the embedded
+# forktest program" and the build decides which architecture that is.  Explicit
+# rules (the .so's, ld.so, rootfs, netsurf resources) still win over this pattern
+# for their own targets, which is why they need no exclusion here.
+# -----------------------------------------------------------------------------
+$(OBJ_DIR)/user/%_blob.o: user/%_$(ARCH).elf
 	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) \
+	    --redefine-sym _binary_user_$*_$(ARCH)_elf_start=_binary_user_$*_elf_start \
+	    --redefine-sym _binary_user_$*_$(ARCH)_elf_end=_binary_user_$*_elf_end \
+	    --redefine-sym _binary_user_$*_$(ARCH)_elf_size=_binary_user_$*_elf_size \
+	    $< $@
+
 
 # NORMAL C programs linked against REAL, pristine musl (need `make musl` first;
 # blobs wired in only when musl-i386/lib/libc.a exists, see the i386 block).
@@ -1151,72 +1187,54 @@ user/%.muslelf: user/%.c $(MUSL_LIBC)
 	    $(MUSL_PREFIX)/lib/crtn.o
 endif
 
-# §M39 stage 2 — crypttest overrides the generic %.muslelf rule to ALSO compile
-# with Mbed TLS's headers and link its static libs (libmbedcrypto for the
-# crypto primitives; x509+tls linked too so the same rule serves stage 3).
-user/crypttest.muslelf: user/crypttest.c $(MUSL_LIBC)
-	@mkdir -p $(OBJ_DIR)/user
-	gcc $(MUSL_CC_FLAGS) -c user/crypttest.c \
-	    -I$(MUSL_PREFIX)/include -I$(MBEDTLS_PREFIX)/include \
-	    -o $(OBJ_DIR)/user/crypttest.muslo
-	ld -m elf_i386 -static -Ttext-segment=$(USER_BASE) -e _start -o $@ \
-	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
-	    $(OBJ_DIR)/user/crypttest.muslo \
-	    --start-group \
-	    $(MBEDTLS_PREFIX)/lib/libmbedtls.a $(MBEDTLS_PREFIX)/lib/libmbedx509.a \
-	    $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a $(MUSL_PREFIX)/lib/libc.a \
-	    `gcc -m32 -print-libgcc-file-name` --end-group \
-	    $(MUSL_PREFIX)/lib/crtn.o
+# §M39 — the four Mbed TLS programs.  Each overrides the generic %.muslelf rule
+# to ALSO compile with Mbed TLS's headers and link its three static libs:
+#   crypttest  (stage 2)  — the crypto primitives
+#   ssltest    (stage 3)  — an in-memory TLS handshake
+#   httpstest  (stage 3b) — REAL HTTPS: the BIO rides a live M24 socket and the
+#                           trust store is the provisioned CA bundle
+#   wget                  — the HTTP/HTTPS download front-end (URL from argv)
+# They were four copies of one recipe; that duplication is exactly why the
+# x86_64 side never grew them.  One canned recipe per arch now serves all four,
+# so adding a fifth TLS program is one name in MBEDTLS_PROGS.
+MBEDTLS_PROGS := crypttest ssltest httpstest wget
 
-# §M39 stage 3 — ssltest: same mbedTLS static link (SSL/x509/crypto), in-memory
-# TLS handshake.  (Own rule so it also pulls the SSL + x509 objects.)
-user/ssltest.muslelf: user/ssltest.c $(MUSL_LIBC)
+ifeq ($(ARCH),x86_64)
+# The cross gcc driver supplies its own crt/libc/libgcc and its own sysroot
+# headers, so the whole link is one command (same shape as the generic x86_64
+# %.muslelf rule).  -Ttext-segment moves the ELF headers too, putting the whole
+# image at the d-os user base.
+define MBEDTLS_PROG_BUILD
 	@mkdir -p $(OBJ_DIR)/user
-	gcc $(MUSL_CC_FLAGS) -c user/ssltest.c \
+	$(MUSL_ELF_CC) -static -no-pie -Os -Wall -I$(MBEDTLS_PREFIX)/include \
+	    -Wl,-Ttext-segment=$(USER_BASE) $< -o $@ \
+	    $(MBEDTLS_PREFIX)/lib/libmbedtls.a \
+	    $(MBEDTLS_PREFIX)/lib/libmbedx509.a \
+	    $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a
+endef
+MUSL_LIBC_DEP := $(MUSL_SYSROOT)/lib/libc.a
+else
+define MBEDTLS_PROG_BUILD
+	@mkdir -p $(OBJ_DIR)/user
+	gcc $(MUSL_CC_FLAGS) -c $< \
 	    -I$(MUSL_PREFIX)/include -I$(MBEDTLS_PREFIX)/include \
-	    -o $(OBJ_DIR)/user/ssltest.muslo
+	    -o $(OBJ_DIR)/user/$*.muslo
 	ld -m elf_i386 -static -Ttext-segment=$(USER_BASE) -e _start -o $@ \
 	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
-	    $(OBJ_DIR)/user/ssltest.muslo \
+	    $(OBJ_DIR)/user/$*.muslo \
 	    --start-group \
 	    $(MBEDTLS_PREFIX)/lib/libmbedtls.a $(MBEDTLS_PREFIX)/lib/libmbedx509.a \
 	    $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a $(MUSL_PREFIX)/lib/libc.a \
 	    `gcc -m32 -print-libgcc-file-name` --end-group \
 	    $(MUSL_PREFIX)/lib/crtn.o
+endef
+MUSL_LIBC_DEP := $(MUSL_LIBC)
+endif
 
-# §M39 stage 3b — httpstest: REAL HTTPS.  Same mbedTLS static link as ssltest,
-# but the BIO rides a live M24 socket (send/recv) and the trust store is the
-# provisioned CA bundle — an actual network TLS client, not an in-memory one.
-user/httpstest.muslelf: user/httpstest.c $(MUSL_LIBC)
-	@mkdir -p $(OBJ_DIR)/user
-	gcc $(MUSL_CC_FLAGS) -c user/httpstest.c \
-	    -I$(MUSL_PREFIX)/include -I$(MBEDTLS_PREFIX)/include \
-	    -o $(OBJ_DIR)/user/httpstest.muslo
-	ld -m elf_i386 -static -Ttext-segment=$(USER_BASE) -e _start -o $@ \
-	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
-	    $(OBJ_DIR)/user/httpstest.muslo \
-	    --start-group \
-	    $(MBEDTLS_PREFIX)/lib/libmbedtls.a $(MBEDTLS_PREFIX)/lib/libmbedx509.a \
-	    $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a $(MUSL_PREFIX)/lib/libc.a \
-	    `gcc -m32 -print-libgcc-file-name` --end-group \
-	    $(MUSL_PREFIX)/lib/crtn.o
-
-# §M39 — wget: the HTTP/HTTPS download front-end.  Same mbedTLS static link as
-# httpstest (TLS over a live M24 socket + the CA bundle), URL + optional file
-# from argv.
-user/wget.muslelf: user/wget.c $(MUSL_LIBC)
-	@mkdir -p $(OBJ_DIR)/user
-	gcc $(MUSL_CC_FLAGS) -c user/wget.c \
-	    -I$(MUSL_PREFIX)/include -I$(MBEDTLS_PREFIX)/include \
-	    -o $(OBJ_DIR)/user/wget.muslo
-	ld -m elf_i386 -static -Ttext-segment=$(USER_BASE) -e _start -o $@ \
-	    $(MUSL_PREFIX)/lib/crt1.o $(MUSL_PREFIX)/lib/crti.o \
-	    $(OBJ_DIR)/user/wget.muslo \
-	    --start-group \
-	    $(MBEDTLS_PREFIX)/lib/libmbedtls.a $(MBEDTLS_PREFIX)/lib/libmbedx509.a \
-	    $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a $(MUSL_PREFIX)/lib/libc.a \
-	    `gcc -m32 -print-libgcc-file-name` --end-group \
-	    $(MUSL_PREFIX)/lib/crtn.o
+# Static pattern rule: an EXPLICIT rule for these four targets, so it wins over
+# the generic user/%.muslelf pattern while still providing $* to the recipe.
+$(patsubst %,user/%.muslelf,$(MBEDTLS_PROGS)): user/%.muslelf: user/%.c $(MUSL_LIBC_DEP)
+	$(MBEDTLS_PROG_BUILD)
 
 # The CA trust bundle, embedded verbatim.  objcopy derives the symbol from the
 # input path: _binary_third_party_cacert_pem_{start,end}.  Provisioned into the

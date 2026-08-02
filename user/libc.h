@@ -34,7 +34,32 @@ int   futex(int* uaddr, int op, int val);
  * tls_load4 reads the int at %gs:4 (a demo accessor — the compiler's __thread
  * ABI layering lands with the libc port).  */
 void set_tls(void* tp);
-static inline int tls_load4(void) { int v; __asm__ volatile ("movl %%gs:4, %0" : "=r"(v)); return v; }
+/* Read the 4-byte word at byte offset `off` of THIS thread's TLS block.
+ *
+ * TWO things here are arch-dependent and both used to be hard-coded:
+ *   - WHICH register carries the thread pointer is the kernel's choice (see
+ *     hal_set_tls_base): i386 a %gs GDT descriptor, x86_64 the FS.base MSR,
+ *     aarch64 TPIDR_EL0.  Reading %gs on x86_64 dereferences a base of 0.
+ *   - WHERE a field sits inside the block depends on pointer size, so the
+ *     offset has to come from the caller (offsetof), never a literal.  A fixed
+ *     "4" silently read the wrong half of a 64-bit pointer — no crash, just a
+ *     value that never matched. */
+#if defined(__x86_64__)
+static inline int tls_load4(unsigned long off) {
+    int v; __asm__ volatile ("movl %%fs:(%1), %0" : "=r"(v) : "r"(off)); return v;
+}
+#elif defined(__i386__)
+static inline int tls_load4(unsigned long off) {
+    int v; __asm__ volatile ("movl %%gs:(%1), %0" : "=r"(v) : "r"(off)); return v;
+}
+#else
+/* aarch64: the thread pointer is a register, not a segment. */
+static inline int tls_load4(unsigned long off) {
+    unsigned long tp;
+    __asm__ volatile ("mrs %0, tpidr_el0" : "=r"(tp));
+    return *(int*)(tp + off);
+}
+#endif
 
 /* POSIX syscall breadth (M36).  These structs match the kernel's kstat /
  * kutsname / ktimespec (syscall.h). */

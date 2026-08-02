@@ -124,9 +124,21 @@ int thread_create(int (*fn)(void*), void* arg) {
     char* base = (char*)mmap(65536, -1);
     if (!base) return -1;
     unsigned long* sp = (unsigned long*)(base + 65536);
+#if defined(__x86_64__)
+    /* amd64 SysV passes fn's argument in RDI, not on the stack, so the kernel
+     * cannot start `fn` directly the way i386 can — __thread_start (crt0)
+     * picks the argument off the stack into RDI first.  See that trampoline
+     * for the exact layout this builds. */
+    extern void __thread_start(void);
+    *--sp = (unsigned long)fn;                   /* [rsp+16] */
+    *--sp = (unsigned long)arg;                  /* [rsp+8]  */
+    *--sp = (unsigned long)__thread_exit_tramp;  /* [rsp] = fn's return address */
+    return (int)syscall3(SYS_CLONE, (long)__thread_start, (long)sp, 0);
+#else
     *--sp = (unsigned long)arg;                  /* fn's argument ([esp+4]) */
     *--sp = (unsigned long)__thread_exit_tramp;  /* fn's return address ([esp]) */
     return (int)syscall3(SYS_CLONE, (long)fn, (long)sp, 0);
+#endif
 }
 int thread_join(int tid) { return waitpid(tid, 0); }
 
