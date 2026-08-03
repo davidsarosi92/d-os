@@ -2219,6 +2219,57 @@ static void run_wayland_client(const char* what, const unsigned char* s,
 extern const unsigned char _binary_user_wlupstream_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_wlupstream_muslelf_end[]   __attribute__((weak));
 
+/* §M40 — `simpleshm [win]`: run weston-simple-shm, an UNMODIFIED upstream
+ * Wayland application (weston's own reference client, compiled straight out of
+ * its tree).  Identical plumbing to wayupstream — the point is precisely that
+ * nothing about it is special-cased. */
+extern const unsigned char _binary_user_simpleshm_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_simpleshm_muslelf_end[]   __attribute__((weak));
+
+static void run_upstream_wl(const char* what, const unsigned char* sp,
+                            const unsigned char* ep, int windowed,
+                            int argc, const char* const* argv) {
+    struct task* me = task_current();
+    if (me->fds[3]) { kprintf("%s: fd 3 already in use\n", what); return; }
+
+    struct usock *srv, *cli;
+    if (usock_pair(&srv, &cli) != 0) { kprintf("%s: usock_pair failed\n", what); return; }
+    struct ofile* cli_of = ofile_from_sock(cli);
+    struct wl_conn* conn = (struct wl_conn*)kmalloc(sizeof *conn);
+    if (!cli_of || !conn) {
+        kprintf("%s: out of memory\n", what);
+        if (cli_of) ofile_unref(cli_of); else usock_close(cli);
+        usock_close(srv); return;
+    }
+    me->fds[3] = cli_of;
+    wl_conn_init(conn, srv);
+    if (windowed) { gui_start(); task_msleep(300); conn->wm_mode = 1; }
+    task_spawn_arg("wl-server", wl_server_task, conn);
+
+    kprintf("%s: WAYLAND_SOCKET=3%s\n", what,
+            windowed ? " — surface becomes a desktop window" : "");
+    proc_set_exec_env("WAYLAND_SOCKET=3");
+    int prev = me->linux_abi;
+    me->linux_abi = 1;
+    int rc = proc_exec_elf_argv(sp, (size_t)(ep - sp), argc, argv);
+    me->linux_abi = prev;
+    kprintf("%s: client exited rc=%d\n", what, rc);
+}
+
+static void cmd_simpleshm(const char* args) {
+    const unsigned char* sp = _binary_user_simpleshm_muslelf_start;
+    if (!sp) {
+        console_write("simpleshm: not embedded — run "
+                      "./scripts/fetch-wayland.sh + `make ARCH=<arch> wayland`\n");
+        return;
+    }
+    int windowed = (args && (args[0] == 'w' || args[0] == 'W'));
+    const char* argv[] = { "weston-simple-shm" };
+    console_write("simpleshm: running UNMODIFIED weston-simple-shm...\n");
+    run_upstream_wl("simpleshm", sp, _binary_user_simpleshm_muslelf_end,
+                    windowed, 1, argv);
+}
+
 static void cmd_wayupstream(const char* args) {
     /* `wayupstream win` runs the server in SERVER-PER-SURFACE mode, so the
      * client's xdg_toplevel becomes a real desktop window and its commits are
@@ -2623,6 +2674,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "waywin"))         { wl_window_demo();   return; }
     if (streq(line, "wayinput"))       { wl_input_demo();    return; }
     if (streq(line, "wayclient"))      { cmd_wayclient();    return; }
+    if (streq(line, "simpleshm"))      { cmd_simpleshm(""); return; }
+    if (starts_with(line, "simpleshm "))   { cmd_simpleshm(line + 10); return; }
     if (streq(line, "wayupstream"))    { cmd_wayupstream(""); return; }
     if (starts_with(line, "wayupstream ")) { cmd_wayupstream(line + 12); return; }
     if (streq(line, "wayapp"))         { cmd_wayapp();       return; }

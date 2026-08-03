@@ -4123,9 +4123,45 @@ and the client's frame loop is genuinely self-sustaining — each callback
 requests the next and commits — producing ~130 commits over the run instead of
 the two a one-shot test would show.
 
-**Open:** the toolkit itself.  Mesa `llvmpipe` (for EGL/GL) is a multi-hour
-build that pulls in LLVM; an shm-only SDL or a bare upstream demo client is the
-cheaper next probe, and the protocol surface above is what either needs first.
+#### Stage 6 — an UNMODIFIED upstream application runs
+
+`weston-simple-shm` — weston's own reference client — runs on d-os, **compiled
+exactly as it sits in the weston tree**.  Not a d-os test program: everything
+around it is what weston's build system would have provided (the generated
+protocol code, `shared/os-compatibility.c`, a `config.h`), and not a line of
+`clients/simple-shm.c` is patched.
+
+It binds every global, creates an `xdg_toplevel` titled "simple-shm", allocates
+a 250×250 shm pool whose descriptor arrives over SCM_RIGHTS, and then **animates
+continuously** — each commit carries a different checksum, driven by its own
+frame-callback loop — into a real d-os window with a title bar and a taskbar
+button.  716 frames in one i386 run.
+
+`config.h` defines `HAVE_MEMFD_CREATE`, which sends `os_create_anonymous_file`
+down the memfd path.  That is not a shortcut: d-os has no writable
+`XDG_RUNTIME_DIR` for the `mkostemp` fallback to use, so the memfd path (§M40
+stage 2) is the one that can actually work.
+
+Two requests it makes had to be accepted:
+
+- `xdg_toplevel.set_app_id` — the desktop-file identity.  We have no application
+  database to look it up in, but every real toolkit sends it and an unanswered
+  request is a protocol error to a strict client.
+- `wl_shm_pool.destroy` — the client is done with the POOL, but buffers carved
+  out of it stay valid, so the frames must **not** be released.  simple-shm
+  destroys its pool immediately after creating its buffers and then draws from
+  them for the rest of its life; releasing there would pull the pixels out from
+  under a live window.
+
+One build trap worth recording: `-I<weston>/shared` must **not** be on the
+include path.  weston has its own `shared/signal.h`, so that directory makes
+`#include <signal.h>` resolve to weston's server-side header instead of the C
+library's.  The sources include it as `"shared/os-compatibility.h"`, so
+`-I<weston>` is what they actually need.
+
+**Open:** a full toolkit (SDL/GTK/Qt).  Those need EGL, hence Mesa `llvmpipe`
+and LLVM — a multi-hour build and the natural next milestone, now that the
+protocol surface underneath it is proven by a real application.
 
 ---
 
@@ -4275,6 +4311,17 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   `polltest`, `solibtest`, `forktest`, `threadtest`, `musltest`, `dnstest`,
   `httptest` (`HTTP/1.1 200 OK`) and `pkgrun sh -c` all green; aarch64 builds
   clean.
+
+- **2026-08-03 — §M40: an UNMODIFIED upstream Wayland application runs on d-os
+  (DOCS §4.40).**  `weston-simple-shm`, weston's own reference client, compiled
+  exactly as it sits in the weston tree, animates continuously in a real d-os
+  window (716 frames in one i386 run) — its shm pool descriptor arriving over
+  SCM_RIGHTS and its frame-callback loop driven by the server.  Getting there
+  needed stages 3–6: the surface mapped onto a `gui_window` sized to the client's
+  buffer, real desktop input routed into the client's `wl_seat` (which also
+  fixed NetSurf's input — a hook-backed window had no app-host draining its
+  queue), `wl_output` + `wl_surface.frame` (the two globals a toolkit refuses to
+  start without), and accepting `set_app_id` + `wl_shm_pool.destroy`.
 
 - **2026-08-03 — §M40 stage 2 complete + the Linux-ABI pointer gate (DOCS §4.40,
   §4.41).**  The upstream libwayland client now drives a real `xdg_toplevel` with

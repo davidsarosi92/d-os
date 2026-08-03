@@ -153,6 +153,9 @@ ifeq ($(ARCH),i386)
   # §M40 (i386) — the upstream libwayland client (`make wayland`).
   ifneq ($(wildcard third_party/wayland-i386/lib/libwayland-client.a),)
     ARCH_EXTRA_OBJS += user/wlupstream_muslblob.o
+    ifneq ($(wildcard third_party/weston/clients/simple-shm.c),)
+      ARCH_EXTRA_OBJS += user/simpleshm_muslblob.o
+    endif
   endif
   # §M43: the on-device C compiler (make tcc) — the tcc binary + a rootfs
   # archive (tcc/musl headers + crt) unpacked into the VFS at boot.
@@ -363,6 +366,9 @@ else ifeq ($(ARCH),x86_64)
   # §M40 (x86_64) — the upstream libwayland client (`make ARCH=x86_64 wayland`).
   ifneq ($(wildcard third_party/wayland-x86_64/lib/libwayland-client.a),)
     ARCH_EXTRA_OBJS += user/wlupstream_muslblob.o
+    ifneq ($(wildcard third_party/weston/clients/simple-shm.c),)
+      ARCH_EXTRA_OBJS += user/simpleshm_muslblob.o
+    endif
   endif
   # §M43 (x86_64) — the on-device C compiler (`make tcc ARCH=x86_64`).
   TINYCC_PREFIX := third_party/tinycc-x86_64
@@ -1312,6 +1318,39 @@ user/%.muslelf: user/%.c $(MUSL_LIBC)
 	    `gcc -m32 -print-libgcc-file-name` --end-group \
 	    $(MUSL_PREFIX)/lib/crtn.o
 endif
+
+# §M40 — weston-simple-shm: an UNMODIFIED upstream Wayland application.
+#
+# Not a d-os test program.  clients/simple-shm.c is compiled exactly as it sits
+# in the weston tree; everything below is what weston's own build system would
+# provide — the generated protocol code, its shared/ helper, and a config.h.
+#
+# config.h normally comes from meson.  HAVE_MEMFD_CREATE is defined because d-os
+# implements it (§M40 stage 2), which sends os_create_anonymous_file down the
+# memfd path instead of hunting for a writable XDG_RUNTIME_DIR — d-os has no
+# such directory, so this is the path that can actually work.
+WESTON_DIR := third_party/weston
+FS_XML     := /usr/share/wayland-protocols/unstable/fullscreen-shell/fullscreen-shell-unstable-v1.xml
+
+user/simpleshm.muslelf: $(WESTON_DIR)/clients/simple-shm.c \
+                        $(WL_PREFIX)/lib/libwayland-client.a
+	@mkdir -p $(WL_GEN)
+	wayland-scanner private-code  $(FS_XML) $(WL_GEN)/fullscreen-shell-protocol.c
+	wayland-scanner client-header $(FS_XML) $(WL_GEN)/fullscreen-shell-unstable-v1-client-protocol.h
+	printf '%s\n' '#define HAVE_MEMFD_CREATE 1' > $(WL_GEN)/config.h
+	# NB: -I$(WESTON_DIR)/shared is deliberately ABSENT.  weston has its own
+	# shared/signal.h, and putting that directory on the include path makes
+	# simple-shm.c's `#include <signal.h>` pick up weston's server-side header
+	# instead of the C library's.  The sources include it as
+	# "shared/os-compatibility.h", so -I$(WESTON_DIR) is what they actually need.
+	$(MUSL_ELF_CC) -static -no-pie -Os -w -std=gnu99 -D_GNU_SOURCE \
+	    -I$(WL_GEN) -I$(WL_PREFIX)/include \
+	    -I$(WESTON_DIR) -I$(WESTON_DIR)/include \
+	    -Wl,-Ttext-segment=$(USER_BASE) \
+	    $(WESTON_DIR)/clients/simple-shm.c \
+	    $(WESTON_DIR)/shared/os-compatibility.c \
+	    $(WL_GEN)/fullscreen-shell-protocol.c \
+	    -o $@ $(WL_PREFIX)/lib/libwayland-client.a $(FFI_PREFIX)/lib/libffi.a
 
 # §M40 — the upstream-libwayland client.  Its own rule (not the generic
 # %.muslelf) because it links libwayland-client + libffi and needs the generated

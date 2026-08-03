@@ -43,6 +43,18 @@ TLS, NetSurf, Wayland.  Nothing failed visibly, which is why it survived two
 milestones.  Now armed on both; the `_k`/`_u` discipline covers the places that
 legitimately pass kernel buffers (new `sys_recv_u`).
 
+✅ **§M40 STAGE 6 — AN UNMODIFIED UPSTREAM WAYLAND APP RUNS (2026-08-03, DOCS
+§4.40).**  `weston-simple-shm` (weston's own reference client, compiled exactly
+as it sits in its tree — nothing patched) animates continuously in a real d-os
+window on both x86 arches; 716 frames in one i386 run.  `config.h` sets
+HAVE_MEMFD_CREATE because d-os has no writable XDG_RUNTIME_DIR for the mkostemp
+fallback.  Accepted two more requests: `xdg_toplevel.set_app_id` and
+`wl_shm_pool.destroy` (**buffers outlive the pool** — simple-shm destroys its
+pool right after creating its buffers, so releasing the frames there would pull
+the pixels out from under a live window).  **Build trap:** never put
+`-I<weston>/shared` on the include path — weston has its own `shared/signal.h`
+and it shadows the C library's.  Shell: `simpleshm [win]`.
+
 ✅ **§M40 STAGE 5 (2026-08-03, DOCS §4.40).**  The two globals a real toolkit
 REFUSES to start without: **`wl_output`** (SDL/GTK/Qt all need the size+scale
 before laying out; full geometry/mode/scale/done burst, real framebuffer size)

@@ -44,7 +44,7 @@ enum { WL_CALLBACK_EVT_DONE = 0 };
 enum { WL_COMPOSITOR_REQ_CREATE_SURFACE = 0 };
 enum { WL_SHM_REQ_CREATE_POOL = 0 };
 enum { WL_SHM_EVT_FORMAT = 0 };
-enum { WL_SHM_POOL_REQ_CREATE_BUFFER = 0 };
+enum { WL_SHM_POOL_REQ_CREATE_BUFFER = 0, WL_SHM_POOL_REQ_DESTROY = 1 };
 enum { WL_BUFFER_EVT_RELEASE = 0 };
 enum { WL_SURFACE_REQ_ATTACH = 1, WL_SURFACE_REQ_DAMAGE = 2,
        WL_SURFACE_REQ_FRAME = 3,
@@ -57,7 +57,7 @@ enum { WL_OUTPUT_MODE_CURRENT = 1, WL_OUTPUT_MODE_PREFERRED = 2 };
 enum { XDG_WM_BASE_REQ_GET_XDG_SURFACE = 2 };
 enum { XDG_SURFACE_REQ_GET_TOPLEVEL = 1, XDG_SURFACE_REQ_ACK_CONFIGURE = 4 };
 enum { XDG_SURFACE_EVT_CONFIGURE = 0 };
-enum { XDG_TOPLEVEL_REQ_SET_TITLE = 2 };
+enum { XDG_TOPLEVEL_REQ_SET_TITLE = 2, XDG_TOPLEVEL_REQ_SET_APP_ID = 3 };
 enum { XDG_TOPLEVEL_EVT_CONFIGURE = 0, XDG_TOPLEVEL_EVT_CLOSE = 1 };
 /* wl_seat / wl_pointer / wl_keyboard (input). */
 enum { WL_SEAT_REQ_GET_POINTER = 0, WL_SEAT_REQ_GET_KEYBOARD = 1 };
@@ -458,6 +458,17 @@ static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
 
     } else if (iface == WLI_SURFACE && op == WL_SURFACE_REQ_ATTACH && blen >= 4) {
         kprintf("wayland: surface %u attach buffer %u\n", obj, get32(body));
+
+    } else if (iface == WLI_XDG_TOPLEVEL && op == XDG_TOPLEVEL_REQ_SET_APP_ID) {
+        /* set_app_id — the desktop-file identity.  We have no application
+         * database to look it up in, but every real toolkit sends it and an
+         * unanswered request is a protocol error to a strict client. */
+
+    } else if (iface == WLI_SHM_POOL && op == WL_SHM_POOL_REQ_DESTROY) {
+        /* pool.destroy — the client is done with the POOL, but any wl_buffer
+         * carved out of it stays valid, so the frames must NOT be released
+         * here.  weston-simple-shm destroys its pool immediately after creating
+         * its buffers and then draws from them for the rest of its life. */
 
     } else if (iface == WLI_SURFACE && op == WL_SURFACE_REQ_FRAME && blen >= 4) {
         /* frame(callback) — "tell me when it is a good time to draw the next
