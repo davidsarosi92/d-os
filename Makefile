@@ -66,7 +66,7 @@ MUSL_COREUTIL_BLOBS := $(patsubst %,user/%_muslblob.o,$(MUSL_COREUTILS))
 # wedgewin = a GUI client that opens a window and then freezes: the automated
 # test for "the chrome still works when the app behind it is frozen".
 MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o \
-                   user/wedgewin_muslblob.o
+                   user/wedgewin_muslblob.o user/pthreadtest_muslblob.o
 # §M37 dynamic-linking artifacts — the ld.so blob + the dynamically linked tests.
 MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
                    user/libgreet_blob.o user/solibtest_dynblob.o \

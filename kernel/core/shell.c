@@ -1955,6 +1955,23 @@ static void cmd_wedgewin(void) {
     kprintf("wedgewin: spawned pid %d — its window's X must still close it\n", pid);
 }
 
+/* §M40 — `pthreadtest`: REAL musl pthreads (clone + futex join), the threading
+ * every toolkit and Mesa is built on. */
+extern const unsigned char _binary_user_pthreadtest_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_pthreadtest_muslelf_end[]   __attribute__((weak));
+
+static void cmd_pthreadtest(void) {
+    const unsigned char* sp = _binary_user_pthreadtest_muslelf_start;
+    if (!sp) { console_write("pthreadtest: not embedded\n"); return; }
+    console_write("pthreadtest: exec'ing a REAL musl pthread program...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(sp, (size_t)(_binary_user_pthreadtest_muslelf_end - sp));
+    if (me) me->linux_abi = prev;
+    kprintf("pthreadtest: returned rc=%d\n", rc);
+}
+
 static void cmd_musltest(void) {
     if (!_binary_user_muslhello_muslelf_start) {
         console_write("musltest: not embedded — run `make musl` then rebuild\n");
@@ -2676,6 +2693,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "tlstest"))        { cmd_tlstest(); return; }
     if (streq(line, "linuxtest"))      { cmd_linuxtest(); return; }
     if (streq(line, "wedgewin"))       { cmd_wedgewin(); return; }
+    if (streq(line, "pthreadtest"))    { cmd_pthreadtest(); return; }
     if (streq(line, "musltest"))       { cmd_musltest(); return; }
     if (streq(line, "musldyntest"))    { cmd_musldyntest(); return; }
     if (streq(line, "randtest"))       { cmd_randtest(); return; }

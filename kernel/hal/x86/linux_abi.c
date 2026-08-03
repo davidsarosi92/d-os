@@ -41,6 +41,13 @@ extern uint32_t saved_eip;
  * set).  Anything else returns -ENOSYS and is logged once. */
 #define LNX_exit             1
 #define LNX_fork             2
+#define LNX_clone         120
+#define LNX_futex         240
+/* clone() flag bits we care about (linux/sched.h). */
+#define LNX_CLONE_VM                0x00000100
+#define LNX_CLONE_PARENT_SETTID     0x00100000
+#define LNX_CLONE_CHILD_CLEARTID    0x00200000
+#define LNX_CLONE_CHILD_SETTID      0x01000000
 #define LNX_read             3
 #define LNX_write            4
 #define LNX_open             5
@@ -1004,6 +1011,52 @@ static void linux_syscall_body(struct int_frame* f) {
              * isatty() correctly report "not a terminal" (→ fully-buffered
              * stdio) instead of logging an unhandled syscall. */
             f->eax = (uint32_t)-LNX_ENOTTY;
+            return;
+
+        /* §M40 — clone().  i386 argument order is (flags, stack, ptid, TLS, ctid)
+         * — TLS comes BEFORE ctid here, the opposite of amd64; getting that
+         * backwards hands the kernel a thread pointer where it expects a futex
+         * address.  Only the THREAD shape is served (CLONE_VM); anything else
+         * is a fork. */
+        case LNX_clone: {
+            unsigned long flags = (unsigned long)f->ebx;
+            struct user_regs r;
+            r.eax = 0;
+            r.ebx = f->ebx; r.ecx = f->ecx; r.edx = f->edx;
+            r.esi = f->esi; r.edi = f->edi; r.ebp = f->ebp;
+            r.eip = f->eip; r.eflags = f->eflags; r.user_sp = f->user_esp;
+            if (!(flags & LNX_CLONE_VM)) {          /* a fork in disguise */
+                f->eax = (uint32_t)proc_fork(&r);
+                return;
+            }
+            if (!f->ecx) { f->eax = (uint32_t)-LNX_EINVAL; return; }
+            int* ctid = (flags & LNX_CLONE_CHILD_CLEARTID) ? (int*)f->edi : NULL;
+            if (ctid && !lnx_w_ok((uintptr_t)ctid, sizeof(int))) {
+                f->eax = (uint32_t)-LNX_EFAULT; return;
+            }
+            /* i386 TLS: musl passes a `struct user_desc*`, not a raw base — the
+             * base is the field the GDT descriptor needs, so read it out.  Using
+             * the descriptor address as the thread pointer would aim %gs at the
+             * descriptor itself. */
+            uintptr_t tls = 0;
+            if (f->esi) {
+                const struct lnx_user_desc* ud = (const struct lnx_user_desc*)f->esi;
+                if (lnx_r_ok((uintptr_t)ud, sizeof *ud)) tls = (uintptr_t)ud->base_addr;
+            }
+            int tid = proc_clone_thread(&r, (uintptr_t)f->ecx, tls, ctid);
+            if (tid < 0) { f->eax = (uint32_t)-LNX_EINVAL; return; }
+            if ((flags & LNX_CLONE_PARENT_SETTID) && f->edx) {
+                if (lnx_w_ok(f->edx, sizeof(int))) *(int*)f->edx = tid;
+            }
+            if ((flags & LNX_CLONE_CHILD_SETTID) && ctid) *ctid = tid;
+            f->eax = (uint32_t)tid;
+            return;
+        }
+
+        case LNX_futex:
+            /* musl's pthread mutexes/joins are futexes; without this a thread
+             * that has to WAIT spins on -ENOSYS forever. */
+            f->eax = (uint32_t)sys_futex((int*)f->ebx, (int)f->ecx, (int)f->edx);
             return;
 
         case LNX_fcntl64:

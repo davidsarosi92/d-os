@@ -43,6 +43,19 @@ TLS, NetSurf, Wayland.  Nothing failed visibly, which is why it survived two
 milestones.  Now armed on both; the `_k`/`_u` discipline covers the places that
 legitimately pass kernel buffers (new `sys_recv_u`).
 
+✅ **§M40 STAGE 9 — REAL musl PTHREADS (2026-08-03, DOCS §4.40).**  `clone` was
+the last hard `-ENOSYS` in the Linux ABI and it blocked every toolkit AND Mesa.
+`proc_clone_thread()` = `proc_fork` but the child SHARES the address space,
+resumes on the caller's stack at the SAME instruction with rax/eax = 0 (musl's
+`__clone` pre-lays fn+arg there), and installs the caller's thread pointer.
+**`pthread_join` needs the kernel**: `CLONE_CHILD_CLEARTID` — `task_exit_code`
+zeroes the tid word and futex-wakes before marking DEAD, else a program prints
+everything and hangs in join.  **i386 traps:** arg order is (flags, stack, ptid,
+TLS, ctid) — TLS BEFORE ctid, opposite of amd64; TLS is a per-CPU GDT descriptor
+so the thread must be CPU-pinned and entered with the TLS selector in `%gs`
+(else musl faults at `%gs:0x10`); and musl passes a `struct user_desc*`, not a
+raw base.  Shell: `pthreadtest`.
+
 ✅ **§M40 STAGES 7–8 (2026-08-03, DOCS §4.40).**  **Focus**: `wl_pointer.enter`
 / `wl_keyboard.enter` + `modifiers` + `wl_pointer.frame` — a real client IGNORES
 input that arrives without a preceding enter.  (libwayland caught a malformed

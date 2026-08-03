@@ -72,6 +72,12 @@ struct task {
      * build_initial_stack consumes and clears it, so it can never leak into an
      * unrelated later exec.  The seam a full per-exec environ grows from. */
     char exec_extra_env[64];
+
+    /* §M40 — CLONE_CHILD_CLEARTID.  musl's pthread_join blocks on a futex at
+     * this address and relies on the KERNEL zeroing it + waking the waiters
+     * when the thread dies; without that, joining a finished thread hangs
+     * forever.  NULL for anything not created by clone(). */
+    int* clear_tid;
     int      pid;
     /* M27 — process model.  `ppid` is the parent's pid (a stable int, not
      * a pointer, so it never dangles when the parent is reaped).  On the

@@ -4214,9 +4214,43 @@ end to end:
 d-os scancode 4  →  wl_keyboard.key 4  →  xkb keycode 12  →  keysym a / A
 ```
 
+#### Stage 9 — real musl pthreads (`clone`)
+
+Every toolkit, and Mesa itself, is built on POSIX threads — so "threads work"
+has to mean *musl's* threads, not d-os's own `thread_create`.  `clone` was the
+last hard `-ENOSYS` in the Linux ABI and it blocked all of them.
+
+`proc_clone_thread()` is `proc_fork` with the one difference that matters: the
+child **shares** the address space rather than getting a copy, resumes on a
+caller-supplied stack, and installs a caller-supplied thread pointer.  Linux's
+clone resumes the child at the *same instruction* with the return value 0 —
+musl's `__clone` relies on exactly that, having pre-laid the start function and
+its argument on the new stack — which is why this reuses the fork register
+snapshot instead of taking an entry point like the native `proc_clone`.
+
+**`pthread_join` needs kernel help.**  musl parks on a futex at the child's tid
+address and the contract is that the *kernel* zeroes it and wakes the waiters
+when the thread dies (`CLONE_CHILD_CLEARTID`).  `task_exit_code` now does that
+before marking the task DEAD, while the shared address space is still current.
+Without it a program prints all its output and then hangs in join — which is
+exactly what "it works but never exits" looks like.
+
+**Two i386-only traps.**  The argument order is `(flags, stack, ptid, TLS,
+ctid)` — TLS *before* ctid, the opposite of amd64 — so getting it backwards
+hands the kernel a thread pointer where it expects a futex address.  And i386
+TLS is a per-CPU GDT descriptor: the thread must be pinned to the CPU whose
+descriptor is programmed **and** entered with the TLS selector in `%gs`, which
+is not part of the register snapshot.  Missing that, musl's first thread-pointer
+read faults at `%gs:0x10`.  (musl also passes a `struct user_desc*` here, not a
+raw base — the base has to be read out of it.)
+
+Verified on both arches with `pthreadtest`, a real `pthread_create` /
+`pthread_mutex` / `pthread_join` program: 4 threads, 20000 locked increments,
+all four joined, counter exact.
+
 **Open:** a full toolkit (SDL/GTK/Qt).  Those need EGL, hence Mesa — a large
-build and the natural next milestone, now that everything underneath it is
-proven by a real application.
+build, but the threading, dynamic linking, shm and protocol surface underneath
+it are now all proven by real code.
 
 ---
 

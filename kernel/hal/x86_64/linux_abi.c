@@ -82,6 +82,11 @@ extern uint64_t saved_rip;
 #define LNX_setsockopt       54
 #define LNX_getsockopt       55
 #define LNX_clone            56
+/* clone() flag bits we care about (linux/sched.h). */
+#define LNX_CLONE_VM                0x00000100
+#define LNX_CLONE_PARENT_SETTID     0x00100000
+#define LNX_CLONE_CHILD_CLEARTID    0x00200000
+#define LNX_CLONE_CHILD_SETTID      0x01000000
 #define LNX_fork             57
 #define LNX_execve           59
 #define LNX_exit             60
@@ -946,12 +951,52 @@ static void linux_syscall_body(struct int_frame* f) {
             f->rax = (uint64_t)-LNX_EOPNOTSUPP;
             return;
 
-        /* ---- Still deferred: threads (clone with CLONE_VM). */
-        case LNX_clone:
-            kprintf("linux-abi64: syscall %lu not yet ported (x86_64)\n",
-                    (unsigned long)f->rax);
-            f->rax = (uint64_t)-LNX_ENOSYS;
+        /* §M40 — clone().  amd64: clone(flags, stack, ptid, ctid, tls).
+         *
+         * Only the THREAD shape is served (CLONE_VM|CLONE_THREAD), which is
+         * what musl's pthread_create issues; a clone without CLONE_VM is a
+         * fork and is routed there so both spellings work.  musl's __clone has
+         * already laid the start function and its argument on the new stack and
+         * expects the child to resume at the same instruction with rax = 0. */
+        case LNX_clone: {
+            unsigned long flags = (unsigned long)a0;
+            if (!(flags & LNX_CLONE_VM)) {          /* a fork in disguise */
+                struct user_regs r;
+                r.rax = 0;
+                r.rbx = f->rbx; r.rcx = f->rcx; r.rdx = f->rdx;
+                r.rsi = f->rsi; r.rdi = f->rdi; r.rbp = f->rbp;
+                r.r8  = f->r8;  r.r9  = f->r9;  r.r10 = f->r10; r.r11 = f->r11;
+                r.r12 = f->r12; r.r13 = f->r13; r.r14 = f->r14; r.r15 = f->r15;
+                r.rip = f->rip; r.rflags = f->rflags; r.user_sp = f->rsp;
+                f->rax = (uint64_t)proc_fork(&r);
+                return;
+            }
+            if (!a1) { f->rax = (uint64_t)-LNX_EINVAL; return; }
+
+            struct user_regs r;
+            r.rax = 0;
+            r.rbx = f->rbx; r.rcx = f->rcx; r.rdx = f->rdx;
+            r.rsi = f->rsi; r.rdi = f->rdi; r.rbp = f->rbp;
+            r.r8  = f->r8;  r.r9  = f->r9;  r.r10 = f->r10; r.r11 = f->r11;
+            r.r12 = f->r12; r.r13 = f->r13; r.r14 = f->r14; r.r15 = f->r15;
+            r.rip = f->rip; r.rflags = f->rflags; r.user_sp = f->rsp;
+
+            /* ctid lives in the SHARED address space, so the pointer stays
+             * valid for the child's whole life — the kernel keeps it and
+             * zeroes it at exit (see task_exit_code). */
+            int* ctid = (flags & LNX_CLONE_CHILD_CLEARTID) ? (int*)a3 : NULL;
+            if (ctid && !lnx_w_ok((uintptr_t)ctid, sizeof(int))) {
+                f->rax = (uint64_t)-LNX_EFAULT; return;
+            }
+            int tid = proc_clone_thread(&r, (uintptr_t)a1, (uintptr_t)a4, ctid);
+            if (tid < 0) { f->rax = (uint64_t)-LNX_EINVAL; return; }
+            if ((flags & LNX_CLONE_PARENT_SETTID) && a2) {
+                if (lnx_w_ok(a2, sizeof(int))) *(int*)a2 = tid;
+            }
+            if ((flags & LNX_CLONE_CHILD_SETTID) && ctid) *ctid = tid;
+            f->rax = (uint64_t)tid;
             return;
+        }
 
         default:
             kprintf("linux-abi64: unhandled syscall %lu (returning -ENOSYS)\n",

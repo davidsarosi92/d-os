@@ -71,6 +71,7 @@
  * ============================================================================= */
 
 #include "task.h"
+#include "syscall.h"   /* sys_futex — CLONE_CHILD_CLEARTID wake */
 #include "kmalloc.h"
 #include "printf.h"
 #include "lock.h"
@@ -1056,6 +1057,19 @@ void task_exit(void) { task_exit_code(0); }
 void task_exit_code(int code) {
     struct percpu* me = this_cpu();
     struct task* self = me->current;
+
+    /* §M40 — CLONE_CHILD_CLEARTID.  musl's pthread_join parks on a futex at
+     * this address, and the contract is that the KERNEL zeroes it and wakes the
+     * waiters when the thread dies.  Do it BEFORE the task is marked DEAD, while
+     * the shared address space is still current: joining a finished thread
+     * otherwise blocks forever, which is how "the program printed all its output
+     * and then hung" looks. */
+    if (self->clear_tid) {
+        int* p = self->clear_tid;
+        self->clear_tid = NULL;
+        *p = 0;
+        sys_futex(p, 1 /* FUTEX_WAKE */, 0x7fffffff);
+    }
 
     /* Mark DEAD under master_lock so iterators see a consistent state. */
     uint32_t mfl = spin_lock_irqsave(&master_lock);

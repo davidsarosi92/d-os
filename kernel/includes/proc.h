@@ -77,4 +77,13 @@ int proc_clone(uintptr_t entry, uintptr_t stack);
  * never leak into an unrelated later one.  NULL/"" clears it. */
 void proc_set_exec_env(const char* kv);
 
+/* §M40 — clone() as a THREAD (musl pthread_create): the child SHARES the
+ * caller's address space, resumes at the same instruction with the return value
+ * 0 on `child_stack`, and installs `tls` as its thread pointer.  `ctid_kaddr` is
+ * the CLONE_CHILD_CLEARTID address (a user VA in the SHARED space, so it stays
+ * valid for the child's lifetime) or NULL.  Returns the new tid, or -1. */
+struct user_regs;
+int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
+                      uintptr_t tls, int* ctid_kaddr);
+
 #endif

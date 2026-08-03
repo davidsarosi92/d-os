@@ -137,3 +137,93 @@ int proc_fork(struct user_regs* parent_regs) {
     task_set_reap_owned(child, 1);
     return child->pid;                       /* parent: fork() returns child pid */
 }
+
+/* ---------------------------------------------------------------------------
+ * §M40 — clone() as a THREAD (musl's pthread_create).
+ *
+ * Same shape as fork above, with the one difference that matters: the child
+ * SHARES the address space instead of getting a copy, resumes on a stack the
+ * caller supplies, and installs the caller-supplied thread pointer.  Linux's
+ * clone resumes the child at the SAME instruction with the return value 0 —
+ * musl's __clone relies on exactly that, having pre-laid the start function and
+ * its argument on the new stack — which is why this reuses the fork register
+ * snapshot rather than taking an entry point like the native proc_clone.
+ *
+ * The fd "table" is per-task here, so the child gets ref-bumped copies of the
+ * parent's descriptors.  Sharing the OBJECTS is what POSIX threads actually
+ * need for I/O; a descriptor opened later by one thread is not yet visible to
+ * the others (a real shared table is a follow-up).
+ * ------------------------------------------------------------------------- */
+struct clone_boot_t {
+    struct vmm_space* space;
+    struct user_regs  regs;
+    uintptr_t         tls;
+    struct ofile*     fds[TASK_MAX_FDS];
+};
+
+static void clone_thread_bootstrap(void) {
+    struct clone_boot_t* b = (struct clone_boot_t*)task_start_arg();
+    struct task* me = task_current();
+
+    me->mm        = b->space;               /* SHARED with the creator */
+    me->mm_shared = 1;
+    me->user_task = 1;
+    for (int i = 0; i < TASK_MAX_FDS; i++) me->fds[i] = b->fds[i];
+
+    struct user_regs  regs  = b->regs;
+    struct vmm_space* space = b->space;
+    uintptr_t         tls   = b->tls;
+    kfree(b);
+
+    vmm_space_switch(space);
+    if (me->kstack_base)
+        hal_set_kernel_stack((uintptr_t)me->kstack_base + TASK_KSTACK_SZ);
+    /* i386 TLS is a per-CPU GDT descriptor, so a thread that uses it must be
+     * pinned to the CPU whose descriptor we program, and the resume path has to
+     * enter ring 3 with the TLS SELECTOR in %gs — %gs is not part of the
+     * register snapshot.  Without this the thread runs with a plain data
+     * selector and musl's very first thread-pointer read faults at %gs:0x10. */
+    if (tls) {
+        me->tls_base = tls;
+        me->has_tls  = 1;
+        task_set_affinity(me, 1u << this_cpu_id());
+        hal_set_tls_base(tls);
+        g_entry_gs = gdt_tls_selector();
+    } else {
+        g_entry_gs = 0x23;
+    }
+
+    enter_user_mode_regs(&regs);            /* → ring 3, eax = 0 */
+}
+
+int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
+                      uintptr_t tls, int* ctid_kaddr) {
+    struct task* parent = task_current();
+    if (!parent || !parent->mm || !child_stack) return -1;
+
+    struct clone_boot_t* b = (struct clone_boot_t*)kmalloc(sizeof *b);
+    if (!b) return -1;
+    b->space   = parent->mm;                /* share, do not clone */
+    b->regs    = *parent_regs;
+    b->regs.eax = 0;                    /* the child sees clone() == 0 */
+    b->regs.user_sp = child_stack;
+    b->tls     = tls;
+    for (int i = 0; i < TASK_MAX_FDS; i++)
+        b->fds[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
+
+    struct task* child = task_spawn_arg("thread", clone_thread_bootstrap, b);
+    if (!child) {
+        for (int i = 0; i < TASK_MAX_FDS; i++)
+            if (b->fds[i]) ofile_unref(b->fds[i]);
+        kfree(b);
+        return -1;
+    }
+    child->mm_shared   = 1;                 /* set early: it may run at once */
+    child->linux_abi   = parent->linux_abi;
+    child->clear_tid   = ctid_kaddr;        /* CLONE_CHILD_CLEARTID (see task_exit) */
+    hal_fpu_save(parent->fpu_state);
+    for (unsigned i = 0; i < HAL_FPU_STATE_SIZE; i++)
+        child->fpu_state[i] = parent->fpu_state[i];
+    task_set_reap_owned(child, 1);          /* the creator joins it */
+    return child->pid;
+}
