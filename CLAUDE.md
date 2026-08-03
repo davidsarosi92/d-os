@@ -43,6 +43,18 @@ TLS, NetSurf, Wayland.  Nothing failed visibly, which is why it survived two
 milestones.  Now armed on both; the `_k`/`_u` discipline covers the places that
 legitimately pass kernel buffers (new `sys_recv_u`).
 
+✅ **§M40 STAGE 4 (2026-08-03, DOCS §4.40).**  REAL desktop input reaches the
+upstream client's `wl_seat` (pointer motion + keys, both arches).  Three gaps,
+all hidden by §M26's demo synthesising input instead of taking it from the
+desktop: (1) nobody drained a hook-backed window's queue — a Wayland window's
+"host" is the server task (blocked on its socket) and a dosgui window has
+`host_task` cleared, so the COMPOSITOR now pumps any window with an
+`input_hook`; **this also fixed NetSurf's input, broken the same way**; (2)
+pointer motion was only delivered on click (fine for widgets, useless for a
+client); (3) only nav/Ctrl-letter keycodes were forwarded.  Client-side lesson:
+fill listener structs COMPLETELY — libwayland calls whatever arrives and a NULL
+slot is a jump to zero.
+
 ✅ **§M40 STAGE 3 (2026-08-03, DOCS §4.40).**  `wayupstream win` → the upstream
 client's `xdg_toplevel` IS a desktop window (title bar + taskbar button + its
 pixels as contents), verified by screenshot on both arches.  The window is now

@@ -4053,9 +4053,47 @@ Two things had to move for it to look like an application rather than a demo:
   it (and retitled if it changes later).  Without this every application's
   window said "Wayland client".
 
-**Open:** input from the window back into the client's `wl_seat` under wm_mode
-is wired but only exercised by the native demo; then a real toolkit (Mesa
-`llvmpipe` + GTK/Qt/SDL).
+#### Stage 4 — real input reaches the client's `wl_seat`
+
+The client binds `wl_seat`, takes a `wl_pointer` and a `wl_keyboard`, installs
+upstream listeners, and receives genuine desktop input: moving the QEMU pointer
+over the window and pressing a key produce
+
+```
+wlupstream: pointer motion -> (78,62)
+wlupstream: key 4 pressed
+```
+
+on both arches — dispatched by libwayland's own machinery into the client's
+callbacks.
+
+**Three gaps had to close, and each had been hidden by the same thing: §M26's
+demo synthesised input directly instead of letting it come from the desktop.**
+
+1. **Nobody drained a hook-backed window's event queue.**  Queued input is
+   consumed by the window's app-host (`app_host_main`) — but a Wayland window is
+   created by the server task, which then blocks reading its client's socket,
+   and a dosgui window (NetSurf) is client-managed with `host_task` cleared
+   outright.  Neither is anyone's app-host, so the events simply piled up.  The
+   compositor now pumps any window that has an `input_hook`: it is an ordinary
+   task (the hook does a socket send, which must not happen in the mouse IRQ)
+   and such a window has no widgets for anyone else to dispatch to.
+   **This also fixes NetSurf's input, which had the same defect.**
+2. **Pointer motion never reached a window.**  Widget windows deliberately get
+   motion only on click — a widget hit-test per mouse packet would be pointless
+   work — but `wl_pointer.motion` is how an application tracks the cursor at
+   all.  Motion is now delivered to hook-backed windows.
+3. **Only nav and Ctrl-letter keycodes were forwarded.**  Again correct for
+   widgets, wrong for a client: `wl_keyboard.key` carries raw keycodes and the
+   application does its own interpretation, so a hook-backed window gets every
+   key.
+
+Note the listener structs in the client are filled completely, stubs included:
+libwayland calls whatever the compositor sends, and a NULL slot for an event
+that does arrive is a jump to address zero.
+
+**Open:** a real toolkit (Mesa `llvmpipe` + GTK/Qt/SDL) — the remaining §M40
+work, and the point of the whole milestone.
 
 ---
 

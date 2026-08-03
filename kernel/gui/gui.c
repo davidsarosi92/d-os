@@ -1698,6 +1698,33 @@ static void apply_pending(void) {
     }
 }
 
+/* §M40 — deliver queued input for a WIN_APP window that has an INPUT HOOK but
+ * NO app-host task.
+ *
+ * A hook-backed window has no app-host that drains its queue: a Wayland window
+ * is created by the server task, which then blocks reading its client's socket,
+ * and a dosgui window (NetSurf) is client-managed with host_task cleared
+ * outright.  Either way app_host_main never runs for it, so queued events
+ * simply piled up and the hook was never called.  The §M26 demo hid this by
+ * synthesising input directly, so it only surfaced once a REAL client asked for
+ * a wl_seat.
+ *
+ * The compositor is the right owner: it is an ordinary task (the hook does a
+ * socket send, which must not happen in the mouse IRQ) and a hook-backed window
+ * has no widgets for anyone else to dispatch to. */
+static void pump_hostless_input(void) {
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+        struct gui_window* win = &windows[i];
+        if (!win->used || win->kind != WIN_APP) continue;
+        if (!win->input_hook) continue;
+        while (win->aq_t != win->aq_h) {
+            struct app_event e = win->aq[win->aq_t];
+            win->aq_t = (win->aq_t + 1) % AQ_SZ;
+            app_dispatch_event(win, &e);
+        }
+    }
+}
+
 static void gui_compositor_main(void) {
     kprintf("gui: compositor up on pid %d (shell '%s')\n",
             task_current() ? task_current()->pid : -1,
@@ -1709,6 +1736,7 @@ static void gui_compositor_main(void) {
         dispatch_events();
         dispatch_keys();
         dispatch_keycodes();
+        pump_hostless_input();
         apply_pending();
 
         /* ~1 Hz per-window housekeeping.  (The shell clock moved to the
@@ -1804,6 +1832,17 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
      * popup is open; route it to the desktop task instead of running the
      * shell in the IRQ. */
     if (pnl_pop_on) pevq_push(PEV_MOTION, mx, my);
+
+    /* §M40 — a window that forwards its input to a CLIENT (Wayland) wants the
+     * whole pointer stream, not just clicks: `wl_pointer.motion` is how an
+     * application tracks the cursor at all.  Widget windows deliberately get
+     * motion only on click (a widget hit-test per mouse packet would be
+     * pointless work), so this is gated on the hook rather than made general. */
+    {
+        struct gui_window* hw = topmost_at(mx, my);
+        if (hw && hw->kind == WIN_APP && hw->input_hook && !hw->minimized)
+            evq_push(hw, mx - hw->x - BORDER, my - hw->y - TITLE_H, 0);
+    }
 
     if (pressed & MOUSE_BTN_LEFT) {
         /* Desktop chrome gets first refusal.  A click over the taskbar or
@@ -1994,8 +2033,12 @@ static int gui_raw_key(uint8_t keycode, uint8_t mods) {
         /* Widget-bound keycodes?  focused_win is an atomic pointer
          * read; kind/used are stable for live windows. */
         struct gui_window* win = focused_win;
+        /* §M40 — widget windows only want the keycodes their widgets act on
+         * (nav + Ctrl-letter); a window forwarding to a CLIENT wants EVERY key,
+         * because `wl_keyboard.key` carries raw keycodes and the application
+         * does its own interpretation. */
         if (win && win->used && win->kind == WIN_APP &&
-            (kc_is_nav(keycode) ||
+            (win->input_hook || kc_is_nav(keycode) ||
              ((mods & KBD_MOD_CTRL_MASK) &&
               keycode >= KC_A && keycode <= KC_Z))) {
             uint32_t n = (kcq_h + 1) % KCQ_SZ;

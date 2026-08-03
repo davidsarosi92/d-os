@@ -47,6 +47,64 @@ static int configured, ok;
 static struct wl_compositor *compositor;
 static struct wl_shm        *shm;
 static struct xdg_wm_base   *wm_base;
+static struct wl_seat       *seat;
+static int keys_seen, motions_seen;
+
+/* ---- wl_seat input, through upstream's own event dispatch -------------------
+ * The listener structs must be filled COMPLETELY: libwayland calls whatever the
+ * compositor sends, and a NULL slot for an event that does arrive is a jump to
+ * address zero.  Stubs for the ones d-os does not emit yet are therefore not
+ * boilerplate — they are the contract. */
+static void pt_enter(void *d, struct wl_pointer *p, uint32_t s_, struct wl_surface *sf,
+                     wl_fixed_t x, wl_fixed_t y)
+{ (void)d;(void)p;(void)s_;(void)sf;(void)x;(void)y; }
+static void pt_leave(void *d, struct wl_pointer *p, uint32_t s_, struct wl_surface *sf)
+{ (void)d;(void)p;(void)s_;(void)sf; }
+static void pt_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t x, wl_fixed_t y)
+{
+    (void)d; (void)p; (void)t;
+    motions_seen++;
+    printf("wlupstream: pointer motion -> (%d,%d)\n",
+           wl_fixed_to_int(x), wl_fixed_to_int(y));
+}
+static void pt_button(void *d, struct wl_pointer *p, uint32_t s_, uint32_t t,
+                      uint32_t b, uint32_t st)
+{ (void)d;(void)p;(void)s_;(void)t;(void)b;(void)st; }
+static void pt_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t a, wl_fixed_t v)
+{ (void)d;(void)p;(void)t;(void)a;(void)v; }
+static void pt_frame(void *d, struct wl_pointer *p) { (void)d;(void)p; }
+static void pt_axis_src(void *d, struct wl_pointer *p, uint32_t s_) { (void)d;(void)p;(void)s_; }
+static void pt_axis_stop(void *d, struct wl_pointer *p, uint32_t t, uint32_t a)
+{ (void)d;(void)p;(void)t;(void)a; }
+static void pt_axis_disc(void *d, struct wl_pointer *p, uint32_t a, int32_t v)
+{ (void)d;(void)p;(void)a;(void)v; }
+static const struct wl_pointer_listener pointer_listener = {
+    pt_enter, pt_leave, pt_motion, pt_button, pt_axis,
+    pt_frame, pt_axis_src, pt_axis_stop, pt_axis_disc,
+};
+
+static void kb_keymap(void *d, struct wl_keyboard *k, uint32_t f, int32_t fd, uint32_t sz)
+{ (void)d;(void)k;(void)f;(void)sz; if (fd >= 0) close(fd); }
+static void kb_enter(void *d, struct wl_keyboard *k, uint32_t s_, struct wl_surface *sf,
+                     struct wl_array *keys)
+{ (void)d;(void)k;(void)s_;(void)sf;(void)keys; }
+static void kb_leave(void *d, struct wl_keyboard *k, uint32_t s_, struct wl_surface *sf)
+{ (void)d;(void)k;(void)s_;(void)sf; }
+static void kb_key(void *d, struct wl_keyboard *k, uint32_t s_, uint32_t t,
+                   uint32_t key, uint32_t state)
+{
+    (void)d; (void)k; (void)s_; (void)t;
+    keys_seen++;
+    printf("wlupstream: key %u %s\n", key, state ? "pressed" : "released");
+}
+static void kb_mods(void *d, struct wl_keyboard *k, uint32_t s_, uint32_t dep,
+                    uint32_t lat, uint32_t lock, uint32_t grp)
+{ (void)d;(void)k;(void)s_;(void)dep;(void)lat;(void)lock;(void)grp; }
+static void kb_repeat(void *d, struct wl_keyboard *k, int32_t rate, int32_t delay)
+{ (void)d;(void)k;(void)rate;(void)delay; }
+static const struct wl_keyboard_listener keyboard_listener = {
+    kb_keymap, kb_enter, kb_leave, kb_key, kb_mods, kb_repeat,
+};
 
 /* xdg_surface.configure must be acknowledged before the surface may be shown —
  * this is the handshake that makes the window real. */
@@ -78,6 +136,7 @@ static void reg_global(void *data, struct wl_registry *reg, uint32_t name,
         wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, 1);
     } else if (!strcmp(iface, "wl_seat")) {
         have_seat = 1;
+        seat = wl_registry_bind(reg, name, &wl_seat_interface, 1);
     }
 }
 
@@ -96,6 +155,11 @@ int main(int argc, char **argv)
      * keep servicing the connection — otherwise the client exits immediately
      * and the window is torn down before anyone can see it. */
     int keep = (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'w');
+
+    /* d-os has no tty, so musl makes stdout FULLY buffered — a long-running
+     * client's progress would only appear when it exits, which is exactly the
+     * output we need while it is still holding its window open. */
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     struct wl_display *dpy = wl_display_connect(NULL);
     if (!dpy) {
@@ -189,12 +253,25 @@ int main(int argc, char **argv)
            "xdg_toplevel + shm buffer on d-os\n", ok ? "PASS" : "FAIL");
 
     if (keep) {
+        /* Ask for the input devices and let libwayland dispatch what the
+         * compositor sends into the listeners above. */
+        if (seat) {
+            struct wl_pointer *ptr = wl_seat_get_pointer(seat);
+            struct wl_keyboard *kb = wl_seat_get_keyboard(seat);
+            if (ptr) wl_pointer_add_listener(ptr, &pointer_listener, NULL);
+            if (kb)  wl_keyboard_add_listener(kb, &keyboard_listener, NULL);
+            wl_display_roundtrip(dpy);
+            printf("wlupstream: wl_seat input hooked (pointer=%d keyboard=%d)\n",
+                   ptr != NULL, kb != NULL);
+        }
         printf("wlupstream: window is up — holding the connection open\n");
         for (int i = 0; i < 200; i++) {
             if (wl_display_roundtrip(dpy) < 0) break;
             struct timespec ts = { 0, 100 * 1000000L };   /* 100 ms */
             nanosleep(&ts, NULL);
         }
+        printf("wlupstream: input seen — %d key(s), %d motion(s)\n",
+               keys_seen, motions_seen);
     }
 
 out:
