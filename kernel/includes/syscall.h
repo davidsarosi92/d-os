@@ -153,6 +153,7 @@ int  sys_bind(int fd, int port);
 #define FDK_SOCK    2
 #define FDK_NETSOCK 3
 int  sys_fd_kind(int fd);                     /* → FDK_*, or -1 if not open */
+int  sys_memfd_resize(int fd, size_t size);   /* ftruncate() on a memfd      */
 int  sys_socket_setnonblock(int fd, int on);
 int  sys_socket_getnonblock(int fd);          /* → 0/1, or -1 if not a socket */
 int  sys_connect(int fd, uint32_t ip, int port);           /* TCP handshake    */

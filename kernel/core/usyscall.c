@@ -470,11 +470,33 @@ long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
         t->mmap_cursor += (uintptr_t)n * PAGE_SIZE;
     }
 
-    /* File to read from for a file-backed mapping (else anonymous zero-fill). */
+    /* File to read from for a file-backed mapping (else anonymous zero-fill).
+     *
+     * §M40 — a memfd (FD_SHM) is a THIRD case and must be handled separately:
+     * its whole purpose is that both sides see the SAME frames, so it maps the
+     * object's existing pages rather than allocating fresh ones.  Missing this
+     * branch is why an upstream Wayland client's mmap of its shm pool failed —
+     * the native sys_mmap had it, this Linux-facing entry point did not. */
     struct file* file = NULL;
     if (fd >= 0 && !(flags & MAP_ANONYMOUS)) {
         struct ofile* o = fd_lookup(fd);
-        if (!o || o->kind != FD_VFS || !o->file) return -1;
+        if (!o) return -1;
+        if (o->kind == FD_SHM && o->shm) {
+            struct shm* sh = o->shm;
+            int first = (int)(offset / PAGE_SIZE);
+            for (int i = 0; i < n; i++) {
+                int idx = first + i;
+                if (idx >= sh->nframes) break;      /* short object: stop here */
+                /* VMM_SHARED: the shm object owns these frames, so tearing the
+                 * address space down must not free them. */
+                if (vmm_space_map(t->mm, va + (uintptr_t)i * PAGE_SIZE,
+                                  sh->frames[idx],
+                                  vf | VMM_WRITABLE | VMM_SHARED) != 0)
+                    return -1;
+            }
+            return (long)va;
+        }
+        if (o->kind != FD_VFS || !o->file) return -1;
         file = o->file;
     }
 
@@ -530,6 +552,15 @@ int sys_memfd(size_t size) {
     int fd = fd_install(o);
     if (fd < 0) { ofile_unref(o); return -1; }
     return fd;
+}
+
+/* §M40 — ftruncate() on a memfd.  Linux's memfd_create hands back a zero-length
+ * object and the caller sizes it with ftruncate; a Wayland client does exactly
+ * that before passing the fd to wl_shm_create_pool. */
+int sys_memfd_resize(int fd, size_t size) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_SHM || !o->shm) return -1;
+    return shm_grow(o->shm, size);
 }
 
 /* ---- unix sockets + fd passing (stage 5) ---------------------------------- */

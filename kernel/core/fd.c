@@ -97,6 +97,27 @@ struct shm* shm_create(size_t size) {
     return s;
 }
 
+/* Grow a shm object to at least `size` bytes (§M40).  Linux's memfd_create
+ * returns a ZERO-length object that the caller then ftruncate()s to the size it
+ * wants — which is exactly what a Wayland client does before handing the fd to
+ * wl_shm_create_pool.  Shrinking is not supported (nothing needs it, and the
+ * frames may already be mapped); an already-large-enough object succeeds. */
+int shm_grow(struct shm* s, size_t size) {
+    if (!s) return -1;
+    int n = (int)((size + 4095) / 4096);
+    if (n <= s->nframes) return 0;
+    if (n > SHM_MAX_FRAMES) return -1;
+    for (int i = s->nframes; i < n; i++) {
+        uint32_t f = pmm_alloc_frame();
+        if (!f) return -1;                      /* keep what we already grew to */
+        uint8_t* p = (uint8_t*)(uintptr_t)f;
+        for (int b = 0; b < 4096; b++) p[b] = 0;
+        s->frames[i] = f;
+        s->nframes = i + 1;
+    }
+    return 0;
+}
+
 struct shm* shm_ref(struct shm* s) {
     if (s) s->refcount++;
     return s;

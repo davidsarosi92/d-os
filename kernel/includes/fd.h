@@ -59,6 +59,9 @@ struct shm {
  * zeroed.  Returns NULL on OOM / too large. */
 struct shm* shm_create(size_t size);
 struct shm* shm_ref   (struct shm* s);
+/* Grow to at least `size` bytes (Linux memfd_create + ftruncate shape).  0 on
+ * success; shrinking is not supported. */
+int         shm_grow  (struct shm* s, size_t size);
 void        shm_unref (struct shm* s);   /* frees frames at refcount 0 */
 
 /* ---- unix socket pair + fd passing (stage 5) ------------------------------ */

@@ -106,6 +106,10 @@ extern uint64_t saved_rip;
 #define LNX_openat          257
 #define LNX_set_robust_list 273
 #define LNX_getrandom       318
+/* §M40 — a Wayland client's shm pool: memfd_create gives a zero-length object,
+ * ftruncate sizes it, then the fd travels over SCM_RIGHTS. */
+#define LNX_ftruncate        77
+#define LNX_memfd_create    319
 #define LNX_membarrier      324
 
 #define LNX_ENOSYS  38
@@ -156,6 +160,65 @@ static int linux_open_flags(int lf) {
 
 /* x86_64 iovec — 64-bit base + length. */
 struct lnx_iovec { void* iov_base; uint64_t iov_len; };
+
+/* ---- SCM_RIGHTS (§M40) ------------------------------------------------------
+ * Passing a file descriptor over a UNIX socket is how a Wayland client hands the
+ * compositor its shm pool, so libwayland cannot create a single buffer without
+ * it.  Linux carries the descriptor in the msghdr's ANCILLARY data:
+ *
+ *     struct cmsghdr { size_t cmsg_len; int cmsg_level; int cmsg_type; }
+ *     followed by the payload, each block padded to sizeof(long).
+ *
+ * `size_t` and the alignment differ between i386 and x86_64, which is precisely
+ * why this struct is declared per-arch rather than shared — the same C text
+ * yields the right 12-byte/4-aligned and 16-byte/8-aligned layouts.
+ *
+ * d-os already moves descriptors between tasks (usock.c, M25 stage 5); this is
+ * only the Linux-shaped wrapper around sys_send_k/sys_recv's `passfd`. */
+#define LNX_SOL_SOCKET  1
+#define LNX_SCM_RIGHTS  1
+
+/* Defined further down with the other ring-3 pointer checks. */
+static int lnx_r_ok(uintptr_t uptr, uintptr_t len);
+static int lnx_w_ok(uintptr_t uptr, uintptr_t len);
+
+struct lnx_cmsghdr {
+    unsigned long cmsg_len;      /* header + payload, unpadded */
+    int           cmsg_level;
+    int           cmsg_type;
+};
+
+#define LNX_CMSG_ALIGN(n) (((n) + sizeof(long) - 1) & ~(unsigned long)(sizeof(long) - 1))
+
+/* Pull the FIRST descriptor out of a client's control buffer, or -1.  The
+ * control buffer is client memory, so it is validated before being read. */
+static int lnx_cmsg_take_fd(const void* ctl, unsigned long ctllen) {
+    if (!ctl || ctllen < sizeof(struct lnx_cmsghdr)) return -1;
+    if (!lnx_r_ok((uintptr_t)ctl, ctllen)) return -1;
+    const struct lnx_cmsghdr* c = (const struct lnx_cmsghdr*)ctl;
+    if (c->cmsg_level != LNX_SOL_SOCKET || c->cmsg_type != LNX_SCM_RIGHTS)
+        return -1;
+    if (c->cmsg_len < LNX_CMSG_ALIGN(sizeof *c) + sizeof(int)) return -1;
+    if (c->cmsg_len > ctllen) return -1;
+    const int* fds = (const int*)((const uint8_t*)ctl + LNX_CMSG_ALIGN(sizeof *c));
+    return fds[0];
+}
+
+/* Write a one-descriptor SCM_RIGHTS block into the client's control buffer and
+ * report how many bytes it occupies (0 if it does not fit / none passed). */
+static unsigned long lnx_cmsg_put_fd(void* ctl, unsigned long ctllen, int fd) {
+    unsigned long need = LNX_CMSG_ALIGN(sizeof(struct lnx_cmsghdr)) + sizeof(int);
+    if (fd < 0 || !ctl || ctllen < need) return 0;
+    if (!lnx_w_ok((uintptr_t)ctl, need)) return 0;
+    struct lnx_cmsghdr* c = (struct lnx_cmsghdr*)ctl;
+    c->cmsg_len   = need;
+    c->cmsg_level = LNX_SOL_SOCKET;
+    c->cmsg_type  = LNX_SCM_RIGHTS;
+    int* fds = (int*)((uint8_t*)ctl + LNX_CMSG_ALIGN(sizeof(struct lnx_cmsghdr)));
+    fds[0] = fd;
+    return need;
+}
+
 
 /* ---- BSD sockets (Linux x86_64 gives each call its own syscall number, unlike
  * i386's single multiplexed socketcall) --------------------------------------
@@ -301,10 +364,17 @@ static long linux_recvmsg(int fd, struct lnx_msghdr* mh, int flags) {
      * AF_INET socket goes through recvfrom.  Handling only the latter is what
      * made upstream libwayland's very first read fail. */
     if (sys_fd_kind(fd) != FDK_NETSOCK) {
-        long r = sys_read(fd, iov->iov_base, (size_t)iov->iov_len);
+        /* sys_recv is the read that can also carry a DESCRIPTOR; anything it
+         * hands back is marshalled into the client's SCM_RIGHTS block. */
+        int passfd = -1;
+        long r = sys_recv(fd, iov->iov_base, (size_t)iov->iov_len, &passfd);
         if (r < 0) return r;
-        mh->msg_namelen = 0;         /* connection-mode: no source address */
-        mh->msg_flags   = 0;
+        mh->msg_namelen    = 0;      /* connection-mode: no source address */
+        mh->msg_flags      = 0;
+        unsigned long ctl = lnx_cmsg_put_fd(mh->msg_control,
+                                            (unsigned long)mh->msg_controllen,
+                                            passfd);
+        mh->msg_controllen = ctl;
         return r;
     }
 
@@ -343,9 +413,14 @@ static long linux_sendmsg(int fd, const struct lnx_msghdr* mh, int flags) {
         for (uint64_t k = 0; k < v->iov_len && total < sizeof buf; k++)
             buf[total++] = p[k];
     }
-    /* Same routing on the way out: a UNIX socket takes the plain write path. */
-    if (sys_fd_kind(fd) != FDK_NETSOCK)
+    /* Same routing on the way out — but a UNIX socket may also be carrying a
+     * DESCRIPTOR in its ancillary data (a Wayland client's shm pool). */
+    if (sys_fd_kind(fd) != FDK_NETSOCK) {
+        int passfd = lnx_cmsg_take_fd(mh->msg_control,
+                                      (unsigned long)mh->msg_controllen);
+        if (passfd >= 0) return sys_send_k(fd, buf, total, passfd);
         return sys_write_k(fd, buf, total);
+    }
 
     if (mh->msg_name) {                              /* datagram to a peer */
         uint32_t ip; int port;
@@ -563,6 +638,15 @@ void linux_syscall_dispatch(struct int_frame* f) {
         case LNX_ioctl:
             /* ENOTTY (not ENOSYS) → musl's isatty() reports "not a terminal". */
             f->rax = (uint64_t)-LNX_ENOTTY;
+            return;
+
+        case LNX_memfd_create:
+            /* The NAME is advisory (Linux only uses it for /proc); we ignore it
+             * and hand back a zero-length shm object, which ftruncate sizes. */
+            f->rax = (uint64_t)(long)sys_memfd(0);
+            return;
+        case LNX_ftruncate:
+            f->rax = (uint64_t)(long)sys_memfd_resize((int)a0, (size_t)a1);
             return;
 
         case LNX_getrandom:

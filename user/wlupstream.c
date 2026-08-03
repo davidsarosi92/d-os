@@ -22,21 +22,62 @@
 
 #include <wayland-client.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+
+/* musl only declares memfd_create when _GNU_SOURCE is on and the headers are
+ * new enough; go straight to the syscall so this file needs no feature-test
+ * gymnastics.  The name is advisory on Linux and ignored by d-os. */
+static int memfd_create(const char *name, unsigned flags) {
+    return (int)syscall(SYS_memfd_create, name, flags);
+}
+#include <xdg-shell-client-protocol.h>
+
+#define W      160
+#define H      120
+#define STRIDE (W * 4)
 
 static int have_compositor, have_shm, have_xdg, have_seat, n_globals;
+static int configured, ok;
+static struct wl_compositor *compositor;
+static struct wl_shm        *shm;
+static struct xdg_wm_base   *wm_base;
+
+/* xdg_surface.configure must be acknowledged before the surface may be shown —
+ * this is the handshake that makes the window real. */
+static void xsurf_configure(void *data, struct xdg_surface *xs, uint32_t serial)
+{
+    (void)data;
+    configured = 1;
+    xdg_surface_ack_configure(xs, serial);
+}
+static const struct xdg_surface_listener xsurf_listener = { xsurf_configure };
 
 static void reg_global(void *data, struct wl_registry *reg, uint32_t name,
                        const char *iface, uint32_t version)
 {
-    (void)data; (void)reg;
+    (void)data;
     n_globals++;
     printf("wlupstream:   global %u: %s v%u\n", name, iface, version);
-    if      (!strcmp(iface, "wl_compositor")) have_compositor = 1;
-    else if (!strcmp(iface, "wl_shm"))        have_shm        = 1;
-    else if (!strcmp(iface, "xdg_wm_base"))   have_xdg        = 1;
-    else if (!strcmp(iface, "wl_seat"))       have_seat       = 1;
+    /* Bind the ones we need.  Version 1 across the board: this client only uses
+     * the base requests, and asking for no more than we use is what keeps it
+     * portable to any compositor. */
+    if (!strcmp(iface, "wl_compositor")) {
+        have_compositor = 1;
+        compositor = wl_registry_bind(reg, name, &wl_compositor_interface, 1);
+    } else if (!strcmp(iface, "wl_shm")) {
+        have_shm = 1;
+        shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
+    } else if (!strcmp(iface, "xdg_wm_base")) {
+        have_xdg = 1;
+        wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, 1);
+    } else if (!strcmp(iface, "wl_seat")) {
+        have_seat = 1;
+    }
 }
 
 static void reg_global_remove(void *data, struct wl_registry *reg, uint32_t name)
@@ -85,10 +126,63 @@ int main(void)
     printf("wlupstream: %d global(s) — compositor=%d shm=%d xdg_wm_base=%d seat=%d\n",
            n_globals, have_compositor, have_shm, have_xdg, have_seat);
 
-    int ok = have_compositor && have_shm && have_xdg && have_seat;
-    printf("wlupstream: %s — UPSTREAM libwayland-client spoke to the d-os server\n",
-           ok ? "PASS" : "FAIL");
+    if (!(compositor && shm && wm_base)) {
+        printf("wlupstream: FAIL — a required global is missing\n");
+        wl_display_disconnect(dpy);
+        return 2;
+    }
+    printf("wlupstream: stage 1 PASS — handshake through upstream libwayland\n");
 
+    /* ---- stage 2: a real shm buffer and a real xdg_toplevel ---------------
+     * Everything below is the ordinary Wayland client sequence, written the way
+     * any application writes it.  The interesting part on d-os is what it
+     * exercises underneath: memfd_create + ftruncate + mmap, and the pool fd
+     * travelling to the server over SCM_RIGHTS. */
+    int fd = memfd_create("wl-shm", 0);
+    if (fd < 0) { printf("wlupstream: memfd_create failed\n"); goto out; }
+    if (ftruncate(fd, STRIDE * H) < 0) {
+        printf("wlupstream: ftruncate failed\n"); goto out;
+    }
+    uint32_t *px = mmap(NULL, STRIDE * H, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) { printf("wlupstream: mmap failed\n"); goto out; }
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            px[y * W + x] = ((x ^ y) & 16) ? 0xFF3366CCu : 0xFF102040u;
+    printf("wlupstream: shm buffer %dx%d ready (fd %d)\n", W, H, fd);
+
+    struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, STRIDE * H);
+    if (!pool) { printf("wlupstream: create_pool failed\n"); goto out; }
+    struct wl_buffer *buf = wl_shm_pool_create_buffer(pool, 0, W, H, STRIDE,
+                                                      WL_SHM_FORMAT_ARGB8888);
+    struct wl_surface *surf = wl_compositor_create_surface(compositor);
+    if (!buf || !surf) { printf("wlupstream: buffer/surface failed\n"); goto out; }
+
+    struct xdg_surface *xsurf = xdg_wm_base_get_xdg_surface(wm_base, surf);
+    if (!xsurf) { printf("wlupstream: get_xdg_surface failed\n"); goto out; }
+    xdg_surface_add_listener(xsurf, &xsurf_listener, NULL);
+    struct xdg_toplevel *top = xdg_surface_get_toplevel(xsurf);
+    if (!top) { printf("wlupstream: get_toplevel failed\n"); goto out; }
+    xdg_toplevel_set_title(top, "Upstream Wayland");
+    wl_surface_commit(surf);            /* role assigned → server configures */
+
+    if (wl_display_roundtrip(dpy) < 0) {
+        printf("wlupstream: configure roundtrip failed\n"); goto out;
+    }
+    printf("wlupstream: xdg_surface.configure seen = %d\n", configured);
+
+    wl_surface_attach(surf, buf, 0, 0);
+    wl_surface_damage(surf, 0, 0, W, H);
+    wl_surface_commit(surf);
+    if (wl_display_roundtrip(dpy) < 0) {
+        printf("wlupstream: commit roundtrip failed\n"); goto out;
+    }
+
+    ok = configured;
+    printf("wlupstream: %s — UPSTREAM libwayland-client drove a real "
+           "xdg_toplevel + shm buffer on d-os\n", ok ? "PASS" : "FAIL");
+
+out:
     wl_display_disconnect(dpy);
     return ok ? 0 : 2;
 }

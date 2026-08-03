@@ -3983,9 +3983,46 @@ the generated protocol tables, the connection layer and `ffi_call` are all
 working.  The §M26 native `waytest` (handshake + shm buffer + xdg_shell) still
 passes unchanged.
 
-**Open (stage 2+):** `wl_shm` pool creation over upstream (needs SCM_RIGHTS in
-the Linux-ABI `sendmsg`/`recvmsg` control path), an `xdg_toplevel` window driven
-by the upstream library, then a real toolkit (Mesa `llvmpipe` + GTK/Qt/SDL).
+#### Stage 2 — a real window, driven by upstream libwayland
+
+The client now runs the ordinary application sequence: bind
+`wl_compositor`/`wl_shm`/`xdg_wm_base`, `memfd_create` + `ftruncate` + `mmap` a
+pixel buffer, `wl_shm_create_pool` → `create_buffer`, `create_surface` →
+`get_xdg_surface` → `get_toplevel` → `set_title` → commit, wait for
+`xdg_surface.configure`, `ack_configure`, then attach + damage + commit.  The
+server logs every step and the configure handshake completes:
+
+```
+wlupstream: shm buffer 160x120 ready (fd 4)
+wayland: get_toplevel -> object 10; sending configure
+wayland: xdg_toplevel set_title("Upstream Wayland")
+wlupstream: xdg_surface.configure seen = 1
+wayland: xdg_surface ack_configure(serial=2)
+wayland: surface 8 attach buffer 7
+```
+
+Three kernel gaps had to be closed for that:
+
+| gap | fix |
+|-----|-----|
+| no `memfd_create` / `ftruncate` in either Linux ABI | mapped to `sys_memfd` + the new `sys_memfd_resize` / `shm_grow` (Linux hands back a zero-length object and sizes it afterwards) |
+| `sys_mmap_full` knew only file-backed and anonymous mappings | a memfd (`FD_SHM`) is a third case: it maps the object's EXISTING frames, shared, which is the whole point.  The native `sys_mmap` had this; the Linux-facing entry point did not, so the client's `mmap` of its own pool failed |
+| no SCM_RIGHTS in the ABI control path | `lnx_cmsg_take_fd` / `lnx_cmsg_put_fd` around the existing `usock` descriptor passing (`sys_send_k`'s `passfd`), declared per-arch so the 12-byte/4-aligned and 16-byte/8-aligned `cmsghdr` layouts both come out right |
+
+**One defect remains, measured precisely.**  The pool's descriptor arrives at the
+server as MISSING.  The control block itself is well-formed — dumping the 20
+bytes the client hands to `sendmsg` gives
+`14 00 00 00 | 00 00 00 00 | 01 00 00 00 | 01 00 00 00 | 00 00 00 00`, i.e. a
+correct `cmsg_len=20`, `SOL_SOCKET`, `SCM_RIGHTS` — but the descriptor payload is
+**0**, while the client demonstrably holds fd 4 (it prints it, and its own
+`ftruncate`/`mmap` on that fd succeed).  So the kernel side is reading exactly
+what the client wrote; the value is lost earlier, inside libwayland's outgoing
+fd ring or the closure's `h`-argument marshalling.  Note the §M26 native
+`waytest` still passes its pool fd (`shm-fd=received`), so d-os's descriptor
+passing itself is fine — this is specific to the upstream path.
+
+**Open:** that fd value; then a visible window through the WM bridge, and a real
+toolkit (Mesa `llvmpipe` + GTK/Qt/SDL).
 
 ---
 
