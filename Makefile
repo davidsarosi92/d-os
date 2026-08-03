@@ -150,6 +150,10 @@ ifeq ($(ARCH),i386)
     ARCH_EXTRA_OBJS += $(CXX_RUNTIME_BLOBS)
   endif
 
+  # §M40 (i386) — the upstream libwayland client (`make wayland`).
+  ifneq ($(wildcard third_party/wayland-i386/lib/libwayland-client.a),)
+    ARCH_EXTRA_OBJS += user/wlupstream_muslblob.o
+  endif
   # §M43: the on-device C compiler (make tcc) — the tcc binary + a rootfs
   # archive (tcc/musl headers + crt) unpacked into the VFS at boot.
   TINYCC_PREFIX := third_party/tinycc-i686
@@ -233,6 +237,8 @@ ifeq ($(ARCH),i386)
   # NetSurf binary (same one §M38's C++ uses).  Only defined when it's present
   # (make musl-cross-i686); its musl is ABI-compatible with the provisioned
   # /lib/ld-musl-i386.so.1, so binaries built here run on it (as libstdc++ does).
+  MUSL_TRIPLE   := i686-linux-musl
+  MUSL_AR       := third_party/musl-cross-i686/bin/i686-linux-musl-ar
   MUSL_ELF_CC   := third_party/musl-cross-i686/bin/i686-linux-musl-gcc
   MUSL_ELF_CXX  := third_party/musl-cross-i686/bin/i686-linux-musl-g++
   MUSL_SYSROOT  := third_party/musl-cross-i686/i686-linux-musl
@@ -312,6 +318,8 @@ else ifeq ($(ARCH),x86_64)
   # complete x86_64 musl (static libc.a + shared libc.so=ld.so + crt + a musl
   # libstdc++).  No separate `make musl` needed — the prebuilt sysroot is it.
   MUSL_SYSROOT := third_party/musl-cross-x86_64/x86_64-linux-musl
+  MUSL_TRIPLE  := x86_64-linux-musl
+  MUSL_AR      := third_party/musl-cross-x86_64/bin/x86_64-linux-musl-ar
   MUSL_ELF_CC  := third_party/musl-cross-x86_64/bin/x86_64-linux-musl-gcc
   MUSL_ELF_CXX := third_party/musl-cross-x86_64/bin/x86_64-linux-musl-g++
   # The canonical PT_INTERP path an x86_64 musl dynamic binary carries; pkg.c
@@ -351,6 +359,10 @@ else ifeq ($(ARCH),x86_64)
     ifneq ($(wildcard third_party/cacert.pem),)
       ARCH_EXTRA_OBJS += third_party/cacert_blob.o
     endif
+  endif
+  # §M40 (x86_64) — the upstream libwayland client (`make ARCH=x86_64 wayland`).
+  ifneq ($(wildcard third_party/wayland-x86_64/lib/libwayland-client.a),)
+    ARCH_EXTRA_OBJS += user/wlupstream_muslblob.o
   endif
   # §M43 (x86_64) — the on-device C compiler (`make tcc ARCH=x86_64`).
   TINYCC_PREFIX := third_party/tinycc-x86_64
@@ -912,6 +924,103 @@ mbedtls:
 	@echo "Mbed TLS $(ARCH) libs → $(MBEDTLS_PREFIX)/lib/"
 
 # -----------------------------------------------------------------------------
+# §M40 — UPSTREAM libwayland-client, cross-built for this arch's musl.
+#
+# §M26 built d-os's own Wayland SERVER and a hand-written mini client library
+# (user/libwl).  This is the other half: the REAL libwayland-client, so an
+# unmodified Wayland application links against the same library it would on
+# Linux.  Nothing here is forked — the vendored tree is pristine.
+#
+# THREE PIECES, and only the first is unusual:
+#
+#   wayland-scanner  runs on the HOST (apt's, see the Dockerfile) and turns the
+#                    protocol XML into C.  Nothing generated is committed; it is
+#                    regenerated into $(WL_GEN) on every build.
+#   libffi           libwayland dispatches an incoming event by building an
+#                    argument list at runtime and calling the listener through
+#                    ffi_call.  There is no way around it short of forking the
+#                    library, which is what this milestone exists NOT to do.
+#   the library      four C files + the generated protocol table, compiled with
+#                    the same musl cross toolchain as the rest of the userland.
+#
+# Produces third_party/wayland-<arch>/{lib,include}.
+#     docker run --rm --platform=linux/amd64 -v "$PWD":/src d-os-build \
+#         make ARCH=x86_64 wayland
+# -----------------------------------------------------------------------------
+WL_DIR     := third_party/wayland
+FFI_DIR    := third_party/libffi
+WL_PREFIX  := third_party/wayland-$(ARCH)
+FFI_PREFIX := third_party/libffi-$(ARCH)
+WL_GEN     := $(OBJ_DIR)/wlgen
+XDG_XML    := /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
+
+wayland: $(WL_PREFIX)/lib/libwayland-client.a
+
+# libffi first — the client library links against it.
+$(FFI_PREFIX)/lib/libffi.a:
+	@test -f $(FFI_DIR)/configure || { \
+	  echo "libffi missing — run ./scripts/fetch-wayland.sh first"; exit 1; }
+	@test -x $(MUSL_ELF_CC) || { \
+	  echo "musl toolchain for $(ARCH) missing ($(MUSL_ELF_CC))"; exit 1; }
+	rm -rf /tmp/ffi && cp -a $(FFI_DIR) /tmp/ffi
+	cd /tmp/ffi && CC=$(CURDIR)/$(MUSL_ELF_CC) ./configure \
+	    --host=$(MUSL_TRIPLE) --prefix=$(CURDIR)/$(FFI_PREFIX) \
+	    --disable-shared --enable-static --disable-docs >/dev/null
+	$(MAKE) -C /tmp/ffi -j4 >/dev/null
+	$(MAKE) -C /tmp/ffi install >/dev/null
+	rm -rf /tmp/ffi
+	@echo "libffi ($(ARCH)) → $(FFI_PREFIX)/lib/libffi.a"
+
+$(WL_PREFIX)/lib/libwayland-client.a: $(FFI_PREFIX)/lib/libffi.a
+	@test -d $(WL_DIR)/src || { \
+	  echo "wayland missing — run ./scripts/fetch-wayland.sh first"; exit 1; }
+	@command -v wayland-scanner >/dev/null || { \
+	  echo "wayland-scanner missing — rebuild the docker image"; exit 1; }
+	# Build in a COPY: wayland's sources do `#include "../config.h"`, which meson
+	# normally generates at the tree root.  Writing it into the vendored tree
+	# would stop that tree being pristine, so the whole build happens in /tmp.
+	rm -rf /tmp/wl && cp -a $(WL_DIR) /tmp/wl
+	printf '%s\n' \
+	  '/* Generated by the d-os build (meson would normally emit this). */' \
+	  '#define HAVE_ACCEPT4 1' \
+	  '/* musl has a working MSG_CMSG_CLOEXEC and no BSD sys/ucred.h. */' \
+	  > /tmp/wl/config.h
+	rm -rf $(WL_GEN) && mkdir -p $(WL_GEN)
+	# Protocol -> C.  `private-code` emits the interface TABLES (the symbols the
+	# library and every client share); `client-header` emits the typed proxy
+	# wrappers an application actually calls.
+	wayland-scanner private-code   /tmp/wl/protocol/wayland.xml $(WL_GEN)/wayland-protocol.c
+	wayland-scanner client-header  /tmp/wl/protocol/wayland.xml $(WL_GEN)/wayland-client-protocol.h
+	wayland-scanner private-code   $(XDG_XML) $(WL_GEN)/xdg-shell-protocol.c
+	wayland-scanner client-header  $(XDG_XML) $(WL_GEN)/xdg-shell-client-protocol.h
+	# wayland-version.h is normally produced by meson from the .in template.
+	sed -e 's/@WAYLAND_VERSION_MAJOR@/1/' -e 's/@WAYLAND_VERSION_MINOR@/22/' \
+	    -e 's/@WAYLAND_VERSION_MICRO@/0/' -e 's/@WAYLAND_VERSION@/1.22.0/' \
+	    /tmp/wl/src/wayland-version.h.in > $(WL_GEN)/wayland-version.h
+	for f in connection wayland-client wayland-os wayland-util; do \
+	    $(MUSL_ELF_CC) -c -Os -fPIC -std=gnu99 \
+	        -I/tmp/wl/src -I$(CURDIR)/$(WL_GEN) -I$(CURDIR)/$(FFI_PREFIX)/include \
+	        /tmp/wl/src/$$f.c -o $(WL_GEN)/$$f.o || exit 1; \
+	done
+	$(MUSL_ELF_CC) -c -Os -fPIC -std=gnu99 \
+	    -I/tmp/wl/src -I$(WL_GEN) $(WL_GEN)/wayland-protocol.c \
+	    -o $(WL_GEN)/wayland-protocol.o
+	$(MUSL_ELF_CC) -c -Os -fPIC -std=gnu99 \
+	    -I/tmp/wl/src -I$(WL_GEN) $(WL_GEN)/xdg-shell-protocol.c \
+	    -o $(WL_GEN)/xdg-shell-protocol.o
+	rm -rf $(WL_PREFIX) && mkdir -p $(WL_PREFIX)/lib $(WL_PREFIX)/include
+	$(MUSL_AR) rcs $(WL_PREFIX)/lib/libwayland-client.a \
+	    $(WL_GEN)/connection.o $(WL_GEN)/wayland-client.o $(WL_GEN)/wayland-os.o \
+	    $(WL_GEN)/wayland-util.o $(WL_GEN)/wayland-protocol.o \
+	    $(WL_GEN)/xdg-shell-protocol.o
+	cp $(WL_DIR)/src/wayland-client.h $(WL_DIR)/src/wayland-client-core.h \
+	   $(WL_DIR)/src/wayland-util.h $(WL_PREFIX)/include/
+	rm -rf /tmp/wl
+	cp $(WL_GEN)/wayland-client-protocol.h $(WL_GEN)/xdg-shell-client-protocol.h \
+	   $(WL_GEN)/wayland-version.h $(WL_PREFIX)/include/
+	@echo "libwayland-client ($(ARCH)) → $(WL_PREFIX)/lib/"
+
+# -----------------------------------------------------------------------------
 # TinyCC (§M43) — an on-device C compiler.  Cross-built with the musl C++
 # toolchain so the `tcc` binary is an i686-musl ELF that RUNS on d-os (under
 # §M37) and compiles C → runnable ELF on d-os.  Built on the container-local fs;
@@ -1203,6 +1312,15 @@ user/%.muslelf: user/%.c $(MUSL_LIBC)
 	    `gcc -m32 -print-libgcc-file-name` --end-group \
 	    $(MUSL_PREFIX)/lib/crtn.o
 endif
+
+# §M40 — the upstream-libwayland client.  Its own rule (not the generic
+# %.muslelf) because it links libwayland-client + libffi and needs the generated
+# protocol headers.  Guarded by the arch's built library, like every other port.
+user/wlupstream.muslelf: user/wlupstream.c $(WL_PREFIX)/lib/libwayland-client.a
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -static -no-pie -Os -Wall -I$(WL_PREFIX)/include \
+	    -Wl,-Ttext-segment=$(USER_BASE) $< -o $@ \
+	    $(WL_PREFIX)/lib/libwayland-client.a $(FFI_PREFIX)/lib/libffi.a
 
 # §M39 — the four Mbed TLS programs.  Each overrides the generic %.muslelf rule
 # to ALSO compile with Mbed TLS's headers and link its three static libs:

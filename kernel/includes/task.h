@@ -64,6 +64,14 @@ enum task_state {
 
 struct task {
     char     name[TASK_NAME_MAX + 1];
+
+    /* §M40 — ONE environment variable handed to the next exec on this task
+     * ("KEY=VALUE", empty = none).  Per-launch data that cannot live in the
+     * static default env: a Wayland client needs WAYLAND_SOCKET=<fd>, which is
+     * decided by whoever set up the socket.  Set it with proc_set_exec_env();
+     * build_initial_stack consumes and clears it, so it can never leak into an
+     * unrelated later exec.  The seam a full per-exec environ grows from. */
+    char exec_extra_env[64];
     int      pid;
     /* M27 — process model.  `ppid` is the parent's pid (a stable int, not
      * a pointer, so it never dangles when the parent is reaped).  On the

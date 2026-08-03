@@ -146,6 +146,13 @@ int  sys_bind(int fd, int port);
  * nothing to read: Linux's EAGAIN, so a personality layer can pass it straight
  * through to its client.  (The native d-os libc only ever tests for < 0.) */
 #define SOCK_EAGAIN 11
+/* Which kind of object an fd names (values match enum fd_kind in fd.h): a
+ * personality layer routes recvmsg/sendmsg by this. */
+#define FDK_VFS     0
+#define FDK_SHM     1
+#define FDK_SOCK    2
+#define FDK_NETSOCK 3
+int  sys_fd_kind(int fd);                     /* → FDK_*, or -1 if not open */
 int  sys_socket_setnonblock(int fd, int on);
 int  sys_socket_getnonblock(int fd);          /* → 0/1, or -1 if not a socket */
 int  sys_connect(int fd, uint32_t ip, int port);           /* TCP handshake    */

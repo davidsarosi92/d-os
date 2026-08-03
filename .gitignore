@@ -70,6 +70,10 @@ third_party/musl-i386/
 third_party/musl/
 third_party/tinycc-*/
 third_party/tinycc/
+third_party/wayland/
+third_party/wayland-*/
+third_party/libffi/
+third_party/libffi-*/
 third_party/zlib/
 user/*.cxxelf
 user/*.dynelf

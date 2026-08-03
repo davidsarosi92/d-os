@@ -2210,6 +2210,50 @@ static void run_wayland_client(const char* what, const unsigned char* s,
     kprintf("%s: client exited rc=%d\n", what, rc);      /* fd 3 auto-closed → server tears down */
 }
 
+/* §M40 — `wayupstream`: the same fd-3 handshake, but the client is a musl binary
+ * linked against the REAL libwayland-client.  Two differences from the native
+ * clients above: it runs under the Linux personality (it is a musl program), and
+ * it needs WAYLAND_SOCKET=3 in its environment — that is upstream libwayland's
+ * documented "already-connected fd" mechanism, the same one a real compositor
+ * uses to launch its own clients, so no named UNIX socket is required. */
+extern const unsigned char _binary_user_wlupstream_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_wlupstream_muslelf_end[]   __attribute__((weak));
+
+static void cmd_wayupstream(void) {
+    const unsigned char* sp = _binary_user_wlupstream_muslelf_start;
+    if (!sp) {
+        console_write("wayupstream: not embedded — run "
+                      "`make ARCH=<arch> wayland` then rebuild\n");
+        return;
+    }
+    struct task* me = task_current();
+    if (me->fds[3]) { console_write("wayupstream: fd 3 already in use\n"); return; }
+
+    struct usock *srv, *cli;
+    if (usock_pair(&srv, &cli) != 0) {
+        console_write("wayupstream: usock_pair failed\n"); return;
+    }
+    struct ofile* cli_of = ofile_from_sock(cli);
+    struct wl_conn* conn = (struct wl_conn*)kmalloc(sizeof *conn);
+    if (!cli_of || !conn) {
+        console_write("wayupstream: out of memory\n");
+        if (cli_of) ofile_unref(cli_of); else usock_close(cli);
+        usock_close(srv); return;
+    }
+    me->fds[3] = cli_of;
+    wl_conn_init(conn, srv);
+    task_spawn_arg("wl-server", wl_server_task, conn);
+
+    console_write("wayupstream: running a REAL libwayland-client "
+                  "(WAYLAND_SOCKET=3)...\n");
+    proc_set_exec_env("WAYLAND_SOCKET=3");
+    int prev = me->linux_abi;
+    me->linux_abi = 1;
+    int rc = proc_exec_elf(sp, (size_t)(_binary_user_wlupstream_muslelf_end - sp));
+    me->linux_abi = prev;
+    kprintf("wayupstream: client exited rc=%d\n", rc);
+}
+
 static void cmd_wayclient(void) {
     run_wayland_client("wayclient", _binary_user_wlclient_elf_start,
                        _binary_user_wlclient_elf_end);
@@ -2569,6 +2613,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "waywin"))         { wl_window_demo();   return; }
     if (streq(line, "wayinput"))       { wl_input_demo();    return; }
     if (streq(line, "wayclient"))      { cmd_wayclient();    return; }
+    if (streq(line, "wayupstream"))    { cmd_wayupstream(); return; }
     if (streq(line, "wayapp"))         { cmd_wayapp();       return; }
     if (streq(line, "waycomp"))        { wl_compositor_demo(); return; }
     if (starts_with(line, "pkgrun "))  { cmd_pkgrun(line + 7); return; }

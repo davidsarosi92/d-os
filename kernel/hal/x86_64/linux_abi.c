@@ -295,6 +295,19 @@ static long linux_recvmsg(int fd, struct lnx_msghdr* mh, int flags) {
     if (!mh->msg_iov || mh->msg_iovlen == 0) return -LNX_EOPNOTSUPP;
     if (!lnx_r_ok((uintptr_t)mh->msg_iov, sizeof(struct lnx_iovec))) return -LNX_EFAULT;
     struct lnx_iovec* iov = &mh->msg_iov[0];
+
+    /* Route by fd KIND.  A UNIX socket (the Wayland display connection) has no
+     * datagram source address and is served by the ordinary read path; only an
+     * AF_INET socket goes through recvfrom.  Handling only the latter is what
+     * made upstream libwayland's very first read fail. */
+    if (sys_fd_kind(fd) != FDK_NETSOCK) {
+        long r = sys_read(fd, iov->iov_base, (size_t)iov->iov_len);
+        if (r < 0) return r;
+        mh->msg_namelen = 0;         /* connection-mode: no source address */
+        mh->msg_flags   = 0;
+        return r;
+    }
+
     uint32_t ip = 0; int port = 0;
     /* Payload lands in the CLIENT's iovec, source address in kernel locals —
      * sys_recvfrom_u is exactly that split and bounce-buffers the payload. */
@@ -330,6 +343,10 @@ static long linux_sendmsg(int fd, const struct lnx_msghdr* mh, int flags) {
         for (uint64_t k = 0; k < v->iov_len && total < sizeof buf; k++)
             buf[total++] = p[k];
     }
+    /* Same routing on the way out: a UNIX socket takes the plain write path. */
+    if (sys_fd_kind(fd) != FDK_NETSOCK)
+        return sys_write_k(fd, buf, total);
+
     if (mh->msg_name) {                              /* datagram to a peer */
         uint32_t ip; int port;
         if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)mh->msg_name,

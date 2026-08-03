@@ -3926,6 +3926,69 @@ CA verification, `wget http://example.com` downloads 571 body bytes, and
 
 ---
 
+### 4.40 Upstream libwayland-client (M40 stage 1)
+
+§M26 built d-os's own Wayland **server** plus a hand-written mini client library
+(`user/libwl`).  That proved the wire protocol.  §M40 is the other half, and the
+one that matters for running unmodified applications: **the real
+libwayland-client** — the same library a GTK/Qt/SDL program links against on
+Linux — talking to our server.  Nothing is forked; the vendored tree is pristine.
+
+**Three pieces, and only the first is unusual.**
+
+| piece | where it runs | why |
+|-------|---------------|-----|
+| `wayland-scanner` | the HOST (apt's, in the build image) | turns the protocol XML into C.  Nothing generated is committed — it is regenerated on every build. |
+| `libffi` | cross-built for the target musl | libwayland dispatches an incoming event by building an argument list at runtime and calling the listener through `ffi_call`.  There is no way around it short of forking the library, which is what this milestone exists NOT to do. |
+| the library | cross-built for the target musl | four C files (`connection`, `wayland-client`, `wayland-os`, `wayland-util`) + the generated protocol tables. |
+
+`make [ARCH=…] wayland` produces `third_party/{libffi,wayland}-<arch>/`.  The
+build happens in a scratch copy of the tree because wayland's sources do
+`#include "../config.h"`, which meson would normally generate at the tree root —
+writing it into the vendored tree would stop that tree being pristine.
+
+**How the client connects.**  d-os has no named UNIX sockets, so there is no
+`$XDG_RUNTIME_DIR/wayland-0` to open.  It does not need one: libwayland honours
+**`WAYLAND_SOCKET`**, an already-connected file-descriptor number — the same
+documented mechanism a real compositor uses to launch its own clients — which is
+exactly the shape d-os already had (`run_wayland_client` hands the client fd 3
+and runs the server on the other end).  Passing it needed one new kernel seam:
+`proc_set_exec_env()` (`task.exec_extra_env`), one `KEY=VALUE` handed to the next
+exec on the calling task and consumed by it, so it can never leak into a later
+one.  That is the seam a full per-exec `environ` will grow from.
+
+**One real bug this surfaced.**  Both Linux-ABI layers implemented `recvmsg` /
+`sendmsg` for AF_INET sockets only.  A Wayland display connection is a UNIX
+socket, so libwayland's very first read returned a bare `-1`, which musl turned
+into **EPERM** — a spectacularly misleading errno for "wrong fd type", and the
+reason the first run reported `wl_display_get_error=1` with no protocol error.
+Both now route by `sys_fd_kind()`: a UNIX socket takes the ordinary read/write
+path, only an AF_INET socket goes through recvfrom/sendto.
+
+**Verified on i386 and x86_64** — `wayupstream`:
+
+```
+wlupstream: connected, display fd = 3
+wayland: get_registry(id=2) -> advertising 4 globals
+wayland: sync(callback=3) -> done + delete_id
+wlupstream:   global 1: wl_compositor v4
+wlupstream:   global 2: wl_shm v1
+wlupstream:   global 3: xdg_wm_base v2
+wlupstream:   global 4: wl_seat v5
+wlupstream: PASS — UPSTREAM libwayland-client spoke to the d-os server
+```
+
+Every global came back through libwayland's own closure machinery, which means
+the generated protocol tables, the connection layer and `ffi_call` are all
+working.  The §M26 native `waytest` (handshake + shm buffer + xdg_shell) still
+passes unchanged.
+
+**Open (stage 2+):** `wl_shm` pool creation over upstream (needs SCM_RIGHTS in
+the Linux-ABI `sendmsg`/`recvmsg` control path), an `xdg_toplevel` window driven
+by the upstream library, then a real toolkit (Mesa `llvmpipe` + GTK/Qt/SDL).
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -4039,6 +4102,22 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   `polltest`, `solibtest`, `forktest`, `threadtest`, `musltest`, `dnstest`,
   `httptest` (`HTTP/1.1 200 OK`) and `pkgrun sh -c` all green; aarch64 builds
   clean.
+
+- **2026-08-03 — §M40 stage 1: UPSTREAM libwayland-client runs on d-os (DOCS
+  §4.40).**  The real, unmodified libwayland — not our §M26 mini client library —
+  completes `wl_display_connect` + `get_registry` + a listener +
+  `wl_display_roundtrip` against the d-os Wayland server, on both i386 and
+  x86_64.  `make [ARCH=…] wayland` cross-builds libffi (needed for libwayland's
+  `ffi_call` event dispatch) and the client library, with `wayland-scanner`
+  generating the protocol code on the host; the vendored tree stays pristine
+  (the build runs in a scratch copy because wayland `#include "../config.h"`,
+  which meson would normally generate at the tree root).  The client connects via
+  `WAYLAND_SOCKET` — upstream's documented already-connected-fd mechanism — which
+  needed one new kernel seam, `proc_set_exec_env()`: one `KEY=VALUE` handed to
+  the next exec on the calling task and consumed by it.  **Bug found on the way:**
+  both Linux-ABI layers implemented recvmsg/sendmsg for AF_INET only, so
+  libwayland's first read on the UNIX display socket returned a bare -1 that musl
+  turned into EPERM; both now route by `sys_fd_kind()`.
 
 - **2026-08-03 — closing a window is not a crash (DOCS §4.38.1).**  Clicking the
   title-bar X on NetSurf force-killed the client immediately and therefore

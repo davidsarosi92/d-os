@@ -118,6 +118,17 @@ static void fill_at_random(uint8_t out[16], uint32_t frame_phys, uintptr_t stack
     random_bytes(out, 16);
 }
 
+/* See proc.h.  Stored on the task, consumed by the next build_initial_stack. */
+void proc_set_exec_env(const char* kv) {
+    struct task* t = task_current();
+    if (!t) return;
+    int i = 0;
+    if (kv) while (kv[i] && i < (int)sizeof t->exec_extra_env - 1) {
+        t->exec_extra_env[i] = kv[i]; i++;
+    }
+    t->exec_extra_env[i] = '\0';
+}
+
 static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
                                      int argc, const char* const argv[],
                                      const struct loaded_prog* lp) {
@@ -142,14 +153,28 @@ static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
      *     env is a follow-up; this makes getenv()/`env` meaningful).  Native
      *     crt0 ignores envp; musl reads it. */
     static const char* const default_env[] = { "PATH=/bin", "HOME=/", "TERM=d-os" };
-    const int nenv = (int)(sizeof default_env / sizeof default_env[0]);
+    const int base_env = (int)(sizeof default_env / sizeof default_env[0]);
+    /* §M40 — plus at most ONE caller-supplied variable for this exec (see
+     * proc_set_exec_env).  The launcher of a Wayland client has to pass
+     * WAYLAND_SOCKET=<fd>, which is per-launch data and cannot live in a static
+     * table; a full per-exec environ is the natural generalisation and this is
+     * the seam it will grow from. */
+    const char* extra = NULL;
+    struct task* me = task_current();
+    if (me && me->exec_extra_env[0]) extra = me->exec_extra_env;
+    const char* env[8];
+    int nenv = 0;
+    for (int i = 0; i < base_env; i++) env[nenv++] = default_env[i];
+    if (extra) env[nenv++] = extra;
     uintptr_t env_uva[8];
     for (int i = nenv - 1; i >= 0; i--) {
-        uint32_t l = u_strlen(default_env[i]) + 1;
+        uint32_t l = u_strlen(env[i]) + 1;
         koff -= l;
-        for (uint32_t j = 0; j < l; j++) base[koff + j] = (uint8_t)default_env[i][j];
+        for (uint32_t j = 0; j < l; j++) base[koff + j] = (uint8_t)env[i][j];
         env_uva[i] = stack_va + koff;
     }
+
+    if (me) me->exec_extra_env[0] = '\0';       /* one exec only — consumed */
 
     /* 1b. Reserve + fill the 16 AT_RANDOM bytes just below the strings and
      *     record their user VA (kept 4-byte aligned). */

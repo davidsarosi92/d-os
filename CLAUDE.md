@@ -35,6 +35,22 @@ breadcrumb** (kind/cpu/pid/pc/addr/code/uptime/comm).  Also: taskbar clock shows
 the ISO date + keyboard layout, wallpaper label carries the arch
 (`d-os M47  x32`/`x64`/`arm64`).
 
+✅ **§M40 STAGE 1 — UPSTREAM libwayland-client RUNS (2026-08-03, DOCS §4.40,
+i386 + x86_64).**  The REAL library (not §M26's mini `user/libwl`) does
+connect + get_registry + listener + roundtrip against the d-os server; all 4
+globals arrive through libwayland's own libffi closure dispatch.  `make [ARCH=…]
+wayland` cross-builds libffi + libwayland-client; `wayland-scanner` runs on the
+HOST (in the image) and nothing generated is committed; the vendored tree stays
+pristine (build runs in a /tmp copy because wayland `#include "../config.h"`).
+Client connects via **`WAYLAND_SOCKET`** (upstream's already-connected-fd
+mechanism — no named unix socket needed), which added `proc_set_exec_env()` /
+`task.exec_extra_env`: ONE `KEY=VALUE` for the next exec, consumed by it.
+**Bug found:** both Linux-ABI layers did recvmsg/sendmsg for AF_INET only, so
+libwayland's first read on the UNIX socket returned a bare -1 → musl reported
+EPERM; both now route by `sys_fd_kind()`.  Shell: `wayupstream`.  Open: SCM_RIGHTS
+in the ABI control path (wl_shm pools), an upstream-driven xdg_toplevel, then a
+real toolkit.
+
 ✅ **CLOSING A WINDOW IS NOT A CRASH (2026-08-03, DOCS §4.38.1).**  The X button
 force-killed a client-managed window's client on the FIRST compositor pass, so
 closing a healthy NetSurf was recorded as "unresponsive task reclaimed by force"

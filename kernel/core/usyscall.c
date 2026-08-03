@@ -1098,6 +1098,16 @@ int sys_socket(int domain, int type, int proto) {
  * returns, so every musl program that resolves a name hangs.  Honouring the
  * flag is what makes the recv loop terminate.
  * ------------------------------------------------------------------------- */
+/* §M40 — which KIND of object an fd refers to.  A personality layer's recvmsg /
+ * sendmsg has to route by kind: a UNIX socket (a Wayland display connection) and
+ * an AF_INET socket need completely different primitives, and handling only the
+ * latter made libwayland's first read fail with a bare -1 — which musl turned
+ * into EPERM, a spectacularly misleading errno for "wrong fd type". */
+int sys_fd_kind(int fd) {
+    struct ofile* o = fd_lookup(fd);
+    return o ? (int)o->kind : -1;
+}
+
 int sys_socket_setnonblock(int fd, int on) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_NETSOCK) return -1;
