@@ -43,6 +43,14 @@ TLS, NetSurf, Wayland.  Nothing failed visibly, which is why it survived two
 milestones.  Now armed on both; the `_k`/`_u` discipline covers the places that
 legitimately pass kernel buffers (new `sys_recv_u`).
 
+✅ **§M40 STAGE 5 (2026-08-03, DOCS §4.40).**  The two globals a real toolkit
+REFUSES to start without: **`wl_output`** (SDL/GTK/Qt all need the size+scale
+before laying out; full geometry/mode/scale/done burst, real framebuffer size)
+and **`wl_surface.frame`** (a render loop BLOCKS on the callback — ignoring it
+stops the app drawing entirely; answered on the next commit, then the callback
+object is deleted).  Verified on both arches; the client's frame loop is
+self-sustaining (~130 commits/run).
+
 ✅ **§M40 STAGE 4 (2026-08-03, DOCS §4.40).**  REAL desktop input reaches the
 upstream client's `wl_seat` (pointer motion + keys, both arches).  Three gaps,
 all hidden by §M26's demo synthesising input instead of taking it from the

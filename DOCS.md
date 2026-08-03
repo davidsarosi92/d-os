@@ -4092,8 +4092,40 @@ Note the listener structs in the client are filled completely, stubs included:
 libwayland calls whatever the compositor sends, and a NULL slot for an event
 that does arrive is a jump to address zero.
 
-**Open:** a real toolkit (Mesa `llvmpipe` + GTK/Qt/SDL) — the remaining §M40
-work, and the point of the whole milestone.
+#### Stage 5 — the two globals a real toolkit refuses to start without
+
+Before attempting a toolkit port it is worth knowing what a toolkit actually
+demands, because both of these are hard requirements rather than niceties:
+
+- **`wl_output`.**  SDL, GTK and Qt all walk the registry looking for an output
+  and will not open a window without one — they need the size and scale before
+  they can lay anything out.  A compositor that advertises none simply looks
+  broken to them.  The server now exports `wl_output` v2 and answers a bind with
+  the full property burst: `geometry` (position, physical size, make/model),
+  `mode` (current + preferred, the real framebuffer size at 60 Hz), `scale`, and
+  the `done` that tells the client the burst is complete.
+- **`wl_surface.frame`.**  A render loop asks for a frame callback and then
+  *blocks until it fires*.  Ignoring the request does not merely lose throttling
+  — the application stops drawing entirely.  The server now records the callback
+  and answers it on the next commit (the moment that frame became visible),
+  then deletes the object, as the protocol requires for a single-shot
+  `wl_callback`.
+
+Verified on both arches with the upstream client:
+
+```
+wlupstream:   global 5: wl_output v2
+wlupstream: output make=d-os model=virtual
+wlupstream: output mode 1920x1200 @60000 mHz (preferred)
+```
+
+and the client's frame loop is genuinely self-sustaining — each callback
+requests the next and commits — producing ~130 commits over the run instead of
+the two a one-shot test would show.
+
+**Open:** the toolkit itself.  Mesa `llvmpipe` (for EGL/GL) is a multi-hour
+build that pulls in LLVM; an shm-only SDL or a bare upstream demo client is the
+cheaper next probe, and the protocol surface above is what either needs first.
 
 ---
 

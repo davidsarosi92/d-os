@@ -48,6 +48,48 @@ static struct wl_compositor *compositor;
 static struct wl_shm        *shm;
 static struct xdg_wm_base   *wm_base;
 static struct wl_seat       *seat;
+static struct wl_output     *output;
+static int have_output, out_w, out_h, frames_done;
+
+/* wl_output — a toolkit reads the screen size from here before laying out. */
+static void out_geometry(void *d, struct wl_output *o, int32_t x, int32_t y,
+                         int32_t pw, int32_t ph, int32_t sub,
+                         const char *make, const char *model, int32_t tr)
+{
+    (void)d;(void)o;(void)x;(void)y;(void)pw;(void)ph;(void)sub;(void)tr;
+    printf("wlupstream: output make=%s model=%s\n", make, model);
+}
+static void out_mode(void *d, struct wl_output *o, uint32_t flags,
+                     int32_t w, int32_t h, int32_t refresh)
+{
+    (void)d;(void)o;
+    if (flags & WL_OUTPUT_MODE_CURRENT) { out_w = w; out_h = h; }
+    printf("wlupstream: output mode %dx%d @%d mHz%s\n", w, h, refresh,
+           (flags & WL_OUTPUT_MODE_PREFERRED) ? " (preferred)" : "");
+}
+static void out_done(void *d, struct wl_output *o) { (void)d;(void)o; have_output = 1; }
+static void out_scale(void *d, struct wl_output *o, int32_t s_) { (void)d;(void)o;(void)s_; }
+static const struct wl_output_listener output_listener = {
+    out_geometry, out_mode, out_done, out_scale,
+};
+
+/* wl_surface.frame — the throttle every render loop waits on. */
+static void frame_done(void *d, struct wl_callback *cb, uint32_t time);
+static const struct wl_callback_listener frame_listener = { frame_done };
+static struct wl_surface *g_surf;
+static void frame_done(void *d, struct wl_callback *cb, uint32_t time)
+{
+    (void)d; (void)time;
+    wl_callback_destroy(cb);
+    frames_done++;
+    /* Ask for the next one exactly as a real client does, so the loop is
+     * self-sustaining rather than a one-shot test. */
+    if (g_surf) {
+        struct wl_callback *n = wl_surface_frame(g_surf);
+        if (n) wl_callback_add_listener(n, &frame_listener, NULL);
+        wl_surface_commit(g_surf);
+    }
+}
 static int keys_seen, motions_seen;
 
 /* ---- wl_seat input, through upstream's own event dispatch -------------------
@@ -134,6 +176,9 @@ static void reg_global(void *data, struct wl_registry *reg, uint32_t name,
     } else if (!strcmp(iface, "xdg_wm_base")) {
         have_xdg = 1;
         wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, 1);
+    } else if (!strcmp(iface, "wl_output")) {
+        output = wl_registry_bind(reg, name, &wl_output_interface, 1);
+        if (output) wl_output_add_listener(output, &output_listener, NULL);
     } else if (!strcmp(iface, "wl_seat")) {
         have_seat = 1;
         seat = wl_registry_bind(reg, name, &wl_seat_interface, 1);
@@ -241,8 +286,12 @@ int main(int argc, char **argv)
     }
     printf("wlupstream: xdg_surface.configure seen = %d\n", configured);
 
+    g_surf = surf;
     wl_surface_attach(surf, buf, 0, 0);
     wl_surface_damage(surf, 0, 0, W, H);
+    {   struct wl_callback *fcb = wl_surface_frame(surf);
+        if (fcb) wl_callback_add_listener(fcb, &frame_listener, NULL);
+    }
     wl_surface_commit(surf);
     if (wl_display_roundtrip(dpy) < 0) {
         printf("wlupstream: commit roundtrip failed\n"); goto out;
@@ -270,8 +319,9 @@ int main(int argc, char **argv)
             struct timespec ts = { 0, 100 * 1000000L };   /* 100 ms */
             nanosleep(&ts, NULL);
         }
-        printf("wlupstream: input seen — %d key(s), %d motion(s)\n",
-               keys_seen, motions_seen);
+        printf("wlupstream: input seen — %d key(s), %d motion(s); "
+               "frame callbacks %d; output %dx%d (done=%d)\n",
+               keys_seen, motions_seen, frames_done, out_w, out_h, have_output);
     }
 
 out:

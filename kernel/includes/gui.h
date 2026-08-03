@@ -131,6 +131,11 @@ int  gui_window_content_size(struct gui_window* win, int* w, int* h);
  * gui.c. */
 void gui_window_outer_for_content(int cw, int ch, int* ow, int* oh);
 
+/* Screen size in pixels (0 before gui_start).  The Wayland server reports this
+ * as its wl_output mode. */
+int  gui_screen_w(void);
+int  gui_screen_h(void);
+
 /* §M26 — paint a raw ARGB pixel block into a window's content surface (at
  * content-relative x,y) and composite it.  The Wayland server uses this to turn
  * a committed wl_shm buffer into a real window's contents.  `gui_window_pixel`

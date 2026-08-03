@@ -73,6 +73,10 @@ struct wl_conn {
      * window is only created once we know the buffer size, so the title has to
      * wait here for it. */
     char                title[64];
+    /* §M40 — pending wl_surface.frame callback id (0 = none).  A toolkit's draw
+     * loop asks for one and then WAITS for it before producing the next frame,
+     * so a compositor that never answers freezes the application. */
+    uint32_t            frame_cb;
 };
 
 /* Initialise a connection over `sock` (registers wl_display as object 1). */

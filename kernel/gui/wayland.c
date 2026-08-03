@@ -20,7 +20,9 @@
 #include "wayland.h"
 #include "fd.h"          /* usock_pair/send/recv/close/can_read */
 #include "gfx.h"         /* gfx_surface / gfx_fb_surface — the compositor bridge */
-#include "gui.h"         /* gui_window_blit — the WM-managed window target      */
+#include "gui.h"           /* gui_window_blit — the WM-managed window target      */
+
+#include "timer.h"         /* timer_ticks_ms — wl_callback.done timestamps        */
 #include "task.h"        /* task_msleep / task_start_arg                        */
 #include "kmalloc.h"     /* the per-connection wl_conn for a server task        */
 #include "printf.h"
@@ -31,7 +33,7 @@
 enum { WLI_NONE = 0, WLI_DISPLAY, WLI_REGISTRY, WLI_CALLBACK,
        WLI_COMPOSITOR, WLI_SHM, WLI_SHM_POOL, WLI_BUFFER, WLI_SURFACE,
        WLI_XDG_WM_BASE, WLI_XDG_SURFACE, WLI_XDG_TOPLEVEL,
-       WLI_SEAT, WLI_POINTER, WLI_KEYBOARD };
+       WLI_SEAT, WLI_POINTER, WLI_KEYBOARD, WLI_OUTPUT };
 
 /* Real Wayland opcodes (from wayland.xml).  request = client→server. */
 enum { WL_DISPLAY_REQ_SYNC = 0, WL_DISPLAY_REQ_GET_REGISTRY = 1 };
@@ -45,7 +47,12 @@ enum { WL_SHM_EVT_FORMAT = 0 };
 enum { WL_SHM_POOL_REQ_CREATE_BUFFER = 0 };
 enum { WL_BUFFER_EVT_RELEASE = 0 };
 enum { WL_SURFACE_REQ_ATTACH = 1, WL_SURFACE_REQ_DAMAGE = 2,
+       WL_SURFACE_REQ_FRAME = 3,
        WL_SURFACE_REQ_COMMIT = 6, WL_SURFACE_REQ_DAMAGE_BUFFER = 9 };
+/* wl_output — every real toolkit enumerates outputs before it will start. */
+enum { WL_OUTPUT_EVT_GEOMETRY = 0, WL_OUTPUT_EVT_MODE = 1,
+       WL_OUTPUT_EVT_DONE = 2, WL_OUTPUT_EVT_SCALE = 3 };
+enum { WL_OUTPUT_MODE_CURRENT = 1, WL_OUTPUT_MODE_PREFERRED = 2 };
 /* xdg_shell (the modern window role protocol). */
 enum { XDG_WM_BASE_REQ_GET_XDG_SURFACE = 2 };
 enum { XDG_SURFACE_REQ_GET_TOPLEVEL = 1, XDG_SURFACE_REQ_ACK_CONFIGURE = 4 };
@@ -70,6 +77,7 @@ static const struct wl_global g_globals[] = {
     { 2, "wl_shm",        1 },
     { 3, "xdg_wm_base",   2 },
     { 4, "wl_seat",       5 },
+    { 5, "wl_output",     2 },
 };
 #define WL_NGLOBALS (int)(sizeof g_globals / sizeof g_globals[0])
 
@@ -175,6 +183,71 @@ static void send_xdg_surface_configure(struct wl_conn* c, uint32_t xs, uint32_t 
     usock_send(c->sock, msg, 12, NULL);
 }
 
+/* Describe the one output we have: geometry + current mode + scale + done.
+ *
+ * This is not optional decoration.  Every real toolkit (SDL, GTK, Qt) walks the
+ * registry looking for a wl_output and refuses to open a window without one —
+ * it needs the size and scale before it can lay anything out.  A compositor
+ * that advertises none simply looks broken to them.
+ *
+ * `done` is what tells the client the burst of property events is complete. */
+static void send_output_info(struct wl_conn* c, uint32_t out) {
+    int sw = gui_screen_w(), sh = gui_screen_h();
+    if (sw <= 0) sw = 1280;
+    if (sh <= 0) sh = 800;
+
+    /* geometry(x, y, phys_w_mm, phys_h_mm, subpixel, make, model, transform).
+     * The two strings are wire strings: u32 length (including the NUL) then the
+     * bytes, padded to 4. */
+    static const char mk[] = "d-os";
+    static const char md[] = "virtual";
+    uint32_t mkl = (uint32_t)sizeof mk, mdl = (uint32_t)sizeof md;
+    uint32_t mkp = align4(mkl), mdp = align4(mdl);
+    uint32_t size = 8 + 4 * 5 + 4 + mkp + 4 + mdp + 4;
+    uint8_t msg[96];
+    if (size <= sizeof msg) {
+        uint32_t o = 0;
+        put32(msg + o, out); o += 4;
+        put32(msg + o, (size << 16) | WL_OUTPUT_EVT_GEOMETRY); o += 4;
+        put32(msg + o, 0); o += 4;                   /* x                     */
+        put32(msg + o, 0); o += 4;                   /* y                     */
+        put32(msg + o, (uint32_t)(sw / 4)); o += 4;  /* physical width  (mm)  */
+        put32(msg + o, (uint32_t)(sh / 4)); o += 4;  /* physical height (mm)  */
+        put32(msg + o, 0); o += 4;                   /* subpixel: unknown     */
+        put32(msg + o, mkl); o += 4;
+        for (uint32_t i = 0; i < mkp; i++) msg[o + i] = (i < mkl) ? (uint8_t)mk[i] : 0;
+        o += mkp;
+        put32(msg + o, mdl); o += 4;
+        for (uint32_t i = 0; i < mdp; i++) msg[o + i] = (i < mdl) ? (uint8_t)md[i] : 0;
+        o += mdp;
+        put32(msg + o, 0); o += 4;                   /* transform: normal     */
+        usock_send(c->sock, msg, o, NULL);
+    }
+
+    /* mode(flags, width, height, refresh_mHz) */
+    uint8_t m[24];
+    put32(m + 0, out);
+    put32(m + 4, (24u << 16) | WL_OUTPUT_EVT_MODE);
+    put32(m + 8, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED);
+    put32(m + 12, (uint32_t)sw);
+    put32(m + 16, (uint32_t)sh);
+    put32(m + 20, 60000);                            /* 60 Hz in mHz          */
+    usock_send(c->sock, m, 24, NULL);
+
+    uint8_t sc[12];
+    put32(sc + 0, out);
+    put32(sc + 4, (12u << 16) | WL_OUTPUT_EVT_SCALE);
+    put32(sc + 8, 1);
+    usock_send(c->sock, sc, 12, NULL);
+
+    uint8_t dn[8];
+    put32(dn + 0, out);
+    put32(dn + 4, (8u << 16) | WL_OUTPUT_EVT_DONE);
+    usock_send(c->sock, dn, 8, NULL);
+
+    kprintf("wayland: wl_output -> %dx%d @60Hz scale 1\n", sw, sh);
+}
+
 /* Emit wl_seat.capabilities(caps) — a bitmask of WL_SEAT_CAP_*. */
 static void send_seat_capabilities(struct wl_conn* c, uint32_t seat, uint32_t caps) {
     uint8_t msg[12];
@@ -227,6 +300,7 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock) {
     c->window = NULL;
     c->wm_mode = 0;
     c->title[0] = '\0';
+    c->frame_cb = 0;
 }
 
 /* §M26 — forward a WM-managed window's input to the Wayland client (wl_seat).
@@ -294,6 +368,16 @@ static void wl_surface_commit(struct wl_conn* c) {
             c->surface_id, c->buf_w, c->buf_h, topleft, sum,
             c->window ? " (blitted to window)" : t ? " (blitted to screen)" : "");
     send_buffer_release(c, c->buffer_id);
+
+    /* The frame the client asked about is now on screen — release its callback
+     * (and delete the object, as the protocol requires: a wl_callback is
+     * single-shot). */
+    if (c->frame_cb) {
+        send_callback_done(c, c->frame_cb, (uint32_t)timer_ticks_ms());
+        send_delete_id(c, c->frame_cb);
+        if (c->frame_cb < WL_MAX_OBJECTS) c->obj_iface[c->frame_cb] = WLI_NONE;
+        c->frame_cb = 0;
+    }
 }
 
 /* Process one request whose 8-byte header has already been read. */
@@ -332,12 +416,15 @@ static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
         uint8_t bi = (name == 1) ? WLI_COMPOSITOR :
                      (name == 2) ? WLI_SHM :
                      (name == 3) ? WLI_XDG_WM_BASE :
-                     (name == 4) ? WLI_SEAT : WLI_NONE;
+                     (name == 4) ? WLI_SEAT :
+                     (name == 5) ? WLI_OUTPUT : WLI_NONE;
         if (new_id < WL_MAX_OBJECTS) c->obj_iface[new_id] = bi;
         kprintf("wayland: bind(name=%u) -> object %u\n", name, new_id);
         if (bi == WLI_SHM) {                             /* advertise formats */
             send_shm_format(c, new_id, WL_SHM_FORMAT_ARGB8888);
             send_shm_format(c, new_id, WL_SHM_FORMAT_XRGB8888);
+        } else if (bi == WLI_OUTPUT) {                   /* describe the screen */
+            send_output_info(c, new_id);
         } else if (bi == WLI_SEAT) {                     /* advertise input caps */
             send_seat_capabilities(c, new_id, WL_SEAT_CAP_POINTER | WL_SEAT_CAP_KEYBOARD);
         }
@@ -371,6 +458,17 @@ static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
 
     } else if (iface == WLI_SURFACE && op == WL_SURFACE_REQ_ATTACH && blen >= 4) {
         kprintf("wayland: surface %u attach buffer %u\n", obj, get32(body));
+
+    } else if (iface == WLI_SURFACE && op == WL_SURFACE_REQ_FRAME && blen >= 4) {
+        /* frame(callback) — "tell me when it is a good time to draw the next
+         * frame".  Every toolkit's render loop requests one and then BLOCKS
+         * until it fires, so a compositor that ignores this does not merely
+         * lose throttling: the application stops drawing entirely.  We answer
+         * on the next commit, which is the moment the current frame became
+         * visible. */
+        uint32_t cb = get32(body);
+        if (cb < WL_MAX_OBJECTS) c->obj_iface[cb] = WLI_CALLBACK;
+        c->frame_cb = cb;
 
     } else if (iface == WLI_SURFACE &&
                (op == WL_SURFACE_REQ_DAMAGE ||
