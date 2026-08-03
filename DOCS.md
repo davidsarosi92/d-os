@@ -4269,10 +4269,66 @@ meson a cross `pkg-config`, and then face the runtime questions — Mesa `dlopen
 its DRI module, and its EGL Wayland platform has to be pushed onto the
 `wl_shm`-based swrast path rather than looking for `/dev/dri`.
 
-That is a milestone-sized effort of its own, with genuine unknowns rather than
-just volume.  Everything *underneath* it is now proven by real code: musl
-pthreads, dynamic linking, shm + fd passing, and a protocol surface an
-unmodified upstream application already runs on.
+**That deferral is now closed — see §4.40.1 below: EGL + GLES2 run.**
+
+---
+
+### 4.40.1 EGL + GLES2 on Mesa softpipe (M40, DoD complete)
+
+The milestone's remaining half: *an EGL/GLES2 program renders through a software
+rasteriser and is presented as a Wayland buffer.*  It runs — `egltri win` opens a
+desktop window holding a **spinning orange triangle** drawn by GLES2 shaders,
+`GL_RENDERER` = `softpipe`, `GL_VERSION` = `OpenGL ES 3.1 Mesa 23.1.9`.
+
+The stack, bottom-up, all of it upstream and unmodified:
+
+    d-os Wayland server (§M26)
+    libwayland-client (upstream, §4.40)
+    libwayland-egl            — wl_surface → EGLNativeWindow
+    Mesa EGL + GLES2, gallium swrast/softpipe
+    musl pthreads (§4.39) + dynamic linking (§M37) + shm/SCM_RIGHTS (§M26)
+
+Mesa is cross-built for musl against **our** wayland headers and libdrm
+(`third_party/mesa-cross.txt` + a cross `pkg-config` shim); `make mesa` drives
+it, and the resulting `libEGL`/`libGLESv2`/`libglapi`/`libexpat`/`libdrm`/
+`swrast_dri.so` are embedded as blobs that `pkg.c` lays into `/lib` at boot.
+`egltri` is the first client linked DYNAMICALLY on purpose: libEGL is a shared
+object that `dlopen()`s the DRI driver, so there is no static option.
+
+Two bugs stood between "it builds" and "it draws", and both are worth keeping:
+
+**1. Two copies of libwayland in one process.**  libEGL statically absorbed
+`libwayland-client.a`, so the application and Mesa each had their own copy of the
+protocol object tables.  A proxy created by one was unrecognisable to the other,
+and `wl_connection_demarshal` crashed on the first event.  Fixed by building
+libwayland as a real **shared** object and having Mesa link against it — which
+also required switching the core protocol from `wayland-scanner private-code` to
+`public-code`, because `private-code` hides the very interface symbols another
+library must share.  *Lesson: a static library is fine until two consumers in one
+address space must agree on its state — then it must be shared, and its symbols
+must be visible.*
+
+**2. `mincore()` was stubbed as "succeed and ignore".**  It had been grouped with
+`madvise` as advisory.  It is not: its RETURN VALUE is the answer.  Mesa's
+`_eglPointerIsDereferencable()` asks `mincore` whether an address is mapped, in
+order to tell a version-3 `wl_egl_window` (whose first word is the literal 3)
+from an ancient one (whose first word is a `wl_surface *`).  Answering "yes,
+mapped" for every address made Mesa dereference **address 3** — a null fault deep
+inside `wl_proxy_create_wrapper`, three libraries away from the cause.  Now
+implemented truthfully on both arches: `EINVAL` if unaligned, `ENOMEM` if the
+range holds unmapped pages, otherwise the residency vector.
+*Lesson: stubbing a syscall as "succeed and ignore" is only safe when the CALLER
+ignores the result too.  A **query** must answer truthfully or fail — a
+convenient lie propagates into a fault with no trace back to the lie.*
+
+Diagnosing #2 needed the fault address turned into a name.  The route that
+worked, and is worth reusing: log every file-backed `mmap` the loader makes, find
+which mapping contains the faulting PC, subtract its base, and `nm` that offset
+in the *unstripped* library.  It named `wl_proxy_create_wrapper` in one pass
+after two rounds of guessing had failed.
+
+Scope note: this is x86_64 only, matching the milestone's stated target (i386 is
+out of scope for the heavy ports).
 
 ---
 
@@ -4378,6 +4434,19 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 ---
 
 ## 8. Change log
+
+- **2026-08-03 — §M40 COMPLETE: EGL + GLES2 render through a Wayland buffer.**
+  `egltri win` opens a d-os desktop window with a spinning GLES2 triangle drawn
+  by Mesa's softpipe rasteriser (`OpenGL ES 3.1 Mesa 23.1.9`), presented over the
+  §M26 `wl_shm` path.  Mesa cross-built for musl against our own wayland/libdrm
+  (`make mesa`), libraries embedded and laid into `/lib` at boot.  Two fixes made
+  it work, both in DOCS §4.40.1: libwayland had to become a real SHARED object
+  (libEGL had statically absorbed it — two protocol object tables in one process
+  crashed the first event dispatch, and `wayland-scanner private-code` hid the
+  symbols that must be shared), and **`mincore` had to stop lying** — it was
+  stubbed as advisory alongside `madvise`, but its return value IS the answer, and
+  reporting "mapped" for every address made Mesa dereference address 3.  Now
+  implemented truthfully on i386 + x86_64.  x86_64 only, as the milestone scopes.
 
 - **2026-08-02 — FIX: a syscall now runs with interrupts ENABLED (the freeze +
   reboot when launching NetSurf from the desktop).**  Reported symptom: start

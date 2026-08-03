@@ -110,6 +110,8 @@ extern uint32_t saved_eip;
 #define LNX_ENOTTY  25
 #define LNX_ENOENT   2
 #define LNX_EINVAL  22
+#define LNX_PAGE_SIZE 4096
+#define LNX_ENOMEM  12
 #define LNX_EAFNOSUPPORT 97
 /* §M42 — resource/font path resolution + the display bridge (see the x86_64
  * twin for the rationale).  i386 syscall numbers + custom DOSGUI numbers. */
@@ -118,6 +120,7 @@ extern uint32_t saved_eip;
 #define LNX_readlink        85
 #define LNX_readlinkat     305
 #define LNX_madvise        219
+#define LNX_mincore        218
 #define LNX_nanosleep      162
 #define LNX_clock_nanosleep 267
 #define LNX_sched_yield    158
@@ -1132,6 +1135,28 @@ static void linux_syscall_body(struct int_frame* f) {
         case LNX_madvise:
             f->eax = 0;                              /* advisory — accept + ignore */
             return;
+
+        case LNX_mincore: {
+            /* NOT advisory, unlike its neighbour above — the RETURN VALUE is the
+             * answer.  Mesa's _eglPointerIsDereferencable() asks mincore whether
+             * an address is mapped, so a blanket "success" would tell it that
+             * literally every address is dereferenceable (see the x86_64 twin,
+             * where exactly that made libEGL dereference the address 3).
+             * Linux: EINVAL if addr is unaligned, ENOMEM if the range holds
+             * unmapped pages, else 0 with one byte per page (bit 0 = resident;
+             * we never swap, so every mapped page reports resident). */
+            uintptr_t addr = f->ebx, len = f->ecx, uvec = f->edx;
+            if (addr & (LNX_PAGE_SIZE - 1)) { f->eax = (uint32_t)-LNX_EINVAL; return; }
+            uintptr_t pages = (len + LNX_PAGE_SIZE - 1) / LNX_PAGE_SIZE;
+            if (!pages) { f->eax = 0; return; }
+            if (!lnx_w_ok(uvec, pages))   { f->eax = (uint32_t)-LNX_EFAULT; return; }
+            if (!vmm_user_access_ok(addr, pages * LNX_PAGE_SIZE, 0)) {
+                f->eax = (uint32_t)-LNX_ENOMEM; return;
+            }
+            for (uintptr_t i = 0; i < pages; i++) ((uint8_t*)uvec)[i] = 1;
+            f->eax = 0;
+            return;
+        }
 
         case LNX_nanosleep:
         case LNX_clock_nanosleep: {

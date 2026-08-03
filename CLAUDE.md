@@ -414,9 +414,15 @@ space) + **server-per-surface** (`wl_conn.wm_mode`: `xdg get_toplevel` spawns a
 `gui_window`, commits fill it, input routed to the client's wl_seat via
 `gui_window_set_input_hook`; `waycomp` = SURFACE-IN-WINDOW OK + key/motion) + a
 **mini-libwayland client library** (`user/libwl` + `user/wlapp.c`; `wayapp`).
-Only the UPSTREAM libwayland port (unmodified GTK/Qt/SDL apps) is left → §M40
-(needs wayland-scanner + protocol XML → generated proxies, a musl library
-build).**  The
+The UPSTREAM libwayland port landed as **§M40, now COMPLETE** (DOCS §4.40 +
+§4.40.1, x86_64): upstream libwayland-client cross-built for musl runs
+`weston-simple-shm` UNMODIFIED in a d-os window, and **Mesa EGL + GLES2 on
+gallium softpipe** spins a shader-drawn triangle presented through `wl_shm`
+(`egltri win`).  Two lessons: libwayland must be a SHARED object (libEGL had
+absorbed it statically — two protocol object tables in one process crash the
+first event dispatch), and **`mincore` must answer truthfully** — stubbed as
+"succeed and ignore" alongside `madvise`, it told Mesa every address was mapped,
+so Mesa dereferenced the literal 3 stored in a version-3 `wl_egl_window`.**  The
 desktop label is now dynamic (`kernel/includes/version.h` `DOS_MILESTONE` — bump
 it when a milestone ships).  Also open: more coreutils, tty line-editing/`isatty`.
 §M35 (threads/futex/TLS/per-CPU TSS) COMPLETE (UP+SMP, §4.28); also: §M34 POSIX

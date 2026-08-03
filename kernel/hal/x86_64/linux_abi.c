@@ -142,6 +142,7 @@ extern uint64_t saved_rip;
 #define LNX_ENOENT   2
 #define LNX_EFAULT  14
 #define LNX_ENOMEM  12
+#define PAGE_SIZE   4096
 
 /* arch_prctl subfunction codes (asm/prctl.h). */
 #define ARCH_SET_GS 0x1001
@@ -778,11 +779,38 @@ static void linux_syscall_body(struct int_frame* f) {
             f->rax = sizeof(unsigned long);
             return;
         }
-        case LNX_mincore:      /* Mesa probes residency; "not resident" is fine */
         case LNX_madvise:
             /* Purely advisory (MADV_*) — safe to accept and ignore. */
             f->rax = 0;
             return;
+        case LNX_mincore: {
+            /* mincore() is NOT advisory — its RETURN VALUE is the answer, and
+             * accepting it blindly is actively harmful.  Mesa's
+             * _eglPointerIsDereferencable() asks mincore whether an address is
+             * mapped; a bare `return 0` means "yes, mapped" for EVERY address,
+             * including the literal 3 that a version-3 wl_egl_window stores in
+             * its first word.  Mesa then took its legacy branch and dereferenced
+             * address 3 — a null fault inside wl_proxy_create_wrapper, one
+             * indirection away from the EGL triangle.  Lesson: a syscall stubbed
+             * as "succeed and ignore" is only safe when the CALLER ignores the
+             * result too; a query must answer truthfully or fail.
+             *
+             * Linux semantics: EINVAL if addr is not page-aligned, ENOMEM if the
+             * range holds unmapped pages, otherwise 0 with one byte per page in
+             * vec (bit 0 = resident).  Everything we have mapped is resident —
+             * no swap — so a mapped page reports 1. */
+            uintptr_t addr = a0, len = a1, uvec = a2;
+            if (addr & (PAGE_SIZE - 1)) { f->rax = (uint64_t)-LNX_EINVAL; return; }
+            uintptr_t pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+            if (!pages) { f->rax = 0; return; }
+            if (!lnx_w_ok(uvec, pages))   { f->rax = (uint64_t)-LNX_EFAULT; return; }
+            if (!vmm_user_access_ok(addr, pages * PAGE_SIZE, 0)) {
+                f->rax = (uint64_t)-LNX_ENOMEM; return;
+            }
+            for (uintptr_t i = 0; i < pages; i++) ((uint8_t*)uvec)[i] = 1;
+            f->rax = 0;
+            return;
+        }
         case LNX_nanosleep:
         case LNX_clock_nanosleep: {
             /* Yield for the requested time — NetSurf's fb event loop sleeps here

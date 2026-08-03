@@ -18,11 +18,15 @@
 #include <wayland-client.h>
 #include <wayland-egl.h>
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <xdg-shell-client-protocol.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <math.h>
 
+#define FRAMES 500      /* ~20 s at 25 fps — long enough to see + screenshot */
 #define W 200
 #define H 200
 
@@ -52,7 +56,11 @@ static const struct xdg_surface_listener xs_listener = { xs_configure };
  * buffer happened to be that colour". */
 static const char *VS =
     "attribute vec2 pos;\n"
-    "void main() { gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    "uniform float phase;\n"
+    "void main() {\n"
+    "  float c = cos(phase), s = sin(phase);\n"
+    "  gl_Position = vec4(pos.x * c - pos.y * s, pos.x * s + pos.y * c, 0.0, 1.0);\n"
+    "}\n";
 static const char *FS =
     "precision mediump float;\n"
     "void main() { gl_FragColor = vec4(1.0, 0.55, 0.1, 1.0); }\n";
@@ -99,7 +107,20 @@ int main(void)
     struct wl_egl_window *win = wl_egl_window_create(surf, W, H);
     if (!win) { printf("egltri: wl_egl_window_create failed\n"); return 1; }
 
-    EGLDisplay ed = eglGetDisplay((EGLNativeDisplayType)dpy);
+    /* eglGetPlatformDisplay, NOT eglGetDisplay: the legacy call makes Mesa
+     * AUTODETECT the platform and, if it does not recognise the pointer as a
+     * wl_display, open a connection of its own with wl_display_connect(NULL).
+     * That cannot work here — libwayland unsets WAYLAND_SOCKET once the first
+     * connect has consumed it — so Mesa would end up with a NULL wl_display and
+     * crash in wl_proxy_create_wrapper the moment a window surface is created.
+     * Naming the platform and handing over OUR display removes the guess. */
+    PFNEGLGETPLATFORMDISPLAYEXTPROC getPlatformDisplay =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)
+        eglGetProcAddress("eglGetPlatformDisplayEXT");
+    EGLDisplay ed = getPlatformDisplay
+        ? getPlatformDisplay(EGL_PLATFORM_WAYLAND_EXT, dpy, NULL)
+        : eglGetDisplay((EGLNativeDisplayType)dpy);
+    if (ed == EGL_NO_DISPLAY) { printf("egltri: no EGL display\n"); return 1; }
     EGLint major = 0, minor = 0;
     if (!eglInitialize(ed, &major, &minor)) {
         printf("egltri: eglInitialize failed (0x%x)\n", eglGetError()); return 1;
@@ -146,10 +167,15 @@ int main(void)
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, tri);
     glEnableVertexAttribArray(0);
 
-    for (int frame = 0; frame < 60; frame++) {
+    /* Animated, and paced to real time: a still frame cannot distinguish "GL
+     * rendered this" from "the buffer happened to be that colour", and a
+     * free-running loop finishes before anyone (or any screenshot) sees it. */
+    GLint uloc = glGetUniformLocation(prog, "phase");
+    for (int frame = 0; frame < FRAMES; frame++) {
         glViewport(0, 0, W, H);
         glClearColor(0.05f, 0.10f, 0.25f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
+        if (uloc >= 0) glUniform1f(uloc, frame * 0.06f);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         if (!eglSwapBuffers(ed, es)) {
             printf("egltri: eglSwapBuffers failed (0x%x)\n", eglGetError());
@@ -157,6 +183,8 @@ int main(void)
         }
         if (frame == 0) printf("egltri: first frame swapped\n");
         wl_display_dispatch_pending(dpy);
+        struct timespec ts = { 0, 40 * 1000 * 1000 };   /* ~25 fps */
+        nanosleep(&ts, NULL);
     }
 
     printf("egltri: PASS — GLES2 triangle rendered and presented via Wayland\n");
