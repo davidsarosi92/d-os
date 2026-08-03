@@ -164,6 +164,11 @@ struct gui_window {
     /* IRQ → compositor handoff (state_lock). */
     int  pending_w, pending_h;
     volatile int want_close;
+
+    /* §M47.1 — grace deadline for a CLIENT-MANAGED window's close.  Set on the
+     * first compositor pass that sees want_close; the client is force-killed
+     * only once it expires.  0 = no close in flight. */
+    uint64_t close_deadline_ms;
 };
 
 static struct gui_window windows[GUI_MAX_WINDOWS];
@@ -200,8 +205,15 @@ static struct gui_window* lastclick_win = NULL;
 static struct gfx_surface fbsurf, backsurf, wallsurf;
 static int work_h = 0;                  /* screen minus shell chrome     */
 static int gmax_cols = 0, gmax_rows = 0;
-/* §M46 — see gui_start: X on a package window force-kills a wedged client. */
+/* §M46 — see gui_start: X on a package window force-kills a wedged client.
+ * §M47.1 — but only after a GRACE PERIOD.  Killing on the first compositor pass
+ * meant the X button never gave the client the chance to notice the close event
+ * and quit by itself, so an ordinary "close the browser" was reported as a
+ * forced kill — a crash record, and (since §M47 stage 2) a Crash Reports window
+ * popping up as though something had gone wrong.  The kill is the FALLBACK for a
+ * wedged client, not the close path. */
 static int close_forces_kill = 1;
+static unsigned close_grace_ms = 2000;
 
 /* M22.6 — tear-free presentation via a Bochs-VBE double buffer (see
  * fb_terminal.c).  When `flip_ok`, compose() copies the dirty region from
@@ -1589,9 +1601,16 @@ static void apply_pending(void) {
             if (!ct || ct->state == TASK_DEAD) {
                 win->host_released = 1;              /* nothing left to coordinate */
             } else if (close_forces_kill && !ct->kill_forced) {
-                kprintf("gui: close '%s' → force-killing client pid %d\n",
-                        win->title, win->client_pid);
-                task_force_kill(win->client_pid);
+                uint64_t now = timer_ticks_ms();
+                if (!win->close_deadline_ms) {
+                    /* First pass: start the clock and let the client quit. */
+                    win->close_deadline_ms = now + close_grace_ms;
+                } else if (now >= win->close_deadline_ms) {
+                    kprintf("gui: '%s' did not close within %ums → force-killing "
+                            "client pid %d\n", win->title, close_grace_ms,
+                            win->client_pid);
+                    task_force_kill(win->client_pid);
+                }
             }
         }
 
@@ -1613,6 +1632,7 @@ static void apply_pending(void) {
             kprintf("gui: app window '%s' closed (host pid %d)\n",
                     win->title, host ? host->pid : -1);
             win->want_close = 0;
+    win->close_deadline_ms = 0;
             destroy_window(win);
             reap_gui_host(host);                /* reap once its last window is gone */
             continue;
@@ -1639,6 +1659,7 @@ static void apply_pending(void) {
                 win->vc = NULL;
             }
             win->want_close = 0;
+    win->close_deadline_ms = 0;
             destroy_window(win);
             continue;
         }
@@ -2025,6 +2046,7 @@ static struct gui_window* window_alloc(const char* title, enum win_kind kind,
     win->x = x;  win->y = y;  win->w = w;  win->h = h;
     win->pending_w = win->pending_h = 0;
     win->want_close = 0;
+    win->close_deadline_ms = 0;
     win->widgets = NULL;  win->focusw = NULL;
     win->on_layout = NULL; win->on_close = NULL; win->app_ctx = NULL;
     win->cells = NULL; win->vc = NULL;
@@ -2196,6 +2218,15 @@ int gui_start(void) {
     {
         const char* v = config_get("gui.close_forces_kill", "1");
         close_forces_kill = (v && (v[0]=='1'||v[0]=='y'||v[0]=='t'||v[0]=='Y'));
+        /* How long a client-managed window's client gets to quit by itself
+         * before the X button escalates to a forced kill.  Long enough that a
+         * healthy app never hits it, short enough that a wedged one still goes
+         * away promptly. */
+        const char* g = config_get("gui.close_grace_ms", "2000");
+        unsigned ms = 0;
+        for (const char* c = g; c && *c >= '0' && *c <= '9'; c++)
+            ms = ms * 10u + (unsigned)(*c - '0');
+        if (ms) close_grace_ms = ms;
     }
 
     if (gfx_fb_surface(&fbsurf) != 0) {

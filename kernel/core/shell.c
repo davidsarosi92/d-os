@@ -1931,6 +1931,30 @@ static void cmd_linuxtest(void) {
 extern const unsigned char _binary_user_muslhello_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_muslhello_muslelf_end[]   __attribute__((weak));
 
+/* §M46/§M47.1 — `wedgewin`: open a GUI window with a client that then FREEZES.
+ * The point is the title-bar X: a frozen client can never observe the close
+ * event, so the window must still go away through the compositor's force-kill
+ * fallback (after gui.close_grace_ms).  Spawned as an independent Linux-ABI
+ * task, never as an excursion — a wedged excursion would take this shell with
+ * it, which is exactly the failure mode M46 exists to prevent. */
+extern const unsigned char _binary_user_wedgewin_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_wedgewin_muslelf_end[]   __attribute__((weak));
+
+static void cmd_wedgewin(void) {
+    if (!_binary_user_wedgewin_muslelf_start) {
+        console_write("wedgewin: not embedded — run `make musl` then rebuild\n");
+        return;
+    }
+    gui_start();
+    task_msleep(300);
+    size_t len = (size_t)(_binary_user_wedgewin_muslelf_end -
+                          _binary_user_wedgewin_muslelf_start);
+    const char* argv[] = { "wedgewin" };
+    int pid = proc_spawn_argv_under("wedgewin", _binary_user_wedgewin_muslelf_start,
+                                    len, 1, argv, 1, gui_desktop_pid());
+    kprintf("wedgewin: spawned pid %d — its window's X must still close it\n", pid);
+}
+
 static void cmd_musltest(void) {
     if (!_binary_user_muslhello_muslelf_start) {
         console_write("musltest: not embedded — run `make musl` then rebuild\n");
@@ -2526,6 +2550,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "threadtest"))     { cmd_threadtest(); return; }
     if (streq(line, "tlstest"))        { cmd_tlstest(); return; }
     if (streq(line, "linuxtest"))      { cmd_linuxtest(); return; }
+    if (streq(line, "wedgewin"))       { cmd_wedgewin(); return; }
     if (streq(line, "musltest"))       { cmd_musltest(); return; }
     if (streq(line, "musldyntest"))    { cmd_musldyntest(); return; }
     if (streq(line, "randtest"))       { cmd_randtest(); return; }

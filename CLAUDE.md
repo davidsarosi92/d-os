@@ -35,6 +35,18 @@ breadcrumb** (kind/cpu/pid/pc/addr/code/uptime/comm).  Also: taskbar clock shows
 the ISO date + keyboard layout, wallpaper label carries the arch
 (`d-os M47  x32`/`x64`/`arm64`).
 
+✅ **CLOSING A WINDOW IS NOT A CRASH (2026-08-03, DOCS §4.38.1).**  The X button
+force-killed a client-managed window's client on the FIRST compositor pass, so
+closing a healthy NetSurf was recorded as "unresponsive task reclaimed by force"
+and popped the Crash Reports window.  The kill is the FALLBACK for a wedged
+client: a grace deadline (`gui.close_grace_ms`, default 2000 ms) now precedes it.
+New `wedgewin` cmd + `user/wedgewin.c` (a client that opens a window then
+freezes) is the automated test M46's "chrome works when the app is frozen"
+guarantee never had.  **Harness lesson:** step the QEMU mouse in <=100 px hops —
+the PS/2 delta is a signed byte, so one big `mouse_move` is clamped and the click
+lands elsewhere (the first repro attempt clicked the page and wrongly concluded
+there was no bug).
+
 ✅ **x86_64 USERLAND PARITY (2026-08-02, DOCS §4.39).**  x86_64 now runs the same
 userland i386 does: musl coreutils + `sh`, ring-3 sockets, threads/TLS/signals,
 Mbed TLS (crypto + TLSv1.3 + HTTPS w/ CA verify + `wget`), and on-device TinyCC.

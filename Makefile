@@ -63,7 +63,10 @@ X86_USER_BLOBS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
 MUSL_COREUTILS := echo cat ls env sh
 MUSL_COREUTIL_BLOBS := $(patsubst %,user/%_muslblob.o,$(MUSL_COREUTILS))
 # Other musl-linked programs that are not coreutils (socket/network probes).
-MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o
+# wedgewin = a GUI client that opens a window and then freezes: the automated
+# test for "the chrome still works when the app behind it is frozen".
+MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o \
+                   user/wedgewin_muslblob.o
 # §M37 dynamic-linking artifacts — the ld.so blob + the dynamically linked tests.
 MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
                    user/libgreet_blob.o user/solibtest_dynblob.o \

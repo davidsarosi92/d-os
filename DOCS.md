@@ -3782,6 +3782,45 @@ sink, and per-kind filtering of what opens the window.
 
 ---
 
+### 4.38.1 Closing a window is not a crash (M47.1)
+
+M46 promised that the title-bar X **always** closes a window, even when the app
+behind it is frozen, and implemented that by force-killing the client.  The
+implementation force-killed on the FIRST compositor pass that saw `want_close` —
+before the client could possibly have noticed the close event.  So closing a
+perfectly healthy NetSurf was reported as *"unresponsive task reclaimed by
+force"*, wrote a crash record, and (once §M47 stage 2 landed) popped the Crash
+Reports window as though the browser had crashed.
+
+The kill is the **fallback for a wedged client, not the close path**.  A
+client-managed window now gets a grace deadline on the first pass
+(`gui.close_grace_ms`, default 2000 ms); the force-kill fires only after it
+expires.  A healthy client sees the close event, calls `DOSGUI_DESTROY`, and the
+window is disposed with no kill and no record.  M46's guarantee is unchanged: a
+frozen client still loses its window, just two seconds later.
+
+**`wedgewin` — the test this guarantee never had.**  `wedge` proved a wedged
+ring-3 task can be reclaimed; nothing proved the thing a user actually
+experiences, which is why a regression in the opposite direction went unnoticed.
+`user/wedgewin.c` opens a real window through the dosgui bridge, presents one
+frame, then spins forever without ever polling — so the close event can never be
+observed by it.  Verified on x86_64:
+
+| case | result |
+|------|--------|
+| NetSurf (healthy) — click X | window closes, **no** force-kill, **no** crash record |
+| `wedgewin` (frozen) — click X | `'Wedged App' did not close within 2000ms → force-killing client pid 18`, window disposed, forced-kill recorded, Crash Reports opens |
+
+The second row is the correct outcome: that program really *was* unresponsive.
+
+**Lesson (test-shape, worth keeping):** the pointer harness that drives these
+tests must step the mouse in ≤100 px hops — QEMU's PS/2 packet carries a signed
+byte delta, so one big `mouse_move` is silently clamped and the click lands
+somewhere else entirely.  The first attempt at this repro clicked the middle of
+the page and concluded, wrongly, that the bug did not exist.
+
+---
+
 ### 4.39 x86_64 userland parity (M47.5)
 
 Until this point x86_64 ran a visibly smaller userland than i386 — no coreutils,
@@ -3993,6 +4032,18 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   `polltest`, `solibtest`, `forktest`, `threadtest`, `musltest`, `dnstest`,
   `httptest` (`HTTP/1.1 200 OK`) and `pkgrun sh -c` all green; aarch64 builds
   clean.
+
+- **2026-08-03 — closing a window is not a crash (DOCS §4.38.1).**  Clicking the
+  title-bar X on NetSurf force-killed the client immediately and therefore
+  recorded a crash + popped the Crash Reports window, as though the browser had
+  died.  M46's force-kill is the fallback for a WEDGED client, not the close
+  path: a client-managed window now gets a grace deadline
+  (`gui.close_grace_ms`, default 2000 ms) and is only force-killed once it
+  expires.  Healthy clients close cleanly with no record; M46's "the X always
+  closes the window" guarantee is unchanged.  Adds `user/wedgewin.c` + the
+  `wedgewin` command — a client that opens a real window and then freezes,
+  which is the automated test that guarantee never had (and whose absence is why
+  the regression went unnoticed).  Both cases verified on x86_64.
 
 - **2026-08-03 — musl `getaddrinfo` fixed (DOCS §4.39).**  Two pre-existing
   defects, found by tracing what musl's resolver actually did.  (1) We discarded
