@@ -577,6 +577,7 @@ CORE_C_SRCS := \
     kernel/gui/dosgui.c \
     kernel/gui/widget.c \
     kernel/gui/wayland.c \
+    kernel/gui/wl_keymap.c \
     kernel/gui/w_editor.c \
     kernel/gui/clipboard.c \
     kernel/gui/shell_vista.c \
@@ -677,6 +678,7 @@ CORE_C_SRCS := \
     kernel/gui/dosgui.c \
     kernel/gui/widget.c \
     kernel/gui/wayland.c \
+    kernel/gui/wl_keymap.c \
     kernel/gui/w_editor.c \
     kernel/gui/clipboard.c \
     kernel/gui/shell_vista.c \
@@ -740,6 +742,7 @@ CORE_C_SRCS := \
     kernel/gui/dosgui.c \
     kernel/gui/widget.c \
     kernel/gui/wayland.c \
+    kernel/gui/wl_keymap.c \
     kernel/gui/w_editor.c \
     kernel/gui/clipboard.c \
     kernel/gui/shell_vista.c \

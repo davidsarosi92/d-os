@@ -296,6 +296,26 @@ static void send_pointer_frame(struct wl_conn* c) {
     usock_send(c->sock, msg, 8, NULL);
 }
 
+/* wl_keyboard.keymap(format, fd, size) — the keymap travels as a DESCRIPTOR
+ * (SCM_RIGHTS), which is the whole reason the shm + fd-passing work had to come
+ * first.  Sent once, immediately after the client asks for the keyboard: a
+ * toolkit that gets `key` events before it has a keymap cannot translate them
+ * and will simply discard them. */
+static void send_keyboard_keymap(struct wl_conn* c) {
+    if (!c->keyboard_id || c->keymap_sent) return;
+    uint32_t size = 0;
+    struct ofile* km = wl_keymap_make(&size);
+    if (!km) return;
+    uint8_t msg[16];
+    put32(msg + 0, c->keyboard_id);
+    put32(msg + 4, (16u << 16) | WL_KEYBOARD_EVT_KEYMAP);
+    put32(msg + 8, 1);                    /* format: XKB_V1                   */
+    put32(msg + 12, size);
+    usock_send(c->sock, msg, 16, km);     /* the fd rides the same message    */
+    ofile_unref(km);                      /* the travelling reference is sent */
+    c->keymap_sent = 1;
+}
+
 static void send_keyboard_enter(struct wl_conn* c) {
     if (!c->keyboard_id || !c->surface_id || c->kbd_entered) return;
     uint8_t msg[20];
@@ -362,6 +382,7 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock) {
     c->xdg_surface_id = c->xdg_toplevel_id = 0;
     c->pointer_id = c->keyboard_id = 0;
     c->ptr_entered = c->kbd_entered = 0;
+    c->keymap_sent = 0;
     c->target = NULL;
     c->blit_x = c->blit_y = 0;
     c->window = NULL;
@@ -611,6 +632,7 @@ static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
         if (nid < WL_MAX_OBJECTS) c->obj_iface[nid] = WLI_KEYBOARD;
         c->keyboard_id = nid;
         kprintf("wayland: get_keyboard -> object %u\n", nid);
+        send_keyboard_keymap(c);          /* before any key event can arrive */
 
     } else {
         kprintf("wayland: object %u (iface %u) opcode %u — unhandled\n", obj, iface, op);

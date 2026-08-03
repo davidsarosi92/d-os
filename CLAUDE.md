@@ -43,6 +43,18 @@ TLS, NetSurf, Wayland.  Nothing failed visibly, which is why it survived two
 milestones.  Now armed on both; the `_k`/`_u` discipline covers the places that
 legitimately pass kernel buffers (new `sys_recv_u`).
 
+✅ **§M40 STAGES 7–8 (2026-08-03, DOCS §4.40).**  **Focus**: `wl_pointer.enter`
+/ `wl_keyboard.enter` + `modifiers` + `wl_pointer.frame` — a real client IGNORES
+input that arrives without a preceding enter.  (libwayland caught a malformed
+`modifiers` we had sized 24 bytes instead of 28 — "message too short" — the kind
+of thing a hand-written test client never notices.)  **Keymap**: an xkb keymap
+GENERATED from d-os's live layout (`keymap_active()`), passed as a memfd over
+SCM_RIGHTS; keycodes = d-os scancode + 8, text self-contained (no `include`).
+Verified with a REAL xkb compiler (`xkbcli compile-keymap --from-xkb`: 297 lines,
+zero diagnostics; exit codes are inverted in 1.4.0, so the output is the signal —
+establish it with a known-bad control).  Chain: scancode 4 → key 4 → xkb 12 →
+keysym a/A.  Shell: `waykeymap`.
+
 ✅ **§M40 STAGE 6 — AN UNMODIFIED UPSTREAM WAYLAND APP RUNS (2026-08-03, DOCS
 §4.40).**  `weston-simple-shm` (weston's own reference client, compiled exactly
 as it sits in its tree — nothing patched) animates continuously in a real d-os

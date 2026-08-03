@@ -81,6 +81,7 @@ struct wl_conn {
      * input that arrives without a preceding enter, so this is sent once and
      * never revoked (one surface per connection). */
     int                 ptr_entered, kbd_entered;
+    int                 keymap_sent;    /* wl_keyboard.keymap delivered once */
 };
 
 /* Initialise a connection over `sock` (registers wl_display as object 1). */
@@ -126,3 +127,10 @@ void wl_input_demo (void);
 void wl_compositor_demo(void);
 
 #endif /* WAYLAND_H */
+
+/* §M40 — build an xkb keymap from the ACTIVE d-os keyboard layout and return it
+ * as a memfd the client can mmap (wl_keyboard.keymap passes a descriptor, not
+ * bytes).  *size_out includes the terminating NUL, which xkbcommon requires.
+ * Implemented in kernel/gui/wl_keymap.c. */
+struct ofile;
+struct ofile* wl_keymap_make(uint32_t* size_out);

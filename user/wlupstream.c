@@ -130,8 +130,25 @@ static const struct wl_pointer_listener pointer_listener = {
     pt_frame, pt_axis_src, pt_axis_stop, pt_axis_disc,
 };
 
+static int keymap_ok;
 static void kb_keymap(void *d, struct wl_keyboard *k, uint32_t f, int32_t fd, uint32_t sz)
-{ (void)d;(void)k;(void)f;(void)sz; if (fd >= 0) close(fd); }
+{
+    (void)d; (void)k;
+    /* Exactly what a toolkit does: mmap the descriptor read-only and hand the
+     * text to xkbcommon.  We have no xkbcommon here, so we check the shape —
+     * XKB_V1 format, a mapping that parses as a keymap header. */
+    if (fd < 0) { printf("wlupstream: keymap event with no fd\n"); return; }
+    char *km = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (km == MAP_FAILED) {
+        printf("wlupstream: keymap mmap failed (fmt=%u size=%u)\n", f, sz);
+        close(fd); return;
+    }
+    keymap_ok = (f == 1 && sz > 32 && !strncmp(km, "xkb_keymap", 10));
+    printf("wlupstream: keymap fmt=%u size=%u first-line=\"%.10s\" -> %s\n",
+           f, sz, km, keymap_ok ? "XKB_V1 OK" : "unexpected");
+    munmap(km, sz);
+    close(fd);
+}
 static void kb_enter(void *d, struct wl_keyboard *k, uint32_t s_, struct wl_surface *sf,
                      struct wl_array *keys)
 {
@@ -333,9 +350,9 @@ int main(int argc, char **argv)
         }
         printf("wlupstream: input seen — %d key(s), %d motion(s); "
                "frame callbacks %d; output %dx%d (done=%d); "
-               "enters ptr=%d kbd=%d\n",
+               "enters ptr=%d kbd=%d; keymap=%d\n",
                keys_seen, motions_seen, frames_done, out_w, out_h, have_output,
-               ptr_enters, kbd_enters);
+               ptr_enters, kbd_enters, keymap_ok);
     }
 
 out:

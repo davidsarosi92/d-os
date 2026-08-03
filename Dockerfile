@@ -43,6 +43,7 @@ RUN apt update && apt install -y \
     libwayland-dev \
     libwayland-bin \
     wayland-protocols \
-    libffi-dev
+    libffi-dev \
+    libxkbcommon-tools
 
 WORKDIR /src

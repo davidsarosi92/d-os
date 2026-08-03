@@ -2256,6 +2256,26 @@ static void run_upstream_wl(const char* what, const unsigned char* sp,
     kprintf("%s: client exited rc=%d\n", what, rc);
 }
 
+/* §M40 — `waykeymap`: print the xkb keymap this system would hand a Wayland
+ * client.  It exists to be VERIFIED, not admired: the text can be piped into a
+ * real xkb compiler (`xkbcli compile-keymap`) to prove the generator produces
+ * something xkbcommon actually accepts — a client reporting "the string starts
+ * with xkb_keymap" proves nothing of the sort. */
+static void cmd_waykeymap(void) {
+    uint32_t size = 0;
+    struct ofile* km = wl_keymap_make(&size);
+    if (!km) { console_write("waykeymap: could not build a keymap\n"); return; }
+    kprintf("---- BEGIN XKB KEYMAP (%u bytes) ----\n", size);
+    struct shm* s = km->shm;
+    for (uint32_t off = 0; off + 1 < size; off++) {
+        uint32_t fi = off / 4096, fo = off % 4096;
+        if ((int)fi >= s->nframes) break;
+        console_putchar((char)*(volatile uint8_t*)(uintptr_t)(s->frames[fi] + fo));
+    }
+    console_write("---- END XKB KEYMAP ----\n");
+    ofile_unref(km);
+}
+
 static void cmd_simpleshm(const char* args) {
     const unsigned char* sp = _binary_user_simpleshm_muslelf_start;
     if (!sp) {
@@ -2674,6 +2694,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "waywin"))         { wl_window_demo();   return; }
     if (streq(line, "wayinput"))       { wl_input_demo();    return; }
     if (streq(line, "wayclient"))      { cmd_wayclient();    return; }
+    if (streq(line, "waykeymap"))      { cmd_waykeymap(); return; }
     if (streq(line, "simpleshm"))      { cmd_simpleshm(""); return; }
     if (starts_with(line, "simpleshm "))   { cmd_simpleshm(line + 10); return; }
     if (streq(line, "wayupstream"))    { cmd_wayupstream(""); return; }

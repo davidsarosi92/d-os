@@ -4180,11 +4180,43 @@ and dropped the connection.  That strictness is the whole value of running a
 real client library: a hand-written test client had happily ignored the
 malformed event for two milestones.
 
-**Open:** a full toolkit (SDL/GTK/Qt).  Those need EGL, hence Mesa `llvmpipe`
-and LLVM — a multi-hour build and the natural next milestone, now that the
-protocol surface underneath it is proven by a real application.  Also still
-open: `wl_keyboard.keymap` (we forward raw keycodes; a toolkit wants an xkb
-keymap over a memfd before it can translate them) and `xkbcommon`.
+#### Stage 8 — the keymap, generated from d-os's own layout
+
+`wl_keyboard.key` carries a raw keycode and nothing else.  A toolkit turns that
+into a character by feeding it to xkbcommon **together with the keymap the
+compositor handed it** — so without one a client receives keystrokes it cannot
+interpret at all.
+
+The keymap is **generated from the live d-os layout** (`keymap_active()`), not
+embedded as a fixed file: d-os already has layouts (us + hu, selected by
+`keyboard.layout`, shown in the taskbar), and shipping a second copy would mean
+two sources of truth that disagree the moment someone switches layout.
+
+It travels the way the protocol requires — as a **descriptor**, not bytes:
+`wl_keymap_make()` builds the text into a memfd and `wl_keyboard.keymap(XKB_V1,
+fd, size)` passes it over SCM_RIGHTS, which is precisely why the shm and
+fd-passing work had to come first.  The size includes the terminating NUL, which
+xkbcommon requires.  Keycodes are d-os scancodes + 8 (the compositor defines the
+keymap it hands out, so the two only have to agree with each other — one table
+instead of an evdev translation layer).  The text is self-contained: no
+`include` directives, since those make xkbcommon look for files d-os does not
+have.
+
+**Verified with a real xkb compiler, not by eyeballing the string.**  `waykeymap`
+dumps the keymap; fed to `xkbcli compile-keymap --from-xkb` it produces 297
+lines of compiled keymap with **zero diagnostics**, where a deliberately broken
+input produces a syntax error and no output.  (Note the exit codes are inverted
+in xkbcli 1.4.0 — success exits 1 — so the output/stderr are the signal, which a
+control run against a known-bad keymap establishes.)  The mapping is consistent
+end to end:
+
+```
+d-os scancode 4  →  wl_keyboard.key 4  →  xkb keycode 12  →  keysym a / A
+```
+
+**Open:** a full toolkit (SDL/GTK/Qt).  Those need EGL, hence Mesa — a large
+build and the natural next milestone, now that everything underneath it is
+proven by a real application.
 
 ---
 

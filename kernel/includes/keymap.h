@@ -127,6 +127,11 @@ int  keymap_select(const char* name);
 /* Active layout's short name, e.g. "us".  Never NULL after keymap_init. */
 const char* keymap_current(void);
 
+/* §M40 — the ACTIVE layout itself.  The Wayland server generates an xkb keymap
+ * from it, so switching d-os's layout also switches what a toolkit sees.
+ * NULL before keymap_init. */
+const struct kbd_layout* keymap_active(void);
+
 /* Translate (keycode, modifier_mask) into an ASCII character.  Returns
  * 0 for unmapped combinations.  Input drivers call this on every fresh
  * key-down to produce the character to push into vc_kbd_push. */

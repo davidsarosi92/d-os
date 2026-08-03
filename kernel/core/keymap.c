@@ -81,6 +81,8 @@ const char* keymap_current(void) {
     return active ? active->name : "?";
 }
 
+const struct kbd_layout* keymap_active(void) { return active; }
+
 char keymap_translate(uint8_t keycode, uint8_t mods) {
     if (!active) return 0;
     int col = 0;
