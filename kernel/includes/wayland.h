@@ -69,6 +69,10 @@ struct wl_conn {
      * blits the buffer into it (chrome + move/resize come free from the WM). */
     struct gui_window*  window;
     int                 wm_mode;        /* create a gui_window per xdg_toplevel */
+    /* §M40 — the client titles its toplevel BEFORE it has any content, but the
+     * window is only created once we know the buffer size, so the title has to
+     * wait here for it. */
+    char                title[64];
 };
 
 /* Initialise a connection over `sock` (registers wl_display as object 1). */

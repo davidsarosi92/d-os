@@ -43,6 +43,14 @@ TLS, NetSurf, Wayland.  Nothing failed visibly, which is why it survived two
 milestones.  Now armed on both; the `_k`/`_u` discipline covers the places that
 legitimately pass kernel buffers (new `sys_recv_u`).
 
+✅ **§M40 STAGE 3 (2026-08-03, DOCS §4.40).**  `wayupstream win` → the upstream
+client's `xdg_toplevel` IS a desktop window (title bar + taskbar button + its
+pixels as contents), verified by screenshot on both arches.  The window is now
+created at the FIRST COMMIT WITH CONTENT (our configure says 0×0 = "you pick",
+so the size is unknown at `get_toplevel`) and sized via the new
+`gui_window_outer_for_content()`; the title arrives before any content, so
+`wl_conn.title` holds it until the window exists.
+
 ✅ **§M40 STAGE 2 (2026-08-03, DOCS §4.40, i386 + x86_64).**  Upstream libwayland
 drives a REAL `xdg_toplevel` + shm buffer; the server reads the client's pixels
 (`top-left=ff102040`).  Added: SCM_RIGHTS in both ABI control paths,

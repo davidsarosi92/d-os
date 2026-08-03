@@ -226,6 +226,7 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock) {
     c->blit_x = c->blit_y = 0;
     c->window = NULL;
     c->wm_mode = 0;
+    c->title[0] = '\0';
 }
 
 /* §M26 — forward a WM-managed window's input to the Wayland client (wl_seat).
@@ -264,6 +265,23 @@ static void wl_surface_commit(struct wl_conn* c) {
             }
         }
     }
+    /* Server-per-surface: a top-level becomes a real desktop window the moment
+     * it first has CONTENT — not at get_toplevel, because only now do we know
+     * the size the client chose (our configure says 0x0 = "you pick").  Sizing
+     * the window to the buffer is what makes an application look right instead
+     * of a fixed placeholder rectangle with the pixels in one corner. */
+    if (c->wm_mode && !c->window && c->buf_w && c->buf_h) {
+        int ow = 0, oh = 0;
+        gui_window_outer_for_content((int)c->buf_w, (int)c->buf_h, &ow, &oh);
+        c->window = gui_app_window_create(c->title[0] ? c->title : "Wayland client",
+                                          340, 220, ow, oh, NULL, NULL);
+        if (c->window) {
+            gui_window_set_input_hook(c->window, wl_window_input, c);
+            kprintf("wayland: created a %dx%d WM window for the surface\n",
+                    (int)c->buf_w, (int)c->buf_h);
+        }
+    }
+
     /* WM-managed window target: the buffer becomes the window's contents.
      * (Single-frame buffers: the pixels are contiguous in frames[0].) */
     if (c->window && s->nframes >= 1) {
@@ -385,13 +403,6 @@ static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
         /* Server-per-surface: a top-level maps to a real desktop window.  Its
          * committed buffers become the window's contents (wl_conn.window) and
          * its input is routed to this client's wl_seat (input hook). */
-        if (c->wm_mode && !c->window) {
-            c->window = gui_app_window_create("Wayland client", 340, 220, 260, 200, NULL, NULL);
-            if (c->window) {
-                gui_window_set_input_hook(c->window, wl_window_input, c);
-                kprintf("wayland: created a WM window for the surface\n");
-            }
-        }
         send_xdg_toplevel_configure(c, nid, 0, 0);       /* client picks a size */
         send_xdg_surface_configure(c, c->xdg_surface_id, ++c->serial);
 
@@ -401,6 +412,14 @@ static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
         for (; k + 1 < slen && k < sizeof t - 1; k++) t[k] = (char)body[4 + k];
         t[k] = 0;
         kprintf("wayland: xdg_toplevel set_title(\"%s\")\n", t);
+        /* A real client titles its window AFTER the role is assigned, so the
+         * window already exists under a placeholder name — retitle it, or the
+         * title bar keeps saying "Wayland client" for every application. */
+        {   uint32_t i = 0;
+            for (; t[i] && i < sizeof c->title - 1; i++) c->title[i] = t[i];
+            c->title[i] = '\0';
+        }
+        if (c->window && t[0]) gui_window_set_title(c->window, t);
 
     } else if (iface == WLI_XDG_SURFACE && op == XDG_SURFACE_REQ_ACK_CONFIGURE && blen >= 4) {
         kprintf("wayland: xdg_surface ack_configure(serial=%u)\n", get32(body));

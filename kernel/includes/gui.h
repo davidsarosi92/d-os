@@ -125,6 +125,12 @@ int  gui_widget_focused(struct widget* w);      /* is w the focused one? */
 /* Content-area size in pixels (excludes decorations). */
 int  gui_window_content_size(struct gui_window* win, int* w, int* h);
 
+/* §M40 — the inverse: what OUTER size does a window need so its content area is
+ * exactly cw x ch?  A Wayland client picks its own buffer size and the window
+ * must be built around it, so the decoration thickness cannot stay private to
+ * gui.c. */
+void gui_window_outer_for_content(int cw, int ch, int* ow, int* oh);
+
 /* §M26 — paint a raw ARGB pixel block into a window's content surface (at
  * content-relative x,y) and composite it.  The Wayland server uses this to turn
  * a committed wl_shm buffer into a real window's contents.  `gui_window_pixel`

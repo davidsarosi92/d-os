@@ -2219,7 +2219,13 @@ static void run_wayland_client(const char* what, const unsigned char* s,
 extern const unsigned char _binary_user_wlupstream_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_wlupstream_muslelf_end[]   __attribute__((weak));
 
-static void cmd_wayupstream(void) {
+static void cmd_wayupstream(const char* args) {
+    /* `wayupstream win` runs the server in SERVER-PER-SURFACE mode, so the
+     * client's xdg_toplevel becomes a real desktop window and its commits are
+     * blitted into it — the same wm_mode the native `waycomp` demo uses.  With
+     * no argument the connection is headless, which keeps the protocol test
+     * runnable without a GUI. */
+    int windowed = (args && (args[0] == 'w' || args[0] == 'W'));
     const unsigned char* sp = _binary_user_wlupstream_muslelf_start;
     if (!sp) {
         console_write("wayupstream: not embedded — run "
@@ -2242,14 +2248,18 @@ static void cmd_wayupstream(void) {
     }
     me->fds[3] = cli_of;
     wl_conn_init(conn, srv);
+    if (windowed) { gui_start(); task_msleep(300); conn->wm_mode = 1; }
     task_spawn_arg("wl-server", wl_server_task, conn);
 
-    console_write("wayupstream: running a REAL libwayland-client "
-                  "(WAYLAND_SOCKET=3)...\n");
+    kprintf("wayupstream: running a REAL libwayland-client (WAYLAND_SOCKET=3)%s\n",
+            windowed ? " — surface becomes a desktop window" : "");
     proc_set_exec_env("WAYLAND_SOCKET=3");
     int prev = me->linux_abi;
     me->linux_abi = 1;
-    int rc = proc_exec_elf(sp, (size_t)(_binary_user_wlupstream_muslelf_end - sp));
+    const char* argv[] = { "wlupstream", "-w" };
+    int rc = proc_exec_elf_argv(sp,
+                 (size_t)(_binary_user_wlupstream_muslelf_end - sp),
+                 windowed ? 2 : 1, argv);
     me->linux_abi = prev;
     kprintf("wayupstream: client exited rc=%d\n", rc);
 }
@@ -2613,7 +2623,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "waywin"))         { wl_window_demo();   return; }
     if (streq(line, "wayinput"))       { wl_input_demo();    return; }
     if (streq(line, "wayclient"))      { cmd_wayclient();    return; }
-    if (streq(line, "wayupstream"))    { cmd_wayupstream(); return; }
+    if (streq(line, "wayupstream"))    { cmd_wayupstream(""); return; }
+    if (starts_with(line, "wayupstream ")) { cmd_wayupstream(line + 12); return; }
     if (streq(line, "wayapp"))         { cmd_wayapp();       return; }
     if (streq(line, "waycomp"))        { wl_compositor_demo(); return; }
     if (starts_with(line, "pkgrun "))  { cmd_pkgrun(line + 7); return; }

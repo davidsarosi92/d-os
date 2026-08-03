@@ -26,6 +26,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 
@@ -89,8 +90,13 @@ static const struct wl_registry_listener reg_listener = {
     reg_global, reg_global_remove
 };
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* `-w`: the server put our toplevel in a desktop window, so stay alive and
+     * keep servicing the connection — otherwise the client exits immediately
+     * and the window is torn down before anyone can see it. */
+    int keep = (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'w');
+
     struct wl_display *dpy = wl_display_connect(NULL);
     if (!dpy) {
         printf("wlupstream: wl_display_connect failed "
@@ -181,6 +187,15 @@ int main(void)
     ok = configured;
     printf("wlupstream: %s — UPSTREAM libwayland-client drove a real "
            "xdg_toplevel + shm buffer on d-os\n", ok ? "PASS" : "FAIL");
+
+    if (keep) {
+        printf("wlupstream: window is up — holding the connection open\n");
+        for (int i = 0; i < 200; i++) {
+            if (wl_display_roundtrip(dpy) < 0) break;
+            struct timespec ts = { 0, 100 * 1000000L };   /* 100 ms */
+            nanosleep(&ts, NULL);
+        }
+    }
 
 out:
     wl_display_disconnect(dpy);

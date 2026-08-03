@@ -4033,9 +4033,29 @@ the console and deliberately absent from the table (`fd_lookup` rejects them,
 `fd_install` starts at 3) — a dup must obey the same convention or it returns
 something that looks valid and can never be looked up again.
 
-**Open:** a visible window through the WM bridge (the surface is committed but
-not yet mapped onto a `gui_window`), and a real toolkit (Mesa `llvmpipe` +
-GTK/Qt/SDL).
+#### Stage 3 — the surface IS a desktop window
+
+`wayupstream win` runs the connection in the server-per-surface `wm_mode` the
+§M26 `waycomp` demo established, so the upstream client's `xdg_toplevel` becomes
+a real desktop window: title bar, taskbar button, and the client's pixels as its
+contents.  Verified by screenshot on both arches.
+
+Two things had to move for it to look like an application rather than a demo:
+
+- **The window is created at the FIRST COMMIT WITH CONTENT, not at
+  `get_toplevel`.**  Our configure says 0×0 — "you pick a size" — so at
+  `get_toplevel` the size is genuinely unknown; creating the window there meant
+  a fixed placeholder rectangle with the client's pixels in one corner.  New
+  `gui_window_outer_for_content()` turns the buffer size into the outer window
+  size, since the decoration thickness can no longer stay private to `gui.c`.
+- **The title is remembered until then.**  A client titles its toplevel *before*
+  it has any content, so `wl_conn.title` holds it and the window is created with
+  it (and retitled if it changes later).  Without this every application's
+  window said "Wayland client".
+
+**Open:** input from the window back into the client's `wl_seat` under wm_mode
+is wired but only exercised by the native demo; then a real toolkit (Mesa
+`llvmpipe` + GTK/Qt/SDL).
 
 ---
 

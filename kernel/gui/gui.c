@@ -811,6 +811,11 @@ int gui_widget_focused(struct widget* w) {
     return w && w->win && w->win->focusw == w;
 }
 
+void gui_window_outer_for_content(int cw, int ch, int* ow, int* oh) {
+    if (ow) *ow = cw + 2 * BORDER;
+    if (oh) *oh = ch + TITLE_H + BORDER;
+}
+
 int gui_window_content_size(struct gui_window* win, int* w, int* h) {
     if (!win) return -1;
     if (w) *w = win->surf.w;
