@@ -28,6 +28,7 @@
 #include "syscall.h"
 #include "idt.h"
 #include "task.h"
+#include "percpu.h"     /* smp_ncpus — sched_getaffinity */
 #include "printf.h"
 #include "hal_api.h"
 #include "vfs.h"
@@ -124,6 +125,11 @@ extern uint64_t saved_rip;
 #define LNX_access           21
 #define LNX_faccessat       269
 #define LNX_madvise          28
+#define LNX_mincore          27
+/* Mesa sizes its thread pools from the CPU affinity mask; a bare -ENOSYS makes
+ * it compute a nonsense CPU count and then dereference null. */
+#define LNX_sched_setaffinity 203
+#define LNX_sched_getaffinity 204
 #define LNX_nanosleep        35
 #define LNX_clock_nanosleep 230
 #define LNX_sched_yield      24
@@ -750,6 +756,29 @@ static void linux_syscall_body(struct int_frame* f) {
             f->rax = (lnx_stat_upath((uintptr_t)path, &k) != 0) ? (uint64_t)-LNX_ENOENT : 0;
             return;
         }
+        case LNX_sched_setaffinity:
+            f->rax = 0;                    /* accepted; d-os schedules its own */
+            return;
+        case LNX_sched_getaffinity: {
+            /* getaffinity(pid, cpusetsize, mask) → BYTES written, mask filled.
+             * Report the CPUs this task may actually run on; a caller that gets
+             * an empty or error answer concludes there are zero CPUs. */
+            size_t cap = (size_t)a1;
+            if (!a2 || cap < sizeof(unsigned long)) {
+                f->rax = (uint64_t)-LNX_EINVAL; return;
+            }
+            if (!lnx_w_ok(a2, sizeof(unsigned long))) {
+                f->rax = (uint64_t)-LNX_EFAULT; return;
+            }
+            int n = smp_ncpus();
+            if (n <= 0) n = 1;
+            if (n > 64) n = 64;
+            unsigned long m = (n >= 64) ? ~0UL : ((1UL << n) - 1UL);
+            *(unsigned long*)a2 = m;
+            f->rax = sizeof(unsigned long);
+            return;
+        }
+        case LNX_mincore:      /* Mesa probes residency; "not resident" is fine */
         case LNX_madvise:
             /* Purely advisory (MADV_*) — safe to accept and ignore. */
             f->rax = 0;

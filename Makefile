@@ -370,6 +370,15 @@ else ifeq ($(ARCH),x86_64)
       ARCH_EXTRA_OBJS += user/simpleshm_muslblob.o
     endif
   endif
+  # §M40 (x86_64) — the Mesa software-GL runtime + the EGL triangle, once Mesa
+  # has been built for this arch.
+  ifneq ($(wildcard third_party/mesa-$(ARCH)/lib/dri/swrast_dri.so),)
+    ARCH_EXTRA_OBJS += user/libEGL_so_blob.o user/libGLESv2_so_blob.o \
+                       user/libglapi_so_blob.o user/libexpat_so_blob.o \
+                       user/libdrm_so_blob.o user/swrast_dri_so_blob.o \
+                       user/mesaz_so_blob.o user/libwlclient_so_blob.o \
+                       user/egltri_dynblob.o
+  endif
   # §M43 (x86_64) — the on-device C compiler (`make tcc ARCH=x86_64`).
   TINYCC_PREFIX := third_party/tinycc-x86_64
   ifneq ($(wildcard $(TINYCC_PREFIX)/bin/tcc),)
@@ -974,7 +983,7 @@ $(FFI_PREFIX)/lib/libffi.a:
 	rm -rf /tmp/ffi && cp -a $(FFI_DIR) /tmp/ffi
 	cd /tmp/ffi && CC=$(CURDIR)/$(MUSL_ELF_CC) ./configure \
 	    --host=$(MUSL_TRIPLE) --prefix=$(CURDIR)/$(FFI_PREFIX) \
-	    --disable-shared --enable-static --disable-docs >/dev/null
+	    --disable-shared --enable-static --disable-docs --with-pic >/dev/null
 	$(MAKE) -C /tmp/ffi -j4 >/dev/null
 	$(MAKE) -C /tmp/ffi install >/dev/null
 	rm -rf /tmp/ffi
@@ -998,7 +1007,11 @@ $(WL_PREFIX)/lib/libwayland-client.a: $(FFI_PREFIX)/lib/libffi.a
 	# Protocol -> C.  `private-code` emits the interface TABLES (the symbols the
 	# library and every client share); `client-header` emits the typed proxy
 	# wrappers an application actually calls.
-	wayland-scanner private-code   /tmp/wl/protocol/wayland.xml $(WL_GEN)/wayland-protocol.c
+	# PUBLIC code for the core protocol: `private-code` hides the interface
+	# symbols (wl_surface_interface & co), which is right for a program that
+	# links the tables privately and wrong for a SHARED library that has to
+	# export them to its users — real libwayland-client.so exports them too.
+	wayland-scanner public-code    /tmp/wl/protocol/wayland.xml $(WL_GEN)/wayland-protocol.c
 	wayland-scanner client-header  /tmp/wl/protocol/wayland.xml $(WL_GEN)/wayland-client-protocol.h
 	wayland-scanner private-code   $(XDG_XML) $(WL_GEN)/xdg-shell-protocol.c
 	wayland-scanner client-header  $(XDG_XML) $(WL_GEN)/xdg-shell-client-protocol.h
@@ -1023,12 +1036,33 @@ $(WL_PREFIX)/lib/libwayland-client.a: $(FFI_PREFIX)/lib/libffi.a
 	    -I/tmp/wl/src -I$(WL_GEN) $(WL_GEN)/xdg-shell-protocol.c \
 	    -o $(WL_GEN)/xdg-shell-protocol.o
 	rm -rf $(WL_PREFIX) && mkdir -p $(WL_PREFIX)/lib $(WL_PREFIX)/include
+	# libwayland-egl lives in the WAYLAND tree, not Mesa's (it moved years ago).
+	# An EGL application calls wl_egl_window_create(); libEGL reads the resulting
+	# struct through the wayland-egl-backend ABI.
+	$(MUSL_ELF_CC) -c -Os -fPIC -std=gnu99 -I/tmp/wl -I/tmp/wl/src \
+	    -I$(CURDIR)/$(WL_GEN) /tmp/wl/egl/wayland-egl.c -o $(WL_GEN)/wayland-egl.o
 	for f in wayland-server event-loop wayland-shm; do \
 	    $(MUSL_ELF_CC) -c -Os -fPIC -std=gnu99 \
 	        -I/tmp/wl -I/tmp/wl/src -I$(CURDIR)/$(WL_GEN) \
 	        -I$(CURDIR)/$(FFI_PREFIX)/include \
 	        /tmp/wl/src/$$f.c -o $(WL_GEN)/$$f.o || exit 1; \
 	done
+	# libwayland-client must be SHARED.  Mesa links it into libEGL.so, and the
+	# application links it too — with a static archive each ends up with its OWN
+	# copy of libwayland's object tables, so an event demarshalled by one refers
+	# to proxies registered in the other's table.  That crashes in
+	# wl_connection_demarshal with a null interface, which is exactly the fault
+	# this cost an afternoon to find.  One shared instance, one table.
+	$(MUSL_ELF_CC) -shared -Wl,-soname,libwayland-client.so.0 \
+	    -o $(WL_PREFIX)/lib/libwayland-client.so.0 \
+	    $(WL_GEN)/connection.o $(WL_GEN)/wayland-client.o $(WL_GEN)/wayland-os.o \
+	    $(WL_GEN)/wayland-util.o $(WL_GEN)/wayland-protocol.o \
+	    $(FFI_PREFIX)/lib/libffi.a
+	ln -sf libwayland-client.so.0 $(WL_PREFIX)/lib/libwayland-client.so
+	# xdg-shell is a wayland-protocols EXTENSION, not part of libwayland: every
+	# client links its tables itself, so it stays private and out of the .so.
+	$(MUSL_AR) rcs $(WL_PREFIX)/lib/libxdg-shell.a $(WL_GEN)/xdg-shell-protocol.o
+	$(MUSL_AR) rcs $(WL_PREFIX)/lib/libwayland-egl.a $(WL_GEN)/wayland-egl.o
 	$(MUSL_AR) rcs $(WL_PREFIX)/lib/libwayland-server.a \
 	    $(WL_GEN)/wayland-server.o $(WL_GEN)/event-loop.o $(WL_GEN)/wayland-shm.o \
 	    $(WL_GEN)/connection.o $(WL_GEN)/wayland-os.o $(WL_GEN)/wayland-util.o \
@@ -1045,14 +1079,21 @@ $(WL_PREFIX)/lib/libwayland-client.a: $(FFI_PREFIX)/lib/libffi.a
 	# pkg-config metadata.  Mesa (and any meson-built consumer) discovers
 	# wayland through pkg-config, not by guessing paths, so a hand-built library
 	# without a .pc is invisible to it however correct the .a is.
-	cp $(WL_DIR)/egl/wayland-egl-backend.h $(WL_PREFIX)/include/
+	#
+	# The .pc names the SHARED library by absolute path, not `-lwayland-client`.
+	# The static archive still exists beside it for the static clients that link
+	# it explicitly, and with both present a plain -l left Mesa linking its own
+	# private copy of libwayland into libEGL.so — two object tables in one
+	# process, and a null-interface crash in wl_connection_demarshal.
+	cp $(WL_DIR)/egl/wayland-egl-backend.h $(WL_DIR)/egl/wayland-egl.h \
+	   $(WL_DIR)/egl/wayland-egl-core.h $(WL_PREFIX)/include/
 	mkdir -p $(WL_PREFIX)/lib/pkgconfig
 	printf '%s\n' \
 	  'prefix=$(CURDIR)/$(WL_PREFIX)' 'libdir=$${prefix}/lib' \
 	  'includedir=$${prefix}/include' '' \
 	  'Name: Wayland Client' 'Description: Wayland client side library' \
 	  'Version: 1.22.0' 'Cflags: -I$${includedir}' \
-	  'Libs: -L$${libdir} -lwayland-client' \
+	  'Libs: $${libdir}/libwayland-client.so.0' \
 	  > $(WL_PREFIX)/lib/pkgconfig/wayland-client.pc
 	printf '%s\n' \
 	  'prefix=$(CURDIR)/$(WL_PREFIX)' 'includedir=$${prefix}/include' '' \
@@ -1068,7 +1109,7 @@ $(WL_PREFIX)/lib/libwayland-client.a: $(FFI_PREFIX)/lib/libffi.a
 	  'includedir=$${prefix}/include' '' \
 	  'Name: Wayland Server' 'Description: Wayland server side library' \
 	  'Version: 1.22.0' 'Cflags: -I$${includedir}' \
-	  'Libs: -L$${libdir} -lwayland-server' \
+	  'Libs: -L$${libdir} -lwayland-server -L$(CURDIR)/$(FFI_PREFIX)/lib -lffi' \
 	  > $(WL_PREFIX)/lib/pkgconfig/wayland-server.pc
 	rm -rf /tmp/wl
 	@echo "libwayland-client ($(ARCH)) → $(WL_PREFIX)/lib/"
@@ -1398,6 +1439,50 @@ user/simpleshm.muslelf: $(WESTON_DIR)/clients/simple-shm.c \
 	    $(WESTON_DIR)/shared/os-compatibility.c \
 	    $(WL_GEN)/fullscreen-shell-protocol.c \
 	    -o $@ $(WL_PREFIX)/lib/libwayland-client.a $(FFI_PREFIX)/lib/libffi.a
+
+# §M40 — egltri: the EGL + GLES2 triangle, the milestone's remaining DoD.
+#
+# DYNAMICALLY linked, unlike every other §M40 client: Mesa's libEGL and
+# libGLESv2 are shared objects and libEGL dlopen()s the DRI driver on top of
+# that, so there is no static option.  This is the §M37 path (PT_INTERP + our
+# ld.so), the same one NetSurf uses.
+MESA_PREFIX := third_party/mesa-$(ARCH)
+DRM_PREFIX  := third_party/libdrm-$(ARCH)
+
+# The Mesa runtime, embedded so pkg.c can lay it into d-os's /lib at boot.
+# Each is copied to an arch-agnostic user/ path first, because objcopy derives
+# the blob's symbol name from the input path (the same convention every other
+# .so here follows).
+define MESA_SO_BLOB
+$(OBJ_DIR)/user/$(2)_blob.o: $(3)
+	@mkdir -p $$(@D)
+	cp $(3) user/$(2)
+	objcopy --input-target=binary $$(USER_OCARGS) user/$(2) $$@
+	rm -f user/$(2)
+endef
+$(eval $(call MESA_SO_BLOB,,libEGL_so,$(MESA_PREFIX)/lib/libEGL.so.1.0.0))
+$(eval $(call MESA_SO_BLOB,,libGLESv2_so,$(MESA_PREFIX)/lib/libGLESv2.so.2.0.0))
+$(eval $(call MESA_SO_BLOB,,libglapi_so,$(MESA_PREFIX)/lib/libglapi.so.0.0.0))
+$(eval $(call MESA_SO_BLOB,,libexpat_so,$(MESA_PREFIX)/lib/libexpat.so.1.6.7))
+$(eval $(call MESA_SO_BLOB,,libdrm_so,$(DRM_PREFIX)/lib/libdrm.so.2.4.0))
+$(eval $(call MESA_SO_BLOB,,swrast_dri_so,$(MESA_PREFIX)/lib/dri/swrast_dri.so))
+# Mesa's own zlib subproject build: the DRI driver has a DT_NEEDED on plain
+# `libz.so`, which is a different soname from the `libz.so.1` the NetSurf stack
+# installs, so it needs its own copy rather than a symlink to that one.
+$(eval $(call MESA_SO_BLOB,,mesaz_so,$(MESA_PREFIX)/lib/libz.so))
+# The shared libwayland-client both libEGL and the application link against.
+$(eval $(call MESA_SO_BLOB,,libwlclient_so,$(WL_PREFIX)/lib/libwayland-client.so.0))
+
+user/egltri.dynelf: user/egltri.c $(WL_PREFIX)/lib/libwayland-client.a \
+                    $(MESA_PREFIX)/lib/libEGL.so
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -fPIC -pie -Os -Wall -Wl,-dynamic-linker,$(DOS_LDSO) \
+	    -I$(WL_PREFIX)/include -I$(MESA_PREFIX)/include \
+	    user/egltri.c -o $@ \
+	    -L$(MESA_PREFIX)/lib -lEGL -lGLESv2 -lglapi -lexpat \
+	    -L$(CURDIR)/third_party/libdrm-$(ARCH)/lib -ldrm \
+	    $(WL_PREFIX)/lib/libwayland-egl.a $(WL_PREFIX)/lib/libxdg-shell.a \
+	    -L$(WL_PREFIX)/lib -lwayland-client
 
 # §M40 — the upstream-libwayland client.  Its own rule (not the generic
 # %.muslelf) because it links libwayland-client + libffi and needs the generated

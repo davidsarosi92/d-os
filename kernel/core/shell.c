@@ -2293,6 +2293,27 @@ static void cmd_waykeymap(void) {
     ofile_unref(km);
 }
 
+/* §M40 — `egltri [win]`: the EGL + GLES2 triangle, the milestone's DoD.
+ * Dynamically linked (Mesa is shared objects), so it needs LIBGL_DRIVERS_PATH
+ * pointing at the provisioned rasteriser in addition to WAYLAND_SOCKET. */
+extern const unsigned char _binary_user_egltri_dynelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_egltri_dynelf_end[]   __attribute__((weak));
+
+static void cmd_egltri(const char* args) {
+    const unsigned char* sp = _binary_user_egltri_dynelf_start;
+    if (!sp) {
+        console_write("egltri: not embedded — build Mesa first "
+                      "(see DOCS §4.40)\n");
+        return;
+    }
+    int windowed = (args && (args[0] == 'w' || args[0] == 'W'));
+    const char* argv[] = { "egltri" };
+    console_write("egltri: running an EGL + GLES2 client (Mesa swrast)...\n");
+    proc_set_exec_env("LIBGL_DRIVERS_PATH=/lib/dri");
+    run_upstream_wl("egltri", sp, _binary_user_egltri_dynelf_end,
+                    windowed, 1, argv);
+}
+
 static void cmd_simpleshm(const char* args) {
     const unsigned char* sp = _binary_user_simpleshm_muslelf_start;
     if (!sp) {
@@ -2712,6 +2733,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "waywin"))         { wl_window_demo();   return; }
     if (streq(line, "wayinput"))       { wl_input_demo();    return; }
     if (streq(line, "wayclient"))      { cmd_wayclient();    return; }
+    if (streq(line, "egltri"))         { cmd_egltri(""); return; }
+    if (starts_with(line, "egltri "))  { cmd_egltri(line + 7); return; }
     if (streq(line, "waykeymap"))      { cmd_waykeymap(); return; }
     if (streq(line, "simpleshm"))      { cmd_simpleshm(""); return; }
     if (starts_with(line, "simpleshm "))   { cmd_simpleshm(line + 10); return; }

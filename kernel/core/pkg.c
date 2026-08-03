@@ -631,6 +631,25 @@ extern const unsigned char _binary_user_ldmusl_so_end[]        __attribute__((we
 
 /* §M37 stage 5: a separate shared library, provisioned at /lib/libgreet.so so
  * ld.so can resolve a program's DT_NEEDED "libgreet.so" via the search path. */
+/* §M40 — Mesa's software-GL runtime (weak: present only once `make wayland` +
+ * the Mesa build have run for this arch). */
+extern const unsigned char _binary_user_libEGL_so_start[]      __attribute__((weak));
+extern const unsigned char _binary_user_libEGL_so_end[]        __attribute__((weak));
+extern const unsigned char _binary_user_libGLESv2_so_start[]   __attribute__((weak));
+extern const unsigned char _binary_user_libGLESv2_so_end[]     __attribute__((weak));
+extern const unsigned char _binary_user_libglapi_so_start[]    __attribute__((weak));
+extern const unsigned char _binary_user_libglapi_so_end[]      __attribute__((weak));
+extern const unsigned char _binary_user_libexpat_so_start[]    __attribute__((weak));
+extern const unsigned char _binary_user_libexpat_so_end[]      __attribute__((weak));
+extern const unsigned char _binary_user_libdrm_so_start[]      __attribute__((weak));
+extern const unsigned char _binary_user_libdrm_so_end[]        __attribute__((weak));
+extern const unsigned char _binary_user_mesaz_so_start[]       __attribute__((weak));
+extern const unsigned char _binary_user_mesaz_so_end[]         __attribute__((weak));
+extern const unsigned char _binary_user_libwlclient_so_start[] __attribute__((weak));
+extern const unsigned char _binary_user_libwlclient_so_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_swrast_dri_so_start[]  __attribute__((weak));
+extern const unsigned char _binary_user_swrast_dri_so_end[]    __attribute__((weak));
+
 extern const unsigned char _binary_user_libgreet_so_start[]    __attribute__((weak));
 extern const unsigned char _binary_user_libgreet_so_end[]      __attribute__((weak));
 
@@ -795,6 +814,46 @@ static void ldso_provision(void) {
     /* Aux runtime libraries (the DT_NEEDED search-path test lib + the C++
      * runtime) are still provisioned directly to /lib for now; folding them
      * into store packages the same way is a follow-up. */
+    /* §M40 — the Mesa software-GL runtime.  Laid straight into /lib (and
+     * /lib/dri for the rasteriser, which libEGL dlopen()s rather than links)
+     * so an EGL client's DT_NEEDED chain resolves: libEGL → libglapi + libexpat
+     * + libdrm → libc.  Folding these into store packages is the same follow-up
+     * the other aux libraries are waiting on. */
+    {
+        struct { const unsigned char* s; const unsigned char* e; const char* path; }
+        mesa[] = {
+            { _binary_user_libEGL_so_start,      _binary_user_libEGL_so_end,      "/lib/libEGL.so.1"     },
+            { _binary_user_libGLESv2_so_start,   _binary_user_libGLESv2_so_end,   "/lib/libGLESv2.so.2"  },
+            { _binary_user_libglapi_so_start,    _binary_user_libglapi_so_end,    "/lib/libglapi.so.0"   },
+            { _binary_user_libexpat_so_start,    _binary_user_libexpat_so_end,    "/lib/libexpat.so.1"   },
+            { _binary_user_libdrm_so_start,      _binary_user_libdrm_so_end,      "/lib/libdrm.so.2"     },
+            /* The DRI driver's DT_NEEDED is plain `libz.so`, a different soname
+             * from the `libz.so.1` the NetSurf stack installs — so it gets its
+             * own copy rather than sharing that one. */
+            { _binary_user_mesaz_so_start,       _binary_user_mesaz_so_end,       "/lib/libz.so"         },
+            /* ONE shared libwayland-client for the whole process: libEGL links
+             * it and so does the application, and with a static archive each
+             * would get its own object tables — an event demarshalled by one
+             * then refers to proxies registered in the other's. */
+            { _binary_user_libwlclient_so_start, _binary_user_libwlclient_so_end, "/lib/libwayland-client.so.0" },
+        };
+        int any = 0;
+        for (unsigned i = 0; i < sizeof mesa / sizeof mesa[0]; i++) {
+            if (!mesa[i].s) continue;
+            write_file(mesa[i].path, mesa[i].s, blob_len(mesa[i].s, mesa[i].e));
+            any = 1;
+        }
+        if (_binary_user_swrast_dri_so_start) {
+            vfs_mkdir("/lib/dri");
+            write_file("/lib/dri/swrast_dri.so", _binary_user_swrast_dri_so_start,
+                       blob_len(_binary_user_swrast_dri_so_start,
+                                _binary_user_swrast_dri_so_end));
+            any = 1;
+        }
+        if (any) kprintf("mesa: software GL runtime provisioned "
+                         "(/lib/libEGL.so.1 + /lib/dri/swrast_dri.so)\n");
+    }
+
     /* A separate shared library for the DT_NEEDED search-path test (stage 5). */
     if (_binary_user_libgreet_so_start)
         write_file("/lib/libgreet.so", _binary_user_libgreet_so_start,
