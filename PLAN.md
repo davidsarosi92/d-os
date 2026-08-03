@@ -54,7 +54,7 @@
 | §M23 | Audio subsystem — ✅ stage 1 (i386): AC97 PCM output + tone (DOCS §4.26) | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) — ✅ stages 1–3 (i386): virtio-net + ARP/IPv4/ICMP/UDP/TCP + DNS + ping/wget (DOCS §4.25) | ~1080 |
 | §M25 | Userland foundation (Wayland prerequisites) — ✅ stages 1–7 + Tier B tail (concurrent user processes + full-arch libc; DOCS §4.24) | ~1545 |
-| §M26 | Wayland server (wire protocol on M22 + M25) — ✅ core + integration (i386+x86_64, DOCS §4.32): handshake + shm buffers (SCM_RIGHTS) + xdg_shell + framebuffer/gui_window bridge + wl_seat input + a real ring-3 client + **server-per-surface** (`waycomp`: a client's toplevel IS a desktop window, input routed to its wl_seat) + a **mini-libwayland client lib** (`user/libwl`, `wayapp`). Only upstream libwayland (unmodified apps) left → §M40 | ~1615 |
+| §M26 | Wayland server (wire protocol on M22 + M25) — ✅ core + integration (i386+x86_64, DOCS §4.32): handshake + shm buffers (SCM_RIGHTS) + xdg_shell + framebuffer/gui_window bridge + wl_seat input + a real ring-3 client + **server-per-surface** (`waycomp`: a client's toplevel IS a desktop window, input routed to its wl_seat) + a **mini-libwayland client lib** (`user/libwl`, `wayapp`). Upstream libwayland + unmodified apps landed in §M40 | ~1615 |
 | §M27 | Process model — init, hierarchy, reaper, kill-tree — ✅ shipped | ~1818 |
 | §M28 | System log (klog ring buffer + dmesg) — ✅ shipped | ~1860 |
 | Tier A | Blocking primitives — wait-queue + task_wait + blocking IPC — ✅ shipped (DOCS §4.20) | — |
@@ -70,14 +70,30 @@
 | §M37 | Dynamic linking — ld.so / `.so` / dlopen — ✅ shipped (i386, DOCS §4.33): shared musl (libc.so=ld.so) + ET_DYN/PIE loader + PT_INTERP + full auxv + full mmap2/mprotect/fstat64; dynamic hello, separate .so (DT_NEEDED + .so __thread), dlopen all green | — |
 | §M38 | C++ runtime + support libs — ◐ runtime shipped (i386, DOCS §4.34): musl-cross-make g++ 11.2.0 + libstdc++; `cpptest` throws+catches across a `.so` (DWARF unwind) + STL, dynamically linked.  Support libs (zlib/freetype/harfbuzz/ICU/Skia) still open | — |
 | §M39 | Crypto + entropy + TLS + DNS — ◐ stages 1–3b shipped (i386, DOCS §4.35): ChaCha20 CSPRNG + /dev/urandom + getrandom (arch-generic); Mbed TLS v3.6.2 (`crypttest` SHA-256+AES-GCM); **verified TLS 1.3** handshake (`ssltest`); **stage 3b = REAL HTTPS** — musl `socketcall`→M24 sockets (`netmusl`), `httpstest` = DNS→TCP:443→TLS 1.3 handshake→Mozilla CA bundle at /etc/ssl/cert.pem→VERIFY_REQUIRED (flags 0x0)→HTTP 200.  **stage 3c** = musl `getaddrinfo` runs natively (recvmsg/sendmsg/poll in linux_abi → `httpstest` resolves via real musl resolver) + a userland `wget` (http+https over mbedTLS, argv URL).  Open: DHCP resolv.conf, x86_64/aarch64 | — |
-| §M40 | Client graphics stack — Wayland client + EGL/GL (Mesa swrast) + Skia | — |
+| **§M40** | **Client graphics stack** — ◐ **the Wayland-client half SHIPPED** (i386 + x86_64, DOCS §4.40): UPSTREAM libwayland-client cross-built for musl (+ libffi, `wayland-scanner` on the host, vendored tree pristine); connects via `WAYLAND_SOCKET`; drives a real `xdg_toplevel` + shm buffer; the surface IS a desktop window sized to the client's buffer; real desktop input reaches its `wl_seat`; `wl_output` + `wl_surface.frame` added (the two globals a toolkit refuses to start without).  **DoD half met: `weston-simple-shm` — an UNMODIFIED upstream application — animates continuously in a d-os window.**  Open: EGL/GLES2 via Mesa `llvmpipe` (needs LLVM), then a full toolkit | — |
 | §M41 | Linux syscall ABI shim — optional binary-compat accelerator | — |
 | §M42 | Web browser bring-up — NetSurf → WebKit → Firefox/Chromium (north star) — ◐ IN PROGRESS (**x86_64 + i386**): Tier-1 NetSurf component libs (wapcaplet/parserutils/hubbub/css/dom/nsgif/nsbmp) + runway libs (nsutils/nslog/nspsl/**nsfb** framebuffer surface) all ported + running as store pkgs; **the NetSurf BINARY compiles + links + RUNS** — a 915 KB musl dynamic PIE (`make netsurf`); `netsurf [url]` shell cmd execs it under linux-abi, `/res` (resources+TTF+Messages) provisioned at boot; `netsurf` (0 unhandled syscalls) RENDERS a real page (`about:welcome` — text, links, fonts, layout) into a **WM-managed desktop window** via the display bridge (`kernel/gui/dosgui.c` + a libnsfb `dos` surface backend + `gui_window_blit`); a **Start-menu "NetSurf" launcher** (`GUI_APP`) opens it.  **Ported to i386 too** (same lib stack rebuilt with the musl-cross-i686 toolchain; linux_abi grew i386 readlink/access/madvise/stat64/statx/uname/rt_sigaction + the DOSGUI syscalls via int 0x80).  Verified by framebuffer screendump on BOTH arches.  i386 musl **unified to 1.2.5** (the musl-cross-i686 toolchain's musl rebuilt to match the 1.2.5 runtime the kernel provisions; `MUSL_VER=1.2.5` pinned in the Makefile).  Two i386 runtime bugs fixed: a triple-fault (heavy pkg_init ran on the shell task's small stack → moved to the boot task) and a GUI freeze (NetSurf busy-spun → added nanosleep/sched_yield + a yielding `dos_input`).  Left: network fetch (a `dos` fetcher over M24+mbedTLS) → `https://` pages; NetSurf window UX (close button, minimize/restore, click/type input — it bypasses the M22.7 app-host loop) | — |
 | §M43 | Native developer toolchain (self-hosting) — ◐ first slice shipped (i386, DOCS §4.36): **TinyCC compiles + runs C ON d-os** (`tcc`/`exec` shell cmds + Editor "Run" button).  Full gcc/clang self-hosting + binutils/make still open | — |
 | §M44 | Language ecosystems — Rust / C++ / .NET (NativeAOT→CoreCLR) / Java (JVM); run cross-built musl binaries, then per-runtime ports | — |
 | §M45 | Package manager frontend + GUI installer — apt-like UX + wizard over the §M35.5 store; remote repo over §M39 TLS; driver/module hot-swap via §M33 | — |
 | **§M46** | **Resilient control plane + freeze-freeness** — ✅ **SHIPPED** (i386 + x86_64, aarch64 parity; DOCS §4.37): ring-3 fault ⇒ kill just the process (all 3 arches); real force-kill of a WEDGED ring-3 task at the timer preemption boundary (`fkill`, Task Manager "Force kill", opt-in `package.auto_fkill_ms` runaway policy); ib700 HW watchdog + NMI hard-lockup recovery + deadlock reporting on COM1; Ctrl+Alt+Del / Ctrl+Alt+X trapped in the keyboard IRQ (work while an app is frozen), window X force-kills an unresponsive client; the ring-3 pointer boundary closed with a per-syscall gate **and** a real exception table (`.ex_table` + `uaccess_*`, `faulttest`); dosgui handles owner-bound + blits range-checked; sigreturn EFLAGS sanitised; `sys_kill` restricted to the caller's subtree; x86_64 real COW; ACPI tables above the identity map mapped on demand | — |
-| **§M47** | **Crash records & reporting** — ✅ **SHIPPED** (i386 + x86_64, aarch64 parity; DOCS §4.38): fault-safe capture into a static ring (`crash_report`, no locks/alloc/IO) + deferred delivery on an ordinary task (`crash_drain`) + a `CRASH_SINK()` registry, so ANY reporting mechanism can be armed later WITHOUT touching a fault path.  Sinks: `klog` (always on) + `gui-report` (the Crash Reports window, gated by `crash.report`).  Surfaces: `crash`, `/proc/crash`, the system log, the GUI window.  A triple fault / power loss — the one event nothing in the guest can log — is reported on the NEXT boot from a CMOS NVRAM marker + a 40-byte checksummed breadcrumb of the last record (kind/pid/pc/addr/code/uptime/comm) | — |
+| **§M47** | **Crash records & reporting** — ✅ **SHIPPED** (i386 + x86_64, aarch64 parity; DOCS §4.38): fault-safe capture into a static ring (`crash_report`, no locks/alloc/IO) + deferred delivery on an ordinary task (`crash_drain`) + a `CRASH_SINK()` registry, so ANY reporting mechanism can be armed later WITHOUT touching a fault path.  Sinks: `klog` (always on) + `gui-report` (the Crash Reports window, gated by `crash.report`).  Surfaces: `crash`, `/proc/crash`, the system log, the GUI window.  A triple fault / power loss — the one event nothing in the guest can log — is reported on the NEXT boot from a CMOS NVRAM marker + a 40-byte checksummed breadcrumb of the last record (kind/pid/pc/addr/code/uptime/comm).  **Stage 2**: `/proc/crash` + the Crash
+Reports GUI window (a sink, not a fault-path change) + a wider breadcrumb.
+**§M47.1**: closing a window is not a crash — the X asks first, a SECOND X click
+forces (`gui.close_grace_ms` is only the unattended backstop); `wedgewin` is the
+automated test M46's "chrome works when the app is frozen" guarantee never had.
+**§M47.2**: `linux_syscall_dispatch` never armed `task->in_user_syscall`, so
+M46's per-syscall pointer gate was OFF for the ENTIRE musl userland — now armed
+on both arches | — |
+| **§M47.5** | **x86_64 userland parity** — ✅ **SHIPPED** (DOCS §4.39): musl
+coreutils + `sh`, ring-3 sockets, threads/TLS/signals, Mbed TLS (TLSv1.3 + HTTPS
+w/ CA verify + `wget`), on-device TinyCC.  The gap was DUPLICATION, not missing
+kernel support: objcopy blob symbols carried the arch in their NAME, the program
+lists were written twice, and the x86_64 dispatcher stopped at M25.  Four 32-bit
+assumptions fixed (crt0 argv, thread-arg passing, TLS segment+offset, missing
+virtio-net/AC97).  Also fixed musl `getaddrinfo` on both arches (SOCK_NONBLOCK
+was discarded; `hostorder_to_sockaddr` validated a kernel word as a user
+pointer) | — |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -3738,11 +3754,22 @@ to a **display server** and renders through a GL/2D stack.  §M26 provides
 the Wayland *server*; this milestone provides the *client* side plus the
 rendering path the browser plugs into.
 
+**Status: the Wayland-client half is SHIPPED — see DOCS §4.40.**  Upstream
+libwayland-client is cross-built for musl (with libffi; `wayland-scanner` runs on
+the host and nothing generated is committed), connects over `WAYLAND_SOCKET`,
+drives a real `xdg_toplevel` with an shm buffer, gets its surface mapped to a
+desktop window and receives real input on its `wl_seat`.  `weston-simple-shm`,
+compiled unmodified out of the weston tree, animates in a d-os window — which
+means step 1 below is done and step 4's "a client is a Wayland client either way"
+premise is now demonstrated rather than assumed.  What remains of this milestone
+is steps 2–3: EGL/GL and a rasteriser.
+
 **Design.**
-1. **Wayland client** — `libwayland-client` over the §M25 unix-socket +
-   fd-passing + mmap substrate (the same primitives §M26's server uses);
-   `xkbcommon` for keymap handling; `wayland-protocols` (xdg-shell) so a
-   real client's surface/seat/keyboard/pointer wiring works.
+1. **Wayland client** — ✅ done (DOCS §4.40).  `libwayland-client` over the §M25
+   unix-socket + fd-passing + mmap substrate (the same primitives §M26's server
+   uses); `wayland-protocols` (xdg-shell) so a real client's surface/seat/
+   keyboard/pointer wiring works.  `xkbcommon` still open (we forward raw
+   keycodes; a toolkit that wants a keymap will need it).
 2. **Software GL** — **Mesa's software rasteriser** (`llvmpipe`/`swrast`)
    exposing EGL + GLES2/GL3, running purely on the CPU (no GPU driver
    needed — the pragmatic path; hardware GL is a much later, per-GPU
@@ -3773,11 +3800,12 @@ rendering path the browser plugs into.
    wants seat/output/maybe xdg-decoration).
 
 **Definition of done:**
-- A `weston-terminal`-class Wayland client (or `wpe`'s test app) runs
-  against the §M26 server: draws, takes keyboard + pointer input.
-- An EGL+GLES2 program clears + draws a triangle via `llvmpipe`, presented
+- ✅ A `weston-terminal`-class Wayland client runs against the §M26 server:
+  draws, takes keyboard + pointer input.  (`weston-simple-shm`, unmodified;
+  input verified via the pointer/keyboard listeners.)
+- 🔲 An EGL+GLES2 program clears + draws a triangle via `llvmpipe`, presented
   through a Wayland buffer.
-- DOCS.md "Client graphics stack" chapter.
+- ✅ DOCS.md chapter (§4.40).
 
 **Out of scope:** hardware GPU acceleration (per-GPU drivers — a north
 star of its own), Vulkan, X11/XWayland, DMA-BUF zero-copy (software
