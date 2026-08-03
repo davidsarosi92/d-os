@@ -165,10 +165,13 @@ struct gui_window {
     int  pending_w, pending_h;
     volatile int want_close;
 
-    /* §M47.1 — grace deadline for a CLIENT-MANAGED window's close.  Set on the
-     * first compositor pass that sees want_close; the client is force-killed
-     * only once it expires.  0 = no close in flight. */
+    /* §M47.1 — closing a CLIENT-MANAGED window is a TWO-CLICK escalation:
+     *   1st X click → want_close (a polite request the client should honour);
+     *   2nd X click → close_force_now (the user has decided it is hung).
+     * `close_deadline_ms` is only the unattended backstop, in case nobody is
+     * there to click a second time.  0 = no close in flight. */
     uint64_t close_deadline_ms;
+    volatile int close_force_now;
 };
 
 static struct gui_window windows[GUI_MAX_WINDOWS];
@@ -206,14 +209,20 @@ static struct gfx_surface fbsurf, backsurf, wallsurf;
 static int work_h = 0;                  /* screen minus shell chrome     */
 static int gmax_cols = 0, gmax_rows = 0;
 /* §M46 — see gui_start: X on a package window force-kills a wedged client.
- * §M47.1 — but only after a GRACE PERIOD.  Killing on the first compositor pass
- * meant the X button never gave the client the chance to notice the close event
- * and quit by itself, so an ordinary "close the browser" was reported as a
+ * §M47.1 — but that is the FALLBACK, not the close path.  Killing on the first
+ * compositor pass meant the X never gave the client a chance to notice the close
+ * event and quit by itself, so an ordinary "close the browser" was reported as a
  * forced kill — a crash record, and (since §M47 stage 2) a Crash Reports window
- * popping up as though something had gone wrong.  The kill is the FALLBACK for a
- * wedged client, not the close path. */
+ * popping up as though something had gone wrong.
+ *
+ * The escalation is now the USER's, which is the familiar desktop contract:
+ *   1st X click → ask the client to close;
+ *   2nd X click → it clearly is not going to, so force it, immediately.
+ * `close_grace_ms` remains only as an UNATTENDED backstop for the case where
+ * nobody is there to click again, so it is deliberately generous — long enough
+ * that it never pre-empts a client that is merely slow to shut down. */
 static int close_forces_kill = 1;
-static unsigned close_grace_ms = 2000;
+static unsigned close_grace_ms = 10000;
 
 /* M22.6 — tear-free presentation via a Bochs-VBE double buffer (see
  * fb_terminal.c).  When `flip_ok`, compose() copies the dirty region from
@@ -1602,8 +1611,12 @@ static void apply_pending(void) {
                 win->host_released = 1;              /* nothing left to coordinate */
             } else if (close_forces_kill && !ct->kill_forced) {
                 uint64_t now = timer_ticks_ms();
-                if (!win->close_deadline_ms) {
-                    /* First pass: start the clock and let the client quit. */
+                if (win->close_force_now) {
+                    kprintf("gui: second close click on '%s' → force-killing "
+                            "client pid %d\n", win->title, win->client_pid);
+                    task_force_kill(win->client_pid);
+                } else if (!win->close_deadline_ms) {
+                    /* First pass: start the backstop and let the client quit. */
                     win->close_deadline_ms = now + close_grace_ms;
                 } else if (now >= win->close_deadline_ms) {
                     kprintf("gui: '%s' did not close within %ums → force-killing "
@@ -1633,6 +1646,7 @@ static void apply_pending(void) {
                     win->title, host ? host->pid : -1);
             win->want_close = 0;
     win->close_deadline_ms = 0;
+    win->close_force_now = 0;
             destroy_window(win);
             reap_gui_host(host);                /* reap once its last window is gone */
             continue;
@@ -1660,6 +1674,7 @@ static void apply_pending(void) {
             }
             win->want_close = 0;
     win->close_deadline_ms = 0;
+    win->close_force_now = 0;
             destroy_window(win);
             continue;
         }
@@ -1812,6 +1827,11 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
                             mx >= bx1 - 3 * CLOSE_W - 6 &&
                             mx <  bx1 - 2 * CLOSE_W - 6);
             if (in_close) {
+                /* Second click on an already-requested close = "force it".
+                 * Runs in the mouse IRQ, so this is a plain volatile store; the
+                 * compositor acts on it (task_force_kill takes locks we must
+                 * not take here). */
+                if (win->want_close) win->close_force_now = 1;
                 win->want_close = 1;
             } else if (in_max) {
                 toggle_maximize_locked(win);                 /* M22.5 */
@@ -2047,6 +2067,7 @@ static struct gui_window* window_alloc(const char* title, enum win_kind kind,
     win->pending_w = win->pending_h = 0;
     win->want_close = 0;
     win->close_deadline_ms = 0;
+    win->close_force_now = 0;
     win->widgets = NULL;  win->focusw = NULL;
     win->on_layout = NULL; win->on_close = NULL; win->app_ctx = NULL;
     win->cells = NULL; win->vc = NULL;
@@ -2218,11 +2239,10 @@ int gui_start(void) {
     {
         const char* v = config_get("gui.close_forces_kill", "1");
         close_forces_kill = (v && (v[0]=='1'||v[0]=='y'||v[0]=='t'||v[0]=='Y'));
-        /* How long a client-managed window's client gets to quit by itself
-         * before the X button escalates to a forced kill.  Long enough that a
-         * healthy app never hits it, short enough that a wedged one still goes
-         * away promptly. */
-        const char* g = config_get("gui.close_grace_ms", "2000");
+        /* The UNATTENDED backstop only — the primary escalation is the user's
+         * second click on the X (see close_force_now).  Generous on purpose: it
+         * must never pre-empt a client that is merely slow to shut down. */
+        const char* g = config_get("gui.close_grace_ms", "10000");
         unsigned ms = 0;
         for (const char* c = g; c && *c >= '0' && *c <= '9'; c++)
             ms = ms * 10u + (unsigned)(*c - '0');

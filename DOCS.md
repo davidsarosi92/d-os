@@ -3792,12 +3792,18 @@ perfectly healthy NetSurf was reported as *"unresponsive task reclaimed by
 force"*, wrote a crash record, and (once §M47 stage 2 landed) popped the Crash
 Reports window as though the browser had crashed.
 
-The kill is the **fallback for a wedged client, not the close path**.  A
-client-managed window now gets a grace deadline on the first pass
-(`gui.close_grace_ms`, default 2000 ms); the force-kill fires only after it
-expires.  A healthy client sees the close event, calls `DOSGUI_DESTROY`, and the
-window is disposed with no kill and no record.  M46's guarantee is unchanged: a
-frozen client still loses its window, just two seconds later.
+The kill is the **fallback for a wedged client, not the close path**, and the
+escalation belongs to the USER — the familiar desktop contract:
+
+| click | meaning |
+|-------|---------|
+| 1st X | *ask* the client to close.  A healthy one sees the close event, calls `DOSGUI_DESTROY`, and the window is disposed with **no kill and no crash record**. |
+| 2nd X | the window is still there, so it clearly is not going to close on its own — force it, **immediately**. |
+
+`gui.close_grace_ms` (default 10000 ms) survives only as the **unattended
+backstop**, for when nobody is there to click a second time; it is deliberately
+generous so it never pre-empts a client that is merely slow to shut down.
+M46's guarantee is unchanged — the X still always closes the window.
 
 **`wedgewin` — the test this guarantee never had.**  `wedge` proved a wedged
 ring-3 task can be reclaimed; nothing proved the thing a user actually
@@ -3808,10 +3814,11 @@ observed by it.  Verified on x86_64:
 
 | case | result |
 |------|--------|
-| NetSurf (healthy) — click X | window closes, **no** force-kill, **no** crash record |
-| `wedgewin` (frozen) — click X | `'Wedged App' did not close within 2000ms → force-killing client pid 18`, window disposed, forced-kill recorded, Crash Reports opens |
+| NetSurf (healthy) — one X click | window closes, **no** force-kill, **no** crash record |
+| `wedgewin` (frozen) — first X click | window **stays open** (the request was made and ignored) |
+| `wedgewin` (frozen) — second X click | `gui: second close click on 'Wedged App' → force-killing client pid 18`, window disposed, forced-kill recorded, Crash Reports opens |
 
-The second row is the correct outcome: that program really *was* unresponsive.
+The last row is the correct outcome: that program really *was* unresponsive.
 
 **Lesson (test-shape, worth keeping):** the pointer harness that drives these
 tests must step the mouse in ≤100 px hops — QEMU's PS/2 packet carries a signed
@@ -4037,10 +4044,10 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   title-bar X on NetSurf force-killed the client immediately and therefore
   recorded a crash + popped the Crash Reports window, as though the browser had
   died.  M46's force-kill is the fallback for a WEDGED client, not the close
-  path: a client-managed window now gets a grace deadline
-  (`gui.close_grace_ms`, default 2000 ms) and is only force-killed once it
-  expires.  Healthy clients close cleanly with no record; M46's "the X always
-  closes the window" guarantee is unchanged.  Adds `user/wedgewin.c` + the
+  path, and the escalation is the USER's: the FIRST X click asks the client to
+  close, the SECOND forces it immediately.  `gui.close_grace_ms` (now 10000 ms)
+  remains only as the unattended backstop.  Healthy clients close on one click
+  with no record; M46's "the X always closes the window" guarantee is unchanged.  Adds `user/wedgewin.c` + the
   `wedgewin` command — a client that opens a real window and then freezes,
   which is the automated test that guarantee never had (and whose absence is why
   the regression went unnoticed).  Both cases verified on x86_64.

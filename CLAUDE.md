@@ -39,7 +39,9 @@ the ISO date + keyboard layout, wallpaper label carries the arch
 force-killed a client-managed window's client on the FIRST compositor pass, so
 closing a healthy NetSurf was recorded as "unresponsive task reclaimed by force"
 and popped the Crash Reports window.  The kill is the FALLBACK for a wedged
-client: a grace deadline (`gui.close_grace_ms`, default 2000 ms) now precedes it.
+client, and the escalation is the USER's: **1st X click = ask, 2nd X click =
+force immediately**.  `gui.close_grace_ms` (10000 ms) is only the unattended
+backstop.
 New `wedgewin` cmd + `user/wedgewin.c` (a client that opens a window then
 freezes) is the automated test M46's "chrome works when the app is frozen"
 guarantee never had.  **Harness lesson:** step the QEMU mouse in <=100 px hops —
