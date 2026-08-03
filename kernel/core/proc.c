@@ -122,11 +122,19 @@ static void fill_at_random(uint8_t out[16], uint32_t frame_phys, uintptr_t stack
 void proc_set_exec_env(const char* kv) {
     struct task* t = task_current();
     if (!t) return;
-    int i = 0;
-    if (kv) while (kv[i] && i < (int)sizeof t->exec_extra_env - 1) {
-        t->exec_extra_env[i] = kv[i]; i++;
+    if (!kv || !kv[0]) {                     /* NULL/"" clears the whole set */
+        for (int s = 0; s < TASK_EXEC_ENV_MAX; s++) t->exec_extra_env[s][0] = '\0';
+        return;
     }
-    t->exec_extra_env[i] = '\0';
+    for (int s = 0; s < TASK_EXEC_ENV_MAX; s++) {
+        if (t->exec_extra_env[s][0]) continue;          /* occupied */
+        int i = 0;
+        while (kv[i] && i < (int)sizeof t->exec_extra_env[s] - 1) {
+            t->exec_extra_env[s][i] = kv[i]; i++;
+        }
+        t->exec_extra_env[s][i] = '\0';
+        return;
+    }
 }
 
 static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
@@ -159,13 +167,14 @@ static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
      * WAYLAND_SOCKET=<fd>, which is per-launch data and cannot live in a static
      * table; a full per-exec environ is the natural generalisation and this is
      * the seam it will grow from. */
-    const char* extra = NULL;
     struct task* me = task_current();
-    if (me && me->exec_extra_env[0]) extra = me->exec_extra_env;
     const char* env[8];
     int nenv = 0;
     for (int i = 0; i < base_env; i++) env[nenv++] = default_env[i];
-    if (extra) env[nenv++] = extra;
+    if (me) {
+        for (int s = 0; s < TASK_EXEC_ENV_MAX && nenv < 8; s++)
+            if (me->exec_extra_env[s][0]) env[nenv++] = me->exec_extra_env[s];
+    }
     uintptr_t env_uva[8];
     for (int i = nenv - 1; i >= 0; i--) {
         uint32_t l = u_strlen(env[i]) + 1;
@@ -174,7 +183,8 @@ static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
         env_uva[i] = stack_va + koff;
     }
 
-    if (me) me->exec_extra_env[0] = '\0';       /* one exec only — consumed */
+    if (me)                                     /* one exec only — consumed */
+        for (int s = 0; s < TASK_EXEC_ENV_MAX; s++) me->exec_extra_env[s][0] = '\0';
 
     /* 1b. Reserve + fill the 16 AT_RANDOM bytes just below the strings and
      *     record their user VA (kept 4-byte aligned). */

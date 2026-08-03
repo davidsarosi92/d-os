@@ -1,0 +1,15 @@
+#!/bin/sh
+# Cross pkg-config for the d-os musl target (§M40).
+#
+# meson resolves target dependencies with pkg-config, but the HOST's pkg-config
+# would answer with the HOST's libraries.  PKG_CONFIG_LIBDIR (not _PATH) REPLACES
+# the default search path, so only our cross-built .pc files are visible — which
+# is what makes "found: YES" mean "found for the target".
+PREFIX=/src/third_party
+ARCH=${DOS_ARCH:-x86_64}
+# /usr/share/pkgconfig is appended on purpose: it holds ARCHITECTURE-INDEPENDENT
+# data packages, and wayland-protocols is one of them — a directory of XML, not
+# a library.  Nothing there can pollute the target link.
+export PKG_CONFIG_LIBDIR="$PREFIX/libdrm-$ARCH/lib/pkgconfig:$PREFIX/wayland-$ARCH/lib/pkgconfig:$PREFIX/libffi-$ARCH/lib/pkgconfig:/usr/share/pkgconfig"
+export PKG_CONFIG_SYSROOT_DIR=
+exec /usr/bin/pkg-config "$@"

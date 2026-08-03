@@ -65,13 +65,15 @@ enum task_state {
 struct task {
     char     name[TASK_NAME_MAX + 1];
 
-    /* §M40 — ONE environment variable handed to the next exec on this task
-     * ("KEY=VALUE", empty = none).  Per-launch data that cannot live in the
-     * static default env: a Wayland client needs WAYLAND_SOCKET=<fd>, which is
-     * decided by whoever set up the socket.  Set it with proc_set_exec_env();
-     * build_initial_stack consumes and clears it, so it can never leak into an
-     * unrelated later exec.  The seam a full per-exec environ grows from. */
-    char exec_extra_env[64];
+    /* §M40 — environment variables handed to the NEXT exec on this task
+     * ("KEY=VALUE" each, empty slot = none).  Per-launch data that cannot live
+     * in the static default env: a Wayland client needs WAYLAND_SOCKET=<fd>,
+     * and a Mesa client also needs LIBGL_DRIVERS_PATH — which is why this is a
+     * small array rather than the single slot it started as.  Set with
+     * proc_set_exec_env(); build_initial_stack consumes and clears them, so
+     * they can never leak into an unrelated later exec. */
+#define TASK_EXEC_ENV_MAX 4
+    char exec_extra_env[TASK_EXEC_ENV_MAX][96];
 
     /* §M40 — CLONE_CHILD_CLEARTID.  musl's pthread_join blocks on a futex at
      * this address and relies on the KERNEL zeroing it + waking the waiters

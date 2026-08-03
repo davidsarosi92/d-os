@@ -72,9 +72,10 @@ int proc_execve(const char* path, char* const argv[]);
  * pid) to the caller, or -1.  The caller joins it with waitpid(tid). */
 int proc_clone(uintptr_t entry, uintptr_t stack);
 
-/* §M40 — hand ONE "KEY=VALUE" environment variable to the NEXT exec performed by
- * the calling task (see task.exec_extra_env).  Consumed by that exec, so it can
- * never leak into an unrelated later one.  NULL/"" clears it. */
+/* §M40 — hand a "KEY=VALUE" environment variable to the NEXT exec performed by
+ * the calling task (see task.exec_extra_env).  Call once per variable, up to
+ * TASK_EXEC_ENV_MAX; they are consumed by that exec, so they can never leak
+ * into an unrelated later one.  NULL/"" clears the whole set. */
 void proc_set_exec_env(const char* kv);
 
 /* §M40 — clone() as a THREAD (musl pthread_create): the child SHARES the

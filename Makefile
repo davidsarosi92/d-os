@@ -1006,6 +1006,11 @@ $(WL_PREFIX)/lib/libwayland-client.a: $(FFI_PREFIX)/lib/libffi.a
 	sed -e 's/@WAYLAND_VERSION_MAJOR@/1/' -e 's/@WAYLAND_VERSION_MINOR@/22/' \
 	    -e 's/@WAYLAND_VERSION_MICRO@/0/' -e 's/@WAYLAND_VERSION@/1.22.0/' \
 	    /tmp/wl/src/wayland-version.h.in > $(WL_GEN)/wayland-version.h
+	# Mesa's wayland platform links against wayland-SERVER too (for its wl_drm
+	# glue), so the server half has to exist even though d-os is its own
+	# compositor and never runs libwayland-server.  Same sources, one more
+	# scanner pass for the server-side protocol header.
+	wayland-scanner server-header /tmp/wl/protocol/wayland.xml $(WL_GEN)/wayland-server-protocol.h
 	for f in connection wayland-client wayland-os wayland-util; do \
 	    $(MUSL_ELF_CC) -c -Os -fPIC -std=gnu99 \
 	        -I/tmp/wl/src -I$(CURDIR)/$(WL_GEN) -I$(CURDIR)/$(FFI_PREFIX)/include \
@@ -1018,6 +1023,16 @@ $(WL_PREFIX)/lib/libwayland-client.a: $(FFI_PREFIX)/lib/libffi.a
 	    -I/tmp/wl/src -I$(WL_GEN) $(WL_GEN)/xdg-shell-protocol.c \
 	    -o $(WL_GEN)/xdg-shell-protocol.o
 	rm -rf $(WL_PREFIX) && mkdir -p $(WL_PREFIX)/lib $(WL_PREFIX)/include
+	for f in wayland-server event-loop wayland-shm; do \
+	    $(MUSL_ELF_CC) -c -Os -fPIC -std=gnu99 \
+	        -I/tmp/wl -I/tmp/wl/src -I$(CURDIR)/$(WL_GEN) \
+	        -I$(CURDIR)/$(FFI_PREFIX)/include \
+	        /tmp/wl/src/$$f.c -o $(WL_GEN)/$$f.o || exit 1; \
+	done
+	$(MUSL_AR) rcs $(WL_PREFIX)/lib/libwayland-server.a \
+	    $(WL_GEN)/wayland-server.o $(WL_GEN)/event-loop.o $(WL_GEN)/wayland-shm.o \
+	    $(WL_GEN)/connection.o $(WL_GEN)/wayland-os.o $(WL_GEN)/wayland-util.o \
+	    $(WL_GEN)/wayland-protocol.o
 	$(MUSL_AR) rcs $(WL_PREFIX)/lib/libwayland-client.a \
 	    $(WL_GEN)/connection.o $(WL_GEN)/wayland-client.o $(WL_GEN)/wayland-os.o \
 	    $(WL_GEN)/wayland-util.o $(WL_GEN)/wayland-protocol.o \
@@ -1027,6 +1042,35 @@ $(WL_PREFIX)/lib/libwayland-client.a: $(FFI_PREFIX)/lib/libffi.a
 	rm -rf /tmp/wl
 	cp $(WL_GEN)/wayland-client-protocol.h $(WL_GEN)/xdg-shell-client-protocol.h \
 	   $(WL_GEN)/wayland-version.h $(WL_PREFIX)/include/
+	# pkg-config metadata.  Mesa (and any meson-built consumer) discovers
+	# wayland through pkg-config, not by guessing paths, so a hand-built library
+	# without a .pc is invisible to it however correct the .a is.
+	cp $(WL_DIR)/egl/wayland-egl-backend.h $(WL_PREFIX)/include/
+	mkdir -p $(WL_PREFIX)/lib/pkgconfig
+	printf '%s\n' \
+	  'prefix=$(CURDIR)/$(WL_PREFIX)' 'libdir=$${prefix}/lib' \
+	  'includedir=$${prefix}/include' '' \
+	  'Name: Wayland Client' 'Description: Wayland client side library' \
+	  'Version: 1.22.0' 'Cflags: -I$${includedir}' \
+	  'Libs: -L$${libdir} -lwayland-client' \
+	  > $(WL_PREFIX)/lib/pkgconfig/wayland-client.pc
+	printf '%s\n' \
+	  'prefix=$(CURDIR)/$(WL_PREFIX)' 'includedir=$${prefix}/include' '' \
+	  'Name: Wayland EGL backend' \
+	  'Description: Interface between EGL and the Wayland client library' \
+	  'Version: 3' 'Cflags: -I$${includedir}' \
+	  > $(WL_PREFIX)/lib/pkgconfig/wayland-egl-backend.pc
+	cp $(WL_DIR)/src/wayland-server.h $(WL_DIR)/src/wayland-server-core.h \
+	   $(WL_PREFIX)/include/
+	cp $(WL_GEN)/wayland-server-protocol.h $(WL_PREFIX)/include/
+	printf '%s\n' \
+	  'prefix=$(CURDIR)/$(WL_PREFIX)' 'libdir=$${prefix}/lib' \
+	  'includedir=$${prefix}/include' '' \
+	  'Name: Wayland Server' 'Description: Wayland server side library' \
+	  'Version: 1.22.0' 'Cflags: -I$${includedir}' \
+	  'Libs: -L$${libdir} -lwayland-server' \
+	  > $(WL_PREFIX)/lib/pkgconfig/wayland-server.pc
+	rm -rf /tmp/wl
 	@echo "libwayland-client ($(ARCH)) → $(WL_PREFIX)/lib/"
 
 # -----------------------------------------------------------------------------
