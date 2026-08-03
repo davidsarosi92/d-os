@@ -4159,9 +4159,32 @@ include path.  weston has its own `shared/signal.h`, so that directory makes
 library's.  The sources include it as `"shared/os-compatibility.h"`, so
 `-I<weston>` is what they actually need.
 
+#### Stage 7 — focus, the events a toolkit waits for
+
+`wl_pointer.motion` and `wl_keyboard.key` are ignored by a real client until the
+surface has been told it has **focus**: SDL, GTK and Qt all drop input that
+arrives without a preceding `enter`, because on a real compositor that is what
+"the pointer is over someone else's window" looks like.  §M26 got away without
+them only because its demo client had no such logic.
+
+The server now sends `wl_pointer.enter` and `wl_keyboard.enter` (plus the
+`modifiers` that must follow it, and `wl_pointer.frame`, which a v5 client waits
+for before applying what it has received) the first time it has both a surface
+and the device object.  There is one surface per connection and it owns the
+window, so focus follows the window and is never revoked.
+
+**libwayland caught a bug our own client never would have.**  The first
+`modifiers` event was sized 24 bytes; its signature is five uints, so it is 28.
+Upstream answered with `message too short, object (15), message modifiers(uuuuu)`
+and dropped the connection.  That strictness is the whole value of running a
+real client library: a hand-written test client had happily ignored the
+malformed event for two milestones.
+
 **Open:** a full toolkit (SDL/GTK/Qt).  Those need EGL, hence Mesa `llvmpipe`
 and LLVM — a multi-hour build and the natural next milestone, now that the
-protocol surface underneath it is proven by a real application.
+protocol surface underneath it is proven by a real application.  Also still
+open: `wl_keyboard.keymap` (we forward raw keycodes; a toolkit wants an xkb
+keymap over a memfd before it can translate them) and `xkbcommon`.
 
 ---
 

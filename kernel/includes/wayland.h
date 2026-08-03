@@ -77,6 +77,10 @@ struct wl_conn {
      * loop asks for one and then WAITS for it before producing the next frame,
      * so a compositor that never answers freezes the application. */
     uint32_t            frame_cb;
+    /* §M40 — has the client been told its surface has focus?  A toolkit drops
+     * input that arrives without a preceding enter, so this is sent once and
+     * never revoked (one surface per connection). */
+    int                 ptr_entered, kbd_entered;
 };
 
 /* Initialise a connection over `sock` (registers wl_display as object 1). */

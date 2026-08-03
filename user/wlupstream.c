@@ -97,9 +97,14 @@ static int keys_seen, motions_seen;
  * compositor sends, and a NULL slot for an event that does arrive is a jump to
  * address zero.  Stubs for the ones d-os does not emit yet are therefore not
  * boilerplate — they are the contract. */
+static int ptr_enters, kbd_enters;
 static void pt_enter(void *d, struct wl_pointer *p, uint32_t s_, struct wl_surface *sf,
                      wl_fixed_t x, wl_fixed_t y)
-{ (void)d;(void)p;(void)s_;(void)sf;(void)x;(void)y; }
+{
+    (void)d;(void)p;(void)s_;(void)sf;(void)x;(void)y;
+    ptr_enters++;
+    printf("wlupstream: pointer ENTER (surface focused)\n");
+}
 static void pt_leave(void *d, struct wl_pointer *p, uint32_t s_, struct wl_surface *sf)
 { (void)d;(void)p;(void)s_;(void)sf; }
 static void pt_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t x, wl_fixed_t y)
@@ -129,7 +134,11 @@ static void kb_keymap(void *d, struct wl_keyboard *k, uint32_t f, int32_t fd, ui
 { (void)d;(void)k;(void)f;(void)sz; if (fd >= 0) close(fd); }
 static void kb_enter(void *d, struct wl_keyboard *k, uint32_t s_, struct wl_surface *sf,
                      struct wl_array *keys)
-{ (void)d;(void)k;(void)s_;(void)sf;(void)keys; }
+{
+    (void)d;(void)k;(void)s_;(void)sf;(void)keys;
+    kbd_enters++;
+    printf("wlupstream: keyboard ENTER (surface focused)\n");
+}
 static void kb_leave(void *d, struct wl_keyboard *k, uint32_t s_, struct wl_surface *sf)
 { (void)d;(void)k;(void)s_;(void)sf; }
 static void kb_key(void *d, struct wl_keyboard *k, uint32_t s_, uint32_t t,
@@ -141,7 +150,10 @@ static void kb_key(void *d, struct wl_keyboard *k, uint32_t s_, uint32_t t,
 }
 static void kb_mods(void *d, struct wl_keyboard *k, uint32_t s_, uint32_t dep,
                     uint32_t lat, uint32_t lock, uint32_t grp)
-{ (void)d;(void)k;(void)s_;(void)dep;(void)lat;(void)lock;(void)grp; }
+{
+    (void)d;(void)k;(void)s_;(void)lat;(void)lock;(void)grp;
+    printf("wlupstream: keyboard modifiers (depressed=%u)\n", dep);
+}
 static void kb_repeat(void *d, struct wl_keyboard *k, int32_t rate, int32_t delay)
 { (void)d;(void)k;(void)rate;(void)delay; }
 static const struct wl_keyboard_listener keyboard_listener = {
@@ -320,8 +332,10 @@ int main(int argc, char **argv)
             nanosleep(&ts, NULL);
         }
         printf("wlupstream: input seen — %d key(s), %d motion(s); "
-               "frame callbacks %d; output %dx%d (done=%d)\n",
-               keys_seen, motions_seen, frames_done, out_w, out_h, have_output);
+               "frame callbacks %d; output %dx%d (done=%d); "
+               "enters ptr=%d kbd=%d\n",
+               keys_seen, motions_seen, frames_done, out_w, out_h, have_output,
+               ptr_enters, kbd_enters);
     }
 
 out:

@@ -63,8 +63,12 @@ enum { XDG_TOPLEVEL_EVT_CONFIGURE = 0, XDG_TOPLEVEL_EVT_CLOSE = 1 };
 enum { WL_SEAT_REQ_GET_POINTER = 0, WL_SEAT_REQ_GET_KEYBOARD = 1 };
 enum { WL_SEAT_EVT_CAPABILITIES = 0 };
 enum { WL_SEAT_CAP_POINTER = 1, WL_SEAT_CAP_KEYBOARD = 2 };
-enum { WL_POINTER_EVT_MOTION = 2, WL_POINTER_EVT_BUTTON = 3 };
-enum { WL_KEYBOARD_EVT_KEY = 3 };
+enum { WL_POINTER_EVT_ENTER = 0, WL_POINTER_EVT_LEAVE = 1,
+       WL_POINTER_EVT_MOTION = 2, WL_POINTER_EVT_BUTTON = 3,
+       WL_POINTER_EVT_FRAME = 5 };
+enum { WL_KEYBOARD_EVT_KEYMAP = 0, WL_KEYBOARD_EVT_ENTER = 1,
+       WL_KEYBOARD_EVT_LEAVE = 2, WL_KEYBOARD_EVT_KEY = 3,
+       WL_KEYBOARD_EVT_MODIFIERS = 4 };
 enum { WL_KEY_RELEASED = 0, WL_KEY_PRESSED = 1 };
 
 /* wl_shm pixel formats (subset). */
@@ -257,9 +261,69 @@ static void send_seat_capabilities(struct wl_conn* c, uint32_t seat, uint32_t ca
     usock_send(c->sock, msg, 12, NULL);
 }
 
+/* ---- focus: the events a toolkit waits for before it believes any input -----
+ *
+ * A real client does not act on `motion` or `key` at all until it has been told
+ * the surface has focus.  SDL, GTK and Qt all drop input that arrives without a
+ * preceding `enter`, because on a real compositor that is what "the pointer is
+ * over someone else's window" looks like.  §M26 got away without them only
+ * because its demo client had no such logic.
+ *
+ * We have exactly one surface per connection and it owns the window, so focus
+ * follows the window: send `enter` once the client has both a surface and the
+ * device object, and never take it away.
+ * --------------------------------------------------------------------------- */
+static void send_pointer_enter(struct wl_conn* c) {
+    if (!c->pointer_id || !c->surface_id || c->ptr_entered) return;
+    uint8_t msg[24];
+    put32(msg + 0, c->pointer_id);
+    put32(msg + 4, (24u << 16) | WL_POINTER_EVT_ENTER);
+    put32(msg + 8, ++c->serial);
+    put32(msg + 12, c->surface_id);
+    put32(msg + 16, 0);                       /* surface_x, 24.8 fixed */
+    put32(msg + 20, 0);                       /* surface_y             */
+    usock_send(c->sock, msg, 24, NULL);
+    c->ptr_entered = 1;
+}
+
+/* wl_pointer.frame — v5 groups related events; a client that binds v5+ waits
+ * for it before applying anything it has received. */
+static void send_pointer_frame(struct wl_conn* c) {
+    if (!c->pointer_id) return;
+    uint8_t msg[8];
+    put32(msg + 0, c->pointer_id);
+    put32(msg + 4, (8u << 16) | WL_POINTER_EVT_FRAME);
+    usock_send(c->sock, msg, 8, NULL);
+}
+
+static void send_keyboard_enter(struct wl_conn* c) {
+    if (!c->keyboard_id || !c->surface_id || c->kbd_entered) return;
+    uint8_t msg[20];
+    put32(msg + 0, c->keyboard_id);
+    put32(msg + 4, (20u << 16) | WL_KEYBOARD_EVT_ENTER);
+    put32(msg + 8, ++c->serial);
+    put32(msg + 12, c->surface_id);
+    put32(msg + 16, 0);                       /* keys: array of length 0 */
+    usock_send(c->sock, msg, 20, NULL);
+    /* modifiers must follow enter — a client that never sees one assumes an
+     * unknown modifier state and may ignore keys. */
+    /* modifiers(serial, depressed, latched, locked, group) — FIVE uints, so 28
+     * bytes.  Getting the size wrong is not silently tolerated: libwayland
+     * reports "message too short" and drops the connection, which is exactly
+     * the strictness a real client brings and our own demo client never did. */
+    uint8_t m[28];
+    put32(m + 0, c->keyboard_id);
+    put32(m + 4, (28u << 16) | WL_KEYBOARD_EVT_MODIFIERS);
+    put32(m + 8, ++c->serial);
+    put32(m + 12, 0); put32(m + 16, 0); put32(m + 20, 0); put32(m + 24, 0);
+    usock_send(c->sock, m, 28, NULL);
+    c->kbd_entered = 1;
+}
+
 /* Emit wl_keyboard.key(serial, time, key, state). */
 void wl_send_key(struct wl_conn* c, uint32_t key, int pressed) {
     if (!c->keyboard_id) return;
+    send_keyboard_enter(c);                   /* focus first, always */
     uint8_t msg[24];
     put32(msg + 0, c->keyboard_id);
     put32(msg + 4, (24u << 16) | WL_KEYBOARD_EVT_KEY);
@@ -273,6 +337,7 @@ void wl_send_key(struct wl_conn* c, uint32_t key, int pressed) {
 /* Emit wl_pointer.motion(time, x, y) — coordinates are 24.8 fixed-point. */
 void wl_send_motion(struct wl_conn* c, int x, int y) {
     if (!c->pointer_id) return;
+    send_pointer_enter(c);                    /* focus first, always */
     uint8_t msg[20];
     put32(msg + 0, c->pointer_id);
     put32(msg + 4, (20u << 16) | WL_POINTER_EVT_MOTION);
@@ -280,6 +345,7 @@ void wl_send_motion(struct wl_conn* c, int x, int y) {
     put32(msg + 12, (uint32_t)(x << 8));          /* surface_x fixed */
     put32(msg + 16, (uint32_t)(y << 8));          /* surface_y fixed */
     usock_send(c->sock, msg, 20, NULL);
+    send_pointer_frame(c);
 }
 
 /* ---- connection + dispatch ----------------------------------------------- */
@@ -295,6 +361,7 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock) {
     c->buf_off = c->buf_w = c->buf_h = c->buf_stride = 0;
     c->xdg_surface_id = c->xdg_toplevel_id = 0;
     c->pointer_id = c->keyboard_id = 0;
+    c->ptr_entered = c->kbd_entered = 0;
     c->target = NULL;
     c->blit_x = c->blit_y = 0;
     c->window = NULL;
