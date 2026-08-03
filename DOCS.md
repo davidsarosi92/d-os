@@ -4248,9 +4248,31 @@ Verified on both arches with `pthreadtest`, a real `pthread_create` /
 `pthread_mutex` / `pthread_join` program: 4 threads, 20000 locked increments,
 all four joined, counter exact.
 
-**Open:** a full toolkit (SDL/GTK/Qt).  Those need EGL, hence Mesa — a large
-build, but the threading, dynamic linking, shm and protocol surface underneath
-it are now all proven by real code.
+#### Where the EGL/GL half stands (probed, not guessed)
+
+The milestone's remaining DoD item is *"an EGL+GLES2 program clears + draws a
+triangle via a software rasteriser, presented through a Wayland buffer"*.  Rather
+than estimate it, the Mesa build was actually attempted so the next session
+starts from a measured position:
+
+- The build image now carries Mesa's toolchain (meson, ninja, python3-mako,
+  libexpat, pkg-config) and `third_party/mesa-cross.txt` is a working meson
+  cross file for the musl x86_64 toolchain.
+- `meson setup` with `-Dgallium-drivers=swrast -Dllvm=disabled -Dgbm=disabled
+  -Dplatforms=wayland` gets **most of the way through configuration** — it
+  builds the bundled expat subproject and resolves everything else — and then
+  stops at `Run-time dependency libdrm found: NO`.  Note the driver is spelled
+  `swrast`, not `softpipe`, in Mesa 23's option list.
+
+So the next steps are concrete: cross-build **libdrm** (small, also meson), give
+meson a cross `pkg-config`, and then face the runtime questions — Mesa `dlopen`s
+its DRI module, and its EGL Wayland platform has to be pushed onto the
+`wl_shm`-based swrast path rather than looking for `/dev/dri`.
+
+That is a milestone-sized effort of its own, with genuine unknowns rather than
+just volume.  Everything *underneath* it is now proven by real code: musl
+pthreads, dynamic linking, shm + fd passing, and a protocol surface an
+unmodified upstream application already runs on.
 
 ---
 

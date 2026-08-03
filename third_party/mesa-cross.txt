@@ -1,0 +1,12 @@
+[binaries]
+c = '/src/third_party/musl-cross-x86_64/bin/x86_64-linux-musl-gcc'
+cpp = '/src/third_party/musl-cross-x86_64/bin/x86_64-linux-musl-g++'
+ar = '/src/third_party/musl-cross-x86_64/bin/x86_64-linux-musl-ar'
+strip = '/src/third_party/musl-cross-x86_64/bin/x86_64-linux-musl-strip'
+pkg-config = 'pkg-config'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

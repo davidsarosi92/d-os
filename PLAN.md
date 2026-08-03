@@ -3803,8 +3803,14 @@ is steps 2–3: EGL/GL and a rasteriser.
 - ✅ A `weston-terminal`-class Wayland client runs against the §M26 server:
   draws, takes keyboard + pointer input.  (`weston-simple-shm`, unmodified;
   input verified via the pointer/keyboard listeners.)
-- 🔲 An EGL+GLES2 program clears + draws a triangle via `llvmpipe`, presented
-  through a Wayland buffer.
+- 🔲 An EGL+GLES2 program clears + draws a triangle via a software rasteriser,
+  presented through a Wayland buffer.  **Probed** (DOCS §4.40): the build image
+  now has meson/ninja/mako/expat, `third_party/mesa-cross.txt` is a working musl
+  cross file, and `meson setup -Dgallium-drivers=swrast -Dllvm=disabled` gets
+  through most of configuration before stopping at a missing **libdrm**.  Next:
+  cross-build libdrm, a cross `pkg-config`, then the runtime questions (Mesa
+  `dlopen`s its DRI module; its EGL Wayland platform must take the `wl_shm`
+  swrast path rather than opening `/dev/dri`).
 - ✅ DOCS.md chapter (§4.40).
 
 **Out of scope:** hardware GPU acceleration (per-GPU drivers — a north

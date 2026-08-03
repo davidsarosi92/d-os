@@ -46,4 +46,14 @@ RUN apt update && apt install -y \
     libffi-dev \
     libxkbcommon-tools
 
+# §M40 — Mesa's build system (meson/ninja) + its generators (python3-mako) and
+# libexpat, for the software-GL half of the milestone.  wayland-protocols is
+# already above; Mesa needs it for the EGL Wayland platform.
+RUN apt update && apt install -y \
+    meson \
+    ninja-build \
+    python3-mako \
+    libexpat1-dev \
+    pkg-config
+
 WORKDIR /src
