@@ -154,6 +154,7 @@ int  sys_bind(int fd, int port);
 #define FDK_NETSOCK 3
 int  sys_fd_kind(int fd);                     /* → FDK_*, or -1 if not open */
 int  sys_memfd_resize(int fd, size_t size);   /* ftruncate() on a memfd      */
+int  sys_dupfd(int fd, int minfd);            /* F_DUPFD / F_DUPFD_CLOEXEC  */
 int  sys_socket_setnonblock(int fd, int on);
 int  sys_socket_getnonblock(int fd);          /* → 0/1, or -1 if not a socket */
 int  sys_connect(int fd, uint32_t ip, int port);           /* TCP handshake    */
@@ -190,6 +191,9 @@ int  sys_stat_k(const char* kpath, struct kstat* out);
 int  sys_fstat_k(int fd, struct kstat* out);
 int  sys_clock_gettime_k(int which, struct ktimespec* out);
 long sys_recvfrom_k(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out);
+/* recv with the PAYLOAD going to ring 3 and any passed descriptor coming back in
+ * a kernel local (the Linux personality marshals it into SCM_RIGHTS itself). */
+long sys_recv_u(int fd, uintptr_t ubuf, size_t n, int* kpassfd_out);
 
 /* Bulk-payload cores (§1.1 layer 3).  The gated wrappers above stage ring-3
  * payloads through a kernel chunk and then call these, so the VFS / socket /

@@ -4009,20 +4009,66 @@ Three kernel gaps had to be closed for that:
 | `sys_mmap_full` knew only file-backed and anonymous mappings | a memfd (`FD_SHM`) is a third case: it maps the object's EXISTING frames, shared, which is the whole point.  The native `sys_mmap` had this; the Linux-facing entry point did not, so the client's `mmap` of its own pool failed |
 | no SCM_RIGHTS in the ABI control path | `lnx_cmsg_take_fd` / `lnx_cmsg_put_fd` around the existing `usock` descriptor passing (`sys_send_k`'s `passfd`), declared per-arch so the 12-byte/4-aligned and 16-byte/8-aligned `cmsghdr` layouts both come out right |
 
-**One defect remains, measured precisely.**  The pool's descriptor arrives at the
-server as MISSING.  The control block itself is well-formed — dumping the 20
-bytes the client hands to `sendmsg` gives
-`14 00 00 00 | 00 00 00 00 | 01 00 00 00 | 01 00 00 00 | 00 00 00 00`, i.e. a
-correct `cmsg_len=20`, `SOL_SOCKET`, `SCM_RIGHTS` — but the descriptor payload is
-**0**, while the client demonstrably holds fd 4 (it prints it, and its own
-`ftruncate`/`mmap` on that fd succeed).  So the kernel side is reading exactly
-what the client wrote; the value is lost earlier, inside libwayland's outgoing
-fd ring or the closure's `h`-argument marshalling.  Note the §M26 native
-`waytest` still passes its pool fd (`shm-fd=received`), so d-os's descriptor
-passing itself is fine — this is specific to the upstream path.
+**Verified end to end on i386 and x86_64.**  The server reads the client's
+pixels out of shared memory:
 
-**Open:** that fd value; then a visible window through the WM bridge, and a real
-toolkit (Mesa `llvmpipe` + GTK/Qt/SDL).
+```
+wayland: create_pool(id=3,size=76800) shm-fd=received
+wayland: COMMIT surface 8: 160x120 buffer, top-left=ff102040 checksum=e4484200
+wlupstream: PASS — UPSTREAM libwayland-client drove a real xdg_toplevel + shm buffer
+```
+
+`0xff102040` is exactly the colour the client wrote at (0,0).
+
+**The pool descriptor arrived as 0 at first, and the reason is worth keeping.**
+libwayland DUPLICATES every descriptor it sends
+(`wl_closure_marshal` → `wl_os_dupfd_cloexec` → `fcntl(F_DUPFD_CLOEXEC)`), and
+our `fcntl` "succeeded" by returning 0 for every command it did not implement.
+**0 is a valid descriptor**, so libwayland believed the dup and sent descriptor
+zero — no error anywhere, at any layer.  Two fixes: `F_DUPFD`/`F_DUPFD_CLOEXEC`
+now really duplicate (`sys_dupfd`), and any unimplemented command that is
+supposed to yield a descriptor fails loudly instead.  The first attempt at
+`sys_dupfd` then handed back 0 again, because descriptors 0–2 are reserved for
+the console and deliberately absent from the table (`fd_lookup` rejects them,
+`fd_install` starts at 3) — a dup must obey the same convention or it returns
+something that looks valid and can never be looked up again.
+
+**Open:** a visible window through the WM bridge (the surface is committed but
+not yet mapped onto a `gui_window`), and a real toolkit (Mesa `llvmpipe` +
+GTK/Qt/SDL).
+
+---
+
+### 4.41 The ring-3 pointer gate was never armed for the Linux ABI (M47.2)
+
+Found while chasing the Wayland descriptor above, and more serious than the bug
+that led to it.
+
+§M46 closed the ring-3 pointer boundary in three layers, the first being a
+**per-syscall gate**: `task->in_user_syscall` is set for the duration of a
+syscall entered from ring 3, and the `sys_*` wrappers validate their pointer
+arguments only while it is set — which is what lets the same handlers serve
+in-kernel callers that legitimately pass kernel buffers.
+
+The native dispatchers (`hal/x86/syscall.c`, `hal/x86_64/syscall.c`) set it.
+**`linux_syscall_dispatch` never did, on either arch.**  So for every program
+running under the Linux personality — every musl coreutil, the shell, the TLS
+stack, NetSurf, the Wayland clients, i.e. essentially the entire userland — the
+gated wrappers fell through to their ungated `_k` cores and ring-3 pointers were
+dereferenced without validation.  Layer 1 was off for the code that needed it
+most, and nothing failed visibly, which is exactly why it went unnoticed for two
+milestones.
+
+Both dispatchers now arm it around the body, like the native path.  The
+discipline that follows is the one already established: anything in
+`linux_abi.c` that legitimately hands a KERNEL buffer to a `sys_*` must call the
+`_k` core (`linux_sendmsg`'s gather buffer) or the `_u` split
+(`sys_recvfrom_u`, and the new `sys_recv_u` for recvmsg's payload-to-ring-3 /
+descriptor-to-kernel shape).
+
+Verified with the gate armed, both arches: `musltest`, `pkgrun sh -c`, HTTPS
+with CA verification, `tcc` compiling and running a program, `wayupstream`, and
+NetSurf launching and closing cleanly with no crash record.
 
 ---
 
@@ -4139,6 +4185,23 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   `polltest`, `solibtest`, `forktest`, `threadtest`, `musltest`, `dnstest`,
   `httptest` (`HTTP/1.1 200 OK`) and `pkgrun sh -c` all green; aarch64 builds
   clean.
+
+- **2026-08-03 — §M40 stage 2 complete + the Linux-ABI pointer gate (DOCS §4.40,
+  §4.41).**  The upstream libwayland client now drives a real `xdg_toplevel` with
+  a real shm buffer on both arches, and the server reads its pixels out of
+  shared memory (`top-left=ff102040`, the colour the client wrote).  Needed:
+  SCM_RIGHTS in both ABI control paths, `memfd_create`/`ftruncate`, memfd
+  mapping from the Linux `mmap` entry point, `wl_surface.damage`, and a real
+  `F_DUPFD`/`F_DUPFD_CLOEXEC` — libwayland dups every descriptor it sends, and
+  our `fcntl` "succeeded" by returning 0, which **is a valid descriptor**, so the
+  pool silently arrived carrying fd 0.  `sys_dupfd` must also skip 0–2, which
+  are reserved for the console and absent from the fd table.
+  **Bigger find:** `linux_syscall_dispatch` never armed `task->in_user_syscall`,
+  so §M46's first boundary layer was disabled for the ENTIRE musl userland.  Now
+  armed on both arches, with the established `_k`/`_u` discipline for the places
+  that legitimately pass kernel buffers (adds `sys_recv_u`).  Verified with the
+  gate on: musltest, `pkgrun sh -c`, HTTPS, `tcc`, `wayupstream`, and NetSurf
+  launch+close clean.
 
 - **2026-08-03 — §M40 stage 1: UPSTREAM libwayland-client runs on d-os (DOCS
   §4.40).**  The real, unmodified libwayland — not our §M26 mini client library —

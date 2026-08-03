@@ -367,7 +367,8 @@ static long linux_recvmsg(int fd, struct lnx_msghdr* mh, int flags) {
         /* sys_recv is the read that can also carry a DESCRIPTOR; anything it
          * hands back is marshalled into the client's SCM_RIGHTS block. */
         int passfd = -1;
-        long r = sys_recv(fd, iov->iov_base, (size_t)iov->iov_len, &passfd);
+        long r = sys_recv_u(fd, (uintptr_t)iov->iov_base, (size_t)iov->iov_len,
+                            &passfd);
         if (r < 0) return r;
         mh->msg_namelen    = 0;      /* connection-mode: no source address */
         mh->msg_flags      = 0;
@@ -433,11 +434,21 @@ static long linux_sendmsg(int fd, const struct lnx_msghdr* mh, int flags) {
 }
 
 /* fcntl(fd, cmd, arg) — only the status-flag commands do real work. */
+#define LNX_F_DUPFD          0
+#define LNX_F_DUPFD_CLOEXEC 1030
 #define LNX_F_GETFL    3
 #define LNX_F_SETFL    4
 #define LNX_O_NONBLOCK 04000
 
 static long linux_fcntl(int fd, int cmd, long arg) {
+    /* F_DUPFD(_CLOEXEC) must really duplicate.  libwayland dups every descriptor
+     * it sends, and an fcntl that "succeeds" with 0 is indistinguishable from a
+     * dup to fd 0 — exactly how a Wayland client's shm pool silently arrived
+     * carrying descriptor zero. */
+    if (cmd == LNX_F_DUPFD || cmd == LNX_F_DUPFD_CLOEXEC) {
+        int nfd = sys_dupfd(fd, (int)arg);
+        return (nfd < 0) ? -LNX_EINVAL : nfd;
+    }
     if (cmd == LNX_F_SETFL) {
         sys_socket_setnonblock(fd, (arg & LNX_O_NONBLOCK) ? 1 : 0);
         return 0;                          /* not a socket → accept and ignore */
@@ -471,7 +482,25 @@ static void linux_exit(struct int_frame* f, int code) {
     (void)f;
 }
 
+static void linux_syscall_body(struct int_frame* f);
+
+/* §1.1 — arm the RING-3 POINTER GATE for the duration, exactly like the native
+ * dispatcher does.  It never was armed here, which silently disabled the first
+ * of §M46's three boundary layers for the ENTIRE musl userland — every
+ * coreutil, the shell, NetSurf, the TLS stack — because the gated sys_*
+ * wrappers fall through to their ungated `_k` cores when the flag is clear.
+ * Everything in this file that legitimately hands a KERNEL buffer to a sys_*
+ * must therefore call the `_k` core (linux_sendmsg) or the `_u` split
+ * (recvmsg/recvfrom) — the same discipline the native path already follows. */
 void linux_syscall_dispatch(struct int_frame* f) {
+    struct task* me = task_current();
+    int prev = me ? me->in_user_syscall : 0;
+    if (me) me->in_user_syscall = 1;
+    linux_syscall_body(f);
+    if (me) me->in_user_syscall = prev;
+}
+
+static void linux_syscall_body(struct int_frame* f) {
     /* SysV/Linux x86_64 argument registers. */
     uint64_t a0 = f->rdi, a1 = f->rsi, a2 = f->rdx;
     uint64_t a3 = f->r10, a4 = f->r8,  a5 = f->r9;

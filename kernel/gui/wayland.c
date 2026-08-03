@@ -44,7 +44,8 @@ enum { WL_SHM_REQ_CREATE_POOL = 0 };
 enum { WL_SHM_EVT_FORMAT = 0 };
 enum { WL_SHM_POOL_REQ_CREATE_BUFFER = 0 };
 enum { WL_BUFFER_EVT_RELEASE = 0 };
-enum { WL_SURFACE_REQ_ATTACH = 1, WL_SURFACE_REQ_COMMIT = 6 };
+enum { WL_SURFACE_REQ_ATTACH = 1, WL_SURFACE_REQ_DAMAGE = 2,
+       WL_SURFACE_REQ_COMMIT = 6, WL_SURFACE_REQ_DAMAGE_BUFFER = 9 };
 /* xdg_shell (the modern window role protocol). */
 enum { XDG_WM_BASE_REQ_GET_XDG_SURFACE = 2 };
 enum { XDG_SURFACE_REQ_GET_TOPLEVEL = 1, XDG_SURFACE_REQ_ACK_CONFIGURE = 4 };
@@ -352,6 +353,17 @@ static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
 
     } else if (iface == WLI_SURFACE && op == WL_SURFACE_REQ_ATTACH && blen >= 4) {
         kprintf("wayland: surface %u attach buffer %u\n", obj, get32(body));
+
+    } else if (iface == WLI_SURFACE &&
+               (op == WL_SURFACE_REQ_DAMAGE ||
+                op == WL_SURFACE_REQ_DAMAGE_BUFFER) && blen >= 16) {
+        /* damage(x, y, width, height) — the client marking which part of the
+         * surface changed.  We always recomposite the whole surface on commit,
+         * so the rect is advisory; ACCEPTING it is what matters, because every
+         * real toolkit sends it and an "unhandled" reply is a protocol error to
+         * a strict client. */
+        (void)get32(body); (void)get32(body + 4);
+        (void)get32(body + 8); (void)get32(body + 12);
 
     } else if (iface == WLI_SURFACE && op == WL_SURFACE_REQ_COMMIT) {
         wl_surface_commit(c);

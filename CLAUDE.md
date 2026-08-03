@@ -35,6 +35,24 @@ breadcrumb** (kind/cpu/pid/pc/addr/code/uptime/comm).  Also: taskbar clock shows
 the ISO date + keyboard layout, wallpaper label carries the arch
 (`d-os M47  x32`/`x64`/`arm64`).
 
+✅ **§M47.2 — THE RING-3 POINTER GATE WAS NEVER ARMED FOR THE LINUX ABI
+(2026-08-03, DOCS §4.41).**  `linux_syscall_dispatch` never set
+`task->in_user_syscall` on EITHER arch, so §M46's first boundary layer (the
+per-syscall pointer gate) was off for **every** musl program — coreutils, sh,
+TLS, NetSurf, Wayland.  Nothing failed visibly, which is why it survived two
+milestones.  Now armed on both; the `_k`/`_u` discipline covers the places that
+legitimately pass kernel buffers (new `sys_recv_u`).
+
+✅ **§M40 STAGE 2 (2026-08-03, DOCS §4.40, i386 + x86_64).**  Upstream libwayland
+drives a REAL `xdg_toplevel` + shm buffer; the server reads the client's pixels
+(`top-left=ff102040`).  Added: SCM_RIGHTS in both ABI control paths,
+`memfd_create`/`ftruncate` (`sys_memfd_resize`/`shm_grow`), memfd mapping from
+the Linux `mmap` path, `wl_surface.damage`, real `F_DUPFD`/`F_DUPFD_CLOEXEC`.
+**Lesson:** libwayland DUPS every fd it sends; our `fcntl` "succeeded" with 0,
+and 0 IS a valid descriptor — the pool silently carried fd 0.  An unimplemented
+command that should yield a descriptor must fail loudly.  `sys_dupfd` must skip
+0–2 (console-reserved, absent from the fd table).
+
 ✅ **§M40 STAGE 1 — UPSTREAM libwayland-client RUNS (2026-08-03, DOCS §4.40,
 i386 + x86_64).**  The REAL library (not §M26's mini `user/libwl`) does
 connect + get_registry + listener + roundtrip against the d-os server; all 4

@@ -75,6 +75,7 @@ extern uint32_t saved_eip;
 #define LNX_exit_group     252
 #define LNX_getdents64     220
 #define LNX_fcntl64        221
+#define LNX_fcntl           55   /* the pre-LFS variant musl still uses */
 #define LNX_set_tid_address 258
 #define LNX_openat         295
 #define LNX_poll           168   /* musl's DNS resolver waits on the UDP socket
@@ -126,6 +127,10 @@ extern uint32_t saved_eip;
 #define LNX_EOPNOTSUPP   95
 
 /* Linux socketcall sub-call numbers (linux/net.h). */
+/* Type-bits Linux ORs into socket()'s `type` argument. */
+#define LSOCK_NONBLOCK  0x800
+#define LSOCK_CLOEXEC   0x80000
+
 #define LSOC_SOCKET      1
 #define LSOC_BIND        2
 #define LSOC_CONNECT     3
@@ -405,7 +410,8 @@ static long linux_recvmsg(int fd, struct lnx_msghdr* mh, int flags) {
         /* sys_recv is the read that can also carry a DESCRIPTOR; anything it
          * hands back is marshalled into the client's SCM_RIGHTS block. */
         int passfd = -1;
-        long r = sys_recv(fd, iov->iov_base, (size_t)iov->iov_len, &passfd);
+        long r = sys_recv_u(fd, (uintptr_t)iov->iov_base, (size_t)iov->iov_len,
+                            &passfd);
         if (r < 0) return r;
         mh->msg_namelen    = 0;      /* connection-mode: no source address */
         mh->msg_flags      = 0;
@@ -508,7 +514,12 @@ static long linux_socketcall_k(int call, const uint32_t* a) {
             int proto  = (int)a[2];
             if (domain != AF_INET) return -LNX_EAFNOSUPPORT;
             int fd = sys_socket(domain, type, proto);
-            return (fd < 0) ? -LNX_EOPNOTSUPP : fd;
+            if (fd < 0) return -LNX_EOPNOTSUPP;
+            /* SOCK_NONBLOCK is NOT decoration: musl's resolver drains its socket
+             * with `while (recvmsg(...) >= 0)` and needs the EAGAIN only a
+             * non-blocking socket produces. */
+            if ((int)a[1] & LSOCK_NONBLOCK) sys_socket_setnonblock(fd, 1);
+            return fd;
         }
         case LSOC_BIND: {
             int fd = (int)a[0];
@@ -593,6 +604,35 @@ static long linux_socketcall(int call, const uint32_t* uargs) {
     return linux_socketcall_k(call, a);
 }
 
+/* fcntl(fd, cmd, arg).  Most commands are flag bookkeeping we do not track yet
+ * and can safely report success for — but NOT the two that yield a DESCRIPTOR.
+ * libwayland dups every fd it sends (wl_closure_marshal -> wl_os_dupfd_cloexec),
+ * and an fcntl that "succeeds" with 0 is indistinguishable from a dup to fd 0,
+ * which is exactly how a Wayland client's shm pool silently arrived carrying
+ * descriptor zero.  O_NONBLOCK is honoured too, since it changes real behaviour
+ * (see sys_socket_setnonblock). */
+#define LNX_F_DUPFD          0
+#define LNX_F_DUPFD_CLOEXEC 1030
+#define LNX_F_GETFL          3
+#define LNX_F_SETFL          4
+#define LNX_O_NONBLOCK   04000
+
+static long linux_fcntl(int fd, int cmd, long arg) {
+    if (cmd == LNX_F_DUPFD || cmd == LNX_F_DUPFD_CLOEXEC) {
+        int nfd = sys_dupfd(fd, (int)arg);
+        return (nfd < 0) ? -LNX_EINVAL : nfd;
+    }
+    if (cmd == LNX_F_SETFL) {
+        sys_socket_setnonblock(fd, (arg & LNX_O_NONBLOCK) ? 1 : 0);
+        return 0;                          /* not a socket → accept and ignore */
+    }
+    if (cmd == LNX_F_GETFL) {
+        int nb = sys_socket_getnonblock(fd);
+        return (nb > 0) ? LNX_O_NONBLOCK : 0;
+    }
+    return 0;                              /* CLOEXEC etc: accepted, untracked */
+}
+
 /* End a Linux process/excursion: an independent user task exits for good;
  * an excursion teleports back to proc_exec_*'s caller (identical to the native
  * SYS_EXIT handling — the personality only changes the number, not the flow). */
@@ -606,7 +646,25 @@ static void linux_exit(struct int_frame* f, int code) {
     (void)f;
 }
 
+static void linux_syscall_body(struct int_frame* f);
+
+/* §1.1 — arm the RING-3 POINTER GATE for the duration, exactly like the native
+ * dispatcher does.  It never was armed here, which silently disabled the first
+ * of §M46's three boundary layers for the ENTIRE musl userland — every
+ * coreutil, the shell, NetSurf, the TLS stack — because the gated sys_*
+ * wrappers fall through to their ungated `_k` cores when the flag is clear.
+ * Everything in this file that legitimately hands a KERNEL buffer to a sys_*
+ * must therefore call the `_k` core (linux_sendmsg) or the `_u` split
+ * (recvmsg/recvfrom) — the same discipline the native path already follows. */
 void linux_syscall_dispatch(struct int_frame* f) {
+    struct task* me = task_current();
+    int prev = me ? me->in_user_syscall : 0;
+    if (me) me->in_user_syscall = 1;
+    linux_syscall_body(f);
+    if (me) me->in_user_syscall = prev;
+}
+
+static void linux_syscall_body(struct int_frame* f) {
     switch (f->eax) {
         case LNX_exit:
         case LNX_exit_group:
@@ -949,11 +1007,8 @@ void linux_syscall_dispatch(struct int_frame* f) {
             return;
 
         case LNX_fcntl64:
-            /* musl's opendir() sets FD_CLOEXEC via fcntl.  We don't track the
-             * CLOEXEC/status flags yet; report success (0) so descriptor setup
-             * proceeds.  F_DUPFD would need real work, but musl's dir/stdio
-             * paths only use the flag-setting/getting commands. */
-            f->eax = 0;
+        case LNX_fcntl:
+            f->eax = (uint32_t)linux_fcntl((int)f->ebx, (int)f->ecx, (long)f->edx);
             return;
 
         case LNX_mmap2: {

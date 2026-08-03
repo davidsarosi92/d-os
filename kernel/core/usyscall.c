@@ -608,6 +608,34 @@ int sys_dup2(int oldfd, int newfd) {
     return newfd;
 }
 
+/* §M40 — dup the descriptor into the lowest free slot >= `minfd` (POSIX
+ * F_DUPFD / F_DUPFD_CLOEXEC).  Returns the new fd, or -1.
+ *
+ * This is not an obscure corner: libwayland DUPLICATES every descriptor it is
+ * asked to send (wl_closure_marshal → wl_os_dupfd_cloexec), so without it a
+ * Wayland client cannot pass its shm pool at all.  Worse, an fcntl that
+ * "succeeds" by returning 0 is indistinguishable from a successful dup to fd 0,
+ * so the failure was completely silent — the pool arrived carrying descriptor
+ * zero.  Unimplemented commands that yield a DESCRIPTOR must fail loudly. */
+int sys_dupfd(int fd, int minfd) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o) return -1;
+    struct task* t = task_current();
+    if (!t) return -1;
+    /* 0/1/2 are RESERVED for the console and deliberately absent from the table
+     * (fd_lookup rejects them, fd_install starts at 3).  A dup must obey the
+     * same convention: handing back 0 produces a descriptor that looks valid to
+     * the caller and can never be looked up again — which is precisely how a
+     * Wayland client ended up passing descriptor zero to the compositor. */
+    if (minfd < 3) minfd = 3;
+    for (int i = minfd; i < TASK_MAX_FDS; i++) {
+        if (t->fds[i]) continue;
+        t->fds[i] = ofile_ref(o);
+        return i;
+    }
+    return -1;
+}
+
 /* M34 — kill(pid, sig): post `sig` to task `pid`.  Delivery happens when that
  * task next returns to user mode (hal/x86/signal.c).  A task blocked in a
  * syscall won't notice until it returns (no EINTR yet — a follow-up). */
@@ -938,6 +966,26 @@ long sys_recv(int fd, void* buf, size_t n, int* passfd_out) {
     if (r > 0 && copy_to_user((uintptr_t)buf, b.buf, (size_t)r) != 0) r = -1;
     bounce_fini(&b);
     if (passfd_out) copy_to_user((uintptr_t)passfd_out, &kpass, sizeof kpass);
+    return r;
+}
+
+/* recv into a RING-3 payload buffer, with any passed descriptor landing in the
+ * caller's KERNEL local.  Same split as sys_recvfrom_u, and needed for the same
+ * reason: the Linux personality's recvmsg owns the descriptor (it marshals it
+ * into the client's SCM_RIGHTS block itself) while the payload pointer is the
+ * client's.  Handing sys_recv a kernel `passfd_out` made its user-pointer check
+ * reject the call — the FOURTH time this exact shape has bitten (see the sys_*_k
+ * cores, linux_sendmsg and hostorder_to_sockaddr): a validity check belongs
+ * where the pointer's ORIGIN is known. */
+long sys_recv_u(int fd, uintptr_t ubuf, size_t n, int* kpassfd_out) {
+    if (kpassfd_out) *kpassfd_out = -1;
+    if (n && !vmm_user_access_ok(ubuf, n, 1)) return -1;
+
+    struct bounce b; bounce_init(&b, n ? n : 1);
+    size_t chunk = (n > b.cap) ? b.cap : n;
+    long r = sys_recv_k(fd, b.buf, chunk, kpassfd_out);
+    if (r > 0 && copy_to_user(ubuf, b.buf, (size_t)r) != 0) r = -1;
+    bounce_fini(&b);
     return r;
 }
 
