@@ -384,6 +384,11 @@ void vmm_print_status(void) {
 struct vmm_space {
     uint64_t* pml4;         /* process PML4 (identity: virt == phys) */
     uintptr_t pml4_phys;
+
+    /* §M48 — the mmap bump cursor lives with the ADDRESS SPACE, not with the
+     * task.  See the i386 twin for why a per-task cursor (or a snapshot copied
+     * at clone time) lets one thread map over another's memory. */
+    uintptr_t mmap_cursor;
 };
 
 static inline uint64_t read_cr3(void) {
@@ -396,6 +401,9 @@ static inline void write_cr3(uint64_t v) {
 struct vmm_space* vmm_space_create(void) {
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
     if (!s) return NULL;
+    /* kmalloc does not zero: an uninitialised bump cursor is handed straight
+     * back to the program as an mmap address. */
+    s->mmap_cursor = 0;
 
     pmm_phys_t pml4_phys = pmm_alloc_frame();
     if (!pml4_phys) { kfree(s); return NULL; }
@@ -570,6 +578,10 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     if (!parent) return NULL;
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
     if (!s) return NULL;
+    /* fork(): the child inherits the parent's mappings, so it must inherit the
+     * cursor too — restarting at the region base would re-issue addresses the
+     * child already has mapped. */
+    s->mmap_cursor = parent->mmap_cursor;
     pmm_phys_t pml4_phys = pmm_alloc_frame();
     if (!pml4_phys) { kfree(s); return NULL; }
     s->pml4      = (uint64_t*)phys_to_virt(pml4_phys);
@@ -690,3 +702,14 @@ void vmm_space_switch(struct vmm_space* s) {
  * map.  Valid while RAM ≤ 1 GiB (our configs); a larger identity map would
  * push this higher — revisit with the ELF loader if we run big-RAM guests. */
 uintptr_t vmm_user_base(void) { return 0x40000000u; }
+
+
+/* §M48 — the address space's mmap bump cursor.  Policy (where the region
+ * starts, how far it may grow) stays in usyscall.c; the SPACE only owns the
+ * storage, so every task sharing an mm shares one cursor. */
+uintptr_t vmm_space_mmap_cursor(struct vmm_space* s) {
+    return s ? s->mmap_cursor : 0;
+}
+void vmm_space_set_mmap_cursor(struct vmm_space* s, uintptr_t v) {
+    if (s) s->mmap_cursor = v;
+}

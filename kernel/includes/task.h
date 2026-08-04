@@ -121,7 +121,6 @@ struct task {
     struct ofile* fds[TASK_MAX_FDS];
     /* M25 stage 4 — bump cursor for anonymous / shm mmap VAs in this task's
      * user space.  Reset by the exec path; grows upward per mmap. */
-    uintptr_t     mmap_cursor;
     /* Tier B — 1 for an INDEPENDENT user process (proc_spawn): it runs at
      * ring 3/EL0 as its own preemptible task, uses its own kernel stack for
      * privilege transitions (scheduler sets TSS.esp0 to its kstack top on x86),

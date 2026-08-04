@@ -42,7 +42,6 @@ extern uint16_t g_entry_gs;
 struct fork_boot {
     struct vmm_space* space;
     struct user_regs  regs;
-    uintptr_t         mmap_cursor;
     struct ofile*     fds[TASK_MAX_FDS];    /* parent fd snapshot, refs bumped */
 };
 
@@ -54,7 +53,6 @@ static void fork_child_bootstrap(void) {
     struct task* me = task_current();
 
     me->mm          = b->space;
-    me->mmap_cursor = b->mmap_cursor;
     me->user_task   = 1;
     for (int i = 0; i < TASK_MAX_FDS; i++) me->fds[i] = b->fds[i];
 
@@ -92,7 +90,6 @@ int proc_fork(struct user_regs* parent_regs) {
     b->space       = child_space;
     b->regs        = *parent_regs;
     b->regs.eax    = 0;                      /* child: fork() returns 0         */
-    b->mmap_cursor = parent->mmap_cursor;
     for (int i = 0; i < TASK_MAX_FDS; i++)
         b->fds[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
 

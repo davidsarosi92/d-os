@@ -339,6 +339,13 @@ void vmm_print_status(void) {
 struct vmm_space {
     uint32_t* pd;           /* 4 KiB page directory (identity: virt == phys) */
     uint32_t  pd_phys;      /* == (uint32_t)pd, cached for CR3 loads */
+    /* §M48 — the mmap bump cursor lives with the ADDRESS SPACE, not with the
+     * task.  It used to be per-task, so a cloned thread started at zero, reset
+     * it to the region base, and handed out addresses ON TOP OF the mappings
+     * its own process was already using.  A snapshot copied at clone time is
+     * no better: two threads then bump independent copies toward the same
+     * addresses.  One space, one cursor. */
+    uintptr_t mmap_cursor;
 };
 
 static inline uint32_t read_cr3(void) {
@@ -355,6 +362,9 @@ static int pde_is_kernel_shared(struct vmm_space* s, uint32_t i) {
 struct vmm_space* vmm_space_create(void) {
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
     if (!s) return NULL;
+    /* kmalloc does not zero: an uninitialised bump cursor is handed straight
+     * back to the program as an mmap address. */
+    s->mmap_cursor = 0;
 
     pmm_phys_t pd_phys = pmm_alloc_frame();       /* one 4 KiB frame = 1024 PDEs */
     if (!pd_phys) { kfree(s); return NULL; }
@@ -430,6 +440,10 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     if (!parent) return NULL;
     struct vmm_space* child = vmm_space_create();     /* kernel snapshot only */
     if (!child) return NULL;
+    /* fork(): the child inherits the parent's mappings, so it must inherit the
+     * cursor too — restarting at the region base would re-issue addresses the
+     * child already has mapped. */
+    child->mmap_cursor = parent->mmap_cursor;
 
     /* Walk the parent's private user mappings.  WRITABLE pages become
      * copy-on-write (shared read-only in BOTH spaces, ref-counted); read-only
@@ -547,3 +561,14 @@ void vmm_space_switch(struct vmm_space* s) {
 
 /* User region base: 1 GiB, comfortably above the 256 MiB identity map. */
 uintptr_t vmm_user_base(void) { return 0x40000000u; }
+
+
+/* §M48 — the address space's mmap bump cursor.  Policy (where the region
+ * starts, how far it may grow) stays in usyscall.c; the SPACE only owns the
+ * storage, so every task sharing an mm shares one cursor. */
+uintptr_t vmm_space_mmap_cursor(struct vmm_space* s) {
+    return s ? s->mmap_cursor : 0;
+}
+void vmm_space_set_mmap_cursor(struct vmm_space* s, uintptr_t v) {
+    if (s) s->mmap_cursor = v;
+}

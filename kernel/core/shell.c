@@ -341,7 +341,7 @@ static void cmd_faulttest(void) {
     if (!s) { console_write("faulttest: no space\n"); return; }
     struct vmm_space* prev = me->mm;
     int prev_gate = me->in_user_syscall;
-    me->mm = s; me->mmap_cursor = 0;
+    me->mm = s;
     vmm_space_switch(s);
     me->in_user_syscall = 1;                 /* pretend we came from ring 3 */
 
@@ -391,7 +391,7 @@ static void cmd_faulttest(void) {
     }
 
     vmm_space_switch(prev);
-    me->mm = prev; me->mmap_cursor = 0;
+    me->mm = prev;
     vmm_space_destroy(s);
 
     kprintf("faulttest: gate   write(kernel ptr)=%ld open(unmapped)=%d stat(unmapped)=%d -> %s\n",
@@ -1402,7 +1402,7 @@ static void cmd_shmtest(void) {
     struct vmm_space* s = vmm_space_create();
     if (!s) { console_write("shmtest: no space\n"); return; }
     struct vmm_space* prev = me->mm;
-    me->mm = s; me->mmap_cursor = 0;
+    me->mm = s;
     vmm_space_switch(s);
 
     long a = sys_mmap(8192, -1);                     /* anonymous, 2 pages */
@@ -1424,7 +1424,7 @@ static void cmd_shmtest(void) {
     if (fd >= 0) sys_close(fd);                       /* frees shm frames once */
 
     vmm_space_switch(prev);
-    me->mm = prev; me->mmap_cursor = 0;
+    me->mm = prev;
     vmm_space_destroy(s);                             /* frees anon; skips shm */
 
     kprintf("shmtest: anon-mmap=%s shm-shared=%s (a=%p m1=%p m2=%p)\n",
@@ -1444,7 +1444,7 @@ static void cmd_socktest(void) {
     struct vmm_space* s = vmm_space_create();
     if (!s) { console_write("socktest: no space\n"); return; }
     struct vmm_space* prev = me->mm;
-    me->mm = s; me->mmap_cursor = 0;
+    me->mm = s;
     vmm_space_switch(s);
 
     int fds[2] = { -1, -1 };
@@ -1479,7 +1479,7 @@ static void cmd_socktest(void) {
     if (fds[1] >= 0) sys_close(fds[1]);
 
     vmm_space_switch(prev);
-    me->mm = prev; me->mmap_cursor = 0;
+    me->mm = prev;
     vmm_space_destroy(s);
 
     kprintf("socktest: pair+data=%s fd-passing(shared mem)=%s (passed fd=%d)\n",
@@ -2153,6 +2153,27 @@ static void cmd_netmusl(void) {
  * shared library (libgreet.so, at /lib).  Exercises ld.so's real work: locate
  * a genuinely separate .so via the search path and resolve symbols across
  * three objects (main → libgreet → libc). */
+extern const unsigned char _binary_user_thrdyn_dynelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_thrdyn_dynelf_end[]   __attribute__((weak));
+
+/* `pthreadtest` covers threads in a STATIC binary.  This covers them in a
+ * DYNAMIC one, which is where NetSurf died the moment it grew a worker. */
+static void cmd_thrdyn(void) {
+    if (!_binary_user_thrdyn_dynelf_start) {
+        console_write("thrdyn: not embedded — run `make musl` then rebuild\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_thrdyn_dynelf_end -
+                          _binary_user_thrdyn_dynelf_start);
+    console_write("thrdyn: threads inside a DYNAMIC musl binary...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(_binary_user_thrdyn_dynelf_start, len);
+    if (me) me->linux_abi = prev;
+    kprintf("thrdyn: returned rc=%d\n", rc);
+}
+
 extern const unsigned char _binary_user_solibtest_dynelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_solibtest_dynelf_end[]   __attribute__((weak));
 
@@ -2736,6 +2757,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "netmusl"))        { cmd_netmusl(); return; }
     if (streq(line, "httpstest"))      { cmd_httpstest(); return; }
     if (streq(line, "cpptest"))        { cmd_cpptest(); return; }
+    if (streq(line, "thrdyn"))        { cmd_thrdyn(); return; }
     if (streq(line, "solibtest"))      { cmd_solibtest(); return; }
     if (streq(line, "dlopentest"))     { cmd_dlopentest(); return; }
     if (streq(line, "pkg"))            { cmd_pkg("");        return; }

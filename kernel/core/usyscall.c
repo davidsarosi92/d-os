@@ -388,16 +388,16 @@ long sys_lseek(int fd, long off, int whence) {
 
 /* Map memory into the calling task's user space: `fd < 0` → a fresh anonymous
  * region; otherwise map the shared-memory object behind `fd`.  Returns the
- * user VA (bump-allocated from task->mmap_cursor) or -1. */
+ * user VA (bump-allocated from the ADDRESS SPACE's cursor) or -1. */
 long sys_mmap(size_t len, int fd) {
     struct task* t = task_current();
     if (!t || !t->mm) return -1;
 
     int n = (int)((len + PAGE_SIZE - 1) / PAGE_SIZE);
     if (n <= 0) n = 1;
-    if (t->mmap_cursor == 0)
-        t->mmap_cursor = vmm_user_base() + MMAP_BASE_OFFSET;
-    uintptr_t va = t->mmap_cursor;
+    if (vmm_space_mmap_cursor(t->mm) == 0)
+        vmm_space_set_mmap_cursor(t->mm, vmm_user_base() + MMAP_BASE_OFFSET);
+    uintptr_t va = vmm_space_mmap_cursor(t->mm);
 
     if (fd < 0) {
         for (int i = 0; i < n; i++) {
@@ -425,7 +425,7 @@ long sys_mmap(size_t len, int fd) {
         }
         n = cnt;
     }
-    t->mmap_cursor += (uintptr_t)n * PAGE_SIZE;
+    vmm_space_set_mmap_cursor(t->mm, va + (uintptr_t)n * PAGE_SIZE);
     return (long)va;
 }
 
@@ -464,10 +464,10 @@ long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
          * against a garbage/kernel addr, not against self-overwrite. */
         if (va < vmm_user_base() || va + (uintptr_t)n * PAGE_SIZE < va) return -1;
     } else {
-        if (t->mmap_cursor == 0)
-            t->mmap_cursor = vmm_user_base() + MMAP_BASE_OFFSET;
-        va = t->mmap_cursor;
-        t->mmap_cursor += (uintptr_t)n * PAGE_SIZE;
+        if (vmm_space_mmap_cursor(t->mm) == 0)
+            vmm_space_set_mmap_cursor(t->mm, vmm_user_base() + MMAP_BASE_OFFSET);
+        va = vmm_space_mmap_cursor(t->mm);
+        vmm_space_set_mmap_cursor(t->mm, va + (uintptr_t)n * PAGE_SIZE);
     }
 
     /* File to read from for a file-backed mapping (else anonymous zero-fill).
@@ -1085,7 +1085,6 @@ void fd_close_all(void) {
     for (int fd = 3; fd < TASK_MAX_FDS; fd++) {
         if (t->fds[fd]) { ofile_unref(t->fds[fd]); t->fds[fd] = NULL; }
     }
-    t->mmap_cursor = 0;
 }
 
 /* ---- network sockets (M24 socket API — AF_INET) --------------------------- */

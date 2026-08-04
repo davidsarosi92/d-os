@@ -55,6 +55,11 @@ uint64_t* mmu_kernel_l1(void);          /* mmu.c — shared kernel L1 table */
 
 struct vmm_space {
     uint64_t* l1;                       /* level-1 table = TTBR0 root */
+
+    /* §M48 — the mmap bump cursor lives with the ADDRESS SPACE, not with the
+     * task.  See the i386 twin for why a per-task cursor (or a snapshot copied
+     * at clone time) lets one thread map over another's memory. */
+    uintptr_t mmap_cursor;
 };
 
 /* Allocate a zeroed 4 KiB translation table.  RAM is identity-mapped, so the
@@ -114,6 +119,9 @@ int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
 struct vmm_space* aarch64_vmm_create(void) {
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof *s);
     if (!s) return NULL;
+    /* kmalloc does not zero: an uninitialised bump cursor is handed straight
+     * back to the program as an mmap address. */
+    s->mmap_cursor = 0;
     s->l1 = alloc_table();
     if (!s->l1) { kfree(s); return NULL; }
     uint64_t* kl1 = mmu_kernel_l1();
@@ -326,4 +334,15 @@ void vmm_space_switch(struct vmm_space* s) {
         "msr ttbr0_el1, %0\n"
         "dsb ish\ntlbi vmalle1\ndsb ish\nisb\n"
         :: "r"(target) : "memory");
+}
+
+
+/* §M48 — the address space's mmap bump cursor.  Policy (where the region
+ * starts, how far it may grow) stays in usyscall.c; the SPACE only owns the
+ * storage, so every task sharing an mm shares one cursor. */
+uintptr_t vmm_space_mmap_cursor(struct vmm_space* s) {
+    return s ? s->mmap_cursor : 0;
+}
+void vmm_space_set_mmap_cursor(struct vmm_space* s, uintptr_t v) {
+    if (s) s->mmap_cursor = v;
 }

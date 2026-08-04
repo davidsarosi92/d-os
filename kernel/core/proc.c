@@ -312,7 +312,7 @@ static int proc_exec_common(const void* image, size_t len,
      * mode.  Control returns here when the program issues SYS_EXIT. */
     struct task* me = task_current();
     struct vmm_space* prev = me ? me->mm : NULL;
-    if (me) { me->mm = s; me->mmap_cursor = 0; }   /* fresh mmap region */
+    if (me) me->mm = s;              /* a fresh space carries a fresh cursor */
     vmm_space_switch(s);
 
     enter_user_mode_wrap(lp.entry, user_sp);
@@ -411,7 +411,6 @@ int proc_execve(const char* path, char* const uargv[]) {
     me->sig_pending = 0;
     struct vmm_space* old = me->mm;
     me->mm = ns;
-    me->mmap_cursor = 0;
     vmm_space_switch(ns);
     if (old) vmm_space_destroy(old);
     kfree(img);
@@ -447,7 +446,6 @@ static void user_task_bootstrap(void) {
     uintptr_t entry = b->entry, sp = b->user_sp;
 
     me->mm          = b->space;
-    me->mmap_cursor = 0;
     me->user_task   = 1;
     me->linux_abi   = b->linux_abi;   /* a musl/Linux-ABI package (e.g. NetSurf) */
     kfree(b);
@@ -478,7 +476,6 @@ struct clone_boot {
     struct vmm_space* space;
     uintptr_t         entry;
     uintptr_t         user_sp;
-    uintptr_t         mmap_cursor;
     struct ofile*     fds[TASK_MAX_FDS];
 };
 
@@ -489,7 +486,6 @@ static void clone_bootstrap(void) {
     me->mm          = b->space;      /* SHARED with the creator */
     me->mm_shared   = 1;
     me->user_task   = 1;
-    me->mmap_cursor = b->mmap_cursor;
     for (int i = 0; i < TASK_MAX_FDS; i++) me->fds[i] = b->fds[i];
 
     uintptr_t entry = b->entry, sp = b->user_sp;
@@ -510,7 +506,6 @@ int proc_clone(uintptr_t entry, uintptr_t stack) {
     b->space       = parent->mm;    /* share, don't clone */
     b->entry       = entry;
     b->user_sp     = stack;
-    b->mmap_cursor = parent->mmap_cursor;
     for (int i = 0; i < TASK_MAX_FDS; i++)
         b->fds[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
 

@@ -70,6 +70,7 @@ MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o \
 # §M37 dynamic-linking artifacts — the ld.so blob + the dynamically linked tests.
 MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
                    user/libgreet_blob.o user/solibtest_dynblob.o \
+                   user/thrdyn_dynblob.o \
                    user/dlopentest_dynblob.o
 # §M38 C++ runtime artifacts (cpptest = exceptions across a .so + the .so's).
 CXX_RUNTIME_BLOBS := user/cpptest_cxxblob.o user/libcpplib_blob.o \

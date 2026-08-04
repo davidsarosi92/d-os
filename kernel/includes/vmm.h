@@ -182,6 +182,13 @@ int  vmm_space_protect(struct vmm_space* space, uintptr_t virt, uint32_t flags);
 /* Physical address of the space's top-level table (CR3 / PML4 / TTBR0). */
 uintptr_t vmm_space_pd_phys(struct vmm_space* space);
 
+/* §M48 — the mmap bump cursor, owned by the ADDRESS SPACE.  It used to live on
+ * the task, which meant a cloned thread began at zero and re-issued addresses
+ * its own process was already using; copying a snapshot at clone time only
+ * delays the collision.  All tasks sharing an mm must share one cursor. */
+uintptr_t vmm_space_mmap_cursor(struct vmm_space* space);
+void      vmm_space_set_mmap_cursor(struct vmm_space* space, uintptr_t v);
+
 /* Make `space` (NULL = kernel space) the active address space on this CPU.
  * Loads CR3 (x86) / TTBR0 (aarch64) only when it actually changes, so
  * switching between kernel threads is free. */
