@@ -9,7 +9,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M47"                 /* latest shipped: §M47 crash records + pluggable reporting */
+#define DOS_MILESTONE  "M48"                 /* latest shipped: §M48 discovered memory ceiling + a usable browser */
 
 /* Short architecture tag for the on-screen label.  Deliberately the FAMILIAR
  * short form ("x32"/"x64") rather than the toolchain triple — the wallpaper

@@ -4365,6 +4365,206 @@ NetSurf launching and closing cleanly with no crash record.
 
 ---
 
+### 4.42 The memory ceiling, discovered rather than compiled in (M48)
+
+The physical-memory ceiling used to be `BUDDY_MAX_FRAMES`, a per-arch `#define`
+sizing a static `page_state[]` in `.bss`.  That construction cannot scale:
+metadata is one byte per frame, so supporting 128 GiB means 33 MiB of `.bss` on
+every machine — including the 256 MiB one that has to load it before it can run.
+"Supports big machines" and "boots on small ones" were in direct opposition for
+as long as the number was baked in.
+
+`pmm_init` now reads the firmware memory map, asks the HAL how far memory
+reaches, and sizes its metadata to the RAM *this* machine has, out of a boot
+arena reserved before any free list exists (`pmm_bootmem_alloc`).  kmalloc's
+big-alloc side table and the COW refcount table follow the same rule.  One
+kernel image boots on 128 MiB and on 128 GiB and pays for neither on the other.
+
+Physical addresses widened to arch width (`pmm_phys_t`): the API returned
+`uint32_t`, which is a 4 GiB ceiling no amount of metadata would have lifted.
+
+**Seeding** no longer releases every usable frame individually at order 0 and
+lets coalescing rebuild the higher orders.  Correct at 65k frames, ruinous at
+33.8 million: it turned a 128 GiB boot into minutes of bookkeeping to
+reconstruct a structure we can emit directly.  It now covers each run of usable
+frames with the largest *aligned* power-of-two blocks that fit — the shape
+coalescing would have converged on, without the intermediate work.
+
+**`ZONE_DMA32`** is new and not cosmetic.  While the ceiling was 4 GiB, "any
+frame" and "a frame a 32-bit device can reach" were the same thing, so no driver
+had to say which it meant.  Past 4 GiB they diverge, and a device handed an
+address it can only store 32 bits of does not fail loudly — it DMAs into
+whatever the truncation lands on.  Device buffers now name DMA32 explicitly
+(`pmm_alloc_frame_dma32`); 64-bit DMA is an opt-in a driver has to earn.
+
+#### The kernel direct map, and why user space could not move instead
+
+Raising the ceiling exposed a defect far larger than the one being fixed:
+**x86_64 userland was broken on any machine with more than 1 GiB of RAM.**
+
+The identity map grew by adding 1 GiB pages at virtual == physical.  User space
+starts at `vmm_user_base()` = 1 GiB, so the first extension landed exactly on
+top of it; `walk_to_pt_root` refuses to build a mapping under a large page, and
+every `exec` returned `ELF_ENOMEM`.  The port only ever looked healthy because
+it was always tested with `-m 1024M`.
+
+User programs cannot move out of the way: they are compiled with the small code
+model, which requires every symbol below 2 GiB.  So the *kernel's* physical
+window moved instead — all of physical memory is mapped once in the canonical
+upper half at `KERNEL_DIRECT_MAP_BASE` (PML4[256]), reached through
+`phys_to_virt`, and low addresses belong entirely to user space whatever the RAM
+size.  `phys_to_virt`/`virt_to_phys` are portable and compile to nothing where
+the base is 0, so i386 and aarch64 are unaffected.
+
+ACPI needed the same treatment.  It identity-mapped its tables on the stated
+reasoning that they sit "far below the user base" — true on i386, false on
+x86_64, where firmware puts them at the top of low RAM (~2 GiB on a 2 GiB
+machine, inside the user region).  Every process inherited that mapping and
+`fork()` came back reading ACPI memory.  It escaped notice because with much
+more RAM the tables sit above the user region again.
+
+#### i386: the ceiling was self-imposed, then it is real
+
+The i386 identity map stopped at 256 MiB "because we have no pressure for more",
+while `vmm_user_base()` is 1 GiB — everything below that is the kernel's to map
+and nothing can collide with it.  Three quarters of the reachable window sat
+unused, which is why a 512 MiB box managed 234 MiB and why Mesa ran out of
+memory on a machine that had plenty.  The map now runs to 1 GiB (256 PSE PDEs,
+a quarter of the page directory; user mappings start at PDE 256): 473 MiB usable
+on a 512 MiB box.
+
+Past that the limit is real.  32-bit paging holds 32-bit physical addresses —
+4 GiB, full stop — and reaching it needs kmap, since 4 GiB of virtual space
+cannot linearly map 4 GiB of RAM alongside user space.  **64 GiB on i386 is
+exactly the PAE maximum, and PAE is a different page-table format, not a bigger
+constant.**
+
+#### Four latent bugs this surfaced, all silent
+
+- **slab's `page_of`** masked with `~(4096u - 1)`, a 32-bit value that
+  zero-extends and erases every bit above 4 GiB, pointing the lookup at an
+  unrelated low page.  `kfree` then rejected valid objects.
+- **The COW refcount table** covered only the first 1 GiB, documented as costing
+  "a little memory, never correctness".  True for the fault path, false for
+  clone/free: `fork` shares an untracked page in both spaces while
+  `free_subtree`, finding no refcount, releases it from each.  A double free —
+  the buddy handed one frame to two owners and the second's page table
+  overwrote the first's.  The i386 twin had the same shape and was safe only
+  because its window happened to equal its identity cap; both are now sized from
+  `pmm_nr_frames`.
+- **`send()`/`recv()` on a connected TCP socket** do not work in ring 3: the
+  Linux-ABI layer wires `connect`/`read`/`write`, and the send/recv entry points
+  serve the datagram paths (see §4.43).
+- **i386 ring 3 could not execute SSE.**  `CR4.OSFXSR` was deliberately left
+  clear, documented in `fpu.c` as "ring-3 code here is x87-only".  That held
+  only while every user binary came from our own toolchain; a ported library
+  does not ask, and Mesa's i386 build uses SSE for its math and memory paths.
+  Enabling it needed no change to `fpu.c` — the eager FXSAVE path was written to
+  cover the XMM half the moment OSFXSR is set.
+
+**Verified:** x86_64 boots and runs userland at 1G / 2G / 3G / 4G / 8G / 128G
+(130 891 MiB managed at 128 GiB, zero faults, zero `kfree` errors); i386
+regression-free at 256M / 512M; aarch64 builds.
+
+---
+
+### 4.43 NetSurf: input it can act on, and a fetcher (M48)
+
+Two independent reasons the browser was inert.
+
+**Nothing could be clicked.**  `enum gui_input_type` was `{ KEY, MOTION }`.  A
+window that forwards input to a client — NetSurf via dosgui, any Wayland surface
+— could learn that the pointer *moved* but never that a button was pressed: a
+click reached the compositor, raised the window, and was then delivered as an
+indistinguishable motion event.  No link, form field or scrollbar could ever be
+activated.  `GUI_INPUT_BUTTON` now carries press and release for both buttons
+through `evq` → `aq` → `app_dispatch_event` → the client, in content
+coordinates, with the motion pushed immediately before the press so the client's
+pointer is where the click happened.
+
+**Typing produced noise.**  `gui_raw_key` CONSUMED every key for a hook-backed
+window, so the keymap never ran and only the raw scancode was forwarded.
+libnsfb reads its key codes as SDL-shaped values where printable characters ARE
+their ASCII, so NetSurf rendered scancodes as characters.  `gui_input` now
+carries the cooked character alongside the scancode — both are needed and
+neither substitutes for the other, since Wayland builds characters from
+scancodes with its own xkb keymap while NetSurf has no keymap at all.  Return
+needed mapping too: the keymap yields `'\n'` (10), `NSFB_KEY_RETURN` is 13, so
+Enter in the URL bar inserted a character instead of navigating.
+
+**No fetcher.**  The curated source list carried `data:`, `resource:` and
+`file:` only, with the curl fetcher compiled out — so typing an address or
+clicking a link did nothing, and that was never an input bug: no code in the
+binary could speak HTTP.  `user/netsurf/fetch_dos.c` implements NetSurf's
+`fetcher_operation_table` over what `wget` already proves on this stack — ring-3
+sockets, musl `getaddrinfo`, Mbed TLS — and attaches through `fetcher_init`'s
+existing `WITH_CURL` hook by DEFINING `fetch_curl_register`, so the vendored tree
+stays untouched.  (`WITH_CURL` is set for `content/fetch.c` alone; globally it
+also switches `utils/time.c` to `curl_getdate`, a symbol we do not have.)
+Certificates are verified against `/etc/ssl/cert.pem` with
+`MBEDTLS_SSL_VERIFY_REQUIRED` and the hostname is checked.
+
+Three transport findings, each of which cost a run to isolate:
+
+- **`send`/`recv` do not work** for a connected TCP socket here; the Linux-ABI
+  layer wires `connect`/`read`/`write`.  The fetch connected, appeared to send,
+  and received nothing for 30 seconds while `wget` fetched the same URL.
+- **Never wait for end-of-stream.**  This transport does not surface the peer's
+  FIN as `read() == 0`, so "read until EOF" hangs forever.  The length comes
+  from the protocol instead: headers, then `Content-Length`, then stop.
+- **The read must stay BLOCKING.**  Network RX is polled from the calling task,
+  not from an interrupt, so the blocking read is what drives the NIC; a
+  non-blocking one returns `EAGAIN` forever and nothing ever arrives.
+
+Chunked bodies are decoded, because chunk sizes are not content: before that,
+example.com rendered with a stray `22f` above the heading and a `0` below it.
+
+**And the guest had no network card.**  `run_qemu.sh` attached none, so the
+browser could not open a site however well the fetcher worked.  Every network
+test passed its own `-netdev` on the command line — which is exactly how a gap
+like this survives: the automated path and the path a person uses were not the
+same path.
+
+**Verified by screenshot** on both x86 arches: `http://example.com` and
+`https://example.com` render, and `http://info.cern.ch` renders with its
+favicon fetched as a subresource.
+
+**Open:** `poll()` runs each transfer to completion synchronously, which stalls
+the UI on a slow link — the context list is already the shape an incremental
+version needs, so that is a change to `dos_fetch_poll` alone.
+
+---
+
+### 4.44 Mesa/EGL on i386 (M48)
+
+`egltri win` renders the rotating GLES2 triangle in a d-os window on i386 as
+well as x86_64 (`softpipe`, `OpenGL ES 3.1 Mesa 23.1.9`).
+
+The Mesa blob block sat inside the Makefile's x86_64 branch, so "Mesa is
+x86_64-only" was a property of where ten lines lived rather than of the code —
+every path in them is already parameterised by `$(ARCH)`.  Hoisted out and
+guarded on the built artifact; `scripts/build-mesa.sh` builds the tree for
+either arch, so the second one is a parameter rather than a re-derivation.
+
+Two blockers, both covered in §4.42: ring 3 could not execute SSE, and the
+identity map's self-imposed 256 MiB cap starved Mesa's allocations.
+
+The diagnosis is worth keeping because the symptom was so uninformative.
+`eglCreateContext` returned `EGL_BAD_ALLOC`, which the DRI layer emits for every
+context failure from a missing driver to a real allocation error.  Asking the
+allocator directly settled it: a 32 MiB `malloc` failed IN THE CLIENT while the
+kernel reported 139 MiB free — d-os commits `mmap` eagerly, one frame per page,
+so Mesa's arenas were charged in full against a 234 MiB ceiling.
+
+Diagnostics kept rather than removed: `egltri d` sets `EGL_LOG_LEVEL`/
+`MESA_DEBUG` so Mesa narrates its own driver loading, `EGL_CLIENT_APIS` is
+printed (it distinguishes a missing GLES frontend from a runtime failure), and
+`eglCreateContext`/`eglCreateWindowSurface` are checked separately — testing
+both and asking `eglGetError()` once reports `EGL_SUCCESS` whenever the first
+failed and the second succeeded, which is exactly what this bring-up hit.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -4434,6 +4634,32 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 ---
 
 ## 8. Change log
+
+- **2026-08-04 — §M48: the memory ceiling is discovered, not compiled in; NetSurf
+  becomes usable; Mesa reaches i386 (DOCS §4.42–§4.44).**  `pmm_init` sizes its
+  metadata from the firmware map instead of a per-arch `#define`, so one image
+  boots on 128 MiB and on 128 GiB — verified on x86_64 at 1G/2G/3G/4G/8G/128G
+  with userland running and zero faults.  Physical addresses widened to arch
+  width; seeding emits maximal aligned blocks instead of releasing 33.8 million
+  frames one at a time; new `ZONE_DMA32` keeps device buffers under 4 GiB now
+  that "any frame" and "a frame a 32-bit device can reach" have stopped being
+  the same thing.  **x86_64 userland turned out to be broken on any machine with
+  more than 1 GiB of RAM** — the identity map's 1 GiB page landed on top of the
+  user region and every `exec` returned `ELF_ENOMEM`; the port only looked
+  healthy because it was always tested with `-m 1024M`.  Fixed by moving the
+  kernel's physical window to a direct map in the upper half.  Four more latent
+  bugs surfaced and were fixed: slab's 32-bit page mask, the COW refcount
+  table's 1 GiB window (a double free once exceeded), ACPI identity-mapping its
+  tables into user space, and i386 ring 3 being unable to execute SSE.  i386's
+  identity map now runs to 1 GiB (234 → 473 MiB usable on a 512 MiB box); past
+  that the limit is real, and 64 GiB there is exactly the PAE maximum.  NetSurf
+  gained mouse-button events (the compositor had none, so nothing was ever
+  clickable), cooked characters (typing was raw scancodes rendered as text), and
+  an http/https fetcher over d-os sockets + Mbed TLS with real certificate
+  verification.  `run_qemu.sh` now attaches a network card — its absence is why
+  no site would load however well the fetcher worked.  `egltri win` renders on
+  i386 too.  New: `PLAN_AARCH64.md`, a measured catch-up roadmap for the ARM64
+  port.
 
 - **2026-08-03 — §M40 COMPLETE: EGL + GLES2 render through a Wayland buffer.**
   `egltri win` opens a d-os desktop window with a spinning GLES2 triangle drawn

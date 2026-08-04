@@ -18,6 +18,49 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M48 — THE MEMORY CEILING IS DISCOVERED, NOT COMPILED IN + A USABLE
+BROWSER (2026-08-04, DOCS §4.42–§4.44).**  `pmm_init` sizes its metadata from the
+firmware map instead of a per-arch `#define`, so ONE image boots on 128 MiB and
+on 128 GiB (x86_64 verified at 1G/2G/3G/4G/8G/128G, userland running, zero
+faults).  `pmm_phys_t` widens physical addresses to arch width; seeding emits
+maximal ALIGNED runs instead of releasing 33.8 M frames one at a time; new
+`ZONE_DMA32` — past 4 GiB, "any frame" and "a frame a 32-bit device can reach"
+stop being the same thing, and a device handed a truncated address does not fail
+loudly.  **Raising the ceiling exposed that x86_64 userland was broken on ANY
+machine with >1 GiB RAM**: the identity map's 1 GiB page landed exactly on
+`vmm_user_base()` and every `exec` returned `ELF_ENOMEM` — invisible because
+every x86_64 test used `-m 1024M`.  User programs cannot move (small code model
+⇒ symbols below 2 GiB), so the KERNEL's physical window moved: a direct map in
+the canonical upper half (`KERNEL_DIRECT_MAP_BASE`, `phys_to_virt`), which
+compiles to nothing where the base is 0.  **Four more latent bugs, all silent:**
+slab's `page_of` masked with a 32-bit `~(4096u-1)`; the COW refcount table
+covered 1 GiB and a frame outside it became a DOUBLE FREE (fork shares it, both
+spaces free it — same shape on i386, safe only by coincidence); ACPI
+identity-mapped its tables "far below the user base", true on i386 and false on
+x86_64 where they sit at the top of low RAM, so `fork()` read ACPI memory; and
+i386 ring 3 could not execute SSE (`CR4.OSFXSR` deliberately clear — fine while
+every binary was ours, fatal for a ported library).  **i386's identity map now
+runs to 1 GiB** (it stopped at 256 MiB while user space starts at 1 GiB — three
+quarters of the window unused): 234 → 473 MiB on a 512 MiB box.  Past that the
+limit is REAL: 32-bit paging = 32-bit physical addresses, and **64 GiB on i386
+is exactly the PAE maximum — a different page-table format, not a bigger
+constant.**  **NetSurf is now usable**: the compositor had NO mouse-button event
+at all (`{KEY, MOTION}`), so a click arrived as motion and nothing in any client
+was ever clickable; typing forwarded raw scancodes, which libnsfb reads as ASCII;
+and there was no http fetcher compiled in.  `user/netsurf/fetch_dos.c` attaches
+through `fetcher_init`'s own `WITH_CURL` hook (vendored tree untouched) over
+ring-3 sockets + Mbed TLS with CA + hostname verification.  Transport lessons:
+**`send`/`recv` do not work on a connected TCP socket** (the Linux-ABI layer
+wires `connect`/`read`/`write`), **never wait for EOF** (the FIN is not surfaced
+as `read()==0` — take the length from `Content-Length`), and **the read must stay
+BLOCKING** (RX is polled from the calling task, so the blocking read is what
+drives the NIC).  **`run_qemu.sh` had no NIC** — every network test passed its
+own `-netdev`, so the automated path and the path a person uses were not the same
+path.  **Mesa/EGL runs on i386** (`egltri win`, softpipe, GLES 3.1); the blob
+block was x86_64-only by where ten Makefile lines lived, not by anything in the
+code.  New: `scripts/build-mesa.sh` (arch-parametric), `PLAN_AARCH64.md`.
+Open: i386 kmap/PAE, a non-blocking fetcher `poll`.
+
 ✅ **§M47 — CRASH RECORDS & REPORTING (2026-08-02, DOCS §4.38, all 3 arches).**
 M46 stopped the box from dying; M47 makes sure that when something *does* go
 wrong the system SAYS SO.  Two phases on purpose: **capture** (`crash_report`)

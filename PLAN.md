@@ -94,6 +94,29 @@ assumptions fixed (crt0 argv, thread-arg passing, TLS segment+offset, missing
 virtio-net/AC97).  Also fixed musl `getaddrinfo` on both arches (SOCK_NONBLOCK
 was discarded; `hostorder_to_sockaddr` validated a kernel word as a user
 pointer) | — |
+| **§M48** | **The memory ceiling, discovered rather than compiled in — and a
+usable browser** — ✅ **SHIPPED** (DOCS §4.42–§4.44).  `pmm_init` sizes its
+metadata from the firmware map instead of a per-arch `#define`, so ONE image
+boots on 128 MiB and on 128 GiB (verified on x86_64 at 1G/2G/3G/4G/8G/128G with
+userland running, zero faults).  Physical addresses widened to arch width; block
+seeding emits maximal aligned runs instead of releasing 33.8 M frames one at a
+time; new `ZONE_DMA32` because past 4 GiB "any frame" and "a frame a 32-bit
+device can reach" stop being the same thing.  **Found: x86_64 userland was broken
+on ANY machine with >1 GiB RAM** — the identity map's 1 GiB page landed on the
+user region and every `exec` returned `ELF_ENOMEM`; it only looked healthy
+because every test used `-m 1024M`.  Fixed with a kernel direct map in the upper
+half (`phys_to_virt`), since user programs cannot move (small code model).  Four
+more latent bugs: slab's 32-bit page mask, the COW refcount table's 1 GiB window
+(a DOUBLE FREE once exceeded — same shape on i386), ACPI identity-mapping its
+tables into user space, and i386 ring 3 unable to execute SSE (`CR4.OSFXSR`).
+i386's identity map now runs to 1 GiB (234 → 473 MiB usable on a 512 MiB box);
+past that the limit is real and 64 GiB there is exactly the PAE maximum.
+**NetSurf**: mouse-button events (the compositor had NONE — nothing was ever
+clickable, in any client), cooked characters (typing was raw scancodes rendered
+as text), and an http/https fetcher over d-os sockets + Mbed TLS with real
+certificate verification.  `run_qemu.sh` now attaches a NIC — its absence is why
+no site loaded however well the fetcher worked.  **Mesa** runs on i386 too | i386
+kmap / PAE; non-blocking fetcher `poll` |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -4258,6 +4281,18 @@ spaces make force-kill safe).  All shipped → this milestone is unblocked.
 ---
 
 ## Change log
+
+- **2026-08-04** — **§M48 SHIPPED: the memory ceiling is discovered, not
+  compiled in; NetSurf becomes usable; Mesa reaches i386.**  See DOCS §4.42–4.44.
+  The lesson worth carrying forward is not any single bug but the pattern behind
+  three of them: a constant chosen for the machines of the day, with a comment
+  explaining why it was safe, that stopped being safe the moment the machine
+  changed — the identity-map cap, the COW refcount window, and ACPI's "far below
+  the user base".  Each was correct when written and each failed silently, not
+  loudly.  A fourth of the same kind: `run_qemu.sh` had no NIC, and every network
+  test passed its own `-netdev`, so the automated path and the path a person uses
+  were never the same path.  Open after this: i386 kmap (and PAE for >4 GiB), a
+  non-blocking fetcher `poll`, and `PLAN_AARCH64.md`'s A1–A7.
 
 - **2026-07-21** — **§M42 NetSurf: runway libs + the browser BINARY compiles +
   links (x86_64).**  Ported the last framework deps as store packages —
