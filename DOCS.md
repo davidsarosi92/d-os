@@ -4530,8 +4530,24 @@ same path.
 favicon fetched as a subresource.
 
 **Open:** `poll()` runs each transfer to completion synchronously, which stalls
-the UI on a slow link — the context list is already the shape an incremental
-version needs, so that is a change to `dos_fetch_poll` alone.
+the UI on a slow link.
+
+An incremental `poll` is not the answer, and this was measured rather than
+assumed: RX is polled from the calling task, so the blocking read is what drives
+the NIC — a non-blocking socket returns `EAGAIN` forever and nothing arrives.
+The blocking cannot be removed, only moved off the drawing thread.
+
+**A worker thread per transfer was tried and does not yet work.**  The fetch
+itself succeeds — the trace shows the full `HTTP 200` from the worker — and the
+browser then dies immediately afterwards, on i386 with a fault just below a page
+boundary in the mmap region (first `#PF`, then `#GP` after the connection state
+was moved off the worker's stack and the stack size set explicitly to 256 KiB).
+The timing and the address point at the thread EXIT path rather than at the
+fetch: musl's `__unmapself` releases the thread's own stack and then syscalls
+`exit`, which is exactly the sequence that leaves nothing valid to execute on if
+the unmap takes effect too early.  `pthreadtest` passes, so this is not "threads
+are broken" — it is something about a thread that exits inside a large dynamic
+PIE, and it needs its own investigation before the fetcher can use one.
 
 ---
 
