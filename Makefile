@@ -2102,7 +2102,7 @@ user/netsurf.dynelf: user/libcss.so.0 user/libdom.so.0 user/libhubbub.so.0 \
                      user/libnsutils.so.0 user/libnslog.so.0 user/libnspsl.so.0 \
                      user/libnsgif.so.0 user/libnsbmp.so.0 user/libnsfb.so.0 \
                      user/libpng16.so.16 user/libz.so.1 user/libfreetype.so.6 \
-                     user/netsurf/dos_image_data.c
+                     user/netsurf/dos_image_data.c user/netsurf/fetch_dos.c
 	NS_CC=/src/$(MUSL_ELF_CC) NS_LDSO=$(DOS_LDSO) sh scripts/build-netsurf.sh
 
 # The browser binary itself, embedded as a blob so the `netsurf` shell command
