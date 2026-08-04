@@ -126,21 +126,21 @@ void hal_arch_early_init(void) {
 /* ---------------------------------------------------------------------------
  * Identity-map extension (M19.5.1).
  *
- * No-op on i386 today.  vmm.c builds a 256 MiB identity map at boot via
+ * §M48: reports 1 GiB.  vmm.c builds a 1 GiB identity map at boot via
  * 4 MiB PSE PDEs and we don't grow it: doing so would need either (a)
  * extending into kernel virtual address space we use for kmalloc /
  * vmm_map (a layout reshuffle), or (b) kmap-style on-demand temporary
  * mappings.  Neither is shipped — see PLAN §M19.5.1.  Returns the
- * existing identity cap so pmm_init caps managed memory at 256 MiB
+ * existing identity cap so pmm_init caps managed memory at 1 GiB
  * on i386.
  *
- * On systems with > 256 MiB RAM, the kmap-less i386 PMM simply ignores
+ * On systems with > 1 GiB RAM, the kmap-less i386 PMM simply ignores
  * the upper frames.  Users hit by this should run x86_64 or wait for
  * kmap to land.
  * --------------------------------------------------------------------------- */
 uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
     (void)end_phys;
-    return (uintptr_t)256u * 1024u * 1024u;     /* IDENTITY_MAP_MIB in vmm.c */
+    return (uintptr_t)1024u * 1024u * 1024u;    /* IDENTITY_MAP_MIB in vmm.c */
 }
 
 /* ---------------------------------------------------------------------------

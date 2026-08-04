@@ -22,6 +22,7 @@
 #include <GLES2/gl2.h>
 #include <xdg-shell-client-protocol.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
@@ -128,6 +129,13 @@ int main(void)
     printf("egltri: EGL %d.%d — vendor '%s'\n", major, minor,
            eglQueryString(ed, EGL_VENDOR));
     printf("egltri: EGL_VERSION '%s'\n", eglQueryString(ed, EGL_VERSION));
+    /* Which APIs the driver actually brought.  If GLES is missing here, a
+     * failing eglCreateContext is a BUILD problem (the GLES frontend was not
+     * compiled in), not a runtime one — and the EGL error alone cannot tell
+     * those apart, since the DRI layer collapses every context failure into
+     * EGL_BAD_ALLOC. */
+    printf("egltri: EGL_CLIENT_APIS '%s'\n", eglQueryString(ed, EGL_CLIENT_APIS));
+    printf("egltri: EGL_EXTENSIONS '%s'\n", eglQueryString(ed, EGL_EXTENSIONS));
 
     eglBindAPI(EGL_OPENGL_ES_API);
     static const EGLint cfg_attr[] = {
@@ -142,10 +150,27 @@ int main(void)
         return 1;
     }
     static const EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    /* Checked SEPARATELY and immediately.  eglGetError() reports the error of
+     * the LAST call and clears it, so testing both results together and then
+     * asking once will report EGL_SUCCESS whenever the first call failed and
+     * the second succeeded — which is exactly what the i386 bring-up hit. */
     EGLContext ctx = eglCreateContext(ed, cfg, EGL_NO_CONTEXT, ctx_attr);
+    if (ctx == EGL_NO_CONTEXT) {
+        printf("egltri: eglCreateContext(GLES2) failed (0x%x)\n", eglGetError());
+        /* Is the client simply out of memory?  The DRI layer collapses a
+         * context allocation failure into the same EGL_BAD_ALLOC it uses for
+         * everything else, so ask the allocator directly rather than inferring.
+         * (Do NOT probe EGL again here — a second eglCreateContext after a
+         * failed one walks half-initialised driver state and faults.) */
+        size_t probe = 32u << 20;
+        void* p32 = malloc(probe);
+        printf("egltri: 32 MiB malloc after failure: %s\n", p32 ? "OK" : "FAILED");
+        free(p32);
+        return 1;
+    }
     EGLSurface es = eglCreateWindowSurface(ed, cfg, (EGLNativeWindowType)win, NULL);
-    if (ctx == EGL_NO_CONTEXT || es == EGL_NO_SURFACE) {
-        printf("egltri: context/surface failed (0x%x)\n", eglGetError()); return 1;
+    if (es == EGL_NO_SURFACE) {
+        printf("egltri: eglCreateWindowSurface failed (0x%x)\n", eglGetError()); return 1;
     }
     if (!eglMakeCurrent(ed, es, es, ctx)) {
         printf("egltri: eglMakeCurrent failed (0x%x)\n", eglGetError()); return 1;

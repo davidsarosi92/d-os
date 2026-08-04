@@ -10,10 +10,10 @@
  *     are identity-mapped via 4 MiB PSE PDEs: virt == phys, RW, supervisor.
  *
  * Because our kernel image, stack, heap, and any physical memory the PMM
- * hands us today all live below 256 MiB, every pointer we already hold
+ * hands us today all live below 1 GiB, every pointer we already hold
  * keeps working the instant paging turns on — no pointer rewriting, no
  * higher-half magic, no relocation.  That simplicity is the whole reason
- * for the 256 MiB identity map; later milestones may swap this out for a
+ * for the 1 GiB identity map; later milestones may swap this out for a
  * higher-half kernel mapping when we want to reclaim the low virtual
  * addresses for user space.
  *
@@ -67,7 +67,20 @@
 #define PD_IDX(v)  (((v) >> 22) & 0x3FF)
 #define PT_IDX(v)  (((v) >> 12) & 0x3FF)
 
-#define IDENTITY_MAP_MIB 256
+/* §M48 — the identity map runs right up to where user space begins.
+ *
+ * It used to stop at 256 MiB "because we have no pressure for more", which
+ * left three quarters of the reachable window unused: `vmm_user_base()` is
+ * 1 GiB, so everything below that is the kernel's to map and NOTHING can
+ * collide with it.  The old cap was the reason a 512 MiB i386 box managed only
+ * 234 MiB, and the reason a ported library that allocates generously (Mesa)
+ * ran out of memory on a machine that had plenty.
+ *
+ * 1 GiB / 4 MiB = 256 PSE PDEs, a quarter of the page directory; user mappings
+ * start at PDE 256 and are untouched.  Going FURTHER is not possible without
+ * moving user space, which the small code model forbids — past this point the
+ * i386 answer is kmap or PAE, not a bigger constant. */
+#define IDENTITY_MAP_MIB 1024
 #define IDENTITY_PDES    (IDENTITY_MAP_MIB / 4)   /* 4 MiB per PSE PDE */
 
 /* ------------------------------------------------------------------------- */
@@ -137,7 +150,7 @@ void vmm_init(void) {
 
     /* Flip the master switch.  The instruction right after this one is
      * fetched from EIP, now translated via kernel_pd.  Because the
-     * current EIP sits in the identity-mapped 256 MiB, execution
+     * current EIP sits in the identity-mapped 1 GiB, execution
      * continues seamlessly. */
     write_cr0(read_cr0() | 0x80000000u);        /* CR0.PG */
 
@@ -183,7 +196,7 @@ int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
 /* Core 4 KiB map, parameterised by the target page directory.  Both the
  * kernel PD (vmm_map) and a per-process space's PD (vmm_space_map, M25)
  * share this exact walk.  `pd` points at a 1024-entry PDE array reachable
- * through the identity map (every PD we allocate lives below 256 MiB). */
+ * through the identity map (every PD we allocate lives below 1 GiB). */
 static int map_in_pd(uint32_t* pd, uint32_t virt, uint32_t phys, uint32_t flags) {
     uint32_t pdi = PD_IDX(virt);
     uint32_t pti = PT_IDX(virt);
@@ -196,7 +209,7 @@ static int map_in_pd(uint32_t* pd, uint32_t virt, uint32_t phys, uint32_t flags)
     uint32_t* pt;
     if ((pde & PDE_P) == 0) {
         /* No table here yet — carve one out of physical memory.  Today
-         * the PMM only ever returns frames below 256 MiB, so we can
+         * the PMM only ever returns frames below 1 GiB, so we can
          * reach the new table through the identity map and zero it. */
         pmm_phys_t pt_phys = pmm_alloc_frame();
         if (!pt_phys) return -2;
@@ -317,7 +330,7 @@ void vmm_print_status(void) {
  * created by *snapshotting* the kernel PD (so the identity map + every
  * boot-time kernel high-mapping stays reachable after a CR3 switch — the
  * kernel code and stack keep resolving) and then receives the process's
- * own user-region PTs on top.  Because the kernel region below 256 MiB is
+ * own user-region PTs on top.  Because the kernel region below 1 GiB is
  * PSE leaves (no shared PT pages) and the high mappings are static and
  * boot-time, the snapshot copy is sufficient — see the vmm.h note on the
  * stage-1 kernel-mapping limitation.

@@ -2307,10 +2307,22 @@ static void cmd_egltri(const char* args) {
                       "(see DOCS §4.40)\n");
         return;
     }
-    int windowed = (args && (args[0] == 'w' || args[0] == 'W'));
+    int windowed = 0, dbg = 0;
+    for (const char* a = args; a && *a; a++) {
+        if (*a == 'w' || *a == 'W') windowed = 1;
+        if (*a == 'd' || *a == 'D') dbg = 1;
+    }
     const char* argv[] = { "egltri" };
     console_write("egltri: running an EGL + GLES2 client (Mesa swrast)...\n");
     proc_set_exec_env("LIBGL_DRIVERS_PATH=/lib/dri");
+    /* `egltri d` — make Mesa narrate its own driver loading.  An EGL error code
+     * says WHICH call failed but never why; EGL_BAD_ALLOC out of
+     * eglCreateContext covers everything from a missing driver .so to a real
+     * out-of-memory, and guessing between those is what this avoids. */
+    if (dbg) {
+        proc_set_exec_env("EGL_LOG_LEVEL=debug");
+        proc_set_exec_env("MESA_DEBUG=1");
+    }
     run_upstream_wl("egltri", sp, _binary_user_egltri_dynelf_end,
                     windowed, 1, argv);
 }
