@@ -396,7 +396,11 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock) {
 static void wl_window_input(struct gui_window* win, const struct gui_input* gi, void* ctx) {
     (void)win;
     struct wl_conn* c = (struct wl_conn*)ctx;
-    if (gi->type == GUI_INPUT_KEY)         wl_send_key(c, (uint32_t)gi->keycode, gi->pressed);
+    /* keycode 0 = the character-only companion event (see gui.h `ch`): a
+     * Wayland client gets scancodes and builds characters from its own xkb
+     * keymap, so it has no use for this one and must not see a key 0. */
+    if (gi->type == GUI_INPUT_KEY && gi->keycode)
+        wl_send_key(c, (uint32_t)gi->keycode, gi->pressed);
     else if (gi->type == GUI_INPUT_MOTION) wl_send_motion(c, gi->x, gi->y);
 }
 

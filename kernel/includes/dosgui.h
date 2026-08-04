@@ -18,10 +18,12 @@
 
 /* Input event handed back to the client by dosgui_poll (mirrors gui_input). */
 struct dosgui_event {
-    int32_t type;      /* 0 = key, 1 = motion (enum gui_input_type), 2 = close */
-    int32_t keycode;   /* key: raw scancode */
-    int32_t pressed;   /* key: 1 = down, 0 = up */
-    int32_t x, y;      /* motion: content-relative position */
+    int32_t type;      /* enum gui_input_type: 0 = key, 1 = motion,          */
+                       /* 2 = button; 3 = close (dosgui-only, no gui_input)   */
+    int32_t keycode;   /* key: raw scancode.  button: 1 = left, 2 = right     */
+    int32_t pressed;   /* key/button: 1 = down, 0 = up                        */
+    int32_t x, y;      /* motion/button: content-relative position            */
+    int32_t ch;        /* key: the character the keymap produced, 0 if none    */
 };
 
 /* Create a WM window `w`x`h` titled `title` (copied); returns a small

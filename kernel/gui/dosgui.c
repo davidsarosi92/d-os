@@ -60,6 +60,7 @@ static void dosgui_input_cb(struct gui_window* w, const struct gui_input* in, vo
         e->pressed = (int32_t)in->pressed;
         e->x       = (int32_t)in->x;
         e->y       = (int32_t)in->y;
+        e->ch      = (int32_t)in->ch;
         d->tail = nt;
     }
     spin_unlock(&d->lock);
@@ -133,7 +134,8 @@ int dosgui_poll(int handle, struct dosgui_event* out) {
     /* Title-bar X clicked?  Report a close event so the client quits itself;
      * once its task dies the compositor disposes the window (M22.7). */
     if (d->win && gui_window_want_close(d->win)) {
-        out->type = 2; out->keycode = 0; out->pressed = 0; out->x = 0; out->y = 0;
+        out->type = 3; out->keycode = 0; out->pressed = 0; out->x = 0; out->y = 0;
+        out->ch = 0;
         return 1;
     }
     int got = 0;

@@ -1,0 +1,15 @@
+[binaries]
+c = '/src/third_party/musl-cross-i686/bin/i686-linux-musl-gcc'
+cpp = '/src/third_party/musl-cross-i686/bin/i686-linux-musl-g++'
+ar = '/src/third_party/musl-cross-i686/bin/i686-linux-musl-ar'
+strip = '/src/third_party/musl-cross-i686/bin/i686-linux-musl-strip'
+# meson <0.64 spells this key `pkgconfig`; newer versions accept `pkg-config`.
+# Give it both, or dependency lookup silently falls back to the host's.
+pkgconfig = '/src/third_party/dos-pkgconfig'
+pkg-config = '/src/third_party/dos-pkgconfig'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'x86'
+cpu = 'i686'
+endian = 'little'

@@ -147,11 +147,26 @@ uint32_t gui_window_pixel(struct gui_window* win, int x, int y);
 /* §M26 — input forwarding.  When a hook is set, the window's keyboard/pointer
  * input is delivered here (instead of to widgets) — the Wayland server routes
  * it to wl_keyboard/wl_pointer.  `keycode` is a raw scancode; `pressed` = down. */
-enum gui_input_type { GUI_INPUT_KEY, GUI_INPUT_MOTION };
+/* §M48 — GUI_INPUT_BUTTON is new, and its absence was a real gap: a window
+ * that forwards input to a client (NetSurf via dosgui, any Wayland surface)
+ * could receive keys and pointer MOTION but had no way to learn that a button
+ * was pressed.  A click reached the compositor, raised the window, and was
+ * then delivered as an indistinguishable motion event — which is why the
+ * browser rendered pages it could not be clicked on: no link, no form field,
+ * no scrollbar could ever be activated. */
+enum gui_input_type { GUI_INPUT_KEY, GUI_INPUT_MOTION, GUI_INPUT_BUTTON };
 struct gui_input {
     enum gui_input_type type;
-    int keycode, pressed;               /* GUI_INPUT_KEY    */
-    int x, y;                           /* GUI_INPUT_MOTION (content-relative) */
+    int keycode, pressed;               /* KEY: scancode; BUTTON: 1=L 2=R 3=M */
+    int x, y;                           /* MOTION / BUTTON (content-relative) */
+    /* KEY: the character the active keymap produced, or 0 for a key that has
+     * none (arrows, Home/End).  Both halves are needed and neither can stand
+     * in for the other: Wayland wants the SCANCODE (its xkb keymap is built
+     * from d-os scancodes), while a client like NetSurf wants the CHARACTER
+     * and has no keymap of its own.  Forwarding only the scancode is what made
+     * typing a URL produce garbage — the browser read raw scancodes as if they
+     * were character codes. */
+    int ch;
 };
 void gui_window_set_input_hook(struct gui_window* win,
         void (*fn)(struct gui_window*, const struct gui_input*, void*), void* ctx);

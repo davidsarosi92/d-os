@@ -35,7 +35,7 @@
 #define DOSGUI_DESTROY 0xD053
 
 /* Kernel dosgui_event layout (must match kernel/includes/dosgui.h). */
-struct dos_event { int32_t type, keycode, pressed, x, y; };
+struct dos_event { int32_t type, keycode, pressed, x, y, ch; };
 
 static int dos_handle = -1;    /* one browser window per process is plenty */
 
@@ -135,12 +135,58 @@ static bool dos_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
         }
         return false;
     }
-    if (de.type == 2) {                 /* window closed (title-bar X) */
+    if (de.type == 3) {                 /* window closed (title-bar X) */
         event->type = NSFB_EVENT_CONTROL;
         event->value.controlcode = NSFB_CONTROL_QUIT;
     } else if (de.type == 0) {          /* key */
+        /* libnsfb's key codes are SDL-shaped: printable characters ARE their
+         * ASCII value, and the non-printing keys live above 255.  So a key
+         * that produced a character maps straight across, and only the ones
+         * that produced none need translating from d-os scancodes.
+         *
+         * Forwarding the scancode for everything (what we used to do) meant
+         * NetSurf read 'h' as scancode 0x23 and put whatever character that
+         * happens to be into the URL bar — typing was pure noise. */
         event->type = de.pressed ? NSFB_EVENT_KEY_DOWN : NSFB_EVENT_KEY_UP;
-        event->value.keycode = (enum nsfb_key_code_e)de.keycode;
+        if (de.ch) {
+            /* Two control characters do NOT share their ASCII value with the
+             * libnsfb key code, and getting them wrong is very visible: the
+             * keymap yields '\n' (10) for Return, while NSFB_KEY_RETURN is 13
+             * (CR).  Passed through unmapped, pressing Enter in the URL bar
+             * inserted a character instead of navigating. */
+            int k = de.ch;
+            if (k == '\n') k = NSFB_KEY_RETURN;
+            else if (k == 0x7F) k = NSFB_KEY_BACKSPACE;
+            event->value.keycode = (enum nsfb_key_code_e)k;
+        } else {
+            enum nsfb_key_code_e k = NSFB_KEY_UNKNOWN;
+            switch (de.keycode) {           /* keymap.h KC_* */
+            case 0x52: k = NSFB_KEY_UP;       break;
+            case 0x51: k = NSFB_KEY_DOWN;     break;
+            case 0x4F: k = NSFB_KEY_RIGHT;    break;
+            case 0x50: k = NSFB_KEY_LEFT;     break;
+            case 0x4A: k = NSFB_KEY_HOME;     break;
+            case 0x4D: k = NSFB_KEY_END;      break;
+            case 0x4B: k = NSFB_KEY_PAGEUP;   break;
+            case 0x4E: k = NSFB_KEY_PAGEDOWN; break;
+            case 0x4C: k = NSFB_KEY_DELETE;   break;
+            default:   return false;         /* nothing meaningful to report */
+            }
+            event->value.keycode = k;
+        }
+    } else if (de.type == 2) {          /* mouse button */
+        /* libnsfb has no separate button event: NetSurf reads clicks as KEY
+         * events carrying the pseudo-keycodes NSFB_KEY_MOUSE_n.  Without this
+         * branch the browser saw pointer motion and nothing else, so no link,
+         * form field or scrollbar could ever be activated.
+         *
+         * The position matters as much as the button.  NetSurf acts on the
+         * cursor location it last recorded, so emit the move first (below, on
+         * the compositor side we push motion immediately before the press) —
+         * here we only need to report which button changed. */
+        event->type = de.pressed ? NSFB_EVENT_KEY_DOWN : NSFB_EVENT_KEY_UP;
+        event->value.keycode = (de.keycode == 2) ? NSFB_KEY_MOUSE_3
+                                                 : NSFB_KEY_MOUSE_1;
     } else {                            /* motion */
         event->type = NSFB_EVENT_MOVE_ABSOLUTE;
         event->value.vector.x = de.x;

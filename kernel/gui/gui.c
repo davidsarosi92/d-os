@@ -95,13 +95,14 @@ enum win_kind { WIN_TERM, WIN_APP };
 /* M22.7 — per-window input event (compositor produces, the window's app-host
  * task consumes).  Widget hit-testing + dispatch happens on the host, not the
  * compositor, so a slow app handler can no longer stall the whole GUI. */
-enum ae_type { AE_MOUSE, AE_KEY, AE_KEYCODE };
+enum ae_type { AE_MOUSE, AE_KEY, AE_KEYCODE, AE_BUTTON };
 struct app_event {
     uint8_t type;
     int16_t x, y;                       /* AE_MOUSE: content-relative     */
     uint8_t dbl;
     char    c;                          /* AE_KEY                         */
     uint8_t kc, mods;                   /* AE_KEYCODE                     */
+    uint8_t btn, down;                  /* AE_BUTTON: 1=L 2=R 3=M, 1=press */
 };
 #define AQ_SZ 32
 
@@ -390,6 +391,7 @@ struct gev {
     struct gui_window* win;
     int16_t x, y;                       /* content-relative              */
     uint8_t dbl;
+    uint8_t btn, down;                  /* 0 = motion; else button + edge */
 };
 #define EVQ_SZ 32
 static struct gev        evq[EVQ_SZ];
@@ -413,13 +415,18 @@ static volatile uint32_t lq_h = 0, lq_t = 0;
 static volatile int power_req = 0;      /* 0 none / 1 reboot / 2 shutdown */
 static volatile int sak_close_req = 0;  /* §M46 Ctrl+Alt+X — close/force top app */
 
-static void evq_push(struct gui_window* w, int cx, int cy, int dbl) {
+/* `btn` 0 = plain motion; otherwise the button index, with `down` saying
+ * press or release. */
+static void evq_push(struct gui_window* w, int cx, int cy, int dbl,
+                     int btn, int down) {
     uint32_t n = (evq_h + 1) % EVQ_SZ;
     if (n == evq_t) return;
     evq[evq_h].win = w;
     evq[evq_h].x = (int16_t)cx;
     evq[evq_h].y = (int16_t)cy;
     evq[evq_h].dbl = (uint8_t)dbl;
+    evq[evq_h].btn = (uint8_t)btn;
+    evq[evq_h].down = (uint8_t)down;
     evq_h = n;
 }
 
@@ -668,8 +675,16 @@ static void app_dispatch_event(struct gui_window* win, const struct app_event* e
     if (win->input_hook) {
         struct gui_input gi = {0};
         if (e->type == AE_MOUSE)        { gi.type = GUI_INPUT_MOTION; gi.x = e->x; gi.y = e->y; }
+        else if (e->type == AE_BUTTON)  { gi.type = GUI_INPUT_BUTTON; gi.x = e->x; gi.y = e->y;
+                                          gi.keycode = e->btn; gi.pressed = e->down; }
         else if (e->type == AE_KEYCODE) { gi.type = GUI_INPUT_KEY; gi.keycode = e->kc; gi.pressed = 1; }
-        else return;                    /* AE_KEY (cooked char) — ignored here */
+        /* AE_KEY carries the keymap's OUTPUT.  It used to be dropped here, on
+         * the grounds that a client gets the scancode — but a client with no
+         * keymap of its own cannot turn a scancode into a letter, so every
+         * typed character arrived as noise. */
+        else if (e->type == AE_KEY)     { gi.type = GUI_INPUT_KEY; gi.ch = (unsigned char)e->c;
+                                          gi.pressed = 1; }
+        else return;
         win->input_hook(win, &gi, win->input_ctx);
         return;
     }
@@ -1469,8 +1484,9 @@ static void dispatch_events(void) {
         evq_t = (evq_t + 1) % EVQ_SZ;
         struct gui_window* win = e.win;
         if (!win || !win->used || win->kind != WIN_APP) continue;
-        struct app_event ae = { .type = AE_MOUSE, .x = e.x, .y = e.y,
-                                .dbl = e.dbl };
+        struct app_event ae = { .type = e.btn ? AE_BUTTON : AE_MOUSE,
+                                .x = e.x, .y = e.y, .dbl = e.dbl,
+                                .btn = e.btn, .down = e.down };
         aq_push(win, ae);
     }
 }
@@ -1841,7 +1857,16 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
     {
         struct gui_window* hw = topmost_at(mx, my);
         if (hw && hw->kind == WIN_APP && hw->input_hook && !hw->minimized)
-            evq_push(hw, mx - hw->x - BORDER, my - hw->y - TITLE_H, 0);
+            evq_push(hw, mx - hw->x - BORDER, my - hw->y - TITLE_H, 0, 0, 0);
+    }
+
+    /* Right press goes only to a client window, and only over its content —
+     * the desktop chrome has no right-click behaviour to compete with. */
+    if (pressed & MOUSE_BTN_RIGHT) {
+        struct gui_window* rw = topmost_at(mx, my);
+        if (rw && rw->kind == WIN_APP && rw->input_hook && !rw->minimized &&
+            my >= rw->y + TITLE_H)
+            evq_push(rw, mx - rw->x - BORDER, my - rw->y - TITLE_H, 0, 2, 1);
     }
 
     if (pressed & MOUSE_BTN_LEFT) {
@@ -1924,7 +1949,11 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
                 lastclick_ms = now;
                 lastclick_x = mx; lastclick_y = my;
                 lastclick_win = win;
-                evq_push(win, cxr, cyr, dbl);
+                /* Motion first (so the client's pointer is where the click
+                 * happened), then the press itself.  A widget window ignores
+                 * the button event; a client window needs both. */
+                evq_push(win, cxr, cyr, dbl, 0, 0);
+                evq_push(win, cxr, cyr, dbl, 1, 1);
             }
         }
     }
@@ -1966,6 +1995,16 @@ drag_update:
         if (rubber_h < MIN_H) rubber_h = MIN_H;
         if (rubber_w > fbsurf.w) rubber_w = fbsurf.w;
         if (rubber_h > work_h)   rubber_h = work_h;
+    }
+
+    /* Button RELEASE.  A client needs the up edge as much as the down one —
+     * without it a link click never completes and a drag never ends. */
+    if (released & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT)) {
+        struct gui_window* rw = topmost_at(mx, my);
+        if (rw && rw->kind == WIN_APP && rw->input_hook && !rw->minimized &&
+            my >= rw->y + TITLE_H)
+            evq_push(rw, mx - rw->x - BORDER, my - rw->y - TITLE_H, 0,
+                     (released & MOUSE_BTN_LEFT) ? 1 : 2, 0);
     }
 
     if (released & MOUSE_BTN_LEFT) {
@@ -2047,7 +2086,13 @@ static int gui_raw_key(uint8_t keycode, uint8_t mods) {
                 kcq_h = n;
             }
             need_frame = 1;
-            return 1;
+            /* A client window takes the raw keycode AND must still let the
+             * keymap run: returning 1 here consumed the key outright, so the
+             * cooked character was never produced and a client with no keymap
+             * of its own (NetSurf) could not receive letters at all.  Report
+             * "not consumed" for those, so ps2_keyboard goes on to translate
+             * and the character arrives as a second event. */
+            return win->input_hook ? 0 : 1;
         }
         return 0;
     }
