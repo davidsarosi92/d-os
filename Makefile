@@ -370,15 +370,6 @@ else ifeq ($(ARCH),x86_64)
       ARCH_EXTRA_OBJS += user/simpleshm_muslblob.o
     endif
   endif
-  # §M40 (x86_64) — the Mesa software-GL runtime + the EGL triangle, once Mesa
-  # has been built for this arch.
-  ifneq ($(wildcard third_party/mesa-$(ARCH)/lib/dri/swrast_dri.so),)
-    ARCH_EXTRA_OBJS += user/libEGL_so_blob.o user/libGLESv2_so_blob.o \
-                       user/libglapi_so_blob.o user/libexpat_so_blob.o \
-                       user/libdrm_so_blob.o user/swrast_dri_so_blob.o \
-                       user/mesaz_so_blob.o user/libwlclient_so_blob.o \
-                       user/egltri_dynblob.o
-  endif
   # §M43 (x86_64) — the on-device C compiler (`make tcc ARCH=x86_64`).
   TINYCC_PREFIX := third_party/tinycc-x86_64
   ifneq ($(wildcard $(TINYCC_PREFIX)/bin/tcc),)
@@ -538,6 +529,25 @@ else ifeq ($(ARCH),aarch64)
 
 else
   $(error Unsupported ARCH "$(ARCH)" — supported: i386, x86_64, aarch64)
+endif
+
+# -----------------------------------------------------------------------------
+# §M40 — the Mesa software-GL runtime + the EGL triangle.
+#
+# ARCH-AGNOSTIC ON PURPOSE.  This block used to sit inside the x86_64 branch,
+# which made "Mesa is x86_64-only" a property of the BUILD rather than of the
+# code — every path below is already parameterised by $(ARCH), so i386 was
+# excluded by where the lines lived and nothing else.  (The same duplication is
+# what kept the whole userland i386-only until §4.39.)  It is guarded on the
+# built artifact, so an arch without a Mesa tree simply skips it; build one
+# with `ARCH=<arch> ./scripts/build-mesa.sh`.
+# -----------------------------------------------------------------------------
+ifneq ($(wildcard third_party/mesa-$(ARCH)/lib/dri/swrast_dri.so),)
+  ARCH_EXTRA_OBJS += user/libEGL_so_blob.o user/libGLESv2_so_blob.o \
+                     user/libglapi_so_blob.o user/libexpat_so_blob.o \
+                     user/libdrm_so_blob.o user/swrast_dri_so_blob.o \
+                     user/mesaz_so_blob.o user/libwlclient_so_blob.o \
+                     user/egltri_dynblob.o
 endif
 
 # -----------------------------------------------------------------------------

@@ -113,6 +113,7 @@ static void ap_main(void) {
      * traps (syscalls/IRQs from a user task scheduled here) land on a valid
      * per-CPU kernel stack.  After percpu_init_ap so this_cpu_id() is valid. */
     gdt_load_cpu_tss();
+    hal_arch_init_this_cpu();   /* CR0/CR4 SSE bits are per-CPU */
 
     /* Announce ourselves on serial — once per boot per AP. */
     kprintf("ap: cpu %d (apic_id=%u) online\n",

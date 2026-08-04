@@ -82,10 +82,45 @@ void hal_intr_restore(uint32_t cookie) {
  * GDT second (which also loads TR); IDT last.
  * --------------------------------------------------------------------------- */
 
+/* Enable SSE/SSE2 for ring 3 (i386).
+ *
+ * Until §M48 this kernel deliberately left CR4.OSFXSR clear, on the reasoning
+ * that 32-bit userland was x87-only.  That held while everything in user space
+ * was built by our own toolchain — but a PORTED library does not ask: Mesa's
+ * i386 build uses SSE for its math and memory paths, and every one of those
+ * instructions raised #UD.  The EGL client got as far as the Wayland handshake
+ * and then died on an "Invalid Opcode" inside libEGL, which reads like a
+ * corrupt binary rather than a disabled CPU feature.
+ *
+ * Per-CPU state, so it has to run on every core (see hal_arch_init_this_cpu).
+ * FXSAVE/FXRSTOR already cover the XMM half automatically once OSFXSR is set —
+ * fpu.c was written for exactly this day and needs no change.
+ *
+ *   CR0: clear EM (bit 2, "emulate FPU"), set MP (bit 1, "monitor coproc").
+ *   CR4: set OSFXSR (bit 9) + OSXMMEXCPT (bit 10). */
+static void enable_sse(void) {
+    uint32_t cr0, cr4;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1u << 2);
+    cr0 |=  (1u << 1);
+    __asm__ volatile ("mov %0, %%cr0" :: "r"(cr0));
+    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1u << 9) | (1u << 10);
+    __asm__ volatile ("mov %0, %%cr4" :: "r"(cr4));
+}
+
+/* The per-CPU half of arch bring-up — everything an AP must repeat for itself.
+ * Mirrors the x86_64 twin; missing it makes a task fault only once the load
+ * balancer moves it onto a core that never ran this. */
+void hal_arch_init_this_cpu(void) {
+    enable_sse();
+}
+
 void hal_arch_early_init(void) {
     tss_init();
     gdt_init();
     idt_init();
+    enable_sse();
 }
 
 /* ---------------------------------------------------------------------------

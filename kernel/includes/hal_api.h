@@ -84,6 +84,10 @@ void     hal_intr_restore(uint32_t cookie);
  * --------------------------------------------------------------------------- */
 void hal_arch_early_init(void);
 
+/* The per-CPU half of arch bring-up: state that lives in a control register
+ * or MSR and therefore has to be programmed again on every core. */
+void hal_arch_init_this_cpu(void);
+
 /* ---------------------------------------------------------------------------
  * Task stack setup.
  *
