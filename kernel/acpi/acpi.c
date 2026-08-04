@@ -41,6 +41,7 @@
 #include "vmm.h"        /* §1.1/freeze — map ACPI tables that sit above the
                          * boot identity window (see acpi_reach below) */
 #include <stdint.h>
+#include "hal_api.h"   /* phys_to_virt — ACPI tables via the kernel direct map */
 
 /* ------------------------------------------------------------------------- */
 /* Table layouts.  All are packed because ACPI defines them byte-for-byte and
@@ -268,12 +269,25 @@ static int      g_have_srat = 0;
  * very first table read is an unmapped KERNEL access — a ring-0 #PF during
  * boot, i.e. the box dies before the shell with no way to diagnose it.  That is
  * a freeze-class bug, so map on demand: identity-map any page of the range that
- * is not mapped yet.  The addresses are far below the user base, so an identity
- * mapping here can never collide with a user address space.  Kernel-only
- * (no VMM_USER), read/write because parse_* only reads but the mapper needs a
- * concrete flag set. */
+ * is not mapped yet.  Kernel-only (no VMM_USER), read/write because parse_*
+ * only reads but the mapper needs a concrete flag set.
+ *
+ * §M48 — this used to claim "the addresses are far below the user base, so an
+ * identity mapping here can never collide with a user address space".  That
+ * held on i386 (256 MiB window, user at 1 GiB) but NOT on x86_64: firmware
+ * puts the tables at the top of LOW RAM, which on a 2 GiB machine is ~2 GiB —
+ * squarely inside the user region.  The identity mapping then built a page
+ * directory in the kernel's PDPT[1], every process inherited it, and user
+ * mappings landed in the SAME shared tables as the ACPI pages.  fork() came
+ * back reading ACPI memory.  It only escaped notice because with much more
+ * RAM the tables sit above the user region again.
+ *
+ * Where a kernel direct map exists, all of physical memory is already
+ * reachable through it, so there is nothing to map and nothing to collide
+ * with; the on-demand identity path remains for the arches without one. */
 static void acpi_reach(uintptr_t phys, uint32_t len) {
     if (!phys || !len) return;
+    if (KERNEL_DIRECT_MAP_BASE) return;          /* covered by the direct map */
     for (uintptr_t p = phys & ~(uintptr_t)0xFFF; p < phys + len; p += 0x1000) {
         if (vmm_translate(p) == 0) vmm_map(p, p, VMM_WRITABLE);
     }
@@ -284,7 +298,7 @@ static void acpi_reach(uintptr_t phys, uint32_t len) {
 static const struct sdt_header* acpi_reach_table(uint32_t phys) {
     if (!phys) return 0;
     acpi_reach(phys, sizeof(struct sdt_header));
-    const struct sdt_header* h = (const struct sdt_header*)(uintptr_t)phys;
+    const struct sdt_header* h = (const struct sdt_header*)phys_to_virt(phys);
     acpi_reach(phys, h->length);
     return h;
 }
@@ -312,7 +326,7 @@ static int sig8(const char* a, const char* b) {
  * followed by a matching checksum.  Returns the first valid RSDP or NULL. */
 static const struct rsdp* scan_rsdp_in(uint32_t start, uint32_t end) {
     for (uint32_t a = start; a + sizeof(struct rsdp) <= end; a += 16) {
-        const struct rsdp* r = (const struct rsdp*)a;
+        const struct rsdp* r = (const struct rsdp*)phys_to_virt(a);
         if (sig8(r->signature, "RSD PTR ") && checksum_ok(r, 20)) return r;
     }
     return 0;

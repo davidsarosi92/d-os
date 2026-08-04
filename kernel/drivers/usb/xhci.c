@@ -53,6 +53,7 @@
  * ============================================================================= */
 
 #include "pci.h"
+#include "hal_api.h"   /* phys_to_virt / virt_to_phys — kernel direct map */
 #include "hal.h"
 #include "vmm.h"
 #include "pmm.h"
@@ -240,9 +241,9 @@ static inline uint16_t mmio_r16(volatile uint8_t* base, uint32_t off) {
  * --------------------------------------------------------------------------- */
 
 static int ring_alloc(struct xhci_ring* r, int with_link_trb) {
-    uint32_t frame = pmm_alloc_frame();
+    pmm_phys_t frame = pmm_alloc_frame_dma32();
     if (!frame) return -1;
-    r->trbs    = (struct xhci_trb*)(uintptr_t)frame;
+    r->trbs    = (struct xhci_trb*)phys_to_virt(frame);
     r->phys    = frame;
     r->size    = 4096 / sizeof(struct xhci_trb);   /* 256 */
     r->enqueue = 0;
@@ -250,7 +251,7 @@ static int ring_alloc(struct xhci_ring* r, int with_link_trb) {
     r->cycle   = 1;                                 /* PCS starts at 1 */
     /* Zero the whole frame so unused TRBs have cycle=0 (HC treats as
      * not yet produced).  PMM hands us an uninitialized frame. */
-    uint32_t* p = (uint32_t*)(uintptr_t)frame;
+    uint32_t* p = (uint32_t*)phys_to_virt(frame);
     for (int i = 0; i < 1024; i++) p[i] = 0;
     if (with_link_trb) {
         /* Last TRB = Link to TRB 0 with Toggle Cycle, so the producer
@@ -519,7 +520,7 @@ static int xhci_reset_and_init(void) {
     mmio_w32(xhc.op, XHCI_OP_CONFIG, xhc.max_slots);
 
     /* DCBAA — single frame, zeroed. */
-    uint32_t dcbaa_frame = pmm_alloc_frame();
+    pmm_phys_t dcbaa_frame = pmm_alloc_frame_dma32();
     if (!dcbaa_frame) return -1;
     xhc.dcbaa = (uint64_t*)(uintptr_t)dcbaa_frame;
     for (int i = 0; i < 512; i++) xhc.dcbaa[i] = 0;
@@ -535,7 +536,7 @@ static int xhci_reset_and_init(void) {
      * dedicate a frame to the segment and a tiny ERST nearby).  We
      * just allocate a separate frame for the ERST. */
     if (ring_alloc(&xhc.evt_ring, 0) != 0) return -1;
-    uint32_t erst_frame = pmm_alloc_frame();
+    pmm_phys_t erst_frame = pmm_alloc_frame_dma32();
     if (!erst_frame) return -1;
     uint32_t* erst = (uint32_t*)(uintptr_t)erst_frame;
     for (int i = 0; i < 1024; i++) erst[i] = 0;
@@ -640,8 +641,8 @@ static int enumerate_root_device(void) {
     kprintf("xhci: slot %u assigned\n", slot);
 
     /* Allocate Device Context and Input Context (one frame each). */
-    uint32_t dev_frame = pmm_alloc_frame();
-    uint32_t ic_frame  = pmm_alloc_frame();
+    pmm_phys_t dev_frame = pmm_alloc_frame_dma32();
+    pmm_phys_t ic_frame  = pmm_alloc_frame_dma32();
     uint32_t tr_frame_addr; /* later */
     if (!dev_frame || !ic_frame) {
         kprintf("xhci: OOM for contexts\n"); return -1;
@@ -700,7 +701,7 @@ static int enumerate_root_device(void) {
 
 static int enumerate_and_configure(void) {
     /* Allocate a DMA buffer for descriptors (one frame). */
-    uint32_t buf_frame = pmm_alloc_frame();
+    pmm_phys_t buf_frame = pmm_alloc_frame_dma32();
     if (!buf_frame) return -1;
     uint8_t* buf = (uint8_t*)(uintptr_t)buf_frame;
     uint32_t buf_phys = buf_frame;
@@ -817,7 +818,7 @@ static int enumerate_and_configure(void) {
     }
 
     /* DMA buffer for the periodic report. */
-    uint32_t rb_frame = pmm_alloc_frame();
+    pmm_phys_t rb_frame = pmm_alloc_frame_dma32();
     if (!rb_frame) return -1;
     xhc.intr_in_buf = (uint8_t*)(uintptr_t)rb_frame;
     xhc.intr_in_buf_phys = rb_frame;

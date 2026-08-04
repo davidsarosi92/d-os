@@ -145,7 +145,14 @@ static inline size_t align_up(size_t v, size_t a) {
 #define SLAB_SLOT_ALIGN 8u
 
 static struct slab* page_of(void* p) {
-    return (struct slab*)((uintptr_t)p & ~(SLAB_PAGE_SIZE - 1));
+    /* The cast on the MASK is load-bearing, not decoration.  `SLAB_PAGE_SIZE`
+     * is unsigned int, so `~(SLAB_PAGE_SIZE - 1)` is the 32-bit value
+     * 0xFFFFF000, which zero-extends to 0x00000000FFFFF000 — masking away
+     * every bit above 4 GiB.  With memory above 4 GiB in play (§M48) that
+     * silently pointed page_of at an unrelated low page, so slab_cache_of saw
+     * no SLAB_MAGIC and kfree rejected perfectly valid objects.  Widen the
+     * mask FIRST, then invert. */
+    return (struct slab*)((uintptr_t)p & ~((uintptr_t)SLAB_PAGE_SIZE - 1));
 }
 
 static void* slot_addr(struct slab* s, struct slab_cache* c, uint16_t idx) {
@@ -214,10 +221,10 @@ static struct slab* slab_pop_cached_locked(struct slab_cache* c) {
 }
 
 static struct slab* slab_alloc_fresh(struct slab_cache* c) {
-    uint32_t phys = page_alloc(0, ZONE_DEFAULT);
+    pmm_phys_t phys = page_alloc(0, ZONE_DEFAULT);
     if (!phys) return NULL;
 
-    struct slab* s = (struct slab*)(uintptr_t)phys;
+    struct slab* s = (struct slab*)phys_to_virt(phys);
     s->magic     = SLAB_MAGIC;
     s->cache     = c;
     s->next      = NULL;
@@ -248,7 +255,7 @@ static void slab_release(struct slab_cache* c, struct slab* s) {
         return;
     }
     s->magic = 0;
-    page_free((uint32_t)(uintptr_t)s, 0);
+    page_free(virt_to_phys(s), 0);
 }
 
 /* -------------------------------------------------------------------------- */

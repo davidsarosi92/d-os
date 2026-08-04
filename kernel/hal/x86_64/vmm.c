@@ -63,9 +63,11 @@ extern uint8_t pdpt[];
 extern uint8_t pd_low[];
 
 static inline uint64_t* table_at(uintptr_t phys) {
-    /* We're identity-mapped over the PMM range, so phys-as-virt is
-     * directly addressable.  Strip the low 12 bits (PTE flags). */
-    return (uint64_t*)(uintptr_t)(phys & PAGE_MASK_4K);
+    /* Page tables are reached through the kernel direct map (§M48) — NOT as
+     * bare physical addresses.  Low virtual addresses now belong to user
+     * space, so a physical-as-virtual dereference would read whatever the
+     * running process has mapped there.  Strip the low 12 bits (PTE flags). */
+    return (uint64_t*)phys_to_virt(phys & PAGE_MASK_4K);
 }
 
 static inline void invlpg(uintptr_t virt) {
@@ -92,41 +94,48 @@ uintptr_t vmm_kernel_pd_phys(void) {
     return (uintptr_t)pml4;
 }
 
-/* M19.5.1 — extend the identity map past the boot-time 1 GiB cap.
+/* §M48 — install the KERNEL DIRECT MAP; stop growing the LOW identity map.
  *
- * Strategy: 1 GiB pages in PDPT[1..].  Long mode allows PS=1 at the
- * PDPT level to mean "1 GiB page" (AMD64 APM Vol 2 §5.3.7).  Every
- * x86_64 CPU since K10 / Nehalem supports it; QEMU TCG supports it
- * unconditionally.  If a CPU ever didn't, we'd get #GP on the first
- * access — fall-back is to drop down to 2 MiB pages (more PD frames,
- * not implemented today).
+ * This used to add 1 GiB pages to PDPT[1..], mapping physical N at virtual N
+ * for as much RAM as existed.  That is exactly what collided with user space:
+ * user programs are linked at vmm_user_base() (1 GiB) and cannot move, because
+ * the small code model requires every symbol below 2 GiB.  So on any machine
+ * with more than 1 GiB of RAM the identity map's 1 GiB page landed on top of
+ * the user region, walk_to_pt_root refused to build a user mapping under a
+ * large page, and every exec failed with ELF_ENOMEM.  The port only ever
+ * looked healthy because it was always tested with -m 1024M.
  *
- * Each PDPT entry covers 1 GiB.  We add entries for [1 GiB, end_phys),
- * leaving PDPT[0] (which boot.s set up via 2 MiB pages) untouched.
- * No TLB flush needed — we're adding mappings, not changing existing
- * ones.  Returns the new physical extent actually covered (rounded up
- * to 1 GiB granularity, capped at 512 GiB — PDPT capacity).
+ * The low identity map therefore stays at the boot-time 1 GiB — below
+ * vmm_user_base(), covering the kernel image and early structures, where it
+ * can never be in a user program's way.  ALL of physical memory is mapped
+ * instead in the canonical upper half at KERNEL_DIRECT_MAP_BASE (PML4[256]),
+ * which no user mapping can reach.  One PDPT of 1 GiB pages covers 512 GiB.
  *
- * Caller (pmm_init) is expected to clamp this to BUDDY_MAX_FRAMES.
- * We don't do that capping here so the HAL stays single-purpose. */
+ * 1 GiB pages need PDPTE.PS (AMD64 APM Vol 2 §5.3.7) — present on every
+ * x86_64 since K10 / Nehalem, unconditional in QEMU TCG.
+ *
+ * Adding mappings needs no TLB flush: nothing changed, only filled in. */
+
+/* The direct map's PDPT.  In .bss, so it lives inside the kernel image below
+ * 1 GiB and its link address IS its physical address — which is what the PML4
+ * entry has to contain. */
+static uint64_t dm_pdpt[512] __attribute__((aligned(4096)));
+
 uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
-    /* Round up to 1 GiB boundary. */
     const uintptr_t GIB = (uintptr_t)1 << 30;
     uintptr_t end = (end_phys + GIB - 1) & ~(GIB - 1);
-    /* boot.s gave us PDPT[0] = first 1 GiB.  Nothing to do if request
-     * fits in there. */
-    if (end <= GIB) return GIB;
-    /* PDPT cap: 512 entries × 1 GiB = 512 GiB.  We won't hit this
-     * any time soon. */
-    if (end > GIB * 512) end = GIB * 512;
+    if (end > GIB * 512) end = GIB * 512;          /* one PDPT's worth */
+    if (end < GIB)       end = GIB;
 
-    uint64_t* pdpt_tbl = (uint64_t*)pdpt;
-    for (uintptr_t addr = GIB; addr < end; addr += GIB) {
-        unsigned idx = (unsigned)((addr >> 30) & 0x1FF);
-        if (pdpt_tbl[idx] & PTE_P) continue;        /* already mapped */
-        pdpt_tbl[idx] = ((uint64_t)addr & PAGE_MASK_4K)
-                      | PTE_P | PTE_RW | PTE_PS;
-    }
+    for (uintptr_t addr = 0; addr < end; addr += GIB)
+        dm_pdpt[(addr >> 30) & 0x1FF] =
+            ((uint64_t)addr & PAGE_MASK_4K) | PTE_P | PTE_RW | PTE_PS;
+
+    /* Hook it under PML4[256].  Kernel-only — no PTE_US anywhere on this
+     * path, so ring 3 can never walk into the direct map. */
+    ((uint64_t*)pml4)[256] =
+        ((uint64_t)(uintptr_t)dm_pdpt & PAGE_MASK_4K) | PTE_P | PTE_RW;
+
     return end;
 }
 
@@ -156,14 +165,14 @@ int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
     __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
     const int shifts[4] = { 39, 30, 21, 12 };
     for (uintptr_t p = va & ~0xFFFUL; p < va + len; p += 0x1000) {
-        uint64_t* tbl = (uint64_t*)(uintptr_t)(cr3 & AMASK);
+        uint64_t* tbl = (uint64_t*)phys_to_virt(cr3 & AMASK);
         int mapped = 0;
         for (int level = 0; level < 4; level++) {
             uint64_t e = tbl[((unsigned)(p >> shifts[level])) & 0x1FFu];
             if (!(e & PTE_P) || !(e & PTE_US)) return 0;
             if (want_write && !(e & PTE_RW))   return 0;
             if (level == 3 || (level >= 1 && (e & PTE_PS))) { mapped = 1; break; }
-            tbl = (uint64_t*)(uintptr_t)(e & AMASK);
+            tbl = (uint64_t*)phys_to_virt(e & AMASK);
         }
         if (!mapped) return 0;
     }
@@ -216,9 +225,9 @@ static uint64_t* walk_to_pt_root(uint64_t* root, uintptr_t virt, int create,
          * map dependency: pmm_alloc_frame returns a phys addr within
          * the first 1 GiB (our identity range), so we can zero it via
          * a direct pointer. */
-        uint32_t newphys = pmm_alloc_frame();
+        pmm_phys_t newphys = pmm_alloc_frame();
         if (!newphys) return 0;
-        uint64_t* newtbl = (uint64_t*)(uintptr_t)newphys;
+        uint64_t* newtbl = (uint64_t*)phys_to_virt(newphys);
         for (int i = 0; i < 512; i++) newtbl[i] = 0;
 
         /* Parent entry: P + RW always; carry USER from caller flags so
@@ -285,9 +294,9 @@ int vmm_map_4mib(uintptr_t virt, uintptr_t phys, uint32_t flags) {
                 tbl = table_at((uintptr_t)e);
                 continue;
             }
-            uint32_t newphys = pmm_alloc_frame();
+            pmm_phys_t newphys = pmm_alloc_frame();
             if (!newphys) return -3;
-            uint64_t* newtbl = (uint64_t*)(uintptr_t)newphys;
+            uint64_t* newtbl = (uint64_t*)phys_to_virt(newphys);
             for (int j = 0; j < 512; j++) newtbl[j] = 0;
             tbl[idx] = ((uint64_t)newphys & PAGE_MASK_4K)
                      | PTE_P | PTE_RW
@@ -388,9 +397,9 @@ struct vmm_space* vmm_space_create(void) {
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
     if (!s) return NULL;
 
-    uint32_t pml4_phys = pmm_alloc_frame();
+    pmm_phys_t pml4_phys = pmm_alloc_frame();
     if (!pml4_phys) { kfree(s); return NULL; }
-    s->pml4      = (uint64_t*)(uintptr_t)pml4_phys;
+    s->pml4      = (uint64_t*)phys_to_virt(pml4_phys);
     s->pml4_phys = pml4_phys;
 
     /* Snapshot the kernel PML4 (mostly just [0]). */
@@ -403,10 +412,10 @@ struct vmm_space* vmm_space_create(void) {
      * and becomes private on first map. */
     uint64_t k0 = kpml4[0];
     if (k0 & PTE_P) {
-        uint32_t pdpt_phys = pmm_alloc_frame();
+        pmm_phys_t pdpt_phys = pmm_alloc_frame();
         if (!pdpt_phys) { pmm_free_frame(pml4_phys); kfree(s); return NULL; }
         uint64_t* kpdpt = table_at((uintptr_t)k0);
-        uint64_t* npdpt = (uint64_t*)(uintptr_t)pdpt_phys;
+        uint64_t* npdpt = (uint64_t*)phys_to_virt(pdpt_phys);
         for (int i = 0; i < 512; i++) npdpt[i] = kpdpt[i];
         /* Point PML4[0] at the private PDPT; keep P+RW, USER widened lazily
          * by walk_to_pt_root when the first user page is mapped. */
@@ -415,19 +424,40 @@ struct vmm_space* vmm_space_create(void) {
     return s;
 }
 
-/* M34/§3.1 — per-frame COW reference counts, indexed by frame number.  Mirrors
- * the i386 table; sized for the first 1 GiB of physical memory, which is where
- * the PMM hands out user pages on the machines we run.  A frame OUTSIDE that
- * range is "untracked": cow_slot returns NULL and the resolver then always makes
- * a PRIVATE COPY (never "grant write in place", which would silently hand two
- * processes the same writable page).  Untracked frames therefore cost a little
- * memory, never correctness. */
-#define COW_MAX_FRAMES  (1024u * 1024u * 1024u / 4096u)   /* 262144 = 512 KiB */
-static uint16_t g_cow_ref[COW_MAX_FRAMES];
+/* M34/§3.1 — per-frame COW reference counts, indexed by frame number.
+ *
+ * §M48 — this table used to be a static array covering only the first 1 GiB of
+ * physical memory, on the reasoning that "a frame outside that range is
+ * untracked: cow_slot returns NULL and the resolver then always makes a private
+ * copy, so untracked frames cost a little memory, never correctness".
+ *
+ * That reasoning covered the FAULT path but not the other two.  clone_subtree
+ * still maps a writable page COW in BOTH parent and child and merely skips the
+ * refcount when the slot is NULL — and free_subtree, finding no refcount,
+ * frees the frame from EACH space.  A double free: the buddy then handed the
+ * same frame to two owners, and the second one's page table silently
+ * overwrote the first one's.  What that looked like was one of two freshly
+ * spawned processes dying on a not-present code page, on machines with more
+ * than 1 GiB of RAM and only after a fork had happened.
+ *
+ * So the table now covers every frame the PMM manages, sized at boot from the
+ * same arena as page_state[].  There is no untracked case left to reason
+ * about. */
+static uint16_t* g_cow_ref;
+static uint32_t  g_cow_nr;
 
 static uint16_t* cow_slot(uintptr_t phys) {
+    if (!g_cow_ref) {
+        /* First use — after pmm_init, so the frame count is known.  Bootmem
+         * memory is not zeroed; a stale nonzero refcount would pin frames
+         * forever, so clear it explicitly. */
+        g_cow_nr  = pmm_nr_frames;
+        g_cow_ref = (uint16_t*)pmm_bootmem_alloc(g_cow_nr * (uint32_t)sizeof(uint16_t));
+        if (!g_cow_ref) { g_cow_nr = 0; return NULL; }
+        for (uint32_t i = 0; i < g_cow_nr; i++) g_cow_ref[i] = 0;
+    }
     uintptr_t fn = phys >> 12;
-    return (fn < COW_MAX_FRAMES) ? &g_cow_ref[fn] : NULL;
+    return (fn < g_cow_nr) ? &g_cow_ref[fn] : NULL;
 }
 
 /* Free the tables a space added on top of the kernel snapshot, one level
@@ -446,7 +476,7 @@ static void free_subtree(uint64_t* tbl, uint64_t* ktbl, int depth) {
                          ? table_at((uintptr_t)ktbl[i]) : NULL;
         if (depth < 3) {
             free_subtree(child, kchild, depth + 1);
-            pmm_free_frame((uint32_t)((uintptr_t)e & PAGE_MASK_4K));
+            pmm_free_frame((pmm_phys_t)((uintptr_t)e & PAGE_MASK_4K));
         } else {
             /* depth 3 = PT: user pages.  Skip VMM_SHARED (borrowed) ones —
              * their owner (e.g. a shm object) frees them.  A COW-shared frame
@@ -458,7 +488,7 @@ static void free_subtree(uint64_t* tbl, uint64_t* ktbl, int depth) {
                 if (rc && *rc > 1) { (*rc)--; continue; }
                 if (rc) *rc = 0;
             }
-            pmm_free_frame((uint32_t)fphys);
+            pmm_free_frame((pmm_phys_t)fphys);
         }
     }
 }
@@ -466,7 +496,7 @@ static void free_subtree(uint64_t* tbl, uint64_t* ktbl, int depth) {
 void vmm_space_destroy(struct vmm_space* s) {
     if (!s) return;
     free_subtree(s->pml4, (uint64_t*)pml4, 0);
-    pmm_free_frame((uint32_t)s->pml4_phys);
+    pmm_free_frame((pmm_phys_t)s->pml4_phys);
     kfree(s);
 }
 
@@ -488,9 +518,9 @@ static const int shift_for_depth[4] = { 39, 30, 21, 12 };
 
 static uintptr_t clone_subtree(uint64_t* ptbl, uint64_t* ktbl, int depth,
                                uintptr_t va) {
-    uint32_t phys = pmm_alloc_frame();
+    pmm_phys_t phys = pmm_alloc_frame();
     if (!phys) return 0;
-    uint64_t* ntbl = (uint64_t*)(uintptr_t)phys;
+    uint64_t* ntbl = (uint64_t*)phys_to_virt(phys);
     for (int i = 0; i < 512; i++) {
         uint64_t e = ptbl[i];
         if (!(e & PTE_P))              { ntbl[i] = 0; continue; }
@@ -522,10 +552,10 @@ static uintptr_t clone_subtree(uint64_t* ptbl, uint64_t* ktbl, int depth,
                 continue;
             }
             /* Read-only (code) → eager private copy. */
-            uint32_t fphys = pmm_alloc_frame();
+            pmm_phys_t fphys = pmm_alloc_frame();
             if (!fphys) return 0;
-            const uint8_t* src = (const uint8_t*)fphys_old;
-            uint8_t* dst = (uint8_t*)(uintptr_t)fphys;
+            const uint8_t* src = (const uint8_t*)phys_to_virt(fphys_old);
+            uint8_t* dst = (uint8_t*)phys_to_virt(fphys);
             for (int b = 0; b < 4096; b++) dst[b] = src[b];
             ntbl[i] = ((uint64_t)fphys & PAGE_MASK_4K) | (e & ~PAGE_MASK_4K);
         }
@@ -540,9 +570,9 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     if (!parent) return NULL;
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
     if (!s) return NULL;
-    uint32_t pml4_phys = pmm_alloc_frame();
+    pmm_phys_t pml4_phys = pmm_alloc_frame();
     if (!pml4_phys) { kfree(s); return NULL; }
-    s->pml4      = (uint64_t*)(uintptr_t)pml4_phys;
+    s->pml4      = (uint64_t*)phys_to_virt(pml4_phys);
     s->pml4_phys = pml4_phys;
 
     uint64_t* kpml4 = (uint64_t*)pml4;
@@ -596,10 +626,10 @@ int vmm_cow_fault(uintptr_t fault_va) {
         *rc = 0;
     } else {
         /* Shared (or untracked → always copy, see cow_slot): private copy. */
-        uint32_t nf = pmm_alloc_frame();
+        pmm_phys_t nf = pmm_alloc_frame();
         if (!nf) return 0;                          /* OOM → treat as real fault */
-        const uint8_t* src = (const uint8_t*)old;
-        uint8_t* dst = (uint8_t*)(uintptr_t)nf;
+        const uint8_t* src = (const uint8_t*)phys_to_virt(old);
+        uint8_t* dst = (uint8_t*)phys_to_virt(nf);
         for (int b = 0; b < 4096; b++) dst[b] = src[b];
         if (rc) (*rc)--;
         pt[pti] = ((uint64_t)nf & PAGE_MASK_4K)

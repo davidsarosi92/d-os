@@ -60,7 +60,7 @@ struct vmm_space {
 /* Allocate a zeroed 4 KiB translation table.  RAM is identity-mapped, so the
  * physical frame address is directly usable as the kernel pointer. */
 static uint64_t* alloc_table(void) {
-    uint32_t pa = pmm_alloc_frame();
+    pmm_phys_t pa = pmm_alloc_frame();
     if (pa == PMM_ALLOC_FAIL) return NULL;
     uint64_t* t = (uint64_t*)(uintptr_t)pa;
     for (int i = 0; i < 512; i++) t[i] = 0;

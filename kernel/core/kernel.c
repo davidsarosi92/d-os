@@ -211,7 +211,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
 
     /* Two-level paging path round-trip. */
     {
-        uint32_t phys = pmm_alloc_frame();
+        pmm_phys_t phys = pmm_alloc_frame();
         uint32_t virt = 0xE0000000u;
         if (phys && vmm_map(virt, phys, VMM_WRITABLE) == 0) {
             volatile uint32_t* p = (volatile uint32_t*)virt;

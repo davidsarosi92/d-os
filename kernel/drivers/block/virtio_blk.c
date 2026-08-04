@@ -224,14 +224,14 @@ static int vblk_init_queue(struct virtio_blk* v) {
 
     /* Three contiguous frames: desc fills page 0, avail spills into page
      * 1, used starts at page 2 (page-aligned per legacy virtio rule). */
-    uint32_t phys = pmm_alloc_contiguous(3);
+    pmm_phys_t phys = pmm_alloc_contiguous_dma32(3);
     if (!phys) {
         kprintf("virtio-blk: no contiguous frames for queue\n");
         return -2;
     }
 
     /* Zero the queue area.  Identity-mapped virt == phys for this range. */
-    uint8_t* q = (uint8_t*)(uintptr_t)phys;
+    uint8_t* q = (uint8_t*)phys_to_virt(phys);
     for (uint32_t i = 0; i < QUEUE_BYTES; i++) q[i] = 0;
 
     v->queue_phys = phys;
@@ -255,10 +255,10 @@ static int vblk_init_buffers(struct virtio_blk* v) {
      * is NOT safe here because the device DMAs to descriptor addresses
      * as physical addresses, and heap pages live at virtual
      * 0xD0000000+ which doesn't match their physical backing. */
-    uint32_t f = pmm_alloc_frame();
+    pmm_phys_t f = pmm_alloc_frame_dma32();
     if (!f) return -1;
-    v->req_hdr    = (struct virtio_blk_req_hdr*)(uintptr_t)f;
-    v->req_status = (volatile uint8_t*)((uintptr_t)f + sizeof(*v->req_hdr));
+    v->req_hdr    = (struct virtio_blk_req_hdr*)phys_to_virt(f);
+    v->req_status = (volatile uint8_t*)((uintptr_t)phys_to_virt(f) + sizeof(*v->req_hdr));
     return 0;
 }
 
@@ -282,19 +282,21 @@ static int vblk_request(struct virtio_blk* v, uint32_t type, uint64_t lba,
      * `buf` may be heap-backed (virt 0xD0000000+) — translate that one
      * through the page tables.  Single-page buffers only for now (a
      * larger buffer would need to be split into per-page descriptors). */
-    v->desc[0].addr  = (uint64_t)(uintptr_t)v->req_hdr;
+    v->desc[0].addr  = kptr_phys(v->req_hdr);
     v->desc[0].len   = sizeof(struct virtio_blk_req_hdr);
     v->desc[0].flags = VRING_DESC_F_NEXT;
     v->desc[0].next  = 1;
 
-    uint32_t buf_phys = vmm_translate((uint32_t)(uintptr_t)buf);
-    if (!buf_phys) buf_phys = (uint32_t)(uintptr_t)buf;   /* identity-mapped fallback */
-    v->desc[1].addr  = (uint64_t)buf_phys;
+    /* Physical, and at FULL width: the descriptor addr field is 64-bit in the
+     * spec, and since §M48 the block cache's pages can genuinely live above
+     * 4 GiB.  Narrowing here would aim the device's DMA at a truncated
+     * address — a write to memory that belongs to something else. */
+    v->desc[1].addr  = kptr_phys(buf);
     v->desc[1].len   = nsectors * SECTOR_SIZE;
     v->desc[1].flags = data_flags;
     v->desc[1].next  = 2;
 
-    v->desc[2].addr  = (uint64_t)(uintptr_t)v->req_status;
+    v->desc[2].addr  = kptr_phys((const void*)v->req_status);
     v->desc[2].len   = 1;
     v->desc[2].flags = VRING_DESC_F_WRITE;          /* device writes status */
     v->desc[2].next  = 0;

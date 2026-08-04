@@ -123,6 +123,62 @@ uintptr_t hal_task_init_stack(void* stack_top, void (*entry)(void));
 uintptr_t hal_extend_identity_map(uintptr_t end_phys);
 
 /* ---------------------------------------------------------------------------
+ * Physical <-> kernel-virtual window (§M48).
+ *
+ * The kernel constantly needs to touch a page it only has the PHYSICAL address
+ * of — zeroing a fresh frame, threading a free-list link through it, reading a
+ * page table.  Historically it just dereferenced the physical address, which
+ * works only because low memory is identity-mapped.
+ *
+ * That identity map is also what broke 64-bit userland.  User programs are
+ * linked at `vmm_user_base()` (1 GiB) — they cannot move, because they are
+ * compiled with the small code model, which requires every symbol below 2 GiB.
+ * So as soon as a machine had more than 1 GiB of RAM, the identity map's
+ * 1 GiB page landed exactly on top of the user region and the page-table
+ * walker refused to build user mappings under it.  Every x86_64 exec failed
+ * with ELF_ENOMEM; the port only ever appeared to work because it was always
+ * tested with -m 1024M.
+ *
+ * The fix is to stop competing for low addresses: on x86_64 all of physical
+ * memory is mapped ONCE at KERNEL_DIRECT_MAP_BASE in the (kernel-only) upper
+ * half, and physical dereferences go through `phys_to_virt`.  Low addresses
+ * then belong entirely to user space, whatever the RAM size.
+ *
+ * On i386 and aarch64 the direct map base is 0, so this is the identity
+ * mapping those ports already have and the calls compile away to nothing.
+ * --------------------------------------------------------------------------- */
+#if defined(__x86_64__)
+/* Canonical upper half, PML4 slot 256.  Physical memory is capped well below
+ * the 512 GiB a single PDPT of 1 GiB pages covers. */
+#  define KERNEL_DIRECT_MAP_BASE  0xFFFF800000000000UL
+#else
+#  define KERNEL_DIRECT_MAP_BASE  0UL
+#endif
+
+/* Kernel-virtual pointer for a physical address.  Valid once the direct map is
+ * installed (hal_extend_identity_map, called from pmm_init). */
+static inline void* phys_to_virt(uint64_t phys) {
+    return (void*)(uintptr_t)(phys + KERNEL_DIRECT_MAP_BASE);
+}
+
+/* Inverse — ONLY for pointers that came from phys_to_virt.  A kernel image or
+ * stack address is not in the direct map and must not be passed here. */
+static inline uint64_t virt_to_phys(const void* v) {
+    return (uint64_t)(uintptr_t)v - KERNEL_DIRECT_MAP_BASE;
+}
+
+/* Physical address of ANY kernel pointer — direct-map or kernel-image/low.
+ * Use this where an address is handed to hardware (a DMA descriptor), since
+ * the buffer may equally be a kmalloc'd direct-map page or a static array in
+ * the image.  virt_to_phys is the cheaper choice when the origin is known. */
+static inline uint64_t kptr_phys(const void* v) {
+    uintptr_t a = (uintptr_t)v;
+    if (KERNEL_DIRECT_MAP_BASE && a >= (uintptr_t)KERNEL_DIRECT_MAP_BASE)
+        return (uint64_t)(a - (uintptr_t)KERNEL_DIRECT_MAP_BASE);
+    return (uint64_t)a;
+}
+
+/* ---------------------------------------------------------------------------
  * Syscall epilogue helper.
  *
  * SYS_EXIT bypasses the normal iret-back-to-ring-3 path: it restores a

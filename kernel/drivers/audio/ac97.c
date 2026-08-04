@@ -168,8 +168,8 @@ static int ac97_init(void* ctx) {
 
     /* DMA memory: one frame for the BDL, contiguous frames for the PCM
      * buffer.  PMM-backed → phys == virt in the identity map. */
-    g_ac97.bdl_phys = pmm_alloc_frame();
-    g_ac97.pcm_phys = pmm_alloc_contiguous(32);        /* 128 KB               */
+    g_ac97.bdl_phys = pmm_alloc_frame_dma32();
+    g_ac97.pcm_phys = pmm_alloc_contiguous_dma32(32);        /* 128 KB               */
     if (!g_ac97.bdl_phys || !g_ac97.pcm_phys) { kprintf("ac97: DMA OOM\n"); return -3; }
     g_ac97.bdl = (struct bdl_entry*)(uintptr_t)g_ac97.bdl_phys;
     g_ac97.pcm = (int16_t*)(uintptr_t)g_ac97.pcm_phys;

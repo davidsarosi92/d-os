@@ -24,6 +24,7 @@
  * ============================================================================= */
 
 #include "block_cache.h"
+#include "hal_api.h"   /* phys_to_virt / virt_to_phys — kernel direct map */
 #include "block.h"
 #include "pmm.h"
 #include "printf.h"
@@ -45,13 +46,13 @@ int bcache_init(void) {
     if (initialized) return 0;
 
     for (uint32_t i = 0; i < BCACHE_SLOTS; i++) {
-        uint32_t f = pmm_alloc_frame();
+        pmm_phys_t f = pmm_alloc_frame();
         if (!f) {
             /* Roll back what we already allocated so the system can
              * boot without a cache (the fs layer falls back to direct
              * I/O via dev->read/write). */
             for (uint32_t j = 0; j < i; j++) {
-                pmm_free_frame((uint32_t)(uintptr_t)slots[j].data);
+                pmm_free_frame((pmm_phys_t)(uintptr_t)slots[j].data);
                 slots[j].data = NULL;
             }
             kprintf("bcache: init failed at slot %u (pmm OOM)\n", i);
@@ -59,7 +60,7 @@ int bcache_init(void) {
         }
         slots[i].dev      = NULL;
         slots[i].lba      = 0;
-        slots[i].data     = (uint8_t*)(uintptr_t)f;       /* identity-mapped */
+        slots[i].data     = (uint8_t*)phys_to_virt(f);    /* kernel direct map */
         slots[i].refcount = 0;
         slots[i].dirty    = 0;
         slots[i].lru_tick = 0;

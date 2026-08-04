@@ -137,10 +137,10 @@ static int vn_setup_queue(uint16_t io, uint16_t qidx, struct vnet_queue* q) {
         kprintf("virtio-net: queue %u size=%u, expected %u\n", qidx, qsize, QSIZE);
         return -1;
     }
-    uint32_t phys = pmm_alloc_contiguous(3);
+    pmm_phys_t phys = pmm_alloc_contiguous_dma32(3);
     if (!phys) { kprintf("virtio-net: no frames for queue %u\n", qidx); return -2; }
 
-    uint8_t* base = (uint8_t*)(uintptr_t)phys;
+    uint8_t* base = (uint8_t*)phys_to_virt(phys);
     for (uint32_t i = 0; i < QUEUE_BYTES; i++) base[i] = 0;
 
     q->desc  = (struct virtq_desc*) base;
@@ -171,7 +171,7 @@ static void vn_rx_post(struct virtio_net* v, uint16_t di) {
 
 static int vn_init_rx(struct virtio_net* v) {
     for (uint16_t i = 0; i < RX_BUFFERS; i++) {
-        uint32_t f = pmm_alloc_frame();          /* 4 KiB ≥ RX_BUF_SIZE        */
+        pmm_phys_t f = pmm_alloc_frame_dma32();          /* 4 KiB ≥ RX_BUF_SIZE        */
         if (!f) { kprintf("virtio-net: no RX frame %u\n", i); return -1; }
         v->rx_buf_phys[i] = f;
         vn_rx_post(v, i);
@@ -182,7 +182,7 @@ static int vn_init_rx(struct virtio_net* v) {
 }
 
 static int vn_init_tx(struct virtio_net* v) {
-    uint32_t f = pmm_alloc_frame();
+    pmm_phys_t f = pmm_alloc_frame_dma32();
     if (!f) { kprintf("virtio-net: no TX frame\n"); return -1; }
     v->tx_buf_phys = f;
     return 0;

@@ -153,8 +153,8 @@ int aarch64_usertest(void) {
     struct vmm_space* sp = aarch64_vmm_create();
     if (!sp) { kprintf("usertest: vmm_create failed\n"); return -1; }
 
-    uint32_t code_pa = pmm_alloc_frame();
-    uint32_t stk_pa  = pmm_alloc_frame();
+    pmm_phys_t code_pa = pmm_alloc_frame();
+    pmm_phys_t stk_pa  = pmm_alloc_frame();
     if (code_pa == PMM_ALLOC_FAIL || stk_pa == PMM_ALLOC_FAIL) {
         kprintf("usertest: pmm OOM\n"); return -1;
     }

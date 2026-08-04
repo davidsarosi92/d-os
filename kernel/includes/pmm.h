@@ -39,15 +39,29 @@
 #define PMM_ALLOC_FAIL      0u      /* OOM sentinel — frame 0 is always reserved */
 
 /* Buddy allocator parameters.  See pmm.c file header for the rationale
- * behind each cap.  Bumping BUDDY_MAX_FRAMES raises the supported
- * physical-memory ceiling (it's a .bss cost: 1 byte per frame).
+ * behind each cap.
  *
- * M19.5.1 — per-arch cap.  i386 stays at 1 GiB (identity map is fixed
- * at 256 MiB by vmm.c; the cap is generous since the mmap caps it
- * further if RAM is smaller).  x86_64 bumps to 4 GiB because
- * hal_extend_identity_map can grow the identity map to that range
- * cheaply via 1 GiB PDPT pages.  Real >4 GiB systems would bump
- * further; the page_state[] cost is 1 MiB at 4 GiB, 4 MiB at 16 GiB. */
+ * §M48 — THE FRAME CEILING IS NO LONGER A COMPILE-TIME CONSTANT.
+ *
+ * It used to be `BUDDY_MAX_FRAMES`, a per-arch #define that sized a static
+ * `page_state[]` array in .bss.  That construction cannot scale: the metadata
+ * is 1 byte per frame, so a build that supports 128 GiB would carry 33 MiB of
+ * .bss on EVERY box — including the 256 MiB one that has to load it before it
+ * can even run.  Raising the ceiling and keeping small machines bootable are
+ * directly opposed as long as the number is baked in.
+ *
+ * So the ceiling is now DISCOVERED: pmm_init reads the firmware memory map,
+ * asks the HAL how far the identity map reaches, and sizes the metadata to the
+ * RAM this particular machine actually has (see `pmm_bootmem_alloc`).  One
+ * kernel image therefore boots on 128 MiB and on 128 GiB, paying for neither
+ * on the other.  The only remaining limits are real ones:
+ *
+ *   i386    — 32-bit paging means 32-bit physical addresses: 4 GiB, full stop.
+ *             (64 GiB would need PAE — a different page-table format, not a
+ *             bigger constant.)
+ *   x86_64  — hal_extend_identity_map covers 512 GiB via 1 GiB PDPT pages.
+ *   aarch64 — the Phase-A MMU identity-maps with 1 GiB blocks.
+ */
 /* Order 12 = a single contiguous alloc up to 2^12 pages = 16 MiB.  Order
  * 10 (4 MiB) capped surfaces at 1024×1024-ish; the M22.6 move to a
  * 1920×1200 desktop needs 9.2 MiB per full-screen surface (backbuffer +
@@ -57,28 +71,75 @@
  * 9.2 MiB surface — acceptable for a handful of full-screen surfaces (a
  * vmalloc-style scatter mapping would remove the waste; noted for later). */
 #define BUDDY_MAX_ORDER     12
+
+/* Sanity ceiling, NOT a memory-size policy.  A corrupt or hostile memory map
+ * claiming petabytes must not make us try to allocate petabytes of metadata,
+ * so the discovered frame count is clamped here.  1 << 26 frames = 256 GiB of
+ * RAM, whose metadata is 64 MiB — comfortably above both the x86_64 identity
+ * map's 512 GiB reach and any machine this kernel will meet. */
+#define BUDDY_FRAME_HARD_CAP  (1u << 26)
+
+/* The DISCOVERED frame ceiling: one past the highest pfn the PMM has metadata
+ * for.  Valid only after pmm_init; zero before it.  Everything that used to
+ * compare against BUDDY_MAX_FRAMES compares against this. */
+extern uint32_t pmm_nr_frames;
+
+/* Physical address width.  i386's page tables hold 32-bit physical addresses,
+ * so widening the type there would buy nothing but code size; the 64-bit
+ * arches must reach past 4 GiB or the ceiling above is decorative. */
 #if defined(__x86_64__) || defined(__aarch64__)
-/* aarch64: the QEMU `virt` board places RAM at physical 0x4000_0000, so the
- * frame descriptor array must be indexable up past pfn 0x40000 (1 GiB) — the
- * 1 GiB cap would leave every RAM frame out of range.  The 4 GiB cap (1 MiB
- * of page_state metadata) covers the device window + several GiB of RAM. */
-#  define BUDDY_MAX_FRAMES  (1u << 20)      /* 4 GiB cap, 1 MiB metadata */
+typedef uint64_t pmm_phys_t;
 #else
-#  define BUDDY_MAX_FRAMES  (1u << 18)      /* 1 GiB cap, 256 KiB metadata */
+typedef uint32_t pmm_phys_t;
 #endif
 
-/* Zone identifiers.  Allocators that don't care should pass
- * ZONE_DEFAULT — which falls back NORMAL → DMA → fail. */
+/* Zone identifiers, ordered by how CONSTRAINED the memory is: a lower zone can
+ * satisfy anything a higher one can, but not vice versa.  A hint therefore
+ * means "this zone, then fall back DOWNWARD"; ZONE_DEFAULT == ZONE_NORMAL.
+ *
+ *   ZONE_DMA    phys < 16 MiB   — legacy ISA DMA
+ *   ZONE_DMA32  phys < 4 GiB    — anything that addresses DMA with 32 bits
+ *   ZONE_NORMAL phys >= 4 GiB   — unconstrained; empty on i386 by construction
+ *
+ * §M48 — DMA32 is new, and it is not cosmetic.  While the frame ceiling was
+ * 4 GiB, "any frame" and "a frame a 32-bit device can reach" were the same
+ * thing, so no driver had to say which it wanted.  Past 4 GiB they diverge,
+ * and a device handed a 40-bit address it can only store 32 bits of does not
+ * fail loudly — it DMAs into whatever the truncated address happens to hit.
+ * So every device buffer now names DMA32 explicitly (see the *_dma32 helpers);
+ * 64-bit-capable DMA is an opt-in a driver has to earn, one driver at a time.
+ */
 #define ZONE_DMA            0
-#define ZONE_NORMAL         1
-#define ZONE_HIGHMEM        2      /* reserved; not populated today */
+#define ZONE_DMA32          1
+#define ZONE_NORMAL         2
 #define NR_ZONES            3
 #define ZONE_DEFAULT        (-1)
+
+/* Frame index of the 4 GiB line — the DMA32 / NORMAL boundary. */
+#define ZONE_DMA32_FRAME_LIMIT  (1u << 20)
 
 /* Build the buddy free lists from the multiboot mmap, reserve protected
  * regions (kernel image, low memory, multiboot info).  Call once at
  * boot after `mboot_init`. */
 void pmm_init(void);
+
+/* ---------------------------------------------------------------------------
+ * Boot-time arena (§M48).
+ *
+ * The chicken-and-egg problem the dynamic ceiling creates: the buddy allocator
+ * cannot hand out its own metadata, and the metadata's size is only known once
+ * the memory map has been read.  So pmm_init first reserves one contiguous
+ * arena out of the raw memory map — before any free list exists — and carves it
+ * out of the pool so the buddy never sees it.  `pmm_bootmem_alloc` bump-
+ * allocates from that arena.
+ *
+ * Intended for structures that are (a) sized from the RAM count and (b) live
+ * for the lifetime of the kernel — page_state[] and kmalloc's big-alloc side
+ * table.  There is no free.  Returns NULL if the arena is exhausted, and may
+ * be called after pmm_init (the arena stays reserved), which is what lets
+ * kmalloc_init size its own table.
+ * --------------------------------------------------------------------------- */
+void* pmm_bootmem_alloc(uint32_t bytes);
 
 /* ---------------------------------------------------------------------------
  * Order-aware API.  An "order" is a log2 page count: order 0 = one
@@ -90,17 +151,25 @@ void pmm_init(void);
  * NORMAL first then falls back to DMA; DMA returns DMA-only; NORMAL
  * returns NORMAL-only.
  * --------------------------------------------------------------------------- */
-uint32_t page_alloc(int order, int zone_hint);
-void     page_free (uint32_t phys, int order);
+pmm_phys_t page_alloc(int order, int zone_hint);
+void       page_free (pmm_phys_t phys, int order);
 
 /* ---------------------------------------------------------------------------
  * Legacy 1-frame / N-frame API.  Kept stable so existing drivers
  * (virtio_blk, xhci, ramfs frame slabs) don't need rewrites; internally
  * dispatches to page_alloc / page_free.
  * --------------------------------------------------------------------------- */
-uint32_t pmm_alloc_frame(void);
-uint32_t pmm_alloc_contiguous(uint32_t n);
-void     pmm_free_frame(uint32_t addr);
+pmm_phys_t pmm_alloc_frame(void);
+pmm_phys_t pmm_alloc_contiguous(uint32_t n);
+void       pmm_free_frame(pmm_phys_t addr);
+
+/* The same two, restricted to memory a 32-bit DMA engine can address.  Use
+ * these for anything whose address is handed to hardware through a 32-bit
+ * register or descriptor field.  On i386 they are indistinguishable from the
+ * plain versions; on a large 64-bit machine they are the difference between a
+ * working device and silent memory corruption. */
+pmm_phys_t pmm_alloc_frame_dma32(void);
+pmm_phys_t pmm_alloc_contiguous_dma32(uint32_t n);
 
 /* Statistics.  `managed` is the total count of frames the PMM knows
  * about (sum of AVAILABLE mmap regions in frames).  `free` and `used`

@@ -10,6 +10,7 @@
  * =========================================================================== */
 
 #include "shell.h"
+#include "hal_api.h"   /* phys_to_virt / virt_to_phys — kernel direct map */
 #include "console.h"
 #include "keyboard.h"
 #include "hal.h"
@@ -838,7 +839,7 @@ static void cmd_slabinfo(void) {
 }
 
 static void cmd_buddyinfo(void) {
-    const char* zone_names[NR_ZONES] = { "DMA", "NORMAL", "HIGHMEM" };
+    const char* zone_names[NR_ZONES] = { "DMA", "DMA32", "NORMAL" };
     uint32_t order_counts[BUDDY_MAX_ORDER + 1];
     kprintf("ZONE     MANAGED  FREE-BLOCKS-PER-ORDER (0..%u)\n",
             BUDDY_MAX_ORDER);
@@ -1128,8 +1129,8 @@ static void cmd_blktest(void) {
      * splitting its physical backing across two non-adjacent frames —
      * fatal for a single-descriptor DMA.  A whole frame is over-
      * allocated for 512 bytes but trivially correct. */
-    uint32_t wf = pmm_alloc_frame();
-    uint32_t rf = pmm_alloc_frame();
+    pmm_phys_t wf = pmm_alloc_frame();
+    pmm_phys_t rf = pmm_alloc_frame();
     if (!wf || !rf) {
         console_write("blktest: PMM OOM\n");
         if (wf) pmm_free_frame(wf);
@@ -1242,11 +1243,11 @@ static void cmd_mmtest(void) {
     struct vmm_space* s = vmm_space_create();
     if (!s) { console_write("mmtest: vmm_space_create failed\n"); return; }
 
-    uint32_t frame = pmm_alloc_frame();          /* backing for the user page */
+    pmm_phys_t frame = pmm_alloc_frame();          /* backing for the user page */
     if (!frame) { console_write("mmtest: no frame\n"); vmm_space_destroy(s); return; }
 
     /* Seed the sentinel through the identity map (frame < 256 MiB). */
-    *(volatile uint32_t*)(uintptr_t)frame = 0xC0FFEE42u;
+    *(volatile uint32_t*)phys_to_virt(frame) = 0xC0FFEE42u;
 
     const uintptr_t UVA = vmm_user_base();        /* arch's user-region base */
     if (vmm_space_map(s, UVA, frame, VMM_WRITABLE | VMM_USER) != 0) {

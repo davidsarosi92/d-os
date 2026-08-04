@@ -137,13 +137,13 @@ void proc_set_exec_env(const char* kv) {
     }
 }
 
-static uintptr_t build_initial_stack(uint32_t frame_phys, uintptr_t stack_va,
+static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
                                      int argc, const char* const argv[],
                                      const struct loaded_prog* lp) {
     if (argc < 0) argc = 0;
     if (argc > PROC_MAX_ARGV) argc = PROC_MAX_ARGV;
 
-    uint8_t* base = (uint8_t*)(uintptr_t)frame_phys;   /* kernel identity view  */
+    uint8_t* base = (uint8_t*)phys_to_virt(frame_phys); /* kernel direct map    */
     for (uint32_t i = 0; i < PAGE_SIZE; i++) base[i] = 0;
 
     /* 1. Copy the argument strings to the top of the page, recording each
@@ -270,14 +270,14 @@ static int load_program(struct vmm_space* s, const void* image, size_t len,
  * Returns the TOP page's frame (for build_initial_stack, which writes argc/
  * argv/envp/auxv there) and its VA via *stack_va_out; the pages below it are
  * zeroed scratch for stack growth.  Returns 0 on failure. */
-static uint32_t map_user_stack(struct vmm_space* s, uintptr_t* stack_va_out) {
+static pmm_phys_t map_user_stack(struct vmm_space* s, uintptr_t* stack_va_out) {
     uintptr_t top_page = vmm_user_base() + PROC_STACK_TOP - PAGE_SIZE;
-    uint32_t top_frame = 0;
+    pmm_phys_t top_frame = 0;
     for (uint32_t i = 0; i < PROC_STACK_PAGES; i++) {
         uintptr_t va = top_page - (uintptr_t)i * PAGE_SIZE;
-        uint32_t fr = pmm_alloc_frame();
+        pmm_phys_t fr = pmm_alloc_frame();
         if (!fr) return 0;
-        uint8_t* p = (uint8_t*)(uintptr_t)fr;
+        uint8_t* p = (uint8_t*)phys_to_virt(fr);
         for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = 0;
         if (vmm_space_map(s, va, fr, VMM_USER | VMM_WRITABLE) != 0) {
             pmm_free_frame(fr);
@@ -303,7 +303,7 @@ static int proc_exec_common(const void* image, size_t len,
 
     /* Multi-page user stack (grows down), clear of the loaded image. */
     uintptr_t stack_va;
-    uint32_t stk = map_user_stack(s, &stack_va);
+    pmm_phys_t stk = map_user_stack(s, &stack_va);
     if (!stk) { vmm_space_destroy(s); return -1; }
     uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, argv, &lp);
 
@@ -400,7 +400,7 @@ int proc_execve(const char* path, char* const uargv[]) {
         vmm_space_destroy(ns); kfree(img); kfree(strbuf); return -1;
     }
     uintptr_t stack_va;
-    uint32_t stk = map_user_stack(ns, &stack_va);
+    pmm_phys_t stk = map_user_stack(ns, &stack_va);
     if (!stk) { vmm_space_destroy(ns); kfree(img); kfree(strbuf); return -1; }
     uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, kargv, &lp);
 
@@ -544,7 +544,7 @@ int proc_spawn_argv_under(const char* name, const void* image, size_t len,
     if (rc != ELF_OK) { vmm_space_destroy(s); return rc; }
 
     uintptr_t stack_va;
-    uint32_t stk = map_user_stack(s, &stack_va);
+    pmm_phys_t stk = map_user_stack(s, &stack_va);
     if (!stk) { vmm_space_destroy(s); return -1; }
 
     struct user_boot* b = (struct user_boot*)kmalloc(sizeof *b);

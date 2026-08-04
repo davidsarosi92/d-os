@@ -301,7 +301,7 @@ int virtio_gpu_init(void) {
 
     /* Contiguous framebuffer: 1280*800*4 = 4,096,000 B = exactly 1000 frames. */
     uint32_t nframes = (FB_PITCH * FB_HEIGHT + 4095) / 4096;
-    g_fb_phys = pmm_alloc_contiguous(nframes);
+    g_fb_phys = pmm_alloc_contiguous_dma32(nframes);
     if (g_fb_phys == PMM_ALLOC_FAIL) { kprintf("virtio-gpu: FB alloc (%u frames) failed\n", nframes); return -1; }
 
     /* 1. Create the 2D resource. */

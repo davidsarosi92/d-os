@@ -5,6 +5,7 @@
  * ============================================================================= */
 
 #include "fd.h"
+#include "hal_api.h"   /* phys_to_virt / virt_to_phys — kernel direct map */
 #include "vfs.h"
 #include "pmm.h"
 #include "kmalloc.h"
@@ -83,14 +84,14 @@ struct shm* shm_create(size_t size) {
     s->refcount = 1;
     s->nframes  = n;
     for (int i = 0; i < n; i++) {
-        uint32_t f = pmm_alloc_frame();
+        pmm_phys_t f = pmm_alloc_frame();
         if (!f) {                               /* OOM — unwind */
             for (int j = 0; j < i; j++) pmm_free_frame(s->frames[j]);
             kfree(s);
             return NULL;
         }
         /* Zero the frame through the identity map (frames are < 1 GiB). */
-        uint8_t* p = (uint8_t*)(uintptr_t)f;
+        uint8_t* p = (uint8_t*)phys_to_virt(f);
         for (int b = 0; b < 4096; b++) p[b] = 0;
         s->frames[i] = f;
     }
@@ -108,9 +109,9 @@ int shm_grow(struct shm* s, size_t size) {
     if (n <= s->nframes) return 0;
     if (n > SHM_MAX_FRAMES) return -1;
     for (int i = s->nframes; i < n; i++) {
-        uint32_t f = pmm_alloc_frame();
+        pmm_phys_t f = pmm_alloc_frame();
         if (!f) return -1;                      /* keep what we already grew to */
-        uint8_t* p = (uint8_t*)(uintptr_t)f;
+        uint8_t* p = (uint8_t*)phys_to_virt(f);
         for (int b = 0; b < 4096; b++) p[b] = 0;
         s->frames[i] = f;
         s->nframes = i + 1;

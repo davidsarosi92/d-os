@@ -55,8 +55,8 @@ size_t arch_user_hello(uint8_t* buf, size_t cap, uintptr_t base) {
 }
 
 int arch_ringtest(void) {
-    uint32_t code_phys  = pmm_alloc_frame();
-    uint32_t stack_phys = pmm_alloc_frame();
+    pmm_phys_t code_phys  = pmm_alloc_frame();
+    pmm_phys_t stack_phys = pmm_alloc_frame();
     if (!code_phys || !stack_phys) {
         console_write("ringtest: pmm OOM\n");
         if (code_phys)  pmm_free_frame(code_phys);

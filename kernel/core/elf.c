@@ -91,9 +91,9 @@ static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len
     uintptr_t span = page_off + p->memsz;
 
     for (uintptr_t off = 0; off < span; off += PAGE_SIZE) {
-        uint32_t frame = pmm_alloc_frame();
+        pmm_phys_t frame = pmm_alloc_frame();
         if (!frame) return ELF_ENOMEM;
-        uint8_t* dst = (uint8_t*)(uintptr_t)frame;   /* identity-mapped */
+        uint8_t* dst = (uint8_t*)phys_to_virt(frame);   /* kernel direct map */
         for (int i = 0; i < (int)PAGE_SIZE; i++) dst[i] = 0;
 
         /* Copy the slice of file data that lands in this page.  `fpos` is

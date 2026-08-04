@@ -401,9 +401,9 @@ long sys_mmap(size_t len, int fd) {
 
     if (fd < 0) {
         for (int i = 0; i < n; i++) {
-            uint32_t fr = pmm_alloc_frame();
+            pmm_phys_t fr = pmm_alloc_frame();
             if (!fr) return -1;
-            uint8_t* p = (uint8_t*)(uintptr_t)fr;
+            uint8_t* p = (uint8_t*)phys_to_virt(fr);
             for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = 0;
             if (vmm_space_map(t->mm, va + (uintptr_t)i * PAGE_SIZE, fr,
                               VMM_USER | VMM_WRITABLE) != 0) {
@@ -506,9 +506,9 @@ long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
          * the fresh frame maps cleanly. */
         if (flags & MAP_FIXED) vmm_space_unmap(t->mm, page_va);
 
-        uint32_t fr = pmm_alloc_frame();
+        pmm_phys_t fr = pmm_alloc_frame();
         if (!fr) return -1;
-        uint8_t* p = (uint8_t*)(uintptr_t)fr;         /* kernel identity view  */
+        uint8_t* p = (uint8_t*)phys_to_virt(fr);      /* kernel direct map     */
         for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = 0;
 
         if (file) {

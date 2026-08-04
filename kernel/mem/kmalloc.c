@@ -12,11 +12,11 @@
  *   2. Ask the slab layer if the page is a slab page; if yes,
  *      slab_free routes it back into the magazine / cache.
  *   3. Otherwise look up `big_alloc_order[pfn]` (a side table sized to
- *      BUDDY_MAX_FRAMES) for the order of the page-alloc-backed
+ *      pmm_nr_frames) for the order of the page-alloc-backed
  *      allocation; if found, page_free at that order.
  *   4. Otherwise complain — the pointer wasn't from us.
  *
- * The side table is 1 byte per frame, sized to BUDDY_MAX_FRAMES.  It
+ * The side table is 1 byte per frame, sized at boot to pmm_nr_frames.  It
  * holds 0xFF for "not a kmalloc-big-alloc page" and 0..BUDDY_MAX_ORDER
  * for the head of one.  Interior frames stay 0xFF — kfree only looks
  * up the head pfn (== p >> 12 for a returned page-aligned pointer).
@@ -33,6 +33,7 @@
  * ============================================================================= */
 
 #include "kmalloc.h"
+#include "hal_api.h"   /* phys_to_virt / virt_to_phys — kernel direct map */
 #include "slab.h"
 #include "pmm.h"
 #include "printf.h"
@@ -44,7 +45,15 @@
 /* -------------------------------------------------------------------------- */
 
 #define BIG_NONE 0xFFu
-static uint8_t big_alloc_order[BUDDY_MAX_FRAMES];
+
+/* §M48 — sized to the RAM this machine actually has, out of the PMM's boot
+ * arena.  It used to be a static array dimensioned by a compile-time frame
+ * cap, which forced a choice between "supports big machines" and "fits on
+ * small ones"; pmm_nr_frames removes the choice.  NULL (and nr == 0) until
+ * kmalloc_init, and every access is bounds-checked against nr, so a kfree
+ * that somehow ran early just takes the "not ours" path. */
+static uint8_t* big_alloc_order;
+static uint32_t big_alloc_nr;
 
 static uint32_t big_allocs   = 0;
 static uint32_t big_bytes    = 0;     /* sum of order_to_bytes for live big allocs */
@@ -73,10 +82,21 @@ void kmalloc_init(void) {
     if (initialized) return;
 
     /* Mark the entire side table as "not a big-alloc page".  Done
-     * explicitly even though .bss is zero — 0x00 is a valid order
-     * (= one frame), so we'd misidentify every never-touched frame
-     * as a 1-page big-alloc page.  Manual fill it is. */
-    for (uint32_t i = 0; i < BUDDY_MAX_FRAMES; i++) big_alloc_order[i] = BIG_NONE;
+     * explicitly even though fresh memory may read as zero — 0x00 is a
+     * valid order (= one frame), so we'd misidentify every never-touched
+     * frame as a 1-page big-alloc page.  Manual fill it is. */
+    big_alloc_nr    = pmm_nr_frames;
+    big_alloc_order = (uint8_t*)pmm_bootmem_alloc(big_alloc_nr);
+    if (!big_alloc_order) {
+        /* Without the side table kfree cannot tell a big allocation from a
+         * stray pointer, so every >2 KiB block would leak.  Say so loudly
+         * rather than limp: this only happens if the arena was mis-sized. */
+        kprintf("kmalloc: FATAL — no boot arena for the %u KiB big-alloc table\n",
+                big_alloc_nr >> 10);
+        big_alloc_nr = 0;
+        return;
+    }
+    for (uint32_t i = 0; i < big_alloc_nr; i++) big_alloc_order[i] = BIG_NONE;
 
     slab_init();
     initialized = 1;
@@ -98,14 +118,23 @@ void* kmalloc(size_t size) {
     /* Slow path: page-alloc backed.  Round up to the smallest order
      * that fits, allocate from the buddy, record in the side table. */
     int order = order_for_bytes(size);
-    uint32_t phys = page_alloc(order, ZONE_DEFAULT);
+    pmm_phys_t phys = page_alloc(order, ZONE_DEFAULT);
     if (!phys) return NULL;
 
+    /* The table spans every frame the PMM manages, so a frame it just handed
+     * us is in range by construction — checked anyway, because leaking one
+     * block beats corrupting whatever follows the table. */
+    if ((phys >> 12) >= big_alloc_nr) {
+        kprintf("kmalloc: frame %u outside the %u-frame side table\n",
+                phys >> 12, big_alloc_nr);
+        page_free(phys, order);
+        return NULL;
+    }
     big_alloc_order[phys >> 12] = (uint8_t)order;
     big_allocs++;
     big_bytes += (1u << order) * 4096u;
 
-    return (void*)(uintptr_t)phys;
+    return phys_to_virt(phys);
 }
 
 void* kcalloc(size_t n, size_t size) {
@@ -150,8 +179,8 @@ void kfree(void* p) {
         return;
     }
 
-    uint32_t pfn = (uint32_t)(uintptr_t)p >> 12;
-    if (pfn >= BUDDY_MAX_FRAMES || big_alloc_order[pfn] == BIG_NONE) {
+    uint32_t pfn = (uint32_t)(virt_to_phys(p) >> 12);
+    if (pfn >= big_alloc_nr || big_alloc_order[pfn] == BIG_NONE) {
         kprintf("kfree: pointer %p not from kmalloc\n", p);
         return;
     }
@@ -161,7 +190,7 @@ void kfree(void* p) {
     if (big_allocs) big_allocs--;
     if (big_bytes >= (1u << order) * 4096u) big_bytes -= (1u << order) * 4096u;
 
-    page_free((uint32_t)(uintptr_t)p, order);
+    page_free(virt_to_phys(p), order);
 }
 
 /* -------------------------------------------------------------------------- */

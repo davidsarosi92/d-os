@@ -198,7 +198,7 @@ static int map_in_pd(uint32_t* pd, uint32_t virt, uint32_t phys, uint32_t flags)
         /* No table here yet — carve one out of physical memory.  Today
          * the PMM only ever returns frames below 256 MiB, so we can
          * reach the new table through the identity map and zero it. */
-        uint32_t pt_phys = pmm_alloc_frame();
+        pmm_phys_t pt_phys = pmm_alloc_frame();
         if (!pt_phys) return -2;
 
         pt = (uint32_t*)(uintptr_t)pt_phys;
@@ -343,7 +343,7 @@ struct vmm_space* vmm_space_create(void) {
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
     if (!s) return NULL;
 
-    uint32_t pd_phys = pmm_alloc_frame();       /* one 4 KiB frame = 1024 PDEs */
+    pmm_phys_t pd_phys = pmm_alloc_frame();       /* one 4 KiB frame = 1024 PDEs */
     if (!pd_phys) { kfree(s); return NULL; }
 
     s->pd      = (uint32_t*)(uintptr_t)pd_phys; /* reachable via identity map */
@@ -357,15 +357,29 @@ struct vmm_space* vmm_space_create(void) {
 }
 
 /* M34 — per-frame COW reference counts, indexed by frame number (phys >> 12).
- * Covers the i386 low-memory region the PMM allocates user pages from (256 MiB
- * → 64 Ki frames).  A count of 0 means "not COW-shared" (a normally-owned page
- * freed by its single owner); a page made COW by fork starts at 2. */
-#define COW_MAX_FRAMES  (256u * 1024u * 1024u / 4096u)   /* 65536 */
-static uint16_t g_cow_ref[COW_MAX_FRAMES];
+ * A count of 0 means "not COW-shared" (a normally-owned page freed by its
+ * single owner); a page made COW by fork starts at 2.
+ *
+ * §M48 — sized at boot to every frame the PMM manages, not to a fixed window.
+ * The old 256 MiB array exactly matched the i386 identity cap, so no frame was
+ * ever out of range and the gap never showed; the moment the cap moves, an
+ * untracked frame becomes a DOUBLE FREE, because fork shares the page in both
+ * spaces while free_subtree, seeing no refcount, releases it from each.  (That
+ * is not hypothetical — it is what the x86_64 twin did once its own window was
+ * exceeded.)  Sizing from pmm_nr_frames removes the failure mode rather than
+ * relying on a coincidence between two constants. */
+static uint16_t* g_cow_ref;
+static uint32_t  g_cow_nr;
 
 static inline uint16_t* cow_slot(uint32_t phys) {
+    if (!g_cow_ref) {
+        g_cow_nr  = pmm_nr_frames;
+        g_cow_ref = (uint16_t*)pmm_bootmem_alloc(g_cow_nr * (uint32_t)sizeof(uint16_t));
+        if (!g_cow_ref) { g_cow_nr = 0; return NULL; }
+        for (uint32_t i = 0; i < g_cow_nr; i++) g_cow_ref[i] = 0;
+    }
     uint32_t fn = phys >> 12;
-    return (fn < COW_MAX_FRAMES) ? &g_cow_ref[fn] : NULL;
+    return (fn < g_cow_nr) ? &g_cow_ref[fn] : NULL;
 }
 
 void vmm_space_destroy(struct vmm_space* s) {
@@ -442,7 +456,7 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
                 }
             } else {
                 /* Read-only (code) → eager private copy (cheap, rarely large). */
-                uint32_t nf = pmm_alloc_frame();
+                pmm_phys_t nf = pmm_alloc_frame();
                 if (!nf) { vmm_space_destroy(child); return NULL; }
                 const uint32_t* src = (const uint32_t*)(uintptr_t)frame;
                 uint32_t* dst = (uint32_t*)(uintptr_t)nf;
@@ -479,7 +493,7 @@ int vmm_cow_fault(uintptr_t fault_va) {
         if (rc) *rc = 0;
     } else {
         (*rc)--;                                        /* one fewer sharer   */
-        uint32_t nf = pmm_alloc_frame();
+        pmm_phys_t nf = pmm_alloc_frame();
         if (!nf) { (*rc)++; return 0; }                 /* OOM → real fault    */
         const uint32_t* src = (const uint32_t*)(uintptr_t)old;
         uint32_t* dst = (uint32_t*)(uintptr_t)nf;
