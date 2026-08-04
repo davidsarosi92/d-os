@@ -124,7 +124,17 @@ if command -v "$QEMU" >/dev/null 2>&1; then
     # -m 256M: two 1920x1200 heap surfaces (backbuffer + wallpaper) are
     #   ~9.2 MiB each, rounded to 16 MiB by the buddy allocator — well
     #   past QEMU's 128 MiB i386 default once the rest of the kernel is in.
-    EXTRA="-m 256M -vga none -device VGA,vgamem_mb=32"
+    # -m 1024M: the i386 identity map now runs to 1 GiB (it stopped at 256 MiB
+    #   until §M48, which is what made Mesa run out of memory on a machine that
+    #   had plenty), so this is the point where extra RAM starts being usable.
+    #   x86_64 has no such ceiling at all.
+    EXTRA="-m 1024M -vga none -device VGA,vgamem_mb=32"
+    # A NETWORK CARD.  Its absence is why the browser could not open a single
+    # site however well the fetcher worked: there was nothing to fetch over.
+    # `user` mode needs no host privileges and gives the guest 10.0.2.15 with a
+    # NAT gateway and DNS at 10.0.2.3 — which is exactly what /etc/resolv.conf
+    # is provisioned for.
+    EXTRA="$EXTRA -netdev user,id=net0 -device virtio-net-pci,netdev=net0"
     if [ "$(uname -s)" = "Darwin" ]; then
         EXTRA="$EXTRA -display cocoa,zoom-to-fit=off"
     fi
