@@ -116,6 +116,25 @@ INC="-I$NS -I$NS/include -I$NS/content -I$NS/content/handlers \
 DEFS="-Os -w -std=gnu99 -fPIC -D_GNU_SOURCE -Dnsframebuffer -Dsmall \
  -DFB_USE_FREETYPE -include $OUT/dos_prelude.h"
 
+# --- Mbed TLS (https) ---------------------------------------------------------
+# NS_MBEDTLS points at third_party/mbedtls-<arch>.  Without it the fetcher still
+# builds and serves http, refusing https with a clear message rather than a
+# mysterious failure — so a tree that has not run `make mbedtls` is not broken,
+# just plaintext-only.
+TLS_LIBS=""
+if [ -n "${NS_MBEDTLS:-}" ] && [ -f "$NS_MBEDTLS/lib/libmbedtls.a" ]; then
+    DEFS="$DEFS -DDOS_FETCH_TLS"
+    INC="$INC -I$NS_MBEDTLS/include"
+    # Order matters for a static link, which resolves left to right:
+    # libmbedtls -> libmbedx509 -> libmbedcrypto.  Omitting x509 links until
+    # the TLS 1.3 certificate path pulls mbedtls_x509_crt_parse_der.
+    TLS_LIBS="$NS_MBEDTLS/lib/libmbedtls.a $NS_MBEDTLS/lib/libmbedx509.a \
+              $NS_MBEDTLS/lib/libmbedcrypto.a"
+    echo "netsurf: https enabled (Mbed TLS at $NS_MBEDTLS)"
+else
+    echo "netsurf: https DISABLED (no Mbed TLS for this arch; http still works)"
+fi
+
 # --- curated source list ------------------------------------------------------
 S_CONTENT="content.c content_factory.c fetch.c hlcache.c llcache.c mimesniff.c textsearch.c urldb.c no_backing_store.c"
 S_FETCH="fetchers/data.c fetchers/resource.c fetchers/file/dirlist.c fetchers/file/file.c"
@@ -185,7 +204,7 @@ $CC -pie -o "$OUT/netsurf.dynelf" "$OUT"/*.o \
     "$U/libwapcaplet.so.0" "$U/libparserutils.so.0" \
     "$U/libnsutils.so.0" "$U/libnslog.so.0" "$U/libnspsl.so.0" \
     "$U/libnsgif.so.0" "$U/libnsbmp.so.0" "$U/libnsfb.so.0" \
-    "$U/libpng16.so.16" "$U/libz.so.1" "$U/libfreetype.so.6" -lm || {
+    "$U/libpng16.so.16" "$U/libz.so.1" "$U/libfreetype.so.6" $TLS_LIBS -lm || {
         echo "netsurf: link failed"; exit 1; }
 
 cp "$OUT/netsurf.dynelf" "$U/netsurf.dynelf"

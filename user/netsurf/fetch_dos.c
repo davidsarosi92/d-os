@@ -50,6 +50,15 @@
 #include <netdb.h>
 #include <netinet/in.h>
 
+#ifdef DOS_FETCH_TLS
+#include <mbedtls/ssl.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/error.h>
+#include <psa/crypto.h>
+#endif
+
 #include "utils/errors.h"
 #include "utils/nsurl.h"
 #include "utils/log.h"
@@ -61,6 +70,126 @@
  * below what d-os can spare. */
 #define DOS_FETCH_MAX_BODY  (8u << 20)
 #define DOS_FETCH_CHUNK     (16u << 10)
+#define DOS_FETCH_CA_PATH   "/etc/ssl/cert.pem"
+
+/* One transport, two backings, so the HTTP request/response code is written
+ * once.  Same shape as `wget`'s — deliberately, because that one is proven on
+ * this stack and divergence here would be divergence in the part that is
+ * hardest to debug. */
+struct conn {
+    int fd;
+    int tls;
+#ifdef DOS_FETCH_TLS
+    mbedtls_ssl_context      ssl;
+    mbedtls_ssl_config       conf;
+    mbedtls_x509_crt         ca;
+    mbedtls_entropy_context  entropy;
+    mbedtls_ctr_drbg_context drbg;
+#endif
+};
+
+#ifdef DOS_FETCH_TLS
+/* BIO over the plain socket.  write/read, not send/recv — see send_all.
+ *
+ * The transport error code is mbedTLS's generic one rather than
+ * MBEDTLS_ERR_NET_*: those live in net_sockets.h, which is the module we are
+ * replacing, and pulling it in just for two constants would drag in the POSIX
+ * socket layer we deliberately bypass. */
+#define DOS_BIO_ERR  MBEDTLS_ERR_SSL_INTERNAL_ERROR
+
+static int bio_send(void *ctx, const unsigned char *b, size_t n)
+{
+    long w = write(*(int *)ctx, b, n);
+    return w >= 0 ? (int)w : DOS_BIO_ERR;
+}
+static int bio_recv(void *ctx, unsigned char *b, size_t n)
+{
+    long r = read(*(int *)ctx, b, n);
+    return r >= 0 ? (int)r : DOS_BIO_ERR;
+}
+
+/* Verify against the CA bundle AND the hostname.  A browser that skips either
+ * is worse than one that cannot do https at all, because it looks like it can. */
+static int tls_start(struct conn *c, const char *host)
+{
+    c->tls = 1;
+    psa_crypto_init();
+    mbedtls_entropy_init(&c->entropy);
+    mbedtls_ctr_drbg_init(&c->drbg);
+    if (mbedtls_ctr_drbg_seed(&c->drbg, mbedtls_entropy_func, &c->entropy,
+                              (const unsigned char *)"d-os-netsurf", 12) != 0)
+        return -1;
+
+    mbedtls_x509_crt_init(&c->ca);
+    FILE *cf = fopen(DOS_FETCH_CA_PATH, "rb");
+    if (!cf) { fprintf(stderr, "fetch_dos: no %s\n", DOS_FETCH_CA_PATH); return -1; }
+    fseek(cf, 0, SEEK_END); long clen = ftell(cf); fseek(cf, 0, SEEK_SET);
+    unsigned char *cab = clen > 0 ? malloc((size_t)clen + 1) : NULL;
+    if (!cab || fread(cab, 1, (size_t)clen, cf) != (size_t)clen) {
+        fclose(cf); free(cab); return -1;
+    }
+    fclose(cf);
+    cab[clen] = 0;
+    int rc = mbedtls_x509_crt_parse(&c->ca, cab, (size_t)clen + 1);
+    free(cab);
+    if (rc < 0) return -1;
+
+    mbedtls_ssl_config_init(&c->conf);
+    mbedtls_ssl_config_defaults(&c->conf, MBEDTLS_SSL_IS_CLIENT,
+                                MBEDTLS_SSL_TRANSPORT_STREAM,
+                                MBEDTLS_SSL_PRESET_DEFAULT);
+    mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->drbg);
+    mbedtls_ssl_conf_ca_chain(&c->conf, &c->ca, NULL);
+    mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    mbedtls_ssl_init(&c->ssl);
+    if (mbedtls_ssl_setup(&c->ssl, &c->conf) != 0) return -1;
+    mbedtls_ssl_set_hostname(&c->ssl, host);
+    mbedtls_ssl_set_bio(&c->ssl, &c->fd, bio_send, bio_recv, NULL);
+
+    int hs;
+    while ((hs = mbedtls_ssl_handshake(&c->ssl)) != 0) {
+        if (hs != MBEDTLS_ERR_SSL_WANT_READ && hs != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            char e[128] = {0};
+            mbedtls_strerror(hs, e, sizeof e);
+            fprintf(stderr, "fetch_dos: TLS handshake failed -0x%x %s\n",
+                    (unsigned)(-hs), e);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void tls_end(struct conn *c)
+{
+    if (!c->tls) return;
+    mbedtls_ssl_close_notify(&c->ssl);
+    mbedtls_ssl_free(&c->ssl);
+    mbedtls_ssl_config_free(&c->conf);
+    mbedtls_x509_crt_free(&c->ca);
+    mbedtls_ctr_drbg_free(&c->drbg);
+    mbedtls_entropy_free(&c->entropy);
+    c->tls = 0;
+}
+#endif /* DOS_FETCH_TLS */
+
+static long c_write(struct conn *c, const void *b, size_t n)
+{
+#ifdef DOS_FETCH_TLS
+    if (c->tls) return mbedtls_ssl_write(&c->ssl, b, n);
+#endif
+    return write(c->fd, b, n);
+}
+static long c_read(struct conn *c, void *b, size_t n)
+{
+#ifdef DOS_FETCH_TLS
+    if (c->tls) {
+        int r = mbedtls_ssl_read(&c->ssl, b, n);
+        if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
+        return r;
+    }
+#endif
+    return read(c->fd, b, n);
+}
 
 struct dos_fetch {
     struct fetch  *parent;          /* NetSurf's handle for callbacks        */
@@ -153,6 +282,15 @@ static int tcp_connect(const char *host, int port)
     return fd;
 }
 
+static void conn_close(struct conn *c)
+{
+#ifdef DOS_FETCH_TLS
+    tls_end(c);
+#endif
+    if (c->fd >= 0) close(c->fd);
+    c->fd = -1;
+}
+
 /* write()/read(), NOT send()/recv().
  *
  * d-os routes ring-3 sockets through the Linux-ABI layer, and that layer wires
@@ -160,10 +298,10 @@ static int tcp_connect(const char *host, int port)
  * are for the datagram paths.  Using them here connected successfully, appeared
  * to send, and then never received a byte, while `wget` fetched the very same
  * URL: the difference was exactly this pair of calls. */
-static bool send_all(int fd, const char *buf, size_t len)
+static bool send_all(struct conn *c, const char *buf, size_t len)
 {
     while (len) {
-        ssize_t w = write(fd, buf, len);
+        long w = c_write(c, buf, len);
         if (w <= 0) return false;
         buf += w; len -= (size_t)w;
     }
@@ -249,7 +387,7 @@ static long content_length(const char *b, size_t hdr_len)
     return -1;
 }
 
-static char *read_all(int fd, size_t *out_len)
+static char *read_all(struct conn *c, size_t *out_len)
 {
     size_t cap = DOS_FETCH_CHUNK, len = 0;
     char *buf = malloc(cap);
@@ -270,7 +408,7 @@ static char *read_all(int fd, size_t *out_len)
             buf = nb; cap = ncap;
         }
 
-        ssize_t r = read(fd, buf + len, DOS_FETCH_CHUNK);
+        long r = c_read(c, buf + len, DOS_FETCH_CHUNK);
         if (r > 0) {
             len += (size_t)r;
             last = now_ms();
@@ -285,8 +423,10 @@ static char *read_all(int fd, size_t *out_len)
                          * never reports.  Drop to non-blocking and take what
                          * arrives before it goes quiet — best effort, but it
                          * terminates. */
-                        int fl = fcntl(fd, F_GETFL, 0);
-                        if (fl >= 0 && fcntl(fd, F_SETFL, fl | O_NONBLOCK) == 0)
+                        /* Only meaningful for the plain path; a TLS record
+                         * layer cannot be drained by flipping the socket. */
+                        int fl = c->tls ? -1 : fcntl(c->fd, F_GETFL, 0);
+                        if (fl >= 0 && fcntl(c->fd, F_SETFL, fl | O_NONBLOCK) == 0)
                             nonblock = 1;
                     }
                 }
@@ -443,16 +583,28 @@ static void do_fetch(struct dos_fetch *c)
     fprintf(stderr, "fetch_dos: host=%s port=%d tls=%d path=%s\n",
             u.host, u.port, (int)u.tls, u.path);
 
+#ifndef DOS_FETCH_TLS
     if (u.tls) {
-        /* Deliberately explicit rather than silently failing: d-os HAS Mbed TLS
-         * (see `httpstest`/`wget`), it is simply not linked into NetSurf yet. */
-        send_error(c, "https is not wired into this build yet (http works)");
+        /* Explicit rather than obscure: Mbed TLS exists on d-os (`wget`,
+         * `httpstest`), this build just was not linked against it. */
+        send_error(c, "https is not available in this build");
         return;
     }
+#endif
 
-    int fd = tcp_connect(u.host, u.port);
-    fprintf(stderr, "fetch_dos: connect -> fd=%d\n", fd);
-    if (fd < 0) { send_error(c, "Could not connect to server"); return; }
+    struct conn conn;
+    memset(&conn, 0, sizeof conn);
+    conn.fd = tcp_connect(u.host, u.port);
+    fprintf(stderr, "fetch_dos: connect -> fd=%d\n", conn.fd);
+    if (conn.fd < 0) { send_error(c, "Could not connect to server"); return; }
+
+#ifdef DOS_FETCH_TLS
+    if (u.tls && tls_start(&conn, u.host) != 0) {
+        tls_end(&conn); close(conn.fd);
+        send_error(c, "TLS handshake failed");
+        return;
+    }
+#endif
 
     char req[2048];
     int n = snprintf(req, sizeof req,
@@ -465,15 +617,15 @@ static void do_fetch(struct dos_fetch *c)
                      "\r\n",
                      u.path, u.host);
     if (n <= 0 || n >= (int)sizeof req) {
-        close(fd); send_error(c, "Request too long"); return;
+        conn_close(&conn); send_error(c, "Request too long"); return;
     }
-    if (!send_all(fd, req, (size_t)n)) {
-        close(fd); send_error(c, "Could not send request"); return;
+    if (!send_all(&conn, req, (size_t)n)) {
+        conn_close(&conn); send_error(c, "Could not send request"); return;
     }
 
     size_t len = 0;
-    char *resp = read_all(fd, &len);
-    close(fd);
+    char *resp = read_all(&conn, &len);
+    conn_close(&conn);
     fprintf(stderr, "fetch_dos: received %u bytes\n", (unsigned)len);
 
     if (!resp || len == 0) {
