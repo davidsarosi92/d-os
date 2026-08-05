@@ -25,16 +25,21 @@
  * have.  Defining it globally turns a working date parser into a link error.)
  *
  * ---------------------------------------------------------------------------
- * The one shortcut, stated plainly
+ * Where the blocking went
  * ---------------------------------------------------------------------------
- * `poll` performs the whole transfer synchronously: connect, request, read to
- * completion, then deliver.  A real fetcher is non-blocking and interleaves
- * many transfers; this blocks NetSurf's event loop for the duration of one.
- * For a first cut over a LAN/SLIRP link that is a fraction of a second and the
- * page arrives; on a slow link the UI will visibly stall.  The structure here
- * (a list of contexts, each with a state, polled repeatedly) is the one a
- * non-blocking version needs, so making it incremental is a change to
- * dos_fetch_poll and nothing else.
+ * The obvious way to keep a UI responsive is a non-blocking socket and an
+ * incremental poll.  That does not work here: d-os polls network RX from the
+ * CALLING TASK rather than from an interrupt, so the blocking read is what
+ * drives the NIC — a non-blocking one returns EAGAIN forever and the response
+ * never arrives at all.  The blocking cannot be removed, only moved off the
+ * thread that draws.
+ *
+ * So each transfer runs on its own pthread and `poll` becomes what it should
+ * be: a check for finished work.  The split is strict — the worker touches
+ * ONLY sockets, TLS and its own context, while every NetSurf callback happens
+ * on the main thread inside poll.  NetSurf's core is not thread-safe, and a
+ * fetcher calling back from a worker would corrupt the content cache in ways
+ * that look nothing like a threading bug.
  * ============================================================================= */
 
 #include <stdbool.h>
@@ -49,6 +54,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 
 #ifdef DOS_FETCH_TLS
 #include <mbedtls/ssl.h>
@@ -197,10 +203,25 @@ struct dos_fetch {
     bool           only_2xx;
     bool           aborted;
     bool           started;
+
+    /* The worker and what it hands back. */
+    pthread_t      th;
+    bool           th_live;         /* created and not yet joined            */
+    volatile bool  done;            /* worker finished (success or failure)  */
+    bool           delivered;       /* result already given to NetSurf       */
+    char          *resp;            /* malloc'd response, or NULL            */
+    size_t         resp_len;
+    const char    *err;             /* failure reason, or NULL on success    */
+
     struct dos_fetch *next;
 };
 
-static struct dos_fetch *dos_ring;   /* fetches awaiting poll                */
+/* Fetches live here from `start` until `free`.  Only the main thread touches
+ * the list — a worker writes solely into its own context. */
+static struct dos_fetch *dos_ring;
+
+/* musl's default thread stack is small and the TLS handshake is not. */
+#define DOS_FETCH_STACK  (256u << 10)
 
 /* ---------------------------------------------------------------------------
  * URL splitting.
@@ -571,7 +592,18 @@ static void deliver(struct dos_fetch *c, char *resp, size_t len)
 }
 
 /* Run one fetch to completion. */
-static void do_fetch(struct dos_fetch *c)
+static void do_fetch_work(struct dos_fetch *c);
+
+/* Worker thread body.  Network only — no NetSurf call may be made from here. */
+static void *fetch_worker(void *arg)
+{
+    struct dos_fetch *c = arg;
+    do_fetch_work(c);
+    c->done = true;                 /* published last: poll reads it as the gate */
+    return NULL;
+}
+
+static void do_fetch_work(struct dos_fetch *c)
 {
     struct urlparts u;
     const char *urlstr = nsurl_access(c->url);
@@ -579,7 +611,7 @@ static void do_fetch(struct dos_fetch *c)
      * d-os console, and a fetcher that blocks silently is indistinguishable
      * from one that has hung. */
     fprintf(stderr, "fetch_dos: GET %s\n", urlstr ? urlstr : "(null)");
-    if (!split_url(urlstr, &u)) { send_error(c, "Unsupported URL"); return; }
+    if (!split_url(urlstr, &u)) { c->err = "Unsupported URL"; return; }
     fprintf(stderr, "fetch_dos: host=%s port=%d tls=%d path=%s\n",
             u.host, u.port, (int)u.tls, u.path);
 
@@ -587,21 +619,23 @@ static void do_fetch(struct dos_fetch *c)
     if (u.tls) {
         /* Explicit rather than obscure: Mbed TLS exists on d-os (`wget`,
          * `httpstest`), this build just was not linked against it. */
-        send_error(c, "https is not available in this build");
+        c->err = "https is not available in this build";
         return;
     }
 #endif
 
-    struct conn conn;
-    memset(&conn, 0, sizeof conn);
-    conn.fd = tcp_connect(u.host, u.port);
-    fprintf(stderr, "fetch_dos: connect -> fd=%d\n", conn.fd);
-    if (conn.fd < 0) { send_error(c, "Could not connect to server"); return; }
+    /* On the HEAP, not the worker's stack: `struct conn` embeds mbedTLS's ssl
+     * context, config, CA chain, entropy and DRBG state. */
+    struct conn *cn = calloc(1, sizeof *cn);
+    if (!cn) { c->err = "Out of memory"; return; }
+    cn->fd = tcp_connect(u.host, u.port);
+    fprintf(stderr, "fetch_dos: connect -> fd=%d\n", cn->fd);
+    if (cn->fd < 0) { free(cn); c->err = "Could not connect to server"; return; }
 
 #ifdef DOS_FETCH_TLS
-    if (u.tls && tls_start(&conn, u.host) != 0) {
-        tls_end(&conn); close(conn.fd);
-        send_error(c, "TLS handshake failed");
+    if (u.tls && tls_start(cn, u.host) != 0) {
+        tls_end(cn); close(cn->fd); free(cn);
+        c->err = "TLS handshake failed";
         return;
     }
 #endif
@@ -617,24 +651,25 @@ static void do_fetch(struct dos_fetch *c)
                      "\r\n",
                      u.path, u.host);
     if (n <= 0 || n >= (int)sizeof req) {
-        conn_close(&conn); send_error(c, "Request too long"); return;
+        conn_close(cn); free(cn); c->err = "Request too long"; return;
     }
-    if (!send_all(&conn, req, (size_t)n)) {
-        conn_close(&conn); send_error(c, "Could not send request"); return;
+    if (!send_all(cn, req, (size_t)n)) {
+        conn_close(cn); free(cn); c->err = "Could not send request"; return;
     }
 
     size_t len = 0;
-    char *resp = read_all(&conn, &len);
-    conn_close(&conn);
+    char *resp = read_all(cn, &len);
+    conn_close(cn);
+    free(cn);
     fprintf(stderr, "fetch_dos: received %u bytes\n", (unsigned)len);
 
     if (!resp || len == 0) {
         free(resp);
-        send_error(c, "Empty response from server");
+        c->err = "Empty response from server";
         return;
     }
-    deliver(c, resp, len);
-    free(resp);
+    c->resp = resp;                 /* poll delivers it; free releases it */
+    c->resp_len = len;
 }
 
 /* ---------------------------------------------------------------------------
@@ -667,6 +702,23 @@ static bool dos_fetch_start(void *v)
     c->started = true;
     c->next = dos_ring;
     dos_ring = c;
+
+    pthread_attr_t attr;
+    int ok = -1;
+    if (pthread_attr_init(&attr) == 0) {
+        pthread_attr_setstacksize(&attr, DOS_FETCH_STACK);
+        ok = pthread_create(&c->th, &attr, fetch_worker, c);
+        pthread_attr_destroy(&attr);
+    }
+    if (ok != 0) {
+        /* No thread: run inline rather than fail the fetch.  The UI stalls for
+         * this one transfer, which beats a page that will not load. */
+        fprintf(stderr, "fetch_dos: no worker thread, fetching inline\n");
+        do_fetch_work(c);
+        c->done = true;
+        return true;
+    }
+    c->th_live = true;
     return true;
 }
 
@@ -688,24 +740,36 @@ static void unlink_ctx(struct dos_fetch *c)
 static void dos_fetch_free(void *v)
 {
     struct dos_fetch *c = v;
+    /* A running worker writes into this context, so it MUST be reaped before
+     * the memory goes away — an abort during a slow transfer is exactly when
+     * that happens.  Joining can block for the rest of that transfer;
+     * detaching instead would trade a stall for a use-after-free. */
+    if (c->th_live) { pthread_join(c->th, NULL); c->th_live = false; }
     unlink_ctx(c);
     if (c->url) nsurl_unref(c->url);
+    free(c->resp);
     free(c);
 }
 
 static void dos_fetch_poll(lwc_string *scheme)
 {
     (void)scheme;
-    /* Take the whole list first.  A callback can start or abort fetches, which
-     * would otherwise mutate the list under the walk. */
-    struct dos_fetch *work = dos_ring;
-    dos_ring = NULL;
+    /* Deliver finished transfers.  A callback can start, abort or free fetches
+     * — i.e. mutate the very list being walked — so the search restarts after
+     * each delivery instead of continuing, and the list is only read here. */
+    for (;;) {
+        struct dos_fetch *c = NULL;
+        for (struct dos_fetch *p = dos_ring; p; p = p->next)
+            if (p->done && !p->delivered) { c = p; break; }
+        if (!c) return;
 
-    while (work) {
-        struct dos_fetch *c = work;
-        work = c->next;
-        c->next = NULL;
-        if (!c->aborted) do_fetch(c);
+        c->delivered = true;
+        if (c->th_live) { pthread_join(c->th, NULL); c->th_live = false; }
+        if (c->aborted) continue;
+
+        if (c->err)       send_error(c, c->err);
+        else if (c->resp) deliver(c, c->resp, c->resp_len);
+        else              send_error(c, "Empty response from server");
         /* NetSurf calls ->free once it has seen FINISHED or ERROR; the context
          * must survive until then, so nothing is released here. */
     }

@@ -4529,25 +4529,22 @@ same path.
 `https://example.com` render, and `http://info.cern.ch` renders with its
 favicon fetched as a subresource.
 
-**Open:** `poll()` runs each transfer to completion synchronously, which stalls
-the UI on a slow link.
+**The fetcher is non-blocking**, but not the way it looks like it should be.
+An incremental `poll` cannot work here: RX is polled from the calling task, so
+the blocking read is what drives the NIC — a non-blocking socket returns
+`EAGAIN` forever and nothing arrives.  The blocking cannot be removed, only
+moved, so each transfer runs on its own pthread and `poll` became a check for
+finished work.  The split is strict: the worker touches only sockets, TLS and
+its own context; every NetSurf callback happens on the main thread, because
+NetSurf's core is not thread-safe.
 
-An incremental `poll` is not the answer, and this was measured rather than
-assumed: RX is polled from the calling task, so the blocking read is what drives
-the NIC — a non-blocking socket returns `EAGAIN` forever and nothing arrives.
-The blocking cannot be removed, only moved off the drawing thread.
-
-**A worker thread per transfer was tried and does not yet work.**  The fetch
-itself succeeds — the trace shows the full `HTTP 200` from the worker — and the
-browser then dies immediately afterwards, on i386 with a fault just below a page
-boundary in the mmap region (first `#PF`, then `#GP` after the connection state
-was moved off the worker's stack and the stack size set explicitly to 256 KiB).
-The timing and the address point at the thread EXIT path rather than at the
-fetch: musl's `__unmapself` releases the thread's own stack and then syscalls
-`exit`, which is exactly the sequence that leaves nothing valid to execute on if
-the unmap takes effect too early.  `pthreadtest` passes, so this is not "threads
-are broken" — it is something about a thread that exits inside a large dynamic
-PIE, and it needs its own investigation before the fetcher can use one.
+Getting there required a kernel fix, and the symptom pointed at the wrong
+place entirely.  Adding one worker killed the browser immediately after a
+SUCCESSFUL fetch, at an address just below a page boundary — which reads like a
+stack overflow or a thread-exit problem, and is neither.  `thrdyn` (a new
+reproducer: threads in a DYNAMIC musl binary, in three phases) localised it —
+a thread that returns at once is fine, a thread that calls `malloc` is not —
+and the fix is in §4.45.
 
 ---
 
@@ -4578,6 +4575,37 @@ printed (it distinguishes a missing GLES frontend from a runtime failure), and
 `eglCreateContext`/`eglCreateWindowSurface` are checked separately — testing
 both and asking `eglGetError()` once reports `EGL_SUCCESS` whenever the first
 failed and the second succeeded, which is exactly what this bring-up hit.
+
+---
+
+### 4.45 The mmap cursor belonged to the address space (M48)
+
+`sys_mmap` bump-allocates user addresses from a cursor that lived on
+`struct task`.  A cloned thread therefore started at zero, `sys_mmap_full` reset
+it to the region base, and the thread handed out addresses **on top of the
+mappings its own process was already using**.
+
+i386's clone path did not even copy the parent's cursor (the x86_64 twin did),
+which is why the browser died there first.  Copying is not the fix either: two
+threads then bump independent copies toward the same addresses and collide
+slightly later.  One address space, one cursor — it now lives in
+`struct vmm_space` behind `vmm_space_{,set_}mmap_cursor`, shared by every task
+that shares an mm, and `fork` inherits the parent's value because the child
+inherits the parent's mappings.
+
+Two traps on the way, both worth remembering.  `vmm_space_create` uses
+`kmalloc`, which does not zero, so an uninitialised cursor is handed straight
+back to the program as an mmap address — a NULL+8 fault inside ld.so before
+anything printed.  And the field lives in a header, so the first rebuild kept
+stale objects and booted into nonsense: the no-header-dependencies pitfall
+CLAUDE.md documents, hit twice in one session.
+
+Why it hid for so long: `pthreadtest` passes because a static binary's threads
+in that test never allocate.  "Threads work" and "threads can allocate" were
+different claims, and only the first had ever been tested.
+
+**Verified** on i386 and x86_64: `thrdyn` PASS (all three phases),
+`pthreadtest` PASS, `forktest`, `solibtest`; aarch64 builds.
 
 ---
 
