@@ -12,6 +12,7 @@
 #include "abi.h"
 #include "syscall.h"
 #include "task.h"
+#include "fd.h"
 #include <stddef.h>
 
 /* --- canonical handlers ---------------------------------------------------
@@ -60,6 +61,80 @@ static long h_getppid(struct abi_ctx* c) {
     return t ? t->ppid : 0;
 }
 
+/* --- operations whose translation is NOT one-to-one ------------------------
+ *
+ * These are the ones that justify having a canonical vocabulary at all: each
+ * needs a decision, and making it once here is the difference between one
+ * engine and one hand-written layer per architecture.
+ * ------------------------------------------------------------------------- */
+
+/* Linux errno values the guests share.  Only the handful the engine itself
+ * returns; a guest ABI whose errno space differs would translate in its own
+ * adapter rather than here. */
+#define ABI_ENOTTY 25
+#define ABI_ENOSYS 38
+
+struct abi_iovec { void* base; unsigned long len; };
+
+/* readv/writev: a vector, not a buffer.  Looping over sys_read/sys_write is
+ * the whole implementation, but it must stop on a SHORT read — otherwise the
+ * next iovec is filled from a later part of the stream and the caller silently
+ * gets reordered data. */
+static long h_writev(struct abi_ctx* c) {
+    const struct abi_iovec* v = (const struct abi_iovec*)c->a[1];
+    int n = (int)c->a[2];
+    long total = 0;
+    for (int i = 0; i < n && v; i++) {
+        long w = sys_write((int)c->a[0], v[i].base, (size_t)v[i].len);
+        if (w < 0) return total ? total : w;
+        total += w;
+    }
+    return total;
+}
+static long h_readv(struct abi_ctx* c) {
+    const struct abi_iovec* v = (const struct abi_iovec*)c->a[1];
+    int n = (int)c->a[2];
+    long total = 0;
+    for (int i = 0; i < n && v; i++) {
+        long r = sys_read((int)c->a[0], v[i].base, (size_t)v[i].len);
+        if (r < 0) return total ? total : r;
+        total += r;
+        if ((unsigned long)r < v[i].len) break;   /* short read → done */
+    }
+    return total;
+}
+
+/* ioctl: ENOTTY, not ENOSYS.  The distinction matters — musl's isatty() reads
+ * ENOTTY as "this is not a terminal" and carries on with block buffering,
+ * while ENOSYS is an unknown-call error it has no story for.  Answering the
+ * question correctly is not the same as implementing the call. */
+static long h_ioctl(struct abi_ctx* c) { (void)c; return -ABI_ENOTTY; }
+
+/* brk: report failure so a libc falls back to mmap.  d-os has no program
+ * break, and pretending otherwise would hand out addresses nothing backs. */
+static long h_brk(struct abi_ctx* c) { (void)c; return 0; }
+
+static long h_mmap(struct abi_ctx* c) {
+    return sys_mmap_full(c->a[0], (size_t)c->a[1], (int)c->a[2], (int)c->a[3],
+                         (int)c->a[4], (uint64_t)c->a[5]);
+}
+
+/* set_tid_address returns the caller's tid.  d-os has no separate tid space,
+ * so the pid is the honest answer — the same one gettid gives. */
+static long h_settid(struct abi_ctx* c) {
+    (void)c;
+    struct task* t = task_current();
+    return t ? t->pid : 0;
+}
+
+/* exit: does NOT return.  Declared in the vocabulary precisely so the shims
+ * do not each have to remember that. */
+static long h_exit(struct abi_ctx* c) {
+    struct task* t = task_current();
+    if (t && t->user_task) { fd_close_all(); task_exit_code((int)c->a[0]); }
+    return 0;   /* unreachable for a user task */
+}
+
 /* The operation table, indexed by `enum abi_op`.  A NULL slot means "declared
  * in the vocabulary, no handler yet" — abi_invoke reports that as unhandled so
  * the caller can fall back, which is what lets an existing hand-written layer
@@ -77,6 +152,14 @@ static const struct {
     [ABI_MUNMAP]   = { "munmap",   h_munmap },
     [ABI_GETPID]   = { "getpid",   h_getpid },
     [ABI_GETPPID]  = { "getppid",  h_getppid },
+    [ABI_GETTID]   = { "gettid",   h_getpid },      /* no separate tid space */
+    [ABI_EXIT]     = { "exit",     h_exit },
+    [ABI_READV]    = { "readv",    h_readv },
+    [ABI_WRITEV]   = { "writev",   h_writev },
+    [ABI_IOCTL]    = { "ioctl",    h_ioctl },
+    [ABI_BRK]      = { "brk",      h_brk },
+    [ABI_MMAP]     = { "mmap",     h_mmap },
+    [ABI_SET_TID_ADDRESS] = { "set_tid_address", h_settid },
 };
 
 enum abi_op abi_lookup(const struct abi_map* map, unsigned long nr) {

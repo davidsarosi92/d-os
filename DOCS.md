@@ -16,81 +16,82 @@ when sections are added.)
 
 | § | Section | ~line |
 |---|---------|------:|
-| 1 | Project layout | 97 |
-| 2 | Boot flow | 163 |
-| 3 | Memory layout | 180 |
-| 4 | Components | 202 |
-| 4.0 | Module framework + console registry | 204 |
-| 4.1 | Terminal drivers | 277 |
-| 4.2 | Keyboard | 300 |
-| 4.3 | Shell | 313 |
-| 4.4 | HAL x86 | 349 |
-| 4.5 | GDT | 359 |
-| 4.6 | IDT + PIC + IRQ dispatch | 379 |
-| 4.7 | Multiboot info | 403 |
-| 4.8 | Physical Memory Manager — buddy allocator (M19) | 419 |
-| 4.9 | Virtual Memory Manager | 479 |
-| 4.X | Tasks + scheduler | 506 |
-| 4.X | SMP — APIC, AP boot, per-CPU, real spinlocks (M18) | 567 |
-| 4.X | HAL — arch-independent interface | 695 |
-| 4.X | Keyboard layouts | 752 |
-| 4.X | USB host stack — xHCI + HID boot keyboard | 827 |
-| 4.X | Virtual consoles / pane split | 927 |
-| 4.X | Ring 3 / user mode | 1012 |
-| 4.X | Block layer + virtio-blk | 1055 |
-| 4.X | procfs — kernel state as files under /proc | 1107 |
-| 4.X | devfs — drivers as files under /dev | 1139 |
-| 4.X | Configuration store | 1162 |
-| 4.X | Filesystem layer | 1178 |
-| 4.X | Block cache | 1238 |
-| 4.X | exFAT | 1267 |
-| 4.X | Timer | 1312 |
-| 4.10 | Kernel heap — slab + page_alloc (M19) | 1330 |
-| 4.11 | Serial debug | 1393 |
-| 4.X | Supported architectures — i386 + x86_64 (M20) | 1407 |
-| 4.12 | ACPI | 1548 |
-| 4.13 | GUI — compositor, WM, widgets, apps (M22 – M22.5) | 1569 |
-| 4.14 | GUI development — writing apps and desktop shells (M22.2) | 1845 |
-| 4.15 | Process model — init, hierarchy, reaper, kill-tree (M27) | 1920 |
-| 4.16 | Per-task GUI apps (M22.7 Stage A) | 1978 |
-| 4.17 | ARM64 (AArch64) port — Phases A–M (M21, full x86 parity) | 2057 |
-| 4.18 | System log — klog ring buffer + dmesg | 2398 |
-| 4.19 | Userland foundation — processes, fds, IPC, libc (M25) | 2462 |
-| 4.20 | Blocking primitives — wait-queue, task_wait, blocking IPC (... | 2539 |
-| 4.21 | Services & the service bus (M29) | 2596 |
-| 4.22 | Watchdog — freeze detection (M31) | 2657 |
-| 4.23 | cron — time-based task scheduling (M30) | 2698 |
-| 4.24 | Concurrent user processes + full-arch libc (Tier B — M25 tail) | 2731 |
-| 4.25 | Networking — virtio-net + TCP/IP stack (M24, i386) | 2782 |
-| 4.26 | Audio — AC97 codec + PCM output (M23, i386) | 2876 |
-| 4.27 | POSIX process model — fork/exec/wait/pipe/signals (M34, i386) | 2924 |
-| 4.28 | Threads + futex (M35, i386) | 3009 |
-| 4.29 | Package manager — content-addressed store (M35.5, first slice) | 3077 |
-| 4.30 | POSIX syscall breadth + libc growth (M36 stage 1, i386) | 3118 |
-| 4.31 | Linux i386 syscall-ABI compat layer (M36 stage 2 / §M41, i386) | 3152 |
-| 4.32 | Wayland display server (M26, stage 1 — wire protocol + hand... | 3303 |
-| 4.33 | Dynamic linking — ld.so / .so / dlopen (M37, i386) | 3409 |
-| 4.34 | C++ runtime — libstdc++ + exceptions (M38, i386) | 3476 |
-| 4.35 | Crypto, entropy & TLS (M39, i386) | 3507 |
-| 4.36 | On-device C compiler — TinyCC (M43 slice, i386) | 3603 |
-| 4.37 | Resilience & the ring-3 boundary (M46 + kernel audit) | 3643 |
-| 4.38 | Crash records & reporting (M47) | 3752 |
-| 4.38.1 | Closing a window is not a crash (M47.1) | 3821 |
-| 4.39 | x86_64 userland parity (M47.5) | 3867 |
-| 4.40 | Upstream libwayland-client (M40 stage 1) | 3965 |
-| 4.40.1 | EGL + GLES2 on Mesa softpipe (M40, DoD complete) | 4312 |
-| 4.41 | The ring-3 pointer gate was never armed for the Linux ABI (... | 4371 |
-| 4.42 | The memory ceiling, discovered rather than compiled in (M48) | 4404 |
-| 4.43 | NetSurf: input it can act on, and a fetcher (M48) | 4507 |
-| 4.44 | Mesa/EGL on i386 (M48) | 4587 |
-| 4.45 | The mmap cursor belonged to the address space (M48) | 4617 |
-| 4.46 | Load distribution across CPUs, measured (M49) | 4648 |
-| 4.47 | AArch64 grows a POSIX process model (A1) | 4957 |
-| 4.48 | One translation engine instead of one per architecture (M50) | 5043 |
-| 5 | Build & run | 5127 |
-| 6 | Compiler flags | 5154 |
-| 7 | Roadmap / open milestones | 5180 |
-| 8 | Change log | 5202 |
+| 1 | Project layout | 98 |
+| 2 | Boot flow | 164 |
+| 3 | Memory layout | 181 |
+| 4 | Components | 203 |
+| 4.0 | Module framework + console registry | 205 |
+| 4.1 | Terminal drivers | 278 |
+| 4.2 | Keyboard | 301 |
+| 4.3 | Shell | 314 |
+| 4.4 | HAL x86 | 350 |
+| 4.5 | GDT | 360 |
+| 4.6 | IDT + PIC + IRQ dispatch | 380 |
+| 4.7 | Multiboot info | 404 |
+| 4.8 | Physical Memory Manager — buddy allocator (M19) | 420 |
+| 4.9 | Virtual Memory Manager | 480 |
+| 4.X | Tasks + scheduler | 507 |
+| 4.X | SMP — APIC, AP boot, per-CPU, real spinlocks (M18) | 568 |
+| 4.X | HAL — arch-independent interface | 696 |
+| 4.X | Keyboard layouts | 753 |
+| 4.X | USB host stack — xHCI + HID boot keyboard | 828 |
+| 4.X | Virtual consoles / pane split | 928 |
+| 4.X | Ring 3 / user mode | 1013 |
+| 4.X | Block layer + virtio-blk | 1056 |
+| 4.X | procfs — kernel state as files under /proc | 1108 |
+| 4.X | devfs — drivers as files under /dev | 1140 |
+| 4.X | Configuration store | 1163 |
+| 4.X | Filesystem layer | 1179 |
+| 4.X | Block cache | 1239 |
+| 4.X | exFAT | 1268 |
+| 4.X | Timer | 1313 |
+| 4.10 | Kernel heap — slab + page_alloc (M19) | 1331 |
+| 4.11 | Serial debug | 1394 |
+| 4.X | Supported architectures — i386 + x86_64 (M20) | 1408 |
+| 4.12 | ACPI | 1549 |
+| 4.13 | GUI — compositor, WM, widgets, apps (M22 – M22.5) | 1570 |
+| 4.14 | GUI development — writing apps and desktop shells (M22.2) | 1846 |
+| 4.15 | Process model — init, hierarchy, reaper, kill-tree (M27) | 1921 |
+| 4.16 | Per-task GUI apps (M22.7 Stage A) | 1979 |
+| 4.17 | ARM64 (AArch64) port — Phases A–M (M21, full x86 parity) | 2058 |
+| 4.18 | System log — klog ring buffer + dmesg | 2399 |
+| 4.19 | Userland foundation — processes, fds, IPC, libc (M25) | 2463 |
+| 4.20 | Blocking primitives — wait-queue, task_wait, blocking IPC (... | 2540 |
+| 4.21 | Services & the service bus (M29) | 2597 |
+| 4.22 | Watchdog — freeze detection (M31) | 2658 |
+| 4.23 | cron — time-based task scheduling (M30) | 2699 |
+| 4.24 | Concurrent user processes + full-arch libc (Tier B — M25 tail) | 2732 |
+| 4.25 | Networking — virtio-net + TCP/IP stack (M24, i386) | 2783 |
+| 4.26 | Audio — AC97 codec + PCM output (M23, i386) | 2877 |
+| 4.27 | POSIX process model — fork/exec/wait/pipe/signals (M34, i386) | 2925 |
+| 4.28 | Threads + futex (M35, i386) | 3010 |
+| 4.29 | Package manager — content-addressed store (M35.5, first slice) | 3078 |
+| 4.30 | POSIX syscall breadth + libc growth (M36 stage 1, i386) | 3119 |
+| 4.31 | Linux i386 syscall-ABI compat layer (M36 stage 2 / §M41, i386) | 3153 |
+| 4.32 | Wayland display server (M26, stage 1 — wire protocol + hand... | 3304 |
+| 4.33 | Dynamic linking — ld.so / .so / dlopen (M37, i386) | 3410 |
+| 4.34 | C++ runtime — libstdc++ + exceptions (M38, i386) | 3477 |
+| 4.35 | Crypto, entropy & TLS (M39, i386) | 3508 |
+| 4.36 | On-device C compiler — TinyCC (M43 slice, i386) | 3604 |
+| 4.37 | Resilience & the ring-3 boundary (M46 + kernel audit) | 3644 |
+| 4.38 | Crash records & reporting (M47) | 3753 |
+| 4.38.1 | Closing a window is not a crash (M47.1) | 3822 |
+| 4.39 | x86_64 userland parity (M47.5) | 3868 |
+| 4.40 | Upstream libwayland-client (M40 stage 1) | 3966 |
+| 4.40.1 | EGL + GLES2 on Mesa softpipe (M40, DoD complete) | 4313 |
+| 4.41 | The ring-3 pointer gate was never armed for the Linux ABI (... | 4372 |
+| 4.42 | The memory ceiling, discovered rather than compiled in (M48) | 4405 |
+| 4.43 | NetSurf: input it can act on, and a fetcher (M48) | 4508 |
+| 4.44 | Mesa/EGL on i386 (M48) | 4588 |
+| 4.45 | The mmap cursor belonged to the address space (M48) | 4618 |
+| 4.46 | Load distribution across CPUs, measured (M49) | 4649 |
+| 4.47 | AArch64 grows a POSIX process model (A1) | 4958 |
+| 4.48 | One translation engine instead of one per architecture (M50) | 5044 |
+| 4.49 | AArch64 runs unmodified musl (A2), and the engine proves it... | 5126 |
+| 5 | Build & run | 5203 |
+| 6 | Compiler flags | 5230 |
+| 7 | Roadmap / open milestones | 5256 |
+| 8 | Change log | 5278 |
 
 ---
 
@@ -5122,6 +5123,81 @@ the shared asset either way — but the hard part is never the numbers, it is th
 semantics: HANDLEs versus file descriptors, `CreateProcess` versus fork/exec,
 SEH versus signals, reserve/commit versus `mmap`.
 
+### 4.49 AArch64 runs unmodified musl (A2), and the engine proves itself
+
+`hal/aarch64/linux_abi.c` is **~80 lines**.  Its siblings are 1211
+(`hal/x86/linux_abi.c`) and 1064 (`hal/x86_64/linux_abi.c`).  The difference is
+not capability — the ARM port runs the same unmodified static musl binary the
+x86 ports do — it is that §M50 moved the translation into a shared engine
+before this port was written.
+
+What remains in the file is the only architecture-specific thing about a
+syscall translation: **x8 = number, x0..x5 = arguments, result in x0.**
+Everything else is `kernel/core/abi_linux.c` (the arm64 numbering, as data) and
+`abi_engine.c` (handlers shared with both x86 arches).  The §M47.2 pointer gate
+is armed from the first line, since that is precisely the thing both x86 layers
+left unset for two milestones without anything failing visibly.
+
+**`musltest` passes with ZERO unhandled syscalls.**  The vocabulary grown for
+x86 was already sufficient for an ARM musl startup — the best available evidence
+that the engine's split between "what a number means" and "what the meaning
+does" falls in the right place.
+
+#### The trap that A6 predicted, hit four stages early
+
+The first attempt faulted at EL0 with `FAR_EL1 = 0`, which reads exactly like a
+null dereference and is nothing of the kind.  Disassembling the faulting address
+gave the answer in one step:
+
+```
+00000001000021a0 <memset>:
+   1000021a0:   4e010c20   dup  v0.16b, w1
+```
+
+musl's `memset` opens with NEON, so libc startup trapped on its first string
+operation — an FP/SIMD access trap, not a bad pointer.  Reasoning from `FAR = 0`
+would have cost an evening; **when a fault address looks impossible, disassemble
+the faulting instruction before theorising about the address.**
+
+`kernel/hal/aarch64/fpu.c` had described this failure, and both halves of its
+fix, before it happened: enable `CPACR_EL1.FPEN` **and** save/restore the vector
+registers, with an explicit warning that doing the first without the second is
+worse than neither, because FP would start working and silently corrupt across
+task switches.  Both are now implemented:
+
+- `hal_fpu_enable_this_cpu()` sets `CPACR_EL1.FPEN = 0b11`, called from **both**
+  the BSP and the AP bring-up paths.  It is a per-CPU system register: enable it
+  on one core only and FP works there and traps on the other — the nastiest
+  possible shape of this bug.
+- `hal_fpu_save`/`restore` move Q0..Q31 + FPCR + FPSR (528 bytes, aligned inside
+  the oversized blob the core hands over).
+
+Two small encoding notes: `stp` of 64-bit registers has a scaled 7-bit immediate
+topping out at 504, so the control words at offset 512 need plain `str`; and a
+zeroed image is a valid starting state here, unlike x86's FXSAVE, where an
+all-zero MXCSR unmasks every SIMD exception and faults on the first instruction.
+
+This also unblocks A5/A6 early — the FP unit is what every ported library needs.
+
+#### Verified
+
+On `qemu-system-aarch64 -M virt`: `musltest` prints `hello from REAL musl on
+d-os (unmodified, static libc)` and returns 0, and the A1 self-tests
+(`forktest`, `sigtest`, `pipetest`) all still pass with FP live on the
+context-switch path.  i386 and x86_64 rebuild, and their `musltest`,
+`solibtest` and `crypttest` are unchanged.
+
+#### Provisioning, which the plan had in the wrong order
+
+A2's proof needs a musl for this architecture — the toolchain half of A3 — so
+the two stages were not independent.  It was cheap:
+`scripts/fetch-musl-cross-prebuilt.sh` was already arch-parametric, so an
+aarch64 musl.cc toolchain is a download rather than the ~10 h from-source gcc
+build the i386 path once needed.  The `%.muslelf` rule now keys off "does this
+arch have a musl cross-sysroot" instead of naming x86_64, and the musl blob rule
+uses `$(USER_OBJCOPY)` rather than a bare `objcopy` that does not exist in the
+ARM container.
+
 ---
 
 ## 5. Build & run
@@ -5200,6 +5276,24 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-07 — AArch64 A2: unmodified musl runs on ARM, in ~80 lines
+  (DOCS §4.49).**  `hal/aarch64/linux_abi.c` is ~80 lines against 1211 and 1064
+  for its x86 siblings — not less capability, but §M50's engine landing first,
+  so all that remains is x8 = number, x0..x5 = args, result in x0.  `musltest`
+  passes with **zero unhandled syscalls**: the vocabulary grown for x86 was
+  already enough for an ARM musl startup.  **The trap PLAN_AARCH64 predicted for
+  A6 arrived at A2:** musl's `memset` opens with `dup v0.16b, w1`, so libc
+  startup trapped on NEON — presenting as an EL0 fault with `FAR_EL1 = 0`, which
+  reads exactly like a null dereference and is nothing of the kind.
+  Disassembling the faulting address settled it in one step.  `fpu.c` had
+  described this failure and both halves of the fix in advance; both are now
+  implemented — `CPACR_EL1.FPEN` enabled **per CPU** (BSP and AP; enable it on
+  one core only and FP works there and traps on the other) and Q0..Q31 + FPCR/
+  FPSR saved on context switch.  A1's `forktest`/`sigtest`/`pipetest` still pass
+  with FP live on the switch path.  Also: A2's proof needed the toolchain half of
+  A3, so the plan's ordering was wrong — cheap to fix, since the prebuilt-fetch
+  script was already arch-parametric.
 
 - **2026-08-07 — §M50 started: one guest-ABI translation engine instead of one
   per architecture (DOCS §4.48).**  The two Linux personalities were 2275 lines

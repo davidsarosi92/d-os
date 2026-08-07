@@ -32,6 +32,7 @@
 #include "task.h"
 #include "workqueue.h"
 #include "hal_api.h"
+void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "vfs.h"
 #include "procfs.h"
 #include "module.h"
@@ -153,6 +154,10 @@ void aarch64_main_entry(uint64_t dtb) {
      * drives preemption (timer_isr → schedule_request; gic → schedule_check). */
     gic_init();
     timer_init(100);
+    /* A2 — CPACR_EL1.FPEN is per-CPU: enable FP/SIMD on THIS core, or a
+     * musl binary's NEON memset traps here while working on the other. */
+    hal_fpu_enable_this_cpu();
+
     hal_intr_enable();
 
     /* SMP (Phase E) — start the secondary cores via PSCI; each joins the

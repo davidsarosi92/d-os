@@ -24,6 +24,7 @@
 #include "percpu.h"
 #include "task.h"
 #include "hal_api.h"
+void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include <stdint.h>
 
 /* Number of CPUs the kernel is built to manage.  MUST match the QEMU `-smp`
@@ -116,6 +117,10 @@ void smp_secondary_main(uint64_t cpu) {
 
     /* This core's GIC CPU interface + banked timer PPI. */
     gic_cpu_init();
+    /* A2 — CPACR_EL1.FPEN is per-CPU: enable FP/SIMD on THIS core, or a
+     * musl binary's NEON memset traps here while working on the other. */
+    hal_fpu_enable_this_cpu();
+
 
     /* Join the per-CPU table + become this CPU's idle task, then arm this
      * core's generic timer so its own tick drives preemption. */

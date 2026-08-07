@@ -18,6 +18,29 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **AARCH64 A2 — UNMODIFIED musl RUNS ON ARM, IN ~80 LINES (2026-08-07, DOCS
+§4.49).**  `hal/aarch64/linux_abi.c` is **~80 lines** vs 1211 (x86) and 1064
+(x86_64) — not less capability but §M50's engine landing FIRST, so all that
+remains is the genuinely arch-specific part: **x8 = number, x0..x5 = args,
+result in x0**.  `musltest` passes with **ZERO unhandled syscalls** — the
+vocabulary grown for x86 was already enough for an ARM musl startup, which is
+the strongest evidence the engine's split is right.  Pointer gate armed from
+line one (§M47.2's lesson).  **THE TRAP PLAN_AARCH64 PREDICTED FOR A6 ARRIVED AT
+A2:** musl's `memset` opens with `dup v0.16b, w1` (NEON), so libc startup
+trapped — presenting as an EL0 fault with **`FAR_EL1 = 0`, which reads exactly
+like a null dereference and is nothing of the kind**.  *When a fault address
+looks impossible, DISASSEMBLE THE FAULTING INSTRUCTION before theorising about
+the address* — it took one step.  `fpu.c` had described this failure AND both
+halves of the fix in advance; both now implemented: `CPACR_EL1.FPEN` per CPU
+(**BSP and AP** — enable one core only and FP works there and traps on the
+other) + Q0..Q31/FPCR/FPSR saved on context switch (`stp` of 64-bit regs tops
+out at 504, so the control words at 512 need plain `str`; a zeroed image IS
+valid here, unlike x86 FXSAVE).  A1's forktest/sigtest/pipetest still pass with
+FP live on the switch path.  **This unblocks A5/A6 early** — the FP unit is what
+every ported library needs.  Also: A2's proof needed the toolchain half of A3
+(plan ordering was wrong), cheap because `fetch-musl-cross-prebuilt.sh` was
+already arch-parametric.
+
 ▶️ **§M50 STARTED — ONE GUEST-ABI TRANSLATION ENGINE (2026-08-07, DOCS §4.48,
 PLAN §M50).**  `hal/x86/linux_abi.c` + `hal/x86_64/linux_abi.c` = 2275 lines,
 ~160 `case`s, **two copies of one idea**; aarch64 (A2) would have been a third.

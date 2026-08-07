@@ -30,7 +30,7 @@ Concretely, comparing symbol coverage:
 
 | capability | x86_64 | aarch64 |
 |---|---|---|
-| `linux_syscall_dispatch` (Linux ABI personality) | yes | **absent** |
+| `linux_syscall_dispatch` (Linux ABI personality) | yes | ✅ **A2** |
 | `proc_fork` / `vmm_space_clone` / `vmm_cow_fault` | yes | ✅ **A1** |
 | `proc_clone_thread` (pthreads) | yes | **absent** (A4) |
 | signal delivery + sigreturn | yes | ✅ **A1** |
@@ -116,6 +116,42 @@ already exist and are arch-neutral.
 (as both x86 ports now do).  A fixed window is a double free waiting for the
 day the machine has more RAM than the constant assumed.
 *Done when:* `forktest`, `sigtest`, `pipetest` pass over the serial shell.
+
+### A2 — the Linux ABI personality  ✅ **SHIPPED (2026-08-07)**
+
+`hal/aarch64/linux_abi.c` is **~80 lines** where its x86 siblings are 1211 and
+1064 — not because aarch64 supports less, but because §M50 moved the
+translation into a shared engine first.  What is left here is the only genuinely
+architecture-specific part: x8 = number, x0..x5 = arguments, result in x0.
+Everything else is `kernel/core/abi_linux.c` (data) and `abi_engine.c` (shared
+handlers).  The pointer gate (`task->in_user_syscall`) is armed from the first
+line, per the warning below.
+
+**`musltest` passes: an unmodified static musl binary runs, with ZERO unhandled
+syscalls** — the shared vocabulary was already sufficient, which is the strongest
+available evidence that the engine's split is the right one.
+
+**The blocker the plan did not list.**  A2's proof needs a musl for this arch,
+i.e. the toolchain half of A3 — so the two stages were ordered wrongly.  It
+turned out cheap: `scripts/fetch-musl-cross-prebuilt.sh` was already
+arch-parametric, so it is a download, not a from-source gcc build.
+
+**And the trap A6 predicted, hit four stages early.**  musl's `memset` opens
+with `dup v0.16b, w1` — NEON — so libc startup trapped on its first string
+operation.  The symptom lied: an EL0 exception with `FAR_EL1 = 0`, which reads
+exactly like a null dereference and is nothing of the kind.  Disassembling the
+faulting address settled it immediately where reasoning about null pointers
+would have wasted an evening.  **`kernel/hal/aarch64/fpu.c` had described this
+exact failure, and both halves of the fix, before it happened** — enable
+`CPACR_EL1.FPEN` per CPU *and* save/restore Q0..Q31 + FPCR/FPSR, with a warning
+that doing the first without the second is worse than neither.  Both are now
+implemented, and the A1 self-tests still pass with FP live on the context-switch
+path.
+
+Note this also unblocks A5/A6 early: the FP unit is the thing every ported
+library needs, and it is now on.
+
+*Original plan, kept for the record:*
 
 ### A2 — the Linux ABI personality
 `hal/aarch64/linux_abi.c`: AArch64 Linux syscall numbers (`svc #0`, x8 =

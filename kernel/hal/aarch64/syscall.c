@@ -62,7 +62,16 @@ void aarch64_syscall(struct trapframe* tf) {
     if (me) me->in_user_syscall = prev;
 }
 
+void linux_syscall_dispatch(struct trapframe* tf);   /* linux_abi.c (A2) */
+
 static void aarch64_syscall_body(struct trapframe* tf) {
+    /* A2 — personality routing, the same one-line branch the x86 dispatchers
+     * carry: a task exec'd from a package that declares a Linux ABI is serviced
+     * by the Linux personality, everything else by the native numbers below. */
+    {
+        struct task* cur = task_current();
+        if (cur && cur->linux_abi) { linux_syscall_dispatch(tf); return; }
+    }
     uint64_t num = tf->x[8];
     switch (num) {
         case SYS_PRINT:

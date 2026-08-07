@@ -239,6 +239,12 @@ void signal_sigreturn(struct int_frame* f);
 
 /* M36 / §M41 — Linux i386 syscall-ABI dispatch (hal/x86/linux_abi.c).  The
  * native dispatcher routes here for a process with the Linux personality. */
+#if defined(__aarch64__)
+/* Same reason as signal_deliver above: the trap frame is per-arch, so the
+ * signature has to follow it. */
+void linux_syscall_dispatch(struct trapframe* f);
+#else
 void linux_syscall_dispatch(struct int_frame* f);
+#endif
 
 #endif

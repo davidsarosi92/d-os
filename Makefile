@@ -519,6 +519,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/vmm.c \
       kernel/hal/aarch64/fork.c \
       kernel/hal/aarch64/signal.c \
+      kernel/hal/aarch64/linux_abi.c \
       kernel/hal/aarch64/syscall.c \
       kernel/hal/aarch64/uaccess.c \
       kernel/hal/aarch64/fpu.c \
@@ -543,7 +544,7 @@ else ifeq ($(ARCH),aarch64)
   # so adding them here is the whole change.
   ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
                      user/forktest_blob.o user/pipetest_blob.o \
-                     user/sigtest_blob.o
+                     user/sigtest_blob.o user/muslhello_muslblob.o
 
   # Tier B — in-tree user libc build knobs (aarch64).  Uses the cross toolchain
   # ($(CC)/$(LD)/$(CROSS)objcopy); user base is 4 GiB (above the identity map).
@@ -1604,7 +1605,11 @@ $(OBJ_DIR)/third_party/cacert_blob.o: third_party/cacert.pem
 
 $(OBJ_DIR)/user/%_muslblob.o: user/%.muslelf
 	@mkdir -p $(@D)
-	objcopy --input-target=binary $(USER_OCARGS) $< $@
+	# $(USER_OBJCOPY), not bare `objcopy`: the aarch64 container carries only the
+	# cross binutils, so the unqualified name is simply absent there.  The
+	# in-tree-libc blob rule above already knew this; this one did not, because
+	# no arch had ever needed both a musl blob and a cross objcopy at once.
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
 # §M37 — DYNAMICALLY-linked musl programs.  Same compile, but linked as a PIE
 # (-pie) against the SHARED libc.so with the musl dynamic linker as PT_INTERP

@@ -94,6 +94,7 @@ static void cmd_help(void) {
             "  forktest          fork()+waitpid() self-test (§A1)\n"
             "  pipetest          pipe()+dup2() self-test (§A1)\n"
             "  sigtest           signal delivery self-test (§A1)\n"
+            "  musltest          run an unmodified static musl binary (§A2)\n"
             "  clear             clear the screen\n");
 }
 
@@ -113,6 +114,8 @@ extern const unsigned char _binary_user_pipetest_elf_start[] __attribute__((weak
 extern const unsigned char _binary_user_pipetest_elf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_sigtest_elf_start[]  __attribute__((weak));
 extern const unsigned char _binary_user_sigtest_elf_end[]    __attribute__((weak));
+extern const unsigned char _binary_user_muslhello_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_muslhello_muslelf_end[]   __attribute__((weak));
 
 int proc_exec_elf(const unsigned char* image, unsigned long len);
 
@@ -131,6 +134,23 @@ static void cmd_pipetest(void) {
 }
 static void cmd_sigtest(void) {
     run_blob("sigtest", _binary_user_sigtest_elf_start, _binary_user_sigtest_elf_end);
+}
+
+/* A2 — run an UNMODIFIED static musl binary under the Linux/arm64 personality.
+ * The flag is set around the excursion exactly as shell.c does it on x86: the
+ * personality is a property of the running task, and this shell task borrows it
+ * for the duration of the call. */
+static void cmd_musltest(void) {
+    const unsigned char* a = _binary_user_muslhello_muslelf_start;
+    const unsigned char* b = _binary_user_muslhello_muslelf_end;
+    if (!a || !b) { kprintf("musltest: not embedded for this arch\n"); return; }
+    kprintf("musltest: exec'ing a REAL musl binary (Linux/arm64 personality)...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(a, (unsigned long)(b - a));
+    if (me) me->linux_abi = prev;
+    kprintf("musltest: returned rc=%d\n", rc);
 }
 
 static void cmd_meminfo(void) {
@@ -287,6 +307,7 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "forktest")) cmd_forktest();
         else if (s_eq(cmd, "pipetest")) cmd_pipetest();
         else if (s_eq(cmd, "sigtest"))  cmd_sigtest();
+        else if (s_eq(cmd, "musltest")) cmd_musltest();
         else if (s_eq(cmd, "clear"))  kprintf("\033[2J\033[H");
         else kprintf("unknown command '%s' (try 'help')\n", cmd);
     }

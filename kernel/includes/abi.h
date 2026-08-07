@@ -65,6 +65,29 @@ enum abi_op {
     /* Process identity */
     ABI_GETPID,
     ABI_GETPPID,
+    ABI_GETTID,
+
+    /* Process lifetime.  ABI_EXIT never returns — a handler is allowed not to,
+     * and the shim must not assume it will. */
+    ABI_EXIT,
+
+    /* Scatter/gather I/O.  Named separately from READ/WRITE rather than
+     * folded into them: the argument SHAPE differs (a vector, not a buffer),
+     * and hiding that behind the same op would push the difference back into
+     * the per-arch shims, which is exactly what this vocabulary exists to
+     * prevent. */
+    ABI_READV,
+    ABI_WRITEV,
+
+    /* Terminal control.  Answered, not implemented: see the handler. */
+    ABI_IOCTL,
+
+    /* Memory */
+    ABI_BRK,
+    ABI_MMAP,
+
+    /* Threading identity used at libc startup. */
+    ABI_SET_TID_ADDRESS,
 
     ABI_OP_MAX
 };

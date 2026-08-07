@@ -17,6 +17,22 @@
  * easiest to get right, and it makes the claim "a new arch is a table"
  * checkable rather than aspirational.
  *
+ * NOT mapped here yet, on purpose:
+ *
+ *   `exit` / `exit_group`.  The x86 layers' exit does two things — terminate a
+ *   user process, and, when the ELF was run as a synchronous EXCURSION from the
+ *   kernel (`proc_exec_elf`, which is how `musltest` and every self-test runs),
+ *   teleport back to the kernel stack it came from.  That second half is
+ *   arch-coupled (a saved SP/PC pair per arch), so exit cannot be a shared
+ *   handler until the excursion path is unified.  Mapping it before then would
+ *   have silently broken every self-test on both x86 arches, which is the kind
+ *   of thing the "engine may decline, the switch is the fallback" design exists
+ *   to make survivable — but declining on purpose is better than finding out.
+ *
+ *   amd64 `mmap`.  Its existing case translates a failure into -ENOMEM; until
+ *   the canonical handler does exactly that, routing it here would change
+ *   behaviour rather than move it.
+ *
  * Numbers verified against the Linux kernel's own tables:
  *   i386   arch/x86/entry/syscalls/syscall_32.tbl
  *   amd64  arch/x86/entry/syscalls/syscall_64.tbl
@@ -35,6 +51,12 @@ static const struct abi_nument linux_i386_ents[] = {
     {  64, ABI_GETPPID  },
     {  91, ABI_MUNMAP   },
     { 125, ABI_MPROTECT },
+    { 145, ABI_READV    },
+    { 146, ABI_WRITEV   },
+    {  54, ABI_IOCTL    },
+    {  45, ABI_BRK      },
+    { 258, ABI_SET_TID_ADDRESS },
+    { 224, ABI_GETTID   },
 };
 
 /* ---- Linux / amd64 -------------------------------------------------------- */
@@ -47,6 +69,12 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  11, ABI_MUNMAP   },
     {  39, ABI_GETPID   },
     { 110, ABI_GETPPID  },
+    {  19, ABI_READV    },
+    {  20, ABI_WRITEV   },
+    {  16, ABI_IOCTL    },
+    {  12, ABI_BRK      },
+    { 218, ABI_SET_TID_ADDRESS },
+    { 186, ABI_GETTID   },
 };
 
 /* ---- Linux / arm64 (the asm-generic numbering) ---------------------------- */
@@ -59,6 +87,13 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 173, ABI_GETPPID  },
     { 215, ABI_MUNMAP   },
     { 226, ABI_MPROTECT },
+    {  65, ABI_READV    },
+    {  66, ABI_WRITEV   },
+    {  29, ABI_IOCTL    },
+    { 214, ABI_BRK      },
+    { 222, ABI_MMAP     },
+    {  96, ABI_SET_TID_ADDRESS },
+    { 178, ABI_GETTID   },
 };
 
 #define ARRAY_N(a) ((uint32_t)(sizeof(a) / sizeof((a)[0])))
