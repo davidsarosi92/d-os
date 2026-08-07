@@ -101,6 +101,8 @@ static const struct abi_nument linux_arm64_ents[] = {
     {  96, ABI_SET_TID_ADDRESS },
     { 178, ABI_GETTID   },
     { 135, ABI_SIGPROCMASK },
+    { 260, ABI_WAIT     },          /* wait4 */
+    { 221, ABI_EXECVE   },
 };
 
 #define ARRAY_N(a) ((uint32_t)(sizeof(a) / sizeof((a)[0])))

@@ -13,6 +13,7 @@
 #include "syscall.h"
 #include "task.h"
 #include "fd.h"
+#include "proc.h"
 #include <stddef.h>
 
 /* --- canonical handlers ---------------------------------------------------
@@ -123,6 +124,24 @@ static long h_mmap(struct abi_ctx* c) {
  * so the pid is the honest answer — the same one gettid gives. */
 static long h_sigprocmask(struct abi_ctx* c) { (void)c; return 0; }
 
+/* wait4(pid, status, options, rusage) — rusage is ignored (d-os collects no
+ * per-process resource accounting yet); reporting it as unsupported would fail
+ * a shell that only ever wants the exit status. */
+static long h_wait(struct abi_ctx* c) {
+    int status = 0;
+    int pid = task_wait((int)c->a[0], &status);
+    if (c->a[1]) *(int*)(uintptr_t)c->a[1] = status;
+    return pid;
+}
+
+/* execve(path, argv, envp) — envp is not honoured yet (the initial stack
+ * carries a fixed default environment, see build_initial_stack).  Does not
+ * return on success. */
+static long h_execve(struct abi_ctx* c) {
+    return proc_execve((const char*)(uintptr_t)c->a[0],
+                       (char* const*)(uintptr_t)c->a[1]);
+}
+
 static long h_settid(struct abi_ctx* c) {
     (void)c;
     struct task* t = task_current();
@@ -163,6 +182,8 @@ static const struct {
     [ABI_MMAP]     = { "mmap",     h_mmap },
     [ABI_SET_TID_ADDRESS] = { "set_tid_address", h_settid },
     [ABI_SIGPROCMASK]     = { "sigprocmask",     h_sigprocmask },
+    [ABI_WAIT]            = { "wait",            h_wait },
+    [ABI_EXECVE]          = { "execve",          h_execve },
 };
 
 enum abi_op abi_lookup(const struct abi_map* map, unsigned long nr) {

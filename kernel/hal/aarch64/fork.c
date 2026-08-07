@@ -40,6 +40,7 @@
 struct fork_boot {
     struct vmm_space* space;
     struct user_regs  regs;
+    uint64_t          tpidr;                /* the parent's LIVE thread pointer */
     struct ofile*     fds[TASK_MAX_FDS];    /* parent fd snapshot, refs bumped */
 };
 
@@ -61,9 +62,21 @@ static void fork_child_bootstrap(void) {
 
     struct user_regs  regs  = b->regs;      /* copy out before freeing b */
     struct vmm_space* space = b->space;
+    uint64_t          tpidr = b->tpidr;
     kfree(b);
 
     vmm_space_switch(space);
+
+    /* Install the parent's thread pointer.  `has_tls`/`tls_base` are NOT enough
+     * on this arch: EL0 can write TPIDR_EL0 itself (musl's aarch64
+     * __set_thread_area is one `msr`, no syscall), so the kernel was never told
+     * and has_tls is 0 — while the register very much holds a live pointer.
+     *
+     * Missing this is not a subtle degradation.  musl's fork path computes its
+     * `struct pthread` as TP - 0xc8 and immediately stores through it, so a
+     * child starting with TP = 0 faults at address -0xa8 on its first
+     * instruction after the syscall.  That was the actual symptom. */
+    __asm__ volatile ("msr tpidr_el0, %0" :: "r"(tpidr));
     if (me->has_tls) hal_set_tls_base(me->tls_base);
 
     enter_user_mode_regs(&regs);            /* → EL0 at the fork point; no return */
@@ -81,6 +94,8 @@ int proc_fork(struct user_regs* parent_regs) {
     b->space      = child_space;
     b->regs       = *parent_regs;
     b->regs.x[0]  = 0;                       /* child: fork() returns 0 */
+    /* Read it LIVE rather than from the task struct — see the bootstrap. */
+    __asm__ volatile ("mrs %0, tpidr_el0" : "=r"(b->tpidr));
     for (int i = 0; i < TASK_MAX_FDS; i++)
         b->fds[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
 

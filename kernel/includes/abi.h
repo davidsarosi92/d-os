@@ -95,6 +95,11 @@ enum abi_op {
      * abort startup in libcs that treat it as fatal. */
     ABI_SIGPROCMASK,
 
+    /* Process control.  Both are arch-neutral: they take pointers and return a
+     * value, with none of exit's or clone's coupling to the trap frame. */
+    ABI_WAIT,
+    ABI_EXECVE,
+
     ABI_OP_MAX
 };
 
