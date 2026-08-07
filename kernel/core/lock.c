@@ -130,6 +130,15 @@ void spin_lock(spinlock_t* l) {
     spin_acquire(l, __builtin_return_address(0));
 }
 
+int spin_trylock(spinlock_t* l) {
+    /* §M49 — acquire or report failure; never spins, so it is usable where
+     * waiting would be worse than skipping.  The xHCI event-ring drain is
+     * the motivating case: if someone else is already draining the ring,
+     * a second drainer has nothing useful to do and blocking would only
+     * hold up whatever it was called from. */
+    return atomic_cmpxchg(&l->locked, 0, 1) ? 1 : 0;
+}
+
 /* --------------------------------------------------------------------------
  * preempt_disable / preempt_enable / preempt_count — per-CPU (M18.6.2).
  *

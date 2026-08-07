@@ -25,6 +25,7 @@
  * ============================================================================= */
 
 #include "usb.h"
+#include "printf.h"
 #include "vc.h"
 #include "keymap.h"
 #include <stdint.h>
@@ -68,7 +69,17 @@ void usb_hid_kbd_handle_report(const uint8_t* report) {
 
         /* Universal keycode = HID usage; pass through unchanged. */
         char c = keymap_translate(k, mods);
-        if (c) vc_kbd_push(c);
+        if (c) {
+            /* §M49 — say so ONCE.  Without this there is no way to tell from
+             * the guest whether a keystroke arrived over USB HID or over the
+             * PS/2 controller, which both exist on every PC target: the
+             * shell looks identical either way.  That mattered when the
+             * xHCI event drain moved off the timer ISR onto a workqueue —
+             * "typing still works" is not evidence the USB path works. */
+            static int announced = 0;
+            if (!announced) { announced = 1; kprintf("usb-hid: first key delivered over USB\n"); }
+            vc_kbd_push(c);
+        }
     }
 
     /* Snapshot the new keys as our previous-state for the next report. */

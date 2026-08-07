@@ -45,12 +45,8 @@ degenerating to the old behaviour at the default.  Result: queue spread 2..6 →
 2..3, x86_64 seven of eight hogs at the ideal 49-50%.  **Lesson:** `struct task`
 is constructed in FOUR places and only one is `spawn_common` — the new weight
 field stayed zero in the other three and the first boot took a #DE in the
-scheduler; one `task_sched_defaults()` plus a guard at the division.  Open:
-`vc_getchar` is still a spin-poll (an idle shell pegs a core — making it block
-needs waking waitq-parked tasks from the kill path, i.e. §M46 teardown
-semantics), and no kernel workqueue **deliberately**, until it has a real
-consumer (NIC RX).  **THEN BOTH OF THOSE WERE DONE TOO:** `vc_getchar` and
-init's reaper now BLOCK (per-VC waitq woken from the keyboard IRQ; the ring
+scheduler; one `task_sched_defaults()` plus a guard at the division.
+**Then the two remaining polls:** `vc_getchar` and init's reaper now BLOCK (per-VC waitq woken from the keyboard IRQ; the ring
 write stays lock-free but the WAKE takes the lock — that is what closes the
 lost-wakeup window), so an idle 4-CPU box went from **one core pegged at 100% to
 all four at 0-2%**.  That needed `task_kill` to wake waitq-parked tasks (new
@@ -69,10 +65,25 @@ needs `irq_work`'s shape).  `wqtest [n]`: 16 items over 4 CPUs in **26 ms vs
 ~80 ms serial**.  **Lesson:** that test first reported FAIL on duplicate runs —
 the TEST was wrong, not the queue; re-queueing an item that is already RUNNING
 is the intended semantic (how a driver says "more arrived while you drained").
-Still open: `keyboard_getchar` + the GUI compositor/app-host loops are still
-`hlt`+`yield` polls (the GUI ones need waitqs on the compositor's event queues —
-a compositor change), and the workqueue has no production consumer yet (NIC RX
-first, then the xHCI event ring polled from the timer ISR).
+**First production consumer: the xHCI event-ring drain** — `xhci_poll()` runs
+from the TIMER IRQ on both arches and used to drain the whole ring there (MMIO
+walk + HID decode + a `vc_kbd_push` that now wakes a task and may IPI a core);
+the ISR now only `work_submit`s.  One change in `xhci.c` covers both arches
+because both timers call the same function.  It also closed a LATENT bug:
+`evt_drain` is not reentrant and its other caller (`cmd_submit_wait`, task
+context, enumeration) could be interrupted mid-drain — and `evt_drain(NULL)`
+from the ISR SWALLOWS the command completion the enumerating task waits for,
+turning success into a 200 ms timeout.  New `spin_trylock` (deferred drain skips
+if someone is already draining; the enumeration path holds the lock across its
+whole wait).  **Verified with `-device qemu-xhci -device usb-kbd`:
+`usb-hid: first key delivered over USB` — a one-shot marker added because every
+PC target ALSO has PS/2, so "typing still works" is not evidence the USB path
+works.**  Still open: `keyboard_getchar` + the GUI compositor/app-host loops are
+still `hlt`+`yield` polls (the GUI ones need waitqs on the compositor's event
+queues — a compositor change), and NIC RX is the next workqueue consumer but
+needs `net.c` LOCKED first: the stack is single-task by construction ("everything
+runs in one task context → no locking") and every blocking helper spins calling
+`dev->poll`.
 
 ✅ **§M48 — THE MEMORY CEILING IS DISCOVERED, NOT COMPILED IN + A USABLE
 BROWSER (2026-08-04, DOCS §4.42–§4.44).**  `pmm_init` sizes its metadata from the

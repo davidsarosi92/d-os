@@ -4843,11 +4843,43 @@ draining".  The assertion contradicted the contract written in the same commit.
 It now checks what is actually guaranteed: every item ran, nothing pending
 after the flush, and the completion counter agreeing with the runs observed.
 
-There is **no production consumer yet**.  The honest first one is NIC RX (today
-polled from the calling task, §M48); the xHCI event ring polled from the timer
-ISR is the second.  Both are conversions worth doing on their own schedule —
-neither was worth risking in the same change that rewrote the scheduler's
-blocking primitives.
+#### 8. Its first production consumer: the xHCI event ring
+
+`xhci_poll()` is called from the **timer IRQ** (x86 `pit.c`, aarch64
+`timer.c`) every 10 ms, and it used to drain the whole Event Ring right
+there: MMIO reads across the ring, HID report decoding, and — since §M49 made
+the console read blocking — a `vc_kbd_push` that takes a waitq lock, makes a
+task RUNNABLE and may IPI another core.  That is a great deal of work to do
+with interrupts off, on every tick, with every other interrupt on the machine
+queued behind it.
+
+The ISR now only submits; the drain runs on a worker.  One change in `xhci.c`
+covers both arches, because both timers call the same function.
+
+It also **fixed a latent bug**.  `evt_drain` is not reentrant and has always
+had a second caller: `cmd_submit_wait`, which drains the ring in task context
+during enumeration.  The timer ISR could interrupt it mid-drain on the same
+CPU — corrupting the dequeue cursor and, worse, `evt_drain(NULL)` from the ISR
+**swallows the command completion the enumerating task is waiting for**,
+turning a successful command into a 200 ms timeout.  Rare because enumeration
+is short, and real.  A new `spin_trylock` gives the deferred drain the right
+semantics (if someone else is draining, a second drainer has nothing useful to
+do and waiting would only tie up a worker), while the enumeration path holds
+the lock across its whole bounded wait so it can never lose its event.
+
+**Verified** with `-device qemu-xhci -device usb-kbd`: enumeration completes,
+and the guest prints `usb-hid: first key delivered over USB` — a one-shot
+marker added for exactly this, because a PC target always has a PS/2
+controller too and "typing still works" is not evidence that the USB path
+works.  `wqtest` reports the drain alongside its own items: `+1 completions
+from other submitters`.
+
+NIC RX remains the next consumer, and it is a bigger job than it looks: the
+stack is single-task by construction (`net.c` says so — "everything therefore
+runs in one task context → no locking"), every blocking helper spins calling
+`dev->poll`, and moving RX to a worker means locking the stack and converting
+those spins to waits.  That is §M24's documented follow-up, not a loose end of
+this one.
 
 #### Result
 
@@ -4879,8 +4911,8 @@ giving the compositor's event queues waitqs — worth doing, but a compositor
 change rather than a scheduler one, and not something to fold into the same
 work that rewrote the blocking primitives.
 
-The workqueue has no production consumer yet — NIC RX first, then the xHCI
-event ring.
+The workqueue's first consumer is the xHCI drain; NIC RX is next and needs
+`net.c` locked first (see above).
 
 Priority is per-task only.  There is no group or per-user fairness (a process
 that spawns ten threads gets ten shares), which is fine until §M32 makes users
@@ -4994,8 +5026,15 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   nothing): `wqtest` runs 16 items across 4 CPUs in 26 ms against ~80 ms serial.
   Its first test asserted no duplicate runs and failed against the contract
   written beside it — re-queueing an item that is already RUNNING is the
-  intended semantic.  No production consumer yet: NIC RX first, then the xHCI
-  event ring.
+  intended semantic.  **First production consumer: the xHCI event-ring drain**,
+  which ran inside the timer IRQ (MMIO ring walk + HID decode + a task wake) and
+  now only submits from there — one change covering both arches, and it closed a
+  latent bug on the way: `evt_drain` is not reentrant and the ISR could swallow
+  the command completion `cmd_submit_wait` was waiting for.  Verified with a USB
+  keyboard attached (`usb-hid: first key delivered over USB`, a marker added
+  because every PC target also has PS/2 and "typing works" proves nothing).
+  NIC RX is next and needs `net.c` locked first — the stack is single-task by
+  construction.
 
 - **2026-08-04 — §M48: the memory ceiling is discovered, not compiled in; NetSurf
   becomes usable; Mesa reaches i386 (DOCS §4.42–§4.44).**  `pmm_init` sizes its

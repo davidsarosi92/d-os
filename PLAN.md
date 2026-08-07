@@ -226,7 +226,7 @@ what); a session can pick a theme and push on it.
 | M18 | SMP support — APIC, AP boot, per-CPU, locking   | Concurrency      | ✅ DOCS §4.X |
 | M19 | Memory at scale — slab, huge pages, near-NUMA   | Memory           | ✅ DOCS §4.8, §4.10 |
 | M18.6 | SMP polish — per-CPU runqueue + load balancer ✅, preempt_count ✅, taskset ✅, cross-CPU IPI ✅, MSI/MSI-X ✅ | Concurrency | §M18.6 (balancer completed by §M49) |
-| M49 | Load distribution — periodic balance, demand metric, blocking sleeps/console reads, priority/`nice`, deferred-work pool, `sched`/`wqtest` | Concurrency | ✅ DOCS §4.46 |
+| M49 | Load distribution — periodic balance, demand metric, blocking sleeps/console reads, priority/`nice`, deferred-work pool (first consumer: xHCI drain), `sched`/`wqtest` | Concurrency | ✅ DOCS §4.46 |
 | M19.5 | Memory polish — HIGHMEM ✅ (x86_64), empty-slab caching ✅, SRAT/NUMA ✅ (parser) | Memory | §M19.5 |
 | M20 | x64 (long mode) port (UP)                       | Architecture     | ✅ DOCS §4.X (closed by §M20.5) |
 | M20.5 | x64 SMP + APIC + ring-3 (int 0x80) — Phase A/B/C | Architecture | ✅ §M20.5 |

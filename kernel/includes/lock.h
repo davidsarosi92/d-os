@@ -77,6 +77,11 @@ void spin_unlock(spinlock_t* l);
  * peers' locks). */
 void spin_lock(spinlock_t* l);
 
+/* Try to acquire without waiting.  Returns 1 if the lock is now held (release
+ * it with spin_unlock), 0 if someone else holds it.  Caller is responsible for
+ * IRQ-off, exactly like spin_lock. */
+int spin_trylock(spinlock_t* l);
+
 /* ---------------------------------------------------------------------------
  * preempt_disable / preempt_enable
  *

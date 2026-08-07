@@ -1023,13 +1023,23 @@ static void cmd_wqtest(const char* args) {
      * own documented contract — the assertion was wrong, not the queue.
      * What must hold: every item ran, nothing was left pending after the
      * flush, and the completion counter agrees with the runs observed. */
-    int ok = (ran == n) && (pending == 0) && ((uint64_t)runs == done1 - done0);
+    /* The completion counter is GLOBAL, so it may exceed our own runs: the
+     * xHCI event-ring drain submits work from the timer tick, and any
+     * future consumer will too.  This check originally demanded exact
+     * equality and started failing the moment the queue got a real
+     * production user — the counter read +12 against 11 of our runs, the
+     * difference being one USB drain.  `>=` is what was actually meant. */
+    int ok = (ran == n) && (pending == 0) && (done1 - done0 >= (uint64_t)runs);
     if (ok)
         kprintf("wqtest: PASS (all %d ran, %d re-queued while running, "
                 "flush drained everything)\n", n, extra);
     else
         kprintf("wqtest: FAIL (ran=%d/%d, runs=%d, counter=+%u, pending=%d)\n",
                 ran, n, runs, (unsigned)(done1 - done0), pending);
+    if (done1 - done0 > (uint64_t)runs)
+        kprintf("wqtest: (+%u completions from other submitters — the xHCI "
+                "drain runs on this pool)\n",
+                (unsigned)(done1 - done0 - (uint64_t)runs));
 }
 
 /* `nice <pid> <value>` — scheduling priority, -20 (strongest) .. +19

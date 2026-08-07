@@ -62,6 +62,8 @@
 #include "module.h"
 #include "driver.h"
 #include "timer.h"
+#include "lock.h"
+#include "workqueue.h"
 #include "usb.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -367,6 +369,13 @@ static int evt_drain(struct xhci_trb* out_completion) {
  * doorbell uses target=0), then poll the Event Ring for a Command
  * Completion Event.  Returns the completion code (1 = success).
  * --------------------------------------------------------------------------- */
+/* §M49 — event-ring serialisation + deferred drain.  Declared here because
+ * cmd_submit_wait (below) is the first user; the reasoning lives with
+ * xhci_poll at the bottom of the file. */
+static spinlock_t  xhci_drain_lock;
+static struct work xhci_drain_work;
+static int         xhci_work_ready = 0;
+
 static int cmd_submit_wait(uint32_t plo, uint32_t phi,
                            uint32_t status, uint32_t control,
                            uint32_t* out_slot_id) {
@@ -377,16 +386,23 @@ static int cmd_submit_wait(uint32_t plo, uint32_t phi,
      * responds within microseconds, but we don't have IRQ-driven
      * delivery yet so a tick-based bound is enough. */
     uint64_t deadline = timer_ticks_ms() + 200;
+    /* §M49 — own the ring for the whole wait, so no background drain can
+     * consume the completion we are looking for.  Held across a bounded
+     * poll: the alternative (lock per drain) reopens exactly the race this
+     * closes. */
+    uint32_t fl = spin_lock_irqsave(&xhci_drain_lock);
+    int rc = -1;                                    /* timeout */
     while (timer_ticks_ms() < deadline) {
         struct xhci_trb evt;
         int n = evt_drain(&evt);
         if (n > 0 && ((evt.control >> TRB_TYPE_SHIFT) & 0x3F) == TRB_TYPE_CMD_COMPLETION) {
-            uint32_t cc = (evt.status >> 24) & 0xFF;
             if (out_slot_id) *out_slot_id = (evt.control >> TRB_SLOT_SHIFT) & 0xFF;
-            return (int)cc;
+            rc = (int)((evt.status >> 24) & 0xFF);
+            break;
         }
     }
-    return -1;  /* timeout */
+    spin_unlock_irqrestore(&xhci_drain_lock, fl);
+    return rc;
 }
 
 /* ---------------------------------------------------------------------------
@@ -841,13 +857,76 @@ static int enumerate_and_configure(void) {
 }
 
 /* ---------------------------------------------------------------------------
- * Public poll function — called from the PIT IRQ tick (every quantum)
- * to drain the Event Ring so HID reports arrive without their own IRQ.
+ * Event-ring servicing (§M49).
+ *
+ * `xhci_poll()` is called from the TIMER IRQ (x86 pit.c, aarch64 timer.c)
+ * every USB_POLL_TICKS.  It used to drain the Event Ring right there, in
+ * interrupt context: MMIO reads over the whole ring, HID report decoding,
+ * and — since §M49 made the console read blocking — a `vc_kbd_push` that
+ * takes a waitq lock, makes a task RUNNABLE and may IPI another core.
+ * That is a lot of work to do with interrupts off, on every tick, for
+ * every other interrupt on the machine to wait behind.
+ *
+ * So the ISR now only SUBMITS: the drain runs on a workqueue worker, in
+ * ordinary task context where it is preemptible and can land on any core.
+ * This is the canonical shape a workqueue exists for.
+ *
+ * `xhci_drain_lock` is not optional, and it fixes something that was
+ * already broken.  `evt_drain` is not reentrant, and it has always had a
+ * second caller: `cmd_submit_wait`, which drains the ring in TASK context
+ * during device enumeration.  The timer ISR could interrupt it mid-drain
+ * on the same CPU — corrupting the dequeue cursor, and worse, `evt_drain(NULL)`
+ * from the ISR SWALLOWS the command completion the enumerating task is
+ * waiting for, turning a successful command into a 200 ms timeout.  Rare,
+ * because enumeration is short, but real.
+ *
+ * The deferred drain uses TRY-lock: if anyone else is already draining,
+ * there is nothing useful for a second drainer to do, and waiting would
+ * only tie up a worker.  The enumeration path takes the lock for its whole
+ * wait, so it can never lose its completion event to a background drain.
  * --------------------------------------------------------------------------- */
+
+/* Drain the ring if nobody else is.  Returns without waiting otherwise. */
+static void xhci_drain_once(void) {
+    uint32_t fl = hal_intr_save();
+    if (!spin_trylock(&xhci_drain_lock)) { hal_intr_restore(fl); return; }
+    evt_drain(NULL);
+    spin_unlock(&xhci_drain_lock);
+    hal_intr_restore(fl);
+}
+
+static void xhci_drain_workfn(struct work* w) {
+    (void)w;
+    xhci_drain_once();
+}
 
 void xhci_poll(void) {
     if (!xhc.present) return;
-    evt_drain(NULL);
+
+    /* Arm lazily: the driver initialises long before the workqueue pool
+     * exists, and this is the only place that runs afterwards on every
+     * arch (x86 pit.c and aarch64 timer.c both land here).  Serialised on
+     * the drain lock so two timer ISRs cannot both initialise the item. */
+    if (!xhci_work_ready) {
+        int workers = 0;
+        workqueue_stats(&workers, NULL, NULL);
+        if (workers > 0) {
+            uint32_t fl = hal_intr_save();
+            if (spin_trylock(&xhci_drain_lock)) {
+                if (!xhci_work_ready) {
+                    work_init(&xhci_drain_work, xhci_drain_workfn);
+                    xhci_work_ready = 1;
+                }
+                spin_unlock(&xhci_drain_lock);
+            }
+            hal_intr_restore(fl);
+        }
+    }
+
+    /* Before the pool is up there is no worker to run it, so drain inline —
+     * the ISR cost only matters once the system is doing something. */
+    if (xhci_work_ready && work_submit(&xhci_drain_work) == 0) return;
+    xhci_drain_once();
 }
 
 /* ---------------------------------------------------------------------------
