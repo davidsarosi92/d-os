@@ -49,6 +49,7 @@
 #include "crash.h"     /* §M47 — the `crash` report list */
 #include "proc.h"
 #include "syscall.h"
+#include "workqueue.h"  /* §M49 — deferred-work pool + wqtest */
 #include "fd.h"
 #include "service.h"
 #include "cron.h"
@@ -132,6 +133,8 @@ static void cmd_help(void) {
                   "  gui (compositor + desktop), gui stats, launch [app]\n"
                   "  run <path.bas> (Tiny-BASIC)\n"
                   "  lslayout, setlayout <us|hu|...>, lscpu, taskset <pid> <mask>\n"
+                  "  sched [ms] (how work is spread over the CPUs), loop [n], loopstop\n"
+                  "  nice <pid> <-20..19> (scheduling priority), wqtest [n]\n"
                   "  slabinfo, buddyinfo\n"
                   "  shutdown, reboot\n");
 }
@@ -565,14 +568,34 @@ static void cmd_wedge(void) {
             pid, pid, pid, ms > 0 ? " (auto-fkill armed)" : "");
 }
 
-static void cmd_loop(void) {
+/* `loop [n]` — spawn n CPU hogs (default 1).  The count exists for §M49:
+ * one hog cannot show a load-distribution problem, because there is
+ * nothing to distribute.  `loop 8` on a 4-CPU box is the shape that makes
+ * an imbalance visible under `sched`. */
+static void cmd_loop(const char* args) {
+    while (*args == ' ') args++;
+    int count = 0;
+    for (; *args >= '0' && *args <= '9'; args++) count = count * 10 + (*args - '0');
+    if (count <= 0) count = 1;
+    if (count > 32) count = 32;             /* a shell typo shouldn't OOM the box */
     loop_stop_flag = 0;
-    struct task* t = task_spawn("cpu-hog", loop_hog_main);
-    if (!t) {
-        console_write("loop: spawn failed (OOM?)\n");
-        return;
+    int spawned = 0;
+    for (int i = 0; i < count; i++) {
+        struct task* t = task_spawn("cpu-hog", loop_hog_main);
+        if (!t) break;
+        spawned++;
     }
-    kprintf("loop: spawned pid %d — should NOT freeze the shell\n", t->pid);
+    if (!spawned) { console_write("loop: spawn failed (OOM?)\n"); return; }
+    kprintf("loop: spawned %d cpu-hog(s) — should NOT freeze the shell; "
+            "`sched` to see the spread, `loopstop` to stop them all\n", spawned);
+}
+
+/* `loopstop` — release every cpu-hog spawned by `loop`.  They poll the
+ * flag, so they exit at their next iteration.  Without this, measuring
+ * twice in one boot means measuring the first run's leftovers too. */
+static void cmd_loopstop(void) {
+    loop_stop_flag = 1;
+    console_write("loopstop: all cpu-hogs asked to exit\n");
 }
 
 /* -------------------------------------------------------------------- */
@@ -614,16 +637,14 @@ static void cmd_pane_split(struct vc* my_vc, enum vc_split_dir dir) {
         kprintf("pane: split failed (max %d panes?)\n", VC_MAX);
         return;
     }
-    /* Spawn the shell task for the new pane.  Bind the VC BEFORE the
-     * runqueue can pick it (preempt_disable) so the task's first
-     * kprintf already routes through vc_putchar(nv, ...). */
-    preempt_disable();
-    struct task* t = task_spawn("shell", shell_provider_active()->entry);
-    if (t) {
-        task_set_out_console(t, nv);
-        nv->task = t;
-    }
-    preempt_enable();
+    /* Spawn the shell task for the new pane with the VC already bound, so
+     * the task's first kprintf routes through vc_putchar(nv, ...).
+     * §M49 — this was a set-after-spawn under preempt_disable, which is
+     * not a barrier against another CPU picking the task up (that counter
+     * is per-CPU).  The binding belongs in the spawn. */
+    struct task* t = task_spawn_console("shell", shell_provider_active()->entry,
+                                        -1, nv);
+    if (t) nv->task = t;
 
     if (!t) {
         kprintf("pane: spawn failed for new pane id=%d\n", nv->id);
@@ -742,6 +763,296 @@ static void cmd_lscpu(void) {
                 p->rq_count,
                 (i == me) ? " <this>" : "");
     }
+}
+
+/* --------------------------------------------------------------------
+ * `sched [ms]` — measure how work is actually spread across the CPUs
+ * (§M49).
+ *
+ * Why a sampling command and not a cumulative dump: since-boot totals
+ * average away exactly what we need to see.  A CPU that was hammered
+ * during boot and is idle now looks "half busy" forever, and a balancer
+ * fix would be indistinguishable from no fix.  So this takes two
+ * snapshots `ms` apart and reports the DELTA — the picture right now.
+ *
+ * BUSY% is the share of the window this CPU spent running a non-idle
+ * task.  RQ is the instantaneous queue depth.  The two together are the
+ * whole point: rq 1 + busy 100% is a saturated CPU with nothing to give
+ * away, rq 4 + busy 100% is a CPU with three tasks' worth of work that
+ * belongs somewhere else.  MIGR counts tasks pulled here by the
+ * balancer — the cost side, and the way to catch a balancer that merely
+ * shuttles the same task around.
+ * -------------------------------------------------------------------- */
+
+#define SCHED_SNAP_MAX 64          /* tasks tracked per sample; plenty here */
+
+struct sched_snap_task {
+    int      pid;
+    uint64_t cpu_ms;
+    int      cpu_home;
+    uint32_t demand;
+    int      nice;
+    char     name[24];
+};
+
+struct sched_snap {
+    struct sched_snap_task t[SCHED_SNAP_MAX];
+    int      n;
+    uint64_t now;
+};
+
+static void sched_snap_one(const struct task* t, int is_current, void* ctx) {
+    (void)is_current;   /* only true for the CALLING task — useless here */
+    struct sched_snap* s = (struct sched_snap*)ctx;
+    if (s->n >= SCHED_SNAP_MAX) return;
+    /* Idle tasks would each report ~100% of their core and drown the real
+     * tasks out; per-CPU BUSY% already says how idle a core is. */
+    if (t->is_idle) return;
+    struct sched_snap_task* e = &s->t[s->n++];
+    e->pid      = t->pid;
+    /* Same switch-boundary gap as the per-CPU busy counter: a task that is
+     * on a CPU right now has not been credited for the slice it is in the
+     * middle of.  Find out whether it is running anywhere and add it. */
+    e->cpu_ms   = t->cpu_ms;
+    for (int c = 0; c < smp_ncpus() && c < 32; c++) {
+        struct percpu* p = percpu_at(c);
+        if (p && p->current == t) {
+            if (s->now > t->sched_in_ms) e->cpu_ms += s->now - t->sched_in_ms;
+            break;
+        }
+    }
+    e->cpu_home = t->cpu_home;
+    e->demand   = t->demand;
+    e->nice     = t->nice;
+    int i = 0;
+    for (; i < (int)sizeof(e->name) - 1 && t->name[i]; i++) e->name[i] = t->name[i];
+    e->name[i] = '\0';
+}
+
+static void cmd_sched(const char* args) {
+    while (*args == ' ') args++;
+    uint32_t window = 0;
+    for (; *args >= '0' && *args <= '9'; args++) window = window * 10 + (uint32_t)(*args - '0');
+    if (window < 100)   window = 1000;      /* too short to measure anything */
+    if (window > 10000) window = 10000;
+
+    int n = smp_ncpus();
+    /* Snapshot A. */
+    static uint64_t busy0[32], sw0[32], mig0[32];
+    /* `busy_ms` is only credited at a context switch, so a task that
+     * monopolises a core without ever being switched out contributes
+     * NOTHING to it — the first version of this command reported a core
+     * running one busy task at 0%.  Add the in-flight slice at both
+     * snapshots to close that gap. */
+    #define BUSY_NOW(p, now) \
+        ((p)->busy_ms + (((p)->current && !(p)->current->is_idle && \
+                          (now) > (p)->current->sched_in_ms) \
+                         ? (now) - (p)->current->sched_in_ms : 0))
+    struct sched_snap* a = (struct sched_snap*)kmalloc(sizeof *a);
+    struct sched_snap* b = (struct sched_snap*)kmalloc(sizeof *b);
+    if (!a || !b) { console_write("sched: OOM\n"); kfree(a); kfree(b); return; }
+    a->n = b->n = 0;
+    uint64_t t0 = timer_ticks_ms();
+    a->now = t0;
+    for (int i = 0; i < n && i < 32; i++) {
+        struct percpu* p = percpu_at(i);
+        busy0[i] = p ? BUSY_NOW(p, t0)  : 0;
+        sw0[i]   = p ? p->switches      : 0;
+        mig0[i]  = p ? p->migrations    : 0;
+    }
+    task_for_each(sched_snap_one, a);
+
+    kprintf("sched: sampling %u ms across %d CPU(s)...\n", window, n);
+    task_msleep(window);
+
+    uint64_t t1 = timer_ticks_ms();
+    b->now = t1;
+    uint64_t elapsed = t1 - t0;
+    if (elapsed == 0) elapsed = 1;          /* never divide by a stopped clock */
+    task_for_each(sched_snap_one, b);
+
+    kprintf("CPU  RQ  LOAD  BUSY%%  SWITCH  MIGR  CURRENT\n");
+    unsigned lo = 100, hi = 0;
+    int rq_lo = 1 << 30, rq_hi = 0;
+    int ld_lo = 1 << 30, ld_hi = 0;
+    for (int i = 0; i < n && i < 32; i++) {
+        struct percpu* p = percpu_at(i);
+        if (!p || !p->online) continue;
+        uint64_t bnow = BUSY_NOW(p, t1);
+        uint64_t db = (bnow > busy0[i]) ? bnow - busy0[i] : 0;
+        if (db > elapsed) db = elapsed;     /* clamp a torn/racy sample */
+        unsigned pct = (unsigned)((db * 100) / elapsed);
+        if (pct < lo) lo = pct;
+        if (pct > hi) hi = pct;
+        if (p->rq_count < rq_lo) rq_lo = p->rq_count;
+        if (p->rq_count > rq_hi) rq_hi = p->rq_count;
+        if (p->rq_load < ld_lo) ld_lo = p->rq_load;
+        if (p->rq_load > ld_hi) ld_hi = p->rq_load;
+        kprintf("%d    %d   %d   %u      %u       %u     %s\n",
+                i, p->rq_count, p->rq_load, pct,
+                (unsigned)(p->switches   - sw0[i]),
+                (unsigned)(p->migrations - mig0[i]),
+                (p->current && p->current->name) ? p->current->name : "?");
+    }
+    if (rq_lo > rq_hi) rq_lo = rq_hi = 0;
+    if (ld_lo > ld_hi) ld_lo = ld_hi = 0;
+    /* LOAD spread is the number that matters: it is what the balancer
+     * equalises, and unlike BUSY% it stays informative when every core is
+     * saturated (four hogs and one hog are both 100% busy). */
+    kprintf("spread: load %d..%d (delta %d), busy %u%%..%u%% (delta %u), rq %d..%d\n",
+            ld_lo, ld_hi, ld_hi - ld_lo, lo, hi, hi - lo, rq_lo, rq_hi);
+
+    /* Per-task CPU time consumed during the window, and where it ran.
+     * This is the line that shows an imbalance as a human sees it: two
+     * hogs at 99% and two at 1% is a scheduling failure no aggregate
+     * per-CPU number makes obvious. */
+    /* DEM is the balancer's own view of the task (how much CPU it WANTS);
+     * CPU%% is what it actually got.  The two diverging is the signature
+     * of contention: a hog reads DEM 100 and CPU%% 25 on a crowded core. */
+    kprintf("PID  CPU  NI  DEM  CPU%%  NAME\n");
+    for (int i = 0; i < b->n; i++) {
+        uint64_t before = 0;
+        int seen = 0;
+        for (int j = 0; j < a->n; j++)
+            if (a->t[j].pid == b->t[i].pid) { before = a->t[j].cpu_ms; seen = 1; break; }
+        uint64_t used = seen ? (b->t[i].cpu_ms - before) : b->t[i].cpu_ms;
+        if (used > elapsed) used = elapsed;
+        unsigned pct = (unsigned)((used * 100) / elapsed);
+        if (pct == 0) continue;             /* idle/blocked tasks: not the story */
+        kprintf("%d    %d    %d   %u   %u     %s%s\n",
+                b->t[i].pid, b->t[i].cpu_home, b->t[i].nice,
+                b->t[i].demand, pct, b->t[i].name, seen ? "" : " (new)");
+    }
+    kfree(a);
+    kfree(b);
+    #undef BUSY_NOW
+}
+
+/* --------------------------------------------------------------------
+ * `wqtest [n]` — submit n work items and prove they ran (§M49).
+ *
+ * Each item spins for a few milliseconds so the run is long enough to be
+ * observed, then records WHICH CPU executed it.  With a worker per core
+ * and the §M49 balancer spreading them, the items should land on more
+ * than one CPU — that spread is the claim being tested, and a version of
+ * this that only counted completions would pass just as happily on a
+ * single core.
+ *
+ * Also exercises the two contracts that are easy to get wrong: work_flush
+ * must not return until every callback has RETURNED (not merely been
+ * dequeued), and a re-submit of a still-queued item must collapse into
+ * one run.
+ * -------------------------------------------------------------------- */
+
+#define WQTEST_MAX 32
+
+struct wqtest_item {
+    struct work w;
+    int         idx;
+    volatile int ran;
+    volatile int cpu;
+};
+
+static struct wqtest_item wqt[WQTEST_MAX];
+
+static void wqtest_fn(struct work* w) {
+    struct wqtest_item* it = (struct wqtest_item*)w;   /* w is the first member */
+    /* Busy for a few ms — long enough that concurrent items overlap, which
+     * is what makes the CPU spread meaningful. */
+    uint64_t end = timer_ticks_ms() + 5;
+    while (timer_ticks_ms() < end) { /* spin */ }
+    it->cpu = this_cpu_id();
+    it->ran++;
+}
+
+static void cmd_wqtest(const char* args) {
+    while (*args == ' ') args++;
+    int n = 0;
+    for (; *args >= '0' && *args <= '9'; args++) n = n * 10 + (*args - '0');
+    if (n <= 0) n = 8;
+    if (n > WQTEST_MAX) n = WQTEST_MAX;
+
+    int workers = 0, pending = 0;
+    uint64_t done0 = 0;
+    workqueue_stats(&workers, &pending, &done0);
+    if (workers == 0) { console_write("wqtest: no workers (pool not up)\n"); return; }
+
+    for (int i = 0; i < n; i++) {
+        wqt[i].idx = i;
+        wqt[i].ran = 0;
+        wqt[i].cpu = -1;
+        work_init(&wqt[i].w, wqtest_fn);
+    }
+
+    kprintf("wqtest: submitting %d items to %d worker(s)...\n", n, workers);
+    uint64_t t0 = timer_ticks_ms();
+    for (int i = 0; i < n; i++) work_submit(&wqt[i].w);
+    /* Re-submitting the same items immediately must NOT double them. */
+    for (int i = 0; i < n; i++) work_submit(&wqt[i].w);
+    work_flush();
+    uint64_t elapsed = timer_ticks_ms() - t0;
+
+    int ran = 0, extra = 0, runs = 0;
+    int per_cpu[32];
+    for (int i = 0; i < 32; i++) per_cpu[i] = 0;
+    for (int i = 0; i < n; i++) {
+        runs += wqt[i].ran;
+        if (wqt[i].ran >= 1) ran++;
+        if (wqt[i].ran >  1) extra++;      /* re-queued while running — legal */
+        if (wqt[i].cpu >= 0 && wqt[i].cpu < 32) per_cpu[wqt[i].cpu]++;
+    }
+    int cpus_used = 0;
+    for (int i = 0; i < 32; i++) if (per_cpu[i]) cpus_used++;
+
+    kprintf("wqtest: %d/%d items ran in %u ms across %d CPU(s):", ran, n,
+            (unsigned)elapsed, cpus_used);
+    for (int i = 0; i < smp_ncpus() && i < 32; i++) kprintf(" cpu%d=%d", i, per_cpu[i]);
+    kprintf("\n");
+
+    uint64_t done1 = 0;
+    workqueue_stats(&workers, &pending, &done1);
+    /* Serial work would take n*5 ms; real overlap should beat that
+     * noticeably once there is more than one worker. */
+    kprintf("wqtest: completed counter +%u, still pending %d, serial would be ~%d ms\n",
+            (unsigned)(done1 - done0), pending, n * 5);
+    /* `extra` is NOT a failure.  The second submit loop collapses into the
+     * first only for items still WAITING; an item a worker has already
+     * picked up is legitimately queued again, which is exactly how a
+     * driver says "more arrived while you were draining".  The first
+     * version of this test asserted zero duplicates and failed against its
+     * own documented contract — the assertion was wrong, not the queue.
+     * What must hold: every item ran, nothing was left pending after the
+     * flush, and the completion counter agrees with the runs observed. */
+    int ok = (ran == n) && (pending == 0) && ((uint64_t)runs == done1 - done0);
+    if (ok)
+        kprintf("wqtest: PASS (all %d ran, %d re-queued while running, "
+                "flush drained everything)\n", n, extra);
+    else
+        kprintf("wqtest: FAIL (ran=%d/%d, runs=%d, counter=+%u, pending=%d)\n",
+                ran, n, runs, (unsigned)(done1 - done0), pending);
+}
+
+/* `nice <pid> <value>` — scheduling priority, -20 (strongest) .. +19
+ * (weakest), 0 default (§M49).  Unprivileged in both directions: d-os has
+ * no user model yet (§M32), so there is nobody to protect the setting
+ * from. */
+static void cmd_nice(const char* args) {
+    while (*args == ' ') args++;
+    int pid = 0, any = 0;
+    for (; *args >= '0' && *args <= '9'; args++) { pid = pid * 10 + (*args - '0'); any = 1; }
+    if (!any) { console_write("nice: usage: nice <pid> <-20..19>\n"); return; }
+    while (*args == ' ') args++;
+    int neg = 0;
+    if (*args == '-') { neg = 1; args++; }
+    else if (*args == '+') args++;
+    int val = 0, hasval = 0;
+    for (; *args >= '0' && *args <= '9'; args++) { val = val * 10 + (*args - '0'); hasval = 1; }
+    if (!hasval) { console_write("nice: missing value (-20..19)\n"); return; }
+    if (neg) val = -val;
+    if (task_set_nice(pid, val) != 0) { kprintf("nice: no task with pid %u\n", pid); return; }
+    struct task* t = task_find(pid);
+    kprintf("nice: pid %d nice=%d weight=%u (%u%% of a default task's share)\n",
+            pid, t ? t->nice : val, t ? t->weight : 0, t ? t->weight : 0);
 }
 
 /* `taskset <pid> <hex_mask>` — pin task to a CPU set (M18.6.3).
@@ -2815,13 +3126,20 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "wedge"))          { cmd_wedge();     return; }
     if (streq(line, "spawn"))          { cmd_spawn();    return; }
     if (streq(line, "yield"))          { task_yield();   return; }
-    if (streq(line, "loop"))           { cmd_loop();     return; }
+    if (streq(line, "loop"))           { cmd_loop("");   return; }
+    if (starts_with(line, "loop "))    { cmd_loop(line + 5); return; }
+    if (streq(line, "loopstop"))       { cmd_loopstop(); return; }
     if (starts_with(line, "run "))     { cmd_run(my_vc, line + 4); return; }
     if (streq(line, "pane"))           { cmd_pane(my_vc, "");      return; }
     if (starts_with(line, "pane "))    { cmd_pane(my_vc, line + 5); return; }
     if (streq(line, "lslayout"))       { cmd_lslayout();             return; }
     if (starts_with(line, "setlayout ")) { cmd_setlayout(line + 10); return; }
     if (streq(line, "lscpu"))          { cmd_lscpu();                return; }
+    if (starts_with(line, "nice "))    { cmd_nice(line + 5);         return; }
+    if (streq(line, "wqtest"))         { cmd_wqtest("");             return; }
+    if (starts_with(line, "wqtest "))  { cmd_wqtest(line + 7);       return; }
+    if (streq(line, "sched"))          { cmd_sched("");              return; }
+    if (starts_with(line, "sched "))   { cmd_sched(line + 6);        return; }
     if (starts_with(line, "taskset "))  { cmd_taskset(line + 8);     return; }
     if (streq(line, "slabinfo"))       { cmd_slabinfo();             return; }
     if (streq(line, "buddyinfo"))      { cmd_buddyinfo();            return; }

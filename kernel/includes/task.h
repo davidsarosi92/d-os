@@ -43,6 +43,7 @@
 /* Per-process address space (M25).  Opaque here — see vmm.h.  Forward
  * declared so `struct task` can hold one without pulling in the VMM. */
 struct vmm_space;
+struct waitq;      /* §M49 — task.wq back-pointer; defined in waitq.h */
 /* Generic open-file object behind a descriptor (M25 stage 3/4) — see fd.h. */
 struct ofile;
 
@@ -55,6 +56,28 @@ struct ofile;
  * memory (the desktop froze).  16 KiB matches the headroom the boot task's
  * stack has (where the same browser ran fine). */
 #define TASK_KSTACK_SZ 16384
+
+/* §M49 — full scale of `task.demand`: one task that wants an entire CPU.
+ * Expressed as a percentage so a runqueue's summed load reads directly as
+ * "how many cores' worth of work is queued here" (250 = two and a half). */
+#define TASK_DEMAND_MAX 100
+
+/* §M49 — scheduling weight of a nice-0 task.  A weight of 2*BASE means
+ * twice the CPU quanta per round, BASE/2 means half.  Kept at 100 so a
+ * weight reads directly as a percentage of the default share. */
+#define TASK_WEIGHT_BASE 100
+#define TASK_NICE_MIN   (-20)
+#define TASK_NICE_MAX     19
+
+/* Map a nice value to a scheduling weight.  Returns TASK_WEIGHT_BASE for
+ * nice 0. */
+uint32_t task_nice_to_weight(int nice);
+
+/* §M49 — set a task's nice value (clamped to the legal range) and derive
+ * its weight.  Returns 0 on success, -1 if no such task.  Lowering nice
+ * (more CPU) is unprivileged here: d-os has no multi-user model yet
+ * (§M32), so there is nothing to protect it from. */
+int task_set_nice(int pid, int nice);
 
 enum task_state {
     TASK_RUNNABLE,
@@ -200,6 +223,13 @@ struct task {
      * singly-linked list through `wq_next` (a task can be blocked on at
      * most one waitq at a time).  NULL otherwise.  See waitq.h. */
     struct task* wq_next;
+    /* §M49 — WHICH waitq the task is parked on, or NULL.  The `wq_next`
+     * link alone says "somewhere in some queue", which is not enough to
+     * get a task out again: a kill has to lock the owning queue and
+     * unlink the task from it, and there is no way back to that queue
+     * from the task without this pointer.  Set by waitq_block, cleared
+     * by whoever wakes the task. */
+    struct waitq* wq;
     /* M22.3 — cooperative kill (the Linux kthread_stop contract: all
      * tasks are kernel threads today, so forced termination at an
      * arbitrary preemption point is unsafe — the victim might hold a
@@ -219,6 +249,56 @@ struct task {
      * `cpu_ms`.  Feeds `ps` and the GUI task manager. */
     uint64_t cpu_ms;
     uint64_t sched_in_ms;
+    /* §M49 — RUNNABLE-time tracking, the load balancer's demand signal.
+     *
+     * `cpu_ms` above answers "how much CPU did this task GET", which on a
+     * saturated core is a property of the competition, not of the task:
+     * four hogs sharing a CPU each show 25% and look modest.  What the
+     * balancer needs is how much CPU the task WANTS, and that is the time
+     * it spends RUNNABLE — running plus waiting in a runqueue.  A CPU hog
+     * is runnable ~100% of the time no matter how little it is given; a
+     * task that blocks on I/O is runnable a few percent.  Queue length
+     * cannot tell those apart, which is the whole reason this exists:
+     * with queue depths balanced at 4/3/3/3 the actual shares were still
+     * 25% vs 49% for identical tasks, because three of those queue slots
+     * were near-idle tasks.
+     *
+     * `runnable_since` is stamped on runqueue insert, `runnable_acc`
+     * accumulates on removal; the sample pair lets the balancer turn the
+     * total into a percentage over its own window.  `demand` is that
+     * percentage, EWMA-smoothed, 0..TASK_DEMAND_MAX.  It starts at
+     * maximum: an unmeasured task must be assumed to want a full core,
+     * or a burst of fresh tasks would all look free and pile onto one
+     * CPU before any of them had a measurement. */
+    uint64_t runnable_since;        /* ms stamp of the current runqueue stay */
+    uint64_t runnable_acc;          /* total runnable ms in completed stays */
+    uint64_t demand_sample_ms;      /* when `demand` was last recomputed */
+    uint64_t demand_acc_at_sample;  /* total runnable ms at that moment */
+    uint32_t demand;                /* 0..TASK_DEMAND_MAX — smoothed CPU appetite */
+    /* §M49 — deadline for a timed sleep (task_msleep), 0 when not sleeping
+     * on a clock.  The task is TASK_SLEEPING and off every runqueue until
+     * the tick sweep passes this stamp. */
+    uint64_t sleep_until_ms;
+    /* §M49 — scheduling priority.  Until now every task was equal, which
+     * is fine until the machine is busy: eight CPU hogs and the desktop
+     * compositor competed on identical terms, so heavy background work
+     * made the UI stutter with nothing able to say otherwise.
+     *
+     * `nice` is the user-facing knob (-20 strongest .. +19 weakest, 0
+     * default) and `weight` is its scheduling meaning: quanta per round,
+     * relative to TASK_WEIGHT_BASE.  Weight also scales the task's
+     * contribution to runqueue load, so placement packs cheap tasks more
+     * densely than expensive ones.
+     *
+     * `deficit` is the running quantum budget (see schedule_locked) and
+     * `skips_left` starves a below-baseline task of whole turns —
+     * together they cover both halves of the nice range.  At the default
+     * weight both degenerate to exactly the pre-§M49 behaviour: rotate
+     * once per tick, never skip. */
+    int      nice;
+    uint32_t weight;
+    int      deficit;
+    int      skips_left;
     /* M34 — POSIX signals.  `sig_pending` is a bitmask of posted signals;
      * `sig_handler[sig]` is SIG_DFL(0) / SIG_IGN(1) / a ring-3 handler address;
      * `sig_restorer` is the libc trampoline that issues SYS_SIGRETURN after a
@@ -284,6 +364,23 @@ struct task* task_spawn_arg_under(const char* name, void (*entry)(void),
  * The GUI uses it to parent a launched terminal's shell to the desktop
  * session instead of the transient launcher task. */
 struct task* task_spawn_under(const char* name, void (*entry)(void), int ppid);
+
+/* §M49 — spawn with the output console ALREADY bound.  `ppid` >= 0 forces
+ * the parent, < 0 means "the caller".
+ *
+ * Binding the console after the spawn call returns is a race on SMP, and
+ * `preempt_disable()` does not close it: since §M18.6.2 that counter is
+ * PER-CPU, while `task_enqueue` places a new task on the least-loaded
+ * core and IPIs it — so another CPU can be running the task's entry point
+ * before the binding lands, and a shell that finds no console exits
+ * immediately.  It survived because the window is short and the everyday
+ * run was uniprocessor (see §M49); the boot shell died the first time the
+ * scheduler's timing shifted.
+ *
+ * `start_arg` already had exactly this treatment (see spawn_common) — the
+ * console just never got it. */
+struct task* task_spawn_console(const char* name, void (*entry)(void),
+                                int ppid, void* console);
 
 /* Cooperative yield.  No-op if we're the only runnable task.  Returns
  * when this task is scheduled again. */

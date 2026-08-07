@@ -225,7 +225,8 @@ what); a session can pick a theme and push on it.
 | M17 | Portability cut — extract `hal_api.h`           | Architecture     | ✅ DOCS §4.X (partial — see notes) |
 | M18 | SMP support — APIC, AP boot, per-CPU, locking   | Concurrency      | ✅ DOCS §4.X |
 | M19 | Memory at scale — slab, huge pages, near-NUMA   | Memory           | ✅ DOCS §4.8, §4.10 |
-| M18.6 | SMP polish — per-CPU runqueue + load balancer ✅, preempt_count ✅, taskset ✅, cross-CPU IPI ✅, MSI/MSI-X ✅ | Concurrency | §M18.6 |
+| M18.6 | SMP polish — per-CPU runqueue + load balancer ✅, preempt_count ✅, taskset ✅, cross-CPU IPI ✅, MSI/MSI-X ✅ | Concurrency | §M18.6 (balancer completed by §M49) |
+| M49 | Load distribution — periodic balance, demand metric, blocking sleeps/console reads, priority/`nice`, deferred-work pool, `sched`/`wqtest` | Concurrency | ✅ DOCS §4.46 |
 | M19.5 | Memory polish — HIGHMEM ✅ (x86_64), empty-slab caching ✅, SRAT/NUMA ✅ (parser) | Memory | §M19.5 |
 | M20 | x64 (long mode) port (UP)                       | Architecture     | ✅ DOCS §4.X (closed by §M20.5) |
 | M20.5 | x64 SMP + APIC + ring-3 (int 0x80) — Phase A/B/C | Architecture | ✅ §M20.5 |
@@ -1321,6 +1322,33 @@ contends.
 - Periodic load-balance pass (every N ticks on tick handler) steals
   tasks from the heaviest queue to the lightest.  Cheap heuristic:
   count of non-idle RUNNABLE entries per rq.
+
+**Lesson learned (§M49, 2026-08-06).**  This periodic pass was designed
+here and then NOT built — what shipped balanced only when a runqueue ran
+empty, and the source comment described the periodic version anyway,
+naming a `LOAD_BALANCE_INTERVAL_MS` that existed nowhere.  A ✅ row and a
+confident comment are not evidence that a design was implemented.
+
+Worse, nothing could have caught it: `run_qemu.sh` passed no `-smp`, so
+the balancer never ran on the everyday path at all.  **Ship the way to
+measure a subsystem together with the subsystem** — the `sched` command
+took an hour and turned a guess into 15-20% versus 66% on identical
+tasks.
+
+And the "cheap heuristic" above is the part that aged worst: queue length
+scores four hogs and four sleepers identically.  See DOCS §4.46 for the
+demand metric that replaced it, and for why `task_msleep`, `vc_getchar`
+and init's reaper all had to start really sleeping before any metric could
+be trusted — three separate `hlt`+`yield` loops, each with a comment
+asserting it was cheap, together keeping a core busy on an idle machine.
+
+**Second lesson (§M49).**  Making them block shifted the boot timing just
+enough to expose a latent SMP race: four call sites bound a task's console
+AFTER spawning it, guarded by `preempt_disable()` — which §M18.6.2 made
+PER-CPU, while `task_enqueue` deliberately places the new task on another
+core.  Every one of those sites carried a comment explaining why it was
+safe.  A guard whose scope changed under it is worse than no guard,
+because the comment keeps vouching for it.
 
 **Files:** `kernel/core/task.c`, `kernel/includes/percpu.h`.
 

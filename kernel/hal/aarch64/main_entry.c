@@ -30,6 +30,7 @@
 #include "pmm.h"
 #include "kmalloc.h"
 #include "task.h"
+#include "workqueue.h"
 #include "hal_api.h"
 #include "vfs.h"
 #include "procfs.h"
@@ -265,17 +266,26 @@ void aarch64_main_entry(uint64_t dtb) {
          * shell's VC, with no multi-task console-race garble on screen. */
         vc_init();
         task_start_init();                      /* M27 reaper (prints to serial) */
+        /* §M49 — deferred-work pool.  After init, because the workers are
+         * spawned detached (parented to init). */
+        workqueue_init();
         virtio_input_init();                    /* keyboard + mouse (prints to serial) */
         struct vc* root = vc_root();
         if (root) {
-            struct task* sh = task_spawn("shell", shell_provider_active()->entry);
-            if (sh) { task_set_out_console(sh, root); root->task = sh; }
+            /* §M49 — VC bound by the spawn, not after it (SMP race). */
+            struct task* sh = task_spawn_console("shell",
+                                                 shell_provider_active()->entry,
+                                                 -1, root);
+            if (sh) root->task = sh;
             if (!sh) kprintf("aarch64: FATAL — failed to spawn framebuffer shell\n");
         } else {
             kprintf("aarch64: FATAL — no root VC (framebuffer init failed)\n");
         }
     } else {
         task_start_init();                      /* M27 universal reaper */
+        /* §M49 — deferred-work pool.  After init, because the workers are
+         * spawned detached (parented to init). */
+        workqueue_init();
         kprintf("aarch64: no framebuffer — UART serial shell (pid 0 → idle).\n");
         if (!task_spawn("shell", serial_shell_entry))
             kprintf("aarch64: FATAL — failed to spawn serial shell\n");

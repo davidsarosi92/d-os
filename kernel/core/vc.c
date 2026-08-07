@@ -225,6 +225,7 @@ static struct vc* vc_alloc_new(void) {
     v->bg      = VC_BG;
     v->in_head = 0;
     v->in_tail = 0;
+    waitq_init(&v->inq);                /* §M49 — readers park, they don't spin */
     vcs[vc_n++] = v;
     return v;
 }
@@ -382,21 +383,50 @@ void vc_kbd_push(char c) {
     if (next == v->in_tail) return;     /* ring full — drop */
     v->in_buf[v->in_head] = c;
     v->in_head = next;
+    /* §M49 — release whoever is parked in vc_getchar.  The ring write
+     * above stays outside the lock (it is still single-producer /
+     * single-consumer), but the WAKE has to take it: that is what closes
+     * the lost-wakeup window.  A reader tests the ring and parks while
+     * holding this same lock, so this wake cannot slip between its test
+     * and its park — it either happens before the test (reader sees the
+     * byte) or after the park (reader is woken).
+     *
+     * Called from the keyboard IRQ, hence the irqsave form. */
+    uint32_t fl = waitq_lock(&v->inq);
+    waitq_wake_all(&v->inq);
+    waitq_unlock(&v->inq, fl);
 }
 
+/* §M49 — block until a byte arrives, instead of polling for one.
+ *
+ * This was `hlt` + `task_yield` in a loop, which kept the caller RUNNABLE
+ * and queued for as long as it waited: one runqueue slot per idle shell,
+ * a core halted on every turn through the queue, and — after §M49 started
+ * measuring demand as time spent runnable — a shell that measured
+ * identical to a CPU hog.  An otherwise idle d-os sat at 100% of a core.
+ *
+ * The kill contract is preserved deliberately.  `task.h` and the GUI
+ * window teardown both rely on a killed shell dying "at its next
+ * vc_getchar yield", so the wait breaks on `task_should_stop()` and exits
+ * through `task_yield()` — the documented cooperative kill point, which
+ * calls `task_exit()` for us.  The other half of that contract lives in
+ * the scheduler: `task_kill` now wakes a task parked on a waitq
+ * (wake_waitq_sleeper), because a blocked task cannot poll a flag. */
 char vc_getchar(struct vc* v) {
     for (;;) {
+        uint32_t fl = waitq_lock(&v->inq);
+        while (v->in_head == v->in_tail && !task_should_stop())
+            waitq_block(&v->inq);
+
         if (v->in_head != v->in_tail) {
             char c = v->in_buf[v->in_tail];
             v->in_tail = (v->in_tail + 1) & VC_INBUF_MASK;
+            waitq_unlock(&v->inq, fl);
             return c;
         }
-        /* Sleep until the next interrupt arrives (IRQ may have filled
-         * our ring), then offer the CPU to other tasks before re-
-         * checking.  Same atomic enable+halt pair as in
-         * keyboard_getchar — must be back-to-back so an IRQ posted
-         * between the ring check and the halt never gets missed. */
-        hal_cpu_idle();
+        waitq_unlock(&v->inq, fl);
+        /* Woken with an empty ring => a kill is pending.  Never exit
+         * while holding the waitq lock. */
         task_yield();
     }
 }

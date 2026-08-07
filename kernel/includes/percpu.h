@@ -50,6 +50,16 @@ struct percpu {
      * (per-CPU). */
     struct task* rq_head;          /* first task in this CPU's runqueue, NULL = empty */
     int          rq_count;         /* count of non-idle RUNNABLE tasks queued here */
+    /* §M49 — summed `demand` of the tasks queued here, i.e. how much CPU
+     * this runqueue's contents actually WANT (100 = one core's worth).
+     * This, not rq_count, is what the balancer and the spawn-time
+     * placement compare: four hogs and four sleepers are the same
+     * rq_count and nothing like the same load.  Maintained
+     * incrementally under rq_lock on insert/remove, and recomputed from
+     * scratch by the owning CPU at each balance tick (which is also when
+     * the per-task demand figures are refreshed).  Read locklessly by
+     * peers — a stale read costs one suboptimal steal decision. */
+    int          rq_load;
     spinlock_t   rq_lock;          /* protects rq_head + rq_count + member rq_next/rq_prev */
     /* M18.6.1 — per-CPU deferred-reschedule flag.  Set by the local
      * timer IRQ handler and by cross-CPU preempt IPI (vector 0x41
@@ -58,6 +68,23 @@ struct percpu {
      * CPU only.  Pre-M18.6.1 this was a single global, which got
      * raced under SMP. */
     volatile int need_resched;
+    /* --- Scheduler instrumentation (§M49).  Written by this CPU only, at
+     * the context-switch boundary, so no lock and no atomics; read
+     * locklessly by `sched` / /proc/sched, where a torn 64-bit read on a
+     * 32-bit build costs a single wrong sample and nothing else.
+     *
+     * These exist because the load balancer could not be evaluated without
+     * them.  `rq_count` says how many tasks are QUEUED, which is not the
+     * same question as how much work a CPU is DOING (one hog saturates a
+     * CPU with rq_count 1) — and a balancer is only as good as the metric
+     * you judge it by.  `migrations` is the cost side of the ledger: a
+     * balancer that keeps a queue even by shuttling the same task back and
+     * forth every window is worse than no balancer at all, and without a
+     * counter that failure mode is invisible. */
+    uint64_t     last_balance_ms;  /* §M49 — when this CPU last ran a balance pass */
+    uint64_t     busy_ms;          /* ms spent running a NON-idle task */
+    uint64_t     switches;         /* context switches performed here */
+    uint64_t     migrations;       /* tasks pulled onto this CPU by the balancer */
 };
 
 /* Bring up the per-CPU table on the BSP.  Records the BSP's APIC ID

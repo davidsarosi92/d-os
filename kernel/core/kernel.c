@@ -64,6 +64,7 @@
 #include "config.h"
 #include "crash.h"     /* §M47 — unclean-shutdown marker */
 #include "task.h"
+#include "workqueue.h"
 #include "proc.h"                /* proc_exec_elf — x86_64 musl boot self-test */
 #include "pkg.h"                 /* pkg_init — provision ld.so for the x86_64 test hook */
 #include "timer.h"
@@ -418,6 +419,9 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * has a universal reaper: exited kernel threads no longer leak as
      * zombies, and orphans re-parent to init instead of dangling. */
     task_start_init();
+    /* §M49 — deferred-work pool.  After init, because the workers are
+     * spawned detached (parented to init). */
+    workqueue_init();
 
     /* M29 — services + service bus.  Register /proc/services + /proc/bus
      * (queues if procfs isn't up yet), then spawn the supervisor as a child
@@ -594,21 +598,22 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
         vc_init();
         struct vc* root_vc = vc_root();
         if (root_vc) {
-            preempt_disable();
             /* The boot shell is a SESSION ROOT: spawn it detached (parented to
              * init), NOT as a child of this transient boot worker — kernel_main
              * task_exit()s right after setup, and with the "parent dies → its
              * subtree dies" rule a caller-parented shell would be killed the
              * instant boot finished.  Detached, it (and the GUI session it may
-             * later start) outlives the boot task. */
+             * later start) outlives the boot task.
+             *
+             * §M49 — the VC is bound BY the spawn, not after it.  This used to
+             * be a set-after-spawn inside preempt_disable, which does not work
+             * on SMP (that counter is per-CPU while the new task is placed on
+             * the least-loaded core): the shell could reach its entry point on
+             * another CPU, find no console and exit. */
             struct task* shell0 =
-                task_spawn_under("shell", shell_provider_active()->entry,
-                                 task_reaper_pid());
-            if (shell0) {
-                task_set_out_console(shell0, root_vc);
-                root_vc->task = shell0;
-            }
-            preempt_enable();
+                task_spawn_console("shell", shell_provider_active()->entry,
+                                   task_reaper_pid(), root_vc);
+            if (shell0) root_vc->task = shell0;
             if (!shell0) {
                 kprintf("FATAL: failed to spawn shell on root VC\n");
             }

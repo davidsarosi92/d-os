@@ -628,6 +628,7 @@ CORE_C_SRCS := \
     kernel/drivers/net/virtio_net.c \
     kernel/core/net.c \
     kernel/core/futex.c \
+    kernel/core/workqueue.c \
     kernel/core/pkg.c \
     kernel/drivers/audio/ac97.c \
     kernel/core/audio.c \
@@ -664,6 +665,7 @@ CORE_C_SRCS := \
       kernel/core/crash.c \
     kernel/core/pkg.c \
     kernel/core/futex.c \
+    kernel/core/workqueue.c \
     kernel/core/net.c \
     kernel/core/audio.c \
     kernel/core/random.c \
@@ -795,6 +797,7 @@ CORE_C_SRCS := \
     kernel/drivers/audio/ac97.c \
     kernel/core/audio.c \
     kernel/core/futex.c \
+    kernel/core/workqueue.c \
     kernel/core/pkg.c \
     kernel/drivers/usb/xhci.c \
     kernel/drivers/usb/usb_hid.c \

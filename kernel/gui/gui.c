@@ -2221,15 +2221,16 @@ static struct gui_window* term_window_create(const char* title,
         return NULL;
     }
 
-    preempt_disable();
     /* M22.7 — parent the shell as requested: the desktop/session (session
      * shells, so a kill_tree(desktop) takes them with it), init (detached
      * shells, which outlive the session), or the caller (< 0).  Without this
      * a shell launched from the taskbar orphaned to init when its transient
-     * launcher app-host exited. */
-    struct task* t = task_spawn_under(task_name, entry, shell_ppid);
+     * launcher app-host exited.
+     * §M49 — the window's VC is bound by the spawn; setting it afterwards
+     * raced the task's own start on another core (preempt_disable is
+     * per-CPU and does not hold that off). */
+    struct task* t = task_spawn_console(task_name, entry, shell_ppid, win->vc);
     if (t) {
-        task_set_out_console(t, win->vc);
         win->vc->task = t;
         /* M27 — this window owns its shell's reap (the close teardown
          * kills + reaps it and nulls the pointer).  Tell init's universal
@@ -2237,7 +2238,6 @@ static struct gui_window* term_window_create(const char* title,
          * same struct. */
         task_set_reap_owned(t, 1);
     }
-    preempt_enable();
     if (!t) kprintf("gui: task spawn failed for '%s'\n", win->title);
 
     window_show(win);

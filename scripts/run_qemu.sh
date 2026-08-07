@@ -129,6 +129,15 @@ if command -v "$QEMU" >/dev/null 2>&1; then
     #   had plenty), so this is the point where extra RAM starts being usable.
     #   x86_64 has no such ceiling at all.
     EXTRA="-m 1024M -vga none -device VGA,vgamem_mb=32"
+    # MORE THAN ONE CPU.  Until §M49 this script passed no -smp at all, so the
+    # default run was uniprocessor and the per-CPU runqueue + load balancer
+    # (§M18.6.1) NEVER EXECUTED on the path a person actually uses — every test
+    # that ever exercised SMP passed its own -smp, which meant the measured
+    # path and the used path were two different paths.  (Exactly the shape of
+    # the §M48 missing-NIC bug: the browser could not load a page because the
+    # everyday script had no network card, while every network test supplied
+    # one.)  Override with SMP=1 to reproduce a UP-only issue.
+    EXTRA="$EXTRA -smp ${SMP:-4}"
     # A NETWORK CARD.  Its absence is why the browser could not open a single
     # site however well the fetcher worked: there was nothing to fetch over.
     # `user` mode needs no host privileges and gives the guest 10.0.2.15 with a

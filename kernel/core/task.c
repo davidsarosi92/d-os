@@ -36,12 +36,19 @@
  *   pick instead of O(ntasks * ncpus) under the global lock — and the
  *   common case is O(1) when the head matches.
  *
- *   Load balance runs every LOAD_BALANCE_INTERVAL_MS on the local
- *   tick: if this CPU's rq is empty, scan peers for the longest queue
- *   and steal one task whose affinity allows running here.  Then send
- *   a reschedule IPI to ourselves only if the steal woke us up from
- *   idle and we want immediate pickup (the natural next local tick is
- *   usually fine and avoids self-IPI overhead).
+ *   Load balance has TWO triggers (§M49):
+ *     - this CPU's rq ran empty: steal any runnable task from the
+ *       longest peer queue rather than idle;
+ *     - every LOAD_BALANCE_INTERVAL_MS on the local tick: pull from a
+ *       peer that is at least LOAD_BALANCE_MIN_DELTA tasks busier.
+ *   Only the first existed before §M49, and it is a work-stealing rule,
+ *   not a load-distribution one — with every queue non-empty an
+ *   arbitrarily bad split never corrected itself.  See
+ *   load_balance_periodic for the measurement and the constants.
+ *
+ *   (This comment previously described the periodic pass as if it were
+ *   implemented, naming a LOAD_BALANCE_INTERVAL_MS that did not exist
+ *   anywhere in the tree.  It does now.)
  *
  * ---------------------------------------------------------------------
  * Brand-new task wiring (unchanged from M18)
@@ -141,6 +148,67 @@ static void master_insert_locked(struct task* t) {
 /* Per-CPU runqueue plumbing.                                           */
 /* ------------------------------------------------------------------- */
 
+/* §M49 — load-balancer tuning, kept in one block so the policy can be
+ * read without hunting through the code that applies it.  Each constant
+ * is justified where it is used (load_balance_periodic, task_refresh_demand). */
+#define LOAD_BALANCE_INTERVAL_MS 100   /* how often a CPU re-examines the spread */
+#define LOAD_BALANCE_MIN_DELTA    25   /* demand units of imbalance worth a migration */
+#define LOAD_BALANCE_MAX_STEAL     4   /* migrations per pass, bounding IRQ-off time */
+#define LOAD_SAMPLE_MIN_MS        50   /* shortest window that yields a usable demand */
+#define SLEEP_SWEEP_BATCH         16   /* timed sleepers woken per tick sweep */
+
+/* §M49 — nice → weight.  A coarse table rather than a formula: eight
+ * steps across the range are plenty for a kernel whose whole priority
+ * requirement today is "the desktop should outrank a batch job", and a
+ * table makes the ratios inspectable instead of implied.  Each step is
+ * roughly 1.5x, so nice -20 gets about ten times the CPU of nice 0 and
+ * nice +19 about a tenth. */
+uint32_t task_nice_to_weight(int nice) {
+    static const uint32_t tbl[] = {
+        /* nice -20..-15 */ 1000, 1000, 1000, 700, 700, 700,
+        /* nice -14.. -9 */  500,  500,  500, 350, 350, 350,
+        /* nice  -8.. -3 */  250,  250,  250, 175, 175, 175,
+        /* nice  -2..  0 */  150,  120, TASK_WEIGHT_BASE,
+        /* nice   1..  6 */   80,   65,   55,  45,  36,  30,
+        /* nice   7.. 12 */   25,   20,   17,  14,  12,  10,
+        /* nice  13.. 19 */    9,    8,    7,   6,   5,   4, 3,
+    };
+    if (nice < TASK_NICE_MIN) nice = TASK_NICE_MIN;
+    if (nice > TASK_NICE_MAX) nice = TASK_NICE_MAX;
+    return tbl[nice - TASK_NICE_MIN];
+}
+
+/* §M49 — timed-sleep bookkeeping (see task_msleep / sleep_sweep).  The
+ * counter exists purely so the per-tick sweep can return immediately when
+ * nothing is sleeping on a clock. */
+static volatile int g_timed_sleepers = 0;
+static uint64_t     g_sleep_sweep_ms = 0;
+
+/* Weighted load contribution of one task — defined with the demand code
+ * below, but needed by the runqueue insert/remove helpers above it. */
+static int task_load_contrib(const struct task* t);
+static void task_refresh_demand(struct task* t, uint64_t now);
+
+/* §M49 — scheduler-visible defaults for a freshly built task.
+ *
+ * This exists because FOUR places construct a `struct task` and only one
+ * of them is `spawn_common`: pid 0, the BSP idle task and each AP's idle
+ * task are all synthesised by hand.  Initialising the new weight fields
+ * in spawn_common alone left the other three at kcalloc's zero, and a
+ * weight of zero is a DIVIDE BY ZERO in the round-robin replenish — the
+ * kernel took a #DE before the scheduler had run once.  One initialiser
+ * that every construction site calls is the fix; the alternative is
+ * remembering four places forever, and the next field would break it
+ * again the same way. */
+static void task_sched_defaults(struct task* t) {
+    t->nice       = 0;
+    t->weight     = TASK_WEIGHT_BASE;
+    t->deficit    = (int)TASK_WEIGHT_BASE;
+    t->skips_left = 0;
+    t->demand           = TASK_DEMAND_MAX;
+    t->demand_sample_ms = timer_ticks_ms();
+}
+
 /* Insert at tail of rq.  Caller holds rq->rq_lock; task->cpu_home is
  * the caller-set destination CPU index.  Idempotent: re-enqueueing
  * an already-on-this-rq task is a no-op (defensive — shouldn't
@@ -160,6 +228,11 @@ static void rq_insert_tail_locked(struct percpu* rq, struct task* t) {
         head->rq_prev  = t;
     }
     rq->rq_count++;
+    /* §M49 — the task starts accruing runnable time here (running or
+     * merely waiting: both are "wants CPU"), and its demand joins this
+     * queue's load. */
+    t->runnable_since = timer_ticks_ms();
+    rq->rq_load += task_load_contrib(t);
 }
 
 /* Remove a task from its current rq.  Caller holds the OWNING rq's
@@ -180,10 +253,90 @@ static void rq_remove_locked(struct percpu* rq, struct task* t) {
     t->rq_next = NULL;
     t->rq_prev = NULL;
     if (rq->rq_count > 0) rq->rq_count--;
+    /* §M49 — close the runnable-time stay and withdraw the demand we
+     * contributed.  Subtracting the SAME value we added is what keeps
+     * rq_load consistent: `demand` only ever changes in the refresh
+     * pass, which runs under this same lock while the task is queued. */
+    {
+        uint64_t now = timer_ticks_ms();
+        if (now > t->runnable_since) t->runnable_acc += now - t->runnable_since;
+        t->runnable_since = now;
+    }
+    rq->rq_load -= task_load_contrib(t);
+    if (rq->rq_load < 0) rq->rq_load = 0;
+    /* §M49 — take a demand sample on the way OUT too.  The periodic
+     * refresh only walks tasks that are currently queued, so a task that
+     * blocks quickly and often — every interactive task, now that the
+     * console read really blocks — would never be re-measured and would
+     * keep whatever demand it last had (for a fresh task, the maximum).
+     * Sampling here is what lets an interactive task's demand actually
+     * fall.  Ordering matters: the load above was withdrawn using the OLD
+     * demand, which is the value that was added on insert. */
+    task_refresh_demand(t, timer_ticks_ms());
+}
+
+/* §M49 — recompute one task's `demand` from the runnable time it has
+ * accrued since its last sample.  Caller holds the owning rq_lock.
+ *
+ * The EWMA (three parts history, one part new sample) is deliberately
+ * sluggish: at a 100 ms balance interval it settles in roughly half a
+ * second, which is fast enough to follow a task changing behaviour and
+ * slow enough that one unlucky window cannot trigger a migration. */
+static void task_refresh_demand(struct task* t, uint64_t now) {
+    uint64_t total = t->runnable_acc;
+    if (t->rq_next || t->rq_prev)                 /* currently queued */
+        if (now > t->runnable_since) total += now - t->runnable_since;
+
+    uint64_t dt = now - t->demand_sample_ms;
+    if (dt < LOAD_SAMPLE_MIN_MS) return;          /* too short to mean anything */
+
+    uint64_t used = (total > t->demand_acc_at_sample)
+                  ? total - t->demand_acc_at_sample : 0;
+    uint32_t pct = (uint32_t)((used * TASK_DEMAND_MAX) / dt);
+    if (pct > TASK_DEMAND_MAX) pct = TASK_DEMAND_MAX;
+
+    t->demand              = (t->demand * 3 + pct) / 4;
+    t->demand_sample_ms    = now;
+    t->demand_acc_at_sample = total;
+}
+
+/* §M49 — a task's contribution to its runqueue's load: demand scaled by
+ * weight.  A nice-19 hog wants a full CPU just as much as a nice-0 hog
+ * does, but it will not get one, so counting them equally would keep a
+ * core reserved for work the scheduler has already decided to starve.
+ * Placement and balancing should pack cheap tasks densely. */
+static int task_load_contrib(const struct task* t) {
+    uint64_t c = (uint64_t)t->demand * t->weight / TASK_WEIGHT_BASE;
+    return (int)c;
+}
+
+/* §M49 — refresh every demand figure on THIS CPU's runqueue and republish
+ * the summed load.  Own lock only: each CPU maintains its own number and
+ * peers read it locklessly, so balancing never needs two rq_locks. */
+static void rq_refresh_local_load(struct percpu* me) {
+    uint64_t now = timer_ticks_ms();
+    uint32_t fl  = spin_lock_irqsave(&me->rq_lock);
+    int sum = 0;
+    struct task* head = me->rq_head;
+    if (head) {
+        struct task* t = head;
+        do {
+            task_refresh_demand(t, now);
+            sum += task_load_contrib(t);
+            t = t->rq_next;
+        } while (t != head);
+    }
+    me->rq_load = sum;
+    spin_unlock_irqrestore(&me->rq_lock, fl);
 }
 
 /* Pick the lightest-loaded online CPU among those allowed by `mask`.
- * Tiebreak: prefer this_cpu_id so newly spawned tasks land here. */
+ * Tiebreak: prefer this_cpu_id so newly spawned tasks land here.
+ *
+ * §M49 — "lightest" is summed demand, not queue length.  Placing a new
+ * CPU-bound task on a core that holds three sleepers is not the same
+ * decision as placing it on a core that holds three hogs, and rq_count
+ * scores those identically. */
 static int pick_lightest_cpu(uint32_t mask) {
     int self = this_cpu_id();
     int best = -1;
@@ -193,7 +346,7 @@ static int pick_lightest_cpu(uint32_t mask) {
         if ((mask & (1u << i)) == 0) continue;
         struct percpu* p = percpu_at(i);
         if (!p || !p->online) continue;
-        int load = p->rq_count;
+        int load = p->rq_load;
         if (load < best_load || (load == best_load && i == self)) {
             best = i;
             best_load = load;
@@ -255,6 +408,7 @@ void task_init(void) {
     t0->cpu_mask    = 0xFFFFFFFFu;
     t0->cpu_home    = 0;                /* BSP */
     t0->rq_next = t0->rq_prev = NULL;
+    task_sched_defaults(t0);
     hal_fpu_init_state(t0->fpu_state);  /* valid image before the first restore */
 
     /* Insert into master list. */
@@ -293,6 +447,7 @@ void task_init(void) {
         bsp_idle->cpu_mask    = 1u << 0;        /* pinned to BSP */
         bsp_idle->cpu_home    = 0;
         bsp_idle->rq_next = bsp_idle->rq_prev = NULL;
+        task_sched_defaults(bsp_idle);
         hal_fpu_init_state(bsp_idle->fpu_state);
 
         uint32_t fl2 = spin_lock_irqsave(&master_lock);
@@ -331,6 +486,7 @@ void task_install_ap_idle(void) {
     idle->cpu_mask    = 1u << cpu;  /* pinned to this AP */
     idle->cpu_home    = cpu;
     idle->rq_next = idle->rq_prev = NULL;
+    task_sched_defaults(idle);
     hal_fpu_init_state(idle->fpu_state);
 
     uint32_t fl = spin_lock_irqsave(&master_lock);
@@ -379,13 +535,18 @@ static void task_notify_change(void) {
  * (so it is visible even if another CPU picks the task up immediately),
  * readable by the entry via task_start_arg(). */
 static struct task* spawn_common(const char* name, void (*entry)(void),
-                                 int ppid_override, void* arg) {
+                                 int ppid_override, void* arg, void* console) {
     struct task* t = (struct task*)kcalloc(1, sizeof(struct task));
     if (!t) return NULL;
 
     void* stack = kmalloc(TASK_KSTACK_SZ);
     if (!stack) { kfree(t); return NULL; }
     t->start_arg = arg;
+    /* §M49 — bind the console HERE, before the task can be enqueued.
+     * Doing it from the caller after spawn returns is an SMP race:
+     * the task may already be running on another core.  Same reason
+     * start_arg is set here. */
+    t->out_console = console;
 
     str_copy_n(t->name, name, sizeof t->name);
     t->pid         = next_pid++;
@@ -409,6 +570,12 @@ static struct task* spawn_common(const char* name, void (*entry)(void),
     t->cpu_mask    = 0xFFFFFFFFu;
     t->cpu_home    = -1;
     t->rq_next = t->rq_prev = NULL;
+    /* §M49 — nice 0 and "assumed to want a whole CPU" until measured.
+     * Starting demand at zero would be worse than having no metric: a
+     * burst of fresh tasks would each look free and pick_lightest_cpu
+     * would stack the lot onto one core before the first measurement
+     * window closed.  Guessing high is self-correcting. */
+    task_sched_defaults(t);
     /* A fresh, VALID FPU/SIMD image.  kcalloc's zeroing is not enough — an
      * all-zero x86 FXSAVE image restores MXCSR = 0, i.e. every SIMD exception
      * unmasked, and the task would take #XF on its first FP instruction. */
@@ -426,14 +593,14 @@ static struct task* spawn_common(const char* name, void (*entry)(void),
 }
 
 struct task* task_spawn(const char* name, void (*entry)(void)) {
-    return spawn_common(name, entry, -1, NULL);  /* parent = caller */
+    return spawn_common(name, entry, -1, NULL, NULL);  /* parent = caller */
 }
 
 /* M22.7 — spawn with a start argument (read via task_start_arg in the
  * entry).  Parent = caller.  Used by the GUI to hand each app-host task
  * the app it should run. */
 struct task* task_spawn_arg(const char* name, void (*entry)(void), void* arg) {
-    return spawn_common(name, entry, -1, arg);
+    return spawn_common(name, entry, -1, arg, NULL);
 }
 
 /* Like task_spawn_arg, but with an EXPLICIT parent pid (>= 0), or the caller
@@ -442,7 +609,7 @@ struct task* task_spawn_arg(const char* name, void (*entry)(void), void* arg) {
  * exits immediately → M27 would otherwise re-parent the package to init). */
 struct task* task_spawn_arg_under(const char* name, void (*entry)(void),
                                   void* arg, int ppid) {
-    return spawn_common(name, entry, ppid, arg);
+    return spawn_common(name, entry, ppid, arg, NULL);
 }
 
 void* task_start_arg(void) {
@@ -456,14 +623,21 @@ void* task_start_arg(void) {
  * Before init exists (g_init_pid == 0) it falls back to pid 0 (kernel),
  * which is also a permanent root — still detached from the caller. */
 struct task* task_spawn_detached(const char* name, void (*entry)(void)) {
-    return spawn_common(name, entry, g_init_pid, NULL);
+    return spawn_common(name, entry, g_init_pid, NULL, NULL);
 }
 
 /* M22.7 — spawn with an EXPLICIT parent pid (>= 0), or the caller when
  * ppid < 0.  Lets the GUI parent a launched terminal's shell to the desktop
  * (session) rather than to the transient launcher task that created it. */
 struct task* task_spawn_under(const char* name, void (*entry)(void), int ppid) {
-    return spawn_common(name, entry, ppid, NULL);
+    return spawn_common(name, entry, ppid, NULL, NULL);
+}
+
+/* §M49 — see task.h: the console must be bound before the task can be
+ * picked up by any CPU, so it goes through spawn_common like start_arg. */
+struct task* task_spawn_console(const char* name, void (*entry)(void),
+                                int ppid, void* console) {
+    return spawn_common(name, entry, ppid, NULL, console);
 }
 
 /* ------------------------------------------------------------------- */
@@ -492,16 +666,31 @@ static struct task* pick_next_local_locked(struct percpu* rq) {
     int self = this_cpu_id();
     struct task* head = rq->rq_head;
     if (!head) return NULL;
-    struct task* t = head;
-    do {
-        if (t->state == TASK_RUNNABLE &&
-            !t->is_idle &&
-            (t->cpu_mask & (1u << self)) &&
-            !task_running_elsewhere(t)) {
-            return t;
-        }
-        t = t->rq_next;
-    } while (t != head);
+
+    /* §M49 — two passes.  The first honours `skips_left`, which is how a
+     * below-baseline nice value gives up whole turns (a task at weight 50
+     * sits out every other round).  If that pass finds nothing — every
+     * eligible task owes a skip — the second pass ignores skips entirely,
+     * so a runqueue of nothing but niced-down tasks still runs rather
+     * than falling through to idle.  At the default weight no task ever
+     * carries a skip and the first pass always wins on its first
+     * iteration, exactly as before. */
+    for (int pass = 0; pass < 2; pass++) {
+        struct task* t = head;
+        do {
+            if (t->state == TASK_RUNNABLE &&
+                !t->is_idle &&
+                (t->cpu_mask & (1u << self)) &&
+                !task_running_elsewhere(t)) {
+                if (pass == 0 && t->skips_left > 0) {
+                    t->skips_left--;            /* passed over, pays a turn */
+                } else {
+                    return t;
+                }
+            }
+            t = t->rq_next;
+        } while (t != head);
+    }
     return NULL;
 }
 
@@ -548,13 +737,32 @@ static void rq_rotate_to_tail_locked(struct percpu* rq, struct task* t) {
  *   - is RUNNABLE non-idle
  *   - isn't `current` on the victim CPU
  *   - has us in its affinity mask
- * Returns the task with rq_lock dropped (caller re-acquires if
- * needed).  Caller does NOT hold any lock entering. */
-static struct task* load_steal_one(struct percpu* victim) {
+ *   - has demand <= `max_demand`
+ * and, among those, whose demand is CLOSEST to `want_demand`.
+ *
+ * §M49 — WHICH task moves matters as much as whether one does.  Moving a
+ * sleeper off an overloaded CPU changes the queue length and none of the
+ * load, so the imbalance survives a migration that looked like progress.
+ * The caller therefore asks for a specific size:
+ *
+ *   - the periodic balancer wants half the imbalance, because a move
+ *     shifts the difference by twice the task's demand — take exactly
+ *     half and the two CPUs end up level.  It also caps demand below the
+ *     full imbalance, so a move can never overshoot into a mirror-image
+ *     imbalance and start a ping-pong.
+ *   - the idle path passes want=max=TASK_DEMAND_MAX, i.e. "the heaviest
+ *     thing you have": we have nothing to run, so overshoot is
+ *     impossible and the biggest task is the most useful to take.
+ *
+ * Returns the task already removed from the victim's queue and re-homed
+ * to us.  Caller does NOT hold any lock entering. */
+static struct task* load_steal_one(struct percpu* victim,
+                                   uint32_t want_demand, uint32_t max_demand) {
     int self = this_cpu_id();
     uint32_t fl = spin_lock_irqsave(&victim->rq_lock);
     struct task* head = victim->rq_head;
     struct task* found = NULL;
+    uint32_t best_dist = 0xFFFFFFFFu;
     if (head) {
         struct task* t = head;
         do {
@@ -562,8 +770,13 @@ static struct task* load_steal_one(struct percpu* victim) {
                 !t->is_idle &&
                 t != victim->current &&
                 (t->cpu_mask & (1u << self))) {
-                found = t;
-                break;
+                /* Compare in the SAME units the imbalance is expressed
+                 * in — weighted contribution, not raw demand. */
+                uint32_t c = (uint32_t)task_load_contrib(t);
+                if (c > max_demand) { t = t->rq_next; continue; }
+                uint32_t dist = (c > want_demand)
+                              ? c - want_demand : want_demand - c;
+                if (dist < best_dist) { best_dist = dist; found = t; }
             }
             t = t->rq_next;
         } while (t != head);
@@ -576,35 +789,121 @@ static struct task* load_steal_one(struct percpu* victim) {
     return found;
 }
 
-/* Try to steal one task onto this_cpu's rq.  Returns 1 if we got
- * one, 0 otherwise.  Caller must NOT hold this CPU's rq_lock. */
-static int load_balance_pull(void) {
+/* Try to steal one task onto this_cpu's rq.  Returns 1 if we got one,
+ * 0 otherwise.  Caller must NOT hold this CPU's rq_lock.
+ *
+ * `min_delta` is how much busier the victim must be than us before a
+ * steal is worth it.  The idle caller passes 1 (our queue is empty, so
+ * anything at all beats idling).  The periodic caller passes 2 — see
+ * load_balance_periodic for why 1 would oscillate. */
+static int load_balance_pull(int min_delta) {
     int self = this_cpu_id();
     int n = smp_ncpus();
-    /* Find the busiest peer (snapshot read of rq_count without the
-     * lock — races are fine: worst case we pick a slightly-less-busy
-     * CPU, which still beats spinning idle). */
+    struct percpu* mine = this_cpu();
+    if (!mine) return 0;
+    /* Two different questions, so two different metrics.
+     *
+     * An EMPTY queue is asking "is there any work at all?", and there the
+     * right measure is the plain task count.  Scoring by demand would be
+     * a regression: a runnable task that has been blocking a lot carries
+     * demand near zero, so a demand-only rule would leave real work
+     * queued on a peer while this CPU sat in the idle loop.  Nothing can
+     * overshoot when we hold nothing, so take the heaviest available.
+     *
+     * A NON-EMPTY queue is asking "is the work spread fairly?", and there
+     * only demand answers it — that is the entire §M49 finding.
+     * `min_delta` applies to this case alone. */
+    int idle_pull = (mine->rq_count == 0);
+    int my_load   = idle_pull ? 0 : mine->rq_load;
+
     int best = -1;
     int best_load = 0;
     for (int i = 0; i < n; i++) {
         if (i == self) continue;
         struct percpu* p = percpu_at(i);
         if (!p || !p->online) continue;
-        if (p->rq_count > best_load) {
+        int load = idle_pull ? p->rq_count : p->rq_load;
+        if (load > best_load) {
             best = i;
-            best_load = p->rq_count;
+            best_load = load;
         }
     }
     if (best < 0 || best_load <= 0) return 0;
 
-    struct task* stolen = load_steal_one(percpu_at(best));
+    uint32_t want, cap;
+    if (idle_pull) {
+        /* No ceiling: a weighted contribution can far exceed
+         * TASK_DEMAND_MAX (a nice -20 task counts ten times a nice-0
+         * one), and capping at 100 here would make exactly the most
+         * important tasks unstealable by an idle CPU. */
+        want = cap = 0x7FFFFFFFu;
+    } else {
+        int delta = best_load - my_load;
+        if (delta < min_delta) return 0;
+        want = (uint32_t)(delta / 2);
+        cap  = (uint32_t)(delta - 1);
+    }
+    struct task* stolen = load_steal_one(percpu_at(best), want, cap);
     if (!stolen) return 0;
 
-    struct percpu* mine = this_cpu();
     uint32_t fl = spin_lock_irqsave(&mine->rq_lock);
     rq_insert_tail_locked(mine, stolen);
     spin_unlock_irqrestore(&mine->rq_lock, fl);
+    mine->migrations++;
     return 1;
+}
+
+/* ---------------------------------------------------------------------
+ * Periodic load balance (§M49).
+ *
+ * Until §M49 the ONLY balancing trigger was "this CPU's runqueue ran
+ * empty".  That is a work-stealing rule, not a load-distribution rule,
+ * and the difference is measurable: pin five CPU hogs onto CPU0 while
+ * CPU1..3 keep one each, and nothing ever moves — no queue is empty, so
+ * no steal is attempted.  Measured on a 4-CPU i386 guest, the five tasks
+ * on CPU0 got 15-20% of a core each while the singletons got 66%, a 3.3x
+ * unfairness between identical tasks that persisted indefinitely.
+ *
+ * Note what does NOT reveal this: every CPU was 100% busy the whole
+ * time.  Aggregate utilisation is blind to it, which is why `sched`
+ * reports queue depth and per-task share as well.
+ *
+ * So: every LOAD_BALANCE_INTERVAL_MS each CPU also checks whether some
+ * peer is meaningfully busier than it is, and pulls if so.
+ *
+ * Two constants carry the design:
+ *
+ *   MIN_DELTA = 2.  A move takes one task off the victim and puts it on
+ *   us, so it swings the difference by TWO.  With a threshold of 1, a
+ *   3-vs-2 split would move a task to make it 2-vs-3, and the next
+ *   window would move it straight back — a permanent ping-pong that
+ *   costs cache locality and buys nothing.  At 2 the post-move state is
+ *   never worse than the pre-move state.
+ *
+ *   MAX_STEAL = 4.  Each pull re-reads the queue depths and re-checks
+ *   the threshold, so a large imbalance is corrected within a single
+ *   pass (5-vs-1 becomes 4-vs-2 becomes 3-vs-3, then stops on the
+ *   threshold) instead of trickling one task per 100 ms window.  The cap
+ *   just bounds the worst-case time spent here with interrupts off.
+ *
+ * Concurrency: two CPUs may pull from the same victim at once.  Each
+ * takes the victim's rq_lock so the queue itself is safe, and the
+ * threshold is re-evaluated on every pull, so the worst case is one
+ * extra migration — not a runaway.
+ * --------------------------------------------------------------------- */
+
+/* Called from schedule_check (timer-IRQ exit), holding NO rq_lock. */
+static void load_balance_tick(struct percpu* me) {
+    if (smp_ncpus() < 2) return;                 /* nothing to balance against */
+    uint64_t now = timer_ticks_ms();
+    if (now - me->last_balance_ms < LOAD_BALANCE_INTERVAL_MS) return;
+    me->last_balance_ms = now;
+    /* Republish our own load first — peers read this number locklessly to
+     * decide whether we are worth stealing from, so a CPU that never
+     * refreshed would advertise a permanently stale figure. */
+    rq_refresh_local_load(me);
+    for (int i = 0; i < LOAD_BALANCE_MAX_STEAL; i++)
+        if (!load_balance_pull(LOAD_BALANCE_MIN_DELTA)) break;
 }
 
 /* schedule_locked — pick + context_switch.  NEVER releases the lock:
@@ -636,8 +935,34 @@ static void schedule_locked(struct percpu* me) {
     struct task* prev = me->current;
     if (!prev) return;
 
+    /* §M49 — weighted round robin.  `deficit` is a quantum budget spent
+     * by the tick handler (schedule_check) while this task is current;
+     * only when it runs out does the task go to the back of the queue and
+     * get a fresh budget of `weight`.  So weight 300 runs three quanta per
+     * round and weight 100 runs one — identical to the unweighted
+     * behaviour, which is why the default costs nothing.
+     *
+     * Weights BELOW the base cannot buy fewer than one quantum, so they
+     * buy fewer TURNS instead: the replenish converts the leftover debt
+     * into `skips_left`, which pick_next_local_locked honours.
+     *
+     * A task that yields voluntarily has its deficit zeroed by
+     * task_yield, so cooperative yielding still hands the CPU over
+     * immediately rather than being ignored until the quantum expires. */
     if (prev->state == TASK_RUNNABLE && !prev->is_idle &&
-        prev->cpu_home == this_cpu_id()) {
+        prev->cpu_home == this_cpu_id() &&
+        prev->deficit <= 0) {
+        int debt = -prev->deficit;              /* how far past the budget */
+        /* Never trust the weight to be non-zero here.  A zero weight is a
+         * #DE, and this runs in the scheduler on every tick — the one
+         * place a kernel cannot afford to fault.  See task_sched_defaults
+         * for how a zero got here in the first place. */
+        uint32_t w = prev->weight ? prev->weight : TASK_WEIGHT_BASE;
+        prev->deficit = (int)w;
+        prev->skips_left = (w < TASK_WEIGHT_BASE)
+                         ? (int)((TASK_WEIGHT_BASE + debt) / w) - 1
+                         : 0;
+        if (prev->skips_left < 0) prev->skips_left = 0;
         rq_rotate_to_tail_locked(me, prev);
     }
 
@@ -648,7 +973,7 @@ static void schedule_locked(struct percpu* me) {
          * load-balance steal — can't hold rq_lock while taking
          * another CPU's lock (would risk deadlock). */
         spin_unlock(&me->rq_lock);
-        int stole = load_balance_pull();
+        int stole = load_balance_pull(1);   /* we're empty: take anything */
         spin_lock(&me->rq_lock);
         if (stole) next = pick_next_local_locked(me);
     }
@@ -666,9 +991,16 @@ static void schedule_locked(struct percpu* me) {
     /* M22.3 — CPU-time accounting at the switch boundary.  Cheap: one
      * timer read + two u64 ops per context switch. */
     {
-        uint64_t now = timer_ticks_ms();
-        prev->cpu_ms += now - prev->sched_in_ms;
+        uint64_t now   = timer_ticks_ms();
+        uint64_t slice = now - prev->sched_in_ms;
+        prev->cpu_ms += slice;
         next->sched_in_ms = now;
+        /* §M49 — per-CPU busy time.  Everything that is not the idle task
+         * counts as work, which is what makes "is this core actually loaded"
+         * answerable at all; rq_count alone cannot tell a saturated CPU from
+         * an idle one. */
+        if (!prev->is_idle) me->busy_ms += slice;
+        me->switches++;
     }
 
     me->current = next;
@@ -731,6 +1063,11 @@ void task_yield(void) {
     if (self) {                              /* §M46 — voluntary yield: not a runaway */
         self->last_yield_ms   = timer_ticks_ms();
         self->cpu_ms_at_yield = self->cpu_ms;
+        /* §M49 — giving up the CPU on purpose forfeits the rest of the
+         * quantum budget, so the rotate in schedule_locked actually
+         * happens.  Without this a high-weight task's voluntary yield
+         * would be silently ignored until its quanta ran out. */
+        self->deficit = 0;
     }
     schedule();
 }
@@ -740,13 +1077,161 @@ int task_should_stop(void) {
     return self ? self->kill_pending : 0;
 }
 
+/* §M49 — a REAL timed sleep: the caller leaves every runqueue until its
+ * deadline, and the tick sweep puts it back.
+ *
+ * The previous implementation was a spin-yield loop — hlt, yield, re-read
+ * the clock — which left the task RUNNABLE and queued for the whole
+ * "sleep".  That cost twice over.  It burned a scheduling slot on every
+ * round through the queue, and the `hlt` HALTED THE CPU while other
+ * runnable tasks sat on that same runqueue waiting: a sleeping cron job
+ * could idle a core that had work queued behind it.
+ *
+ * It also made the §M49 load metric meaningless, which is how it was
+ * found.  Demand is measured as time spent runnable, so a task that
+ * never leaves the queue measures as wanting a full CPU.  Every service
+ * task in the system — cron, watchdog, heartbeat — reported demand 100,
+ * identical to a genuine CPU hog, and the balancer had no signal to work
+ * with.  A metric is only as honest as the state it observes.
+ *
+ * Early boot (no `current` yet, or the idle task itself) keeps the old
+ * busy-wait: there is nothing to switch to and nothing to sweep us. */
 void task_msleep(uint32_t ms) {
     uint64_t end = timer_ticks_ms() + (uint64_t)ms;
-    while (timer_ticks_ms() < end) {
-        if (task_should_stop()) return;     /* let a kill land promptly */
-        hal_cpu_idle();                     /* hlt until the next IRQ (low power) */
-        task_yield();
+    struct task* self = task_current();
+    if (!self || self->is_idle) {
+        while (timer_ticks_ms() < end) hal_cpu_idle();
+        return;
     }
+
+    while (timer_ticks_ms() < end) {
+        if (task_should_stop()) return;          /* let a kill land promptly */
+
+        uint32_t fl = hal_intr_save();
+        /* Re-check under IRQs off: the sweep runs from the timer IRQ, so
+         * without this a tick landing here could pass our deadline after
+         * we tested it and before we parked — and nothing would wake us. */
+        if (timer_ticks_ms() >= end) { hal_intr_restore(fl); return; }
+
+        self->sleep_until_ms  = end;
+        self->state           = TASK_SLEEPING;
+        self->last_yield_ms   = timer_ticks_ms();  /* §M46 — blocking = responsive */
+        self->cpu_ms_at_yield = self->cpu_ms;
+        g_timed_sleepers++;
+
+        struct percpu* me = this_cpu();
+        spin_lock(&me->rq_lock);
+        if (self->cpu_home == this_cpu_id()) rq_remove_locked(me, self);
+        spin_unlock(&me->rq_lock);
+
+        hal_intr_restore(fl);
+        schedule();                              /* off-queue until swept */
+    }
+    self->sleep_until_ms = 0;
+}
+
+/* §M49 — wake every timed sleeper whose deadline has passed.  Runs from
+ * the timer-IRQ exit path on whichever CPU ticks first in a given
+ * millisecond.
+ *
+ * The counter fast-path matters: with no timed sleepers this is a single
+ * load and return, so the common case costs nothing.  Waking is done
+ * AFTER dropping master_lock — task_enqueue takes an rq_lock, and taking
+ * an rq_lock underneath master_lock would introduce a second lock order
+ * into a kernel that otherwise only ever nests the other way. */
+static void sleep_sweep(void) {
+    if (g_timed_sleepers <= 0) return;
+    uint64_t now = timer_ticks_ms();
+    if (now == g_sleep_sweep_ms) return;         /* at most one sweep per ms */
+    g_sleep_sweep_ms = now;
+
+    struct task* wake[SLEEP_SWEEP_BATCH];
+    int n = 0;
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    struct task* t = master_head;
+    if (t) {
+        do {
+            if (t->state == TASK_SLEEPING && t->sleep_until_ms &&
+                t->sleep_until_ms <= now) {
+                t->sleep_until_ms = 0;
+                if (g_timed_sleepers > 0) g_timed_sleepers--;
+                wake[n++] = t;
+                if (n == SLEEP_SWEEP_BATCH) break;   /* rest wait one more tick */
+            }
+            t = t->next;
+        } while (t != master_head);
+    }
+    spin_unlock_irqrestore(&master_lock, fl);
+
+    for (int i = 0; i < n; i++) {
+        if (wake[i]->state != TASK_SLEEPING) continue;   /* someone beat us to it */
+        wake[i]->state = TASK_RUNNABLE;
+        task_enqueue(wake[i]);
+    }
+}
+
+/* §M49 — drag a timed sleeper back onto a runqueue ahead of its deadline.
+ *
+ * Needed because task_msleep now really blocks.  While it was a spin-yield
+ * loop, a kill landed within a tick: the sleeper was RUNNABLE the whole
+ * time and re-tested task_should_stop() on every pass.  A blocked task
+ * tests nothing, so without this a `kill` on a service sleeping one second
+ * would sit unacknowledged for up to that second — and the GUI window
+ * teardown and the §M46 kill-tree both wait on tasks reaching a kill
+ * point.  Cheap to do right: a timed sleeper is on no waitq, so there is
+ * no queue to unlink it from — only its deadline to cancel.
+ *
+ * Callers hold no rq_lock. */
+static void wake_timed_sleeper(struct task* t) {
+    if (!t || t->state != TASK_SLEEPING || !t->sleep_until_ms) return;
+    t->sleep_until_ms = 0;
+    if (g_timed_sleepers > 0) g_timed_sleepers--;
+    t->state = TASK_RUNNABLE;
+    task_enqueue(t);
+}
+
+/* §M49 — drag a task parked on a WAITQ back onto a runqueue.
+ *
+ * The counterpart of wake_timed_sleeper for the other way a task can be
+ * asleep.  Needed once blocking spread from `task_msleep` to the console
+ * read: a shell parked in `vc_getchar` waiting for a keystroke has to be
+ * killable without one arriving, because both the GUI window teardown and
+ * §M46's kill-tree wait for tasks to reach a kill point.
+ *
+ * This is a SPURIOUS wake by design — the condition the task blocked on
+ * is still false.  That is safe precisely because waitq's contract makes
+ * callers loop on their condition (see waitq.h); the woken task re-tests,
+ * finds nothing, and its loop is expected to check `task_should_stop()`
+ * before parking again.
+ *
+ * Lock order is wq->lock then rq_lock (via task_enqueue), matching
+ * waitq_block — the only other place that holds both. */
+static void wake_waitq_sleeper(struct task* t) {
+    if (!t) return;
+    struct waitq* wq = t->wq;
+    if (!wq) return;
+
+    uint32_t fl = spin_lock_irqsave(&wq->lock);
+    /* Unlink from the singly-linked parked list.  It may already be gone
+     * — a real waker could have raced us between the read of t->wq and
+     * this lock — in which case there is nothing left to do. */
+    struct task** pp = &wq->head;
+    while (*pp) {
+        if (*pp == t) { *pp = t->wq_next; t->wq_next = NULL; break; }
+        pp = &(*pp)->wq_next;
+    }
+    t->wq = NULL;
+    int woke = (t->state == TASK_SLEEPING);
+    if (woke) t->state = TASK_RUNNABLE;
+    spin_unlock_irqrestore(&wq->lock, fl);
+
+    if (woke) task_enqueue(t);
+}
+
+/* Both flavours of sleep, for a caller that just wants the task awake. */
+static void wake_blocked_task(struct task* t) {
+    wake_timed_sleeper(t);
+    wake_waitq_sleeper(t);
 }
 
 int task_kill(int pid) {
@@ -754,6 +1239,7 @@ int task_kill(int pid) {
     struct task* t = task_find(pid);
     if (!t || t->is_idle || t->state == TASK_DEAD) return -1;
     t->kill_pending = 1;
+    wake_blocked_task(t);                    /* so it notices now, not at its deadline */
     task_notify_change();                    /* M22.4 — liveness will change */
     return 0;
 }
@@ -778,6 +1264,7 @@ int task_force_kill(int pid) {
     if (!t || t->is_idle || t->state == TASK_DEAD) return -1;
     t->kill_pending = 1;
     t->kill_forced  = 1;
+    wake_blocked_task(t);                    /* §M49 — see task_kill */
     task_notify_change();
     return 0;
 }
@@ -944,12 +1431,16 @@ static void init_entry(void) {
             task_current() ? task_current()->pid : -1);
     for (;;) {
         reaper_pass();
-        /* Poll at the timer's pace: hlt until the next IRQ, then yield.
-         * DEAD tasks are rare events, so a ~100 Hz sweep is effectively
-         * event-driven while costing nothing when the system is quiet
-         * (mirrors the compositor's idle loop). */
-        hal_cpu_idle();
-        task_yield();
+        /* Sweep at roughly the timer's pace.  This used to be
+         * `hal_cpu_idle(); task_yield();` with a comment claiming it
+         * "cost nothing when the system is quiet" — §M49 measured the
+         * opposite: the loop stayed RUNNABLE, so init held a runqueue
+         * slot forever, halted its core on every turn, and reported
+         * demand 100 to the load balancer, indistinguishable from a CPU
+         * hog.  On an otherwise idle machine init alone pegged a core.
+         * `task_msleep` really blocks now, so the same sweep rate costs
+         * an off-queue task instead of a busy one. */
+        task_msleep(10);
     }
 }
 
@@ -1209,6 +1700,7 @@ void waitq_block(struct waitq* wq) {
     /* Register + mark SLEEPING under wq->lock. */
     self->wq_next = wq->head;
     wq->head      = self;
+    self->wq      = wq;                         /* §M49 — so a kill can find us */
     self->state   = TASK_SLEEPING;
     self->last_yield_ms   = timer_ticks_ms();   /* §M46 — blocking = responsive */
     self->cpu_ms_at_yield = self->cpu_ms;
@@ -1230,6 +1722,7 @@ void waitq_block(struct waitq* wq) {
     /* Woken.  Re-acquire the condition lock for the caller's recheck
      * loop.  IRQs are still off (schedule restored them to entry state).*/
     spin_lock(&wq->lock);
+    self->wq = NULL;                            /* §M49 — no longer parked */
 }
 
 /* Wake helper — caller holds wq->lock.  `all` drains the whole queue;
@@ -1248,6 +1741,7 @@ static void wq_wake_locked(struct waitq* wq, int all) {
     for (;;) {
         struct task* nxt = all ? t->wq_next : NULL;
         t->wq_next = NULL;
+        t->wq      = NULL;                      /* §M49 */
         if (t->state == TASK_SLEEPING) {
             t->state = TASK_RUNNABLE;
             /* task_enqueue picks an affinity-legal CPU, inserts on its rq,
@@ -1287,6 +1781,20 @@ void schedule_check(void) {
     if (preempt_count() != 0) return;   /* hot path asked us to wait */
 
     me->need_resched = 0;
+    /* §M49 — spend one quantum of the running task's budget.  This is the
+     * only place time is charged, and it runs once per tick, so a
+     * "quantum" is exactly one timer tick regardless of how often
+     * schedule() is called for other reasons. */
+    {
+        struct task* cur = me->current;
+        if (cur && !cur->is_idle) cur->deficit -= (int)TASK_WEIGHT_BASE;
+    }
+    /* §M49 — wake expired timed sleepers first (they may be the most
+     * deserving thing to run), then balance, so a task pulled in this
+     * pass is eligible for the very next pick instead of waiting a
+     * whole tick. */
+    sleep_sweep();
+    load_balance_tick(me);
     schedule();
 }
 
@@ -1385,6 +1893,36 @@ int task_set_affinity(struct task* t, uint32_t mask) {
     }
 
     t->cpu_mask = mask;
+    return 0;
+}
+
+/* §M49 — set scheduling priority.  Recomputing `deficit` from the new
+ * weight immediately (rather than letting the old budget drain) makes the
+ * change take effect on the current round, which is what someone typing
+ * `nice` at a stuttering desktop expects. */
+int task_set_nice(int pid, int nice) {
+    struct task* t = task_find(pid);
+    if (!t) return -1;
+    if (nice < TASK_NICE_MIN) nice = TASK_NICE_MIN;
+    if (nice > TASK_NICE_MAX) nice = TASK_NICE_MAX;
+
+    /* The task's load contribution changes with its weight, so its
+     * runqueue's published total has to be corrected under that queue's
+     * lock — otherwise the balancer works from a figure that no longer
+     * matches the queue's contents. */
+    struct percpu* rq = (t->cpu_home >= 0) ? percpu_at(t->cpu_home) : NULL;
+    uint32_t fl = 0;
+    if (rq) fl = spin_lock_irqsave(&rq->rq_lock);
+    int queued = (t->rq_next || t->rq_prev) ? 1 : 0;
+    if (rq && queued) rq->rq_load -= task_load_contrib(t);
+    t->nice       = nice;
+    t->weight     = task_nice_to_weight(nice);
+    t->deficit    = (int)t->weight;
+    t->skips_left = 0;
+    if (rq && queued) rq->rq_load += task_load_contrib(t);
+    if (rq) spin_unlock_irqrestore(&rq->rq_lock, fl);
+
+    task_notify_change();
     return 0;
 }
 

@@ -18,6 +18,62 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M49 — LOAD DISTRIBUTION, MEASURED (2026-08-06, DOCS §4.46, i386 +
+x86_64, aarch64 builds).**  §M18.6.1's balancer ran **only when a runqueue went
+empty** — work stealing, not load distribution — so with every queue non-empty
+an arbitrarily bad split never corrected itself; the file's own comment
+described a periodic pass and named a `LOAD_BALANCE_INTERVAL_MS` **that existed
+nowhere in the tree**.  Nothing caught it because **`run_qemu.sh` passed no
+`-smp`**: the everyday run was uniprocessor, so the balancer never executed on
+the path a person uses (the §M48 missing-NIC shape again — the measured path and
+the used path were different paths).  New **`sched [ms]`** samples twice and
+reports the delta (per-CPU rq/load/busy%/switches/migrations, per-task
+demand-vs-actual); it showed five hogs on CPU0 at 15-20% of a core while
+singletons got 66% — **and every CPU read 100% busy, so aggregate utilisation is
+blind to this whole class of bug.**  Four fixes: (1) a **periodic threshold
+pass** (a migration swings the difference by TWICE the moved task, hence a
+minimum delta — at 1 it ping-pongs forever); (2) load = **demand** (share of
+time spent RUNNABLE), because queue length scores four hogs and four sleepers
+alike, and *which* task moves matters — the balancer asks for one of roughly
+half the imbalance; (3) **`task_msleep` really blocks** — it was a spin-yield
+loop that kept every service queued AND `hlt`ed the CPU with work behind it, so
+`cron`/`watchdog` measured as CPU hogs (**a metric is only as honest as the
+state it observes**); `task_kill` now wakes a timed sleeper so §M46 teardown
+latency is unchanged; (4) **priority** — `nice <pid> <-20..19>` → a weight that
+is both quantum budget and load share (measured 65/16/13/4% for -10/0/0/+10),
+degenerating to the old behaviour at the default.  Result: queue spread 2..6 →
+2..3, x86_64 seven of eight hogs at the ideal 49-50%.  **Lesson:** `struct task`
+is constructed in FOUR places and only one is `spawn_common` — the new weight
+field stayed zero in the other three and the first boot took a #DE in the
+scheduler; one `task_sched_defaults()` plus a guard at the division.  Open:
+`vc_getchar` is still a spin-poll (an idle shell pegs a core — making it block
+needs waking waitq-parked tasks from the kill path, i.e. §M46 teardown
+semantics), and no kernel workqueue **deliberately**, until it has a real
+consumer (NIC RX).  **THEN BOTH OF THOSE WERE DONE TOO:** `vc_getchar` and
+init's reaper now BLOCK (per-VC waitq woken from the keyboard IRQ; the ring
+write stays lock-free but the WAKE takes the lock — that is what closes the
+lost-wakeup window), so an idle 4-CPU box went from **one core pegged at 100% to
+all four at 0-2%**.  That needed `task_kill` to wake waitq-parked tasks (new
+`task->wq` back-pointer — `wq_next` alone says "in some queue", not WHICH), and
+it exposed a **latent SMP race**: the boot shell's VC was bound AFTER spawn
+under `preempt_disable`, which has been PER-CPU since §M18.6.2 while
+`task_enqueue` puts the task on another core and IPIs it — the shell reached its
+entry point first and exited with "no VC bound".  Four sites had it; fixed with
+`task_spawn_console`, binding it inside the spawn exactly as `start_arg` already
+was.  And a **deferred-work pool** (`kernel/core/workqueue.c`,
+`work_submit`/`work_flush`/`workqueue_stats`, one `kworker` per CPU, blocking so
+an idle pool costs nothing; pending list and waitq share ONE lock by waitq's own
+contract; `work_flush` counts callbacks that RETURNED, not items dequeued; NO
+NMI submission — §M47's crash capture keeps its lock-free ring, an NMI-safe path
+needs `irq_work`'s shape).  `wqtest [n]`: 16 items over 4 CPUs in **26 ms vs
+~80 ms serial**.  **Lesson:** that test first reported FAIL on duplicate runs —
+the TEST was wrong, not the queue; re-queueing an item that is already RUNNING
+is the intended semantic (how a driver says "more arrived while you drained").
+Still open: `keyboard_getchar` + the GUI compositor/app-host loops are still
+`hlt`+`yield` polls (the GUI ones need waitqs on the compositor's event queues —
+a compositor change), and the workqueue has no production consumer yet (NIC RX
+first, then the xHCI event ring polled from the timer ISR).
+
 ✅ **§M48 — THE MEMORY CEILING IS DISCOVERED, NOT COMPILED IN + A USABLE
 BROWSER (2026-08-04, DOCS §4.42–§4.44).**  `pmm_init` sizes its metadata from the
 firmware map instead of a per-arch `#define`, so ONE image boots on 128 MiB and

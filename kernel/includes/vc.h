@@ -46,6 +46,8 @@ enum vc_split_dir {
     VC_SPLIT_VERT  = 1,                 /* left / right */
 };
 
+#include "waitq.h"                      /* §M49 — blocking vc_getchar */
+
 struct vc_node;                         /* opaque to callers */
 struct task;                            /* fwd */
 
@@ -59,6 +61,13 @@ struct vc {
     volatile char     in_buf[VC_INBUF_SZ];
     volatile uint32_t in_head;
     volatile uint32_t in_tail;
+    /* §M49 — readers park here instead of spinning.  vc_getchar used to
+     * be a hlt+yield poll, so a shell waiting for a keystroke stayed
+     * RUNNABLE forever: it held a runqueue slot, measured as a CPU hog to
+     * the load balancer, and halted its core on every turn.  An idle d-os
+     * kept a whole core at 100% for each open shell.  vc_kbd_push wakes
+     * this from IRQ context. */
+    struct waitq      inq;
     /* Shell task bound to this VC (NULL until spawned). */
     struct task*      task;
     /* M22: optional output override.  When non-NULL, vc_putchar hands

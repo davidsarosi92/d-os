@@ -4609,6 +4609,285 @@ different claims, and only the first had ever been tested.
 
 ---
 
+### 4.46 Load distribution across CPUs, measured (M49)
+
+§M18.6.1 shipped "per-CPU runqueue + load balancer" and the row has been ✅ ever
+since.  Both halves were real; the second was narrower than its own design said.
+
+#### What was actually there
+
+`kernel/core/task.c` balanced **only when a CPU's runqueue ran empty**, on the
+way into the idle loop.  That is a work-stealing rule — "am I out of work?" —
+not a load-distribution rule — "is the work spread fairly?".  With every queue
+holding at least one task, an arbitrarily bad split never corrected itself.
+
+The file's own header comment described a periodic pass running every
+`LOAD_BALANCE_INTERVAL_MS`, and named a constant **that did not exist anywhere
+in the tree**.  The comment had documented the design, not the code, for two
+milestones.
+
+#### Nothing measured it, because nothing ran it
+
+`scripts/run_qemu.sh` passed no `-smp` at all.  The everyday i386/x86_64 run was
+uniprocessor, so the load balancer **never executed on the path a person uses**;
+every test that ever exercised SMP supplied its own `-smp`.  This is the same
+shape as §M48's missing NIC — the measured path and the used path were two
+different paths — and it is why the gap survived so long.  The script now
+defaults to `-smp 4` (`SMP=1` reproduces uniprocessor).
+
+#### The measurement
+
+New `sched [ms]` command: it samples twice and reports the delta, because
+since-boot totals average away exactly what matters.  Per CPU it shows queue
+depth, summed load, busy%, context switches and migrations; per task, the
+balancer's view (`DEM`) beside what the task actually got (`CPU%`).
+
+Pin five hogs onto CPU0 while CPU1–3 keep one each (`loop 8` + `taskset`), on a
+4-CPU i386 guest:
+
+```
+CPU  RQ  BUSY%  SWITCH  MIGR
+0    6   100      441       0      <- five hogs, 15-20% of a core each
+2    2   100      418       0      <- one hog, 66%
+```
+
+Identical tasks, a 3.3x difference, stable indefinitely.  `MIGR 0` everywhere:
+the balancer genuinely never ran.
+
+**Note what does not show it.**  Every CPU reads 100% busy.  Aggregate
+utilisation is blind to this class of problem, which is why `sched` reports
+queue depth and per-task share as well — a dashboard that only had busy% would
+have declared the machine perfectly balanced.
+
+#### Three fixes
+
+**1. A periodic pass.**  Every 100 ms each CPU also checks whether a peer is
+meaningfully busier, and pulls if so.  Two constants carry the policy.
+`MIN_DELTA` exists because a migration swings the difference by *twice* the
+moved task: at a threshold of 1 a 3-vs-2 split would move a task to make it
+2-vs-3 and move it back next window, a permanent ping-pong that costs cache
+locality and buys nothing.  `MAX_STEAL` lets one pass correct a large imbalance
+(5-vs-1 → 4-vs-2 → 3-vs-3, then the threshold stops it) instead of trickling one
+task per window.
+
+**2. Load means demand, not queue length.**  Queue depth scores four hogs and
+four sleepers identically.  After fix 1 the depths equalised at 4/3/3/3 and the
+hogs *still* ran at 25% versus 49%, because three of those slots were near-idle
+tasks.  So each task now carries a `demand`: the share of wall-clock it spends
+**runnable** — running *or waiting in a queue* — EWMA-smoothed.  `cpu_ms`
+cannot serve here; on a saturated core it measures the competition rather than
+the task, and four hogs sharing a CPU each read a modest 25%.  A runqueue's
+load is the sum of its tasks' demand, maintained under `rq_lock` and published
+for peers to read locklessly, so balancing never needs two runqueue locks.
+
+Demand starts at maximum for a new task deliberately: starting at zero would be
+worse than having no metric, because a burst of fresh tasks would all look free
+and land on one core before the first window closed.  Guessing high is
+self-correcting.
+
+*Which* task moves matters as much as whether one does — migrating a sleeper off
+an overloaded CPU changes the queue length and none of the load.  The periodic
+caller therefore asks for a task of roughly **half** the imbalance (a move of
+exactly half leaves the two CPUs level) and refuses anything larger than the
+imbalance itself, so a correction can never overshoot into a mirror image.  The
+idle caller asks for the heaviest task available: holding nothing, it cannot
+overshoot.
+
+**3. `task_msleep` really sleeps.**  It was a spin-yield loop — `hlt`, yield,
+re-read the clock — leaving the task RUNNABLE and queued for the whole "sleep".
+That cost twice: a scheduling slot on every round, and the `hlt` **halted the
+CPU while other runnable tasks sat on that same runqueue**, so a sleeping cron
+job could idle a core with work queued behind it.
+
+It was found through fix 2.  Demand is measured as time spent runnable, so a
+task that never leaves the queue measures as wanting a full CPU: `cron`,
+`watchdog` and `heartbeat` all reported demand 100, indistinguishable from a
+genuine hog.  **A metric is only as honest as the state it observes.**  Sleepers
+now leave every runqueue and a tick sweep wakes them; `ps` shows them `SLP`.
+
+That change has a consequence worth recording: while the sleep was a poll, a
+`kill` landed within a tick because the task re-tested `task_should_stop()` on
+every pass.  A blocked task tests nothing, and both the GUI window teardown and
+§M46's kill-tree wait for tasks to reach a kill point — so `task_kill` and
+`task_force_kill` now wake a timed sleeper explicitly.  Cheap to do correctly: a
+timed sleeper is on no waitq, so there is no queue to unlink it from.
+
+#### 4. Priority
+
+Every task had equal weight, which is fine until the machine is busy: eight
+background hogs and the desktop competed on identical terms, and nothing could
+say otherwise.  `nice <pid> <-20..19>` now sets a priority, mapped through a
+coarse eight-step table to a **weight** — a table rather than a formula so the
+ratios are inspectable instead of implied.
+
+Weight means two things.  It is the task's quantum budget per round
+(`deficit`, spent one tick at a time by the tick handler, replenished on
+rotation), and it scales the task's contribution to runqueue load, so placement
+packs cheap tasks more densely than expensive ones — a nice-19 hog wants a full
+core just as much as a nice-0 one, but it will not get one, and reserving a core
+for work the scheduler has already decided to starve would be wrong.
+
+Weights *below* baseline cannot buy fewer than one quantum, so they buy fewer
+**turns** instead: the replenish converts leftover debt into `skips_left`, which
+the pick honours by passing the task over.  The pick therefore runs two passes —
+the second ignores skips, so a runqueue holding nothing but niced-down tasks
+still runs instead of falling through to idle.
+
+Four hogs pinned to one CPU, one at nice -10 and one at nice +10:
+
+```
+PID  NI  CPU%
+16  -10   65      weight 350
+18    0   16      weight 100
+17    0   13      weight 100
+19  +10    4      weight  14
+```
+
+The measured shares track the weights (350:100:100:14 predicts 62:18:18:2).
+
+At the default nice 0 every one of these paths degenerates to the previous
+behaviour — one quantum per tick, never skipped — so the feature costs nothing
+when unused.
+
+**Lesson learned.**  The first boot with weights took a **divide error before
+the scheduler had run once**.  `struct task` is constructed in FOUR places and
+only one is `spawn_common`: pid 0, the BSP idle task and each AP's idle task are
+synthesised by hand, so they kept kcalloc's zero weight, and a zero weight is a
+division by zero in the replenish.  Fixed with one `task_sched_defaults()` that
+every site calls, plus a guard at the division itself — the scheduler tick is
+the last place in a kernel that can afford to fault.  Adding a field to a struct
+whose construction is spread over four functions is a change to four functions.
+
+#### 5. The console read blocks too — and an idle machine goes quiet
+
+`vc_getchar` was the same `hlt` + `task_yield` poll as the old `task_msleep`, so
+a shell waiting at its prompt stayed RUNNABLE forever: one runqueue slot per
+open shell, a core halted on every turn through the queue, and — once demand
+was measured as time spent runnable — a reading of 100, identical to a CPU hog.
+`init`'s reaper loop had the same shape, under a comment claiming it "cost
+nothing when the system is quiet".
+
+Both now block.  Readers park on a per-VC `waitq` that `vc_kbd_push` wakes from
+the keyboard IRQ; the ring write stays outside the lock (still single-producer,
+single-consumer) but the **wake** takes it, which is what closes the
+lost-wakeup window — a reader tests the ring and parks while holding that same
+lock, so the wake can never land between its test and its park.
+
+The kill contract needed the other half.  `task.h` and the GUI window teardown
+both rely on a killed shell dying "at its next `vc_getchar` yield", and a
+blocked task polls nothing — so `task_kill` now wakes a task parked on a waitq
+as well as a timed sleeper.  That required a `task->wq` back-pointer: `wq_next`
+alone says "somewhere in some queue", which is not enough to get a task out
+again.  The wake is deliberately spurious — the condition is still false — and
+that is safe precisely because waitq's contract already makes callers loop.
+
+Measured on an otherwise idle 4-CPU i386 guest, before and after: **one core at
+100% → all four at 0-2%.**
+
+#### 6. An SMP race the timing change exposed
+
+The first boot with a blocking console printed `shell_task_entry: no VC bound —
+exiting`.  The boot shell was spawned and its VC bound immediately afterwards,
+inside `preempt_disable()` — but **that counter has been per-CPU since
+§M18.6.2**, while `task_enqueue` places a new task on the least-loaded core and
+IPIs it.  The new task could therefore reach its entry point on another CPU
+before the binding landed.
+
+Pre-existing, latent, and invisible while the everyday run was uniprocessor.
+Four call sites had it (boot shell, `pane split`, GUI window shells, the
+aarch64 boot shell), all with a comment explaining why `preempt_disable` made
+them safe.
+
+`start_arg` already had the right treatment — set inside `spawn_common`, before
+the task can be enqueued, with a comment saying exactly why.  The console just
+never got the same.  New `task_spawn_console()` threads it through the same
+path, and all four sites use it.
+
+#### 7. A deferred-work pool
+
+New `kernel/core/workqueue.c`: `work_submit()` from a restricted context
+(interrupt handler, spinlock-held region), callback runs later on an ordinary
+task that may block, allocate or draw.  One worker per CPU, parented to init.
+
+It is built on the scheduler rather than beside it, which is what makes it
+worth having here: the workers are plain tasks, so several items submitted at
+once genuinely run on several cores and §M49's balancer spreads them without
+the workqueue knowing anything about CPUs.  And they block on a waitq, so an
+idle pool costs nothing — a property that only became true once §M49 fixed the
+poll loops above.
+
+The pending list and the workers' waitq share **one** lock: waitq's contract
+already says its lock serialises the guarded condition, the condition here *is*
+the list, and sharing closes the lost-wakeup window for free.  Submission wakes
+exactly one worker — waking the pool for a single item would have every worker
+take the lock, find nothing and park again.  `work_flush` waits on an
+`inflight` count that is decremented when a callback **returns**, not when its
+item is dequeued; counting the queue alone would let a flush return while a
+callback was still touching the submitter's data, which is the bug flush exists
+to prevent.
+
+Deliberately absent: submission from NMI.  `work_submit` takes a spinlock, and
+an NMI interrupting a CPU that holds it deadlocks.  §M47's crash capture is
+exactly such a caller and keeps its own lock-free ring; an NMI-safe path needs
+Linux's `irq_work` shape (per-CPU list + self-IPI), a different mechanism
+rather than a flag on this one.
+
+`wqtest [n]` measures it: 16 items across 4 CPUs in **26 ms against ~80 ms
+serial**, four items on four cores in 5 ms against 20.
+
+**Lesson learned.**  `wqtest` first reported FAIL on duplicate runs — and the
+test was wrong, not the queue.  Re-submitting an item that is still *waiting*
+collapses into one run; an item a worker has already picked up is legitimately
+queued again, which is precisely how a driver says "more arrived while you were
+draining".  The assertion contradicted the contract written in the same commit.
+It now checks what is actually guaranteed: every item ran, nothing pending
+after the flush, and the completion counter agreeing with the runs observed.
+
+There is **no production consumer yet**.  The honest first one is NIC RX (today
+polled from the calling task, §M48); the xHCI event ring polled from the timer
+ISR is the second.  Both are conversions worth doing on their own schedule —
+neither was worth risking in the same change that rewrote the scheduler's
+blocking primitives.
+
+#### Result
+
+Same experiment, after:
+
+```
+CPU  RQ  LOAD  BUSY%  MIGR
+0    3   299   100      0
+1    3   300   100      0
+2    2   200   100      0
+3    2   200   100      0
+```
+
+Queue-depth spread 2..6 → 2..3.  The residual is arithmetic, not a defect: nine
+tasks do not divide evenly across four CPUs, and the balancer correctly stops
+rather than ping-ponging.  On x86_64 with eight hogs, seven of the eight settle
+at 49-50% of a core — the ideal split.
+
+**Verified** on i386 and x86_64 at `-smp 4`: the imbalance experiment above,
+plus `forktest`, `pthreadtest` (20000/20000), `solibtest`, prompt reaping after
+`loopstop`, and services still firing on schedule; aarch64 builds.
+
+#### Still open
+
+`keyboard_getchar` (`/dev/keyboard`) and the GUI compositor / app-host loops are
+still `hlt`+`yield` polls.  The keyboard one has no in-kernel caller worth the
+change; the GUI loops do real work per iteration and converting them means
+giving the compositor's event queues waitqs — worth doing, but a compositor
+change rather than a scheduler one, and not something to fold into the same
+work that rewrote the blocking primitives.
+
+The workqueue has no production consumer yet — NIC RX first, then the xHCI
+event ring.
+
+Priority is per-task only.  There is no group or per-user fairness (a process
+that spawns ten threads gets ten shares), which is fine until §M32 makes users
+real.
+
+---
+
 ## 5. Build & run
 
 ```sh
@@ -4678,6 +4957,45 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
 ---
 
 ## 8. Change log
+
+- **2026-08-06 — §M49: load distribution across CPUs, measured (DOCS §4.46).**
+  §M18.6.1's load balancer only ran when a CPU's runqueue went empty — a
+  work-stealing rule, not a distribution rule — so with every queue non-empty an
+  arbitrarily bad split never corrected itself.  The file's own header comment
+  described a periodic pass and named a constant that existed nowhere in the
+  tree.  **`run_qemu.sh` passed no `-smp` at all**, so the balancer never
+  executed on the path a person actually uses; every SMP test supplied its own
+  flag (the §M48 missing-NIC shape again).  New `sched [ms]` command samples the
+  spread; on 4 CPUs, five hogs pinned to CPU0 got 15-20% of a core each while
+  singletons got 66% — a 3.3x unfairness that aggregate busy% (100% everywhere)
+  cannot see.  Fixed in three parts: a periodic threshold pass with an
+  anti-ping-pong margin; load measured as **demand** (share of time spent
+  RUNNABLE) instead of queue length, since four hogs and four sleepers are the
+  same queue depth; and `task_msleep` made to really block — it was a spin-yield
+  loop that kept every service task queued *and* halted the CPU with work behind
+  it, which is why `cron` and `watchdog` measured as CPU hogs.  A metric is only
+  as honest as the state it observes.  `task_kill` now wakes a timed sleeper, so
+  kill latency stays what §M46 teardown assumes.  Queue spread 2..6 → 2..3; on
+  x86_64 seven of eight hogs settle at the ideal 49-50%.  Also **priority**:
+  `nice <pid> <-20..19>` → a weight that is both the task's quantum budget and
+  its share of runqueue load (measured 65%/16%/13%/4% for nice -10/0/0/+10),
+  degenerating to the old behaviour at the default.  Its first boot took a
+  divide error — `struct task` is built in four places and only one is
+  `spawn_common`, so three kept a zero weight; one shared initialiser plus a
+  guard at the division.  **`vc_getchar` and init's reaper now block too**, so
+  an idle 4-CPU box went from one core pegged at 100% to all four at 0-2%; that
+  needed `task_kill` to wake waitq-parked tasks (new `task->wq` back-pointer),
+  and it exposed a latent SMP race — the boot shell's VC was bound *after*
+  spawn under `preempt_disable`, which is per-CPU, so another core could run the
+  shell first and it exited with "no VC bound" (four sites; fixed with
+  `task_spawn_console`, which binds it inside the spawn as `start_arg` already
+  was).  Finally a **deferred-work pool** (`kernel/core/workqueue.c`,
+  `work_submit`/`work_flush`, one worker per CPU, blocking so an idle pool costs
+  nothing): `wqtest` runs 16 items across 4 CPUs in 26 ms against ~80 ms serial.
+  Its first test asserted no duplicate runs and failed against the contract
+  written beside it — re-queueing an item that is already RUNNING is the
+  intended semantic.  No production consumer yet: NIC RX first, then the xHCI
+  event ring.
 
 - **2026-08-04 — §M48: the memory ceiling is discovered, not compiled in; NetSurf
   becomes usable; Mesa reaches i386 (DOCS §4.42–§4.44).**  `pmm_init` sizes its
