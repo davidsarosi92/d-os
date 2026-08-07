@@ -467,6 +467,28 @@ else ifeq ($(ARCH),aarch64)
   CROSS   := aarch64-linux-gnu-
   CC      := $(CROSS)gcc
   LD      := $(CROSS)ld
+
+  # §A2/A3 — the musl userland for aarch64, provisioned exactly like x86_64's:
+  # a PREBUILT musl.cc cross-toolchain whose sysroot IS a complete aarch64 musl
+  # (static libc.a + shared libc.so == ld.so + crt).  Fetch it once with
+  #     ./scripts/fetch-musl-cross-prebuilt.sh aarch64-linux-musl
+  # which was already arch-parametric — a download, not the ~10h from-source
+  # gcc build the i386 path once needed.
+  #
+  # NOTE the two toolchains above are NOT interchangeable: the aarch64-linux-gnu
+  # cross gcc builds the KERNEL (freestanding, -mgeneral-regs-only), while this
+  # one builds RING-3 binaries against musl.  Using the kernel compiler for
+  # userland would produce something with no libc; using this one for the kernel
+  # would drag in FP/NEON we do not save on context switch.
+  MUSL_SYSROOT := third_party/musl-cross-aarch64/aarch64-linux-musl
+  MUSL_TRIPLE  := aarch64-linux-musl
+  MUSL_AR      := third_party/musl-cross-aarch64/bin/aarch64-linux-musl-ar
+  MUSL_ELF_CC  := third_party/musl-cross-aarch64/bin/aarch64-linux-musl-gcc
+  MUSL_ELF_CXX := third_party/musl-cross-aarch64/bin/aarch64-linux-musl-g++
+  # The canonical PT_INTERP path an aarch64 musl dynamic binary carries.
+  DOS_LDSO     := /lib/ld-musl-aarch64.so.1
+  MUSL_HDR_DIR := $(MUSL_SYSROOT)/include
+  MUSL_CRT_DIR := $(MUSL_SYSROOT)/lib
   # -mno-outline-atomics: emit atomics inline instead of via libgcc's runtime
   #   LSE-detection helpers, which pull in glibc's __getauxval (unavailable
   #   freestanding).
@@ -1413,10 +1435,14 @@ $(OBJ_DIR)/user/%_blob.o: user/%_$(ARCH).elf
 # any user/<name>.c → user/<name>.muslelf → <name>_muslblob.o (symbol
 # _binary_user_<name>_muslelf_start).  Add coreutils via MUSL_COREUTILS above.
 MUSL_CC_FLAGS := -m32 -static -fno-pie -Os -Wall
-ifeq ($(ARCH),x86_64)
-# x86_64: the prebuilt musl.cc cross-gcc driver links crt1/crti/libc.a/libgcc/
-# crtn itself; -static -no-pie + -Wl,-Ttext-segment relocates the whole image
-# (ELF headers included) to the d-os user base — same trick the i386 rule uses.
+# §A3 — the condition is "does this arch have a musl cross-SYSROOT", not "is
+# this x86_64".  It used to name the arch, which is exactly the shape §M47.5
+# found and fixed elsewhere: a per-arch list that one arch quietly falls off.
+# aarch64 now sets MUSL_SYSROOT too, so it takes this branch unchanged.
+ifneq ($(MUSL_SYSROOT),)
+# A prebuilt musl.cc cross-gcc driver links crt1/crti/libc.a/libgcc/crtn
+# itself; -static -no-pie + -Wl,-Ttext-segment relocates the whole image (ELF
+# headers included) to the d-os user base — same trick the i386 rule uses.
 user/%.muslelf: user/%.c $(MUSL_SYSROOT)/lib/libc.a
 	@mkdir -p $(OBJ_DIR)/user
 	$(MUSL_ELF_CC) -static -no-pie -Os -Wall \
