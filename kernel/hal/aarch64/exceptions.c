@@ -50,6 +50,9 @@ void aarch64_irq_dispatch(void) { }
 /* SVC syscall dispatcher (syscall.c).  Weak so the early Phase-A/B builds
  * (before the userspace slice is linked) still resolve; the strong definition
  * decodes x8 and services SYS_PRINT/SYS_EXIT. */
+void signal_deliver(struct trapframe* tf) __attribute__((weak));
+void signal_deliver(struct trapframe* tf) { (void)tf; }
+
 void aarch64_syscall(struct trapframe* tf) __attribute__((weak));
 void aarch64_syscall(struct trapframe* tf) { (void)tf; }
 
@@ -118,6 +121,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
              * kill (a wedged ring-3 package that never yields) is torn down
              * right here.  SPSR_EL1.M[3:0]==0 means "came from EL0". */
             task_force_kill_point((tf->spsr & 0xF) == 0);
+            signal_deliver(tf);           /* §A1 — same return-to-EL0 hook */
             return;                       /* return → RESTORE_TRAPFRAME → eret */
         case EXC_FIQ:
             /* We route everything through IRQ; a real FIQ is unexpected. */
@@ -142,6 +146,11 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                  * unmasking here does not disturb the return to EL0. */
                 hal_intr_enable();
                 aarch64_syscall(tf);
+                /* §A1 — deliver a pending signal on the way back to EL0, the
+                 * same hook point the x86 ports use.  It must run AFTER the
+                 * syscall so the handler frame captures the syscall's result
+                 * in x0 and sigreturn restores it. */
+                signal_deliver(tf);
                 return;                       /* → RESTORE_TRAPFRAME → eret to EL0 */
             }
             /* §A1 — copy-on-write.  After a fork() both parent and child hold

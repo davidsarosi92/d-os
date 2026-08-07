@@ -49,6 +49,9 @@ void aarch64_vmm_kernel_switch(void);
 /* SVC dispatcher.  Called from aarch64_exception_handler for EC == 0x15. */
 static void aarch64_syscall_body(struct trapframe* tf);
 
+/* signal.c — §A1 */
+void signal_sigreturn(struct trapframe* tf);
+
 /* §1.1 — see the x86 twins: flag the task while servicing an SVC from EL0 so
  * usyscall.c gates the frame's pointer arguments as USER pointers. */
 void aarch64_syscall(struct trapframe* tf) {
@@ -161,6 +164,21 @@ static void aarch64_syscall_body(struct trapframe* tf) {
         case SYS_DUP2:
             tf->x[0] = (uint64_t)sys_dup2((int)tf->x[0], (int)tf->x[1]);
             break;
+
+        /* ---- §A1: signals ------------------------------------------------ */
+        case SYS_KILL:
+            tf->x[0] = (uint64_t)sys_kill((int)tf->x[0], (int)tf->x[1]);
+            break;
+        case SYS_SIGACTION:
+            tf->x[0] = (uint64_t)sys_sigaction((int)tf->x[0], (long)tf->x[1],
+                                               (long)tf->x[2]);
+            break;
+        case SYS_SIGRETURN:
+            /* Restores the pre-handler context; do NOT assign tf->x[0]
+             * afterwards — signal_sigreturn already set it to the interrupted
+             * syscall's result. */
+            signal_sigreturn(tf);
+            return;
 
         default:
             kprintf("syscall: unknown number %lu\n", (unsigned long)num);

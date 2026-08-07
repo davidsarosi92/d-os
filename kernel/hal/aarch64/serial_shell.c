@@ -93,6 +93,7 @@ static void cmd_help(void) {
             "  usertest          drop to EL0 and run a userspace program\n"
             "  forktest          fork()+waitpid() self-test (§A1)\n"
             "  pipetest          pipe()+dup2() self-test (§A1)\n"
+            "  sigtest           signal delivery self-test (§A1)\n"
             "  clear             clear the screen\n");
 }
 
@@ -110,6 +111,8 @@ extern const unsigned char _binary_user_forktest_elf_start[] __attribute__((weak
 extern const unsigned char _binary_user_forktest_elf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_pipetest_elf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_pipetest_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_sigtest_elf_start[]  __attribute__((weak));
+extern const unsigned char _binary_user_sigtest_elf_end[]    __attribute__((weak));
 
 int proc_exec_elf(const unsigned char* image, unsigned long len);
 
@@ -125,6 +128,9 @@ static void cmd_forktest(void) {
 }
 static void cmd_pipetest(void) {
     run_blob("pipetest", _binary_user_pipetest_elf_start, _binary_user_pipetest_elf_end);
+}
+static void cmd_sigtest(void) {
+    run_blob("sigtest", _binary_user_sigtest_elf_start, _binary_user_sigtest_elf_end);
 }
 
 static void cmd_meminfo(void) {
@@ -280,6 +286,7 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "usertest")) cmd_usertest();
         else if (s_eq(cmd, "forktest")) cmd_forktest();
         else if (s_eq(cmd, "pipetest")) cmd_pipetest();
+        else if (s_eq(cmd, "sigtest"))  cmd_sigtest();
         else if (s_eq(cmd, "clear"))  kprintf("\033[2J\033[H");
         else kprintf("unknown command '%s' (try 'help')\n", cmd);
     }

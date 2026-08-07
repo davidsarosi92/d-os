@@ -224,8 +224,18 @@ void syscall_dispatch(struct int_frame* f);
 /* M34 signals (arch — hal/x86/signal.c).  signal_deliver runs on the
  * return-to-user path after each syscall; signal_sigreturn restores the
  * pre-handler context for SYS_SIGRETURN. */
+#if defined(__aarch64__)
+/* The "interrupt frame" is per-arch: x86 has struct int_frame, AArch64 has the
+ * trapframe vectors.S builds (x0..x30 + ELR + SPSR).  Declaring these with the
+ * x86 type on every arch made the ARM definitions conflict with their own
+ * header — the signature has to follow the frame, not the other way round. */
+struct trapframe;
+void signal_deliver(struct trapframe* f);
+void signal_sigreturn(struct trapframe* f);
+#else
 void signal_deliver(struct int_frame* f);
 void signal_sigreturn(struct int_frame* f);
+#endif
 
 /* M36 / §M41 — Linux i386 syscall-ABI dispatch (hal/x86/linux_abi.c).  The
  * native dispatcher routes here for a process with the Linux personality. */

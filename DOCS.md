@@ -16,79 +16,80 @@ when sections are added.)
 
 | § | Section | ~line |
 |---|---------|------:|
-| 1 | Project layout | 95 |
-| 2 | Boot flow | 161 |
-| 3 | Memory layout | 178 |
-| 4 | Components | 200 |
-| 4.0 | Module framework + console registry | 202 |
-| 4.1 | Terminal drivers | 275 |
-| 4.2 | Keyboard | 298 |
-| 4.3 | Shell | 311 |
-| 4.4 | HAL x86 | 347 |
-| 4.5 | GDT | 357 |
-| 4.6 | IDT + PIC + IRQ dispatch | 377 |
-| 4.7 | Multiboot info | 401 |
-| 4.8 | Physical Memory Manager — buddy allocator (M19) | 417 |
-| 4.9 | Virtual Memory Manager | 477 |
-| 4.X | Tasks + scheduler | 504 |
-| 4.X | SMP — APIC, AP boot, per-CPU, real spinlocks (M18) | 565 |
-| 4.X | HAL — arch-independent interface | 693 |
-| 4.X | Keyboard layouts | 750 |
-| 4.X | USB host stack — xHCI + HID boot keyboard | 825 |
-| 4.X | Virtual consoles / pane split | 925 |
-| 4.X | Ring 3 / user mode | 1010 |
-| 4.X | Block layer + virtio-blk | 1053 |
-| 4.X | procfs — kernel state as files under /proc | 1105 |
-| 4.X | devfs — drivers as files under /dev | 1137 |
-| 4.X | Configuration store | 1160 |
-| 4.X | Filesystem layer | 1176 |
-| 4.X | Block cache | 1236 |
-| 4.X | exFAT | 1265 |
-| 4.X | Timer | 1310 |
-| 4.10 | Kernel heap — slab + page_alloc (M19) | 1328 |
-| 4.11 | Serial debug | 1391 |
-| 4.X | Supported architectures — i386 + x86_64 (M20) | 1405 |
-| 4.12 | ACPI | 1546 |
-| 4.13 | GUI — compositor, WM, widgets, apps (M22 – M22.5) | 1567 |
-| 4.14 | GUI development — writing apps and desktop shells (M22.2) | 1843 |
-| 4.15 | Process model — init, hierarchy, reaper, kill-tree (M27) | 1918 |
-| 4.16 | Per-task GUI apps (M22.7 Stage A) | 1976 |
-| 4.17 | ARM64 (AArch64) port — Phases A–M (M21, full x86 parity) | 2055 |
-| 4.18 | System log — klog ring buffer + dmesg | 2396 |
-| 4.19 | Userland foundation — processes, fds, IPC, libc (M25) | 2460 |
-| 4.20 | Blocking primitives — wait-queue, task_wait, blocking IPC (... | 2537 |
-| 4.21 | Services & the service bus (M29) | 2594 |
-| 4.22 | Watchdog — freeze detection (M31) | 2655 |
-| 4.23 | cron — time-based task scheduling (M30) | 2696 |
-| 4.24 | Concurrent user processes + full-arch libc (Tier B — M25 tail) | 2729 |
-| 4.25 | Networking — virtio-net + TCP/IP stack (M24, i386) | 2780 |
-| 4.26 | Audio — AC97 codec + PCM output (M23, i386) | 2874 |
-| 4.27 | POSIX process model — fork/exec/wait/pipe/signals (M34, i386) | 2922 |
-| 4.28 | Threads + futex (M35, i386) | 3007 |
-| 4.29 | Package manager — content-addressed store (M35.5, first slice) | 3075 |
-| 4.30 | POSIX syscall breadth + libc growth (M36 stage 1, i386) | 3116 |
-| 4.31 | Linux i386 syscall-ABI compat layer (M36 stage 2 / §M41, i386) | 3150 |
-| 4.32 | Wayland display server (M26, stage 1 — wire protocol + hand... | 3301 |
-| 4.33 | Dynamic linking — ld.so / .so / dlopen (M37, i386) | 3407 |
-| 4.34 | C++ runtime — libstdc++ + exceptions (M38, i386) | 3474 |
-| 4.35 | Crypto, entropy & TLS (M39, i386) | 3505 |
-| 4.36 | On-device C compiler — TinyCC (M43 slice, i386) | 3601 |
-| 4.37 | Resilience & the ring-3 boundary (M46 + kernel audit) | 3641 |
-| 4.38 | Crash records & reporting (M47) | 3750 |
-| 4.38.1 | Closing a window is not a crash (M47.1) | 3819 |
-| 4.39 | x86_64 userland parity (M47.5) | 3865 |
-| 4.40 | Upstream libwayland-client (M40 stage 1) | 3963 |
-| 4.40.1 | EGL + GLES2 on Mesa softpipe (M40, DoD complete) | 4310 |
-| 4.41 | The ring-3 pointer gate was never armed for the Linux ABI (... | 4369 |
-| 4.42 | The memory ceiling, discovered rather than compiled in (M48) | 4402 |
-| 4.43 | NetSurf: input it can act on, and a fetcher (M48) | 4505 |
-| 4.44 | Mesa/EGL on i386 (M48) | 4585 |
-| 4.45 | The mmap cursor belonged to the address space (M48) | 4615 |
-| 4.46 | Load distribution across CPUs, measured (M49) | 4646 |
-| 5 | Build & run | 4957 |
-| 6 | Compiler flags | 4984 |
-| 7 | Roadmap / open milestones | 5010 |
-| 8 | Change log | 5032 |
+| 1 | Project layout | 96 |
+| 2 | Boot flow | 162 |
+| 3 | Memory layout | 179 |
+| 4 | Components | 201 |
+| 4.0 | Module framework + console registry | 203 |
+| 4.1 | Terminal drivers | 276 |
+| 4.2 | Keyboard | 299 |
+| 4.3 | Shell | 312 |
+| 4.4 | HAL x86 | 348 |
+| 4.5 | GDT | 358 |
+| 4.6 | IDT + PIC + IRQ dispatch | 378 |
+| 4.7 | Multiboot info | 402 |
+| 4.8 | Physical Memory Manager — buddy allocator (M19) | 418 |
+| 4.9 | Virtual Memory Manager | 478 |
+| 4.X | Tasks + scheduler | 505 |
+| 4.X | SMP — APIC, AP boot, per-CPU, real spinlocks (M18) | 566 |
+| 4.X | HAL — arch-independent interface | 694 |
+| 4.X | Keyboard layouts | 751 |
+| 4.X | USB host stack — xHCI + HID boot keyboard | 826 |
+| 4.X | Virtual consoles / pane split | 926 |
+| 4.X | Ring 3 / user mode | 1011 |
+| 4.X | Block layer + virtio-blk | 1054 |
+| 4.X | procfs — kernel state as files under /proc | 1106 |
+| 4.X | devfs — drivers as files under /dev | 1138 |
+| 4.X | Configuration store | 1161 |
+| 4.X | Filesystem layer | 1177 |
+| 4.X | Block cache | 1237 |
+| 4.X | exFAT | 1266 |
+| 4.X | Timer | 1311 |
+| 4.10 | Kernel heap — slab + page_alloc (M19) | 1329 |
+| 4.11 | Serial debug | 1392 |
+| 4.X | Supported architectures — i386 + x86_64 (M20) | 1406 |
+| 4.12 | ACPI | 1547 |
+| 4.13 | GUI — compositor, WM, widgets, apps (M22 – M22.5) | 1568 |
+| 4.14 | GUI development — writing apps and desktop shells (M22.2) | 1844 |
+| 4.15 | Process model — init, hierarchy, reaper, kill-tree (M27) | 1919 |
+| 4.16 | Per-task GUI apps (M22.7 Stage A) | 1977 |
+| 4.17 | ARM64 (AArch64) port — Phases A–M (M21, full x86 parity) | 2056 |
+| 4.18 | System log — klog ring buffer + dmesg | 2397 |
+| 4.19 | Userland foundation — processes, fds, IPC, libc (M25) | 2461 |
+| 4.20 | Blocking primitives — wait-queue, task_wait, blocking IPC (... | 2538 |
+| 4.21 | Services & the service bus (M29) | 2595 |
+| 4.22 | Watchdog — freeze detection (M31) | 2656 |
+| 4.23 | cron — time-based task scheduling (M30) | 2697 |
+| 4.24 | Concurrent user processes + full-arch libc (Tier B — M25 tail) | 2730 |
+| 4.25 | Networking — virtio-net + TCP/IP stack (M24, i386) | 2781 |
+| 4.26 | Audio — AC97 codec + PCM output (M23, i386) | 2875 |
+| 4.27 | POSIX process model — fork/exec/wait/pipe/signals (M34, i386) | 2923 |
+| 4.28 | Threads + futex (M35, i386) | 3008 |
+| 4.29 | Package manager — content-addressed store (M35.5, first slice) | 3076 |
+| 4.30 | POSIX syscall breadth + libc growth (M36 stage 1, i386) | 3117 |
+| 4.31 | Linux i386 syscall-ABI compat layer (M36 stage 2 / §M41, i386) | 3151 |
+| 4.32 | Wayland display server (M26, stage 1 — wire protocol + hand... | 3302 |
+| 4.33 | Dynamic linking — ld.so / .so / dlopen (M37, i386) | 3408 |
+| 4.34 | C++ runtime — libstdc++ + exceptions (M38, i386) | 3475 |
+| 4.35 | Crypto, entropy & TLS (M39, i386) | 3506 |
+| 4.36 | On-device C compiler — TinyCC (M43 slice, i386) | 3602 |
+| 4.37 | Resilience & the ring-3 boundary (M46 + kernel audit) | 3642 |
+| 4.38 | Crash records & reporting (M47) | 3751 |
+| 4.38.1 | Closing a window is not a crash (M47.1) | 3820 |
+| 4.39 | x86_64 userland parity (M47.5) | 3866 |
+| 4.40 | Upstream libwayland-client (M40 stage 1) | 3964 |
+| 4.40.1 | EGL + GLES2 on Mesa softpipe (M40, DoD complete) | 4311 |
+| 4.41 | The ring-3 pointer gate was never armed for the Linux ABI (... | 4370 |
+| 4.42 | The memory ceiling, discovered rather than compiled in (M48) | 4403 |
+| 4.43 | NetSurf: input it can act on, and a fetcher (M48) | 4506 |
+| 4.44 | Mesa/EGL on i386 (M48) | 4586 |
+| 4.45 | The mmap cursor belonged to the address space (M48) | 4616 |
+| 4.46 | Load distribution across CPUs, measured (M49) | 4647 |
+| 4.47 | AArch64 grows a POSIX process model (A1) | 4956 |
+| 5 | Build & run | 5044 |
+| 6 | Compiler flags | 5071 |
+| 7 | Roadmap / open milestones | 5097 |
+| 8 | Change log | 5119 |
 
 ---
 
@@ -4952,6 +4953,92 @@ Priority is per-task only.  There is no group or per-user fairness (a process
 that spawns ten threads gets ten shares), which is fine until §M32 makes users
 real.
 
+### 4.47 AArch64 grows a POSIX process model (A1)
+
+M21 declared "full x86 parity" in 2026-07-10 and it was true then; §M34's
+`fork`/signals landed on x86 afterwards and were never carried across.
+`PLAN_AARCH64.md` scoped the catch-up as "mirror `hal/x86_64/fork.c`".
+Measured, that file was about a quarter of it.
+
+#### What was actually missing
+
+`struct user_regs` had no aarch64 branch, so the port silently used the **i386**
+definition — `eax`, `ebx`, `esi` at 64-bit width.  There was no
+`enter_user_mode_regs` to resume EL0 from a full register set, and no decode of
+a data abort into a copy-on-write resolution.  The absence of `fork.c` was the
+symptom the plan noticed; these three were the work.
+
+#### Copy-on-write
+
+`vmm_space_clone` walks the parent's user region (L1[4..511] → L2 → L3, since
+`vmm_user_base()` is 4 GiB), marks every leaf read-only in **both** spaces and
+tags it `PTE_SW_COW` — bit 56, software-reserved in a stage-1 descriptor, next
+to the existing `PTE_SW_SHARED`.  Read-only in both is the part that is easy to
+get wrong: leave the parent writable and it silently edits the child's memory.
+
+Borrowed pages (`PTE_SW_SHARED`, i.e. memfd and shared mappings) stay shared and
+writable — privatising one on first write would hand the child a copy nobody
+else can see, which is the opposite of what the mapping is for.
+
+The refcount table is sized from `pmm_nr_frames`, per §M48: a fixed window
+leaves any frame above it untracked, and an untracked shared frame is a double
+free the moment both address spaces exit.  Teardown releases COW pages through
+the count instead of freeing them outright.
+
+A 2 MiB block leaf in the user region would be shared writably by a plain
+descriptor copy.  Nothing creates one today (`aarch64_vmm_map_user` is 4 KiB
+granular), so the clone **refuses loudly** rather than guessing — if that ever
+changes, the failure is a message, not silent shared memory.
+
+#### Three things the x86 code cannot be transliterated into
+
+**SP_EL0 is not in the trapframe.**  Taking an exception from EL0 switches the
+CPU to SP_EL1 and leaves SP_EL0 banked, so `vectors.S` never had a reason to
+save it.  A forked child resuming in its own address space needs it, and so does
+signal delivery; both read and write it directly with `mrs`/`msr`.
+
+**The return address is a register.**  x86 pushes the signal trampoline so the
+handler's `ret` consumes it.  AArch64's `ret` branches to x30, so the trampoline
+goes in x30 and nothing is pushed — which is also why, on entry to
+`SYS_SIGRETURN`, the user SP points *exactly* at the saved context, with no
+return address above it to skip.
+
+**COW is checked before the uaccess fixup.**  When the kernel writes to a user
+page on a task's behalf (a `uaccess` copy into a freshly forked child's buffer),
+the right answer is to resolve the copy-on-write and continue — not to unwind
+the copy with `-EFAULT`.  Reversing the two makes fork-then-write-through-a-
+syscall fail in a way that looks like a bad pointer.
+
+One smaller thing: `enter_user_mode_regs` restores the register holding the
+frame pointer **last, through itself** (`ldr x9, [x9, #72]`).  Restore it any
+earlier and every remaining load reads from whatever the child's value happened
+to be.
+
+#### Where the proof runs
+
+The ARM serial console is `serial_shell.c`, a small REPL of its own — the full
+`shell.c` only comes up on a VC behind virtio-input, which a headless boot has
+no way to drive.  That is why `PLAN_AARCH64` scopes A1's definition of done to
+the serial shell, and why the three self-tests were added there.
+
+**Verified** on `qemu-system-aarch64 -M virt`: `forktest` reports
+`parent fork()=18, waitpid=18 status=7, secret still=111` — the child's write to
+`secret` did not reach the parent, so the COW isolation is real and not merely
+asserted; `pipetest` and `sigtest` pass (`handler ran in ring 3, caught signal
+10`, then sigreturn restores the interrupted context).  i386 and x86_64 rebuild
+unchanged.
+
+Also fixed on the way: the teardown path cast physical addresses to `uint32_t`
+before freeing them, which frees a *different* frame on any machine with RAM
+above 4 GiB.  Pre-existing, and exactly the §M48 shape.
+
+#### Still open on this arch
+
+`proc_clone_thread` (A4 — TLS is `TPIDR_EL0`, much simpler than i386's per-CPU
+GDT descriptor), and the whole of A2: without the Linux-ABI personality no musl
+binary runs, which is why the port still embeds three in-tree-libc programs
+where x86 embeds sixty.
+
 ---
 
 ## 5. Build & run
@@ -5030,6 +5117,29 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-07 — AArch64 A1: a POSIX process model on ARM (DOCS §4.47).**
+  M21's "full x86 parity" was true when written; §M34's fork and signals landed
+  on x86 afterwards and were never carried across.  `PLAN_AARCH64` scoped the
+  catch-up as "mirror `hal/x86_64/fork.c`" — measured, that file was about a
+  quarter of it: the port also had no aarch64 `struct user_regs` (it silently
+  used the **i386** one, `eax`/`ebx` at 64-bit width), no `enter_user_mode_regs`,
+  and no decode of a data abort into a copy-on-write resolution.  Now:
+  `vmm_space_clone` marks both sides read-only + `PTE_SW_COW`, `vmm_cow_fault`
+  privatises on first write (refcount table sized from `pmm_nr_frames`, per
+  §M48), `fork.c` + `signal.c`, and `SYS_FORK`/`WAITPID`/`EXECVE`/`PIPE`/`DUP2`/
+  `KILL`/`SIGACTION`/`SIGRETURN` in the dispatcher.  Three ARM-specific traps
+  worth remembering: **SP_EL0 is not in the trapframe** (EL0 exceptions switch
+  to SP_EL1 and leave it banked, so fork and signal delivery read it with
+  `mrs`); **the signal return address is a register**, not a stack slot, so the
+  trampoline goes in x30 and sigreturn finds the saved context exactly at the
+  user SP; and **COW must be resolved before the uaccess fixup**, or a kernel
+  write into a forked child's buffer unwinds as `-EFAULT` instead of copying the
+  page.  Verified over the ARM serial shell (`forktest` — `secret still=111`,
+  i.e. real isolation — plus `pipetest` and `sigtest`).  Also fixed: the
+  teardown path truncated 64-bit physical addresses to `uint32_t` before freeing
+  them.  Open on this arch: `proc_clone_thread` (A4) and the Linux-ABI
+  personality (A2), without which no musl binary runs at all.
 
 - **2026-08-06 — §M49: load distribution across CPUs, measured (DOCS §4.46).**
   §M18.6.1's load balancer only ran when a CPU's runqueue went empty — a

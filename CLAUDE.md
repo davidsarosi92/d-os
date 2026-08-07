@@ -18,6 +18,31 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **AARCH64 A1 — A POSIX PROCESS MODEL ON ARM (2026-08-07, DOCS §4.47,
+PLAN_AARCH64 stage A1).**  M21's "full x86 parity" was true when written; §M34's
+fork + signals landed on x86 afterwards and were never carried across.
+PLAN_AARCH64 scoped this as "mirror `hal/x86_64/fork.c`" — **that file was about
+a quarter of the job**: the port also had NO aarch64 `struct user_regs` (it fell
+through to the **i386** one — `eax`/`ebx` names at 64-bit width), no
+`enter_user_mode_regs`, and no data-abort decode into a COW resolution.
+Shipped: `vmm_space_clone` (both sides read-only + `PTE_SW_COW`, bit 56) +
+`vmm_cow_fault`, refcount table sized from `pmm_nr_frames` (§M48 lesson),
+`fork.c` + `signal.c`, and SYS_FORK/WAITPID/EXECVE/PIPE/DUP2/KILL/SIGACTION/
+SIGRETURN.  **Three ARM traps worth carrying into A2+:** (1) **SP_EL0 is NOT in
+the trapframe** — an EL0 exception switches to SP_EL1 and leaves it banked, so
+fork and signal delivery read/write it with `mrs`/`msr`; (2) **the signal return
+address is a REGISTER** (x30), not a stack slot, so nothing is pushed and
+`SYS_SIGRETURN` finds the saved context exactly at the user SP; (3) **COW must
+be resolved BEFORE the uaccess fixup** — a kernel write into a forked child's
+buffer must copy the page, not unwind as `-EFAULT`.  Verified over the ARM
+SERIAL shell (`serial_shell.c` is its own small REPL — the full `shell.c` needs
+a VC behind virtio-input, undrivable headless, which is why PLAN_AARCH64 scopes
+the proof there): `forktest` prints `secret still=111` (real COW isolation),
+`pipetest` + `sigtest` pass.  Also fixed a pre-existing truncation: teardown cast
+physical addresses to `uint32_t` before freeing them.  Next on this arch: **A2,
+the Linux-ABI personality** — without it no musl binary runs at all, which is
+why ARM embeds 3 in-tree-libc programs where x86 embeds ~60.
+
 ✅ **§M49 — LOAD DISTRIBUTION, MEASURED (2026-08-06, DOCS §4.46, i386 +
 x86_64, aarch64 builds).**  §M18.6.1's balancer ran **only when a runqueue went
 empty** — work stealing, not load distribution — so with every queue non-empty

@@ -31,9 +31,9 @@ Concretely, comparing symbol coverage:
 | capability | x86_64 | aarch64 |
 |---|---|---|
 | `linux_syscall_dispatch` (Linux ABI personality) | yes | **absent** |
-| `proc_fork` / `vmm_space_clone` / `vmm_cow_fault` | yes | **absent** |
-| `proc_clone_thread` (pthreads) | yes | **absent** |
-| signal delivery + sigreturn | yes | **absent** |
+| `proc_fork` / `vmm_space_clone` / `vmm_cow_fault` | yes | ✅ **A1** |
+| `proc_clone_thread` (pthreads) | yes | **absent** (A4) |
+| signal delivery + sigreturn | yes | ✅ **A1** |
 
 And the build's entire user-program list for aarch64 is:
 
@@ -41,7 +41,8 @@ And the build's entire user-program list for aarch64 is:
 ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o
 ```
 
-Three in-tree-libc programs.  x86 embeds ~60, including musl, the coreutils,
+Three in-tree-libc programs.  (A1 added `forktest`, `pipetest` and `sigtest` —
+still in-tree-libc, so the count that matters below is unchanged.)  x86 embeds ~60, including musl, the coreutils,
 `sh`, ld.so, Mbed TLS, TinyCC, libwayland, NetSurf and Mesa.
 
 That list is not a coincidence: **without the Linux-ABI personality no musl
@@ -65,6 +66,46 @@ force-kill safe point is wired.
 
 Ordered by dependency, not by appeal.  Each stage is independently
 verifiable — do not start one before its predecessor boots.
+
+### A1 — COW fork + signals  ✅ **SHIPPED (2026-08-07)**
+
+`vmm_space_clone` marks both sides read-only + `PTE_SW_COW` (bit 56, software-
+reserved in a stage-1 descriptor); `vmm_cow_fault` privatises on the first
+write; `fork.c` + `signal.c` mirror the x86_64 pair.  **Verified over the serial
+shell: `forktest`, `pipetest` and `sigtest` all pass** — `forktest` prints
+`secret still=111`, i.e. the child's write did not reach the parent, which is
+the COW isolation being real rather than asserted.
+
+**What the plan below underestimated.**  "Mirror `hal/x86_64/fork.c`" was not
+the whole job: the port was also missing `struct user_regs` (it fell through to
+the *i386* definition — `eax`/`ebx` names at 64-bit width), an
+`enter_user_mode_regs` to resume EL0 with a full register set, and any decode of
+a data abort into a COW resolution.  Roughly three quarters of the work was in
+those three gaps, not in the file the plan named.
+
+**Three AArch64-specific things worth carrying into A2+:**
+
+1. **SP_EL0 is not in the trapframe.**  Taking an exception from EL0 switches
+   the CPU to SP_EL1 and leaves SP_EL0 banked, so `vectors.S` never had a reason
+   to save it — but a forked child resuming in its own address space needs it,
+   and so does signal delivery.  Both read/write it directly with `mrs`/`msr`.
+2. **The return address is a register.**  x86 pushes the signal trampoline so
+   the handler's `ret` consumes it; AArch64's `ret` branches to x30, so the
+   trampoline goes in x30 and nothing is pushed — which is also why, on entry to
+   `SYS_SIGRETURN`, the user SP points *exactly* at the saved context with no
+   return address to skip.
+3. **COW must be checked before the uaccess fixup.**  When the kernel writes to
+   a user page on a task's behalf, the right answer is to resolve the
+   copy-on-write and continue, not to unwind the copy with `-EFAULT`.  Reversing
+   the two makes fork-then-write-through-a-syscall fail in a way that looks like
+   a bad pointer.
+
+Also fixed while in the teardown path: physical addresses were cast to
+`uint32_t` before being freed, which frees a *different* frame on any machine
+with RAM above 4 GiB — the same §M48 shape the note below warned about, already
+present.
+
+*Original plan, kept for the record:*
 
 ### A1 — COW fork + signals  *(prerequisite for everything)*
 `vmm_space_clone` + `vmm_cow_fault` for the 4-level AArch64 translation
