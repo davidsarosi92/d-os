@@ -4332,6 +4332,114 @@ spaces make force-kill safe).  All shipped → this milestone is unblocked.
 
 ---
 
+## §M50 — The guest-ABI translation engine (STARTED 2026-08-07)
+
+**Shipped so far (DOCS §4.48):** the pipeline exists and two live
+architectures run their musl userland through it.  What remains is
+migrating the rest of the vocabulary and adding the aarch64 shim.
+
+**Why it exists.**  `hal/x86/linux_abi.c` and `hal/x86_64/linux_abi.c` are
+2275 lines and ~160 `case` labels between them — two copies of one idea.
+aarch64 (PLAN_AARCH64 A2) would have been a third.  The syscall NUMBERS
+differ per platform; the MEANINGS do not.
+
+**The pipeline.**
+
+```
+guest trap ──► arch shim ──► number map ──► canonical op ──► handler
+  (regs)      (frame→args)  (per guest ABI)  (arch-neutral)   (shared)
+```
+
+- a new ARCHITECTURE is a shim (~6 lines: which registers hold what);
+- a new GUEST ABI is a table;
+- a new SYSCALL is one handler, and every arch gets it at once.
+
+**Migration is incremental by construction.**  The engine may DECLINE a
+number it does not know, and the hand-written switch stays as the
+fallback — so the 2275 lines move one operation at a time, with the old
+path beside the new one for comparison, instead of in one unverifiable
+jump.
+
+---
+
+### Can this reach Windows?  (design note, 2026-08-07)
+
+Asked directly, and worth writing down because the honest answer changes
+the shape of the vocabulary rather than just extending it.
+
+**The syscall boundary is the wrong cut for Windows.**  Linux's syscall
+numbers are a stable, documented contract — which is exactly why a number
+map works.  Windows' NT syscall numbers are *not*: they are an internal
+detail that changes between builds, and no Microsoft documentation
+promises them.  This is why neither Wine nor WSL1 translates there.  Wine
+cuts at the **library** boundary (a PE loader plus reimplemented
+`ntdll`/`kernel32`), WSL1 cut at the NT syscall layer and Microsoft
+eventually abandoned it for a real kernel in WSL2.
+
+So the pipeline generalises, but the cut point is per-guest:
+
+| guest | cut | why |
+|---|---|---|
+| Linux | syscall number → op | the ABI *is* the contract |
+| Windows | PE loader + DLLs → op | the DLL exports are the contract |
+
+The canonical operation vocabulary is what both land on — and that is the
+part worth building now, because it is the same asset either way.
+
+**Where the real chasms are.**  They are not in the syscall translation;
+they are semantic, and a table cannot hide them:
+
+- **Object model.**  A Linux fd is a small integer into a per-process
+  table.  An NT HANDLE is a reference to a typed, named, security-checked
+  kernel object.  Mapping one onto the other loses type and ACL.
+- **Paths.**  Drive letters, backslash separators, case-insensitive-but-
+  case-preserving semantics, the extended-length namespace, and the fact
+  that a Windows path can name things that are not files.
+- **Process creation.**  `fork` has no Windows equivalent — `CreateProcess`
+  builds a process from scratch.  Emulating `fork` on a Windows host is a
+  known-hard problem (Cygwin's is famously fragile); the reverse
+  (`CreateProcess` on a fork/exec kernel) is much easier, and is the
+  direction d-os would need.
+- **Errors and control flow.**  errno vs `GetLastError` vs HRESULT vs
+  structured exception handling; signals vs APCs.
+- **Memory.**  `mmap` vs the reserve/commit split of `VirtualAlloc`.
+- **The registry and security descriptors**, which have no analogue at all.
+
+**What that implies for the design here.**  Do not let the vocabulary
+quietly become "Linux with different numbers".  Two rules follow:
+
+1. **Name operations after what they DO**, not after any one system's
+   spelling — already the rule in `abi.h`, and the reason `ABI_SEEK` is
+   not `ABI_LSEEK`.
+2. **A semantic mismatch must be a visible adapter, not a silent lie.**
+   Where a guest's operation cannot be satisfied exactly, that belongs in
+   a named per-guest adapter with its own state (a HANDLE table, a path
+   translator), and it should be *possible to refuse* rather than
+   approximate.  §M29's service bus already has this shape — strict bind
+   by default, `BUS_ADAPTER` only when `bus.allow-adaptation` is set —
+   and the same discipline applies here.
+
+**Realistic staging, if it is ever pursued:**
+
+1. Finish the Linux side: migrate both x86 layers into the engine, add
+   the aarch64 shim (PLAN_AARCH64 A2).  This is the part with immediate
+   value, and it is what proves the vocabulary.
+2. A PE/COFF loader — independently useful and self-contained, and it
+   answers "can we even load one" before any ABI question arises.
+3. A minimal `ntdll`/`kernel32` subset in USERLAND, implemented on d-os
+   syscalls, with a HANDLE table and a path translator as real objects.
+   Target console programs only; a GUI program means reimplementing
+   `user32`/`gdi32`, which is a different project entirely.
+4. Only then ask whether any of it should move into the kernel.
+
+**Expectation setting:** stage 3 is where Wine has spent three decades.
+As a teaching exercise on "hello world" console binaries it is a few
+weekends; as compatibility with real software it is not a milestone, it
+is a career.  Worth doing for what it teaches about the boundary — worth
+being explicit that it will not run Photoshop.
+
+---
+
 ## Change log
 
 - **2026-08-06** — **§M49 SHIPPED: load distribution across CPUs, measured

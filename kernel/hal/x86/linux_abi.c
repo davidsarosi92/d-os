@@ -21,6 +21,7 @@
 #include "syscall.h"
 #include "idt.h"
 #include "task.h"
+#include "abi.h"      /* §M50 — the shared guest-ABI translation engine */
 #include "printf.h"
 #include "hal_api.h"
 #include "gdt.h"          /* gdt_tls_selector — the ring-3 %gs selector */
@@ -675,6 +676,24 @@ void linux_syscall_dispatch(struct int_frame* f) {
 }
 
 static void linux_syscall_body(struct int_frame* f) {
+    /* §M50 — THE ARCH SHIM.  Linux/i386 passes arguments in ebx,ecx,edx,esi,
+     * edi,ebp; that mapping is the ONLY architecture-specific thing about a
+     * syscall translation, and it is these six lines.  Everything the engine
+     * answers below is shared with x86_64 (and with any future arch) — the
+     * same operations, the same handlers, a different number map.
+     *
+     * Note what is NOT duplicated: `read` is 3 here and 0 on amd64, and neither
+     * this file nor the handler knows or cares.  That difference lives in
+     * kernel/core/abi_linux.c as data. */
+    {
+        long r;
+        if (abi_dispatch(&abi_map_linux_i386, f->eax,
+                         f->ebx, f->ecx, f->edx, f->esi, f->edi, f->ebp, &r)) {
+            f->eax = (uint32_t)r;
+            return;
+        }
+    }
+
     switch (f->eax) {
         case LNX_exit:
         case LNX_exit_group:

@@ -636,6 +636,8 @@ CORE_C_SRCS := \
     kernel/core/net.c \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
+    kernel/core/abi_engine.c \
+    kernel/core/abi_linux.c \
     kernel/core/pkg.c \
     kernel/drivers/audio/ac97.c \
     kernel/core/audio.c \
@@ -673,6 +675,8 @@ CORE_C_SRCS := \
     kernel/core/pkg.c \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
+    kernel/core/abi_engine.c \
+    kernel/core/abi_linux.c \
     kernel/core/net.c \
     kernel/core/audio.c \
     kernel/core/random.c \
@@ -805,6 +809,8 @@ CORE_C_SRCS := \
     kernel/core/audio.c \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
+    kernel/core/abi_engine.c \
+    kernel/core/abi_linux.c \
     kernel/core/pkg.c \
     kernel/drivers/usb/xhci.c \
     kernel/drivers/usb/usb_hid.c \

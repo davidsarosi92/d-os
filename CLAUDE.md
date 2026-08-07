@@ -18,6 +18,28 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+▶️ **§M50 STARTED — ONE GUEST-ABI TRANSLATION ENGINE (2026-08-07, DOCS §4.48,
+PLAN §M50).**  `hal/x86/linux_abi.c` + `hal/x86_64/linux_abi.c` = 2275 lines,
+~160 `case`s, **two copies of one idea**; aarch64 (A2) would have been a third.
+Linux numbers `read` 3/0/63 on i386/amd64/arm64 — same meaning, different DATA.
+Pipeline: **arch shim (frame→args) → per-guest number map → canonical op →
+shared handler** (`includes/abi.h`, `core/abi_engine.c`, `core/abi_linux.c`).
+A new ARCH = ~6 lines; a new GUEST ABI = a table; a new SYSCALL = one handler
+every arch gets at once.  **The engine may DECLINE** and the old switch stays as
+fallback — that is what makes the 2275 lines migrate ONE OPERATION AT A TIME
+with both paths side by side.  Vocabulary is named after MEANINGS not Linux
+spellings (`ABI_SEEK`, not `ABI_LSEEK`) — otherwise the interlingua quietly
+becomes "Linux with different numbers".  Both x86 arches now serve read/write/
+close/seek/mprotect/munmap/getpid/getppid through it, musl userland unchanged
+(`musltest`+`solibtest`+`crypttest` pass on both); `abi` prints the three number
+spaces side by side.  **Windows analysis in PLAN §M50:** the pipeline
+generalises, the CUT POINT does not — NT syscall numbers are not a contract
+(they change between builds), which is why Wine cuts at the DLL boundary and why
+WSL1 was replaced by a real kernel; the hard part is SEMANTICS (HANDLEs vs fds,
+CreateProcess vs fork, SEH vs signals, reserve/commit vs mmap), not numbering.
+Next: migrate more ops, then the aarch64 shim (PLAN_AARCH64 A2) — which also
+needs `make musl` made arch-parametric (today hardwired `--target=i386`).
+
 ✅ **AARCH64 A1 — A POSIX PROCESS MODEL ON ARM (2026-08-07, DOCS §4.47,
 PLAN_AARCH64 stage A1).**  M21's "full x86 parity" was true when written; §M34's
 fork + signals landed on x86 afterwards and were never carried across.

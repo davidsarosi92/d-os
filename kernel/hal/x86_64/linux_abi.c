@@ -28,6 +28,7 @@
 #include "syscall.h"
 #include "idt.h"
 #include "task.h"
+#include "abi.h"      /* §M50 — the shared guest-ABI translation engine */
 #include "percpu.h"     /* smp_ncpus — sched_getaffinity */
 #include "printf.h"
 #include "hal_api.h"
@@ -517,6 +518,24 @@ static void linux_syscall_body(struct int_frame* f) {
     uint64_t a0 = f->rdi, a1 = f->rsi, a2 = f->rdx;
     uint64_t a3 = f->r10, a4 = f->r8,  a5 = f->r9;
     (void)a4; (void)a5;
+
+    /* §M50 — THE ARCH SHIM.  Everything above this point is the only
+     * architecture-specific part of a syscall translation: which registers
+     * carry the number and the arguments.  Below it, the engine answers from a
+     * table shared with every other arch and guest ABI (kernel/core/abi_*.c).
+     *
+     * It is consulted FIRST and may decline: an operation the vocabulary does
+     * not name yet falls through to the hand-written switch below.  That is
+     * what lets 1000 lines of it migrate one operation at a time, with the old
+     * path still there to compare against, instead of in one unverifiable
+     * jump. */
+    {
+        long r;
+        if (abi_dispatch(&abi_map_linux_amd64, f->rax, a0, a1, a2, a3, a4, a5, &r)) {
+            f->rax = (uint64_t)r;
+            return;
+        }
+    }
 
     switch (f->rax) {
         case LNX_exit:

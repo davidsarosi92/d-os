@@ -16,80 +16,81 @@ when sections are added.)
 
 | § | Section | ~line |
 |---|---------|------:|
-| 1 | Project layout | 96 |
-| 2 | Boot flow | 162 |
-| 3 | Memory layout | 179 |
-| 4 | Components | 201 |
-| 4.0 | Module framework + console registry | 203 |
-| 4.1 | Terminal drivers | 276 |
-| 4.2 | Keyboard | 299 |
-| 4.3 | Shell | 312 |
-| 4.4 | HAL x86 | 348 |
-| 4.5 | GDT | 358 |
-| 4.6 | IDT + PIC + IRQ dispatch | 378 |
-| 4.7 | Multiboot info | 402 |
-| 4.8 | Physical Memory Manager — buddy allocator (M19) | 418 |
-| 4.9 | Virtual Memory Manager | 478 |
-| 4.X | Tasks + scheduler | 505 |
-| 4.X | SMP — APIC, AP boot, per-CPU, real spinlocks (M18) | 566 |
-| 4.X | HAL — arch-independent interface | 694 |
-| 4.X | Keyboard layouts | 751 |
-| 4.X | USB host stack — xHCI + HID boot keyboard | 826 |
-| 4.X | Virtual consoles / pane split | 926 |
-| 4.X | Ring 3 / user mode | 1011 |
-| 4.X | Block layer + virtio-blk | 1054 |
-| 4.X | procfs — kernel state as files under /proc | 1106 |
-| 4.X | devfs — drivers as files under /dev | 1138 |
-| 4.X | Configuration store | 1161 |
-| 4.X | Filesystem layer | 1177 |
-| 4.X | Block cache | 1237 |
-| 4.X | exFAT | 1266 |
-| 4.X | Timer | 1311 |
-| 4.10 | Kernel heap — slab + page_alloc (M19) | 1329 |
-| 4.11 | Serial debug | 1392 |
-| 4.X | Supported architectures — i386 + x86_64 (M20) | 1406 |
-| 4.12 | ACPI | 1547 |
-| 4.13 | GUI — compositor, WM, widgets, apps (M22 – M22.5) | 1568 |
-| 4.14 | GUI development — writing apps and desktop shells (M22.2) | 1844 |
-| 4.15 | Process model — init, hierarchy, reaper, kill-tree (M27) | 1919 |
-| 4.16 | Per-task GUI apps (M22.7 Stage A) | 1977 |
-| 4.17 | ARM64 (AArch64) port — Phases A–M (M21, full x86 parity) | 2056 |
-| 4.18 | System log — klog ring buffer + dmesg | 2397 |
-| 4.19 | Userland foundation — processes, fds, IPC, libc (M25) | 2461 |
-| 4.20 | Blocking primitives — wait-queue, task_wait, blocking IPC (... | 2538 |
-| 4.21 | Services & the service bus (M29) | 2595 |
-| 4.22 | Watchdog — freeze detection (M31) | 2656 |
-| 4.23 | cron — time-based task scheduling (M30) | 2697 |
-| 4.24 | Concurrent user processes + full-arch libc (Tier B — M25 tail) | 2730 |
-| 4.25 | Networking — virtio-net + TCP/IP stack (M24, i386) | 2781 |
-| 4.26 | Audio — AC97 codec + PCM output (M23, i386) | 2875 |
-| 4.27 | POSIX process model — fork/exec/wait/pipe/signals (M34, i386) | 2923 |
-| 4.28 | Threads + futex (M35, i386) | 3008 |
-| 4.29 | Package manager — content-addressed store (M35.5, first slice) | 3076 |
-| 4.30 | POSIX syscall breadth + libc growth (M36 stage 1, i386) | 3117 |
-| 4.31 | Linux i386 syscall-ABI compat layer (M36 stage 2 / §M41, i386) | 3151 |
-| 4.32 | Wayland display server (M26, stage 1 — wire protocol + hand... | 3302 |
-| 4.33 | Dynamic linking — ld.so / .so / dlopen (M37, i386) | 3408 |
-| 4.34 | C++ runtime — libstdc++ + exceptions (M38, i386) | 3475 |
-| 4.35 | Crypto, entropy & TLS (M39, i386) | 3506 |
-| 4.36 | On-device C compiler — TinyCC (M43 slice, i386) | 3602 |
-| 4.37 | Resilience & the ring-3 boundary (M46 + kernel audit) | 3642 |
-| 4.38 | Crash records & reporting (M47) | 3751 |
-| 4.38.1 | Closing a window is not a crash (M47.1) | 3820 |
-| 4.39 | x86_64 userland parity (M47.5) | 3866 |
-| 4.40 | Upstream libwayland-client (M40 stage 1) | 3964 |
-| 4.40.1 | EGL + GLES2 on Mesa softpipe (M40, DoD complete) | 4311 |
-| 4.41 | The ring-3 pointer gate was never armed for the Linux ABI (... | 4370 |
-| 4.42 | The memory ceiling, discovered rather than compiled in (M48) | 4403 |
-| 4.43 | NetSurf: input it can act on, and a fetcher (M48) | 4506 |
-| 4.44 | Mesa/EGL on i386 (M48) | 4586 |
-| 4.45 | The mmap cursor belonged to the address space (M48) | 4616 |
-| 4.46 | Load distribution across CPUs, measured (M49) | 4647 |
-| 4.47 | AArch64 grows a POSIX process model (A1) | 4956 |
-| 5 | Build & run | 5044 |
-| 6 | Compiler flags | 5071 |
-| 7 | Roadmap / open milestones | 5097 |
-| 8 | Change log | 5119 |
+| 1 | Project layout | 97 |
+| 2 | Boot flow | 163 |
+| 3 | Memory layout | 180 |
+| 4 | Components | 202 |
+| 4.0 | Module framework + console registry | 204 |
+| 4.1 | Terminal drivers | 277 |
+| 4.2 | Keyboard | 300 |
+| 4.3 | Shell | 313 |
+| 4.4 | HAL x86 | 349 |
+| 4.5 | GDT | 359 |
+| 4.6 | IDT + PIC + IRQ dispatch | 379 |
+| 4.7 | Multiboot info | 403 |
+| 4.8 | Physical Memory Manager — buddy allocator (M19) | 419 |
+| 4.9 | Virtual Memory Manager | 479 |
+| 4.X | Tasks + scheduler | 506 |
+| 4.X | SMP — APIC, AP boot, per-CPU, real spinlocks (M18) | 567 |
+| 4.X | HAL — arch-independent interface | 695 |
+| 4.X | Keyboard layouts | 752 |
+| 4.X | USB host stack — xHCI + HID boot keyboard | 827 |
+| 4.X | Virtual consoles / pane split | 927 |
+| 4.X | Ring 3 / user mode | 1012 |
+| 4.X | Block layer + virtio-blk | 1055 |
+| 4.X | procfs — kernel state as files under /proc | 1107 |
+| 4.X | devfs — drivers as files under /dev | 1139 |
+| 4.X | Configuration store | 1162 |
+| 4.X | Filesystem layer | 1178 |
+| 4.X | Block cache | 1238 |
+| 4.X | exFAT | 1267 |
+| 4.X | Timer | 1312 |
+| 4.10 | Kernel heap — slab + page_alloc (M19) | 1330 |
+| 4.11 | Serial debug | 1393 |
+| 4.X | Supported architectures — i386 + x86_64 (M20) | 1407 |
+| 4.12 | ACPI | 1548 |
+| 4.13 | GUI — compositor, WM, widgets, apps (M22 – M22.5) | 1569 |
+| 4.14 | GUI development — writing apps and desktop shells (M22.2) | 1845 |
+| 4.15 | Process model — init, hierarchy, reaper, kill-tree (M27) | 1920 |
+| 4.16 | Per-task GUI apps (M22.7 Stage A) | 1978 |
+| 4.17 | ARM64 (AArch64) port — Phases A–M (M21, full x86 parity) | 2057 |
+| 4.18 | System log — klog ring buffer + dmesg | 2398 |
+| 4.19 | Userland foundation — processes, fds, IPC, libc (M25) | 2462 |
+| 4.20 | Blocking primitives — wait-queue, task_wait, blocking IPC (... | 2539 |
+| 4.21 | Services & the service bus (M29) | 2596 |
+| 4.22 | Watchdog — freeze detection (M31) | 2657 |
+| 4.23 | cron — time-based task scheduling (M30) | 2698 |
+| 4.24 | Concurrent user processes + full-arch libc (Tier B — M25 tail) | 2731 |
+| 4.25 | Networking — virtio-net + TCP/IP stack (M24, i386) | 2782 |
+| 4.26 | Audio — AC97 codec + PCM output (M23, i386) | 2876 |
+| 4.27 | POSIX process model — fork/exec/wait/pipe/signals (M34, i386) | 2924 |
+| 4.28 | Threads + futex (M35, i386) | 3009 |
+| 4.29 | Package manager — content-addressed store (M35.5, first slice) | 3077 |
+| 4.30 | POSIX syscall breadth + libc growth (M36 stage 1, i386) | 3118 |
+| 4.31 | Linux i386 syscall-ABI compat layer (M36 stage 2 / §M41, i386) | 3152 |
+| 4.32 | Wayland display server (M26, stage 1 — wire protocol + hand... | 3303 |
+| 4.33 | Dynamic linking — ld.so / .so / dlopen (M37, i386) | 3409 |
+| 4.34 | C++ runtime — libstdc++ + exceptions (M38, i386) | 3476 |
+| 4.35 | Crypto, entropy & TLS (M39, i386) | 3507 |
+| 4.36 | On-device C compiler — TinyCC (M43 slice, i386) | 3603 |
+| 4.37 | Resilience & the ring-3 boundary (M46 + kernel audit) | 3643 |
+| 4.38 | Crash records & reporting (M47) | 3752 |
+| 4.38.1 | Closing a window is not a crash (M47.1) | 3821 |
+| 4.39 | x86_64 userland parity (M47.5) | 3867 |
+| 4.40 | Upstream libwayland-client (M40 stage 1) | 3965 |
+| 4.40.1 | EGL + GLES2 on Mesa softpipe (M40, DoD complete) | 4312 |
+| 4.41 | The ring-3 pointer gate was never armed for the Linux ABI (... | 4371 |
+| 4.42 | The memory ceiling, discovered rather than compiled in (M48) | 4404 |
+| 4.43 | NetSurf: input it can act on, and a fetcher (M48) | 4507 |
+| 4.44 | Mesa/EGL on i386 (M48) | 4587 |
+| 4.45 | The mmap cursor belonged to the address space (M48) | 4617 |
+| 4.46 | Load distribution across CPUs, measured (M49) | 4648 |
+| 4.47 | AArch64 grows a POSIX process model (A1) | 4957 |
+| 4.48 | One translation engine instead of one per architecture (M50) | 5043 |
+| 5 | Build & run | 5127 |
+| 6 | Compiler flags | 5154 |
+| 7 | Roadmap / open milestones | 5180 |
+| 8 | Change log | 5202 |
 
 ---
 
@@ -5039,6 +5040,88 @@ GDT descriptor), and the whole of A2: without the Linux-ABI personality no musl
 binary runs, which is why the port still embeds three in-tree-libc programs
 where x86 embeds sixty.
 
+### 4.48 One translation engine instead of one per architecture (M50)
+
+`hal/x86/linux_abi.c` and `hal/x86_64/linux_abi.c` are 2275 lines and ~160
+`case` labels between them, and they are two copies of one idea.  The aarch64
+port (PLAN_AARCH64 A2) would have been a third.  Linux numbers its syscalls
+differently on every architecture — `read` is 3 on i386, 0 on amd64, 63 on
+arm64 — but it is the same `read`.  The difference between the ports is
+numbering, and numbering is data.
+
+#### The pipeline
+
+```
+guest trap ──► arch shim ──► number map ──► canonical op ──► handler
+  (regs)      (frame→args)  (per guest ABI)  (arch-neutral)   (shared)
+```
+
+Each stage is replaceable alone.  A new **architecture** is a shim — six lines
+saying which registers hold the number, the arguments and the result.  A new
+**guest ABI** is a table.  A new **syscall** is one handler, and every
+architecture and every guest that names it gets it at once.
+
+`kernel/includes/abi.h` is the contract, `kernel/core/abi_engine.c` the
+handlers, `kernel/core/abi_linux.c` the three Linux number spaces as data.
+
+#### Two decisions worth keeping
+
+**The vocabulary is named after meanings, not after Linux.**  `ABI_SEEK`, not
+`ABI_LSEEK`.  Tying the interlingua to one system's spelling would quietly make
+that system the only guest that ever fits — and the point of an interlingua is
+the guests that are not written yet.
+
+**The engine may decline.**  `abi_dispatch` returns "not handled" for a number
+the map does not name, and the hand-written switch stays behind it as the
+fallback.  That is what makes migration incremental: 2275 lines move one
+operation at a time, with the old path beside the new one for comparison,
+instead of in a single unverifiable jump.  A handler that does not exist yet is
+a normal state, not an error.
+
+#### Where the truth is recorded rather than dressed up
+
+There is no `sys_munmap` — user `mmap` is a bump allocator that does not
+reclaim, so unmapping succeeds and leaks a bounded amount.  Both x86 layers
+have always done this.  The canonical handler says so in one place, so the gap
+stays visible instead of being rediscovered per architecture.
+
+#### Proof
+
+Both x86 architectures now route `read`, `write`, `close`, `seek`, `mprotect`,
+`munmap`, `getpid` and `getppid` through the shared engine, and their existing
+musl userland is unchanged by it: `musltest` (an unmodified **static** musl
+binary), `solibtest` (a **dynamic** one, so ld.so's own `read`/`seek`/`mprotect`
+traffic goes through the engine) and `crypttest` (Mbed TLS) all pass on i386
+and x86_64.  aarch64 builds; its shim is A2.
+
+`abi` prints the tables — one row per meaning, one column per platform:
+
+```
+MEANING     linux/i386   linux/amd64   linux/arm64
+op 1         3            0            63            (read)
+op 2         4            1            64            (write)
+op 3         6            3            57            (close)
+op 4         19           8            62            (seek)
+op 7         20           39           172           (getpid)
+```
+
+The arm64 column is filled in although no aarch64 shim consumes it yet —
+deliberately, because writing the numbering beside its siblings is where it is
+easiest to get right, and it makes "a new arch is a table" checkable rather
+than aspirational.
+
+#### On reaching further than Linux
+
+Whether this can host a Windows guest is analysed in PLAN.md §M50.  The short
+version: the pipeline generalises but the **cut point** does not.  Linux's
+syscall numbers are a documented contract, which is why a number map works;
+Windows' NT syscall numbers are an internal detail that changes between builds,
+which is why Wine cuts at the DLL boundary instead and why WSL1's kernel-level
+approach was eventually replaced by a real kernel.  The canonical vocabulary is
+the shared asset either way — but the hard part is never the numbers, it is the
+semantics: HANDLEs versus file descriptors, `CreateProcess` versus fork/exec,
+SEH versus signals, reserve/commit versus `mmap`.
+
 ---
 
 ## 5. Build & run
@@ -5117,6 +5200,24 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-07 — §M50 started: one guest-ABI translation engine instead of one
+  per architecture (DOCS §4.48).**  The two Linux personalities were 2275 lines
+  and ~160 `case` labels of the same idea, and aarch64 would have been a third.
+  Linux numbers `read` 3 on i386, 0 on amd64 and 63 on arm64 — same meaning,
+  different data.  New pipeline: arch shim (frame → argument vector) → per-guest
+  number map → canonical operation → shared handler.  A new architecture is six
+  lines, a new guest ABI is a table, a new syscall is one handler that every
+  arch gets at once.  The engine may DECLINE, with the hand-written switch as
+  fallback, so 2275 lines migrate one operation at a time rather than in one
+  unverifiable jump.  Both x86 arches now serve read/write/close/seek/mprotect/
+  munmap/getpid/getppid through it with their musl userland unchanged
+  (`musltest`, `solibtest`, `crypttest` pass on both).  New `abi` command prints
+  the three number spaces side by side.  PLAN §M50 records the analysis of
+  whether this can reach a Windows guest: the pipeline generalises but the cut
+  point does not — NT syscall numbers are not a contract, which is why Wine cuts
+  at the DLL boundary, and the hard part is semantics (HANDLEs vs fds,
+  CreateProcess vs fork, SEH vs signals), not numbering.
 
 - **2026-08-07 — AArch64 A1: a POSIX process model on ARM (DOCS §4.47).**
   M21's "full x86 parity" was true when written; §M34's fork and signals landed

@@ -49,7 +49,8 @@
 #include "crash.h"     /* §M47 — the `crash` report list */
 #include "proc.h"
 #include "syscall.h"
-#include "workqueue.h"  /* §M49 — deferred-work pool + wqtest */
+#include "workqueue.h"
+#include "abi.h"        /* §M50 — guest-ABI translation tables */  /* §M49 — deferred-work pool + wqtest */
 #include "fd.h"
 #include "service.h"
 #include "cron.h"
@@ -134,7 +135,7 @@ static void cmd_help(void) {
                   "  run <path.bas> (Tiny-BASIC)\n"
                   "  lslayout, setlayout <us|hu|...>, lscpu, taskset <pid> <mask>\n"
                   "  sched [ms] (how work is spread over the CPUs), loop [n], loopstop\n"
-                  "  nice <pid> <-20..19> (scheduling priority), wqtest [n]\n"
+                  "  nice <pid> <-20..19> (scheduling priority), wqtest [n], abi\n"
                   "  slabinfo, buddyinfo\n"
                   "  shutdown, reboot\n");
 }
@@ -1040,6 +1041,49 @@ static void cmd_wqtest(const char* args) {
         kprintf("wqtest: (+%u completions from other submitters — the xHCI "
                 "drain runs on this pool)\n",
                 (unsigned)(done1 - done0 - (uint64_t)runs));
+}
+
+/* --------------------------------------------------------------------
+ * `abi` — show the guest-ABI translation tables (§M50).
+ *
+ * The point of the engine is that a platform's syscall numbering is DATA,
+ * so the data should be readable.  Printing the three Linux number spaces
+ * side by side is also the clearest statement of what the engine does:
+ * one column per platform, one row per meaning.
+ * -------------------------------------------------------------------- */
+static void cmd_abi(void) {
+    int have = 0, total = 0;
+    abi_stats(&have, &total);
+    kprintf("abi: %d/%d canonical operations have handlers\n", have, total);
+
+    const struct abi_map* maps[] = {
+        &abi_map_linux_i386, &abi_map_linux_amd64, &abi_map_linux_arm64,
+    };
+    const unsigned nmaps = sizeof(maps) / sizeof(maps[0]);
+
+    /* kprintf is a minimal formatter with no width specifiers, so columns are
+     * padded by hand rather than by "%-14s". */
+    console_write("MEANING     ");
+    for (unsigned m = 0; m < nmaps; m++) { kprintf("%s   ", maps[m]->name); }
+    console_write("\n");
+
+    /* One row per MEANING, one column per platform: the same operation under
+     * three different numbers is the whole point. */
+    for (uint32_t i = 0; i < maps[0]->n_ents; i++) {
+        uint16_t op = maps[0]->ents[i].op;
+        kprintf("op %u", (unsigned)op);
+        console_write(op < 10 ? "         " : "        ");
+        for (unsigned m = 0; m < nmaps; m++) {
+            int found = -1;
+            for (uint32_t j = 0; j < maps[m]->n_ents; j++)
+                if (maps[m]->ents[j].op == op) { found = (int)maps[m]->ents[j].nr; break; }
+            if (found >= 0) kprintf("%d", found); else console_write("-");
+            console_write("            ");
+        }
+        console_write("\n");
+    }
+    console_write("abi: one meaning per row, one platform per column — the "
+                  "difference between platforms is the table, not the code\n");
 }
 
 /* `nice <pid> <value>` — scheduling priority, -20 (strongest) .. +19
@@ -3147,6 +3191,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "lscpu"))          { cmd_lscpu();                return; }
     if (starts_with(line, "nice "))    { cmd_nice(line + 5);         return; }
     if (streq(line, "wqtest"))         { cmd_wqtest("");             return; }
+    if (streq(line, "abi"))            { cmd_abi();                  return; }
     if (starts_with(line, "wqtest "))  { cmd_wqtest(line + 7);       return; }
     if (streq(line, "sched"))          { cmd_sched("");              return; }
     if (starts_with(line, "sched "))   { cmd_sched(line + 6);        return; }
