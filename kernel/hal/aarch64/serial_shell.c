@@ -91,6 +91,8 @@ static void cmd_help(void) {
             "  rm <path>         remove a file\n"
             "  blk [lba]         hexdump a sector of /dev/vda\n"
             "  usertest          drop to EL0 and run a userspace program\n"
+            "  forktest          fork()+waitpid() self-test (§A1)\n"
+            "  pipetest          pipe()+dup2() self-test (§A1)\n"
             "  clear             clear the screen\n");
 }
 
@@ -98,6 +100,32 @@ static void cmd_help(void) {
  * x86 shell's `ringtest`.  Runs a tiny program at EL0 that SYS_PRINTs + SYS_EXITs. */
 int aarch64_usertest(void);
 static void cmd_usertest(void) { aarch64_usertest(); }
+
+/* §A1 — the POSIX self-tests.  These live here rather than in shell.c because
+ * the ARM serial console runs THIS minimal REPL; the full shell.c only comes up
+ * on a VC once the framebuffer + virtio-input path is running, which a headless
+ * boot has no way to drive.  PLAN_AARCH64's definition of done for A1 is
+ * "passes over the serial shell" for exactly that reason. */
+extern const unsigned char _binary_user_forktest_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_forktest_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_pipetest_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_pipetest_elf_end[]   __attribute__((weak));
+
+int proc_exec_elf(const unsigned char* image, unsigned long len);
+
+static void run_blob(const char* name, const unsigned char* a,
+                     const unsigned char* b) {
+    if (!a || !b) { kprintf("%s: not embedded for this arch\n", name); return; }
+    kprintf("%s: exec'ing...\n", name);
+    int rc = proc_exec_elf(a, (unsigned long)(b - a));
+    kprintf("%s: returned rc=%d\n", name, rc);
+}
+static void cmd_forktest(void) {
+    run_blob("forktest", _binary_user_forktest_elf_start, _binary_user_forktest_elf_end);
+}
+static void cmd_pipetest(void) {
+    run_blob("pipetest", _binary_user_pipetest_elf_start, _binary_user_pipetest_elf_end);
+}
 
 static void cmd_meminfo(void) {
     uint32_t managed = pmm_managed_frames();
@@ -250,6 +278,8 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "rm"))     cmd_rm(args);
         else if (s_eq(cmd, "blk"))    cmd_blk(args);
         else if (s_eq(cmd, "usertest")) cmd_usertest();
+        else if (s_eq(cmd, "forktest")) cmd_forktest();
+        else if (s_eq(cmd, "pipetest")) cmd_pipetest();
         else if (s_eq(cmd, "clear"))  kprintf("\033[2J\033[H");
         else kprintf("unknown command '%s' (try 'help')\n", cmd);
     }

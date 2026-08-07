@@ -100,3 +100,55 @@ user_stub_msg:
     .asciz  "hello from EL0 (aarch64 userspace)!\n"
     .balign 4
 user_stub_end:
+
+/* -----------------------------------------------------------------------------
+ * void enter_user_mode_regs(struct user_regs* r);  — ONE-WAY, never returns.
+ *
+ * Resume EL0 with a complete register set.  fork()'s child uses this to appear
+ * at exactly the instruction after the parent's `svc`, with x0 = 0.
+ *
+ * Layout (kernel/includes/usermode.h, aarch64 branch):
+ *   [x0 + 0x00 .. 0xF0]  x0..x30
+ *   [x0 + 0xF8]          SP_EL0
+ *   [x0 + 0x100]         PC     → ELR_EL1
+ *   [x0 + 0x108]         PSTATE → SPSR_EL1
+ *
+ * The pointer arrives in x0, which is itself one of the registers to restore,
+ * so it is moved to x9 and x9 is restored last (through itself).  Restore the
+ * register holding the frame pointer any earlier and every load after it reads
+ * from whatever the child's value happened to be.
+ * --------------------------------------------------------------------------- */
+.global enter_user_mode_regs
+enter_user_mode_regs:
+    mov     x9, x0                      /* frame pointer, out of the way */
+
+    ldr     x10, [x9, #0xF8]            /* SP_EL0  */
+    msr     sp_el0, x10
+    ldr     x10, [x9, #0x100]           /* PC      */
+    msr     elr_el1, x10
+    ldr     x10, [x9, #0x108]           /* PSTATE  */
+    msr     spsr_el1, x10
+
+    ldp     x1,  x2,  [x9, #8 * 1]
+    ldp     x3,  x4,  [x9, #8 * 3]
+    ldp     x5,  x6,  [x9, #8 * 5]
+    ldp     x7,  x8,  [x9, #8 * 7]
+    ldp     x11, x12, [x9, #8 * 11]
+    ldp     x13, x14, [x9, #8 * 13]
+    ldp     x15, x16, [x9, #8 * 15]
+    ldp     x17, x18, [x9, #8 * 17]
+    ldp     x19, x20, [x9, #8 * 19]
+    ldp     x21, x22, [x9, #8 * 21]
+    ldp     x23, x24, [x9, #8 * 23]
+    ldp     x25, x26, [x9, #8 * 25]
+    ldp     x27, x28, [x9, #8 * 27]
+    ldp     x29, x30, [x9, #8 * 29]
+    ldr     x10, [x9, #8 * 10]
+    ldr     x0,  [x9, #8 * 0]
+    /* x9 LAST: it is still the frame pointer, so it has to read its own saved
+     * value THROUGH itself.  `ldr x9, [x9, ...]` is exactly that — reads, then
+     * overwrites the base.  Restoring it any earlier loses the pointer and
+     * every remaining load reads garbage. */
+    ldr     x9,  [x9, #8 * 9]
+    isb
+    eret                                /* → EL0; never returns here     */

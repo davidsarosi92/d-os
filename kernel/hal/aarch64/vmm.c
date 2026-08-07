@@ -29,6 +29,7 @@
 #include "pmm.h"
 #include "kmalloc.h"
 #include "printf.h"
+#include "task.h"   /* §A1 — vmm_cow_fault needs the current task's space */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -210,6 +211,16 @@ int vmm_map_4mib(uint32_t va, uint32_t pa, int flags) {
 /* Descriptor software-use bit (IGNORED by the hardware walk) marking a
  * BORROWED page — vmm_space_destroy leaves those frames for their owner. */
 #define PTE_SW_SHARED   (1ULL << 55)
+/* §A1 — a second software bit: this page is COPY-ON-WRITE.  Both the parent
+ * and the child of a fork() carry it, both mapped read-only; the first writer
+ * takes a permission fault and vmm_cow_fault privatises the page.  Bits 55-58
+ * are reserved for software use in a stage-1 descriptor, so the hardware walk
+ * ignores it. */
+#define PTE_SW_COW      (1ULL << 56)
+
+/* AP[2]: 0 = read/write, 1 = read-only.  Defined here (rather than beside
+ * vmm_space_protect further down) because the COW paths above it need it. */
+#define PTE_AP_RO_BIT   (1ULL << 7)
 
 /* Walk the KERNEL table (mmu_kernel_l1) for `va`; return phys or 0.  Handles
  * 1 GiB / 2 MiB block descriptors and 4 KiB pages.  Used by the isolation
@@ -235,6 +246,158 @@ uintptr_t vmm_user_base(void) { return 0x100000000ULL; }   /* 4 GiB */
 
 struct vmm_space* vmm_space_create(void) { return aarch64_vmm_create(); }
 
+/* ---------------------------------------------------------------------------
+ * Copy-on-write fork (§A1, the AArch64 twin of the two x86 vmm.c files).
+ *
+ * A frame shared by a fork can be owned by several address spaces at once, so
+ * "free it when this space dies" stops being true and a reference count has to
+ * decide.  The table is sized from `pmm_nr_frames`, i.e. from the RAM the
+ * firmware actually reported — the §M48 lesson, learned the expensive way on
+ * x86_64: a FIXED window meant any frame above it was untracked, and an
+ * untracked shared frame is a DOUBLE FREE the moment both spaces exit.
+ * Allocated from the boot arena because it must not itself be a buddy
+ * allocation that COW might later have to reason about.
+ * ------------------------------------------------------------------------- */
+
+void vmm_space_destroy(struct vmm_space* s);   /* defined below; clone unwinds with it */
+
+static uint16_t* g_cow_ref = NULL;
+static uint32_t  g_cow_nr  = 0;
+
+/* Refcount slot for a physical frame, or NULL if untracked (allocation failed,
+ * or the frame sits past what the PMM knows about).  An untracked frame is
+ * always COPIED rather than shared-in-place — the conservative direction: it
+ * wastes a page, where guessing the other way loses data. */
+static uint16_t* cow_slot(uintptr_t phys) {
+    if (!g_cow_ref) {
+        g_cow_nr  = pmm_nr_frames;
+        g_cow_ref = (uint16_t*)pmm_bootmem_alloc(g_cow_nr * (uint32_t)sizeof(uint16_t));
+        if (!g_cow_ref) { g_cow_nr = 0; return NULL; }
+        for (uint32_t i = 0; i < g_cow_nr; i++) g_cow_ref[i] = 0;
+    }
+    uintptr_t fn = phys >> 12;
+    return (fn < g_cow_nr) ? &g_cow_ref[fn] : NULL;
+}
+
+/* Drop a reference to a COW frame; free it when the last holder lets go.
+ * Called from the teardown path for every page carrying PTE_SW_COW. */
+static void cow_release(uintptr_t phys) {
+    uint16_t* rc = cow_slot(phys);
+    if (rc && *rc > 0) { (*rc)--; return; }   /* someone else still holds it */
+    pmm_free_frame((pmm_phys_t)phys);
+}
+
+/* Mark one leaf read-only + COW in place, and account the extra reference.
+ * Returns the descriptor to store in the CHILD (identical to the parent's). */
+static uint64_t cow_share_leaf(uint64_t* parent_slot) {
+    uint64_t pte = *parent_slot;
+    uintptr_t phys = (uintptr_t)(pte & PTE_ADDR_MASK);
+
+    /* A borrowed page (memfd / shared mapping) must stay shared and WRITABLE —
+     * that is the whole point of it.  Privatising it on first write would give
+     * the child a copy nobody else can see. */
+    if (pte & PTE_SW_SHARED) return pte;
+
+    uint16_t* rc = cow_slot(phys);
+    if (rc) {
+        /* First time this frame is shared, it has one holder already. */
+        if (*rc == 0) *rc = 1;
+        (*rc)++;
+    }
+    /* Read-only in BOTH spaces: the parent must fault on its own next write
+     * too, or it would silently edit the child's memory. */
+    uint64_t shared = (pte | PTE_AP_RO_BIT | PTE_SW_COW);
+    *parent_slot = shared;
+    return shared;
+}
+
+struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
+    if (!parent) return NULL;
+    struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof *s);
+    if (!s) return NULL;
+    /* The child inherits the parent's mappings, so it inherits the mmap
+     * cursor too — restarting at the region base would re-issue addresses the
+     * child already has mapped (§M48). */
+    s->mmap_cursor = parent->mmap_cursor;
+    s->l1 = alloc_table();
+    if (!s->l1) { kfree(s); return NULL; }
+
+    uint64_t* kl1 = mmu_kernel_l1();
+    for (int i = 0; i < 4; i++) s->l1[i] = kl1[i];      /* kernel low 4 GiB */
+
+    for (int i1 = 4; i1 < 512; i1++) {                  /* user region only */
+        uint64_t e1 = parent->l1[i1];
+        if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) continue;
+        uint64_t* pl2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+        uint64_t* cl2 = next_table(s->l1, (uint64_t)i1);
+        if (!cl2) { vmm_space_destroy(s); return NULL; }
+
+        for (int i2 = 0; i2 < 512; i2++) {
+            uint64_t e2 = pl2[i2];
+            if (!(e2 & PTE_VALID)) continue;
+            if (!(e2 & PTE_TABLE)) {
+                /* A 2 MiB block leaf.  Nothing maps user memory this way today
+                 * (aarch64_vmm_map_user is 4 KiB granular); copying the
+                 * descriptor would silently share 2 MiB writably, so refuse
+                 * loudly instead of guessing. */
+                kprintf("vmm: fork: unexpected 2MiB user block at l1[%d] l2[%d]\n", i1, i2);
+                vmm_space_destroy(s);
+                return NULL;
+            }
+            uint64_t* pl3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+            uint64_t* cl3 = next_table(cl2, (uint64_t)i2);
+            if (!cl3) { vmm_space_destroy(s); return NULL; }
+            for (int i3 = 0; i3 < 512; i3++)
+                if (pl3[i3] & PTE_VALID)
+                    cl3[i3] = cow_share_leaf(&pl3[i3]);
+        }
+    }
+    /* The parent's own entries just became read-only — its TLB still holds the
+     * writable versions, so without this its next write would NOT fault and it
+     * would scribble on the child's pages. */
+    __asm__ volatile ("dsb ish\ntlbi vmalle1\ndsb ish\nisb" ::: "memory");
+    return s;
+}
+
+/* Resolve a write fault on a COW page in the CURRENT address space.  Returns 1
+ * if it was ours to handle (retry the instruction), 0 if it is a real fault. */
+int vmm_cow_fault(uintptr_t fault_va) {
+    struct task* t = task_current();
+    if (!t || !t->mm) return 0;
+    uint64_t* l1 = t->mm->l1;
+    if (!l1) return 0;
+
+    uint64_t e1 = l1[(fault_va >> 30) & 0x1FF];
+    if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) return 0;
+    uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+    uint64_t e2 = l2[(fault_va >> 21) & 0x1FF];
+    if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) return 0;
+    uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+    unsigned i3 = (unsigned)((fault_va >> 12) & 0x1FF);
+    uint64_t pte = l3[i3];
+    if (!(pte & PTE_VALID) || !(pte & PTE_SW_COW)) return 0;   /* not a COW page */
+
+    uintptr_t old = (uintptr_t)(pte & PTE_ADDR_MASK);
+    uint16_t* rc  = cow_slot(old);
+
+    if (rc && *rc <= 1) {
+        /* Last tracked sharer — grant write in place, no copy needed. */
+        l3[i3] = (pte & ~PTE_AP_RO_BIT) & ~PTE_SW_COW;
+        *rc = 0;
+    } else {
+        pmm_phys_t nf = pmm_alloc_frame();
+        if (nf == PMM_ALLOC_FAIL) return 0;             /* OOM → a real fault */
+        const uint8_t* src = (const uint8_t*)(uintptr_t)old;
+        uint8_t* dst = (uint8_t*)(uintptr_t)nf;
+        for (int b = 0; b < 4096; b++) dst[b] = src[b];
+        if (rc && *rc > 0) (*rc)--;
+        l3[i3] = (((uint64_t)nf & PTE_ADDR_MASK) | (pte & ~PTE_ADDR_MASK))
+                 & ~PTE_AP_RO_BIT & ~PTE_SW_COW;
+    }
+    __asm__ volatile ("dsb ish\ntlbi vmalle1\ndsb ish\nisb" ::: "memory");
+    return 1;
+}
+
 /* Free the user-region tables (l1[4..]) + their frames; kernel-shared
  * blocks (l1[0..3]) are left alone. */
 static void free_l2_subtree(uint64_t* l2) {
@@ -242,10 +405,19 @@ static void free_l2_subtree(uint64_t* l2) {
         uint64_t e = l2[i];
         if ((e & PTE_VALID) && (e & PTE_TABLE)) {
             uint64_t* l3 = (uint64_t*)(uintptr_t)(e & PTE_ADDR_MASK);
-            for (int j = 0; j < 512; j++)
-                if ((l3[j] & PTE_VALID) && !(l3[j] & PTE_SW_SHARED))
-                    pmm_free_frame((uint32_t)(l3[j] & PTE_ADDR_MASK));  /* owned page */
-            pmm_free_frame((uint32_t)(e & PTE_ADDR_MASK));              /* L3 table */
+            for (int j = 0; j < 512; j++) {
+                uint64_t pte = l3[j];
+                if (!(pte & PTE_VALID) || (pte & PTE_SW_SHARED)) continue;
+                uintptr_t pa = (uintptr_t)(pte & PTE_ADDR_MASK);
+                /* §A1 — a COW frame may still belong to the other side of a
+                 * fork.  Freeing it outright here is the double free §M48
+                 * found on x86_64. */
+                if (pte & PTE_SW_COW) cow_release(pa);
+                else                  pmm_free_frame((pmm_phys_t)pa);
+            }
+            /* NOT (uint32_t): a physical address is 64-bit wide on this arch,
+             * and truncating it frees a DIFFERENT frame. */
+            pmm_free_frame((pmm_phys_t)(e & PTE_ADDR_MASK));            /* L3 table */
         }
     }
 }
@@ -256,10 +428,10 @@ void vmm_space_destroy(struct vmm_space* s) {
         if ((e & PTE_VALID) && (e & PTE_TABLE)) {
             uint64_t* l2 = (uint64_t*)(uintptr_t)(e & PTE_ADDR_MASK);
             free_l2_subtree(l2);
-            pmm_free_frame((uint32_t)(e & PTE_ADDR_MASK));             /* L2 table */
+            pmm_free_frame((pmm_phys_t)(e & PTE_ADDR_MASK));           /* L2 table */
         }
     }
-    pmm_free_frame((uint32_t)(uintptr_t)s->l1);                        /* L1 table */
+    pmm_free_frame((pmm_phys_t)(uintptr_t)s->l1);                      /* L1 table */
     kfree(s);
 }
 

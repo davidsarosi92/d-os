@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include "uaccess.h"      /* §1.1 — fault-fixup table for EL0 memory copies */
 #include "task.h"
+#include "vmm.h"   /* §A1 — vmm_cow_fault on a write to a fork-shared page */
 #include "hal_api.h"
 #include "crash.h"      /* §M47 — record every fault */
 
@@ -142,6 +143,33 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                 hal_intr_enable();
                 aarch64_syscall(tf);
                 return;                       /* → RESTORE_TRAPFRAME → eret to EL0 */
+            }
+            /* §A1 — copy-on-write.  After a fork() both parent and child hold
+             * their shared pages read-only, so the first write by either is a
+             * PERMISSION fault, not an error: vmm_cow_fault gives the writer a
+             * private copy and we retry the instruction.
+             *
+             * ESR encoding: EC 0x24 = data abort from a lower EL (EL0), 0x25 =
+             * from the current EL (EL1); DFSC (bits 5:0) 0b0011LL = permission
+             * fault at translation level LL; bit 6 (WnR) = 1 for a write.
+             *
+             * Checked BEFORE the uaccess fixup below, and the order is
+             * load-bearing: when the KERNEL writes to a user page on a task's
+             * behalf (a uaccess copy into a freshly forked child's buffer), the
+             * right answer is to resolve the COW and continue, not to unwind
+             * the copy with -EFAULT.  Reversing these two makes fork+write
+             * through a syscall fail in a way that looks like a bad pointer. */
+            {
+                uint64_t ec = esr >> 26;
+                if (ec == 0x24 || ec == 0x25) {
+                    uint64_t dfsc = esr & 0x3F;
+                    int is_write  = (int)((esr >> 6) & 1);
+                    if (is_write && (dfsc & 0x3C) == 0x0C) {   /* permission fault */
+                        uint64_t far;
+                        __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
+                        if (vmm_cow_fault((uintptr_t)far)) return;   /* retry */
+                    }
+                }
             }
             /* §1.1 — user-access exception table (parity with x86): an EL1
              * abort inside a uaccess primitive (an EL0 pointer that went bad

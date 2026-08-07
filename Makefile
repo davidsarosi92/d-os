@@ -495,6 +495,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/lib.c \
       kernel/hal/aarch64/smp.c \
       kernel/hal/aarch64/vmm.c \
+      kernel/hal/aarch64/fork.c \
       kernel/hal/aarch64/syscall.c \
       kernel/hal/aarch64/uaccess.c \
       kernel/hal/aarch64/fpu.c \
@@ -514,7 +515,11 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/smp_entry.S \
       kernel/hal/aarch64/usermode.S
 
-  ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o
+  # §A1 — the fork/pipe self-tests, now that aarch64 has proc_fork.  These are
+  # in-tree-libc programs and the build rules are already arch-parameterised,
+  # so adding them here is the whole change.
+  ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
+                     user/forktest_blob.o user/pipetest_blob.o
 
   # Tier B — in-tree user libc build knobs (aarch64).  Uses the cross toolchain
   # ($(CC)/$(LD)/$(CROSS)objcopy); user base is 4 GiB (above the identity map).

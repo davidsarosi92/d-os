@@ -33,7 +33,25 @@ void enter_user_mode(uintptr_t user_ip, uintptr_t user_sp)
  * child at the parent's post-`int 0x80` point with eax = 0).  Field order +
  * widths match the i386 usermode.s reader (offsets 0,4,8,...).  Never returns
  * (iret into ring 3).  i386 today; other arches provide their own. */
-#if defined(__x86_64__)
+#if defined(__aarch64__)
+/* aarch64: the full EL0 register set, laid out so fork() can resume the child
+ * exactly where the parent's `svc` returned, with x0 = 0.
+ *
+ * Deliberately the trapframe vectors.S already builds (x0..x30 + ELR + SPSR)
+ * plus the one thing that frame does NOT capture: SP_EL0.  On an exception from
+ * EL0 the CPU switches to SP_EL1 and leaves SP_EL0 banked and untouched, so the
+ * handler never had a reason to save it — but a child resuming in a DIFFERENT
+ * address space very much needs it.
+ *
+ * Field order and widths match the reader in kernel/hal/aarch64/usermode.S
+ * (enter_user_mode_regs): x[0..30] at 0..240, then user_sp, pc, pstate. */
+struct user_regs {
+    uint64_t x[31];        /* x0..x30; x0 is the syscall return value */
+    uint64_t user_sp;      /* SP_EL0 */
+    uint64_t pc;           /* ELR_EL1 — where EL0 resumes */
+    uint64_t pstate;       /* SPSR_EL1 */
+};
+#elif defined(__x86_64__)
 /* x86_64: a full GPR set for fork() to resume the child at the parent's post-
  * `syscall` point with rax = 0.  Field order matches the reader in
  * kernel/hal/x86_64/usermode.s (enter_user_mode_regs). */

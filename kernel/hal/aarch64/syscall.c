@@ -22,6 +22,8 @@
 #include "pmm.h"
 #include "usermode.h"
 #include "task.h"
+#include "proc.h"
+#include "usermode.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -124,6 +126,40 @@ static void aarch64_syscall_body(struct trapframe* tf) {
         case SYS_POLL:
             tf->x[0] = (uint64_t)sys_poll((struct pollfd*)(uintptr_t)tf->x[0],
                           (int)tf->x[1], (int)tf->x[2]);
+            break;
+
+        /* ---- §A1: POSIX process model (fork / wait / exec / pipes) -------- */
+        case SYS_FORK: {
+            /* Build the child's resume state from the trapframe, plus the one
+             * register the trapframe does not hold.  Taking an exception from
+             * EL0 switches the CPU to SP_EL1 and leaves SP_EL0 banked, so
+             * vectors.S never saved it — but the child resumes on that stack
+             * in its own address space, so read it here. */
+            struct user_regs r;
+            for (int i = 0; i < 31; i++) r.x[i] = tf->x[i];
+            r.x[0]   = 0;                     /* the child sees fork() == 0 */
+            __asm__ volatile ("mrs %0, sp_el0" : "=r"(r.user_sp));
+            r.pc     = tf->elr;               /* the instruction after `svc` */
+            r.pstate = tf->spsr;
+            tf->x[0] = (uint64_t)proc_fork(&r);
+            break;
+        }
+        case SYS_WAITPID: {
+            int status = 0;
+            int pid = task_wait((int)tf->x[0], &status);
+            if (tf->x[1]) *(int*)(uintptr_t)tf->x[1] = status;
+            tf->x[0] = (uint64_t)pid;
+            break;
+        }
+        case SYS_EXECVE:      /* on success it does not return */
+            tf->x[0] = (uint64_t)proc_execve((const char*)(uintptr_t)tf->x[0],
+                                             (char* const*)(uintptr_t)tf->x[1]);
+            break;
+        case SYS_PIPE:
+            tf->x[0] = (uint64_t)sys_pipe((int*)(uintptr_t)tf->x[0]);
+            break;
+        case SYS_DUP2:
+            tf->x[0] = (uint64_t)sys_dup2((int)tf->x[0], (int)tf->x[1]);
             break;
 
         default:
