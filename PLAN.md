@@ -2338,6 +2338,30 @@ sockaddr` layer + multiple concurrent TCP conns + TX segmentation; IRQ-driven RX
 + a `netd` task; TCP retransmit/congestion + a server role; DHCP (stage 7);
 IPv6; `/proc/net`; x86_64/aarch64 ports.
 
+**IRQ-driven RX, re-scoped after §M49 (2026-08-06).**  §M49 built the missing
+half of this — a deferred-work pool (`work_submit`, one worker per CPU) whose
+first consumer is the xHCI event drain, exactly the "ISR hands work to task
+context" shape RX needs.  What is NOT ready is `net.c` itself.  The file says so
+in its own header: *"everything therefore runs in one task context → no
+locking"*, and the whole stack is built on that — a static TX assembly buffer, a
+single `g_tcp` connection state, an ARP cache and UDP bindings with no
+serialisation, and every blocking helper (`arp_resolve`, `ping`, `tcp_connect`,
+`tcp_recv`) spinning on `dev->poll(dev)` from the CALLING task.  §M48 recorded
+the user-visible consequence: *the blocking read is what drives the NIC*.
+
+So RX-on-a-worker is not a driver change, it is a stack change, and in this
+order: (1) put the stack's state under one lock — the waitq's own, so the same
+lock that guards the state is the one waiters park on; (2) make the worker the
+SOLE caller of `dev->poll`, preserving today's single-consumer property rather
+than adding reentrancy to a stack that has never had it; (3) convert the spin
+loops to waitq waits woken by the RX path, which needs a timeout the current
+`waitq_block` does not have; (4) only then wire the NIC's own interrupt (the
+MSI/MSI-X allocator from §M18.6.5 is already there).  Doing (4) first is the
+tempting mistake: two pollers on one virtqueue.
+
+*Done when:* `ping`, `nslookup`, `wget` and NetSurf all still work, and a
+blocking `recv` no longer needs to be the thing that pumps the ring.
+
 **Why now:** after SMP and (probably) the x64 port, when the kernel
 can usefully share state across cores and a real network workload
 has the headroom to make sense.
@@ -4310,6 +4334,45 @@ spaces make force-kill safe).  All shipped → this milestone is unblocked.
 
 ## Change log
 
+- **2026-08-06** — **§M49 SHIPPED: load distribution across CPUs, measured
+  (DOCS §4.46, i386 + x86_64, aarch64 builds).**  §M18.6.1's load balancer ran
+  **only when a runqueue went empty** — a work-stealing rule, not a
+  load-distribution one — so with every queue non-empty an arbitrarily bad split
+  never corrected itself.  The design above (periodic pass, every N ticks) was
+  written and never built, and the source comment described it anyway, naming a
+  `LOAD_BALANCE_INTERVAL_MS` that existed nowhere.  **Nothing could have caught
+  it: `run_qemu.sh` passed no `-smp`**, so the balancer never ran on the path a
+  person uses — every SMP test supplied its own flag (the §M48 missing-NIC shape
+  again).  New **`sched [ms]`** samples the spread twice and reports the delta;
+  five hogs pinned to CPU0 got 15-20% of a core each while singletons got 66%,
+  **while every CPU read 100% busy** — aggregate utilisation is blind to this
+  entire class of bug.  Fixes: a periodic threshold pass (a migration swings the
+  difference by TWICE the moved task, hence the anti-ping-pong margin); load
+  measured as **demand** (share of time spent RUNNABLE) instead of queue length,
+  since four hogs and four sleepers are the same depth; **`task_msleep`,
+  `vc_getchar` and init's reaper made to really block** — three `hlt`+`yield`
+  loops, each under a comment asserting it was cheap, together keeping a core at
+  100% on an idle machine and making `cron`/`watchdog` measure as CPU hogs (*a
+  metric is only as honest as the state it observes*); and **priority**
+  (`nice -20..19` → a weight that is both quantum budget and load share).
+  Plus a **deferred-work pool** (`kernel/core/workqueue.c`), whose first
+  consumer is the **xHCI event-ring drain** — it ran inside the timer IRQ and
+  now only submits from there, which also closed a latent bug (`evt_drain` is
+  not reentrant, and the ISR could swallow the command completion the
+  enumerating task was waiting for).  Results: queue spread 2..6 → 2..3;
+  x86_64 seven of eight hogs at the ideal 49-50%; idle box one core at 100% →
+  four at 0-2%; `wqtest` 16 items over 4 CPUs in 26 ms against ~80 ms serial.
+  **Two lessons beyond the scheduler.**  (1) A ✅ row and a confident comment
+  are not evidence a design was implemented — and **ship the way to measure a
+  subsystem together with the subsystem**; `sched` took an hour and turned a
+  guess into a number.  (2) Making the sleeps real shifted the boot timing and
+  exposed a **latent SMP race**: four sites bound a task's console AFTER
+  spawning it under `preempt_disable()`, which §M18.6.2 made PER-CPU while
+  `task_enqueue` deliberately places the task on another core.  Every one of
+  them carried a comment explaining why it was safe.  *A guard whose scope
+  changed under it is worse than no guard, because the comment keeps vouching
+  for it.*  Open: `keyboard_getchar` + the GUI compositor/app-host loops are
+  still polls, and NIC RX needs `net.c` locked first (re-scoped under §M24).
 - **2026-08-04** — **§M48 SHIPPED: the memory ceiling is discovered, not
   compiled in; NetSurf becomes usable; Mesa reaches i386.**  See DOCS §4.42–4.44.
   The lesson worth carrying forward is not any single bug but the pattern behind

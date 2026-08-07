@@ -16,45 +16,79 @@ when sections are added.)
 
 | § | Section | ~line |
 |---|---------|------:|
-| 1 | Project layout | 51 |
-| 2 | Boot flow | 115 |
-| 3 | Memory layout | 132 |
-| 4 | Components | 154 |
-| 4.0 | Module framework + console registry | 156 |
-| 4.1 | Terminal drivers (FB + VGA) | 222 |
-| 4.2 | Keyboard (PS/2 IRQ-driven) | 245 |
-| 4.3 | Shell | 258 |
-| 4.4 | HAL x86 (io.c) | 294 |
-| 4.5 | GDT | 304 |
-| 4.6 | IDT + PIC + IRQ dispatch | 324 |
-| 4.7 | Multiboot info | 348 |
-| 4.8 | Physical Memory Manager (M19: buddy + zones) | 378 |
-| 4.9 | Virtual Memory Manager | ~440 |
-| 4.X | Tasks + scheduler (M13: preemption) | 422 |
-| 4.X | SMP — APIC, AP boot, per-CPU, real spinlocks (M18) | ~492 |
-| 4.X | HAL — arch-independent interface (M17) | ~580 |
-| 4.X | Keyboard layouts (M16) | ~665 |
-| 4.X | USB host stack — xHCI + HID (M15) | ~750 |
-| 4.X | Virtual consoles / pane split (M14) | ~840 |
-| 4.X | Ring 3 / user mode | ~925 |
-| 4.X | Supported architectures — i386 + x86_64 (M20) | ~1365 |
-| 4.X | Block layer + virtio-blk (M11) | 490 |
-| 4.X | procfs | 542 |
-| 4.X | devfs | 573 |
-| 4.X | Configuration store | 596 |
-| 4.X | Filesystem layer (VFS + ramfs) | 612 |
-| 4.X | Block cache (M12) | ~700 |
-| 4.X | exFAT (M12) | ~730 |
-| 4.X | Timer (PIT) | 646 |
-| 4.10 | Kernel heap (M19: slab + per-CPU mag + page_alloc) | ~1255 |
-| 4.11 | Serial debug (COM1) | 687 |
-| 4.12 | ACPI (shutdown) | 701 |
-| 4.13 | GUI — compositor, WM, widgets, apps (M22 – M22.5) | ~1532 |
-| 4.14 | GUI development — apps, desktop shells (M22.2+) | ~1752 |
-| 5 | Build & run | 722 |
-| 6 | Compiler flags | 735 |
-| 7 | Roadmap | 751 |
-| 8 | Change log | 766 |
+| 1 | Project layout | 95 |
+| 2 | Boot flow | 161 |
+| 3 | Memory layout | 178 |
+| 4 | Components | 200 |
+| 4.0 | Module framework + console registry | 202 |
+| 4.1 | Terminal drivers | 275 |
+| 4.2 | Keyboard | 298 |
+| 4.3 | Shell | 311 |
+| 4.4 | HAL x86 | 347 |
+| 4.5 | GDT | 357 |
+| 4.6 | IDT + PIC + IRQ dispatch | 377 |
+| 4.7 | Multiboot info | 401 |
+| 4.8 | Physical Memory Manager — buddy allocator (M19) | 417 |
+| 4.9 | Virtual Memory Manager | 477 |
+| 4.X | Tasks + scheduler | 504 |
+| 4.X | SMP — APIC, AP boot, per-CPU, real spinlocks (M18) | 565 |
+| 4.X | HAL — arch-independent interface | 693 |
+| 4.X | Keyboard layouts | 750 |
+| 4.X | USB host stack — xHCI + HID boot keyboard | 825 |
+| 4.X | Virtual consoles / pane split | 925 |
+| 4.X | Ring 3 / user mode | 1010 |
+| 4.X | Block layer + virtio-blk | 1053 |
+| 4.X | procfs — kernel state as files under /proc | 1105 |
+| 4.X | devfs — drivers as files under /dev | 1137 |
+| 4.X | Configuration store | 1160 |
+| 4.X | Filesystem layer | 1176 |
+| 4.X | Block cache | 1236 |
+| 4.X | exFAT | 1265 |
+| 4.X | Timer | 1310 |
+| 4.10 | Kernel heap — slab + page_alloc (M19) | 1328 |
+| 4.11 | Serial debug | 1391 |
+| 4.X | Supported architectures — i386 + x86_64 (M20) | 1405 |
+| 4.12 | ACPI | 1546 |
+| 4.13 | GUI — compositor, WM, widgets, apps (M22 – M22.5) | 1567 |
+| 4.14 | GUI development — writing apps and desktop shells (M22.2) | 1843 |
+| 4.15 | Process model — init, hierarchy, reaper, kill-tree (M27) | 1918 |
+| 4.16 | Per-task GUI apps (M22.7 Stage A) | 1976 |
+| 4.17 | ARM64 (AArch64) port — Phases A–M (M21, full x86 parity) | 2055 |
+| 4.18 | System log — klog ring buffer + dmesg | 2396 |
+| 4.19 | Userland foundation — processes, fds, IPC, libc (M25) | 2460 |
+| 4.20 | Blocking primitives — wait-queue, task_wait, blocking IPC (... | 2537 |
+| 4.21 | Services & the service bus (M29) | 2594 |
+| 4.22 | Watchdog — freeze detection (M31) | 2655 |
+| 4.23 | cron — time-based task scheduling (M30) | 2696 |
+| 4.24 | Concurrent user processes + full-arch libc (Tier B — M25 tail) | 2729 |
+| 4.25 | Networking — virtio-net + TCP/IP stack (M24, i386) | 2780 |
+| 4.26 | Audio — AC97 codec + PCM output (M23, i386) | 2874 |
+| 4.27 | POSIX process model — fork/exec/wait/pipe/signals (M34, i386) | 2922 |
+| 4.28 | Threads + futex (M35, i386) | 3007 |
+| 4.29 | Package manager — content-addressed store (M35.5, first slice) | 3075 |
+| 4.30 | POSIX syscall breadth + libc growth (M36 stage 1, i386) | 3116 |
+| 4.31 | Linux i386 syscall-ABI compat layer (M36 stage 2 / §M41, i386) | 3150 |
+| 4.32 | Wayland display server (M26, stage 1 — wire protocol + hand... | 3301 |
+| 4.33 | Dynamic linking — ld.so / .so / dlopen (M37, i386) | 3407 |
+| 4.34 | C++ runtime — libstdc++ + exceptions (M38, i386) | 3474 |
+| 4.35 | Crypto, entropy & TLS (M39, i386) | 3505 |
+| 4.36 | On-device C compiler — TinyCC (M43 slice, i386) | 3601 |
+| 4.37 | Resilience & the ring-3 boundary (M46 + kernel audit) | 3641 |
+| 4.38 | Crash records & reporting (M47) | 3750 |
+| 4.38.1 | Closing a window is not a crash (M47.1) | 3819 |
+| 4.39 | x86_64 userland parity (M47.5) | 3865 |
+| 4.40 | Upstream libwayland-client (M40 stage 1) | 3963 |
+| 4.40.1 | EGL + GLES2 on Mesa softpipe (M40, DoD complete) | 4310 |
+| 4.41 | The ring-3 pointer gate was never armed for the Linux ABI (... | 4369 |
+| 4.42 | The memory ceiling, discovered rather than compiled in (M48) | 4402 |
+| 4.43 | NetSurf: input it can act on, and a fetcher (M48) | 4505 |
+| 4.44 | Mesa/EGL on i386 (M48) | 4585 |
+| 4.45 | The mmap cursor belonged to the address space (M48) | 4615 |
+| 4.46 | Load distribution across CPUs, measured (M49) | 4646 |
+| 5 | Build & run | 4957 |
+| 6 | Compiler flags | 4984 |
+| 7 | Roadmap / open milestones | 5010 |
+| 8 | Change log | 5032 |
 
 ---
 
@@ -4985,6 +5019,13 @@ Linker: `ld -m elf_x86_64 -T linker-x86_64.ld -nostdlib -z max-page-size=0x1000`
   mappings.
 - [x] **M6 — VBE framebuffer + bitmap font:** graphical text mode so we
   can pick a sane resolution and font size.
+
+This list stops at M6 and has not been the roadmap for a long time —
+**PLAN.md is**, with a status table covering M1 through M49 plus the
+design sketches and definitions of done.  `PLAN_AARCH64.md` carries the
+ARM64 port's catch-up plan separately, organised by gap rather than by
+milestone.  Kept here only so a reader who lands in this section is not
+misled into thinking M6 is where the work ends.
 
 ---
 
