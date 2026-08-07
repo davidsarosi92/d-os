@@ -121,6 +121,8 @@ static long h_mmap(struct abi_ctx* c) {
 
 /* set_tid_address returns the caller's tid.  d-os has no separate tid space,
  * so the pid is the honest answer — the same one gettid gives. */
+static long h_sigprocmask(struct abi_ctx* c) { (void)c; return 0; }
+
 static long h_settid(struct abi_ctx* c) {
     (void)c;
     struct task* t = task_current();
@@ -160,6 +162,7 @@ static const struct {
     [ABI_BRK]      = { "brk",      h_brk },
     [ABI_MMAP]     = { "mmap",     h_mmap },
     [ABI_SET_TID_ADDRESS] = { "set_tid_address", h_settid },
+    [ABI_SIGPROCMASK]     = { "sigprocmask",     h_sigprocmask },
 };
 
 enum abi_op abi_lookup(const struct abi_map* map, unsigned long nr) {

@@ -31,6 +31,7 @@
 #include "kmalloc.h"
 #include "task.h"
 #include "workqueue.h"
+#include "pkg.h"
 #include "hal_api.h"
 void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "vfs.h"
@@ -274,6 +275,14 @@ void aarch64_main_entry(uint64_t dtb) {
         /* §M49 — deferred-work pool.  After init, because the workers are
          * spawned detached (parented to init). */
         workqueue_init();
+        /* A3 — provision the package store (/lib ld.so + the store recipes).
+         * On x86 this lives in kernel_main; aarch64 runs its OWN main_entry,
+         * the divergence PLAN_AARCH64 warns about.  Note it is here TWICE, once
+         * per boot path: the first attempt patched only the framebuffer branch
+         * and the headless serial boot silently had no store at all.  pkg_init
+         * is idempotent, which is what makes duplicating it safe — but the real
+         * fix is converging the two entry paths. */
+        pkg_init();
         virtio_input_init();                    /* keyboard + mouse (prints to serial) */
         struct vc* root = vc_root();
         if (root) {
@@ -291,6 +300,14 @@ void aarch64_main_entry(uint64_t dtb) {
         /* §M49 — deferred-work pool.  After init, because the workers are
          * spawned detached (parented to init). */
         workqueue_init();
+        /* A3 — provision the package store (/lib ld.so + the store recipes).
+         * On x86 this lives in kernel_main; aarch64 runs its OWN main_entry,
+         * the divergence PLAN_AARCH64 warns about.  Note it is here TWICE, once
+         * per boot path: the first attempt patched only the framebuffer branch
+         * and the headless serial boot silently had no store at all.  pkg_init
+         * is idempotent, which is what makes duplicating it safe — but the real
+         * fix is converging the two entry paths. */
+        pkg_init();
         kprintf("aarch64: no framebuffer — UART serial shell (pid 0 → idle).\n");
         if (!task_spawn("shell", serial_shell_entry))
             kprintf("aarch64: FATAL — failed to spawn serial shell\n");

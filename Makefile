@@ -544,7 +544,8 @@ else ifeq ($(ARCH),aarch64)
   # so adding them here is the whole change.
   ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
                      user/forktest_blob.o user/pipetest_blob.o \
-                     user/sigtest_blob.o user/muslhello_muslblob.o
+                     user/sigtest_blob.o user/muslhello_muslblob.o \
+                     $(MUSL_COREUTIL_BLOBS)
 
   # Tier B — in-tree user libc build knobs (aarch64).  Uses the cross toolchain
   # ($(CC)/$(LD)/$(CROSS)objcopy); user base is 4 GiB (above the identity map).

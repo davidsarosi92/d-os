@@ -21,6 +21,7 @@
 #include "printf.h"
 #include "pmm.h"
 #include "task.h"
+#include "pkg.h"
 #include "vfs.h"
 #include "block.h"
 #include <stdint.h>
@@ -95,6 +96,8 @@ static void cmd_help(void) {
             "  pipetest          pipe()+dup2() self-test (§A1)\n"
             "  sigtest           signal delivery self-test (§A1)\n"
             "  musltest          run an unmodified static musl binary (§A2)\n"
+            "  pkg list | pkg install <name>   package store (§A3)\n"
+            "  pkgrun <n> [args] run a store package (§A3)\n"
             "  clear             clear the screen\n");
 }
 
@@ -140,6 +143,49 @@ static void cmd_sigtest(void) {
  * The flag is set around the excursion exactly as shell.c does it on x86: the
  * personality is a property of the running task, and this shell task borrows it
  * for the duration of the call. */
+/* A3 — `pkg install <name>` / `pkg list`.  The store's recipes are REGISTERED
+ * at boot (pkg_init) but not installed; installing is the explicit act that
+ * builds the content-addressed path and links it into the profile. */
+static void cmd_pkg(const char* args) {
+    while (*args == ' ') args++;
+    if (s_eq(args, "list") || !*args) { pkg_list(); return; }
+    const char* p = args;
+    if (p[0]=='i' && p[1]=='n' && p[2]=='s' && p[3]=='t' && p[4]=='a' &&
+        p[5]=='l' && p[6]=='l' && p[7]==' ') {
+        p += 8;
+        while (*p == ' ') p++;
+        int rc = pkg_install(p);
+        kprintf("pkg: install '%s' rc=%d\n", p, rc);
+        return;
+    }
+    kprintf("usage: pkg list | pkg install <name>\n");
+}
+
+/* A3 — run a STORE package: `pkgrun <name> [args...]`.  The backend is chosen
+ * by data (pkg_backend_active), and the package's own recipe declares its ABI,
+ * so nothing here knows or cares that these are musl/Linux binaries. */
+static void cmd_pkgrun(const char* line) {
+    static char scratch[256];
+    const char* argv[16];
+    int argc = 0, n = 0;
+    while (line[n] && n < 255) { scratch[n] = line[n]; n++; }
+    scratch[n] = '\0';
+    int i = 0;
+    while (scratch[i] && argc < 16) {
+        while (scratch[i] == ' ') i++;
+        if (!scratch[i]) break;
+        char q = 0;
+        if (scratch[i] == '"' || scratch[i] == '\'') { q = scratch[i]; i++; }
+        argv[argc++] = &scratch[i];
+        if (q) { while (scratch[i] && scratch[i] != q) i++; }
+        else   { while (scratch[i] && scratch[i] != ' ') i++; }
+        if (scratch[i]) scratch[i++] = '\0';
+    }
+    if (argc == 0) { kprintf("usage: pkgrun <name> [args...]\n"); return; }
+    int rc = pkg_backend_active()->run(argc, (const char* const*)argv);
+    kprintf("pkgrun: '%s' returned rc=%d\n", argv[0], rc);
+}
+
 static void cmd_musltest(void) {
     const unsigned char* a = _binary_user_muslhello_muslelf_start;
     const unsigned char* b = _binary_user_muslhello_muslelf_end;
@@ -308,6 +354,8 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "pipetest")) cmd_pipetest();
         else if (s_eq(cmd, "sigtest"))  cmd_sigtest();
         else if (s_eq(cmd, "musltest")) cmd_musltest();
+        else if (s_eq(cmd, "pkgrun"))   cmd_pkgrun(args);
+        else if (s_eq(cmd, "pkg"))      cmd_pkg(args);
         else if (s_eq(cmd, "clear"))  kprintf("\033[2J\033[H");
         else kprintf("unknown command '%s' (try 'help')\n", cmd);
     }

@@ -89,6 +89,12 @@ enum abi_op {
     /* Threading identity used at libc startup. */
     ABI_SET_TID_ADDRESS,
 
+    /* Signal mask.  Answered as best-effort success: d-os has no per-task
+     * blocked-signal set yet, and a libc that cannot mask signals still runs
+     * correctly — it just cannot defer them.  Reporting failure instead would
+     * abort startup in libcs that treat it as fatal. */
+    ABI_SIGPROCMASK,
+
     ABI_OP_MAX
 };
 

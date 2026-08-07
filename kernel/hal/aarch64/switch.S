@@ -37,11 +37,29 @@ context_switch:
     stp     x25, x26, [sp, #-16]!
     stp     x27, x28, [sp, #-16]!
     stp     x29, x30, [sp, #-16]!
+    /* §A3 — TPIDR_EL0 is part of the thread context ON THIS ARCH, and it has to
+     * be saved HERE rather than by the scheduler.
+     *
+     * On x86 a task's thread pointer can only be changed through the kernel (a
+     * GDT descriptor on i386, the FS.base MSR on x86_64), so the scheduler
+     * knows when a task has one and restores it from task->tls_base.  AArch64
+     * lets EL0 write TPIDR_EL0 DIRECTLY — musl's aarch64 __set_thread_area is
+     * a single `msr`, no syscall — so the kernel is never told, task->has_tls
+     * stays 0, and the register survives only until some other task runs.
+     *
+     * The symptom was a forked musl child faulting at a small negative offset
+     * from zero: a thread pointer that had been someone else's, or none.
+     * Saving it with the callee-saved set makes it a property of the context,
+     * which is what it actually is. */
+    mrs     x2, tpidr_el0
+    stp     x2, xzr, [sp, #-16]!
 
     mov     x2, sp
     str     x2, [x0]              /* *save_sp_to = current SP           */
     mov     sp, x1               /* switch to the new task's stack      */
 
+    ldp     x2, xzr, [sp], #16
+    msr     tpidr_el0, x2
     ldp     x29, x30, [sp], #16
     ldp     x27, x28, [sp], #16
     ldp     x25, x26, [sp], #16

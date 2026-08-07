@@ -34,7 +34,11 @@ extern void task_exit(void) __attribute__((noreturn));
 
 /* Slot indices into the synthetic frame (see switch.S layout comment). */
 enum {
-    SLOT_X29 = 0, SLOT_X30,
+    /* §A3 — TPIDR_EL0 is pushed LAST by context_switch, so it pops FIRST and
+     * therefore sits at the lowest address: slot 0.  A brand-new task starts
+     * with a zero thread pointer, which is correct — it has not set one yet. */
+    SLOT_TPIDR = 0, SLOT_TPIDR_PAD,
+    SLOT_X29,     SLOT_X30,
     SLOT_X27,     SLOT_X28,
     SLOT_X25,     SLOT_X26,
     SLOT_X23,     SLOT_X24,

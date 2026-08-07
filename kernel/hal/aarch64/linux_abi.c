@@ -21,6 +21,8 @@
 #include "task.h"
 #include "fd.h"
 #include "syscall.h"
+#include "proc.h"
+#include "usermode.h"
 #include "printf.h"
 #include <stdint.h>
 
@@ -43,6 +45,8 @@ void aarch64_user_exit(void);          /* usermode.S — excursion teleport */
  * stack is saved per arch.  See kernel/core/abi_linux.c for the note. */
 #define LNX_ARM64_exit        93
 #define LNX_ARM64_exit_group  94
+#define LNX_ARM64_clone      220
+#define LNX_CLONE_VM      0x00000100u
 
 void linux_syscall_dispatch(struct trapframe* tf) {
     struct task* me = task_current();
@@ -59,6 +63,29 @@ void linux_syscall_dispatch(struct trapframe* tf) {
         if (me && me->user_task) { fd_close_all(); task_exit_code((int)tf->x[0]); }
         aarch64_user_exit();                     /* excursion: teleport back */
         if (me) me->in_user_syscall = prev;      /* unreachable */
+        return;
+    }
+
+    /* clone(2), fork flavour.  Frame-coupled like exit, and for the same
+     * reason: the child resumes from the PARENT'S register set, which only the
+     * shim can see.  arm64 orders the arguments (flags, stack, ptid, tls,
+     * ctid); without CLONE_VM the caller means fork, which is what a shell
+     * needs.  The thread flavour is A4. */
+    if (nr == LNX_ARM64_clone) {
+        unsigned long flags = tf->x[0];
+        if (!(flags & LNX_CLONE_VM)) {
+            struct user_regs r;
+            for (int i = 0; i < 31; i++) r.x[i] = tf->x[i];
+            r.x[0] = 0;
+            __asm__ volatile ("mrs %0, sp_el0" : "=r"(r.user_sp));
+            r.pc     = tf->elr;
+            r.pstate = tf->spsr;
+            tf->x[0] = (uint64_t)proc_fork(&r);
+        } else {
+            kprintf("linux/arm64: clone(CLONE_VM) — threads are A4\n");
+            tf->x[0] = (uint64_t)(-LNX_ENOSYS);
+        }
+        if (me) me->in_user_syscall = prev;
         return;
     }
 

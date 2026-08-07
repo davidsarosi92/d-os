@@ -33,6 +33,12 @@
  *   the canonical handler does exactly that, routing it here would change
  *   behaviour rather than move it.
  *
+ * `rt_sigprocmask` is mapped for arm64 only so far.  The x86 layers fold it
+ * into a shared "best-effort success" case alongside rt_sigaction, membarrier
+ * and fcntl; splitting one number out of that group is a behaviour change until
+ * each is checked individually, and the engine declining is cheaper than
+ * guessing.
+ *
  * Numbers verified against the Linux kernel's own tables:
  *   i386   arch/x86/entry/syscalls/syscall_32.tbl
  *   amd64  arch/x86/entry/syscalls/syscall_64.tbl
@@ -94,6 +100,7 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 222, ABI_MMAP     },
     {  96, ABI_SET_TID_ADDRESS },
     { 178, ABI_GETTID   },
+    { 135, ABI_SIGPROCMASK },
 };
 
 #define ARRAY_N(a) ((uint32_t)(sizeof(a) / sizeof((a)[0])))
