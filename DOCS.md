@@ -5365,19 +5365,56 @@ the stamp.**
   per-guest FLAG translation (Linux `O_*` → the VFS's).  A number map maps
   numbers; flags are a second table, and adding one is a design step, not an
   entry.
-- **`sh -c` with more than one command fails on BOTH x86 arches** — measured,
-  not fixed.  i386 faults at `eip=0x45ffff00` (a user *stack* address, i.e. it
-  returned into its own stack) with `cr2=0x1d`; x86_64 takes a page fault then a
-  #GP.  The same shape as the ARM bug — parent forks, the first child runs, the
-  parent's resume is wrong — but it cannot be the same cause, because x86 keeps
-  the user SP in the CPU-pushed frame.  This was invisible until now precisely
-  because the x86_64 `sh` blob was the AArch64 binary; i386 fails too, so the
-  §M36 claim that a multi-command `sh` works needs re-establishing rather than
-  assuming.  **Top of the list.**
-- An intermittent SMP `#GP` in `load_steal_one` (the §M49 balancer) was seen
-  once in five x86_64 boots at `-smp 2`, taking the runqueue lock down with it.
-  Not reproduced since; recorded here so the next sighting is the second one,
-  not the first.
+- **`sh -c` with more than one command fails on BOTH x86 arches, and only under
+  SMP.**  Narrowed, not root-caused — the state of the hunt is below so the next
+  session starts where this one stopped rather than from the symptom.
+
+  **Reproduction.**  `pkgrun sh -c "echo A; echo B"`, i386, `-smp 2`: fails
+  roughly two runs in three.  The **same binary at `-smp 1` passes every time**,
+  and so does `-smp 2` with a `kprintf` on the syscall path — i.e. it is a race,
+  not a logic error.  x86_64 behaves the same way (a #PF then a #GP).  It was
+  invisible until now because the x86_64 `sh` blob was the AArch64 binary; i386
+  fails too, so §M36's "a multi-command `sh` works" needs **re-establishing, not
+  assuming**.
+
+  **What the failure looks like.**  `A` prints, the *parent* (`pid 13 'shell'`,
+  running `sh` as an excursion) takes a user fault, and `B` still prints — so the
+  second child was forked and ran.  The parent's `esp`/`ebp` at the fault are
+  **identical across runs** (`esp=0x45fffc60`, `ebp=0x45fffdb8`, inside
+  `run_command`'s frame, its local `argv[]` visible on the stack and correct),
+  while the faulting `eip` is **different every time** and always garbage —
+  `0x45ffff00`, `0x45ffff59` (both inside its own argv strings), `0xfff`.  So the
+  parent reaches a fixed point in its own code and transfers control to a value
+  that varies: a corrupted code pointer or return address, not a corrupted stack
+  pointer.  That distinguishes it from the AArch64 bug above, which was the stack
+  pointer itself.
+
+  **Ruled out by measurement, not by argument:**
+
+  | Hypothesis | How it was killed |
+  |---|---|
+  | The artifact cache shipping a foreign-arch binary | fixed; i386 was never affected and still fails |
+  | `task_reap` freeing a task still linked in a runqueue | a check before `kfree` never fired in any run |
+  | Stale cross-CPU TLB after a COW resolution or migration | forced an unconditional `CR3` reload on every switch — **still fails** |
+  | `signal_deliver` rewriting a ring-0 frame | it guards on `(cs & 3) == 3`; correct |
+
+  **Still standing, and the thing to look at first:** *there is no TLB shootdown
+  IPI anywhere in the tree.*  Every `invlpg` in `hal/x86/vmm.c` and
+  `hal/x86_64/vmm.c` is CPU-local, and `lapic_send_ipi` is used only for the
+  preempt IPI.  Forcing a full `CR3` reload on every switch closes the
+  *migration* window but **not** the window where two tasks share one address
+  space and run concurrently on two cores — which is exactly what a `fork` in
+  flight looks like before the child's `execve` completes.  Proving or excluding
+  that needs a real shootdown, which is a milestone-sized change touching both
+  x86 arches.
+
+- An intermittent SMP kernel fault in `load_steal_one` (the §M49 balancer) — a
+  `#GP` on x86_64 and a `#PF` at `cr2=0xf0010123` on i386, each taking the
+  runqueue lock down with it and hanging the box in `schedule`.  Seen twice in
+  roughly a dozen `-smp 2` boots.  Likely the same underlying corruption as the
+  item above rather than a separate bug — a walk of the victim's ring is exactly
+  what notices a scribbled pointer first — but recorded separately until that is
+  shown rather than assumed.
 
 ---
 

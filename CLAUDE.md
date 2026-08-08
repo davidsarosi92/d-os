@@ -47,14 +47,26 @@ per-arch artifact cache filed `user/*.muslelf` by `build/.last_arch` — a HINT,
 wrong whenever `make` runs directly — and had parked an AArch64 `sh.muslelf` in
 the x86_64 slot, whence it was linked into the x86_64 kernel and surfaced as
 `rc=-7` (ELF_EBADARCH); **27 cached artifacts were mis-filed**.  The cache now
-keys on the file's own `e_machine`: *ask the file, not the stamp.*  **OPEN,
-MEASURED, NOT FIXED — TOP OF THE LIST: a multi-command `sh -c` fails on BOTH x86
-arches** (i386 returns into its own stack at `eip=0x45ffff00`; x86_64 #PF then
-#GP).  Invisible until now because the x86_64 blob was the wrong architecture —
-and i386 fails too, so §M36's "multi-command sh works" needs RE-ESTABLISHING,
-not assuming.  Also open: `ls` needs `openat`+`getdents64`, which need a place
-in the §M50 pipeline for per-guest FLAG translation (a second table, a design
-step).
+keys on the file's own `e_machine`: *ask the file, not the stamp.*  **OPEN, NARROWED, NOT ROOT-CAUSED —
+TOP OF THE LIST (full state of the hunt in DOCS §4.50): a multi-command `sh -c`
+fails on BOTH x86 arches and ONLY UNDER SMP.**  `-smp 1` passes every time;
+`-smp 2` fails ~2 runs in 3; adding a `kprintf` to the syscall path makes it pass
+— a RACE, not a logic error.  The parent's `esp`/`ebp` at the fault are IDENTICAL
+every run (inside `run_command`, its local `argv[]` intact) while the faulting
+`eip` is DIFFERENT every run and always garbage — so a corrupted **code pointer**,
+not a corrupted stack pointer (which is what distinguishes it from the ARM bug).
+Ruled out by measurement: the artifact cache (i386 never affected), `task_reap`
+freeing a still-queued task (probe never fired), stale cross-CPU TLB on migration
+(forced an unconditional CR3 reload — **still fails**), `signal_deliver` on a
+ring-0 frame (correctly guarded).  **Still standing and where to look first:
+THERE IS NO TLB SHOOTDOWN IPI IN THE TREE** — every `invlpg` on both x86 arches
+is CPU-local and `lapic_send_ipi` serves only the preempt IPI.  A CR3 reload
+closes the MIGRATION window but not the one where two tasks share an address
+space on two cores concurrently — exactly what a `fork` in flight is before the
+child's `execve` lands.  Also seen twice: an SMP kernel fault in `load_steal_one`
+(§M49 balancer) taking the runqueue lock down; probably the same corruption, not
+yet shown.  Also open: `ls` needs `openat`+`getdents64`, which need a place in
+the §M50 pipeline for per-guest FLAG translation (a second table, a design step).
 
 ✅ **AARCH64 A2 — UNMODIFIED musl RUNS ON ARM, IN ~80 LINES (2026-08-07, DOCS
 §4.49).**  `hal/aarch64/linux_abi.c` is **~80 lines** vs 1211 (x86) and 1064
