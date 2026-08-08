@@ -14,6 +14,7 @@
 #include "task.h"
 #include "fd.h"
 #include "proc.h"
+#include "vmm.h"        /* vmm_user_access_ok — guest-pointer validation */
 #include <stddef.h>
 
 /* --- canonical handlers ---------------------------------------------------
@@ -74,6 +75,15 @@ static long h_getppid(struct abi_ctx* c) {
  * adapter rather than here. */
 #define ABI_ENOTTY 25
 #define ABI_ENOSYS 38
+#define ABI_EFAULT 14
+
+/* Is [uptr, uptr+len) a writable GUEST address in the active space?  The check
+ * lives here, in the handler, because this is where the pointer's ORIGIN is
+ * known — the same rule the x86 layers arrived at the hard way (DOCS §M46:
+ * putting it in a shared sys_* helper broke every in-kernel caller). */
+static int abi_user_w_ok(unsigned long uptr, unsigned long len) {
+    return uptr && vmm_user_access_ok((uintptr_t)uptr, (uintptr_t)len, 1);
+}
 
 struct abi_iovec { void* base; unsigned long len; };
 
@@ -126,11 +136,22 @@ static long h_sigprocmask(struct abi_ctx* c) { (void)c; return 0; }
 
 /* wait4(pid, status, options, rusage) — rusage is ignored (d-os collects no
  * per-process resource accounting yet); reporting it as unsupported would fail
- * a shell that only ever wants the exit status. */
+ * a shell that only ever wants the exit status.
+ *
+ * The status word is an ENCODING, not the exit code: a guest reads it through
+ * WIFEXITED/WEXITSTATUS, which look for the code in bits 8..15 and the signal
+ * in bits 0..6.  Handing back the raw code happens to work for 0 and is wrong
+ * for every other value — the kind of bug that hides until a program checks
+ * whether its child succeeded. */
 static long h_wait(struct abi_ctx* c) {
-    int status = 0;
-    int pid = task_wait((int)c->a[0], &status);
-    if (c->a[1]) *(int*)(uintptr_t)c->a[1] = status;
+    int code = 0;
+    int pid = task_wait((int)c->a[0], &code);
+    if (c->a[1]) {
+        /* The status slot is the GUEST's pointer — validate it here, where its
+         * origin is known.  (§M46's lesson, three times over.) */
+        if (!abi_user_w_ok(c->a[1], sizeof(int))) return -ABI_EFAULT;
+        *(int*)(uintptr_t)c->a[1] = (code & 0xFF) << 8;   /* WIFEXITED form */
+    }
     return pid;
 }
 

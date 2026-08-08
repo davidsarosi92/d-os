@@ -283,7 +283,11 @@ static uint16_t* cow_slot(uintptr_t phys) {
  * Called from the teardown path for every page carrying PTE_SW_COW. */
 static void cow_release(uintptr_t phys) {
     uint16_t* rc = cow_slot(phys);
-    if (rc && *rc > 0) { (*rc)--; return; }   /* someone else still holds it */
+    if (rc && *rc > 1) { (*rc)--; return; }   /* someone else still holds it */
+    /* Last holder (rc 0 or 1), or an untracked frame.  `*rc > 0` here instead of
+     * `> 1` would decrement the final reference and return WITHOUT freeing —
+     * a silent leak of every page a fork ever shared.  Matches the x86_64 twin. */
+    if (rc) *rc = 0;
     pmm_free_frame((pmm_phys_t)phys);
 }
 
@@ -354,8 +358,14 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     }
     /* The parent's own entries just became read-only — its TLB still holds the
      * writable versions, so without this its next write would NOT fault and it
-     * would scribble on the child's pages. */
-    __asm__ volatile ("dsb ish\ntlbi vmalle1\ndsb ish\nisb" ::: "memory");
+     * would scribble on the child's pages.
+     *
+     * `vmalle1IS` (inner-shareable), NOT `vmalle1`: the plain form invalidates
+     * only THIS CPU.  A sibling thread of the parent running on another core
+     * would keep its stale writable entry and write straight through the COW —
+     * the failure would be silent data corruption between parent and child,
+     * visible only under -smp. */
+    __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");
     return s;
 }
 
@@ -394,7 +404,9 @@ int vmm_cow_fault(uintptr_t fault_va) {
         l3[i3] = (((uint64_t)nf & PTE_ADDR_MASK) | (pte & ~PTE_ADDR_MASK))
                  & ~PTE_AP_RO_BIT & ~PTE_SW_COW;
     }
-    __asm__ volatile ("dsb ish\ntlbi vmalle1\ndsb ish\nisb" ::: "memory");
+    /* Inner-shareable: another core may share this mm (threads) and still hold
+     * the read-only entry we just replaced.  See vmm_space_clone. */
+    __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");
     return 1;
 }
 

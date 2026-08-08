@@ -198,10 +198,25 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
              * (halt / reboot / kill) — same knob as x86. */
             if ((tf->spsr & 0xF) == 0) {
                 extern void task_exit_code(int) __attribute__((noreturn));
-                uint64_t far; __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
+                uint64_t far, sp0;
+                __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
+                __asm__ volatile ("mrs %0, sp_el0" : "=r"(sp0));
+                /* ESR is the difference between "jumped to a bad address" and
+                 * "dereferenced a bad address" — EC 0x20/0x21 is an INSTRUCTION
+                 * abort (FAR = the PC itself), 0x24/0x25 a DATA abort (FAR = the
+                 * operand).  Printing only elr/far leaves that ambiguous, and
+                 * guessing wrong sends the investigation to the wrong half of
+                 * the program.  SP_EL0 is here for the same reason: it is banked
+                 * out of the trapframe, so nothing else in a dump reveals it. */
                 uart_early_puts("\nfault: EL0 user exception elr=");
                 uart_early_puthex(tf->elr);
                 uart_early_puts(" far="); uart_early_puthex(far);
+                uart_early_puts(" esr="); uart_early_puthex(esr);
+                uart_early_puts(" sp_el0="); uart_early_puthex(sp0);
+                {
+                    struct task* ct = task_current();
+                    uart_early_puts(" task="); uart_early_puts(ct ? ct->name : "?");
+                }
                 uart_early_puts(" — killing process\n");
                 {   /* §M47 — record it for the reporting sinks. */
                     struct task* ct = task_current();

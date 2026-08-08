@@ -37,7 +37,10 @@ enum {
     /* §A3 — TPIDR_EL0 is pushed LAST by context_switch, so it pops FIRST and
      * therefore sits at the lowest address: slot 0.  A brand-new task starts
      * with a zero thread pointer, which is correct — it has not set one yet. */
-    SLOT_TPIDR = 0, SLOT_TPIDR_PAD,
+    /* SLOT_SP_EL0 shares that pair.  Zero is right for a brand-new task: a
+     * kernel thread never uses SP_EL0, and a task that will drop to EL0 gets a
+     * real one from enter_user_mode* before it ever runs there. */
+    SLOT_TPIDR = 0, SLOT_SP_EL0,
     SLOT_X29,     SLOT_X30,
     SLOT_X27,     SLOT_X28,
     SLOT_X25,     SLOT_X26,

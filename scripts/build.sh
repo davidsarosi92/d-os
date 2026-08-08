@@ -43,27 +43,65 @@ ARCH=${ARCH:-i386}
 CACHE=build/.userartifacts
 ART_GLOBS='user/*.muslelf user/*.dynelf user/*.cxxelf user/*.so user/*.so.* user/*.bin user/ldmusl.so'
 
-stash_artifacts() {          # $1 = arch whose artifacts are currently in user/
+# --- the cache is keyed by what a file IS, not by what the stamp claims ------
+#
+# `build/.last_arch` is only a HINT about which arch the files in user/ belong
+# to, and it can be wrong: `make` run directly bypasses this script, and an
+# interrupted build leaves artifacts behind without updating the stamp.  Filing
+# on the hint alone once parked an AArch64 `sh.muslelf` in the x86_64 slot, from
+# where it was restored, linked into the x86_64 kernel, and only surfaced at
+# RUNTIME as `pkgrun: 'sh' returned rc=-7` (ELF_EBADARCH) — a build accident
+# wearing a kernel bug's clothes.
+#
+# Every artifact carries its own architecture in its ELF header, so read it.
+elf_machine_for() {          # $1 = arch → the e_machine value it must carry
+    case "$1" in i386) echo 3;; x86_64) echo 62;; aarch64) echo 183;; *) echo "";; esac
+}
+artifact_arch() {            # $1 = file → its arch name, or "" if not an ELF
+    head -c 4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n' | grep -qi '^7f454c46$' \
+        || { echo ""; return; }
+    m=$(od -An -tu2 -j18 -N2 "$1" 2>/dev/null | tr -d ' ')
+    case "$m" in 3) echo i386;; 62) echo x86_64;; 183) echo aarch64;; *) echo "";; esac
+}
+stash_artifacts() {          # $1 = arch the files in user/ are BELIEVED to be
     [ "${DOS_ARTIFACT_CACHE:-1}" = 1 ] || return 0
-    mkdir -p "$CACHE/$1"
     for f in $ART_GLOBS; do
-        if [ -e "$f" ]; then mv -f "$f" "$CACHE/$1/" 2>/dev/null || true; fi
+        [ -e "$f" ] || continue
+        # File it under the arch the FILE says, falling back to the hint for a
+        # non-ELF artifact (there is nothing better to go on for those).
+        a=$(artifact_arch "$f"); [ -n "$a" ] || a="$1"
+        if [ "$a" != "$1" ]; then
+            echo "build: $(basename "$f") is $a, not $1 — parking it under $a"
+        fi
+        mkdir -p "$CACHE/$a"
+        mv -f "$f" "$CACHE/$a/" 2>/dev/null || true
     done
 }
 restore_artifacts() {        # $1 = arch to restore INTO user/ (missing files only)
     [ "${DOS_ARTIFACT_CACHE:-1}" = 1 ] || return 0
     [ -d "$CACHE/$1" ] || return 0
     for f in "$CACHE/$1"/*; do
-        if [ -e "$f" ] && [ ! -e "user/$(basename "$f")" ]; then
-            cp -p "$f" user/ 2>/dev/null || true
+        [ -e "$f" ] || continue
+        [ -e "user/$(basename "$f")" ] && continue
+        # Second gate: a cache entry that does not match its own slot is not
+        # restored (and not kept) — it would silently poison this arch's build.
+        a=$(artifact_arch "$f")
+        if [ -n "$a" ] && [ "$a" != "$1" ]; then
+            echo "build: cached $(basename "$f") is $a, not $1 — discarding it"
+            mkdir -p "$CACHE/$a"; mv -f "$f" "$CACHE/$a/" 2>/dev/null || rm -f "$f"
+            continue
         fi
+        cp -p "$f" user/ 2>/dev/null || true
     done
 }
 refresh_cache() {            # $1 = arch — keep the cache in step after a build
     [ "${DOS_ARTIFACT_CACHE:-1}" = 1 ] || return 0
     mkdir -p "$CACHE/$1"
     for f in $ART_GLOBS; do
-        if [ -e "$f" ]; then cp -p "$f" "$CACHE/$1/" 2>/dev/null || true; fi
+        [ -e "$f" ] || continue
+        a=$(artifact_arch "$f"); [ -n "$a" ] || a="$1"
+        mkdir -p "$CACHE/$a"                 # by content, same rule as the stash
+        cp -p "$f" "$CACHE/$a/" 2>/dev/null || true
     done
 }
 

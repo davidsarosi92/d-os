@@ -15,7 +15,8 @@
  * for a brand-new task it is `task_trampoline` (see task_arch.c), whose
  * matching x19 slot carries the task entry pointer.
  *
- * Push order (pre-index, SP decreasing): x19/x20 first … x29/x30 last, so
+* Push order (pre-index, SP decreasing): x19/x20 first … x29/x30 last, then
+ * TPIDR_EL0/SP_EL0, so
  * at the saved SP the layout (low→high address) is:
  *   [sp+0x00] x29   [sp+0x08] x30
  *   [sp+0x10] x27   [sp+0x18] x28
@@ -52,14 +53,36 @@ context_switch:
      * Saving it with the callee-saved set makes it a property of the context,
      * which is what it actually is. */
     mrs     x2, tpidr_el0
-    stp     x2, xzr, [sp, #-16]!
+    /* §A3 — SP_EL0 belongs here for the SAME reason, and leaving it out was a
+     * real bug, not a theoretical one.
+     *
+     * SP_EL0 is banked: taking an exception from EL0 switches the CPU to SP_EL1
+     * and leaves SP_EL0 alone, so it appears in no trapframe (A1 already learned
+     * that for fork and signal delivery).  But it is also never WRITTEN by the
+     * kernel except at the eret into EL0 — from then on it belongs to the user
+     * program, which moves it on every call.  Nothing else in the system holds a
+     * copy.
+     *
+     * So when task A blocks at EL0 (say in wait4) and task B runs at EL0, B's
+     * stack pointer stays in SP_EL0.  A's trapframe restores its registers and
+     * its PC and erets — with B'S STACK POINTER.  A then reads its locals and
+     * return addresses from whatever happens to live at those offsets in its own
+     * stack, and returns into nothing.  On x86 this class of bug cannot exist:
+     * the user SP is a field in the interrupt frame the CPU itself pushes.
+     *
+     * The symptom was `sh -c "echo one"` printing `one` and then the SHELL
+     * dying at a wild PC — the parent's first schedule-out at EL0 was its
+     * waitpid, so the corruption always landed after the child had run. */
+    mrs     x3, sp_el0
+    stp     x2, x3,  [sp, #-16]!
 
     mov     x2, sp
     str     x2, [x0]              /* *save_sp_to = current SP           */
     mov     sp, x1               /* switch to the new task's stack      */
 
-    ldp     x2, xzr, [sp], #16
+    ldp     x2, x3,  [sp], #16
     msr     tpidr_el0, x2
+    msr     sp_el0,    x3
     ldp     x29, x30, [sp], #16
     ldp     x27, x28, [sp], #16
     ldp     x25, x26, [sp], #16

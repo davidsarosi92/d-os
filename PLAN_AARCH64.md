@@ -162,11 +162,62 @@ unset on BOTH x86 layers for two milestones (§M47.2) precisely because
 nothing failed visibly without it.
 *Done when:* `musltest` runs an unmodified static musl binary.
 
-### A3 — musl + the store
+### A3 — musl + the store ✅ SHIPPED (2026-08-08, DOCS §4.50)
 Cross-build musl for `aarch64-linux-musl`, then the coreutils and `sh` as
 §M35.5 store packages.  The recipes are already arch-parameterised; the
 work is toolchain provisioning, not new code.
 *Done when:* `pkgrun sh -c "echo a; ls /store"` forks and execs.
+
+**It was not toolchain provisioning.**  The predicted work (a musl cross
+toolchain, arch-parametric recipes) took an afternoon; what the stage actually
+cost was two bugs the plan had no way to foresee, both of the same shape —
+**state that belongs to a task, held in a place nothing saves.**
+
+*Lesson 1 — SP_EL0 is part of the context, and the context switch never saved
+it.*  A1 recorded "SP_EL0 is NOT in the trapframe" and applied it to `fork` and
+signal delivery.  The conclusion was right and the scope was too small: SP_EL0
+is banked, and the kernel writes it exactly once (the `eret` into EL0) after
+which it belongs to the user program.  So when task A blocked at EL0 — for a
+shell, its `waitpid` — and task B ran at EL0, B's stack pointer stayed in the
+register, and A's `eret` resumed it **with B's stack**.  x86 cannot have this
+bug: the user SP is a field in the frame the CPU itself pushes.  The symptom
+was `sh -c "echo one"` printing `one` and then the shell dying at a wild PC —
+always after the child had run, because the parent's first schedule-out at EL0
+*was* the wait.  The fix is four instructions in `switch.S`, beside the
+TPIDR_EL0 save that landed one commit earlier for the identical reason.
+**Rule of thumb for any new arch: enumerate the registers the kernel writes
+once and the user owns thereafter; every one of them belongs in the switch.**
+
+*Lesson 2 — the failure was diagnosed by narrowing, not by guessing.*  Four
+plausible theories (COW double-free, stale TLB, trapframe corruption, a
+clobbered excursion SP) were each killed by a measurement rather than argued
+about: a `never free` experiment, a `-smp 1` run, a canary word in the
+trapframe, and finally a dump of the user stack — which showed kernel frame
+data at user addresses and named the answer outright.  The canary was the
+turning point: it proved the frame was **intact**, which eliminated every
+theory about the return path at once.
+
+*Also found on the way (fixed, all pre-existing):* `cow_release` decremented
+the LAST reference without freeing (every fork-shared page leaked);
+`vmm_space_clone`/`vmm_cow_fault` used `tlbi vmalle1` — CPU-local — where a
+sibling core keeps a stale writable entry and writes straight through the COW;
+and the shared `ABI_WAIT` handler returned the raw exit code instead of the
+`(code & 0xFF) << 8` status word a guest reads through `WIFEXITED`, with no
+validation of the guest's status pointer.
+
+*Not done:* `ls` still needs `openat` (56) + `getdents64` (61); they are the
+next two operations to migrate into the §M50 engine, and both need a place in
+the pipeline for per-guest FLAG translation (Linux `O_*` → VFS), which the
+number map does not have yet.  That is a real design step, not a table entry.
+
+**Build lesson (`scripts/build.sh`).** The per-arch artifact cache filed
+`user/*.muslelf` by `build/.last_arch` — a HINT, wrong whenever `make` is run
+directly or a build is interrupted.  An AArch64 `sh.muslelf` got parked in the
+x86_64 slot, restored, and linked into the x86_64 kernel, where it surfaced as
+`pkgrun: 'sh' returned rc=-7` — a build accident wearing a kernel bug's
+clothes.  27 of the cached artifacts turned out to be mis-filed.  The cache now
+keys on the file's own `e_machine`: **an artifact says which architecture it is,
+so ask it instead of the stamp.**
 
 ### A4 — threads, TLS, dynamic linking
 `proc_clone_thread` + `CLONE_CHILD_CLEARTID`, TLS via `TPIDR_EL0` (much

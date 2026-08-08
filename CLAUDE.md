@@ -18,6 +18,44 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **AARCH64 A3 — A SHELL THAT FORKS AND EXECS, AND THE REGISTER NOBODY SAVED
+(2026-08-08, DOCS §4.50).**  `pkgrun sh -c "echo A; echo B; echo C"` prints all
+three on ARM — a musl shell forking musl coreutils out of the store, third arch,
+`-smp 1` and `-smp 4`.  The predicted work (cross toolchain, arch-parametric
+recipes) was an afternoon; the stage was held up by **per-task state kept where
+nothing saves it, twice**: `TPIDR_EL0` (EL0 writes it with one `msr`, so
+`has_tls` is never set and a forked musl child dies at `TP-0xc8`), then
+**`SP_EL0`** — banked, absent from the trapframe, written by the kernel exactly
+once at the `eret` into EL0, and **never saved by `context_switch`**.  A task
+that blocked at EL0 resumed with whichever task ran there next, so `sh -c "echo
+one"` printed `one` and THEN the shell died at a wild PC (a shell's first
+schedule-out at EL0 is its `waitpid`).  **x86 cannot have this bug — the user SP
+is a field in the frame the CPU pushes — which is why no design review caught
+it.**  RULE FOR A4 AND ANY NEW ARCH: *enumerate the registers the kernel writes
+once and the user owns thereafter; every one belongs in the switch* (here:
+TPIDR_EL0, SP_EL0, FP/SIMD — all three found one crash at a time).  Found by
+NARROWING, not guessing: a never-free experiment, a `-smp 1` run, a **canary in
+the trapframe — which proved the frame INTACT and killed every theory about the
+return path at once**, `ESR` in the fault print, then a dump of the user stack
+showing kernel frame data at user addresses.  `ESR`+`SP_EL0`+task name are now
+permanent in that print.  Three pre-existing defects fixed on the way:
+`cow_release` decremented the LAST reference without freeing (every fork-shared
+page leaked); the COW paths used CPU-local `tlbi vmalle1` where a sibling core
+keeps a stale writable entry (→ `vmalle1is`); `ABI_WAIT` returned the raw exit
+code instead of `(code & 0xFF) << 8`, unvalidated.  **Build lesson:** the
+per-arch artifact cache filed `user/*.muslelf` by `build/.last_arch` — a HINT,
+wrong whenever `make` runs directly — and had parked an AArch64 `sh.muslelf` in
+the x86_64 slot, whence it was linked into the x86_64 kernel and surfaced as
+`rc=-7` (ELF_EBADARCH); **27 cached artifacts were mis-filed**.  The cache now
+keys on the file's own `e_machine`: *ask the file, not the stamp.*  **OPEN,
+MEASURED, NOT FIXED — TOP OF THE LIST: a multi-command `sh -c` fails on BOTH x86
+arches** (i386 returns into its own stack at `eip=0x45ffff00`; x86_64 #PF then
+#GP).  Invisible until now because the x86_64 blob was the wrong architecture —
+and i386 fails too, so §M36's "multi-command sh works" needs RE-ESTABLISHING,
+not assuming.  Also open: `ls` needs `openat`+`getdents64`, which need a place
+in the §M50 pipeline for per-guest FLAG translation (a second table, a design
+step).
+
 ✅ **AARCH64 A2 — UNMODIFIED musl RUNS ON ARM, IN ~80 LINES (2026-08-07, DOCS
 §4.49).**  `hal/aarch64/linux_abi.c` is **~80 lines** vs 1211 (x86) and 1064
 (x86_64) — not less capability but §M50's engine landing FIRST, so all that
