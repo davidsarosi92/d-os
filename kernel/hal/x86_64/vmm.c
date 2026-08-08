@@ -31,6 +31,7 @@
  * ============================================================================= */
 
 #include "vmm.h"
+#include "hal_api.h"   /* §M51 — hal_tlb_shootdown */
 #include "pmm.h"
 #include "printf.h"
 #include "kmalloc.h"
@@ -255,10 +256,12 @@ int vmm_map(uintptr_t virt, uintptr_t phys, uint32_t flags) {
     if (!pt) return -1;
 
     unsigned idx = IDX_PT(virt);
+    int was_present = (pt[idx] & PTE_P) != 0;
     pt[idx] = ((uint64_t)phys & PAGE_MASK_4K)
             | PTE_P
             | ((uint64_t)flags & (PTE_RW | PTE_US));
-    invlpg(virt);
+    if (was_present) hal_tlb_shootdown(0, virt);   /* §M51 — a remap weakens */
+    else             invlpg(virt);
     return 0;
 }
 
@@ -320,7 +323,7 @@ void vmm_unmap(uintptr_t virt) {
     uint64_t* pt = walk_to_pt(virt, /*create*/0, 0);
     if (!pt) return;            /* already unmapped or behind a large page */
     pt[IDX_PT(virt)] = 0;
-    invlpg(virt);
+    hal_tlb_shootdown(0, virt);          /* §M51 — present → absent */
 }
 
 uintptr_t vmm_translate(uintptr_t virt) {
@@ -557,6 +560,9 @@ static uintptr_t clone_subtree(uint64_t* ptbl, uint64_t* ktbl, int depth,
                 ptbl[i] = cow_e;                  /* parent loses write access  */
                 ntbl[i] = cow_e;                  /* child shares it read-only  */
                 invlpg(entry_va);                 /* parent's CR3 is live NOW    */
+                /* Remote CPUs are handled by ONE whole-space shootdown at the
+                 * end of the clone — per page it would be thousands of IPI
+                 * round trips for the same end state (§M51). */
                 continue;
             }
             /* Read-only (code) → eager private copy. */
@@ -602,6 +608,15 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
          * child fault (#PF err=5: present, user, protection). */
         s->pml4[0] = ((uint64_t)cphys & PAGE_MASK_4K) | (p0 & ~PAGE_MASK_4K);
     }
+    /* §M51 — clone_subtree took write access AWAY from the parent, entry by
+     * entry, and the parent may be runnable on another core RIGHT NOW: that is
+     * exactly the window between fork and the child's execve.  That core still
+     * holds writable entries for the pages we just protected, so its next write
+     * does NOT fault — it lands in the frame the child now shares, and the two
+     * processes corrupt each other with no fault and no log.  One whole-space
+     * shootdown, not one per page: the pages number in the thousands and every
+     * remote CPU flushes everything anyway. */
+    hal_tlb_shootdown(0, 0);
     return s;
 }
 
@@ -647,7 +662,10 @@ int vmm_cow_fault(uintptr_t fault_va) {
         pt[pti] = ((uint64_t)nf & PAGE_MASK_4K)
                 | ((((pte & ~PAGE_MASK_4K) | PTE_RW) & ~(uint64_t)VMM_COW));
     }
-    invlpg(fault_va & ~(uintptr_t)0xFFF);
+    /* §M51 — the entry now points at a different frame (or became writable in
+     * place); a sibling thread on another core still holds the old read-only
+     * one.  Without this it writes through a translation we already replaced. */
+    hal_tlb_shootdown(0, fault_va & ~(uintptr_t)0xFFF);
     return 1;
 }
 
@@ -658,9 +676,14 @@ int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
     if (!pt) return -1;
     /* VMM_SHARED (0x400) rides in PTE bit 10 (OS-available) so
      * free_subtree can skip borrowed frames it doesn't own. */
+    /* §M51 — see the i386 twin: only a REMAP over a present entry can weaken
+     * or redirect an existing translation, and only that needs every CPU told.
+     * A fresh map is free — nothing has it cached. */
+    int was_present = (pt[IDX_PT(virt)] & PTE_P) != 0;
     pt[IDX_PT(virt)] = ((uint64_t)phys & PAGE_MASK_4K)
                      | PTE_P | ((uint64_t)flags & (PTE_RW | PTE_US | VMM_SHARED));
-    invlpg(virt);
+    if (was_present) hal_tlb_shootdown(0, virt);
+    else             invlpg(virt);
     return 0;
 }
 
@@ -669,7 +692,7 @@ void vmm_space_unmap(struct vmm_space* s, uintptr_t virt) {
     uint64_t* pt = walk_to_pt_root(s->pml4, virt, /*create*/0, 0);
     if (!pt) return;
     pt[IDX_PT(virt)] = 0;
-    invlpg(virt);
+    hal_tlb_shootdown(0, virt);          /* §M51 — present → absent */
 }
 
 /* Change the protection of an already-mapped page WITHOUT touching its frame
@@ -685,7 +708,7 @@ int vmm_space_protect(struct vmm_space* s, uintptr_t virt, uint32_t flags) {
     pt[IDX_PT(virt)] = (pte & PAGE_MASK_4K) | PTE_P
                      | ((uint64_t)flags & (PTE_RW | PTE_US))
                      | (pte & VMM_SHARED);
-    invlpg(virt);
+    hal_tlb_shootdown(0, virt);          /* §M51 — may drop PTE_RW */
     return 0;
 }
 

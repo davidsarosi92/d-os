@@ -41,6 +41,7 @@
  * ========================================================================= */
 
 #include "vmm.h"
+#include "hal_api.h"   /* §M51 — hal_tlb_shootdown */
 #include "pmm.h"
 #include "printf.h"
 #include "kmalloc.h"
@@ -197,7 +198,14 @@ int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
  * kernel PD (vmm_map) and a per-process space's PD (vmm_space_map, M25)
  * share this exact walk.  `pd` points at a 1024-entry PDE array reachable
  * through the identity map (every PD we allocate lives below 1 GiB). */
-static int map_in_pd(uint32_t* pd, uint32_t virt, uint32_t phys, uint32_t flags) {
+/* `notify` = should a remap of an already-present entry be broadcast to the
+ * other CPUs?  Every ordinary caller says yes.  vmm_space_clone says NO — it
+ * rewrites the parent's ENTIRE user space one page at a time and then issues a
+ * single whole-space shootdown, because doing it per page is thousands of IPI
+ * round trips to achieve exactly the same end state.  (Getting that wrong is
+ * not subtle: a fork went from microseconds to never finishing.) */
+static int map_in_pd_ex(uint32_t* pd, uint32_t virt, uint32_t phys,
+                        uint32_t flags, int notify) {
     uint32_t pdi = PD_IDX(virt);
     uint32_t pti = PT_IDX(virt);
     uint32_t pde = pd[pdi];
@@ -226,9 +234,20 @@ static int map_in_pd(uint32_t* pd, uint32_t virt, uint32_t phys, uint32_t flags)
 
     /* VMM_SHARED (0x400) / VMM_COW (0x800) ride along in PTE OS-available bits
      * 10/11 so vmm_space_destroy + the COW fault path can classify the frame. */
+    /* §M51 — a remap (overwriting a PRESENT entry) can weaken or redirect an
+     * existing translation, so every CPU has to be told.  A fresh map cannot:
+     * a CPU with nothing cached will walk the table and find the new entry.
+     * The distinction matters — `map_in_pd` runs once per page of every ELF
+     * load and every mmap, and an IPI round trip on each would be brutal. */
+    int was_present = (pt[pti] & PTE_P) != 0;
     pt[pti] = (phys & PAGE_MASK) | PTE_P | (flags & (PTE_RW | PTE_US | VMM_SHARED | VMM_COW));
-    invlpg(virt);
+    if (was_present && notify) hal_tlb_shootdown(0, virt);
+    else                       invlpg(virt);
     return 0;
+}
+
+static int map_in_pd(uint32_t* pd, uint32_t virt, uint32_t phys, uint32_t flags) {
+    return map_in_pd_ex(pd, virt, phys, flags, /*notify*/1);
 }
 
 /* Core unmap, parameterised by the target page directory. */
@@ -242,7 +261,7 @@ static void unmap_in_pd(uint32_t* pd, uint32_t virt) {
 
     uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
     pt[pti] = 0;
-    invlpg(virt);
+    hal_tlb_shootdown(0, virt);          /* §M51 — weakening: every CPU */
 }
 
 /* Change the protection of an already-mapped page WITHOUT touching its frame
@@ -260,7 +279,7 @@ static int protect_in_pd(uint32_t* pd, uint32_t virt, uint32_t flags) {
     if ((pte & PTE_P) == 0) return -1;          /* not present */
     pt[pti] = (pte & PAGE_MASK) | PTE_P |
               (flags & (PTE_RW | PTE_US)) | (pte & (VMM_SHARED | VMM_COW));
-    invlpg(virt);
+    hal_tlb_shootdown(0, virt);          /* §M51 — may drop PTE_RW */
     return 0;
 }
 
@@ -477,7 +496,8 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
                  * Share the frame read-only in both spaces. */
                 uint16_t* rc = cow_slot(frame);
                 if (rc) { *rc = (*rc == 0) ? 2 : (uint16_t)(*rc + 1); }
-                map_in_pd(parent->pd, virt, frame, VMM_USER | VMM_COW);  /* parent RO+COW */
+                map_in_pd_ex(parent->pd, virt, frame, VMM_USER | VMM_COW,
+                             /*notify*/0);                  /* parent RO+COW */
                 if (map_in_pd(child->pd, virt, frame, VMM_USER | VMM_COW) != 0) {
                     vmm_space_destroy(child); return NULL;
                 }
@@ -494,6 +514,17 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
             }
         }
     }
+    /* §M51 — the loop above took write access AWAY from the parent, one entry
+     * at a time, and the parent may be runnable on another core RIGHT NOW
+     * (that is precisely the window between fork and the child's execve).
+     * That core still holds writable entries for the pages we just protected,
+     * so its next write does NOT fault: it lands in the frame the child now
+     * shares, and the two processes scribble on each other silently.
+     *
+     * One whole-space shootdown rather than one per page: the pages number in
+     * the thousands and every remote CPU flushes everything anyway, so per-page
+     * IPIs would cost thousands of round trips to achieve the same thing. */
+    hal_tlb_shootdown(0, 0);
     return child;
 }
 
@@ -527,7 +558,11 @@ int vmm_cow_fault(uintptr_t fault_va) {
         for (int k = 0; k < 1024; k++) dst[k] = src[k];
         pt[pti] = (nf & PAGE_MASK) | PTE_P | PTE_US | PTE_RW;
     }
-    invlpg(va & PAGE_MASK);
+    /* §M51 — the page now points at a DIFFERENT frame (or became writable in
+     * place).  A sibling thread on another core still holds the old, read-only
+     * entry; without this it keeps faulting on a page we already resolved, or
+     * worse, keeps reading the pre-copy frame. */
+    hal_tlb_shootdown(0, va & PAGE_MASK);
     return 1;
 }
 

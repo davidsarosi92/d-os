@@ -89,6 +89,7 @@ when sections are added.)
 | 4.48 | One translation engine instead of one per architecture (M50) | 5044 |
 | 4.49 | AArch64 runs unmodified musl (A2), and the engine proves it... | 5126 |
 | 4.50 | AArch64 A3 — a shell that forks and execs, and the regist... | 5256 |
+| 4.51 | The broadcast x86 does not have (M51 — TLB shootdown) | 5419 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -5416,6 +5417,109 @@ the stamp.**
   what notices a scribbled pointer first — but recorded separately until that is
   shown rather than assumed.
 
+### 4.51 The broadcast x86 does not have (M51 — TLB shootdown)
+
+`pkgrun sh -c "echo A; echo B; ls /store"` now runs to completion on i386 at
+`-smp 1`, `-smp 2` and `-smp 4`, with no faults.  Before this it failed roughly
+two runs in three at `-smp 2` and passed every time at `-smp 1` — the signature
+of a race, and the race was a missing TLB broadcast.
+
+#### What was wrong
+
+x86 does not broadcast TLB invalidation.  `invlpg` and a CR3 reload affect the
+CPU that executes them and nothing else, so a page-table edit made on one core
+leaves every other core translating the OLD entry.  Every `invlpg` in
+`hal/x86/vmm.c` and `hal/x86_64/vmm.c` was CPU-local, and nothing anywhere sent
+an invalidation IPI — `lapic_send_ipi` existed but served only the preempt IPI.
+
+Copy-on-write is a page-table edit whose entire safety argument is "the next
+write faults": `fork()` marks the parent's pages read-only so the parent's own
+next write traps and gets a private copy.  If the parent is also runnable on a
+second core — which is exactly the window between `fork` and the child's
+`execve` — that core still holds a WRITABLE entry for the pages just protected.
+Its next write does not fault.  It goes into the frame the child is now sharing,
+and the two processes scribble on each other with no fault and no log.
+
+AArch64 never had this hole: `tlbi ...is` is a hardware broadcast across the
+inner-shareable domain, which is why the ARM port's COW works and why
+`hal_tlb_shootdown` is empty there.  The difference in *how* is exactly what a
+HAL is for, so the entry point lives in `hal_api.h` and portable VMM code says
+"tell every CPU" once.
+
+#### The protocol (`kernel/hal/x86/tlb.c`, shared by both x86 arches)
+
+A ticket pair per CPU (`percpu.tlb_req` / `tlb_ack`) and nothing else — no lock,
+no shared request slot, no message:
+
+    sender   flush locally, then for every other online CPU take a ticket
+             (atomic ++tlb_req), send IPI vector 0x42, and wait for that
+             CPU's tlb_ack to reach the ticket.
+    target   flush everything, then publish tlb_ack = tlb_req.
+
+Three properties, each load-bearing:
+
+1. **The request carries no address.**  The remote action is always a full
+   flush, so overlapping requests from different senders cannot clobber each
+   other — which is what removes the need for a lock.  A per-VA `invlpg` would
+   be cheaper and would need a request slot, a lock, and an answer to "what if
+   two CPUs shoot down at once"; on a path that already costs an IPI round trip
+   that trade is not worth making.
+2. **`tlb_ack` is published after the flush**, never before.  The counter is
+   the promise.
+3. **The wait loop services its own slot.**  A shootdown can be issued from a
+   page-fault handler, i.e. with interrupts disabled, so a waiting CPU cannot
+   take the IPI another waiting CPU is waiting on.  Checking our own ticket in
+   the spin loop means a peer's request is honoured whether or not we can
+   currently take an interrupt, and the cycle cannot form.
+
+Uniprocessor is free: with one CPU online there is no remote work at all.
+
+#### Only weakening edits pay for it
+
+A remap over a PRESENT entry, an unmap, an mprotect and a COW resolution all
+broadcast.  A *fresh* map does not — a CPU with nothing cached will walk the
+table and find the new entry.  That distinction is not an optimisation, it is
+the difference between working and not: `map_in_pd` runs once per page of every
+ELF load and every mmap.
+
+`vmm_space_clone` is the other half of the same lesson.  It rewrites the
+parent's entire user space one page at a time, so the first version — which
+broadcast per page — turned a fork into thousands of IPI round trips and never
+finished.  The clone now suppresses the per-page broadcast (`map_in_pd_ex(...,
+notify=0)` on i386, a plain local `invlpg` on x86_64) and issues **one
+whole-space shootdown at the end**, which reaches the same end state.
+
+#### Lesson: the harness lied for an hour
+
+Most of the time on this went into a phantom.  After adding fields to
+`struct percpu` the shootdown appeared to hang: the target CPU was demonstrably
+alive (its tick and switch counters advanced) yet never took vector 0x42, and
+its `apic_id` read back as 3 on a two-CPU box whose boot log said 1.
+
+**This project has no header dependencies** — CLAUDE.md says so, and says to run
+`make clean ARCH=<arch>` after editing a shared header.  I had not.  Half the
+tree was compiled against the old `struct percpu` layout and half against the
+new one, so every per-CPU field was read at the wrong offset.  Every measurement
+taken in that window was fiction, and the "stuck IPI" never existed: after
+`make clean` the very first run passed.
+
+Two things to carry: a documented build convention is a *correctness*
+convention, not a style note; and **an impossible measurement — a field holding
+a value it cannot hold — is evidence about the build, not about the code.**
+
+#### Open
+
+- **x86_64 still fails at `-smp` ≥ 2, and it is NOT this bug.**  `-smp 1` runs
+  `sh -c "echo A; echo B"` cleanly; `-smp 2` takes kernel faults, one of them a
+  `#GP` inside `copy_str` while `execve` marshals argv.  Verified independently
+  of this change: with the shootdown wiring removed, `-smp 2` fails the same way
+  (a `#GP` at a garbage `rip`), so M51 neither caused nor fixed it.  i386 and
+  x86_64 share the VMM shape but not the syscall entry path, and the fault being
+  in a user-pointer copy points there.
+- The shootdown is a full remote flush.  Per-VA `invlpg` on the remote side
+  would need the request slot and lock described above; worth doing only if
+  measurement shows the flush costs something real.
+
 ---
 
 ## 7. Roadmap / open milestones
@@ -5441,6 +5545,44 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-08 — §M51: the broadcast x86 does not have (DOCS §4.51).**  x86 does
+  not broadcast TLB invalidation — `invlpg` and a CR3 reload are strictly local
+  — and nothing in the tree ever sent an invalidation IPI.  Copy-on-write's
+  entire safety argument is "the next write faults", so a parent runnable on a
+  second core during the window between `fork` and the child's `execve` kept a
+  WRITABLE entry for pages `fork` had just protected: its next write did not
+  fault, it landed in the frame the child was sharing, and the two processes
+  corrupted each other with no fault and no log.  That is why
+  `pkgrun sh -c "echo A; echo B"` failed ~2 runs in 3 at `-smp 2` and passed
+  every time at `-smp 1`.  New `kernel/hal/x86/tlb.c` (shared by both x86
+  arches) does the broadcast with IPI vector 0x42 and a per-CPU ticket pair —
+  no lock, no request slot, because the remote action is always a FULL flush,
+  which makes overlapping requests harmless; the ack is published only after
+  the flush; and **the wait loop services its own slot**, without which two
+  simultaneous shootdowns from interrupt-disabled contexts wait on each other
+  forever.  AArch64 needs none of it (`tlbi ...is` is a hardware broadcast), so
+  its `hal_tlb_shootdown` is an empty function with the reason written down.
+  Only WEAKENING edits pay: a remap over a present entry, unmap, mprotect and
+  the COW resolution broadcast; a fresh map does not, and that distinction is
+  what keeps `map_in_pd` (once per page of every ELF load) affordable.
+  `vmm_space_clone` suppresses the per-page broadcast entirely and issues ONE
+  whole-space shootdown at the end — the first version broadcast per page and
+  turned a fork into thousands of IPI round trips that never finished.
+  **Verified: i386 clean at `-smp 1`, `-smp 2` and `-smp 4`.**  **Lesson: the
+  harness lied for an hour.**  After adding fields to `struct percpu` the
+  shootdown appeared to hang — the target CPU was alive (tick/switch counters
+  advancing) yet never took the vector, and its `apic_id` read back as 3 on a
+  box whose boot log said 1.  This project has no header dependencies and
+  CLAUDE.md says to `make clean` after editing a shared header; I had not, so
+  half the tree used the old `struct percpu` layout.  Every measurement in that
+  window was fiction and the first run after `make clean` passed.  *A
+  documented build convention is a correctness convention, and an impossible
+  measurement is evidence about the build, not about the code.*  **Open:
+  x86_64 still fails at `-smp` ≥ 2 and it is NOT this bug** — `-smp 1` is clean,
+  `-smp 2` takes a kernel `#GP` inside `copy_str` while `execve` marshals argv,
+  and removing the shootdown wiring reproduces the same failure, so M51 neither
+  caused nor fixed it.
 
 - **2026-08-08 — AArch64 A3: a shell that forks and execs, and the register
   nobody saved (DOCS §4.50).**  `pkgrun sh -c "echo A; echo B; echo C"` prints

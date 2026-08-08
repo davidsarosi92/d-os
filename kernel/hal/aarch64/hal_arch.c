@@ -145,3 +145,19 @@ int hal_elf_can_exec(unsigned cls, unsigned machine) {
  * always-on RAM region) fills these in. */
 int hal_nvram_read(unsigned idx, uint8_t* out) { (void)idx; (void)out; return 0; }
 int hal_nvram_write(unsigned idx, uint8_t val) { (void)idx; (void)val; return 0; }
+
+/* §M51 — TLB shootdown.  Empty on purpose, and the emptiness is the point.
+ *
+ * AArch64 broadcasts invalidation in HARDWARE: `tlbi ...is` reaches every core
+ * in the inner-shareable domain, so the invalidation stays where the page-table
+ * edit is (see vmm_space_clone and vmm_cow_fault, which both use the `is`
+ * form).  x86 has no such instruction — `invlpg` and a CR3 reload are strictly
+ * local — so there the broadcast has to be built out of an IPI, which is what
+ * hal/x86/tlb.c is.
+ *
+ * Keeping the entry point in the shared HAL rather than #ifdef-ing the callers
+ * means portable VMM code can say "tell every CPU" once and be right on both
+ * architectures; the difference in HOW is exactly what the HAL is for. */
+void hal_tlb_shootdown(uintptr_t root_phys, uintptr_t va) {
+    (void)root_phys; (void)va;
+}

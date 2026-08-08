@@ -18,6 +18,44 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M51 — THE BROADCAST x86 DOES NOT HAVE (2026-08-08, DOCS §4.51, i386
+verified at -smp 1/2/4).**  x86 does NOT broadcast TLB invalidation — `invlpg`
+and a CR3 reload are strictly local — and **nothing in the tree ever sent an
+invalidation IPI**.  COW's whole safety argument is "the next write faults", so
+a parent runnable on a second core in the window between `fork` and the child's
+`execve` kept a WRITABLE entry for pages `fork` had just protected: its next
+write did NOT fault, it landed in the frame the child was sharing, and the two
+processes corrupted each other **with no fault and no log**.  That is why
+`pkgrun sh -c "echo A; echo B"` failed ~2 runs in 3 at `-smp 2` and passed every
+time at `-smp 1`.  New **`kernel/hal/x86/tlb.c`** (shared by both x86 arches):
+IPI vector 0x42 + a per-CPU **ticket pair** (`percpu.tlb_req`/`tlb_ack`) — no
+lock and no request slot, because the remote action is always a **FULL flush**,
+which makes overlapping requests harmless; the ack is published only AFTER the
+flush; and **the wait loop services its own slot**, without which two
+simultaneous shootdowns from interrupt-disabled contexts wait on each other
+forever.  aarch64 needs none of it (`tlbi ...is` IS the hardware broadcast) —
+its `hal_tlb_shootdown` is an empty function with the reason written down.
+**Only WEAKENING edits pay:** remap-over-present, unmap, mprotect and the COW
+resolution broadcast; a FRESH map does not, and that distinction is what keeps
+`map_in_pd` (once per page of every ELF load) affordable.  `vmm_space_clone`
+suppresses the per-page broadcast entirely and issues ONE whole-space shootdown
+at the end — the first version broadcast per page and turned a fork into
+thousands of IPI round trips that never finished.  **LESSON — THE HARNESS LIED
+FOR AN HOUR:** after adding fields to `struct percpu` the shootdown *appeared*
+to hang; the target CPU was demonstrably alive (tick/switch counters advancing)
+yet never took the vector, and its `apic_id` read back as 3 on a box whose boot
+log said 1.  **This project has no header dependencies** — CLAUDE.md says to
+`make clean ARCH=<arch>` after editing a shared header, and I had not, so half
+the tree used the OLD `struct percpu` layout.  Every measurement in that window
+was fiction; the first run after `make clean` passed.  *A documented build
+convention is a CORRECTNESS convention, and an impossible measurement — a field
+holding a value it cannot hold — is evidence about the BUILD, not the code.*
+**OPEN: x86_64 still fails at `-smp` ≥ 2 and it is NOT this bug** — `-smp 1` is
+clean, `-smp 2` takes a kernel `#GP` inside `copy_str` while `execve` marshals
+argv, and removing the shootdown wiring reproduces the same failure, so §M51
+neither caused nor fixed it.  i386 and x86_64 share the VMM shape but NOT the
+syscall entry path, and a fault in a user-pointer copy points there.
+
 ✅ **AARCH64 A3 — A SHELL THAT FORKS AND EXECS, AND THE REGISTER NOBODY SAVED
 (2026-08-08, DOCS §4.50).**  `pkgrun sh -c "echo A; echo B; echo C"` prints all
 three on ARM — a musl shell forking musl coreutils out of the store, third arch,

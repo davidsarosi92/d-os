@@ -255,6 +255,31 @@ int hal_hw_random(uint32_t* out);
  * ------------------------------------------------------------------------- */
 #define HAL_FPU_STATE_SIZE   576
 
+/* ---------------------------------------------------------------------------
+ * TLB shootdown (§M51).
+ *
+ * Invalidate `va` — or, with va == 0, the whole address space — in the space
+ * whose page-table root is `root_phys`, on EVERY CPU, not just this one.
+ *
+ * This exists because the two architectures disagree about whose job the
+ * broadcast is.  AArch64 has `tlbi ...is`: the instruction reaches every core
+ * in the inner-shareable domain, so its implementation is empty here and the
+ * invalidation stays where the page-table edit is.  x86 has no such
+ * instruction — `invlpg` and a CR3 reload are strictly local — so the
+ * broadcast has to be built out of an inter-processor interrupt
+ * (hal/x86/tlb.c).
+ *
+ * WHEN TO CALL IT.  After any edit that makes an existing translation WEAKER
+ * or invalid — write→read-only, present→absent, or a remap to a different
+ * frame.  Making a translation stronger (absent→present) needs nothing: a CPU
+ * with no cached entry will walk the table and see the new one.
+ *
+ * `root_phys` rather than a `struct vmm_space*` so the HAL needs to know
+ * nothing about either arch's page-table types.  Pass 0 to mean "whatever this
+ * CPU currently has loaded".
+ * ------------------------------------------------------------------------- */
+void hal_tlb_shootdown(uintptr_t root_phys, uintptr_t va);
+
 void hal_fpu_init_state(void* blob);   /* make `blob` a valid initial image  */
 void hal_fpu_save(void* blob);         /* current CPU state → blob            */
 void hal_fpu_restore(void* blob);      /* blob → current CPU state            */

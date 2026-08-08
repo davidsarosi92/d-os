@@ -91,7 +91,8 @@ extern void isr36(void); extern void isr37(void); extern void isr38(void); exter
 extern void isr40(void); extern void isr41(void); extern void isr42(void); extern void isr43(void);
 extern void isr44(void); extern void isr45(void); extern void isr46(void); extern void isr47(void);
 extern void isr64(void);                           /* LAPIC timer (M18.5) */
-extern void isr65(void);                           /* reserved: cross-CPU preempt IPI */
+extern void isr65(void);                           /* 0x41 — cross-CPU preempt IPI  */
+extern void isr66(void);                           /* 0x42 — TLB shootdown IPI (§M51) */
 extern void isr80(void);                           /* MSI pool (M18.6.5) */
 extern void isr81(void);
 extern void isr82(void);
@@ -188,6 +189,9 @@ void idt_init(void) {
     /* APIC vectors (M18.5).  Same numbering as i386. */
     set_gate(0x40, isr64, 0x8E);
     set_gate(0x41, isr65, 0x8E);
+    /* §M51 — cross-CPU TLB shootdown.  x86 does not broadcast invalidation,
+     * so the broadcast is this IPI; see hal/x86/tlb.c. */
+    set_gate(0x42, isr66, 0x8E);
 
     /* MSI pool (M18.6.5). */
     set_gate(0x50, isr80, 0x8E);
@@ -379,6 +383,18 @@ void isr_handler(struct int_frame* f) {
          * so a wedged busy-looping ring-3 program is force-killable on x86_64. */
         task_force_kill_point((f->cs & 3) == 3);
         schedule_check();
+        return;
+    }
+
+    /* §M51 — cross-CPU TLB shootdown.  Deliberately handled BEFORE the
+     * preempt/timer block and with no schedule_check: this must be the
+     * shortest possible path.  A sender is spinning on our acknowledgement,
+     * possibly with interrupts disabled, so anything we do here that could
+     * block or reschedule would hold it up — or deadlock it. */
+    if (f->int_no == 0x42) {
+        extern void x86_tlb_ipi(void);
+        x86_tlb_ipi();
+        lapic_eoi();
         return;
     }
 

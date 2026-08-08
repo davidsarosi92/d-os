@@ -101,6 +101,7 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/hal_arch.c \
       kernel/hal/x86/task_arch.c \
       kernel/hal/x86/lapic.c \
+      kernel/hal/x86/tlb.c \
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/smp.c \
       kernel/hal/x86/syscall.c \
@@ -292,6 +293,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/fork.c \
       kernel/hal/x86_64/signal.c \
       kernel/hal/x86/lapic.c \
+      kernel/hal/x86/tlb.c \
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/pci.c \
       kernel/hal/x86/fb_present.c \

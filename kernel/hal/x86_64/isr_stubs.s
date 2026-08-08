@@ -141,6 +141,7 @@ ISR_NOERR 47
 ; -----------------------------------------------------------------------------
 ISR_NOERR 64
 ISR_NOERR 65
+ISR_NOERR 66          ; 0x42 — cross-CPU TLB shootdown IPI (§M51)
 ISR_NOERR 80
 ISR_NOERR 81
 ISR_NOERR 82

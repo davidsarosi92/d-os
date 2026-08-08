@@ -85,6 +85,21 @@ struct percpu {
     uint64_t     busy_ms;          /* ms spent running a NON-idle task */
     uint64_t     switches;         /* context switches performed here */
     uint64_t     migrations;       /* tasks pulled onto this CPU by the balancer */
+
+    /* --- TLB shootdown (§M51).  A ticket pair, not a message: a sender
+     * bumps `tlb_req` on every CPU it needs to flush and waits for that
+     * CPU's `tlb_ack` to catch up.  The request carries no address on
+     * purpose — the remote action is always "flush everything", which is
+     * unconditionally correct no matter how many senders overlap and
+     * removes any need for a lock or a shared request slot.  Paying a
+     * full flush instead of an `invlpg` costs performance on a path that
+     * is already an IPI round trip.
+     *
+     * Monotonic counters, touched with atomics; `tlb_ack` is only ever
+     * advanced AFTER the flush, so `ack >= my_ticket` means "the entries
+     * I care about are gone from that CPU". */
+    volatile uint32_t tlb_req;     /* bumped by whoever wants this CPU flushed */
+    volatile uint32_t tlb_ack;     /* set to tlb_req by this CPU, after flushing */
 };
 
 /* Bring up the per-CPU table on the BSP.  Records the BSP's APIC ID

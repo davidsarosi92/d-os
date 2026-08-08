@@ -9,7 +9,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M49"                 /* latest shipped: §M49 load distribution across CPUs, measured */
+#define DOS_MILESTONE  "M51"                 /* latest shipped: §M51 TLB shootdown — the broadcast x86 lacks */
 
 /* Short architecture tag for the on-screen label.  Deliberately the FAMILIAR
  * short form ("x32"/"x64") rather than the toolchain triple — the wallpaper

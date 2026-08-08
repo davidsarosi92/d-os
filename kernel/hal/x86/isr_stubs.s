@@ -114,10 +114,12 @@ ISR_NOERR 47
 ; via the LAPIC instead of the legacy IRQ path.
 ;
 ;   0x40 (64) — LAPIC timer (per-CPU preempt tick)
-;   0x41 (65) — reserved for cross-CPU preempt IPI (placeholder)
+;   0x41 (65) — cross-CPU preempt IPI
+;   0x42 (66) — cross-CPU TLB shootdown IPI (§M51, hal/x86/tlb.c)
 ; -----------------------------------------------------------------------------
 ISR_NOERR 64
 ISR_NOERR 65
+ISR_NOERR 66
 
 ; -----------------------------------------------------------------------------
 ; MSI vectors (M18.6.5).  Pool of 4 vectors (0x50..0x53 = 80..83) handed
