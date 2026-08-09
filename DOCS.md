@@ -90,6 +90,7 @@ when sections are added.)
 | 4.49 | AArch64 runs unmodified musl (A2), and the engine proves it... | 5126 |
 | 4.50 | AArch64 A3 — a shell that forks and execs, and the regist... | 5256 |
 | 4.51 | The broadcast x86 does not have (M51 — TLB shootdown) | 5419 |
+| 4.52 | The note that outlived its premise (M52 — per-CPU SYSCALL) | 5523 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -5520,6 +5521,90 @@ a value it cannot hold — is evidence about the build, not about the code.**
   would need the request slot and lock described above; worth doing only if
   measurement shows the flush costs something real.
 
+### 4.52 The note that outlived its premise (M52 — per-CPU SYSCALL entry, x86_64)
+
+x86_64 now runs `pkgrun sh -c "echo A; echo B; ls /store"` cleanly at `-smp 1`,
+`-smp 2` and `-smp 4`.  Before this it was reliable only on one CPU; on two it
+produced a child executing its own argv strings, kernel `#GP`s at garbage
+addresses, and — memorably — the kernel returning to address 3.
+
+#### The bug was documented before it was written
+
+`syscall_entry.s` had said this in its own header since §M20.6.1:
+
+> This uses a GLOBAL scratch pair, so it is UP-correct only — which matches
+> x86_64's current single (non-per-CPU) TSS: ring-3 tasks only run on the BSP
+> today.  When x86_64 grows a per-CPU TSS (like i386's M35), this must move to
+> a swapgs + %gs:per-cpu-slot scheme.  **Noted, not built.**
+
+Every word was true when written.  §M35 then gave x86_64 a per-CPU TSS and
+ring-3 tasks began running on APs — and nothing went back to the note.  The
+premise it depended on became false silently, because a comment cannot fail a
+test.
+
+What was left was two globals:
+
+    syscall_kernel_rsp   the kernel stack to switch to
+    scratch_user_rsp     where the caller's rsp was stashed
+
+Two CPUs inside `syscall` at the same time therefore **stashed over each
+other's user rsp and ran the kernel on the same stack**.  Each then returned to
+ring 3 with the other's stack pointer.
+
+The reason this needs a trick at all: `syscall` hands the kernel no stack —
+`rsp` is still the *user* stack on entry — and leaves no register free to find
+one with.  `rcx` and `r11` are already clobbered by the instruction itself and
+everything else holds a syscall argument.
+
+`swapgs` exists for exactly this.  It swaps `IA32_KERNEL_GS_BASE` into `GS.base`
+atomically, so the stub can address a per-CPU slot without computing an address:
+
+    [gs:0]  this CPU's ring-0 stack top   (written by hal_set_kernel_stack)
+    [gs:8]  this CPU's user-rsp stash
+
+GS is free for it — x86_64 musl keeps thread-local storage in FS, which is also
+why `arch_prctl(ARCH_SET_GS)` was already answered with `-ENOSYS`.  The stub
+`swapgs`es back **before** entering the shared `isr_common` tail, so the rest of
+the kernel and the `iretq` back to ring 3 see exactly the state they always did
+and need to know nothing about any of this.  Nothing can interrupt the window
+between the two: `IA32_FMASK` cleared IF, and both accesses touch already-mapped
+kernel pages.
+
+`syscall_init_64` already ran per CPU, so the `KERNEL_GS_BASE` write goes there;
+`hal_set_kernel_stack` writes the slot of the CPU it is running on, which is the
+CPU doing the context switch.
+
+#### Why it hid for so long
+
+- **i386 was immune.** It reaches the kernel through `int 0x80`, and an
+  interrupt gate switches stacks using the TSS — which has been per-CPU since
+  §M35.  Only the x86_64 fast-syscall path had to find a stack by hand.
+- **Native d-os programs were immune.** `forktest`, `forkexec` and `pipetest`
+  link the in-tree libc and use `int 0x80`; all three passed at `-smp 2`
+  throughout.  Only *musl* binaries issue `syscall`, because musl's
+  `syscall_arch.h` hard-codes the instruction — and not patching musl is the
+  entire point of the Linux-ABI personality.
+- **One musl process was immune.** `musltest` passed at `-smp 2`: a single
+  process rarely has a second thread of its own inside a syscall at the same
+  instant.  It took *two* musl processes — a shell and the coreutil it forks —
+  to collide.
+
+That is three separate reasons why every test in the suite could pass while the
+flagship capability was broken, and it is the general lesson: **a deferred note
+is a dependency on a premise, and nothing in the build checks that the premise
+still holds.**  The two milestones that invalidated it (§M35's per-CPU TSS,
+ring-3 on APs) were both green.
+
+#### Found by elimination
+
+`-smp 1` clean, `-smp 2` broken said "race".  The in-tree fork/exec tests
+passing at `-smp 2` while the musl shell failed said "not fork, not COW" — and
+pointed straight at the one path the two groups do not share.  The first fault
+captured (`pid 'forked'`, executing inside its own argv strings, with a kernel
+address sitting in `rdi`) was consistent with a return to ring 3 through someone
+else's frame.  §M51's TLB shootdown, landed just before this, was verified
+*not* to be the cause by removing it and reproducing the failure unchanged.
+
 ---
 
 ## 7. Roadmap / open milestones
@@ -5545,6 +5630,35 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-09 — §M52: the note that outlived its premise (DOCS §4.52).**
+  x86_64's SYSCALL entry stub kept the kernel stack and the stashed user `rsp`
+  in two GLOBALS, so two CPUs inside `syscall` at once overwrote each other's
+  stash **and ran the kernel on the same stack** — each then returned to ring 3
+  with the other's stack pointer.  The file's own header had said so since
+  §M20.6.1 ("UP-correct only ... ring-3 tasks only run on the BSP today ...
+  *Noted, not built*"), and every word was true when written; §M35 then gave
+  x86_64 a per-CPU TSS and ring-3 tasks began running on APs, and nothing went
+  back to the note.  **A comment cannot fail a test.**  Fixed with `swapgs` —
+  the instruction that exists for exactly this: it swaps `IA32_KERNEL_GS_BASE`
+  into `GS.base` atomically, so the stub reaches a per-CPU slot (`[gs:0]` kernel
+  rsp, `[gs:8]` user-rsp stash) without needing a spare register to compute an
+  address, and `syscall` leaves none — `rcx`/`r11` are clobbered by the
+  instruction and everything else holds an argument.  GS is free because
+  x86_64 musl keeps TLS in FS.  The stub swaps back before the shared
+  `isr_common` tail, so nothing else in the kernel needs to know.  **Verified:
+  x86_64 clean at `-smp 1`, `-smp 2` and `-smp 4`, with `forktest`, `pipetest`,
+  `musltest` and the multi-command shell all green; i386 unaffected and still
+  green at `-smp 4`.**  **Why it hid: three independent immunities.**  i386
+  enters through `int 0x80`, and an interrupt gate switches stacks via the TSS,
+  per-CPU since §M35.  Native d-os programs (`forktest`/`forkexec`/`pipetest`)
+  use `int 0x80` too and passed at `-smp 2` throughout — only *musl* binaries
+  issue `syscall`, because musl hard-codes the instruction and not patching musl
+  is the whole point of the personality.  And a single musl process rarely
+  collides with itself, so `musltest` passed; it took TWO musl processes — a
+  shell and the coreutil it forks — to break.  **The general lesson: a deferred
+  note is a dependency on a premise, and nothing in the build checks that the
+  premise still holds.**  Both milestones that invalidated it were green.
 
 - **2026-08-08 — §M51: the broadcast x86 does not have (DOCS §4.51).**  x86 does
   not broadcast TLB invalidation — `invlpg` and a CR3 reload are strictly local

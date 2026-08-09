@@ -39,7 +39,8 @@
 #include "task.h"
 #include "proc.h"
 #include "usermode.h"
-#include "percpu.h"
+#include "percpu.h"   /* §M52 — this_cpu_id for the per-CPU syscall area */
+#include "acpi.h"     /* ACPI_MAX_CPUS — same bound the TSS array uses */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -64,6 +65,8 @@ extern void syscall_entry_64(void);
 #define MSR_STAR   0xC0000081u
 #define MSR_LSTAR  0xC0000082u
 #define MSR_FMASK  0xC0000084u
+#define MSR_GS_BASE        0xC0000101u
+#define MSR_KERNEL_GS_BASE 0xC0000102u
 
 static inline void wrmsr(uint32_t msr, uint64_t val) {
     __asm__ volatile ("wrmsr"
@@ -75,9 +78,49 @@ static inline uint64_t rdmsr(uint32_t msr) {
     return ((uint64_t)hi << 32) | lo;
 }
 
+/* §M52 — the per-CPU SYSCALL scratch area.
+ *
+ * SYSCALL hands the kernel no stack: rsp is still the USER stack on entry, so
+ * the entry stub has to stash it and load a kernel one before it can touch
+ * memory.  It also has no free register to find them with — rcx and r11 are
+ * already clobbered by the instruction itself and everything else holds a
+ * syscall argument.
+ *
+ * The original stub kept both in globals, which was correct while ring-3 tasks
+ * only ever ran on the BSP and is a disaster now that they do not: two CPUs in
+ * SYSCALL at the same time overwrite each other's stashed user rsp AND run the
+ * kernel on the SAME stack.  syscall_entry.s said as much in its own header
+ * ("UP-correct only ... Noted, not built"), and the note outlived the premise.
+ *
+ * `swapgs` is the instruction that exists for exactly this: one MSR the CPU
+ * swaps into GS.base atomically at the entry, giving the stub a per-CPU base
+ * to address through without needing a register to compute it.  GS is free for
+ * this — x86_64 musl puts thread-local storage in FS. */
+struct syscall_area {
+    uint64_t kernel_rsp;      /* [gs:0]  — this CPU's ring-0 stack top   */
+    uint64_t user_rsp;        /* [gs:8]  — stash of the caller's rsp     */
+};
+static struct syscall_area g_syscall_area[ACPI_MAX_CPUS];
+
+/* tss.c calls this from hal_set_kernel_stack, on the CPU doing the switch. */
+void syscall_set_kernel_rsp(int cpu, uintptr_t top) {
+    if (cpu >= 0 && cpu < ACPI_MAX_CPUS) g_syscall_area[cpu].kernel_rsp = (uint64_t)top;
+}
+
 void syscall_init_64(void) {
     /* EFER.SCE (bit 0) — arm the SYSCALL/SYSRET instructions. */
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1u);
+
+    /* §M52 — point this CPU's KERNEL_GS_BASE at its own scratch area, and
+     * leave GS_BASE (the value in force while ring 3 runs) at zero.  `swapgs`
+     * in the entry stub exchanges the two, so [gs:...] inside the stub always
+     * addresses THIS CPU's slot no matter which CPU took the syscall. */
+    {
+        int c = this_cpu_id();
+        if (c < 0 || c >= ACPI_MAX_CPUS) c = 0;
+        wrmsr(MSR_GS_BASE, 0);
+        wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)(uintptr_t)&g_syscall_area[c]);
+    }
 
     /* STAR[47:32] = kernel CS (0x08): SYSCALL loads CS=0x08, SS=0x10.
      * STAR[63:48] = user base for SYSRET; we iretq back so it is unused, but

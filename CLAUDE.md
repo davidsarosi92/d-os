@@ -18,6 +18,33 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M52 — THE NOTE THAT OUTLIVED ITS PREMISE (2026-08-09, DOCS §4.52; x86_64
+clean at -smp 1/2/4).**  x86_64's SYSCALL entry stub kept the kernel stack and
+the stashed user `rsp` in **two GLOBALS**, so two CPUs inside `syscall` at once
+overwrote each other's stash **and ran the kernel on the SAME stack** — each
+then returned to ring 3 with the other's stack pointer (a child executing its
+own argv strings; the kernel returning to address 3).  **`syscall_entry.s` had
+said so in its own header since §M20.6.1** — *"UP-correct only … ring-3 tasks
+only run on the BSP today … **Noted, not built**"* — and every word was TRUE
+when written.  §M35 then gave x86_64 a per-CPU TSS and ring-3 tasks began
+running on APs; nothing went back to the note.  **A COMMENT CANNOT FAIL A
+TEST.**  Fixed with **`swapgs`**, the instruction that exists for exactly this:
+it swaps `IA32_KERNEL_GS_BASE` into `GS.base` atomically so the stub reaches a
+per-CPU slot (`[gs:0]` kernel rsp, `[gs:8]` user-rsp stash) **without needing a
+spare register** — and `syscall` leaves none (`rcx`/`r11` clobbered by the
+instruction, everything else holds an argument).  GS is free because x86_64 musl
+keeps TLS in FS.  Swaps back BEFORE the shared `isr_common` tail, so nothing
+else in the kernel knows.  **WHY IT HID — THREE INDEPENDENT IMMUNITIES:** (1)
+i386 enters via `int 0x80`, and an interrupt gate switches stacks through the
+TSS, per-CPU since §M35; (2) native d-os programs (`forktest`/`forkexec`/
+`pipetest`) use `int 0x80` too and passed at -smp 2 throughout — only **musl**
+binaries issue `syscall` (musl hard-codes it, and not patching musl is the whole
+point of the personality); (3) ONE musl process rarely collides with itself, so
+`musltest` passed — it took TWO (a shell and the coreutil it forks).  **GENERAL
+LESSON: a deferred note is a DEPENDENCY ON A PREMISE, and nothing in the build
+checks that the premise still holds.**  Both milestones that invalidated it were
+green.
+
 ✅ **§M51 — THE BROADCAST x86 DOES NOT HAVE (2026-08-08, DOCS §4.51, i386
 verified at -smp 1/2/4).**  x86 does NOT broadcast TLB invalidation — `invlpg`
 and a CR3 reload are strictly local — and **nothing in the tree ever sent an
@@ -50,11 +77,10 @@ the tree used the OLD `struct percpu` layout.  Every measurement in that window
 was fiction; the first run after `make clean` passed.  *A documented build
 convention is a CORRECTNESS convention, and an impossible measurement — a field
 holding a value it cannot hold — is evidence about the BUILD, not the code.*
-**OPEN: x86_64 still fails at `-smp` ≥ 2 and it is NOT this bug** — `-smp 1` is
-clean, `-smp 2` takes a kernel `#GP` inside `copy_str` while `execve` marshals
-argv, and removing the shootdown wiring reproduces the same failure, so §M51
-neither caused nor fixed it.  i386 and x86_64 share the VMM shape but NOT the
-syscall entry path, and a fault in a user-pointer copy points there.
+The x86_64 SMP failure left open here turned out to be a
+DIFFERENT bug entirely and is fixed in §M52 above — and the pointer that led
+there was exactly "i386 and x86_64 share the VMM shape but NOT the syscall entry
+path".
 
 ✅ **AARCH64 A3 — A SHELL THAT FORKS AND EXECS, AND THE REGISTER NOBODY SAVED
 (2026-08-08, DOCS §4.50).**  `pkgrun sh -c "echo A; echo B; echo C"` prints all

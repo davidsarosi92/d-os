@@ -76,7 +76,10 @@ static struct tss64 tss[TSS_MAX_CPUS];
  * every context switch by hal_set_kernel_stack — the scheduler sets it for the
  * task about to run on THIS CPU.  If SYSCALL entry ever needs to work without
  * that guarantee it must become per-CPU (e.g. via %gs and swapgs). */
-extern uint64_t syscall_kernel_rsp;
+/* §M52 — syscall.c owns the per-CPU SYSCALL scratch area; the entry stub
+ * reaches it through swapgs.  Was a single global, which made SYSCALL
+ * UP-only long after ring-3 tasks started running on APs. */
+void syscall_set_kernel_rsp(int cpu, uintptr_t top);
 
 /* Dedicated kernel stack used for ring-3 → ring-0 transitions, mirror
  * of the i386 syscall_stack.  4 KiB is plenty for a syscall handler;
@@ -104,7 +107,8 @@ void tss_init(void) {
          * mode has no business doing port I/O). */
         tss[c].iomap_base = sizeof(struct tss64);
     }
-    syscall_kernel_rsp = tss[0].rsp0;      /* BSP; APs refresh it on entry */
+    for (int c = 0; c < TSS_MAX_CPUS; c++)
+        syscall_set_kernel_rsp(c, (uintptr_t)tss[c].rsp0);
 }
 
 void tss_set_kernel_stack(uintptr_t sp) {
@@ -117,7 +121,7 @@ void tss_set_kernel_stack(uintptr_t sp) {
 void hal_set_kernel_stack(uintptr_t top) {
     int c = this_cpu_id();
     tss[c].rsp0 = top ? (uint64_t)top : default_rsp0(c);
-    syscall_kernel_rsp = tss[c].rsp0;
+    syscall_set_kernel_rsp(c, (uintptr_t)tss[c].rsp0);
 }
 
 /* M35 TLS (x86_64) — set the thread pointer.  On x86_64, thread-local storage
