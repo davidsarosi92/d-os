@@ -395,6 +395,13 @@ void task_yield(void);
  * the internals later without changing callers. */
 void task_msleep(uint32_t ms);
 
+/* §M53 — sleep until an ABSOLUTE deadline on the timer_now_ns() timeline.
+ * Unlike task_msleep this arms a real timer instead of relying on the per-tick
+ * sweep, so the deadline is kept in nanoseconds rather than rounded to a tick.
+ * Returns 0 if the deadline was reached, -1 if the task was asked to stop —
+ * a kill must not wait for a long sleep to finish. */
+int task_sleep_until_ns(uint64_t deadline_ns);
+
 /* The currently scheduled task (or NULL very early in boot, before
  * task_init has run).  Read-only view; do not retain across blocking
  * calls — the next yield may change `current`. */

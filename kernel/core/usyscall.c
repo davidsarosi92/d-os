@@ -48,6 +48,7 @@
 #include "kmalloc.h"
 #include "rtc.h"
 #include "timer.h"
+#include "ktimer.h"
 #include "random.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -876,6 +877,23 @@ int sys_clock_gettime(int which, struct ktimespec* out) {
 int sys_nanosleep(unsigned ms) {
     task_msleep(ms);
     return 0;
+}
+
+/* §M53 — clock_nanosleep(clock, flags, request).
+ *
+ * `abs_time` selects the two POSIX behaviours, and the difference is not
+ * cosmetic: a RELATIVE sleep restarted after a signal drifts (each restart
+ * re-measures from "now", so the total is longer than asked), while an
+ * ABSOLUTE one does not.  Every periodic loop that must not drift — a frame
+ * pump, a poller, a libc's own timing helpers — is written against the
+ * absolute form, which is why it exists at all.
+ *
+ * `ns` is the deadline when abs_time, otherwise the delay.  Returns 0 on
+ * completion, -EINTR-shaped -1 if the task was asked to stop. */
+long sys_clock_nanosleep_ns(int which, int abs_time, uint64_t ns) {
+    (void)which;   /* MONOTONIC and REALTIME share one timeline here */
+    uint64_t deadline = abs_time ? ns : timer_now_ns() + ns;
+    return task_sleep_until_ns(deadline);
 }
 
 /* §M39 — getrandom(buf, n, flags): fill `buf` with CSPRNG bytes.  Never blocks

@@ -29,6 +29,7 @@
  * ============================================================================= */
 
 #include "timer.h"
+#include "ktimer.h"
 #include "hal.h"
 #include "hal_api.h"
 #include "idt.h"
@@ -97,6 +98,16 @@ static uint32_t usb_poll_count = 0;
 static void pit_irq(struct int_frame* f) {
     (void)f;
     ticks_ms++;
+
+    /* §M53 — fire due deadline timers HERE, on the real tick.
+     *
+     * The first version hooked this into schedule_check, which looked like the
+     * same thing and is not: schedule_check runs at the QUANTUM rate (every
+     * SCHED_QUANTUM_TICKS ticks, i.e. 100 Hz), so every timer was up to 10 ms
+     * late no matter what deadline it asked for.  `ktimer` measured it — a
+     * 500 us sleep taking 9.7 ms — which is exactly the kind of thing a
+     * timer service with no accuracy measurement would have shipped with. */
+    ktimer_expire();
 
     if (++quantum_count >= SCHED_QUANTUM_TICKS) {
         quantum_count = 0;

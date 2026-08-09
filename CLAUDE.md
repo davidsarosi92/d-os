@@ -18,6 +18,38 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+▶️ **§M53 STAGES 1–2 — TIME, IN NANOSECONDS (2026-08-09, DOCS §4.53, all 3
+arches).**  `timer_now_ns()` — ONE monotonic nanosecond clock from whatever the
+machine has, callers never learning which: `CNTPCT_EL0` on aarch64 (62.5 MHz,
+16 ns; the architecture DEFINES the rate, nothing to calibrate) and the TSC on
+x86 (~1.2 GHz, 1 ns) but **only once established to be constant-rate**
+(`CPUID.80000007:EDX[8]`, or `CPUID.1:ECX[31]` — a hypervisor virtualises the
+TSC so it cannot track a guest core's frequency scaling).  Neither → keep the
+tick: *a coarse clock that is right beats a fine one that is wrong.*  Plus
+**deadline timers** (`ktimer_arm`/`ktimer_cancel`, one sorted list, callbacks in
+IRQ context with the lock dropped), `task_sleep_until_ns`, and
+`sys_clock_nanosleep_ns` (the ABSOLUTE form matters: a relative sleep restarted
+after a signal DRIFTS, so every non-drifting periodic loop is written against
+the absolute one).  **THE CLOCK FOUND A REAL BUG IN ITS FIRST MINUTES:** `ktime`
+reported a 100 ms sleep on aarch64 as **57 ms** — `timer_ticks_ms` divided a
+tick counter that EVERY CPU increments by a PER-CPU rate, so the millisecond
+clock ran N× too fast on an N-CPU box and every timeout/watchdog deadline/sleep
+on that arch was wrong by the CPU count, silently, **for want of a second
+opinion**.  Now read from `CNTPCT` directly (100.0/105/106 ms at -smp 1/2/4);
+x86 was never affected (the PIT delivers to the BSP only).  **AND THE ACCURACY
+FLOOR IS MEASURED, NOT ASSUMED:** expiry first went into `schedule_check`, which
+LOOKS like the tick and runs at the QUANTUM rate — every timer up to 10 ms late
+regardless of its deadline (a 500 µs sleep measured 9.7 ms).  Moved to the tick
+ISR: worst lateness **9037 µs → 840–953 µs on i386**, i.e. the tick period
+itself; aarch64's floor is 10 ms because it ticks at 100 Hz, and its `ktimer`
+says so.  New **`ktime`** + **`ktimer`** commands on both shells report source,
+resolution and the error on a spread of sleeps.  **Open:** one-shot hardware
+deadlines (TSC-deadline / `CNTP_CVAL`) to remove the tick floor; raising the
+aarch64 tick needs a quantum divider like x86's `SCHED_QUANTUM_TICKS` first;
+`timerfd` + `timer_create`/`setitimer` (stage 3, and what `epoll`-shaped event
+loops need); a clock read costs a 64-bit division (~2–4 µs under emulation) —
+Linux precomputes a multiply-and-shift.
+
 ✅ **§M52 — THE NOTE THAT OUTLIVED ITS PREMISE (2026-08-09, DOCS §4.52; x86_64
 clean at -smp 1/2/4).**  x86_64's SYSCALL entry stub kept the kernel stack and
 the stashed user `rsp` in **two GLOBALS**, so two CPUs inside `syscall` at once

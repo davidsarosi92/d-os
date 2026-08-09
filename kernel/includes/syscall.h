@@ -167,6 +167,8 @@ long sys_getdents64(int fd, void* buf, size_t cap);   /* Linux dirent64 (linux_a
 int  sys_uname(struct kutsname* out);
 int  sys_clock_gettime(int which, struct ktimespec* out);
 int  sys_nanosleep(unsigned ms);
+/* §M53 — nanosecond sleep, relative or to an absolute deadline. */
+long sys_clock_nanosleep_ns(int which, int abs_time, uint64_t ns);
 long sys_getrandom(void* buf, size_t n, unsigned flags);   /* §M39 */
 long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port);
 long sys_recvfrom(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out);

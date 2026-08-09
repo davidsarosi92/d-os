@@ -22,6 +22,7 @@
  * wall-clock-ish base.
  * ============================================================================= */
 
+#include "ktimer.h"
 #include <stdint.h>
 
 void uart_early_puts(const char* s);
@@ -73,6 +74,13 @@ static void timer_isr(uint32_t intid) {
     (void)intid;
     tick_count++;
     write_cntp_tval(interval);          /* schedule the next interrupt        */
+
+    /* §M53 — due deadline timers fire on the tick (see the x86 twin for why
+     * this must NOT live in schedule_check).  This arch ticks at 100 Hz, so
+     * 10 ms is its accuracy floor until the generic timer is driven as a
+     * one-shot deadline instead of a periodic source; `ktimer` reports the
+     * lateness actually observed rather than leaving it to be assumed. */
+    ktimer_expire();
 
     if (this_cpu_id() == 0) xhci_poll();   /* service USB (BSP only)          */
 

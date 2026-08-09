@@ -91,6 +91,7 @@ when sections are added.)
 | 4.50 | AArch64 A3 — a shell that forks and execs, and the regist... | 5256 |
 | 4.51 | The broadcast x86 does not have (M51 — TLB shootdown) | 5419 |
 | 4.52 | The note that outlived its premise (M52 — per-CPU SYSCALL) | 5523 |
+| 4.53 | Time, in nanoseconds (M53 stages 1–2) | 5608 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -5605,6 +5606,108 @@ address sitting in `rdi`) was consistent with a return to ring 3 through someone
 else's frame.  §M51's TLB shootdown, landed just before this, was verified
 *not* to be the cause by removing it and reproducing the failure unchanged.
 
+### 4.53 Time, in nanoseconds (M53 stages 1–2)
+
+Two things landed: a monotonic nanosecond clock, and deadline timers built on
+it.  Together they replace "poll a millisecond counter on every tick" with
+"tell me when this instant arrives".
+
+#### Stage 1 — the clock
+
+`timer_ticks_ms` counts interrupts.  Every timestamp it produced was a multiple
+of one millisecond, so two reads taken microseconds apart compared EQUAL and any
+duration measured across it carried ±1 ms.  Fine for a watchdog deadline;
+useless for anything a program times.
+
+`timer_now_ns()` is one monotonic nanosecond clock from whatever the machine
+has, and callers never learn which:
+
+| arch | source | measured |
+|---|---|---|
+| aarch64 | `CNTPCT_EL0`, rate from `CNTFRQ_EL0` | 62.5 MHz, 16 ns |
+| i386 / x86_64 | TSC, calibrated against the PIT | ~1.2 GHz, 1 ns |
+| fallback | the 1 ms tick, scaled | 1 ms |
+
+The ARM side needs no calibration and no capability check — the architecture
+*defines* the counter's rate and hands it over in a register.  The x86 side is
+eighty lines establishing the same two facts: that the counter is constant-rate
+(`CPUID.80000007:EDX[8]`, or `CPUID.1:ECX[31]` for a hypervisor, which
+virtualises the TSC and so cannot track a guest core's frequency scaling), and
+what its rate is.  Neither → keep the tick, because a coarse clock that is right
+beats a fine one that is wrong.
+
+Two implementation details that are load-bearing rather than incidental:
+
+- **The conversion splits into seconds plus a remainder.**  The obvious
+  `delta * 1000000000 / hz` overflows 64 bits after about nine seconds at 2 GHz
+  — long enough to look correct in a boot test and then wrap in front of a user.
+- **The clock never returns less than it last returned.**  The counter is read
+  without a lock and on x86 it is per-CPU; a task migrating between two slightly
+  skewed CPUs would otherwise see time step backward, which breaks callers in
+  ways that are very hard to trace back to the clock.
+
+**What it found in its first minutes.**  `ktime` reported a 100 ms sleep on
+aarch64 as 57 ms.  `timer_ticks_ms` computed `tick_count * 1000 / hz`, and
+`tick_count` is a single global that EVERY CPU's timer ISR increments while `hz`
+is the per-CPU rate — so on an N-CPU machine the millisecond clock ran N times
+too fast.  Every timeout, watchdog deadline and sleep on that architecture was
+wrong by the CPU count, silently, because nothing had a second opinion to check
+it against.  It now reads `CNTPCT` directly: exact, and indifferent to how many
+CPUs take interrupts.  Measured after: 100.0 ms at `-smp 1`, 105 ms at `-smp 2`,
+106 ms at `-smp 4`.  x86 was never affected — the PIT delivers to the BSP only.
+
+#### Stage 2 — deadline timers
+
+`ktimer_arm(t, deadline_ns, fn, arg)` fires a callback at an absolute
+nanosecond deadline; `ktimer_cancel` returns whether it actually removed a
+pending timer, which is the only race-free way to know a callback will not run.
+A single sorted list under one lock — deliberately not a hierarchical wheel,
+which earns its complexity at thousands of pending timers where the honest
+number here is a handful.  The interface hides the list, so that can change
+later without touching a caller.
+
+Callbacks run in interrupt context with the lock NOT held, so a callback may arm
+another timer; anything heavier belongs on the §M49 workqueue.
+
+`task_sleep_until_ns()` is the first consumer, and `sys_clock_nanosleep_ns`
+exposes both POSIX forms.  The absolute form is not a convenience: a relative
+sleep restarted after a signal drifts, so every periodic loop that must not
+drift is written against the absolute one.
+
+#### The accuracy floor is measured, not assumed
+
+`ktimer` sleeps for a spread of intervals and reports the error, because a timer
+list is easy to believe in and the number that matters is *lateness*.
+
+The first version hooked expiry into `schedule_check`, which looks like the tick
+and is not — it runs at the QUANTUM rate (every `SCHED_QUANTUM_TICKS`, 100 Hz).
+Every timer was up to 10 ms late regardless of its deadline, and a 500 µs sleep
+measured 9.7 ms.  Moving expiry to the actual tick ISR fixed it:
+
+| | before | after |
+|---|---|---|
+| worst lateness, i386 | 9037 µs | **840–953 µs** |
+
+That ~1 ms is the tick period — the deadline is exact, the moment we *notice* it
+is not.  aarch64 ticks at 100 Hz, so its floor is 10 ms (measured: 9193 µs) and
+its `ktimer` output says so.  Removing the floor entirely means driving the
+timer hardware as a one-shot deadline instead of a periodic source, which is a
+change to the timer service alone — nothing above it moves.  That decision now
+has a number behind it instead of an intuition.
+
+#### Open
+
+- One-shot hardware deadlines (TSC-deadline / LAPIC one-shot; `CNTP_CVAL` on
+  ARM) to remove the tick floor.
+- aarch64 still ticks at 100 Hz.  Raising it needs a quantum divider like
+  x86's `SCHED_QUANTUM_TICKS`, or the scheduler would preempt ten times more
+  often as a side effect.
+- `timerfd`, `timer_create`/`setitimer` — the remaining POSIX surface, and the
+  piece `epoll`-shaped event loops need.
+- A clock read currently costs a 64-bit division (~2–4 µs measured under
+  emulation on i386).  Linux precomputes a multiply-and-shift; worth doing if a
+  caller ever reads the clock in a hot loop.
+
 ---
 
 ## 7. Roadmap / open milestones
@@ -5630,6 +5733,33 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-09 — §M53 stages 1–2: time, in nanoseconds (DOCS §4.53).**  A
+  monotonic nanosecond clock (`timer_now_ns`) and deadline timers built on it
+  (`ktimer_arm`/`ktimer_cancel`, `task_sleep_until_ns`,
+  `sys_clock_nanosleep_ns`), replacing "poll a millisecond counter every tick"
+  with "tell me when this instant arrives".  Sources: `CNTPCT_EL0` on aarch64
+  (62.5 MHz, 16 ns — the architecture defines the rate, so nothing to
+  calibrate), the TSC on x86 (~1.2 GHz, 1 ns) but only once established to be
+  constant-rate via `CPUID.80000007:EDX[8]` or a hypervisor bit; neither → keep
+  the tick, because a coarse clock that is right beats a fine one that is wrong.
+  **The clock found a real bug in its first minutes:** `ktime` reported a 100 ms
+  sleep on aarch64 as 57 ms, because `timer_ticks_ms` divided a tick counter
+  that EVERY CPU increments by a per-CPU rate — so the millisecond clock ran N
+  times too fast on an N-CPU machine, and every timeout, watchdog deadline and
+  sleep on that arch was wrong by the CPU count, silently, for want of a second
+  opinion.  Now read from `CNTPCT` directly (100.0/105/106 ms at -smp 1/2/4);
+  x86 was never affected.  **And the accuracy floor is measured rather than
+  assumed:** expiry was first hooked into `schedule_check`, which looks like the
+  tick but runs at the QUANTUM rate — every timer up to 10 ms late regardless of
+  its deadline, a 500 µs sleep measuring 9.7 ms.  Moved to the tick ISR: worst
+  lateness 9037 µs → **840–953 µs on i386**, which is the tick period itself
+  (aarch64's is 10 ms, since it ticks at 100 Hz, and its `ktimer` says so).  New
+  `ktime` and `ktimer` commands on both shells report the source, its
+  resolution, and the error on a spread of sleeps — a timer list is easy to
+  believe in, and lateness is the number that decides whether one-shot hardware
+  deadlines are worth building.  Verified on all three architectures with the
+  fork/pipe/signal/musl suite green.
 
 - **2026-08-09 — §M52: the note that outlived its premise (DOCS §4.52).**
   x86_64's SYSCALL entry stub kept the kernel stack and the stashed user `rsp`

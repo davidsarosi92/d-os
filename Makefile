@@ -665,6 +665,7 @@ CORE_C_SRCS := \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
     kernel/core/ktime.c \
+    kernel/core/ktimer.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/pkg.c \
@@ -705,6 +706,7 @@ CORE_C_SRCS := \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
     kernel/core/ktime.c \
+    kernel/core/ktimer.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/net.c \
@@ -840,6 +842,7 @@ CORE_C_SRCS := \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
     kernel/core/ktime.c \
+    kernel/core/ktimer.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/pkg.c \

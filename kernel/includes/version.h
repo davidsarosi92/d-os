@@ -9,7 +9,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M52"                 /* latest shipped: §M52 per-CPU SYSCALL entry (x86_64 swapgs) */
+#define DOS_MILESTONE  "M53"                 /* latest shipped: §M53 nanosecond clock + deadline timers */
 
 /* Short architecture tag for the on-screen label.  Deliberately the FAMILIAR
  * short form ("x32"/"x64") rather than the toolchain triple — the wallpaper

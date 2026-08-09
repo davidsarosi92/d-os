@@ -22,6 +22,7 @@
 #include "pmm.h"
 #include "task.h"
 #include "timer.h"
+#include "ktimer.h"
 #include "pkg.h"
 #include "vfs.h"
 #include "block.h"
@@ -191,6 +192,26 @@ static void cmd_pkgrun(const char* line) {
  * needs no calibration: the architecture defines CNTPCT_EL0's rate and hands it
  * over in CNTFRQ_EL0, so what is worth checking here is only that the numbers
  * agree with a tick-based sleep. */
+/* §M53 — the ARM half of the timer-accuracy report.  Its floor is 10 ms here,
+ * not 1 ms: this arch ticks at 100 Hz, and ktimer_expire runs on the tick. */
+static void cmd_ktimer(void) {
+    uint32_t pending; uint64_t fired, late;
+    ktimer_stats(&pending, &fired, &late);
+    kprintf("ktimer: %u pending, %u fired, worst lateness %u us\n",
+            pending, (unsigned)fired, (unsigned)(late / 1000ull));
+    static const unsigned req_us[] = { 500, 1000, 5000, 20000, 100000 };
+    for (unsigned i = 0; i < sizeof req_us / sizeof req_us[0]; i++) {
+        uint64_t want = (uint64_t)req_us[i] * 1000ull;
+        uint64_t t0 = timer_now_ns();
+        task_sleep_until_ns(t0 + want);
+        kprintf("  %u us -> %u us\n", req_us[i],
+                (unsigned)((timer_now_ns() - t0) / 1000ull));
+    }
+    ktimer_stats(&pending, &fired, &late);
+    kprintf("  worst lateness %u us (floor = one 10 ms tick on this arch)\n",
+            (unsigned)(late / 1000ull));
+}
+
 static void cmd_ktime(void) {
     kprintf("clock source : %s", timer_source_name());
     if (timer_source_hz())
@@ -364,6 +385,7 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "free"))   cmd_meminfo();
         else if (s_eq(cmd, "uptime")) kprintf("up %u ms\n", (unsigned)timer_ticks_ms());
         else if (s_eq(cmd, "ktime"))  cmd_ktime();
+        else if (s_eq(cmd, "ktimer")) cmd_ktimer();
         else if (s_eq(cmd, "ps"))     cmd_ps();
         else if (s_eq(cmd, "ls"))     cmd_ls(args);
         else if (s_eq(cmd, "cat"))    cmd_cat(args);

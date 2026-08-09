@@ -86,9 +86,10 @@
 #include "percpu.h"
 #include "smp.h"
 #include "timer.h"          /* M22.3: per-task CPU-time accounting */
+#include "ktimer.h"         /* §M53 — deadline timers */
 #include "vmm.h"            /* M25: per-process address-space switch */
 #include "waitq.h"
-#include "crash.h"      /* §M47 — record a forced kill */          /* Tier A.1: block/wake wait-queue primitive */
+#include "crash.h"          /* §M47 — record a forced kill */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -1096,6 +1097,62 @@ int task_should_stop(void) {
  *
  * Early boot (no `current` yet, or the idle task itself) keeps the old
  * busy-wait: there is nothing to switch to and nothing to sweep us. */
+/* §M53 — sleep until an absolute nanosecond deadline.
+ *
+ * The difference from task_msleep is not just the unit.  task_msleep parks the
+ * task and a per-tick sweep asks "is anyone due", so a sleep can only END on a
+ * tick boundary and its granularity is the tick no matter how it was
+ * expressed.  This arms a real timer: the deadline is kept in nanoseconds and
+ * the wakeup is driven by the timer service, which is what `clock_nanosleep`
+ * with TIMER_ABSTIME actually promises and what a libc's own timing loops
+ * assume.
+ *
+ * The floor on accuracy is still the tick, because ktimer_expire runs from the
+ * tick — the deadline is exact, the moment we NOTICE it is not.  Replacing the
+ * periodic tick with a one-shot hardware deadline is the upgrade that removes
+ * that floor, and it is a change to the timer service alone: nothing here or
+ * above changes when it lands.  `ktimer` reports the observed lateness so the
+ * decision to do it can be made on a number.
+ *
+ * Returns 0 if the deadline was reached, -1 if the task was asked to stop
+ * (a kill must not be deferred until a long sleep finishes). */
+static void sleep_timer_fired(struct ktimer* t) {
+    struct waitq* wq = (struct waitq*)t->arg;
+    /* The wake takes the waitq lock — that is what closes the lost-wakeup
+     * window against a task that is between checking the deadline and
+     * parking itself (§M49's lesson, in the one place it is easiest to get
+     * wrong). */
+    uint32_t fl = waitq_lock(wq);
+    waitq_wake_all(wq);
+    waitq_unlock(wq, fl);
+}
+
+int task_sleep_until_ns(uint64_t deadline_ns) {
+    struct task* self = task_current();
+    if (!self || self->is_idle) {
+        while (timer_now_ns() < deadline_ns) hal_cpu_idle();
+        return 0;
+    }
+
+    struct waitq  wq = WAITQ_INIT;
+    struct ktimer t  = { 0, 0, 0, 0, 0 };
+    ktimer_arm(&t, deadline_ns, sleep_timer_fired, &wq);
+
+    int rc = 0;
+    uint32_t fl = waitq_lock(&wq);
+    while (timer_now_ns() < deadline_ns) {
+        if (task_should_stop()) { rc = -1; break; }
+        waitq_block(&wq);
+    }
+    waitq_unlock(&wq, fl);
+
+    /* Cancel unconditionally: on the normal path the timer has already fired
+     * (harmless), on the stop path it has not and its callback would otherwise
+     * reference a waitq on a stack frame that is about to disappear. */
+    ktimer_cancel(&t);
+    return rc;
+}
+
 void task_msleep(uint32_t ms) {
     uint64_t end = timer_ticks_ms() + (uint64_t)ms;
     struct task* self = task_current();

@@ -22,6 +22,7 @@
 #include "module.h"
 #include "driver.h"
 #include "timer.h"
+#include "ktimer.h"
 #include "vfs.h"
 #include "random.h"
 #include "devtools.h"
@@ -836,6 +837,37 @@ static void sched_snap_one(const struct task* t, int is_current, void* ctx) {
  * to compare a measured interval against the tick that was used to calibrate
  * it.  Printing "hires counter" without proving it advances would be exactly
  * the kind of claim this project keeps learning not to trust. */
+/* §M53 — `ktimer`: does the timer service actually meet its deadlines?
+ *
+ * The list is easy to get right and easy to believe in; the number that
+ * matters is LATENESS, because the deadline is kept in nanoseconds while the
+ * moment we notice it is bounded by the tick.  Measuring a spread of sleeps
+ * against the clock is what turns "we have timers" into a figure someone can
+ * decide on — specifically, whether replacing the periodic tick with a
+ * one-shot hardware deadline is worth doing. */
+static void cmd_ktimer(void) {
+    uint32_t pending; uint64_t fired, late;
+    ktimer_stats(&pending, &fired, &late);
+    kprintf("ktimer: %u pending, %u fired, worst lateness %u us\n",
+            pending, (unsigned)fired, (unsigned)(late / 1000ull));
+
+    static const unsigned req_us[] = { 500, 1000, 5000, 20000, 100000 };
+    kprintf("  requested   actual    error\n");
+    for (unsigned i = 0; i < sizeof req_us / sizeof req_us[0]; i++) {
+        uint64_t want = (uint64_t)req_us[i] * 1000ull;
+        uint64_t t0 = timer_now_ns();
+        task_sleep_until_ns(t0 + want);
+        uint64_t got = timer_now_ns() - t0;
+        long err = (long)((int64_t)got - (int64_t)want) / 1000;
+        kprintf("  %u us      %u us     %s%u us\n", req_us[i],
+                (unsigned)(got / 1000ull), err < 0 ? "-" : "+",
+                (unsigned)(err < 0 ? -err : err));
+    }
+    ktimer_stats(&pending, &fired, &late);
+    kprintf("  after: %u fired, worst lateness %u us (floor = one tick)\n",
+            (unsigned)fired, (unsigned)(late / 1000ull));
+}
+
 static void cmd_ktime(void) {
     kprintf("clock source : %s", timer_source_name());
     if (timer_source_hz())
@@ -3223,6 +3255,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "abi"))            { cmd_abi();                  return; }
     if (starts_with(line, "wqtest "))  { cmd_wqtest(line + 7);       return; }
     if (streq(line, "ktime"))          { cmd_ktime();                return; }
+    if (streq(line, "ktimer"))         { cmd_ktimer();               return; }
     if (streq(line, "sched"))          { cmd_sched("");              return; }
     if (starts_with(line, "sched "))   { cmd_sched(line + 6);        return; }
     if (starts_with(line, "taskset "))  { cmd_taskset(line + 8);     return; }
