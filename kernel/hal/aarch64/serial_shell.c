@@ -21,6 +21,7 @@
 #include "printf.h"
 #include "pmm.h"
 #include "task.h"
+#include "timer.h"
 #include "pkg.h"
 #include "vfs.h"
 #include "block.h"
@@ -186,6 +187,26 @@ static void cmd_pkgrun(const char* line) {
     kprintf("pkgrun: '%s' returned rc=%d\n", argv[0], rc);
 }
 
+/* §M53 — the same clock report the x86 shell prints.  On this arch the source
+ * needs no calibration: the architecture defines CNTPCT_EL0's rate and hands it
+ * over in CNTFRQ_EL0, so what is worth checking here is only that the numbers
+ * agree with a tick-based sleep. */
+static void cmd_ktime(void) {
+    kprintf("clock source : %s", timer_source_name());
+    if (timer_source_hz())
+        kprintf(" (%u kHz)", (unsigned)(timer_source_hz() / 1000u));
+    kprintf("\n resolution  : %u ns\n", (unsigned)timer_res_ns());
+    uint64_t a = timer_now_ns(), b = timer_now_ns(), c = timer_now_ns();
+    kprintf(" back-to-back: %u ns, %u ns apart\n",
+            (unsigned)(b - a), (unsigned)(c - b));
+    uint64_t t0 = timer_now_ns();
+    task_msleep(100);
+    uint64_t t1 = timer_now_ns();
+    kprintf(" 100 ms sleep: measured %u us by the ns clock\n",
+            (unsigned)((t1 - t0) / 1000ull));
+    kprintf(" uptime      : %u ms\n", (unsigned)(t1 / 1000000ull));
+}
+
 static void cmd_musltest(void) {
     const unsigned char* a = _binary_user_muslhello_muslelf_start;
     const unsigned char* b = _binary_user_muslhello_muslelf_end;
@@ -342,6 +363,7 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "meminfo"))cmd_meminfo();
         else if (s_eq(cmd, "free"))   cmd_meminfo();
         else if (s_eq(cmd, "uptime")) kprintf("up %u ms\n", (unsigned)timer_ticks_ms());
+        else if (s_eq(cmd, "ktime"))  cmd_ktime();
         else if (s_eq(cmd, "ps"))     cmd_ps();
         else if (s_eq(cmd, "ls"))     cmd_ls(args);
         else if (s_eq(cmd, "cat"))    cmd_cat(args);

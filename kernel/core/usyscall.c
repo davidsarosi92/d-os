@@ -847,15 +847,24 @@ static uint32_t rtc_to_epoch(const struct rtc_time* t) {
 int sys_clock_gettime_k(int which, struct ktimespec* out) {
     if (!out) return -1;
     if (which == CLOCK_MONOTONIC) {
-        uint64_t ms = timer_ticks_ms();
-        out->sec  = (uint32_t)(ms / 1000);
-        out->nsec = (uint32_t)((ms % 1000) * 1000000u);
+        /* §M53 — nanoseconds from the real clock source, not the 1 ms tick.
+         * The tick version returned the same value for every call inside a
+         * millisecond, so two timestamps taken microseconds apart compared
+         * EQUAL and any duration measured across it was quantised to ±1 ms. */
+        uint64_t ns = timer_now_ns();
+        out->sec  = (uint32_t)(ns / 1000000000ull);
+        out->nsec = (uint32_t)(ns % 1000000000ull);
         return 0;
     }
+    /* CLOCK_REALTIME: the RTC gives whole seconds only, so the sub-second part
+     * comes from the monotonic clock.  That makes successive reads strictly
+     * increasing (which callers assume) at the cost of the fraction not being
+     * phase-aligned to the RTC's own second boundary — a trade every kernel
+     * makes until it grows an NTP-style discipline. */
     struct rtc_time t;
     if (rtc_read(&t) != 0) { out->sec = 0; out->nsec = 0; return 0; }
     out->sec  = rtc_to_epoch(&t);
-    out->nsec = 0;
+    out->nsec = (uint32_t)(timer_now_ns() % 1000000000ull);
     return 0;
 }
 

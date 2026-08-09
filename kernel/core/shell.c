@@ -830,6 +830,35 @@ static void sched_snap_one(const struct task* t, int is_current, void* ctx) {
     e->name[i] = '\0';
 }
 
+/* §M53 — `ktime`: what clock is actually backing timer_now_ns, and does it
+ * resolve better than the tick?  The measurement matters more than the name:
+ * a source can be present and mis-calibrated, and the only way to see that is
+ * to compare a measured interval against the tick that was used to calibrate
+ * it.  Printing "hires counter" without proving it advances would be exactly
+ * the kind of claim this project keeps learning not to trust. */
+static void cmd_ktime(void) {
+    kprintf("clock source : %s", timer_source_name());
+    if (timer_source_hz())
+        kprintf(" (%u kHz)", (unsigned)(timer_source_hz() / 1000u));
+    kprintf("\n resolution  : %u ns\n", (unsigned)timer_res_ns());
+
+    /* Back-to-back reads: with the tick these are IDENTICAL most of the time,
+     * which is the whole problem in one number. */
+    uint64_t a = timer_now_ns(), b = timer_now_ns(), c = timer_now_ns();
+    kprintf(" back-to-back: %u ns, %u ns apart\n",
+            (unsigned)(b - a), (unsigned)(c - b));
+
+    /* Measure one tick-based sleep with the new clock.  Agreement to within a
+     * tick is the calibration check; a wildly different number means the
+     * counter frequency is wrong, not that the sleep is. */
+    uint64_t t0 = timer_now_ns();
+    task_msleep(100);
+    uint64_t t1 = timer_now_ns();
+    kprintf(" 100 ms sleep: measured %u us (%u ms) by the ns clock\n",
+            (unsigned)((t1 - t0) / 1000ull), (unsigned)((t1 - t0) / 1000000ull));
+    kprintf(" uptime      : %u ms\n", (unsigned)(t1 / 1000000ull));
+}
+
 static void cmd_sched(const char* args) {
     while (*args == ' ') args++;
     uint32_t window = 0;
@@ -3193,6 +3222,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "wqtest"))         { cmd_wqtest("");             return; }
     if (streq(line, "abi"))            { cmd_abi();                  return; }
     if (starts_with(line, "wqtest "))  { cmd_wqtest(line + 7);       return; }
+    if (streq(line, "ktime"))          { cmd_ktime();                return; }
     if (streq(line, "sched"))          { cmd_sched("");              return; }
     if (starts_with(line, "sched "))   { cmd_sched(line + 6);        return; }
     if (starts_with(line, "taskset "))  { cmd_taskset(line + 8);     return; }

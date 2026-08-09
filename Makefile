@@ -102,6 +102,7 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/task_arch.c \
       kernel/hal/x86/lapic.c \
       kernel/hal/x86/tlb.c \
+      kernel/hal/x86/tsc.c \
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/smp.c \
       kernel/hal/x86/syscall.c \
@@ -294,6 +295,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/signal.c \
       kernel/hal/x86/lapic.c \
       kernel/hal/x86/tlb.c \
+      kernel/hal/x86/tsc.c \
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/pci.c \
       kernel/hal/x86/fb_present.c \
@@ -662,6 +664,7 @@ CORE_C_SRCS := \
     kernel/core/net.c \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
+    kernel/core/ktime.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/pkg.c \
@@ -701,6 +704,7 @@ CORE_C_SRCS := \
     kernel/core/pkg.c \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
+    kernel/core/ktime.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/net.c \
@@ -835,6 +839,7 @@ CORE_C_SRCS := \
     kernel/core/audio.c \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
+    kernel/core/ktime.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/pkg.c \

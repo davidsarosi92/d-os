@@ -22,6 +22,24 @@
  * up. */
 uint64_t timer_ticks_ms(void);
 
+/* §M53 — the same clock, in nanoseconds, from whatever source the machine
+ * actually has: the ARM system counter, an invariant x86 TSC, or (if neither is
+ * usable) the millisecond tick scaled up.  Callers never learn which.
+ *
+ * MONOTONIC and never decreasing, including across a task migrating between
+ * CPUs whose counters are slightly skewed — see the clamp in ktime.c.  Starts
+ * near zero at boot.  `timer_res_ns` reports the granularity actually achieved,
+ * which is what `clock_getres` should answer and what makes a coarse fallback
+ * visible instead of silent. */
+uint64_t    timer_now_ns(void);
+uint64_t    timer_res_ns(void);
+const char* timer_source_name(void);
+uint64_t    timer_source_hz(void);      /* 0 when running on the tick */
+
+/* Install the clock.  Must run after the tick source is live, because the x86
+ * calibration measures the TSC against it. */
+void ktime_init(void);
+
 /* Busy-wait for at least `ms` milliseconds.  Cooperative sleeping
  * (yielding to the scheduler) lands when M7 brings tasks. */
 void timer_msleep(uint32_t ms);

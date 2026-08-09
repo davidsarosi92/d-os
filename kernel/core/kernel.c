@@ -421,6 +421,9 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     task_start_init();
     /* §M49 — deferred-work pool.  After init, because the workers are
      * spawned detached (parented to init). */
+    /* §M53 — install the nanosecond clock.  MUST be after the tick source is
+     * live: the x86 calibration measures the TSC against the PIT. */
+    ktime_init();
     workqueue_init();
 
     /* M29 — services + service bus.  Register /proc/services + /proc/bus

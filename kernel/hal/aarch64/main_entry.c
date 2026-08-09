@@ -30,6 +30,7 @@
 #include "pmm.h"
 #include "kmalloc.h"
 #include "task.h"
+#include "timer.h"
 #include "workqueue.h"
 #include "pkg.h"
 #include "hal_api.h"
@@ -274,6 +275,7 @@ void aarch64_main_entry(uint64_t dtb) {
         task_start_init();                      /* M27 reaper (prints to serial) */
         /* §M49 — deferred-work pool.  After init, because the workers are
          * spawned detached (parented to init). */
+        ktime_init();          /* §M53 — nanosecond clock */
         workqueue_init();
         /* A3 — provision the package store (/lib ld.so + the store recipes).
          * On x86 this lives in kernel_main; aarch64 runs its OWN main_entry,
@@ -299,6 +301,7 @@ void aarch64_main_entry(uint64_t dtb) {
         task_start_init();                      /* M27 universal reaper */
         /* §M49 — deferred-work pool.  After init, because the workers are
          * spawned detached (parented to init). */
+        ktime_init();          /* §M53 — nanosecond clock */
         workqueue_init();
         /* A3 — provision the package store (/lib ld.so + the store recipes).
          * On x86 this lives in kernel_main; aarch64 runs its OWN main_entry,
