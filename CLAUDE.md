@@ -18,6 +18,57 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M54 — A TASK THE SCHEDULER WAS STILL STANDING ON (2026-08-10, DOCS §4.54,
+all 3 arches).**  Reported as *"open NetSurf, a crash report comes up, close it,
+open it again — the machine dies"*; §M47's NVRAM breadcrumb had already written
+the answer down from the previous boot — `kernel-fault in 'idle-3' at
+pc=0x120ab5` = **`pick_next_local_locked+0x54`, reading `t->state` out of a task
+that was no longer a task**.  ROOT CAUSE: `schedule_locked` publishes the
+incoming task as `current` **BEFORE** it swaps stacks, so between those two
+points the outgoing task is current NOWHERE while a CPU is still executing on
+its kernel stack and has not written back its saved `esp`.  Both the guard that
+stops two CPUs picking one task (`task_running_elsewhere`) and the reaper's
+"is it current anywhere" check asked exactly that question — so one CPU resumed
+a task **from a stale esp while another was still on it** (one task, two CPUs,
+one stack), and the reaper **freed a kernel stack that was in use**.  Fixed with
+`task->on_cpu`, a flag that spans the WHOLE switch, released by the task that
+takes the CPU over — the outgoing task cannot do it, because by the time it
+would be safe it is no longer running.  **Missing the second arrival point (the
+brand-new-task trampoline, `task_finish_first_switch`) was a bug in the first
+version of the fix** and left tasks unreapable.  FOUR MORE on the same path:
+(1) a **DEAD task could be enqueued** (the wake paths decide under one lock and
+enqueue after dropping it) — the check now lives inside `rq_insert_tail_locked`,
+under the destination queue's lock, one instruction before the insert; (2) the
+exit path's `if (self->cpu_home == this_cpu_id()) rq_remove_locked(...)` in FOUR
+places is not a removal but a removal ATTEMPT — **a guard that silently skips
+when its premise fails is not a guard** — replaced by `rq_purge_all` over every
+queue, airtight BECAUSE it runs after DEAD is published; (3) *"I marked myself
+asleep, then took myself off the queue — but by then someone had already woken
+me"* — `task_msleep`/`waitq_block` left a task **awake, ready and on no
+runqueue**, never scheduled again, with no trace (this is what "the shell just
+stopped" was); (4) the runqueue walks trusted the ring absolutely — now bounded,
+and a broken ring is repaired + reported instead of faulting in the scheduler
+with the lock held.  **NEW `killstorm [rounds] [tasks]` (both shells)
+reproduces the whole family in seconds** — 480 spawn+kill cycles over 4 CPUs;
+killed the box on the first run, now three clean runs on x86_64 and 300 clean on
+aarch64.  *A bug that needs a browser, a crash and a reboot is a bug nobody can
+work on.*  **GUI half (what the user saw FIRST):** a crashed dosgui client
+leaked its bridge handle forever (`dosgui_destroy` is a call a crashed client
+never makes), so NetSurf refused to open after four crashes — disposal is now
+NOTIFIED from `destroy_window` on every route (`gui_window_set_dispose_cb`): *a
+handle whose lifetime is INFERRED is a handle that leaks.*  **Diagnostics that
+were missing exactly when needed:** x86_64 kernel-fault records hard-coded 0 for
+the fault address (CR2 now recorded), ring-0 dumps name the faulting task/pid/
+CPU, two CPUs faulting at once no longer interleave their dumps
+(`crash_dump_begin/end`, bounded + lock-free — never a real lock in fault
+context), and `crash_report` claims its ring slot atomically (two simultaneous
+faults used to blend into ONE record).  **OPEN:** the reap sweep still reports a
+queued task roughly once in several hundred kills (caught, repaired, logged —
+box unaffected); an i386 `killstorm` run once hung a shell task (box stayed up);
+`load_steal_one` leaves `cpu_home` naming the stealer while the task is briefly
+on no queue — setting it to -1 is more honest and HANGS tasks, because the block
+paths use `cpu_home` to find the queue to detach from.
+
 ▶️ **§M53 STAGES 1–2 — TIME, IN NANOSECONDS (2026-08-09, DOCS §4.53, all 3
 arches).**  `timer_now_ns()` — ONE monotonic nanosecond clock from whatever the
 machine has, callers never learning which: `CNTPCT_EL0` on aarch64 (62.5 MHz,

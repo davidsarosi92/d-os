@@ -192,6 +192,51 @@ static void cmd_pkgrun(const char* line) {
  * needs no calibration: the architecture defines CNTPCT_EL0's rate and hands it
  * over in CNTFRQ_EL0, so what is worth checking here is only that the numbers
  * agree with a tick-based sleep. */
+/* §M54 — the ARM half of `killstorm` (see the x86 shell for the full
+ * rationale).  The scheduler is arch-independent core code, so the race this
+ * exercises — a task killed while blocked, on several CPUs at once — is the
+ * same race here; only the shell it is driven from differs.  Running it on
+ * ARM is what makes "fixed on all three arches" a measurement rather than an
+ * inference from shared source. */
+static volatile int g_ks_alive;
+
+static void killstorm_victim(void) {
+    while (!task_should_stop()) task_msleep(2);
+    __atomic_sub_fetch(&g_ks_alive, 1, __ATOMIC_RELAXED);
+}
+
+static void cmd_killstorm(const char* args) {
+    int rounds = 0, per = 0;
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) rounds = rounds * 10 + (*args - '0');
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) per = per * 10 + (*args - '0');
+    if (rounds <= 0) rounds = 20;
+    if (per    <= 0) per    = 8;
+    if (per > 32) per = 32;
+
+    kprintf("killstorm: %d rounds x %d blocked tasks\n", rounds, per);
+    int spawned = 0, killed = 0;
+    for (int r = 0; r < rounds; r++) {
+        int pids[32];
+        int n = 0;
+        for (int i = 0; i < per; i++) {
+            struct task* t = task_spawn("ks-victim", killstorm_victim);
+            if (!t) break;
+            pids[n++] = t->pid;
+            __atomic_add_fetch(&g_ks_alive, 1, __ATOMIC_RELAXED);
+        }
+        spawned += n;
+        task_msleep(6);
+        for (int i = 0; i < n; i++) { task_kill(pids[i]); killed++; }
+        task_msleep(10);
+    }
+    for (int i = 0; i < 200 && __atomic_load_n(&g_ks_alive, __ATOMIC_RELAXED); i++)
+        task_msleep(10);
+    kprintf("killstorm: done — %d spawned, %d killed, %d still alive\n",
+            spawned, killed, __atomic_load_n(&g_ks_alive, __ATOMIC_RELAXED));
+}
+
 /* §M53 — the ARM half of the timer-accuracy report.  Its floor is 10 ms here,
  * not 1 ms: this arch ticks at 100 Hz, and ktimer_expire runs on the tick. */
 static void cmd_ktimer(void) {
@@ -386,6 +431,7 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "uptime")) kprintf("up %u ms\n", (unsigned)timer_ticks_ms());
         else if (s_eq(cmd, "ktime"))  cmd_ktime();
         else if (s_eq(cmd, "ktimer")) cmd_ktimer();
+        else if (s_eq(cmd, "killstorm")) cmd_killstorm(args);
         else if (s_eq(cmd, "ps"))     cmd_ps();
         else if (s_eq(cmd, "ls"))     cmd_ls(args);
         else if (s_eq(cmd, "cat"))    cmd_cat(args);

@@ -64,6 +64,9 @@ static void dump_and_halt(const char* what, struct trapframe* tf) {
     __asm__ volatile ("mrs %0, esr_el1"  : "=r"(esr));
     __asm__ volatile ("mrs %0, far_el1"  : "=r"(far));
 
+    /* §M54 — one CPU at a time (see crash.c): two cores faulting together
+     * interleave these lines character by character over one UART. */
+    crash_dump_begin();
     uart_early_puts("\n*** AArch64 exception: ");
     uart_early_puts(what);
     uart_early_puts(" ***\n  ESR_EL1 = "); uart_early_puthex(esr);
@@ -84,6 +87,7 @@ static void dump_and_halt(const char* what, struct trapframe* tf) {
                      ct ? ct->name : "kernel",
                      (uintptr_t)tf->elr, (uintptr_t)far, 11, what);
     }
+    crash_dump_end();
     /* §3.1 — ring-0 (EL1) fault policy parity with x86: kernel.fault_policy=reboot
      * restarts the machine (PSCI) instead of halting forever.  Default = halt. */
     {

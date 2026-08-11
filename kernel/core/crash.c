@@ -53,10 +53,14 @@ static void copy_str(char* dst, const char* src, int cap) {
 
 void crash_report(int kind, int pid, const char* comm,
                   uintptr_t pc, uintptr_t addr, int code, const char* what) {
-    /* Claim a slot.  Not atomic across CPUs, and deliberately so: see the file
-     * header — a lock here could deadlock against the very fault we are
-     * recording. */
-    uint32_t seq = g_next_seq++;
+    /* Claim a slot.  No LOCK here — see the file header: a lock on this path
+     * could deadlock against the very fault being recorded.  But `seq++` is a
+     * read-modify-write, and two CPUs faulting at the same instant (which is
+     * exactly what a shared-state bug looks like) then claimed the SAME slot
+     * and interleaved their strings into it, so the one record describing the
+     * failure was a blend of two.  §M54 — an atomic increment is still
+     * lock-free; there was never a reason for this to be a plain `++`. */
+    uint32_t seq = __atomic_fetch_add(&g_next_seq, 1, __ATOMIC_ACQ_REL);
     struct crash_record* r = &g_ring[seq % CRASH_RING];
 
     r->seq  = seq;
@@ -76,6 +80,36 @@ void crash_report(int kind, int pid, const char* comm,
      * of a previous breadcrumb, so persisting it would overwrite the evidence
      * with our own summary of it. */
     if (r->kind != CRASH_UNCLEAN_BOOT) crash_nv_store(r);
+}
+
+/* ---------------------------------------------------------------------------
+ * §M54 — serialise the ring-0 fault DUMP (the kprintf, not the record).
+ *
+ * Two CPUs faulting within a few microseconds of each other interleave their
+ * output one character at a time, and the result is unreadable — at precisely
+ * the moment the kernel most needs to be read.  A real lock is out of the
+ * question here (this runs in fault context, possibly holding the lock whose
+ * misuse caused the fault), so this is a bare test-and-set with a BOUNDED
+ * wait: a second faulter gives the first one a chance to finish and then
+ * prints anyway.  Worst case we are back to today's interleaving; typical
+ * case the two dumps come out one after the other, whole.
+ * --------------------------------------------------------------------------- */
+static volatile uint32_t g_dump_busy;
+
+void crash_dump_begin(void) {
+    for (int i = 0; i < 2000000; i++) {
+        uint32_t expect = 0;
+        if (__atomic_compare_exchange_n(&g_dump_busy, &expect, 1, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return;
+        __asm__ volatile ("" ::: "memory");
+    }
+    /* Timed out — the holder may be halting and will never release.  Print
+     * anyway: a garbled report beats no report. */
+}
+
+void crash_dump_end(void) {
+    __atomic_store_n(&g_dump_busy, 0, __ATOMIC_RELEASE);
 }
 
 int crash_count(void) { return (int)g_captured; }

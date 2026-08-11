@@ -102,6 +102,19 @@ int  gui_window_want_close(struct gui_window* win);
 void gui_window_set_client_managed(struct gui_window* win, int client_pid);
 void gui_window_client_release(struct gui_window* win);
 
+/* §M54 — tell the bridge when the compositor DISPOSES the window, whatever
+ * route disposed it (client_release, the X button, or the client dying without
+ * releasing anything).  Without this the bridge can only learn about the
+ * disposals it caused itself, so a client that CRASHES leaves its handle
+ * occupied forever and its window pointer dangling — the handle table runs out
+ * after a few crashes and the app stops being able to open at all.
+ *
+ * A handle whose lifetime is INFERRED is a handle that leaks: the owner of a
+ * handle has to be told when the object behind it dies.  Runs on the compositor
+ * task, once, before the window struct is recycled. */
+void gui_window_set_dispose_cb(struct gui_window* win,
+                               void (*cb)(struct gui_window*, void*), void* ctx);
+
 /* Raise + focus a window (used by singleton apps on re-launch). */
 void gui_window_raise(struct gui_window* win);
 

@@ -92,6 +92,7 @@ when sections are added.)
 | 4.51 | The broadcast x86 does not have (M51 — TLB shootdown) | 5419 |
 | 4.52 | The note that outlived its premise (M52 — per-CPU SYSCALL) | 5523 |
 | 4.53 | Time, in nanoseconds (M53 stages 1–2) | 5608 |
+| 4.54 | A task the scheduler was still standing on (M54) | 5720 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -5710,6 +5711,214 @@ has a number behind it instead of an intuition.
 
 ---
 
+### 4.54 A task the scheduler was still standing on (M54)
+
+**The report was three sentences: open NetSurf, a crash report appears, close
+it, open it again — the machine dies.**  The rule this violates is the oldest
+one in the project: *nothing a user program does may take the box down.*  A
+browser crashing is a browser problem; the machine going with it is a kernel
+problem.
+
+#### The evidence, which was already on disk
+
+The guest had rebooted, and §M47's NVRAM breadcrumb had already written down
+what killed the previous boot:
+
+```
+crash: PREVIOUS BOOT ENDED UNCLEANLY — last recorded event was kernel-fault
+       in 'idle-3' (pid 4) at pc=0x0000000000120ab5 code=11
+```
+
+```
+$ ./scripts/dos-sym.sh 120ab5 x86_64
+0x120ab5 is in pick_next_local_locked (+0x54)
+  120ab5: 8b 80 d8 01 00 00     movl 0x1d8(%rax), %eax    # t->state
+```
+
+The idle task of CPU 3, walking its own runqueue, read `state` out of a task
+that was not a task any more.  So the crash had nothing to do with the browser
+except its timing: the browser's DEATH left something behind in the scheduler,
+and the next scheduling decision stepped on it.
+
+#### The root cause: `current` is not "running"
+
+`schedule_locked` publishes the incoming task as the CPU's `current` **before**
+it swaps stacks:
+
+```c
+me->current = next;
+...                          /* FPU save/restore, address-space switch —      */
+                             /* all of it still executing on PREV's stack     */
+context_switch(&prev->esp, next->esp);
+```
+
+Between those two points the outgoing task is `current` **nowhere**, while a
+CPU is still executing on its kernel stack and has not yet written back its
+saved stack pointer.  Two independent pieces of the kernel asked the wrong
+question about that state:
+
+- `task_running_elsewhere` (the guard that stops two CPUs picking one task)
+  scanned only `current` — so a second CPU concluded the task was free, picked
+  it, and resumed it **from a stale `esp`**.  One task, two CPUs, one stack.
+- `task_reap` refused to free a task that was `current` somewhere — so it
+  freed one that was merely being switched away from, handing its kernel stack
+  to the next allocation while a live CPU was still writing to it.
+
+Everything downstream is corruption with no attribution: a wild return address
+(the machine was observed jumping to `0x3`, and to a heap page in the direct
+map), a runqueue ring with a freed task in it, a fault in the idle task on a
+third CPU.  **The recorded crash was three or four hops away from its cause.**
+
+The fix is one bit that answers the question actually being asked — *is a CPU
+still standing on this task?*
+
+```c
+volatile int on_cpu;    /* struct task */
+```
+
+Set when a task is switched to; cleared by **the task that takes the CPU over**,
+because the outgoing task cannot do it (by the time it would be safe, it is no
+longer running).  The incoming task finds its predecessor in a per-CPU
+`g_leaving` slot.  There are exactly two places an incoming task can arrive —
+the tail of `schedule_locked` for an established task, and
+`task_finish_first_switch` for a brand-new one — and **missing the second one
+was a bug in the first version of this fix**: a task switched away from in
+favour of a freshly spawned task kept `on_cpu` set forever and became
+unreapable.
+
+`task_running_elsewhere`, `load_steal_one` and `task_reap` now all consult
+`on_cpu`.  The `current` scan is kept underneath it as a second opinion.
+
+#### Four more defects on the same path
+
+1. **A DEAD task could be enqueued.**  `wake_timed_sleeper` and
+   `wake_waitq_sleeper` decide "this task was asleep, wake it" and then call
+   `task_enqueue` *after* dropping the lock they decided under.  In that window
+   the task can be woken for real by somebody else, run, and exit.  Nothing
+   takes a DEAD task out of a runqueue again — its own exit path has already
+   run — so it stays linked until it is reaped and freed.  The test now lives
+   inside `rq_insert_tail_locked`, under the destination queue's lock, one
+   instruction before the insert.
+
+2. **The exit path removed the task from the wrong queue — or from none.**
+   Four places read
+
+   ```c
+   if (self->cpu_home == this_cpu_id()) rq_remove_locked(me, self);
+   ```
+
+   which is not a removal but a removal *attempt*: when the premise is false the
+   task silently stays queued, and the premise is false for a real window (a
+   waker may re-home a task onto another CPU's queue while it is still
+   `current` here — `waitq_block`'s own comment describes that window).  Now
+   `rq_purge_all` sweeps every queue, which is airtight *because* it runs after
+   DEAD is published: an enqueue is then either already complete (and the sweep
+   finds it) or still waiting for the lock (and refuses when it gets it).
+
+3. **"I marked myself asleep, then took myself off the queue — but by then
+   someone had already woken me."**  `task_msleep` and `waitq_block` set
+   `state = SLEEPING` and dequeue as two steps.  A waker fitting between them
+   flips the state back to RUNNABLE and finds the task still queued, so its
+   enqueue is a no-op — and then the sleeper dequeues itself anyway.  The result
+   is a task that is **awake, ready, and on no runqueue**: never picked again,
+   by anything, ever.  That is what "the shell just stopped" looked like, and it
+   leaves nothing behind at all.  Both now re-check after dequeuing and put
+   themselves back rather than sleeping through a wake meant for them.
+
+4. **The runqueue walks trusted the ring absolutely.**  One bad link and the
+   kernel dereferenced it, in the scheduler, holding the queue lock — the box
+   died and took its own diagnostics with it.  `pick_next_local_locked`,
+   `load_steal_one` and `rq_refresh_local_load` are now bounded walks that
+   repair a broken ring (closing it at the last reachable node) and report once,
+   lock-free, over the serial port.
+
+#### The reproducer, in the tree
+
+None of this was reachable by clicking.  `killstorm [rounds] [tasks]` (both
+shells) spawns N tasks that park in `task_msleep`, kills them all, and repeats
+— so the three-party operation at the centre of the bug (a killer wakes a
+sleeper, another CPU runs it and it exits, the reaper frees it) happens
+hundreds of times a second on every core at once.
+
+It killed the machine within seconds on the first run.  After the fixes:
+
+```
+killstorm: done — 480 spawned, 480 killed, 0 still alive     (x86_64, -smp 4)
+killstorm: done — 480 spawned, 480 killed, 0 still alive
+killstorm: done — 480 spawned, 480 killed, 0 still alive
+killstorm: done — 300 spawned, 300 killed, 0 still alive     (aarch64, -smp 4)
+```
+
+**A bug that needs a browser, a crash and a reboot to reproduce is a bug nobody
+can work on.  Same bug, in a shell command, in two seconds.**
+
+#### The GUI half: a handle whose lifetime was inferred
+
+Separately — and this is what the user actually saw first — a crashed NetSurf
+could not be reopened after four crashes.  `dosgui` released a bridge handle
+only in `dosgui_destroy`, which is a call a *crashed* client never makes.  So
+every crash burned one of four handles permanently and left `win` pointing at a
+window struct the compositor had already recycled.
+
+The fix is a disposal notification (`gui_window_set_dispose_cb`) fired from
+`destroy_window` on **every** teardown route, not just the ones the bridge
+caused itself.  *A handle whose lifetime is inferred is a handle that leaks:
+the owner of a handle has to be told when the object behind it dies.*
+
+#### Diagnostics that were missing at the moment they were needed
+
+- The x86_64 kernel-fault record hard-coded **0** for the fault address.  CR2 is
+  the most informative number a page fault has, the box halts, and the record is
+  the only thing that survives to the next boot.  Now recorded (i386 and aarch64
+  already did).
+- Ring-0 fault dumps did not say **which task** faulted.  "EXCEPTION 6 at rip=3"
+  names an address and nothing else.  Now: task name, pid, CPU.
+- Two CPUs faulting at once interleaved their dumps character by character,
+  exactly when the output most needs to be readable.  `crash_dump_begin/end` is
+  a bounded, lock-free gate (never a real lock — this runs in fault context)
+  around the dump on all three arches.
+- `crash_report` claimed its ring slot with a plain `seq++`.  Two CPUs faulting
+  together claimed the *same* slot and blended their strings into it — so the
+  one record describing the failure was a mixture of two.  Now an atomic
+  increment, which is still lock-free.
+
+#### Lessons
+
+- **`current` is not "running".**  A CPU is standing on a task's stack from
+  before that task is published as current until after it is unpublished.  Any
+  question of the form "is anyone using this task?" has to be asked of a flag
+  that spans the whole switch, not of a pointer that changes in the middle of
+  it.
+- **A guard that silently skips when its premise fails is not a guard.**
+  `if (cpu_home == this_cpu_id()) remove()` reads like a removal and behaves
+  like a coin flip.
+- **The crash you record is not the crash that happened.**  Every symptom here
+  (fault in the idle task, jump to 0x3, #GP in the crash reporter itself) was
+  several hops downstream of one shared-state bug.  What made it findable was
+  narrowing with a reproducer, not reading the faults.
+- **Make it reproducible before making it right.**  The first two "fixes" in
+  this milestone were wrong and the stress test said so within a minute — one
+  left a task unreapable, one hung tasks outright.  Neither would have been
+  caught by clicking on a browser.
+
+#### Open
+
+- The `task_reap` sweep still occasionally reports a task that was queued at
+  reap time (roughly one in several hundred kills under `killstorm`).  It is
+  caught, repaired and logged — the box is unaffected — but an ordering
+  assumption in the exit path is still not exactly right, and the message says
+  so rather than repairing in silence.
+- Under `killstorm` on i386 a shell task was once observed hanging (the box
+  stayed up and responsive).  The lost-task race in (3) above is fixed and
+  x86_64/aarch64 now run clean; i386 needs another pass with the same test.
+- `load_steal_one` sets `cpu_home` to the stealing CPU while the task is
+  briefly on no queue at all.  Setting it to -1 there is more honest and
+  **hangs tasks** — the block paths use `cpu_home` to find the queue to detach
+  from.  The right fix is a single owner for that transition, not a more honest
+  transient.
+
+---
+
 ## 7. Roadmap / open milestones
 
 - [x] **M1 — GDT:** own Global Descriptor Table, stop relying on GRUB's.
@@ -5733,6 +5942,37 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-10 — §M54: a task the scheduler was still standing on (DOCS §4.54).**
+  Reported as "open NetSurf, it crashes, reopen it, the machine dies"; the
+  actual fault was in `pick_next_local_locked`, in the idle task of another
+  CPU, several hops downstream.  Root cause: `schedule_locked` publishes the
+  incoming task as `current` BEFORE swapping stacks, so between those points
+  the outgoing task is current nowhere while a CPU is still executing on its
+  stack — and both the "is this task running elsewhere" guard and the reaper's
+  "is it current anywhere" check asked exactly that question.  One CPU resumed
+  a task from a stale `esp` while another was still on it; the reaper freed a
+  kernel stack that was in use.  Fixed with an `on_cpu` flag that spans the
+  whole switch, released by the task that takes the CPU over (both arrival
+  points — missing the brand-new-task trampoline was a bug in the first version
+  of the fix).  Four more defects on the same path: a DEAD task could be
+  enqueued (the check now lives under the destination queue's lock, one
+  instruction before the insert); the exit path removed the task from the wrong
+  queue or from none (`rq_purge_all` sweeps every queue, airtight because it
+  runs after DEAD is published); `task_msleep`/`waitq_block` could dequeue
+  themselves *after* a waker had already woken them, leaving a task awake,
+  ready and on no runqueue — never scheduled again, with no trace; and the
+  runqueue walks are now bounded and repair a broken ring instead of faulting
+  in the scheduler.  New **`killstorm`** command on both shells reproduces the
+  whole family in seconds (480 spawn+kill cycles across 4 CPUs, three runs
+  clean on x86_64, 300 clean on aarch64) — a bug that needed a browser, a crash
+  and a reboot is now a two-second shell command.  GUI half: a crashed dosgui
+  client leaked its bridge handle permanently, so NetSurf could not be reopened
+  after four crashes; disposal is now NOTIFIED (`gui_window_set_dispose_cb`)
+  from every teardown route.  Diagnostics: x86_64 kernel-fault records now
+  carry CR2 (they hard-coded 0), ring-0 dumps name the faulting task/pid/CPU,
+  simultaneous dumps no longer interleave, and `crash_report` claims its ring
+  slot atomically.
 
 - **2026-08-09 — §M53 stages 1–2: time, in nanoseconds (DOCS §4.53).**  A
   monotonic nanosecond clock (`timer_now_ns`) and deadline timers built on it

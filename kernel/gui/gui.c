@@ -145,6 +145,12 @@ struct gui_window {
      * dispose the window if that client dies WITHOUT a clean DOSGUI_DESTROY
      * (force-kill / crash).  0 for a normal app-host window. */
     int  client_pid;
+    /* §M54 — "this window is gone" notification for whoever owns a handle to
+     * it (the dosgui bridge).  Fired exactly once, from destroy_window, on
+     * EVERY disposal route — that is the point: the bridge must not have to
+     * infer the window's death from the route it happened to take. */
+    void (*on_dispose)(struct gui_window*, void*);
+    void*  dispose_ctx;
     struct app_event aq[AQ_SZ];
     volatile uint32_t aq_h, aq_t;
     volatile int tick_pending;          /* compositor asks host to on_tick */
@@ -917,6 +923,13 @@ void gui_window_set_client_managed(struct gui_window* win, int client_pid) {
     if (win) { win->host_task = NULL; win->client_pid = client_pid; }
 }
 
+/* §M54 — see gui.h.  One slot, set at creation by the bridge that owns the
+ * handle; the compositor calls it exactly once when the struct is disposed. */
+void gui_window_set_dispose_cb(struct gui_window* win,
+                               void (*cb)(struct gui_window*, void*), void* ctx) {
+    if (win) { win->on_dispose = cb; win->dispose_ctx = ctx; }
+}
+
 /* §M42 — the client (dosgui_destroy, from dos_finalise) says it is finished with
  * the window and will not touch it again.  Mark it disposable: want_close makes
  * apply_pending pick it up; host_released makes it skip the host-coordination /
@@ -1394,6 +1407,20 @@ static void destroy_window(struct gui_window* win) {
     /* M22.7 — a released WIN_APP already ran on_close + freed its widgets on
      * its host task; don't repeat it here.  WIN_TERM keeps the old path. */
     if (win->on_close && !win->host_released) win->on_close(win);
+
+    /* §M54 — tell the handle owner the window is going away.  Unconditional and
+     * BEFORE any teardown, because the whole point is that it must not depend
+     * on which route got us here: on_close above is skipped for a released
+     * window, and the crash route sets host_released, which is exactly the
+     * combination that used to leave the dosgui bridge holding a handle to a
+     * window that no longer exists. */
+    if (win->on_dispose) {
+        void (*cb)(struct gui_window*, void*) = win->on_dispose;
+        void* ctx = win->dispose_ctx;
+        win->on_dispose = NULL;                 /* fire once, never re-enter */
+        win->dispose_ctx = NULL;
+        cb(win, ctx);
+    }
 
     uint32_t fl = spin_lock_irqsave(&state_lock);
     int i;
@@ -2172,6 +2199,8 @@ static struct gui_window* window_alloc(const char* title, enum win_kind kind,
     /* M22.7 — per-task app fields. */
     win->host_task = NULL;
     win->client_pid = 0;                /* §M46 — clear stale client on reuse */
+    win->on_dispose = NULL;             /* §M54 — never inherit a dead owner   */
+    win->dispose_ctx = NULL;
     win->input_hook = NULL;             /* dosgui/wayland re-arm per window     */
     win->input_ctx  = NULL;
     win->aq_h = win->aq_t = 0;

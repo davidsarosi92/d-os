@@ -218,6 +218,21 @@ struct task {
     int      cpu_home;
     struct task* rq_next;
     struct task* rq_prev;
+    /* §M54 — "a CPU is still standing on this task's kernel stack".
+     *
+     * `current` is NOT that answer.  The scheduler publishes the incoming task
+     * as `current` BEFORE the stack swap, so between those two points the
+     * outgoing task is current nowhere while the CPU is still executing on its
+     * stack (the FPU save/restore and the address-space switch all run there,
+     * and context_switch itself writes back into it).  A reaper that only
+     * checked `current` therefore freed the stack out from under a live CPU,
+     * which reappears later as a return to a garbage address — the machine
+     * jumping to 0x3 with nothing to say why.
+     *
+     * Set when a task is about to be switched TO, cleared by whichever task
+     * the CPU switches to next, once the swap is genuinely complete.  Reaping
+     * waits for it. */
+    volatile int on_cpu;
     /* Tier A.1 — wait-queue link.  When state==TASK_SLEEPING because the
      * task parked itself on a `struct waitq`, it hangs off that queue's
      * singly-linked list through `wq_next` (a task can be blocked on at

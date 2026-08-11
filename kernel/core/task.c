@@ -90,6 +90,7 @@
 #include "vmm.h"            /* M25: per-process address-space switch */
 #include "waitq.h"
 #include "crash.h"          /* §M47 — record a forced kill */
+#include "klog.h"           /* §M54 — report a corpse found in a runqueue */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -214,8 +215,21 @@ static void task_sched_defaults(struct task* t) {
  * the caller-set destination CPU index.  Idempotent: re-enqueueing
  * an already-on-this-rq task is a no-op (defensive — shouldn't
  * happen if state transitions are right). */
-static void rq_insert_tail_locked(struct percpu* rq, struct task* t) {
-    if (t->rq_next || t->rq_prev || rq->rq_head == t) return;
+static int rq_insert_tail_locked(struct percpu* rq, struct task* t) {
+    /* §M54 — A DEAD TASK MUST NEVER ENTER A RUNQUEUE.  Nothing takes it out
+     * again (its own exit path has already run), so it stays linked until it
+     * is reaped and FREED — and then the queue holds a dangling pointer that
+     * the next schedule() dereferences.  That is not a hypothetical: it is
+     * the fault this milestone was opened for (see task_reap's sweep for the
+     * full story).  The test lives HERE, under the destination rq's lock and
+     * one instruction before the insert, because every caller that tested it
+     * earlier was testing a value that could still change. */
+    if (t->state == TASK_DEAD) return 0;
+    /* Already on SOME queue.  Returning 0 (not 1) matters: the caller uses it
+     * to decide whether to claim ownership via cpu_home, and claiming a queue
+     * the task was not actually put on is how cpu_home came to name one queue
+     * while another one held the task. */
+    if (t->rq_next || t->rq_prev || rq->rq_head == t) return 0;
     if (!rq->rq_head) {
         rq->rq_head = t;
         t->rq_next  = t;
@@ -234,6 +248,7 @@ static void rq_insert_tail_locked(struct percpu* rq, struct task* t) {
      * queue's load. */
     t->runnable_since = timer_ticks_ms();
     rq->rq_load += task_load_contrib(t);
+    return 1;
 }
 
 /* Remove a task from its current rq.  Caller holds the OWNING rq's
@@ -274,6 +289,146 @@ static void rq_remove_locked(struct percpu* rq, struct task* t) {
      * fall.  Ordering matters: the load above was withdrawn using the OLD
      * demand, which is the value that was added on insert. */
     task_refresh_demand(t, timer_ticks_ms());
+}
+
+/* §M54 — take `t` off WHATEVER runqueue currently holds it.
+ *
+ * Every place that detaches a task used to read
+ *
+ *     if (self->cpu_home == this_cpu_id()) rq_remove_locked(me, self);
+ *
+ * which is not a removal but a removal ATTEMPT: when the premise is false the
+ * task silently stays queued.  And the premise is false for a real window —
+ * a waker (task_enqueue) may re-home a task onto another CPU's queue while it
+ * is still `current` here, which waitq_block's own comment describes.  A task
+ * that then EXITS through that branch stays linked in a queue it no longer
+ * belongs to, is reaped, is freed, and the next schedule() on that CPU walks
+ * into freed memory.
+ *
+ * Caller must hold NO rq_lock.  The retry loop handles the task being re-homed
+ * between reading cpu_home and taking that queue's lock: we only remove while
+ * holding the lock of the queue we verified it belongs to. */
+static void rq_detach_anywhere(struct task* t) {
+    if (!t || t->is_idle) return;
+    for (int spins = 0; spins < 64; spins++) {
+        int home = t->cpu_home;
+        if (home < 0) return;                      /* on no queue at all */
+        struct percpu* rq = percpu_at(home);
+        if (!rq) return;
+        uint32_t fl = spin_lock_irqsave(&rq->rq_lock);
+        if (t->cpu_home == home) {                 /* still the same queue */
+            rq_remove_locked(rq, t);
+            spin_unlock_irqrestore(&rq->rq_lock, fl);
+            return;
+        }
+        spin_unlock_irqrestore(&rq->rq_lock, fl);  /* re-homed under us; retry */
+    }
+}
+
+/* §M54 — the runqueue ring lost its circularity: `last_good`'s forward link
+ * was NULL (or the walk ran past the queue's own length).  Close the ring at
+ * the last node we could reach, which keeps every task still on the reachable
+ * side and restores a walkable list; anything past the break is unreachable
+ * and would have been unschedulable anyway.
+ *
+ * Deliberately NOT klog: this runs inside the scheduler with rq_lock held, and
+ * the log path takes locks of its own.  serial_write is the lock-free channel
+ * the kernel already uses for reports from contexts that cannot afford any
+ * (the NMI watchdog uses it for the same reason).  Reported ONCE — a repeating
+ * message from the scheduler would drown the machine and the serial line. */
+static int g_ring_break_reported;              /* report once, not per pick */
+
+/* §M54 — per-CPU "the task this CPU just switched away from", handed to the
+ * incoming task so it can release the outgoing one's on_cpu flag once the
+ * stack swap is really finished.  Written under the owning CPU's rq_lock and
+ * read on the same CPU immediately after the switch, so it needs no lock of
+ * its own.  A plain array rather than a struct percpu field: this is scheduler
+ * bookkeeping with exactly one reader and one writer per slot, and percpu.h is
+ * a header shared by every arch.
+ *
+ * 32 is not an arbitrary cap: `cpu_mask` is a uint32_t, so 32 CPUs is already
+ * the scheduler's own hard limit everywhere else in this file. */
+#define SCHED_MAX_CPUS 32
+static struct task* g_leaving[SCHED_MAX_CPUS];
+
+/* Release the task this CPU switched away from: the swap is complete, nothing
+ * is standing on its stack, and (if it exited) it is now reapable.  Called by
+ * the INCOMING task — the only context that can observe the switch finishing —
+ * from both places one can arrive: schedule_locked's tail for an established
+ * task, and task_finish_first_switch for a brand-new one. */
+static void sched_release_leaving(void) {
+    int cpu = this_cpu_id();
+    if (cpu < 0 || cpu >= SCHED_MAX_CPUS) return;
+    struct task* left = g_leaving[cpu];
+    g_leaving[cpu] = NULL;
+    if (left) __atomic_store_n(&left->on_cpu, 0, __ATOMIC_RELEASE);
+}
+
+static void rq_ring_repair(struct percpu* rq, struct task* last_good,
+                           const char* where) {
+    extern void serial_write(const char* s);
+    if (last_good && rq->rq_head) {
+        last_good->rq_next   = rq->rq_head;
+        rq->rq_head->rq_prev = last_good;
+    } else {
+        rq->rq_head  = NULL;
+        rq->rq_count = 0;
+        rq->rq_load  = 0;
+    }
+    if (!g_ring_break_reported) {
+        g_ring_break_reported = 1;
+        serial_write("\n!! sched: runqueue ring was broken in ");
+        serial_write(where);
+        serial_write(" — repaired, box kept running (see M54)\n");
+    }
+}
+
+/* No real runqueue is anywhere near this long; it exists only so a ring that
+ * closes onto itself WITHOUT passing through head cannot spin forever. */
+#define RQ_WALK_MAX 4096
+
+/* §M54 — is `t` REALLY a member of this queue?  Caller holds rq->rq_lock.
+ *
+ * "t->rq_next != NULL" only says the task is on SOME queue, and acting on that
+ * from the wrong queue corrupts that queue's count and load while leaving the
+ * task where it was.  Membership is a property of the ring, so the ring is
+ * what gets asked.  Bounded like every other walk in this file. */
+static int rq_contains_locked(struct percpu* rq, struct task* t) {
+    struct task* head = rq->rq_head;
+    if (!head || !t) return 0;
+    struct task* p = head;
+    for (int guard = RQ_WALK_MAX; guard > 0; guard--) {
+        if (p == t) return 1;
+        p = p->rq_next;
+        if (!p || p == head) break;
+    }
+    return 0;
+}
+
+/* §M54 — take `t` off EVERY runqueue, checking each one.  Caller holds no
+ * rq_lock.  Returns the number of queues it was actually found on (normally 1,
+ * or 0 if it was already off).
+ *
+ * Used by the exit path AFTER the task is marked DEAD, and that ordering is
+ * what makes it airtight rather than merely thorough: once DEAD is published,
+ * task_enqueue refuses the task under the destination queue's own lock, so an
+ * enqueue is either already complete (and this sweep finds it) or still waiting
+ * for that lock (and will refuse when it gets it).  Detaching from the single
+ * queue cpu_home names cannot make that claim — cpu_home is written under the
+ * DESTINATION queue's lock and read under the source's, so the two can be about
+ * different queues at the same instant. */
+static int rq_purge_all(struct task* t) {
+    if (!t || t->is_idle) return 0;
+    int found = 0;
+    int n = smp_ncpus();
+    for (int i = 0; i < n; i++) {
+        struct percpu* rq = percpu_at(i);
+        if (!rq) continue;
+        uint32_t fl = spin_lock_irqsave(&rq->rq_lock);
+        if (rq_contains_locked(rq, t)) { rq_remove_locked(rq, t); found++; }
+        spin_unlock_irqrestore(&rq->rq_lock, fl);
+    }
+    return found;
 }
 
 /* §M49 — recompute one task's `demand` from the runnable time it has
@@ -321,11 +476,17 @@ static void rq_refresh_local_load(struct percpu* me) {
     struct task* head = me->rq_head;
     if (head) {
         struct task* t = head;
-        do {
+        /* §M54 — bounded walk (see pick_next_local_locked). */
+        for (int guard = RQ_WALK_MAX; ; guard--) {
             task_refresh_demand(t, now);
             sum += task_load_contrib(t);
+            if (!t->rq_next || guard <= 1) {
+                rq_ring_repair(me, t, "rq_refresh_local_load");
+                break;
+            }
             t = t->rq_next;
-        } while (t != head);
+            if (t == head) break;
+        }
     }
     me->rq_load = sum;
     spin_unlock_irqrestore(&me->rq_lock, fl);
@@ -372,8 +533,21 @@ static void task_enqueue(struct task* t) {
     if (!rq) return;
 
     uint32_t fl = spin_lock_irqsave(&rq->rq_lock);
-    t->cpu_home = cpu;
-    rq_insert_tail_locked(rq, t);
+    /* §M54 — DEAD is decided elsewhere but must be OBSERVED here, holding the
+     * destination queue's lock: this is the last moment before the pointer
+     * becomes reachable from the scheduler, and it is the only moment at which
+     * "not dead" is still true when the insert happens.  Leave cpu_home alone
+     * on the reject so it keeps naming whatever queue (if any) really holds
+     * the task. */
+    if (t->state == TASK_DEAD) {
+        spin_unlock_irqrestore(&rq->rq_lock, fl);
+        return;
+    }
+    /* §M54 — claim the task for this queue ONLY if it really went on it.  Two
+     * wakers can race (the timer sweep and an explicit kill both wake a timed
+     * sleeper); the second insert is a no-op, and overwriting cpu_home there
+     * would leave it pointing at a queue the task is not on. */
+    if (rq_insert_tail_locked(rq, t)) t->cpu_home = cpu;
     spin_unlock_irqrestore(&rq->rq_lock, fl);
 
     /* If we enqueued onto a different CPU, kick it so it picks up
@@ -408,6 +582,9 @@ void task_init(void) {
     t0->kstack_base = NULL;             /* we don't own boot's stack */
     t0->cpu_mask    = 0xFFFFFFFFu;
     t0->cpu_home    = 0;                /* BSP */
+    /* §M54 — pid 0 IS the running context right now; say so, or the first task
+     * it switches away from would clear a flag that was never set. */
+    t0->on_cpu      = 1;
     t0->rq_next = t0->rq_prev = NULL;
     task_sched_defaults(t0);
     hal_fpu_init_state(t0->fpu_state);  /* valid image before the first restore */
@@ -650,6 +827,31 @@ struct task* task_spawn_console(const char* name, void (*entry)(void),
  * steal a `current` task, but if a race ever sneaks through this
  * guards against double-running. */
 static int task_running_elsewhere(struct task* t) {
+    /* §M54 — THE `current` SCAN BELOW IS NOT SUFFICIENT, and this is where the
+     * whole family of "the box died in the scheduler" faults came from.
+     *
+     * A CPU switching away publishes the INCOMING task as its `current` before
+     * it swaps stacks.  From that instant until the swap completes, the
+     * outgoing task is `current` nowhere while a CPU is still executing on its
+     * stack and has not yet written back its saved stack pointer.  A second
+     * CPU that consults only `current` therefore concludes the task is free,
+     * picks it, and resumes it FROM A STALE esp — two CPUs running one task on
+     * one stack.  Everything downstream of that is corruption with no
+     * attribution: a wild return address, a broken runqueue ring, a fault in
+     * the idle task on a third CPU.
+     *
+     * `on_cpu` is the honest question ("is a CPU still standing on this task?")
+     * and it spans the whole switch, so it closes the window the `current` test
+     * leaves open.  The scan is kept underneath it as a second opinion: it
+     * costs a handful of loads and it is the check that would notice if the
+     * on_cpu bookkeeping itself were ever wrong.
+     *
+     * Our own `current` is excluded deliberately — a CPU must still be able to
+     * keep running the task it is already running. */
+    if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) {
+        struct percpu* me = this_cpu();
+        if (!me || me->current != t) return 1;
+    }
     int self = this_cpu_id();
     int n = smp_ncpus();
     for (int i = 0; i < n; i++) {
@@ -659,6 +861,7 @@ static int task_running_elsewhere(struct task* t) {
     }
     return 0;
 }
+
 
 /* Walk this CPU's runqueue and return the first RUNNABLE task whose
  * affinity includes us and which isn't running elsewhere.  Caller
@@ -678,7 +881,14 @@ static struct task* pick_next_local_locked(struct percpu* rq) {
      * iteration, exactly as before. */
     for (int pass = 0; pass < 2; pass++) {
         struct task* t = head;
-        do {
+        /* §M54 — bound the walk.  This loop USED to trust the ring absolutely:
+         * one bad link and the kernel dereferenced it, in the scheduler, with
+         * the rq lock held — i.e. the box died and took its own diagnostics
+         * with it.  The ring should never break (see task_reap's sweep), but
+         * "should never" is not a property the scheduler can afford to bet the
+         * machine on, so a broken ring now degrades to "this CPU idles and
+         * says why" instead of to a halt. */
+        for (int guard = RQ_WALK_MAX; ; guard--) {
             if (t->state == TASK_RUNNABLE &&
                 !t->is_idle &&
                 (t->cpu_mask & (1u << self)) &&
@@ -689,8 +899,13 @@ static struct task* pick_next_local_locked(struct percpu* rq) {
                     return t;
                 }
             }
+            if (!t->rq_next || guard <= 1) {
+                rq_ring_repair(rq, t, "pick_next_local");
+                return NULL;
+            }
             t = t->rq_next;
-        } while (t != head);
+            if (t == head) break;
+        }
     }
     return NULL;
 }
@@ -766,24 +981,46 @@ static struct task* load_steal_one(struct percpu* victim,
     uint32_t best_dist = 0xFFFFFFFFu;
     if (head) {
         struct task* t = head;
-        do {
+        /* §M54 — same bounded walk as pick_next_local_locked, for the same
+         * reason: this loop has already been seen faulting on a bad link, and
+         * it runs holding ANOTHER CPU's runqueue lock — a fault here takes
+         * that lock down with it and wedges a second core on the way out. */
+        for (int guard = RQ_WALK_MAX; ; guard--) {
             if (t->state == TASK_RUNNABLE &&
                 !t->is_idle &&
                 t != victim->current &&
+                /* §M54 — and not mid-switch on ANY cpu: "not the victim's
+                 * current" has the same blind spot as task_running_elsewhere's
+                 * scan, and stealing a task that a CPU is still standing on
+                 * hands it to a third core to resume from a stale stack. */
+                !__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE) &&
                 (t->cpu_mask & (1u << self))) {
                 /* Compare in the SAME units the imbalance is expressed
                  * in — weighted contribution, not raw demand. */
                 uint32_t c = (uint32_t)task_load_contrib(t);
-                if (c > max_demand) { t = t->rq_next; continue; }
-                uint32_t dist = (c > want_demand)
-                              ? c - want_demand : want_demand - c;
-                if (dist < best_dist) { best_dist = dist; found = t; }
+                if (c <= max_demand) {
+                    uint32_t dist = (c > want_demand)
+                                  ? c - want_demand : want_demand - c;
+                    if (dist < best_dist) { best_dist = dist; found = t; }
+                }
+            }
+            if (!t->rq_next || guard <= 1) {
+                rq_ring_repair(victim, t, "load_steal_one");
+                found = NULL;
+                break;
             }
             t = t->rq_next;
-        } while (t != head);
+            if (t == head) break;
+        }
     }
     if (found) {
         rq_remove_locked(victim, found);
+        /* The task is off every queue until the caller inserts it, but it keeps
+         * naming us as its home throughout.  §M54 tried -1 here ("on no queue,
+         * and honest about it") and that HUNG tasks: cpu_home is what the block
+         * paths use to find the queue to detach from, and a -1 they cannot act
+         * on leaves a task queued and asleep at the same time.  Honesty about a
+         * transient is worth less than a value every reader can use. */
         found->cpu_home = self;
     }
     spin_unlock_irqrestore(&victim->rq_lock, fl);
@@ -1005,6 +1242,16 @@ static void schedule_locked(struct percpu* me) {
     }
 
     me->current = next;
+    /* §M54 — publish "still on a CPU" for BOTH sides of the switch before it
+     * begins.  `next` is about to run; `prev` keeps the flag until the CPU has
+     * finished leaving its stack, and the task that lands here next clears it
+     * (see below).  g_leaving is per-CPU and written under this CPU's rq_lock,
+     * which we hold. */
+    next->on_cpu = 1;
+    {
+        int cpu = this_cpu_id();
+        if (cpu >= 0 && cpu < SCHED_MAX_CPUS) g_leaving[cpu] = prev;
+    }
     /* Tier B — set the per-task ring-3→ring-0 kernel stack (TSS.esp0 on x86).
      * An independent user task uses its own kstack top; anything else restores
      * the arch default (fixed syscall stack / excursion model).  No-op on
@@ -1039,6 +1286,19 @@ static void schedule_locked(struct percpu* me) {
     vmm_space_switch(next->mm);
     context_switch(&prev->esp, next->esp);
     /* Resumes here when `prev` is scheduled back in by SOME CPU. */
+
+    /* §M54 — release the task this CPU switched AWAY from, now that the swap
+     * is complete and nothing is standing on its stack any more.
+     *
+     * The outgoing task cannot do this itself: by the time it would be safe,
+     * that task is no longer running.  So the INCOMING task does it, which is
+     * the only context that can observe "the switch finished".  We are on the
+     * CPU that performed the switch (context_switch does not move CPUs), so
+     * this CPU's slot names exactly the task that just left.
+     *
+     * For a task that exited, this is the moment it becomes reapable: this
+     * store is what task_reap waits for. */
+    sched_release_leaving();
 }
 
 void schedule(void) {
@@ -1176,10 +1436,29 @@ void task_msleep(uint32_t ms) {
         self->cpu_ms_at_yield = self->cpu_ms;
         g_timed_sleepers++;
 
-        struct percpu* me = this_cpu();
-        spin_lock(&me->rq_lock);
-        if (self->cpu_home == this_cpu_id()) rq_remove_locked(me, self);
-        spin_unlock(&me->rq_lock);
+        /* §M54 — detach from whichever queue holds us, not merely from this
+         * CPU's (see rq_detach_anywhere).  IRQs are already off; the helper's
+         * spin_lock_irqsave/restore preserves that. */
+        rq_detach_anywhere(self);
+
+        /* §M54 — AND CHECK THAT WE ARE STILL ASLEEP.
+         *
+         * Marking ourselves SLEEPING and taking ourselves off the runqueue are
+         * two steps, and a waker fitting between them (a kill, the timer sweep)
+         * flips us back to RUNNABLE and finds us already queued, so its enqueue
+         * is a no-op — and then WE dequeue ourselves anyway.  The result is a
+         * task that is awake, ready, and on no queue: it is never picked again,
+         * by anything, forever.  That is what "the shell stopped for no reason"
+         * looked like, and it leaves no trace at all.
+         *
+         * If our state changed under us, the wake already happened: put
+         * ourselves back and re-test the deadline instead of sleeping through
+         * a wake that was meant for us. */
+        if (self->state != TASK_SLEEPING) {
+            task_enqueue(self);
+            hal_intr_restore(fl);
+            continue;
+        }
 
         hal_intr_restore(fl);
         schedule();                              /* off-queue until swept */
@@ -1244,6 +1523,11 @@ static void wake_timed_sleeper(struct task* t) {
     t->sleep_until_ms = 0;
     if (g_timed_sleepers > 0) g_timed_sleepers--;
     t->state = TASK_RUNNABLE;
+    /* §M54 — the DEAD re-check that makes this safe lives inside task_enqueue,
+     * under the destination queue's lock.  Testing it out here instead would
+     * be testing a value that can change one instruction later: the task can
+     * be woken by a real waker, run, and exit while this wake is still in
+     * flight.  See rq_insert_tail_locked. */
     task_enqueue(t);
 }
 
@@ -1282,6 +1566,13 @@ static void wake_waitq_sleeper(struct task* t) {
     if (woke) t->state = TASK_RUNNABLE;
     spin_unlock_irqrestore(&wq->lock, fl);
 
+    /* §M54 — `woke` is a decision taken under wq->lock, but the ENQUEUE happens
+     * after it is dropped, and in that window the task can be woken for real by
+     * somebody else, get scheduled, and exit.  Enqueueing it then would put a
+     * DEAD task into a runqueue that nothing ever takes it out of again — and
+     * the reaper would free it under the scheduler's feet.  The re-check that
+     * closes this is inside task_enqueue, where it is under the destination
+     * queue's lock and cannot go stale between test and insert. */
     if (woke) task_enqueue(t);
 }
 
@@ -1356,6 +1647,47 @@ int task_reap(int pid) {
     int n = smp_ncpus();
     for (int i = 0; i < n; i++)
         if (percpu_at(i) && percpu_at(i)->current == t) return -1;
+
+    /* §M54 — and NOT current is not the same as NOT RUNNING.  The scheduler
+     * publishes the incoming task as `current` before it swaps stacks, so a
+     * task that has just been switched away from is current nowhere while the
+     * CPU is still executing on its kernel stack.  Freeing it there hands that
+     * stack to the next allocation while a live CPU is still writing to it —
+     * the machine then returns into whatever overwrote it (the observed
+     * signature was a jump to address 0x3, from a kernel with no clue why).
+     * on_cpu is cleared by the task that takes the CPU over, i.e. strictly
+     * after the swap.  Caller retries, exactly as for the `current` test. */
+    if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) return -1;
+
+    /* §M54 — THE LAST LINE OF DEFENCE: never free a task that is still linked
+     * in a runqueue.
+     *
+     * This is the one place a task struct is freed, so it is the one place
+     * that can make "freed while queued" STRUCTURALLY impossible instead of
+     * merely unlikely.  The exit path and task_enqueue were both fixed to not
+     * leave a corpse behind, but those are two of many wake paths, and the
+     * failure mode they produce is the worst kind the kernel has: the queue
+     * keeps the pointer, kfree hands the memory to somebody else, and the
+     * NEXT schedule() on an unrelated CPU dereferences whatever that somebody
+     * wrote — a fault in pick_next_local_locked, in the idle task, with no
+     * trace of who caused it.  That fault is what took the box down after a
+     * crashed NetSurf was reaped.
+     *
+     * Sweeping every CPU costs one lock per CPU, once per task death, on a
+     * path that already walks the whole task ring — nothing measurable.  If
+     * the sweep ever actually finds something it SAYS SO, loudly: that means
+     * a wake path is still racing and the cause fix above is incomplete, and
+     * a silent repair would hide exactly the evidence needed to finish it. */
+    if (rq_purge_all(t) > 0) {
+        /* Reported, not silently repaired.  The exit path already swept every
+         * queue while DEAD, so reaching here means an ordering assumption in
+         * this file is wrong — and a silent repair would delete exactly the
+         * evidence needed to find out which one. */
+        klog(KLOG_ERR, "task",
+             "reap: pid %d '%s' was STILL QUEUED — removed (an ordering "
+             "assumption in the exit path is wrong; see M54)", t->pid, t->name);
+    }
+    t->cpu_home = -1;                        /* on no queue, and stays that way */
 
     /* Unlink from the master ring (circular SLL — walk for the prev). */
     uint32_t fl = spin_lock_irqsave(&master_lock);
@@ -1597,6 +1929,13 @@ void task_set_out_console(struct task* t, void* console) {
  * one schedule() was looking at — i.e. THIS CPU's rq.  Safe to call
  * because the new task is running on the CPU that did schedule(). */
 void task_finish_first_switch(void) {
+    /* §M54 — a brand-new task is the ONE incoming task that never reaches the
+     * code after context_switch in schedule_locked: it starts on the trampoline
+     * instead.  So it has to do the same release here, or the task this CPU
+     * just switched away from keeps `on_cpu` set forever and can never be
+     * reaped.  Same reasoning, same place in the sequence — the first thing the
+     * new task does, before it enables interrupts. */
+    sched_release_leaving();
     spin_unlock(&this_cpu()->rq_lock);
 }
 
@@ -1682,16 +2021,26 @@ void task_exit_code(int code) {
         }
     }
 
-    /* Remove from this CPU's rq so the next pick doesn't keep
-     * tripping over a DEAD entry.  (M18.6.1 — pre-refactor, DEAD
-     * tasks were left in the ring and skipped by the state check;
-     * with per-CPU rqs we have a clean remove path.)  Then schedule
-     * away.  The DEAD task is not on any rq and not RUNNABLE — won't
-     * be picked again. */
+    /* Remove from the rq so the next pick doesn't keep tripping over a DEAD
+     * entry.  (M18.6.1 — pre-refactor, DEAD tasks were left in the ring and
+     * skipped by the state check; with per-CPU rqs we have a clean remove
+     * path.)  Then schedule away.  The DEAD task is not on any rq and not
+     * RUNNABLE — won't be picked again.
+     *
+     * §M54 — this used to remove only from THIS CPU's queue, and only when
+     * cpu_home happened to agree.  A task re-homed by a concurrent waker
+     * therefore exited while still linked in another CPU's queue, and the
+     * queue kept the pointer right through the kfree in task_reap.  Detach
+     * from wherever we actually are, BEFORE taking the local rq lock (the
+     * helper takes the owning queue's lock itself, and locking two rqs at
+     * once is exactly the ordering hazard worth not having).
+     *
+     * A single-queue detach is not enough here, though: we are already DEAD,
+     * which is precisely the state in which a sweep of EVERY queue becomes
+     * airtight (see rq_purge_all).  The cost is one uncontended lock per CPU,
+     * once, on a path that is already the slowest thing a task ever does. */
+    rq_purge_all(self);
     uint32_t rfl = spin_lock_irqsave(&me->rq_lock);
-    if (self->cpu_home == this_cpu_id()) {
-        rq_remove_locked(me, self);
-    }
     schedule_locked(me);
     spin_unlock_irqrestore(&me->rq_lock, rfl);
 
@@ -1762,13 +2111,31 @@ void waitq_block(struct waitq* wq) {
     self->last_yield_ms   = timer_ticks_ms();   /* §M46 — blocking = responsive */
     self->cpu_ms_at_yield = self->cpu_ms;
 
-    /* Detach from this CPU's runqueue so schedule() won't pick us. */
-    struct percpu* me = this_cpu();
-    spin_lock(&me->rq_lock);
-    if (self->cpu_home == this_cpu_id()) {
-        rq_remove_locked(me, self);
+    /* Detach from whichever runqueue holds us so schedule() won't pick us.
+     * §M54 — "whichever", not "this CPU's": see rq_detach_anywhere. */
+    rq_detach_anywhere(self);
+
+    /* §M54 — same two-step hazard as task_msleep: a waker that ran between
+     * "state = SLEEPING" and the dequeue above already popped us off this
+     * waitq and re-queued us, and our dequeue then undid its work, leaving us
+     * RUNNABLE and on no runqueue — awake and unschedulable.  If that
+     * happened, do not commit to sleeping: re-queue and return.  Returning
+     * without having slept is always safe here because waitq's contract makes
+     * every caller re-test its condition in a loop (see waitq.h). */
+    if (self->state != TASK_SLEEPING) {
+        /* Unlink ourselves first.  A waker normally pops us before flipping the
+         * state, but "normally" is not a guarantee, and returning while still
+         * linked would let the caller's retry register us a SECOND time on the
+         * same singly-linked queue.  We hold wq->lock, so this is safe. */
+        struct task** pp = &wq->head;
+        while (*pp) {
+            if (*pp == self) { *pp = self->wq_next; self->wq_next = NULL; break; }
+            pp = &(*pp)->wq_next;
+        }
+        self->wq = NULL;
+        task_enqueue(self);
+        return;                                  /* caller keeps wq->lock */
     }
-    spin_unlock(&me->rq_lock);
 
     /* Commit to sleeping: release the condition lock (a waker may run
      * now) and switch away.  We are SLEEPING + off every rq, so no CPU

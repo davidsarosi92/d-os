@@ -66,6 +66,32 @@ static void dosgui_input_cb(struct gui_window* w, const struct gui_input* in, vo
     spin_unlock(&d->lock);
 }
 
+/* §M54 — the compositor has disposed this window (by ANY route: the client's
+ * own DOSGUI_DESTROY, the title-bar X, or the client dying without releasing
+ * anything).  Free the handle and drop the pointer.
+ *
+ * Before this existed, a handle was released only by dosgui_destroy — a call
+ * that a CRASHED client never makes.  So every browser crash burned one of the
+ * four handles permanently and left `win` pointing at a window struct the
+ * compositor had already recycled for somebody else.  After four crashes
+ * NetSurf simply could not open a window any more, and the reason was invisible
+ * from the outside.
+ *
+ * Runs on the compositor task while the client (if any) is already gone, so the
+ * ring's lock is not needed for the fields written here — but taking it costs
+ * nothing and keeps the rule "every mutation of a slot is under its lock". */
+static void dosgui_disposed_cb(struct gui_window* w, void* ctx) {
+    (void)w;
+    struct dosgui_win* d = (struct dosgui_win*)ctx;
+    if (!d) return;
+    spin_lock(&d->lock);
+    d->win       = NULL;
+    d->used      = 0;
+    d->owner_pid = 0;
+    d->head = d->tail = 0;
+    spin_unlock(&d->lock);
+}
+
 int dosgui_create(int w, int h, const char* title) {
     if (w <= 0 || h <= 0) return -1;
     int handle = -1;
@@ -84,6 +110,10 @@ int dosgui_create(int w, int h, const char* title) {
     d->head = d->tail = 0;
     spin_lock_init(&d->lock);
     gui_window_set_input_hook(d->win, dosgui_input_cb, d);
+    /* §M54 — arm the disposal notification BEFORE the window can be disposed,
+     * so there is no window of time in which the compositor could tear it down
+     * without telling us. */
+    gui_window_set_dispose_cb(d->win, dosgui_disposed_cb, d);
 
     /* Detach the window from the app-host reap machinery.  gui_app_window_create
      * bound the window to THIS task (the ring-3 client that issued DOSGUI_CREATE)
@@ -120,6 +150,11 @@ int dosgui_present(int handle, const uint32_t* px, int w, int h, int stride) {
     uintptr_t bytes = ((uintptr_t)(h - 1) * (uintptr_t)stride + (uintptr_t)w)
                       * sizeof(uint32_t);
     if (!vmm_user_access_ok((uintptr_t)px, bytes, 0)) return -1;
+    /* §M54 — the compositor can dispose the window under a live client (the X
+     * button's force path), which clears d->win.  Present is the one call that
+     * dereferences it, so it re-checks rather than trusting the handle lookup
+     * it made a few instructions ago. */
+    if (!d->win) return -1;
     gui_window_blit(d->win, 0, 0, px, w, h, stride);
     return 0;
 }
@@ -156,7 +191,9 @@ void dosgui_destroy(int handle) {
      * dos_finalise just before it exits).  Release it to the compositor for
      * disposal — client_release marks want_close + host_released so apply_pending
      * tears it down WITHOUT touching the (init-owned) client task struct. */
+    /* Only ASK for disposal here.  The slot is freed by dosgui_disposed_cb when
+     * the compositor actually tears the window down — one release path for all
+     * routes, instead of this one clearing the slot early and the crash route
+     * never clearing it at all. */
     if (d->win) gui_window_client_release(d->win);
-    d->win = NULL;
-    d->used = 0;
 }

@@ -31,6 +31,7 @@
 #include "config.h"
 #include "uaccess.h"   /* §1.1 — fault-fixup table for user copies */
 #include "vmm.h"       /* M34 — vmm_cow_fault on a write to a fork-shared page */
+#include "percpu.h"    /* §M54 — name the CPU in the ring-0 fault dump */
 #include <stdint.h>
 
 /* --------------------------------------------------------------------------
@@ -359,17 +360,39 @@ void isr_handler(struct int_frame* f) {
                          (uintptr_t)f->rip, 0, sig, exception_name[f->int_no]);
             task_exit_code(128 + sig);   /* noreturn */
         }
-        kprintf("\n!! EXCEPTION %u (%s) at cs:rip=%lx:%p err=%lx\n",
-                (unsigned)f->int_no, exception_name[f->int_no],
-                (unsigned long)f->cs, (void*)(uintptr_t)f->rip,
-                (unsigned long)f->err_code);
+        /* §M54 — a kernel #PF's fault ADDRESS is the most informative number
+         * the machine has about it, and this record used to hard-code 0 for
+         * it.  Recovering it afterwards is impossible: the box halts, and the
+         * only thing that survives to the next boot is this record.  Read CR2
+         * for a page fault; there is no such address for the other traps. */
+        uintptr_t fault_addr = 0;
+        if (f->int_no == 14) {
+            uint64_t cr2;
+            __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+            fault_addr = (uintptr_t)cr2;
+        }
+        /* §M54 — say WHO faulted.  "EXCEPTION 6 at rip=3" names an address and
+         * nothing else; the task it happened in is what turns a fault into a
+         * lead, and it is one field away.  Bracketed so a simultaneous fault on
+         * another CPU cannot shred the line. */
+        crash_dump_begin();
+        {
+            struct task* ft = task_current();
+            kprintf("\n!! EXCEPTION %u (%s) at cs:rip=%lx:%p err=%lx addr=%p "
+                    "task=%s pid %d cpu %d\n",
+                    (unsigned)f->int_no, exception_name[f->int_no],
+                    (unsigned long)f->cs, (void*)(uintptr_t)f->rip,
+                    (unsigned long)f->err_code, (void*)fault_addr,
+                    ft ? ft->name : "?", ft ? ft->pid : -1, this_cpu_id());
+        }
         /* §M47 — capture BEFORE the policy: halt and reboot both never return. */
         {
             struct task* ct = task_current();
             crash_report(CRASH_KERNEL_FAULT, ct ? ct->pid : -1,
-                         ct ? ct->name : "kernel", (uintptr_t)f->rip, 0,
+                         ct ? ct->name : "kernel", (uintptr_t)f->rip, fault_addr,
                          fault_signal((int)f->int_no), exception_name[f->int_no]);
         }
+        crash_dump_end();
         ring0_fault_policy(fault_signal((int)f->int_no));
     }
 

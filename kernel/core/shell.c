@@ -129,6 +129,7 @@ static void cmd_help(void) {
                   "  config, getconf <key>, setconf <key> <value>, saveconf\n"
                   "  ringtest, ps, spawn, yield, loop, kill <pid>, fkill <pid>\n"
                   "  wedge (runaway ring-3 task), faulttest (bad user pointers)\n"
+                  "  killstorm [rounds] [tasks] (kill blocked tasks under SMP)\n"
                   "  fputest (per-task FP/SIMD register file)\n"
                   "  archtest (ELF arch gate), crash (what has gone wrong)\n"
                   "  pane, pane split horizontal|vertical\n"
@@ -270,6 +271,81 @@ static void cmd_spawn(void) {
     struct task* t = task_spawn("ticker", ticker_main);
     if (!t) console_write("spawn: failed (OOM?)\n");
     else    kprintf("spawned pid %d\n", t->pid);
+}
+
+/* -------------------------------------------------------------------- */
+/* §M54 — `killstorm [rounds] [tasks]`: kill BLOCKED tasks, hard and     */
+/* often, on every CPU at once.                                          */
+/*                                                                       */
+/* WHAT IT IS FOR.  Killing a task that is asleep is a three-party       */
+/* operation: the killer wakes it (state → RUNNABLE, enqueue), some CPU  */
+/* picks it up and it exits (DEAD, dequeue), and the reaper frees it.    */
+/* Those run concurrently on different CPUs, and if a wake lands between */
+/* the exit and the free, the freed task stays linked in a runqueue —    */
+/* after which the next schedule() on that CPU walks into freed memory   */
+/* and the machine dies in the scheduler, with nothing left to say why.  */
+/* That is the fault this test exists to make ordinary and repeatable:   */
+/* it took a crashed browser and a reboot to produce it by accident.     */
+/*                                                                       */
+/* Each victim parks in task_msleep (a real block since §M49), so the    */
+/* kill has to go through the wake path rather than being noticed by a   */
+/* task that was runnable all along.  A pass is silence: no fault, and   */
+/* no "STILL QUEUED" report from task_reap's sweep.                      */
+/* -------------------------------------------------------------------- */
+
+static volatile int g_ks_alive;
+
+static void killstorm_victim(void) {
+    while (!task_should_stop()) task_msleep(2);
+    __atomic_sub_fetch(&g_ks_alive, 1, __ATOMIC_RELAXED);
+}
+
+static void cmd_killstorm(const char* args) {
+    int rounds = 0, per = 0;
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) rounds = rounds * 10 + (*args - '0');
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) per = per * 10 + (*args - '0');
+    if (rounds <= 0) rounds = 20;
+    if (per    <= 0) per    = 8;
+    if (per > 32) per = 32;
+
+    kprintf("killstorm: %d rounds x %d blocked tasks (cpus=%d)\n",
+            rounds, per, smp_ncpus());
+    int spawned = 0, killed = 0;
+    for (int r = 0; r < rounds; r++) {
+        int pids[32];
+        int n = 0;
+        for (int i = 0; i < per; i++) {
+            struct task* t = task_spawn("ks-victim", killstorm_victim);
+            if (!t) break;
+            pids[n++] = t->pid;
+            __atomic_add_fetch(&g_ks_alive, 1, __ATOMIC_RELAXED);
+        }
+        spawned += n;
+        /* Let them actually reach the blocked state — killing a task that has
+         * not parked yet exercises a different (easier) path. */
+        task_msleep(6);
+        for (int i = 0; i < n; i++) { task_kill(pids[i]); killed++; }
+        /* Give init a moment to reap; the sweep in task_reap is where a corpse
+         * left in a runqueue would be caught and reported. */
+        task_msleep(10);
+        /* A progress marker per round.  Without it, a storm that stops halfway
+         * is indistinguishable from one that never started — and "it stopped
+         * somewhere" is the single most useful fact about a hang. */
+        kprintf("killstorm: round %d ok (%d alive)\n", r + 1,
+                __atomic_load_n(&g_ks_alive, __ATOMIC_RELAXED));
+    }
+    /* Wait for stragglers rather than leaving them behind for the next test. */
+    for (int i = 0; i < 200 && __atomic_load_n(&g_ks_alive, __ATOMIC_RELAXED); i++)
+        task_msleep(10);
+    int left = __atomic_load_n(&g_ks_alive, __ATOMIC_RELAXED);
+    kprintf("killstorm: done — %d spawned, %d killed, %d still alive\n",
+            spawned, killed, left);
+    /* A victim that never finished is a task the scheduler lost: dump the
+     * table so the next question ("in what state, on which CPU?") is already
+     * answered by the run that found it. */
+    if (left) task_list();
 }
 
 /* -------------------------------------------------------------------- */
@@ -3240,6 +3316,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "fkill "))   { cmd_fkill(line + 6); return; }
     if (streq(line, "wedge"))          { cmd_wedge();     return; }
     if (streq(line, "spawn"))          { cmd_spawn();    return; }
+    if (streq(line, "killstorm"))      { cmd_killstorm("");        return; }
+    if (starts_with(line, "killstorm ")) { cmd_killstorm(line + 10); return; }
     if (streq(line, "yield"))          { task_yield();   return; }
     if (streq(line, "loop"))           { cmd_loop("");   return; }
     if (starts_with(line, "loop "))    { cmd_loop(line + 5); return; }

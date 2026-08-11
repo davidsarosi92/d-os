@@ -24,6 +24,7 @@
 #include "task.h"
 #include "crash.h"      /* §M47 — record every fault */
 #include "vmm.h"
+#include "percpu.h"    /* §M54 — name the CPU in the ring-0 fault dump */
 #include "lapic.h"
 #include "ioapic.h"
 #include "pci.h"
@@ -460,9 +461,18 @@ void isr_handler(struct int_frame* f) {
 
         /* Ring-0 (kernel) exception.  Dump, then apply the configured policy
          * (halt / reboot / kill — see ring0_fault_policy). */
-        kprintf("\n!! EXCEPTION %d (%s) at cs:eip=%x:%p err=%x cr2=%p\n",
-                f->int_no, exception_name[f->int_no],
-                f->cs, (void*)f->eip, f->err_code, (void*)_cr2);
+        /* §M54 — one CPU at a time, and say WHICH TASK: two CPUs faulting at
+         * once used to interleave their dumps character by character, and the
+         * address alone never says whose failure it was. */
+        crash_dump_begin();
+        {
+            struct task* ft = task_current();
+            kprintf("\n!! EXCEPTION %d (%s) at cs:eip=%x:%p err=%x cr2=%p "
+                    "task=%s pid %d cpu %d\n",
+                    f->int_no, exception_name[f->int_no],
+                    f->cs, (void*)f->eip, f->err_code, (void*)_cr2,
+                    ft ? ft->name : "?", ft ? ft->pid : -1, this_cpu_id());
+        }
         /* §M47 — capture BEFORE applying the policy: halt and reboot both mean
          * this function never returns, so a record written afterwards would
          * never exist.  On the reboot path the marker in NVRAM is what carries
@@ -475,6 +485,7 @@ void isr_handler(struct int_frame* f) {
                          (uintptr_t)f->eip, (uintptr_t)_cr2,
                          fault_signal((int)f->int_no), exception_name[f->int_no]);
         }
+        crash_dump_end();
         ring0_fault_policy(fault_signal((int)f->int_no));
     }
 

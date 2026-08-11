@@ -9,7 +9,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M53"                 /* latest shipped: §M53 nanosecond clock + deadline timers */
+#define DOS_MILESTONE  "M54"                 /* latest shipped: §M54 scheduler use-after-free + crash-path diagnostics */
 
 /* Short architecture tag for the on-screen label.  Deliberately the FAMILIAR
  * short form ("x32"/"x64") rather than the toolchain triple — the wallpaper

@@ -79,6 +79,12 @@ struct crash_record {
  * record would defeat the point, so the ring simply overwrites its oldest
  * entry.  `comm`/`what` may be NULL.
  * ------------------------------------------------------------------------- */
+/* §M54 — bracket a ring-0 fault DUMP so two CPUs faulting at once do not
+ * interleave their output character by character.  Bounded wait, never a real
+ * lock (this runs in fault context); see crash.c. */
+void crash_dump_begin(void);
+void crash_dump_end(void);
+
 void crash_report(int kind, int pid, const char* comm,
                   uintptr_t pc, uintptr_t addr, int code, const char* what);
 
