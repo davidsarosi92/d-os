@@ -29,6 +29,14 @@ struct epoll;                   /* §M56 — a readiness set behind a descriptor
 struct ofile {
     enum fd_kind kind;
     int          refcount;      /* # of descriptors referencing this object */
+    /* §M57 — O_NONBLOCK, and it lives HERE rather than in each object because
+     * it is a property of the open file DESCRIPTION, not of the thing behind
+     * it: two descriptors dup'd from one another share it, and two independent
+     * opens of the same file do not.  It used to exist only inside
+     * `struct netsock`, so O_NONBLOCK on a pipe silently did nothing — which
+     * is the failure mode an event loop is least able to survive, because
+     * every fd it drains is one it must not block on. */
+    int          nonblock;
     struct file* file;          /* FD_VFS  */
     struct shm*  shm;           /* FD_SHM  */
     struct usock* sock;         /* FD_SOCK */
@@ -84,6 +92,7 @@ long usock_recv (struct usock* s, void* buf, size_t n, int block,
 void usock_close(struct usock* s);
 int  usock_can_read (struct usock* s);   /* bytes buffered? (poll POLLIN)  */
 int  usock_can_write(struct usock* s);   /* peer open + space? (POLLOUT)   */
+int  usock_peer_open (struct usock* s);  /* other end still there? (§M57)  */
 
 /* Tier A.3 — poll readiness signal.  usock_send / usock_close call this
  * after changing an fd's readiness so a task blocked in a (timeout < 0)
@@ -98,12 +107,17 @@ void fd_readiness_signal(void);
  * time a new fd kind appeared — which is precisely what happened to FD_NETSOCK,
  * reported as permanently ready by poll's fall-through for two milestones.
  *
- * Both outputs are 0/1.  An unknown or closed fd reports neither. */
-void fd_readiness(int fd, int* rd_out, int* wr_out);
+ * Returns a bitmask of POLL* bits (syscall.h), whose values are deliberately
+ * Linux's so that mapping to epoll's EPOLL* is the identity rather than a
+ * translation table.  §M57 widened this from two 0/1 outputs to a mask because
+ * readiness is not only "can I read": a hung-up peer and an error are
+ * conditions a loop must be able to SEE, and POSIX reports them whether or not
+ * they were requested. */
+uint32_t fd_readiness(int fd);
 
-/* Readiness of an AF_INET socket (usyscall.c owns struct netsock). */
-int netsock_can_read(struct netsock* ns);
-int netsock_can_write(struct netsock* ns);
+/* Readiness of an AF_INET socket (usyscall.c owns struct netsock), as a
+ * POLL* mask. */
+uint32_t netsock_readiness(struct netsock* ns);
 
 /* The one blocking loop behind both poll(2) and epoll_wait(2).
  *

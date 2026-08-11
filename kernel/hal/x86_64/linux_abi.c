@@ -676,7 +676,12 @@ static void linux_syscall_body(struct int_frame* f) {
             return;
 
         case LNX_set_robust_list:
-        case LNX_rt_sigprocmask:
+        /* LNX_rt_sigprocmask is NO LONGER here (§M56): it is a real operation
+         * in the ABI engine now.  Leaving the case would have shadowed it
+         * forever — the engine is consulted first but DECLINES numbers absent
+         * from the guest's map, and this stub then answered "success" without
+         * doing anything.  That is exactly how the real handler sat unreached
+         * on both x86 guests while working on arm64, whose map did name it. */
         case LNX_rt_sigaction:
         case LNX_membarrier:               /* UP + no reordering we care about */
         case LNX_fcntl:

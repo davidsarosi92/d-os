@@ -111,9 +111,12 @@ void net_rx(struct net_device* dev, const uint8_t* frame, uint32_t len);
  * than blocking forever on a promise. */
 void net_rx_irq(struct net_device* dev);
 
-/* Non-zero when a recv on the (single) connected stream socket would not
- * block — unread bytes or a peer FIN.  Backs poll/epoll readiness (§M56). */
-int net_tcp_can_read(void);
+/* Report both halves of stream readiness in one locked read: whether unread
+ * bytes are waiting, and whether the peer has sent its FIN.  Sampled together
+ * because a caller reading them separately could see "no data" and "no FIN"
+ * from two different instants and conclude the connection was merely quiet
+ * (§M56/§M57).  Either pointer may be NULL. */
+void net_tcp_state(int* readable, int* peer_fin);
 
 /* ----------------------- Waiting for the network (§M55) ------------------- */
 

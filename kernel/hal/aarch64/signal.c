@@ -64,6 +64,16 @@ void signal_deliver(struct trapframe* f) {
     for (int sig = 1; sig < NSIG; sig++) {
         uint32_t bit = 1u << sig;
         if (!(t->sig_pending & bit)) continue;
+        /* §M57 — a BLOCKED signal stays pending; it is not consumed and not
+         * delivered.  Skipping the `sig_pending &= ~bit` below is the whole
+         * mechanism: sigprocmask must DEFER a signal, never lose one, and
+         * clearing the bit here would turn "block SIGPIPE while I write" into
+         * "throw away the SIGPIPE that arrived while I wrote".
+         *
+         * SIGKILL and SIGSTOP cannot be blocked — a process must not be able
+         * to make itself unkillable, which on this kernel is not a policy
+         * nicety but the thing §M46 exists to guarantee. */
+        if ((t->sig_blocked & bit) && sig != SIGKILL) continue;
         t->sig_pending &= ~bit;
 
         uintptr_t h = t->sig_handler[sig];

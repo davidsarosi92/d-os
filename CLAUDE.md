@@ -57,10 +57,58 @@ later fails for no visible reason.*  Proven with an UNMODIFIED musl binary on
 all three arches (`epollmusltest`): sizes 12/12/16, cookie `0x1122334455667788`
 intact everywhere — bits in BOTH halves on purpose, because a four-byte offset
 error would look plausible with a small integer and invisible with zero.  Shell:
-`epolltest`, `epollmusltest`.  **OPEN:** per-fd wakeups instead of a scan;
-generic `O_NONBLOCK` on VFS/pipe fds (only sockets carry it); `epoll_pwait`'s
-signal mask is ignored (the WAIT is real, the mask is not — this kernel has no
-sigprocmask-during-wait, and honouring it would be a lie with more steps).
+`epolltest`, `epollmusltest`.
+
+**§M56.1 — FINISHED THE OPEN ITEMS (same day).**  Four of the five were things
+an event loop cannot work without.  **Hangup is visible WITHOUT reading**:
+readiness is a POLL* mask now, `POLLERR`/`POLLHUP`/`POLLNVAL` reported
+UNREQUESTED (POSIX — the only other way to find EOF is the read the loop exists
+to avoid), and **`POLLRDHUP` kept SEPARATE from `POLLHUP`**: a closed writer
+with data still buffered reports `RDHUP|IN` (`2001`), only once drained
+`RDHUP|HUP` (`2010`) — collapsing them would throw away the tail of every
+conversation whose writer closed promptly, which is most of them.
+**`O_NONBLOCK` is GENERIC**: it lived inside `struct netsock`, so setting it on
+a pipe did nothing AND said nothing (the worst failure an event loop can meet);
+it now lives on `struct ofile` where POSIX puts it — a property of the open file
+DESCRIPTION, shared by dup, not by a second open — and an empty pipe with a live
+writer returns **EAGAIN, not 0** (zero means EOF, and a drain loop told EOF by a
+live pipe stops for good).  **An epoll set is itself pollable** so loops nest —
+which immediately created a way to hang the kernel (two sets watching each other
+recurse until the stack is gone, with a lock held on every frame), closed with a
+bounded `task->epoll_depth`; refusing to descend reports "not ready", so a
+too-deep chain never fires instead of killing the box.  **`sigprocmask` IS REAL**
+(it was `return 0` — accept and forget): a blocked signal stays PENDING and is
+delivered when unblocked (*dropping it would make sigprocmask a way to LOSE
+signals rather than DEFER them*), SIGKILL stays unblockable (§M46's guarantee,
+not politeness), `rt_sigpending` added because without it "defer" and "discard"
+are indistinguishable from inside the process — and `epoll_pwait` now swaps the
+mask around the wait, which is the ENTIRE reason that call exists (unblock-then-
+wait as two steps loses a signal landing between them).  **TWO BUGS THE NEW
+TESTS FOUND:** (1) **`ABI_SIGPROCMASK` had a working handler registered in the
+arm64 map ONLY** — §M50's engine DECLINES numbers absent from a guest's map and
+lets the old per-arch `switch` answer, where a stub returned "success, did
+nothing".  So it worked on arm64 and was unreachable on both x86 guests, with no
+error anywhere: *a fallback is only a fallback while nothing better exists; when
+something better arrives it must be REMOVED IN THE SAME CHANGE* (§M52's lesson,
+arriving through the mechanism §M50 built).  (2) **A Linux `sigset_t` stores
+signal N at bit N-1; this kernel stores it at bit N** — both self-consistent,
+and copying the word across without shifting fails SILENTLY: SIGALRM (14) lands
+on bit 14, which is SIGCHLD's slot here, so the mask looks set and never
+matches.  One number in one test (`pending=0`) was the whole symptom;
+`abi_sigset_to_kernel`/`to_guest` are the whole fix.  (The first run also
+"found" a POLLRDHUP bug that was the TEST's: it closed a pipe fd without
+`EPOLL_CTL_DEL`, the next pipe reused the number, `ADD` failed `-EEXIST`, and
+the stale entry's narrower mask hid the bit.)  **THE ONE ITEM NOT BUILT, WITH
+THE NUMBER BEHIND IT:** `epoll_wait` still scans — `epolltest` now MEASURES it
+at **~16 µs for 26 registered fds** (≈620 ns each, emulated), so
+`EPOLL_MAX_ITEMS = 64` bounds the worst case at ~40 µs BY CONSTRUCTION and a
+realistic loop (<10 fds) pays ~6 µs.  Per-fd wakeups would buy none of that back
+at this scale and would cost a new lifetime relationship between epoll items and
+open file descriptions — §M54's defect class.  *A measured decision with a
+measured trigger, not a deferral.*  **STILL OPEN:** `EPOLLERR` has no producer
+(no fd kind carries an error state); signal masks are 32 bits and a guest
+`sigset_t`'s high words are left UNTOUCHED rather than zeroed (a libc keeping
+state there would rather be ignored than corrupted).
 
 ✅ **§M55 — WAITING FOR THE NETWORK WITHOUT SPENDING A CPU ON IT (2026-08-11,
 DOCS §4.56, i386 + x86_64 at -smp 4).**  §M24 drove RX by *polling from the

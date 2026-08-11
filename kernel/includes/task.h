@@ -335,6 +335,17 @@ struct task {
      * handler returns.  Delivered on the return-to-user path (hal/x86/signal.c).
      * Zero-initialised by kcalloc → every task starts with default dispositions. */
     uint32_t  sig_pending;
+    /* §M57 — signals the task has asked NOT to receive (sigprocmask).  A
+     * blocked signal stays PENDING and is delivered when it is unblocked;
+     * dropping it instead would make sigprocmask a way to lose signals rather
+     * than to defer them, which is the opposite of what it is for. */
+    uint32_t  sig_blocked;
+    /* §M57 — recursion depth while evaluating epoll readiness.  An epoll set
+     * is itself pollable, so set A may watch set B; nothing stops B watching A,
+     * and the readiness walk would then recurse until the kernel stack ran out
+     * — with a lock held on every frame.  A depth counter is cheaper and more
+     * honest than trying to detect the cycle. */
+    int       epoll_depth;
     uintptr_t sig_handler[32];          /* NSIG (syscall.h) */
     uintptr_t sig_restorer;
     /* Per-task FPU / SIMD register file (2026-08-01).  The integer context

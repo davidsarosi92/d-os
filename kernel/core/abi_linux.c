@@ -70,7 +70,9 @@ static const struct abi_nument linux_i386_ents[] = {
     { 329, ABI_EPOLL_CREATE },      /* epoll_create1 */
     { 255, ABI_EPOLL_CTL },
     { 256, ABI_EPOLL_WAIT },
-    { 319, ABI_EPOLL_WAIT },        /* epoll_pwait — mask ignored, see handler */
+    { 319, ABI_EPOLL_WAIT },        /* epoll_pwait */
+    { 176, ABI_SIGPENDING },        /* rt_sigpending  */
+    { 175, ABI_SIGPROCMASK },       /* rt_sigprocmask */
     { 326, ABI_TIMERFD_GETTIME },
     { 104, ABI_SETITIMER       },
 };
@@ -99,6 +101,8 @@ static const struct abi_nument linux_amd64_ents[] = {
     { 233, ABI_EPOLL_CTL },
     { 232, ABI_EPOLL_WAIT },
     { 281, ABI_EPOLL_WAIT },        /* epoll_pwait */
+    { 127, ABI_SIGPENDING },        /* rt_sigpending  */
+    {  14, ABI_SIGPROCMASK },       /* rt_sigprocmask */
     { 287, ABI_TIMERFD_GETTIME },
     {  38, ABI_SETITIMER       },
 };
@@ -131,6 +135,7 @@ static const struct abi_nument linux_arm64_ents[] = {
                                      * either: glibc/musl call epoll_pwait. */
     {  21, ABI_EPOLL_CTL },
     {  22, ABI_EPOLL_WAIT },        /* epoll_pwait */
+    { 136, ABI_SIGPENDING },        /* rt_sigpending */
     {  87, ABI_TIMERFD_GETTIME },
     { 103, ABI_SETITIMER       },
 };

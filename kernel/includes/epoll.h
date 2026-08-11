@@ -50,6 +50,7 @@ struct epoll;
 #define EPOLLOUT     0x004
 #define EPOLLERR     0x008
 #define EPOLLHUP     0x010
+#define EPOLLRDHUP   0x2000             /* peer closed its writing half */
 #define EPOLLET      0x80000000u        /* rejected — see the header */
 #define EPOLLONESHOT 0x40000000u
 
@@ -79,5 +80,10 @@ int epoll_wait_obj(struct epoll* ep, struct epoll_ev* out, int maxevents,
 
 /* How many descriptors are registered — backs `epolltest` and diagnostics. */
 int epoll_count(struct epoll* ep);
+
+/* Non-zero if a wait would return immediately.  This is what makes an epoll
+ * set itself pollable, so one loop can be nested inside another — and it costs
+ * nothing extra, because the set already has to answer this question. */
+int epoll_has_events(struct epoll* ep);
 
 #endif

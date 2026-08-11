@@ -8,11 +8,17 @@ It boots on **i386, x86_64 and aarch64** from one source tree: its own
 GDT / IDT / paging (or EL1 / MMU on ARM), a preemptive SMP scheduler
 with per-CPU runqueues and a load balancer, ramfs + devfs + procfs +
 exFAT on virtio-blk, USB via xHCI, a compositing GUI with windows and
-a taskbar, a TCP/IP stack, audio, and ring-3 userland running
-**unmodified static and dynamic musl binaries** through a Linux
+a taskbar, an interrupt-driven TCP/IP stack, audio, and ring-3 userland
+running **unmodified static and dynamic musl binaries** through a Linux
 syscall-ABI personality — coreutils, `sh`, TLS, a Wayland server with
 upstream libwayland clients, Mesa/EGL on softpipe, and the NetSurf
 browser fetching real pages over HTTPS.
+
+Waiting is a first-class thing here: a nanosecond monotonic clock and
+deadline timers, `timerfd` and `setitimer`, `poll` and `epoll` with real
+timeouts, and a network stack whose waiters block rather than spin — so
+eight tasks waiting on the network cost 0% of four CPUs instead of eight
+busy cores.
 
 It is a hobby kernel, not a product: expect sharp edges, and read the
 docs below before trusting anything to it.
@@ -40,11 +46,19 @@ gui                     # start the desktop
 loop 8 ; sched          # eight CPU hogs, then see how they spread
 nice <pid> -10          # scheduling priority
 wqtest                  # deferred-work pool, across cores
+killstorm               # kill blocked tasks, hard and often, on every CPU
 ping 10.0.2.2 ; wget    # networking
+lsnic ; netstorm 8      # NIC state; eight tasks waiting at once, for free
+ktime ; timerfdtest     # the clock, and timers behind descriptors
+epolltest               # readiness sets + real poll timeouts
 pkgrun sh -c "ls /store"  # musl shell + coreutils from the package store
 netsurf                 # the browser
 shutdown                # ACPI soft-off
 ```
+
+Most of the self-tests print a `PASS`/`ok` line and a measurement, so a
+headless boot can be checked by grepping the serial log — and so a claim
+about the kernel can be argued with a number.
 
 ## Where to read more
 

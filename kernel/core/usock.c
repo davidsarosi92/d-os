@@ -124,6 +124,12 @@ long usock_recv(struct usock* s, void* buf, size_t n, int block,
 /* Readiness queries for poll(2). */
 int usock_can_read(struct usock* s)  { return s && s->count > 0; }
 int usock_can_write(struct usock* s) { return s && s->peer && s->peer->count < USOCK_BUF; }
+/* §M57 — is the other end still there?  `peer` is cleared by usock_close, so
+ * this is the whole hangup story for a pipe or socketpair.  Kept separate from
+ * can_read so a reader can drain what is already buffered before it acts on
+ * the close — collapsing the two would discard the tail of every conversation
+ * whose writer closed promptly, which is most of them. */
+int usock_peer_open(struct usock* s) { return s && s->peer != NULL; }
 
 /* Close one endpoint: disconnect the peer, drop any still-queued passed fds
  * (their travelling references), and free.  Called by ofile_unref(FD_SOCK)

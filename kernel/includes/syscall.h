@@ -124,6 +124,15 @@ struct kdirent { uint16_t reclen; uint8_t type; char name[]; };
 /* poll(2) events (Linux values). */
 #define POLLIN      0x001   /* readable                                        */
 #define POLLOUT     0x004   /* writable                                        */
+/* §M57 — the condition bits.  POSIX: these are reported in `revents` whether
+ * or not the caller asked for them, because a hangup or an error is not
+ * something a program can decline to hear about — and a loop that could not
+ * see EOF would have to attempt a read to discover it, which is exactly the
+ * blocking it used poll to avoid. */
+#define POLLERR     0x008   /* error condition (always reported)               */
+#define POLLHUP     0x010   /* peer hung up entirely (always reported)         */
+#define POLLNVAL    0x020   /* fd is not open (always reported)                */
+#define POLLRDHUP   0x2000  /* peer closed its WRITING half — Linux's value    */
 
 struct pollfd {
     int   fd;

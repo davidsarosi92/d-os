@@ -26,6 +26,8 @@
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
+#include <signal.h>
+#include <sys/time.h>
 
 int main(void) {
     printf("epollmusl: sizeof(struct epoll_event) = %d\n",
@@ -75,6 +77,44 @@ int main(void) {
     n = epoll_wait(ep, out, 4, 150);
     printf("epollmusl: idle wait -> n=%d (expect 0)\n", n);
     if (n != 0) ok = 0;
+
+    /* --- sigprocmask, which was a `return 0` stub until M57 ------------ */
+    /*
+     * The check has to be observable, so: block SIGALRM, arm a 60 ms timer,
+     * sleep past it, and confirm the signal is PENDING rather than delivered
+     * or lost.  A stub that accepted and forgot would fail here in the most
+     * informative way — the handler would have run.
+     */
+    sigset_t block, old_set;
+    sigemptyset(&block);
+    sigaddset(&block, SIGALRM);
+    if (sigprocmask(SIG_BLOCK, &block, &old_set) != 0) {
+        printf("epollmusl: sigprocmask failed\n");
+        ok = 0;
+    }
+
+    struct itimerval iv;
+    memset(&iv, 0, sizeof iv);
+    iv.it_value.tv_usec = 60000;                  /* 60 ms, microseconds */
+    setitimer(ITIMER_REAL, &iv, 0);
+
+    struct epoll_event idle[1];
+    epoll_wait(ep, idle, 1, 200);                 /* outlive the timer */
+
+    sigset_t pend;
+    sigemptyset(&pend);
+    sigpending(&pend);
+    int is_pending = sigismember(&pend, SIGALRM);
+    printf("epollmusl: SIGALRM blocked -> pending=%d (want 1)\n", is_pending);
+    if (!is_pending) {
+        printf("epollmusl: FAIL (a blocked signal was lost, not deferred)\n");
+        ok = 0;
+    }
+    /* Reaching this line at all is half the result: an unblocked SIGALRM with
+     * no handler terminates the process, so a stub sigprocmask would have
+     * killed us before the printf. */
+
+    sigprocmask(SIG_SETMASK, &old_set, 0);
 
     close(tfd);
     close(ep);

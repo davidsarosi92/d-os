@@ -242,7 +242,74 @@ static long h_mmap(struct abi_ctx* c) {
 
 /* set_tid_address returns the caller's tid.  d-os has no separate tid space,
  * so the pid is the honest answer — the same one gettid gives. */
-static long h_sigprocmask(struct abi_ctx* c) { (void)c; return 0; }
+/* §M57 — rt_sigprocmask, for real.
+ *
+ * This was `return 0` — accept and forget.  That is not a harmless stub: a
+ * program that blocks SIGPIPE around a write to a closed pipe, or blocks
+ * SIGALRM while it touches the state its handler reads, was getting neither,
+ * silently.  The kernel had the pending mask all along; what it lacked was
+ * the blocked one.
+ *
+ * The mask is a guest `sigset_t`, which is 128 bytes on Linux — but only the
+ * low 32 bits can name a signal this kernel has, so we read and write the
+ * first word and leave the rest alone.  Writing zeroes over the whole thing
+ * would be worse than ignoring it: a libc that keeps state in the high words
+ * would have it silently cleared. */
+#define ABI_SIG_BLOCK   0
+#define ABI_SIG_UNBLOCK 1
+#define ABI_SIG_SETMASK 2
+
+/* THE OFF-BY-ONE THAT IS NOT AN OFF-BY-ONE.
+ *
+ * A Linux `sigset_t` stores signal N at bit N-1: SIGHUP (1) is bit 0.  This
+ * kernel's `sig_pending` / `sig_blocked` store signal N at bit N, because they
+ * are built with `1u << sig` and nothing ever needed to disagree.  Both
+ * conventions are self-consistent; copying the word across without shifting is
+ * what is wrong, and it fails SILENTLY — SIGALRM (14) blocked by the guest
+ * arrives as bit 14 in the kernel, which is SIGCHLD's slot here, so the mask
+ * appears to be set and simply never matches.
+ *
+ * It cost a test that reported `pending=0` on all three arches with no other
+ * symptom.  These two functions are the entire fix, and they exist as named
+ * functions rather than inline shifts so the next signal-shaped operation has
+ * something obvious to call. */
+static uint32_t abi_sigset_to_kernel(uint32_t guest) { return guest << 1; }
+static uint32_t abi_sigset_to_guest (uint32_t kern)  { return kern  >> 1; }
+
+static long h_sigprocmask(struct abi_ctx* c) {
+    struct task* t = task_current();
+    if (!t) return 0;
+    int how = (int)c->a[0];
+    unsigned long setp = c->a[1], oldp = c->a[2];
+
+    uint32_t old = t->sig_blocked;
+    if (oldp) {
+        if (!abi_user_w_ok(oldp, 4)) return -ABI_EFAULT;
+        *(uint32_t*)(uintptr_t)oldp = abi_sigset_to_guest(old);
+    }
+    if (!setp) return 0;                        /* query only */
+    if (!vmm_user_access_ok((uintptr_t)setp, 4, 0)) return -ABI_EFAULT;
+
+    uint32_t nw = abi_sigset_to_kernel(*(const uint32_t*)(uintptr_t)setp);
+    uint32_t nb;
+    switch (how) {
+    case ABI_SIG_BLOCK:   nb = old |  nw; break;
+    case ABI_SIG_UNBLOCK: nb = old & ~nw; break;
+    case ABI_SIG_SETMASK: nb = nw;        break;
+    default: return -ABI_EINVAL;
+    }
+    /* SIGKILL is never blockable — see the delivery path's note.  Masking it
+     * here rather than only at delivery means `sigprocmask(SIG_BLOCK, full)`
+     * followed by a query reports the truth. */
+    nb &= ~(1u << 9);                           /* SIGKILL */
+    t->sig_blocked = nb;
+
+    /* Unblocking may have made an already-pending signal deliverable, and the
+     * task is about to return to ring 3 — where the delivery check runs — so
+     * nothing else is needed here.  Stating it because the absence of a wake
+     * looks like an omission. */
+    return 0;
+}
 
 /* wait4(pid, status, options, rusage) — rusage is ignored (d-os collects no
  * per-process resource accounting yet); reporting it as unsupported would fail
@@ -327,9 +394,25 @@ static long h_epoll_wait(struct abi_ctx* c) {
     unsigned long outp = c->a[1];
     int maxevents = (int)c->a[2];
     int timeout   = (int)c->a[3];
-    /* epoll_pwait's signal mask (a[4]/a[5]) is ignored: this kernel has no
-     * sigprocmask-during-wait, so honouring it would be a lie with more steps.
-     * Programs use pwait for the mask AND for the wait; the wait is real. */
+    unsigned long maskp = c->a[4];
+
+    /* §M57 — epoll_pwait's mask, honoured.  The whole reason the call exists
+     * is that "unblock this signal" and "start waiting" must be ONE step: do
+     * them separately and a signal arriving in between is delivered while the
+     * program is not yet waiting, so the wait it then enters has nothing left
+     * to wake it.  Swapping the mask around the wait closes exactly that
+     * window — which is why it could not be done until the blocked mask was
+     * real (it was a `return 0` stub until this milestone). */
+    struct task* t = task_current();
+    uint32_t saved_mask = 0;
+    int mask_swapped = 0;
+    if (maskp && t) {
+        if (!vmm_user_access_ok((uintptr_t)maskp, 4, 0)) return -ABI_EFAULT;
+        saved_mask = t->sig_blocked;
+        t->sig_blocked = abi_sigset_to_kernel(*(const uint32_t*)(uintptr_t)maskp)
+                       & ~(1u << 9);            /* SIGKILL stays unblockable */
+        mask_swapped = 1;
+    }
 
     if (maxevents <= 0 || maxevents > 256) return -ABI_EINVAL;
     unsigned long sz = abi_epoll_ev_bytes(c);
@@ -337,8 +420,9 @@ static long h_epoll_wait(struct abi_ctx* c) {
         return -ABI_EFAULT;
 
     uint64_t* k = (uint64_t*)kmalloc(sizeof(uint64_t) * 2 * (size_t)maxevents);
-    if (!k) return -ABI_ENOMEM;
+    if (!k) { if (mask_swapped) t->sig_blocked = saved_mask; return -ABI_ENOMEM; }
     int n = sys_epoll_wait_k(epfd, k, maxevents, timeout);
+    if (mask_swapped) t->sig_blocked = saved_mask;   /* restore on EVERY path */
     if (n > 0) {
         uint8_t* out = (uint8_t*)(uintptr_t)outp;
         unsigned long doff = abi_epoll_data_off(c);
@@ -349,7 +433,22 @@ static long h_epoll_wait(struct abi_ctx* c) {
         }
     }
     kfree(k);
-    return n < 0 ? n : n;
+    return n;
+}
+
+/* rt_sigpending(set, sigsetsize).  Reports signals that ARRIVED while blocked
+ * — the proof that sigprocmask defers rather than discards. */
+static long h_sigpending(struct abi_ctx* c) {
+    struct task* t = task_current();
+    unsigned long p = c->a[0];
+    if (!p) return -ABI_EFAULT;
+    if (!abi_user_w_ok(p, 4)) return -ABI_EFAULT;
+    /* Only the signals that are BOTH pending and blocked: an unblocked
+     * pending signal is one the task simply has not returned to ring 3 to
+     * collect yet, and reporting it would be a race, not information. */
+    *(uint32_t*)(uintptr_t)p =
+        t ? abi_sigset_to_guest(t->sig_pending & t->sig_blocked) : 0;
+    return 0;
 }
 
 static long h_wait(struct abi_ctx* c) {
@@ -419,6 +518,7 @@ static const struct {
     [ABI_EPOLL_CREATE]    = { "epoll_create",    h_epoll_create    },
     [ABI_EPOLL_CTL]       = { "epoll_ctl",       h_epoll_ctl       },
     [ABI_EPOLL_WAIT]      = { "epoll_wait",      h_epoll_wait      },
+    [ABI_SIGPENDING]      = { "sigpending",      h_sigpending      },
     [ABI_WAIT]            = { "wait",            h_wait },
     [ABI_EXECVE]          = { "execve",          h_execve },
 };

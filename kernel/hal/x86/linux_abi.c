@@ -63,6 +63,13 @@ extern uint32_t saved_eip;
 #define LNX_mprotect       125
 #define LNX_readv          145
 #define LNX_writev         146
+/* §M56 — rt_sigprocmask is handled by the ABI engine now, not by the switch
+ * below.  The stub that used to live here answered "success" and did nothing,
+ * and because the engine only handles numbers present in the guest's map, it
+ * silently shadowed the real handler on both x86 guests while arm64 — whose
+ * map did name the number — got the working one.  A fallback is only a
+ * fallback while nothing better exists; when something better arrives, the
+ * fallback has to be removed in the same change. */
 #define LNX_rt_sigprocmask 175
 #define LNX_mmap2          192
 #define LNX_fstat64        197
@@ -753,13 +760,6 @@ static void linux_syscall_body(struct int_frame* f) {
             f->eax = (uint32_t)sys_mprotect(f->ebx, (size_t)f->ecx, (int)f->edx);
             return;
 
-        case LNX_rt_sigprocmask:
-            /* musl brackets fork() (and other paths) with signal-mask changes.
-             * We don't implement a per-task blocked-signal mask yet; report
-             * success so those paths proceed (signals themselves are best-effort
-             * here anyway). */
-            f->eax = 0;
-            return;
 
         case LNX_munmap:
             /* The d-os user mmap bump-allocates and does not reclaim yet, so

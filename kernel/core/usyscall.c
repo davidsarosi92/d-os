@@ -316,13 +316,24 @@ long sys_read_k(int fd, void* buf, size_t n) {
     if (o->kind == FD_VFS)  return (long)vfs_read(o->file, buf, n);
     /* Sockets read(2) with POSIX blocking semantics (block == 1): an empty
      * read waits for the peer to send (or close → 0/EOF). */
-    if (o->kind == FD_SOCK) return usock_recv(o->sock, buf, n, 1, NULL);
+    /* §M57 — one flag, checked in one place.  `block` is the inverse of the
+     * description's O_NONBLOCK; before this the socket layer carried its own
+     * copy and every other kind ignored the flag entirely. */
+    int block = !o->nonblock;
+    if (o->kind == FD_SOCK) {
+        long r = usock_recv(o->sock, buf, n, block, NULL);
+        /* A non-blocking read that found nothing must say EAGAIN, not 0: zero
+         * means END OF FILE, and a drain loop told "EOF" by an empty pipe
+         * whose writer is very much alive stops for good. */
+        if (!block && r == 0 && usock_peer_open(o->sock)) return -SOCK_EAGAIN;
+        return r;
+    }
     if (o->kind == FD_NETSOCK) return netsock_read(o->nsock, buf, n);
     /* §M53 stage 3 — reading a timerfd yields the expiration COUNT and resets
      * it.  Blocking by default, like every other read here; a caller that
      * wants the non-blocking form uses poll(2), which is the whole point of
      * the descriptor existing. */
-    if (o->kind == FD_TIMER) return timerfd_read(o->tfd, buf, n, 1);
+    if (o->kind == FD_TIMER) return timerfd_read(o->tfd, buf, n, block);
     return -1;
 }
 
@@ -1039,8 +1050,8 @@ void fd_readiness_signal(void) {
 }
 
 /* See fd.h — the single definition of readiness, shared by poll and epoll. */
-void fd_readiness(int fd, int* rd_out, int* wr_out) {
-    int rd = 0, wr = 0;
+uint32_t fd_readiness(int fd) {
+    uint32_t r = 0;
 
     if (fd == 0) {
         /* stdin is COOKED (stdin_read_line blocks until Enter), so it becomes
@@ -1050,55 +1061,78 @@ void fd_readiness(int fd, int* rd_out, int* wr_out) {
          * that lies about which reads will not block is the one thing a poll
          * must never do. */
         struct vc* v = vc_focused();
-        rd = v ? vc_can_read_line(v) : 0;
-    } else if (fd == 1 || fd == 2) {
-        wr = 1;                                    /* console out: always writable */
-    } else {
-        struct ofile* o = fd_lookup(fd);
-        if (o) {
-            switch (o->kind) {
-            case FD_SOCK:
-                rd = usock_can_read(o->sock);
-                wr = usock_can_write(o->sock);
-                break;
-            /* §M53 stage 3 — a timerfd is readable exactly while it has
-             * uncollected expirations, and is never writable.  This is what
-             * lets a loop wait for a deadline and its sockets in the SAME
-             * call instead of choosing between them. */
-            case FD_TIMER:
-                rd = timerfd_can_read(o->tfd);
-                break;
-            /* §M56 — an AF_INET socket used to fall through to "always ready",
-             * so a loop polling one span at full speed and every epoll_wait on
-             * it would have returned instantly.  Datagram readiness is its RX
-             * ring; a stream's is the stack's. */
-            case FD_NETSOCK:
-                rd = netsock_can_read(o->nsock);
-                wr = netsock_can_write(o->nsock);
-                break;
-            case FD_VFS:
-            case FD_SHM:
-            default:
-                rd = 1; wr = 1;                    /* regular files never block */
-                break;
-            }
-        }
+        if (v && vc_can_read_line(v)) r |= POLLIN;
+        return r;
     }
-    if (rd_out) *rd_out = rd;
-    if (wr_out) *wr_out = wr;
+    if (fd == 1 || fd == 2) return POLLOUT;      /* console out: always writable */
+
+    struct ofile* o = fd_lookup(fd);
+    /* POLLNVAL is the honest answer for a descriptor that is not open, and it
+     * is reported unrequested: a loop watching an fd it has already closed
+     * would otherwise wait forever on something that can never be ready. */
+    if (!o) return POLLNVAL;
+
+    switch (o->kind) {
+    case FD_SOCK:
+        if (usock_can_read(o->sock))  r |= POLLIN;
+        if (usock_can_write(o->sock)) r |= POLLOUT;
+        /* §M57 — the peer endpoint is gone.  RDHUP says "no more data will
+         * ever arrive"; HUP additionally says the buffered data is drained, so
+         * there is nothing left at all.  Reporting them separately is what
+         * lets a reader finish what is already queued before it closes down —
+         * collapsing the two would throw away the tail of every conversation
+         * whose writer closed promptly. */
+        if (!usock_peer_open(o->sock)) {
+            r |= POLLRDHUP;
+            if (!usock_can_read(o->sock)) r |= POLLHUP;
+        }
+        break;
+    /* §M53 stage 3 — a timerfd is readable exactly while it has uncollected
+     * expirations, and is never writable.  This is what lets a loop wait for a
+     * deadline and its sockets in the SAME call instead of choosing. */
+    case FD_TIMER:
+        if (timerfd_can_read(o->tfd)) r |= POLLIN;
+        break;
+    /* §M56 — an AF_INET socket used to fall through to "always ready", so a
+     * loop polling one span at full speed and every epoll_wait on it returned
+     * instantly. */
+    case FD_NETSOCK:
+        r |= netsock_readiness(o->nsock);
+        break;
+    case FD_EPOLL:
+        /* An epoll set is itself pollable: readable when it has events.  This
+         * is what makes nesting one loop inside another possible, and costs a
+         * single call because the set already knows. */
+        if (epoll_has_events(o->ep)) r |= POLLIN;
+        break;
+    case FD_VFS:
+    case FD_SHM:
+    default:
+        r |= POLLIN | POLLOUT;                   /* regular files never block */
+        break;
+    }
+    return r;
 }
 
 /* Fill each pollfd's revents with the currently-ready events; return the
- * number of fds with any requested event set (the readiness snapshot). */
+ * number of fds with any reportable event set.
+ *
+ * POLLERR/POLLHUP/POLLNVAL go into revents whether or not they were requested
+ * — POSIX requires it, and a loop that could not see a hangup would have to
+ * attempt a read to discover EOF, which is the blocking it used poll to avoid.
+ * POLLRDHUP, by contrast, is Linux's and IS request-gated: a program that does
+ * not ask for it must not have its revents grow a bit it never expected. */
+#define POLL_ALWAYS (POLLERR | POLLHUP | POLLNVAL)
+
 static int poll_snapshot(struct pollfd* pfds, int nfds) {
     int ready = 0;
     for (int i = 0; i < nfds; i++) {
         struct pollfd* pf = &pfds[i];
         pf->revents = 0;
-        int rd = 0, wr = 0;
-        if (pf->fd >= 0) fd_readiness(pf->fd, &rd, &wr);
-        if ((pf->events & POLLIN)  && rd) pf->revents |= POLLIN;
-        if ((pf->events & POLLOUT) && wr) pf->revents |= POLLOUT;
+        if (pf->fd < 0) continue;                /* negative fd: ignored, POSIX */
+        uint32_t r = fd_readiness(pf->fd);
+        uint32_t want = (uint32_t)(unsigned short)pf->events | POLL_ALWAYS;
+        pf->revents = (short)(r & want);
         if (pf->revents) ready++;
     }
     return ready;
@@ -1416,15 +1450,25 @@ static int ns_has_dgram(void* a) {
  * readiness lives in the stack (one connection today, §M55's open item), so we
  * ask there.  Writability is "connected", which is as honest as a stack with
  * no send buffer can be. */
-int netsock_can_read(struct netsock* ns) {
-    if (!ns) return 0;
-    if (ns->type == SOCK_STREAM) return ns->connected ? net_tcp_can_read() : 0;
-    return ns->rx_head != ns->rx_tail;
-}
-int netsock_can_write(struct netsock* ns) {
-    if (!ns) return 0;
-    if (ns->type == SOCK_STREAM) return ns->connected ? 1 : 0;
-    return 1;                                    /* datagrams: always sendable */
+uint32_t netsock_readiness(struct netsock* ns) {
+    if (!ns) return POLLNVAL;
+    if (ns->type != SOCK_STREAM)
+        return (ns->rx_head != ns->rx_tail ? POLLIN : 0) | POLLOUT;
+
+    if (!ns->connected) return 0;                /* not connected: nothing yet */
+    uint32_t r = POLLOUT;                        /* no send buffer to fill up  */
+    int rd = 0, fin = 0;
+    net_tcp_state(&rd, &fin);
+    if (rd) r |= POLLIN;
+    /* §M57 — the peer's FIN.  A stream reader MUST be able to see this without
+     * reading, or it can only discover EOF by attempting the read it used the
+     * event loop to avoid.  POLLIN stays set while unread bytes remain, so the
+     * loop drains the tail first and only then sees POLLHUP. */
+    if (fin) {
+        r |= POLLRDHUP;
+        if (!rd) r |= POLLHUP;
+    }
+    return r;
 }
 
 /* net.c UDP-binding callback: enqueue an arriving datagram (drop if the ring
@@ -1496,17 +1540,27 @@ int sys_fd_kind(int fd) {
     return o ? (int)o->kind : -1;
 }
 
+/* §M57 — O_NONBLOCK for ANY descriptor, not just an AF_INET socket.
+ *
+ * The name is historical: it was a socket-only knob, and every other kind
+ * silently ignored the flag — so a musl program that set O_NONBLOCK on a pipe
+ * got a blocking pipe and no error, which is the one failure an event loop
+ * cannot survive (every fd it drains is one it must not block on).  The flag
+ * now lives on the open file description, where POSIX says it belongs; the
+ * netsock's own copy is kept in step so the socket paths that read it directly
+ * do not have to be rewritten in the same change. */
 int sys_socket_setnonblock(int fd, int on) {
     struct ofile* o = fd_lookup(fd);
-    if (!o || o->kind != FD_NETSOCK) return -1;
-    o->nsock->nonblock = on ? 1 : 0;
+    if (!o) return -1;
+    o->nonblock = on ? 1 : 0;
+    if (o->kind == FD_NETSOCK && o->nsock) o->nsock->nonblock = o->nonblock;
     return 0;
 }
 
 int sys_socket_getnonblock(int fd) {
     struct ofile* o = fd_lookup(fd);
-    if (!o || o->kind != FD_NETSOCK) return -1;
-    return o->nsock->nonblock;
+    if (!o) return -1;
+    return o->nonblock;
 }
 
 int sys_bind(int fd, int port) {

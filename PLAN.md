@@ -4373,8 +4373,37 @@ binary.
   also leaves `data` unaligned on x86, so it is marshalled bytewise: code that
   works only on forgiving hardware is a port failure waiting to happen.
 
-**Still open:** per-fd wakeups instead of a scan; generic `O_NONBLOCK` on
-VFS/pipe descriptors; `epoll_pwait`'s signal mask.
+**§M56.1 — the open items, finished (same day).**  Hangup reporting
+(POLLHUP/POLLRDHUP/POLLERR/POLLNVAL, with RDHUP kept separate from HUP so a
+reader drains the tail before shutting down); generic `O_NONBLOCK` on the open
+file description; epoll sets are themselves pollable, with a bounded recursion
+depth; real `sigprocmask` + `rt_sigpending` + `epoll_pwait`'s mask.
+
+- *A stub that answers "success" is worse than one that answers "unimplemented".*
+  `h_sigprocmask` returned 0 for two milestones.  Nothing failed, so nothing was
+  investigated — while every program that blocked a signal got no blocking.
+
+- *When a fallback is superseded, delete it in the same change.*  The real
+  sigprocmask handler was registered in the arm64 map only; the engine declines
+  unknown numbers, so on both x86 guests the old switch's stub kept answering.
+  The feature worked on one arch and was unreachable on two, silently.
+
+- *Two self-consistent conventions still need a translation.*  A Linux
+  `sigset_t` numbers signals from bit 0; this kernel numbers them from bit 1.
+  Neither is wrong; copying the word across is.  It failed with one wrong
+  number in one test and no other symptom.
+
+- *Report a hangup separately from a hangup-with-nothing-left.*  POLLRDHUP and
+  POLLHUP look redundant until a writer closes with data still buffered.
+
+- *Measure before optimising, and write the number down.*  epoll's scan costs
+  ~620 ns per registered fd here, so the 64-item cap bounds it at ~40 µs and a
+  real loop pays ~6 µs.  Per-fd wakeups would buy none of that back and would
+  add a lifetime relationship between epoll items and open file descriptions —
+  §M54's defect class.  Declining is the decision; the measurement is why.
+
+**Still open:** per-fd wakeups (see above); `EPOLLERR` has no producer; signal
+masks are 32 bits and a guest `sigset_t`'s high words are left untouched.
 
 ---
 

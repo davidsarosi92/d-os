@@ -1192,14 +1192,18 @@ int net_tcp_recv(struct net_device* dev, void* buf, uint32_t len) {
     return (int)cnt;                             /* 0 = EOF (peer FIN, drained) */
 }
 
-/* §M56 — readiness for poll/epoll on a connected stream socket.  Unread bytes
- * OR a peer FIN both make a read return without blocking (the second returns
- * 0, which is exactly what a caller needs to be told about). */
-int net_tcp_can_read(void) {
+/* §M56/§M57 — readiness for poll/epoll on the connected stream socket.  Both
+ * facts in one locked read, because they are read together and a caller that
+ * sampled them separately could see "no data" and "no FIN" from two different
+ * instants and conclude the connection was merely quiet.
+ *
+ * `readable` counts unread bytes only; the FIN is reported separately so a
+ * loop can drain the tail before it acts on the hangup. */
+void net_tcp_state(int* readable, int* peer_fin) {
     uint32_t f = net_lock();
-    int r = (g_tcp_rxconsumed < g_tcp_rxlen) || g_tcp.peer_fin;
+    if (readable) *readable = (g_tcp_rxconsumed < g_tcp_rxlen);
+    if (peer_fin) *peer_fin = g_tcp.peer_fin;
     net_unlock(f);
-    return r;
 }
 
 void net_tcp_close(struct net_device* dev) {

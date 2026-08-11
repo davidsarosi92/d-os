@@ -509,6 +509,61 @@ static void cmd_epolltest(void) {
         if (n != 1 || evbuf[1] != 0x2222ull) {
             console_write("epoll: FAIL (pipe not reported)\n"); ok = 0;
         }
+        /* DEL before close, always.  A set watches descriptor NUMBERS, so a
+         * closed-and-reused fd silently inherits the old registration — the
+         * first version of this test skipped the DEL, the next pipe got the
+         * same fd number, its ADD failed with -EEXIST, and the stale entry's
+         * narrower event mask made the kernel look like it was dropping
+         * POLLRDHUP.  The hazard is real; it just belonged to the test. */
+        sys_epoll_ctl_k(ep, EPOLL_CTL_DEL, pfds[0], 0, 0);
+        sys_close(pfds[0]); sys_close(pfds[1]);
+    }
+
+    /* --- 3b. hangup: closing the writer must be VISIBLE without reading -- */
+    if (sys_pipe(pfds) == 0) {
+        if (sys_epoll_ctl_k(ep, EPOLL_CTL_ADD, pfds[0],
+                            POLLIN | EPOLLRDHUP, 0x3333ull) != 0) {
+            console_write("epoll: FAIL (ctl ADD for the hangup case)\n"); ok = 0;
+        }
+        sys_write_k(pfds[1], "z", 1);
+        sys_close(pfds[1]);                      /* writer gone, one byte left */
+
+        n = sys_epoll_wait_k(ep, evbuf, 8, 1000);
+        kprintf("epoll: after writer close -> n=%d events=%x\n",
+                n, n > 0 ? (unsigned)evbuf[0] : 0);
+        /* The byte is still there, so POLLIN AND RDHUP — but NOT yet HUP:
+         * a reader must be able to drain the tail before it shuts down. */
+        if (n != 1 || !(evbuf[0] & POLLIN) || !(evbuf[0] & POLLRDHUP)
+                   || (evbuf[0] & POLLHUP)) {
+            console_write("epoll: FAIL (hangup reported wrong with data left)\n");
+            ok = 0;
+        }
+        char c = 0;
+        sys_read_k(pfds[0], &c, 1);              /* drain it */
+        n = sys_epoll_wait_k(ep, evbuf, 8, 1000);
+        kprintf("epoll: after drain      -> n=%d events=%x\n",
+                n, n > 0 ? (unsigned)evbuf[0] : 0);
+        if (n != 1 || !(evbuf[0] & POLLHUP)) {
+            console_write("epoll: FAIL (POLLHUP not reported once drained)\n");
+            ok = 0;
+        }
+        sys_epoll_ctl_k(ep, EPOLL_CTL_DEL, pfds[0], 0, 0);
+        sys_close(pfds[0]);
+    }
+
+    /* --- 3c. O_NONBLOCK on a PIPE, which used to be silently ignored ---- */
+    if (sys_pipe(pfds) == 0) {
+        sys_socket_setnonblock(pfds[0], 1);
+        char c = 0;
+        long r = sys_read_k(pfds[0], &c, 1);     /* empty, writer alive */
+        kprintf("epoll: nonblocking empty pipe read -> %d (want EAGAIN=%d)\n",
+                (int)r, -SOCK_EAGAIN);
+        /* Must be EAGAIN and NOT 0: zero means end of file, and a drain loop
+         * told "EOF" by a live-but-empty pipe stops for good. */
+        if (r != -SOCK_EAGAIN) {
+            console_write("epoll: FAIL (O_NONBLOCK ignored on a pipe)\n");
+            ok = 0;
+        }
         sys_close(pfds[0]); sys_close(pfds[1]);
     }
 
@@ -520,6 +575,33 @@ static void cmd_epolltest(void) {
         ok = 0;
     } else {
         kprintf("epoll: EPOLLET refused with %d (correct)\n", rc);
+    }
+
+    /* --- 5. what does the SCAN actually cost? --------------------------- */
+    /*
+     * epoll's reputation is O(ready); ours scans the registered set.  Rather
+     * than argue about whether that matters here, measure it: fill the set
+     * with timerfds that will never fire and time a non-blocking wait.  The
+     * number is what decides whether per-fd wakeups are worth the cross-object
+     * lifetime coupling they require — and it is printed rather than asserted
+     * so a future reader can re-decide with their own workload.
+     */
+    int bench = sys_epoll_create();
+    if (bench >= 0) {
+        int fds[48]; int nf = 0;
+        for (int i = 0; i < 48; i++) {
+            int t = sys_timerfd_create();
+            if (t < 0) break;
+            fds[nf++] = t;
+            sys_epoll_ctl_k(bench, EPOLL_CTL_ADD, t, POLLIN, (uint64_t)i);
+        }
+        uint64_t b0 = timer_now_ns();
+        for (int i = 0; i < 100; i++) sys_epoll_wait_k(bench, evbuf, 8, 0);
+        uint64_t per_ns = (timer_now_ns() - b0) / 100ull;
+        kprintf("epoll: scan of %d registered fds costs %u ns per wait\n",
+                nf, (unsigned)per_ns);
+        for (int i = 0; i < nf; i++) sys_close(fds[i]);
+        sys_close(bench);
     }
 
     sys_close(tfd);
