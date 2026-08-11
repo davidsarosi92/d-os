@@ -4376,11 +4376,37 @@ of 4 CPUs.
   two pollers on one virtqueue (the ISR and every spinning waiter).  The lock
   and the single poller had to land before the interrupt could be safe.
 
-**Still open:** the NIC interrupt (turns netd's yield loop into a block);
-`vnet_poll` notifying the device on an empty pump; the stack remains
-single-instance above the transport (one ping, one DNS query, one TCP
-connection) — this milestone makes concurrency safe, not multi-connection.
-Then `epoll` and non-blocking file I/O.
+**Part 2 — the NIC interrupt (same day).**  Safe to wire only after part 1:
+beforehand it would have been the ISR plus every spinning waiter on one
+virtqueue.  The ISR acks the device and wakes the poller, and does not drain the
+ring (draining runs `net_rx`, which can generate a TCP ACK, which spins on the
+TX virtqueue).  netd blocks on the interrupt with a 10 ms backstop, so a missed
+interrupt costs latency rather than liveness.  `nettest` 4982 → 26/39 pumps;
+`netstorm 8` 4047 → 286 pumps at 0% of 4 CPUs.
+
+- *An interrupt you have not received is a promise, not a capability.*  The
+  stack flips to interrupt mode on the first one it actually takes, so a driver
+  that wires a line which never fires degrades to polling instead of blocking
+  forever.
+
+- *A counter beats a flag when the question is "since when".*  Sampling the
+  interrupt sequence before the pump and re-comparing it under the queue lock is
+  what makes an interrupt that lands during the pump impossible to lose.
+
+- *Separate the alarming number from the diagnostic one.*  Backstops fire ~300
+  times during `netstorm` and that is the design (nothing is coming, so the
+  timer is the only waker).  Only a backstop whose next pump finds frames is a
+  missed interrupt, and that is counted on its own.
+
+- *A self-contradictory measurement is evidence about the measuring apparatus.*
+  A run reported "serialised, peak waiters 0" and "8 probes done in 2912 ms" at
+  once.  Both cannot hold: I had changed a struct in a shared header and rebuilt
+  without `make clean`, and this project has no header dependencies.  §M51's
+  lesson, stated in CLAUDE.md, and it still caught me.
+
+**Still open:** the stack remains single-instance above the transport (one ping,
+one DNS query, one TCP connection) — this milestone makes concurrency safe, not
+multi-connection.  Then `epoll` and non-blocking file I/O.
 
 ---
 

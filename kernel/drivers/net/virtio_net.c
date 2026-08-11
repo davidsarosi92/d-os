@@ -13,9 +13,17 @@
  * (legacy, VIRTIO_NET_F_MRG_RXBUF NOT negotiated → 10 bytes, no num_buffers).
  * We zero it on TX and skip it on RX.
  *
- * Polling only (no IRQ): the stack calls vnet_poll() to drain the RX ring, and
- * TX waits synchronously on the used ring (one outstanding frame at a time,
- * exactly like virtio_blk).  IRQ-driven RX is a §M24 follow-up.
+ * RX is INTERRUPT-DRIVEN (§M55): the device's legacy PCI interrupt wakes the
+ * stack's poller task, which then drains the ring in task context.  The ISR
+ * itself only acknowledges the device and calls net_rx_irq() — draining from
+ * interrupt context would run net_rx, which can generate a TCP ACK, which
+ * spins on the TX virtqueue below.  vnet_poll() therefore stays exactly as it
+ * was and is simply called from somewhere sane.
+ *
+ * TX still waits synchronously on the used ring (one outstanding frame at a
+ * time, exactly like virtio_blk), so TX completion interrupts are actively
+ * SUPPRESSED (VRING_AVAIL_F_NO_INTERRUPT on the transmitq): an interrupt whose
+ * only effect is to wake a task that finds nothing to do is pure cost.
  *
  * DMA memory: queues + buffers come from the PMM so phys == virt inside the
  * 256 MiB identity map (heap-backed kmalloc would give a virtual pointer whose
@@ -31,6 +39,7 @@
 #include "pmm.h"
 #include "printf.h"
 #include "driver.h"
+#include "idt.h"                                /* irq_install, struct int_frame */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -56,6 +65,11 @@
 
 #define VRING_DESC_F_NEXT     0x01
 #define VRING_DESC_F_WRITE    0x02             /* device writes to buffer     */
+
+/* avail->flags: ask the device NOT to interrupt on completions of this queue.
+ * Advisory in the spec, honoured by QEMU, and correct for a queue whose
+ * completions we wait for synchronously anyway. */
+#define VRING_AVAIL_F_NO_INTERRUPT 0x01
 
 /* virtio-net feature bits. */
 #define VIRTIO_NET_F_MAC      (1u << 5)        /* config MAC is valid         */
@@ -231,6 +245,7 @@ static int vnet_transmit(struct net_device* dev, const void* frame, uint32_t len
 static void vnet_poll(struct net_device* dev) {
     struct virtio_net* v = (struct virtio_net*)dev->priv;
     struct vnet_queue* q = &v->rx;
+    int recycled = 0;
 
     while (q->used->idx != q->last_used_idx) {
         uint16_t uidx = q->last_used_idx % QSIZE;
@@ -245,10 +260,30 @@ static void vnet_poll(struct net_device* dev) {
 
         q->last_used_idx++;
         /* Recycle the buffer back into the avail ring. */
-        if (di < RX_BUFFERS) vn_rx_post(v, di);
+        if (di < RX_BUFFERS) { vn_rx_post(v, di); recycled = 1; }
     }
-    /* Let the device know fresh buffers are available. */
-    outw(v->io_base + VN_OFF_QUEUE_NOTIFY, 0);
+    /* Notify only if we actually gave the device something.  The notify is a
+     * port write, i.e. a VM exit under emulation, and telling a device that
+     * fresh buffers are available when none are is a cost with no meaning —
+     * on an empty pump that was one wasted exit per poll round. */
+    if (recycled) outw(v->io_base + VN_OFF_QUEUE_NOTIFY, 0);
+}
+
+/* ----------------------- Interrupt ---------------------------------------- */
+
+/* Interrupt context.  Two jobs and no third:
+ *
+ *  1. ACKNOWLEDGE.  Reading the legacy ISR status register is what deasserts
+ *     the device's level-triggered line; skipping it is an interrupt storm,
+ *     not a missed packet.  The read also clears it, so a zero here means the
+ *     interrupt was not ours (the line can be shared) and we must NOT ack it.
+ *  2. WAKE the stack's poller.  Nothing else — see the file header.
+ */
+static void vnet_irq(struct int_frame* f) {
+    (void)f;
+    uint8_t st = inb(g_vnet.io_base + VN_OFF_ISR_STATUS);
+    if (!st) return;                              /* not our device           */
+    net_rx_irq(&g_eth0);
 }
 
 /* ----------------------- DRIVER() lifecycle ------------------------------- */
@@ -301,6 +336,22 @@ static int vnet_init(void* ctx) {
     if (vn_setup_queue(io, 1, &g_vnet.tx) != 0) return -5;   /* transmitq      */
     if (vn_init_rx(&g_vnet) != 0) return -6;
     if (vn_init_tx(&g_vnet) != 0) return -7;
+
+    /* We wait for TX completions synchronously, so a TX interrupt can only
+     * ever wake a task that finds nothing to do.  Ask the device to skip them;
+     * the used ring is still updated, which is all vnet_transmit reads. */
+    g_vnet.tx.avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
+    barrier();
+
+    /* Hook the device's interrupt BEFORE DRIVER_OK.  The other order leaves a
+     * window in which the device may deliver a frame and raise a line nobody
+     * has claimed — harmless for the frame (the poller's backstop finds it)
+     * but the unhandled assertion is not worth the risk. */
+    if (pd.irq_line != 0xFF) {
+        irq_install(pd.irq_line, vnet_irq);
+    } else {
+        kprintf("virtio-net: no IRQ line, RX stays polled\n");
+    }
 
     /* Driver ready. */
     outb(io + VN_OFF_DEV_STATUS,

@@ -234,11 +234,16 @@ void net_list(void) {
     }
     /* The poller's own state.  `waiters 0` + `netd idle` on a quiet box is the
      * whole point of §M55: nothing is polling anything. */
-    uint32_t pumps = 0, inl = 0, frames = 0; int waiters = 0, running = 0;
-    net_poller_stats(&pumps, &inl, &frames, &waiters, &running);
+    struct net_poller_stats st;
+    net_poller_stats(&st);
     kprintf("netd: %s   waiters %d   pumps %u (%u inline)   frames %u\n",
-            running ? (waiters ? "polling" : "idle") : "not started",
-            waiters, pumps, inl, frames);
+            st.running ? (st.waiters ? "polling" : "idle") : "not started",
+            st.waiters, st.pumps, st.inline_pumps, st.frames);
+    /* backstops on a quiet wire are the design, not a defect — only
+     * `missed` is a fault (see g_missed_irqs). */
+    kprintf("      rx-irq: %s   interrupts %u   backstops %u (idle)   missed %u\n",
+            st.irq_live ? "live" : "none seen (polled)",
+            st.irqs, st.backstops, st.missed_irqs);
 }
 
 /* =============================================================================
@@ -258,6 +263,7 @@ void net_list(void) {
 
 static struct waitq g_netwq  = WAITQ_INIT;   /* stack lock + waiter parking   */
 static struct waitq g_netdwq = WAITQ_INIT;   /* netd's own idle parking spot  */
+static struct waitq g_nicwq  = WAITQ_INIT;   /* where netd waits for the NIC  */
 static volatile int g_waiters      = 0;      /* guarded by g_netdwq's lock    */
 static volatile int g_netd_running = 0;
 static volatile int g_netd_spawned = 0;
@@ -272,13 +278,61 @@ static volatile uint32_t g_rx_frames;        /* frames handed to net_rx      */
  * inferring it from the total. */
 static volatile uint32_t g_inline_pumps;
 
-/* How long netd keeps yielding after the wire has gone quiet before it starts
- * sleeping between pumps.  Yielding keeps latency at a scheduler slice while a
- * conversation is in flight; the sleep is what stops a waiter with a multi-
- * second deadline from pinning a core when nothing is coming.  Both disappear
- * once the NIC interrupt lands and netd can simply block. */
+/* The POLLED fallback's pacing, used only while no NIC interrupt has ever
+ * arrived (see net_rx_irq).  Yielding keeps latency at a scheduler slice while
+ * a conversation is in flight; the sleep is what stops a waiter with a multi-
+ * second deadline from pinning a core when nothing is coming. */
 #define NETD_SPIN_ROUNDS   2048
 #define NETD_IDLE_SLEEP_NS 1000000ull        /* 1 ms                          */
+
+/* The interrupt path's backstop.  netd blocks until the NIC says a frame
+ * arrived — but never INDEFINITELY: a missed or misrouted interrupt must
+ * degrade this stack to polling, not to a hang.  Ten milliseconds is slow
+ * enough to cost nothing when interrupts work and fast enough that a box whose
+ * interrupt is broken still passes its own tests, loudly (`lsnic` reports how
+ * many times the backstop had to fire, which is how you tell "the interrupt is
+ * wired" from "the interrupt is delivering"). */
+#define NETD_IRQ_BACKSTOP_NS 10000000ull     /* 10 ms                         */
+
+/* Interrupt bookkeeping.  g_irq_seq is the thing netd compares against: a
+ * COUNTER rather than a flag, because a flag cannot distinguish "no interrupt
+ * since I looked" from "one arrived and was already consumed". */
+static volatile uint32_t g_irq_seq;
+static volatile uint32_t g_irq_count;        /* NIC interrupts taken          */
+static volatile uint32_t g_backstop_count;   /* times we timed out instead    */
+static volatile uint32_t g_missed_irqs;      /* backstops that FOUND frames   */
+static volatile int      g_nic_irq_seen;     /* set by the FIRST real one     */
+
+/* Why g_missed_irqs exists, and why the raw backstop count is not enough.
+ *
+ * Most backstops are not defects: when nothing is coming, the timer is the
+ * ONLY thing that can wake the poller, so a wait on a quiet wire back-stops
+ * once every NETD_IRQ_BACKSTOP_NS by design.  `netstorm`, which waits three
+ * seconds for replies that never arrive, therefore reports ~300 of them and is
+ * working perfectly.
+ *
+ * The one that matters is a backstop whose very next pump FINDS FRAMES: the
+ * data was already there and nothing told us.  That is a missed interrupt, and
+ * it is the only figure here that should ever be read as a fault. */
+
+/* Called by a NIC driver's ISR.  Interrupt context: this may take a lock (all
+ * holders of it mask interrupts) and wake tasks, and it may do NOTHING else.
+ * In particular it must not drain the RX ring — draining calls net_rx, which
+ * can generate a TCP ACK, which spins waiting on the TX virtqueue.  That is
+ * §M49's xHCI lesson, and it applies here word for word.
+ *
+ * The stack learns that interrupts WORK by receiving one, rather than by being
+ * told: a driver that wires an interrupt which never fires leaves netd in the
+ * polled mode instead of blocking forever on a promise. */
+void net_rx_irq(struct net_device* dev) {
+    (void)dev;
+    uint32_t f = waitq_lock(&g_nicwq);
+    g_irq_seq++;
+    g_irq_count++;
+    g_nic_irq_seen = 1;
+    waitq_wake_all(&g_nicwq);
+    waitq_unlock(&g_nicwq, f);
+}
 
 uint32_t net_lock(void)              { return waitq_lock(&g_netwq); }
 void     net_unlock(uint32_t flags)  { waitq_unlock(&g_netwq, flags); }
@@ -398,9 +452,43 @@ int net_wait_cond(int (*cond)(void*), void* arg, uint32_t timeout_ms) {
     return ok;
 }
 
+/* The backstop half of netd's interrupt wait.  Same shape as the deadline
+ * timer above, and for the same reason: the wake must take the queue lock, or
+ * it can slip past a task that has decided to park but has not yet done so. */
+static void nic_backstop_fired(struct ktimer* t) {
+    struct waitq* wq = (struct waitq*)t->arg;
+    uint32_t f = waitq_lock(wq);
+    waitq_wake_all(wq);
+    waitq_unlock(wq, f);
+}
+
+/* Block until the NIC reports a frame, or the backstop fires.
+ *
+ * `seq_before` is the interrupt count sampled BEFORE the pump that came back
+ * empty.  Re-comparing it here under the queue lock is what makes an interrupt
+ * that landed DURING that pump impossible to miss: the ISR increments the
+ * counter under this same lock, so either it got there first (and the counter
+ * differs, so we do not park) or it arrives after we are parked (and its wake
+ * finds us).  Testing a bare "is there work" flag instead would lose exactly
+ * the interrupts that arrive in that window. */
+static int netd_wait_for_irq(uint32_t seq_before) {
+    struct ktimer t = { 0, 0, 0, 0, 0 };
+    ktimer_arm(&t, timer_now_ns() + NETD_IRQ_BACKSTOP_NS, nic_backstop_fired, &g_nicwq);
+
+    uint32_t f = waitq_lock(&g_nicwq);
+    if (g_irq_seq == seq_before && !task_should_stop()) waitq_block(&g_nicwq);
+    int woken_by_irq = (g_irq_seq != seq_before);
+    waitq_unlock(&g_nicwq, f);
+
+    if (!woken_by_irq) g_backstop_count++;
+    ktimer_cancel(&t);
+    return !woken_by_irq;                        /* "this was a backstop" */
+}
+
 static void netd_main(void) {
     __atomic_store_n(&g_netd_running, 1, __ATOMIC_RELEASE);
     uint32_t quiet = 0;
+    int after_backstop = 0;                      /* see g_missed_irqs */
 
     for (;;) {
         /* Park until somebody wants packets.  This is the whole reason an idle
@@ -415,28 +503,49 @@ static void netd_main(void) {
          * very first pump of the next one straight into the sleep. */
         if (parked) quiet = 0;
 
+        /* Sample the interrupt counter BEFORE pumping — see netd_wait_for_irq
+         * for why the order matters. */
+        uint32_t seq = __atomic_load_n(&g_irq_seq, __ATOMIC_ACQUIRE);
+
         uint32_t lf  = net_lock();
         uint32_t got = net_pump_locked();
         if (got) waitq_wake_all(&g_netwq);
         net_unlock(lf);
 
-        if (got) { quiet = 0; task_yield(); }
-        else if (++quiet < NETD_SPIN_ROUNDS) task_yield();
-        else {
-            quiet = NETD_SPIN_ROUNDS;            /* don't wrap the counter */
+        /* Frames found by a pump that ran because the TIMER fired mean the
+         * interrupt for them never arrived.  This is the only reading here
+         * that is a fault. */
+        if (got && after_backstop) g_missed_irqs++;
+        after_backstop = 0;
+
+        if (got) {
+            /* Frames are flowing: come straight back for the next batch rather
+             * than waiting to be told about work that is already here. */
+            quiet = 0;
+            task_yield();
+        } else if (__atomic_load_n(&g_nic_irq_seen, __ATOMIC_ACQUIRE)) {
+            after_backstop = netd_wait_for_irq(seq);   /* the real thing      */
+        } else if (++quiet < NETD_SPIN_ROUNDS) {
+            task_yield();                        /* polled fallback           */
+        } else {
+            quiet = NETD_SPIN_ROUNDS;            /* don't wrap the counter    */
             task_sleep_until_ns(timer_now_ns() + NETD_IDLE_SLEEP_NS);
         }
     }
     __atomic_store_n(&g_netd_running, 0, __ATOMIC_RELEASE);
 }
 
-void net_poller_stats(uint32_t* pumps, uint32_t* inline_pumps, uint32_t* frames,
-                      int* waiters, int* running) {
-    if (pumps)        *pumps        = g_pump_count;
-    if (inline_pumps) *inline_pumps = g_inline_pumps;
-    if (frames)       *frames       = g_rx_frames;
-    if (waiters) *waiters = g_waiters;
-    if (running) *running = g_netd_running;
+void net_poller_stats(struct net_poller_stats* out) {
+    if (!out) return;
+    out->pumps        = g_pump_count;
+    out->inline_pumps = g_inline_pumps;
+    out->frames       = g_rx_frames;
+    out->irqs         = g_irq_count;
+    out->backstops    = g_backstop_count;
+    out->missed_irqs  = g_missed_irqs;
+    out->waiters      = g_waiters;
+    out->running      = g_netd_running;
+    out->irq_live     = g_nic_irq_seen;
 }
 
 /* ----------------------- L2 transmit -------------------------------------- */

@@ -99,6 +99,18 @@ void net_list(void);                          /* backs the `lsnic` command    */
  * the frame length (no virtio/NIC header, no FCS). */
 void net_rx(struct net_device* dev, const uint8_t* frame, uint32_t len);
 
+/* A NIC driver's ISR calls this to say "there may be work on the RX ring".
+ *
+ * It does NOT deliver a frame, and that is the point: the ISR must not drain
+ * the ring itself, because draining calls net_rx, which can generate a TCP ACK,
+ * which spins waiting on the TX virtqueue.  All this does is wake the poller.
+ * The driver still owns acknowledging its own interrupt before calling.
+ *
+ * The stack learns that interrupts work by RECEIVING one — a driver that wires
+ * an interrupt which never fires leaves the poller in its timed fallback rather
+ * than blocking forever on a promise. */
+void net_rx_irq(struct net_device* dev);
+
 /* ----------------------- Waiting for the network (§M55) ------------------- */
 
 /* Take / release the stack lock.  A consumer that keeps its own state inside
@@ -120,12 +132,25 @@ int net_wait_cond(int (*cond)(void* arg), void* arg, uint32_t timeout_ms);
 void net_pump_once(void);
 
 /* Poller counters for `lsnic` — a change to the concurrency model is only
- * worth making if it can be measured afterwards.  `inline_pumps` counts the
- * ones NOT driven by netd: it is reported separately because a rising figure
- * there means the poller is not doing its job, and that should be visible
- * rather than inferred from a total. */
-void net_poller_stats(uint32_t* pumps, uint32_t* inline_pumps, uint32_t* frames,
-                      int* waiters, int* running);
+ * worth making if it can be measured afterwards.  Several of these fields are
+ * kept apart rather than summed on purpose:
+ *
+ *   inline_pumps  pumps NOT driven by netd.  A rising figure means the poller
+ *                 is not doing its job, which should be visible rather than
+ *                 inferred from a total.
+ *   irqs          "the interrupt is wired" and "the interrupt is delivering"
+ *                 are different claims; a zero here answers the second.
+ *   backstops     waits that ended on the poller's own timer instead.  On a
+ *                 quiet wire this is the DESIGN, not a defect: with nothing
+ *                 coming, the timer is the only thing that can wake it.
+ *   missed_irqs   backstops whose next pump found frames waiting.  THIS is
+ *                 the fault reading: the data was there and nothing said so. */
+struct net_poller_stats {
+    uint32_t pumps, inline_pumps, frames;
+    uint32_t irqs, backstops, missed_irqs;
+    int      waiters, running, irq_live;
+};
+void net_poller_stats(struct net_poller_stats* out);
 
 /* ----------------------- Byte-order helpers ------------------------------- */
 /* x86 is little-endian; network order is big-endian. */

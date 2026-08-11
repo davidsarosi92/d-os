@@ -57,13 +57,36 @@ poller is not doing its job, and that should be visible rather than inferred*.
 **Two process lessons:** I nearly skipped that measurement because the number
 merely looked large; and the build behind the first explanation had **FAILED** —
 an `error:` slipped past my output filter and I read a stale ISO (§M51 again:
-*check the exit status, not the output*).  **OPEN:** the NIC interrupt (turns
-netd's yield loop into a block — it had to come SECOND or the ISR and the
-spinning waiters would have been two pollers on one virtqueue); `vnet_poll`
-notifies the device even on an empty pump (one pointless VM exit per pump); the
-stack is still single-instance above the transport (one ping, one DNS query, one
-TCP connection) — §M55 makes concurrency SAFE, not multi-connection; `epoll` and
-non-blocking file I/O are next.
+*check the exit status, not the output*).  **PART 2 — THE NIC INTERRUPT**, safe to wire only
+now (before part 1 it would have been the ISR PLUS every spinning waiter on one
+virtqueue).  The ISR does two things and no third: **acks the device** (reading
+the legacy ISR status register is what deasserts the level-triggered line —
+skipping it is an interrupt storm, and a zero read means it was not ours) and
+**wakes the poller**.  It does NOT drain the ring: draining runs `net_rx`, which
+can generate a TCP ACK, which spins on the TX virtqueue — §M49's xHCI lesson
+verbatim.  **The stack learns interrupts work by RECEIVING one** (no config key;
+a driver that wires an interrupt which never fires degrades to polling instead
+of blocking forever on a promise), and **netd never blocks indefinitely** — a
+10 ms backstop makes a missed interrupt cost LATENCY, not LIVENESS, while an
+interrupt SEQUENCE COUNTER sampled before the pump and re-compared under the
+queue lock makes one arriving DURING that pump impossible to lose (a bare "is
+there work" flag would lose exactly those).  TX completion interrupts are
+suppressed (`VRING_AVAIL_F_NO_INTERRUPT` — we wait for them synchronously, so
+they could only wake a task with nothing to do), and `vnet_poll` notifies only
+when it actually recycled a buffer.  **Measured: `nettest` 4982 → 26/39 pumps;
+`netstorm 8` 4047 → 286 pumps at 0% of 4 CPUs; `missed 0` throughout.**  The
+~290 backstops `netstorm` reports are the DESIGN, not a defect (3 s ÷ 10 ms =
+300 with nothing coming) — which is why `missed` is counted separately: only a
+backstop whose next pump FINDS FRAMES is a fault.  **AND THE SAME RAKE, AGAIN:**
+the first part-2 run reported `peak waiters 0` + FAIL while 8 probes
+demonstrably finished in parallel in 2912 ms — I had added a struct field to
+`net.h` and rebuilt **without `make clean`**, so net.c and shell.c used two
+layouts of one struct.  §M51's lesson, which CLAUDE.md states outright, and it
+still caught me; what saved it is that the numbers CONTRADICTED EACH OTHER —
+*a self-contradictory measurement is evidence about the measuring apparatus.*
+**OPEN:** the stack is still single-instance above the transport (one ping, one
+DNS query, one TCP connection) — §M55 makes concurrency SAFE, not
+multi-connection; `epoll` and non-blocking file I/O are next.
 
 ✅ **§M54 — A TASK THE SCHEDULER WAS STILL STANDING ON (2026-08-10, DOCS §4.54,
 all 3 arches).**  Reported as *"open NetSurf, a crash report comes up, close it,

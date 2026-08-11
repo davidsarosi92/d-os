@@ -1739,8 +1739,8 @@ static void cmd_netstorm(const char* args) {
         struct percpu* p = percpu_at(i);
         if (p) busy0 += p->busy_ms;
     }
-    uint32_t pumps0 = 0;
-    net_poller_stats(&pumps0, NULL, NULL, NULL, NULL);
+    struct net_poller_stats st0;
+    net_poller_stats(&st0);
 
     uint64_t t0 = timer_ticks_ms();
     int spawned = 0;
@@ -1753,8 +1753,9 @@ static void cmd_netstorm(const char* args) {
      * the thing it tests reports nothing). */
     int peak = 0;
     for (int ms = 0; ms < 20000; ms += 50) {
-        int w = 0;
-        net_poller_stats(NULL, NULL, NULL, &w, NULL);
+        struct net_poller_stats sn;
+        net_poller_stats(&sn);
+        int w = sn.waiters;
         if (w > peak) peak = w;
         if (__atomic_load_n(&g_nst_done, __ATOMIC_ACQUIRE) >= spawned) break;
         task_msleep(50);
@@ -1770,12 +1771,13 @@ static void cmd_netstorm(const char* args) {
     uint64_t db  = busy1 > busy0 ? busy1 - busy0 : 0;
     uint32_t pct = elapsed ? (uint32_t)((db * 100) / (elapsed * (uint64_t)ncpu)) : 0;
 
-    uint32_t pumps1 = 0;
-    net_poller_stats(&pumps1, NULL, NULL, NULL, NULL);
+    struct net_poller_stats st1;
+    net_poller_stats(&st1);
 
     kprintf("netstorm: %d/%d finished in %u ms, peak waiters %d, "
-            "%u%% of %d CPUs busy while waiting, %u pumps\n",
-            done, spawned, (uint32_t)elapsed, peak, pct, ncpu, pumps1 - pumps0);
+            "%u%% of %d CPUs busy while waiting, %u pumps, %u irqs\n",
+            done, spawned, (uint32_t)elapsed, peak, pct, ncpu,
+            st1.pumps - st0.pumps, st1.irqs - st0.irqs);
     if (done < spawned)
         console_write("netstorm: FAIL (a probe never returned)\n");
     else if (peak < 2 && spawned > 1)
