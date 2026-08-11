@@ -94,6 +94,7 @@ when sections are added.)
 | 4.53 | Time, in nanoseconds (M53 stages 1–2) | 5608 |
 | 4.54 | A task the scheduler was still standing on (M54) | 5720 |
 | 4.55 | A deadline you can wait on (M53 stage 3) | 5900 |
+| 4.56 | Waiting for the network without spending a CPU on it (M55) | 6066 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -6062,6 +6063,142 @@ Shell: `timerfdtest [ms]`, `alarmtest [ms]` (both shells, all three arches).
 
 ---
 
+### 4.56 Waiting for the network without spending a CPU on it (M55)
+
+**Files:** `kernel/core/net.c`, `kernel/includes/net.h`,
+`kernel/core/usyscall.c` (socket RX), `kernel/core/shell.c` (`netstorm`,
+`lsnic`).  **Verified:** i386 + x86_64, `-smp 4`.
+
+#### What was wrong
+
+§M24 drove receive by *polling from the calling task*: whoever wanted a reply
+called `dev->poll()` in a bounded spin loop until it arrived.  The file said so
+in its own header — *"Everything therefore runs in one task context → no
+locking"* — and that was true when written.  Three defects follow from it, and
+they compound:
+
+1. **The waiter burned a CPU.**  A task waiting for a DNS answer spun with
+   `hal_cpu_pause()` and never left the runqueue, so *waiting for the network
+   cost exactly as much CPU as computing flat out*.  §M49 removed the last such
+   polls from the console and the init reaper for precisely this reason; the
+   network stack was the one that got away.
+
+2. **N waiters meant N pollers.**  `dev->poll()` is not reentrant — it advances
+   the driver's `last_used_idx` and recycles RX buffers — so two tasks each
+   "waiting for their own packet" were two tasks mutating one ring.  It survived
+   only because nothing ever waited on two sockets at once, which is a statement
+   about the workload, not about the code.
+
+3. **A spin count is not a timeout.**  `20000000u` iterations means a different
+   amount of time on every machine, every arch and every host CPU under
+   emulation.  That is not a theoretical complaint: it is how musl's resolver
+   came to hang "for minutes" on emulated i386 (§M39).  The bound was doing its
+   job; it just could not say how long its job took.
+
+#### The model now
+
+One poller task (`netd`) is the only caller of `dev->poll`.  Everyone else
+BLOCKS on a wait queue until the state they care about changes or a real
+deadline — §M53's nanosecond clock — passes.
+
+`g_netwq`'s lock is THE stack lock.  By waitq's own contract the queue's lock
+also serialises the guarded condition, so the ARP cache, the ping and DNS reply
+flags, the TCP connection state and the per-socket RX rings are all mutated and
+checked under it; `net_rx()` and everything below it run with it HELD.
+
+**netd runs exactly while somebody is waiting, and is fully blocked otherwise.**
+A poller with nobody waiting for it is pure waste, and an idle box must not pay
+for a network stack it is not using.  On a machine that has never touched the
+network the task does not even exist: `lsnic` reports `netd: not started`.
+
+#### The consequence that reshaped the file
+
+The RX path may never block, so **it may never resolve an ARP entry**.  Every
+reply generated while handling a frame therefore goes back to the MAC that frame
+CAME FROM — which is the correct next hop by construction, on-link or via a
+router, and is cheaper besides: *a TCP ACK has no business doing an address
+lookup*.  That is what the `via_mac` argument on the emit path is for, and why
+the send helpers now come in two flavours:
+
+- `*_locked` — assembly and transmit only, caller already holds the lock and has
+  already decided the next hop.  Used by the RX path.
+- unlocked — resolve the route (which may block), then take the lock and emit.
+  Used from task context, and never called with the lock held.
+
+A TCP connection resolves its peer's MAC **once**, at connect time, and caches
+it in `g_tcp.peer_mac`: a connection has a fixed route for its lifetime, so this
+is not merely an optimisation — it is what makes `tcp_input` able to ACK at all.
+
+#### Timeouts
+
+Every spin budget became a duration: ARP 3 × 1000 ms, ping 1000 ms, DNS 3000 ms,
+TCP connect 5000 ms, TCP recv 10000 ms, HTTP "gone quiet" 2000 ms, datagram recv
+5000 ms.  Each wait arms a `ktimer` for its own deadline; the callback takes the
+queue lock and wakes, which is what closes the window against a task that has
+checked its deadline but not yet parked.
+
+#### `netstorm` — the proof, because a model change that cannot be measured is a claim
+
+New shell command `netstorm [n]`: n tasks each ARP for a *different* address
+nothing will answer for, so every one of them really has to wait (a cache hit
+would prove nothing).  Each probe takes 3 × 1000 ms; the measurement is the
+elapsed time, and it is falsifiable — parallel waiting is ~3 s, serialised
+waiting would be 3 s × n.  The shell watches rather than participating, so it can
+still report a wedge (the `killstorm` lesson: a test that hangs along with the
+thing it tests reports nothing at all).
+
+```
+netstorm: 8/8  finished in 3296 ms, peak waiters  8, 2% of 4 CPUs busy, 4047 pumps
+netstorm: 16/16 finished in 3467 ms, peak waiters 16, 3% of 4 CPUs busy
+```
+
+Doubling the waiters changed neither the elapsed time nor the CPU cost.  Under
+the old model those same 8 tasks would have been 8 cores' worth of spinning.
+
+#### A number that did not add up, and the bug behind it
+
+The first `netstorm` on a freshly booted box reported **143 115 pumps**; the
+second, doing identical work, reported **4 463**.  Same load, same duration,
+35× the polling — one of the two had to be wrong.
+
+It was the first.  `net_wait_cond` has a fallback for the case where the poller
+is not up yet: pump in line so the wait can still make progress.  That fallback
+looped **with the stack lock held and interrupts off**, so a CPU that entered it
+could not be preempted — and what it was waiting for was the scheduler starting
+`netd`.  Eight probes entering it at once starved the very task whose arrival
+would end it, turning a startup window into 138 000 wasted pumps.
+
+The fix is one line of discipline: drop the lock and `task_yield()` each round.
+First-use cost fell to **4047 pumps, of which 2 were inline** — and the inline
+counter is now reported separately by `lsnic`, because *a rising count there
+means the poller is not doing its job, and that should be visible rather than
+inferred from a total*.
+
+**Two process lessons from the same episode.**  The measurement that exposed
+this was one I had almost not taken — the number simply looked large.  And the
+build that produced the first "explanation" had **failed**: my error filter let
+`error:` through unnoticed and I read a stale ISO.  §M51's rule again, from the
+other direction: *check the build's exit status, not its output.*
+
+#### Open
+
+- **The NIC interrupt**, which turns netd's yield loop into a block.  Doing it
+  BEFORE this change would have put two pollers on one virtqueue — the ISR and
+  every spinning waiter — which is exactly why it comes second.  Until then netd
+  yields for 2048 rounds after the wire goes quiet and then sleeps 1 ms between
+  pumps, which is what keeps a long wait off the CPU.
+- `vnet_poll` notifies the device on every pump even when it recycled no
+  buffers; that is one VM exit per pump under QEMU and it is pointless.
+- The stack is still single-instance above the transport: one in-flight ping,
+  one DNS query, one TCP connection.  §M55 makes concurrency *safe*, it does not
+  make the stack multi-connection — and `netstorm` is careful to test only what
+  is claimed.
+- `dev->transmit` now waits for its virtqueue completion with interrupts masked.
+  Under QEMU that is microseconds; the driver's own bounded spin is what keeps a
+  wedged device from becoming a hard lockup.
+
+---
+
 ## 7. Roadmap / open milestones
 
 - [x] **M1 — GDT:** own Global Descriptor Table, stop relying on GRUB's.
@@ -6085,6 +6222,38 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-11 — §M55: waiting for the network without spending a CPU on it
+  (DOCS §4.56).**  The network stack drove RX by polling from the calling task,
+  so waiting for a packet cost as much CPU as computing flat out, N waiters were
+  N tasks mutating one non-reentrant RX ring, and every timeout was a spin count
+  that meant a different duration on every machine.  Now ONE poller task
+  (`netd`) is the only caller of `dev->poll` and everyone else BLOCKS on the
+  stack's wait queue until their condition holds or a real millisecond deadline
+  passes.  netd runs exactly while somebody is waiting and is fully blocked
+  otherwise — on a box that has never touched the network the task does not even
+  exist.  The wait queue's lock is the stack lock, so `net_rx` and everything
+  below it run with it held, which means **the RX path may never resolve an ARP
+  entry**: replies now go back to the MAC the frame came from (the correct next
+  hop by construction), and a TCP connection caches its peer's MAC once at
+  connect time.  New `netstorm [n]`: **8 and 16 concurrent waiters both finish
+  in ~3.4 s at 2–3% of 4 CPUs** — doubling the waiters changed neither figure,
+  where the old model would have spun one core per waiter.  **A number that did
+  not add up found a real bug:** the first storm on a fresh boot reported 143 115
+  pumps and the second, doing identical work, 4 463 — `net_wait_cond`'s
+  poller-not-up-yet fallback looped with the stack lock held and interrupts off,
+  starving the very task whose arrival would end it; dropping the lock and
+  yielding each round cut first-use cost to 4047 pumps, 2 of them inline.  The
+  inline count is now reported separately by `lsnic`, because a rising figure
+  there means the poller is not doing its job and that should be visible rather
+  than inferred.  Two process lessons: the measurement that exposed this was one
+  I nearly skipped because the number merely looked large, and the build behind
+  the first explanation had FAILED — an `error:` slipped past my output filter
+  and I read a stale ISO.  Check the exit status, not the output.  Open: the NIC
+  interrupt (which turns netd's yield loop into a block, and which had to come
+  second or the ISR and the spinning waiters would have been two pollers on one
+  virtqueue); `vnet_poll`'s pointless notify on an empty pump; the stack is still
+  single-instance above the transport.
 
 - **2026-08-10 — §M53 stage 3: a deadline you can wait on (DOCS §4.55).**
   `timerfd` (create/settime/gettime, read, poll-integrated) and `setitimer`

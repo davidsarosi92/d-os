@@ -1234,8 +1234,21 @@ struct netsock {
 
 static uint16_t g_ephem_port = 0xC000;
 
+/* How long a blocking datagram recv waits.  A real duration, not a spin count
+ * (§M55) — the old 40-million-iteration bound meant seconds on real hardware
+ * and minutes under emulation, from the same source line. */
+#define NS_RECV_TIMEOUT_MS 5000
+
+/* The awaited condition, evaluated by net_wait_cond under the stack lock. */
+static int ns_has_dgram(void* a) {
+    struct netsock* ns = (struct netsock*)a;
+    return ns->rx_head != ns->rx_tail;
+}
+
 /* net.c UDP-binding callback: enqueue an arriving datagram (drop if the ring
- * is full).  Runs in the receiver's task context (RX polled). */
+ * is full).  Runs on the poller task with the STACK LOCK HELD (§M55), which is
+ * what makes this ring safe against the consumer below — and is also why it
+ * must not block or allocate. */
 static void ns_udp_cb(uint32_t src_ip, uint16_t src_port,
                       const uint8_t* data, uint32_t len, void* ctx) {
     struct netsock* ns = (struct netsock*)ctx;
@@ -1393,26 +1406,24 @@ long sys_recvfrom_k(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out
     struct netsock* ns = o->nsock;
     struct net_device* dev = net_primary();
     if (!dev) return -1;
-    /* Poll the RX ring until a datagram lands (bounded — no IRQ RX yet).
-     *
-     * A NON-BLOCKING socket gets exactly one pump of the device — enough to
+
+    /* A NON-BLOCKING socket gets exactly one pump of the device — enough to
      * pick up anything already on the wire, which is what a real IRQ-driven
-     * driver would have done for us — and then reports EAGAIN instead of
-     * spinning.  Without that distinction the bounded spin still "returns", but
-     * only after tens of millions of iterations: on emulated i386 that is
-     * minutes, which is indistinguishable from a hang and is exactly how this
-     * broke musl's resolver. */
+     * driver would have done for us — and then reports EAGAIN.  Without that
+     * distinction musl's resolver, which drains its socket with
+     * `while (recvmsg(...) >= 0)`, waits out the full blocking timeout on a
+     * socket it explicitly asked not to block on. */
     if (ns->nonblock) {
-        if (ns->rx_head == ns->rx_tail && dev->poll) dev->poll(dev);
-        if (ns->rx_head == ns->rx_tail) return -SOCK_EAGAIN;
-    } else {
-        for (uint32_t spins = 0; spins < 40000000u; spins++) {
-            if (ns->rx_head != ns->rx_tail) break;
-            if (dev->poll) dev->poll(dev);
-            hal_cpu_pause();
-        }
-        if (ns->rx_head == ns->rx_tail) return -1;     /* timeout */
+        if (!ns_has_dgram(ns)) net_pump_once();
+        if (!ns_has_dgram(ns)) return -SOCK_EAGAIN;
+    } else if (!net_wait_cond(ns_has_dgram, ns, NS_RECV_TIMEOUT_MS)) {
+        return -1;                                     /* timeout */
     }
+
+    /* Dequeue under the stack lock — the producer (ns_udp_cb) runs on the
+     * poller task, so the "is there one" and the copy have to be one step. */
+    uint32_t f = net_lock();
+    if (ns->rx_head == ns->rx_tail) { net_unlock(f); return -1; }
     struct ns_dgram* d = &ns->rx[ns->rx_tail];
     uint32_t cnt = (d->len < n) ? d->len : (uint32_t)n;
     uint8_t* out = (uint8_t*)buf;
@@ -1420,6 +1431,7 @@ long sys_recvfrom_k(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out
     if (ip_out)   *ip_out   = d->src_ip;
     if (port_out) *port_out = d->src_port;
     ns->rx_tail = (ns->rx_tail + 1) % NS_RXSLOTS;
+    net_unlock(f);
     return (long)cnt;
 }
 

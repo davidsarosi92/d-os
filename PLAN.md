@@ -4332,6 +4332,58 @@ spaces make force-kill safe).  All shipped → this milestone is unblocked.
 
 ---
 
+## §M55 — Network async: one poller, blocking waiters ✅
+
+**Shipped 2026-08-11 — see DOCS.md §4.56.**  The network stack no longer
+polls the NIC from whichever task happens to be waiting.  One poller task
+(`netd`) is the only caller of `dev->poll`; every other task blocks on the
+stack's wait queue until its condition holds or a real millisecond deadline
+passes, and netd itself blocks whenever nobody is waiting.  Measured with the
+new `netstorm [n]`: 8 and 16 concurrent waiters both finish in ~3.4 s at 2–3%
+of 4 CPUs.
+
+**Lessons learned.**
+
+- *A comment describing a concurrency model is a dependency on a premise.*
+  net.c's header said "everything runs in one task context → no locking" and
+  that was true when written.  Nothing in the build noticed when blocking
+  primitives, SMP and ring-3 sockets each made it less true.  (§M52's lesson,
+  in a different file.)
+
+- *A spin count is not a timeout.*  `20000000u` iterations means a different
+  duration on every machine, every arch and every host CPU under emulation.
+  Once §M53 gave the kernel a nanosecond clock there was no excuse left, and
+  the musl-resolver hang of §M39 was this defect all along.
+
+- *Holding a lock across a wait for the thing that will release you is a
+  deadlock with extra steps.*  `net_wait_cond`'s "poller not up yet" fallback
+  spun with the stack lock held and interrupts off — so it could not be
+  preempted, and what it was waiting for was the scheduler starting `netd`.
+  Eight tasks entering it at once starved the very task whose arrival would end
+  it.
+
+- *An implausible number is evidence, not noise.*  Two runs doing identical
+  work reported 143 115 and 4 463 pumps.  One of them had to be wrong, and
+  chasing the discrepancy is what found the bug above.  I nearly let it go
+  because the number merely looked large rather than impossible.
+
+- *Check a build's exit status, not its output.*  A `grep error:` filter over
+  build output let a compile failure through, and the first explanation of that
+  discrepancy was measured on a stale ISO — §M51's lesson arriving by a
+  different route.
+
+- *Ordering was load-bearing.*  Wiring the NIC interrupt first would have put
+  two pollers on one virtqueue (the ISR and every spinning waiter).  The lock
+  and the single poller had to land before the interrupt could be safe.
+
+**Still open:** the NIC interrupt (turns netd's yield loop into a block);
+`vnet_poll` notifying the device on an empty pump; the stack remains
+single-instance above the transport (one ping, one DNS query, one TCP
+connection) — this milestone makes concurrency safe, not multi-connection.
+Then `epoll` and non-blocking file I/O.
+
+---
+
 ## §M50 — The guest-ABI translation engine (STARTED 2026-08-07)
 
 **Shipped so far (DOCS §4.48):** the pipeline exists and two live

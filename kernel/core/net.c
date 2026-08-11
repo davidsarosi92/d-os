@@ -12,11 +12,64 @@
  *       │
  *     net_rx (driver → stack) ─► Ethernet demux ─► ARP in / IPv4 in ─► ICMP in
  *
- * RX model for this first slice is *poll from the calling task*: the driver's
- * dev->poll() pumps the RX ring into net_rx(), and the blocking helpers
- * (arp resolve, ping) call it in a bounded spin loop.  Everything therefore
- * runs in one task context → no locking.  IRQ-driven RX + a `netd` task are a
- * documented follow-up; net_rx() is already shaped to be called from an ISR.
+ * ---------------------------------------------------------------------------
+ * CONCURRENCY (§M55 — this replaces the original "one task context" model)
+ * ---------------------------------------------------------------------------
+ *
+ * The first slice drove RX by *polling from the calling task*: whoever wanted a
+ * reply called dev->poll() in a bounded spin loop until it arrived.  That model
+ * has three defects, and they compound:
+ *
+ *   1. THE WAITER BURNS A CPU.  A task waiting for a DNS answer spun with
+ *      hal_cpu_pause() and never left the runqueue, so waiting for the network
+ *      cost exactly as much CPU as computing flat out.  §M49 removed the last
+ *      such polls from the console and the reaper for this reason; the network
+ *      stack was the one that got away.
+ *
+ *   2. N WAITERS MEANT N POLLERS.  dev->poll() is not reentrant — it advances
+ *      the driver's last_used_idx and recycles RX buffers — so two tasks each
+ *      "waiting for their own packet" were two tasks mutating one ring.  It
+ *      survived only because nothing ever waited on two sockets at once.
+ *
+ *   3. A SPIN COUNT IS NOT A TIMEOUT.  `20000000u` iterations means a different
+ *      amount of time on every machine, every arch and every host CPU under
+ *      emulation.  That is not a theoretical complaint: it is exactly how musl's
+ *      resolver came to hang "for minutes" on emulated i386 (§M39) — the bound
+ *      was doing its job, it just could not say how long its job took.
+ *
+ * The model now is: ONE poller task (`netd`) is the only caller of dev->poll,
+ * and everyone else BLOCKS on a wait queue until the state they care about
+ * changes or a REAL deadline (§M53's nanosecond clock) passes.
+ *
+ * netd runs exactly while somebody is waiting for a packet, and is fully
+ * blocked otherwise — a poller with nobody waiting for it is pure waste, and an
+ * idle box must not pay for a network stack it is not using.
+ *
+ * `g_netwq`'s lock is THE stack lock: by waitq's own contract (waitq.h) the
+ * queue's lock also serialises the condition, so the ARP cache, the ping/DNS
+ * reply flags, the TCP connection state and the per-socket RX rings are all
+ * mutated and checked under it.  net_rx() and everything below it therefore run
+ * with the lock HELD.
+ *
+ * THE CONSEQUENCE THAT SHAPES THE REST OF THE FILE: the RX path may never
+ * block, so it may never resolve an ARP entry.  Instead every reply generated
+ * while handling a frame is sent back to the MAC that frame CAME FROM — which
+ * is the correct next hop by construction, on-link or via a router, and is
+ * cheaper besides (a TCP ACK has no business doing an address lookup).  That is
+ * what the `via_mac` argument on the emit path is for, and why the send helpers
+ * come in `_locked` (assembly + transmit only) and unlocked (resolve, then
+ * emit) flavours.  A `_locked` function called from task context must be
+ * wrapped in net_lock/net_unlock; an unlocked one must NOT be called with the
+ * lock held.
+ *
+ * Interrupts are off while the stack lock is held, so dev->transmit's wait for
+ * the virtqueue completion now runs with them masked.  Under QEMU that
+ * completes in microseconds; the driver's own bounded spin is what keeps a
+ * wedged device from turning into a hard lockup.
+ *
+ * Still a follow-up: the NIC interrupt, which turns netd's yield loop into a
+ * block.  Doing it BEFORE this change would have put two pollers on one
+ * virtqueue — the ISR and every spinning waiter — which is why it comes second.
  *
  * All multi-byte on-wire fields are big-endian; we convert at the boundary
  * with htons/htonl (net.h).  The stack's own state is host byte order.
@@ -26,6 +79,10 @@
 #include "hal.h"
 #include "hal_api.h"
 #include "printf.h"
+#include "waitq.h"
+#include "ktimer.h"
+#include "timer.h"
+#include "task.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -175,15 +232,223 @@ void net_list(void) {
         kprintf("     RX %u pkts / %u bytes   TX %u pkts / %u bytes   drop %u\n",
                 n->rx_packets, n->rx_bytes, n->tx_packets, n->tx_bytes, n->rx_dropped);
     }
+    /* The poller's own state.  `waiters 0` + `netd idle` on a quiet box is the
+     * whole point of §M55: nothing is polling anything. */
+    uint32_t pumps = 0, inl = 0, frames = 0; int waiters = 0, running = 0;
+    net_poller_stats(&pumps, &inl, &frames, &waiters, &running);
+    kprintf("netd: %s   waiters %d   pumps %u (%u inline)   frames %u\n",
+            running ? (waiters ? "polling" : "idle") : "not started",
+            waiters, pumps, inl, frames);
+}
+
+/* =============================================================================
+ * The stack lock, the poller task, and waiting for a packet (§M55)
+ *
+ * See the file header for why this exists.  Three objects:
+ *
+ *   g_netwq   the stack lock AND the queue every waiter parks on.  Held across
+ *             net_rx and everything it calls, and across every frame assembly.
+ *   g_netdwq  where netd itself parks when nobody is waiting.  Its lock guards
+ *             g_waiters, which is the whole condition netd blocks on.
+ *   g_waiters how many tasks are currently waiting for the network.  0 means
+ *             netd sleeps; the transition 0→1 is what wakes it.
+ *
+ * The two queues are never held nested, in either order.
+ * ============================================================================= */
+
+static struct waitq g_netwq  = WAITQ_INIT;   /* stack lock + waiter parking   */
+static struct waitq g_netdwq = WAITQ_INIT;   /* netd's own idle parking spot  */
+static volatile int g_waiters      = 0;      /* guarded by g_netdwq's lock    */
+static volatile int g_netd_running = 0;
+static volatile int g_netd_spawned = 0;
+
+/* Observability — a change like this is only worth making if it can be
+ * measured afterwards (`lsnic` prints these). */
+static volatile uint32_t g_pump_count;       /* dev->poll rounds             */
+static volatile uint32_t g_rx_frames;        /* frames handed to net_rx      */
+/* Pumps NOT driven by netd — the fallback in net_wait_cond and the
+ * non-blocking single pump.  Kept apart on purpose: a rising count here means
+ * the poller is not doing its job, and that is not something to discover by
+ * inferring it from the total. */
+static volatile uint32_t g_inline_pumps;
+
+/* How long netd keeps yielding after the wire has gone quiet before it starts
+ * sleeping between pumps.  Yielding keeps latency at a scheduler slice while a
+ * conversation is in flight; the sleep is what stops a waiter with a multi-
+ * second deadline from pinning a core when nothing is coming.  Both disappear
+ * once the NIC interrupt lands and netd can simply block. */
+#define NETD_SPIN_ROUNDS   2048
+#define NETD_IDLE_SLEEP_NS 1000000ull        /* 1 ms                          */
+
+uint32_t net_lock(void)              { return waitq_lock(&g_netwq); }
+void     net_unlock(uint32_t flags)  { waitq_unlock(&g_netwq, flags); }
+
+/* Pump every device once.  Caller holds the stack lock.  Returns the number of
+ * frames that reached net_rx during this round. */
+static uint32_t net_pump_locked(void) {
+    uint32_t before = g_rx_frames;
+    g_pump_count++;
+    for (struct net_device* n = g_head; n; n = n->next)
+        if (n->poll) n->poll(n);
+    return g_rx_frames - before;
+}
+
+/* One pump for a caller that will NOT wait (a non-blocking recv).  This exists
+ * so that "give the device one chance" stays a stack operation instead of a
+ * bare dev->poll() in another file — that bare call was the second poller. */
+void net_pump_once(void) {
+    uint32_t f = net_lock();
+    g_inline_pumps++;
+    uint32_t got = net_pump_locked();
+    if (got) waitq_wake_all(&g_netwq);
+    net_unlock(f);
+}
+
+/* The deadline half of a wait.  Runs in interrupt context (ktimer's contract),
+ * so it does the one safe thing: take the queue lock and wake.  Taking the lock
+ * is not overhead here — it is what closes the window against a task that has
+ * checked its deadline but not yet parked. */
+static void net_deadline_fired(struct ktimer* t) {
+    struct waitq* wq = (struct waitq*)t->arg;
+    uint32_t f = waitq_lock(wq);
+    waitq_wake_all(wq);
+    waitq_unlock(wq, f);
+}
+
+static void netd_main(void);
+
+/* Start the poller on first use.  A box with no NIC, or one whose network is
+ * never touched, never pays for the task at all. */
+static void netd_ensure(void) {
+    if (__atomic_load_n(&g_netd_spawned, __ATOMIC_ACQUIRE)) return;
+    if (__atomic_exchange_n(&g_netd_spawned, 1, __ATOMIC_ACQ_REL)) return;
+    struct task* t = task_spawn_detached("netd", netd_main);
+    if (!t) {
+        /* Spawning failed — fall back to pumping from the waiter, which is the
+         * old model.  Slower and CPU-hungry, but the network keeps working;
+         * silently having no poller at all would hang every wait instead. */
+        __atomic_store_n(&g_netd_spawned, 0, __ATOMIC_RELEASE);
+        kprintf("netd: could not start poller, falling back to in-line polling\n");
+    }
+}
+
+static void net_wait_begin(void) {
+    netd_ensure();
+    uint32_t f = waitq_lock(&g_netdwq);
+    g_waiters++;
+    waitq_wake_all(&g_netdwq);
+    waitq_unlock(&g_netdwq, f);
+}
+
+static void net_wait_end(void) {
+    uint32_t f = waitq_lock(&g_netdwq);
+    if (g_waiters > 0) g_waiters--;
+    waitq_unlock(&g_netdwq, f);
+}
+
+/* Wait until `cond` reports true or `timeout_ms` elapses.  `cond` is evaluated
+ * WITH THE STACK LOCK HELD — it may read stack state freely and must not take
+ * the lock itself or block.  Returns 1 if the condition became true. */
+int net_wait_cond(int (*cond)(void*), void* arg, uint32_t timeout_ms) {
+    if (!cond) return 0;
+
+    /* Fast path: already true.  Worth having because most sends find the ARP
+     * entry cached, and starting a timer + waking netd for that would cost more
+     * than the lookup it is protecting. */
+    uint32_t f0 = net_lock();
+    int done = cond(arg);
+    net_unlock(f0);
+    if (done) return 1;
+
+    uint64_t deadline = timer_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+    struct ktimer t = { 0, 0, 0, 0, 0 };
+    ktimer_arm(&t, deadline, net_deadline_fired, &g_netwq);
+
+    net_wait_begin();
+
+    int ok = 0;
+    uint32_t f = net_lock();
+    for (;;) {
+        if (cond(arg))                  { ok = 1; break; }
+        if (timer_now_ns() >= deadline) break;
+        if (task_should_stop())         break;   /* a kill must not wait out a
+                                                  * multi-second timeout       */
+        if (__atomic_load_n(&g_netd_running, __ATOMIC_ACQUIRE)) {
+            waitq_block(&g_netwq);
+        } else {
+            /* No poller yet (see netd_ensure) — pump here so the wait can still
+             * make progress.  DROP THE LOCK AND YIELD each round: staying in
+             * this loop with the lock held and interrupts off would starve the
+             * very task we are waiting for the scheduler to start, which turns
+             * a brief fallback into a permanent one. */
+            g_inline_pumps++;
+            if (net_pump_locked()) waitq_wake_all(&g_netwq);
+            net_unlock(f);
+            task_yield();
+            f = net_lock();
+        }
+    }
+    net_unlock(f);
+
+    net_wait_end();
+    /* Cancel unconditionally: on the normal path it has already fired
+     * (harmless), on the timeout path it has not — and its callback would
+     * otherwise reference a queue this frame is about to leave. */
+    ktimer_cancel(&t);
+    return ok;
+}
+
+static void netd_main(void) {
+    __atomic_store_n(&g_netd_running, 1, __ATOMIC_RELEASE);
+    uint32_t quiet = 0;
+
+    for (;;) {
+        /* Park until somebody wants packets.  This is the whole reason an idle
+         * box costs nothing: with no waiters netd is off every runqueue. */
+        uint32_t f = waitq_lock(&g_netdwq);
+        int parked = 0;
+        while (!g_waiters && !task_should_stop()) { parked = 1; waitq_block(&g_netdwq); }
+        waitq_unlock(&g_netdwq, f);
+        if (task_should_stop()) break;
+        /* A fresh waiter deserves the fast path.  Without this reset the
+         * counter left over from the last conversation's tail would put the
+         * very first pump of the next one straight into the sleep. */
+        if (parked) quiet = 0;
+
+        uint32_t lf  = net_lock();
+        uint32_t got = net_pump_locked();
+        if (got) waitq_wake_all(&g_netwq);
+        net_unlock(lf);
+
+        if (got) { quiet = 0; task_yield(); }
+        else if (++quiet < NETD_SPIN_ROUNDS) task_yield();
+        else {
+            quiet = NETD_SPIN_ROUNDS;            /* don't wrap the counter */
+            task_sleep_until_ns(timer_now_ns() + NETD_IDLE_SLEEP_NS);
+        }
+    }
+    __atomic_store_n(&g_netd_running, 0, __ATOMIC_RELEASE);
+}
+
+void net_poller_stats(uint32_t* pumps, uint32_t* inline_pumps, uint32_t* frames,
+                      int* waiters, int* running) {
+    if (pumps)        *pumps        = g_pump_count;
+    if (inline_pumps) *inline_pumps = g_inline_pumps;
+    if (frames)       *frames       = g_rx_frames;
+    if (waiters) *waiters = g_waiters;
+    if (running) *running = g_netd_running;
 }
 
 /* ----------------------- L2 transmit -------------------------------------- */
 
-/* Single-task poll model → a static assembly buffer is safe (no reentrancy). */
+/* Assembly buffer for outgoing frames.  Safe as a static because every emit
+ * path holds the stack lock — that is what replaced the old "single task, so no
+ * reentrancy" argument, which stopped being true the moment netd could send an
+ * ACK while a task sent a request. */
 static uint8_t g_txframe[ETH_FRAME_MAX];
 
-static int eth_send(struct net_device* dev, const uint8_t* dst_mac,
-                    uint16_t ethertype, const void* payload, uint32_t len) {
+static int eth_send_locked(struct net_device* dev, const uint8_t* dst_mac,
+                           uint16_t ethertype, const void* payload, uint32_t len) {
     if (len > ETH_MTU) return -1;
     struct eth_hdr* eh = (struct eth_hdr*)g_txframe;
     mac_copy(eh->dst, dst_mac);
@@ -193,6 +458,14 @@ static int eth_send(struct net_device* dev, const uint8_t* dst_mac,
     for (uint32_t i = 0; i < len; i++) g_txframe[ETH_HLEN + i] = p[i];
     return dev->transmit(dev, g_txframe, ETH_HLEN + len);
 }
+
+/* Assemble an IPv4 packet and hand it to `via_mac`.  Caller holds the stack
+ * lock and has ALREADY decided the next hop — which is what lets the RX path
+ * generate replies without ever performing a lookup.  Defined with the rest of
+ * IPv4 at the bottom of the file. */
+static int ipv4_emit_locked(struct net_device* dev, const uint8_t* via_mac,
+                            uint32_t dst_ip, uint8_t proto,
+                            const void* payload, uint32_t len);
 
 /* ----------------------- ARP ---------------------------------------------- */
 
@@ -217,8 +490,8 @@ static int arp_cache_get(uint32_t ip, uint8_t* mac) {
     return -1;
 }
 
-static void arp_send(struct net_device* dev, uint16_t oper,
-                     const uint8_t* target_mac, uint32_t target_ip) {
+static void arp_send_locked(struct net_device* dev, uint16_t oper,
+                            const uint8_t* target_mac, uint32_t target_ip) {
     struct arp_pkt a;
     a.htype = htons(1);
     a.ptype = htons(ETHERTYPE_IPV4);
@@ -230,7 +503,7 @@ static void arp_send(struct net_device* dev, uint16_t oper,
     mac_copy(a.tha, target_mac);
     ip_to_octets(target_ip, a.tpa);
     const uint8_t* dst = (oper == ARP_OP_REQUEST) ? BCAST_MAC : target_mac;
-    eth_send(dev, dst, ETHERTYPE_ARP, &a, sizeof(a));
+    eth_send_locked(dev, dst, ETHERTYPE_ARP, &a, sizeof(a));
 }
 
 static void arp_input(struct net_device* dev, const uint8_t* p, uint32_t len) {
@@ -245,23 +518,49 @@ static void arp_input(struct net_device* dev, const uint8_t* p, uint32_t len) {
     arp_cache_put(spa, a->sha);
 
     if (ntohs(a->oper) == ARP_OP_REQUEST && tpa == dev->ip) {
-        /* Somebody wants our MAC → reply to the sender. */
-        arp_send(dev, ARP_OP_REPLY, a->sha, spa);
+        /* Somebody wants our MAC → reply to the sender.  We already hold the
+         * stack lock (we are inside net_rx) and the target MAC is right there
+         * in the request, so this needs no lookup and cannot block. */
+        arp_send_locked(dev, ARP_OP_REPLY, a->sha, spa);
     }
 }
 
+/* Timeouts, in milliseconds and therefore meaning the same thing on every
+ * machine — see defect 3 in the file header. */
+#define ARP_TIMEOUT_MS      1000
+#define ARP_ATTEMPTS        3
+
+struct arp_wait { uint32_t ip; uint8_t* mac; };
+static int arp_cond(void* a) {                  /* evaluated under the lock */
+    struct arp_wait* w = (struct arp_wait*)a;
+    return arp_cache_get(w->ip, w->mac) == 0;
+}
+
+/* MUST NOT be called with the stack lock held — it waits for a reply. */
 int net_arp_resolve(struct net_device* dev, uint32_t ip, uint8_t mac_out[ETH_ALEN]) {
-    if (arp_cache_get(ip, mac_out) == 0) return 0;
-    /* Fire a request, then poll the RX ring until the reply lands. */
-    for (int attempt = 0; attempt < 3; attempt++) {
-        arp_send(dev, ARP_OP_REQUEST, BCAST_MAC, ip);
-        for (uint32_t spins = 0; spins < 20000000u; spins++) {
-            if (dev->poll) dev->poll(dev);
-            if (arp_cache_get(ip, mac_out) == 0) return 0;
-            hal_cpu_pause();
-        }
+    struct arp_wait w = { ip, mac_out };
+
+    uint32_t f = net_lock();
+    int hit = arp_cache_get(ip, mac_out) == 0;
+    net_unlock(f);
+    if (hit) return 0;
+
+    for (int attempt = 0; attempt < ARP_ATTEMPTS; attempt++) {
+        uint32_t rf = net_lock();
+        arp_send_locked(dev, ARP_OP_REQUEST, BCAST_MAC, ip);
+        net_unlock(rf);
+        if (net_wait_cond(arp_cond, &w, ARP_TIMEOUT_MS)) return 0;
     }
     return -1;
+}
+
+/* Pick the next hop for `dst_ip` and resolve its MAC: the destination itself if
+ * it is on our subnet, otherwise the gateway.  Blocks, so like net_arp_resolve
+ * it must be called WITHOUT the stack lock. */
+static int route_mac(struct net_device* dev, uint32_t dst_ip, uint8_t mac[ETH_ALEN]) {
+    uint32_t nexthop = ((dst_ip & dev->netmask) == (dev->ip & dev->netmask))
+                     ? dst_ip : dev->gateway;
+    return net_arp_resolve(dev, nexthop, mac);
 }
 
 /* ----------------------- ICMP --------------------------------------------- */
@@ -272,14 +571,16 @@ static volatile uint16_t g_ping_id      = 0;
 static volatile uint16_t g_ping_got_seq = 0;
 static volatile int      g_ping_replied = 0;
 
-static void icmp_input(struct net_device* dev, uint32_t src_ip,
-                       const uint8_t* p, uint32_t len) {
+static void icmp_input(struct net_device* dev, const uint8_t* src_mac,
+                       uint32_t src_ip, const uint8_t* p, uint32_t len) {
     if (len < sizeof(struct icmp_hdr)) return;
     const struct icmp_hdr* ic = (const struct icmp_hdr*)p;
 
     if (ic->type == ICMP_ECHO_REQUEST) {
         /* Someone is pinging us → echo it straight back (swap type, keep
-         * id/seq/payload, recompute checksum). */
+         * id/seq/payload, recompute checksum).  Straight back means literally
+         * that: to the MAC the request arrived from, so this reply costs no
+         * lookup and — the part that matters here — cannot block. */
         static uint8_t reply[ETH_MTU];
         if (len > sizeof(reply)) return;
         for (uint32_t i = 0; i < len; i++) reply[i] = p[i];
@@ -287,13 +588,23 @@ static void icmp_input(struct net_device* dev, uint32_t src_ip,
         r->type = ICMP_ECHO_REPLY;
         r->checksum = 0;
         r->checksum = net_checksum(reply, len);
-        net_ipv4_send(dev, src_ip, IP_PROTO_ICMP, reply, len);
+        ipv4_emit_locked(dev, src_mac, src_ip, IP_PROTO_ICMP, reply, len);
     } else if (ic->type == ICMP_ECHO_REPLY) {
         if (g_ping_active && ntohs(ic->id) == g_ping_id) {
             g_ping_got_seq = ntohs(ic->seq);
             g_ping_replied = 1;
         }
     }
+}
+
+#define PING_TIMEOUT_MS 1000
+
+/* The awaited condition: the reply we are actually waiting for.  Matching the
+ * sequence number matters — a late reply to the PREVIOUS request would
+ * otherwise satisfy this one and report a round trip that never happened. */
+static int ping_cond(void* a) {
+    uint16_t seq = *(uint16_t*)a;
+    return g_ping_replied && g_ping_got_seq == seq;
 }
 
 int net_ping(struct net_device* dev, uint32_t ip, int count) {
@@ -315,23 +626,21 @@ int net_ping(struct net_device* dev, uint32_t ip, int count) {
         for (int i = 0; i < 8; i++) msg[sizeof(struct icmp_hdr) + i] = 'a' + i;
         ic->checksum = net_checksum(msg, sizeof(msg));
 
+        uint32_t f = net_lock();
         g_ping_replied = 0;
         g_ping_active  = 1;
+        net_unlock(f);
 
         if (net_ipv4_send(dev, ip, IP_PROTO_ICMP, msg, sizeof(msg)) != 0) {
             kprintf("  seq=%d: send failed (ARP?)\n", seq);
-            g_ping_active = 0;
+            f = net_lock(); g_ping_active = 0; net_unlock(f);
             continue;
         }
 
-        /* Poll for the reply, bounded. */
-        int got = 0;
-        for (uint32_t spins = 0; spins < 20000000u; spins++) {
-            if (dev->poll) dev->poll(dev);
-            if (g_ping_replied && g_ping_got_seq == (uint16_t)seq) { got = 1; break; }
-            hal_cpu_pause();
-        }
-        g_ping_active = 0;
+        uint16_t want = (uint16_t)seq;
+        int got = net_wait_cond(ping_cond, &want, PING_TIMEOUT_MS);
+
+        f = net_lock(); g_ping_active = 0; net_unlock(f);
 
         if (got) { kprintf("  reply from %s: seq=%d\n", ipb, seq); received++; }
         else     { kprintf("  seq=%d: timeout\n", seq); }
@@ -349,17 +658,30 @@ int net_ping(struct net_device* dev, uint32_t ip, int count) {
 struct udp_binding { uint16_t port; udp_recv_fn fn; void* ctx; int used; };
 static struct udp_binding g_udp[UDP_BINDINGS];
 
+/* The binding table is read from the RX path (under the lock) and written from
+ * task context, so bind/unbind take the lock too. */
 int net_udp_bind(uint16_t port, udp_recv_fn fn, void* ctx) {
     if (!fn) { net_udp_unbind(port); return 0; }
+    int rc = -1;
+    uint32_t f = net_lock();
     for (int i = 0; i < UDP_BINDINGS; i++)
-        if (g_udp[i].used && g_udp[i].port == port) { g_udp[i].fn = fn; g_udp[i].ctx = ctx; return 0; }
+        if (g_udp[i].used && g_udp[i].port == port) {
+            g_udp[i].fn = fn; g_udp[i].ctx = ctx; rc = 0; goto out;
+        }
     for (int i = 0; i < UDP_BINDINGS; i++)
-        if (!g_udp[i].used) { g_udp[i].used = 1; g_udp[i].port = port; g_udp[i].fn = fn; g_udp[i].ctx = ctx; return 0; }
-    return -1;
+        if (!g_udp[i].used) {
+            g_udp[i].used = 1; g_udp[i].port = port;
+            g_udp[i].fn = fn; g_udp[i].ctx = ctx; rc = 0; goto out;
+        }
+out:
+    net_unlock(f);
+    return rc;
 }
 void net_udp_unbind(uint16_t port) {
+    uint32_t f = net_lock();
     for (int i = 0; i < UDP_BINDINGS; i++)
         if (g_udp[i].used && g_udp[i].port == port) g_udp[i].used = 0;
+    net_unlock(f);
 }
 
 int net_udp_send(struct net_device* dev, uint32_t dst_ip,
@@ -368,6 +690,12 @@ int net_udp_send(struct net_device* dev, uint32_t dst_ip,
     static uint8_t buf[ETH_MTU];
     uint32_t total = sizeof(struct udp_hdr) + len;
     if (total > sizeof(buf)) return -1;
+
+    /* Resolve first, unlocked — this is the one part that may block. */
+    uint8_t mac[ETH_ALEN];
+    if (route_mac(dev, dst_ip, mac) != 0) return -2;
+
+    uint32_t f = net_lock();
     struct udp_hdr* uh = (struct udp_hdr*)buf;
     uh->src_port = htons(src_port);
     uh->dst_port = htons(dst_port);
@@ -375,7 +703,9 @@ int net_udp_send(struct net_device* dev, uint32_t dst_ip,
     uh->checksum = 0;                          /* omitted (legal for IPv4)   */
     const uint8_t* p = (const uint8_t*)payload;
     for (uint32_t i = 0; i < len; i++) buf[sizeof(struct udp_hdr) + i] = p[i];
-    return net_ipv4_send(dev, dst_ip, IP_PROTO_UDP, buf, total);
+    int rc = ipv4_emit_locked(dev, mac, dst_ip, IP_PROTO_UDP, buf, total);
+    net_unlock(f);
+    return rc;
 }
 
 static void udp_input(struct net_device* dev, uint32_t src_ip,
@@ -471,6 +801,10 @@ static void dns_recv(uint32_t src_ip, uint16_t src_port,
     g_dns.done = 1;                            /* answered, but no A record    */
 }
 
+#define DNS_TIMEOUT_MS 3000
+
+static int dns_cond(void* a) { (void)a; return g_dns.done; }
+
 int net_dns_query(struct net_device* dev, const char* hostname, uint32_t* out_ip) {
     /* Build the DNS query packet. */
     uint8_t q[512];
@@ -484,7 +818,9 @@ int net_dns_query(struct net_device* dev, const char* hostname, uint32_t* out_ip
     q[off++] = 0x00; q[off++] = 0x01;          /* qtype  = A                  */
     q[off++] = 0x00; q[off++] = 0x01;          /* qclass = IN                 */
 
+    uint32_t f = net_lock();
     g_dns.done = 0; g_dns.ok = 0; g_dns.ip = 0;
+    net_unlock(f);
     net_udp_bind(DNS_LOCAL_PORT, dns_recv, NULL);
 
     if (net_udp_send(dev, DNS_SERVER, DNS_LOCAL_PORT, DNS_PORT, q, off) != 0) {
@@ -493,11 +829,7 @@ int net_dns_query(struct net_device* dev, const char* hostname, uint32_t* out_ip
     }
 
     int rc = -1;
-    for (uint32_t spins = 0; spins < 30000000u; spins++) {
-        if (dev->poll) dev->poll(dev);
-        if (g_dns.done) { rc = g_dns.ok ? 0 : -2; break; }
-        hal_cpu_pause();
-    }
+    if (net_wait_cond(dns_cond, NULL, DNS_TIMEOUT_MS)) rc = g_dns.ok ? 0 : -2;
     net_udp_unbind(DNS_LOCAL_PORT);
     if (rc == 0 && out_ip) *out_ip = g_dns.ip;
     return rc;
@@ -510,6 +842,11 @@ enum { TCP_ST_CLOSED = 0, TCP_ST_SYN_SENT, TCP_ST_ESTABLISHED, TCP_ST_CLOSING };
 static struct {
     int      state;
     uint32_t peer_ip;
+    /* The next hop's MAC, resolved ONCE at connect time.  A connection has a
+     * fixed route for its lifetime, so caching it here is not just an
+     * optimisation: it is what lets tcp_input ACK from the RX path, where
+     * resolving an address would mean blocking with the stack lock held. */
+    uint8_t  peer_mac[ETH_ALEN];
     uint16_t peer_port, local_port;
     uint32_t snd_nxt;                          /* next seq we will send       */
     uint32_t rcv_nxt;                          /* next seq we expect          */
@@ -541,8 +878,8 @@ static uint16_t tcp_checksum(uint32_t src_ip, uint32_t dst_ip,
 
 /* Send a segment with the given flags + optional payload.  SYN and FIN each
  * consume one sequence number — the caller bumps snd_nxt accordingly. */
-static int tcp_send_seg(struct net_device* dev, uint8_t flags,
-                        const void* data, uint32_t len) {
+static int tcp_send_seg_locked(struct net_device* dev, uint8_t flags,
+                               const void* data, uint32_t len) {
     static uint8_t seg[ETH_MTU];
     uint32_t total = sizeof(struct tcp_hdr) + len;
     if (total > sizeof(seg)) return -1;
@@ -559,7 +896,8 @@ static int tcp_send_seg(struct net_device* dev, uint8_t flags,
     const uint8_t* p = (const uint8_t*)data;
     for (uint32_t i = 0; i < len; i++) seg[sizeof(struct tcp_hdr) + i] = p[i];
     th->checksum = tcp_checksum(dev->ip, g_tcp.peer_ip, seg, total);
-    return net_ipv4_send(dev, g_tcp.peer_ip, IP_PROTO_TCP, seg, total);
+    return ipv4_emit_locked(dev, g_tcp.peer_mac, g_tcp.peer_ip,
+                            IP_PROTO_TCP, seg, total);
 }
 
 static void tcp_input(struct net_device* dev, uint32_t src_ip,
@@ -587,7 +925,7 @@ static void tcp_input(struct net_device* dev, uint32_t src_ip,
             g_tcp.rcv_nxt = their_seq + 1;     /* their SYN consumes a seq    */
             g_tcp.state = TCP_ST_ESTABLISHED;
             g_tcp.established = 1;
-            tcp_send_seg(dev, TCP_ACK, NULL, 0);   /* finish the handshake     */
+            tcp_send_seg_locked(dev, TCP_ACK, NULL, 0);   /* finish the handshake     */
         }
         return;
     }
@@ -597,55 +935,84 @@ static void tcp_input(struct net_device* dev, uint32_t src_ip,
         for (uint32_t i = 0; i < dlen && g_tcp_rxlen < TCP_RX_CAP; i++)
             g_tcp_rx[g_tcp_rxlen++] = data[i];
         g_tcp.rcv_nxt += dlen;
-        tcp_send_seg(dev, TCP_ACK, NULL, 0);
+        tcp_send_seg_locked(dev, TCP_ACK, NULL, 0);
     } else if (dlen > 0) {
         /* Duplicate / out-of-order — re-ACK what we have. */
-        tcp_send_seg(dev, TCP_ACK, NULL, 0);
+        tcp_send_seg_locked(dev, TCP_ACK, NULL, 0);
     }
 
     if (flags & TCP_FIN) {
         /* FIN occupies the seq right after its data. */
         if (their_seq + dlen == g_tcp.rcv_nxt) {
             g_tcp.rcv_nxt += 1;
-            tcp_send_seg(dev, TCP_ACK, NULL, 0);
+            tcp_send_seg_locked(dev, TCP_ACK, NULL, 0);
             g_tcp.peer_fin = 1;
             g_tcp.state = TCP_ST_CLOSING;
         }
     }
 }
 
-/* Bounded poll helper: pump RX for up to `spin_budget` iterations or until
- * `*flag` becomes non-zero.  Returns 1 if the flag fired. */
-static int tcp_poll_until(struct net_device* dev, volatile int* flag,
-                          uint32_t spin_budget) {
-    for (uint32_t s = 0; s < spin_budget; s++) {
-        if (dev->poll) dev->poll(dev);
-        if (*flag) return 1;
-        hal_cpu_pause();
-    }
-    return 0;
+/* Timeouts for the connection's phases — real milliseconds (see the file
+ * header on why the old spin budgets were not timeouts). */
+#define TCP_CONNECT_MS   5000
+#define TCP_RECV_MS     10000
+#define TCP_QUIET_MS     2000       /* "no new data for this long" = done      */
+#define TCP_FINWAIT_MS   1000
+
+static int tcp_established_cond(void* a) { (void)a; return g_tcp.established; }
+static int tcp_fin_cond(void* a)         { (void)a; return g_tcp.peer_fin;    }
+static int tcp_readable_cond(void* a) {
+    (void)a;
+    return g_tcp_rxconsumed < g_tcp_rxlen || g_tcp.peer_fin;
 }
 
-int net_http_get(struct net_device* dev, uint32_t ip, uint16_t port,
-                 const char* host, const char* path) {
-    /* Fresh connection state. */
+/* Open the connection: resolve the route, publish fresh state, send the SYN and
+ * wait for the SYN-ACK.  Resolving happens FIRST and unlocked, because it is
+ * the one step that can block; from here on every segment this connection sends
+ * — including the ACKs generated on the RX path — is a pure send. */
+static int tcp_open(struct net_device* dev, uint32_t ip, uint16_t port) {
+    uint8_t mac[ETH_ALEN];
+    if (route_mac(dev, ip, mac) != 0) return -1;
+
+    uint32_t f = net_lock();
     g_tcp.state       = TCP_ST_SYN_SENT;
     g_tcp.peer_ip     = ip;
+    mac_copy(g_tcp.peer_mac, mac);
     g_tcp.peer_port   = port;
     g_tcp.local_port  = 0xE000 + (g_tcp.local_port & 0x0FFF) + 1;  /* vary port */
     g_tcp.snd_nxt     = 0x2000;                /* our ISN                      */
     g_tcp.rcv_nxt     = 0;
-    g_tcp.established  = 0;
-    g_tcp.peer_fin     = 0;
-    g_tcp_rxlen        = 0;
-
-    /* Handshake: SYN → (SYN-ACK) → ACK. */
-    tcp_send_seg(dev, TCP_SYN, NULL, 0);
+    g_tcp.established = 0;
+    g_tcp.peer_fin    = 0;
+    g_tcp_rxlen       = 0;
+    g_tcp_rxconsumed  = 0;
+    tcp_send_seg_locked(dev, TCP_SYN, NULL, 0);
     g_tcp.snd_nxt += 1;                         /* SYN consumes a seq          */
-    if (!tcp_poll_until(dev, &g_tcp.established, 20000000u)) {
+    net_unlock(f);
+
+    if (!net_wait_cond(tcp_established_cond, NULL, TCP_CONNECT_MS)) {
+        f = net_lock(); g_tcp.state = TCP_ST_CLOSED; net_unlock(f);
+        return -1;
+    }
+    return 0;
+}
+
+/* Send our FIN and give the peer a moment to answer.  Shared by the HTTP
+ * helper and the socket API so both close the same way. */
+static void tcp_shutdown(struct net_device* dev) {
+    uint32_t f = net_lock();
+    tcp_send_seg_locked(dev, TCP_FIN | TCP_ACK, NULL, 0);
+    g_tcp.snd_nxt += 1;
+    net_unlock(f);
+    net_wait_cond(tcp_fin_cond, NULL, TCP_FINWAIT_MS);
+    f = net_lock(); g_tcp.state = TCP_ST_CLOSED; net_unlock(f);
+}
+
+int net_http_get(struct net_device* dev, uint32_t ip, uint16_t port,
+                 const char* host, const char* path) {
+    if (tcp_open(dev, ip, port) != 0) {
         kprintf("http: connect to %u.%u.%u.%u:%u timed out\n",
                 (ip>>24)&0xFF,(ip>>16)&0xFF,(ip>>8)&0xFF,ip&0xFF, port);
-        g_tcp.state = TCP_ST_CLOSED;
         return -1;
     }
 
@@ -655,87 +1022,70 @@ int net_http_get(struct net_device* dev, uint32_t ip, uint16_t port,
                             "\r\nConnection: close\r\n\r\n" };
     for (int pi = 0; pi < 5; pi++)
         for (const char* c = parts[pi]; *c && n < (int)sizeof(req) - 1; c++) req[n++] = *c;
-    tcp_send_seg(dev, TCP_PSH | TCP_ACK, req, (uint32_t)n);
+    uint32_t f = net_lock();
+    tcp_send_seg_locked(dev, TCP_PSH | TCP_ACK, req, (uint32_t)n);
     g_tcp.snd_nxt += (uint32_t)n;
+    net_unlock(f);
 
-    /* Drain the response until the peer FINs or we go quiet. */
-    uint32_t last_len = 0, quiet = 0;
-    for (uint32_t s = 0; s < 60000000u; s++) {
-        if (dev->poll) dev->poll(dev);
-        if (g_tcp.peer_fin) break;
-        if (g_tcp_rxlen != last_len) { last_len = g_tcp_rxlen; quiet = 0; }
-        else if (++quiet > 8000000u) break;    /* no new data for a while      */
-        hal_cpu_pause();
+    /* Drain until the peer FINs or the response goes quiet.  "Quiet" is now a
+     * duration rather than a spin count, so each round waits TCP_QUIET_MS and
+     * only gives up if nothing at all arrived in that window. */
+    uint32_t last_len = 0;
+    for (;;) {
+        if (net_wait_cond(tcp_fin_cond, NULL, TCP_QUIET_MS)) break;
+        uint32_t now_len = g_tcp_rxlen;
+        if (now_len == last_len) break;
+        last_len = now_len;
     }
 
-    /* Politely close our side. */
-    tcp_send_seg(dev, TCP_FIN | TCP_ACK, NULL, 0);
-    g_tcp.snd_nxt += 1;
-    tcp_poll_until(dev, &g_tcp.peer_fin, 4000000u);
-    g_tcp.state = TCP_ST_CLOSED;
-
+    tcp_shutdown(dev);
     return (int)g_tcp_rxlen;
 }
 
 /* ---- general TCP client API (M24 socket API) -----------------------------
  * A minimal connect/send/recv/close over the same single-connection g_tcp
  * engine (one TCP socket at a time).  Backs SOCK_STREAM sockets in
- * usyscall.c.  Data is delivered in-order; recv drains the accumulation
- * buffer (blocking-poll until data or peer FIN). */
+ * usyscall.c.  Data is delivered in-order; recv blocks until data arrives or
+ * the peer closes. */
 
 int net_tcp_connect(struct net_device* dev, uint32_t ip, uint16_t port) {
-    g_tcp.state       = TCP_ST_SYN_SENT;
-    g_tcp.peer_ip     = ip;
-    g_tcp.peer_port   = port;
-    g_tcp.local_port  = 0xE000 + (g_tcp.local_port & 0x0FFF) + 1;
-    g_tcp.snd_nxt     = 0x2000;
-    g_tcp.rcv_nxt     = 0;
-    g_tcp.established  = 0;
-    g_tcp.peer_fin     = 0;
-    g_tcp_rxlen        = 0;
-    g_tcp_rxconsumed   = 0;
-
-    tcp_send_seg(dev, TCP_SYN, NULL, 0);
-    g_tcp.snd_nxt += 1;
-    if (!tcp_poll_until(dev, &g_tcp.established, 20000000u)) {
-        g_tcp.state = TCP_ST_CLOSED;
-        return -1;
-    }
-    return 0;
+    return tcp_open(dev, ip, port);
 }
 
 int net_tcp_send(struct net_device* dev, const void* buf, uint32_t len) {
-    if (g_tcp.state != TCP_ST_ESTABLISHED && g_tcp.state != TCP_ST_CLOSING) return -1;
+    uint32_t f = net_lock();
+    if (g_tcp.state != TCP_ST_ESTABLISHED && g_tcp.state != TCP_ST_CLOSING) {
+        net_unlock(f);
+        return -1;
+    }
     /* One segment (callers send small requests; segmentation is a follow-up). */
     if (len > ETH_MTU - 40) len = ETH_MTU - 40;
-    tcp_send_seg(dev, TCP_PSH | TCP_ACK, buf, len);
+    tcp_send_seg_locked(dev, TCP_PSH | TCP_ACK, buf, len);
     g_tcp.snd_nxt += len;
+    net_unlock(f);
     return (int)len;
 }
 
 int net_tcp_recv(struct net_device* dev, void* buf, uint32_t len) {
-    /* Block-poll until unconsumed data is available or the peer closes. */
-    for (uint32_t s = 0; s < 60000000u; s++) {
-        if (g_tcp_rxconsumed < g_tcp_rxlen) break;
-        if (g_tcp.peer_fin) break;
-        if (dev->poll) dev->poll(dev);
-        hal_cpu_pause();
-    }
+    (void)dev;
+    net_wait_cond(tcp_readable_cond, NULL, TCP_RECV_MS);
+
+    /* Drain under the lock: the RX path appends to this very buffer, so the
+     * "how much is there" and the copy have to be one indivisible step. */
+    uint32_t f = net_lock();
     uint32_t avail = g_tcp_rxlen - g_tcp_rxconsumed;
-    if (avail == 0) return 0;                    /* EOF (peer FIN, drained) */
-    uint32_t cnt = avail < len ? avail : len;
-    uint8_t* out = (uint8_t*)buf;
+    uint32_t cnt   = avail < len ? avail : len;
+    uint8_t* out   = (uint8_t*)buf;
     for (uint32_t i = 0; i < cnt; i++) out[i] = g_tcp_rx[g_tcp_rxconsumed + i];
     g_tcp_rxconsumed += cnt;
-    return (int)cnt;
+    net_unlock(f);
+
+    return (int)cnt;                             /* 0 = EOF (peer FIN, drained) */
 }
 
 void net_tcp_close(struct net_device* dev) {
     if (g_tcp.state == TCP_ST_CLOSED) return;
-    tcp_send_seg(dev, TCP_FIN | TCP_ACK, NULL, 0);
-    g_tcp.snd_nxt += 1;
-    tcp_poll_until(dev, &g_tcp.peer_fin, 4000000u);
-    g_tcp.state = TCP_ST_CLOSED;
+    tcp_shutdown(dev);
 }
 
 /* Expose the accumulated response so the shell `wget` command can print it. */
@@ -746,9 +1096,11 @@ const uint8_t* net_http_body(uint32_t* len_out) {
 
 /* ----------------------- IPv4 --------------------------------------------- */
 
-int net_ipv4_send(struct net_device* dev, uint32_t dst_ip, uint8_t proto,
-                  const void* payload, uint32_t len) {
-    /* Assemble [IPv4 header | payload] in a scratch buffer. */
+static int ipv4_emit_locked(struct net_device* dev, const uint8_t* via_mac,
+                            uint32_t dst_ip, uint8_t proto,
+                            const void* payload, uint32_t len) {
+    /* Assemble [IPv4 header | payload] in a scratch buffer.  Static, and safe
+     * because the caller holds the stack lock. */
     static uint8_t pkt[ETH_MTU];
     uint32_t total = sizeof(struct ipv4_hdr) + len;
     if (total > sizeof(pkt)) return -1;
@@ -769,17 +1121,25 @@ int net_ipv4_send(struct net_device* dev, uint32_t dst_ip, uint8_t proto,
     const uint8_t* pl = (const uint8_t*)payload;
     for (uint32_t i = 0; i < len; i++) pkt[sizeof(struct ipv4_hdr) + i] = pl[i];
 
-    /* Next hop: the destination if it is on our subnet, else the gateway. */
-    uint32_t nexthop = ((dst_ip & dev->netmask) == (dev->ip & dev->netmask))
-                     ? dst_ip : dev->gateway;
-
-    uint8_t mac[ETH_ALEN];
-    if (net_arp_resolve(dev, nexthop, mac) != 0) return -2;
-
-    return eth_send(dev, mac, ETHERTYPE_IPV4, pkt, total);
+    return eth_send_locked(dev, via_mac, ETHERTYPE_IPV4, pkt, total);
 }
 
-static void ipv4_input(struct net_device* dev, const uint8_t* p, uint32_t len) {
+/* Task-context send: pick and resolve the next hop, then emit.  MUST NOT be
+ * called with the stack lock held (route_mac blocks) — the RX path uses
+ * ipv4_emit_locked with the source MAC instead. */
+int net_ipv4_send(struct net_device* dev, uint32_t dst_ip, uint8_t proto,
+                  const void* payload, uint32_t len) {
+    uint8_t mac[ETH_ALEN];
+    if (route_mac(dev, dst_ip, mac) != 0) return -2;
+
+    uint32_t f = net_lock();
+    int rc = ipv4_emit_locked(dev, mac, dst_ip, proto, payload, len);
+    net_unlock(f);
+    return rc;
+}
+
+static void ipv4_input(struct net_device* dev, const uint8_t* src_mac,
+                       const uint8_t* p, uint32_t len) {
     if (len < sizeof(struct ipv4_hdr)) return;
     const struct ipv4_hdr* ih = (const struct ipv4_hdr*)p;
     if ((ih->ver_ihl >> 4) != 4) return;
@@ -796,7 +1156,7 @@ static void ipv4_input(struct net_device* dev, const uint8_t* p, uint32_t len) {
     uint32_t l4len = total - ihl;
 
     switch (ih->proto) {
-        case IP_PROTO_ICMP: icmp_input(dev, src, l4, l4len); break;
+        case IP_PROTO_ICMP: icmp_input(dev, src_mac, src, l4, l4len); break;
         case IP_PROTO_UDP:  udp_input (dev, src, l4, l4len); break;
         case IP_PROTO_TCP:  tcp_input (dev, src, l4, l4len); break;
         default: break;
@@ -805,6 +1165,9 @@ static void ipv4_input(struct net_device* dev, const uint8_t* p, uint32_t len) {
 
 /* ----------------------- Ethernet demux (RX entry) ------------------------ */
 
+/* Called by the driver's poll (and, once the NIC interrupt lands, from an ISR)
+ * with the stack lock HELD — see the file header.  Nothing below here may
+ * block; the source MAC is threaded down so replies never need to look one up. */
 void net_rx(struct net_device* dev, const uint8_t* frame, uint32_t len) {
     if (len < ETH_HLEN) { dev->rx_dropped++; return; }
     const struct eth_hdr* eh = (const struct eth_hdr*)frame;
@@ -813,12 +1176,13 @@ void net_rx(struct net_device* dev, const uint8_t* frame, uint32_t len) {
     if (!mac_eq(eh->dst, dev->mac) && !mac_eq(eh->dst, BCAST_MAC)) return;
 
     dev->rx_packets++; dev->rx_bytes += len;
+    g_rx_frames++;                            /* what net_pump_locked counts */
     const uint8_t* payload = frame + ETH_HLEN;
     uint32_t plen = len - ETH_HLEN;
 
     switch (ntohs(eh->ethertype)) {
         case ETHERTYPE_ARP:  arp_input (dev, payload, plen); break;
-        case ETHERTYPE_IPV4: ipv4_input(dev, payload, plen); break;
+        case ETHERTYPE_IPV4: ipv4_input(dev, eh->src, payload, plen); break;
         default: break;
     }
 }

@@ -131,6 +131,7 @@ static void cmd_help(void) {
                   "  wedge (runaway ring-3 task), faulttest (bad user pointers)\n"
                   "  killstorm [rounds] [tasks] (kill blocked tasks under SMP)\n"
                   "  timerfdtest [ms], alarmtest [ms] (timing, M53 stage 3)\n"
+                  "  netstorm [n] (n tasks waiting on the network at once)\n"
                   "  fputest (per-task FP/SIMD register file)\n"
                   "  archtest (ELF arch gate), crash (what has gone wrong)\n"
                   "  pane, pane split horizontal|vertical\n"
@@ -1682,6 +1683,105 @@ static void cmd_wget(const char* args) {
     for (uint32_t i = 0; i < show; i++) console_putchar((char)body[i]);
     if (show < blen) kprintf("\n... [%u bytes total]\n", blen);
     else             kprintf("\n[%u bytes]\n", blen);
+}
+
+/* -------------------------------------------------------------------- */
+/* §M55 — `netstorm [n]`: prove that N tasks can wait for the network at  */
+/* the same time, and that waiting is FREE.                              */
+/*                                                                       */
+/* The old stack could not do this even in principle: every waiter drove */
+/* dev->poll() itself, so N waiters were N tasks mutating one RX ring     */
+/* while each burned a CPU.  It survived only because nothing ever waited */
+/* on two things at once — which is a statement about the workload, not   */
+/* about the code.                                                       */
+/*                                                                       */
+/* Each probe asks for an address nothing will answer for, so it really   */
+/* has to WAIT — a cache hit would prove nothing.  Every probe therefore  */
+/* takes ARP_ATTEMPTS × ARP_TIMEOUT_MS ≈ 3 s, and the measurement is the  */
+/* elapsed time: ~3 s means they waited in PARALLEL, ~3 s × n would mean  */
+/* they had serialised behind each other.  The peak waiter count and the  */
+/* per-CPU busy figure from `sched` say the rest.                        */
+/* -------------------------------------------------------------------- */
+
+static volatile int g_nst_idx, g_nst_done;
+
+static void netstorm_probe(void) {
+    int i = __atomic_fetch_add(&g_nst_idx, 1, __ATOMIC_ACQ_REL);
+    struct net_device* dev = net_primary();
+    if (dev) {
+        uint8_t mac[6];
+        /* Distinct unassigned addresses on our own subnet: on-link, so this
+         * really does emit an ARP request and really does wait for a reply
+         * that is never coming. */
+        net_arp_resolve(dev, IPV4(10, 0, 2, 200) + (uint32_t)(i & 31), mac);
+    }
+    __atomic_add_fetch(&g_nst_done, 1, __ATOMIC_ACQ_REL);
+}
+
+static void cmd_netstorm(const char* args) {
+    int n = 0;
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) n = n * 10 + (*args - '0');
+    if (n <= 0) n = 6;
+    if (n > 16) n = 16;
+
+    if (!net_primary()) { console_write("netstorm: no net device\n"); return; }
+
+    __atomic_store_n(&g_nst_idx, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_nst_done, 0, __ATOMIC_RELEASE);
+
+    /* Sample aggregate CPU-busy across the storm.  This is the claim that
+     * matters — "waiting for the network is free" — and asserting it without
+     * measuring it is exactly the kind of comment §M52 was about. */
+    int ncpu = smp_ncpus(); if (ncpu > 32) ncpu = 32;
+    uint64_t busy0 = 0;
+    for (int i = 0; i < ncpu; i++) {
+        struct percpu* p = percpu_at(i);
+        if (p) busy0 += p->busy_ms;
+    }
+    uint32_t pumps0 = 0;
+    net_poller_stats(&pumps0, NULL, NULL, NULL, NULL);
+
+    uint64_t t0 = timer_ticks_ms();
+    int spawned = 0;
+    for (int i = 0; i < n; i++)
+        if (task_spawn_detached("net-probe", netstorm_probe)) spawned++;
+    kprintf("netstorm: %d probe(s) waiting on unanswerable addresses...\n", spawned);
+
+    /* Watch from the shell — which is NOT one of the waiters, so it can still
+     * report if they all wedge (the killstorm lesson: a test that hangs with
+     * the thing it tests reports nothing). */
+    int peak = 0;
+    for (int ms = 0; ms < 20000; ms += 50) {
+        int w = 0;
+        net_poller_stats(NULL, NULL, NULL, &w, NULL);
+        if (w > peak) peak = w;
+        if (__atomic_load_n(&g_nst_done, __ATOMIC_ACQUIRE) >= spawned) break;
+        task_msleep(50);
+    }
+    uint64_t elapsed = timer_ticks_ms() - t0;
+    int done = __atomic_load_n(&g_nst_done, __ATOMIC_ACQUIRE);
+
+    uint64_t busy1 = 0;
+    for (int i = 0; i < ncpu; i++) {
+        struct percpu* p = percpu_at(i);
+        if (p) busy1 += p->busy_ms;
+    }
+    uint64_t db  = busy1 > busy0 ? busy1 - busy0 : 0;
+    uint32_t pct = elapsed ? (uint32_t)((db * 100) / (elapsed * (uint64_t)ncpu)) : 0;
+
+    uint32_t pumps1 = 0;
+    net_poller_stats(&pumps1, NULL, NULL, NULL, NULL);
+
+    kprintf("netstorm: %d/%d finished in %u ms, peak waiters %d, "
+            "%u%% of %d CPUs busy while waiting, %u pumps\n",
+            done, spawned, (uint32_t)elapsed, peak, pct, ncpu, pumps1 - pumps0);
+    if (done < spawned)
+        console_write("netstorm: FAIL (a probe never returned)\n");
+    else if (peak < 2 && spawned > 1)
+        console_write("netstorm: FAIL (never more than one waiter — serialised)\n");
+    else
+        console_write("netstorm: PASS (concurrent waiters, one poller)\n");
 }
 
 /* `nettest` — self-contained §M24 check: ARP + ping the SLIRP gateway (§M24.1),
@@ -3432,6 +3532,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "netsurf"))        { cmd_netsurf(""); return; }
     if (starts_with(line, "netsurf ")) { cmd_netsurf(line + 8); return; }
     if (streq(line, "nettest"))        { cmd_nettest();  return; }
+    if (streq(line, "netstorm"))       { cmd_netstorm(""); return; }
+    if (starts_with(line, "netstorm ")) { cmd_netstorm(line + 9); return; }
     if (streq(line, "lsaudio"))        { audio_list();   return; }
     if (streq(line, "beep"))           { cmd_beep();     return; }
     if (starts_with(line, "tone "))    { cmd_tone(line + 5); return; }

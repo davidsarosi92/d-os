@@ -17,11 +17,13 @@
  * boundary with htons/htonl.  Keeping the API host-order means callers write
  * `net_parse_ip("10.0.2.2", &ip)` and never juggle endianness.
  *
- * Concurrency: §M24.1 drives RX by *polling from the calling task* (no IRQ,
- * no background thread) — so ARP/ping run entirely in one task context and
- * need no locking.  IRQ-driven RX + a `netd` poll task are a follow-up
- * (§M24 stage note); the interface below is already shaped for it (a driver
- * may fire `net_rx` from an ISR once that lands).
+ * Concurrency (§M55): ONE poller task (`netd`) is the only caller of
+ * `dev->poll`, and every other task BLOCKS on the stack's wait queue until the
+ * state it cares about changes or a real deadline passes.  `net_rx` and
+ * everything under it run with the stack lock held and must never block.  The
+ * full rationale — and the rule about `_locked` vs unlocked send helpers — is
+ * in net.c's header.  A driver may fire `net_rx` from an ISR once the NIC
+ * interrupt lands; it must take the stack lock to do so.
  * ============================================================================= */
 
 #ifndef NET_H
@@ -96,6 +98,34 @@ void net_list(void);                          /* backs the `lsnic` command    */
  * the ARP or IPv4 handler.  `frame` points at the Ethernet header; `len` is
  * the frame length (no virtio/NIC header, no FCS). */
 void net_rx(struct net_device* dev, const uint8_t* frame, uint32_t len);
+
+/* ----------------------- Waiting for the network (§M55) ------------------- */
+
+/* Take / release the stack lock.  A consumer that keeps its own state inside
+ * the stack (a socket's RX ring, say) must hold this while it looks at that
+ * state, because the RX path fills it with the lock held.  Returns the saved
+ * IRQ flags — pass them back verbatim. */
+uint32_t net_lock(void);
+void     net_unlock(uint32_t flags);
+
+/* Block until `cond` reports true or `timeout_ms` elapses; returns 1 if the
+ * condition became true.  `cond` is evaluated WITH THE STACK LOCK HELD, so it
+ * may read stack state freely but must not take the lock or block.  Waiting
+ * here also starts the poller, so a caller never has to think about it. */
+int net_wait_cond(int (*cond)(void* arg), void* arg, uint32_t timeout_ms);
+
+/* Give the device exactly one chance to deliver, for a caller that will NOT
+ * wait (a non-blocking recv).  This exists so "pump once" stays a stack
+ * operation: a bare dev->poll() from another file is a second poller. */
+void net_pump_once(void);
+
+/* Poller counters for `lsnic` — a change to the concurrency model is only
+ * worth making if it can be measured afterwards.  `inline_pumps` counts the
+ * ones NOT driven by netd: it is reported separately because a rising figure
+ * there means the poller is not doing its job, and that should be visible
+ * rather than inferred from a total. */
+void net_poller_stats(uint32_t* pumps, uint32_t* inline_pumps, uint32_t* frames,
+                      int* waiters, int* running);
 
 /* ----------------------- Byte-order helpers ------------------------------- */
 /* x86 is little-endian; network order is big-endian. */

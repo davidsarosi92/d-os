@@ -18,6 +18,53 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M55 — WAITING FOR THE NETWORK WITHOUT SPENDING A CPU ON IT (2026-08-11,
+DOCS §4.56, i386 + x86_64 at -smp 4).**  §M24 drove RX by *polling from the
+calling task*, and net.c's header said so — *"everything runs in one task
+context → no locking"*, true when written.  Three defects follow and they
+compound: (1) **the waiter burned a CPU** — a task waiting for DNS spun with
+`hal_cpu_pause` and never left the runqueue, so *waiting for the network cost
+exactly as much as computing flat out* (§M49 removed the last such polls from
+the console and the reaper; the net stack was the one that got away); (2) **N
+waiters meant N pollers** — `dev->poll` is not reentrant (it advances
+`last_used_idx` and recycles RX buffers), so two waiters were two tasks mutating
+one ring, surviving only because nothing ever waited on two sockets at once —
+*a statement about the workload, not the code*; (3) **a spin count is not a
+timeout** — `20000000u` means a different duration on every machine and arch,
+and is exactly how musl's resolver hung "for minutes" on emulated i386.  NOW:
+ONE poller task (**`netd`**) is the only caller of `dev->poll`, everyone else
+BLOCKS on the stack waitq until their condition holds or a REAL millisecond
+deadline (§M53's clock + a per-wait `ktimer`) passes; **netd runs exactly while
+somebody is waiting and is fully blocked otherwise** — on a box that never
+touches the network the task does not exist (`lsnic`: `netd: not started`).
+The waitq's lock IS the stack lock (waitq's own contract), so `net_rx` and
+everything below runs with it HELD — **whence the rule that reshaped the file:
+the RX path may never resolve an ARP entry.**  Replies now go back to the MAC
+the frame CAME FROM (the correct next hop by construction, on-link or routed,
+and cheaper — *a TCP ACK has no business doing an address lookup*), via a
+`via_mac` argument and `_locked` (assemble+transmit) vs unlocked (resolve, then
+emit) send helpers; a TCP connection resolves its peer's MAC ONCE at connect.
+**NEW `netstorm [n]`** — n tasks ARP for different unanswerable addresses, so
+each really waits: **8 and 16 concurrent waiters both finish in ~3.4 s at 2–3%
+of 4 CPUs**, and the elapsed time is falsifiable (serialised would be 3 s × n).
+**A NUMBER THAT DID NOT ADD UP FOUND A REAL BUG:** first storm on a fresh boot
+143115 pumps, second (identical work) 4463 — `net_wait_cond`'s
+poller-not-up-yet fallback looped **with the stack lock held and interrupts
+off**, so it could not be preempted and starved the very task whose arrival
+would end it.  Dropping the lock + yielding each round: **4047 pumps, 2 inline**.
+The inline count is now separate in `lsnic` — *a rising figure there means the
+poller is not doing its job, and that should be visible rather than inferred*.
+**Two process lessons:** I nearly skipped that measurement because the number
+merely looked large; and the build behind the first explanation had **FAILED** —
+an `error:` slipped past my output filter and I read a stale ISO (§M51 again:
+*check the exit status, not the output*).  **OPEN:** the NIC interrupt (turns
+netd's yield loop into a block — it had to come SECOND or the ISR and the
+spinning waiters would have been two pollers on one virtqueue); `vnet_poll`
+notifies the device even on an empty pump (one pointless VM exit per pump); the
+stack is still single-instance above the transport (one ping, one DNS query, one
+TCP connection) — §M55 makes concurrency SAFE, not multi-connection; `epoll` and
+non-blocking file I/O are next.
+
 ✅ **§M54 — A TASK THE SCHEDULER WAS STILL STANDING ON (2026-08-10, DOCS §4.54,
 all 3 arches).**  Reported as *"open NetSurf, a crash report comes up, close it,
 open it again — the machine dies"*; §M47's NVRAM breadcrumb had already written
