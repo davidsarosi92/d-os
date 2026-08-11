@@ -120,6 +120,8 @@ extern const unsigned char _binary_user_pipetest_elf_start[] __attribute__((weak
 extern const unsigned char _binary_user_pipetest_elf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_sigtest_elf_start[]  __attribute__((weak));
 extern const unsigned char _binary_user_sigtest_elf_end[]    __attribute__((weak));
+extern const unsigned char _binary_user_epollmusl_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_epollmusl_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_muslhello_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_muslhello_muslelf_end[]   __attribute__((weak));
 
@@ -348,6 +350,23 @@ static void cmd_musltest(void) {
     kprintf("musltest: returned rc=%d\n", rc);
 }
 
+/* §M56 — the arm64 half of the epoll ABI proof, and the interesting half:
+ * this is the arch where `struct epoll_event` is 16 bytes rather than 12,
+ * because Linux packs it on x86_64 only.  A kernel that derived the size from
+ * the word width would pass on i386, pass on amd64, and fail exactly here. */
+static void cmd_epollmusltest(void) {
+    const unsigned char* a = _binary_user_epollmusl_muslelf_start;
+    const unsigned char* b = _binary_user_epollmusl_muslelf_end;
+    if (!a || !b) { kprintf("epollmusl: not embedded for this arch\n"); return; }
+    kprintf("epollmusl: exec'ing a REAL musl binary (Linux/arm64 personality)...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(a, (unsigned long)(b - a));
+    if (me) me->linux_abi = prev;
+    kprintf("epollmusl: returned rc=%d\n", rc);
+}
+
 static void cmd_meminfo(void) {
     uint32_t managed = pmm_managed_frames();
     uint32_t freef   = pmm_free_frames();
@@ -508,6 +527,7 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "pipetest")) cmd_pipetest();
         else if (s_eq(cmd, "sigtest"))  cmd_sigtest();
         else if (s_eq(cmd, "musltest")) cmd_musltest();
+        else if (s_eq(cmd, "epollmusltest")) cmd_epollmusltest();
         else if (s_eq(cmd, "pkgrun"))   cmd_pkgrun(args);
         else if (s_eq(cmd, "pkg"))      cmd_pkg(args);
         else if (s_eq(cmd, "clear"))  kprintf("\033[2J\033[H");

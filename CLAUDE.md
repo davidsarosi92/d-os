@@ -18,6 +18,50 @@ shell panes (Alt-N to focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M56 — A WAIT THAT IS REALLY A WAIT (2026-08-11, DOCS §4.57, all 3
+arches).**  **`poll(2)` with a positive timeout was treated as a SNAPSHOT** —
+documented as such, which made it sound conservative.  It is not: a program
+asking to wait 200 ms got an immediate 0, so **every correct event loop written
+against it became a busy loop** (do the right thing, see nothing, ask again,
+forever).  *A timeout that returns early is not a safe approximation of one that
+waits; it is a different function.*  It now arms a `ktimer` and blocks like
+every other wait §M53 and §M55 built.  **ONE definition of readiness**
+(`fd_readiness`, shared by poll and epoll) replaced two, and extracting it
+immediately exposed two bugs in `poll_snapshot`'s fall-through: **`FD_NETSOCK`
+was reported PERMANENTLY READY** (so any loop polling an AF_INET socket spun —
+unnoticed because nothing polled one until epoll made it obvious), and **stdin
+was never ready at all**.  stdin is now readable when a whole LINE is buffered,
+not a byte — cooked reads block until Enter, and *a poll that lies about which
+reads will not block is the one thing a poll must never do*; `vc_kbd_push`
+signals on the newline only.  **NEW: `epoll`** (create/ctl/wait,
+level-triggered, kernel-resident set, caller cookie returned verbatim).  Stated
+plainly in its own header: **our `epoll_wait` still SCANS**, so the asymptotics
+are poll's — the win is the INTERFACE (the watch list stops crossing the syscall
+boundary every iteration); genuine O(ready) needs per-fd waitqs with callback
+registration, a change to every fd kind, and bundling it in silently would claim
+an efficiency the code does not have.  **`EPOLLET` is REFUSED, not downgraded**
+— serving it level-triggered would "work" (level is a superset) but a program
+written for it drains each fd once per report and would be handed the same fd
+forever, spinning while appearing correct; a loud `-EINVAL` points at the one
+line to change.  poll and epoll share ONE blocking loop (`fd_readiness_wait`):
+two copies would be two chances to get the lost-wakeup rule wrong.  **THE
+SHARPEST ABI TRAP YET:** `struct epoll_event` is 12 bytes on i386, **12 on
+amd64** (Linux packs it on x86_64 *specifically* so the 32- and 64-bit layouts
+agree) and **16 on arm64** — the size does NOT follow the word size, so deriving
+one from the other passes on two arches and fails on the third.
+`abi_map.epoll_event_bytes` carries it (a sibling of §M53's `word_bytes`); and
+the x86 layout leaves `data` at offset 4, **unaligned for a u64 on a 64-bit
+host**, so it is marshalled BYTEWISE rather than relying on x86's tolerance —
+*writing the kernel so it only works on forgiving hardware is how an arch port
+later fails for no visible reason.*  Proven with an UNMODIFIED musl binary on
+all three arches (`epollmusltest`): sizes 12/12/16, cookie `0x1122334455667788`
+intact everywhere — bits in BOTH halves on purpose, because a four-byte offset
+error would look plausible with a small integer and invisible with zero.  Shell:
+`epolltest`, `epollmusltest`.  **OPEN:** per-fd wakeups instead of a scan;
+generic `O_NONBLOCK` on VFS/pipe fds (only sockets carry it); `epoll_pwait`'s
+signal mask is ignored (the WAIT is real, the mask is not — this kernel has no
+sigprocmask-during-wait, and honouring it would be a lie with more steps).
+
 ✅ **§M55 — WAITING FOR THE NETWORK WITHOUT SPENDING A CPU ON IT (2026-08-11,
 DOCS §4.56, i386 + x86_64 at -smp 4).**  §M24 drove RX by *polling from the
 calling task*, and net.c's header said so — *"everything runs in one task

@@ -37,7 +37,8 @@
 #include "task.h"
 #include "vfs.h"
 #include "fd.h"
-#include "timerfd.h"          /* §M53 stage 3 — timer descriptors */
+#include "timerfd.h"       /* §M53 stage 3 — timer descriptors */
+#include "epoll.h"          /* §M56 — readiness sets            */
 #include "vmm.h"
 #include "uaccess.h"   /* §1.1 — fault-safe user copies (exception table) */
 #include "pmm.h"
@@ -1037,6 +1038,56 @@ void fd_readiness_signal(void) {
     waitq_unlock(&readiness_wq, f);
 }
 
+/* See fd.h — the single definition of readiness, shared by poll and epoll. */
+void fd_readiness(int fd, int* rd_out, int* wr_out) {
+    int rd = 0, wr = 0;
+
+    if (fd == 0) {
+        /* stdin is COOKED (stdin_read_line blocks until Enter), so it becomes
+         * readable when a whole LINE is buffered, not when a byte is.  Saying
+         * "readable" on the first keystroke would be worse than saying nothing:
+         * the caller's read(2) would then block until Enter anyway — a poll
+         * that lies about which reads will not block is the one thing a poll
+         * must never do. */
+        struct vc* v = vc_focused();
+        rd = v ? vc_can_read_line(v) : 0;
+    } else if (fd == 1 || fd == 2) {
+        wr = 1;                                    /* console out: always writable */
+    } else {
+        struct ofile* o = fd_lookup(fd);
+        if (o) {
+            switch (o->kind) {
+            case FD_SOCK:
+                rd = usock_can_read(o->sock);
+                wr = usock_can_write(o->sock);
+                break;
+            /* §M53 stage 3 — a timerfd is readable exactly while it has
+             * uncollected expirations, and is never writable.  This is what
+             * lets a loop wait for a deadline and its sockets in the SAME
+             * call instead of choosing between them. */
+            case FD_TIMER:
+                rd = timerfd_can_read(o->tfd);
+                break;
+            /* §M56 — an AF_INET socket used to fall through to "always ready",
+             * so a loop polling one span at full speed and every epoll_wait on
+             * it would have returned instantly.  Datagram readiness is its RX
+             * ring; a stream's is the stack's. */
+            case FD_NETSOCK:
+                rd = netsock_can_read(o->nsock);
+                wr = netsock_can_write(o->nsock);
+                break;
+            case FD_VFS:
+            case FD_SHM:
+            default:
+                rd = 1; wr = 1;                    /* regular files never block */
+                break;
+            }
+        }
+    }
+    if (rd_out) *rd_out = rd;
+    if (wr_out) *wr_out = wr;
+}
+
 /* Fill each pollfd's revents with the currently-ready events; return the
  * number of fds with any requested event set (the readiness snapshot). */
 static int poll_snapshot(struct pollfd* pfds, int nfds) {
@@ -1045,25 +1096,7 @@ static int poll_snapshot(struct pollfd* pfds, int nfds) {
         struct pollfd* pf = &pfds[i];
         pf->revents = 0;
         int rd = 0, wr = 0;
-
-        if (pf->fd == 0) {                         /* stdin: never ready today */
-            rd = 0; wr = 0;
-        } else if (pf->fd == 1 || pf->fd == 2) {   /* console out: always writable */
-            wr = 1;
-        } else {
-            struct ofile* o = fd_lookup(pf->fd);
-            if (o) {
-                if (o->kind == FD_SOCK) { rd = usock_can_read(o->sock);
-                                          wr = usock_can_write(o->sock); }
-                /* §M53 stage 3 — a timerfd is readable exactly while it has
-                 * uncollected expirations, and is never writable.  This one
-                 * line is what lets a loop wait for a deadline and its sockets
-                 * in the SAME poll instead of choosing between them. */
-                else if (o->kind == FD_TIMER) { rd = timerfd_can_read(o->tfd);
-                                                wr = 0; }
-                else                    { rd = 1; wr = 1; }   /* VFS/shm: ready */
-            }
-        }
+        if (pf->fd >= 0) fd_readiness(pf->fd, &rd, &wr);
         if ((pf->events & POLLIN)  && rd) pf->revents |= POLLIN;
         if ((pf->events & POLLOUT) && wr) pf->revents |= POLLOUT;
         if (pf->revents) ready++;
@@ -1071,27 +1104,71 @@ static int poll_snapshot(struct pollfd* pfds, int nfds) {
     return ready;
 }
 
-/* poll(2).  timeout == 0: non-blocking snapshot (the Wayland event-loop tick).
- * timeout  < 0: block until at least one fd is ready (the classic "wait for an
- * event" loop).  timeout  > 0: a finite millisecond wait is not honoured yet
- * (needs a timed wakeup — deferred with cron/watchdog's timed-sleep); treated
- * as a snapshot so it never blocks past the caller's intent. */
-/* Core: `pfds` is always KERNEL memory (see the *_k note in syscall.h). */
-int sys_poll_k(struct pollfd* pfds, int nfds, int timeout) {
-    for (;;) {
-        int ready = poll_snapshot(pfds, nfds);
-        if (ready > 0 || timeout >= 0) return ready;   /* ready, or non-blocking */
+/* The deadline half of a finite readiness wait.  Interrupt context (ktimer's
+ * contract): take the queue lock and wake, which is what stops the timer from
+ * slipping past a task that has decided to park but not yet parked. */
+static void readiness_deadline_fired(struct ktimer* t) {
+    struct waitq* wq = (struct waitq*)t->arg;
+    uint32_t f = waitq_lock(wq);
+    waitq_wake_all(wq);
+    waitq_unlock(wq, f);
+}
 
-        /* timeout < 0 → block until readiness changes, then re-scan.  Re-check
-         * under the queue lock so a signal that races our snapshot isn't lost:
-         * the socket layer makes an fd ready BEFORE it takes readiness_wq to
-         * signal, so if we hold the lock and still see nothing ready, a wake
-         * can only arrive after we park. */
+/* See fd.h.  The single blocking loop behind poll(2) and epoll_wait(2). */
+int fd_readiness_wait(int (*scan)(void* ctx), void* ctx, int timeout_ms) {
+    int ready = scan(ctx);
+    if (ready > 0 || timeout_ms == 0) return ready;
+
+    /* A FINITE timeout is a real bounded wait now (§M56).  It used to be
+     * treated as a snapshot — documented, but a program asking to wait 200 ms
+     * got an immediate 0, so every correct event loop written against it
+     * became a busy loop.  A timeout that returns early is not a conservative
+     * approximation of one that waits; it is a different function. */
+    uint64_t deadline = 0;
+    struct ktimer t = { 0, 0, 0, 0, 0 };
+    if (timeout_ms > 0) {
+        deadline = timer_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+        ktimer_arm(&t, deadline, readiness_deadline_fired, &readiness_wq);
+    }
+
+    for (;;) {
+        if (timeout_ms > 0 && timer_now_ns() >= deadline) break;
+        /* §1.5 — a kill must not wait out a multi-second timeout. */
+        if (task_should_stop()) break;
+
+        /* Re-scan under the queue lock so a change that races the scan is not
+         * lost: every producer makes its fd ready BEFORE taking this lock to
+         * signal, so holding it and still seeing nothing means any wake can
+         * only arrive after we are parked (waitq.h's contract). */
         uint32_t f = waitq_lock(&readiness_wq);
-        if (poll_snapshot(pfds, nfds) > 0) { waitq_unlock(&readiness_wq, f); continue; }
+        ready = scan(ctx);
+        if (ready > 0) { waitq_unlock(&readiness_wq, f); break; }
         waitq_block(&readiness_wq);
         waitq_unlock(&readiness_wq, f);
+        ready = 0;
     }
+
+    /* Cancel unconditionally: on the ready path it has not fired and its
+     * callback would otherwise reference a queue this frame is leaving; on the
+     * timeout path it already has, and cancelling is a no-op. */
+    if (timeout_ms > 0) ktimer_cancel(&t);
+    return ready;
+}
+
+/* poll(2).  timeout == 0: non-blocking snapshot (the Wayland event-loop tick).
+ * timeout  < 0: block until at least one fd is ready.  timeout > 0: a real
+ * bounded wait (§M56 — see fd_readiness_wait for why this had to stop being a
+ * snapshot). */
+struct poll_scan_ctx { struct pollfd* pfds; int nfds; };
+static int poll_scan(void* c) {
+    struct poll_scan_ctx* s = (struct poll_scan_ctx*)c;
+    return poll_snapshot(s->pfds, s->nfds);
+}
+
+/* Core: `pfds` is always KERNEL memory (see the *_k note in syscall.h). */
+int sys_poll_k(struct pollfd* pfds, int nfds, int timeout) {
+    struct poll_scan_ctx c = { pfds, nfds };
+    return fd_readiness_wait(poll_scan, &c, timeout);
 }
 
 /* poll(2) over a RING-3 pollfd array.  The array is read-modify-write, so it is
@@ -1182,6 +1259,91 @@ int sys_timerfd_gettime(int fd, uint64_t* out) {
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * §M56 — epoll syscalls.
+ *
+ * The native calls carry each event as a flat u64 PAIR (events, data) rather
+ * than a `struct epoll_event`, for the same reason SYS_TIMERFD_SETTIME takes
+ * u64[2]: that struct's size is a property of the GUEST — 12 bytes on i386 and
+ * amd64, 16 on arm64, because Linux packs it on x86_64 specifically so the 32-
+ * and 64-bit layouts agree and does not pack it elsewhere.  Baking one of those
+ * layouts into the kernel's own interface would push a guest's marshalling
+ * problem inward; the personality layer converts and the native ABI stays flat.
+ * --------------------------------------------------------------------------- */
+int sys_epoll_create(void) {
+    struct epoll* ep = epoll_create_obj();
+    if (!ep) return -1;
+    struct ofile* o = ofile_from_epoll(ep);
+    if (!o) { epoll_close(ep); return -1; }
+    int fd = fd_install(o);
+    if (fd < 0) ofile_unref(o);
+    return fd;
+}
+
+int sys_epoll_ctl_k(int epfd, int op, int fd, uint32_t events, uint64_t data) {
+    struct ofile* o = fd_lookup(epfd);
+    if (!o || o->kind != FD_EPOLL) return -9;            /* -EBADF */
+    /* Watching an epoll set with itself is a cycle with no bottom; Linux
+     * rejects it and so do we, at the one place that can see both fds. */
+    if (fd == epfd) return -22;                          /* -EINVAL */
+    return epoll_ctl_obj(o->ep, op, fd, events, data);
+}
+
+int sys_epoll_ctl_u(int epfd, int op, int fd, const uint64_t* ev) {
+    uint64_t k[2] = { 0, 0 };
+    if (op != EPOLL_CTL_DEL) {
+        if (!ev) return -22;
+        if (user_ptr_gate_armed()) {
+            if (!user_r(ev, sizeof k)) return -14;       /* -EFAULT */
+            if (copy_from_user(k, (uintptr_t)ev, sizeof k) != 0) return -14;
+        } else {
+            k[0] = ev[0]; k[1] = ev[1];
+        }
+    }
+    return sys_epoll_ctl_k(epfd, op, fd, (uint32_t)k[0], k[1]);
+}
+
+/* `out` is a KERNEL array of 2*maxevents u64s: (events, data) per slot. */
+int sys_epoll_wait_k(int epfd, uint64_t* out, int maxevents, int timeout_ms) {
+    struct ofile* o = fd_lookup(epfd);
+    if (!o || o->kind != FD_EPOLL) return -9;
+    if (!out || maxevents <= 0 || maxevents > 256) return -22;
+
+    struct epoll_ev* evs = (struct epoll_ev*)kmalloc(sizeof(*evs) * (size_t)maxevents);
+    if (!evs) return -12;                                /* -ENOMEM */
+    int n = epoll_wait_obj(o->ep, evs, maxevents, timeout_ms);
+    for (int i = 0; i < n && i < maxevents; i++) {
+        out[i * 2 + 0] = evs[i].events;
+        out[i * 2 + 1] = evs[i].data;
+    }
+    kfree(evs);
+    return n;
+}
+
+/* Ring-3 form.  The result is staged in kernel memory and copied out ONCE:
+ * epoll_wait parks between scans, and writing into ring-3 memory across a
+ * scheduling point is exactly what §M46's bounce-buffer rule exists to stop. */
+int sys_epoll_wait_u(int epfd, uintptr_t uout, int maxevents, int timeout_ms) {
+    if (maxevents <= 0 || maxevents > 256) return -22;
+    size_t bytes = sizeof(uint64_t) * 2 * (size_t)maxevents;
+    if (user_ptr_gate_armed() && !vmm_user_access_ok(uout, bytes, 1)) return -14;
+
+    uint64_t* k = (uint64_t*)kmalloc(bytes);
+    if (!k) return -12;
+    int n = sys_epoll_wait_k(epfd, k, maxevents, timeout_ms);
+    if (n > 0) {
+        size_t used = sizeof(uint64_t) * 2 * (size_t)n;
+        if (user_ptr_gate_armed()) {
+            if (copy_to_user(uout, k, used) != 0) n = -14;
+        } else {
+            uint64_t* d = (uint64_t*)uout;
+            for (size_t i = 0; i < used / sizeof(uint64_t); i++) d[i] = k[i];
+        }
+    }
+    kfree(k);
+    return n;
+}
+
 int sys_setitimer_u(const uint64_t* times) {
     uint64_t t[2] = { 0, 0 };
     if (!times) return -1;
@@ -1243,6 +1405,26 @@ static uint16_t g_ephem_port = 0xC000;
 static int ns_has_dgram(void* a) {
     struct netsock* ns = (struct netsock*)a;
     return ns->rx_head != ns->rx_tail;
+}
+
+/* §M56 — readiness for fd_readiness().  Before this an AF_INET socket fell
+ * through poll's default and was reported PERMANENTLY ready, so any loop
+ * polling one spun at full speed; it went unnoticed because nothing polled a
+ * network socket until epoll made it the obvious thing to do.
+ *
+ * A datagram socket is readable when its RX ring has one.  A stream socket's
+ * readiness lives in the stack (one connection today, §M55's open item), so we
+ * ask there.  Writability is "connected", which is as honest as a stack with
+ * no send buffer can be. */
+int netsock_can_read(struct netsock* ns) {
+    if (!ns) return 0;
+    if (ns->type == SOCK_STREAM) return ns->connected ? net_tcp_can_read() : 0;
+    return ns->rx_head != ns->rx_tail;
+}
+int netsock_can_write(struct netsock* ns) {
+    if (!ns) return 0;
+    if (ns->type == SOCK_STREAM) return ns->connected ? 1 : 0;
+    return 1;                                    /* datagrams: always sendable */
 }
 
 /* net.c UDP-binding callback: enqueue an arriving datagram (drop if the ring

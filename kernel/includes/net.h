@@ -111,6 +111,10 @@ void net_rx(struct net_device* dev, const uint8_t* frame, uint32_t len);
  * than blocking forever on a promise. */
 void net_rx_irq(struct net_device* dev);
 
+/* Non-zero when a recv on the (single) connected stream socket would not
+ * block — unread bytes or a peer FIN.  Backs poll/epoll readiness (§M56). */
+int net_tcp_can_read(void);
+
 /* ----------------------- Waiting for the network (§M55) ------------------- */
 
 /* Take / release the stack lock.  A consumer that keeps its own state inside

@@ -111,6 +111,17 @@ enum abi_op {
     ABI_TIMERFD_GETTIME,
     ABI_SETITIMER,
 
+    /* §M56 — a readiness SET kept by the kernel.  `struct epoll_event` is the
+     * sharpest example yet of why the map has to describe the guest: it is 12
+     * bytes on i386 AND on amd64 — Linux packs it on x86_64 specifically so the
+     * 32- and 64-bit layouts agree — but 16 on arm64, where it is not packed
+     * and the u64 aligns to 8.  So its size does NOT follow word_bytes, and a
+     * handler that derived it from the word size would get amd64 wrong.  The
+     * map carries the size itself (abi_map.epoll_event_bytes). */
+    ABI_EPOLL_CREATE,
+    ABI_EPOLL_CTL,
+    ABI_EPOLL_WAIT,
+
     ABI_OP_MAX
 };
 
@@ -162,6 +173,11 @@ struct abi_map {
      * the host's own word size would be right only by coincidence, and would
      * silently break the first time a 32-bit guest ran on a 64-bit kernel. */
     uint8_t                 word_bytes;
+    /* §M56 — sizeof(struct epoll_event) IN THE GUEST.  Kept separate from
+     * word_bytes on purpose: it is 12 on both i386 and amd64 but 16 on arm64,
+     * so it is not derivable from the word size and never was.  See the
+     * ABI_EPOLL_* note above. */
+    uint8_t                 epoll_event_bytes;
 };
 
 /* Look up a guest number.  Returns ABI_OP_NONE when the map does not name it,

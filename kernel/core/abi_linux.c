@@ -66,6 +66,11 @@ static const struct abi_nument linux_i386_ents[] = {
     /* §M53 stage 3 — timing. */
     { 322, ABI_TIMERFD_CREATE  },
     { 325, ABI_TIMERFD_SETTIME },
+    { 254, ABI_EPOLL_CREATE },      /* epoll_create  */
+    { 329, ABI_EPOLL_CREATE },      /* epoll_create1 */
+    { 255, ABI_EPOLL_CTL },
+    { 256, ABI_EPOLL_WAIT },
+    { 319, ABI_EPOLL_WAIT },        /* epoll_pwait — mask ignored, see handler */
     { 326, ABI_TIMERFD_GETTIME },
     { 104, ABI_SETITIMER       },
 };
@@ -89,6 +94,11 @@ static const struct abi_nument linux_amd64_ents[] = {
     /* §M53 stage 3 — timing. */
     { 283, ABI_TIMERFD_CREATE  },
     { 286, ABI_TIMERFD_SETTIME },
+    { 213, ABI_EPOLL_CREATE },      /* epoll_create  */
+    { 291, ABI_EPOLL_CREATE },      /* epoll_create1 */
+    { 233, ABI_EPOLL_CTL },
+    { 232, ABI_EPOLL_WAIT },
+    { 281, ABI_EPOLL_WAIT },        /* epoll_pwait */
     { 287, ABI_TIMERFD_GETTIME },
     {  38, ABI_SETITIMER       },
 };
@@ -116,18 +126,29 @@ static const struct abi_nument linux_arm64_ents[] = {
     /* §M53 stage 3 — timing. */
     {  85, ABI_TIMERFD_CREATE  },
     {  86, ABI_TIMERFD_SETTIME },
+    {  20, ABI_EPOLL_CREATE },      /* epoll_create1 — arm64 has no plain
+                                     * epoll_create, and no plain epoll_wait
+                                     * either: glibc/musl call epoll_pwait. */
+    {  21, ABI_EPOLL_CTL },
+    {  22, ABI_EPOLL_WAIT },        /* epoll_pwait */
     {  87, ABI_TIMERFD_GETTIME },
     { 103, ABI_SETITIMER       },
 };
 
 #define ARRAY_N(a) ((uint32_t)(sizeof(a) / sizeof((a)[0])))
 
+/* The trailing two numbers are word_bytes and epoll_event_bytes.  Note that
+ * they do NOT track each other: `struct epoll_event` is 12 bytes on i386 and
+ * ALSO 12 on amd64 (Linux packs it there precisely so the layouts agree), but
+ * 16 on arm64, where it is unpacked and the u64 aligns to 8.  Deriving the
+ * struct size from the word size would therefore be correct on exactly one of
+ * these three. */
 const struct abi_map abi_map_linux_i386 = {
-    "linux/i386",  linux_i386_ents,  ARRAY_N(linux_i386_ents),  4
+    "linux/i386",  linux_i386_ents,  ARRAY_N(linux_i386_ents),  4, 12
 };
 const struct abi_map abi_map_linux_amd64 = {
-    "linux/amd64", linux_amd64_ents, ARRAY_N(linux_amd64_ents), 8
+    "linux/amd64", linux_amd64_ents, ARRAY_N(linux_amd64_ents), 8, 12
 };
 const struct abi_map abi_map_linux_arm64 = {
-    "linux/arm64", linux_arm64_ents, ARRAY_N(linux_arm64_ents), 8
+    "linux/arm64", linux_arm64_ents, ARRAY_N(linux_arm64_ents), 8, 16
 };

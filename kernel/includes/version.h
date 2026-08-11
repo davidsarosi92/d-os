@@ -9,7 +9,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M55"                 /* latest shipped: §M55 network async — one poller, blocking waiters */
+#define DOS_MILESTONE  "M56"                 /* latest shipped: §M56 epoll + real poll timeouts */
 
 /* Short architecture tag for the on-screen label.  Deliberately the FAMILIAR
  * short form ("x32"/"x64") rather than the toolchain triple — the wallpaper

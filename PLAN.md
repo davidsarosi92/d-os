@@ -4332,6 +4332,52 @@ spaces make force-kill safe).  All shipped → this milestone is unblocked.
 
 ---
 
+## §M56 — A wait that is really a wait (poll timeouts + epoll) ✅
+
+**Shipped 2026-08-11 — see DOCS.md §4.57.**  `poll(2)` honours a finite
+timeout; `epoll_create`/`ctl`/`wait` exist, level-triggered, with the set kept
+in the kernel; poll and epoll share one readiness definition and one blocking
+loop.  Verified on all three arches, including through an unmodified musl
+binary.
+
+**Lessons learned.**
+
+- *A timeout that returns early is not a conservative version of one that
+  waits.*  poll's positive timeout was documented as "treated as a snapshot so
+  it never blocks past the caller's intent", which reads like caution and is
+  actually a different function: every correct event loop written against it
+  became a busy loop.
+
+- *Extracting a shared definition is a bug-finding technique.*  Merging poll's
+  and epoll's readiness into one function surfaced, in the same hour, that
+  AF_INET sockets had been reported permanently ready and that stdin had never
+  been reported ready at all.  Neither was visible while the definition lived
+  inside a single caller.
+
+- *A poll must not lie about which reads will not block.*  Cooked stdin becomes
+  readable at end of LINE, not at the first keystroke, because that is when a
+  read will return.
+
+- *Refuse what you cannot serve, even when a superset would "work".*  Serving
+  EPOLLET as level-triggered satisfies the type system and spins the program.
+  -EINVAL costs the author one line; the silent downgrade costs them a day.
+
+- *Say what the implementation is not.*  epoll's whole reputation is O(ready);
+  ours scans.  The interface is the win, and writing that in the header is
+  cheaper than someone later measuring it.
+
+- *A guest struct's size is a property of the guest, and not always of its word
+  size.*  `struct epoll_event` is 12 bytes on i386 AND amd64 (Linux packs it on
+  x86_64 so the layouts agree) but 16 on arm64.  Deriving the size from the word
+  width passes on two of three arches — the worst possible failure mode.  It
+  also leaves `data` unaligned on x86, so it is marshalled bytewise: code that
+  works only on forgiving hardware is a port failure waiting to happen.
+
+**Still open:** per-fd wakeups instead of a scan; generic `O_NONBLOCK` on
+VFS/pipe descriptors; `epoll_pwait`'s signal mask.
+
+---
+
 ## §M55 — Network async: one poller, blocking waiters ✅
 
 **Shipped 2026-08-11 — see DOCS.md §4.56.**  The network stack no longer

@@ -20,10 +20,11 @@ struct file;                    /* vfs.h  */
 struct shm;                     /* below  */
 struct usock;                   /* unix socket endpoint (stage 5)          */
 
-enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER };
+enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER, FD_EPOLL };
 
 struct netsock;                 /* network (AF_INET) socket — usyscall.c        */
 struct timerfd;                 /* §M53 stage 3 — a deadline behind a descriptor */
+struct epoll;                   /* §M56 — a readiness set behind a descriptor   */
 
 struct ofile {
     enum fd_kind kind;
@@ -33,6 +34,7 @@ struct ofile {
     struct usock* sock;         /* FD_SOCK */
     struct netsock* nsock;      /* FD_NETSOCK (M24 socket API) */
     struct timerfd* tfd;        /* FD_TIMER (§M53 stage 3) */
+    struct epoll* ep;           /* FD_EPOLL (§M56)         */
 };
 
 /* Wrap a resource in a fresh ofile (refcount 1), or NULL on OOM. */
@@ -41,6 +43,7 @@ struct ofile* ofile_from_shm (struct shm* s);
 struct ofile* ofile_from_sock(struct usock* s);
 struct ofile* ofile_from_netsock(struct netsock* s);
 struct ofile* ofile_from_timerfd(struct timerfd* t);
+struct ofile* ofile_from_epoll(struct epoll* e);
 
 /* Refcount management.  ofile_unref drops the last reference → closes the
  * wrapped resource + frees the ofile. */
@@ -87,5 +90,31 @@ int  usock_can_write(struct usock* s);   /* peer open + space? (POLLOUT)   */
  * poll() wakes and re-scans.  Defined in usyscall.c (owns the global
  * readiness wait-queue); declared here so the socket layer can raise it. */
 void fd_readiness_signal(void);
+
+/* THE definition of "is this descriptor ready" (§M56).
+ *
+ * poll(2) and epoll_wait(2) must agree exactly about this, so they share one
+ * function rather than two switch statements that would drift apart the first
+ * time a new fd kind appeared — which is precisely what happened to FD_NETSOCK,
+ * reported as permanently ready by poll's fall-through for two milestones.
+ *
+ * Both outputs are 0/1.  An unknown or closed fd reports neither. */
+void fd_readiness(int fd, int* rd_out, int* wr_out);
+
+/* Readiness of an AF_INET socket (usyscall.c owns struct netsock). */
+int netsock_can_read(struct netsock* ns);
+int netsock_can_write(struct netsock* ns);
+
+/* The one blocking loop behind both poll(2) and epoll_wait(2).
+ *
+ * `scan` reports how many of the caller's descriptors are currently ready (and
+ * records whatever detail the caller needs); this owns the deadline, the
+ * parking, and the check-then-park discipline that keeps a wakeup from being
+ * lost.  `timeout_ms` follows poll's convention: <0 waits forever, 0 returns
+ * the first scan, >0 is a REAL bounded wait.  Returns `scan`'s last value.
+ *
+ * Two copies of this loop would be two chances to get the lost-wakeup rule
+ * wrong, which is why epoll does not have its own. */
+int fd_readiness_wait(int (*scan)(void* ctx), void* ctx, int timeout_ms);
 
 #endif

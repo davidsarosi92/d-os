@@ -66,7 +66,8 @@ MUSL_COREUTIL_BLOBS := $(patsubst %,user/%_muslblob.o,$(MUSL_COREUTILS))
 # wedgewin = a GUI client that opens a window and then freezes: the automated
 # test for "the chrome still works when the app behind it is frozen".
 MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o \
-                   user/wedgewin_muslblob.o user/pthreadtest_muslblob.o
+                   user/wedgewin_muslblob.o user/pthreadtest_muslblob.o \
+                   user/epollmusl_muslblob.o
 # §M37 dynamic-linking artifacts — the ld.so blob + the dynamically linked tests.
 MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
                    user/libgreet_blob.o user/solibtest_dynblob.o \
@@ -549,6 +550,7 @@ else ifeq ($(ARCH),aarch64)
   ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
                      user/forktest_blob.o user/pipetest_blob.o \
                      user/sigtest_blob.o user/muslhello_muslblob.o \
+                     user/epollmusl_muslblob.o \
                      $(MUSL_COREUTIL_BLOBS)
 
   # Tier B — in-tree user libc build knobs (aarch64).  Uses the cross toolchain
@@ -668,6 +670,7 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/itimer.c \
+    kernel/core/epoll.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/pkg.c \
@@ -711,6 +714,7 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/itimer.c \
+    kernel/core/epoll.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/net.c \
@@ -849,6 +853,7 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/itimer.c \
+    kernel/core/epoll.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/pkg.c \

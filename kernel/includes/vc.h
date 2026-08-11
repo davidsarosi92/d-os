@@ -116,6 +116,15 @@ void vc_clear(struct vc* v);
  * sti+hlt + task_yield to be polite to other tasks. */
 char vc_getchar(struct vc* v);
 
+/* Non-zero when a COMPLETE LINE is buffered — i.e. when vc_getchar-driven
+ * cooked input (stdin_read_line) would return without blocking.
+ *
+ * This is deliberately not "is the ring non-empty".  stdin is cooked: a read
+ * blocks until Enter, so reporting readable on the first keystroke would give
+ * a poller a descriptor whose read then blocks anyway.  A poll that lies about
+ * which reads will not block is the one thing a poll must never do. */
+int vc_can_read_line(struct vc* v);
+
 /* IRQ-side: push `c` into the focused VC's input ring.  Drops the byte
  * if no VC is focused or the ring is full.  Lock-free under SPSC. */
 void vc_kbd_push(char c);

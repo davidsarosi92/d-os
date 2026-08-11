@@ -10,10 +10,12 @@
  * ============================================================================= */
 
 #include "abi.h"
+#include "epoll.h"        /* EPOLL_CTL_* — the guest's own numbers */
 #include "syscall.h"
 #include "task.h"
 #include "fd.h"
 #include "proc.h"
+#include "kmalloc.h"
 #include "vmm.h"        /* vmm_user_access_ok — guest-pointer validation */
 #include <stddef.h>
 
@@ -76,6 +78,8 @@ static long h_getppid(struct abi_ctx* c) {
 #define ABI_ENOTTY 25
 #define ABI_ENOSYS 38
 #define ABI_EFAULT 14
+#define ABI_EINVAL 22
+#define ABI_ENOMEM 12
 
 /* Is [uptr, uptr+len) a writable GUEST address in the active space?  The check
  * lives here, in the handler, because this is where the pointer's ORIGIN is
@@ -249,6 +253,105 @@ static long h_sigprocmask(struct abi_ctx* c) { (void)c; return 0; }
  * in bits 0..6.  Handing back the raw code happens to work for 0 and is wrong
  * for every other value — the kind of bug that hides until a program checks
  * whether its child succeeded. */
+/* ---------------------------------------------------------------------------
+ * §M56 — epoll.
+ *
+ * The whole arch-specific content of this is ONE number: how big the guest's
+ * `struct epoll_event` is.  Everything else — the flags, the ctl ops, the
+ * timeout convention — is identical across the three ABIs, which is exactly
+ * the split §M50's engine exists to expose.
+ *
+ * The guest layout is { u32 events; u64 data; }, packed on x86 (12 bytes, data
+ * at offset 4, UNALIGNED on a 64-bit host) and unpacked on arm64 (16 bytes,
+ * data at offset 8).  We therefore read and write `data` BYTEWISE rather than
+ * through a u64*: on x86_64 that pointer would be misaligned, and while x86
+ * tolerates it, writing the kernel so that it only works on forgiving hardware
+ * is how an arch port later fails for no visible reason.
+ * ------------------------------------------------------------------------- */
+static unsigned long abi_epoll_ev_bytes(const struct abi_ctx* c) {
+    /* Default to the x86 packed size rather than 0 if a map predates the
+     * field — a zero here would make every bounds check pass trivially. */
+    if (c->map && c->map->epoll_event_bytes) return c->map->epoll_event_bytes;
+    return 12u;
+}
+
+/* Offset of the `data` member: right after the u32 when packed, 8-aligned
+ * when not.  Derived from the struct SIZE, which is the only thing the map
+ * needs to carry. */
+static unsigned long abi_epoll_data_off(const struct abi_ctx* c) {
+    return abi_epoll_ev_bytes(c) == 12u ? 4u : 8u;
+}
+
+static uint64_t abi_ld64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i);   /* LE guests */
+    return v;
+}
+static void abi_st64(uint8_t* p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+static uint32_t abi_ld32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static void abi_st32(uint8_t* p, uint32_t v) {
+    for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static long h_epoll_create(struct abi_ctx* c) {
+    /* epoll_create's `size` hint and epoll_create1's flags are both accepted
+     * and ignored: the size hint has been advisory since Linux 2.6.8, and the
+     * only flag is EPOLL_CLOEXEC, which is meaningful once this kernel has
+     * close-on-exec at all. */
+    (void)c;
+    return sys_epoll_create();
+}
+
+static long h_epoll_ctl(struct abi_ctx* c) {
+    int epfd = (int)c->a[0], op = (int)c->a[1], fd = (int)c->a[2];
+    unsigned long evp = c->a[3];
+    uint64_t kev[2] = { 0, 0 };
+
+    if (op != EPOLL_CTL_DEL) {
+        unsigned long sz = abi_epoll_ev_bytes(c);
+        if (!evp || !vmm_user_access_ok((uintptr_t)evp, sz, 0)) return -ABI_EFAULT;
+        const uint8_t* p = (const uint8_t*)(uintptr_t)evp;
+        kev[0] = abi_ld32(p);
+        kev[1] = abi_ld64(p + abi_epoll_data_off(c));
+    }
+    return sys_epoll_ctl_k(epfd, op, fd, (uint32_t)kev[0], kev[1]);
+}
+
+static long h_epoll_wait(struct abi_ctx* c) {
+    int epfd = (int)c->a[0];
+    unsigned long outp = c->a[1];
+    int maxevents = (int)c->a[2];
+    int timeout   = (int)c->a[3];
+    /* epoll_pwait's signal mask (a[4]/a[5]) is ignored: this kernel has no
+     * sigprocmask-during-wait, so honouring it would be a lie with more steps.
+     * Programs use pwait for the mask AND for the wait; the wait is real. */
+
+    if (maxevents <= 0 || maxevents > 256) return -ABI_EINVAL;
+    unsigned long sz = abi_epoll_ev_bytes(c);
+    if (!outp || !abi_user_w_ok(outp, sz * (unsigned long)maxevents))
+        return -ABI_EFAULT;
+
+    uint64_t* k = (uint64_t*)kmalloc(sizeof(uint64_t) * 2 * (size_t)maxevents);
+    if (!k) return -ABI_ENOMEM;
+    int n = sys_epoll_wait_k(epfd, k, maxevents, timeout);
+    if (n > 0) {
+        uint8_t* out = (uint8_t*)(uintptr_t)outp;
+        unsigned long doff = abi_epoll_data_off(c);
+        for (int i = 0; i < n; i++) {
+            uint8_t* e = out + (unsigned long)i * sz;
+            abi_st32(e, (uint32_t)k[i * 2 + 0]);
+            abi_st64(e + doff, k[i * 2 + 1]);
+        }
+    }
+    kfree(k);
+    return n < 0 ? n : n;
+}
+
 static long h_wait(struct abi_ctx* c) {
     int code = 0;
     int pid = task_wait((int)c->a[0], &code);
@@ -313,6 +416,9 @@ static const struct {
     [ABI_TIMERFD_SETTIME] = { "timerfd_settime", h_timerfd_settime },
     [ABI_TIMERFD_GETTIME] = { "timerfd_gettime", h_timerfd_gettime },
     [ABI_SETITIMER]       = { "setitimer",       h_setitimer       },
+    [ABI_EPOLL_CREATE]    = { "epoll_create",    h_epoll_create    },
+    [ABI_EPOLL_CTL]       = { "epoll_ctl",       h_epoll_ctl       },
+    [ABI_EPOLL_WAIT]      = { "epoll_wait",      h_epoll_wait      },
     [ABI_WAIT]            = { "wait",            h_wait },
     [ABI_EXECVE]          = { "execve",          h_execve },
 };

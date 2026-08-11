@@ -40,6 +40,7 @@
  * ============================================================================= */
 
 #include "vc.h"
+#include "fd.h"                       /* fd_readiness_signal (§M56) */
 #include "task.h"
 #include "console.h"
 #include "lock.h"
@@ -395,6 +396,12 @@ void vc_kbd_push(char c) {
     uint32_t fl = waitq_lock(&v->inq);
     waitq_wake_all(&v->inq);
     waitq_unlock(&v->inq, fl);
+
+    /* §M56 — stdin only becomes READABLE at end of line (cooked input), so a
+     * poller is signalled on the newline and not on every keystroke.  Waking
+     * every poll(2) in the system 60 times a second because someone is typing
+     * would be a cost with no corresponding readiness. */
+    if (c == '\n') fd_readiness_signal();
 }
 
 /* §M49 — block until a byte arrives, instead of polling for one.
@@ -429,6 +436,20 @@ char vc_getchar(struct vc* v) {
          * while holding the waitq lock. */
         task_yield();
     }
+}
+
+/* See vc.h: readable means a whole LINE is available, because that is what a
+ * cooked read will consume.  Scanning the ring costs a few dozen byte
+ * comparisons and is only done from poll/epoll, never per keystroke. */
+int vc_can_read_line(struct vc* v) {
+    if (!v) return 0;
+    uint32_t head = v->in_head, tail = v->in_tail;
+    while (tail != head) {
+        char c = v->in_buf[tail];
+        if (c == '\n') return 1;
+        tail = (tail + 1) & VC_INBUF_MASK;
+    }
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------

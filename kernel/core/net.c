@@ -1192,6 +1192,16 @@ int net_tcp_recv(struct net_device* dev, void* buf, uint32_t len) {
     return (int)cnt;                             /* 0 = EOF (peer FIN, drained) */
 }
 
+/* §M56 — readiness for poll/epoll on a connected stream socket.  Unread bytes
+ * OR a peer FIN both make a read return without blocking (the second returns
+ * 0, which is exactly what a caller needs to be told about). */
+int net_tcp_can_read(void) {
+    uint32_t f = net_lock();
+    int r = (g_tcp_rxconsumed < g_tcp_rxlen) || g_tcp.peer_fin;
+    net_unlock(f);
+    return r;
+}
+
 void net_tcp_close(struct net_device* dev) {
     if (g_tcp.state == TCP_ST_CLOSED) return;
     tcp_shutdown(dev);

@@ -74,6 +74,14 @@
 #define SYS_TIMERFD_GETTIME 39  /* (fd, u64 out[2]) → 0 / -1                   */
 #define SYS_SETITIMER 40        /* (u64 times[2]) → 0 — delivers SIGALRM       */
 
+/* §M56 — epoll.  `struct epoll_event` is NOT passed across this boundary: its
+ * size is a property of the guest ABI (12 bytes on i386/amd64, 16 on arm64),
+ * so the native calls take a flat u64 pair per event and the ABI layer owns
+ * the marshalling.  Same rule, same reason, as SYS_TIMERFD_SETTIME's u64[2]. */
+#define SYS_EPOLL_CREATE 41     /* () → fd                                     */
+#define SYS_EPOLL_CTL    42     /* (epfd, op, fd, u64 ev[2]) → 0 / -errno      */
+#define SYS_EPOLL_WAIT   43     /* (epfd, u64 out[], maxev, timeout_ms) → n    */
+
 /* M36 shared structs (kernel + libc agree on the layout). */
 struct kstat {
     uint32_t size;
@@ -159,6 +167,13 @@ int  sys_setitimer_u(const uint64_t* times);
 int  sys_setitimer_ns(uint64_t value_ns, uint64_t interval_ns);
 int  sys_getitimer_ns(uint64_t* value_ns, uint64_t* interval_ns);
 void itimer_cancel_pid(int pid);        /* called when a task exits            */
+/* §M56 — epoll.  The _k forms take kernel memory; the _u forms stage a ring-3
+ * array through a bounce buffer, the §M46 discipline. */
+int  sys_epoll_create(void);
+int  sys_epoll_ctl_k(int epfd, int op, int fd, uint32_t events, uint64_t data);
+int  sys_epoll_ctl_u(int epfd, int op, int fd, const uint64_t* ev);
+int  sys_epoll_wait_k(int epfd, uint64_t* out, int maxevents, int timeout_ms);
+int  sys_epoll_wait_u(int epfd, uintptr_t uout, int maxevents, int timeout_ms);
 long sys_sigaction(int sig, long handler, long restorer);  /* → old handler    */
 int  sys_socket(int domain, int type, int proto);          /* M24 socket API   */
 int  sys_bind(int fd, int port);

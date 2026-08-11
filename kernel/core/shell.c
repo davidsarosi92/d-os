@@ -50,6 +50,7 @@
 #include "crash.h"     /* §M47 — the `crash` report list */
 #include "proc.h"
 #include "syscall.h"
+#include "epoll.h"       /* §M56 — EPOLL_CTL_*, EPOLLET */
 #include "workqueue.h"
 #include "abi.h"        /* §M50 — guest-ABI translation tables */  /* §M49 — deferred-work pool + wqtest */
 #include "fd.h"
@@ -132,6 +133,7 @@ static void cmd_help(void) {
                   "  killstorm [rounds] [tasks] (kill blocked tasks under SMP)\n"
                   "  timerfdtest [ms], alarmtest [ms] (timing, M53 stage 3)\n"
                   "  netstorm [n] (n tasks waiting on the network at once)\n"
+                  "  epolltest, epollmusltest (readiness sets, M56)\n"
                   "  fputest (per-task FP/SIMD register file)\n"
                   "  archtest (ELF arch gate), crash (what has gone wrong)\n"
                   "  pane, pane split horizontal|vertical\n"
@@ -431,6 +433,98 @@ static void cmd_timerfdtest(const char* args) {
             (unsigned)(rem / 1000), (unsigned)(iv / 1000));
     sys_close(fd);
     console_write("timerfd: ok\n");
+}
+
+/* -------------------------------------------------------------------- */
+/* §M56 — `epolltest`: a readiness set, and a timeout that is real.      */
+/*                                                                       */
+/* Two claims, both falsifiable by the clock:                            */
+/*                                                                       */
+/*  1. A FINITE TIMEOUT WAITS.  poll(2) with `timeout > 0` used to be     */
+/*     treated as a snapshot — documented as such, but a program asking   */
+/*     to wait 200 ms got an immediate 0, so every correct event loop     */
+/*     written against it became a busy loop.  The test measures the      */
+/*     elapsed time and fails if the call came back early.                */
+/*                                                                       */
+/*  2. ONE WAIT SERVES SEVERAL SOURCES.  A timerfd and a pipe go into one */
+/*     epoll set, and the loop is woken by whichever is ready — which is  */
+/*     the entire point of registering a set instead of asking about one  */
+/*     descriptor at a time.                                              */
+/* -------------------------------------------------------------------- */
+
+static void cmd_epolltest(void) {
+    /* --- 1. a finite timeout on an empty set must actually wait --------- */
+    int ep = sys_epoll_create();
+    if (ep < 0) { console_write("epoll: create failed\n"); return; }
+
+    uint64_t t0 = timer_now_ns();
+    uint64_t evbuf[2 * 8];
+    int n = sys_epoll_wait_k(ep, evbuf, 8, 200);
+    uint64_t waited_us = (timer_now_ns() - t0) / 1000ull;
+    kprintf("epoll: empty set, 200 ms timeout -> n=%d after %u us\n",
+            n, (unsigned)waited_us);
+    int ok = (n == 0 && waited_us >= 150000ull);
+    if (!ok) console_write("epoll: FAIL (a finite timeout returned early)\n");
+
+    /* --- 2. a timerfd in the set wakes the wait ------------------------- */
+    int tfd = sys_timerfd_create();
+    if (tfd < 0) { console_write("epoll: timerfd failed\n"); sys_close(ep); return; }
+    sys_timerfd_settime(tfd, 0, 80000000ull, 0);         /* one-shot, 80 ms */
+
+    uint64_t ev[2] = { POLLIN, 0xABCDEF01ull };          /* events, cookie */
+    if (sys_epoll_ctl_k(ep, EPOLL_CTL_ADD, tfd, (uint32_t)ev[0], ev[1]) != 0)
+        console_write("epoll: FAIL (ctl ADD)\n");
+
+    t0 = timer_now_ns();
+    n = sys_epoll_wait_k(ep, evbuf, 8, 5000);
+    waited_us = (timer_now_ns() - t0) / 1000ull;
+    kprintf("epoll: timerfd -> n=%d events=%x data=%x%x after %u us\n",
+            n, (unsigned)evbuf[0],
+            (unsigned)(evbuf[1] >> 32), (unsigned)evbuf[1],
+            (unsigned)waited_us);
+    if (n != 1 || evbuf[1] != 0xABCDEF01ull) {
+        console_write("epoll: FAIL (timerfd not reported, or cookie mangled)\n");
+        ok = 0;
+    }
+    /* The cookie is the whole ergonomics of epoll: the kernel hands back the
+     * caller's own pointer-sized token, so a loop does not have to search its
+     * own tables for which connection an fd belongs to. */
+
+    uint64_t drained = 0;
+    sys_read_k(tfd, &drained, sizeof drained);
+
+    /* --- 3. a pipe in the SAME set ------------------------------------- */
+    int pfds[2];
+    if (sys_pipe(pfds) == 0) {
+        if (sys_epoll_ctl_k(ep, EPOLL_CTL_ADD, pfds[0], POLLIN, 0x2222ull) != 0)
+            console_write("epoll: FAIL (ctl ADD pipe)\n");
+
+        /* Nothing written yet: the set must NOT report the pipe. */
+        n = sys_epoll_wait_k(ep, evbuf, 8, 50);
+        if (n != 0) { kprintf("epoll: FAIL (spurious ready, n=%d)\n", n); ok = 0; }
+
+        sys_write_k(pfds[1], "x", 1);
+        n = sys_epoll_wait_k(ep, evbuf, 8, 1000);
+        kprintf("epoll: pipe -> n=%d data=%x\n", n, (unsigned)evbuf[1]);
+        if (n != 1 || evbuf[1] != 0x2222ull) {
+            console_write("epoll: FAIL (pipe not reported)\n"); ok = 0;
+        }
+        sys_close(pfds[0]); sys_close(pfds[1]);
+    }
+
+    /* --- 4. edge-triggered is REFUSED, not silently downgraded --------- */
+    int rc = sys_epoll_ctl_k(ep, EPOLL_CTL_MOD, tfd, POLLIN | EPOLLET, 0);
+    if (rc >= 0) {
+        console_write("epoll: FAIL (EPOLLET accepted — a program written for "
+                      "it would spin)\n");
+        ok = 0;
+    } else {
+        kprintf("epoll: EPOLLET refused with %d (correct)\n", rc);
+    }
+
+    sys_close(tfd);
+    sys_close(ep);
+    console_write(ok ? "epoll: ok\n" : "epoll: FAILED\n");
 }
 
 /* §M53 stage 3 — `alarmtest`: the OTHER delivery.  A program with nothing to
@@ -2657,6 +2751,8 @@ static void cmd_linuxtest(void) {
 
 /* M36 stage 2 — `musltest`: run a REAL, unmodified musl-linked ELF under the
  * Linux personality.  Embedded only when `make musl` produced the binary. */
+extern const unsigned char _binary_user_epollmusl_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_epollmusl_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_muslhello_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_muslhello_muslelf_end[]   __attribute__((weak));
 
@@ -2699,6 +2795,25 @@ static void cmd_pthreadtest(void) {
     int rc = proc_exec_elf(sp, (size_t)(_binary_user_pthreadtest_muslelf_end - sp));
     if (me) me->linux_abi = prev;
     kprintf("pthreadtest: returned rc=%d\n", rc);
+}
+
+/* §M56 — `epollmusltest`: epoll through UNMODIFIED musl.  `epolltest` proves
+ * the mechanism; this proves the TRANSLATION, which is where the trap is —
+ * `struct epoll_event` is 12 bytes on i386 AND amd64 but 16 on arm64, so its
+ * size does not follow the word size and cannot be derived from it.  The
+ * cookie carries bits in both halves of the u64 precisely so an offset error
+ * of four bytes shows up instead of looking plausible. */
+static void cmd_epollmusltest(void) {
+    const unsigned char* a = _binary_user_epollmusl_muslelf_start;
+    const unsigned char* b = _binary_user_epollmusl_muslelf_end;
+    if (!a || !b) { console_write("epollmusl: not embedded for this arch\n"); return; }
+    console_write("epollmusl: exec'ing a REAL musl binary (Linux personality)...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(a, (unsigned long)(b - a));
+    if (me) me->linux_abi = prev;
+    kprintf("epollmusl: returned rc=%d\n", rc);
 }
 
 static void cmd_musltest(void) {
@@ -3546,6 +3661,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "spawn"))          { cmd_spawn();    return; }
     if (streq(line, "killstorm"))      { cmd_killstorm("");        return; }
     if (streq(line, "timerfdtest"))    { cmd_timerfdtest("");      return; }
+    if (streq(line, "epolltest"))      { cmd_epolltest();          return; }
+    if (streq(line, "epollmusltest"))  { cmd_epollmusltest();      return; }
     if (starts_with(line, "timerfdtest ")) { cmd_timerfdtest(line + 12); return; }
     if (streq(line, "alarmtest"))      { cmd_alarmtest("");        return; }
     if (starts_with(line, "alarmtest ")) { cmd_alarmtest(line + 10); return; }
