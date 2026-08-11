@@ -37,6 +37,7 @@
 #include "task.h"
 #include "vfs.h"
 #include "fd.h"
+#include "timerfd.h"          /* §M53 stage 3 — timer descriptors */
 #include "vmm.h"
 #include "uaccess.h"   /* §1.1 — fault-safe user copies (exception table) */
 #include "pmm.h"
@@ -316,6 +317,11 @@ long sys_read_k(int fd, void* buf, size_t n) {
      * read waits for the peer to send (or close → 0/EOF). */
     if (o->kind == FD_SOCK) return usock_recv(o->sock, buf, n, 1, NULL);
     if (o->kind == FD_NETSOCK) return netsock_read(o->nsock, buf, n);
+    /* §M53 stage 3 — reading a timerfd yields the expiration COUNT and resets
+     * it.  Blocking by default, like every other read here; a caller that
+     * wants the non-blocking form uses poll(2), which is the whole point of
+     * the descriptor existing. */
+    if (o->kind == FD_TIMER) return timerfd_read(o->tfd, buf, n, 1);
     return -1;
 }
 
@@ -1049,6 +1055,12 @@ static int poll_snapshot(struct pollfd* pfds, int nfds) {
             if (o) {
                 if (o->kind == FD_SOCK) { rd = usock_can_read(o->sock);
                                           wr = usock_can_write(o->sock); }
+                /* §M53 stage 3 — a timerfd is readable exactly while it has
+                 * uncollected expirations, and is never writable.  This one
+                 * line is what lets a loop wait for a deadline and its sockets
+                 * in the SAME poll instead of choosing between them. */
+                else if (o->kind == FD_TIMER) { rd = timerfd_can_read(o->tfd);
+                                                wr = 0; }
                 else                    { rd = 1; wr = 1; }   /* VFS/shm: ready */
             }
         }
@@ -1104,6 +1116,82 @@ int sys_poll(struct pollfd* pfds, int nfds, int timeout) {
     }
     kfree(k);
     return r;
+}
+
+/* ---------------------------------------------------------------------------
+ * §M53 stage 3 — timerfd syscalls.
+ *
+ * Nanoseconds, not a struct: `struct itimerspec` is four words whose WIDTH
+ * depends on the guest (16 bytes on i386, 32 on a 64-bit ABI), and baking that
+ * layout into the native call would push a guest's marshalling problem into
+ * the kernel's own interface.  The personality layer converts; the native ABI
+ * speaks the one unit the clock speaks.
+ * --------------------------------------------------------------------------- */
+int sys_timerfd_create(void) {
+    struct timerfd* tf = timerfd_create_obj();
+    if (!tf) return -1;
+    struct ofile* o = ofile_from_timerfd(tf);
+    if (!o) { timerfd_close(tf); return -1; }
+    int fd = fd_install(o);
+    if (fd < 0) ofile_unref(o);
+    return fd;
+}
+
+/* `abs` selects an absolute deadline on the timer_now_ns() timeline.  value 0
+ * disarms.  Returns 0, or -1 on a bad descriptor. */
+int sys_timerfd_settime(int fd, int abs, uint64_t value_ns, uint64_t interval_ns) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_TIMER) return -1;
+    return timerfd_set(o->tfd, abs, value_ns, interval_ns);
+}
+
+/* Reports the time REMAINING (Linux's semantics), not the deadline that was
+ * set — a caller that wanted the deadline back already has it. */
+int sys_timerfd_gettime_k(int fd, uint64_t* remaining_ns, uint64_t* interval_ns) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_TIMER) return -1;
+    return timerfd_get(o->tfd, remaining_ns, interval_ns);
+}
+
+/* Ring-3 entry points.  The times travel as a two-element u64 array rather than
+ * as register arguments: a nanosecond value does not fit one register on i386,
+ * and packing it into a REGISTER PAIR would make the native ABI's shape depend
+ * on the word size — exactly the arch-specific detail every other syscall here
+ * has been kept free of. */
+int sys_timerfd_settime_u(int fd, int abs, const uint64_t* times) {
+    uint64_t t[2] = { 0, 0 };
+    if (!times) return -1;
+    if (user_ptr_gate_armed()) {
+        if (!user_r(times, sizeof t)) return -1;
+        if (copy_from_user(t, (uintptr_t)times, sizeof t) != 0) return -1;
+    } else {
+        t[0] = times[0]; t[1] = times[1];
+    }
+    return sys_timerfd_settime(fd, abs, t[0], t[1]);
+}
+
+int sys_timerfd_gettime(int fd, uint64_t* out) {
+    uint64_t t[2] = { 0, 0 };
+    if (!out) return -1;
+    if (sys_timerfd_gettime_k(fd, &t[0], &t[1]) != 0) return -1;
+    if (user_ptr_gate_armed()) {
+        if (!user_w(out, sizeof t)) return -1;
+        return copy_to_user((uintptr_t)out, t, sizeof t) == 0 ? 0 : -1;
+    }
+    out[0] = t[0]; out[1] = t[1];
+    return 0;
+}
+
+int sys_setitimer_u(const uint64_t* times) {
+    uint64_t t[2] = { 0, 0 };
+    if (!times) return -1;
+    if (user_ptr_gate_armed()) {
+        if (!user_r(times, sizeof t)) return -1;
+        if (copy_from_user(t, (uintptr_t)times, sizeof t) != 0) return -1;
+    } else {
+        t[0] = times[0]; t[1] = times[1];
+    }
+    return sys_setitimer_ns(t[0], t[1]);
 }
 
 void fd_close_all(void) {

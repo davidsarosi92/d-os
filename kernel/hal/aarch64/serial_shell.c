@@ -22,6 +22,7 @@
 #include "pmm.h"
 #include "task.h"
 #include "timer.h"
+#include "syscall.h"   /* §M53 stage 3 — timerfd + setitimer self-tests */
 #include "ktimer.h"
 #include "pkg.h"
 #include "vfs.h"
@@ -192,6 +193,67 @@ static void cmd_pkgrun(const char* line) {
  * needs no calibration: the architecture defines CNTPCT_EL0's rate and hands it
  * over in CNTFRQ_EL0, so what is worth checking here is only that the numbers
  * agree with a tick-based sleep. */
+/* §M53 stage 3 — the ARM half of `timerfdtest`.  Same code path, coarser
+ * floor: this arch ticks at 100 Hz, so the error is ~10 ms rather than ~1 ms,
+ * and the test says so instead of looking broken. */
+static void cmd_timerfdtest(const char* args) {
+    unsigned period_ms = 0;
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) period_ms = period_ms * 10 + (unsigned)(*args - '0');
+    if (period_ms == 0) period_ms = 50;
+
+    int fd = sys_timerfd_create();
+    if (fd < 0) { kprintf("timerfd: create failed\n"); return; }
+    uint64_t period_ns = (uint64_t)period_ms * 1000000ull;
+    uint64_t t0 = timer_now_ns();
+    if (sys_timerfd_settime(fd, 0, period_ns, period_ns) != 0) {
+        kprintf("timerfd: settime failed\n"); sys_close(fd); return;
+    }
+    kprintf("timerfd: fd %d, period %u ms — waiting via poll(2)\n", fd, period_ms);
+    for (int i = 1; i <= 5; i++) {
+        struct pollfd pf = { .fd = fd, .events = POLLIN, .revents = 0 };
+        int r = sys_poll_k(&pf, 1, -1);
+        uint64_t now = timer_now_ns();
+        uint64_t buf = 0;
+        long got = sys_read_k(fd, &buf, sizeof buf);
+        uint64_t want = t0 + (uint64_t)i * period_ns;
+        long long err_us = (long long)((now - want) / 1000ull);
+        if (now < want) err_us = -(long long)((want - now) / 1000ull);
+        kprintf("  tick %d: poll=%d read=%d expirations=%u  drift %s%u us\n",
+                i, r, (int)got, (unsigned)buf, err_us < 0 ? "-" : "+",
+                (unsigned)(err_us < 0 ? -err_us : err_us));
+    }
+    sys_close(fd);
+    kprintf("timerfd: ok\n");
+}
+
+static void cmd_alarmtest(const char* args) {
+    unsigned ms = 0;
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) ms = ms * 10 + (unsigned)(*args - '0');
+    if (ms == 0) ms = 100;
+    struct task* me = task_current();
+    if (!me) return;
+    me->sig_pending &= ~(1u << SIGALRM);
+    uint64_t t0 = timer_now_ns();
+    if (sys_setitimer_ns((uint64_t)ms * 1000000ull, 0) != 0) {
+        kprintf("alarm: setitimer failed\n"); return;
+    }
+    for (int i = 0; i < 400; i++) {
+        if (me->sig_pending & (1u << SIGALRM)) break;
+        task_msleep(5);
+    }
+    uint64_t dt = timer_now_ns() - t0;
+    if (me->sig_pending & (1u << SIGALRM)) {
+        me->sig_pending &= ~(1u << SIGALRM);
+        kprintf("alarm: SIGALRM posted after %u us (asked for %u us)\nalarm: ok\n",
+                (unsigned)(dt / 1000), ms * 1000);
+    } else {
+        kprintf("alarm: FAIL — SIGALRM never arrived\n");
+    }
+    sys_setitimer_ns(0, 0);
+}
+
 /* §M54 — the ARM half of `killstorm` (see the x86 shell for the full
  * rationale).  The scheduler is arch-independent core code, so the race this
  * exercises — a task killed while blocked, on several CPUs at once — is the
@@ -432,6 +494,8 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "ktime"))  cmd_ktime();
         else if (s_eq(cmd, "ktimer")) cmd_ktimer();
         else if (s_eq(cmd, "killstorm")) cmd_killstorm(args);
+        else if (s_eq(cmd, "timerfdtest")) cmd_timerfdtest(args);
+        else if (s_eq(cmd, "alarmtest"))   cmd_alarmtest(args);
         else if (s_eq(cmd, "ps"))     cmd_ps();
         else if (s_eq(cmd, "ls"))     cmd_ls(args);
         else if (s_eq(cmd, "cat"))    cmd_cat(args);

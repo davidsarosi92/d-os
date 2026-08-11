@@ -93,6 +93,7 @@ when sections are added.)
 | 4.52 | The note that outlived its premise (M52 — per-CPU SYSCALL) | 5523 |
 | 4.53 | Time, in nanoseconds (M53 stages 1–2) | 5608 |
 | 4.54 | A task the scheduler was still standing on (M54) | 5720 |
+| 4.55 | A deadline you can wait on (M53 stage 3) | 5900 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -5943,6 +5944,124 @@ and cost two runs each.
 
 ---
 
+### 4.55 A deadline you can wait on (M53 stage 3)
+
+Stage 2 gave the kernel deadline timers and `clock_nanosleep` gave a program a
+way to wait for one — but only by doing nothing else while it waits.  A real
+event loop cannot afford that: it is already blocked in `poll` on sockets and
+pipes, and "wake me in 20 ms" has to arrive through the SAME wait, or the loop
+has to choose between being responsive to I/O and being punctual.
+
+Stage 3 closes both halves of the POSIX timing surface:
+
+- **`timerfd`** — the timer becomes a DESCRIPTOR, so a timeout is just another
+  readable fd and the loop keeps one blocking point instead of two.  This is
+  exactly what an `epoll`-shaped loop needs, which is why it had to land before
+  the async work rather than after it.
+- **`setitimer`** — for the program that wants to be INTERRUPTED by time rather
+  than to wait for it (a watchdog around a blocking call, a timeout on
+  something with no descriptor to poll).  Delivers SIGALRM.
+
+Both sit on stage 2's `ktimer`; only the delivery differs.
+
+#### The count is the point
+
+A read of a timerfd yields the number of EXPIRATIONS since the last read and
+resets it — Linux's semantics, kept deliberately.  A timer that quietly dropped
+the ticks nobody collected would let a program drift with no way to notice; the
+count is what makes a missed tick observable instead of invisible.  Same idea,
+one layer up, as the §M53 stage 1 finding that a millisecond clock can be N
+times too fast and nothing says so.
+
+#### Re-arm from the DEADLINE, never from now
+
+A periodic timer that re-arms from `now` adds each expiry's lateness to every
+subsequent period.  The lateness is bounded by the tick, so the drift is not:
+over a minute it accumulates without limit.  Stepping the stored deadline
+forward instead keeps the phase.  If the machine was busy longer than a whole
+period, whole periods are skipped and ADDED TO THE COUNT rather than fired as a
+catch-up burst — the reader learns it fell behind, which is the honest report.
+
+`timerfdtest` measures this the only way that can catch it: the error is
+reported against the ORIGINAL start, not against the previous tick.  A drifting
+timer looks perfect tick-to-tick.
+
+```
+x86_64, 50 ms period, waited on via poll(2):
+  tick 1: drift +953 us     tick 4: drift +782 us
+  tick 2: drift +1001 us    tick 5: drift +397 us
+  tick 3: drift +1066 us
+aarch64, same test:  +11293, +10386, +9248, +7269, +8424 us
+```
+
+The error oscillates around the tick period and does not accumulate.  ARM's
+floor is ~10 ms because it ticks at 100 Hz — the same number §M53 stage 2
+measured, now visible from a second direction.
+
+#### The `word_bytes` the map was missing
+
+`struct itimerspec` is four `long`s: 16 bytes on a 32-bit guest and 32 on a
+64-bit one.  The §M50 engine's handlers are shared across every architecture
+and deliberately never learn which one they are on — so the width had to come
+from somewhere else, and the right somewhere was the GUEST DESCRIPTION that
+already existed: `struct abi_map` gained `word_bytes`.  A handler that had
+inferred it from the host's own `sizeof(long)` would be right only by
+coincidence, and would break silently the first time a 32-bit guest ran on a
+64-bit kernel.
+
+That is the §M50 payoff arriving as advertised: **four canonical operations,
+four handlers, four rows per guest table — and `timerfd` exists on all three
+architectures at once.**  `it_interval` comes FIRST in `itimerspec`; getting
+that backwards produces a timer that works exactly once and then never again,
+which reads like a different bug entirely.  `setitimer`'s `itimerval` is
+MICROseconds, not nanoseconds — the one place POSIX uses a different unit for
+the same idea, and a silent factor of 1000 if it is missed.
+
+#### Delivery is a bit, not a call
+
+The itimer callback runs in interrupt context, so it does the one thing that is
+safe there: set the pending-signal bit atomically.  The task notices it on its
+own return-to-user path, where every other signal is delivered — so this adds a
+SOURCE of signals, not a second delivery mechanism.  `sys_kill` would have been
+the tidier call and is the wrong one: it takes the scheduler's lock and applies
+a ring-3 credential rule, neither of which belongs on a timer interrupt.
+
+Interval timers live in a table keyed by pid rather than in `struct task`.  A
+timer embedded in the task would have to be cancelled at exactly the right
+point in teardown, and the cost of getting that wrong is a callback firing into
+freed memory — §M54's failure, one layer up.  `task_exit_code` cancels the slot;
+a pid that is gone is simply a miss.
+
+#### Interfaces
+
+| Native | Linux (i386 / amd64 / arm64) |
+|---|---|
+| `SYS_TIMERFD_CREATE` 37 | 322 / 283 / 85 |
+| `SYS_TIMERFD_SETTIME` 38 | 325 / 286 / 86 |
+| `SYS_TIMERFD_GETTIME` 39 | 326 / 287 / 87 |
+| `SYS_SETITIMER` 40 | 104 / 38 / 103 |
+
+The native calls pass times as a two-element `uint64_t` array rather than as
+register arguments: a nanosecond value does not fit one register on i386, and
+packing it into a register PAIR would make the native ABI's shape depend on the
+word size — the arch-specific detail every other syscall here has been kept
+free of.
+
+Shell: `timerfdtest [ms]`, `alarmtest [ms]` (both shells, all three arches).
+
+#### Open
+
+- `timer_create`/`timer_settime` (POSIX per-process timer IDs, `sigev_notify`)
+  are not implemented; `setitimer` covers ITIMER_REAL, which is what almost
+  every program that wants an alarm actually uses.  ITIMER_VIRTUAL and
+  ITIMER_PROF need per-task CPU-time accounting hooks and are declined rather
+  than faked.
+- `poll(2)` still treats a positive timeout as a snapshot.  Now that a deadline
+  is a first-class object, a finite `poll` timeout is a timerfd internally —
+  the natural next step, and the one the async work wants.
+
+---
+
 ## 7. Roadmap / open milestones
 
 - [x] **M1 — GDT:** own Global Descriptor Table, stop relying on GRUB's.
@@ -5966,6 +6085,32 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-10 — §M53 stage 3: a deadline you can wait on (DOCS §4.55).**
+  `timerfd` (create/settime/gettime, read, poll-integrated) and `setitimer`
+  (SIGALRM), on all three arches.  A timer behind a descriptor is what lets an
+  event loop wait for time and for I/O in ONE place instead of choosing between
+  being responsive and being punctual — the piece an `epoll`-shaped loop needs,
+  which is why it landed before the async work.  A read yields the EXPIRATION
+  COUNT and resets it, so a loop that fell behind learns how far; a timer that
+  dropped uncollected ticks would let a program drift with nothing to notice.
+  Periodic timers re-arm from the stored DEADLINE, never from `now`: re-arming
+  from now adds each expiry's lateness to every later period, and since lateness
+  is bounded by the tick but drift is not, it accumulates without limit.
+  `timerfdtest` measures the error against the ORIGINAL start rather than the
+  previous tick — a drifting timer looks perfect tick-to-tick — and shows it
+  oscillating around the tick floor (~1 ms x86, ~10 ms aarch64 at 100 Hz)
+  instead of growing.  The §M50 engine paid off as advertised: four canonical
+  ops, four handlers and four table rows per guest gave all three arches
+  `timerfd` at once — with one addition, `abi_map.word_bytes`, because
+  `struct itimerspec` is four `long`s (16 bytes on a 32-bit guest, 32 on a
+  64-bit one) and the width is a property of the GUEST, not something a shared
+  handler may infer from the host.  Interval timers live in a pid-keyed table
+  rather than in `struct task`: an embedded timer would have to be cancelled at
+  exactly the right point in teardown, and getting that wrong fires a callback
+  into freed memory — §M54's failure one layer up.  Delivery is an atomic
+  pending-signal bit set from interrupt context, not a `sys_kill` (which takes
+  the scheduler lock and applies a ring-3 credential rule).
 
 - **2026-08-10 — §M54: a task the scheduler was still standing on (DOCS §4.54).**
   Reported as "open NetSurf, it crashes, reopen it, the machine dies"; the

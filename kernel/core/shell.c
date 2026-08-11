@@ -130,6 +130,7 @@ static void cmd_help(void) {
                   "  ringtest, ps, spawn, yield, loop, kill <pid>, fkill <pid>\n"
                   "  wedge (runaway ring-3 task), faulttest (bad user pointers)\n"
                   "  killstorm [rounds] [tasks] (kill blocked tasks under SMP)\n"
+                  "  timerfdtest [ms], alarmtest [ms] (timing, M53 stage 3)\n"
                   "  fputest (per-task FP/SIMD register file)\n"
                   "  archtest (ELF arch gate), crash (what has gone wrong)\n"
                   "  pane, pane split horizontal|vertical\n"
@@ -372,6 +373,103 @@ static void cmd_killstorm(const char* args) {
         task_list();
         task_kill(drvpid);
     }
+}
+
+/* -------------------------------------------------------------------- */
+/* §M53 stage 3 — `timerfdtest`: prove that a deadline can be WAITED FOR  */
+/* alongside I/O, and that a periodic one does not drift.                */
+/*                                                                       */
+/* Two things are measured rather than asserted.  (1) The wait goes       */
+/* through poll(2), not through a sleep — that is the whole point of the  */
+/* descriptor, and a timerfd that woke only its own reader would pass a   */
+/* read-based test and still be useless to an event loop.  (2) The error  */
+/* reported is the error against the ORIGINAL start, not against the      */
+/* previous tick: a timer that re-arms from "now" looks perfect tick to   */
+/* tick and drifts without bound over a minute, and only the cumulative   */
+/* number shows it.                                                      */
+/* -------------------------------------------------------------------- */
+static void cmd_timerfdtest(const char* args) {
+    unsigned period_ms = 0;
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) period_ms = period_ms * 10 + (unsigned)(*args - '0');
+    if (period_ms == 0) period_ms = 50;
+
+    int fd = sys_timerfd_create();
+    if (fd < 0) { console_write("timerfd: create failed\n"); return; }
+
+    uint64_t period_ns = (uint64_t)period_ms * 1000000ull;
+    uint64_t t0 = timer_now_ns();
+    if (sys_timerfd_settime(fd, 0 /* relative */, period_ns, period_ns) != 0) {
+        console_write("timerfd: settime failed\n");
+        sys_close(fd);
+        return;
+    }
+    kprintf("timerfd: fd %d, period %u ms — waiting via poll(2)\n", fd, period_ms);
+
+    for (int i = 1; i <= 5; i++) {
+        struct pollfd pf = { .fd = fd, .events = POLLIN, .revents = 0 };
+        int r = sys_poll_k(&pf, 1, -1);         /* block until readable */
+        uint64_t now = timer_now_ns();
+        uint64_t buf = 0;
+        long got = sys_read_k(fd, &buf, sizeof buf);
+
+        /* Error against the START, not against the previous tick — see above. */
+        uint64_t want = t0 + (uint64_t)i * period_ns;
+        long long err_us = (long long)((now - want) / 1000ull);
+        if (now < want) err_us = -(long long)((want - now) / 1000ull);
+
+        kprintf("  tick %d: poll=%d revents=%x read=%d expirations=%u  drift %s%u us\n",
+                i, r, (unsigned)pf.revents, (int)got, (unsigned)buf,
+                err_us < 0 ? "-" : "+",
+                (unsigned)(err_us < 0 ? -err_us : err_us));
+    }
+
+    uint64_t rem = 0, iv = 0;
+    sys_timerfd_gettime_k(fd, &rem, &iv);
+    kprintf("  gettime: %u us to go, interval %u us\n",
+            (unsigned)(rem / 1000), (unsigned)(iv / 1000));
+    sys_close(fd);
+    console_write("timerfd: ok\n");
+}
+
+/* §M53 stage 3 — `alarmtest`: the OTHER delivery.  A program with nothing to
+ * poll wants to be interrupted, not woken, so this arms an interval timer and
+ * watches SIGALRM land in the caller's pending set. */
+static void cmd_alarmtest(const char* args) {
+    unsigned ms = 0;
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) ms = ms * 10 + (unsigned)(*args - '0');
+    if (ms == 0) ms = 100;
+
+    struct task* me = task_current();
+    if (!me) return;
+    me->sig_pending &= ~(1u << SIGALRM);
+
+    uint64_t t0 = timer_now_ns();
+    if (sys_setitimer_ns((uint64_t)ms * 1000000ull, 0) != 0) {
+        console_write("alarm: setitimer failed\n");
+        return;
+    }
+    kprintf("alarm: armed for %u ms — waiting for SIGALRM to be posted\n", ms);
+
+    /* A kernel task never takes a return-to-user trip, so it observes the
+     * PENDING BIT rather than a handler call.  Same signal, same posting
+     * path — only the delivery point differs, and that difference is what
+     * this test deliberately does not pretend to cover. */
+    for (int i = 0; i < 400; i++) {
+        if (me->sig_pending & (1u << SIGALRM)) break;
+        task_msleep(5);
+    }
+    uint64_t dt = timer_now_ns() - t0;
+    if (me->sig_pending & (1u << SIGALRM)) {
+        me->sig_pending &= ~(1u << SIGALRM);
+        kprintf("alarm: SIGALRM posted after %u us (asked for %u us)\n",
+                (unsigned)(dt / 1000), ms * 1000);
+        console_write("alarm: ok\n");
+    } else {
+        console_write("alarm: FAIL — SIGALRM never arrived\n");
+    }
+    sys_setitimer_ns(0, 0);
 }
 
 /* -------------------------------------------------------------------- */
@@ -3343,6 +3441,10 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "wedge"))          { cmd_wedge();     return; }
     if (streq(line, "spawn"))          { cmd_spawn();    return; }
     if (streq(line, "killstorm"))      { cmd_killstorm("");        return; }
+    if (streq(line, "timerfdtest"))    { cmd_timerfdtest("");      return; }
+    if (starts_with(line, "timerfdtest ")) { cmd_timerfdtest(line + 12); return; }
+    if (streq(line, "alarmtest"))      { cmd_alarmtest("");        return; }
+    if (starts_with(line, "alarmtest ")) { cmd_alarmtest(line + 10); return; }
     if (starts_with(line, "killstorm ")) { cmd_killstorm(line + 10); return; }
     if (streq(line, "yield"))          { task_yield();   return; }
     if (streq(line, "loop"))           { cmd_loop("");   return; }

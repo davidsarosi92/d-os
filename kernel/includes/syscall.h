@@ -64,6 +64,15 @@
 #define SYS_CLOCK_GETTIME 34/* (which, struct ktimespec*) → 0                  */
 #define SYS_NANOSLEEP 35    /* (ms) → 0  (millisecond sleep, simplified)       */
 #define SYS_GETRANDOM 36    /* (buf, n, flags) → bytes  (§M39 CSPRNG)          */
+/* §M53 stage 3 — a deadline behind a descriptor, so an event loop can wait for
+ * time and for I/O in the SAME poll instead of choosing between them.  Times
+ * are NANOSECONDS on the timer_now_ns() timeline: `struct itimerspec` is four
+ * words whose width depends on the guest, and that is a personality's problem,
+ * not this interface's. */
+#define SYS_TIMERFD_CREATE  37  /* () → fd                                     */
+#define SYS_TIMERFD_SETTIME 38  /* (fd, abs, u64 times[2]) → 0 / -1            */
+#define SYS_TIMERFD_GETTIME 39  /* (fd, u64 out[2]) → 0 / -1                   */
+#define SYS_SETITIMER 40        /* (u64 times[2]) → 0 — delivers SIGALRM       */
 
 /* M36 shared structs (kernel + libc agree on the layout). */
 struct kstat {
@@ -97,6 +106,7 @@ struct kdirent { uint16_t reclen; uint8_t type; char name[]; };
 #define SIGKILL    9
 #define SIGUSR1    10
 #define SIGSEGV    11
+#define SIGALRM    14       /* §M53 stage 3 — setitimer/alarm expiry           */
 #define SIGUSR2    12
 #define SIGTERM    15
 #define SIGCHLD    17
@@ -139,6 +149,16 @@ int  sys_socketpair(int* fds);          /* fds[0],fds[1] = connected unix pair *
 int  sys_pipe(int* fds);                /* fds[0]=read, fds[1]=write            */
 int  sys_dup2(int oldfd, int newfd);    /* redirect a descriptor               */
 int  sys_kill(int pid, int sig);        /* post a signal to a task             */
+/* §M53 stage 3 — see the SYS_TIMERFD_* notes above. */
+int  sys_timerfd_create(void);
+int  sys_timerfd_settime(int fd, int abs, uint64_t value_ns, uint64_t interval_ns);
+int  sys_timerfd_gettime_k(int fd, uint64_t* remaining_ns, uint64_t* interval_ns);
+int  sys_timerfd_settime_u(int fd, int abs, const uint64_t* times);
+int  sys_timerfd_gettime(int fd, uint64_t* out);
+int  sys_setitimer_u(const uint64_t* times);
+int  sys_setitimer_ns(uint64_t value_ns, uint64_t interval_ns);
+int  sys_getitimer_ns(uint64_t* value_ns, uint64_t* interval_ns);
+void itimer_cancel_pid(int pid);        /* called when a task exits            */
 long sys_sigaction(int sig, long handler, long restorer);  /* → old handler    */
 int  sys_socket(int domain, int type, int proto);          /* M24 socket API   */
 int  sys_bind(int fd, int port);

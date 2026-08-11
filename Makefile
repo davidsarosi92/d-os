@@ -666,6 +666,8 @@ CORE_C_SRCS := \
     kernel/core/workqueue.c \
     kernel/core/ktime.c \
     kernel/core/ktimer.c \
+    kernel/core/timerfd.c \
+    kernel/core/itimer.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/pkg.c \
@@ -707,6 +709,8 @@ CORE_C_SRCS := \
     kernel/core/workqueue.c \
     kernel/core/ktime.c \
     kernel/core/ktimer.c \
+    kernel/core/timerfd.c \
+    kernel/core/itimer.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/net.c \
@@ -843,6 +847,8 @@ CORE_C_SRCS := \
     kernel/core/workqueue.c \
     kernel/core/ktime.c \
     kernel/core/ktimer.c \
+    kernel/core/timerfd.c \
+    kernel/core/itimer.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/pkg.c \

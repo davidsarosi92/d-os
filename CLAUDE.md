@@ -69,7 +69,44 @@ box unaffected); an i386 `killstorm` run once hung a shell task (box stayed up);
 on no queue — setting it to -1 is more honest and HANGS tasks, because the block
 paths use `cpu_home` to find the queue to detach from.
 
-▶️ **§M53 STAGES 1–2 — TIME, IN NANOSECONDS (2026-08-09, DOCS §4.53, all 3
+✅ **§M53 STAGE 3 — A DEADLINE YOU CAN WAIT ON (2026-08-10, DOCS §4.55, all 3
+arches).**  `timerfd` + `setitimer`.  Stage 2 let a program WAIT for a deadline
+but only by doing nothing else meanwhile; a real event loop is already blocked
+in `poll` on its sockets, so "wake me in 20 ms" has to arrive through the SAME
+wait or the loop chooses between being responsive and being punctual.  A timer
+behind a DESCRIPTOR makes the two commensurable — and it is exactly what an
+`epoll`-shaped loop needs, which is why it landed before the async work.
+`setitimer` is the other delivery (SIGALRM) for the program with nothing to
+poll.  **A read yields the EXPIRATION COUNT and resets it**: a timer that
+silently dropped uncollected ticks would let a program drift with nothing to
+notice — the §M53 stage-1 lesson one layer up.  **Periodic timers re-arm from
+the stored DEADLINE, never from `now`** — re-arming from now adds each expiry's
+lateness to every later period, and lateness is bounded by the tick while the
+drift is not.  `timerfdtest` measures error against the ORIGINAL start, not the
+previous tick (*a drifting timer looks perfect tick-to-tick*): it oscillates
+around the tick floor (~1 ms x86, ~10 ms aarch64 at 100 Hz) and does not grow.
+**§M50's engine paid off exactly as advertised — four canonical ops, four
+handlers, four table rows per guest, and all three arches got `timerfd` at
+once** — with one addition: **`abi_map.word_bytes`**, because `struct
+itimerspec` is four `long`s (16 bytes on a 32-bit guest, 32 on a 64-bit one)
+and the width is a property of the GUEST, not something a shared handler may
+infer from the host's own `sizeof(long)`.  Traps worth keeping: `it_interval`
+comes FIRST in `itimerspec` (getting it backwards yields a timer that works
+exactly once, which reads like a different bug), and `itimerval` is
+MICROseconds — the one place POSIX uses a different unit for the same idea.
+Interval timers live in a **pid-keyed table, not in `struct task`**: an embedded
+timer must be cancelled at exactly the right point in teardown, and getting that
+wrong fires a callback into freed memory (§M54's failure one layer up).
+Delivery is an atomic pending-signal BIT set from interrupt context, never
+`sys_kill` (which takes the scheduler lock + applies a ring-3 credential rule).
+Shell: `timerfdtest [ms]`, `alarmtest [ms]`.  **Open:** `timer_create`
+(per-process timer IDs / `sigev_notify`) and ITIMER_VIRTUAL/PROF (need per-task
+CPU-time hooks — declined rather than faked); `poll(2)` still treats a positive
+timeout as a snapshot, and now that a deadline is a first-class object a finite
+`poll` timeout should just BE a timerfd internally — the next thing the async
+work wants.
+
+✅ **§M53 STAGES 1–2 — TIME, IN NANOSECONDS (2026-08-09, DOCS §4.53, all 3
 arches).**  `timer_now_ns()` — ONE monotonic nanosecond clock from whatever the
 machine has, callers never learning which: `CNTPCT_EL0` on aarch64 (62.5 MHz,
 16 ns; the architecture DEFINES the rate, nothing to calibrate) and the TSC on

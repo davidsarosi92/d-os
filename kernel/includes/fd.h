@@ -20,9 +20,10 @@ struct file;                    /* vfs.h  */
 struct shm;                     /* below  */
 struct usock;                   /* unix socket endpoint (stage 5)          */
 
-enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK };
+enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER };
 
 struct netsock;                 /* network (AF_INET) socket — usyscall.c        */
+struct timerfd;                 /* §M53 stage 3 — a deadline behind a descriptor */
 
 struct ofile {
     enum fd_kind kind;
@@ -31,6 +32,7 @@ struct ofile {
     struct shm*  shm;           /* FD_SHM  */
     struct usock* sock;         /* FD_SOCK */
     struct netsock* nsock;      /* FD_NETSOCK (M24 socket API) */
+    struct timerfd* tfd;        /* FD_TIMER (§M53 stage 3) */
 };
 
 /* Wrap a resource in a fresh ofile (refcount 1), or NULL on OOM. */
@@ -38,6 +40,7 @@ struct ofile* ofile_from_file(struct file* f);
 struct ofile* ofile_from_shm (struct shm* s);
 struct ofile* ofile_from_sock(struct usock* s);
 struct ofile* ofile_from_netsock(struct netsock* s);
+struct ofile* ofile_from_timerfd(struct timerfd* t);
 
 /* Refcount management.  ofile_unref drops the last reference → closes the
  * wrapped resource + frees the ofile. */

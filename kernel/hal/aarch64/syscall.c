@@ -175,6 +175,20 @@ static void aarch64_syscall_body(struct trapframe* tf) {
             break;
 
         /* ---- §A1: signals ------------------------------------------------ */
+        case SYS_TIMERFD_CREATE:
+            tf->x[0] = (uint64_t)sys_timerfd_create();
+            break;
+        case SYS_TIMERFD_SETTIME:
+            tf->x[0] = (uint64_t)sys_timerfd_settime_u((int)tf->x[0], (int)tf->x[1],
+                                                       (const uint64_t*)tf->x[2]);
+            break;
+        case SYS_TIMERFD_GETTIME:
+            tf->x[0] = (uint64_t)sys_timerfd_gettime((int)tf->x[0],
+                                                     (uint64_t*)tf->x[1]);
+            break;
+        case SYS_SETITIMER:
+            tf->x[0] = (uint64_t)sys_setitimer_u((const uint64_t*)tf->x[0]);
+            break;
         case SYS_KILL:
             tf->x[0] = (uint64_t)sys_kill((int)tf->x[0], (int)tf->x[1]);
             break;

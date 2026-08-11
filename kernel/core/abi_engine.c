@@ -85,6 +85,112 @@ static int abi_user_w_ok(unsigned long uptr, unsigned long len) {
     return uptr && vmm_user_access_ok((uintptr_t)uptr, (uintptr_t)len, 1);
 }
 
+/* §M53 stage 3 — read/write a guest `long` at the guest's own width.
+ *
+ * `struct itimerspec` is four longs; on a 32-bit guest that is 16 bytes and on
+ * a 64-bit one 32.  These two helpers are the entire difference, and they take
+ * the width from the MAP (the guest's description) rather than from sizeof on
+ * the host — which would be right only when guest and kernel happen to agree. */
+static unsigned long abi_get_word(const struct abi_ctx* c, unsigned long p, int i) {
+    if (c->map && c->map->word_bytes == 4)
+        return (unsigned long)((const uint32_t*)(uintptr_t)p)[i];
+    return (unsigned long)((const uint64_t*)(uintptr_t)p)[i];
+}
+
+static void abi_put_word(const struct abi_ctx* c, unsigned long p, int i,
+                         unsigned long v) {
+    if (c->map && c->map->word_bytes == 4) ((uint32_t*)(uintptr_t)p)[i] = (uint32_t)v;
+    else                                   ((uint64_t*)(uintptr_t)p)[i] = (uint64_t)v;
+}
+
+static unsigned long abi_itimerspec_bytes(const struct abi_ctx* c) {
+    return (c->map && c->map->word_bytes == 4) ? 16u : 32u;
+}
+
+/* itimerspec layout, in guest words: [0]=it_interval.sec [1]=it_interval.nsec
+ * [2]=it_value.sec [3]=it_value.nsec.  Note the INTERVAL comes first — a
+ * detail worth stating, because getting it backwards produces a timer that
+ * works exactly once and then never again, which reads like a different bug. */
+#define ABI_ITS_IV_SEC   0
+#define ABI_ITS_IV_NSEC  1
+#define ABI_ITS_VAL_SEC  2
+#define ABI_ITS_VAL_NSEC 3
+
+static long h_timerfd_create(struct abi_ctx* c) {
+    (void)c;
+    /* The clockid and flags are accepted and ignored: there is one clock here
+     * (timer_now_ns) and it is monotonic, so CLOCK_MONOTONIC is what every
+     * caller gets whatever it asked for.  Failing instead would stop programs
+     * that pass CLOCK_REALTIME out of habit and never depend on the
+     * difference. */
+    return sys_timerfd_create();
+}
+
+static long h_timerfd_settime(struct abi_ctx* c) {
+    int fd  = (int)c->a[0];
+    int abs = (c->a[1] & 1) != 0;               /* TFD_TIMER_ABSTIME */
+    unsigned long newp = c->a[2], oldp = c->a[3];
+    if (!newp) return -ABI_EFAULT;
+    if (!vmm_user_access_ok((uintptr_t)newp, abi_itimerspec_bytes(c), 0))
+        return -ABI_EFAULT;
+
+    if (oldp) {
+        if (!abi_user_w_ok(oldp, abi_itimerspec_bytes(c))) return -ABI_EFAULT;
+        uint64_t rem = 0, iv = 0;
+        sys_timerfd_gettime_k(fd, &rem, &iv);
+        abi_put_word(c, oldp, ABI_ITS_IV_SEC,   (unsigned long)(iv / 1000000000ull));
+        abi_put_word(c, oldp, ABI_ITS_IV_NSEC,  (unsigned long)(iv % 1000000000ull));
+        abi_put_word(c, oldp, ABI_ITS_VAL_SEC,  (unsigned long)(rem / 1000000000ull));
+        abi_put_word(c, oldp, ABI_ITS_VAL_NSEC, (unsigned long)(rem % 1000000000ull));
+    }
+
+    uint64_t iv_ns = (uint64_t)abi_get_word(c, newp, ABI_ITS_IV_SEC) * 1000000000ull
+                   + (uint64_t)abi_get_word(c, newp, ABI_ITS_IV_NSEC);
+    uint64_t v_ns  = (uint64_t)abi_get_word(c, newp, ABI_ITS_VAL_SEC) * 1000000000ull
+                   + (uint64_t)abi_get_word(c, newp, ABI_ITS_VAL_NSEC);
+    return sys_timerfd_settime(fd, abs, v_ns, iv_ns) == 0 ? 0 : -ABI_EFAULT;
+}
+
+static long h_timerfd_gettime(struct abi_ctx* c) {
+    unsigned long p = c->a[1];
+    if (!abi_user_w_ok(p, abi_itimerspec_bytes(c))) return -ABI_EFAULT;
+    uint64_t rem = 0, iv = 0;
+    if (sys_timerfd_gettime_k((int)c->a[0], &rem, &iv) != 0) return -ABI_EFAULT;
+    abi_put_word(c, p, ABI_ITS_IV_SEC,   (unsigned long)(iv / 1000000000ull));
+    abi_put_word(c, p, ABI_ITS_IV_NSEC,  (unsigned long)(iv % 1000000000ull));
+    abi_put_word(c, p, ABI_ITS_VAL_SEC,  (unsigned long)(rem / 1000000000ull));
+    abi_put_word(c, p, ABI_ITS_VAL_NSEC, (unsigned long)(rem % 1000000000ull));
+    return 0;
+}
+
+/* setitimer(which, new, old).  `struct itimerval` is microseconds, not
+ * nanoseconds — the one place POSIX uses a different unit for the same idea,
+ * and a silent factor of 1000 if it is missed. */
+static long h_setitimer(struct abi_ctx* c) {
+    int which = (int)c->a[0];
+    if (which != 0) return -ABI_ENOSYS;         /* only ITIMER_REAL → SIGALRM */
+    unsigned long newp = c->a[1], oldp = c->a[2];
+
+    if (oldp) {
+        if (!abi_user_w_ok(oldp, abi_itimerspec_bytes(c))) return -ABI_EFAULT;
+        uint64_t v = 0, iv = 0;
+        sys_getitimer_ns(&v, &iv);
+        abi_put_word(c, oldp, ABI_ITS_IV_SEC,   (unsigned long)(iv / 1000000000ull));
+        abi_put_word(c, oldp, ABI_ITS_IV_NSEC,  (unsigned long)((iv % 1000000000ull) / 1000));
+        abi_put_word(c, oldp, ABI_ITS_VAL_SEC,  (unsigned long)(v / 1000000000ull));
+        abi_put_word(c, oldp, ABI_ITS_VAL_NSEC, (unsigned long)((v % 1000000000ull) / 1000));
+    }
+    if (!newp) return 0;                        /* query-only form */
+    if (!vmm_user_access_ok((uintptr_t)newp, abi_itimerspec_bytes(c), 0))
+        return -ABI_EFAULT;
+
+    uint64_t iv_ns = (uint64_t)abi_get_word(c, newp, ABI_ITS_IV_SEC) * 1000000000ull
+                   + (uint64_t)abi_get_word(c, newp, ABI_ITS_IV_NSEC) * 1000ull;
+    uint64_t v_ns  = (uint64_t)abi_get_word(c, newp, ABI_ITS_VAL_SEC) * 1000000000ull
+                   + (uint64_t)abi_get_word(c, newp, ABI_ITS_VAL_NSEC) * 1000ull;
+    return sys_setitimer_ns(v_ns, iv_ns) == 0 ? 0 : -ABI_EFAULT;
+}
+
 struct abi_iovec { void* base; unsigned long len; };
 
 /* readv/writev: a vector, not a buffer.  Looping over sys_read/sys_write is
@@ -203,6 +309,10 @@ static const struct {
     [ABI_MMAP]     = { "mmap",     h_mmap },
     [ABI_SET_TID_ADDRESS] = { "set_tid_address", h_settid },
     [ABI_SIGPROCMASK]     = { "sigprocmask",     h_sigprocmask },
+    [ABI_TIMERFD_CREATE]  = { "timerfd_create",  h_timerfd_create  },
+    [ABI_TIMERFD_SETTIME] = { "timerfd_settime", h_timerfd_settime },
+    [ABI_TIMERFD_GETTIME] = { "timerfd_gettime", h_timerfd_gettime },
+    [ABI_SETITIMER]       = { "setitimer",       h_setitimer       },
     [ABI_WAIT]            = { "wait",            h_wait },
     [ABI_EXECVE]          = { "execve",          h_execve },
 };

@@ -63,6 +63,11 @@ static const struct abi_nument linux_i386_ents[] = {
     {  45, ABI_BRK      },
     { 258, ABI_SET_TID_ADDRESS },
     { 224, ABI_GETTID   },
+    /* §M53 stage 3 — timing. */
+    { 322, ABI_TIMERFD_CREATE  },
+    { 325, ABI_TIMERFD_SETTIME },
+    { 326, ABI_TIMERFD_GETTIME },
+    { 104, ABI_SETITIMER       },
 };
 
 /* ---- Linux / amd64 -------------------------------------------------------- */
@@ -81,6 +86,11 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  12, ABI_BRK      },
     { 218, ABI_SET_TID_ADDRESS },
     { 186, ABI_GETTID   },
+    /* §M53 stage 3 — timing. */
+    { 283, ABI_TIMERFD_CREATE  },
+    { 286, ABI_TIMERFD_SETTIME },
+    { 287, ABI_TIMERFD_GETTIME },
+    {  38, ABI_SETITIMER       },
 };
 
 /* ---- Linux / arm64 (the asm-generic numbering) ---------------------------- */
@@ -103,16 +113,21 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 135, ABI_SIGPROCMASK },
     { 260, ABI_WAIT     },          /* wait4 */
     { 221, ABI_EXECVE   },
+    /* §M53 stage 3 — timing. */
+    {  85, ABI_TIMERFD_CREATE  },
+    {  86, ABI_TIMERFD_SETTIME },
+    {  87, ABI_TIMERFD_GETTIME },
+    { 103, ABI_SETITIMER       },
 };
 
 #define ARRAY_N(a) ((uint32_t)(sizeof(a) / sizeof((a)[0])))
 
 const struct abi_map abi_map_linux_i386 = {
-    "linux/i386",  linux_i386_ents,  ARRAY_N(linux_i386_ents)
+    "linux/i386",  linux_i386_ents,  ARRAY_N(linux_i386_ents),  4
 };
 const struct abi_map abi_map_linux_amd64 = {
-    "linux/amd64", linux_amd64_ents, ARRAY_N(linux_amd64_ents)
+    "linux/amd64", linux_amd64_ents, ARRAY_N(linux_amd64_ents), 8
 };
 const struct abi_map abi_map_linux_arm64 = {
-    "linux/arm64", linux_arm64_ents, ARRAY_N(linux_arm64_ents)
+    "linux/arm64", linux_arm64_ents, ARRAY_N(linux_arm64_ents), 8
 };

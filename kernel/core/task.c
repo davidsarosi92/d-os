@@ -2072,6 +2072,11 @@ void task_exit_code(int code) {
      * which is precisely the state in which a sweep of EVERY queue becomes
      * airtight (see rq_purge_all).  The cost is one uncontended lock per CPU,
      * once, on a path that is already the slowest thing a task ever does. */
+    /* §M53 stage 3 — an interval timer must not outlive its owner: pids are
+     * reused, and an alarm landing on an unrelated process later would look
+     * like a random SIGALRM with nothing to trace it to. */
+    itimer_cancel_pid(self->pid);
+
     rq_purge_all(self);
     uint32_t rfl = spin_lock_irqsave(&me->rq_lock);
     schedule_locked(me);

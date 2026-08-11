@@ -342,6 +342,20 @@ static void syscall_dispatch_body(struct int_frame* f) {
         case SYS_NANOSLEEP:
             f->rax = (uint64_t)sys_nanosleep((unsigned)f->rbx);
             return;
+        case SYS_TIMERFD_CREATE:
+            f->rax = (uint64_t)sys_timerfd_create();
+            return;
+        case SYS_TIMERFD_SETTIME:
+            f->rax = (uint64_t)sys_timerfd_settime_u((int)f->rbx, (int)f->rcx,
+                                                     (const uint64_t*)(uintptr_t)f->rdx);
+            return;
+        case SYS_TIMERFD_GETTIME:
+            f->rax = (uint64_t)sys_timerfd_gettime((int)f->rbx,
+                                                   (uint64_t*)(uintptr_t)f->rcx);
+            return;
+        case SYS_SETITIMER:
+            f->rax = (uint64_t)sys_setitimer_u((const uint64_t*)(uintptr_t)f->rbx);
+            return;
         case SYS_GETRANDOM:
             f->rax = (uint64_t)sys_getrandom((void*)(uintptr_t)f->rbx, (size_t)f->rcx,
                                              (unsigned)f->rdx);

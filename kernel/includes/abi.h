@@ -100,6 +100,17 @@ enum abi_op {
     ABI_WAIT,
     ABI_EXECVE,
 
+    /* §M53 stage 3 — timing.  A deadline behind a descriptor, so a guest event
+     * loop can wait for time and for I/O in one place, plus the interval timer
+     * that delivers SIGALRM for the guest that wants to be interrupted instead.
+     * Both arrive as `struct itimerspec`, whose WORD WIDTH is a property of the
+     * guest ABI — which is why the map now carries it (see abi_map.word_bytes)
+     * rather than the handler guessing. */
+    ABI_TIMERFD_CREATE,
+    ABI_TIMERFD_SETTIME,
+    ABI_TIMERFD_GETTIME,
+    ABI_SETITIMER,
+
     ABI_OP_MAX
 };
 
@@ -141,6 +152,16 @@ struct abi_map {
     const char*             name;       /* "linux/amd64" — appears in diagnostics */
     const struct abi_nument* ents;
     uint32_t                n_ents;
+    /* §M53 stage 3 — the guest's word size in bytes (4 or 8).
+     *
+     * Most operations never need it: a pointer is a pointer and an int is an
+     * int.  But some pass STRUCTS whose layout is `long`-shaped — timespec,
+     * itimerspec, stat — and those are 16 bytes on a 32-bit guest and 32 on a
+     * 64-bit one.  Putting the width in the MAP keeps that where the rest of
+     * the guest's description already lives; a handler that inferred it from
+     * the host's own word size would be right only by coincidence, and would
+     * silently break the first time a 32-bit guest ran on a 64-bit kernel. */
+    uint8_t                 word_bytes;
 };
 
 /* Look up a guest number.  Returns ABI_OP_NONE when the map does not name it,
