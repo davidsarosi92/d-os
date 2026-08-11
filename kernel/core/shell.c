@@ -294,10 +294,41 @@ static void cmd_spawn(void) {
 /* -------------------------------------------------------------------- */
 
 static volatile int g_ks_alive;
+static volatile int g_ks_round;          /* progress, readable from outside */
+static volatile int g_ks_done;
+static volatile int g_ks_rounds, g_ks_per;
+static volatile int g_ks_spawned, g_ks_killed;
 
 static void killstorm_victim(void) {
     while (!task_should_stop()) task_msleep(2);
     __atomic_sub_fetch(&g_ks_alive, 1, __ATOMIC_RELAXED);
+}
+
+/* The storm runs on its OWN task, not on the shell.  If it stalls, the shell
+ * is still there to say so and to dump the task table — a test that hangs
+ * along with the thing it is testing reports nothing at all, which is exactly
+ * how two runs of this were wasted. */
+static void killstorm_driver(void) {
+    int rounds = g_ks_rounds, per = g_ks_per;
+    for (int r = 0; r < rounds; r++) {
+        int pids[32];
+        int n = 0;
+        for (int i = 0; i < per; i++) {
+            struct task* t = task_spawn("ks-victim", killstorm_victim);
+            if (!t) break;
+            pids[n++] = t->pid;
+            __atomic_add_fetch(&g_ks_alive, 1, __ATOMIC_RELAXED);
+        }
+        __atomic_add_fetch(&g_ks_spawned, n, __ATOMIC_RELAXED);
+        /* Let them actually reach the blocked state — killing a task that has
+         * not parked yet exercises a different (easier) path. */
+        task_msleep(6);
+        for (int i = 0; i < n; i++) task_kill(pids[i]);
+        __atomic_add_fetch(&g_ks_killed, n, __ATOMIC_RELAXED);
+        task_msleep(10);
+        __atomic_store_n(&g_ks_round, r + 1, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&g_ks_done, 1, __ATOMIC_RELEASE);
 }
 
 static void cmd_killstorm(const char* args) {
@@ -310,42 +341,37 @@ static void cmd_killstorm(const char* args) {
     if (per    <= 0) per    = 8;
     if (per > 32) per = 32;
 
+    g_ks_round = g_ks_done = g_ks_spawned = g_ks_killed = 0;
+    g_ks_rounds = rounds; g_ks_per = per;
     kprintf("killstorm: %d rounds x %d blocked tasks (cpus=%d)\n",
             rounds, per, smp_ncpus());
-    int spawned = 0, killed = 0;
-    for (int r = 0; r < rounds; r++) {
-        int pids[32];
-        int n = 0;
-        for (int i = 0; i < per; i++) {
-            struct task* t = task_spawn("ks-victim", killstorm_victim);
-            if (!t) break;
-            pids[n++] = t->pid;
-            __atomic_add_fetch(&g_ks_alive, 1, __ATOMIC_RELAXED);
-        }
-        spawned += n;
-        /* Let them actually reach the blocked state — killing a task that has
-         * not parked yet exercises a different (easier) path. */
-        task_msleep(6);
-        for (int i = 0; i < n; i++) { task_kill(pids[i]); killed++; }
-        /* Give init a moment to reap; the sweep in task_reap is where a corpse
-         * left in a runqueue would be caught and reported. */
+    struct task* drv = task_spawn("ks-driver", killstorm_driver);
+    if (!drv) { console_write("killstorm: cannot spawn driver\n"); return; }
+    int drvpid = drv->pid;
+
+    /* Poll for completion, and give up on NO PROGRESS rather than on a total
+     * time budget: a slow machine finishes late, a broken one stops moving. */
+    int last = -1, stuck = 0;
+    while (!__atomic_load_n(&g_ks_done, __ATOMIC_ACQUIRE)) {
         task_msleep(10);
-        /* A progress marker per round.  Without it, a storm that stops halfway
-         * is indistinguishable from one that never started — and "it stopped
-         * somewhere" is the single most useful fact about a hang. */
-        kprintf("killstorm: round %d ok (%d alive)\n", r + 1,
-                __atomic_load_n(&g_ks_alive, __ATOMIC_RELAXED));
+        int now = __atomic_load_n(&g_ks_round, __ATOMIC_ACQUIRE);
+        if (now == last) { if (++stuck > 400) break; }   /* ~4 s of silence */
+        else             { last = now; stuck = 0; }
     }
-    /* Wait for stragglers rather than leaving them behind for the next test. */
-    for (int i = 0; i < 200 && __atomic_load_n(&g_ks_alive, __ATOMIC_RELAXED); i++)
-        task_msleep(10);
-    int left = __atomic_load_n(&g_ks_alive, __ATOMIC_RELAXED);
-    kprintf("killstorm: done — %d spawned, %d killed, %d still alive\n",
-            spawned, killed, left);
-    /* A victim that never finished is a task the scheduler lost: dump the
-     * table so the next question ("in what state, on which CPU?") is already
-     * answered by the run that found it. */
-    if (left) task_list();
+
+    int done = __atomic_load_n(&g_ks_done, __ATOMIC_ACQUIRE);
+    kprintf("killstorm: %s — %d/%d rounds, %d spawned, %d killed, %d alive\n",
+            done ? "done" : "STALLED",
+            __atomic_load_n(&g_ks_round, __ATOMIC_ACQUIRE), rounds,
+            g_ks_spawned, g_ks_killed,
+            __atomic_load_n(&g_ks_alive, __ATOMIC_RELAXED));
+    if (!done) {
+        /* The whole point of running the storm elsewhere: report what the
+         * scheduler was holding when it stopped making progress. */
+        console_write("killstorm: task table at the stall —\n");
+        task_list();
+        task_kill(drvpid);
+    }
 }
 
 /* -------------------------------------------------------------------- */

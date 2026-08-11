@@ -417,7 +417,8 @@ static int rq_contains_locked(struct percpu* rq, struct task* t) {
  * queue cpu_home names cannot make that claim — cpu_home is written under the
  * DESTINATION queue's lock and read under the source's, so the two can be about
  * different queues at the same instant. */
-static int rq_purge_all(struct task* t) {
+static int rq_purge_all_where(struct task* t, int* where) {
+    if (where) *where = -1;
     if (!t || t->is_idle) return 0;
     int found = 0;
     int n = smp_ncpus();
@@ -425,11 +426,17 @@ static int rq_purge_all(struct task* t) {
         struct percpu* rq = percpu_at(i);
         if (!rq) continue;
         uint32_t fl = spin_lock_irqsave(&rq->rq_lock);
-        if (rq_contains_locked(rq, t)) { rq_remove_locked(rq, t); found++; }
+        if (rq_contains_locked(rq, t)) {
+            rq_remove_locked(rq, t);
+            found++;
+            if (where && *where < 0) *where = i;
+        }
         spin_unlock_irqrestore(&rq->rq_lock, fl);
     }
     return found;
 }
+
+static int rq_purge_all(struct task* t) { return rq_purge_all_where(t, NULL); }
 
 /* §M49 — recompute one task's `demand` from the runnable time it has
  * accrued since its last sample.  Caller holds the owning rq_lock.
@@ -1434,7 +1441,13 @@ void task_msleep(uint32_t ms) {
         self->state           = TASK_SLEEPING;
         self->last_yield_ms   = timer_ticks_ms();  /* §M46 — blocking = responsive */
         self->cpu_ms_at_yield = self->cpu_ms;
-        g_timed_sleepers++;
+        /* §M54 — publish the claim, then the count.  Both atomic: the count is
+         * read by every tick to decide whether to sweep at all, and a plain
+         * `++` from several CPUs loses updates — a lost increment reads as
+         * "nobody is sleeping" and the sweep never runs again for that
+         * sleeper. */
+        __atomic_store_n(&self->timed_sleep, 1, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&g_timed_sleepers, 1, __ATOMIC_ACQ_REL);
 
         /* §M54 — detach from whichever queue holds us, not merely from this
          * CPU's (see rq_detach_anywhere).  IRQs are already off; the helper's
@@ -1455,6 +1468,11 @@ void task_msleep(uint32_t ms) {
          * ourselves back and re-test the deadline instead of sleeping through
          * a wake that was meant for us. */
         if (self->state != TASK_SLEEPING) {
+            /* Release the claim if the waker did not take it (it normally
+             * does; this covers a wake that changed our state by some other
+             * route).  Whoever holds the claim owns the count. */
+            if (__atomic_exchange_n(&self->timed_sleep, 0, __ATOMIC_ACQ_REL))
+                __atomic_sub_fetch(&g_timed_sleepers, 1, __ATOMIC_ACQ_REL);
             task_enqueue(self);
             hal_intr_restore(fl);
             continue;
@@ -1476,7 +1494,7 @@ void task_msleep(uint32_t ms) {
  * an rq_lock underneath master_lock would introduce a second lock order
  * into a kernel that otherwise only ever nests the other way. */
 static void sleep_sweep(void) {
-    if (g_timed_sleepers <= 0) return;
+    if (__atomic_load_n(&g_timed_sleepers, __ATOMIC_ACQUIRE) <= 0) return;
     uint64_t now = timer_ticks_ms();
     if (now == g_sleep_sweep_ms) return;         /* at most one sweep per ms */
     g_sleep_sweep_ms = now;
@@ -1488,9 +1506,14 @@ static void sleep_sweep(void) {
     if (t) {
         do {
             if (t->state == TASK_SLEEPING && t->sleep_until_ms &&
-                t->sleep_until_ms <= now) {
+                t->sleep_until_ms <= now &&
+                /* §M54 — CLAIM it.  Testing the deadline and then acting on it
+                 * are two steps, and a concurrent kill takes the same two: both
+                 * used to conclude the sleep was theirs to end and both
+                 * decremented the count for one sleep. */
+                __atomic_exchange_n(&t->timed_sleep, 0, __ATOMIC_ACQ_REL)) {
+                __atomic_sub_fetch(&g_timed_sleepers, 1, __ATOMIC_ACQ_REL);
                 t->sleep_until_ms = 0;
-                if (g_timed_sleepers > 0) g_timed_sleepers--;
                 wake[n++] = t;
                 if (n == SLEEP_SWEEP_BATCH) break;   /* rest wait one more tick */
             }
@@ -1500,7 +1523,9 @@ static void sleep_sweep(void) {
     spin_unlock_irqrestore(&master_lock, fl);
 
     for (int i = 0; i < n; i++) {
-        if (wake[i]->state != TASK_SLEEPING) continue;   /* someone beat us to it */
+        /* No "did someone beat us to it" test any more: holding the claim IS
+         * the answer, and skipping here after claiming would leave the task
+         * asleep with nobody left who could wake it. */
         wake[i]->state = TASK_RUNNABLE;
         task_enqueue(wake[i]);
     }
@@ -1519,9 +1544,13 @@ static void sleep_sweep(void) {
  *
  * Callers hold no rq_lock. */
 static void wake_timed_sleeper(struct task* t) {
-    if (!t || t->state != TASK_SLEEPING || !t->sleep_until_ms) return;
+    if (!t) return;
+    /* §M54 — the claim replaces the state+deadline test.  Those were two loads
+     * with no lock between them and the sweep taking the same pair, so the two
+     * could agree that the same single sleep was theirs to end. */
+    if (!__atomic_exchange_n(&t->timed_sleep, 0, __ATOMIC_ACQ_REL)) return;
+    __atomic_sub_fetch(&g_timed_sleepers, 1, __ATOMIC_ACQ_REL);
     t->sleep_until_ms = 0;
-    if (g_timed_sleepers > 0) g_timed_sleepers--;
     t->state = TASK_RUNNABLE;
     /* §M54 — the DEAD re-check that makes this safe lives inside task_enqueue,
      * under the destination queue's lock.  Testing it out here instead would
@@ -1678,14 +1707,18 @@ int task_reap(int pid) {
      * the sweep ever actually finds something it SAYS SO, loudly: that means
      * a wake path is still racing and the cause fix above is incomplete, and
      * a silent repair would hide exactly the evidence needed to finish it. */
-    if (rq_purge_all(t) > 0) {
+    int where = -1;
+    if (rq_purge_all_where(t, &where) > 0) {
         /* Reported, not silently repaired.  The exit path already swept every
          * queue while DEAD, so reaching here means an ordering assumption in
          * this file is wrong — and a silent repair would delete exactly the
-         * evidence needed to find out which one. */
+         * evidence needed to find out which one.  The two extra numbers are
+         * the whole diagnosis: if the queue it was found on is the one
+         * cpu_home names, an enqueue completed after the exit swept; if not,
+         * a link was left behind by a queue-to-queue move. */
         klog(KLOG_ERR, "task",
-             "reap: pid %d '%s' was STILL QUEUED — removed (an ordering "
-             "assumption in the exit path is wrong; see M54)", t->pid, t->name);
+             "reap: pid %d '%s' STILL QUEUED on cpu %d (cpu_home %d) — removed",
+             t->pid, t->name, where, t->cpu_home);
     }
     t->cpu_home = -1;                        /* on no queue, and stays that way */
 

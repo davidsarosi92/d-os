@@ -233,6 +233,21 @@ struct task {
      * the CPU switches to next, once the swap is genuinely complete.  Reaping
      * waits for it. */
     volatile int on_cpu;
+    /* §M54 — "this task owns a live timed sleep", and the TOKEN that says who
+     * gets to end it.
+     *
+     * A timed sleep is ended by two independent parties: the tick sweep when
+     * the deadline passes, and a kill that does not want to wait for it.  Both
+     * used to test `sleep_until_ms` without a lock between them, so both could
+     * decide the sleep was theirs to end — and both then decremented the global
+     * sleeper count for ONE sleep.  A count that drifts low is not a slow
+     * kernel, it is a stopped one: the sweep skips itself entirely when the
+     * count reads zero, so a real sleeper is never woken and the task blocks
+     * forever with no fault, no log and no way in.
+     *
+     * Claimed with an atomic exchange: whoever swaps this 1 → 0 owns the wake,
+     * exactly once, and is the only one that adjusts the count. */
+    volatile int timed_sleep;
     /* Tier A.1 — wait-queue link.  When state==TASK_SLEEPING because the
      * task parked itself on a `struct waitq`, it hangs off that queue's
      * singly-linked list through `wq_next` (a task can be blocked on at

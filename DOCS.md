@@ -5815,7 +5815,21 @@ unreapable.
    DEAD is published: an enqueue is then either already complete (and the sweep
    finds it) or still waiting for the lock (and refuses when it gets it).
 
-3. **"I marked myself asleep, then took myself off the queue — but by then
+3. **A sleeper count that could drift low, which is not a slow kernel but a
+   stopped one.**  A timed sleep is ended by two independent parties — the tick
+   sweep when the deadline passes, and a kill that will not wait for it — and
+   both tested `sleep_until_ms` with no lock between them.  Both could conclude
+   the sleep was theirs to end, and both then decremented the global sleeper
+   count for ONE sleep; the plain `++`/`--` could also simply lose an update
+   across CPUs.  The sweep **skips itself entirely when that count reads zero**,
+   so an undercount means a real sleeper is never woken: the task blocks
+   forever, with no fault, no log and no way in.  Ending a timed sleep is now a
+   CLAIM — an atomic exchange of `task->timed_sleep` 1 → 0 — and whoever wins it
+   owns the wake, exactly once, and is the only one that touches the count.
+   (This is also what made aarch64's `forktest` report `status=130` instead of
+   `status=7` under load: the child's exit was being raced.)
+
+4. **"I marked myself asleep, then took myself off the queue — but by then
    someone had already woken me."**  `task_msleep` and `waitq_block` set
    `state = SLEEPING` and dequeue as two steps.  A waker fitting between them
    flips the state back to RUNNABLE and finds the task still queued, so its
@@ -5825,7 +5839,7 @@ unreapable.
    leaves nothing behind at all.  Both now re-check after dequeuing and put
    themselves back rather than sleeping through a wake meant for them.
 
-4. **The runqueue walks trusted the ring absolutely.**  One bad link and the
+5. **The runqueue walks trusted the ring absolutely.**  One bad link and the
    kernel dereferenced it, in the scheduler, holding the queue lock — the box
    died and took its own diagnostics with it.  `pick_next_local_locked`,
    `load_steal_one` and `rq_refresh_local_load` are now bounded walks that
@@ -5901,20 +5915,30 @@ the owner of a handle has to be told when the object behind it dies.*
   left a task unreapable, one hung tasks outright.  Neither would have been
   caught by clicking on a browser.
 
+#### Where it stands
+
+Six back-to-back storms per arch (≈2900 spawn+kill cycles each, `-smp 4`),
+i386 / x86_64 / aarch64: **no fault, no stall, no lost task, every victim
+reaped.**  `killstorm` itself now runs the storm on its own task and the shell
+watches it, so a stall is REPORTED with the task table rather than hanging the
+test along with the thing it is testing — the first two versions hung silently
+and cost two runs each.
+
 #### Open
 
-- The `task_reap` sweep still occasionally reports a task that was queued at
-  reap time (roughly one in several hundred kills under `killstorm`).  It is
-  caught, repaired and logged — the box is unaffected — but an ordering
-  assumption in the exit path is still not exactly right, and the message says
-  so rather than repairing in silence.
-- Under `killstorm` on i386 a shell task was once observed hanging (the box
-  stayed up and responsive).  The lost-task race in (3) above is fixed and
-  x86_64/aarch64 now run clean; i386 needs another pass with the same test.
+- The `task_reap` sweep still reports a queued task roughly 8 times in 2900
+  kills.  It is caught, repaired and logged, and the box is unaffected.  The
+  instrumented message narrows it sharply: **every single instance was
+  `cpu N (cpu_home N)`** — a *completed*, self-consistent `task_enqueue` that
+  landed after the exit path had already swept every queue while DEAD.  Since
+  both the DEAD test and the insert happen under that queue's own lock, that
+  should be impossible; one of the orderings in this file is still not what it
+  reads like, and the message says so rather than repairing in silence.
 - `load_steal_one` sets `cpu_home` to the stealing CPU while the task is
   briefly on no queue at all.  Setting it to -1 there is more honest and
   **hangs tasks** — the block paths use `cpu_home` to find the queue to detach
-  from.  The right fix is a single owner for that transition, not a more honest
+  from, and a -1 they cannot act on leaves a task queued and asleep at once.
+  The right fix is a single owner for that transition, not a more honest
   transient.
 
 ---
