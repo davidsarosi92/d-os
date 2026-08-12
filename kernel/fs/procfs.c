@@ -83,8 +83,8 @@ static void pw_put_uptime(struct procfs_writer* w, uint64_t total_ms) {
     uint32_t min = (uint32_t)((total_ms / 60000) % 60);
     uint32_t hr  = (uint32_t)(total_ms / 3600000);
     pw_put_uint(w, hr);  pw_putc(w, ':');
-    if (min < 10) pw_putc(w, '0'); pw_put_uint(w, min); pw_putc(w, ':');
-    if (sec < 10) pw_putc(w, '0'); pw_put_uint(w, sec); pw_putc(w, '.');
+    if (min < 10) { pw_putc(w, '0'); } pw_put_uint(w, min); pw_putc(w, ':');
+    if (sec < 10) { pw_putc(w, '0'); } pw_put_uint(w, sec); pw_putc(w, '.');
     if (ms < 100) pw_putc(w, '0');
     if (ms < 10)  pw_putc(w, '0');
     pw_put_uint(w, ms);

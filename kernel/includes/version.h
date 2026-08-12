@@ -9,7 +9,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M56"                 /* latest shipped: §M56 epoll + real poll timeouts */
+#define DOS_MILESTONE  "M57"                 /* latest shipped: §M57 scheduler lifetime — the §M54 residual */
 
 /* Short architecture tag for the on-screen label.  Deliberately the FAMILIAR
  * short form ("x32"/"x64") rather than the toolchain triple — the wallpaper

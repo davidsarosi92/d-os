@@ -131,6 +131,8 @@ static void cmd_help(void) {
                   "  ringtest, ps, spawn, yield, loop, kill <pid>, fkill <pid>\n"
                   "  wedge (runaway ring-3 task), faulttest (bad user pointers)\n"
                   "  killstorm [rounds] [tasks] (kill blocked tasks under SMP)\n"
+                  "  rqcheck                (check the runqueue invariant now)\n"
+                  "  schedstorm [rounds]    (affinity+nice churn, audited)\n"
                   "  timerfdtest [ms], alarmtest [ms] (timing, M53 stage 3)\n"
                   "  netstorm [n] (n tasks waiting on the network at once)\n"
                   "  epolltest, epollmusltest (readiness sets, M56)\n"
@@ -376,6 +378,203 @@ static void cmd_killstorm(const char* args) {
         task_list();
         task_kill(drvpid);
     }
+}
+
+/* -------------------------------------------------------------------- */
+/* §M57 — `rqcheck` and `schedstorm [rounds]`.                           */
+/*                                                                       */
+/* WHY THESE EXIST.  Every defect in the §M54/§M57 family is a           */
+/* disagreement between where a task IS and where the kernel thinks it   */
+/* is, and none of them announces itself: the symptom is a fault in the  */
+/* scheduler, a shell that stops, or a "STILL QUEUED" line at reap time  */
+/* — each arbitrarily far from the code that caused it, and each rare    */
+/* enough to be dismissed as a one-off.  §M54's own notes close with     */
+/* "roughly once in several hundred kills", which is a confession that   */
+/* the evidence was a log line rather than a measurement.                */
+/*                                                                       */
+/* So the invariant is stated in code (task_rq_audit) and CHECKED.  A    */
+/* violation is then a fact, reproducible in seconds, that names the     */
+/* rule it broke — instead of a crash three subsystems downstream.       */
+/*                                                                       */
+/* `killstorm` already churns spawn/kill/wake.  It does NOT touch the    */
+/* two paths §M57 found broken (`taskset` and `nice` both act on the     */
+/* queue an UNLOCKED cpu_home read names), which is precisely why those  */
+/* two survived §M54 untouched: nothing exercised them under load.       */
+/* schedstorm does, from several CPUs at once, against tasks that are    */
+/* simultaneously being migrated by the balancer.                        */
+/*                                                                       */
+/* The final audit is taken AT REST.  Rule 5 (ready, unqueued, running   */
+/* nowhere) has a legitimate transient while a task is being re-homed,   */
+/* so reading it mid-churn would produce a test that fails for a reason  */
+/* that is not a bug — the fastest way to teach everyone to ignore it.   */
+/* -------------------------------------------------------------------- */
+
+static void rq_audit_print(const char* tag, const struct rq_audit* a, int bad) {
+    /* Structural verdict first, because that is the pass/fail one; the two
+     * soft counters follow, labelled, so a stale estimate can never be
+     * mistaken for a corrupted runqueue. */
+    kprintf("%s: %d queued | struct: home %d orphan %d count %d ring %d -> %s"
+            " | soft: lost %d load %d\n",
+            tag, a->tasks_queued, a->bad_home, a->orphan_home, a->bad_count,
+            a->broken_ring, bad ? "VIOLATIONS" : "consistent",
+            a->lost, a->bad_load);
+}
+
+static void cmd_rqcheck(const char* args) {
+    (void)args;
+    struct rq_audit a;
+    int bad = task_rq_audit(&a);
+    rq_audit_print("rqcheck", &a, bad);
+}
+
+static volatile int g_ss_rounds, g_ss_done, g_ss_worst, g_ss_churn;
+static volatile int g_ss_pids[12], g_ss_npids, g_ss_stop, g_ss_churners;
+static struct rq_audit g_ss_worst_snap;
+
+/* SEVERAL churners, not one.  The first version of this test drove affinity
+ * and nice from a single task and reported `ok` even against the PRE-§M57
+ * code — because the only thing it could race with was the periodic balancer,
+ * which fires every LOAD_BALANCE_INTERVAL_MS, so a 240 ms run offered about
+ * two chances to hit a window measured in instructions.  A test that cannot
+ * fail is not evidence.
+ *
+ * Two tasks re-homing the SAME task is the same bug with a window orders of
+ * magnitude wider: both read cpu_home, both decide, and the second acts on a
+ * queue the first has already moved the task off — which is precisely what
+ * "act on the queue an unlocked read named" means.  It is also the realistic
+ * case: a shell, the Task Manager and a script can all call taskset. */
+static void schedstorm_churner(void) {
+    struct task* self = task_current();
+    unsigned seed = (unsigned)(self ? self->pid : 1) * 2654435761u;
+    uint32_t ncpu = (uint32_t)smp_ncpus();
+    while (!__atomic_load_n(&g_ss_stop, __ATOMIC_ACQUIRE) && !task_should_stop()) {
+        int n = __atomic_load_n(&g_ss_npids, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < n; i++) {
+            seed = seed * 1103515245u + 12345u;
+            int pid = g_ss_pids[i];
+            struct task* t = task_find(pid);
+            if (!t) continue;
+            uint32_t mask = ((seed >> 8) & ((1u << ncpu) - 1u));
+            if (!mask) mask = 1u;
+            task_set_affinity(t, mask);
+            task_set_nice(pid, (int)((seed >> 16) % 21u) - 10);
+            __atomic_add_fetch(&g_ss_churn, 2, __ATOMIC_RELAXED);
+        }
+        task_yield();
+    }
+    __atomic_sub_fetch(&g_ss_churners, 1, __ATOMIC_ACQ_REL);
+}
+
+/* A hog, so the balancer has something worth migrating.  A queue of sleepers
+ * is never rebalanced (§M49: load is demand, not queue length), and an
+ * unmigrated task cannot expose a migration bug. */
+static void schedstorm_hog(void) {
+    volatile unsigned x = 0;
+    while (!task_should_stop()) { for (int i = 0; i < 20000; i++) x += i; task_yield(); }
+}
+
+#define SS_CHURNERS 4
+
+static void schedstorm_driver(void) {
+    int rounds = g_ss_rounds;
+    int pids[12];
+    int n = 0;
+    for (int i = 0; i < 12; i++) {
+        struct task* t = task_spawn("ss-hog", schedstorm_hog);
+        if (!t) break;
+        pids[n++] = t->pid;
+        g_ss_pids[i] = t->pid;
+    }
+    __atomic_store_n(&g_ss_npids, n, __ATOMIC_RELEASE);
+
+    __atomic_store_n(&g_ss_stop, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_ss_churners, 0, __ATOMIC_RELEASE);
+    for (int i = 0; i < SS_CHURNERS; i++) {
+        if (task_spawn("ss-churn", schedstorm_churner))
+            __atomic_add_fetch(&g_ss_churners, 1, __ATOMIC_ACQ_REL);
+    }
+
+    for (int r = 0; r < rounds; r++) {
+        /* One transient task per round, so spawn/exit/reap runs alongside the
+         * affinity churn — the reaper's sweep and the balancer's migration are
+         * the two things that must not disagree about where a task is. */
+        struct task* tmp = task_spawn("ss-tmp", schedstorm_hog);
+        if (tmp) { int p = tmp->pid; task_msleep(2); task_kill(p); }
+
+        struct rq_audit a;
+        /* task_rq_audit returns the STRUCTURAL count; rules 5 and 6 are
+         * reported in `a` and checked at rest below. */
+        int hard = task_rq_audit(&a);
+        if (hard > __atomic_load_n(&g_ss_worst, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&g_ss_worst, hard, __ATOMIC_RELAXED);
+            /* Keep the WORST SNAPSHOT, not just its size.  "4 violations" does
+             * not say which rule, and the rule is the entire diagnosis. */
+            g_ss_worst_snap = a;
+        }
+        task_msleep(4);
+    }
+
+    /* Stop the churners and WAIT for them: an affinity call still in flight
+     * while the audit is taken at rest would be the transient the "at rest"
+     * reading exists to exclude. */
+    __atomic_store_n(&g_ss_stop, 1, __ATOMIC_RELEASE);
+    for (int i = 0; i < 200 && __atomic_load_n(&g_ss_churners, __ATOMIC_ACQUIRE); i++)
+        task_msleep(10);
+
+    for (int i = 0; i < n; i++) {
+        struct task* t = task_find(pids[i]);
+        if (t) task_set_affinity(t, 0xFFFFFFFFu);
+        task_set_nice(pids[i], 0);
+    }
+    for (int i = 0; i < n; i++) task_kill(pids[i]);
+    __atomic_store_n(&g_ss_done, 1, __ATOMIC_RELEASE);
+}
+
+static void cmd_schedstorm(const char* args) {
+    int rounds = 0;
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) rounds = rounds * 10 + (*args - '0');
+    if (rounds <= 0) rounds = 60;
+
+    struct rq_audit before;
+    int bad0 = task_rq_audit(&before);
+    rq_audit_print("schedstorm: before", &before, bad0);
+
+    g_ss_rounds = rounds; g_ss_done = 0; g_ss_worst = 0; g_ss_churn = 0;
+    kprintf("schedstorm: %d rounds, %d concurrent churners, %d cpus\n",
+            rounds, SS_CHURNERS, smp_ncpus());
+
+    struct task* drv = task_spawn("ss-driver", schedstorm_driver);
+    if (!drv) { console_write("schedstorm: cannot spawn driver\n"); return; }
+
+    /* Same no-progress rule as killstorm: a slow box finishes late, a broken
+     * one stops moving. */
+    int last = -1, stuck = 0;
+    while (!__atomic_load_n(&g_ss_done, __ATOMIC_ACQUIRE)) {
+        task_msleep(10);
+        int now = __atomic_load_n(&g_ss_churn, __ATOMIC_RELAXED);
+        if (now == last) { if (++stuck > 800) break; }      /* ~8 s of silence */
+        else             { last = now; stuck = 0; }
+    }
+    int done = __atomic_load_n(&g_ss_done, __ATOMIC_ACQUIRE);
+
+    /* AT REST — every rule must hold now, rule 5 included.  Give the reaper a
+     * moment first: a task that has just exited is legitimately not on a queue
+     * and not yet freed. */
+    task_msleep(200);
+    struct rq_audit after;
+    int bad1 = task_rq_audit(&after);
+    rq_audit_print("schedstorm: after ", &after, bad1);
+
+    int worst = __atomic_load_n(&g_ss_worst, __ATOMIC_RELAXED);
+    if (worst) rq_audit_print("schedstorm: worst ", &g_ss_worst_snap, worst);
+    kprintf("schedstorm: %s — %d churn ops, worst structural mid-churn %d\n",
+            done ? "done" : "STALLED",
+            __atomic_load_n(&g_ss_churn, __ATOMIC_RELAXED), worst);
+    /* Pass = structurally perfect THROUGHOUT, and everything (rules 5 and 6
+     * included) exact once the churn has stopped. */
+    int pass = done && worst == 0 && bad1 == 0 && after.lost == 0 && after.bad_load == 0;
+    kprintf("schedstorm: %s\n", pass ? "ok" : "FAIL");
 }
 
 /* -------------------------------------------------------------------- */
@@ -3778,6 +3977,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "wedge"))          { cmd_wedge();     return; }
     if (streq(line, "spawn"))          { cmd_spawn();    return; }
     if (streq(line, "killstorm"))      { cmd_killstorm("");        return; }
+    if (streq(line, "rqcheck"))        { cmd_rqcheck("");          return; }
+    if (streq(line, "schedstorm"))     { cmd_schedstorm("");       return; }
     if (streq(line, "timerfdtest"))    { cmd_timerfdtest("");      return; }
     if (streq(line, "epolltest"))      { cmd_epolltest();          return; }
     if (streq(line, "epollmusltest"))  { cmd_epollmusltest();      return; }
@@ -3785,6 +3986,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "alarmtest"))      { cmd_alarmtest("");        return; }
     if (starts_with(line, "alarmtest ")) { cmd_alarmtest(line + 10); return; }
     if (starts_with(line, "killstorm ")) { cmd_killstorm(line + 10); return; }
+    if (starts_with(line, "schedstorm ")) { cmd_schedstorm(line + 11); return; }
     if (streq(line, "yield"))          { task_yield();   return; }
     if (streq(line, "loop"))           { cmd_loop("");   return; }
     if (starts_with(line, "loop "))    { cmd_loop(line + 5); return; }

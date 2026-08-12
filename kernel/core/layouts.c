@@ -102,7 +102,7 @@ const struct kbd_layout kbd_layout_us = {
  *   4  '!'/$
  *   5  '%'/%
  *   6  '/'/&
- *   7  '='/*
+ *   7  '='/ asterisk
  *   8  '('/(
  *   9  ')'/)
  *   0  '='/' — actually Hungarian: 0 BASE = ö (accented); ASCII fallback 0

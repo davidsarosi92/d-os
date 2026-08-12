@@ -214,6 +214,21 @@ struct task {
      * via percpu->idle directly.
      *   cpu_home   : which CPU's rq this task lives on (or -1).
      *   rq_next/rq_prev : doubly-linked list rooted at percpu->rq_head.
+     *
+     * §M57 — cpu_home is a FACT, not a hint, and the sentence above is now
+     * enforced rather than intended.  It is written in exactly two places —
+     * rq_insert_tail_locked (claim) and rq_remove_locked (release) — each
+     * holding the lock of the queue it names, so it is -1 precisely when the
+     * task is on no runqueue.  A reader that holds queue N's lock and finds
+     * cpu_home == N may therefore act on that queue; a reader holding no lock
+     * may use it only to CHOOSE a candidate and must re-check it under that
+     * candidate's lock (rq_detach_anywhere is the pattern).
+     *
+     * Do NOT assign it from a call site.  Every hand-assignment this file used
+     * to have was a chance to name a queue that did not hold the task, and each
+     * one produced the same failure at a distance: a ring spliced from a CPU
+     * that did not own its lock, surfacing as a ring-repair report, a hung
+     * task, or reap's "STILL QUEUED" — never near the code that caused it.
      */
     int      cpu_home;
     struct task* rq_next;
@@ -583,5 +598,75 @@ void task_set_change_hook(void (*fn)(void));
  * path respects affinity). */
 int      task_set_affinity(struct task* t, uint32_t mask);
 uint32_t task_get_affinity(const struct task* t);
+
+/* =============================================================================
+ * §M57 — RUNQUEUE CONSISTENCY AUDIT.
+ *
+ * The §M54/§M57 defects all have the same shape: a task's queue MEMBERSHIP and
+ * the kernel's BELIEF about it (cpu_home, rq_count, rq_load) drift apart, and
+ * nothing notices until something faults somewhere else entirely — a ring walk
+ * in the scheduler, a hung shell, a "STILL QUEUED" at reap time.  Each of those
+ * is a symptom observed minutes and megabytes away from its cause.
+ *
+ * So state the invariant in code and check it directly.  It is short:
+ *
+ *   1. a task linked in CPU N's ring has cpu_home == N;
+ *   2. a task linked in a ring never has cpu_home == -1;
+ *   3. rq_count equals what the ring actually contains;
+ *   4. every ring is circular and no longer than the queue claims;
+ *   5. no RUNNABLE non-idle task sits on NO queue while not running;
+ *   6. rq_load equals the summed contribution of the ring's members.
+ *
+ * RULES 1-4 ARE STRUCTURAL AND HOLD AT EVERY INSTANT.  Rules 5 and 6 are not,
+ * and saying so is the difference between a checker people trust and one they
+ * learn to ignore:
+ *
+ *   - Rule 5 has a legitimate transient — a task really is on no queue for a
+ *     moment while it is re-homed — so it must be read AT REST.
+ *   - Rule 6 measures a published ESTIMATE.  rq_load is read locklessly by
+ *     peers by design ("a stale read costs one suboptimal steal decision"),
+ *     and a weight change on an unqueued task can race its own enqueue.  The
+ *     figure self-heals at the next balance tick, so a transient disagreement
+ *     is the design, not a defect; a PERSISTENT one is a real bug and is what
+ *     rule 6 is worth checking for, at rest.
+ *
+ * Reporting all six together and demanding zero would have made the honest
+ * answer ("structurally perfect, one estimate briefly stale") indistinguishable
+ * from a corrupted runqueue.  They are counted separately for that reason.
+ *
+ * Rule 1 subsumes "a task is never in two rings": two rings can only share a
+ * task by having been spliced together, and then one walk reaches members whose
+ * cpu_home names the other queue.  Rule 5 is the one that catches a HANG
+ * directly — a task that is ready, on no queue, and current nowhere is a task
+ * that will never be picked again, which is what "the shell just stopped"
+ * looked like from the outside.  It is the only rule with legitimate
+ * transients (a task is briefly off-queue while being re-homed), so it must be
+ * read at REST, not during churn.
+ *
+ * `task_rq_audit` walks every queue under its own lock and fills in how many
+ * times each rule was broken.  A violation is a FACT about the scheduler, not
+ * an opinion, which is what makes this able to FALSIFY a fix rather than merely
+ * fail to contradict it — the §M56.2 lesson, applied one milestone later.
+ *
+ * Cheap enough to call in a loop from a stress test (one uncontended lock per
+ * CPU plus a bounded walk), and deliberately read-only: it REPORTS, it does not
+ * repair.  A checker that quietly fixes what it finds destroys the evidence.
+ * ============================================================================= */
+struct rq_audit {
+    int tasks_queued;       /* total tasks found linked in some runqueue     */
+    int bad_home;           /* rule 1 — linked in N but cpu_home says other  */
+    int orphan_home;        /* rule 2 — cpu_home == -1 yet linked in a ring  */
+    int bad_count;          /* rule 3 — rq_count disagrees with the ring     */
+    int broken_ring;        /* rule 4 — not circular within the bound        */
+    int lost;               /* rule 5 — ready, unqueued, running nowhere     */
+    int bad_load;           /* rule 6 — published rq_load is stale           */
+};
+
+/* Returns the number of STRUCTURAL violations — rules 1-4 only, the ones that
+ * must hold at every instant.  `lost` and `bad_load` are reported in `out` and
+ * deliberately excluded from the return value: a caller checking mid-churn
+ * wants "is the runqueue corrupt", and folding a legitimate transient into
+ * that answer is how a checker gets ignored. */
+int task_rq_audit(struct rq_audit* out);
 
 #endif

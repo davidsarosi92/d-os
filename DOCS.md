@@ -96,6 +96,7 @@ when sections are added.)
 | 4.55 | A deadline you can wait on (M53 stage 3) | 5900 |
 | 4.56 | Waiting for the network without spending a CPU on it (M55) | 6066 |
 | 4.57 | A wait that is really a wait (M56 — poll timeouts + epoll) | 6258 |
+| 4.58 | A task is not dead while it is still running (M57 — the §M54 residual) | 6517 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -6513,6 +6514,194 @@ guest keeps beyond `sigsetsize` is its own business and is left untouched.
 - `EPOLLONESHOT` disarms on report; `EPOLLEXCLUSIVE` and edge-triggered mode are
   not implemented (the latter deliberately refused, see above).
 
+
+### 4.58 A task is not dead while it is still running (M57 — the §M54 residual)
+
+§M54 rebuilt the scheduler's lifetime rules and closed five real defects, but
+its own notes ended with three things it could not finish.  The first was
+written down like this:
+
+> the reap sweep still reports a queued task roughly once in several hundred
+> kills (caught, repaired, logged — box unaffected)
+
+That sentence is a confession.  "Roughly once in several hundred" is not a
+measurement, it is a shrug — and the reason it stayed a shrug for two
+milestones is that the only evidence was a log line arriving long after the
+event, from a subsystem that was merely the first to notice.  §M57 turns each
+of the three into something that can be reproduced in seconds, then fixes it.
+
+#### The invariant, stated in code
+
+Every defect in this family is one thing: **a disagreement between where a task
+IS and where the kernel believes it is.**  None announces itself; the symptom
+is a fault in the scheduler, a shell that stops, or a line at reap time — each
+arbitrarily far from its cause.
+
+So `task_rq_audit` (task.h) states the rule and checks it directly:
+
+1. a task linked in CPU N's ring has `cpu_home == N`;
+2. a task linked in a ring never has `cpu_home == -1`;
+3. `rq_count` equals what the ring contains;
+4. every ring is circular within its bound;
+5. no RUNNABLE non-idle task sits on no queue while running nowhere;
+6. `rq_load` equals the summed contribution of the ring's members.
+
+**Rules 1–4 are structural and hold at every instant.  Rules 5 and 6 do not,
+and saying so is the difference between a checker people trust and one they
+learn to ignore.**  Rule 5 has a legitimate transient (a task really is off
+every queue for a moment while it is re-homed).  Rule 6 measures a published
+*estimate* — `rq_load` is read locklessly by peers by design, and self-heals at
+each balance tick; a transient disagreement is the design, a persistent one is
+a bug.  Reporting all six together and demanding zero would have made "one
+estimate briefly stale" indistinguishable from "the runqueue is corrupt".
+
+Two commands drive it: `rqcheck` (one snapshot) and `schedstorm [rounds]`
+(spawn/kill churn plus **four concurrent tasks** hammering `taskset` and `nice`
+on a shared set of hogs, auditing every round).
+
+#### cpu_home was a hint being used as a fact
+
+`task.h` had documented `cpu_home` as "which CPU's rq this task lives on (or
+-1)" since M18.6.1.  It was an aspiration: callers assigned it at moments when
+they merely *intended* to place a task, under whichever lock they happened to
+hold.  So it could name a queue that did not hold the task — and every
+operation acting on "the queue `cpu_home` names" then mutated a ring while
+holding the wrong CPU's lock.  Four sites did exactly that:
+
+- **`rq_rotate_to_tail_locked`** tested `!t->rq_next || !t->rq_prev`, which
+  answers "is it on *a* queue", not "is it on *this* one".
+- **`task_set_affinity`** (reachable from the `taskset` command) read
+  `cpu_home` unlocked and then called `rq_remove_locked` on that queue —
+  a helper that does not verify membership, so it spliced the task out of a
+  *different* CPU's ring and charged the removal to the wrong queue's counters.
+- **`task_set_nice`** did the same for `rq_load`, subtracting and adding on a
+  queue that need not hold the task.
+- **`load_steal_one`** left the task on no queue while `cpu_home` still named
+  the destination — a lie in the direction that hurts, because the block paths
+  use `cpu_home` to find the queue to detach from.
+
+`cpu_home` is now an **ownership token**: claimed by CAS from -1 inside
+`rq_insert_tail_locked`, released by a store back to -1 at the *end* of
+`rq_remove_locked`, both under the owning queue's lock.  The rule is one
+sentence — *holding queue N's lock while `cpu_home == N` is exclusive
+permission to touch that task's `rq_next`/`rq_prev`* — and it makes the value
+checkable rather than merely well-intentioned.  §M54 had tried clearing it to
+-1 in the steal and that HUNG TASKS; the reason is visible now, and it is
+instructive: the matching *claim* was missing, so a queued task carried -1
+forever and every detach silently did nothing.  **Half of this fix is worse
+than neither half.**
+
+The migration itself became one transition under **both** rq locks, taken in
+ascending `cpu_index` order — the only place in the file that nests two, and
+the ordering rule is stated there once instead of being reasoned about at every
+reader.
+
+#### The residual itself: DEAD was published too early
+
+With the audit in place the reap report finally said something useful.  The
+first version printed the task's state *after* the sweep had removed it, which
+is the same for every cause and therefore says nothing — a measurement artifact
+that cost one round of wrong theories.  Capturing it under the lock, before the
+removal, gave the answer in one line:
+
+```
+reap: pid 25 'ks-victim' STILL QUEUED on cpu 3
+      (home 3, next=set prev=set head=self state=2) — removed
+```
+
+The task is **properly linked**, `cpu_home` **agrees**, and `state=2` is
+`TASK_DEAD`.  So this was never a corrupted ring at all.
+
+`task_exit_code` marked itself DEAD at the top and then did a great deal of
+preemptible work — waking joiners, tearing down the subtree, cancelling
+timers — before sweeping the runqueues.  But `pick_next_local_locked` picks
+only RUNNABLE tasks, so **from the instant a task calls itself DEAD it is
+unschedulable, while it is still executing with interrupts on.**  One timer
+preemption in that window and the task is switched away and never picked again:
+it never reaches its own `rq_purge_all`, so it stays linked as a corpse — and
+`task_reap` frees the struct and the kernel stack out from under a suspended
+stack frame.
+
+*A task is not dead while it is still running.*  Everything before the end is
+work the task does while ALIVE, so it now stays RUNNABLE for all of it and
+remains an ordinary preemptible task.  DEAD, the joiner wake, the queue sweep
+and the final switch happen together with interrupts off, as one indivisible
+step whose every part is bounded.  `me = this_cpu()` is re-read there too: the
+value read at function entry may name a CPU this task has since migrated off,
+and scheduling on another CPU's runqueue puts two CPUs on one stack.
+
+Nothing regresses from publishing DEAD later — a parent in `task_wait` now
+wakes when the child is genuinely finished rather than when it has merely begun
+to finish, which is what the call always meant.
+
+#### Measured
+
+| | before | after |
+|---|---|---|
+| `killstorm`, 2880 kills, i386 -smp 4 | ~1 `STILL QUEUED` per 200–300 kills | **0** |
+| `schedstorm`, ~420k churn ops | **hard-locks the box** (NMI, several CPUs) | **0 structural violations** |
+
+The falsification matters more than the pass.  The first `schedstorm` drove
+affinity from a single task and reported `ok` even against the pre-§M57 code —
+because the only thing it could race with was the periodic balancer, which
+fires every `LOAD_BALANCE_INTERVAL_MS`, so a 240 ms run offered about two
+chances to hit a window measured in instructions.  **A test that cannot fail is
+not evidence.**  With four concurrent churners it takes the pre-fix kernel down
+with an NMI hard-lockup within a minute, and passes on the fixed one.
+
+#### The log that shredded, and why it is a correctness bug
+
+`printf.c` carried this line: *"Not reentrant; fine because the kernel is
+single-threaded today."*  True when written, false since §M18 brought up SMP —
+the §M52 shape exactly, a deferred note outliving its premise, because **a
+comment cannot fail a test**.
+
+The cost is not cosmetic.  Two CPUs formatting at once interleave character by
+character, so a completed self-test reads as
+
+```
+kstorm-vict:im 20/2r0oun ds,id 240 spa0)wned, 240 killed, 0 alive
+```
+
+and every automated check in this project is a grep over the serial log.  One
+`killstorm` run was read as a frozen shell on exactly this evidence, and the
+run had passed.  *A harness that silently loses output is worse than none,
+because it is trusted.*
+
+`console_out_begin`/`console_out_end` now bracket a whole `kprintf` or
+`console_write`.  Two properties carry the design:
+
+- **Preemption is disabled, not interrupts.**  A message can be slow — a
+  framebuffer scroll moves megabytes — and holding it with interrupts off drops
+  timer ticks and can trip the softlockup watchdog.  A logging path that makes
+  the machine look wedged is a poor trade for tidy output.
+- **Re-entry is detected, not waited on.**  If this CPU already holds it (an
+  ISR, an NMI, or a sink that itself prints), the message goes out unlocked.
+  The owner test comes *before* the acquire, because `spin_lock` blocks: asking
+  "do I already hold this?" after waiting for it is a question whose only
+  answer is a hung machine.  Fault-context paths keep their existing lock-free
+  channel (§M47).
+
+#### Also fixed
+
+- **`usock_set_owner` had no prototype** — added in §M56.2 and called across a
+  translation unit, so the compiler assumed `int usock_set_owner()`.  It
+  happens to pass two pointers correctly on every arch we build today, which is
+  exactly the kind of luck an arch port later runs out of.
+- Source comments labelled **§M57** that belonged to §M56.1, relabelled: one
+  label meaning two unrelated bodies of work is a comment that misleads later.
+- Two warnings cleared so the build is silent again and a real one cannot hide
+  in the noise.
+
+#### Still open
+
+- `AARCH64_MAX_CPUS` ships at 2, so the ARM verification is genuine SMP but at
+  two cores rather than four.
+- `load_balance_pull`'s `mine->migrations++` counts an attempt whose insert can
+  still be refused (the task went DEAD under us) — the figure is diagnostic
+  only, and is now the only place in the file where a count can exceed the
+  event it names.
+
 ---
 
 ## 7. Roadmap / open milestones
@@ -6538,6 +6727,62 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-12 — §M57: a task is not dead while it is still running (DOCS
+  §4.58).**  §M54's own notes ended with *"the reap sweep still reports a queued
+  task roughly once in several hundred kills"* — a confession, not a
+  measurement, and it stayed one for two milestones because the only evidence
+  was a log line arriving long after the event from the subsystem that merely
+  noticed first.  **The invariant is now stated in code** (`task_rq_audit`, six
+  rules) and driven by `rqcheck` + `schedstorm`, with rules 5 and 6 counted
+  SEPARATELY because they have legitimate transients — folding a briefly stale
+  estimate into "the runqueue is corrupt" is how a checker gets ignored.
+  **`cpu_home` was a hint being used as a fact:** documented since M18.6.1 as
+  "which CPU's rq this task lives on", it was assigned by callers at moments
+  when they merely INTENDED to place a task, so it could name a queue that did
+  not hold it — and four sites then mutated a ring while holding the wrong
+  CPU's lock, including `taskset` and `nice`, both reachable from the shell.  It
+  is an **ownership token** now: claimed by CAS from -1 inside
+  `rq_insert_tail_locked`, released at the END of `rq_remove_locked`, both under
+  the owning queue's lock, with one sentence covering every reader — *holding
+  queue N's lock while cpu_home == N is exclusive permission to touch that
+  task's links*.  §M54 had tried the release half alone and it HUNG TASKS;
+  **half of this fix is worse than neither half.**  Migration became one
+  transition under BOTH rq locks, ascending cpu_index.  **THE RESIDUAL ITSELF
+  WAS NOT A CORRUPTED RING AT ALL:** with the diagnostic captured under the lock
+  and BEFORE the removal (the first version printed the state the removal had
+  just created — the same for every cause, and one round of wrong theories), the
+  report read `home 3, next=set prev=set head=self state=2` — properly linked,
+  cpu_home agreeing, `state=2` = DEAD.  `task_exit_code` marked itself DEAD at
+  the top and then did a great deal of PREEMPTIBLE work, but
+  `pick_next_local_locked` picks only RUNNABLE tasks, so **from that store the
+  task was unschedulable while still executing with interrupts on** — one timer
+  preemption and it was switched away forever, never reaching its own
+  `rq_purge_all`, left in a runqueue as a corpse, and freed by the reaper with a
+  live frame on its stack.  DEAD, the joiner wake, the sweep and the final
+  switch are now one indivisible step with interrupts off, and `this_cpu()` is
+  re-read there (the value from function entry can name a CPU the task has since
+  migrated off — scheduling on another CPU's runqueue puts two CPUs on one
+  stack).  **Measured: 2880 kills, 0 `STILL QUEUED` (was ~1 per 200–300);
+  ~420k churn ops, 0 structural violations.**  **THE FALSIFICATION MATTERS MORE
+  THAN THE PASS:** the first `schedstorm` drove affinity from ONE task and
+  reported `ok` even against the pre-fix code, because the only thing it could
+  race was the 100 ms balancer — *a test that cannot fail is not evidence*; with
+  four concurrent churners it takes the pre-fix kernel down with an NMI
+  hard-lockup and passes on the fixed one.  **AND THE LOG ITSELF WAS BROKEN:**
+  `printf.c` said *"Not reentrant; fine because the kernel is single-threaded
+  today"* — true when written, false since §M18, the §M52 shape exactly, because
+  a comment cannot fail a test.  Two CPUs interleave character by character, and
+  every check in this project is a grep over the serial log, so **one passing
+  `killstorm` was read as a frozen shell on that evidence alone**.  Output is
+  serialised now with PREEMPTION disabled rather than interrupts (a framebuffer
+  scroll moves megabytes; holding it IRQ-off drops ticks and trips the
+  softlockup watchdog) and with same-CPU re-entry detected BEFORE the acquire
+  rather than waited on.  Also: `usock_set_owner` had no prototype since §M56.2
+  (the compiler assumed `int f()`, correct by luck on today's arches); stale
+  §M57 comment labels belonging to §M56.1 relabelled; two warnings cleared so
+  the build is silent and a real one cannot hide.  Verified i386 + x86_64 at
+  -smp 4 and aarch64 at -smp 2, full regression green on both x86 arches.
 
 - **2026-08-11 — §M56: a wait that is really a wait (DOCS §4.57).**  `poll(2)`
   with a positive timeout was treated as a snapshot — documented as such, which

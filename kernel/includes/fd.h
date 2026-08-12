@@ -29,7 +29,7 @@ struct epoll;                   /* §M56 — a readiness set behind a descriptor
 struct ofile {
     enum fd_kind kind;
     int          refcount;      /* # of descriptors referencing this object */
-    /* §M57 — O_NONBLOCK, and it lives HERE rather than in each object because
+    /* §M56.1 — O_NONBLOCK, and it lives HERE rather than in each object because
      * it is a property of the open file DESCRIPTION, not of the thing behind
      * it: two descriptors dup'd from one another share it, and two independent
      * opens of the same file do not.  It used to exist only inside
@@ -96,9 +96,15 @@ long usock_send (struct usock* s, const void* buf, size_t n, struct ofile* passf
 long usock_recv (struct usock* s, void* buf, size_t n, int block,
                  struct ofile** passfile_out);
 void usock_close(struct usock* s);
+/* §M56.2 — bind the endpoint to the open file description that owns it, so a
+ * readiness change can name itself.  Declared here rather than called on
+ * faith: without a prototype the compiler assumes `int usock_set_owner()`,
+ * which happens to pass two pointers correctly on the arches we build today
+ * and is exactly the kind of luck an arch port later runs out of. */
+void usock_set_owner(struct usock* s, struct ofile* o);
 int  usock_can_read (struct usock* s);   /* bytes buffered? (poll POLLIN)  */
 int  usock_can_write(struct usock* s);   /* peer open + space? (POLLOUT)   */
-int  usock_peer_open (struct usock* s);  /* other end still there? (§M57)  */
+int  usock_peer_open (struct usock* s);  /* other end still there? (§M56.1)  */
 
 /* Tier A.3 — poll readiness signal.  usock_send / usock_close call this
  * after changing an fd's readiness so a task blocked in a (timeout < 0)
@@ -125,7 +131,7 @@ void fd_readiness_changed(struct ofile* o);
  *
  * Returns a bitmask of POLL* bits (syscall.h), whose values are deliberately
  * Linux's so that mapping to epoll's EPOLL* is the identity rather than a
- * translation table.  §M57 widened this from two 0/1 outputs to a mask because
+ * translation table.  §M56.1 widened this from two 0/1 outputs to a mask because
  * readiness is not only "can I read": a hung-up peer and an error are
  * conditions a loop must be able to SEE, and POSIX reports them whether or not
  * they were requested. */

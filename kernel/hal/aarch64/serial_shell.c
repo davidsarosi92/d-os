@@ -21,6 +21,7 @@
 #include "printf.h"
 #include "pmm.h"
 #include "task.h"
+#include "percpu.h"    /* §M57 — smp_ncpus() for the runqueue audit + storm */
 #include "timer.h"
 #include "syscall.h"   /* §M53 stage 3 — timerfd + setitimer self-tests */
 #include "ktimer.h"
@@ -101,6 +102,8 @@ static void cmd_help(void) {
             "  musltest          run an unmodified static musl binary (§A2)\n"
             "  pkg list | pkg install <name>   package store (§A3)\n"
             "  pkgrun <n> [args] run a store package (§A3)\n"
+            "  rqcheck           check the runqueue invariant now (§M57)\n"
+            "  schedstorm [n]    affinity+nice churn, audited (§M57)\n"
             "  clear             clear the screen\n");
 }
 
@@ -299,6 +302,82 @@ static void cmd_killstorm(const char* args) {
         task_msleep(10);
     kprintf("killstorm: done — %d spawned, %d killed, %d still alive\n",
             spawned, killed, __atomic_load_n(&g_ks_alive, __ATOMIC_RELAXED));
+}
+
+/* §M57 — the ARM half of the runqueue audit + scheduler storm.  Same argument
+ * as killstorm above: the runqueue, cpu_home and the balancer are core code, so
+ * the invariant being checked is literally the same code — but "the same code"
+ * is an inference, and ARM has already produced two scheduler bugs x86 could
+ * not have (SP_EL0, the per-CPU tick divisor).  Running the checker here is
+ * what makes three arches a measurement. */
+static volatile int g_ss_worst;
+
+static void schedstorm_hog(void) {
+    volatile unsigned x = 0;
+    while (!task_should_stop()) { for (int i = 0; i < 20000; i++) x += i; task_yield(); }
+}
+
+static void rq_audit_print(const char* tag, const struct rq_audit* a, int bad) {
+    /* Structural verdict first, because that is the pass/fail one; the two
+     * soft counters follow, labelled, so a stale estimate can never be
+     * mistaken for a corrupted runqueue. */
+    kprintf("%s: %d queued | struct: home %d orphan %d count %d ring %d -> %s"
+            " | soft: lost %d load %d\n",
+            tag, a->tasks_queued, a->bad_home, a->orphan_home, a->bad_count,
+            a->broken_ring, bad ? "VIOLATIONS" : "consistent",
+            a->lost, a->bad_load);
+}
+
+static void cmd_rqcheck(void) {
+    struct rq_audit a;
+    int bad = task_rq_audit(&a);
+    rq_audit_print("rqcheck", &a, bad);
+}
+
+static void cmd_schedstorm(const char* args) {
+    int rounds = 0;
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) rounds = rounds * 10 + (*args - '0');
+    if (rounds <= 0) rounds = 40;
+
+    int pids[8], n = 0;
+    for (int i = 0; i < 8; i++) {
+        struct task* t = task_spawn("ss-hog", schedstorm_hog);
+        if (!t) break;
+        pids[n++] = t->pid;
+    }
+    kprintf("schedstorm: %d rounds, %d hogs, %d cpus\n", rounds, n, smp_ncpus());
+
+    g_ss_worst = 0;
+    unsigned seed = 0x1234567u;
+    for (int r = 0; r < rounds; r++) {
+        for (int i = 0; i < n; i++) {
+            seed = seed * 1103515245u + 12345u;
+            struct task* t = task_find(pids[i]);
+            if (!t) continue;
+            uint32_t mask = ((seed >> 8) & ((1u << (uint32_t)smp_ncpus()) - 1u));
+            if (!mask) mask = 1u;
+            task_set_affinity(t, mask);
+            task_set_nice(pids[i], (int)((seed >> 16) % 21u) - 10);
+        }
+        struct rq_audit a;
+        int hard = task_rq_audit(&a);   /* structural only; 5+6 at rest */
+        if (hard > g_ss_worst) g_ss_worst = hard;
+        task_msleep(4);
+    }
+
+    for (int i = 0; i < n; i++) {
+        struct task* t = task_find(pids[i]);
+        if (t) task_set_affinity(t, 0xFFFFFFFFu);
+        task_set_nice(pids[i], 0);
+        task_kill(pids[i]);
+    }
+    task_msleep(200);                     /* at rest: every rule, rule 5 too */
+    struct rq_audit after;
+    int bad1 = task_rq_audit(&after);
+    rq_audit_print("schedstorm: after ", &after, bad1);
+    kprintf("schedstorm: worst mid-churn %d, at rest %d -> %s\n",
+            g_ss_worst, bad1, (g_ss_worst == 0 && bad1 == 0) ? "ok" : "FAIL");
 }
 
 /* §M53 — the ARM half of the timer-accuracy report.  Its floor is 10 ms here,
@@ -513,6 +592,8 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "ktime"))  cmd_ktime();
         else if (s_eq(cmd, "ktimer")) cmd_ktimer();
         else if (s_eq(cmd, "killstorm")) cmd_killstorm(args);
+        else if (s_eq(cmd, "rqcheck"))   cmd_rqcheck();
+        else if (s_eq(cmd, "schedstorm")) cmd_schedstorm(args);
         else if (s_eq(cmd, "timerfdtest")) cmd_timerfdtest(args);
         else if (s_eq(cmd, "alarmtest"))   cmd_alarmtest(args);
         else if (s_eq(cmd, "ps"))     cmd_ps();

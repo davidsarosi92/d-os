@@ -317,7 +317,7 @@ long sys_read_k(int fd, void* buf, size_t n) {
     if (o->kind == FD_VFS)  return (long)vfs_read(o->file, buf, n);
     /* Sockets read(2) with POSIX blocking semantics (block == 1): an empty
      * read waits for the peer to send (or close → 0/EOF). */
-    /* §M57 — one flag, checked in one place.  `block` is the inverse of the
+    /* §M56.1 — one flag, checked in one place.  `block` is the inverse of the
      * description's O_NONBLOCK; before this the socket layer carried its own
      * copy and every other kind ignored the flag entirely. */
     int block = !o->nonblock;
@@ -1089,7 +1089,7 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
     case FD_SOCK:
         if (usock_can_read(o->sock))  r |= POLLIN;
         if (usock_can_write(o->sock)) r |= POLLOUT;
-        /* §M57 — the peer endpoint is gone.  RDHUP says "no more data will
+        /* §M56.1 — the peer endpoint is gone.  RDHUP says "no more data will
          * ever arrive"; HUP additionally says the buffered data is drained, so
          * there is nothing left at all.  Reporting them separately is what
          * lets a reader finish what is already queued before it closes down —
@@ -1477,7 +1477,7 @@ uint32_t netsock_readiness(struct netsock* ns) {
      * or dropped connection looks exactly like a server that answered with
      * nothing, and a loop cannot tell "done" from "broken". */
     if (rst) r |= POLLERR;
-    /* §M57 — the peer's FIN.  A stream reader MUST be able to see this without
+    /* §M56.1 — the peer's FIN.  A stream reader MUST be able to see this without
      * reading, or it can only discover EOF by attempting the read it used the
      * event loop to avoid.  POLLIN stays set while unread bytes remain, so the
      * loop drains the tail first and only then sees POLLHUP. */
@@ -1557,7 +1557,7 @@ int sys_fd_kind(int fd) {
     return o ? (int)o->kind : -1;
 }
 
-/* §M57 — O_NONBLOCK for ANY descriptor, not just an AF_INET socket.
+/* §M56.1 — O_NONBLOCK for ANY descriptor, not just an AF_INET socket.
  *
  * The name is historical: it was a socket-only knob, and every other kind
  * silently ignored the flag — so a musl program that set O_NONBLOCK on a pipe

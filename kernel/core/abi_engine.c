@@ -242,7 +242,7 @@ static long h_mmap(struct abi_ctx* c) {
 
 /* set_tid_address returns the caller's tid.  d-os has no separate tid space,
  * so the pid is the honest answer — the same one gettid gives. */
-/* §M57 — rt_sigprocmask, for real.
+/* §M56.1 — rt_sigprocmask, for real.
  *
  * This was `return 0` — accept and forget.  That is not a harmless stub: a
  * program that blocks SIGPIPE around a write to a closed pipe, or blocks
@@ -423,7 +423,7 @@ static long h_epoll_wait(struct abi_ctx* c) {
     int timeout   = (int)c->a[3];
     unsigned long maskp = c->a[4];
 
-    /* §M57 — epoll_pwait's mask, honoured.  The whole reason the call exists
+    /* §M56.1 — epoll_pwait's mask, honoured.  The whole reason the call exists
      * is that "unblock this signal" and "start waiting" must be ONE step: do
      * them separately and a signal arriving in between is delivered while the
      * program is not yet waiting, so the wait it then enters has nothing left

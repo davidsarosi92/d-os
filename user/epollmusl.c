@@ -78,7 +78,7 @@ int main(void) {
     printf("epollmusl: idle wait -> n=%d (expect 0)\n", n);
     if (n != 0) ok = 0;
 
-    /* --- sigprocmask, which was a `return 0` stub until M57 ------------ */
+    /* --- sigprocmask, which was a `return 0` stub until M56.1 ------------ */
     /*
      * The check has to be observable, so: block SIGALRM, arm a 60 ms timer,
      * sleep past it, and confirm the signal is PENDING rather than delivered

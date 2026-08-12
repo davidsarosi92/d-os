@@ -27,12 +27,42 @@
  *
  * Intentional simplifications:
  *   - No width, precision, padding, sign, or %.Nf.
- *   - Not reentrant; fine because the kernel is single-threaded today.
+ *
+ * §M57 — THE LINE THAT USED TO STAND HERE WAS "Not reentrant; fine because the
+ * kernel is single-threaded today."  It was true when written and has been
+ * false since §M18 brought up SMP; nothing went back to it, because a comment
+ * cannot fail a test (§M52, the same shape, in the x86_64 syscall stub).
+ *
+ * What it cost is not cosmetic.  Two CPUs formatting at once interleave
+ * CHARACTER BY CHARACTER, so a completed self-test reads as
+ *
+ *     kstorm-vict:im 20/2r0oun ds,id 240 spa0)wned, 240 killed, 0 alive
+ *
+ * — and every automated check in this project works by grepping the serial
+ * log.  A shredded line does not merely look untidy: it makes a passing test
+ * report as a hang, which is exactly how one run of `killstorm` was read as a
+ * frozen shell before the log was examined byte by byte.  *A test harness that
+ * silently loses output is worse than no harness, because it is trusted.*
+ *
+ * So one kprintf is now atomic against another.  Two properties matter more
+ * than the ordering itself:
+ *
+ *   - IRQ-safe: the lock is taken with interrupts off, because kprintf is
+ *     called from the timer ISR and from driver ISRs.
+ *   - RE-ENTRY-SAFE: a context that cannot be locked out — an NMI, or a
+ *     console sink that itself calls kprintf — must NOT deadlock waiting for
+ *     a lock this same CPU already holds.  It detects the recursion and prints
+ *     unlocked, accepting interleaving in the one case where the alternative
+ *     is a dead machine.  That is printk's rule, and it is a rule about
+ *     LIVENESS: a diagnostic path that can hang is a diagnostic path that will
+ *     hang exactly when it is needed.
  * =========================================================================== */
 
 #include "printf.h"
 #include "console.h"
 #include "klog.h"
+#include "lock.h"
+#include "percpu.h"
 #include <stdarg.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -111,7 +141,9 @@ static int64_t fetch_signed(va_list* ap, enum length_mod lm) {
 /* va_list core.  kprintf is a thin variadic wrapper; klog() calls this
  * directly with its own forwarded va_list so structured log lines run
  * through the identical formatter (and thus the same console + klog tee). */
-void kvprintf(const char* fmt, va_list ap) {
+/* The formatter proper.  Emits unlocked — every entry point below brackets it
+ * (§M57), and it has early returns, so the bracket cannot live inside. */
+static void kvprintf_raw(const char* fmt, va_list ap) {
     /* Work on a private copy.  On x86_64 the SysV ABI makes `va_list` an
      * array type, so a `va_list` *parameter* decays to a pointer — which
      * means `&ap` would be a pointer-to-pointer, the wrong type for the
@@ -191,6 +223,15 @@ void kvprintf(const char* fmt, va_list ap) {
         }
     }
     va_end(aq);
+}
+
+/* §M57 — the serialised entry points.  One message at a time; see the file
+ * header for what the interleaving cost. */
+void kvprintf(const char* fmt, va_list ap) {
+    uint32_t fl;
+    int held = console_out_begin(&fl);
+    kvprintf_raw(fmt, ap);
+    console_out_end(fl, held);
 }
 
 /* Variadic wrapper — owns the va_list, delegates the work to kvprintf. */

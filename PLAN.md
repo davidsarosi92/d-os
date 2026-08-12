@@ -4433,6 +4433,75 @@ trigger written down); `EPOLLEXCLUSIVE` and edge-triggered mode.
 
 ---
 
+## §M57 — A task is not dead while it is still running ✅
+
+**Shipped 2026-08-12 — see DOCS.md §4.58.**  §M54's three open items closed.
+`cpu_home` becomes an ownership token (claimed by CAS, released after the
+unlink, both under the owning queue's lock); migration becomes one transition
+under both rq locks in ascending cpu_index order; `rq_rotate_to_tail_locked`,
+`task_set_affinity` and `task_set_nice` stop acting on a queue named by an
+unlocked read.  The residual itself turned out not to be a corrupted ring at
+all: `task_exit_code` published DEAD and then did preemptible work, and since
+`pick_next_local_locked` picks only RUNNABLE tasks, a preemption in that window
+stranded the task forever — linked in a runqueue, never reaching its own sweep,
+and freed by the reaper with a live frame on its stack.  New `rqcheck` and
+`schedstorm` state the runqueue invariant in code and check it.  Measured: 2880
+kills with 0 `STILL QUEUED` (was ~1 per 200–300), ~420k affinity/nice churn ops
+with 0 structural violations, three arches.
+
+**Lessons learned.**
+
+- *A test that cannot fail is not evidence.*  The first `schedstorm` drove
+  affinity from one task and reported `ok` even against the pre-fix code — the
+  only thing it could race with was the balancer's 100 ms tick, so a 240 ms run
+  offered about two chances to hit a window measured in instructions.  With four
+  concurrent churners the same test takes the pre-fix kernel down with an NMI
+  hard-lockup inside a minute.  **Run the new test against the OLD code before
+  believing it about the new code.**
+
+- *A diagnostic must be captured where the evidence still exists.*  The reap
+  report printed the task's link state AFTER the sweep had removed it — which is
+  identical for every possible cause and therefore says nothing.  Moving the
+  capture under the lock and before the removal turned "STILL QUEUED, once in a
+  few hundred kills" into one line naming the fault exactly.  It cost a round of
+  wrong theories first.
+
+- *Half of a two-sided invariant is worse than neither half.*  §M54 tried
+  clearing `cpu_home` in the steal without adding the matching claim, and it
+  hung tasks: a queued task carried -1 forever, so every block path silently
+  failed to detach.  The pair (claim on insert / release on remove) only works
+  as a pair.
+
+- *A value documented as a fact must be enforced as one, or it is a hint.*
+  `cpu_home` had said "which CPU's rq this task lives on" since M18.6.1 and was
+  written by whoever felt like it.  Four sites then mutated a ring while holding
+  another CPU's lock — two of them reachable from ordinary shell commands.
+
+- *A state that makes a task unschedulable must be published atomically with
+  the switch away.*  "Mark yourself DEAD, then tidy up" reads as obviously safe
+  and is the opposite: everything after the store runs on borrowed time that the
+  scheduler has already refused to grant.
+
+- *A logging path that shreds under concurrency is a correctness bug, not a
+  cosmetic one.*  `printf.c` still said "single-threaded today" — true when
+  written, false since §M18 (the §M52 shape again).  Every automated check here
+  is a grep over the serial log, so a passing `killstorm` was read as a frozen
+  shell purely because two CPUs interleaved a line.  **A harness that silently
+  loses output is worse than no harness, because it is trusted.**
+
+- *Serialising output must not use the obvious lock.*  Interrupts-off across a
+  message would hold the CPU through a multi-megabyte framebuffer scroll and
+  trip the softlockup watchdog — the logging path would make the machine look
+  wedged.  Preemption-off plus a re-entry test taken BEFORE the acquire is the
+  version that cannot deadlock the one path you need when everything else is
+  already broken.
+
+**Still open:** `AARCH64_MAX_CPUS` ships at 2, so ARM verification is real SMP
+at two cores; `load_balance_pull`'s migration counter still counts an attempt
+whose insert can be refused (diagnostic only).
+
+---
+
 ## §M55 — Network async: one poller, blocking waiters ✅
 
 **Shipped 2026-08-11 — see DOCS.md §4.56.**  The network stack no longer

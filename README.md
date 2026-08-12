@@ -47,6 +47,7 @@ loop 8 ; sched          # eight CPU hogs, then see how they spread
 nice <pid> -10          # scheduling priority
 wqtest                  # deferred-work pool, across cores
 killstorm               # kill blocked tasks, hard and often, on every CPU
+rqcheck ; schedstorm    # the runqueue invariant, stated and checked under churn
 ping 10.0.2.2 ; wget    # networking
 lsnic ; netstorm 8      # NIC state; eight tasks waiting at once, for free
 ktime ; timerfdtest     # the clock, and timers behind descriptors
@@ -58,7 +59,10 @@ shutdown                # ACPI soft-off
 
 Most of the self-tests print a `PASS`/`ok` line and a measurement, so a
 headless boot can be checked by grepping the serial log — and so a claim
-about the kernel can be argued with a number.
+about the kernel can be argued with a number.  Two habits keep that honest:
+a new test is run against the OLD code first, because **a test that cannot
+fail is not evidence**; and kernel output is serialised, because two CPUs
+interleaving one line once turned a passing run into a reported hang.
 
 ## Where to read more
 

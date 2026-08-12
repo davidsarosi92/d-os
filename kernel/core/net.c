@@ -1205,7 +1205,7 @@ int net_tcp_recv(struct net_device* dev, void* buf, uint32_t len) {
     return (int)cnt;                             /* 0 = EOF (peer FIN, drained) */
 }
 
-/* §M56/§M57 — readiness for poll/epoll on the connected stream socket.  Both
+/* §M56/§M56.1 — readiness for poll/epoll on the connected stream socket.  Both
  * facts in one locked read, because they are read together and a caller that
  * sampled them separately could see "no data" and "no FIN" from two different
  * instants and conclude the connection was merely quiet.

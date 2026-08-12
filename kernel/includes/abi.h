@@ -122,7 +122,7 @@ enum abi_op {
     ABI_EPOLL_CTL,
     ABI_EPOLL_WAIT,
 
-    /* §M57 — the query half of the signal mask.  Without it a program can
+    /* §M56.1 — the query half of the signal mask.  Without it a program can
      * block a signal but never find out that one arrived, which makes
      * "defer this signal" indistinguishable from "discard it" from the
      * inside — and it is the only way to assert that the mask DEFERS. */

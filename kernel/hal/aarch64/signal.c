@@ -64,7 +64,7 @@ void signal_deliver(struct trapframe* f) {
     for (int sig = 1; sig < NSIG; sig++) {
         uint32_t bit = 1u << sig;
         if (!(t->sig_pending & bit)) continue;
-        /* §M57 — a BLOCKED signal stays pending; it is not consumed and not
+        /* §M56.1 — a BLOCKED signal stays pending; it is not consumed and not
          * delivered.  Skipping the `sig_pending &= ~bit` below is the whole
          * mechanism: sigprocmask must DEFER a signal, never lose one, and
          * clearing the bit here would turn "block SIGPIPE while I write" into

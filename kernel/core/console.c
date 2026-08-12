@@ -15,9 +15,68 @@
 #include "console.h"
 #include "printf.h"
 #include "task.h"
+#include "lock.h"
+#include "percpu.h"
+#include "hal_api.h"
 #include <stddef.h>
 
 static struct console_sink* head = NULL;
+
+/* ---------------------------------------------------------------------------
+ * §M57 — output serialisation.  Contract + why: console.h.
+ *
+ * `owner` is written only while the lock is held, and read (unlocked) only to
+ * detect THIS CPU re-entering.  That read is safe without an atomic: a stale
+ * value can only be another CPU's id, which is not ours, so the worst outcome
+ * is that we take the lock — the correct action anyway.  Only our OWN id can
+ * make us skip it, and only we can write that.
+ * --------------------------------------------------------------------------- */
+static spinlock_t   out_lock;
+static volatile int out_owner = -1;         /* cpu id holding it, -1 = free */
+
+int console_out_begin(uint32_t* flags) {
+    (void)flags;
+    /* PREEMPTION off, not interrupts.
+     *
+     * The obvious implementation takes the lock with interrupts disabled, and
+     * it is wrong for this particular lock: a console message can be slow —
+     * a full-screen scroll on the framebuffer sink is a multi-megabyte move —
+     * and doing that with interrupts off drops timer ticks and can trip the
+     * softlockup watchdog.  A logging path that makes the machine look wedged
+     * is a poor trade for tidy output.
+     *
+     * preempt_disable is enough, and it is per-CPU (§M18.6.2).  It keeps the
+     * holder on this CPU so a second task here cannot spin against a holder
+     * that has been scheduled away, while the timer keeps ticking.
+     *
+     * What it does NOT prevent is an interrupt on this CPU printing while we
+     * hold the lock — which is exactly what the owner test below is for.  The
+     * test comes BEFORE the acquire because spin_lock blocks: asking "do I
+     * already hold this?" after waiting for it is a question whose only answer
+     * is a hung machine.  That ordering is the whole difference between a
+     * recursion guard and a deadlock. */
+    preempt_disable();
+    int self = this_cpu_id();
+    if (out_owner == self) {
+        /* Already ours further up this CPU's stack (an ISR, an NMI, or a sink
+         * that itself prints).  Go on unlocked: interleaved output is a bad
+         * outcome, a wedged diagnostic path is a fatal one — and this is the
+         * rare case, not the common one the lock exists for. */
+        return 0;
+    }
+    spin_lock(&out_lock);
+    out_owner = self;
+    return 1;
+}
+
+void console_out_end(uint32_t flags, int held) {
+    (void)flags;
+    if (held) {
+        out_owner = -1;
+        spin_unlock(&out_lock);
+    }
+    preempt_enable();
+}
 
 /* Per-task output routing (M14).  vc_init installs `vc_putchar` here so
  * console_putchar can deliver to the running task's bound VC without the
@@ -74,7 +133,13 @@ void console_putchar(char c) {
 }
 
 void console_write(const char* s) {
+    /* §M57 — a whole string is one message, for the same reason a whole
+     * kprintf is: half of one line inside another is not a smaller problem
+     * than a shredded word. */
+    uint32_t fl;
+    int held = console_out_begin(&fl);
     while (*s) console_putchar(*s++);
+    console_out_end(fl, held);
 }
 
 void console_clear(void) {
