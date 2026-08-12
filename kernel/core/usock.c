@@ -42,7 +42,14 @@ struct usock {
      * concurrency-safe.  Note the pairing: send(A) fills A->peer(B)'s ring
      * and wakes B->readers; a blocked recv(B) waits on B->readers. */
     struct waitq readers;
+    /* §M56.2 — the ofile this endpoint lives behind, so a readiness change can
+     * name itself instead of telling every poller in the system to re-look.
+     * Safe as a bare pointer because the ofile OWNS this object: it is freed
+     * by ofile_unref, so the pointer cannot outlive what it points at. */
+    struct ofile* owner;
 };
+
+void usock_set_owner(struct usock* s, struct ofile* o) { if (s) s->owner = o; }
 
 /* Create a connected pair.  Returns 0 on success, -1 on OOM. */
 int usock_pair(struct usock** a, struct usock** b) {
@@ -80,7 +87,9 @@ long usock_send(struct usock* s, const void* buf, size_t n, struct ofile* passfi
         waitq_wake_all(&p->readers);                     /* wake blocked recv(peer) */
     waitq_unlock(&p->readers, f);
 
-    if (wrote > 0 || passfile) fd_readiness_signal();    /* wake blocked poll() */
+    /* The PEER became readable, not us — name its description so a poller
+     * watching a hundred other descriptors re-evaluates only this one. */
+    if (wrote > 0 || passfile) fd_readiness_changed(p->owner);
     return (long)wrote;
 }
 
@@ -145,7 +154,7 @@ void usock_close(struct usock* s) {
         p->peer = NULL;                      /* peer now sees us gone */
         waitq_wake_all(&p->readers);         /* unblock recv(peer) → EOF */
         waitq_unlock(&p->readers, f);
-        fd_readiness_signal();               /* poll(peer) re-scans → EOF/err */
+        fd_readiness_changed(p->owner);      /* the peer's poll → EOF/HUP */
     }
     for (int i = 0; i < s->fdq_count; i++) ofile_unref(s->fdq[i]);
     kfree(s);

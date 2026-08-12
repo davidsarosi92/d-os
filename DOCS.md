@@ -6445,30 +6445,73 @@ closed a pipe fd without `EPOLL_CTL_DEL`, the next pipe reused the number, the
 hazard is real — a set watches descriptor *numbers* — it just belonged to the
 caller, which is exactly what `epoll_close`'s comment already said.
 
-#### The one item NOT built, and the number behind that
+#### `epoll_wait`: the cache that was built, measured, and removed
 
-`epoll_wait` still scans the registered set.  Rather than argue about it,
-`epolltest` measures it:
+The remaining item was "stop scanning the whole set".  It was implemented: each
+item remembered `(description, generation, answer)` and a scan re-evaluated only
+descriptors whose description had bumped a global generation counter.  The
+lifetime problem was solved cleanly — the fd table is consulted every time, so a
+remembered pointer is only ever *compared*, never dereferenced, and generations
+come from one global sequence so a new object at a reused address cannot present
+a number the cache has seen.
+
+It was still wrong, and the test written alongside it said so on the first run:
 
 ```
-epoll: scan of 26 registered fds costs ~16 us per wait   (i386 and x86_64, emulated)
+epoll: memo check — 20/20 ready, 0/20 idle transitions seen
+epoll: FAIL (the readiness cache hid a transition)
 ```
 
-≈620 ns per registered descriptor under emulation, so `EPOLL_MAX_ITEMS = 64`
-bounds the worst case at ~40 µs **by construction**, and a realistic loop here
-(under ten descriptors) pays ~6 µs.  Per-fd wakeups would buy none of that back
-in any workload this kernel can currently host, and would cost a new lifetime
-relationship between epoll items and open file descriptions — the exact class of
-defect §M54 spent itself removing.  *The trigger for revisiting is a measured
-one:* a program whose scan cost is visible next to its work.
+A cache like this is correct only if **every** state change that affects
+readiness bumps the generation — and the sites are not where intuition puts
+them.  A pipe's *readability* changes when its owner reads; its *writability*
+changes when its **peer** reads.  A producer-side bump is not enough, the
+enumeration has to be exhaustive, and two sites were missing on the first
+attempt.  *A cache whose invalidation must be remembered at every mutation site
+is a bug generator* — and the bug it generates is an event that never arrives,
+surfacing long after the change that caused it.
+
+It also bought nothing: **15.5 µs versus 16.4 µs** for 26 registered
+descriptors, inside the noise.  The per-item cost is the descriptor lookup and
+the loop, not the readiness evaluation the cache was skipping.
+
+So it was removed, and replaced with the one change that is plainly redundant
+work: `fd_readiness_of()` takes the `ofile` the scan has already resolved
+instead of looking it up a second time.  Honest about that too — at this scale
+the benchmark is noise-dominated (16–25 µs across runs) and does **not**
+demonstrate a speedup.  It is the right shape, not a proven win.
+
+The standing measurement: ~16 µs for 26 descriptors, so `EPOLL_MAX_ITEMS = 64`
+bounds a scan at tens of microseconds **by construction**, and a realistic loop
+here (under ten descriptors) pays a few.  Genuine per-fd wakeups need per-object
+wait queues with callback registration and the lifetime coupling that comes with
+them — §M54's defect class — for a saving this workload cannot notice.  *The
+trigger for revisiting is measured:* a program whose scan cost is visible next
+to its work.
+
+#### `EPOLLERR` has a producer now
+
+A TCP `RST` is not a `FIN`.  Both end the connection, but a FIN is the peer
+saying "I am done sending" and an RST is "this connection is broken" — the first
+is an orderly EOF, the second is an error.  Without the distinction a refused or
+dropped connection looks exactly like a server that answered with nothing.
+`g_tcp.reset` now surfaces as `POLLERR`, which (like `POLLHUP`) is reported
+whether or not it was requested.
+
+#### Signal masks are read and written at their real width
+
+A guest `sigset_t` is passed with a `sigsetsize`, and every libc passes 8.  This
+kernel has 32 signals and no real-time signals, so bits 32–63 can never be
+pending here — writing **zero** for them is the truth, not a loss, which is why
+the full eight bytes are now handled rather than the first four.  Anything the
+guest keeps beyond `sigsetsize` is its own business and is left untouched.
 
 #### Still open
 
-- Per-fd wakeups (see the measurement above — a decision, not a deferral).
-- `EPOLLERR` has no producer: no fd kind currently carries an error state.
-- Signal masks are 32 bits; a guest `sigset_t` is 128 bytes and the high words
-  are left untouched rather than zeroed, because a libc that keeps state there
-  would rather be ignored than corrupted.
+- Per-fd wakeups — declined on the measurement above, with the reason and the
+  trigger both written down.
+- `EPOLLONESHOT` disarms on report; `EPOLLEXCLUSIVE` and edge-triggered mode are
+  not implemented (the latter deliberately refused, see above).
 
 ---
 
@@ -6563,6 +6606,33 @@ misled into thinking M6 is where the work ends.
   of that back at this scale and would cost a new lifetime relationship between
   epoll items and open file descriptions — §M54's defect class.  A measured
   decision, with a measured trigger for revisiting.
+
+- **2026-08-12 — §M56.2: no bugs left behind (DOCS §4.57).**  `EPOLLERR` has a
+  producer: a TCP **RST is not a FIN** — both end the connection, but one is an
+  orderly EOF and the other is a broken connection, and without the distinction
+  a refused or dropped connection looks exactly like a server that answered with
+  nothing.  **Signal masks are read and written at their real width** (8 bytes,
+  the `sigsetsize` every libc passes): this kernel has 32 signals and no
+  real-time signals, so writing ZERO for bits 32–63 is the truth rather than a
+  loss, and what the guest keeps beyond `sigsetsize` is left untouched.  **And
+  `epoll_wait`'s scan was finished — by building the cache, measuring it, and
+  removing it.**  Each item remembered (description, generation, answer); the
+  lifetime problem was solved cleanly (the fd table is consulted every time, so
+  a remembered pointer is only ever COMPARED, and generations come from one
+  global sequence so a reused address cannot present a seen number).  It was
+  still wrong, and the test written alongside it said so on the first run —
+  `memo check: 20/20 ready, 0/20 idle`.  A cache like this is correct only if
+  EVERY readiness-affecting state change bumps the generation, and the sites are
+  not where intuition puts them: a pipe's readability changes when its OWNER
+  reads, its writability when its PEER reads.  Two sites were missing on the
+  first attempt.  *A cache whose invalidation must be remembered at every
+  mutation site is a bug generator*, and the bug is an event that never arrives.
+  It also bought nothing — 15.5 µs vs 16.4 µs for 26 descriptors, inside the
+  noise, because the per-item cost is the lookup and the loop, not the readiness
+  evaluation it skipped.  Replaced by `fd_readiness_of()`, which takes the ofile
+  the scan already resolved instead of looking it up twice — plainly redundant
+  work removed, and honestly labelled as the right shape rather than a proven
+  win, because at this scale the benchmark is noise-dominated (16–25 µs).
 
 - **2026-08-11 — §M55: waiting for the network without spending a CPU on it
   (DOCS §4.56).**  The network stack drove RX by polling from the calling task,

@@ -34,6 +34,12 @@
 struct timerfd;
 
 /* Create a disarmed timer object.  NULL on OOM. */
+struct ofile;
+/* §M56.2 — tell the timer which description it lives behind, so an expiry can
+ * name itself to the poller instead of waking everyone.  Called once, by
+ * ofile_from_timerfd. */
+void timerfd_set_owner(struct timerfd* tf, struct ofile* o);
+
 struct timerfd* timerfd_create_obj(void);
 void            timerfd_close(struct timerfd* tf);
 

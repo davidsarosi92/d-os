@@ -961,6 +961,13 @@ static struct {
     uint32_t rcv_nxt;                          /* next seq we expect          */
     volatile int established;
     volatile int peer_fin;
+    /* §M56.2 — an RST is not a FIN.  Both end the connection, but a FIN is the
+     * peer saying "I am done sending" and an RST is "this connection is
+     * broken": the first is an orderly EOF, the second is an ERROR, and a
+     * program that cannot tell them apart will treat a refused or dropped
+     * connection as a successful zero-length response.  This is what gives
+     * poll/epoll a POLLERR to report. */
+    volatile int reset;
 } g_tcp;
 
 /* Response accumulation buffer (bounded — a first-slice wget, not a stream). */
@@ -1027,7 +1034,12 @@ static void tcp_input(struct net_device* dev, uint32_t src_ip,
     const uint8_t* data = p + hlen;
     uint32_t dlen = len - hlen;
 
-    if (flags & TCP_RST) { g_tcp.state = TCP_ST_CLOSING; g_tcp.peer_fin = 1; return; }
+    if (flags & TCP_RST) {
+        g_tcp.state = TCP_ST_CLOSING;
+        g_tcp.peer_fin = 1;
+        g_tcp.reset    = 1;             /* surfaces as POLLERR, not a clean EOF */
+        return;
+    }
 
     if (g_tcp.state == TCP_ST_SYN_SENT) {
         if ((flags & TCP_SYN) && (flags & TCP_ACK)) {
@@ -1093,6 +1105,7 @@ static int tcp_open(struct net_device* dev, uint32_t ip, uint16_t port) {
     g_tcp.rcv_nxt     = 0;
     g_tcp.established = 0;
     g_tcp.peer_fin    = 0;
+    g_tcp.reset       = 0;
     g_tcp_rxlen       = 0;
     g_tcp_rxconsumed  = 0;
     tcp_send_seg_locked(dev, TCP_SYN, NULL, 0);
@@ -1199,10 +1212,11 @@ int net_tcp_recv(struct net_device* dev, void* buf, uint32_t len) {
  *
  * `readable` counts unread bytes only; the FIN is reported separately so a
  * loop can drain the tail before it acts on the hangup. */
-void net_tcp_state(int* readable, int* peer_fin) {
+void net_tcp_state(int* readable, int* peer_fin, int* reset) {
     uint32_t f = net_lock();
     if (readable) *readable = (g_tcp_rxconsumed < g_tcp_rxlen);
     if (peer_fin) *peer_fin = g_tcp.peer_fin;
+    if (reset)    *reset    = g_tcp.reset;
     net_unlock(f);
 }
 

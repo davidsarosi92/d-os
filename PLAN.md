@@ -4402,8 +4402,34 @@ depth; real `sigprocmask` + `rt_sigpending` + `epoll_pwait`'s mask.
   add a lifetime relationship between epoll items and open file descriptions —
   §M54's defect class.  Declining is the decision; the measurement is why.
 
-**Still open:** per-fd wakeups (see above); `EPOLLERR` has no producer; signal
-masks are 32 bits and a guest `sigset_t`'s high words are left untouched.
+**§M56.2 — no bugs left behind.**  `EPOLLERR` has a producer (a TCP RST is not
+a FIN — an error, not an orderly EOF); signal masks are handled at their real
+8-byte width; and `epoll_wait`'s scan was finished by building the readiness
+cache, measuring it, and removing it again.
+
+- *A cache whose invalidation must be remembered at every mutation site is a bug
+  generator.*  The memo was correct about lifetimes — the fd table is consulted
+  every time, so a remembered pointer is only compared — and still wrong,
+  because a pipe's readability changes when its OWNER reads and its writability
+  when its PEER reads.  Two sites were missing on the first attempt, and the
+  failure mode is an event that never arrives.
+
+- *Write the test that can falsify the optimisation before the optimisation.*
+  Twenty ready/idle transitions caught it on the first run.  Without it the
+  cache would have shipped and the missing event would have surfaced weeks
+  later, in something else.
+
+- *Measure before AND after.*  It saved 15.5 µs against 16.4 µs — inside the
+  noise — because the per-item cost was the descriptor lookup and the loop, not
+  the readiness evaluation it was skipping.  The optimisation was aimed at the
+  wrong thing.
+
+- *Do not claim a speedup the benchmark does not show.*  Removing the redundant
+  second lookup is obviously right and cannot be wrong; at this scale it is also
+  not measurable, and the comment says so.
+
+**Still open:** genuine per-fd wakeups (declined on the measurement, with the
+trigger written down); `EPOLLEXCLUSIVE` and edge-triggered mode.
 
 ---
 

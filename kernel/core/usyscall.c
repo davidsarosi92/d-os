@@ -175,7 +175,8 @@ static void bounce_fini(struct bounce* b) {
  * first chunk is what was available — and looping for more would block a caller
  * that asked for a big buffer but only expected whatever had arrived.  That
  * distinction is why this is a per-fd question and not a global policy. */
-static struct ofile* fd_lookup(int fd);        /* defined with the fd table below */
+/* fd_lookup is declared in fd.h — it stopped being private to this file when
+ * epoll needed to resolve a descriptor without re-implementing the table. */
 static int read_may_loop(int fd) {
     if (fd < 3) return 0;                       /* stdin is line-oriented       */
     struct ofile* o = fd_lookup(fd);
@@ -207,7 +208,7 @@ long sys_print(const char* user_str) {
 }
 
 /* Resolve a real fd (>= 3) to its ofile, or NULL if out of range / not open. */
-static struct ofile* fd_lookup(int fd) {
+struct ofile* fd_lookup(int fd) {
     struct task* t = task_current();
     if (!t || fd < 3 || fd >= TASK_MAX_FDS) return NULL;
     return t->fds[fd];
@@ -333,7 +334,14 @@ long sys_read_k(int fd, void* buf, size_t n) {
      * it.  Blocking by default, like every other read here; a caller that
      * wants the non-blocking form uses poll(2), which is the whole point of
      * the descriptor existing. */
-    if (o->kind == FD_TIMER) return timerfd_read(o->tfd, buf, n, block);
+    if (o->kind == FD_TIMER) {
+        long r = timerfd_read(o->tfd, buf, n, block);
+        /* Reading a timerfd RESETS its expiration count, so it stops being
+         * readable — the mirror image of the expiry that made it readable.
+         * A poller holding a cached "readable" would otherwise spin. */
+        if (r > 0) fd_readiness_changed(o);
+        return r;
+    }
     return -1;
 }
 
@@ -1051,6 +1059,12 @@ void fd_readiness_signal(void) {
 
 /* See fd.h — the single definition of readiness, shared by poll and epoll. */
 uint32_t fd_readiness(int fd) {
+    /* fd 0/1/2 have no ofile, so the lookup is skipped for them by the
+     * `_of` form itself; passing what we have avoids doing it twice. */
+    return fd_readiness_of(fd, (fd >= 3) ? fd_lookup(fd) : NULL);
+}
+
+uint32_t fd_readiness_of(int fd, struct ofile* o) {
     uint32_t r = 0;
 
     if (fd == 0) {
@@ -1066,7 +1080,6 @@ uint32_t fd_readiness(int fd) {
     }
     if (fd == 1 || fd == 2) return POLLOUT;      /* console out: always writable */
 
-    struct ofile* o = fd_lookup(fd);
     /* POLLNVAL is the honest answer for a descriptor that is not open, and it
      * is reported unrequested: a loop watching an fd it has already closed
      * would otherwise wait forever on something that can never be ready. */
@@ -1457,9 +1470,13 @@ uint32_t netsock_readiness(struct netsock* ns) {
 
     if (!ns->connected) return 0;                /* not connected: nothing yet */
     uint32_t r = POLLOUT;                        /* no send buffer to fill up  */
-    int rd = 0, fin = 0;
-    net_tcp_state(&rd, &fin);
+    int rd = 0, fin = 0, rst = 0;
+    net_tcp_state(&rd, &fin, &rst);
     if (rd) r |= POLLIN;
+    /* §M56.2 — an RST is an ERROR, not an end of file.  Without this a refused
+     * or dropped connection looks exactly like a server that answered with
+     * nothing, and a loop cannot tell "done" from "broken". */
+    if (rst) r |= POLLERR;
     /* §M57 — the peer's FIN.  A stream reader MUST be able to see this without
      * reading, or it can only discover EOF by attempting the read it used the
      * event loop to avoid.  POLLIN stays set while unread bytes remain, so the

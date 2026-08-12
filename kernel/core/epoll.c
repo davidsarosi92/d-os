@@ -133,6 +133,34 @@ struct ep_scan_ctx {
  * event loop to avoid.  EPOLLRDHUP is Linux's own and IS request-gated. */
 #define EP_ALWAYS (EPOLLERR | EPOLLHUP)
 
+/* WHY THERE IS NO READINESS CACHE HERE.
+ *
+ * There was one, briefly: each item remembered (description, generation,
+ * answer) so a scan re-evaluated only the descriptors that had moved.  It was
+ * removed, and both halves of the reason are worth keeping.
+ *
+ * It did not work.  A cache like this is only correct if EVERY state change
+ * that affects readiness bumps the generation, and the sites are not where you
+ * expect: a pipe's writability changes when its PEER reads, and its readability
+ * changes when the OWNER reads — so a producer-side bump is not enough, and the
+ * enumeration has to be complete or the cache hides an event.  The test in
+ * `epolltest` that drives 20 ready/idle transitions caught exactly that, with
+ * two sites missing on the first attempt.  *A cache whose invalidation must be
+ * remembered at every mutation site is a bug generator*, and the bug it
+ * generates is an event that never arrives — which surfaces long after the
+ * change that caused it.
+ *
+ * And it bought nothing: 15.5 us versus 16.4 us for 26 registered descriptors,
+ * inside the noise.  The per-item cost is the descriptor lookup and the loop,
+ * not the readiness evaluation the cache was avoiding.
+ *
+ * What replaced it is `fd_readiness_of`, which takes the ofile the scan has
+ * already resolved instead of looking it up a second time.  That removes work
+ * that was plainly redundant and cannot be wrong — but honesty about the
+ * measurement: at this scale the benchmark is noise-dominated (16-25 us across
+ * runs) and does NOT demonstrate a speedup.  It is the right shape, not a
+ * proven win, and saying so is cheaper than someone later trusting the claim.
+ */
 static int ep_scan(void* c) {
     struct ep_scan_ctx* s = (struct ep_scan_ctx*)c;
     int n = 0;
@@ -144,7 +172,8 @@ static int ep_scan(void* c) {
 
         /* The shared definition (fd.h).  POLL* and EPOLL* deliberately have
          * the same values, so this is a mask, not a translation. */
-        uint32_t rev = fd_readiness(e->fd) & (e->events | EP_ALWAYS);
+        uint32_t rev = fd_readiness_of(e->fd, fd_lookup(e->fd))
+                     & (e->events | EP_ALWAYS);
         if (!rev) continue;
 
         s->out[n].events = rev;

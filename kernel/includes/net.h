@@ -115,8 +115,11 @@ void net_rx_irq(struct net_device* dev);
  * bytes are waiting, and whether the peer has sent its FIN.  Sampled together
  * because a caller reading them separately could see "no data" and "no FIN"
  * from two different instants and conclude the connection was merely quiet
- * (§M56/§M57).  Either pointer may be NULL. */
-void net_tcp_state(int* readable, int* peer_fin);
+ * (§M56).  `reset` distinguishes an RST from a FIN — an orderly EOF from a
+ * broken connection, which is the difference between POLLHUP and POLLERR and
+ * the difference between "the server answered nothing" and "the server refused
+ * you".  Any pointer may be NULL. */
+void net_tcp_state(int* readable, int* peer_fin, int* reset);
 
 /* ----------------------- Waiting for the network (§M55) ------------------- */
 

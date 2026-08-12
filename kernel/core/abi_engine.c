@@ -273,8 +273,36 @@ static long h_mmap(struct abi_ctx* c) {
  * symptom.  These two functions are the entire fix, and they exist as named
  * functions rather than inline shifts so the next signal-shaped operation has
  * something obvious to call. */
-static uint32_t abi_sigset_to_kernel(uint32_t guest) { return guest << 1; }
-static uint32_t abi_sigset_to_guest (uint32_t kern)  { return kern  >> 1; }
+static uint32_t abi_sigset_to_kernel(uint64_t guest) { return (uint32_t)(guest << 1); }
+static uint64_t abi_sigset_to_guest (uint32_t kern)  { return (uint64_t)kern >> 1; }
+
+/* How much of a guest `sigset_t` is worth touching.
+ *
+ * The declared type is 128 bytes, but Linux only defines 64 signals, so the
+ * kernel ABI passes `sigsetsize` and every libc passes 8.  This kernel has 32
+ * signals and no real-time signals at all, so bits 32..63 can never be pending
+ * here — reporting them as ZERO is the truth, not a loss of information, which
+ * is why the full 8 bytes are written rather than only the first 4.  Anything
+ * the guest keeps beyond `sigsetsize` is its own business and is left alone. */
+#define ABI_SIGSET_BYTES 8
+
+static int abi_sigset_read(struct abi_ctx* c, unsigned long p, uint64_t* out) {
+    (void)c;
+    if (!vmm_user_access_ok((uintptr_t)p, ABI_SIGSET_BYTES, 0)) return 0;
+    const uint8_t* b = (const uint8_t*)(uintptr_t)p;
+    uint64_t v = 0;
+    for (int i = 0; i < ABI_SIGSET_BYTES; i++) v |= (uint64_t)b[i] << (8 * i);
+    *out = v;
+    return 1;
+}
+
+static int abi_sigset_write(struct abi_ctx* c, unsigned long p, uint64_t v) {
+    if (!abi_user_w_ok(p, ABI_SIGSET_BYTES)) return 0;
+    (void)c;
+    uint8_t* b = (uint8_t*)(uintptr_t)p;
+    for (int i = 0; i < ABI_SIGSET_BYTES; i++) b[i] = (uint8_t)(v >> (8 * i));
+    return 1;
+}
 
 static long h_sigprocmask(struct abi_ctx* c) {
     struct task* t = task_current();
@@ -283,14 +311,13 @@ static long h_sigprocmask(struct abi_ctx* c) {
     unsigned long setp = c->a[1], oldp = c->a[2];
 
     uint32_t old = t->sig_blocked;
-    if (oldp) {
-        if (!abi_user_w_ok(oldp, 4)) return -ABI_EFAULT;
-        *(uint32_t*)(uintptr_t)oldp = abi_sigset_to_guest(old);
-    }
+    if (oldp && !abi_sigset_write(c, oldp, abi_sigset_to_guest(old)))
+        return -ABI_EFAULT;
     if (!setp) return 0;                        /* query only */
-    if (!vmm_user_access_ok((uintptr_t)setp, 4, 0)) return -ABI_EFAULT;
 
-    uint32_t nw = abi_sigset_to_kernel(*(const uint32_t*)(uintptr_t)setp);
+    uint64_t gw = 0;
+    if (!abi_sigset_read(c, setp, &gw)) return -ABI_EFAULT;
+    uint32_t nw = abi_sigset_to_kernel(gw);
     uint32_t nb;
     switch (how) {
     case ABI_SIG_BLOCK:   nb = old |  nw; break;
@@ -407,10 +434,10 @@ static long h_epoll_wait(struct abi_ctx* c) {
     uint32_t saved_mask = 0;
     int mask_swapped = 0;
     if (maskp && t) {
-        if (!vmm_user_access_ok((uintptr_t)maskp, 4, 0)) return -ABI_EFAULT;
+        uint64_t gw = 0;
+        if (!abi_sigset_read(c, maskp, &gw)) return -ABI_EFAULT;
         saved_mask = t->sig_blocked;
-        t->sig_blocked = abi_sigset_to_kernel(*(const uint32_t*)(uintptr_t)maskp)
-                       & ~(1u << 9);            /* SIGKILL stays unblockable */
+        t->sig_blocked = abi_sigset_to_kernel(gw) & ~(1u << 9);  /* SIGKILL */
         mask_swapped = 1;
     }
 
@@ -442,12 +469,11 @@ static long h_sigpending(struct abi_ctx* c) {
     struct task* t = task_current();
     unsigned long p = c->a[0];
     if (!p) return -ABI_EFAULT;
-    if (!abi_user_w_ok(p, 4)) return -ABI_EFAULT;
     /* Only the signals that are BOTH pending and blocked: an unblocked
      * pending signal is one the task simply has not returned to ring 3 to
      * collect yet, and reporting it would be a race, not information. */
-    *(uint32_t*)(uintptr_t)p =
-        t ? abi_sigset_to_guest(t->sig_pending & t->sig_blocked) : 0;
+    uint64_t v = t ? abi_sigset_to_guest(t->sig_pending & t->sig_blocked) : 0;
+    if (!abi_sigset_write(c, p, v)) return -ABI_EFAULT;
     return 0;
 }
 

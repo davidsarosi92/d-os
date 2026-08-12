@@ -53,6 +53,12 @@ struct ofile* ofile_from_netsock(struct netsock* s);
 struct ofile* ofile_from_timerfd(struct timerfd* t);
 struct ofile* ofile_from_epoll(struct epoll* e);
 
+/* Resolve a descriptor of the CURRENT task to its open file description, or
+ * NULL if it is not open.  A live table read, not a cached pointer — which is
+ * what makes it safe to compare the result against a remembered pointer
+ * (§M56.2's readiness memo) rather than dereferencing the remembered one. */
+struct ofile* fd_lookup(int fd);
+
 /* Refcount management.  ofile_unref drops the last reference → closes the
  * wrapped resource + frees the ofile. */
 struct ofile* ofile_ref  (struct ofile* o);
@@ -100,6 +106,16 @@ int  usock_peer_open (struct usock* s);  /* other end still there? (§M57)  */
  * readiness wait-queue); declared here so the socket layer can raise it. */
 void fd_readiness_signal(void);
 
+/* §M56.2 — the same wake, but naming the description that changed.
+ *
+ * Today this is the global wake with the object recorded for diagnostics: the
+ * readiness cache it was built to serve was removed (see epoll.c on why a
+ * cache whose invalidation must be remembered at every mutation site is a bug
+ * generator).  It is kept because naming the description that changed is
+ * strictly more information than not naming it, and because passing NULL
+ * degrades to exactly the old behaviour. */
+void fd_readiness_changed(struct ofile* o);
+
 /* THE definition of "is this descriptor ready" (§M56).
  *
  * poll(2) and epoll_wait(2) must agree exactly about this, so they share one
@@ -114,6 +130,11 @@ void fd_readiness_signal(void);
  * conditions a loop must be able to SEE, and POSIX reports them whether or not
  * they were requested. */
 uint32_t fd_readiness(int fd);
+
+/* The same answer for a caller that has ALREADY resolved the descriptor.
+ * epoll's scan holds the ofile anyway, and paying for the lookup twice per
+ * registered descriptor was, measurably, most of what a scan cost. */
+uint32_t fd_readiness_of(int fd, struct ofile* o);
 
 /* Readiness of an AF_INET socket (usyscall.c owns struct netsock), as a
  * POLL* mask. */

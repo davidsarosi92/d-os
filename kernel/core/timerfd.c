@@ -28,7 +28,12 @@ struct timerfd {
     volatile uint64_t expirations;      /* since the last read                 */
     struct waitq    wq;                 /* readers park here                   */
     spinlock_t      lock;               /* guards next_ns/interval_ns          */
+    /* §M56.2 — the description this timer lives behind, so an expiry can name
+     * itself.  Owned by that ofile, so the pointer cannot outlive it. */
+    struct ofile*   owner;
 };
+
+void timerfd_set_owner(struct timerfd* tf, struct ofile* o) { if (tf) tf->owner = o; }
 
 /* ---------------------------------------------------------------------------
  * Expiry — interrupt context.
@@ -71,7 +76,7 @@ static void tfd_fired(struct ktimer* t) {
     uint32_t wf = waitq_lock(&tf->wq);
     waitq_wake_all(&tf->wq);
     waitq_unlock(&tf->wq, wf);
-    fd_readiness_signal();
+    fd_readiness_changed(tf->owner);
 }
 
 /* ---------------------------------------------------------------------------

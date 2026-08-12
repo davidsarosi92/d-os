@@ -34,6 +34,11 @@ static struct ofile* ofile_alloc(enum fd_kind k) {
     return o;
 }
 
+void fd_readiness_changed(struct ofile* o) {
+    (void)o;                    /* see fd.h — the wake is global today */
+    fd_readiness_signal();
+}
+
 struct ofile* ofile_from_file(struct file* f) {
     if (!f) return NULL;
     struct ofile* o = ofile_alloc(FD_VFS);
@@ -48,7 +53,10 @@ struct ofile* ofile_from_shm(struct shm* s) {
 }
 struct ofile* ofile_from_sock(struct usock* s) {
     struct ofile* o = ofile_alloc(FD_SOCK);
-    if (o) o->sock = s;
+    /* §M56.2 — the object learns its description here, at the one point where
+     * the two are joined.  Doing it anywhere else would mean a window in which
+     * a readiness change cannot name itself. */
+    if (o) { o->sock = s; usock_set_owner(s, o); }
     return o;
 }
 struct ofile* ofile_from_netsock(struct netsock* s) {
@@ -59,7 +67,7 @@ struct ofile* ofile_from_netsock(struct netsock* s) {
 
 struct ofile* ofile_from_timerfd(struct timerfd* t) {
     struct ofile* o = ofile_alloc(FD_TIMER);
-    if (o) o->tfd = t;
+    if (o) { o->tfd = t; timerfd_set_owner(t, o); }
     return o;
 }
 

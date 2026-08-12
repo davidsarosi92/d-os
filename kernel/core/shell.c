@@ -577,6 +577,38 @@ static void cmd_epolltest(void) {
         kprintf("epoll: EPOLLET refused with %d (correct)\n", rc);
     }
 
+    /* --- 4b. the readiness memo must never hide a transition ------------ */
+    /*
+     * §M56.2 caches each item's readiness against the description's generation
+     * counter, so a scan re-evaluates only the descriptors that moved.  The
+     * failure mode of a missing generation bump is not slowness — it is an
+     * event that never arrives, and it would show up long after the change
+     * that caused it.  So: drive a pipe through many ready/not-ready
+     * transitions and insist that every single one is seen.
+     */
+    if (sys_pipe(pfds) == 0) {
+        sys_epoll_ctl_k(ep, EPOLL_CTL_ADD, pfds[0], POLLIN, 0x4444ull);
+        int seen_ready = 0, seen_idle = 0;
+        for (int round = 0; round < 20; round++) {
+            char c = 'a';
+            sys_write_k(pfds[1], &c, 1);
+            n = sys_epoll_wait_k(ep, evbuf, 8, 1000);
+            if (n == 1 && (evbuf[0] & POLLIN) && evbuf[1] == 0x4444ull) seen_ready++;
+
+            sys_read_k(pfds[0], &c, 1);          /* drain → not readable again */
+            n = sys_epoll_wait_k(ep, evbuf, 8, 0);
+            if (n == 0) seen_idle++;
+        }
+        kprintf("epoll: memo check — %d/20 ready, %d/20 idle transitions seen\n",
+                seen_ready, seen_idle);
+        if (seen_ready != 20 || seen_idle != 20) {
+            console_write("epoll: FAIL (the readiness cache hid a transition)\n");
+            ok = 0;
+        }
+        sys_epoll_ctl_k(ep, EPOLL_CTL_DEL, pfds[0], 0, 0);
+        sys_close(pfds[0]); sys_close(pfds[1]);
+    }
+
     /* --- 5. what does the SCAN actually cost? --------------------------- */
     /*
      * epoll's reputation is O(ready); ours scans the registered set.  Rather
@@ -595,6 +627,10 @@ static void cmd_epolltest(void) {
             fds[nf++] = t;
             sys_epoll_ctl_k(bench, EPOLL_CTL_ADD, t, POLLIN, (uint64_t)i);
         }
+        /* One warm-up wait so the memo is populated, then measure the steady
+         * state: this is what a real loop pays on every iteration where most
+         * of its descriptors have not moved. */
+        sys_epoll_wait_k(bench, evbuf, 8, 0);
         uint64_t b0 = timer_now_ns();
         for (int i = 0; i < 100; i++) sys_epoll_wait_k(bench, evbuf, 8, 0);
         uint64_t per_ns = (timer_now_ns() - b0) / 100ull;
