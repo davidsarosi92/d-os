@@ -20,6 +20,31 @@ focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **NETSURF RESIZES ITS CONTENTS NOW (2026-08-16, DOCS §4.60).**  Reported from
+use: *the window grows, the page inside stays small.*  Only client-managed
+(dosgui) windows were affected, and the reason is structural: a resize allocates
+a bigger content surface and then needs SOMEBODY to refill it — a terminal
+re-renders its grid, an app window's host consumes `layout_pending` — but a
+dosgui window has `host_task` cleared by design (§M54), so nothing consumed it
+and **the bridge had no event that could carry a size at all**.  Fixed with
+`dosgui_event` type 4 = RESIZE, reported the way `close` already is: by
+comparing window state in `dosgui_poll` rather than queueing, because a resize
+is a LEVEL not an edge — a drag produces fifty of them and only the last is
+true.  `libnsfb_dos.c` turns it into `NSFB_EVENT_RESIZE`, after which
+**everything already existed upstream** (fbtk → `gui_resize()` → realloc +
+re-layout): the vendored tree needed no patch, because a framebuffer frontend
+normally runs on a screen and nobody had ever sent it the event.  **AND
+`dos_set_geometry` HAD TO START REALLOCATING** — it changed the dimensions and
+left the buffer alone, harmless only while nothing could change them; the first
+real resize would have plotted past the end of the heap block.  *A latent bug is
+a bug whose trigger has not shipped yet.*  **Verified by driving the mouse**
+(`--monitor-cmd` in the test harness: home the pointer, walk to the grip in ≤90
+px steps because the PS/2 delta is a signed byte, press, drag, release,
+screendump) — and the first attempt missed the grip by 23 px and proved nothing,
+so the window's rectangle is now MEASURED out of the before-shot instead of
+derived from constants.  Result: 795×579 → 1089×793 with the page text
+REFLOWING, which a scaled image would not do.
+
 ✅ **§M24 COMPLETE — A NETWORK THAT CAN HOLD MORE THAN ONE CONVERSATION
 (2026-08-15, DOCS §4.59, all 3 arches).**  §M24's first stages shipped a NIC and
 a TCP/IP stack in July; §M55 made waiting free; §M56 built poll and epoll —

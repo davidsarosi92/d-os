@@ -98,6 +98,7 @@ when sections are added.)
 | 4.57 | A wait that is really a wait (M56 — poll timeouts + epoll) | 6258 |
 | 4.58 | A task is not dead while it is still running (M57 — the §M54 residual) | 6517 |
 | 4.59 | A network that can hold more than one conversation (M24, second half) | 6706 |
+| 4.60 | A window that resizes its contents too (§M42 follow-up) | 6960 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -6932,6 +6933,52 @@ not the path the kernel uses.***
   row of guest-width words rather than a fixed 16-byte address.
 - IPv6, multicast, a firewall, and zero-copy RX remain out of scope, as
   §M24 said from the start.
+
+---
+
+### 4.60 A window that resizes its contents too (§M42 follow-up)
+
+Reported from use: *"I enlarge the NetSurf window, the window grows nicely, but
+its content does not — it stays small."*  Every other window kind was fine.
+
+**Why only that one.**  A resize allocates a new, larger content surface and
+then has to tell somebody to fill it.  A terminal window re-renders its cell
+grid; an app window's host task gets `layout_pending` and re-lays-out its
+widgets.  A **client-managed** window — the dosgui bridge NetSurf renders
+through — has neither: `host_task` is cleared by design (§M54: the compositor
+must never reap a client init owns), so nothing consumed `layout_pending`, and
+the bridge had no event that could carry a size.  The compositor grew the
+window, the client kept presenting its original 800×600 image, and it landed in
+the corner of a bigger surface.
+
+**The fix is one event and one `realloc`.**
+
+- `dosgui_event` gains **type 4 = RESIZE**, carrying the new content size.  It
+  is reported the way the close event already is — by comparing window state
+  inside `dosgui_poll`, not by queueing — because a resize is a LEVEL, not an
+  edge: what a client needs is the size the window is NOW, and a drag that
+  produced fifty events would hand it forty-nine stale ones.
+- `user/netsurf/libnsfb_dos.c` turns it into `NSFB_EVENT_RESIZE`.  Everything
+  downstream already existed upstream: fbtk's event loop calls `gui_resize()`,
+  which reallocates through `nsfb_set_geometry` and re-lays-out the toolbar and
+  browser widgets.  The vendored tree needed no patch — a framebuffer frontend
+  normally runs on a screen, which does not change size, so nothing had ever
+  sent it the event.
+- **And `dos_set_geometry` had to start reallocating**, like the ram surface it
+  was modelled on.  It changed the dimensions and left the buffer alone, which
+  was harmless only because nothing could change them; the first real resize
+  would have had NetSurf plot past the end of its heap block.  *A latent bug is
+  a bug whose trigger has not shipped yet.*
+
+**Verified by driving the mouse**, not by reasoning about it: `scripts/dos-shell-
+test.py` grew a `--monitor-cmd` option, and the test homes the pointer, walks it
+to the grip in ≤90-pixel steps (the PS/2 delta is a signed byte — §M48), presses,
+drags and releases, then screendumps.  The first attempt missed the grip by 23
+pixels and proved nothing; measuring the window's real rectangle out of the
+"before" screenshot rather than deriving it from constants is what made the
+test actually press the thing it was aiming at.  After: the window spans
+1089×793 instead of 795×579, and the page text REFLOWS to the new width — a
+scaled-up image would not.
 
 ---
 

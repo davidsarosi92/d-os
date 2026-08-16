@@ -27,6 +27,11 @@ struct dosgui_win {
     int                used;
     int                owner_pid;   /* the ring-3 client that created it (§audit#4) */
     struct gui_window* win;
+    /* The content size this client has been TOLD about.  A window's size is
+     * changed by the user through the WM — the client is not consulted and
+     * cannot poll for it — so the bridge remembers what it last reported and
+     * raises a RESIZE when the two differ. */
+    int                rep_w, rep_h;
     /* Input ring (single-producer compositor, single-consumer client). */
     struct dosgui_event evq[DOSGUI_EVQ];
     volatile int       head, tail;
@@ -108,6 +113,8 @@ int dosgui_create(int w, int h, const char* title) {
     if (!d->win) return -1;
 
     d->head = d->tail = 0;
+    d->rep_w = w; d->rep_h = h;          /* the size it asked for is the size
+                                          * it already knows about            */
     spin_lock_init(&d->lock);
     gui_window_set_input_hook(d->win, dosgui_input_cb, d);
     /* §M54 — arm the disposal notification BEFORE the window can be disposed,
@@ -173,6 +180,33 @@ int dosgui_poll(int handle, struct dosgui_event* out) {
         out->ch = 0;
         return 1;
     }
+    /* §M42 — the window has been RESIZED.
+     *
+     * Reported the same way the close is: by comparing window state on poll,
+     * not by an enqueued event.  A resize is a LEVEL, not an edge — what the
+     * client needs is the size the window is NOW, and a queue could hand it a
+     * stale one after a drag produced fifty of them.  Comparing on poll means
+     * the client always learns the current size and exactly once per change.
+     *
+     * Without this a client-managed window had no way to find out at all: it
+     * has no app-host to re-lay it out (host_task is cleared by design), so the
+     * WM grew the window, the compositor allocated a bigger content surface,
+     * and the client went on presenting its original small image into the
+     * corner of it.  That is exactly what a user sees as "the window resizes
+     * but its contents do not". */
+    if (d->win) {
+        int cw = 0, ch = 0;
+        if (gui_window_content_size(d->win, &cw, &ch) == 0 &&
+            cw > 0 && ch > 0 && (cw != d->rep_w || ch != d->rep_h)) {
+            spin_lock(&d->lock);
+            d->rep_w = cw; d->rep_h = ch;
+            spin_unlock(&d->lock);
+            out->type = 4; out->keycode = 0; out->pressed = 0;
+            out->x = (int32_t)cw; out->y = (int32_t)ch; out->ch = 0;
+            return 1;
+        }
+    }
+
     int got = 0;
     spin_lock(&d->lock);
     if (d->head != d->tail) {

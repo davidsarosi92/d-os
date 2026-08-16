@@ -19,10 +19,12 @@
 /* Input event handed back to the client by dosgui_poll (mirrors gui_input). */
 struct dosgui_event {
     int32_t type;      /* enum gui_input_type: 0 = key, 1 = motion,          */
-                       /* 2 = button; 3 = close (dosgui-only, no gui_input)   */
+                       /* 2 = button; 3 = close, 4 = RESIZE (dosgui-only —    */
+                       /* neither has a gui_input, both are window state)     */
     int32_t keycode;   /* key: raw scancode.  button: 1 = left, 2 = right     */
     int32_t pressed;   /* key/button: 1 = down, 0 = up                        */
-    int32_t x, y;      /* motion/button: content-relative position            */
+    int32_t x, y;      /* motion/button: content-relative position;           */
+                       /* RESIZE: the new content size in pixels              */
     int32_t ch;        /* key: the character the keymap produced, 0 if none    */
 };
 

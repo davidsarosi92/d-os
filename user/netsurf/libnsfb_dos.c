@@ -70,10 +70,37 @@ static int dos_initialise(nsfb_t *nsfb)
 static int
 dos_set_geometry(nsfb_t *nsfb, int width, int height, enum nsfb_format_e format)
 {
+    int prev_w = nsfb->width, prev_h = nsfb->height;
+    enum nsfb_format_e prev_fmt = nsfb->format;
+    int startsize = (nsfb->width * nsfb->height * nsfb->bpp) / 8;
+
     if (width > 0)  nsfb->width = width;
     if (height > 0) nsfb->height = height;
     if (format != NSFB_FMT_ANY) nsfb->format = format;
     select_plotters(nsfb);
+
+    /* REALLOCATE, exactly as the ram surface does.  This function used to
+     * change the dimensions and leave the buffer alone, which was invisible
+     * only because nothing ever changed them: the window could not be resized.
+     * The moment it could, growing the geometry without growing the allocation
+     * would have NetSurf plot past the end of the heap block — a corruption
+     * whose symptom appears somewhere else entirely, later. */
+    int endsize = (nsfb->width * nsfb->height * nsfb->bpp) / 8;
+    if (nsfb->ptr != NULL && startsize != endsize) {
+        uint8_t *p = realloc(nsfb->ptr, (size_t)endsize);
+        if (p == NULL) {
+            /* Put everything back: a surface whose dimensions promise memory
+             * it does not have is worse than one that refused to change. */
+            nsfb->width = prev_w;
+            nsfb->height = prev_h;
+            nsfb->format = prev_fmt;
+            select_plotters(nsfb);
+            nsfb->linelen = (nsfb->width * nsfb->bpp) / 8;
+            return -1;
+        }
+        nsfb->ptr = p;
+    }
+
     nsfb->linelen = (nsfb->width * nsfb->bpp) / 8;
     return 0;
 }
@@ -135,7 +162,17 @@ static bool dos_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
         }
         return false;
     }
-    if (de.type == 3) {                 /* window closed (title-bar X) */
+    if (de.type == 4) {                 /* the WM resized our window */
+        /* Everything downstream of this already exists upstream: fbtk's event
+         * handler turns NSFB_EVENT_RESIZE into gui_resize(), which reallocates
+         * the framebuffer through nsfb_set_geometry and re-lays-out the
+         * toolbar and browser widgets.  All that was missing was somebody to
+         * say the window had changed size — a framebuffer frontend normally
+         * runs on a screen, which does not. */
+        event->type = NSFB_EVENT_RESIZE;
+        event->value.resize.w = de.x;
+        event->value.resize.h = de.y;
+    } else if (de.type == 3) {          /* window closed (title-bar X) */
         event->type = NSFB_EVENT_CONTROL;
         event->value.controlcode = NSFB_CONTROL_QUIT;
     } else if (de.type == 0) {          /* key */

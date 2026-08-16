@@ -192,6 +192,11 @@ def main():
     ap.add_argument("--mem", default="512M")
     ap.add_argument("--disk", default="")
     ap.add_argument("--log", default="")
+    ap.add_argument("--monitor-cmd", action="append", default=[],
+                    help="a raw QEMU monitor command to run after the shell "
+                         "commands (repeatable) — mouse_move/mouse_button for "
+                         "driving the GUI, screendump for looking at it.  "
+                         "Prefix with 'sleep <s>' to pause.")
     ap.add_argument("--screenshot", default="",
                     help="after the commands, dump the framebuffer to this "
                          "PPM path (the QEMU monitor's screendump) — the only "
@@ -248,6 +253,13 @@ def main():
                     mon.type_line(c, a.key_delay)
                 time.sleep(a.between)
             time.sleep(a.settle)
+            for mc in a.monitor_cmd:
+                if mc.startswith("sleep "):
+                    time.sleep(float(mc.split()[1]))
+                    continue
+                print("+ monitor: %s" % mc, file=sys.stderr)
+                mon.cmd(mc)
+                time.sleep(0.12)
             if a.screenshot:
                 mon.cmd("screendump " + os.path.abspath(a.screenshot))
                 time.sleep(2)
