@@ -52,7 +52,7 @@
 #define SYS_CONNECT 23      /* (fd, ip, port) → 0    (TCP — next slice)        */
 #define SYS_SENDTO 24       /* (fd, buf, n, ip, port) → bytes / -1  (UDP)      */
 #define SYS_RECVFROM 25     /* (fd, buf, n, u32* ip, int* port) → bytes / -1   */
-#define SYS_BIND   26       /* (fd, port) → 0 / -1                             */
+#define SYS_BIND   26       /* (fd, ip, port) → 0 / -1                         */
 #define SYS_CLONE  27       /* (entry, stack) → tid  (M35 thread)              */
 #define SYS_FUTEX  28       /* (uaddr, op, val) → 0 / -1  (M35)                */
 #define SYS_SET_TLS 29      /* (base) → %gs selector  (M35 thread-local storage) */
@@ -81,6 +81,13 @@
 #define SYS_EPOLL_CREATE 41     /* () → fd                                     */
 #define SYS_EPOLL_CTL    42     /* (epfd, op, fd, u64 ev[2]) → 0 / -errno      */
 #define SYS_EPOLL_WAIT   43     /* (epfd, u64 out[], maxev, timeout_ms) → n    */
+/* §M24.10 — the SERVER half of the socket API.  A stack that can only make
+ * outgoing connections cannot host anything, and accept() is the call every
+ * network program on earth is written around. */
+#define SYS_LISTEN       44     /* (fd, backlog) → 0 / -1                      */
+#define SYS_ACCEPT       45     /* (fd, u32* ip, int* port) → new fd / -1      */
+#define SYS_GETSOCKNAME  46     /* (fd, u32* ip, int* port) → 0 / -1           */
+#define SYS_GETPEERNAME  47     /* (fd, u32* ip, int* port) → 0 / -1           */
 
 /* M36 shared structs (kernel + libc agree on the layout). */
 struct kstat {
@@ -185,7 +192,17 @@ int  sys_epoll_wait_k(int epfd, uint64_t* out, int maxevents, int timeout_ms);
 int  sys_epoll_wait_u(int epfd, uintptr_t uout, int maxevents, int timeout_ms);
 long sys_sigaction(int sig, long handler, long restorer);  /* → old handler    */
 int  sys_socket(int domain, int type, int proto);          /* M24 socket API   */
-int  sys_bind(int fd, int port);
+int  sys_bind(int fd, uint32_t ip, int port);
+int  sys_listen(int fd, int backlog);
+/* accept/getsockname/getpeername take KERNEL out-pointers; a personality layer
+ * marshals the guest's sockaddr itself (the *_k / *_u discipline). */
+int  sys_accept(int fd, uint32_t* ip_out, int* port_out);
+int  sys_getsockname(int fd, uint32_t* ip_out, int* port_out);
+int  sys_getpeername(int fd, uint32_t* ip_out, int* port_out);
+int  sys_shutdown(int fd, int how);           /* 0=SHUT_RD 1=SHUT_WR 2=both  */
+int  sys_accept_k(int fd, uint32_t* ip_out, int* port_out);
+int  sys_getsockname_k(int fd, uint32_t* ip_out, int* port_out);
+int  sys_getpeername_k(int fd, uint32_t* ip_out, int* port_out);
 /* O_NONBLOCK on a socket.  The value a non-blocking recv returns when there is
  * nothing to read: Linux's EAGAIN, so a personality layer can pass it straight
  * through to its client.  (The native d-os libc only ever tests for < 0.) */

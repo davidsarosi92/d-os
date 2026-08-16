@@ -97,6 +97,7 @@ when sections are added.)
 | 4.56 | Waiting for the network without spending a CPU on it (M55) | 6066 |
 | 4.57 | A wait that is really a wait (M56 — poll timeouts + epoll) | 6258 |
 | 4.58 | A task is not dead while it is still running (M57 — the §M54 residual) | 6517 |
+| 4.59 | A network that can hold more than one conversation (M24, second half) | 6706 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -6704,6 +6705,236 @@ because it is trusted.*
 
 ---
 
+### 4.59 A network that can hold more than one conversation (M24, second half)
+
+**Shipped 2026-08-15, all three architectures.**  §M24 stages 1–3 gave this
+kernel a NIC, ARP/IPv4/ICMP/UDP/TCP and a socket API in 2026-07; §M55 made
+waiting for the network free; §M56 gave it poll and epoll.  What none of them
+changed is that the transport underneath held **exactly one TCP connection, in
+one file-scope struct**, could not accept an incoming one at all, and forgot
+every byte the moment it left.  This is the rest of §M24.
+
+#### What was actually wrong
+
+- **One connection.**  `g_tcp` was a single `static struct`.  A second
+  `connect()` silently destroyed the first.  §M56 had just built the machinery
+  for watching many descriptors at once, over a transport that could hold one
+  conversation.
+- **No server role.**  There was no LISTEN, no accept queue, and therefore no
+  way to test the half of the socket API every network program is written
+  around — not merely untested, untestable.
+- **A receive buffer that only grew.**  16 KiB of response and the connection
+  stalled for good: nothing was ever reclaimed, and the advertised window was a
+  constant that had stopped being true.
+- **No send buffer.**  `net_tcp_send` put the caller's bytes on the wire and
+  forgot them, so one dropped segment ended the conversation.
+- **One device, hard-coded.**  Address, mask, gateway and nameserver were
+  compile-time constants matching QEMU's SLIRP.
+- **Two copies of the socket ABI** (one per x86 arch), and aarch64 built the
+  whole portable stack with **no NIC driver at all** — every network feature
+  this project shipped was untested on a third of its targets.
+
+#### What is there now
+
+**A loopback device (`kernel/drivers/net/loopback.c`).**  A real device, not a
+shortcut: a frame goes through the full IPv4/TCP output path, sits in a queue,
+and comes back through `net_rx` exactly as a NIC's would.  The queue is what
+breaks the recursion — `transmit` runs with the stack lock held, and calling
+`net_rx` directly would re-enter the whole stack on one C stack with a lock on
+every frame.  It makes both endpoints ours: deterministic, no host network, and
+available on an arch with no NIC.  `lo drop <permille>` makes it lose frames on
+purpose, which is what turns retransmission from an untestable feature into a
+tested one.
+
+**Routing.**  `net_route(dst)` picks the device: 127.0.0.0/8 to the loopback,
+otherwise a matching subnet, otherwise the default route.  `net_primary()` was
+redefined as *the first non-loopback device* — with the old "first registered"
+reading, adding `lo` would have silently handed every existing caller (ping,
+DNS, wget, NetSurf's fetcher) a device that reaches nothing, on registration
+order alone.
+
+**A TCP connection table** (`TCP_MAX_CONNS = 32`, static): four-tuple
+demultiplexing with a LISTEN entry as the fallback match — and the ORDER is
+load-bearing, since a listener and its accepted connections share a local port.
+Per connection: a receive RING (so the free space it implies *is* the window we
+advertise), a linear send buffer with segmentation, real sequence arithmetic on
+signed differences, and the RFC 793 state set through TIME_WAIT.  The table is
+static because connections are created on the RX path, under the stack lock
+with interrupts off, where an allocator call would nest the heap's lock inside
+the network's on the one path that must not fail.
+
+*Over the loopback every connection occupies TWO entries*, because both
+endpoints live in this table — which is why the first `tcptest 8` came back 7/8
+with one RST sent, and the stack was telling the truth about a limit.
+
+**A server role.**  `listen`/`accept` with a bounded backlog, `SYN_RCVD`
+children owned by their listener until accepted, and an RST for a segment that
+belongs to no connection — that last one is why connecting to a closed port now
+fails immediately instead of at the timeout, and is what gives poll/epoll the
+POLLERR §M56.2 built.  A listening socket reports POLLIN when a connection is
+waiting, which is the convention every event loop is written against.
+
+**Reliability.**  One sweeper timer for the whole table (a per-connection
+`ktimer` would be §M53's warning: an embedded timer must be cancelled at
+exactly the right point in teardown), 200 ms RTO with exponential backoff,
+Go-Back-N retransmission, zero-window probing, and a close that keeps working:
+a connection whose owner has closed becomes an ORPHAN that keeps sending until
+its queue drains and its FIN is acknowledged, up to a 10 s cap.
+
+**The socket ABI became six canonical operations plus a table per guest**
+(§M50): `ABI_SOCKET/BIND/CONNECT/LISTEN/ACCEPT/ACCEPT4/GETSOCKNAME/
+GETPEERNAME/SEND/SENDTO/RECV/RECVFROM/SHUTDOWN/SET-GETSOCKOPT`, with ONE
+`sockaddr_in` marshaller for all three architectures.  i386's `socketcall(102)`
+became a pure demultiplexer into those same ops; the per-arch cases were
+deleted rather than left as a shadow (§M56.1's rule).  `shutdown` stopped being
+`return 0` and became a real half-close.
+
+**DHCP** (`kernel/core/dhcp.c`): DISCOVER/OFFER/REQUEST/ACK, address, mask,
+router and nameserver applied to the device, lease recorded, and T1 renewal
+armed on a `ktimer` that hands the actual conversation to a §M49 worker —
+because a DHCP exchange sends and then waits, and neither is legal in a timer
+callback.  Off by default (`net.dhcp`), because SLIRP hands out exactly the
+address the driver already hard-codes and every boot would pay for arriving at
+the same four numbers.
+
+**`/proc/net/{dev,arp,route,tcp,stat}`**, for which procfs learned one-level
+subdirectories.  **AArch64 got a NIC**: `virtio_mmio_net.c`, the sibling of the
+port's block driver, ~250 lines of transport after which ARM runs the same
+stack the x86 arches do.
+
+
+#### The wallpaper label learned to say two things
+
+Milestones do not always finish in numerical order, and this one did not: §M24
+was completed after §M57 shipped.  Neither obvious label was honest — `M57`
+hides a milestone's worth of work, `M24` reads as a regression to anyone who
+saw the wallpaper yesterday — so the label carries both and the relationship
+between them: **`d-os M57 (updated M24)  x32`**.  `DOS_MILESTONE_NOTE` (empty
+when there is nothing to say) is cleared when the next numbered milestone
+ships, at which point the number is the newer news.
+
+Verified the only way a drawn thing can be: a `screendump` of the running
+desktop.  The first one still read `d-os M57  x32` — this project has no header
+dependencies, so `version.h` changed and `gui.o` did not.  *A screenshot is the
+test for anything that is drawn, and it caught a stale object file that every
+source file in the tree contradicted.*
+
+#### The bug this milestone found in the two before it
+
+`wget http://example.com/` reported **`cannot resolve`**, and so did NetSurf —
+while `nettest` said DNS was fine.  Both statements were true, and the gap
+between them is the bug:
+
+- **§M55** made the network poller (`netd`) run *only while somebody is waiting
+  for the network*, which is what makes an idle box cost nothing.
+- **§M56** made a finite `poll()` timeout a *real* wait instead of a snapshot,
+  which is what makes an event loop stop spinning.
+
+Neither knew about the other.  A task blocked in `poll()` on a socket **is**
+waiting for the network, but nothing said so — so the poller stayed parked, no
+frame was ever collected, and the wait ran to its deadline with the answer
+sitting unread in the NIC.  musl's resolver sends its query and then polls; it
+therefore never resolved anything again, and every ring-3 program that looks up
+a name — `wget`, NetSurf's fetcher — stopped working.
+
+**Nothing in the build could see it.**  `nettest` resolves through the KERNEL
+resolver, which waits with `net_wait_cond` and thus counts itself.  The
+regression lived entirely on the ring-3 path, between two changes that were
+each correct and each verified.
+
+The fix is two lines of contract: a readiness wait that touched a socket
+registers as a network waiter for its duration (`net_waiter_enter/leave`), and
+a pump that delivered frames wakes the readiness queue as well as its own —
+*after* dropping the stack lock, because a poll waiter holds the readiness
+queue while its scan takes the stack lock, and signalling from inside the stack
+lock would be the opposite order.  Verified end to end: `wget` over HTTP and
+HTTPS (TLS 1.3), and NetSurf reporting `HTTP 200, 571 body bytes` for
+example.com.
+
+*The general lesson: **two subsystems can each be right and compose into a bug,
+and the test that would catch it is the one that uses the path a program uses,
+not the path the kernel uses.***
+
+#### Measured
+
+| check | i386 | x86_64 | aarch64 |
+|---|---|---|---|
+| `tcptest 8` (server + 8 concurrent clients over `lo`) | PASS, 363 ms | PASS, 369 ms | PASS (4 clients), 404 ms |
+| `tcploss 100 32` (32 KiB through a 10 % loss link) | PASS, 891 ms | PASS, 857 ms | PASS, 1113 ms |
+| `nettest` (SLIRP: ICMP + DNS + HTTP) | PASS | PASS | ping + DHCP PASS |
+| `netmuslserv` (bind/listen/accept via unmodified musl) | PASS | PASS | PASS |
+| `dhcp` (against SLIRP) | 10.0.2.15/24, lease 86400 s | same | same |
+
+#### Lessons
+
+- **A test that cannot fail is not evidence — so build the way to make it
+  fail first.**  The loopback learned to drop frames *before* the retransmit
+  timer was written.  `tcptest` was checked against a deliberately shrunken
+  connection table (2 entries): 0/4 clients connected, FAIL.  Without that, a
+  passing run says nothing about a stack that can hold several connections.
+
+- **Three bugs surfaced in the order a slow transfer is usually
+  misdiagnosed**, and every one of them looked like "the network is slow":
+
+  1. A **zero-window deadlock** — an ACK that only WIDENS the window carries
+     the same acknowledgement number, so reacting to it only inside the
+     "new data acknowledged" branch left the sender stopped.
+  2. A **window probe that dug its own hole** — advancing `snd_nxt` for the
+     probe byte means that when the receiver (which by definition has no room)
+     drops it, everything after it is out of order, and only the RTO repairs
+     the gap.
+  3. **A FIN whose sequence number was inferred from `snd_nxt`** — a
+     retransmission rolls `snd_nxt` back, after which an ACK covering only the
+     data satisfied "have they acknowledged my FIN?".  The sender moved to
+     FIN_WAIT_2 believing the conversation was over while the peer sat in
+     ESTABLISHED; every byte arrived and the reader still blocked until its
+     timeout.
+
+  What found all three was **instrumentation, not inspection**: splitting the
+  test's wall clock into "time in recv", "time asleep" and "time in send" turned
+  8.5 s of mystery into "the 33rd read waited 8 s", and printing the connection
+  table AT THE MOMENT OF THE STALL named the third bug in one line — after two
+  wrong theories that a measurement had already ruled out.
+
+- **A counter that lives on an object cannot measure a period longer than the
+  object.**  The loss test summed per-connection retransmit counts and reported
+  zero while seven timeouts had fired — the connections had ended.  The
+  assertion uses a cumulative global now.
+
+- **Syscall numbers are data, and data must be copied, not recalled.**  The
+  i386 socket numbers are not sequential by name (360 is `socketpair`, between
+  `socket` and `bind`), and reciting them from memory put `ABI_CONNECT` on
+  bind's number.  The symptom was a `bind` that failed with ECONNREFUSED — the
+  one errno that names the handler which actually ran.
+
+- **A doubled struct field is a doubled struct layout.**  Adding `flags` to
+  `struct net_device` and rebuilding without `make clean` produced
+  `net: registered eth0 ... ip=255.255.255.0` — this project has no header
+  dependencies and CLAUDE.md says so; the log caught it in one line.
+
+- **The path the tests take and the path a person takes must be the same
+  path.**  The ARM run script had no NIC; both it and the new harness attach one
+  now (§M48's shape, one arch over).
+
+#### Still open
+
+- **No reassembly queue**: an out-of-order segment is dropped and duplicate-
+  ACKed rather than held.  Correct, and it costs throughput on a lossy link.
+- **No congestion control** (no cwnd, no slow start): the peer's advertised
+  window is the only limit.  Honest on a loopback and on SLIRP; wrong on a real
+  path with a bottleneck.
+- **RTO is fixed at 200 ms**, not RTT-estimated — on links whose round trip is
+  microseconds, an estimator would be measuring the emulator.
+- The aarch64 NIC is **polled**, not interrupt-driven; the stack degrades to
+  its timed fallback and `lsnic` says `rx-irq: none seen (polled)`.
+- `sendmsg`/`recvmsg` are still per-arch: they carry control messages and file
+  descriptors (SCM_RIGHTS — what Wayland runs on), whose `struct msghdr` is a
+  row of guest-width words rather than a fixed 16-byte address.
+- IPv6, multicast, a firewall, and zero-copy RX remain out of scope, as
+  §M24 said from the start.
+
+---
+
 ## 7. Roadmap / open milestones
 
 - [x] **M1 — GDT:** own Global Descriptor Table, stop relying on GRUB's.
@@ -6727,6 +6958,50 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-15 — §M24 SECOND HALF: a network that can hold more than one
+  conversation (DOCS §4.59, all three arches).**  §M24's first stages shipped a
+  NIC and a TCP/IP stack in July; what they left was a transport holding
+  **exactly one connection in one file-scope struct**, with no server role, a
+  receive buffer that only grew, and no memory of a byte once it was sent.
+  §M56 had just built poll and epoll on top of it — machinery for watching many
+  descriptors at once, over something that could hold one conversation.  Now:
+  a bounded **connection table** with four-tuple demultiplexing, per-connection
+  receive ring and send buffer, **listen/accept**, retransmission with
+  zero-window probing, and a close that keeps working until its data and FIN are
+  delivered.  A **loopback device** makes both endpoints ours — deterministic,
+  no host network, available on an arch with no NIC — and `lo drop <permille>`
+  makes it lose frames on purpose, which is what turned retransmission from an
+  untestable feature into a tested one.  The **socket ABI became canonical
+  operations plus one table per guest** (§M50), with a single `sockaddr_in`
+  marshaller: i386's `socketcall` is now a demultiplexer into the same handlers
+  amd64 and arm64 reach directly, the per-arch copies are deleted, and
+  `shutdown` stopped being `return 0`.  Plus **DHCP** (address, mask, router,
+  nameserver, T1 renewal through a §M49 worker), **/proc/net/**, and a
+  **virtio-mmio NIC for aarch64** — after which ARM runs the same stack the x86
+  arches do, closing an open item that had let every network feature ship
+  untested on a third of the targets.  **Measured:** 8 concurrent connections on
+  each arch; 32 KiB through a 10 % loss link intact, in order, on each arch;
+  bind/listen/accept/getpeername/shutdown through an **unmodified musl binary**
+  on each arch.  **Three real bugs, each of which looked like "the network is
+  slow":** an ACK that only widened the window did not restart the sender; a
+  zero-window probe that occupied a sequence number dug a hole only the RTO
+  could fill; and a FIN whose sequence number was inferred from `snd_nxt` was
+  declared acknowledged after a retransmission rolled `snd_nxt` back — sender in
+  FIN_WAIT_2, receiver still ESTABLISHED, every byte delivered and the reader
+  blocked until timeout.  **What found them was instrumentation, not
+  inspection:** splitting the test's wall clock into recv/asleep/send turned 8.5
+  s of mystery into "the 33rd read waited 8 s", and dumping the connection table
+  AT THE MOMENT OF THE STALL named the last one in a line, after two wrong
+  theories the measurements had already excluded.  Also: a per-connection
+  counter cannot measure a period longer than the connection (the loss test read
+  zero retransmits while seven timeouts had fired); i386's socket syscall
+  numbers are not sequential by name and reciting them put `connect`'s handler
+  on `bind`'s number; and adding a field to `struct net_device` without
+  `make clean` produced `eth0 ... ip=255.255.255.0` — two layouts of one struct
+  in one build, caught by the log in one line.  Open: no reassembly queue, no
+  congestion control, a fixed RTO, a polled ARM NIC, and sendmsg/recvmsg still
+  per-arch.
 
 - **2026-08-12 — §M57: a task is not dead while it is still running (DOCS
   §4.58).**  §M54's own notes ended with *"the reap sweep still reports a queued

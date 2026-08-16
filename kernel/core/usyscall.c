@@ -1051,6 +1051,15 @@ long sys_recv_u(int fd, uintptr_t ubuf, size_t n, int* kpassfd_out) {
  * all its fds, which is what a level-triggered poll does anyway. */
 static struct waitq readiness_wq = WAITQ_INIT;
 
+/* Did the last readiness scan look at a network socket?
+ *
+ * A counter rather than a flag, and sampled around the caller's OWN first scan,
+ * so "my fds include a socket" is answered by what this call actually looked
+ * at.  A concurrent scan on another CPU can only produce a FALSE POSITIVE —
+ * which starts a poller that promptly parks again — and that is the harmless
+ * direction: a false negative would be a wait that never receives anything. */
+static volatile uint32_t g_netsock_scans;
+
 void fd_readiness_signal(void) {
     uint32_t f = waitq_lock(&readiness_wq);
     waitq_wake_all(&readiness_wq);
@@ -1110,6 +1119,7 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
      * loop polling one span at full speed and every epoll_wait on it returned
      * instantly. */
     case FD_NETSOCK:
+        g_netsock_scans++;
         r |= netsock_readiness(o->nsock);
         break;
     case FD_EPOLL:
@@ -1163,8 +1173,17 @@ static void readiness_deadline_fired(struct ktimer* t) {
 
 /* See fd.h.  The single blocking loop behind poll(2) and epoll_wait(2). */
 int fd_readiness_wait(int (*scan)(void* ctx), void* ctx, int timeout_ms) {
+    uint32_t seen0 = g_netsock_scans;
     int ready = scan(ctx);
     if (ready > 0 || timeout_ms == 0) return ready;
+
+    /* If this wait involves a SOCKET, tell the network stack somebody is
+     * waiting: its poller only runs while somebody is (§M55), and nothing
+     * else in this path would ever have said so.  Without it a poll on a
+     * socket waits out its whole timeout while the answer sits unread in the
+     * NIC — which is precisely how musl's resolver stopped resolving. */
+    int wants_net = (g_netsock_scans != seen0);
+    if (wants_net) net_waiter_enter();
 
     /* A FINITE timeout is a real bounded wait now (§M56).  It used to be
      * treated as a snapshot — documented, but a program asking to wait 200 ms
@@ -1199,6 +1218,7 @@ int fd_readiness_wait(int (*scan)(void* ctx), void* ctx, int timeout_ms) {
      * callback would otherwise reference a queue this frame is leaving; on the
      * timeout path it already has, and cancelling is a no-op. */
     if (timeout_ms > 0) ktimer_cancel(&t);
+    if (wants_net) net_waiter_leave();
     return ready;
 }
 
@@ -1431,12 +1451,22 @@ struct ns_dgram {
 };
 struct netsock {
     int      type;
+    uint32_t local_ip;                  /* bind address; 0 = every address   */
     uint16_t local_port;
     int      bound;
     int      nonblock;                  /* SOCK_NONBLOCK / O_NONBLOCK        */
     struct ns_dgram rx[NS_RXSLOTS];
     volatile int rx_head, rx_tail;      /* head = produce, tail = consume */
-    /* SOCK_STREAM (TCP) state. */
+    /* SOCK_STREAM (TCP).  §M24.9 — a socket now names ONE connection out of
+     * the stack's table instead of implying the only one that could exist.
+     * `conn` is an active connection (connected or accepted); `lsock` is a
+     * passive one.  They are separate fields rather than a union with a flag
+     * because every operation is legal on exactly one of them, and a listening
+     * socket that answered read() with a connection's data would be a bug
+     * nobody would find by reading the call site. */
+    struct tcp_conn* conn;
+    struct tcp_conn* lsock;
+    int      rd_shut;                   /* shutdown(SHUT_RD): reads end here  */
     int      connected;
     uint32_t peer_ip; uint16_t peer_port;
 };
@@ -1447,6 +1477,11 @@ static uint16_t g_ephem_port = 0xC000;
  * (§M55) — the old 40-million-iteration bound meant seconds on real hardware
  * and minutes under emulation, from the same source line. */
 #define NS_RECV_TIMEOUT_MS 5000
+/* How long a BLOCKING accept waits before reporting that nobody called.  A
+ * bound rather than "forever" for the same reason every other wait in this
+ * kernel has one: a task parked with no deadline is a task nothing but a kill
+ * can retrieve. */
+#define NS_ACCEPT_TIMEOUT_MS 30000
 
 /* The awaited condition, evaluated by net_wait_cond under the stack lock. */
 static int ns_has_dgram(void* a) {
@@ -1468,10 +1503,18 @@ uint32_t netsock_readiness(struct netsock* ns) {
     if (ns->type != SOCK_STREAM)
         return (ns->rx_head != ns->rx_tail ? POLLIN : 0) | POLLOUT;
 
-    if (!ns->connected) return 0;                /* not connected: nothing yet */
-    uint32_t r = POLLOUT;                        /* no send buffer to fill up  */
-    int rd = 0, fin = 0, rst = 0;
-    net_tcp_state(&rd, &fin, &rst);
+    /* §M24.10 — a LISTENING socket is "readable" when a connection is waiting
+     * to be accepted.  That is the convention every event loop is written
+     * against (accept() is the read of a listening socket), and without it a
+     * server built on epoll blocks forever on a set that never reports. */
+    if (ns->lsock) return net_tcp_pending(ns->lsock) > 0 ? POLLIN : 0;
+    if (ns->rd_shut) return POLLIN | POLLHUP;    /* readable, and it is EOF   */
+
+    if (!ns->conn) return 0;                     /* not connected: nothing yet */
+    int rd = 0, wr = 0, fin = 0, rst = 0, up = 0;
+    net_tcp_state(ns->conn, &rd, &wr, &fin, &rst, &up);
+    uint32_t r = wr ? POLLOUT : 0;               /* honest now: the send buffer
+                                                  * can actually fill up      */
     if (rd) r |= POLLIN;
     /* §M56.2 — an RST is an ERROR, not an end of file.  Without this a refused
      * or dropped connection looks exactly like a server that answered with
@@ -1508,10 +1551,12 @@ static void ns_udp_cb(uint32_t src_ip, uint16_t src_port,
 void netsock_close(struct netsock* ns) {
     if (!ns) return;
     if (ns->bound) net_udp_unbind(ns->local_port);
-    if (ns->type == SOCK_STREAM && ns->connected) {
-        struct net_device* dev = net_primary();
-        if (dev) net_tcp_close(dev);
-    }
+    /* Both handles, and in this order: closing the listener refuses every peer
+     * still sitting in its backlog, which is the right thing to do to a
+     * connection whose server has gone away — leaving them established and
+     * unowned is how a client ends up talking to nobody. */
+    if (ns->conn)  { net_tcp_close(ns->conn);  ns->conn  = NULL; }
+    if (ns->lsock) { net_tcp_close(ns->lsock); ns->lsock = NULL; }
     kfree(ns);
 }
 
@@ -1580,10 +1625,26 @@ int sys_socket_getnonblock(int fd) {
     return o->nonblock;
 }
 
-int sys_bind(int fd, int port) {
+/* bind(fd, ip, port).
+ *
+ * The address argument is new in §M24.10 and it is not decoration: a server
+ * binds 0.0.0.0 to serve every interface and 127.0.0.1 to serve only the local
+ * one, and the difference is the whole of a listening socket's security
+ * posture.  The old two-argument form silently discarded it. */
+int sys_bind(int fd, uint32_t ip, int port) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_NETSOCK) return -1;
-    return ns_ensure_bound(o->nsock, (uint16_t)port);
+    struct netsock* ns = o->nsock;
+    ns->local_ip = ip;
+    if (ns->type == SOCK_STREAM) {
+        /* A stream socket's port is claimed by listen()/connect(), where the
+         * connection table can refuse a clash; remembering it is all bind
+         * does. */
+        ns->local_port = (uint16_t)port;
+        ns->bound = 1;
+        return 0;
+    }
+    return ns_ensure_bound(ns, (uint16_t)port);
 }
 
 /* M24 — connect(fd, ip, port): TCP handshake for a SOCK_STREAM socket. */
@@ -1592,29 +1653,159 @@ int sys_connect(int fd, uint32_t ip, int port) {
     if (!o || o->kind != FD_NETSOCK) return -1;
     struct netsock* ns = o->nsock;
     if (ns->type != SOCK_STREAM) return -1;
-    struct net_device* dev = net_primary();
-    if (!dev) return -1;
-    if (net_tcp_connect(dev, ip, (uint16_t)port) != 0) return -1;
+    if (ns->conn) return -1;                     /* already connected          */
+    struct tcp_conn* c = net_tcp_connect(ip, (uint16_t)port, 0);
+    if (!c) return -1;
+    ns->conn = c;
     ns->connected = 1; ns->peer_ip = ip; ns->peer_port = (uint16_t)port;
     return 0;
+}
+
+/* listen(fd, backlog) — turn a bound socket into a passive one. */
+int sys_listen(int fd, int backlog) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETSOCK) return -1;
+    struct netsock* ns = o->nsock;
+    if (ns->type != SOCK_STREAM || ns->conn || ns->lsock) return -1;
+    if (!ns->local_port) return -1;              /* listen without bind        */
+    struct tcp_conn* l = net_tcp_listen(ns->local_ip, ns->local_port, backlog);
+    if (!l) return -1;
+    ns->lsock = l;
+    return 0;
+}
+
+/* accept(fd, &ip, &port) → a NEW descriptor for the accepted connection.
+ *
+ * Every pointer here is a KERNEL one; the personality layer marshals the
+ * client's sockaddr itself (the *_k / *_u split — see syscall.h).  A blocking
+ * accept waits; a non-blocking one answers EAGAIN, which is what lets an event
+ * loop call it only when its poll said the listener was readable. */
+int sys_accept_k(int fd, uint32_t* ip_out, int* port_out) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETSOCK) return -1;
+    struct netsock* ls = o->nsock;
+    if (!ls->lsock) return -1;                   /* not a listening socket     */
+
+    struct tcp_conn* c = net_tcp_accept(ls->lsock,
+                                        ls->nonblock ? 0 : NS_ACCEPT_TIMEOUT_MS);
+    if (!c) return ls->nonblock ? -SOCK_EAGAIN : -1;
+
+    struct netsock* ns = (struct netsock*)kcalloc(1, sizeof *ns);
+    if (!ns) { net_tcp_close(c); return -1; }
+    ns->type = SOCK_STREAM;
+    ns->conn = c;
+    ns->connected = 1;
+    net_tcp_peer(c, &ns->peer_ip, &ns->peer_port);
+    net_tcp_local(c, &ns->local_ip, &ns->local_port);
+
+    struct ofile* no = ofile_from_netsock(ns);
+    if (!no) { net_tcp_close(c); kfree(ns); return -1; }
+    int nfd = fd_install(no);
+    if (nfd < 0) { ofile_unref(no); return -1; }
+    if (ip_out)   *ip_out   = ns->peer_ip;
+    if (port_out) *port_out = ns->peer_port;
+    return nfd;
+}
+
+/* shutdown(fd, how) — 0 = SHUT_RD, 1 = SHUT_WR, 2 = both.
+ *
+ * Both halves are REAL.  Answering "success" to SHUT_RD while still delivering
+ * data would be the §M56.1 stub shape: nothing fails, so nothing is
+ * investigated, while every program that used it got no shutdown.  The read
+ * half is enforced locally (further reads report end of stream) because that
+ * is precisely what it means — it is a promise about THIS socket, not a
+ * message to the peer. */
+int sys_shutdown(int fd, int how) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETSOCK) return -1;
+    struct netsock* ns = o->nsock;
+    if (how == 0 || how == 2) ns->rd_shut = 1;
+    if (how == 1 || how == 2) {
+        if (!ns->conn) return -1;
+        net_tcp_shutdown(ns->conn);
+    }
+    return 0;
+}
+
+/* getsockname / getpeername — kernel-pointer cores, same split as accept. */
+int sys_getsockname_k(int fd, uint32_t* ip_out, int* port_out) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETSOCK) return -1;
+    struct netsock* ns = o->nsock;
+    uint32_t ip = ns->local_ip; uint16_t port = ns->local_port;
+    if (ns->conn) net_tcp_local(ns->conn, &ip, &port);
+    if (ip_out)   *ip_out   = ip;
+    if (port_out) *port_out = port;
+    return 0;
+}
+
+int sys_getpeername_k(int fd, uint32_t* ip_out, int* port_out) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETSOCK) return -1;
+    struct netsock* ns = o->nsock;
+    if (!ns->conn) return -1;                    /* not connected              */
+    uint32_t ip = 0; uint16_t port = 0;
+    net_tcp_peer(ns->conn, &ip, &port);
+    if (ip_out)   *ip_out   = ip;
+    if (port_out) *port_out = port;
+    return 0;
+}
+
+/* The GATED entries.  Same split as sendto/recvfrom and for the same reason
+ * (§M46, §M47.2): the *_k cores take kernel pointers and have in-kernel
+ * callers, so a ring-3 check inside them would reject every one of those; the
+ * check belongs where the pointer's ORIGIN is known. */
+static int ns_addr_out(uint32_t* ip_out, int* port_out, uint32_t ip, int port) {
+    if (ip_out) {
+        if (!user_w(ip_out, sizeof *ip_out)) return -1;
+        if (copy_to_user((uintptr_t)ip_out, &ip, sizeof ip) != 0) return -1;
+    }
+    if (port_out) {
+        if (!user_w(port_out, sizeof *port_out)) return -1;
+        if (copy_to_user((uintptr_t)port_out, &port, sizeof port) != 0) return -1;
+    }
+    return 0;
+}
+
+int sys_accept(int fd, uint32_t* ip_out, int* port_out) {
+    if (!user_ptr_gate_armed()) return sys_accept_k(fd, ip_out, port_out);
+    uint32_t ip = 0; int port = 0;
+    int r = sys_accept_k(fd, &ip, &port);
+    if (r >= 0 && ns_addr_out(ip_out, port_out, ip, port) != 0) return -1;
+    return r;
+}
+
+int sys_getsockname(int fd, uint32_t* ip_out, int* port_out) {
+    if (!user_ptr_gate_armed()) return sys_getsockname_k(fd, ip_out, port_out);
+    uint32_t ip = 0; int port = 0;
+    int r = sys_getsockname_k(fd, &ip, &port);
+    if (r == 0 && ns_addr_out(ip_out, port_out, ip, port) != 0) return -1;
+    return r;
+}
+
+int sys_getpeername(int fd, uint32_t* ip_out, int* port_out) {
+    if (!user_ptr_gate_armed()) return sys_getpeername_k(fd, ip_out, port_out);
+    uint32_t ip = 0; int port = 0;
+    int r = sys_getpeername_k(fd, &ip, &port);
+    if (r == 0 && ns_addr_out(ip_out, port_out, ip, port) != 0) return -1;
+    return r;
 }
 
 /* Stream read/write over a connected SOCK_STREAM socket (called by
  * sys_read/sys_write when the fd is FD_NETSOCK). */
 static long netsock_write(struct netsock* ns, const void* buf, size_t n) {
-    if (ns->type != SOCK_STREAM || !ns->connected) return -1;
-    struct net_device* dev = net_primary();
-    return dev ? net_tcp_send(dev, buf, (uint32_t)n) : -1;
+    if (ns->type != SOCK_STREAM || !ns->conn) return -1;
+    int r = net_tcp_send(ns->conn, buf, (uint32_t)n, ns->nonblock);
+    return (r == NET_EAGAIN) ? -SOCK_EAGAIN : r;
 }
 static long netsock_read(struct netsock* ns, void* buf, size_t n) {
-    if (ns->type != SOCK_STREAM || !ns->connected) return -1;
-    struct net_device* dev = net_primary();
-    if (!dev) return -1;
-    long r = net_tcp_recv(dev, buf, (uint32_t)n);
-    /* Same contract as the datagram path: a non-blocking stream reports EAGAIN
-     * rather than "connection produced nothing", so a caller's drain loop can
-     * tell "no data right now" from "error". */
-    if (r <= 0 && ns->nonblock) return -SOCK_EAGAIN;
+    if (ns->type != SOCK_STREAM || !ns->conn) return -1;
+    if (ns->rd_shut) return 0;                   /* shutdown(SHUT_RD) = EOF   */
+    int r = net_tcp_recv(ns->conn, buf, (uint32_t)n, ns->nonblock, 0);
+    /* NET_EAGAIN is "nothing yet", and it is NOT zero: zero means the peer
+     * closed, and a drain loop told EOF by a live connection stops for good
+     * (§M56.1's pipe lesson, one layer up). */
+    if (r == NET_EAGAIN) return -SOCK_EAGAIN;
     return r;
 }
 

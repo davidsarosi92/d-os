@@ -53,8 +53,19 @@
 
 /* ----------------------- The device abstraction --------------------------- */
 
+/* Device flags. */
+/* §M24.8 — a LOOPBACK device delivers what it is given straight back to the
+ * stack.  The flag is not decoration: two rules key off it.  (1) Its peers are
+ * never resolved — there is no wire and therefore no ARP, and asking would
+ * block forever for an answer that cannot come.  (2) It is never the DEFAULT
+ * route: `net_primary()` skips it, so every caller written before loopback
+ * existed keeps meaning "the device that reaches the outside world" even though
+ * the registry now has two entries. */
+#define NETDEV_F_LOOPBACK  0x00000001u
+
 struct net_device {
     const char* name;                         /* e.g. "eth0"                 */
+    uint32_t    flags;                        /* NETDEV_F_*                  */
     uint8_t     mac[ETH_ALEN];
 
     /* L3 configuration — host byte order.  Set by the driver at register
@@ -87,10 +98,34 @@ struct net_device {
 
 int  net_register(struct net_device* dev);
 struct net_device* net_find(const char* name);
-struct net_device* net_primary(void);         /* first registered, or NULL   */
+
+/* The DEFAULT-ROUTE device: the first registered non-loopback one, or NULL.
+ *
+ * The definition changed with §M24.8 and the wording matters.  It used to be
+ * "the first registered device", which was the same thing while `eth0` was the
+ * only device there could be; the moment `lo` joined the registry that reading
+ * would have handed every existing caller — ping, DNS, wget, NetSurf's fetcher
+ * — a device that cannot reach anything, purely on registration order.  A
+ * loopback interface is never a route to the world, so it is never primary. */
+struct net_device* net_primary(void);
+
+/* Pick the device a packet for `dst_ip` must leave through: the loopback for
+ * 127.0.0.0/8, otherwise the first device whose subnet contains `dst_ip`,
+ * otherwise the default-route device.  Returns NULL if nothing can carry it.
+ *
+ * This is the whole routing table.  It is a FUNCTION rather than a table
+ * because with two devices — one loopback, one NIC — a table would have
+ * exactly two rows that can never be edited; when a second NIC or a static
+ * route arrives, this is the one place that grows. */
+struct net_device* net_route(uint32_t dst_ip);
+
+/* Is `ip` an address this host answers to?  Used by the TCP layer to decide
+ * whether a passive socket bound to a specific address should take a segment. */
+int net_is_local_ip(uint32_t ip);
 typedef void (*net_iter_fn)(struct net_device* dev, void* ctx);
 void net_for_each(net_iter_fn fn, void* ctx);
 void net_list(void);                          /* backs the `lsnic` command    */
+void net_procfs_init(void);                   /* /proc/net/{dev,arp,route,tcp,stat} */
 
 /* ----------------------- RX entry (driver → stack) ------------------------ */
 
@@ -111,15 +146,21 @@ void net_rx(struct net_device* dev, const uint8_t* frame, uint32_t len);
  * than blocking forever on a promise. */
 void net_rx_irq(struct net_device* dev);
 
-/* Report both halves of stream readiness in one locked read: whether unread
- * bytes are waiting, and whether the peer has sent its FIN.  Sampled together
- * because a caller reading them separately could see "no data" and "no FIN"
- * from two different instants and conclude the connection was merely quiet
- * (§M56).  `reset` distinguishes an RST from a FIN — an orderly EOF from a
- * broken connection, which is the difference between POLLHUP and POLLERR and
- * the difference between "the server answered nothing" and "the server refused
- * you".  Any pointer may be NULL. */
-void net_tcp_state(int* readable, int* peer_fin, int* reset);
+/* "Nothing right now, ask again" — the stream/datagram answer that is NOT an
+ * error and NOT an end of file.  Kept as a net.h constant rather than the
+ * syscall layer's errno so the stack does not have to know what a syscall is;
+ * usyscall.c translates it into EAGAIN at the boundary. */
+#define NET_EAGAIN  (-2)
+
+/* ----------------------- Loopback loss injection (a test instrument) ------ */
+
+/* Make the loopback device DROP a share of the frames handed to it (per
+ * thousand; 0 = a perfect link).  Declared here rather than in a driver header
+ * because it is part of how this subsystem is tested, and a test instrument
+ * that is hard to find is one nobody uses: without a way to lose a packet, a
+ * retransmission timer is a feature no test in the build can falsify. */
+void loopback_set_drop(uint32_t permille);
+void loopback_stats(uint32_t* drop_permille, uint32_t* injected, uint32_t* qfull);
 
 /* ----------------------- Waiting for the network (§M55) ------------------- */
 
@@ -135,6 +176,13 @@ void     net_unlock(uint32_t flags);
  * may read stack state freely but must not take the lock or block.  Waiting
  * here also starts the poller, so a caller never has to think about it. */
 int net_wait_cond(int (*cond)(void* arg), void* arg, uint32_t timeout_ms);
+
+/* Say that this task is waiting for network state to change (and, when the
+ * last one leaves, that nobody is).  net_wait_cond does this itself; a task
+ * blocked in poll()/epoll_wait() on a socket must do it explicitly, or the
+ * poller stays parked and the frame it is waiting for is never collected. */
+void net_waiter_enter(void);
+void net_waiter_leave(void);
 
 /* Give the device exactly one chance to deliver, for a caller that will NOT
  * wait (a non-blocking recv).  This exists so "pump once" stays a stack
@@ -203,6 +251,16 @@ int net_udp_send(struct net_device* dev, uint32_t dst_ip,
 /* A bound receive handler: called for each datagram whose dst_port matches.
  * Only one binding per port in this first slice (enough for a stub resolver /
  * a `nc -u` test).  Passing NULL unbinds. */
+/* Broadcast a datagram from an explicit source address — the shape DHCP needs
+ * before this host has an address of its own (see net.c). */
+int net_udp_broadcast(struct net_device* dev, uint32_t src_ip,
+                      uint16_t src_port, uint16_t dst_port,
+                      const void* payload, uint32_t len);
+
+/* The resolver's nameserver.  Settable because DHCP learns it (option 6). */
+void     net_set_dns(uint32_t ip);
+uint32_t net_get_dns(void);
+
 typedef void (*udp_recv_fn)(uint32_t src_ip, uint16_t src_port,
                             const uint8_t* data, uint32_t len, void* ctx);
 int  net_udp_bind(uint16_t port, udp_recv_fn fn, void* ctx);
@@ -215,29 +273,100 @@ void net_udp_unbind(uint16_t port);
  * success, <0 on failure/timeout.  The precursor to getaddrinfo (§M39). */
 int net_dns_query(struct net_device* dev, const char* hostname, uint32_t* out_ip);
 
-/* ----------------------- TCP + HTTP (§M24.3) ------------------------------ */
+/* ----------------------- TCP (§M24.3 + §M24.9/.10/.11) -------------------- */
+
+/* A connection is an OPAQUE handle.  Callers hold a pointer and never learn
+ * what is behind it, which is what let the single `g_tcp` become a table
+ * without touching a line of the socket layer's logic.
+ *
+ * LIFETIME, stated once so nobody has to derive it: the handle is valid from
+ * the call that produced it (connect / listen / accept) until the matching
+ * `net_tcp_close`.  The RX path never releases one — it only changes state —
+ * so a handle cannot go stale underneath a socket that still exists. */
+struct tcp_conn;
+
+/* Open a connection.  Picks its own device via net_route(), resolves the next
+ * hop once, and blocks until the handshake completes or `timeout_ms` passes
+ * (0 = the default).  Returns NULL on refusal (an RST arrives promptly, so a
+ * closed port fails fast rather than at the timeout) or on timeout. */
+struct tcp_conn* net_tcp_connect(uint32_t ip, uint16_t port, uint32_t timeout_ms);
+
+/* Passive open.  `local_ip` 0 means every local address — a listener has no
+ * device of its own, because each connection it accepts takes the device its
+ * SYN arrived on.  Returns NULL if the port is already in use. */
+struct tcp_conn* net_tcp_listen(uint32_t local_ip, uint16_t port, int backlog);
+
+/* Take the next established connection off a listener's backlog, waiting up to
+ * `timeout_ms` (0 = do not wait).  Returns NULL if none arrived. */
+struct tcp_conn* net_tcp_accept(struct tcp_conn* l, uint32_t timeout_ms);
+int  net_tcp_pending(struct tcp_conn* l);   /* how many are queued (readiness) */
+
+/* Queue bytes for transmission.  Returns the number ACCEPTED (which may be
+ * less than `len` — the send buffer is finite), NET_EAGAIN if a non-blocking
+ * socket would have had to wait, or -1 on a broken connection. */
+int  net_tcp_send(struct tcp_conn* c, const void* buf, uint32_t len, int nonblock);
+
+/* Read.  >0 = bytes, 0 = the peer closed AND the buffer is drained, NET_EAGAIN
+ * = nothing arrived within the timeout (or would have blocked), -1 = the
+ * connection is broken.  The timeout and the end of stream are DIFFERENT
+ * answers: the first slice returned 0 for both, which made a slow server
+ * indistinguishable from a finished one. */
+int  net_tcp_recv(struct tcp_conn* c, void* buf, uint32_t len, int nonblock,
+                  uint32_t timeout_ms);
+
+void net_tcp_shutdown(struct tcp_conn* c);   /* half-close: FIN, keep the fd */
+void net_tcp_close(struct tcp_conn* c);
+
+/* Readiness for poll/epoll — every field sampled in ONE locked read, because a
+ * caller that read them separately could see "no data" and "no FIN" from two
+ * different instants and conclude the connection was merely quiet (§M56).
+ * `reset` distinguishes an RST from a FIN: an orderly EOF from a broken
+ * connection, which is the difference between POLLHUP and POLLERR, and between
+ * "the server answered nothing" and "the server refused you".  Any pointer may
+ * be NULL. */
+void net_tcp_state(struct tcp_conn* c, int* readable, int* writable,
+                   int* peer_fin, int* reset, int* connected);
+
+void net_tcp_peer (struct tcp_conn* c, uint32_t* ip, uint16_t* port);
+void net_tcp_local(struct tcp_conn* c, uint32_t* ip, uint16_t* port);
+
+/* Diagnostics — backs `netstat` and /proc/net/tcp.  A per-connection retransmit
+ * counter is not decoration: it is the only way to tell a link that recovered
+ * from one that never lost anything, which is what makes the loss test a test. */
+struct net_tcp_info {
+    const char* state;
+    const char* dev;
+    uint32_t local_ip, peer_ip;
+    uint16_t local_port, peer_port;
+    uint32_t rx_queued, tx_queued;
+    uint32_t tx_segs, rx_segs, retrans;
+    int      listener;
+};
+typedef void (*net_tcp_iter_fn)(const struct net_tcp_info* info, void* ctx);
+void net_tcp_foreach(net_tcp_iter_fn fn, void* ctx);
+void net_tcp_counters(uint32_t* rst_sent, uint32_t* rst_rcvd, uint32_t* noconn);
+void net_tcp_timing_counters(uint32_t* persists, uint32_t* rtos, uint32_t* zerowin);
+void net_tcp_output_counters(uint32_t* datasegs, uint32_t* wndblocked);
+int  net_tcp_capacity(void);      /* table size — a full table refuses (RST) */
+
+/* ----------------------- HTTP helper (the `wget` engine) ------------------ */
 
 /* Open a TCP connection to (ip:port), send a minimal HTTP/1.0 GET for `path`
- * (Host: `host`, Connection: close), stream the response to the console, then
- * close.  Single connection at a time, client-only.  Returns the number of
- * response bytes received, or <0 on connect failure.
+ * (Host: `host`, Connection: close), accumulate the response, then close.
+ * Returns the number of response bytes received, or <0 on connect failure.
+ * `dev` is ignored — the route decides which device carries it — and is kept
+ * only so the shell's existing call sites read the same.
  *
- * Simplifications (this first slice, safe on QEMU SLIRP's lossless local
- * link): no congestion control, no retransmit timers, in-order delivery only.
- * A proper socket-backed TCP with timers is §M24 stage 5-6 / §M25. */
+ * The response is accumulated in the helper's OWN buffer rather than in the
+ * connection's receive ring.  They used to be one object, which is why a
+ * response larger than the ring could not be received at all: nothing drained
+ * it, so the window went to zero and the transfer stopped there. */
 int net_http_get(struct net_device* dev, uint32_t ip, uint16_t port,
                  const char* host, const char* path);
 
 /* Access the last response body accumulated by net_http_get (for the shell
  * `wget` command to print).  Returns the buffer; *len_out gets its length. */
 const uint8_t* net_http_body(uint32_t* len_out);
-
-/* General TCP client API (M24 socket API) — one connection at a time, over the
- * same single g_tcp engine as net_http_get.  Back SOCK_STREAM sockets. */
-int  net_tcp_connect(struct net_device* dev, uint32_t ip, uint16_t port);
-int  net_tcp_send(struct net_device* dev, const void* buf, uint32_t len);
-int  net_tcp_recv(struct net_device* dev, void* buf, uint32_t len);   /* 0 = EOF */
-void net_tcp_close(struct net_device* dev);
 
 /* ----------------------- ICMP echo (ping) --------------------------------- */
 

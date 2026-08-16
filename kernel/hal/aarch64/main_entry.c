@@ -62,6 +62,8 @@ void     aarch64_boot_meminfo_init(void);
 void     aarch64_serial_console_init(void);
 void     serial_shell_entry(void);   /* serial_shell.c — the Phase D REPL     */
 int      virtio_mmio_blk_init(void); /* virtio_mmio_blk.c — Phase F disk       */
+int      virtio_mmio_net_init(void); /* virtio_mmio_net.c — §M24 NIC           */
+void     net_procfs_init(void);      /* net.c — the /proc/net files            */
 int      virtio_gpu_init(void);      /* virtio_gpu.c — Phase I framebuffer     */
 int      virtio_input_init(void);    /* virtio_input.c — Phase J kbd + mouse   */
 void     keymap_init(void);          /* keymap.c — select the default layout   */
@@ -230,6 +232,14 @@ void aarch64_main_entry(uint64_t dtb) {
      * slots for an attached disk; if present, register it as /dev/vda and run
      * a write→read round-trip on a scratch sector to prove real disk DMA.
      * ----------------------------------------------------------------------- */
+    /* §M24 — the NIC.  The portable stack has been in this build since the
+     * port began with nothing underneath it; this is the transport that makes
+     * it real on ARM.  Absent (`-netdev` not passed) it simply reports so and
+     * the loopback still gives the stack something to carry. */
+    if (virtio_mmio_net_init() != 0)
+        kprintf("aarch64: no virtio-net device attached (loopback only)\n");
+    net_procfs_init();
+
     if (virtio_mmio_blk_init() == 0) {
         struct block_device* d = blk_find("vda");
         if (d && d->sector_count > 200) {

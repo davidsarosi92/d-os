@@ -10,6 +10,7 @@
  * ============================================================================= */
 
 #include "abi.h"
+#include "printf.h"
 #include "epoll.h"        /* EPOLL_CTL_* — the guest's own numbers */
 #include "syscall.h"
 #include "task.h"
@@ -511,6 +512,186 @@ static long h_exit(struct abi_ctx* c) {
     return 0;   /* unreachable for a user task */
 }
 
+/* ===========================================================================
+ * The BSD socket surface (§M24 second half).
+ *
+ * ONE marshalling of `struct sockaddr_in`, shared by every architecture and
+ * every entry convention.  Before this it existed twice — once in each x86
+ * layer — and a third copy was exactly what the aarch64 port would have
+ * needed, for a struct whose layout is the same everywhere.
+ *
+ * AND IT IS THE SAME EVERYWHERE, which is worth stating because the last
+ * struct through this pipeline was not: `struct epoll_event` is 12 bytes on
+ * i386 and amd64 but 16 on arm64 (§M56), so a size derived from the word width
+ * passes on two arches and fails on the third.  `sockaddr_in` has no such
+ * trap — 16 bytes, fixed fields, network byte order — and `socklen_t` is a
+ * 32-bit unsigned on every ABI here.  A shared marshaller is therefore CORRECT
+ * rather than merely convenient, and saying so is how the next person knows
+ * not to go looking for a per-arch case that was never needed.
+ * ======================================================================== */
+
+#define ABI_AF_INET        2
+#define ABI_SOCK_NONBLOCK  0x800      /* Linux O_NONBLOCK, socket-type flag   */
+#define ABI_SOCK_CLOEXEC   0x80000
+#define ABI_EAFNOSUPPORT   97
+#define ABI_EOPNOTSUPP     95
+#define ABI_ENOTCONN       107
+#define ABI_EAGAIN         11
+
+struct abi_sockaddr_in {
+    uint16_t sin_family;
+    uint16_t sin_port;                /* network byte order                   */
+    uint32_t sin_addr;                /* network byte order                   */
+    uint8_t  sin_zero[8];
+};
+
+static uint16_t abi_ntohs(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
+static uint32_t abi_ntohl(uint32_t v) {
+    return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
+           ((v & 0x00FF0000u) >> 8)  | ((v & 0xFF000000u) >> 24);
+}
+
+static int abi_user_r_ok(unsigned long uptr, unsigned long len) {
+    return uptr && vmm_user_access_ok((uintptr_t)uptr, (uintptr_t)len, 0);
+}
+
+/* guest sockaddr_in → host-order (ip, port).  Returns 0 on success. */
+static int abi_addr_in(unsigned long uaddr, uint32_t* ip, int* port) {
+    if (!abi_user_r_ok(uaddr, sizeof(struct abi_sockaddr_in))) return -1;
+    const struct abi_sockaddr_in* sa = (const struct abi_sockaddr_in*)(uintptr_t)uaddr;
+    if (sa->sin_family != ABI_AF_INET) return -2;
+    *ip   = abi_ntohl(sa->sin_addr);
+    *port = (int)abi_ntohs(sa->sin_port);
+    return 0;
+}
+
+/* host-order (ip, port) → guest sockaddr_in, honouring the caller's socklen.
+ *
+ * Linux writes at most `*addrlen` bytes and then stores the address's TRUE
+ * size, which is how a caller learns it was truncated.  Reporting the
+ * truncated length instead would make every short buffer look like a success. */
+static void abi_addr_out(unsigned long uaddr, unsigned long ulen,
+                         uint32_t ip, int port) {
+    if (!uaddr || !ulen) return;
+    if (!abi_user_r_ok(ulen, sizeof(uint32_t))) return;
+    uint32_t room = *(uint32_t*)(uintptr_t)ulen;
+    struct abi_sockaddr_in sa;
+    sa.sin_family = ABI_AF_INET;
+    sa.sin_port   = abi_ntohs((uint16_t)port);
+    sa.sin_addr   = abi_ntohl(ip);
+    for (int i = 0; i < 8; i++) sa.sin_zero[i] = 0;
+    uint32_t n = room < sizeof sa ? room : (uint32_t)sizeof sa;
+    if (n && abi_user_w_ok(uaddr, n)) {
+        uint8_t* dst = (uint8_t*)(uintptr_t)uaddr;
+        const uint8_t* src = (const uint8_t*)&sa;
+        for (uint32_t i = 0; i < n; i++) dst[i] = src[i];
+    }
+    if (abi_user_w_ok(ulen, sizeof(uint32_t)))
+        *(uint32_t*)(uintptr_t)ulen = (uint32_t)sizeof sa;
+}
+
+static long h_socket(struct abi_ctx* c) {
+    int domain = (int)c->a[0];
+    int type   = (int)c->a[1];
+    if (domain != ABI_AF_INET) return -ABI_EAFNOSUPPORT;
+    int fd = sys_socket(domain, type & 0xFF, (int)c->a[2]);
+    if (fd < 0) return -ABI_EOPNOTSUPP;
+    /* SOCK_NONBLOCK is not decoration: musl's resolver drains its socket with
+     * `while (recvmsg(...) >= 0)` and needs the EAGAIN only a non-blocking
+     * socket produces (§M39). */
+    if (type & ABI_SOCK_NONBLOCK) sys_socket_setnonblock(fd, 1);
+    return fd;
+}
+
+static long h_bind(struct abi_ctx* c) {
+    uint32_t ip; int port;
+    int r = abi_addr_in(c->a[1], &ip, &port);
+    if (r == -1) return -ABI_EFAULT;
+    if (r == -2) return -ABI_EAFNOSUPPORT;
+    return sys_bind((int)c->a[0], ip, port) == 0 ? 0 : -ABI_EINVAL;
+}
+
+static long h_connect(struct abi_ctx* c) {
+    uint32_t ip; int port;
+    int r = abi_addr_in(c->a[1], &ip, &port);
+    if (r == -1) return -ABI_EFAULT;
+    if (r == -2) return -ABI_EAFNOSUPPORT;
+    /* ECONNREFUSED (111) is the honest answer now that a closed port answers
+     * with an RST rather than with silence — the stack cannot tell us which
+     * yet, so the generic failure stands and the distinction is written down
+     * as the next thing to carry through. */
+    return sys_connect((int)c->a[0], ip, port) == 0 ? 0 : -111;
+}
+
+static long h_listen(struct abi_ctx* c) {
+    return sys_listen((int)c->a[0], (int)c->a[1]) == 0 ? 0 : -ABI_EINVAL;
+}
+
+/* accept(fd, addr, addrlen) and accept4(fd, addr, addrlen, flags). */
+static long h_accept_common(struct abi_ctx* c, int flags) {
+    uint32_t ip = 0; int port = 0;
+    int fd = sys_accept_k((int)c->a[0], &ip, &port);
+    if (fd == -ABI_EAGAIN) return -ABI_EAGAIN;
+    if (fd < 0) return -ABI_EINVAL;
+    abi_addr_out(c->a[1], c->a[2], ip, port);
+    if (flags & ABI_SOCK_NONBLOCK) sys_socket_setnonblock(fd, 1);
+    return fd;
+}
+static long h_accept (struct abi_ctx* c) { return h_accept_common(c, 0); }
+static long h_accept4(struct abi_ctx* c) { return h_accept_common(c, (int)c->a[3]); }
+
+static long h_getsockname(struct abi_ctx* c) {
+    uint32_t ip = 0; int port = 0;
+    if (sys_getsockname_k((int)c->a[0], &ip, &port) != 0) return -ABI_EINVAL;
+    abi_addr_out(c->a[1], c->a[2], ip, port);
+    return 0;
+}
+
+static long h_getpeername(struct abi_ctx* c) {
+    uint32_t ip = 0; int port = 0;
+    if (sys_getpeername_k((int)c->a[0], &ip, &port) != 0) return -ABI_ENOTCONN;
+    abi_addr_out(c->a[1], c->a[2], ip, port);
+    return 0;
+}
+
+/* send/recv are sendto/recvfrom without an address, and on a CONNECTED socket
+ * that is exactly a write/read — which is where the stream payload has always
+ * gone (sys_read/sys_write route FD_NETSOCK to the TCP engine). */
+static long h_send(struct abi_ctx* c) {
+    return sys_write((int)c->a[0], (const void*)c->a[1], (size_t)c->a[2]);
+}
+static long h_recv(struct abi_ctx* c) {
+    return sys_read((int)c->a[0], (void*)c->a[1], (size_t)c->a[2]);
+}
+
+static long h_sendto(struct abi_ctx* c) {
+    if (!c->a[4]) return sys_write((int)c->a[0], (const void*)c->a[1], (size_t)c->a[2]);
+    uint32_t ip; int port;
+    int r = abi_addr_in(c->a[4], &ip, &port);
+    if (r == -1) return -ABI_EFAULT;
+    if (r == -2) return -ABI_EAFNOSUPPORT;
+    return sys_sendto((int)c->a[0], (const void*)c->a[1], (size_t)c->a[2], ip, port);
+}
+
+static long h_recvfrom(struct abi_ctx* c) {
+    uint32_t ip = 0; int port = 0;
+    long n = sys_recvfrom_u((int)c->a[0], (uintptr_t)c->a[1], (size_t)c->a[2],
+                            &ip, &port);
+    if (n >= 0 && c->a[4]) abi_addr_out(c->a[4], c->a[5], ip, port);
+    return n;
+}
+
+static long h_shutdown(struct abi_ctx* c) {
+    return sys_shutdown((int)c->a[0], (int)c->a[1]);
+}
+
+/* No socket options are honoured, and reporting success is deliberate: musl's
+ * getaddrinfo and every TLS setup set SO_RCVTIMEO / TCP_NODELAY and treat a
+ * failure as fatal, while ignoring them costs at most a timeout that never
+ * fires.  The day one of them changes behaviour, it stops being a stub. */
+static long h_setsockopt(struct abi_ctx* c) { (void)c; return 0; }
+static long h_getsockopt(struct abi_ctx* c) { (void)c; return 0; }
+
 /* The operation table, indexed by `enum abi_op`.  A NULL slot means "declared
  * in the vocabulary, no handler yet" — abi_invoke reports that as unhandled so
  * the caller can fall back, which is what lets an existing hand-written layer
@@ -547,6 +728,22 @@ static const struct {
     [ABI_SIGPENDING]      = { "sigpending",      h_sigpending      },
     [ABI_WAIT]            = { "wait",            h_wait },
     [ABI_EXECVE]          = { "execve",          h_execve },
+    /* §M24 — the socket surface, shared by all three arches at once. */
+    [ABI_SOCKET]       = { "socket",       h_socket       },
+    [ABI_BIND]         = { "bind",         h_bind         },
+    [ABI_CONNECT]      = { "connect",      h_connect      },
+    [ABI_LISTEN]       = { "listen",       h_listen       },
+    [ABI_ACCEPT]       = { "accept",       h_accept       },
+    [ABI_ACCEPT4]      = { "accept4",      h_accept4      },
+    [ABI_GETSOCKNAME]  = { "getsockname",  h_getsockname  },
+    [ABI_GETPEERNAME]  = { "getpeername",  h_getpeername  },
+    [ABI_SEND]         = { "send",         h_send         },
+    [ABI_SENDTO]       = { "sendto",       h_sendto       },
+    [ABI_RECV]         = { "recv",         h_recv         },
+    [ABI_RECVFROM]     = { "recvfrom",     h_recvfrom     },
+    [ABI_SHUTDOWN]     = { "shutdown",     h_shutdown     },
+    [ABI_SETSOCKOPT]   = { "setsockopt",   h_setsockopt   },
+    [ABI_GETSOCKOPT]   = { "getsockopt",   h_getsockopt   },
 };
 
 enum abi_op abi_lookup(const struct abi_map* map, unsigned long nr) {

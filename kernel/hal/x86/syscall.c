@@ -150,10 +150,23 @@ static void syscall_dispatch_body(struct int_frame* f) {
             f->eax = (uint32_t)sys_socket((int)f->ebx, (int)f->ecx, (int)f->edx);
             return;
         case SYS_BIND:
-            f->eax = (uint32_t)sys_bind((int)f->ebx, (int)f->ecx);
+            f->eax = (uint32_t)sys_bind((int)f->ebx, (uint32_t)f->ecx, (int)f->edx);
             return;
         case SYS_CONNECT:
             f->eax = (uint32_t)sys_connect((int)f->ebx, (uint32_t)f->ecx, (int)f->edx);
+            return;
+        /* §M24.10 — the server half. */
+        case SYS_LISTEN:
+            f->eax = (uint32_t)sys_listen((int)f->ebx, (int)f->ecx);
+            return;
+        case SYS_ACCEPT:
+            f->eax = (uint32_t)sys_accept((int)f->ebx, (uint32_t*)f->ecx, (int*)f->edx);
+            return;
+        case SYS_GETSOCKNAME:
+            f->eax = (uint32_t)sys_getsockname((int)f->ebx, (uint32_t*)f->ecx, (int*)f->edx);
+            return;
+        case SYS_GETPEERNAME:
+            f->eax = (uint32_t)sys_getpeername((int)f->ebx, (uint32_t*)f->ecx, (int*)f->edx);
             return;
 
         /* M35 — threads. */

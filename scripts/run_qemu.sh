@@ -53,7 +53,12 @@ if [ "$ARCH" = "aarch64" ]; then
     #   ... -device qemu-xhci -device usb-kbd    (drop virtio-keyboard-device)
     # The xHCI comes up over the PCIe ECAM bus (pci.c) and the HID keyboard
     # drives the shell.
+    # -netdev user + virtio-net-device: the §M24 NIC.  Present here as well as
+    #   in scripts/dos-shell-test.py deliberately — §M48 found a whole class of
+    #   bug in the gap between the path the tests take and the path a person
+    #   takes, and an absent NIC is exactly that gap.
     QEMU_MACHINE="-M virt,gic-version=2 -cpu cortex-a72 -smp 2 -m 256M \
+        -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
         -serial mon:stdio -rtc base=localtime \
         -device virtio-gpu-device -device virtio-keyboard-device \
         -device virtio-mouse-device \

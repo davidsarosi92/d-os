@@ -177,8 +177,16 @@ static inline uint64_t virt_to_phys(const void* v) {
  * the image.  virt_to_phys is the cheaper choice when the origin is known. */
 static inline uint64_t kptr_phys(const void* v) {
     uintptr_t a = (uintptr_t)v;
-    if (KERNEL_DIRECT_MAP_BASE && a >= (uintptr_t)KERNEL_DIRECT_MAP_BASE)
+    /* The test has to be a PREPROCESSOR one, not a runtime one: where the base
+     * is 0 (every 32-bit arch), `a >= 0` is always true and gcc says so — in
+     * every translation unit that includes this header, which on a clean build
+     * is a hundred copies of one warning.  A real warning cannot be seen in
+     * that, and §M57 had already paid for the lesson that a noisy build is a
+     * build nobody reads. */
+#if KERNEL_DIRECT_MAP_BASE
+    if (a >= (uintptr_t)KERNEL_DIRECT_MAP_BASE)
         return (uint64_t)(a - (uintptr_t)KERNEL_DIRECT_MAP_BASE);
+#endif
     return (uint64_t)a;
 }
 

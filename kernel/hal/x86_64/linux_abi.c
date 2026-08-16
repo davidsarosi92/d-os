@@ -943,93 +943,29 @@ static void linux_syscall_body(struct int_frame* f) {
             f->rax = (uint64_t)sys_poll((struct pollfd*)a0, (int)a1, (int)a2);
             return;
 
-        /* ---- BSD sockets.  Unlike i386 (one multiplexed socketcall), amd64
-         * Linux gives each call its own number, so these translate directly to
-         * the M24 primitives.  Byte order is converted in the sockaddr helpers
-         * above — the M24 stack only ever sees host order. */
-        case LNX_socket: {
-            int domain = (int)a0;
-            int type   = (int)a1 & 0xFF;      /* strip SOCK_CLOEXEC/NONBLOCK */
-            if (domain != AF_INET_LNX) { f->rax = (uint64_t)-LNX_EAFNOSUPPORT; return; }
-            int fd = sys_socket(domain, type, (int)a2);
-            if (fd < 0) { f->rax = (uint64_t)-LNX_EOPNOTSUPP; return; }
-            /* SOCK_NONBLOCK is NOT decoration: musl's resolver drains its
-             * socket with `while (recvmsg(...) >= 0)` and needs the EAGAIN that
-             * only a non-blocking socket produces. */
-            if ((int)a1 & LSOCK_NONBLOCK) sys_socket_setnonblock(fd, 1);
-            f->rax = (uint64_t)fd;
-            return;
-        }
-        case LNX_bind: {
-            uint32_t ip; int port;
-            if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)a1, &ip, &port) != 0) {
-                f->rax = (uint64_t)-LNX_EAFNOSUPPORT; return;
-            }
-            f->rax = (uint64_t)(long)(sys_bind((int)a0, port) == 0 ? 0 : -1);
-            return;
-        }
-        case LNX_connect: {
-            uint32_t ip; int port;
-            if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)a1, &ip, &port) != 0) {
-                f->rax = (uint64_t)-LNX_EAFNOSUPPORT; return;
-            }
-            f->rax = (uint64_t)(long)(sys_connect((int)a0, ip, port) == 0 ? 0 : -1);
-            return;
-        }
-        case LNX_sendto: {
-            const struct lnx_sockaddr_in* dst = (const struct lnx_sockaddr_in*)a4;
-            if (!dst) {                       /* connected stream → plain write */
-                f->rax = (uint64_t)sys_write((int)a0, (const void*)a1, (size_t)a2);
-                return;
-            }
-            uint32_t ip; int port;
-            if (sockaddr_to_hostorder(dst, &ip, &port) != 0) {
-                f->rax = (uint64_t)-LNX_EAFNOSUPPORT; return;
-            }
-            f->rax = (uint64_t)sys_sendto((int)a0, (const void*)a1, (size_t)a2, ip, port);
-            return;
-        }
-        case LNX_recvfrom: {
-            struct lnx_sockaddr_in* src = (struct lnx_sockaddr_in*)a4;
-            uint32_t* uaddrlen = (uint32_t*)a5;
-            uint32_t ip = 0; int port = 0;
-            long n = sys_recvfrom_u((int)a0, a1, (size_t)a2, &ip, &port);
-            if (n >= 0 && src) {
-                /* HERE the socklen_t is the CLIENT's, so it is validated here —
-                 * the helper itself takes a kernel word (see its header). */
-                uint32_t room = (uint32_t)sizeof(struct lnx_sockaddr_in);
-                if (uaddrlen) {
-                    if (!lnx_w_ok((uintptr_t)uaddrlen, sizeof *uaddrlen)) {
-                        f->rax = (uint64_t)-LNX_EFAULT; return;
-                    }
-                    room = *uaddrlen;
-                }
-                hostorder_to_sockaddr(src, &room, ip, port);
-                if (uaddrlen) *uaddrlen = room;
-            }
-            f->rax = (uint64_t)n;
-            return;
-        }
+        /* ---- BSD sockets.
+         *
+         * §M24 MOVED THIS OUT.  socket/bind/connect/listen/accept/accept4/
+         * getsockname/getpeername/sendto/recvfrom/shutdown/set-getsockopt are
+         * canonical operations now (kernel/core/abi_engine.c), reached through
+         * this arch's number map — so the engine above answers them and the
+         * cases that used to be here are GONE rather than left as a shadow.
+         * §M56.1's lesson, applied on purpose: a superseded fallback that is
+         * still reachable is a second implementation nobody is testing, and
+         * the last one of those worked on one arch and was silently dead on
+         * two.
+         *
+         * sendmsg/recvmsg stay: they are about CONTROL MESSAGES and passing
+         * file descriptors (SCM_RIGHTS, which Wayland runs on), and their
+         * `struct msghdr` is a row of guest-width words — a different
+         * marshalling problem from a fixed 16-byte sockaddr, and one that has
+         * not been solved once yet. */
         case LNX_sendmsg:
             f->rax = (uint64_t)linux_sendmsg((int)a0, (const struct lnx_msghdr*)a1,
                                              (int)a2);
             return;
         case LNX_recvmsg:
             f->rax = (uint64_t)linux_recvmsg((int)a0, (struct lnx_msghdr*)a1, (int)a2);
-            return;
-        case LNX_shutdown:
-            f->rax = 0;                       /* close() does the teardown */
-            return;
-        case LNX_setsockopt:
-        case LNX_getsockopt:
-            /* No socket options are honoured yet; report success so musl's
-             * getaddrinfo/TLS setup (SO_RCVTIMEO, TCP_NODELAY…) proceeds. */
-            f->rax = 0;
-            return;
-        case LNX_listen:
-        case LNX_getsockname:
-        case LNX_getpeername:
-            f->rax = (uint64_t)-LNX_EOPNOTSUPP;
             return;
 
         /* §M40 — clone().  amd64: clone(flags, stack, ptid, ctid, tls).

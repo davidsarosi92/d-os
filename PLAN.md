@@ -240,7 +240,7 @@ what); a session can pick a theme and push on it.
 | M22.6 | Tear-free present — Bochs-VBE page flip + display-scaling fix | UX | ✅ DOCS §4.13 |
 | M22.7 | Per-task GUI apps (each WIN_APP on its own task) + panel-as-task | UX | ✅ DOCS §4.16 |
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
-| M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | §M24    |
+| M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | ✅ DOCS §4.25 + §4.59 (complete: connection table, server role, retransmit, DHCP, /proc/net, all 3 arches) |
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | ✅ §M25 (stages 1–7) + Tier B (concurrent user processes + full-arch libc, DOCS §4.24) |
 | M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | §M26 |
 | M27 | Process model — init, parent/child hierarchy, always-on reaper, kill-tree | Concurrency | ✅ DOCS §4.15 |
@@ -2321,22 +2321,96 @@ synthesis, surround, ALSA-compat layer.
 
 ---
 
-## §M24 — Network stack (NIC → TCP/IP → sockets) — ✅ stages 1–3 shipped (i386)
+## §M24 — Network stack (NIC → TCP/IP → sockets) — ✅ COMPLETE
 
-**Status (2026-07-11): §M24.1–.3 + stage 6 (sockets) SHIPPED on i386 — see
-DOCS.md §4.25.**  virtio-net driver + `net_device` registry + Ethernet/ARP/
-IPv4/ICMP/UDP/TCP + a DNS stub resolver, all arch-independent in
-`kernel/core/net.c`.  **Plus the BSD socket syscall API to userland** (stage 6):
-`FD_NETSOCK` + `struct netsock` back `socket`/`bind`/`connect`/`sendto`/
-`recvfrom` (syscalls 22–26) — UDP + a single-connection TCP.  Boot-tested
-end-to-end through QEMU SLIRP: `nettest` (kernel: ICMP 3/3, DNS, TCP 200 OK)
-*and from ring 3* `dnstest` (UDP-socket DNS → example.com) + `httptest`
-(UDP DNS + TCP socket → `HTTP/1.1 200 OK`, 829 B).  Shell: `lsnic`/`ping`/`arp`/
-`nslookup`/`wget`/`nettest`/`dnstest`/`httptest`.  RX is polled from the calling
-task (no IRQ/lock yet).  **Still open** (design below is the roadmap): a `struct
-sockaddr` layer + multiple concurrent TCP conns + TX segmentation; IRQ-driven RX
-+ a `netd` task; TCP retransmit/congestion + a server role; DHCP (stage 7);
-IPv6; `/proc/net`; x86_64/aarch64 ports.
+**Status: COMPLETE (2026-08-15) — see DOCS.md §4.25 (stages 1–3) and §4.59
+(the second half).**
+
+Stages 1–3 + the socket API shipped 2026-07-11 on i386: virtio-net, the
+portable Ethernet/ARP/IPv4/ICMP/UDP/TCP stack, a DNS stub resolver and
+`FD_NETSOCK` sockets.  §M55 (DOCS §4.56) then made waiting for the network
+free, and §M56 gave it poll/epoll.  **The second half landed 2026-08-15 on all
+three architectures** and is what the design below actually asked for:
+
+- a **loopback device** + a routing decision (`net_route`), so both endpoints
+  of a test can be ours and 127.0.0.1 means something;
+- a **TCP connection table** (32 entries, four-tuple demux, per-connection
+  receive ring + send buffer, real sequence arithmetic, the RFC 793 states);
+- a **server role** — listen/accept with a bounded backlog, and an RST for a
+  segment belonging to no connection, so a closed port fails fast;
+- **reliability** — segmentation, RTO retransmission with backoff, window
+  advertisement and zero-window probing, and a close that keeps working until
+  its data and FIN are delivered;
+- the **socket ABI as canonical §M50 operations**, one `sockaddr_in`
+  marshaller for all three arches, i386's `socketcall` reduced to a
+  demultiplexer, the per-arch copies deleted, and a real `shutdown`;
+- **DHCP** (stage 7) with lease renewal through a §M49 worker;
+- **`/proc/net/{dev,arp,route,tcp,stat}`** (procfs learned subdirectories);
+- **a virtio-mmio NIC for aarch64**, closing "x86_64/aarch64 ports".
+
+**Definition of done, met:** 8 concurrent connections and a 32 KiB transfer
+through a 10 % loss link (intact, in order) on i386, x86_64 and aarch64; and
+bind/listen/accept/getpeername/shutdown through an UNMODIFIED musl binary on
+each.  `tcptest`, `tcploss`, `netstat`, `lo drop`, `dhcp` in both shells.
+
+**Lessons learned.**
+
+- *Build the way to make a test fail before you build the thing it tests.*  The
+  loopback learned to drop frames before the retransmit timer existed, and
+  `tcptest` was checked against a deliberately shrunken connection table
+  (0/4 clients connected, FAIL) before being believed about the real one.
+
+- *Three separate bugs each presented as "the network is slow".*  An ACK that
+  only WIDENS the window carries the same acknowledgement number, so reacting
+  to it only where new data is acknowledged leaves the sender stopped; a
+  zero-window probe that occupies a sequence number digs a hole only the RTO
+  can fill; and a FIN whose sequence number is inferred from `snd_nxt` is
+  declared acknowledged after a retransmission rolls `snd_nxt` back — leaving
+  the sender in FIN_WAIT_2 and the receiver in ESTABLISHED, with every byte
+  delivered and the reader blocked until its timeout.  **Record the FIN's own
+  sequence number; do not derive a fact from a value that moves.**
+
+- *Instrumentation found all three; inspection found none.*  Splitting the
+  test's wall clock into time-in-recv / time-asleep / time-in-send turned 8.5
+  seconds of mystery into "the 33rd read waited 8 s", and printing the
+  connection table AT THE MOMENT OF THE STALL named the last bug in one line —
+  after two theories the measurements had already ruled out.
+
+- *A counter that lives on an object cannot measure a period longer than the
+  object.*  The loss test summed per-connection retransmit counters and read
+  zero while seven timeouts had fired: the connections had ended.
+
+- *Syscall numbers are data and must be copied, not recalled.*  i386's socket
+  numbers are not sequential by name — 360 is `socketpair`, between `socket`
+  and `bind` — and reciting them put `connect`'s handler on `bind`'s number.
+  The symptom was a bind failing with ECONNREFUSED: the one errno that names
+  the handler that actually ran.
+
+- *Two correct changes can compose into a bug that neither one's tests can
+  see.*  §M55 made the network poller run only while somebody waits; §M56 made
+  a finite `poll()` timeout a real wait.  A task polling a SOCKET is waiting
+  for the network and had no way to say so, so the poller stayed parked and the
+  wait ran to its deadline with the answer sitting in the NIC.  musl's resolver
+  polls — so nothing in ring 3 could resolve a name, `wget` and NetSurf
+  included, while `nettest` passed throughout because the KERNEL resolver waits
+  through `net_wait_cond` and counts itself.  **The test that catches this is
+  the one that uses the path a program uses, not the path the kernel uses.**
+
+- *A test that needs the host's network reports the host's network.*  The
+  server half cannot be reached through SLIRP without a hostfwd rule the
+  automated runs do not have, which is why the loopback came first and why the
+  whole suite runs on a machine with no NIC at all.
+
+**Still open (deliberately, with the trigger written down):** no reassembly
+queue for out-of-order segments (they are dropped and duplicate-ACKed — correct,
+and it costs throughput on a lossy link); no congestion control (the peer's
+window is the only limit — honest on a loopback and on SLIRP, wrong on a real
+bottleneck); a fixed 200 ms RTO rather than an RTT estimate (on links whose
+round trip is microseconds an estimator measures the emulator); the aarch64 NIC
+is polled rather than interrupt-driven; `sendmsg`/`recvmsg` remain per-arch
+because their `msghdr` is guest-width words rather than a fixed address.  IPv6,
+multicast, IPsec, bridging/VLAN, netfilter and zero-copy RX were out of scope
+from the start and stay there.
 
 **IRQ-driven RX, re-scoped after §M49 (2026-08-06).**  §M49 built the missing
 half of this — a deferred-work pool (`work_submit`, one worker per CPU) whose
@@ -4689,6 +4763,27 @@ being explicit that it will not run Photoshop.
 ---
 
 ## Change log
+
+- **2026-08-15** — **§M24 COMPLETE: a network that can hold more than one
+  conversation (DOCS §4.59, all three arches).**  The stack's second half:
+  a bounded TCP connection table with four-tuple demultiplexing, a server role
+  (listen/accept, RST for an unclaimed segment), per-connection receive ring +
+  send buffer, RTO retransmission with zero-window probing, DHCP, /proc/net,
+  the socket ABI as canonical §M50 operations with ONE sockaddr marshaller for
+  three arches, and a virtio-mmio NIC for aarch64 — which is what finally made
+  "the portable stack is in the ARM build" mean the ARM build runs it.  A
+  LOOPBACK device with deliberate frame loss (`lo drop`) is what made any of it
+  testable: the server half cannot be reached through SLIRP at all without a
+  hostfwd rule the automated runs do not have.  Measured on i386, x86_64 and
+  aarch64: 8 concurrent connections; 32 KiB through a 10 % loss link intact and
+  in order; bind/listen/accept/getpeername/shutdown through an unmodified musl
+  binary.  Three bugs found, each presenting as "the network is slow" — a
+  window update that did not restart the sender, a probe byte that dug a
+  sequence hole, and a FIN declared acknowledged because its position was
+  inferred from a value a retransmission moves.  The lesson that carried them
+  all: **instrumentation found them and inspection did not** — splitting the
+  test's wall clock into recv/asleep/send, and dumping the connection table at
+  the moment of the stall rather than after it.
 
 - **2026-08-06** — **§M49 SHIPPED: load distribution across CPUs, measured
   (DOCS §4.46, i386 + x86_64, aarch64 builds).**  §M18.6.1's load balancer ran

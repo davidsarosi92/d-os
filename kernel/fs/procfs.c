@@ -159,13 +159,58 @@ static const struct file_ops procfs_file_ops = {
 static struct procfs_node* pending_head = NULL;
 static struct dentry*      proc_dir     = NULL;
 
+/* A registered name may contain ONE slash, which makes it a file inside a
+ * subdirectory of /proc — `net/tcp` becomes /proc/net/tcp.
+ *
+ * Added for §M24: the network's diagnostics are several files about one
+ * subsystem, and Linux's own answer to that — the /proc/net directory — is a
+ * path everybody already knows.  Flattening them into proc_net_tcp would
+ * have worked and
+ * would have taught a reader a private convention for no reason.  One level is
+ * all that is offered — anything deeper wants a real tree, and there is
+ * nothing yet that needs one. */
+static struct dentry* proc_subdir(const char* name, size_t n) {
+    for (struct dentry* d = proc_dir ? proc_dir->children : NULL; d; d = d->sibling) {
+        size_t i = 0;
+        while (i < n && d->name[i] && d->name[i] == name[i]) i++;
+        if (i == n && d->name[i] == '\0') return d;
+    }
+    struct inode* ino = (struct inode*)kcalloc(1, sizeof(struct inode));
+    if (!ino) return NULL;
+    ino->type = INODE_DIR;
+    /* Borrow /proc's OWN directory operations.  A directory inode with no ops
+     * can be walked (lookup follows dentry children, so `cat /proc/net/tcp`
+     * works) but cannot be LISTED — `ls /proc/net` answered "readdir failed",
+     * which is the shape of bug that gets called a filesystem mystery: the
+     * file is there and the directory is empty. */
+    if (proc_dir && proc_dir->inode) ino->ops = proc_dir->inode->ops;
+    char buf[32];
+    size_t i = 0;
+    for (; i < n && i < sizeof buf - 1; i++) buf[i] = name[i];
+    buf[i] = '\0';
+    struct dentry* d = vfs_attach_child(proc_dir, buf, ino);
+    if (!d) { kfree(ino); return NULL; }
+    return d;
+}
+
 static int attach_node(struct procfs_node* node) {
+    struct dentry* parent = proc_dir;
+    const char* leaf = node->name;
+    for (const char* p = node->name; *p; p++) {
+        if (*p == '/') {
+            parent = proc_subdir(node->name, (size_t)(p - node->name));
+            leaf   = p + 1;
+            break;
+        }
+    }
+    if (!parent || !*leaf) return -3;
+
     struct inode* ino = (struct inode*)kcalloc(1, sizeof(struct inode));
     if (!ino) return -1;
     ino->type    = INODE_FILE;
     ino->ops     = &procfs_file_ops;
     ino->private = node;
-    if (!vfs_attach_child(proc_dir, node->name, ino)) {
+    if (!vfs_attach_child(parent, leaf, ino)) {
         kfree(ino);
         return -2;
     }

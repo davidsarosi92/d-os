@@ -525,83 +525,53 @@ static const uint8_t socketcall_nargs[] = {
 static long linux_socketcall_k(int call, const uint32_t* a) {
     if (call < 0 || call >= (int)(sizeof socketcall_nargs / sizeof socketcall_nargs[0]))
         return -LNX_EINVAL;
+
+    /* §M24 — THE DEMULTIPLEXER, and nothing else.
+     *
+     * i386 is the only architecture that packs the whole socket API behind one
+     * syscall number, and that is a CALLING CONVENTION, not a different set of
+     * operations.  So this function's entire job is to turn a sub-call number
+     * into a canonical operation and hand the already-fetched argument words to
+     * the same shared handler amd64 and arm64 reach directly.  What used to be
+     * here — sockaddr conversion, flag stripping, the socklen dance — is in
+     * kernel/core/abi_engine.c now, written once. */
+    static const uint16_t op_of[] = {
+        [LSOC_SOCKET]      = ABI_SOCKET,
+        [LSOC_BIND]        = ABI_BIND,
+        [LSOC_CONNECT]     = ABI_CONNECT,
+        [LSOC_LISTEN]      = ABI_LISTEN,
+        [LSOC_ACCEPT]      = ABI_ACCEPT,
+        [LSOC_GETSOCKNAME] = ABI_GETSOCKNAME,
+        [LSOC_GETPEERNAME] = ABI_GETPEERNAME,
+        [LSOC_SEND]        = ABI_SEND,
+        [LSOC_RECV]        = ABI_RECV,
+        [LSOC_SENDTO]      = ABI_SENDTO,
+        [LSOC_RECVFROM]    = ABI_RECVFROM,
+        [LSOC_SHUTDOWN]    = ABI_SHUTDOWN,
+        [LSOC_SETSOCKOPT]  = ABI_SETSOCKOPT,
+        [LSOC_GETSOCKOPT]  = ABI_GETSOCKOPT,
+    };
+    if (call < (int)(sizeof op_of / sizeof op_of[0]) && op_of[call]) {
+        struct abi_ctx c;
+        for (int i = 0; i < 6; i++) c.a[i] = (unsigned long)a[i];
+        c.nr  = LNX_socketcall;
+        c.map = &abi_map_linux_i386;
+        long out = -LNX_ENOSYS;
+        if (abi_invoke((enum abi_op)op_of[call], &c, &out)) return out;
+        return -LNX_ENOSYS;
+    }
+
     switch (call) {
-        case LSOC_SOCKET: {
-            int domain = (int)a[0];
-            int type   = (int)a[1] & 0xFF;      /* strip SOCK_CLOEXEC/NONBLOCK */
-            int proto  = (int)a[2];
-            if (domain != AF_INET) return -LNX_EAFNOSUPPORT;
-            int fd = sys_socket(domain, type, proto);
-            if (fd < 0) return -LNX_EOPNOTSUPP;
-            /* SOCK_NONBLOCK is NOT decoration: musl's resolver drains its socket
-             * with `while (recvmsg(...) >= 0)` and needs the EAGAIN only a
-             * non-blocking socket produces. */
-            if ((int)a[1] & LSOCK_NONBLOCK) sys_socket_setnonblock(fd, 1);
-            return fd;
-        }
-        case LSOC_BIND: {
-            int fd = (int)a[0];
-            uint32_t ip; int port;
-            if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)a[1], &ip, &port) != 0)
-                return -LNX_EAFNOSUPPORT;
-            return sys_bind(fd, port) == 0 ? 0 : -1;
-        }
-        case LSOC_CONNECT: {
-            int fd = (int)a[0];
-            uint32_t ip; int port;
-            if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)a[1], &ip, &port) != 0)
-                return -LNX_EAFNOSUPPORT;
-            return sys_connect(fd, ip, port) == 0 ? 0 : -1;
-        }
-        case LSOC_SEND:                            /* send == sendto(NULL dest) */
-            return sys_write((int)a[0], (const void*)a[1], (size_t)a[2]);
-        case LSOC_RECV:                            /* recv == recvfrom(NULL src) */
-            return sys_read((int)a[0], (void*)a[1], (size_t)a[2]);
-        case LSOC_SENDTO: {
-            int fd = (int)a[0];
-            const void* buf = (const void*)a[1];
-            size_t len = (size_t)a[2];
-            const struct lnx_sockaddr_in* dst = (const struct lnx_sockaddr_in*)a[4];
-            if (!dst) return sys_write(fd, buf, len);   /* connected stream */
-            uint32_t ip; int port;
-            if (sockaddr_to_hostorder(dst, &ip, &port) != 0) return -LNX_EAFNOSUPPORT;
-            return sys_sendto(fd, buf, len, ip, port);
-        }
-        case LSOC_RECVFROM: {
-            int fd = (int)a[0];
-            void* buf = (void*)a[1];
-            size_t len = (size_t)a[2];
-            struct lnx_sockaddr_in* src = (struct lnx_sockaddr_in*)a[4];
-            uint32_t* uaddrlen = (uint32_t*)a[5];
-            uint32_t ip = 0; int port = 0;
-            long n = sys_recvfrom_u(fd, (uintptr_t)buf, len, &ip, &port);
-            if (n >= 0 && src) {
-                /* HERE the socklen_t is the CLIENT's, so it is validated here —
-                 * the helper itself takes a kernel word (see its header). */
-                uint32_t room = (uint32_t)sizeof(struct lnx_sockaddr_in);
-                if (uaddrlen) {
-                    if (!lnx_w_ok((uintptr_t)uaddrlen, sizeof *uaddrlen)) return -LNX_EFAULT;
-                    room = *uaddrlen;
-                }
-                hostorder_to_sockaddr(src, &room, ip, port);
-                if (uaddrlen) *uaddrlen = room;
-            }
-            return n;
-        }
+        /* These two stay here: they carry CONTROL MESSAGES and file
+         * descriptors (SCM_RIGHTS — what Wayland runs on), whose `struct
+         * msghdr` is a row of guest-width words rather than a fixed 16-byte
+         * address.  That marshalling has not been solved once yet, and moving
+         * it half-solved would trade a duplicated implementation for a subtly
+         * wrong one. */
         case LSOC_SENDMSG:
             return linux_sendmsg((int)a[0], (const struct lnx_msghdr*)a[1], (int)a[2]);
         case LSOC_RECVMSG:
             return linux_recvmsg((int)a[0], (struct lnx_msghdr*)a[1], (int)a[2]);
-        case LSOC_SHUTDOWN:
-            return 0;                              /* close() does the teardown */
-        case LSOC_SETSOCKOPT:
-        case LSOC_GETSOCKOPT:
-            /* No socket options are honoured yet; report success so musl's
-             * getaddrinfo/TLS setup (SO_RCVTIMEO, TCP_NODELAY…) proceeds. */
-            return 0;
-        case LSOC_GETSOCKNAME:
-        case LSOC_GETPEERNAME:
-            return -LNX_EOPNOTSUPP;
         default:
             kprintf("linux-abi: unhandled socketcall %d\n", call);
             return -LNX_ENOSYS;
@@ -997,33 +967,15 @@ static void linux_syscall_body(struct int_frame* f) {
             f->eax = (uint32_t)linux_socketcall((int)f->ebx, (const uint32_t*)f->ecx);
             return;
 
-        /* Direct socket syscalls: repack the register args into the socketcall
-         * array shape and reuse the ONE translator (ebx/ecx/edx/esi/edi/ebp). */
-        case LNX_socket:      case LNX_bind:       case LNX_connect:
-        case LNX_getsockopt:  case LNX_setsockopt: case LNX_getsockname:
-        case LNX_getpeername: case LNX_sendto:     case LNX_recvfrom:
-        case LNX_sendmsg:     case LNX_recvmsg:
-        case LNX_shutdown: {
-            static const struct { uint32_t nr; int call; } map[] = {
-                { LNX_socket,      LSOC_SOCKET      },
-                { LNX_bind,        LSOC_BIND        },
-                { LNX_connect,     LSOC_CONNECT     },
-                { LNX_getsockopt,  LSOC_GETSOCKOPT  },
-                { LNX_setsockopt,  LSOC_SETSOCKOPT  },
-                { LNX_getsockname, LSOC_GETSOCKNAME },
-                { LNX_getpeername, LSOC_GETPEERNAME },
-                { LNX_sendto,      LSOC_SENDTO      },
-                { LNX_recvfrom,    LSOC_RECVFROM    },
-                { LNX_sendmsg,     LSOC_SENDMSG     },
-                { LNX_recvmsg,     LSOC_RECVMSG     },
-                { LNX_shutdown,    LSOC_SHUTDOWN    },
-            };
+        /* Direct socket syscalls (359+) are canonical operations now and are
+         * answered by the engine above, from this arch's number map.  The two
+         * that are not — sendmsg/recvmsg — still repack their register
+         * arguments into the socketcall array shape so both spellings reach
+         * one implementation. */
+        case LNX_sendmsg:
+        case LNX_recvmsg: {
             uint32_t args[6] = { f->ebx, f->ecx, f->edx, f->esi, f->edi, f->ebp };
-            int call = -1;
-            for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
-                if (map[i].nr == f->eax) { call = map[i].call; break; }
-            /* `args` is OUR array (built from registers), so the core is the
-             * right entry — the gated wrapper would reject a kernel pointer. */
+            int call = (f->eax == LNX_sendmsg) ? LSOC_SENDMSG : LSOC_RECVMSG;
             f->eax = (uint32_t)linux_socketcall_k(call, args);
             return;
         }

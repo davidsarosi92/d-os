@@ -13,10 +13,96 @@ GDT / IDT / paging → talks to a 1280×800 framebuffer with an embedded
 boot-HID keyboards → ramfs + devfs + procfs mounted at
 `/`, `/dev`, `/proc` → preemptive round-robin scheduler with ring-3
 syscalls via `int 0x80` → virtio-blk block device exposed as
-`/dev/vda` → exFAT mountable as `/mnt` → screen split into multiple
-shell panes (Alt-N to focus, `pane split h|v` to split).
+`/dev/vda` → exFAT mountable as `/mnt` → a TCP/IP stack with a real
+connection table, a server role and DHCP over virtio-net + a loopback
+(`/proc/net/*`) → screen split into multiple shell panes (Alt-N to
+focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
+
+✅ **§M24 COMPLETE — A NETWORK THAT CAN HOLD MORE THAN ONE CONVERSATION
+(2026-08-15, DOCS §4.59, all 3 arches).**  §M24's first stages shipped a NIC and
+a TCP/IP stack in July; §M55 made waiting free; §M56 built poll and epoll —
+**machinery for watching many descriptors at once, over a transport that held
+ONE TCP connection in one file-scope struct**, could not accept an incoming one
+at all, and forgot every byte the moment it left.  NOW: a bounded **connection
+table** (32 entries, four-tuple demux with the LISTEN entry as the FALLBACK
+match — the order is load-bearing, since a listener and its accepted children
+share a local port), per-connection **receive RING** (so the free space it
+implies IS the advertised window, instead of a constant that stopped being true
+at 16 KiB) + **send buffer** with segmentation, RFC 793 states through
+TIME_WAIT, **listen/accept** with a bounded backlog, and an **RST for a segment
+belonging to no connection** — which is why a closed port now fails fast instead
+of at the timeout.  The table is STATIC because connections are created on the
+RX path under the stack lock with interrupts off, where an allocator call would
+nest the heap's lock inside the network's on the one path that must not fail.
+**A LOOPBACK DEVICE MADE ANY OF THIS TESTABLE** — the server half cannot be
+reached through SLIRP without a hostfwd rule the automated runs do not have, and
+a test that needs the host's network reports the host's network.  It is a real
+device (full IPv4/TCP output path → queue → `net_rx`; the queue is what stops
+transmit from re-entering the stack with a lock on every frame), and `lo drop
+<permille>` makes it lose frames ON PURPOSE: *the retransmit timer was written
+AFTER the link learned to lose things, because a timer nothing can falsify is
+not a feature.*  `tcptest` was likewise checked against a deliberately shrunken
+table (2 entries → 0/4 clients, FAIL) before being believed about the real one.
+**THREE BUGS, EACH PRESENTING AS "THE NETWORK IS SLOW":** (1) an ACK that only
+WIDENS the window carries the same acknowledgement number, so reacting to it
+only inside the "new data acked" branch left the sender stopped; (2) a
+zero-window probe that OCCUPIES a sequence number digs a hole exactly when the
+receiver has no room to fill it, and only the RTO repairs it; (3) **a FIN whose
+sequence number was inferred from `snd_nxt`** — a retransmission rolls
+`snd_nxt` BACK, after which an ACK covering only the data satisfied "have they
+acknowledged my FIN?": sender in FIN_WAIT_2, receiver still ESTABLISHED, every
+byte delivered, and the reader blocked until its timeout.  *Do not derive a
+fact from a value that moves — record the FIN's own sequence number.*  **WHAT
+FOUND ALL THREE WAS INSTRUMENTATION, NOT INSPECTION:** splitting the test's wall
+clock into time-in-recv / asleep / in-send turned 8.5 s of mystery into "the
+33rd read waited 8 s", and printing the connection table AT THE MOMENT OF THE
+STALL named the last one in a single line — after two theories the measurements
+had already excluded.  Also: **a counter that lives on an object cannot measure
+a period longer than the object** (the loss test summed per-connection retransmit
+counts and read 0 while 7 timeouts had fired).  **THE SOCKET ABI IS §M50
+OPERATIONS NOW** — 15 canonical ops, ONE `sockaddr_in` marshaller for three
+arches (and unlike `epoll_event` it really is the same everywhere, which is
+worth stating so nobody hunts for the per-arch case), i386's `socketcall(102)`
+reduced to a demultiplexer into those same handlers, the per-arch copies DELETED
+(§M56.1's rule), and `shutdown` promoted from `return 0` to a real half-close.
+**i386's socket numbers are not sequential by name** (360 is `socketpair`,
+between `socket` and `bind`) and reciting them put `connect`'s handler on bind's
+number — the symptom was a bind failing with ECONNREFUSED, the one errno that
+names the handler that actually ran: *syscall numbers are data; copy them, do
+not recall them.*  Plus **DHCP** (address/mask/router/nameserver, T1 renewal via
+a §M49 worker because a ktimer callback may not send and wait), **/proc/net/**
+{dev,arp,route,tcp,stat} (procfs learned one-level subdirectories), and **a
+virtio-mmio NIC for aarch64** — the open item that had let every network feature
+ship untested on a third of the targets.  **MEASURED on i386 + x86_64 +
+aarch64: 8 concurrent connections; 32 KiB through a 10 % loss link intact and in
+order; bind/listen/accept/getpeername/shutdown through an UNMODIFIED musl
+binary.**  New: `tcptest`, `tcploss`, `netstat`, `lo drop`, `dhcp` (in BOTH
+shells — they live in `kernel/core/net_cmds.c`, not in a shell, because a test
+that lives in one shell can only run on the arches that build it), and
+`scripts/dos-shell-test.py` (boot headless, type commands, capture serial — the
+harness every earlier milestone rebuilt by hand).  **AND IT FOUND A LIVE REGRESSION IN THE TWO MILESTONES BEFORE IT** — the one
+the user actually reported ("web pages do not come up"): **§M55** made netd run
+only while somebody waits for the network; **§M56** made a finite `poll()`
+timeout a REAL wait.  Neither knew about the other, so **a task polling a
+SOCKET was a waiter nobody counted** — the poller stayed parked, no frame was
+collected, and the wait ran to its deadline with the answer sitting in the NIC.
+musl's resolver sends and then polls, so **nothing in ring 3 could resolve a
+name** (`wget`, NetSurf's fetcher) while `nettest` passed throughout, because
+the KERNEL resolver waits through `net_wait_cond` and counts itself.  *Two
+changes, each correct, each verified, composing into a bug that only the path a
+PROGRAM takes could reveal.*  Fixed by two contracts: a readiness wait that
+touched a socket registers as a network waiter (`net_waiter_enter/leave`), and
+a pump that delivered frames wakes the readiness queue too — **after** dropping
+the stack lock, since a poll waiter holds the readiness queue while its scan
+takes the stack lock and the other order deadlocks.  Verified end to end: HTTP
+and HTTPS (TLS 1.3) through musl `wget`, and NetSurf fetching example.com
+(`HTTP 200, 571 body bytes`).  **OPEN:** no reassembly queue
+(out-of-order segments are dropped + dup-ACKed), no congestion control (the
+peer's window is the only limit), a fixed 200 ms RTO (an estimator would measure
+the emulator), the ARM NIC is polled, and `sendmsg`/`recvmsg` stay per-arch
+(their `msghdr` is guest-width words, not a fixed address).
 
 ✅ **§M57 — A TASK IS NOT DEAD WHILE IT IS STILL RUNNING (2026-08-12, DOCS
 §4.58, all 3 arches).**  §M54's three open items, closed.  Its own notes ended
@@ -1167,9 +1253,11 @@ until POSIX + libc exist.**
 - **M23** — Audio — ✅ stage 1 shipped (i386, DOCS §4.26): AC97 PCM output +
   tone (`lsaudio`/`beep`/`tone`).  Open: WAV player, /dev/dsp, mixer, input,
   HDA, x86_64/aarch64.
-- **M24** — Network — ✅ stages 1–3 shipped (i386, DOCS §4.25): virtio-net +
-  ARP/IPv4/ICMP/UDP/TCP + DNS + ping/nslookup/wget.  Open: socket syscall API
-  to userland, IRQ RX, TCP timers/server, DHCP, IPv6, x86_64/aarch64.
+- **M24** — Network — ✅ **COMPLETE** (DOCS §4.25 + §4.59, all 3 arches):
+  virtio-net (PCI + virtio-mmio) + loopback + routing, ARP/IPv4/ICMP/UDP/TCP
+  with a real connection table, listen/accept, retransmission, DHCP, /proc/net,
+  and the socket ABI as shared §M50 operations.  Open: reassembly queue,
+  congestion control, RTT-estimated RTO, an interrupt for the ARM NIC, IPv6.
 - **§M19.5.1 i386 kmap** — the deferred half of HIGHMEM: real
   kmap-style temp mappings so i386 can manage > 256 MiB of RAM.
 - **§M19.5.3 per-NUMA-node PMM zones** — the deferred deeper half
@@ -1352,7 +1440,13 @@ Block / USB drivers are i386-only today; x86_64 boots without them
   - Flip the PLAN.md status table row to ✅ and condense the design
     section to a one-paragraph "Shipped, see DOCS.md §…" pointer.
   - Bump `DOS_MILESTONE` in `kernel/includes/version.h` to the new M number
-    (the desktop wallpaper draws it — always show the latest shipped milestone).
+    (the desktop wallpaper draws it — always show the latest shipped milestone)
+    **and clear `DOS_MILESTONE_NOTE`**, whose whole job is to name an OLDER
+    section finished after that number shipped (`M57 (updated M24)`); once a
+    newer number exists the note is advertising old work as fresh.  A shared
+    header, so `make clean ARCH=<arch>` — the label is drawn from a constant
+    compiled into gui.c, and a rebuilt kernel with a stale gui.o shows the old
+    string while every source file says otherwise.
 - **Boot-test in QEMU** before claiming done.  For most milestones a
   sendkey-driven script + `-serial file:` capture is enough; for the
   framebuffer text path, `pmemsave 0xb8000` + a small Python script

@@ -128,6 +128,35 @@ enum abi_op {
      * inside — and it is the only way to assert that the mask DEFERS. */
     ABI_SIGPENDING,
 
+    /* §M24 second half — the BSD socket surface.
+     *
+     * These arrive one operation per number on amd64 and arm64, and on i386
+     * both as direct numbers AND multiplexed through `socketcall(102)`; the
+     * i386 shim demultiplexes into exactly these ops, so there is one
+     * implementation rather than one per calling convention.
+     *
+     * ACCEPT and ACCEPT4 are SEPARATE ops although accept4 is accept plus a
+     * flag word, and SEND/SENDTO likewise.  The reason is arity: the arch shim
+     * fills all six argument slots from registers, so a handler that reads a
+     * fourth argument a three-argument call never passed reads whatever the
+     * guest happened to leave there.  One op per ARITY is the only version
+     * that cannot silently take a garbage flag word for an instruction. */
+    ABI_SOCKET,
+    ABI_BIND,
+    ABI_CONNECT,
+    ABI_LISTEN,
+    ABI_ACCEPT,
+    ABI_ACCEPT4,
+    ABI_GETSOCKNAME,
+    ABI_GETPEERNAME,
+    ABI_SEND,
+    ABI_SENDTO,
+    ABI_RECV,
+    ABI_RECVFROM,
+    ABI_SHUTDOWN,
+    ABI_SETSOCKOPT,
+    ABI_GETSOCKOPT,
+
     ABI_OP_MAX
 };
 

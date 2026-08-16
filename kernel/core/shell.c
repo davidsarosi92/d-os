@@ -32,6 +32,8 @@
 #include "block.h"
 #include "block_cache.h"
 #include "net.h"
+#include "dhcp.h"
+#include "net_cmds.h"
 #include "audio.h"
 #include "pkg.h"
 #include "wayland.h"
@@ -135,7 +137,12 @@ static void cmd_help(void) {
                   "  schedstorm [rounds]    (affinity+nice churn, audited)\n"
                   "  timerfdtest [ms], alarmtest [ms] (timing, M53 stage 3)\n"
                   "  netstorm [n] (n tasks waiting on the network at once)\n"
+                  "  tcptest [n] (echo server + n concurrent clients over lo)\n"
+                  "  netstat (the TCP connection table), lo drop <permille>\n"
+                  "  dhcp [dev|status] (ask the network for an address)\n"
+                  "  tcploss [permille] [kb] (a stream that survives loss)\n"
                   "  epolltest, epollmusltest (readiness sets, M56)\n"
+                  "  netmuslserv (bind/listen/accept through real musl)\n"
                   "  fputest (per-task FP/SIMD register file)\n"
                   "  archtest (ELF arch gate), crash (what has gone wrong)\n"
                   "  pane, pane split horizontal|vertical\n"
@@ -1928,9 +1935,6 @@ static void cmd_pane(struct vc* my_vc, const char* args) {
 
 /* `ping <ip> [count]` — ARP-resolve then ICMP-echo the target. */
 static void cmd_ping(const char* args) {
-    struct net_device* dev = net_primary();
-    if (!dev) { console_write("ping: no network device (no virtio-net?)\n"); return; }
-
     /* Parse "<ip>" and an optional trailing count. */
     char ipbuf[32]; int i = 0;
     while (args[i] && args[i] != ' ' && i < 31) { ipbuf[i] = args[i]; i++; }
@@ -1939,6 +1943,12 @@ static void cmd_ping(const char* args) {
 
     uint32_t ip;
     if (net_parse_ip(ipbuf, &ip) != 0) { console_write("ping: bad IP\n"); return; }
+
+    /* §M24.8 — the device follows from the DESTINATION now, not from "the only
+     * one we have": 127.0.0.1 must go to `lo` even on a box that also has a
+     * NIC, and on a box with no NIC at all it is the only reachable address. */
+    struct net_device* dev = net_route(ip);
+    if (!dev) { console_write("ping: no route to host\n"); return; }
 
     int count = 3;
     while (args[i] == ' ') i++;
@@ -1951,10 +1961,10 @@ static void cmd_ping(const char* args) {
 
 /* `arp <ip>` — resolve and print the MAC. */
 static void cmd_arp(const char* args) {
-    struct net_device* dev = net_primary();
-    if (!dev) { console_write("arp: no network device\n"); return; }
     uint32_t ip;
     if (net_parse_ip(args, &ip) != 0) { console_write("usage: arp <ip>\n"); return; }
+    struct net_device* dev = net_route(ip);
+    if (!dev) { console_write("arp: no route to host\n"); return; }
     uint8_t mac[6];
     if (net_arp_resolve(dev, ip, mac) == 0) {
         char ipb[16], macb[18]; net_fmt_ip(ip, ipb); net_fmt_mac(mac, macb);
@@ -3068,6 +3078,8 @@ static void cmd_linuxtest(void) {
 
 /* M36 stage 2 — `musltest`: run a REAL, unmodified musl-linked ELF under the
  * Linux personality.  Embedded only when `make musl` produced the binary. */
+extern const unsigned char _binary_user_netmuslserv_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_netmuslserv_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_epollmusl_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_epollmusl_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_muslhello_muslelf_start[] __attribute__((weak));
@@ -3131,6 +3143,24 @@ static void cmd_epollmusltest(void) {
     int rc = proc_exec_elf(a, (unsigned long)(b - a));
     if (me) me->linux_abi = prev;
     kprintf("epollmusl: returned rc=%d\n", rc);
+}
+
+/* §M24 — `netmuslserv`: the SERVER socket API through an unmodified musl
+ * binary.  `tcptest` proves the stack; this proves the ABI — sockaddr_in in
+ * network byte order, socklen_t in and out, accept/getpeername agreeing, and
+ * a shutdown that really sends a FIN.  One program, and it runs on all three
+ * architectures because the handlers behind it are shared (§M50). */
+static void cmd_netmuslserv(void) {
+    const unsigned char* a = _binary_user_netmuslserv_muslelf_start;
+    const unsigned char* b = _binary_user_netmuslserv_muslelf_end;
+    if (!a || !b) { console_write("netmuslserv: not embedded for this arch\n"); return; }
+    console_write("netmuslserv: exec'ing a REAL musl binary (Linux personality)...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(a, (unsigned long)(b - a));
+    if (me) me->linux_abi = prev;
+    kprintf("netmuslserv: returned rc=%d\n", rc);
 }
 
 static void cmd_musltest(void) {
@@ -3966,6 +3996,17 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "netsurf"))        { cmd_netsurf(""); return; }
     if (starts_with(line, "netsurf ")) { cmd_netsurf(line + 8); return; }
     if (streq(line, "nettest"))        { cmd_nettest();  return; }
+    /* §M24 — these live in kernel/core/net_cmds.c so the AArch64 serial shell
+     * runs the SAME tests rather than a second copy of them. */
+    if (streq(line, "dhcp"))           { netcmd_dhcp("");   return; }
+    if (starts_with(line, "dhcp "))    { netcmd_dhcp(line + 5); return; }
+    if (streq(line, "netstat"))        { netcmd_netstat();  return; }
+    if (streq(line, "tcptest"))        { netcmd_tcptest(""); return; }
+    if (starts_with(line, "tcptest ")) { netcmd_tcptest(line + 8); return; }
+    if (streq(line, "tcploss"))        { netcmd_tcploss(""); return; }
+    if (starts_with(line, "tcploss ")) { netcmd_tcploss(line + 8); return; }
+    if (streq(line, "lo"))             { netcmd_lo("");     return; }
+    if (starts_with(line, "lo "))      { netcmd_lo(line + 3); return; }
     if (streq(line, "netstorm"))       { cmd_netstorm(""); return; }
     if (starts_with(line, "netstorm ")) { cmd_netstorm(line + 9); return; }
     if (streq(line, "lsaudio"))        { audio_list();   return; }
@@ -3982,6 +4023,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "timerfdtest"))    { cmd_timerfdtest("");      return; }
     if (streq(line, "epolltest"))      { cmd_epolltest();          return; }
     if (streq(line, "epollmusltest"))  { cmd_epollmusltest();      return; }
+    if (streq(line, "netmuslserv"))    { cmd_netmuslserv();        return; }
     if (starts_with(line, "timerfdtest ")) { cmd_timerfdtest(line + 12); return; }
     if (streq(line, "alarmtest"))      { cmd_alarmtest("");        return; }
     if (starts_with(line, "alarmtest ")) { cmd_alarmtest(line + 10); return; }

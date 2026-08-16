@@ -279,7 +279,23 @@ static void syscall_dispatch_body(struct int_frame* f) {
             f->rax = (uint64_t)sys_socket((int)f->rbx, (int)f->rcx, (int)f->rdx);
             return;
         case SYS_BIND:
-            f->rax = (uint64_t)sys_bind((int)f->rbx, (int)f->rcx);
+            f->rax = (uint64_t)sys_bind((int)f->rbx, (uint32_t)f->rcx, (int)f->rdx);
+            return;
+        /* §M24.10 — the server half. */
+        case SYS_LISTEN:
+            f->rax = (uint64_t)sys_listen((int)f->rbx, (int)f->rcx);
+            return;
+        case SYS_ACCEPT:
+            f->rax = (uint64_t)sys_accept((int)f->rbx, (uint32_t*)(uintptr_t)f->rcx,
+                                          (int*)(uintptr_t)f->rdx);
+            return;
+        case SYS_GETSOCKNAME:
+            f->rax = (uint64_t)sys_getsockname((int)f->rbx, (uint32_t*)(uintptr_t)f->rcx,
+                                               (int*)(uintptr_t)f->rdx);
+            return;
+        case SYS_GETPEERNAME:
+            f->rax = (uint64_t)sys_getpeername((int)f->rbx, (uint32_t*)(uintptr_t)f->rcx,
+                                               (int*)(uintptr_t)f->rdx);
             return;
         case SYS_CONNECT:
             f->rax = (uint64_t)sys_connect((int)f->rbx, (uint32_t)f->rcx, (int)f->rdx);

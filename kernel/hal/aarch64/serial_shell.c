@@ -19,6 +19,8 @@
  * ============================================================================= */
 
 #include "printf.h"
+#include "net.h"
+#include "net_cmds.h"
 #include "pmm.h"
 #include "task.h"
 #include "percpu.h"    /* §M57 — smp_ncpus() for the runqueue audit + storm */
@@ -104,7 +106,35 @@ static void cmd_help(void) {
             "  pkgrun <n> [args] run a store package (§A3)\n"
             "  rqcheck           check the runqueue invariant now (§M57)\n"
             "  schedstorm [n]    affinity+nice churn, audited (§M57)\n"
+            "  lsnic             network devices + poller stats (§M24)\n"
+            "  ping <ip> [n]     ICMP echo (127.0.0.1 works with no NIC)\n"
+            "  netstat           the TCP connection table (§M24)\n"
+            "  tcptest [n]       echo server + n concurrent clients over lo\n"
+            "  tcploss [pm] [kb] a stream that survives a lossy link\n"
+            "  dhcp [status]     ask the network for an address (§M24)\n"
+            "  netmuslserv       bind/listen/accept through real musl (§M24)\n"
             "  clear             clear the screen\n");
+}
+
+/* §M24 — `ping <ip> [count]`.  The route decides the device, so 127.0.0.1
+ * works on a board with no NIC attached at all — which is the usual headless
+ * ARM run, and the reason this is worth having here. */
+static void cmd_ping(char* args) {
+    while (*args == ' ') args++;
+    char ip[32]; int i = 0;
+    while (args[i] && args[i] != ' ' && i < 31) { ip[i] = args[i]; i++; }
+    ip[i] = '\0';
+    if (!i) { kprintf("usage: ping <ip> [count]\n"); return; }
+    uint32_t a;
+    if (net_parse_ip(ip, &a) != 0) { kprintf("ping: bad IP\n"); return; }
+    int count = 3;
+    while (args[i] == ' ') i++;
+    if (args[i]) { int c = 0;
+        for (int j = i; args[j] >= '0' && args[j] <= '9'; j++) c = c * 10 + (args[j] - '0');
+        if (c > 0 && c <= 16) count = c; }
+    struct net_device* dev = net_route(a);
+    if (!dev) { kprintf("ping: no route to host\n"); return; }
+    net_ping(dev, a, count);
 }
 
 /* Phase L — the EL0/userspace self-test (syscall.c), the ARM analogue of the
@@ -446,6 +476,24 @@ static void cmd_epollmusltest(void) {
     kprintf("epollmusl: returned rc=%d\n", rc);
 }
 
+/* §M24 — the socket ABI through an unmodified musl binary, on ARM.  The same
+ * program the x86 shells run: the handlers behind it are shared (§M50), so
+ * this is the claim that a new architecture costs a table and not a port. */
+extern const unsigned char _binary_user_netmuslserv_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_netmuslserv_muslelf_end[]   __attribute__((weak));
+static void cmd_netmuslserv(void) {
+    const unsigned char* a = _binary_user_netmuslserv_muslelf_start;
+    const unsigned char* b = _binary_user_netmuslserv_muslelf_end;
+    if (!a || !b) { kprintf("netmuslserv: not embedded for this arch\n"); return; }
+    kprintf("netmuslserv: exec'ing a REAL musl binary (Linux/arm64 personality)...\n");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(a, (unsigned long)(b - a));
+    if (me) me->linux_abi = prev;
+    kprintf("netmuslserv: returned rc=%d\n", rc);
+}
+
 static void cmd_meminfo(void) {
     uint32_t managed = pmm_managed_frames();
     uint32_t freef   = pmm_free_frames();
@@ -609,8 +657,17 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "sigtest"))  cmd_sigtest();
         else if (s_eq(cmd, "musltest")) cmd_musltest();
         else if (s_eq(cmd, "epollmusltest")) cmd_epollmusltest();
+        else if (s_eq(cmd, "netmuslserv"))   cmd_netmuslserv();
         else if (s_eq(cmd, "pkgrun"))   cmd_pkgrun(args);
         else if (s_eq(cmd, "pkg"))      cmd_pkg(args);
+        /* §M24 — the same implementations the x86 shell runs (net_cmds.c). */
+        else if (s_eq(cmd, "lsnic"))    net_list();
+        else if (s_eq(cmd, "ping"))     cmd_ping(args);
+        else if (s_eq(cmd, "netstat"))  netcmd_netstat();
+        else if (s_eq(cmd, "tcptest"))  netcmd_tcptest(args);
+        else if (s_eq(cmd, "tcploss"))  netcmd_tcploss(args);
+        else if (s_eq(cmd, "lo"))       netcmd_lo(args);
+        else if (s_eq(cmd, "dhcp"))     netcmd_dhcp(args);
         else if (s_eq(cmd, "clear"))  kprintf("\033[2J\033[H");
         else kprintf("unknown command '%s' (try 'help')\n", cmd);
     }

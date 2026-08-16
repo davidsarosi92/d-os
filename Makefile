@@ -67,7 +67,7 @@ MUSL_COREUTIL_BLOBS := $(patsubst %,user/%_muslblob.o,$(MUSL_COREUTILS))
 # test for "the chrome still works when the app behind it is frozen".
 MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o \
                    user/wedgewin_muslblob.o user/pthreadtest_muslblob.o \
-                   user/epollmusl_muslblob.o
+                   user/epollmusl_muslblob.o user/netmuslserv_muslblob.o
 # §M37 dynamic-linking artifacts — the ld.so blob + the dynamically linked tests.
 MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
                    user/libgreet_blob.o user/solibtest_dynblob.o \
@@ -530,6 +530,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/fpu.c \
       kernel/hal/aarch64/pci.c \
       kernel/hal/aarch64/virtio_mmio_blk.c \
+    kernel/hal/aarch64/virtio_mmio_net.c \
       kernel/hal/aarch64/virtio_gpu.c \
       kernel/hal/aarch64/virtio_input.c \
       kernel/hal/aarch64/pl031_rtc.c \
@@ -551,6 +552,7 @@ else ifeq ($(ARCH),aarch64)
                      user/forktest_blob.o user/pipetest_blob.o \
                      user/sigtest_blob.o user/muslhello_muslblob.o \
                      user/epollmusl_muslblob.o \
+                     user/netmuslserv_muslblob.o \
                      $(MUSL_COREUTIL_BLOBS)
 
   # Tier B — in-tree user libc build knobs (aarch64).  Uses the cross toolchain
@@ -663,7 +665,10 @@ CORE_C_SRCS := \
     kernel/drivers/null/null.c \
     kernel/drivers/block/virtio_blk.c \
     kernel/drivers/net/virtio_net.c \
+    kernel/drivers/net/loopback.c \
     kernel/core/net.c \
+    kernel/core/dhcp.c \
+    kernel/core/net_cmds.c \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
     kernel/core/ktime.c \
@@ -718,6 +723,9 @@ CORE_C_SRCS := \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
     kernel/core/net.c \
+    kernel/core/dhcp.c \
+    kernel/core/net_cmds.c \
+    kernel/drivers/net/loopback.c \
     kernel/core/audio.c \
     kernel/core/random.c \
     kernel/core/fd.c \
@@ -844,7 +852,10 @@ CORE_C_SRCS := \
     kernel/drivers/null/null.c \
     kernel/drivers/block/virtio_blk.c \
     kernel/drivers/net/virtio_net.c \
+    kernel/drivers/net/loopback.c \
     kernel/core/net.c \
+    kernel/core/dhcp.c \
+    kernel/core/net_cmds.c \
     kernel/drivers/audio/ac97.c \
     kernel/core/audio.c \
     kernel/core/futex.c \

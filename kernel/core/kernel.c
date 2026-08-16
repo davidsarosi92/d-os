@@ -59,6 +59,7 @@
 #include "devfs.h"
 #include "random.h"
 #include "procfs.h"
+#include "net.h"
 #include "block_cache.h"
 #include "block.h"
 #include "config.h"
@@ -125,6 +126,9 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
 
     /* procfs (M10) — synthetic /proc files exposing kernel state. */
     procfs_init();
+    /* §M24 — /proc/net/{dev,arp,route,tcp,stat}.  Registered AFTER procfs_init
+     * so the nodes attach live rather than queueing. */
+    net_procfs_init();
 
     /* Block cache (M12) — pmm-backed buffer pool sitting between fs
      * code and dev->read/write.  Init here so any fs mounted at boot

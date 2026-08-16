@@ -75,6 +75,28 @@ static const struct abi_nument linux_i386_ents[] = {
     { 175, ABI_SIGPROCMASK },       /* rt_sigprocmask */
     { 326, ABI_TIMERFD_GETTIME },
     { 104, ABI_SETITIMER       },
+    /* §M24 — sockets.  i386 has BOTH: these direct numbers (since 4.3) and the
+     * old `socketcall(102)` multiplexer, which the i386 shim demultiplexes into
+     * the SAME canonical ops.  102 is deliberately absent from this table: it
+     * is not an operation, it is an envelope. */
+    { 359, ABI_SOCKET      },
+    { 361, ABI_BIND        },
+    { 362, ABI_CONNECT     },
+    { 363, ABI_LISTEN      },
+    { 364, ABI_ACCEPT4     },   /* i386 has no plain accept(2)                */
+    { 365, ABI_GETSOCKOPT  },
+    { 366, ABI_SETSOCKOPT  },
+    { 367, ABI_GETSOCKNAME },
+    { 368, ABI_GETPEERNAME },
+    { 369, ABI_SENDTO      },
+    { 371, ABI_RECVFROM    },
+    { 373, ABI_SHUTDOWN    },
+    /* 360 is socketpair and 370/372 are sendmsg/recvmsg — deliberately absent.
+     * These numbers are NOT sequential by name: 360 sits between socket and
+     * bind, and getsockopt comes before setsockopt.  Reciting them from memory
+     * put ABI_CONNECT on bind's number, and the failure was a bind that
+     * returned ECONNREFUSED — the one errno that names the handler that
+     * actually ran.  Verified against arch/x86/entry/syscalls/syscall_32.tbl. */
 };
 
 /* ---- Linux / amd64 -------------------------------------------------------- */
@@ -105,6 +127,20 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  14, ABI_SIGPROCMASK },       /* rt_sigprocmask */
     { 287, ABI_TIMERFD_GETTIME },
     {  38, ABI_SETITIMER       },
+    /* §M24 — sockets. */
+    {  41, ABI_SOCKET      },
+    {  42, ABI_CONNECT     },
+    {  43, ABI_ACCEPT      },
+    {  44, ABI_SENDTO      },
+    {  45, ABI_RECVFROM    },
+    {  48, ABI_SHUTDOWN    },
+    {  49, ABI_BIND        },
+    {  50, ABI_LISTEN      },
+    {  51, ABI_GETSOCKNAME },
+    {  52, ABI_GETPEERNAME },
+    {  54, ABI_SETSOCKOPT  },
+    {  55, ABI_GETSOCKOPT  },
+    { 288, ABI_ACCEPT4     },
 };
 
 /* ---- Linux / arm64 (the asm-generic numbering) ---------------------------- */
@@ -138,6 +174,23 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 136, ABI_SIGPENDING },        /* rt_sigpending */
     {  87, ABI_TIMERFD_GETTIME },
     { 103, ABI_SETITIMER       },
+    /* §M24 — sockets.  arm64 gets the whole server surface in the same change
+     * as the two x86 arches, which is the entire claim §M50 made: a new
+     * operation is one handler and one row per guest, not one implementation
+     * per architecture. */
+    { 198, ABI_SOCKET      },
+    { 200, ABI_BIND        },
+    { 201, ABI_LISTEN      },
+    { 202, ABI_ACCEPT      },
+    { 203, ABI_CONNECT     },
+    { 204, ABI_GETSOCKNAME },
+    { 205, ABI_GETPEERNAME },
+    { 206, ABI_SENDTO      },
+    { 207, ABI_RECVFROM    },
+    { 208, ABI_SETSOCKOPT  },
+    { 209, ABI_GETSOCKOPT  },
+    { 210, ABI_SHUTDOWN    },
+    { 242, ABI_ACCEPT4     },
 };
 
 #define ARRAY_N(a) ((uint32_t)(sizeof(a) / sizeof((a)[0])))

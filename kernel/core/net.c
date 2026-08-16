@@ -83,6 +83,8 @@
 #include "ktimer.h"
 #include "timer.h"
 #include "task.h"
+#include "procfs.h"
+#include "fd.h"        /* fd_readiness_signal — wake poll/epoll waiters */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -216,7 +218,40 @@ struct net_device* net_find(const char* name) {
     return NULL;
 }
 
-struct net_device* net_primary(void) { return g_head; }
+/* The default-route device.  See net.h for why loopback is excluded rather
+ * than merely registered last: registration order is a property of the DRIVER
+ * table, and making a routing decision depend on it means one added driver can
+ * silently redirect every packet in the system. */
+struct net_device* net_primary(void) {
+    for (struct net_device* n = g_head; n; n = n->next)
+        if (!(n->flags & NETDEV_F_LOOPBACK)) return n;
+    return NULL;
+}
+
+static struct net_device* net_loopback(void) {
+    for (struct net_device* n = g_head; n; n = n->next)
+        if (n->flags & NETDEV_F_LOOPBACK) return n;
+    return NULL;
+}
+
+int net_is_local_ip(uint32_t ip) {
+    for (struct net_device* n = g_head; n; n = n->next)
+        if (n->ip && n->ip == ip) return 1;
+    return 0;
+}
+
+struct net_device* net_route(uint32_t dst_ip) {
+    /* 127.0.0.0/8 belongs to the loopback by definition, and nothing else may
+     * claim it — a NIC whose subnet was misconfigured to overlap must not
+     * silently start carrying localhost traffic onto the wire. */
+    if ((dst_ip >> 24) == 127) return net_loopback();
+
+    for (struct net_device* n = g_head; n; n = n->next) {
+        if (n->flags & NETDEV_F_LOOPBACK) continue;
+        if (n->netmask && (dst_ip & n->netmask) == (n->ip & n->netmask)) return n;
+    }
+    return net_primary();
+}
 
 void net_for_each(net_iter_fn fn, void* ctx) {
     for (struct net_device* n = g_head; n; n = n->next) fn(n, ctx);
@@ -334,6 +369,18 @@ void net_rx_irq(struct net_device* dev) {
     waitq_unlock(&g_nicwq, f);
 }
 
+/* §M24 — the poller's "somebody cares" counter, exposed.
+ *
+ * netd runs only while somebody is waiting for the network (§M55), and until
+ * now the only way to be that somebody was to call net_wait_cond().  A task
+ * blocked in poll()/epoll_wait() on a socket is waiting just as much and had
+ * no way to say so — so the poller stayed parked, no frames were ever
+ * received, and the wait ran to its timeout with the answer sitting in the
+ * NIC.  That is what broke musl's resolver (and with it every page load)
+ * the moment §M56 turned a finite poll timeout into a real wait. */
+void net_waiter_enter(void);
+void net_waiter_leave(void);
+
 uint32_t net_lock(void)              { return waitq_lock(&g_netwq); }
 void     net_unlock(uint32_t flags)  { waitq_unlock(&g_netwq, flags); }
 
@@ -356,6 +403,11 @@ void net_pump_once(void) {
     uint32_t got = net_pump_locked();
     if (got) waitq_wake_all(&g_netwq);
     net_unlock(f);
+    /* AFTER the unlock, never inside it.  A poll waiter holds the readiness
+     * queue's lock while its scan takes the stack lock, so signalling from
+     * under the stack lock would be the opposite order and the two would
+     * deadlock the first time they raced. */
+    if (got) fd_readiness_signal();
 }
 
 /* The deadline half of a wait.  Runs in interrupt context (ktimer's contract),
@@ -399,6 +451,9 @@ static void net_wait_end(void) {
     if (g_waiters > 0) g_waiters--;
     waitq_unlock(&g_netdwq, f);
 }
+
+void net_waiter_enter(void) { net_wait_begin(); }
+void net_waiter_leave(void) { net_wait_end();   }
 
 /* Wait until `cond` reports true or `timeout_ms` elapses.  `cond` is evaluated
  * WITH THE STACK LOCK HELD — it may read stack state freely and must not take
@@ -511,6 +566,10 @@ static void netd_main(void) {
         uint32_t got = net_pump_locked();
         if (got) waitq_wake_all(&g_netwq);
         net_unlock(lf);
+        /* Wake poll()/epoll_wait() too — they wait on a different queue, and a
+         * socket that became readable is exactly what they are there for.
+         * Outside the lock: see net_pump_once. */
+        if (got) fd_readiness_signal();
 
         /* Frames found by a pump that ran because the TIMER fired mean the
          * interrupt for them never arrived.  This is the only reading here
@@ -572,8 +631,15 @@ static int eth_send_locked(struct net_device* dev, const uint8_t* dst_mac,
  * lock and has ALREADY decided the next hop — which is what lets the RX path
  * generate replies without ever performing a lookup.  Defined with the rest of
  * IPv4 at the bottom of the file. */
+/* `src_ip` is passed EXPLICITLY rather than taken from dev->ip.  Two callers
+ * need it to be something else: a connection carries the address it was
+ * established on (which, once the host has more than one device, is not always
+ * the sending device's primary address), and DHCP must send from 0.0.0.0
+ * before it has an address at all.  A sentinel meaning "use the device's"
+ * would have to be a value no real address can take, and 0.0.0.0 — the one
+ * obvious candidate — is precisely the value DHCP needs to send. */
 static int ipv4_emit_locked(struct net_device* dev, const uint8_t* via_mac,
-                            uint32_t dst_ip, uint8_t proto,
+                            uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
                             const void* payload, uint32_t len);
 
 /* ----------------------- ARP ---------------------------------------------- */
@@ -667,6 +733,12 @@ int net_arp_resolve(struct net_device* dev, uint32_t ip, uint8_t mac_out[ETH_ALE
  * it is on our subnet, otherwise the gateway.  Blocks, so like net_arp_resolve
  * it must be called WITHOUT the stack lock. */
 static int route_mac(struct net_device* dev, uint32_t dst_ip, uint8_t mac[ETH_ALEN]) {
+    /* A loopback has no wire and therefore no neighbours: there is nobody to
+     * answer an ARP request, so asking would spend the full retry budget and
+     * then fail.  Any MAC will do — the device hands the frame straight back —
+     * so we use its own, which is what a frame "from us to us" should carry. */
+    if (dev->flags & NETDEV_F_LOOPBACK) { mac_copy(mac, dev->mac); return 0; }
+
     uint32_t nexthop = ((dst_ip & dev->netmask) == (dev->ip & dev->netmask))
                      ? dst_ip : dev->gateway;
     return net_arp_resolve(dev, nexthop, mac);
@@ -697,7 +769,7 @@ static void icmp_input(struct net_device* dev, const uint8_t* src_mac,
         r->type = ICMP_ECHO_REPLY;
         r->checksum = 0;
         r->checksum = net_checksum(reply, len);
-        ipv4_emit_locked(dev, src_mac, src_ip, IP_PROTO_ICMP, reply, len);
+        ipv4_emit_locked(dev, src_mac, dev->ip, src_ip, IP_PROTO_ICMP, reply, len);
     } else if (ic->type == ICMP_ECHO_REPLY) {
         if (g_ping_active && ntohs(ic->id) == g_ping_id) {
             g_ping_got_seq = ntohs(ic->seq);
@@ -812,7 +884,33 @@ int net_udp_send(struct net_device* dev, uint32_t dst_ip,
     uh->checksum = 0;                          /* omitted (legal for IPv4)   */
     const uint8_t* p = (const uint8_t*)payload;
     for (uint32_t i = 0; i < len; i++) buf[sizeof(struct udp_hdr) + i] = p[i];
-    int rc = ipv4_emit_locked(dev, mac, dst_ip, IP_PROTO_UDP, buf, total);
+    int rc = ipv4_emit_locked(dev, mac, dev->ip, dst_ip, IP_PROTO_UDP, buf, total);
+    net_unlock(f);
+    return rc;
+}
+
+/* Send a UDP datagram to the all-ones broadcast address, from `src_ip` (which
+ * for DHCP is 0.0.0.0 — the whole point being that we do not have an address
+ * yet).  Separate from net_udp_send because BOTH of that function's normal
+ * steps are impossible here: there is no source address to put in the header,
+ * and there is nobody to ARP for a destination that is by definition everyone. */
+int net_udp_broadcast(struct net_device* dev, uint32_t src_ip,
+                      uint16_t src_port, uint16_t dst_port,
+                      const void* payload, uint32_t len) {
+    static uint8_t buf[ETH_MTU];
+    uint32_t total = sizeof(struct udp_hdr) + len;
+    if (!dev || total > sizeof(buf)) return -1;
+
+    uint32_t f = net_lock();
+    struct udp_hdr* uh = (struct udp_hdr*)buf;
+    uh->src_port = htons(src_port);
+    uh->dst_port = htons(dst_port);
+    uh->len      = htons((uint16_t)total);
+    uh->checksum = 0;
+    const uint8_t* p = (const uint8_t*)payload;
+    for (uint32_t i = 0; i < len; i++) buf[sizeof(struct udp_hdr) + i] = p[i];
+    int rc = ipv4_emit_locked(dev, BCAST_MAC, src_ip, 0xFFFFFFFFu,
+                              IP_PROTO_UDP, buf, total);
     net_unlock(f);
     return rc;
 }
@@ -838,7 +936,14 @@ static void udp_input(struct net_device* dev, uint32_t src_ip,
 
 /* ----------------------- DNS stub resolver -------------------------------- */
 
-#define DNS_SERVER  IPV4(10, 0, 2, 3)          /* QEMU SLIRP DNS proxy       */
+/* The resolver's server address.  A DEFAULT rather than a constant since
+ * §M24.12: DHCP learns the real one (option 6) and installs it here, and a
+ * hard-coded 10.0.2.3 is only correct on the emulator it was written for. */
+#define DNS_SERVER_DEFAULT  IPV4(10, 0, 2, 3)  /* QEMU SLIRP DNS proxy       */
+static uint32_t g_dns_server = DNS_SERVER_DEFAULT;
+
+void net_set_dns(uint32_t ip)  { if (ip) g_dns_server = ip; }
+uint32_t net_get_dns(void)     { return g_dns_server; }
 #define DNS_PORT    53
 #define DNS_LOCAL_PORT 0xC353
 
@@ -932,7 +1037,7 @@ int net_dns_query(struct net_device* dev, const char* hostname, uint32_t* out_ip
     net_unlock(f);
     net_udp_bind(DNS_LOCAL_PORT, dns_recv, NULL);
 
-    if (net_udp_send(dev, DNS_SERVER, DNS_LOCAL_PORT, DNS_PORT, q, off) != 0) {
+    if (net_udp_send(dev, g_dns_server, DNS_LOCAL_PORT, DNS_PORT, q, off) != 0) {
         net_udp_unbind(DNS_LOCAL_PORT);
         return -1;
     }
@@ -944,47 +1049,246 @@ int net_dns_query(struct net_device* dev, const char* hostname, uint32_t* out_ip
     return rc;
 }
 
-/* ----------------------- TCP (client-only, single connection) ------------- */
+/* =============================================================================
+ * TCP (§M24, second half) — a CONNECTION TABLE, a server role, a send buffer
+ * and retransmission.
+ *
+ * WHAT WAS HERE BEFORE, AND WHY IT HAD TO GO.  The first slice kept exactly one
+ * connection in a file-scope `g_tcp`, one receive buffer that only ever grew,
+ * and no send buffer at all: `net_tcp_send` put the caller's bytes on the wire
+ * and forgot them.  Every one of those is fine for "fetch one page and print
+ * it", which is what it was written for, and none survives contact with an
+ * event loop:
+ *
+ *   - ONE CONNECTION.  §M56 gave this kernel poll and epoll — machinery whose
+ *     entire purpose is watching several descriptors at once — over a transport
+ *     that could hold one conversation at a time.  A second connect() silently
+ *     destroyed the first.
+ *   - NO SERVER ROLE.  Nothing could arrive from outside, so the accept path
+ *     that every network program is written around did not exist and could not
+ *     be tested even in principle.
+ *   - A RECEIVE BUFFER THAT ONLY GREW.  Sixteen kilobytes of response and the
+ *     connection stalled for good, because nothing was ever reclaimed while the
+ *     advertised window stayed a constant that had stopped being true.
+ *   - NO SEND BUFFER.  Bytes that left were unrecoverable, so one dropped
+ *     segment ended the conversation instead of costing a round trip.
+ *
+ * THE SHAPE NOW.  A bounded table of `struct tcp_conn`, demultiplexed by the
+ * four-tuple (local ip/port, peer ip/port) with a LISTEN entry as the fallback
+ * match; per-connection receive ring, send buffer and sequence state; a
+ * retransmission sweep on one timer.
+ *
+ * The table is STATIC, not heap-allocated, and that is deliberate: a connection
+ * is created on the RX path, which runs under the stack lock with interrupts
+ * off, and an allocator call there would nest the heap's lock inside the
+ * network lock on the one path that must never fail.  Sixteen connections is a
+ * limit this kernel can state honestly; a heap that might not answer is not.
+ *
+ * OWNERSHIP — the rule that keeps this safe without a refcount.  A connection
+ * is released by exactly one route: whoever owns it calls net_tcp_close.
+ * Connections a LISTEN created for peers nobody has accepted yet are owned by
+ * that listener and go down with it.  THE RX PATH NEVER FREES A CONNECTION; it
+ * may only change one's state.  That is what makes a pointer held by a socket
+ * safe to dereference for as long as the socket exists — §M54's defect class
+ * ruled out by construction instead of by a lifetime rule someone must
+ * remember.
+ * ============================================================================= */
 
-enum { TCP_ST_CLOSED = 0, TCP_ST_SYN_SENT, TCP_ST_ESTABLISHED, TCP_ST_CLOSING };
+/* Sequence arithmetic is MODULAR: 0xFFFFFFFF + 1 == 0 is an ordinary event in a
+ * long-lived connection, so comparisons must be made on the SIGNED difference.
+ * Writing `a < b` on the raw values works for hours and then mis-orders a
+ * stream exactly once per 4 GiB — a bug that gets blamed on the network. */
+static inline int seq_lt (uint32_t a, uint32_t b) { return (int32_t)(a - b) <  0; }
+static inline int seq_leq(uint32_t a, uint32_t b) { return (int32_t)(a - b) <= 0; }
+static inline int seq_gt (uint32_t a, uint32_t b) { return (int32_t)(a - b) >  0; }
 
-static struct {
-    int      state;
-    uint32_t peer_ip;
-    /* The next hop's MAC, resolved ONCE at connect time.  A connection has a
-     * fixed route for its lifetime, so caching it here is not just an
-     * optimisation: it is what lets tcp_input ACK from the RX path, where
-     * resolving an address would mean blocking with the stack lock held. */
+enum {
+    TCP_ST_CLOSED = 0,
+    TCP_ST_LISTEN,
+    TCP_ST_SYN_SENT,
+    TCP_ST_SYN_RCVD,
+    TCP_ST_ESTABLISHED,
+    TCP_ST_FIN_WAIT_1,      /* our FIN is out, not acknowledged yet        */
+    TCP_ST_FIN_WAIT_2,      /* our FIN is acked; theirs has not arrived    */
+    TCP_ST_CLOSE_WAIT,      /* they are done sending; we still may send    */
+    TCP_ST_LAST_ACK,        /* we answered their FIN with ours             */
+    TCP_ST_TIME_WAIT,       /* both done; absorbing stray retransmissions  */
+};
+
+static const char* const TCP_STATE_NAMES[] = {
+    "CLOSED", "LISTEN", "SYN_SENT", "SYN_RCVD", "ESTABLISHED",
+    "FIN_WAIT_1", "FIN_WAIT_2", "CLOSE_WAIT", "LAST_ACK", "TIME_WAIT",
+};
+
+/* How many connections may exist at once.
+ *
+ * The number is larger than it looks, for a reason that is easy to get wrong:
+ * OVER THE LOOPBACK EVERY CONNECTION OCCUPIES TWO ENTRIES, because both
+ * endpoints live in this table.  Eight concurrent local connections plus their
+ * listener is seventeen — which is how the first `tcptest 8` run came back
+ * 7/8 with one RST sent, and it was the stack telling the truth about a limit
+ * rather than a bug. */
+#define TCP_MAX_CONNS   32
+#define TCP_RXBUF       8192
+#define TCP_TXBUF       8192
+/* The accept queue is a RING, so one slot is always the empty marker and the
+ * largest honourable backlog is one less.  Sized to the connection table
+ * rather than to a round number: a listener that could queue more peers than
+ * the stack can hold connections would accept SYNs it must then refuse. */
+#define TCP_ACCEPTQ     TCP_MAX_CONNS
+#define TCP_MSS_CAP     1460          /* ETH_MTU - IPv4(20) - TCP(20)        */
+
+struct tcp_conn {
+    uint8_t  used;
+    uint8_t  listener;
+    uint8_t  state;
+    uint8_t  fin_pending;       /* close requested; FIN goes once tx drains   */
+    uint8_t  fin_sent;          /* our FIN occupies a sequence number         */
+    uint32_t fin_seq;           /* WHICH sequence number.  Recorded rather
+                                 * than derived from snd_nxt, because a
+                                 * retransmission rolls snd_nxt BACK, and a
+                                 * "have they acknowledged my FIN?" test made
+                                 * of a rolled-back snd_nxt answers yes to an
+                                 * acknowledgement of the data alone. */
+    uint8_t  orphan;            /* owner is gone; the sweeper reclaims it     */
+    volatile uint8_t peer_fin;  /* their FIN arrived and was acknowledged     */
+    volatile uint8_t reset;     /* RST — an ERROR, not an orderly end (§M56.2)*/
+
+    struct net_device* dev;
+    uint32_t local_ip, peer_ip;
+    uint16_t local_port, peer_port;
     uint8_t  peer_mac[ETH_ALEN];
-    uint16_t peer_port, local_port;
-    uint32_t snd_nxt;                          /* next seq we will send       */
-    uint32_t rcv_nxt;                          /* next seq we expect          */
-    volatile int established;
-    volatile int peer_fin;
-    /* §M56.2 — an RST is not a FIN.  Both end the connection, but a FIN is the
-     * peer saying "I am done sending" and an RST is "this connection is
-     * broken": the first is an orderly EOF, the second is an ERROR, and a
-     * program that cannot tell them apart will treat a refused or dropped
-     * connection as a successful zero-length response.  This is what gives
-     * poll/epoll a POLLERR to report. */
-    volatile int reset;
-} g_tcp;
 
-/* Response accumulation buffer (bounded — a first-slice wget, not a stream). */
-#define TCP_RX_CAP 16384
-static uint8_t         g_tcp_rx[TCP_RX_CAP];
-static volatile uint32_t g_tcp_rxlen;
-static uint32_t          g_tcp_rxconsumed;   /* net_tcp_recv read cursor */
+    /* Send side.  tx[] is LINEAR, not a ring: tx[i] is the byte at sequence
+     * snd_una + i, and an acknowledgement compacts it.  A ring would save the
+     * compaction memmove and cost a wrap case in every one of emit, queue and
+     * retransmit — three places to get an off-by-one wrong on a path where the
+     * symptom is a corrupted byte stream a megabyte later. */
+    uint32_t snd_una, snd_nxt, snd_wnd;
+    uint8_t  tx[TCP_TXBUF];
+    uint32_t tx_len;
 
-/* TCP checksum: pseudo-header (src, dst, proto, tcp-len) + segment.  Mandatory
- * (unlike UDP), so we always compute it.  `src_ip`/`dst_ip` are host order. */
+    /* Receive side.  A RING, with rx_head/rx_tail as monotonic byte counters,
+     * so the free space they imply IS the window we advertise — an
+     * advertisement that follows the reader rather than a constant that stops
+     * being true the moment the reader falls behind. */
+    uint32_t rcv_nxt;
+    uint8_t  rx[TCP_RXBUF];
+    uint32_t rx_head, rx_tail;
+
+    /* Retransmission + lingering. */
+    uint64_t rto_deadline_ns;         /* 0 = nothing outstanding             */
+    uint32_t rto_ms;
+    uint32_t retries;
+    uint64_t linger_deadline_ns;      /* TIME_WAIT / orphan reclaim          */
+
+    /* Listener state. */
+    struct tcp_conn* aq[TCP_ACCEPTQ];
+    uint8_t  aq_head, aq_tail, backlog;
+    struct tcp_conn* parent;
+
+    /* Per-connection counters — `netstat` prints them, and the loss test
+     * asserts on `retrans`, which is the only way to tell a recovery from a
+     * link that never lost anything. */
+    uint32_t tx_segs, rx_segs, retrans;
+};
+
+static struct tcp_conn g_conns[TCP_MAX_CONNS];
+static uint32_t g_tcp_ephem = 0;
+static uint32_t g_tcp_isn   = 0x2000;
+static uint32_t g_tcp_rst_sent, g_tcp_rst_rcvd, g_tcp_dropped;
+/* Why these three exist: a transfer that is slow for a bad reason and one that
+ * is slow for a good reason look identical from the outside, and the only way
+ * to tell them apart is to count the events that carry a 200 ms price tag. */
+static uint32_t g_tcp_persists;     /* zero-window probes sent               */
+static uint32_t g_tcp_wndblock;     /* output runs that sent NOTHING because
+                                     * the peer's window had no room         */
+static uint32_t g_tcp_datasegs;     /* data segments actually emitted        */
+static uint32_t g_tcp_rtos;         /* retransmit timeouts that fired        */
+static uint32_t g_tcp_zerowin;      /* times WE advertised a shut window     */
+
+/* ----------------------- the table (always under the stack lock) ---------- */
+
+static struct tcp_conn* tcp_alloc_locked(void) {
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        struct tcp_conn* c = &g_conns[i];
+        if (c->used) continue;
+        /* Reset every field EXCEPT the two 8 KiB buffers: they are defined by
+         * their counters, so bytes below the head are unreachable, and zeroing
+         * 16 KiB here would put a memset of that size on the RX path with
+         * interrupts off, once per arriving SYN. */
+        c->used = 1;
+        c->listener = c->state = c->fin_pending = c->fin_sent = c->orphan = 0;
+        c->peer_fin = c->reset = 0;
+        c->dev = NULL;
+        c->local_ip = c->peer_ip = 0;
+        c->local_port = c->peer_port = 0;
+        for (int k = 0; k < ETH_ALEN; k++) c->peer_mac[k] = 0;
+        c->snd_una = c->snd_nxt = c->snd_wnd = c->tx_len = 0;
+        c->fin_seq = 0;
+        c->rcv_nxt = c->rx_head = c->rx_tail = 0;
+        c->rto_deadline_ns = 0; c->rto_ms = 0; c->retries = 0;
+        c->linger_deadline_ns = 0;
+        c->aq_head = c->aq_tail = c->backlog = 0;
+        c->parent = NULL;
+        c->tx_segs = c->rx_segs = c->retrans = 0;
+        return c;
+    }
+    return NULL;
+}
+
+static void tcp_free_locked(struct tcp_conn* c) {
+    if (!c) return;
+    c->state = TCP_ST_CLOSED;
+    c->used  = 0;
+}
+
+static int tcp_port_taken_locked(uint16_t port) {
+    for (int i = 0; i < TCP_MAX_CONNS; i++)
+        if (g_conns[i].used && g_conns[i].local_port == port) return 1;
+    return 0;
+}
+
+static uint16_t tcp_ephem_port_locked(void) {
+    for (int tries = 0; tries < 0x4000; tries++) {
+        uint16_t p = (uint16_t)(0xC000 + (g_tcp_ephem++ & 0x3FFF));
+        if (!tcp_port_taken_locked(p)) return p;
+    }
+    return 0;
+}
+
+/* Which connection does this segment belong to?  Exact four-tuple first, a
+ * LISTEN on the same local port only as a fallback — the ORDER is load-bearing:
+ * a listener and the connections it accepted share a local port, so matching
+ * the listener first would route every segment of every accepted connection
+ * into the accept queue. */
+static struct tcp_conn* tcp_lookup_locked(uint32_t local_ip, uint16_t local_port,
+                                          uint32_t peer_ip, uint16_t peer_port) {
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        struct tcp_conn* c = &g_conns[i];
+        if (!c->used || c->listener) continue;
+        if (c->local_port == local_port && c->peer_port == peer_port &&
+            c->peer_ip == peer_ip &&
+            (c->local_ip == local_ip || c->local_ip == 0)) return c;
+    }
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        struct tcp_conn* c = &g_conns[i];
+        if (!c->used || !c->listener || c->state != TCP_ST_LISTEN) continue;
+        if (c->local_port != local_port) continue;
+        if (c->local_ip == 0 || c->local_ip == local_ip) return c;   /* 0.0.0.0 */
+    }
+    return NULL;
+}
+
+/* ----------------------- output ------------------------------------------- */
+
 static uint16_t tcp_checksum(uint32_t src_ip, uint32_t dst_ip,
                              const uint8_t* seg, uint32_t len) {
     uint32_t sum = 0;
     sum += (src_ip >> 16) & 0xFFFF; sum += src_ip & 0xFFFF;
     sum += (dst_ip >> 16) & 0xFFFF; sum += dst_ip & 0xFFFF;
-    sum += IP_PROTO_TCP;                        /* 0x0006 word                 */
-    sum += len;                                 /* TCP length                  */
+    sum += IP_PROTO_TCP;
+    sum += len;
     for (uint32_t i = 0; i + 1 < len; i += 2)
         sum += ((uint16_t)seg[i] << 8) | seg[i+1];
     if (len & 1) sum += (uint16_t)seg[len-1] << 8;
@@ -992,249 +1296,903 @@ static uint16_t tcp_checksum(uint32_t src_ip, uint32_t dst_ip,
     return htons((uint16_t)~sum);
 }
 
-/* Send a segment with the given flags + optional payload.  SYN and FIN each
- * consume one sequence number — the caller bumps snd_nxt accordingly. */
-static int tcp_send_seg_locked(struct net_device* dev, uint8_t flags,
-                               const void* data, uint32_t len) {
+/* Free space in the receive ring — the number we advertise, and the only thing
+ * that stops a fast peer from overrunning a reader that has stopped reading. */
+static uint32_t tcp_rx_free(const struct tcp_conn* c) {
+    uint32_t used = c->rx_head - c->rx_tail;
+    return (used >= TCP_RXBUF) ? 0 : (TCP_RXBUF - used);
+}
+static uint32_t tcp_rx_avail(const struct tcp_conn* c) { return c->rx_head - c->rx_tail; }
+
+/* Emit one segment.  `seq` is an explicit argument because a RETRANSMISSION
+ * carries an old sequence number with a current acknowledgement and a current
+ * window: taking all three from the connection would make every retransmit look
+ * like new data. */
+static int tcp_emit_locked(struct tcp_conn* c, uint32_t seq, uint8_t flags,
+                           const uint8_t* data, uint32_t len) {
     static uint8_t seg[ETH_MTU];
     uint32_t total = sizeof(struct tcp_hdr) + len;
-    if (total > sizeof(seg)) return -1;
+    if (!c->dev || total > sizeof(seg)) return -1;
+
     struct tcp_hdr* th = (struct tcp_hdr*)seg;
-    th->src_port = htons(g_tcp.local_port);
-    th->dst_port = htons(g_tcp.peer_port);
-    th->seq      = htonl(g_tcp.snd_nxt);
-    th->ack      = htonl(g_tcp.rcv_nxt);
-    th->data_off = 5 << 4;                      /* 20-byte header, no options  */
+    th->src_port = htons(c->local_port);
+    th->dst_port = htons(c->peer_port);
+    th->seq      = htonl(seq);
+    th->ack      = htonl(c->rcv_nxt);
+    th->data_off = 5 << 4;
     th->flags    = flags;
-    th->window   = htons(64240);
+    uint32_t win = tcp_rx_free(c);
+    if (!win) g_tcp_zerowin++;
+    th->window   = htons(win > 65535 ? 65535 : (uint16_t)win);
     th->checksum = 0;
     th->urgent   = 0;
-    const uint8_t* p = (const uint8_t*)data;
-    for (uint32_t i = 0; i < len; i++) seg[sizeof(struct tcp_hdr) + i] = p[i];
-    th->checksum = tcp_checksum(dev->ip, g_tcp.peer_ip, seg, total);
-    return ipv4_emit_locked(dev, g_tcp.peer_mac, g_tcp.peer_ip,
+    for (uint32_t i = 0; i < len; i++) seg[sizeof(struct tcp_hdr) + i] = data[i];
+    th->checksum = tcp_checksum(c->local_ip, c->peer_ip, seg, total);
+    c->tx_segs++;
+    return ipv4_emit_locked(c->dev, c->peer_mac, c->local_ip, c->peer_ip,
                             IP_PROTO_TCP, seg, total);
 }
 
-static void tcp_input(struct net_device* dev, uint32_t src_ip,
+/* A bare RST for a segment belonging to no connection.
+ *
+ * Not politeness: without it, connecting to a port nobody listens on is
+ * indistinguishable from connecting to a host that is merely slow, and the
+ * caller waits out the whole connect timeout instead of failing immediately.
+ * It is also what gives poll/epoll the POLLERR §M56.2 built.  Sent straight
+ * back to the MAC the segment arrived from, so it needs no lookup and cannot
+ * block. */
+static void tcp_send_rst_locked(struct net_device* dev, const uint8_t* via_mac,
+                                uint32_t local_ip, uint32_t peer_ip,
+                                const struct tcp_hdr* th, uint32_t seglen) {
+    if (th->flags & TCP_RST) return;            /* never answer an RST with one */
+    uint8_t seg[sizeof(struct tcp_hdr)];
+    struct tcp_hdr* r = (struct tcp_hdr*)seg;
+    r->src_port = th->dst_port;
+    r->dst_port = th->src_port;
+    r->data_off = 5 << 4;
+    r->window   = 0;
+    r->checksum = 0;
+    r->urgent   = 0;
+    if (th->flags & TCP_ACK) {
+        r->seq   = th->ack;                     /* the seq they expect from us  */
+        r->ack   = 0;
+        r->flags = TCP_RST;
+    } else {
+        uint32_t hlen = (uint32_t)(th->data_off >> 4) * 4;
+        uint32_t dlen = seglen > hlen ? seglen - hlen : 0;
+        if (th->flags & TCP_SYN) dlen++;
+        r->seq   = 0;
+        r->ack   = htonl(ntohl(th->seq) + dlen);
+        r->flags = TCP_RST | TCP_ACK;
+    }
+    r->checksum = tcp_checksum(local_ip, peer_ip, seg, sizeof(seg));
+    g_tcp_rst_sent++;
+    ipv4_emit_locked(dev, via_mac, local_ip, peer_ip, IP_PROTO_TCP, seg, sizeof(seg));
+}
+
+/* Retransmission timing.  A FIXED timeout with exponential backoff rather than
+ * an RTT estimator: on the two links this kernel has — a loopback and QEMU's
+ * SLIRP — the round trip is microseconds, so a Jacobson estimator would be
+ * measuring the emulator's scheduling noise and calling it a network.  The
+ * constant is a floor, not a tuning: what matters is that a lost segment is
+ * RECOVERED, and recovering it 200 ms late is a latency cost, while never
+ * recovering it is data loss. */
+#define TCP_RTO_INITIAL_MS   200u
+#define TCP_RTO_MAX_MS      3000u
+#define TCP_RETRIES_MAX        8u     /* ~8 doublings, then the peer is gone   */
+#define TCP_TIME_WAIT_MS    1000u     /* short: this is not an internet router */
+/* How long a connection whose owner has closed may keep working.
+ *
+ * This is NOT the same as TIME_WAIT and the difference cost an afternoon.  A
+ * close() with bytes still queued must keep sending them — and send the FIN
+ * AFTER them — or the peer's last read waits out its whole timeout for an end
+ * of stream that was thrown away.  The symptom is spectacularly misleading: a
+ * transfer that delivers every byte correctly and takes 8 seconds instead of
+ * 0.4, which reads as "the network is slow" and is actually "the sender gave
+ * up on the goodbye". */
+#define TCP_ORPHAN_MS      10000u
+
+static void tcp_arm_rto_locked(struct tcp_conn* c) {
+    if (!c->rto_ms) c->rto_ms = TCP_RTO_INITIAL_MS;
+    c->rto_deadline_ns = timer_now_ns() + (uint64_t)c->rto_ms * 1000000ull;
+}
+
+/* Send whatever the peer's window and our queue allow.  Called after anything
+ * that can change either: data queued by the sender, an ACK that opened the
+ * window, a state change. */
+static void tcp_output_locked(struct tcp_conn* c) {
+    if (!c->used || !c->dev) return;
+    if (c->state != TCP_ST_ESTABLISHED && c->state != TCP_ST_CLOSE_WAIT &&
+        c->state != TCP_ST_FIN_WAIT_1  && c->state != TCP_ST_LAST_ACK) return;
+
+    uint32_t mss = c->dev->mtu - sizeof(struct ipv4_hdr) - sizeof(struct tcp_hdr);
+    if (mss > TCP_MSS_CAP) mss = TCP_MSS_CAP;
+
+    for (;;) {
+        uint32_t inflight = c->snd_nxt - c->snd_una;
+        if (inflight >= c->tx_len) break;                    /* nothing unsent */
+        /* The peer's window bounds what may be OUTSTANDING, not what may be
+         * queued — that difference is the entire point of a send buffer. */
+        if (c->snd_wnd <= inflight) { g_tcp_wndblock++; break; }  /* no room   */
+        uint32_t n = c->tx_len - inflight;
+        uint32_t room = c->snd_wnd - inflight;
+        if (n > room) n = room;
+        if (n > mss)  n = mss;
+        if (tcp_emit_locked(c, c->snd_nxt, TCP_PSH | TCP_ACK, &c->tx[inflight], n) != 0)
+            break;
+        c->snd_nxt += n;
+        g_tcp_datasegs++;
+    }
+
+    /* Our FIN goes out only once every queued byte has been sent: a FIN that
+     * overtakes data is a stream truncated by its own close. */
+    if (c->fin_pending && !c->fin_sent && (c->snd_nxt - c->snd_una) >= c->tx_len) {
+        if (tcp_emit_locked(c, c->snd_nxt, TCP_FIN | TCP_ACK, NULL, 0) == 0) {
+            c->fin_sent = 1;
+            c->fin_seq  = c->snd_nxt;
+            c->snd_nxt += 1;                                 /* FIN takes a seq */
+        }
+    }
+    if (c->snd_nxt != c->snd_una && !c->rto_deadline_ns) tcp_arm_rto_locked(c);
+}
+
+/* ----------------------- input -------------------------------------------- */
+
+/* Copy a segment's payload into the receive ring, as much as fits.  Whatever
+ * does not fit is simply not acknowledged, so the peer retransmits it — which
+ * is exactly what a window is for and why partial acceptance is correct rather
+ * than a shortcut. */
+static uint32_t tcp_rx_store_locked(struct tcp_conn* c, const uint8_t* d, uint32_t len) {
+    uint32_t room = tcp_rx_free(c);
+    if (len > room) len = room;
+    for (uint32_t i = 0; i < len; i++)
+        c->rx[(c->rx_head + i) % TCP_RXBUF] = d[i];
+    c->rx_head += len;
+    return len;
+}
+
+/* A listener's child has reached ESTABLISHED: hand it to whoever is in accept.
+ * A full queue DROPS the connection (RST) rather than growing without bound —
+ * an unbounded accept queue turns a slow server into an out-of-memory event. */
+static void tcp_accept_enqueue_locked(struct tcp_conn* l, struct tcp_conn* c) {
+    uint8_t nx    = (uint8_t)((l->aq_head + 1) % TCP_ACCEPTQ);
+    uint8_t depth = (uint8_t)((l->aq_head + TCP_ACCEPTQ - l->aq_tail) % TCP_ACCEPTQ);
+    if (nx == l->aq_tail || depth >= l->backlog) {   /* backlog full           */
+        tcp_emit_locked(c, c->snd_nxt, TCP_RST, NULL, 0);
+        tcp_free_locked(c);
+        return;
+    }
+    l->aq[l->aq_head] = c;
+    l->aq_head = nx;
+}
+
+static void tcp_input(struct net_device* dev, const uint8_t* src_mac,
+                      uint32_t src_ip, uint32_t dst_ip,
                       const uint8_t* p, uint32_t len) {
     if (len < sizeof(struct tcp_hdr)) return;
     const struct tcp_hdr* th = (const struct tcp_hdr*)p;
 
-    /* Only handle segments for our single active connection. */
-    if (g_tcp.state == TCP_ST_CLOSED) return;
-    if (src_ip != g_tcp.peer_ip) return;
-    if (ntohs(th->dst_port) != g_tcp.local_port) return;
-    if (ntohs(th->src_port) != g_tcp.peer_port) return;
-
-    uint32_t their_seq = ntohl(th->seq);
-    uint8_t  flags = th->flags;
-    uint32_t hlen  = (th->data_off >> 4) * 4;
+    uint16_t sport = ntohs(th->src_port), dport = ntohs(th->dst_port);
+    uint32_t hlen  = (uint32_t)(th->data_off >> 4) * 4;
     if (hlen < sizeof(struct tcp_hdr) || hlen > len) return;
     const uint8_t* data = p + hlen;
     uint32_t dlen = len - hlen;
+    uint32_t seq  = ntohl(th->seq);
+    uint32_t ack  = ntohl(th->ack);
+    uint8_t  flags = th->flags;
+
+    struct tcp_conn* c = tcp_lookup_locked(dst_ip, dport, src_ip, sport);
+    if (!c) {
+        /* Nobody is listening.  Answering with an RST is what turns a connect
+         * to a closed port into an immediate failure instead of a timeout. */
+        g_tcp_dropped++;
+        tcp_send_rst_locked(dev, src_mac, dst_ip, src_ip, th, len);
+        return;
+    }
+    c->rx_segs++;
 
     if (flags & TCP_RST) {
-        g_tcp.state = TCP_ST_CLOSING;
-        g_tcp.peer_fin = 1;
-        g_tcp.reset    = 1;             /* surfaces as POLLERR, not a clean EOF */
+        g_tcp_rst_rcvd++;
+        if (c->listener) return;               /* a listener survives an RST   */
+        c->reset   = 1;
+        c->peer_fin = 1;                        /* every wait must end          */
+        c->state   = TCP_ST_CLOSED;
+        c->rto_deadline_ns = 0;
         return;
     }
 
-    if (g_tcp.state == TCP_ST_SYN_SENT) {
+    /* ---- LISTEN: a new connection request ------------------------------- */
+    if (c->listener) {
+        if (!(flags & TCP_SYN)) {
+            tcp_send_rst_locked(dev, src_mac, dst_ip, src_ip, th, len);
+            return;
+        }
+        struct tcp_conn* n = tcp_alloc_locked();
+        if (!n) {                               /* table full — refuse loudly  */
+            tcp_send_rst_locked(dev, src_mac, dst_ip, src_ip, th, len);
+            return;
+        }
+        n->dev        = dev;
+        n->local_ip   = dst_ip;
+        n->local_port = dport;
+        n->peer_ip    = src_ip;
+        n->peer_port  = sport;
+        mac_copy(n->peer_mac, src_mac);         /* the correct next hop, free  */
+        n->parent     = c;
+        n->rcv_nxt    = seq + 1;                /* their SYN consumes a seq    */
+        n->snd_una    = n->snd_nxt = (g_tcp_isn += 0x10000);
+        n->snd_wnd    = ntohs(th->window);
+        n->state      = TCP_ST_SYN_RCVD;
+        tcp_emit_locked(n, n->snd_nxt, TCP_SYN | TCP_ACK, NULL, 0);
+        n->snd_nxt += 1;                        /* our SYN consumes one too    */
+        tcp_arm_rto_locked(n);
+        return;
+    }
+
+    /* ---- SYN_SENT: the handshake's second segment ------------------------ */
+    if (c->state == TCP_ST_SYN_SENT) {
         if ((flags & TCP_SYN) && (flags & TCP_ACK)) {
-            g_tcp.rcv_nxt = their_seq + 1;     /* their SYN consumes a seq    */
-            g_tcp.state = TCP_ST_ESTABLISHED;
-            g_tcp.established = 1;
-            tcp_send_seg_locked(dev, TCP_ACK, NULL, 0);   /* finish the handshake     */
+            if (ack != c->snd_nxt) {            /* not for our SYN             */
+                tcp_send_rst_locked(dev, src_mac, dst_ip, src_ip, th, len);
+                return;
+            }
+            c->rcv_nxt = seq + 1;
+            c->snd_una = ack;
+            c->snd_wnd = ntohs(th->window);
+            c->state   = TCP_ST_ESTABLISHED;
+            c->rto_deadline_ns = 0; c->retries = 0; c->rto_ms = 0;
+            tcp_emit_locked(c, c->snd_nxt, TCP_ACK, NULL, 0);
+            tcp_output_locked(c);               /* data queued before connect  */
         }
         return;
     }
 
-    /* ESTABLISHED / CLOSING — accept in-order data, ACK it. */
-    if (dlen > 0 && their_seq == g_tcp.rcv_nxt) {
-        for (uint32_t i = 0; i < dlen && g_tcp_rxlen < TCP_RX_CAP; i++)
-            g_tcp_rx[g_tcp_rxlen++] = data[i];
-        g_tcp.rcv_nxt += dlen;
-        tcp_send_seg_locked(dev, TCP_ACK, NULL, 0);
-    } else if (dlen > 0) {
-        /* Duplicate / out-of-order — re-ACK what we have. */
-        tcp_send_seg_locked(dev, TCP_ACK, NULL, 0);
+    /* ---- everything else needs a plausible acknowledgement --------------- */
+    if (flags & TCP_ACK) {
+        /* An acknowledgement PAST snd_nxt is not nonsense here: a zero-window
+         * probe sends a byte without advancing snd_nxt, so a receiver that had
+         * room by the time it arrived legitimately acknowledges one more than
+         * we think we sent.  Pulling snd_nxt up to meet it is the honest
+         * repair; discarding the ACK would strand the connection on the one
+         * path that exists to unstick it. */
+        if (seq_gt(ack, c->snd_nxt) && seq_leq(ack, c->snd_nxt + 1)) c->snd_nxt = ack;
+
+        if (seq_gt(ack, c->snd_una) && seq_leq(ack, c->snd_nxt)) {
+            /* Bytes acknowledged, clamped to what tx[] actually holds: a SYN
+             * and a FIN each occupy a sequence number without occupying a byte
+             * of the buffer, so the raw difference over-counts by one at each
+             * end of the connection's life. */
+            uint32_t acked = ack - c->snd_una;
+            if (acked > c->tx_len) acked = c->tx_len;
+            for (uint32_t i = 0; i + acked < c->tx_len; i++)
+                c->tx[i] = c->tx[i + acked];
+            c->tx_len -= acked;
+            c->snd_una = ack;
+            c->retries = 0;
+            c->rto_ms  = 0;
+            c->rto_deadline_ns = 0;
+            if (c->snd_una != c->snd_nxt) tcp_arm_rto_locked(c);
+            tcp_output_locked(c);        /* the window may have just opened   */
+        }
+        c->snd_wnd = ntohs(th->window);
+        /* Not only inside the "new data acknowledged" branch above: a pure
+         * WINDOW UPDATE carries the same acknowledgement number and a bigger
+         * window, and it is the only thing that can restart a sender the
+         * receiver had stopped.  Reacting to it just here was the difference
+         * between a 32 KiB transfer and a connection that stopped at 10 KiB
+         * (the first `tcploss` run said so before anything else did). */
+        tcp_output_locked(c);
+
+        if (c->state == TCP_ST_SYN_RCVD && seq_leq(c->snd_nxt, ack)) {
+            c->state = TCP_ST_ESTABLISHED;
+            c->rto_deadline_ns = 0;
+            if (c->parent) tcp_accept_enqueue_locked(c->parent, c);
+        }
+        /* "Have they acknowledged my FIN?" is a question about the FIN's own
+         * sequence number, and nothing else.  Asking it of snd_nxt was wrong
+         * in exactly one situation and wrong badly: after a retransmission
+         * rolled snd_nxt back to snd_una, an ACK covering only the DATA
+         * satisfied the test, the sender moved to FIN_WAIT_2 believing the
+         * conversation was over, and never sent the FIN again — while the
+         * peer sat in ESTABLISHED waiting for an end of stream that had been
+         * declared delivered.  Every byte arrived; the reader still blocked
+         * until its timeout, which reads as a slow network. */
+        if (c->state == TCP_ST_FIN_WAIT_1 && c->fin_sent && seq_gt(ack, c->fin_seq))
+            c->state = TCP_ST_FIN_WAIT_2;
+        if (c->state == TCP_ST_LAST_ACK && c->fin_sent && seq_gt(ack, c->fin_seq)) {
+            c->state = TCP_ST_CLOSED;
+            c->rto_deadline_ns = 0;
+            return;
+        }
     }
 
+    /* ---- data ------------------------------------------------------------ */
+    if (dlen) {
+        if (seq == c->rcv_nxt) {
+            uint32_t took = tcp_rx_store_locked(c, data, dlen);
+            c->rcv_nxt += took;
+            tcp_emit_locked(c, c->snd_nxt, TCP_ACK, NULL, 0);
+        } else {
+            /* Out of order or already seen.  We keep no reassembly queue — a
+             * duplicate ACK naming what we DO have is both the correct answer
+             * and the signal that makes the peer resend it.  Holding
+             * out-of-order segments would buy throughput on a lossy link and
+             * cost a second buffer with its own overlap arithmetic; the
+             * decision is recorded here rather than left to be inferred. */
+            tcp_emit_locked(c, c->snd_nxt, TCP_ACK, NULL, 0);
+        }
+    }
+
+    /* ---- their FIN ------------------------------------------------------- */
     if (flags & TCP_FIN) {
-        /* FIN occupies the seq right after its data. */
-        if (their_seq + dlen == g_tcp.rcv_nxt) {
-            g_tcp.rcv_nxt += 1;
-            tcp_send_seg_locked(dev, TCP_ACK, NULL, 0);
-            g_tcp.peer_fin = 1;
-            g_tcp.state = TCP_ST_CLOSING;
+        /* The FIN occupies the sequence right after the segment's data, so it
+         * is only ours to take once that data has been accepted. */
+        if (seq + dlen == c->rcv_nxt) {
+            c->rcv_nxt += 1;
+            c->peer_fin = 1;
+            tcp_emit_locked(c, c->snd_nxt, TCP_ACK, NULL, 0);
+            switch (c->state) {
+                case TCP_ST_ESTABLISHED: c->state = TCP_ST_CLOSE_WAIT; break;
+                case TCP_ST_FIN_WAIT_1:  c->state = TCP_ST_TIME_WAIT;
+                                         c->linger_deadline_ns = timer_now_ns() +
+                                             (uint64_t)TCP_TIME_WAIT_MS * 1000000ull;
+                                         break;
+                case TCP_ST_FIN_WAIT_2:  c->state = TCP_ST_TIME_WAIT;
+                                         c->linger_deadline_ns = timer_now_ns() +
+                                             (uint64_t)TCP_TIME_WAIT_MS * 1000000ull;
+                                         break;
+                default: break;
+            }
+        } else {
+            tcp_emit_locked(c, c->snd_nxt, TCP_ACK, NULL, 0);
         }
     }
 }
 
-/* Timeouts for the connection's phases — real milliseconds (see the file
- * header on why the old spin budgets were not timeouts). */
+/* ----------------------- the sweeper (retransmit + reclaim) --------------- */
+
+/* One timer for every connection, rather than a timer per connection.
+ *
+ * A per-connection ktimer would be the obvious design and it is the one §M53
+ * warned about: an embedded timer must be cancelled at exactly the right point
+ * in teardown, and getting that wrong fires a callback into freed memory.  With
+ * a single sweep the connection table is walked under the lock that already
+ * protects it, and a connection that went away is simply not there. */
+#define TCP_SWEEP_MS  50u
+
+static struct ktimer g_tcp_sweeper;
+static volatile int  g_tcp_sweeper_on;
+
+static void tcp_sweep_locked(void) {
+    uint64_t now = timer_now_ns();
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        struct tcp_conn* c = &g_conns[i];
+        if (!c->used || c->listener) continue;
+
+        /* Retransmit: everything from snd_una, one MSS worth, and let the
+         * ACK-driven path take it from there. */
+        if (c->rto_deadline_ns && now >= c->rto_deadline_ns) {
+            if (++c->retries > TCP_RETRIES_MAX) {
+                c->reset = 1;                    /* the peer is unreachable    */
+                c->peer_fin = 1;
+                c->state = TCP_ST_CLOSED;
+                c->rto_deadline_ns = 0;
+                continue;
+            }
+            c->retrans++;
+            g_tcp_rtos++;
+            uint32_t mss = c->dev ? c->dev->mtu - sizeof(struct ipv4_hdr)
+                                                - sizeof(struct tcp_hdr) : TCP_MSS_CAP;
+            if (mss > TCP_MSS_CAP) mss = TCP_MSS_CAP;
+
+            if (c->state == TCP_ST_SYN_SENT) {
+                tcp_emit_locked(c, c->snd_una, TCP_SYN, NULL, 0);
+            } else if (c->state == TCP_ST_SYN_RCVD) {
+                tcp_emit_locked(c, c->snd_una, TCP_SYN | TCP_ACK, NULL, 0);
+            } else if (c->tx_len) {
+                uint32_t n = c->tx_len < mss ? c->tx_len : mss;
+                /* With the window shut this retransmission IS the persist
+                 * probe, and one byte is all the receiver can be asked to
+                 * take: sending a full segment it must discard turns every
+                 * timeout into wasted bandwidth on the link that is already
+                 * struggling. */
+                if (c->snd_wnd == 0) n = 1;
+                tcp_emit_locked(c, c->snd_una, TCP_PSH | TCP_ACK, &c->tx[0], n);
+                /* Everything past what we just re-sent is unsent again: this is
+                 * the "go back to snd_una" of Go-Back-N.  Without it the gap
+                 * stays a gap and the receiver drops everything after it. */
+                if (c->snd_nxt - c->snd_una > n) c->snd_nxt = c->snd_una + n;
+                /* ...and the FIN goes back with it.  It sits immediately after
+                 * the queued data, so rewinding the data un-sends it too; a
+                 * FIN left marked sent is a FIN never sent again. */
+                c->fin_sent = 0;
+            } else if (c->fin_sent) {
+                tcp_emit_locked(c, c->fin_seq, TCP_FIN | TCP_ACK, NULL, 0);
+            }
+            /* Exponential backoff — a link that is dropping does not improve
+             * by being asked more often. */
+            c->rto_ms = c->rto_ms ? c->rto_ms * 2 : TCP_RTO_INITIAL_MS;
+            if (c->rto_ms > TCP_RTO_MAX_MS) c->rto_ms = TCP_RTO_MAX_MS;
+            c->rto_deadline_ns = now + (uint64_t)c->rto_ms * 1000000ull;
+        }
+
+        /* Zero-window persist.  When the peer advertises no room, nothing is
+         * outstanding, so the retransmit timer above is not armed — and the
+         * window update that would restart us is an ACK the peer may never
+         * send, or may send and lose.  Then both sides wait forever, each
+         * correctly.  One byte, periodically, is what breaks that. */
+        if (c->tx_len && c->snd_nxt == c->snd_una && c->snd_wnd == 0 &&
+            !c->rto_deadline_ns &&
+            (c->state == TCP_ST_ESTABLISHED || c->state == TCP_ST_CLOSE_WAIT)) {
+            /* A window probe asks one question — "how much room have you now?"
+             * — and the answer rides on the ACK it provokes.  snd_nxt is NOT
+             * advanced, and that is the whole subtlety:
+             *
+             *   - Advance it, and when the receiver (which by definition has
+             *     no room) DROPS the probe byte, the sender's next segment
+             *     starts one byte past what the receiver expects.  That hole
+             *     is repaired only by the retransmit timer, so EVERY window
+             *     reopen costs a full RTO.  Measured: a 32 KiB transfer to a
+             *     slow reader took 8.9 s instead of 0.4 s, with a zero-loss
+             *     link — the timer doing exactly its job, for a hole the
+             *     sender had dug itself.
+             *   - Leave it, and if the receiver happens to have room by then
+             *     it ACCEPTS the byte and acknowledges past snd_nxt — which
+             *     the ACK path handles explicitly (see there).
+             *
+             * The probe is re-sent by this same branch while the window stays
+             * shut, so it needs no timer of its own. */
+            (void)0;
+        }
+
+        /* Reclaim, in the one order that does not throw data away:
+         *
+         *   1. a TIME_WAIT that has served its purpose,
+         *   2. an orphan that has actually FINISHED (state CLOSED),
+         *   3. an orphan that has run out of patience.
+         *
+         * Rule 3 is a hard cap, not the normal exit.  An orphan with queued
+         * bytes is still WORKING — its ACKs, retransmissions and FIN all flow
+         * from this same sweep — and reclaiming it early is indistinguishable
+         * from the peer vanishing. */
+        if (c->state == TCP_ST_TIME_WAIT && c->linger_deadline_ns &&
+            now >= c->linger_deadline_ns) {
+            if (c->orphan) { tcp_free_locked(c); continue; }
+            c->state = TCP_ST_CLOSED;
+        }
+        if (c->orphan) {
+            if (c->state == TCP_ST_CLOSED) { tcp_free_locked(c); continue; }
+            if (c->linger_deadline_ns && now >= c->linger_deadline_ns) {
+                /* Out of time with work outstanding: say so rather than
+                 * disappearing quietly, because "the peer stopped
+                 * acknowledging" is a fact about the network and a silent
+                 * reclaim is a fact about nothing. */
+                if (c->tx_len)
+                    kprintf("tcp: abandoning %u unsent byte(s) to %u.%u.%u.%u:%u\n",
+                            c->tx_len, (c->peer_ip>>24)&0xFF, (c->peer_ip>>16)&0xFF,
+                            (c->peer_ip>>8)&0xFF, c->peer_ip&0xFF, c->peer_port);
+                tcp_free_locked(c);
+                continue;
+            }
+        }
+    }
+}
+
+static void tcp_sweep_fired(struct ktimer* t) {
+    (void)t;
+    uint32_t f = net_lock();
+    tcp_sweep_locked();
+    /* Re-arm from inside the callback: ktimer is one-shot, and a sweep that
+     * stops when a connection is quiet is a sweep that never resumes. */
+    if (g_tcp_sweeper_on) {
+        ktimer_arm(&g_tcp_sweeper, timer_now_ns() + (uint64_t)TCP_SWEEP_MS * 1000000ull,
+                   tcp_sweep_fired, NULL);
+    }
+    waitq_wake_all(&g_netwq);       /* a retransmit may have unblocked a waiter */
+    net_unlock(f);
+}
+
+/* Started on the first connection and never stopped.  A box that never opens a
+ * socket never arms it — same rule as netd (§M55): an idle machine must not pay
+ * for a subsystem it is not using. */
+static void tcp_sweeper_ensure(void) {
+    if (__atomic_exchange_n(&g_tcp_sweeper_on, 1, __ATOMIC_ACQ_REL)) return;
+    ktimer_arm(&g_tcp_sweeper, timer_now_ns() + (uint64_t)TCP_SWEEP_MS * 1000000ull,
+               tcp_sweep_fired, NULL);
+}
+
+/* ----------------------- waits -------------------------------------------- */
+
 #define TCP_CONNECT_MS   5000
 #define TCP_RECV_MS     10000
-#define TCP_QUIET_MS     2000       /* "no new data for this long" = done      */
+#define TCP_SEND_MS      5000
 #define TCP_FINWAIT_MS   1000
 
-static int tcp_established_cond(void* a) { (void)a; return g_tcp.established; }
-static int tcp_fin_cond(void* a)         { (void)a; return g_tcp.peer_fin;    }
+struct tcp_wait { struct tcp_conn* c; };
+
+static int tcp_estab_cond(void* a) {
+    struct tcp_conn* c = ((struct tcp_wait*)a)->c;
+    return c->state == TCP_ST_ESTABLISHED || c->state == TCP_ST_CLOSED || c->reset;
+}
 static int tcp_readable_cond(void* a) {
-    (void)a;
-    return g_tcp_rxconsumed < g_tcp_rxlen || g_tcp.peer_fin;
+    struct tcp_conn* c = ((struct tcp_wait*)a)->c;
+    return tcp_rx_avail(c) > 0 || c->peer_fin || c->reset;
+}
+static int tcp_writable_cond(void* a) {
+    struct tcp_conn* c = ((struct tcp_wait*)a)->c;
+    return c->tx_len < TCP_TXBUF || c->reset || c->state == TCP_ST_CLOSED;
+}
+static int tcp_drained_cond(void* a) {
+    struct tcp_conn* c = ((struct tcp_wait*)a)->c;
+    return c->tx_len == 0 || c->reset || c->state == TCP_ST_CLOSED;
+}
+static int tcp_accept_cond(void* a) {
+    struct tcp_conn* l = ((struct tcp_wait*)a)->c;
+    return l->aq_head != l->aq_tail || !l->used;
 }
 
-/* Open the connection: resolve the route, publish fresh state, send the SYN and
- * wait for the SYN-ACK.  Resolving happens FIRST and unlocked, because it is
- * the one step that can block; from here on every segment this connection sends
- * — including the ACKs generated on the RX path — is a pure send. */
-static int tcp_open(struct net_device* dev, uint32_t ip, uint16_t port) {
+/* ----------------------- public API --------------------------------------- */
+
+struct tcp_conn* net_tcp_connect(uint32_t ip, uint16_t port, uint32_t timeout_ms) {
+    struct net_device* dev = net_route(ip);
+    if (!dev) return NULL;
+
+    /* Resolve the next hop FIRST and unlocked — it is the one step that can
+     * block, and doing it here is what lets every later segment, including the
+     * ACKs generated on the RX path, be a pure send (§M55). */
     uint8_t mac[ETH_ALEN];
-    if (route_mac(dev, ip, mac) != 0) return -1;
+    if (route_mac(dev, ip, mac) != 0) return NULL;
+
+    tcp_sweeper_ensure();
 
     uint32_t f = net_lock();
-    g_tcp.state       = TCP_ST_SYN_SENT;
-    g_tcp.peer_ip     = ip;
-    mac_copy(g_tcp.peer_mac, mac);
-    g_tcp.peer_port   = port;
-    g_tcp.local_port  = 0xE000 + (g_tcp.local_port & 0x0FFF) + 1;  /* vary port */
-    g_tcp.snd_nxt     = 0x2000;                /* our ISN                      */
-    g_tcp.rcv_nxt     = 0;
-    g_tcp.established = 0;
-    g_tcp.peer_fin    = 0;
-    g_tcp.reset       = 0;
-    g_tcp_rxlen       = 0;
-    g_tcp_rxconsumed  = 0;
-    tcp_send_seg_locked(dev, TCP_SYN, NULL, 0);
-    g_tcp.snd_nxt += 1;                         /* SYN consumes a seq          */
+    struct tcp_conn* c = tcp_alloc_locked();
+    if (!c) { net_unlock(f); return NULL; }
+    c->dev        = dev;
+    c->local_ip   = dev->ip;
+    c->local_port = tcp_ephem_port_locked();
+    c->peer_ip    = ip;
+    c->peer_port  = port;
+    mac_copy(c->peer_mac, mac);
+    c->snd_una = c->snd_nxt = (g_tcp_isn += 0x10000);
+    c->snd_wnd = 1460;                    /* until they tell us otherwise      */
+    c->state   = TCP_ST_SYN_SENT;
+    tcp_emit_locked(c, c->snd_nxt, TCP_SYN, NULL, 0);
+    c->snd_nxt += 1;
+    tcp_arm_rto_locked(c);
     net_unlock(f);
 
-    if (!net_wait_cond(tcp_established_cond, NULL, TCP_CONNECT_MS)) {
-        f = net_lock(); g_tcp.state = TCP_ST_CLOSED; net_unlock(f);
-        return -1;
+    struct tcp_wait w = { c };
+    net_wait_cond(tcp_estab_cond, &w, timeout_ms ? timeout_ms : TCP_CONNECT_MS);
+
+    f = net_lock();
+    int ok = (c->state == TCP_ST_ESTABLISHED);
+    if (!ok) { tcp_free_locked(c); c = NULL; }
+    net_unlock(f);
+    return c;
+}
+
+struct tcp_conn* net_tcp_listen(uint32_t local_ip, uint16_t port, int backlog) {
+    tcp_sweeper_ensure();
+    uint32_t f = net_lock();
+    if (tcp_port_taken_locked(port)) { net_unlock(f); return NULL; }
+    struct tcp_conn* l = tcp_alloc_locked();
+    if (!l) { net_unlock(f); return NULL; }
+    l->listener   = 1;
+    l->state      = TCP_ST_LISTEN;
+    l->local_ip   = local_ip;              /* 0 = every local address          */
+    l->local_port = port;
+    l->backlog    = (uint8_t)(backlog <= 0 || backlog > TCP_ACCEPTQ - 1
+                              ? TCP_ACCEPTQ - 1 : backlog);
+    /* A listener has no device of its own: the child takes the device the SYN
+     * arrived on, which is how one listener serves every interface. */
+    net_unlock(f);
+    return l;
+}
+
+struct tcp_conn* net_tcp_accept(struct tcp_conn* l, uint32_t timeout_ms) {
+    if (!l || !l->listener) return NULL;
+    struct tcp_wait w = { l };
+    if (l->aq_head == l->aq_tail && timeout_ms)
+        net_wait_cond(tcp_accept_cond, &w, timeout_ms);
+
+    uint32_t f = net_lock();
+    struct tcp_conn* c = NULL;
+    if (l->used && l->aq_head != l->aq_tail) {
+        c = l->aq[l->aq_tail];
+        l->aq_tail = (uint8_t)((l->aq_tail + 1) % TCP_ACCEPTQ);
+        if (c) { c->parent = NULL; }        /* it belongs to its acceptor now  */
     }
-    return 0;
+    net_unlock(f);
+    return c;
 }
 
-/* Send our FIN and give the peer a moment to answer.  Shared by the HTTP
- * helper and the socket API so both close the same way. */
-static void tcp_shutdown(struct net_device* dev) {
+int net_tcp_send(struct tcp_conn* c, const void* buf, uint32_t len, int nonblock) {
+    if (!c || !c->used) return -1;
+    const uint8_t* p = (const uint8_t*)buf;
     uint32_t f = net_lock();
-    tcp_send_seg_locked(dev, TCP_FIN | TCP_ACK, NULL, 0);
-    g_tcp.snd_nxt += 1;
+    if (c->reset || c->state == TCP_ST_CLOSED) { net_unlock(f); return -1; }
+    if (c->state == TCP_ST_FIN_WAIT_1 || c->state == TCP_ST_FIN_WAIT_2 ||
+        c->state == TCP_ST_LAST_ACK   || c->fin_pending) { net_unlock(f); return -1; }
+    uint32_t room = TCP_TXBUF - c->tx_len;
     net_unlock(f);
-    net_wait_cond(tcp_fin_cond, NULL, TCP_FINWAIT_MS);
-    f = net_lock(); g_tcp.state = TCP_ST_CLOSED; net_unlock(f);
+
+    if (!room) {
+        /* A blocking send waits for the peer to acknowledge something; a
+         * non-blocking one says EAGAIN, which is the answer an event loop
+         * needs in order to go back to its poll rather than spin. */
+        if (nonblock) return NET_EAGAIN;
+        struct tcp_wait w = { c };
+        if (!net_wait_cond(tcp_writable_cond, &w, TCP_SEND_MS)) return NET_EAGAIN;
+    }
+
+    f = net_lock();
+    if (c->reset || c->state == TCP_ST_CLOSED) { net_unlock(f); return -1; }
+    room = TCP_TXBUF - c->tx_len;
+    uint32_t n = len < room ? len : room;
+    for (uint32_t i = 0; i < n; i++) c->tx[c->tx_len + i] = p[i];
+    c->tx_len += n;
+    tcp_output_locked(c);
+    net_unlock(f);
+    return (int)n;
 }
+
+/* Returns >0 bytes, 0 for a clean end of stream, NET_EAGAIN when nothing
+ * arrived in time, -1 on a broken connection.
+ *
+ * THE TIMEOUT IS NOT AN END OF FILE.  The previous version returned 0 both when
+ * the peer had closed and when ten seconds passed with nothing on the wire, so
+ * a slow server was indistinguishable from a finished one and every drain loop
+ * stopped early on a busy day. */
+int net_tcp_recv(struct tcp_conn* c, void* buf, uint32_t len, int nonblock,
+                 uint32_t timeout_ms) {
+    if (!c || !c->used) return -1;
+    struct tcp_wait w = { c };
+
+    uint32_t f = net_lock();
+    uint32_t avail = tcp_rx_avail(c);
+    net_unlock(f);
+
+    if (!avail) {
+        if (nonblock) {
+            uint32_t g = net_lock();
+            int fin = c->peer_fin, rst = c->reset;
+            net_unlock(g);
+            if (rst) return -1;
+            if (fin) return 0;
+            return NET_EAGAIN;
+        }
+        net_wait_cond(tcp_readable_cond, &w, timeout_ms ? timeout_ms : TCP_RECV_MS);
+    }
+
+    f = net_lock();
+    avail = tcp_rx_avail(c);
+    uint32_t n = avail < len ? avail : len;
+    uint8_t* out = (uint8_t*)buf;
+    for (uint32_t i = 0; i < n; i++) out[i] = c->rx[(c->rx_tail + i) % TCP_RXBUF];
+    c->rx_tail += n;
+    int fin = c->peer_fin, rst = c->reset;
+    /* Draining the ring re-opens the window.  Telling the peer costs one
+     * segment and is what un-stalls a sender that filled it — a window update
+     * nobody sends is a connection that stops for good. */
+    if (n && (c->state == TCP_ST_ESTABLISHED || c->state == TCP_ST_CLOSE_WAIT))
+        tcp_emit_locked(c, c->snd_nxt, TCP_ACK, NULL, 0);
+    net_unlock(f);
+
+    if (n) return (int)n;
+    if (rst) return -1;
+    if (fin) return 0;                       /* a real, drained end of stream  */
+    return NET_EAGAIN;                       /* nothing arrived in time        */
+}
+
+/* Readiness for poll/epoll, sampled in ONE locked read — a caller that read
+ * these separately could see "no data" and "no FIN" from two different instants
+ * and conclude the connection was merely quiet (§M56). */
+void net_tcp_state(struct tcp_conn* c, int* readable, int* writable,
+                   int* peer_fin, int* reset, int* connected) {
+    if (!c || !c->used) {
+        if (readable)  *readable  = 0;
+        if (writable)  *writable  = 0;
+        if (peer_fin)  *peer_fin  = 1;
+        if (reset)     *reset     = 1;
+        if (connected) *connected = 0;
+        return;
+    }
+    uint32_t f = net_lock();
+    if (readable)  *readable  = tcp_rx_avail(c) > 0;
+    if (writable)  *writable  = (c->state == TCP_ST_ESTABLISHED ||
+                                 c->state == TCP_ST_CLOSE_WAIT) && c->tx_len < TCP_TXBUF;
+    if (peer_fin)  *peer_fin  = c->peer_fin;
+    if (reset)     *reset     = c->reset;
+    if (connected) *connected = (c->state == TCP_ST_ESTABLISHED ||
+                                 c->state == TCP_ST_CLOSE_WAIT);
+    net_unlock(f);
+}
+
+int net_tcp_pending(struct tcp_conn* l) {
+    if (!l || !l->listener || !l->used) return 0;
+    uint32_t f = net_lock();
+    int n = (int)((l->aq_head + TCP_ACCEPTQ - l->aq_tail) % TCP_ACCEPTQ);
+    net_unlock(f);
+    return n;
+}
+
+void net_tcp_peer(struct tcp_conn* c, uint32_t* ip, uint16_t* port) {
+    if (!c || !c->used) { if (ip) *ip = 0; if (port) *port = 0; return; }
+    uint32_t f = net_lock();
+    if (ip)   *ip   = c->peer_ip;
+    if (port) *port = c->peer_port;
+    net_unlock(f);
+}
+
+void net_tcp_local(struct tcp_conn* c, uint32_t* ip, uint16_t* port) {
+    if (!c || !c->used) { if (ip) *ip = 0; if (port) *port = 0; return; }
+    uint32_t f = net_lock();
+    if (ip)   *ip   = c->local_ip;
+    if (port) *port = c->local_port;
+    net_unlock(f);
+}
+
+/* Half-close: send our FIN and keep the connection.  This is what
+ * shutdown(fd, SHUT_WR) means and it is not the same as close: the peer sees
+ * end-of-stream and may keep answering, which is exactly how "send the
+ * request, then tell them you are done, then read the reply" works. */
+void net_tcp_shutdown(struct tcp_conn* c) {
+    if (!c || !c->used || c->listener) return;
+    uint32_t f = net_lock();
+    if (c->state == TCP_ST_ESTABLISHED || c->state == TCP_ST_CLOSE_WAIT) {
+        c->fin_pending = 1;
+        c->state = (c->state == TCP_ST_CLOSE_WAIT) ? TCP_ST_LAST_ACK
+                                                   : TCP_ST_FIN_WAIT_1;
+        tcp_output_locked(c);
+    }
+    net_unlock(f);
+}
+
+void net_tcp_close(struct tcp_conn* c) {
+    if (!c || !c->used) return;
+
+    uint32_t f = net_lock();
+    if (c->listener) {
+        /* Everything the listener accepted but nobody took is its
+         * responsibility: refuse those peers rather than leaving them
+         * connected to a socket that no longer exists. */
+        while (c->aq_head != c->aq_tail) {
+            struct tcp_conn* p = c->aq[c->aq_tail];
+            c->aq_tail = (uint8_t)((c->aq_tail + 1) % TCP_ACCEPTQ);
+            if (p && p->used) {
+                tcp_emit_locked(p, p->snd_nxt, TCP_RST, NULL, 0);
+                tcp_free_locked(p);
+            }
+        }
+        tcp_free_locked(c);
+        net_unlock(f);
+        return;
+    }
+
+    int need_fin = (c->state == TCP_ST_ESTABLISHED || c->state == TCP_ST_CLOSE_WAIT);
+    if (need_fin) {
+        c->fin_pending = 1;
+        c->state = (c->state == TCP_ST_CLOSE_WAIT) ? TCP_ST_LAST_ACK
+                                                   : TCP_ST_FIN_WAIT_1;
+        tcp_output_locked(c);
+    }
+    net_unlock(f);
+
+    if (need_fin) {
+        /* Give the peer a moment to acknowledge — but do not BLOCK a close on
+         * a peer that has gone away.  Whatever is unfinished after this is the
+         * sweeper's problem, which is why the connection is marked an orphan
+         * rather than freed here. */
+        struct tcp_wait w = { c };
+        net_wait_cond(tcp_drained_cond, &w, TCP_FINWAIT_MS);
+    }
+
+    f = net_lock();
+    if (c->state == TCP_ST_CLOSED || c->reset) {
+        tcp_free_locked(c);
+    } else {
+        c->orphan = 1;
+        c->linger_deadline_ns = timer_now_ns() +
+                                (uint64_t)TCP_ORPHAN_MS * 1000000ull;
+    }
+    net_unlock(f);
+}
+
+/* Diagnostics for `netstat` and /proc/net/tcp. */
+void net_tcp_foreach(net_tcp_iter_fn fn, void* ctx) {
+    if (!fn) return;
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        uint32_t f = net_lock();
+        struct tcp_conn* c = &g_conns[i];
+        struct net_tcp_info info;
+        int used = c->used;
+        if (used) {
+            info.state      = TCP_STATE_NAMES[c->state < 10 ? c->state : 0];
+            info.local_ip   = c->local_ip;   info.local_port = c->local_port;
+            info.peer_ip    = c->peer_ip;    info.peer_port  = c->peer_port;
+            info.rx_queued  = tcp_rx_avail(c);
+            info.tx_queued  = c->tx_len;
+            info.tx_segs    = c->tx_segs;
+            info.rx_segs    = c->rx_segs;
+            info.retrans    = c->retrans;
+            info.listener   = c->listener;
+            info.dev        = c->dev ? c->dev->name : "-";
+        }
+        net_unlock(f);
+        if (used) fn(&info, ctx);
+    }
+}
+
+int net_tcp_capacity(void) { return TCP_MAX_CONNS; }
+
+void net_tcp_counters(uint32_t* rst_sent, uint32_t* rst_rcvd, uint32_t* noconn) {
+    if (rst_sent) *rst_sent = g_tcp_rst_sent;
+    if (rst_rcvd) *rst_rcvd = g_tcp_rst_rcvd;
+    if (noconn)   *noconn   = g_tcp_dropped;
+}
+
+void net_tcp_timing_counters(uint32_t* persists, uint32_t* rtos, uint32_t* zerowin) {
+    if (persists) *persists = g_tcp_persists;
+    if (rtos)     *rtos     = g_tcp_rtos;
+    if (zerowin)  *zerowin  = g_tcp_zerowin;
+}
+
+void net_tcp_output_counters(uint32_t* datasegs, uint32_t* wndblocked) {
+    if (datasegs)   *datasegs   = g_tcp_datasegs;
+    if (wndblocked) *wndblocked = g_tcp_wndblock;
+}
+
+/* ----------------------- HTTP helper (the `wget` engine) ------------------ */
+
+/* Its own accumulation buffer, no longer the connection's receive ring.  The
+ * two were the same object in the first slice, which is why a response larger
+ * than the ring could not be received at all: the reader never drained it,
+ * so the window it advertised went to zero and stayed there. */
+#define HTTP_BODY_CAP 65536
+static uint8_t  g_http_body[HTTP_BODY_CAP];
+static uint32_t g_http_body_len;
 
 int net_http_get(struct net_device* dev, uint32_t ip, uint16_t port,
                  const char* host, const char* path) {
-    if (tcp_open(dev, ip, port) != 0) {
-        kprintf("http: connect to %u.%u.%u.%u:%u timed out\n",
+    (void)dev;                                   /* the route decides now      */
+    struct tcp_conn* c = net_tcp_connect(ip, port, TCP_CONNECT_MS);
+    if (!c) {
+        kprintf("http: connect to %u.%u.%u.%u:%u failed\n",
                 (ip>>24)&0xFF,(ip>>16)&0xFF,(ip>>8)&0xFF,ip&0xFF, port);
         return -1;
     }
 
-    /* Build + send the request. */
     char req[512]; int n = 0;
     const char* parts[] = { "GET ", path, " HTTP/1.0\r\nHost: ", host,
                             "\r\nConnection: close\r\n\r\n" };
     for (int pi = 0; pi < 5; pi++)
-        for (const char* c = parts[pi]; *c && n < (int)sizeof(req) - 1; c++) req[n++] = *c;
-    uint32_t f = net_lock();
-    tcp_send_seg_locked(dev, TCP_PSH | TCP_ACK, req, (uint32_t)n);
-    g_tcp.snd_nxt += (uint32_t)n;
-    net_unlock(f);
+        for (const char* q = parts[pi]; *q && n < (int)sizeof(req) - 1; q++) req[n++] = *q;
+    net_tcp_send(c, req, (uint32_t)n, 0);
 
-    /* Drain until the peer FINs or the response goes quiet.  "Quiet" is now a
-     * duration rather than a spin count, so each round waits TCP_QUIET_MS and
-     * only gives up if nothing at all arrived in that window. */
-    uint32_t last_len = 0;
+    g_http_body_len = 0;
     for (;;) {
-        if (net_wait_cond(tcp_fin_cond, NULL, TCP_QUIET_MS)) break;
-        uint32_t now_len = g_tcp_rxlen;
-        if (now_len == last_len) break;
-        last_len = now_len;
+        uint8_t chunk[1024];
+        int r = net_tcp_recv(c, chunk, sizeof chunk, 0, 2000);
+        if (r == 0) break;                       /* peer closed — the response */
+        if (r < 0) break;                        /* error or nothing in 2 s    */
+        for (int i = 0; i < r && g_http_body_len < HTTP_BODY_CAP; i++)
+            g_http_body[g_http_body_len++] = chunk[i];
     }
-
-    tcp_shutdown(dev);
-    return (int)g_tcp_rxlen;
+    net_tcp_close(c);
+    return (int)g_http_body_len;
 }
 
-/* ---- general TCP client API (M24 socket API) -----------------------------
- * A minimal connect/send/recv/close over the same single-connection g_tcp
- * engine (one TCP socket at a time).  Backs SOCK_STREAM sockets in
- * usyscall.c.  Data is delivered in-order; recv blocks until data arrives or
- * the peer closes. */
-
-int net_tcp_connect(struct net_device* dev, uint32_t ip, uint16_t port) {
-    return tcp_open(dev, ip, port);
-}
-
-int net_tcp_send(struct net_device* dev, const void* buf, uint32_t len) {
-    uint32_t f = net_lock();
-    if (g_tcp.state != TCP_ST_ESTABLISHED && g_tcp.state != TCP_ST_CLOSING) {
-        net_unlock(f);
-        return -1;
-    }
-    /* One segment (callers send small requests; segmentation is a follow-up). */
-    if (len > ETH_MTU - 40) len = ETH_MTU - 40;
-    tcp_send_seg_locked(dev, TCP_PSH | TCP_ACK, buf, len);
-    g_tcp.snd_nxt += len;
-    net_unlock(f);
-    return (int)len;
-}
-
-int net_tcp_recv(struct net_device* dev, void* buf, uint32_t len) {
-    (void)dev;
-    net_wait_cond(tcp_readable_cond, NULL, TCP_RECV_MS);
-
-    /* Drain under the lock: the RX path appends to this very buffer, so the
-     * "how much is there" and the copy have to be one indivisible step. */
-    uint32_t f = net_lock();
-    uint32_t avail = g_tcp_rxlen - g_tcp_rxconsumed;
-    uint32_t cnt   = avail < len ? avail : len;
-    uint8_t* out   = (uint8_t*)buf;
-    for (uint32_t i = 0; i < cnt; i++) out[i] = g_tcp_rx[g_tcp_rxconsumed + i];
-    g_tcp_rxconsumed += cnt;
-    net_unlock(f);
-
-    return (int)cnt;                             /* 0 = EOF (peer FIN, drained) */
-}
-
-/* §M56/§M56.1 — readiness for poll/epoll on the connected stream socket.  Both
- * facts in one locked read, because they are read together and a caller that
- * sampled them separately could see "no data" and "no FIN" from two different
- * instants and conclude the connection was merely quiet.
- *
- * `readable` counts unread bytes only; the FIN is reported separately so a
- * loop can drain the tail before it acts on the hangup. */
-void net_tcp_state(int* readable, int* peer_fin, int* reset) {
-    uint32_t f = net_lock();
-    if (readable) *readable = (g_tcp_rxconsumed < g_tcp_rxlen);
-    if (peer_fin) *peer_fin = g_tcp.peer_fin;
-    if (reset)    *reset    = g_tcp.reset;
-    net_unlock(f);
-}
-
-void net_tcp_close(struct net_device* dev) {
-    if (g_tcp.state == TCP_ST_CLOSED) return;
-    tcp_shutdown(dev);
-}
-
-/* Expose the accumulated response so the shell `wget` command can print it. */
 const uint8_t* net_http_body(uint32_t* len_out) {
-    if (len_out) *len_out = g_tcp_rxlen;
-    return g_tcp_rx;
+    if (len_out) *len_out = g_http_body_len;
+    return g_http_body;
 }
+
 
 /* ----------------------- IPv4 --------------------------------------------- */
 
 static int ipv4_emit_locked(struct net_device* dev, const uint8_t* via_mac,
-                            uint32_t dst_ip, uint8_t proto,
+                            uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
                             const void* payload, uint32_t len) {
     /* Assemble [IPv4 header | payload] in a scratch buffer.  Static, and safe
      * because the caller holds the stack lock. */
@@ -1251,7 +2209,7 @@ static int ipv4_emit_locked(struct net_device* dev, const uint8_t* via_mac,
     ih->ttl       = 64;
     ih->proto     = proto;
     ih->checksum  = 0;
-    ih->src       = htonl(dev->ip);
+    ih->src       = htonl(src_ip);
     ih->dst       = htonl(dst_ip);
     ih->checksum  = net_checksum(ih, sizeof(struct ipv4_hdr));
 
@@ -1270,7 +2228,7 @@ int net_ipv4_send(struct net_device* dev, uint32_t dst_ip, uint8_t proto,
     if (route_mac(dev, dst_ip, mac) != 0) return -2;
 
     uint32_t f = net_lock();
-    int rc = ipv4_emit_locked(dev, mac, dst_ip, proto, payload, len);
+    int rc = ipv4_emit_locked(dev, mac, dev->ip, dst_ip, proto, payload, len);
     net_unlock(f);
     return rc;
 }
@@ -1284,7 +2242,11 @@ static void ipv4_input(struct net_device* dev, const uint8_t* src_mac,
     if (ihl < sizeof(struct ipv4_hdr) || ihl > len) return;
 
     uint32_t dst = ntohl(ih->dst);
-    if (dst != dev->ip && dst != 0xFFFFFFFFu) return;   /* not for us         */
+    /* An UNCONFIGURED device (dev->ip == 0) accepts anything addressed to it,
+     * because it does not yet know what it is addressed as.  That is not
+     * laxity, it is the only way DHCP can work: the reply that TELLS us our
+     * address is itself addressed to that address. */
+    if (dev->ip && dst != dev->ip && dst != 0xFFFFFFFFu) return;   /* not ours */
 
     uint32_t src = ntohl(ih->src);
     uint16_t total = ntohs(ih->total_len);
@@ -1295,7 +2257,7 @@ static void ipv4_input(struct net_device* dev, const uint8_t* src_mac,
     switch (ih->proto) {
         case IP_PROTO_ICMP: icmp_input(dev, src_mac, src, l4, l4len); break;
         case IP_PROTO_UDP:  udp_input (dev, src, l4, l4len); break;
-        case IP_PROTO_TCP:  tcp_input (dev, src, l4, l4len); break;
+        case IP_PROTO_TCP:  tcp_input (dev, src_mac, src, dst, l4, l4len); break;
         default: break;
     }
 }
@@ -1374,4 +2336,124 @@ void net_fmt_ip(uint32_t ip, char* buf) {
         if (i != 3) buf[pos++] = '.';
     }
     buf[pos] = '\0';
+}
+
+/* =============================================================================
+ * /proc/net (§M24 stage 8)
+ *
+ * The same information `lsnic`, `netstat` and `arp` print, as FILES — because
+ * a shell command can only be read by a person at a console, and a file can be
+ * read by a program, a test script, and a person over a serial line.  The
+ * shapes deliberately echo Linux's (/proc/net/dev, /proc/net/arp,
+ * /proc/net/route, /proc/net/tcp) without pretending to be byte-compatible
+ * with them: matching the columns exactly would invite tools to parse them,
+ * and this kernel does not promise what those tools would then rely on.
+ * ========================================================================== */
+
+static void pw_ip(struct procfs_writer* w, uint32_t ip) {
+    char b[16]; net_fmt_ip(ip, b); pw_puts(w, b);
+}
+
+static void gen_net_dev(struct procfs_writer* w) {
+    pw_puts(w, "iface  rx-packets rx-bytes tx-packets tx-bytes drops  address\n");
+    for (struct net_device* n = g_head; n; n = n->next) {
+        pw_puts(w, n->name); pw_puts(w, "  ");
+        pw_put_uint(w, n->rx_packets); pw_putc(w, ' ');
+        pw_put_uint(w, n->rx_bytes);   pw_putc(w, ' ');
+        pw_put_uint(w, n->tx_packets); pw_putc(w, ' ');
+        pw_put_uint(w, n->tx_bytes);   pw_putc(w, ' ');
+        pw_put_uint(w, n->rx_dropped); pw_putc(w, ' ');
+        pw_ip(w, n->ip); pw_putc(w, '/'); pw_ip(w, n->netmask);
+        if (n->flags & NETDEV_F_LOOPBACK) pw_puts(w, " loopback");
+        pw_putc(w, '\n');
+    }
+}
+
+static void gen_net_arp(struct procfs_writer* w) {
+    pw_puts(w, "address          hw-address\n");
+    uint32_t f = net_lock();
+    struct arp_entry snap[ARP_CACHE_SIZE];
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) snap[i] = g_arp[i];
+    net_unlock(f);
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+        if (!snap[i].valid) continue;
+        char mb[18]; net_fmt_mac(snap[i].mac, mb);
+        pw_ip(w, snap[i].ip); pw_puts(w, "  "); pw_puts(w, mb); pw_putc(w, '\n');
+    }
+}
+
+static void gen_net_route(struct procfs_writer* w) {
+    pw_puts(w, "destination      gateway          iface\n");
+    for (struct net_device* n = g_head; n; n = n->next) {
+        pw_ip(w, n->ip & n->netmask); pw_puts(w, "  ");
+        pw_puts(w, "-                ");
+        pw_puts(w, n->name); pw_putc(w, '\n');
+    }
+    struct net_device* d = net_primary();
+    if (d && d->gateway) {
+        pw_puts(w, "0.0.0.0          ");
+        pw_ip(w, d->gateway); pw_puts(w, "  "); pw_puts(w, d->name); pw_putc(w, '\n');
+    }
+}
+
+static void proc_tcp_row(const struct net_tcp_info* i, void* ctx) {
+    struct procfs_writer* w = (struct procfs_writer*)ctx;
+    pw_puts(w, i->state); pw_putc(w, ' ');
+    pw_ip(w, i->local_ip); pw_putc(w, ':'); pw_put_uint(w, i->local_port);
+    pw_puts(w, " -> ");
+    pw_ip(w, i->peer_ip);  pw_putc(w, ':'); pw_put_uint(w, i->peer_port);
+    pw_puts(w, "  rxq "); pw_put_uint(w, i->rx_queued);
+    pw_puts(w, " txq ");  pw_put_uint(w, i->tx_queued);
+    pw_puts(w, " retx "); pw_put_uint(w, i->retrans);
+    pw_puts(w, "  ");     pw_puts(w, i->dev);
+    pw_putc(w, '\n');
+}
+
+static void gen_net_tcp(struct procfs_writer* w) {
+    pw_puts(w, "state local -> peer  queues  device\n");
+    net_tcp_foreach(proc_tcp_row, w);
+    uint32_t rs = 0, rr = 0, nc = 0;
+    net_tcp_counters(&rs, &rr, &nc);
+    pw_puts(w, "resets-sent "); pw_put_uint(w, rs);
+    pw_puts(w, " resets-received "); pw_put_uint(w, rr);
+    pw_puts(w, " no-connection "); pw_put_uint(w, nc);
+    pw_putc(w, '\n');
+}
+
+static void gen_net_stat(struct procfs_writer* w) {
+    struct net_poller_stats st;
+    net_poller_stats(&st);
+    pw_puts(w, "poller "); pw_puts(w, st.running ? "running" : "stopped");
+    pw_puts(w, " waiters "); pw_put_uint(w, (unsigned)st.waiters);
+    pw_puts(w, " pumps ");   pw_put_uint(w, st.pumps);
+    pw_puts(w, " inline ");  pw_put_uint(w, st.inline_pumps);
+    pw_puts(w, " frames ");  pw_put_uint(w, st.frames);
+    pw_putc(w, '\n');
+    pw_puts(w, "irqs ");      pw_put_uint(w, st.irqs);
+    pw_puts(w, " backstops "); pw_put_uint(w, st.backstops);
+    pw_puts(w, " missed ");    pw_put_uint(w, st.missed_irqs);
+    pw_putc(w, '\n');
+    uint32_t pers = 0, rtos = 0, zwin = 0, dsegs = 0, wblk = 0;
+    net_tcp_timing_counters(&pers, &rtos, &zwin);
+    net_tcp_output_counters(&dsegs, &wblk);
+    pw_puts(w, "tcp data-segments "); pw_put_uint(w, dsegs);
+    pw_puts(w, " window-blocked ");   pw_put_uint(w, wblk);
+    pw_puts(w, " rtos ");             pw_put_uint(w, rtos);
+    pw_puts(w, " persists ");         pw_put_uint(w, pers);
+    pw_puts(w, " zero-window ");      pw_put_uint(w, zwin);
+    pw_putc(w, '\n');
+}
+
+static struct procfs_node nd_net_dev   = { .name = "net/dev",   .gen = gen_net_dev   };
+static struct procfs_node nd_net_arp   = { .name = "net/arp",   .gen = gen_net_arp   };
+static struct procfs_node nd_net_route = { .name = "net/route", .gen = gen_net_route };
+static struct procfs_node nd_net_tcp   = { .name = "net/tcp",   .gen = gen_net_tcp   };
+static struct procfs_node nd_net_stat  = { .name = "net/stat",  .gen = gen_net_stat  };
+
+void net_procfs_init(void) {
+    procfs_register(&nd_net_dev);
+    procfs_register(&nd_net_arp);
+    procfs_register(&nd_net_route);
+    procfs_register(&nd_net_tcp);
+    procfs_register(&nd_net_stat);
 }
