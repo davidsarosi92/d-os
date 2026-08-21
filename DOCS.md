@@ -99,6 +99,7 @@ when sections are added.)
 | 4.58 | A task is not dead while it is still running (M57 — the §M54 residual) | 6517 |
 | 4.59 | A network that can hold more than one conversation (M24, second half) | 6706 |
 | 4.60 | A window that resizes its contents too (§M42 follow-up) | 6960 |
+| 4.61 | What a drag actually costs (a measurement) | 7000 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -6979,6 +6980,59 @@ pixels and proved nothing; measuring the window's real rectangle out of the
 test actually press the thing it was aiming at.  After: the window spans
 1089×793 instead of 795×579, and the page text REFLOWS to the new width — a
 scaled-up image would not.
+
+---
+
+### 4.61 What a drag actually costs (a measurement, not yet a fix)
+
+Reported from use: *"a little lag when I drag the mouse with a big window."*
+The compositor already had damage-rect counters (`gui stats`, M22.3) but no
+TIME, and "lag" is a statement about duration — pixels are only a proxy for it,
+since the same rectangle costs a different number of milliseconds on a 4 GHz
+core and under emulation.
+
+So `compose()` now accumulates its own nanoseconds, and a MOVE drag prints a
+one-line summary when it ends (`gui.drag_stats`, off by default).  It has to be
+a report rather than a command: by the time anyone could type `gui stats` the
+drag is over and its cost has been averaged into everything else.
+
+**Measured on i386 under QEMU, the same 40-step drag on two window sizes:**
+
+| | 240×130 | 921×721 |
+|---|---|---|
+| motions / window moves | 42 / 40 | 42 / 40 |
+| composites | 45 | 45 |
+| blitted | 7.2 MB | 71 MB |
+| **time inside compose** | 338 ms (11 % of the drag) | **1630 ms (51 %)** |
+| **per composite** | 7.5 ms | **36 ms** |
+
+`DRAG_FRAME_MS` is 30, so with a big window **one composite takes longer than
+the interval between frames**: the compositor cannot keep up and the window
+trails the pointer.  That is the lag, quantified — it is not a stall or a lost
+wakeup, it is a fill-rate wall at about 43 MB/s of software compositing.
+
+**Two candidate savings were measured rather than assumed:**
+
+- *Skip the dragged window's SHADOW while it moves* — 1704 → 1420 ms, **−17 %**.
+  The shadow is an alpha blend over the whole window rect, and alpha costs
+  several times what a copy does.
+- *Skip the wallpaper where an opaque window covers the damage rect* — 1420 →
+  1384 ms, **−2 %**, i.e. nothing.  The reason is worth writing down: during a
+  drag the damage rect is the window UNION the strip it vacated, so it is never
+  fully covered.  The optimisation is real, it just does not apply to the case
+  that hurts.
+
+Both were reverted; what shipped is the instrument.  The structural fix is the
+classic one — a **screen-to-screen copy**: a moving window's pixels do not
+change, so the composited image could be copied from the old position and only
+the vacated strip repainted, turning three passes over the area into one.  That
+touches the flip buffer's age-2 replay and the overlap rules, so it is a
+change to make deliberately, with these numbers as the before.
+
+*The instrument is the deliverable here.*  The first version of it reported 15
+microseconds per frame for megabytes of blitting, because the accumulation sat
+BEFORE the draw and present passes — a measurement placed on the wrong side of
+the work does not understate it, it reports the work as free.
 
 ---
 

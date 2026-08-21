@@ -115,7 +115,12 @@ class Monitor:
 
     def __init__(self, path):
         self.sock = connect_unix(path)
-        self.sock.settimeout(2)
+        # A SHORT drain timeout.  With the obvious 2 s the drain after every
+        # command blocked until it expired whenever the monitor had nothing
+        # more to say — so each mouse_move cost ~1.6 s and a "drag" delivered
+        # under one event a second.  A harness that cannot reproduce the input
+        # rate cannot measure what that rate costs.
+        self.sock.settimeout(0.05)
         time.sleep(0.3)
         self._drain()
 
@@ -257,9 +262,11 @@ def main():
                 if mc.startswith("sleep "):
                     time.sleep(float(mc.split()[1]))
                     continue
-                print("+ monitor: %s" % mc, file=sys.stderr)
                 mon.cmd(mc)
-                time.sleep(0.12)
+                # Mouse MOTION is paced fast on purpose: a real mouse delivers
+                # ~100 events a second, and a harness that sends eight is not
+                # reproducing the load it claims to measure.
+                time.sleep(0.008 if mc.startswith("mouse_move") else 0.12)
             if a.screenshot:
                 mon.cmd("screendump " + os.path.abspath(a.screenshot))
                 time.sleep(2)

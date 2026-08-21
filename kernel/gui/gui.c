@@ -206,6 +206,18 @@ static int rubber_w, rubber_h;
 #define DRAG_FRAME_MS 30
 static uint64_t last_drag_frame_ms = 0;
 
+/* §perf — per-drag accounting, printed when the drag ends (gui.drag_stats=1).
+ *
+ * It has to be a REPORT rather than a command, because by the time anyone
+ * could type `gui stats` the drag is over and its cost has been averaged into
+ * everything else.  The figures are chosen to separate the two candidate
+ * explanations of "dragging lags": if `moved` is far below `motions` the
+ * window is being throttled, and if the compositor's own milliseconds fill the
+ * elapsed time the blit is the bottleneck. */
+static uint64_t drag_t0_ms, drag_compose0_ns;
+static uint32_t drag_motions, drag_frames, drag_f0;
+static uint64_t drag_px0;
+
 /* Double-click tracking (IRQ only). */
 static uint64_t lastclick_ms = 0;
 static int lastclick_x = -100, lastclick_y = -100;
@@ -319,6 +331,11 @@ static struct rect dmg_list[DMG_MAX];
 static int         dmg_n = 0;
 static uint32_t frames_full = 0, frames_partial = 0;
 static uint64_t total_blit_px = 0;              /* M22.7 — avg damage/frame */
+/* §perf — how much TIME the compositor spends, not just how many pixels it
+ * moves.  "The desktop lags when I drag a big window" is a statement about
+ * duration, and pixels are only a proxy for it: the same rectangle costs a
+ * different number of milliseconds on a 4 GHz core and under emulation. */
+static uint64_t total_compose_ns = 0;
 
 static int rects_overlap(const struct rect* r, int x0, int y0, int x1, int y1) {
     return !(x0 >= r->x1 || x1 <= r->x0 || y0 >= r->y1 || y1 <= r->y0);
@@ -1302,6 +1319,7 @@ static void draw_scene_rect(const struct scene_snapshot* s,
 }
 
 static void compose(void) {
+    uint64_t compose_t0 = timer_now_ns();
     /* 1. Snapshot + clear the damage LIST: anything damaged while we paint
      *    lands in the next frame. */
     struct rect rl[DMG_MAX + 2];
@@ -1397,6 +1415,13 @@ static void compose(void) {
                              fr[k].x1 - fr[k].x0, fr[k].y1 - fr[k].y0);
         }
     }
+
+    /* At the END, after the draw pass AND the present.  The first version of
+     * this accumulated before them and reported 15 microseconds a frame for
+     * megabytes of blitting — it was timing the bookkeeping, which is the
+     * cheapest thing in the function.  A measurement placed on the wrong side
+     * of the work does not merely understate it; it says the work is free. */
+    total_compose_ns += timer_now_ns() - compose_t0;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1845,6 +1870,14 @@ static void raise_window(struct gui_window* win) {
     zorder[zcount - 1] = win;
 }
 
+/* Read the gate ONCE.  This runs on the mouse path, and a string lookup in the
+ * config store per drag is a cost the feature is supposed to be measuring. */
+static int drag_report_on(void) {
+    static int cached = -1;
+    if (cached < 0) cached = (int)config_get_long("gui.drag_stats", 0);
+    return cached;
+}
+
 static void gui_mouse(int dx, int dy, unsigned buttons) {
     /* M22.4 — per-motion drag damage bookkeeping (filled under the
      * lock, consumed after unlock so gui_damage isn't nested deeper
@@ -1957,6 +1990,11 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
                     drag_win = win;
                     grab_dx  = mx - win->x;
                     grab_dy  = my - win->y;
+                    drag_t0_ms = timer_ticks_ms();
+                    drag_compose0_ns = total_compose_ns;
+                    drag_px0 = total_blit_px;
+                    drag_f0  = frames_full + frames_partial;
+                    drag_motions = drag_frames = 0;
                 }
             } else if (!win->maximized &&
                        mx >= win->x + win->w - GRIP &&
@@ -2004,8 +2042,10 @@ drag_update:
         if (tgt_y < 0)                   tgt_y = 0;
         if (tgt_y > work_h - TITLE_H)    tgt_y = work_h - TITLE_H;
         uint64_t now = timer_ticks_ms();
+        drag_motions++;
         if ((tgt_x != drag_win->x || tgt_y != drag_win->y) &&
             (uint64_t)(now - last_drag_frame_ms) >= DRAG_FRAME_MS) {
+            drag_frames++;
             last_drag_frame_ms = now;
             drag_old_x = drag_win->x;  drag_old_y = drag_win->y;
             drag_old_w = drag_win->w;  drag_old_h = drag_win->h;
@@ -2035,6 +2075,16 @@ drag_update:
     }
 
     if (released & MOUSE_BTN_LEFT) {
+        if (drag == DRAG_MOVE && drag_win && drag_report_on()) {
+            uint32_t ms  = (uint32_t)(timer_ticks_ms() - drag_t0_ms);
+            uint32_t cms = (uint32_t)((total_compose_ns - drag_compose0_ns) / 1000000ull);
+            uint32_t kb  = (uint32_t)(((total_blit_px - drag_px0) * 4) / 1024);
+            uint32_t fr  = (frames_full + frames_partial) - drag_f0;
+            kprintf("gui: drag %dx%d — %u motions, %u moved, %u frames, "
+                    "%u KB, %u ms in compose of %u ms elapsed\n",
+                    drag_win->w, drag_win->h, drag_motions, drag_frames,
+                    fr, kb, cms, ms);
+        }
         if (drag == DRAG_RESIZE) force_full = 1;       /* geometry changes */
         if (drag == DRAG_RESIZE && drag_win &&
             (rubber_w != drag_win->w || rubber_h != drag_win->h)) {
