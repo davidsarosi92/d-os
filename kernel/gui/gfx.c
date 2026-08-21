@@ -131,6 +131,38 @@ void gfx_line(struct gfx_surface* s, int x0, int y0, int x1, int y1, uint32_t co
     }
 }
 
+void gfx_move_within(struct gfx_surface* s, int sx, int sy,
+                     int dx, int dy, int w, int h) {
+    if (!s || !s->px || w <= 0 || h <= 0) return;
+
+    /* Clip both rectangles against the surface, in lockstep: whatever is
+     * trimmed from one end must be trimmed from the other, or the copy shifts
+     * by the difference and the image tears along that edge. */
+    if (sx < 0) { w += sx; dx -= sx; sx = 0; }
+    if (dx < 0) { w += dx; sx -= dx; dx = 0; }
+    if (sy < 0) { h += sy; dy -= sy; sy = 0; }
+    if (dy < 0) { h += dy; sy -= dy; dy = 0; }
+    if (sx + w > s->w) w = s->w - sx;
+    if (dx + w > s->w) w = s->w - dx;
+    if (sy + h > s->h) h = s->h - sy;
+    if (dy + h > s->h) h = s->h - dy;
+    if (w <= 0 || h <= 0) return;
+    if (sx == dx && sy == dy) return;
+
+    /* Row order follows the vertical direction, column order the horizontal
+     * one.  Both matter: a diagonal move that got either wrong smears the
+     * image in that axis, and the smear looks exactly like a driver bug. */
+    int down  = (dy > sy);
+    int right = (dx > sx);
+    for (int j = 0; j < h; j++) {
+        int row = down ? (h - 1 - j) : j;
+        uint32_t* dp = s->px + (size_t)(dy + row) * s->stride + dx;
+        const uint32_t* sp = s->px + (size_t)(sy + row) * s->stride + sx;
+        if (right) { for (int i = w - 1; i >= 0; i--) dp[i] = sp[i]; }
+        else       { for (int i = 0; i < w; i++)      dp[i] = sp[i]; }
+    }
+}
+
 void gfx_blit(struct gfx_surface* dst, int dx, int dy,
               const struct gfx_surface* src, int sx, int sy, int w, int h) {
     if (!dst || !dst->px || !src || !src->px) return;

@@ -56,6 +56,21 @@ void gfx_line(struct gfx_surface* s, int x0, int y0, int x1, int y1, uint32_t co
 /* Copy a w×h block from src(sx,sy) to dst(dx,dy).  Clips against both
  * surfaces.  Surfaces must not overlap (they never do today: window
  * content → backbuffer → framebuffer is a strict pipeline). */
+/* Move a rectangle WITHIN one surface, correct even when source and
+ * destination overlap.
+ *
+ * This is not gfx_blit with the same surface twice: gfx_blit walks rows
+ * top-to-bottom and pixels left-to-right, which reads source pixels a previous
+ * row has already overwritten whenever the destination is below/right of the
+ * source.  The copy direction has to follow the sign of the movement — the
+ * ancient bitblt rule, and the reason a "move" primitive exists at all.
+ *
+ * Clipped to the surface's BOUNDS, deliberately not to its clip rect: the
+ * compositor sets a clip per damage rect, and a move is one operation spanning
+ * several of them. */
+void gfx_move_within(struct gfx_surface* s, int sx, int sy,
+                     int dx, int dy, int w, int h);
+
 void gfx_blit(struct gfx_surface* dst, int dx, int dy,
               const struct gfx_surface* src, int sx, int sy, int w, int h);
 

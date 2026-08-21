@@ -20,6 +20,46 @@ focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **A DRAG IS A COPY NOW, NOT A REPAINT (2026-08-21, DOCS §4.61).**  Reported
+from use: *"a little lag when I drag a big window."*  The compositor had
+damage-rect counters but no TIME, and lag is a claim about duration — so
+`compose()` now accumulates its own nanoseconds and a MOVE drag prints a
+summary when it ends (`gui.drag_stats`).  **MEASURED FIRST:** the same 40-step
+drag costs 338 ms of compose on a 240×130 window and **1630 ms on a 921×721
+one — 36 ms per composite against a 30 ms frame budget**, i.e. one composite
+takes longer than the interval between frames and the window necessarily trails
+the pointer.  Not a stall, a fill-rate wall (~43 MB/s of software compositing).
+**TWO CANDIDATE SAVINGS WERE MEASURED, NOT ASSUMED** — skipping the dragged
+window's shadow is worth 17%, skipping the wallpaper under an opaque window is
+worth 2% (during a drag the damage rect is the window UNION the vacated strip,
+so it is never fully covered: a real optimisation that does not apply to the
+case that hurts) — and both were reverted in favour of the structural fix.
+**A MOVING WINDOW'S PIXELS DO NOT CHANGE**, so the composited image is COPIED
+inside the back buffer and only the leftovers are painted: **1630 → 986 ms, 22
+ms per composite, under budget.**  The move is passed OUT OF BAND (a
+`move_hint`) rather than as damage, which is what makes it safe: the copy path
+runs only when the damage list is otherwise EMPTY, so anything else that
+changed falls back to the painter — inspecting merged damage rects could not
+tell a window that MOVED from one that moved AND redrew, and the failure mode
+of guessing is a stale image nobody can explain.  **FOUR RULES, EACH A WAY TO
+GET IT WRONG:** copy FIRST and paint second (the vacated strip and the cursor's
+footprint are INSIDE the source, and the painter draws the window already
+moved); the window must be TOPMOST (anything above would be dragged along);
+**the cursor comes along for the ride** (`draw_cursor` paints into the back
+buffer, so the copy deposits a second cursor at old+delta — one small rect
+repainted after); and DIRECTION matters (`gfx_move_within` picks row/column
+order from the sign of the move, where a plain blit would read pixels it had
+already overwritten).  **THE REPORT COUNTS BOTH PATHS ON PURPOSE:** `40 copied,
+0 repainted` would mean the fallback is never exercised and therefore never
+tested — dragging the self-refreshing Task Manager gives `37 copied, 3
+repainted`, both paths in one drag, image correct.  Verified by SCREENDUMP on
+i386 + x86_64: a window dragged off another reveals it cleanly, a window
+dragged partly off-screen survives the clipping, NetSurf keeps its page and
+chrome.  *And the instrument's own first version reported 15 µs per frame for
+megabytes of blitting, because the accumulation sat BEFORE the draw and present
+passes — a measurement placed on the wrong side of the work does not understate
+it, it reports the work as free.*
+
 ✅ **NETSURF RESIZES ITS CONTENTS NOW (2026-08-16, DOCS §4.60).**  Reported from
 use: *the window grows, the page inside stays small.*  Only client-managed
 (dosgui) windows were affected, and the reason is structural: a resize allocates

@@ -214,8 +214,37 @@ static uint64_t last_drag_frame_ms = 0;
  * explanations of "dragging lags": if `moved` is far below `motions` the
  * window is being throttled, and if the compositor's own milliseconds fill the
  * elapsed time the blit is the bottleneck. */
+/* §perf — THE MOVE HINT: "this window went from here to there, and nothing
+ * else changed".
+ *
+ * A dragged window's pixels do not change — only its position does — so the
+ * composited image can be COPIED from the old place to the new one instead of
+ * being rebuilt out of wallpaper, shadow, chrome and content.  Measured, that
+ * rebuild was 36 ms per frame for a 921x721 window against a 30 ms frame
+ * budget, which is precisely what "the window trails the pointer" is made of.
+ *
+ * The hint is passed OUT OF BAND rather than as damage, and that is what makes
+ * the optimisation safe: compose takes the fast path only when the damage list
+ * is otherwise EMPTY.  Anything else that changed this frame — an app
+ * repainting, a window raising, the panel — puts a rect in that list and the
+ * whole thing falls back to the ordinary painter.  The alternative (inspecting
+ * merged damage rects to guess whether they are "only the drag") cannot
+ * distinguish a window that moved from one that moved AND redrew, and the
+ * failure mode of guessing wrong is a stale image nobody can explain. */
+struct move_hint {
+    int  active;
+    struct gui_window* win;
+    int  ox, oy, nx, ny, w, h;
+};
+static struct move_hint mv_hint;               /* guarded by state_lock      */
+
 static uint64_t drag_t0_ms, drag_compose0_ns;
 static uint32_t drag_motions, drag_frames, drag_f0;
+/* How many composites took the copy path and how many fell back.  Both
+ * numbers matter: all-fast would mean the fallback is never exercised (and so
+ * never tested), and all-slow would mean the optimisation is not running at
+ * all while the timing appears to improve for some other reason. */
+static uint32_t drag_fast, drag_slow;
 static uint64_t drag_px0;
 
 /* Double-click tracking (IRQ only). */
@@ -1348,13 +1377,49 @@ static void compose(void) {
     s.rrx = s.rry = 0;
     if (s.dwin) { s.rrx = s.dwin->x; s.rry = s.dwin->y; }
     s.fsnap = focused_win;
+    struct move_hint mh = mv_hint;
+    mv_hint.active = 0;                          /* consumed exactly once     */
     spin_unlock_irqrestore(&state_lock, fl);
+
+    /* ---- can this frame be a COPY instead of a repaint? ------------------
+     *
+     * Every condition below is a way the copy could produce a wrong image, so
+     * each one is a fall-back to the ordinary painter rather than a fix-up:
+     *
+     *  - OTHER DAMAGE (rn != 0).  Something else changed and the merged rects
+     *    can no longer be attributed; repaint everything.
+     *  - NOT TOPMOST.  The source rectangle is only the dragged window's own
+     *    pixels if nothing is drawn over it.  Anything above would be dragged
+     *    along with it — a window that never moved, smearing across the screen.
+     *  - MINIMISED / GONE / not the window being dragged now.
+     *  - A ZERO move, which the copy would spend its whole cost on. */
+    int fast = 0;
+    int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;      /* the union (draw + present) */
+    if (mh.active && mh.win && mh.win == s.dwin && s.zn > 0 &&
+        s.zsnap[s.zn - 1] == mh.win &&           /* topmost visible           */
+        rn == 0 &&                               /* nothing else changed      */
+        (mh.nx != mh.ox || mh.ny != mh.oy)) {
+        fast = 1;
+        bx0 = (mh.ox < mh.nx ? mh.ox : mh.nx) - 2;
+        by0 = (mh.oy < mh.ny ? mh.oy : mh.ny) - 2;
+        bx1 = (mh.ox > mh.nx ? mh.ox : mh.nx) + mh.w + 7;   /* +5 shadow, +2  */
+        by1 = (mh.oy > mh.ny ? mh.oy : mh.ny) + mh.h + 7;
+    } else if (mh.active && mh.win) {
+        /* The slow path still has to REPAINT the move, so the rects the drag
+         * did not add now go in. */
+        int ax0 = (mh.ox < mh.nx ? mh.ox : mh.nx) - 2;
+        int ay0 = (mh.oy < mh.ny ? mh.oy : mh.ny) - 2;
+        int ax1 = (mh.ox > mh.nx ? mh.ox : mh.nx) + mh.w + 7;
+        int ay1 = (mh.oy > mh.ny ? mh.oy : mh.ny) + mh.h + 7;
+        if (rn < DMG_MAX) rl[rn++] = (struct rect){ ax0, ay0, ax1, ay1 };
+    }
 
     /* 3. Cursor damage from HERE (M22.4): erase the last-drawn sprite and
      *    draw the fresh one — two SEPARATE small rects, appended to the
      *    list (not unioned with far-away window damage). */
     int cur_moved = (s.cx != last_cur_x || s.cy != last_cur_y);
-    if (rn == 0 && !cur_moved) return;          /* spurious wake */
+    int prev_cur_x = last_cur_x, prev_cur_y = last_cur_y;
+    if (rn == 0 && !cur_moved && !fast) return; /* spurious wake */
     if (cur_moved && rn < DMG_MAX + 2)
         rl[rn++] = (struct rect){ CUR_DMG_X(last_cur_x), CUR_DMG_Y(last_cur_y),
                                   CUR_DMG_X(last_cur_x) + CUR_DMG_W,
@@ -1364,6 +1429,71 @@ static void compose(void) {
                                   CUR_DMG_X(s.cx) + CUR_DMG_W,
                                   CUR_DMG_Y(s.cy) + CUR_DMG_H };
     last_cur_x = s.cx;  last_cur_y = s.cy;
+
+    /* 3b. THE COPY, and the small list of things that still have to be
+     *     painted around it.
+     *
+     * Order is load-bearing and there is only one correct one: COPY FIRST.
+     * The regions that need painting — the strip the window vacated, the
+     * cursor's old footprint — lie INSIDE the source rectangle, and the
+     * painter draws the scene as it is NOW (window already at its new
+     * position).  Painting any of them before the copy would feed the copy
+     * pixels that belong to the new frame, and the window would carry a band
+     * of wallpaper across the screen with it. */
+    int copy_x = 0, copy_y = 0, copy_w = 0, copy_h = 0;   /* what got filled  */
+    if (fast) {
+        int shx = mh.nx - mh.ox, shy = mh.ny - mh.oy;
+        /* The valid source window: on screen at BOTH ends, and above the
+         * panel — the taskbar is composited over the windows, so a source row
+         * inside the panel strip holds panel pixels, not the window's. */
+        int l = mh.ox, r = mh.ox + mh.w, t = mh.oy, b = mh.oy + mh.h;
+        if (l < 0) l = 0;
+        if (l < -shx) l = -shx;
+        if (t < 0) t = 0;
+        if (t < -shy) t = -shy;
+        if (r > fbsurf.w) r = fbsurf.w;
+        if (r > fbsurf.w - shx) r = fbsurf.w - shx;
+        if (b > work_h) b = work_h;
+        if (b > work_h - shy) b = work_h - shy;
+
+        if (r - l > 0 && b - t > 0) {
+            gfx_move_within(&backsurf, l, t, l + shx, t + shy, r - l, b - t);
+            copy_x = l + shx; copy_y = t + shy;
+            copy_w = r - l;   copy_h = b - t;
+        } else {
+            fast = 0;                            /* nothing worth copying     */
+        }
+    }
+
+    if (fast) drag_fast++;
+    if (mh.active && !fast) drag_slow++;
+
+    if (fast) {
+        /* Everything in the union EXCEPT what the copy just filled, as up to
+         * four rectangles: the vacated strips, the new shadow band, and any
+         * part of the destination the clipping above could not supply. */
+        struct rect keep = { copy_x, copy_y, copy_x + copy_w, copy_y + copy_h };
+        if (by0 < keep.y0 && rn < DMG_MAX + 2)
+            rl[rn++] = (struct rect){ bx0, by0, bx1, keep.y0 };
+        if (keep.y1 < by1 && rn < DMG_MAX + 2)
+            rl[rn++] = (struct rect){ bx0, keep.y1, bx1, by1 };
+        if (bx0 < keep.x0 && rn < DMG_MAX + 2)
+            rl[rn++] = (struct rect){ bx0, keep.y0, keep.x0, keep.y1 };
+        if (keep.x1 < bx1 && rn < DMG_MAX + 2)
+            rl[rn++] = (struct rect){ keep.x1, keep.y0, bx1, keep.y1 };
+
+        /* THE CURSOR CAME ALONG FOR THE RIDE.  draw_cursor paints the sprite
+         * INTO the back buffer, so the source rectangle had a cursor burned
+         * into it and the copy has just deposited a second one at
+         * (old cursor + the move).  It is a handful of pixels and it is inside
+         * the window, so repainting that one small rectangle removes it. */
+        int shx = mh.nx - mh.ox, shy = mh.ny - mh.oy;
+        if (rn < DMG_MAX + 2)
+            rl[rn++] = (struct rect){ CUR_DMG_X(prev_cur_x) + shx,
+                                      CUR_DMG_Y(prev_cur_y) + shy,
+                                      CUR_DMG_X(prev_cur_x) + shx + CUR_DMG_W,
+                                      CUR_DMG_Y(prev_cur_y) + shy + CUR_DMG_H };
+    }
 
     /* 4. Clamp each rect to the screen; drop empties. */
     struct rect fr[DMG_MAX + 2];
@@ -1378,14 +1508,28 @@ static void compose(void) {
         fr[fn++] = (struct rect){ x0, y0, x1, y1 };
         if (x0 == 0 && y0 == 0 && x1 == fbsurf.w && y1 == fbsurf.h) any_full = 1;
     }
+    /* The copied rectangle is not painted — but it MUST be presented, or the
+     * work stays in the back buffer and the screen shows the window still at
+     * its old place.  It goes in as a present-only entry, remembered by index
+     * so the draw pass below can step over exactly it. */
+    int skip_draw = -1;
+    if (fast && copy_w > 0 && copy_h > 0 && fn < DMG_MAX + 2) {
+        fr[fn] = (struct rect){ copy_x, copy_y, copy_x + copy_w, copy_y + copy_h };
+        skip_draw = fn++;
+    }
+
     if (fn == 0) return;
     if (any_full) frames_full++; else frames_partial++;
     for (int k = 0; k < fn; k++)                 /* actual damage this frame */
         total_blit_px += (uint64_t)(fr[k].x1 - fr[k].x0) * (fr[k].y1 - fr[k].y0);
 
-    /* 5. Draw pass — paint each rect into backsurf. */
-    for (int k = 0; k < fn; k++)
+    /* 5. Draw pass — paint each rect into backsurf.  The copied rectangle is
+     *    skipped: its pixels are already correct, and repainting them is the
+     *    entire cost this path exists to avoid. */
+    for (int k = 0; k < fn; k++) {
+        if (k == skip_draw) continue;
         draw_scene_rect(&s, fr[k].x0, fr[k].y0, fr[k].x1, fr[k].y1);
+    }
     gfx_clear_clip(&backsurf);
 
     /* 6. Present — blit each rect (M22.6 flip has buffer-age 2, so it also
@@ -1883,8 +2027,10 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
      * lock, consumed after unlock so gui_damage isn't nested deeper
      * than it has to be). */
     int drag_moved = 0;
-    int drag_old_x = 0, drag_old_y = 0, drag_old_w = 0, drag_old_h = 0;
-    int drag_new_x = 0, drag_new_y = 0;
+    /* Only the ORIGIN is still needed here: where the window came from, for
+     * the move hint.  The rest of the old bookkeeping (size, destination)
+     * moved into the hint itself when the drag stopped raising damage rects. */
+    int drag_old_x = 0, drag_old_y = 0;
     /* M22.7 — precise structural damage: the windows whose look changed
      * (focus highlight, z-order raise, minimize) instead of the whole
      * screen.  Captured under the lock, damaged after unlock. */
@@ -1995,6 +2141,7 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
                     drag_px0 = total_blit_px;
                     drag_f0  = frames_full + frames_partial;
                     drag_motions = drag_frames = 0;
+                    drag_fast = drag_slow = 0;
                 }
             } else if (!win->maximized &&
                        mx >= win->x + win->w - GRIP &&
@@ -2048,10 +2195,19 @@ drag_update:
             drag_frames++;
             last_drag_frame_ms = now;
             drag_old_x = drag_win->x;  drag_old_y = drag_win->y;
-            drag_old_w = drag_win->w;  drag_old_h = drag_win->h;
             drag_win->x = tgt_x;  drag_win->y = tgt_y;
-            drag_new_x = tgt_x;   drag_new_y = tgt_y;
             drag_moved = 1;
+            /* Publish the move.  If several motions coalesce before the
+             * compositor runs, the LAST one wins and the origin stays the
+             * position the screen actually shows — an intermediate origin
+             * would name pixels that were never on screen. */
+            if (!mv_hint.active || mv_hint.win != drag_win) {
+                mv_hint.ox = drag_old_x;  mv_hint.oy = drag_old_y;
+            }
+            mv_hint.active = 1;
+            mv_hint.win = drag_win;
+            mv_hint.nx = tgt_x;  mv_hint.ny = tgt_y;
+            mv_hint.w  = drag_win->w;  mv_hint.h = drag_win->h;
         }
         /* else: coalesce — the window catches up on the next allowed frame;
          * the cursor still glides (need_frame set below). */
@@ -2080,10 +2236,11 @@ drag_update:
             uint32_t cms = (uint32_t)((total_compose_ns - drag_compose0_ns) / 1000000ull);
             uint32_t kb  = (uint32_t)(((total_blit_px - drag_px0) * 4) / 1024);
             uint32_t fr  = (frames_full + frames_partial) - drag_f0;
-            kprintf("gui: drag %dx%d — %u motions, %u moved, %u frames, "
-                    "%u KB, %u ms in compose of %u ms elapsed\n",
+            kprintf("gui: drag %dx%d — %u motions, %u moved, %u frames "
+                    "(%u copied, %u repainted), %u KB, %u ms in compose of "
+                    "%u ms elapsed\n",
                     drag_win->w, drag_win->h, drag_motions, drag_frames,
-                    fr, kb, cms, ms);
+                    fr, drag_fast, drag_slow, kb, cms, ms);
         }
         if (drag == DRAG_RESIZE) force_full = 1;       /* geometry changes */
         if (drag == DRAG_RESIZE && drag_win &&
@@ -2119,11 +2276,12 @@ drag_update:
         panel_gen++;                            /* taskbar buttons may change */
         if (!hit) need_frame = 1;               /* click on empty desktop */
     } else if (drag_moved) {
-        /* Same margins as gui_damage_win (+5 shadow, +2 safety). */
-        gui_damage(drag_old_x - 2, drag_old_y - 2,
-                   drag_old_w + 9, drag_old_h + 9);
-        gui_damage(drag_new_x - 2, drag_new_y - 2,
-                   drag_old_w + 9, drag_old_h + 9);
+        /* NO damage rects for the move itself — the hint carries it, and
+         * compose decides whether it can copy the image instead of repainting
+         * it.  Damaging here as well would defeat the "nothing else changed"
+         * test the fast path is built on.  What is still needed is a FRAME:
+         * need_frame wakes the compositor without claiming any area. */
+        need_frame = 1;
     } else {
         need_frame = 1;                         /* cursor glide only */
     }

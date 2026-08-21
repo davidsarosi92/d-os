@@ -99,7 +99,7 @@ when sections are added.)
 | 4.58 | A task is not dead while it is still running (M57 — the §M54 residual) | 6517 |
 | 4.59 | A network that can hold more than one conversation (M24, second half) | 6706 |
 | 4.60 | A window that resizes its contents too (§M42 follow-up) | 6960 |
-| 4.61 | What a drag actually costs (a measurement) | 7000 |
+| 4.61 | What a drag actually costs — and the copy that fixed it | 7000 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -6983,7 +6983,7 @@ scaled-up image would not.
 
 ---
 
-### 4.61 What a drag actually costs (a measurement, not yet a fix)
+### 4.61 What a drag actually costs — and the copy that fixed it
 
 Reported from use: *"a little lag when I drag the mouse with a big window."*
 The compositor already had damage-rect counters (`gui stats`, M22.3) but no
@@ -7022,12 +7022,64 @@ wakeup, it is a fill-rate wall at about 43 MB/s of software compositing.
   fully covered.  The optimisation is real, it just does not apply to the case
   that hurts.
 
-Both were reverted; what shipped is the instrument.  The structural fix is the
-classic one — a **screen-to-screen copy**: a moving window's pixels do not
-change, so the composited image could be copied from the old position and only
-the vacated strip repainted, turning three passes over the area into one.  That
-touches the flip buffer's age-2 replay and the overlap rules, so it is a
-change to make deliberately, with these numbers as the before.
+Both were reverted.  The structural fix is the classic one and it is what
+shipped: **a screen-to-screen copy**.
+
+#### The copy path
+
+A dragged window's pixels do not change — only its position does — so the
+composited image is COPIED inside the back buffer from the old position to the
+new one, and only what is left over gets painted: the strip the window vacated,
+the new shadow band, and anything the clipping could not supply.
+
+The move is passed to the compositor **out of band** (a `move_hint`) instead of
+as damage, and that is what makes it safe: the fast path is taken only when the
+damage list is otherwise EMPTY.  Anything else that changed this frame — an app
+repainting, a window raising, the panel — puts a rect in that list and the
+frame falls back to the ordinary painter.  The alternative, inspecting merged
+damage rects to guess whether they are "only the drag", cannot distinguish a
+window that moved from one that moved AND redrew, and guessing wrong leaves a
+stale image nobody can explain.
+
+Four rules make the copy correct, and each was a way to get it wrong:
+
+- **Copy FIRST, paint second.**  The regions that still need painting — the
+  vacated strip, the cursor's footprint — lie INSIDE the source rectangle, and
+  the painter draws the scene as it is now, with the window already moved.
+  Painting any of them first would feed the copy pixels belonging to the new
+  frame, and the window would carry a band of wallpaper across the screen.
+- **The dragged window must be TOPMOST.**  The source rectangle is only its own
+  pixels if nothing is drawn over it; anything above would be dragged along
+  with it.
+- **The cursor comes along for the ride.**  `draw_cursor` paints into the back
+  buffer, so the source had a cursor burned into it and the copy deposits a
+  second one at (old cursor + the move).  That one small rectangle is repainted
+  after the copy.
+- **Direction matters.**  `gfx_move_within` picks its row and column order from
+  the sign of the movement; a plain blit walks top-to-bottom and would read
+  source pixels it had already overwritten.
+
+The copy is also clipped to the region above the taskbar, because the panel is
+composited over the windows: a source row inside the panel strip holds panel
+pixels, not the window's.  Whatever the clipping cannot supply is simply part
+of the repaint set.
+
+#### Measured after
+
+| same 40-step drag | before | after |
+|---|---|---|
+| 921×721, time in compose | 1630 ms | **986 ms** (x86_64: 1000 ms) |
+| 921×721, per composite | 36 ms | **22 ms** — under the 30 ms frame budget |
+| 240×130, time in compose | 338 ms | **247 ms** |
+
+The drag report counts both paths, and that is deliberate: `40 copied, 0
+repainted` would mean the fallback is never exercised and therefore never
+tested.  Dragging the **Task Manager**, which refreshes itself, gives `37
+copied, 3 repainted` — both paths in one drag, with the image correct
+afterwards.  Verified by screendump on i386 and x86_64: a window dragged off
+another reveals the one underneath cleanly, a window dragged partly off-screen
+survives the clipping, and NetSurf (`39 copied, 1 repainted`) keeps its page,
+toolbar, status bar and scrollbars intact.
 
 *The instrument is the deliverable here.*  The first version of it reported 15
 microseconds per frame for megabytes of blitting, because the accumulation sat
