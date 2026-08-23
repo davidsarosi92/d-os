@@ -39,6 +39,7 @@
 #include "widget.h"
 #include "ui.h"        /* §M65 — the menu bar */
 #include "itemview.h"  /* §M65 — the list is a MODEL + a table view now */
+#include "shortcut.h"  /* §M64 tail — Send to desktop writes a .lnk */
 #include "config.h"
 #include "vfs.h"
 #include "timer.h"
@@ -398,6 +399,38 @@ static void fm_del(struct w_button* b, void* ctx) {
 }
 
 /* Ren: selected entry → name from the input box (same directory). */
+/* §M64 tail — SEND TO DESKTOP.  The last piece of "a shortcut is a file": the
+ * file manager already creates, renames and deletes files, so the one thing it
+ * could not do was make the KIND of file the desktop reads.
+ *
+ * The target is `file:<path>`, not a copy of anything — a shortcut points at
+ * something that already exists, and §M64's one resolver already knows how to
+ * open a path through the GUI_APP_ASSOC association.  The icon is left to
+ * shortcut_add's default rather than guessed from the extension here: the
+ * mapping from content to icon belongs next to the icons, not in a menu
+ * handler, and guessing it in two places is how they drift. */
+static void fm_sendto(struct w_button* b, void* ctx) {
+    (void)b;
+    struct fileman* fm = (struct fileman*)ctx;
+    int sel = fm->iv ? fm->iv->sel : -1;
+    if (sel < 0) { w_label_set(fm->status, "select an entry first"); return; }
+
+    char p[FM_PATH_MAX];
+    path_join(p, (int)sizeof(p), fm->path, fm->names[sel]);
+
+    char target[FM_PATH_MAX + 8];
+    int n = 0;
+    const char* pre = "file:";
+    while (pre[n]) { target[n] = pre[n]; n++; }
+    for (int i = 0; p[i] && n < (int)sizeof target - 1; i++) target[n++] = p[i];
+    target[n] = '\0';
+
+    int rc = shortcut_add(fm->names[sel], target, NULL);
+    if (rc == 0)       w_label_set(fm->status, "sent to desktop");
+    else if (rc == -2) w_label_set(fm->status, "desktop is full");
+    else               w_label_set(fm->status, "could not write the shortcut");
+}
+
 static void fm_ren(struct w_button* b, void* ctx) {
     (void)b;
     struct fileman* fm = (struct fileman*)ctx;
@@ -506,6 +539,7 @@ static void fm_path_submit(struct w_textinput* t, void* ctx) {
 enum {
     FM_CMD_UP = 1, FM_CMD_MKDIR, FM_CMD_TOUCH, FM_CMD_REN, FM_CMD_COPY,
     FM_CMD_DEL, FM_CMD_VIEW, FM_CMD_REFRESH, FM_CMD_ROOT, FM_CMD_CLOSE,
+    FM_CMD_SENDTO,
 };
 
 static const struct ui_menu_def fm_menu[] = {
@@ -515,6 +549,7 @@ static const struct ui_menu_def fm_menu[] = {
     { "File",   "Rename",      FM_CMD_REN     },
     { "File",   "Copy",        FM_CMD_COPY    },
     { "File",   "Delete",      FM_CMD_DEL     },
+    { "File",   "Send to desktop", FM_CMD_SENDTO },
     { "File",   "-",           0              },
     { "File",   "Close",       FM_CMD_CLOSE   },
     { "View",   "Open",        FM_CMD_VIEW    },
@@ -538,6 +573,7 @@ static void fm_ui_event(struct gui_window* win, int id, int type, int value,
     case FM_CMD_REN:     fm_ren(NULL, fm);   break;
     case FM_CMD_COPY:    fm_copy(NULL, fm);  break;
     case FM_CMD_DEL:     fm_del(NULL, fm);   break;
+    case FM_CMD_SENDTO:  fm_sendto(NULL, fm); break;
     case FM_CMD_VIEW:    fm_view(NULL, fm);  break;
     case FM_CMD_REFRESH: fm_refresh(fm); gui_window_request_redraw(fm->win); break;
     case FM_CMD_ROOT:
