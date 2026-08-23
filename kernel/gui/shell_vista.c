@@ -22,6 +22,7 @@
 #include "gui.h"           /* gui_damage — the icon layer damages its own rects */
 #include "widget.h"        /* WPTR_* — §M58's pointer phases, shared vocabulary */
 #include "klog.h"          /* a drag must leave evidence on the serial log */
+#include "icons.h"         /* ICON_APP — the item_entry's default glyph */
 #include "gfx.h"
 #include "rtc.h"
 #include "keymap.h"
@@ -125,21 +126,124 @@ static void vista_draw_under(struct gfx_surface* back) {
     iview->draw(back, bx, by, bw, bh, m, icon_sel, 0);
 }
 
+static void icon_select(int idx);       /* §M64 tail — defined with the keys */
+
 static void vista_desktop_click(int x, int y, int dbl) {
     if (!iview || !iview->hit) return;
     int bx, by, bw, bh;
     icons_box(&bx, &by, &bw, &bh);
     int idx = iview->hit(x - bx, y - by, bw, bh, shortcut_model(), 0);
 
-    if (idx != icon_sel) {
-        int prev = icon_sel;
-        icon_sel = idx;
-        icons_damage_item(prev);
-        icons_damage_item(idx);
-    }
+    /* One selection routine for both input paths — two copies would be two
+     * chances for the mouse and the keyboard to disagree about what is
+     * highlighted, and only one of them would be on screen. */
+    icon_select(idx);
     /* Double-click activates.  We are on the desktop task with no lock held
      * (desktop.h), so the launch may do real work. */
     if (dbl && idx >= 0) shortcut_launch(idx);
+}
+
+/* ------------------------------------------------------------------------- */
+/* §M64 tail — KEYBOARD NAVIGATION.                                           */
+/*                                                                            */
+/* "The icon to the right" used to be "the next index", and with explicit      */
+/* slots it is not: item 5 may sit left of item 2.  So the neighbour is found  */
+/* GEOMETRICALLY, from the same rectangles the view draws — one source of      */
+/* truth again, and it works unchanged for the list view, where the geometry   */
+/* happens to agree with the order.                                            */
+/* ------------------------------------------------------------------------- */
+
+static int icon_rect_of(int i, int* cx, int* cy) {
+    int bx, by, bw, bh;
+    icons_box(&bx, &by, &bw, &bh);
+    int ox, oy, ow, oh;
+    if (!iview || !iview->rect ||
+        iview->rect(i, bw, bh, shortcut_model(), 0, &ox, &oy, &ow, &oh) != 0)
+        return -1;
+    *cx = ox + ow / 2;
+    *cy = oy + oh / 2;
+    return 0;
+}
+
+/* The nearest item strictly in direction (dx,dy).  The perpendicular offset is
+ * weighted four times the parallel one, so "right" prefers the same row and
+ * only falls to another row when that row has run out — which is what a person
+ * means by the word. */
+static int icon_neighbour(int from, int dx, int dy) {
+    const struct item_model* m = shortcut_model();
+    int n = m->count ? m->count(m->ctx) : 0;
+    int fx, fy;
+    if (from < 0 || icon_rect_of(from, &fx, &fy) != 0) return n ? 0 : -1;
+
+    int best = -1, best_score = 0;
+    for (int i = 0; i < n; i++) {
+        if (i == from) continue;
+        int cx, cy;
+        if (icon_rect_of(i, &cx, &cy) != 0) continue;
+        int along = (cx - fx) * dx + (cy - fy) * dy;
+        if (along <= 0) continue;                  /* not in that direction */
+        int perp  = (cx - fx) * dy + (cy - fy) * dx;
+        if (perp < 0) perp = -perp;
+        int score = along + 4 * perp;
+        if (best < 0 || score < best_score) { best = i; best_score = score; }
+    }
+    return best;
+}
+
+static void icon_select(int idx) {
+    if (idx == icon_sel) return;
+    int prev = icon_sel;
+    icon_sel = idx;
+    icons_damage_item(prev);
+    icons_damage_item(idx);
+    gui_desktop_icons_changed();
+    /* Selecting something is what gives the desktop the keyboard; clearing it
+     * hands Enter and Escape back to the console behind us. */
+    gui_desktop_focus(idx >= 0);
+
+    /* Which icon is selected is otherwise INVISIBLE without a screenshot, and
+     * a screenshot cannot be taken on the arch with no display device at all
+     * (§M60's reason for `wallpaper check`).  One line per deliberate user
+     * action, so the keyboard path and the mouse path are both observable on
+     * the serial log. */
+    struct item_entry e = { 0, 0, ICON_APP, 0 };
+    const struct item_model* m = shortcut_model();
+    if (idx >= 0 && m->get && m->get(m->ctx, idx, &e) == 0)
+        klog(KLOG_INFO, "gui", "desktop: selected %d (%s)\n", idx, e.label);
+    else
+        klog(KLOG_INFO, "gui", "desktop: selection cleared\n");
+}
+
+/* Move the selection one step, or start it.  A search that finds nothing must
+ * NOT clear the selection: at the edge of the field the honest answer to "move
+ * right" is "stay", and an icon that vanishes from under the arrow keys is how
+ * a keyboard user loses their place. */
+static void icon_move(int dx, int dy) {
+    if (icon_sel < 0) { icon_select(0); return; }
+    int nb = icon_neighbour(icon_sel, dx, dy);
+    if (nb >= 0) icon_select(nb);
+}
+
+static void vista_desktop_key(int keycode, int mods) {
+    (void)mods;
+    const struct item_model* m = shortcut_model();
+    int n = m->count ? m->count(m->ctx) : 0;
+    if (!n) return;
+
+    switch (keycode) {
+    case KC_RIGHT: icon_move( 1,  0); break;
+    case KC_LEFT:  icon_move(-1,  0); break;
+    case KC_DOWN:  icon_move( 0,  1); break;
+    case KC_UP:    icon_move( 0, -1); break;
+    case KC_HOME:  icon_select(0);     break;
+    case KC_END:   icon_select(n - 1); break;
+    case KC_ESC:   icon_select(-1);    break;
+    case KC_ENTER:
+        /* The desktop task, no lock (desktop.h) — so this may spawn. */
+        if (icon_sel >= 0 && icon_sel < n) shortcut_launch(icon_sel);
+        break;
+    default: break;
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -514,5 +618,6 @@ DESKTOP_SHELL(vista) = {
     .motion         = vista_motion,
     .desktop_click  = vista_desktop_click,
     .desktop_pointer = vista_desktop_pointer, /* §M64 tail — drag an icon */
+    .desktop_key    = vista_desktop_key,      /* §M64 tail — arrows + Enter */
     .second_tick    = vista_second_tick,
 };

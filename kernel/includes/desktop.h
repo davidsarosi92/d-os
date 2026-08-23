@@ -77,6 +77,16 @@ struct desktop_shell {
      * shell does not arrange anything. */
     void (*desktop_pointer)(int x, int y, int phase);
 
+    /* §M64 tail — a raw keycode that no window wanted.  The desktop is the
+     * focus of last resort: with nothing open, the arrow keys and Enter have
+     * no other owner, and until now they were DROPPED — an icon field you
+     * could only reach with a mouse, which is half the reason §M65 added Tab
+     * cycling to windows.
+     *
+     * Runs on the DESKTOP TASK with no lock held, like the two above, because
+     * Enter launches an app.  NULL = this shell ignores the keyboard. */
+    void (*desktop_key)(int keycode, int mods);
+
     /* Pointer events (mouse IRQ, WM lock held — see header comment). */
     int  (*click) (int x, int y);       /* non-zero = consumed           */
     void (*motion)(int x, int y);

@@ -421,6 +421,10 @@ struct pev { uint8_t type; int16_t x, y; };
 #define PEV_DESK_PRESS   4
 #define PEV_DESK_DRAG    5
 #define PEV_DESK_RELEASE 6
+/* §M64 tail — a keycode nothing else claimed; x carries the code, y the
+ * modifiers.  The queue's two fields are a point for the pointer events and a
+ * key here: one more event type, not one more queue. */
+#define PEV_DESK_KEY     7
 #define PEVQ_SZ 32
 static struct pev        pevq[PEVQ_SZ];
 static volatile uint32_t pevq_h = 0, pevq_t = 0;
@@ -433,6 +437,15 @@ static volatile uint32_t pevq_h = 0, pevq_t = 0;
  * A flag and not a pointer: the desktop is not an object that can be
  * destroyed mid-drag, which is exactly why the widget grab needed to be one. */
 static volatile int desk_grab = 0;
+
+/* §M64 tail — does the desktop hold the keyboard?  Published by the shell
+ * whenever its icon selection appears or clears (gui_desktop_focus), and read
+ * in the keyboard IRQ to decide whether Enter and Escape belong to a shortcut
+ * or to the shell behind the desktop.  A flag rather than a query because the
+ * reader is an interrupt handler and the writer is the desktop task. */
+static volatile int desk_focus = 0;
+
+void gui_desktop_focus(int on) { desk_focus = on ? 1 : 0; }
 
 /* M22.4 — set by the task-lifecycle hook (any context) and consumed by
  * the compositor loop: run every window's on_tick NOW instead of at
@@ -2001,6 +2014,8 @@ static void desktop_main(void) {
                  * taken for something else). */
                 if (shell && shell->desktop_click)
                     shell->desktop_click(e.x, e.y, e.type == PEV_DESK_DBL);
+            } else if (e.type == PEV_DESK_KEY) {
+                if (shell && shell->desktop_key) shell->desktop_key(e.x, e.y);
             } else if (e.type == PEV_DESK_PRESS || e.type == PEV_DESK_DRAG ||
                        e.type == PEV_DESK_RELEASE) {
                 /* §M64 tail — same contract as desktop_click above: the
@@ -2563,7 +2578,15 @@ static void dispatch_keycodes(void) {
         uint32_t fl = spin_lock_irqsave(&state_lock);
         struct gui_window* win = focused_win;
         spin_unlock_irqrestore(&state_lock, fl);
-        if (!win || !win->used || win->kind != WIN_APP) continue;
+        if (!win || !win->used || win->kind != WIN_APP) {
+            /* §M64 tail — NOBODY ELSE WANTED IT, so the desktop gets it.
+             * These keycodes used to be dropped here, which is why the icon
+             * field could be reached only with a mouse.  Queued rather than
+             * called: Enter activates a shortcut, and that spawns an app-host
+             * task — the desktop task's job, not the compositor's. */
+            pevq_push(PEV_DESK_KEY, (int)(e & 0xFF), (int)(e >> 8));
+            continue;
+        }
         struct app_event ae = { .type = AE_KEYCODE, .kc = (uint8_t)(e & 0xFF),
                                 .mods = (uint8_t)(e >> 8) };
         aq_push(win, ae);
@@ -3438,6 +3461,36 @@ static int gui_raw_key(uint8_t keycode, uint8_t mods) {
              * "not consumed" for those, so ps2_keyboard goes on to translate
              * and the character arrives as a second event. */
             return win->input_hook ? 0 : 1;
+        }
+
+        /* §M64 tail — NO WINDOW WANTED IT: the desktop is the focus of last
+         * resort.  These keycodes were dropped here, which is why the icon
+         * field could only be reached with a mouse.
+         *
+         * ENTER AND ESCAPE ARE GATED ON THE DESKTOP ACTUALLY HAVING A
+         * SELECTION, and that gate is not fussiness: the GUI suppresses the
+         * boot shell's console but keys still reach its VC, so consuming
+         * Enter unconditionally would make it impossible to submit a shell
+         * command while the desktop is up — including for the test harness
+         * that drives this build.  So the rule is the one a person already
+         * expects: select something and the desktop has the keyboard; clear
+         * the selection and it goes back.  The arrows are safe either way —
+         * nothing else was ever going to receive them. */
+        int nav = (keycode == KC_LEFT || keycode == KC_RIGHT ||
+                   keycode == KC_UP   || keycode == KC_DOWN  ||
+                   keycode == KC_HOME || keycode == KC_END);
+        int claim = (desk_focus && (keycode == KC_ENTER || keycode == KC_ESC));
+        if (nav || claim) {
+            uint32_t n = (kcq_h + 1) % KCQ_SZ;
+            if (n != kcq_t) {
+                kcq[kcq_h] = (uint16_t)(keycode | ((uint16_t)mods << 8));
+                kcq_h = n;
+            }
+            need_frame = 1;
+            /* Consume only what we CLAIMED.  An arrow key nothing else uses
+             * may as well fall through; Enter must not, or it would both open
+             * a shortcut and submit a shell line. */
+            return claim ? 1 : 0;
         }
         return 0;
     }

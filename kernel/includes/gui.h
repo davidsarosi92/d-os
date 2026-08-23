@@ -99,6 +99,14 @@ int  gui_wallpaper_reload(void);
  * boot shell before `gui`. */
 void gui_desktop_icons_changed(void);
 
+/* §M64 tail — the desktop shell says whether it currently holds the keyboard
+ * (i.e. something on the icon field is selected).  While it does, Enter and
+ * Escape are delivered to the shell's `desktop_key` instead of falling through
+ * to the console behind the desktop; while it does not, they reach the console
+ * exactly as before — which is what keeps a shell command typeable with the
+ * desktop up.  Called from the desktop task, read in the keyboard IRQ. */
+void gui_desktop_focus(int on);
+
 /* §M61 — change the display mode.  QUEUED: the switch happens on the
  * compositor task between frames, because a mode set while compose() is
  * mid-blit writes into a buffer that is about to be freed.  Returns 0 when the
