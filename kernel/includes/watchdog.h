@@ -63,10 +63,26 @@ void watchdog_unregister(void);
  * the watchdog task pets it; the NMI lockup handler (idt.c) logs + recovers. */
 void hw_watchdog_init(void);
 void hw_watchdog_pet(void);
+/* Non-zero once hw_watchdog_init() has armed the device.  The TICK pets it
+ * (task.c) and must not touch the ports before it is armed — nor at all when
+ * `kernel.hw_watchdog` is off. */
+int  hw_watchdog_armed(void);
+
+/* Deliberately wedge the boot CPU with interrupts off, so the hardware
+ * watchdog's NMI is the only thing that can end it.  `hardlock` in both
+ * shells.  The box REBOOTS on success — that is the pass condition. */
+void watchdog_hardlock_test(void);
 void hw_watchdog_disable(void);
 
 /* NMI lockup escalation counter, shared with the arch NMI handler (idt.c) so a
  * repeated fire (recovery failed) can escalate to reboot.  Defined in watchdog.c. */
 extern volatile uint32_t g_nmi_lockups;
+
+
+/* NMI-safe: layer 2's per-CPU scheduler-tick counter, now vs. at the last
+ * sweep.  Equal values = that CPU has stopped taking ticks, which is what a
+ * hard lockup IS.  Used by the NMI report so it names the wedged CPU rather
+ * than whichever CPU the alarm happened to interrupt (§4.67). */
+int watchdog_cpu_tick_state(int cpu, uint64_t* now_ticks, uint64_t* last_seen);
 
 #endif

@@ -16,6 +16,8 @@
 #include "task.h"
 #include "lock.h"
 #include "vmm.h"                 /* vmm_user_access_ok — validate the client px */
+#include "ui.h"                  /* §M65 — the shared toolkit, built from a blob */
+#include "kmalloc.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -230,4 +232,128 @@ void dosgui_destroy(int handle) {
      * routes, instead of this one clearing the slot early and the crash route
      * never clearing it at all. */
     if (d->win) gui_window_client_release(d->win);
+}
+
+/* ===========================================================================
+ * §M65 stage 4 — THE TOOLKIT, FROM RING 3.
+ *
+ * A client can already own a window and blit pixels into it.  What it could
+ * not do is use the SAME widgets the kernel-side apps use — and building a
+ * second toolkit in ring 3 would mean two of everything: two checkboxes, two
+ * layout engines, two sets of bugs.
+ *
+ * So the toolkit is shared, and the boundary carries DATA:
+ *
+ *   in   — a blob: a header, N fixed-size spec records, and a string pool.
+ *          Offsets, never pointers, because a pointer means nothing on the
+ *          other side of an address space.  This is why `struct ui_spec` was
+ *          designed as ints and strings in the first place (§M65 stage 1).
+ *   out  — the events the widgets raise, on the SAME queue the client already
+ *          drains for keys and clicks: type 5, carrying (id, type, value).
+ *
+ * REUSING THE EVENT STRUCT rather than widening it is deliberate: its layout
+ * is an ABI shared with clients that are already built (NetSurf's libnsfb
+ * backend), and a struct that grows breaks every one of them.  Three int32
+ * fields it already has say everything a UI event needs.
+ * ========================================================================= */
+
+#define DG_UI_MAGIC   0x49554F44u        /* "DOUI" */
+#define DG_UI_VERSION 1
+#define DG_UI_MAX_SPECS 64
+#define DG_UI_MAX_BLOB  (16 * 1024)
+
+/* On-the-wire record.  Fixed width, little-endian, no padding surprises: every
+ * field is int32 on purpose so the layout is identical on all three arches
+ * (§M56's epoll_event lesson — a struct whose size follows the word width is a
+ * struct that behaves differently per arch). */
+struct dg_ui_rec {
+    int32_t id, parent;
+    int32_t cls_off, text_off;           /* byte offsets into the string pool */
+    int32_t value, min, max, weight, flags;
+};
+
+struct dg_ui_hdr {
+    uint32_t magic, version;
+    int32_t  count;                      /* number of records                 */
+    int32_t  str_off, str_len;           /* string pool, relative to the blob  */
+};
+
+/* The event sink handed to ui_build: a widget event becomes a queue entry the
+ * client's existing poll loop returns. */
+static void dosgui_ui_event(struct gui_window* w, int id, int type, int value,
+                            void* ctx) {
+    (void)w;
+    struct dosgui_win* d = (struct dosgui_win*)ctx;
+    if (!d) return;
+    spin_lock(&d->lock);
+    int nt = (d->tail + 1) % DOSGUI_EVQ;
+    if (nt != d->head) {
+        struct dosgui_event* e = &d->evq[d->tail];
+        e->type    = 5;                  /* UI event                          */
+        e->keycode = (int32_t)id;
+        e->pressed = (int32_t)type;
+        e->x       = (int32_t)value;
+        e->y       = 0;
+        e->ch      = 0;
+        d->tail = nt;
+    }
+    spin_unlock(&d->lock);
+}
+
+int dosgui_ui_build(int handle, const void* blob, int len) {
+    struct dosgui_win* d = dosgui_owned(handle);
+    if (!d || !d->win || !blob) return -1;
+    if (len < (int)sizeof(struct dg_ui_hdr) || len > DG_UI_MAX_BLOB) return -1;
+
+    /* The blob is a RING-3 buffer: copy it in before looking at a single field,
+     * because every offset in it is about to be used as an index (§M46's rule —
+     * validate where the pointer's origin is known, then work on a kernel
+     * copy). */
+    char* buf = (char*)kmalloc((size_t)len);
+    if (!buf) return -1;
+    if (copy_from_user(buf, (uintptr_t)blob, (size_t)len) != 0) { kfree(buf); return -1; }
+
+    struct dg_ui_hdr* h = (struct dg_ui_hdr*)buf;
+    if (h->magic != DG_UI_MAGIC || h->version != DG_UI_VERSION) { kfree(buf); return -1; }
+    if (h->count < 0 || h->count > DG_UI_MAX_SPECS)             { kfree(buf); return -1; }
+    if (h->str_off < 0 || h->str_len < 0 ||
+        h->str_off > len || h->str_off + h->str_len > len)      { kfree(buf); return -1; }
+
+    int64_t need = (int64_t)sizeof *h + (int64_t)h->count * (int64_t)sizeof(struct dg_ui_rec);
+    if (need > len) { kfree(buf); return -1; }
+
+    /* Make the pool NUL-terminated at its end, so a truncated offset can only
+     * ever yield a short string — never a walk off the buffer. */
+    if (h->str_len > 0) buf[h->str_off + h->str_len - 1] = 0;
+
+    struct dg_ui_rec* rec = (struct dg_ui_rec*)(buf + sizeof *h);
+    struct ui_spec* sp = (struct ui_spec*)kcalloc((size_t)(h->count ? h->count : 1),
+                                                  sizeof *sp);
+    if (!sp) { kfree(buf); return -1; }
+
+    for (int i = 0; i < h->count; i++) {
+        const char* cls  = "";
+        const char* text = "";
+        if (rec[i].cls_off  >= 0 && rec[i].cls_off  < h->str_len)
+            cls  = buf + h->str_off + rec[i].cls_off;
+        if (rec[i].text_off >= 0 && rec[i].text_off < h->str_len)
+            text = buf + h->str_off + rec[i].text_off;
+        sp[i].id     = rec[i].id;
+        sp[i].parent = rec[i].parent;
+        sp[i].cls    = cls;
+        sp[i].text   = text;
+        sp[i].value  = rec[i].value;
+        sp[i].min    = rec[i].min;
+        sp[i].max    = rec[i].max;
+        sp[i].weight = rec[i].weight;
+        sp[i].flags  = rec[i].flags;
+    }
+
+    /* The controls COPY every string they are given (checkbox caption, radio
+     * options, text content), so the pool may die with this call — checked,
+     * because the alternative is a widget pointing into freed memory. */
+    int built = ui_build(d->win, sp, h->count, dosgui_ui_event, d);
+    kfree(sp);
+    kfree(buf);
+    return built;
 }

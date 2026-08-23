@@ -826,12 +826,134 @@ static uint32_t find_free_dir_slot(struct exfat_fs* fs,
     }
 }
 
-static int exfat_create(struct inode* dir, const char* name, struct inode** out) {
+/* ---------------------------------------------------------------------- */
+/* §M12 completion — mkdir / rmdir / unlink.                              */
+/*                                                                        */
+/* These were `NULL` with the comment "not in M12 DOD" since the FS        */
+/* landed, and everything they need already existed for files: the         */
+/* bitmap allocator, the FAT chain writer, the directory-slot finder, the  */
+/* entry-set checksum and the name hash.  What was missing was the small   */
+/* amount that makes a DIRECTORY different from a file:                    */
+/*                                                                        */
+/*   - it owns a cluster from the moment it exists (a file may have none), */
+/*     and that cluster must be ZEROED, because an all-zero entry is what  */
+/*     exFAT reads as "end of directory";                                  */
+/*   - its Stream Extension carries AllocationPossible + NoFatChain and a  */
+/*     DataLength of one cluster, where an empty file carries zeros;       */
+/*   - the File entry's attribute is DIRECTORY, not ARCHIVE.               */
+/*                                                                        */
+/* Deletion is the same in both directions: mark every entry of the set    */
+/* "not in use" (clear bit 7 of the type byte — the entry is preserved,    */
+/* which is what makes exFAT undelete possible and what fsck expects),     */
+/* then release the cluster chain to the bitmap.  A directory is refused   */
+/* while it still has entries, because a recursive delete is a POLICY and  */
+/* belongs one layer up (vfs_unlink_recursive already implements it).      */
+/* ---------------------------------------------------------------------- */
+
+/* Zero every sector of `cluster`.  An empty directory IS a zeroed cluster. */
+static int cluster_zero(struct exfat_fs* fs, uint32_t cluster) {
+    uint64_t lba = cluster_first_lba(fs, cluster);
+    uint32_t secs = fs->bytes_per_cluster / fs->bytes_per_sector;
+    for (uint32_t i = 0; i < secs; i++) {
+        struct bcache_buf* b = bcache_get(fs->dev, lba + i);
+        if (!b) return -1;
+        memset_(b->data, 0, fs->bytes_per_sector);
+        bcache_mark_dirty(b);
+        bcache_release(b);
+    }
+    return 0;
+}
+
+/* Clear a cluster's bit in the allocation bitmap. */
+static void bitmap_free(struct exfat_fs* fs, uint32_t cluster) {
+    if (!fs->bitmap_cluster || cluster < 2) return;
+    uint64_t idx = (uint64_t)cluster - 2;
+    if (idx >= fs->cluster_count) return;
+    uint64_t byte = idx / 8, bit = idx % 8;
+    uint64_t lba = cluster_first_lba(fs, fs->bitmap_cluster)
+                 + byte / fs->bytes_per_sector;
+    struct bcache_buf* b = bcache_get(fs->dev, lba);
+    if (!b) return;
+    b->data[byte % fs->bytes_per_sector] &= (uint8_t)~(1u << bit);
+    bcache_mark_dirty(b);
+    bcache_release(b);
+}
+
+/* Release a whole chain.  Walks the FAT when the chain is fat-linked; a
+ * NoFatChain run is contiguous, so its length comes from the size. */
+static void chain_free(struct exfat_fs* fs, uint32_t start, int no_fat_chain,
+                       uint64_t data_length) {
+    if (start < 2) return;
+    if (no_fat_chain) {
+        uint64_t n = (data_length + fs->bytes_per_cluster - 1) / fs->bytes_per_cluster;
+        if (n == 0) n = 1;
+        for (uint64_t i = 0; i < n; i++) bitmap_free(fs, (uint32_t)(start + i));
+        return;
+    }
+    uint32_t cur = start;
+    for (int guard = 0; guard < 1 << 20 && cur >= 2; guard++) {
+        uint32_t nxt = fat_next(fs, cur);
+        bitmap_free(fs, cur);
+        fat_set(fs, cur, 0);
+        if (nxt >= EXFAT_FAT_EOC_FIRST) break;
+        cur = nxt;
+    }
+}
+
+/* Mark the whole entry set at `slot` as not-in-use. */
+static int dirent_set_delete(struct exfat_fs* fs, uint32_t dir_cluster,
+                             int dir_nofat, uint32_t slot) {
+    struct dir_iter it = { .fs = fs, .first_cluster = dir_cluster,
+                           .no_fat_chain = dir_nofat };
+    uint8_t e[EXFAT_ENTRY_SIZE];
+    if (dir_entry_read(&it, slot, e) != 0) return -1;
+    if (e[0] != EXFAT_TYPE_FILE) return -1;
+    int sec = e[1];
+    for (int i = 0; i <= sec; i++) {
+        if (dir_entry_read(&it, slot + i, e) != 0) return -1;
+        e[0] &= (uint8_t)0x7F;          /* "not in use", entry preserved */
+        if (dir_entry_write(&it, slot + i, e) != 0) return -1;
+    }
+    return 0;
+}
+
+/* Is this directory empty?  Any in-use File entry means no. */
+static int dir_is_empty(struct exfat_fs* fs, uint32_t cluster, int no_fat) {
+    struct dir_iter it = { .fs = fs, .first_cluster = cluster,
+                           .no_fat_chain = no_fat };
+    uint8_t e[EXFAT_ENTRY_SIZE];
+    for (uint32_t i = 0; i < 4096; i++) {
+        if (dir_entry_read(&it, i, e) != 0) break;
+        if (e[0] == 0x00) break;                    /* end of directory */
+        if (e[0] == EXFAT_TYPE_FILE) return 0;      /* an in-use file/dir */
+    }
+    return 1;
+}
+
+static int exfat_make(struct inode* dir, const char* name, struct inode** out,
+                      int as_dir) {
     struct exfat_inode* dei = (struct exfat_inode*)dir->private;
     struct exfat_fs* fs = dei->fs;
 
     int name_len = (int)strlen_(name);
     if (name_len == 0 || name_len > EXFAT_MAX_NAME) return -1;
+
+    /* REFUSE AN EXISTING NAME.
+     *
+     * Without this the create path happily wrote a SECOND entry set with the
+     * same name, and the newest one shadowed the old: on the second boot
+     * `mkdir /mnt/store` "succeeded", produced a fresh EMPTY directory, and the
+     * sixteen packages already on the disk became invisible — so everything was
+     * rebuilt while `ls` from the shell (which had resolved the other one)
+     * showed them present.  The symptom pointed at caching; the cause was a
+     * missing existence check in the six lines above it. */
+    {
+        struct inode* dup = NULL;
+        if (exfat_lookup(dir, name, &dup) == 0 && dup) {
+            if (out) *out = dup;
+            return -7;                          /* already exists */
+        }
+    }
     int name_entries = (name_len + 14) / 15;
     if (name_entries > EXFAT_MAX_NAME_ENTRIES)      return -1;
     int sec_count    = 1 + name_entries;            /* stream + name entries */
@@ -849,21 +971,38 @@ static int exfat_create(struct inode* dir, const char* name, struct inode** out)
     uint8_t* fe  = set + 0 * EXFAT_ENTRY_SIZE;
     uint8_t* se  = set + 1 * EXFAT_ENTRY_SIZE;
 
+    /* A directory owns a cluster from the start; a file may own none. */
+    uint32_t new_cluster = 0;
+    if (as_dir) {
+        new_cluster = bitmap_alloc(fs);
+        if (!new_cluster) return -5;            /* volume full */
+        if (cluster_zero(fs, new_cluster) != 0) {
+            bitmap_free(fs, new_cluster);
+            return -6;
+        }
+        /* One cluster, contiguous → NoFatChain.  The FAT still gets an
+         * end-of-chain marker so a fat-walking tool sees a terminated chain
+         * rather than whatever the cluster held before. */
+        fat_set(fs, new_cluster, EXFAT_FAT_EOC);
+    }
+
     /* File Directory Entry. */
     fe[0] = EXFAT_TYPE_FILE;
     fe[1] = (uint8_t)sec_count;
     wle16(fe + 2, 0);                           /* checksum patched below */
-    wle16(fe + 4, EXFAT_ATTR_ARCHIVE);
+    wle16(fe + 4, as_dir ? EXFAT_ATTR_DIRECTORY : EXFAT_ATTR_ARCHIVE);
     /* Timestamps left as zero — acceptable to Linux fsck. */
 
     /* Stream Extension. */
     se[0] = EXFAT_TYPE_STREAM;
-    se[1] = 0;                                  /* no AllocPossible (empty file) */
+    /* flags: bit0 AllocationPossible, bit1 NoFatChain.  Both set for the
+     * directory's single contiguous cluster; an empty file has neither. */
+    se[1] = as_dir ? 0x03 : 0x00;
     se[3] = (uint8_t)name_len;
     wle16(se + 4, name_hash_ascii(name, name_len));
-    wle64(se + 0x08, 0);                        /* ValidDataLength */
-    wle32(se + 0x14, 0);                        /* FirstCluster */
-    wle64(se + 0x18, 0);                        /* DataLength */
+    wle64(se + 0x08, as_dir ? fs->bytes_per_cluster : 0);   /* ValidDataLength */
+    wle32(se + 0x14, new_cluster);                          /* FirstCluster   */
+    wle64(se + 0x18, as_dir ? fs->bytes_per_cluster : 0);   /* DataLength     */
 
     /* File Name entries. */
     int produced = 0;
@@ -899,17 +1038,53 @@ static int exfat_create(struct inode* dir, const char* name, struct inode** out)
 
     /* Build an inode mirroring the entries we just wrote. */
     struct parsed_file pf = {
-        .attrs         = EXFAT_ATTR_ARCHIVE,
+        .attrs         = as_dir ? EXFAT_ATTR_DIRECTORY : EXFAT_ATTR_ARCHIVE,
         .sec_count     = (uint8_t)sec_count,
-        .stream_flags  = 0,
+        .stream_flags  = as_dir ? 0x03 : 0,
         .name_length   = (uint8_t)name_len,
-        .first_cluster = 0,
-        .data_length   = 0,
+        .first_cluster = new_cluster,
+        .data_length   = as_dir ? fs->bytes_per_cluster : 0,
         .dirent_index  = slot,
     };
     struct inode* ino = build_inode(fs, &pf, dei->first_cluster, dei->no_fat_chain);
     if (!ino) return -4;
-    *out = ino;
+    if (out) *out = ino;
+    return 0;
+}
+
+static int exfat_create(struct inode* dir, const char* name, struct inode** out) {
+    return exfat_make(dir, name, out, 0);
+}
+
+static int exfat_mkdir(struct inode* dir, const char* name, struct inode** out) {
+    return exfat_make(dir, name, out, 1);
+}
+
+/* Remove `name` from `dir`.  Refuses a non-empty directory (-2, the code the
+ * VFS already documents for that case); a recursive delete is policy and lives
+ * one layer up. */
+static int exfat_unlink(struct inode* dir, const char* name,
+                        struct inode* child) {
+    struct exfat_inode* dei = (struct exfat_inode*)dir->private;
+    struct exfat_fs* fs = dei->fs;
+
+    /* The VFS resolved the dentry and hands us the inode; look it up only if it
+     * did not (an eager-tree fs would always have one — exFAT's lookup is lazy,
+     * so both routes have to work). */
+    struct inode* target = child;
+    if (!target && (exfat_lookup(dir, name, &target) != 0 || !target)) return -1;
+    struct exfat_inode* tei = (struct exfat_inode*)target->private;
+    if (!tei) return -1;
+
+    if (target->type == INODE_DIR &&
+        !dir_is_empty(fs, tei->first_cluster, tei->no_fat_chain))
+        return -2;                              /* not empty */
+
+    if (dirent_set_delete(fs, dei->first_cluster, dei->no_fat_chain,
+                          tei->dirent_index) != 0)
+        return -1;
+    chain_free(fs, tei->first_cluster, tei->no_fat_chain, target->size);
+    bcache_sync(fs->dev);
     return 0;
 }
 
@@ -934,8 +1109,8 @@ static const struct file_ops exfat_dir_ops = {
 static const struct inode_ops exfat_inode_ops_dir = {
     .lookup = exfat_lookup,
     .create = exfat_create,
-    .mkdir  = NULL,                 /* not in M12 DOD */
-    .unlink = NULL,
+    .mkdir  = exfat_mkdir,
+    .unlink = exfat_unlink,
 };
 
 /* ---------------------------------------------------------------------- */

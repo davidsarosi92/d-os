@@ -21,6 +21,14 @@
 #include "printf.h"
 #include "net.h"
 #include "net_cmds.h"
+#include "config.h"       /* §M63 stage 0 — setconf/getconf/saveconf */
+#include "wallpaper.h"
+#include "shortcut.h"
+#include "settings.h"
+#include "clipboard.h"
+#include "gui.h"
+#include "splash.h"
+#include "watchdog.h"   /* §M60 — one implementation, both shells */
 #include "pmm.h"
 #include "task.h"
 #include "percpu.h"    /* §M57 — smp_ncpus() for the runqueue audit + storm */
@@ -668,6 +676,24 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "tcploss"))  netcmd_tcploss(args);
         else if (s_eq(cmd, "lo"))       netcmd_lo(args);
         else if (s_eq(cmd, "dhcp"))     netcmd_dhcp(args);
+        /* §M60 — wallpaper.c hosts the command so ARM gets it too: the
+         * framebuffer differs MOST on this arch (virtio-gpu scanout, not a
+         * linear LFB), which is the last place a background test should be
+         * missing. */
+        else if (s_eq(cmd, "wallpaper")) wallpaper_cmd(args);
+        else if (s_eq(cmd, "shortcut"))  shortcut_cmd(args);
+        else if (s_eq(cmd, "conf"))      settings_cmd(args);
+        else if (s_eq(cmd, "clip"))      clipboard_cmd(args);
+        else if (s_eq(cmd, "mode"))      display_cmd(args);
+        else if (s_eq(cmd, "splash"))    splash_cmd(args);
+        else if (s_eq(cmd, "hardlock")) watchdog_hardlock_test();
+        /* §M63 stage 0 — config from ARM too.  These lived in shell.c only,
+         * so this arch could create a persistent store and then had no command
+         * able to write to it. */
+        else if (s_eq(cmd, "getconf"))  config_cmd_getconf(args);
+        else if (s_eq(cmd, "setconf"))  config_cmd_setconf(args);
+        else if (s_eq(cmd, "saveconf")) config_cmd_saveconf();
+        else if (s_eq(cmd, "config"))   config_dump();
         else if (s_eq(cmd, "clear"))  kprintf("\033[2J\033[H");
         else kprintf("unknown command '%s' (try 'help')\n", cmd);
     }

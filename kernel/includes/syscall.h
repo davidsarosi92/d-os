@@ -89,6 +89,17 @@
 #define SYS_GETSOCKNAME  46     /* (fd, u32* ip, int* port) → 0 / -1           */
 #define SYS_GETPEERNAME  47     /* (fd, u32* ip, int* port) → 0 / -1           */
 
+/* §M65 — THE DISPLAY BRIDGE, reachable from BOTH personalities under ONE
+ * number space.  These are d-os operations (Linux has no such calls), so the
+ * numbers are ours to choose — and choosing the same ones for the native ABI
+ * as for the Linux personality is what stops a program's window code from
+ * depending on which libc it was linked against. */
+#define SYS_DOSGUI_CREATE   0xD050  /* (w, h, title) → handle / -1             */
+#define SYS_DOSGUI_PRESENT  0xD051  /* (handle, px, w[, stride]) → 0 / -1      */
+#define SYS_DOSGUI_POLL     0xD052  /* (handle, ev*) → 1 / 0 / -1              */
+#define SYS_DOSGUI_DESTROY  0xD053  /* (handle) → 0                            */
+#define SYS_DOSGUI_UI_BUILD 0xD054  /* (handle, blob, len) → widgets built     */
+
 /* M36 shared structs (kernel + libc agree on the layout). */
 struct kstat {
     uint32_t size;

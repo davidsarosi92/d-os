@@ -52,7 +52,8 @@ X86_USER_BLOBS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
                   user/dnstest_blob.o user/httptest_blob.o \
                   user/threadtest_blob.o user/tlstest_blob.o \
                   user/posixtest_blob.o \
-                  user/wlclient_blob.o user/wlapp_blob.o
+                  user/wlclient_blob.o user/wlapp_blob.o \
+                  user/redirtest_blob.o user/uidemo_blob.o
 # NB: linuxhello is deliberately NOT here — it hard-codes the i386 Linux syscall
 # numbers and `int 0x80`, which is the whole point of that program (it mimics an
 # unmodified 32-bit Linux binary).  The x86_64 equivalent would be a separate
@@ -120,6 +121,11 @@ ifeq ($(ARCH),i386)
 
   ARCH_EXTRA_OBJS := kernel/hal/x86/ap_trampoline_blob.o $(X86_USER_BLOBS) \
                      user/linuxhello_blob.o
+
+  # §M60 — the embedded default wallpaper (all arches).
+  ifneq ($(wildcard assets/wallpaper-default.bmp),)
+    ARCH_EXTRA_OBJS += assets/wallpaper_blob.o
+  endif
 
   # REAL musl-linked programs are embedded ONLY when musl has been built
   # (`make musl`); otherwise the kernel builds without them.  This keeps the
@@ -310,6 +316,11 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/syscall_entry.s
 
   ARCH_EXTRA_OBJS := kernel/hal/x86_64/ap_trampoline_blob.o $(X86_USER_BLOBS)
+
+  # §M60 — the embedded default wallpaper (all arches).
+  ifneq ($(wildcard assets/wallpaper-default.bmp),)
+    ARCH_EXTRA_OBJS += assets/wallpaper_blob.o
+  endif
 
   # Tier B — in-tree user libc build knobs (x86_64).  -mno-sse* because the
   # kernel does not init/save FPU/XMM state for user tasks.
@@ -550,10 +561,16 @@ else ifeq ($(ARCH),aarch64)
   # so adding them here is the whole change.
   ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
                      user/forktest_blob.o user/pipetest_blob.o \
+                     user/redirtest_blob.o user/uidemo_blob.o \
                      user/sigtest_blob.o user/muslhello_muslblob.o \
                      user/epollmusl_muslblob.o \
                      user/netmuslserv_muslblob.o \
                      $(MUSL_COREUTIL_BLOBS)
+
+  # §M60 — the embedded default wallpaper (all arches).
+  ifneq ($(wildcard assets/wallpaper-default.bmp),)
+    ARCH_EXTRA_OBJS += assets/wallpaper_blob.o
+  endif
 
   # Tier B — in-tree user libc build knobs (aarch64).  Uses the cross toolchain
   # ($(CC)/$(LD)/$(CROSS)objcopy); user base is 4 GiB (above the identity map).
@@ -630,15 +647,29 @@ CORE_C_SRCS := \
     kernel/core/block.c \
     kernel/core/block_cache.c \
     kernel/core/lock.c \
+    kernel/core/splash.c \
     kernel/core/vc.c \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
     kernel/gui/dosgui.c \
     kernel/gui/widget.c \
+    kernel/gui/ui.c \
+    kernel/gui/w_controls.c \
+    kernel/gui/w_menubar.c \
     kernel/gui/wayland.c \
     kernel/gui/wl_keymap.c \
     kernel/gui/w_editor.c \
     kernel/gui/clipboard.c \
+    kernel/gui/wallpaper.c \
+    kernel/gui/vpath.c \
+    assets/splash_logo.c \
+    kernel/gui/icons.c \
+    kernel/gui/itemview.c \
+    kernel/gui/w_itemview.c \
+    kernel/gui/shortcut.c \
+    kernel/gui/settings.c \
+    kernel/gui/apps/controlpanel.c \
+    kernel/gui/apps/displaypanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
     kernel/gui/apps/fileman.c \
@@ -737,6 +768,7 @@ CORE_C_SRCS := \
     kernel/core/cron.c \
     kernel/core/console.c \
     kernel/core/lock.c \
+    kernel/core/splash.c \
     kernel/core/percpu.c \
     kernel/core/multiboot.c \
     kernel/core/module.c \
@@ -758,10 +790,23 @@ CORE_C_SRCS := \
     kernel/gui/gui.c \
     kernel/gui/dosgui.c \
     kernel/gui/widget.c \
+    kernel/gui/ui.c \
+    kernel/gui/w_controls.c \
+    kernel/gui/w_menubar.c \
     kernel/gui/wayland.c \
     kernel/gui/wl_keymap.c \
     kernel/gui/w_editor.c \
     kernel/gui/clipboard.c \
+    kernel/gui/wallpaper.c \
+    kernel/gui/vpath.c \
+    assets/splash_logo.c \
+    kernel/gui/icons.c \
+    kernel/gui/itemview.c \
+    kernel/gui/w_itemview.c \
+    kernel/gui/shortcut.c \
+    kernel/gui/settings.c \
+    kernel/gui/apps/controlpanel.c \
+    kernel/gui/apps/displaypanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
     kernel/gui/apps/fileman.c \
@@ -817,15 +862,29 @@ CORE_C_SRCS := \
     kernel/core/block.c \
     kernel/core/block_cache.c \
     kernel/core/lock.c \
+    kernel/core/splash.c \
     kernel/core/vc.c \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
     kernel/gui/dosgui.c \
     kernel/gui/widget.c \
+    kernel/gui/ui.c \
+    kernel/gui/w_controls.c \
+    kernel/gui/w_menubar.c \
     kernel/gui/wayland.c \
     kernel/gui/wl_keymap.c \
     kernel/gui/w_editor.c \
     kernel/gui/clipboard.c \
+    kernel/gui/wallpaper.c \
+    kernel/gui/vpath.c \
+    assets/splash_logo.c \
+    kernel/gui/icons.c \
+    kernel/gui/itemview.c \
+    kernel/gui/w_itemview.c \
+    kernel/gui/shortcut.c \
+    kernel/gui/settings.c \
+    kernel/gui/apps/controlpanel.c \
+    kernel/gui/apps/displaypanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
     kernel/gui/apps/fileman.c \
@@ -1239,9 +1298,23 @@ kernel: $(KERNEL_BIN)
 # Per-source compile rule.  The `@mkdir -p $(@D)` ensures the
 # build/<arch>/obj/<dir>/ tree exists before each invocation; without
 # it gcc would fail trying to write into a nonexistent directory.
+# HEADER DEPENDENCIES.  `-MMD -MP` makes the compiler emit a .d file listing
+# every header an object really included; including them below is what makes
+# `make` rebuild a .c when a header it uses changes.
+#
+# This is not a convenience.  Without it, editing a shared header and rebuilding
+# incrementally leaves objects compiled against the OLD struct layout linked
+# beside ones compiled against the new — and the failure is not a link error but
+# a wrong field offset: a jump through a garbage `ops` pointer, an array walked
+# with the wrong stride.  CLAUDE.md carried "run make clean after editing a
+# shared header" as a rule for exactly this reason, and the rule was forgotten
+# three times in one day (§M63's descriptor, §M65's `struct widget`), each time
+# costing a debugging session that ended in "…and it was the build".
+# A documented convention that must be remembered is a bug generator; this is
+# the fix.
 $(OBJ_DIR)/%.o: %.c
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(OBJ_DIR)/%.o: %.s
 	@mkdir -p $(@D)
@@ -1336,6 +1409,24 @@ user/forktest_$(ARCH).elf: user/libc.c user/forktest.c user/libc.h $(USER_CRT0_S
 	$(CC) $(USER_CFLAGS) -c user/forktest.c -o $(OBJ_DIR)/user/forktest.o
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/forktest.o $(OBJ_DIR)/user/libc.o
+
+
+user/uidemo_$(ARCH).elf: user/libc.c user/uidemo.c user/libc.h $(USER_CRT0_SRC)
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c    -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/uidemo.c  -o $(OBJ_DIR)/user/uidemo.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/uidemo.o $(OBJ_DIR)/user/libc.o
+
+
+user/redirtest_$(ARCH).elf: user/libc.c user/redirtest.c user/libc.h $(USER_CRT0_SRC)
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c       -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/redirtest.c  -o $(OBJ_DIR)/user/redirtest.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/redirtest.o $(OBJ_DIR)/user/libc.o
 
 
 user/forkexec_$(ARCH).elf: user/libc.c user/forkexec.c user/libc.h $(USER_CRT0_SRC)
@@ -1543,6 +1634,11 @@ DRM_PREFIX  := third_party/libdrm-$(ARCH)
 define MESA_SO_BLOB
 $(OBJ_DIR)/user/$(2)_blob.o: $(3)
 	@mkdir -p $$(@D)
+	# rm BEFORE the copy as well as after: the scratch path is arch-agnostic
+	# and therefore SHARED by every arch's build, so a leftover from an
+	# interrupted or concurrent run makes `cp` fail with "File exists" — an
+	# error that names the copy and says nothing about the real cause.
+	rm -f user/$(2)
 	cp $(3) user/$(2)
 	objcopy --input-target=binary $$(USER_OCARGS) user/$(2) $$@
 	rm -f user/$(2)
@@ -1635,6 +1731,19 @@ $(patsubst %,user/%.muslelf,$(MBEDTLS_PROGS)): user/%.muslelf: user/%.c $(MUSL_L
 $(OBJ_DIR)/third_party/cacert_blob.o: third_party/cacert.pem
 	@mkdir -p $(@D)
 	objcopy --input-target=binary $(USER_OCARGS) third_party/cacert.pem $@
+
+# §M60 — the default wallpaper, embedded so a fresh boot has a real background
+# rather than a gradient and an instruction.  It is a 24-bpp uncompressed BMP
+# because that is the one format the kernel decodes (wallpaper.c explains why
+# richer codecs belong in ring 3), converted once and committed: the build then
+# needs no image tooling at all, on any host.
+# $(USER_OBJCOPY), not bare objcopy — the aarch64 container carries only the
+# cross binutils (the lesson the muslblob rule below already records).
+$(OBJ_DIR)/assets/wallpaper_blob.o: assets/wallpaper-default.bmp
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) \
+	    assets/wallpaper-default.bmp $@
+
 
 $(OBJ_DIR)/user/%_muslblob.o: user/%.muslelf
 	@mkdir -p $(@D)
@@ -2255,3 +2364,7 @@ clean:
 
 clean-all:
 	rm -rf build
+
+# The dependency files produced above.  `-include` (not `include`) so a fresh
+# tree with no .d files yet is not an error.
+-include $(shell find $(OBJ_DIR) -name '*.d' 2>/dev/null)

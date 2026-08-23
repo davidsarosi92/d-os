@@ -97,6 +97,9 @@ static const struct abi_nument linux_i386_ents[] = {
      * put ABI_CONNECT on bind's number, and the failure was a bind that
      * returned ECONNREFUSED — the one errno that names the handler that
      * actually ran.  Verified against arch/x86/entry/syscalls/syscall_32.tbl. */
+    /* §M65 — d-os display-bridge op; the SAME number on every guest,
+     * because it is ours to choose (Linux has no such call). */
+    { 0xD054, ABI_UI_BUILD },
 };
 
 /* ---- Linux / amd64 -------------------------------------------------------- */
@@ -141,6 +144,9 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  54, ABI_SETSOCKOPT  },
     {  55, ABI_GETSOCKOPT  },
     { 288, ABI_ACCEPT4     },
+    /* §M65 — d-os display-bridge op; the SAME number on every guest,
+     * because it is ours to choose (Linux has no such call). */
+    { 0xD054, ABI_UI_BUILD },
 };
 
 /* ---- Linux / arm64 (the asm-generic numbering) ---------------------------- */
@@ -191,6 +197,9 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 209, ABI_GETSOCKOPT  },
     { 210, ABI_SHUTDOWN    },
     { 242, ABI_ACCEPT4     },
+    /* §M65 — d-os display-bridge op; the SAME number on every guest,
+     * because it is ours to choose (Linux has no such call). */
+    { 0xD054, ABI_UI_BUILD },
 };
 
 #define ARRAY_N(a) ((uint32_t)(sizeof(a) / sizeof((a)[0])))

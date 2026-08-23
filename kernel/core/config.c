@@ -119,8 +119,101 @@ int config_set(const char* key, const char* value) {
     return 0;
 }
 
-int config_save(void) {
-    struct file* f = vfs_open(CONF_PATH, VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+/* ------------------------------------------------------------------- */
+/* §M63 stage 0 — change notification + persistence.                    */
+/* ------------------------------------------------------------------- */
+
+/* Where a save actually lands.  Empty until a writable volume is attached. */
+static char persist_path[160] = "";
+
+static int starts_with_(const char* s, const char* pfx) {
+    while (*pfx) { if (*s++ != *pfx++) return 0; }
+    return 1;
+}
+
+void config_notify(const char* key, const char* value) {
+    if (!key) return;
+    int n = (int)(__stop_config_watches - __start_config_watches);
+    for (int i = 0; i < n; i++) {
+        const struct config_watch* w = &__start_config_watches[i];
+        if (!w->changed) continue;
+        if (w->prefix && *w->prefix && !starts_with_(key, w->prefix)) continue;
+        w->changed(key, value);
+    }
+}
+
+int config_apply(const char* key, const char* value) {
+    if (!key || !value) return -1;
+    /* Notify only on a REAL change.  Re-applying the same value happens all
+     * the time (a config file overlaid onto identical defaults, a panel
+     * re-writing what is already there), and a subsystem told to re-read on
+     * every no-op change would rebuild its state for nothing — at boot, that
+     * is the whole defaults table. */
+    const char* old = config_get(key, (const char*)0);
+    int same = old && streq(old, value);
+    int rc = config_set(key, value);
+    if (rc == 0 && !same) {
+        /* LOG the decision.  A settings change is a change to how the machine
+         * behaves, and until now the only trace of one was whatever the
+         * subsystem chose to print — so a panel that applied a value and a
+         * panel that silently did nothing produced the same (empty) log.  It
+         * also makes the Control Panel testable without a screen. */
+        klog(KLOG_INFO, "config", "%s = %s (was %s)\n", key, value,
+             old ? old : "unset");
+        config_notify(key, value);
+    }
+    return rc;
+}
+
+const char* config_persist_path(void) {
+    return persist_path[0] ? persist_path : (const char*)0;
+}
+
+/* Write the cache to `path`.  Split out of config_save so the persistent
+ * target and the ramfs one share one writer. */
+static int save_to(const char* path);
+
+int config_attach_persistent(const char* dir) {
+    if (!dir || !*dir) return -1;
+
+    /* Build "<dir>/d-os.conf".  A flat file in the volume root rather than
+     * "<dir>/etc/d-os.conf": creating a directory on exFAT is a code path this
+     * has no reason to depend on, and a config file you can see at the top of
+     * the disk is easier to rescue with another OS. */
+    int n = 0;
+    while (dir[n] && n < (int)sizeof persist_path - 12) { persist_path[n] = dir[n]; n++; }
+    if (n > 0 && persist_path[n - 1] == '/') n--;          /* no double slash */
+    const char* leaf = "/d-os.conf";
+    for (int i = 0; leaf[i]; i++) persist_path[n++] = leaf[i];
+    persist_path[n] = '\0';
+
+    /* Load it if it is there.  Overlay via config_apply so any subsystem that
+     * already consumed a key at boot is told the saved value differs — the
+     * keyboard layout is the live example: keymap picks its layout long before
+     * this runs. */
+    int loaded = config_load_path(persist_path);
+    if (loaded == 0) {
+        kprintf("config: persistent store %s loaded\n", persist_path);
+        return 0;
+    }
+
+    /* Not there (or unreadable).  Create it, which is also the only honest
+     * test of whether this volume can be written at all — a persistent path we
+     * merely HOPE is writable would turn every later save into a silent
+     * failure, which is the exact bug this milestone exists to remove. */
+    if (save_to(persist_path) == 0) {
+        kprintf("config: persistent store %s created\n", persist_path);
+        return 0;
+    }
+
+    persist_path[0] = '\0';
+    klog(KLOG_WARN, "config",
+         "%s not writable — settings will NOT survive a reboot\n", dir);
+    return -1;
+}
+
+static int save_to(const char* path) {
+    struct file* f = vfs_open(path, VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
     if (!f) return -1;
 
     /* Header comment so a hex-dump tells you what file this is. */
@@ -135,6 +228,70 @@ int config_save(void) {
     }
     vfs_close(f);
     return 0;
+}
+
+int config_save(void) {
+    /* The persistent target when one has been attached; the ramfs path
+     * otherwise.  Note this NEVER fails over from one to the other: if the
+     * disk write fails, saying so is the point — falling back to a copy in RAM
+     * would report success for a save that vanishes at the next boot. */
+    const char* p = config_persist_path();
+    return save_to(p ? p : CONF_PATH);
+}
+
+/* ------------------------------------------------------------------- */
+/* Shell commands — implemented HERE so both shells run one copy.       */
+/*                                                                      */
+/* §M24's rule, and this file was breaking it: `setconf`/`getconf`/     */
+/* `saveconf` lived in shell.c only, so on aarch64 (which runs its own  */
+/* serial_shell.c) there was NO way to change or save a setting at all. */
+/* The §M63 stage-0 work found it the obvious way — the persistent      */
+/* store was created on ARM, and then `saveconf` answered "unknown      */
+/* command".  Config is the last subsystem that should be reachable on  */
+/* one arch only.                                                       */
+/* ------------------------------------------------------------------- */
+
+void config_cmd_getconf(const char* key) {
+    while (key && *key == ' ') key++;
+    if (!key || !*key) { kprintf("getconf: missing key\n"); return; }
+    const char* v = config_get(key, (const char*)0);
+    if (v) kprintf("%s = %s\n", key, v);
+    else   kprintf("%s: not set\n", key);
+}
+
+void config_cmd_setconf(const char* args) {
+    while (args && *args == ' ') args++;
+    if (!args || !*args) { kprintf("setconf: missing args\n"); return; }
+    const char* p = args;
+    while (*p && *p != ' ') p++;
+    if (!*p) { kprintf("setconf: missing value\n"); return; }
+
+    char key[64];
+    int i = 0;
+    while (args + i < p && i < (int)sizeof key - 1) { key[i] = args[i]; i++; }
+    key[i] = 0;
+    const char* val = p + 1;
+    while (*val == ' ') val++;
+
+    /* config_apply, not config_set: a key typed by a person is a DECISION, and
+     * the subsystem that read it at boot has to hear about it. */
+    if (config_apply(key, val) == 0) kprintf("%s = %s\n", key, val);
+    else                             kprintf("setconf: failed\n");
+}
+
+void config_cmd_saveconf(void) {
+    /* Report the PATH, not just success.  "config saved." was true and
+     * useless: without a writable volume the save lands on ramfs and
+     * evaporates at the next boot, which is exactly what the person doing
+     * this needs to be told. */
+    const char* p = config_persist_path();
+    if (config_save() == 0) {
+        if (p) kprintf("config saved to %s (survives reboot)\n", p);
+        else   kprintf("config saved to %s on ramfs — will NOT survive a "
+                       "reboot (no writable volume)\n", CONF_PATH);
+    } else {
+        kprintf("saveconf: failed writing %s\n", p ? p : CONF_PATH);
+    }
 }
 
 /* Trim leading + trailing whitespace in place.  Returns a pointer into
@@ -164,11 +321,14 @@ static void parse_line(char* line) {
     char* key = trim(trimmed);
     char* val = trim(eq + 1);
     if (*key == 0) return;
-    config_set(key, val);
+    /* config_apply, not config_set: a file loaded AFTER boot (the persistent
+     * store, attached once the disk is mounted) carries decisions subsystems
+     * have already acted on, and the watchers are what let them catch up. */
+    config_apply(key, val);
 }
 
-int config_load(void) {
-    struct file* f = vfs_open(CONF_PATH, VFS_RDONLY);
+int config_load_path(const char* path) {
+    struct file* f = vfs_open(path, VFS_RDONLY);
     if (!f) return -1;                          /* not an error — file may not exist yet */
 
     /* Read entire file.  Cap at 16 KiB which is a lot for a conf file. */
@@ -192,6 +352,8 @@ int config_load(void) {
     kfree(buf);
     return 0;
 }
+
+int config_load(void) { return config_load_path(CONF_PATH); }
 
 void config_init(void) {
     /* Plant defaults first.  config_set replaces existing entries, so

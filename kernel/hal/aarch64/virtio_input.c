@@ -87,6 +87,7 @@ struct virtio_input_event { uint16_t type; uint16_t code; uint32_t value; } __at
 #define EV_REL 0x02
 #define REL_X  0x00
 #define REL_Y  0x01
+#define REL_WHEEL 0x08
 #define BTN_LEFT   0x110
 #define BTN_RIGHT  0x111
 #define BTN_MIDDLE 0x112
@@ -173,12 +174,21 @@ static void handle_key(uint16_t code, int32_t value) {
 static mouse_listener_t g_listener;
 void mouse_set_listener(mouse_listener_t fn) { g_listener = fn; }
 
-static int g_mdx, g_mdy;
+/* §M61 follow-up — the WHEEL.  virtio-input reports it as REL_WHEEL, so ARM
+ * gets scrolling for free where x86 needed the IntelliMouse knock.  The symbol
+ * has to exist here regardless: it is part of mouse.h's interface, and the
+ * shared GUI registers on it unconditionally — a link error on one arch is how
+ * an interface says it was only half implemented. */
+static mouse_wheel_t g_wheel;
+void mouse_set_wheel_listener(mouse_wheel_t fn) { g_wheel = fn; }
+
+static int g_mdx, g_mdy, g_mdz;
 static unsigned g_mbtn;
 
 static void handle_rel(uint16_t code, int32_t value) {
     if (code == REL_X) g_mdx += value;
     else if (code == REL_Y) g_mdy += value;
+    else if (code == REL_WHEEL) g_mdz += value;   /* positive = wheel up */
 }
 static void handle_btn(uint16_t code, int32_t value) {
     unsigned bit = 0;
@@ -192,7 +202,10 @@ static void flush_mouse(void) {
     /* EV_SYN only follows real REL/BTN events, so a flush here always reflects
      * a change (motion and/or a button transition). */
     if (g_listener) g_listener(g_mdx, g_mdy, g_mbtn);
-    g_mdx = g_mdy = 0;
+    /* Reported separately from motion, same contract as the PS/2 driver: a
+     * wheel delta routed as dy would move the cursor instead of scrolling. */
+    if (g_mdz && g_wheel) g_wheel(g_mdz);
+    g_mdx = g_mdy = g_mdz = 0;
 }
 
 static void dispatch_event(struct virtio_input_event* e) {

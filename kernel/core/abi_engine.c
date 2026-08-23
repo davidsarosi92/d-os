@@ -10,6 +10,7 @@
  * ============================================================================= */
 
 #include "abi.h"
+#include "dosgui.h"     /* §M65 — the toolkit build op */
 #include "printf.h"
 #include "epoll.h"        /* EPOLL_CTL_* — the guest's own numbers */
 #include "syscall.h"
@@ -55,6 +56,14 @@ static long h_munmap(struct abi_ctx* c) {
     (void)c;
     return 0;
 }
+/* §M65 — build the shared widget toolkit inside a dosgui window.  The blob
+ * pointer is a ring-3 address; dosgui_ui_build copies it in before reading a
+ * single field, which is where that check belongs (the pointer's ORIGIN is
+ * known there, §M46's rule). */
+static long h_ui_build(struct abi_ctx* c) {
+    return dosgui_ui_build((int)c->a[0], (const void*)c->a[1], (int)c->a[2]);
+}
+
 static long h_getpid(struct abi_ctx* c) {
     (void)c;
     struct task* t = task_current();
@@ -708,6 +717,7 @@ static const struct {
     [ABI_MPROTECT] = { "mprotect", h_mprotect },
     [ABI_MUNMAP]   = { "munmap",   h_munmap },
     [ABI_GETPID]   = { "getpid",   h_getpid },
+    [ABI_UI_BUILD] = { "ui_build", h_ui_build },
     [ABI_GETPPID]  = { "getppid",  h_getppid },
     [ABI_GETTID]   = { "gettid",   h_getpid },      /* no separate tid space */
     [ABI_EXIT]     = { "exit",     h_exit },

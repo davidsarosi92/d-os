@@ -25,6 +25,7 @@
 #include "syscall.h"
 #include "task.h"
 #include "crash.h"      /* §M47 — record every fault */
+#include "watchdog.h"   /* §4.67 follow-up — name the STALLED cpu in an NMI */
 #include "lapic.h"
 #include "ioapic.h"
 #include "pci.h"
@@ -309,13 +310,54 @@ void isr_handler(struct int_frame* f) {
         extern volatile uint32_t g_nmi_lockups;
         g_nmi_lockups++;
         struct task* cur = task_current();
+        /* §M54's dump bracket, applied to the NMI report too: when several
+         * CPUs take the alarm at once their characters interleaved and the
+         * result was unreadable — which cost real time diagnosing the very
+         * bug this path exists to report (§4.67).  Bounded + lock-free, so a
+         * holder that never releases still lets the next CPU print. */
+        crash_dump_begin();
         serial_write("\n!! NMI HARD-LOCKUP rip=");
         ser_hex64(f->rip);
         serial_write(" cs="); ser_hex64(f->cs);
+        serial_write(" cpu="); ser_hex64((uint64_t)this_cpu_id());
         serial_write("\n");
+
+        /* WHICH CPU ACTUALLY STOPPED — see the i386 copy for the argument: the
+         * alarm interrupts one CPU and that is routinely an IDLE one, so the
+         * rip above can name the healthiest CPU in the machine.  Layer 2's
+         * per-CPU tick counters say which one really stopped. */
+        {
+            /* The signal is the SMALLEST PROGRESS, not equality: the sweep's
+             * snapshot is up to WD_SWEEP_MS old, so a CPU that wedged just
+             * after it still shows a few ticks.  Two passes, both plain reads:
+             * find the least-advanced CPU, then print every CPU's delta and
+             * point at that one. */
+            int n = smp_ncpus();
+            if (n > 64) n = 64;
+            uint64_t best = ~0ull;
+            int worst = -1;
+            for (int i = 0; i < n; i++) {
+                uint64_t nowt = 0, seen = 0;
+                if (watchdog_cpu_tick_state(i, &nowt, &seen) != 0) continue;
+                uint64_t d = nowt - seen;
+                if (d < best) { best = d; worst = i; }
+            }
+            for (int i = 0; i < n; i++) {
+                uint64_t nowt = 0, seen = 0;
+                if (watchdog_cpu_tick_state(i, &nowt, &seen) != 0) continue;
+                serial_write("   cpu "); ser_hex64((uint64_t)i);
+                serial_write(" ticks="); ser_hex64((uint64_t)nowt);
+                serial_write(" +since-sweep="); ser_hex64((uint64_t)(nowt - seen));
+                serial_write(i == worst
+                             ? "  <-- LEAST PROGRESS: the wedged CPU is here,"
+                               " not necessarily where the eip above points\n"
+                             : "\n");
+            }
+        }
         int from_user = (f->cs & 3) == 3;
         if (!from_user || g_nmi_lockups >= 2) {
             serial_write("!! NMI HARD-LOCKUP: kernel-mode or persistent — rebooting\n");
+            crash_dump_end();
             hal_reboot();
             for (;;) __asm__ volatile ("hlt");
         }
@@ -325,6 +367,7 @@ void isr_handler(struct int_frame* f) {
         }
         f->rflags |= (1ull << 9);                   /* set IF → iret enables IRQs */
         { extern void hw_watchdog_pet(void); hw_watchdog_pet(); }
+        crash_dump_end();
         return;
     }
 

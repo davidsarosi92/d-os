@@ -5,7 +5,8 @@
  * button + one button per window + RTC clock) and the Start menu.
  * The launcher menu is built from the GUI_APP registry — apps appear
  * here by registering themselves, this file names none of them.
- * Only the power actions (Reboot / Shut Down) are fixed tail items.
+ * Only the session/power actions (Exit GUI / Reboot / Shut Down) are fixed
+ * tail items.
  *
  * Threading: see desktop.h.  click/motion run in the mouse IRQ with
  * the WM lock held (hence the *_locked services); draw + second_tick
@@ -13,8 +14,12 @@
  * ============================================================================= */
 
 #include "desktop.h"
+#include "itemview.h"      /* §M64 — the layout is swappable, not hardcoded */
+#include "shortcut.h"
+#include "config.h"
 #include "gui_app.h"
 #include "gui_internal.h"
+#include "gui.h"           /* gui_damage — the icon layer damages its own rects */
 #include "gfx.h"
 #include "rtc.h"
 #include "keymap.h"
@@ -31,7 +36,13 @@
 #define CLOCK_W     212
 #define SM_W        210
 #define SM_ITEM_H   26
-#define SM_MAX_APPS 10                  /* menu rows before the power tail */
+/* §M63 — raised from 10.  The Control Panel made it eleven apps, and the cap
+ * silently DROPS the overflow: the last registered app simply stops appearing
+ * in the launcher, which looks like a broken registration rather than a full
+ * menu.  Twelve is still a cap (a scrolling menu is a different feature), but
+ * it is now above the number of apps that exist, and the failure mode is
+ * written down instead of discovered. */
+#define SM_MAX_APPS 12                  /* menu rows before the power tail */
 
 #define COL_TB_TOP      0xFF4B5A70u
 #define COL_TB_BOT      0xFF222A37u
@@ -55,6 +66,82 @@
 
 static int scr_w = 0, scr_h = 0;
 
+/* -------------------------------------------------------------------------- */
+/* §M64 — desktop icons.                                                       */
+/*                                                                             */
+/* The shell owns the SELECTION and the layout choice; the items themselves    */
+/* come from shortcut.c and the arrangement from an ITEM_VIEW picked by name   */
+/* (`desktop.view`).  That split is the whole point: switching this desktop to */
+/* a list is a config value, not a code change here.                           */
+/* -------------------------------------------------------------------------- */
+
+#define ICONS_PAD   12                  /* inset from the screen edges */
+
+static const struct item_view* iview = NULL;
+static int icon_sel = -1;               /* selected shortcut, -1 = none */
+
+/* The icon field's box on screen.  Full desktop area minus the taskbar. */
+static void icons_box(int* x, int* y, int* w, int* h) {
+    *x = ICONS_PAD;
+    *y = ICONS_PAD;
+    *w = scr_w - 2 * ICONS_PAD;
+    *h = scr_h - TASKBAR_H - 2 * ICONS_PAD;
+    if (*w < 0) *w = 0;
+    if (*h < 0) *h = 0;
+}
+
+/* Damage exactly one icon's cell — used when the selection moves, so clicking
+ * around the desktop costs two small rects rather than a full recompose
+ * (§4.61 measured what a full-screen repaint costs). */
+static void icons_damage_item(int idx) {
+    if (idx < 0 || !iview || !iview->rect) return;
+    int bx, by, bw, bh;
+    icons_box(&bx, &by, &bw, &bh);
+    int ox, oy, ow, oh;
+    if (iview->rect(idx, bw, bh, shortcut_model(), 0, &ox, &oy, &ow, &oh) != 0)
+        return;
+    gui_damage(bx + ox, by + oy, ow, oh);
+}
+
+static int icon_last_n = -1;            /* to notice add/remove */
+
+static void vista_draw_under(struct gfx_surface* back) {
+    if (!iview || !iview->draw) return;
+    const struct item_model* m = shortcut_model();
+
+    /* Drop a selection that no longer means what it meant.  Indices are
+     * positions, not identities, so after a delete the same number is a
+     * DIFFERENT shortcut — highlighting it would be quietly wrong, and the
+     * next Enter would open something the user did not point at.  Detected
+     * here rather than pushed from the mutation path, so it stays true no
+     * matter who changed the set. */
+    int n = m->count ? m->count(m->ctx) : 0;
+    if (n != icon_last_n) { icon_last_n = n; icon_sel = -1; }
+
+    int bx, by, bw, bh;
+    icons_box(&bx, &by, &bw, &bh);
+    iview->draw(back, bx, by, bw, bh, m, icon_sel, 0);
+}
+
+static void vista_desktop_click(int x, int y, int dbl) {
+    if (!iview || !iview->hit) return;
+    int bx, by, bw, bh;
+    icons_box(&bx, &by, &bw, &bh);
+    int idx = iview->hit(x - bx, y - by, bw, bh, shortcut_model(), 0);
+
+    if (idx != icon_sel) {
+        int prev = icon_sel;
+        icon_sel = idx;
+        icons_damage_item(prev);
+        icons_damage_item(idx);
+    }
+    /* Double-click activates.  We are on the desktop task with no lock held
+     * (desktop.h), so the launch may do real work. */
+    if (dbl && idx >= 0) shortcut_launch(idx);
+}
+
+
+
 /* Menu state — written by click/motion (IRQ, WM lock held), read by
  * draw (compositor snapshot race is a benign one-frame lag). */
 static int menu_open  = 0;
@@ -72,7 +159,7 @@ static char clock_str[CLOCK_STR_MAX] = "";
 static int menu_rows(void) {
     int apps = gui_app_count();
     if (apps > SM_MAX_APPS) apps = SM_MAX_APPS;
-    return apps + 2;                    /* + Reboot + Shut Down */
+    return apps + 3;                    /* + Exit GUI + Reboot + Shut Down */
 }
 
 static int menu_h(void)   { return menu_rows() * SM_ITEM_H + 12; }
@@ -102,7 +189,13 @@ static const char* menu_label(int row) {
         const struct gui_app_def* a = gui_app_at(row);
         return a ? a->name : "?";
     }
-    return (row == apps) ? "Reboot" : "Shut Down";
+    /* Three fixed tail items, in escalating order of what they end: the GUI
+     * session, the kernel, the machine.  "Exit GUI" sits above Reboot because
+     * leaving the desktop is the reversible one — `gui` at the shell brings it
+     * straight back. */
+    if (row == apps)     return "Exit GUI";
+    if (row == apps + 1) return "Reboot";
+    return "Shut Down";
 }
 
 /* -------------------------------------------------------------------------- */
@@ -116,6 +209,13 @@ static void vista_init(int w, int h) {
     menu_hover = -1;
     clock_str[0] = 0;
     publish_popup();
+
+    /* §M64 — the layout comes from config, so "I would like a list instead of
+     * icons" is a setconf away and not a rewrite.  An unknown name falls back
+     * to the first registered view rather than to nothing (itemview.c). */
+    iview = item_view_by_name(config_get("desktop.view", "grid"));
+    icon_sel = -1;
+    shortcut_reload();
 }
 
 static int vista_bottom_reserve(void) { return TASKBAR_H; }
@@ -229,8 +329,10 @@ static int vista_click(int x, int y) {
             if (idx >= 0 && idx < apps)
                 gui_queue_launch(gui_app_at(idx));
             else if (idx == apps)
-                gui_queue_power(1);
+                gui_queue_exit();               /* back to the text shell */
             else if (idx == apps + 1)
+                gui_queue_power(1);
+            else if (idx == apps + 2)
                 gui_queue_power(0);
             menu_open = 0;
             publish_popup();
@@ -317,7 +419,9 @@ DESKTOP_SHELL(vista) = {
     .init           = vista_init,
     .bottom_reserve = vista_bottom_reserve,
     .draw           = vista_draw,
+    .draw_under     = vista_draw_under,        /* §M64 — icons under windows */
     .click          = vista_click,
     .motion         = vista_motion,
+    .desktop_click  = vista_desktop_click,
     .second_tick    = vista_second_tick,
 };

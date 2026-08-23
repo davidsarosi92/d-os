@@ -57,6 +57,7 @@
 #include "driver.h"
 #include "vfs.h"
 #include "devfs.h"
+#include "clipboard.h"
 #include "random.h"
 #include "procfs.h"
 #include "net.h"
@@ -67,11 +68,13 @@
 #include "task.h"
 #include "workqueue.h"
 #include "proc.h"                /* proc_exec_elf — x86_64 musl boot self-test */
+#include "gui.h"                 /* gui_autostart — boot into the desktop */
 #include "pkg.h"                 /* pkg_init — provision ld.so for the x86_64 test hook */
 #include "timer.h"
 #include "vc.h"
 #include "lock.h"
 #include "keymap.h"
+#include "splash.h"   /* §M62 — the boot screen */
 #include <stdint.h>
 
 #define MULTIBOOT1_BOOTLOADER_MAGIC 0x2BADB002
@@ -110,6 +113,18 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * up here without kernel_main having to mention any of them by name. */
     module_init_all();
 
+    /* §M62 — THE SCREEN IS OURS FROM HERE, and the splash goes up on the
+     * default IMMEDIATELY.  This call used to sit ~40 lines further down, after
+     * devfs/procfs/bcache init, which is why a handful of lines still made it
+     * onto the screen before the boot picture: the framebuffer console became
+     * active inside module_init_all above, and everything printed between the
+     * two was drawn.  There is no useful work to do between them — so there is
+     * nothing between them.
+     *
+     * (The lines are not lost, only unseen: klog and serial are untouched, and
+     * if the stored setting turns out to say "off" they are REPLAYED.) */
+    splash_early_quiet();
+
     /* DRIVER() registry — newer scaffold (M8) with probe/init/shutdown
      * lifecycle.  Coexists with MODULE(); see driver.h for rationale. */
     driver_init_all();
@@ -119,6 +134,9 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * (ramfs created /dev) and after module/driver init (so all
      * registrations are queued). */
     devfs_init();
+    /* §M59 — the clipboard as a file: `cat x > /dev/clipboard` works, and ring 3
+     * reaches it without waiting for a syscall to be defined for it. */
+    clipboard_devfs_init();
 
     /* §M39 — kernel CSPRNG + /dev/urandom + /dev/random (after devfs so the
      * nodes attach live; seeds from the hardware RNG + boot jitter). */
@@ -137,6 +155,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
 
     /* From this point user-visible output flows: the FB sink (or VGA
      * fallback) is active, the serial sink is also active. */
+
     kprintf("d-os booted.\n");
 
     /* Configuration store: defaults + overlay from /etc/d-os.conf if
@@ -219,10 +238,13 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
         pmm_phys_t phys = pmm_alloc_frame();
         uint32_t virt = 0xE0000000u;
         if (phys && vmm_map(virt, phys, VMM_WRITABLE) == 0) {
-            volatile uint32_t* p = (volatile uint32_t*)virt;
+            volatile uint32_t* p = (volatile uint32_t*)(uintptr_t)virt;
             *p = 0xDEADBEEFu;
+            /* (uintptr_t) before (void*): `virt` is a uint32_t and this file
+             * compiles for x86_64 too, where the direct cast warns.  A silent
+             * build is what lets a real warning be seen (§M57). */
             kprintf("vmm self-test: virt %p -> phys %p, readback=%x\n",
-                    (void*)virt, (void*)phys, *p);
+                    (void*)(uintptr_t)virt, (void*)(uintptr_t)phys, *p);
             vmm_unmap(virt);
             pmm_free_frame(phys);
         }
@@ -267,6 +289,28 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      *          write + persistence end-to-end on the serial log alone. */
     {
         if (vfs_mount("exfat", "/mnt", "vda") == 0) {
+            /* §M63 stage 0 — THE FIRST WRITABLE VOLUME IS WHERE SETTINGS LIVE.
+             * config_init() ran ~125 lines above, and it had to: half of boot
+             * reads config.  But `/` is ramfs, so until this point every
+             * `saveconf` wrote into memory and every setting a user changed
+             * died at the next boot — silently.  Attaching here overlays the
+             * saved store and redirects future saves onto the disk; the
+             * overlay goes through config_apply, so subsystems that already
+             * consumed a key (keymap, console colours) are notified rather
+             * than left one boot behind. */
+            config_attach_persistent("/mnt");
+
+            /* §M62 — the boot screen starts HERE, not with the rest of config.
+             * `boot.splash` lives in the PERSISTENT store, and that store is
+             * this mount: reading the key before the disk is attached always
+             * yields the default, so an earlier call could never see a user's
+             * choice.  It is also the right place on its own terms — the long
+             * phase a splash exists to cover (package provisioning, the store,
+             * the browser's resources) begins after this point, and everything
+             * before it is a second of driver init. */
+            splash_begin();
+            splash_progress("storage", 30);
+
             struct file* f = vfs_open("/mnt/dos-marker.txt", VFS_RDONLY);
             if (f) {
                 char b[64];
@@ -319,13 +363,50 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
         }
     }
 
+    /* ------------------------------------------------------------------
+     * Boot self-tests: how long they are allowed to take.
+     *
+     * They earned their place when preemption and SMP were new, and they are
+     * the only thing that would notice either breaking on a machine nobody
+     * tests — so they stay ON by default (a check nobody runs is a comment,
+     * §M52).  What they may NOT do is charge a user 1.6 s on every boot for
+     * fixed sleeps: `kernel.selftest_ms` tunes the window, and 0 skips them
+     * entirely for someone who wants the fastest possible boot.
+     * ------------------------------------------------------------------ */
+    const long SELFTEST_RUN_MS = config_get_long("kernel.selftest_ms", 150);
+
+    /* Wait for a self-test hog to notice its stop flag and exit.  A JOIN, not a
+     * sleep: it returns the moment the task is gone, where the fixed 100 ms it
+     * replaces was charged in full on every boot whether or not anything was
+     * still running.  Bounded so a hog that never exits cannot hang the boot —
+     * the test would then simply report what it measured. */
+    /* Poll for DISAPPEARANCE rather than task_wait(): init is an always-on
+     * universal reaper (§M27), so it may collect these tasks before we do, and
+     * a wait for a child somebody else already reaped never completes — it just
+     * burns the bound.  Measured: the first version cost ~400 ms of timeouts on
+     * the parallel test alone, which is the very padding this change is
+     * removing. */
+    #define selftest_join2(_a, _b) do {                                        \
+        uint64_t _dl = timer_ticks_ms() + 100;                                 \
+        while (timer_ticks_ms() < _dl) {                                       \
+            int _live = 0;                                                     \
+            if ((_a) && task_find((_a)->pid) &&                                \
+                task_find((_a)->pid)->state != TASK_DEAD) _live = 1;           \
+            if ((_b) && task_find((_b)->pid) &&                                \
+                task_find((_b)->pid)->state != TASK_DEAD) _live = 1;           \
+            if (!_live) break;                                                 \
+            hal_cpu_halt();                                                    \
+        }                                                                      \
+    } while (0)
+    #define selftest_join(_t) selftest_join2((_t), (struct task*)0)
+
     /* Preemption self-test (M13).  Spawn a tight-loop task that never
      * yields, then sleep on `hlt` for ~500 ms in the kernel thread.
      * Under cooperative scheduling we'd never wake (the hog would have
      * eaten the CPU on the first IRQ-driven retry).  Under preemption
      * the PIT IRQ pulls us back every quantum.  Success criterion:
      * the kprintf below ever runs AND the hog made some progress. */
-    {
+    if (SELFTEST_RUN_MS > 0) {
         extern volatile uint32_t preempt_test_counter;
         extern volatile int      preempt_test_stop;
 
@@ -339,14 +420,19 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
 
         struct task* hog = task_spawn("preempt-test", preempt_test_entry);
         if (hog) {
-            uint64_t deadline = timer_ticks_ms() + 500;
+            /* MEASURED (2026-08-21): this test and the parallel one below cost
+             * 1.64 s of a 7.5 s boot — 22 % — and every millisecond of it was a
+             * FIXED SLEEP, not work.  The proof needs a few quanta, not half a
+             * second: SCHED_QUANTUM_TICKS is 50 at 1000 Hz, so 150 ms is three
+             * full quanta and the hog cannot fail to be preempted in that
+             * window.  And waiting a flat 100 ms for the hog to exit was pure
+             * padding — `task_wait` returns the moment it does. */
+            uint64_t deadline = timer_ticks_ms() + SELFTEST_RUN_MS;
             while (timer_ticks_ms() < deadline) hal_cpu_halt();
 
             uint32_t ticks = preempt_test_counter;
             preempt_test_stop = 1;
-            /* Let the hog observe stop_flag and exit cleanly. */
-            uint64_t reap_deadline = timer_ticks_ms() + 100;
-            while (timer_ticks_ms() < reap_deadline) hal_cpu_halt();
+            selftest_join(hog);
 
             if (ticks > 0) {
                 kprintf("preempt self-test: PASS — kernel ran while hog tight-looped (hog ticks=%u)\n",
@@ -368,7 +454,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * shell spawn so kernel_main is the only non-idle RUNNABLE task
      * besides the hogs themselves — keeps the test cheap to schedule
      * under TCG even on -smp 4. */
-    if (smp_ncpus() > 1) {
+    if (SELFTEST_RUN_MS > 0 && smp_ncpus() > 1) {
         extern volatile uint32_t par_test_counter1;
         extern volatile uint32_t par_test_counter2;
         extern volatile int      par_test_stop;
@@ -382,15 +468,13 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
         struct task* h1 = task_spawn("par-hog1", par_test_entry1);
         struct task* h2 = task_spawn("par-hog2", par_test_entry2);
         if (h1 && h2) {
-            uint64_t deadline = timer_ticks_ms() + 500;
+            uint64_t deadline = timer_ticks_ms() + SELFTEST_RUN_MS;
             while (timer_ticks_ms() < deadline) hal_cpu_halt();
 
             uint32_t t1 = par_test_counter1;
             uint32_t t2 = par_test_counter2;
             par_test_stop = 1;
-            /* Let them observe stop_flag and exit. */
-            uint64_t reap = timer_ticks_ms() + 100;
-            while (timer_ticks_ms() < reap) hal_cpu_halt();
+            selftest_join2(h1, h2);
 
             uint64_t total = (uint64_t)t1 + (uint64_t)t2;
             int both_progressed = (t1 > 0 && t2 > 0);
@@ -434,6 +518,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * (queues if procfs isn't up yet), then spawn the supervisor as a child
      * of init: it autostarts the enabled services and supervises restarts.
      * After init so the supervisor's parent already exists. */
+    splash_progress("services", 85);
     service_init();
     bus_init();
     cron_init();                 /* M30 — /proc/cron (cron autostarts as a service) */
@@ -603,6 +688,9 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
          * selects (config may already be loaded from /etc at this
          * point); default is the full "d-os" shell. */
         vc_init();
+        /* §M62 — the screen has an owner now; if the splash was declined,
+         * replay what it missed while the console was quiet. */
+        splash_screen_ready();
         struct vc* root_vc = vc_root();
         if (root_vc) {
             /* The boot shell is a SESSION ROOT: spawn it detached (parented to
@@ -617,6 +705,11 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
              * on SMP (that counter is per-CPU while the new task is placed on
              * the least-loaded core): the shell could reach its entry point on
              * another CPU, find no console and exit. */
+            /* §M62 — the splash ends where its job ends: the moment a shell
+             * is about to own the screen.  A splash that outlives boot is a
+             * splash covering a working system. */
+            splash_progress("ready", 100);
+            splash_end();
             struct task* shell0 =
                 task_spawn_console("shell", shell_provider_active()->entry,
                                    task_reaper_pid(), root_vc);
@@ -624,6 +717,16 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
             if (!shell0) {
                 kprintf("FATAL: failed to spawn shell on root VC\n");
             }
+
+            /* The DESKTOP is what boot ends at, unless asked otherwise.  The
+             * text shell above is spawned FIRST and on purpose: the GUI merely
+             * suppresses the console, so leaving the desktop (Start → Exit GUI,
+             * or `gui stop`) lands on a shell that has been there all along
+             * rather than on a screen with nothing behind it.
+             *
+             * `gui.autostart=0` boots to the text console — still one word, and
+             * still the right default for a kernel that is being worked on. */
+            if (shell0) gui_autostart();
         } else {
             kprintf("FATAL: no root VC — no framebuffer?\n");
         }

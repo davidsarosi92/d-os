@@ -78,6 +78,7 @@
  * ============================================================================= */
 
 #include "task.h"
+#include "watchdog.h"   /* §M31 L3 — hw_watchdog_pet from the tick */
 #include "syscall.h"   /* sys_futex — CLONE_CHILD_CLEARTID wake */
 #include "kmalloc.h"
 #include "printf.h"
@@ -2425,6 +2426,30 @@ void schedule_request(void) {
      * deadlock, IRQ storm) stops advancing it and the watchdog sweep on a
      * healthy CPU notices.  Just a monotonic counter — no lock needed. */
     me->ticks++;
+
+    /* §M31 L3 FIX (2026-08-21) — pet the HARDWARE watchdog from the TICK, on
+     * the boot CPU only.
+     *
+     * It used to be petted exclusively by the watchdog TASK, whose premise is
+     * "if I cannot run, the scheduler is wedged".  During boot that premise is
+     * FALSE: provisioning copies megabytes and every console line at 1920×1200
+     * scrolls the framebuffer under §M57's preempt-disabled print lock, so on a
+     * loaded host a single stretch can exceed the device's ~4 s window while
+     * the system is making perfectly good progress.  The result was an NMI
+     * "HARD-LOCKUP" and a reboot for a machine that was merely SLOW — reported
+     * from use on x86_64, and the worst possible failure: the safety net kills
+     * the healthy patient.
+     *
+     * Petting from the tick keeps exactly the property the device is for: a
+     * REAL hard lockup is interrupts dying, and then this line stops executing
+     * and the NMI fires.  The task-level watchdog still runs (heartbeats,
+     * softlockup, runaway) and still pets — it simply is no longer the ONLY
+     * thing standing between a slow boot and a reboot.
+     *
+     * BSP only, because on an SMP box a wedged AP must NOT be masked by healthy
+     * APs continuing to pet; the per-CPU softlockup sweep is what catches that
+     * case, and it reports rather than reboots. */
+    if (me->cpu_index == 0 && hw_watchdog_armed()) hw_watchdog_pet();
 }
 
 void schedule_check(void) {

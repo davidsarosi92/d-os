@@ -10,6 +10,7 @@
 
 #include "gui.h"
 #include "gui_app.h"
+#include "icons.h"
 #include "widget.h"
 #include "kmalloc.h"
 #include <stddef.h>
@@ -46,4 +47,4 @@ static void hello_open(void) {
     gui_window_request_redraw(w);
 }
 
-GUI_APP("Hello", hello_open);
+GUI_APP_ICON("Hello", hello_open, ICON_APP);

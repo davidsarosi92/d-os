@@ -11,6 +11,7 @@
  * ============================================================================= */
 
 #include "crash.h"
+#include "splash.h"
 #include "printf.h"
 #include "klog.h"
 #include "timer.h"
@@ -97,6 +98,13 @@ void crash_report(int kind, int pid, const char* comm,
 static volatile uint32_t g_dump_busy;
 
 void crash_dump_begin(void) {
+    /* §M62 — hand the screen back BEFORE anything is printed.  Every ring-0
+     * fault dump, NMI report and panic in this kernel goes through here, which
+     * is exactly why the hook lives at this one point: a NEW fault path gets
+     * the behaviour for free instead of having to remember it.  A splash left
+     * up over a panic turns a diagnosable crash into "it froze at the logo". */
+    splash_abort();
+
     for (int i = 0; i < 2000000; i++) {
         uint32_t expect = 0;
         if (__atomic_compare_exchange_n(&g_dump_busy, &expect, 1, 0,

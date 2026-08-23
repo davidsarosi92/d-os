@@ -44,6 +44,23 @@ struct desktop_shell {
     /* Paint the chrome onto the backbuffer (compositor task). */
     void (*draw)(struct gfx_surface* back);
 
+    /* §M64 — paint UNDER the windows, straight after the wallpaper blit and
+     * before any window is composed (compositor task).  Desktop icons live
+     * here: they are part of the background layer, not chrome floating over
+     * the applications.  Drawing them in `draw` would put a shortcut icon on
+     * top of every window, which is the one thing a desktop icon must never
+     * do.  NULL = nothing under the windows. */
+    void (*draw_under)(struct gfx_surface* back);
+
+    /* §M64 — a left click that hit NO window and is not over the chrome, i.e.
+     * a click on the desktop itself.  `dbl` is non-zero for a double click.
+     *
+     * UNLIKE `click`/`motion` below, this runs on the DESKTOP TASK with NO
+     * lock held, so it may open files, allocate and launch apps — which is
+     * exactly what activating a shortcut does.  It must still be quick: the
+     * desktop task is also what repaints the chrome. */
+    void (*desktop_click)(int x, int y, int dbl);
+
     /* Pointer events (mouse IRQ, WM lock held — see header comment). */
     int  (*click) (int x, int y);       /* non-zero = consumed           */
     void (*motion)(int x, int y);

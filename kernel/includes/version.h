@@ -17,13 +17,13 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M57"                 /* highest completed number: §M57 scheduler lifetime */
+#define DOS_MILESTONE  "M65"                 /* highest completed number: §M65 widget toolkit */
 
 /* An OLDER section completed after that number shipped.  Empty ("") when there
  * is nothing to say — and it must be CLEARED when the next numbered milestone
  * ships, because from then on the number itself is the newer news and a stale
  * note would advertise old work as fresh. */
-#define DOS_MILESTONE_NOTE  " (updated M24)"   /* §M24 network stack, 2026-08-15 */
+#define DOS_MILESTONE_NOTE  ""                 /* cleared: M65 is the newer news */
 
 /* Short architecture tag for the on-screen label.  Deliberately the FAMILIAR
  * short form ("x32"/"x64") rather than the toolchain triple — the wallpaper

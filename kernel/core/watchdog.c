@@ -18,6 +18,7 @@
 #include "task.h"
 #include "lock.h"
 #include "klog.h"
+#include "printf.h"
 #include "timer.h"
 #include "percpu.h"
 #include "procfs.h"
@@ -36,6 +37,12 @@ volatile uint32_t g_nmi_lockups = 0;
  * hard-lockup net is absent.  (Convention 3: no arch #ifdef in core code.) */
 __attribute__((weak)) void hw_watchdog_init(void) { }
 __attribute__((weak)) void hw_watchdog_pet(void)  { }
+
+/* Armed state lives HERE rather than in the driver: the tick asks about it on
+ * every interrupt, and a build with no ib700 driver still links (the weak stubs
+ * above), so the flag must exist even when the device does not. */
+static volatile int g_hw_armed = 0;
+int hw_watchdog_armed(void) { return g_hw_armed; }
 
 #define WD_MAX        32       /* opt-in per-task heartbeat slots        */
 #define WD_SWEEP_MS   500      /* how often the sweep runs               */
@@ -167,6 +174,24 @@ static void sweep_softlockup(void) {
     }
 }
 
+/* NMI-SAFE readout of layer 2's state: what a CPU's scheduler-tick counter says
+ * NOW, and what the last sweep recorded.  A CPU whose two numbers are equal has
+ * taken no tick since the sweep — that is the CPU that stopped.
+ *
+ * It exists because the hard-lockup report names the CPU that TOOK the alarm,
+ * and §4.67 already established that this is routinely an IDLE one (the NMI
+ * landed on `hal_cpu_halt`): the report was pointing at the healthiest CPU in
+ * the machine.  Plain reads, no locks, no allocation — callable from the NMI
+ * handler, which is the only place it matters. */
+int watchdog_cpu_tick_state(int cpu, uint64_t* now_ticks, uint64_t* last_seen) {
+    if (cpu < 0 || cpu >= WD_MAX_CPUS) return -1;
+    struct percpu* p = percpu_at(cpu);
+    if (!p || !p->online) return -1;
+    if (now_ticks) *now_ticks = p->ticks;
+    if (last_seen) *last_seen = cpu_tick_seen[cpu];
+    return 0;
+}
+
 /* Layer 3 (§M46): RUNAWAY user tasks.  A ring-3 package that opted in
  * (auto_fkill_ms > 0) but hogs the CPU that long WITHOUT voluntarily yielding /
  * blocking — a frozen browser stuck in a loop does no syscalls, so it never
@@ -214,7 +239,11 @@ static void watchdog_entry(void) {
         const char* v = config_get("kernel.hw_watchdog", "1");
         hw = v && (v[0] == '1' || v[0] == 'y' || v[0] == 't');
     }
-    if (hw) { hw_watchdog_init(); klog(KLOG_INFO, "watchdog", "HW watchdog armed (ib700)\n"); }
+    if (hw) {
+        hw_watchdog_init();
+        g_hw_armed = 1;          /* from here the TICK pets it too — see task.c */
+        klog(KLOG_INFO, "watchdog", "HW watchdog armed (ib700, petted from the tick)\n");
+    }
 
     for (;;) {
         if (hw) hw_watchdog_pet();     /* pet FIRST — a slow sweep must not lapse */
@@ -233,6 +262,48 @@ static void watchdog_entry(void) {
         sweep_softlockup();
         sweep_runaway();
     }
+}
+
+/* ------------------------------------------------------------------- */
+/* Deliberate hard lockup — the only way to know the net still catches.  */
+/*                                                                      */
+/* Petting the ib700 from the TICK (task.c) removed a false positive: a  */
+/* slow boot no longer reboots the box.  But a safety net that has been  */
+/* loosened and not re-tested is a safety net nobody can trust, and this */
+/* project's own rule is that a test which cannot fail is not evidence   */
+/* (§M57).  So: pin to the BOOT CPU, disable interrupts, spin.  That is  */
+/* exactly the condition the hardware watchdog exists for — the tick     */
+/* stops, the pet stops, the NMI fires ~4 s later and the kernel-mode    */
+/* path reboots.  Nothing else in the system can recover from this, by   */
+/* construction.                                                        */
+/* ------------------------------------------------------------------- */
+void watchdog_hardlock_test(void) {
+    kprintf("watchdog: DELIBERATE HARD LOCKUP on CPU 0 — the ib700 NMI should "
+            "fire in ~4 s and reboot.  If the box just sits here, the net is "
+            "gone.\n");
+    /* Pin first: the pet lives on the BSP tick, so wedging any other CPU would
+     * (correctly) not trip THIS device — that case is the softlockup sweep's,
+     * and it reports rather than reboots. */
+    struct task* me = task_current();
+    if (me) task_set_affinity(me, 1u << 0);
+    /* Affinity is a REQUEST until the task is next scheduled, so yield until it
+     * has actually landed on CPU 0 — a bounded wait, and then SAY where it
+     * ended up.  The first version yielded once and assumed; at -smp 4 it wedged
+     * some other CPU, no NMI fired (correctly — see below), and the test looked
+     * like the safety net was gone when it was the TEST that had missed. */
+    int cpu = -1;
+    for (int i = 0; i < 100; i++) {
+        cpu = this_cpu_id();
+        if (cpu == 0) break;
+        task_yield();
+    }
+    if (cpu != 0) {
+        kprintf("watchdog: could not pin to CPU 0 (on %d) — wedging it anyway; "
+                "expect a softlockup REPORT, not a reboot\n", cpu);
+    }
+    hal_intr_disable();
+    for (;;) { /* no hlt: a halted CPU with IRQs off is the same lockup, but
+                * spinning also proves the CPU is alive and simply unreachable */ }
 }
 
 /* ------------------------------------------------------------------- */

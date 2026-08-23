@@ -36,6 +36,7 @@
 
 #include "gui.h"
 #include "gui_app.h"
+#include "icons.h"
 #include "widget.h"
 #include "crash.h"
 #include "config.h"
@@ -202,7 +203,7 @@ static void crashapp_open(void) {
     ca_refresh(win);
 }
 
-GUI_APP("Crash Reports", crashapp_open);
+GUI_APP_ICON("Crash Reports", crashapp_open, ICON_WARN);
 
 /* ---------------------------------------------------------------------------
  * The sink.  See the file header for why this is only a queue push.

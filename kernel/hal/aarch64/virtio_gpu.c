@@ -90,10 +90,12 @@ static struct virtq_used  q_used        __attribute__((aligned(16)));
 /* ---- virtio-gpu 2D command protocol --------------------------------------- */
 enum {
     VIRTIO_GPU_CMD_RESOURCE_CREATE_2D    = 0x0101,
+    VIRTIO_GPU_CMD_RESOURCE_UNREF        = 0x0102,   /* §M61 — mode change */
     VIRTIO_GPU_CMD_SET_SCANOUT           = 0x0103,
     VIRTIO_GPU_CMD_RESOURCE_FLUSH        = 0x0104,
     VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D   = 0x0105,
     VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING = 0x0106,
+    VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING = 0x0107,   /* §M61 */
     VIRTIO_GPU_RESP_OK_NODATA            = 0x1100,
 };
 
@@ -128,6 +130,21 @@ struct virtio_gpu_resource_attach_backing {
     uint32_t resource_id;
     uint32_t nr_entries;
     struct virtio_gpu_mem_entry entry;   /* single contiguous backing region */
+} __attribute__((packed));
+
+/* §M61 — both take just an id: "stop using this resource's memory" and "the
+ * resource is gone".  Sent in that order, because between them the device
+ * still owns a pointer into RAM we are about to free. */
+struct virtio_gpu_resource_unref {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+} __attribute__((packed));
+
+struct virtio_gpu_resource_detach_backing {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
 } __attribute__((packed));
 
 struct virtio_gpu_set_scanout {
@@ -167,6 +184,13 @@ static uintptr_t g_base;                 /* MMIO transport base, 0 = absent    *
 static uint16_t  g_last_used;
 static uint64_t  g_fb_phys;              /* contiguous RAM framebuffer         */
 static int       g_ready;
+
+/* §M61 — the geometry is RUNTIME state now, not three #defines.  FB_WIDTH /
+ * FB_HEIGHT remain the boot mode; everything after bring-up reads these. */
+static uint32_t  g_w = FB_WIDTH, g_h = FB_HEIGHT;
+static uint32_t  g_pitch  = FB_PITCH;
+static uint32_t  g_frames;               /* frames backing g_fb_phys           */
+static uint32_t  g_res_id = GPU_RESOURCE_ID;
 
 /* ---- MMIO + barrier helpers ------------------------------------------------ */
 static inline void     w32(uint32_t off, uint32_t v) { *(volatile uint32_t*)(g_base + off) = v; }
@@ -223,29 +247,185 @@ int fb_flip_init(volatile uint32_t** buf0, volatile uint32_t** buf1) {
 }
 void fb_flip_to(int idx) { (void)idx; }
 
+/* ==========================================================================
+ * §M61 — MODE SETTING on virtio-gpu.
+ *
+ * The x86 backend changes mode with four register writes.  Here it is a
+ * sequence of device commands and one allocation, and the allocation is what
+ * makes it interesting: the framebuffer must be CONTIGUOUS guest RAM, so a
+ * bigger mode is a fresh buddy block (whose maximum order is the ceiling M22.6
+ * met at 1920x1200 = 9.2 MiB), and every step can fail with the display
+ * half-configured.
+ *
+ * THE RULE THAT SHAPES THE CODE — the same one x86 follows: build the NEW
+ * everything first, switch the scanout in one command, and only then take the
+ * old one apart.  A failure anywhere before the switch leaves the display
+ * exactly as it was, which is the only acceptable outcome for an operation
+ * whose failure mode is "no picture".
+ *
+ * The resource id ALTERNATES between two values rather than being reused: the
+ * old resource is still bound to the scanout while the new one is being built,
+ * and a device that is asked to create a resource with a live id is entitled
+ * to refuse.
+ * ========================================================================== */
+
+static const struct fb_mode gpu_modes[] = {
+    {  640,  480, 32 }, {  800,  600, 32 }, { 1024,  768, 32 },
+    { 1280,  720, 32 }, { 1280,  800, 32 }, { 1280, 1024, 32 },
+    { 1440,  900, 32 }, { 1600,  900, 32 }, { 1680, 1050, 32 },
+    { 1920, 1080, 32 }, { 1920, 1200, 32 },
+};
+#define N_GPU_MODES ((int)(sizeof gpu_modes / sizeof gpu_modes[0]))
+
+int fb_mode_count(void) {
+    /* Without a device there is exactly one mode: whatever we booted with.
+     * Callers read a count of 1 as "this display cannot be asked to change"
+     * (fb_present.h), which is still the honest answer here. */
+    return g_ready ? N_GPU_MODES : 1;
+}
+
+int fb_mode_current(struct fb_mode* out) {
+    if (!out) return -1;
+    out->w = (uint16_t)g_w; out->h = (uint16_t)g_h; out->bpp = 32;
+    return 0;
+}
+
+int fb_mode_get(int index, struct fb_mode* out) {
+    if (!out) return -1;
+    if (!g_ready) return index == 0 ? fb_mode_current(out) : -1;
+    if (index < 0 || index >= N_GPU_MODES) return -1;
+    *out = gpu_modes[index];
+    return 0;
+}
+
+int fb_mode_set(uint32_t w, uint32_t h, uint32_t bpp) {
+    if (!g_ready) return -2;                 /* no device — cannot change     */
+    if (bpp != 32) return -3;                /* one pixel format on purpose   */
+    if (w < 320 || h < 200 || w > 4096 || h > 4096) return -4;
+    if (w == g_w && h == g_h) return 0;      /* already there                 */
+
+    uint32_t pitch   = w * FB_BPP;
+    uint64_t bytes   = (uint64_t)pitch * h;
+    uint32_t nframes = (uint32_t)((bytes + 4095) / 4096);
+
+    /* 1. THE NEW FRAMEBUFFER FIRST.  If this fails, nothing has been touched
+     *    and the display is still showing the old mode. */
+    uint64_t nfb = pmm_alloc_contiguous_dma32(nframes);
+    if (nfb == PMM_ALLOC_FAIL) {
+        kprintf("virtio-gpu: %ux%u needs %u contiguous frames — refused "
+                "(buddy order ceiling)\n", w, h, nframes);
+        return -5;
+    }
+
+    uint32_t new_id = (g_res_id == GPU_RESOURCE_ID) ? GPU_RESOURCE_ID + 1
+                                                    : GPU_RESOURCE_ID;
+
+    /* 2. New resource + backing.  Both can fail; both undo cleanly because the
+     *    scanout still points at the old resource. */
+    struct virtio_gpu_resource_create_2d* c = (void*)g_cmd;
+    *c = (struct virtio_gpu_resource_create_2d){
+        .hdr = { .type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D },
+        .resource_id = new_id,
+        .format = VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
+        .width = w, .height = h,
+    };
+    if (gpu_submit(sizeof *c) != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("virtio-gpu: create_2d(%ux%u) refused\n", w, h);
+        pmm_free_contiguous(nfb, nframes);
+        return -6;
+    }
+
+    struct virtio_gpu_resource_attach_backing* b = (void*)g_cmd;
+    *b = (struct virtio_gpu_resource_attach_backing){
+        .hdr = { .type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING },
+        .resource_id = new_id, .nr_entries = 1,
+        .entry = { .addr = nfb, .length = (uint32_t)bytes },
+    };
+    if (gpu_submit(sizeof *b) != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("virtio-gpu: attach_backing(%ux%u) refused\n", w, h);
+        struct virtio_gpu_resource_unref* u = (void*)g_cmd;
+        *u = (struct virtio_gpu_resource_unref){
+            .hdr = { .type = VIRTIO_GPU_CMD_RESOURCE_UNREF }, .resource_id = new_id };
+        gpu_submit(sizeof *u);
+        pmm_free_contiguous(nfb, nframes);
+        return -7;
+    }
+
+    /* 3. THE SWITCH — one command, and the point of no return. */
+    struct virtio_gpu_set_scanout* sc = (void*)g_cmd;
+    *sc = (struct virtio_gpu_set_scanout){
+        .hdr = { .type = VIRTIO_GPU_CMD_SET_SCANOUT },
+        .r = { .x = 0, .y = 0, .width = w, .height = h },
+        .scanout_id = GPU_SCANOUT_ID, .resource_id = new_id,
+    };
+    if (gpu_submit(sizeof *sc) != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("virtio-gpu: set_scanout(%ux%u) refused — staying at %ux%u\n",
+                w, h, g_w, g_h);
+        struct virtio_gpu_resource_unref* u = (void*)g_cmd;
+        *u = (struct virtio_gpu_resource_unref){
+            .hdr = { .type = VIRTIO_GPU_CMD_RESOURCE_UNREF }, .resource_id = new_id };
+        gpu_submit(sizeof *u);
+        pmm_free_contiguous(nfb, nframes);
+        return -8;
+    }
+
+    /* 4. Only now is the old one dead.  Detach before unref: the device is
+     *    holding a pointer into RAM we are about to hand back to the
+     *    allocator, and the order is how it learns to stop. */
+    uint64_t old_fb     = g_fb_phys;
+    uint32_t old_frames = g_frames;
+    uint32_t old_id     = g_res_id;
+
+    struct virtio_gpu_resource_detach_backing* d = (void*)g_cmd;
+    *d = (struct virtio_gpu_resource_detach_backing){
+        .hdr = { .type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING },
+        .resource_id = old_id };
+    gpu_submit(sizeof *d);
+    struct virtio_gpu_resource_unref* u = (void*)g_cmd;
+    *u = (struct virtio_gpu_resource_unref){
+        .hdr = { .type = VIRTIO_GPU_CMD_RESOURCE_UNREF }, .resource_id = old_id };
+    gpu_submit(sizeof *u);
+
+    g_fb_phys = nfb;
+    g_frames  = nframes;
+    g_res_id  = new_id;
+    g_w = w; g_h = h; g_pitch = pitch;
+
+    /* The console + GUI read the geometry from fb_terminal, so tell it before
+     * anything draws — a renderer using the old pitch writes diagonal stripes,
+     * which looks like a device bug and is arithmetic. */
+    fb_adopt_mode((volatile uint32_t*)(uintptr_t)nfb, w, h, pitch);
+    if (old_fb != PMM_ALLOC_FAIL && old_frames)
+        pmm_free_contiguous(old_fb, old_frames);
+
+    kprintf("virtio-gpu: mode %ux%u (resource %u, %u frames)\n",
+            w, h, new_id, nframes);
+    return 0;
+}
+
 /* Copy a dirty rect out of guest RAM into the host resource, then present it.
  * fb_terminal calls this after every render primitive.  Rects are clamped to
  * the framebuffer; a degenerate rect is ignored. */
 void fb_present_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     if (!g_ready) return;
-    if (x >= FB_WIDTH || y >= FB_HEIGHT || w == 0 || h == 0) return;
-    if (x + w > FB_WIDTH)  w = FB_WIDTH  - x;
-    if (y + h > FB_HEIGHT) h = FB_HEIGHT - y;
+    if (x >= g_w || y >= g_h || w == 0 || h == 0) return;
+    if (x + w > g_w) w = g_w - x;
+    if (y + h > g_h) h = g_h - y;
 
     dsb();   /* make the CPU's pixel writes visible to the device's DMA read */
 
     struct virtio_gpu_transfer_to_host_2d* t = (void*)g_cmd;
     t->hdr = (struct virtio_gpu_ctrl_hdr){ .type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D };
     t->r = (struct virtio_gpu_rect){ .x = x, .y = y, .width = w, .height = h };
-    t->offset = (uint64_t)y * FB_PITCH + (uint64_t)x * FB_BPP;
-    t->resource_id = GPU_RESOURCE_ID;
+    t->offset = (uint64_t)y * g_pitch + (uint64_t)x * FB_BPP;
+    t->resource_id = g_res_id;
     t->padding = 0;
     gpu_submit(sizeof *t);
 
     struct virtio_gpu_resource_flush* f = (void*)g_cmd;
     f->hdr = (struct virtio_gpu_ctrl_hdr){ .type = VIRTIO_GPU_CMD_RESOURCE_FLUSH };
     f->r = (struct virtio_gpu_rect){ .x = x, .y = y, .width = w, .height = h };
-    f->resource_id = GPU_RESOURCE_ID;
+    f->resource_id = g_res_id;
     f->padding = 0;
     gpu_submit(sizeof *f);
 }
@@ -303,6 +483,7 @@ int virtio_gpu_init(void) {
     uint32_t nframes = (FB_PITCH * FB_HEIGHT + 4095) / 4096;
     g_fb_phys = pmm_alloc_contiguous_dma32(nframes);
     if (g_fb_phys == PMM_ALLOC_FAIL) { kprintf("virtio-gpu: FB alloc (%u frames) failed\n", nframes); return -1; }
+    g_frames = nframes;          /* §M61 — remembered so a mode change can free it */
 
     /* 1. Create the 2D resource. */
     struct virtio_gpu_resource_create_2d* c = (void*)g_cmd;

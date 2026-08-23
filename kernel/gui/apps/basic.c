@@ -23,6 +23,7 @@
 
 #include "gui.h"
 #include "gui_app.h"
+#include "icons.h"
 #include "basic.h"
 #include "task.h"
 #include "vc.h"
@@ -81,4 +82,4 @@ static void basic_open_with(const char* path) {
 static void basic_launch(void)                { basic_open_with(NULL); }
 static void basic_open_path(const char* path) { basic_open_with(path); }
 
-GUI_APP_ASSOC("BASIC", basic_launch, basic_open_path, "bas");
+GUI_APP_ASSOC_ICON("BASIC", basic_launch, basic_open_path, "bas", ICON_CODE);

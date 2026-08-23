@@ -26,6 +26,8 @@
  * ============================================================================= */
 
 #include "syscall.h"
+#include "dosgui.h"      /* §M65 — the display bridge, both personalities */
+#include "vmm.h"         /* copy_str_from_user — the title is a client string */
 #include "idt.h"
 #include "console.h"
 #include "printf.h"
@@ -89,6 +91,32 @@ static void syscall_dispatch_body(struct int_frame* f) {
              * fine because TSS.esp0 resets it for the next transition. */
             hal_syscall_exit_to_kernel(saved_esp, saved_eip);
         }
+
+        /* §M65 — the display bridge, under the SAME numbers the Linux
+         * personality uses (syscall.h explains why).  Only the toolkit build
+         * and the window lifecycle are here; a native program that wants to
+         * blit pixels uses PRESENT exactly as a musl one does. */
+        case SYS_DOSGUI_CREATE: {
+            char title[64];
+            if (copy_str_from_user(title, f->edx, sizeof title) < 0) title[0] = 0;
+            f->eax = (uint32_t)dosgui_create((int)f->ebx, (int)f->ecx, title);
+            return;
+        }
+        case SYS_DOSGUI_PRESENT:
+            f->eax = (uint32_t)dosgui_present((int)f->ebx, (const uint32_t*)f->ecx,
+                                              (int)f->edx, (int)f->esi, (int)f->edi);
+            return;
+        case SYS_DOSGUI_POLL:
+            f->eax = (uint32_t)dosgui_poll((int)f->ebx, (struct dosgui_event*)f->ecx);
+            return;
+        case SYS_DOSGUI_DESTROY:
+            dosgui_destroy((int)f->ebx);
+            f->eax = 0;
+            return;
+        case SYS_DOSGUI_UI_BUILD:
+            f->eax = (uint32_t)dosgui_ui_build((int)f->ebx, (const void*)f->ecx,
+                                               (int)f->edx);
+            return;
 
         case SYS_GETPID:
             f->eax = (uint32_t)(task_current() ? task_current()->pid : -1);

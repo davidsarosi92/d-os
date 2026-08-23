@@ -6,6 +6,7 @@
 
 #include "gui.h"
 #include "gui_app.h"
+#include "icons.h"
 #include "widget.h"
 #include <stddef.h>
 
@@ -34,4 +35,4 @@ static void about_open(void) {
     gui_window_request_redraw(w);
 }
 
-GUI_APP("About d-os", about_open);
+GUI_APP_ICON("About d-os", about_open, ICON_INFO);

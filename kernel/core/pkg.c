@@ -15,6 +15,9 @@
 #include "kmalloc.h"
 #include "proc.h"
 #include "task.h"
+#include "config.h"
+#include "klog.h"
+#include "timer.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -122,7 +125,96 @@ static uint32_t recipe_hash(const struct pkg_recipe* r) {
     return hc.h;
 }
 
-/* store dir NAME ("<hex8>-<name>-<version>") + full PATH ("/store/<name>"). */
+/* ------------------------------------------------------------------------
+ * §M62 follow-up — WHERE THE STORE LIVES.
+ *
+ * Asked from use: *"pkg seems to install on every boot — if there is storage
+ * and it is already installed, could it skip?"*  It already skips: `pkg_build`
+ * returns early when the content-addressed path exists.  The path never
+ * existed, because `/store` is on RAMFS and ramfs starts empty.
+ *
+ * So the fix is not a new check but a durable place to check: with a writable
+ * volume attached (§M63 stage 0), the store lives on it and the existing
+ * content-addressed skip does the rest.  Without one it stays on ramfs and
+ * everything is rebuilt — which is the correct behaviour for a machine with no
+ * disk, and happens automatically if the disk LATER disappears: the root is
+ * decided per boot from what is actually mounted, never remembered.
+ *
+ * `pkg.store` = auto (default) | ram — for someone who wants the volatile
+ * behaviour on a machine that has a disk.
+ * ------------------------------------------------------------------------ */
+static char g_store_root[64] = "/store";
+
+const char* pkg_store_root(void) { return g_store_root; }
+
+static void store_root_init(void) {
+    /* DEFAULT: ram.  Measured, and the measurement went the other way from the
+     * intuition — the persistent store works and costs more than it saves:
+     *
+     *   ram  (rebuild every boot)      82 ms
+     *   disk (reuse, `built: 0`)     7823 ms
+     *
+     * Reuse skips the sixteen builds, but every package's payload is still
+     * COPIED out of the store into /bin and /lib on ramfs at every boot (that
+     * is what makes PATH and ld.so work), and on the disk those copies are
+     * block reads through a 256 KiB cache instead of memcpy.  Twenty megabytes
+     * of that is seconds under emulation.
+     *
+     * So the capability ships and the default does not: `pkg.store = disk`
+     * turns it on for anyone who wants a durable store more than a fast boot.
+     * Making disk the better choice needs the copies to stop crossing the
+     * boundary — bigger reads, or /lib living on the volume too — and that is a
+     * change to how the profile works, not a knob. */
+    const char* mode = config_get("pkg.store", "ram");
+    if (!mode || mode[0] != 'd') return;             /* ram (default): /store */
+    const char* persist = config_persist_path();     /* "<dir>/d-os.conf" or NULL */
+    if (!persist) return;                            /* no writable volume */
+
+    /* Derive the volume's directory from the config file's path — one source of
+     * truth for "where persistent things go", rather than a second constant
+     * that could disagree with it. */
+    int n = 0, last = -1;
+    while (persist[n] && n < (int)sizeof g_store_root - 8) {
+        if (persist[n] == '/') last = n;
+        g_store_root[n] = persist[n];
+        n++;
+    }
+    if (last <= 0) return;                           /* "/d-os.conf" → root; keep ram */
+    g_store_root[last] = '\0';
+    /* append "/store" */
+    int k = last;
+    const char* leaf = "/store";
+    for (int i = 0; leaf[i] && k < (int)sizeof g_store_root - 1; i++)
+        g_store_root[k++] = leaf[i];
+    g_store_root[k] = '\0';
+
+    /* PROVE the volume can hold a store before using it.
+     *
+     * The store is a DIRECTORY PER PACKAGE, and exFAT here has no mkdir
+     * (`.mkdir = NULL` in exfat.c — "not in M12 DOD").  Without this probe the
+     * root pointed at the disk and every single package failed with
+     * "mkdir … failed", which is a worse outcome than never having tried: the
+     * store was empty AND the boot was noisy.
+     *
+     * Probing is also what makes this self-enabling — the day exFAT grows
+     * mkdir, the store moves to the disk with no code change here and the
+     * content-addressed skip in pkg_build starts paying off across boots. */
+    if (vfs_mkdir(g_store_root) != 0) {
+        /* "already exists" is the normal case from the second boot onward, and
+         * it is indistinguishable from "cannot mkdir" in the return code — so
+         * ask the filesystem instead of the error. */
+        struct file* probe = vfs_open(g_store_root, VFS_RDONLY);
+        if (probe) { vfs_close(probe); return; }     /* already there → fine */
+        klog(KLOG_NOTICE, "pkg",
+             "%s cannot hold the store (no mkdir on this filesystem) — "
+             "using volatile /store\n", g_store_root);
+        g_store_root[0] = '/'; g_store_root[1] = 's'; g_store_root[2] = 't';
+        g_store_root[3] = 'o'; g_store_root[4] = 'r'; g_store_root[5] = 'e';
+        g_store_root[6] = '\0';
+    }
+}
+
+/* store dir NAME ("<hex8>-<name>-<version>") + full PATH ("<root>/<name>"). */
 static void store_dirname_r(const struct pkg_recipe* r, char* buf, int cap) {
     char hb[9]; hex8(recipe_hash(r), hb);
     int p = sappend(buf, cap, 0, hb);
@@ -132,7 +224,8 @@ static void store_dirname_r(const struct pkg_recipe* r, char* buf, int cap) {
     sappend(buf, cap, p, r->version);
 }
 static void store_path_r(const struct pkg_recipe* r, char* buf, int cap) {
-    int p = sappend(buf, cap, 0, "/store/");
+    int p = sappend(buf, cap, 0, g_store_root);
+    p = sappend(buf, cap, p, "/");
     char dn[96]; store_dirname_r(r, dn, sizeof dn);
     sappend(buf, cap, p, dn);
 }
@@ -145,6 +238,15 @@ static int write_file(const char* path, const void* data, unsigned len) {
     if (!f) return -1;
     if (len) vfs_write(f, data, len);
     vfs_close(f);
+    /* §M31 L3 (2026-08-21) — boot provisioning writes MEGABYTES in a tight
+     * loop (musl, libstdc++, the Mesa runtime, NetSurf's ~9 MiB /res), and it
+     * runs on one task with nothing forcing a reschedule.  On a loaded host
+     * that stretch was long enough to starve the watchdog task past the ib700's
+     * ~4 s window, and the box REBOOTED for being slow.  The hardware watchdog
+     * is petted from the tick now (task.c), which fixes the symptom; yielding
+     * here fixes the cause — nothing that runs for seconds should hold a CPU
+     * without offering it up. */
+    task_yield();
     return 0;
 }
 static int read_file(const char* path, char* buf, int cap) {
@@ -189,7 +291,7 @@ int pkg_build(const char* id) {
     char path[160]; store_path_r(r, path, sizeof path);
     if (path_exists(path)) return 0;                  /* content-addressed reuse */
 
-    vfs_mkdir("/store");
+    vfs_mkdir(g_store_root);
     if (vfs_mkdir(path) != 0) { kprintf("pkg: mkdir %s failed\n", path); return -1; }
 
     /* Payload → <path>/bin/<name> for a program, or <path>/lib/<soname> for a
@@ -244,7 +346,7 @@ int pkg_build(const char* id) {
     sappend(cp, sizeof cp, cpp, "/.closure");
     write_file(cp, clo, (unsigned)cc.pos);
 
-    kprintf("pkg: built /store/%s\n", path + 7);   /* skip "/store/" for brevity */
+    kprintf("pkg: built %s\n", path);
     return 0;
 }
 
@@ -308,7 +410,8 @@ static void profile_remove(const char* dirname) {
  * profile symlink; a symlink-based view is a follow-up. */
 static void profile_bin_expose(struct pkg_recipe* r) {
     char dn[96]; store_dirname_r(r, dn, sizeof dn);
-    char src[224]; int p = sappend(src, sizeof src, 0, "/store/");
+    char src[224]; int p = sappend(src, sizeof src, 0, g_store_root);
+    p = sappend(src, sizeof src, p, "/");
     p = sappend(src, sizeof src, p, dn);
     p = sappend(src, sizeof src, p, "/bin/");
     sappend(src, sizeof src, p, r->name);
@@ -346,6 +449,7 @@ static long copy_file(const char* src, const char* dst) {
     while (ok) {
         ssize_t r = vfs_read(in, buf, CHUNK);
         if (r <= 0) break;
+        task_yield();                 /* see write_file: a 17 MiB copy is seconds */
         ssize_t off = 0;
         while (off < r) {
             ssize_t w = vfs_write(out, buf + off, (size_t)(r - off));
@@ -362,7 +466,8 @@ static long copy_file(const char* src, const char* dst) {
 static void profile_lib_expose(struct pkg_recipe* r) {
     if (!r->soname) return;
     char dn[96]; store_dirname_r(r, dn, sizeof dn);
-    char src[224]; int p = sappend(src, sizeof src, 0, "/store/");
+    char src[224]; int p = sappend(src, sizeof src, 0, g_store_root);
+    p = sappend(src, sizeof src, p, "/");
     p = sappend(src, sizeof src, p, dn);
     p = sappend(src, sizeof src, p, "/lib/");
     sappend(src, sizeof src, p, r->soname);
@@ -430,7 +535,8 @@ static void rs_add_closure(struct reachset* rs, const char* dn) {
     int idx = rs->n++;
     sappend(rs->names[idx], 96, 0, dn);
     /* read /store/<dn>/.closure and recurse */
-    char cp[224]; int p = sappend(cp, sizeof cp, 0, "/store/");
+    char cp[224]; int p = sappend(cp, sizeof cp, 0, g_store_root);
+    p = sappend(cp, sizeof cp, p, "/");
     p = sappend(cp, sizeof cp, p, dn);
     sappend(cp, sizeof cp, p, "/.closure");
     char buf[1024];
@@ -461,7 +567,7 @@ int pkg_gc(void) {
     }
 
     /* 2. Sweep /store: delete any entry not in the reachable set. */
-    struct file* d = vfs_open("/store", VFS_RDONLY);
+    struct file* d = vfs_open(g_store_root, VFS_RDONLY);
     if (!d) return 0;
     /* Collect dead entries first (deleting during readdir is unsafe). */
     char dead[64][96]; int nd = 0;
@@ -474,7 +580,8 @@ int pkg_gc(void) {
     vfs_close(d);
 
     for (int i = 0; i < nd; i++) {
-        char p[224]; int pp = sappend(p, sizeof p, 0, "/store/");
+        char p[224]; int pp = sappend(p, sizeof p, 0, g_store_root);
+        pp = sappend(p, sizeof p, pp, "/");
         sappend(p, sizeof p, pp, dead[i]);
         if (vfs_unlink_recursive(p) == 0)
             kprintf("pkg: gc reclaimed %s\n", dead[i]);
@@ -486,13 +593,13 @@ int pkg_gc(void) {
 /* ----------------------- diagnostics -------------------------------------- */
 
 void pkg_list(void) {
-    struct file* d = vfs_open("/store", VFS_RDONLY);
+    struct file* d = vfs_open(g_store_root, VFS_RDONLY);
     if (!d) { kprintf("pkg: store is empty\n"); return; }
     struct dirent de;
     kprintf("store paths (* = installed in profile):\n");
     while (vfs_readdir(d, &de) > 0) {
         if (de.name[0] == '.') continue;
-        kprintf("  %s /store/%s\n", profile_has(de.name) ? "*" : " ", de.name);
+        kprintf("  %s %s/%s\n", profile_has(de.name) ? "*" : " ", g_store_root, de.name);
     }
     vfs_close(d);
 }
@@ -539,13 +646,15 @@ int pkg_run(int argc, const char* const argv[]) {
     char dn[96]; store_dirname_r(r, dn, sizeof dn);
 
     /* <store>/<dn>/bin/<name> — the immutable payload we exec from the store. */
-    char binp[224]; int bp = sappend(binp, sizeof binp, 0, "/store/");
+    char binp[224]; int bp = sappend(binp, sizeof binp, 0, g_store_root);
+    bp = sappend(binp, sizeof binp, bp, "/");
     bp = sappend(binp, sizeof binp, bp, dn);
     bp = sappend(binp, sizeof binp, bp, "/bin/");
     sappend(binp, sizeof binp, bp, name);
 
     /* <store>/<dn>/.abi → personality (data-driven, self-describing store). */
-    char abip[224]; int ap = sappend(abip, sizeof abip, 0, "/store/");
+    char abip[224]; int ap = sappend(abip, sizeof abip, 0, g_store_root);
+    ap = sappend(abip, sizeof abip, ap, "/");
     ap = sappend(abip, sizeof abip, ap, dn);
     sappend(abip, sizeof abip, ap, "/.abi");
     char abi[32];
@@ -562,7 +671,8 @@ int pkg_run(int argc, const char* const argv[]) {
      * arches here is the difference between "cannot exec" and an answer the
      * user can act on.  A missing .arch means an entry written by an older
      * build — treat it as native rather than refusing to run it. */
-    char archp[224]; int arp2 = sappend(archp, sizeof archp, 0, "/store/");
+    char archp[224]; int arp2 = sappend(archp, sizeof archp, 0, g_store_root);
+    arp2 = sappend(archp, sizeof archp, arp2, "/");
     arp2 = sappend(archp, sizeof archp, arp2, dn);
     sappend(archp, sizeof archp, arp2, "/.arch");
     char parch[24];
@@ -782,8 +892,31 @@ static void rootfs_unpack_blob(const unsigned char* p, const unsigned char* end)
 extern const unsigned char _binary_user_netsurf_res_bin_start[] __attribute__((weak));
 extern const unsigned char _binary_user_netsurf_res_bin_end[]   __attribute__((weak));
 
-static void rootfs_unpack(void) {
+/* §M62 follow-up — these are unpacked ON DEMAND, not at boot.
+ *
+ * MEASURED, because the question ("does pkg reinstall everything every boot?")
+ * deserved a number rather than an impression: pkg_init cost 174 ms on a quiet
+ * host and 763 ms on a loaded one, and **171 of those 174 ms were these two
+ * archives** — the store's own 16 packages and the ld.so provisioning were
+ * about 3 ms together.  The store was the suspect; the resources were the cost.
+ *
+ * They are also the two things most boots never touch: the tcc rootfs matters
+ * only if you compile ON the machine, and NetSurf's ~9 MiB of resources only if
+ * you open the browser.  Unpacking them when the thing that needs them starts
+ * moves the cost to the person who asked for it and takes it off everyone else.
+ *
+ * Idempotent and cheap to ask: the flag is checked, not the filesystem. */
+static int rootfs_tcc_done = 0, rootfs_res_done = 0;
+
+void pkg_ensure_tcc_rootfs(void) {
+    if (rootfs_tcc_done) return;
+    rootfs_tcc_done = 1;
     rootfs_unpack_blob(_binary_user_rootfs_bin_start, _binary_user_rootfs_bin_end);
+}
+
+void pkg_ensure_netsurf_res(void) {
+    if (rootfs_res_done) return;
+    rootfs_res_done = 1;
     rootfs_unpack_blob(_binary_user_netsurf_res_bin_start, _binary_user_netsurf_res_bin_end);
 }
 
@@ -1069,6 +1202,13 @@ void pkg_backend_register(const struct pkg_ops* ops) { if (ops) g_pkg_backend = 
 const struct pkg_ops* pkg_backend_active(void) { return g_pkg_backend; }
 
 void pkg_init(void) {
+    /* timer_ticks_ms, not timer_now_ns: the nanosecond clock (§M53) is set up
+     * later than this on some boot paths, and reading it before then returns
+     * ZERO — which made this instrument report "0 us" for work that takes a
+     * tenth of a second.  Twice now an instrument has been the thing that was
+     * wrong (the first version divided 763218 us by 1000000 and printed 0 ms).
+     * A measurement is a claim; check the apparatus before believing it. */
+    uint64_t t_start = timer_ticks_ms();
     /* Idempotent: pkg_init may be reached from more than one path (the x86_64
      * boot self-test provisions early; shell_run also calls it lazily).  The
      * built-in recipes are file-scope statics linked into the registry, so a
@@ -1079,14 +1219,18 @@ void pkg_init(void) {
     inited = 1;
 
     /* Announce the active package-manager backend (swappable component). */
+    store_root_init();
     pkg_backend_register(&store_ops);
-    kprintf("pkg: backend '%s' v%s active\n",
-            g_pkg_backend->name, g_pkg_backend->version);
+    kprintf("pkg: backend '%s' v%s active, store at %s%s\n",
+            g_pkg_backend->name, g_pkg_backend->version, g_store_root,
+            g_store_root[1] == 's' ? " (volatile — rebuilt every boot)" : "");
 
-    vfs_mkdir("/store");
+    vfs_mkdir(g_store_root);
     vfs_mkdir("/etc"); vfs_mkdir("/etc/pkg");
     ldso_provision();
-    rootfs_unpack();                 /* §M43 — tcc headers/crt/libs into the VFS */
+    /* The tcc rootfs and NetSurf's resources are NOT unpacked here — see
+     * pkg_ensure_tcc_rootfs / pkg_ensure_netsurf_res for the measurement that
+     * moved them. */
 
     /* §M39 3b — network/TLS system files at the standard paths so ring-3 TLS
      * clients (musl httpstest, a future wget) find them:
@@ -1134,4 +1278,9 @@ void pkg_init(void) {
     register_coreutil(&rc_ls,   "ls",   _binary_user_ls_muslelf_start,   _binary_user_ls_muslelf_end);
     register_coreutil(&rc_env,  "env",  _binary_user_env_muslelf_start,  _binary_user_env_muslelf_end);
     register_coreutil(&rc_sh,   "sh",   _binary_user_sh_muslelf_start,   _binary_user_sh_muslelf_end);
+
+    /* MEASURE what provisioning costs, so the question "should the store live
+     * on the disk?" is answered with a number instead of an impression. */
+    klog(KLOG_INFO, "pkg", "provisioning took %u ms\n",
+         (unsigned)(timer_ticks_ms() - t_start));
 }

@@ -83,6 +83,54 @@ SECTIONS
         __stop_desktop_shells = .;
     }
 
+    /* Config watch registry (§M63 stage 0) — CONFIG_WATCH() entries.  A
+     * subsystem that read a key at boot registers here so a later change
+     * (the persistent store being overlaid once the disk mounts, or a
+     * settings panel writing the key) reaches it instead of taking effect
+     * only at the NEXT boot. */
+    .config_watches : ALIGN(8)
+    {
+        __start_config_watches = .;
+        KEEP(*(config_watches))
+        __stop_config_watches = .;
+    }
+
+    /* Item-view registry (§M63/§M64) — ITEM_VIEW() layouts (grid, list, …).
+     * The desktop and the control panel pick one BY NAME from config, so a
+     * new layout is a new file rather than an edit to either consumer. */
+    .item_views : ALIGN(8)
+    {
+        __start_item_views = .;
+        KEEP(*(item_views))
+        __stop_item_views = .;
+    }
+
+    /* Control-panel registries (§M63): SETTINGS_PANEL() pages and
+     * CONFIG_KEY() descriptors.  A setting ships next to the code it
+     * configures; controlpanel.c names none of them. */
+    .settings_panels : ALIGN(8)
+    {
+        __start_settings_panels = .;
+        KEEP(*(settings_panels))
+        __stop_settings_panels = .;
+    }
+
+    /* §M65 — widget-class registry: WIDGET_CLASS() entries, looked up BY
+       NAME so a class can be named in data (and later across a boundary). */
+    .ui_classes : ALIGN(8)
+    {
+        __start_ui_classes = .;
+        KEEP(*(ui_classes))
+        __stop_ui_classes = .;
+    }
+
+    .config_keys : ALIGN(8)
+    {
+        __start_config_keys = .;
+        KEEP(*(config_keys))
+        __stop_config_keys = .;
+    }
+
     .shell_providers : ALIGN(8)
     {
         __start_shell_providers = .;

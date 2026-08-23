@@ -104,3 +104,7 @@ third_party/netsurf/
 user/*.so.*
 third_party/.musl123-backup/
 scratchpad_*.sh
+
+# Python bytecode cache from the host-side build/test scripts
+# (scripts/svg2paths.py, scripts/dos-shell-test.py).  A build product.
+**/__pycache__/

@@ -384,8 +384,43 @@ static void editor_destroy(struct widget* w) {
     if (e->buf) { kfree(e->buf); e->buf = NULL; }
 }
 
-static const struct widget_ops editor_ops =
-    { editor_draw, editor_mouse, editor_key, editor_keycode, editor_destroy };
+/* §M58 — mouse DRAG selection.  The editor already had a selection model
+ * (anchor + cursor, Shift+arrows); all that was missing was the pointer stream,
+ * which `widget_ops.mouse` could not express.  Press drops the anchor, drag
+ * moves the cursor with the anchor held, release does nothing — the range is
+ * whatever the two offsets say.
+ *
+ * Note the shared helper: `ed_move_to(e, off, keep_anchor)` is the same call
+ * Shift+arrow uses, so keyboard and mouse selection cannot drift apart. */
+static void editor_pointer(struct widget* w, int lx, int ly, int phase) {
+    struct w_editor* e = (struct w_editor*)w;
+    if (phase == WPTR_RELEASE) return;
+
+    int line = e->scroll_line + (ly - ED_PAD_Y) / WED_ROW_H;
+    int col  = e->scroll_col  + (lx - ED_PAD_X + GFX_GLYPH_W / 2) / GFX_GLYPH_W;
+    if (line < 0) line = 0;
+    if (col  < 0) col  = 0;
+    int lcount = ed_line_count(e);
+    if (line >= lcount) line = lcount - 1;
+    int ls = ed_offset_of_line(e, line);
+    int le = ed_line_end(e, ls);
+    if (col > le - ls) col = le - ls;
+
+    e->pref_col = -1;
+    if (phase == WPTR_PRESS) {
+        gui_window_focus_widget(w->win, w);
+        e->anchor = -1;                 /* a new press starts a new selection */
+        ed_move_to(e, ls + col, 0);
+        e->anchor = e->cursor;          /* …anchored where it started */
+    } else {
+        ed_move_to(e, ls + col, 1);     /* keep the anchor → extend */
+    }
+    gui_window_request_redraw(w->win);
+}
+
+static const struct widget_ops editor_ops = {
+    editor_draw, editor_mouse, editor_key, editor_keycode, editor_destroy, editor_pointer, NULL
+};
 
 /* -------------------------------------------------------------------------- */
 /* Public API.                                                                 */

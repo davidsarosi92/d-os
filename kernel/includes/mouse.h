@@ -24,4 +24,12 @@ typedef void (*mouse_listener_t)(int dx, int dy, unsigned buttons);
  * Until a listener is set, packets are decoded and dropped. */
 void mouse_set_listener(mouse_listener_t fn);
 
+/* §M61 follow-up — the WHEEL, reported separately from motion because it is not
+ * a movement: routing a wheel delta as `dy` would move the cursor instead of
+ * scrolling what is under it.  `dz` is positive for wheel-up.  Only fires on a
+ * device that accepted the IntelliMouse knock (ps2_mouse.c reads the ID back);
+ * on one that did not, no wheel events arrive and everything else still works. */
+typedef void (*mouse_wheel_t)(int dz);
+void mouse_set_wheel_listener(mouse_wheel_t fn);
+
 #endif

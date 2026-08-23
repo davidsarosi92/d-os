@@ -171,6 +171,15 @@ void       pmm_free_frame(pmm_phys_t addr);
 pmm_phys_t pmm_alloc_frame_dma32(void);
 pmm_phys_t pmm_alloc_contiguous_dma32(uint32_t n);
 
+/* Release a run obtained from pmm_alloc_contiguous* .
+ *
+ * It takes `n` — the SAME count the allocation asked for — and not just the
+ * address, because a contiguous run is one buddy block of order ceil_log2(n):
+ * freeing it as `n` separate order-0 frames corrupts the allocator's
+ * accounting, and there is no way to recover the order from the address alone.
+ * The symmetry is the contract: free with the count you allocated with. */
+void       pmm_free_contiguous(pmm_phys_t addr, uint32_t n);
+
 /* Statistics.  `managed` is the total count of frames the PMM knows
  * about (sum of AVAILABLE mmap regions in frames).  `free` and `used`
  * always add up to `managed`. */

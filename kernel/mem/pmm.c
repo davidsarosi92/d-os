@@ -654,6 +654,15 @@ pmm_phys_t pmm_alloc_contiguous_dma32(uint32_t n) {
     return page_alloc(order, ZONE_DMA32);
 }
 
+void pmm_free_contiguous(pmm_phys_t addr, uint32_t n) {
+    if (addr == PMM_ALLOC_FAIL || n == 0) return;
+    /* The order the ALLOCATION used — see the header: a contiguous run is one
+     * buddy block, and the free must name the same block. */
+    int order = ceil_log2(n);
+    if (order > BUDDY_MAX_ORDER) return;
+    page_free(addr, order);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Stats.                                                                     */
 /* -------------------------------------------------------------------------- */

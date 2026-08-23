@@ -25,6 +25,13 @@
  * the returned virtual base equals the physical base. */
 extern int fb_get_info(volatile uint32_t** px, uint32_t* w, uint32_t* h,
                        uint32_t* pitch_bytes);
+/* §M61 — the console's four numbers, updated in ONE place after a mode set.
+ * Declared in fb_present.h now, shared with the aarch64 backend. */
+/* Physical base of the framebuffer as the bootloader reported it, and the
+ * mapping of a physical FB address into the kernel's address space.  Both live
+ * in fb_terminal.c, which is where the multiboot info was read. */
+extern uint32_t fb_get_phys_base(void);
+extern uintptr_t fb_phys_to_virt(uint32_t phys);
 
 /* -------------------------------------------------------------------------- */
 /* fb_present interface.                                                       */
@@ -39,7 +46,10 @@ int fb_present_map(uint64_t phys, uint64_t size) {
     for (uint32_t a = base_aligned; a < end; a += 0x00400000u) {
         int r = vmm_map_4mib(a, a, VMM_WRITABLE);
         if (r != 0 && r != -2) {
-            kprintf("fb: vmm_map_4mib(%p) failed: %d\n", (void*)a, r);
+            /* (uintptr_t) first: `a` is 32-bit and this file also compiles for
+             * x86_64, where a bare cast to void* warns.  A silent build is what
+             * lets a REAL warning be seen (§M57). */
+            kprintf("fb: vmm_map_4mib(%p) failed: %d\n", (void*)(uintptr_t)a, r);
             return -1;
         }
     }
@@ -129,4 +139,113 @@ int fb_flip_init(volatile uint32_t** buf0, volatile uint32_t** buf1) {
 void fb_flip_to(int idx) {
     if (!fb_flip_ok) return;
     dispi_write(VBE_DISPI_INDEX_Y_OFFSET, idx ? (uint16_t)flip_height : 0);
+}
+
+/* ==========================================================================
+ * §M61 — MODE SETTING on the Bochs-VBE device.
+ *
+ * The same register file the page flip above already drives, which is why this
+ * belongs here and not in a new file: XRES/YRES/BPP plus the ENABLE bit, and
+ * the framebuffer BAR does not move — only the geometry and the pitch change.
+ *
+ * The mode LIST is curated rather than enumerated, because this device has no
+ * mode table: it accepts more or less any size that fits in VRAM.  A handful of
+ * standard sizes is what a person wants to choose from, and each is offered
+ * only if the device actually accepts it (probed once, at first ask) — an
+ * offered mode that then fails is worse than one that was never listed.
+ * ========================================================================== */
+
+#define VBE_DISPI_INDEX_XRES        0x1
+#define VBE_DISPI_INDEX_YRES        0x2
+#define VBE_DISPI_INDEX_BPP         0x3
+#define VBE_DISPI_INDEX_ENABLE      0x4
+#define VBE_DISPI_INDEX_VIRT_WIDTH  0x6
+#define VBE_DISPI_ENABLED           0x01
+#define VBE_DISPI_LFB_ENABLED       0x40
+
+/* The physical base of the framebuffer, captured the first time we look.  NOT
+ * derived from the mapped pointer: that works only where the FB is identity
+ * mapped, and this file compiles for x86_64 too. */
+static uint32_t fb_phys_captured = 0;
+
+static const struct fb_mode candidates[] = {
+    {  640,  480, 32 }, {  800,  600, 32 }, { 1024,  768, 32 },
+    { 1280,  720, 32 }, { 1280,  800, 32 }, { 1280, 1024, 32 },
+    { 1440,  900, 32 }, { 1600,  900, 32 }, { 1680, 1050, 32 },
+    { 1920, 1080, 32 }, { 1920, 1200, 32 },
+};
+#define N_CANDIDATES ((int)(sizeof candidates / sizeof candidates[0]))
+
+static int dispi_present(void) {
+    uint16_t id = dispi_read(VBE_DISPI_INDEX_ID);
+    return (id >= 0xB0C0 && id <= 0xB0C5);
+}
+
+int fb_mode_count(void) {
+    /* Without the DISPI device there is exactly one mode: whatever the
+     * bootloader set.  Callers use that to know the feature is absent. */
+    return dispi_present() ? N_CANDIDATES : 1;
+}
+
+int fb_mode_current(struct fb_mode* out) {
+    volatile uint32_t* px; uint32_t w, h, pitch;
+    if (!out || fb_get_info(&px, &w, &h, &pitch) != 0) return -1;
+    out->w = (uint16_t)w; out->h = (uint16_t)h;
+    out->bpp = (uint16_t)((pitch / (w ? w : 1)) * 8);
+    return 0;
+}
+
+int fb_mode_get(int index, struct fb_mode* out) {
+    if (!out) return -1;
+    if (!dispi_present()) return index == 0 ? fb_mode_current(out) : -1;
+    if (index < 0 || index >= N_CANDIDATES) return -1;
+    *out = candidates[index];
+    return 0;
+}
+
+int fb_mode_set(uint32_t w, uint32_t h, uint32_t bpp) {
+    volatile uint32_t* px; uint32_t ow, oh, opitch;
+    if (fb_get_info(&px, &ow, &oh, &opitch) != 0) return -1;
+    if (!dispi_present()) return -2;
+    if (bpp != 32) return -3;                 /* the whole stack is 32-bpp */
+    if (w < 320 || h < 200 || w > 4096 || h > 4096) return -4;
+
+    if (!fb_phys_captured) fb_phys_captured = fb_get_phys_base();
+    if (!fb_phys_captured) return -5;
+
+    /* Map the new frame BEFORE switching: if the window cannot be mapped we
+     * still have a working display, whereas a device already switched to a
+     * mode whose memory is unmapped is a black screen with no way back. */
+    uint32_t new_pitch = w * 4;
+    if (fb_present_map(fb_phys_captured, (uint64_t)new_pitch * h * 2) != 0) return -6;
+
+    dispi_write(VBE_DISPI_INDEX_ENABLE, 0);          /* must be off to program */
+    dispi_write(VBE_DISPI_INDEX_XRES, (uint16_t)w);
+    dispi_write(VBE_DISPI_INDEX_YRES, (uint16_t)h);
+    dispi_write(VBE_DISPI_INDEX_BPP,  (uint16_t)bpp);
+    dispi_write(VBE_DISPI_INDEX_VIRT_WIDTH, (uint16_t)w);
+    dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
+
+    /* Read back.  The device CLAMPS what it cannot do rather than failing, so
+     * believing the write would leave the kernel drawing at a size the display
+     * is not showing — the classic "everything is shifted" bug. */
+    uint16_t gw = dispi_read(VBE_DISPI_INDEX_XRES);
+    uint16_t gh = dispi_read(VBE_DISPI_INDEX_YRES);
+    if (gw != (uint16_t)w || gh != (uint16_t)h) {
+        dispi_write(VBE_DISPI_INDEX_ENABLE, 0);
+        dispi_write(VBE_DISPI_INDEX_XRES, (uint16_t)ow);
+        dispi_write(VBE_DISPI_INDEX_YRES, (uint16_t)oh);
+        dispi_write(VBE_DISPI_INDEX_BPP,  32);
+        dispi_write(VBE_DISPI_INDEX_VIRT_WIDTH, (uint16_t)ow);
+        dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
+        return -7;
+    }
+
+    /* The flip's second buffer belonged to the OLD geometry; the compositor
+     * re-establishes it after the resize. */
+    fb_flip_ok = 0;
+
+    fb_adopt_mode((volatile uint32_t*)(uintptr_t)fb_phys_to_virt(fb_phys_captured),
+                  w, h, new_pitch);
+    return 0;
 }

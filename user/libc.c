@@ -42,6 +42,8 @@
  * (rax/eax = number, rbx/ecx/edx = args); aarch64 traps via `svc #0` with the
  * kernel's x8 = number, x0..x2 = args ABI.  The kernel dispatchers read exactly
  * these registers. */
+long dos_syscall3(long n, long a, long b, long c);   /* exported below */
+
 static long syscall3(long n, long a, long b, long c) {
     long r;
 #if defined(__aarch64__)
@@ -256,4 +258,12 @@ int printf(const char* fmt, ...) {
     }
     va_end(ap);
     return 0;
+}
+
+
+/* §M65 — the exported raw entry.  Thin on purpose: the display bridge's
+ * operations are d-os's own, and a wrapper per call would be five functions
+ * that add nothing but a place to get the argument order wrong. */
+long dos_syscall3(long n, long a, long b, long c) {
+    return syscall3(n, a, b, c);
 }

@@ -25,6 +25,7 @@
 
 #include "gui.h"
 #include "gui_app.h"
+#include "icons.h"
 #include "widget.h"
 #include "keymap.h"
 #include "vfs.h"
@@ -292,5 +293,5 @@ static void editor_open_with(const char* path) {
 static void editor_launch(void)                { editor_open_with(NULL); }
 static void editor_open_path(const char* path) { editor_open_with(path); }
 
-GUI_APP_ASSOC("Editor", editor_launch, editor_open_path,
-              "txt conf md cfg log");
+GUI_APP_ASSOC_ICON("Editor", editor_launch, editor_open_path,
+                   "txt conf md cfg log", ICON_DOC);

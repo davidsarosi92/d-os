@@ -141,6 +141,12 @@ enum abi_op {
      * fourth argument a three-argument call never passed reads whatever the
      * guest happened to leave there.  One op per ARITY is the only version
      * that cannot silently take a garbage flag word for an instruction. */
+    /* §M65 — the display bridge's toolkit build.  A d-os operation, not a
+     * Linux one, which is exactly why it goes through the ENGINE: the number
+     * is the same on every guest, and a shared handler means all three arches
+     * gain it at once instead of three switch arms drifting apart. */
+    ABI_UI_BUILD,
+
     ABI_SOCKET,
     ABI_BIND,
     ABI_CONNECT,

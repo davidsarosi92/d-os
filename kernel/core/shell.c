@@ -43,11 +43,18 @@
 #include "percpu.h"
 #include "slab.h"
 #include "gui.h"
+#include "ui.h"            /* §M65 — `ui` prints the class registry */
 #include "uaccess.h"   /* §1.1 — faulttest exercises the exception table */
 #include "gui_app.h"
+#include "wallpaper.h"   /* §M60 — the `wallpaper` command lives in wallpaper.c */
+#include "shortcut.h"    /* §M64 — desktop shortcuts, likewise shared */
+#include "settings.h"    /* §M63 — `conf`: declared keys, validated */
+#include "splash.h"
+#include "clipboard.h"   /* §M58/§M59 — `clip` */
 #include "shell_provider.h"
 #include "basic.h"
 #include "klog.h"
+#include "watchdog.h"
 #include "elf.h"
 #include "crash.h"     /* §M47 — the `crash` report list */
 #include "proc.h"
@@ -146,7 +153,14 @@ static void cmd_help(void) {
                   "  fputest (per-task FP/SIMD register file)\n"
                   "  archtest (ELF arch gate), crash (what has gone wrong)\n"
                   "  pane, pane split horizontal|vertical\n"
-                  "  gui (compositor + desktop), gui stats, launch [app]\n"
+                  "  gui (compositor + desktop), gui stop, gui stats, launch [app]\n"
+                  "  termcheck (terminal scrollback self-test, in a GUI window)\n"
+                  "  wallpaper [gradient|solid:RRGGBB|<path.bmp>|fit <mode>]\n"
+                  "  shortcut [list|add <name> <target> [icon]|rm <name>]\n"
+                  "  conf [list|show <key>|set <key> <value>]\n"
+                  "  clip [show|paste [primary]|copy <text>|promote]\n"
+                  "  mode [list|<w>x<h> [--force]|confirm|revert]\n"
+                  "  splash [on|off|status]\n"
                   "  run <path.bas> (Tiny-BASIC)\n"
                   "  lslayout, setlayout <us|hu|...>, lscpu, taskset <pid> <mask>\n"
                   "  sched [ms] (how work is spread over the CPUs), loop [n], loopstop\n"
@@ -1357,12 +1371,27 @@ static void cmd_gui_stats(void) {
     gui_get_stats(&full, &partial, &avg_kb);
     kprintf("frames: %u full, %u partial (dirty-rect), avg %u KB blitted/frame\n",
             full, partial, avg_kb);
+    struct gui_desktop_stats d;
+    gui_get_desktop_stats(&d);
+    kprintf("desktop: %u loop iterations, %u panel repaints, %u chrome events\n",
+            d.iters, d.draws, d.events);
+    kprintf("         %u half-second ticks, %u changed the chrome, clock %u ms\n",
+            d.ticks, d.tick_dirty, d.clock_ms);
 }
 
 /* `gui` — start the M22 compositor.  The calling shell keeps running in
  * its (now invisible) pane; two fresh shells come up in windows.  A
  * second invocation is a no-op — the compositor is a singleton. */
-static void cmd_gui(void) {
+static void cmd_gui(const char* args) {
+    while (args && *args == ' ') args++;
+    if (args && starts_with(args, "stop")) {
+        /* The other direction, from the shell side.  It exists because the
+         * Start menu's "Exit GUI" is unreachable when the desktop is what went
+         * wrong — and a way out that only works while everything works is not
+         * a way out. */
+        if (gui_stop() != 0) console_write("gui: not running\n");
+        return;
+    }
     if (gui_is_active()) {
         console_write("gui: already running\n");
         return;
@@ -2002,6 +2031,9 @@ extern const unsigned char _binary_user_netsurf_dynelf_end[]   __attribute__((we
  * DT_NEEDED store .so's from /lib, and its runtime resources come from /res
  * (provisioned into the VFS at boot).  With no argument it opens about:welcome. */
 static void cmd_netsurf(const char* args) {
+    /* §M62 follow-up — ~9 MiB of browser resources, unpacked on first launch
+     * rather than on every boot (see pkg.h for the measurement). */
+    pkg_ensure_netsurf_res();
     if (!_binary_user_netsurf_dynelf_start) {
         console_write("netsurf: not built — run `make ARCH=x86_64 netsurf`\n");
         return;
@@ -3055,6 +3087,45 @@ static void cmd_posixtest(void) {
     kprintf("posixtest: returned rc=%d\n", rc);
 }
 
+/* §M65 — `uidemo`: the widget toolkit driven from RING 3.  It builds a label,
+ * a checkbox, a radio group and a slider by sending a DESCRIPTION over the
+ * display bridge, and prints the events they raise — the proof that the
+ * toolkit's data-shaped API buys what it was designed for. */
+extern const unsigned char _binary_user_uidemo_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_uidemo_elf_end[]   __attribute__((weak));
+
+static void cmd_uidemo(void) {
+    if (!_binary_user_uidemo_elf_start) {
+        console_write("uidemo: not embedded for this arch\n");
+        return;
+    }
+    if (!gui_is_active()) { console_write("uidemo: the GUI is not running\n"); return; }
+    size_t len = (size_t)(_binary_user_uidemo_elf_end - _binary_user_uidemo_elf_start);
+    const char* argv[] = { "uidemo" };
+    int pid = proc_spawn_argv_under("uidemo", _binary_user_uidemo_elf_start, len,
+                                    1, argv, 0, gui_desktop_pid());
+    kprintf("uidemo: spawned pid %d\n", pid);
+}
+
+/* §M59 — `redirtest`: does STDOUT REDIRECTION work from ring 3?  It exists
+ * because a bug reported as "the clipboard will not take a ring-3 write" was
+ * really `dup2(fd, 1)` being refused — fds 0/1/2 were not table entries, so no
+ * shell could redirect anything, and the failure was silent (the bytes went to
+ * the terminal and the exit status said success). */
+extern const unsigned char _binary_user_redirtest_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_redirtest_elf_end[]   __attribute__((weak));
+
+static void cmd_redirtest(void) {
+    if (!_binary_user_redirtest_elf_start) {
+        console_write("redirtest: not embedded for this arch\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_redirtest_elf_end -
+                          _binary_user_redirtest_elf_start);
+    int rc = proc_exec_elf(_binary_user_redirtest_elf_start, len);
+    kprintf("redirtest: returned rc=%d\n", rc);
+}
+
 /* M36 — `linuxtest`: run a Linux-ABI program under the Linux personality
  * (task->linux_abi), routing its syscalls through the linux_abi translator. */
 extern const unsigned char _binary_user_linuxhello_elf_start[] __attribute__((weak));
@@ -3643,6 +3714,9 @@ extern const unsigned char _binary_user_dostcc_start[] __attribute__((weak));
 extern const unsigned char _binary_user_dostcc_end[]   __attribute__((weak));
 
 static void cmd_tcc(const char* args) {
+    /* §M62 follow-up — the compiler's headers/crt/libs are unpacked HERE, on
+     * first use, instead of at every boot (see pkg.h). */
+    pkg_ensure_tcc_rootfs();
     if (!_binary_user_dostcc_start) {
         console_write("tcc: not embedded — run `make tcc` then rebuild\n");
         return;
@@ -3775,27 +3849,31 @@ static void cmd_pkgtest(void) {
 /* Configuration commands.                                              */
 /* -------------------------------------------------------------------- */
 
-static void cmd_getconf(const char* key) {
-    if (!key || !*key) { console_write("getconf: missing key\n"); return; }
-    const char* v = config_get(key, NULL);
-    if (v) kprintf("%s = %s\n", key, v);
-    else   kprintf("%s: not set\n", key);
-}
+/* §M63 stage 0 — these now delegate to config.c so the ARM serial shell runs
+ * the SAME implementation (it had none at all before). */
+static void cmd_getconf(const char* key) { config_cmd_getconf(key); }
+static void cmd_setconf(const char* args) { config_cmd_setconf(args); }
 
-/* `setconf <key> <value>` — same wonky "split at first space" parser as
- * `write`.  Doesn't honor quoting yet. */
-static void cmd_setconf(const char* args) {
-    if (!args || !*args) { console_write("setconf: missing args\n"); return; }
-    const char* p = args;
-    while (*p && *p != ' ') p++;
-    if (!*p)              { console_write("setconf: missing value\n"); return; }
-    char key[64];
-    int  i = 0;
-    while (args + i < p && i < (int)sizeof key - 1) { key[i] = args[i]; i++; }
-    key[i] = 0;
-    const char* val = p + 1;
-    if (config_set(key, val) == 0) kprintf("%s = %s\n", key, val);
-    else                           console_write("setconf: failed\n");
+/* §M12 completion — `rm [-r] <path>`.  The x86 shell never had one: exFAT
+ * could not delete (`.unlink = NULL`) and nobody missed it on ramfs.  With
+ * unlink/rmdir implemented there is something to remove, and a filesystem you
+ * can only add to is not a filesystem you can use. */
+static void cmd_rm(const char* args) {
+    while (args && *args == ' ') args++;
+    if (!args || !*args) { console_write("rm: usage: rm [-r] <path>\n"); return; }
+
+    int recursive = 0;
+    if (args[0] == '-' && args[1] == 'r') {
+        recursive = 1;
+        args += 2;
+        while (*args == ' ') args++;
+        if (!*args) { console_write("rm: usage: rm [-r] <path>\n"); return; }
+    }
+
+    int rc = recursive ? vfs_unlink_recursive(args) : vfs_unlink(args);
+    if (rc == 0)       kprintf("removed %s\n", args);
+    else if (rc == -2) kprintf("rm: %s is not empty (use -r)\n", args);
+    else               kprintf("rm: cannot remove %s\n", args);
 }
 
 static void cmd_uptime(void) {
@@ -3892,8 +3970,37 @@ static void dispatch(struct vc* my_vc, const char* line) {
      * pane anyway; vc_clear also reaches GUI windows via the emit hook. */
     if (streq(line, "clear"))  { vc_clear(my_vc);  return; }
     /* M22: bring up the compositor + two shell windows.  Idempotent. */
-    if (streq(line, "gui"))       { cmd_gui();       return; }
+    if (streq(line, "gui"))       { cmd_gui("");     return; }
     if (streq(line, "gui stats")) { cmd_gui_stats(); return; }
+    if (streq(line, "termcheck")) { gui_term_check(); return; }
+    if (streq(line, "ui"))        { ui_cmd("");      return; }
+    if (starts_with(line, "ui ")) { ui_cmd(line + 3); return; }
+    if (streq(line, "redirtest")) { cmd_redirtest(); return; }
+    if (streq(line, "uidemo"))    { cmd_uidemo();    return; }
+    /* MATCH THE EXACT WORD, not the `gui ` prefix: a generic prefix arm added
+     * above an existing exact one silently swallows it, and `gui stats` started
+     * answering "already running". */
+    if (streq(line, "gui stop"))  { cmd_gui("stop");  return; }
+    /* §M60 — desktop background.  Implementation is shared with the ARM
+     * serial shell (wallpaper.c), so both arches run the same command. */
+    if (streq(line, "wallpaper"))        { wallpaper_cmd("");        return; }
+    if (starts_with(line, "wallpaper ")) { wallpaper_cmd(line + 10); return; }
+    /* §M64 — desktop shortcuts (shared with the ARM serial shell). */
+    if (streq(line, "shortcut"))         { shortcut_cmd("");         return; }
+    if (starts_with(line, "shortcut "))  { shortcut_cmd(line + 9);   return; }
+    /* §M63 — declared settings.  `conf set` VALIDATES; `setconf` does not
+     * (it must stay able to set undeclared keys). */
+    if (streq(line, "conf"))             { settings_cmd("");         return; }
+    if (starts_with(line, "conf "))      { settings_cmd(line + 5);   return; }
+    /* §M58/§M59 — the clipboard and the primary selection. */
+    if (streq(line, "clip"))             { clipboard_cmd("");        return; }
+    if (starts_with(line, "clip "))      { clipboard_cmd(line + 5);  return; }
+    /* §M61 — display mode. */
+    if (streq(line, "mode"))             { display_cmd("");         return; }
+    if (starts_with(line, "mode "))      { display_cmd(line + 5);   return; }
+    /* §M62 — the boot screen, and the way to test that a fault removes it. */
+    if (streq(line, "splash"))           { splash_cmd("");          return; }
+    if (starts_with(line, "splash "))    { splash_cmd(line + 7);    return; }
     /* M22.2: GUI app registry access from any shell. */
     if (streq(line, "launch"))          { cmd_launch("");        return; }
     if (starts_with(line, "launch "))   { cmd_launch(line + 7);  return; }
@@ -3913,6 +4020,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "touch "))  { cmd_touch(line + 6); return; }
     if (starts_with(line, "write "))  { cmd_write(line + 6); return; }
     if (starts_with(line, "mount "))  { cmd_mount(line + 6); return; }
+    if (starts_with(line, "rm "))     { cmd_rm   (line + 3); return; }
 
     /* Config commands. */
     if (streq(line, "config"))         { config_dump(); return; }
@@ -3981,6 +4089,9 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "archtest"))      { cmd_archtest(); return; }
     if (streq(line, "crash"))         { cmd_crash(); return; }
     if (streq(line, "wdtest"))         { cmd_wdtest(); return; }
+    /* §M31 L3 — deliberately wedge CPU 0 with IRQs off; the ib700 NMI must
+     * fire and reboot.  The box going down IS the pass. */
+    if (streq(line, "hardlock"))       { watchdog_hardlock_test(); return; }
     if (streq(line, "cron"))           { cmd_cron("");         return; }
     if (starts_with(line, "cron "))    { cmd_cron(line + 5);   return; }
     if (streq(line, "crontab"))        { cron_list();          return; }
@@ -4050,11 +4161,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "taskset "))  { cmd_taskset(line + 8);     return; }
     if (streq(line, "slabinfo"))       { cmd_slabinfo();             return; }
     if (streq(line, "buddyinfo"))      { cmd_buddyinfo();            return; }
-    if (streq(line, "saveconf"))       {
-        if (config_save() == 0) console_write("config saved.\n");
-        else                    console_write("saveconf: failed\n");
-        return;
-    }
+    if (streq(line, "saveconf"))       { config_cmd_saveconf(); return; }
     if (starts_with(line, "getconf ")) { cmd_getconf(line + 8); return; }
     if (starts_with(line, "setconf ")) { cmd_setconf(line + 8); return; }
     if (streq(line, "memcheck")){

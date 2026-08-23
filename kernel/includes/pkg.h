@@ -116,6 +116,13 @@ void pkg_register(struct pkg_recipe* r);
  * once at boot after the VFS is up. */
 void pkg_init(void);
 
+/* §M62 follow-up — unpack the on-demand archives.  Both are idempotent and are
+ * called by the things that need them (the on-device compiler, the browser);
+ * boot does not pay for either.  Measured: they were 171 ms of pkg_init's
+ * 174 ms, and most boots use neither. */
+void pkg_ensure_tcc_rootfs(void);
+void pkg_ensure_netsurf_res(void);
+
 /* Build recipe `id` (+ its deps) into the store if absent; content-addressed,
  * so identical inputs reuse the same immutable path.  Returns 0 on success. */
 int  pkg_build(const char* id);

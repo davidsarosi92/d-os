@@ -77,6 +77,26 @@ int keymap_select(const char* name) {
     return -1;
 }
 
+/* §M63 stage 0 — the layout is chosen at keymap_init, which runs long before
+ * the persistent config store is attached (that needs a mounted disk).  Without
+ * this watcher a saved `keyboard.layout` took effect one boot LATE — the file
+ * held "hu", the machine typed "us", and nothing anywhere said why.  It also
+ * makes `setconf keyboard.layout hu` behave like `setlayout hu`, instead of
+ * being a setting that silently waits for a reboot. */
+static void keymap_conf_changed(const char* key, const char* value) {
+    (void)key;
+    if (!value || !*value) return;
+    if (keymap_select(value) == 0)
+        kprintf("keymap: layout now '%s' (config)\n", keymap_current());
+    else
+        kprintf("keymap: config asked for unknown layout '%s' — keeping '%s'\n",
+                value, keymap_current());
+}
+CONFIG_WATCH(keymap_watch) = {
+    .prefix  = "keyboard.layout",
+    .changed = keymap_conf_changed,
+};
+
 const char* keymap_current(void) {
     return active ? active->name : "?";
 }

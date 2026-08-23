@@ -167,7 +167,24 @@ def qemu_argv(a, sersock, monsock):
             "-netdev", "user,id=net0", "-device", "virtio-net-device,netdev=net0",
             "-serial", "unix:%s,server,nowait" % sersock,
             "-monitor", "unix:%s,server,nowait" % monsock, "-no-reboot",
+            # THE DISPLAY, for the same reason as the NIC above.  Without a
+            # virtio-gpu this arch boots serial-only, so nothing that draws —
+            # the GUI, the wallpaper, §M61's mode setting — could be tested
+            # here at all, and "aarch64 declines" stayed true by accident.
+            # The keyboard comes with it: a framebuffer boot puts the shell on
+            # a VC, and `sendkey` needs a device to arrive through.
+            "-device", "virtio-gpu-device",
+            "-device", "virtio-keyboard-device",
+            "-device", "virtio-mouse-device",
         ]
+        # --disk used to be honoured on x86 ONLY, silently: the flag was
+        # accepted, the ARM guest simply never saw a disk, and anything that
+        # needed persistent storage "failed" on this arch for no visible
+        # reason.  On -M virt the drive has to be attached to a virtio-MMIO
+        # slot explicitly (there is no if=virtio auto-wiring here).
+        if a.disk:
+            argv += ["-drive", "if=none,id=hd0,file=%s,format=raw" % a.disk,
+                     "-device", "virtio-blk-device,drive=hd0"]
     else:
         qemu = "qemu-system-i386" if a.arch == "i386" else "qemu-system-x86_64"
         argv = [
@@ -176,9 +193,28 @@ def qemu_argv(a, sersock, monsock):
             "-serial", "unix:%s,server,nowait" % sersock,
             "-monitor", "unix:%s,server,nowait" % monsock, "-no-reboot",
             "-netdev", "user,id=net0", "-device", "virtio-net-pci,netdev=net0",
+            # THE SAME MACHINE run_qemu.sh GIVES A PERSON.  Until now the harness
+            # left these out, so every GUI test ran WITHOUT the page flip (the
+            # std-VGA default has no room for a second 1920x1200 frame), without
+            # the hardware watchdog, and with a different RTC — i.e. the measured
+            # path and the used path were different machines.  That is the §M48
+            # missing-NIC / §M49 missing-smp shape for the fourth time, and it is
+            # why a lockup a user hit on the everyday run could not appear in any
+            # test here.  The watchdog in particular is wanted: if a test wedges
+            # the guest, the NMI report is the evidence.
+            "-vga", "none", "-device", "VGA,vgamem_mb=32",
+            "-rtc", "base=localtime",
+            "-device", "ib700", "-action", "watchdog=inject-nmi",
         ]
         if a.disk:
-            argv += ["-drive", "if=virtio,file=%s,format=raw" % a.disk]
+            argv += ["-drive", "if=virtio,file=%s,format=raw" % a.disk,
+                     # A FORMATTED image carries a boot signature, and SeaBIOS
+                     # then boots the (empty) disk instead of the CD — the guest
+                     # hangs with NO serial output at all, which reads exactly
+                     # like a kernel that died before the first kprintf.
+                     # CLAUDE.md documents the trap; the harness should not make
+                     # everyone rediscover it.
+                     "-boot", "d"]
     return argv + list(a.extra)
 
 
@@ -194,8 +230,20 @@ def main():
                     help="seconds to wait between commands")
     ap.add_argument("--key-delay", type=float, default=0.02)
     ap.add_argument("--smp", type=int, default=4)
-    ap.add_argument("--mem", default="512M")
+    # 1024M: what run_qemu.sh gives, and past that point i386 can actually
+    # use the extra RAM (§M48 raised the identity map to 1 GiB).
+    ap.add_argument("--mem", default="1024M")
     ap.add_argument("--disk", default="")
+    # --empty is the harness spelling of run_qemu.sh's flag of the same name: a
+    # FRESHLY FORMATTED, empty volume.  A test that reuses whatever the last run
+    # left behind is a test whose result depends on the order the tests ran in,
+    # and the failure that produces (a stale /mnt/store shadowing a rebuild) has
+    # already cost this project a debugging session.  No disk at all remains the
+    # default — that is what "neither flag" has always meant here.
+    ap.add_argument("--empty", nargs="?", const="", default=None,
+                    metavar="PATH",
+                    help="attach a freshly formatted, EMPTY 64 MiB exFAT disk "
+                         "(default path: build/<arch>/test-empty.img)")
     ap.add_argument("--log", default="")
     ap.add_argument("--monitor-cmd", action="append", default=[],
                     help="a raw QEMU monitor command to run after the shell "
@@ -210,11 +258,39 @@ def main():
     # prompt: the prompt is written to the virtual console, and only kprintf
     # output is teed to COM1.  x86's shell announces its pane; the ARM serial
     # REPL prints its own banner.
-    ap.add_argument("--boot-marker", default=r"\[pane \d+ ready|serial shell ready")
+    # NOTE: the aarch64 alternative is the REPL's actual banner.  It used to
+    # read "serial shell ready", which serial_shell.c has not printed for a
+    # long time — so every ARM run silently failed the boot wait and typed
+    # NOTHING, then printed a log that looks like a healthy boot.  A harness
+    # that quietly stops driving the guest is worse than one that crashes.
+    ap.add_argument("--boot-marker",
+                    default=r"\[pane \d+ ready|serial shell ready|Type 'help'")
     ap.add_argument("extra", nargs="*", help="extra QEMU arguments")
     a = ap.parse_args()
 
     os.chdir(ROOT)
+
+    if a.empty is not None:
+        # mkfs.exfat lives in the build container, not on a Mac host.  Formatting
+        # is arch-independent, so the x86 image does it for every arch.
+        a.disk = a.empty or "build/%s/test-empty.img" % a.arch
+        os.makedirs(os.path.dirname(a.disk) or ".", exist_ok=True)
+        if os.path.exists(a.disk):
+            os.remove(a.disk)
+        print("test: --empty — formatting a fresh exFAT disk at %s" % a.disk)
+        rc = subprocess.call(
+            ["docker", "run", "--rm", "--platform=linux/amd64",
+             "-v", "%s:/src" % ROOT, "d-os-build", "bash", "-c",
+             "dd if=/dev/zero of=/src/%s bs=1M count=64 status=none && "
+             "mkfs.exfat -n DOS /src/%s >/dev/null" % (a.disk, a.disk)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if rc != 0:
+            # Refuse rather than silently run without one: the whole point of
+            # the flag is a known starting state, and a run that quietly lost it
+            # would report a pass about a machine nobody asked for.
+            raise SystemExit("test: could not format %s (is the d-os-build "
+                             "image present?)" % a.disk)
+
     log = a.log or "/tmp/dos-test-%s.log" % a.arch
     sersock = "/tmp/dos-test-%s.ser" % a.arch
     monsock = "/tmp/dos-test-%s.mon" % a.arch

@@ -39,6 +39,91 @@ int  gui_start(void);
 /* Non-zero once gui_start succeeded. */
 int  gui_is_active(void);
 
+/* §M58 — `termcheck`: write numbered lines until they scroll off, then select
+ * one BY ABSOLUTE LINE NUMBER and print what the copy path returns.  A
+ * screenshot cannot show that a selection still names the text it was given;
+ * this can.  Must run inside a GUI terminal window. */
+void gui_term_check(void);
+
+/* Desktop-task loop counters, printed by `gui stats`.  They exist because
+ * "the taskbar is not updating" has three causes that look identical from
+ * outside the guest: the loop is not running, it runs but never marks itself
+ * dirty, or it draws and the damage never reaches the compositor.  One line of
+ * numbers separates them. */
+struct gui_desktop_stats {
+    unsigned iters;         /* desktop-loop iterations                       */
+    unsigned draws;         /* panel repaints                                */
+    unsigned events;        /* chrome clicks/motions taken off the queue     */
+    unsigned ticks;         /* half-second housekeeping ticks                */
+    unsigned tick_dirty;    /* …of which changed the chrome (clock, layout)  */
+    unsigned clock_ms;      /* what timer_ticks_ms() reads on that task      */
+};
+void gui_get_desktop_stats(struct gui_desktop_stats* out);
+
+/* Boot-time: start the desktop if `gui.autostart` says so (default: yes).
+ *
+ * ONE function rather than the six lines at each call site, because there are
+ * TWO boot paths — x86's `kernel_main` and aarch64's own `main_entry` — and
+ * this project has repeatedly shipped features that existed on one of them
+ * only (§4.63's `setconf` on ARM is the same shape).  Returns 1 if the desktop
+ * came up, 0 if it was declined by config, -1 if it was wanted and failed. */
+int  gui_autostart(void);
+
+/* Ask for the GUI session to end and the screen to go back to the text shell.
+ * Safe from anywhere including IRQ context and the chrome (Start → Exit GUI):
+ * it only sets a flag.  The teardown itself runs on a task of its own, because
+ * it KILLS the desktop session — and the compositor, which is where chrome
+ * clicks are dispatched, is inside that session.  A task cannot tidily free the
+ * surfaces it is still composing from. */
+void gui_queue_exit(void);
+
+/* The teardown itself (normally reached through gui_queue_exit).  Kills the
+ * desktop session, releases the input hooks, frees the surfaces and hands the
+ * screen back to the console.  Returns 0 if a session was running.  After it
+ * returns, `gui_start()` may be called again — this is a stop, not a shutdown. */
+int  gui_stop(void);
+
+/* §M60 — repaint the wallpaper surface from the current `gui.wallpaper` /
+ * `gui.wallpaper_fit` config and damage the whole screen.  Called by
+ * `wallpaper_set*` (and later the §M63 Personalisation panel) so a source
+ * change is visible without a reboot.  A no-op returning 0 when the GUI is not
+ * running — the config key is still what boot will read.  Returns 0 if the
+ * requested source was used, -1 if it fell back to the gradient. */
+int  gui_wallpaper_reload(void);
+
+/* §M64 — the desktop's shortcut set changed (added, removed, reloaded).
+ * Damages the icon area so the next compose repaints it from the model.
+ * Deliberately NOT a redraw request into the shell: `draw_under` reads the
+ * model live, so damage is the whole notification.  Safe (a no-op) when the
+ * GUI is not running, which is the normal case for `shortcut add` typed at a
+ * boot shell before `gui`. */
+void gui_desktop_icons_changed(void);
+
+/* §M61 — change the display mode.  QUEUED: the switch happens on the
+ * compositor task between frames, because a mode set while compose() is
+ * mid-blit writes into a buffer that is about to be freed.  Returns 0 when the
+ * request was accepted (not when the mode is live). */
+int  gui_request_mode(int w, int h);
+int  gui_current_mode(int* w, int* h);
+
+/* Confirm-or-revert.  `arm` marks the change provisional (so the saved
+ * geometry is kept), `confirm` keeps it, `revert` restores the previous mode
+ * AND the window geometry saved before the change — a cancelled experiment
+ * must leave the desktop exactly as it was, not merely the resolution. */
+void gui_set_mode_applied_cb(void (*fn)(int w, int h));
+void gui_mode_arm_confirm(void);
+void gui_mode_confirm(void);
+void gui_mode_revert(void);
+
+/* §M61 — the `mode` command (displaypanel.c), shared by both shells. */
+void display_cmd(const char* args);
+int  display_set_mode(int w, int h, int force);
+
+/* §M61 — a window-level cooked-key hook, consulted before the focused widget.
+ * The confirm dialog uses it so Enter/Esc work with nothing focused. */
+void gui_window_set_key_hook(struct gui_window* win,
+                             void (*fn)(struct gui_window*, char));
+
 /* §M42 — pid of the desktop/session task (0 before gui_start).  Taskbar-launched
  * apps parent under this so they appear under the desktop in the process tree. */
 int  gui_desktop_pid(void);
@@ -49,6 +134,11 @@ int  gui_desktop_pid(void);
  * task with no event loop.  Used by the taskbar and the `launch` command. */
 struct gui_app_def;
 void gui_queue_launch(const struct gui_app_def* app);
+
+/* §M61 — the same thing for a window that is not a launcher entry: run
+ * `open_fn` on a fresh app-host task.  A window created anywhere else is bound
+ * to a task with no app-host loop, so it never lays out and never ticks. */
+void gui_queue_open(void (*open_fn)(void));
 
 /* §M46 secure-attention key (Ctrl+Alt+X): request the compositor close/force the
  * top-most app window.  Safe to call from the keyboard IRQ (single volatile
@@ -131,8 +221,37 @@ void gui_window_set_on_close(struct gui_window* win,
 /* Append a widget to the window's list (constructors call this). */
 void gui_window_add_widget(struct gui_window* win, struct widget* w);
 
+/* §M65 — THE WINDOW POPUP: one overlay above every window, used by the menu
+ * bar and the combo box.  `items` is one string with '\n' between entries and
+ * "-" for a separator — flat, because the same call has to survive being sent
+ * from ring 3.  The choice comes back to `owner` as an app event carrying the
+ * row index (-1 = dismissed) and the `tag` handed in here, so ONE handler can
+ * tell which menu was open. */
+void gui_popup_open(struct gui_window* owner, int sx, int sy,
+                    const char* items, int tag);
+void gui_popup_close(void);
+int  gui_popup_active(void);
+
+/* §M65 — the toolkit's per-window state slot (owned by ui.c, freed with the
+ * window).  Accessors, not a field, so ui.c stays out of gui.c's internals. */
+/* Where the window's CONTENT starts on screen — widgets think in content
+ * coordinates, the popup overlay thinks in screen ones. */
+void gui_window_content_origin(struct gui_window* win, int* sx, int* sy);
+
+/* Ask for a layout + repaint of this window's toolkit widgets. */
+void gui_window_request_layout(struct gui_window* win);
+
+void* gui_window_ui(struct gui_window* win);
+void  gui_window_set_ui(struct gui_window* win, void* p);
+
 /* Keyboard focus within the window (textinput click handler calls it). */
 void gui_window_focus_widget(struct gui_window* win, struct widget* w);
+struct widget* gui_window_focused_widget(struct gui_window* win);
+
+/* §M65 — Tab / Shift+Tab: move the keyboard focus to the next / previous
+ * focusable widget, wrapping.  Handled at the WINDOW level because no control
+ * can know what comes after it. */
+void gui_window_focus_cycle(struct gui_window* win, int backwards);
 int  gui_widget_focused(struct widget* w);      /* is w the focused one? */
 
 /* Content-area size in pixels (excludes decorations). */

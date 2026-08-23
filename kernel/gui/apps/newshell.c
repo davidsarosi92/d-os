@@ -8,6 +8,7 @@
 
 #include "gui.h"
 #include "gui_app.h"
+#include "icons.h"
 
 static int next_shell_no = 3;           /* "shell 1" + "shell 2" exist at start */
 
@@ -41,5 +42,5 @@ static void newshell_launch_detached(void) {
     gui_window_create_detached(name, 140 + k * 48, 100 + k * 40, 560, 360);
 }
 
-GUI_APP("New Shell", newshell_launch);
-GUI_APP("Detached Shell", newshell_launch_detached);
+GUI_APP_ICON("New Shell", newshell_launch, ICON_TERMINAL);
+GUI_APP_ICON("Detached Shell", newshell_launch_detached, ICON_TERMINAL);

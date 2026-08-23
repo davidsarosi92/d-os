@@ -25,6 +25,7 @@
 
 #include "gui.h"
 #include "gui_app.h"
+#include "icons.h"
 #include "widget.h"
 #include "task.h"
 #include "kmalloc.h"
@@ -294,4 +295,4 @@ static void taskman_open(void) {
     tm_refresh(win);
 }
 
-GUI_APP("Task Manager", taskman_open);
+GUI_APP_ICON("Task Manager", taskman_open, ICON_CHART);

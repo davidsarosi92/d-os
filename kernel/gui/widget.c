@@ -12,6 +12,7 @@
 #include "keymap.h"          /* M22.5: KC_* keycodes for navigation */
 #include "clipboard.h"       /* M22.5: Ctrl+C/V in textinput */
 #include "kmalloc.h"
+#include "ui.h"             /* §M65 — ui_text_clipped + the class registry */
 #include <stddef.h>
 
 /* Palette — deliberately close to the window chrome in gui.c. */
@@ -37,8 +38,20 @@ static void str_copy(char* dst, const char* src, int cap) {
 }
 
 void widget_draw_all(struct widget* head, struct gfx_surface* s) {
-    for (struct widget* w = head; w; w = w->next)
-        if (w->ops && w->ops->draw) w->ops->draw(w, s);
+    for (struct widget* w = head; w; w = w->next) {
+        if (!w->ops || !w->ops->draw) continue;
+        /* §M65 — A WIDGET DRAWS INSIDE ITS OWN BOX.  Enforced here, in the one
+         * loop every widget's draw goes through, rather than trusted to each
+         * of them: the toolkit measures a widget and then tells it a size, and
+         * a draw that ignores it lands on the widget next door (the settings
+         * page's help text did exactly that).  With a scrolling container the
+         * clip is narrower still — its viewport — which is what makes a child
+         * scrolled half out of view stop at the edge instead of spilling. */
+        if (w->clip_w > 0) gfx_set_clip(s, w->clip_x, w->clip_y, w->clip_w, w->clip_h);
+        else               gfx_set_clip(s, w->x, w->y, w->w, w->h);
+        w->ops->draw(w, s);
+        gfx_clear_clip(s);
+    }
 }
 
 struct widget* widget_at(struct widget* head, int lx, int ly) {
@@ -49,14 +62,20 @@ struct widget* widget_at(struct widget* head, int lx, int ly) {
     return hit;
 }
 
-static void base_init(struct widget* w, struct gui_window* win,
-                      int x, int y, int ww, int hh,
-                      const struct widget_ops* ops, void* ctx, int focusable) {
+/* §M65 — EXPORTED as widget_init.  It was static, so every widget outside this
+ * file hand-rolled its own initialisation — and w_itemview.c's copy forgot to
+ * set `win`, which is why keyboard navigation had never worked in an item view
+ * (§4.70).  A constructor written by hand skips exactly the line nothing else
+ * needed; one shared initialiser is how that stops happening. */
+void widget_init(struct widget* w, struct gui_window* win,
+                 int x, int y, int ww, int hh,
+                 const struct widget_ops* ops, void* ctx, int focusable) {
     w->x = x; w->y = y; w->w = ww; w->h = hh;
     w->ops = ops;
     w->win = win;
     w->ctx = ctx;
     w->focusable = focusable;
+    w->clip_x = w->clip_y = w->clip_w = w->clip_h = 0;   /* §M65: unrestricted */
     w->next = NULL;
     gui_window_add_widget(win, w);
 }
@@ -74,17 +93,21 @@ static void outline(struct gfx_surface* s, int x, int y, int w, int h, uint32_t 
 
 static void label_draw(struct widget* w, struct gfx_surface* s) {
     struct w_label* l = (struct w_label*)w;
-    gfx_text(s, w->x, w->y + (w->h - GFX_GLYPH_H) / 2, l->text, l->color);
+    /* §M65 — clipped to the label's own rect.  A label is the widget most
+     * likely to be handed text longer than its box (a help line, a path), and
+     * text that spills is text drawn over the widget next to it. */
+    ui_text_clipped(s, w, w->x, w->y + (w->h - GFX_GLYPH_H) / 2, l->text, l->color);
 }
 
-static const struct widget_ops label_ops =
-    { label_draw, NULL, NULL, NULL, NULL };
+static const struct widget_ops label_ops = {
+    label_draw, NULL, NULL, NULL, NULL, NULL, NULL
+};
 
 struct w_label* w_label_create(struct gui_window* win, int x, int y, int w,
                                const char* text) {
     struct w_label* l = (struct w_label*)kcalloc(1, sizeof(*l));
     if (!l) return NULL;
-    base_init(&l->base, win, x, y, w, GFX_GLYPH_H + 4, &label_ops, NULL, 0);
+    widget_init(&l->base, win, x, y, w, GFX_GLYPH_H + 4, &label_ops, NULL, 0);
     l->color = WCOL_TEXT;
     str_copy(l->text, text, (int)sizeof(l->text));
     return l;
@@ -115,8 +138,9 @@ static void button_mouse(struct widget* w, int lx, int ly, int kind) {
     if (b->on_click) b->on_click(b, w->ctx);
 }
 
-static const struct widget_ops button_ops =
-    { button_draw, button_mouse, NULL, NULL, NULL };
+static const struct widget_ops button_ops = {
+    button_draw, button_mouse, NULL, NULL, NULL, NULL, NULL
+};
 
 struct w_button* w_button_create(struct gui_window* win, int x, int y,
                                  int w, int h, const char* text,
@@ -124,7 +148,7 @@ struct w_button* w_button_create(struct gui_window* win, int x, int y,
                                  void* ctx) {
     struct w_button* b = (struct w_button*)kcalloc(1, sizeof(*b));
     if (!b) return NULL;
-    base_init(&b->base, win, x, y, w, h, &button_ops, ctx, 0);
+    widget_init(&b->base, win, x, y, w, h, &button_ops, ctx, 0);
     b->on_click = on_click;
     str_copy(b->text, text, (int)sizeof(b->text));
     return b;
@@ -238,14 +262,26 @@ static void listview_key(struct widget* w, char c) {
     if (lv->on_activate) lv->on_activate(lv, lv->sel, w->ctx);
 }
 
-static const struct widget_ops listview_ops =
-    { listview_draw, listview_mouse, listview_key, listview_keycode, NULL };
+/* §M61 follow-up — the wheel, for the same reason the item view got one: with
+ * no wheel a list ends at its last visible row.  Three rows per notch. */
+static void listview_scroll(struct widget* w, int dz) {
+    struct w_listview* lv = (struct w_listview*)w;
+    lv->scroll -= dz * 3;
+    if (lv->scroll < 0) lv->scroll = 0;
+    if (lv->scroll > lv->count - 1) lv->scroll = lv->count > 0 ? lv->count - 1 : 0;
+    gui_window_request_redraw(w->win);
+}
+
+static const struct widget_ops listview_ops = {
+    listview_draw, listview_mouse, listview_key, listview_keycode, NULL, NULL,
+    listview_scroll
+};
 
 struct w_listview* w_listview_create(struct gui_window* win, int x, int y,
                                      int w, int h, void* ctx) {
     struct w_listview* lv = (struct w_listview*)kcalloc(1, sizeof(*lv));
     if (!lv) return NULL;
-    base_init(&lv->base, win, x, y, w, h, &listview_ops, ctx, 1);
+    widget_init(&lv->base, win, x, y, w, h, &listview_ops, ctx, 1);
     lv->sel = -1;
     return lv;
 }
@@ -329,14 +365,15 @@ static void textinput_keycode(struct widget* w, uint8_t kc, uint8_t mods) {
     }
 }
 
-static const struct widget_ops textinput_ops =
-    { textinput_draw, textinput_mouse, textinput_key, textinput_keycode, NULL };
+static const struct widget_ops textinput_ops = {
+    textinput_draw, textinput_mouse, textinput_key, textinput_keycode, NULL, NULL, NULL
+};
 
 struct w_textinput* w_textinput_create(struct gui_window* win, int x, int y,
                                        int w, void* ctx) {
     struct w_textinput* t = (struct w_textinput*)kcalloc(1, sizeof(*t));
     if (!t) return NULL;
-    base_init(&t->base, win, x, y, w, 16, &textinput_ops, ctx, 1);
+    widget_init(&t->base, win, x, y, w, 16, &textinput_ops, ctx, 1);
     return t;
 }
 
@@ -346,3 +383,138 @@ void w_textinput_set(struct w_textinput* t, const char* text) {
     t->len = 0;
     while (t->buf[t->len]) t->len++;
 }
+
+/* ===========================================================================
+ * §M65 — CLASS REGISTRATIONS for the M22 controls.
+ *
+ * The controls themselves are untouched: each class is a thin adapter that
+ * builds one from a `struct ui_spec` and reports the size it wants.  That is
+ * what lets the layout engine place a twenty-line-old listview next to a
+ * brand-new checkbox without either knowing about the other — and what lets a
+ * panel (or, later, a ring-3 client) name "listview" in DATA instead of
+ * calling a function pointer it cannot marshal.
+ * ========================================================================= */
+
+
+static struct widget* cls_label_create(struct gui_window* win,
+                                       const struct ui_spec* sp) {
+    struct w_label* l = w_label_create(win, 0, 0, 120, sp->text);
+    return l ? &l->base : NULL;
+}
+static void cls_label_measure(struct widget* w, int avail_w, int* min_w,
+                              int* pref_w, int* pref_h) {
+    struct w_label* l = (struct w_label*)w;
+    int n = 0; while (l->text[n]) n++;
+    *min_w  = GFX_GLYPH_W * 4;
+    *pref_w = n * GFX_GLYPH_W;
+    if (*pref_w > avail_w) *pref_w = avail_w;
+    *pref_h = GFX_GLYPH_H + 4;
+}
+static void cls_label_settext(struct widget* w, const char* t) {
+    w_label_set((struct w_label*)w, t);
+}
+static int cls_label_gettext(struct widget* w, char* out, int cap) {
+    struct w_label* l = (struct w_label*)w;
+    int i = 0; for (; l->text[i] && i < cap - 1; i++) out[i] = l->text[i];
+    if (cap) out[i] = 0;
+    return i;
+}
+WIDGET_CLASS(wc_label) = {
+    .name = "label", .create = cls_label_create, .measure = cls_label_measure,
+    .set_text = cls_label_settext, .get_text = cls_label_gettext,
+};
+
+/* The button's click reaches the window's ONE event sink rather than a
+ * per-widget callback: (id, type) is what a boundary can carry. */
+static void cls_button_click(struct w_button* b, void* ctx) {
+    (void)ctx;
+    ui_emit(&b->base, UI_EV_CLICK, 0);
+}
+static struct widget* cls_button_create(struct gui_window* win,
+                                        const struct ui_spec* sp) {
+    struct w_button* b = w_button_create(win, 0, 0, 90, 22, sp->text,
+                                         cls_button_click, NULL);
+    return b ? &b->base : NULL;
+}
+static void cls_button_measure(struct widget* w, int avail_w, int* min_w,
+                               int* pref_w, int* pref_h) {
+    struct w_button* b = (struct w_button*)w;
+    int n = 0; while (b->text[n]) n++;
+    *min_w  = 40;
+    *pref_w = n * GFX_GLYPH_W + 20;
+    if (*pref_w > avail_w) *pref_w = avail_w;
+    *pref_h = 22;
+}
+static void cls_button_settext(struct widget* w, const char* t) {
+    str_copy(((struct w_button*)w)->text, t, (int)sizeof ((struct w_button*)w)->text);
+}
+WIDGET_CLASS(wc_button) = {
+    .name = "button", .create = cls_button_create, .measure = cls_button_measure,
+    .set_text = cls_button_settext,
+};
+
+static void cls_list_select(struct w_listview* lv, int idx, void* ctx) {
+    (void)ctx;
+    ui_emit(&lv->base, UI_EV_CHANGE, idx);
+}
+static void cls_list_activate(struct w_listview* lv, int idx, void* ctx) {
+    (void)ctx;
+    ui_emit(&lv->base, UI_EV_ACTIVATE, idx);
+}
+static struct widget* cls_list_create(struct gui_window* win,
+                                      const struct ui_spec* sp) {
+    (void)sp;
+    struct w_listview* lv = w_listview_create(win, 0, 0, 200, 120, NULL);
+    if (!lv) return NULL;
+    lv->on_select   = cls_list_select;
+    lv->on_activate = cls_list_activate;
+    return &lv->base;
+}
+static void cls_list_measure(struct widget* w, int avail_w, int* min_w,
+                             int* pref_w, int* pref_h) {
+    (void)w;
+    *min_w  = 80;
+    *pref_w = avail_w;                  /* a list takes what it is given */
+    *pref_h = 120;                      /* …and grows by weight, not by wish */
+}
+static int  cls_list_get(struct widget* w) { return ((struct w_listview*)w)->sel; }
+static void cls_list_set(struct widget* w, int v) {
+    struct w_listview* lv = (struct w_listview*)w;
+    if (v >= 0 && v < lv->count) lv->sel = v;
+}
+WIDGET_CLASS(wc_listview) = {
+    .name = "listview", .create = cls_list_create, .measure = cls_list_measure,
+    .get_value = cls_list_get, .set_value = cls_list_set,
+};
+
+static void cls_text_submit(struct w_textinput* t, void* ctx) {
+    (void)ctx;
+    ui_emit(&t->base, UI_EV_SUBMIT, 0);
+}
+static struct widget* cls_text_create(struct gui_window* win,
+                                      const struct ui_spec* sp) {
+    struct w_textinput* t = w_textinput_create(win, 0, 0, 160, NULL);
+    if (!t) return NULL;
+    if (sp->text) w_textinput_set(t, sp->text);
+    t->on_submit = cls_text_submit;
+    return &t->base;
+}
+static void cls_text_measure(struct widget* w, int avail_w, int* min_w,
+                             int* pref_w, int* pref_h) {
+    *min_w  = 80;
+    *pref_w = avail_w;
+    *pref_h = w->h > 0 ? w->h : 22;
+}
+static void cls_text_settext(struct widget* w, const char* t) {
+    w_textinput_set((struct w_textinput*)w, t);
+}
+static int cls_text_gettext(struct widget* w, char* out, int cap) {
+    struct w_textinput* t = (struct w_textinput*)w;
+    int i = 0; for (; t->buf[i] && i < cap - 1; i++) out[i] = t->buf[i];
+    if (cap) out[i] = 0;
+    return i;
+}
+WIDGET_CLASS(wc_textinput) = {
+    .name = "textinput", .create = cls_text_create, .measure = cls_text_measure,
+    .set_text = cls_text_settext, .get_text = cls_text_gettext,
+};

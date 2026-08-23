@@ -178,9 +178,9 @@ static void bounce_fini(struct bounce* b) {
 /* fd_lookup is declared in fd.h — it stopped being private to this file when
  * epoll needed to resolve a descriptor without re-implementing the table. */
 static int read_may_loop(int fd) {
-    if (fd < 3) return 0;                       /* stdin is line-oriented       */
     struct ofile* o = fd_lookup(fd);
-    return (o && o->kind == FD_VFS);
+    if (!o) return 0;                           /* console stdin is line-oriented */
+    return (o->kind == FD_VFS);
 }
 
 /* SYS_PRINT — write a NUL-terminated RING-3 string to the console.
@@ -207,10 +207,21 @@ long sys_print(const char* user_str) {
     return 0;
 }
 
-/* Resolve a real fd (>= 3) to its ofile, or NULL if out of range / not open. */
+/* Resolve `fd` to its ofile, or NULL if out of range / not open.
+ *
+ * §M59 — 0/1/2 ARE TABLE SLOTS.  They used to be rejected outright, with the
+ * console reached by number inside sys_read/sys_write, and the consequence was
+ * not a missing corner but a missing FEATURE: `dup2(fd, 1)` returned -1, so
+ * shell REDIRECTION could not work even in principle.  `sh -c "echo x > f"`
+ * reported success and wrote to the terminal, which is how a redirection into
+ * /dev/clipboard came to be reported as a clipboard bug.
+ *
+ * A NULL entry at 0/1/2 still means "the console": that is the DEFAULT, not a
+ * special case, and it is what keeps every program that never redirects
+ * working exactly as before. */
 struct ofile* fd_lookup(int fd) {
     struct task* t = task_current();
-    if (!t || fd < 3 || fd >= TASK_MAX_FDS) return NULL;
+    if (!t || fd < 0 || fd >= TASK_MAX_FDS) return NULL;
     return t->fds[fd];
 }
 
@@ -231,7 +242,9 @@ static long netsock_read (struct netsock* ns, void* buf, size_t n);
 
 /* Core: `buf` is always KERNEL memory (see the *_k note in syscall.h). */
 long sys_write_k(int fd, const void* buf, size_t n) {
-    if (fd == 1 || fd == 2) {                 /* stdout / stderr → console */
+    /* A REDIRECTED std stream is just an ofile; the console is what a slot with
+     * nothing in it means. */
+    if ((fd == 1 || fd == 2) && !fd_lookup(fd)) {
         const char* s = (const char*)buf;
         /* §M43: also capture into the task's buffer if one is set (Editor
          * "Compile & Run" reads it back), leaving room for a NUL terminator. */
@@ -310,10 +323,11 @@ static long stdin_read_line(char* buf, size_t cap) {
 
 /* Core: `buf` is always KERNEL memory (see the *_k note in syscall.h). */
 long sys_read_k(int fd, void* buf, size_t n) {
-    if (fd == 0) return stdin_read_line((char*)buf, n);   /* cooked stdin */
-    if (fd == 1 || fd == 2) return -1;
     struct ofile* o = fd_lookup(fd);
-    if (!o) return -1;
+    if (!o) {
+        if (fd == 0) return stdin_read_line((char*)buf, n);   /* cooked stdin */
+        return -1;                       /* console out is not readable */
+    }
     if (o->kind == FD_VFS)  return (long)vfs_read(o->file, buf, n);
     /* Sockets read(2) with POSIX blocking semantics (block == 1): an empty
      * read waits for the peer to send (or close → 0/EOF). */
@@ -388,9 +402,14 @@ int sys_open(const char* path, int flags) {
 }
 
 int sys_close(int fd) {
-    if (fd >= 0 && fd <= 2) return 0;          /* std streams: no-op */
     struct ofile* o = fd_lookup(fd);
-    if (!o) return -1;
+    if (!o) {
+        /* Closing a std stream that was never redirected is a no-op rather than
+         * an error: the console has no object to release, and a shell closes
+         * descriptors it did not open all the time. */
+        if (fd >= 0 && fd <= 2) return 0;
+        return -1;
+    }
     task_current()->fds[fd] = NULL;
     ofile_unref(o);
     return 0;
@@ -628,7 +647,9 @@ int sys_dup2(int oldfd, int newfd) {
     struct ofile* o = fd_lookup(oldfd);
     if (!o) return -1;
     if (oldfd == newfd) return newfd;
-    if (newfd < 3 || newfd >= TASK_MAX_FDS) return -1;
+    /* 0/1/2 included: `dup2(fd, 1)` is exactly how every shell implements `>`.
+     * Refusing it is what made redirection impossible (see fd_lookup). */
+    if (newfd < 0 || newfd >= TASK_MAX_FDS) return -1;
     struct task* t = task_current();
     if (t->fds[newfd]) { ofile_unref(t->fds[newfd]); t->fds[newfd] = NULL; }
     t->fds[newfd] = ofile_ref(o);
@@ -1087,7 +1108,8 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
         if (v && vc_can_read_line(v)) r |= POLLIN;
         return r;
     }
-    if (fd == 1 || fd == 2) return POLLOUT;      /* console out: always writable */
+    if ((fd == 1 || fd == 2) && !fd_lookup(fd))
+        return POLLOUT;                         /* console out: always writable */
 
     /* POLLNVAL is the honest answer for a descriptor that is not open, and it
      * is reported unrequested: a loop watching an fd it has already closed

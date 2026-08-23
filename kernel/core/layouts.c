@@ -19,6 +19,11 @@
  *   - Punctuation positions (HU: 0=ö, etc — but most ASCII fallbacks).
  *   - AltGr-accessed symbols (HU: AltGr+v=@, AltGr+q=\, AltGr+ě= ...).
  *
+ * §M63 follow-up: the accented vowels are no longer 0.  The font carries a
+ * Latin-2 upper half now (fb_terminal.c), so the layout emits ISO-8859-2 codes
+ * and á/é/í/ó/ö/ő/ú/ü/ű actually appear.  The old comment below described the
+ * reason they were empty and is kept for the reasoning, not as current state.
+ *
  * About the magyar layout below: it's the **ISO 102-key Hungarian
  * QWERTZ** mapping AS FAR AS 7-bit ASCII can express.  The Hungarian
  * accented vowels (á, é, í, ó, ú, ö, ő, ü, ű) need an extended font
@@ -127,18 +132,32 @@ static const char hu_base[KBD_KEYCODE_MAX] = {
     [0x18] = 'u', [0x19] = 'v', [0x1A] = 'w', [0x1B] = 'x',
     [0x1C] = 'z',                  /* HID 0x1C ("Y" on US) → 'z' on HU */
     [KC_Z] = 'y',                  /* HID 0x1D ("Z" on US) → 'y' on HU */
-    /* Number row: HU base — accented vowels omitted, ASCII rest filled. */
+    /* Number row.  On a Hungarian board it reads  0 1 2 3 4 5 6 7 8 9 ö ü ó :
+     * the '0' sits on the key LEFT of 1 (HID 0x35, the US backtick), and the
+     * key where US has 0 carries ö.  So KC_0 is NOT '0' here — getting that
+     * wrong is how a layout ends up looking right and typing wrong. */
     [KC_1] = '1', [0x1F] = '2', [0x20] = '3', [0x21] = '4', [0x22] = '5',
-    [0x23] = '6', [0x24] = '7', [0x25] = '8', [KC_9] = '9', [KC_0] = '0',
+    [0x23] = '6', [0x24] = '7', [0x25] = '8', [KC_9] = '9',
     [KC_ENTER]     = '\n',
     [KC_ESC]       = 27,
     [KC_BACKSPACE] = '\b',
     [KC_TAB]       = '\t',
     [KC_SPACE]     = ' ',
-    /* Punctuation row — base layer; accented-vowel keys (0x2F=ő, 0x30=ú,
-     * 0x33=é, 0x34=á, 0x35=0, 0x2D=ü, 0x2E=ó) left as 0. */
+    /* The accented vowels, FILLED IN at last (they were 0 — "the layout does
+     * not lie about what it produces" — until the font grew a Latin-2 half).
+     * Codes are ISO-8859-2; see the font table in fb_terminal.c for why that
+     * encoding and not Latin-1 (ő and ű do not exist in Latin-1). */
+    [KC_0]  = (char)0xF6,  /* ö  — the US-0 key                            */
+    [0x2D] = (char)0xFC,   /* ü  — the US-minus key                        */
+    [0x2E] = (char)0xF3,   /* ó  — the US-equals key                       */
+    [0x2F] = (char)0xF5,   /* ő  — the US-[ key                            */
+    [0x30] = (char)0xFA,   /* ú  — the US-] key                            */
+    [0x31] = (char)0xFB,   /* ű  — the US-backslash key                    */
+    [0x33] = (char)0xE9,   /* é  — the US-semicolon key                    */
+    [0x34] = (char)0xE1,   /* á  — the US-apostrophe key                   */
+    [0x35] = '0',          /* the key LEFT of 1 is '0' on HU               */
     [0x36] = ',', [0x37] = '.', [0x38] = '-',     /* on HU, /? key is - and _ */
-    [KC_NONUS_BSLASH] = '<',                       /* 102nd key */
+    [KC_NONUS_BSLASH] = (char)0xED,   /* í — the 102nd key, left of Y */
 };
 
 static const char hu_shift[KBD_KEYCODE_MAX] = {
@@ -150,14 +169,23 @@ static const char hu_shift[KBD_KEYCODE_MAX] = {
     [0x1C] = 'Z', [KC_Z] = 'Y',
     /* Shifted number row — Magyar conventional. */
     [KC_1] = '\'', [0x1F] = '"', [0x20] = '+', [0x21] = '!', [0x22] = '%',
-    [0x23] = '/',  [0x24] = '=', [0x25] = '(', [KC_9] = ')', [KC_0] = '=',
+    [0x23] = '/',  [0x24] = '=', [0x25] = '(', [KC_9] = ')',
+    [KC_0] = (char)0xD6,   /* Ö — see the base table: KC_0 is the ö key here */
     [KC_ENTER]     = '\n',
     [KC_ESC]       = 27,
     [KC_BACKSPACE] = '\b',
     [KC_TAB]       = '\t',
     [KC_SPACE]     = ' ',
+    /* Shifted accented vowels — the capitals. */
+    [0x2D] = (char)0xDC,   /* Ü */
+    [0x2E] = (char)0xD3,   /* Ó */
+    [0x2F] = (char)0xD5,   /* Ő */
+    [0x30] = (char)0xDA,   /* Ú */
+    [0x31] = (char)0xDB,   /* Ű */
+    [0x33] = (char)0xC9,   /* É */
+    [0x34] = (char)0xC1,   /* Á */
     [0x36] = '?', [0x37] = ':', [0x38] = '_',
-    [KC_NONUS_BSLASH] = '>',
+    [KC_NONUS_BSLASH] = (char)0xCD,   /* Í */
 };
 
 /* AltGr column — the symbols that need RAlt on a Hungarian keyboard

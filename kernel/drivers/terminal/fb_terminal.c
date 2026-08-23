@@ -41,6 +41,11 @@ static volatile uint32_t* fb_pixels = 0;        /* pointer into the mapped FB */
 static uint32_t fb_width  = 0;                  /* pixels per row */
 static uint32_t fb_height = 0;                  /* pixel rows */
 static uint32_t fb_pitch_bytes = 0;             /* bytes per pixel row */
+/* §M61 — the framebuffer's PHYSICAL base, kept because a mode set has to
+ * re-map the window and must not derive the address from the mapped pointer:
+ * that identity holds on the platforms we have and is exactly the kind of
+ * assumption an arch port later discovers the hard way. */
+static uint32_t fb_phys_base = 0;
 
 #define GLYPH_W 8
 #define GLYPH_H 8
@@ -59,7 +64,21 @@ static uint32_t cur_row = 0;
 /* Font data — 128 × 8 bytes.  Rows laid out top-to-bottom, MSB = left pixel. */
 /* Glyphs derived from the classic CP437 8×8 ROM font (public domain).        */
 /* -------------------------------------------------------------------------- */
-static const uint8_t font8x8[128][8] = {
+/* §M63 follow-up — the table is 256 entries and the encoding above 0x7F is
+ * ISO-8859-2 (Latin-2), NOT Latin-1.  That choice is forced rather than
+ * stylistic: Hungarian needs ő and ű, and neither exists in Latin-1 — a font
+ * that stopped at Latin-1 would render seven of the nine accented vowels and
+ * silently drop the two that are most characteristic of the language.
+ *
+ * Only the Hungarian vowels are filled in so far; every other high position is
+ * a zero glyph, which draws as a blank rather than as a wrong letter.  Adding
+ * the rest of Latin-2 is a table edit and nothing else.
+ *
+ * The accented shapes are DERIVED from the base letters (same stems, mark in
+ * the free top row; uppercase shifted down one row, which is free because row
+ * 7 is empty for every capital in this font).  Derivation rather than drawing
+ * is what keeps them looking like the same typeface. */
+static const uint8_t font8x8[256][8] = {
     /* 0x00-0x1F control codes: all zero glyphs */
     [' ']  = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
     ['!']  = {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
@@ -157,6 +176,26 @@ static const uint8_t font8x8[128][8] = {
     ['}']  = {0x70,0x18,0x18,0x0E,0x18,0x18,0x70,0x00},
     ['~']  = {0x76,0xDC,0x00,0x00,0x00,0x00,0x00,0x00},
     [0x7F] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF},     /* fallback block */
+
+    /* ---- ISO-8859-2 (Latin-2): the Hungarian accented vowels ---- */
+    [0xE1] = {0x0C,0x00,0x78,0x0C,0x7C,0xCC,0x76,0x00},   /* a */
+    [0xC1] = {0x0C,0x30,0x78,0xCC,0xCC,0xFC,0xCC,0xCC},   /* A */
+    [0xE9] = {0x0C,0x00,0x78,0xCC,0xFC,0xC0,0x78,0x00},   /* e */
+    [0xC9] = {0x0C,0xFE,0x62,0x68,0x78,0x68,0x62,0xFE},   /* E */
+    [0xED] = {0x0C,0x00,0x70,0x30,0x30,0x30,0x78,0x00},   /* i */
+    [0xCD] = {0x0C,0x78,0x30,0x30,0x30,0x30,0x30,0x78},   /* I */
+    [0xF3] = {0x0C,0x00,0x78,0xCC,0xCC,0xCC,0x78,0x00},   /* o */
+    [0xD3] = {0x0C,0x38,0x6C,0xC6,0xC6,0xC6,0x6C,0x38},   /* O */
+    [0xF6] = {0x6C,0x00,0x78,0xCC,0xCC,0xCC,0x78,0x00},   /* ö */
+    [0xD6] = {0x6C,0x38,0x6C,0xC6,0xC6,0xC6,0x6C,0x38},   /* Ö */
+    [0xF5] = {0x36,0x00,0x78,0xCC,0xCC,0xCC,0x78,0x00},   /* ő */
+    [0xD5] = {0x36,0x36,0x6C,0xC6,0xC6,0xC6,0x6C,0x38},   /* Ő */
+    [0xFA] = {0x0C,0x00,0xCC,0xCC,0xCC,0xCC,0x76,0x00},   /* u */
+    [0xDA] = {0x0C,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xFC},   /* U */
+    [0xFC] = {0x6C,0x00,0xCC,0xCC,0xCC,0xCC,0x76,0x00},   /* ü */
+    [0xDC] = {0x6C,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xFC},   /* Ü */
+    [0xFB] = {0x36,0x00,0xCC,0xCC,0xCC,0xCC,0x76,0x00},   /* ű */
+    [0xDB] = {0x36,0x36,0xCC,0xCC,0xCC,0xCC,0xCC,0xFC},   /* Ű */
 };
 
 /* -------------------------------------------------------------------------- */
@@ -182,7 +221,7 @@ static void fb_fill_bg(void) {
 /* Render one glyph at cell (col, row).  Characters outside 0..127 land on
  * the fallback glyph at 0x7F so nothing disappears silently. */
 static void draw_glyph(unsigned char ch, uint32_t col, uint32_t row) {
-    const uint8_t* g = font8x8[ch < 128 ? ch : 0x7F];
+    const uint8_t* g = font8x8[ch];
     uint32_t ox = col * GLYPH_W;
     uint32_t oy = row * GLYPH_H;
     for (int py = 0; py < GLYPH_H; py++) {
@@ -230,6 +269,34 @@ static void scroll_one_row(void) {
 /* longer wanders across pane boundaries.                                    */
 /* -------------------------------------------------------------------------- */
 
+/* §M61 — adopt a NEW mode.  Called by the mode-setting backend after the
+ * device has actually switched: the console's idea of the screen is these four
+ * numbers, and every renderer above (gfx surfaces, the compositor) reads them
+ * back through fb_get_info.  Updating them in one place is what keeps a mode
+ * change from being a hunt through every file that cached a width.
+ *
+ * The cell grid is recomputed here too; a caller that wants the console
+ * repainted clears it afterwards (the compositor repaints everything anyway). */
+uint32_t fb_get_phys_base(void) { return fb_phys_base; }
+
+/* On both platforms the framebuffer window is mapped at its physical address
+ * (x86 identity-maps the VRAM BAR; on ARM it is ordinary RAM already mapped by
+ * the boot tables).  The function exists so a future platform where that is
+ * NOT true has one place to change. */
+uintptr_t fb_phys_to_virt(uint32_t phys) { return (uintptr_t)phys; }
+
+void fb_adopt_mode(volatile uint32_t* px, uint32_t w, uint32_t h, uint32_t pitch) {
+    if (!px || !w || !h || !pitch) return;
+    fb_pixels      = px;
+    fb_width       = w;
+    fb_height      = h;
+    fb_pitch_bytes = pitch;
+    cell_cols      = w / GLYPH_W;
+    cell_rows      = h / GLYPH_H;
+    if (cur_col >= cell_cols) cur_col = 0;
+    if (cur_row >= cell_rows) cur_row = cell_rows ? cell_rows - 1 : 0;
+}
+
 int fb_cell_cols(void) { return (int)cell_cols; }
 int fb_cell_rows(void) { return (int)cell_rows; }
 
@@ -256,7 +323,7 @@ void fb_clear_cells(int col, int row, int w, int h, uint32_t bg) {
 void fb_draw_glyph_at(int col, int row, char ch, uint32_t fg, uint32_t bg) {
     if (!fb_pixels) return;
     if (col < 0 || row < 0 || col >= (int)cell_cols || row >= (int)cell_rows) return;
-    const uint8_t* g = font8x8[(unsigned char)ch < 128 ? (unsigned char)ch : 0x7F];
+    const uint8_t* g = font8x8[(unsigned char)ch];
     uint32_t ox = col * GLYPH_W;
     uint32_t oy = row * GLYPH_H;
     for (int py = 0; py < GLYPH_H; py++) {
@@ -321,7 +388,7 @@ int fb_get_info(volatile uint32_t** px, uint32_t* w, uint32_t* h,
 /* One glyph = 8 bytes, row-major, MSB = leftmost pixel.  Out-of-range
  * characters land on the 0x7F fallback block, same as draw_glyph. */
 const uint8_t* fb_font_glyph(unsigned char ch) {
-    return font8x8[ch < 128 ? ch : 0x7F];
+    return font8x8[ch];   /* 256 entries: 0x80+ is Latin-2 (see the table) */
 }
 
 /* NB: the Bochs-VBE double-buffer page flip (fb_flip_init / fb_flip_to) and the
@@ -352,6 +419,7 @@ int fb_term_init_if_available(const struct mboot_info* mbi) {
     if (fb_present_map(fb_phys, fb_size) != 0) return -5;
 
     fb_pixels      = (volatile uint32_t*)(uintptr_t)fb_phys;
+    fb_phys_base   = fb_phys;
     fb_width       = mbi->framebuffer_width;
     fb_height      = mbi->framebuffer_height;
     fb_pitch_bytes = mbi->framebuffer_pitch;
@@ -451,6 +519,7 @@ int fb_term_init_direct(uint64_t phys, uint32_t width, uint32_t height,
     if (fb_present_map(phys, (uint64_t)pitch_bytes * height) != 0) return -1;
 
     fb_pixels      = (volatile uint32_t*)(uintptr_t)phys;
+    fb_phys_base   = (uint32_t)phys;
     fb_width       = width;
     fb_height      = height;
     fb_pitch_bytes = pitch_bytes;

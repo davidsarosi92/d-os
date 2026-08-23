@@ -40,6 +40,7 @@
  * ============================================================================= */
 
 #include "vc.h"
+#include "splash.h"
 #include "fd.h"                       /* fd_readiness_signal (§M56) */
 #include "task.h"
 #include "console.h"
@@ -373,10 +374,30 @@ static int (*raw_kbd_hook)(uint8_t, uint8_t) = NULL;
 void vc_set_raw_kbd_hook(int (*fn)(uint8_t, uint8_t)) { raw_kbd_hook = fn; }
 
 int vc_raw_kbd_dispatch(uint8_t keycode, uint8_t mods) {
+    /* §M62 rule 4 — ANY key drops the boot splash, and this is the one place
+     * every input driver already passes through BEFORE it decides where the
+     * key should go (PS/2, USB HID, virtio-input all call it pre-translation).
+     *
+     * It used to live in `vc_kbd_push` alone, which looked equivalent and was
+     * not: the drivers only call that when a VC is FOCUSED, and during boot
+     * there is no VC yet — `vc_init` runs near the end.  So for the entire
+     * period the splash is actually up, the escape hatch was unreachable, and
+     * ESC in particular never produced anything at all (a bare Escape has no
+     * shell meaning, so nothing else noticed either).  Reported from use.
+     *
+     * Pre-translation also means it does not depend on the key having a
+     * character: Escape, a function key and Shift+something all dismiss it. */
+    if (splash_active()) { splash_key(); return 1; }
+
     return raw_kbd_hook ? raw_kbd_hook(keycode, mods) : 0;
 }
 
 void vc_kbd_push(char c) {
+    /* §M62 — any key drops the boot splash.  A boot screen you cannot get out
+     * of hides the answer exactly when it is wanted; the key is consumed so it
+     * does not also land in whatever is reading. */
+    if (splash_active()) { splash_key(); return; }
+
     if (kbd_hook && kbd_hook(c)) return;        /* consumed by the GUI */
     struct vc* v = focused;             /* snapshot — pointer-sized atomic */
     if (!v) return;

@@ -36,6 +36,10 @@ struct gui_app_def {
      * extensions (no dots) the app claims, e.g. "txt conf md". */
     void      (*open_path)(const char* path);
     const char* extensions;
+    /* §M64 — an `enum icon_id` (icons.h).  Zero (ICON_NONE) means "not
+     * stated", and every consumer substitutes ICON_APP for it: adding the
+     * field must not turn every existing registration into a blank tile. */
+    int         icon;
 };
 
 extern struct gui_app_def __start_gui_apps[];
@@ -49,6 +53,19 @@ extern struct gui_app_def __stop_gui_apps[];
         .launch = (_launchfn),                                          \
     }
 
+/* §M64 — registration with an ICON.  A separate macro rather than an extra
+ * argument to GUI_APP so the dozen existing call sites keep compiling: the
+ * registry is a struct with designated initialisers, and an app that never
+ * says anything about icons still gets a sensible one. */
+#define GUI_APP_ICON(_name, _launchfn, _icon)                           \
+    static const struct gui_app_def                                     \
+    __attribute__((used, section("gui_apps"), aligned(4)))              \
+    __gui_app_##_launchfn = {                                           \
+        .name   = (_name),                                              \
+        .launch = (_launchfn),                                          \
+        .icon   = (_icon),                                              \
+    }
+
 /* M22.5 — registration WITH a file-type association. */
 #define GUI_APP_ASSOC(_name, _launchfn, _openfn, _exts)                 \
     static const struct gui_app_def                                     \
@@ -58,6 +75,18 @@ extern struct gui_app_def __stop_gui_apps[];
         .launch     = (_launchfn),                                      \
         .open_path  = (_openfn),                                        \
         .extensions = (_exts),                                          \
+    }
+
+/* …and with both. */
+#define GUI_APP_ASSOC_ICON(_name, _launchfn, _openfn, _exts, _icon)     \
+    static const struct gui_app_def                                     \
+    __attribute__((used, section("gui_apps"), aligned(4)))              \
+    __gui_app_##_launchfn = {                                           \
+        .name       = (_name),                                          \
+        .launch     = (_launchfn),                                      \
+        .open_path  = (_openfn),                                        \
+        .extensions = (_exts),                                          \
+        .icon       = (_icon),                                          \
     }
 
 /* Registry walk helpers (implemented in gui.c — trivial, but keep the

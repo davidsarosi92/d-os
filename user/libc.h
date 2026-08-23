@@ -20,6 +20,10 @@ int   close(int fd);
 void  exit (int code);
 void* mmap (size_t len, int fd);            /* fd<0 = anonymous */
 int   getpid(void);
+
+/* Raw syscall, for the d-os operations a libc wrapper would only obscure —
+ * the display bridge (SYS_DOSGUI_*) is the reason this is exported. */
+long  dos_syscall3(long n, long a, long b, long c);
 int   fork  (void);                         /* → child pid in parent, 0 in child */
 int   waitpid(int pid, int* status);        /* block for a child; → reaped pid */
 

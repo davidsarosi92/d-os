@@ -117,6 +117,14 @@ as text), and an http/https fetcher over d-os sockets + Mbed TLS with real
 certificate verification.  `run_qemu.sh` now attaches a NIC — its absence is why
 no site loaded however well the fetcher worked.  **Mesa** runs on i386 too | i386
 kmap / PAE; non-blocking fetcher `poll` |
+| §M58 | **Text selection** — a pointer grab + press/motion/release for widgets, a selection MODEL (byte range for text, cell rectangle for the terminal grid), inverted rendering on damage rects, word/line on double/triple click.  Blocked today by the widget mouse callback having only click/double — a drag has no transport | — |
+| §M59 | **Clipboard, system-wide** — the M22.5 kernel clipboard widened to typed offers + a ring-3 surface (§M50 ops + `/dev/clipboard`) + Wayland `wl_data_device` (ownership-based, fd hand-off) + a primary selection (select ⇒ middle-click paste).  Today nothing in ring 3 can touch the clipboard at all | — |
+| §M60 | ✅ **Wallpaper (SHIPPED, DOCS §4.62)** — the background becomes a surface with a source (`gui.wallpaper`: gradient / path / solid) + a fit mode; ONE trivial in-kernel decoder, everything else decoded in ring 3 and handed over the dosgui bridge; unreadable image ⇒ gradient + a klog line; `wallpaper` cmd then a Settings app | — |
+| §M61 | ✅ **Resolution switching (SHIPPED, DOCS §4.70 + §4.77 — aarch64 too)** — the mode is a constant in `boot.s` (and `FB_WIDTH` on ARM) today.  New `fb_mode_list`/`fb_mode_set` behind the existing `fb_present.h` seam (Bochs DISPI / virtio-gpu set_scanout), then the real work: resize the backbuffer + wallpaper + panel, clamp windows, re-send `wl_output`, deliver the §4.60 dosgui RESIZE; apply-confirm-or-revert, because a bad mode is a black screen | — |
+| §M62 | ✅ **Boot splash (SHIPPED, DOCS §4.71)** — `boot.splash` off/on/quiet; an embedded image painted through `fb_present` before the GUI exists; the log is SUPPRESSED, never discarded (`dmesg` keeps it); Esc drops to the log; **any fault/panic/watchdog trip tears the splash down first** — a splash over a panic turns a diagnosable crash into "it froze at the logo" | — |
+| §M63 | ✅ **Control Panel (SHIPPED, DOCS §4.65; stage 0 §4.63)** — a `SETTINGS_PANEL()` linker registry (so a setting ships next to the code it configures and `controlpanel.c` never changes), panels as their own §M22.7 windows, ONE Start-menu entry.  **Stage 0 is a prerequisite that does not exist: settings do not survive a reboot** — `/etc/d-os.conf` is on ramfs and `config_init` runs 125 lines before the exFAT mount.  Panels: Display (§M61), Personalisation (§M60), System (a dozen existing keys with no UI), Packages (§M35.5/§M45 as a panel, not an app), Region (= three features: live keymap switch + a `rtc_write()` that exists on NEITHER arch + a timezone/locale layer that does not exist at all) | — |
+| §M64 | ✅ **Desktop shortcuts (SHIPPED, DOCS §4.64)** — icons on the wallpaper, shortcuts ONLY.  A shortcut is a FILE (`/desktop/*.lnk`) so the file manager, `ls` and `rm` already work on it; four target kinds behind one resolver; drawn by the desktop shell, damaged as small rects; drag-to-move needs §M58's press/motion/release.  **Real cost is the icons: there is no icon anywhere in this system and `GUI_APP` has no icon field.**  Never auto-populate | — |
+| §M65 | ✅ **Widget toolkit with a seam (SHIPPED, DOCS §4.78)** — `WIDGET_CLASS()` registry (name-addressed), `struct ui_spec` as DATA, one event sink per window, two-pass layout, three CELL-based size classes, checkbox/radio/slider/combo/menubar, a window popup, a table view, and the same toolkit from RING 3 over the dosgui bridge | — |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -217,7 +225,7 @@ what); a session can pick a theme and push on it.
 | M9  | `devfs` — drivers as files under `/dev`         | Driver framework | ✅ DOCS §4.X |
 | M10 | `procfs` — kernel state as files under `/proc`  | Driver framework | ✅ DOCS §4.X |
 | M11 | Block layer + first block driver (virtio-blk)   | Storage          | ✅ DOCS §4.X |
-| M12 | exFAT (with multi-FS abstraction for FAT/NTFS)  | Storage          | ✅ DOCS §4.X |
+| M12 | exFAT (with multi-FS abstraction for FAT/NTFS)  | Storage          | ✅ DOCS §4.X + §4.73 (mkdir/rmdir) |
 | M13 | Preemptive scheduling (timer IRQ → schedule)    | Concurrency      | ✅ DOCS §4.X |
 | M14 | Multi-session shell with FB pane splitting      | UX               | ✅ DOCS §4.X |
 | M15 | USB host stack + USB HID keyboard              | Input            | ✅ DOCS §4.X |
@@ -252,6 +260,13 @@ what); a session can pick a theme and push on it.
 | M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation | Security | §M32 |
 | M33 | Execution domains — a service's run location (kernel / user / isolated) as a declared capability + config choice; driver placement (fault-tolerant → user-mode isolation) is the flagship case | Reliability | §M33 |
 | **M46** | **Resilient control plane — SAK hotkeys + force-kill** — Ctrl+Alt+Del = always-live Task Manager, Ctrl+Alt+X = kill last/frozen app, window chrome (close/min/restore) works even when the app is wedged (close ⇒ force-kill), Task Manager force-quit; the enabler is a real force-kill of a wedged ring-3 process | Reliability / UX | ✅ DOCS §4.37 |
+| M58 | Text selection — pointer grab + press/motion/release, selection model (text bytes / terminal cells), word + line selection | UX | §M58 |
+| M59 | Clipboard, system-wide — typed offers, ring-3 ops + `/dev/clipboard`, Wayland `wl_data_device`, primary selection | UX | §M59 (wants §M58) |
+| M60 | Wallpaper — image background, fit modes, config + `wallpaper` cmd, gradient fallback | UX | ✅ DOCS §4.62 (panel → §M63) |
+| M61 | Resolution switching at runtime — `fb_mode_set`, scene resize, `mode` cmd, Display panel, confirm-or-revert dialog | UX / Devices | ✅ DOCS §4.70 (x86) + §4.77 (aarch64) |
+| M62 | Boot splash, switchable — `boot.splash`, drawn splash, log suppressed not discarded, torn down by any fault | UX / Reliability | ✅ DOCS §4.71 |
+| M63 | Control Panel — `SETTINGS_PANEL()` + `CONFIG_KEY()` registries, generic panel, one Start-menu entry, `conf` with validation | UX / Architecture | ✅ DOCS §4.65 (+ stage 0 §4.63) |
+| M64 | Desktop shortcuts — icons on the wallpaper, shortcut files, one resolver, swappable grid/list view | UX | ✅ DOCS §4.64 (drag-to-move still needs §M58) |
 
 ### Cross-cutting constraints
 
@@ -705,7 +720,24 @@ no SetChecksum.  FAT16 / FAT12 are width adjustments to FAT32.
 
 **M12 follow-ups deferred to later milestones (write them up here when
 they get scheduled):**
-- `mkdir` / `unlink` / `rmdir` on exFAT.
+- ✅ **`mkdir` / `unlink` / `rmdir` on exFAT — shipped 2026-08-22, DOCS §4.73.**
+  Asked for directly, and the piece §4.72 was blocked on: a package store is a
+  directory per package.  A directory turned out to be a file with three
+  differences (ATTR_DIRECTORY, a ZEROED first cluster — "end of directory" is a
+  0x00 type byte, so an unzeroed cluster is a directory full of garbage — and a
+  DataLength of one cluster, never zero); removal is not erasure but clearing
+  **bit 7** of every entry in the set (the SecondaryCount matters: clearing only
+  the File entry leaves orphan Stream/Name entries that `fsck` reports); freeing
+  the clusters needs both allocation shapes (`NoFatChain` run vs a FAT walk),
+  and getting that wrong leaks free space SILENTLY.  A non-empty directory is
+  refused with -2 — `rm -r` is policy, and it already lives in the VFS.
+  **The bug worth remembering: `exfat_make` did not check for an existing
+  name**, so the second boot created a SECOND `/mnt/store` that the scan found
+  first — every package rebuilt while `ls` showed a full store.  *A filesystem
+  that can create the same name twice does not have a namespace.*  Verified by
+  `fsck.exfat -n` = clean on i386 and x86_64, not by our reader agreeing with
+  our writer.  Also added: `rm [-r]` in the x86 shell (there was none — nothing
+  to delete before), and `--empty` / `--no-disk` on every run script.
 - exFAT filenames >30 chars and non-ASCII (proper UTF-16 + Up-case
   Table).
 - ActiveFat / VolumeDirty bit management in the VolumeFlags field.
@@ -4762,7 +4794,824 @@ being explicit that it will not run Photoshop.
 
 ---
 
+## Desktop UX cluster (§M58 – §M62) — the things a person actually reaches for
+
+Five milestones requested from USE, not from the architecture: select text,
+copy it, change the wallpaper, change the resolution, and decide whether the
+machine boots with a log or a splash.  They are grouped because they share one
+property — **each looks like a small feature and each is blocked by a missing
+piece of plumbing rather than by missing polish**, which is exactly the shape
+§M48 hit when "NetSurf is not clickable" turned out to be *the compositor has
+no mouse-button event at all*.  Every design below therefore starts by naming
+the plumbing, not the pixels.
+
+Order is dependency, not importance: §M58 produces a selection, §M59 is where
+it goes, §M60 and §M61 are the display's own state, §M62 is what the user sees
+before any of it exists.  §M63 is the container all of their settings land in,
+§M64 puts the user's own choices on the desktop.
+
+### Execution order (scheduled 2026-08-21 — this is the running plan)
+
+Sequenced for **visible payoff per block**, not for architectural tidiness.
+Every earlier milestone in this project was infrastructure whose success looked
+identical to its absence; this cluster is the opposite, and the schedule should
+exploit that — **each block below ends in something a screendump can show.**
+Plumbing is pulled in only when the block above it needs it, which is also why
+persistence lands second rather than first: the wallpaper works from `setconf`
+on the first boot it exists, it simply does not stick yet.
+
+| Block | Ships | Ends with (the screendump) |
+|-------|-------|----------------------------|
+| **1** | ✅ §M60 wallpaper (DOCS §4.62) + ✅ §M63 **stage 0** persistent config (DOCS §4.63) | A photograph as the desktop background — that survives a reboot |
+| **2** | ✅ The icon primitive (DRAWN, not embedded) + the abstract item view + §M64 shortcuts (DOCS §4.64) | Icons on the wallpaper; double-click opens NetSurf |
+| **3** | ✅ §M63 proper — `SETTINGS_PANEL()` + `CONFIG_KEY()` generic panel + System/Personalisation/Region panels (DOCS §4.65) | One Start-menu entry opening an icon grid that changes the desktop |
+| **4** | ◐ §M58 selection + §M59 clipboard — kernel half DONE (DOCS §4.69); editor drag, Ctrl+C and the ring-3/Wayland tail open | Dragging across terminal output, pasting it into the editor |
+| **5** | ◐ §M61 resolution + Display panel + confirm-or-revert (DOCS §4.70; x86) | The desktop re-laying itself at a new mode, NetSurf reflowing |
+| **6** | ✅ §M62 boot splash (DOCS §4.71) | The machine booting with a logo — and dropping to the log on any key |
+
+Rules for the run: **shell command before panel, always** (a setting with no
+headless path cannot be regression-tested here); `make clean ARCH=<arch>` after
+every shared-header edit (§M51's lesson, which this cluster will touch
+repeatedly — `widget.h`, `gui.h`, `gfx.h`, `config.h` are all shared); and each
+block is verified by screendump on i386 first, then x86_64 and aarch64 before
+it is called done — §M61 especially, where the three arches genuinely differ.
+
+---
+
+## §M65 — Widget toolkit with a seam ✅
+
+**Shipped 2026-08-23 — DOCS §4.78.**  Asked for from use: components behind one
+API, swappable, responsive.  The finding that shaped it: the missing piece was
+LAYOUT and IDENTITY, not the control list — M22's five controls all took
+absolute pixels, so every panel computed its own geometry and none survived a
+resolution change.
+
+Design decisions worth keeping: a class is named in DATA (`WIDGET_CLASS()`), a
+window's interface is an array of `struct ui_spec` (ints + strings), events go
+to ONE sink as `(id, type, value)` — all three so the same toolkit can be driven
+from ring 3, which it now is (`dosgui_ui_build`, `user/uidemo.c`).  New
+capabilities go on the CLASS so no existing `widget_ops` had to change.
+Responsive = three size classes measured in character CELLS plus one rule
+(a row becomes a column when narrow).
+
+**Lessons learned:** a hover repaint that sets `need_frame` without claiming an
+AREA paints only the cursor's own rectangle (§4.61) — the menu left a trail;
+a box per row gives each row its own label width and nothing aligns (`UI_GRID`
+shares one column); table columns sized by declared weights smear when the text
+is longer than its share — size from CONTENT, bounded scan; and a client-managed
+window has no app-host, so BOTH its input (fixed in §M40) and its drawing
+(fixed here) need the compositor to step in.
+
+## §M58 — Text selection (a selection that exists before anything can copy it) ✅
+
+**Completed 2026-08-22 with SCROLLBACK — DOCS §4.75.**  The open item was
+"scrollback-anchored selection", and the two turned out to be one feature: a
+terminal you cannot scroll back is one whose output you cannot select once one
+more line has arrived.  History is a ring of rows; the selection is addressed in
+ABSOLUTE LINE NUMBERS, because a grid row is a screen position that every new
+line renumbers.  `termcheck` proves it by selecting an off-screen line by number.
+
+
+**Kernel half shipped 2026-08-21 — see DOCS.md §4.69.**  `widget_ops.pointer`
+(press/drag/release) + a real pointer GRAB; terminal windows select over the
+cell grid, linear in reading order, repainted and copied on the compositor
+rather than in the mouse IRQ.  **Still open:** the editor's mouse drag (its
+keyboard selection model exists, it needs the new op wired), `Ctrl+C` in a
+terminal (needs the *selection ⇒ copy, none ⇒ SIGINT* rule in the keyboard
+path), and scrollback-anchored selection.
+
+**Lessons learned.**
+
+- *A missing event is not a missing feature — it is a missing sentence in a
+  struct.*  `widget_ops.mouse` said click-or-double, so a drag could not be
+  expressed anywhere in the toolkit.
+- *New optional ops go at the END of an ops struct.*  Every `widget_ops` in the
+  tree is a positional initialiser; a field inserted in the middle re-binds all
+  of them, and the compiler only warns where the types happen to differ.
+- *Content clicks were gated on `kind == WIN_APP`* — so a press inside a
+  terminal reached nothing at all, which is exactly why the text people most
+  want to copy was the one thing that could not be selected.
+- *Record in the IRQ, work on the compositor.*  A grid re-render is thousands
+  of blits and the clipboard allocates.
+
+**Original design (kept for the reasoning).**  Nothing on this desktop can be
+selected with a mouse.  The editor
+widget has a real selection model (`anchor` + cursor, `ed_sel_min/max`,
+rendered inverted) but it is driven by **shift + arrow keys only** —
+`editor_mouse()` moves the caret and drops the selection.  Terminal windows,
+the file manager's text, NetSurf's page and every label have no selection of
+any kind.  So "copy what is on screen" is currently impossible everywhere
+except by retyping it.
+
+**The plumbing that is missing.**  `struct widget_ops.mouse` is
+`(w, lx, ly, kind)` with `kind: 0 = click, 1 = double` — **there is no press,
+no motion-while-held, and no release.**  A drag-selection is by definition
+"press here, move there, release", so today it has no transport, whatever the
+widget does.  This is the §M48 shape again and it is the whole milestone: the
+event, then the model, then the rendering.
+
+**Design.**
+1. **Pointer events grow a button phase.**  Extend the widget mouse callback
+   (or add `press`/`drag`/`release` entries — a new entry keeps every existing
+   widget compiling unchanged, which matters because the ops struct is
+   positional and there are a dozen implementers).  The compositor already
+   knows button state since §M48; what is missing is *routing motion to the
+   widget that took the press* — i.e. a **pointer grab**: from press to
+   release, motion goes to the pressing widget even when the pointer leaves it,
+   otherwise a selection stops at the window edge.
+2. **A selection is a range over a MODEL, never over pixels.**  Two models
+   exist and they are not the same: a byte range in a text buffer (editor,
+   labels) and a **cell rectangle over a terminal grid** (row/col, with the
+   line-wrap question: a wrapped logical line should copy as one line, a
+   deliberately short one should keep its newline — the standard terminal trap).
+   Define both; do not force the terminal through the byte-range model.
+3. **Rendering is the widget's job**, damage is the compositor's: a selection
+   that changes must repaint only the affected rows (§4.61's damage discipline —
+   selecting a paragraph must not become a full-screen recompose per mouse
+   motion, and the drag arrives at motion rate).
+4. **Double-click = word, triple-click = line** are part of the feature, not
+   polish; they are also the only selection a user can make in a terminal
+   without a steady hand.
+5. **Where it applies, in order:** the terminal window (highest value — every
+   command's output lives there), the editor (upgrade its existing model to
+   mouse), the file manager's path bar, then read-only labels.  NetSurf's own
+   selection is the browser's, not ours — it needs only the pointer events from
+   step 1 reaching it through the dosgui bridge.
+
+**Done when:** dragging across a terminal window's output highlights it, the
+highlight survives scrolling, double-click takes a word, and `Ctrl+C` (or the
+middle-click primary paste, §M59) yields exactly the bytes that were inverted —
+verified by screendump plus a byte-for-byte comparison of the copied text, not
+by looking at it.
+
+**Watch out for:** a selection anchored to a screen row is wrong the moment the
+terminal scrolls — anchor it to the scrollback's own line numbering.  And the
+mouse IRQ context rule from `desktop.h` still holds: press/motion arrive with
+the WM lock held, so the widget may record a range there but must not reflow or
+allocate.
+
+---
+
+## §M59 — The clipboard, system-wide (one clipboard, every process) ◐
+
+**2026-08-22 — DOCS §4.76.**  The ring-3 half is done, and the bug behind it was
+not the clipboard: fds 0/1/2 were not descriptor-table entries, so `dup2(fd, 1)`
+was refused and NO program here could redirect anything (silently, with a
+successful exit status).  Fixed; `redirtest` proves stdout redirection into a
+file and into `/dev/clipboard` on all three arches.  Typed offers shipped
+(`clip type`, ioctl on the device so both personalities reach it).  **Still
+open: Wayland `wl_data_device`** — deliberately not shipped, because nothing in
+the tree would exercise it; it needs a client that copies and pastes first.
+
+
+**Kernel half shipped 2026-08-21 — see DOCS.md §4.69.**  Two slots: the
+explicit clipboard and the PRIMARY selection, because what you selected and what
+you deliberately copied are two intentions and one slot means every drag
+destroys the other.  Middle-click pastes primary into a terminal; `clip`
+(both shells) shows, pastes, copies and promotes.  **Still open — and it is the
+larger half:** typed offers, the ring-3 ABI surface (§M50 ops + `/dev/clipboard`)
+and Wayland's `wl_data_device` with its ownership + fd hand-off.
+
+**Original design (kept for the reasoning).**  `kernel/gui/clipboard.c` exists
+(M22.5) and is exactly what its header
+says — *"kernel-global text clipboard … in-kernel GUI widgets only.  A userland
+clipboard protocol arrives with §M25/§M26"*.  Both of those shipped.  So today
+copying works inside the editor and inside a text field, and **nothing in ring 3
+can read or write the clipboard at all** — not a musl program, not NetSurf, not
+a Wayland client — which means the clipboard cannot carry anything between the
+two halves of the system that a user actually moves data between.
+
+**Design.**
+1. **Keep the kernel object, widen its shape.**  The store becomes a small
+   set of **typed offers** (`mime` + bytes) instead of one `char[]`, because
+   `text/plain;charset=utf-8` and `image/png` are the same clipboard with
+   different contents and retrofitting a type later means changing every
+   caller.  Bound the size and say what happens at the bound (refuse, do not
+   truncate — a silently truncated paste is worse than a failed one).
+2. **A ring-3 surface.**  As canonical §M50 operations (`ABI_CLIPBOARD_GET` /
+   `_SET` / `_TYPES`), so all three arches get it from one handler — and as
+   `/dev/clipboard` for the shell (`cat file > /dev/clipboard`), which costs
+   nothing once the object is typed and makes the feature scriptable.
+3. **Wayland: `wl_data_device_manager` + `wl_data_source`/`wl_data_offer`.**
+   This is the one an unmodified upstream client speaks, and it is
+   **ownership-based, not copy-based**: the source app keeps the data and hands
+   over a pipe fd when someone pastes.  That is the right model anyway (a copied
+   50 MB image is not memcpy'd into the kernel), but it means the clipboard must
+   hold *either* bytes *or* a live owner, and the owner can die between the copy
+   and the paste — decide that explicitly (owner dies ⇒ offer is revoked, paste
+   fails cleanly; or the kernel snapshots small offers eagerly).
+4. **Two clipboards, because X11 was right by accident:** the explicit one
+   (Ctrl+C) and the **primary selection** (selecting text fills it, middle-click
+   pastes it).  §M58 produces the second for free; skipping it makes terminal
+   copy-paste feel broken to anyone who has used one.
+5. **Ctrl+C is overloaded on a terminal** — in a shell it is SIGINT.  The rule:
+   with a selection active, `Ctrl+C` copies and clears it; with none, it
+   interrupts.  Write it down in the source, because whichever way it is
+   decided, the other behaviour will be reported as a bug.
+
+**Done when:** text selected in a terminal pastes into the editor, into a
+`pkgrun sh` command line, and into an unmodified Wayland client; and something
+copied in NetSurf pastes into the editor.  Verified with a byte comparison
+through `/dev/clipboard`, not by eye.
+
+**Watch out for:** the clipboard is a **cross-process channel**, which makes it
+a §M32/§M46 boundary object the day multi-user exists — the ring-3 entry points
+take user pointers, so they are `sys_*_k` cores plus a gated wrapper (§M46's
+rule) from the first line, not after the first EFAULT.
+
+---
+
+## §M60 — Wallpaper: a picture, and a way to change it ✅
+
+**Shipped 2026-08-21 — see DOCS.md §4.62** (all three arches).  `gui.wallpaper`
+= gradient | `solid:RRGGBB` | a BMP path, `gui.wallpaper_fit` =
+fill/stretch/center/tile, changeable at runtime with the `wallpaper` command —
+which lives in `wallpaper.c`, not in a shell, so the ARM serial REPL runs the
+same implementation.  Verified by screendump on i386 + x86_64 AND by
+`wallpaper check`, an off-screen render printing corner pixels and a checksum,
+which is the only verification available on aarch64: the test harness passes no
+display device at all there.  All three arches produce byte-identical
+checksums.  **Left to §M63:** the Personalisation panel (§M63 owns the window)
+and persistence (§M63 stage 0 — settings still die at reboot).
+
+**Lessons learned.**
+
+- *A fallback must say why, and a status line must never report the fallback as
+  if it were the choice.*  The first version answered "gradient" whenever
+  nothing had been rendered yet — which is the normal state before `gui` starts,
+  and exactly the moment a user has just set a picture.
+- *Verification has to survive the machine having no screen.*  The ARM harness
+  cannot screendump, so the decoder is checked by rendering into memory and
+  printing pixels.  The by-product is better than a screenshot: the numbers are
+  comparable across arches.
+- *A harness that quietly stops driving the guest is worse than one that
+  crashes.*  `dos-shell-test.py`'s default boot marker had gone stale against
+  `serial_shell.c`, so every aarch64 run typed NOTHING and printed a log that
+  reads like a healthy boot.
+- *Stream, do not load.*  Row-at-a-time decoding straight into the destination
+  removes the two large allocations an image loader normally needs, and it is
+  the same decision that keeps `center`/`tile` cheap.
+
+**Original design (kept for the reasoning).**  The desktop background was
+`gfx_vgradient(&wallsurf, …)` — a gradient computed in `gui_start`, with the
+milestone label drawn in the corner.  There was no way to put an image there,
+and no way to change it without recompiling.
+
+**Design.**
+1. **The wallpaper becomes a surface with a SOURCE**, chosen by config:
+   `gui.wallpaper` = `gradient` (today's, and the fallback) | a VFS path |
+   `solid:RRGGBB`.  Plus `gui.wallpaper_fit` = `stretch` | `center` | `tile` |
+   `fill` — a fit mode is not decoration, it is the difference between a photo
+   and a smear, and the scaling code is the same code §M61 needs.
+2. **Decoding.**  The kernel should learn ONE trivially decodable format
+   (uncompressed BMP or QOI — a few hundred lines, no allocator surprises), and
+   everything else should arrive **already decoded**: NetSurf's `nsgif`/`nsbmp`
+   and any PNG library are ring-3 store packages (§M42), so a userland
+   `setwall` tool decoding to RGBA and handing the pixels to the compositor
+   through the dosgui bridge is both smaller and safer than a codec zoo in ring
+   0.  *A kernel-resident image decoder is an attack surface with a mouse
+   attached to it.*
+3. **Persistence** is the config store (§M5) plus the exFAT mount for the image
+   itself — with the failure path defined: **an unreadable or malformed
+   wallpaper falls back to the gradient and says so in klog.**  A desktop that
+   will not start because a JPEG moved is a worse desktop than one with a
+   gradient.
+4. **UI**: a `wallpaper <path|gradient>` shell command FIRST (testable
+   headless), then a **`SETTINGS_PANEL()` under §M63** — "Personalisation" —
+   rather than a bespoke app of its own.  This milestone owns the panel's
+   contents; §M63 owns the window it sits in.
+5. **Memory**: at 1920×1200×4 the wallpaper is 9.2 MiB, and it is a contiguous
+   surface (the `BUDDY_MAX_ORDER` constraint M22.6 already hit).  A second one
+   held during a change doubles that — so swap through a single allocation, or
+   accept the peak deliberately and write down which.
+
+**Done when:** `setconf gui.wallpaper /mnt/pic.bmp` + reboot shows the picture,
+`wallpaper gradient` restores it live, a corrupt file falls back with a klog
+line, and dragging a window over it still composites at §4.61's measured cost
+(a wallpaper blit is the compositor's floor — measure it, because §4.61 showed
+the wallpaper is 2 % of a drag and this could easily make it more).
+
+---
+
+## §M61 — Display mode: changing the resolution while the machine runs ◐
+
+**Shipped 2026-08-21 on x86 — see DOCS.md §4.70.**  `fb_mode_*` behind the
+`fb_present.h` seam (Bochs VBE), the scene resize on the compositor, the
+`mode` command on both shells, the Display panel, and the confirm-or-revert
+dialog with a ktimer countdown.  **aarch64 declines and says why** — one
+reported mode is the interface's way of saying the display cannot change.
+
+**Lessons learned.**
+
+- *A queued change means the requester sees stale state.*  The dialog was
+  centred on the screen that no longer existed; it is built by the compositor
+  once the new mode is live.
+- *A window is bound to the task that creates it, and only an APP-HOST loop
+  runs `on_layout`/`on_tick`.*  Built anywhere else it is an empty box.  New
+  `gui_queue_open(fn)` — which is `gui_queue_launch` minus the launcher entry.
+- *A guard whose condition is backwards fails only in the case it was written
+  for.*  The geometry snapshot was taken in every case EXCEPT a provisional
+  change, so the revert had nothing to restore and did nothing, silently.
+- *Read the mode back.*  The device clamps what it cannot do rather than
+  failing, so believing the write leaves the kernel drawing at a size the
+  display is not showing.
+
+**Original design (kept for the reasoning).**  The resolution is a **constant
+in the multiboot header** —
+`dd 1920 / dd 1200 / dd 32` in `kernel/hal/x86/boot.s`, requested from GRUB at
+boot — and `FB_WIDTH 1280` in `virtio_gpu.c` on ARM.  Changing it today means
+editing assembly and rebuilding.  Everything above it (backbuffer, wallpaper,
+panel surface, window geometry, `wl_output`) is sized once from that number and
+never expects it to move.
+
+**Design.**
+1. **A mode-setting HAL entry point**, next to `fb_present.h`'s existing cut
+   (`fb_present_map` / `fb_present_flush` — the seam M21 already carved for
+   exactly this kind of arch difference): `fb_mode_list()` +
+   `fb_mode_set(w, h, bpp)`.
+   - **x86**: Bochs-VBE DISPI (`XRES`/`YRES`/`BPP` + `ENABLE`) — the same
+     register file `fb_present.c` already drives for the page flip, so the
+     double-buffer's `VIRT_HEIGHT` must be re-established after every mode set,
+     and the LFB's pitch re-read rather than recomputed.
+   - **aarch64**: virtio-gpu `resource_create_2d` + `set_scanout` with a new
+     size, and a **new contiguous framebuffer allocation** — which is where the
+     buddy-order ceiling bites before anything else does.
+   - Anything that cannot mode-set reports a single mode and refuses the rest;
+     `fb_mode_list` existing is what lets a Settings UI be honest.
+2. **Resizing the scene is the actual work.**  A mode change must: reallocate
+   the backbuffer and wallpaper, re-run the shell's `init(screen_w, screen_h)`
+   and `bottom_reserve`, clamp every window into the new bounds (a window at
+   x=1700 on a 1024-wide screen is unreachable — clamp, and remember the old
+   geometry so switching back restores it), re-send **`wl_output` geometry/mode/
+   done** to every Wayland client, and deliver the **dosgui RESIZE event**
+   §4.60 built to every client-managed window.  *That §4.60 event is why this
+   milestone is now affordable: the hard half — "who tells the app its canvas
+   moved" — already exists and is tested.*
+3. **Serialise it against the compositor.**  A mode set while `compose()` is
+   mid-blit writes into a freed backbuffer.  It runs ON the compositor task,
+   between frames, with the WM lock held for the geometry pass — not from a
+   shell command's own task.
+4. **UI**: `mode` / `mode <w>x<h>` shell command first (headless-testable),
+   the §M63 "Display" `SETTINGS_PANEL()` second, and — **not optional** — a
+   **confirm-or-revert dialog**, because an unsupported mode on real hardware
+   is a black screen and nobody can click "revert" on a black screen.
+   Specified exactly, since this is the part that must not be improvised:
+   - the new mode is applied FIRST, then a dialog window opens **in the new
+     mode** carrying a live **countdown**, an **OK** button and a **Cancel**
+     button;
+   - **OK** keeps the mode and writes it to config; **Cancel** reverts at once;
+     **the countdown reaching zero reverts** — the safe outcome is the one that
+     requires no input, which is the whole point of the dialog;
+   - the timeout is **15 seconds by default and configurable**
+     (`gui.mode_confirm_s`; 0 = never auto-revert, for someone who knows their
+     monitor and is tired of the dialog);
+   - the countdown runs on a **`ktimer` (§M53), never on a frame counter**: at a
+     mode the display cannot show there may be no frames at all, and a revert
+     that only fires while the compositor is drawing is a revert that never
+     happens in the one case it exists for;
+   - reverting restores the previous mode AND the window geometry saved in
+     step 2, so a cancelled experiment leaves the desktop exactly as it was;
+   - the dialog takes the keyboard too (Enter = OK, Esc = Cancel): at a broken
+     mode the pointer is as invisible as everything else;
+   - and the shell command gets the same contract (`mode 1280x800` prompts,
+     `mode 1280x800 --force` skips it) so the headless test can drive both the
+     confirm and the expire path — *a revert nothing can trigger on purpose is
+     a revert nobody has tested.*
+5. **The boot resolution stays a request**, but should come from config where
+   the loader allows it (GRUB `gfxpayload`) instead of an assembler literal, so
+   a chosen mode survives a reboot.
+
+**Done when:** `mode 1280x800` on a 1920×1200 boot re-lays the desktop with
+windows clamped, NetSurf and a Wayland client both re-layout their contents
+(the §4.60 proof: text reflows, the image is not scaled), switching back
+restores the previous window geometry, and a screendump at each step is
+correct on i386, x86_64 and aarch64.
+
+**Watch out for:** every `1280`/`1920` literal outside the mode setter is a bug
+waiting for this milestone — `wayland.c` already carries `if (sw <= 0) sw =
+1280;`.  Grep them out as step zero.
+
+---
+
+## §M62 — Boot screen, switchable (and never at the cost of the log) ✅
+
+**Shipped 2026-08-21 — see DOCS.md §4.71.**  `boot.splash` = off/on/quiet, a
+DRAWN splash (no file, no decoder, no allocation), the log suppressed but kept
+in klog, any key dropping to it, and **every fault tearing it down** through one
+hook in `crash_dump_begin()`.  Demonstrated by `splash faultkernel`.
+
+**Lessons learned.**
+
+- *Suppressing one path is not suppressing output.*  The console sink and the
+  per-task VC hook are two paths to the screen, and after `vc_init` the live
+  one is the VC.
+- *There is more than one screen sink*, and the first match was the inactive
+  VGA fallback while the framebuffer one kept printing.
+- *A deliberate fault that does not fault is not a test.*  `*(int*)0x4 = …`
+  succeeds — low memory is identity-mapped — so the screendump showed the
+  splash still up for the innocent reason that nothing had crashed.
+- *Handing the screen back is not clearing it.*  The first working report
+  printed on top of the gradient; a panic report over a logo is still a panic
+  report over a logo.
+
+**Original design (kept for the reasoning).**  Boot today is the kernel log
+scrolling up a framebuffer terminal.
+That is the right default for a kernel under development and the wrong one for
+showing the machine to anyone — and the interesting part is that **both
+audiences are right**, so the answer is a switch, not a choice.
+
+**Design.**
+1. **`boot.splash` = `off` (default) | `on` | `quiet`.**  `off` = today's log.
+   `on` = splash with the log suppressed to a klog ring (still readable with
+   `dmesg` afterwards — *suppressed, never discarded*).  `quiet` = splash plus a
+   one-line progress/status area.
+2. **The splash is a compositor-less painter**: a logo + a progress indicator
+   drawn straight into the linear framebuffer through `fb_present`, running
+   before the GUI exists.  It must not depend on the heap being warm, on a
+   filesystem being mounted, or on any driver that could be the thing that
+   hangs — so the image is **embedded in the kernel image** (the objcopy blob
+   pattern the userland programs already use), not loaded from disk.
+3. **Any fault, panic, watchdog trip or NMI lockup TEARS THE SPLASH DOWN and
+   restores the text console** before printing (§M46/§M47 paths).  This is the
+   whole safety argument: a splash that stays up over a panic converts a
+   diagnosable crash into "it froze at the logo", which is precisely the failure
+   mode every distro has shipped at least once.  A `CRASH_SINK()`-adjacent hook
+   or an explicit `splash_abort()` at the top of the fault path — decided in
+   this milestone, not later.
+4. **An escape hatch that works while it is up:** any keypress (or Esc) drops
+   to the log immediately, and the kernel keeps feeding the framebuffer terminal
+   underneath so the switch is instant rather than a replay.
+5. **Progress is honest or absent.**  A bar that is a timer pretending to be
+   progress is a lie the log does not tell; drive it from real boot phases
+   (drivers probed / filesystems mounted / GUI up) or ship a spinner.
+6. **The handover to the desktop** should not flash: the splash's last frame
+   and the first composed frame are both full-screen blits, so present the
+   desktop's first frame before tearing the splash down (M22.6's page flip makes
+   this free — the splash is on one buffer, the desktop's first frame on the
+   other).
+
+**Done when:** `setconf boot.splash on` + reboot shows the splash and `dmesg`
+still has every line the log would have printed; Esc during boot drops to the
+log; a deliberately faulting boot (§M46's test hooks) shows the panic text, not
+the logo; and all three arches behave the same — on aarch64 the "framebuffer"
+is a virtio-gpu scanout that must be flushed per frame (`fb_present_flush`),
+which is exactly the difference this design routes through the existing seam.
+
+---
+
+## §M63 — Control Panel (a place for settings, and a seam so it never grows) ✅
+
+**Shipped 2026-08-21 — see DOCS.md §4.65** (stage 0 in §4.63).
+`SETTINGS_PANEL()` + `CONFIG_KEY()` registries, a generic panel that renders
+every declared key so most settings need NO UI code, panels as their own
+§M22.7 windows, one Start-menu entry, and `conf` (list/show/set **with
+validation**) on both shells.  Twelve keys declared, eleven of which had been
+discoverable only by reading source.  Verified by screendump on i386 and
+headlessly on all three arches.
+
+**Lessons learned.**
+
+- *A cap that silently drops the overflow reads as a broken registration.*
+  `SM_MAX_APPS` was 10 with 10 apps; the eleventh simply never appeared.
+- *Declare the setting next to the code that reads it.*  That is the entire
+  payoff of a registry — otherwise the panel accumulates knowledge of every
+  subsystem, which is the thing being avoided.
+- *A descriptor buys validation, not just rendering.*  `conf set` can refuse a
+  bad enum; `setconf` deliberately still cannot, because it must reach keys
+  nobody has declared.
+- *Cycle, don't type.*  With no dropdown widget, cycling through the legal
+  values is the only affordance that tells the user what they are.
+
+**Original design (kept for the reasoning).**  §M60, §M61 and §M62 each end
+with "…and a UI for it".  Written three
+times that is three bespoke apps, three Start-menu entries and three places to
+keep consistent — and the Start menu cannot even take them: `shell_vista.c`
+caps the launcher at **`SM_MAX_APPS 10`** and there are already **8 registered
+`GUI_APP`s**.  So the container is not a nicety that comes after the settings;
+**it is the thing that decides whether adding a setting is a line or an app.**
+
+**The four rules that make this a milestone rather than a window.**
+
+1. **A registry, not a hardcoded list.**  `SETTINGS_PANEL()` — a linker-section
+   registry exactly like `GUI_APP()`, `DESKTOP_SHELL()`, `SERVICE()`,
+   `CRASH_SINK()` — with `{ name, category, icon, open() }`.  A new setting
+   ships its own panel next to the code it configures; **`controlpanel.c` never
+   changes again.**  This is convention #2 (self-registration) and #5 (final API
+   shape from day one) applied to settings, and it is the entire architectural
+   content of the milestone.
+2. **A panel is a VIEW over the config store — never the storage.**  Every
+   setting is a `config` key that `setconf`/`getconf` can already reach, and the
+   panel only reads and writes it.  The reason is not tidiness: **every
+   automated check in this project is a grep over a serial log**
+   (`scripts/dos-shell-test.py`), so a setting that exists only inside a GUI
+   cannot be regression-tested at all.  Shell command first, panel second — for
+   every single setting.  A corollary worth building on purpose: since a panel
+   is a view, most panels need **no code at all** — a `CONFIG_KEY()` descriptor
+   (`key`, type `bool|enum|int|string|path`, allowed values, default, one-line
+   help) lets ONE generic panel render every plain setting, and a hand-written
+   panel is then reserved for the few that need a preview, a file picker or a
+   revert timer.  It also gives `getconf`/`setconf` validation and a `conf -l`
+   listing for free — today a mistyped value is discovered by the subsystem
+   that reads it, if at all.
+3. **The icon grid is ONE view over an abstract item collection — not the
+   layout.**  The Control Panel does not own a grid; it owns a **model** (a
+   list of items: icon, label, sub-label, payload, enabled flag) and hands it to
+   a **swappable view** — `grid` today, `list` / `details` / `tiles` later —
+   chosen per site by config (`controlpanel.view`, `desktop.view`).  This is
+   convention #5 applied where it is cheapest to apply: the model/view split
+   costs nothing at the first implementation and is a rewrite afterwards.  It
+   is also not speculative, because **there are already three consumers** — the
+   Control Panel's panels, §M64's desktop shortcuts, and the file manager,
+   whose `listview` is exactly this widget written once for one caller (and
+   which should migrate onto it, giving the file manager icon view for free).
+   The view is a widget with the ordinary `widget_ops`; selection, keyboard
+   navigation, hit-testing and scrolling live in the model+view pair, so a new
+   layout is a `draw` and a `hit` function, not a new app.
+4. **Panels open as their own windows, not as pages inside one.**  §M22.7 put
+   every `WIN_APP` on its own task precisely so a slow or wedged app cannot take
+   the GUI down; hosting eight panels in one window undoes that for the one app
+   whose job is to change display modes and keyboard layouts — the two settings
+   most able to wedge.  The Control Panel is an **icon grid that launches**;
+   each panel is an ordinary app window with its own task.
+
+**Stage 0 — settings must survive a reboot.  ✅ SHIPPED 2026-08-21, DOCS §4.63**
+— `config_attach_persistent("/mnt")` after the exFAT mount on both entry paths,
+`saveconf` naming the file and saying outright when it will not survive, and
+`CONFIG_WATCH()` + `config_apply` so a key read at boot hears about a later
+change (the first two watchers: keyboard layout and wallpaper).  Verified
+across a real reboot on i386.  The original statement of the problem:  `config_save()` writes `/etc/d-os.conf`, and **`/` is ramfs** — the
+persistent volume is exFAT at `/mnt`.  Worse, the ordering forbids it anyway:
+`config_init()` runs at `kernel.c:144` and the exFAT mount is ~125 lines later,
+at `kernel.c:269`.  So today `saveconf` persists into RAM and every setting dies
+at the next boot.  **A Control Panel on top of that is theatre**, so this comes
+first: a two-phase config (defaults + ramfs overlay early, then a re-overlay
+from the persistent volume once it is mounted, with `config_save` writing
+there), plus the question every such design must answer out loud — *what happens
+when the disk is absent?*  (Answer: run from defaults, mark the store
+read-only, and let the panel say "not persisted" rather than silently accepting
+changes.)
+
+**The panels, in ascending order of honesty about their cost.**
+
+- **Display** (§M61) — resolution, and later refresh/scale.  Cheap once §M61
+  exists; it is a list from `fb_mode_list()` plus the confirm-or-revert dialog.
+- **Personalisation** (§M60) — wallpaper, fit mode, accent colour, and the
+  desktop-shell chooser (`gui.shell`, which is already a config key with two
+  implementations — the seam is built, nothing exposes it).
+- **System** — the cheapest panel in the list and one of the most useful,
+  because **the keys already exist and nothing exposes them**: `boot.splash`
+  (§M62), `kernel.fault_policy` (halt/reboot/kill), `crash.report`,
+  `gui.drag_stats`, `bus.allow-adaptation`, `package.auto_fkill_ms`,
+  `shell.provider`, `gui.close_forces_kill` / `close_grace_ms`.  Today these
+  are discoverable only by reading source.  It also carries the read-only
+  system facts that have no home — arch, milestone (`version.h`), CPU count,
+  memory, uptime, boot device — which the About window shows a fraction of.
+- **Packages (§M35.5 / §M45)** — the store is real and has **no UI at all**:
+  installed closures, profiles, generations + rollback, GC, and the recipe's
+  declared `.abi` backend.  §M45 already plans an apt-like frontend + a GUI
+  installer; **it should register as a `SETTINGS_PANEL()` instead of becoming a
+  separate app**, because "what is installed" and "what is configured" are the
+  same question asked twice.  Note the one real design constraint: install/GC
+  are long operations, so the panel drives them **asynchronously** (§M49's
+  workqueue or its own task) and shows progress — a settings window that blocks
+  its own task for a package install is a wedged window, and §M46 will treat it
+  as one.
+- **Region — the big one, and it is not a settings panel, it is three
+  features.**  (a) **Keyboard layout** is the only part that already works:
+  `keymap.h` says the layout is chosen from `keyboard.layout` and *can be
+  switched at runtime* — but §M40 generates the Wayland **xkb keymap** from
+  `keymap_active()` and sends it once, so switching live must **re-generate and
+  re-send the keymap** to every client or they keep typing the old layout.
+  (b) **Setting the clock has no driver support**: `rtc_read()` exists on both
+  x86 (`cmos_rtc.c`) and ARM (`pl031_rtc.c`) and **there is no `rtc_write()` on
+  either** — that is a new HAL entry point on two arches, and on ARM the PL031
+  is read-only in QEMU's default wiring, which needs checking before promising
+  it.  (c) **Timezone and date/time format do not exist as concepts anywhere**
+  — no locale, no offset, one hardcoded rendering in the taskbar clock and
+  another in the file manager.  So "Region" means introducing a time/locale
+  layer first, and it should be split out rather than smuggled in behind an
+  icon.
+- **Later, for free:** Network (§M24 has `netstat`/DHCP state and no UI), Users
+  (§M32), Sound (§M23 mixer), Devices (`lsnic`/`lsaudio`/`blk`/`lsusb` are all
+  shell commands with a natural list view).
+
+**Start menu.**  The launcher keeps application entries and gains **one**
+"Control Panel" row; settings never appear as separate `GUI_APP`s.  That is
+what the `SM_MAX_APPS 10` cap forces anyway, and it is the right shape: the
+Start menu lists *what you run*, the Control Panel lists *what you change*.
+(If the menu should shrink further, the alternative is a two-level menu —
+`Programs ▸` + `Control Panel` — which is a separate, purely cosmetic change to
+`shell_vista.c` and should not be bundled here.)
+
+**Done when:** the Start menu has one settings entry; opening it shows an icon
+grid built from the registry with nothing named in `controlpanel.c`; changing
+the wallpaper and the resolution from it works and **survives a reboot**; every
+one of those settings is also reachable from the shell and therefore covered by
+a headless test; and a panel that hangs does not take the Control Panel or the
+desktop with it (`wedgewin`'s guarantee, applied here).
+
+**Watch out for:** the desktop shell's `click`/`motion` run **in the mouse IRQ
+with the WM lock held** (`desktop.h`'s own contract), and §M22.7 already learned
+this once — *app launches were moved to the desktop task* for exactly this
+reason.  An icon that launches a panel must queue the launch, never perform it.
+
+---
+
+## §M64 — Desktop shortcuts (icons on the wallpaper, and nothing more) ✅
+
+**Shipped 2026-08-21 — see DOCS.md §4.64.**  The icon primitive (drawn, not
+stored), the model/view split the user asked for (`ITEM_VIEW()` + `desktop.view`
+= grid | list), and shortcuts as `/desktop/*.lnk` files behind one resolver.
+The compositor gained a background LAYER (`draw_under`) rather than a chrome
+hook, so icons sit under every window.  Verified by screendump on i386
+(select, double-click opens NetSurf) and headlessly by `shortcut check` on
+every arch.
+
+**Lessons learned.**
+
+- *Draw the icons.*  Sixteen glyphs from gfx primitives beat a bitmap set here:
+  one definition per size, no per-arch blob plumbing, and nothing that can fail
+  at runtime.  The trade — geometry, not artwork — is written in the header
+  along with the seam that replaces it.
+- *A view that draws correctly and hit-tests wrongly is invisible in a
+  screenshot.*  `shortcut check` prints the hit answer next to the checksum for
+  exactly that reason.
+- *Copy an existing caller's convention instead of assuming one.*  The reload
+  loop tested `vfs_readdir(…) == 0`; this VFS returns >0 per entry, so `add`
+  succeeded and `list` showed an empty desktop — two halves that each looked
+  right.
+- *Icons belong UNDER the windows.*  Putting them in the existing chrome hook
+  would have been one line and would have drawn a shortcut on top of every
+  application.
+
+**Original design (kept for the reasoning).**  The desktop is wallpaper +
+taskbar and nothing else — `gui_start`
+deliberately boots to a bare desktop, "the user launches from Start".  Which
+means the surface a person looks at all day holds **zero** of their own
+choices.  Scope is deliberately narrow and worth stating in the milestone
+title: **a shortcut is a pointer to something that already exists** — a name, a
+target and a position.  No embedded app, no live tiles, no widgets.
+
+**Design.**
+
+1. **A shortcut is a FILE, not a config key.**  A tiny text record in
+   `/desktop/<name>.lnk` (`target=`, `args=`, `icon=`, `x=`, `y=`), because
+   files are what the system already has tools for: the file manager can create
+   one ("Send to desktop"), `ls` lists them, `rm` deletes one, and the exFAT
+   mount can hold them.  Config keys would need a whole parallel CRUD, and
+   deleting one would mean editing a key namespace by hand.
+2. **Four target kinds, one resolver:** a registered `GUI_APP` by name (the
+   common case — no path, survives a rebuild), an ELF in the store
+   (`pkgrun`-shaped), a shell command line, and a plain file (opened through
+   the existing `GUI_APP_ASSOC` extension association the file manager already
+   uses).  One `shortcut_launch()` covering all four, so "double-click a
+   shortcut" and "double-click in the file manager" cannot drift apart.
+3. **The desktop is a second consumer of §M63's item view, not its own
+   layout.**  Shortcuts are a model (icon + label + payload); grid is the
+   default view, list/details are config (`desktop.view`).  The desktop's
+   constraint is that it draws onto the wallpaper from the desktop shell rather
+   than into a window — so the view's `draw` must take a target surface and an
+   origin, never assume a window, which is a five-minute decision now and a
+   refactor later.
+4. **Rendering: the desktop shell draws them, the compositor damages them.**
+   `desktop_shell.draw` runs on the compositor task after the windows — icons
+   belong there.  But **an icon must repaint as a small rect**, not by
+   redrawing the wallpaper (§4.61 measured what a full-screen repaint costs);
+   selecting or moving an icon damages two rects, the old and the new.
+5. **Icons: there is no icon anywhere in this system.**  The only graphics
+   primitive with pictures in it is the 8×8 glyph font.  Two honest options:
+   a set of small embedded bitmaps (the objcopy blob pattern already used for
+   userland programs) or draw-from-primitives placeholders.  **`GUI_APP` has no
+   icon field**, so the registry grows one either way — that is the real cost
+   item of this milestone, not the shortcut logic.
+6. **Interaction:** single click selects, double click launches, **drag moves**
+   — and drag needs §M58's press/motion/release plumbing, so §M64 either
+   follows §M58 or ships without moving (place-on-create only).  Say which;
+   do not discover it halfway.  Keyboard: Del removes, F2 renames, arrows move
+   the selection — the desktop is only reachable by keyboard if these exist.
+7. **Position is persisted in the file** — which makes §M63's stage 0 (a
+   writable, surviving filesystem) a shared prerequisite: on a diskless boot,
+   `/desktop` is ramfs and the icons a user arranges are gone at reboot.  Same
+   answer as §M63: say so rather than pretend.
+8. **Auto-population is a trap.**  Do NOT seed the desktop from the `GUI_APP`
+   registry — a desktop that re-creates icons the user deleted is the single
+   most-complained-about behaviour of every system that has done it.  Ship
+   empty, plus a `shortcut add <name> <target>` shell command (headless-testable
+   first, as always) and "Send to desktop" in the file manager and the Start
+   menu.
+
+**Done when:** `shortcut add NetSurf app:NetSurf` puts an icon on the wallpaper,
+double-clicking it opens NetSurf as a normal windowed app, the icon survives a
+reboot on a machine with a disk, deleting the file removes it, and a full drag
+of a big window over the icon field still composites at §4.61's measured cost.
+
+---
+
 ## Change log
+
+- **2026-08-21** — **§M62 SHIPPED (DOCS §4.71) — the §M58–§M64 desktop-UX
+  cluster is done.**  Six blocks in one run: wallpaper sources, persistent
+  settings, icons + a swappable item view + desktop shortcuts, the Control
+  Panel, text selection + two clipboards, runtime resolution switching, and the
+  boot screen.  The through-line worth keeping is that **every one of them was
+  blocked by missing plumbing rather than missing polish** — a drag had no
+  transport, a setting had nowhere to persist, a layout had nowhere to be
+  chosen, a window built on the wrong task never ticked — and that the bugs
+  which mattered were found by tests that could FAIL: an off-screen render with
+  a checksum, a deliberate hard lockup, a deliberate ring-0 fault.
+
+- **2026-08-21** — **§M61 SHIPPED on x86 (DOCS §4.70)** — block 5.  The
+  resolution stopped being an assembler literal.  The part worth remembering is
+  not the register write but the protocol around it: apply, ask IN the new mode
+  with a ktimer countdown, and make the outcome that needs no input the safe
+  one — plus the same contract on the shell, so both the confirm and the expire
+  path can be driven headlessly.
+
+- **2026-08-21** — **§M58 + §M59 kernel half (DOCS §4.69)** — block 4.  The
+  toolkit could not express a drag at all (`widget_ops.mouse` was click or
+  double click), so the milestone starts with a pointer phase stream and a
+  grab.  Terminal selection works on the cell grid; two clipboard slots
+  (selection vs deliberate copy) with middle-click paste.  The ring-3 and
+  Wayland surfaces remain — they are the larger half of §M59 and were always
+  scheduled as its tail.
+
+- **2026-08-21** — **§M63 SHIPPED (DOCS §4.65)** — block 3.  The container that
+  stops every later setting from becoming an app: two registries, a generic
+  panel driven by `CONFIG_KEY()` descriptors (so most settings need no UI
+  code), panels as their own windows, one Start-menu entry, and `conf` with
+  validation on both shells.  §M61's Display panel and §M45's package frontend
+  now have somewhere to register instead of somewhere to be written.
+
+- **2026-08-21** — **§M64 SHIPPED (DOCS §4.64)** — block 2.  Icons exist now
+  (drawn from primitives, not stored), the layout is a swappable `ITEM_VIEW()`
+  chosen by config rather than something each consumer hardcodes, and a
+  shortcut is a file with four target kinds behind one resolver.  Design point
+  worth keeping: the compositor gained a background LAYER (`draw_under`)
+  instead of a chrome hook, because icons belong under the windows — the
+  one-line alternative would have drawn a shortcut on top of every app.
+
+- **2026-08-21** — **§M63 stage 0 SHIPPED (DOCS §4.63)** — block 1 finished.
+  Settings now survive a reboot, and the lesson worth keeping is that the file
+  copy was the easy half: a key read at BOOT has already been acted on by the
+  time the persistent store is overlaid, so `CONFIG_WATCH()` +
+  `config_apply` (set-and-notify, distinct from set) is what turns
+  "the value is in the cache" into "the machine behaves that way".  Without it
+  a saved keyboard layout applies one boot late, with the file and the machine
+  disagreeing and nothing explaining why.  Also: the harness now passes
+  `-boot d` with `--disk` (a formatted image otherwise makes SeaBIOS boot the
+  disk and the guest produces NO serial output at all) **and attaches the disk
+  on aarch64 at all** — `--disk` was an x86-only flag that failed silently
+  everywhere else.  Two features turned out to exist on one arch only: that
+  one, and `setconf`/`getconf`/`saveconf`, which lived in `shell.c` and left
+  ARM able to create a persistent store but not write to it (now shared in
+  `config.c`, §M24's rule).  Also: a persistent store makes test runs
+  **stateful** — the image has to be re-made between runs.
+
+- **2026-08-21** — **§M60 SHIPPED (DOCS §4.62, all three arches)** — block 1 of
+  the desktop-UX schedule.  The background is a configurable SOURCE with fit
+  modes and a fallback that explains itself; the command lives in `wallpaper.c`
+  so both shells run one implementation.  The part worth carrying forward is the
+  verification: **`wallpaper check` renders off-screen and prints pixels**,
+  because the aarch64 harness has no display device and a screendump there is
+  impossible, not merely awkward — and the three arches then return
+  byte-identical checksums, which a screenshot could never establish.  Two
+  process findings: a status line that reported the fallback while the config
+  held a picture, and an **ARM harness that had silently stopped typing** for
+  want of a boot marker that still matched.
+
+- **2026-08-21** — **§M63 (Control Panel) and §M64 (desktop shortcuts) added**,
+  and they change the shape of the four before them: §M60/§M61/§M62 stop each
+  ending in "…and a UI for it" and instead ship a `SETTINGS_PANEL()` into one
+  registry.  Two findings while designing it, both structural.  (1) **Settings
+  do not survive a reboot and nothing says so**: `config_save()` writes
+  `/etc/d-os.conf` on **ramfs** (the persistent volume is exFAT at `/mnt`), and
+  the ordering forbids it regardless — `config_init()` is at `kernel.c:144`,
+  the mount at `kernel.c:269`.  A Control Panel on top of that is theatre, so
+  persistent config is stage 0 rather than a later nicety.  (2) **"Regional
+  settings" is not a panel, it is three features**: the keyboard layout is the
+  only part that already switches at runtime (and even that must re-generate
+  and re-send §M40's xkb keymap or clients keep the old layout), `rtc_write()`
+  exists on NEITHER arch, and timezone/locale/date-format are not concepts
+  anywhere in the tree.  Also recorded: the Start menu physically cannot hold
+  one entry per setting — `shell_vista.c` caps it at `SM_MAX_APPS 10` with 8
+  apps already registered, which is the concrete argument for the container.
+
+- **2026-08-21** — **Backlog: the desktop UX cluster §M58–§M62 added** (design
+  only, nothing shipped).  Requested from use: text selection, a clipboard that
+  crosses the ring boundary, a changeable wallpaper, a changeable resolution,
+  and a switchable boot screen.  What they have in common is worth recording up
+  front: **each is blocked by missing plumbing rather than by missing polish.**
+  Selection has no transport at all (`widget_ops.mouse` carries click and
+  double-click — a drag cannot be expressed); the clipboard is in-kernel-widgets
+  only and its own header says the userland protocol arrives with §M25/§M26,
+  both of which shipped; the wallpaper is a `gfx_vgradient` call; the resolution
+  is an assembler literal in the multiboot header.  That is the §M48 shape
+  ("NetSurf is not clickable" = the compositor has no button event), so each
+  design names the plumbing before the pixels.  Two of them lean on work already
+  done: §M61 inherits §4.60's dosgui RESIZE event, which is the hard half of a
+  mode change, and §M62 inherits §M47's fault paths — which it must hook, since
+  a splash left up over a panic converts a diagnosable crash into "it froze at
+  the logo".
 
 - **2026-08-15** — **§M24 COMPLETE: a network that can hold more than one
   conversation (DOCS §4.59, all three arches).**  The stack's second half:

@@ -42,6 +42,7 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "smp.h"
 #include "block.h"
 #include "block_cache.h"
+#include "config.h"          /* §M63 stage 0 — config_attach_persistent */
 #include "vc.h"
 #include "shell_provider.h"
 #include "service.h"
@@ -258,9 +259,15 @@ void aarch64_main_entry(uint64_t dtb) {
          * exFAT filesystem the shell's ls/cat/write/rm then operate on real,
          * persistent storage under /mnt. */
         bcache_init();
-        if (vfs_mount("exfat", "/mnt", "vda") == 0)
+        if (vfs_mount("exfat", "/mnt", "vda") == 0) {
             kprintf("aarch64: exFAT mounted at /mnt (persistent storage)\n");
-        else
+            /* §M63 stage 0 — settings live on the first writable volume.  This
+             * arch runs its OWN main_entry (the divergence PLAN_AARCH64 warns
+             * about), so the call kernel_main makes has to be repeated here or
+             * ARM would keep losing every setting at reboot while x86 kept
+             * them — the same shape as the pkg_init duplication below. */
+            config_attach_persistent("/mnt");
+        } else
             kprintf("aarch64: /dev/vda has no exFAT volume (skipping /mnt mount)\n");
     }
 
@@ -304,6 +311,10 @@ void aarch64_main_entry(uint64_t dtb) {
                                                  -1, root);
             if (sh) root->task = sh;
             if (!sh) kprintf("aarch64: FATAL — failed to spawn framebuffer shell\n");
+            /* Boot into the desktop, exactly as x86 does — through the SAME
+             * function, so the two entry paths cannot drift on it (this file
+             * IS the divergence PLAN_AARCH64 warns about). */
+            if (sh) gui_autostart();
         } else {
             kprintf("aarch64: FATAL — no root VC (framebuffer init failed)\n");
         }

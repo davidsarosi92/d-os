@@ -23,6 +23,8 @@
 
 #include "gui.h"
 #include "gui_app.h"
+#include "pkg.h"
+#include "icons.h"
 #include "task.h"
 #include "proc.h"
 #include "config.h"
@@ -33,6 +35,10 @@ extern const unsigned char _binary_user_netsurf_dynelf_start[] __attribute__((we
 extern const unsigned char _binary_user_netsurf_dynelf_end[]   __attribute__((weak));
 
 static void netsurf_launch(void) {
+    /* §M62 follow-up — the browser's resources are unpacked on first launch,
+     * not at boot: they were 171 ms of every boot, and most boots never open a
+     * browser (see pkg.h). */
+    pkg_ensure_netsurf_res();
     if (!_binary_user_netsurf_dynelf_start) {
         kprintf("netsurf: not built into this image\n");
         return;
@@ -61,6 +67,6 @@ static void netsurf_launch(void) {
     }
 }
 
-GUI_APP("NetSurf", netsurf_launch);
+GUI_APP_ICON("NetSurf", netsurf_launch, ICON_GLOBE);
 
 #endif /* i386 || x86_64 */
