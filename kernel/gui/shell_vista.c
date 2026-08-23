@@ -20,6 +20,8 @@
 #include "gui_app.h"
 #include "gui_internal.h"
 #include "gui.h"           /* gui_damage — the icon layer damages its own rects */
+#include "widget.h"        /* WPTR_* — §M58's pointer phases, shared vocabulary */
+#include "klog.h"          /* a drag must leave evidence on the serial log */
 #include "gfx.h"
 #include "rtc.h"
 #include "keymap.h"
@@ -138,6 +140,94 @@ static void vista_desktop_click(int x, int y, int dbl) {
     /* Double-click activates.  We are on the desktop task with no lock held
      * (desktop.h), so the launch may do real work. */
     if (dbl && idx >= 0) shortcut_launch(idx);
+}
+
+/* ------------------------------------------------------------------------- */
+/* §M64 tail — DRAG AN ICON TO A SLOT.                                        */
+/*                                                                            */
+/* The whole feature is three lines of state and one rule: remember what was   */
+/* pressed, follow it while the button is down, and write the slot down when   */
+/* the button comes up.  It could not exist before §M58 because a drag had no  */
+/* transport at all — `widget_ops.mouse` carried click and double-click, and   */
+/* nothing else.                                                              */
+/* ------------------------------------------------------------------------- */
+
+static int drag_idx  = -1;              /* shortcut being dragged, -1 = none */
+static int drag_col  = -1, drag_row = -1;   /* slot last previewed */
+static int drag_moved = 0;              /* did it ever leave its own slot?   */
+/* Where it STARTED.  Kept because the live preview overwrites the item's
+ * stored slot on every cell it crosses, and the drop needs the original to
+ * hand to whatever it swaps with — otherwise the displaced icon inherits a
+ * position from the middle of the gesture, which is a slot the user never
+ * pointed at and cannot predict. */
+static int drag_from_col = -1, drag_from_row = -1;
+
+static void vista_desktop_pointer(int x, int y, int phase) {
+    if (!iview || !iview->slot_at) return;   /* this layout cannot be arranged */
+
+    int bx, by, bw, bh;
+    icons_box(&bx, &by, &bw, &bh);
+    int px = x - bx, py = y - by;
+
+    if (phase == WPTR_PRESS) {
+        drag_idx = iview->hit(px, py, bw, bh, shortcut_model(), 0);
+        drag_col = drag_row = -1;
+        drag_moved = 0;
+        drag_from_col = drag_from_row = -1;
+        if (drag_idx >= 0)
+            shortcut_pos_of(drag_idx, &drag_from_col, &drag_from_row);
+        return;
+    }
+    if (drag_idx < 0) return;                /* the press hit empty desktop */
+
+    int col, row;
+    if (iview->slot_at(px, py, bw, bh, &col, &row) != 0) {
+        /* Dragged outside the icon field (over the taskbar, off the screen).
+         * The last previewed slot stands — an icon that vanishes because the
+         * pointer left the field would be a shortcut the user cannot find. */
+        if (phase == WPTR_RELEASE) { drag_idx = -1; }
+        return;
+    }
+
+    if (phase == WPTR_DRAG) {
+        if (col == drag_col && row == drag_row) return;   /* same cell, no work */
+        /* Move it in the MODEL and damage the two cells — this is the live
+         * preview, and it costs two small rects rather than a recompose
+         * (§4.61 measured what a full-screen repaint is worth).  The file is
+         * NOT written here: a drag crosses a dozen cells and each one would be
+         * a `.lnk` rewrite, i.e. VFS traffic proportional to hand tremor. */
+        icons_damage_item(drag_idx);
+        shortcut_set_pos_live(drag_idx, col, row);
+        drag_col = col; drag_row = row;
+        drag_moved = 1;
+        icons_damage_item(drag_idx);
+        gui_desktop_icons_changed();
+        return;
+    }
+
+    if (phase == WPTR_RELEASE) {
+        /* Persist exactly once, and only if it actually moved: a plain click
+         * is a press and a release with nothing between them, and rewriting a
+         * file on every click would make selecting an icon a disk write.
+         *
+         * Put it back where it started FIRST, so the commit sees the gesture's
+         * real origin and the swap hands that slot to whatever was displaced. */
+        if (drag_moved && drag_col >= 0) {
+            shortcut_set_pos_live(drag_idx, drag_from_col, drag_from_row);
+            shortcut_set_pos(drag_idx, drag_col, drag_row);
+            gui_desktop_icons_changed();
+            /* Say so on the log.  Without this the ONLY evidence a drag ever
+             * happened is a screenshot, and a screenshot cannot distinguish an
+             * icon that moved and was SAVED from one that moved and will be
+             * back in its old slot at the next boot — which is exactly the bug
+             * this milestone's tail turned out to contain. */
+            klog(KLOG_INFO, "gui", "desktop: shortcut %d moved (%d,%d) -> (%d,%d)\n",
+                 drag_idx, drag_from_col, drag_from_row, drag_col, drag_row);
+        }
+        drag_idx = -1;
+        drag_col = drag_row = -1;
+        drag_moved = 0;
+    }
 }
 
 
@@ -423,5 +513,6 @@ DESKTOP_SHELL(vista) = {
     .click          = vista_click,
     .motion         = vista_motion,
     .desktop_click  = vista_desktop_click,
+    .desktop_pointer = vista_desktop_pointer, /* §M64 tail — drag an icon */
     .second_tick    = vista_second_tick,
 };

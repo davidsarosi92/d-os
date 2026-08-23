@@ -72,6 +72,23 @@ struct item_model {
     const char* (*col_title)(void* ctx, int col);
     int  (*col_weight)(void* ctx, int col);
     int  (*cell)(void* ctx, int index, int col, char* out, int cap);
+
+    /* §M64 tail — where the owner has PUT this item, if anywhere.  Appended
+     * for the same reason the columns were: a model that leaves it NULL lays
+     * out in flow order exactly as it did before, so the Control Panel and the
+     * file manager are untouched by this existing.
+     *
+     * THE UNIT IS A GRID SLOT (column, row), NOT A PIXEL, and that is the
+     * whole decision.  §M61 made the resolution a runtime choice: a position
+     * stored in pixels puts an icon off the screen the moment somebody picks
+     * a smaller mode — silently, because nothing draws outside the box, so it
+     * reads as "my shortcut was deleted".  A slot survives the mode change,
+     * cannot half-overlap its neighbour, and is what the .lnk file has always
+     * stored (`x`/`y`, with -1 meaning "not placed").
+     *
+     * Return 0 and fill the two outputs when the item is placed; non-zero when
+     * it is not, and the view puts it in flow order. */
+    int  (*pos)(void* ctx, int index, int* col, int* row);
 };
 
 /* A layout.  Stateless: everything it needs arrives as arguments. */
@@ -95,6 +112,21 @@ struct item_view {
 
     /* How many items fit at once — the scroll step and the page size. */
     int  (*page)(int w, int h);
+
+    /* §M64 tail — which SLOT does a point fall in?  The other half of
+     * `item_model.pos`, and what makes drag-to-move possible: the drop lands
+     * at a point, and somebody has to turn that into the thing a position is
+     * stored as.
+     *
+     * OPTIONAL ON PURPOSE — a layout decides whether its items can be
+     * arranged at all.  The list and the table say NO by leaving this NULL,
+     * because their order IS the model's order and dropping row 3 onto row 7
+     * means REORDER, which is a different feature with different persistence.
+     * A caller can therefore tell "this view cannot be arranged" from "the
+     * drop missed the field", instead of a silent no-op that reads as a bug.
+     *
+     * Returns 0 and fills the two outputs on success. */
+    int  (*slot_at)(int px, int py, int w, int h, int* col, int* row);
 };
 
 extern struct item_view __start_item_views[];

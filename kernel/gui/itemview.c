@@ -54,18 +54,87 @@ static int str_len(const char* s) { int n = 0; while (s && s[n]) n++; return n; 
 #define G_ICON      48
 #define G_PAD       8
 
+/* Ceiling on the free-slot walk in g_place().  A layout pass must terminate
+ * even if the model reports nonsense (every slot claimed, a `pos` that answers
+ * differently on two calls): past this the item is placed wherever the walk
+ * stopped, which is wrong on screen and cannot hang the compositor.  Sized
+ * well above SHORTCUT_MAX so it is unreachable in normal use. */
+#define SLOT_SCAN_MAX  4096
+
 static int g_cols(int w) {
     int c = w / G_CELL_W;
     return c < 1 ? 1 : c;
 }
 
+/* Does any PLACED item sit in linear slot `s`?  (§M64 tail.)  Bounded by the
+ * item count, and on a desktop where nothing has been dragged yet there is
+ * nothing to scan — `m->pos` answers "not placed" for every item. */
+static int slot_taken(const struct item_model* m, int cols, int s, int except) {
+    int n = m->count ? m->count(m->ctx) : 0;
+    for (int j = 0; j < n; j++) {
+        if (j == except) continue;
+        int c, r;
+        if (m->pos(m->ctx, j, &c, &r) != 0) continue;
+        if (c < 0) c = 0;
+        if (c >= cols) c = cols - 1;
+        if (r * cols + c == s) return 1;
+    }
+    return 0;
+}
+
+/* Where does an item go?  Its own slot if it has one, otherwise the first slot
+ * no PLACED item has claimed, counting in model order.
+ *
+ * The skip is what stops a dragged icon and an auto-placed one from landing on
+ * top of each other: flow order knows nothing about the slots somebody has
+ * dragged things into, and two icons in one cell is not a layout, it is a lost
+ * shortcut. */
+static int g_place(const struct item_model* m, int i, int cols, int* oc, int* or_) {
+    if (m && m->pos && m->pos(m->ctx, i, oc, or_) == 0) {
+        /* Clamped rather than dropped: a column that no longer exists (a
+         * narrower mode) must still be reachable — an icon hidden off the
+         * right edge is indistinguishable from one that was deleted. */
+        if (*oc < 0)      *oc = 0;
+        if (*oc >= cols)  *oc = cols - 1;
+        if (*or_ < 0)     *or_ = 0;
+        return 0;
+    }
+    if (!m || !m->pos) {                       /* no positioning at all */
+        *oc = i % cols; *or_ = i / cols;
+        return 0;
+    }
+    /* Unplaced: rank among the other unplaced items, then walk the free slots. */
+    int rank = 0;
+    for (int j = 0; j < i; j++) {
+        int c, r;
+        if (m->pos(m->ctx, j, &c, &r) != 0) rank++;
+    }
+    int s = 0, seen = 0;
+    for (;;) {
+        if (!slot_taken(m, cols, s, i)) {
+            if (seen == rank) break;
+            seen++;
+        }
+        s++;
+        if (s > SLOT_SCAN_MAX) break;          /* bounded — see below */
+    }
+    *oc = s % cols; *or_ = s / cols;
+    return 0;
+}
+
 static int grid_rect(int i, int w, int h, const struct item_model* m, int scroll,
                      int* ox, int* oy, int* ow, int* oh) {
-    (void)m;
     int cols = g_cols(w);
-    int idx  = i - scroll;
-    if (idx < 0) return -1;
-    int r = idx / cols, c = idx % cols;
+    int c, r;
+    if (m && m->pos) {
+        g_place(m, i, cols, &c, &r);
+        r -= scroll;
+    } else {
+        int idx = i - scroll;
+        if (idx < 0) return -1;
+        r = idx / cols; c = idx % cols;
+    }
+    if (r < 0) return -1;
     int y = r * G_CELL_H;
     if (y >= h) return -1;
     *ox = c * G_CELL_W; *oy = y; *ow = G_CELL_W; *oh = G_CELL_H;
@@ -81,7 +150,11 @@ static void grid_draw(struct gfx_surface* s, int x, int y, int w, int h,
                       const struct item_model* m, int sel, int scroll) {
     if (!m || !m->count || !m->get) return;
     int n = m->count(m->ctx);
-    for (int i = scroll; i < n; i++) {
+    /* With slots the model's order and the screen's order are different
+     * things, so every item is offered to `grid_rect` and IT decides what is
+     * off the top — starting at `scroll` would skip a placed item whose index
+     * is low and whose row is high. */
+    for (int i = m->pos ? 0 : scroll; i < n; i++) {
         int cx, cy, cw, ch;
         if (grid_rect(i, w, h, m, scroll, &cx, &cy, &cw, &ch) != 0) continue;
         struct item_entry e = { 0, 0, ICON_APP, 0 };
@@ -109,11 +182,36 @@ static int grid_hit(int px, int py, int w, int h,
                     const struct item_model* m, int scroll) {
     if (!m || !m->count) return -1;
     if (px < 0 || py < 0 || px >= w || py >= h) return -1;
+
+    /* With explicit slots the arithmetic below no longer holds — slot (2,0)
+     * may belong to item 5 — so ask the same function that DREW them.  One
+     * source of truth for "where is item i": a hit test that computes the
+     * answer a second way is how a view ends up drawing correctly and
+     * selecting the wrong thing (§M64 shipped `shortcut check` for exactly
+     * this failure). */
+    if (m->pos) {
+        int n = m->count(m->ctx);
+        for (int i = 0; i < n; i++) {
+            int ox, oy, ow, oh;
+            if (grid_rect(i, w, h, m, scroll, &ox, &oy, &ow, &oh) != 0) continue;
+            if (px >= ox && px < ox + ow && py >= oy && py < oy + oh) return i;
+        }
+        return -1;
+    }
+
     int cols = g_cols(w);
     int c = px / G_CELL_W, r = py / G_CELL_H;
     if (c >= cols) return -1;
     int idx = scroll + r * cols + c;
     return idx < m->count(m->ctx) ? idx : -1;
+}
+
+static int grid_slot_at(int px, int py, int w, int h, int* col, int* row) {
+    if (px < 0 || py < 0 || px >= w || py >= h) return -1;
+    int c = px / G_CELL_W, r = py / G_CELL_H;
+    if (c >= g_cols(w)) return -1;
+    *col = c; *row = r;
+    return 0;
 }
 
 ITEM_VIEW(itemview_grid) = {
@@ -122,6 +220,7 @@ ITEM_VIEW(itemview_grid) = {
     .hit  = grid_hit,
     .rect = grid_rect,
     .page = grid_page,
+    .slot_at = grid_slot_at,        /* §M64 tail — the grid can be arranged */
 };
 
 /* ===================================================================== */

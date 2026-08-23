@@ -61,6 +61,22 @@ struct desktop_shell {
      * desktop task is also what repaints the chrome. */
     void (*desktop_click)(int x, int y, int dbl);
 
+    /* §M64 tail — the pointer PHASE stream on the desktop: press, drag,
+     * release, using §M58's vocabulary (WPTR_PRESS / WPTR_DRAG / WPTR_RELEASE)
+     * rather than a second one, because this system should have one answer to
+     * "what phase is this pointer event in".
+     *
+     * Like `desktop_click` and unlike `click`/`motion`, this runs on the
+     * DESKTOP TASK with NO lock held — a release persists a shortcut's
+     * position, which opens a file.
+     *
+     * The compositor GRABS on press: once a desktop drag has started, drag and
+     * release arrive here no matter what the pointer is over.  Without the
+     * grab, dragging an icon across a window would end the drag at the
+     * window's edge, which is §M58's lesson stated one layer up.  NULL = this
+     * shell does not arrange anything. */
+    void (*desktop_pointer)(int x, int y, int phase);
+
     /* Pointer events (mouse IRQ, WM lock held — see header comment). */
     int  (*click) (int x, int y);       /* non-zero = consumed           */
     void (*motion)(int x, int y);

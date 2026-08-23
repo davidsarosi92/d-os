@@ -416,9 +416,23 @@ struct pev { uint8_t type; int16_t x, y; };
 /* §M64 — a click on the desktop background (no window, no chrome). */
 #define PEV_DESK_CLICK 2
 #define PEV_DESK_DBL   3
+/* §M64 tail — the desktop's pointer PHASES, carrying WPTR_* in the queue so
+ * the shell sees §M58's vocabulary and not a second one. */
+#define PEV_DESK_PRESS   4
+#define PEV_DESK_DRAG    5
+#define PEV_DESK_RELEASE 6
 #define PEVQ_SZ 32
 static struct pev        pevq[PEVQ_SZ];
 static volatile uint32_t pevq_h = 0, pevq_t = 0;
+
+/* §M64 tail — a desktop drag in progress.  Set on a press that hit no window
+ * and no chrome, cleared on release.  While set, motion and release go to the
+ * DESKTOP whatever the pointer is over: a drag that ends at the first window
+ * it crosses is not a drag (§M58's grab, one layer up).
+ *
+ * A flag and not a pointer: the desktop is not an object that can be
+ * destroyed mid-drag, which is exactly why the widget grab needed to be one. */
+static volatile int desk_grab = 0;
 
 /* M22.4 — set by the task-lifecycle hook (any context) and consumed by
  * the compositor loop: run every window's on_tick NOW instead of at
@@ -1987,6 +2001,14 @@ static void desktop_main(void) {
                  * taken for something else). */
                 if (shell && shell->desktop_click)
                     shell->desktop_click(e.x, e.y, e.type == PEV_DESK_DBL);
+            } else if (e.type == PEV_DESK_PRESS || e.type == PEV_DESK_DRAG ||
+                       e.type == PEV_DESK_RELEASE) {
+                /* §M64 tail — same contract as desktop_click above: the
+                 * desktop task, no lock.  The release writes a `.lnk`. */
+                if (shell && shell->desktop_pointer)
+                    shell->desktop_pointer(e.x, e.y,
+                        e.type == PEV_DESK_PRESS   ? WPTR_PRESS :
+                        e.type == PEV_DESK_DRAG    ? WPTR_DRAG  : WPTR_RELEASE);
             } else {
                 uint32_t fl = spin_lock_irqsave(&state_lock);
                 if (e.type == PEV_CLICK) { if (shell && shell->click)  shell->click(e.x, e.y); }
@@ -2963,6 +2985,11 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
         evq_push_ptr(grab_win, mx - grab_win->x - BORDER,
                      my - grab_win->y - TITLE_H, WPTR_DRAG);
 
+    /* §M64 tail — motion while the DESKTOP holds the grab.  Queued rather than
+     * acted on: moving an icon re-lays the background layer and the release
+     * writes a file, and we are in the mouse IRQ under the WM lock. */
+    if (desk_grab && (dx || dy)) pevq_push(PEV_DESK_DRAG, mx, my);
+
     /* §M58/§M59 — MIDDLE-CLICK PASTE of the primary selection into a terminal.
      * This is the entire reason the primary selection is a separate slot: you
      * select with the left button and paste with the middle one, without either
@@ -3143,6 +3170,12 @@ static void gui_mouse(int dx, int dy, unsigned buttons) {
             lastclick_x = mx; lastclick_y = my;
             lastclick_win = NULL;
             pevq_push(dbl ? PEV_DESK_DBL : PEV_DESK_CLICK, mx, my);
+            /* §M64 tail — and the phase stream, plus the grab.  The press is
+             * pushed AFTER the click so the shell has already updated its
+             * selection when the drag begins: a drag moves the icon the user
+             * just pressed, and the two must agree on which one that is. */
+            pevq_push(PEV_DESK_PRESS, mx, my);
+            desk_grab = 1;
         }
     }
 
@@ -3211,6 +3244,11 @@ drag_update:
          * (clipboard_set allocates), so all this does is mark it ready. */
         if (term_sel_win->sel_on) term_sel_copy = term_sel_win;
         term_sel_win = NULL;
+    }
+
+    if ((released & MOUSE_BTN_LEFT) && desk_grab) {
+        pevq_push(PEV_DESK_RELEASE, mx, my);
+        desk_grab = 0;
     }
 
     if ((released & MOUSE_BTN_LEFT) && grab_win) {

@@ -43,6 +43,7 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "block.h"
 #include "block_cache.h"
 #include "config.h"          /* §M63 stage 0 — config_attach_persistent */
+#include "shortcut.h"        /* §M64 tail — shortcut_attach_persistent */
 #include "vc.h"
 #include "shell_provider.h"
 #include "service.h"
@@ -267,6 +268,13 @@ void aarch64_main_entry(uint64_t dtb) {
              * ARM would keep losing every setting at reboot while x86 kept
              * them — the same shape as the pkg_init duplication below. */
             config_attach_persistent("/mnt");
+
+            /* §M64 tail — the shortcuts too, and the comment above is the
+             * whole argument for why this line exists twice in this tree. */
+            if (shortcut_attach_persistent("/mnt") == 0)
+                kprintf("desktop: shortcuts persist in /mnt/desktop\n");
+            else
+                kprintf("desktop: shortcuts in /desktop — will NOT survive a reboot\n");
         } else
             kprintf("aarch64: /dev/vda has no exFAT volume (skipping /mnt mount)\n");
     }

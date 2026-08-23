@@ -41,6 +41,14 @@ struct shortcut {
 static struct shortcut list[SHORTCUT_MAX];
 static int list_n = 0;
 
+/* Where the `.lnk` files live.  Starts as the RAM directory and is redirected
+ * onto the persistent volume by shortcut_attach_persistent() — see the header
+ * for why this is not a compile-time constant (it was, and shortcuts silently
+ * did not survive a reboot). */
+static char sc_dir[64] = SHORTCUT_DIR;
+
+const char* shortcut_dir(void) { return sc_dir; }
+
 /* ------------------------------------------------------------------- */
 /* Small string helpers (no libc).                                      */
 /* ------------------------------------------------------------------- */
@@ -167,16 +175,42 @@ static int write_lnk(const struct shortcut* sc) {
 /* Loading.                                                             */
 /* ------------------------------------------------------------------- */
 
+int shortcut_attach_persistent(const char* mount) {
+    if (!mount || !*mount) return -1;
+
+    char dir[64];
+    copy_(dir, sizeof dir, mount);
+    int p = len_(dir);
+    while (p > 0 && dir[p - 1] == '/') dir[--p] = '\0';
+    const char* leaf = "/desktop";
+    for (int i = 0; leaf[i] && p < (int)sizeof dir - 1; i++) dir[p++] = leaf[i];
+    dir[p] = '\0';
+
+    /* Creating the directory IS the write test — it is a write to the volume,
+     * and it is the same argument §M63 stage 0 made about creating the config
+     * file.  When it already exists a previous boot created it, which is
+     * evidence of the same thing.  What we must not do is assume: a path we
+     * merely HOPE is writable turns every later `shortcut add` into a silent
+     * failure, which is precisely the bug being fixed here. */
+    vfs_mkdir(dir);
+    struct file* d = vfs_open(dir, VFS_RDONLY);
+    if (!d) return -1;                  /* no directory there — keep the RAM one */
+    vfs_close(d);
+
+    copy_(sc_dir, sizeof sc_dir, dir);
+    return shortcut_reload() >= 0 ? 0 : -1;
+}
+
 int shortcut_reload(void) {
     list_n = 0;
 
-    struct file* d = vfs_open(SHORTCUT_DIR, VFS_RDONLY);
+    struct file* d = vfs_open(shortcut_dir(), VFS_RDONLY);
     if (!d) {
         /* No /desktop yet — create it so `shortcut add` and the file manager
          * have somewhere to write.  Missing is not an error: a fresh system
          * has no shortcuts and that is the intended state (§M64 ships empty,
          * deliberately — see the header on auto-population). */
-        vfs_mkdir(SHORTCUT_DIR);
+        vfs_mkdir(shortcut_dir());
         return 0;
     }
 
@@ -189,14 +223,14 @@ int shortcut_reload(void) {
     while (vfs_readdir(d, &de) > 0) {
         if (list_n >= SHORTCUT_MAX) {
             klog(KLOG_WARN, "gui", "shortcut: more than %d in %s — ignoring the rest\n",
-                 SHORTCUT_MAX, SHORTCUT_DIR);
+                 SHORTCUT_MAX, shortcut_dir());
             break;
         }
         int n = len_(de.name);
         if (n < 5 || !streq_(de.name + n - 4, ".lnk")) continue;
 
         char path[80];
-        copy_(path, sizeof path, SHORTCUT_DIR);
+        copy_(path, sizeof path, shortcut_dir());
         int p = len_(path);
         if (p < (int)sizeof path - 1) path[p++] = '/';
         for (int i = 0; de.name[i] && p < (int)sizeof path - 1; i++) path[p++] = de.name[i];
@@ -227,8 +261,21 @@ static int m_get(void* ctx, int i, struct item_entry* out) {
 
 static void m_activate(void* ctx, int i) { (void)ctx; shortcut_launch(i); }
 
+/* §M64 tail — the slot the user dragged this icon to, if any.  -1/-1 is the
+ * "never placed" state a fresh `.lnk` carries (shortcut_add writes it), and it
+ * is what keeps a new shortcut landing in a tidy flow position instead of on
+ * top of whatever occupies cell (0,0). */
+static int m_pos(void* ctx, int i, int* col, int* row) {
+    (void)ctx;
+    if (i < 0 || i >= list_n) return -1;
+    if (list[i].x < 0 || list[i].y < 0) return -1;
+    *col = list[i].x; *row = list[i].y;
+    return 0;
+}
+
 static const struct item_model model = {
     .count = m_count, .get = m_get, .activate = m_activate, .ctx = NULL,
+    .pos = m_pos,
 };
 
 const struct item_model* shortcut_model(void) { return &model; }
@@ -314,7 +361,7 @@ int shortcut_add(const char* name, const char* target, const char* icon) {
     if (!name || !*name || !target || !*target) return -1;
     if (list_n >= SHORTCUT_MAX) return -2;
 
-    vfs_mkdir(SHORTCUT_DIR);                 /* no-op when it exists */
+    vfs_mkdir(shortcut_dir());                 /* no-op when it exists */
 
     struct shortcut sc;
     copy_(sc.name, sizeof sc.name, name);
@@ -322,7 +369,7 @@ int shortcut_add(const char* name, const char* target, const char* icon) {
     sc.icon = icon_by_name(icon);
     sc.x = sc.y = -1;                        /* -1 = let the layout place it */
 
-    copy_(sc.file, sizeof sc.file, SHORTCUT_DIR);
+    copy_(sc.file, sizeof sc.file, shortcut_dir());
     int p = len_(sc.file);
     sc.file[p++] = '/';
     for (int i = 0; name[i] && p < (int)sizeof sc.file - 5; i++) {
@@ -356,11 +403,52 @@ int shortcut_remove(const char* name) {
     return -1;
 }
 
-int shortcut_set_pos(int index, int x, int y) {
+int shortcut_set_pos_live(int index, int x, int y) {
     if (index < 0 || index >= list_n) return -1;
     list[index].x = x;
     list[index].y = y;
-    return write_lnk(&list[index]);
+    return 0;
+}
+
+void shortcut_pos_of(int index, int* x, int* y) {
+    if (index < 0 || index >= list_n) { *x = *y = -1; return; }
+    *x = list[index].x;
+    *y = list[index].y;
+}
+
+/* Which PLACED shortcut holds slot (x,y)?  -1 = none. */
+static int placed_at(int x, int y, int except) {
+    for (int i = 0; i < list_n; i++)
+        if (i != except && list[i].x == x && list[i].y == y) return i;
+    return -1;
+}
+
+int shortcut_set_pos(int index, int x, int y) {
+    if (index < 0 || index >= list_n) return -1;
+
+    /* A DROP ONTO AN OCCUPIED SLOT SWAPS THE TWO.  The alternatives are worse:
+     * stacking hides one shortcut behind another (it looks deleted, and the
+     * hit test can only return one of them), and refusing the drop makes the
+     * icon spring back for a reason nothing on screen explains.  A swap is
+     * deterministic, needs no search, and cannot fail.
+     *
+     * If the slot merely LOOKS occupied — an unplaced icon that the flow
+     * layout happened to put there — there is nothing to swap with, and the
+     * layout moves it along on the next draw, because g_place() skips slots a
+     * placed item has claimed. */
+    int other = (x >= 0 && y >= 0) ? placed_at(x, y, index) : -1;
+    int ox = list[index].x, oy = list[index].y;
+
+    list[index].x = x;
+    list[index].y = y;
+    int rc = write_lnk(&list[index]);
+
+    if (other >= 0) {
+        list[other].x = ox;              /* may be -1/-1: back to flow order */
+        list[other].y = oy;
+        if (write_lnk(&list[other]) != 0) rc = -1;
+    }
+    return rc;
 }
 
 /* ------------------------------------------------------------------- */
@@ -382,14 +470,15 @@ void shortcut_cmd(const char* args) {
 
     if (!cmd[0] || streq_(cmd, "list")) {
         shortcut_reload();
-        kprintf("desktop shortcuts (%d) in %s:\n", list_n, SHORTCUT_DIR);
+        kprintf("desktop shortcuts (%d) in %s:\n", list_n, shortcut_dir());
         for (int i = 0; i < list_n; i++)
             kprintf("  %s  ->  %s  [%s]\n", list[i].name, list[i].target,
                     icon_name(list[i].icon));
         if (!list_n)
             kprintf("  (none — `shortcut add <name> <target> [icon]`)\n");
         kprintf("  targets: app:<name> | file:<path> | run:<cmd> | store:<pkg>\n");
-        kprintf("  also: shortcut open <name> | shortcut check [view]\n");
+        kprintf("  also: shortcut open <name> | move <name> <col> <row> "
+                "| check [view]\n");
         return;
     }
 
@@ -406,6 +495,42 @@ void shortcut_cmd(const char* args) {
         if (rc == 0)       kprintf("shortcut: added %s -> %s\n", name, target);
         else if (rc == -2) kprintf("shortcut: desktop is full (%d)\n", SHORTCUT_MAX);
         else               kprintf("shortcut: could not write %s\n", name);
+        return;
+    }
+
+    if (streq_(cmd, "move")) {
+        /* §M64 tail — THE DROP, WITHOUT A MOUSE.  The pointer transport can
+         * only be exercised by driving the pointer, but everything the drop
+         * DECIDES — the slot, the swap with whatever was there, the rewrite of
+         * both files — is reachable from here, so it can be regression-tested
+         * on a machine with no display at all (the rule §M60 paid for: a
+         * feature with no headless path cannot be checked here). */
+        char name[48], cs[12], rs[12];
+        rest = word(rest, name, sizeof name);
+        rest = word(rest, cs, sizeof cs);
+        word(rest, rs, sizeof rs);
+        if (!name[0] || !cs[0] || !rs[0]) {
+            kprintf("shortcut: move <name> <col> <row>   (-1 -1 = unplace)\n");
+            return;
+        }
+        shortcut_reload();
+        for (int i = 0; i < list_n; i++) {
+            if (!streq_(list[i].name, name)) continue;
+            int c = num_(cs), r = num_(rs);
+            int oc = list[i].x, orow = list[i].y;
+            int other = (c >= 0 && r >= 0) ? placed_at(c, r, i) : -1;
+            if (shortcut_set_pos(i, c, r) != 0) {
+                kprintf("shortcut: could not write %s\n", name);
+                return;
+            }
+            kprintf("shortcut: %s (%d,%d) -> (%d,%d)\n", name, oc, orow, c, r);
+            if (other >= 0)
+                kprintf("  swapped with %s, now at (%d,%d)\n",
+                        list[other].name, list[other].x, list[other].y);
+            gui_desktop_icons_changed();
+            return;
+        }
+        kprintf("shortcut: no such shortcut '%s'\n", name);
         return;
     }
 
@@ -451,6 +576,26 @@ void shortcut_cmd(const char* args) {
          * screenshot. */
         kprintf("  hit(centre of cell 0) = %d, page = %d\n",
                 v->hit(24, 24, w, h, shortcut_model(), 0), v->page(w, h));
+
+        /* §M64 tail — WHERE each item actually landed, and whether the view's
+         * own hit test agrees.  A placement bug and a hit-test bug produce the
+         * same checksum, and neither is visible in a screenshot: this is the
+         * line that separates "the icon is drawn there" from "clicking there
+         * finds that icon". */
+        kprintf("  arrangeable = %s\n", v->slot_at ? "yes" : "no (fixed order)");
+        for (int i = 0; i < list_n; i++) {
+            int ox, oy, ow, oh;
+            if (!v->rect || v->rect(i, w, h, shortcut_model(), 0,
+                                    &ox, &oy, &ow, &oh) != 0) {
+                kprintf("    %s slot=(%d,%d) off-field\n",
+                        list[i].name, list[i].x, list[i].y);
+                continue;
+            }
+            int back = v->hit(ox + ow / 2, oy + oh / 2, w, h, shortcut_model(), 0);
+            kprintf("    %s slot=(%d,%d) px=(%d,%d) hit=%d%s\n",
+                    list[i].name, list[i].x, list[i].y, ox, oy, back,
+                    back == i ? "" : "  <-- MISMATCH");
+        }
         gfx_surface_free(&tmp);
         return;
     }
@@ -466,5 +611,6 @@ void shortcut_cmd(const char* args) {
         return;
     }
 
-    kprintf("shortcut: list | add <name> <target> [icon] | rm <name> | open <name>\n");
+    kprintf("shortcut: list | add <name> <target> [icon] | rm <name> "
+            "| open <name> | move <name> <col> <row> | check [view]\n");
 }

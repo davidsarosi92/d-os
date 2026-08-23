@@ -38,8 +38,30 @@
 #ifndef SHORTCUT_H
 #define SHORTCUT_H
 
-#define SHORTCUT_DIR    "/desktop"
+#define SHORTCUT_DIR    "/desktop"  /* the RAM fallback — see shortcut_dir() */
 #define SHORTCUT_MAX    64          /* bounded like every other table here */
+
+/* Move the shortcut directory onto the first writable volume (§M64 tail).
+ *
+ * THE SAME BUG §M63 STAGE 0 FIXED FOR SETTINGS, ONE LAYER OVER: `/` is ramfs
+ * and the persistent volume is the exFAT mount, so a shortcut written to
+ * `/desktop` was written into memory and lost at the next boot — while every
+ * document here claimed a shortcut is a file precisely SO THAT it would
+ * survive one.  Called right after the mount on BOTH entry paths (x86
+ * `kernel_main`, aarch64 `main_entry`): miss one and that arch keeps losing
+ * shortcuts while the other keeps them.
+ *
+ * Returns 0 when the directory exists and is readable there, non-zero when it
+ * does not — in which case the RAM directory stays in use and everything keeps
+ * working, without persisting.  The caller says which of the two it got; a
+ * volume we merely HOPE is writable turns every later save into a silent
+ * failure. */
+int  shortcut_attach_persistent(const char* mount);
+
+/* Where the shortcuts actually live right now — `/desktop`, or the persistent
+ * one once attached.  Printed by `shortcut list`, because a user who cannot
+ * find their `.lnk` files with `ls` has no way to discover this. */
+const char* shortcut_dir(void);
 
 struct item_model;
 
@@ -58,9 +80,22 @@ void shortcut_launch(int index);
 int  shortcut_add(const char* name, const char* target, const char* icon);
 int  shortcut_remove(const char* name);
 
-/* Persist the position of shortcut `index` (drag-to-move, once §M58's
- * press/motion/release plumbing exists).  Returns 0 on success. */
+/* Persist the position of shortcut `index` — the drop at the end of a drag.
+ * `x`/`y` are a GRID SLOT (column, row), not pixels: see itemview.h's
+ * `item_model.pos` for why, and -1/-1 means "unplaced, let the layout choose".
+ * A drop onto a slot another shortcut holds SWAPS the two.  Writes both `.lnk`
+ * files.  Returns 0 on success. */
 int  shortcut_set_pos(int index, int x, int y);
+
+/* The same move, IN MEMORY ONLY — the live preview while a drag is in flight.
+ * Separate from the call above because a drag crosses a dozen cells and each
+ * one would otherwise be a file rewrite: VFS traffic proportional to how
+ * steady the user's hand is.  No swap, so a mid-drag overlap is possible and
+ * momentary; the drop is what resolves it. */
+int  shortcut_set_pos_live(int index, int x, int y);
+
+/* Read back a shortcut's stored slot.  Fills -1/-1 when it has none. */
+void shortcut_pos_of(int index, int* x, int* y);
 
 /* The `shortcut` shell command — implemented next to the model rather than in
  * a shell, so the ARM serial REPL runs the same one (§M24's rule). */

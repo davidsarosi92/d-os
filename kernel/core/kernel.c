@@ -64,6 +64,7 @@
 #include "block_cache.h"
 #include "block.h"
 #include "config.h"
+#include "shortcut.h"        /* §M64 tail — shortcut_attach_persistent */
 #include "crash.h"     /* §M47 — unclean-shutdown marker */
 #include "task.h"
 #include "workqueue.h"
@@ -299,6 +300,17 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
              * consumed a key (keymap, console colours) are notified rather
              * than left one boot behind. */
             config_attach_persistent("/mnt");
+
+            /* §M64 tail — AND THE SHORTCUTS, for exactly the same reason.
+             * `/desktop` was a constant pointing at ramfs, so "a shortcut is a
+             * file so that it survives a reboot" was true about the format and
+             * false about the outcome.  Same call site, same honesty rule: it
+             * reports which of the two modes we are in rather than assuming
+             * the good one. */
+            if (shortcut_attach_persistent("/mnt") == 0)
+                kprintf("desktop: shortcuts persist in /mnt/desktop\n");
+            else
+                kprintf("desktop: shortcuts in /desktop — will NOT survive a reboot\n");
 
             /* §M62 — the boot screen starts HERE, not with the rest of config.
              * `boot.splash` lives in the PERSISTENT store, and that store is
