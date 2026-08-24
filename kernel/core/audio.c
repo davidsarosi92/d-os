@@ -949,7 +949,7 @@ static void audio_mixtest(uint32_t ms) {
     audio_stream_list();
 }
 
-static void audio_master_save(void);   /* defined with the config keys below */
+
 
 /* `volume` / `volume <0..100>` / `volume mute|unmute|toggle` — the headless
  * path, which exists BEFORE the taskbar control that calls the same functions
@@ -985,7 +985,7 @@ void audio_cmd_volume(const char* args) {
     kprintf("volume %d%%%s\n", (vol * 100) / 256, muted ? " [MUTED]" : "");
     /* Persist through config so it survives a reboot and the Control Panel
      * shows it — the §M63 machinery, reused rather than duplicated. */
-    audio_master_save();
+    audio_volume_persist();
 }
 
 /* ---- persistence -----------------------------------------------------------
@@ -1022,7 +1022,7 @@ CONFIG_WATCH(audio_watch) = {
     .changed = audio_conf_changed,
 };
 
-static void audio_master_save(void) {
+void audio_volume_persist(void) {
     int vol, muted;
     audio_master_get(&vol, &muted);
     char b[8];

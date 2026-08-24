@@ -28,6 +28,11 @@ ARCH=${ARCH:-i386}
 #   --no-disk         — no storage at all.  The mode where "will NOT survive a
 #                       reboot" is the truth, and where every provisioning path
 #                       has to work from nothing.
+#   --no-audio        — no sound card.  §M23's third indicator state is exactly
+#                       this machine, so it needs to be one flag away: the
+#                       taskbar must show "no device" rather than hiding the
+#                       control, and that is only testable if a person can
+#                       actually boot without one.
 #
 # They are FLAGS rather than an environment variable because a mode you have to
 # remember the spelling of is a mode that gets tested once.  (`DOS_DISK=none`
@@ -39,18 +44,21 @@ ARCH=${ARCH:-i386}
 # ARM would be worse than no option.
 # -----------------------------------------------------------------------------
 DISK_MODE=keep
+AUDIO_MODE=on
 QEMU_EXTRA_ARGS=""
 
 usage() {
     cat >&2 <<'EOF'
-usage: run_qemu.sh [--empty | --no-disk] [-- <extra qemu args>]
+usage: run_qemu.sh [--empty | --no-disk] [--no-audio] [-- <extra qemu args>]
 
   (no flag)   attach the persistent disk (created + formatted on first use)
   --empty     wipe that disk and attach a FRESHLY FORMATTED, empty one
   --no-disk   run with no storage at all (RAM only; nothing persists)
+  --no-audio  attach no sound card (the taskbar then shows "no device")
 
   ARCH=i386|x86_64|aarch64   selects the build to boot (default: i386)
   SMP=<n>                    number of vCPUs on the x86 arches (default: 4)
+  DOS_AUDIO=<backend>|none   force the host audio backend, or none
 EOF
 }
 
@@ -58,6 +66,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --empty)            DISK_MODE=empty ;;
         --no-disk|--nodisk) DISK_MODE=none ;;
+        --no-audio|--noaudio) AUDIO_MODE=none ;;
         -h|--help)          usage; exit 0 ;;
         --)                 shift; QEMU_EXTRA_ARGS="$*"; break ;;
         *)
@@ -114,6 +123,9 @@ dos_format_disk() {
 # DOS_AUDIO=<backend> forces one.
 # -----------------------------------------------------------------------------
 dos_audio_backend() {
+    # The FLAG wins over the environment: it is the more specific, more
+    # deliberate statement, and the same precedence --no-disk has.
+    if [ "$AUDIO_MODE" = "none" ]; then echo none; return; fi
     if [ -n "${DOS_AUDIO:-}" ]; then echo "$DOS_AUDIO"; return; fi
     case "$(uname -s)" in
         Darwin) echo coreaudio ;;

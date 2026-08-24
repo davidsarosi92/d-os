@@ -192,6 +192,39 @@ void icon_draw(struct gfx_surface* s, int x, int y, int n, int id) {
         break;
     }
 
+    /* §M23 — a speaker: a small box plus a flared cone, then the state mark.
+     * Drawn from primitives like every other icon here (§M64's argument: one
+     * definition serves 24/48/64 px, there is no file to be missing, and an
+     * icon cannot fail at runtime). */
+    case ICON_VOLUME:
+    case ICON_VOLUME_MUTED:
+    case ICON_VOLUME_OFF: {
+        uint32_t body = (id == ICON_VOLUME_OFF) ? C_GREY : C_BLUE;
+        tile(s, x, y, n, body);
+        /* speaker box */
+        gfx_fill(s, x + 3 * u, y + 6 * u, 3 * u, 4 * u, C_WHITE);
+        /* cone: widening steps */
+        gfx_fill(s, x + 6 * u, y + 5 * u, u, 6 * u, C_WHITE);
+        gfx_fill(s, x + 7 * u, y + 4 * u, u, 8 * u, C_WHITE);
+        if (id == ICON_VOLUME) {
+            /* two arcs = sound coming out */
+            gfx_fill(s, x + 9 * u,  y + 5 * u, u, 6 * u, C_WHITE);
+            gfx_fill(s, x + 11 * u, y + 3 * u, u, 10 * u, C_WHITE);
+        } else if (id == ICON_VOLUME_MUTED) {
+            /* a cross where the sound would be — the universal "off" mark */
+            for (int i = 0; i < 5; i++) {
+                gfx_fill(s, x + (9 + i) * u, y + (4 + i) * u, u, u, C_WHITE);
+                gfx_fill(s, x + (13 - i) * u, y + (4 + i) * u, u, u, C_WHITE);
+            }
+        } else {
+            /* unavailable: a bar through the whole glyph, and a dimmed body,
+             * so it reads as "not present" rather than "switched off". */
+            for (int i = 0; i < 12; i++)
+                gfx_fill(s, x + (2 + i) * u, y + (2 + i) * u, u, u, C_RED);
+        }
+        break;
+    }
+
     case ICON_INFO: {
         tile(s, x, y, n, C_TEAL);
         gfx_fill(s, x + 7 * u, y + 3 * u, 2 * u, 2 * u, C_WHITE);
@@ -234,6 +267,9 @@ static const struct { const char* name; int id; } names[] = {
     { "warn",      ICON_WARN      },
     { "code",      ICON_CODE      },
     { "info",      ICON_INFO      },
+    { "volume",    ICON_VOLUME    },
+    { "muted",     ICON_VOLUME_MUTED },
+    { "noaudio",   ICON_VOLUME_OFF },
     { NULL, 0 }
 };
 

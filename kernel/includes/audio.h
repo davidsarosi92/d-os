@@ -129,6 +129,12 @@ void audio_master_get(int* vol_256, int* muted);
  * needs: playing, muted, or nothing to play through. */
 int  audio_available(void);
 
+/* Write the current master level + mute into the config store, so a change
+ * made from the taskbar survives a reboot exactly as `volume 40` does.  Uses
+ * config_set rather than config_apply: the value is already in effect, and
+ * applying would re-enter the watcher to set what it just set. */
+void audio_volume_persist(void);
+
 /* ---------------------------------------------------------------------------
  * WAV playback (§M23 stage 2).
  *

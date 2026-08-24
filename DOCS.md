@@ -3068,8 +3068,90 @@ its volume through the block layer *by name*, so storage worked without a
 `/dev` to look in.  Fixed at the same point in the sequence x86 uses; ARM now
 lists `random urandom clipboard zero null` plus `dsp`.
 
-**Still open:** the mixer and multiple streams, PCM input, Intel HDA, the AC97
-completion interrupt, and whether `/dev/vda` should be published on ARM (the
+#### Stage 4 — the mixer, and a deadlock written against a header that forbade it
+
+A sound used to OWN the device for its whole duration: `play` and a second
+program could not both be heard.  Every source now opens a **stream** and
+writes into its own ring; one **pump task** owns the device and mixes whatever
+is active into each period, running exactly while somebody has audio and fully
+blocked otherwise (§M55's shape).  Streams are single-producer /
+single-consumer, so a ring needs no lock; the table lock covers open, close and
+the pump's walk.  **Mixing saturates** — a wrap turns the loudest instant into
+white noise, and only when two things overlap, which is maximally audible and
+maximally confusing to diagnose.
+
+**The bug, and where it was already written down.**  `waitq.h` states the
+discipline in its own header: hold the lock, *loop* on the condition, unlock
+after — and `waitq_block` **re-acquires** the lock before returning.  The first
+version treated it as returning unlocked and `continue`d straight back into
+`waitq_lock`: a task deadlocking against itself with interrupts masked.
+`waitq_wake_all` was also called unlocked in three places, which the same
+header forbids in capitals.  It surfaced as an **NMI hard lockup in
+`hal_cpu_pause`**, and §4.67.1's watchdog named the wedged CPU correctly — the
+diagnostic built for exactly this paid for itself.  The writer's full-ring wait
+is now a bounded sleep rather than a second waitq: the ring is ~341 ms deep, so
+a 2 ms poll costs nothing measurable and buys a wait that *ends* if the device
+stops consuming.
+
+**The period size is measured, not chosen.**  The device is stopped between
+periods (one BDL entry per call today), so every boundary is a small gap that
+QEMU's capture fills by holding the last sample.  At 2048 frames the stretch
+was visible — 300 ms of square wave came back as **323 ms at 411 Hz** instead
+of 443 — while 4096 measures clean.  The real fix is queueing the next buffer
+before the current drains; until then this costs latency, not correctness.
+
+**Master volume and mute** are applied once to the finished mix, not per
+stream: the system volume must not change the balance between two things
+playing.  **Mute is not volume 0** — stored separately, so unmuting restores
+the level the user chose.  A muted mix still produces frames rather than
+skipping the period, so the device keeps its timing and unmuting resumes
+mid-sound instead of replaying a backlog.  It is a setting through §M63's
+machinery (`audio.volume`, `audio.muted`), so the Control Panel renders it with
+no per-key UI code and a restored value takes effect immediately.
+
+#### The taskbar sound indicator — three states, never hidden
+
+Asked for from use.  A speaker icon sits immediately left of the clock, and
+clicking it opens a small flyout with a volume slider and a Mute row.
+
+**Three icons, not two.**  A device that is missing or failed shows a
+*different* glyph from one the user silenced — otherwise "I turned it off" and
+"it is broken" are the same picture and the user goes looking for the wrong
+problem.  And the button is **always drawn**, including when audio is
+unavailable: a control that disappears when its subsystem fails leaves nothing
+to point at, and "there is no icon" is not a diagnosis.  That is §M46's
+argument for chrome that keeps working while an app is wedged.
+
+| State | Icon | Verified by |
+|-------|------|-------------|
+| audio present, audible | blue body, two arcs | the flyout's slider renders |
+| muted by the user | blue body, a cross | pixel colour `0x3D6FB8` + white marks |
+| no device / failed | grey body, a red bar | pixel colour `0x5A6478` |
+
+The flyout follows §M65's popup rule — an open popup owns the next click
+wherever it lands, so dismissing it never activates what is behind it — and
+both chrome popups publish their extent through **one** function, because a
+second publisher is a second thing that can forget to clear it.  Dragging the
+slider **unmutes**: reaching for the volume is unambiguous, and leaving it
+muted would look like the control does nothing.  `volume [0..100|mute|unmute|
+toggle]` exists on both shells and came *first* (§M60's rule: a setting with no
+headless path cannot be regression-tested here).
+
+`run_qemu.sh` gained **`--no-audio`** alongside `--empty`/`--no-disk`, because
+the third indicator state *is* that machine and needs to be one flag away.
+
+**Verified by measuring captured audio:** two streams from two tasks at 6000
+and 4000 peak at exactly **10000** — the assertion is an amplitude because that
+is the one thing a mix cannot fake; a test that played two sounds and listened
+for "both" would pass with one silently dropped.  The three earlier
+measurements are unchanged through the new path, playback length is exact at
+200.0 / 300.0 / 600.0 ms, and with `volume 50` + mute the muted run produces
+**no non-silent stretch at all** while the unmuted one peaks at exactly
+**4000 = 8000 × 128/256**.
+
+**Still open:** PCM input, Intel HDA, the AC97 completion interrupt, queueing
+the next period before the current drains (which is what would shrink the
+mixer's ~85 ms latency), and whether `/dev/vda` should be published on ARM (the
 block driver initialises after `devfs_init` there — not chased here).
 
 ### 4.26 Audio — AC97 codec + PCM output (M23, i386)

@@ -53,6 +53,13 @@ enum icon_id {
     ICON_WARN,          /* crash reports                               */
     ICON_CODE,          /* BASIC / code                                */
     ICON_INFO,          /* about                                       */
+    /* §M23 — the taskbar's sound indicator.  THREE states, not two: a device
+     * that is missing or failed must look different from one that is merely
+     * muted, or "I turned it off" and "it is broken" are the same picture and
+     * the user goes looking for the wrong problem. */
+    ICON_VOLUME,        /* audio available, audible                    */
+    ICON_VOLUME_MUTED,  /* audio available, silenced by the user       */
+    ICON_VOLUME_OFF,    /* no device / audio unavailable               */
     ICON__COUNT
 };
 

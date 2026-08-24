@@ -23,6 +23,7 @@
 #include "widget.h"        /* WPTR_* — §M58's pointer phases, shared vocabulary */
 #include "klog.h"          /* a drag must leave evidence on the serial log */
 #include "icons.h"         /* ICON_APP — the item_entry's default glyph */
+#include "audio.h"         /* §M23 — the taskbar sound indicator */
 #include "gfx.h"
 #include "rtc.h"
 #include "keymap.h"
@@ -37,6 +38,16 @@
  * glancing at the corner, not by running a command — and a wrong layout is the
  * single most confusing thing that can happen while typing. */
 #define CLOCK_W     212
+/* §M23 — the sound indicator, immediately left of the clock.  Square, so the
+ * icon renderer gets the box it expects. */
+#define VOL_W       28
+#define VOL_ICON    20
+/* The volume popup: a slider and a mute row.  Deliberately small — this is a
+ * status indicator's flyout, not a settings page.  The Sound page in the
+ * Control Panel is where the full set lives (§M63 renders it from the
+ * CONFIG_KEY descriptors with no per-key UI code). */
+#define VOLPOP_W    180
+#define VOLPOP_H    76
 #define SM_W        210
 #define SM_ITEM_H   26
 /* §M63 — raised from 10.  The Control Panel made it eleven apps, and the cap
@@ -346,6 +357,35 @@ static int menu_hover = -1;
 #define CLOCK_STR_MAX 32
 static char clock_str[CLOCK_STR_MAX] = "";
 
+/* §M23 — sound indicator + its flyout. */
+static int vol_pop_open = 0;
+
+/* The button's box, so draw and hit-test cannot disagree about where it is. */
+static void vol_box(int* x, int* y, int* w, int* h) {
+    *x = scr_w - CLOCK_W - VOL_W;
+    *y = scr_h - TASKBAR_H + (TASKBAR_H - VOL_ICON) / 2;
+    *w = VOL_W;
+    *h = VOL_ICON;
+}
+
+/* Which of the THREE icons applies right now.  The distinction is the whole
+ * point of the control: a machine with no working audio shows a different
+ * glyph from one the user silenced, so "I muted it" and "it is broken" are
+ * never the same picture. */
+static int vol_icon_id(void) {
+    if (!audio_available()) return ICON_VOLUME_OFF;
+    int vol, muted;
+    audio_master_get(&vol, &muted);
+    return (muted || vol == 0) ? ICON_VOLUME_MUTED : ICON_VOLUME;
+}
+
+static int volpop_x(void) {
+    int x = scr_w - CLOCK_W - VOLPOP_W;
+    if (x < 0) x = 0;
+    return x;
+}
+static int volpop_y(void) { return scr_h - TASKBAR_H - VOLPOP_H; }
+
 /* -------------------------------------------------------------------------- */
 /* Geometry helpers shared by draw + hit-test.                                 */
 /* -------------------------------------------------------------------------- */
@@ -361,9 +401,16 @@ static int menu_top(void) { return scr_h - TASKBAR_H - menu_h(); }
 
 /* M22.7-B — tell the compositor the popup's on-screen rect so it composites
  * (and hit-routes) it while open.  Called whenever menu_open changes. */
+/* Tell the compositor which chrome popup is open, so it composites that rect
+ * on top of the windows and routes clicks inside it here.  BOTH popups go
+ * through this one function — a second publisher would be a second thing that
+ * can forget to clear the extent, and a stale extent swallows clicks over a
+ * window for reasons nothing on screen explains. */
 static void publish_popup(void) {
-    if (menu_open) gui_panel_set_popup(1, 4, menu_top(), SM_W, menu_h());
-    else           gui_panel_set_popup(0, 0, 0, 0, 0);
+    if (menu_open)         gui_panel_set_popup(1, 4, menu_top(), SM_W, menu_h());
+    else if (vol_pop_open) gui_panel_set_popup(1, volpop_x(), volpop_y(),
+                                               VOLPOP_W, VOLPOP_H);
+    else                   gui_panel_set_popup(0, 0, 0, 0, 0);
 }
 
 static int tbtn_width(int nslots) {
@@ -469,6 +516,57 @@ static void vista_draw(struct gfx_surface* back) {
                  ty + (TASKBAR_H - GFX_GLYPH_H) / 2, clock_str, COL_TEXT);
     }
 
+    /* §M23 — the sound indicator.  ALWAYS drawn, including when audio is
+     * unavailable: a control that disappears when the subsystem fails leaves
+     * the user with nothing to point at, and "there is no icon" is not a
+     * diagnosis.  That is the same argument §M46 made for chrome that keeps
+     * working while an app is wedged. */
+    {
+        int vx, vy, vw, vh;
+        vol_box(&vx, &vy, &vw, &vh);
+        icon_draw(back, vx + (vw - VOL_ICON) / 2, vy, VOL_ICON, vol_icon_id());
+    }
+
+    /* §M23 — the volume flyout. */
+    if (vol_pop_open) {
+        int px = volpop_x(), py = volpop_y();
+        gfx_fill(back, px, py, VOLPOP_W, VOLPOP_H, COL_SM_BG);
+        gfx_fill(back, px, py, VOLPOP_W, 1, COL_TB_HILITE);
+        gfx_fill(back, px, py, 1, VOLPOP_H, COL_TB_HILITE);
+        gfx_fill(back, px + VOLPOP_W - 1, py, 1, VOLPOP_H, 0xFF141B26u);
+
+        int vol, muted;
+        audio_master_get(&vol, &muted);
+        int pct = (vol * 100) / 256;
+
+        if (!audio_available()) {
+            gfx_text(back, px + 10, py + 12, "No audio device", COL_TEXT);
+            gfx_text(back, px + 10, py + 30, "nothing to play through", COL_TB_HILITE);
+        } else {
+            char line[24];
+            int n = 0;
+            const char* lbl = "Volume ";
+            for (int i = 0; lbl[i]; i++) line[n++] = lbl[i];
+            if (pct >= 100) { line[n++] = '1'; line[n++] = '0'; line[n++] = '0'; }
+            else if (pct >= 10) { line[n++] = (char)('0' + pct / 10); line[n++] = (char)('0' + pct % 10); }
+            else line[n++] = (char)('0' + pct);
+            line[n++] = '%'; line[n] = 0;
+            gfx_text(back, px + 10, py + 10, line, COL_TEXT);
+
+            /* The slider: a track and a filled portion.  Drawn from the SAME
+             * geometry the click handler reads back (vol_track_*), so the
+             * knob cannot end up somewhere the click does not land. */
+            int tx = px + 10, tw = VOLPOP_W - 20, tyy = py + 30;
+            gfx_fill(back, tx, tyy, tw, 6, 0xFF1B2434u);
+            int fill = muted ? 0 : (tw * pct) / 100;
+            gfx_fill(back, tx, tyy, fill, 6, muted ? 0xFF556070u : 0xFF4C8BE0u);
+            gfx_fill(back, tx + (fill ? fill - 2 : 0), tyy - 3, 4, 12,
+                     muted ? 0xFF8B94A6u : COL_TEXT);
+
+            gfx_text(back, px + 10, py + 52, muted ? "[ Unmute ]" : "[ Mute ]", COL_TEXT);
+        }
+    }
+
     /* Start menu overlay. */
     if (menu_open) {
         int mh = menu_h(), myy = menu_top();
@@ -510,8 +608,77 @@ static void vista_motion(int x, int y) {
     }
 }
 
+/* The slider's track, in ONE place: the drawing reads it and so does the hit
+ * test.  Two copies of this arithmetic is how a slider ends up looking right
+ * and responding at the wrong offset. */
+static void vol_track(int* tx, int* ty_, int* tw) {
+    *tx  = volpop_x() + 10;
+    *tw  = VOLPOP_W - 20;
+    *ty_ = volpop_y() + 30;
+}
+
+/* Set the level from a point on the track, and remember it. */
+static void vol_set_from_x(int x) {
+    int tx, tyy, tw;
+    vol_track(&tx, &tyy, &tw);
+    int pct = tw > 0 ? ((x - tx) * 100) / tw : 0;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    int vol, muted;
+    audio_master_get(&vol, &muted);
+    /* Dragging the slider UNMUTES: reaching for the volume is unambiguous
+     * about what the user wants, and leaving it muted would look like the
+     * control does nothing. */
+    audio_master_set((pct * 256) / 100, 0);
+    (void)vol; (void)muted;
+    audio_volume_persist();
+}
+
 static int vista_click(int x, int y) {
     int ty = scr_h - TASKBAR_H;
+
+    /* §M23 — an open volume flyout owns the next click, wherever it lands
+     * (§M65's popup rule): inside it is a choice, outside it is a dismissal,
+     * and in both cases it must not also reach whatever is underneath. */
+    if (vol_pop_open) {
+        int px = volpop_x(), py = volpop_y();
+        int inside = (x >= px && x < px + VOLPOP_W && y >= py && y < py + VOLPOP_H);
+        if (inside && audio_available()) {
+            int tx, tyy, tw;
+            vol_track(&tx, &tyy, &tw);
+            if (y >= tyy - 6 && y <= tyy + 12) {
+                vol_set_from_x(x);
+                gui_request_frame();
+                return 1;                       /* stay open: allow re-aiming */
+            }
+            if (y >= py + 48 && y <= py + 64) { /* the Mute / Unmute row */
+                int vol, muted;
+                audio_master_get(&vol, &muted);
+                audio_master_set(vol, !muted);
+                audio_volume_persist();
+                gui_request_frame();
+                return 1;
+            }
+        }
+        vol_pop_open = 0;
+        publish_popup();
+        gui_request_frame();
+        if (inside) return 1;
+        /* fall through: a click outside only dismissed the flyout */
+    }
+
+    /* The sound button itself. */
+    {
+        int vx, vy, vw, vh;
+        vol_box(&vx, &vy, &vw, &vh);
+        if (x >= vx && x < vx + vw && y >= scr_h - TASKBAR_H) {
+            vol_pop_open = !vol_pop_open;
+            menu_open = 0;                       /* one popup at a time */
+            publish_popup();
+            gui_request_frame();
+            return 1;
+        }
+    }
 
     /* Open menu gets first pick. */
     if (menu_open) {
