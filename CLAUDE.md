@@ -20,6 +20,61 @@ focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M23 STAGE 2 — A WAV PLAYER, AND THE TWO SILENT TRUNCATIONS UNDER IT
+(2026-08-24, DOCS §4.26.1, i386 + x86_64 measured, all 3 arches build).**
+`play <path.wav>` — and before it could exist, two things in the stage-1 path
+had to stop lying.  **THE DRIVER WAITED BY SPINNING:** `ac97_play` sat in
+`hal_cpu_pause()` for the ENTIRE duration of the sound — three seconds of audio
+burned three seconds of a CPU, and on a UP box the only one.  *§M49's, §M55's
+and §M56's lesson for the THIRD time — waiting must not cost the same as
+computing* — and it survived because the only caller was a beep short enough
+that nobody noticed.  It sleeps now against a REAL-TIME deadline from the
+buffer's own duration (a wedged device costs a bounded wait, not a hung shell);
+**deliberately not an interrupt yet** — AC97's IOC would replace the poll with a
+waitq exactly as §M55 did for the NIC, and that is written down as the next step
+*because unlike the spin, a sleeping poll is already CORRECT, merely coarse*.
+**TWO SILENT TRUNCATIONS, THE SAME SHAPE ONE LAYER APART:** `ac97_play` clamped
+to its DMA buffer and returned SUCCESS, and `audio_play_tone` clamped to its
+render buffer and returned success — so **`tone 440 3000` played 666 ms and said
+nothing about the missing two and a third seconds.**  Invisible while the only
+caller is a beep that fits; silent data loss the moment anything streams.
+`play` returns the frames it ACTUALLY consumed (a short count is the normal
+case), `audio_play_pcm` is the loop every caller would otherwise write and get
+wrong its own way, and the tone renders in chunks **carrying phase and level
+across them** — restarting per buffer is an audible click twice a second plus a
+dropped partial half-period each time.  **THE PLAYER STREAMS, NEVER LOADS** (one
+input block, one output block, both static: a four-minute song is ~40 MB of PCM
+— §M60's wallpaper argument, worse); RIFF chunks are skipped by DECLARED LENGTH
+so LIST/INFO/fact are not parse errors, and a non-PCM format is **REFUSED BY
+NAME** — *feeding compressed bytes to a DAC is exactly what noise sounds like.*
+**THREE CONVERSIONS, EACH A WAY TO BE SILENTLY WRONG:** 8-bit WAV samples are
+UNSIGNED (biased around 128 — treating them as signed is a classic, very audible
+bug); **mono is DUPLICATED** (played into one side it sounds like a broken
+speaker and every listener blames the hardware); and rate conversion is
+NEAREST-SAMPLE **and says so** — not band-limited, aliases on a big ratio, but
+the alternative is refusing every file that is not already 48 kHz *and most WAV
+files in the world are 44.1*.  The fixed-point accumulator **carries across
+blocks and is never re-derived from a block index** — §M53's periodic-timer
+lesson in a different costume, where re-deriving accumulates one rounding error
+per block into audible drift.  **VERIFIED BY MEASURING THE CAPTURED AUDIO, NOT
+BY LISTENING** — the test file is written BY THE GUEST (`play testwav`, §M60's
+rule) and is deliberately NOT the device's format (22050 Hz, mono, 8-bit),
+*because a file that already matched the DAC would exercise none of the three
+conversions*: through `-audiodev wav`, **498.9 ms for 498 asked, amplitude
+exactly ±18432 (= (200-128)<<8, so the 8-bit bias is right), 440.0 Hz by zero
+crossing (the resampler preserves pitch), L == R on all 22001 frames (mono
+really was duplicated)** — and the spin fix has its own number from the playing
+task's own `cpu_ms`: **3000 ms of audio costs 204 ms of CPU (1 → 204); spinning
+it would have been ~3000**, with the full three seconds now arriving (3000.0 ms
+captured where the old clamp gave 666) at an unchanged 444 Hz, *which is what
+proves the phase carried across all five chunk boundaries.*  `play`/`lsaudio`
+live in `audio.c` and are wired into the aarch64 serial REPL too (§M24's rule):
+**that arch has the audio CORE and no audio DEVICE**, so they answer `no audio
+devices` — the honest failure, better than "unknown command" telling the user
+the feature does not exist.  **OPEN:** `/dev/dsp` (stage 3, raw PCM from ring
+3), mixer/multi-stream, PCM input, Intel HDA, the AC97 completion interrupt, and
+**virtio-sound for aarch64 — the remaining arch asymmetry.**
+
 ✅ **§M64 TAIL — A DESKTOP YOU CAN ARRANGE, AND THE PERSISTENCE IT ONLY CLAIMED
 (2026-08-23, DOCS §4.79, all 3 arches build, i386 driven).**  §M64's three open
 items closed — and the second thing closed was not on the list.  **A POSITION IS

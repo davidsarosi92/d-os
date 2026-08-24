@@ -62,6 +62,7 @@ when sections are added.)
 | 4.23 | cron — time-based task scheduling (M30) | 2699 |
 | 4.24 | Concurrent user processes + full-arch libc (Tier B — M25 tail) | 2732 |
 | 4.25 | Networking — virtio-net + TCP/IP stack (M24, i386) | 2783 |
+| 4.26.1 | Audio stage 2 — WAV player, blocking playback (§M23) | 2907 |
 | 4.26 | Audio — AC97 codec + PCM output (M23, i386) | 2877 |
 | 4.27 | POSIX process model — fork/exec/wait/pipe/signals (M34, i386) | 2925 |
 | 4.28 | Threads + futex (M35, i386) | 3010 |
@@ -2903,6 +2904,74 @@ machine; a listening (server) role; DHCP; IPv6; `/proc/net/*`;
 x86_64/aarch64 ports.
 
 ---
+
+### 4.26.1 Audio stage 2 — a WAV player, and the two silent truncations under it (§M23)
+
+**2026-08-24.**  `play <path.wav>`.  Getting there meant fixing two things in
+the stage-1 path that were true-looking and wrong.
+
+**The driver waited by SPINNING.**  `ac97_play` sat in `hal_cpu_pause()` for
+the entire duration of the sound: three seconds of audio burned three seconds
+of a CPU, and on a uniprocessor box the only one.  That is §M49's, §M55's and
+§M56's lesson for the third time — *waiting must not cost the same as
+computing* — and it survived because the only caller was a beep short enough
+that nobody noticed.  It sleeps now, against a real-time deadline derived from
+the buffer's own duration, so a wedged device costs a bounded wait rather than
+a hung shell.  **Deliberately not an interrupt yet:** AC97 can raise IOC on
+buffer completion and wiring it would replace the poll with a waitq exactly as
+§M55 did for the NIC — the next step, written down, because unlike the spin a
+sleeping poll is already *correct*, merely coarse.
+
+**Two silent truncations, the same shape one layer apart.**  `ac97_play`
+clamped to its DMA buffer and returned success; `audio_play_tone` clamped to
+its render buffer and returned success — so `tone 440 3000` played **666 ms**
+and said nothing about the missing two and a third seconds.  Invisible while
+the only caller is a beep that fits, and silent data loss the moment anything
+streams.  `play` returns the frames it actually consumed (a short count is
+normal), `audio_play_pcm` is the loop every caller would otherwise write, and
+the tone renders in chunks **carrying phase and level across them** — restart
+per buffer and you get an audible click roughly twice a second plus a dropped
+partial half-period each time.
+
+**The player streams, never loads.**  One input block and one output block,
+both static and small: a four-minute song is ~40 MB of PCM, which is not a
+thing to hold in kernel memory (§M60's argument about a 9 MB wallpaper, worse).
+RIFF chunks are skipped by declared length, so LIST/INFO/fact between `fmt `
+and `data` are not parse errors; a non-PCM format is **refused by name** rather
+than played, because feeding compressed bytes to a DAC is what noise is.
+
+| Conversion | Why it is a trap |
+|-----------|------------------|
+| 8-bit → 16-bit | WAV 8-bit samples are **unsigned**, biased around 128; treating them as signed is a classic, very audible bug |
+| mono → stereo | duplicated to both channels — played into one side it sounds like a broken speaker and the listener blames the hardware |
+| rate → device rate | **nearest-sample**, and says so; not band-limited, will alias on a big ratio.  The alternative is refusing every file that is not already 48 kHz, and most WAV files are 44.1 |
+
+The resampler's fixed-point accumulator **carries across blocks and is never
+re-derived from a block index** — §M53's periodic-timer lesson in a different
+costume; re-deriving accumulates one rounding error per block into audible
+drift.
+
+**Verified by measuring the captured audio, not by listening.**  The test file
+is written BY THE GUEST (`play testwav`, §M60's rule) and is deliberately *not*
+the device's format — 22050 Hz, mono, 8-bit — because a file that already
+matched the DAC would exercise none of the three conversions.  Captured through
+QEMU's `-audiodev wav` on i386 and x86_64:
+
+| Measurement | Result | What it proves |
+|-------------|--------|----------------|
+| duration | 498.9 ms for 498 ms asked | the stream reaches the end |
+| amplitude | exactly ±18432 | `(200-128)<<8` — the 8-bit bias is handled |
+| frequency | 440.0 Hz by zero crossing | the resampler preserves pitch |
+| channels | L == R on all 22001 frames | mono really was duplicated |
+| `tone 440 3000` | 3000.0 ms captured, 444 Hz | the chunked tone carries phase (was 666 ms) |
+| playing task's `cpu_ms` | 1 → 204 for 3000 ms of audio | the spin is gone; it would have been ~3000 |
+
+`play`/`lsaudio` live in `audio.c` and are wired into the aarch64 serial REPL
+too (§M24's rule).  **That arch has the audio core and no audio device**, so
+they answer `no audio devices` — the honest failure, better than "unknown
+command" implying the feature does not exist.  **virtio-sound is the remaining
+arch asymmetry**, and `/dev/dsp` (stage 3, raw PCM from ring 3), the mixer and
+PCM input remain open.
 
 ### 4.26 Audio — AC97 codec + PCM output (M23, i386)
 
@@ -8961,6 +9030,19 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-24 — §M23 stage 2: a WAV player, and the two silent truncations
+  under it (DOCS §4.26.1).**  `play <path.wav>`, streamed rather than loaded.
+  The driver had been waiting by SPINNING — three seconds of audio burned three
+  seconds of a CPU, §M49/§M55/§M56's lesson for the third time — and both the
+  driver and the tone generator clamped to their buffers and returned SUCCESS,
+  so `tone 440 3000` played 666 ms silently.  `play` now reports the frames it
+  consumed, the tone renders in chunks carrying phase, and the player handles
+  the three conversions that can each be silently wrong (8-bit is UNSIGNED,
+  mono must be duplicated, rate conversion is nearest-sample and says so).
+  Verified by MEASURING the captured audio on i386 and x86_64: 498.9 ms for 498
+  asked, amplitude exactly ±18432, 440.0 Hz by zero crossing, L == R on every
+  frame; and 3000 ms of audio now costs 204 ms of CPU instead of ~3000.
 
 - **2026-08-23 — §M64 tail: a desktop you can arrange (DOCS §4.79).**  Drag an
   icon, walk the field with the arrow keys, open with Enter, and send a file

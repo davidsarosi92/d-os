@@ -51,7 +51,7 @@
 | §M22.5 | Desktop apps — editor, BASIC, file manager 2.0, maximize | ~1557 |
 | §M22.6 | Tear-free present (page flip) + display scaling | ~1587 |
 | §M22.7 | Per-task GUI apps + panel-as-task — ✅ shipped | ~1660 |
-| §M23 | Audio subsystem — ✅ stage 1 (i386): AC97 PCM output + tone (DOCS §4.26) | ~1040 |
+| §M23 | Audio subsystem — ◐ stage 1 + stage 2 (i386 + x86_64): AC97 PCM output, tone, WAV player (DOCS §4.26, §4.26.1) | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) — ✅ stages 1–3 (i386): virtio-net + ARP/IPv4/ICMP/UDP/TCP + DNS + ping/wget (DOCS §4.25) | ~1080 |
 | §M25 | Userland foundation (Wayland prerequisites) — ✅ stages 1–7 + Tier B tail (concurrent user processes + full-arch libc; DOCS §4.24) | ~1545 |
 | §M26 | Wayland server (wire protocol on M22 + M25) — ✅ core + integration (i386+x86_64, DOCS §4.32): handshake + shm buffers (SCM_RIGHTS) + xdg_shell + framebuffer/gui_window bridge + wl_seat input + a real ring-3 client + **server-per-surface** (`waycomp`: a client's toplevel IS a desktop window, input routed to its wl_seat) + a **mini-libwayland client lib** (`user/libwl`, `wayapp`). Upstream libwayland + unmodified apps landed in §M40 | ~1615 |
@@ -247,7 +247,7 @@ what); a session can pick a theme and push on it.
 | M22.5 | Desktop apps — text editor, BASIC interpreter, file manager 2.0, maximize/restore | UX | ✅ DOCS §4.13 |
 | M22.6 | Tear-free present — Bochs-VBE page flip + display-scaling fix | UX | ✅ DOCS §4.13 |
 | M22.7 | Per-task GUI apps (each WIN_APP on its own task) + panel-as-task | UX | ✅ DOCS §4.16 |
-| M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | §M23    |
+| M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | ◐ stage 1 (DOCS §4.26) + stage 2 WAV player, blocking playback, honest frame counts (DOCS §4.26.1).  Open: /dev/dsp, mixer, input, HDA, **virtio-sound for aarch64** |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | ✅ DOCS §4.25 + §4.59 (complete: connection table, server role, retransmit, DHCP, /proc/net, all 3 arches) |
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | ✅ §M25 (stages 1–7) + Tier B (concurrent user processes + full-arch libc, DOCS §4.24) |
 | M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | §M26 |
