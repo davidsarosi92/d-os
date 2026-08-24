@@ -20,6 +20,56 @@ focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M23 STAGE 4 + THE TASKBAR SOUND INDICATOR (2026-08-24, DOCS §4.26.1, all
+3 arches).**  **A MIXER**, because a sound USED TO OWN THE DEVICE for its whole
+duration — `play` and a second program could not both be heard.  Every source
+opens a STREAM now; ONE pump task owns the device and mixes what is active into
+each period, running exactly while somebody has audio and fully blocked
+otherwise (§M55's shape).  Streams are single-producer/single-consumer so a ring
+needs no lock.  **MIXING SATURATES** — *a wrap turns the loudest instant into
+white noise, and only when two things overlap: maximally audible, maximally
+confusing.*  **THE BUG I WROTE, AND WHERE IT WAS ALREADY WRITTEN DOWN:**
+`waitq.h` states the discipline in its own header — hold the lock, LOOP on the
+condition, unlock after, and **`waitq_block` RE-ACQUIRES the lock before
+returning**.  I treated it as returning unlocked and `continue`d back into
+`waitq_lock` = *a task deadlocking against itself with interrupts masked*; I
+also called `waitq_wake_all` unlocked in three places, which the same header
+forbids in capitals.  It surfaced as an **NMI HARD LOCKUP in `hal_cpu_pause`**
+and §4.67.1's watchdog **named the wedged CPU correctly — the diagnostic built
+for exactly this paid for itself.**  **THE PERIOD SIZE IS MEASURED, NOT CHOSEN:**
+the device stops between periods (one BDL entry per call), so each boundary is a
+gap the capture fills by holding the last sample — at 2048 frames *300 ms came
+back as 323 ms at 411 Hz instead of 443*; 4096 measures clean.  **MASTER VOLUME
++ MUTE** applied ONCE to the finished mix (*the system volume must not change
+the balance between two things playing*), and **MUTE IS NOT VOLUME 0** — stored
+separately so unmuting restores the level the user chose; a muted mix still
+produces frames so the device keeps its timing.  A §M63 setting
+(`audio.volume`/`audio.muted`), so the Control Panel gets it with no per-key UI
+code.  **THE TASKBAR INDICATOR, asked for from use: THREE ICONS, NOT TWO** — a
+missing/failed device shows a DIFFERENT glyph from a user-silenced one,
+*otherwise "I turned it off" and "it is broken" are the same picture and the
+user goes looking for the wrong problem* — and the button is **ALWAYS DRAWN**,
+because *a control that disappears when its subsystem fails leaves nothing to
+point at, and "there is no icon" is not a diagnosis* (§M46's argument for chrome
+that survives a wedged app).  Icons are DRAWN from primitives (§M64).  The
+flyout obeys §M65's popup rule, **both chrome popups publish through ONE
+function** (*a second publisher is a second thing that can forget to clear the
+extent, and a stale extent swallows clicks over a window*), and the slider's
+track geometry lives in ONE place that draw and hit-test both read.  Dragging
+UNMUTES.  `run_qemu.sh` gained **`--no-audio`** — *the third indicator state IS
+that machine, and a state nobody can boot into is a state nobody has tested.*
+**VERIFIED BY MEASURING AUDIO AND READING PIXELS:** two streams from two TASKS
+at 6000+4000 peak at **exactly 10000** (*an amplitude is the one thing a mix
+cannot fake; a test that played two sounds and listened for "both" would pass
+with one silently dropped*); playback length exact at 200.0/300.0/600.0 ms; with
+`volume 50`+mute the muted run gives **no non-silent stretch at all** and the
+unmuted one peaks at **4000 = 8000×128/256**; no device → grey button
+(0x5A6478) + "No audio device"; muted → blue (0x3D6FB8) + cross, logging
+`master 256/256 (muted)` (**the level PRESERVED, not zeroed**).  **OPEN:** PCM
+input, Intel HDA, the AC97 completion IRQ, queueing the next period before the
+current drains (what would shrink the ~85 ms latency), and whether `/dev/vda`
+should be published on ARM.
+
 ✅ **§M23 STAGE 2 — A WAV PLAYER, AND THE TWO SILENT TRUNCATIONS UNDER IT
 (2026-08-24, DOCS §4.26.1, i386 + x86_64 measured, all 3 arches build).**
 `play <path.wav>` — and before it could exist, two things in the stage-1 path
