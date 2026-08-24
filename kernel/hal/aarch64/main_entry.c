@@ -44,6 +44,7 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "block_cache.h"
 #include "config.h"          /* §M63 stage 0 — config_attach_persistent */
 #include "shortcut.h"        /* §M64 tail — shortcut_attach_persistent */
+#include "gui.h"             /* gui_autostart — was an IMPLICIT declaration */
 #include "vc.h"
 #include "shell_provider.h"
 #include "service.h"
@@ -68,6 +69,7 @@ int      virtio_mmio_net_init(void); /* virtio_mmio_net.c — §M24 NIC         
 void     net_procfs_init(void);      /* net.c — the /proc/net files            */
 int      virtio_gpu_init(void);      /* virtio_gpu.c — Phase I framebuffer     */
 int      virtio_input_init(void);    /* virtio_input.c — Phase J kbd + mouse   */
+int      virtio_snd_init(void);      /* virtio_snd.c — §M23 stage 2, ARM audio  */
 void     keymap_init(void);          /* keymap.c — select the default layout   */
 void     driver_init_all(void);      /* driver.c — probe DRIVER()s (xHCI)       */
 void     xhci_poll(void);            /* xhci.c — poll the USB event/HID rings   */
@@ -311,6 +313,7 @@ void aarch64_main_entry(uint64_t dtb) {
          * fix is converging the two entry paths. */
         pkg_init();
         virtio_input_init();                    /* keyboard + mouse (prints to serial) */
+        virtio_snd_init();                      /* §M23 — audio, if a device is attached */
         struct vc* root = vc_root();
         if (root) {
             /* §M49 — VC bound by the spawn, not after it (SMP race). */
@@ -340,6 +343,12 @@ void aarch64_main_entry(uint64_t dtb) {
          * is idempotent, which is what makes duplicating it safe — but the real
          * fix is converging the two entry paths. */
         pkg_init();
+        /* §M23 — AND HERE TOO.  The comment above this branch's pkg_init call
+         * is a warning written from experience: the framebuffer branch is the
+         * one that gets patched and the headless one silently does without.
+         * Audio has nothing to do with having a display, so a serial-only boot
+         * must find the sound device exactly as a graphical one does. */
+        virtio_snd_init();
         kprintf("aarch64: no framebuffer — UART serial shell (pid 0 → idle).\n");
         if (!task_spawn("shell", serial_shell_entry))
             kprintf("aarch64: FATAL — failed to spawn serial shell\n");

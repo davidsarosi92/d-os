@@ -372,7 +372,8 @@ static int audio_write_testwav(const char* path, uint32_t freq, uint32_t ms) {
     #undef P16
     if (wav_put(f, h, 44) != 0) { vfs_close(f); return -1; }
 
-    uint32_t half = rate / (freq * 2 ? freq * 2 : 1);
+    if (!freq) freq = 440;                         /* never divide by zero */
+    uint32_t half = rate / (freq * 2);
     if (!half) half = 1;
     uint8_t blk[512];
     uint32_t phase = 0, written = 0;

@@ -98,6 +98,29 @@ dos_format_disk() {
 # attach, or nothing.  Never fails the run: a machine that will not boot
 # because its optional disk could not be formatted is a worse outcome than one
 # that boots without persistence and says so.
+# -----------------------------------------------------------------------------
+# §M23 — THE SOUND CARD, on the path a PERSON runs.
+#
+# This script attached no audio device at all, so `lsaudio` on an everyday boot
+# printed nothing and `play`/`tone` had nothing to play into — while every audio
+# TEST passed its own `-device`.  That is the fifth time this exact shape has
+# appeared here (§M48's missing NIC, §M49's missing -smp, §4.66's missing disk,
+# §4.67.1's watchdog/VGA): the measured machine and the used machine were
+# different machines.
+#
+# The BACKEND is host-specific and cannot be guessed portably, so it is chosen
+# from `uname` with an escape hatch that matches the one storage already has
+# (`DOS_DISK=none`): DOS_AUDIO=none boots with no sound card on purpose, and
+# DOS_AUDIO=<backend> forces one.
+# -----------------------------------------------------------------------------
+dos_audio_backend() {
+    if [ -n "${DOS_AUDIO:-}" ]; then echo "$DOS_AUDIO"; return; fi
+    case "$(uname -s)" in
+        Darwin) echo coreaudio ;;
+        *)      echo pa ;;
+    esac
+}
+
 dos_prepare_disk() {
     _p="$1"
     case "$DISK_MODE" in
@@ -167,6 +190,16 @@ if [ "$ARCH" = "aarch64" ]; then
         -device virtio-mouse-device \
         -global virtio-mmio.force-legacy=false"
 
+    # §M23 — the sound card, for the same reason as the NIC and the display
+    # above.  This arch has no AC97 (that is a PCI card and `virt` has no PCI
+    # slot for it), so the device is virtio-sound on a virtio-MMIO slot — the
+    # same way this machine gets every other device.
+    AUDIO_BACKEND=$(dos_audio_backend)
+    if [ "$AUDIO_BACKEND" != "none" ]; then
+        QEMU_MACHINE="$QEMU_MACHINE -audiodev $AUDIO_BACKEND,id=snd0 \
+            -device virtio-sound-device,audiodev=snd0"
+    fi
+
     # Storage, through the SAME three switches the x86 arches use (see the top
     # of the file).  Until this was shared, ARM attached a disk only if one
     # happened to exist and nothing ever created it — so the arch where the
@@ -203,6 +236,7 @@ if [ "$ARCH" = "aarch64" ]; then
 fi
 
 ISO=build/$ARCH/d-os.iso
+
 case "$ARCH" in
     i386)   QEMU=qemu-system-i386 ;;
     x86_64) QEMU=qemu-system-x86_64 ;;
@@ -257,6 +291,11 @@ if command -v "$QEMU" >/dev/null 2>&1; then
     # NAT gateway and DNS at 10.0.2.3 — which is exactly what /etc/resolv.conf
     # is provisioned for.
     EXTRA="$EXTRA -netdev user,id=net0 -device virtio-net-pci,netdev=net0"
+    # §M23 — AC97, the codec both x86 arches drive.
+    AUDIO_BACKEND=$(dos_audio_backend)
+    if [ "$AUDIO_BACKEND" != "none" ]; then
+        EXTRA="$EXTRA -audiodev $AUDIO_BACKEND,id=snd0 -device AC97,audiodev=snd0"
+    fi
     if [ "$(uname -s)" = "Darwin" ]; then
         EXTRA="$EXTRA -display cocoa,zoom-to-fit=off"
     fi

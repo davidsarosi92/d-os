@@ -247,7 +247,7 @@ what); a session can pick a theme and push on it.
 | M22.5 | Desktop apps — text editor, BASIC interpreter, file manager 2.0, maximize/restore | UX | ✅ DOCS §4.13 |
 | M22.6 | Tear-free present — Bochs-VBE page flip + display-scaling fix | UX | ✅ DOCS §4.13 |
 | M22.7 | Per-task GUI apps (each WIN_APP on its own task) + panel-as-task | UX | ✅ DOCS §4.16 |
-| M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | ◐ stage 1 (DOCS §4.26) + stage 2 WAV player, blocking playback, honest frame counts (DOCS §4.26.1).  Open: /dev/dsp, mixer, input, HDA, **virtio-sound for aarch64** |
+| M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | ◐ stage 1 (DOCS §4.26) + stage 2 WAV player, blocking playback, honest frame counts (DOCS §4.26.1).  **All 3 arches** (virtio-sound on ARM).  Open: /dev/dsp, mixer, input, HDA, AC97 IRQ |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | ✅ DOCS §4.25 + §4.59 (complete: connection table, server role, retransmit, DHCP, /proc/net, all 3 arches) |
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | ✅ §M25 (stages 1–7) + Tier B (concurrent user processes + full-arch libc, DOCS §4.24) |
 | M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | §M26 |

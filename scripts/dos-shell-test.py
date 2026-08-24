@@ -173,10 +173,19 @@ def qemu_argv(a, sersock, monsock):
             # here at all, and "aarch64 declines" stayed true by accident.
             # The keyboard comes with it: a framebuffer boot puts the shell on
             # a VC, and `sendkey` needs a device to arrive through.
-            "-device", "virtio-gpu-device",
-            "-device", "virtio-keyboard-device",
-            "-device", "virtio-mouse-device",
         ]
+        # ...unless the test wants the OTHER boot path.  aarch64 has two:
+        # with a framebuffer it runs the full shell.c on a VC, without one it
+        # runs serial_shell.c as a REPL on the PL011 — different shells, and
+        # only the second one answers on the wire the harness reads.  Leaving
+        # the GPU permanently attached made the serial path untestable, which
+        # is the same shape as the bug the comment above describes.
+        if not a.no_display:
+            argv += [
+                "-device", "virtio-gpu-device",
+                "-device", "virtio-keyboard-device",
+                "-device", "virtio-mouse-device",
+            ]
         # --disk used to be honoured on x86 ONLY, silently: the flag was
         # accepted, the ARM guest simply never saw a disk, and anything that
         # needed persistent storage "failed" on this arch for no visible
@@ -244,6 +253,11 @@ def main():
                     metavar="PATH",
                     help="attach a freshly formatted, EMPTY 64 MiB exFAT disk "
                          "(default path: build/<arch>/test-empty.img)")
+    ap.add_argument("--no-display", action="store_true",
+                    help="aarch64 only: attach no virtio-gpu, so the guest "
+                         "boots the SERIAL shell (serial_shell.c) instead of "
+                         "the framebuffer one — the only way to drive that "
+                         "path, and the only way to read its output")
     ap.add_argument("--log", default="")
     ap.add_argument("--monitor-cmd", action="append", default=[],
                     help="a raw QEMU monitor command to run after the shell "

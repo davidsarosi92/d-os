@@ -71,9 +71,31 @@ proves the phase carried across all five chunk boundaries.*  `play`/`lsaudio`
 live in `audio.c` and are wired into the aarch64 serial REPL too (§M24's rule):
 **that arch has the audio CORE and no audio DEVICE**, so they answer `no audio
 devices` — the honest failure, better than "unknown command" telling the user
-the feature does not exist.  **OPEN:** `/dev/dsp` (stage 3, raw PCM from ring
-3), mixer/multi-stream, PCM input, Intel HDA, the AC97 completion interrupt, and
-**virtio-sound for aarch64 — the remaining arch asymmetry.**
+the feature does not exist.  **AND THE ARCH ASYMMETRY IS CLOSED: aarch64 HAS A SOUND DEVICE NOW**
+(`virtio_snd.c`) — AC97 is a PCI card and `-M virt` has no slot for one, so ARM
+had the core, the commands and NO DEVICE, which reads as *"sound is an x86
+feature here"*.  virtio-sound over virtio-MMIO, the same way this machine gets
+every other device.  **TWO THINGS WORTH CARRYING:** a TX message is a THREE-part
+descriptor chain (device-READABLE header + payload, device-WRITABLE status) —
+merge them or drop `VRING_DESC_F_WRITE` and the device REJECTS the buffer, *which
+is silence with no error anywhere*; and **the stream count comes from CONFIG
+SPACE, do not assume one** — the first version asked for a fixed four and got
+`BAD_MSG` (0x8001), because per spec a query past the available items is
+MALFORMED, not merely optimistic.  *It failed cleanly only because the status was
+CHECKED — an unchecked request would have left the info buffer zeroed and picked
+"stream 0, direction 0": silently right on this device and wrong on the next.*
+**MEASURED ON ARM THROUGH THE SAME ANALYSIS AS x86** — 399.1 ms for 399 asked,
+±18432, 439.7 Hz, L == R — *three arches, one file, the same audio.*  **PLUS THE
+FIFTH APPEARANCE OF THE HARNESS SHAPE:** `run_qemu.sh` attached NO audio device,
+so an everyday boot had no sound card while every audio TEST passed its own
+`-device` (§M48 NIC, §M49 -smp, §4.66 disk, §4.67.1 watchdog/VGA — now this).
+Both arches get one, `DOS_AUDIO=none` is the deliberate escape (matching
+`DOS_DISK=none`); and `dos-shell-test.py` gained **`--no-display`**, because
+aarch64 has TWO boot paths (framebuffer → full `shell.c` on a VC; none →
+`serial_shell.c` on the PL011) and with the GPU permanently attached *the serial
+one could not be driven or read at all.*  **OPEN:** `/dev/dsp` (stage 3, raw PCM
+from ring 3), mixer/multi-stream, PCM input, Intel HDA, the AC97 completion
+interrupt.
 
 ✅ **§M64 TAIL — A DESKTOP YOU CAN ARRANGE, AND THE PERSISTENCE IT ONLY CLAIMED
 (2026-08-23, DOCS §4.79, all 3 arches build, i386 driven).**  §M64's three open

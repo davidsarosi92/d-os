@@ -544,6 +544,7 @@ else ifeq ($(ARCH),aarch64)
     kernel/hal/aarch64/virtio_mmio_net.c \
       kernel/hal/aarch64/virtio_gpu.c \
       kernel/hal/aarch64/virtio_input.c \
+      kernel/hal/aarch64/virtio_snd.c \
       kernel/hal/aarch64/pl031_rtc.c \
       kernel/hal/aarch64/dtb.c \
       kernel/hal/aarch64/serial_shell.c \

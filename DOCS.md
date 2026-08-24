@@ -2967,11 +2967,50 @@ QEMU's `-audiodev wav` on i386 and x86_64:
 | playing task's `cpu_ms` | 1 → 204 for 3000 ms of audio | the spin is gone; it would have been ~3000 |
 
 `play`/`lsaudio` live in `audio.c` and are wired into the aarch64 serial REPL
-too (§M24's rule).  **That arch has the audio core and no audio device**, so
-they answer `no audio devices` — the honest failure, better than "unknown
-command" implying the feature does not exist.  **virtio-sound is the remaining
-arch asymmetry**, and `/dev/dsp` (stage 3, raw PCM from ring 3), the mixer and
-PCM input remain open.
+too (§M24's rule).
+
+#### aarch64 gets a sound device: virtio-sound
+
+AC97 is a PCI card and QEMU's `-M virt` has no slot for one, so this
+architecture had the audio core, the commands, and **no device** — `lsaudio`
+printed nothing, and the honest reading of that is "sound is an x86 feature
+here".  `kernel/hal/aarch64/virtio_snd.c` is the ARM answer, for the same
+reason virtio-gpu, virtio-input and virtio-net were: on `virt`, the way a
+device arrives is a virtio-MMIO slot.
+
+Playing a sound there is a **conversation, not a register write** — `PCM_INFO`
+to describe the streams, `SET_PARAMS`, `PREPARE`, `START`, then TX buffers.
+Two things are worth carrying forward:
+
+- **A TX message is a three-part descriptor chain**: a device-*readable*
+  header carrying the stream id, the device-*readable* PCM payload, and a
+  device-*writable* status.  Merge the status into the header descriptor, or
+  forget `VRING_DESC_F_WRITE` on it, and the device rejects the buffer —
+  which is silence with no error anywhere.
+- **The stream count comes from config space; do not assume one.**  The first
+  version queried a fixed four streams and the device answered
+  `VIRTIO_SND_S_BAD_MSG` (0x8001): per spec, a query running past the
+  available items is *malformed*, not merely optimistic.  It failed cleanly
+  only because the status code was checked — an unchecked request would have
+  left the info buffer zeroed and picked "stream 0, direction 0", i.e.
+  silently the right answer on this device and the wrong one on the next.
+
+**Measured on aarch64 through the same analysis as x86** — 399.1 ms for 399
+asked, amplitude ±18432, 439.7 Hz, L == R — so the three architectures produce
+the same audio from the same file.
+
+Two harness-shaped findings came with it.  **`run_qemu.sh` attached no audio
+device at all**, so an everyday boot had no sound card while every audio test
+passed its own `-device`: the *fifth* appearance of this exact shape (§M48's
+NIC, §M49's `-smp`, §4.66's disk, §4.67.1's watchdog/VGA).  Both arches get one
+now, with `DOS_AUDIO=none` as the deliberate escape, matching `DOS_DISK=none`.
+And `dos-shell-test.py` gained **`--no-display`**: aarch64 has *two* boot paths
+— with a framebuffer it runs the full `shell.c` on a VC, without one it runs
+`serial_shell.c` on the PL011 — and with the GPU permanently attached the
+serial path could not be driven or read at all.
+
+**Still open:** `/dev/dsp` (stage 3, raw PCM from ring 3), the mixer and
+multiple streams, PCM input, Intel HDA, and the AC97 completion interrupt.
 
 ### 4.26 Audio — AC97 codec + PCM output (M23, i386)
 
