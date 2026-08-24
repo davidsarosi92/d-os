@@ -11,6 +11,10 @@
 #include "devfs.h"
 #include "task.h"      /* task_msleep — the /dev/dsp writer waits its turn */
 #include "timer.h"
+#include "waitq.h"
+#include "lock.h"
+#include "config.h"
+#include "settings.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -70,6 +74,10 @@ int audio_play_tone(uint32_t freq, uint32_t ms) {
      * put a discontinuity at every boundary — an audible click roughly twice a
      * second, and a frequency that is subtly wrong because the last partial
      * half-period is dropped each time. */
+    /* Through a STREAM, like every other source — so a tone no longer owns
+     * the device and can be heard over whatever else is playing. */
+    struct audio_stream* st = audio_stream_open("tone");
+    if (!st) return -1;
     uint32_t done = 0;
     while (done < want) {
         uint32_t n = want - done;
@@ -79,10 +87,10 @@ int audio_play_tone(uint32_t freq, uint32_t ms) {
             g_tone[f * 2 + 1] = level;         /* right                       */
             if (++phase >= half) { phase = 0; level = (int16_t)-level; }
         }
-        int rc = audio_play_pcm(dev, g_tone, n);
-        if (rc != 0) return rc;
+        if (audio_stream_write(st, g_tone, n) < (int)n) break;
         done += n;
     }
+    audio_stream_close(st);                    /* drains before returning     */
     return 0;
 }
 
@@ -101,6 +109,278 @@ int audio_play_pcm(struct audio_dev* dev, const int16_t* frames, uint32_t nframe
         done += (uint32_t)n;
     }
     return 0;
+}
+
+/* ===========================================================================
+ * Streams + the mixer (§M23 stage 4).  See audio.h for why this exists.
+ * =========================================================================== */
+
+#define MIX_STREAMS      8
+/* Frames per mix pass.  ~85 ms at 48 kHz, and the size is MEASURED rather than
+ * chosen for tidiness: the device is stopped between periods (one BDL entry
+ * per call today), so every period boundary is a small gap, and QEMU's capture
+ * holds the last sample across it.  At 2048 the stretch was visible —
+ * 300 ms of square wave came back as 323 ms at 411 Hz instead of 443 — while
+ * 4096 measures clean.  The real fix is queueing the next buffer before the
+ * current one drains (the AC97 BDL has 32 entries and we use one); until then
+ * this is the trade, and it costs latency, not correctness. */
+#define MIX_PERIOD       4096
+#define STREAM_FRAMES    16384                 /* ring depth, ~341 ms at 48 k  */
+#define STREAM_MASK      (STREAM_FRAMES - 1)   /* power of two: index by AND   */
+
+struct audio_stream {
+    int      used;
+    char     name[16];
+    int16_t  ring[STREAM_FRAMES * 2];
+    /* SINGLE producer, SINGLE consumer: the writer owns `head`, the pump owns
+     * `tail`, and neither needs a lock to read the other's — the ring's
+     * contents are only ever touched in the region the index pair says is
+     * safe.  The table lock below covers open/close and the pump's walk, not
+     * these. */
+    volatile uint32_t head, tail;
+    int      volume;                           /* 1/256ths, 256 = unity        */
+    volatile int closing;                      /* drain, then release          */
+};
+
+static struct audio_stream g_streams[MIX_STREAMS];
+static spinlock_t          g_mix_lock = SPINLOCK_INIT;
+static struct waitq        g_mix_wq;           /* pump sleeps here when idle   */
+static int                 g_pump_started;
+static int16_t             g_mix_buf[MIX_PERIOD * 2];
+static uint32_t            g_mix_passes, g_mix_clips;
+
+/* Master level, applied to the finished mix.  Separate from `muted` on
+ * purpose — see audio.h: a mute that zeroes the volume forgets it. */
+static int g_master_vol = 256;
+static int g_master_mute = 0;
+
+void audio_master_set(int vol_256, int muted) {
+    if (vol_256 < 0)   vol_256 = 0;
+    if (vol_256 > 256) vol_256 = 256;
+    g_master_vol  = vol_256;
+    g_master_mute = muted ? 1 : 0;
+    klog(KLOG_INFO, "audio", "master %d/256%s\n", g_master_vol,
+         g_master_mute ? " (muted)" : "");
+}
+
+void audio_master_get(int* vol_256, int* muted) {
+    if (vol_256) *vol_256 = g_master_vol;
+    if (muted)   *muted   = g_master_mute;
+}
+
+int audio_available(void) { return audio_primary() != NULL; }
+
+static int streq_a(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+static uint32_t stream_count(const struct audio_stream* s) {
+    return s->head - s->tail;                  /* wraps correctly on uint32    */
+}
+
+static int any_stream_has_audio(void) {
+    for (int i = 0; i < MIX_STREAMS; i++) {
+        const struct audio_stream* s = &g_streams[i];
+        if (s->used && stream_count(s)) return 1;
+    }
+    return 0;
+}
+
+/* Mix one period.  Returns the number of frames produced (0 = nothing to do).
+ *
+ * Streams that are EMPTY contribute silence rather than stalling the mix: one
+ * source running dry must not stop the others, which is the difference between
+ * a mixer and a queue. */
+static uint32_t mix_one_period(void) {
+    uint32_t want = MIX_PERIOD, produced = 0;
+    for (uint32_t i = 0; i < want * 2; i++) g_mix_buf[i] = 0;
+
+    for (int i = 0; i < MIX_STREAMS; i++) {
+        struct audio_stream* s = &g_streams[i];
+        if (!s->used) continue;
+        uint32_t have = stream_count(s);
+        if (!have) continue;
+        uint32_t n = have < want ? have : want;
+        if (n > produced) produced = n;
+
+        uint32_t t = s->tail;
+        for (uint32_t f = 0; f < n; f++) {
+            uint32_t idx = (t + f) & STREAM_MASK;
+            for (int c = 0; c < 2; c++) {
+                int32_t v   = s->ring[idx * 2 + c];
+                int32_t cur = g_mix_buf[f * 2 + c];
+                int32_t sum = cur + ((v * s->volume) >> 8);
+                /* SATURATE.  A wrap here turns the loudest instant into white
+                 * noise, and only when two streams overlap — maximally audible
+                 * and maximally confusing to diagnose. */
+                if (sum >  32767) { sum =  32767; g_mix_clips++; }
+                if (sum < -32768) { sum = -32768; g_mix_clips++; }
+                g_mix_buf[f * 2 + c] = (int16_t)sum;
+            }
+        }
+        s->tail = t + n;                       /* publish AFTER reading        */
+    }
+
+    /* MASTER, applied once to the finished mix.  Muted still produces frames
+     * rather than skipping the period: the device keeps its timing, the
+     * streams keep draining, and unmuting resumes mid-sound instead of
+     * replaying a backlog that piled up while nothing was consuming. */
+    if (produced) {
+        int v = g_master_mute ? 0 : g_master_vol;
+        if (v != 256) {
+            for (uint32_t i = 0; i < produced * 2; i++)
+                g_mix_buf[i] = (int16_t)((g_mix_buf[i] * v) >> 8);
+        }
+    }
+    return produced;
+}
+
+static void mixer_pump(void) {
+    for (;;) {
+        struct audio_dev* dev = audio_primary();
+
+        /* THE DOCUMENTED DISCIPLINE, verbatim from waitq.h: hold the lock,
+         * loop on the condition, unlock after.  `waitq_block` RE-ACQUIRES the
+         * lock before returning — the first version treated it as if it
+         * returned unlocked and `continue`d straight back into `waitq_lock`,
+         * which is a task deadlocking against itself with interrupts masked.
+         * It presented as an NMI hard lockup in `hal_cpu_pause`, and §4.67.1's
+         * report named the wedged CPU correctly. */
+        uint32_t fl = waitq_lock(&g_mix_wq);
+        while (!(dev = audio_primary()) || !any_stream_has_audio())
+            waitq_block(&g_mix_wq);
+        waitq_unlock(&g_mix_wq, fl);
+
+        uint32_t n = mix_one_period();
+        if (!n) continue;
+        g_mix_passes++;
+        /* The device call BLOCKS for the period's real duration — that is what
+         * paces the whole mixer, so there is no timing loop anywhere here. */
+        audio_play_pcm(dev, g_mix_buf, n);
+    }
+}
+
+static void mixer_start_once(void) {
+    uint32_t fl = spin_lock_irqsave(&g_mix_lock);
+    int start = !g_pump_started;
+    g_pump_started = 1;
+    spin_unlock_irqrestore(&g_mix_lock, fl);
+    if (start) {
+        waitq_init(&g_mix_wq);
+        task_spawn_detached("sound", mixer_pump);
+    }
+}
+
+struct audio_stream* audio_stream_open(const char* name) {
+    if (!audio_primary()) return NULL;
+    mixer_start_once();
+
+    uint32_t fl = spin_lock_irqsave(&g_mix_lock);
+    struct audio_stream* s = NULL;
+    for (int i = 0; i < MIX_STREAMS; i++) {
+        if (!g_streams[i].used) { s = &g_streams[i]; break; }
+    }
+    if (s) {
+        s->used = 1; s->head = s->tail = 0; s->volume = 256; s->closing = 0;
+        int i = 0;
+        for (; name && name[i] && i < (int)sizeof s->name - 1; i++) s->name[i] = name[i];
+        s->name[i] = '\0';
+    }
+    spin_unlock_irqrestore(&g_mix_lock, fl);
+    if (!s) klog(KLOG_WARN, "audio", "no free stream (%d in use)\n", MIX_STREAMS);
+    return s;
+}
+
+void audio_stream_volume(struct audio_stream* s, int vol_256) {
+    if (!s) return;
+    if (vol_256 < 0)   vol_256 = 0;
+    if (vol_256 > 1024) vol_256 = 1024;        /* 4x, bounded: above that the
+                                                * mix is clipping by design    */
+    s->volume = vol_256;
+}
+
+int audio_stream_write(struct audio_stream* s, const int16_t* frames, uint32_t nframes) {
+    if (!s || !s->used || !frames) return -1;
+    uint32_t written = 0;
+
+    while (written < nframes) {
+        uint32_t used = stream_count(s);
+        uint32_t room = STREAM_FRAMES - used;
+        if (!room) {
+            /* Full: wait for the pump to drain some.  A SLEEP rather than a
+             * second waitq, deliberately — the ring is ~341 ms deep, so a 2 ms
+             * poll costs nothing measurable, and it buys a BOUNDED wait: a
+             * device that stops consuming makes the writer fail and say so
+             * instead of parking forever on a wake that will never come. */
+            uint64_t deadline = timer_ticks_ms() + 5000;
+            while (stream_count(s) >= STREAM_FRAMES) {
+                if (timer_ticks_ms() > deadline) {
+                    klog(KLOG_WARN, "audio", "stream '%s' stalled — %u frames written\n",
+                         s->name, written);
+                    return (int)written;
+                }
+                task_msleep(2);
+            }
+            continue;
+        }
+        uint32_t n = nframes - written;
+        if (n > room) n = room;
+
+        uint32_t h = s->head;
+        for (uint32_t f = 0; f < n; f++) {
+            uint32_t idx = (h + f) & STREAM_MASK;
+            s->ring[idx * 2 + 0] = frames[(written + f) * 2 + 0];
+            s->ring[idx * 2 + 1] = frames[(written + f) * 2 + 1];
+        }
+        s->head = h + n;                       /* publish AFTER filling        */
+        written += n;
+
+        /* Tell the pump there is work.  Every write, not just the first: the
+         * pump may have gone back to sleep between periods.  Under the lock,
+         * because waitq.h says so — the queue is mutated by the wake, and
+         * doing it unlocked corrupts the list a blocked task is linked into. */
+        uint32_t wf = waitq_lock(&g_mix_wq);
+        waitq_wake_all(&g_mix_wq);
+        waitq_unlock(&g_mix_wq, wf);
+    }
+    return (int)written;
+}
+
+void audio_stream_close(struct audio_stream* s) {
+    if (!s || !s->used) return;
+
+    /* DRAIN, do not drop.  A close that discarded the buffered tail would cut
+     * the end off every sound, and the caller — which asked for the whole
+     * thing to be played — has no way to notice. */
+    uint64_t deadline = timer_ticks_ms() + 10000;
+    while (stream_count(s)) {
+        uint32_t wf = waitq_lock(&g_mix_wq);
+        waitq_wake_all(&g_mix_wq);
+        waitq_unlock(&g_mix_wq, wf);
+        if (timer_ticks_ms() > deadline) break;
+        task_msleep(2);
+    }
+
+    uint32_t fl = spin_lock_irqsave(&g_mix_lock);
+    s->used = 0;
+    s->head = s->tail = 0;
+    spin_unlock_irqrestore(&g_mix_lock, fl);
+}
+
+void audio_stream_list(void) {
+    uint32_t fl = spin_lock_irqsave(&g_mix_lock);
+    int n = 0;
+    for (int i = 0; i < MIX_STREAMS; i++) if (g_streams[i].used) n++;
+    kprintf("streams: %d/%d open, %u mix passes, %u clipped samples\n",
+            n, MIX_STREAMS, g_mix_passes, g_mix_clips);
+    for (int i = 0; i < MIX_STREAMS; i++) {
+        struct audio_stream* s = &g_streams[i];
+        if (!s->used) continue;
+        kprintf("  %s  %u frames buffered  vol %d/256\n",
+                s->name, stream_count(s), s->volume);
+    }
+    spin_unlock_irqrestore(&g_mix_lock, fl);
 }
 
 /* ----------------------- WAV playback (§M23 stage 2) ---------------------- */
@@ -296,6 +576,11 @@ int audio_play_wav(const char* path) {
     if (wav_frame(&src, &cl, &cr) != 0) { vfs_close(f); return -1; }
     uint32_t have = 1;                        /* source frames consumed so far  */
 
+    /* Through a stream, so a file no longer owns the device: a second sound
+     * during playback is MIXED rather than made to wait. */
+    struct audio_stream* st = audio_stream_open("play");
+    if (!st) { vfs_close(f); return -1; }
+
     uint32_t played = 0;
     int eof = 0;
     while (!eof) {
@@ -312,8 +597,9 @@ int audio_play_wav(const char* path) {
             n++;
             acc += step;
         }
-        if (n && audio_play_pcm(dev, g_wav_out, n) != 0) {
+        if (n && audio_stream_write(st, g_wav_out, n) < (int)n) {
             kprintf("play: device stopped accepting audio\n");
+            audio_stream_close(st);
             vfs_close(f);
             return -1;
         }
@@ -324,6 +610,7 @@ int audio_play_wav(const char* path) {
         have  = 1;
     }
 
+    audio_stream_close(st);                    /* drains before returning     */
     vfs_close(f);
     kprintf("play: done — %u frames (%u ms)\n", played,
             (played * 1000u) / dst_rate);
@@ -423,12 +710,15 @@ static int audio_write_testwav(const char* path, uint32_t freq, uint32_t ms) {
 #define DSP_IOC_GET_RATE     0x4401
 #define DSP_IOC_GET_CHANNELS 0x4402
 
-/* One writer at a time.  Two tasks writing interleaved periods would produce
- * garbled audio rather than a mix — mixing is a MIXER, which §M23 scopes out
- * — so the second writer waits its turn.  A flag plus a sleep, not a spinlock:
- * the write blocks for the buffer's real duration, and holding a spinlock
- * across that would be the §M49 mistake with extra steps. */
-static volatile int g_dsp_busy = 0;
+/* §M23 stage 4 — the node now owns a STREAM rather than the device.  The
+ * "one writer at a time" busy flag this used to need is gone: two programs
+ * writing to /dev/dsp are two streams and get MIXED, which is what a person
+ * expects a sound device to do.
+ *
+ * The stream is opened lazily on the first write and released by close(),
+ * because devfs has no open hook — only the close one this device needed for
+ * its drain. */
+static struct audio_stream* g_dsp_stream = NULL;
 
 /* A write must be a whole number of FRAMES, and a caller has no reason to know
  * that: `cat` writes whatever block size it likes, so a 4-byte frame gets
@@ -456,14 +746,10 @@ static ssize_t dsp_dev_write(void* ctx, const void* buf, size_t n, uint64_t off)
         return -1;
     }
 
-    /* Wait for the previous writer, with a bound so a wedged device cannot
-     * hang every other writer forever. */
-    uint64_t deadline = timer_ticks_ms() + 5000;
-    while (g_dsp_busy) {
-        if (timer_ticks_ms() > deadline) return -1;
-        task_msleep(1);
+    if (!g_dsp_stream) {
+        g_dsp_stream = audio_stream_open("dsp");
+        if (!g_dsp_stream) return -1;
     }
-    g_dsp_busy = 1;
 
     const uint8_t* src = (const uint8_t*)buf;
     size_t consumed = 0;
@@ -493,11 +779,11 @@ static ssize_t dsp_dev_write(void* ctx, const void* buf, size_t n, uint64_t off)
             g_dsp_fill++;
         }
         if (g_dsp_fill < WAV_OUT_FRAMES) break;          /* not a period yet   */
-        if (audio_play_pcm(dev, g_dsp_buf, g_dsp_fill) != 0) { rc = -1; break; }
+        if (audio_stream_write(g_dsp_stream, g_dsp_buf, g_dsp_fill) < (int)g_dsp_fill) {
+            rc = -1; break;
+        }
         g_dsp_fill = 0;
     }
-
-    g_dsp_busy = 0;
     return rc;
 }
 
@@ -506,8 +792,11 @@ static ssize_t dsp_dev_write(void* ctx, const void* buf, size_t n, uint64_t off)
  * which is the sort of loss that sounds like "the file was truncated". */
 static int dsp_dev_close(void* ctx) {
     (void)ctx;
-    struct audio_dev* dev = audio_primary();
-    if (dev && g_dsp_fill) audio_play_pcm(dev, g_dsp_buf, g_dsp_fill);
+    if (g_dsp_stream) {
+        if (g_dsp_fill) audio_stream_write(g_dsp_stream, g_dsp_buf, g_dsp_fill);
+        audio_stream_close(g_dsp_stream);      /* drains */
+        g_dsp_stream = NULL;
+    }
     g_dsp_fill   = 0;
     g_dsp_tail_n = 0;          /* an incomplete frame at close is not audio */
     return 0;
@@ -593,12 +882,179 @@ static void audio_dsptest(uint32_t freq, uint32_t ms) {
             wrote, total, ms);
 }
 
+/* `play mixtest [ms]` — TWO SOURCES AT ONCE, from two TASKS.
+ *
+ * The assertion is an amplitude, because that is the one thing a mix cannot
+ * fake: both tones are the same frequency and start together, at 6000 and
+ * 4000, so a working mixer produces 10000 and either stream alone produces
+ * 6000 or 4000.  A test that just played two sounds and listened for "both"
+ * would pass with one of them silently dropped. */
+static volatile int g_mixtest_ms;
+static volatile int g_mixtest_done;
+
+static void mixtest_second(void) {
+    struct audio_stream* st = audio_stream_open("mixtest-B");
+    if (st) {
+        struct audio_dev* dev = audio_primary();
+        uint32_t rate = dev ? dev->rate : 48000;
+        uint32_t total = (rate / 1000u) * (uint32_t)g_mixtest_ms;
+        uint32_t half = rate / 880;            /* 440 Hz: half-period frames   */
+        int16_t level = 4000; uint32_t phase = 0, done = 0;
+        while (done < total) {
+            uint32_t n = total - done;
+            if (n > WAV_OUT_FRAMES) n = WAV_OUT_FRAMES;
+            for (uint32_t i = 0; i < n; i++) {
+                g_tone[i * 2 + 0] = level; g_tone[i * 2 + 1] = level;
+                if (++phase >= half) { phase = 0; level = (int16_t)-level; }
+            }
+            if (audio_stream_write(st, g_tone, n) < (int)n) break;
+            done += n;
+        }
+        audio_stream_close(st);
+    }
+    g_mixtest_done = 1;
+}
+
+static void audio_mixtest(uint32_t ms) {
+    struct audio_dev* dev = audio_primary();
+    if (!dev) { kprintf("audio: no device\n"); return; }
+    if (!ms) ms = 400;
+    g_mixtest_ms = (int)ms;
+    g_mixtest_done = 0;
+
+    task_spawn_detached("mixtest", mixtest_second);
+
+    struct audio_stream* st = audio_stream_open("mixtest-A");
+    if (!st) { kprintf("mixtest: no stream\n"); return; }
+    uint32_t rate = dev->rate;
+    uint32_t total = (rate / 1000u) * ms;
+    uint32_t half = rate / 880;
+    int16_t level = 6000; uint32_t phase = 0, done = 0;
+    while (done < total) {
+        uint32_t n = total - done;
+        if (n > WAV_OUT_FRAMES) n = WAV_OUT_FRAMES;
+        for (uint32_t i = 0; i < n; i++) {
+            g_wav_out[i * 2 + 0] = level; g_wav_out[i * 2 + 1] = level;
+            if (++phase >= half) { phase = 0; level = (int16_t)-level; }
+        }
+        if (audio_stream_write(st, g_wav_out, n) < (int)n) break;
+        done += n;
+    }
+    audio_stream_close(st);
+
+    uint64_t deadline = timer_ticks_ms() + 5000;
+    while (!g_mixtest_done && timer_ticks_ms() < deadline) task_msleep(5);
+    kprintf("mixtest: two streams, %u ms, amplitudes 6000 + 4000 "
+            "(a working mix reads 10000)\n", ms);
+    audio_stream_list();
+}
+
+static void audio_master_save(void);   /* defined with the config keys below */
+
+/* `volume` / `volume <0..100>` / `volume mute|unmute|toggle` — the headless
+ * path, which exists BEFORE the taskbar control that calls the same functions
+ * (the rule §M60 paid for: a setting with no shell command cannot be
+ * regression-tested on a machine with no display). */
+void audio_cmd_volume(const char* args) {
+    while (args && *args == ' ') args++;
+    int vol, muted;
+    audio_master_get(&vol, &muted);
+
+    if (!args || !*args) {
+        kprintf("volume %d%%%s  (%s)\n", (vol * 100) / 256,
+                muted ? " [MUTED]" : "",
+                audio_available() ? "device present" : "NO AUDIO DEVICE");
+        kprintf("  volume <0..100> | mute | unmute | toggle\n");
+        return;
+    }
+
+    if (streq_a(args, "mute"))        { audio_master_set(vol, 1); }
+    else if (streq_a(args, "unmute")) { audio_master_set(vol, 0); }
+    else if (streq_a(args, "toggle")) { audio_master_set(vol, !muted); }
+    else {
+        uint32_t pct = 0; int digits = 0;
+        for (const char* p = args; *p >= '0' && *p <= '9'; p++) {
+            pct = pct * 10 + (uint32_t)(*p - '0'); digits++;
+        }
+        if (!digits) { kprintf("volume: <0..100> | mute | unmute | toggle\n"); return; }
+        if (pct > 100) pct = 100;
+        audio_master_set((int)((pct * 256) / 100), muted);
+    }
+
+    audio_master_get(&vol, &muted);
+    kprintf("volume %d%%%s\n", (vol * 100) / 256, muted ? " [MUTED]" : "");
+    /* Persist through config so it survives a reboot and the Control Panel
+     * shows it — the §M63 machinery, reused rather than duplicated. */
+    audio_master_save();
+}
+
+/* ---- persistence -----------------------------------------------------------
+ * The master level is a SETTING, so it goes through §M63's machinery rather
+ * than growing a private file: declared with CONFIG_KEY so the Control Panel
+ * renders it with no per-key UI code, and watched so a value restored from the
+ * disk (or set with `setconf`) takes effect immediately instead of one boot
+ * later — the §M63 stage 0 lesson. */
+CONFIG_KEY(ck_audio_volume) = {
+    .key = "audio.volume", .group = "Sound", .type = CFG_INT,
+    .min = 0, .max = 100, .def = "80",
+    .help = "master output level, 0-100",
+};
+CONFIG_KEY(ck_audio_muted) = {
+    .key = "audio.muted", .group = "Sound", .type = CFG_BOOL, .def = "0",
+    .help = "silence all output without forgetting the level",
+};
+
+static int cfg_num(const char* key, int def) {
+    const char* v = config_get(key, NULL);
+    if (!v || !*v) return def;
+    int n = 0, any = 0;
+    for (; *v >= '0' && *v <= '9'; v++) { n = n * 10 + (*v - '0'); any = 1; }
+    return any ? n : def;
+}
+
+static void audio_conf_changed(const char* key, const char* value) {
+    (void)key; (void)value;
+    audio_master_set((cfg_num("audio.volume", 80) * 256) / 100,
+                     cfg_num("audio.muted", 0));
+}
+CONFIG_WATCH(audio_watch) = {
+    .prefix  = "audio.",
+    .changed = audio_conf_changed,
+};
+
+static void audio_master_save(void) {
+    int vol, muted;
+    audio_master_get(&vol, &muted);
+    char b[8];
+    int pct = (vol * 100) / 256, n = 0;
+    if (!pct) b[n++] = '0';
+    else { char t[8]; int m = 0; while (pct) { t[m++] = (char)('0' + pct % 10); pct /= 10; }
+           while (m) b[n++] = t[--m]; }
+    b[n] = 0;
+    /* config_set, not config_apply: the value is already in effect, and
+     * applying would re-enter the watcher to set what it just set. */
+    config_set("audio.volume", b);
+    config_set("audio.muted", muted ? "1" : "0");
+}
+
 void audio_cmd_play(const char* args) {
     while (args && *args == ' ') args++;
     if (!args || !*args) {
         kprintf("play <path.wav>  |  play testwav <path> [freq] [ms]"
-                "  |  play dsptest [freq] [ms]\n");
+                "  |  play dsptest [freq] [ms]  |  play mixtest [ms]\n");
         return;
+    }
+
+    {
+        const char* p = args; const char* kw = "mixtest"; int is_mix = 1;
+        for (int i = 0; kw[i]; i++) if (p[i] != kw[i]) { is_mix = 0; break; }
+        if (is_mix && (p[7] == '\0' || p[7] == ' ')) {
+            p += 7; while (*p == ' ') p++;
+            uint32_t ms = 0;
+            while (*p >= '0' && *p <= '9') ms = ms * 10 + (uint32_t)(*p++ - '0');
+            audio_mixtest(ms);
+            return;
+        }
     }
 
     {

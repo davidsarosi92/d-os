@@ -51,8 +51,83 @@ int  audio_play_tone(uint32_t freq, uint32_t ms);
 
 /* Play a whole PCM buffer, however many `play` calls that takes — the loop
  * every caller would otherwise write, and get subtly wrong in its own way now
- * that a short count is legal.  Returns 0 when everything was played. */
+ * that a short count is legal.  Returns 0 when everything was played.
+ *
+ * THIS IS THE DEVICE-LEVEL PATH and it is what the MIXER uses; ordinary
+ * playback goes through a stream (below).  Calling it directly while streams
+ * are running would interleave two sources onto one device — which is the
+ * problem the mixer exists to solve. */
 int  audio_play_pcm(struct audio_dev* dev, const int16_t* frames, uint32_t nframes);
+
+/* ---------------------------------------------------------------------------
+ * Streams and the mixer (§M23 stage 4).
+ *
+ * Before this, a sound OWNED the device for its whole duration: `play` and a
+ * second program could not both be heard, and `/dev/dsp` enforced that with a
+ * busy flag — one writer at a time, everyone else waiting.  That is a
+ * defensible thing for a beep and an obviously wrong thing for a desktop,
+ * where a notification sound arriving during music must not have to wait for
+ * the music to end.
+ *
+ * So every source now opens a STREAM and writes into its own ring; ONE pump
+ * task owns the device and mixes whatever is active into each period.  The
+ * shape is deliberately §M55's: the pump runs exactly while somebody has
+ * audio to play and is fully blocked otherwise, so a machine making no sound
+ * costs nothing.
+ *
+ * MIXING SATURATES.  Two loud streams sum past what 16 bits can hold, and a
+ * wrap turns the loudest moment of a piece into white noise — the failure is
+ * both maximally audible and maximally confusing, since it appears only when
+ * two things happen at once.
+ *
+ * Each stream is single-producer / single-consumer, so the ring needs no lock
+ * of its own; the table lock covers open, close and the pump's walk.
+ * --------------------------------------------------------------------------- */
+
+struct audio_stream;
+
+/* Open a stream on the primary device.  NULL if there is no device or no free
+ * slot — bounded like every other table here, and reported rather than
+ * silently queued behind somebody else. */
+struct audio_stream* audio_stream_open(const char* name);
+
+/* Write interleaved 16-bit stereo frames at the device's rate.  BLOCKS while
+ * the stream's ring is full, which is what paces a producer to real time —
+ * and is the only backpressure a writer needs, since the pump drains at
+ * exactly the speed the hardware consumes.  Returns frames written, or
+ * negative on error. */
+int  audio_stream_write(struct audio_stream* s, const int16_t* frames, uint32_t nframes);
+
+/* Volume in 1/256ths (256 = unity, 0 = silent).  Per stream, because "turn the
+ * music down while this plays" is the whole point of having streams. */
+void audio_stream_volume(struct audio_stream* s, int vol_256);
+
+/* Drain what is buffered, then release the slot.  It DRAINS rather than
+ * dropping, so `play` still returns when the sound has actually finished — a
+ * command that returns early leaves the shell printing its prompt over its own
+ * audio. */
+void audio_stream_close(struct audio_stream* s);
+
+/* Backs `lsaudio`'s stream section: how many are open and what they are. */
+void audio_stream_list(void);
+
+/* ---------------------------------------------------------------------------
+ * Master volume and mute.
+ *
+ * Applied ONCE to the finished mix rather than to each stream, because that is
+ * what "the system volume" means: turning it down must not change the balance
+ * between two things that are playing.
+ *
+ * MUTE IS NOT VOLUME 0.  They are stored separately so that unmuting restores
+ * the level the user had chosen — a mute implemented by zeroing the volume
+ * forgets it, and the user has to find their setting again every time.
+ * --------------------------------------------------------------------------- */
+void audio_master_set(int vol_256, int muted);
+void audio_master_get(int* vol_256, int* muted);
+
+/* Is there a working output device?  The three answers a status indicator
+ * needs: playing, muted, or nothing to play through. */
+int  audio_available(void);
 
 /* ---------------------------------------------------------------------------
  * WAV playback (§M23 stage 2).
@@ -75,6 +150,7 @@ int  audio_play_wav(const char* path);
  * than in a shell — §M24's rule, so the aarch64 serial REPL runs the same
  * implementation instead of a second one that drifts. */
 void audio_cmd_play(const char* args);
+void audio_cmd_volume(const char* args);
 
 /* Publish /dev/dsp (§M23 stage 3).  Called next to clipboard_devfs_init() on
  * BOTH entry paths — the node belongs to the audio subsystem, not to a card,
