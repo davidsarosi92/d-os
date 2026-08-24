@@ -37,6 +37,10 @@
 void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "vfs.h"
 #include "procfs.h"
+#include "devfs.h"          /* this arch had no /dev at all — see the call site */
+#include "clipboard.h"       /* §M59 — /dev/clipboard */
+#include "random.h"          /* §M39 — /dev/urandom */
+#include "audio.h"           /* §M23 stage 3 — audio_devfs_init */
 #include "module.h"
 #include "percpu.h"
 #include "smp.h"
@@ -215,6 +219,27 @@ void aarch64_main_entry(uint64_t dtb) {
     /* procfs (M29 parity): ramfs bootstraps /proc, so populate it — gives
      * aarch64 /proc/services + /proc/bus (and the built-ins) like x86. */
     procfs_init();
+
+    /* THIS ARCH HAD NO `/dev` AT ALL.  `devfs_init()` is called from x86's
+     * kernel_main and this entry path — which is a whole second copy of boot,
+     * the divergence PLAN_AARCH64 warns about — never called it, so `ls /dev`
+     * answered "(empty)" here while every device that registers a node worked
+     * fine on x86.  §M59's `/dev/clipboard`, §M39's `/dev/urandom` and
+     * `/dev/null` were all effectively x86-only features, silently, and
+     * nothing failed loudly enough to say so: the drivers register into a list
+     * and the list was simply never published as files.
+     *
+     * (The exFAT mount was unaffected and is why this survived: `/dev/vda` is
+     * a devfs NODE, but the mount resolves the volume through the block layer
+     * by NAME, so storage worked without a `/dev` to look in.)
+     *
+     * Found while adding `/dev/dsp`, which would have landed on x86 and gone
+     * missing here — on the very arch that had just been given a sound
+     * device.  Same ordering as x86: after the modules have registered. */
+    devfs_init();
+    clipboard_devfs_init();
+    audio_devfs_init();          /* §M23 stage 3 — /dev/dsp */
+    random_init();
 
     /* Probe DRIVER()s (M15 USB: xHCI over the PCIe ECAM bus).  A no-op if no
      * xHCI controller is attached (`-device qemu-xhci`); when present it

@@ -8,6 +8,9 @@
 #include "printf.h"
 #include "vfs.h"
 #include "klog.h"
+#include "devfs.h"
+#include "task.h"      /* task_msleep — the /dev/dsp writer waits its turn */
+#include "timer.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -394,11 +397,225 @@ static int audio_write_testwav(const char* path, uint32_t freq, uint32_t ms) {
     return 0;
 }
 
+/* ----------------------- /dev/dsp (§M23 stage 3) -------------------------- */
+
+/* RAW PCM AS A FILE.  `cat sound.raw > /dev/dsp` plays it, and a ring-3
+ * program reaches the speaker by opening a file — no new syscall, and it works
+ * for BOTH personalities, because a Linux-ABI binary has no d-os syscall
+ * numbers to call (the argument §M59 made for /dev/clipboard, and the reason
+ * that device shipped instead of an ABI operation).
+ *
+ * THE NODE BELONGS TO THE SUBSYSTEM, NOT TO A CARD.  It is registered whether
+ * or not any driver came up, and a write with no device fails with a REASON.
+ * Registering it from the driver instead would make `/dev/dsp` present on a
+ * machine with a sound card and *absent* on one without — so "this system
+ * cannot play audio" and "this system has no such device file" would look
+ * identical to a program, and the second is a much more confusing answer.
+ *
+ * The format is the device's own: 16-bit signed stereo at its native rate.
+ * There is no `SNDCTL_DSP_SPEED` to change it, and asking is REFUSED rather
+ * than accepted-and-ignored — silently taking a rate you then do not honour
+ * plays everything at the wrong pitch, which is the single most confusing way
+ * for an audio device to fail.  A caller asks what the device IS (the two
+ * ioctls below) and converts on its own side; `play` already does exactly
+ * that, and its converter is the one to reuse. */
+
+#define DSP_IOC_GET_RATE     0x4401
+#define DSP_IOC_GET_CHANNELS 0x4402
+
+/* One writer at a time.  Two tasks writing interleaved periods would produce
+ * garbled audio rather than a mix — mixing is a MIXER, which §M23 scopes out
+ * — so the second writer waits its turn.  A flag plus a sleep, not a spinlock:
+ * the write blocks for the buffer's real duration, and holding a spinlock
+ * across that would be the §M49 mistake with extra steps. */
+static volatile int g_dsp_busy = 0;
+
+/* A write must be a whole number of FRAMES, and a caller has no reason to know
+ * that: `cat` writes whatever block size it likes, so a 4-byte frame gets
+ * split across two writes roughly always.  The remainder is carried here
+ * instead of being dropped — dropping it does not merely lose a sample, it
+ * shifts every following sample by one channel and swaps left with right for
+ * the rest of the stream. */
+static uint8_t g_dsp_tail[4];
+static int     g_dsp_tail_n = 0;
+
+/* The period being assembled.  Its own buffer, not the WAV player's: the two
+ * can be in use at the same time (a `play` on one task, a /dev/dsp writer on
+ * another) and sharing the scratch would make each corrupt the other's audio
+ * in a way that only shows up under concurrency. */
+static int16_t  g_dsp_buf[WAV_OUT_FRAMES * 2];
+static uint32_t g_dsp_fill = 0;
+
+static ssize_t dsp_dev_write(void* ctx, const void* buf, size_t n, uint64_t off) {
+    (void)ctx; (void)off;                     /* a stream has no position */
+    if (!buf || n == 0) return 0;
+
+    struct audio_dev* dev = audio_primary();
+    if (!dev) {
+        klog(KLOG_WARN, "audio", "/dev/dsp: no audio device\n");
+        return -1;
+    }
+
+    /* Wait for the previous writer, with a bound so a wedged device cannot
+     * hang every other writer forever. */
+    uint64_t deadline = timer_ticks_ms() + 5000;
+    while (g_dsp_busy) {
+        if (timer_ticks_ms() > deadline) return -1;
+        task_msleep(1);
+    }
+    g_dsp_busy = 1;
+
+    const uint8_t* src = (const uint8_t*)buf;
+    size_t consumed = 0;
+    ssize_t rc = (ssize_t)n;
+
+    /* BUFFER UP TO A FULL PERIOD BEFORE PLAYING ANYTHING.
+     *
+     * The first version played whatever each write() contained.  A writer
+     * using 1000-byte chunks — which is what a real one does — therefore got a
+     * 250-frame playback per call: the DMA engine started and halted every
+     * five milliseconds, and the gaps between those starts stretched the
+     * stream.  It was audible in the capture as 403 Hz where 444 was written,
+     * over 256 ms where 300 was asked for; the amplitude and the L/R pairing
+     * were both perfect, which is what said the framing was right and the
+     * PACING was wrong.
+     *
+     * So a write only plays whole periods, and whatever is left waits for the
+     * next write — or for close(), which is why this device needed a close
+     * hook to exist at all. */
+    while (consumed < n) {
+        while (g_dsp_fill < WAV_OUT_FRAMES && consumed < n) {
+            while (g_dsp_tail_n < 4 && consumed < n) g_dsp_tail[g_dsp_tail_n++] = src[consumed++];
+            if (g_dsp_tail_n < 4) break;      /* partial frame — keep it for next time */
+            g_dsp_buf[g_dsp_fill * 2 + 0] = (int16_t)((uint16_t)g_dsp_tail[0] | ((uint16_t)g_dsp_tail[1] << 8));
+            g_dsp_buf[g_dsp_fill * 2 + 1] = (int16_t)((uint16_t)g_dsp_tail[2] | ((uint16_t)g_dsp_tail[3] << 8));
+            g_dsp_tail_n = 0;
+            g_dsp_fill++;
+        }
+        if (g_dsp_fill < WAV_OUT_FRAMES) break;          /* not a period yet   */
+        if (audio_play_pcm(dev, g_dsp_buf, g_dsp_fill) != 0) { rc = -1; break; }
+        g_dsp_fill = 0;
+    }
+
+    g_dsp_busy = 0;
+    return rc;
+}
+
+/* Drain on close — the tail of the sound.  Without this the last partial
+ * period (up to ~85 ms) would be silently dropped from every write sequence,
+ * which is the sort of loss that sounds like "the file was truncated". */
+static int dsp_dev_close(void* ctx) {
+    (void)ctx;
+    struct audio_dev* dev = audio_primary();
+    if (dev && g_dsp_fill) audio_play_pcm(dev, g_dsp_buf, g_dsp_fill);
+    g_dsp_fill   = 0;
+    g_dsp_tail_n = 0;          /* an incomplete frame at close is not audio */
+    return 0;
+}
+
+static ssize_t dsp_dev_read(void* ctx, void* buf, size_t n, uint64_t off) {
+    (void)ctx; (void)buf; (void)n; (void)off;
+    /* PCM capture is §M23's next stage and there is no input path at all yet.
+     * Returning 0 would mean END OF FILE, and a recorder told EOF writes an
+     * empty file and reports success — so this fails instead. */
+    return -1;
+}
+
+static int dsp_dev_ioctl(void* ctx, int cmd, void* arg) {
+    (void)ctx;
+    struct audio_dev* dev = audio_primary();
+    if (!dev || !arg) return -1;
+    if (cmd == DSP_IOC_GET_RATE)     { *(uint32_t*)arg = dev->rate;     return 0; }
+    if (cmd == DSP_IOC_GET_CHANNELS) { *(uint32_t*)arg = dev->channels; return 0; }
+    return -1;                                 /* including any "set format" */
+}
+
+static struct devfs_node dsp_dev = {
+    .name = "dsp", .kind = DEVFS_CHAR,
+    .read = dsp_dev_read, .write = dsp_dev_write,
+    .ioctl = dsp_dev_ioctl, .ctx = NULL,
+    .close = dsp_dev_close,
+};
+
+void audio_devfs_init(void) { devfs_register(&dsp_dev); }
+
+/* `play dsptest [freq] [ms]` — drive /dev/dsp THROUGH THE VFS, the way a
+ * program would, rather than calling the audio core directly.
+ *
+ * THE CHUNK SIZE IS DELIBERATELY AWKWARD.  1000 bytes is not a multiple of the
+ * 4-byte frame, so every write leaves a partial frame behind — which is what a
+ * real writer does (`cat` uses whatever block size it likes) and what the
+ * device node has to carry across calls.  Getting that wrong does not merely
+ * lose a sample: it shifts every following sample by one channel and swaps
+ * left with right for the rest of the stream, which a capture makes obvious
+ * and a listener would describe as "it sounds fine but backwards". */
+static void audio_dsptest(uint32_t freq, uint32_t ms) {
+    struct audio_dev* dev = audio_primary();
+    if (!dev) { kprintf("audio: no device\n"); return; }
+    if (!freq) freq = 440;
+    if (!ms)   ms   = 300;
+
+    struct file* f = vfs_open("/dev/dsp", VFS_WRONLY);
+    if (!f) { kprintf("dsptest: cannot open /dev/dsp\n"); return; }
+
+    uint32_t total = (dev->rate / 1000u) * ms;
+    uint32_t half  = dev->rate / (freq * 2);
+    if (!half) half = 1;
+    int16_t level = 8000;
+    uint32_t phase = 0;
+
+    /* Render into the same output block the WAV player uses, then hand it to
+     * the device node in 1000-byte pieces. */
+    uint32_t done = 0;
+    uint32_t wrote = 0;
+    while (done < total) {
+        uint32_t n = total - done;
+        if (n > WAV_OUT_FRAMES) n = WAV_OUT_FRAMES;
+        for (uint32_t i = 0; i < n; i++) {
+            g_wav_out[i * 2 + 0] = level;
+            g_wav_out[i * 2 + 1] = level;
+            if (++phase >= half) { phase = 0; level = (int16_t)-level; }
+        }
+        const uint8_t* p = (const uint8_t*)g_wav_out;
+        uint32_t bytes = n * 4, off = 0;
+        while (off < bytes) {
+            uint32_t chunk = bytes - off;
+            if (chunk > 1000) chunk = 1000;        /* NOT a multiple of 4      */
+            ssize_t w = vfs_write(f, p + off, chunk);
+            if (w <= 0) { kprintf("dsptest: write failed at %u\n", wrote + off); vfs_close(f); return; }
+            off += (uint32_t)w;
+        }
+        wrote += bytes;
+        done  += n;
+    }
+    vfs_close(f);
+    kprintf("dsptest: wrote %u bytes (%u frames, %u ms) to /dev/dsp in 1000-byte chunks\n",
+            wrote, total, ms);
+}
+
 void audio_cmd_play(const char* args) {
     while (args && *args == ' ') args++;
     if (!args || !*args) {
-        kprintf("play <path.wav>  |  play testwav <path> [freq] [ms]\n");
+        kprintf("play <path.wav>  |  play testwav <path> [freq] [ms]"
+                "  |  play dsptest [freq] [ms]\n");
         return;
+    }
+
+    {
+        const char* p = args;
+        const char* kw = "dsptest";
+        int is_dsp = 1;
+        for (int i = 0; kw[i]; i++) if (p[i] != kw[i]) { is_dsp = 0; break; }
+        if (is_dsp && (p[7] == '\0' || p[7] == ' ')) {
+            p += 7;
+            while (*p == ' ') p++;
+            uint32_t freq = 0, ms = 0;
+            while (*p >= '0' && *p <= '9') freq = freq * 10 + (uint32_t)(*p++ - '0');
+            while (*p == ' ') p++;
+            while (*p >= '0' && *p <= '9') ms = ms * 10 + (uint32_t)(*p++ - '0');
+            audio_dsptest(freq, ms);
+            return;
+        }
     }
 
     /* `play testwav <path>` — generate, then play it, so one command exercises

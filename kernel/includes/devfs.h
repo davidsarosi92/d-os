@@ -53,6 +53,16 @@ struct devfs_node {
     ssize_t (*write)(void* ctx, const void* buf, size_t n, uint64_t off);
     int     (*ioctl)(void* ctx, int cmd, void* arg);
 
+    /* Called when a handle on this node is closed.  Optional, and appended
+     * rather than inserted (§M58's positional-initialiser scar).
+     *
+     * It exists because a STREAM device needs a drain point: /dev/dsp buffers
+     * writes up to one period so that a writer using small chunks does not
+     * restart the DMA engine every few milliseconds, and without a close hook
+     * the final partial period would simply never be played — the tail of
+     * every sound silently missing. */
+    int     (*close)(void* ctx);
+
     void* ctx;                  /* opaque, passed back into the callbacks */
 
     /* Internal use — link in the pending-or-live list.  Drivers should not

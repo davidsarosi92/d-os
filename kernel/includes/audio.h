@@ -76,4 +76,9 @@ int  audio_play_wav(const char* path);
  * implementation instead of a second one that drifts. */
 void audio_cmd_play(const char* args);
 
+/* Publish /dev/dsp (§M23 stage 3).  Called next to clipboard_devfs_init() on
+ * BOTH entry paths — the node belongs to the audio subsystem, not to a card,
+ * so it exists even with no driver up and a write then fails with a reason. */
+void audio_devfs_init(void);
+
 #endif /* AUDIO_H */

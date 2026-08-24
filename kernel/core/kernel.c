@@ -65,6 +65,7 @@
 #include "block.h"
 #include "config.h"
 #include "shortcut.h"        /* §M64 tail — shortcut_attach_persistent */
+#include "audio.h"           /* §M23 stage 3 — audio_devfs_init */
 #include "crash.h"     /* §M47 — unclean-shutdown marker */
 #include "task.h"
 #include "workqueue.h"
@@ -138,6 +139,8 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     /* §M59 — the clipboard as a file: `cat x > /dev/clipboard` works, and ring 3
      * reaches it without waiting for a syscall to be defined for it. */
     clipboard_devfs_init();
+    /* §M23 stage 3 — /dev/dsp, the speaker as a file. */
+    audio_devfs_init();
 
     /* §M39 — kernel CSPRNG + /dev/urandom + /dev/random (after devfs so the
      * nodes attach live; seeds from the hardware RNG + boot jitter). */

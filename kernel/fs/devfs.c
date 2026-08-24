@@ -52,7 +52,9 @@ static ssize_t adapter_write(struct file* f, const void* buf, size_t n,
 }
 
 static int adapter_close(struct file* f) {
-    (void)f;
+    if (!f || !f->inode) return 0;
+    struct devfs_node* d = (struct devfs_node*)f->inode->private;
+    if (d && d->close) return d->close(d->ctx);
     return 0;
 }
 

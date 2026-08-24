@@ -3009,8 +3009,68 @@ And `dos-shell-test.py` gained **`--no-display`**: aarch64 has *two* boot paths
 `serial_shell.c` on the PL011 — and with the GPU permanently attached the
 serial path could not be driven or read at all.
 
-**Still open:** `/dev/dsp` (stage 3, raw PCM from ring 3), the mixer and
-multiple streams, PCM input, Intel HDA, and the AC97 completion interrupt.
+#### Stage 3 — `/dev/dsp`, and the pacing bug the measurement caught
+
+Raw PCM as a file: `cat sound.raw > /dev/dsp`.  A ring-3 program reaches the
+speaker by opening a file — no new syscall, and it works for **both**
+personalities, since a Linux-ABI binary has no d-os syscall numbers to call.
+That is §M59's argument for `/dev/clipboard`, and the reason that shipped as a
+device instead of an ABI operation.
+
+**The node belongs to the subsystem, not to a card.**  It is registered whether
+or not a driver came up, and a write with no device fails with a reason.
+Registering it from the driver would make `/dev/dsp` present on a machine with
+a sound card and *absent* on one without — so "cannot play audio" and "no such
+device file" would look identical to a program, and the second is the more
+confusing answer.
+
+**No `SNDCTL_DSP_SPEED`.**  The format is the device's own; asking to change it
+is *refused* rather than accepted-and-ignored, because silently taking a rate
+you do not honour plays everything at the wrong pitch — the most confusing way
+an audio device can fail.  A caller asks what the device *is* and converts on
+its own side, which is what `play` already does.
+
+**The bug the capture found.**  The first version played whatever each
+`write()` contained.  A writer using 1000-byte chunks — what a real one does —
+got a 250-frame playback per call: the DMA engine started and halted every five
+milliseconds, and the gaps stretched the stream.
+
+| | first version | with period buffering |
+|---|---|---|
+| duration (300 ms written) | 256.4 ms | **300.0 ms** |
+| frequency (444 Hz written) | 403.7 Hz | **443.3 Hz** |
+| silent samples inside | many | **0** |
+| amplitude, L == R | correct | correct |
+
+The amplitude and channel pairing were right in *both* runs, and that is what
+identified the fault: the framing was fine and the **pacing** was wrong.  A
+write now plays only whole periods and the remainder waits — which is why this
+device needed devfs to grow a **`close` hook**: without a drain point the final
+partial period would be dropped from every sound, a loss that sounds like a
+truncated file.  Partial *frames* are carried across writes too; dropping four
+stray bytes does not lose a sample, it shifts every later sample by one channel
+and swaps left with right for the rest of the stream.
+
+Verified on i386 and aarch64 by `play dsptest`, which writes through the VFS in
+deliberately awkward 1000-byte chunks: **300.0 ms, ±8000, 443.3 Hz, L == R** on
+both.
+
+#### aarch64 had no `/dev` at all
+
+Found while adding the node above.  `devfs_init()` is called from x86's
+`kernel_main`, and this architecture runs its **own** entry path — the
+divergence `PLAN_AARCH64` warns about — which never called it.  `ls /dev`
+answered `(empty)` there, so §M59's `/dev/clipboard`, §M39's `/dev/urandom` and
+`/dev/null` were all effectively x86-only, silently: the drivers register into
+a list and the list was simply never published as files.  The exFAT mount is
+why it survived unnoticed — `/dev/vda` is a devfs node, but a mount resolves
+its volume through the block layer *by name*, so storage worked without a
+`/dev` to look in.  Fixed at the same point in the sequence x86 uses; ARM now
+lists `random urandom clipboard zero null` plus `dsp`.
+
+**Still open:** the mixer and multiple streams, PCM input, Intel HDA, the AC97
+completion interrupt, and whether `/dev/vda` should be published on ARM (the
+block driver initialises after `devfs_init` there — not chased here).
 
 ### 4.26 Audio — AC97 codec + PCM output (M23, i386)
 
