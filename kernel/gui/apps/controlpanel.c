@@ -136,3 +136,17 @@ SETTINGS_PANEL(sp_input) = {
     .summary = "keyboard layout",
     .icon    = ICON_KEYBOARD,
 };
+
+/* §M23 — Sound.  No `open`, so this is the generic CONFIG_KEY panel: the two
+ * keys are declared in audio.c next to the code that reads them, and this
+ * registration is the ENTIRE cost of giving them a page.  That is the whole
+ * claim §M63 made — a setting should be a line, not an app — and it is worth
+ * noting that adding sound to the Control Panel really did take one struct.
+ *
+ * The taskbar indicator and this page write the SAME keys, so there is one
+ * answer to "what is the volume" rather than two that drift. */
+SETTINGS_PANEL(sp_sound) = {
+    .name    = "Sound",
+    .summary = "output volume and mute",
+    .icon    = ICON_VOLUME,
+};

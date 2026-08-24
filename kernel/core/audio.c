@@ -961,7 +961,7 @@ void audio_cmd_volume(const char* args) {
     audio_master_get(&vol, &muted);
 
     if (!args || !*args) {
-        kprintf("volume %d%%%s  (%s)\n", (vol * 100) / 256,
+        kprintf("volume %d%%%s  (%s)\n", (vol * 100 + 128) / 256,
                 muted ? " [MUTED]" : "",
                 audio_available() ? "device present" : "NO AUDIO DEVICE");
         kprintf("  volume <0..100> | mute | unmute | toggle\n");
@@ -978,11 +978,11 @@ void audio_cmd_volume(const char* args) {
         }
         if (!digits) { kprintf("volume: <0..100> | mute | unmute | toggle\n"); return; }
         if (pct > 100) pct = 100;
-        audio_master_set((int)((pct * 256) / 100), muted);
+        audio_master_set((int)((pct * 256 + 50) / 100), muted);
     }
 
     audio_master_get(&vol, &muted);
-    kprintf("volume %d%%%s\n", (vol * 100) / 256, muted ? " [MUTED]" : "");
+    kprintf("volume %d%%%s\n", (vol * 100 + 128) / 256, muted ? " [MUTED]" : "");
     /* Persist through config so it survives a reboot and the Control Panel
      * shows it — the §M63 machinery, reused rather than duplicated. */
     audio_volume_persist();
@@ -1014,7 +1014,10 @@ static int cfg_num(const char* key, int def) {
 
 static void audio_conf_changed(const char* key, const char* value) {
     (void)key; (void)value;
-    audio_master_set((cfg_num("audio.volume", 80) * 256) / 100,
+    /* ROUND TO NEAREST, both ways.  The level is stored in 1/256ths and shown
+     * as a percentage, so truncating at each step made 35 come back as 34 —
+     * a one-percent wobble that reads as "the setting did not take". */
+    audio_master_set((cfg_num("audio.volume", 80) * 256 + 50) / 100,
                      cfg_num("audio.muted", 0));
 }
 CONFIG_WATCH(audio_watch) = {
@@ -1026,7 +1029,7 @@ void audio_volume_persist(void) {
     int vol, muted;
     audio_master_get(&vol, &muted);
     char b[8];
-    int pct = (vol * 100) / 256, n = 0;
+    int pct = (vol * 100 + 128) / 256, n = 0;
     if (!pct) b[n++] = '0';
     else { char t[8]; int m = 0; while (pct) { t[m++] = (char)('0' + pct % 10); pct /= 10; }
            while (m) b[n++] = t[--m]; }

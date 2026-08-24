@@ -537,7 +537,7 @@ static void vista_draw(struct gfx_surface* back) {
 
         int vol, muted;
         audio_master_get(&vol, &muted);
-        int pct = (vol * 100) / 256;
+        int pct = (vol * 100 + 128) / 256;
 
         if (!audio_available()) {
             gfx_text(back, px + 10, py + 12, "No audio device", COL_TEXT);
@@ -629,7 +629,7 @@ static void vol_set_from_x(int x) {
     /* Dragging the slider UNMUTES: reaching for the volume is unambiguous
      * about what the user wants, and leaving it muted would look like the
      * control does nothing. */
-    audio_master_set((pct * 256) / 100, 0);
+    audio_master_set((pct * 256 + 50) / 100, 0);
     (void)vol; (void)muted;
     audio_volume_persist();
 }
