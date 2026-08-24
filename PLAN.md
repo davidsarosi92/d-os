@@ -266,7 +266,7 @@ what); a session can pick a theme and push on it.
 | M61 | Resolution switching at runtime — `fb_mode_set`, scene resize, `mode` cmd, Display panel, confirm-or-revert dialog | UX / Devices | ✅ DOCS §4.70 (x86) + §4.77 (aarch64) |
 | M62 | Boot splash, switchable — `boot.splash`, drawn splash, log suppressed not discarded, torn down by any fault | UX / Reliability | ✅ DOCS §4.71 |
 | M63 | Control Panel — `SETTINGS_PANEL()` + `CONFIG_KEY()` registries, generic panel, one Start-menu entry, `conf` with validation | UX / Architecture | ✅ DOCS §4.65 (+ stage 0 §4.63) |
-| M64 | Desktop shortcuts — icons on the wallpaper, shortcut files, one resolver, swappable grid/list view | UX | ✅ DOCS §4.64 (drag-to-move still needs §M58) |
+| M64 | Desktop shortcuts — icons on the wallpaper, shortcut files, one resolver, swappable grid/list view | UX | ✅ DOCS §4.64 + §4.79 (drag-to-move, keyboard, Send to desktop, and the ramfs-persistence bug it exposed).  Open: `run:` targets |
 
 ### Cross-cutting constraints
 
@@ -4828,6 +4828,15 @@ on the first boot it exists, it simply does not stick yet.
 | **4** | ◐ §M58 selection + §M59 clipboard — kernel half DONE (DOCS §4.69); editor drag, Ctrl+C and the ring-3/Wayland tail open | Dragging across terminal output, pasting it into the editor |
 | **5** | ◐ §M61 resolution + Display panel + confirm-or-revert (DOCS §4.70; x86) | The desktop re-laying itself at a new mode, NetSurf reflowing |
 | **6** | ✅ §M62 boot splash (DOCS §4.71) | The machine booting with a logo — and dropping to the log on any key |
+| **7** | ◐ **The tail** (2026-08-23, DOCS §4.79) — §M64 drag-to-move + keyboard + Send to desktop, and the ramfs-persistence bug they exposed; `gui.mode` confirmed applied at `gui_start`.  Open: `run:` targets, exFAT `rename` | An icon dragged to a new slot — that is still there after a reboot |
+
+**After block 7 the cluster is done and there is no block 8.**  The next named
+milestone is **§M23 stage 2 (audio)**, which is the last real ARCH ASYMMETRY in
+the tree: AC97 output exists on i386 only, at `beep`/`tone` level, with no WAV
+player, no `/dev/dsp`, no mixer and no driver at all on x86_64 or aarch64.
+Everything else outstanding is either a large structural milestone (§M32
+multi-user, §M33 execution domains) or a packaging question (boot time is ~80 %
+GRUB reading a 61 MB image, §4.68).
 
 Rules for the run: **shell command before panel, always** (a setting with no
 headless path cannot be regression-tested here); `make clean ARCH=<arch>` after

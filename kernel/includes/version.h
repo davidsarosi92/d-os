@@ -23,7 +23,7 @@
  * is nothing to say — and it must be CLEARED when the next numbered milestone
  * ships, because from then on the number itself is the newer news and a stale
  * note would advertise old work as fresh. */
-#define DOS_MILESTONE_NOTE  ""                 /* cleared: M65 is the newer news */
+#define DOS_MILESTONE_NOTE  " (updated M64)"   /* §M64's tail: drag, keyboard, persistence */
 
 /* Short architecture tag for the on-screen label.  Deliberately the FAMILIAR
  * short form ("x32"/"x64") rather than the toolchain triple — the wallpaper

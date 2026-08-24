@@ -20,6 +20,78 @@ focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M64 TAIL — A DESKTOP YOU CAN ARRANGE, AND THE PERSISTENCE IT ONLY CLAIMED
+(2026-08-23, DOCS §4.79, all 3 arches build, i386 driven).**  §M64's three open
+items closed — and the second thing closed was not on the list.  **A POSITION IS
+A GRID SLOT, NOT A PIXEL**, and everything follows from that: §M61 made the
+resolution a runtime choice, so an icon positioned in pixels goes off the screen
+at the next smaller mode — *silently, because nothing draws outside the box, and
+what the user sees is a shortcut that was deleted.*  The `.lnk` has carried
+`x`/`y` since §M64 and nothing had ever read them.  **TWO OPTIONAL POINTS
+APPENDED to the item-view interface** (§M58's positional-initialiser scar, now a
+rule): `item_model.pos` says where the owner put an item, `item_view.slot_at`
+turns a drop point into a slot — and **`slot_at` is optional ON PURPOSE, because
+a layout decides whether its items can be positioned at all**: the list and the
+table say NO by leaving it NULL, since dropping row 3 onto row 7 means REORDER,
+a different feature with different persistence.  *A caller can tell "this view
+cannot be arranged" from "the drop missed".*  Models without `pos` (Control
+Panel, file manager) are untouched.  **PLACEMENT IS THE MODEL'S JOB:** an
+unplaced item takes the first slot no PLACED item claimed — flow order knows
+nothing about the cells somebody dragged into, and *two icons in one cell is not
+a layout, it is a lost shortcut*.  With slots in play `grid_hit` stops doing
+arithmetic and asks `grid_rect` — one source of truth, *because a view that
+draws correctly and hit-tests wrongly is invisible in a screenshot*.  **A DROP
+ONTO AN OCCUPIED SLOT SWAPS** (stacking hides one and the hit test can only
+return one of them; refusing springs the icon back for a reason nothing on
+screen explains), the live preview is MEMORY-ONLY and the file is written once
+on release (*a drag crosses a dozen cells; each would be a `.lnk` rewrite, i.e.
+VFS traffic proportional to hand tremor*), and **the gesture's ORIGIN is
+captured at press** — the preview overwrites the stored slot, so the swap must
+hand over the slot the user STARTED from, not one from mid-gesture.
+**TRANSPORT:** `desktop_pointer(x,y,phase)` carrying §M58's WPTR_* (the same
+vocabulary, not a second one) **plus a GRAB** — without it the gesture ends at
+the first window it crosses.  **THE KEYBOARD: THE DESKTOP IS THE FOCUS OF LAST
+RESORT** — and the keycodes were not being dropped where it looked
+(`dispatch_keycodes` skips events with no focused window, but nothing reached
+it: `gui_raw_key` only ENQUEUES when there is a focused `WIN_APP`).  **Enter and
+Escape are gated on the desktop having a selection, and that gate is
+load-bearing:** the GUI suppresses the console but keys still reach its VC —
+that is how a command is typed with the desktop up and **how this project's own
+harness drives every GUI build**, so consuming Enter unconditionally would have
+made the test that proves the feature its first casualty.  The neighbour is
+GEOMETRIC (item 5 may sit left of item 2), weighted 4× perpendicular so "right"
+prefers the current row; a search that finds nothing leaves the selection alone
+— *at the edge of the field the honest answer to "move right" is "stay".*
+**AND THE BUG UNDER ALL OF IT: SHORTCUTS DID NOT SURVIVE A REBOOT.**
+`SHORTCUT_DIR` was a constant pointing at `/desktop` = **ramfs**, while the
+persistent volume is the exFAT mount — so *"a shortcut is a FILE so that it
+survives a reboot" was true about the format and false about the outcome*, and
+every document here claimed otherwise.  **§M63 stage 0's bug exactly, one layer
+over**, hidden for the same reason: the write SUCCEEDS.
+`shortcut_attach_persistent("/mnt")` on **BOTH** entry paths (miss one and that
+arch keeps losing them), creating the directory IS the write test, and it names
+which mode it is in.  **VERIFIED IN THE ORDER THAT MAKES EACH STEP FALSIFIABLE:**
+`shortcut move` is the drop WITHOUT a mouse (so slot + swap + both rewrites are
+testable with no display), `shortcut check` now prints each item's slot, its
+pixels AND the view's own hit test there with a `MISMATCH` flag; then a real
+reboot (both shortcuts and slot (2,1) return); then a DRIVEN MOUSE DRAG
+(`desktop: shortcut 0 moved (-1,-1) -> (1,0)`, and the next boot reports slot
+(1,0)); then `sendkey` alone walking two icons in different rows/columns, End,
+Escape, and **Enter opening one** (`app-host 'app:Task Manager' up`).  Every
+pointer hop under 90 px (§4.60's signed-byte lesson, re-paid).  **The drop LOGS
+itself** — *a screenshot cannot distinguish an icon that moved from one that
+moved and will be back in its old slot at the next boot, which is exactly the
+bug this work contained.*  **Also closed:** file manager **Send to desktop**
+(one row in §M65's declared menu model, `file:<path>` — a pointer, not a copy),
+and **`gui.mode` is confirmed applied at `gui_start`** (the status text listed it
+as open; the code reads it and a reboot comes up at 1024×768).  **STILL OPEN:**
+`run:` targets (want a terminal window accepting an initial command — a shell
+change, and `shortcut_launch` SAYS so rather than doing nothing); exFAT
+`rename`; the Send-to-desktop menu ROW is not pointer-verified (only the code it
+calls), because the harness cannot type once a GUI window has focus.  **NOTICED,
+NOT CAUSED HERE:** `gui stats` prints nothing on serial while the GUI is up
+though `shortcut list` does — likely writing to the suppressed console.
+
 ✅ **§M65 TAIL — THE OPEN ITEMS, AND THE BUILD TRAP CLOSED FOR GOOD
 (2026-08-23, DOCS §4.78).**  **Tab / Shift+Tab cycles focus**, handled at the
 WINDOW level and wrapping — no control can know what comes after it, and a

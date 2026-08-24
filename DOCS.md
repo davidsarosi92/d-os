@@ -117,6 +117,7 @@ when sections are added.)
 | 4.76 | Redirection: fds 0/1/2 were not descriptors (§M59) | 8469 |
 | 4.77 | aarch64 can change resolution now (§M61 complete) | 8537 |
 | 4.78 | A widget toolkit with a seam: classes, layout, ring 3 (§M65) | 8601 |
+| 4.79 | A desktop you can arrange: drag, keyboard, slots (§M64 tail) | 8800 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -8796,6 +8797,144 @@ adds a second set of controls — stated in ui.h because the first attempt did
 exactly that), and there is no keyboard route into the table's rows beyond the
 item view's own arrows.
 
+### 4.79 The desktop you can arrange: drag, keyboard, and the slot that survives a reboot (§M64 tail)
+
+§M64 shipped icons on the wallpaper and said what it had left out: drag-to-move
+(blocked — a drag had no transport until §M58 built one), keyboard navigation,
+and "Send to desktop" in the file manager.  This closes the first three, and
+the second thing it closed was not on the list.
+
+**A POSITION IS A GRID SLOT, NOT A PIXEL.**  This is the decision the rest
+follows from.  §M61 made the resolution a runtime choice, and an icon whose
+position is stored in pixels goes off the screen the moment somebody picks a
+smaller mode — silently, because nothing draws outside the box, and what the
+user sees is a shortcut that was deleted.  A slot survives the mode change and
+cannot half-overlap its neighbour.  The `.lnk` file has carried `x`/`y` since
+§M64 with `-1` meaning "not placed", and nothing had ever read them.
+
+**Two optional points on the item-view interface, both APPENDED** (§M58's
+positional-initialiser scar, now a written rule):
+
+| Added to | What it answers | NULL means |
+|----------|-----------------|------------|
+| `item_model.pos` | where the owner has put item *i* | nothing is placed; flow order, exactly as before |
+| `item_view.slot_at` | which slot a drop point falls in | **this layout cannot be arranged** |
+
+`slot_at` is optional *on purpose*.  A layout decides whether its items can be
+positioned: the list and the table say no by leaving it NULL, because their
+order IS the model's order and dropping row 3 onto row 7 means REORDER — a
+different feature with different persistence.  A caller can therefore tell
+"this view cannot be arranged" from "the drop missed the field", instead of a
+silent no-op that reads as a bug.  Models without `pos` — the Control Panel,
+the file manager — are untouched by any of this existing.
+
+**Placement is the model's job, not the view's.**  An unplaced item takes the
+first slot no *placed* item has claimed, counting in model order: flow order
+knows nothing about the cells somebody has dragged things into, and two icons
+in one cell is not a layout, it is a lost shortcut.  The walk is bounded
+(`SLOT_SCAN_MAX`) so a layout pass terminates even if the model answers
+inconsistently.  With slots in play, `grid_hit` stops doing arithmetic and asks
+`grid_rect` — one source of truth for "where is item *i*", because a view that
+draws correctly and hit-tests wrongly is invisible in a screenshot.
+
+**A drop onto an occupied slot SWAPS the two.**  Stacking hides a shortcut
+behind another and the hit test can only return one of them; refusing the drop
+springs the icon back for a reason nothing on screen explains.  The live
+preview during the drag is memory-only (`shortcut_set_pos_live`) and the file
+is written once, on release — a drag crosses a dozen cells and each one would
+otherwise be a `.lnk` rewrite, i.e. VFS traffic proportional to hand tremor.
+The gesture's ORIGIN is captured at press, because the preview overwrites the
+stored slot and the swap must hand over the slot the user *started* from, not
+one from the middle of the gesture.
+
+**The transport.**  `desktop_shell` gained `desktop_pointer(x, y, phase)`
+carrying §M58's `WPTR_PRESS`/`DRAG`/`RELEASE` — the same vocabulary, not a
+second one — with a GRAB: once a desktop drag starts, drag and release arrive
+there whatever the pointer is over.  Without it the gesture would end at the
+first window it crossed, which is §M58's lesson one layer up.  Dispatched on
+the desktop task with no lock held, like `desktop_click`, because the drop
+writes a file.
+
+**The keyboard: the desktop is the focus of last resort.**  The keycodes were
+not being dropped where it looked — `dispatch_keycodes` skips events with no
+focused window, but nothing ever reached it, because `gui_raw_key` only
+enqueues a keycode when there is a focused `WIN_APP` to receive it.  Both
+halves had to move.
+
+*Enter and Escape are gated on the desktop having a selection*, and that gate
+is load-bearing: the GUI suppresses the boot shell's console but keys still
+reach its VC — that is how a command is typed with the desktop up, and how this
+project's test harness drives every GUI build.  Consuming Enter unconditionally
+would make a shell command unsubmittable while the desktop runs, and the test
+that proves the feature would be its first casualty.  So `gui_desktop_focus()`
+is published by the shell when its selection appears or clears, and read in the
+keyboard IRQ.  The arrows need no gate — nothing else was going to receive them.
+
+*The neighbour is geometric.*  With explicit slots, item 5 may sit left of item
+2, so "the icon to the right" is found from the same rectangles the view draws,
+weighting the perpendicular offset four times the parallel one so "right"
+prefers the current row and only leaves it when that row runs out.  A search
+that finds nothing leaves the selection alone: at the edge of the field the
+honest answer to "move right" is "stay".
+
+**AND THE BUG UNDER ALL OF IT: SHORTCUTS DID NOT SURVIVE A REBOOT.**
+`SHORTCUT_DIR` was a constant pointing at `/desktop`, which is **ramfs**, while
+the persistent volume is the exFAT mount at `/mnt`.  So "a shortcut is a FILE
+so that it survives a reboot" was true about the format and false about the
+outcome — and every document here, including the project's own status file,
+claimed otherwise.  **This is §M63 stage 0's bug exactly, one layer over**, and
+it hid for the same reason: the write SUCCEEDS.
+
+`shortcut_attach_persistent("/mnt")` runs right after the mount on **both**
+entry paths (x86 `kernel_main`, aarch64 `main_entry`) — miss one and that arch
+keeps losing shortcuts while the other keeps them, the shape §M63 already paid
+for.  Creating the directory IS the write test.  It reports which of the two
+modes it is in (`shortcuts persist in /mnt/desktop` vs `will NOT survive a
+reboot`), because a path we merely HOPE is writable turns every later
+`shortcut add` into a silent failure.
+
+**Verification, in the order that makes each step falsifiable.**  `shortcut
+move <name> <col> <row>` is the drop *without a mouse*, so the slot, the swap
+and the two file rewrites are regression-testable on a machine with no display
+(§M60's rule).  `shortcut check` now prints every item's slot, its pixels and
+the view's own hit test at that rectangle, flagging a `MISMATCH` — a placement
+bug and a hit-test bug produce the same checksum and neither shows in a
+screenshot.
+
+| Check | Result |
+|-------|--------|
+| Two shortcuts, one moved to (0,0) | the unplaced one steps aside to the next free slot |
+| The second moved onto (0,0) | they swap; the layout checksum changes |
+| Reboot on a fresh disk | both shortcuts and the slot (2,1) come back |
+| A real mouse drag (press, two hops right, release) | `desktop: shortcut 0 moved (-1,-1) -> (1,0)` |
+| The next boot | reports it at slot (1,0) |
+| `sendkey down/right/left/end/esc` | selection walks two icons in different rows and columns, then clears |
+| `sendkey ret` with a selection | `gui: app-host 'app:Task Manager' up` |
+
+Every mouse hop is under 90 px because the PS/2 delta is a signed byte and one
+big move is clamped (§4.60's lesson, re-paid).  The drop logs itself for a
+reason worth keeping: **a screenshot cannot distinguish an icon that moved from
+one that moved and will be back in its old slot at the next boot** — which is
+exactly the bug this work turned out to contain.
+
+**Also closed here:** the file manager's **Send to desktop** (one row in §M65's
+declared menu model, targeting `file:<path>` — a pointer, not a copy, resolved
+by §M64's one resolver through `GUI_APP_ASSOC`), and the confirmation that
+**`gui.mode` is applied at `gui_start`** — the status text still listed it as
+open, but the code reads it and a reboot brings the desktop up at 1024×768.
+
+**Still open in §M64:** `run:` shortcut targets, which want a terminal window
+that accepts an initial command — a shell change, not a shortcut change, and
+`shortcut_launch` says so rather than doing nothing quietly.  The Send-to-
+desktop menu ROW has not been clicked by a driven pointer (only the code it
+calls is exercised): the harness cannot type a shell command once a GUI window
+has focus, so checking the click means reading the menu's coordinates back out
+of a screendump first.
+
+**Noticed, not investigated, not caused here:** `gui stats` prints nothing on
+the serial log while the GUI is up, though `shortcut list` from the same shell
+does — most likely it writes to the suppressed console rather than through
+`kprintf`.  Written down so it is not rediscovered as a new bug.
 
 ---
 
@@ -8822,6 +8961,26 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-23 — §M64 tail: a desktop you can arrange (DOCS §4.79).**  Drag an
+  icon, walk the field with the arrow keys, open with Enter, and send a file
+  there from the file manager.  A position is a GRID SLOT, not a pixel, because
+  §M61 made the resolution a runtime choice and pixels put an icon off the
+  screen at the next smaller mode — silently, which reads as a deleted
+  shortcut.  Two optional points appended to the item-view interface
+  (`item_model.pos`, `item_view.slot_at`), with `slot_at` optional so a layout
+  can say it cannot be arranged at all rather than swallowing the drop.  A drop
+  onto an occupied slot SWAPS; the live preview is memory-only and the file is
+  written once, on release.  The desktop became the keyboard's focus of last
+  resort, with Enter and Escape gated on it having a selection — otherwise a
+  shell command could not be typed with the desktop up, which would have broken
+  the harness that proves the feature.  **And the bug under it: shortcuts did
+  not survive a reboot** — `/desktop` is ramfs while the persistent volume is
+  the exFAT mount, so "a shortcut is a file so that it survives" was true about
+  the format and false about the outcome; §M63 stage 0's bug one layer over,
+  fixed on both entry paths.  Verified headlessly (`shortcut move`/`check`,
+  which now prints each item's slot AND the view's own hit test at it), across
+  a real reboot, and by driving the mouse and the keyboard.
 
 - **2026-08-23 — §M65: a widget toolkit with a seam (DOCS §4.78).**  Asked for
   from use — components behind one API, swappable by anyone, responsive.  The
