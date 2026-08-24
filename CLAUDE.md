@@ -93,9 +93,39 @@ Both arches get one, `DOS_AUDIO=none` is the deliberate escape (matching
 `DOS_DISK=none`); and `dos-shell-test.py` gained **`--no-display`**, because
 aarch64 has TWO boot paths (framebuffer → full `shell.c` on a VC; none →
 `serial_shell.c` on the PL011) and with the GPU permanently attached *the serial
-one could not be driven or read at all.*  **OPEN:** `/dev/dsp` (stage 3, raw PCM
-from ring 3), mixer/multi-stream, PCM input, Intel HDA, the AC97 completion
-interrupt.
+one could not be driven or read at all.*  **STAGE 3 — `/dev/dsp`, AND THE PACING BUG ITS OWN MEASUREMENT CAUGHT.**  Raw
+PCM as a file (§M59's `/dev/clipboard` argument applied to the speaker: no new
+syscall, and it works for BOTH personalities because a Linux-ABI binary has no
+d-os syscall numbers to call).  **THE NODE BELONGS TO THE SUBSYSTEM, NOT A
+CARD** — registered even with no driver up, so *"this machine cannot play
+audio" and "no such device file" are different answers to a program rather than
+the same one*.  No `SNDCTL_DSP_SPEED`: changing the format is **REFUSED**, not
+accepted-and-ignored, *because silently taking a rate you do not honour plays
+everything at the wrong pitch — the most confusing way an audio device can
+fail.*  **THE BUG:** the first version played whatever each `write()` held, so a
+1000-byte-chunk writer (what a real one is) got a 250-frame playback per call —
+the DMA engine started and halted every 5 ms and the gaps stretched the stream:
+**300 ms written came back as 256.4 ms, 444 Hz as 403.7.**  *The amplitude and
+the L/R pairing were perfect in BOTH runs, and that is what named the fault: the
+framing was right and the PACING was wrong.*  With period buffering: **300.0 ms,
+443.3 Hz, ZERO silent samples inside.**  Hence **devfs grew a `close` HOOK** — a
+write plays only whole periods and the remainder waits, and without a drain
+point the last partial period would be dropped from every sound (*a loss that
+sounds like a truncated file*).  Partial FRAMES carry across writes for a
+sharper reason: *dropping four stray bytes does not lose a sample, it shifts
+every later sample by one channel and swaps left with right for the rest of the
+stream.*  **AND AARCH64 HAD NO `/dev` AT ALL** — `devfs_init()` is called from
+x86's `kernel_main` and this arch runs its OWN entry path, which never called
+it: `ls /dev` answered `(empty)`, so §M59's `/dev/clipboard`, §M39's
+`/dev/urandom` and `/dev/null` were **effectively x86-only, silently** (the
+drivers register into a list; the list was never published as files).  *The
+exFAT mount is why nobody noticed: `/dev/vda` is a devfs node, but a mount
+resolves its volume through the block layer BY NAME, so storage worked without a
+`/dev` to look in.*  Verified on i386 AND aarch64 by `play dsptest`, which
+writes through the VFS in deliberately awkward 1000-byte chunks.  **OPEN:**
+mixer/multi-stream, PCM input, Intel HDA, the AC97 completion interrupt, and
+whether `/dev/vda` should be published on ARM (its block driver initialises
+after `devfs_init` there — not chased).
 
 ✅ **§M64 TAIL — A DESKTOP YOU CAN ARRANGE, AND THE PERSISTENCE IT ONLY CLAIMED
 (2026-08-23, DOCS §4.79, all 3 arches build, i386 driven).**  §M64's three open
