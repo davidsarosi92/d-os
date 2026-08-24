@@ -38,6 +38,8 @@
 #include "pmm.h"
 #include "printf.h"
 #include "driver.h"
+#include "task.h"      /* task_msleep — a wait must not cost a CPU */
+#include "timer.h"     /* timer_ticks_ms — the drain deadline is real time */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -78,6 +80,12 @@
 #define BDL_ENTRIES      32
 #define DMA_FRAMES       32000  /* matches the tone core's cap; ×4 = 128 KB   */
 
+/* Slack on top of the buffer's own duration before the drain wait gives up.
+ * The engine reports completion slightly after the last sample leaves, and an
+ * emulated device under host load can be later still — so this is generous on
+ * purpose: a spurious "timeout" would cut the tail off every sound. */
+#define AC97_DRAIN_GRACE_MS  500
+
 struct bdl_entry {
     uint32_t addr;
     uint16_t samples;
@@ -100,7 +108,11 @@ static struct audio_dev g_audio;
 
 static int ac97_play(struct audio_dev* dev, const int16_t* frames, uint32_t nframes) {
     struct ac97* a = (struct ac97*)dev->priv;
+    /* Clamp, but TELL THE CALLER — the return value is the frame count that
+     * was actually played, so a streaming caller comes back for the rest
+     * instead of losing it (see audio.h). */
     if (nframes > DMA_FRAMES) nframes = DMA_FRAMES;
+    if (nframes == 0) return 0;
 
     /* Copy the caller's PCM into our DMA buffer (phys == virt). */
     for (uint32_t i = 0; i < nframes * 2; i++) a->pcm[i] = frames[i];
@@ -117,15 +129,38 @@ static int ac97_play(struct audio_dev* dev, const int16_t* frames, uint32_t nfra
 
     outb(a->nabm + PO_CR, CR_RPBM);                   /* run                   */
 
-    /* Poll until the DMA controller halts (playback consumed the buffer at
-     * real-time rate).  Bounded so a stuck device can't wedge the shell. */
-    uint32_t spins = 0;
+    /* WAIT FOR THE DMA ENGINE TO HALT — BY SLEEPING, NOT BY SPINNING.
+     *
+     * This used to be `hal_cpu_pause()` in a tight loop for the ENTIRE
+     * duration of the sound: playing three seconds of audio burned three
+     * seconds of a CPU, and on a uniprocessor box it burned the only one.
+     * That is §M49's, §M55's and §M56's lesson for the third time — *waiting
+     * must not cost the same as computing* — and it had survived here because
+     * the only caller was a beep short enough that nobody noticed.  It stops
+     * being unnoticeable the moment a file streams through this function.
+     *
+     * The sleep is the right granularity by construction: the buffer being
+     * waited on is tens of milliseconds long at minimum, so a millisecond
+     * tick cannot make the gap between chunks audible on its own.
+     *
+     * NOT AN INTERRUPT, and the reason is written down rather than left to be
+     * rediscovered: AC97 can raise IOC on buffer completion, and wiring it
+     * would replace this poll with a waitq exactly as §M55 did for the NIC.
+     * It is the next step, not this one — and unlike the spin, a sleeping
+     * poll is already CORRECT, merely coarse.  The deadline is real time, so
+     * a wedged device costs a bounded wait rather than a hung shell. */
+    uint32_t ms_total = (nframes * 1000u) / (dev->rate ? dev->rate : 48000u);
+    uint64_t deadline = timer_ticks_ms() + ms_total + AC97_DRAIN_GRACE_MS;
     while (!(inw(a->nabm + PO_SR) & SR_DCH)) {
-        hal_cpu_pause();
-        if (++spins > 2000000000u) { kprintf("ac97: playback timeout\n"); break; }
+        if (timer_ticks_ms() > deadline) {
+            kprintf("ac97: playback timeout after %u ms\n",
+                    (unsigned)(ms_total + AC97_DRAIN_GRACE_MS));
+            break;
+        }
+        task_msleep(1);
     }
     outb(a->nabm + PO_CR, 0);                          /* stop                  */
-    return 0;
+    return (int)nframes;                               /* frames actually played */
 }
 
 /* ----------------------- Bring-up ----------------------------------------- */

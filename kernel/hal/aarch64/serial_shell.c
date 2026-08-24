@@ -33,6 +33,7 @@
 #include "task.h"
 #include "percpu.h"    /* §M57 — smp_ncpus() for the runqueue audit + storm */
 #include "timer.h"
+#include "audio.h"      /* §M23 stage 2 — lsaudio / play, from the core */
 #include "syscall.h"   /* §M53 stage 3 — timerfd + setitimer self-tests */
 #include "ktimer.h"
 #include "pkg.h"
@@ -643,6 +644,13 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "help"))   cmd_help();
         else if (s_eq(cmd, "echo"))   kprintf("%s\n", args);
         else if (s_eq(cmd, "meminfo"))cmd_meminfo();
+        /* §M23 stage 2 — the same implementation the x86 shell calls (§M24's
+         * rule).  This arch has the audio CORE and no audio DEVICE, so today
+         * they answer "no audio devices" — which is the honest failure, and
+         * strictly better than "unknown command" telling the user the feature
+         * does not exist.  virtio-sound is what fills the gap. */
+        else if (s_eq(cmd, "lsaudio")) audio_list();
+        else if (s_eq(cmd, "play"))    audio_cmd_play(args);
         else if (s_eq(cmd, "free"))   cmd_meminfo();
         else if (s_eq(cmd, "uptime")) kprintf("up %u ms\n", (unsigned)timer_ticks_ms());
         else if (s_eq(cmd, "ktime"))  cmd_ktime();

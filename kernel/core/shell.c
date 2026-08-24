@@ -4123,6 +4123,9 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "lsaudio"))        { audio_list();   return; }
     if (streq(line, "beep"))           { cmd_beep();     return; }
     if (starts_with(line, "tone "))    { cmd_tone(line + 5); return; }
+    /* §M23 stage 2 — the implementation lives in audio.c, not here, so the ARM
+     * serial REPL runs the same one (§M24's rule). */
+    if (starts_with(line, "play "))    { audio_cmd_play(line + 5); return; }
     if (streq(line, "ps"))             { task_list();    return; }
     if (starts_with(line, "kill "))    { cmd_kill(line + 5); return; }
     if (starts_with(line, "fkill "))   { cmd_fkill(line + 6); return; }
