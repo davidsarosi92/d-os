@@ -7,8 +7,9 @@
  * State storage: the `drivers` linker section holds the static descriptors
  * (`struct driver`).  Those go in rodata-style storage and we don't mutate
  * them.  Per-driver runtime state (probed / initialized / failed) lives in
- * a parallel `driver_state_arr` byte array allocated from the heap at
- * `driver_init_all` time and indexed by (d - __start_drivers).
+ * a SLOT TABLE (see below) that holds the descriptor pointer, so a driver
+ * loaded from outside the kernel image is the same kind of thing as one the
+ * linker placed.
  * ============================================================================= */
 
 #include "driver.h"
@@ -22,13 +23,58 @@
 #include "settings.h"
 #include <stddef.h>
 
-/* Parallel state — one byte per registered driver, filled during
- * driver_init_all.  NULL until then; queries before init read 0. */
-static uint8_t* driver_state_arr = NULL;
-static uint32_t driver_count     = 0;
+/* ----------------------------------------------------------------------
+ * The registry is a SLOT TABLE, not the linker array.
+ *
+ * It used to index straight into the `drivers` section — state lived in a
+ * parallel byte array addressed by `d - __start_drivers`.  That is exact and
+ * cheap for drivers built into the image, and it makes a driver from anywhere
+ * else IMPOSSIBLE: a descriptor that is not in the section produces a
+ * meaningless difference, and the state lookup lands wherever that pointer
+ * arithmetic happens to point.
+ *
+ * A slot holds the descriptor pointer instead, so a built-in and a loaded
+ * driver differ only in where their `struct driver` lives.  Bounded like every
+ * other table here, and the ceiling is reported rather than silently applied.
+ * ---------------------------------------------------------------------- */
+#define DRV_MAX_SLOTS 64
 
-static uint32_t driver_index(const struct driver* d) {
-    return (uint32_t)(d - __start_drivers);
+struct drv_slot {
+    struct driver* d;
+    uint8_t        state;
+    uint8_t        dynamic;      /* came from outside the kernel image */
+};
+
+static struct drv_slot g_slots[DRV_MAX_SLOTS];
+static uint32_t        driver_count = 0;
+static int             registry_ready = 0;
+
+static struct drv_slot* slot_of(const struct driver* d) {
+    for (uint32_t i = 0; i < driver_count; i++)
+        if (g_slots[i].d == d) return &g_slots[i];
+    return NULL;
+}
+
+/* Append a descriptor the linker did not place.  This is what a module loader
+ * calls; nothing else should. */
+int driver_attach(struct driver* d) {
+    if (!d || !d->name) return -1;
+    if (!registry_ready) return -2;          /* before driver_init_all */
+    if (driver_find(d->name)) {
+        kprintf("drv: '%s' is already registered\n", d->name);
+        return -3;
+    }
+    if (driver_count >= DRV_MAX_SLOTS) {
+        kprintf("drv: registry full (%d) — '%s' not attached\n",
+                DRV_MAX_SLOTS, d->name);
+        return -4;
+    }
+    g_slots[driver_count].d       = d;
+    g_slots[driver_count].state   = 0;
+    g_slots[driver_count].dynamic = 1;
+    driver_count++;
+    kprintf("drv: attached '%s' (%s)\n", d->name, d->class ? d->class : "?");
+    return 0;
 }
 
 /* Stop every driver that came up, in REVERSE init order.
@@ -50,50 +96,58 @@ static uint32_t driver_index(const struct driver* d) {
  * driver code is how a crash report turns into a second crash — they go
  * straight to hal_reboot() and the comment at those call sites says so. */
 void driver_shutdown_all(void) {
-    if (!driver_state_arr || driver_count == 0) return;
+    if (driver_count == 0) return;
     int stopped = 0;
     for (uint32_t k = driver_count; k > 0; k--) {
-        struct driver* d = &__start_drivers[k - 1];
-        if (!(driver_state_arr[k - 1] & DRV_S_INITED)) continue;
-        if (!d->ops || !d->ops->shutdown) continue;
-        d->ops->shutdown(d->ctx);
-        driver_state_arr[k - 1] &= (uint8_t)~DRV_S_INITED;
+        struct drv_slot* sl = &g_slots[k - 1];
+        if (!(sl->state & DRV_S_INITED)) continue;
+        if (!sl->d->ops || !sl->d->ops->shutdown) continue;
+        sl->d->ops->shutdown(sl->d->ctx);
+        sl->state &= (uint8_t)~DRV_S_INITED;
         stopped++;
     }
     kprintf("drivers: %d stopped\n", stopped);
 }
 
 uint8_t driver_state(const struct driver* d) {
-    if (!driver_state_arr) return 0;
-    uint32_t i = driver_index(d);
-    if (i >= driver_count) return 0;
-    return driver_state_arr[i];
+    struct drv_slot* sl = slot_of(d);
+    return sl ? sl->state : 0;
 }
 
 void driver_init_all(void) {
-    driver_count = (uint32_t)(__stop_drivers - __start_drivers);
-    if (driver_count == 0) {
+    uint32_t built_in = (uint32_t)(__stop_drivers - __start_drivers);
+    if (built_in == 0) {
         kprintf("drivers: registry empty\n");
+        registry_ready = 1;
         return;
+    }
+    if (built_in > DRV_MAX_SLOTS) {
+        kprintf("drivers: %u built in, only %d slots — the rest are ignored\n",
+                built_in, DRV_MAX_SLOTS);
+        built_in = DRV_MAX_SLOTS;
     }
 
-    driver_state_arr = (uint8_t*)kcalloc(driver_count, 1);
-    if (!driver_state_arr) {
-        kprintf("drivers: OOM allocating state array\n");
-        return;
+    /* Seed the slot table from the linker section.  From here on nothing
+     * indexes that section directly — a built-in driver and a loaded one are
+     * the same thing to every operation below. */
+    for (uint32_t i = 0; i < built_in; i++) {
+        g_slots[i].d       = &__start_drivers[i];
+        g_slots[i].state   = 0;
+        g_slots[i].dynamic = 0;
     }
+    driver_count = built_in;
+    registry_ready = 1;
 
     int probed = 0, inited = 0, absent = 0, failed = 0;
     for (uint32_t i = 0; i < driver_count; i++) {
-        struct driver* d = &__start_drivers[i];
+        struct drv_slot* sl = &g_slots[i];
+        struct driver* d = sl->d;
         uint8_t st = 0;
 
         /* Probe — NULL probe means "always present". */
         if (d->ops && d->ops->probe) {
-            int r = d->ops->probe(d->ctx);
-            if (r != 0) {
-                st |= DRV_S_PROBE_FAIL;
-                driver_state_arr[i] = st;
+            if (d->ops->probe(d->ctx) != 0) {
+                sl->state = DRV_S_PROBE_FAIL;
                 absent++;
                 continue;
             }
@@ -106,45 +160,42 @@ void driver_init_all(void) {
             int r = d->ops->init(d->ctx);
             if (r != 0) {
                 st |= DRV_S_INIT_FAIL;
-                driver_state_arr[i] = st;
-                kprintf("driver %s (%s) init failed: %d\n",
-                        d->name, d->class, r);
+                sl->state = st;
+                kprintf("driver %s (%s) init failed: %d\n", d->name, d->class, r);
                 failed++;
                 continue;
             }
         }
         st |= DRV_S_INITED;
-        driver_state_arr[i] = st;
+        sl->state = st;
         inited++;
     }
 
     kprintf("drivers: %u registered (%d ok, %d absent, %d failed)\n",
             driver_count, inited, absent, failed);
+    (void)probed;
 }
 
-/* Map state bits to a short label for the lsdrv view. */
 static const char* state_label(uint8_t st) {
     if (st & DRV_S_QUARANTINE) return "QUARANTINED";
+    if (st & DRV_S_ADMIN_DOWN) return "stopped";
     if (st & DRV_S_INITED)     return "OK";
-    if (st & DRV_S_INIT_FAIL)  return "init-fail";
+    if (st & DRV_S_INIT_FAIL)  return "INIT FAILED";
     if (st & DRV_S_PROBE_FAIL) return "absent";
     if (st & DRV_S_PROBED)     return "probed";
-    return "registered";
+    return "-";
 }
 
 void driver_list(void) {
-    if (driver_count == 0) {
-        kprintf("drivers: registry empty\n");
-        return;
-    }
-    kprintf("drivers (%u registered):\n", driver_count);
+    if (driver_count == 0) { kprintf("drivers: registry empty\n"); return; }
+    kprintf("drivers (%u):\n", driver_count);
     for (uint32_t i = 0; i < driver_count; i++) {
-        struct driver* d = &__start_drivers[i];
-        kprintf("  [%s] %s v%s — %s\n",
-                d->class ? d->class : "?",
-                d->name  ? d->name  : "(unnamed)",
-                d->version ? d->version : "?",
-                state_label(driver_state_arr ? driver_state_arr[i] : 0));
+        struct drv_slot* sl = &g_slots[i];
+        kprintf("  [%s] %s v%s — %s%s\n",
+                sl->d->class ? sl->d->class : "?", sl->d->name,
+                sl->d->version ? sl->d->version : "?",
+                state_label(sl->state),
+                sl->dynamic ? "  (loaded)" : "");
     }
 }
 
@@ -158,19 +209,18 @@ static int str_eq(const char* a, const char* b) {
 }
 
 struct driver* driver_find(const char* name) {
-    uint32_t n = (uint32_t)(__stop_drivers - __start_drivers);
-    for (uint32_t i = 0; i < n; i++)
-        if (__start_drivers[i].name && str_eq(__start_drivers[i].name, name))
-            return &__start_drivers[i];
+    for (uint32_t i = 0; i < driver_count; i++)
+        if (g_slots[i].d->name && str_eq(g_slots[i].d->name, name))
+            return g_slots[i].d;
     return NULL;
 }
 
 int driver_stop(const char* name) {
     struct driver* d = driver_find(name);
     if (!d) { kprintf("drv: no driver '%s'\n", name); return -1; }
-    uint32_t i = driver_index(d);
-    if (!driver_state_arr || i >= driver_count) return -1;
-    if (!(driver_state_arr[i] & DRV_S_INITED)) {
+    struct drv_slot* sl = slot_of(d);
+    if (!sl) return -1;
+    if (!(sl->state & DRV_S_INITED)) {
         kprintf("drv: '%s' is not running\n", name);
         return -2;
     }
@@ -183,16 +233,17 @@ int driver_stop(const char* name) {
         return -3;
     }
     d->ops->shutdown(d->ctx);
-    driver_state_arr[i] &= (uint8_t)~DRV_S_INITED;
+    sl->state &= (uint8_t)~DRV_S_INITED;
+    sl->state |= DRV_S_ADMIN_DOWN;          /* stays down until asked back */
     kprintf("drv: stopped '%s'\n", name);
     return 0;
 }
 
 void driver_fault(const char* name, const char* why) {
     struct driver* d = driver_find(name);
-    if (!d || !driver_state_arr) return;
-    uint32_t i = driver_index(d);
-    if (i >= driver_count) return;
+    if (!d) return;
+    struct drv_slot* sl = slot_of(d);
+    if (!sl) return;
 
     klog(KLOG_WARN, "drv", "'%s' faulted: %s\n", name, why ? why : "no reason given");
 
@@ -200,64 +251,65 @@ void driver_fault(const char* name, const char* why) {
      * the point is that nothing restarts it, not that we can always take it
      * down cleanly — and saying which of the two happened matters more than
      * pretending they are the same. */
-    if ((driver_state_arr[i] & DRV_S_INITED) && d->ops && d->ops->shutdown) {
+    if ((sl->state & DRV_S_INITED) && d->ops && d->ops->shutdown) {
         d->ops->shutdown(d->ctx);
-        driver_state_arr[i] &= (uint8_t)~DRV_S_INITED;
+        sl->state &= (uint8_t)~DRV_S_INITED;
         kprintf("drv: '%s' stopped and quarantined\n", name);
     } else {
         kprintf("drv: '%s' quarantined (could not be stopped)\n", name);
     }
-    driver_state_arr[i] |= DRV_S_QUARANTINE;
+    sl->state |= DRV_S_QUARANTINE;
 }
 
 int driver_start(const char* name) {
     struct driver* d = driver_find(name);
     if (!d) { kprintf("drv: no driver '%s'\n", name); return -1; }
-    uint32_t i = driver_index(d);
-    if (!driver_state_arr || i >= driver_count) return -1;
-    if (driver_state_arr[i] & DRV_S_INITED) {
+    struct drv_slot* sl = slot_of(d);
+    if (!sl) return -1;
+    if (sl->state & DRV_S_INITED) {
         kprintf("drv: '%s' is already running\n", name);
         return -2;
     }
     if (d->ops && d->ops->probe && d->ops->probe(d->ctx) != 0) {
         kprintf("drv: '%s' — hardware not present\n", name);
-        driver_state_arr[i] |= DRV_S_PROBE_FAIL;
+        sl->state |= DRV_S_PROBE_FAIL;
         return -3;
     }
-    driver_state_arr[i] |= DRV_S_PROBED;
+    sl->state |= DRV_S_PROBED;
     /* An explicit start is the user overruling the quarantine — that is what
      * makes quarantine a pause rather than a death sentence. */
-    driver_state_arr[i] &= (uint8_t)~(DRV_S_PROBE_FAIL | DRV_S_INIT_FAIL |
-                                      DRV_S_QUARANTINE);
+    sl->state &= (uint8_t)~(DRV_S_PROBE_FAIL | DRV_S_INIT_FAIL |
+                            DRV_S_QUARANTINE | DRV_S_ADMIN_DOWN);
     if (d->ops && d->ops->init && d->ops->init(d->ctx) != 0) {
-        driver_state_arr[i] |= DRV_S_INIT_FAIL;
+        sl->state |= DRV_S_INIT_FAIL;
         kprintf("drv: '%s' failed to start\n", name);
         return -4;
     }
-    driver_state_arr[i] |= DRV_S_INITED;
+    sl->state |= DRV_S_INITED;
     kprintf("drv: started '%s'\n", name);
     return 0;
 }
 
 int driver_rescan(void) {
-    if (!driver_state_arr) return 0;
     int started = 0;
     for (uint32_t i = 0; i < driver_count; i++) {
-        struct driver* d = &__start_drivers[i];
-        if (driver_state_arr[i] & DRV_S_INITED) continue;
+        struct drv_slot* sl = &g_slots[i];
+        struct driver* d = sl->d;
+        if (sl->state & DRV_S_INITED) continue;
         /* A driver that FAILED to init is not retried here: re-running an
          * init that just failed, on a timer, is a loop that fills the log and
          * fixes nothing (§M29's crash-loop backoff, same reasoning).  It takes
          * an explicit `drv start`. */
-        if (driver_state_arr[i] & DRV_S_INIT_FAIL) continue;
-        if (driver_state_arr[i] & DRV_S_QUARANTINE) continue;   /* held back */
+        if (sl->state & DRV_S_INIT_FAIL) continue;
+        if (sl->state & DRV_S_QUARANTINE) continue;   /* held back: faulted */
+        if (sl->state & DRV_S_ADMIN_DOWN)  continue;   /* held back: by hand */
         if (d->ops && d->ops->probe && d->ops->probe(d->ctx) != 0) continue;
         if (d->ops && d->ops->init && d->ops->init(d->ctx) != 0) {
-            driver_state_arr[i] |= DRV_S_INIT_FAIL;
+            sl->state |= DRV_S_INIT_FAIL;
             continue;
         }
-        driver_state_arr[i] |= DRV_S_PROBED | DRV_S_INITED;
-        driver_state_arr[i] &= (uint8_t)~DRV_S_PROBE_FAIL;
+        sl->state |= DRV_S_PROBED | DRV_S_INITED;
+        sl->state &= (uint8_t)~DRV_S_PROBE_FAIL;
         kprintf("drv: '%s' appeared — started\n", d->name);
         started++;
     }

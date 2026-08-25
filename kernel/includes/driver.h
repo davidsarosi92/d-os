@@ -97,6 +97,12 @@ void system_reboot(void);
  * ---------------------------------------------------------------------- */
 struct driver* driver_find(const char* name);
 
+/* Add a descriptor the LINKER did not place — what a module loader calls once
+ * it has relocated a driver into kernel memory.  The registry keeps slots
+ * rather than indexing the `drivers` section precisely so that a loaded driver
+ * and a built-in one are the same kind of thing everywhere else. */
+int driver_attach(struct driver* d);
+
 /* Stop one driver: run its shutdown hook and clear INITED.  Returns 0 on
  * success, non-zero if it was not running or has no way to stop. */
 int driver_stop(const char* name);
@@ -137,6 +143,13 @@ void driver_cmd(const char* args);
  * notices.  That is §M33's execution domains, and calling this isolation would
  * be exactly the "isolation theatre" that plan refuses. */
 #define DRV_S_QUARANTINE  0x10
+/* Stopped BY HAND.  Distinct from quarantine — "the user turned it off" and
+ * "it misbehaved" are different facts and `lsdrv` should not conflate them —
+ * but with the same effect on the automatic paths: neither is restarted
+ * behind the user's back.  Without this a `drv stop` (or the stop half of a
+ * swap) was silently undone by the next hot-plug rescan, about two seconds
+ * later, which looks like the command did nothing. */
+#define DRV_S_ADMIN_DOWN  0x20
 
 uint8_t driver_state(const struct driver* d);
 
