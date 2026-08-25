@@ -9221,6 +9221,32 @@ adds a second set of controls — stated in ui.h because the first attempt did
 exactly that), and there is no keyboard route into the table's rows beyond the
 item view's own arrows.
 
+### 4.78.0 `/dev/<name>` belongs to the block layer, not to a driver
+
+**2026-08-25.**  `/dev/vda` existed on x86 and simply did not on aarch64 — the
+same disk, a file on one architecture and not on the other.  The cause was
+placement: `devfs_register` was called by the *x86 virtio-blk driver*, and the
+ARM driver registers the same abstract block device without it.  The
+"one-arch-only feature" shape §M63 has now paid for three times.
+
+The adapter needs nothing a driver knows.  Sector size and the read/write ops
+all live in `struct block_device`, so the "treat the disk as one big file" view
+moved into `blk_register()` — the call every block driver on every architecture
+already makes — with the device itself as the `ctx`.  The driver-local copy was
+deleted rather than left as dead code.
+
+Whole sectors only, refused loudly rather than silently rounded: a write that
+lands on the wrong sector boundary corrupts a filesystem in a way nothing
+reports until much later.  A device beyond the bounded node pool still works
+for mounts and for `blk`; it just has no `/dev` entry, and the log says which
+of the two happened.
+
+**Verified:** aarch64 with a disk now lists `vda` alongside `random urandom dsp
+clipboard zero null` and `blk` reads through it; aarch64 *without* a disk shows
+no `vda`, so the node follows the hardware rather than being a phantom; and
+i386 is unchanged — the device registers, exFAT mounts, and the persistent
+config and desktop shortcuts load from it.
+
 ### 4.78.1 exFAT can rename now — the last NULL in the ops table (§M12)
 
 **2026-08-25.**  `.rename` was the one operation `exfat_inode_ops_dir` still

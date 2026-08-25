@@ -350,38 +350,13 @@ static int vblk_write_op(struct block_device* dev, uint64_t lba,
     return vblk_request(v, VIRTIO_BLK_T_OUT, lba, (void*)buf, count);
 }
 
-/* ----------------------- devfs adapter ------------------------------------ */
-
-/* Read N bytes at offset `off` from the device.  Implements the simple
- * "treat the disk as one big file" view.  `cat /dev/vda | head -c 512`
- * (when pipes exist) — for now we use it via the blktest command. */
-static ssize_t vblk_devfs_read(void* ctx, void* buf, size_t n, uint64_t off) {
-    (void)ctx;
-    if (!g_vblk_present) return -1;
-    /* Only sector-aligned full-sector reads supported in this milestone.
-     * A partial-byte read would need a bounce buffer; not yet. */
-    if (off  % SECTOR_SIZE) return -1;
-    if (n    % SECTOR_SIZE) return -1;
-    uint32_t count = (uint32_t)(n / SECTOR_SIZE);
-    if (vblk_read_op(&g_vda, off / SECTOR_SIZE, count, buf) != 0) return -1;
-    return (ssize_t)n;
-}
-
-static ssize_t vblk_devfs_write(void* ctx, const void* buf, size_t n, uint64_t off) {
-    (void)ctx;
-    if (!g_vblk_present) return -1;
-    if (off % SECTOR_SIZE) return -1;
-    if (n   % SECTOR_SIZE) return -1;
-    uint32_t count = (uint32_t)(n / SECTOR_SIZE);
-    if (vblk_write_op(&g_vda, off / SECTOR_SIZE, count, buf) != 0) return -1;
-    return (ssize_t)n;
-}
-
-static struct devfs_node vda_devfs_node = {
-    .name = "vda", .kind = DEVFS_BLOCK,
-    .read = vblk_devfs_read, .write = vblk_devfs_write, .ioctl = NULL, .ctx = NULL,
-    ._next = NULL,
-};
+/* ----------------------- devfs adapter ------------------------------------ *
+ * REMOVED.  The "treat the disk as one big file" view needs nothing this
+ * driver knows — sector size and the read/write ops all live in `struct
+ * block_device` — so it moved into blk_register(), which every block driver on
+ * every architecture already calls.  It was here, and only here, which is why
+ * /dev/vda existed on x86 and not on aarch64.
+ * -------------------------------------------------------------------------- */
 
 /* ----------------------- DRIVER() lifecycle ------------------------------- */
 
@@ -449,8 +424,10 @@ static int vblk_init(void* ctx) {
     g_vda.next         = NULL;
     blk_register(&g_vda);
 
-    /* Expose as /dev/vda. */
-    devfs_register(&vda_devfs_node);
+    /* /dev/vda is published by blk_register() now — by the layer every block
+     * driver shares, so aarch64's driver gets it too instead of this being an
+     * x86-only convenience.  Registering here as well would be a duplicate
+     * name in devfs. */
 
     g_vblk_present = 1;
     kprintf("virtio-blk: %u sectors at PCI %u:%u.%u io=%x irq=%u\n",
