@@ -1068,11 +1068,21 @@ int audio_record_wav(const char* path, uint32_t ms) {
 
     uint64_t t0 = timer_ticks_ms();
     uint32_t done = 0;
+    uint32_t first_ms = 0, first_frames = 0;   /* the FIRST buffer, measured  */
     while (done < total) {
         uint32_t want = total - done;
         if (want > WAV_OUT_FRAMES) want = WAV_OUT_FRAMES;
         int got = dev->record(dev, g_wav_out, want);
         if (got <= 0) break;
+        /* THE FIRST BUFFER IS THE DEVICE'S OWN FILL RATE, with no backlog and
+         * no accumulation behind it: a buffer of N frames cannot arrive faster
+         * than N/rate seconds unless the device is producing faster than the
+         * rate it reports.  One number that separates "our loop" from "the
+         * device" — the whole reason the overall ratio was ambiguous. */
+        if (!done) {
+            first_ms     = (uint32_t)(timer_ticks_ms() - t0);
+            first_frames = (uint32_t)got;   /* what it ACTUALLY returned */
+        }
         vfs_write(f, g_wav_out, (size_t)got * 4);
         done += (uint32_t)got;
     }
@@ -1081,8 +1091,32 @@ int audio_record_wav(const char* path, uint32_t ms) {
 
     kprintf("rec: %s — %u of %u frames (%u ms asked, %u ms elapsed) at %u Hz\n",
             path, done, total, ms, elapsed, rate);
+    /* Compare against the frames the call ACTUALLY returned, not the frames we
+     * asked for: the driver clamps to its own buffer size, and the first
+     * version of this line printed the request (4096 frames / 85 ms) against a
+     * device that had handed back 1024 (21 ms) — an instrument that reports
+     * the wrong expectation is worse than no instrument, because the number it
+     * prints looks authoritative. */
+    if (first_frames)
+        kprintf("rec: first buffer %u frames in %u ms (nominal %u ms at %u Hz)\n",
+                first_frames, first_ms, (first_frames * 1000u) / rate, rate);
     if (done < total)
         kprintf("rec: SHORT — the header promises %u frames\n", total);
+
+    /* THE FILE IS FINE; THE TIMELINE IS THE THING TO REPORT.  A device that
+     * hands over frames faster than real time still produces the right NUMBER
+     * of them, so the recording plays back at the right length — but it did
+     * not take the time it should have, and with a real microphone that is the
+     * signature of an overrun: the samples being copied out are not the ones
+     * that were arriving while we were away.
+     *
+     * Measured here as QEMU's AC97 input with the `none` backend, which is not
+     * rate-limited; virtio-sound on the same core paces to within 1 %.  Said
+     * out loud rather than smoothed over with a sleep, because the sleep would
+     * make the number look right without making the audio right. */
+    if (elapsed && elapsed * 10u < ms * 9u)
+        kprintf("rec: captured FASTER than real time (%u ms for %u ms of audio)"
+                " — the device is not rate-limiting its input\n", elapsed, ms);
     return done ? 0 : -1;
 }
 

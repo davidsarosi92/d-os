@@ -122,6 +122,10 @@
  * cover the gap between mix passes and little enough that the volume slider
  * still feels attached to what you hear. */
 #define AC97_DEPTH       4
+/* How far the CAPTURE engine may run ahead of the reader, in buffers.  Small
+ * for the reason above: the runway is latency on the way in, and a long one
+ * lets the device lap the reader. */
+#define AC97_REC_DEPTH   4
 #define DMA_FRAMES       AC97_BUF_FRAMES
 
 /* Slack on top of the buffer's own duration before the drain wait gives up.
@@ -322,7 +326,14 @@ static void ac97_rec_start(struct ac97* a) {
     }
     outw(a->nabm + PI_SR, 0x1C);
     outl(a->nabm + PI_BDBAR, a->rec_bdl_phys);
-    outb(a->nabm + PI_LVI, (uint8_t)(AC97_NBUF - 1));
+    /* THE READER PACES THE DEVICE.  Handing the engine the whole ring lets it
+     * run a full 32 buffers — ~680 ms — ahead of whoever is reading, and then
+     * a `rec` drains that backlog faster than real time: 1000 ms of frames
+     * arrived in 804.  Worse, once it laps the reader the samples being copied
+     * out have already been overwritten, so the count stays right while the
+     * audio is wrong.  A window of AC97_REC_DEPTH buffers keeps the device
+     * just ahead of the reader and no further. */
+    outb(a->nabm + PI_LVI, (uint8_t)(AC97_REC_DEPTH - 1));
     outb(a->nabm + PI_CR, CR_RPBM);
     a->rec_next = 0;
     a->rec_running = 1;
@@ -356,11 +367,13 @@ static int ac97_record(struct audio_dev* dev, int16_t* frames, uint32_t nframes)
     const int16_t* src = a->rec_pcm + (size_t)a->rec_next * AC97_BUF_FRAMES * 2;
     for (uint32_t i = 0; i < nframes * 2; i++) frames[i] = src[i];
 
-    /* Hand the slot back: re-arm it and move LVI so the engine may reuse it. */
+    /* Hand the slot back and move the window on by one, so the engine gains
+     * exactly the buffer we just freed — never more. */
     a->rec_bdl[a->rec_next].samples = (uint16_t)(AC97_BUF_FRAMES * 2);
     a->rec_bdl[a->rec_next].control = BDL_IOC;
-    outb(a->nabm + PI_LVI, (uint8_t)a->rec_next);
     a->rec_next = (a->rec_next + 1) & (AC97_NBUF - 1);
+    outb(a->nabm + PI_LVI,
+         (uint8_t)((a->rec_next + AC97_REC_DEPTH - 1) & (AC97_NBUF - 1)));
     return (int)nframes;
 }
 
@@ -449,6 +462,15 @@ static int ac97_init(void* ctx) {
     g_audio.period_frames = 1024;
     g_audio.priv     = &g_ac97;
     audio_register(&g_audio);
+
+    /* READ THE RATES BACK.  A codec CLAMPS what it cannot do, so believing the
+     * write leaves the driver assuming a rate the hardware is not using — and
+     * capture is measurably running ~20 %% fast, which is exactly what a rate
+     * mismatch looks like from outside.  §M61 made the same argument about
+     * mode setting: read it back, do not believe the write. */
+    kprintf("ac97: ext_audio=%x ext_ctrl=%x dac_rate=%u adc_rate=%u\n",
+            inw(nam + NAM_EXT_AUDIO), inw(nam + NAM_EXT_CTRL),
+            inw(nam + NAM_PCM_DAC_RATE), inw(nam + NAM_PCM_ADC_RATE));
 
     kprintf("ac97: up at PCI %u:%u.%u nam=%x nabm=%x\n",
             pd.bus, pd.slot, pd.func, nam, nabm);

@@ -3291,9 +3291,42 @@ That is a narrowing, not a diagnosis, and it is where the next look should
 start.  The round trip works on both: `rec` then `play` reproduces
 48000 frames / 1000 ms.
 
-**Still open:** the AC97 capture rate above, Intel HDA, an interrupt for
-virtio-sound (its used ring is already exact, so this would only save the 1 ms
-poll), and whether `/dev/vda` should be published on ARM.
+#### The AC97 capture rate, chased to a conclusion
+
+The 0.8× above turned out to be worth following.  **Four hypotheses were
+eliminated by measurement, which is the part worth keeping** — a future reader
+should not repeat them:
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| the codec is not at 48 kHz | read `PCM_DAC_RATE`/`PCM_ADC_RATE` back | both report **48000**, VRA enabled |
+| the engine runs a full ring ahead and we drain a backlog | bound the runway to 4 buffers via `LVI` | **no change** (806 vs 804 ms) |
+| the core or the backend under-paces generally | compare virtio-sound on the same core and backend | it paces to **99 %** |
+| a real backend would behave differently | `-audiodev coreaudio` | **0 frames** — no microphone access headless; cannot arbitrate |
+
+The measurement that settled it is the **first buffer of a session**: 1024
+frames cannot arrive faster than 21 ms if the device is producing at the rate
+it reports, and on the second recording it arrived in **5 ms**.  So QEMU's AC97
+input with the `none` backend is not rate-limited; it produces silence as fast
+as the DMA asks.  Nothing in the driver, the codec setup or the read loop is
+implicated.
+
+*The instrument lied first, and that is recorded too:* the initial version of
+this line printed the frames REQUESTED (4096 / 85 ms) against a device that had
+returned 1024 (21 ms).  A diagnostic that reports the wrong expectation is
+worse than none, because its number looks authoritative.
+
+**What was done about it.**  Not a sleep to make the number look right — the
+file is already correct (the frame count is exact, so it plays back at the
+right length) and padding the elapsed time would hide the condition rather than
+fix it.  `rec` now *says* it: `captured FASTER than real time (810 ms for
+1000 ms of audio) — the device is not rate-limiting its input`.  With a real
+microphone that same message is the signature of an **overrun**, which is
+exactly when a user needs to see it.
+
+**Still open:** Intel HDA, an interrupt for virtio-sound (its used ring is
+already exact, so this would only save the 1 ms poll), and whether `/dev/vda`
+should be published on ARM.
 
 ### 4.26 Audio — AC97 codec + PCM output (M23, i386)
 
