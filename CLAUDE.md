@@ -65,10 +65,28 @@ with one silently dropped*); playback length exact at 200.0/300.0/600.0 ms; with
 `volume 50`+mute the muted run gives **no non-silent stretch at all** and the
 unmuted one peaks at **4000 = 8000×128/256**; no device → grey button
 (0x5A6478) + "No audio device"; muted → blue (0x3D6FB8) + cross, logging
-`master 256/256 (muted)` (**the level PRESERVED, not zeroed**).  **OPEN:** PCM
-input, Intel HDA, the AC97 completion IRQ, queueing the next period before the
-current drains (what would shrink the ~85 ms latency), and whether `/dev/vda`
-should be published on ARM.
+`master 256/256 (muted)` (**the level PRESERVED, not zeroed**).  **STAGE 5 — BOTH DRIVERS QUEUE; MIXER LATENCY 85 ms → 21 ms.**  `play` returns
+on QUEUEING and blocks when the device's queue is full (still real-time paced —
+a slot frees only when the hardware consumes one); new `drain` waits for the
+sound to actually end; and **the DEVICE advertises `period_frames`** so a
+queueing driver is not held to a non-queueing one's latency.  **THREE BUGS,
+EACH FOUND BY MEASURING:** (1) the ring used 4 of the BDL's 32 entries so **LVI
+wrapped BACKWARDS**, which the engine reads as "already past the end" — it
+halts and skips queued buffers (*300 ms came back as 129, 600 as 88*); the ring
+must wrap over the WHOLE list.  (2) 3–10 ms missing off the end, variably —
+`audio_stream_close` called `drain` while the pump could still be queueing the
+last period, *stopping the engine out from under it*; **this file's own header
+says one pump owns the device and I broke that rule three functions later.**
+(3) A few ms still gone: **`DCH` means the DMA halted, not that the codec
+emptied** — a settle before clearing the run bit, MEASURED not guessed (at
+30 ms the capture held the last sample and 200 ms read as 231; at 4 ms exact).
+*`BDL_BUP` was the obvious suspect and was measured INNOCENT* — removed anyway
+because it means "this is the last buffer" and that is wrong in a ring.
+**MEASURED: x86 exact at 200.0/600.0/1000.0 ms (0.9 % short at 300), aarch64
+exact at 200.0/300.0/600.0, zero silent samples, two streams still peak at
+exactly 10000, WAV unchanged.**  **OPEN:** PCM input, Intel HDA, the AC97
+completion IRQ (would replace the drain poll with a waitq and retire the settle
+constant), and whether `/dev/vda` should be published on ARM.
 
 ✅ **§M23 STAGE 2 — A WAV PLAYER, AND THE TWO SILENT TRUNCATIONS UNDER IT
 (2026-08-24, DOCS §4.26.1, i386 + x86_64 measured, all 3 arches build).**

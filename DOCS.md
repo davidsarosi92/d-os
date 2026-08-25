@@ -3184,9 +3184,25 @@ short at 300 (0.9 %); zero silent samples inside; two streams still peak at
 exactly 10000; the WAV path is unchanged at 299.3 ms / ±18432 / 439.3 Hz; and
 aarch64, whose driver does not queue, is untouched at 300.0 ms.
 
+**virtio-sound queues too**, so both architectures now run at the same ~21 ms
+period.  A TX message is three descriptors, so the ring holds `qsz / 3` chains
+and each in-flight buffer owns its own header, payload and status — sharing one
+set would mean the device reading the payload and writing the status of an
+*earlier* buffer while the next is being filled.  The chain count comes from
+the **negotiated** ring size rather than the compile-time one: a device may
+offer fewer, and overrunning the ring shows up as "audio stops after a while"
+rather than as an error.
+
+aarch64 measures **200.0, 300.0 and 600.0 ms exact** with zero silent samples —
+marginally better than x86, which is 0.9 % short at one length.  Two streams
+still peak at exactly 10000 there; the total span reads longer than the test's
+nominal length because the two streams are started from two independently
+spawned tasks and do not begin on the same millisecond, which is what the peak
+proves they nonetheless *overlapped*.
+
 **Still open:** PCM input, Intel HDA, the AC97 completion interrupt (which would
-replace the drain poll with a waitq, §M55's shape), queueing in the virtio-sound
-driver too, and whether `/dev/vda` should be published on ARM.
+replace the drain poll with a waitq, §M55's shape, and retire the measured
+settle constant), and whether `/dev/vda` should be published on ARM.
 
 ### 4.26 Audio — AC97 codec + PCM output (M23, i386)
 

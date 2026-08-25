@@ -93,7 +93,11 @@
 #define VIRTIO_DEVID_SOUND 25
 #define VIRTIO_F_VERSION_1_BIT 0
 
-#define QSIZE 8                      /* control/tx rings: we use one at a time */
+/* TX needs THREE descriptors per message (header, payload, status), so the
+ * ring has to hold 3 x the number of buffers we want in flight.  16 gives four
+ * chains with room to spare; the negotiated size is still checked at run time,
+ * because a device is entitled to offer fewer. */
+#define QSIZE 16
 
 struct virtq_desc  { uint64_t addr; uint32_t len; uint16_t flags; uint16_t next; } __attribute__((packed));
 struct virtq_avail { uint16_t flags; uint16_t idx; uint16_t ring[QSIZE]; uint16_t used_event; } __attribute__((packed));
@@ -162,9 +166,13 @@ struct snd_pcm_status { uint32_t status; uint32_t latency_bytes; } __attribute__
  * stereo frames = ~85 ms at 48 kHz: long enough that the millisecond-granular
  * completion wait cannot make the gap between periods audible, short enough
  * that a `play` caller is not blocked for a noticeable time in one call. */
-#define SND_PERIOD_FRAMES 4096
+/* One period per queued buffer.  1024 frames = ~21 ms, the same as the AC97
+ * driver asks for — affordable for the same reason: this driver QUEUES, so a
+ * short period no longer means a gap at every boundary. */
+#define SND_PERIOD_FRAMES 1024
 #define SND_PERIOD_BYTES  (SND_PERIOD_FRAMES * 4)
-#define SND_BUFFER_BYTES  (SND_PERIOD_BYTES * 2)
+#define SND_NBUF          4      /* buffers in flight; the depth IS the latency */
+#define SND_BUFFER_BYTES  (SND_PERIOD_BYTES * SND_NBUF)
 
 struct snd_dev {
     uintptr_t base;
@@ -187,9 +195,14 @@ struct snd_dev {
      * live for the device's lifetime; the identity map makes virt == phys. */
     uint8_t  req[64]   __attribute__((aligned(16)));
     uint8_t  resp[512] __attribute__((aligned(16)));
-    struct snd_pcm_xfer   xfer   __attribute__((aligned(16)));
-    struct snd_pcm_status status __attribute__((aligned(16)));
-    int16_t  pcm[SND_PERIOD_FRAMES * 2] __attribute__((aligned(16)));
+    /* One set per in-flight buffer.  They cannot share: the device is reading
+     * the payload and writing the status of an EARLIER buffer while we fill
+     * the next, so a single set would be overwritten mid-playback. */
+    struct snd_pcm_xfer   xfer[SND_NBUF]   __attribute__((aligned(16)));
+    struct snd_pcm_status status[SND_NBUF] __attribute__((aligned(16)));
+    int16_t  pcm[SND_NBUF][SND_PERIOD_FRAMES * 2] __attribute__((aligned(16)));
+    uint16_t tsub;                          /* buffers submitted so far      */
+    uint16_t nchains;                       /* how many the ring can hold    */
 };
 
 static struct snd_dev   g_snd;
@@ -260,51 +273,88 @@ static int ctrl_simple(struct snd_dev* d, uint32_t code) {
 
 /* ---- playback --------------------------------------------------------------- */
 
+/* How many buffers the device has not finished with.  `tsub` counts what we
+ * submitted, the used ring's index counts what came back — both 16-bit and
+ * both monotonic, so the difference is the answer even across a wrap. */
+static uint16_t snd_outstanding(struct snd_dev* d) {
+    return (uint16_t)(d->tsub - *(const volatile uint16_t*)&d->tused.idx);
+}
+
+static void snd_drain(struct audio_dev* dev) {
+    struct snd_dev* d = (struct snd_dev*)dev->priv;
+    if (!d->ready) return;
+    /* Bounded by what can actually be in flight, so a device that stops
+     * answering costs a wait rather than a hung shell. */
+    uint64_t deadline = timer_ticks_ms() +
+                        (SND_NBUF * SND_PERIOD_FRAMES * 1000ull) /
+                        (dev->rate ? dev->rate : 48000u) + 500;
+    while (snd_outstanding(d)) {
+        if (timer_ticks_ms() > deadline) {
+            klog(KLOG_WARN, "audio", "virtio-snd: drain timed out\n");
+            break;
+        }
+        task_msleep(1);
+    }
+    if (r32(d->base, R_INTSTATUS) & 1) w32(d->base, R_INTACK, 1);
+}
+
 static int snd_play(struct audio_dev* dev, const int16_t* frames, uint32_t nframes) {
     struct snd_dev* d = (struct snd_dev*)dev->priv;
     if (!d->ready) return -1;
     if (nframes > SND_PERIOD_FRAMES) nframes = SND_PERIOD_FRAMES;
     if (nframes == 0) return 0;
 
-    for (uint32_t i = 0; i < nframes * 2; i++) d->pcm[i] = frames[i];
-    d->xfer.stream_id     = d->stream_id;
-    d->status.status      = 0;
-    d->status.latency_bytes = 0;
+    /* BLOCK WHILE THE QUEUE IS FULL — the pacing, now that this returns on
+     * queueing rather than on playback.  Sleep, never spin. */
+    uint16_t depth = d->nchains < SND_NBUF ? d->nchains : SND_NBUF;
+    uint64_t deadline = timer_ticks_ms() +
+                        (SND_NBUF * SND_PERIOD_FRAMES * 1000ull) /
+                        (dev->rate ? dev->rate : 48000u) + 500;
+    while (snd_outstanding(d) >= depth) {
+        if (timer_ticks_ms() > deadline) {
+            klog(KLOG_WARN, "audio", "virtio-snd: queue stuck\n");
+            return -1;
+        }
+        task_msleep(1);
+    }
 
-    /* THREE descriptors, and the split is not cosmetic: the header and the
-     * payload are what the DEVICE reads, the status is what it WRITES back.
-     * A status descriptor without VRING_DESC_F_WRITE is rejected, and a
-     * rejected buffer is silence with nothing logged anywhere. */
-    d->tdesc[0].addr  = (uint64_t)(uintptr_t)&d->xfer;
-    d->tdesc[0].len   = sizeof d->xfer;
-    d->tdesc[0].flags = VRING_DESC_F_NEXT;
-    d->tdesc[0].next  = 1;
-    d->tdesc[1].addr  = (uint64_t)(uintptr_t)d->pcm;
-    d->tdesc[1].len   = nframes * 4;
-    d->tdesc[1].flags = VRING_DESC_F_NEXT;
-    d->tdesc[1].next  = 2;
-    d->tdesc[2].addr  = (uint64_t)(uintptr_t)&d->status;
-    d->tdesc[2].len   = sizeof d->status;
-    d->tdesc[2].flags = VRING_DESC_F_WRITE;
-    d->tdesc[2].next  = 0;
+    uint32_t slot = d->tsub % depth;
+    for (uint32_t i = 0; i < nframes * 2; i++) d->pcm[slot][i] = frames[i];
+    d->xfer[slot].stream_id      = d->stream_id;
+    d->status[slot].status        = 0;
+    d->status[slot].latency_bytes = 0;
+
+    /* THREE descriptors per message, and the split is not cosmetic: the header
+     * and payload are what the DEVICE reads, the status is what it WRITES
+     * back.  A status descriptor without VRING_DESC_F_WRITE is rejected, and a
+     * rejected buffer is silence with nothing logged anywhere.
+     *
+     * Chain `slot` owns descriptors 3*slot .. 3*slot+2, so two buffers in
+     * flight never share a descriptor. */
+    uint32_t b = slot * 3;
+    d->tdesc[b + 0].addr  = (uint64_t)(uintptr_t)&d->xfer[slot];
+    d->tdesc[b + 0].len   = sizeof d->xfer[slot];
+    d->tdesc[b + 0].flags = VRING_DESC_F_NEXT;
+    d->tdesc[b + 0].next  = (uint16_t)(b + 1);
+    d->tdesc[b + 1].addr  = (uint64_t)(uintptr_t)d->pcm[slot];
+    d->tdesc[b + 1].len   = nframes * 4;
+    d->tdesc[b + 1].flags = VRING_DESC_F_NEXT;
+    d->tdesc[b + 1].next  = (uint16_t)(b + 2);
+    d->tdesc[b + 2].addr  = (uint64_t)(uintptr_t)&d->status[slot];
+    d->tdesc[b + 2].len   = sizeof d->status[slot];
+    d->tdesc[b + 2].flags = VRING_DESC_F_WRITE;
+    d->tdesc[b + 2].next  = 0;
 
     uint16_t ai = d->tavail.idx;
-    d->tavail.ring[ai % QSIZE] = 0;
+    d->tavail.ring[ai % QSIZE] = (uint16_t)b;
     dsb();
-    d->tavail.idx = ai + 1;
+    d->tavail.idx = (uint16_t)(ai + 1);
+    d->tsub++;
     dsb();
     w32(d->base, R_QUEUENOTIFY, 2);
 
-    /* The device completes the buffer once it has been PLAYED, so this wait is
-     * the real-time pacing — the buffer's own duration plus slack, exactly as
-     * the AC97 drain does. */
-    uint32_t ms = (nframes * 1000u) / (dev->rate ? dev->rate : 48000u);
-    if (wait_used(&d->tused, &d->tlast, ms + 500) != 0) {
-        klog(KLOG_WARN, "audio", "virtio-snd: playback timed out\n");
-        return -1;
-    }
     if (r32(d->base, R_INTSTATUS) & 1) w32(d->base, R_INTACK, 1);
-    return (int)nframes;
+    return (int)nframes;                     /* QUEUED, not yet heard */
 }
 
 /* ---- bring-up ---------------------------------------------------------------- */
@@ -390,9 +440,25 @@ static int snd_dev_init(struct snd_dev* d, uintptr_t base) {
      * that is simply never serviced. */
     if (queue_setup(d, 0, d->cdesc, &d->cavail, &d->cused) != 0) return -1;
     if (queue_setup(d, 2, d->tdesc, &d->tavail, &d->tused) != 0) return -1;
+    /* How many 3-descriptor chains the NEGOTIATED ring can hold.  Asking the
+     * device rather than assuming QSIZE: it may offer fewer, and overrunning
+     * the ring is the kind of fault that shows up as "audio stops after a
+     * while" rather than as an error. */
+    {
+        w32(d->base, R_QUEUESEL, 2);
+        uint32_t nmax = r32(d->base, R_QUEUENUMMAX);
+        uint32_t qsz  = (nmax < QSIZE) ? nmax : QSIZE;
+        d->nchains = (uint16_t)(qsz / 3);
+        if (d->nchains == 0) {
+            klog(KLOG_WARN, "audio", "virtio-snd: TX ring too small (%u)\n", qsz);
+            return -1;
+        }
+        if (d->nchains > SND_NBUF) d->nchains = SND_NBUF;
+    }
 
     w32(base, R_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
     d->clast = d->tlast = 0;
+    d->tsub = 0;
 
     if (pick_output_stream(d) != 0) return -1;
 
@@ -436,6 +502,8 @@ int virtio_snd_init(void) {
         g_audio.rate     = 48000;
         g_audio.channels = 2;
         g_audio.play     = snd_play;
+        g_audio.drain    = snd_drain;
+        g_audio.period_frames = SND_PERIOD_FRAMES;   /* it queues, so 21 ms */
         g_audio.priv     = &g_snd;
         audio_register(&g_audio);
         kprintf("virtio-snd: up at slot %d (base %p), stream %u\n",
