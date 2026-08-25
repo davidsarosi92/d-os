@@ -119,6 +119,7 @@ when sections are added.)
 | 4.77 | aarch64 can change resolution now (§M61 complete) | 8537 |
 | 4.78 | A widget toolkit with a seam: classes, layout, ring 3 (§M65) | 8601 |
 | 4.79 | A desktop you can arrange: drag, keyboard, slots (§M64 tail) | 8800 |
+| 4.80 | Driver agility: lifecycle, hot-plug, quarantine (§M66) | 8950 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -9534,6 +9535,85 @@ does — most likely it writes to the suppressed console rather than through
 
 ---
 
+### 4.80 Driver agility: lifecycle, hot-plug and quarantine (§M66)
+
+**2026-08-25.**  Asked from use: *"is driver loading plug and play?  can we
+load one the moment it is needed, swap one, stop a broken one?"*  No on every
+count — and one part was worse than no: **`driver_ops.shutdown` had been
+declared since §M8, documented as "called on power-off / reboot", and nothing
+had ever called it.**  Every driver that wrote one had it be dead code.  §M52's
+shape: a contract stated in a header, believed by every reader, never executed.
+
+**The blocker was never the registry — it was lifetimes.**  A device was handed
+out as a raw pointer and held across sleeps (the mixer for a period, the WAV
+player for a whole file), while the block layer, devfs, the IDT and the PMM all
+kept their own references into driver-owned statics.  "Stop a driver" therefore
+meant leaving dangling pointers in four registries at once — the bug class
+§M54 and §M57 already paid for with tasks.
+
+| Step | What it establishes |
+|------|---------------------|
+| shutdown is real | reverse init order, because init order is dependency order.  One route (`system_power_off`/`system_reboot`), not five call sites — §M63's shape.  **Fault paths deliberately excluded**: a watchdog reboot runs from an interrupt with the machine in an unknown state, where calling driver code turns a crash report into a second crash |
+| lifetimes | `audio_get`/`audio_put` count users *inside* a call; `audio_unregister` marks dying, waits, unlinks — and **refuses** rather than unlinking under a live user.  The pump holds its reference for one period, not for its lifetime, so a device stays removable while nothing is playing |
+| stop / start | a driver with **no shutdown hook is refused**, not forced: it cannot put its hardware down or withdraw its registrations |
+| swap | audio is the first class with two drivers, so this is testable rather than a design claim |
+| hot-plug | see below |
+| quarantine | a misbehaving driver is stopped and held back from the automatic paths; an explicit `drv start` overrules |
+
+**Hot-plug needed something x86 never had.**  Firmware programs BARs *at boot*,
+so a device added later arrives with none, and the first symptom is a driver
+complaining about a BAR rather than about hot-plug.  (aarch64 has always
+assigned them — booting raw via `-kernel` there is no firmware at all.)
+`pci_assign_bars` sizes and assigns from a bump allocator **seeded above the
+firmware's high-water mark**: there is no PCI resource manager here, so the one
+thing that must not happen is handing out a window an existing device already
+decodes, and scanning once makes that impossible by construction rather than by
+luck.
+
+Detection is **polled**, on a cron job with `drivers.rescan_ms` (0 = off).  The
+claim is *"usable within one interval"*, not *"on the instant"*: being told
+about a new PCI device needs the ACPI hot-plug GPE decoded and routed — large
+machinery for one event — while re-probing what is not running is cheap and
+costs nothing once everything is up.
+
+**Three bugs the test output showed, all mine:**
+
+- `%02x` printed literally — this printf has no width specifiers, which §M65
+  wrote down the same day.
+- `ac97: completion IRQ on line 0`.  A hot-added device has no routed
+  interrupt, and **line 0 is the timer**: installing there is not a degraded
+  driver, it is a stopped machine.  Refused now, and the polled path carries it
+  (§M55's degradation rule).
+- After `drv swap ac97 hda` the hot-plug poller **restarted ac97** two seconds
+  later, silently undoing the swap.  `DRV_S_ADMIN_DOWN` records "stopped by
+  hand", kept distinct from quarantine because *the user turned it off* and *it
+  misbehaved* are different facts, while both mean the same to the automatic
+  paths.
+
+**The registry became a slot table** rather than an index into the `drivers`
+linker section.  Every operation used to compute `d - __start_drivers`, which
+is exact for built-ins and makes a driver from anywhere else impossible.  That
+change is what §M67 needs; `driver_attach()` is the entry point a loader will
+call.
+
+**Verified, with no typing until the last step:** boot with no audio device →
+`device_add AC97` on the monitor → the guest assigns the BARs, declines the
+unrouted IRQ, starts the driver (`drv: 'ac97' appeared — started`) → a typed
+`play dsptest` returns **300.0 ms, peak 8000, 443.3 Hz**.  The swap is two
+separate 300.0 ms sounds through two different controllers with a live swap
+between them; quarantine makes `drv rescan` start **0** drivers until an
+explicit start clears it.
+
+**What this is NOT:** it contains the *consequences* of a driver that fails or
+misreports.  It does not contain a driver that corrupts memory — in one address
+space the damage is done before anything notices.  That is §M33, and calling
+this isolation would be the "isolation theatre" that plan refuses by name.
+
+**Next:** §M67, loadable modules — planned, not started, and deliberately so:
+loading foreign code into ring 0 wants §M33 first or alongside.
+
+---
+
 ## 7. Roadmap / open milestones
 
 - [x] **M1 — GDT:** own Global Descriptor Table, stop relying on GRUB's.
@@ -9557,6 +9637,16 @@ misled into thinking M6 is where the work ends.
 ---
 
 ## 8. Change log
+
+- **2026-08-25 — §M66: driver agility (DOCS §4.80).**  Orderly shutdown (which
+  had been declared since §M8 and never called), device lifetimes that let a
+  registry REFUSE to release a device in use, `drv stop|start|swap`, PCI
+  hot-plug with the BAR assignment x86 never had, and fault quarantine.
+  Verified by hot-adding a sound card to a running machine with no typing and
+  then playing 300.0 ms of measured audio through it, and by swapping the audio
+  driver live between two controllers.  The registry is a slot table now, which
+  is what §M67 (loadable modules) needs.  Explicitly not isolation — that is
+  §M33.
 
 - **2026-08-24 — §M23 stage 2: a WAV player, and the two silent truncations
   under it (DOCS §4.26.1).**  `play <path.wav>`, streamed rather than loaded.

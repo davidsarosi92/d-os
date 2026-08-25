@@ -266,6 +266,8 @@ what); a session can pick a theme and push on it.
 | M61 | Resolution switching at runtime — `fb_mode_set`, scene resize, `mode` cmd, Display panel, confirm-or-revert dialog | UX / Devices | ✅ DOCS §4.70 (x86) + §4.77 (aarch64) |
 | M62 | Boot splash, switchable — `boot.splash`, drawn splash, log suppressed not discarded, torn down by any fault | UX / Reliability | ✅ DOCS §4.71 |
 | M63 | Control Panel — `SETTINGS_PANEL()` + `CONFIG_KEY()` registries, generic panel, one Start-menu entry, `conf` with validation | UX / Architecture | ✅ DOCS §4.65 (+ stage 0 §4.63) |
+| M66 | **Driver agility** — orderly shutdown, device lifetimes, runtime stop/start/swap, PCI hot-plug with BAR assignment, fault quarantine | Architecture / Devices | ✅ DOCS §4.80 |
+| M67 | **Loadable driver modules** — a driver from outside the kernel image (kernel symbol table + ELF relocation + versioned ABI) | Architecture | §M67 — planned, see the section for the cost and the risk |
 | M64 | Desktop shortcuts — icons on the wallpaper, shortcut files, one resolver, swappable grid/list view | UX | ✅ DOCS §4.64 + §4.79 (drag-to-move, keyboard, Send to desktop, and the ramfs-persistence bug it exposed).  All four target kinds resolve |
 
 ### Cross-cutting constraints
@@ -4195,6 +4197,78 @@ subsystem + procfs.  If a concrete need for *hierarchical,
 runtime-tunable, persisted* settings appears, the direction is a
 sysfs-style tunables tree (procfs write-handlers + save-to-`/etc`),
 not a binary registry.  Revisit only with a specific use case.
+
+---
+
+## §M66 — Driver agility: lifecycle, hot-plug, quarantine — ✅ shipped
+
+**Shipped 2026-08-25 — see DOCS.md §4.80.**  Asked for from use: *"is driver
+loading plug and play?  can we load one the moment it is needed, swap one, stop
+a broken one?"*  The answer at the time was no on every count, and one part was
+worse than that — `driver_ops.shutdown` had been declared since §M8 and
+documented as "called on power-off / reboot", and **nothing had ever called
+it**.
+
+Six steps, each measured: an orderly power path that really stops drivers (in
+reverse init order, because init order is dependency order); device LIFETIMES,
+so a class registry can refuse to release a device somebody is still inside a
+call on; `drv stop|start|swap`; **PCI hot-plug**, which needed BAR assignment
+x86 had never had (firmware programs BARs at boot, so anything added later
+arrives with none); and fault QUARANTINE, so a misbehaving driver costs one
+attempt rather than a restart loop.
+
+The registry became a slot table rather than an index into the linker section
+— which is what makes §M67 possible at all.
+
+**Deliberately NOT claimed:** this contains the CONSEQUENCES of a driver that
+fails, not a driver that corrupts memory.  In one address space the damage is
+done before anything notices; that is §M33, and calling this isolation would be
+the "isolation theatre" §M33 refuses by name.
+
+---
+
+## §M67 — Loadable driver modules (a driver from outside the kernel image)
+
+**Status: planned.**  §M66 made every driver operation work on a descriptor
+whose storage the linker did not choose, and added `driver_attach()` as the
+entry point.  What is missing is everything that turns a file into such a
+descriptor.
+
+**Why it is a milestone and not a feature.**  A loader means running code in
+ring 0 that the kernel build did not produce.  That is the least forgiving
+place in the tree, and the parts are each individually sharp:
+
+1. **A kernel symbol table.**  A module calls `kprintf`, `kmalloc`,
+   `audio_register`.  Name → address has to be generated at build time (the
+   tree already generates source: `assets/splash_logo.c`, the objcopy blobs)
+   and it defines, permanently, which symbols are public.
+2. **ELF relocation.**  Parse a relocatable object, allocate executable kernel
+   pages, apply the arch's relocation types (`R_386_32` / `R_386_PC32` on
+   i386, and different sets on x86_64 and aarch64), resolve undefined symbols
+   through the table above.
+3. **A VERSIONED ABI.**  `struct driver` already carries a `version`, but the
+   KERNEL side needs one too: a module built against an older struct layout
+   would otherwise read the wrong offsets silently — the failure mode being a
+   plausible-looking driver that corrupts something unrelated.  §M51's lesson
+   in a harder form, since the build cannot catch it.
+4. **Unload.**  Relocation-aware teardown, on top of §M66's quiesce.
+
+**The honest cost.**  Comparable to the whole of §M66, and it leaves behind an
+ABI that must be maintained forever.  §M66 already delivers the agility the
+original question asked for — hardware that appears becomes usable, drivers
+stop cleanly, swap and quarantine work.  §M67 adds only that the driver need
+not be *in the image*.
+
+**Ordering note, and it is the important one.**  If the goal is loading a
+driver from a THIRD PARTY, §M33 (execution domains) should come first or
+alongside.  Loading foreign code into ring 0 with no isolation is precisely
+the risk §M66's fault containment cannot address, and shipping the loader
+first would build the door before the lock.
+
+**Definition of done:** a driver built as a separate object, not linked into
+the kernel, loaded from the store at runtime, appearing in `lsdrv` as
+`(loaded)`, driving real hardware, and unloadable again — with a version
+mismatch REFUSED loudly rather than executed.
 
 ---
 

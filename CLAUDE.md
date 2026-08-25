@@ -20,6 +20,58 @@ focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M66 — DRIVER AGILITY: LIFECYCLE, HOT-PLUG, QUARANTINE (2026-08-25, DOCS
+§4.80, all 3 arches).**  Asked from use: *"is driver loading plug and play?  can
+we load one the moment it is needed, swap one, stop a broken one?"*  No on every
+count — and **one part was worse than no: `driver_ops.shutdown` was declared in
+§M8, documented as "called on power-off / reboot", and NOTHING HAD EVER CALLED
+IT.**  §M52's shape exactly.  **THE BLOCKER WAS NEVER THE REGISTRY — IT WAS
+LIFETIMES:** a device was handed out as a RAW POINTER and held across sleeps
+(the mixer for a period, the WAV player for a whole file) while the block layer,
+devfs, the IDT and the PMM each kept their own reference into driver-owned
+statics, so *"stop a driver" meant dangling pointers in four registries at
+once* — §M54/§M57's bug class.  Now: `audio_get`/`audio_put` count users INSIDE
+a call, `audio_unregister` marks-waits-unlinks and **REFUSES rather than
+unlinking under a live user**; the pump holds its reference for ONE PERIOD, not
+its lifetime, *so a device stays removable exactly when removal is easiest*.
+**Shutdown runs in REVERSE INIT ORDER** (init order is dependency order) through
+ONE route (`system_power_off`/`system_reboot`), not five call sites (§M63's
+shape) — and **the fault paths are deliberately excluded**, because a watchdog
+reboot runs from an interrupt with the machine in an unknown state and *calling
+driver code there turns a crash report into a second crash*.  **`drv
+stop|start|swap|rescan|fault`**; a driver with NO shutdown hook is **refused**,
+not forced (it cannot withdraw its registrations).  **HOT-PLUG NEEDED SOMETHING
+x86 NEVER HAD:** firmware programs BARs AT BOOT, so a device added later arrives
+with none and *the first symptom is a driver complaining about a BAR rather than
+about hot-plug* (aarch64 always assigned them — booting raw there is no
+firmware).  `pci_assign_bars` seeds its bump allocator **ABOVE the firmware's
+high-water mark**: with no PCI resource manager, handing out a window an
+existing device already decodes must be impossible BY CONSTRUCTION, not by luck.
+Detection is POLLED (`drivers.rescan_ms`, 0 = off) and the claim is *"usable
+within one interval"*, not "on the instant" — the ACPI hot-plug GPE is large
+machinery for one event.  **THREE BUGS THE OUTPUT SHOWED, ALL MINE:** `%02x`
+printed literally (*this printf has no width specifiers — §M65 wrote that down
+the same day*); `completion IRQ on line 0` — **a hot-added device has no routed
+interrupt and line 0 is the TIMER**, so installing there *is not a degraded
+driver, it is a stopped machine* (refused; the polled path carries it, §M55);
+and after `drv swap ac97 hda` **the poller RESTARTED ac97 two seconds later**,
+silently undoing the swap — hence `DRV_S_ADMIN_DOWN`, kept distinct from
+quarantine because *"the user turned it off" and "it misbehaved" are different
+facts* though both mean the same to the automatic paths.  **THE REGISTRY IS A
+SLOT TABLE NOW**, not an index into the linker section — which is what §M67
+needs.  **VERIFIED WITH NO TYPING UNTIL THE LAST STEP:** boot with no audio
+device → `device_add AC97` on the monitor → BARs assigned, unrouted IRQ
+declined, `drv: 'ac97' appeared — started` → a typed `play dsptest` gives
+**300.0 ms / peak 8000 / 443.3 Hz**; the swap is two separate 300.0 ms sounds
+through two controllers with a live swap between them; quarantine makes `drv
+rescan` start **0** drivers until an explicit start clears it.  **WHAT THIS IS
+NOT:** it contains the CONSEQUENCES of a driver that fails — *not* one that
+corrupts memory, because in one address space the damage is done before anything
+notices.  That is §M33, and calling this isolation would be the "isolation
+theatre" that plan refuses by name.  **NEXT: §M67 loadable modules — planned,
+not started, and deliberately so: loading foreign code into ring 0 wants §M33
+first or alongside.**
+
 ✅ **§M23 STAGE 4 + THE TASKBAR SOUND INDICATOR (2026-08-24, DOCS §4.26.1, all
 3 arches).**  **A MIXER**, because a sound USED TO OWN THE DEVICE for its whole
 duration — `play` and a second program could not both be heard.  Every source
