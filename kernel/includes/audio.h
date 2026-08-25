@@ -23,9 +23,16 @@ struct audio_dev {
     uint32_t    rate;                         /* native sample rate (Hz)     */
     uint32_t    channels;                     /* 2 (stereo)                  */
 
-    /* Play interleaved 16-bit stereo frames.  Blocking: returns once the
-     * samples it accepted have actually been played.  `frames` holds
-     * nframes*2 int16 samples.
+    /* Play interleaved 16-bit stereo frames.  `frames` holds nframes*2 int16
+     * samples.
+     *
+     * RETURNS ONCE THE FRAMES ARE QUEUED, and BLOCKS while the device's queue
+     * is full — which is what still paces a caller to real time, since the
+     * queue only drains as fast as the hardware consumes it.  It used to
+     * return once they had been PLAYED, and that is precisely what made every
+     * buffer boundary a gap: the engine was stopped for as long as it took the
+     * caller to come back with the next one.  Use `drain` to wait for the
+     * sound to actually finish.
      *
      * RETURNS THE NUMBER OF FRAMES CONSUMED, or negative on error — it may be
      * FEWER than asked for, because a driver's DMA buffer is finite.  §M23
@@ -35,6 +42,26 @@ struct audio_dev {
      * learn that the tail of its chunk was dropped.  A short count is the
      * normal case for a streaming caller — see audio_play_pcm(). */
     int (*play)(struct audio_dev* dev, const int16_t* frames, uint32_t nframes);
+
+    /* Wait until everything handed to `play` has actually been heard.
+     *
+     * This exists BECAUSE `play` stopped meaning "played" (see above): a
+     * driver that queues has to be asked when the queue is empty, or closing a
+     * stream would return while the tail of the sound is still in the device
+     * and the next thing to touch the hardware would cut it off.  Optional —
+     * a driver whose `play` really does block until the sound is over has
+     * nothing to wait for and leaves this NULL. */
+    void (*drain)(struct audio_dev* dev);
+
+    /* Preferred mix period in frames, or 0 for the core's default.
+     *
+     * The mixer's latency is one period, so smaller is better — but the floor
+     * is set by the DRIVER: one that stops the hardware between buffers leaves
+     * an audible gap at every boundary, and only one that QUEUES can afford a
+     * short period.  So the device states what it can take rather than the
+     * core guessing, which is what stops a queueing driver from being held to
+     * a non-queueing one's latency. */
+    uint32_t period_frames;
 
     void* priv;                               /* driver-private state        */
     struct audio_dev* next;                   /* registry link               */

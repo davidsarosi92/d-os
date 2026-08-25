@@ -3149,10 +3149,44 @@ measurements are unchanged through the new path, playback length is exact at
 **no non-silent stretch at all** while the unmuted one peaks at exactly
 **4000 = 8000 × 128/256**.
 
-**Still open:** PCM input, Intel HDA, the AC97 completion interrupt, queueing
-the next period before the current drains (which is what would shrink the
-mixer's ~85 ms latency), and whether `/dev/vda` should be published on ARM (the
-block driver initialises after `devfs_init` there — not chased here).
+#### Stage 5 — the driver queues, and the mixer's latency drops four-fold
+
+The period size was ~85 ms because the AC97 driver **stopped the engine between
+buffers**: every boundary was a gap, so the period had to be long enough to
+hide them.  The BDL is a 32-entry list and one entry was being used.
+
+`play` now returns once frames are **queued** and blocks while the device's
+queue is full — which still paces the caller to real time, since the queue only
+frees a slot when the hardware consumes one.  A new optional `drain` waits for
+the sound to actually finish, because "played" and "queued" stopped being the
+same thing.  The device also advertises `period_frames`: **the driver states
+what it can take** rather than the core guessing, which is what stops a
+queueing driver from being held to a non-queueing one's latency.  AC97 asks for
+1024 frames (~21 ms); virtio-sound leaves it at the 4096 default and is
+measurably unaffected.
+
+**Three bugs on the way, each found by measuring rather than reading:**
+
+| Symptom | Cause |
+|---|---|
+| >half the audio lost, worse the longer the sound (300 ms → 129, 600 → 88) | the ring used 4 of the BDL's 32 entries, so `LVI` wrapped backwards every 4 — the engine reads that as "already past the end" and halts, skipping queued buffers.  **The ring has to wrap over the full list**, which is what the hardware's index arithmetic expects |
+| 3–10 ms missing off the end, variable | `audio_stream_close` called `drain` while the pump could still be queueing the final period — the closer stopped the engine out from under it.  Only the pump touches the device now (this file's own header already said so); a closer waits for the pump to report itself idle |
+| a few ms still missing | `DCH` means the DMA engine halted, not that the codec has emptied.  A short settle before clearing the run bit; **measured, not guessed** — at 30 ms the capture held the last sample and a 200 ms sound read as 231, at 4 ms it reads exact |
+
+`BDL_BUP` was also removed from queued entries: it means "this is the end, emit
+zeros after it", which is right for a driver playing one buffer and wrong for a
+ring, where it tells the engine every entry is the last.  (Measured to be *not*
+the cause of the loss above — worth recording, because it was the obvious
+suspect and it was innocent.)
+
+**Measured:** playback length is exact at 200.0, 600.0 and 1000.0 ms and 2.7 ms
+short at 300 (0.9 %); zero silent samples inside; two streams still peak at
+exactly 10000; the WAV path is unchanged at 299.3 ms / ±18432 / 439.3 Hz; and
+aarch64, whose driver does not queue, is untouched at 300.0 ms.
+
+**Still open:** PCM input, Intel HDA, the AC97 completion interrupt (which would
+replace the drain poll with a waitq, §M55's shape), queueing in the virtio-sound
+driver too, and whether `/dev/vda` should be published on ARM.
 
 ### 4.26 Audio — AC97 codec + PCM output (M23, i386)
 

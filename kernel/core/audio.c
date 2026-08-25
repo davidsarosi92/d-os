@@ -124,7 +124,7 @@ int audio_play_pcm(struct audio_dev* dev, const int16_t* frames, uint32_t nframe
  * 4096 measures clean.  The real fix is queueing the next buffer before the
  * current one drains (the AC97 BDL has 32 entries and we use one); until then
  * this is the trade, and it costs latency, not correctness. */
-#define MIX_PERIOD       4096
+#define MIX_PERIOD_MAX   4096   /* the buffer we allocate; the default too      */
 #define STREAM_FRAMES    16384                 /* ring depth, ~341 ms at 48 k  */
 #define STREAM_MASK      (STREAM_FRAMES - 1)   /* power of two: index by AND   */
 
@@ -146,8 +146,28 @@ static struct audio_stream g_streams[MIX_STREAMS];
 static spinlock_t          g_mix_lock = SPINLOCK_INIT;
 static struct waitq        g_mix_wq;           /* pump sleeps here when idle   */
 static int                 g_pump_started;
-static int16_t             g_mix_buf[MIX_PERIOD * 2];
+static int16_t             g_mix_buf[MIX_PERIOD_MAX * 2];
+
+/* How many frames one mix pass produces.  THE DEVICE CHOOSES, because the
+ * floor is a driver property: one that stops the hardware between buffers
+ * leaves a gap at every boundary and needs a long period to hide it, while one
+ * that QUEUES can afford a short one.  Letting the core pick would hold a
+ * queueing driver to a non-queueing driver's latency. */
+static uint32_t mix_period(void) {
+    struct audio_dev* d = audio_primary();
+    uint32_t p = (d && d->period_frames) ? d->period_frames : MIX_PERIOD_MAX;
+    if (p > MIX_PERIOD_MAX) p = MIX_PERIOD_MAX;
+    return p;
+}
 static uint32_t            g_mix_passes, g_mix_clips;
+/* Set by the pump when it has drained the device and is about to block.  A
+ * closer waits for THIS rather than draining the device itself: only the pump
+ * may touch the hardware (this file's own header says so), and the first
+ * version broke that rule — the closer called `drain` while the pump could
+ * still be queueing the final period, so the engine was stopped out from under
+ * it.  The loss was small and variable, 3 to 9 ms off the end of a sound,
+ * which is exactly what a race looks like from the outside. */
+static volatile int        g_pump_idle = 1;
 
 /* Master level, applied to the finished mix.  Separate from `muted` on
  * purpose — see audio.h: a mute that zeroes the volume forgets it. */
@@ -193,7 +213,7 @@ static int any_stream_has_audio(void) {
  * source running dry must not stop the others, which is the difference between
  * a mixer and a queue. */
 static uint32_t mix_one_period(void) {
-    uint32_t want = MIX_PERIOD, produced = 0;
+    uint32_t want = mix_period(), produced = 0;
     for (uint32_t i = 0; i < want * 2; i++) g_mix_buf[i] = 0;
 
     for (int i = 0; i < MIX_STREAMS; i++) {
@@ -247,9 +267,22 @@ static void mixer_pump(void) {
          * which is a task deadlocking against itself with interrupts masked.
          * It presented as an NMI hard lockup in `hal_cpu_pause`, and §4.67.1's
          * report named the wedged CPU correctly. */
+        /* Nothing left to mix: let the hardware finish what it already has,
+         * THEN say we are idle, THEN block.  The order matters — announcing
+         * idle before the drain would let a closer return while the tail of
+         * the sound is still in the device. */
+        {
+            struct audio_dev* d = audio_primary();
+            if (d && !any_stream_has_audio()) {
+                if (d->drain) d->drain(d);
+                g_pump_idle = 1;
+            }
+        }
+
         uint32_t fl = waitq_lock(&g_mix_wq);
         while (!(dev = audio_primary()) || !any_stream_has_audio())
             waitq_block(&g_mix_wq);
+        g_pump_idle = 0;
         waitq_unlock(&g_mix_wq, fl);
 
         uint32_t n = mix_one_period();
@@ -365,7 +398,23 @@ void audio_stream_close(struct audio_stream* s) {
     uint32_t fl = spin_lock_irqsave(&g_mix_lock);
     s->used = 0;
     s->head = s->tail = 0;
+    int last = !any_stream_has_audio();
+    for (int i = 0; i < MIX_STREAMS && last; i++) if (g_streams[i].used) last = 0;
     spin_unlock_irqrestore(&g_mix_lock, fl);
+
+    /* THE RING BEING EMPTY IS NOT THE SOUND BEING OVER.  `play` returns when
+     * frames are QUEUED, so the last period may still be inside the device —
+     * returning now would let the caller print its prompt, or the next sound
+     * start, over the tail of this one.
+     *
+     * We wait for the PUMP to report itself idle rather than draining the
+     * device here: only the pump touches the hardware.  Only the last stream
+     * waits — doing it while another is still playing would block this caller
+     * until that one finished too. */
+    if (last) {
+        uint64_t d2 = timer_ticks_ms() + 10000;
+        while (!g_pump_idle && timer_ticks_ms() < d2) task_msleep(2);
+    }
 }
 
 void audio_stream_list(void) {

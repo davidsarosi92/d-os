@@ -78,13 +78,47 @@
 
 #define AC97_RATE        48000
 #define BDL_ENTRIES      32
-#define DMA_FRAMES       32000  /* matches the tone core's cap; ×4 = 128 KB   */
+/* THE BDL IS A RING NOW.  Four slices of the same 128 KB DMA region: the
+ * driver fills one, points the engine at it and RETURNS, so the next buffer is
+ * already queued before the current one drains and the hardware never stops
+ * between them.  It used to be one buffer played to completion per call, which
+ * made every boundary a gap — measured at 2048-frame periods as 300 ms of
+ * square wave coming back as 323 ms at 411 Hz instead of 443.
+ *
+ * Four, not thirty-two: the depth IS the latency, and three buffers in flight
+ * is enough to cover the gap between the mixer finishing one period and
+ * starting the next.  A deeper queue would only make the volume slider feel
+ * further away from the sound. */
+/* THE RING IS THE WHOLE 32-ENTRY BDL, not a few slots of it.
+ *
+ * The first attempt used four entries and wrapped LVI every four — and lost
+ * more than half the audio, deterministically and worse the longer the sound
+ * (300 ms came back as 129, 600 ms as 88).  LVI is an index into the 32-entry
+ * list and the engine plays until CIV reaches it: wrapping it back to 0 while
+ * CIV sits at 3 reads as "already past the end", so the engine halts and the
+ * queued buffers are skipped.  Wrapping over the FULL list is what the
+ * hardware's index arithmetic expects.
+ *
+ * 32 x 1024 frames x 4 bytes = the same 128 KB allocation, and 1024 frames is
+ * exactly the mix period, so a period is one entry. */
+#define AC97_NBUF        BDL_ENTRIES        /* 32 — the whole list            */
+#define AC97_BUF_FRAMES  1024
+/* How far ahead we let the queue run.  THE DEPTH IS THE LATENCY: four buffers
+ * is ~85 ms of sound already committed to the hardware, which is enough to
+ * cover the gap between mix passes and little enough that the volume slider
+ * still feels attached to what you hear. */
+#define AC97_DEPTH       4
+#define DMA_FRAMES       AC97_BUF_FRAMES
 
 /* Slack on top of the buffer's own duration before the drain wait gives up.
  * The engine reports completion slightly after the last sample leaves, and an
  * emulated device under host load can be later still — so this is generous on
  * purpose: a spurious "timeout" would cut the tail off every sound. */
 #define AC97_DRAIN_GRACE_MS  500
+/* Time given to the codec to empty after the DMA engine reports itself halted
+ * — see ac97_drain().  Measured, not guessed: without it a sound lost 3-10 ms
+ * off its tail. */
+#define AC97_SETTLE_MS       4
 
 struct bdl_entry {
     uint32_t addr;
@@ -99,6 +133,8 @@ struct ac97 {
     struct bdl_entry* bdl;
     uint32_t pcm_phys;               /* PCM DMA buffer                        */
     int16_t* pcm;
+    uint32_t head;                   /* next ring slot to fill                */
+    int      running;                /* engine started and not yet drained    */
 };
 
 static struct ac97 g_ac97;
@@ -106,61 +142,104 @@ static struct audio_dev g_audio;
 
 /* ----------------------- Playback ----------------------------------------- */
 
-static int ac97_play(struct audio_dev* dev, const int16_t* frames, uint32_t nframes) {
-    struct ac97* a = (struct ac97*)dev->priv;
-    /* Clamp, but TELL THE CALLER — the return value is the frame count that
-     * was actually played, so a streaming caller comes back for the rest
-     * instead of losing it (see audio.h). */
-    if (nframes > DMA_FRAMES) nframes = DMA_FRAMES;
-    if (nframes == 0) return 0;
-
-    /* Copy the caller's PCM into our DMA buffer (phys == virt). */
-    for (uint32_t i = 0; i < nframes * 2; i++) a->pcm[i] = frames[i];
-
-    /* One BDL entry covers the whole buffer; IOC|BUP so the engine halts
-     * cleanly at the end instead of underrunning into noise. */
-    a->bdl[0].addr    = a->pcm_phys;
-    a->bdl[0].samples = (uint16_t)(nframes * 2);      /* stereo → 2 per frame */
-    a->bdl[0].control = BDL_IOC | BDL_BUP;
-
+/* Take the PCM-out box back to a known state.  Used when starting a fresh
+ * sound: after a halt the engine's current index still points at whatever it
+ * finished, and starting again from there would REPLAY that buffer. */
+static void ac97_engine_reset(struct ac97* a) {
+    outb(a->nabm + PO_CR, 0);
+    outb(a->nabm + PO_CR, CR_RR);
+    for (uint32_t s = 0; (inb(a->nabm + PO_CR) & CR_RR) && s < 100000; s++) hal_cpu_pause();
+    outw(a->nabm + PO_SR, 0x1C);
     outl(a->nabm + PO_BDBAR, a->bdl_phys);
-    outb(a->nabm + PO_LVI, 0);                        /* last valid index = 0 */
-    outw(a->nabm + PO_SR, 0x1C);                      /* clear RWC status bits */
+    a->head = 0;
+    a->running = 0;
+}
 
-    outb(a->nabm + PO_CR, CR_RPBM);                   /* run                   */
+/* How many buffers the engine has not finished with.
+ *
+ * `head` never catches up to CIV because the caller blocks at NBUF-1, so the
+ * two indices are never equal while running — which is what makes this count
+ * unambiguous rather than "full or empty, cannot tell". */
+static uint32_t ac97_outstanding(struct ac97* a) {
+    if (!a->running) return 0;
+    if (inw(a->nabm + PO_SR) & SR_DCH) return 0;      /* halted: nothing left */
+    uint32_t civ = (uint32_t)inb(a->nabm + PO_CIV) & (AC97_NBUF - 1);
+    return (a->head - civ) & (AC97_NBUF - 1);
+}
 
-    /* WAIT FOR THE DMA ENGINE TO HALT — BY SLEEPING, NOT BY SPINNING.
-     *
-     * This used to be `hal_cpu_pause()` in a tight loop for the ENTIRE
-     * duration of the sound: playing three seconds of audio burned three
-     * seconds of a CPU, and on a uniprocessor box it burned the only one.
-     * That is §M49's, §M55's and §M56's lesson for the third time — *waiting
-     * must not cost the same as computing* — and it had survived here because
-     * the only caller was a beep short enough that nobody noticed.  It stops
-     * being unnoticeable the moment a file streams through this function.
-     *
-     * The sleep is the right granularity by construction: the buffer being
-     * waited on is tens of milliseconds long at minimum, so a millisecond
-     * tick cannot make the gap between chunks audible on its own.
-     *
-     * NOT AN INTERRUPT, and the reason is written down rather than left to be
-     * rediscovered: AC97 can raise IOC on buffer completion, and wiring it
-     * would replace this poll with a waitq exactly as §M55 did for the NIC.
-     * It is the next step, not this one — and unlike the spin, a sleeping
-     * poll is already CORRECT, merely coarse.  The deadline is real time, so
-     * a wedged device costs a bounded wait rather than a hung shell. */
-    uint32_t ms_total = (nframes * 1000u) / (dev->rate ? dev->rate : 48000u);
-    uint64_t deadline = timer_ticks_ms() + ms_total + AC97_DRAIN_GRACE_MS;
+static void ac97_drain(struct audio_dev* dev) {
+    struct ac97* a = (struct ac97*)dev->priv;
+    if (!a->running) return;
+    /* Bounded by what is actually queued plus slack, so a device that stops
+     * answering costs a wait rather than a hung shell. */
+    uint64_t deadline = timer_ticks_ms() +
+                        (AC97_DEPTH * AC97_BUF_FRAMES * 1000ull) /
+                        (dev->rate ? dev->rate : 48000u) + AC97_DRAIN_GRACE_MS;
     while (!(inw(a->nabm + PO_SR) & SR_DCH)) {
         if (timer_ticks_ms() > deadline) {
-            kprintf("ac97: playback timeout after %u ms\n",
-                    (unsigned)(ms_total + AC97_DRAIN_GRACE_MS));
+            kprintf("ac97: drain timeout\n");
             break;
         }
         task_msleep(1);
     }
-    outb(a->nabm + PO_CR, 0);                          /* stop                  */
-    return (int)nframes;                               /* frames actually played */
+    /* DCH says the DMA engine halted, which is NOT the same as the last
+     * samples having left the codec.  Stopping the moment it sets cut a few
+     * milliseconds off the end of every sound — small, variable, and audible
+     * only as sounds feeling clipped.  Give it a beat before pulling the run
+     * bit; the cost is paid once per sound, not per buffer. */
+    task_msleep(AC97_SETTLE_MS);
+    outb(a->nabm + PO_CR, 0);
+    a->running = 0;
+    a->head = 0;
+}
+
+static int ac97_play(struct audio_dev* dev, const int16_t* frames, uint32_t nframes) {
+    struct ac97* a = (struct ac97*)dev->priv;
+    if (nframes > AC97_BUF_FRAMES) nframes = AC97_BUF_FRAMES;
+    if (nframes == 0) return 0;
+
+    /* A fresh sound: the engine is stopped, so put it back to slot 0. */
+    if (!a->running || (inw(a->nabm + PO_SR) & SR_DCH)) ac97_engine_reset(a);
+
+    /* BLOCK WHILE THE QUEUE IS FULL.  This is what still paces the caller to
+     * real time now that `play` returns on QUEUEING rather than on playback:
+     * the queue only frees a slot when the hardware has consumed one.  Sleep,
+     * never spin — the §M49/§M55/§M56 rule this driver already had to learn. */
+    uint64_t deadline = timer_ticks_ms() +
+                        (AC97_DEPTH * AC97_BUF_FRAMES * 1000ull) /
+                        (dev->rate ? dev->rate : 48000u) + AC97_DRAIN_GRACE_MS;
+    while (ac97_outstanding(a) >= AC97_DEPTH) {
+        if (timer_ticks_ms() > deadline) {
+            kprintf("ac97: queue stuck — dropping %u frames\n", nframes);
+            return -1;
+        }
+        task_msleep(1);
+    }
+
+    uint32_t slot = a->head;
+    int16_t* dst = a->pcm + (size_t)slot * AC97_BUF_FRAMES * 2;
+    for (uint32_t i = 0; i < nframes * 2; i++) dst[i] = frames[i];
+
+    a->bdl[slot].addr    = a->pcm_phys + slot * AC97_BUF_FRAMES * 4;
+    a->bdl[slot].samples = (uint16_t)(nframes * 2);   /* stereo → 2 per frame */
+    /* IOC so the engine updates its status per buffer; NOT BUP.  BUP means
+     * "this is the end — emit zeros after it", which is right for a driver
+     * that plays exactly one buffer and wrong for a ring: setting it on every
+     * entry tells the engine each one is the last. */
+    a->bdl[slot].control = BDL_IOC;
+
+    /* LVI AFTER the entry is valid: it is what tells the engine the buffer
+     * exists, so publishing it first is handing over a descriptor that is
+     * still being written. */
+    a->head = (slot + 1) & (AC97_NBUF - 1);
+    outb(a->nabm + PO_LVI, (uint8_t)slot);
+
+    if (!a->running) {
+        outw(a->nabm + PO_SR, 0x1C);
+        outb(a->nabm + PO_CR, CR_RPBM);
+        a->running = 1;
+    }
+    return (int)nframes;                              /* QUEUED, not yet heard */
 }
 
 /* ----------------------- Bring-up ----------------------------------------- */
@@ -215,6 +294,11 @@ static int ac97_init(void* ctx) {
     g_audio.rate     = AC97_RATE;
     g_audio.channels = 2;
     g_audio.play     = ac97_play;
+    g_audio.drain    = ac97_drain;
+    /* This driver QUEUES, so it can afford a short period — and says so rather
+     * than letting the core assume the conservative one a non-queueing device
+     * needs.  1024 frames = ~21 ms of mixer latency. */
+    g_audio.period_frames = 1024;
     g_audio.priv     = &g_ac97;
     audio_register(&g_audio);
 
