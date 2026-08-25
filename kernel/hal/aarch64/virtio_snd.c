@@ -53,6 +53,12 @@
 #include "klog.h"
 #include "task.h"
 #include "timer.h"
+#include "waitq.h"
+#include "ktimer.h"
+
+/* gic.c — this is the first virtio-mmio driver here to take an interrupt. */
+void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
+void gic_enable_irq(uint32_t intid);
 #include <stdint.h>
 #include <stddef.h>
 
@@ -97,6 +103,18 @@
  * ring has to hold 3 x the number of buffers we want in flight.  16 gives four
  * chains with room to spare; the negotiated size is still checked at run time,
  * because a device is entitled to offer fewer. */
+/* QEMU `virt` wires virtio-mmio slot N to SPI (16 + N), and an SPI is INTID
+ * 32 + n — so slot N is INTID 48 + N.  Hardcoded like the 0x0a000000 base
+ * every one of these drivers already hardcodes: this port targets one machine,
+ * and the honest place for that assumption is next to the other one.  If it is
+ * wrong the driver still works — the backstop below turns a missing interrupt
+ * into latency, never into silence (§M55's rule). */
+#define VIRTIO_MMIO_INTID_BASE 48
+
+/* How long a wait may go without hearing from the device.  A missed interrupt
+ * then costs one backstop of latency instead of a hung task. */
+#define SND_IRQ_BACKSTOP_NS  (10ull * 1000000ull)   /* 10 ms */
+
 #define QSIZE 16
 
 struct virtq_desc  { uint64_t addr; uint32_t len; uint16_t flags; uint16_t next; } __attribute__((packed));
@@ -230,6 +248,56 @@ static inline void     w32(uintptr_t b, uint32_t off, uint32_t v) { *(volatile u
 static inline uint32_t r32(uintptr_t b, uint32_t off)             { return *(volatile uint32_t*)(b + off); }
 static inline void dsb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
 
+/* §M23 — THE COMPLETION INTERRUPT.  Shaped exactly like §M55's NIC wait: a
+ * SEQUENCE counter the ISR bumps, sampled before the condition is tested and
+ * compared under the queue lock, so an interrupt arriving inside that window
+ * cannot be lost the way a bare "is there work" flag would lose it. */
+static struct waitq      g_sndwq;
+static volatile uint32_t g_irq_seq;
+static volatile uint32_t g_irq_count;
+
+static void snd_backstop_fired(struct ktimer* t) {
+    (void)t;
+    uint32_t f = waitq_lock(&g_sndwq);
+    waitq_wake_all(&g_sndwq);
+    waitq_unlock(&g_sndwq, f);
+}
+
+/* The ISR does two things and no third: acknowledge the device (reading and
+ * writing InterruptACK is what deasserts the line — skipping it is an
+ * interrupt storm) and wake whoever is waiting.  It does NOT drain a queue,
+ * because draining runs code that blocks — §M49's xHCI lesson. */
+static void snd_irq(uint32_t intid) {
+    (void)intid;
+    struct snd_dev* d = &g_snd;
+    if (!d->base) return;
+    uint32_t st = r32(d->base, R_INTSTATUS);
+    if (!st) return;                       /* not ours */
+    w32(d->base, R_INTACK, st);
+    g_irq_seq++;
+    g_irq_count++;
+    uint32_t f = waitq_lock(&g_sndwq);
+    waitq_wake_all(&g_sndwq);
+    waitq_unlock(&g_sndwq, f);
+}
+
+/* Sleep until the device says something, or the backstop fires.  Bounded
+ * regardless, so a driver whose interrupt never arrives degrades to polling
+ * rather than hanging on a promise (§M55's rule, stated there as: the stack
+ * learns interrupts work by RECEIVING one). */
+static uint32_t snd_irq_count(void) { return g_irq_count; }
+
+static void snd_wait_event(void) {
+    uint32_t seq = g_irq_seq;
+    struct ktimer t = { 0, 0, 0, 0, 0 };
+    ktimer_arm(&t, timer_now_ns() + SND_IRQ_BACKSTOP_NS, snd_backstop_fired, NULL);
+    uint32_t f = waitq_lock(&g_sndwq);
+    if (g_irq_seq == seq && !task_should_stop()) waitq_block(&g_sndwq);
+    waitq_unlock(&g_sndwq, f);
+    ktimer_cancel(&t);
+}
+
+
 /* Wait for a used-ring entry, SLEEPING rather than spinning — the same rule the
  * AC97 drain wait had to learn: a wait must not cost a CPU.  The deadline is
  * real time, so a device that never answers costs a bounded wait instead of a
@@ -242,7 +310,7 @@ static int wait_used(const struct virtq_used* used, uint16_t* last, uint32_t ms)
      * exactly the kind of assumption an arch port later trips over. */
     while (*last == *(const volatile uint16_t*)&used->idx) {
         if (timer_ticks_ms() > deadline) return -1;
-        task_msleep(1);
+        snd_wait_event();
     }
     dsb();
     (*last)++;
@@ -311,7 +379,7 @@ static void snd_drain(struct audio_dev* dev) {
             klog(KLOG_WARN, "audio", "virtio-snd: drain timed out\n");
             break;
         }
-        task_msleep(1);
+        snd_wait_event();
     }
     if (r32(d->base, R_INTSTATUS) & 1) w32(d->base, R_INTACK, 1);
 }
@@ -333,7 +401,7 @@ static int snd_play(struct audio_dev* dev, const int16_t* frames, uint32_t nfram
             klog(KLOG_WARN, "audio", "virtio-snd: queue stuck\n");
             return -1;
         }
-        task_msleep(1);
+        snd_wait_event();
     }
 
     uint32_t slot = d->tsub % depth;
@@ -451,7 +519,7 @@ static int snd_record(struct audio_dev* dev, int16_t* frames, uint32_t nframes) 
                         (dev->rate ? dev->rate : 48000u) + 500;
     while (d->rlast == *(volatile uint16_t*)&d->rused.idx) {
         if (timer_ticks_ms() > deadline) return 0;
-        task_msleep(1);
+        snd_wait_event();
     }
     dsb();
     uint32_t slot = (uint32_t)(d->rlast % (d->rchains ? d->rchains : 1));
@@ -616,6 +684,10 @@ int virtio_snd_init(void) {
         if (*(volatile uint32_t*)(base + R_VERSION) != 2) continue;
         if (*(volatile uint32_t*)(base + R_DEVICEID) != VIRTIO_DEVID_SOUND) continue;
 
+        waitq_init(&g_sndwq);
+        gic_register_handler(VIRTIO_MMIO_INTID_BASE + (uint32_t)i, snd_irq);
+        gic_enable_irq(VIRTIO_MMIO_INTID_BASE + (uint32_t)i);
+
         if (snd_dev_init(&g_snd, base) != 0) {
             kprintf("virtio-snd: device at slot %d failed to start\n", i);
             return 0;
@@ -625,6 +697,7 @@ int virtio_snd_init(void) {
         g_audio.channels = 2;
         g_audio.play     = snd_play;
         g_audio.drain    = snd_drain;
+        g_audio.irq_count = snd_irq_count;
         g_audio.period_frames = SND_PERIOD_FRAMES;   /* it queues, so 21 ms */
         /* BOTH conditions: an input stream exists AND the RX queue came up.
          * They are established at different points in bring-up, so checking
@@ -636,8 +709,10 @@ int virtio_snd_init(void) {
         }
         g_audio.priv     = &g_snd;
         audio_register(&g_audio);
-        kprintf("virtio-snd: up at slot %d (base %p), stream %u\n",
-                i, (void*)base, (unsigned)g_snd.stream_id);
+        g_audio.priv = &g_snd;
+        kprintf("virtio-snd: up at slot %d (base %p), stream %u, INTID %u\n",
+                i, (void*)base, (unsigned)g_snd.stream_id,
+                (unsigned)(VIRTIO_MMIO_INTID_BASE + i));
         return 1;
     }
     return 0;

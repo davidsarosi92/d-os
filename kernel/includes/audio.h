@@ -79,6 +79,12 @@ struct audio_dev {
      * a non-queueing one's latency. */
     uint32_t period_frames;
 
+    /* How many completion interrupts this device has taken, or NULL if it does
+     * not use one.  Counted rather than assumed: §M55's rule is that a driver
+     * learns its interrupt works by RECEIVING one, and `lsaudio` is where that
+     * shows. */
+    uint32_t (*irq_count)(void);
+
     void* priv;                               /* driver-private state        */
     struct audio_dev* next;                   /* registry link               */
 };

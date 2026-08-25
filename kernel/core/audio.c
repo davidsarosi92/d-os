@@ -34,8 +34,16 @@ struct audio_dev* audio_primary(void) { return g_head; }
 
 void audio_list(void) {
     if (!g_head) { kprintf("no audio devices\n"); return; }
-    for (struct audio_dev* n = g_head; n; n = n->next)
-        kprintf("%s  %u Hz  %u ch  16-bit PCM\n", n->name, n->rate, n->channels);
+    for (struct audio_dev* n = g_head; n; n = n->next) {
+        kprintf("%s  %u Hz  %u ch  16-bit PCM%s\n", n->name, n->rate, n->channels,
+                n->record ? "  (capture)" : "");
+        /* Did the completion interrupt actually fire?  §M55's rule made
+         * visible: a driver that wired an interrupt which never arrives
+         * degrades to polling, and counting them is the only way to tell
+         * which of the two happened. */
+        if (n->irq_count)
+            kprintf("  completion interrupts: %u\n", n->irq_count());
+    }
 }
 
 /* ----------------------- Tone generator ----------------------------------- */

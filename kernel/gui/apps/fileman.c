@@ -45,6 +45,7 @@
 #include "timer.h"
 #include "kmalloc.h"
 #include "printf.h"
+#include "klog.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -426,7 +427,14 @@ static void fm_sendto(struct w_button* b, void* ctx) {
     target[n] = '\0';
 
     int rc = shortcut_add(fm->names[sel], target, NULL);
-    if (rc == 0)       w_label_set(fm->status, "sent to desktop");
+    if (rc == 0)       { w_label_set(fm->status, "sent to desktop");
+                         /* Say it on the log too.  The status line is visible
+                          * only in a screenshot, and a screenshot cannot show
+                          * that a FILE was written — which is what a shortcut
+                          * is (§M64).  The drop in §4.79 logs itself for the
+                          * same reason. */
+                         klog(KLOG_INFO, "gui", "fileman: sent '%s' to the desktop\n",
+                              fm->names[sel]); }
     else if (rc == -2) w_label_set(fm->status, "desktop is full");
     else               w_label_set(fm->status, "could not write the shortcut");
 }
