@@ -55,6 +55,17 @@
 #define NAM_EXT_CTRL     0x2A   /* extended audio status/control (VRA enable) */
 #define NAM_PCM_DAC_RATE 0x2C   /* front DAC sample rate (with VRA)           */
 
+/* PCM IN box at NABM offset 0x00 — the same register layout as PCM OUT, one
+ * box lower.  Capture is the same DMA engine pointed the other way: the device
+ * WRITES our buffers instead of reading them. */
+#define PI_BDBAR         0x00
+#define PI_CIV           0x04
+#define PI_LVI           0x05
+#define PI_SR            0x06
+#define PI_PICB          0x08
+#define PI_CR            0x0B
+#define NAM_PCM_ADC_RATE 0x32   /* record rate, with VRA                      */
+
 /* NABM (bus master) register offsets — PCM OUT box at 0x10. */
 #define PO_BDBAR         0x10
 #define PO_CIV           0x14
@@ -152,6 +163,15 @@ struct ac97 {
     volatile uint32_t submitted;
     volatile uint32_t completed;
     volatile int      irq_seen;
+    /* Capture side.  Its own BDL and buffers: recording while playing is two
+     * independent DMA engines, and sharing either would make one silently
+     * corrupt the other. */
+    uint32_t rec_bdl_phys;
+    struct bdl_entry* rec_bdl;
+    uint32_t rec_pcm_phys;
+    int16_t* rec_pcm;
+    uint32_t rec_next;               /* next ring slot we will read from      */
+    int      rec_running;
 };
 
 static struct ac97 g_ac97;
@@ -284,6 +304,66 @@ static int ac97_play(struct audio_dev* dev, const int16_t* frames, uint32_t nfra
     return (int)nframes;                              /* QUEUED, not yet heard */
 }
 
+/* ----------------------- Capture ------------------------------------------ */
+
+/* Arm the input engine with the whole ring, so the device always has somewhere
+ * to put samples.  Unlike playback we do not feed it buffer by buffer: a
+ * recorder that runs out of somewhere-to-write DROPS audio, and the drop is
+ * silent — the samples simply never existed. */
+static void ac97_rec_start(struct ac97* a) {
+    outb(a->nabm + PI_CR, 0);
+    outb(a->nabm + PI_CR, CR_RR);
+    for (uint32_t s = 0; (inb(a->nabm + PI_CR) & CR_RR) && s < 100000; s++) hal_cpu_pause();
+
+    for (uint32_t i = 0; i < AC97_NBUF; i++) {
+        a->rec_bdl[i].addr    = a->rec_pcm_phys + i * AC97_BUF_FRAMES * 4;
+        a->rec_bdl[i].samples = (uint16_t)(AC97_BUF_FRAMES * 2);
+        a->rec_bdl[i].control = BDL_IOC;
+    }
+    outw(a->nabm + PI_SR, 0x1C);
+    outl(a->nabm + PI_BDBAR, a->rec_bdl_phys);
+    outb(a->nabm + PI_LVI, (uint8_t)(AC97_NBUF - 1));
+    outb(a->nabm + PI_CR, CR_RPBM);
+    a->rec_next = 0;
+    a->rec_running = 1;
+}
+
+/* Begin a fresh session: re-arming the box drops whatever was collected while
+ * nobody was listening, so a recording starts at the moment it was asked for. */
+static void ac97_record_start(struct audio_dev* dev) {
+    struct ac97* a = (struct ac97*)dev->priv;
+    if (a->rec_pcm) ac97_rec_start(a);
+}
+
+static int ac97_record(struct audio_dev* dev, int16_t* frames, uint32_t nframes) {
+    struct ac97* a = (struct ac97*)dev->priv;
+    if (!a->rec_pcm) return -1;
+    if (nframes > AC97_BUF_FRAMES) nframes = AC97_BUF_FRAMES;
+    if (nframes == 0) return 0;
+    if (!a->rec_running) ac97_rec_start(a);
+
+    /* Wait until the engine has moved PAST the slot we want to read, which is
+     * what says that slot is full.  Sleeping, bounded — a device that captures
+     * nothing must cost a wait, not a hung shell. */
+    uint64_t deadline = timer_ticks_ms() +
+                        (AC97_BUF_FRAMES * 1000ull) /
+                        (dev->rate ? dev->rate : 48000u) + AC97_DRAIN_GRACE_MS;
+    while (((uint32_t)inb(a->nabm + PI_CIV) & (AC97_NBUF - 1)) == a->rec_next) {
+        if (timer_ticks_ms() > deadline) return 0;     /* nothing captured    */
+        task_msleep(1);
+    }
+
+    const int16_t* src = a->rec_pcm + (size_t)a->rec_next * AC97_BUF_FRAMES * 2;
+    for (uint32_t i = 0; i < nframes * 2; i++) frames[i] = src[i];
+
+    /* Hand the slot back: re-arm it and move LVI so the engine may reuse it. */
+    a->rec_bdl[a->rec_next].samples = (uint16_t)(AC97_BUF_FRAMES * 2);
+    a->rec_bdl[a->rec_next].control = BDL_IOC;
+    outb(a->nabm + PI_LVI, (uint8_t)a->rec_next);
+    a->rec_next = (a->rec_next + 1) & (AC97_NBUF - 1);
+    return (int)nframes;
+}
+
 /* ----------------------- Bring-up ----------------------------------------- */
 
 static int ac97_probe(void* ctx) {
@@ -321,13 +401,23 @@ static int ac97_init(void* ctx) {
     /* Try to set the DAC to 48 kHz via variable-rate audio, if supported. */
     outw(nam + NAM_EXT_CTRL, inw(nam + NAM_EXT_CTRL) | 0x0001);  /* VRA enable */
     outw(nam + NAM_PCM_DAC_RATE, AC97_RATE);
+    outw(nam + NAM_PCM_ADC_RATE, AC97_RATE);           /* capture rate too    */
 
     /* DMA memory: one frame for the BDL, contiguous frames for the PCM
      * buffer.  PMM-backed → phys == virt in the identity map. */
+    g_ac97.rec_bdl_phys = pmm_alloc_frame_dma32();
+    g_ac97.rec_pcm_phys = pmm_alloc_contiguous_dma32(32);    /* 128 KB capture */
     g_ac97.bdl_phys = pmm_alloc_frame_dma32();
     g_ac97.pcm_phys = pmm_alloc_contiguous_dma32(32);        /* 128 KB               */
     if (!g_ac97.bdl_phys || !g_ac97.pcm_phys) { kprintf("ac97: DMA OOM\n"); return -3; }
     g_ac97.bdl = (struct bdl_entry*)(uintptr_t)g_ac97.bdl_phys;
+    if (g_ac97.rec_bdl_phys && g_ac97.rec_pcm_phys) {
+        g_ac97.rec_bdl = (struct bdl_entry*)(uintptr_t)g_ac97.rec_bdl_phys;
+        g_ac97.rec_pcm = (int16_t*)(uintptr_t)g_ac97.rec_pcm_phys;
+    } else {
+        /* Capture is optional: a box short of DMA memory should still PLAY. */
+        kprintf("ac97: no DMA for capture — recording unavailable\n");
+    }
     g_ac97.pcm = (int16_t*)(uintptr_t)g_ac97.pcm_phys;
     for (int i = 0; i < BDL_ENTRIES; i++) { g_ac97.bdl[i].addr = 0; g_ac97.bdl[i].samples = 0; g_ac97.bdl[i].control = 0; }
 
@@ -349,6 +439,10 @@ static int ac97_init(void* ctx) {
     g_audio.channels = 2;
     g_audio.play     = ac97_play;
     g_audio.drain    = ac97_drain;
+    if (g_ac97.rec_pcm) {
+        g_audio.record       = ac97_record;
+        g_audio.record_start = ac97_record_start;
+    }
     /* This driver QUEUES, so it can afford a short period — and says so rather
      * than letting the core assume the conservative one a non-queueing device
      * needs.  1024 frames = ~21 ms of mixer latency. */

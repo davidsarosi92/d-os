@@ -652,6 +652,7 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "lsaudio")) audio_list();
         else if (s_eq(cmd, "play"))    audio_cmd_play(args);
         else if (s_eq(cmd, "volume"))  audio_cmd_volume(args);
+        else if (s_eq(cmd, "rec"))     audio_cmd_rec(args);
         else if (s_eq(cmd, "free"))   cmd_meminfo();
         else if (s_eq(cmd, "uptime")) kprintf("up %u ms\n", (unsigned)timer_ticks_ms());
         else if (s_eq(cmd, "ktime"))  cmd_ktime();

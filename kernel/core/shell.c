@@ -4126,6 +4126,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     /* §M23 stage 2 — the implementation lives in audio.c, not here, so the ARM
      * serial REPL runs the same one (§M24's rule). */
     if (starts_with(line, "play "))    { audio_cmd_play(line + 5); return; }
+    if (starts_with(line, "rec "))     { audio_cmd_rec(line + 4);     return; }
     if (streq(line, "volume"))         { audio_cmd_volume("");        return; }
     if (starts_with(line, "volume "))  { audio_cmd_volume(line + 7);  return; }
     if (streq(line, "ps"))             { task_list();    return; }

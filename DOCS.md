@@ -3234,9 +3234,46 @@ The settle constant survives only on the polled path, where it is still the
 best available answer, and is documented as the crutch it is.  Two streams
 still peak at exactly 10000 and the WAV path is unchanged.
 
-**Still open:** PCM input, Intel HDA, an interrupt for virtio-sound (its used
-ring is already exact, so this would only save the 1 ms poll), and whether
-`/dev/vda` should be published on ARM.
+#### Stage 7 — capture, and what is honestly verified about it
+
+`rec <path.wav> [ms]` records to a file and `/dev/dsp` is readable.  AC97's
+PCM-IN box is the same DMA ring pointed the other way — the device writes our
+buffers instead of reading them — with its own BDL and memory, because
+recording while playing is two independent engines and sharing either would
+have one silently corrupt the other.
+
+**A recording starts when you ask for it.**  A capture engine keeps filling its
+ring once started, so the first version handed back whatever the device had
+already collected: `rec 250` completed in **0 ms**, entirely from stale
+buffers.  A new `record_start` op re-arms the box, and `/dev/dsp` arms once per
+open (the close hook resets it).  After that the elapsed times are
+proportional — 1000 ms → 804, 500 → 392, 250 → 191.
+
+**WHAT IS NOT VERIFIED, stated rather than left to assumption.**  No QEMU audio
+backend available here can inject a known signal: `wav` is output-only and
+rejects `in.path`, `none` supplies silence, `coreaudio` is a real microphone on
+the developer's machine.  So this is what the tests can and cannot say:
+
+| Claim | Verified? |
+|-------|-----------|
+| the frame count is what was asked for | **yes** — 48000/48000, 24000/24000, 12000/12000 |
+| the file is well-formed | **yes** — 96044 bytes for 24000 frames, and `play` re-parses it as 48000 Hz / 2 ch / 16-bit |
+| recording starts on request | **yes** — the 0 ms case is gone and times are proportional |
+| the samples are the sound that went in | **no** — nothing can put a known sound in |
+
+The elapsed time is consistently ~0.8× real time with the null backend, and
+**that ratio is not attributed here**: it could be our reading or QEMU's
+unpaced null input, and the experiment that would separate them is the one the
+missing backend prevents.  It is written down rather than explained away.
+
+aarch64 answers `rec: virtio-snd cannot record` — the honest failure, since
+capture there needs an input stream and the RX queue.  `NULL` for `record`
+means "cannot", which is deliberately a different answer from handing back
+zeros that look like a working quiet microphone.
+
+**Still open:** capture on aarch64, Intel HDA, an interrupt for virtio-sound
+(its used ring is already exact, so this would only save the 1 ms poll), and
+whether `/dev/vda` should be published on ARM.
 
 ### 4.26 Audio — AC97 codec + PCM output (M23, i386)
 

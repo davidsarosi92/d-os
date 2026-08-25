@@ -53,6 +53,22 @@ struct audio_dev {
      * nothing to wait for and leaves this NULL. */
     void (*drain)(struct audio_dev* dev);
 
+    /* Capture `nframes` into `frames` (interleaved 16-bit stereo at `rate`).
+     * Blocking: returns the number of frames actually captured, or negative.
+     * NULL means this device cannot record, which is a different answer from
+     * "recorded silence" and is reported as such rather than handing back a
+     * buffer of zeros that looks like a working quiet microphone. */
+    int (*record)(struct audio_dev* dev, int16_t* frames, uint32_t nframes);
+
+    /* Begin a fresh capture session, discarding anything already buffered.
+     *
+     * A capture engine keeps filling its ring once started, so without this a
+     * recording would begin with whatever the device happened to collect
+     * BEFORE it was asked — measured as `rec 250` completing in 0 ms, entirely
+     * from stale buffers.  "Record 250 ms" means starting now, not handing
+     * back the last 250 ms that went past. */
+    void (*record_start)(struct audio_dev* dev);
+
     /* Preferred mix period in frames, or 0 for the core's default.
      *
      * The mixer's latency is one period, so smaller is better — but the floor
@@ -184,6 +200,22 @@ int  audio_play_wav(const char* path);
  * implementation instead of a second one that drifts. */
 void audio_cmd_play(const char* args);
 void audio_cmd_volume(const char* args);
+
+/* ---------------------------------------------------------------------------
+ * Capture (§M23 stage 7).
+ *
+ * `rec <path.wav> [ms]` records to a file; /dev/dsp becomes readable.
+ *
+ * A NOTE ON WHAT IS VERIFIED, because it is less than everywhere else in this
+ * subsystem: no QEMU audio backend available here can INJECT a known signal —
+ * `wav` is output-only and rejects `in.path`, `none` supplies silence, and
+ * `coreaudio` is a real microphone on the developer's machine.  So the frame
+ * counts, the real-time pacing and the device's own status are testable
+ * headlessly and THE CONTENT IS NOT.  Said plainly rather than left for
+ * somebody to assume the same standard as playback.
+ * --------------------------------------------------------------------------- */
+int  audio_record_wav(const char* path, uint32_t ms);
+void audio_cmd_rec(const char* args);
 
 /* Publish /dev/dsp (§M23 stage 3).  Called next to clipboard_devfs_init() on
  * BOTH entry paths — the node belongs to the audio subsystem, not to a card,

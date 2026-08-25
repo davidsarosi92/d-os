@@ -768,6 +768,10 @@ static int audio_write_testwav(const char* path, uint32_t freq, uint32_t ms) {
  * because devfs has no open hook — only the close one this device needed for
  * its drain. */
 static struct audio_stream* g_dsp_stream = NULL;
+/* Has this open already started a capture session?  Reset by close(), so each
+ * open of /dev/dsp reads audio from when it opened rather than from whenever
+ * the device last happened to be armed. */
+static int g_dsp_rec_armed = 0;
 
 /* A write must be a whole number of FRAMES, and a caller has no reason to know
  * that: `cat` writes whatever block size it likes, so a 4-byte frame gets
@@ -848,15 +852,33 @@ static int dsp_dev_close(void* ctx) {
     }
     g_dsp_fill   = 0;
     g_dsp_tail_n = 0;          /* an incomplete frame at close is not audio */
+    g_dsp_rec_armed = 0;
     return 0;
 }
 
 static ssize_t dsp_dev_read(void* ctx, void* buf, size_t n, uint64_t off) {
-    (void)ctx; (void)buf; (void)n; (void)off;
-    /* PCM capture is §M23's next stage and there is no input path at all yet.
-     * Returning 0 would mean END OF FILE, and a recorder told EOF writes an
-     * empty file and reports success — so this fails instead. */
-    return -1;
+    (void)ctx; (void)off;                     /* a stream has no position */
+    struct audio_dev* dev = audio_primary();
+    if (!dev || !dev->record || !buf) {
+        /* NOT 0: zero means END OF FILE, and a recorder told EOF writes an
+         * empty file and reports success.  "This device cannot record" has to
+         * be an error, not an empty result. */
+        return -1;
+    }
+    if (!g_dsp_rec_armed) {
+        if (dev->record_start) dev->record_start(dev);
+        g_dsp_rec_armed = 1;
+    }
+    uint32_t want = (uint32_t)(n / 4);         /* whole frames only */
+    if (!want) return 0;
+    if (want > WAV_OUT_FRAMES) want = WAV_OUT_FRAMES;
+    int got = dev->record(dev, g_dsp_buf, want);
+    if (got <= 0) return got < 0 ? -1 : 0;
+    for (int i = 0; i < got * 2; i++) {
+        ((uint8_t*)buf)[i * 2 + 0] = (uint8_t)(g_dsp_buf[i] & 0xFF);
+        ((uint8_t*)buf)[i * 2 + 1] = (uint8_t)((g_dsp_buf[i] >> 8) & 0xFF);
+    }
+    return (ssize_t)got * 4;
 }
 
 static int dsp_dev_ioctl(void* ctx, int cmd, void* arg) {
@@ -1004,6 +1026,79 @@ static void audio_mixtest(uint32_t ms) {
  * path, which exists BEFORE the taskbar control that calls the same functions
  * (the rule §M60 paid for: a setting with no shell command cannot be
  * regression-tested on a machine with no display). */
+/* ----------------------- Capture to a file (§M23 stage 7) ----------------- */
+
+int audio_record_wav(const char* path, uint32_t ms) {
+    struct audio_dev* dev = audio_primary();
+    if (!dev)          { kprintf("audio: no device\n"); return -1; }
+    if (!dev->record)  { kprintf("rec: %s cannot record\n", dev->name); return -1; }
+    if (!path || !*path) { kprintf("rec: give a path\n"); return -1; }
+    if (!ms) ms = 1000;
+
+    uint32_t rate  = dev->rate ? dev->rate : 48000;
+    uint32_t total = (rate / 1000u) * ms;
+    uint32_t bytes = total * 4;
+
+    struct file* f = vfs_open(path, VFS_WRONLY | VFS_CREATE);
+    if (!f) { kprintf("rec: cannot create %s\n", path); return -1; }
+
+    /* A 44-byte canonical WAV header, written FIRST with the length we intend
+     * to record.  If the capture stops short the header would over-promise, so
+     * the real count is checked at the end and reported — a file whose header
+     * lies about its length is worse than a short one. */
+    uint8_t h[44];
+    #define P4(o,str) do { h[o]=(uint8_t)str[0]; h[o+1]=(uint8_t)str[1]; \
+                           h[o+2]=(uint8_t)str[2]; h[o+3]=(uint8_t)str[3]; } while (0)
+    #define P32(o,v) do { uint32_t _v=(v); h[o]=(uint8_t)_v; h[o+1]=(uint8_t)(_v>>8); \
+                          h[o+2]=(uint8_t)(_v>>16); h[o+3]=(uint8_t)(_v>>24); } while (0)
+    #define P16(o,v) do { uint16_t _v=(uint16_t)(v); h[o]=(uint8_t)_v; \
+                          h[o+1]=(uint8_t)(_v>>8); } while (0)
+    P4(0,"RIFF"); P32(4, 36 + bytes); P4(8,"WAVE");
+    P4(12,"fmt "); P32(16,16); P16(20,1); P16(22,2);
+    P32(24, rate); P32(28, rate * 4); P16(32,4); P16(34,16);
+    P4(36,"data"); P32(40, bytes);
+    #undef P4
+    #undef P32
+    #undef P16
+    vfs_write(f, h, 44);
+
+    /* Start the session HERE, so what lands in the file is what happened from
+     * this moment — not whatever the device had already buffered. */
+    if (dev->record_start) dev->record_start(dev);
+
+    uint64_t t0 = timer_ticks_ms();
+    uint32_t done = 0;
+    while (done < total) {
+        uint32_t want = total - done;
+        if (want > WAV_OUT_FRAMES) want = WAV_OUT_FRAMES;
+        int got = dev->record(dev, g_wav_out, want);
+        if (got <= 0) break;
+        vfs_write(f, g_wav_out, (size_t)got * 4);
+        done += (uint32_t)got;
+    }
+    uint32_t elapsed = (uint32_t)(timer_ticks_ms() - t0);
+    vfs_close(f);
+
+    kprintf("rec: %s — %u of %u frames (%u ms asked, %u ms elapsed) at %u Hz\n",
+            path, done, total, ms, elapsed, rate);
+    if (done < total)
+        kprintf("rec: SHORT — the header promises %u frames\n", total);
+    return done ? 0 : -1;
+}
+
+void audio_cmd_rec(const char* args) {
+    while (args && *args == ' ') args++;
+    if (!args || !*args) { kprintf("rec <path.wav> [ms]\n"); return; }
+    char path[128];
+    int n = 0;
+    while (*args && *args != ' ' && n < (int)sizeof path - 1) path[n++] = *args++;
+    path[n] = '\0';
+    while (*args == ' ') args++;
+    uint32_t ms = 0;
+    while (*args >= '0' && *args <= '9') ms = ms * 10 + (uint32_t)(*args++ - '0');
+    audio_record_wav(path, ms);
+}
+
 void audio_cmd_volume(const char* args) {
     while (args && *args == ' ') args++;
     int vol, muted;
