@@ -225,7 +225,7 @@ what); a session can pick a theme and push on it.
 | M9  | `devfs` — drivers as files under `/dev`         | Driver framework | ✅ DOCS §4.X |
 | M10 | `procfs` — kernel state as files under `/proc`  | Driver framework | ✅ DOCS §4.X |
 | M11 | Block layer + first block driver (virtio-blk)   | Storage          | ✅ DOCS §4.X |
-| M12 | exFAT (with multi-FS abstraction for FAT/NTFS)  | Storage          | ✅ DOCS §4.X + §4.73 (mkdir/rmdir) |
+| M12 | exFAT (with multi-FS abstraction for FAT/NTFS)  | Storage          | ✅ DOCS §4.X + §4.73 (mkdir/rmdir) + §4.78.1 (rename — the ops table has no NULLs left) |
 | M13 | Preemptive scheduling (timer IRQ → schedule)    | Concurrency      | ✅ DOCS §4.X |
 | M14 | Multi-session shell with FB pane splitting      | UX               | ✅ DOCS §4.X |
 | M15 | USB host stack + USB HID keyboard              | Input            | ✅ DOCS §4.X |

@@ -9221,6 +9221,60 @@ adds a second set of controls — stated in ui.h because the first attempt did
 exactly that), and there is no keyboard route into the table's rows beyond the
 item view's own arrows.
 
+### 4.78.1 exFAT can rename now — the last NULL in the ops table (§M12)
+
+**2026-08-25.**  `.rename` was the one operation `exfat_inode_ops_dir` still
+left NULL, and `vfs.h` said why: *"exFAT would need a directory-entry rewrite —
+deferred"*.
+
+**A RENAME IS NOT AN EDIT.**  The name lives across File Name entries at
+fifteen characters each, so a different name is very often a different *number*
+of entries — and `SecondaryCount`, the `SetChecksum` and the slot's extent all
+change with it.  Patching in place would work for names that happen to round
+the same way and corrupt the set for the ones that do not: correct in testing,
+wrong on a user's file.
+
+So a complete new entry set is written, describing the **same cluster chain**,
+and the old set is then deleted.  The data is never touched — a rename must not
+read or move a byte of the file, which is what the directory test proves by
+reading a file *through* its parent's new name.
+
+**The order is the design.**  New first, old second: a crash between them
+leaves two names for one chain, which `fsck` reports as a cross-link and a
+human can resolve.  The other order leaves the chain allocated and
+unreferenced — the file is simply gone.  *Losing the name is recoverable;
+losing the file is not.*
+
+Two details that would each have produced a quiet wrong answer:
+
+- **The inode still pointed at the old slot.**  Every later write goes through
+  `dirent_index` to rewrite the Stream Extension, so leaving it stale would
+  have the next write update a *deleted* entry — the file would look renamed
+  and then silently stop growing.
+- **An existing target is refused** by the fs itself, not left to the VFS
+  (§4.73's rule: a filesystem that can hold one name twice does not have a
+  namespace).
+
+The entry-set builder was factored out of `exfat_make` rather than copied: the
+checksum, the name hash and the fifteen-chars-per-entry split are three things
+to get wrong, and two copies means fixing a bug in one of them.
+
+**`mv <old> <new>` came with it**, for the reason `rm` came with unlink: an
+operation with no way to invoke it cannot be tested, and the file manager's
+Rename button is unreachable from a machine with no display.  A too-long name
+now returns its own code — it had reported *"same directory only?"* for a
+43-character name and sent the first test looking in the wrong place entirely.
+(exFAT here caps names at 30 characters, which is a limit of this
+implementation's two name entries, not of the format.)
+
+**Verified:** a rename across the entry-count boundary (6 chars → 26, one name
+entry → two) keeps the size and the contents; the new name and its bytes
+survive a **reboot**; a **directory** rename leaves the file inside it readable
+through the new path; a colliding target and an over-long name are both
+refused with the right message; and `fsck.exfat -n` reports **`clean`** after
+each — the check that counts, since our own reader agreeing with our own writer
+would only prove they share a misunderstanding.
+
 ### 4.79 The desktop you can arrange: drag, keyboard, and the slot that survives a reboot (§M64 tail)
 
 §M64 shipped icons on the wallpaper and said what it had left out: drag-to-move

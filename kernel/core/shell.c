@@ -3858,6 +3858,30 @@ static void cmd_setconf(const char* args) { config_cmd_setconf(args); }
  * could not delete (`.unlink = NULL`) and nobody missed it on ramfs.  With
  * unlink/rmdir implemented there is something to remove, and a filesystem you
  * can only add to is not a filesystem you can use. */
+/* §M12 — `mv <old> <new>`, same directory.  Added with exFAT's rename for the
+ * reason `rm` was added with its unlink: a filesystem operation with no way to
+ * invoke it is a filesystem operation nobody can test, and the file manager's
+ * Rename button is not reachable from a machine with no display. */
+static void cmd_mv(const char* args) {
+    char oldp[192], newp[192];
+    int n = 0;
+    while (*args == ' ') args++;
+    while (*args && *args != ' ' && n < (int)sizeof oldp - 1) oldp[n++] = *args++;
+    oldp[n] = '\0';
+    while (*args == ' ') args++;
+    n = 0;
+    while (*args && *args != ' ' && n < (int)sizeof newp - 1) newp[n++] = *args++;
+    newp[n] = '\0';
+    if (!oldp[0] || !newp[0]) { kprintf("usage: mv <old> <new>\n"); return; }
+
+    int rc = vfs_rename(oldp, newp);
+    if (rc == 0)       kprintf("renamed %s -> %s\n", oldp, newp);
+    else if (rc == -2) kprintf("mv: %s already exists\n", newp);
+    else if (rc == -5) kprintf("mv: name too long for this filesystem\n");
+    else if (rc == -3) kprintf("mv: the directory is full\n");
+    else               kprintf("mv: failed (%d) — same directory only?\n", rc);
+}
+
 static void cmd_rm(const char* args) {
     while (args && *args == ' ') args++;
     if (!args || !*args) { console_write("rm: usage: rm [-r] <path>\n"); return; }
@@ -4021,6 +4045,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "write "))  { cmd_write(line + 6); return; }
     if (starts_with(line, "mount "))  { cmd_mount(line + 6); return; }
     if (starts_with(line, "rm "))     { cmd_rm   (line + 3); return; }
+    if (starts_with(line, "mv "))     { cmd_mv   (line + 3); return; }
 
     /* Config commands. */
     if (streq(line, "config"))         { config_dump(); return; }

@@ -930,6 +930,58 @@ static int dir_is_empty(struct exfat_fs* fs, uint32_t cluster, int no_fat) {
     return 1;
 }
 
+/* ----------------------------------------------------------------------
+ * Build a complete directory entry SET (File + Stream + Name entries).
+ *
+ * Factored out of exfat_make because rename needs the identical bytes with a
+ * different name: the checksum, the name hash and the 15-chars-per-entry
+ * split are three places to get wrong, and having them twice would mean
+ * fixing a bug in one of the copies.
+ *
+ * Returns the number of entries written into `set`, or -1 if the name does not
+ * fit.  `set` must have room for (2 + EXFAT_MAX_NAME_ENTRIES) entries.
+ * ---------------------------------------------------------------------- */
+static int build_entry_set(uint8_t* set, const char* name, int name_len,
+                           int is_dir, uint32_t first_cluster,
+                           uint64_t data_len, uint8_t stream_flags) {
+    int name_entries = (name_len + 14) / 15;
+    if (name_len <= 0 || name_entries > EXFAT_MAX_NAME_ENTRIES) return -1;
+    int sec_count = 1 + name_entries;
+    int total_e   = 1 + sec_count;
+
+    memset_(set, 0, (size_t)total_e * EXFAT_ENTRY_SIZE);
+    uint8_t* fe = set + 0 * EXFAT_ENTRY_SIZE;
+    uint8_t* se = set + 1 * EXFAT_ENTRY_SIZE;
+
+    fe[0] = EXFAT_TYPE_FILE;
+    fe[1] = (uint8_t)sec_count;
+    wle16(fe + 2, 0);                           /* checksum patched below */
+    wle16(fe + 4, is_dir ? EXFAT_ATTR_DIRECTORY : EXFAT_ATTR_ARCHIVE);
+
+    se[0] = EXFAT_TYPE_STREAM;
+    se[1] = stream_flags;
+    se[3] = (uint8_t)name_len;
+    wle16(se + 4, name_hash_ascii(name, name_len));
+    wle64(se + 0x08, data_len);                 /* ValidDataLength */
+    wle32(se + 0x14, first_cluster);
+    wle64(se + 0x18, data_len);                 /* DataLength      */
+
+    int produced = 0;
+    for (int j = 0; j < name_entries; j++) {
+        uint8_t* ne = set + (2 + j) * EXFAT_ENTRY_SIZE;
+        ne[0] = EXFAT_TYPE_NAME;
+        ne[1] = 0;
+        for (int k = 0; k < 15; k++) {
+            uint16_t ch = 0;
+            if (produced < name_len) ch = (uint8_t)name[produced++];
+            wle16(ne + 2 + k * 2, ch);
+        }
+    }
+
+    wle16(fe + 2, set_checksum(set, total_e * EXFAT_ENTRY_SIZE));
+    return total_e;
+}
+
 static int exfat_make(struct inode* dir, const char* name, struct inode** out,
                       int as_dir) {
     struct exfat_inode* dei = (struct exfat_inode*)dir->private;
@@ -966,10 +1018,6 @@ static int exfat_make(struct inode* dir, const char* name, struct inode** out,
 
     /* Build the entries in a local buffer. */
     uint8_t set[(1 + 1 + EXFAT_MAX_NAME_ENTRIES) * EXFAT_ENTRY_SIZE];
-    memset_(set, 0, sizeof set);
-
-    uint8_t* fe  = set + 0 * EXFAT_ENTRY_SIZE;
-    uint8_t* se  = set + 1 * EXFAT_ENTRY_SIZE;
 
     /* A directory owns a cluster from the start; a file may own none. */
     uint32_t new_cluster = 0;
@@ -986,40 +1034,12 @@ static int exfat_make(struct inode* dir, const char* name, struct inode** out,
         fat_set(fs, new_cluster, EXFAT_FAT_EOC);
     }
 
-    /* File Directory Entry. */
-    fe[0] = EXFAT_TYPE_FILE;
-    fe[1] = (uint8_t)sec_count;
-    wle16(fe + 2, 0);                           /* checksum patched below */
-    wle16(fe + 4, as_dir ? EXFAT_ATTR_DIRECTORY : EXFAT_ATTR_ARCHIVE);
-    /* Timestamps left as zero — acceptable to Linux fsck. */
-
-    /* Stream Extension. */
-    se[0] = EXFAT_TYPE_STREAM;
-    /* flags: bit0 AllocationPossible, bit1 NoFatChain.  Both set for the
-     * directory's single contiguous cluster; an empty file has neither. */
-    se[1] = as_dir ? 0x03 : 0x00;
-    se[3] = (uint8_t)name_len;
-    wle16(se + 4, name_hash_ascii(name, name_len));
-    wle64(se + 0x08, as_dir ? fs->bytes_per_cluster : 0);   /* ValidDataLength */
-    wle32(se + 0x14, new_cluster);                          /* FirstCluster   */
-    wle64(se + 0x18, as_dir ? fs->bytes_per_cluster : 0);   /* DataLength     */
-
-    /* File Name entries. */
-    int produced = 0;
-    for (int j = 0; j < name_entries; j++) {
-        uint8_t* ne = set + (2 + j) * EXFAT_ENTRY_SIZE;
-        ne[0] = EXFAT_TYPE_NAME;
-        ne[1] = 0;
-        for (int k = 0; k < 15; k++) {
-            uint16_t ch = 0;
-            if (produced < name_len) ch = (uint8_t)name[produced++];
-            wle16(ne + 2 + k * 2, ch);
-        }
+    if (build_entry_set(set, name, name_len, as_dir, new_cluster,
+                        as_dir ? fs->bytes_per_cluster : 0,
+                        as_dir ? 0x03 : 0x00) != total_e) {
+        if (new_cluster) bitmap_free(fs, new_cluster);
+        return -1;
     }
-
-    /* SetChecksum. */
-    uint16_t cs = set_checksum(set, total_e * EXFAT_ENTRY_SIZE);
-    wle16(fe + 2, cs);
 
     /* Write the entries to disk. */
     struct dir_iter it = {
@@ -1088,6 +1108,104 @@ static int exfat_unlink(struct inode* dir, const char* name,
     return 0;
 }
 
+/* ----------------------------------------------------------------------
+ * Rename — the last NULL in the ops table (§M12's gap, closed).
+ *
+ * A RENAME IS NOT AN EDIT.  The name lives across File Name entries at fifteen
+ * characters each, so a different name is very often a different NUMBER of
+ * entries — and SecondaryCount, the SetChecksum and the slot's extent all
+ * change with it.  Patching in place would work for names that happen to round
+ * the same way and corrupt the set for the ones that do not, which is the
+ * worst kind of bug: correct in testing, wrong on a user's file.
+ *
+ * So: write a COMPLETE new entry set describing the same cluster chain, then
+ * delete the old one.  The DATA is never touched — a rename must not read or
+ * move a single byte of the file.
+ *
+ * ORDER: new first, old second.  A crash between them leaves two names for one
+ * chain, which `fsck` reports as a cross-link and a human can resolve; the
+ * other order leaves the chain allocated and unreferenced, i.e. the file is
+ * simply gone.  Losing the name is recoverable, losing the file is not.
+ * ---------------------------------------------------------------------- */
+static int exfat_rename(struct inode* dir, const char* oldname,
+                        const char* newname, struct inode* child) {
+    struct exfat_inode* dei = (struct exfat_inode*)dir->private;
+    if (!dei) return -1;
+    struct exfat_fs* fs = dei->fs;
+
+    int new_len = (int)strlen_(newname);
+    /* -5, not -1: "the name is too long for this filesystem" is a different
+     * thing from "that rename cannot be done", and a caller that cannot tell
+     * them apart reports the wrong reason to the user.  (It reported "same
+     * directory only?" for a 43-character name, which sent the first test
+     * looking in entirely the wrong place.) */
+    if (new_len == 0) return -1;
+    if (new_len > EXFAT_MAX_NAME) return -5;
+
+    struct inode* target = child;
+    if (!target && (exfat_lookup(dir, oldname, &target) != 0 || !target)) return -1;
+    struct exfat_inode* tei = (struct exfat_inode*)target->private;
+    if (!tei) return -1;
+
+    /* Renaming to the name it already has is success, and must NOT go through
+     * the write-then-delete below — that would delete the set just written. */
+    if (streq_(oldname, newname)) return 0;
+
+    /* REFUSE AN EXISTING TARGET, the rule §4.73 paid for: a filesystem that
+     * can hold one name twice does not have a namespace.  The VFS may also
+     * check, but the fs owns its directory and must not depend on that. */
+    {
+        struct inode* dup = NULL;
+        if (exfat_lookup(dir, newname, &dup) == 0 && dup) return -2;
+    }
+
+    /* The new set describes exactly what the old one did — same cluster, same
+     * length, same kind — with a different name. */
+    int is_dir = (target->type == INODE_DIR);
+    uint8_t flags = 0;
+    if (tei->first_cluster) flags |= 0x01;                 /* AllocationPossible */
+    if (tei->no_fat_chain)  flags |= 0x02;                 /* NoFatChain         */
+
+    uint8_t set[(1 + 1 + EXFAT_MAX_NAME_ENTRIES) * EXFAT_ENTRY_SIZE];
+    int total_e = build_entry_set(set, newname, new_len, is_dir,
+                                  tei->first_cluster, target->size, flags);
+    if (total_e < 0) return -1;
+
+    uint32_t slot = find_free_dir_slot(fs, dei->first_cluster, dei->no_fat_chain,
+                                       total_e);
+    if (slot == (uint32_t)-1) return -3;                   /* directory full */
+
+    struct dir_iter it = {
+        .fs            = fs,
+        .first_cluster = dei->first_cluster,
+        .no_fat_chain  = dei->no_fat_chain,
+    };
+    for (int i = 0; i < total_e; i++) {
+        if (dir_entry_write(&it, slot + i, set + i * EXFAT_ENTRY_SIZE) != 0)
+            return -4;
+    }
+
+    /* The old set goes only once the new one is on the disk. */
+    if (dirent_set_delete(fs, dei->first_cluster, dei->no_fat_chain,
+                          tei->dirent_index) != 0) {
+        /* The new set is already written; leaving both would be a cross-link,
+         * so undo it and report failure rather than half-renaming. */
+        dirent_set_delete(fs, dei->first_cluster, dei->no_fat_chain, slot);
+        bcache_sync(fs->dev);
+        return -4;
+    }
+
+    /* THE INODE STILL POINTS AT THE OLD SLOT.  Every later write goes through
+     * `dirent_index` to rewrite the Stream Extension, so leaving it stale
+     * would have the next write update a DELETED entry — the file would look
+     * renamed and then silently stop growing. */
+    tei->dirent_index = slot;
+    tei->sec_count    = (uint8_t)(total_e - 1);
+
+    bcache_sync(fs->dev);
+    return 0;
+}
+
 /* ---------------------------------------------------------------------- */
 /* Tables.                                                                 */
 /* ---------------------------------------------------------------------- */
@@ -1111,6 +1229,7 @@ static const struct inode_ops exfat_inode_ops_dir = {
     .create = exfat_create,
     .mkdir  = exfat_mkdir,
     .unlink = exfat_unlink,
+    .rename = exfat_rename,
 };
 
 /* ---------------------------------------------------------------------- */
