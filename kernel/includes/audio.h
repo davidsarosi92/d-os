@@ -87,11 +87,43 @@ struct audio_dev {
 
     void* priv;                               /* driver-private state        */
     struct audio_dev* next;                   /* registry link               */
+
+    /* ---- lifetime -------------------------------------------------------
+     * A device used to be handed out as a raw pointer and held across sleeps
+     * — the mixer keeps one for the length of a period, the WAV player for a
+     * whole file.  That is fine as long as nothing can ever be removed, and
+     * the moment a driver can be stopped it becomes a dangling pointer in
+     * four registries at once.
+     *
+     * `refs` counts users currently INSIDE a call; `dying` says the device is
+     * on its way out and must not be handed to anybody new.  Removal marks,
+     * waits for the count to reach zero, and only then unlinks — the shape
+     * §M54 and §M57 arrived at for tasks, which is the same problem. */
+    volatile int refs;
+    volatile int dying;
 };
 
 /* Registry. */
 int  audio_register(struct audio_dev* dev);
-struct audio_dev* audio_primary(void);        /* first registered, or NULL   */
+/* The primary device, WITHOUT taking a reference.  Safe only for answering
+ * questions that do not outlive the call — "is there a device", "what is its
+ * rate".  Anything that will still be holding the pointer after it might have
+ * slept has to use audio_get()/audio_put() instead. */
+struct audio_dev* audio_primary(void);
+
+/* Borrow the primary device.  Returns NULL if there is none or it is being
+ * removed.  Every successful get must be matched by a put — a leaked
+ * reference does not crash anything, it just makes the device impossible to
+ * remove, which is a much more confusing symptom. */
+struct audio_dev* audio_get(void);
+void audio_put(struct audio_dev* dev);
+
+/* Remove a device from the registry.  Marks it dying so no new user can take
+ * it, waits (bounded) for the current ones to leave, then unlinks.  Returns 0
+ * when it is gone, non-zero if somebody would not let go — in which case the
+ * device stays registered, because unlinking it anyway is exactly the
+ * use-after-free this protocol exists to prevent. */
+int audio_unregister(struct audio_dev* dev);
 void audio_list(void);                        /* backs the `lsaudio` command  */
 
 /* Generate + play a square-wave tone of `freq` Hz for `ms` milliseconds on

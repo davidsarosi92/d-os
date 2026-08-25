@@ -497,6 +497,7 @@ static int hda_init(void* ctx) {
     /* BAR0 is MEMORY here, not I/O — the first PCI device in this tree that is
      * (AC97 and virtio-net both use port I/O), so the window has to be mapped
      * before a single register can be read. */
+    pci_assign_bars(&pd);                      /* hot-added: no BARs yet */
     uint32_t bar = pd.bar[0];
     if (bar & 1) { kprintf("hda: BAR0 is I/O space — unexpected\n"); return -2; }
     uintptr_t phys = (uintptr_t)(bar & ~0xFu);
@@ -622,11 +623,17 @@ static int hda_init(void* ctx) {
      * `irq_install` does not chain in this tree, so the line is logged. */
     mw32(g_hda.mmio, HDA_INTCTL,
          INTCTL_GIE | INTCTL_CIE | (1u << g_hda.out_sd));
-    if (pd.irq_line != 0xFF) {
+    /* 0 and 0xFF both mean "no line assigned" — a hot-added device arrives
+     * that way, because firmware routes interrupts at boot and nothing routed
+     * this one.  Line 0 is the TIMER on a PC: installing here would replace
+     * the tick handler, which is not a degraded driver but a stopped machine.
+     * Refusing leaves the polled path in use (§M55's rule), which is exactly
+     * the right degradation. */
+    if (pd.irq_line != 0xFF && pd.irq_line != 0) {
         irq_install(pd.irq_line, hda_irq);
         kprintf("hda: completion IRQ on line %u\n", pd.irq_line);
     } else {
-        kprintf("hda: no IRQ line — completion stays polled\n");
+        kprintf("hda: no IRQ line routed — completion stays polled\n");
     }
 
     kprintf("hda: up at PCI %u:%u.%u mmio=%p codec=%d dac=%u pin=%u out_sd=%d\n",
@@ -646,6 +653,8 @@ static int hda_init(void* ctx) {
 static void hda_shutdown(void* ctx) {
     (void)ctx;
     if (!g_hda.mmio) return;
+    /* Withdraw first — see the same call in ac97.c for why. */
+    if (audio_unregister(&g_audio) != 0) return;
     mw32(g_hda.mmio, HDA_INTCTL, 0);
     mw8(sd_reg(&g_hda), SD_CTL, 0);
     if (g_hda.has_input) mw8(in_sd_reg(&g_hda), SD_CTL, 0);

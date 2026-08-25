@@ -21,6 +21,13 @@
 /* ----------------------- Registry ----------------------------------------- */
 
 static struct audio_dev* g_head = NULL;
+/* Guards the registry list AND the per-device refs/dying pair — one lock, so
+ * "is it dying" and "take a reference" cannot be decided in different
+ * instants. */
+static spinlock_t g_reg_lock = SPINLOCK_INIT;
+/* Defined with the mixer below — a removal has to wake the pump so it notices
+ * the device is going and drops its reference. */
+static struct waitq g_mix_wq;
 
 int audio_register(struct audio_dev* dev) {
     dev->next = NULL;
@@ -30,7 +37,66 @@ int audio_register(struct audio_dev* dev) {
     return 0;
 }
 
-struct audio_dev* audio_primary(void) { return g_head; }
+struct audio_dev* audio_primary(void) {
+    struct audio_dev* d = g_head;
+    return (d && d->dying) ? NULL : d;
+}
+
+struct audio_dev* audio_get(void) {
+    uint32_t fl = spin_lock_irqsave(&g_reg_lock);
+    struct audio_dev* d = g_head;
+    if (d && d->dying) d = NULL;
+    if (d) d->refs++;
+    spin_unlock_irqrestore(&g_reg_lock, fl);
+    return d;
+}
+
+void audio_put(struct audio_dev* dev) {
+    if (!dev) return;
+    uint32_t fl = spin_lock_irqsave(&g_reg_lock);
+    if (dev->refs > 0) dev->refs--;
+    spin_unlock_irqrestore(&g_reg_lock, fl);
+}
+
+int audio_unregister(struct audio_dev* dev) {
+    if (!dev) return -1;
+
+    /* MARK FIRST.  Between the mark and the unlink a new user must be
+     * impossible, or the wait below is racing something that can always
+     * arrive — the §M57 rule that a state must be published before the
+     * thing it protects is taken apart. */
+    uint32_t fl = spin_lock_irqsave(&g_reg_lock);
+    dev->dying = 1;
+    spin_unlock_irqrestore(&g_reg_lock, fl);
+
+    /* Wake anything parked on the mixer so it notices and lets go. */
+    uint64_t deadline = timer_ticks_ms() + 3000;
+    while (dev->refs > 0) {
+        uint32_t wf = waitq_lock(&g_mix_wq);
+        waitq_wake_all(&g_mix_wq);
+        waitq_unlock(&g_mix_wq, wf);
+        if (timer_ticks_ms() > deadline) {
+            /* REFUSE rather than unlink under a live user.  A device removed
+             * out from under somebody is the use-after-free this whole
+             * protocol exists to prevent; a refusal is a message. */
+            dev->dying = 0;
+            klog(KLOG_WARN, "audio", "%s still has %d user(s) — not removed\n",
+                 dev->name, dev->refs);
+            return -2;
+        }
+        task_msleep(2);
+    }
+
+    fl = spin_lock_irqsave(&g_reg_lock);
+    struct audio_dev** pp = &g_head;
+    while (*pp && *pp != dev) pp = &(*pp)->next;
+    if (*pp) *pp = dev->next;
+    dev->next = NULL;
+    dev->dying = 0;
+    spin_unlock_irqrestore(&g_reg_lock, fl);
+    kprintf("audio: unregistered %s\n", dev->name);
+    return 0;
+}
 
 void audio_list(void) {
     if (!g_head) { kprintf("no audio devices\n"); return; }
@@ -152,7 +218,6 @@ struct audio_stream {
 
 static struct audio_stream g_streams[MIX_STREAMS];
 static spinlock_t          g_mix_lock = SPINLOCK_INIT;
-static struct waitq        g_mix_wq;           /* pump sleeps here when idle   */
 static int                 g_pump_started;
 static int16_t             g_mix_buf[MIX_PERIOD_MAX * 2];
 
@@ -280,10 +345,15 @@ static void mixer_pump(void) {
          * idle before the drain would let a closer return while the tail of
          * the sound is still in the device. */
         {
-            struct audio_dev* d = audio_primary();
-            if (d && !any_stream_has_audio()) {
-                if (d->drain) d->drain(d);
-                g_pump_idle = 1;
+            struct audio_dev* d = audio_get();
+            if (d) {
+                if (!any_stream_has_audio()) {
+                    if (d->drain) d->drain(d);
+                    g_pump_idle = 1;
+                }
+                audio_put(d);
+            } else {
+                g_pump_idle = 1;             /* no device: nothing to drain */
             }
         }
 
@@ -296,9 +366,15 @@ static void mixer_pump(void) {
         uint32_t n = mix_one_period();
         if (!n) continue;
         g_mix_passes++;
-        /* The device call BLOCKS for the period's real duration — that is what
-         * paces the whole mixer, so there is no timing loop anywhere here. */
-        audio_play_pcm(dev, g_mix_buf, n);
+        /* A REFERENCE FOR THE LENGTH OF ONE PERIOD, not for the pump's
+         * lifetime.  Holding it across the idle block would make the device
+         * unremovable whenever nothing is playing — which is exactly when
+         * removing it is easiest and most likely.  Scoped this tightly, a
+         * removal waits at most one period. */
+        struct audio_dev* used = audio_get();
+        if (!used) continue;                 /* went away between mix and play */
+        audio_play_pcm(used, g_mix_buf, n);
+        audio_put(used);
     }
 }
 

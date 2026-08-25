@@ -16,6 +16,9 @@
 #include "printf.h"
 #include "hal_api.h"
 #include "hal.h"
+#include "cron.h"
+#include "config.h"
+#include "settings.h"
 #include <stddef.h>
 
 /* Parallel state — one byte per registered driver, filled during
@@ -143,6 +146,139 @@ void driver_list(void) {
     }
 }
 
+/* ---------------------------------------------------------------------- */
+/* Runtime control.                                                        */
+/* ---------------------------------------------------------------------- */
+
+static int str_eq(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+struct driver* driver_find(const char* name) {
+    uint32_t n = (uint32_t)(__stop_drivers - __start_drivers);
+    for (uint32_t i = 0; i < n; i++)
+        if (__start_drivers[i].name && str_eq(__start_drivers[i].name, name))
+            return &__start_drivers[i];
+    return NULL;
+}
+
+int driver_stop(const char* name) {
+    struct driver* d = driver_find(name);
+    if (!d) { kprintf("drv: no driver '%s'\n", name); return -1; }
+    uint32_t i = driver_index(d);
+    if (!driver_state_arr || i >= driver_count) return -1;
+    if (!(driver_state_arr[i] & DRV_S_INITED)) {
+        kprintf("drv: '%s' is not running\n", name);
+        return -2;
+    }
+    if (!d->ops || !d->ops->shutdown) {
+        /* REFUSED, not forced.  A driver with no shutdown hook has no way to
+         * put its hardware down or withdraw its registrations, and stopping it
+         * would mean leaving a live DMA engine and a dangling device behind —
+         * the exact failure this work exists to prevent. */
+        kprintf("drv: '%s' has no shutdown hook — refusing to stop it\n", name);
+        return -3;
+    }
+    d->ops->shutdown(d->ctx);
+    driver_state_arr[i] &= (uint8_t)~DRV_S_INITED;
+    kprintf("drv: stopped '%s'\n", name);
+    return 0;
+}
+
+int driver_start(const char* name) {
+    struct driver* d = driver_find(name);
+    if (!d) { kprintf("drv: no driver '%s'\n", name); return -1; }
+    uint32_t i = driver_index(d);
+    if (!driver_state_arr || i >= driver_count) return -1;
+    if (driver_state_arr[i] & DRV_S_INITED) {
+        kprintf("drv: '%s' is already running\n", name);
+        return -2;
+    }
+    if (d->ops && d->ops->probe && d->ops->probe(d->ctx) != 0) {
+        kprintf("drv: '%s' — hardware not present\n", name);
+        driver_state_arr[i] |= DRV_S_PROBE_FAIL;
+        return -3;
+    }
+    driver_state_arr[i] |= DRV_S_PROBED;
+    driver_state_arr[i] &= (uint8_t)~(DRV_S_PROBE_FAIL | DRV_S_INIT_FAIL);
+    if (d->ops && d->ops->init && d->ops->init(d->ctx) != 0) {
+        driver_state_arr[i] |= DRV_S_INIT_FAIL;
+        kprintf("drv: '%s' failed to start\n", name);
+        return -4;
+    }
+    driver_state_arr[i] |= DRV_S_INITED;
+    kprintf("drv: started '%s'\n", name);
+    return 0;
+}
+
+int driver_rescan(void) {
+    if (!driver_state_arr) return 0;
+    int started = 0;
+    for (uint32_t i = 0; i < driver_count; i++) {
+        struct driver* d = &__start_drivers[i];
+        if (driver_state_arr[i] & DRV_S_INITED) continue;
+        /* A driver that FAILED to init is not retried here: re-running an
+         * init that just failed, on a timer, is a loop that fills the log and
+         * fixes nothing (§M29's crash-loop backoff, same reasoning).  It takes
+         * an explicit `drv start`. */
+        if (driver_state_arr[i] & DRV_S_INIT_FAIL) continue;
+        if (d->ops && d->ops->probe && d->ops->probe(d->ctx) != 0) continue;
+        if (d->ops && d->ops->init && d->ops->init(d->ctx) != 0) {
+            driver_state_arr[i] |= DRV_S_INIT_FAIL;
+            continue;
+        }
+        driver_state_arr[i] |= DRV_S_PROBED | DRV_S_INITED;
+        driver_state_arr[i] &= (uint8_t)~DRV_S_PROBE_FAIL;
+        kprintf("drv: '%s' appeared — started\n", d->name);
+        started++;
+    }
+    return started;
+}
+
+void driver_cmd(const char* args) {
+    while (args && *args == ' ') args++;
+    if (!args || !*args) { driver_list(); return; }
+
+    char verb[16]; int n = 0;
+    while (*args && *args != ' ' && n < (int)sizeof verb - 1) verb[n++] = *args++;
+    verb[n] = 0;
+    while (*args == ' ') args++;
+
+    if (str_eq(verb, "list"))    { driver_list(); return; }
+    if (str_eq(verb, "rescan"))  {
+        int k = driver_rescan();
+        kprintf("drv: rescan — %d driver(s) came up\n", k);
+        return;
+    }
+    if (str_eq(verb, "stop"))    { driver_stop(args);  return; }
+    if (str_eq(verb, "start"))   { driver_start(args); return; }
+    if (str_eq(verb, "swap")) {
+        /* Two names: stop the first, start the second.  The order matters —
+         * the class registry hands out the FIRST registered device, so the
+         * outgoing one has to be gone before the incoming one registers or
+         * the swap would appear to do nothing. */
+        char a[24]; n = 0;
+        while (*args && *args != ' ' && n < (int)sizeof a - 1) a[n++] = *args++;
+        a[n] = 0;
+        while (*args == ' ') args++;
+        if (!a[0] || !*args) { kprintf("drv: swap <from> <to>\n"); return; }
+        if (driver_stop(a) != 0) { kprintf("drv: swap aborted\n"); return; }
+        int rc = driver_start(args);
+        /* -2 is "already running", which for a SWAP is success: the target is
+         * bound and the outgoing one is gone.  The first version reported it
+         * as a failure — "nothing is bound now" — while the class registry had
+         * in fact just handed everything to the new driver.  A message that
+         * contradicts what happened is worse than no message. */
+        if (rc == 0 || rc == -2)
+            kprintf("drv: '%s' is now bound\n", args);
+        else
+            kprintf("drv: '%s' did not start — nothing is bound now\n", args);
+        return;
+    }
+    kprintf("drv: list | rescan | stop <name> | start <name> | swap <from> <to>\n");
+}
+
 /* ----------------------------------------------------------------------
  * Orderly power transitions.
  *
@@ -161,3 +297,33 @@ void system_reboot(void) {
     driver_shutdown_all();
     hal_reboot();
 }
+
+/* ----------------------------------------------------------------------
+ * Hot-plug, step 5: hardware that appears becomes usable on its own.
+ *
+ * POLLED, and that is a deliberate trade rather than an oversight.  Being
+ * told about a new PCI device needs the ACPI hot-plug GPE decoded and routed,
+ * which is a large piece of machinery for one event; re-probing the drivers
+ * that are NOT running is cheap — probe() is defined as side-effect-free and
+ * usually reads a couple of config words — and it costs nothing at all once
+ * every driver is up, because the loop then has nothing to look at.
+ *
+ * So the honest claim is "usable within one interval", not "on the instant",
+ * and the interval is a setting.  0 turns it off for anyone who would rather
+ * type `drv rescan`.
+ * ---------------------------------------------------------------------- */
+CONFIG_KEY(ck_drv_rescan) = {
+    .key = "drivers.rescan_ms", .group = "System", .type = CFG_INT,
+    .min = 0, .max = 60000, .def = "2000",
+    .help = "how often to look for newly attached hardware, 0 = never",
+};
+
+static void job_driver_rescan(void) {
+    const char* v = config_get("drivers.rescan_ms", "2000");
+    int ms = 0;
+    for (; *v >= '0' && *v <= '9'; v++) ms = ms * 10 + (*v - '0');
+    if (ms == 0) return;                     /* switched off */
+    driver_rescan();                         /* silent unless something starts */
+}
+
+CRON_JOB("driver-rescan", job_driver_rescan, 2000);

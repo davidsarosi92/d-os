@@ -33,7 +33,8 @@
 #include "task.h"
 #include "percpu.h"    /* §M57 — smp_ncpus() for the runqueue audit + storm */
 #include "timer.h"
-#include "audio.h"      /* §M23 stage 2 — lsaudio / play, from the core */
+#include "audio.h"
+#include "driver.h"      /* §M23 stage 2 — lsaudio / play, from the core */
 #include "syscall.h"   /* §M53 stage 3 — timerfd + setitimer self-tests */
 #include "ktimer.h"
 #include "pkg.h"
@@ -650,6 +651,7 @@ void serial_shell_entry(void) {
          * strictly better than "unknown command" telling the user the feature
          * does not exist.  virtio-sound is what fills the gap. */
         else if (s_eq(cmd, "lsaudio")) audio_list();
+        else if (s_eq(cmd, "drv"))     driver_cmd(args);
         else if (s_eq(cmd, "play"))    audio_cmd_play(args);
         else if (s_eq(cmd, "volume"))  audio_cmd_volume(args);
         else if (s_eq(cmd, "rec"))     audio_cmd_rec(args);

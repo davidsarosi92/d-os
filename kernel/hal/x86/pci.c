@@ -22,6 +22,8 @@
  * ============================================================================= */
 
 #include "pci.h"
+#include "printf.h"
+#include <stddef.h>
 #include "hal.h"
 #include <stdint.h>
 
@@ -242,4 +244,95 @@ int pci_alloc_msi(uint8_t bus, uint8_t slot, uint8_t func,
     pci_write16(bus, slot, func, cap + MSI_MSGCTRL_OFF, msgctrl);
 
     return (int)vector;
+}
+
+/* ----------------------------------------------------------------------
+ * BAR assignment for HOT-ADDED devices.
+ *
+ * On x86 the firmware programs every BAR it finds AT BOOT, which is why this
+ * never had to exist: by the time a driver looked, the addresses were there.
+ * A device plugged in afterwards has none — its BARs read back zero — and the
+ * first symptom is a driver refusing to start with a message about the BAR,
+ * not about hot-plug.  (The aarch64 port has always done this, because
+ * booting raw via `-kernel` there is no firmware at all.)
+ *
+ * THE ALLOCATOR IS SEEDED ABOVE WHAT THE FIRMWARE ALREADY USED.  There is no
+ * PCI resource manager here, so the one thing that must not happen is handing
+ * out a window some existing device is already decoding — a silent overlap
+ * where two devices answer the same address.  Scanning for the high-water mark
+ * once makes that impossible by construction instead of by luck.
+ * ---------------------------------------------------------------------- */
+static uint32_t g_io_next  = 0;
+static uint32_t g_mem_next = 0;
+
+static void bar_watermark(const struct pci_device* d, void* ctx) {
+    (void)ctx;
+    for (int i = 0; i < 6; i++) {
+        uint32_t b = d->bar[i];
+        if (!b) continue;
+        if (b & 1) {                                    /* I/O */
+            uint32_t base = (b & ~0x3u) + 0x100;
+            if (base > g_io_next) g_io_next = base;
+        } else {
+            uint32_t base = (b & ~0xFu) + 0x10000;
+            if (base > g_mem_next) g_mem_next = base;
+        }
+    }
+}
+
+static void pci_bars_init_once(void) {
+    if (g_io_next) return;
+    g_io_next  = 0xd000;                 /* floors, in case nothing is assigned */
+    g_mem_next = 0xfe000000u;
+    pci_scan(bar_watermark, NULL);
+    kprintf("pci: hot-plug BAR windows start at io=%x mem=%x\n",
+            g_io_next, g_mem_next);
+}
+
+int pci_assign_bars(struct pci_device* pd) {
+    if (!pd) return -1;
+    pci_bars_init_once();
+    int assigned = 0;
+
+    for (int i = 0; i < 6; i++) {
+        uint8_t off = PCI_BAR0 + i * 4;
+        uint32_t bar = pci_read32(pd->bus, pd->slot, pd->func, off);
+        if (bar & ~0xFu) { pd->bar[i] = bar; continue; }     /* already set */
+
+        /* Size it: all-ones in, the mask comes back.  A BAR that sizes to
+         * zero is simply not implemented — skip it rather than assign an
+         * address to something that does not decode. */
+        pci_write32(pd->bus, pd->slot, pd->func, off, 0xFFFFFFFFu);
+        uint32_t mask = pci_read32(pd->bus, pd->slot, pd->func, off);
+        if (mask == 0 || mask == 0xFFFFFFFFu) {
+            pci_write32(pd->bus, pd->slot, pd->func, off, bar);
+            pd->bar[i] = bar;
+            continue;
+        }
+
+        uint32_t base;
+        if (mask & 1) {                                     /* I/O BAR */
+            uint32_t size = (~(mask & ~0x3u) + 1) & 0xFFFF;
+            if (size == 0) size = 0x20;
+            g_io_next = (g_io_next + size - 1) & ~(size - 1);
+            base = g_io_next;
+            g_io_next += size;
+            pci_write32(pd->bus, pd->slot, pd->func, off, base | 1);
+        } else {
+            uint32_t size = ~(mask & ~0xFu) + 1;
+            if (size == 0) size = 0x1000;
+            g_mem_next = (g_mem_next + size - 1) & ~(size - 1);
+            base = g_mem_next;
+            g_mem_next += size;
+            pci_write32(pd->bus, pd->slot, pd->func, off, base);
+        }
+        pd->bar[i] = pci_read32(pd->bus, pd->slot, pd->func, off);
+        assigned++;
+    }
+    if (assigned)
+        /* No width specifiers in this printf — `%02x` prints literally
+         * (§M65 wrote that down and I still reached for it). */
+        kprintf("pci: assigned %d BAR(s) to %x:%x.%u\n",
+                assigned, pd->bus, pd->slot, pd->func);
+    return assigned;
 }

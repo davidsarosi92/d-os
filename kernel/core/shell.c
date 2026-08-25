@@ -4146,6 +4146,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "netstorm"))       { cmd_netstorm(""); return; }
     if (starts_with(line, "netstorm ")) { cmd_netstorm(line + 9); return; }
     if (streq(line, "lsaudio"))        { audio_list();   return; }
+    if (streq(line, "drv"))            { driver_cmd("");        return; }
+    if (starts_with(line, "drv "))     { driver_cmd(line + 4);  return; }
     if (streq(line, "beep"))           { cmd_beep();     return; }
     if (starts_with(line, "tone "))    { cmd_tone(line + 5); return; }
     /* §M23 stage 2 — the implementation lives in audio.c, not here, so the ARM

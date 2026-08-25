@@ -83,6 +83,36 @@ void driver_list(void);
 void system_power_off(void);
 void system_reboot(void);
 
+/* ----------------------------------------------------------------------
+ * Runtime control (steps 3-5 of the driver-agility work).
+ *
+ * A driver can be stopped, started and re-probed while the system runs.  All
+ * three go through the SAME state array `driver_init_all` fills, so `lsdrv`
+ * keeps telling the truth about what is running.
+ *
+ * What makes stopping safe is not this layer: it is that the class registry
+ * the driver publishes into (audio, block, ...) can REFUSE to let go while
+ * somebody is inside a call.  A stop that the class refuses leaves the driver
+ * running and says so — see audio_unregister().
+ * ---------------------------------------------------------------------- */
+struct driver* driver_find(const char* name);
+
+/* Stop one driver: run its shutdown hook and clear INITED.  Returns 0 on
+ * success, non-zero if it was not running or has no way to stop. */
+int driver_stop(const char* name);
+
+/* Probe + init one driver that is not currently running. */
+int driver_start(const char* name);
+
+/* Re-probe every driver that is NOT running, and init the ones whose hardware
+ * has appeared.  This is what makes newly attached hardware usable: cheap,
+ * idempotent, and safe to call at any time.  Returns how many came up. */
+int driver_rescan(void);
+
+/* The `drv` shell command — implemented next to the registry rather than in a
+ * shell, so the ARM serial REPL runs the same one (§M24's rule). */
+void driver_cmd(const char* args);
+
 /* Per-driver state bits exposed in case future code wants to query without
  * going through the human-readable list. */
 #define DRV_S_PROBED      0x01  /* probe() returned 0 (or NULL probe) */

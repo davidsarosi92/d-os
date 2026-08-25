@@ -82,6 +82,13 @@ int  pci_find_device(uint16_t vendor, uint16_t device, struct pci_device* out);
  * 0 if `bar` is a memory-space BAR or unpopulated. */
 uint16_t pci_bar_io_base(uint32_t bar);
 
+/* Give a device addresses for any BAR the firmware left unassigned, and
+ * refresh `pd->bar[]`.  Needed for HOT-ADDED devices: x86 firmware programs
+ * BARs at boot, so anything plugged in later arrives with none, and the
+ * driver's first symptom is a complaint about the BAR rather than about
+ * hot-plug.  Returns how many were assigned (0 = nothing to do). */
+int pci_assign_bars(struct pci_device* pd);
+
 /* ---------------------------------------------------------------------------
  * Capability list (M18.6.5).
  *

@@ -390,6 +390,8 @@ static int ac97_init(void* ctx) {
     struct pci_device pd;
     if (pci_find_device(AC97_VENDOR, AC97_DEVICE, &pd) != 0) return -1;
 
+    /* A hot-added card arrives with no BARs — see pci_assign_bars(). */
+    pci_assign_bars(&pd);
     uint16_t nam  = pci_bar_io_base(pd.bar[0]);
     uint16_t nabm = pci_bar_io_base(pd.bar[1]);
     if (!nam || !nabm) { kprintf("ac97: BARs not I/O-space\n"); return -2; }
@@ -439,11 +441,17 @@ static int ac97_init(void* ctx) {
      * the line is logged so a collision is visible rather than mysterious.
      * If no line is routed, or it never fires, the polled path stays in use
      * (§M55: a driver learns its interrupt works by receiving one). */
-    if (pd.irq_line != 0xFF) {
+    /* 0 and 0xFF both mean "no line assigned" — a hot-added device arrives
+     * that way, because firmware routes interrupts at boot and nothing routed
+     * this one.  Line 0 is the TIMER on a PC: installing here would replace
+     * the tick handler, which is not a degraded driver but a stopped machine.
+     * Refusing leaves the polled path in use (§M55's rule), which is exactly
+     * the right degradation. */
+    if (pd.irq_line != 0xFF && pd.irq_line != 0) {
         irq_install(pd.irq_line, ac97_irq);
         kprintf("ac97: completion IRQ on line %u\n", pd.irq_line);
     } else {
-        kprintf("ac97: no IRQ line — completion stays polled\n");
+        kprintf("ac97: no IRQ line routed — completion stays polled\n");
     }
 
     /* Register the abstract audio device. */
@@ -483,6 +491,12 @@ static int ac97_init(void* ctx) {
 static void ac97_shutdown(void* ctx) {
     (void)ctx;
     if (!g_ac97.nabm) return;
+    /* WITHDRAW BEFORE STOPPING THE HARDWARE.  audio_unregister() waits until
+     * nobody is inside a call on this device; silencing the engine first would
+     * cut the sound somebody is still mid-write on.  It can refuse — and if it
+     * does, the device stays usable and we leave it alone rather than
+     * half-removing it. */
+    if (audio_unregister(&g_audio) != 0) return;
     outb(g_ac97.nabm + PO_CR, 0);
     outb(g_ac97.nabm + PI_CR, 0);
     g_ac97.running = 0;
