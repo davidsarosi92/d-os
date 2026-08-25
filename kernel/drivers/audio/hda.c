@@ -51,6 +51,7 @@
 #include "driver.h"
 #include "task.h"
 #include "timer.h"
+#include "idt.h"       /* irq_install, struct int_frame */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -63,7 +64,10 @@
 #define HDA_GCAP        0x00    /* 16: stream counts                          */
 #define HDA_GCTL        0x08    /* 32: bit0 CRST — 0 resets, 1 runs           */
 #define HDA_STATESTS    0x0E    /* 16: one bit per codec address that replied  */
-#define HDA_INTCTL      0x20
+#define HDA_INTCTL      0x20    /* 32: bit31 global, bit30 controller, per-SD  */
+#define HDA_INTSTS      0x24
+#define INTCTL_GIE      0x80000000u
+#define INTCTL_CIE      0x40000000u
 #define HDA_IC          0x60    /* 32: immediate command                      */
 #define HDA_IR          0x64    /* 32: immediate response                     */
 #define HDA_ICS         0x68    /* 16: bit0 busy, bit1 result valid           */
@@ -109,8 +113,10 @@
 
 #define WIDGET_TYPE(cap)        (((cap) >> 20) & 0xF)
 #define WIDGET_AUDIO_OUT        0x0
+#define WIDGET_AUDIO_IN         0x1
 #define WIDGET_PIN              0x4
 #define PINCAP_OUTPUT           (1u << 4)
+#define PINCAP_INPUT            (1u << 5)
 
 /* 48 kHz, 16-bit, 2 channels: base 48k, no mult/div, 16-bit = 0b001, chan-1 = 1. */
 #define HDA_FMT_48K_16_2        0x0011
@@ -133,6 +139,18 @@ struct hda {
     int       codec;                         /* address that answered          */
     int       out_sd;                        /* first output stream descriptor */
     uint32_t  dac_nid, pin_nid;
+    /* Capture.  Its own stream descriptor, BDL and buffers — recording while
+     * playing is two independent DMA engines, and sharing either would have
+     * one quietly corrupt the other (the argument AC97 and virtio-sound both
+     * make for their second ring). */
+    uint32_t  adc_nid, inpin_nid;
+    int       in_sd, has_input;
+    uint32_t  rec_bdl_phys;
+    struct bdl_entry* rec_bdl;
+    uint32_t  rec_pcm_phys;
+    int16_t*  rec_pcm;
+    uint32_t  rec_next;
+    int       rec_running;
 
     uint32_t  bdl_phys;
     struct bdl_entry* bdl;
@@ -153,6 +171,25 @@ static inline uint32_t mr32(uintptr_t b, uint32_t o) { return *(volatile uint32_
 static inline void mw8 (uintptr_t b, uint32_t o, uint8_t v)  { *(volatile uint8_t*)(b + o) = v; }
 static inline void mw16(uintptr_t b, uint32_t o, uint16_t v) { *(volatile uint16_t*)(b + o) = v; }
 static inline void mw32(uintptr_t b, uint32_t o, uint32_t v) { *(volatile uint32_t*)(b + o) = v; }
+
+
+/* The completion interrupt.  Same two-things-and-no-third rule as AC97's:
+ * acknowledge the device and count.  No draining here — that runs code which
+ * blocks (§M49's xHCI lesson). */
+static void hda_irq(struct int_frame* f) {
+    (void)f;
+    struct hda* h = &g_hda;
+    if (!h->mmio) return;
+    uint32_t sts = mr32(h->mmio, HDA_INTSTS);
+    if (!(sts & (1u << h->out_sd))) return;          /* not our stream */
+    uintptr_t sd = h->mmio + HDA_SD_BASE + (uintptr_t)h->out_sd * HDA_SD_STRIDE;
+    uint8_t ss = mr8(sd, SD_STS);
+    mw8(sd, SD_STS, ss);                             /* RWC: write to clear */
+    h->completed++;
+    h->irq_seen = 1;
+}
+
+static uint32_t hda_irq_count(void) { return g_hda.completed; }
 
 static uintptr_t sd_reg(struct hda* h) {
     return h->mmio + HDA_SD_BASE + (uintptr_t)h->out_sd * HDA_SD_STRIDE;
@@ -219,12 +256,22 @@ static int hda_find_widgets(struct hda* h) {
             if (!ok) continue;
             uint32_t t = WIDGET_TYPE(cap);
             if (t == WIDGET_AUDIO_OUT && !h->dac_nid) h->dac_nid = w;
-            if (t == WIDGET_PIN && !h->pin_nid) {
+            if (t == WIDGET_AUDIO_IN && !h->adc_nid) h->adc_nid = w;
+            if (t == WIDGET_PIN) {
                 uint32_t pc = hda_param(h, w, PARAM_PIN_CAP, &ok);
-                if (ok && (pc & PINCAP_OUTPUT)) h->pin_nid = w;
+                if (!ok) continue;
+                if ((pc & PINCAP_OUTPUT) && !h->pin_nid)   h->pin_nid = w;
+                if ((pc & PINCAP_INPUT)  && !h->inpin_nid) h->inpin_nid = w;
             }
         }
-        if (h->dac_nid && h->pin_nid) return 0;
+        if (h->dac_nid && h->pin_nid) {
+            /* Capture is OPTIONAL: a codec with no ADC (QEMU's `hda-output`
+             * is exactly that) must still play.  Reported rather than
+             * silently absent — "this device cannot record" and "recording is
+             * broken" have to look different. */
+            h->has_input = (h->adc_nid && h->inpin_nid);
+            return 0;
+        }
     }
     return -1;
 }
@@ -303,6 +350,18 @@ static void hda_drain(struct audio_dev* dev) {
      * AC97 carries on ITS polled path — with the same escape: wiring this
      * controller's completion interrupt would make the count exact and retire
      * the constant, exactly as it did there. */
+    /* THE SETTLE STAYS EVEN WITH THE INTERRUPT, and that is where HDA differs
+     * from AC97 — worth writing down, because the obvious move was to gate it
+     * on `irq_seen` the way that driver does.  Measured: gating it made 600 ms
+     * come back as 593 and 1000 as 970.
+     *
+     * The reason is the CYCLIC stream.  AC97 halts by itself at the last valid
+     * index, so its drain simply stops asking and the codec empties on its own
+     * time; an HDA stream wraps and plays the ring again, so it has to be
+     * stopped BY HAND — and a completion means the DMA engine finished the
+     * buffer, not that the link and codec have emitted it.  The interrupt
+     * makes the COUNT exact, which is what the queue-depth pacing uses; it
+     * cannot make the stop safe. */
     task_msleep(HDA_SETTLE_MS);
     mw8(sd_reg(h), SD_CTL, 0);
     h->running = 0;
@@ -348,6 +407,74 @@ static int hda_play(struct audio_dev* dev, const int16_t* frames, uint32_t nfram
         mw32(sd, SD_CTL, (1u << 20) | SDCTL_RUN | SDCTL_IOCE);
         h->running = 1;
     }
+    return (int)nframes;
+}
+
+/* ---- capture --------------------------------------------------------------- */
+
+static uintptr_t in_sd_reg(struct hda* h) {
+    return h->mmio + HDA_SD_BASE + (uintptr_t)h->in_sd * HDA_SD_STRIDE;
+}
+
+/* Arm the input engine with the whole ring and start it.  Called at the start
+ * of every recording, which is what makes a recording contain what happened
+ * from THEN — the stale-buffer problem the AC97 side measured as `rec 250`
+ * finishing in 0 ms. */
+static void hda_record_start(struct audio_dev* dev) {
+    struct hda* h = (struct hda*)dev->priv;
+    if (!h->has_input || !h->rec_pcm) return;
+    uintptr_t sd = in_sd_reg(h);
+
+    mw8(sd, SD_CTL, 0);
+    for (int i = 0; i < 1000 && (mr8(sd, SD_CTL) & SDCTL_RUN); i++) hal_cpu_pause();
+    mw8(sd, SD_CTL, SDCTL_SRST);
+    for (int i = 0; i < 1000 && !(mr8(sd, SD_CTL) & SDCTL_SRST); i++) hal_cpu_pause();
+    mw8(sd, SD_CTL, 0);
+    for (int i = 0; i < 1000 && (mr8(sd, SD_CTL) & SDCTL_SRST); i++) hal_cpu_pause();
+
+    for (uint32_t i = 0; i < HDA_NBUF; i++) {
+        h->rec_bdl[i].addr_lo = h->rec_pcm_phys + i * HDA_BUF_FRAMES * 4;
+        h->rec_bdl[i].addr_hi = 0;
+        h->rec_bdl[i].len     = HDA_BUF_FRAMES * 4;
+        h->rec_bdl[i].flags   = 1;
+    }
+    mw32(sd, SD_BDPL, h->rec_bdl_phys);
+    mw32(sd, SD_BDPU, 0);
+    mw32(sd, SD_CBL, HDA_NBUF * HDA_BUF_FRAMES * 4);
+    mw16(sd, SD_LVI, HDA_NBUF - 1);
+    mw16(sd, SD_FMT, HDA_FMT_48K_16_2);
+    mw8(sd, SD_STS, SDSTS_BCIS);
+    /* Stream tag 2 — the codec's ADC was told the same number, and a mismatch
+     * points the DMA engine at a converter listening for somebody else. */
+    mw32(sd, SD_CTL, (2u << 20) | SDCTL_RUN);
+    h->rec_next = 0;
+    h->rec_running = 1;
+}
+
+static int hda_record(struct audio_dev* dev, int16_t* frames, uint32_t nframes) {
+    struct hda* h = (struct hda*)dev->priv;
+    if (!h->has_input || !h->rec_pcm) return -1;
+    if (nframes > HDA_BUF_FRAMES) nframes = HDA_BUF_FRAMES;
+    if (nframes == 0) return 0;
+    if (!h->rec_running) hda_record_start(dev);
+
+    uintptr_t sd = in_sd_reg(h);
+    uint64_t deadline = timer_ticks_ms() +
+                        (HDA_BUF_FRAMES * 1000ull) /
+                        (dev->rate ? dev->rate : 48000u) + HDA_DRAIN_GRACE_MS;
+    /* Wait until the engine has moved PAST the slot we want, which is what
+     * says that slot is full. */
+    for (;;) {
+        uint32_t pos = mr32(sd, 0x04);                  /* SD_LPIB */
+        uint32_t cur = (pos / (HDA_BUF_FRAMES * 4)) % HDA_NBUF;
+        if (cur != h->rec_next) break;
+        if (timer_ticks_ms() > deadline) return 0;      /* nothing captured */
+        task_msleep(1);
+    }
+
+    const int16_t* src = h->rec_pcm + (size_t)h->rec_next * HDA_BUF_FRAMES * 2;
+    for (uint32_t i = 0; i < nframes * 2; i++) frames[i] = src[i];
+    h->rec_next = (h->rec_next + 1) & (HDA_NBUF - 1);
     return (int)nframes;
 }
 
@@ -409,6 +536,20 @@ static int hda_init(void* ctx) {
     }
 
     /* DMA memory: one frame for the BDL, 128 KB for the ring. */
+    /* Input stream descriptors come FIRST (0 .. ISS-1), output after them. */
+    g_hda.in_sd = 0;
+    if (g_hda.has_input) {
+        g_hda.rec_bdl_phys = pmm_alloc_frame_dma32();
+        g_hda.rec_pcm_phys = pmm_alloc_contiguous_dma32(32);
+        if (g_hda.rec_bdl_phys && g_hda.rec_pcm_phys) {
+            g_hda.rec_bdl = (struct bdl_entry*)(uintptr_t)g_hda.rec_bdl_phys;
+            g_hda.rec_pcm = (int16_t*)(uintptr_t)g_hda.rec_pcm_phys;
+        } else {
+            kprintf("hda: no DMA for capture — recording unavailable\n");
+            g_hda.has_input = 0;
+        }
+    }
+
     g_hda.bdl_phys = pmm_alloc_frame_dma32();
     g_hda.pcm_phys = pmm_alloc_contiguous_dma32(32);
     if (!g_hda.bdl_phys || !g_hda.pcm_phys) { kprintf("hda: DMA OOM\n"); return -5; }
@@ -447,6 +588,14 @@ static int hda_init(void* ctx) {
      * identical unless you ask the right field. */
     hda_set_amp(&g_hda, g_hda.dac_nid, "dac");
     hda_set_amp(&g_hda, g_hda.pin_nid, "pin");
+
+    if (g_hda.has_input) {
+        hda_verb(&g_hda, g_hda.adc_nid,   VERB_SET_POWER, 0, &ok);
+        hda_verb(&g_hda, g_hda.inpin_nid, VERB_SET_POWER, 0, &ok);
+        hda_verb(&g_hda, g_hda.adc_nid,   VERB_SET_FORMAT, HDA_FMT_48K_16_2, &ok);
+        hda_verb(&g_hda, g_hda.adc_nid,   VERB_SET_STREAM_CHAN, (2u << 4) | 0, &ok);
+        hda_verb(&g_hda, g_hda.inpin_nid, VERB_SET_PIN_CTL, 0x20, &ok);  /* in enable */
+    }
     /* If the pin can choose its source, point it at our converter. */
     uint32_t cll = hda_param(&g_hda, g_hda.pin_nid, PARAM_CONN_LIST_LEN, &ok);
     if (ok && (cll & 0x7F) > 0)
@@ -458,12 +607,36 @@ static int hda_init(void* ctx) {
     g_audio.play          = hda_play;
     g_audio.drain         = hda_drain;
     g_audio.period_frames = HDA_BUF_FRAMES;
+    g_audio.irq_count     = hda_irq_count;
+    if (g_hda.has_input && g_hda.rec_pcm) {
+        g_audio.record       = hda_record;
+        g_audio.record_start = hda_record_start;
+    }
     g_audio.priv          = &g_hda;
     audio_register(&g_audio);
+
+    /* Interrupts: the stream's own bit plus the two global enables.  Wired
+     * AFTER the device is otherwise ready, and the driver still works if the
+     * line is shared or never fires — `irq_seen` stays 0 and the polled path
+     * carries it (§M55: a driver learns its interrupt works by receiving one).
+     * `irq_install` does not chain in this tree, so the line is logged. */
+    mw32(g_hda.mmio, HDA_INTCTL,
+         INTCTL_GIE | INTCTL_CIE | (1u << g_hda.out_sd));
+    if (pd.irq_line != 0xFF) {
+        irq_install(pd.irq_line, hda_irq);
+        kprintf("hda: completion IRQ on line %u\n", pd.irq_line);
+    } else {
+        kprintf("hda: no IRQ line — completion stays polled\n");
+    }
 
     kprintf("hda: up at PCI %u:%u.%u mmio=%p codec=%d dac=%u pin=%u out_sd=%d\n",
             pd.bus, pd.slot, pd.func, (void*)g_hda.mmio, g_hda.codec,
             (unsigned)g_hda.dac_nid, (unsigned)g_hda.pin_nid, g_hda.out_sd);
+    if (g_hda.has_input)
+        kprintf("hda: capture adc=%u pin=%u in_sd=%d\n",
+                (unsigned)g_hda.adc_nid, (unsigned)g_hda.inpin_nid, g_hda.in_sd);
+    else
+        kprintf("hda: this codec has no capture path\n");
     return 0;
 }
 

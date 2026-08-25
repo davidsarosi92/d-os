@@ -3371,7 +3371,33 @@ the count exact and retire the constant, exactly as it did for AC97.
 443–444 Hz; two streams peak at exactly 10000 through the mixer.  AC97 is
 unaffected on the same build.
 
-**Still open:** HDA's completion interrupt, and HDA capture.
+**HDA's completion interrupt, and where it differs from AC97's.**  Wired the
+same way — the ISR acknowledges and counts, nothing else — and it fires: 29
+completions across a 600 ms sound, one per period.  But **the settle could not
+be retired here**, and that is the part worth keeping.  Gating it on
+`irq_seen`, exactly as AC97 does, made 600 ms come back as 593 and 1000 as 970.
+
+The reason is the **cyclic** stream.  AC97 halts by itself at the last valid
+index, so its drain simply stops asking and the codec empties in its own time.
+An HDA stream wraps and plays the ring again, so it must be stopped *by hand* —
+and a completion means the DMA engine finished the buffer, not that the link
+and codec have emitted it.  The interrupt makes the **count** exact, which is
+what the queue-depth pacing uses; it cannot make the stop safe.  Two drivers,
+the same interrupt, opposite conclusions about the same constant.
+
+**HDA capture** works on a codec that has an ADC and an input pin — enumerated,
+like the output path, so `hda-duplex` records and `hda-output` says *"this
+codec has no capture path"* rather than failing obscurely.  It also corroborates
+the earlier diagnosis: the *"captured FASTER than real time"* warning fires here
+too, on a completely different controller, which is what one would expect if
+the cause is QEMU's unpaced null input rather than anything in the AC97 driver.
+
+**Measured:** playback exact at 300.0 and 600.0 ms, 1000 ms within 1 %, peak
+±8000, two streams at exactly 10000; capture 24000/24000 frames with a working
+`rec` → `play` round trip.  AC97 is unaffected on the same build.
+
+**Still open:** nothing named in §M23 — the remaining ideas (a second capture
+format, HDA's CORB/RIRB, per-stream volume in the UI) are wants, not gaps.
 
 ### 4.26 Audio — AC97 codec + PCM output (M23, i386)
 
