@@ -712,6 +712,7 @@ CORE_C_SRCS := \
     kernel/core/abi_linux.c \
     kernel/core/pkg.c \
     kernel/drivers/audio/ac97.c \
+    kernel/drivers/audio/hda.c \
     kernel/core/audio.c \
     kernel/drivers/usb/xhci.c \
     kernel/drivers/usb/usb_hid.c \
@@ -917,6 +918,7 @@ CORE_C_SRCS := \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \
     kernel/drivers/audio/ac97.c \
+    kernel/drivers/audio/hda.c \
     kernel/core/audio.c \
     kernel/core/futex.c \
     kernel/core/workqueue.c \

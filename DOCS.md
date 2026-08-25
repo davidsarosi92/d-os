@@ -3324,9 +3324,54 @@ fix it.  `rec` now *says* it: `captured FASTER than real time (810 ms for
 microphone that same message is the signature of an **overrun**, which is
 exactly when a user needs to see it.
 
-**Still open:** Intel HDA, an interrupt for virtio-sound (its used ring is
-already exact, so this would only save the 1 ms poll), and whether `/dev/vda`
-should be published on ARM.
+#### Intel HDA — the second driver, which is what tested the interface
+
+HDA is what real hardware from the last twenty years has, and a second driver
+behind `struct audio_dev` is the only real test of whether that interface was
+an abstraction or just AC97 with extra steps.  **It was an abstraction:** the
+mixer, the WAV player, `/dev/dsp`, the taskbar control and the Sound panel
+needed no change at all.
+
+The device is two halves that barely know each other — a PCI **controller**
+with DMA streams fed by a BDL (the same shape AC97 uses), and **codecs** on a
+serial link addressed by verbs, forming a graph of widgets that has to be
+*walked* to learn which node is a DAC and which is the socket.  Bring-up is:
+reset, see which codec answered, walk for an output converter and an output
+pin, wire and unmute them, drive the stream.
+
+Two simplifications, each with its reason.  **Verbs go through the immediate
+command registers, not CORB/RIRB**: those rings exist to queue hundreds of
+verbs without a round trip, and this driver sends a few dozen once — two DMA
+rings and their wrap-around bookkeeping would be pure cost.  **Output only**:
+capture already works here through AC97, and an input path would be a second
+one that cannot be held to this subsystem's standard, for the reason §4.26.1
+gives.
+
+It is also the first PCI device in this tree whose BAR0 is **memory**, so the
+window has to be mapped before a single register can be read.
+
+**Three bugs, and the middle one is the instructive one:**
+
+| Symptom | Cause |
+|---|---|
+| level ±5050 for a tone written at ±8000 | the amp gain was a plausible constant (`0x2F`).  The 0 dB point is a property of the widget — its capability word carries an offset — so it is read, not assumed |
+| complete silence after "fixing" that | the PIN has *no* output amp, so its capability word reads zero, and the offset taken from it is zero — which is not 0 dB but **maximum attenuation**.  An absent capability and a zero-valued one look identical unless you ask the right field |
+| level ±313 after "fixing" *that* | clamping the offset to the reported step count.  QEMU reports `0x80034A4A` — offset 0x4A with a step count of 3, which cannot both be true — and the plausible-looking correction made it far worse.  The offset fits the gain field and measures right, so it is used as given |
+
+Each of those looked like a fix and each was checked against a capture, which
+is the only reason the last one was not shipped.
+
+The tail needed the same settle AC97's polled path carries, and for the same
+reason: an HDA stream is **cyclic**, so it must be stopped or it loops — but
+not the instant the last buffer is accounted for, because the link and codec
+are still emptying.  Wiring this controller's completion interrupt would make
+the count exact and retire the constant, exactly as it did for AC97.
+
+**Measured:** 300.0 and 600.0 ms exact, 1000 ms within 0.13 %; peak ±8000;
+443–444 Hz; two streams peak at exactly 10000 through the mixer.  AC97 is
+unaffected on the same build.
+
+**Still open:** HDA's completion interrupt, and HDA capture.
 
 ### 4.26 Audio — AC97 codec + PCM output (M23, i386)
 
