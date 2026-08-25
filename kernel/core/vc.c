@@ -392,6 +392,25 @@ int vc_raw_kbd_dispatch(uint8_t keycode, uint8_t mods) {
     return raw_kbd_hook ? raw_kbd_hook(keycode, mods) : 0;
 }
 
+/* Push one character into a NAMED console's input ring.
+ *
+ * Split out of vc_kbd_push because a keystroke and an injected command are two
+ * different things: a keystroke belongs to whoever has focus, while "run this
+ * in that window" names its destination.  Everything below the destination —
+ * the ring, the wake, the end-of-line readiness signal — is identical, and
+ * duplicating it would be two chances to get the lost-wakeup rule wrong. */
+void vc_kbd_push_to(struct vc* v, char c) {
+    if (!v) return;
+    uint32_t next = (v->in_head + 1) & VC_INBUF_MASK;
+    if (next == v->in_tail) return;     /* ring full — drop */
+    v->in_buf[v->in_head] = c;
+    v->in_head = next;
+    uint32_t fl = waitq_lock(&v->inq);
+    waitq_wake_all(&v->inq);
+    waitq_unlock(&v->inq, fl);
+    if (c == '\n') fd_readiness_signal();
+}
+
 void vc_kbd_push(char c) {
     /* §M62 — any key drops the boot splash.  A boot screen you cannot get out
      * of hides the answer exactly when it is wanted; the key is consumed so it
@@ -400,29 +419,7 @@ void vc_kbd_push(char c) {
 
     if (kbd_hook && kbd_hook(c)) return;        /* consumed by the GUI */
     struct vc* v = focused;             /* snapshot — pointer-sized atomic */
-    if (!v) return;
-    uint32_t next = (v->in_head + 1) & VC_INBUF_MASK;
-    if (next == v->in_tail) return;     /* ring full — drop */
-    v->in_buf[v->in_head] = c;
-    v->in_head = next;
-    /* §M49 — release whoever is parked in vc_getchar.  The ring write
-     * above stays outside the lock (it is still single-producer /
-     * single-consumer), but the WAKE has to take it: that is what closes
-     * the lost-wakeup window.  A reader tests the ring and parks while
-     * holding this same lock, so this wake cannot slip between its test
-     * and its park — it either happens before the test (reader sees the
-     * byte) or after the park (reader is woken).
-     *
-     * Called from the keyboard IRQ, hence the irqsave form. */
-    uint32_t fl = waitq_lock(&v->inq);
-    waitq_wake_all(&v->inq);
-    waitq_unlock(&v->inq, fl);
-
-    /* §M56 — stdin only becomes READABLE at end of line (cooked input), so a
-     * poller is signalled on the newline and not on every keystroke.  Waking
-     * every poll(2) in the system 60 times a second because someone is typing
-     * would be a cost with no corresponding readiness. */
-    if (c == '\n') fd_readiness_signal();
+    vc_kbd_push_to(v, c);
 }
 
 /* §M49 — block until a byte arrives, instead of polling for one.

@@ -28,6 +28,7 @@
 #include "klog.h"
 #include "task.h"
 #include "shell_provider.h"
+#include "vc.h"          /* vc_kbd_push_to — hand the command to its window */
 #include <stddef.h>
 
 struct shortcut {
@@ -339,13 +340,42 @@ void shortcut_launch(int index) {
     }
 
     if (starts_(t, "run:") || starts_(t, "store:")) {
-        /* Reserved spelling, honest behaviour: there is no "run a command line
-         * in a fresh window" primitive yet — that wants the terminal window to
-         * accept an initial command, which is a shell change, not a shortcut
-         * change.  Say so instead of silently doing nothing. */
-        kprintf("shortcut '%s': target kind '%s' is not implemented yet\n",
-                list[index].name, t);
-        klog(KLOG_WARN, "gui", "shortcut: unimplemented target '%s'\n", t);
+        /* A COMMAND LINE IN ITS OWN TERMINAL.  The window is opened and the
+         * command is pushed into ITS console as if typed — deliberately, so
+         * there is no second "execute this" path in the shell to drift from
+         * the one people use.  The shell parses it, reports its errors and
+         * leaves its output on screen exactly as an interactive command does.
+         *
+         * `store:` maps here too: running a package IS a command line, and
+         * having the spelling resolve to the same mechanism is the point of
+         * having reserved it. */
+        const char* cmd = t + (starts_(t, "run:") ? 4 : 6);
+        while (*cmd == ' ') cmd++;
+        if (!*cmd) {
+            kprintf("shortcut '%s': empty command\n", list[index].name);
+            return;
+        }
+
+        char title[32];
+        copy_(title, sizeof title, list[index].name);
+        struct gui_window* w = gui_window_create(title, 160, 120, 620, 380);
+        if (!w) {
+            klog(KLOG_WARN, "gui", "shortcut: no window for '%s'\n", t);
+            return;
+        }
+        struct vc* v = gui_window_console(w);
+        if (!v) {
+            klog(KLOG_WARN, "gui", "shortcut: window has no console\n");
+            return;
+        }
+        /* The shell prints its prompt before it reads, so the characters can
+         * go in immediately — they wait in the console's ring until it does. */
+        const char* pre = starts_(t, "store:") ? "pkgrun " : "";
+        for (int i = 0; pre[i]; i++)  vc_kbd_push_to(v, pre[i]);
+        for (int i = 0; cmd[i]; i++)  vc_kbd_push_to(v, cmd[i]);
+        vc_kbd_push_to(v, '\n');
+        klog(KLOG_INFO, "gui", "shortcut '%s': running '%s%s'\n",
+             list[index].name, pre, cmd);
         return;
     }
 

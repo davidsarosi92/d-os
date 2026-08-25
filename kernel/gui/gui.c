@@ -3677,6 +3677,11 @@ struct gui_window* gui_window_create(const char* title, int x, int y, int w, int
 /* M22.7 — DETACHED mode: the shell is parented to init, so it OUTLIVES the
  * desktop session (a kill_tree(desktop) does not reach it).  Its window
  * stays composited as long as the compositor runs — a "detached terminal". */
+struct vc* gui_window_console(struct gui_window* win) {
+    if (!win || !win->used || win->kind != WIN_TERM) return NULL;
+    return win->vc;
+}
+
 struct gui_window* gui_window_create_detached(const char* title,
                                               int x, int y, int w, int h) {
     return term_window_create(title, x, y, w, h, "shell",

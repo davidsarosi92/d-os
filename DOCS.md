@@ -9427,13 +9427,34 @@ by §M64's one resolver through `GUI_APP_ASSOC`), and the confirmation that
 **`gui.mode` is applied at `gui_start`** — the status text still listed it as
 open, but the code reads it and a reboot brings the desktop up at 1024×768.
 
-**Still open in §M64:** `run:` shortcut targets, which want a terminal window
-that accepts an initial command — a shell change, not a shortcut change, and
-`shortcut_launch` says so rather than doing nothing quietly.  The Send-to-
-desktop menu ROW has not been clicked by a driven pointer (only the code it
-calls is exercised): the harness cannot type a shell command once a GUI window
-has focus, so checking the click means reading the menu's coordinates back out
-of a screendump first.
+**`run:` and `store:` work now**, which was §M64's last open item — the
+resolver no longer says "not implemented yet" about anything.
+
+A `run:` shortcut opens a terminal window and **pushes the command into that
+window's console as if typed**.  Deliberately: there is then no second
+"execute this" path in the shell to drift away from the one people use, so the
+command is parsed, its errors reported and its output left on screen exactly
+as an interactive one.  `store:<pkg>` maps to `pkgrun <pkg>` through the same
+mechanism — running a package *is* a command line, and having the reserved
+spelling resolve to it is the point of having reserved it.
+
+That needed one small split in the console layer: `vc_kbd_push` delivers to
+whoever has FOCUS, which is right for a keystroke and wrong for "run this in
+that window".  `vc_kbd_push_to(vc, c)` names the destination; everything below
+it — the ring, the wake, the end-of-line readiness signal — is the same code,
+because duplicating it would be two chances to get the lost-wakeup rule wrong.
+`gui_window_console()` is the other half: the window is what a user points at,
+the VC is what a shell reads from, and only the compositor knew which belonged
+to which.
+
+**Verified:** `shortcut add mem run:meminfo` then `shortcut open mem` opens a
+window and the memory report appears; `store:echo` resolves to `pkgrun echo`
+and the shell reports honestly that the package is not installed.
+
+**Still open in §M64:** the Send-to-desktop menu ROW has not been clicked by a
+driven pointer (only the code it calls is exercised): the harness cannot type a
+shell command once a GUI window has focus, so checking the click means reading
+the menu's coordinates back out of a screendump first.
 
 **Noticed, not investigated, not caused here:** `gui stats` prints nothing on
 the serial log while the GUI is up, though `shortcut list` from the same shell

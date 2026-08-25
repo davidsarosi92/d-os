@@ -266,7 +266,7 @@ what); a session can pick a theme and push on it.
 | M61 | Resolution switching at runtime — `fb_mode_set`, scene resize, `mode` cmd, Display panel, confirm-or-revert dialog | UX / Devices | ✅ DOCS §4.70 (x86) + §4.77 (aarch64) |
 | M62 | Boot splash, switchable — `boot.splash`, drawn splash, log suppressed not discarded, torn down by any fault | UX / Reliability | ✅ DOCS §4.71 |
 | M63 | Control Panel — `SETTINGS_PANEL()` + `CONFIG_KEY()` registries, generic panel, one Start-menu entry, `conf` with validation | UX / Architecture | ✅ DOCS §4.65 (+ stage 0 §4.63) |
-| M64 | Desktop shortcuts — icons on the wallpaper, shortcut files, one resolver, swappable grid/list view | UX | ✅ DOCS §4.64 + §4.79 (drag-to-move, keyboard, Send to desktop, and the ramfs-persistence bug it exposed).  Open: `run:` targets |
+| M64 | Desktop shortcuts — icons on the wallpaper, shortcut files, one resolver, swappable grid/list view | UX | ✅ DOCS §4.64 + §4.79 (drag-to-move, keyboard, Send to desktop, and the ramfs-persistence bug it exposed).  All four target kinds resolve |
 
 ### Cross-cutting constraints
 

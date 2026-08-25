@@ -164,6 +164,12 @@ struct gui_window* gui_window_create(const char* title, int x, int y, int w, int
 struct gui_window* gui_window_create_detached(const char* title,
                                               int x, int y, int w, int h);
 
+/* The console behind a terminal window, or NULL for any other kind.  Exists so
+ * a caller can hand that window's shell some input (§M64's `run:` shortcut) —
+ * the window is the thing a user points at, the VC is the thing a shell reads
+ * from, and only the compositor knows which belongs to which. */
+struct vc* gui_window_console(struct gui_window* win);
+
 /* M22.5 — terminal window hosting a CUSTOM task instead of a shell
  * (the BASIC interpreter uses this).  The task's kprintf output lands
  * in the window (out_console = the window's offscreen VC), keyboard

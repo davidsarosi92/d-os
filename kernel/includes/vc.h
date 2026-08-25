@@ -129,6 +129,13 @@ int vc_can_read_line(struct vc* v);
  * if no VC is focused or the ring is full.  Lock-free under SPSC. */
 void vc_kbd_push(char c);
 
+/* Push into a NAMED console rather than the focused one — how a command is
+ * handed to a terminal window that was just opened for it (§M64's `run:`
+ * shortcut target).  The receiving shell cannot tell it from typing, which is
+ * the point: there is no second "execute this" path in the shell to drift from
+ * the one people use. */
+void vc_kbd_push_to(struct vc* v, char c);
+
 /* M22.4 — non-zero if any VC (pane or offscreen) has a shell task with
  * this pid bound to it.  The GUI task manager consults this before
  * opportunistically task_reap()ing a DEAD task: a VC-bound task struct
