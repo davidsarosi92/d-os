@@ -640,10 +640,24 @@ static int hda_init(void* ctx) {
     return 0;
 }
 
+/* Same reason as AC97's: a running stream descriptor is a live bus master.
+ * Interrupts go off too — an IRQ taken after the handler's assumptions stop
+ * holding is a fault with a confusing address. */
+static void hda_shutdown(void* ctx) {
+    (void)ctx;
+    if (!g_hda.mmio) return;
+    mw32(g_hda.mmio, HDA_INTCTL, 0);
+    mw8(sd_reg(&g_hda), SD_CTL, 0);
+    if (g_hda.has_input) mw8(in_sd_reg(&g_hda), SD_CTL, 0);
+    g_hda.running = 0;
+    g_hda.rec_running = 0;
+    kprintf("hda: streams stopped\n");
+}
+
 static const struct driver_ops hda_ops = {
     .probe    = hda_probe,
     .init     = hda_init,
-    .shutdown = NULL,
+    .shutdown = hda_shutdown,
 };
 
 DRIVER(hda, "audio", &hda_ops, NULL);

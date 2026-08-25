@@ -14,6 +14,8 @@
 #include "driver.h"
 #include "kmalloc.h"
 #include "printf.h"
+#include "hal_api.h"
+#include "hal.h"
 #include <stddef.h>
 
 /* Parallel state — one byte per registered driver, filled during
@@ -23,6 +25,38 @@ static uint32_t driver_count     = 0;
 
 static uint32_t driver_index(const struct driver* d) {
     return (uint32_t)(d - __start_drivers);
+}
+
+/* Stop every driver that came up, in REVERSE init order.
+ *
+ * WHY THIS FUNCTION HAD TO BE WRITTEN AT ALL: `driver_ops.shutdown` has been
+ * declared since §M8 and documented as "called on power-off / reboot", and
+ * NOTHING IN THE TREE EVER CALLED IT.  Every driver that bothered to write one
+ * had it dead-code the whole time.  That is §M52's shape exactly — a contract
+ * stated in a header, believed by everyone reading it, and never executed —
+ * and it is the first thing to fix before anything is built on top of the
+ * lifecycle.
+ *
+ * REVERSE ORDER because init order is dependency order: the later a driver
+ * came up, the more likely it sits on top of an earlier one.  Taking them down
+ * front-to-back would pull the floor out from under whatever is still running.
+ *
+ * NOT called from a fault or watchdog path.  Those reboot from inside an
+ * interrupt with the machine in an unknown state, where calling arbitrary
+ * driver code is how a crash report turns into a second crash — they go
+ * straight to hal_reboot() and the comment at those call sites says so. */
+void driver_shutdown_all(void) {
+    if (!driver_state_arr || driver_count == 0) return;
+    int stopped = 0;
+    for (uint32_t k = driver_count; k > 0; k--) {
+        struct driver* d = &__start_drivers[k - 1];
+        if (!(driver_state_arr[k - 1] & DRV_S_INITED)) continue;
+        if (!d->ops || !d->ops->shutdown) continue;
+        d->ops->shutdown(d->ctx);
+        driver_state_arr[k - 1] &= (uint8_t)~DRV_S_INITED;
+        stopped++;
+    }
+    kprintf("drivers: %d stopped\n", stopped);
 }
 
 uint8_t driver_state(const struct driver* d) {
@@ -107,4 +141,23 @@ void driver_list(void) {
                 d->version ? d->version : "?",
                 state_label(driver_state_arr ? driver_state_arr[i] : 0));
     }
+}
+
+/* ----------------------------------------------------------------------
+ * Orderly power transitions.
+ *
+ * ONE place, not five.  `hal_shutdown` / `hal_reboot` are called from the
+ * shell, the rescue shell and the desktop's Start menu, and adding the driver
+ * teardown at each of those is the shape §M63 paid for twice: miss one and
+ * that route silently skips it.  These two functions ARE the deliberate route;
+ * the fault paths keep calling the HAL directly, on purpose.
+ * ---------------------------------------------------------------------- */
+void system_power_off(void) {
+    driver_shutdown_all();
+    hal_shutdown();
+}
+
+void system_reboot(void) {
+    driver_shutdown_all();
+    hal_reboot();
 }

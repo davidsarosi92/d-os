@@ -477,10 +477,23 @@ static int ac97_init(void* ctx) {
     return 0;
 }
 
+/* Stop the DMA engine before the machine goes.  Not cosmetic: a bus-master
+ * engine left running across a warm reboot keeps writing into memory the next
+ * kernel is about to use, and the corruption lands somewhere unrelated. */
+static void ac97_shutdown(void* ctx) {
+    (void)ctx;
+    if (!g_ac97.nabm) return;
+    outb(g_ac97.nabm + PO_CR, 0);
+    outb(g_ac97.nabm + PI_CR, 0);
+    g_ac97.running = 0;
+    g_ac97.rec_running = 0;
+    kprintf("ac97: DMA stopped\n");
+}
+
 static const struct driver_ops ac97_ops = {
     .probe    = ac97_probe,
     .init     = ac97_init,
-    .shutdown = NULL,
+    .shutdown = ac97_shutdown,
 };
 
 DRIVER(ac97, "audio", &ac97_ops, NULL);

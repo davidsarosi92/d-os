@@ -19,6 +19,7 @@
 #include "printf.h"
 #include "timer.h"
 #include "hal.h"
+#include "driver.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -74,7 +75,7 @@ static void rescue_entry(void) {
                     (unsigned)((ms % 1000) / 100));
         } else if (rstreq(line, "reboot")) {
             kprintf("rebooting...\n");
-            hal_reboot();
+            system_reboot();
         } else {
             kprintf("rescue: unknown '%s' (help, uptime, reboot)\n", line);
         }

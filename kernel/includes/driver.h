@@ -63,9 +63,25 @@ extern struct driver __stop_drivers[];
  * must run AFTER kmalloc_init.  Failures are logged but don't abort. */
 void driver_init_all(void);
 
+/* Stop every driver that came up, in REVERSE init order (init order is
+ * dependency order).  Call it on a DELIBERATE power-off or reboot — never
+ * from a fault or watchdog path, where the machine's state is unknown and
+ * running arbitrary driver code turns a crash report into a second crash.
+ *
+ * NB: this exists because `shutdown` above was declared in §M8, documented as
+ * "called on power-off / reboot", and never actually called by anything. */
+void driver_shutdown_all(void);
+
 /* Diagnostic — print the registry to the console with each driver's
  * runtime state.  Backs the `lsdrv` shell command. */
 void driver_list(void);
+
+/* Deliberate power transitions: stop the drivers, then ask the machine to go.
+ * Use these from anything a PERSON triggered.  A fault or watchdog path must
+ * NOT — it calls hal_reboot() directly, because running driver code with the
+ * machine in an unknown state is how a crash report becomes a second crash. */
+void system_power_off(void);
+void system_reboot(void);
 
 /* Per-driver state bits exposed in case future code wants to query without
  * going through the human-readable list. */

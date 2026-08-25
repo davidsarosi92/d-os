@@ -52,6 +52,7 @@
 #include "printf.h"
 #include "hal.h"
 #include "hal_api.h"
+#include "driver.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -2525,8 +2526,8 @@ static void dispatch_launches(void) {
          * keep init off it, same contract as WIN_TERM shells. */
         task_set_reap_owned(host, 1);
     }
-    if (power_req == 1) hal_reboot();
-    if (power_req == 2) hal_shutdown();
+    if (power_req == 1) system_reboot();
+    if (power_req == 2) system_power_off();
     if (exit_req) {
         /* Not here: this is the compositor, and the teardown kills it.  Hand
          * the job to a task outside the session (see gui_teardown). */

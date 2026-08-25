@@ -4217,13 +4217,13 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "shutdown")) {
         console_write("shutting down...\n");
         crash_boot_clean();     /* §M47 — an orderly exit: disarm the marker */
-        hal_shutdown();                                 /* normally never returns */
+        system_power_off();                             /* normally never returns */
         return;
     }
     if (streq(line, "reboot")) {
         console_write("rebooting...\n");
         crash_boot_clean();     /* §M47 — an orderly exit: disarm the marker */
-        hal_reboot();                                   /* normally never returns */
+        system_reboot();                                /* normally never returns */
         return;
     }
     if (starts_with(line, "echo ")) {
