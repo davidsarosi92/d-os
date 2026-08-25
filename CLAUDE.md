@@ -101,9 +101,26 @@ whatever the codec had not yet emitted.  It does not: every queued buffer has
 completed, so the engine halts by itself, and the next sound resets the PCM box
 anyway.  **NOW EXACT AND REPEATABLE AT 200.0 / 300.0 / 600.0 / 1000.0 ms on
 x86, matching aarch64.**  The settle constant survives only on the polled path
-and is documented as the crutch it is.  **OPEN:** PCM input, Intel HDA, an
-interrupt for virtio-sound (its used ring is already exact — this would only
-save the 1 ms poll), and whether `/dev/vda` should be published on ARM.
+and is documented as the crutch it is.  **STAGE 7 — CAPTURE, ON BOTH ARCHES, WITH AN HONEST ACCOUNT OF WHAT IS
+PROVEN.**  `rec <path.wav> [ms]` + a readable `/dev/dsp`.  AC97's PCM-IN box and
+virtio-sound's RX queue, each with **their own** ring and buffers — *recording
+while playing is two independent flows and sharing either would have one
+silently corrupt the other.*  **A RECORDING STARTS WHEN YOU ASK FOR IT:** a
+capture engine keeps filling its ring, so the first version returned stale
+audio — **`rec 250` completed in 0 ms** — which is not "record 250 ms" but
+"give me the last 250 ms that went past"; a new `record_start` op re-arms, and
+`/dev/dsp` arms once per open.  **WHAT IS *NOT* VERIFIED, SAID PLAINLY: no QEMU
+backend here can inject a known signal** (`wav` is output-only and rejects
+`in.path`, `none` is silence, `coreaudio` is a real microphone), so the frame
+counts, the file's shape and the start-on-request are testable and **the
+CONTENT is not.**  **THE TWO ARCHES THEN NARROWED THE ONE UNEXPLAINED NUMBER:**
+same core, same null backend — **virtio-sound paces to 991 ms of 1000 (99 %)
+while AC97 runs 804 ms (80 %)** — so the null input DOES pace on one path, which
+points the AC97 discrepancy at the AC97 side (its ADC rate, or our reading of
+`CIV`) rather than at the core.  *A narrowing, not a diagnosis, and written down
+as such.*  Round trip verified on both: `rec` then `play` reproduces
+48000 frames / 1000 ms.  **OPEN:** that AC97 capture rate, Intel HDA, an
+interrupt for virtio-sound, and whether `/dev/vda` should be published on ARM.
 
 ✅ **§M23 STAGE 2 — A WAV PLAYER, AND THE TWO SILENT TRUNCATIONS UNDER IT
 (2026-08-24, DOCS §4.26.1, i386 + x86_64 measured, all 3 arches build).**

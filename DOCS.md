@@ -3266,14 +3266,34 @@ The elapsed time is consistently ~0.8× real time with the null backend, and
 unpaced null input, and the experiment that would separate them is the one the
 missing backend prevents.  It is written down rather than explained away.
 
-aarch64 answers `rec: virtio-snd cannot record` — the honest failure, since
-capture there needs an input stream and the RX queue.  `NULL` for `record`
-means "cannot", which is deliberately a different answer from handing back
-zeros that look like a working quiet microphone.
+**aarch64 captures too**, through virtio-sound's RX queue and a second stream.
+An RX message is a device-*readable* header and a device-*writable* payload and
+status — the mirror of TX, and getting a direction flag wrong there is not a
+crash but a buffer the device refuses, i.e. silence with nothing logged.  The
+capture side keeps its own queue, descriptors and buffers, for the same reason
+AC97 keeps a second BDL: recording while playing is two independent flows
+through one device.  Registration requires **both** an input stream and a
+working RX queue — they are established at different points in bring-up, and
+checking only one would advertise a capture path with nowhere to put samples.
 
-**Still open:** capture on aarch64, Intel HDA, an interrupt for virtio-sound
-(its used ring is already exact, so this would only save the 1 ms poll), and
-whether `/dev/vda` should be published on ARM.
+**AND THE COMPARISON NARROWS THE UNATTRIBUTED RATIO ABOVE.**  Same core, same
+null backend, two devices:
+
+| | frames | 1000 ms asked | 250 ms asked |
+|---|---|---|---|
+| aarch64 / virtio-sound | 48000/48000 | **991 ms** | 224 ms |
+| i386 / AC97 | 48000/48000 | 804 ms | 191 ms |
+
+virtio-sound paces to within 1 % of real time, so QEMU's null input *does* pace
+on that path — which points the AC97 discrepancy at the AC97 side (its ADC rate
+or our reading of `CIV`) rather than at the core or at the backend in general.
+That is a narrowing, not a diagnosis, and it is where the next look should
+start.  The round trip works on both: `rec` then `play` reproduces
+48000 frames / 1000 ms.
+
+**Still open:** the AC97 capture rate above, Intel HDA, an interrupt for
+virtio-sound (its used ring is already exact, so this would only save the 1 ms
+poll), and whether `/dev/vda` should be published on ARM.
 
 ### 4.26 Audio — AC97 codec + PCM output (M23, i386)
 

@@ -118,6 +118,7 @@ struct virtq_used  { uint16_t flags; uint16_t idx; struct virtq_used_elem ring[Q
 #define VIRTIO_SND_S_OK             0x8000
 
 #define VIRTIO_SND_D_OUTPUT         0
+#define VIRTIO_SND_D_INPUT          1
 #define VIRTIO_SND_PCM_FMT_S16      5
 #define VIRTIO_SND_PCM_RATE_48000   7
 
@@ -203,6 +204,23 @@ struct snd_dev {
     int16_t  pcm[SND_NBUF][SND_PERIOD_FRAMES * 2] __attribute__((aligned(16)));
     uint16_t tsub;                          /* buffers submitted so far      */
     uint16_t nchains;                       /* how many the ring can hold    */
+
+    /* ---- capture (RX, queue 3) --------------------------------------------
+     * Its own queue, descriptors and buffers.  Recording while playing is two
+     * independent flows through one device, and sharing either side would have
+     * one silently corrupt the other — the same argument the AC97 driver makes
+     * for a second BDL. */
+    int      has_input;
+    uint32_t in_stream_id;
+    int      in_started;
+    struct virtq_desc  rdesc[QSIZE] __attribute__((aligned(16)));
+    struct virtq_avail ravail       __attribute__((aligned(16)));
+    struct virtq_used  rused        __attribute__((aligned(16)));
+    struct snd_pcm_xfer   rxfer[SND_NBUF]   __attribute__((aligned(16)));
+    struct snd_pcm_status rstatus[SND_NBUF] __attribute__((aligned(16)));
+    int16_t  rpcm[SND_NBUF][SND_PERIOD_FRAMES * 2] __attribute__((aligned(16)));
+    uint16_t rlast;                         /* used entries consumed         */
+    uint16_t rchains;
 };
 
 static struct snd_dev   g_snd;
@@ -357,6 +375,94 @@ static int snd_play(struct audio_dev* dev, const int16_t* frames, uint32_t nfram
     return (int)nframes;                     /* QUEUED, not yet heard */
 }
 
+/* ---- capture ------------------------------------------------------------------ */
+
+/* Post one RX slot: the device READS the stream id and WRITES both the samples
+ * and the status.  Getting the direction flags wrong here is not a crash, it
+ * is a buffer the device refuses — silence with nothing logged. */
+static void snd_rx_post(struct snd_dev* d, uint32_t slot) {
+    uint32_t b = slot * 3;
+    d->rxfer[slot].stream_id = d->in_stream_id;
+    d->rstatus[slot].status = 0;
+    d->rdesc[b + 0].addr  = (uint64_t)(uintptr_t)&d->rxfer[slot];
+    d->rdesc[b + 0].len   = sizeof d->rxfer[slot];
+    d->rdesc[b + 0].flags = VRING_DESC_F_NEXT;
+    d->rdesc[b + 0].next  = (uint16_t)(b + 1);
+    d->rdesc[b + 1].addr  = (uint64_t)(uintptr_t)d->rpcm[slot];
+    d->rdesc[b + 1].len   = SND_PERIOD_FRAMES * 4;
+    d->rdesc[b + 1].flags = VRING_DESC_F_WRITE | VRING_DESC_F_NEXT;
+    d->rdesc[b + 1].next  = (uint16_t)(b + 2);
+    d->rdesc[b + 2].addr  = (uint64_t)(uintptr_t)&d->rstatus[slot];
+    d->rdesc[b + 2].len   = sizeof d->rstatus[slot];
+    d->rdesc[b + 2].flags = VRING_DESC_F_WRITE;
+    d->rdesc[b + 2].next  = 0;
+
+    uint16_t ai = d->ravail.idx;
+    d->ravail.ring[ai % QSIZE] = (uint16_t)b;
+    dsb();
+    d->ravail.idx = (uint16_t)(ai + 1);
+    dsb();
+    w32(d->base, R_QUEUENOTIFY, 3);
+}
+
+static void snd_record_start(struct audio_dev* dev) {
+    struct snd_dev* d = (struct snd_dev*)dev->priv;
+    if (!d->has_input) return;
+
+    /* Re-arm from scratch, so a recording contains what happened from NOW —
+     * the stale-buffer problem the AC97 side measured as `rec 250` finishing
+     * in 0 ms. */
+    uint32_t save = d->stream_id;
+    d->stream_id = d->in_stream_id;
+    if (d->in_started) { ctrl_simple(d, VIRTIO_SND_R_PCM_STOP);
+                         ctrl_simple(d, VIRTIO_SND_R_PCM_RELEASE); }
+    struct snd_pcm_set_params p = {
+        VIRTIO_SND_R_PCM_SET_PARAMS, d->in_stream_id,
+        SND_BUFFER_BYTES, SND_PERIOD_BYTES, 0,
+        2, VIRTIO_SND_PCM_FMT_S16, VIRTIO_SND_PCM_RATE_48000, 0
+    };
+    int ok = (ctrl_request(d, &p, sizeof p, sizeof(struct snd_hdr)) == VIRTIO_SND_S_OK) &&
+             ctrl_simple(d, VIRTIO_SND_R_PCM_PREPARE) == 0;
+    d->stream_id = save;
+    if (!ok) { klog(KLOG_WARN, "audio", "virtio-snd: capture setup refused\n");
+               d->has_input = 0; return; }
+
+    d->rlast = d->rused.idx;                 /* discard anything already there */
+    for (uint32_t i = 0; i < d->rchains; i++) snd_rx_post(d, i);
+
+    save = d->stream_id; d->stream_id = d->in_stream_id;
+    ctrl_simple(d, VIRTIO_SND_R_PCM_START);
+    d->stream_id = save;
+    d->in_started = 1;
+}
+
+static int snd_record(struct audio_dev* dev, int16_t* frames, uint32_t nframes) {
+    struct snd_dev* d = (struct snd_dev*)dev->priv;
+    if (!d->has_input) return -1;
+    if (!d->in_started) snd_record_start(dev);
+    if (!d->has_input) return -1;
+    if (nframes > SND_PERIOD_FRAMES) nframes = SND_PERIOD_FRAMES;
+    if (nframes == 0) return 0;
+
+    /* Wait for the device to hand a filled buffer back.  Bounded — a device
+     * that captures nothing costs a wait, not a hung shell. */
+    uint64_t deadline = timer_ticks_ms() +
+                        (SND_PERIOD_FRAMES * 1000ull) /
+                        (dev->rate ? dev->rate : 48000u) + 500;
+    while (d->rlast == *(volatile uint16_t*)&d->rused.idx) {
+        if (timer_ticks_ms() > deadline) return 0;
+        task_msleep(1);
+    }
+    dsb();
+    uint32_t slot = (uint32_t)(d->rlast % (d->rchains ? d->rchains : 1));
+    d->rlast++;
+
+    for (uint32_t i = 0; i < nframes * 2; i++) frames[i] = d->rpcm[slot][i];
+    snd_rx_post(d, slot);                    /* hand the slot back            */
+    if (r32(d->base, R_INTSTATUS) & 1) w32(d->base, R_INTACK, 1);
+    return (int)nframes;
+}
+
 /* ---- bring-up ---------------------------------------------------------------- */
 
 static int queue_setup(struct snd_dev* d, uint32_t q, struct virtq_desc* desc,
@@ -412,14 +518,25 @@ static int pick_output_stream(struct snd_dev* d) {
     }
     const struct snd_pcm_info* info =
         (const struct snd_pcm_info*)(d->resp + sizeof(struct snd_hdr));
+    int have_out = 0;
     for (uint32_t i = 0; i < nstreams; i++) {
-        if (info[i].direction != VIRTIO_SND_D_OUTPUT) continue;
         if (info[i].channels_max < 2) continue;    /* the core is stereo-only  */
-        d->stream_id = i;
-        return 0;
+        if (!have_out && info[i].direction == VIRTIO_SND_D_OUTPUT) {
+            d->stream_id = i;
+            have_out = 1;
+        } else if (!d->has_input && info[i].direction == VIRTIO_SND_D_INPUT) {
+            d->in_stream_id = i;
+            d->has_input = 1;
+        }
     }
-    klog(KLOG_WARN, "audio", "virtio-snd: no stereo output stream\n");
-    return -1;
+    if (!have_out) {
+        klog(KLOG_WARN, "audio", "virtio-snd: no stereo output stream\n");
+        return -1;
+    }
+    kprintf("virtio-snd: %u stream(s), output %u%s\n", (unsigned)nstreams,
+            (unsigned)d->stream_id,
+            d->has_input ? ", capture available" : ", no capture stream");
+    return 0;
 }
 
 static int snd_dev_init(struct snd_dev* d, uintptr_t base) {
@@ -440,6 +557,9 @@ static int snd_dev_init(struct snd_dev* d, uintptr_t base) {
      * that is simply never serviced. */
     if (queue_setup(d, 0, d->cdesc, &d->cavail, &d->cused) != 0) return -1;
     if (queue_setup(d, 2, d->tdesc, &d->tavail, &d->tused) != 0) return -1;
+    /* Queue 3 is capture.  A device that refuses it simply cannot record, so
+     * this is not fatal — playback must still come up. */
+    int rx_ok = (queue_setup(d, 3, d->rdesc, &d->ravail, &d->rused) == 0);
     /* How many 3-descriptor chains the NEGOTIATED ring can hold.  Asking the
      * device rather than assuming QSIZE: it may offer fewer, and overrunning
      * the ring is the kind of fault that shows up as "audio stops after a
@@ -454,6 +574,8 @@ static int snd_dev_init(struct snd_dev* d, uintptr_t base) {
             return -1;
         }
         if (d->nchains > SND_NBUF) d->nchains = SND_NBUF;
+        d->rchains = rx_ok ? d->nchains : 0;
+        if (!rx_ok) d->has_input = 0;
     }
 
     w32(base, R_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
@@ -504,6 +626,14 @@ int virtio_snd_init(void) {
         g_audio.play     = snd_play;
         g_audio.drain    = snd_drain;
         g_audio.period_frames = SND_PERIOD_FRAMES;   /* it queues, so 21 ms */
+        /* BOTH conditions: an input stream exists AND the RX queue came up.
+         * They are established at different points in bring-up, so checking
+         * only one would advertise a capture path that has nowhere to put the
+         * samples. */
+        if (g_snd.has_input && g_snd.rchains) {
+            g_audio.record       = snd_record;
+            g_audio.record_start = snd_record_start;
+        }
         g_audio.priv     = &g_snd;
         audio_register(&g_audio);
         kprintf("virtio-snd: up at slot %d (base %p), stream %u\n",
