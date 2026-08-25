@@ -18,6 +18,7 @@
 #include "hal.h"
 #include "cron.h"
 #include "config.h"
+#include "klog.h"
 #include "settings.h"
 #include <stddef.h>
 
@@ -123,6 +124,7 @@ void driver_init_all(void) {
 
 /* Map state bits to a short label for the lsdrv view. */
 static const char* state_label(uint8_t st) {
+    if (st & DRV_S_QUARANTINE) return "QUARANTINED";
     if (st & DRV_S_INITED)     return "OK";
     if (st & DRV_S_INIT_FAIL)  return "init-fail";
     if (st & DRV_S_PROBE_FAIL) return "absent";
@@ -186,6 +188,28 @@ int driver_stop(const char* name) {
     return 0;
 }
 
+void driver_fault(const char* name, const char* why) {
+    struct driver* d = driver_find(name);
+    if (!d || !driver_state_arr) return;
+    uint32_t i = driver_index(d);
+    if (i >= driver_count) return;
+
+    klog(KLOG_WARN, "drv", "'%s' faulted: %s\n", name, why ? why : "no reason given");
+
+    /* Stop it if it CAN be stopped.  If it cannot, quarantine still applies:
+     * the point is that nothing restarts it, not that we can always take it
+     * down cleanly — and saying which of the two happened matters more than
+     * pretending they are the same. */
+    if ((driver_state_arr[i] & DRV_S_INITED) && d->ops && d->ops->shutdown) {
+        d->ops->shutdown(d->ctx);
+        driver_state_arr[i] &= (uint8_t)~DRV_S_INITED;
+        kprintf("drv: '%s' stopped and quarantined\n", name);
+    } else {
+        kprintf("drv: '%s' quarantined (could not be stopped)\n", name);
+    }
+    driver_state_arr[i] |= DRV_S_QUARANTINE;
+}
+
 int driver_start(const char* name) {
     struct driver* d = driver_find(name);
     if (!d) { kprintf("drv: no driver '%s'\n", name); return -1; }
@@ -201,7 +225,10 @@ int driver_start(const char* name) {
         return -3;
     }
     driver_state_arr[i] |= DRV_S_PROBED;
-    driver_state_arr[i] &= (uint8_t)~(DRV_S_PROBE_FAIL | DRV_S_INIT_FAIL);
+    /* An explicit start is the user overruling the quarantine — that is what
+     * makes quarantine a pause rather than a death sentence. */
+    driver_state_arr[i] &= (uint8_t)~(DRV_S_PROBE_FAIL | DRV_S_INIT_FAIL |
+                                      DRV_S_QUARANTINE);
     if (d->ops && d->ops->init && d->ops->init(d->ctx) != 0) {
         driver_state_arr[i] |= DRV_S_INIT_FAIL;
         kprintf("drv: '%s' failed to start\n", name);
@@ -223,6 +250,7 @@ int driver_rescan(void) {
          * fixes nothing (§M29's crash-loop backoff, same reasoning).  It takes
          * an explicit `drv start`. */
         if (driver_state_arr[i] & DRV_S_INIT_FAIL) continue;
+        if (driver_state_arr[i] & DRV_S_QUARANTINE) continue;   /* held back */
         if (d->ops && d->ops->probe && d->ops->probe(d->ctx) != 0) continue;
         if (d->ops && d->ops->init && d->ops->init(d->ctx) != 0) {
             driver_state_arr[i] |= DRV_S_INIT_FAIL;
@@ -252,6 +280,7 @@ void driver_cmd(const char* args) {
         return;
     }
     if (str_eq(verb, "stop"))    { driver_stop(args);  return; }
+    if (str_eq(verb, "fault"))   { driver_fault(args, "asked for by hand"); return; }
     if (str_eq(verb, "start"))   { driver_start(args); return; }
     if (str_eq(verb, "swap")) {
         /* Two names: stop the first, start the second.  The order matters —
@@ -276,7 +305,8 @@ void driver_cmd(const char* args) {
             kprintf("drv: '%s' did not start — nothing is bound now\n", args);
         return;
     }
-    kprintf("drv: list | rescan | stop <name> | start <name> | swap <from> <to>\n");
+    kprintf("drv: list | rescan | stop <name> | start <name> | swap <from> <to>"
+            " | fault <name>\n");
 }
 
 /* ----------------------------------------------------------------------

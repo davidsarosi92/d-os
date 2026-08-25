@@ -15,6 +15,7 @@
 #include "lock.h"
 #include "config.h"
 #include "settings.h"
+#include "driver.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -178,7 +179,19 @@ int audio_play_pcm(struct audio_dev* dev, const int16_t* frames, uint32_t nframe
         if (n < 0) return n;
         if (n == 0) {                  /* accepted nothing and reported success */
             klog(KLOG_WARN, "audio", "%s accepted 0 frames — giving up\n", dev->name);
-            return -1;                 /* better than spinning here forever     */
+            /* AND QUARANTINE IT.  A device that reports success while taking
+             * nothing will do it again on the next period and every one after
+             * — the loop above would spin, and the mixer would look hung for a
+             * reason nothing names.  The subsystem that NOTICED is the right
+             * one to report it; the driver cannot, because from inside it
+             * everything returned fine. */
+            driver_fault(dev->name, "accepted 0 frames");
+            return -1;
+        }
+        if (n < 0) {
+            klog(KLOG_WARN, "audio", "%s failed a write\n", dev->name);
+            driver_fault(dev->name, "write error");
+            return n;
         }
         done += (uint32_t)n;
     }

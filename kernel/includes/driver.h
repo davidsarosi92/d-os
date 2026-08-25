@@ -101,6 +101,12 @@ struct driver* driver_find(const char* name);
  * success, non-zero if it was not running or has no way to stop. */
 int driver_stop(const char* name);
 
+/* Report that a running driver has misbehaved: stop it if it can be stopped,
+ * and quarantine it so nothing restarts it behind the user's back.  Meant to
+ * be called BY a subsystem that noticed — a device that stopped answering, a
+ * driver that returned nonsense — rather than by the driver itself. */
+void driver_fault(const char* name, const char* why);
+
 /* Probe + init one driver that is not currently running. */
 int driver_start(const char* name);
 
@@ -119,6 +125,18 @@ void driver_cmd(const char* args);
 #define DRV_S_INITED      0x02  /* init() returned 0 (or NULL init) */
 #define DRV_S_PROBE_FAIL  0x04
 #define DRV_S_INIT_FAIL   0x08
+/* §M33-lite — QUARANTINED: this driver misbehaved and will not be started
+ * again automatically.  It takes an explicit `drv start` (which clears it), so
+ * a broken driver costs one failed attempt rather than a restart loop that
+ * fills the log and fixes nothing — §M29's crash-loop reasoning, applied to
+ * hardware bring-up.
+ *
+ * NOTE WHAT THIS IS AND IS NOT.  It contains the CONSEQUENCES of a driver that
+ * fails or misreports; it does NOT contain a driver that corrupts memory,
+ * because in one address space the damage is already done by the time anything
+ * notices.  That is §M33's execution domains, and calling this isolation would
+ * be exactly the "isolation theatre" that plan refuses. */
+#define DRV_S_QUARANTINE  0x10
 
 uint8_t driver_state(const struct driver* d);
 
