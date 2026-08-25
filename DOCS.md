@@ -3200,9 +3200,43 @@ nominal length because the two streams are started from two independently
 spawned tasks and do not begin on the same millisecond, which is what the peak
 proves they nonetheless *overlapped*.
 
-**Still open:** PCM input, Intel HDA, the AC97 completion interrupt (which would
-replace the drain poll with a waitq, §M55's shape, and retire the measured
-settle constant), and whether `/dev/vda` should be published on ARM.
+#### Stage 6 — the completion interrupt, and the last 0.9 %
+
+x86 was 0.9 % short at one length while aarch64 measured exact, and the reason
+was the *signal*, not the arithmetic: ARM knew precisely which buffers the
+device had finished (its used ring), while AC97 was inferring it from `CIV`
+plus a settle constant tuned against one emulator.
+
+The AC97 `IOC` interrupt supplies the same exact fact.  The ISR does two things
+and no third — acknowledge the device and count the completion — because
+§M49's xHCI lesson was a drain inside an interrupt handler reaching code that
+blocks.  `outstanding` becomes `submitted - completed`, and the driver **learns
+that its interrupt works by receiving one** (§M55's rule): until `irq_seen` is
+set it keeps the polled path, so wiring an interrupt that never fires costs
+latency rather than silence.  The tree's `irq_install` does *not* chain, so the
+line is logged and a collision is visible rather than mysterious.
+
+That alone did not finish it — 300 ms became exact and repeatable, but 200 and
+1000 lost a few milliseconds.  **The drain was clearing the run bit** the
+instant the last completion arrived, cutting whatever the codec had not yet
+emitted.  It no longer does: every queued buffer has completed, so the engine
+halts on its own, and the next sound calls `ac97_engine_reset()` anyway — there
+was nothing to gain by stopping it by hand.
+
+| asked | measured (repeated) |
+|-------|---------------------|
+| 200 ms | **200.0** |
+| 300 ms | **300.0** |
+| 600 ms | **600.0** |
+| 1000 ms | **1000.0** |
+
+The settle constant survives only on the polled path, where it is still the
+best available answer, and is documented as the crutch it is.  Two streams
+still peak at exactly 10000 and the WAV path is unchanged.
+
+**Still open:** PCM input, Intel HDA, an interrupt for virtio-sound (its used
+ring is already exact, so this would only save the 1 ms poll), and whether
+`/dev/vda` should be published on ARM.
 
 ### 4.26 Audio — AC97 codec + PCM output (M23, i386)
 

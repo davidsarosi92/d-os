@@ -38,6 +38,7 @@
 #include "pmm.h"
 #include "printf.h"
 #include "driver.h"
+#include "idt.h"       /* irq_install, struct int_frame */
 #include "task.h"      /* task_msleep — a wait must not cost a CPU */
 #include "timer.h"     /* timer_ticks_ms — the drain deadline is real time */
 #include <stdint.h>
@@ -66,6 +67,8 @@
 /* PO_CR bits. */
 #define CR_RPBM          0x01   /* run bus master                             */
 #define CR_RR            0x02   /* reset registers                            */
+#define CR_LVBIE         0x04   /* interrupt on last-valid-buffer             */
+#define CR_IOCE          0x10   /* interrupt on buffer completion             */
 
 /* PO_SR bits. */
 #define SR_DCH           0x01   /* DMA controller halted                      */
@@ -135,6 +138,20 @@ struct ac97 {
     int16_t* pcm;
     uint32_t head;                   /* next ring slot to fill                */
     int      running;                /* engine started and not yet drained    */
+    /* §M23 stage 6 — completion accounting from the INTERRUPT.
+     *
+     * `submitted` is ours; `completed` is bumped by the ISR.  Their difference
+     * is an EXACT count of what the device still holds — which is what the
+     * aarch64 driver has had all along from its used ring, and why that one
+     * measured exact while this one was inferring the answer from CIV plus a
+     * settle constant.
+     *
+     * `irq_seen` is the §M55 rule: a driver learns that its interrupt works by
+     * RECEIVING one.  Until then it keeps using the polled path, so wiring an
+     * interrupt that never fires costs latency, not silence. */
+    volatile uint32_t submitted;
+    volatile uint32_t completed;
+    volatile int      irq_seen;
 };
 
 static struct ac97 g_ac97;
@@ -153,6 +170,7 @@ static void ac97_engine_reset(struct ac97* a) {
     outl(a->nabm + PO_BDBAR, a->bdl_phys);
     a->head = 0;
     a->running = 0;
+    a->submitted = a->completed = 0;
 }
 
 /* How many buffers the engine has not finished with.
@@ -162,9 +180,25 @@ static void ac97_engine_reset(struct ac97* a) {
  * unambiguous rather than "full or empty, cannot tell". */
 static uint32_t ac97_outstanding(struct ac97* a) {
     if (!a->running) return 0;
+    /* The exact answer, once the interrupt has proved itself. */
+    if (a->irq_seen) return a->submitted - a->completed;
     if (inw(a->nabm + PO_SR) & SR_DCH) return 0;      /* halted: nothing left */
     uint32_t civ = (uint32_t)inb(a->nabm + PO_CIV) & (AC97_NBUF - 1);
     return (a->head - civ) & (AC97_NBUF - 1);
+}
+
+/* The ISR does two things and no third: acknowledge the device and count the
+ * completion.  No mixing, no wakeups into the audio core — §M49's xHCI lesson,
+ * where draining a ring inside the interrupt handler reached code that blocks. */
+static void ac97_irq(struct int_frame* f) {
+    (void)f;
+    struct ac97* a = &g_ac97;
+    if (!a->nabm) return;
+    uint16_t sr = inw(a->nabm + PO_SR);
+    if (!(sr & (SR_BCIS | SR_LVBCI))) return;         /* not ours             */
+    a->completed++;
+    a->irq_seen = 1;
+    outw(a->nabm + PO_SR, sr & (SR_BCIS | SR_LVBCI)); /* RWC: write to clear  */
 }
 
 static void ac97_drain(struct audio_dev* dev) {
@@ -175,20 +209,27 @@ static void ac97_drain(struct audio_dev* dev) {
     uint64_t deadline = timer_ticks_ms() +
                         (AC97_DEPTH * AC97_BUF_FRAMES * 1000ull) /
                         (dev->rate ? dev->rate : 48000u) + AC97_DRAIN_GRACE_MS;
-    while (!(inw(a->nabm + PO_SR) & SR_DCH)) {
+    while (ac97_outstanding(a) || (!a->irq_seen && !(inw(a->nabm + PO_SR) & SR_DCH))) {
         if (timer_ticks_ms() > deadline) {
             kprintf("ac97: drain timeout\n");
             break;
         }
         task_msleep(1);
     }
-    /* DCH says the DMA engine halted, which is NOT the same as the last
-     * samples having left the codec.  Stopping the moment it sets cut a few
-     * milliseconds off the end of every sound — small, variable, and audible
-     * only as sounds feeling clipped.  Give it a beat before pulling the run
-     * bit; the cost is paid once per sound, not per buffer. */
-    task_msleep(AC97_SETTLE_MS);
-    outb(a->nabm + PO_CR, 0);
+    /* THE SETTLE IS THE POLLED PATH'S CRUTCH.  `DCH` says the DMA engine
+     * halted, which is not the same as the last samples having left — so
+     * without a better signal the driver had to wait a measured constant, and
+     * a constant tuned against one emulator is exactly the kind of number that
+     * is wrong on the next machine.  With the interrupt the count is exact and
+     * the crutch is not used. */
+    if (!a->irq_seen) task_msleep(AC97_SETTLE_MS);
+
+    /* DO NOT CLEAR THE RUN BIT HERE.  Every buffer we queued has been
+     * completed, so the engine halts by itself once it reaches the last one —
+     * and stopping it by hand at that moment cuts whatever the codec has not
+     * yet emitted, which measured as a few milliseconds off the end.  There is
+     * nothing to gain by it either: the next sound calls ac97_engine_reset(),
+     * which resets the PCM box properly before queueing anything. */
     a->running = 0;
     a->head = 0;
 }
@@ -232,11 +273,12 @@ static int ac97_play(struct audio_dev* dev, const int16_t* frames, uint32_t nfra
      * exists, so publishing it first is handing over a descriptor that is
      * still being written. */
     a->head = (slot + 1) & (AC97_NBUF - 1);
+    a->submitted++;
     outb(a->nabm + PO_LVI, (uint8_t)slot);
 
     if (!a->running) {
         outw(a->nabm + PO_SR, 0x1C);
-        outb(a->nabm + PO_CR, CR_RPBM);
+        outb(a->nabm + PO_CR, CR_RPBM | CR_IOCE | CR_LVBIE);
         a->running = 1;
     }
     return (int)nframes;                              /* QUEUED, not yet heard */
@@ -288,6 +330,18 @@ static int ac97_init(void* ctx) {
     g_ac97.bdl = (struct bdl_entry*)(uintptr_t)g_ac97.bdl_phys;
     g_ac97.pcm = (int16_t*)(uintptr_t)g_ac97.pcm_phys;
     for (int i = 0; i < BDL_ENTRIES; i++) { g_ac97.bdl[i].addr = 0; g_ac97.bdl[i].samples = 0; g_ac97.bdl[i].control = 0; }
+
+    /* The completion interrupt.  NOTE the tree's own warning: `irq_install`
+     * does not CHAIN, so two devices sharing a line overwrite each other —
+     * the line is logged so a collision is visible rather than mysterious.
+     * If no line is routed, or it never fires, the polled path stays in use
+     * (§M55: a driver learns its interrupt works by receiving one). */
+    if (pd.irq_line != 0xFF) {
+        irq_install(pd.irq_line, ac97_irq);
+        kprintf("ac97: completion IRQ on line %u\n", pd.irq_line);
+    } else {
+        kprintf("ac97: no IRQ line — completion stays polled\n");
+    }
 
     /* Register the abstract audio device. */
     g_audio.name     = "ac97";

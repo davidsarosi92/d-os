@@ -84,9 +84,26 @@ emptied** — a settle before clearing the run bit, MEASURED not guessed (at
 because it means "this is the last buffer" and that is wrong in a ring.
 **MEASURED: x86 exact at 200.0/600.0/1000.0 ms (0.9 % short at 300), aarch64
 exact at 200.0/300.0/600.0, zero silent samples, two streams still peak at
-exactly 10000, WAV unchanged.**  **OPEN:** PCM input, Intel HDA, the AC97
-completion IRQ (would replace the drain poll with a waitq and retire the settle
-constant), and whether `/dev/vda` should be published on ARM.
+exactly 10000, WAV unchanged.**  **STAGE 6 — THE COMPLETION INTERRUPT, AND THE LAST 0.9 %.**  x86 was 0.9 %
+short at one length while ARM measured exact, and *the difference was the
+SIGNAL, not the arithmetic*: ARM knew exactly which buffers the device had
+finished (its used ring), while AC97 inferred it from `CIV` plus a settle
+constant tuned against one emulator.  The `IOC` interrupt supplies the same
+exact fact — ISR does TWO things and no third (ack + count; §M49's xHCI lesson
+was a drain inside an ISR reaching code that blocks), `outstanding` becomes
+`submitted - completed`, and **the driver learns its interrupt works by
+RECEIVING one** (§M55) so a never-firing IRQ costs latency, not silence.
+*`irq_install` does not CHAIN in this tree, so the line is logged and a
+collision is visible rather than mysterious.*  **THAT ALONE DID NOT FINISH IT:**
+300 ms became exact and repeatable but 200 and 1000 lost a few ms — **the drain
+was clearing the run bit the instant the last completion arrived**, cutting
+whatever the codec had not yet emitted.  It does not: every queued buffer has
+completed, so the engine halts by itself, and the next sound resets the PCM box
+anyway.  **NOW EXACT AND REPEATABLE AT 200.0 / 300.0 / 600.0 / 1000.0 ms on
+x86, matching aarch64.**  The settle constant survives only on the polled path
+and is documented as the crutch it is.  **OPEN:** PCM input, Intel HDA, an
+interrupt for virtio-sound (its used ring is already exact — this would only
+save the 1 ms poll), and whether `/dev/vda` should be published on ARM.
 
 ✅ **§M23 STAGE 2 — A WAV PLAYER, AND THE TWO SILENT TRUNCATIONS UNDER IT
 (2026-08-24, DOCS §4.26.1, i386 + x86_64 measured, all 3 arches build).**
