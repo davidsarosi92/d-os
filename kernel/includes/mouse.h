@@ -24,6 +24,15 @@ typedef void (*mouse_listener_t)(int dx, int dy, unsigned buttons);
  * Until a listener is set, packets are decoded and dropped. */
 void mouse_set_listener(mouse_listener_t fn);
 
+/* §M33 Tier 1 — deliver an event that came from OUTSIDE the kernel.
+ *
+ * A ring-3 driver cannot call the listener: the listener is a kernel function
+ * pointer and the driver is in another address space.  So the boundary crossing
+ * ends here, at one call that feeds the same two listeners the in-kernel driver
+ * feeds — which is what lets the input stack be unaware of where its driver
+ * runs.  `dz` is the wheel and is 0 for a mouse without one. */
+void mouse_publish(int dx, int dy, unsigned buttons, int dz);
+
 /* §M61 follow-up — the WHEEL, reported separately from motion because it is not
  * a movement: routing a wheel delta as `dy` would move the cursor instead of
  * scrolling what is under it.  `dz` is positive for wheel-up.  Only fires on a

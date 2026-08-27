@@ -32,6 +32,7 @@
  * ============================================================================= */
 
 #include "syscall.h"
+#include "drvuser.h"   /* §M33 Tier 1 — ring-3 driver resources */
 #include "idt.h"
 #include "console.h"
 #include "printf.h"
@@ -375,6 +376,22 @@ static void syscall_dispatch_body(struct int_frame* f) {
         case SYS_GETRANDOM:
             f->rax = (uint64_t)sys_getrandom((void*)(uintptr_t)f->rbx, (size_t)f->rcx,
                                              (unsigned)f->rdx);
+            return;
+
+        /* §M33 Tier 1 — a ring-3 driver asking for its resources.  Same
+         * bodies as the i386 dispatcher; only the register names differ. */
+        case SYS_DRV_PORTS:
+            f->rax = (uint64_t)drvuser_sys_ports((uint16_t)f->rbx, (uint16_t)f->rcx);
+            return;
+        case SYS_DRV_IRQ:
+            f->rax = (uint64_t)drvuser_sys_irq((int)f->rbx);
+            return;
+        case SYS_DRV_IRQ_WAIT:
+            f->rax = (uint64_t)drvuser_sys_irq_wait((int)f->rbx, (int)f->rcx);
+            return;
+        case SYS_DRV_INPUT:
+            f->rax = (uint64_t)drvuser_sys_input((int)f->rbx, (int)f->rcx,
+                                                 (unsigned)f->rdx, (int)f->rsi);
             return;
 
         default:

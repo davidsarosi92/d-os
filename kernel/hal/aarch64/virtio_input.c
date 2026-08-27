@@ -182,6 +182,15 @@ void mouse_set_listener(mouse_listener_t fn) { g_listener = fn; }
 static mouse_wheel_t g_wheel;
 void mouse_set_wheel_listener(mouse_wheel_t fn) { g_wheel = fn; }
 
+/* §M33 Tier 1 — the one place an event reaches the listeners, whoever decoded
+ * it.  The twin of the x86 one in ps2_mouse.c, and it exists on both arches for
+ * §M24's reason: a seam that exists on one entry path only is a shape this tree
+ * has paid for repeatedly, and the ring-3 driver syscall calls this by name. */
+void mouse_publish(int dx, int dy, unsigned buttons, int dz) {
+    if (g_listener) g_listener(dx, dy, buttons);
+    if (dz && g_wheel) g_wheel(dz);
+}
+
 static int g_mdx, g_mdy, g_mdz;
 static unsigned g_mbtn;
 

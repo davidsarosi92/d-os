@@ -3163,11 +3163,15 @@ are not guarded (no caller to unwind to).
     handles not pointers, offsets not addresses, `drv_irq_wait` blocks, one
     context owns everything, DMA carries CPU and device addresses separately.
     `ps2_mouse` is ported to it and measured.
-  * **Tier 1** — the API's USER-MODE backend: port grants into the TSS I/O
-    bitmap, MMIO mapped into the driver's own space, `drv_irq_wait` as a
-    syscall, clients reached over IPC — then that same `ps2_mouse` source in
-    ring 3.  This is what makes `DOMAIN_USER` enforceable and therefore what
-    `domain_enforceable()` is waiting for.
+  * **Tier 1, first half — shipped 2026-08-27.**  Port grants really are in the
+    TSS I/O bitmap, bounded by a kernel-side manifest; `drv_irq_wait` and input
+    publication are syscalls.  Falsified by `drvtest`: a granted port reads from
+    ring 3, an ungranted request is refused, and a raw `in` on an ungranted port
+    is a #GP that kills only that process.
+  * **Tier 1, rest** — PLACING a driver there: the spawn path (`domain = user`
+    launches the ring-3 image instead of calling init), MMIO mapped into the
+    driver's own space, and CLIENT RECONNECTION.  Until these exist
+    `domain_enforceable()` still refuses `user`, and it names what is missing.
   * **Stage 5 — an IOMMU driver.**  Until it exists a DMA driver outside the
     kernel is placement, not isolation, and the code marks it `ADVISORY(!)`.
   * **Tier 2** — DMA drivers in ring 3 with clean teardown and CLIENT

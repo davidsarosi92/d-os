@@ -26,6 +26,11 @@
 #include "percpu.h"        /* this_cpu_id  */
 #include <stdint.h>
 
+/* Ports 0..0x3FF, one bit each.  See the bitmap's own comment for why this is
+ * a deliberate ceiling and not a shortcut. */
+#define IOMAP_PORTS 0x400
+#define IOMAP_BYTES (IOMAP_PORTS / 8)
+
 /* Full 32-bit TSS layout per the SDM.  `__attribute__((packed))` is
  * critical; the CPU reads each field at its exact offset. */
 struct tss32 {
@@ -46,6 +51,24 @@ struct tss32 {
     uint32_t ldt;           /* 0x60 */
     uint16_t trap;          /* 0x64 */
     uint16_t iomap_base;    /* 0x66 */
+
+    /* ---- §M33 Tier 1: the I/O permission bitmap -----------------------------
+     * A ring-3 IN/OUT is allowed only if its port's bit here is CLEAR and the
+     * byte is inside the TSS limit.  Both halves matter, and the second is the
+     * one doing the security work: **a port beyond the bitmap is denied by the
+     * limit**, so covering only 0..0x3FF means everything above it is refused
+     * BY CONSTRUCTION rather than by a check somebody has to remember.
+     *
+     * 0x400 ports is the legacy ISA range — PS/2, serial, the PIC, the PIT.  A
+     * PCI I/O BAR (AC97's lives around 0xC000) is therefore NOT grantable to
+     * ring 3, and that lines up with reality rather than limiting it: every
+     * driver with a high I/O BAR here is a DMA driver, and a DMA driver cannot
+     * be isolated at all until there is an IOMMU (§M33 stage 5).
+     *
+     * The trailing 0xFF byte is required by the SDM: the CPU may read one byte
+     * past the port's own, and that read must deny. */
+    uint8_t  iomap[IOMAP_BYTES];
+    uint8_t  iomap_tail;
 } __attribute__((packed));
 
 /* One TSS + one dedicated ring-3→ring-0 syscall stack per logical CPU.  The
@@ -69,8 +92,12 @@ void tss_init(void) {
         for (uint32_t i = 0; i < sizeof(struct tss32); i++) b[i] = 0;
         tss[c].ss0  = GDT_KERNEL_DS;
         tss[c].esp0 = fallback_esp0(c);
-        /* iomap_base = sizeof(TSS) → "no I/O bitmap": ring-3 IN/OUT #GP. */
+        /* No bitmap by default: iomap_base points past the segment limit, so
+         * every ring-3 IN/OUT #GPs.  A task with no port grant gets exactly
+         * this, which is what keeps the default unchanged from before §M33. */
         tss[c].iomap_base = sizeof(struct tss32);
+        for (uint32_t i = 0; i < IOMAP_BYTES; i++) tss[c].iomap[i] = 0xFF;
+        tss[c].iomap_tail = 0xFF;
     }
 }
 
@@ -91,4 +118,34 @@ void hal_set_kernel_stack(uintptr_t top) {
 uintptr_t tss_get_addr(void)          { return (uintptr_t)&tss[0]; }   /* legacy */
 uintptr_t tss_get_addr_cpu(int cpu)   { return (uintptr_t)&tss[cpu]; }
 uint32_t  tss_get_limit(void)         { return sizeof(struct tss32) - 1; }
+
+/* ----------------------------------------------------------------------
+ * §M33 Tier 1 — install a task's port grant.
+ *
+ * `bm` is IOMAP_BYTES of bitmap (0 = allowed) or NULL for "no ports", which is
+ * every task that is not a user-mode driver.
+ *
+ * THE COPY IS SKIPPED WHEN NOTHING CHANGED, and that is not premature: this
+ * runs on every context switch, and 128 bytes per switch on a box that has no
+ * user-mode driver at all would be pure cost for a feature nobody enabled.
+ * The cached owner is per-CPU because the TSS is.
+ * ---------------------------------------------------------------------- */
+static const void* iomap_loaded[TSS_MAX_CPUS];
+
+void hal_set_io_bitmap(const void* bm) {
+    int c = this_cpu_id();
+    if (iomap_loaded[c] == bm) return;
+    iomap_loaded[c] = bm;
+
+    if (!bm) {
+        tss[c].iomap_base = sizeof(struct tss32);   /* past the limit = deny */
+        return;
+    }
+    const uint8_t* src = (const uint8_t*)bm;
+    for (uint32_t i = 0; i < IOMAP_BYTES; i++) tss[c].iomap[i] = src[i];
+    tss[c].iomap_tail = 0xFF;
+    tss[c].iomap_base = (uint16_t)__builtin_offsetof(struct tss32, iomap);
+}
+
+uint32_t hal_io_bitmap_bytes(void) { return IOMAP_BYTES; }
 int       tss_max_cpus(void)          { return TSS_MAX_CPUS; }

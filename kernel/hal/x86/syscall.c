@@ -26,6 +26,7 @@
  * ============================================================================= */
 
 #include "syscall.h"
+#include "drvuser.h"   /* §M33 Tier 1 — ring-3 driver resources */
 #include "dosgui.h"      /* §M65 — the display bridge, both personalities */
 #include "vmm.h"         /* copy_str_from_user — the title is a client string */
 #include "idt.h"
@@ -96,6 +97,23 @@ static void syscall_dispatch_body(struct int_frame* f) {
          * personality uses (syscall.h explains why).  Only the toolkit build
          * and the window lifecycle are here; a native program that wants to
          * blit pixels uses PRESENT exactly as a musl one does. */
+        /* §M33 Tier 1 — a ring-3 driver asking for its resources.  The
+         * bodies check the CALLER: a process the kernel did not place as a
+         * driver holds no manifest, so every one of these refuses. */
+        case SYS_DRV_PORTS:
+            f->eax = (uint32_t)drvuser_sys_ports((uint16_t)f->ebx, (uint16_t)f->ecx);
+            return;
+        case SYS_DRV_IRQ:
+            f->eax = (uint32_t)drvuser_sys_irq((int)f->ebx);
+            return;
+        case SYS_DRV_IRQ_WAIT:
+            f->eax = (uint32_t)drvuser_sys_irq_wait((int)f->ebx, (int)f->ecx);
+            return;
+        case SYS_DRV_INPUT:
+            f->eax = (uint32_t)drvuser_sys_input((int)f->ebx, (int)f->ecx,
+                                                 (unsigned)f->edx, (int)f->esi);
+            return;
+
         case SYS_DOSGUI_CREATE: {
             char title[64];
             if (copy_str_from_user(title, f->edx, sizeof title) < 0) title[0] = 0;

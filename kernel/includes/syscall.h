@@ -94,6 +94,25 @@
  * numbers are ours to choose — and choosing the same ones for the native ABI
  * as for the Linux personality is what stops a program's window code from
  * depending on which libc it was linked against. */
+/* ----------------------------------------------------------------------
+ * §M33 Tier 1 — the driver-runtime API, as seen from ring 3.
+ *
+ * These are the syscall form of drvrt.h, and they exist so the SAME driver
+ * source can be compiled for either side of the boundary.  Note what is NOT
+ * here: no way to name a port directly, no callback registration, no kernel
+ * pointer.  A driver gets HANDLES and asks the kernel to act on them, which is
+ * the whole reason drvrt.h was shaped the way it was before any of this
+ * existed.
+ *
+ * ALL OF THEM CHECK THE CALLER'S GRANT.  A process that was not placed as a
+ * driver holds no resources, so every one of these refuses — the syscalls are
+ * reachable by anything and useful only to something the kernel put there.
+ * ---------------------------------------------------------------------- */
+#define SYS_DRV_PORTS       0xD060  /* (base, count, why) → handle / -1        */
+#define SYS_DRV_IRQ         0xD061  /* (line, why) → handle / -1               */
+#define SYS_DRV_IRQ_WAIT    0xD062  /* (handle, timeout_ms) → n fired / <0     */
+#define SYS_DRV_INPUT       0xD063  /* (dx, dy, buttons, dz) → 0 / -1          */
+
 #define SYS_DOSGUI_CREATE   0xD050  /* (w, h, title) → handle / -1             */
 #define SYS_DOSGUI_PRESENT  0xD051  /* (handle, px, w[, stride]) → 0 / -1      */
 #define SYS_DOSGUI_POLL     0xD052  /* (handle, ev*) → 1 / 0 / -1              */

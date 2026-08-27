@@ -46,6 +46,9 @@
 #include "percpu.h"        /* this_cpu_id                              */
 #include <stdint.h>
 
+#define IOMAP_PORTS 0x400
+#define IOMAP_BYTES (IOMAP_PORTS / 8)
+
 struct tss64 {
     uint32_t reserved0;             /* 0x00 */
     uint64_t rsp0;                  /* 0x04 — kernel stack pointer */
@@ -62,6 +65,14 @@ struct tss64 {
     uint64_t reserved2;             /* 0x5C */
     uint16_t reserved3;             /* 0x64 */
     uint16_t iomap_base;            /* 0x66 */
+
+    /* §M33 Tier 1 — the I/O permission bitmap.  Identical in purpose and size
+     * to the i386 twin; see kernel/hal/x86/tss.c for why 0x400 ports is a
+     * deliberate ceiling rather than a shortcut.  The mechanism is unchanged in
+     * long mode: IN/OUT from ring 3 consults it, and a port past the segment
+     * limit is denied. */
+    uint8_t  iomap[IOMAP_BYTES];
+    uint8_t  iomap_tail;
 } __attribute__((packed));
 
 #define TSS_MAX_CPUS ACPI_MAX_CPUS
@@ -106,6 +117,8 @@ void tss_init(void) {
          * any ring-3 IN/OUT traps with #GP (which is what we want; user
          * mode has no business doing port I/O). */
         tss[c].iomap_base = sizeof(struct tss64);
+        for (uint32_t i = 0; i < IOMAP_BYTES; i++) tss[c].iomap[i] = 0xFF;
+        tss[c].iomap_tail = 0xFF;
     }
     for (int c = 0; c < TSS_MAX_CPUS; c++)
         syscall_set_kernel_rsp(c, (uintptr_t)tss[c].rsp0);
@@ -141,4 +154,21 @@ void hal_set_tls_base(uintptr_t base) {
 uintptr_t tss_get_addr(void)        { return (uintptr_t)&tss[0]; }
 uintptr_t tss_get_addr_cpu(int cpu) { return (uintptr_t)&tss[cpu]; }
 uint32_t  tss_get_limit(void)       { return sizeof(struct tss64) - 1; }
+
+/* §M33 Tier 1 — install a task's port grant.  See the i386 twin for the
+ * reasoning, including why the copy is skipped when nothing changed. */
+static const void* iomap_loaded[TSS_MAX_CPUS];
+
+void hal_set_io_bitmap(const void* bm) {
+    int c = this_cpu_id();
+    if (iomap_loaded[c] == bm) return;
+    iomap_loaded[c] = bm;
+    if (!bm) { tss[c].iomap_base = sizeof(struct tss64); return; }
+    const uint8_t* src = (const uint8_t*)bm;
+    for (uint32_t i = 0; i < IOMAP_BYTES; i++) tss[c].iomap[i] = src[i];
+    tss[c].iomap_tail = 0xFF;
+    tss[c].iomap_base = (uint16_t)__builtin_offsetof(struct tss64, iomap);
+}
+
+uint32_t hal_io_bitmap_bytes(void) { return IOMAP_BYTES; }
 int       tss_max_cpus(void)        { return TSS_MAX_CPUS; }

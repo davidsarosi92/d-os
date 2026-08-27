@@ -64,20 +64,27 @@ int domain_enforceable(uint32_t domain, const char** why) {
         return 0;
 
     case DOMAIN_USER:
-        /* The substrate EXISTS — §M25 shipped per-process address spaces,
-         * ring-3 processes, an fd table and unix-socket IPC, and §M34 added
-         * fork/exec/signals.  What does not exist is the DRIVER-side backend:
-         * a driver in ring 3 needs its I/O ports granted through the TSS I/O
-         * bitmap, its MMIO mapped into its own space, its interrupt turned
-         * into something it can wait on, and its clients reached over IPC.
-         * That is §M33 Tier 1, and none of it is written.
+        /* §M33 TIER 1 IS PARTLY BUILT, AND THE ANSWER STILL HAS TO BE NO.
          *
-         * Saying so is the point.  Accepting `user` and running the driver in
-         * ring 0 anyway would leave the user believing in a boundary that is
-         * not there. */
-        if (why) *why = "no user-mode driver backend yet (§M33 Tier 1): "
-                        "port grants, MMIO mapping, IRQ forwarding and client "
-                        "IPC are unwritten";
+         * What exists and is measured: a ring-3 process gets its PORTS through
+         * a syscall, bounded by a kernel-side manifest and enforced by the
+         * CPU's I/O permission bitmap — a granted port reads, an ungranted one
+         * is a #GP that kills only that process.  It can claim an interrupt and
+         * block on it, and publish input events back.
+         *
+         * What does not: nothing PLACES a driver there.  The spawn path, MMIO
+         * mapping into the driver's own space and client reconnection are
+         * unwritten, so honouring `driver.<name>.domain = user` would be a
+         * promise rather than a placement.
+         *
+         * THE DISTINCTION IS THE DISCIPLINE.  A mechanism working in a test is
+         * not a placement being honoured, and reporting the first as the second
+         * is exactly the isolation theatre §M33 refuses by name.  Accepting
+         * `user` and running the driver in ring 0 anyway would leave the user
+         * believing in a boundary that is not there. */
+        if (why) *why = "the port/IRQ half of §M33 Tier 1 works (see `drvtest`) "
+                        "but nothing is PLACED there yet: the spawn path, MMIO "
+                        "mapping and client reconnection are unwritten";
         return -1;
 
     case DOMAIN_ISOLATED:

@@ -53,7 +53,8 @@ X86_USER_BLOBS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
                   user/threadtest_blob.o user/tlstest_blob.o \
                   user/posixtest_blob.o \
                   user/wlclient_blob.o user/wlapp_blob.o \
-                  user/redirtest_blob.o user/uidemo_blob.o
+                  user/redirtest_blob.o user/uidemo_blob.o \
+                  user/drvtest_blob.o
 # NB: linuxhello is deliberately NOT here — it hard-codes the i386 Linux syscall
 # numbers and `int 0x80`, which is the whole point of that program (it mimics an
 # unmodified 32-bit Linux binary).  The x86_64 equivalent would be a separate
@@ -658,6 +659,7 @@ CORE_C_SRCS := \
     kernel/core/domain.c \
     kernel/core/drvguard.c \
     kernel/core/drvrt.c \
+    kernel/core/drvuser.c \
     kernel/core/ksym.c \
     kernel/core/modload.c \
     kernel/core/config.c \
@@ -796,6 +798,7 @@ CORE_C_SRCS := \
     kernel/core/domain.c \
     kernel/core/drvguard.c \
     kernel/core/drvrt.c \
+    kernel/core/drvuser.c \
     kernel/core/ksym.c \
     kernel/core/modload.c \
     kernel/core/keymap.c \
@@ -881,6 +884,7 @@ CORE_C_SRCS := \
     kernel/core/domain.c \
     kernel/core/drvguard.c \
     kernel/core/drvrt.c \
+    kernel/core/drvuser.c \
     kernel/core/ksym.c \
     kernel/core/modload.c \
     kernel/core/config.c \
@@ -1443,6 +1447,15 @@ user/uidemo_$(ARCH).elf: user/libc.c user/uidemo.c user/libc.h $(USER_CRT0_SRC)
 	$(CC) $(USER_CFLAGS) -c user/uidemo.c  -o $(OBJ_DIR)/user/uidemo.o
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/uidemo.o $(OBJ_DIR)/user/libc.o
+
+
+user/drvtest_$(ARCH).elf: user/libc.c user/drvtest.c user/libc.h $(USER_CRT0_SRC)
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c     -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/drvtest.c  -o $(OBJ_DIR)/user/drvtest.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/drvtest.o $(OBJ_DIR)/user/libc.o
 
 
 user/redirtest_$(ARCH).elf: user/libc.c user/redirtest.c user/libc.h $(USER_CRT0_SRC)

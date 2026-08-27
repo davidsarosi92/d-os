@@ -1400,6 +1400,12 @@ static void schedule_locked(struct percpu* me) {
     hal_set_kernel_stack((next->user_task && next->kstack_base)
                          ? (uintptr_t)next->kstack_base + TASK_KSTACK_SZ
                          : 0);
+    /* §M33 Tier 1 — and the incoming task's PORT GRANT, for the same reason
+     * and at the same moment: a ring-3 IN/OUT after this point must consult
+     * this task's permission and not the previous one's.  NULL for everything
+     * that is not a user-mode driver, which is the unchanged default and the
+     * case the installer short-circuits. */
+    hal_set_io_bitmap(next->io_bitmap);
     /* M35 TLS — point this CPU's user-TLS segment base at the incoming
      * thread's thread-pointer, so its %gs-relative __thread accesses resolve
      * to its own block.  No-op if the task set no TLS.  (TLS threads are

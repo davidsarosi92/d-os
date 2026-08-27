@@ -151,6 +151,12 @@ struct task {
      * for kernel threads AND the excursion-model self-tests (proc_exec_elf),
      * which keep the fixed syscall stack + teleport-back. */
     int           user_task;
+    /* §M33 Tier 1 — this task's ring-3 port grant, or NULL for "no ports",
+     * which is every task that is not a user-mode driver.  Installed into the
+     * TSS on context switch.  A POINTER, not an inline array: the bitmap is
+     * 128 bytes and only a driver process ever has one, so paying for it in
+     * every struct task would be the cost of a feature almost nothing uses. */
+    void*         io_bitmap;
     /* §1.1 — set while this task is INSIDE a syscall entered from ring 3, i.e.
      * while its pointer arguments are USER pointers.  The sys_* handlers are
      * dual-use (an arch dispatcher calls them with ring-3 pointers, in-kernel

@@ -10111,9 +10111,66 @@ interrupt.  It was wrong — the harness runs every typed `--cmd` BEFORE any
 `--monitor-cmd`, so `drv res` had been asked before the mouse ever moved.  The
 comment was corrected; the number is what settled it, not the story.*
 
+**§M33 Tier 1, first half (2026-08-27) — a ring-3 process that may touch exactly
+its own ports.**  Not a driver placed in ring 3; the MECHANISM under one, built
+and falsified.
+
+**The grant is enforced by the CPU, not by a check.**  The TSS grew an I/O
+permission bitmap and `struct task` a pointer to one, installed on context
+switch.  Ports 0..0x3FF are covered and **everything above is denied by the
+segment limit** — by construction rather than by a test somebody has to
+remember.  That ceiling lines up with reality rather than limiting it: a PCI
+I/O BAR (AC97's sits near 0xC000) is not grantable, and every driver here with a
+high I/O BAR is a DMA driver, which cannot be isolated at all until there is an
+IOMMU.  A task with no grant gets `iomap_base` past the limit, which is exactly
+the behaviour that existed before §M33 — so the default is unchanged and
+provably so (ring-3 musl still runs on both x86 arches).
+
+**A request is bounded by a MANIFEST the driver did not write.**  Letting a
+driver process ask for its own resources would let it ask for the PIC's ports,
+or the other keyboard's — a smaller hole than ring 0 and still a hole, and one
+that could not be closed later without changing an interface drivers were
+already written against.  So `drvuser.c` holds a table (`ps2_mouse`: ports
+0x60..0x64, IRQ 12), the driver still asks through the same API, and the answer
+is bounded by something outside it.
+
+**Verified three ways, and the third is the one that matters** (`drvtest`, i386
+and x86_64, identical results):
+
+```
+drv-user: 'ps2_mouse' granted ports 60..64 in ring 3
+drvtest:  read 0x64 from ring 3 = 1c
+drv-user: 'ps2_mouse' asked for ports 3f8..3ff, manifest allows 60..64
+fault: user EXCEPTION 13 (General Protection) pid 15 cs:eip=1b:0x400000a2
+       — killing process
+```
+
+A granted port really reads from ring 3; an ungranted one is refused by the
+kernel; and a **raw `in` on a port that was never granted is a #GP** that kills
+only that process while the machine carries on.  *A grant that is merely
+recorded is a comment* — the test is that the hardware says no, and it is
+attempted last precisely because the pass IS the fault (§M62's lesson about a
+deliberate fault that quietly succeeds making a test whose pass and fail look
+identical).
+
+**`domain_enforceable()` still refuses `user`, and that is the point.**  The
+mechanism works; nothing PLACES a driver there yet — the spawn path, MMIO
+mapping into the driver's own space and client reconnection are unwritten.  *A
+mechanism working in a test is not a placement being honoured, and reporting the
+first as the second is the isolation theatre this milestone refuses by name.*
+The refusal message names exactly what is missing.
+
 ---
 
 ## 8. Change log
+
+- **2026-08-27 — §M33 Tier 1, first half: ring-3 port grants (DOCS §4.82).**
+  A TSS I/O permission bitmap per task, driver resource syscalls, and a
+  kernel-side manifest that bounds what a driver process may ask for.  Proven
+  three ways on both x86 arches, including a raw `in` on an ungranted port
+  taking a #GP that kills only that process.  `domain_enforceable` still
+  refuses `user`: the mechanism works, nothing is placed there yet, and saying
+  otherwise would be theatre.
 
 - **2026-08-27 — §M33 stage 2: the driver-runtime API (DOCS §4.82).**  The
   narrow waist — handles not pointers, offsets not addresses, a driver that

@@ -21,6 +21,7 @@
 #include "printf.h"
 #include "module.h"
 #include "driver.h"
+#include "drvuser.h"   /* §M33 Tier 1 — drvtest */
 #include "modload.h"   /* §M67 — insmod / rmmod / lsmod */
 #include "ksym.h"      /* §M67 — ksyms */
 #include "timer.h"
@@ -3128,6 +3129,39 @@ static void cmd_redirtest(void) {
     kprintf("redirtest: returned rc=%d\n", rc);
 }
 
+/* §M33 Tier 1 — `drvtest`: prove a ring-3 process gets exactly its granted
+ * ports, and faults on anything else.
+ *
+ * The process is ATTACHED to the ps2_mouse manifest before it runs and detached
+ * after: without that it holds no manifest and every resource syscall refuses,
+ * which is the default and is what every other ring-3 program sees. */
+extern const unsigned char _binary_user_drvtest_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_drvtest_elf_end[]   __attribute__((weak));
+
+static void cmd_drvtest(void) {
+    if (!_binary_user_drvtest_elf_start) {
+        console_write("drvtest: not embedded for this arch\n");
+        return;
+    }
+    /* proc_exec_elf runs it as an excursion on THIS task, so this task's pid is
+     * the one the syscalls will see. */
+    int pid = task_current() ? task_current()->pid : -1;
+    if (drvuser_attach(pid, "ps2_mouse") != 0) {
+        console_write("drvtest: could not attach the manifest\n");
+        return;
+    }
+    size_t len = (size_t)(_binary_user_drvtest_elf_end -
+                          _binary_user_drvtest_elf_start);
+    int rc = proc_exec_elf(_binary_user_drvtest_elf_start, len);
+    drvuser_detach(pid);
+    /* The task's grant goes with it — leaving a shell permitted to touch the
+     * 8042 after the test would be the dangling-grant shape of every other
+     * lifetime bug in this tree. */
+    if (task_current()) task_current()->io_bitmap = NULL;
+    hal_set_io_bitmap(NULL);
+    kprintf("drvtest: returned rc=%d\n", rc);
+}
+
 /* M36 — `linuxtest`: run a Linux-ABI program under the Linux personality
  * (task->linux_abi), routing its syscalls through the linux_abi translator. */
 extern const unsigned char _binary_user_linuxhello_elf_start[] __attribute__((weak));
@@ -4090,6 +4124,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "procspawn"))      { cmd_procspawn(); return; }
     if (streq(line, "runargs"))        { cmd_runargs(""); return; }
     if (starts_with(line, "runargs ")) { cmd_runargs(line + 8); return; }
+    if (streq(line, "drvtest"))        { cmd_drvtest(); return; }
     if (streq(line, "forktest"))       { cmd_forktest(); return; }
     if (streq(line, "forkexec"))       { cmd_forkexec(); return; }
     if (streq(line, "pipetest"))       { cmd_pipetest(); return; }

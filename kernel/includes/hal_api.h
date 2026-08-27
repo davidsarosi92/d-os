@@ -350,4 +350,20 @@ int hal_elf_can_exec(unsigned cls, unsigned machine);
 int hal_nvram_read(unsigned idx, uint8_t* out);   /* 1 = read, 0 = unavailable */
 int hal_nvram_write(unsigned idx, uint8_t val);   /* 1 = written               */
 
+/* ----------------------------------------------------------------------
+ * §M33 Tier 1 — per-task I/O port grant.
+ *
+ * Install `bm` (hal_io_bitmap_bytes() bytes, a 0 bit = permitted) as the
+ * running task's ring-3 port permission, or NULL for "no ports at all", which
+ * is every task that is not a user-mode driver.  Called from the context
+ * switch.
+ *
+ * ON AARCH64 THIS IS EMPTY AND THAT IS THE ANSWER, not a gap: the architecture
+ * has no port I/O, so there is no permission to grant.  A driver that needs
+ * ports there is a driver for hardware that machine does not have, and
+ * drv_ports_request already says DRV_ENOSYS.
+ * ---------------------------------------------------------------------- */
+void     hal_set_io_bitmap(const void* bm);
+uint32_t hal_io_bitmap_bytes(void);
+
 #endif

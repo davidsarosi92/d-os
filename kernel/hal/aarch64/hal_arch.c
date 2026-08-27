@@ -161,3 +161,16 @@ int hal_nvram_write(unsigned idx, uint8_t val) { (void)idx; (void)val; return 0;
 void hal_tlb_shootdown(uintptr_t root_phys, uintptr_t va) {
     (void)root_phys; (void)va;
 }
+
+/* =============================================================================
+ * §M33 Tier 1 — port grants.
+ *
+ * EMPTY, AND THAT IS THE ANSWER RATHER THAN A GAP.  aarch64 has no port I/O
+ * address space: there is no instruction to permit and nothing to put in a
+ * bitmap.  Everything a device exposes here is MMIO, and MMIO is granted by
+ * mapping it into the driver's address space — which is the page tables, not a
+ * TSS.  `drv_ports_request` already reports DRV_ENOSYS on this arch, so a
+ * driver finds out at the request rather than from a device that never answers.
+ * ============================================================================= */
+void     hal_set_io_bitmap(const void* bm) { (void)bm; }
+uint32_t hal_io_bitmap_bytes(void)         { return 0; }

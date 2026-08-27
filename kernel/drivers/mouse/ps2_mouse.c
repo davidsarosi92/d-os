@@ -138,6 +138,15 @@ static mouse_wheel_t wheel_listener = NULL;
 
 void mouse_set_wheel_listener(mouse_wheel_t fn) { wheel_listener = fn; }
 
+/* §M33 Tier 1 — the one place an event reaches the listeners, whoever decoded
+ * it.  The in-kernel packet assembler calls it, and so does the syscall a
+ * ring-3 driver publishes through: the input stack cannot tell which, which is
+ * the property that makes the placement a deployment decision. */
+void mouse_publish(int dx, int dy, unsigned buttons, int dz) {
+    if (listener) listener(dx, dy, buttons);
+    if (dz && wheel_listener) wheel_listener(dz);
+}
+
 /* Drain everything the controller has for us — one interrupt can cover more
  * than one buffered byte under load.  Runs on the mouse TASK now, not in
  * interrupt context, so calling the listener from here is an ordinary call
@@ -165,7 +174,7 @@ static void mouse_drain(void) {
         int dy = (int)pkt[2] - (int)((pkt[0] & 0x20) ? 0x100 : 0);
         unsigned buttons = pkt[0] & 0x07;        /* LB=1 RB=2 MB=4 — matches MOUSE_BTN_* */
 
-        if (listener) listener(dx, -dy, buttons);   /* flip: wire +Y is up */
+        int dz_ = 0;
 
         /* Byte 3 is a 4-bit signed Z delta (the upper nibble carries extra
          * buttons on 5-button mice — ignored).  Positive = wheel UP on the
@@ -173,7 +182,7 @@ static void mouse_drain(void) {
          * moves the content up, so it is passed through as-is and the consumer
          * decides.  Reported separately from motion because a wheel event is
          * not a movement: routing it as dy would move the cursor. */
-        if (pkt_len == 4 && wheel_listener) {
+        if (pkt_len == 4) {
             int dz = (int)(pkt[3] & 0x0F);
             if (dz & 0x08) dz -= 16;            /* 4-bit two's complement */
             /* NEGATED to match the documented contract (positive = wheel UP).
@@ -181,8 +190,9 @@ static void mouse_drain(void) {
              * this wire, so passing it through would scroll every list the
              * wrong way — and "the wheel works but goes backwards" is a bug
              * report nobody enjoys writing. */
-            if (dz) wheel_listener(-dz);
+            dz_ = -dz;
         }
+        mouse_publish(dx, -dy, buttons, dz_);   /* flip: wire +Y is up */
     }
 }
 
