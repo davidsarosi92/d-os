@@ -16,6 +16,7 @@
 
 #include <stdint.h>
 #include "uaccess.h"      /* §1.1 — fault-fixup table for EL0 memory copies */
+#include "drvguard.h"   /* §M33 Tier 0 — contain a driver fault */
 #include "task.h"
 #include "vmm.h"   /* §A1 — vmm_cow_fault on a write to a fork-shared page */
 #include "hal_api.h"
@@ -191,6 +192,29 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
             if ((tf->spsr & 0xF) != 0) {           /* came from EL1 (kernel) */
                 uintptr_t pc = (uintptr_t)tf->elr;
                 if (uaccess_fixup_lookup(&pc)) { tf->elr = (uint64_t)pc; return; }
+
+                /* §M33 Tier 0 — a fault INSIDE A DRIVER unwinds out of that
+                 * driver's entry point rather than reaching a policy that takes
+                 * the whole machine.  Next to the uaccess fixup because it is
+                 * the same idea with a bigger unit of recovery, and before any
+                 * policy so this class can never halt the box either.
+                 *
+                 * Refused when the driver held a lock — unwinding past one
+                 * deadlocks, which is worse than the panic it replaces. */
+                uintptr_t rip_ = 0, rarg_ = 0;
+                if (drvguard_recover(pc, &rip_, &rarg_)) {
+                    /* FAR_EL1 read here rather than reused: the COW branch's
+                     * copy is scoped to that block.  §A2's lesson applies to
+                     * reading it at all — a FAR of 0 looks exactly like a null
+                     * dereference and is not always one. */
+                    uint64_t fa = 0;
+                    __asm__ volatile ("mrs %0, far_el1" : "=r"(fa));
+                    drvguard_report((int)(esr >> 26), "EL1 abort", pc,
+                                    (uintptr_t)fa);
+                    tf->elr  = (uint64_t)rip_;
+                    tf->x[0] = (uint64_t)rarg_;   /* the pad reads its ctx from x0 */
+                    return;
+                }
             }
             /* §M46 — a fault taken FROM EL0 (user mode) must NEVER halt the box:
              * terminate the offending process and let the scheduler continue,

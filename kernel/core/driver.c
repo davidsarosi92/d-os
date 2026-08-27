@@ -21,6 +21,8 @@
 #include "config.h"
 #include "klog.h"
 #include "settings.h"
+#include "drvguard.h"    /* §M33 Tier 0 — guarded driver entry points */
+#include "domain.h"       /* §M33 — declared placement */
 #include <stddef.h>
 
 /* ----------------------------------------------------------------------
@@ -77,6 +79,43 @@ int driver_attach(struct driver* d) {
     return 0;
 }
 
+/* ----------------------------------------------------------------------
+ * §M33 Tier 0 — every driver entry point goes through the guard.
+ *
+ * Three one-line wrappers rather than each call site spelling out
+ * `drvguard_call(d, "init", d->ops->init, d->ctx)`: there are nine call sites
+ * in this file, and a guard applied to eight of them is a guard nobody can
+ * rely on.  One place per hook, and the hook's own NULL check lives inside
+ * drvguard_call.
+ *
+ * A FAULTED call is reported to the caller as a failure, which is what makes
+ * this transparent: `driver_start` already handles "init failed", so it needs
+ * no new case for "init died" — same path, different reason printed.
+ * ---------------------------------------------------------------------- */
+static int drv_probe(struct driver* d) {
+    if (!d->ops || !d->ops->probe) return 0;      /* no probe = always present */
+    int r = drvguard_call(d, "probe", d->ops->probe, d->ctx);
+    return (r == DRVGUARD_FAULTED) ? -1 : r;
+}
+
+static int drv_init(struct driver* d) {
+    if (!d->ops || !d->ops->init) return 0;
+    return drvguard_call(d, "init", d->ops->init, d->ctx);
+}
+
+/* Shutdown is guarded too, and it matters MORE than the others rather than
+ * less: it runs on the power-off path and from `rmmod`, so a fault there would
+ * take the machine down at exactly the moment the user asked it to stop
+ * cleanly.  A faulted shutdown is reported as a REFUSAL (non-zero), which is
+ * the safe reading — §M67 made a refusal mean "the driver is still live and its
+ * registrations still stand", and after a fault that is precisely what we do
+ * not know to be false. */
+static int drv_shutdown(struct driver* d) {
+    if (!d->ops || !d->ops->shutdown) return 0;
+    int r = drvguard_call(d, "shutdown", d->ops->shutdown, d->ctx);
+    return (r == DRVGUARD_FAULTED) ? -1 : r;
+}
+
 /* Stop every driver that came up, in REVERSE init order.
  *
  * WHY THIS FUNCTION HAD TO BE WRITTEN AT ALL: `driver_ops.shutdown` has been
@@ -106,12 +145,23 @@ void driver_shutdown_all(void) {
          * away either way, and refusing to shut down the OTHER drivers because
          * one is busy would be strictly worse.  It is COUNTED separately so the
          * line does not claim more than happened. */
-        if (sl->d->ops->shutdown(sl->d->ctx) != 0) { refused++; continue; }
+        if (drv_shutdown(sl->d) != 0) { refused++; continue; }
         sl->state &= (uint8_t)~DRV_S_INITED;
         stopped++;
     }
     if (refused) kprintf("drivers: %d stopped, %d still busy\n", stopped, refused);
     else         kprintf("drivers: %d stopped\n", stopped);
+}
+
+/* Walk the registry as it ACTUALLY is.  §M66 replaced the linker array with a
+ * slot table and §M67 started adding entries the linker never placed; anything
+ * still iterating `__start_drivers` is reporting a subset and calling it the
+ * whole.  /proc/drivers was doing exactly that. */
+int driver_count_all(void) { return (int)driver_count; }
+
+struct driver* driver_at(int i) {
+    if (i < 0 || (uint32_t)i >= driver_count) return NULL;
+    return g_slots[i].d;
 }
 
 uint8_t driver_state(const struct driver* d) {
@@ -151,7 +201,7 @@ void driver_init_all(void) {
 
         /* Probe — NULL probe means "always present". */
         if (d->ops && d->ops->probe) {
-            if (d->ops->probe(d->ctx) != 0) {
+            if (drv_probe(d) != 0) {
                 sl->state = DRV_S_PROBE_FAIL;
                 absent++;
                 continue;
@@ -162,7 +212,7 @@ void driver_init_all(void) {
 
         /* Init — NULL init means "no setup needed". */
         if (d->ops && d->ops->init) {
-            int r = d->ops->init(d->ctx);
+            int r = drv_init(d);
             if (r != 0) {
                 st |= DRV_S_INIT_FAIL;
                 sl->state = st;
@@ -281,7 +331,7 @@ int driver_stop(const char* name) {
      * its device was still live and still registered.  Harmless while every
      * driver was built in; a use-after-free the moment `rmmod` can free the
      * code behind it. */
-    if (d->ops->shutdown(d->ctx) != 0) {
+    if (drv_shutdown(d) != 0) {
         kprintf("drv: '%s' refused to stop — it is still in use\n", name);
         return -4;
     }
@@ -304,7 +354,7 @@ void driver_fault(const char* name, const char* why) {
      * down cleanly — and saying which of the two happened matters more than
      * pretending they are the same. */
     if ((sl->state & DRV_S_INITED) && d->ops && d->ops->shutdown &&
-        d->ops->shutdown(d->ctx) == 0) {
+        drv_shutdown(d) == 0) {
         sl->state &= (uint8_t)~DRV_S_INITED;
         kprintf("drv: '%s' stopped and quarantined\n", name);
     } else {
@@ -318,11 +368,28 @@ int driver_start(const char* name) {
     if (!d) { kprintf("drv: no driver '%s'\n", name); return -1; }
     struct drv_slot* sl = slot_of(d);
     if (!sl) return -1;
-    if (sl->state & DRV_S_INITED) {
+    /* QUARANTINE IS CHECKED BEFORE "already running", and the order is a bug
+     * fix rather than a preference.
+     *
+     * §M66's `driver_fault` can only clear INITED if the driver HAS a shutdown
+     * hook and that hook succeeds — for a driver with none (or one that
+     * refuses) the bit stays set even though the driver has demonstrably
+     * stopped working.  With the old order, `lsdrv` said QUARANTINED and
+     * `drv start` said "already running": two answers to one question, and the
+     * documented way to clear a quarantine did not work on exactly the drivers
+     * most likely to need it.
+     *
+     * An explicit start on a quarantined driver therefore RE-INITIALISES it.
+     * That is what the user asked for, and a driver that faulted is not in a
+     * state where "it is already running" means anything. */
+    if (sl->state & DRV_S_QUARANTINE) {
+        kprintf("drv: '%s' was quarantined — clearing and re-initialising\n", name);
+        sl->state &= (uint8_t)~DRV_S_INITED;
+    } else if (sl->state & DRV_S_INITED) {
         kprintf("drv: '%s' is already running\n", name);
         return -2;
     }
-    if (d->ops && d->ops->probe && d->ops->probe(d->ctx) != 0) {
+    if (drv_probe(d) != 0) {
         kprintf("drv: '%s' — hardware not present\n", name);
         sl->state |= DRV_S_PROBE_FAIL;
         return -3;
@@ -332,7 +399,7 @@ int driver_start(const char* name) {
      * makes quarantine a pause rather than a death sentence. */
     sl->state &= (uint8_t)~(DRV_S_PROBE_FAIL | DRV_S_INIT_FAIL |
                             DRV_S_QUARANTINE | DRV_S_ADMIN_DOWN);
-    if (d->ops && d->ops->init && d->ops->init(d->ctx) != 0) {
+    if (drv_init(d) != 0) {
         sl->state |= DRV_S_INIT_FAIL;
         kprintf("drv: '%s' failed to start\n", name);
         return -4;
@@ -355,8 +422,8 @@ int driver_rescan(void) {
         if (sl->state & DRV_S_INIT_FAIL) continue;
         if (sl->state & DRV_S_QUARANTINE) continue;   /* held back: faulted */
         if (sl->state & DRV_S_ADMIN_DOWN)  continue;   /* held back: by hand */
-        if (d->ops && d->ops->probe && d->ops->probe(d->ctx) != 0) continue;
-        if (d->ops && d->ops->init && d->ops->init(d->ctx) != 0) {
+        if (drv_probe(d) != 0) continue;
+        if (drv_init(d) != 0) {
             sl->state |= DRV_S_INIT_FAIL;
             continue;
         }
@@ -366,6 +433,169 @@ int driver_rescan(void) {
         started++;
     }
     return started;
+}
+
+
+/* ----------------------------------------------------------------------
+ * §M33 — where a driver is PLACED, and the honesty gate on asking.
+ *
+ * `driver_domain()` answers "where does this driver actually run", which today
+ * is always DOMAIN_KERNEL — but it answers it by RESOLVING config against the
+ * driver's declared set rather than by returning a constant, so the day Tier 1
+ * lands nothing above this function changes.
+ *
+ * The refusal ladder, in order, because each rung produces a different message
+ * and a user who hits one should not have to discover the next by trying again:
+ *   1. not a domain name at all
+ *   2. the driver did not DECLARE it (a property of the code — config cannot
+ *      widen a capability)
+ *   3. the driver is boot-critical (it exists before anywhere else exists)
+ *   4. this machine cannot ENFORCE it (domain.h's gate)
+ * ---------------------------------------------------------------------- */
+uint32_t driver_domain(const struct driver* d) {
+    if (!d) return DOMAIN_KERNEL;
+    const char* v = NULL;
+    /* `driver.<name>.domain`, looked up per driver.  A `driver.profile`
+     * (desktop|server) that sets many at once is §M33 stage 4 and wants a
+     * placement policy to be worth having; with one reachable domain it would
+     * be a key with one legal value. */
+    char key[64];
+    int n = 0;
+    const char* pfx = "driver.";
+    for (int i = 0; pfx[i] && n < (int)sizeof key - 1; i++) key[n++] = pfx[i];
+    for (int i = 0; d->name && d->name[i] && n < (int)sizeof key - 8; i++)
+        key[n++] = d->name[i];
+    const char* sfx = ".domain";
+    for (int i = 0; sfx[i] && n < (int)sizeof key - 1; i++) key[n++] = sfx[i];
+    key[n] = 0;
+
+    v = config_get(key, NULL);
+    if (!v) return DOMAIN_KERNEL;
+    uint32_t want = domain_parse(v);
+    if (!want) return DOMAIN_KERNEL;
+
+    /* A stored value that is no longer legal falls back to KERNEL rather than
+     * refusing to run the driver: the config may outlive a rebuild in which
+     * the driver stopped declaring a domain, and "your sound card does not
+     * come up because of a stale setting" is a bad way to find that out. */
+    uint32_t declared = d->domains ? d->domains : DOMAIN_KERNEL;
+    if (!(declared & want)) return DOMAIN_KERNEL;
+    if (domain_enforceable(want, NULL) != 0) return DOMAIN_KERNEL;
+    return want;
+}
+
+/* Ask for a placement.  Returns 0 if it was accepted and stored. */
+int driver_set_domain(const char* name, const char* domain_str) {
+    struct driver* d = driver_find(name);
+    if (!d) { kprintf("drv: no driver '%s'\n", name); return -1; }
+
+    uint32_t want = domain_parse(domain_str);
+    if (!want) {
+        kprintf("drv: '%s' is not a domain (kernel | user | isolated)\n",
+                domain_str ? domain_str : "");
+        return -2;
+    }
+
+    uint32_t declared = d->domains ? d->domains : DOMAIN_KERNEL;
+    if (!(declared & want)) {
+        char buf[40];
+        domain_set_str(declared, buf, sizeof buf);
+        kprintf("drv: '%s' does not declare domain '%s' — it declares %s\n",
+                name, domain_name(want), buf);
+        kprintf("     (a domain is a capability of the CODE; config chooses "
+                "among what the driver says it can do, and cannot widen it)\n");
+        return -3;
+    }
+
+    if (d->flags & DRVF_BOOT_CRITICAL) {
+        kprintf("drv: '%s' is boot-critical — it comes up before there is "
+                "anywhere else to put it\n", name);
+        return -4;
+    }
+
+    const char* why = NULL;
+    if (domain_enforceable(want, &why) != 0) {
+        kprintf("drv: cannot place '%s' in domain '%s' — %s\n",
+                name, domain_name(want), why ? why : "not available");
+        kprintf("     REFUSED rather than accepted and quietly run in the "
+                "kernel: a boundary you believe in and do not have is worse "
+                "than one you know you lack\n");
+        return -5;
+    }
+
+    char key[64];
+    int n = 0;
+    const char* pfx = "driver.";
+    for (int i = 0; pfx[i]; i++) key[n++] = pfx[i];
+    for (int i = 0; d->name[i] && n < (int)sizeof key - 8; i++) key[n++] = d->name[i];
+    const char* sfx = ".domain";
+    for (int i = 0; sfx[i]; i++) key[n++] = sfx[i];
+    key[n] = 0;
+    config_apply(key, domain_name(want));
+    kprintf("drv: '%s' will run in domain '%s' — restart it to apply\n",
+            name, domain_name(want));
+    return 0;
+}
+
+
+/* The placement table.  Shows the DECLARED set next to the resolved one, so
+ * "why can I not move this" is answerable from the same line as "where is it" —
+ * and the isolation column says what a placement would actually deliver, which
+ * for a DMA driver in ring 3 without an IOMMU is not what "user" sounds like. */
+void driver_domains_list(void) {
+    kprintf("driver placement (%u):\n", driver_count);
+    for (uint32_t i = 0; i < driver_count; i++) {
+        struct driver* d = g_slots[i].d;
+        char decl[40];
+        domain_set_str(d->domains ? d->domains : DOMAIN_KERNEL, decl, sizeof decl);
+        uint32_t at = driver_domain(d);
+        enum domain_isolation iso =
+            domain_isolation_of(at, (d->flags & DRVF_DMA) ? 1 : 0);
+        kprintf("  %s: at %s, can be %s, isolation %s%s%s\n",
+                d->name, domain_name(at), decl, domain_isolation_name(iso),
+                (d->flags & DRVF_BOOT_CRITICAL) ? ", boot-critical" : "",
+                (d->flags & DRVF_DMA) ? ", DMA" : "");
+    }
+    kprintf("faults contained so far: %u\n", drvguard_fault_count());
+}
+
+/* ----------------------------------------------------------------------
+ * `drv crash <name>` — make a driver fault ON PURPOSE, inside a guarded entry
+ * point, so Tier 0's containment can be falsified rather than asserted.
+ *
+ * IT MUST FAULT FOR REAL, and getting that right needed §M62's lesson: writing
+ * to a low address does NOT fault here, because low memory is identity-mapped
+ * — the first version of that milestone's test "succeeded" silently and the
+ * feature looked fine for the innocent reason that nothing had crashed.  So
+ * the address is deliberately far outside anything this kernel maps.
+ *
+ * It runs through `drvguard_call` rather than faulting inline, because what is
+ * being tested is the GUARD, not the fault: a fault outside a guarded call is
+ * the old behaviour and would prove nothing about the new one.
+ * ---------------------------------------------------------------------- */
+static int crash_victim(void* ctx) {
+    (void)ctx;
+    /* Volatile so the compiler cannot decide this is undefined and elide it —
+     * a test that gets optimised away passes by not running. */
+    volatile unsigned* p = (volatile unsigned*)(uintptr_t)0xDEAD0000u;
+    *p = 0x1234;                 /* unmapped on every arch here */
+    return 0;                    /* never reached */
+}
+
+void driver_crash(const char* name) {
+    while (name && *name == ' ') name++;
+    if (!name || !*name) { kprintf("drv: crash <name>\n"); return; }
+    struct driver* d = driver_find(name);
+    if (!d) { kprintf("drv: no driver '%s'\n", name); return; }
+
+    kprintf("drv: making '%s' fault on purpose (inside a guarded call)\n", name);
+    int r = drvguard_call(d, "crash-test", crash_victim, d->ctx);
+    if (r == DRVGUARD_FAULTED)
+        kprintf("drv: contained — '%s' faulted and the call unwound; "
+                "we are still here\n", name);
+    else
+        kprintf("drv: NOT CONTAINED — the call returned %d without faulting, "
+                "so this proved nothing\n", r);
 }
 
 void driver_cmd(const char* args) {
@@ -409,8 +639,25 @@ void driver_cmd(const char* args) {
             kprintf("drv: '%s' did not start — nothing is bound now\n", args);
         return;
     }
+    if (str_eq(verb, "domain")) {
+        char a[24]; n = 0;
+        while (*args && *args != ' ' && n < (int)sizeof a - 1) a[n++] = *args++;
+        a[n] = 0;
+        while (*args == ' ') args++;
+        if (!a[0]) { driver_domains_list(); return; }
+        if (!*args) { kprintf("drv: domain <name> <kernel|user|isolated>\n"); return; }
+        driver_set_domain(a, args);
+        return;
+    }
+    /* §M33 Tier 0's own falsification.  `drv fault` REPORTS a fault somebody
+     * else noticed; this one MAKES the driver actually fault, inside a guarded
+     * entry point, which is the only way to find out whether the containment
+     * works.  A safety net nobody has fallen into is a safety net nobody has
+     * tested — §M31's argument for `hardlock`, one layer over. */
+    if (str_eq(verb, "crash")) { driver_crash(args); return; }
+
     kprintf("drv: list | rescan | stop <name> | start <name> | swap <from> <to>"
-            " | fault <name>\n");
+            " | fault <name> | domain [<name> <where>] | crash <name>\n");
 }
 
 /* ----------------------------------------------------------------------

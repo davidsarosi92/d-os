@@ -442,4 +442,9 @@ static const struct driver_ops vblk_ops = {
     .shutdown = NULL,
 };
 
-DRIVER(virtio_blk, "block", &vblk_ops, NULL);
+/* BOOT-CRITICAL: the root volume is mounted through this driver before there
+ * is any process substrate to move it into, and DMA-capable: the device writes
+ * into memory by itself, so ring 3 without an IOMMU would be a placement, not
+ * an isolation. */
+DRIVER_EX(virtio_blk, "block", &vblk_ops, NULL,
+          DOMAIN_KERNEL, DRVF_BOOT_CRITICAL | DRVF_DMA);

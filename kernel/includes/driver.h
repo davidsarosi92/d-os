@@ -30,6 +30,7 @@
 
 #include <stdint.h>
 #include "version.h"        /* DOS_VERSION — the default per-driver version */
+#include "domain.h"         /* §M33 — DOMAIN_* / the declared placement set */
 
 /* Per-driver lifecycle hooks.  All can be NULL — a missing probe means
  * "always present", a missing init means "nothing to initialize", a
@@ -72,7 +73,41 @@ struct driver {
     const struct driver_ops* ops;
     void*                    ctx;
     const char*              version;       /* defaults to DOS_VERSION (see DRIVER) */
+
+    /* ---- §M33 execution domains --------------------------------------------
+     * `domains` is a CAPABILITY OF THE CODE: which domains this driver is
+     * WRITTEN to survive in.  Config chooses among the declared set and can
+     * never widen it — see domain.h for why the two halves are separate.
+     *
+     * DEFAULT IS KERNEL-ONLY, and that default is doing real work: every
+     * driver in this tree calls `outb`/`kmalloc`/`irq_install` directly, so
+     * none of them can run in ring 3 as written.  A driver claiming
+     * DOMAIN_USER must have been ported to the driver-runtime API, and until
+     * that API exists nothing may claim it.
+     *
+     * `flags` carries the facts a placement policy needs and cannot infer:
+     * whether the driver is boot-critical (it comes up before the process and
+     * IPC substrate exists, so it can never be moved), and whether it drives
+     * DMA (which decides whether ring 3 is isolation or theatre).
+     *
+     * APPENDED AT THE END, and that is a rule rather than a habit: every
+     * `struct driver` in this tree is a POSITIONAL initialiser inside a macro,
+     * and §M58's scar is a field added in the MIDDLE silently re-binding every
+     * one of them by a slot.  New fields go last. */
+    uint32_t                 domains;       /* 0 means DOMAIN_KERNEL (see DRIVER) */
+    uint32_t                 flags;
 };
+
+/* Cannot be moved anywhere, ever: this driver comes up before there IS a
+ * process substrate to move it into.  The console, the timer, the interrupt
+ * controller and the boot disk are the chicken-and-egg set — they must not
+ * appear in a placement list at all, because offering a choice that cannot be
+ * honoured is worse than offering none. */
+#define DRVF_BOOT_CRITICAL  0x01
+/* Programs a device that writes to memory on its own.  Decides whether a
+ * placement outside ring 0 is ISOLATION or ADVISORY: without an IOMMU the
+ * device can DMA over kernel memory whatever ring its driver sits in. */
+#define DRVF_DMA            0x02
 
 /* Boundary symbols emitted by linker.ld around the `drivers` section. */
 extern struct driver __start_drivers[];
@@ -152,6 +187,31 @@ int driver_rescan(void);
  * shell, so the ARM serial REPL runs the same one (§M24's rule). */
 void driver_cmd(const char* args);
 
+/* ----------------------------------------------------------------------
+ * §M33 — execution domains.
+ * ---------------------------------------------------------------------- */
+
+/* Where this driver actually runs.  RESOLVED from config against the driver's
+ * declared set and the machine's ability to enforce it — not a constant, so
+ * nothing above this call has to change when a second domain becomes real. */
+uint32_t driver_domain(const struct driver* d);
+
+/* Ask for a placement.  0 if accepted (and stored); negative with a printed
+ * reason otherwise.  Refuses a domain the driver did not declare, a
+ * boot-critical driver, and a domain this machine cannot enforce — the last
+ * being the honesty gate: a boundary you believe in and do not have is worse
+ * than one you know you lack. */
+int  driver_set_domain(const char* name, const char* domain_str);
+
+/* The placement table: declared set, resolved domain, and what isolation that
+ * would actually deliver. */
+void driver_domains_list(void);
+
+/* Make a driver fault on purpose inside a guarded entry point, so §M33 Tier 0's
+ * containment can be falsified.  A safety net nobody has fallen into is one
+ * nobody has tested (§M31's argument for `hardlock`). */
+void driver_crash(const char* name);
+
 /* Per-driver state bits exposed in case future code wants to query without
  * going through the human-readable list. */
 #define DRV_S_PROBED      0x01  /* probe() returned 0 (or NULL probe) */
@@ -180,10 +240,22 @@ void driver_cmd(const char* args);
 
 uint8_t driver_state(const struct driver* d);
 
+/* Walk the registry including drivers the linker did not place (§M67 modules).
+ * Anything iterating `__start_drivers` directly is reporting a subset. */
+int             driver_count_all(void);
+struct driver*  driver_at(int i);
+
 /* Macro hygiene mirrors MODULE() in module.h — `aligned(4)` must match
  * `sizeof(struct driver)` to keep array-stride iteration correct.  See the
  * file-level comment for the M2 lesson learned. */
 #define DRIVER(_name, _class, _ops_ptr, _ctx_ptr)                         \
+    DRIVER_EX(_name, _class, _ops_ptr, _ctx_ptr, DOMAIN_KERNEL, 0)
+
+/* The full form, for a driver that has something to declare.  The plain
+ * DRIVER() above stays the common case on purpose — a driver that says nothing
+ * gets kernel-only placement and no special flags, which is the truth for
+ * every driver written before §M33. */
+#define DRIVER_EX(_name, _class, _ops_ptr, _ctx_ptr, _domains, _flags)    \
     static const struct driver                                            \
     __attribute__((used, section("drivers"), aligned(4)))                 \
     __drv_def_##_name = {                                                 \
@@ -192,6 +264,8 @@ uint8_t driver_state(const struct driver* d);
         .ops     = (_ops_ptr),                                            \
         .ctx     = (_ctx_ptr),                                            \
         .version = DOS_VERSION,                                           \
+        .domains = (_domains),                                            \
+        .flags   = (_flags),                                              \
     }
 
 #endif

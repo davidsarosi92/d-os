@@ -117,7 +117,8 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/boot.s \
       kernel/hal/x86/isr_stubs.s \
       kernel/hal/x86/usermode.s \
-      kernel/hal/x86/switch.s
+      kernel/hal/x86/switch.s \
+      kernel/hal/x86/drvguard_arch.s
 
   ARCH_EXTRA_OBJS := kernel/hal/x86/ap_trampoline_blob.o $(X86_USER_BLOBS) \
                      user/linuxhello_blob.o
@@ -315,6 +316,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/boot.s \
       kernel/hal/x86_64/isr_stubs.s \
       kernel/hal/x86_64/switch.s \
+      kernel/hal/x86_64/drvguard_arch.s \
       kernel/hal/x86_64/usermode.s \
       kernel/hal/x86_64/syscall_entry.s
 
@@ -560,6 +562,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/boot.S \
       kernel/hal/aarch64/vectors.S \
       kernel/hal/aarch64/switch.S \
+      kernel/hal/aarch64/drvguard_arch.S \
       kernel/hal/aarch64/smp_entry.S \
       kernel/hal/aarch64/usermode.S
 
@@ -652,6 +655,8 @@ CORE_C_SRCS := \
     kernel/core/console.c \
     kernel/core/module.c \
     kernel/core/driver.c \
+    kernel/core/domain.c \
+    kernel/core/drvguard.c \
     kernel/core/ksym.c \
     kernel/core/modload.c \
     kernel/core/config.c \
@@ -787,6 +792,8 @@ CORE_C_SRCS := \
     kernel/core/block_cache.c \
     kernel/core/config.c \
     kernel/core/driver.c \
+    kernel/core/domain.c \
+    kernel/core/drvguard.c \
     kernel/core/ksym.c \
     kernel/core/modload.c \
     kernel/core/keymap.c \
@@ -869,6 +876,8 @@ CORE_C_SRCS := \
     kernel/core/console.c \
     kernel/core/module.c \
     kernel/core/driver.c \
+    kernel/core/domain.c \
+    kernel/core/drvguard.c \
     kernel/core/ksym.c \
     kernel/core/modload.c \
     kernel/core/config.c \

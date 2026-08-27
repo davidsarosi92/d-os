@@ -121,6 +121,7 @@ when sections are added.)
 | 4.79 | A desktop you can arrange: drag, keyboard, slots (§M64 tail) | 8800 |
 | 4.80 | Driver agility: lifecycle, hot-plug, quarantine (§M66) | 8950 |
 | 4.81 | Loadable driver modules (§M67) | 9650 |
+| 4.82 | Execution domains + Tier 0 driver fault containment (§M33) | 9900 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -9892,7 +9893,188 @@ makes the finding specific.
 
 ---
 
+### 4.82 Execution domains, and a driver fault that is not a dead machine (§M33 Tier 0)
+
+**2026-08-27.**  §M33's first two stages: the DECLARED placement capability with
+its honesty gate, and Tier 0 — fault containment for drivers.  Tier 1 (a driver
+in ring 3) and Tier 2 (plus an IOMMU) are not built, and the code says so out
+loud rather than leaving it to a reader to notice.
+
+#### The declaration, and why the two halves are separate
+
+`.domains` on `struct driver` is a **capability of the CODE** — "this driver is
+written so that it *could* run in ring 3".  The config key
+`driver.<name>.domain` is a **deployment decision** that picks among the
+declared set and cannot widen it.
+
+Without the first half, config could ask for something the code cannot do and
+the failure would arrive at runtime, in the field, on somebody else's machine.
+With it, the refusal happens at the moment of asking and names the reason —
+four different reasons, in order, because a user who clears one should not have
+to discover the next by trying again:
+
+```
+drv: 'ac97' does not declare domain 'user' — it declares kernel
+     (a domain is a capability of the CODE; config chooses among what the
+      driver says it can do, and cannot widen it)
+drv: 'virtio_blk' is boot-critical — it comes up before there is anywhere
+     else to put it
+```
+
+**Every driver in the tree declares KERNEL only, and that default is doing real
+work.**  They all call `outb` / `kmalloc` / `irq_install` directly, so none of
+them can run in ring 3 as written; a driver may claim `DOMAIN_USER` only once it
+has been ported to the driver-runtime API, and that API does not exist yet.
+
+**THE HONESTY GATE.**  `domain_enforceable()` is the single place that knows
+what is real, so `user` and `isolated` are **refused with the reason** rather
+than accepted and quietly run in the kernel:
+
+```
+drv: cannot place 'x' in domain 'user' — no user-mode driver backend yet
+     (§M33 Tier 1): port grants, MMIO mapping, IRQ forwarding and client IPC
+     are unwritten
+     REFUSED rather than accepted and quietly run in the kernel: a boundary
+     you believe in and do not have is worse than one you know you lack
+```
+
+One function, so the day Tier 1 lands there is one place to change and every
+caller inherits it — three copies of that test would be three chances for one of
+them to still be refusing after the thing became possible.
+
+**"Allowed" and "isolated" are kept as separate questions**, because the DMA
+case is exactly where they diverge: a DMA-capable driver in ring 3 is *allowed*
+(once Tier 1 exists) and is *not isolated* until an IOMMU constrains the device.
+A single boolean would have to pick one of those to report, and either choice
+misleads.  `/proc/drivers` therefore carries both, and `virtio_blk`, `xhci`,
+`ac97`, `hda` and `virtio_net` are marked `DRVF_DMA`.
+
+#### Tier 0 — the uaccess fixup, one level up
+
+Before this, a fault inside a driver was a ring-0 fault: `kernel.fault_policy`,
+i.e. halt, reboot, or kill the kthread.  All three take the system with them for
+what may be one broken sound card.
+
+§M46 gave the kernel an exception table — a fault at a known instruction resumes
+at a known fixup, which is how a user pointer that goes bad mid-copy returns
+`-EFAULT`.  Tier 0 is the same idea with a bigger unit of recovery: *abandon
+this whole call and return an error to whoever made it.*
+
+`drvguard_call()` saves the callee-saved registers, the stack pointer and a
+landing address into a per-CPU slot and then calls the driver.  The ring-0 fault
+handler consults that slot **next to the uaccess fixup and before any policy**,
+and on a hit rewrites the trap frame to resume in an assembly landing pad which
+restores the saved state and returns a failure code up the ordinary C return
+path.  All nine driver entry-point call sites in `driver.c` go through three
+one-line wrappers — a guard applied to eight of nine is a guard nobody can rely
+on.
+
+**Why a landing pad rather than just editing the frame.**  A same-privilege
+`iret` on i386 pops only EIP/CS/EFLAGS, and the `pusha` slot for ESP is the one
+`popa` throws away — there is no way to restore the faulting stack through the
+frame.  So the handler returns *to the pad*, still on the interrupted stack, and
+the pad switches SP itself.  `iretq` on x86_64 would not need the indirection
+and aarch64's `eret` would; all three use the same shape anyway, so a reader who
+has understood one has understood all three.
+
+**THE GUARD THAT MAKES UNWINDING SAFE, and it is load-bearing.**  Unwinding out
+of a call that HOLDS A LOCK would leave it held forever, and *a deadlocked
+machine is worse than a panicked one, because a panic says what happened.*  So
+recovery is REFUSED when the preemption count has moved since the guard was
+armed — this tree's spinlocks disable preemption, so a changed count is exactly
+"the driver took a lock and has not released it".  The fault then falls through
+to the old policy, which is the correct outcome: the system genuinely cannot
+continue, and it says so.
+
+#### WHAT THIS IS NOT, and it is not a footnote
+
+**Tier 0 is not memory isolation and must never be described as any.**  The
+driver runs in ring 0 in the one address space, and by the time a fault is taken
+the wild write has already happened.  What is contained is the CONSEQUENCE of
+the trap-style failures — a null dereference, a bad pointer, a divide by zero —
+which are the common ones, and they go from "the box is gone" to "that driver is
+gone".  The reason to keep repeating it is that a mechanism which catches faults
+LOOKS like isolation from outside.
+
+**IRQ handlers are deliberately not guarded.**  A fault in interrupt context has
+no caller to unwind to — there is an interrupted victim with nothing to do with
+the driver — and pretending otherwise would return control to a random stack.  A
+faulting IRQ handler is still a panic; making it not one is Tier 1's job, where
+there is a process to kill.
+
+#### Two bugs found on the way
+
+**`/proc/drivers` was reporting a subset and calling it the whole.**  It indexed
+`__start_drivers` directly, which §M66 turned into part of the truth and §M67
+made actively wrong — a driver loaded from a module is not in that array at all,
+so the view silently omitted exactly the drivers most likely to be under
+investigation.  It walks the slot table now (`driver_at`).
+
+**`lsdrv` and `drv start` gave two answers to one question.**  §M66's
+`driver_fault` can only clear INITED if the driver HAS a shutdown hook and that
+hook succeeds; for one with none the bit stays set although the driver has
+demonstrably stopped working.  So `lsdrv` said `QUARANTINED` while `drv start`
+said *"already running"* — and the documented way to clear a quarantine did not
+work on precisely the drivers most likely to need it.  Quarantine is now checked
+BEFORE "already running", and an explicit start re-initialises.
+
+#### Verified — by making drivers actually fault
+
+`drv crash <name>` faults on purpose INSIDE a guarded entry point, because a
+safety net nobody has fallen into is one nobody has tested (§M31's argument for
+`hardlock`).  It writes to `0xDEAD0000` rather than to a low address: §M62 found
+that `*(int*)0x4 = …` does **not** fault here — low memory is identity-mapped —
+so its deliberate fault succeeded silently and the test's pass and fail looked
+identical.
+
+**All three arches**, and the whole chain each time: the report names the driver
+and the entry point, §M66 quarantines it, §M47 records it (the Crash Reports
+window opens if `crash.report` is on), the call unwinds, and the shell answers
+afterwards.
+
+```
+!! DRIVER FAULT contained — 'null' died in crash-test: exception 14
+   (Page Fault) at pc=0x0011b288 addr=0xdead0000
+   the driver is quarantined; the system is still running
+drv: contained — 'null' faulted and the call unwound; we are still here
+...
+  [char] null v0.47.1 — QUARANTINED
+drv: 'null' was quarantined — clearing and re-initialising
+  [char] null v0.47.1 — OK
+uptime: 0:00:23.049
+```
+
+On **aarch64 the victim was a LOADED MODULE** (`loopback.ko`), which is a
+compound proof: §M67's loader put the code there and §M33's guard caught its
+fault.  `/proc/drivers`'s `faults-contained` goes 0 → 1 across a crash.
+
+**And §M67's automatic ABI check earned its keep the same day, unprompted.**
+`struct driver` grew two fields here, so `sizeof` went 20 → 28 on i386, and the
+stale-module fixture is now refused with *"struct driver is 28 bytes here, 32 in
+the module"* — a number nobody updated by hand.  That is the half of the version
+check that cannot be forgotten, catching a real change made a milestone later.
+
+**Open (the rest of §M33):** Tier 1 — the driver-runtime API and its user-mode
+backend, and a first non-DMA driver in ring 3; stage 5 — an IOMMU driver,
+without which a DMA driver outside the kernel is placement rather than
+isolation; Tier 2 — DMA drivers in ring 3 with client reconnection, which is the
+genuinely pervasive part.  `driver.profile` (desktop|server) is deliberately
+absent: with one reachable domain it would be a key with one legal value.
+
+---
+
 ## 8. Change log
+
+- **2026-08-27 — §M33 Tier 0: execution domains + driver fault containment
+  (DOCS §4.82).**  A driver's placement becomes a DECLARED capability of the
+  code that config chooses among and cannot widen, with `user`/`isolated`
+  REFUSED and the reason named rather than accepted and quietly run in the
+  kernel.  And Tier 0: a fault inside a driver entry point unwinds out of that
+  entry point — §M46's uaccess fixup with a bigger unit of recovery — so §M66
+  quarantines the driver and the machine keeps running.  Refused when the
+  driver held a lock, because a deadlocked machine is worse than a panicked
+  one.  Proven on all three arches with `drv crash`, on aarch64 against a
+  loaded module.  NOT memory isolation, and the code says so.
 
 - **2026-08-27 — §M67: loadable driver modules (DOCS §4.81).**  A relocatable
   ELF object on disk becomes a driver the registry cannot tell apart from a

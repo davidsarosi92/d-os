@@ -20,6 +20,72 @@ focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+◐ **§M33 TIER 0 — A DRIVER FAULT IS NO LONGER A DEAD MACHINE (2026-08-27, DOCS
+§4.82, all 3 arches).**  Stages 1-2 of §M33: the DECLARED placement capability
+and fault containment.  **`.domains` IS A CAPABILITY OF THE CODE**, `driver.
+<name>.domain` is a DEPLOYMENT DECISION that picks among the declared set and
+**cannot widen it** — without that split, config could ask for something the
+code cannot do and the failure would land at runtime on somebody else's
+machine.  Every driver here declares KERNEL only and *that default is doing real
+work*: they all call `outb`/`kmalloc`/`irq_install` directly, so none can run in
+ring 3 as written.  **THE HONESTY GATE: `user`/`isolated` are REFUSED WITH THE
+REASON**, never accepted and quietly run in the kernel — *a boundary you believe
+in and do not have is worse than one you know you lack* (§M33's own "isolation
+theatre", §M23's argument for three sound icons rather than two).  ONE function
+knows what is real (`domain_enforceable`), so Tier 1 is one edit and every
+caller inherits it; three copies would be three chances for one to keep refusing
+after the thing became possible.  **"ALLOWED" AND "ISOLATED" ARE SEPARATE
+QUESTIONS** because the DMA case is where they diverge — a DMA driver in ring 3
+is allowed and is NOT isolated until an IOMMU exists, and a single boolean would
+have to pick one of those to report.  **TIER 0 IS §M46's UACCESS FIXUP WITH A
+BIGGER UNIT OF RECOVERY:** instead of "resume at the next instruction", *abandon
+this whole call and return an error to whoever made it*.  A per-CPU saved
+context, checked in the ring-0 fault handler NEXT TO the uaccess fixup and
+BEFORE any policy; on a hit the trap frame is rewritten to resume in an assembly
+landing pad that restores the stack and returns a failure up the ordinary C
+path.  **A LANDING PAD RATHER THAN JUST EDITING THE FRAME** because a
+same-privilege `iret` on i386 pops only EIP/CS/EFLAGS and the `pusha` ESP slot
+is the one `popa` discards — the stack cannot be restored through the frame; all
+three arches use the same shape so one reading serves for all.  All NINE entry
+points go through three wrappers — *a guard applied to eight of nine is a guard
+nobody can rely on*.  **THE LOCK CHECK IS LOAD-BEARING:** recovery is REFUSED
+when the preempt count moved since arming (this tree's spinlocks disable
+preemption, so a changed count IS "the driver holds a lock"), and the fault
+falls through to the old policy — *a deadlocked machine is worse than a panicked
+one, because a panic says what happened.*  **WHAT IT IS NOT, and not as a
+footnote: NOT MEMORY ISOLATION.**  Ring 0, one address space, and the wild write
+has already happened by the time the trap fires; what is contained is the
+CONSEQUENCE of the trap-style failures.  *A mechanism that catches faults LOOKS
+like isolation from outside, which is why it is written down three times.*  IRQ
+handlers are deliberately UNGUARDED — a fault in interrupt context has no caller
+to unwind to, and pretending otherwise returns control to a random stack.
+**TWO BUGS FOUND ON THE WAY:** `/proc/drivers` indexed `__start_drivers`
+directly, so **a module-loaded driver was missing from it entirely** — it was
+reporting a subset and calling it the whole, and the missing ones are exactly
+those most likely to be under investigation; and `lsdrv` said `QUARANTINED`
+while `drv start` said **"already running"** — §M66's `driver_fault` can only
+clear INITED via a shutdown hook, so for a driver with none the documented way
+to clear a quarantine did not work on precisely the drivers most likely to need
+it.  **VERIFIED BY MAKING DRIVERS ACTUALLY FAULT:** new `drv crash <name>`
+faults INSIDE a guarded call (*a safety net nobody has fallen into is one nobody
+has tested* — §M31's `hardlock`), writing to `0xDEAD0000` and **not** a low
+address, because §M62 found `*(int*)0x4 =` does not fault here (low memory is
+identity-mapped) and its test's pass and fail therefore looked identical.  On
+all three arches the whole chain runs: the report names the driver AND the entry
+point, §M66 quarantines, §M47 records, the call unwinds, `drv start` revives it,
+and the shell answers afterwards — **on aarch64 the victim was a LOADED MODULE
+(`loopback.ko`), so §M67 put the code there and §M33 caught its fault.**  **AND
+§M67's AUTOMATIC ABI CHECK EARNED ITS KEEP UNPROMPTED:** `struct driver` grew
+two fields here, `sizeof` went 20 → 28 on i386, and the stale fixture is refused
+with *"struct driver is 28 bytes here, 32 in the module"* — **a number nobody
+updated by hand**, catching a real change made a milestone later.  **OPEN:**
+Tier 1 (the driver-runtime API + its user-mode backend + a first non-DMA driver
+in ring 3) — what `domain_enforceable` is waiting for; stage 5 (an IOMMU, without
+which a DMA driver outside the kernel is placement not isolation); Tier 2 (DMA
+drivers in ring 3 with CLIENT RECONNECTION, the genuinely pervasive part).
+`driver.profile` is deliberately absent — with one reachable domain it would be
+a key with one legal value.  **NEXT: §M32 multi-user.**
+
 ✅ **§M67 — A DRIVER THAT IS NOT IN THE KERNEL IMAGE (2026-08-27, DOCS §4.81,
 all 3 arches).**  §M66 left `driver_attach()` as an entry point with no caller;
 this fills it — a relocatable ELF object on disk becomes a `struct driver` the

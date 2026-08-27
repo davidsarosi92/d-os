@@ -31,6 +31,7 @@
 #include "pci.h"
 #include "config.h"
 #include "uaccess.h"   /* §1.1 — fault-fixup table for user copies */
+#include "drvguard.h"  /* §M33 Tier 0 — contain a driver fault */
 #include <stdint.h>
 
 /* --------------------------------------------------------------------------
@@ -477,6 +478,25 @@ void isr_handler(struct int_frame* f) {
         if ((f->cs & 3) == 0) {
             uintptr_t pc = (uintptr_t)f->eip;
             if (uaccess_fixup_lookup(&pc)) { f->eip = (uint32_t)pc; return; }
+
+            /* §M33 Tier 0 — a fault INSIDE A DRIVER unwinds out of that
+             * driver's entry point instead of reaching a fault policy that
+             * takes the whole machine.  Checked here, next to the uaccess
+             * fixup, because it is the same idea with a bigger unit of
+             * recovery — and before any policy, so this class can never halt
+             * the box either.
+             *
+             * Refused (returns 0, falls through) when the driver was holding a
+             * lock: unwinding past a held lock deadlocks, which is worse than
+             * the panic it would replace.  See drvguard.h. */
+            uintptr_t rip_ = 0, rarg_ = 0;
+            if (drvguard_recover(pc, &rip_, &rarg_)) {
+                drvguard_report(f->int_no, exception_name[f->int_no],
+                                pc, (uintptr_t)_cr2);
+                f->eip = (uint32_t)rip_;
+                f->eax = (uint32_t)rarg_;     /* the pad reads its ctx from EAX */
+                return;
+            }
         }
 
         /* §M46/M34 — a fault that happened in RING 3 (CS low 2 bits == 3) must

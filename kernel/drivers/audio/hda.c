@@ -720,9 +720,11 @@ static struct driver hda_driver = {
     .ops     = &hda_ops,
     .ctx     = NULL,
     .version = DOS_VERSION,
+    .domains = DOMAIN_KERNEL,
+    .flags   = DRVF_DMA,       /* the BDL is physical addresses the card reads */
 };
 
 DOS_MODULE("hda", &hda_driver, NULL, NULL);
 #else
-DRIVER(hda, "audio", &hda_ops, NULL);
+DRIVER_EX(hda, "audio", &hda_ops, NULL, DOMAIN_KERNEL, DRVF_DMA);
 #endif

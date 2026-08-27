@@ -179,6 +179,8 @@ static struct driver lo_driver = {
     .ops     = &lo_ops,
     .ctx     = NULL,
     .version = DOS_VERSION,
+    .domains = DOMAIN_KERNEL,
+    .flags   = 0,              /* no hardware at all: nothing to DMA with */
 };
 
 DOS_MODULE("loopback", &lo_driver, NULL, NULL);

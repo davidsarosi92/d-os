@@ -258,7 +258,7 @@ what); a session can pick a theme and push on it.
 | M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | ✅ DOCS §4.23 |
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | ✅ DOCS §4.22 (L1+L2; L3 HW deferred) |
 | M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation | Security | §M32 |
-| M33 | Execution domains — a service's run location (kernel / user / isolated) as a declared capability + config choice; driver placement (fault-tolerant → user-mode isolation) is the flagship case | Reliability | §M33 |
+| M33 | Execution domains — a service's run location as a declared capability + config choice; driver placement is the flagship case | Reliability | ◐ Tier 0 + the declaration shipped 2026-08-27, DOCS §4.82; Tier 1/2 open |
 | **M46** | **Resilient control plane — SAK hotkeys + force-kill** — Ctrl+Alt+Del = always-live Task Manager, Ctrl+Alt+X = kill last/frozen app, window chrome (close/min/restore) works even when the app is wedged (close ⇒ force-kill), Task Manager force-quit; the enabler is a real force-kill of a wedged ring-3 process | Reliability / UX | ✅ DOCS §4.37 |
 | M58 | Text selection — pointer grab + press/motion/release, selection model (text bytes / terminal cells), word + line selection | UX | §M58 |
 | M59 | Clipboard, system-wide — typed offers, ring-3 ops + `/dev/clipboard`, Wayland `wl_data_device`, primary selection | UX | §M59 (wants §M58) |
@@ -3143,7 +3143,36 @@ the GUI multi-session piece leans on the §M22.7 "GUI session" model.
 
 ---
 
-## §M33 — Execution domains: where a service runs (kernel / user / isolated)
+## §M33 — Execution domains — ◐ Tier 0 shipped, Tier 1+ open
+
+**Stages 1 and 2 shipped 2026-08-27 — see DOCS.md §4.82.**  The declared
+`.domains` capability with its honesty gate (`user`/`isolated` REFUSED with the
+reason, never accepted and quietly run in the kernel), `driver.<name>.domain`,
+the `/proc/drivers` placement view, and **Tier 0**: a fault inside a driver
+entry point unwinds out of that entry point instead of reaching a fault policy
+that takes the machine.  Verified on all three arches with `drv crash`.
+
+**What Tier 0 is not, kept here because the plan promised it:** not memory
+isolation — the driver is in ring 0 and the wild write has already happened.  It
+converts the trap-style failures from panic into restart.  Recovery is refused
+when the driver held a lock (a deadlock is worse than a panic), and IRQ handlers
+are not guarded (no caller to unwind to).
+
+**Still open, in the order they unblock each other:**
+  * **Tier 1** — the driver-runtime API (`drv_port_out`, `drv_mmio_map`,
+    `drv_irq_wait`, `drv_dma_alloc`) and its user-mode backend, then a first
+    NON-DMA driver in ring 3.  This is what makes `DOMAIN_USER` enforceable and
+    therefore what `domain_enforceable()` is waiting for.
+  * **Stage 5 — an IOMMU driver.**  Until it exists a DMA driver outside the
+    kernel is placement, not isolation, and the code marks it `ADVISORY(!)`.
+  * **Tier 2** — DMA drivers in ring 3 with clean teardown and CLIENT
+    RECONNECTION, which is the genuinely pervasive part.
+  * `driver.profile` (desktop|server) is deliberately absent: with one
+    reachable domain it would be a key with one legal value.
+
+---
+
+## §M33 (design, retained) — where a service runs (kernel / user / isolated)
 
 > **See also §M68** — the investigation into making the domain CHOICE dynamic,
 > i.e. derived from what the machine can actually enforce.  §M33 is the

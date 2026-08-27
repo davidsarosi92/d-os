@@ -517,4 +517,5 @@ static const struct driver_ops ac97_ops = {
     .shutdown = ac97_shutdown,
 };
 
-DRIVER(ac97, "audio", &ac97_ops, NULL);
+/* DMA-capable: the BDL is a list of physical addresses the card reads. */
+DRIVER_EX(ac97, "audio", &ac97_ops, NULL, DOMAIN_KERNEL, DRVF_DMA);

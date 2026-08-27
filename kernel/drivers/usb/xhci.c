@@ -1004,4 +1004,7 @@ static const struct driver_ops xhci_ops = {
     .shutdown = xhci_shutdown,
 };
 
-DRIVER(xhci, "usb-host", &xhci_ops, NULL);
+/* DMA-capable (command/event rings and transfer buffers are all device-visible
+ * memory).  Not boot-critical — every PC target also has PS/2, which is why
+ * §M49 had to add a one-shot marker to prove the USB path works at all. */
+DRIVER_EX(xhci, "usb-host", &xhci_ops, NULL, DOMAIN_KERNEL, DRVF_DMA);

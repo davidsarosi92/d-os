@@ -22,6 +22,8 @@
 #include "printf.h"
 #include "module.h"
 #include "driver.h"
+#include "domain.h"     /* §M33 — the placement columns */
+#include "drvguard.h"   /* §M33 Tier 0 — faults-contained */
 #include "task.h"
 #include "console.h"
 #include "config.h"
@@ -276,23 +278,55 @@ static void gen_modules(struct procfs_writer* w) {
     pw_putc(w, '\n');
 }
 
+/* §M33 — the placement view.
+ *
+ * IT WALKS THE SLOT TABLE, NOT THE LINKER SECTION.  This used to index
+ * `__start_drivers` directly, which §M66 turned into only part of the truth and
+ * §M67 made actively wrong: a driver loaded from a module is not in that array
+ * at all, so `/proc/drivers` silently omitted exactly the drivers most likely
+ * to be under investigation.
+ *
+ * Columns: what it is, where it runs, where it COULD run, and what isolation
+ * that placement actually delivers — the last being the one not inferable from
+ * the others, because a DMA driver in ring 3 with no IOMMU is placed but not
+ * isolated. */
 static void gen_drivers(struct procfs_writer* w) {
-    int n = (int)(__stop_drivers - __start_drivers);
-    pw_puts(w, "# class      name        state\n");
+    int n = driver_count_all();
+    pw_puts(w, "# class\tname\tstate\tdomain\tcan-be\tisolation\tflags\n");
     for (int i = 0; i < n; i++) {
-        struct driver* d = &__start_drivers[i];
+        struct driver* d = driver_at(i);
+        if (!d) continue;
         uint8_t st = driver_state(d);
         const char* state_str =
+            (st & DRV_S_QUARANTINE) ? "QUARANTINED" :
+            (st & DRV_S_ADMIN_DOWN) ? "stopped" :
             (st & DRV_S_INITED)     ? "OK" :
             (st & DRV_S_INIT_FAIL)  ? "init-fail" :
             (st & DRV_S_PROBE_FAIL) ? "absent" :
             (st & DRV_S_PROBED)     ? "probed" : "registered";
-        pw_puts(w, d->class); pw_putc(w, '\t');
-        pw_puts(w, d->name);  pw_putc(w, '\t');
-        pw_puts(w, state_str); pw_putc(w, '\n');
+        char decl[40];
+        domain_set_str(d->domains ? d->domains : DOMAIN_KERNEL, decl, sizeof decl);
+        uint32_t at = driver_domain(d);
+        int dma = (d->flags & DRVF_DMA) ? 1 : 0;
+
+        pw_puts(w, d->class ? d->class : "?");  pw_putc(w, '\t');
+        pw_puts(w, d->name);                    pw_putc(w, '\t');
+        pw_puts(w, state_str);                  pw_putc(w, '\t');
+        pw_puts(w, domain_name(at));            pw_putc(w, '\t');
+        pw_puts(w, decl);                       pw_putc(w, '\t');
+        pw_puts(w, domain_isolation_name(domain_isolation_of(at, dma)));
+        pw_putc(w, '\t');
+        if (d->flags & DRVF_BOOT_CRITICAL) pw_puts(w, "boot-critical ");
+        if (dma)                           pw_puts(w, "dma ");
+        pw_putc(w, '\n');
     }
     pw_puts(w, "total: ");
     pw_put_uint(w, (unsigned)n);
+    /* §M33 Tier 0's counter.  Here rather than only in the log, because a
+     * system that quietly contains a fault every few seconds looks healthy from
+     * outside — §M29's crash-loop reasoning, one layer over. */
+    pw_puts(w, "\nfaults-contained: ");
+    pw_put_uint(w, drvguard_fault_count());
     pw_putc(w, '\n');
 }
 

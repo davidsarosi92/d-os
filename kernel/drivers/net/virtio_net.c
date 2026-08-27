@@ -380,4 +380,6 @@ static const struct driver_ops vnet_ops = {
     .shutdown = NULL,
 };
 
-DRIVER(virtio_net, "net", &vnet_ops, NULL);
+/* DMA-capable — the virtqueues are memory the device reads and writes on its
+ * own.  Not boot-critical: the machine boots and runs with no network. */
+DRIVER_EX(virtio_net, "net", &vnet_ops, NULL, DOMAIN_KERNEL, DRVF_DMA);
