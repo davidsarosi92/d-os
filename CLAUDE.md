@@ -2254,9 +2254,17 @@ close/lseek/mmap/memfd/socketpair/send/recv/poll` (generic `struct
 ofile`), memfd shared memory (`VMM_SHARED` PTE bit), unix socketpair +
 SCM_RIGHTS fd passing (`usock.c`), poll, in-tree libc (`user/`,
 compiled-C runs in ring 3).  All on 3 arches (libc now all 3 via Tier B).
-**Ring model LOCKED: only ring 0/3 (EL1/EL0) — rings 1/2 never
-(paging is binary → no isolation; security axis = address spaces +
-capabilities, not ring count).**  The former deferred tail (concurrent
+**Ring model: ring 0/3 (EL1/EL0) only — and the reasoning is now
+UNDER REVIEW rather than closed (§M68).**  The standing answer is
+unchanged: paging carries ONE privilege bit, so rings 0/1/2 are all
+supervisor to the MMU and a ring-1 driver can write every kernel page.
+Rings 1/2 have ever bought real isolation only through SEGMENT LIMITS —
+which **i386 enforces and x86_64 ignores, and aarch64 has no analogue
+of**, so the ring axis would give its strongest isolation on the oldest
+target and none on the two that matter.  §M68 is the investigation that
+must produce that verdict WITH A MEASUREMENT (and the capability report
+that is worth building either way); the modern instrument for the same
+goal is protection keys / IOMMU / virtualization, not ring count.  The former deferred tail (concurrent
 preemptible user processes + x86_64/aarch64 libc) SHIPPED as Tier B
 (DOCS §4.24) — `proc_spawn` runs many at once; the synchronous excursion
 (`proc_exec_elf`) is kept for the self-tests.  Self-tests: `userrun/

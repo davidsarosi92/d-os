@@ -268,6 +268,7 @@ what); a session can pick a theme and push on it.
 | M63 | Control Panel — `SETTINGS_PANEL()` + `CONFIG_KEY()` registries, generic panel, one Start-menu entry, `conf` with validation | UX / Architecture | ✅ DOCS §4.65 (+ stage 0 §4.63) |
 | M66 | **Driver agility** — orderly shutdown, device lifetimes, runtime stop/start/swap, PCI hot-plug with BAR assignment, fault quarantine | Architecture / Devices | ✅ DOCS §4.80 |
 | M67 | **Loadable driver modules** — a driver from outside the kernel image | Architecture | ✅ shipped 2026-08-27 — see DOCS.md §4.81 |
+| M68 | **Dynamic privilege model — an INVESTIGATION** — use only the isolation the machine actually offers, switchable; does the ring axis (0/3 vs 0/1/2/3) earn its keep? | Architecture / Security | §M68 — study, verdict required |
 | M64 | Desktop shortcuts — icons on the wallpaper, shortcut files, one resolver, swappable grid/list view | UX | ✅ DOCS §4.64 + §4.79 (drag-to-move, keyboard, Send to desktop, and the ramfs-persistence bug it exposed).  All four target kinds resolve |
 
 ### Cross-cutting constraints
@@ -3144,6 +3145,11 @@ the GUI multi-session piece leans on the §M22.7 "GUI session" model.
 
 ## §M33 — Execution domains: where a service runs (kernel / user / isolated)
 
+> **See also §M68** — the investigation into making the domain CHOICE dynamic,
+> i.e. derived from what the machine can actually enforce.  §M33 is the
+> mechanism; §M68 is the policy that would drive it, and it must not grow a
+> second mechanism of its own.
+
 **The generalisation.**  Don't hard-code "kernel vs user" as a binary
 baked into each subsystem.  Instead make the **execution domain** a
 first-class, *declared* property of a service (§M29), chosen by config:
@@ -4262,6 +4268,232 @@ untested fallback is not a fallback — the trigger and the fix are written down
 in modload.h); no module dependencies (a module cannot import from another
 module, only from the kernel); no signing, which is meaningless before §M33
 anyway.
+
+---
+
+## §M68 — A dynamic privilege model: an INVESTIGATION with a verdict required
+
+**Status: study.  Not scheduled for implementation, and it must not be until
+this section produces a measured answer.**
+
+**Asked for directly, and it is a recurring topic** — which is the reason to
+write it down properly rather than answer it from memory a fourth time.  The
+request: a user-switchable *dynamic ring model*, where the system uses only the
+privilege levels that are actually available and adapts automatically.  Ring 0/3
+only, or ring 0/1/2/3.  A setting along the lines of **"Use dynamic RING
+model"**.  And explicitly: **the effort does not matter, provided the system's
+stability and modularity stay correct** — but whether it has any justification
+at all is part of what this milestone must decide.
+
+The underlying instinct is right and is worth stating on its own, because it
+outlives whatever this section concludes about rings: **a system should adapt to
+the protection the machine offers rather than compile in one model.**  The
+question is whether RING COUNT is the axis on which to express that.
+
+---
+
+### 1. What "dynamic" can mean — three readings, and only one has content
+
+**(a) Discover how many rings the CPU has.**  Near-zero content.  x86 has always
+had four; aarch64 always has EL0 and EL1; RISC-V has M/S/U.  The *count* is not
+a discoverable variable on any target we have or plausibly will have.  A probe
+that always returns the same answer is a constant with a function call in front
+of it.
+
+**(b) Discover which privilege MECHANISMS the machine offers, and place code
+accordingly.**  High content — this genuinely varies between machines, between
+CPU generations, and between the three arches.  This is where the user's
+requirement ("only work with what is available, push the system towards
+automatic adaptation") actually lives.  §5 below is the list.
+
+**(c) Move a component between privilege levels at runtime without a rebuild.**
+This is **§M33 (execution domains)**, already designed: a service declares which
+domains it *can* run in, config chooses among them, the broker resolves domain →
+transport at bind.  §M68 must not build a second mechanism next to it.
+
+So the honest shape of this milestone is: **(b) supplies the facts, §M33 supplies
+the mechanism, and the "dynamic" part is the POLICY that connects them.**
+
+---
+
+### 2. The fact that decides the ring question
+
+**Paging has exactly one privilege bit.**  The x86 page-table U/S bit and
+aarch64's AP bits distinguish *supervisor* from *user* and nothing else.  Rings
+0, 1 and 2 are all supervisor to the MMU.
+
+**So a ring-1 driver can read and write every kernel page.**  It is not
+memory-isolated from the kernel in any way the hardware enforces through paging.
+What rings 1 and 2 *do* restrict is narrower:
+
+  * privileged instructions (`LGDT`, `MOV CR*`, `HLT`, …) — real, and small;
+  * I/O port access, via IOPL and the TSS I/O bitmap — real, and useful for a
+    legacy device driver;
+  * **segment limits** — and this is the whole argument.
+
+**Segment limits are the only mechanism by which rings 1/2 have ever bought real
+memory isolation**, and this is exactly what OS/2 used ring 2 for.  A ring-1
+code/data segment can be limited to a subrange of the linear address space, and
+the CPU enforces it on every access without paging's involvement.
+
+**And it exists on exactly one of our three targets.**
+
+| Target  | Rings / ELs available | Segment limits enforced? | Real isolation from rings 1/2 |
+|---------|-----------------------|--------------------------|-------------------------------|
+| i386    | 0,1,2,3               | **Yes**                  | **Yes** — via segmentation    |
+| x86_64  | 0,1,2,3               | **No** (ignored in long mode for CS/DS/ES/SS) | **No** |
+| aarch64 | EL0,EL1(,EL2,EL3)     | no such concept          | **No** — see below            |
+
+**aarch64 has no intermediate level for this purpose.**  EL2 is the hypervisor
+level and EL3 the secure monitor; neither is "a slightly less privileged kernel".
+Using EL2 to contain a driver means *writing a hypervisor and running the kernel
+as its guest* — a real technique (§5.3), but not "one more ring", and nothing
+about it is served by a ring-count abstraction.
+
+**PROVISIONAL VERDICT ON THE RING AXIS, to be confirmed or overturned by §6's
+measurement:**
+
+> Rings 1 and 2 buy real memory isolation on **exactly one** of our three
+> targets — the 32-bit one — through a mechanism (segmentation) the other two do
+> not have.  A dynamic ring model would therefore deliver its **strongest
+> isolation on the oldest and least important architecture and nothing at all on
+> the two that matter.**  That is backwards, and it is the specific reason the
+> ring axis is a weak instrument for the goal, rather than a general objection to
+> the goal.
+
+This is also, restated with its evidence, the reasoning already recorded as
+*"ring model LOCKED"* — but that entry asserted the conclusion without the
+table, which is why the question kept coming back.
+
+---
+
+### 3. The cost that has to be paid against any benefit
+
+Stated so that "the effort does not matter" is applied to a real number rather
+than to an unknown.  The effort here is not the implementation, it is the
+PERMANENT surface a second privilege level adds:
+
+  * a second calling convention and a second stack discipline at every boundary
+    crossing (the ring-1 ⇄ ring-0 gate is not free and is not the syscall path);
+  * a second origin for every trap, fault and interrupt — every handler in the
+    tree gains a case, and §M54's lesson is what happens when one of them is
+    missed;
+  * **`SYSCALL`/`SYSRET` on x86_64 only work between ring 0 and ring 3** —
+    a ring-1 component cannot use the fast path at all, so it pays `int`-gate
+    cost on the arch where the fast path was the point (§M52 is the file that
+    would have to grow the case);
+  * every `_k`/`_u` pointer-provenance rule (§M46) becomes three-valued.
+
+That cost is unconditional and forever.  It is why this milestone demands a
+measured benefit BEFORE the code, not after.
+
+---
+
+### 4. The anti-goal, borrowed from §M33 by name
+
+**No isolation theatre.**  A `security.isolation = auto` that reports a component
+as "isolated" while the mechanism cannot enforce it is strictly worse than
+reporting `off` — it converts an accurate absence into a false presence, and the
+user goes looking for the wrong problem (§M23's argument for three taskbar sound
+icons rather than two, one layer down).
+
+Concretely: **anything with DMA is not isolated by ANY ring or address-space
+mechanism unless there is an IOMMU.**  A device that can be told to write
+anywhere writes anywhere, whatever ring its driver sits in.  Any policy this
+milestone produces must treat "has DMA" + "no IOMMU" as a hard downgrade to
+`DOMAIN_KERNEL`, and say so.
+
+---
+
+### 5. Where the dynamism actually is — the capability ladder
+
+This is reading (b), and it is the part with genuine content.  Each rung is
+DISCOVERABLE at runtime, VARIES between real machines, and enforces something the
+hardware actually checks.  A "dynamic" policy is a walk down this ladder.
+
+**5.1 Cheap hardening, always taken when present** — `SMEP`/`SMAP` (x86_64),
+`PXN`/`PAN` (aarch64).  Not a domain, not a placement choice; just on.  Worth
+enumerating because a report that lists them is the first honest answer to "how
+protected is this machine".
+
+**5.2 Memory protection keys — the strongest candidate, and the one that
+actually addresses §M67's gap.**  `PKS` (Protection Keys for Supervisor, x86_64)
+and ARMv8.9's `S1POE` let SUPERVISOR pages carry a key, with access flipped by a
+single register write — no address-space switch, no TLB flush.  That is
+in-kernel isolation *without leaving ring 0*, which is precisely the shape "more
+rings" was reaching for, at a fraction of the boundary cost.
+
+**It is the direct answer to what §M67 shipped without:** a loaded module runs in
+ring 0 with no isolation, and §M67's own header says so.  A PKS-tagged module
+heap would make "a module cannot scribble on the kernel" enforceable rather than
+advisory — *and it does not need a single new ring.*
+
+**5.3 Virtualization** — VMX/SVM on x86, EL2 on aarch64.  A driver in its own
+guest, with an IOMMU behind it.  Heavy, real, and the only mechanism on this list
+that contains a DMA-capable driver completely.  Xen's driver domains are the
+existence proof.
+
+**5.4 Address spaces + capabilities** — §M25 and §M33's `DOMAIN_USER` /
+`DOMAIN_ISOLATED`, which the tree already has the substrate for.  This is the
+rung that is reachable today.
+
+**5.5 Nothing available → `DOMAIN_KERNEL`**, which is where everything is now,
+reported honestly rather than dressed up.
+
+---
+
+### 6. Definition of done — what this milestone must produce
+
+It is a study; the deliverable is a decision with evidence, plus the one piece of
+machinery that is useful regardless of which way the decision goes.
+
+1. **A capability report, on all three arches** — `caps` / `/proc/security`,
+   listing what the machine offers: SMEP, SMAP, PKU, **PKS**, VMX/SVM, IOMMU
+   (VT-d / AMD-Vi / SMMU), and on ARM EL2 availability, PAN, POE.  *This is
+   worth building whatever the verdict is*: no adaptive policy of any kind can
+   exist without it, and "how protected is this machine" currently has no
+   answer at all.  It is also the smallest honest thing to ship first.
+
+2. **A measured answer on the ring axis, on i386** — a prototype putting one
+   driver at ring 1 behind a limited segment, with numbers for: the boundary
+   crossing cost versus a direct call, and what the limit actually prevents
+   (demonstrated by an out-of-range access being FAULTED, not by assertion).
+   *A prototype that only shows it works is not the measurement; the measurement
+   is what it costs and what it stops.*
+
+3. **A verdict, written down with the numbers behind it**, and if the verdict is
+   no, the reason recorded here **so the topic stops recurring** — which is the
+   stated purpose of this milestone.
+
+4. **If yes:** the switch, and its NAME matters.  Calling a setting "rings" when
+   the mechanism doing the work is a protection key or an IOMMU is a label that
+   lies, and this tree has a rule about controls that misreport their subsystem.
+   Proposed shape:
+   `security.isolation = off | auto | strict`, where `auto` walks §5's ladder and
+   `strict` refuses to run a component whose declared domain cannot be enforced;
+   plus `security.isolation_report`, because the policy must be able to say WHY
+   it placed something where it did.  A ring-specific sub-key
+   (`security.x86_rings`) would then be an i386-only detail underneath, not the
+   headline — because per §2 that is what it is.
+
+---
+
+### 7. Relationship to the milestones on either side
+
+**§M33 is the prerequisite, not the sibling.**  §M33 already defines the
+vocabulary (a declared set of domains, config choosing among them, the broker
+resolving domain → transport).  §M68's product is the POLICY that picks a domain
+from hardware capability — one function, given §M33's mechanism, and a fork of
+the whole design without it.
+
+**§M67 is what makes it urgent rather than academic.**  Before loadable modules,
+"everything in ring 0" described code that shipped in the image and was reviewed
+with it.  It now describes code that arrives as a file.  The scope written into
+`modload.c` — *modules built from this tree* — is what holds until something on
+§5's ladder is real, and §M68 is how that scope gets lifted.
+
+**Ordering:** §M33 → §M68 step 1 (the capability report, useful immediately) →
+§M68 steps 2–3 (the verdict) → implementation only if the verdict says so.
 
 ---
 
