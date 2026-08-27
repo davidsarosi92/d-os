@@ -123,6 +123,9 @@ ifeq ($(ARCH),i386)
                      user/linuxhello_blob.o
 
   # §M60 — the embedded default wallpaper (all arches).
+  # §M67 — the loadable modules archive.  Unconditional: `modules` is a
+  # first-class build product, not an optional asset.
+  ARCH_EXTRA_OBJS += user/modules_blob.o
   ifneq ($(wildcard assets/wallpaper-default.bmp),)
     ARCH_EXTRA_OBJS += assets/wallpaper_blob.o
   endif
@@ -318,6 +321,9 @@ else ifeq ($(ARCH),x86_64)
   ARCH_EXTRA_OBJS := kernel/hal/x86_64/ap_trampoline_blob.o $(X86_USER_BLOBS)
 
   # §M60 — the embedded default wallpaper (all arches).
+  # §M67 — the loadable modules archive.  Unconditional: `modules` is a
+  # first-class build product, not an optional asset.
+  ARCH_EXTRA_OBJS += user/modules_blob.o
   ifneq ($(wildcard assets/wallpaper-default.bmp),)
     ARCH_EXTRA_OBJS += assets/wallpaper_blob.o
   endif
@@ -569,6 +575,9 @@ else ifeq ($(ARCH),aarch64)
                      $(MUSL_COREUTIL_BLOBS)
 
   # §M60 — the embedded default wallpaper (all arches).
+  # §M67 — the loadable modules archive.  Unconditional: `modules` is a
+  # first-class build product, not an optional asset.
+  ARCH_EXTRA_OBJS += user/modules_blob.o
   ifneq ($(wildcard assets/wallpaper-default.bmp),)
     ARCH_EXTRA_OBJS += assets/wallpaper_blob.o
   endif
@@ -643,6 +652,8 @@ CORE_C_SRCS := \
     kernel/core/console.c \
     kernel/core/module.c \
     kernel/core/driver.c \
+    kernel/core/ksym.c \
+    kernel/core/modload.c \
     kernel/core/config.c \
     kernel/core/task.c \
     kernel/core/block.c \
@@ -697,7 +708,6 @@ CORE_C_SRCS := \
     kernel/drivers/null/null.c \
     kernel/drivers/block/virtio_blk.c \
     kernel/drivers/net/virtio_net.c \
-    kernel/drivers/net/loopback.c \
     kernel/core/net.c \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \
@@ -712,7 +722,6 @@ CORE_C_SRCS := \
     kernel/core/abi_linux.c \
     kernel/core/pkg.c \
     kernel/drivers/audio/ac97.c \
-    kernel/drivers/audio/hda.c \
     kernel/core/audio.c \
     kernel/drivers/usb/xhci.c \
     kernel/drivers/usb/usb_hid.c \
@@ -758,7 +767,6 @@ CORE_C_SRCS := \
     kernel/core/net.c \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \
-    kernel/drivers/net/loopback.c \
     kernel/core/audio.c \
     kernel/core/random.c \
     kernel/core/fd.c \
@@ -779,6 +787,8 @@ CORE_C_SRCS := \
     kernel/core/block_cache.c \
     kernel/core/config.c \
     kernel/core/driver.c \
+    kernel/core/ksym.c \
+    kernel/core/modload.c \
     kernel/core/keymap.c \
     kernel/core/layouts.c \
     kernel/core/vc.c \
@@ -859,6 +869,8 @@ CORE_C_SRCS := \
     kernel/core/console.c \
     kernel/core/module.c \
     kernel/core/driver.c \
+    kernel/core/ksym.c \
+    kernel/core/modload.c \
     kernel/core/config.c \
     kernel/core/task.c \
     kernel/core/block.c \
@@ -913,12 +925,10 @@ CORE_C_SRCS := \
     kernel/drivers/null/null.c \
     kernel/drivers/block/virtio_blk.c \
     kernel/drivers/net/virtio_net.c \
-    kernel/drivers/net/loopback.c \
     kernel/core/net.c \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \
     kernel/drivers/audio/ac97.c \
-    kernel/drivers/audio/hda.c \
     kernel/core/audio.c \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
@@ -2322,6 +2332,82 @@ user/netsurf_res.bin: user/netsurf.dynelf scripts/pack-rootfs.py
 $(OBJ_DIR)/user/netsurf_res_blob.o: user/netsurf_res.bin
 	@mkdir -p $(@D)
 	objcopy --input-target=binary $(USER_OCARGS) $< $@
+
+# =============================================================================
+# §M67 — LOADABLE DRIVER MODULES.
+#
+# A module is a RELOCATABLE OBJECT (`gcc -c`), not a linked executable — see
+# modload.c for why that shape and not a .so.  So the rule is deliberately
+# ordinary: the same compiler, the same CFLAGS and the same include path the
+# kernel itself uses, with one extra define.
+#
+# USING THE KERNEL'S OWN CFLAGS IS NOT A CONVENIENCE, IT IS THE ABI.  On x86_64
+# the kernel is built -mcmodel=large; a module built without it would emit
+# 32-bit-displacement calls and land out of range of the kernel it is calling
+# into.  Deriving the module's flags from the kernel's makes that impossible to
+# get wrong rather than something to remember.
+#
+# -fno-common because the loader REFUSES a COMMON symbol: a tentative
+# definition has no section to be placed in, and silently allocating one would
+# mean two modules sharing a variable neither declared.  GCC 10+ defaults to
+# -fno-common anyway; stating it means the build does not depend on that.
+MODULE_CFLAGS := $(CFLAGS) $(INCLUDES) -DDOS_MODULE_BUILD -fno-common
+
+$(BUILD_DIR)/modules/%.ko: kernel/drivers/audio/%.c
+	@mkdir -p $(@D)
+	$(CC) $(MODULE_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/modules/%.ko: kernel/drivers/net/%.c
+	@mkdir -p $(@D)
+	$(CC) $(MODULE_CFLAGS) -c $< -o $@
+
+# The modules this build ships.  `hda` is the demonstration and it is a REAL
+# one: Intel HDA is a full audio controller — MMIO BAR, codec verb interface,
+# a DMA ring and a completion interrupt — and it is NOT in the kernel image
+# (it was removed from C_SRCS when this rule was added).  So `lsdrv` on a fresh
+# boot has no `hda`, and the only way to get one is to load it.
+# `loopback` ships on EVERY arch and `hda` only where PCI exists.  That split is
+# the point: without a portable module the loader would be an x86 feature with
+# untested relocation code on the third arch — the one-arch-only shape this tree
+# keeps paying for (§4.63's setconf, §M24's network commands, §M23's /dev).
+MODULES := $(BUILD_DIR)/modules/loopback.ko \
+           $(BUILD_DIR)/modules/stale-abi.ko \
+           $(BUILD_DIR)/modules/stale-fp.ko
+ifneq ($(filter $(ARCH),i386 x86_64),)
+  MODULES += $(BUILD_DIR)/modules/hda.ko
+endif
+
+# The two modules the kernel must REFUSE.  They ship because a check nobody has
+# watched fail is a check nobody has tested — and this one guards a failure that
+# is silent when it happens (wrong offsets, corruption somewhere unrelated).
+# Patched from the good module so nothing but the field under test differs.
+$(BUILD_DIR)/modules/stale-abi.ko: $(BUILD_DIR)/modules/loopback.ko scripts/make-stale-module.py
+	python3 scripts/make-stale-module.py $< $@ abi
+
+$(BUILD_DIR)/modules/stale-fp.ko: $(BUILD_DIR)/modules/loopback.ko scripts/make-stale-module.py
+	python3 scripts/make-stale-module.py $< $@ fingerprint
+
+modules: $(MODULES)
+
+# Packed into the same flat archive format pkg.c already unpacks into the VFS
+# (§M43's tcc rootfs, §4.42's NetSurf resources).  The bytes ship with the
+# system, which is the honest description — what makes this a MODULE and not
+# a built-in driver is that the kernel does not link it, has none of its
+# symbols, and boots perfectly well without it.
+# The GOOD modules land in /modules, which autoload walks.  The deliberately
+# broken ones land in /modules/test — autoload does not descend, so the boot log
+# is not three refusals every time, and the tests still have a path to point at.
+# A test fixture that pollutes normal operation stops being run.
+MODULES_GOOD := $(filter-out %/stale-abi.ko %/stale-fp.ko,$(MODULES))
+user/modules.bin: $(MODULES) scripts/pack-rootfs.py
+	python3 scripts/pack-rootfs.py $@ \
+	    $(foreach m,$(MODULES_GOOD),$(m):/modules/$(notdir $(m))) \
+	    $(BUILD_DIR)/modules/stale-abi.ko:/modules/test/stale-abi.ko \
+	    $(BUILD_DIR)/modules/stale-fp.ko:/modules/test/stale-fp.ko
+
+$(OBJ_DIR)/user/modules_blob.o: user/modules.bin
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
 
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)

@@ -267,7 +267,7 @@ what); a session can pick a theme and push on it.
 | M62 | Boot splash, switchable — `boot.splash`, drawn splash, log suppressed not discarded, torn down by any fault | UX / Reliability | ✅ DOCS §4.71 |
 | M63 | Control Panel — `SETTINGS_PANEL()` + `CONFIG_KEY()` registries, generic panel, one Start-menu entry, `conf` with validation | UX / Architecture | ✅ DOCS §4.65 (+ stage 0 §4.63) |
 | M66 | **Driver agility** — orderly shutdown, device lifetimes, runtime stop/start/swap, PCI hot-plug with BAR assignment, fault quarantine | Architecture / Devices | ✅ DOCS §4.80 |
-| M67 | **Loadable driver modules** — a driver from outside the kernel image (kernel symbol table + ELF relocation + versioned ABI) | Architecture | §M67 — planned, see the section for the cost and the risk |
+| M67 | **Loadable driver modules** — a driver from outside the kernel image | Architecture | ✅ shipped 2026-08-27 — see DOCS.md §4.81 |
 | M64 | Desktop shortcuts — icons on the wallpaper, shortcut files, one resolver, swappable grid/list view | UX | ✅ DOCS §4.64 + §4.79 (drag-to-move, keyboard, Send to desktop, and the ramfs-persistence bug it exposed).  All four target kinds resolve |
 
 ### Cross-cutting constraints
@@ -4227,48 +4227,41 @@ the "isolation theatre" §M33 refuses by name.
 
 ---
 
-## §M67 — Loadable driver modules (a driver from outside the kernel image)
+## §M67 — Loadable driver modules — ✅ shipped
 
-**Status: planned.**  §M66 made every driver operation work on a descriptor
-whose storage the linker did not choose, and added `driver_attach()` as the
-entry point.  What is missing is everything that turns a file into such a
-descriptor.
+**Shipped 2026-08-27, all three arches — see DOCS.md §4.81.**  A relocatable
+ELF object on disk becomes a `struct driver` the registry cannot tell apart from
+a built-in one: an `EXPORT_SYMBOL()` table, a version check that is a
+compiler-computed struct fingerprint plus a hand-bumped number for the semantics
+it cannot see, an ELF relocator for all three arches, and unload.  `hda` ships
+as a module on x86 and `loopback` on every arch, both built from the SAME source
+as their built-in form.
 
-**Why it is a milestone and not a feature.**  A loader means running code in
-ring 0 that the kernel build did not produce.  That is the least forgiving
-place in the tree, and the parts are each individually sharp:
+**Two deviations from the plan above, both deliberate:**
 
-1. **A kernel symbol table.**  A module calls `kprintf`, `kmalloc`,
-   `audio_register`.  Name → address has to be generated at build time (the
-   tree already generates source: `assets/splash_logo.c`, the objcopy blobs)
-   and it defines, permanently, which symbols are public.
-2. **ELF relocation.**  Parse a relocatable object, allocate executable kernel
-   pages, apply the arch's relocation types (`R_386_32` / `R_386_PC32` on
-   i386, and different sets on x86_64 and aarch64), resolve undefined symbols
-   through the table above.
-3. **A VERSIONED ABI.**  `struct driver` already carries a `version`, but the
-   KERNEL side needs one too: a module built against an older struct layout
-   would otherwise read the wrong offsets silently — the failure mode being a
-   plausible-looking driver that corrupts something unrelated.  §M51's lesson
-   in a harder form, since the build cannot catch it.
-4. **Unload.**  Relocation-aware teardown, on top of §M66's quiesce.
+  * The symbol table is a **registry, not a generated scrape**.  `nm` over the
+    linked kernel needs a multi-pass link and makes the export surface
+    accidental; a linker section makes "what may a module call" a list somebody
+    wrote.
+  * The version check is **two** checks, because the plan's single "versioned
+    ABI" cannot cover both cases: the fingerprint catches layout and cannot be
+    forgotten, the number catches semantics and can.  It was needed on day one —
+    `driver_ops.shutdown` changed signature without changing any struct's size.
 
-**The honest cost.**  Comparable to the whole of §M66, and it leaves behind an
-ABI that must be maintained forever.  §M66 already delivers the agility the
-original question asked for — hardware that appears becomes usable, drivers
-stop cleanly, swap and quarantine work.  §M67 adds only that the driver need
-not be *in the image*.
+**The ordering question this plan raised, answered:** §M67 shipped BEFORE §M33
+and that is defensible only because its first customer is our own code,
+differently packaged.  Nothing about the loader is a security boundary — module
+code is ring 0 in one address space with no W^X — and the moment the goal is a
+driver from a THIRD PARTY, §M33 is the prerequisite.  That has not changed; it
+has only been made explicit in the source (modload.c's header says it) rather
+than left as a note in a plan.
 
-**Ordering note, and it is the important one.**  If the goal is loading a
-driver from a THIRD PARTY, §M33 (execution domains) should come first or
-alongside.  Loading foreign code into ring 0 with no isolation is precisely
-the risk §M66's fault containment cannot address, and shipping the loader
-first would build the door before the lock.
-
-**Definition of done:** a driver built as a separate object, not linked into
-the kernel, loaded from the store at runtime, appearing in `lsdrv` as
-`(loaded)`, driving real hardware, and unloadable again — with a version
-mismatch REFUSED loudly rather than executed.
+**Still open:** aarch64 B/BL relocations are refused rather than veneered when
+out of ±128 MiB (untestable on the configurations this tree runs, and an
+untested fallback is not a fallback — the trigger and the fix are written down
+in modload.h); no module dependencies (a module cannot import from another
+module, only from the kernel); no signing, which is meaningless before §M33
+anyway.
 
 ---
 

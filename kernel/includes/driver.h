@@ -37,7 +37,27 @@
 struct driver_ops {
     int  (*probe)   (void* ctx);    /* return 0 if hardware/resource is present */
     int  (*init)    (void* ctx);    /* class-specific bring-up; 0 = success */
-    void (*shutdown)(void* ctx);    /* clean stop; called on reboot/shutdown */
+    /* Clean stop.  0 = stopped, non-zero = REFUSED (the class registry has a
+     * live user, so the hardware is still going and the registrations still
+     * stand).
+     *
+     * §M67 CHANGED THIS FROM `void`, and the reason is worth keeping.  §M66
+     * already had drivers that could refuse — `audio_unregister` waits for
+     * users and declines rather than unlinking under one — but a `void` hook
+     * had no way to say so, and `driver_stop` marked the driver stopped
+     * regardless.  That was survivable for exactly one reason: a built-in
+     * driver's CODE cannot be freed, so the worst case was a registry pointing
+     * at a driver that was still there.
+     *
+     * A loadable module's code IS freed, by `rmmod`, immediately after the
+     * stop.  So a refusal nobody propagates became a use-after-free on the
+     * first call into a device that was never really withdrawn.
+     *
+     * Note what this cost: the signature changed WITHOUT changing any struct's
+     * size, which is precisely the case module_abi.h's automatic fingerprint
+     * cannot see — and precisely why DOS_MODULE_ABI, the number a human bumps,
+     * exists next to it.  It was bumped for this. */
+    int  (*shutdown)(void* ctx);
 };
 
 /* The registry entry.  Kept tight (5 fields → 20 bytes? no — only 4 pointers
@@ -102,6 +122,13 @@ struct driver* driver_find(const char* name);
  * rather than indexing the `drivers` section precisely so that a loaded driver
  * and a built-in one are the same kind of thing everywhere else. */
 int driver_attach(struct driver* d);
+
+/* The mirror: remove a slot the loader added, so its module's memory can be
+ * freed.  Refuses a driver that is still running (its class registrations are
+ * live) and refuses a BUILT-IN one outright — that descriptor is in the
+ * kernel's own rodata and detaching it would hide a driver that still exists
+ * rather than remove one.  Returns 0 on success. */
+int driver_detach(struct driver* d);
 
 /* Stop one driver: run its shutdown hook and clear INITED.  Returns 0 on
  * success, non-zero if it was not running or has no way to stop. */

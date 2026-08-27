@@ -920,6 +920,29 @@ void pkg_ensure_netsurf_res(void) {
     rootfs_unpack_blob(_binary_user_netsurf_res_bin_start, _binary_user_netsurf_res_bin_end);
 }
 
+/* §M67 — the loadable driver modules, provisioned into /modules.
+ *
+ * The same flat-archive mechanism, and unpacked AT BOOT rather than on demand
+ * (unlike the two above) because the whole archive is tens of kilobytes and
+ * because "is there a module to load?" is a question the user answers with
+ * `ls /modules` before they know a command exists to load it.
+ *
+ * WHAT THIS DOES AND DOES NOT PROVE.  The bytes ship inside the kernel image,
+ * so it would be fair to ask whether the module is really "outside" it.  It is,
+ * in the only sense that matters: the kernel does not LINK it, holds none of
+ * its symbols, and boots and runs with `hda` absent from `lsdrv` entirely.  The
+ * blob is data being written to a file — and once written it is an ordinary
+ * file, so copying it to the exFAT volume and loading it after a reboot goes
+ * through the disk like any other read.  That is the test worth running, and
+ * it is the one §M67's definition of done asks for. */
+extern const unsigned char _binary_user_modules_bin_start[] __attribute__((weak));
+extern const unsigned char _binary_user_modules_bin_end[]   __attribute__((weak));
+
+static void modules_provision(void) {
+    if (!_binary_user_modules_bin_start) return;   /* no modules in this build */
+    rootfs_unpack_blob(_binary_user_modules_bin_start, _binary_user_modules_bin_end);
+}
+
 static void ldso_provision(void) {
     if (!_binary_user_ldmusl_so_start) return;      /* musl shared not built */
     unsigned len = blob_len(_binary_user_ldmusl_so_start, _binary_user_ldmusl_so_end);
@@ -1228,6 +1251,7 @@ void pkg_init(void) {
     vfs_mkdir(g_store_root);
     vfs_mkdir("/etc"); vfs_mkdir("/etc/pkg");
     ldso_provision();
+    modules_provision();               /* §M67 — the .ko files under /modules */
     /* The tcc rootfs and NetSurf's resources are NOT unpacked here — see
      * pkg_ensure_tcc_rootfs / pkg_ensure_netsurf_res for the measurement that
      * moved them. */

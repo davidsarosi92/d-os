@@ -47,6 +47,7 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "block.h"
 #include "block_cache.h"
 #include "config.h"          /* §M63 stage 0 — config_attach_persistent */
+#include "modload.h"        /* §M67 — modload_autoload() */
 #include "shortcut.h"        /* §M64 tail — shortcut_attach_persistent */
 #include "gui.h"             /* gui_autostart — was an IMPLICIT declaration */
 #include "vc.h"
@@ -337,6 +338,7 @@ void aarch64_main_entry(uint64_t dtb) {
          * is idempotent, which is what makes duplicating it safe — but the real
          * fix is converging the two entry paths. */
         pkg_init();
+        modload_autoload();      /* §M67 — the .ko files under /modules */
         virtio_input_init();                    /* keyboard + mouse (prints to serial) */
         virtio_snd_init();                      /* §M23 — audio, if a device is attached */
         struct vc* root = vc_root();
@@ -368,6 +370,7 @@ void aarch64_main_entry(uint64_t dtb) {
          * is idempotent, which is what makes duplicating it safe — but the real
          * fix is converging the two entry paths. */
         pkg_init();
+        modload_autoload();      /* §M67 — the .ko files under /modules */
         /* §M23 — AND HERE TOO.  The comment above this branch's pkg_init call
          * is a warning written from experience: the framebuffer branch is the
          * one that gets patched and the headless one silently does without.

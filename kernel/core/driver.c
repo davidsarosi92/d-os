@@ -97,16 +97,21 @@ int driver_attach(struct driver* d) {
  * straight to hal_reboot() and the comment at those call sites says so. */
 void driver_shutdown_all(void) {
     if (driver_count == 0) return;
-    int stopped = 0;
+    int stopped = 0, refused = 0;
     for (uint32_t k = driver_count; k > 0; k--) {
         struct drv_slot* sl = &g_slots[k - 1];
         if (!(sl->state & DRV_S_INITED)) continue;
         if (!sl->d->ops || !sl->d->ops->shutdown) continue;
-        sl->d->ops->shutdown(sl->d->ctx);
+        /* A power-off proceeds even if a driver declines: the machine is going
+         * away either way, and refusing to shut down the OTHER drivers because
+         * one is busy would be strictly worse.  It is COUNTED separately so the
+         * line does not claim more than happened. */
+        if (sl->d->ops->shutdown(sl->d->ctx) != 0) { refused++; continue; }
         sl->state &= (uint8_t)~DRV_S_INITED;
         stopped++;
     }
-    kprintf("drivers: %d stopped\n", stopped);
+    if (refused) kprintf("drivers: %d stopped, %d still busy\n", stopped, refused);
+    else         kprintf("drivers: %d stopped\n", stopped);
 }
 
 uint8_t driver_state(const struct driver* d) {
@@ -215,6 +220,43 @@ struct driver* driver_find(const char* name) {
     return NULL;
 }
 
+/* Remove a slot the loader added.  The mirror of driver_attach, and §M67's
+ * last requirement of this file.
+ *
+ * TWO REFUSALS, AND BOTH ARE THE POINT.  A driver that is still INITED is one
+ * whose hardware is live and whose class registrations are still published —
+ * detaching it would leave those registries pointing at a descriptor that is
+ * about to be freed, which is §M54's defect class exactly.  And a BUILT-IN
+ * driver cannot be detached at all: its descriptor lives in the kernel's own
+ * rodata, so removing the slot would not free anything and would only make a
+ * driver that still exists invisible to `lsdrv`.
+ *
+ * The compaction below preserves ORDER, because driver_shutdown_all walks the
+ * table backwards to get reverse-init order.  Swapping the last slot into the
+ * hole would be cheaper and would silently corrupt that ordering — a bug that
+ * shows up only at power-off, on a machine that has unloaded a module. */
+int driver_detach(struct driver* d) {
+    if (!d) return -1;
+    struct drv_slot* sl = slot_of(d);
+    if (!sl) return -2;
+    if (!sl->dynamic) {
+        kprintf("drv: '%s' is built in — it cannot be detached\n", d->name);
+        return -3;
+    }
+    if (sl->state & DRV_S_INITED) {
+        kprintf("drv: '%s' is still running — stop it first\n", d->name);
+        return -4;
+    }
+    uint32_t idx = (uint32_t)(sl - g_slots);
+    for (uint32_t i = idx; i + 1 < driver_count; i++) g_slots[i] = g_slots[i + 1];
+    driver_count--;
+    g_slots[driver_count].d = NULL;
+    g_slots[driver_count].state = 0;
+    g_slots[driver_count].dynamic = 0;
+    kprintf("drv: detached '%s'\n", d->name);
+    return 0;
+}
+
 int driver_stop(const char* name) {
     struct driver* d = driver_find(name);
     if (!d) { kprintf("drv: no driver '%s'\n", name); return -1; }
@@ -232,7 +274,17 @@ int driver_stop(const char* name) {
         kprintf("drv: '%s' has no shutdown hook — refusing to stop it\n", name);
         return -3;
     }
-    d->ops->shutdown(d->ctx);
+    /* §M67 — HONOUR THE REFUSAL.  The hook used to return void and this code
+     * used to clear INITED unconditionally.  A class that declines to be
+     * withdrawn (audio_unregister, while somebody is inside a call) then had
+     * its objection recorded nowhere, and the driver was reported stopped while
+     * its device was still live and still registered.  Harmless while every
+     * driver was built in; a use-after-free the moment `rmmod` can free the
+     * code behind it. */
+    if (d->ops->shutdown(d->ctx) != 0) {
+        kprintf("drv: '%s' refused to stop — it is still in use\n", name);
+        return -4;
+    }
     sl->state &= (uint8_t)~DRV_S_INITED;
     sl->state |= DRV_S_ADMIN_DOWN;          /* stays down until asked back */
     kprintf("drv: stopped '%s'\n", name);
@@ -251,8 +303,8 @@ void driver_fault(const char* name, const char* why) {
      * the point is that nothing restarts it, not that we can always take it
      * down cleanly — and saying which of the two happened matters more than
      * pretending they are the same. */
-    if ((sl->state & DRV_S_INITED) && d->ops && d->ops->shutdown) {
-        d->ops->shutdown(d->ctx);
+    if ((sl->state & DRV_S_INITED) && d->ops && d->ops->shutdown &&
+        d->ops->shutdown(d->ctx) == 0) {
         sl->state &= (uint8_t)~DRV_S_INITED;
         kprintf("drv: '%s' stopped and quarantined\n", name);
     } else {

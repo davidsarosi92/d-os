@@ -144,10 +144,44 @@ static int lo_init(void* ctx) {
     return 0;
 }
 
+/* §M67 — a real shutdown hook, and it is REQUIRED rather than polite.
+ *
+ * §M66 already refused to STOP a driver that has none: without one there is no
+ * way to withdraw its registrations, so stopping it would leave the registry
+ * pointing at a device nobody is driving.  A module raises the stakes — its
+ * descriptor lives in memory `rmmod` frees — so the loader refuses to LOAD a
+ * driver with no shutdown at all.  Loading code that can never be removed is a
+ * leak by construction, and this file was the first place that bit. */
+static int lo_shutdown(void* ctx) {
+    (void)ctx;
+    if (!g_lo.name) return 0;                 /* never came up */
+    net_unregister(&g_lo);
+    return 0;
+}
+
 static const struct driver_ops lo_ops = {
     .probe    = lo_probe,
     .init     = lo_init,
-    .shutdown = NULL,
+    .shutdown = lo_shutdown,
 };
 
+/* Built in, or loaded — see the same construct in hda.c for the argument.  The
+ * loopback device is the module this tree ships on EVERY arch: `hda` is a PCI
+ * card and aarch64 has no slot for one, so without a portable module the
+ * loader would be an x86 feature with untested relocation code on the third
+ * arch — the one-arch-only shape this project keeps paying for. */
+#ifdef DOS_MODULE_BUILD
+#include "module_abi.h"
+
+static struct driver lo_driver = {
+    .name    = "loopback",
+    .class   = "net",
+    .ops     = &lo_ops,
+    .ctx     = NULL,
+    .version = DOS_VERSION,
+};
+
+DOS_MODULE("loopback", &lo_driver, NULL, NULL);
+#else
 DRIVER(loopback, "net", &lo_ops, NULL);
+#endif

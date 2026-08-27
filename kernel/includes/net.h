@@ -97,6 +97,12 @@ struct net_device {
 /* ----------------------- Registry ----------------------------------------- */
 
 int  net_register(struct net_device* dev);
+
+/* Withdraw a device (§M67 — a loadable driver must be removable; the registry
+ * would otherwise keep a pointer into memory `rmmod` has freed).  0 on success,
+ * -1 if it was not registered.  See the note at the definition for what it does
+ * NOT do about concurrent users. */
+int  net_unregister(struct net_device* dev);
 struct net_device* net_find(const char* name);
 
 /* The DEFAULT-ROUTE device: the first registered non-loopback one, or NULL.
@@ -159,8 +165,22 @@ void net_rx_irq(struct net_device* dev);
  * because it is part of how this subsystem is tested, and a test instrument
  * that is hard to find is one nobody uses: without a way to lose a packet, a
  * retransmission timer is a feature no test in the build can falsify. */
-void loopback_set_drop(uint32_t permille);
-void loopback_stats(uint32_t* drop_permille, uint32_t* injected, uint32_t* qfull);
+/* §M67 — WEAK, because loopback ships as a loadable MODULE now.
+ *
+ * These two are the `lo drop` test surface, and they are the only place in the
+ * tree where the kernel reaches INTO a driver by name.  That direction of
+ * dependency is exactly what a module cannot satisfy: the kernel is linked
+ * first, so a strong reference to a symbol that lives in a .ko does not link at
+ * all.  (It did not — this is what the first attempt at making loopback a
+ * module failed on.)
+ *
+ * Weak turns "must be present at link time" into "may be present at run time",
+ * which is the truth: `lo drop` works when the module is loaded and says so
+ * when it is not.  Every caller MUST check for NULL — a weak symbol that is
+ * absent is a call through zero. */
+void loopback_set_drop(uint32_t permille) __attribute__((weak));
+void loopback_stats(uint32_t* drop_permille, uint32_t* injected, uint32_t* qfull)
+    __attribute__((weak));
 
 /* ----------------------- Waiting for the network (§M55) ------------------- */
 

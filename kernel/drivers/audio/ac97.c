@@ -488,20 +488,27 @@ static int ac97_init(void* ctx) {
 /* Stop the DMA engine before the machine goes.  Not cosmetic: a bus-master
  * engine left running across a warm reboot keeps writing into memory the next
  * kernel is about to use, and the corruption lands somewhere unrelated. */
-static void ac97_shutdown(void* ctx) {
+static int ac97_shutdown(void* ctx) {
     (void)ctx;
-    if (!g_ac97.nabm) return;
+    if (!g_ac97.nabm) return 0;          /* never came up: nothing to refuse */
     /* WITHDRAW BEFORE STOPPING THE HARDWARE.  audio_unregister() waits until
      * nobody is inside a call on this device; silencing the engine first would
      * cut the sound somebody is still mid-write on.  It can refuse — and if it
      * does, the device stays usable and we leave it alone rather than
-     * half-removing it. */
-    if (audio_unregister(&g_audio) != 0) return;
+     * half-removing it.
+     *
+     * §M67 — AND THE REFUSAL NOW TRAVELS.  Until modules existed this `return`
+     * told nobody: `driver_stop` marked the driver stopped regardless, which
+     * was survivable only because a built-in driver's code cannot be freed.  A
+     * MODULE's can, so a refusal that is not propagated becomes a registry
+     * pointing into memory the unload released. */
+    if (audio_unregister(&g_audio) != 0) return -1;
     outb(g_ac97.nabm + PO_CR, 0);
     outb(g_ac97.nabm + PI_CR, 0);
     g_ac97.running = 0;
     g_ac97.rec_running = 0;
     kprintf("ac97: DMA stopped\n");
+    return 0;
 }
 
 static const struct driver_ops ac97_ops = {

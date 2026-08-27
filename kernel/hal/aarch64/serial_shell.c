@@ -35,6 +35,8 @@
 #include "timer.h"
 #include "audio.h"
 #include "driver.h"      /* §M23 stage 2 — lsaudio / play, from the core */
+#include "modload.h"   /* §M67 — insmod / rmmod / lsmod */
+#include "ksym.h"      /* §M67 — ksyms */
 #include "syscall.h"   /* §M53 stage 3 — timerfd + setitimer self-tests */
 #include "ktimer.h"
 #include "pkg.h"
@@ -652,6 +654,11 @@ void serial_shell_entry(void) {
          * does not exist.  virtio-sound is what fills the gap. */
         else if (s_eq(cmd, "lsaudio")) audio_list();
         else if (s_eq(cmd, "drv"))     driver_cmd(args);
+        /* §M67 — the loader's own commands, same implementation as x86. */
+        else if (s_eq(cmd, "lsmod"))   modload_list();
+        else if (s_eq(cmd, "insmod"))  modload_cmd_insmod(args);
+        else if (s_eq(cmd, "rmmod"))   modload_cmd_rmmod(args);
+        else if (s_eq(cmd, "ksyms"))   ksym_list(args);
         else if (s_eq(cmd, "play"))    audio_cmd_play(args);
         else if (s_eq(cmd, "volume"))  audio_cmd_volume(args);
         else if (s_eq(cmd, "rec"))     audio_cmd_rec(args);

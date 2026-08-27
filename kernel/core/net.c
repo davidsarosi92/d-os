@@ -209,6 +209,30 @@ int net_register(struct net_device* dev) {
     return 0;
 }
 
+/* §M67 — withdraw a device.  Written because a LOADABLE network driver has to
+ * be removable: the descriptor it registered lives in the module's own memory,
+ * which `rmmod` frees, so a registry still pointing at it is a use-after-free
+ * on the next frame.
+ *
+ * WHAT THIS DOES NOT DO, AND WHY IT IS STILL ENOUGH HERE.  It does not wait for
+ * a user the way `audio_unregister` does — the network stack has no refcount on
+ * a device, and inventing half of one would be worse than none.  It is safe for
+ * the loopback device because the RX path runs under the stack lock and this
+ * unlink runs from a task with that lock available, so a frame is either fully
+ * delivered before the unlink or never starts.  A DMA-capable NIC would need
+ * the audio treatment, and the driver that tries should be made to add it
+ * rather than to copy this comment. */
+int net_unregister(struct net_device* dev) {
+    if (!dev) return -1;
+    struct net_device** pp = &g_head;
+    while (*pp && *pp != dev) pp = &(*pp)->next;
+    if (!*pp) return -1;                         /* not registered */
+    *pp = dev->next;
+    dev->next = NULL;
+    kprintf("net: unregistered %s\n", dev->name);
+    return 0;
+}
+
 struct net_device* net_find(const char* name) {
     for (struct net_device* n = g_head; n; n = n->next) {
         const char* a = n->name; const char* b = name;

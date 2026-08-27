@@ -72,6 +72,7 @@
 #include "proc.h"                /* proc_exec_elf — x86_64 musl boot self-test */
 #include "gui.h"                 /* gui_autostart — boot into the desktop */
 #include "pkg.h"                 /* pkg_init — provision ld.so for the x86_64 test hook */
+#include "modload.h"        /* §M67 — modload_autoload() */
 #include "timer.h"
 #include "vc.h"
 #include "lock.h"
@@ -614,6 +615,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
             { "nsfbtest (libnsfb)", _binary_user_nsfbtest_dynelf_start,     _binary_user_nsfbtest_dynelf_end    },
         };
         pkg_init();                    /* provision /lib ld.so + .so's up front */
+        modload_autoload();      /* §M67 — the .ko files under /modules */
 
         /* The x86_64 text shell now binds to the root VC and takes keyboard
          * input just like i386 (see the VC/shell spawn below), so the boot is an
@@ -671,6 +673,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
                                             * would otherwise run it only later,
                                             * so the browser's DT_NEEDED libs must
                                             * be planted before we exec it) */
+                modload_autoload();      /* §M67 — the .ko files under /modules */
                 gui_start();               /* bring up the compositor */
                 task_msleep(400);          /* let it become ready (à la wayland) */
                 const char* argv[] = { "netsurf", "-f", "dos", "about:welcome" };
@@ -697,6 +700,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * triple-faulting shortly after the prompt (i386, 256 MiB).  Idempotent, so
      * the shell's own call becomes a no-op. */
     pkg_init();
+    modload_autoload();      /* §M67 — the .ko files under /modules */
 
     {
         /* S.1: the boot shell is whatever provider shell.provider

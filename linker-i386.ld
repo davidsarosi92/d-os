@@ -35,6 +35,19 @@ SECTIONS
         __stop_modules = .;
     }
 
+    /* §M67 — kernel symbol table.  EXPORT_SYMBOL() entries: the names a
+     * LOADABLE MODULE is allowed to resolve against.  KEEP() for the usual
+     * reason (nothing references these by name), and note that unlike every
+     * other registry here this one is a PUBLISHED CONTRACT — an entry that
+     * disappears breaks a module built against it, so removing a line from
+     * ksym.c is a breaking change rather than a cleanup. */
+    .ksyms : ALIGN(8)
+    {
+        __start_ksyms = .;
+        KEEP(*(ksyms))
+        __stop_ksyms = .;
+    }
+
     /* Driver registry — sibling of .modules, populated by DRIVER() in
      * kernel/includes/driver.h.  Same KEEP() + ALIGN(4) discipline as
      * above.  Note alignment must equal sizeof(struct driver) (16 on

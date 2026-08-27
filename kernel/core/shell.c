@@ -21,6 +21,8 @@
 #include "printf.h"
 #include "module.h"
 #include "driver.h"
+#include "modload.h"   /* §M67 — insmod / rmmod / lsmod */
+#include "ksym.h"      /* §M67 — ksyms */
 #include "timer.h"
 #include "ktimer.h"
 #include "vfs.h"
@@ -3882,6 +3884,32 @@ static void cmd_mv(const char* args) {
     else               kprintf("mv: failed (%d) — same directory only?\n", rc);
 }
 
+/* §M67 — `cp <src> <dst>`.
+ *
+ * Added here because the shell could `rm` and could not `cp`, which §4.73 had
+ * already argued about deletion: a filesystem you can only add to is not one
+ * you can use.  The immediate need is a module: `insmod` reads a FILE, and
+ * putting that file on the persistent volume is how a module survives a reboot
+ * — but with no copy command there was no way to move one anywhere at all.
+ *
+ * vfs_copy already existed for the file manager's Copy button; this is the same
+ * call reachable without a mouse, which is also what makes it testable. */
+static void cmd_cp(const char* args) {
+    while (args && *args == ' ') args++;
+    if (!args || !*args) { console_write("cp: usage: cp <src> <dst>\n"); return; }
+
+    char src[128];
+    int n = 0;
+    while (args[n] && args[n] != ' ' && n < (int)sizeof src - 1) { src[n] = args[n]; n++; }
+    src[n] = '\0';
+    const char* dst = args + n;
+    while (*dst == ' ') dst++;
+    if (!*dst) { console_write("cp: usage: cp <src> <dst>\n"); return; }
+
+    if (vfs_copy(src, dst) == 0) kprintf("copied %s -> %s\n", src, dst);
+    else                         kprintf("cp: cannot copy %s to %s\n", src, dst);
+}
+
 static void cmd_rm(const char* args) {
     while (args && *args == ' ') args++;
     if (!args || !*args) { console_write("rm: usage: rm [-r] <path>\n"); return; }
@@ -4029,7 +4057,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "launch"))          { cmd_launch("");        return; }
     if (starts_with(line, "launch "))   { cmd_launch(line + 7);  return; }
     if (streq(line, "about"))  { cmd_about();      return; }
-    if (streq(line, "lsmod"))  { module_list();    return; }
+    if (streq(line, "lsmod"))  { modload_list();    return; }
     if (streq(line, "lsdrv"))  { driver_list();    return; }
     if (streq(line, "lsconsole")) { console_list(); return; }
     if (streq(line, "uptime")) { cmd_uptime();      return; }
@@ -4044,6 +4072,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "touch "))  { cmd_touch(line + 6); return; }
     if (starts_with(line, "write "))  { cmd_write(line + 6); return; }
     if (starts_with(line, "mount "))  { cmd_mount(line + 6); return; }
+    if (starts_with(line, "cp "))     { cmd_cp   (line + 3); return; }
     if (starts_with(line, "rm "))     { cmd_rm   (line + 3); return; }
     if (starts_with(line, "mv "))     { cmd_mv   (line + 3); return; }
 
@@ -4148,6 +4177,16 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "lsaudio"))        { audio_list();   return; }
     if (streq(line, "drv"))            { driver_cmd("");        return; }
     if (starts_with(line, "drv "))     { driver_cmd(line + 4);  return; }
+    /* §M67 — loadable modules.  Note these go BELOW no generic prefix arm:
+     * §4.67.1's regression was a `gui ` prefix dispatched above the exact
+     * `gui stats`, which silently swallowed it. */
+    if (streq(line, "lsmod"))          { modload_list();             return; }
+    if (streq(line, "insmod"))         { modload_cmd_insmod("");     return; }
+    if (starts_with(line, "insmod "))  { modload_cmd_insmod(line+7); return; }
+    if (streq(line, "rmmod"))          { modload_cmd_rmmod("");      return; }
+    if (starts_with(line, "rmmod "))   { modload_cmd_rmmod(line+6);  return; }
+    if (streq(line, "ksyms"))          { ksym_list("");             return; }
+    if (starts_with(line, "ksyms "))   { ksym_list(line + 6);       return; }
     if (streq(line, "beep"))           { cmd_beep();     return; }
     if (starts_with(line, "tone "))    { cmd_tone(line + 5); return; }
     /* §M23 stage 2 — the implementation lives in audio.c, not here, so the ARM

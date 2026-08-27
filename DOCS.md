@@ -120,6 +120,7 @@ when sections are added.)
 | 4.78 | A widget toolkit with a seam: classes, layout, ring 3 (§M65) | 8601 |
 | 4.79 | A desktop you can arrange: drag, keyboard, slots (§M64 tail) | 8800 |
 | 4.80 | Driver agility: lifecycle, hot-plug, quarantine (§M66) | 8950 |
+| 4.81 | Loadable driver modules (§M67) | 9650 |
 | 5 | Build & run | 5203 |
 | 6 | Compiler flags | 5230 |
 | 7 | Roadmap / open milestones | 5256 |
@@ -9636,7 +9637,245 @@ misled into thinking M6 is where the work ends.
 
 ---
 
+### 4.81 Loadable driver modules (§M67)
+
+**2026-08-27.**  §M66 made every driver operation work through a slot table
+rather than an index into the linker's `drivers` section, and left
+`driver_attach()` as an entry point with no caller.  §M67 is what fills it: a
+relocatable ELF object on disk becomes a `struct driver` the rest of the system
+cannot tell apart from a built-in one.
+
+**Definition of done, met:** a driver built as a separate object, not linked
+into the kernel, loaded at runtime, appearing in `lsdrv` as `(loaded)`, driving
+real hardware, and unloadable again — with a version mismatch refused loudly
+rather than executed.
+
+#### The four parts
+
+**1. The symbol table — a registry, not a scrape.**  §M67's plan proposed
+generating the table by running `nm` over the linked kernel, the way Linux's
+kallsyms works.  That was rejected for two reasons.  It needs a MULTI-PASS LINK
+(the table's size changes every address it records), and — the real objection —
+it makes the export surface ACCIDENTAL: every non-static function in the tree
+becomes part of a contract nobody decided on.
+
+`EXPORT_SYMBOL()` drops a `{name, address}` pair into a `ksyms` linker section,
+the same trick as `DRIVER()`, `CONFIG_KEY()` and `CRASH_SINK()`.  The answer to
+"what may a module call?" is a list somebody wrote, and removing a line from it
+is a breaking change that looks like one.  **41 symbols on i386, 22 on
+aarch64** — and the difference is real rather than an oversight (see below).
+`ksyms [filter]` prints it, because "unresolved symbol X" is only actionable
+next to the list of what is available.
+
+**THE PART NOBODY DESIGNS FOR: THE COMPILER'S RUNTIME.**  The first module
+built against the list failed to load on one symbol, and it was not a kernel
+function — `__udivdi3`.  A 64-bit division on i386 is not an instruction, so
+GCC calls into libgcc, which is linked into the kernel and not into the module.
+Nothing in the driver's source mentions it; it is there because the driver
+divides a `uint64_t`.  Worth writing down for how it would look to somebody
+porting a driver: the code compiles, the module builds, and `insmod` refuses it
+naming a symbol that occurs nowhere in the source.  The div/mod/shift helpers
+are exported on i386 only — the 64-bit arches do those in hardware, and listing
+them there fails the LINK, which is a tidy demonstration that this really is
+arch-specific.
+
+**2. The versioned ABI — two checks, and neither is sufficient alone.**
+
+  * A **structural fingerprint**: the sizes of every struct a module can see,
+    computed by the compiler on BOTH sides from the real headers
+    (`MODULE_ABI_STRUCTS()`, an X-macro list).  Nobody has to remember to update
+    it — adding a field to `struct driver` changes the number automatically.  It
+    catches LAYOUT changes, the common case and the one with the nastiest
+    failure mode.  A mismatch names WHICH struct moved: *"struct driver is 20
+    bytes here, 24 in the module"*.
+  * **`DOS_MODULE_ABI`**, a number bumped by hand, because a fingerprint cannot
+    see SEMANTICS.
+
+The second earned its place the same day.  `driver_ops.shutdown` had to change
+from `void (*)(void*)` to `int (*)(void*)` (see below) — **a signature change
+that altered no struct's size at all**, so the automatic check saw nothing and a
+module built against the old one would have had its refusal read as success.
+The number went from 1 to 2.
+
+The descriptor's SCALARS come before its pointers on purpose, so the loader can
+read the fingerprint straight out of the file with no relocation applied: a
+module that is going to be refused costs one read and no allocation.
+
+**3. The loader.**  A relocatable object (`gcc -c`), not a shared object: a .so
+resolves its imports through a GOT/PLT that a dynamic linker fills in, which
+means running a linker inside the kernel.  A relocatable object asks for
+neither — every reference to the outside world is an explicit relocation against
+an undefined symbol, and resolving those against the export table IS the link.
+
+Four steps in a deliberate order — validate before allocating, place, relocate,
+attach.  **An unknown relocation type is REFUSED, never skipped**: a skipped
+relocation is a pointer that stays zero or a call that lands at a random offset,
+and it fails at first use, arbitrarily far from the load that caused it.
+i386 `R_386_32/PC32/PLT32`; x86_64 `R_X86_64_64/PC32/PLT32/32/32S`; aarch64
+`ABS64/ABS32/PREL32/CALL26/JUMP26/ADR_PREL_PG_HI21` and the `LO12` family, whose
+immediates are **scaled by the access size** — getting that shift wrong does not
+fail to build and does not fault, it reads the right page at the wrong offset.
+
+**4. Unload.**  Stop through the registry, detach, then free — in that order,
+because the memory being freed is the code that would otherwise still be on
+somebody's call stack.  `driver_detach()` refuses a driver that is still running
+and refuses a BUILT-IN one outright (its descriptor is in the kernel's own
+rodata; removing the slot would hide a driver that still exists rather than
+remove one).  Its compaction preserves ORDER, because `driver_shutdown_all`
+walks the table backwards for reverse-init order — swapping the last slot into
+the hole would be cheaper and would silently corrupt that, a bug that shows up
+only at power-off on a machine that has unloaded a module.
+
+#### THE BUG §M66 LEFT AND §M67 MADE FATAL
+
+§M66 already had drivers that could refuse to stop — `audio_unregister` waits
+for users and declines rather than unlinking under one — but `shutdown` returned
+`void`, so the refusal reached nobody and `driver_stop` cleared INITED anyway.
+That was survivable for exactly one reason: **a built-in driver's code cannot be
+freed**, so the worst case was a registry pointing at a driver that was still
+there.
+
+`rmmod` frees it.  A refusal nobody propagates became a use-after-free on the
+first call into a device that was never really withdrawn.  `shutdown` returns
+`int` now, `driver_stop` honours it (*"'hda' refused to stop — it is still in
+use"*), `driver_fault` only clears INITED if the stop succeeded, and
+`driver_shutdown_all` proceeds anyway on a power-off but COUNTS the refusals
+separately so the line does not claim more than happened.
+
+**And a module with no shutdown hook is refused at LOAD time.**  §M66 refused to
+STOP such a driver; for a module the consequence is sharper — code that can
+never be stopped is a module that can never be removed, i.e. a leak by
+construction.  The loopback driver had `.shutdown = NULL`, and this is what made
+it grow one (plus `net_unregister`, which the tree had never needed).
+
+#### THE LOADER BUG, AND WHY IT LOOKED LIKE ANYTHING BUT A LOADER BUG
+
+The measuring pass laid sections out at offsets from 0; the placing pass laid
+them out at ADDRESSES from a 16-byte-aligned base.  Those agree only when the
+base is at least as aligned as every section wants — **true on i386, where
+nothing asked for more than 16, and false on x86_64, where GCC gives `.data` and
+`.bss` an alignment of 32.**  The placing pass then advanced further than the
+measurement had predicted and the last section ran off the end of the
+allocation.
+
+The symptom was not a crash.  The module loaded, the driver probed, the codec
+answered, the interrupt installed — **every bring-up value printed identically
+to the working arch** — and only the audio came out wrong: peak 32620 instead of
+8000, 1030 Hz instead of 443, left and right no longer equal, because the
+module's `.bss` overlapped whatever the heap handed out next.
+
+Fixed by computing the layout ONCE, in offsets, and over-aligning the image to
+the strictest section alignment rather than to a constant — so the two passes
+are the same arithmetic instead of two arithmetics that have to be kept in step.
+
+#### What ships, and the arch split
+
+`hda` (Intel HDA — MMIO BAR, codec verb interface, DMA ring, completion
+interrupt) on the two x86 arches, and **`loopback` on all three**.  That split is
+the point: without a portable module the loader would be an x86 feature with
+untested relocation code on the third arch — the one-arch-only shape this tree
+keeps paying for (§4.63's `setconf`, §M24's network commands, §M23's `/dev`).
+
+Both are built from **the same source file** as the built-in form; the only
+difference is the registration (`DRIVER()` versus `DOS_MODULE()`), which is the
+claim worth making — a loadable module is not a different KIND of driver.
+
+The module's CFLAGS are DERIVED from the kernel's.  That is not a convenience,
+it is the ABI: on x86_64 the kernel is built `-mcmodel=large`, and a module
+built without it would emit 32-bit-displacement calls and land out of range of
+the kernel it is calling into.
+
+`modules.autoload` (default on) loads `/modules/*.ko` at boot, so behaviour is
+unchanged for anyone who never types `insmod` — and the loader is exercised on
+every boot on every arch rather than only when a test asks for it.  The
+deliberately-broken fixtures live in `/modules/test`, which autoload does not
+descend into: *a test fixture that pollutes normal operation stops being run.*
+
+#### WHAT THIS IS NOT
+
+Module code runs in ring 0, in the one address space, with no isolation.  There
+is no W^X either — the kernel heap is executable on all three arches today
+(i386 has no NX without PAE; x86_64 defines `PTE_NX` and does not use it;
+aarch64's kernel identity map does not set PXN), which is why the loader can
+place code in `kmalloc`'d memory.  That is a fact about the current tree, not a
+design goal.
+
+**A module is as trusted as the kernel.**  The version check stops a STALE
+module, not a hostile one, and is not offered as a security boundary.  Until
+§M33's execution domains exist, the honest scope is modules built from THIS
+tree — which is also why §M67 was safe to ship before §M33: its first customer
+is our own code, differently packaged.
+
+#### Verified
+
+**i386** — `lsdrv` on a fresh boot with `modules.autoload = 0` has no `hda` at
+all; `insmod /modules/hda.ko` reports *7384 bytes, 214 relocations, 55 kernel
+symbols*, the hot-plug rescan starts it, and `play dsptest` measures **300.0 ms,
+peak 8000, 443.3 Hz, L == R, zero internal silence** — byte-identical to the
+built-in driver's numbers.  `drv stop hda` + `rmmod hda` → detached, unloaded,
+gone from `lsdrv`.  Both stale fixtures refused by name.  Copied to the exFAT
+volume, **rebooted**, and loaded from `/mnt/modules/hda.ko` — the same numbers,
+off the disk.
+
+**x86_64** — *10064 bytes, 295 relocations, 52 kernel symbols*; same audio
+figures; `struct driver` correctly reported as 40 bytes there against the
+fixture's 44.
+
+**aarch64** — the loopback module: *101 relocations, 3 kernel symbols*, `ping
+127.0.0.1` replies, stale fixture refused, `drv stop` + `rmmod` unloads it, and
+a subsequent `ping` answers **"no route to host"** — which is what proves the
+device really left the registry rather than merely being marked down.
+
+New: `insmod`, `rmmod`, `lsmod`, `ksyms`, `cp` (the shell could `rm` and could
+not copy, which is what made "put a module on the persistent volume"
+impossible), `modules.autoload`, `scripts/make-stale-module.py`.
+
+#### FOUND, NOT CAUSED HERE: an intermittent HDA defect (§M23)
+
+The module work left a machine idle after playback for the first time, and the
+capture showed the sound REPLAYING every 682.7 ms — which is exactly one
+revolution of the 32-entry BDL, because an HDA stream is cyclic and only stops
+when the driver stops it.
+
+Reproduced and then **isolated by building the same driver both ways**: with
+`hda` BUILT IN the identical signature appears at the identical rate, on both
+x86 arches.  It is a §M23 defect, not a §M67 one.  Two faces, roughly one run in
+four:
+
+  * `play` never returns and the stream replays the whole ring forever; and
+  * the capture contains a **882-sample (20.0 ms = `HDA_SETTLE_MS`) silence**
+    mid-sound, after which the remainder plays at near-full scale with
+    L != R — i.e. the drain fires in the middle of the stream.
+
+One arithmetic error was found and fixed along the way and is worth recording
+even though it did NOT fix the hang: `hda_drain`'s budget was
+`HDA_DEPTH (4) buffers + 500 ms = 585 ms`, while its condition
+(`(head - cur) & 31 == 0`) can legitimately need a **full revolution, 682.7 ms**
+— the deadline was shorter than the time its own condition could take.  It now
+covers `HDA_NBUF`.
+
+*Not root-caused, and said plainly.*  The reproduction recipe is the part §M23
+never had: `insmod` the module, `play dsptest`, leave the machine idle, and
+measure the capture for repeats at 682.7 ms.  AC97 is unaffected (one clean
+300.0 ms burst followed by ten seconds of silence), which is the control that
+makes the finding specific.
+
+---
+
 ## 8. Change log
+
+- **2026-08-27 — §M67: loadable driver modules (DOCS §4.81).**  A relocatable
+  ELF object on disk becomes a driver the registry cannot tell apart from a
+  built-in one: an `EXPORT_SYMBOL()` table (a list somebody wrote, not a scrape
+  of the kernel), a version check that is a compiler-computed struct fingerprint
+  PLUS a hand-bumped number for the semantics it cannot see, an ELF relocator
+  for all three arches, and unload.  `driver_ops.shutdown` had to start
+  RETURNING something — §M66's refusals reached nobody, which was survivable
+  only while a driver's code could never be freed.  Ships `hda` on x86 and
+  `loopback` everywhere, built from the same sources as the built-in form.
+  Measured identical audio to the built-in driver on both x86 arches and a live
+  `ping` through the ARM module.  Also found (and isolated to §M23, not to this
+  work) an intermittent HDA defect that replays a sound every 682.7 ms.
 
 - **2026-08-25 — §M66: driver agility (DOCS §4.80).**  Orderly shutdown (which
   had been declared since §M8 and never called), device lifetimes that let a

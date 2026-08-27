@@ -17,7 +17,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M66"                 /* highest completed number: §M66 driver agility */
+#define DOS_MILESTONE  "M67"                 /* highest completed number: §M67 loadable modules */
 
 /* An OLDER section completed after that number shipped.  Empty ("") when there
  * is nothing to say — and it must be CLEARED when the next numbered milestone

@@ -991,10 +991,11 @@ static int xhci_init(void* ctx) {
     return 0;
 }
 
-static void xhci_shutdown(void* ctx) {
+static int xhci_shutdown(void* ctx) {
     (void)ctx;
-    if (!xhc.present) return;
+    if (!xhc.present) return 0;
     mmio_w32(xhc.op, XHCI_OP_USBCMD, 0);  /* halt */
+    return 0;
 }
 
 static const struct driver_ops xhci_ops = {

@@ -243,12 +243,23 @@ static void tcploss_server(void) {
     __atomic_store_n(&g_tl_srv_done, 1, __ATOMIC_RELEASE);
 }
 
+/* §M67 — the loopback driver is a module; its test hooks may not be there.
+ * A weak symbol that is absent is a call through zero, so every use is gated
+ * and the refusal names the reason rather than doing nothing. */
+static int lo_hooks_ready(const char* what) {
+    if (loopback_set_drop && loopback_stats) return 1;
+    kprintf("%s: the loopback module is not loaded"
+            " (insmod /modules/loopback.ko)\n", what);
+    return 0;
+}
+
 static void tcploss_retrans_row(const struct net_tcp_info* i, void* ctx) {
     (void)ctx;
     g_tl_retrans += i->retrans;
 }
 
 void netcmd_tcploss(const char* args) {
+    if (!lo_hooks_ready("tcploss")) return;
     int permille = 0, kb = 0, have_pm = 0;
     while (*args == ' ') args++;
     for (; *args >= '0' && *args <= '9'; args++) { permille = permille * 10 + (*args - '0'); have_pm = 1; }
@@ -362,6 +373,7 @@ void netcmd_tcploss(const char* args) {
 /* `lo drop <permille>` — the instrument itself, exposed so a person can leave
  * it on and watch another command survive (or not). */
 void netcmd_lo(const char* args) {
+    if (!lo_hooks_ready("lo")) return;
     while (*args == ' ') args++;
     if (nc_starts(args, "drop")) {
         args += 4;

@@ -333,8 +333,28 @@ static uint32_t hda_outstanding(struct hda* h) {
 static void hda_drain(struct audio_dev* dev) {
     struct hda* h = (struct hda*)dev->priv;
     if (!h->running) return;
+    /* THE BUDGET MUST COVER A FULL RING REVOLUTION, NOT THE QUEUE DEPTH.
+     *
+     * `hda_outstanding` is `(head - cur) & (HDA_NBUF-1)` — the distance from
+     * the hardware's position to ours, around a 32-entry ring.  It reaches zero
+     * when `cur` catches up with `head`, and since an HDA stream is CYCLIC
+     * `cur` keeps going after the queued region: in the worst case it has to
+     * travel all 32 entries to get there.
+     *
+     * The old budget was HDA_DEPTH (4) buffers plus the grace: 85 + 500 =
+     * 585 ms.  A full revolution is 32 * 1024 / 48000 = 682.7 ms.  So THE
+     * DEADLINE WAS SHORTER THAN THE TIME ITS OWN CONDITION CAN LEGITIMATELY
+     * NEED, and a drain that started at an unlucky ring position could not
+     * succeed — it timed out, and a timed-out drain leaves the stream running,
+     * which for a cyclic engine means replaying the sound every 682.7 ms
+     * forever.
+     *
+     * FOUND BY §M67, and only because a module test left the machine idle
+     * afterwards: every earlier measurement of this driver either stopped it
+     * immediately or ran shorter than one revolution, so the replay had nowhere
+     * to show up.  The 682.7 ms spacing in the capture is what named it. */
     uint64_t deadline = timer_ticks_ms() +
-                        (HDA_DEPTH * HDA_BUF_FRAMES * 1000ull) /
+                        (HDA_NBUF * HDA_BUF_FRAMES * 1000ull) /
                         (dev->rate ? dev->rate : 48000u) + HDA_DRAIN_GRACE_MS;
     while (hda_outstanding(h)) {
         if (timer_ticks_ms() > deadline) { kprintf("hda: drain timeout\n"); break; }
@@ -650,17 +670,19 @@ static int hda_init(void* ctx) {
 /* Same reason as AC97's: a running stream descriptor is a live bus master.
  * Interrupts go off too — an IRQ taken after the handler's assumptions stop
  * holding is a fault with a confusing address. */
-static void hda_shutdown(void* ctx) {
+static int hda_shutdown(void* ctx) {
     (void)ctx;
-    if (!g_hda.mmio) return;
-    /* Withdraw first — see the same call in ac97.c for why. */
-    if (audio_unregister(&g_audio) != 0) return;
+    if (!g_hda.mmio) return 0;
+    /* Withdraw first, and PROPAGATE the refusal — see the same call in ac97.c
+     * for both halves of why. */
+    if (audio_unregister(&g_audio) != 0) return -1;
     mw32(g_hda.mmio, HDA_INTCTL, 0);
     mw8(sd_reg(&g_hda), SD_CTL, 0);
     if (g_hda.has_input) mw8(in_sd_reg(&g_hda), SD_CTL, 0);
     g_hda.running = 0;
     g_hda.rec_running = 0;
     kprintf("hda: streams stopped\n");
+    return 0;
 }
 
 static const struct driver_ops hda_ops = {
@@ -669,4 +691,38 @@ static const struct driver_ops hda_ops = {
     .shutdown = hda_shutdown,
 };
 
+/* =============================================================================
+ * §M67 — THE SAME SOURCE FILE, EITHER IN THE IMAGE OR OUT OF IT.
+ *
+ * This is the only part of the driver that differs between the two builds, and
+ * that is the claim worth making: a loadable module is not a different KIND of
+ * driver, it is the same code with a different registration.  Everything above
+ * this line — the MMIO mapping, the codec verbs, the DMA ring, the completion
+ * interrupt — is compiled identically both ways.
+ *
+ * The built-in form drops a `struct driver` into the linker's `drivers`
+ * section.  The module form cannot: the linker that produced the running kernel
+ * has long since finished, so instead it publishes a descriptor plus an ABI
+ * fingerprint in `.dosmod`, and the loader calls §M66's `driver_attach` with it.
+ *
+ * NOTE THE `const` DIFFERENCE, it is not cosmetic.  DRIVER() emits a `const`
+ * descriptor, which is correct for something the linker placed in rodata.  A
+ * module's descriptor is NOT const: the registry holds a `struct driver*`, and
+ * more importantly the descriptor has to outlive the load in memory the module
+ * owns and the unload frees.
+ * ============================================================================= */
+#ifdef DOS_MODULE_BUILD
+#include "module_abi.h"
+
+static struct driver hda_driver = {
+    .name    = "hda",
+    .class   = "audio",
+    .ops     = &hda_ops,
+    .ctx     = NULL,
+    .version = DOS_VERSION,
+};
+
+DOS_MODULE("hda", &hda_driver, NULL, NULL);
+#else
 DRIVER(hda, "audio", &hda_ops, NULL);
+#endif
