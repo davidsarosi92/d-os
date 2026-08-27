@@ -10061,9 +10061,66 @@ isolation; Tier 2 — DMA drivers in ring 3 with client reconnection, which is t
 genuinely pervasive part.  `driver.profile` (desktop|server) is deliberately
 absent: with one reachable domain it would be a key with one legal value.
 
+**§M33 stage 2 addendum (2026-08-27) — the driver-runtime API.**  The narrow
+waist a driver is written against instead of calling `outb` / `vmm_map` /
+`irq_install`.  Defined in its FINAL, IPC-shaped form while only the in-kernel
+backend exists — convention #5, and this is the case it was written for: a
+"we'll wrap it later" version would work perfectly, would not fit a process
+boundary, and nobody would find out until Tier 1.
+
+Four rules decide the shape.  **Handles, not pointers** (a pointer is
+meaningless in another address space).  **Offsets, not absolute addresses** —
+`drv_out8(h, off, v)`, so a driver *cannot express* an access outside its grant,
+and the bound is checked in the in-kernel backend too, because a check that only
+runs in the configuration nobody tests is a check that does not work.  **The
+driver waits; it is not called** — `drv_irq_wait()` blocks, so the ISR does
+exactly one thing (count and wake) and no second thing; §M49 had to lift the
+xHCI drain out of an ISR by hand and §M55 did the same for the NIC, and this
+makes that shape the only one on offer.  **One context owns everything**, so
+`drv_release_all()` makes the shutdown hook §M66 requires mechanical rather than
+a checklist.  DMA carries **two addresses**, CPU and device, which are equal on
+every target here and will not be under an IOMMU — separating them now is free
+and finding every driver that conflated them later is not.
+
+**`ps2_mouse` is ported to it**, and that is the point: a new interface cannot
+answer *is it sufficient, or merely plausible?* about itself.  Nothing in the
+driver calls `inb`, `outb` or `irq_install` any more; ports 0x60/0x64 became
+offsets 0 and 4 of a five-port grant, and the ISR became a task blocking in
+`drv_irq_wait`.  The packet decoding, the sync recovery and the IntelliMouse
+knock are untouched — the parts that are about the HARDWARE did not have to
+move.  It is also now a `DRIVER()` rather than a `MODULE()`, so it has the
+lifecycle §M66 gave the registry.
+
+**A boot-order problem the API had to own.**  `driver_init_all()` runs BEFORE
+`task_init()`, so a driver bringing itself up at boot has no scheduler to spawn
+into.  `drv_run()` spawns immediately if the scheduler is up and QUEUES
+otherwise; `drvrt_start_deferred()` flushes the queue from each boot path.  A
+driver started later — a hot-plug rescan, `drv start`, an `insmod` — takes the
+immediate path and never learns there was a question.
+
+Verified by driving the pointer: 31 mouse steps, the cursor lands at
+(1621,1172) for a target of ~(1620,1170), and `drv res` reports **220
+interrupts on line 12** — so the interrupt path is the one doing the work and
+the one-second backstop is a backstop rather than the real mechanism wearing a
+fallback's name.  New: `drv res`, which prints what each driver holds — the
+first question after reading "IRQ 12 is held by ps2-mouse" is what else it has.
+
+*A measurement lesson at my own expense: an earlier run reported `0 fired` and I
+wrote a confident explanation into the source about the poll starving the
+interrupt.  It was wrong — the harness runs every typed `--cmd` BEFORE any
+`--monitor-cmd`, so `drv res` had been asked before the mouse ever moved.  The
+comment was corrected; the number is what settled it, not the story.*
+
 ---
 
 ## 8. Change log
+
+- **2026-08-27 — §M33 stage 2: the driver-runtime API (DOCS §4.82).**  The
+  narrow waist — handles not pointers, offsets not addresses, a driver that
+  WAITS on an interrupt rather than being called, and one context that owns
+  every resource.  Defined in its final IPC-shaped form with only the in-kernel
+  backend built, and proven by porting `ps2_mouse` to it: 220 measured
+  interrupts and a pointer that lands where it was driven.
 
 - **2026-08-27 — §M33 Tier 0: execution domains + driver fault containment
   (DOCS §4.82).**  A driver's placement becomes a DECLARED capability of the

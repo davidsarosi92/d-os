@@ -3159,10 +3159,15 @@ when the driver held a lock (a deadlock is worse than a panic), and IRQ handlers
 are not guarded (no caller to unwind to).
 
 **Still open, in the order they unblock each other:**
-  * **Tier 1** — the driver-runtime API (`drv_port_out`, `drv_mmio_map`,
-    `drv_irq_wait`, `drv_dma_alloc`) and its user-mode backend, then a first
-    NON-DMA driver in ring 3.  This is what makes `DOMAIN_USER` enforceable and
-    therefore what `domain_enforceable()` is waiting for.
+  * ~~The driver-runtime API~~ — **shipped 2026-08-27** (stage 2, DOCS §4.82):
+    handles not pointers, offsets not addresses, `drv_irq_wait` blocks, one
+    context owns everything, DMA carries CPU and device addresses separately.
+    `ps2_mouse` is ported to it and measured.
+  * **Tier 1** — the API's USER-MODE backend: port grants into the TSS I/O
+    bitmap, MMIO mapped into the driver's own space, `drv_irq_wait` as a
+    syscall, clients reached over IPC — then that same `ps2_mouse` source in
+    ring 3.  This is what makes `DOMAIN_USER` enforceable and therefore what
+    `domain_enforceable()` is waiting for.
   * **Stage 5 — an IOMMU driver.**  Until it exists a DMA driver outside the
     kernel is placement, not isolation, and the code marks it `ADVISORY(!)`.
   * **Tier 2** — DMA drivers in ring 3 with clean teardown and CLIENT

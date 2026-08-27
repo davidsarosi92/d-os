@@ -23,6 +23,7 @@
 #include "settings.h"
 #include "drvguard.h"    /* §M33 Tier 0 — guarded driver entry points */
 #include "domain.h"       /* §M33 — declared placement */
+#include "drvrt.h"        /* §M33 stage 2 — drv res */
 #include <stddef.h>
 
 /* ----------------------------------------------------------------------
@@ -655,9 +656,13 @@ void driver_cmd(const char* args) {
      * works.  A safety net nobody has fallen into is a safety net nobody has
      * tested — §M31's argument for `hardlock`, one layer over. */
     if (str_eq(verb, "crash")) { driver_crash(args); return; }
+    /* §M33 stage 2 — what each driver actually HOLDS.  Worth its own verb
+     * because a resource conflict's message names the holder, and the first
+     * question after reading one is "what else does it have". */
+    if (str_eq(verb, "res"))   { drv_res_dump(); return; }
 
     kprintf("drv: list | rescan | stop <name> | start <name> | swap <from> <to>"
-            " | fault <name> | domain [<name> <where>] | crash <name>\n");
+            " | fault <name> | domain [<name> <where>] | crash <name> | res\n");
 }
 
 /* ----------------------------------------------------------------------

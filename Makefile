@@ -657,6 +657,7 @@ CORE_C_SRCS := \
     kernel/core/driver.c \
     kernel/core/domain.c \
     kernel/core/drvguard.c \
+    kernel/core/drvrt.c \
     kernel/core/ksym.c \
     kernel/core/modload.c \
     kernel/core/config.c \
@@ -794,6 +795,7 @@ CORE_C_SRCS := \
     kernel/core/driver.c \
     kernel/core/domain.c \
     kernel/core/drvguard.c \
+    kernel/core/drvrt.c \
     kernel/core/ksym.c \
     kernel/core/modload.c \
     kernel/core/keymap.c \
@@ -878,6 +880,7 @@ CORE_C_SRCS := \
     kernel/core/driver.c \
     kernel/core/domain.c \
     kernel/core/drvguard.c \
+    kernel/core/drvrt.c \
     kernel/core/ksym.c \
     kernel/core/modload.c \
     kernel/core/config.c \

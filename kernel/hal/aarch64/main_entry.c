@@ -47,6 +47,7 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "block.h"
 #include "block_cache.h"
 #include "config.h"          /* §M63 stage 0 — config_attach_persistent */
+#include "drvrt.h"          /* §M33 stage 2 — deferred driver tasks */
 #include "modload.h"        /* §M67 — modload_autoload() */
 #include "shortcut.h"        /* §M64 tail — shortcut_attach_persistent */
 #include "gui.h"             /* gui_autostart — was an IMPLICIT declaration */
@@ -157,6 +158,9 @@ void aarch64_main_entry(uint64_t dtb) {
 
     /* Scheduler (Phase C): synthesise pid 0 from this context + an idle task. */
     task_init();
+    /* §M33 stage 2 — driver bodies that could not be spawned at
+     * driver_init_all() time, because the scheduler did not exist yet. */
+    drvrt_start_deferred();
 
     /* Per-CPU table (Phase E) — build it now so smp_boot_aps() can register
      * secondary cores.  Runs AFTER task_init (which stamped slot 0's current)

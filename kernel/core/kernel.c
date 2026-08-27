@@ -72,6 +72,7 @@
 #include "proc.h"                /* proc_exec_elf — x86_64 musl boot self-test */
 #include "gui.h"                 /* gui_autostart — boot into the desktop */
 #include "pkg.h"                 /* pkg_init — provision ld.so for the x86_64 test hook */
+#include "drvrt.h"          /* §M33 stage 2 — deferred driver tasks */
 #include "modload.h"        /* §M67 — modload_autoload() */
 #include "timer.h"
 #include "vc.h"
@@ -184,6 +185,9 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * current execution context so subsequent `task_spawn` calls have
      * something to schedule against. */
     task_init();
+    /* §M33 stage 2 — driver bodies that could not be spawned at
+     * driver_init_all() time, because the scheduler did not exist yet. */
+    drvrt_start_deferred();
 
     /* ACPI discovery — enables soft-off via `shutdown`, and on the
      * same pass enumerates LAPIC + IOAPIC topology for SMP (M18). */
