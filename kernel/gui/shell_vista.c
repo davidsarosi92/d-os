@@ -33,11 +33,28 @@
 #define TASKBAR_H   34
 #define START_W     74
 #define TBTN_W      150
-/* Clock panel: "YYYY-MM-DD  HH:MM:SS  XX" = 24 glyphs + padding.  The date and
- * the active keyboard layout live here because both are things you check by
- * glancing at the corner, not by running a command — and a wrong layout is the
- * single most confusing thing that can happen while typing. */
-#define CLOCK_W     212
+/* Clock panel: "YYYY-MM-DD  HH:MM:SS" = 20 glyphs + padding.
+ *
+ * THE LAYOUT USED TO BE APPENDED HERE and is not any more: it has its own
+ * indicator now (below), and a fact displayed in two places is two things that
+ * can drift.  The same argument the sound work made — the taskbar control and
+ * the Control Panel page write the SAME keys, so there is one answer to "what
+ * is the volume" rather than two. */
+#define CLOCK_W     180
+/* §M67 tail — the keyboard-layout indicator, immediately LEFT of the sound one.
+ * Same shape and the same rules: always drawn, one flyout at a time, the
+ * geometry in one place so draw and hit-test cannot disagree.
+ *
+ * It is wider than the sound button because it shows the layout's NAME rather
+ * than a state: an icon alone would say "this is about the keyboard" and leave
+ * the one question the indicator exists to answer — *which* layout — unanswered,
+ * and a wrong layout is the single most confusing thing that can happen while
+ * typing. */
+#define KBD_W       52
+#define KBD_ICON    20
+#define KBDPOP_W    150
+#define KBDPOP_ROW  22
+#define KBD_MAX     8            /* layouts the flyout will show; see kbd_names */
 /* §M23 — the sound indicator, immediately left of the clock.  Square, so the
  * icon renderer gets the box it expects. */
 #define VOL_W       28
@@ -359,6 +376,8 @@ static char clock_str[CLOCK_STR_MAX] = "";
 
 /* §M23 — sound indicator + its flyout. */
 static int vol_pop_open = 0;
+/* §M67 tail — keyboard indicator + its flyout. */
+static int kbd_pop_open = 0;
 
 /* The button's box, so draw and hit-test cannot disagree about where it is. */
 static void vol_box(int* x, int* y, int* w, int* h) {
@@ -378,6 +397,44 @@ static int vol_icon_id(void) {
     audio_master_get(&vol, &muted);
     return (muted || vol == 0) ? ICON_VOLUME_MUTED : ICON_VOLUME;
 }
+
+/* The registered layouts, collected once per flyout open.
+ *
+ * COLLECTED RATHER THAN QUERIED PER ROW: `keymap_for_each` is a callback walk,
+ * and calling it from inside draw AND from inside the hit test would be two
+ * walks that could disagree about row order the moment a layout is registered
+ * between them.  One snapshot, read by both. */
+static const char* kbd_names[KBD_MAX];
+static int         kbd_count;
+
+static void kbd_collect_one(const struct kbd_layout* l, void* ctx) {
+    (void)ctx;
+    if (kbd_count < KBD_MAX && l && l->name) kbd_names[kbd_count++] = l->name;
+}
+
+static void kbd_collect(void) {
+    kbd_count = 0;
+    keymap_for_each(kbd_collect_one, NULL);
+}
+
+/* The button's box — the same one-place rule as vol_box. */
+static void kbd_box(int* x, int* y, int* w, int* h) {
+    *x = scr_w - CLOCK_W - VOL_W - KBD_W;
+    *y = scr_h - TASKBAR_H + (TASKBAR_H - KBD_ICON) / 2;
+    *w = KBD_W;
+    *h = KBD_ICON;
+}
+
+static int kbdpop_h(void) {
+    int rows = kbd_count > 0 ? kbd_count : 1;
+    return rows * KBDPOP_ROW + 26;          /* + title row + padding */
+}
+static int kbdpop_x(void) {
+    int x = scr_w - CLOCK_W - VOL_W - KBDPOP_W;
+    if (x < 0) x = 0;
+    return x;
+}
+static int kbdpop_y(void) { return scr_h - TASKBAR_H - kbdpop_h(); }
 
 static int volpop_x(void) {
     int x = scr_w - CLOCK_W - VOLPOP_W;
@@ -410,6 +467,8 @@ static void publish_popup(void) {
     if (menu_open)         gui_panel_set_popup(1, 4, menu_top(), SM_W, menu_h());
     else if (vol_pop_open) gui_panel_set_popup(1, volpop_x(), volpop_y(),
                                                VOLPOP_W, VOLPOP_H);
+    else if (kbd_pop_open) gui_panel_set_popup(1, kbdpop_x(), kbdpop_y(),
+                                               KBDPOP_W, kbdpop_h());
     else                   gui_panel_set_popup(0, 0, 0, 0, 0);
 }
 
@@ -448,6 +507,8 @@ static void vista_init(int w, int h) {
     scr_h = h;
     menu_open = 0;
     menu_hover = -1;
+    vol_pop_open = 0;
+    kbd_pop_open = 0;
     clock_str[0] = 0;
     publish_popup();
 
@@ -525,6 +586,61 @@ static void vista_draw(struct gfx_surface* back) {
         int vx, vy, vw, vh;
         vol_box(&vx, &vy, &vw, &vh);
         icon_draw(back, vx + (vw - VOL_ICON) / 2, vy, VOL_ICON, vol_icon_id());
+    }
+
+    /* §M67 tail — the keyboard indicator: icon + the active layout's name.
+     * ALWAYS DRAWN, for the reason the sound button is: a control that
+     * disappears leaves nothing to point at.  The name is upper-cased because
+     * that is how every other system writes a layout code, and because two
+     * upper-case glyphs are distinguishable at a glance in a way lower-case
+     * ones are not. */
+    {
+        int kx, ky, kw, kh;
+        kbd_box(&kx, &ky, &kw, &kh);
+        icon_draw(back, kx + 2, ky, KBD_ICON, ICON_KEYBOARD);
+        const char* kb = keymap_current();
+        if (kb && kb[0]) {
+            char up[4];
+            int i = 0;
+            for (; kb[i] && i < 3; i++) {
+                char c = kb[i];
+                up[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+            }
+            up[i] = 0;
+            gfx_text(back, kx + KBD_ICON + 4,
+                     ty + (TASKBAR_H - GFX_GLYPH_H) / 2, up, COL_TEXT);
+        }
+    }
+
+    /* The keyboard flyout — one row per registered layout, the active one
+     * marked.  A LIST, not a cycle button: with two layouts a cycle is
+     * indistinguishable from a choice, and with three it becomes a guessing
+     * game about what comes next. */
+    if (kbd_pop_open) {
+        int px = kbdpop_x(), py = kbdpop_y(), ph = kbdpop_h();
+        gfx_fill(back, px, py, KBDPOP_W, ph, COL_SM_BG);
+        gfx_fill(back, px, py, KBDPOP_W, 1, COL_TB_HILITE);
+        gfx_fill(back, px, py, 1, ph, COL_TB_HILITE);
+        gfx_fill(back, px + KBDPOP_W - 1, py, 1, ph, 0xFF141B26u);
+
+        gfx_text(back, px + 10, py + 8, "Keyboard layout", COL_TB_HILITE);
+        gfx_fill(back, px + 8, py + 22, KBDPOP_W - 16, 1, COL_SEP);
+
+        const char* cur = keymap_current();
+        for (int i = 0; i < kbd_count; i++) {
+            int iy = py + 26 + i * KBDPOP_ROW;
+            int active = cur && kbd_names[i] &&
+                         cur[0] == kbd_names[i][0] && cur[1] == kbd_names[i][1];
+            if (active) gfx_fill(back, px + 4, iy - 2, KBDPOP_W - 8, KBDPOP_ROW,
+                                 COL_SM_HOVER);
+            /* The marker is a GLYPH, not just the highlight: a selection shown
+             * only by a background colour is invisible in a screenshot taken
+             * for a bug report, and this project's tests read pixels. */
+            gfx_text(back, px + 10, iy + 2, active ? "*" : " ", COL_TEXT);
+            gfx_text(back, px + 24, iy + 2, kbd_names[i], COL_TEXT);
+        }
+        if (kbd_count == 0)
+            gfx_text(back, px + 10, py + 28, "no layouts", COL_TB_HILITE);
     }
 
     /* §M23 — the volume flyout. */
@@ -667,13 +783,62 @@ static int vista_click(int x, int y) {
         /* fall through: a click outside only dismissed the flyout */
     }
 
+    /* §M67 tail — the keyboard flyout, under the SAME rule as the sound one:
+     * while it is open it owns the next click wherever that lands, and must
+     * not also reach the window underneath (§M65's popup rule). */
+    if (kbd_pop_open) {
+        int px = kbdpop_x(), py = kbdpop_y(), ph = kbdpop_h();
+        int inside = (x >= px && x < px + KBDPOP_W && y >= py && y < py + ph);
+        if (inside) {
+            int idx = (y - (py + 26)) / KBDPOP_ROW;
+            if (idx >= 0 && idx < kbd_count && kbd_names[idx]) {
+                /* config_apply, NOT keymap_select.
+                 *
+                 * The difference is the whole reason §M63 stage 0 exists.
+                 * `keymap_select` changes the live layout and nothing else, so
+                 * the setting would revert at the next boot while the panel and
+                 * the store both said otherwise.  `config_apply` records the
+                 * decision and NOTIFIES — the keymap watcher does the actual
+                 * switch — so this control, `setlayout`, and the Control
+                 * Panel's Region page all go through one path and cannot
+                 * disagree about what the layout is. */
+                config_apply("keyboard.layout", kbd_names[idx]);
+                kbd_pop_open = 0;
+                publish_popup();
+                gui_request_frame();
+                return 1;
+            }
+        }
+        kbd_pop_open = 0;
+        publish_popup();
+        gui_request_frame();
+        if (inside) return 1;
+        /* fall through: a click outside only dismissed the flyout */
+    }
+
     /* The sound button itself. */
     {
         int vx, vy, vw, vh;
         vol_box(&vx, &vy, &vw, &vh);
         if (x >= vx && x < vx + vw && y >= scr_h - TASKBAR_H) {
             vol_pop_open = !vol_pop_open;
+            kbd_pop_open = 0;
             menu_open = 0;                       /* one popup at a time */
+            publish_popup();
+            gui_request_frame();
+            return 1;
+        }
+    }
+
+    /* The keyboard button itself. */
+    {
+        int kx, ky, kw, kh;
+        kbd_box(&kx, &ky, &kw, &kh);
+        if (x >= kx && x < kx + kw && y >= scr_h - TASKBAR_H) {
+            kbd_pop_open = !kbd_pop_open;
+            if (kbd_pop_open) kbd_collect();   /* snapshot for draw + hit test */
+            vol_pop_open = 0;
+            menu_open = 0;
             publish_popup();
             gui_request_frame();
             return 1;
@@ -711,6 +876,8 @@ static int vista_click(int x, int y) {
     if (x >= 4 && x < 4 + START_W) {
         menu_open = !menu_open;
         menu_hover = -1;
+        vol_pop_open = 0;
+        kbd_pop_open = 0;
         publish_popup();
         return 1;
     }
@@ -741,8 +908,10 @@ static int vista_second_tick(void) {
     struct rtc_time t;
     if (rtc_read(&t) != 0) return 0;
 
-    /* "YYYY-MM-DD  HH:MM:SS  XX" — ISO date (unambiguous in every locale),
-     * wall clock, then the active keyboard layout as an upper-case ISO code. */
+    /* "YYYY-MM-DD  HH:MM:SS" — ISO date (unambiguous in every locale) and the
+     * wall clock.  The keyboard layout USED to be appended here and now has its
+     * own indicator with a flyout: showing it in two places would be two things
+     * that can drift, and only one of them can be clicked. */
     char s[CLOCK_STR_MAX];
     int p = 0;
     p = put2(s, p, (unsigned)(t.year / 100));
@@ -754,18 +923,10 @@ static int vista_second_tick(void) {
     p = put2(s, p, t.min);  s[p++] = ':';
     p = put2(s, p, t.sec);
 
-    const char* kb = keymap_current();
-    if (kb && kb[0]) {
-        s[p++] = ' '; s[p++] = ' ';
-        for (int i = 0; kb[i] && p < CLOCK_STR_MAX - 1; i++) {
-            char c = kb[i];
-            s[p++] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
-        }
-    }
     s[p] = 0;
 
-    /* Repaint only on an actual change — the tick fires every second but the
-     * layout (and, most seconds, the date) has not moved. */
+    /* Repaint only on an actual change — the tick fires every second but most
+     * seconds the date has not moved. */
     for (int i = 0; i <= p; i++) {
         if (clock_str[i] != s[i]) {
             for (int j = 0; j <= p; j++) clock_str[j] = s[j];

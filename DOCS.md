@@ -9635,6 +9635,36 @@ ARM64 port's catch-up plan separately, organised by gap rather than by
 milestone.  Kept here only so a reader who lands in this section is not
 misled into thinking M6 is where the work ends.
 
+**Taskbar addendum (2026-08-27) — the keyboard-layout indicator.**  Asked for
+from use: the same treatment the sound icon got, immediately to its LEFT.  Icon
+plus the layout's name, because an icon alone says *"this is about the
+keyboard"* and leaves the one question the indicator exists to answer — WHICH
+layout — unanswered.  The flyout is a LIST with the active row marked, not a
+cycle button: with two layouts a cycle cannot be told apart from a choice, and
+with three it becomes a guessing game about what comes next.
+
+Two things it does NOT do, both deliberate.  It does not call `keymap_select` —
+it calls **`config_apply`**, so the §M63 watcher performs the switch and this
+control, `setlayout` and the Control Panel's Region page all travel one path and
+cannot disagree about what the layout is; `keymap_select` would have changed the
+live layout and left the stored setting saying something else.  And **the clock
+no longer shows the layout**, which it had since §M47: a fact displayed twice is
+two things that can drift, and only one of them can be clicked.
+
+All three chrome popups publish through the one `publish_popup()` function
+(§M23's rule — a second publisher is a second thing that can forget to clear the
+extent, and a stale extent swallows clicks over a window), one is open at a
+time, and the layouts are SNAPSHOT when the flyout opens rather than walked
+separately by draw and by the hit test — two walks of a callback registry can
+disagree about row order.
+
+Verified by driving the mouse: the flyout appears exactly at the box the
+geometry predicts (top highlight, active-row highlight present, 3897 non-
+background pixels of text); clicking the second row logs `keyboard.layout = hu
+(was us)` followed by `keymap: layout now 'hu' (config)` — the config path and
+the live switch, in that order — and the screenshot then shows the flyout gone
+(6603 background pixels → 0) with the button's label re-rendered.
+
 ---
 
 ### 4.81 Loadable driver modules (§M67)
