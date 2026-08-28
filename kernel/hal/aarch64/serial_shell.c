@@ -34,7 +34,8 @@
 #include "percpu.h"    /* §M57 — smp_ncpus() for the runqueue audit + storm */
 #include "timer.h"
 #include "audio.h"
-#include "driver.h"      /* §M23 stage 2 — lsaudio / play, from the core */
+#include "driver.h"
+#include "iommu.h"      /* §M23 stage 2 — lsaudio / play, from the core */
 #include "modload.h"   /* §M67 — insmod / rmmod / lsmod */
 #include "ksym.h"      /* §M67 — ksyms */
 #include "syscall.h"   /* §M53 stage 3 — timerfd + setitimer self-tests */
@@ -654,6 +655,11 @@ void serial_shell_entry(void) {
          * does not exist.  virtio-sound is what fills the gap. */
         else if (s_eq(cmd, "lsaudio")) audio_list();
         else if (s_eq(cmd, "drv"))     driver_cmd(args);
+        /* §M33 stage 5 — the same report both x86 shells give.  ONE copy, in
+         * iommu.c, called from both: §M24's rule, and the case it was written
+         * for is exactly this one — a diagnostic that answers on two arches out
+         * of three teaches the third's users that the question has no answer. */
+        else if (s_eq(cmd, "iommu"))   iommu_report();
         /* §M67 — the loader's own commands, same implementation as x86. */
         else if (s_eq(cmd, "lsmod"))   modload_list();
         else if (s_eq(cmd, "insmod"))  modload_cmd_insmod(args);

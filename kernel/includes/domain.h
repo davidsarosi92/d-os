@@ -79,4 +79,11 @@ int domain_enforceable(uint32_t domain, const char** why);
 enum domain_isolation domain_isolation_of(uint32_t domain, int does_dma);
 const char* domain_isolation_name(enum domain_isolation i);
 
+/* WHY a DMA-capable driver is only advisory on this machine.  NULL when the
+ * question does not arise.  Kept separate from the verdict on purpose: finding
+ * an IOMMU must not improve the verdict — an unprogrammed one restricts
+ * nothing — but it does change whether the gap is a hardware limit or work we
+ * have not done, and those call for different decisions. */
+const char* domain_isolation_reason(int does_dma);
+
 #endif /* DOMAIN_H */

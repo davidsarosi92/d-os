@@ -3203,8 +3203,23 @@ are not guarded (no caller to unwind to).
     continuous typing → 0 bring-up failures on both x86 arches; recovery became
     deterministic at 1 restart.  *This is the shape §M33 predicted a process
     boundary would produce: a privilege that has to become an operation.*
-  * **Stage 5 — an IOMMU driver.**  Until it exists a DMA driver outside the
-    kernel is placement, not isolation, and the code marks it `ADVISORY(!)`.
+  * **Stage 5, first half — shipped 2026-08-28: WHAT CAN THIS MACHINE ENFORCE?**
+    `ADVISORY(!)` was the right answer and an ASSUMPTION — nothing had looked for
+    an IOMMU.  `iommu_init` walks the DMAR and reads the unit's CAP/ECAP.  **The
+    rule: finding one must NOT improve the verdict** — an IOMMU in passthrough
+    restricts nothing, and reporting otherwise because the chipset is capable is
+    the most convincing kind of isolation theatre.  What it buys is the REASON,
+    kept in a separate call: "this machine cannot" vs "this machine can and we
+    have not built it" leave a driver equally exposed and call for different
+    decisions.  `--iommu` on the harness and on run_qemu.sh, deliberately not
+    default (the ordinary machine has none, and that path must stay the tested
+    one).  All three arches answer; ARM says NONE and names the SMMU as the
+    analogue nothing looks for yet.
+  * **Stage 5, second half — the actual remapping.**  Root/context tables,
+    second-level page tables, a domain per placed driver, translation enabled —
+    and the falsification that matters is a DMA address OUTSIDE the driver's
+    buffers being BLOCKED and reported by the unit.  Until that exists a DMA
+    driver outside the kernel is placement, not isolation.
   * **Tier 2, second half** — DMA drivers in ring 3, which needs stage 5.
   * `driver.profile` (desktop|server) is deliberately absent: with one
     reachable domain it would be a key with one legal value.

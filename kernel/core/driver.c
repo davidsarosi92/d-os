@@ -628,6 +628,18 @@ void driver_domains_list(void) {
                 (d->flags & DRVF_DMA) ? ", DMA" : "");
     }
     kprintf("faults contained so far: %u\n", drvguard_fault_count());
+
+    /* §M33 stage 5 — WHY a DMA driver can only ever be advisory here, printed
+     * ONCE at the bottom rather than on every row: it is a property of the
+     * MACHINE, not of any driver, so repeating it per line would make it look
+     * like a per-driver finding and bury the rows.
+     *
+     * It is printed at all because "ADVISORY(!)" says a placement would not
+     * isolate and does not say whether that is a limit of this hardware or work
+     * we have not finished — and somebody deciding whether to place a NIC in
+     * ring 3 needs exactly that distinction. */
+    const char* why = domain_isolation_reason(1);
+    if (why) kprintf("a DMA driver can only be advisory here: %s\n", why);
 }
 
 /* ----------------------------------------------------------------------

@@ -28,6 +28,13 @@ int acpi_init(void);
  * no parseable _S5_ object. */
 void acpi_shutdown(void);
 
+/* §M33 stage 5 — the DMAR table (DMA Remapping Reporting), or NULL if the
+ * firmware published none, which is the usual case and means the machine has
+ * no IOMMU.  Returned as an opaque pointer because its contents are the
+ * IOMMU's business: this module finds tables, it does not interpret hardware
+ * it does not own. */
+const void* acpi_dmar(void);
+
 /* ---------------------------------------------------------------------------
  * MADT-derived topology getters (M18).  Valid after `acpi_init` returns 0.
  *

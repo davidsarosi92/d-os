@@ -42,6 +42,7 @@
 #include "cron.h"
 #include "printf.h"
 #include "acpi.h"
+#include "iommu.h"    /* §M33 stage 5 — DMA remapping capability */
 #include "hal_api.h"
 #include "multiboot.h"
 #include "lapic.h"
@@ -192,6 +193,13 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     /* ACPI discovery — enables soft-off via `shutdown`, and on the
      * same pass enumerates LAPIC + IOAPIC topology for SMP (M18). */
     acpi_init();
+
+    /* §M33 stage 5 — ask whether this machine has DMA remapping hardware.
+     * Immediately after ACPI because the DMAR is an ACPI table, and BEFORE any
+     * driver is placed, so `/proc/security` and the isolation column are
+     * answering from a discovered fact rather than an assumption.  Reads only;
+     * it never enables translation. */
+    iommu_init();
 
     /* APIC bring-up (M18, x86_64 enabled by M20.5 Phase A).  If ACPI
      * gave us a MADT with a LAPIC + at least one IOAPIC, switch IRQ

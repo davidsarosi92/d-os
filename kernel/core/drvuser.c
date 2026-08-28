@@ -337,7 +337,7 @@ int drvuser_launch(const struct driver* d) {
     drvuser_supervisor_start();
 
     kprintf("drv: '%s' placed in ring 3 as pid %d\n", d->name, pid);
-    klog(KLOG_INFO, "drv", "'%s' running in DOMAIN_USER, pid %d", d->name, pid);
+    klog(KLOG_INFO, "drv", "'%s' running in DOMAIN_USER, pid %d\n", d->name, pid);
     return 0;
 }
 
@@ -459,7 +459,7 @@ static void du_restart(struct drvuser* d) {
 
     kprintf("drv: '%s' died (pid %d) — restarted in ring 3 as pid %d "
             "(restart %d of %d)\n", mf->name, old, pid, restarts, max);
-    klog(KLOG_WARN, "drv", "'%s' restarted in DOMAIN_USER: pid %d -> %d",
+    klog(KLOG_WARN, "drv", "'%s' restarted in DOMAIN_USER: pid %d -> %d\n",
          mf->name, old, pid);
 }
 
@@ -715,6 +715,6 @@ long drvuser_sys_log(const char* msg) {
     if (!d) return DRV_EBAD;
     if (!msg) return -1;
     kprintf("drv-user: %s: %s\n", d->mf->name, msg);
-    klog(KLOG_INFO, "drv-user", "%s: %s", d->mf->name, msg);
+    klog(KLOG_INFO, "drv-user", "%s: %s\n", d->mf->name, msg);
     return 0;
 }

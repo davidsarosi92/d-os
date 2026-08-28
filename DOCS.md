@@ -10377,9 +10377,82 @@ process's traffic.  **The policy is falsifiable too:** with `driver.restart_max 
 limit 0)`, a quarantine, and `drv crash` correctly reporting **NOT recovered** —
 the control that makes the positive result mean something.
 
-**What Tier 2 still does not have:** MMIO into a driver's own address space; an
-IOMMU (§M33 stage 5), without which a DMA driver outside the kernel is placement
-and not isolation; and state replay richer than "the driver runs its own bring-up
+**§M33 stage 5, first half (2026-08-28) — WHAT CAN THIS MACHINE ENFORCE AGAINST A
+DEVICE?**
+
+`domain_isolation_of` has returned `ADVISORY(!)` for a DMA-capable driver since
+§M33 stage 1, on the grounds that the DEVICE reads memory and does not care which
+ring asked it to.  That is the right answer, and **it was an assumption**: nothing
+in this kernel had ever looked at whether the machine has an IOMMU.  So stage 5's
+first deliverable is not remapping — it is the answer to the question, discovered
+instead of assumed.
+
+`iommu_init` walks the ACPI **DMAR** table for remapping units, maps the first
+unit's register window and reads its **CAP/ECAP**.  The decoded facts are kept
+rather than reduced to a boolean, because the interesting failures are specific: a
+unit offering no page-table depth we could build is a different problem from one
+with no domain IDs, and "unusable" alone sends somebody looking in the wrong
+place.  SAGAW is the field that decides whether stage 5's second half is possible
+at all.
+
+**THE RULE THE WHOLE THING IS WRITTEN UNDER: FINDING AN IOMMU MUST NOT IMPROVE THE
+ISOLATION VERDICT.**  A DMA driver on a machine whose IOMMU sits in passthrough is
+exactly as exposed as one on a machine with none — every device still reads every
+byte.  Reporting better isolation because the CHIPSET is capable would be the most
+convincing kind of isolation theatre, precisely because the capability is real and
+checkable.  So `domain_isolation_of` deliberately does not consult `iommu_get`,
+and a comment at that line says why.  What detection buys is the **reason**, kept
+in a separate `domain_isolation_reason` — and a reason is what distinguishes *"this
+machine cannot"* from *"this machine can and we have not built it"*, two facts
+that leave a driver equally exposed and call for entirely different decisions.
+
+**THREE THINGS THAT WOULD OTHERWISE HAVE BEEN QUIETLY WRONG.**
+
+* **`phys_to_virt` IS THE WRONG ANSWER FOR MMIO,** and the first boot with an
+  IOMMU attached proved it: a ring-0 page fault at `0xffff8000fed90008`, dead
+  before the shell.  x86_64's direct map covers RAM; a remapping unit at
+  `0xFED90000` is not RAM.  The lapic and ioapic drivers had it right already —
+  identity-map the page and use the physical address, which works the same on both
+  arches.  The helper was copied from ACPI's table-reacher, where the assumption
+  holds because ACPI tables ARE in RAM.
+* **`VMM_CACHE_DIS` is load-bearing.**  A device register mapped cacheable reads
+  back whatever the CPU cached the first time, so a capability register looks
+  plausible and stops tracking the hardware — silent, and it looks like the device
+  lying to you.
+* **The x86-only helpers were outside the `#if`**, which the aarch64 link caught
+  at once (`undefined reference to vmm_map`).  ARM now answers NONE with a named
+  reason: the analogue is an SMMU described by IORT or the device tree, and
+  nothing here looks for one — *unlooked-for* rather than *absent*, because those
+  become different facts the moment somebody asks why ARM cannot place a DMA
+  driver.
+
+**BOTH MACHINES ARE ONE FLAG AWAY, AND NEITHER IS THE DEFAULT BY ACCIDENT.**
+`--iommu` on `run_qemu.sh` and on the harness boots q35 + `intel-iommu`.  It is
+deliberately NOT default: almost every machine a person boots here has no IOMMU,
+and making one standard would stop *that* path being the one under test — the
+§M48/§M49/§4.66 mistake in reverse, where the measured machine was not the used
+one.  `iommu` is a shell verb on all three arches (one implementation, both
+shells — §M24's rule, and the case it was written for), and `iommu_init` runs on
+**both entry paths**, because a capability report missing from one arch is worse
+than none: there, "nothing was reported" reads as "nothing to report".
+
+**MEASURED, i386 AND x86_64, BOTH MACHINES.**  Without the device: `iommu: none`,
+*"no DMAR table"*, and the consequence spelled out — a device can read and write
+all of memory.  With it: `present, NOT programming it`, one unit at `fed90000`,
+48-bit host address width, `cap 80d2008c222f0646`, **3-level and 4-level page
+tables, 65536 domains** — byte-identical decoding on both arches.  And the point
+of the exercise, from `drv domain` on the two machines: the verdict is
+`ADVISORY(!)` on both, while the reason reads *"this machine has no IOMMU … a
+hardware limit, not unfinished work"* on one and *"this machine HAS an IOMMU and
+we do not program it yet (§M33 stage 5) — unfinished work, not a hardware limit"*
+on the other.  aarch64 answers NONE with its own reason.
+
+**What §M33 still does not have:** the second half of stage 5 — root/context
+tables, second-level page tables and enabling translation, which is what would let
+`ADVISORY(!)` ever become anything else; MMIO into a driver's own address space
+(no placeable driver needs it yet, and building a mechanism with no client is what
+§M59 declined to do for Wayland's `wl_data_device`); Tier 2's DMA half, which
+stage 5 gates; and state replay richer than "the driver runs its own bring-up
 again", which is enough for a mouse and will not be for a device holding a
 session.
 
@@ -10387,6 +10460,26 @@ session.
 
 ## 8. Change log
 
+- **2026-08-28 — §M33 stage 5 (first half): what can this machine enforce
+  against a DEVICE? (DOCS §4.82).**  `ADVISORY(!)` for a DMA driver has been the
+  right answer since stage 1 and was an ASSUMPTION — nothing had ever looked for
+  an IOMMU.  `iommu_init` now walks the DMAR and reads the unit's CAP/ECAP, and
+  the rule the whole thing is written under is that **finding one must not
+  improve the verdict**: an IOMMU in passthrough restricts nothing, and reporting
+  otherwise because the chipset is capable would be the most convincing kind of
+  isolation theatre.  What it buys is the REASON — "this machine cannot" versus
+  "this machine can and we have not built it" — kept deliberately separate from
+  the verdict.  Three things caught on the way: `phys_to_virt` is wrong for MMIO
+  (the first IOMMU boot took a ring-0 page fault at `0xffff8000fed90008`, dead
+  before the shell — x86_64's direct map covers RAM and a unit at `0xFED90000` is
+  not RAM); `VMM_CACHE_DIS` is load-bearing on a capability register; and the
+  x86-only helpers sat outside the `#if`, which the aarch64 link found at once.
+  Both machines are one flag away (`--iommu`) and **neither is the default by
+  accident** — almost every machine here has none, so making one standard would
+  stop that path being tested.  Measured on both x86 arches: `none` versus
+  `present, NOT programming it` with one unit at `fed90000`, 3- and 4-level page
+  tables, 65536 domains; `drv domain` gives the SAME verdict and DIFFERENT
+  reasons on the two machines, which is the whole point.
 - **2026-08-28 — §M33 Tier 2: arbitrating a shared controller (DOCS §4.82).**
   The 8042 race is fixed rather than survived.  Two halves: `drv_ports_lock` is
   the GENERIC one — the kernel holds off the competing driver's interrupt on

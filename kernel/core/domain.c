@@ -8,6 +8,7 @@
 
 #include "domain.h"
 #include "printf.h"
+#include "iommu.h"    /* §M33 stage 5 — the REASON, never the verdict */
 #include <stddef.h>
 
 static int d_streq(const char* a, const char* b) {
@@ -126,8 +127,41 @@ int domain_enforceable(uint32_t domain, const char** why) {
  * to pick one of those to report, and either choice misleads. */
 enum domain_isolation domain_isolation_of(uint32_t domain, int does_dma) {
     if (domain == DOMAIN_KERNEL) return ISOL_NONE;
-    if (does_dma)                return ISOL_ADVISORY;   /* until an IOMMU */
+    /* §M33 STAGE 5 — AND THE ANSWER DELIBERATELY DOES NOT CONSULT `iommu_get`.
+     *
+     * The machine may well have DMA remapping hardware; stage 5's first half
+     * went and found out.  It changes NOTHING here, because an IOMMU we have
+     * not programmed sits in passthrough and every device still reads every
+     * byte — a DMA driver on that machine is exactly as exposed as on one with
+     * no IOMMU at all.
+     *
+     * Reporting better isolation because the CHIPSET is capable would be the
+     * most convincing kind of isolation theatre, since the capability is real
+     * and checkable.  What the discovery buys is the REASON (see
+     * domain_isolation_reason), and a reason is what tells a user whether the
+     * gap is a hardware limit or unfinished work. */
+    if (does_dma)                return ISOL_ADVISORY;
     return ISOL_FULL;
+}
+
+/* Why a DMA driver is only advisory here — the sentence that differs between
+ * "this machine cannot" and "this machine can and we have not built it".  Both
+ * leave the driver equally exposed, and they call for entirely different
+ * decisions by whoever is reading. */
+const char* domain_isolation_reason(int does_dma) {
+    if (!does_dma) return NULL;
+    switch (iommu_get()->state) {
+    case IOMMU_ACTIVE:
+        return "translation is on";
+    case IOMMU_PRESENT:
+        return "this machine HAS an IOMMU and we do not program it yet "
+               "(§M33 stage 5) — unfinished work, not a hardware limit";
+    case IOMMU_UNUSABLE:
+        return "this machine's IOMMU cannot be programmed by us — see `iommu`";
+    default:
+        return "this machine has no IOMMU, so nothing can bound what a device "
+               "reads — a hardware limit, not unfinished work";
+    }
 }
 
 const char* domain_isolation_name(enum domain_isolation i) {

@@ -55,6 +55,9 @@ usage: run_qemu.sh [--empty | --no-disk] [--no-audio] [-- <extra qemu args>]
   --empty     wipe that disk and attach a FRESHLY FORMATTED, empty one
   --no-disk   run with no storage at all (RAM only; nothing persists)
   --no-audio  attach no sound card (the taskbar then shows "no device")
+  --iommu     boot a machine that HAS DMA remapping hardware (q35 + intel-iommu).
+              Off by default: the ordinary machine has none, and `iommu` is
+              meant to tell you which of the two you are on.
 
   ARCH=i386|x86_64|aarch64   selects the build to boot (default: i386)
   SMP=<n>                    number of vCPUs on the x86 arches (default: 4)
@@ -67,6 +70,7 @@ while [ $# -gt 0 ]; do
         --empty)            DISK_MODE=empty ;;
         --no-disk|--nodisk) DISK_MODE=none ;;
         --no-audio|--noaudio) AUDIO_MODE=none ;;
+        --iommu)            IOMMU_MODE=on ;;
         -h|--help)          usage; exit 0 ;;
         --)                 shift; QEMU_EXTRA_ARGS="$*"; break ;;
         *)
@@ -303,6 +307,19 @@ if command -v "$QEMU" >/dev/null 2>&1; then
     # NAT gateway and DNS at 10.0.2.3 — which is exactly what /etc/resolv.conf
     # is provisioned for.
     EXTRA="$EXTRA -netdev user,id=net0 -device virtio-net-pci,netdev=net0"
+    # §M33 stage 5 — DMA remapping hardware, on request.
+    #
+    # DELIBERATELY NOT THE DEFAULT.  Almost every machine a person boots here
+    # has no IOMMU, and making one standard would stop that path being the one
+    # under test — the §M48/§M49 mistake in reverse.  What matters is that BOTH
+    # machines are one flag away, because "this box cannot bound what a device
+    # reads" is a claim somebody should be able to check on both.
+    #
+    # q35 is required: the DMAR describes a PCIe root complex, and the i440fx
+    # machine refuses the device outright.
+    if [ "${IOMMU_MODE:-off}" = "on" ]; then
+        EXTRA="$EXTRA -machine q35 -device intel-iommu"
+    fi
     # §M23 — AC97, the codec both x86 arches drive.
     AUDIO_BACKEND=$(dos_audio_backend)
     if [ "$AUDIO_BACKEND" != "none" ]; then

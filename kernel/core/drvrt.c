@@ -221,7 +221,7 @@ static void excl_release(struct drv_res* r, const char* how) {
         kprintf("drv-rt: '%s' held ports %x..%x exclusively too long — "
                 "taken back (%s)\n", r->owner ? r->owner : "?",
                 (unsigned)r->base, (unsigned)(r->base + r->len - 1), how);
-        klog(KLOG_WARN, "drv-rt", "'%s' exclusive claim on %x reclaimed (%s)",
+        klog(KLOG_WARN, "drv-rt", "'%s' exclusive claim on %x reclaimed (%s)\n",
              r->owner ? r->owner : "?", (unsigned)r->base, how);
     }
     r->excl_irq = -1;

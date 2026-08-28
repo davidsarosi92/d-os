@@ -22,6 +22,7 @@
 #include "module.h"
 #include "driver.h"
 #include "drvuser.h"   /* §M33 Tier 1 — drvtest */
+#include "iommu.h"     /* §M33 stage 5 — the `iommu` report */
 #include "modload.h"   /* §M67 — insmod / rmmod / lsmod */
 #include "ksym.h"      /* §M67 — ksyms */
 #include "timer.h"
@@ -4127,6 +4128,12 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "about"))  { cmd_about();      return; }
     if (streq(line, "lsmod"))  { modload_list();    return; }
     if (streq(line, "lsdrv"))  { driver_list();    return; }
+    /* §M33 stage 5 — what this machine can enforce against a DEVICE.  Its own
+     * verb rather than a line in `lsdrv`, because the answer is a property of
+     * the machine and not of any driver: it is the same on a box with no
+     * drivers placed at all, and that is exactly when somebody deciding whether
+     * to place one wants to read it. */
+    if (streq(line, "iommu"))  { iommu_report();   return; }
     if (streq(line, "lsconsole")) { console_list(); return; }
     if (streq(line, "uptime")) { cmd_uptime();      return; }
     if (streq(line, "dmesg"))         { cmd_dmesg("");         return; }

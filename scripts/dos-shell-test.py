@@ -215,6 +215,19 @@ def qemu_argv(a, sersock, monsock):
             "-rtc", "base=localtime",
             "-device", "ib700", "-action", "watchdog=inject-nmi",
         ]
+        if a.iommu:
+            # §M33 stage 5 — a machine with DMA remapping hardware.
+            #
+            # NOT the default, and that is the honest choice: the everyday
+            # machine has no IOMMU, so making it standard here would mean the
+            # no-IOMMU path — the one almost every user boots — stopped being
+            # tested.  The reverse of the §M48/§M49/§4.66 mistake, which was
+            # testing a machine nobody runs.  Both paths are reachable and both
+            # get measured.
+            #
+            # intel-iommu needs q35: the DMAR describes a PCIe root complex, and
+            # on the i440fx machine QEMU refuses the device outright.
+            argv += ["-machine", "q35", "-device", "intel-iommu"]
         if a.disk:
             argv += ["-drive", "if=virtio,file=%s,format=raw" % a.disk,
                      # A FORMATTED image carries a boot signature, and SeaBIOS
@@ -253,6 +266,10 @@ def main():
                     metavar="PATH",
                     help="attach a freshly formatted, EMPTY 64 MiB exFAT disk "
                          "(default path: build/<arch>/test-empty.img)")
+    ap.add_argument("--iommu", action="store_true",
+                    help="boot on a machine that HAS DMA remapping hardware "
+                         "(q35 + intel-iommu).  Off by default so the ordinary "
+                         "no-IOMMU machine stays the one under test.")
     ap.add_argument("--no-display", action="store_true",
                     help="aarch64 only: attach no virtio-gpu, so the guest "
                          "boots the SERIAL shell (serial_shell.c) instead of "

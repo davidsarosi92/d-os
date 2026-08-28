@@ -47,6 +47,7 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "block.h"
 #include "block_cache.h"
 #include "config.h"          /* §M63 stage 0 — config_attach_persistent */
+#include "iommu.h"           /* §M33 stage 5 — DMA remapping capability */
 #include "drvrt.h"          /* §M33 stage 2 — deferred driver tasks */
 #include "modload.h"        /* §M67 — modload_autoload() */
 #include "shortcut.h"        /* §M64 tail — shortcut_attach_persistent */
@@ -161,6 +162,14 @@ void aarch64_main_entry(uint64_t dtb) {
     /* §M33 stage 2 — driver bodies that could not be spawned at
      * driver_init_all() time, because the scheduler did not exist yet. */
     drvrt_start_deferred();
+
+    /* §M33 stage 5 — ask what this machine can enforce against a DEVICE.
+     *
+     * On BOTH entry paths, not just x86's kernel_main.  A capability report
+     * that exists on one arch is worse than none: the arch it is missing from
+     * answers nothing at all, and "nothing was reported" reads as "nothing to
+     * report".  Here it answers NONE with the reason, which is the truth. */
+    iommu_init();
 
     /* Per-CPU table (Phase E) — build it now so smp_boot_aps() can register
      * secondary cores.  Runs AFTER task_init (which stamped slot 0's current)

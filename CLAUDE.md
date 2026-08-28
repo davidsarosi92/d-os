@@ -117,9 +117,38 @@ shipped*, and its deliberate final fault killed the SHELL it ran on.  **MEASURED
 killed one** (i386 + x86_64); six placement cycles under continuous typing → **0
 bring-up failures** where it reliably failed before; recovery deterministic at
 **1 restart**; and `restart_max = 0` turns the same kill into a quarantine, which
-is the control.  **OPEN:** stage 5 (an IOMMU, without which a DMA driver outside
-the kernel is placement not isolation); Tier 2's DMA half; MMIO into a driver's
-own space; state replay richer than "run bring-up again".
+is the control.  **STAGE 5's FIRST HALF SHIPPED THE SAME DAY: WHAT CAN THIS MACHINE
+ENFORCE AGAINST A DEVICE?**  `ADVISORY(!)` for a DMA driver was the right answer
+and an ASSUMPTION — nothing here had ever looked for an IOMMU.  `iommu_init`
+walks the DMAR and reads the unit's CAP/ECAP.  **THE RULE IT IS WRITTEN UNDER:
+FINDING ONE MUST NOT IMPROVE THE VERDICT** — an IOMMU in passthrough restricts
+nothing, and reporting better isolation because the CHIPSET is capable is *the
+most convincing kind of isolation theatre, precisely because the capability is
+real*.  So `domain_isolation_of` deliberately does not consult it; what detection
+buys is a separate REASON, and *"this machine cannot"* vs *"this machine can and
+we have not built it"* leave a driver equally exposed while calling for entirely
+different decisions.  **THREE THINGS CAUGHT:** `phys_to_virt` IS WRONG FOR MMIO
+(the first IOMMU boot took a ring-0 page fault at `0xffff8000fed90008` — dead
+before the shell: x86_64's direct map covers RAM and a unit at `0xFED90000` is
+not RAM; the helper was copied from ACPI's table-reacher, where the assumption
+holds); `VMM_CACHE_DIS` is load-bearing (a cached capability register looks
+plausible and stops tracking the hardware); and the x86-only helpers sat outside
+the `#if`, which the aarch64 link found at once.  **BOTH MACHINES ARE ONE FLAG
+AWAY AND NEITHER IS THE DEFAULT BY ACCIDENT** (`--iommu`): almost every machine
+here has none, so making one standard would stop *that* path being tested — the
+§M48/§M49 mistake in reverse.  `iommu` is a verb on ALL THREE arches from one
+implementation, and `iommu_init` runs on BOTH entry paths, because *a capability
+report missing from one arch is worse than none — there, "nothing was reported"
+reads as "nothing to report"*.  **MEASURED:** `none` vs `present, NOT programming
+it`, one unit at `fed90000`, 3- and 4-level page tables, 65536 domains,
+byte-identical on both x86 arches — and `drv domain` gives the **SAME VERDICT and
+DIFFERENT REASONS** on the two machines, which is the entire point.  **OPEN:**
+stage 5's SECOND half (root/context tables, second-level page tables, translation
+enabled — falsified by a DMA address outside the driver's buffers being BLOCKED);
+Tier 2's DMA half, which that gates; MMIO into a driver's own space (deliberately
+not built — no placeable driver needs it, and a mechanism with no client is what
+§M59 declined for `wl_data_device`); state replay richer than "run bring-up
+again".
 `driver.profile` is deliberately absent — with one reachable domain it would be
 a key with one legal value.  **NEXT: §M32 multi-user.**
 

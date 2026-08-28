@@ -295,6 +295,12 @@ static void acpi_reach(uintptr_t phys, uint32_t len) {
 
 /* Reach a table whose length is in its own header: map the header first, then
  * the full length it declares.  Returns the (now readable) header pointer. */
+/* §M33 stage 5 — the DMAR, if the firmware published one.  Cached during the
+ * RSDT walk like every other table we care about. */
+static const struct sdt_header* g_dmar = 0;
+
+const void* acpi_dmar(void) { return g_dmar; }
+
 static const struct sdt_header* acpi_reach_table(uint32_t phys) {
     if (!phys) return 0;
     acpi_reach(phys, sizeof(struct sdt_header));
@@ -573,6 +579,11 @@ int acpi_init(void) {
             g_fadt = (const struct fadt*)h;
         } else if (sig4(h->signature, "APIC") && checksum_ok(h, h->length)) {
             parse_madt((const struct madt*)h);
+        } else if (sig4(h->signature, "DMAR") && checksum_ok(h, h->length)) {
+            /* §M33 stage 5 — recorded, not parsed here.  The DMAR describes
+             * remapping hardware, which is the IOMMU's subject and not ACPI's;
+             * this file's job is to find tables and hand them over. */
+            g_dmar = h;
         } else if (sig4(h->signature, "SRAT") && checksum_ok(h, h->length)) {
             /* Defer parsing until AFTER MADT — SRAT lookups translate
              * APIC ID to MADT slot, which needs the MADT cache filled. */
