@@ -3173,14 +3173,33 @@ are not guarded (no caller to unwind to).
     from the same source and the pointer still moves.  `domain_enforceable()`
     says yes on x86 and refuses on aarch64 with the reason (no port space, no
     MMIO-into-driver mapping).
-  * **Still missing from Tier 1:** MMIO mapped into a driver's own space (no
+  * **Tier 2, first half — shipped 2026-08-28: RECONNECTION.**  A supervisor
+    notices the driver process is gone (polling for DISAPPEARANCE — init may
+    reap it first), hands the grants back BEFORE re-spawning (our own conflict
+    detector would otherwise refuse the replacement), quiesces the driver's
+    CLIENTS (a driver that dies mid-drag leaves a button held forever), backs
+    off, and quarantines a crash loop through `driver.restart_max`.  `drv crash`
+    is one verb for both placements.  Measured: 25 driven pointer movements →
+    25 events through the process that REPLACED the killed one, both x86 arches;
+    with `restart_max = 0` the same kill quarantines instead, which is the
+    control that makes the positive result mean anything.
+  * **Still missing from Tier 1/2:** MMIO mapped into a driver's own space (no
     placeable driver needs it yet; `drv_mmio_request` refuses from ring 3
-    rather than faking it), and CLIENT RECONNECTION — kill the ring-3 driver
-    and the pointer stops, because nothing restarts it or replays its state.
+    rather than faking it); state replay richer than "the driver runs its own
+    bring-up again", which suffices for a mouse and will not for a device
+    holding a session.
+  * **ARBITRATION OF A SHARED CONTROLLER — new, and found by placing a driver.**
+    The 8042's answer to a config-byte read lands in the single output buffer
+    with the AUX bit clear, so it raises IRQ1 and the KEYBOARD driver reads it;
+    our mouse driver then times out, robbed by a driver behaving correctly.  A
+    ring-3 driver cannot mask an interrupt line and should not be able to.  The
+    bounded retry in `ps2_mouse.c` buys the quiet case and is documented as not
+    a cure.  The real answer is one owner of the controller that both drivers go
+    through — a genuine Tier 2 item, because it is exactly the class of problem
+    a process boundary creates: two drivers, one device, no shared lock.
   * **Stage 5 — an IOMMU driver.**  Until it exists a DMA driver outside the
     kernel is placement, not isolation, and the code marks it `ADVISORY(!)`.
-  * **Tier 2** — DMA drivers in ring 3 with clean teardown and CLIENT
-    RECONNECTION, which is the genuinely pervasive part.
+  * **Tier 2, second half** — DMA drivers in ring 3, which needs stage 5.
   * `driver.profile` (desktop|server) is deliberately absent: with one
     reachable domain it would be a key with one legal value.
 

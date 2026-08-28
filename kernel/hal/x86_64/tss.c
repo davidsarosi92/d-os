@@ -170,5 +170,14 @@ void hal_set_io_bitmap(const void* bm) {
     tss[c].iomap_base = (uint16_t)__builtin_offsetof(struct tss64, iomap);
 }
 
+/* §M33 Tier 2 — drop a cache entry for a bitmap about to be freed.  See the
+ * i386 twin for why: the cache compares POINTERS, and a restarted driver's
+ * fresh allocation lands on the freed one's address, so without this the TSS
+ * would keep the dead driver's permissions and look correct while doing it. */
+void hal_io_bitmap_forget(const void* bm) {
+    for (int c = 0; c < TSS_MAX_CPUS; c++)
+        if (iomap_loaded[c] == bm) iomap_loaded[c] = NULL;
+}
+
 uint32_t hal_io_bitmap_bytes(void) { return IOMAP_BYTES; }
 int       tss_max_cpus(void)        { return TSS_MAX_CPUS; }

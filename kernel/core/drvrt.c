@@ -274,6 +274,10 @@ int drv_irq_wait(drv_handle h, int timeout_ms) {
      * exception. */
     uint32_t n = r->count - r->seen;
     if (n) { r->seen = r->count; return (int)n; }
+    /* Asked BEFORE blocking as well as after.  Only checking afterwards meant a
+     * task woken by a kill re-entered and blocked again, so the stop never
+     * arrived — see DRV_ESTOP in drvrt.h. */
+    if (task_should_stop()) return DRV_ESTOP;
     if (timeout_ms == 0) return 0;
 
     /* A DEADLINE FROM THE CLOCK, and the timer only WAKES.
@@ -297,18 +301,20 @@ int drv_irq_wait(drv_handle h, int timeout_ms) {
      * and remember that waitq_block RE-ACQUIRES the lock before returning.
      * §M23 stage 4 treated it as returning unlocked and produced a task
      * deadlocking against itself with interrupts masked. */
+    int stop = 0;
     uint32_t fl = waitq_lock(&r->wq);
     while (r->count == r->seen) {
         if (armed && timer_now_ns() >= deadline) break;
         waitq_block(&r->wq);
-        if (task_should_stop()) break;
+        if (task_should_stop()) { stop = 1; break; }
     }
     waitq_unlock(&r->wq, fl);
     if (armed) ktimer_cancel(&t);
 
     n = r->count - r->seen;
     r->seen = r->count;
-    return n ? (int)n : DRV_ETIME;
+    if (n) return (int)n;              /* real work outranks the stop request */
+    return stop ? DRV_ESTOP : DRV_ETIME;
 }
 
 uint32_t drv_irq_count(drv_handle h) {
@@ -361,6 +367,33 @@ void drv_release_all(struct drv_rt* rt) {
         r->used = 0;
     }
     rt->nres = 0;
+
+    /* -------------------------------------------------------------------
+     * STOP THE BODY TOO — a stage-2 bug this file shipped with, found while
+     * building §M33 Tier 2's restart path.
+     *
+     * `drv_run` spawns a task that loops on drv_irq_wait + drain.  Releasing
+     * the resources left that task ALIVE with every handle now invalid, so
+     * both calls returned DRV_EBAD immediately and the loop became a hot spin
+     * on a released driver — measured at 4.8 seconds of CPU on a box that had
+     * merely stopped its mouse.
+     *
+     * It was invisible for the ordinary reason: `drv stop` was only ever typed
+     * by hand, and a spinning task looks exactly like an idle system until
+     * something else needs the CPU.  What made it visible was the ring-3
+     * placement — the spinning kernel task starved the new driver's 8042
+     * handshake, which is timing-sensitive, and the placement failed with a
+     * controller timeout that had nothing to do with ring 3.
+     *
+     * NEVER THE CALLER ITSELF.  A shutdown hook usually runs on some other
+     * task, but nothing forbids a driver from tearing itself down from inside
+     * its own body, and killing yourself here would take the release with it.
+     * ------------------------------------------------------------------- */
+    if (rt->body_pid > 0) {
+        struct task* self = task_current();
+        if (!self || self->pid != rt->body_pid) task_kill(rt->body_pid);
+        rt->body_pid = 0;
+    }
 }
 
 /* ---- running the driver body ---------------------------------------------- */
@@ -370,19 +403,23 @@ void drv_release_all(struct drv_rt* rt) {
  * ceiling that is reported beats an allocation that can fail on the one path
  * with no way to report anything. */
 #define DRVRT_MAX_DEFER 8
-struct deferred { const char* name; void (*body)(void); };
+struct deferred { const char* name; void (*body)(void); struct drv_rt* rt; };
 static struct deferred g_defer[DRVRT_MAX_DEFER];
 static int  g_ndefer;
 static int  g_sched_up;
 
 int drv_run(struct drv_rt* rt, const char* name, void (*body)(void)) {
-    (void)rt;
     if (!body) return DRV_EBAD;
     if (g_sched_up) {
         /* Detached, so it outlives whoever called init — the boot task, a
          * `drv start`, or a hot-plug rescan — and is reaped by init rather
          * than by a parent that has moved on (§M27). */
-        return task_spawn_detached(name, body) ? 0 : DRV_ENORES;
+        struct task* t = task_spawn_detached(name, body);
+        if (!t) return DRV_ENORES;
+        /* RECORD THE BODY so drv_release_all can stop it.  See the comment
+         * there: without this a stopped driver keeps its task. */
+        if (rt) rt->body_pid = t->pid;
+        return 0;
     }
     if (g_ndefer >= DRVRT_MAX_DEFER) {
         kprintf("drv-rt: too many deferred driver tasks (%d) — '%s' not started\n",
@@ -391,6 +428,7 @@ int drv_run(struct drv_rt* rt, const char* name, void (*body)(void)) {
     }
     g_defer[g_ndefer].name = name;
     g_defer[g_ndefer].body = body;
+    g_defer[g_ndefer].rt   = rt;
     g_ndefer++;
     return 0;
 }
@@ -399,8 +437,9 @@ void drvrt_start_deferred(void) {
     if (g_sched_up) return;
     g_sched_up = 1;
     for (int i = 0; i < g_ndefer; i++) {
-        if (!task_spawn_detached(g_defer[i].name, g_defer[i].body))
-            kprintf("drv-rt: could not start '%s'\n", g_defer[i].name);
+        struct task* t = task_spawn_detached(g_defer[i].name, g_defer[i].body);
+        if (!t) kprintf("drv-rt: could not start '%s'\n", g_defer[i].name);
+        else if (g_defer[i].rt) g_defer[i].rt->body_pid = t->pid;
     }
     if (g_ndefer) kprintf("drv-rt: %d deferred driver task(s) started\n", g_ndefer);
     g_ndefer = 0;

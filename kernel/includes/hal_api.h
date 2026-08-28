@@ -366,4 +366,10 @@ int hal_nvram_write(unsigned idx, uint8_t val);   /* 1 = written               *
 void     hal_set_io_bitmap(const void* bm);
 uint32_t hal_io_bitmap_bytes(void);
 
+/* Drop any cached reference to `bm`, which the caller is about to free.  The
+ * install above skips the copy when the pointer has not changed, and a freed
+ * bitmap's address is reused by the very next allocation — so a driver restart
+ * without this leaves the CPU holding the dead driver's permissions. */
+void     hal_io_bitmap_forget(const void* bm);
+
 #endif

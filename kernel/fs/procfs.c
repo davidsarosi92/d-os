@@ -23,6 +23,7 @@
 #include "module.h"
 #include "driver.h"
 #include "domain.h"     /* §M33 — the placement columns */
+#include "drvuser.h"    /* §M33 Tier 2 — a placed driver's pid + restarts */
 #include "drvguard.h"   /* §M33 Tier 0 — faults-contained */
 #include "task.h"
 #include "console.h"
@@ -318,6 +319,29 @@ static void gen_drivers(struct procfs_writer* w) {
         pw_putc(w, '\t');
         if (d->flags & DRVF_BOOT_CRITICAL) pw_puts(w, "boot-critical ");
         if (dma)                           pw_puts(w, "dma ");
+        /* §M33 Tier 2 — the pid and the restart count, for a driver that has
+         * one.  The pid is what makes "placed in ring 3" checkable from outside
+         * rather than taken on trust, and the restart count is the only thing
+         * that tells a driver which has been dying and coming back from one
+         * that has simply been up: both look identical in every other column,
+         * which is precisely the state worth noticing. */
+        int pid = drvuser_pid(d->name);
+        if (pid > 0) {
+            pw_puts(w, "pid="); pw_put_uint(w, (unsigned)pid); pw_putc(w, ' ');
+            int rs = drvuser_restarts(d->name);
+            if (rs) { pw_puts(w, "restarts="); pw_put_uint(w, (unsigned)rs);
+                      pw_putc(w, ' '); }
+            int ev = drvuser_events(d->name);
+            if (ev >= 0) { pw_puts(w, "events="); pw_put_uint(w, (unsigned)ev);
+                           pw_putc(w, ' '); }
+        } else if (at == DOMAIN_USER) {
+            /* Config asks for ring 3 and the driver is still in the kernel: a
+             * restart has not happened yet.  Named rather than left blank,
+             * because the `domain` column already reads "user" and the two
+             * together would otherwise claim a placement that has not taken
+             * effect. */
+            pw_puts(w, "pending-restart ");
+        }
         pw_putc(w, '\n');
     }
     pw_puts(w, "total: ");

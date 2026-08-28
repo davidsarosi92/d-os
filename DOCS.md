@@ -10206,16 +10206,158 @@ Measured on both x86 arches: `drv: 'ps2_mouse' placed in ring 3 as pid 25`,
 landing the cursor at (1621,1172) for a target of ~(1620,1170) — the same
 numbers the in-kernel driver produced.
 
-**What Tier 1 still does not have:** MMIO mapped into a driver's own space (no
+**What Tier 1 still does not have:** MMIO mapped into a driver's own space — no
 placeable driver needs it yet, and `drv_mmio_request` REFUSES from ring 3 rather
-than faking it), and CLIENT RECONNECTION — kill the ring-3 driver and the
-pointer stops, because nothing restarts it or replays its state.  That is Tier
-2's genuinely pervasive part and it is not started.
+than faking it.
+
+**§M33 Tier 2, first half (2026-08-28) — a placed driver that comes back.**
+
+Tier 1's honest reading was *the mouse now stops working instead of the machine
+stopping*: better, and still a failure.  Nothing restarted the process, so the
+placement traded a dead machine for a dead device.  This closes that.
+
+**The supervisor** (`kernel/core/drvuser.c`) polls for the driver process
+DISAPPEARING — never `task_wait`, because §M27's init is a universal reaper and
+may collect it first (§M57's rule) — and on a loss does four things in an order
+that is the whole design:
+
+1. **Hand the grants back FIRST.**  `drvrt.c` refuses a second claim on ports
+   somebody already holds, and it is right to; a restart that re-spawned without
+   releasing would be refused by our own conflict detector and the replacement
+   would come up unable to reach its hardware.
+2. **Quiesce the CLIENT.**  A driver that dies mid-drag has told the input stack
+   a button is DOWN and will never say it came up; the restarted driver reports
+   motion from then on, so the pointer works and *every movement is a drag* — a
+   desktop permanently wrong in a way nothing on screen explains.  The manifest
+   carries a per-class `quiesce`, because only the class knows what "nothing is
+   happening" looks like.
+3. **Re-spawn, after a short backoff.**  Not politeness: a driver that dies
+   inside its own bring-up would otherwise burn the whole restart budget faster
+   than the window can see it.
+4. **Quarantine on a crash loop.**  `driver.restart_max` (default 3) inside
+   30 s, then §M66's quarantine — which already means "nothing automatic starts
+   this" — so the policy lands where `lsdrv`, `/proc/drivers` and `drv start`
+   already read it instead of in a second notion of "given up on".
+
+`drv crash <name>` is **one verb for both placements**: in ring 0 the §M33 Tier 0
+guard catches the fault and the call unwinds; in ring 3 the process is
+FORCE-killed (a cooperative kill would be a tidy shutdown, which proves the wrong
+thing) and the supervisor puts it back.  A second command for the second case
+would let one of the two paths quietly stop being exercised.
+
+**SIX BUGS, FIVE OF THEM ALREADY SHIPPED.**
+
+* **`drv stop` on a placed driver ran the IN-KERNEL shutdown hook.**  `drv_init`
+  routes by domain and `drv_shutdown` did not, so stopping a driver running in
+  ring 3 executed code belonging to a driver that was not on the hardware, while
+  the real one carried on.  *A placement is only a placement if EVERY lifecycle
+  edge honours it, not just the one that establishes it.*  And the test is the
+  LIVE PROCESS, not the configured domain: `driver.<name>.domain = user` states
+  an INTENTION and a restart is what applies it, so asking config would answer
+  "ring 3" about a driver still in the kernel and skip the shutdown that has to
+  happen before it can move.
+* **Stopping a driver left its body task SPINNING** (§M33 stage 2).  `drv_run`
+  spawns a loop over `drv_irq_wait` + drain; `drv_release_all` invalidated every
+  handle and left the task alive, so both calls returned `DRV_EBAD` immediately —
+  **4.8 seconds of CPU measured on a box that had merely stopped its mouse.**
+  Invisible while `drv stop` was only ever typed by hand.  What made it visible
+  was the placement: the spinning kernel task starved the new driver's
+  timing-sensitive 8042 handshake, and the failure looked like a ring-3 problem.
+* **A placed driver was effectively UNKILLABLE**, and the reason was a stub that
+  read as honest.  The ring-3 `task_should_stop()` returned 0 with a comment
+  saying a ring-3 driver is stopped by being killed — but the kernel's
+  force-kill only takes a task caught IN USER MODE at a timer preemption, which a
+  driver blocked on a one-second wait reaches about once a second.  So `drv stop`
+  appeared to be ignored.  Now the request rides back as **`DRV_ESTOP` on the
+  wait itself** — a cooperative stop that crosses a process boundary — and the
+  driver's own loop, the same line the in-kernel build runs, sees it.  Forced
+  kill remains the backstop, because "stop" must not mean "ask nicely".
+* **TWO PLACEMENTS OF ONE DRIVER.**  `drv start` and §M66's rescan can both
+  decide a driver needs starting before either sets INITED.  In the kernel that
+  is nearly harmless (init runs twice on an idempotent driver); **a placement is
+  not idempotent** — two spawns are two processes bidding for the same ports, and
+  the observed symptom was a driver quarantining itself with `held by
+  'ps2_mouse'` in the log.  *Blocked by itself.*  The first fix checked for an
+  existing pid AFTER the spawn, which both callers walked straight past; the slot
+  is now RESERVED before anything is spawned, and a child that reaches its first
+  syscall before the launcher records its pid claims the reservation by name.
+* **The per-CPU I/O-bitmap cache is an ABA hazard.**  `hal_set_io_bitmap` skips
+  the copy when the pointer has not changed — correct only while an address means
+  one bitmap forever.  A restart frees the old bitmap and the slab hands the same
+  address back, so the TSS would keep the DEAD driver's permissions.  Today's two
+  grants are identical, so it would have been right by accident; `hal_io_bitmap_
+  forget` closes it before the first driver whose restart asks for a different
+  window inherits the previous one's ports.
+* **A placed driver's own messages went NOWHERE.**  It is spawned by the registry,
+  not by a shell, so it has no console and `write(1, …)` vanished: the first
+  placement failure of this milestone reported *absolutely nothing*, and the
+  cause had to be inferred from a CPU-time column belonging to another task.
+  New `SYS_DRV_LOG` routes them into klog, attributed by the KERNEL from the slot
+  so a message cannot claim to be from a driver other than the one that sent it —
+  and the ring-3 formatter renders `%d`, because "no port grant (-1)" and "no
+  port grant (-5)" are different diagnoses.
+
+**FOUND, NOT CAUSED: THE 8042 IS A SHARED CONTROLLER AND TWO DRIVERS RACE ON IT.**
+The controller's response to `0x20` (read config byte) lands in the single output
+buffer with the AUX bit CLEAR — indistinguishable from a keystroke — so it raises
+IRQ1 and the keyboard driver's handler reads it.  Our `wait_can_read` then times
+out, robbed by a driver behaving correctly.  It is not an occasional race; it is
+one we lose whenever an interrupt beats us to a byte.  **The placement made it
+visible rather than causing it:** in the kernel this code runs at boot, before
+anything can type; in ring 3 it runs when the user asks for the placement —
+necessarily while they are at the keyboard — and a ring-3 driver cannot mask
+IRQ1, nor should it be able to.  A bounded retry buys the quiet case and *is not
+a cure*, which is written down where the loop is so nobody reads it as one.  What
+makes it survivable is the supervisor: recovery, not correctness.  **Real
+arbitration of a shared controller is OPEN** and is a genuine Tier 2 item —
+two drivers, one device, and no lock they can share across a process boundary.
+
+**MEASURED ON BOTH x86 ARCHES, and the measurement is the point.**  A new pid
+proves a process exists; it does not prove the device is driven — the first
+version of the recovery report said "recovered" about a replacement that failed
+its handshake half a second later.  So `drv crash` waits for a DIFFERENT pid that
+holds every grant, and the evidence is EVENTS: place → force-kill → recover →
+drive 25 pointer movements from the QEMU monitor → `lsdrv` (typed through the
+monitor, because the harness runs every `--cmd` before every `--monitor-cmd`)
+reports **`[ring 3, pid 53, 2 restart(s), 25 event(s)]` on i386 and `[ring 3, pid
+55, 4 restart(s), 25 event(s)]` on x86_64** — twenty-five movements, twenty-five
+events, delivered by the process that REPLACED the one we killed.  The counter is
+zeroed by a restart on purpose: a running total would be satisfied by the dead
+process's traffic.  **The policy is falsifiable too:** with `driver.restart_max =
+0` the same kill gives `died and will NOT be restarted (0 restart(s) in 30 s,
+limit 0)`, a quarantine, and `drv crash` correctly reporting **NOT recovered** —
+the control that makes the positive result mean something.
+
+**What Tier 2 still does not have:** MMIO into a driver's own address space; an
+IOMMU (§M33 stage 5), without which a DMA driver outside the kernel is placement
+and not isolation; arbitration of a shared controller (above); and state replay
+richer than "the driver runs its own bring-up again", which is enough for a mouse
+and will not be for a device holding a session.
 
 ---
 
 ## 8. Change log
 
+- **2026-08-28 — §M33 Tier 2 (first half): a placed driver that comes back
+  (DOCS §4.82).**  Tier 1 traded a dead machine for a dead device; a supervisor
+  now notices the process is gone, hands the grants back, tells the driver's
+  clients nothing is happening (a driver that dies mid-drag would otherwise leave
+  a button held forever), re-spawns with backoff, and quarantines a crash loop
+  via `driver.restart_max`.  `drv crash` is one verb for both placements.  Six
+  bugs, five already shipped: `drv stop` ran the IN-KERNEL hook for a driver
+  running in ring 3; a stopped driver left its body task spinning (**4.8 s of
+  CPU** for a stopped mouse); a placed driver was effectively unkillable because
+  its `task_should_stop()` was an honest-looking stub — fixed with `DRV_ESTOP`, a
+  cooperative stop that crosses a process boundary; `drv start` and the rescan job
+  could place the SAME driver twice, so it quarantined itself fighting itself for
+  the 8042; the per-CPU I/O-bitmap cache keys on an address the allocator reuses;
+  and a placed driver's own messages went nowhere at all (`SYS_DRV_LOG`).  Found
+  not caused: **the 8042's response to a config read is indistinguishable from a
+  keystroke**, so the keyboard driver steals it — visible only once a driver is
+  re-initialised on a live machine.  Measured: 25 driven pointer movements → **25
+  events through the process that replaced the killed one**, on i386 and x86_64;
+  and with `restart_max = 0` the same kill quarantines instead, which is the
+  control.
 - **2026-08-28 — §M33 Tier 1 complete: a driver running in ring 3 (DOCS
   §4.82).**  `driver.ps2_mouse.domain = user` places the PS/2 mouse driver in
   its own address space, from the SAME source file, and the pointer still

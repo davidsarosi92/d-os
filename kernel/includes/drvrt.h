@@ -73,6 +73,19 @@ typedef int drv_handle;
 #define DRV_EBAD    (-4)        /* not a handle this context owns */
 #define DRV_ENOSYS  (-5)        /* this machine has no such resource kind */
 #define DRV_ETIME   (-6)        /* drv_irq_wait timed out */
+/* The kernel is asking this driver to stop.  A COOPERATIVE STOP THAT CROSSES
+ * THE PROCESS BOUNDARY: in ring 0 the body polls task_should_stop(), and a
+ * driver in ring 3 cannot see that flag at all — so the request rides back on
+ * the one call the body is always inside, and the user-mode backend turns it
+ * into the same task_should_stop() the in-kernel driver already checks.
+ *
+ * Without it a placed driver was effectively UNKILLABLE for the length of its
+ * own timeout: `task_kill` woke it, the ring-3 stub answered "no, keep going",
+ * and it blocked again.  The kernel's force-kill lands only at a timer
+ * preemption taken IN USER MODE, which a driver that spends its life blocked in
+ * a syscall reaches about once per timeout — so a one-second wait meant a
+ * one-second window, and a stop looked like it had been ignored. */
+#define DRV_ESTOP   (-7)
 
 struct drv_res;
 
@@ -82,6 +95,11 @@ struct drv_rt {
     const char*    owner;                 /* driver name, for conflict reports */
     struct drv_res* res[DRV_MAX_RES];
     int             nres;
+    /* The task drv_run spawned, so drv_release_all can stop it.  A driver's
+     * resources and the loop that uses them have ONE lifetime, and keeping
+     * them separate meant a stopped driver left a task spinning on handles
+     * that no longer existed — see drv_release_all. */
+    int             body_pid;
 };
 
 /* Start a runtime context.  `owner` must outlive it (a string literal or the

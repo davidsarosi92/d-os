@@ -250,6 +250,11 @@ static void mouse_task(void) {
 /* -------------------------------------------------------------------------- */
 
 static int mouse_module_init(void) {
+    /* Which step of the 8042 handshake failed.  EVERY exit is named because
+     * the silent ones cost a round of wrong theories during §M33 Tier 2: a
+     * ring-3 placement failed three times running with no message anywhere,
+     * and "it exited 1" is the same sentence for six different faults. */
+    int step = 0;
     drv_rt_init(&rt, "ps2-mouse");
     h_ports = drv_ports_request(&rt, PS2_BASE, PS2_NPORTS, "8042 aux device");
     if (h_ports < 0) {
@@ -258,25 +263,60 @@ static int mouse_module_init(void) {
     }
 
     /* 1. Enable the aux port itself. */
-    if (wait_can_write()) { kprintf("ps2-mouse: controller timeout\n"); goto fail; }
+    if (wait_can_write()) { step = 1; goto fail; }
     drv_out8(h_ports, PS2_CMD, 0xA8);
 
     /* 2. Config byte: set IRQ12-enable (bit 1), clear aux-clock-inhibit
-     *    (bit 5).  Keep everything else — the keyboard depends on it. */
-    if (wait_can_write()) goto fail;
-    drv_out8(h_ports, PS2_CMD, 0x20);
-    if (wait_can_read())  goto fail;
-    uint8_t cfg = (uint8_t)drv_in8(h_ports, PS2_DATA);
+     *    (bit 5).  Keep everything else — the keyboard depends on it.
+     *
+     * READ-MODIFY-WRITE IS RETRIED, AND THE RETRY IS NOT A CURE.  Read this
+     * before believing the loop below fixes anything.
+     *
+     * The 8042 has ONE output buffer and TWO drivers.  A controller RESPONSE —
+     * the config byte we just asked for — lands in that buffer with the AUX bit
+     * CLEAR, which is indistinguishable from a keystroke, so it raises IRQ1 and
+     * the keyboard driver's handler reads it.  Our `wait_can_read` then times
+     * out having been robbed by a driver behaving perfectly correctly.  It is
+     * not a race we lose occasionally; it is a race we lose whenever an
+     * interrupt beats us to a byte, and asking again produces another byte for
+     * the keyboard to take.
+     *
+     * §M33 TIER 2 FOUND THIS BY PLACING THE DRIVER IN RING 3, and the placement
+     * made it VISIBLE rather than causing it: in the kernel this code runs at
+     * boot, before anything can type and with the handshake effectively alone
+     * on the controller.  In ring 3 it runs when the user asks for the
+     * placement — necessarily while they are at the keyboard — and it cannot
+     * mask IRQ1, because masking an interrupt line is not something a ring-3
+     * driver may do and should not become one.
+     *
+     * So the retry buys the common case (nobody typing) and nothing else;
+     * measured, it recovers on the first attempt on a quiet box and can fail
+     * every attempt under a harness that is typing.  THE REAL ANSWER IS
+     * ARBITRATION OF A SHARED CONTROLLER — one owner of the 8042 that both
+     * drivers go through — and it is recorded as open rather than implied by a
+     * loop that looks like a fix.  What makes the failure survivable meanwhile
+     * is §M33 Tier 2's supervisor, which restarts the driver until a quiet
+     * moment lets bring-up through: recovery, not correctness. */
+    uint8_t cfg = 0;
+    int got_cfg = 0;
+    for (int attempt = 0; attempt < 8 && !got_cfg; attempt++) {
+        if (wait_can_write()) { step = 2; goto fail; }
+        drv_out8(h_ports, PS2_CMD, 0x20);
+        if (wait_can_read()) continue;          /* somebody else took it */
+        cfg = (uint8_t)drv_in8(h_ports, PS2_DATA);
+        got_cfg = 1;
+    }
+    if (!got_cfg) { step = 3; goto fail; }
     cfg |=  0x02;
     cfg &= (uint8_t)~0x20;
-    if (wait_can_write()) goto fail;
+    if (wait_can_write()) { step = 4; goto fail; }
     drv_out8(h_ports, PS2_CMD, 0x60);
-    if (wait_can_write()) goto fail;
+    if (wait_can_write()) { step = 5; goto fail; }
     drv_out8(h_ports, PS2_DATA, cfg);
 
     /* 3. Device: defaults + enable reporting.  aux_send eats the ACKs
      *    synchronously (IRQ12 is not yet installed, so no race). */
-    if (aux_send(0xF6) != 0) { kprintf("ps2-mouse: no device (0xF6 NAK)\n"); goto fail; }
+    if (aux_send(0xF6) != 0) { step = 6; goto fail; }        /* set defaults */
 
     /* 3b. The IntelliMouse knock, BEFORE enabling reporting: 200/100/80 Hz
      *     sample rates in that order, then read the device ID.  ID 3 means the
@@ -295,12 +335,12 @@ static int mouse_module_init(void) {
             }
         }
     }
-    if (aux_send(0xF4) != 0) { kprintf("ps2-mouse: enable failed\n"); goto fail; }
+    if (aux_send(0xF4) != 0) { step = 7; goto fail; }        /* enable reporting */
 
     /* The interrupt is claimed AFTER the enable, for the reason in the file
      * header: a stray ACK reaching the packet assembler shifts every packet. */
     h_irq = drv_irq_request(&rt, 12, "aux packets");
-    if (h_irq < 0) { kprintf("ps2-mouse: no IRQ grant (%d)\n", h_irq); goto fail; }
+    if (h_irq < 0) { kprintf("ps2-mouse: no IRQ grant (%d)\n", h_irq); step = 8; goto fail; }
 
     /* drv_run, not task_spawn: at boot this runs BEFORE task_init() and the
      * API queues it until the scheduler exists.  The driver does not have to
@@ -310,6 +350,7 @@ static int mouse_module_init(void) {
     return 0;
 
 fail:
+    kprintf("ps2-mouse: bring-up failed at step %d\n", step);
     /* ONE CALL RETURNS EVERYTHING.  §M66 made a shutdown hook mandatory and
      * §M67 made a missing one a refusal to load; this is what makes writing a
      * correct one mechanical rather than a checklist. */

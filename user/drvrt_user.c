@@ -34,6 +34,7 @@
 #define SYS_DRV_IRQ      0xD061
 #define SYS_DRV_IRQ_WAIT 0xD062
 #define SYS_DRV_INPUT    0xD063
+#define SYS_DRV_LOG      0xD064
 
 /* Mirror of the grant, so the bounds check is local.  Small and fixed: a
  * ring-3 driver holds a handful of resources, and an allocation here would be
@@ -43,8 +44,9 @@ static struct u_res g_res[DRV_MAX_RES];
 
 void drv_rt_init(struct drv_rt* rt, const char* owner) {
     if (!rt) return;
-    rt->owner = owner;
-    rt->nres  = 0;
+    rt->owner    = owner;
+    rt->nres     = 0;
+    rt->body_pid = 0;              /* in ring 3 the body IS this process */
     for (int i = 0; i < DRV_MAX_RES; i++) { rt->res[i] = 0; g_res[i].used = 0; }
 }
 
@@ -107,8 +109,15 @@ drv_handle drv_irq_request(struct drv_rt* rt, int line, const char* why) {
     return (drv_handle)dos_syscall3(SYS_DRV_IRQ, line, 0, 0);
 }
 
+/* Set once the kernel has asked this driver to stop.  Sticky on purpose: the
+ * request is delivered exactly once, on whichever wait happened to be in
+ * flight, and a driver that checked the flag one loop later would miss it. */
+static int g_stopping;
+
 int drv_irq_wait(drv_handle h, int timeout_ms) {
-    return (int)dos_syscall3(SYS_DRV_IRQ_WAIT, h, timeout_ms, 0);
+    int r = (int)dos_syscall3(SYS_DRV_IRQ_WAIT, h, timeout_ms, 0);
+    if (r == DRV_ESTOP) g_stopping = 1;
+    return r;
 }
 
 uint32_t drv_irq_count(drv_handle h) { (void)h; return 0; }   /* kernel-side stat */
@@ -145,17 +154,64 @@ void mouse_publish(int dx, int dy, unsigned buttons, int dz) {
     dos_syscall4(SYS_DRV_INPUT, dx, dy, (long)buttons, dz);
 }
 
-/* A ring-3 driver is stopped by being killed, so there is no cooperative flag
- * to check — and saying "never" here is the truth rather than a stub. */
-int task_should_stop(void) { return 0; }
+/* THE COOPERATIVE STOP, ACROSS A PROCESS BOUNDARY.
+ *
+ * This used to `return 0` with a comment claiming a ring-3 driver is stopped by
+ * being killed.  That was wrong in a way only the stop path could show: the
+ * driver spends its life blocked in drv_irq_wait, and the kernel's force-kill
+ * only takes a task caught IN USER MODE at a timer preemption — which a driver
+ * on a one-second timeout reaches roughly once a second.  So `drv stop` on a
+ * placed driver appeared to do nothing, and the honest-looking stub was the
+ * reason.
+ *
+ * Now the kernel's request arrives as DRV_ESTOP on the wait itself, and the
+ * driver's own loop — the same line the in-kernel build runs — sees it. */
+int task_should_stop(void) { return g_stopping; }
+
+/* A driver's own messages, rendered here and sent to the kernel's log.
+ *
+ * THE FIRST VERSION WROTE TO FD 1 AND WAS INVISIBLE.  A driver process is
+ * spawned by the registry rather than by a shell, so it has no console bound
+ * and its writes went nowhere — the first ring-3 bring-up failure of this
+ * milestone printed "controller timeout" into a void, and the fault had to be
+ * inferred from a CPU-time column belonging to a different task.  SYS_DRV_LOG
+ * puts the line in klog next to the in-kernel driver's, attributed by the
+ * kernel from the slot.
+ *
+ * %d / %x / %s ONLY, and the conversions are here rather than skipped because
+ * the messages that matter are the ones carrying a number: "no port grant (-1)"
+ * and "no port grant (-5)" are different diagnoses, and a formatter that drops
+ * the argument makes them the same sentence. */
+static int u_fmt_num(char* out, int cap, long v, int base) {
+    char tmp[24]; int n = 0, neg = 0;
+    unsigned long u;
+    if (v < 0 && base == 10) { neg = 1; u = (unsigned long)(-v); } else u = (unsigned long)v;
+    if (!u) tmp[n++] = '0';
+    while (u) { int d = (int)(u % (unsigned long)base); tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); u /= (unsigned long)base; }
+    if (neg) tmp[n++] = '-';
+    int k = 0;
+    while (n && k < cap) out[k++] = tmp[--n];
+    return k;
+}
 
 void kprintf(const char* fmt, ...) {
-    /* No formatting: the driver's messages are bring-up lines, and pulling a
-     * printf into a driver image to render them would cost more than they are
-     * worth.  The text up to the first conversion is written, which keeps every
-     * message identifiable without pretending to be a printf. */
-    int n = 0;
-    while (fmt[n] && fmt[n] != '%') n++;
-    if (n) write(1, fmt, (size_t)n);
-    if (fmt[n]) write(1, "...\n", 4);
+    char buf[128];
+    int  n = 0;
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    for (const char* p = fmt; *p && n < (int)sizeof buf - 1; p++) {
+        if (*p != '%') { if (*p != '\n') buf[n++] = *p; continue; }
+        p++;
+        if (*p == 'd')      n += u_fmt_num(buf + n, (int)sizeof buf - 1 - n,
+                                           __builtin_va_arg(ap, int), 10);
+        else if (*p == 'x') n += u_fmt_num(buf + n, (int)sizeof buf - 1 - n,
+                                           (long)__builtin_va_arg(ap, unsigned), 16);
+        else if (*p == 's') { const char* s = __builtin_va_arg(ap, const char*);
+                              while (s && *s && n < (int)sizeof buf - 1) buf[n++] = *s++; }
+        else if (*p == '%') buf[n++] = '%';
+        else if (!*p)       break;
+    }
+    __builtin_va_end(ap);
+    buf[n] = 0;
+    dos_syscall3(SYS_DRV_LOG, (long)(uintptr_t)buf, n, 0);
 }

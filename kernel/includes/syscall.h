@@ -112,6 +112,14 @@
 #define SYS_DRV_IRQ         0xD061  /* (line, why) → handle / -1               */
 #define SYS_DRV_IRQ_WAIT    0xD062  /* (handle, timeout_ms) → n fired / <0     */
 #define SYS_DRV_INPUT       0xD063  /* (dx, dy, buttons, dz) → 0 / -1          */
+/* A placed driver's own diagnostics.  It exists because a ring-3 driver has no
+ * console: it is spawned by the driver registry, not by a shell, so its
+ * `write(1, ...)` goes nowhere and its bring-up failures were INVISIBLE — the
+ * first placement failure this milestone hit reported nothing at all, and the
+ * cause had to be inferred from a CPU-time column.  Routing them through klog
+ * puts them next to the in-kernel driver's messages, which is where somebody
+ * comparing the two placements will look. */
+#define SYS_DRV_LOG         0xD064  /* (buf, len) → 0 / -1                     */
 
 #define SYS_DOSGUI_CREATE   0xD050  /* (w, h, title) → handle / -1             */
 #define SYS_DOSGUI_PRESENT  0xD051  /* (handle, px, w[, stride]) → 0 / -1      */

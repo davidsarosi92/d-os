@@ -393,6 +393,12 @@ static void syscall_dispatch_body(struct int_frame* f) {
             f->rax = (uint64_t)drvuser_sys_input((int)f->rbx, (int)f->rcx,
                                                  (unsigned)f->rdx, (int)f->rsi);
             return;
+        case SYS_DRV_LOG: {
+            char msg[128];
+            int n = copy_str_from_user(msg, f->rbx, sizeof msg);
+            f->rax = (uint64_t)drvuser_sys_log(n < 0 ? NULL : msg);
+            return;
+        }
 
         default:
             kprintf("syscall: unknown number %lu\n",

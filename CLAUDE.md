@@ -78,11 +78,35 @@ and the shell answers afterwards — **on aarch64 the victim was a LOADED MODULE
 §M67's AUTOMATIC ABI CHECK EARNED ITS KEEP UNPROMPTED:** `struct driver` grew
 two fields here, `sizeof` went 20 → 28 on i386, and the stale fixture is refused
 with *"struct driver is 28 bytes here, 32 in the module"* — **a number nobody
-updated by hand**, catching a real change made a milestone later.  **OPEN:**
-Tier 1 (the driver-runtime API + its user-mode backend + a first non-DMA driver
-in ring 3) — what `domain_enforceable` is waiting for; stage 5 (an IOMMU, without
-which a DMA driver outside the kernel is placement not isolation); Tier 2 (DMA
-drivers in ring 3 with CLIENT RECONNECTION, the genuinely pervasive part).
+updated by hand**, catching a real change made a milestone later.  **TIER 1 + TIER 2's RECONNECTION HALF SHIPPED (2026-08-28, DOCS §4.82):**
+`driver.<name>.domain = user` launches the ring-3 image INSTEAD of calling init,
+and port I/O stays a direct instruction because the grant lives in the CPU's I/O
+permission bitmap — which is what makes a placement affordable rather than a
+performance decision.  A supervisor then makes it survivable: grants back FIRST
+(our own conflict detector would refuse the replacement), CLIENTS QUIESCED (a
+driver that dies mid-drag leaves a button held forever and every later movement
+is a drag), backoff, and §M66 quarantine via `driver.restart_max`.  **SIX BUGS,
+FIVE ALREADY SHIPPED** — `drv stop` ran the IN-KERNEL hook for a driver running
+in ring 3 (*a placement is only a placement if EVERY lifecycle edge honours it*,
+and the test is the LIVE PROCESS, not the configured domain); a stopped driver
+left its body task spinning (**4.8 s of CPU for a stopped mouse**, invisible
+until it starved a ring-3 handshake); a placed driver was **effectively
+unkillable** because its ring-3 `task_should_stop()` was an honest-looking stub —
+now `DRV_ESTOP`, a cooperative stop that crosses a process boundary; `drv start`
+and the rescan job could place ONE driver TWICE, so it quarantined itself
+fighting itself for the 8042 (the first guard ran after the spawn, which both
+callers walked past — the slot is RESERVED first now); the per-CPU I/O-bitmap
+cache keys on an address the allocator immediately reuses; and a placed driver's
+messages went NOWHERE (no console — `SYS_DRV_LOG`).  **FOUND, NOT CAUSED: the
+8042's answer to a config read is indistinguishable from a keystroke**, so the
+keyboard driver steals it — the placement made it visible rather than causing it,
+since in the kernel that code only ever ran at boot.  **MEASURED: 25 driven
+pointer movements → 25 events through the process that REPLACED the killed one**,
+i386 and x86_64; and `restart_max = 0` turns the same kill into a quarantine,
+which is the control.  **OPEN:** stage 5 (an IOMMU, without which a DMA driver
+outside the kernel is placement not isolation); Tier 2's DMA half; MMIO into a
+driver's own space; and ARBITRATION OF A SHARED CONTROLLER — two drivers, one
+8042, no lock they can share across a process boundary.
 `driver.profile` is deliberately absent — with one reachable domain it would be
 a key with one legal value.  **NEXT: §M32 multi-user.**
 

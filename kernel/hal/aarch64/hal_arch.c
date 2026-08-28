@@ -174,3 +174,4 @@ void hal_tlb_shootdown(uintptr_t root_phys, uintptr_t va) {
  * ============================================================================= */
 void     hal_set_io_bitmap(const void* bm) { (void)bm; }
 uint32_t hal_io_bitmap_bytes(void)         { return 0; }
+void     hal_io_bitmap_forget(const void* bm) { (void)bm; }

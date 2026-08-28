@@ -147,5 +147,31 @@ void hal_set_io_bitmap(const void* bm) {
     tss[c].iomap_base = (uint16_t)__builtin_offsetof(struct tss32, iomap);
 }
 
+/* ----------------------------------------------------------------------
+ * §M33 Tier 2 — FORGET A BITMAP THAT IS ABOUT TO BE FREED.
+ *
+ * The cache above compares POINTERS, which is correct exactly as long as a
+ * given address means the same bitmap forever.  Restarting a ring-3 driver
+ * breaks that: the old bitmap is freed and a fresh one allocated, and the slab
+ * hands back the SAME ADDRESS almost every time — so the cache would say
+ * "already loaded" and skip the copy, leaving the TSS holding the DEAD
+ * driver's permissions.
+ *
+ * Today's two grants happen to be identical, so the stale copy would be right
+ * by accident and nothing would look wrong.  That is precisely why it is worth
+ * closing now: the first driver whose restart asks for a different window would
+ * inherit the previous one's ports, and the symptom — a driver reading a port
+ * it was never granted, with no error anywhere — is about as far from its cause
+ * as a bug in this tree can get.
+ *
+ * Called before the free.  Plain stores, no lock: the entry is only ever a
+ * "skip the copy" hint, so the worst a racing CPU can do is reload a bitmap it
+ * already had.
+ * ---------------------------------------------------------------------- */
+void hal_io_bitmap_forget(const void* bm) {
+    for (int c = 0; c < TSS_MAX_CPUS; c++)
+        if (iomap_loaded[c] == bm) iomap_loaded[c] = NULL;
+}
+
 uint32_t hal_io_bitmap_bytes(void) { return IOMAP_BYTES; }
 int       tss_max_cpus(void)          { return TSS_MAX_CPUS; }

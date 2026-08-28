@@ -25,6 +25,7 @@
 #include "domain.h"       /* §M33 — declared placement */
 #include "drvrt.h"        /* §M33 stage 2 — drv res */
 #include "drvuser.h"      /* §M33 Tier 1 — placing a driver in ring 3 */
+#include "task.h"         /* §M33 Tier 2 — killing/waiting on a placed driver */
 #include <stddef.h>
 
 /* ----------------------------------------------------------------------
@@ -136,6 +137,29 @@ static int drv_init(struct driver* d) {
  * registrations still stand", and after a fault that is precisely what we do
  * not know to be false. */
 static int drv_shutdown(struct driver* d) {
+    /* §M33 TIER 2 — STOP THE DRIVER THAT IS ACTUALLY RUNNING.
+     *
+     * A BUG TIER 1 SHIPPED WITH, found by writing the restart path: `drv_init`
+     * routes by domain and this did not, so stopping a placed driver ran the
+     * IN-KERNEL shutdown hook — code belonging to a driver that is not the one
+     * on the hardware, touching ports the kernel no longer owns, while the
+     * ring-3 process carried on driving the device.  It went unnoticed because
+     * the two halves are the same source file and the hook is written to be
+     * harmless when it has nothing to do.  A placement is only a placement if
+     * EVERY lifecycle edge honours it, not just the one that establishes it.
+     *
+     * THE TEST IS THE LIVE PROCESS, NOT THE CONFIGURED DOMAIN, and the
+     * difference is not pedantry — it is the entire window in which a placement
+     * change is applied.  `driver.<name>.domain = user` states an INTENTION;
+     * the driver keeps running wherever it already was until a restart carries
+     * it over.  Asking config where the driver is would answer "ring 3" for a
+     * driver still in the kernel and skip the shutdown that has to happen
+     * before it can move — so the change would take effect by leaving the old
+     * driver live, which is the two-drivers-one-8042 failure drv_init exists to
+     * avoid, arrived at from the other side. */
+    if (drvuser_pid(d->name) > 0)
+        return drvuser_stop(d->name) == 0 ? 0 : -1;
+
     if (!d->ops || !d->ops->shutdown) return 0;
     int r = drvguard_call(d, "shutdown", d->ops->shutdown, d->ctx);
     return (r == DRVGUARD_FAULTED) ? -1 : r;
@@ -271,11 +295,28 @@ void driver_list(void) {
     kprintf("drivers (%u):\n", driver_count);
     for (uint32_t i = 0; i < driver_count; i++) {
         struct drv_slot* sl = &g_slots[i];
-        kprintf("  [%s] %s v%s — %s%s\n",
+        kprintf("  [%s] %s v%s — %s%s",
                 sl->d->class ? sl->d->class : "?", sl->d->name,
                 sl->d->version ? sl->d->version : "?",
                 state_label(sl->state),
                 sl->dynamic ? "  (loaded)" : "");
+        /* §M33 Tier 2 — where it is, for a driver that is not in the kernel.
+         * Only printed when the answer is not the default: adding "at kernel"
+         * to every row would make the one line that matters the hardest to see.
+         *
+         * The LIVE PROCESS is what is reported, and the pending case gets its
+         * own words.  Config says where a driver SHOULD run; a restart is what
+         * moves it, and between the two the honest answer is neither "ring 3"
+         * nor silence — it is "still in the kernel, and here is why that is not
+         * what you asked for". */
+        int pid = drvuser_pid(sl->d->name);
+        if (pid > 0)
+            kprintf("  [ring 3, pid %d, %d restart(s), %d event(s)]",
+                    pid, drvuser_restarts(sl->d->name),
+                    drvuser_events(sl->d->name));
+        else if (driver_domain(sl->d) == DOMAIN_USER)
+            kprintf("  [in kernel — config asks for ring 3, restart to apply]");
+        kprintf("\n");
     }
 }
 
@@ -341,7 +382,12 @@ int driver_stop(const char* name) {
         kprintf("drv: '%s' is not running\n", name);
         return -2;
     }
-    if (!d->ops || !d->ops->shutdown) {
+    /* The hook requirement below is about a driver IN THE KERNEL.  A driver in
+     * ring 3 is stopped by being killed and its grants are returned by the
+     * kernel either way, so demanding a hook it does not need would refuse to
+     * stop exactly the drivers that are safest to stop.  Keyed on the live
+     * process for drv_shutdown's reason: what matters is where the driver IS. */
+    if (drvuser_pid(d->name) <= 0 && (!d->ops || !d->ops->shutdown)) {
         /* REFUSED, not forced.  A driver with no shutdown hook has no way to
          * put its hardware down or withdraw its registrations, and stopping it
          * would mean leaving a live DMA engine and a dangling device behind —
@@ -612,6 +658,58 @@ void driver_crash(const char* name) {
     if (!name || !*name) { kprintf("drv: crash <name>\n"); return; }
     struct driver* d = driver_find(name);
     if (!d) { kprintf("drv: no driver '%s'\n", name); return; }
+
+    /* §M33 TIER 2 — ONE VERB, BOTH PLACEMENTS.
+     *
+     * "Make this driver fail and show me what happens" is the same question
+     * wherever the driver runs, and the answers are what should differ: in
+     * ring 0 the guard catches the fault and the call unwinds; in ring 3 the
+     * process dies and the supervisor puts it back.  A second command for the
+     * second case would let one of the two paths quietly stop being exercised —
+     * §M31's argument that a safety net nobody has fallen into is one nobody
+     * has tested, applied to the net's other half. */
+    int pid = drvuser_pid(name);
+    if (pid > 0) {
+        int before = drvuser_restarts(name);
+        kprintf("drv: killing '%s' (ring-3 pid %d) to see whether it comes back\n",
+                name, pid);
+        /* FORCE, not the cooperative kill.  `task_kill` would deliver DRV_ESTOP
+         * and the driver would shut down tidily — which is `drv stop`, and
+         * proves the wrong thing.  A crash test has to produce a driver that
+         * stops without unwinding, because that is the failure the supervisor
+         * exists for. */
+        task_force_kill(pid);
+        /* POLL for the new pid rather than sleeping a guessed interval.  The
+         * force-kill lands at the victim's next timer preemption taken in user
+         * mode, which for a driver blocked on a one-second wait can be most of
+         * a second away — a fixed 800 ms wait reported "NOT recovered" for a
+         * driver that came back perfectly well 200 ms later, and I believed it
+         * once before checking. */
+        /* Wait for a DIFFERENT, LIVE pid.  Both halves matter: the slot reads
+         * back 0 while the supervisor is between releasing the old process and
+         * spawning the replacement, and the first version treated that
+         * transient as the final answer and reported "NOT recovered" about a
+         * driver that came back a moment later. */
+        int now = pid;
+        for (int k = 0; k < 200; k++) {                              /* ~10 s */
+            task_msleep(50);
+            now = drvuser_pid(name);
+            /* A DIFFERENT pid that has finished BRING-UP.  Waiting on the pid
+             * alone reported "recovered" about a replacement that failed its
+             * handshake moments later — the process existed and the device was
+             * not being driven, which is the exact distinction this milestone
+             * is about. */
+            if (now > 0 && now != pid && drvuser_ready(name)) break;
+        }
+        if (now > 0 && now != pid && drvuser_ready(name))
+            kprintf("drv: recovered — '%s' is pid %d now, device up "
+                    "(%d restart(s))\n", name, now, drvuser_restarts(name));
+        else if (drvuser_restarts(name) != before)
+            kprintf("drv: '%s' restarted but is not running now\n", name);
+        else
+            kprintf("drv: NOT recovered — '%s' has no ring-3 process\n", name);
+        return;
+    }
 
     kprintf("drv: making '%s' fault on purpose (inside a guarded call)\n", name);
     int r = drvguard_call(d, "crash-test", crash_victim, d->ctx);
