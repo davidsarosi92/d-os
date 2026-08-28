@@ -10512,20 +10512,87 @@ are not built.  `domain_isolation_reason` now says exactly that instead of
 — the same theatre in a new costume, and more convincing because the hardware
 really is doing something.
 
-**What §M33 still does not have:** per-driver DMA domains (what would finally move
-`ADVISORY(!)`), which want `drv_dma_request` to allocate into a domain of its own;
-`VIRTIO_F_ACCESS_PLATFORM` in the virtio drivers, without which the two most
-important devices on the machine cannot be put behind the boundary at all; MMIO
-into a driver's own address space (no placeable driver needs it yet, and building
-a mechanism with no client is what §M59 declined to do for Wayland's
-`wl_data_device`); and state replay richer than "the driver runs its own bring-up
-again", which is enough for a mouse and will not be for a device holding a
-session.
+**§M33 stage 5, finished (2026-08-28) — THE BOUNDARY PERMITS PRECISELY WHAT WAS
+GRANTED, PROVEN FROM ALL FOUR SIDES.**
+
+`iommu block` shows a device can be switched off; that is not the same as showing
+the boundary is *where we put it*.  `iommu limit <b>:<s>.<f> <base> <len>` confines
+a device to a window, and grants **accumulate into one domain** — which is not a
+convenience but the shape a per-driver domain needs, since a driver allocates its
+ring, then its data, then more later.  Replacing instead of adding would have
+looked correct in every single-buffer test and been wrong for every real driver.
+
+Four measurements on the same device and the same DMA, on **both x86 arches**:
+
+| domain | result |
+|---|---|
+| identity (all RAM) | `play` completes, **0 fault records** |
+| window excluding the buffers | refused **at the exact buffer address** — `record 0: device 0:3.0 tried to read 3a9f000 — REFUSED (reason 6)` (x86_64), `3ff81000` (i386) |
+| window covering ONE buffer | that access goes through, a **second** one is refused at `3ff80000` |
+| both windows granted | `play` completes, **0 fault records** |
+
+The third row is the one that matters most: the same device, the same playback,
+one region permitted and another refused, with the hardware naming which.  That is
+a boundary tracking each access, not a switch.
+
+**AND THE VIRTIO BYPASS IS A HARD LIMIT, MEASURED RATHER THAN ASSUMED.**  Closing
+it means negotiating `VIRTIO_F_ACCESS_PLATFORM` — **feature bit 33**, which does
+not exist in the 32-bit feature register of the *legacy* virtio PCI transport our
+drivers speak (they write a queue PFN at offset 0x08; modern virtio uses
+capability structures and 64-bit queue addresses).  QEMU says so outright when
+asked: `VIRTIO_F_IOMMU_PLATFORM was supported by neither legacy nor transitional
+device`, and it refuses `disable-modern=on` too.  So putting the disk and the
+network behind this boundary requires porting both virtio drivers to the modern
+1.0 transport — a real piece of work with a named cause, not an oversight.
+
+**THE VERDICT STILL DOES NOT MOVE, AND NOW SAYS EXACTLY WHY.**  Confinement is
+proven; nothing wires it to a driver.  Every device sits in the identity domain
+unless somebody types a command, `drv_dma_request` builds no domain of its own,
+and virtio devices are not behind the unit at all.  `domain_isolation_reason` says
+all three in words, because "translation is on and confinement works" is true and
+would be read as "a DMA driver in ring 3 is isolated", which is false.
+
+**What §M33 still does not have, with what each one waits on:**
+
+* **Per-driver DMA domains** — the last step before `ADVISORY(!)` can become
+  anything else.  `drv_dma_request` would map each allocation into a domain
+  belonging to the calling driver, and `drv_bind_device` would tell the kernel
+  which BDF to confine.  Deliberately not built: **no in-tree DMA driver uses
+  drvrt** (ps2_mouse, the only ported one, has none), and shipping the mechanism
+  with no client is what §M59 declined to do for Wayland's `wl_data_device` —
+  *a protocol surface with nothing to falsify it against "works" until the first
+  real user.*  The trigger is the first DMA driver ported to drvrt.
+* **Modern virtio transport** — see above; without it the two devices that matter
+  most cannot be put behind the boundary at all.
+* **MMIO into a driver's own address space** — same reasoning as per-driver
+  domains: no placeable driver needs it, and `drv_mmio_request` REFUSES from
+  ring 3 rather than faking it.
+* **State replay richer than "the driver runs its own bring-up again"** — enough
+  for a mouse, and it will not be for a device holding a session.
 
 ---
 
 ## 8. Change log
 
+- **2026-08-28 — §M33 stage 5 finished: the boundary permits precisely what was
+  granted (DOCS §4.82).**  `iommu limit` confines a device to a window and grants
+  ACCUMULATE into one domain — the shape a per-driver domain needs, since a driver
+  allocates its buffers one at a time; replacing instead of adding would look
+  right in every single-buffer test and be wrong for every real driver.  Four
+  measurements on the same device and the same DMA, both x86 arches: identity →
+  clean, 0 faults; window excluding the buffers → refused **at the exact buffer
+  address**; window covering ONE buffer → that access passes and a **second** is
+  refused; both granted → clean, 0 faults.  The third is the one that matters: a
+  boundary tracking each access, not a switch.  **The virtio bypass is a measured
+  hard limit** — `VIRTIO_F_ACCESS_PLATFORM` is feature bit 33 and does not exist
+  in the legacy transport our drivers speak; QEMU refuses it outright
+  (*"supported by neither legacy nor transitional device"*), so closing it means
+  porting both drivers to modern virtio 1.0.  **The verdict still does not move
+  and now says exactly why:** confinement is proven, nothing wires it to a driver,
+  `drv_dma_request` builds no domain, and virtio is not behind the unit.
+  Per-driver domains are deliberately NOT built — no in-tree DMA driver uses
+  drvrt, and a mechanism with no client is what §M59 declined for
+  `wl_data_device`.
 - **2026-08-28 — §M33 stage 5 (second half): translation ON, and a device that
   crosses its boundary is stopped by the hardware (DOCS §4.82).**  Root/context
   tables, second-level page tables with 2 MiB leaves (CAP.SLLPS checked, not

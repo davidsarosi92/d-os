@@ -23,7 +23,7 @@
  * is nothing to say — and it must be CLEARED when the next numbered milestone
  * ships, because from then on the number itself is the newer news and a stale
  * note would advertise old work as fresh. */
-#define DOS_MILESTONE_NOTE  " (M33 Tier 2)"    /* an OLDER section advanced after M67 */
+#define DOS_MILESTONE_NOTE  " (M33 stage 5)"    /* an OLDER section advanced after M67 */
 
 /* Short architecture tag for the on-screen label.  Deliberately the FAMILIAR
  * short form ("x32"/"x64") rather than the toolchain triple — the wallpaper

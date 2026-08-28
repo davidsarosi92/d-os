@@ -3226,11 +3226,27 @@ are not guarded (no caller to unwind to).
     not behind the boundary at all — `iommu` lists which devices are and are not.
     The most misleading bug: invalidating the context cache but not the IOTLB
     made `block` report success while the device kept working.
-  * **Still not isolation, and the reason now says so.**  Every device shares one
-    identity domain, so nothing is confined.  What would move `ADVISORY(!)`:
-    per-driver DMA domains built by `drv_dma_request`, plus
-    `VIRTIO_F_ACCESS_PLATFORM` in the virtio drivers — without the latter the two
-    devices that matter most cannot be put behind the boundary at all.
+  * **Stage 5 FINISHED — the boundary permits precisely what was granted.**
+    `iommu limit` confines a device to a window and grants ACCUMULATE into one
+    domain (the shape a per-driver domain needs).  Four measurements, both x86
+    arches: identity → clean; window excluding the buffers → refused at the exact
+    buffer address; window covering ONE buffer → that access passes and a second
+    is refused; both granted → clean, 0 faults.  The third proves a boundary that
+    tracks each access rather than a switch.
+  * **Still not isolation, and the reason now says exactly why.**  Confinement is
+    proven; nothing wires it to a driver.  What would move `ADVISORY(!)`:
+    **per-driver DMA domains** — `drv_dma_request` mapping each allocation into a
+    domain of the calling driver's, plus a `drv_bind_device` naming the BDF to
+    confine.  **Deliberately not built:** no in-tree DMA driver uses drvrt
+    (ps2_mouse has no DMA), and shipping a mechanism with no client is what §M59
+    declined for `wl_data_device`.  The trigger is the first DMA driver ported to
+    drvrt.
+  * **Modern virtio transport — a MEASURED hard limit, not an oversight.**
+    `VIRTIO_F_ACCESS_PLATFORM` is feature bit 33 and does not exist in the 32-bit
+    feature register of the legacy PCI transport our drivers speak.  QEMU refuses
+    it outright: *"VIRTIO_F_IOMMU_PLATFORM was supported by neither legacy nor
+    transitional device"*.  Until both drivers move to virtio 1.0, the disk and
+    the network cannot be put behind the boundary at all.
   * **Tier 2, second half** — DMA drivers in ring 3, which needs stage 5.
   * `driver.profile` (desktop|server) is deliberately absent: with one
     reachable domain it would be a key with one legal value.

@@ -592,6 +592,39 @@ int iommu_enable(void) {
 #endif
 }
 
+/* One device's own domain, remembered so a second grant ADDS to it.
+ *
+ * A per-driver domain is built one buffer at a time — a driver allocates its
+ * ring, then its data, then more later — so "confine to a window" has to be
+ * cumulative or it can only ever express a device with exactly one buffer.
+ * Making it replace instead of add would have looked right in every test with a
+ * single allocation and been wrong for every real driver. */
+#define IOMMU_MAX_DOMAINS 8
+static struct { uint16_t bdf; int used, dom; uint64_t top_phys; uint64_t* top; }
+    g_dom[IOMMU_MAX_DOMAINS];
+
+static int domain_for(uint16_t bdf, uint64_t** top, uint64_t* top_phys, int* dom,
+                      int* is_new) {
+    for (int i = 0; i < IOMMU_MAX_DOMAINS; i++)
+        if (g_dom[i].used && g_dom[i].bdf == bdf) {
+            *top = g_dom[i].top; *top_phys = g_dom[i].top_phys;
+            *dom = g_dom[i].dom; *is_new = 0;
+            return 0;
+        }
+    for (int i = 0; i < IOMMU_MAX_DOMAINS; i++) {
+        if (g_dom[i].used) continue;
+        uint64_t ph;
+        uint64_t* t = table_alloc(&ph);
+        if (!t) return -1;
+        g_dom[i].used = 1; g_dom[i].bdf = bdf;
+        g_dom[i].top = t; g_dom[i].top_phys = ph;
+        g_dom[i].dom = g_next_domain++;
+        *top = t; *top_phys = ph; *dom = g_dom[i].dom; *is_new = 1;
+        return 0;
+    }
+    return -1;
+}
+
 int iommu_restrict(uint16_t bdf, uint64_t base, uint64_t len) {
 #if !defined(__i386__) && !defined(__x86_64__)
     (void)bdf; (void)base; (void)len; return -1;
@@ -600,12 +633,10 @@ int iommu_restrict(uint16_t bdf, uint64_t base, uint64_t len) {
         kprintf("iommu: not active — `iommu on` first\n");
         return -1;
     }
-    uint64_t top_phys;
-    uint64_t* top = table_alloc(&top_phys);
-    if (!top) return -1;
+    uint64_t top_phys; uint64_t* top; int dom, is_new;
+    if (domain_for(bdf, &top, &top_phys, &dom, &is_new) != 0) return -1;
     if (len && domain_map(top, base, len) != 0) return -1;
 
-    int dom = g_next_domain++;
     if (context_set(bdf, top_phys, dom) != 0) return -1;
     invalidate_all();
 
@@ -613,8 +644,13 @@ int iommu_restrict(uint16_t bdf, uint64_t base, uint64_t len) {
      * wrote down the same way after it turned a bring-up dump into garbage
      * exactly when it was needed.  Plain %x, and the b:s.f punctuation carries
      * the structure instead. */
-    kprintf("iommu: %x:%x.%x now sees ONLY %x..%x (domain %d)\n",
+    /* "ONLY" is true of the FIRST grant and a lie about the second, because the
+     * domain accumulates.  Saying it anyway would mislead precisely the person
+     * building up a per-driver domain buffer by buffer — the one use this
+     * primitive exists for. */
+    kprintf("iommu: %x:%x.%x %s %x..%x (domain %d)\n",
             bdf >> 8, (bdf >> 3) & 0x1F, bdf & 7,
+            is_new ? "now sees ONLY" : "may ALSO reach",
             (unsigned)base, (unsigned)(base + len), dom);
     if (!len)
         kprintf("  it can reach NOTHING — every DMA it attempts is now a fault\n");
@@ -737,6 +773,36 @@ void iommu_cmd(const char* args) {
         return;
     }
 
+    if (args[0]=='l'&&args[1]=='i'&&args[2]=='m'&&args[3]=='i'&&args[4]=='t') {
+        /* `iommu limit <b>:<s>.<f> <base> <len>` — confine a device to a WINDOW.
+         *
+         * `block` proves the extreme case: a domain that maps nothing refuses
+         * everything.  That alone does not show the boundary is where we PUT
+         * it, only that we can switch a device off.  A window shows both edges:
+         * give a device a range that excludes its buffers and its real DMA is
+         * refused AT ITS OWN BUFFER ADDRESS; give it one that includes them and
+         * the same DMA goes through untouched.
+         *
+         * This is exactly the granularity a per-driver DMA domain would use, so
+         * proving it here is proving the mechanism that work would rest on. */
+        const char* p = args + 5;
+        while (*p == ' ') p++;
+        const char* e;
+        uint64_t bus = parse_hex(p, &e);
+        if (*e != ':') { kprintf("iommu: limit <b>:<s>.<f> <base> <len>\n"); return; }
+        uint64_t slot = parse_hex(e + 1, &e);
+        uint64_t func = 0;
+        if (*e == '.') func = parse_hex(e + 1, &e);
+        while (*e == ' ') e++;
+        uint64_t base = parse_hex(e, &e);
+        while (*e == ' ') e++;
+        uint64_t len = parse_hex(e, &e);
+        if (!len) { kprintf("iommu: a zero length is `block` — say that instead\n"); return; }
+        iommu_restrict((uint16_t)((bus << 8) | ((slot & 0x1F) << 3) | (func & 7)),
+                       base, len);
+        return;
+    }
+
     if (str_eq_i(args, "faults")) {
         uint32_t n = iommu_fault_count();
         kprintf("iommu: %u fault record(s) in the unit\n", n);
@@ -749,6 +815,7 @@ void iommu_cmd(const char* args) {
         return;
     }
 
-    kprintf("iommu: (no args) | on | block <bus>:<slot>.<func> | faults\n");
+    kprintf("iommu: (no args) | on | block <b>:<s>.<f> | "
+            "limit <b>:<s>.<f> <base> <len> | faults\n");
 }
 

@@ -162,9 +162,12 @@ const char* domain_isolation_reason(int does_dma) {
          * is that the machinery WORKS, not that any driver is confined by it.
          * Per-driver domains are what `drv_dma_request` would have to build,
          * and they are not built. */
-        return "translation is ON but every device shares one identity domain "
-               "— the machinery works, no driver is confined by it yet, and "
-               "virtio devices bypass it entirely (`iommu` lists which)";
+        return "translation is ON and confinement is PROVEN (a device given a "
+               "window is refused outside it, by the hardware, at the exact "
+               "address) — but nothing wires it to a driver: every device sits "
+               "in one identity domain, `drv_dma_request` builds no domain of "
+               "its own, and virtio devices bypass the unit entirely because "
+               "our drivers are legacy (`iommu` lists which)";
     case IOMMU_PRESENT:
         return "this machine HAS an IOMMU and we do not program it yet "
                "(§M33 stage 5) — unfinished work, not a hardware limit";

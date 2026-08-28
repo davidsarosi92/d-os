@@ -170,13 +170,34 @@ and read something else on real hardware).  Also `%02x` printed literally again 
 one shared identity domain confines nobody, so `domain_isolation_reason` says that
 in words rather than "translation is on" — *the short version reads as though it
 were sufficient, which is the same theatre in a new costume and more convincing
-because the hardware really is doing something*.  **OPEN:** per-driver DMA domains
-(what would finally move `ADVISORY(!)`, built by `drv_dma_request`);
-`VIRTIO_F_ACCESS_PLATFORM` in the virtio drivers, without which the two most
-important devices cannot be put behind the boundary at all; MMIO into a driver's
-own space (deliberately not built — no placeable driver needs it, and a mechanism
-with no client is what §M59 declined for `wl_data_device`); state replay richer
-than "run bring-up again".
+because the hardware really is doing something*.  **AND STAGE 5 IS FINISHED: THE BOUNDARY PERMITS PRECISELY WHAT WAS
+GRANTED.**  `iommu limit` confines a device to a WINDOW, and grants **ACCUMULATE
+into one domain** — not a convenience but the shape a per-driver domain needs,
+since a driver allocates its ring, then its data, then more later; *replacing
+instead of adding would look right in every single-buffer test and be wrong for
+every real driver*.  **FOUR MEASUREMENTS, SAME DEVICE, SAME DMA, BOTH x86
+ARCHES:** identity → clean, 0 faults; a window EXCLUDING the buffers → refused
+**at the exact buffer address** (`3a9f000` on x86_64, `3ff81000` on i386); a
+window covering ONE buffer → that access passes and a **SECOND is refused** at
+`3ff80000`; both granted → clean, **0 faults**.  *The third is the one that
+matters — one region permitted and another refused on the same playback, with the
+hardware naming which: a boundary that tracks each access, not a switch.*  **THE
+VIRTIO BYPASS IS A MEASURED HARD LIMIT:** `VIRTIO_F_ACCESS_PLATFORM` is feature
+bit **33** and does not exist in the 32-bit feature register of the LEGACY virtio
+PCI transport our drivers speak — QEMU says so itself (*"supported by neither
+legacy nor transitional device"*), so closing it means porting both drivers to
+modern virtio 1.0.  **THE VERDICT STILL DOES NOT MOVE AND NOW SAYS EXACTLY WHY:**
+confinement is proven and nothing wires it to a driver — every device sits in the
+identity domain unless somebody types a command, `drv_dma_request` builds no
+domain of its own, and virtio is not behind the unit at all.  *"Translation is on
+and confinement works" is true and would be read as "a DMA driver in ring 3 is
+isolated", which is false.*  **OPEN, each with what it waits on:** per-driver DMA
+domains — the last step before `ADVISORY(!)` can change — **deliberately NOT
+built, because no in-tree DMA driver uses drvrt** and a mechanism with no client
+is what §M59 declined for `wl_data_device`; the modern virtio transport (above);
+MMIO into a driver's own space (same reasoning, and `drv_mmio_request` REFUSES
+from ring 3 rather than faking it); state replay richer than "run bring-up
+again".
 `driver.profile` is deliberately absent — with one reachable domain it would be
 a key with one legal value.  **NEXT: §M32 multi-user.**
 
