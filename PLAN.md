@@ -62,7 +62,7 @@
 | §M30 | Task scheduling — cron service — ✅ shipped (DOCS §4.23) | ~1935 |
 | §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) — ✅ shipped L1+L2 (DOCS §4.22; L3 HW deferred) | ~1960 |
 | §M32 | Multi-user — identity, login, file perms, isolation | ~2160 |
-| §M33 | Execution domains — where a service runs (kernel / user / isolated); driver placement is the flagship case | ~2265 |
+| §M33 | Execution domains — ◐ Tier 0/1/2 + stage 5 shipped (DOCS §4.82): a driver runs in ring 3 from the same source, is supervised and restarted, and an IOMMU-confined device is refused outside its granted windows.  Remaining items all gated on named triggers | ~2265 |
 | §M34 | POSIX process & signals — ✅ shipped (i386): fork(COW)/execve/waitpid/pipe/dup2/signals (DOCS §4.27) | — |
 | §M35 | Threads & futex — ✅ shipped (i386, UP + SMP): clone/futex/thread_create + per-CPU TSS (DOCS §4.28) | — |
 | §M35.5 | Package manager & isolation — ✅ store shipped (i386): content-addressed /store + profiles + GC (DOCS §4.29); gates every port | — |
@@ -258,7 +258,7 @@ what); a session can pick a theme and push on it.
 | M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | ✅ DOCS §4.23 |
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | ✅ DOCS §4.22 (L1+L2; L3 HW deferred) |
 | M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation | Security | §M32 |
-| M33 | Execution domains — a service's run location as a declared capability + config choice; driver placement is the flagship case | Reliability | ◐ Tier 0 + the declaration shipped 2026-08-27, DOCS §4.82; Tier 1/2 open |
+| M33 | Execution domains — a service's run location as a declared capability + config choice; driver placement is the flagship case | Reliability | ◐ Tier 0, stage 2, Tier 1, Tier 2 (reconnection + shared-controller arbitration) and stage 5 (IOMMU: translation on, confinement proven) all shipped 2026-08-27/28, DOCS §4.82.  OPEN and each with a written trigger: per-driver DMA domains (waits on the first DMA driver ported to drvrt), modern virtio transport (legacy has no feature bit 33), MMIO into ring 3, richer state replay |
 | **M46** | **Resilient control plane — SAK hotkeys + force-kill** — Ctrl+Alt+Del = always-live Task Manager, Ctrl+Alt+X = kill last/frozen app, window chrome (close/min/restore) works even when the app is wedged (close ⇒ force-kill), Task Manager force-quit; the enabler is a real force-kill of a wedged ring-3 process | Reliability / UX | ✅ DOCS §4.37 |
 | M58 | Text selection — pointer grab + press/motion/release, selection model (text bytes / terminal cells), word + line selection | UX | §M58 |
 | M59 | Clipboard, system-wide — typed offers, ring-3 ops + `/dev/clipboard`, Wayland `wl_data_device`, primary selection | UX | §M59 (wants §M58) |
