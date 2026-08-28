@@ -142,8 +142,9 @@ drv_handle drv_mmio_request(struct drv_rt* rt, uint64_t phys, size_t len, const 
     (void)rt; (void)phys; (void)len; (void)why; return DRV_ENOSYS;
 }
 volatile void* drv_mmio_ptr(drv_handle h) { (void)h; return 0; }
-drv_handle drv_dma_request(struct drv_rt* rt, size_t bytes, const char* why) {
-    (void)rt; (void)bytes; (void)why; return DRV_ENOSYS;
+drv_handle drv_dma_request(struct drv_rt* rt, size_t bytes, int addr_bits,
+                           const char* why) {
+    (void)rt; (void)bytes; (void)addr_bits; (void)why; return DRV_ENOSYS;
 }
 void*    drv_dma_cpu(drv_handle h)    { (void)h; return 0; }
 uint64_t drv_dma_device(drv_handle h) { (void)h; return 0; }

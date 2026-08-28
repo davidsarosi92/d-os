@@ -23,6 +23,8 @@
 #include "driver.h"
 #include "drvuser.h"   /* §M33 Tier 1 — drvtest */
 #include "iommu.h"     /* §M33 stage 5 — the `iommu` report */
+void edu_test(void);
+void edu_escape(uint64_t phys);
 #include "modload.h"   /* §M67 — insmod / rmmod / lsmod */
 #include "ksym.h"      /* §M67 — ksyms */
 #include "timer.h"
@@ -4134,6 +4136,20 @@ static void dispatch(struct vc* my_vc, const char* line) {
      * drivers placed at all, and that is exactly when somebody deciding whether
      * to place one wants to read it. */
     if (starts_with(line, "iommu")) { iommu_cmd(line + 5); return; }
+    /* §M33 — the DMA client the milestone was waiting for.  `edutest` is a
+     * round trip through a real bus-master engine; `eduescape <addr>` aims that
+     * engine somewhere it was never granted, which is the only way to find out
+     * whether the confinement is real. */
+    if (streq(line, "edutest")) { edu_test(); return; }
+    if (starts_with(line, "eduescape ")) {
+        const char* p = line + 10;
+        unsigned long long a = 0;
+        if (p[0]=='0' && (p[1]=='x'||p[1]=='X')) p += 2;
+        while ((*p>='0'&&*p<='9')||((*p|32)>='a'&&(*p|32)<='f'))
+            { int d = (*p<='9')?*p-'0':((*p|32)-'a'+10); a = a*16+(unsigned)d; p++; }
+        edu_escape(a);
+        return;
+    }
     if (streq(line, "lsconsole")) { console_list(); return; }
     if (streq(line, "uptime")) { cmd_uptime();      return; }
     if (streq(line, "dmesg"))         { cmd_dmesg("");         return; }

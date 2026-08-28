@@ -152,6 +152,14 @@ void* pmm_bootmem_alloc(uint32_t bytes);
  * returns NORMAL-only.
  * --------------------------------------------------------------------------- */
 pmm_phys_t page_alloc(int order, int zone_hint);
+
+/* §M33 — a run of 2^order frames entirely below `limit`, for a device whose
+ * address register is narrower than any zone boundary.  The zones express three
+ * widths and real devices are not that tidy; see the implementation for why the
+ * obvious answer (ZONE_DMA) is empty on a machine with a 60 MiB kernel image.
+ * PMM_ALLOC_FAIL rather than a near miss — a device truncating an address it
+ * cannot hold is the failure this exists to prevent. */
+pmm_phys_t page_alloc_below(int order, pmm_phys_t limit);
 void       page_free (pmm_phys_t phys, int order);
 
 /* ---------------------------------------------------------------------------

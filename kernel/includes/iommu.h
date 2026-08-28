@@ -113,6 +113,23 @@ int iommu_enable(void);
  * `bdf` is (bus << 8) | (slot << 3) | func. */
 int iommu_restrict(uint16_t bdf, uint64_t base, uint64_t len);
 
+/* ADD a driver's buffer to that driver's own domain, and move the device into
+ * it.  Called from `drv_dma_request` for every allocation a bound driver makes,
+ * which is what turns "the machinery can confine a device" into "this driver's
+ * device is confined".
+ *
+ * A NO-OP WHEN TRANSLATION IS NOT ON, and that has to be silent rather than an
+ * error: a driver allocating DMA on a machine with no IOMMU is doing nothing
+ * wrong, and failing its allocation because the machine lacks hardware would
+ * make every DMA driver depend on a chipset feature.  What must NOT be silent
+ * is the claim afterwards — `iommu` reports which devices are confined, so an
+ * unconfined one is visible rather than assumed. */
+int iommu_confine(uint16_t bdf, uint64_t base, uint64_t len);
+
+/* Is this device confined to a domain of its own (1) or sitting in the shared
+ * identity domain (0)?  What the isolation verdict is allowed to consult. */
+int iommu_is_confined(uint16_t bdf);
+
 /* How many DMA faults the unit has recorded, and the last one's address.  Read
  * from the fault-recording registers rather than counted by us: a fault that
  * only our software knows about would prove nothing about the hardware. */

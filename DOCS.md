@@ -10552,21 +10552,80 @@ and virtio devices are not behind the unit at all.  `domain_isolation_reason` sa
 all three in words, because "translation is on and confinement works" is true and
 would be read as "a DMA driver in ring 3 is isolated", which is false.
 
+**§M33 — PER-DRIVER DMA DOMAINS, AND THE CLIENT THAT MADE THEM POSSIBLE
+(2026-08-28).**
+
+Three §M33 mechanisms were finished and unreachable for one reason: nothing in
+the tree used them.  Building them anyway is what §M59 declined to do for
+Wayland's `wl_data_device`, so the honest way to finish the milestone was to find
+a client — and the smallest honest client is a device that exists to be driven
+and that nothing depends on.  **QEMU's `edu` device**: an MMIO window, a real
+bus-master DMA engine and an interrupt, in a teaching example, available on x86
+*and* on `-M virt`.
+
+`kernel/drivers/misc/edu.c` is written entirely against `drvrt.h` — no arch code
+— and **runs on all three arches from one source**: `edutest: 256 bytes out and
+back through the device, all correct` on i386, x86_64 and aarch64.
+
+**THE MECHANISM IT UNLOCKED IS ONE LINE IN `drv_dma_request`**, and it is one line
+because everything under it was built first: each buffer a bound driver allocates
+is ADDED to a domain belonging to that driver, and the device is moved into it.
+`drv_bind_device` is what tells the kernel which device the driver speaks for — a
+DMA driver that never calls it stays in the identity domain and is REPORTED that
+way rather than assumed to be fine.
+
+**MEASURED, WITH THE CONTROL THAT MAKES IT MEAN SOMETHING.**  With translation on,
+starting the driver prints `iommu: 0:3.0 now sees ONLY 3d04e000..3d04f000
+(domain 2)` — the device confined to exactly the one page its driver asked for —
+and `edutest` then does the round trip **and aims the device's own DMA engine
+64 KiB past its buffer**: `REFUSED by the hardware (1 fault record) — the device
+is confined to its own buffer`, on **both x86 arches**.  On a machine with no
+IOMMU the identical test says `NOT refused — there is nothing on this machine
+that could have refused it`.
+
+**FOUR BUGS, AND THE FIRST CLIENT FOUND ALL OF THEM — WHICH IS THE ARGUMENT FOR
+HAVING ONE.**
+
+* **The DMA API could not express a device's address width.**  edu addresses
+  28 bits; it was handed a DMA32 buffer at ~1023 MiB, **CLAMPED the address to
+  28 bits, read some other page, cleared its status register to report success,
+  and 255 of 256 bytes came back wrong** with nothing anywhere explaining it.
+  *A device quietly truncating an address it cannot hold is the classic DMA bug,
+  and an API that cannot express the constraint guarantees every driver
+  rediscovers it.*  `drv_dma_request` now takes `addr_bits`, and the result is
+  CHECKED against the limit and refused rather than trusted.
+* **The zones could not serve it, and that is a fact about this kernel.**  Zones
+  express 16 MiB / 4 GiB / unconstrained; real devices are not that tidy.
+  ZONE_DMA fits 28 bits and is EMPTY here — the kernel image is ~61 MiB and
+  occupies everything below 16 MiB — so the zone that fits is unusable and the
+  one that is usable does not fit.  New `page_alloc_below(order, limit)` scans
+  the free lists for a run that fits; it is a linear scan on purpose, because
+  this is a narrow device allocating once at bring-up and making the common path
+  pay for it would be a real cost for a rare case.  At 28 bits on this kernel the
+  allocation is still **refused** — correctly, and visibly.
+* **The driver never enabled bus mastering.**  Silent in the worst way: the
+  command register accepted the transfer, the status register cleared as if it
+  had run, and the buffer came back untouched.  It survived a first reading
+  because every address and direction bit was right.
+* **THE CONFINEMENT WAS 2 MiB GRANULAR, AND SAID 4 KiB.**  `domain_map` used
+  superpages for every domain, so a device "confined to its 4 KiB buffer" was
+  actually granted the surrounding **2 MiB — 512 pages of somebody else's
+  memory** — while `iommu` reported the narrow window, because the report was
+  written from the request.  Caught only because the escape test aims 64 KiB past
+  the buffer rather than a comfortable few megabytes; *a test that had picked a
+  distant address would have passed and the granularity would have shipped.*
+  Leaf size is now a parameter: 2 MiB for the identity domain (size), 4 KiB for a
+  driver's (precision).
+
 **What §M33 still does not have, with what each one waits on:**
 
-* **Per-driver DMA domains** — the last step before `ADVISORY(!)` can become
-  anything else.  `drv_dma_request` would map each allocation into a domain
-  belonging to the calling driver, and `drv_bind_device` would tell the kernel
-  which BDF to confine.  Deliberately not built: **no in-tree DMA driver uses
-  drvrt** (ps2_mouse, the only ported one, has none), and shipping the mechanism
-  with no client is what §M59 declined to do for Wayland's `wl_data_device` —
-  *a protocol surface with nothing to falsify it against "works" until the first
-  real user.*  The trigger is the first DMA driver ported to drvrt.
-* **Modern virtio transport** — see above; without it the two devices that matter
-  most cannot be put behind the boundary at all.
-* **MMIO into a driver's own address space** — same reasoning as per-driver
-  domains: no placeable driver needs it, and `drv_mmio_request` REFUSES from
-  ring 3 rather than faking it.
+* **MMIO into a driver's own address space**, and with it a ring-3 edu — the
+  reason `domain_isolation_of` cannot yet report a confined DMA driver as
+  isolated: the verdict would be unreachable, since edu runs in the kernel where
+  the answer is `none` regardless.  This now HAS a client and is the next step.
+* **Modern virtio transport** — a measured limit (feature bit 33 does not exist
+  in legacy virtio); without it the disk and the network cannot be put behind the
+  boundary at all.  Correctly a virtio-driver item rather than a §M33 one.
 * **State replay richer than "the driver runs its own bring-up again"** — enough
   for a mouse, and it will not be for a device holding a session.
 

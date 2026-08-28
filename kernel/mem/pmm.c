@@ -581,6 +581,59 @@ static void buddy_free_in_zone(struct zone* z, uint32_t pfn, int order) {
 /* Public API: order-aware page_alloc / page_free.                            */
 /* -------------------------------------------------------------------------- */
 
+/* --------------------------------------------------------------------------
+ * §M33 — allocate a run the DEVICE can actually address.
+ *
+ * WHY THE ZONES ARE NOT ENOUGH.  They express three widths — 16 MiB, 4 GiB, and
+ * unconstrained — and real devices are not that tidy.  The first driver written
+ * against the driver-runtime API addresses 28 bits; ZONE_DMA satisfies that and
+ * is EMPTY on this system, because the kernel image is 60 MiB and occupies
+ * everything below 16 MiB.  So the zone that fits is unusable and the zone that
+ * is usable does not fit, and a caller with a bit-width constraint had no way to
+ * say so.
+ *
+ * This walks the free list at the requested order for the first block that fits
+ * under `limit`.  It is a LINEAR SCAN and that is deliberate: this is the rare
+ * path (a narrow device allocating once at bring-up), and making the common path
+ * pay for it — by sorting the free lists, say — would be a real cost for a case
+ * that happens a handful of times per boot.
+ *
+ * Returns PMM_ALLOC_FAIL rather than something that does not fit.  A device
+ * silently truncating an address it cannot hold is precisely the failure being
+ * prevented, and handing back a near-miss would reintroduce it.
+ * -------------------------------------------------------------------------- */
+pmm_phys_t page_alloc_below(int order, pmm_phys_t limit) {
+    if (order < 0 || order > BUDDY_MAX_ORDER) return PMM_ALLOC_FAIL;
+    uint64_t bytes = (uint64_t)4096 << order;
+
+    /* Lowest zone first: its memory is the scarcest and the most likely to fit,
+     * which is the opposite of page_alloc's preference and correct here. */
+    const int order_zones[3] = { ZONE_DMA, ZONE_DMA32, ZONE_NORMAL };
+    for (int zi = 0; zi < 3; zi++) {
+        struct zone* z = &zones[order_zones[zi]];
+        uint32_t fl = spin_lock_irqsave(&z->lock);
+        /* Blocks of exactly this order first; then split a larger one whose
+         * base already fits, since the lower half of a fitting block fits. */
+        for (int o = order; o <= BUDDY_MAX_ORDER; o++) {
+            for (pmm_phys_t cur = z->free_lists[o]; cur; cur = link_load(cur)) {
+                if ((uint64_t)cur + bytes - 1 > (uint64_t)limit) continue;
+                if (!zone_remove(z, phys_to_pfn(cur), o)) continue;
+                /* Give back the halves we do not need, highest first so the
+                 * free lists keep the shape buddy_free expects. */
+                for (int k = o; k > order; k--)
+                    zone_push(z, phys_to_pfn(cur) + (1u << (k - 1)), k - 1);
+                spin_unlock_irqrestore(&z->lock, fl);
+                return cur;
+            }
+        }
+        spin_unlock_irqrestore(&z->lock, fl);
+    }
+    /* Quiet on purpose: the caller reports the refusal with the driver's name
+     * and its address width, which is the part somebody can act on.  A second
+     * message here would only say the same thing without the context. */
+    return PMM_ALLOC_FAIL;
+}
+
 pmm_phys_t page_alloc(int order, int zone_hint) {
     if (order < 0 || order > BUDDY_MAX_ORDER) return PMM_ALLOC_FAIL;
 

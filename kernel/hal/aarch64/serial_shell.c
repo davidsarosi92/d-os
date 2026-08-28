@@ -35,7 +35,8 @@
 #include "timer.h"
 #include "audio.h"
 #include "driver.h"
-#include "iommu.h"      /* §M23 stage 2 — lsaudio / play, from the core */
+#include "iommu.h"
+void edu_test(void);      /* §M23 stage 2 — lsaudio / play, from the core */
 #include "modload.h"   /* §M67 — insmod / rmmod / lsmod */
 #include "ksym.h"      /* §M67 — ksyms */
 #include "syscall.h"   /* §M53 stage 3 — timerfd + setitimer self-tests */
@@ -660,6 +661,9 @@ void serial_shell_entry(void) {
          * for is exactly this one — a diagnostic that answers on two arches out
          * of three teaches the third's users that the question has no answer. */
         else if (s_eq(cmd, "iommu"))   iommu_cmd(args);
+        /* §M33 — the same DMA client on ARM, which is what lets this arch
+         * place a driver at all (see edu.c). */
+        else if (s_eq(cmd, "edutest"))  edu_test();
         /* §M67 — the loader's own commands, same implementation as x86. */
         else if (s_eq(cmd, "lsmod"))   modload_list();
         else if (s_eq(cmd, "insmod"))  modload_cmd_insmod(args);

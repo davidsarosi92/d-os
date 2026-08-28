@@ -436,13 +436,32 @@ static uint64_t* table_alloc(uint64_t* out_phys) {
     return v;
 }
 
-/* Map [va, va+len) to itself in `top`, using 2 MiB leaves. */
-static int domain_map(uint64_t* top, uint64_t base, uint64_t len) {
-    for (uint64_t a = base & ~0x1FFFFFull; a < base + len; a += 0x200000ull) {
+/* Map [base, base+len) to itself in `top`.
+ *
+ * THE LEAF SIZE IS A PARAMETER BECAUSE THE TWO USERS WANT OPPOSITE THINGS, and
+ * getting that wrong is a boundary that looks right and is not.
+ *
+ *   * The IDENTITY domain covers all of RAM and wants 2 MiB leaves — 4 KiB ones
+ *     would cost megabytes of tables at boot on a path that must not fail.
+ *   * A PER-DRIVER domain covers a handful of pages and wants 4 KiB leaves,
+ *     because its whole purpose is precision.
+ *
+ * THE FIRST VERSION USED 2 MiB FOR BOTH, and the confinement was theatre in the
+ * most convincing form: `iommu` reported the device confined to a single 4 KiB
+ * buffer, the report was written from the request, and the DOMAIN actually
+ * granted the surrounding 2 MiB — 512 pages of somebody else's memory.  It was
+ * caught only because the escape test aimed 64 KiB past the buffer rather than
+ * a comfortable few megabytes; a test that had picked a distant address would
+ * have passed and the granularity would have shipped.
+ */
+static int domain_map(uint64_t* top, uint64_t base, uint64_t len, int leaf_2mb) {
+    uint64_t step = leaf_2mb ? 0x200000ull : 0x1000ull;
+    int      leaf_lvl = leaf_2mb ? 2 : 1;
+    for (uint64_t a = base & ~(step - 1); a < base + len; a += step) {
         uint64_t* tbl = top;
-        /* Walk down to the level above the 2 MiB leaf, creating as we go.  The
-         * index arithmetic is x86's: 9 bits per level, leaf at level 2. */
-        for (int lvl = g_levels; lvl > 2; lvl--) {
+        /* Walk down to the level ABOVE the leaf, creating as we go.  9 bits per
+         * level, x86's arithmetic. */
+        for (int lvl = g_levels; lvl > leaf_lvl; lvl--) {
             int idx = (int)((a >> (12 + 9 * (lvl - 1))) & 0x1FF);
             if (!(tbl[idx] & SL_READ)) {
                 uint64_t np;
@@ -452,8 +471,8 @@ static int domain_map(uint64_t* top, uint64_t base, uint64_t len) {
             }
             tbl = (uint64_t*)phys_to_virt((uintptr_t)(tbl[idx] & ~0xFFFull));
         }
-        int idx = (int)((a >> 21) & 0x1FF);
-        tbl[idx] = a | SL_READ | SL_WRITE | SL_SUPERPAGE;
+        int idx = (int)((a >> (12 + 9 * (leaf_lvl - 1))) & 0x1FF);
+        tbl[idx] = a | SL_READ | SL_WRITE | (leaf_2mb ? SL_SUPERPAGE : 0);
     }
     return 0;
 }
@@ -553,7 +572,7 @@ int iommu_enable(void) {
     /* THE IDENTITY DOMAIN.  Every frame the PMM knows about, mapped to itself,
      * because that is exactly what the devices had a moment ago. */
     uint64_t ram = (uint64_t)pmm_nr_frames * 4096ull;
-    if (domain_map(g_default_pml4, 0, ram) != 0) {
+    if (domain_map(g_default_pml4, 0, ram, 1) != 0) {
         kprintf("iommu: out of memory building the identity domain\n");
         return -1;
     }
@@ -635,7 +654,10 @@ int iommu_restrict(uint16_t bdf, uint64_t base, uint64_t len) {
     }
     uint64_t top_phys; uint64_t* top; int dom, is_new;
     if (domain_for(bdf, &top, &top_phys, &dom, &is_new) != 0) return -1;
-    if (len && domain_map(top, base, len) != 0) return -1;
+    /* 4 KiB leaves for a driver's domain: precision is the point, the page
+     * count is small, and a superpage here would silently grant the 2 MiB
+     * around every buffer. */
+    if (len && domain_map(top, base, len, 0) != 0) return -1;
 
     if (context_set(bdf, top_phys, dom) != 0) return -1;
     invalidate_all();
@@ -817,5 +839,33 @@ void iommu_cmd(const char* args) {
 
     kprintf("iommu: (no args) | on | block <b>:<s>.<f> | "
             "limit <b>:<s>.<f> <base> <len> | faults\n");
+}
+
+/* ----------------------------------------------------------------------
+ * §M33 — the per-driver domain, reached from drv_dma_request.
+ * ---------------------------------------------------------------------- */
+int iommu_confine(uint16_t bdf, uint64_t base, uint64_t len) {
+#if !defined(__i386__) && !defined(__x86_64__)
+    (void)bdf; (void)base; (void)len; return 0;
+#else
+    /* Silent when there is nothing to confine with.  A DMA driver on a machine
+     * with no IOMMU is not doing anything wrong, and failing its allocation
+     * would make every such driver depend on a chipset feature.  The claim is
+     * what must stay honest, not the allocation — `iommu` reports the device as
+     * unconfined, and the isolation verdict reads that. */
+    if (g_info.state != IOMMU_ACTIVE) return 0;
+    return iommu_restrict(bdf, base, len);
+#endif
+}
+
+int iommu_is_confined(uint16_t bdf) {
+#if !defined(__i386__) && !defined(__x86_64__)
+    (void)bdf; return 0;
+#else
+    if (g_info.state != IOMMU_ACTIVE) return 0;
+    for (int i = 0; i < IOMMU_MAX_DOMAINS; i++)
+        if (g_dom[i].used && g_dom[i].bdf == bdf) return 1;
+    return 0;
+#endif
 }
 

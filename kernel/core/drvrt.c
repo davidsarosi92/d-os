@@ -23,6 +23,7 @@
 #include "waitq.h"
 #include "timer.h"
 #include "ktimer.h"
+#include "iommu.h"    /* §M33 — a driver's buffers become its domain */
 #include "task.h"
 #include <stddef.h>
 
@@ -428,17 +429,63 @@ uint32_t drv_irq_count(drv_handle h) {
 
 /* ---- DMA ------------------------------------------------------------------ */
 
-drv_handle drv_dma_request(struct drv_rt* rt, size_t bytes, const char* why) {
+void drv_bind_device(struct drv_rt* rt, uint16_t bdf) {
+    if (rt) rt->bdf = bdf;
+}
+
+drv_handle drv_dma_request(struct drv_rt* rt, size_t bytes, int addr_bits,
+                           const char* why) {
     if (!bytes) return DRV_ERANGE;
+    if (addr_bits <= 0 || addr_bits > 64) addr_bits = 32;
     drv_handle h = res_alloc(rt, RES_DMA, why);
     if (h < 0) return h;
     struct drv_res* r = res_of(h);
     size_t frames = (bytes + 4095) / 4096;
-    uint64_t phys = pmm_alloc_contiguous_dma32((uint32_t)frames);
+
+    /* A NARROWER DEVICE GETS THE LOW ZONE, and then the result is CHECKED.
+     * ZONE_DMA (below 16 MiB) satisfies anything from 24 bits upward, which
+     * covers every narrow device this kernel is likely to meet — but a zone is
+     * a coarse stand-in for an arbitrary bit width, so believing it would put
+     * us back where the edu device started: an address the hardware silently
+     * truncates. */
+    uint64_t phys;
+    uint64_t limit = (addr_bits >= 64) ? ~0ull : ((1ull << addr_bits) - 1);
+    if (addr_bits < 32) {
+        int order = 0;
+        while ((1u << order) < frames) order++;
+        phys = page_alloc_below(order, (pmm_phys_t)limit);
+        if (phys == PMM_ALLOC_FAIL) phys = 0;
+    } else {
+        phys = pmm_alloc_contiguous_dma32((uint32_t)frames);
+    }
     if (!phys) { r->used = 0; return DRV_ENORES; }
+
+    if (phys + (uint64_t)frames * 4096 - 1 > limit) {
+        kprintf("drv-rt: '%s' needs %d address bits and the allocator returned "
+                "%x — refusing rather than letting the device truncate it\n",
+                rt ? rt->owner : "?", addr_bits, (unsigned)phys);
+        r->used = 0;
+        return DRV_ENORES;
+    }
     r->base = phys;
     r->len  = frames * 4096;
     r->va   = (uintptr_t)phys;      /* identity/direct on every target here */
+
+    /* §M33 — CONFINE THE DEVICE TO WHAT ITS DRIVER ACTUALLY ASKED FOR.
+     *
+     * This is the line the whole milestone was waiting for, and it is one call
+     * because everything under it was built first.  Each buffer a driver
+     * allocates is ADDED to a domain belonging to that driver, and the device
+     * is moved into it — so from here the device can reach its own buffers and
+     * nothing else, enforced by hardware rather than by our care.
+     *
+     * A driver that never called drv_bind_device is skipped, and skipped
+     * LOUDLY: it stays in the identity domain, which is the old behaviour, and
+     * `iommu` reports it that way.  Quietly leaving it unconfined while the
+     * report said translation was on is the failure this milestone exists to
+     * refuse. */
+    if (rt && rt->bdf != 0xFFFF)
+        iommu_confine(rt->bdf, phys, (uint64_t)r->len);
     /* THE DEVICE ADDRESS IS RECORDED SEPARATELY even though it is the same
      * number today.  Under an IOMMU (§M33 stage 5) it will not be, and a
      * driver that used the CPU pointer because "they are equal" would be the

@@ -549,6 +549,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/uaccess.c \
       kernel/hal/aarch64/fpu.c \
       kernel/hal/aarch64/pci.c \
+      kernel/drivers/misc/edu.c \
       kernel/hal/aarch64/virtio_mmio_blk.c \
     kernel/hal/aarch64/virtio_mmio_net.c \
       kernel/hal/aarch64/virtio_gpu.c \
@@ -705,6 +706,7 @@ CORE_C_SRCS := \
     kernel/core/basic.c \
     kernel/drivers/rtc/cmos_rtc.c \
     kernel/drivers/mouse/ps2_mouse.c \
+    kernel/drivers/misc/edu.c \
     kernel/core/keymap.c \
     kernel/core/layouts.c \
     kernel/core/percpu.c \
@@ -932,6 +934,7 @@ CORE_C_SRCS := \
     kernel/core/basic.c \
     kernel/drivers/rtc/cmos_rtc.c \
     kernel/drivers/mouse/ps2_mouse.c \
+    kernel/drivers/misc/edu.c \
     kernel/core/keymap.c \
     kernel/core/layouts.c \
     kernel/core/percpu.c \

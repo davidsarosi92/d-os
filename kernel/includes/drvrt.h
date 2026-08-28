@@ -95,6 +95,9 @@ struct drv_rt {
     const char*    owner;                 /* driver name, for conflict reports */
     struct drv_res* res[DRV_MAX_RES];
     int             nres;
+    /* Which PCI device this driver speaks for, (bus<<8)|(slot<<3)|func, or
+     * 0xFFFF for "not a PCI driver / not declared".  See drv_bind_device. */
+    uint16_t        bdf;
     /* The task drv_run spawned, so drv_release_all can stop it.  A driver's
      * resources and the loop that uses them have ONE lifetime, and keeping
      * them separate meant a stopped driver left a task spinning on handles
@@ -186,6 +189,21 @@ int drv_irq_wait(drv_handle h, int timeout_ms);
 uint32_t drv_irq_count(drv_handle h);
 
 /* ----------------------------------------------------------------------
+ * WHICH DEVICE THIS DRIVER SPEAKS FOR.
+ *
+ * Bookkeeping until there is an IOMMU, and then the load-bearing piece: the
+ * kernel can build a domain holding exactly this driver's DMA buffers, and it
+ * cannot put the DEVICE into that domain without being told which device the
+ * driver is for.  A DMA driver that never calls this is one the kernel can only
+ * leave in the identity domain — reachable by every byte of RAM — and it will
+ * be REPORTED that way rather than assumed to be fine.
+ *
+ * Called before the first drv_dma_request; calling it later still works, and
+ * confines the device from that point on.
+ * ---------------------------------------------------------------------- */
+void drv_bind_device(struct drv_rt* rt, uint16_t bdf);
+
+/* ----------------------------------------------------------------------
  * DMA.  Two addresses, always, because they are two different numbers and
  * conflating them is the classic driver bug: the CPU pointer to touch it with,
  * and the address to PROGRAM INTO THE DEVICE.  They are equal today on every
@@ -193,7 +211,24 @@ uint32_t drv_irq_count(drv_handle h);
  * stage 5 introduces — so the interface separates them now, while the
  * separation is free.
  * ---------------------------------------------------------------------- */
-drv_handle drv_dma_request(struct drv_rt* rt, size_t bytes, const char* why);
+/* `addr_bits` — HOW MANY ADDRESS BITS THE DEVICE ACTUALLY HAS.  32 for most
+ * things, and this argument exists because the FIRST driver written against
+ * this API needed something else.
+ *
+ * The educational device addresses 28 bits.  Without the parameter it was
+ * handed a DMA32 buffer at ~1023 MiB, the device silently CLAMPED the address
+ * to 28 bits and read some other page — the transfer "completed", the status
+ * register cleared, and 255 of 256 bytes came back wrong with nothing anywhere
+ * saying why.  *A device quietly truncating an address it cannot hold is the
+ * classic DMA bug, and an API that cannot express the constraint guarantees
+ * every driver rediscovers it.*
+ *
+ * The allocation is checked against the limit afterwards and REFUSED if it does
+ * not fit, because a zone is a coarse approximation of an arbitrary bit width
+ * and handing back an address the device cannot reach is exactly the failure
+ * being prevented. */
+drv_handle drv_dma_request(struct drv_rt* rt, size_t bytes, int addr_bits,
+                           const char* why);
 void*      drv_dma_cpu(drv_handle h);
 uint64_t   drv_dma_device(drv_handle h);
 
