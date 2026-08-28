@@ -43,6 +43,8 @@
 #include "klog.h"
 #include "hal_api.h"
 #include "mouse.h"
+#include "proc.h"
+#include "driver.h"
 #include <stddef.h>
 
 /* ----------------------------------------------------------------------
@@ -136,6 +138,49 @@ void drvuser_detach(int pid) {
     drv_release_all(&d->rt);
     if (d->bitmap) { kfree(d->bitmap); d->bitmap = NULL; }
     d->used = 0;
+}
+
+/* ----------------------------------------------------------------------
+ * Launching a driver into ring 3.
+ *
+ * The image is embedded like every other in-tree program (§M25's pattern), and
+ * the process is a REAL preemptible task rather than a synchronous excursion —
+ * a driver that ran as an excursion on its launcher would take the launcher
+ * down with it, which is the opposite of the point.
+ *
+ * ATTACH BEFORE SPAWN, and the order is load-bearing: the driver's very first
+ * instructions ask for its ports, and a process that is not yet attached holds
+ * no manifest and would be refused.  The pid is known before the task runs
+ * because proc_spawn returns it.
+ * ---------------------------------------------------------------------- */
+extern const unsigned char _binary_user_ps2mouse_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_ps2mouse_elf_end[]   __attribute__((weak));
+
+struct drv_image { const char* name; const unsigned char** start; const unsigned char** end; };
+
+static const unsigned char* ps2_s(void) { return _binary_user_ps2mouse_elf_start; }
+static const unsigned char* ps2_e(void) { return _binary_user_ps2mouse_elf_end; }
+
+int drvuser_launch(const struct driver* d) {
+    if (!d || !d->name) return -1;
+    const struct drv_manifest* mf = drvuser_manifest(d->name);
+    if (!mf) return -2;                     /* no manifest = not placeable */
+
+    const unsigned char* img = NULL; const unsigned char* end = NULL;
+    /* One row today.  A table keyed by name rather than a field on `struct
+     * driver`, for the manifest's own reason: what may be placed in ring 3, and
+     * which image is placed there, is the kernel's decision. */
+    { const char* a = d->name; const char* b = "ps2_mouse";
+      while (*a && *a == *b) { a++; b++; }
+      if (*a == *b) { img = ps2_s(); end = ps2_e(); } }
+    if (!img) return -3;                    /* not embedded in this build */
+
+    int pid = proc_spawn_argv(d->name, img, (size_t)(end - img), 0, NULL, 0);
+    if (pid < 0) return -4;
+    if (drvuser_attach(pid, d->name) != 0) { task_kill(pid); return -5; }
+    kprintf("drv: '%s' placed in ring 3 as pid %d\n", d->name, pid);
+    klog(KLOG_INFO, "drv", "'%s' running in DOMAIN_USER, pid %d", d->name, pid);
+    return 0;
 }
 
 /* ----------------------------------------------------------------------

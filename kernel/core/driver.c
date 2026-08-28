@@ -24,6 +24,7 @@
 #include "drvguard.h"    /* §M33 Tier 0 — guarded driver entry points */
 #include "domain.h"       /* §M33 — declared placement */
 #include "drvrt.h"        /* §M33 stage 2 — drv res */
+#include "drvuser.h"      /* §M33 Tier 1 — placing a driver in ring 3 */
 #include <stddef.h>
 
 /* ----------------------------------------------------------------------
@@ -99,7 +100,30 @@ static int drv_probe(struct driver* d) {
     return (r == DRVGUARD_FAULTED) ? -1 : r;
 }
 
+/* §M33 Tier 1 — WHERE THE PLACEMENT ACTUALLY HAPPENS.
+ *
+ * This is the whole of "config chooses where a driver runs": the resolved
+ * domain is consulted once, and DOMAIN_USER means *do not call the driver's
+ * init at all* — spawn its ring-3 image instead and let it bring the device up
+ * from there.  Everything above and below this function is unchanged, which is
+ * what makes the placement a deployment decision rather than a code one.
+ *
+ * The ring-3 launch REPLACES init rather than wrapping it, and that has to be
+ * true: calling init here would bring the device up in the kernel and then
+ * start a second driver for the same hardware in ring 3, which is two drivers
+ * fighting over one 8042. */
 static int drv_init(struct driver* d) {
+    if (driver_domain(d) == DOMAIN_USER) {
+        int rc = drvuser_launch(d);
+        if (rc == 0) return 0;
+        /* A failed ring-3 launch does NOT silently fall back to the kernel.
+         * The user asked for a placement; running the driver somewhere else and
+         * saying nothing would be the isolation theatre this milestone refuses,
+         * just in the other direction. */
+        kprintf("drv: '%s' could not be placed in ring 3 (%d) — not started\n",
+                d->name, rc);
+        return -1;
+    }
     if (!d->ops || !d->ops->init) return 0;
     return drvguard_call(d, "init", d->ops->init, d->ctx);
 }

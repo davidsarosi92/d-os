@@ -3168,10 +3168,15 @@ are not guarded (no caller to unwind to).
     publication are syscalls.  Falsified by `drvtest`: a granted port reads from
     ring 3, an ungranted request is refused, and a raw `in` on an ungranted port
     is a #GP that kills only that process.
-  * **Tier 1, rest** — PLACING a driver there: the spawn path (`domain = user`
-    launches the ring-3 image instead of calling init), MMIO mapped into the
-    driver's own space, and CLIENT RECONNECTION.  Until these exist
-    `domain_enforceable()` still refuses `user`, and it names what is missing.
+  * **Tier 1 — COMPLETE 2026-08-28 on x86.**  `driver.<name>.domain = user`
+    launches the ring-3 image instead of calling init; `ps2_mouse` runs there
+    from the same source and the pointer still moves.  `domain_enforceable()`
+    says yes on x86 and refuses on aarch64 with the reason (no port space, no
+    MMIO-into-driver mapping).
+  * **Still missing from Tier 1:** MMIO mapped into a driver's own space (no
+    placeable driver needs it yet; `drv_mmio_request` refuses from ring 3
+    rather than faking it), and CLIENT RECONNECTION — kill the ring-3 driver
+    and the pointer stops, because nothing restarts it or replays its state.
   * **Stage 5 — an IOMMU driver.**  Until it exists a DMA driver outside the
     kernel is placement, not isolation, and the code marks it `ADVISORY(!)`.
   * **Tier 2** — DMA drivers in ring 3 with clean teardown and CLIENT

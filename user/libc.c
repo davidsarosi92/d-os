@@ -267,3 +267,10 @@ int printf(const char* fmt, ...) {
 long dos_syscall3(long n, long a, long b, long c) {
     return syscall3(n, a, b, c);
 }
+
+/* §M33 Tier 1 — four arguments, for the driver syscalls whose payload is four
+ * integers (a mouse event is dx, dy, buttons, wheel).  syscall5 already exists;
+ * this is it with the fifth left zero, rather than a fourth trap path. */
+long dos_syscall4(long n, long a, long b, long c, long d) {
+    return syscall5(n, a, b, c, d, 0);
+}

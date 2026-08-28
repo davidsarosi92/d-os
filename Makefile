@@ -54,7 +54,7 @@ X86_USER_BLOBS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
                   user/posixtest_blob.o \
                   user/wlclient_blob.o user/wlapp_blob.o \
                   user/redirtest_blob.o user/uidemo_blob.o \
-                  user/drvtest_blob.o
+                  user/drvtest_blob.o user/ps2mouse_blob.o
 # NB: linuxhello is deliberately NOT here — it hard-codes the i386 Linux syscall
 # numbers and `int 0x80`, which is the whole point of that program (it mimics an
 # unmodified 32-bit Linux binary).  The x86_64 equivalent would be a separate
@@ -1447,6 +1447,25 @@ user/uidemo_$(ARCH).elf: user/libc.c user/uidemo.c user/libc.h $(USER_CRT0_SRC)
 	$(CC) $(USER_CFLAGS) -c user/uidemo.c  -o $(OBJ_DIR)/user/uidemo.o
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/uidemo.o $(OBJ_DIR)/user/libc.o
+
+
+# §M33 Tier 1 — the SAME driver source, built as a ring-3 program.
+#
+# Note the include path: it reaches into kernel/includes for drvrt.h, which is
+# the point — one header, two backends.  -DDRV_USERSPACE picks the entry point
+# and the ring-3 helper declarations; everything else in ps2_mouse.c compiles
+# byte-for-byte the same as the kernel build.
+user/ps2mouse_$(ARCH).elf: user/libc.c user/drvrt_user.c kernel/drivers/mouse/ps2_mouse.c user/libc.h $(USER_CRT0_SRC)
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -Ikernel/includes -c user/drvrt_user.c \
+	    -o $(OBJ_DIR)/user/drvrt_user.o
+	$(CC) $(USER_CFLAGS) -Ikernel/includes -DDRV_USERSPACE \
+	    -c kernel/drivers/mouse/ps2_mouse.c -o $(OBJ_DIR)/user/ps2mouse.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/ps2mouse.o \
+	    $(OBJ_DIR)/user/drvrt_user.o $(OBJ_DIR)/user/libc.o
 
 
 user/drvtest_$(ARCH).elf: user/libc.c user/drvtest.c user/libc.h $(USER_CRT0_SRC)

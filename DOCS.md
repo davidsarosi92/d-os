@@ -10160,9 +10160,70 @@ mechanism working in a test is not a placement being honoured, and reporting the
 first as the second is the isolation theatre this milestone refuses by name.*
 The refusal message names exactly what is missing.
 
+**§M33 Tier 1 COMPLETE (2026-08-28) — the same driver source, running in ring 3.**
+
+`driver.ps2_mouse.domain = user` + a restart, and the PS/2 mouse driver is a
+ring-3 process: its ports enforced by the CPU, its interrupt a syscall it blocks
+in, its events reaching the input stack through one publish call — and the
+pointer moves exactly as before.  That is §M33's definition of done for this
+tier: *the same driver source, unchanged, runs in both domains.*
+
+**One file, two builds.**  `ps2_mouse.c` compiles with `-DDRV_USERSPACE` into a
+ring-3 program linked against `user/drvrt_user.c`, or without it into a kernel
+driver linked against `kernel/core/drvrt.c`.  The difference is the includes and
+the registration at the bottom — an `#ifdef` around the entry point, the same
+shape §M67 used for a module.  The packet assembler, the sync recovery, the
+IntelliMouse knock and the bring-up sequence are byte-for-byte identical, which
+is what answers the question a new abstraction cannot answer about itself.
+
+**PORT I/O IS NOT A SYSCALL, and that is what makes the placement affordable.**
+`drv_ports_request` traps once; after it, `drv_in8`/`drv_out8` execute the
+`in`/`out` instruction directly in ring 3, at the speed the kernel driver ran
+at, because the grant lives in the CPU's permission bitmap rather than in a
+per-access check.  A design where every port access trapped would make the
+placement a performance decision as well as a safety one, and the answer would
+always have been "leave it in the kernel".  The interrupt is the opposite and
+unavoidably so — blocking is the kernel's to do, so there is one syscall per
+interrupt, which is the price §M33's plan quoted.
+
+**The launch REPLACES init rather than wrapping it.**  `drv_init` consults the
+resolved domain once: `DOMAIN_USER` spawns the ring-3 image and does not call
+the driver's own init at all.  Calling it would bring the device up in the
+kernel and then start a second driver for the same 8042 — two drivers fighting
+over one controller.  And a failed launch does NOT quietly fall back to the
+kernel: the user asked for a placement, and running the driver somewhere else
+without saying so is the isolation theatre this milestone refuses, in the other
+direction.
+
+**`domain_enforceable()` says yes now, on x86 only, and the arch split is the
+argument rather than an omission.**  aarch64 has no port space and no mapping of
+MMIO into a driver's own address space yet, so "placed in ring 3" there would be
+a location rather than a boundary — and it refuses with that sentence.
+
+Measured on both x86 arches: `drv: 'ps2_mouse' placed in ring 3 as pid 25`,
+`granted ports 60..64`, `granted IRQ 12`, `/proc/drivers` reporting
+`at user, can be kernel|user, isolation full`, and a driven 31-step pointer walk
+landing the cursor at (1621,1172) for a target of ~(1620,1170) — the same
+numbers the in-kernel driver produced.
+
+**What Tier 1 still does not have:** MMIO mapped into a driver's own space (no
+placeable driver needs it yet, and `drv_mmio_request` REFUSES from ring 3 rather
+than faking it), and CLIENT RECONNECTION — kill the ring-3 driver and the
+pointer stops, because nothing restarts it or replays its state.  That is Tier
+2's genuinely pervasive part and it is not started.
+
 ---
 
 ## 8. Change log
+
+- **2026-08-28 — §M33 Tier 1 complete: a driver running in ring 3 (DOCS
+  §4.82).**  `driver.ps2_mouse.domain = user` places the PS/2 mouse driver in
+  its own address space, from the SAME source file, and the pointer still
+  moves.  Port I/O stays a direct instruction — the grant is in the CPU's
+  bitmap, not in a per-access check — so the placement costs one syscall per
+  interrupt rather than per register access.  `domain_enforceable` says yes on
+  x86 and refuses on aarch64 with the reason.  Client reconnection is not
+  built: kill the driver and the pointer stops.
 
 - **2026-08-27 — §M33 Tier 1, first half: ring-3 port grants (DOCS §4.82).**
   A TSS I/O permission bitmap per task, driver resource syscalls, and a

@@ -58,12 +58,28 @@
  * have to move.
  * ============================================================================= */
 
+/* §M33 Tier 1 — THIS FILE COMPILES FOR BOTH SIDES OF THE BOUNDARY.
+ *
+ * With -DDRV_USERSPACE it is a ring-3 program linked against user/drvrt_user.c;
+ * otherwise it is a kernel driver linked against kernel/core/drvrt.c.  The
+ * difference is these includes and the registration at the bottom — everything
+ * between is identical, which is the claim §M33 set out to make and the only
+ * way to find out whether drvrt.h was a real abstraction or AC97 with extra
+ * steps (the question §M23 asked of `struct audio_dev`, one layer down). */
+#ifdef DRV_USERSPACE
+#include "libc.h"
+#include "drvrt.h"
+void mouse_publish(int dx, int dy, unsigned buttons, int dz);
+int  task_should_stop(void);
+void kprintf(const char* fmt, ...);
+#else
 #include "mouse.h"
 #include "hal_api.h"
 #include "drvrt.h"
 #include "driver.h"
 #include "task.h"
 #include "printf.h"
+#endif
 #include <stdint.h>
 #include <stddef.h>
 
@@ -113,9 +129,11 @@ static int aux_send(uint8_t b) {
 /* Listener + packet assembly.                                                */
 /* -------------------------------------------------------------------------- */
 
+#ifndef DRV_USERSPACE
 static mouse_listener_t listener = NULL;
 
 void mouse_set_listener(mouse_listener_t fn) { listener = fn; }
+#endif
 
 /* §M62/§M61 follow-up — WHEEL SUPPORT.
  *
@@ -134,10 +152,13 @@ void mouse_set_listener(mouse_listener_t fn) { listener = fn; }
 static int     pkt_len = 3;            /* 4 once the wheel is enabled */
 static uint8_t pkt[4];
 static int     pkt_idx = 0;
+#ifndef DRV_USERSPACE
 static mouse_wheel_t wheel_listener = NULL;
 
 void mouse_set_wheel_listener(mouse_wheel_t fn) { wheel_listener = fn; }
+#endif
 
+#ifndef DRV_USERSPACE
 /* §M33 Tier 1 — the one place an event reaches the listeners, whoever decoded
  * it.  The in-kernel packet assembler calls it, and so does the syscall a
  * ring-3 driver publishes through: the input stack cannot tell which, which is
@@ -146,6 +167,7 @@ void mouse_publish(int dx, int dy, unsigned buttons, int dz) {
     if (listener) listener(dx, dy, buttons);
     if (dz && wheel_listener) wheel_listener(dz);
 }
+#endif
 
 /* Drain everything the controller has for us — one interrupt can cover more
  * than one buffered byte under load.  Runs on the mouse TASK now, not in
@@ -296,6 +318,17 @@ fail:
     return -1;
 }
 
+#ifdef DRV_USERSPACE
+/* In ring 3 the driver IS the program: bring the device up, then run the body.
+ * `mouse_module_init` and `mouse_task` are the same functions the kernel build
+ * calls — the entry point is the only thing that differs. */
+int main(void) {
+    if (mouse_module_init() != 0) return 1;
+    mouse_task();
+    return 0;
+}
+#else
+
 static int mouse_probe(void* ctx) {
     (void)ctx;
     /* No cheap way to ask an 8042 "is a mouse there" without touching it, and
@@ -329,4 +362,11 @@ static const struct driver_ops mouse_ops = {
  * in the registry that has one.  No DMA, and not boot-critical — the machine
  * boots and runs without a pointer, which is exactly why this was the right
  * first driver to port. */
-DRIVER_EX(ps2_mouse, "input", &mouse_ops, NULL, DOMAIN_KERNEL, 0);
+/* DOMAIN_KERNEL | DOMAIN_USER — the first driver in this tree to declare that
+ * it can run in ring 3, and it may say so because it has been PORTED to the
+ * driver-runtime API and compiles for both sides.  A driver that still calls
+ * `outb` directly must not claim this, which is why the default stays
+ * kernel-only and why the claim is in the source rather than in config. */
+DRIVER_EX(ps2_mouse, "input", &mouse_ops, NULL,
+          DOMAIN_KERNEL | DOMAIN_USER, 0);
+#endif /* DRV_USERSPACE */

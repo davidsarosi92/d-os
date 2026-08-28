@@ -20,6 +20,14 @@ struct drv_manifest;
 int  drvuser_placeable(const char* name);
 const struct drv_manifest* drvuser_manifest(const char* name);
 
+struct driver;
+
+/* Spawn this driver's ring-3 image and attach it to its manifest.  Called from
+ * `drv_init` INSTEAD OF the driver's own init when the resolved domain is
+ * DOMAIN_USER — the placement is not a wrapper around the kernel path, it
+ * replaces it. */
+int  drvuser_launch(const struct driver* d);
+
 /* Mark `pid` as the ring-3 process for `driver_name`, so its resource syscalls
  * are honoured (within the manifest) instead of refused. */
 int  drvuser_attach(int pid, const char* driver_name);

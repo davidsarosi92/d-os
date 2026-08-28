@@ -82,10 +82,26 @@ int domain_enforceable(uint32_t domain, const char** why) {
          * is exactly the isolation theatre §M33 refuses by name.  Accepting
          * `user` and running the driver in ring 0 anyway would leave the user
          * believing in a boundary that is not there. */
-        if (why) *why = "the port/IRQ half of §M33 Tier 1 works (see `drvtest`) "
-                        "but nothing is PLACED there yet: the spawn path, MMIO "
-                        "mapping and client reconnection are unwritten";
+#if defined(__i386__) || defined(__x86_64__)
+        /* REAL NOW, on the arches that have an I/O permission mechanism.
+         *
+         * What makes it real rather than a claim: the driver's ports come from
+         * a kernel-side manifest and are enforced by the CPU (an ungranted `in`
+         * is a #GP), its interrupt is a syscall it blocks in, its events reach
+         * the input stack through one publish call, and `drv_init` LAUNCHES the
+         * ring-3 image INSTEAD OF calling init — so nothing brings the device
+         * up in the kernel as well. */
+        return 0;
+#else
+        /* Still refused where there is nothing to enforce a hardware grant
+         * with.  "Placed in ring 3" with unconstrained device access is a
+         * location, not a boundary — and aarch64 has no port space, while
+         * mapping MMIO into a driver's own address space is unwritten. */
+        if (why) *why = "this arch has no mechanism to enforce a hardware grant "
+                        "(no port space; MMIO mapping into a driver's own space "
+                        "is unwritten)";
         return -1;
+#endif
 
     case DOMAIN_ISOLATED:
         /* Strictly more than USER, so it fails for USER's reason first and for
