@@ -10447,12 +10447,78 @@ hardware limit, not unfinished work"* on one and *"this machine HAS an IOMMU and
 we do not program it yet (§M33 stage 5) — unfinished work, not a hardware limit"*
 on the other.  aarch64 answers NONE with its own reason.
 
-**What §M33 still does not have:** the second half of stage 5 — root/context
-tables, second-level page tables and enabling translation, which is what would let
-`ADVISORY(!)` ever become anything else; MMIO into a driver's own address space
-(no placeable driver needs it yet, and building a mechanism with no client is what
-§M59 declined to do for Wayland's `wl_data_device`); Tier 2's DMA half, which
-stage 5 gates; and state replay richer than "the driver runs its own bring-up
+**§M33 stage 5, second half (2026-08-28) — TRANSLATION IS ON, AND A DEVICE THAT
+CROSSES ITS BOUNDARY IS STOPPED BY THE HARDWARE.**
+
+`iommu on` builds a root table, a context table per bus, second-level page tables,
+points every PCI device at a domain and turns translation on.  **The first domain
+identity-maps all of RAM, and that is not a placeholder — it is the only safe
+first step.**  Enabling translation with tables that do not cover what the devices
+are already doing does not fail politely: the disk stops answering, the NIC stops
+answering, and the machine dies without saying why, because *every path we would
+use to find out is itself a device*.  So the first thing translation does must be
+to change nothing observable — which also makes the enable step falsifiable on its
+own terms.  **Measured on both x86 arches: with translation ON, `ping` still gets
+3/3 replies and `/mnt` still lists.**
+
+**2 MiB leaves, and CAP.SLLPS is CHECKED rather than assumed.**  4 KiB leaves
+would cost megabytes of tables at boot on a path that must not fail.  A unit
+without superpage support would read our leaf entry as a pointer to another table
+and walk into the middle of RAM — *not a refused DMA but a device writing wherever
+the bits happened to point*, which is the exact failure this milestone exists to
+prevent.
+
+**THE FALSIFICATION: `iommu block <b>:<s>.<f>`** gives one device a domain that
+maps nothing.  A mechanism that translates correctly and never refuses anything is
+indistinguishable from passthrough, so the only way to know the boundary is there
+is to cross it and be stopped.  Blocking the AC97 codec and then playing gives —
+read out of **the unit's own fault-recording registers, not a counter we keep** —
+`record 0: device 0:3.0 tried to read 3a9f000 — REFUSED (reason 6)` on x86_64 and
+the same at `3ff81000` on i386, with the records empty beforehand.  *A count our
+software increments would prove our software believes a DMA was refused; the
+hardware's own record is the only witness to the claim being made.*
+
+**THE FINDING THAT MATTERS MOST: VIRTIO DEVICES BYPASS THE IOMMU ENTIRELY.**  A
+virtio device routes DMA through the unit only once the guest negotiates
+`VIRTIO_F_ACCESS_PLATFORM`, which this kernel's virtio drivers do not.  **Measured
+as a clean A/B:** the same block applied to the virtio NIC left it pinging 3/3
+with **zero** fault records, while the AC97 produced a recorded refusal — the
+register writes succeeded in both cases.  So a report that said "translation is
+on" and stopped would let somebody believe every device was behind a boundary
+while **the disk and the network, the two that matter most, were not behind it at
+all**.  That is the isolation theatre §M33 refuses, arrived at through hardware
+rather than through a lie in our code — which makes it harder to see and no less
+false.  `iommu` therefore lists every device as *translated* or *BYPASSES*
+(measured: **6 translated, 2 bypassing**, both virtio), and `iommu block` on a
+bypassing device says **"This restriction will have NO EFFECT"** at the point of
+the false action rather than only in a report somebody might not read.
+
+**TWO BUGS ON THE WAY, ONE OF THEM THE MOST MISLEADING KIND.**  The first version
+invalidated only the **context cache** and not the **IOTLB**, and the result was
+that `iommu block` reported success, the unit accepted every register write, and
+the device *carried on working* — three pings, 3/3 replies, from a NIC that had
+just been told it could reach nothing.  **A boundary that reports itself in place
+and is not there** was one missing register away, and the IOTLB registers are not
+at a fixed offset (ECAP.IRO gives it) so a hard-coded one would have worked here
+and read something else on a real chipset.  The second: `%02x` printed literally —
+*this printf has no width specifiers*, which §M66 wrote down the same way after it
+turned a bring-up dump into garbage exactly when it was needed.
+
+**AND THE ISOLATION VERDICT STILL DOES NOT MOVE.**  With translation on, every
+device shares one identity domain that maps all of RAM, so no driver is confined
+by it; per-driver domains are what `drv_dma_request` would have to build, and they
+are not built.  `domain_isolation_reason` now says exactly that instead of
+"translation is on", because the short version reads as though it were sufficient
+— the same theatre in a new costume, and more convincing because the hardware
+really is doing something.
+
+**What §M33 still does not have:** per-driver DMA domains (what would finally move
+`ADVISORY(!)`), which want `drv_dma_request` to allocate into a domain of its own;
+`VIRTIO_F_ACCESS_PLATFORM` in the virtio drivers, without which the two most
+important devices on the machine cannot be put behind the boundary at all; MMIO
+into a driver's own address space (no placeable driver needs it yet, and building
+a mechanism with no client is what §M59 declined to do for Wayland's
+`wl_data_device`); and state replay richer than "the driver runs its own bring-up
 again", which is enough for a mouse and will not be for a device holding a
 session.
 
@@ -10460,6 +10526,27 @@ session.
 
 ## 8. Change log
 
+- **2026-08-28 — §M33 stage 5 (second half): translation ON, and a device that
+  crosses its boundary is stopped by the hardware (DOCS §4.82).**  Root/context
+  tables, second-level page tables with 2 MiB leaves (CAP.SLLPS checked, not
+  assumed — a unit without them would walk our leaf into the middle of RAM), an
+  identity domain over all RAM, translation enabled.  **The identity domain is
+  the only safe first step**: tables that do not cover what devices are already
+  doing kill the machine with no way to say why, because every diagnostic path is
+  itself a device.  Measured: ping 3/3 and `/mnt` readable with translation on,
+  both x86 arches.  **Falsified by `iommu block`**, which gives one device a
+  domain mapping nothing: the AC97 then produces `record 0: device 0:3.0 tried to
+  read 3a9f000 — REFUSED (reason 6)`, read out of the unit's own fault registers
+  rather than a counter we keep.  **THE FINDING: virtio devices bypass the IOMMU
+  entirely** (no `VIRTIO_F_ACCESS_PLATFORM`) — the same block left the NIC
+  pinging 3/3 with zero faults, so *the disk and the network are not behind this
+  boundary at all*; `iommu` now lists translated vs BYPASSES (6 vs 2) and `iommu
+  block` says "NO EFFECT" at the point of the false action.  **The most
+  misleading bug yet:** invalidating the context cache but not the IOTLB made
+  `block` report success while the device carried on working — a boundary that
+  reports itself in place and is not there, one register away.  **The verdict
+  still does not move:** one shared identity domain confines nobody, and the
+  reason now says so instead of "translation is on".
 - **2026-08-28 — §M33 stage 5 (first half): what can this machine enforce
   against a DEVICE? (DOCS §4.82).**  `ADVISORY(!)` for a DMA driver has been the
   right answer since stage 1 and was an ASSUMPTION — nothing had ever looked for

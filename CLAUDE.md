@@ -142,13 +142,41 @@ report missing from one arch is worse than none — there, "nothing was reported
 reads as "nothing to report"*.  **MEASURED:** `none` vs `present, NOT programming
 it`, one unit at `fed90000`, 3- and 4-level page tables, 65536 domains,
 byte-identical on both x86 arches — and `drv domain` gives the **SAME VERDICT and
-DIFFERENT REASONS** on the two machines, which is the entire point.  **OPEN:**
-stage 5's SECOND half (root/context tables, second-level page tables, translation
-enabled — falsified by a DMA address outside the driver's buffers being BLOCKED);
-Tier 2's DMA half, which that gates; MMIO into a driver's own space (deliberately
-not built — no placeable driver needs it, and a mechanism with no client is what
-§M59 declined for `wl_data_device`); state replay richer than "run bring-up
-again".
+DIFFERENT REASONS** on the two machines, which is the entire point.  **STAGE 5's SECOND HALF SHIPPED TOO: TRANSLATION IS ON AND A DEVICE THAT CROSSES
+ITS BOUNDARY IS STOPPED BY THE HARDWARE.**  Root/context tables, second-level
+page tables with 2 MiB leaves (CAP.SLLPS **checked**, because a unit without them
+would read our leaf as a table pointer and walk into the middle of RAM — *not a
+refused DMA but a device writing wherever the bits point*), an identity domain
+over all RAM, translation enabled.  **THE IDENTITY DOMAIN IS THE ONLY SAFE FIRST
+STEP:** tables that do not cover what devices are already doing kill the box with
+no way to say why, *because every path we would use to find out is itself a
+device*.  Measured: ping 3/3 and `/mnt` readable with translation ON, both x86
+arches.  **FALSIFIED BY `iommu block`** — a domain mapping NOTHING, after which
+the AC97's next DMA gives `record 0: device 0:3.0 tried to read 3a9f000 — REFUSED
+(reason 6)`, read from **the unit's own fault registers, not a counter we keep**
+(*a count our software increments proves our software believes something; the
+hardware's record is the only witness to the claim*).  **THE FINDING THAT MATTERS
+MOST: VIRTIO DEVICES BYPASS THE IOMMU ENTIRELY** — no `VIRTIO_F_ACCESS_PLATFORM`,
+so the same block left the NIC pinging **3/3 with ZERO faults** while AC97 was
+refused; *the disk and the network, the two that matter most, are not behind this
+boundary at all*.  `iommu` lists every device translated vs BYPASSES (6 vs 2) and
+`iommu block` says **"NO EFFECT"** at the point of the false action.  **THE MOST
+MISLEADING BUG YET:** invalidating the context cache but NOT the IOTLB made
+`block` report success, the unit accept every write, and the device carry on
+working — *a boundary that reports itself in place and is not there*, one register
+away (and IOTLB's offset comes from ECAP.IRO, so a hard-coded one would work here
+and read something else on real hardware).  Also `%02x` printed literally again —
+**this printf has no width specifiers**.  **AND THE VERDICT STILL DOES NOT MOVE:**
+one shared identity domain confines nobody, so `domain_isolation_reason` says that
+in words rather than "translation is on" — *the short version reads as though it
+were sufficient, which is the same theatre in a new costume and more convincing
+because the hardware really is doing something*.  **OPEN:** per-driver DMA domains
+(what would finally move `ADVISORY(!)`, built by `drv_dma_request`);
+`VIRTIO_F_ACCESS_PLATFORM` in the virtio drivers, without which the two most
+important devices cannot be put behind the boundary at all; MMIO into a driver's
+own space (deliberately not built — no placeable driver needs it, and a mechanism
+with no client is what §M59 declined for `wl_data_device`); state replay richer
+than "run bring-up again".
 `driver.profile` is deliberately absent — with one reachable domain it would be
 a key with one legal value.  **NEXT: §M32 multi-user.**
 

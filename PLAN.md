@@ -3215,11 +3215,22 @@ are not guarded (no caller to unwind to).
     default (the ordinary machine has none, and that path must stay the tested
     one).  All three arches answer; ARM says NONE and names the SMMU as the
     analogue nothing looks for yet.
-  * **Stage 5, second half — the actual remapping.**  Root/context tables,
-    second-level page tables, a domain per placed driver, translation enabled —
-    and the falsification that matters is a DMA address OUTSIDE the driver's
-    buffers being BLOCKED and reported by the unit.  Until that exists a DMA
-    driver outside the kernel is placement, not isolation.
+  * **Stage 5, second half — shipped 2026-08-28: TRANSLATION IS ON.**  Root and
+    context tables, second-level page tables with 2 MiB leaves (CAP.SLLPS
+    checked, never assumed), an identity domain over all RAM, translation
+    enabled.  The identity domain first, because tables that do not cover what
+    devices already do kill the machine with no way to say why.  Falsified by
+    `iommu block`: the AC97 given a domain mapping nothing produced a refusal the
+    UNIT recorded by device and address.  **THE FINDING: virtio devices bypass
+    the IOMMU** (no `VIRTIO_F_ACCESS_PLATFORM`), so the disk and the network are
+    not behind the boundary at all — `iommu` lists which devices are and are not.
+    The most misleading bug: invalidating the context cache but not the IOTLB
+    made `block` report success while the device kept working.
+  * **Still not isolation, and the reason now says so.**  Every device shares one
+    identity domain, so nothing is confined.  What would move `ADVISORY(!)`:
+    per-driver DMA domains built by `drv_dma_request`, plus
+    `VIRTIO_F_ACCESS_PLATFORM` in the virtio drivers — without the latter the two
+    devices that matter most cannot be put behind the boundary at all.
   * **Tier 2, second half** — DMA drivers in ring 3, which needs stage 5.
   * `driver.profile` (desktop|server) is deliberately absent: with one
     reachable domain it would be a key with one legal value.

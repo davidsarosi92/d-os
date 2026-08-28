@@ -152,7 +152,19 @@ const char* domain_isolation_reason(int does_dma) {
     if (!does_dma) return NULL;
     switch (iommu_get()->state) {
     case IOMMU_ACTIVE:
-        return "translation is on";
+        /* TRANSLATION BEING ON IS NOT ISOLATION FOR THIS DRIVER, and saying
+         * only "translation is on" would read as though it were — the exact
+         * theatre this milestone keeps refusing, now available in a new form
+         * because the hardware really is doing something.
+         *
+         * Every device sits in ONE identity domain that maps all of RAM, so a
+         * device can still reach every byte; what stage 5's second half proved
+         * is that the machinery WORKS, not that any driver is confined by it.
+         * Per-driver domains are what `drv_dma_request` would have to build,
+         * and they are not built. */
+        return "translation is ON but every device shares one identity domain "
+               "— the machinery works, no driver is confined by it yet, and "
+               "virtio devices bypass it entirely (`iommu` lists which)";
     case IOMMU_PRESENT:
         return "this machine HAS an IOMMU and we do not program it yet "
                "(§M33 stage 5) — unfinished work, not a hardware limit";

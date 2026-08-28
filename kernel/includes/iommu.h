@@ -78,7 +78,44 @@ const struct iommu_info* iommu_get(void);
  * fact. */
 const char* iommu_state_name(enum iommu_state s);
 
-/* Backs the `iommu` command. */
+/* Backs the `iommu` command.  `iommu_cmd` handles the verbs; both shells call
+ * it, so all three arches get one implementation (§M24's rule). */
 void iommu_report(void);
+void iommu_cmd(const char* args);
+
+/* ----------------------------------------------------------------------
+ * §M33 stage 5, second half — ACTUALLY PROGRAM IT.
+ *
+ * `iommu_enable` builds a root table, a context table per populated bus, and a
+ * DEFAULT DOMAIN that identity-maps every frame of RAM, then points every PCI
+ * device at that domain and turns translation on.
+ *
+ * THE IDENTITY DOMAIN IS NOT A PLACEHOLDER, IT IS THE ONLY SAFE FIRST STEP.
+ * Enabling translation with a table that does not cover what the devices are
+ * already using does not fail politely: the disk stops answering, the NIC stops
+ * answering, and the machine dies with no way to say why — every diagnostic
+ * path we would use to find out is itself a device.  So the first thing
+ * translation does must be to change NOTHING observable, and the second thing
+ * is to take a single device's permission away on purpose.
+ *
+ * OFF BY DEFAULT (`iommu.enable`).  Turning it on changes what every device on
+ * the machine can reach, which is not a decision a boot should make for
+ * somebody who merely happens to have the hardware.
+ * ---------------------------------------------------------------------- */
+int iommu_enable(void);
+
+/* Give one device a domain that maps ONLY [base, base+len) — everything else
+ * it touches becomes a fault the unit records.  This is the falsification: a
+ * mechanism that translates correctly and never refuses anything is
+ * indistinguishable from passthrough, so the only way to know the boundary is
+ * there is to cross it on purpose and watch it stop you.
+ *
+ * `bdf` is (bus << 8) | (slot << 3) | func. */
+int iommu_restrict(uint16_t bdf, uint64_t base, uint64_t len);
+
+/* How many DMA faults the unit has recorded, and the last one's address.  Read
+ * from the fault-recording registers rather than counted by us: a fault that
+ * only our software knows about would prove nothing about the hardware. */
+uint32_t iommu_fault_count(void);
 
 #endif /* IOMMU_H */

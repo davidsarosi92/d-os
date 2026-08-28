@@ -659,7 +659,7 @@ void serial_shell_entry(void) {
          * iommu.c, called from both: §M24's rule, and the case it was written
          * for is exactly this one — a diagnostic that answers on two arches out
          * of three teaches the third's users that the question has no answer. */
-        else if (s_eq(cmd, "iommu"))   iommu_report();
+        else if (s_eq(cmd, "iommu"))   iommu_cmd(args);
         /* §M67 — the loader's own commands, same implementation as x86. */
         else if (s_eq(cmd, "lsmod"))   modload_list();
         else if (s_eq(cmd, "insmod"))  modload_cmd_insmod(args);

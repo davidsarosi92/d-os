@@ -4133,7 +4133,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
      * the machine and not of any driver: it is the same on a box with no
      * drivers placed at all, and that is exactly when somebody deciding whether
      * to place one wants to read it. */
-    if (streq(line, "iommu"))  { iommu_report();   return; }
+    if (starts_with(line, "iommu")) { iommu_cmd(line + 5); return; }
     if (streq(line, "lsconsole")) { console_list(); return; }
     if (streq(line, "uptime")) { cmd_uptime();      return; }
     if (streq(line, "dmesg"))         { cmd_dmesg("");         return; }
