@@ -106,6 +106,14 @@ void idt_load(void);
  * overwrite each other — there is no chaining today. */
 void irq_install(int irq, irq_handler_t handler);
 
+/* §M33 Tier 2 — mask or unmask a single line, on whichever interrupt controller
+ * is live.  Exists for SHARED-CONTROLLER ARBITRATION: the 8042 has one output
+ * buffer and two drivers, and a controller response is indistinguishable from a
+ * keystroke, so a transaction can only complete if the other driver's interrupt
+ * is held off.  Use it in matched pairs and for microseconds — a line masked and
+ * not restored is a device that has silently stopped working. */
+void irq_set_masked(int irq, int masked);
+
 /* Switch the IRQ delivery path from the 8259 PIC to the IOAPIC + LAPIC
  * pair (M18).  After this call:
  *   - new `irq_install` invocations program the IOAPIC redirection

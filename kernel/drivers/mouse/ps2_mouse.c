@@ -269,50 +269,73 @@ static int mouse_module_init(void) {
     /* 2. Config byte: set IRQ12-enable (bit 1), clear aux-clock-inhibit
      *    (bit 5).  Keep everything else — the keyboard depends on it.
      *
-     * READ-MODIFY-WRITE IS RETRIED, AND THE RETRY IS NOT A CURE.  Read this
-     * before believing the loop below fixes anything.
+     * THE 8042 IS A SHARED CONTROLLER, AND THIS IS THE PART THAT MAKES THE
+     * READ-MODIFY-WRITE SAFE.  Read it before simplifying anything here.
      *
-     * The 8042 has ONE output buffer and TWO drivers.  A controller RESPONSE —
-     * the config byte we just asked for — lands in that buffer with the AUX bit
-     * CLEAR, which is indistinguishable from a keystroke, so it raises IRQ1 and
-     * the keyboard driver's handler reads it.  Our `wait_can_read` then times
-     * out having been robbed by a driver behaving perfectly correctly.  It is
-     * not a race we lose occasionally; it is a race we lose whenever an
-     * interrupt beats us to a byte, and asking again produces another byte for
-     * the keyboard to take.
+     * There are TWO drivers on one controller with ONE output buffer.  The
+     * config byte we are about to ask for arrives in that buffer with the AUX
+     * bit CLEAR — indistinguishable from a keystroke — so it raises IRQ1 and
+     * the KEYBOARD driver's handler reads it.  Our read then times out, robbed
+     * by a driver doing its job correctly.  Not an occasional race: one we lose
+     * whenever an interrupt beats us to a byte, and asking again just produces
+     * another byte for the keyboard to take.
      *
-     * §M33 TIER 2 FOUND THIS BY PLACING THE DRIVER IN RING 3, and the placement
-     * made it VISIBLE rather than causing it: in the kernel this code runs at
-     * boot, before anything can type and with the handshake effectively alone
-     * on the controller.  In ring 3 it runs when the user asks for the
-     * placement — necessarily while they are at the keyboard — and it cannot
-     * mask IRQ1, because masking an interrupt line is not something a ring-3
-     * driver may do and should not become one.
+     * §M33 TIER 2 FOUND IT BY PLACING THIS DRIVER IN RING 3 — the placement
+     * made it VISIBLE rather than causing it.  In the kernel this code only
+     * ever ran at boot, alone on the controller before anything could type; in
+     * ring 3 it runs when the user asks for the placement, which is necessarily
+     * while they are at the keyboard.  The bug was always here; nothing had
+     * ever re-initialised the mouse on a live machine.
      *
-     * So the retry buys the common case (nobody typing) and nothing else;
-     * measured, it recovers on the first attempt on a quiet box and can fail
-     * every attempt under a harness that is typing.  THE REAL ANSWER IS
-     * ARBITRATION OF A SHARED CONTROLLER — one owner of the 8042 that both
-     * drivers go through — and it is recorded as open rather than implied by a
-     * loop that looks like a fix.  What makes the failure survivable meanwhile
-     * is §M33 Tier 2's supervisor, which restarts the driver until a quiet
-     * moment lets bring-up through: recovery, not correctness. */
+     * TWO HALVES, AND THEY ARE DIFFERENT KINDS OF THING:
+     *
+     *   * `drv_ports_lock` is the GENERIC half — hold off the other driver's
+     *     interrupt.  It is an operation the runtime performs because a ring-3
+     *     driver must not be able to mask an interrupt line itself; the kernel
+     *     also decides WHICH line, since a driver allowed to name it could name
+     *     the timer's.  Bounded, and taken back if we never release it.
+     *
+     *   * 0xAD / 0xAE is the DEVICE half, and masking alone is not enough
+     *     without it: a masked IRQ1 stops the keyboard driver being TOLD about
+     *     a byte, it does not stop the keyboard PRODUCING one — and a keystroke
+     *     sitting in the buffer is what our own read would then consume,
+     *     believing it to be the config byte.  Same race, and now we are the
+     *     thief.  Disabling the keyboard interface closes it at the source.
+     *
+     * Held for a transaction and nothing longer. */
     uint8_t cfg = 0;
-    int got_cfg = 0;
-    for (int attempt = 0; attempt < 8 && !got_cfg; attempt++) {
-        if (wait_can_write()) { step = 2; goto fail; }
+    int locked = (drv_ports_lock(h_ports, 50) == 0);
+    if (!locked) { step = 2; goto fail; }
+
+    /* Keyboard interface off for the duration.  Its own state is untouched —
+     * this gates the interface, not the device — so a keystroke pressed during
+     * these few microseconds is delivered once we re-enable. */
+    if (wait_can_write()) { drv_ports_unlock(h_ports); step = 2; goto fail; }
+    drv_out8(h_ports, PS2_CMD, 0xAD);
+
+    int ok = 0;
+    if (wait_can_write() == 0) {
         drv_out8(h_ports, PS2_CMD, 0x20);
-        if (wait_can_read()) continue;          /* somebody else took it */
-        cfg = (uint8_t)drv_in8(h_ports, PS2_DATA);
-        got_cfg = 1;
+        if (wait_can_read() == 0) {
+            cfg = (uint8_t)drv_in8(h_ports, PS2_DATA);
+            cfg |=  0x02;
+            cfg &= (uint8_t)~0x20;
+            if (wait_can_write() == 0) {
+                drv_out8(h_ports, PS2_CMD, 0x60);
+                if (wait_can_write() == 0) {
+                    drv_out8(h_ports, PS2_DATA, cfg);
+                    ok = 1;
+                }
+            }
+        }
     }
-    if (!got_cfg) { step = 3; goto fail; }
-    cfg |=  0x02;
-    cfg &= (uint8_t)~0x20;
-    if (wait_can_write()) { step = 4; goto fail; }
-    drv_out8(h_ports, PS2_CMD, 0x60);
-    if (wait_can_write()) { step = 5; goto fail; }
-    drv_out8(h_ports, PS2_DATA, cfg);
+
+    /* Re-enable the keyboard on EVERY path.  A bring-up that fails after
+     * 0xAD and returns without 0xAE leaves the machine with no keyboard —
+     * which is how a mouse driver's failure becomes an unusable computer. */
+    if (wait_can_write() == 0) drv_out8(h_ports, PS2_CMD, 0xAE);
+    drv_ports_unlock(h_ports);
+    if (!ok) { step = 3; goto fail; }
 
     /* 3. Device: defaults + enable reporting.  aux_send eats the ACKs
      *    synchronously (IRQ12 is not yet installed, so no race). */

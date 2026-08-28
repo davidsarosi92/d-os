@@ -28,6 +28,8 @@ static void puthex(unsigned v) {
     put(b);
 }
 
+#define SYS_DRV_PORTS_LOCK   0xD065
+#define SYS_DRV_PORTS_UNLOCK 0xD066
 #define SYS_DRV_PORTS    0xD060
 #define SYS_DRV_IRQ      0xD061
 
@@ -57,7 +59,36 @@ int main(void) {
     if (bad >= 0) { put("drvtest: FAIL — serial ports granted, manifest ignored\n"); return 1; }
     put("drvtest: 0x3F8 refused by the manifest — good\n");
 
-    /* 3. And the CPU must refuse the one we were never given.  If the bitmap
+    /* 3. THE EXCLUSIVE CLAIM IS BOUNDED, and that is what is falsified here.
+     *
+     * A claim masks the KEYBOARD's interrupt line, so a driver that takes one
+     * and dies — or is simply wrong — would leave the machine with no keyboard.
+     * The kernel therefore takes the claim back on a deadline.  Proving it
+     * needs the reclaim to be OBSERVED rather than assumed: take a claim with a
+     * short deadline, never release it, sleep past it, and ask again.  A second
+     * claim can only succeed if the first one is gone. */
+    long lk = dos_syscall3(SYS_DRV_PORTS_LOCK, h, 40, 0);
+    if (lk != 0) { put("drvtest: FAIL — exclusive claim refused\n"); return 1; }
+    put("drvtest: exclusive claim taken (40 ms) and deliberately NOT released\n");
+
+    /* A second claim while the first stands must be refused — otherwise the
+     * success after the sleep would prove nothing about the deadline, only
+     * that claims are always granted. */
+    if (dos_syscall3(SYS_DRV_PORTS_LOCK, h, 40, 0) == 0) {
+        put("drvtest: FAIL — a second claim was granted while the first stood\n");
+        return 1;
+    }
+    put("drvtest: a second claim while the first stands is refused — good\n");
+
+    nanosleep_ms(250);
+    if (dos_syscall3(SYS_DRV_PORTS_LOCK, h, 40, 0) != 0) {
+        put("drvtest: FAIL — claim never reclaimed, the keyboard would be dead\n");
+        return 1;
+    }
+    dos_syscall3(SYS_DRV_PORTS_UNLOCK, h, 0, 0);
+    put("drvtest: the abandoned claim was reclaimed on its deadline — good\n");
+
+    /* 4. And the CPU must refuse the one we were never given.  If the bitmap
      * works this line does not return; the kernel prints the fault and kills
      * the process, and THAT is the pass. */
     put("drvtest: now reading ungranted 0x3F8 directly — expect a fault\n");

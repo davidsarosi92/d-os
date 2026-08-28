@@ -55,6 +55,14 @@ struct drv_res {
     struct waitq   wq;
     volatile uint32_t count;           /* total fires                        */
     volatile uint32_t seen;            /* what the driver has consumed       */
+
+    /* PORTS only — §M33 Tier 2's shared-controller claim.  See
+     * drv_ports_lock: `excl_irq` is the line held off while the claim
+     * stands, and `excl_t` is the deadline that takes the claim back from a
+     * driver that never released it. */
+    int            excl;               /* claim held                         */
+    int            excl_irq;           /* line masked by it, -1 = none       */
+    struct ktimer  excl_t;
 };
 
 /* A flat table rather than per-context allocation.  The count is the ceiling on
@@ -157,6 +165,97 @@ long drv_in32(drv_handle h, uint16_t off) { long p = port_at(h, off); return p <
 int  drv_out8 (drv_handle h, uint16_t off, uint8_t v)  { long p = port_at(h, off); if (p < 0) return (int)p; outb((uint16_t)p, v); return 0; }
 int  drv_out16(drv_handle h, uint16_t off, uint16_t v) { long p = port_at(h, off); if (p < 0) return (int)p; outw((uint16_t)p, v); return 0; }
 int  drv_out32(drv_handle h, uint16_t off, uint32_t v) { long p = port_at(h, off); if (p < 0) return (int)p; outl((uint16_t)p, v); return 0; }
+
+/* ----------------------------------------------------------------------
+ * §M33 Tier 2 — ARBITRATING A SHARED CONTROLLER.
+ *
+ * THE PROBLEM, CONCRETELY.  The 8042 has ONE output buffer and TWO drivers.
+ * When our mouse driver asks the controller for its config byte, the answer
+ * lands in that buffer with the AUX bit CLEAR — which is exactly what a
+ * keystroke looks like — so it raises IRQ1 and the KEYBOARD driver's handler
+ * reads it.  Our read then times out, robbed by a driver doing its job
+ * correctly.  It is not a race lost occasionally; it is lost whenever an
+ * interrupt beats us to a byte.
+ *
+ * WHY IT NEEDS THE KERNEL, AND WHY THAT IS THE INTERESTING PART.  In ring 0 a
+ * driver would mask IRQ1 around the transaction and be done.  A driver in
+ * ring 3 cannot — masking an interrupt line is not something a placed driver
+ * may do, and giving it that power would hand back most of what the placement
+ * was for.  So the exclusion becomes an OPERATION the runtime offers, with the
+ * same signature on both sides of the boundary, and the driver's source does
+ * not change.  §M33's shape: a capability the kernel performs on request
+ * rather than a privilege it hands over.
+ *
+ * WHICH LINE COMPETES IS THE KERNEL'S KNOWLEDGE, not the driver's.  A driver
+ * that named the line it wanted masked could name IRQ0 and stop the clock.
+ * The table below is the machine's list of shared controllers, and a window
+ * that is not in it gets exclusion with no masking — correct, because nothing
+ * is known to share it.
+ *
+ * THE CLAIM IS BOUNDED, AND THAT IS NOT DEFENSIVE.  A ring-3 driver holds this
+ * across a return to user mode, so it can be killed, preempted, or simply
+ * buggy while holding it — and a permanently masked IRQ1 is a keyboard that
+ * has silently stopped working, which is a far worse failure than the race it
+ * was closing.  A deadline takes the claim back and SAYS SO.
+ * ---------------------------------------------------------------------- */
+static const struct { uint16_t base, count; int irq; } g_shared_ctrl[] = {
+    /* The 8042: the keyboard driver reads port 0x60 from its IRQ1 handler, so
+     * it is a competing reader of every controller response we ask for. */
+    { 0x60, 5, 1 },
+};
+
+static int shared_irq_for(uint16_t base, uint16_t count) {
+    for (unsigned i = 0; i < sizeof g_shared_ctrl / sizeof g_shared_ctrl[0]; i++) {
+        uint32_t a0 = g_shared_ctrl[i].base, a1 = a0 + g_shared_ctrl[i].count;
+        uint32_t b0 = base, b1 = (uint32_t)base + count;
+        if (b0 < a1 && a0 < b1) return g_shared_ctrl[i].irq;
+    }
+    return -1;
+}
+
+static void excl_release(struct drv_res* r, const char* how) {
+    if (!r->excl) return;
+    r->excl = 0;
+    if (r->excl_irq >= 0) irq_set_masked(r->excl_irq, 0);
+    if (how) {
+        kprintf("drv-rt: '%s' held ports %x..%x exclusively too long — "
+                "taken back (%s)\n", r->owner ? r->owner : "?",
+                (unsigned)r->base, (unsigned)(r->base + r->len - 1), how);
+        klog(KLOG_WARN, "drv-rt", "'%s' exclusive claim on %x reclaimed (%s)",
+             r->owner ? r->owner : "?", (unsigned)r->base, how);
+    }
+    r->excl_irq = -1;
+}
+
+/* Runs in IRQ context.  Unmasking a line is a register write, which is all
+ * this does — no allocation, no lock, nothing that can block. */
+static void excl_deadline(struct ktimer* t) {
+    struct drv_res* r = (struct drv_res*)t->arg;
+    if (r) excl_release(r, "deadline");
+}
+
+int drv_ports_lock(drv_handle h, int max_ms) {
+    struct drv_res* r = res_of(h);
+    if (!r || r->kind != RES_PORTS) return DRV_EBAD;
+    if (r->excl) return DRV_EBUSY;
+    if (max_ms <= 0 || max_ms > 1000) max_ms = 50;   /* bounded, always */
+
+    r->excl_irq = shared_irq_for((uint16_t)r->base, (uint16_t)r->len);
+    r->excl     = 1;
+    if (r->excl_irq >= 0) irq_set_masked(r->excl_irq, 1);
+    ktimer_arm(&r->excl_t, timer_now_ns() + (uint64_t)max_ms * 1000000ull,
+               excl_deadline, r);
+    return 0;
+}
+
+int drv_ports_unlock(drv_handle h) {
+    struct drv_res* r = res_of(h);
+    if (!r || r->kind != RES_PORTS) return DRV_EBAD;
+    if (!r->excl) return 0;                          /* already reclaimed */
+    ktimer_cancel(&r->excl_t);
+    excl_release(r, NULL);
+    return 0;
+}
 #else
 /* No port space on this machine.  Every entry point says DRV_ENOSYS rather
  * than pretending — a driver that needs ports is a driver for hardware this
@@ -172,6 +271,11 @@ long drv_in32(drv_handle h, uint16_t off) { (void)h; (void)off; return DRV_ENOSY
 int  drv_out8 (drv_handle h, uint16_t off, uint8_t v)  { (void)h; (void)off; (void)v; return DRV_ENOSYS; }
 int  drv_out16(drv_handle h, uint16_t off, uint16_t v) { (void)h; (void)off; (void)v; return DRV_ENOSYS; }
 int  drv_out32(drv_handle h, uint16_t off, uint32_t v) { (void)h; (void)off; (void)v; return DRV_ENOSYS; }
+/* No ports means no shared port controller to arbitrate.  ENOSYS rather than
+ * "success, did nothing" — a driver that thinks it has exclusive access and
+ * does not is worse off than one told it cannot have any. */
+int  drv_ports_lock(drv_handle h, int max_ms) { (void)h; (void)max_ms; return DRV_ENOSYS; }
+int  drv_ports_unlock(drv_handle h)           { (void)h; return DRV_ENOSYS; }
 #endif
 
 /* ---- MMIO ----------------------------------------------------------------- */
@@ -364,6 +468,18 @@ void drv_release_all(struct drv_rt* rt) {
         }
         if (r->kind == RES_DMA && r->base)
             pmm_free_contiguous((pmm_phys_t)r->base, (uint32_t)(r->len / 4096));
+#if defined(__i386__) || defined(__x86_64__)
+        /* A driver that died holding an exclusive claim would otherwise leave
+         * the competing line masked forever — i.e. leave the KEYBOARD dead
+         * because the mouse driver crashed, which inverts the whole point of
+         * placing it outside the kernel. */
+        if (r->kind == RES_PORTS && r->excl) {
+            ktimer_cancel(&r->excl_t);
+            r->excl = 0;
+            if (r->excl_irq >= 0) irq_set_masked(r->excl_irq, 0);
+            r->excl_irq = -1;
+        }
+#endif
         r->used = 0;
     }
     rt->nres = 0;

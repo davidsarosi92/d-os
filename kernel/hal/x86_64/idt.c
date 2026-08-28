@@ -28,6 +28,7 @@
 #include "watchdog.h"   /* §4.67 follow-up — name the STALLED cpu in an NMI */
 #include "lapic.h"
 #include "ioapic.h"
+#include "acpi.h"   /* ISA IRQ -> GSI, for irq_set_masked */
 #include "pci.h"
 #include "config.h"
 #include "uaccess.h"   /* §1.1 — fault-fixup table for user copies */
@@ -220,6 +221,29 @@ void idt_init(void) {
 /* APs call this to lidt the shared IDT on their own CPU. */
 void idt_load(void) {
     __asm__ volatile ("lidt %0" : : "m"(idtr));
+}
+
+/* §M33 Tier 2 — mask/unmask one line, whichever controller is live.  See the
+ * i386 twin: arbitrating a shared controller means the other driver's interrupt
+ * must not fire mid-transaction, and which of the two interrupt controllers is
+ * in charge is a boot-time decision (masking a disabled 8259 masks nothing). */
+static void pic_mask(int irq) {
+    uint16_t port = (irq < 8) ? PIC1_DATA : PIC2_DATA;
+    uint8_t  mask = inb(port);
+    mask |= (uint8_t)(1 << (irq & 7));
+    outb(port, mask);
+}
+
+void irq_set_masked(int irq, int masked) {
+    if (irq < 0 || irq > 15) return;
+    if (g_apic_mode) {
+        uint32_t gsi = (uint32_t)irq;
+        uint16_t flags = 0;
+        acpi_irq_override(irq, &gsi, &flags);
+        ioapic_mask_gsi(gsi, masked);
+    } else {
+        if (masked) pic_mask(irq); else pic_unmask(irq);
+    }
 }
 
 void irq_install(int irq, irq_handler_t handler) {

@@ -393,6 +393,12 @@ static void syscall_dispatch_body(struct int_frame* f) {
             f->rax = (uint64_t)drvuser_sys_input((int)f->rbx, (int)f->rcx,
                                                  (unsigned)f->rdx, (int)f->rsi);
             return;
+        case SYS_DRV_PORTS_LOCK:
+            f->rax = (uint64_t)drvuser_sys_ports_lock((int)f->rbx, (int)f->rcx);
+            return;
+        case SYS_DRV_PORTS_UNLOCK:
+            f->rax = (uint64_t)drvuser_sys_ports_unlock((int)f->rbx);
+            return;
         case SYS_DRV_LOG: {
             char msg[128];
             int n = copy_str_from_user(msg, f->rbx, sizeof msg);

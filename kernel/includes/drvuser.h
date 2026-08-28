@@ -72,6 +72,8 @@ int  drvuser_ready(const char* name);
 long drvuser_sys_ports(uint16_t base, uint16_t count);
 long drvuser_sys_irq(int line);
 long drvuser_sys_irq_wait(drv_handle h, int timeout_ms);
+long drvuser_sys_ports_lock(drv_handle h, int max_ms);
+long drvuser_sys_ports_unlock(drv_handle h);
 long drvuser_sys_input(int dx, int dy, unsigned buttons, int dz);
 long drvuser_sys_log(const char* msg);
 

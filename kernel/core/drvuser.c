@@ -652,6 +652,26 @@ long drvuser_sys_irq(int line) {
     return h;
 }
 
+/* Exclusive access to the shared controller, on the driver's own port handle.
+ *
+ * The handle check is the whole security of it: without it any process could
+ * name a handle and have the kernel mask an interrupt line on its behalf.  A
+ * driver may only ask about the window it was granted — which is the same rule
+ * the manifest states for the grant itself. */
+long drvuser_sys_ports_lock(drv_handle h, int max_ms) {
+    struct drvuser* d = du_current();
+    if (!d) return DRV_EBAD;
+    if (h != d->h_ports) return DRV_EBAD;
+    return drv_ports_lock(h, max_ms);
+}
+
+long drvuser_sys_ports_unlock(drv_handle h) {
+    struct drvuser* d = du_current();
+    if (!d) return DRV_EBAD;
+    if (h != d->h_ports) return DRV_EBAD;
+    return drv_ports_unlock(h);
+}
+
 long drvuser_sys_irq_wait(drv_handle h, int timeout_ms) {
     struct drvuser* d = du_current();
     if (!d) return DRV_EBAD;

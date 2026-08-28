@@ -126,6 +126,35 @@ int  drv_out16(drv_handle h, uint16_t off, uint16_t v);
 int  drv_out32(drv_handle h, uint16_t off, uint32_t v);
 
 /* ----------------------------------------------------------------------
+ * EXCLUSIVE ACCESS TO A SHARED CONTROLLER.
+ *
+ * Some devices are shared by two drivers that cannot see each other.  The 8042
+ * is the case this exists for: it has ONE output buffer, and a controller's
+ * answer to a command is indistinguishable from a keystroke — same port, AUX
+ * bit clear — so it raises the KEYBOARD's interrupt and the keyboard driver
+ * reads it.  Whoever asked the question gets a timeout.
+ *
+ * WHY IT IS AN OPERATION AND NOT SOMETHING THE DRIVER DOES ITSELF.  In ring 0
+ * a driver would mask the other line and be done.  A driver in ring 3 cannot,
+ * and should not be able to — that is one of the privileges the placement
+ * exists to take away.  So the exclusion is something the RUNTIME performs on
+ * request, identically on both sides, and the driver's source is unchanged
+ * between placements.  Which line competes is the KERNEL's knowledge: a driver
+ * allowed to name it could name the timer's.
+ *
+ * THE CLAIM IS ALWAYS BOUNDED.  `max_ms` is clamped, and when it expires the
+ * kernel takes the claim back and says so — because a ring-3 driver holds this
+ * across a return to user mode, where it can be killed or preempted or simply
+ * wrong, and a line left masked is a device that has silently stopped working.
+ * It is also released if the driver's resources go back, so a crash cannot
+ * leave the keyboard dead behind it.
+ *
+ * Hold it for a transaction, never for a phase of work.
+ * ---------------------------------------------------------------------- */
+int drv_ports_lock(drv_handle h, int max_ms);
+int drv_ports_unlock(drv_handle h);
+
+/* ----------------------------------------------------------------------
  * MMIO.  The pointer is REAL in the in-kernel backend and would be a mapping
  * into the driver's own space in the user one — which is why the driver gets it
  * from a handle rather than computing it: the number differs per backend and

@@ -28,6 +28,7 @@
 #include "percpu.h"    /* §M54 — name the CPU in the ring-0 fault dump */
 #include "lapic.h"
 #include "ioapic.h"
+#include "acpi.h"   /* ISA IRQ -> GSI, for irq_set_masked */
 #include "pci.h"
 #include "config.h"
 #include "uaccess.h"   /* §1.1 — fault-fixup table for user copies */
@@ -246,6 +247,38 @@ void idt_init(void) {
  * each core needs its own lidt to start delivering interrupts. */
 void idt_load(void) {
     __asm__ volatile ("lidt %0" : : "m"(idtr));
+}
+
+/* --------------------------------------------------------------------------
+ * §M33 Tier 2 — mask/unmask one line, whichever interrupt controller is live.
+ *
+ * Needed because a SHARED CONTROLLER has to be arbitrated: two drivers read the
+ * 8042's single output buffer, and a controller response is indistinguishable
+ * from a keystroke, so the only way one driver can complete a transaction is if
+ * the other's interrupt cannot fire meanwhile.
+ *
+ * Routed through here rather than poked directly by the caller because THE
+ * MACHINE HAS TWO INTERRUPT CONTROLLERS and which one is live is a boot-time
+ * decision: masking the 8259 after `idt_use_apic` has disabled it would look
+ * like it worked and mask nothing at all.
+ * -------------------------------------------------------------------------- */
+static void pic_mask(int irq) {
+    uint16_t port = (irq < 8) ? PIC1_DATA : PIC2_DATA;
+    uint8_t  mask = inb(port);
+    mask |= (uint8_t)(1 << (irq & 7));
+    outb(port, mask);
+}
+
+void irq_set_masked(int irq, int masked) {
+    if (irq < 0 || irq > 15) return;
+    if (g_apic_mode) {
+        uint32_t gsi = (uint32_t)irq;
+        uint16_t flags = 0;
+        acpi_irq_override(irq, &gsi, &flags);
+        ioapic_mask_gsi(gsi, masked);
+    } else {
+        if (masked) pic_mask(irq); else pic_unmask(irq);
+    }
 }
 
 void irq_install(int irq, irq_handler_t handler) {

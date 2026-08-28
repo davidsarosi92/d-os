@@ -3188,15 +3188,21 @@ are not guarded (no caller to unwind to).
     rather than faking it); state replay richer than "the driver runs its own
     bring-up again", which suffices for a mouse and will not for a device
     holding a session.
-  * **ARBITRATION OF A SHARED CONTROLLER — new, and found by placing a driver.**
-    The 8042's answer to a config-byte read lands in the single output buffer
-    with the AUX bit clear, so it raises IRQ1 and the KEYBOARD driver reads it;
-    our mouse driver then times out, robbed by a driver behaving correctly.  A
-    ring-3 driver cannot mask an interrupt line and should not be able to.  The
-    bounded retry in `ps2_mouse.c` buys the quiet case and is documented as not
-    a cure.  The real answer is one owner of the controller that both drivers go
-    through — a genuine Tier 2 item, because it is exactly the class of problem
-    a process boundary creates: two drivers, one device, no shared lock.
+  * **ARBITRATION OF A SHARED CONTROLLER — found by placing a driver, and
+    SHIPPED 2026-08-28.**  The 8042's answer to a config-byte read lands in the
+    single output buffer with the AUX bit clear, so it raises IRQ1 and the
+    KEYBOARD driver reads it; our mouse driver then timed out, robbed by a driver
+    behaving correctly.  Fixed in two halves: `drv_ports_lock`/`unlock` is the
+    generic one — the KERNEL holds off the competing line, because a ring-3
+    driver must not be able to mask an interrupt and the kernel decides which
+    line — and `0xAD`/`0xAE` is the device one, without which masking is not
+    enough (a masked IRQ1 stops the keyboard driver being told about a byte, not
+    the keyboard producing one, and then WE steal it).  The claim is bounded and
+    reclaimed on a deadline or on resource release, so a crashed mouse driver
+    cannot leave the keyboard dead.  Measured: six placement cycles under
+    continuous typing → 0 bring-up failures on both x86 arches; recovery became
+    deterministic at 1 restart.  *This is the shape §M33 predicted a process
+    boundary would produce: a privilege that has to become an operation.*
   * **Stage 5 — an IOMMU driver.**  Until it exists a DMA driver outside the
     kernel is placement, not isolation, and the code marks it `ADVISORY(!)`.
   * **Tier 2, second half** — DMA drivers in ring 3, which needs stage 5.

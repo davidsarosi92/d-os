@@ -35,6 +35,8 @@
 #define SYS_DRV_IRQ_WAIT 0xD062
 #define SYS_DRV_INPUT    0xD063
 #define SYS_DRV_LOG      0xD064
+#define SYS_DRV_PORTS_LOCK   0xD065
+#define SYS_DRV_PORTS_UNLOCK 0xD066
 
 /* Mirror of the grant, so the bounds check is local.  Small and fixed: a
  * ring-3 driver holds a handful of resources, and an allocation here would be
@@ -103,6 +105,16 @@ long drv_in32(drv_handle h, uint16_t off) { long p = port_at(h, off); return p <
 int  drv_out8 (drv_handle h, uint16_t off, uint8_t v)  { long p = port_at(h, off); if (p < 0) return (int)p; raw_out8((unsigned short)p, v); return 0; }
 int  drv_out16(drv_handle h, uint16_t off, uint16_t v) { long p = port_at(h, off); if (p < 0) return (int)p; raw_out16((unsigned short)p, v); return 0; }
 int  drv_out32(drv_handle h, uint16_t off, uint32_t v) { long p = port_at(h, off); if (p < 0) return (int)p; raw_out32((unsigned short)p, v); return 0; }
+
+/* The one operation a placed driver genuinely cannot perform itself: holding
+ * off the interrupt of the OTHER driver on a shared controller.  Same signature
+ * as the in-kernel backend, so ps2_mouse.c's bring-up is one source. */
+int drv_ports_lock(drv_handle h, int max_ms) {
+    return (int)dos_syscall3(SYS_DRV_PORTS_LOCK, h, max_ms, 0);
+}
+int drv_ports_unlock(drv_handle h) {
+    return (int)dos_syscall3(SYS_DRV_PORTS_UNLOCK, h, 0, 0);
+}
 
 drv_handle drv_irq_request(struct drv_rt* rt, int line, const char* why) {
     (void)rt; (void)why;

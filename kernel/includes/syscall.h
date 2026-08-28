@@ -120,6 +120,11 @@
  * puts them next to the in-kernel driver's messages, which is where somebody
  * comparing the two placements will look. */
 #define SYS_DRV_LOG         0xD064  /* (buf, len) → 0 / -1                     */
+/* Exclusive access to a shared controller, for the length of one transaction.
+ * A syscall because the kernel is what holds the competing interrupt off — a
+ * placed driver must not be able to mask an interrupt line itself. */
+#define SYS_DRV_PORTS_LOCK  0xD065  /* (handle, max_ms) → 0 / <0               */
+#define SYS_DRV_PORTS_UNLOCK 0xD066 /* (handle) → 0 / <0                       */
 
 #define SYS_DOSGUI_CREATE   0xD050  /* (w, h, title) → handle / -1             */
 #define SYS_DOSGUI_PRESENT  0xD051  /* (handle, px, w[, stride]) → 0 / -1      */

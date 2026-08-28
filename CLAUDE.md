@@ -97,16 +97,29 @@ and the rescan job could place ONE driver TWICE, so it quarantined itself
 fighting itself for the 8042 (the first guard ran after the spawn, which both
 callers walked past — the slot is RESERVED first now); the per-CPU I/O-bitmap
 cache keys on an address the allocator immediately reuses; and a placed driver's
-messages went NOWHERE (no console — `SYS_DRV_LOG`).  **FOUND, NOT CAUSED: the
-8042's answer to a config read is indistinguishable from a keystroke**, so the
-keyboard driver steals it — the placement made it visible rather than causing it,
-since in the kernel that code only ever ran at boot.  **MEASURED: 25 driven
-pointer movements → 25 events through the process that REPLACED the killed one**,
-i386 and x86_64; and `restart_max = 0` turns the same kill into a quarantine,
-which is the control.  **OPEN:** stage 5 (an IOMMU, without which a DMA driver
-outside the kernel is placement not isolation); Tier 2's DMA half; MMIO into a
-driver's own space; and ARBITRATION OF A SHARED CONTROLLER — two drivers, one
-8042, no lock they can share across a process boundary.
+messages went NOWHERE (no console — `SYS_DRV_LOG`).  **FOUND, THEN FIXED: the 8042's
+answer to a config read is indistinguishable from a keystroke**, so the keyboard
+driver steals it — the placement made it visible rather than causing it, since in
+the kernel that code only ever ran at boot, alone on the controller.  **THE FIX
+IS THE SHAPE §M33 PREDICTED: a privilege becomes an OPERATION.**  In ring 0 a
+driver would mask IRQ1; a ring-3 driver must not be able to and *should not*, so
+`drv_ports_lock` has the kernel hold the line off on request — and the KERNEL
+picks the line, because a driver allowed to name it could name the timer's.  The
+DEVICE half (`0xAD`/`0xAE`) is not optional: a masked IRQ1 stops the keyboard
+driver being TOLD about a byte, not the keyboard PRODUCING one, and then *we*
+steal it.  **The claim is BOUNDED** — reclaimed on a deadline and on resource
+release, so a crashed mouse driver cannot leave the keyboard dead; `drvtest`
+falsifies that by abandoning one on purpose.  **AND `drvtest` ITSELF WAS
+UNRUNNABLE TWICE OVER:** it asked for a window the built-in driver held, so *the
+test that proves the port bitmap works had failed on every ordinary boot since it
+shipped*, and its deliberate final fault killed the SHELL it ran on.  **MEASURED:
+25 driven pointer movements → 25 events through the process that REPLACED the
+killed one** (i386 + x86_64); six placement cycles under continuous typing → **0
+bring-up failures** where it reliably failed before; recovery deterministic at
+**1 restart**; and `restart_max = 0` turns the same kill into a quarantine, which
+is the control.  **OPEN:** stage 5 (an IOMMU, without which a DMA driver outside
+the kernel is placement not isolation); Tier 2's DMA half; MMIO into a driver's
+own space; state replay richer than "run bring-up again".
 `driver.profile` is deliberately absent — with one reachable domain it would be
 a key with one legal value.  **NEXT: §M32 multi-user.**
 

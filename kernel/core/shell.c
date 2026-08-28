@@ -3143,23 +3143,57 @@ static void cmd_drvtest(void) {
         console_write("drvtest: not embedded for this arch\n");
         return;
     }
-    /* proc_exec_elf runs it as an excursion on THIS task, so this task's pid is
-     * the one the syscalls will see. */
-    int pid = task_current() ? task_current()->pid : -1;
-    if (drvuser_attach(pid, "ps2_mouse") != 0) {
+    /* STOP THE IN-KERNEL MOUSE DRIVER FIRST, and this is a bug fix rather than
+     * tidiness: the manifest's window is the 8042's, the built-in ps2_mouse
+     * holds exactly that window, and drvrt.c's conflict check refused the test
+     * every time — so `drvtest` has FAILED on every ordinary boot since it
+     * shipped, with a message ("granted request refused") that reads like the
+     * grant machinery is broken rather than like the test asked for something
+     * already taken.
+     *
+     * A test that cannot pass in the default configuration is a test nobody
+     * runs, and this one is what proves the port bitmap works at all. */
+    struct driver* mdrv = driver_find("ps2_mouse");
+    int was_running = (mdrv && (driver_state(mdrv) & DRV_S_INITED)) ? 1 : 0;
+    if (was_running) driver_stop("ps2_mouse");
+
+    /* A SEPARATE PROCESS, NOT AN EXCURSION ON THIS TASK.
+     *
+     * The test's last step FAULTS ON PURPOSE — that is its pass condition — and
+     * as an excursion the faulting task was the SHELL.  So the machine lost its
+     * shell every time the test succeeded, and nothing after `proc_exec_elf`
+     * ever ran, including putting the mouse driver back.  A test whose success
+     * costs you the terminal you ran it from is one people learn not to run.
+     *
+     * Reserved BEFORE the spawn and claimed by the child by name (see
+     * drvuser.c): the child's first act is to ask for its ports, and attaching
+     * after the spawn returned would be a race whose loser is a confusing
+     * failure in the test rather than in the thing being tested. */
+    if (drvuser_attach(0, "ps2_mouse") != 0) {
         console_write("drvtest: could not attach the manifest\n");
+        if (was_running) driver_start("ps2_mouse");
         return;
     }
     size_t len = (size_t)(_binary_user_drvtest_elf_end -
                           _binary_user_drvtest_elf_start);
-    int rc = proc_exec_elf(_binary_user_drvtest_elf_start, len);
+    int pid = proc_spawn_argv("ps2_mouse", _binary_user_drvtest_elf_start,
+                              len, 0, NULL, 0);
+    if (pid < 0) {
+        console_write("drvtest: could not spawn\n");
+        drvuser_detach(drvuser_pid("ps2_mouse"));
+        if (was_running) driver_start("ps2_mouse");
+        return;
+    }
+    /* Poll for DISAPPEARANCE — §M57: init is a universal reaper and may collect
+     * it first, so a wait would never complete. */
+    for (int k = 0; k < 200; k++) {
+        struct task* t = task_find(pid);
+        if (!t || t->state == TASK_DEAD) break;
+        task_msleep(25);
+    }
     drvuser_detach(pid);
-    /* The task's grant goes with it — leaving a shell permitted to touch the
-     * 8042 after the test would be the dangling-grant shape of every other
-     * lifetime bug in this tree. */
-    if (task_current()) task_current()->io_bitmap = NULL;
-    hal_set_io_bitmap(NULL);
-    kprintf("drvtest: returned rc=%d\n", rc);
+    if (was_running) driver_start("ps2_mouse");
+    kprintf("drvtest: done (the fault above is the pass)\n");
 }
 
 /* M36 — `linuxtest`: run a Linux-ABI program under the Linux personality

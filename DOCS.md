@@ -10297,20 +10297,69 @@ would let one of the two paths quietly stop being exercised.
   and the ring-3 formatter renders `%d`, because "no port grant (-1)" and "no
   port grant (-5)" are different diagnoses.
 
-**FOUND, NOT CAUSED: THE 8042 IS A SHARED CONTROLLER AND TWO DRIVERS RACE ON IT.**
-The controller's response to `0x20` (read config byte) lands in the single output
-buffer with the AUX bit CLEAR — indistinguishable from a keystroke — so it raises
-IRQ1 and the keyboard driver's handler reads it.  Our `wait_can_read` then times
-out, robbed by a driver behaving correctly.  It is not an occasional race; it is
-one we lose whenever an interrupt beats us to a byte.  **The placement made it
-visible rather than causing it:** in the kernel this code runs at boot, before
-anything can type; in ring 3 it runs when the user asks for the placement —
-necessarily while they are at the keyboard — and a ring-3 driver cannot mask
-IRQ1, nor should it be able to.  A bounded retry buys the quiet case and *is not
-a cure*, which is written down where the loop is so nobody reads it as one.  What
-makes it survivable is the supervisor: recovery, not correctness.  **Real
-arbitration of a shared controller is OPEN** and is a genuine Tier 2 item —
-two drivers, one device, and no lock they can share across a process boundary.
+**FOUND AND THEN FIXED: THE 8042 IS A SHARED CONTROLLER AND TWO DRIVERS RACED ON
+IT.**  The controller's response to `0x20` (read config byte) lands in the single
+output buffer with the AUX bit CLEAR — indistinguishable from a keystroke — so it
+raises IRQ1 and the keyboard driver's handler reads it.  Our `wait_can_read` then
+timed out, robbed by a driver behaving correctly.  Not an occasional race: one we
+lost whenever an interrupt beat us to a byte, and asking again merely produced
+another byte for the keyboard to take.  **The placement made it visible rather
+than causing it** — in the kernel this code only ever ran at boot, alone on the
+controller before anything could type; in ring 3 it runs when the user asks for
+the placement, which is necessarily while they are at the keyboard.  The bug was
+always there; nothing had ever re-initialised the mouse on a live machine.
+
+**THE FIX IS TWO HALVES, AND THEY ARE DIFFERENT KINDS OF THING.**
+
+* **`drv_ports_lock` / `drv_ports_unlock` — the GENERIC half.**  In ring 0 a
+  driver would mask IRQ1 and be done.  A driver in ring 3 cannot, and *should
+  not be able to* — that is one of the privileges the placement exists to take
+  away.  So the exclusion becomes an OPERATION the runtime performs on request,
+  with the same signature on both sides, and the driver's source is identical
+  between placements.  §M33's shape throughout: **a capability the kernel
+  performs on request, not a privilege it hands over.**  WHICH line is held off
+  is the kernel's knowledge (a table of the machine's shared controllers) —
+  a driver allowed to name the line could name the timer's.  New
+  `irq_set_masked` does it on whichever interrupt controller is live, because
+  masking a 8259 that `idt_use_apic` has already disabled would look like it
+  worked and mask nothing.
+* **`0xAD` / `0xAE` — the DEVICE half, and masking alone is not enough without
+  it.**  A masked IRQ1 stops the keyboard driver being TOLD about a byte; it does
+  not stop the keyboard PRODUCING one, and a keystroke sitting in the buffer is
+  what our own read would then consume believing it to be the config byte — the
+  same race with us as the thief.  Disabling the keyboard interface closes it at
+  the source, and is re-enabled on EVERY exit path, because a bring-up that fails
+  after `0xAD` and returns leaves the machine with no keyboard: *a mouse driver's
+  failure becoming an unusable computer.*
+
+**THE CLAIM IS BOUNDED, AND THAT IS STRUCTURAL RATHER THAN DEFENSIVE.**  A ring-3
+driver holds it across a return to user mode, where it can be killed, preempted,
+or simply wrong — and a permanently masked IRQ1 is a keyboard that has silently
+stopped working, a far worse failure than the race being closed.  A ktimer takes
+the claim back and says so, and `drv_release_all` takes it back when the driver's
+resources go, so **a crashed mouse driver cannot leave the keyboard dead behind
+it.**  Falsified rather than asserted: `drvtest` takes a 40 ms claim, checks that
+a second claim is REFUSED while it stands (without which the later success would
+prove nothing), sleeps past the deadline, and shows the next claim granted —
+`the abandoned claim was reclaimed on its deadline`.
+
+**AND `drvtest` ITSELF HAD TWO DEFECTS, BOTH OF WHICH MADE IT UNRUNNABLE.**  It
+asked for the 8042's window while the built-in `ps2_mouse` held exactly that
+window, so drvrt.c's conflict check refused it — **the test that proves the port
+bitmap works had been FAILING on every ordinary boot since it shipped**, with a
+message ("granted request refused") that reads like the grant machinery is broken
+rather than like the test asked for something already taken.  And it ran as an
+excursion on the shell, so its deliberate final fault — its pass condition —
+**killed the shell you ran it from**, and everything after `proc_exec_elf`,
+including putting the mouse driver back, never ran at all.  It now stops the
+in-kernel driver, runs as its OWN process, and restores the driver afterwards.
+
+**MEASURED, AND THE NUMBERS MOVED.**  Six stop/start placement cycles with the
+harness typing continuously at 0.4 s intervals — the exact condition that used to
+fail — give **0 bring-up failures on i386 and 0 on x86_64**, and every subsequent
+command still typed, which is what proves `0xAE` was restored.  The crash-recovery
+run became deterministic: **1 restart on both arches** where it previously took
+2–4 with several failed bring-ups, and still 25 events for 25 driven movements.
 
 **MEASURED ON BOTH x86 ARCHES, and the measurement is the point.**  A new pid
 proves a process exists; it does not prove the device is driven — the first
@@ -10330,14 +10379,32 @@ the control that makes the positive result mean something.
 
 **What Tier 2 still does not have:** MMIO into a driver's own address space; an
 IOMMU (§M33 stage 5), without which a DMA driver outside the kernel is placement
-and not isolation; arbitration of a shared controller (above); and state replay
-richer than "the driver runs its own bring-up again", which is enough for a mouse
-and will not be for a device holding a session.
+and not isolation; and state replay richer than "the driver runs its own bring-up
+again", which is enough for a mouse and will not be for a device holding a
+session.
 
 ---
 
 ## 8. Change log
 
+- **2026-08-28 — §M33 Tier 2: arbitrating a shared controller (DOCS §4.82).**
+  The 8042 race is fixed rather than survived.  Two halves: `drv_ports_lock` is
+  the GENERIC one — the kernel holds off the competing driver's interrupt on
+  request, because a ring-3 driver must not be able to mask a line itself and
+  the kernel decides WHICH line (one that could name it could name the timer's);
+  `0xAD`/`0xAE` is the DEVICE one, and masking alone is not enough without it,
+  since a masked IRQ1 stops the keyboard driver being TOLD about a byte and not
+  the keyboard producing one — leaving us to steal it instead.  The claim is
+  BOUNDED and reclaimed on a deadline or when the driver's resources go, so a
+  crashed mouse driver cannot leave the keyboard dead; `drvtest` falsifies that
+  by abandoning a claim on purpose.  New `irq_set_masked` masks on whichever
+  interrupt controller is live.  **`drvtest` had two defects that made it
+  unrunnable:** it asked for a window the built-in driver held, so it had FAILED
+  on every ordinary boot since it shipped, and its deliberate final fault killed
+  the SHELL it ran on — it is its own process now.  Measured: six placement
+  cycles under continuous typing → **0 bring-up failures** on both x86 arches
+  (this reliably failed before), and crash-recovery became deterministic at **1
+  restart** where it took 2–4.
 - **2026-08-28 — §M33 Tier 2 (first half): a placed driver that comes back
   (DOCS §4.82).**  Tier 1 traded a dead machine for a dead device; a supervisor
   now notices the process is gone, hands the grants back, tells the driver's
