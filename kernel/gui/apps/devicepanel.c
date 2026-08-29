@@ -193,7 +193,10 @@ static int dm_get(void* ctx, int i, struct item_entry* out) {
     int n = put(dm_label, sizeof dm_label, 0, h->name);
     n = put(dm_label, sizeof dm_label, n, " — ");
     if (!h->online)   n = put(dm_label, sizeof dm_label, n, "not present");
-    else if (!d)      n = put(dm_label, sizeof dm_label, n, "NO DRIVER");
+    else if (!d)      n = put(dm_label, sizeof dm_label, n,
+                             (h->is_pci &&
+                              !hw_needs_driver(h->class_code, h->subclass))
+                             ? "no driver needed" : "NO DRIVER");
     else              n = put(dm_label, sizeof dm_label, n, dp_state(driver_state(d)));
     (void)n;
 
@@ -269,6 +272,9 @@ static int dm_cell(void* ctx, int i, int c, char* out, int cap) {
          * something, so it says so in words rather than being blank — a blank
          * cell reads as "not applicable", which is the opposite. */
         if (h->driver)      put(out, cap, 0, h->driver);
+        else if (h->online && h->is_pci &&
+                 !hw_needs_driver(h->class_code, h->subclass))
+            put(out, cap, 0, "(not needed)");
         /* ASCII, deliberately.  The console pads columns by BYTE count and an
          * em-dash is three bytes to one column, so "— none —" was twelve bytes
          * wide and eight columns wide and pushed the rest of the row sideways.
@@ -279,7 +285,16 @@ static int dm_cell(void* ctx, int i, int c, char* out, int cap) {
 
     case COL_STATE:
         if (!h->online)  put(out, cap, 0, "not present");
-        else if (!d)     put(out, cap, 0, "needs a driver");
+        else if (!d) {
+            /* "Needs one" and "wants none" are different answers, and printing
+             * the first for a host bridge makes the column untrustworthy — after
+             * which the row that DOES need attention reads like more of the
+             * same. */
+            if (h->is_pci && !hw_needs_driver(h->class_code, h->subclass))
+                put(out, cap, 0, "no driver needed");
+            else
+                put(out, cap, 0, "needs a driver");
+        }
         /* State 0 is "nothing has probed this yet" — §M67 attaches a module
          * without starting it.  `dp_state` prints "-" for that, which is the
          * driver registry's shorthand and tells a person nothing. */
@@ -391,7 +406,11 @@ static void dm_refresh_detail(void) {
     if (!d) {
         /* The one row that asks for an action, so it gets the sentence rather
          * than a state word. */
-        n = put(msg, sizeof msg, n, " — present, and nothing here drives it");
+        if (h->is_pci && !hw_needs_driver(h->class_code, h->subclass))
+            n = put(msg, sizeof msg, n,
+                    " — present; nothing drives it and nothing should");
+        else
+            n = put(msg, sizeof msg, n, " — present, and nothing here drives it");
         (void)n;
         w_label_set(dm_detail, msg);
         return;
@@ -586,7 +605,10 @@ void devices_cmd(const char* args) {
     for (int i = 0; i < dm_nhw; i++) {
         if (!dm_hw[i].online) { offline++; continue; }
         online++;
-        if (!dm_hw[i].driver) undriven++;
+        if (!dm_hw[i].driver && (!dm_hw[i].is_pci ||
+                                 hw_needs_driver(dm_hw[i].class_code,
+                                                 dm_hw[i].subclass)))
+            undriven++;
     }
 
     for (int pass = 0; pass < 2; pass++) {

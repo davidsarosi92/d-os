@@ -141,6 +141,19 @@ int hw_enumerate(struct hw_device* out, int cap);
 const char* hw_name_for(uint16_t vendor, uint16_t device,
                         uint8_t class_code, uint8_t subclass);
 
+/* Does this device NEED a driver at all?
+ *
+ * The first version of the device manager printed "needs a driver" for every
+ * unclaimed device, and that over-claims: a **host bridge is the PCI root
+ * complex itself**, and a PCI-to-PCI bridge is handled by enumeration.  Neither
+ * has anything to drive, and Linux has no driver for them either.  Telling a
+ * user their machine needs four drivers it does not need is the same failure as
+ * hiding the one it does — it makes the column untrustworthy, after which the
+ * row that DOES matter reads like more of the same.
+ *
+ * Returns 0 when nothing should be expected to claim it. */
+int hw_needs_driver(uint8_t class_code, uint8_t subclass);
+
 /* Which registered driver claims this device, or NULL.  Answers from the
  * DRIVER_MATCH() declarations only — it says what SHOULD drive the device, not
  * what currently is, and the caller pairs it with `driver_state`. */

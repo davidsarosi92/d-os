@@ -115,6 +115,20 @@ const char* hw_name_for(uint16_t vendor, uint16_t device,
     return class_name(class_code, subclass);
 }
 
+int hw_needs_driver(uint8_t class_code, uint8_t subclass) {
+    if (class_code == 0x06) {
+        /* Bridges.  The host bridge IS the root complex, and a PCI-to-PCI
+         * bridge is enumeration's business — neither is a device somebody
+         * should go looking for software for.  The ISA/LPC bridge is the
+         * interesting exception and is NOT excused: it carries the PCI
+         * interrupt routing, which is real and which this system currently
+         * takes on trust from whatever the firmware left in config space. */
+        if (subclass == 0x00) return 0;      /* host bridge          */
+        if (subclass == 0x04) return 0;      /* PCI-to-PCI bridge    */
+    }
+    return 1;
+}
+
 /* ---------------------------------------------------------------- */
 /* Which driver claims an ID.                                        */
 /* ---------------------------------------------------------------- */
