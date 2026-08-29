@@ -4394,6 +4394,73 @@ anyway.
 
 ---
 
+## CURRENT WORK PLAN (agreed 2026-08-29) — devices: manage them, then reach more of them
+
+§M33 is complete, so the next block is about DEVICES: showing what the machine
+has, and being able to talk to hardware that is not QEMU's virtio.
+
+**Ordered, and the order is by value rather than by size.**
+
+### 1. Device manager — a Control Panel panel
+
+The face of everything §M33 built, and almost all of it already exists behind a
+shell command.  A **`SETTINGS_PANEL()`**, not a `GUI_APP`: §M63's registry is
+exactly for this, and the Start menu has 12 slots with 11 taken — one entry per
+new tool does not fit, which is the problem §M63 was written to solve.
+
+Sources, all present: `driver_at` / `driver_count_all` / `driver_state` /
+`driver_domain`, `drvuser_pid` / `_restarts` / `_events` / `_confined`,
+`drv_res_dump`, the `iommu` per-device list, `/proc/drivers`.
+
+Columns: class, name, state (OK / absent / stopped / **QUARANTINED**), WHERE it
+runs (kernel or ring 3 + pid), **isolation** (none / advisory / full), restarts,
+events, and what it holds (ports / IRQ / MMIO / DMA).
+Actions: start, stop, change domain (kernel ↔ ring 3), and `drv crash` — because
+a control panel that can only observe cannot be used to test anything.
+
+### 2. AHCI — the one that is not about VirtualBox
+
+**Today d-os has no storage on real hardware at all.**  virtio-blk is the only
+block driver, so on a physical machine there is no disk: no persistent config,
+no exFAT mount, nothing that survives a reboot.  AHCI is what every SATA
+controller made this century speaks.
+
+Testable here (`-device ich9-ahci`, or q35's built-in), and the SAME driver then
+works in VirtualBox, VMware and on real iron.  One driver, three platforms —
+which is why it outranks anything VirtualBox-specific.
+
+### 3. AMD-Vi — the second IOMMU backend
+
+Not mainly about AMD: it is what makes `iommu.h` an INTERFACE rather than a file
+with two halves.  Today the header is abstract (state, `confine`, `is_confined`,
+fault count) and `iommu.c` has the DMAR table wired into `iommu_init` — *one
+implementation behind an interface is not an interface, it is a claim.*
+
+Testable here (`-device amd-iommu`).  The test is that `edu`'s confinement and
+the moved isolation verdict behave identically on both chipsets, unchanged.
+
+### 4. virtio-scsi — only if VirtualBox specifically matters
+
+**VirtualBox does not emulate virtio-blk** (IDE / AHCI / NVMe / virtio-scsi).
+Ours is virtio-blk, so it has nothing to attach to there.  virtio-scsi reuses
+the virtio transport we already have; the new part is the SCSI command layer.
+Testable here (`virtio-scsi-pci`).  *Unverified claim to check on a real
+VirtualBox host: that its controller list has no virtio-blk.*
+
+### 5. VMMDev — VirtualBox Guest Additions, and the only item that was blocked
+
+PCI 80EE:CAFE: absolute pointer, dynamic resolution, and HGCM for shared folders
+and clipboard.  It would be a good §M33 client in its own right (MMIO + IRQ +
+physical-address request buffers).
+
+**It was blocked for one reason: nothing here could boot it.**  This host is
+arm64 macOS and cannot run x86 guests under VirtualBox.  The user is installing
+VirtualBox, so the item unblocks the moment there is an **x86 host** to run the
+i386 / x86_64 build on — and the rule stands that it does not ship until it has
+been booted somewhere.
+
+---
+
 ## §M68 — A dynamic privilege model: an INVESTIGATION with a verdict required
 
 **Status: study.  Not scheduled for implementation, and it must not be until
