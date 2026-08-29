@@ -338,6 +338,31 @@ void gui_window_request_redraw_rect(struct gui_window* win,
 
 /* M22.3 — ~1 Hz callback on the compositor task (task-manager style
  * auto-refresh).  NULL to disable. */
+/* Drop this window's widgets.  An app whose `on_layout` BUILDS widgets must
+ * call this at the top of it.
+ *
+ * WHY IT IS THE APP'S CALL AND NOT THE COMPOSITOR'S: a resize re-runs
+ * `on_layout`, and that function means two different things across this tree.
+ * Most apps build their widgets in it; the editor only REPOSITIONS widgets it
+ * created when the window opened.  Clearing the list for the second kind would
+ * hand it freed pointers to write coordinates into, so the compositor cannot
+ * safely decide — the app knows which it is.
+ *
+ * Skipping it in a building `on_layout` is the bug this exists for: every
+ * resize left a whole second set of widgets behind the new one, still drawn at
+ * the old geometry and still answering clicks there. */
+void gui_window_clear_widgets(struct gui_window* win);
+
+/* Diagnostics for the above: how many widgets each app window holds, and a way
+ * to force the re-layout a resize would cause.  `gui widgets` / `gui relayout`.
+ * The count is the test — a duplicated widget list is invisible in a
+ * screenshot, because the new widgets draw over the old ones. */
+void gui_widget_report(void);
+void gui_relayout_all(void);
+/* Count, re-layout N times, count again.  One command because a GUI window with
+ * focus stops the harness typing the second one. */
+void gui_relayout_test(int rounds);
+
 void gui_window_set_tick(struct gui_window* win,
                          void (*fn)(struct gui_window*));
 

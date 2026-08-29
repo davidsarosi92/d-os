@@ -1355,6 +1355,157 @@ static void app_widgets_free(struct gui_window* win) {
     if (win->ui_state) { kfree(win->ui_state); win->ui_state = NULL; }
 }
 
+/* Drop a window's widgets WITHOUT touching `app_ctx` or `ui_state`.
+ *
+ * THE BUG THIS EXISTS FOR, reported from use as *"the redraw is not perfect at
+ * the window edge, and there seems to be a clickable band along the scrollbar
+ * with a fragment of an icon in it"*:
+ *
+ * A resize sets `layout_pending`, and the host answers by calling `on_layout`
+ * again.  Every app's `on_layout` CREATES widgets, and `gui_window_add_widget`
+ * only ever APPENDS — so each resize left a whole second set of widgets behind
+ * the new one.  The old set was still drawn (at its old geometry, which is
+ * where the leftover pixels and the icon fragment came from) and still
+ * hit-tested by `widget_at`, which is the band that answered clicks.  It leaked
+ * the old widgets as well.
+ *
+ * `on_layout` therefore means *build this window's widgets*, and it is now
+ * always called with an EMPTY list — which is what it already assumed at
+ * creation time and what makes the two calls the same call. */
+static void app_widgets_reset(struct gui_window* win) {
+    struct widget* w = win->widgets;
+    while (w) {
+        struct widget* nx = w->next;
+        if (w->ops && w->ops->destroy) w->ops->destroy(w);
+        kfree(w);
+        w = nx;
+    }
+    win->widgets = NULL;
+    win->focusw  = NULL;
+}
+
+/* The public half: an app whose `on_layout` BUILDS widgets calls this at the
+ * top of it, so the rebuild replaces the old set instead of stacking on it.
+ *
+ * Explicit rather than automatic, because `on_layout` means two things in this
+ * tree — build, or merely reposition — and clearing the list before a
+ * repositioning one would hand it freed pointers to write coordinates into. */
+/* Per-window widget counts.
+ *
+ * THIS IS THE TEST FOR THE RE-LAYOUT BUG, and it has to be a COUNT because the
+ * defect is invisible in a screenshot: a duplicated widget list draws the new
+ * widget over the old one, so the window looks almost right — the only visible
+ * trace is a strip of stale pixels where the geometry changed and a region that
+ * answers clicks.  §M64 made the same argument for `shortcut check`: a view
+ * that draws correctly and hit-tests wrongly cannot be photographed. */
+void gui_widget_report(void) {
+    int total = 0, wins = 0;
+    kprintf("gui widgets:\n");
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+        struct gui_window* win = &windows[i];
+        if (!win->used || win->kind != WIN_APP) continue;
+        int n = 0;
+        for (struct widget* w = win->widgets; w; w = w->next) n++;
+        kprintf("  '%s'  %dx%d  %d widget(s)\n", win->title, win->w, win->h, n);
+        total += n;
+        wins++;
+    }
+    if (!wins) kprintf("  (no app windows open)\n");
+    else kprintf("  %d window(s), %d widget(s) total\n", wins, total);
+}
+
+/* Force a re-layout of every app window, as a resize would.  Exists so the
+ * count above can be taken BEFORE and AFTER without a mouse: the harness cannot
+ * drive a resize grip once a GUI window has focus, so the one path that
+ * reproduces this bug would otherwise be untestable here. */
+void gui_relayout_all(void) {
+    int n = 0;
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+        if (!windows[i].used || windows[i].kind != WIN_APP) continue;
+        windows[i].layout_pending = 1;
+        n++;
+    }
+    need_frame = 1;
+    kprintf("gui: re-layout requested for %d window(s)\n", n);
+}
+
+/* Filled by gui_relayout_test, printed by the compositor — see the note at the
+ * end of that function for why the two are not the same task. */
+static volatile int g_relay_report, g_relay_wins, g_relay_before,
+                    g_relay_after, g_relay_rounds;
+
+/* The whole regression test, in ONE command.
+ *
+ * It has to be one command because of a harness limit this project has hit
+ * before: once a GUI window takes focus the shell can no longer be typed at, so
+ * "open a panel" and "then count its widgets" cannot be two commands here.  The
+ * same constraint that made §M64's Send-to-desktop row unverifiable.
+ *
+ * Counts, re-layouts N times, counts again.  A stable total is the pass; a
+ * total that grows by the same amount each round is exactly the bug — one extra
+ * set of widgets per resize. */
+void gui_relayout_test(int rounds) {
+    if (rounds <= 0) rounds = 3;
+    int before = 0, after = 0, wins = 0;
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+        if (!windows[i].used || windows[i].kind != WIN_APP) continue;
+        wins++;
+        for (struct widget* w = windows[i].widgets; w; w = w->next) before++;
+    }
+    if (!wins) {
+        /* OPEN ONE OURSELVES rather than telling the user to.  `launch` as a
+         * separate command cannot work here: it gives the new window focus, and
+         * from that moment the harness cannot type the test.  A regression test
+         * that only a human can run is one that stops being run. */
+        const struct gui_app_def* app = gui_app_find("Control Panel");
+        if (!app) { kprintf("relayout: no app to test with\n"); return; }
+        gui_queue_launch(app);
+        task_msleep(1200);
+        for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+            if (!windows[i].used || windows[i].kind != WIN_APP) continue;
+            wins++;
+            for (struct widget* w = windows[i].widgets; w; w = w->next) before++;
+        }
+        if (!wins) { kprintf("relayout: the test window did not open\n"); return; }
+    }
+    for (int r = 0; r < rounds; r++) {
+        gui_relayout_all();
+        /* The re-layout runs on each window's OWN host task, so this has to
+         * wait for it rather than read straight back — a count taken before the
+         * host has run would pass no matter what. */
+        task_msleep(400);
+    }
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+        if (!windows[i].used || windows[i].kind != WIN_APP) continue;
+        for (struct widget* w = windows[i].widgets; w; w = w->next) after++;
+    }
+    /* HAND THE VERDICT TO THE COMPOSITOR TO PRINT, which is not fussiness.
+     *
+     * While the GUI is up the SHELL's output goes to its VC through the
+     * per-task hook and never reaches the serial line — the standing note
+     * against `gui stats`, and every automated check in this project is a grep
+     * over that line.  The compositor has no VC bound, so its kprintf goes
+     * through the console sinks and out of the serial port, which is why its
+     * own messages are in every log above.
+     *
+     * So the test computes the numbers here and lets the task that CAN be heard
+     * say them.  *A test whose result cannot be read is not a test.* */
+    g_relay_wins   = wins;
+    g_relay_before = before;
+    g_relay_after  = after;
+    g_relay_rounds = rounds;
+    g_relay_report = 1;
+    need_frame = 1;
+}
+
+void gui_window_clear_widgets(struct gui_window* win) {
+    if (!win || win->kind != WIN_APP) return;
+    /* An open popup belongs to a widget that is about to stop existing, and it
+     * owns the next click wherever it lands (§M65). */
+    if (popup.active && popup.owner == win) popup.active = 0;
+    app_widgets_reset(win);
+}
+
 static void app_dispatch_event(struct gui_window* win, const struct app_event* e) {
     /* §M26 — a Wayland-backed window forwards input to its client instead of
      * to widgets.
@@ -1487,7 +1638,25 @@ static void app_host_main(void) {
             }
             if (win->layout_pending) {
                 win->layout_pending = 0;
-                if (win->on_layout) win->on_layout(win);
+                if (win->ui_state) {
+                    /* §M65 — a declared interface is BUILT once and RE-LAID
+                     * OUT after that.  ui.h says so, and the hostless path
+                     * already did it; the host path called on_layout instead,
+                     * which for a ui_build app means describing the interface a
+                     * second time. */
+                    ui_layout(win);
+                } else if (win->on_layout) {
+                    /* NOT cleared automatically here, and that restraint is the
+                     * whole safety of this fix: `on_layout` means two different
+                     * things across this tree.  Some apps CREATE their widgets
+                     * in it; others (the editor) only REPOSITION widgets built
+                     * at open time.  Freeing the list before calling would turn
+                     * the second kind into a use-after-free — it would go on to
+                     * assign coordinates through pointers we had just released.
+                     * An app that rebuilds says so, by calling
+                     * gui_window_clear_widgets() itself. */
+                    win->on_layout(win);
+                }
                 worked = 1;
             }
             if (win->tick_pending) {
@@ -2853,6 +3022,15 @@ static void gui_compositor_main(void) {
         pump_hostless_input();
         pump_hostless_redraw();          /* §M65 — …and paint them */
         apply_pending();
+        if (g_relay_report) {
+            g_relay_report = 0;
+            kprintf("relayout: %d window(s), %d widget(s) before, %d after "
+                    "%d re-layout(s) — %s\n",
+                    g_relay_wins, g_relay_before, g_relay_after, g_relay_rounds,
+                    g_relay_before == g_relay_after
+                        ? "PASS (the set was replaced)"
+                        : "FAIL (widgets accumulated)");
+        }
         term_selection_service();       /* §M58 — repaint + copy */
         apply_mode_change();            /* §M61 — resolution, between frames */
         apply_mode_revert();            /* §M61 — …and the undo, same rule */

@@ -86,6 +86,8 @@ static void cp_on_close(struct gui_window* win) { (void)win; cp_win = NULL; }
 static void cp_layout(struct gui_window* win) {
     struct cp_state* st = (struct cp_state*)gui_window_ctx(win);
     if (!st) return;
+    /* Builds its widgets — so replace the old set (gui_window_clear_widgets). */
+    gui_window_clear_widgets(win);
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
 

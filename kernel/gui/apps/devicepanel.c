@@ -530,6 +530,10 @@ static void dm_on_close(struct gui_window* w) {
 }
 
 static void dm_layout(struct gui_window* win) {
+    /* This layout BUILDS its widgets, so it must replace the old set rather
+     * than stack a new one on top — see gui_window_clear_widgets. */
+    gui_window_clear_widgets(win);
+    dm_view = NULL; dm_detail = NULL;
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
 

@@ -153,6 +153,11 @@ static void dlg_key(struct gui_window* win, char c) {
 }
 
 static void dlg_layout(struct gui_window* win) {
+    /* Builds too, and its label is cached in a static — clearing the list
+     * without dropping that pointer would leave the countdown writing into a
+     * freed widget. */
+    gui_window_clear_widgets(win);
+    dlg_count = NULL;
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
     w_label_create(win, 10, 8, cw - 20, "Keep this display mode?");
@@ -322,6 +327,8 @@ static struct gui_window* dp_win = NULL;
 static void dp_on_close(struct gui_window* w) { (void)w; dp_win = NULL; }
 
 static void dp_layout(struct gui_window* win) {
+    /* Builds its widgets — replace, do not stack (gui_window_clear_widgets). */
+    gui_window_clear_widgets(win);
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
     if (fb_mode_count() <= 1) {
