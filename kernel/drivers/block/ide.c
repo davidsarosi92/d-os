@@ -387,9 +387,27 @@ static int ide_init(void* ctx) {
         }
     }
 
+    /* NO DISKS IS NOT A FAILURE, and returning -1 here was the same mistake as
+     * printing an error for an empty drive slot — made one level up, where it
+     * was more visible and worse.
+     *
+     * `probe` answers "is this hardware present"; the CONTROLLER is, and it
+     * came up.  `init` answers "did bring-up work"; it did.  Whether anything
+     * is PLUGGED IN is a third question, and on the machine this project boots
+     * every day the honest answer is no: the CD-ROM is ATAPI (refused above)
+     * and the data disk is virtio.  Reporting that ordinary configuration as
+     * `init failed` puts a red row in the device manager for a machine with
+     * nothing wrong with it — and a list that cries wolf about the normal case
+     * is one nobody reads for the abnormal one.
+     *
+     * Returning 0 also leaves the driver RUNNING, which is what lets §M66's
+     * rescan attach a disk that appears later; a failed driver would have to be
+     * started by hand first. */
     if (!g_ndisks) {
-        kprintf("ide: controller present, no ATA disk attached\n");
-        return -1;
+        kprintf("ide: controller ready, no ATA disk attached "
+                "(a CD-ROM is ATAPI and does not count)\n");
+        klog(KLOG_INFO, "ide", "controller up, no ATA disk\n");
+        return 0;
     }
     klog(KLOG_INFO, "ide", "%d ATA disk(s) on the legacy ports\n", g_ndisks);
     return 0;
