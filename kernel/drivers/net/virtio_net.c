@@ -39,6 +39,7 @@
 #include "pmm.h"
 #include "printf.h"
 #include "driver.h"
+#include "hwdev.h"
 #include "idt.h"                                /* irq_install, struct int_frame */
 #include <stdint.h>
 #include <stddef.h>
@@ -382,4 +383,7 @@ static const struct driver_ops vnet_ops = {
 
 /* DMA-capable — the virtqueues are memory the device reads and writes on its
  * own.  Not boot-critical: the machine boots and runs with no network. */
+DRIVER_MATCH(m_vnet) = { .driver = "virtio_net",
+                         .vendor = VIRTIO_VENDOR, .device = VIRTIO_NET_DEVICE };
+
 DRIVER_EX(virtio_net, "net", &vnet_ops, NULL, DOMAIN_KERNEL, DRVF_DMA);

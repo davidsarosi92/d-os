@@ -658,6 +658,7 @@ CORE_C_SRCS := \
     kernel/core/console.c \
     kernel/core/module.c \
     kernel/core/driver.c \
+    kernel/core/hwdev.c \
     kernel/core/domain.c \
     kernel/core/iommu.c \
     kernel/core/drvguard.c \
@@ -800,6 +801,7 @@ CORE_C_SRCS := \
     kernel/core/block_cache.c \
     kernel/core/config.c \
     kernel/core/driver.c \
+    kernel/core/hwdev.c \
     kernel/core/domain.c \
     kernel/core/iommu.c \
     kernel/core/drvguard.c \
@@ -888,6 +890,7 @@ CORE_C_SRCS := \
     kernel/core/console.c \
     kernel/core/module.c \
     kernel/core/driver.c \
+    kernel/core/hwdev.c \
     kernel/core/domain.c \
     kernel/core/iommu.c \
     kernel/core/drvguard.c \

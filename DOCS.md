@@ -10852,6 +10852,68 @@ VT-d body's helpers sat outside their `#if`, giving aarch64 a page of "defined b
 not used": noise in a build is where the next real warning hides (§M57).  All
 three arches build silent.
 
+#### THEN IT WAS TURNED AROUND: THE LIST IS OF HARDWARE, NOT OF DRIVERS
+
+Asked from use, and the question exposes the whole thing: *what about a device
+that has no driver?*  In a driver-centric list it is **not a row at all** — no
+registry entry, nothing probing it, nothing logging it — so the one case where a
+person has to go and FIND a driver was the one case nothing reported.  *A list of
+drivers cannot describe the hardware it does not cover.*
+
+`kernel/core/hwdev.c` enumerates the machine instead: the PCI bus, then platform
+devices, then the drivers whose hardware is absent.  One row per piece of
+hardware, with its driver's facts alongside — or, pointedly, `(none)` and
+`needs a driver`.
+
+**TWO SECTIONS, because they are two questions.**  `PRESENT` (here now, with or
+without a driver) and `NOT PRESENT` (we have a driver and the hardware is
+absent).  Collapsing them loses the difference between *nothing is driving this*
+and *there is nothing to drive* — identical in a State column, opposite in what
+they ask you to do (§M23's three sound icons, §M66's stopped-vs-quarantined).
+
+**NAMING: THREE SOURCES, AND THE MIDDLE ONE IS THE MECHANISM.**  An exact
+(vendor, device) table is a courtesy; the **PCI class code** is what makes the
+feature work, because every device carries one — so hardware nobody has taught us
+about is still `SATA controller` rather than two hex numbers, and that is exactly
+the hardware most in need of a name.  The full PCI ID database is deliberately
+not shipped: megabytes, goes stale, and answers a question the class code already
+answers well enough.
+
+**WHICH DRIVER CLAIMS WHAT IS DECLARED BY THE DRIVER.**  `DRIVER_MATCH()` is a
+linker-section registry next to each driver (the `DRIVER()` / `CONFIG_KEY()`
+shape).  A table in the panel would make the device manager accumulate knowledge
+of every driver in the tree — the thing §M63's registries exist to prevent — and
+would go stale silently the first time a driver learned a new ID.  It matches
+**by ID or by CLASS**, because xHCI claims any USB 3 controller and has never
+cared who made it: an interface that expressed only the easy case would be wrong
+for the first general driver to use it.
+
+**The list re-enumerates on the window tick**, not once at open: §M66 made
+hot-plug real, and a device manager that must be closed and reopened to notice
+new hardware is the one thing it must not be.
+
+**What it found immediately, on an ordinary boot:** five present devices with no
+driver at all, none of them previously visible anywhere — the host bridge, the
+ISA bridge, the IDE controller, the PM controller and the VGA.  And on q35,
+`Intel ICH9 SATA controller (AHCI)  0:1f.2  8086:2922  (none)  needs a driver` —
+which is the next item on the work plan, now a fact the machine reports about
+itself rather than a claim in a document.
+
+**Three display bugs, each found by reading the output:**
+
+* `— none —` used an em-dash, and the console pads by BYTE count: twelve bytes
+  to eight columns, so every later cell in the row slid sideways.  *A table whose
+  alignment depends on the encoding of one cell will come apart again* — ASCII
+  `(none)` now.
+* `Runs in` said `kernel` for hardware that is not present, because `dp_where`
+  answers "kernel" for any driver not placed in ring 3.  That is a claim about a
+  thing which is not happening; both it and the isolation verdict are now blank
+  unless the driver is actually running.
+* A never-probed driver with no bus claim was filed under "hardware we have not
+  got".  The loopback interface is as present as the machine is — it is a
+  SOFTWARE device that has not been started, and calling it absent is simply
+  false.
+
 #### Open
 
 * The panel is verified headlessly and by construction (the command walks its
@@ -10859,6 +10921,19 @@ three arches build silent.
   once a GUI window has focus — the same limit §M64's "Send to desktop" row hit.
 * `iommu_release` returns a device to identity; an empty domain would be safer
   for a device caught mid-DMA and would need a way to put it back.
+* **A §M67 MODULE'S `DRIVER_MATCH` IS INVISIBLE TO THE KERNEL.**  A module carries
+  its own `driver_matches` section and the loader does not merge it, so
+  module-provided drivers have no declared hardware name — which is why `hda` and
+  `loopback` show `audio` and `net` where built-in drivers show a real name.  The
+  fix is for `modload` to register a module's matches the way `driver_attach`
+  registers its driver; the registry stopped being a plain linker-section walk for
+  exactly this reason when §M67 landed, and this section has not caught up.
+* **Driver swap / update / browse per device is NOT built** — asked for and
+  explicitly scoped as later.  The device-centric list is its prerequisite: you
+  cannot offer to install a driver for a device you cannot see.
+* The GUI table has no section headers (the table view has none), so the two
+  groups are carried by ordering plus the `Where` and `State` columns
+  (`offline` / `not present`).  The shell command prints the real headings.
 
 ---
 

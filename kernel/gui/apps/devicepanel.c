@@ -68,6 +68,7 @@
 #include "drvuser.h"
 #include "drvrt.h"
 #include "domain.h"
+#include "hwdev.h"
 #include "printf.h"
 #include <stddef.h>
 
@@ -90,6 +91,17 @@ static int put_int(char* out, int cap, int n, int v) {
     int k = 0;
     if (!v) d[k++] = '0';
     while (v && k < 12) { d[k++] = (char)('0' + v % 10); v /= 10; }
+    while (k && n < cap - 1) out[n++] = d[--k];
+    if (n < cap) out[n] = 0;
+    return n;
+}
+
+static int put_hex(char* out, int cap, int n, unsigned v) {
+    static const char* dig = "0123456789abcdef";
+    char d[8];
+    int k = 0;
+    if (!v) d[k++] = '0';
+    while (v && k < 8) { d[k++] = dig[v & 0xF]; v >>= 4; }
     while (k && n < cap - 1) out[n++] = d[--k];
     if (n < cap) out[n] = 0;
     return n;
@@ -135,32 +147,61 @@ static void dp_where(struct driver* d, char* out, int cap) {
 }
 
 /* ---------------------------------------------------------------- */
-/* The model.                                                        */
+/* The model — ONE ROW PER PIECE OF HARDWARE.                        */
+/*                                                                   */
+/* This started driver-centric and was wrong in a way that only      */
+/* showed once somebody asked the obvious question: *what if the     */
+/* device has no driver?*  In a driver list it is not a row at all,  */
+/* so the one case where a person has to go and FIND a driver was    */
+/* the one case nothing reported.  A list of drivers cannot describe */
+/* the hardware it does not cover.                                   */
 /* ---------------------------------------------------------------- */
 
-enum { COL_NAME = 0, COL_CLASS, COL_STATE, COL_WHERE, COL_ISO, COL_RESTARTS,
-       COL_HOLDS, COL__COUNT };
+enum { COL_HW = 0, COL_ADDR, COL_ID, COL_DRIVER, COL_STATE, COL_WHERE,
+       COL_ISO, COL_HOLDS, COL__COUNT };
 
-static int dm_count(void* ctx) { (void)ctx; return driver_count_all(); }
+/* Re-scanned on a tick, not on every cell: `get`/`cell` are called once per
+ * column per row per repaint, and a PCI walk per cell would be hundreds of
+ * config-space reads a frame. */
+#define DM_MAX_HW 48
+static struct hw_device dm_hw[DM_MAX_HW];
+static int              dm_nhw = 0;
 
-static char dm_label[64];
+static void dm_rescan(void) { dm_nhw = hw_enumerate(dm_hw, DM_MAX_HW); }
+
+static int dm_count(void* ctx) { (void)ctx; return dm_nhw; }
+
+/* The driver behind row `i`, or NULL.  Two things can be true and neither
+ * implies the other: hardware can be present with no driver, and a driver can
+ * be registered with no hardware. */
+static struct driver* dm_drv_at(int i) {
+    if (i < 0 || i >= dm_nhw || !dm_hw[i].driver) return NULL;
+    return driver_find(dm_hw[i].driver);
+}
+
+static char dm_label[80];
 
 static int dm_get(void* ctx, int i, struct item_entry* out) {
     (void)ctx;
-    struct driver* d = driver_at(i);
-    if (!d) return -1;
-    /* The list/grid views show one line, so it carries the two facts a person
-     * scanning for trouble needs: the name and the state. */
-    int n = put(dm_label, sizeof dm_label, 0, d->name);
+    if (i < 0 || i >= dm_nhw) return -1;
+    struct hw_device* h = &dm_hw[i];
+    struct driver* d = dm_drv_at(i);
+
+    /* The single line the list and grid views get carries the two facts that
+     * decide whether this row needs attention: what it is, and whether
+     * anything is driving it. */
+    int n = put(dm_label, sizeof dm_label, 0, h->name);
     n = put(dm_label, sizeof dm_label, n, " — ");
-    n = put(dm_label, sizeof dm_label, n, dp_state(driver_state(d)));
+    if (!h->online)   n = put(dm_label, sizeof dm_label, n, "not present");
+    else if (!d)      n = put(dm_label, sizeof dm_label, n, "NO DRIVER");
+    else              n = put(dm_label, sizeof dm_label, n, dp_state(driver_state(d)));
     (void)n;
+
     out->label = dm_label;
-    out->sub   = d->class;
+    out->sub   = h->driver;
     out->icon  = ICON_CHIP;
-    /* Dimmed = not running.  The one visual difference that survives being
-     * squinted at from across the room. */
-    out->dim   = (driver_state(d) & DRV_S_INITED) ? 0 : 1;
+    /* Dimmed = nothing is running against it, for either reason. */
+    out->dim   = (d && (driver_state(d) & DRV_S_INITED)) ? 0 : 1;
     return 0;
 }
 
@@ -169,33 +210,95 @@ static int dm_columns(void* ctx) { (void)ctx; return COL__COUNT; }
 static const char* dm_col_title(void* ctx, int c) {
     (void)ctx;
     switch (c) {
-    case COL_NAME:     return "Device";
-    case COL_CLASS:    return "Class";
-    case COL_STATE:    return "State";
-    case COL_WHERE:    return "Runs in";
-    case COL_ISO:      return "Isolation";
-    case COL_RESTARTS: return "Restarts";
-    case COL_HOLDS:    return "Holds";
+    case COL_HW:     return "Hardware";
+    case COL_ADDR:   return "Where";
+    case COL_ID:     return "ID";
+    case COL_DRIVER: return "Driver";
+    case COL_STATE:  return "State";
+    case COL_WHERE:  return "Runs in";
+    case COL_ISO:    return "Isolation";
+    case COL_HOLDS:  return "Holds";
     }
     return "";
 }
 
 static int dm_col_weight(void* ctx, int c) {
     (void)ctx;
-    return (c == COL_WHERE || c == COL_HOLDS) ? 2 : 1;
+    return (c == COL_HW || c == COL_WHERE) ? 2 : 1;
+}
+
+/* "0:3.0" — the PCI address, which is what a person compares against the
+ * hypervisor's own device list.  Hex without width specifiers (this printf has
+ * none), and the punctuation carries the structure. */
+static int put_bdf(char* out, int cap, int n, uint16_t bdf) {
+    n = put_hex(out, cap, n, (unsigned)(bdf >> 8));
+    n = put(out, cap, n, ":");
+    n = put_hex(out, cap, n, (unsigned)((bdf >> 3) & 0x1F));
+    n = put(out, cap, n, ".");
+    n = put_hex(out, cap, n, (unsigned)(bdf & 7));
+    return n;
 }
 
 static int dm_cell(void* ctx, int i, int c, char* out, int cap) {
     (void)ctx;
-    struct driver* d = driver_at(i);
-    if (!d || cap <= 0) return -1;
+    if (i < 0 || i >= dm_nhw || cap <= 0) return -1;
+    struct hw_device* h = &dm_hw[i];
+    struct driver* d = dm_drv_at(i);
     out[0] = 0;
+
     switch (c) {
-    case COL_NAME:  put(out, cap, 0, d->name); break;
-    case COL_CLASS: put(out, cap, 0, d->class ? d->class : "?"); break;
-    case COL_STATE: put(out, cap, 0, dp_state(driver_state(d))); break;
-    case COL_WHERE: dp_where(d, out, cap); break;
+    case COL_HW: put(out, cap, 0, h->name); break;
+
+    case COL_ADDR:
+        if (!h->online)     put(out, cap, 0, "offline");
+        else if (h->is_pci) put_bdf(out, cap, 0, h->bdf);
+        else                put(out, cap, 0, "platform");
+        break;
+
+    case COL_ID:
+        if (h->is_pci) {
+            int n = put_hex(out, cap, 0, h->vendor);
+            n = put(out, cap, n, ":");
+            put_hex(out, cap, n, h->device);
+        }
+        break;
+
+    case COL_DRIVER:
+        /* THE ROW THAT MATTERS.  Present hardware with nothing claiming it is
+         * the only thing in this table that asks the user to go and do
+         * something, so it says so in words rather than being blank — a blank
+         * cell reads as "not applicable", which is the opposite. */
+        if (h->driver)      put(out, cap, 0, h->driver);
+        /* ASCII, deliberately.  The console pads columns by BYTE count and an
+         * em-dash is three bytes to one column, so "— none —" was twelve bytes
+         * wide and eight columns wide and pushed the rest of the row sideways.
+         * A table whose alignment depends on the encoding of one cell is a
+         * table that will come apart again. */
+        else if (h->online) put(out, cap, 0, "(none)");
+        break;
+
+    case COL_STATE:
+        if (!h->online)  put(out, cap, 0, "not present");
+        else if (!d)     put(out, cap, 0, "needs a driver");
+        /* State 0 is "nothing has probed this yet" — §M67 attaches a module
+         * without starting it.  `dp_state` prints "-" for that, which is the
+         * driver registry's shorthand and tells a person nothing. */
+        else if (driver_state(d) == 0) put(out, cap, 0, "not started");
+        else             put(out, cap, 0, dp_state(driver_state(d)));
+        break;
+
+    case COL_WHERE:
+        /* Only where something is actually RUNNING.  `dp_where` answers
+         * "kernel" for any driver that is not placed in ring 3, which for a
+         * driver whose hardware is absent is a claim about a thing that is not
+         * happening. */
+        if (d && (driver_state(d) & DRV_S_INITED)) dp_where(d, out, cap);
+        break;
+
     case COL_ISO: {
+        /* Same rule: an isolation verdict about a driver that is not running
+         * describes nothing. */
+        if (!d || !(driver_state(d) & DRV_S_INITED)) break;
         enum domain_isolation iso =
             domain_isolation_of(driver_domain(d),
                                 (d->flags & DRVF_DMA) ? 1 : 0,
@@ -203,8 +306,8 @@ static int dm_cell(void* ctx, int i, int c, char* out, int cap) {
         put(out, cap, 0, domain_isolation_name(iso));
         break;
     }
-    case COL_RESTARTS: put_int(out, cap, 0, drvuser_restarts(d->name)); break;
-    case COL_HOLDS:    drv_res_summary(d->name, out, cap); break;
+
+    case COL_HOLDS: if (d) drv_res_summary(d->name, out, cap); break;
     default: return -1;
     }
     return 0;
@@ -246,11 +349,12 @@ static char dm_sel_name[32];
 static void dm_remember(int idx) {
     dm_sel = idx;
     dm_sel_name[0] = 0;
-    struct driver* d = driver_at(idx);
-    if (!d || !d->name) return;
+    if (idx < 0 || idx >= dm_nhw) return;
+    const char* nm = dm_hw[idx].driver;
+    if (!nm) return;            /* hardware with no driver: nothing to act on */
     int i = 0;
-    for (; d->name[i] && i < (int)sizeof dm_sel_name - 1; i++)
-        dm_sel_name[i] = d->name[i];
+    for (; nm[i] && i < (int)sizeof dm_sel_name - 1; i++)
+        dm_sel_name[i] = nm[i];
     dm_sel_name[i] = 0;
 }
 
@@ -267,11 +371,34 @@ static struct driver* dm_selected(void) {
  * decisions (§M33 stage 5). */
 static void dm_refresh_detail(void) {
     if (!dm_detail) return;
+    if (dm_sel < 0 || dm_sel >= dm_nhw) {
+        w_label_set(dm_detail, "Select a device.");
+        return;
+    }
+    struct hw_device* h = &dm_hw[dm_sel];
     struct driver* d = dm_selected();
-    if (!d) { w_label_set(dm_detail, "Select a device."); return; }
 
     char msg[96];
-    int n = put(msg, sizeof msg, 0, d->name);
+    int n = put(msg, sizeof msg, 0, h->name);
+
+    if (!h->online) {
+        n = put(msg, sizeof msg, n, " — not present; the driver is here if it "
+                                    "ever is");
+        (void)n;
+        w_label_set(dm_detail, msg);
+        return;
+    }
+    if (!d) {
+        /* The one row that asks for an action, so it gets the sentence rather
+         * than a state word. */
+        n = put(msg, sizeof msg, n, " — present, and nothing here drives it");
+        (void)n;
+        w_label_set(dm_detail, msg);
+        return;
+    }
+
+    n = put(msg, sizeof msg, n, " — driver ");
+    n = put(msg, sizeof msg, n, d->name);
     n = put(msg, sizeof msg, n, " v");
     n = put(msg, sizeof msg, n, d->version ? d->version : "?");
 
@@ -361,6 +488,12 @@ static void dm_tick(struct gui_window* win) {
     if (!dm_dirty && (++dm_ticks & 1)) return;
     dm_ticks = 0;
     dm_dirty = 0;
+    /* Re-enumerate, not just repaint.  §M66 made hot-plug real, so a device can
+     * APPEAR while this window is open — and a device manager that has to be
+     * closed and reopened to notice new hardware is the one thing it must not
+     * be.  The user asked for exactly this: if something changes, it has to
+     * show here immediately. */
+    dm_rescan();
     /* A driver that has LEFT the registry (rmmod) clears the selection, rather
      * than leaving buttons pointing at a name nothing answers to. */
     if (dm_sel_name[0] && !driver_find(dm_sel_name)) {
@@ -382,6 +515,7 @@ static void dm_layout(struct gui_window* win) {
     gui_window_content_size(win, &cw, &ch);
 
     const int bar = 30;                 /* the action row at the bottom */
+    dm_rescan();
     dm_view = w_itemview_create(win, 6, 6, cw - 12, ch - bar - 28,
                                 &dm_model,
                                 config_get("devices.view", "table"), NULL);
@@ -433,27 +567,66 @@ void devices_cmd(const char* args) {
     while (args && *args == ' ') args++;
 
     if (args && *args && !dev_streq(args, "list")) {
-        kprintf("devices — the device manager's table, on the console\n");
+        kprintf("devices — the hardware in this machine, and what drives it\n");
         kprintf("usage: devices [list]\n");
         kprintf("(actions live on `drv`: start | stop | domain | crash)\n");
         return;
     }
 
-    static const int width[COL__COUNT] = { 12, 8, 12, 24, 10, 8, 20 };
+    dm_rescan();
 
-    for (int c = 0; c < COL__COUNT; c++) col(dm_col_title(NULL, c), width[c]);
-    kprintf("\n");
+    static const int width[COL__COUNT] = { 34, 9, 10, 12, 15, 22, 10, 18 };
 
-    int n = dm_count(NULL);
-    for (int i = 0; i < n; i++) {
-        for (int c = 0; c < COL__COUNT; c++) {
-            char cell[48];
-            if (dm_cell(NULL, i, c, cell, sizeof cell) != 0) cell[0] = 0;
-            col(cell, width[c]);
-        }
-        kprintf("\n");
+    /* TWO SECTIONS, because they are two different questions and one list
+     * cannot ask both.  "Present and nothing drives it" means go and find a
+     * driver; "we have a driver and the hardware is not here" means nothing at
+     * all.  A single State column makes them look like neighbouring degrees of
+     * the same problem. */
+    int online = 0, offline = 0, undriven = 0;
+    for (int i = 0; i < dm_nhw; i++) {
+        if (!dm_hw[i].online) { offline++; continue; }
+        online++;
+        if (!dm_hw[i].driver) undriven++;
     }
-    kprintf("%d device(s)\n", n);
+
+    for (int pass = 0; pass < 2; pass++) {
+        int want_online = (pass == 0);
+        int shown = 0;
+        for (int i = 0; i < dm_nhw; i++) {
+            if (!!dm_hw[i].online != want_online) continue;
+            if (!shown) {
+                kprintf("\n%s:\n", want_online
+                        ? "PRESENT — hardware this machine has"
+                        : "NOT PRESENT — hardware we could drive and have not got");
+                for (int c = 0; c < COL__COUNT; c++) {
+                    /* The offline half has no bus address and no IDs, so its
+                     * header does not pretend to. */
+                    if (!want_online && (c == COL_ADDR || c == COL_ID)) continue;
+                    col(dm_col_title(NULL, c), width[c]);
+                }
+                kprintf("\n");
+            }
+            shown++;
+            for (int c = 0; c < COL__COUNT; c++) {
+                if (!want_online && (c == COL_ADDR || c == COL_ID)) continue;
+                char cell[64];
+                if (dm_cell(NULL, i, c, cell, sizeof cell) != 0) cell[0] = 0;
+                col(cell, width[c]);
+            }
+            kprintf("\n");
+        }
+        if (!shown)
+            kprintf("\n%s: none\n", want_online ? "PRESENT" : "NOT PRESENT");
+    }
+
+    kprintf("\n%d present (%d with no driver), %d known but absent\n",
+            online, undriven, offline);
+    /* Say what to DO about it, once, at the bottom — the count above is a fact
+     * and this is the action it implies, and running them together in every row
+     * would bury both. */
+    if (undriven)
+        kprintf("hardware with no driver is not a fault; it means this system "
+                "has nothing that claims it\n");
 }
 
 SETTINGS_PANEL(sp_devices) = {

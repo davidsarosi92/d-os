@@ -38,6 +38,7 @@
 #include "pmm.h"
 #include "printf.h"
 #include "driver.h"
+#include "hwdev.h"
 #include "idt.h"       /* irq_install, struct int_frame */
 #include "task.h"      /* task_msleep — a wait must not cost a CPU */
 #include "timer.h"     /* timer_ticks_ms — the drain deadline is real time */
@@ -518,4 +519,7 @@ static const struct driver_ops ac97_ops = {
 };
 
 /* DMA-capable: the BDL is a list of physical addresses the card reads. */
+DRIVER_MATCH(m_ac97) = { .driver = "ac97",
+                         .vendor = AC97_VENDOR, .device = AC97_DEVICE };
+
 DRIVER_EX(ac97, "audio", &ac97_ops, NULL, DOMAIN_KERNEL, DRVF_DMA);

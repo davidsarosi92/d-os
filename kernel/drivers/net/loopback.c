@@ -39,6 +39,7 @@
 
 #include "net.h"
 #include "driver.h"
+#include "hwdev.h"
 #include "printf.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -185,5 +186,7 @@ static struct driver lo_driver = {
 
 DOS_MODULE("loopback", &lo_driver, NULL, NULL);
 #else
+DRIVER_MATCH(m_lo) = { .driver = "loopback", .name = "loopback network interface" };
+
 DRIVER(loopback, "net", &lo_ops, NULL);
 #endif

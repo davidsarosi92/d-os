@@ -550,6 +550,12 @@ static void invalidate_all(void) {
         if (!(*(volatile uint32_t*)(g_regs + iotlb + 4) & (1u << 31))) break;
 }
 
+#endif /* x86 — the region resumes after iommu_enable */
+
+/* PUBLIC ENTRY POINTS CARRY THEIR OWN GUARD and must not sit inside the x86-only
+ * region: swallowing one whole makes the arch that cannot do the work fail to
+ * LINK rather than fail to enable, and the error names a symbol rather than a
+ * capability.  This one did exactly that on the first attempt. */
 int iommu_enable(void) {
 #if !defined(__i386__) && !defined(__x86_64__)
     return -1;
@@ -621,6 +627,8 @@ int iommu_enable(void) {
     return 0;
 #endif
 }
+
+#if defined(__i386__) || defined(__x86_64__)
 
 /* One device's own domain, remembered so a second grant ADDS to it.
  *

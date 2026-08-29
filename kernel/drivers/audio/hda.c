@@ -49,6 +49,7 @@
 #include "printf.h"
 #include "klog.h"
 #include "driver.h"
+#include "hwdev.h"
 #include "task.h"
 #include "timer.h"
 #include "idt.h"       /* irq_install, struct int_frame */
@@ -726,5 +727,13 @@ static struct driver hda_driver = {
 
 DOS_MODULE("hda", &hda_driver, NULL, NULL);
 #else
+/* TWO declarations, because this driver really does claim two devices — the
+ * registry is a list, not a single ID, precisely so a driver need not choose
+ * one of the controllers it supports. */
+DRIVER_MATCH(m_hda_ich6) = { .driver = "hda",
+                             .vendor = HDA_VENDOR_INTEL, .device = HDA_DEV_ICH6 };
+DRIVER_MATCH(m_hda_ich9) = { .driver = "hda",
+                             .vendor = HDA_VENDOR_INTEL, .device = HDA_DEV_ICH9 };
+
 DRIVER_EX(hda, "audio", &hda_ops, NULL, DOMAIN_KERNEL, DRVF_DMA);
 #endif

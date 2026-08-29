@@ -61,6 +61,7 @@
 #include "printf.h"
 #include "module.h"
 #include "driver.h"
+#include "hwdev.h"
 #include "timer.h"
 #include "lock.h"
 #include "workqueue.h"
@@ -1007,4 +1008,10 @@ static const struct driver_ops xhci_ops = {
 /* DMA-capable (command/event rings and transfer buffers are all device-visible
  * memory).  Not boot-critical — every PC target also has PS/2, which is why
  * §M49 had to add a one-shot marker to prove the USB path works at all. */
+/* BY CLASS, NOT BY ID — this driver has never cared who made the controller,
+ * and its probe already scans for class 0x0C subclass 0x03.  Declaring it as a
+ * fixed vendor:device pair would be a different (and wrong) claim. */
+DRIVER_MATCH(m_xhci) = { .driver = "xhci", .vendor = HW_ANY_VENDOR,
+                         .cls = 0x0C, .sub = 0x03 };
+
 DRIVER_EX(xhci, "usb-host", &xhci_ops, NULL, DOMAIN_KERNEL, DRVF_DMA);

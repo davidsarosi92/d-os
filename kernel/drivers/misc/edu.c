@@ -59,6 +59,7 @@
 
 #ifndef DRV_USERSPACE
 #include "driver.h"
+#include "hwdev.h"
 #include "pci.h"
 #endif
 #include "drvrt.h"
@@ -294,6 +295,9 @@ static const struct driver_ops edu_ops = {
 /* DOMAIN_KERNEL | DOMAIN_USER, and DRVF_DMA because it is one — which is what
  * makes it the first driver whose placement raises the isolation question with
  * a real answer rather than a note. */
+DRIVER_MATCH(m_edu) = { .driver = "edu",
+                        .vendor = EDU_VENDOR, .device = EDU_DEVICE };
+
 DRIVER_EX(edu, "misc", &edu_ops, NULL, DOMAIN_KERNEL | DOMAIN_USER, DRVF_DMA);
 #endif
 

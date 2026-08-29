@@ -56,6 +56,7 @@
 #include "kmalloc.h"
 #include "printf.h"
 #include "driver.h"
+#include "hwdev.h"
 #include "devfs.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -446,5 +447,11 @@ static const struct driver_ops vblk_ops = {
  * is any process substrate to move it into, and DMA-capable: the device writes
  * into memory by itself, so ring 3 without an IOMMU would be a placement, not
  * an isolation. */
+/* What this driver drives, declared where the driver is (hwdev.h).  Without
+ * it the device manager can see the hardware and cannot say what should be
+ * driving it. */
+DRIVER_MATCH(m_vblk) = { .driver = "virtio_blk",
+                         .vendor = VIRTIO_VENDOR, .device = VIRTIO_BLK_DEVICE };
+
 DRIVER_EX(virtio_blk, "block", &vblk_ops, NULL,
           DOMAIN_KERNEL, DRVF_BOOT_CRITICAL | DRVF_DMA);

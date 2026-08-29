@@ -13,6 +13,7 @@
  * ============================================================================= */
 
 #include "driver.h"
+#include "hwdev.h"
 #include <stddef.h>
 
 static int null_probe(void* ctx) { (void)ctx; return 0; }
@@ -23,5 +24,7 @@ static const struct driver_ops null_ops = {
     .init     = null_init,
     .shutdown = NULL,
 };
+
+DRIVER_MATCH(m_null) = { .driver = "null", .name = "null device (/dev/null)" };
 
 DRIVER(null, "char", &null_ops, NULL);

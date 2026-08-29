@@ -144,6 +144,15 @@ SECTIONS
         __stop_config_keys = .;
     }
 
+    /* Which PCI IDs a driver claims (hwdev.h) — declared NEXT TO THE DRIVER so
+       the device manager never accumulates knowledge of the whole tree. */
+    .driver_matches : ALIGN(8)
+    {
+        __start_driver_matches = .;
+        KEEP(*(driver_matches))
+        __stop_driver_matches = .;
+    }
+
     .shell_providers : ALIGN(8)
     {
         __start_shell_providers = .;

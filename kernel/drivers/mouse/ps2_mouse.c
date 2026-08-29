@@ -77,6 +77,7 @@ void kprintf(const char* fmt, ...);
 #include "hal_api.h"
 #include "drvrt.h"
 #include "driver.h"
+#include "hwdev.h"
 #include "task.h"
 #include "printf.h"
 #endif
@@ -439,6 +440,11 @@ static const struct driver_ops mouse_ops = {
  * driver-runtime API and compiles for both sides.  A driver that still calls
  * `outb` directly must not claim this, which is why the default stays
  * kernel-only and why the claim is in the source rather than in config. */
+/* A PLATFORM device: on no enumerable bus, so its name has no other source.
+ * vendor 0 says "this is a name, not a bus claim". */
+DRIVER_MATCH(m_ps2m) = { .driver = "ps2_mouse",
+                         .name = "PS/2 mouse (8042 aux port)" };
+
 DRIVER_EX(ps2_mouse, "input", &mouse_ops, NULL,
           DOMAIN_KERNEL | DOMAIN_USER, 0);
 #endif /* DRV_USERSPACE */
