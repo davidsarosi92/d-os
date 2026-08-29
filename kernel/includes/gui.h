@@ -127,6 +127,11 @@ void gui_mode_revert(void);
 void display_cmd(const char* args);
 int  display_set_mode(int w, int h, int force);
 
+/* The device manager's table, printed (devicepanel.c).  It walks the PANEL's
+ * own model, so a headless run falsifies the panel rather than an independent
+ * re-reading of the registry that could agree while the panel is wrong. */
+void devices_cmd(const char* args);
+
 /* §M61 — a window-level cooked-key hook, consulted before the focused widget.
  * The confirm dialog uses it so Enter/Esc work with nothing focused. */
 void gui_window_set_key_hook(struct gui_window* win,

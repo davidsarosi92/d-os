@@ -20,6 +20,60 @@ focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **THE DEVICE MANAGER — AND THE THREE DEFECTS A JOINED-UP VIEW FOUND
+(2026-08-29, DOCS §4.83, all 3 arches).**  §M33 shipped a great deal reachable
+only by typing: `lsdrv` for state, `drv domain` for placement and isolation,
+`drv res` for holdings, `drvuser_*` for the ring-3 half — four lists, and the one
+question a person asks (*what is this device doing and is it all right*) was
+answerable from none of them.  A **`SETTINGS_PANEL()`, NOT a `GUI_APP`**: eleven
+of twelve Start-menu slots are taken, which is the problem §M63 exists to solve —
+with a Control Panel, a new tool is a ROW.  Columns each earn their place by
+answering what the others cannot: state (**stopped** and **QUARANTINED** kept
+distinct — §M66's "the user turned it off" vs "it misbehaved"), WHERE it runs
+(**ring 3 with the pid**, because a restarted driver has a different one and that
+is where the supervisor's work becomes visible), isolation, restarts, holdings.
+It can also **start / stop / move / crash** — *a panel that can only observe
+cannot be used to test anything* (§M31's `hardlock`, §M33's `drv crash`); ONE
+"Move" button rather than two, since a pair needs one permanently greyed and a
+control whose only state is disabled is one nobody learns.  **THE `devices`
+COMMAND WALKS THE PANEL'S OWN `cell()`**, not the registry — every check here is
+a grep over a serial log, so a command that reassembled the same facts by a second
+route would pass while the panel showed something else (§M64's `shortcut check`).
+**THE THREE BUGS ARE THE ARGUMENT FOR BUILDING IT, and all three are one shape —
+a fact true in one place and absent in another, invisible while nothing compared
+them.**  (1) **ONE DRIVER, TWO NAMES:** the mouse called `drv_rt_init(&rt,
+"ps2-mouse")` against a registry and a manifest that both say `ps2_mouse`, so it
+held its resources under two different owners depending on where it ran and
+everything keyed on the owner saw two drivers.  (2) **A FAILED BRING-UP KEPT WHAT
+IT TOOK:** `edu` showed a kernel `mmio` grant while running in ring 3, left by a
+boot-time init that failed at the DMA step and returned without releasing —
+invisible for the usual reason, *the driver had failed so nobody looked at what it
+was still holding*.  (3) **A RESTART LOOP WIDENED THE IOMMU BOUNDARY, ONE GRANT
+AT A TIME.**  `iommu_confine` ACCUMULATES by design (a driver allocates its ring,
+then its data, then more later), and nothing released a dead driver's grants — so
+after N restarts its device could reach N buffers while `drv domain` still said
+`isolation full`.  *A boundary that widens quietly every time a driver crashes is
+worse than no boundary, because the reports keep agreeing with the intention.*
+New `iommu_release` returns the device to the **identity** domain and frees its
+tables — identity rather than empty on purpose: empty is safer for a device caught
+mid-DMA, but a driver moved back into the KERNEL would then find its device
+silently dead with nothing pointing at why.  Plus `drv_res_note_mmio`/`_dma`, so a
+placed driver's window and buffer live in the SAME resource table as everything
+else and the frames go back on exactly one path — which also closed the gap where
+**`drv res` listed a placed driver's ports and IRQ and silently omitted the two
+grants that matter most.**  **MEASURED:** pid and restart count move together
+across a crash (`ring 3 pid 30 … 0` → `pid 36 … 1`); under the IOMMU a crash gives
+`back in the identity domain (its own is gone)` then **`now sees ONLY … (domain
+3)`** — *the wording is the test*, since the accumulating bug produced `may ALSO
+reach` and a fresh domain number proves the old tables went back.  **ALSO
+CLEARED:** `x86_64/syscall.c` used `copy_to_user` with no declaration in scope
+(correct by luck on this arch's convention — §M57's `usock_set_owner` shape), and
+the VT-d helpers sat outside their `#if`, giving aarch64 a page of unused-function
+noise — *build noise is where the next real warning hides*.  All three arches
+build silent.  **OPEN:** the panel's BUTTONS are not pointer-verified (the harness
+cannot type once a GUI window has focus — §M64's "Send to desktop" limit).
+**NEXT: AHCI — d-os has no storage on real hardware at all today.**
+
 ◐ **§M33 TIER 0 — A DRIVER FAULT IS NO LONGER A DEAD MACHINE (2026-08-27, DOCS
 §4.82, all 3 arches).**  Stages 1-2 of §M33: the DECLARED placement capability
 and fault containment.  **`.domains` IS A CAPABILITY OF THE CODE**, `driver.

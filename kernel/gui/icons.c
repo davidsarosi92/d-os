@@ -225,6 +225,26 @@ void icon_draw(struct gfx_surface* s, int x, int y, int n, int id) {
         break;
     }
 
+    /* A chip: a square body with legs down both sides.  It is the one picture
+     * that means "a piece of hardware" rather than "a program", which is the
+     * distinction the device manager's row in the Control Panel has to make at
+     * a glance. */
+    case ICON_CHIP: {
+        tile(s, x, y, n, C_SLATE);
+        gfx_fill(s, x + 4 * u, y + 4 * u, 8 * u, 8 * u, C_WHITE);
+        gfx_fill(s, x + 6 * u, y + 6 * u, 4 * u, 4 * u, C_SLATE);   /* die */
+        /* legs — three a side, and on the top and bottom edges too, because a
+         * chip with legs on two sides only reads as a window with a border. */
+        for (int i = 0; i < 3; i++) {
+            int o = (5 + i * 3) * u;
+            gfx_fill(s, x + 2 * u, y + o, 2 * u, u, C_DIM);   /* left  */
+            gfx_fill(s, x + 12 * u, y + o, 2 * u, u, C_DIM);  /* right */
+            gfx_fill(s, x + o, y + 2 * u, u, 2 * u, C_DIM);   /* top   */
+            gfx_fill(s, x + o, y + 12 * u, u, 2 * u, C_DIM);  /* bottom*/
+        }
+        break;
+    }
+
     case ICON_INFO: {
         tile(s, x, y, n, C_TEAL);
         gfx_fill(s, x + 7 * u, y + 3 * u, 2 * u, 2 * u, C_WHITE);
@@ -270,6 +290,7 @@ static const struct { const char* name; int id; } names[] = {
     { "volume",    ICON_VOLUME    },
     { "muted",     ICON_VOLUME_MUTED },
     { "noaudio",   ICON_VOLUME_OFF },
+    { "chip",      ICON_CHIP      },
     { NULL, 0 }
 };
 

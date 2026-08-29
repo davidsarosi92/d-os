@@ -272,8 +272,10 @@ const struct iommu_info* iommu_get(void) { return &g_info; }
  * through a lie in our code, which makes it harder to see and no less false. */
 #define VIRTIO_VENDOR_ID 0x1AF4
 
+/* Guarded with its only caller (the device list inside iommu_report), for the
+ * same reason as the VT-d block below. */
+#if defined(__i386__) || defined(__x86_64__)
 static int device_bypasses(uint16_t vendor) { return vendor == VIRTIO_VENDOR_ID; }
-
 
 struct list_ctx { int translated, bypass; };
 
@@ -286,6 +288,7 @@ static void list_one(const struct pci_device* d, void* vctx) {
             bypass ? "BYPASSES the IOMMU (virtio without platform access)"
                    : "translated");
 }
+#endif
 
 void iommu_report(void) {
     const struct iommu_info* i = &g_info;
@@ -393,6 +396,14 @@ void iommu_report(void) {
 
 #define IOMMU_DOMAIN_DEFAULT  1
 #define IOMMU_DOMAIN_FIRST    2      /* restricted domains start here */
+
+/* EVERYTHING FROM HERE TO iommu_restrict IS THE VT-d IMPLEMENTATION, and it is
+ * guarded rather than merely unreachable on other arches.  §M33 already paid
+ * for the smaller version of this — helpers left outside the guard, which the
+ * aarch64 link found at once — and the residue was a page of "defined but not
+ * used" warnings on that arch.  Noise in a build is not cosmetic here: it is
+ * where the next REAL warning goes to hide (§M57). */
+#if defined(__i386__) || defined(__x86_64__)
 
 static volatile uint8_t* g_regs;
 static uint64_t* g_root;             /* 256 root entries, 2 x u64 each */
@@ -644,6 +655,8 @@ static int domain_for(uint16_t bdf, uint64_t** top, uint64_t* top_phys, int* dom
     return -1;
 }
 
+#endif /* x86 — the VT-d implementation */
+
 int iommu_restrict(uint16_t bdf, uint64_t base, uint64_t len) {
 #if !defined(__i386__) && !defined(__x86_64__)
     (void)bdf; (void)base; (void)len; return -1;
@@ -855,6 +868,71 @@ int iommu_confine(uint16_t bdf, uint64_t base, uint64_t len) {
      * unconfined, and the isolation verdict reads that. */
     if (g_info.state != IOMMU_ACTIVE) return 0;
     return iommu_restrict(bdf, base, len);
+#endif
+}
+
+#if defined(__i386__) || defined(__x86_64__)
+/* Free a domain's page tables, bottom up.  Depth is g_levels (3 or 4), so the
+ * recursion is bounded by the hardware and needs no explicit limit.
+ *
+ * A SUPERPAGE ENTRY IS A LEAF, NOT A TABLE, and descending into one would take
+ * a page of RAM to be a page table and free whatever the mappings pointed at.
+ * The identity domain is built from superpages and is never released, so this
+ * check protects a case that cannot arise today — which is exactly when it is
+ * cheap to get right. */
+static void domain_free_tree(uint64_t* tbl, int lvl) {
+    if (!tbl) return;
+    if (lvl > 1) {
+        for (int i = 0; i < 512; i++) {
+            uint64_t e = tbl[i];
+            if (!(e & SL_READ)) continue;
+            if (e & SL_SUPERPAGE) continue;
+            uint64_t cp = e & ~0xFFFull;
+            domain_free_tree((uint64_t*)phys_to_virt((uintptr_t)cp), lvl - 1);
+            pmm_free_contiguous((pmm_phys_t)cp, 1);
+        }
+    }
+    for (int i = 0; i < 512; i++) tbl[i] = 0;
+}
+#endif
+
+/* Give a device's domain back: the device returns to the identity domain and
+ * its tables are freed.
+ *
+ * THE BUG THIS FIXES IS THE ONE A RESTART LOOP CREATES.  `iommu_confine`
+ * ACCUMULATES grants into one domain, deliberately — a driver allocates its
+ * ring, then its data, then more later, and replacing instead of adding would
+ * look right in every single-buffer test and be wrong for every real driver.
+ * But a driver that DIES and is restarted allocates a fresh buffer each time,
+ * and with nothing releasing the old grant its device could reach every buffer
+ * of every previous incarnation.  After a few restarts "confined to its own
+ * buffer" is simply false, while every message still says it.
+ *
+ * Identity rather than empty on release, for a reason worth stating: an empty
+ * domain would be safer for a device caught mid-DMA, but it also means a driver
+ * moved back into the KERNEL finds its device silently dead with nothing
+ * pointing at why.  Restoring the state the device had before it was ever
+ * placed is the least surprising, and it is the same state every unplaced
+ * device on the machine is in. */
+int iommu_release(uint16_t bdf) {
+#if !defined(__i386__) && !defined(__x86_64__)
+    (void)bdf; return 0;
+#else
+    if (g_info.state != IOMMU_ACTIVE) return 0;
+    for (int i = 0; i < IOMMU_MAX_DOMAINS; i++) {
+        if (!g_dom[i].used || g_dom[i].bdf != bdf) continue;
+        /* Move the device off the tables BEFORE freeing them — the other order
+         * frees memory the unit is still allowed to walk. */
+        context_set(bdf, g_default_phys, IOMMU_DOMAIN_DEFAULT);
+        invalidate_all();
+        domain_free_tree(g_dom[i].top, g_levels);
+        pmm_free_contiguous((pmm_phys_t)g_dom[i].top_phys, 1);
+        g_dom[i].used = 0; g_dom[i].top = NULL; g_dom[i].top_phys = 0;
+        kprintf("iommu: %x:%x.%x back in the identity domain (its own is gone)\n",
+                bdf >> 8, (bdf >> 3) & 0x1F, bdf & 7);
+        return 0;
+    }
+    return 0;
 #endif
 }
 

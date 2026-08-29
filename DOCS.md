@@ -10704,7 +10704,200 @@ output, which an earlier per-attempt version read as a failed echo and
 
 ---
 
+### 4.83 The device manager, and the three defects a joined-up view found
+
+**`kernel/gui/apps/devicepanel.c`** — a `SETTINGS_PANEL()` in the Control Panel,
+plus a `devices` command on both shells.
+
+#### Why a panel and not an app
+
+The Start menu has twelve slots and eleven are taken, which is the problem §M63
+was written to solve: with a Control Panel, adding a tool is a ROW rather than an
+app.  The panel therefore costs one registry entry and no launcher space.
+
+#### Why it existed to be built at all
+
+§M33 shipped a great deal that could only be reached by typing.  `lsdrv` gave
+state, `drv domain` gave placement and isolation, `drv res` gave holdings, and
+the ring-3 half lived in `drvuser_*`.  Four commands, four lists — and the one
+question a person actually asks, *what is this device doing and is it all
+right*, was not answerable from any single one of them.
+
+Columns, each earning its place by answering something the others cannot:
+
+| Column | What only it says |
+|---|---|
+| State | OK / absent / **stopped** / **QUARANTINED** — the last two kept distinct (§M66): "the user turned it off" and "it misbehaved" are different facts |
+| Runs in | kernel, or **ring 3 with the pid** — a restarted driver has a different pid, so this is where the supervisor's work becomes visible |
+| Isolation | none / advisory / full — and it must never flatter (§M33's isolation theatre) |
+| Restarts | a quiet 0 and a quiet 7 are the same picture everywhere else |
+| Holds | ports / irq N / mmio / dma |
+
+It can also START, STOP, MOVE (kernel ↔ ring 3) and CRASH a driver, because a
+panel that can only observe cannot be used to test anything — §M31's argument for
+`hardlock` and §M33's for `drv crash`.  One "Move" button rather than two: a pair
+would need one of them greyed at all times, and a control whose only state is
+disabled is one nobody learns the meaning of.
+
+#### The shell command walks the PANEL'S model
+
+`devices` prints the rows by calling the panel's own `cell()`, not by re-reading
+the registry.  Every automated check in this project is a grep over a serial log,
+so a command that reassembled the same facts by a second route would pass while
+the panel showed something else — §M64's `shortcut check`, which prints the
+view's own hit-test answer rather than a recomputed one.
+
+#### THREE DEFECTS IT FOUND, AND FINDING THEM IS THE ARGUMENT FOR THE VIEW
+
+None of the three is a display bug.  All three are the same shape: *a fact that
+was true in one place and absent in another, invisible while nobody had a reason
+to compare them.*
+
+**1. One driver, two names.**  The Holds column was empty for the PS/2 mouse while
+`drv res` listed its ports and IRQ 12.  The mouse called `drv_rt_init(&rt,
+"ps2-mouse")` while `struct driver.name` and drvuser's manifest both say
+`ps2_mouse` — so **the same driver held its resources under two different owners
+depending on where it was running**, and everything that keys on the owner (the
+conflict detector's message, `drv res`, this column) saw two drivers.  The rule is
+now stated in `drvrt.h`: the owner string IS the registry name.
+
+**2. A failed bring-up kept what it had taken.**  `edu` showed a kernel-held
+`mmio` grant while running in RING 3 — left over from a boot-time init that had
+failed at the DMA step and returned without releasing.  Invisible for the usual
+reason: the driver had failed, so nobody looked at what it was still holding.
+Now one `fail:` label instead of five `return -1`s.  The registry cannot do this
+for a driver — it has no idea where a driver keeps its `drv_rt` — which is
+exactly the kind of obligation that gets forgotten.
+
+**3. A RESTART LOOP WIDENED THE IOMMU BOUNDARY, ONE GRANT AT A TIME.**  The
+serious one.  `iommu_confine` **accumulates** by design — a driver allocates its
+ring, then its data, then more later, and replacing instead of adding would look
+right in every single-buffer test and be wrong for every real driver.  But a
+placed driver that DIES gets a fresh buffer on restart, and nothing was taking
+the old grant away.  After N restarts its device could reach N buffers while
+`drv domain` still reported `isolation full`.  *A boundary that widens quietly
+every time a driver crashes is worse than no boundary, because the reports keep
+agreeing with the intention.*
+
+New `iommu_release(bdf)`: the device returns to the identity domain and its
+tables are freed.  **Identity rather than empty**, and the reason is worth
+stating — an empty domain would be safer for a device caught mid-DMA, but a
+driver later moved back into the KERNEL would find its device silently dead with
+nothing pointing at why.  Restoring the state the device had before it was ever
+placed is the least surprising, and is the state every unplaced device is in.
+
+The DMA frames were leaking too, and the fix is one owner rather than two:
+`drv_res_note_mmio` / `drv_res_note_dma` record a grant the kernel made in the
+DRIVER's address space, so a placed driver's window and buffer appear in the same
+resource table as everything else — and `drv_release_all` frees the frames on
+exactly one path instead of `drvuser.c` keeping a private copy of the address and
+the count.  That also closed the reporting gap underneath: `drv res` had been
+listing a placed driver's ports and IRQ while **silently omitting its register
+window and its DMA buffer**, which for a DMA driver is very nearly the whole
+answer.
+
+#### Verified
+
+* i386: the table's nine rows include both §M67 loaded modules; the Holds column
+  and `drv res` agree after the name fix (`ports, irq 12`).
+* i386, mouse placed in ring 3 then crashed: `ring 3 pid 30 … 0` becomes
+  `ring 3 pid 36 … 1` — the pid and the restart count move together, which is
+  what the two columns exist to show.
+* x86_64 + `--iommu` + `edu` in ring 3: `mmio, dma` in Holds, and `drv res` shows
+  the CPU address `50100000` against the device address `3d1d7000` — **different
+  numbers**, which is what drvrt separated them for.
+* x86_64, crash under the IOMMU: `back in the identity domain (its own is gone)`
+  then `now sees ONLY 3d16b000..3d16c000 (domain 3)`, and the restarted driver's
+  round trip is `256 bytes out and back through the device, all correct`.
+  **The wording is the test**: the accumulating bug produced `may ALSO reach` on
+  the second placement, and a fresh domain number proves the old tables went
+  back.
+
+**NOT verified, and said plainly:** that the *post-restart* escape is refused by
+the unit and recorded there.  The escape happens (the driver reports aiming 64
+KiB past its buffer), but reading the unit's fault registers needs `iommu faults`
+typed AFTER the restart, and the harness stops driving the guest at that point.
+The pre-restart refusal is what §M33 measured and is unchanged.
+
+#### A FOURTH DEFECT, CAUSED BY THE THIRD FIX, AND CAUGHT THE SAME WAY
+
+Making `du_release` give the IOMMU domain back exposed a latent bug in the
+restart path and briefly turned it into a live one.  `du_restart` re-armed the
+slot with the full `du_arm` after spawning the replacement — and `du_arm` runs
+`drv_rt_init`, which **RESETS THE RESOURCE LIST**.  The replacement reaches its
+first syscall *before* that line, which is the entire point of leaving the slot
+reserved with pid 0, so by then it had already claimed its ports, mapped its
+window and taken its DMA buffer — and all of it was orphaned: still held in the
+global table, no longer reachable from the slot, never freed.
+
+That had been a quiet leak.  It became visible when a defensive "release
+anything left over" check I had added to `du_arm` fired there and tore down the
+domain the replacement had *just* built, putting the device back in the identity
+domain seconds after it came up.  The symptom was
+`edutest: FAIL — 8 of 256 bytes came back wrong` from a driver whose own bring-up
+had reported success a line earlier.
+
+The fix is to make the restart path do exactly what the launch path does —
+record the pid and nothing else — and to delete the defensive check.  *A
+defensive check whose premise is false is worse than no check*, the premise here
+being that nothing happens between the release and the re-arm.  `du_arm` now
+belongs to `du_reserve` alone, and says so.
+
+#### Also cleared on the way
+
+`x86_64/syscall.c` used `copy_to_user` and `copy_str_from_user` with no
+declaration in scope, so the compiler assumed `int f()` — correct by luck on this
+arch's calling convention, the §M57 `usock_set_owner` shape exactly.  And the
+VT-d body's helpers sat outside their `#if`, giving aarch64 a page of "defined but
+not used": noise in a build is where the next real warning hides (§M57).  All
+three arches build silent.
+
+#### Open
+
+* The panel is verified headlessly and by construction (the command walks its
+  model); the BUTTONS are not pointer-verified, because the harness cannot type
+  once a GUI window has focus — the same limit §M64's "Send to desktop" row hit.
+* `iommu_release` returns a device to identity; an empty domain would be safer
+  for a device caught mid-DMA and would need a way to put it back.
+
+---
+
 ## 8. Change log
+
+- **2026-08-29 — THE DEVICE MANAGER, AND THE THREE DEFECTS A JOINED-UP VIEW
+  FOUND (DOCS §4.83).**  A `SETTINGS_PANEL()` (not a `GUI_APP` — eleven of twelve
+  Start-menu slots are taken, which is the problem §M63 exists to solve) showing
+  every driver's class, state, WHERE it runs, isolation, restarts and holdings,
+  with start / stop / move / crash — *a panel that can only observe cannot be
+  used to test anything*.  The `devices` command prints the rows by calling the
+  PANEL'S OWN `cell()`, so a headless run falsifies the panel rather than an
+  independent re-reading that could agree while the panel is wrong.  **THE THREE
+  BUGS ARE THE ARGUMENT FOR BUILDING IT**, and all three are one shape — a fact
+  true in one place and absent in another, invisible while nothing compared
+  them.  (1) **One driver, two names:** the mouse called `drv_rt_init(&rt,
+  "ps2-mouse")` against a registry and a manifest that both say `ps2_mouse`, so
+  it held its resources under two different owners depending on where it ran and
+  everything keyed on the owner saw two drivers.  (2) **A failed bring-up kept
+  what it took:** `edu` showed a kernel `mmio` grant while running in ring 3,
+  left by a boot-time init that failed at the DMA step and returned without
+  releasing — invisible because the driver had failed, so nobody looked at what
+  it was still holding.  (3) **A RESTART LOOP WIDENED THE IOMMU BOUNDARY:**
+  `iommu_confine` accumulates by design, but nothing released a dead driver's
+  grants, so after N restarts its device could reach N buffers while `drv domain`
+  still said `isolation full` — *a boundary that widens quietly every time a
+  driver crashes is worse than none, because the reports keep agreeing with the
+  intention.*  New `iommu_release`, plus `drv_res_note_mmio`/`_dma` so a placed
+  driver's window and buffer live in the same resource table as everything else
+  and the frames go back on exactly one path — which also closed the gap where
+  `drv res` listed a placed driver's ports and IRQ and silently omitted the two
+  grants that matter most.  **MEASURED:** the pid and restart count move together
+  across a crash (`ring 3 pid 30 … 0` → `pid 36 … 1`); under the IOMMU a crash
+  gives `back in the identity domain (its own is gone)` then **`now sees ONLY …
+  (domain 3)`** — the wording is the test, since the accumulating bug produced
+  `may ALSO reach`.  Also cleared: `x86_64/syscall.c` called `copy_to_user` with
+  no declaration in scope (correct by luck, the §M57 shape), and the VT-d
+  helpers sat outside their `#if`, giving aarch64 a page of unused-function
+  noise.  All three arches build silent.
 
 - **2026-08-29 — §M33 COMPLETE: a driver in ring 3 whose device cannot reach past
   its own buffer (DOCS §4.82).**  MMIO and DMA reachable from ring 3, and the

@@ -99,10 +99,20 @@
 #define EDU_DMA_BYTES   4096
 
 static struct drv_rt   rt;
-static drv_handle      h_mmio = -1, h_irq = -1, h_dma = -1;
+static drv_handle      h_mmio = -1, h_dma = -1;
+#ifndef DRV_USERSPACE
+/* The completion interrupt is a kernel-build convenience only: the DMA here is
+ * short and polled either way, and a placed driver would have to be granted a
+ * line it does not need. */
+static drv_handle      h_irq = -1;
+#endif
 static volatile uint8_t* regs;
+#ifndef DRV_USERSPACE
+/* Kernel build only: a placed driver never learns its own BDF, because config
+ * space reaches every device on the machine and holding it would give a ring-3
+ * driver MORE reach than the kernel one it replaced. */
 static uint16_t        edu_bdf;
-static uint32_t        edu_irqs;
+#endif
 
 /* 32- and 64-bit register access.  The DMA address registers are 64-bit and the
  * device latches on the write that completes them, so the halves are written in
@@ -160,7 +170,7 @@ static int edu_init(void* ctx) {
     h_mmio = drv_mmio_request(&rt, bar, barlen, "edu registers");
     if (h_mmio < 0) { kprintf("edu: no MMIO (%d)\n", h_mmio); return -1; }
     regs = (volatile uint8_t*)drv_mmio_ptr(h_mmio);
-    if (!regs) { kprintf("edu: MMIO mapped to nothing\n"); return -1; }
+    if (!regs) { kprintf("edu: MMIO mapped to nothing\n"); goto fail; }
 
     uint32_t id = r32(EDU_ID);
     if ((id & 0xFFFF) != 0x00ED) {
@@ -169,7 +179,7 @@ static int edu_init(void* ctx) {
          * driver that trusts the PCI ID alone would then write DMA commands
          * into whatever the window actually decodes. */
         kprintf("edu: identification register reads %x — window not decoding\n", id);
-        return -1;
+        goto fail;
     }
 
     /* Liveness: the device returns the bitwise NOT of whatever is written.  A
@@ -179,7 +189,7 @@ static int edu_init(void* ctx) {
     uint32_t back = r32(EDU_LIVENESS);
     if (back != ~0xA5A5A5A5u) {
         kprintf("edu: liveness check failed (%x)\n", back);
-        return -1;
+        goto fail;
     }
 
     /* HOW MANY ADDRESS BITS THE DEVICE HAS — a property of the INSTANCE, which
@@ -217,7 +227,7 @@ static int edu_init(void* ctx) {
     if (h_dma < 0) {
         kprintf("edu: no DMA buffer at %d address bits (%d) — this kernel has "
                 "nothing free that low\n", dma_bits, h_dma);
-        return -1;
+        goto fail;
     }
 
 #ifndef DRV_USERSPACE
@@ -236,8 +246,26 @@ static int edu_init(void* ctx) {
     klog(KLOG_INFO, "edu", "educational device ready — §M33's DMA client\n");
 #endif
     return 0;
+
+/* A FAILED BRING-UP MUST GIVE BACK WHAT IT TOOK.  Every one of these exits used
+ * to `return -1` with the MMIO window still granted, and the leak was invisible
+ * for the usual reason: the driver had failed, so nobody looked at what it was
+ * holding.  The device manager's "Holds" column is what showed it — `edu`
+ * running in RING 3 while the kernel-side table still listed an mmio grant from
+ * a boot-time init that had failed hours earlier.
+ *
+ * The registry cannot do this for us: it has no idea where a driver keeps its
+ * `drv_rt`, so releasing on a failed init is the driver's own job — which is
+ * exactly the kind of obligation that gets forgotten, and why it is one label
+ * rather than five call sites. */
+fail:
+    drv_release_all(&rt);
+    h_mmio = h_dma = -1;
+    regs = NULL;
+    return -1;
 }
 
+#ifndef DRV_USERSPACE
 static int edu_shutdown(void* ctx) {
     (void)ctx;
     if (h_mmio < 0) return 0;
@@ -248,6 +276,9 @@ static int edu_shutdown(void* ctx) {
     kprintf("edu: stopped\n");
     return 0;
 }
+#endif /* !DRV_USERSPACE — a placed driver is stopped by DRV_ESTOP + the
+        * supervisor, not by a hook the kernel would have to call across a
+        * process boundary. */
 
 #ifndef DRV_USERSPACE
 CONFIG_KEY(ck_edu_dma_bits) = {

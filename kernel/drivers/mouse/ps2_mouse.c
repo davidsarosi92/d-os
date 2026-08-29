@@ -255,7 +255,15 @@ static int mouse_module_init(void) {
      * ring-3 placement failed three times running with no message anywhere,
      * and "it exited 1" is the same sentence for six different faults. */
     int step = 0;
-    drv_rt_init(&rt, "ps2-mouse");
+    /* THE OWNER STRING MUST BE THE REGISTRY NAME.  It was "ps2-mouse" here
+     * while `struct driver` says `ps2_mouse` and drvuser's manifest says
+     * `ps2_mouse` too — so this one driver held its resources under two
+     * different owners depending on where it was running, and everything that
+     * keys on the owner (the conflict detector's message, `drv res`, the
+     * device manager's Holds column) saw two drivers.  The Holds column is
+     * what found it: `drv res` listed ports and IRQ 12 while the table for the
+     * same driver showed nothing. */
+    drv_rt_init(&rt, "ps2_mouse");
     h_ports = drv_ports_request(&rt, PS2_BASE, PS2_NPORTS, "8042 aux device");
     if (h_ports < 0) {
         kprintf("ps2-mouse: no port grant (%d)\n", h_ports);

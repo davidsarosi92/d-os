@@ -41,6 +41,12 @@
 #include "proc.h"
 #include "usermode.h"
 #include "percpu.h"   /* §M52 — this_cpu_id for the per-CPU syscall area */
+/* copy_to_user / copy_str_from_user.  §M33's driver syscalls used both without
+ * this include, so the compiler assumed `int f()` — which happens to work on
+ * this arch's calling convention and is precisely the §M57 `usock_set_owner`
+ * shape: correct by luck, and a warning standing in front of the next real
+ * one. */
+#include "vmm.h"
 #include "acpi.h"     /* ACPI_MAX_CPUS — same bound the TSS array uses */
 #include <stdint.h>
 #include <stddef.h>

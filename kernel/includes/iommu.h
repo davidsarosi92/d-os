@@ -126,6 +126,16 @@ int iommu_restrict(uint16_t bdf, uint64_t base, uint64_t len);
  * unconfined one is visible rather than assumed. */
 int iommu_confine(uint16_t bdf, uint64_t base, uint64_t len);
 
+/* The mirror of `confine`: return the device to the identity domain and free
+ * the domain it had.  Called when a driver gives its resources back.
+ *
+ * IT IS NOT OPTIONAL, because `confine` accumulates: a driver that dies and is
+ * restarted allocates a new buffer each time, and without this its device would
+ * still reach every buffer of every previous incarnation while the reports kept
+ * saying "confined to its own".  A restart loop turns that into a device with
+ * the run of memory, one grant at a time. */
+int iommu_release(uint16_t bdf);
+
 /* Is this device confined to a domain of its own (1) or sitting in the shared
  * identity domain (0)?  What the isolation verdict is allowed to consult. */
 int iommu_is_confined(uint16_t bdf);

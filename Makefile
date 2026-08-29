@@ -693,6 +693,7 @@ CORE_C_SRCS := \
     kernel/gui/settings.c \
     kernel/gui/apps/controlpanel.c \
     kernel/gui/apps/displaypanel.c \
+    kernel/gui/apps/devicepanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
     kernel/gui/apps/fileman.c \
@@ -836,6 +837,7 @@ CORE_C_SRCS := \
     kernel/gui/settings.c \
     kernel/gui/apps/controlpanel.c \
     kernel/gui/apps/displaypanel.c \
+    kernel/gui/apps/devicepanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
     kernel/gui/apps/fileman.c \
@@ -921,6 +923,7 @@ CORE_C_SRCS := \
     kernel/gui/settings.c \
     kernel/gui/apps/controlpanel.c \
     kernel/gui/apps/displaypanel.c \
+    kernel/gui/apps/devicepanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
     kernel/gui/apps/fileman.c \

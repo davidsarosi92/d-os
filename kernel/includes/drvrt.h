@@ -106,7 +106,16 @@ struct drv_rt {
 };
 
 /* Start a runtime context.  `owner` must outlive it (a string literal or the
- * driver's own name field) — it is what a conflict message quotes. */
+ * driver's own name field) — it is what a conflict message quotes.
+ *
+ * `owner` MUST BE THE REGISTRY NAME, spelled exactly as `struct driver.name`
+ * and as drvuser's manifest.  It is not merely a label: everything that asks
+ * "what does this driver hold" matches on this string, so a driver that spells
+ * it differently in one place appears to the resource table as a SECOND driver.
+ * The PS/2 mouse did exactly that — `ps2-mouse` here against `ps2_mouse` in the
+ * registry and the manifest — so its in-kernel and ring-3 placements held their
+ * ports and IRQ under two different owners.  It was invisible until something
+ * tried to join the two views up. */
 void drv_rt_init(struct drv_rt* rt, const char* owner);
 
 /* Return every resource: ports released, MMIO unmapped, IRQ handler removed,
@@ -278,7 +287,39 @@ int  drv_run(struct drv_rt* rt, const char* name, void (*body)(void));
  * task_init().  Idempotent. */
 void drvrt_start_deferred(void);
 
+/* ----------------------------------------------------------------------
+ * Recording a grant the KERNEL made on a placed driver's behalf.
+ *
+ * A ring-3 driver's MMIO window and DMA buffer are not obtained through
+ * `drv_mmio_request` / `drv_dma_request`: the kernel maps them into the
+ * DRIVER's address space, not its own, so those calls would do the wrong
+ * thing.  The consequence was that a placed driver's two most important
+ * holdings appeared in no resource table at all — `drv res` listed its ports
+ * and its IRQ and silently omitted the register window and the DMA buffer,
+ * which for a DMA driver is very nearly the whole answer.
+ *
+ * These record the grant without performing it, so ONE table answers "what
+ * does this driver hold" for both placements — and so `drv_release_all` frees
+ * the DMA frames on exactly one path instead of the caller keeping a private
+ * copy of the address and the count.
+ * ---------------------------------------------------------------------- */
+drv_handle drv_res_note_mmio(struct drv_rt* rt, uint64_t phys, uint64_t len,
+                             uintptr_t va, const char* why);
+drv_handle drv_res_note_dma(struct drv_rt* rt, uint64_t phys, uint64_t len,
+                            uintptr_t va, uint64_t dev, const char* why);
+
 /* Diagnostics: print what a driver is holding.  Backs `drv res`. */
 void drv_res_dump(void);
+
+/* The same facts as one short string — "ports, irq 12, dma" — for a caller
+ * that has a COLUMN rather than a console.  Written because the device manager
+ * needs it and `drv_res_dump` can only print: a panel that re-walked the
+ * resource table itself would be a second reader of a structure this file owns,
+ * and the two would drift the first time a resource kind is added.
+ *
+ * Always NUL-terminates.  An owner holding nothing yields an empty string
+ * rather than a word, because the caller decides how "nothing" reads in its
+ * own layout. */
+void drv_res_summary(const char* owner, char* out, int cap);
 
 #endif /* DRVRT_H */

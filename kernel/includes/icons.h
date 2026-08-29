@@ -60,6 +60,7 @@ enum icon_id {
     ICON_VOLUME,        /* audio available, audible                    */
     ICON_VOLUME_MUTED,  /* audio available, silenced by the user       */
     ICON_VOLUME_OFF,    /* no device / audio unavailable               */
+    ICON_CHIP,          /* a device / the device manager               */
     ICON__COUNT
 };
 

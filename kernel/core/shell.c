@@ -4121,6 +4121,9 @@ static void dispatch(struct vc* my_vc, const char* line) {
     /* §M61 — display mode. */
     if (streq(line, "mode"))             { display_cmd("");         return; }
     if (starts_with(line, "mode "))      { display_cmd(line + 5);   return; }
+    /* The device manager, on a console.  Same rows as the panel. */
+    if (streq(line, "devices"))          { devices_cmd("");         return; }
+    if (starts_with(line, "devices "))   { devices_cmd(line + 8);   return; }
     /* §M62 — the boot screen, and the way to test that a fault removes it. */
     if (streq(line, "splash"))           { splash_cmd("");          return; }
     if (starts_with(line, "splash "))    { splash_cmd(line + 7);    return; }

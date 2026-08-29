@@ -647,7 +647,89 @@ void drvrt_start_deferred(void) {
     g_ndefer = 0;
 }
 
+/* ---- grants the kernel made elsewhere -------------------------------------- */
+/* See drvrt.h for why these exist.  They fill a record and perform nothing:
+ * the mapping already happened, in an address space this file does not own. */
+
+drv_handle drv_res_note_mmio(struct drv_rt* rt, uint64_t phys, uint64_t len,
+                             uintptr_t va, const char* why) {
+    drv_handle h = res_alloc(rt, RES_MMIO, why);
+    if (h < 0) return h;
+    struct drv_res* r = res_of(h);
+    r->base = phys;
+    r->len  = len;
+    r->va   = va;
+    return h;
+}
+
+drv_handle drv_res_note_dma(struct drv_rt* rt, uint64_t phys, uint64_t len,
+                            uintptr_t va, uint64_t dev, const char* why) {
+    drv_handle h = res_alloc(rt, RES_DMA, why);
+    if (h < 0) return h;
+    struct drv_res* r = res_of(h);
+    /* `base` and `len` are what drv_release_all frees, so recording them is not
+     * bookkeeping — it is what makes the frames go back exactly once, on the
+     * same path as every other resource. */
+    r->base = phys;
+    r->len  = len;
+    r->va   = va;
+    r->dev  = dev;
+    return h;
+}
+
 /* ---- diagnostics ---------------------------------------------------------- */
+
+/* One driver's holdings as a short string.  See drvrt.h for why this exists
+ * next to the dump rather than in the caller that wanted it.
+ *
+ * The IRQ carries its LINE and the others do not, and that asymmetry is
+ * deliberate: an interrupt line is the resource whose NUMBER a person acts on
+ * (it is what collides, what a BIOS setting moves, and what "the mouse stopped
+ * working" turns out to be about), while a port range or a DMA buffer address
+ * means nothing without the widths that only `drv res` has room for. */
+static int res_owner_eq(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+void drv_res_summary(const char* owner, char* out, int cap) {
+    int n = 0;
+    if (cap > 0) out[0] = 0;
+    if (!owner) return;
+
+    /* Append `s`, prefixed with ", " once anything is already there.  Every
+     * write is bounded by `cap` — this runs against a fixed cell buffer. */
+    #define APPEND(s) do {                                                   \
+        const char* _s = (s);                                                \
+        if (n && n < cap - 2) { out[n++] = ','; out[n++] = ' '; }            \
+        for (int _i = 0; _s[_i] && n < cap - 1; _i++) out[n++] = _s[_i];     \
+        out[n] = 0;                                                          \
+    } while (0)
+
+    for (int i = 0; i < DRVRT_MAX_RES; i++) {
+        struct drv_res* r = &g_res[i];
+        if (!r->used || !r->owner) continue;
+        if (!res_owner_eq(r->owner, owner)) continue;
+        switch (r->kind) {
+        case RES_PORTS: APPEND("ports"); break;
+        case RES_MMIO:  APPEND("mmio");  break;
+        case RES_DMA:   APPEND("dma");   break;
+        case RES_IRQ: {
+            char irq[12];
+            int k = 0;
+            irq[k++] = 'i'; irq[k++] = 'r'; irq[k++] = 'q'; irq[k++] = ' ';
+            int line = (int)r->base, d[4], dn = 0;
+            if (line <= 0) irq[k++] = '0';
+            else { while (line && dn < 4) { d[dn++] = line % 10; line /= 10; }
+                   while (dn) irq[k++] = (char)('0' + d[--dn]); }
+            irq[k] = 0;
+            APPEND(irq);
+            break;
+        }
+        }
+    }
+    #undef APPEND
+}
 
 void drv_res_dump(void) {
     int n = 0;

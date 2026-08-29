@@ -4401,7 +4401,7 @@ has, and being able to talk to hardware that is not QEMU's virtio.
 
 **Ordered, and the order is by value rather than by size.**
 
-### 1. Device manager — a Control Panel panel
+### 1. Device manager — a Control Panel panel ✅ SHIPPED 2026-08-29 (DOCS §4.83)
 
 The face of everything §M33 built, and almost all of it already exists behind a
 shell command.  A **`SETTINGS_PANEL()`**, not a `GUI_APP`: §M63's registry is
@@ -4417,6 +4417,24 @@ runs (kernel or ring 3 + pid), **isolation** (none / advisory / full), restarts,
 events, and what it holds (ports / IRQ / MMIO / DMA).
 Actions: start, stop, change domain (kernel ↔ ring 3), and `drv crash` — because
 a control panel that can only observe cannot be used to test anything.
+
+**Shipped, see DOCS.md §4.83.**  `kernel/gui/apps/devicepanel.c` + a `devices`
+command on both shells that walks the PANEL'S OWN model, so the headless run
+falsifies the panel rather than a second reading of the registry.
+
+**It paid for itself in defects, which is the part worth carrying forward:**
+joining four separate views up found (1) the PS/2 mouse holding its resources
+under `ps2-mouse` while the registry and the manifest both say `ps2_mouse`,
+(2) `edu` keeping an MMIO grant from a failed boot-time init, and (3) — the
+serious one — **a restart loop widening the IOMMU boundary one grant at a time**,
+because `iommu_confine` accumulates by design and nothing released a dead
+driver's domain.  Fixed with `iommu_release` plus `drv_res_note_mmio`/`_dma`, the
+latter also closing the gap where `drv res` omitted a placed driver's window and
+DMA buffer entirely.
+
+*The general lesson for items 2-5: a view that joins facts up is a test, not
+decoration.  None of those three bugs was reachable from any single existing
+command.*
 
 ### 2. AHCI — the one that is not about VirtualBox
 

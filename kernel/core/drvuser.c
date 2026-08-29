@@ -167,7 +167,8 @@ struct drvuser {
     uint16_t     bdf;
     uint64_t     win_phys, win_len;
     uintptr_t    h_mmio_va;
-    uint64_t     dma_phys;
+    uint64_t     dma_phys;        /* recorded for the IOMMU release; the FRAMES
+                                   * belong to the resource table */
     int          supervise;       /* 0 = it was stopped on purpose */
     int          restarts;        /* inside the current window */
     uint64_t     window_ns;       /* when the current window opened */
@@ -227,6 +228,23 @@ static struct drvuser* du_current(void) {
  * Resources first, bitmap second.  The other order would leave a task briefly
  * permitted to touch ports whose grant has already gone back. */
 static void du_release(struct drvuser* d) {
+    /* THE DEVICE'S DOMAIN GOES BACK FIRST, before `drv_release_all` returns the
+     * frames to the allocator: the other order hands memory out again while the
+     * unit still lets this device write to it.
+     *
+     * Nothing was doing this, and it is the kind of leak only a RESTART LOOP
+     * makes visible.  `iommu_confine` ACCUMULATES by design — a driver
+     * allocates its ring, then its data, then more later — so a placed driver
+     * that died and came back got a fresh buffer and a fresh grant every time
+     * while the old grants stayed.  After N restarts its device could reach N
+     * buffers and `drv domain` still said "isolation full".  *A boundary that
+     * widens quietly every time a driver crashes is worse than no boundary,
+     * because the reports keep agreeing with the intention.*
+     *
+     * The FRAMES are freed by drv_release_all, on the same path as every other
+     * resource — see drv_res_note_dma for why that is one owner rather than a
+     * private copy of the address and the count kept here. */
+    if (d->dma_phys) { iommu_release(d->bdf); d->dma_phys = 0; }
     drv_release_all(&d->rt);
     if (d->bitmap) {
         /* Before the free, not after: the cache in tss.c keys on the ADDRESS,
@@ -238,6 +256,10 @@ static void du_release(struct drvuser* d) {
     d->h_ports = d->h_irq = -1;
 }
 
+/* Arm a FRESH slot.  Only `du_reserve` calls this, and that matters: it resets
+ * the resource list, so calling it on a slot whose process is already running
+ * orphans everything that process has claimed.  The restart path deliberately
+ * does not — see the note where it records the pid. */
 static void du_arm(struct drvuser* d, int pid, const struct drv_manifest* mf) {
     d->used    = 1;
     d->pid     = pid;
@@ -429,9 +451,14 @@ static void du_restart(struct drvuser* d) {
     du_release(d);
     /* The slot stays OURS (that is what keeps the restart counters and keeps a
      * second placement out) but it goes back to "reserved, no process": the
-     * replacement may reach its first syscall before du_arm records its pid,
-     * and du_current can only let it claim a slot whose pid is 0. */
-    d->pid = 0;
+     * replacement may reach its first syscall before we record its pid, and
+     * du_current can only let it claim a slot whose pid is 0.
+     *
+     * `events` is zeroed HERE, before anything is spawned, and not after —
+     * what proves a recovery is traffic through the NEW process, and zeroing
+     * it once the replacement is running would throw away exactly that. */
+    d->pid    = 0;
+    d->events = 0;
 
     /* 2. Put the client back where a clean shutdown would have left it. */
     if (mf->quiesce) mf->quiesce();
@@ -473,16 +500,33 @@ static void du_restart(struct drvuser* d) {
         return;
     }
 
-    int restarts = d->restarts + 1;
-    uint64_t window = d->window_ns;
-    du_arm(d, pid, mf);            /* slot never released — still ours */
+    /* RECORD THE PID AND NOTHING ELSE — the same thing drvuser_launch does after
+     * its spawn, and for the same reason.
+     *
+     * This used to call the full `du_arm`, which re-runs `drv_rt_init` and so
+     * RESETS the resource list.  The replacement reaches its first syscall
+     * before this line — that is the whole point of leaving the slot reserved
+     * with pid 0 — so by the time it ran, the new process had already claimed
+     * its ports, mapped its window and taken its DMA buffer, and all of it was
+     * orphaned: still held in the global table, no longer reachable from the
+     * slot, never freed.
+     *
+     * It became visible rather than merely wasteful once `du_release` learned
+     * to give the IOMMU domain back: a defensive "release anything left over"
+     * check fired here and tore down the domain the REPLACEMENT had just built,
+     * putting the device back in the identity domain seconds after it came up.
+     * The symptom was `edutest: FAIL — 8 of 256 bytes came back wrong` from a
+     * driver whose own bring-up had reported success.
+     *
+     * *A defensive check whose premise is false is worse than no check* — the
+     * premise being that nothing happens between the release and this line. */
+    d->pid       = pid;
     d->drv       = drv;
     d->supervise = 1;
-    d->restarts  = restarts;
-    d->window_ns = window;
+    d->restarts  = d->restarts + 1;
 
     kprintf("drv: '%s' died (pid %d) — restarted in ring 3 as pid %d "
-            "(restart %d of %d)\n", mf->name, old, pid, restarts, max);
+            "(restart %d of %d)\n", mf->name, old, pid, d->restarts, max);
     klog(KLOG_WARN, "drv", "'%s' restarted in DOMAIN_USER: pid %d -> %d\n",
          mf->name, old, pid);
 }
@@ -837,6 +881,7 @@ long drvuser_sys_mmio(uint64_t phys, uint64_t len) {
     kprintf("drv-user: '%s' mapped its %x-byte register window at %x in ring 3\n",
             d->mf->name, (unsigned)len, (unsigned)va);
     d->h_mmio_va = va;
+    drv_res_note_mmio(&d->rt, phys, len, va, "ring-3 register window");
     return (long)va;
 }
 
@@ -884,6 +929,11 @@ long drvuser_sys_dma(int bytes, int addr_bits, uint64_t* out_dev) {
     vmm_space_set_mmap_cursor(t->mm, va + (uintptr_t)frames * 4096);
 
     d->dma_phys = phys;
+    /* Record it where every other resource lives, so `drv res` and the device
+     * manager stop omitting a placed driver's DMA buffer — and so the frames go
+     * back on exactly one path. */
+    drv_res_note_dma(&d->rt, phys, (uint64_t)frames * 4096, va, phys,
+                     "ring-3 DMA buffer");
     if (out_dev) *out_dev = phys;
     kprintf("drv-user: '%s' got %d DMA bytes at %x, confined and mapped at %x\n",
             d->mf->name, bytes, (unsigned)phys, (unsigned)va);

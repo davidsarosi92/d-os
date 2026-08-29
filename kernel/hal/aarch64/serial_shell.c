@@ -714,6 +714,7 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "conf"))      settings_cmd(args);
         else if (s_eq(cmd, "clip"))      clipboard_cmd(args);
         else if (s_eq(cmd, "mode"))      display_cmd(args);
+        else if (s_eq(cmd, "devices"))   devices_cmd(args);
         else if (s_eq(cmd, "splash"))    splash_cmd(args);
         else if (s_eq(cmd, "hardlock")) watchdog_hardlock_test();
         /* §M63 stage 0 — config from ARM too.  These lived in shell.c only,
