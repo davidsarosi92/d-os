@@ -11,6 +11,12 @@
 
 FROM --platform=linux/amd64 ubuntu:22.04
 
+# Marks this as OUR toolchain image, so scripts/build.sh can retire the
+# PREVIOUS one after a rebuild without ever touching an image belonging to
+# something else on the machine.  A blanket `docker image prune` would be
+# the easy version and would reach into every other project here.
+LABEL dos.build-image="1"
+
 RUN apt update && apt install -y \
     make \
     gcc-aarch64-linux-gnu \

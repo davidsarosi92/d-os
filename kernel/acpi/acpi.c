@@ -298,8 +298,10 @@ static void acpi_reach(uintptr_t phys, uint32_t len) {
 /* §M33 stage 5 — the DMAR, if the firmware published one.  Cached during the
  * RSDT walk like every other table we care about. */
 static const struct sdt_header* g_dmar = 0;
+static const struct sdt_header* g_ivrs = 0;
 
 const void* acpi_dmar(void) { return g_dmar; }
+const void* acpi_ivrs(void) { return g_ivrs; }
 
 static const struct sdt_header* acpi_reach_table(uint32_t phys) {
     if (!phys) return 0;
@@ -584,6 +586,12 @@ int acpi_init(void) {
              * remapping hardware, which is the IOMMU's subject and not ACPI's;
              * this file's job is to find tables and hand them over. */
             g_dmar = h;
+        } else if (sig4(h->signature, "IVRS") && checksum_ok(h, h->length)) {
+            /* AMD's equivalent of DMAR, and recorded for the same reason: this
+             * file finds tables, the IOMMU decides what they mean.  Two
+             * vendors' tables handled identically here is what lets iommu.c
+             * have two backends without ACPI knowing there are two. */
+            g_ivrs = h;
         } else if (sig4(h->signature, "SRAT") && checksum_ok(h, h->length)) {
             /* Defer parsing until AFTER MADT — SRAT lookups translate
              * APIC ID to MADT slot, which needs the MADT cache filled. */
@@ -619,8 +627,12 @@ int acpi_init(void) {
 
     /* M18 — log MADT topology summary if one was found. */
     if (g_ncpus > 0 || g_ioapic_phys) {
+        /* Through uintptr_t: these are 32-bit PHYSICAL addresses and %p wants a
+         * pointer, which is 64 bits on x86_64.  The direct cast warned, and a
+         * warning nobody clears is where the next real one hides (§M57). */
         kprintf("ACPI: MADT — %d CPU(s), lapic=%p ioapic=%p\n",
-                g_ncpus, (void*)g_lapic_phys, (void*)g_ioapic_phys);
+                g_ncpus, (void*)(uintptr_t)g_lapic_phys,
+                (void*)(uintptr_t)g_ioapic_phys);
     }
     /* M19.5.3 — log SRAT (NUMA) topology summary if one was found. */
     if (g_have_srat) {

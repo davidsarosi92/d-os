@@ -662,6 +662,7 @@ CORE_C_SRCS := \
     kernel/core/hwdev.c \
     kernel/core/domain.c \
     kernel/core/iommu.c \
+    kernel/core/iommu_amd.c \
     kernel/core/drvguard.c \
     kernel/core/drvrt.c \
     kernel/core/drvuser.c \
@@ -808,6 +809,7 @@ CORE_C_SRCS := \
     kernel/core/hwdev.c \
     kernel/core/domain.c \
     kernel/core/iommu.c \
+    kernel/core/iommu_amd.c \
     kernel/core/drvguard.c \
     kernel/core/drvrt.c \
     kernel/core/drvuser.c \
@@ -897,6 +899,7 @@ CORE_C_SRCS := \
     kernel/core/hwdev.c \
     kernel/core/domain.c \
     kernel/core/iommu.c \
+    kernel/core/iommu_amd.c \
     kernel/core/drvguard.c \
     kernel/core/drvrt.c \
     kernel/core/drvuser.c \

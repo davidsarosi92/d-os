@@ -50,18 +50,23 @@ struct iommu_info {
     enum iommu_state state;
     const char* why;             /* set whenever state < IOMMU_PRESENT */
 
-    uint64_t    reg_base;        /* remapping unit MMIO base, 0 if none */
-    int         units;           /* how many DRHDs the DMAR declared */
-    int         scope_all;       /* a unit claims INCLUDE_PCI_ALL */
-    int         host_addr_width; /* DMAR's host address width, in bits */
+    /* WHICH VENDOR'S HARDWARE — "VT-d", "AMD-Vi", or NULL when there is none.
+     * A field rather than an assumption: everything below used to be Intel's
+     * vocabulary in a struct that claimed to be neutral. */
+    const char* kind;
 
-    /* Straight from the unit's CAP/ECAP registers.  Recorded rather than
-     * reduced to a boolean because the interesting failures are specific: a
-     * unit that cannot do the page-table depth we need is a different problem
-     * from one that has no domains free. */
-    uint64_t    cap, ecap;
-    int         sagaw_39, sagaw_48; /* second-level page-table depths offered */
-    int         domains;            /* domain-id capacity */
+    uint64_t    reg_base;        /* remapping unit MMIO base, 0 if none      */
+    int         units;           /* remapping units the firmware declared    */
+    int         scope_all;       /* a unit covers every device on the bus    */
+    int         host_addr_width; /* physical address width it can translate  */
+    int         domains;         /* domain-id capacity                       */
+    int         page_levels;     /* translation table depth it will be used at */
+
+    /* CAN IT BE PROGRAMMED BY US, as opposed to merely found?  Detection and
+     * capability are different answers, and conflating them is how a report
+     * starts flattering: a backend that reads its own registers perfectly and
+     * cannot yet build a page table must not look like one that can. */
+    int         programmable;
 };
 
 /* Look for an IOMMU and read what it can do.  Safe to call before anything

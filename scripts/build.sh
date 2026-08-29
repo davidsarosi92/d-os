@@ -144,6 +144,20 @@ esac
 
 docker build --platform=linux/amd64 -f "$DOCKERFILE" -t "$IMAGE" .
 
+# RETIRE THE PREVIOUS TOOLCHAIN IMAGE.
+#
+# Rebuilding `-t d-os-build` moves the tag and leaves the old image UNTAGGED but
+# still on disk, at ~1.6 GB a time.  Nothing ever collected those, and the disk
+# filling up is not a hypothetical here: dockerd died of `no space left on
+# device` on this machine, which is a failure that presents as "every docker
+# command hangs forever" rather than as anything about disk.
+#
+# FILTERED BY OUR OWN LABEL, never a blanket prune.  `docker image prune` would
+# be one word shorter and would reach into every other project on the machine —
+# and on a developer's box the untagged images belonging to somebody else's work
+# are not ours to collect.
+docker image prune -f --filter label=dos.build-image=1 >/dev/null 2>&1 || true
+
 # Rebuild the PARSE-TIME-guarded slow artifacts (freetype, NetSurf) BEFORE the
 # main `iso` make (see the hygiene note above), whenever they are MISSING or the
 # ARCH changed.  The `iso`/kernel guards embed the browser only if its prebuilt

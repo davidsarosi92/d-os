@@ -324,6 +324,8 @@ def qemu_argv(a, sersock, monsock):
             # intel-iommu needs q35: the DMAR describes a PCIe root complex, and
             # on the i440fx machine QEMU refuses the device outright.
             argv += ["-machine", "q35", "-device", "intel-iommu"]
+        elif a.amd_iommu:
+            argv += ["-machine", "q35", "-device", "amd-iommu"]
         if a.disk:
             argv += ["-drive", "if=virtio,file=%s,format=raw" % a.disk,
                      # A FORMATTED image carries a boot signature, and SeaBIOS
@@ -362,6 +364,11 @@ def main():
                     metavar="PATH",
                     help="attach a freshly formatted, EMPTY 64 MiB exFAT disk "
                          "(default path: build/<arch>/test-empty.img)")
+    ap.add_argument("--amd-iommu", action="store_true",
+                    help="boot on a machine with AMD's IOMMU instead of Intel's "
+                         "(q35 + amd-iommu).  The point is that everything above "
+                         "the backend seam is unchanged: same verdicts, same "
+                         "commands, a different chipset underneath")
     ap.add_argument("--iommu", action="store_true",
                     help="boot on a machine that HAS DMA remapping hardware "
                          "(q35 + intel-iommu).  Off by default so the ordinary "

@@ -1,5 +1,11 @@
 FROM --platform=linux/amd64 ubuntu:22.04
 
+# Marks this as OUR toolchain image, so scripts/build.sh can retire the
+# PREVIOUS one after a rebuild without ever touching an image belonging to
+# something else on the machine.  A blanket `docker image prune` would be
+# the easy version and would reach into every other project here.
+LABEL dos.build-image="1"
+
 # Non-interactive apt: python3-jsonschema pulls in tzdata, whose postinst
 # otherwise prompts for a timezone and hangs `docker build` (no tty).
 ENV DEBIAN_FRONTEND=noninteractive

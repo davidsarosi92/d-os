@@ -36,6 +36,7 @@
  * ============================================================================= */
 
 #include "iommu.h"
+#include "iommu_backend.h"
 #include "acpi.h"
 #include "printf.h"
 #include "klog.h"
@@ -138,34 +139,33 @@ const char* iommu_state_name(enum iommu_state s) {
     }
 }
 
-void iommu_init(void) {
-    if (g_done) return;
-    g_done = 1;
-    g_info.state = IOMMU_NONE;
-    g_info.why   = "no DMAR table — this machine has no DMA remapping hardware";
+/* The chosen backend, or NULL when this machine has no remapping hardware.
+ * DISPATCHER state, so it lives outside the x86 guard: every arch has the
+ * dispatcher, only x86 has a vendor to put in it. */
+static const struct iommu_backend* g_be;
 
+#if defined(__i386__) || defined(__x86_64__)
+/* VT-d's OWN capability registers.  They used to live in `struct iommu_info`,
+ * where they made a struct that claimed to be vendor-neutral speak Intel — the
+ * thing that proved iommu.h was a claim rather than an interface.  They are
+ * reported through the backend's `report_extra`, so nothing outside this file
+ * sees them. */
+static uint64_t  g_cap, g_ecap;
+static int       g_sagaw_39, g_sagaw_48;
+
+/* VT-d's detect().  This was the body of iommu_init, which is exactly the
+ * problem the backend seam fixes: one vendor's table walk WAS the generic
+ * entry point.  Returns 0 when Intel remapping hardware is present, whatever
+ * state it turned out to be in; non-zero means "not this vendor". */
+static int vtd_detect(struct iommu_info* out) {
+    (void)out;
 #if !defined(__i386__) && !defined(__x86_64__)
-    /* AARCH64 ANSWERS "NONE", AND THE REASON IS NAMED RATHER THAN IMPLIED.
-     *
-     * The ARM analogue is the SMMU, described by the IORT table (or the device
-     * tree on a machine that boots without ACPI, which is how this port boots).
-     * Nothing here looks for it, so the honest answer is that we do not know of
-     * one — which for every purpose that consults this is the same as not having
-     * one, because an IOMMU nobody has found programs nothing.
-     *
-     * Stated as unlooked-for rather than absent, because those become different
-     * facts the moment somebody asks why ARM cannot place a DMA driver. */
-    g_info.why = "no IOMMU support on this arch — the ARM analogue is an SMMU "
-                 "(IORT / device tree) and nothing here looks for one yet";
-    klog(KLOG_INFO, "iommu", "not searched for on this arch — DMA is "
-                             "unrestricted\n");
-    return;
+    return -1;                      /* x86 hardware; the dispatcher says why */
 #else
     const struct dmar_header* d = (const struct dmar_header*)acpi_dmar();
-    if (!d) {
-        klog(KLOG_INFO, "iommu", "no DMAR — DMA is unrestricted on this machine\n");
-        return;
-    }
+    if (!d) return -1;              /* not this vendor */
+    g_info.kind = "VT-d";
+    g_info.host_addr_width = (int)d->host_addr_width + 1;
 
     g_info.host_addr_width = (int)d->host_addr_width + 1;
 
@@ -191,43 +191,43 @@ void iommu_init(void) {
         g_info.state = IOMMU_UNUSABLE;
         g_info.why   = "a DMAR with no usable remapping unit in it";
         klog(KLOG_WARN, "iommu", "DMAR present but declares no usable unit\n");
-        return;
+        return 0;   /* Intel hardware, and this is its state */
     }
 
     volatile uint8_t* regs = reach_regs(g_info.reg_base);
     if (!regs) {
         g_info.state = IOMMU_UNUSABLE;
         g_info.why   = "its register window is beyond this arch's reach";
-        return;
+        return 0;   /* Intel hardware, and this is its state */
     }
 
-    g_info.cap  = reg64(regs, DMAR_REG_CAP);
-    g_info.ecap = reg64(regs, DMAR_REG_ECAP);
+    g_cap  = reg64(regs, DMAR_REG_CAP);
+    g_ecap = reg64(regs, DMAR_REG_ECAP);
 
     /* CAP.SAGAW is bits 8..12: which second-level page-table depths this unit
      * supports.  Bit 1 = 3-level (39-bit addresses), bit 2 = 4-level (48-bit).
      * These are the two we could build; a unit offering neither cannot be
      * programmed by anything we would write, and finding that out here is much
      * cheaper than finding it out with the page tables half written. */
-    uint32_t sagaw = (uint32_t)((g_info.cap >> 8) & 0x1F);
-    g_info.sagaw_39 = (sagaw & 0x2) ? 1 : 0;
-    g_info.sagaw_48 = (sagaw & 0x4) ? 1 : 0;
+    uint32_t sagaw = (uint32_t)((g_cap >> 8) & 0x1F);
+    g_sagaw_39 = (sagaw & 0x2) ? 1 : 0;
+    g_sagaw_48 = (sagaw & 0x4) ? 1 : 0;
 
     /* CAP.ND is bits 0..2: domain-id width, encoded as 4 + 2*ND bits. */
-    uint32_t nd = (uint32_t)(g_info.cap & 0x7);
+    uint32_t nd = (uint32_t)(g_cap & 0x7);
     g_info.domains = (nd <= 6) ? (1 << (4 + 2 * nd)) : 0;
 
-    if (g_info.cap == 0 || g_info.cap == 0xFFFFFFFFFFFFFFFFull) {
+    if (g_cap == 0 || g_cap == 0xFFFFFFFFFFFFFFFFull) {
         g_info.state = IOMMU_UNUSABLE;
         g_info.why   = "its capability register reads back as all-ones or zero "
                        "— the window is not decoding";
-        return;
+        return 0;   /* Intel hardware, and this is its state */
     }
-    if (!g_info.sagaw_39 && !g_info.sagaw_48) {
+    if (!g_sagaw_39 && !g_sagaw_48) {
         g_info.state = IOMMU_UNUSABLE;
         g_info.why   = "it offers no second-level page-table depth we could "
                        "build (neither 3- nor 4-level)";
-        return;
+        return 0;   /* Intel hardware, and this is its state */
     }
 
     /* PRESENT, and deliberately not more than that.
@@ -244,8 +244,99 @@ void iommu_init(void) {
          "VT-d at %x: %d unit(s), %d-bit host, sagaw%s%s, %d domains — "
          "NOT programmed\n",
          (unsigned)g_info.reg_base, g_info.units, g_info.host_addr_width,
-         g_info.sagaw_39 ? " 39" : "", g_info.sagaw_48 ? " 48" : "",
+         g_sagaw_39 ? " 39" : "", g_sagaw_48 ? " 48" : "",
          g_info.domains);
+    return 0;
+#endif
+}
+
+static int      vtd_enable(void);
+static int      vtd_restrict(uint16_t bdf, uint64_t base, uint64_t len);
+static int      vtd_release(uint16_t bdf);
+static int      vtd_is_confined(uint16_t bdf);
+static uint32_t vtd_fault_count(void);
+static void     vtd_fault_dump(void);
+
+/* Only VT-d's own report says CAP/ECAP — the shared struct no longer carries
+ * them, which is the point of moving them here. */
+static void vtd_report_extra(void) {
+#if defined(__i386__) || defined(__x86_64__)
+    kprintf("  cap %x%x ecap %x%x, page-table depths:%s%s\n",
+            (unsigned)(g_cap >> 32), (unsigned)g_cap,
+            (unsigned)(g_ecap >> 32), (unsigned)g_ecap,
+            g_sagaw_39 ? " 3-level" : "", g_sagaw_48 ? " 4-level" : "");
+#endif
+}
+
+static const struct iommu_backend g_vtd = {
+    .name         = "VT-d",
+    .detect       = vtd_detect,
+    .enable       = vtd_enable,
+    .restrict_dev = vtd_restrict,
+    .release_dev  = vtd_release,
+    .is_confined  = vtd_is_confined,
+    .fault_count  = vtd_fault_count,
+    .fault_dump   = vtd_fault_dump,
+    .report_extra = vtd_report_extra,
+};
+
+const struct iommu_backend* iommu_backend_vtd(void) { return &g_vtd; }
+
+#else   /* not x86 */
+
+/* No Intel remapping hardware to speak for.  The dispatcher answers for the
+ * arch before it consults any backend, so this exists purely so the link does
+ * not depend on which architecture is being built — the same shape iommu_amd.c
+ * uses, and the reason both are NULL-safe there. */
+const struct iommu_backend* iommu_backend_vtd(void) { return NULL; }
+
+#endif
+
+/* THE DISPATCHER.  Try each vendor in turn and keep the first that answers.
+ *
+ * The arch verdict lives HERE rather than inside a backend, because "this
+ * architecture has no IOMMU support" is a statement about the port and not
+ * about Intel or AMD — a backend saying it would be one vendor speaking for
+ * the machine, which is the confusion this whole seam exists to end. */
+void iommu_init(void) {
+    if (g_done) return;
+    g_done = 1;
+    g_info.state = IOMMU_NONE;
+    g_info.why   = "no DMAR or IVRS table — this machine has no DMA remapping "
+                   "hardware";
+    g_info.kind  = NULL;
+
+#if !defined(__i386__) && !defined(__x86_64__)
+    /* AARCH64 ANSWERS "NONE", AND THE REASON IS NAMED RATHER THAN IMPLIED.
+     *
+     * The ARM analogue is the SMMU, described by the IORT table (or the device
+     * tree on a machine that boots without ACPI, which is how this port boots).
+     * Nothing here looks for it, so the honest answer is that we do not know of
+     * one — which for every purpose that consults this is the same as not having
+     * one, because an IOMMU nobody has found programs nothing.
+     *
+     * Stated as unlooked-for rather than absent, because those become different
+     * facts the moment somebody asks why ARM cannot place a DMA driver. */
+    g_info.why = "no IOMMU support on this arch — the ARM analogue is an SMMU "
+                 "(IORT / device tree) and nothing here looks for one yet";
+    klog(KLOG_INFO, "iommu", "not searched for on this arch — DMA is "
+                             "unrestricted\n");
+    return;
+#else
+    const struct iommu_backend* tries[] = {
+        iommu_backend_vtd(),
+        iommu_backend_amd(),
+    };
+    for (unsigned i = 0; i < sizeof tries / sizeof tries[0]; i++) {
+        if (!tries[i] || !tries[i]->detect) continue;
+        if (tries[i]->detect(&g_info) == 0) {
+            g_be = tries[i];
+            g_info.programmable = tries[i]->enable ? 1 : 0;
+            return;
+        }
+    }
+    klog(KLOG_INFO, "iommu", "no DMAR or IVRS — DMA is unrestricted on this "
+                             "machine\n");
 #endif
 }
 
@@ -303,14 +394,20 @@ void iommu_report(void) {
                 "  DMA-capable driver is not isolated by being placed in ring 3\n");
         return;
     }
-    kprintf("  units %d, register base %x, host address width %d bits\n",
-            i->units, (unsigned)i->reg_base, i->host_addr_width);
-    kprintf("  cap %x%x ecap %x%x\n",
-            (unsigned)(i->cap >> 32), (unsigned)i->cap,
-            (unsigned)(i->ecap >> 32), (unsigned)i->ecap);
-    kprintf("  page-table depths: %s%s, domains %d, scope %s\n",
-            i->sagaw_39 ? "3-level " : "", i->sagaw_48 ? "4-level" : "",
-            i->domains, i->scope_all ? "all PCI devices" : "listed devices only");
+    /* THE NEUTRAL FACTS, said the same way whichever vendor is underneath —
+     * which is what makes a second backend a drop-in rather than a second
+     * report to keep in step. */
+    kprintf("  kind %s, units %d, register base %x, host address width %d bits\n",
+            i->kind ? i->kind : "?", i->units, (unsigned)i->reg_base,
+            i->host_addr_width);
+    kprintf("  domains %d, %d-level tables, scope %s\n",
+            i->domains, i->page_levels,
+            i->scope_all ? "all PCI devices" : "listed devices only");
+    if (!i->programmable)
+        kprintf("  NOTE: this backend can READ this hardware and cannot yet\n"
+                "  program it — detection is not capability\n");
+    /* …then whatever only this vendor can say. */
+    if (g_be && g_be->report_extra) g_be->report_extra();
     if (i->state == IOMMU_PRESENT)
         kprintf("  consequence: UNCHANGED until translation is enabled — a\n"
                 "  capable IOMMU in passthrough restricts nothing\n");
@@ -410,6 +507,7 @@ static uint64_t* g_root;             /* 256 root entries, 2 x u64 each */
 static uint64_t  g_root_phys;
 static uint64_t* g_default_pml4;     /* the identity domain's top level */
 static uint64_t  g_default_phys;
+
 static int       g_levels;           /* 3 or 4 */
 static int       g_next_domain = IOMMU_DOMAIN_FIRST;
 
@@ -543,7 +641,7 @@ static void invalidate_all(void) {
 
     /* IOTLB, globally.  IVT (bit 63) starts it, IIRG = 01 (bits 61:60) means
      * global, and the unit clears IVT when it is done. */
-    int iro = (int)(((g_info.ecap >> 8) & 0x3FF) * 16);
+    int iro = (int)(((g_ecap >> 8) & 0x3FF) * 16);
     int iotlb = iro + 8;
     wreg64(iotlb, (1ull << 63) | (1ull << 60));
     for (int i = 0; i < 1000000; i++)
@@ -556,10 +654,8 @@ static void invalidate_all(void) {
  * region: swallowing one whole makes the arch that cannot do the work fail to
  * LINK rather than fail to enable, and the error names a symbol rather than a
  * capability.  This one did exactly that on the first attempt. */
-int iommu_enable(void) {
-#if !defined(__i386__) && !defined(__x86_64__)
-    return -1;
-#else
+#if defined(__i386__) || defined(__x86_64__)
+static int vtd_enable(void) {
     if (g_info.state == IOMMU_ACTIVE) return 0;
     if (g_info.state != IOMMU_PRESENT) {
         kprintf("iommu: cannot enable — %s\n", g_info.why ? g_info.why : "?");
@@ -572,14 +668,14 @@ int iommu_enable(void) {
      * them reads our leaf as a pointer to another table and walks into the
      * middle of RAM — not a refused DMA but a device writing wherever the bits
      * point, which is the failure this whole milestone exists to prevent. */
-    if (!((g_info.cap >> 34) & 0x1)) {
+    if (!((g_cap >> 34) & 0x1)) {
         kprintf("iommu: this unit has no 2 MiB superpages — refusing to enable\n"
                 "  (4 KiB leaves would need megabytes of tables at boot, on a\n"
                 "   path that must not fail; unimplemented rather than risked)\n");
         return -1;
     }
 
-    g_levels = g_info.sagaw_48 ? 4 : 3;
+    g_levels = g_sagaw_48 ? 4 : 3;
 
     g_root = table_alloc(&g_root_phys);
     if (!g_root) return -1;
@@ -625,7 +721,6 @@ int iommu_enable(void) {
     klog(KLOG_INFO, "iommu", "translation enabled, %d device(s) identity-mapped\n",
          ctx.n);
     return 0;
-#endif
 }
 
 #if defined(__i386__) || defined(__x86_64__)
@@ -665,10 +760,7 @@ static int domain_for(uint16_t bdf, uint64_t** top, uint64_t* top_phys, int* dom
 
 #endif /* x86 — the VT-d implementation */
 
-int iommu_restrict(uint16_t bdf, uint64_t base, uint64_t len) {
-#if !defined(__i386__) && !defined(__x86_64__)
-    (void)bdf; (void)base; (void)len; return -1;
-#else
+static int vtd_restrict(uint16_t bdf, uint64_t base, uint64_t len) {
     if (g_info.state != IOMMU_ACTIVE) {
         kprintf("iommu: not active — `iommu on` first\n");
         return -1;
@@ -710,13 +802,9 @@ int iommu_restrict(uint16_t bdf, uint64_t base, uint64_t len) {
                     "  the unit.  This restriction will have NO EFFECT.\n");
     }
     return 0;
-#endif
 }
 
-uint32_t iommu_fault_count(void) {
-#if !defined(__i386__) && !defined(__x86_64__)
-    return 0;
-#else
+static uint32_t vtd_fault_count(void) {
     if (!g_regs) return 0;
     /* FSTS.PPF (bit 1) says at least one fault record is present; FRI (bits
      * 8..15) indexes the most recent one.  READ FROM THE UNIT rather than
@@ -724,7 +812,6 @@ uint32_t iommu_fault_count(void) {
      * that our software thinks a DMA was refused, which is not the claim. */
     uint32_t fsts = reg32(VTD_REG_FSTS);
     return (fsts & 0x2) ? 1 + ((fsts >> 8) & 0xFF) : 0;
-#endif
 }
 
 #if defined(__i386__) || defined(__x86_64__)
@@ -740,10 +827,10 @@ uint32_t iommu_fault_count(void) {
  * (bits 40:47) how many there are.  Both are READ rather than assumed: a
  * hard-coded offset works on this emulator and reads some other register on a
  * different chipset. */
-static void fault_dump(void) {
+static void vtd_fault_dump(void) {
     if (!g_regs) { kprintf("  (not programmed)\n"); return; }
-    int fro = (int)(((g_info.cap >> 24) & 0x3FF) * 16);
-    int nfr = (int)(((g_info.cap >> 40) & 0xFF) + 1);
+    int fro = (int)(((g_cap >> 24) & 0x3FF) * 16);
+    int nfr = (int)(((g_cap >> 40) & 0xFF) + 1);
     int shown = 0;
     for (int i = 0; i < nfr; i++) {
         int off = fro + i * 16;
@@ -770,6 +857,11 @@ static void fault_dump(void) {
  * The `iommu` verb.  Lives here rather than in a shell so both shells and all
  * three arches run ONE implementation — §M24's rule.
  * ---------------------------------------------------------------------- */
+#endif  /* x86 — the VT-d implementation pauses here */
+
+/* Plain string helpers, used by the public command below — nothing
+ * arch-specific about them, so they live outside the guard with their
+ * caller rather than inside it with the hardware. */
 static int str_eq_i(const char* a, const char* b) {
     while (*a && *a == *b) { a++; b++; }
     return *a == *b;
@@ -788,6 +880,11 @@ static uint64_t parse_hex(const char* s, const char** end) {
     return v;
 }
 
+
+/* PUBLIC VERB, so it must exist on EVERY arch.  Burying it in the x86-only
+ * span made aarch64 fail to LINK rather than answer "this machine has none"
+ * — the same mistake iommu_enable's note warns about, made again three
+ * functions later. */
 void iommu_cmd(const char* args) {
     while (args && *args == ' ') args++;
     if (!args || !*args) { iommu_report(); return; }
@@ -850,7 +947,8 @@ void iommu_cmd(const char* args) {
         uint32_t n = iommu_fault_count();
         kprintf("iommu: %u fault record(s) in the unit\n", n);
 #if defined(__i386__) || defined(__x86_64__)
-        fault_dump();
+        if (g_be && g_be->fault_dump) g_be->fault_dump();
+        else kprintf("  (no backend to read fault records from)\n");
 #endif
         if (!n)
             kprintf("  none — which is what a device that stayed inside its "
@@ -862,22 +960,8 @@ void iommu_cmd(const char* args) {
             "limit <b>:<s>.<f> <base> <len> | faults\n");
 }
 
-/* ----------------------------------------------------------------------
- * §M33 — the per-driver domain, reached from drv_dma_request.
- * ---------------------------------------------------------------------- */
-int iommu_confine(uint16_t bdf, uint64_t base, uint64_t len) {
-#if !defined(__i386__) && !defined(__x86_64__)
-    (void)bdf; (void)base; (void)len; return 0;
-#else
-    /* Silent when there is nothing to confine with.  A DMA driver on a machine
-     * with no IOMMU is not doing anything wrong, and failing its allocation
-     * would make every such driver depend on a chipset feature.  The claim is
-     * what must stay honest, not the allocation — `iommu` reports the device as
-     * unconfined, and the isolation verdict reads that. */
-    if (g_info.state != IOMMU_ACTIVE) return 0;
-    return iommu_restrict(bdf, base, len);
-#endif
-}
+#if defined(__i386__) || defined(__x86_64__)
+
 
 #if defined(__i386__) || defined(__x86_64__)
 /* Free a domain's page tables, bottom up.  Depth is g_levels (3 or 4), so the
@@ -922,10 +1006,7 @@ static void domain_free_tree(uint64_t* tbl, int lvl) {
  * pointing at why.  Restoring the state the device had before it was ever
  * placed is the least surprising, and it is the same state every unplaced
  * device on the machine is in. */
-int iommu_release(uint16_t bdf) {
-#if !defined(__i386__) && !defined(__x86_64__)
-    (void)bdf; return 0;
-#else
+static int vtd_release(uint16_t bdf) {
     if (g_info.state != IOMMU_ACTIVE) return 0;
     for (int i = 0; i < IOMMU_MAX_DOMAINS; i++) {
         if (!g_dom[i].used || g_dom[i].bdf != bdf) continue;
@@ -941,17 +1022,83 @@ int iommu_release(uint16_t bdf) {
         return 0;
     }
     return 0;
-#endif
 }
 
-int iommu_is_confined(uint16_t bdf) {
-#if !defined(__i386__) && !defined(__x86_64__)
-    (void)bdf; return 0;
-#else
+static int vtd_is_confined(uint16_t bdf) {
     if (g_info.state != IOMMU_ACTIVE) return 0;
     for (int i = 0; i < IOMMU_MAX_DOMAINS; i++)
         if (g_dom[i].used && g_dom[i].bdf == bdf) return 1;
     return 0;
-#endif
+}
+#endif  /* x86 — the VT-d implementation */
+
+
+/* ---------------------------------------------------------------------------
+ * THE PUBLIC LAYER — one dispatch point per operation.
+ *
+ * Every one of these used to BE the VT-d implementation, which is why the
+ * header read as an interface and was not one.  What each adds now is the
+ * honesty gate: a backend that can SEE its hardware and cannot yet program it
+ * leaves `enable` NULL, and the refusal names that rather than failing in a way
+ * that looks like broken hardware.  §M33's rule, applied one layer down —
+ * detection is not capability, and a report that conflates them flatters.
+ * --------------------------------------------------------------------------- */
+
+int iommu_enable(void) {
+    if (!g_be) {
+        kprintf("iommu: no remapping hardware on this machine\n");
+        return -1;
+    }
+    if (!g_be->enable) {
+        kprintf("iommu: %s hardware is present and this backend cannot yet\n"
+                "  program it — detection is not capability\n", g_be->name);
+        return -1;
+    }
+    return g_be->enable();
 }
 
+int iommu_restrict(uint16_t bdf, uint64_t base, uint64_t len) {
+    if (!g_be || !g_be->restrict_dev) {
+        kprintf("iommu: nothing here can confine a device\n");
+        return -1;
+    }
+    return g_be->restrict_dev(bdf, base, len);
+}
+
+int iommu_release(uint16_t bdf) {
+    if (!g_be || !g_be->release_dev) return 0;
+    return g_be->release_dev(bdf);
+}
+
+int iommu_is_confined(uint16_t bdf) {
+    if (!g_be || !g_be->is_confined) return 0;
+    return g_be->is_confined(bdf);
+}
+
+uint32_t iommu_fault_count(void) {
+    if (!g_be || !g_be->fault_count) return 0;
+    return g_be->fault_count();
+}
+
+
+/* Moved OUT of the x86-only span with the rest of the public layer.  It was
+ * the second entry point to be swallowed by that guard, after iommu_cmd, and
+ * the failure is a LINK error on aarch64 rather than an honest "this machine
+ * has none" — which is why the whole public surface now lives together at
+ * the end of the file instead of wherever its implementation happened to be. */
+/* ----------------------------------------------------------------------
+ * §M33 — the per-driver domain, reached from drv_dma_request.
+ * ---------------------------------------------------------------------- */
+int iommu_confine(uint16_t bdf, uint64_t base, uint64_t len) {
+#if !defined(__i386__) && !defined(__x86_64__)
+    (void)bdf; (void)base; (void)len; return 0;
+#else
+    /* Silent when there is nothing to confine with.  A DMA driver on a machine
+     * with no IOMMU is not doing anything wrong, and failing its allocation
+     * would make every such driver depend on a chipset feature.  The claim is
+     * what must stay honest, not the allocation — `iommu` reports the device as
+     * unconfined, and the isolation verdict reads that. */
+    if (g_info.state != IOMMU_ACTIVE) return 0;
+    return iommu_restrict(bdf, base, len);
+#endif
+}

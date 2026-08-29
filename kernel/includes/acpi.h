@@ -35,6 +35,10 @@ void acpi_shutdown(void);
  * it does not own. */
 const void* acpi_dmar(void);
 
+/* AMD's IVRS — the same contract as acpi_dmar: found here, interpreted by the
+ * IOMMU.  NULL when the firmware published none. */
+const void* acpi_ivrs(void);
+
 /* ---------------------------------------------------------------------------
  * MADT-derived topology getters (M18).  Valid after `acpi_init` returns 0.
  *
