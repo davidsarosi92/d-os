@@ -315,7 +315,8 @@ static void gen_drivers(struct procfs_writer* w) {
         pw_puts(w, state_str);                  pw_putc(w, '\t');
         pw_puts(w, domain_name(at));            pw_putc(w, '\t');
         pw_puts(w, decl);                       pw_putc(w, '\t');
-        pw_puts(w, domain_isolation_name(domain_isolation_of(at, dma)));
+        pw_puts(w, domain_isolation_name(
+                       domain_isolation_of(at, dma, drvuser_confined(d->name))));
         pw_putc(w, '\t');
         if (d->flags & DRVF_BOOT_CRITICAL) pw_puts(w, "boot-critical ");
         if (dma)                           pw_puts(w, "dma ");

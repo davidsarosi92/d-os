@@ -24,6 +24,7 @@
 #include "timer.h"
 #include "ktimer.h"
 #include "iommu.h"    /* §M33 — a driver's buffers become its domain */
+#include "pci.h"
 #include "task.h"
 #include <stddef.h>
 
@@ -431,6 +432,44 @@ uint32_t drv_irq_count(drv_handle h) {
 
 void drv_bind_device(struct drv_rt* rt, uint16_t bdf) {
     if (rt) rt->bdf = bdf;
+}
+
+/* The in-kernel backend: read the BAR out of config space, and enable the two
+ * bits the device needs before it can be used at all.
+ *
+ * BUS MASTER IS SET HERE rather than left to each driver, and that is a bug fix
+ * promoted to a rule: the edu driver forgot it and the failure was silent in the
+ * worst way — the command register accepted the transfer, the status register
+ * cleared as though it had run, and the buffer came back untouched.  Every DMA
+ * driver needs it, none of them should have to remember it, and a driver in
+ * ring 3 could not do it even if it did. */
+int drv_device_window(struct drv_rt* rt, int bar, uint64_t* phys, uint64_t* len) {
+#if defined(__i386__) || defined(__x86_64__) || 1
+    if (!rt || rt->bdf == 0xFFFF || bar < 0 || bar > 5) return DRV_EBAD;
+    uint8_t bus = (uint8_t)(rt->bdf >> 8);
+    uint8_t slot = (uint8_t)((rt->bdf >> 3) & 0x1F);
+    uint8_t func = (uint8_t)(rt->bdf & 7);
+
+    uint16_t cmd = pci_read16(bus, slot, func, PCI_COMMAND);
+    pci_write16(bus, slot, func, PCI_COMMAND,
+                (uint16_t)(cmd | 0x0002 | 0x0004));   /* memory space + master */
+
+    uint32_t off = (uint32_t)(PCI_BAR0 + bar * 4);
+    uint32_t v = pci_read32(bus, slot, func, (uint8_t)off);
+    if (v & 1) return DRV_ENOSYS;                     /* an I/O BAR, not MMIO */
+
+    /* Size it the standard way: write all-ones, read back, restore.  Done by
+     * the kernel because it is a config-space write, and because a driver that
+     * sized its own BAR could size somebody else's. */
+    pci_write32(bus, slot, func, (uint8_t)off, 0xFFFFFFFFu);
+    uint32_t probe = pci_read32(bus, slot, func, (uint8_t)off);
+    pci_write32(bus, slot, func, (uint8_t)off, v);
+    uint32_t size = ~(probe & ~0xFu) + 1;
+
+    if (phys) *phys = (uint64_t)(v & ~0xFu);
+    if (len)  *len  = size ? (uint64_t)size : 0x1000ull;
+    return 0;
+#endif
 }
 
 drv_handle drv_dma_request(struct drv_rt* rt, size_t bytes, int addr_bits,

@@ -62,7 +62,7 @@
 | §M30 | Task scheduling — cron service — ✅ shipped (DOCS §4.23) | ~1935 |
 | §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) — ✅ shipped L1+L2 (DOCS §4.22; L3 HW deferred) | ~1960 |
 | §M32 | Multi-user — identity, login, file perms, isolation | ~2160 |
-| §M33 | Execution domains — ◐ Tier 0/1/2 + stage 5 shipped (DOCS §4.82): a driver runs in ring 3 from the same source, is supervised and restarted, and an IOMMU-confined device is refused outside its granted windows.  Remaining items all gated on named triggers | ~2265 |
+| §M33 | Execution domains — ✅ COMPLETE (DOCS §4.82): a driver runs in ring 3 from the same source, is supervised and restarted, and an IOMMU-confined device is refused outside its granted windows.  Remaining items all gated on named triggers | ~2265 |
 | §M34 | POSIX process & signals — ✅ shipped (i386): fork(COW)/execve/waitpid/pipe/dup2/signals (DOCS §4.27) | — |
 | §M35 | Threads & futex — ✅ shipped (i386, UP + SMP): clone/futex/thread_create + per-CPU TSS (DOCS §4.28) | — |
 | §M35.5 | Package manager & isolation — ✅ store shipped (i386): content-addressed /store + profiles + GC (DOCS §4.29); gates every port | — |
@@ -258,7 +258,7 @@ what); a session can pick a theme and push on it.
 | M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | ✅ DOCS §4.23 |
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | ✅ DOCS §4.22 (L1+L2; L3 HW deferred) |
 | M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation | Security | §M32 |
-| M33 | Execution domains — a service's run location as a declared capability + config choice; driver placement is the flagship case | Reliability | ◐ Tier 0, stage 2, Tier 1, Tier 2 (reconnection + shared-controller arbitration) and stage 5 (IOMMU: translation on, confinement proven) all shipped 2026-08-27/28, DOCS §4.82.  OPEN and each with a written trigger: per-driver DMA domains (waits on the first DMA driver ported to drvrt), modern virtio transport (legacy has no feature bit 33), MMIO into ring 3, richer state replay |
+| M33 | Execution domains — a service's run location as a declared capability + config choice; driver placement is the flagship case | Reliability | ✅ COMPLETE 2026-08-29 (DOCS §4.82): Tier 0/1/2, shared-controller arbitration, IOMMU stage 5, and per-driver DMA domains proven by a driver in ring 3 whose device is refused outside its own buffer.  OPEN, none of it gating the claim: the modern virtio transport (legacy has no feature bit 33 — a virtio-driver item), a REAL DMA driver ported to drvrt, richer state replay |
 | **M46** | **Resilient control plane — SAK hotkeys + force-kill** — Ctrl+Alt+Del = always-live Task Manager, Ctrl+Alt+X = kill last/frozen app, window chrome (close/min/restore) works even when the app is wedged (close ⇒ force-kill), Task Manager force-quit; the enabler is a real force-kill of a wedged ring-3 process | Reliability / UX | ✅ DOCS §4.37 |
 | M58 | Text selection — pointer grab + press/motion/release, selection model (text bytes / terminal cells), word + line selection | UX | §M58 |
 | M59 | Clipboard, system-wide — typed offers, ring-3 ops + `/dev/clipboard`, Wayland `wl_data_device`, primary selection | UX | §M59 (wants §M58) |
@@ -3233,14 +3233,27 @@ are not guarded (no caller to unwind to).
     buffer address; window covering ONE buffer → that access passes and a second
     is refused; both granted → clean, 0 faults.  The third proves a boundary that
     tracks each access rather than a switch.
-  * **Still not isolation, and the reason now says exactly why.**  Confinement is
-    proven; nothing wires it to a driver.  What would move `ADVISORY(!)`:
-    **per-driver DMA domains** — `drv_dma_request` mapping each allocation into a
-    domain of the calling driver's, plus a `drv_bind_device` naming the BDF to
-    confine.  **Deliberately not built:** no in-tree DMA driver uses drvrt
-    (ps2_mouse has no DMA), and shipping a mechanism with no client is what §M59
-    declined for `wl_data_device`.  The trigger is the first DMA driver ported to
-    drvrt.
+  * **§M33 COMPLETE — 2026-08-29.**  The trigger fired: `kernel/drivers/misc/edu.c`
+    (QEMU's educational device) is the first DMA driver written against drvrt,
+    runs on ALL THREE arches from one source, and is placeable in ring 3.  With
+    it: per-driver DMA domains built by `drv_dma_request`, ring-3 MMIO and DMA,
+    and `drv_device_window` — because a placed driver cannot read PCI config
+    space and must not.  **Measured:** the driver's device confined to its own
+    4 KiB buffer, the round trip working, and the escape 64 KiB away REFUSED by
+    the hardware and recorded by device and address, on both x86 arches.  The CPU
+    and device addresses are finally different, which is what drvrt.h separated
+    them for.  **`drv domain` reports `edu: at user, isolation full, DMA`** — the
+    first `full` for a DMA driver in this tree.
+  * **Found on the way, and a real bug:** the PS/2 keyboard ISR read one byte per
+    interrupt.  With edge-triggered IRQ1 the rest waited in the controller until
+    the next keypress, so fast typing lost keys — presenting as the test harness
+    mistyping, which cost several rounds before the direction of the fault was
+    believed.  It drains now, stopping at the mouse's AUX bytes.
+  * **Still open, none of it gating §M33's claim:** the modern virtio transport
+    (a measured limit, and a virtio-driver item); a REAL DMA driver ported to
+    drvrt — `edu` proves the mechanisms, and what a synthetic client cannot
+    answer is whether the interface is pleasant to write a complicated driver
+    against; richer state replay.
   * **Modern virtio transport — a MEASURED hard limit, not an oversight.**
     `VIRTIO_F_ACCESS_PLATFORM` is feature bit 33 and does not exist in the 32-bit
     feature register of the legacy PCI transport our drivers speak.  QEMU refuses

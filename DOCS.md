@@ -10617,22 +10617,124 @@ HAVING ONE.**
   Leaf size is now a parameter: 2 MiB for the identity domain (size), 4 KiB for a
   driver's (precision).
 
-**What §M33 still does not have, with what each one waits on:**
+**§M33 COMPLETE (2026-08-29) — A DRIVER IN RING 3 WHOSE DEVICE CANNOT REACH PAST
+ITS OWN BUFFER.**
 
-* **MMIO into a driver's own address space**, and with it a ring-3 edu — the
-  reason `domain_isolation_of` cannot yet report a confined DMA driver as
-  isolated: the verdict would be unreachable, since edu runs in the kernel where
-  the answer is `none` regardless.  This now HAS a client and is the next step.
+The last piece: MMIO and DMA reachable from ring 3, and with them the `edu`
+driver PLACED there.  Measured on both x86 arches:
+
+```
+iommu: 0:3.0 now sees ONLY 3d295000..3d296000 (domain 2)
+drv-user: 'edu' got 4096 DMA bytes at 3d295000, confined and mapped at 50100000
+edu: edutest: 256 bytes out and back through the device, all correct
+edu:   cpu address 50100000, device address 3d295000
+edu:   now aiming it at 3d2a5000, 64 KiB past its buffer
+edu:   no answer visible from ring 3 — the unit's fault records are the kernel's to read
+iommu: 1 fault record(s) in the unit
+  record 0: device 0:3.0 tried to write 3d2a5000 — REFUSED (reason 5)
+```
+
+**THE TWO ADDRESSES ARE FINALLY DIFFERENT** — `cpu 50100000, device 3d295000` —
+which is what `drvrt.h` separated them for on the first day and had never been
+able to demonstrate.  A driver that had used the CPU pointer because "they are
+equal" would break exactly here.
+
+**AND THE PLACED DRIVER CANNOT SEE THE VERDICT ON ITSELF.**  Reading the unit's
+fault records means reading the IOMMU's registers, which is precisely the
+privilege the placement removed — so it reports that the evidence lives on the
+other side of the boundary rather than claiming nothing happened.  The kernel
+then shows the refusal, by device and address.
+
+**`drv_device_window` — A GAP THE FIRST MMIO CLIENT FOUND IMMEDIATELY.**  A
+driver in ring 0 finds its BAR by reading PCI config space.  A driver in ring 3
+cannot, and *must not*: config space reaches every device on the machine, so a
+placed driver holding it would have MORE reach than the kernel driver it
+replaced — the opposite of the point.  So a driver asks the RUNTIME where its
+window is; the kernel, which enumerated the bus and decided this driver may speak
+for this device, answers, and performs the privileged half of bring-up (memory
+space and bus master) in the same call.  **Bus master is set there rather than
+left to each driver** because forgetting it is silent — the command register
+accepts the transfer, the status register clears as though it ran, and the buffer
+comes back untouched, which this very driver demonstrated.
+
+**EVERY ADDRESS A PLACED DRIVER SEES CAME FROM THE KERNEL**, which is what makes
+the bound real rather than checked: it cannot name a window it was not given,
+because it has no way to learn one.
+
+**THE VERDICT MOVES, AND ONLY THIS FAR.**  `drv domain` now reports
+`edu: at user, can be kernel|user, isolation full, DMA` — the first time
+anything in this tree has reported `full` for a DMA driver.  It is earned in both
+directions: the driver cannot reach kernel memory (its address space is its own)
+and neither can the hardware it commands (its domain holds nothing else).  A DMA
+driver in the KERNEL still reports `none`, because nothing the IOMMU does
+isolates it, and virtio devices remain outside the boundary entirely.
+
+**FOUND ON THE WAY, AND IT IS A REAL BUG THAT LOSES KEYSTROKES:** the PS/2
+keyboard ISR read **exactly one byte per interrupt**.  Scancodes arrive in bursts
+— every key is a make AND a break, extended keys are two or three bytes, a fast
+typist overlaps them — and IRQ1 is EDGE-triggered, so a byte left in the
+controller's buffer produces no second edge and waits there until the next
+keypress shifts it out, one keystroke late, forever.  The symptom was the test
+harness appearing to mistype (`drv domain edu user` arriving as `drv domain ed`,
+two runs in three), and *a machine that loses input under load is
+indistinguishable from one being driven wrongly* — which is why the direction of
+the fault took several rounds to believe.  The ISR drains now, stopping at a byte
+whose AUX bit marks it as the mouse's; the mouse driver has drained since it was
+written and the keyboard never did.  Measured: 3 of 3 runs type cleanly where
+1 of 3 did.
+
+The harness gained the belt to that fix: it verifies typing against the guest's
+echo, and **decides once whether this guest echoes at all** rather than guessing
+per command — on x86 the shell lives on a VC and serial carries only kernel
+output, which an earlier per-attempt version read as a failed echo and
+"corrected" with backspaces, corrupting the commands it was meant to protect.
+
+**What §M33 leaves open, each with what it waits on:**
+
 * **Modern virtio transport** — a measured limit (feature bit 33 does not exist
-  in legacy virtio); without it the disk and the network cannot be put behind the
-  boundary at all.  Correctly a virtio-driver item rather than a §M33 one.
+  in legacy virtio; QEMU refuses it outright); without it the disk and the
+  network cannot be put behind the boundary at all.  Correctly a virtio-driver
+  item rather than a §M33 one.
+* **A real DMA driver ported to drvrt** (AC97 is the obvious one).  `edu` proves
+  the mechanisms; what a synthetic client cannot answer is whether the interface
+  is pleasant to write a *complicated* driver against.  Low priority, and §M33's
+  claim does not rest on it.
 * **State replay richer than "the driver runs its own bring-up again"** — enough
-  for a mouse, and it will not be for a device holding a session.
+  for a mouse and for edu, and it will not be for a device holding a session.
 
 ---
 
 ## 8. Change log
 
+- **2026-08-29 — §M33 COMPLETE: a driver in ring 3 whose device cannot reach past
+  its own buffer (DOCS §4.82).**  MMIO and DMA reachable from ring 3, and the
+  `edu` driver placed there: its window mapped into its own address space, its
+  buffer confined by the IOMMU, and the escape 64 KiB away **refused by the
+  hardware and recorded by device and address** — both x86 arches.  The CPU and
+  device addresses are finally DIFFERENT (`50100000` vs `3d295000`), which is
+  what drvrt.h separated them for and had never demonstrated.  New
+  `drv_device_window`, because a placed driver cannot read PCI config space and
+  must not — config space reaches every device on the machine, so holding it
+  would give a placed driver MORE reach than the kernel one it replaced.  **The
+  verdict moves for the first time:** `edu: at user, isolation full, DMA`.  **A
+  real bug found on the way:** the PS/2 keyboard ISR read ONE byte per interrupt,
+  and with edge-triggered IRQ1 the rest waited in the controller until the next
+  keypress — it loses keystrokes for a fast typist, and presented as the harness
+  mistyping.  It drains now, stopping at the mouse's AUX bytes; 3 of 3 runs type
+  cleanly where 1 of 3 did.
+- **2026-08-29 — §M33: per-driver DMA domains, and the client that made them
+  possible (DOCS §4.82).**  Three mechanisms were finished and unreachable
+  because nothing used them; the honest way to finish the milestone was to find a
+  client, and the smallest honest one is QEMU's `edu` device — a teaching example
+  with a real bus-master DMA engine, running on all three arches from one source
+  written entirely against `drvrt.h`.  Each buffer a bound driver allocates is
+  added to a domain of that driver's, and the device moved into it.  **Four bugs,
+  all found by the first client:** the DMA API could not express a device's
+  address width (edu clamped a 1023 MiB address to 28 bits and reported success);
+  the zones could not serve a 28-bit device (ZONE_DMA is empty — the kernel image
+  is 61 MiB), hence `page_alloc_below`; the driver never enabled bus mastering;
+  and **the confinement was 2 MiB granular while reporting 4 KiB**, caught only
+  because the escape test aims 64 KiB past the buffer.
 - **2026-08-28 — §M33 stage 5 finished: the boundary permits precisely what was
   granted (DOCS §4.82).**  `iommu limit` confines a device to a window and grants
   ACCUMULATE into one domain — the shape a per-driver domain needs, since a driver

@@ -76,7 +76,12 @@ int domain_enforceable(uint32_t domain, const char** why);
  * whether it drives DMA?  Separate from the above because "allowed" and
  * "isolated" are different questions and conflating them is how the DMA case
  * gets quietly mis-reported. */
-enum domain_isolation domain_isolation_of(uint32_t domain, int does_dma);
+/* `device_confined`: 1 when an IOMMU holds this driver's DEVICE in a domain
+ * containing only that driver's buffers.  Passed in rather than discovered here
+ * — this file must not know how a driver is placed — and a caller that cannot
+ * establish it passes 0, so the cautious answer stays the default. */
+enum domain_isolation domain_isolation_of(uint32_t domain, int does_dma,
+                                          int device_confined);
 const char* domain_isolation_name(enum domain_isolation i);
 
 /* WHY a DMA-capable driver is only advisory on this machine.  NULL when the

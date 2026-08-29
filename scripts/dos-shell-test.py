@@ -115,6 +115,9 @@ class Monitor:
 
     def __init__(self, path):
         self.sock = connect_unix(path)
+        # None = we have not yet found out whether this guest echoes typed
+        # characters to the serial line.  See type_line.
+        self.echoes = None
         # A SHORT drain timeout.  With the obvious 2 s the drain after every
         # command blocked until it expired whenever the monitor had nothing
         # more to say — so each mouse_move cost ~1.6 s and a "drag" delivered
@@ -136,7 +139,7 @@ class Monitor:
         time.sleep(0.015)
         self._drain()
 
-    def type_line(self, text, delay):
+    def _type_raw(self, text, delay):
         for ch in text:
             if ch in KEYMAP:
                 self.cmd("sendkey " + KEYMAP[ch])
@@ -145,7 +148,60 @@ class Monitor:
             else:
                 raise RuntimeError("no sendkey mapping for %r" % ch)
             time.sleep(delay)
+
+    def type_line(self, text, delay, ser=None, tries=3):
+        """Type `text` and press Enter, verifying the echo WHERE ONE EXISTS.
+
+        `sendkey` is fire-and-forget: QEMU injects a key event and nothing tells
+        the sender whether the guest took it.  Under load it did not — the
+        keyboard driver read one byte per interrupt and lost the rest — and the
+        result was the worst kind of failure, because it looked like a guest
+        bug: `drv domain edu user` arrived as `drv domain ed` and the guest
+        said "not a domain".  That cause is fixed in the kernel; this is the
+        belt to its braces, and a harness that silently loses INPUT is exactly
+        as dangerous as one that loses output (§M57), for the same reason — it
+        is trusted.
+
+        WHETHER THE GUEST ECHOES IS DECIDED ONCE, NOT GUESSED PER COMMAND.  On
+        aarch64 the shell IS the serial line and echoes; on x86 it runs on a VC
+        and the serial carries only kernel output.  A per-attempt guess reads
+        that kernel output as a failed echo and "corrects" it with backspaces,
+        which is how this check spent one round corrupting the very commands it
+        was meant to protect.  So the first command calibrates: if its text
+        comes back, verification is on for the session; if not, it stands down
+        for good and says nothing further.
+        """
+        if ser is None or self.echoes is False:
+            self._type_raw(text, delay)
+            self.cmd("sendkey ret")
+            return True
+
+        for attempt in range(tries):
+            before = len(ser.text())
+            self._type_raw(text, delay)
+            time.sleep(0.25)
+            echo = ser.text()[before:]
+            if text in echo:
+                self.echoes = True
+                self.cmd("sendkey ret")
+                return True
+            if self.echoes is None:
+                # Calibration: this guest does not echo to serial.  Not a
+                # failure of the typing — a fact about where its shell lives.
+                self.echoes = False
+                self.cmd("sendkey ret")
+                return True
+            print("+ retyping (guest took %r, wanted %r)"
+                  % (echo.strip()[-40:], text), file=sys.stderr)
+            for _ in range(len(text) + 8):
+                self.cmd("sendkey backspace")
+                time.sleep(0.01)
+            time.sleep(0.3)
+
+        print("+ WARNING: could not type %r after %d attempts"
+              % (text, tries), file=sys.stderr)
         self.cmd("sendkey ret")
+        return False
 
     def quit(self):
         try:
@@ -362,7 +418,7 @@ def main():
                 if a.arch == "aarch64":
                     ser.write(c + "\r")
                 else:
-                    mon.type_line(c, a.key_delay)
+                    mon.type_line(c, a.key_delay, ser)
                 time.sleep(a.between)
             time.sleep(a.settle)
             for mc in a.monitor_cmd:

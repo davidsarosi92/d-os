@@ -149,15 +149,8 @@ static void kbd_push(char c) {
  * indices is race-free relative to the consumer (getchar simply sees the
  * updated `kbd_head` the next time it's polled).
  * -------------------------------------------------------------------------- */
-static void keyboard_irq(struct int_frame* f) {
-    (void)f;                                /* we don't inspect CPU state */
-
-    /* On some controllers a spurious IRQ may fire with no byte ready;
-     * check the status bit instead of blindly reading. */
-    if ((inb(KBD_STATUS) & KBD_OUT_FULL) == 0) return;
-
-    uint8_t sc = inb(KBD_DATA);
-
+/* One scancode.  Split out of the ISR so the ISR can DRAIN — see there. */
+static void keyboard_byte(uint8_t sc) {
     /* Extended (0xE0-prefixed) scancodes: stash the prefix and handle
      * the follow-up byte on the next IRQ.  We only care about RAlt
      * (0xE0 0x38 make / 0xE0 0xB8 break) — everything else gets
@@ -244,6 +237,48 @@ static void keyboard_irq(struct int_frame* f) {
      * keyboard_getchar in the kernel main path still works. */
     if (vc_focused()) vc_kbd_push(c);
     else              kbd_push(c);
+}
+
+/* --------------------------------------------------------------------------
+ * The interrupt: DRAIN, do not read one byte and leave.
+ *
+ * THE BUG THIS FIXES LOSES KEYSTROKES, and it was found by an instrument
+ * failing rather than by a person complaining — which is the only reason it was
+ * found at all.  The old handler read exactly ONE byte per IRQ.  Scancodes
+ * arrive in bursts: every key is a make AND a break, extended keys are two or
+ * three bytes, and a fast typist overlaps them.  If two land before the handler
+ * runs, the second sits in the controller's output buffer, and IRQ1 is
+ * EDGE-triggered — the line is already asserted, so there is no new edge and no
+ * second interrupt.  The byte waits there until the next keypress shifts it out,
+ * one keystroke late, forever.
+ *
+ * The symptom was `drv domain edu user` arriving as `drv domain ed`, two runs in
+ * three, and the obvious reading was that the harness was mistyping.  It was
+ * not: the guest was dropping what it had been sent.  *A machine that loses
+ * input under load is indistinguishable from one being driven wrongly, which is
+ * why this cost several rounds before the direction of the fault was believed.*
+ *
+ * The mouse driver has drained since it was written (`mouse_drain`); the
+ * keyboard never did.
+ *
+ * THE AUX BIT IS WHY THE LOOP CANNOT SIMPLY READ WHILE OUT_FULL IS SET.  The
+ * 8042 has one output buffer shared with the mouse, and a byte with AUX set
+ * belongs to IRQ12's handler.  Draining past it would make the keyboard eat the
+ * mouse's packets — the same shared-controller hazard §M33 met from the other
+ * side, and a drain loop is exactly what turns it from theoretical into certain.
+ * -------------------------------------------------------------------------- */
+#define KBD_STATUS_AUX 0x20
+
+static void keyboard_irq(struct int_frame* f) {
+    (void)f;                                /* we don't inspect CPU state */
+    /* Bounded: a controller wedged with OUT_FULL permanently set must cost a
+     * few reads, not the machine. */
+    for (int i = 0; i < 16; i++) {
+        uint8_t st = inb(KBD_STATUS);
+        if ((st & KBD_OUT_FULL) == 0) break;
+        if (st & KBD_STATUS_AUX) break;     /* the mouse's — leave it alone */
+        keyboard_byte(inb(KBD_DATA));
+    }
 }
 
 /* --------------------------------------------------------------------------

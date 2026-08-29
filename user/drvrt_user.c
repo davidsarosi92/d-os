@@ -37,6 +37,9 @@
 #define SYS_DRV_LOG      0xD064
 #define SYS_DRV_PORTS_LOCK   0xD065
 #define SYS_DRV_PORTS_UNLOCK 0xD066
+#define SYS_DRV_WINDOW       0xD067
+#define SYS_DRV_MMIO         0xD068
+#define SYS_DRV_DMA          0xD069
 
 /* Mirror of the grant, so the bounds check is local.  Small and fixed: a
  * ring-3 driver holds a handful of resources, and an allocation here would be
@@ -134,20 +137,58 @@ int drv_irq_wait(drv_handle h, int timeout_ms) {
 
 uint32_t drv_irq_count(drv_handle h) { (void)h; return 0; }   /* kernel-side stat */
 
-/* MMIO and DMA: not reachable from ring 3 yet.  REFUSED rather than faked —
- * a driver that needs either is a driver Tier 1 cannot place, and finding that
- * out at the request is the whole reason drvrt.h returns errors instead of
- * assuming success. */
-drv_handle drv_mmio_request(struct drv_rt* rt, uint64_t phys, size_t len, const char* why) {
-    (void)rt; (void)phys; (void)len; (void)why; return DRV_ENOSYS;
+/* WHERE IS MY DEVICE — asked across the boundary, because config space is not
+ * something a placed driver may touch.  The kernel enumerated the bus and
+ * decided this driver may speak for this device; it also does the privileged
+ * half of bring-up (memory space + bus master) inside this call. */
+int drv_device_window(struct drv_rt* rt, int bar, uint64_t* phys, uint64_t* len) {
+    (void)rt;
+    uint64_t out[2] = { 0, 0 };
+    long r = dos_syscall3(SYS_DRV_WINDOW, bar, (long)(uintptr_t)out, 0);
+    if (r != 0) return (int)r;
+    if (phys) *phys = out[0];
+    if (len)  *len  = out[1];
+    return 0;
 }
-volatile void* drv_mmio_ptr(drv_handle h) { (void)h; return 0; }
+
+/* MMIO and DMA are REAL from ring 3 now, and the addresses they return are
+ * mappings in THIS process — the kernel's physical numbers never cross.  Both
+ * are bounded by the manifest, so a request outside the driver's own device is
+ * refused with the reason rather than mapped. */
+static uintptr_t g_mmio_va[DRV_MAX_RES];
+static void*     g_dma_cpu[DRV_MAX_RES];
+static uint64_t  g_dma_dev[DRV_MAX_RES];
+static int       g_nres_local;
+
+drv_handle drv_mmio_request(struct drv_rt* rt, uint64_t phys, size_t len, const char* why) {
+    (void)rt; (void)why;
+    long va = dos_syscall3(SYS_DRV_MMIO, (long)phys, (long)len, 0);
+    if (va < 0) return (drv_handle)va;
+    if (g_nres_local >= DRV_MAX_RES) return DRV_ENORES;
+    int i = g_nres_local++;
+    g_mmio_va[i] = (uintptr_t)va;
+    return (drv_handle)(i + 1);
+}
+volatile void* drv_mmio_ptr(drv_handle h) {
+    if (h <= 0 || h > g_nres_local) return 0;
+    return (volatile void*)g_mmio_va[h - 1];
+}
+
 drv_handle drv_dma_request(struct drv_rt* rt, size_t bytes, int addr_bits,
                            const char* why) {
-    (void)rt; (void)bytes; (void)addr_bits; (void)why; return DRV_ENOSYS;
+    (void)rt; (void)why;
+    uint64_t dev = 0;
+    long va = dos_syscall3(SYS_DRV_DMA, (long)bytes, addr_bits,
+                           (long)(uintptr_t)&dev);
+    if (va < 0) return (drv_handle)va;
+    if (g_nres_local >= DRV_MAX_RES) return DRV_ENORES;
+    int i = g_nres_local++;
+    g_dma_cpu[i] = (void*)(uintptr_t)va;
+    g_dma_dev[i] = dev;
+    return (drv_handle)(i + 1);
 }
-void*    drv_dma_cpu(drv_handle h)    { (void)h; return 0; }
-uint64_t drv_dma_device(drv_handle h) { (void)h; return 0; }
+void*    drv_dma_cpu(drv_handle h)    { return (h > 0 && h <= g_nres_local) ? g_dma_cpu[h-1] : 0; }
+uint64_t drv_dma_device(drv_handle h) { return (h > 0 && h <= g_nres_local) ? g_dma_dev[h-1] : 0; }
 
 /* In ring 3 the "driver body" is simply the program.  `drv_run` calls it
  * instead of spawning, so the driver's own source does not have to know which
@@ -180,6 +221,10 @@ void mouse_publish(int dx, int dy, unsigned buttons, int dz) {
  * Now the kernel's request arrives as DRV_ESTOP on the wait itself, and the
  * driver's own loop — the same line the in-kernel build runs — sees it. */
 int task_should_stop(void) { return g_stopping; }
+
+/* A driver body sleeps between interrupts; in ring 3 that is the ordinary
+ * nanosleep the libc already has, not a kernel scheduler call. */
+void task_msleep(uint32_t ms) { nanosleep_ms(ms); }
 
 /* A driver's own messages, rendered here and sent to the kernel's log.
  *

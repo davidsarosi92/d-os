@@ -191,13 +191,45 @@ confinement is proven and nothing wires it to a driver — every device sits in 
 identity domain unless somebody types a command, `drv_dma_request` builds no
 domain of its own, and virtio is not behind the unit at all.  *"Translation is on
 and confinement works" is true and would be read as "a DMA driver in ring 3 is
-isolated", which is false.*  **OPEN, each with what it waits on:** per-driver DMA
-domains — the last step before `ADVISORY(!)` can change — **deliberately NOT
-built, because no in-tree DMA driver uses drvrt** and a mechanism with no client
-is what §M59 declined for `wl_data_device`; the modern virtio transport (above);
-MMIO into a driver's own space (same reasoning, and `drv_mmio_request` REFUSES
-from ring 3 rather than faking it); state replay richer than "run bring-up
-again".
+isolated", which is false.*  **§M33 IS COMPLETE (2026-08-29), AND THE
+THING THAT FINISHED IT WAS FINDING A CLIENT.**  Three mechanisms were built and
+unreachable because nothing used them — shipping them anyway is what §M59
+declined for `wl_data_device` — so the answer was **QEMU's `edu` device**: a
+teaching example with a real bus-master DMA engine, nothing depending on it,
+present on x86 AND `-M virt`.  `kernel/drivers/misc/edu.c` is written entirely
+against `drvrt.h` with no arch code and **runs on all three arches from one
+source**.  With it: **per-driver DMA domains** (each buffer a bound driver
+allocates joins a domain of that driver's, and the device moves into it),
+**ring-3 MMIO and DMA**, and **`drv_device_window`** — because a placed driver
+cannot read PCI config space and *must not*: config space reaches every device on
+the machine, so holding it would give a placed driver MORE reach than the kernel
+one it replaced.  The kernel does the privileged half of bring-up there too,
+because forgetting bus master is silent (this driver proved it).  **MEASURED, THE
+WHOLE CHAIN, BOTH x86 ARCHES:** `edu` placed in ring 3 → its window mapped into
+its own address space → its buffer confined (`now sees ONLY 3d295000..3d296000`)
+→ round trip correct → **the escape 64 KiB away REFUSED by the hardware and
+recorded by device and address** — and the placed driver *cannot see that record*
+and says so, because reading the unit is the privilege it gave up.  **The CPU and
+device addresses are finally DIFFERENT** (`50100000` vs `3d295000`), which is what
+drvrt.h separated them for and had never been able to demonstrate.  **THE VERDICT
+MOVES FOR THE FIRST TIME:** `edu: at user, isolation full, DMA`.  **FIVE BUGS,
+ALL FOUND BY THE FIRST CLIENT — which is the argument for having one:** the DMA
+API could not express a device's address width (edu clamped a 1023 MiB address to
+28 bits and *reported success*); the zones could not serve a 28-bit device
+(ZONE_DMA is EMPTY here — the kernel image is 61 MiB), hence `page_alloc_below`;
+the driver never enabled bus mastering; **the confinement was 2 MiB granular
+while reporting 4 KiB** (caught only because the escape aims 64 KiB past the
+buffer — *a test picking a distant address would have passed*); and **the PS/2
+keyboard ISR read ONE byte per interrupt** — with edge-triggered IRQ1 the rest
+waited in the controller until the next keypress, so **fast typing loses keys**,
+presenting as the harness mistyping and costing several rounds before the
+direction of the fault was believed.  *A machine that loses input under load is
+indistinguishable from one being driven wrongly.*  **OPEN, none of it gating the
+claim:** the modern virtio transport (a measured limit — feature bit 33 does not
+exist in legacy virtio — and correctly a virtio-driver item); a REAL DMA driver
+ported to drvrt (`edu` proves the mechanisms; what a synthetic client cannot
+answer is whether the interface is pleasant for a COMPLICATED driver); richer
+state replay.
 `driver.profile` is deliberately absent — with one reachable domain it would be
 a key with one legal value.  **NEXT: §M32 multi-user.**
 

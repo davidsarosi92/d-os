@@ -399,6 +399,27 @@ static void syscall_dispatch_body(struct int_frame* f) {
         case SYS_DRV_PORTS_UNLOCK:
             f->rax = (uint64_t)drvuser_sys_ports_unlock((int)f->rbx);
             return;
+        case SYS_DRV_WINDOW: {
+            uint64_t phys = 0, len = 0;
+            long r = drvuser_sys_window((int)f->rbx, &phys, &len);
+            if (r == 0) {
+                uint64_t out[2] = { phys, len };
+                if (copy_to_user((uintptr_t)f->rcx, out, sizeof out) != 0) r = -1;
+            }
+            f->rax = (uint64_t)r;
+            return;
+        }
+        case SYS_DRV_MMIO:
+            f->rax = (uint64_t)drvuser_sys_mmio((uint64_t)f->rbx, (uint64_t)f->rcx);
+            return;
+        case SYS_DRV_DMA: {
+            uint64_t dev = 0;
+            long r = drvuser_sys_dma((int)f->rbx, (int)f->rcx, &dev);
+            if (r >= 0 && f->rdx)
+                if (copy_to_user((uintptr_t)f->rdx, &dev, sizeof dev) != 0) r = -1;
+            f->rax = (uint64_t)r;
+            return;
+        }
         case SYS_DRV_LOG: {
             char msg[128];
             int n = copy_str_from_user(msg, f->rbx, sizeof msg);

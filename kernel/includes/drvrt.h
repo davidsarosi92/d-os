@@ -158,6 +158,27 @@ int drv_ports_lock(drv_handle h, int max_ms);
 int drv_ports_unlock(drv_handle h);
 
 /* ----------------------------------------------------------------------
+ * WHERE IS MY DEVICE?
+ *
+ * A driver in ring 0 finds its own BAR by reading PCI config space.  A driver in
+ * ring 3 CANNOT, and should not be able to: config space reaches every device on
+ * the machine, so handing it over would give a placed driver more reach than the
+ * kernel one it replaced — the opposite of the point.
+ *
+ * That is not a gap discovered late; it is what the first MMIO driver written
+ * against this API immediately ran into.  So a driver asks the RUNTIME where its
+ * window is, and the kernel — which enumerated the bus and decided this driver
+ * may speak for this device — answers.  The in-kernel backend reads config space
+ * on the driver's behalf; the user backend asks across the boundary.  Same call,
+ * same answer, and the driver's source does not know which.
+ *
+ * The kernel also performs the privileged half of bring-up (memory space and bus
+ * master enable) at the same point, because those are config-space writes for the
+ * same reason.
+ * ---------------------------------------------------------------------- */
+int drv_device_window(struct drv_rt* rt, int bar, uint64_t* phys, uint64_t* len);
+
+/* ----------------------------------------------------------------------
  * MMIO.  The pointer is REAL in the in-kernel backend and would be a mapping
  * into the driver's own space in the user one — which is why the driver gets it
  * from a handle rather than computing it: the number differs per backend and

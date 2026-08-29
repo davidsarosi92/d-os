@@ -84,6 +84,10 @@
 #include "config.h"
 #include "settings.h"   /* CONFIG_KEY — the restart policy is a setting */
 #include "timer.h"
+#include "pci.h"
+#include "vmm.h"
+#include "pmm.h"
+#include "iommu.h"
 #include <stddef.h>
 
 /* ----------------------------------------------------------------------
@@ -99,6 +103,13 @@ struct drv_manifest {
     const char* name;
     uint16_t    port_base, port_count;
     int         irq;                 /* -1 = none */
+    /* §M33 — the PCI device this driver may speak for, 0 for "not a PCI
+     * driver".  The kernel resolves the BAR from it, which is what bounds an
+     * MMIO grant: a placed driver names an offset within ITS OWN window and
+     * cannot name somebody else's, because it never sees a physical address it
+     * did not receive from here. */
+    uint16_t    pci_vendor, pci_device;
+    int         dma_bytes;           /* how much DMA it may be given, 0 = none */
     /* §M33 Tier 2 — what to tell this driver's CLIENTS when it dies.  See
      * quiesce_pointer below: a driver that vanishes mid-gesture has left state
      * latched in a client that will never hear the end of it, and only the
@@ -112,7 +123,12 @@ static const struct drv_manifest g_manifest[] = {
     /* The 8042 aux device: four registers at 0x60 and IRQ 12.  Exactly what
      * ps2_mouse.c asks the in-kernel backend for — the same numbers, now
      * written down where the driver cannot reach them. */
-    { "ps2_mouse", 0x60, 5, 12, quiesce_pointer },
+    { "ps2_mouse", 0x60, 5, 12, 0, 0, 0, quiesce_pointer },
+    /* The educational device: no ports at all, which is why it is the first
+     * driver aarch64 can place.  Its window comes from its BAR and its DMA
+     * ceiling is declared here rather than asked for, for the manifest's own
+     * reason — the bound must come from somewhere the driver cannot set. */
+    { "edu", 0, 0, -1, 0x1234, 0x11E8, 4096, NULL },
 };
 #define MANIFEST_N ((int)(sizeof g_manifest / sizeof g_manifest[0]))
 
@@ -147,6 +163,11 @@ struct drvuser {
      * recorded at the first launch rather than looked up later: a driver that
      * has been detached in the meantime must not be brought back by us. */
     const struct driver* drv;
+    /* §M33 — the device this driver was given, and what it was given of it. */
+    uint16_t     bdf;
+    uint64_t     win_phys, win_len;
+    uintptr_t    h_mmio_va;
+    uint64_t     dma_phys;
     int          supervise;       /* 0 = it was stopped on purpose */
     int          restarts;        /* inside the current window */
     uint64_t     window_ns;       /* when the current window opened */
@@ -283,21 +304,24 @@ void drvuser_detach(int pid) {
  * ---------------------------------------------------------------------- */
 extern const unsigned char _binary_user_ps2mouse_elf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_ps2mouse_elf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_edudrv_elf_start[]   __attribute__((weak));
+extern const unsigned char _binary_user_edudrv_elf_end[]     __attribute__((weak));
 
 struct drv_image { const char* name; const unsigned char** start; const unsigned char** end; };
 
 static const unsigned char* ps2_s(void) { return _binary_user_ps2mouse_elf_start; }
 static const unsigned char* ps2_e(void) { return _binary_user_ps2mouse_elf_end; }
+static const unsigned char* edu_s(void) { return _binary_user_edudrv_elf_start; }
+static const unsigned char* edu_e(void) { return _binary_user_edudrv_elf_end; }
 
 /* Which image is this driver's?  A table keyed by name rather than a field on
  * `struct driver`, for the manifest's own reason: what may be placed in ring 3,
  * and which image is placed there, is the kernel's decision. */
 static int du_image(const char* name, const unsigned char** img,
                     const unsigned char** end) {
-    const char* a = name; const char* b = "ps2_mouse";
-    while (*a && *a == *b) { a++; b++; }
-    if (*a != *b) return -1;
-    *img = ps2_s(); *end = ps2_e();
+    if (du_name_eq(name, "ps2_mouse")) { *img = ps2_s(); *end = ps2_e(); }
+    else if (du_name_eq(name, "edu"))  { *img = edu_s(); *end = edu_e(); }
+    else return -1;
     return *img ? 0 : -1;                   /* not embedded in this build */
 }
 
@@ -566,6 +590,20 @@ int drvuser_ready(const char* name) {
     return 0;
 }
 
+/* Is this placed driver's DEVICE confined to a domain of its own?  What the
+ * isolation verdict is finally allowed to consult — and only for a driver that
+ * is actually running in ring 3, because a confined device driven from the
+ * kernel isolates nothing about the driver. */
+int drvuser_confined(const char* name) {
+    for (int i = 0; i < DRVUSER_MAX; i++) {
+        struct drvuser* d = &g_du[i];
+        if (!d->used || !d->mf) continue;
+        if (!du_name_eq(d->mf->name, name)) continue;
+        return d->bdf && iommu_is_confined(d->bdf);
+    }
+    return 0;
+}
+
 int drvuser_events(const char* name) {
     for (int i = 0; i < DRVUSER_MAX; i++) {
         struct drvuser* d = &g_du[i];
@@ -718,3 +756,137 @@ long drvuser_sys_log(const char* msg) {
     klog(KLOG_INFO, "drv-user", "%s: %s\n", d->mf->name, msg);
     return 0;
 }
+
+/* =============================================================================
+ * §M33 — GIVING A PLACED DRIVER ITS DEVICE.
+ *
+ * A driver in ring 3 cannot read PCI config space and must not be able to: config
+ * space reaches every device on the machine, so a placed driver holding it would
+ * have MORE reach than the kernel driver it replaced.  So the kernel resolves the
+ * device, performs the privileged half of bring-up, and hands back only what this
+ * driver's manifest allows.
+ *
+ * EVERY ADDRESS THE DRIVER EVER SEES CAME FROM HERE, which is what makes the
+ * bound real rather than checked: it cannot name a window it was not given,
+ * because it has no way to learn one.
+ * ============================================================================= */
+
+/* Where is this driver's device, and turn it on.  Returns the BAR's physical
+ * base and length into a small user struct. */
+long drvuser_sys_window(int bar, uint64_t* out_phys, uint64_t* out_len) {
+    struct drvuser* d = du_current();
+    if (!d || !d->mf->pci_vendor) return DRV_EBAD;
+    if (bar < 0 || bar > 5) return DRV_EBAD;
+
+    struct pci_device pd;
+    if (pci_find_device(d->mf->pci_vendor, d->mf->pci_device, &pd) != 0)
+        return DRV_ENOSYS;
+
+    uint16_t cmd = pci_read16(pd.bus, pd.slot, pd.func, PCI_COMMAND);
+    pci_write16(pd.bus, pd.slot, pd.func, PCI_COMMAND,
+                (uint16_t)(cmd | 0x0002 | 0x0004));   /* memory space + master */
+
+    uint32_t off = (uint32_t)(PCI_BAR0 + bar * 4);
+    uint32_t v = pci_read32(pd.bus, pd.slot, pd.func, (uint8_t)off);
+    if (v & 1) return DRV_ENOSYS;                     /* I/O BAR, not MMIO */
+    pci_write32(pd.bus, pd.slot, pd.func, (uint8_t)off, 0xFFFFFFFFu);
+    uint32_t probe = pci_read32(pd.bus, pd.slot, pd.func, (uint8_t)off);
+    pci_write32(pd.bus, pd.slot, pd.func, (uint8_t)off, v);
+    uint32_t size = ~(probe & ~0xFu) + 1;
+
+    d->win_phys = (uint64_t)(v & ~0xFu);
+    d->win_len  = size ? (uint64_t)size : 0x1000ull;
+    d->bdf      = (uint16_t)((pd.bus << 8) | (pd.slot << 3) | pd.func);
+    if (out_phys) *out_phys = d->win_phys;
+    if (out_len)  *out_len  = d->win_len;
+    return 0;
+}
+
+/* Map that window into the driver's OWN address space.
+ *
+ * UNCACHED, and that is not a detail: a device register mapped cacheable reads
+ * back what the CPU cached the first time and stops tracking the hardware — the
+ * same trap §M33 stage 5 hit reading the IOMMU's own capability register, and
+ * silent both times.
+ *
+ * Bounded by the window the kernel resolved above, so a request outside it is
+ * refused with the reason rather than mapped. */
+long drvuser_sys_mmio(uint64_t phys, uint64_t len) {
+    struct drvuser* d = du_current();
+    if (!d) return DRV_EBAD;
+    if (!d->win_phys) return DRV_EBAD;             /* ask for the window first */
+    if (phys < d->win_phys || phys + len > d->win_phys + d->win_len) {
+        kprintf("drv-user: '%s' asked to map %x..%x, its window is %x..%x\n",
+                d->mf->name, (unsigned)phys, (unsigned)(phys + len),
+                (unsigned)d->win_phys, (unsigned)(d->win_phys + d->win_len));
+        return DRV_EBUSY;
+    }
+    struct task* t = task_current();
+    if (!t || !t->mm) return DRV_EBAD;
+
+    if (vmm_space_mmap_cursor(t->mm) == 0)
+        vmm_space_set_mmap_cursor(t->mm, vmm_user_base() + 0x10000000u);
+    uintptr_t va = vmm_space_mmap_cursor(t->mm);
+    uint64_t n = (len + 4095) / 4096;
+    for (uint64_t i = 0; i < n; i++)
+        if (vmm_space_map(t->mm, va + (uintptr_t)i * 4096,
+                          (uintptr_t)(phys + i * 4096),
+                          VMM_USER | VMM_WRITABLE | VMM_CACHE_DIS | VMM_SHARED) != 0)
+            return DRV_ENORES;
+    vmm_space_set_mmap_cursor(t->mm, va + (uintptr_t)n * 4096);
+    kprintf("drv-user: '%s' mapped its %x-byte register window at %x in ring 3\n",
+            d->mf->name, (unsigned)len, (unsigned)va);
+    d->h_mmio_va = va;
+    return (long)va;
+}
+
+/* A DMA buffer: allocated, CONFINED to this driver's IOMMU domain, and mapped
+ * into its address space.  The device address is returned separately from the
+ * CPU one — they are equal today and are not the thing being conflated. */
+long drvuser_sys_dma(int bytes, int addr_bits, uint64_t* out_dev) {
+    struct drvuser* d = du_current();
+    if (!d) return DRV_EBAD;
+    if (bytes <= 0 || bytes > d->mf->dma_bytes) {
+        kprintf("drv-user: '%s' asked for %d DMA bytes, manifest allows %d\n",
+                d->mf->name, bytes, d->mf->dma_bytes);
+        return DRV_EBUSY;
+    }
+    if (addr_bits <= 0 || addr_bits > 64) addr_bits = 32;
+
+    uint32_t frames = (uint32_t)((bytes + 4095) / 4096);
+    uint64_t limit = (addr_bits >= 64) ? ~0ull : ((1ull << addr_bits) - 1);
+    uint64_t phys;
+    if (addr_bits < 32) {
+        int order = 0; while ((1u << order) < frames) order++;
+        phys = page_alloc_below(order, (pmm_phys_t)limit);
+        if (phys == PMM_ALLOC_FAIL) phys = 0;
+    } else {
+        phys = pmm_alloc_contiguous_dma32(frames);
+    }
+    if (!phys) return DRV_ENORES;
+    if (phys + (uint64_t)frames * 4096 - 1 > limit) return DRV_ENORES;
+
+    /* CONFINE BEFORE MAPPING.  The device must not be able to reach the buffer
+     * on a wider domain even briefly — and doing it in this order means a
+     * failure here leaves a device that can reach less, never more. */
+    if (d->bdf) iommu_confine(d->bdf, phys, (uint64_t)frames * 4096);
+
+    struct task* t = task_current();
+    if (!t || !t->mm) return DRV_EBAD;
+    if (vmm_space_mmap_cursor(t->mm) == 0)
+        vmm_space_set_mmap_cursor(t->mm, vmm_user_base() + 0x10000000u);
+    uintptr_t va = vmm_space_mmap_cursor(t->mm);
+    for (uint32_t i = 0; i < frames; i++)
+        if (vmm_space_map(t->mm, va + (uintptr_t)i * 4096,
+                          (uintptr_t)(phys + (uint64_t)i * 4096),
+                          VMM_USER | VMM_WRITABLE | VMM_SHARED) != 0)
+            return DRV_ENORES;
+    vmm_space_set_mmap_cursor(t->mm, va + (uintptr_t)frames * 4096);
+
+    d->dma_phys = phys;
+    if (out_dev) *out_dev = phys;
+    kprintf("drv-user: '%s' got %d DMA bytes at %x, confined and mapped at %x\n",
+            d->mf->name, bytes, (unsigned)phys, (unsigned)va);
+    return (long)va;
+}
+

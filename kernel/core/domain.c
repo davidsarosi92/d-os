@@ -125,8 +125,23 @@ int domain_enforceable(uint32_t domain, const char** why) {
  * DMA-capable driver in ring 3 is ALLOWED (once Tier 1 exists) and is NOT
  * isolated until an IOMMU constrains the device.  A single boolean would have
  * to pick one of those to report, and either choice misleads. */
-enum domain_isolation domain_isolation_of(uint32_t domain, int does_dma) {
+enum domain_isolation domain_isolation_of(uint32_t domain, int does_dma,
+                                          int device_confined) {
     if (domain == DOMAIN_KERNEL) return ISOL_NONE;
+    /* §M33 COMPLETE — THE VERDICT MOVES, AND ONLY THIS FAR.
+     *
+     * A DMA driver in ring 3 whose DEVICE is confined by an IOMMU to that
+     * driver's own buffers is isolated in both directions that matter: it
+     * cannot reach kernel memory (its address space is its own) and neither can
+     * the hardware it commands (its domain holds nothing else).  That second
+     * half is what `ADVISORY(!)` has meant since stage 1, and it is now a fact
+     * the caller can establish rather than a hope.
+     *
+     * `device_confined` is passed IN rather than looked up here, because this
+     * file must not know how a driver is placed — and because a caller that
+     * cannot establish it passes 0, which keeps the cautious answer the
+     * default. */
+    if (does_dma && device_confined) return ISOL_FULL;
     /* §M33 STAGE 5 — AND THE ANSWER DELIBERATELY DOES NOT CONSULT `iommu_get`.
      *
      * The machine may well have DMA remapping hardware; stage 5's first half
@@ -162,12 +177,12 @@ const char* domain_isolation_reason(int does_dma) {
          * is that the machinery WORKS, not that any driver is confined by it.
          * Per-driver domains are what `drv_dma_request` would have to build,
          * and they are not built. */
-        return "translation is ON and confinement is PROVEN (a device given a "
-               "window is refused outside it, by the hardware, at the exact "
-               "address) — but nothing wires it to a driver: every device sits "
-               "in one identity domain, `drv_dma_request` builds no domain of "
-               "its own, and virtio devices bypass the unit entirely because "
-               "our drivers are legacy (`iommu` lists which)";
+        return "translation is ON and a driver's own buffers become its "
+               "domain, so a DMA driver PLACED IN RING 3 reports `full`.  Still "
+               "advisory for the rest, and for two named reasons: a driver in "
+               "the KERNEL is not isolated by anything the IOMMU does, and "
+               "virtio devices bypass the unit entirely because our drivers are "
+               "legacy (`iommu` lists which)";
     case IOMMU_PRESENT:
         return "this machine HAS an IOMMU and we do not program it yet "
                "(§M33 stage 5) — unfinished work, not a hardware limit";

@@ -68,6 +68,11 @@ int  drvuser_events(const char* name);
  * is driving the device, not merely running.  A pid alone is not that. */
 int  drvuser_ready(const char* name);
 
+/* 1 when this placed driver's DEVICE is confined to an IOMMU domain holding
+ * only that driver's buffers.  The one fact that lets a DMA driver in ring 3 be
+ * reported as isolated rather than advisory. */
+int  drvuser_confined(const char* name);
+
 /* The syscall bodies.  Arch dispatchers call these; they check the caller. */
 long drvuser_sys_ports(uint16_t base, uint16_t count);
 long drvuser_sys_irq(int line);
@@ -76,5 +81,8 @@ long drvuser_sys_ports_lock(drv_handle h, int max_ms);
 long drvuser_sys_ports_unlock(drv_handle h);
 long drvuser_sys_input(int dx, int dy, unsigned buttons, int dz);
 long drvuser_sys_log(const char* msg);
+long drvuser_sys_window(int bar, uint64_t* out_phys, uint64_t* out_len);
+long drvuser_sys_mmio(uint64_t phys, uint64_t len);
+long drvuser_sys_dma(int bytes, int addr_bits, uint64_t* out_dev);
 
 #endif /* DRVUSER_H */

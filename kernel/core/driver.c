@@ -621,7 +621,8 @@ void driver_domains_list(void) {
         domain_set_str(d->domains ? d->domains : DOMAIN_KERNEL, decl, sizeof decl);
         uint32_t at = driver_domain(d);
         enum domain_isolation iso =
-            domain_isolation_of(at, (d->flags & DRVF_DMA) ? 1 : 0);
+            domain_isolation_of(at, (d->flags & DRVF_DMA) ? 1 : 0,
+                                drvuser_confined(d->name));
         kprintf("  %s: at %s, can be %s, isolation %s%s%s\n",
                 d->name, domain_name(at), decl, domain_isolation_name(iso),
                 (d->flags & DRVF_BOOT_CRITICAL) ? ", boot-critical" : "",

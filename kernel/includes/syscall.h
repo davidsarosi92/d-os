@@ -125,6 +125,15 @@
  * placed driver must not be able to mask an interrupt line itself. */
 #define SYS_DRV_PORTS_LOCK  0xD065  /* (handle, max_ms) → 0 / <0               */
 #define SYS_DRV_PORTS_UNLOCK 0xD066 /* (handle) → 0 / <0                       */
+/* §M33 — giving a placed driver its device.  A ring-3 driver cannot read PCI
+ * config space and must not be able to: config space reaches every device on the
+ * machine.  So the kernel resolves the device, does the privileged half of
+ * bring-up, and hands back only what the manifest allows — and every address the
+ * driver ever sees came from here, which is what makes the bound real rather
+ * than merely checked. */
+#define SYS_DRV_WINDOW      0xD067  /* (bar, out[2] u64) → 0 / <0              */
+#define SYS_DRV_MMIO        0xD068  /* (phys, len) → user VA / <0              */
+#define SYS_DRV_DMA         0xD069  /* (bytes, addr_bits, out_dev*) → VA / <0  */
 
 #define SYS_DOSGUI_CREATE   0xD050  /* (w, h, title) → handle / -1             */
 #define SYS_DOSGUI_PRESENT  0xD051  /* (handle, px, w[, stride]) → 0 / -1      */

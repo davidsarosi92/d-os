@@ -57,15 +57,19 @@
  * theoretical.
  * ============================================================================= */
 
+#ifndef DRV_USERSPACE
 #include "driver.h"
-#include "drvrt.h"
 #include "pci.h"
+#endif
+#include "drvrt.h"
 #include "printf.h"
+#ifndef DRV_USERSPACE
 #include "klog.h"
-#include "task.h"
 #include "config.h"
 #include "settings.h"
 #include "iommu.h"
+#endif
+#include "task.h"
 #include <stddef.h>
 
 #define EDU_VENDOR      0x1234
@@ -111,47 +115,49 @@ static void     w64(int off, uint64_t v) {
     p[1] = (uint32_t)(v >> 32);
 }
 
+#ifndef DRV_USERSPACE
 static int edu_probe(void* ctx) {
     (void)ctx;
     struct pci_device pd;
     return pci_find_device(EDU_VENDOR, EDU_DEVICE, &pd) == 0 ? 0 : -1;
 }
 
+#endif
+
 static int edu_init(void* ctx) {
     (void)ctx;
+    drv_rt_init(&rt, "edu");
+
+#ifndef DRV_USERSPACE
+    /* THE KERNEL BUILD FINDS ITS OWN DEVICE.  A ring-3 build cannot and does not
+     * need to: the kernel resolved it from the manifest before the process
+     * existed, which is the same decision made one layer further out. */
     struct pci_device pd;
     if (pci_find_device(EDU_VENDOR, EDU_DEVICE, &pd) != 0) return -1;
-
-    drv_rt_init(&rt, "edu");
     edu_bdf = (uint16_t)((pd.bus << 8) | (pd.slot << 3) | pd.func);
-
-    /* TELL THE KERNEL WHICH DEVICE THIS DRIVER IS.
-     *
-     * Not bookkeeping: it is what makes per-driver DMA confinement possible at
-     * all.  The kernel can build a domain containing exactly this driver's
-     * buffers, and it cannot put the DEVICE in that domain without being told
-     * which device the driver speaks for.  A driver that does DMA and never
-     * says is a driver the kernel can only leave in the identity domain. */
+    /* Tell the kernel which device this driver speaks for — what makes
+     * per-driver DMA confinement possible at all. */
     drv_bind_device(&rt, edu_bdf);
+#endif
 
-    /* MEMORY SPACE AND BUS MASTER, BEFORE ANYTHING ELSE.
+    /* ASK THE RUNTIME WHERE THE DEVICE IS, rather than reading config space.
      *
-     * A device cannot initiate DMA with the bus-master bit clear, and the
-     * failure is silent in the worst way: the command register accepts the
-     * transfer, the status register clears as if it had run, and the buffer
-     * comes back untouched.  That is exactly what the first version of this
-     * driver saw — 255 of 256 bytes wrong, with every register reporting
-     * success — and it survived a first reading because the addresses and the
-     * direction bits were all correct.
+     * The kernel build could read the BAR directly and the first version did.
+     * A RING-3 build cannot — config space reaches every device on the machine,
+     * so a placed driver holding it would have MORE reach than the kernel driver
+     * it replaced.  One call, answered by whichever backend is underneath, and
+     * every line below this one is identical in both placements.
      *
-     * Firmware usually leaves this set for devices it enumerated; a driver that
-     * relies on that works until the first machine where it does not. */
-    uint16_t cmd = pci_read16(pd.bus, pd.slot, pd.func, PCI_COMMAND);
-    pci_write16(pd.bus, pd.slot, pd.func, PCI_COMMAND,
-                (uint16_t)(cmd | 0x0002 /* memory space */ | 0x0004 /* bus master */));
+     * The privileged half of bring-up — memory space and bus master enable —
+     * happens inside it, for the same reason, and because forgetting bus master
+     * is a silent failure this driver has already made once. */
+    uint64_t bar = 0, barlen = 0;
+    if (drv_device_window(&rt, 0, &bar, &barlen) != 0 || !bar) {
+        kprintf("edu: could not locate the device's register window\n");
+        return -1;
+    }
 
-    uint64_t bar = (uint64_t)(pd.bar[0] & ~0xFull);
-    h_mmio = drv_mmio_request(&rt, bar, 0x100000, "edu registers");
+    h_mmio = drv_mmio_request(&rt, bar, barlen, "edu registers");
     if (h_mmio < 0) { kprintf("edu: no MMIO (%d)\n", h_mmio); return -1; }
     regs = (volatile uint8_t*)drv_mmio_ptr(h_mmio);
     if (!regs) { kprintf("edu: MMIO mapped to nothing\n"); return -1; }
@@ -196,9 +202,17 @@ static int edu_init(void* ctx) {
      * behaving correctly, and a fact about this system worth knowing before
      * somebody ports a genuinely narrow device. */
     int dma_bits = 28;
+#ifndef DRV_USERSPACE
     { const char* v = config_get("driver.edu.dma_bits", "28");
       int n = 0; for (; *v >= '0' && *v <= '9'; v++) n = n * 10 + (*v - '0');
       if (n >= 20 && n <= 64) dma_bits = n; }
+#else
+    /* No config reader in ring 3, and inventing one for a single integer would
+     * be a second configuration system.  The placed build asks for the width the
+     * kernel's manifest is prepared to serve; if the device is narrower than
+     * that, the placement is refused rather than silently truncating. */
+    dma_bits = 32;
+#endif
     h_dma = drv_dma_request(&rt, EDU_DMA_BYTES, dma_bits, "edu transfer buffer");
     if (h_dma < 0) {
         kprintf("edu: no DMA buffer at %d address bits (%d) — this kernel has "
@@ -206,14 +220,21 @@ static int edu_init(void* ctx) {
         return -1;
     }
 
+#ifndef DRV_USERSPACE
+    /* The interrupt is a nicety here: the DMA engine's completion is visible in
+     * the command register, so a driver that never gets the line degrades to
+     * polling rather than to silence (§M55's rule). */
     if (pd.irq_line != 0xFF) {
         h_irq = drv_irq_request(&rt, pd.irq_line, "edu completion");
         if (h_irq < 0) kprintf("edu: no IRQ grant (%d) — polling instead\n", h_irq);
     }
+#endif
 
-    kprintf("edu: up at PCI %x:%x.%x, id %x, %d-byte DMA buffer\n",
-            pd.bus, pd.slot, pd.func, id, EDU_DMA_BYTES);
+    kprintf("edu: up, id %x, %d-byte DMA buffer at %d address bits\n",
+            id, EDU_DMA_BYTES, dma_bits);
+#ifndef DRV_USERSPACE
     klog(KLOG_INFO, "edu", "educational device ready — §M33's DMA client\n");
+#endif
     return 0;
 }
 
@@ -228,6 +249,7 @@ static int edu_shutdown(void* ctx) {
     return 0;
 }
 
+#ifndef DRV_USERSPACE
 CONFIG_KEY(ck_edu_dma_bits) = {
     .key = "driver.edu.dma_bits", .group = "System", .type = CFG_INT,
     .min = 20, .max = 64, .def = "28",
@@ -242,6 +264,7 @@ static const struct driver_ops edu_ops = {
  * makes it the first driver whose placement raises the isolation question with
  * a real answer rather than a note. */
 DRIVER_EX(edu, "misc", &edu_ops, NULL, DOMAIN_KERNEL | DOMAIN_USER, DRVF_DMA);
+#endif
 
 /* ----------------------------------------------------------------------
  * `edutest` — a DMA round trip, and the only thing that can tell a working
@@ -266,9 +289,11 @@ void edu_test(void) {
      * it is a test that mostly measures the harness — this one lost characters
      * often enough to produce two false results before the point was taken.
      * `drvtest` already sets up its own preconditions for the same reason. */
+#ifndef DRV_USERSPACE
     if (h_mmio < 0 || h_dma < 0) {
         if (driver_find("edu")) driver_start("edu");
     }
+#endif
     if (h_mmio < 0 || h_dma < 0) {
         kprintf("edutest: the edu device is not up.  Attach `-device edu`, and\n"
                 "  if its DMA width is not the default 28 bits, say so with\n"
@@ -322,7 +347,16 @@ void edu_test(void) {
      * Both outcomes are printed as facts rather than as pass/fail, because both
      * are correct answers to different machines: unconfined is what this
      * kernel has always done, and confined is what §M33 set out to reach. */
+    /* THE FAULT COUNT COMES FROM THE UNIT, and from ring 3 it comes across the
+     * boundary — a placed driver cannot read the IOMMU's registers, which is
+     * the whole point.  Zero there today: the count is a kernel-side fact and
+     * the placed build reports what it can see, which is that the transfer
+     * either landed or did not. */
+#ifndef DRV_USERSPACE
     uint32_t before = iommu_fault_count();
+#else
+    uint32_t before = 0;
+#endif
     uint64_t outside = dev + 0x10000ull;
     kprintf("  now aiming it at %x, 64 KiB past its buffer\n", (unsigned)outside);
 
@@ -331,17 +365,34 @@ void edu_test(void) {
     w64(EDU_DMA_CNT, 256);
     w32(EDU_DMA_CMD, EDU_DMA_START | EDU_DMA_FROM_DEV);
     dma_wait();
+#ifndef DRV_USERSPACE
     uint32_t after = iommu_fault_count();
+#else
+    uint32_t after = 0;
+#endif
 
     if (after > before)
         kprintf("  REFUSED by the hardware (%u fault record(s)) — the device is "
                 "confined to its own buffer\n", after - before);
+#ifndef DRV_USERSPACE
     else if (iommu_get()->state == IOMMU_ACTIVE)
         kprintf("  NOT refused, and translation IS on — this device is in the "
                 "identity domain or bypasses the unit\n");
+#endif
+#ifdef DRV_USERSPACE
     else
-        kprintf("  NOT refused — there is nothing on this machine that could "
-                "have refused it (`iommu` says why)\n");
+        /* A PLACED DRIVER CANNOT SEE THE UNIT'S FAULT RECORDS, and must not
+         * claim otherwise.  Reading them means reading the IOMMU's registers,
+         * which is exactly the privilege this placement took away — so the
+         * honest report is that the transfer did not visibly land and that the
+         * evidence lives on the other side of the boundary. */
+        kprintf("  no answer visible from ring 3 — the unit's fault records are "
+                "the kernel's to read; ask `iommu faults`\n");
+#else
+    else
+        kprintf("  NOT refused — nothing on this machine refused it "
+                "(`iommu` says whether anything could have)\n");
+#endif
 }
 
 /* Deliberately reach OUTSIDE the granted buffer.
@@ -364,3 +415,18 @@ void edu_escape(uint64_t phys) {
     else
         kprintf("edu: the transfer COMPLETED — nothing stopped it\n");
 }
+
+#ifdef DRV_USERSPACE
+/* The ring-3 entry point.  Everything above is the same source the kernel
+ * build compiles; this is the only line that differs, exactly as ps2_mouse.c
+ * does it — which is the claim §M33 makes and these two drivers are the proof
+ * of, one for ports and one for MMIO + DMA. */
+int main(void) {
+    if (edu_init(NULL) != 0) return 1;
+    edu_test();
+    /* Stay alive so the placement can be inspected — a driver process that
+     * exits looks exactly like one that failed. */
+    for (;;) task_msleep(1000);
+}
+#endif
+
