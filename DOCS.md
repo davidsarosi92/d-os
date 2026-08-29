@@ -10937,6 +10937,131 @@ itself rather than a claim in a document.
 
 ---
 
+### 4.84 AHCI — storage on hardware that is not a hypervisor's
+
+**`kernel/drivers/block/ahci.c`.**  Until this shipped, d-os had exactly one
+block driver — virtio-blk — which means that on **any physical machine there was
+no disk at all**: no persistent config, no exFAT mount, nothing surviving a
+reboot.  Everything §M63 and §M64 built on "the persistent volume" was, on real
+hardware, built on nothing.
+
+AHCI is what every SATA controller made this century speaks, and what QEMU,
+VirtualBox and VMware all present.  **Matched by PCI CLASS (01/06/01), not by
+vendor ID** — which is exactly why it is worth more than a hypervisor-specific
+device: Intel, AMD, VMware and VirtualBox present different IDs and the same
+programming interface.
+
+The device manager (§4.83) put it on the list before the driver existed — on a
+q35 machine it printed `Intel ICH9 SATA controller (AHCI) 0:1f.2 (none) needs a
+driver`, the machine reporting the gap about itself.
+
+#### Four things that are silent when you get them wrong
+
+* **Alignment is architectural.**  Command list 1 KiB, FIS area 256 B, command
+  table 128 B.  The controller *ignores* the low bits rather than complaining,
+  so a misaligned structure means it reads a different address than the one you
+  wrote — a wrong transfer, not an error.  One contiguous frame is laid out by
+  hand (`+0` list, `+1024` FIS, `+2048` table) so every requirement is met by
+  construction rather than by three allocations that each happen to come back
+  aligned.
+* **The port must be stopped before its pointers move** — ST and FRE clear AND
+  CR and FR observed clear.  Writing CLB while the engine runs points live
+  hardware at memory that is about to be something else.
+* **PRDT byte count is count MINUS ONE.**  Off by one in the direction that
+  still works for most transfers is the worst kind.
+* **A bounce buffer, deliberately.**  The caller's buffer is a kernel virtual
+  address and the controller needs a physical one; on i386 those are equal
+  inside the identity map and on x86_64 they are not.  One owned buffer plus a
+  copy removes a class of bug where a driver works until somebody passes it an
+  allocation from the wrong allocator.
+
+Every wait is bounded and says so when it expires: a storage driver that spins
+forever on a controller that stopped answering does not merely fail to read a
+sector, it takes down whatever asked — and at boot that is the boot task.
+ATAPI is **refused by name** rather than attempted (2048-byte sectors, packet
+commands: driving it as a disk gives a mount failure nothing explains), and a
+disk reporting zero sectors is refused rather than registered, because a block
+device that lies about its size lets the filesystem write past the end.
+
+#### THE MOUNT WOULD HAVE MADE THE WHOLE THING USELESS
+
+Both boot paths mounted **`"vda"` by name**.  That was right while virtio-blk was
+the only block driver and wrong the moment a second one existed: **on a physical
+machine there is no `vda`**, so the driver written to give real hardware a
+persistent volume would have registered `sda` and *nothing would ever have
+mounted it*.  The driver would have looked finished and delivered nothing —
+§M64's shortcut bug in a new place, true about the mechanism and false about the
+outcome.
+
+`blk_mount_first()` tries each registered device until one mounts, in
+**registration order** (which is `driver_init_all` order, i.e. dependency order)
+so a machine with both disks keeps mounting the one it mounted yesterday — a
+rule that reordered volumes between boots would move where settings live without
+anybody asking.  The boot log now **names the winner**: `storage: /mnt is on sda`.
+
+`blktest` took no argument and was hard-wired to `vda`, so the one test that
+could establish that this driver reads and writes a real disk could not be
+pointed at it.  It takes a device name now.
+
+#### Verified with NO virtio disk present at all — the physical-machine case
+
+`ahci: controller at 0:4.0, ABAR febd2000, 6 port(s), 32 slot(s), AHCI 10000` →
+`sda` registers with the 65536 sectors IDENTIFY reports (exactly the image size)
+→ `exfat: mounted dev=sda` → `storage: /mnt is on sda` → `config: persistent
+store /mnt/d-os.conf created` → a file written on boot 1 is read back on boot 2
+with the store reported as **`loaded`**, not created.
+
+And the **host** sees `a5 5a a5 5a …` at byte 512 of the image after
+`blktest sda` — our own reader agreeing with our own writer would only prove
+they share a misunderstanding (§4.73's rule).
+
+#### Open
+
+* **aarch64 is deliberately not built** with this: `-M virt` has a PCIe bus, but
+  the portable `vmm_map_4mib` takes 32-bit arguments there and an ECAM BAR is a
+  high address.  Stated rather than attempted.
+* **Polled, not interrupt-driven.**  §M55's rule is that a driver should learn
+  its interrupt works by RECEIVING one; until that is built a bounded poll is
+  correct and merely coarse.
+* **Slot 0 only.**  The block layer above is synchronous, so 32 command slots
+  buy nothing until somebody issues overlapping requests — said plainly rather
+  than left as a comment claiming a queue depth the code does not have.
+* No ATAPI, no NCQ, no port multiplier, no hot-plug on the SATA link.
+
+### 4.84.1 The harness had no sound card — the fifth time this shape appeared
+
+`run_qemu.sh` has attached an audio device since §M23.  `dos-shell-test.py`
+never did, so **every automated run booted a machine with no audio hardware** —
+`lsaudio` empty, the taskbar indicator permanently in its "no device" state, and
+any regression in the audio path invisible to every test in the project.  That
+is the §M48 missing-NIC / §M49 missing-`-smp` / §4.66 missing-disk / §4.67.1
+missing-VGA shape for the fifth time.
+
+Both branches now attach a card by default — AC97 on x86, virtio-sound on a
+virtio-MMIO slot for aarch64 (that arch has no PCI slot for an AC97) — with
+**`--no-audio`** as the deliberate escape, because §M23's *third* taskbar
+indicator state IS the no-device machine and a state nobody can boot into is a
+state nobody has tested.
+
+The default backend is QEMU's **null** one: the guest still sees a real sound
+card, which is the thing under test, while an automated run does not fight the
+host for its speakers.  `--audio-backend wav` is how a test CAPTURES what was
+played, which is how §M23 measured every one of its numbers.
+
+**And `beep`/`tone` lived in `shell.c`**, so aarch64 — which runs its own
+`serial_shell.c` — could list an audio device and had no way to make a sound.
+§M24's rule broken in the usual direction, and on the arch whose audio device is
+hardest to reach.  Moved into `audio.c` next to `play` and `volume`; both shells
+now run one copy.
+
+**Verified on all three arches:** default boot registers a device
+(`audio: registered ac97` / `registered virtio-snd`), `--no-audio` gives
+`no audio devices`, and `tone 440 200` reports
+`playing 440 Hz for 200 ms (9600 frames)` — including on aarch64, where the
+command did not previously exist.
+
+---
+
 ## 8. Change log
 
 - **2026-08-29 — THE DEVICE MANAGER, AND THE THREE DEFECTS A JOINED-UP VIEW
