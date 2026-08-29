@@ -11060,6 +11060,38 @@ now run one copy.
 `playing 440 Hz for 200 ms (9600 frames)` — including on aarch64, where the
 command did not previously exist.
 
+#### The capture warnings on macOS, and why they stay
+
+Reported from use immediately after the above shipped: booting on macOS prints,
+repeatedly,
+
+```
+audio: Can not open `ac97.pi' (no host audio driver)
+audio: Can not open `ac97.mc' (no host audio driver)
+```
+
+which reads exactly like a broken sound setup and is not one.  **QEMU's
+CoreAudio backend is OUTPUT-ONLY**, and every card we attach opens CAPTURE
+streams too — AC97 its line-in (`pi`) and microphone (`mc`), virtio-sound its RX
+queue.  Measured rather than assumed: with `-audiodev coreaudio` the guest still
+reports `audio: registered ac97` and `playing 440 Hz for 200 ms (9600 frames)`,
+so **playback is unaffected**; an output-only HDA codec on the same backend is
+completely silent, which is what identifies capture as the cause.
+
+There is no property on AC97 (or virtio-sound) to turn capture off, and swapping
+to an output-only HDA codec would leave the everyday boot with no working driver
+— `hda` is a §M67 module and nothing starts it automatically.
+
+**The warnings are therefore not removable, and they are deliberately not
+FILTERED.**  A script that greps its own tool's stderr is the harness that
+silently loses output, and this project has paid for that once already (§M57).
+What is fixed is the confusion: `run_qemu.sh` prints the explanation *before*
+QEMU does, and states the fact underneath, which is worth more than the tidy
+console — **`rec` cannot work on this host at all.**  Somebody debugging our
+recording path on a Mac would otherwise be chasing a limitation of the
+emulator's backend.  §M23 stage 7 had already recorded that no backend here can
+INJECT a known signal; this is the stronger statement for macOS.
+
 ---
 
 ## 8. Change log

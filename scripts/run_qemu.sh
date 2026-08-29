@@ -137,6 +137,40 @@ dos_audio_backend() {
     esac
 }
 
+# -----------------------------------------------------------------------------
+# EXPLAIN THE CAPTURE WARNINGS BEFORE QEMU PRINTS THEM.
+#
+# Reported from use: booting on macOS prints, several times,
+#
+#     audio: Can not open `ac97.pi' (no host audio driver)
+#     audio: Can not open `ac97.mc' (no host audio driver)
+#
+# and it reads exactly like a broken sound setup.  It is not.  **QEMU's
+# CoreAudio backend is OUTPUT-ONLY**, and every sound card we attach opens
+# CAPTURE streams as well — AC97 its line-in (`pi`) and microphone (`mc`),
+# virtio-sound its RX queue.  There is no property on any of those devices to
+# turn capture off (an output-only HDA codec is silent here, and swapping to one
+# would leave the everyday boot with no driver, since `hda` is a §M67 module
+# nothing starts automatically).
+#
+# So the warnings cannot be removed, and they must not be FILTERED either: a
+# script that greps its own tool's stderr is the harness that silently loses
+# output, and this project has already paid for that once (§M57).
+#
+# What CAN be fixed is the confusion, and the fact underneath is worth stating
+# on its own: **`rec` cannot work on this host.**  Somebody debugging our
+# recording path on a Mac would otherwise be chasing a limitation of the
+# emulator's backend.  §M23 stage 7 already recorded that no backend here can
+# INJECT a known signal; this is the stronger statement for macOS.
+# -----------------------------------------------------------------------------
+dos_audio_note() {
+    [ "$1" = "coreaudio" ] || return 0
+    echo "run: audio out works; QEMU's CoreAudio backend has NO CAPTURE, so the" >&2
+    echo "run:   'Can not open ac97.pi / ac97.mc' lines below are expected and" >&2
+    echo "run:   harmless — playback is unaffected, but \`rec\` cannot work here." >&2
+    echo "run:   Silence them with --no-audio (the guest then has no sound card)." >&2
+}
+
 dos_prepare_disk() {
     _p="$1"
     case "$DISK_MODE" in
@@ -212,6 +246,7 @@ if [ "$ARCH" = "aarch64" ]; then
     # same way this machine gets every other device.
     AUDIO_BACKEND=$(dos_audio_backend)
     if [ "$AUDIO_BACKEND" != "none" ]; then
+        dos_audio_note "$AUDIO_BACKEND"
         QEMU_MACHINE="$QEMU_MACHINE -audiodev $AUDIO_BACKEND,id=snd0 \
             -device virtio-sound-device,audiodev=snd0"
     fi
@@ -323,6 +358,7 @@ if command -v "$QEMU" >/dev/null 2>&1; then
     # §M23 — AC97, the codec both x86 arches drive.
     AUDIO_BACKEND=$(dos_audio_backend)
     if [ "$AUDIO_BACKEND" != "none" ]; then
+        dos_audio_note "$AUDIO_BACKEND"
         EXTRA="$EXTRA -audiodev $AUDIO_BACKEND,id=snd0 -device AC97,audiodev=snd0"
     fi
     if [ "$(uname -s)" = "Darwin" ]; then
