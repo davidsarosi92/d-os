@@ -947,6 +947,180 @@ int modload_is_loaded(const char* name) { return mod_find(name) != NULL; }
  * ============================================================================= */
 static int g_autoload_done = 0;
 
+/* ----------------------------------------------------------------------
+ * BROWSE — what is on the disk, what it provides, and whether it WOULD load.
+ *
+ * Asked for from use: "swap, update, browse a driver for a device."  Browsing
+ * is the half that has to come first, and it has to answer more than a
+ * directory listing does.  A `.ko` file tells you nothing about which driver it
+ * provides or whether this kernel can take it — and the one thing somebody
+ * wants to know before replacing a working driver is exactly that.
+ *
+ * So this reads the descriptor WITHOUT loading: the module ABI put its scalar
+ * fields ahead of its pointers precisely so a module can be judged straight out
+ * of the FILE before anything is allocated or relocated (§M67).  The same
+ * property that lets a stale module be refused cheaply lets a good one be
+ * DESCRIBED cheaply.
+ * ---------------------------------------------------------------------- */
+
+static int mod_is_loaded(const char* modname) {
+    for (int i = 0; i < MOD_MAX; i++)
+        if (g_mods[i].used && m_strcmp(g_mods[i].name, modname) == 0) return 1;
+    return 0;
+}
+
+/* Read just the descriptor.  Returns 0 and fills `out` when the file is a
+ * module for this kernel; -1 when it is not one at all; -2 when it IS one and
+ * this kernel would refuse it (stale ABI, wrong width).  The three answers are
+ * kept apart because "not a module" and "a module I cannot take" send somebody
+ * to completely different places. */
+static int mod_peek(const char* path, struct module_abi* out) {
+    struct file* f = vfs_open(path, 0);
+    if (!f) return -1;
+
+    /* Same read loop modload_load uses — this VFS has no size call, and a
+     * second way of reading a module would be a second way of getting it
+     * wrong. */
+    size_t cap = 1u << 20, len = 0;
+    uint8_t* img = (uint8_t*)kmalloc(cap);
+    if (!img) { vfs_close(f); return -1; }
+    for (;;) {
+        ssize_t n = vfs_read(f, img + len, cap - len);
+        if (n <= 0) break;
+        len += (size_t)n;
+        if (len == cap) break;
+    }
+    vfs_close(f);
+
+    int rc = -1;
+    const struct elf_ehdr* eh = (const struct elf_ehdr*)img;
+    if (len >= sizeof *eh && eh->e_ident[0] == 0x7F &&
+        eh->e_ident[1] == 'E' && eh->e_ident[2] == 'L' && eh->e_ident[3] == 'F') {
+        const struct elf_shdr* sh = (const struct elf_shdr*)(img + eh->e_shoff);
+        const char* shstr = (const char*)(img + sh[eh->e_shstrndx].sh_offset);
+        for (uint16_t i = 0; i < eh->e_shnum; i++) {
+            if (m_strcmp(shstr + sh[i].sh_name, ".dosmod") != 0) continue;
+            if (!in_bounds((size_t)sh[i].sh_offset, sizeof *out, len)) break;
+            const struct module_abi* d =
+                (const struct module_abi*)(img + sh[i].sh_offset);
+            *out = *d;
+            /* QUIETLY, unlike insmod: browsing a directory must not print a
+             * complaint per file.  The caller reports the verdict in its own
+             * column, which is where somebody looking at a list wants it. */
+            /* THE FINGERPRINT TOO, not just the hand-bumped ABI number.
+             *
+             * The first version checked magic/width/abi and reported
+             * `stale-fp.ko` as loadable — a module insmod refuses.  A verdict
+             * that errs towards "this would work" is worse than no verdict,
+             * because its whole purpose is to be trusted BEFORE somebody swaps
+             * out a driver that currently does.
+             *
+             * §M67 built both checks for a reason and neither is sufficient:
+             * the fingerprint catches a struct that changed size, the ABI
+             * number catches a change of MEANING that moved no struct.  So this
+             * has to consult both, exactly as insmod does. */
+            rc = 0;
+            if (d->magic != MODULE_ABI_MAGIC ||
+                d->word_bytes != (uint16_t)sizeof(void*) ||
+                d->abi != DOS_MODULE_ABI ||
+                d->nstructs != (uint16_t)MODULE_ABI_NSTRUCTS) {
+                rc = -2;
+            } else {
+                static const uint16_t mine[] = MODULE_ABI_FINGERPRINT;
+                for (int q = 0; q < MODULE_ABI_NSTRUCTS; q++)
+                    if (d->sizes[q] != mine[q]) { rc = -2; break; }
+            }
+            break;
+        }
+    }
+    kfree(img);
+    return rc;
+}
+
+void modload_browse(const char* dir) {
+    /* A DIRECTORY ARGUMENT, because the interesting verdict lives somewhere
+     * else.  §M67 keeps its deliberately-broken fixtures in `/modules/test`,
+     * which autoload does not descend into — so the branch that says "this
+     * module IS one and this kernel would refuse it" had nothing to exercise
+     * it.  A path that reports a refusal only for files nobody can point it at
+     * is a path nobody has run. */
+    while (dir && *dir == ' ') dir++;
+    if (!dir || !*dir) dir = "/modules";
+
+    struct file* d = vfs_open(dir, 0);
+    if (!d) { kprintf("modules: cannot open %s\n", dir); return; }
+    kprintf("in %s:\n", dir);
+
+
+    struct dirent e;
+    int n = 0;
+    while (vfs_readdir(d, &e) > 0) {
+        int k = 0;
+        while (e.name[k]) k++;
+        if (k < 3 || e.name[k-3] != '.' || e.name[k-2] != 'k' || e.name[k-1] != 'o')
+            continue;
+
+        char path[128];
+        int p = 0;
+        while (dir[p] && p < (int)sizeof path - 2) { path[p] = dir[p]; p++; }
+        if (p && path[p-1] != '/') path[p++] = '/';
+        int j = 0;
+        while (e.name[j] && p < (int)sizeof path - 1) path[p++] = e.name[j++];
+        path[p] = 0;
+
+        struct module_abi mi;
+        int rc = mod_peek(path, &mi);
+        n++;
+        if (rc == -1) {
+            kprintf("  %s — not a module for this kernel\n", e.name);
+        } else if (rc == -2) {
+            /* The useful case: it IS a module and would be refused.  Visible
+             * BEFORE somebody swaps a working driver for it. */
+            kprintf("  %s — module '%s', built for %s: WOULD BE REFUSED "
+                    "(stale ABI or fingerprint)\n",
+                    e.name, mi.modname, mi.built_for);
+        } else {
+            kprintf("  %s — module '%s' v%s%s\n", e.name, mi.modname,
+                    mi.built_for, mod_is_loaded(mi.modname) ? "  [loaded]" : "");
+        }
+    }
+    vfs_close(d);
+    if (!n) kprintf("  (none)\n");
+}
+
+/* UPDATE — reload a loaded module from the file it came from.
+ *
+ * rmmod + insmod, with the path taken from the slot rather than from the user:
+ * "update this driver" means the one that is running, and asking for the path
+ * again is how somebody reloads a DIFFERENT module by mistake. */
+int modload_reload(const char* name) {
+    char path[96];
+    int found = 0;
+    for (int i = 0; i < MOD_MAX; i++) {
+        if (!g_mods[i].used || m_strcmp(g_mods[i].name, name) != 0) continue;
+        m_strlcpy(path, g_mods[i].path, sizeof path);
+        found = 1;
+        break;
+    }
+    if (!found) { kprintf("update: '%s' is not loaded\n", name); return -1; }
+
+    /* THE UNLOAD MAY REFUSE, and that refusal is the whole safety of this:
+     * §M66's class registries decline while somebody is inside a call, so a
+     * driver in use is not swapped out from under its user. */
+    if (modload_unload(name) != 0) {
+        kprintf("update: '%s' would not unload — nothing changed\n", name);
+        return -1;
+    }
+    if (modload_load(path) != 0) {
+        kprintf("update: '%s' unloaded but the new copy would NOT load — the\n"
+                "  device now has no driver.  `insmod %s` after fixing it.\n",
+                name, path);
+        return -1;
+    }
+    kprintf("update: reloaded '%s' from %s\n", name, path);
+    return 0;
+}
+
 void modload_autoload(void) {
     if (g_autoload_done) return;
     g_autoload_done = 1;

@@ -51,6 +51,22 @@ void modload_cmd_rmmod(const char* args);
  * feature that was wired into only one of them. */
 void modload_autoload(void);
 
+/* BROWSE — what modules are on the disk, what driver each provides, and whether
+ * this kernel would take it.  Reads each descriptor WITHOUT loading, which the
+ * module ABI's scalars-before-pointers layout is what makes cheap (§M67).
+ *
+ * The verdict matters more than the listing: "this module is stale and would be
+ * refused" is exactly what somebody wants to know BEFORE swapping out a driver
+ * that currently works. */
+void modload_browse(const char* dir);
+
+/* UPDATE — reload a loaded module from the file it came from.  The path comes
+ * from the loader's own record, not from the caller: "update this driver" means
+ * the one that is running, and asking for a path again is how somebody reloads
+ * a different module by mistake.  A refusal to unload (the class registry has a
+ * live user) aborts with nothing changed. */
+int modload_reload(const char* name);
+
 /* ----------------------------------------------------------------------
  * NOT BUILT, AND THE TRIGGER FOR BUILDING IT.
  *

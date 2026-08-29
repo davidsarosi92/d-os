@@ -4125,6 +4125,11 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "launch "))   { cmd_launch(line + 7);  return; }
     if (streq(line, "about"))  { cmd_about();      return; }
     if (streq(line, "lsmod"))  { modload_list();    return; }
+    /* §M63's rule: the shell path first, because a panel action with no
+     * headless route cannot be regression-tested here at all. */
+    if (streq(line, "modbrowse")) { modload_browse("");        return; }
+    if (starts_with(line, "modbrowse ")) { modload_browse(line + 10); return; }
+    if (starts_with(line, "modupdate ")) { modload_reload(line + 10); return; }
     if (streq(line, "lsdrv"))  { driver_list();    return; }
     /* §M33 stage 5 — what this machine can enforce against a DEVICE.  Its own
      * verb rather than a line in `lsdrv`, because the answer is a property of

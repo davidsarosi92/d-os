@@ -69,6 +69,7 @@
 #include "drvrt.h"
 #include "domain.h"
 #include "hwdev.h"
+#include "modload.h"
 #include "printf.h"
 #include <stddef.h>
 
@@ -483,6 +484,32 @@ static void act_domain(struct w_button* b, void* ctx) {
     dm_dirty = 1;
 }
 
+/* UPDATE — reload the module behind the selected device.
+ *
+ * Only meaningful for a driver that CAME from a module; a built-in one is in
+ * the kernel image and cannot be replaced without rebooting.  Rather than grey
+ * the button out, it says which case it is: a disabled control teaches nobody
+ * why, and "this driver is built in" is the answer somebody actually needs. */
+static void act_update(struct w_button* b, void* ctx) {
+    (void)b; (void)ctx;
+    struct driver* d = dm_selected();
+    if (!d) return;
+    if (modload_reload(d->name) != 0)
+        kprintf("devices: '%s' is built into the kernel — nothing to reload\n",
+                d->name);
+    dm_dirty = 1;
+}
+
+/* BROWSE — what else is on the disk that could drive something here, and
+ * whether this kernel would take it.  Prints rather than opening a picker: the
+ * verdict is the useful part, and a list of filenames in a dialog would be the
+ * part that is not. */
+static void act_browse(struct w_button* b, void* ctx) {
+    (void)b; (void)ctx;
+    modload_browse("");
+    dm_dirty = 1;
+}
+
 static void act_crash(struct w_button* b, void* ctx) {
     (void)b; (void)ctx;
     struct driver* d = dm_selected();
@@ -547,9 +574,11 @@ static void dm_layout(struct gui_window* win) {
     dm_detail = w_label_create(win, 6, ch - bar - 20, cw - 12, "Select a device.");
 
     int y = ch - bar + 2, x = 6;
-    w_button_create(win, x, y, 58, 22, "Start", act_start, NULL);   x += 62;
-    w_button_create(win, x, y, 58, 22, "Stop",  act_stop,  NULL);   x += 62;
-    w_button_create(win, x, y, 92, 22, "Move", act_domain, NULL);
+    w_button_create(win, x, y, 54, 22, "Start", act_start, NULL);   x += 58;
+    w_button_create(win, x, y, 54, 22, "Stop",  act_stop,  NULL);   x += 58;
+    w_button_create(win, x, y, 78, 22, "Move", act_domain, NULL);   x += 82;
+    w_button_create(win, x, y, 66, 22, "Update", act_update, NULL); x += 70;
+    w_button_create(win, x, y, 66, 22, "Browse", act_browse, NULL);
     /* Crash sits at the far right, away from the others.  It is the one
      * control here whose whole purpose is to break something, and the gap is
      * the only thing standing between a curious click and a stopped device. */

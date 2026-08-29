@@ -668,6 +668,8 @@ void serial_shell_entry(void) {
         else if (s_eq(cmd, "edutest"))  edu_test();
         /* §M67 — the loader's own commands, same implementation as x86. */
         else if (s_eq(cmd, "lsmod"))   modload_list();
+        else if (s_eq(cmd, "modbrowse")) modload_browse(args);
+        else if (s_eq(cmd, "modupdate")) modload_reload(args);
         else if (s_eq(cmd, "insmod"))  modload_cmd_insmod(args);
         else if (s_eq(cmd, "rmmod"))   modload_cmd_rmmod(args);
         else if (s_eq(cmd, "ksyms"))   ksym_list(args);
