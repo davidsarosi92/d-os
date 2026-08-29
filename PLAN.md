@@ -4436,6 +4436,30 @@ DMA buffer entirely.
 decoration.  None of those three bugs was reachable from any single existing
 command.*
 
+**THEN TURNED AROUND, asked from use: the list is of HARDWARE, not of drivers.**
+The question that exposes it is *what about a device with no driver?* — in a
+driver-centric list it is not a row at all, so the one case where somebody must
+go and FIND a driver was the one case nothing reported.  `hwdev.c` enumerates the
+PCI bus, then platform devices, then the drivers whose hardware is absent, in TWO
+sections (present / not present) because those are two different questions.
+`DRIVER_MATCH()` keeps the ID↔driver mapping next to the driver, and matches by
+class as well as by ID.
+
+**It found five present devices with no driver on an ordinary boot** — and on
+q35, `Intel ICH9 SATA controller (AHCI) 0:1f.2 (none) needs a driver`, which is
+item 2 below, now a fact the machine reports about itself.
+
+### 1b. Driver management per device — NOT BUILT, deliberately next
+
+Asked for alongside the above and scoped as later: **swap, update and browse a
+driver for a given device.**  The device-centric list is its prerequisite — you
+cannot offer to install a driver for a device you cannot see — and it is now
+there, with `(none) / needs a driver` marking exactly the rows that would want
+it.  What this needs that does not exist yet: a way to name a driver that is not
+loaded (a module on disk), which is §M67's `insmod` plus a place to browse; and
+`modload` registering a module's `DRIVER_MATCH` so a loaded module can claim a
+device by ID at all (see DOCS §4.83's open items).
+
 ### 2. AHCI — the one that is not about VirtualBox
 
 **Today d-os has no storage on real hardware at all.**  virtio-blk is the only
