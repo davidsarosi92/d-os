@@ -43,6 +43,7 @@
 #include "mouse.h"
 #include "timer.h"
 #include "config.h"
+#include "settings.h"   /* CONFIG_KEY — gui.occlude is a declared setting */
 #include "wallpaper.h"          /* §M60: the desktop background source */
 #include "clipboard.h"          /* §M58/§M59: selection → primary */
 #include "klog.h"               /* §M61: a refused gui.mode is a warning */
@@ -471,6 +472,15 @@ static spinlock_t damage_lock;
 static struct rect dmg_list[DMG_MAX];
 static int         dmg_n = 0;
 static uint32_t frames_full = 0, frames_partial = 0;
+/* Read once at gui_start rather than per rect: this is consulted inside the
+ * painter's inner path, and a config lookup there would cost more than the
+ * skip saves. */
+static int g_occlude = 1;
+/* How often the skip actually fires.  Reported, because an optimisation whose
+ * hit rate nobody can see is one nobody can defend when it turns out not to
+ * apply to the case that hurts — which is exactly what happened to §4.61's
+ * version of this. */
+static uint32_t occluded_rects = 0, painted_rects = 0;
 static uint64_t total_blit_px = 0;              /* M22.7 — avg damage/frame */
 /* §perf — how much TIME the compositor spends, not just how many pixels it
  * moves.  "The desktop lags when I drag a big window" is a statement about
@@ -1433,6 +1443,63 @@ void gui_relayout_all(void) {
  * end of that function for why the two are not the same task. */
 static volatile int g_relay_report, g_relay_wins, g_relay_before,
                     g_relay_after, g_relay_rounds;
+/* Same trick, same reason: the shell's kprintf goes to its VC while the GUI is
+ * up, so the compositor says the number. */
+static volatile int      g_bench_report, g_bench_w, g_bench_h;
+static volatile uint64_t g_bench_ns;
+static volatile uint32_t g_bench_fr;
+
+/* MEASURE THE REPORTED CASE, rather than reason about it.
+ *
+ * Reported from use: *"when a window is full size, the whole thing lags."*  The
+ * compositor is software, and §4.61 already measured its fill rate — so the
+ * question is not whether a full-screen window is expensive but WHERE the
+ * pixels go, and a number is the only thing that answers that.
+ *
+ * Opens a window covering the whole screen (which is the case being reported),
+ * forces N full-screen composites, and reports the per-frame cost.  Self-
+ * contained for the same reason `gui relaytest` is: once a GUI window has focus
+ * the harness cannot type a second command. */
+static void bench_open(void) {
+    int w = backsurf.w, h = backsurf.h;
+    struct gui_window* win =
+        gui_app_window_create("Bench", 0, 0, w, h, NULL, NULL);
+    (void)win;
+}
+
+CONFIG_KEY(ck_gui_occlude) = {
+    .key = "gui.occlude", .group = "Display", .type = CFG_BOOL, .def = "1",
+    .help = "skip painting what an opaque window completely covers",
+};
+
+void gui_compose_bench(int frames) {
+    if (frames <= 0) frames = 30;
+    g_occlude = (int)config_get_long("gui.occlude", 1);
+    occluded_rects = painted_rects = 0;
+    int had = 0;
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++)
+        if (windows[i].used && windows[i].kind == WIN_APP) had = 1;
+    if (!had) { gui_queue_open(bench_open); task_msleep(1200); }
+
+    uint64_t ns0 = total_compose_ns;
+    uint32_t f0  = frames_full + frames_partial;
+    for (int i = 0; i < frames; i++) {
+        gui_damage_all();
+        need_frame = 1;
+        /* Let the compositor actually run: this task is not it, and a loop that
+         * only queued damage would measure nothing but its own speed. */
+        task_msleep(40);
+    }
+    uint64_t ns = total_compose_ns - ns0;
+    uint32_t fr = (frames_full + frames_partial) - f0;
+
+    g_bench_ns = ns;
+    g_bench_fr = fr;
+    g_bench_w  = backsurf.w;
+    g_bench_h  = backsurf.h;
+    g_bench_report = 1;
+    need_frame = 1;
+}
 
 /* The whole regression test, in ONE command.
  *
@@ -2273,15 +2340,57 @@ static void draw_scene_rect(const struct scene_snapshot* s,
                             int rx0, int ry0, int rx1, int ry1) {
     gfx_set_clip(&backsurf, rx0, ry0, rx1 - rx0, ry1 - ry0);
 
-    gfx_blit(&backsurf, 0, 0, &wallsurf, 0, 0, wallsurf.w, wallsurf.h);
+    /* SKIP WHAT AN OPAQUE WINDOW COMPLETELY COVERS.
+     *
+     * Reported from use: *"when a window is full size, the whole thing lags."*
+     * This function painted the wallpaper, then the desktop icons, then every
+     * window from the bottom up — so a full-screen window meant the whole
+     * screen was filled at least TWICE per frame, and everything under it was
+     * pixels computed and then thrown away.
+     *
+     * §4.61 measured skipping the wallpaper at 2% and moved on, and that
+     * measurement was right about the case it looked at: DURING A DRAG the
+     * damage rect is the window UNION the strip it vacated, so it is never
+     * fully covered and the skip almost never fires.  A maximized window is the
+     * opposite case — the damage rect is inside the window every time — which
+     * is why the same optimisation is worth nothing there and a great deal
+     * here.  *A measurement answers the case it was taken on.*
+     *
+     * The test is deliberately strict: the topmost window must cover this rect
+     * ENTIRELY, and only what is strictly below it is skipped.  A partial
+     * overlap paints normally, because "mostly covered" cannot be composited
+     * correctly without per-pixel coverage — and getting that wrong leaves
+     * stale pixels, which is the failure this file has already paid for twice.
+     *
+     * `gui.occlude = 0` turns it off, so both paths stay reachable and
+     * measurable rather than one becoming the only one anybody ever runs. */
+    int first = 0;
+    if (g_occlude) {
+        for (int i = s->zn - 1; i >= 0; i--) {
+            /* Opaque and covering: the CONTENT area plus its border, i.e. the
+             * whole outer rectangle, which is what this function paints. */
+            if (s->wx[i] <= rx0 && s->wy[i] <= ry0 &&
+                s->wx[i] + s->ww[i] >= rx1 && s->wy[i] + s->wh[i] >= ry1) {
+                first = i;
+                break;
+            }
+        }
+    }
+
+    if (first == 0) {
+        painted_rects++;
+        gfx_blit(&backsurf, 0, 0, &wallsurf, 0, 0, wallsurf.w, wallsurf.h);
+    } else {
+        occluded_rects++;
+    }
 
     /* §M64 — the background LAYER: desktop icons sit on the wallpaper and
      * under every window.  Painted per damage rect like everything else here,
      * and clipped by the same clip box, so a shortcut only costs pixels when
      * its rectangle is actually dirty. */
-    if (shell && shell->draw_under) shell->draw_under(&backsurf);
+    if (first == 0 && shell && shell->draw_under) shell->draw_under(&backsurf);
 
-    for (int i = 0; i < s->zn; i++) {
+    for (int i = first; i < s->zn; i++) {
         struct gui_window* win = s->zsnap[i];
         int x = s->wx[i], y = s->wy[i], w = s->ww[i], h = s->wh[i];
         int focused = (win == s->fsnap);
@@ -3022,6 +3131,18 @@ static void gui_compositor_main(void) {
         pump_hostless_input();
         pump_hostless_redraw();          /* §M65 — …and paint them */
         apply_pending();
+        if (g_bench_report) {
+            g_bench_report = 0;
+            uint32_t fr = g_bench_fr ? g_bench_fr : 1;
+            kprintf("compose: %ux%u, %u frame(s), %u us/frame total %u ms "
+                    "[occlusion %s: %u rect(s) skipped, %u painted]\n",
+                    g_bench_w, g_bench_h, g_bench_fr,
+                    (unsigned)((g_bench_ns / fr) / 1000ull),
+                    (unsigned)(g_bench_ns / 1000000ull),
+                    g_occlude ? "on" : "off",
+                    occluded_rects, painted_rects);
+            occluded_rects = painted_rects = 0;
+        }
         if (g_relay_report) {
             g_relay_report = 0;
             kprintf("relayout: %d window(s), %d widget(s) before, %d after "

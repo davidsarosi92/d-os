@@ -363,6 +363,10 @@ void gui_relayout_all(void);
  * focus stops the harness typing the second one. */
 void gui_relayout_test(int rounds);
 
+/* Time N full-screen composites with a full-screen window open — the case
+ * reported as "everything lags when a window is maximized". */
+void gui_compose_bench(int frames);
+
 void gui_window_set_tick(struct gui_window* win,
                          void (*fn)(struct gui_window*));
 

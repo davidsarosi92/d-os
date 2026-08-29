@@ -4088,6 +4088,7 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (streq(line, "gui widgets"))  { gui_widget_report(); return; }
     if (streq(line, "gui relayout")) { gui_relayout_all();  return; }
     if (streq(line, "gui relaytest")) { gui_relayout_test(3); return; }
+    if (streq(line, "gui bench"))     { gui_compose_bench(6);   return; }
     if (streq(line, "termcheck")) { gui_term_check(); return; }
     if (streq(line, "ui"))        { ui_cmd("");      return; }
     if (starts_with(line, "ui ")) { ui_cmd(line + 3); return; }
