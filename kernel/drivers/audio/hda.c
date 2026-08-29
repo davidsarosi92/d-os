@@ -712,6 +712,14 @@ static const struct driver_ops hda_ops = {
  * more importantly the descriptor has to outlive the load in memory the module
  * owns and the unload frees.
  * ============================================================================= */
+/* Declared OUTSIDE the packaging choice: `hda` ships as a MODULE here, and a
+ * declaration in the `#else` branch reaches only the built-in form.  Two IDs,
+ * because this driver really does claim two controllers. */
+DRIVER_MATCH(m_hda_ich6) = { .driver = "hda",
+                             .vendor = HDA_VENDOR_INTEL, .device = HDA_DEV_ICH6 };
+DRIVER_MATCH(m_hda_ich9) = { .driver = "hda",
+                             .vendor = HDA_VENDOR_INTEL, .device = HDA_DEV_ICH9 };
+
 #ifdef DOS_MODULE_BUILD
 #include "module_abi.h"
 
@@ -730,10 +738,6 @@ DOS_MODULE("hda", &hda_driver, NULL, NULL);
 /* TWO declarations, because this driver really does claim two devices — the
  * registry is a list, not a single ID, precisely so a driver need not choose
  * one of the controllers it supports. */
-DRIVER_MATCH(m_hda_ich6) = { .driver = "hda",
-                             .vendor = HDA_VENDOR_INTEL, .device = HDA_DEV_ICH6 };
-DRIVER_MATCH(m_hda_ich9) = { .driver = "hda",
-                             .vendor = HDA_VENDOR_INTEL, .device = HDA_DEV_ICH9 };
 
 DRIVER_EX(hda, "audio", &hda_ops, NULL, DOMAIN_KERNEL, DRVF_DMA);
 #endif

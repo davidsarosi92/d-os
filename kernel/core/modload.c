@@ -59,6 +59,7 @@
 #include "module_abi.h"
 #include "ksym.h"
 #include "driver.h"
+#include "hwdev.h"
 #include "kmalloc.h"
 #include "printf.h"
 #include "klog.h"
@@ -205,6 +206,11 @@ struct loaded_module {
     void*          image;          /* the single allocation for all sections  */
     size_t         image_len;
     struct driver* drv;            /* what we attached, NULL if not a driver  */
+    /* The module's own `driver_matches` range.  Remembered so rmmod can
+     * WITHDRAW it: the module's code is freed, so a range left registered is a
+     * dangling pointer the next hardware scan would walk — §M67's
+     * use-after-free, in a table that did not exist then. */
+    const struct driver_match* matches;
     void         (*mod_exit)(void);
     uint32_t       relocs;         /* diagnostics: how much work the load was */
     uint32_t       syms_resolved;
@@ -777,9 +783,41 @@ int modload_load(const char* path) {
         }
     }
 
+    /* A MODULE'S HARDWARE DECLARATIONS, registered the same way its driver is.
+     *
+     * `DRIVER_MATCH()` puts (vendor, device) -> driver in a `driver_matches`
+     * section.  For a built-in driver the LINKER collects those; a module's copy
+     * is in its own object and the kernel never saw it, so until now a
+     * module-provided driver had no declared hardware name and could not claim a
+     * device by ID at all — which is why `hda` and `loopback` showed as "audio"
+     * and "net" in the device manager where built-ins showed a real name.
+     *
+     * Found BY SECTION NAME, exactly as `.dosmod` is, so this needed no change
+     * to the module ABI and no cooperation from the module: a module declares
+     * its hardware with the same macro a built-in driver uses. */
+    const struct driver_match* mmatch = NULL;
+    int mmatch_n = 0;
+    for (uint16_t i = 0; i < shnum; i++) {
+        if (m_strcmp(SECNAME(i), "driver_matches") != 0) continue;
+        if (!place[i].addr || !sh[i].sh_size) break;
+        mmatch   = (const struct driver_match*)place[i].addr;
+        mmatch_n = (int)(sh[i].sh_size / sizeof(struct driver_match));
+        break;
+    }
+    if (mmatch && mmatch_n > 0 && hw_matches_add(mmatch, mmatch_n) != 0) {
+        /* Not fatal: the driver still works, it just will not be matched to its
+         * device by ID.  Said out loud rather than swallowed, because the
+         * SYMPTOM would otherwise be a device manager row that quietly reads
+         * "needs a driver" next to a driver that is running. */
+        kprintf("insmod: %s: no room to register %d hardware declaration(s)\n",
+                path, mmatch_n);
+        mmatch = NULL;
+    }
+
     if (mabi->driver) {
         int dr = driver_attach(mabi->driver);
         if (dr != 0) {
+            if (mmatch) hw_matches_remove(mmatch);
             if (mabi->mod_exit) mabi->mod_exit();
             kprintf("insmod: %s: driver_attach failed (%d)\n", path, dr);
             goto out;
@@ -787,6 +825,7 @@ int modload_load(const char* path) {
     }
 
     slot->used      = 1;
+    slot->matches   = mmatch;
     slot->image     = image;
     slot->image_len = total + 16;
     slot->drv       = mabi->driver;
@@ -854,6 +893,13 @@ int modload_unload(const char* name) {
     }
 
     if (m->mod_exit) m->mod_exit();
+
+    /* WITHDRAW THE HARDWARE DECLARATIONS BEFORE THE CODE THEY LIVE IN GOES.
+     * The order is the whole point: `kfree(m->image)` is the line that makes a
+     * still-registered range a pointer into freed memory, and the next `devices`
+     * would walk it.  Same shape as §M67's use-after-free — a registration
+     * nobody withdraws — in a table that did not exist when that was fixed. */
+    if (m->matches) hw_matches_remove(m->matches);
 
     kfree(m->image);
     kprintf("rmmod: unloaded '%s'\n", m->name);

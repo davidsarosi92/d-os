@@ -171,6 +171,16 @@ static const struct driver_ops lo_ops = {
  * card and aarch64 has no slot for one, so without a portable module the
  * loader would be an x86 feature with untested relocation code on the third
  * arch — the one-arch-only shape this project keeps paying for. */
+/* WHAT THIS HARDWARE IS, declared OUTSIDE the packaging choice.
+ *
+ * It sat in the `#else` branch, so only the BUILT-IN build carried it and the
+ * module — which is the form this driver actually ships in — declared nothing.
+ * §M67's rule is that a module is the same source as its built-in form and
+ * ONLY THE REGISTRATION DIFFERS; a hardware declaration is not registration,
+ * it is a fact about the device, and it is the same fact either way. */
+DRIVER_MATCH(m_lo) = { .driver = "loopback",
+                       .name = "loopback network interface" };
+
 #ifdef DOS_MODULE_BUILD
 #include "module_abi.h"
 
@@ -186,7 +196,5 @@ static struct driver lo_driver = {
 
 DOS_MODULE("loopback", &lo_driver, NULL, NULL);
 #else
-DRIVER_MATCH(m_lo) = { .driver = "loopback", .name = "loopback network interface" };
-
 DRIVER(loopback, "net", &lo_ops, NULL);
 #endif

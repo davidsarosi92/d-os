@@ -18,6 +18,56 @@ static int hw_streq(const char* a, const char* b) {
 }
 
 /* ---------------------------------------------------------------- */
+/* The match table: built-ins plus whatever modules brought.         */
+/* ---------------------------------------------------------------- */
+
+/* A module's declarations live in ITS OWN copy of the `driver_matches` section,
+ * which the linker never saw.  Rather than a second walk everywhere, both
+ * sources go through one iterator — see hwdev.h for why that mattered more than
+ * it looks. */
+#define HW_MAX_MOD_RANGES 8
+static struct { const struct driver_match* m; int n; } g_mod[HW_MAX_MOD_RANGES];
+
+static int builtin_count(void) {
+    return (int)(__stop_driver_matches - __start_driver_matches);
+}
+
+int hw_match_count(void) {
+    int n = builtin_count();
+    for (int i = 0; i < HW_MAX_MOD_RANGES; i++) if (g_mod[i].m) n += g_mod[i].n;
+    return n;
+}
+
+const struct driver_match* hw_match_at(int i) {
+    int b = builtin_count();
+    if (i < 0) return NULL;
+    if (i < b) return &__start_driver_matches[i];
+    i -= b;
+    for (int k = 0; k < HW_MAX_MOD_RANGES; k++) {
+        if (!g_mod[k].m) continue;
+        if (i < g_mod[k].n) return &g_mod[k].m[i];
+        i -= g_mod[k].n;
+    }
+    return NULL;
+}
+
+int hw_matches_add(const struct driver_match* m, int count) {
+    if (!m || count <= 0) return -1;
+    for (int i = 0; i < HW_MAX_MOD_RANGES; i++) {
+        if (g_mod[i].m) continue;
+        g_mod[i].m = m;
+        g_mod[i].n = count;
+        return 0;
+    }
+    return -1;
+}
+
+void hw_matches_remove(const struct driver_match* m) {
+    for (int i = 0; i < HW_MAX_MOD_RANGES; i++)
+        if (g_mod[i].m == m) { g_mod[i].m = NULL; g_mod[i].n = 0; }
+}
+
+/* ---------------------------------------------------------------- */
 /* Names.                                                            */
 /* ---------------------------------------------------------------- */
 
@@ -140,15 +190,15 @@ int hw_needs_driver(uint8_t class_code, uint8_t subclass) {
  * be declared first. */
 const char* hw_driver_for(uint16_t vendor, uint16_t device,
                           uint8_t class_code, uint8_t subclass) {
-    for (struct driver_match* m = __start_driver_matches;
-         m < __stop_driver_matches; m++) {
+    for (int _mi = 0; _mi < hw_match_count(); _mi++) {
+         const struct driver_match* m = hw_match_at(_mi);
         if (m->vendor == HW_ANY_VENDOR) continue;
         if (m->vendor != vendor) continue;
         if (m->device != HW_ANY_DEVICE && m->device != device) continue;
         return m->driver;
     }
-    for (struct driver_match* m = __start_driver_matches;
-         m < __stop_driver_matches; m++) {
+    for (int _mi = 0; _mi < hw_match_count(); _mi++) {
+         const struct driver_match* m = hw_match_at(_mi);
         if (m->vendor != HW_ANY_VENDOR) continue;
         if (m->cls != class_code) continue;
         if (m->sub != HW_ANY_SUB && m->sub != subclass) continue;
@@ -163,8 +213,8 @@ const char* hw_driver_for(uint16_t vendor, uint16_t device,
  * Printing the class ("audio", "misc") is the honest floor and a poor name,
  * which is why the declaration carries one. */
 const char* hw_hardware_of(const char* driver_name) {
-    for (struct driver_match* m = __start_driver_matches;
-         m < __stop_driver_matches; m++) {
+    for (int _mi = 0; _mi < hw_match_count(); _mi++) {
+         const struct driver_match* m = hw_match_at(_mi);
         if (!hw_streq(m->driver, driver_name)) continue;
         if (m->name) return m->name;
         if (m->vendor != HW_ANY_VENDOR && m->vendor != 0)
@@ -225,10 +275,11 @@ int hw_enumerate(struct hw_device* out, int cap) {
         /* A declaration with vendor 0 is a PLATFORM name, not a bus claim —
          * so it must NOT suppress the row it exists to label. */
         int claims_pci = 0;
-        for (struct driver_match* m = __start_driver_matches;
-             m < __stop_driver_matches; m++)
+        for (int _mi = 0; _mi < hw_match_count(); _mi++) {
+             const struct driver_match* m = hw_match_at(_mi);
             if (hw_streq(m->driver, d->name) && m->vendor != 0)
                 { claims_pci = 1; break; }
+        }
         if (claims_pci) continue;
 
         struct hw_device* h = &out[c.n++];
@@ -267,10 +318,11 @@ int hw_enumerate(struct hw_device* out, int cap) {
          * the scan did not find is genuinely absent, and falls through. */
         if (st == 0) {
             int has_bus_claim = 0;
-            for (struct driver_match* m = __start_driver_matches;
-                 m < __stop_driver_matches; m++)
+            for (int _mi = 0; _mi < hw_match_count(); _mi++) {
+                 const struct driver_match* m = hw_match_at(_mi);
                 if (hw_streq(m->driver, d->name) && m->vendor != 0)
                     { has_bus_claim = 1; break; }
+            }
             if (!has_bus_claim) {
                 if (c.n >= cap) break;
                 struct hw_device* sw = &out[c.n++];
@@ -284,10 +336,11 @@ int hw_enumerate(struct hw_device* out, int cap) {
                 continue;
             }
         }
-        for (struct driver_match* m = __start_driver_matches;
-             m < __stop_driver_matches; m++)
+        for (int _mi = 0; _mi < hw_match_count(); _mi++) {
+             const struct driver_match* m = hw_match_at(_mi);
             if (hw_streq(m->driver, d->name) && m->vendor != 0)
                 { claims_pci = 1; break; }
+        }
         if (claims_pci) {
             /* If the PCI scan already found its device, it is online with a
              * driver that failed — not offline.  Do not list it twice. */

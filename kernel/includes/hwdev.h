@@ -141,6 +141,29 @@ int hw_enumerate(struct hw_device* out, int cap);
 const char* hw_name_for(uint16_t vendor, uint16_t device,
                         uint8_t class_code, uint8_t subclass);
 
+/* ITERATE THE MATCH TABLE THROUGH THESE, never over the linker symbols.
+ *
+ * The declarations come from two places now: the ones the linker collected from
+ * the kernel image, and the ones a §M67 MODULE brought with it.  Six loops in
+ * hwdev.c walked `__start_driver_matches` directly, which meant module support
+ * would have had to be added six times — and would have worked in five.
+ *
+ * `hw_match_count` covers both; `hw_match_at` returns them in that order, so a
+ * built-in declaration still wins over a module's for the same ID. */
+int hw_match_count(void);
+const struct driver_match* hw_match_at(int i);
+
+/* Register / withdraw a module's `driver_matches` section.  Called by the
+ * module loader, which finds the section by name exactly as it finds `.dosmod`
+ * — so a module declares its hardware the same way a built-in driver does and
+ * needs no change to the module ABI at all.
+ *
+ * `remove` takes the same pointer `add` was given: a module's code is FREED by
+ * rmmod, so a range left registered is a dangling pointer the next hardware
+ * scan would walk (§M67's use-after-free, in a new table). */
+int  hw_matches_add(const struct driver_match* m, int count);
+void hw_matches_remove(const struct driver_match* m);
+
 /* Does this device NEED a driver at all?
  *
  * The first version of the device manager printed "needs a driver" for every
