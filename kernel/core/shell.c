@@ -2284,32 +2284,22 @@ static void cmd_nettest(void) {
     }
 }
 
-/* ----------------------- §M23 audio commands ------------------------------ */
-
-/* `beep` — play a short 440 Hz tone (the §M23 smoke test). */
-static void cmd_beep(void) {
-    if (!audio_primary()) { console_write("beep: no audio device (no AC97?)\n"); return; }
-    audio_play_tone(440, 400);
-}
-
-/* `tone <freq> <ms>` — play an arbitrary square-wave tone. */
-static void cmd_tone(const char* args) {
-    if (!audio_primary()) { console_write("tone: no audio device\n"); return; }
-    int freq = 0, ms = 0, i = 0;
-    while (args[i] >= '0' && args[i] <= '9') freq = freq*10 + (args[i++] - '0');
-    while (args[i] == ' ') i++;
-    while (args[i] >= '0' && args[i] <= '9') ms = ms*10 + (args[i++] - '0');
-    if (freq <= 0) freq = 440;
-    if (ms   <= 0) ms   = 400;
-    audio_play_tone((uint32_t)freq, (uint32_t)ms);
-}
-
-static void cmd_blktest(void) {
-    struct block_device* dev = blk_find("vda");
+/* `blktest [dev]` — a sector round trip on ANY registered block device.
+ *
+ * It was hard-wired to "vda", which was fine while virtio-blk was the only
+ * block driver in the tree and became a gap the moment a second one existed:
+ * the AHCI driver's whole claim is that it reads and writes a real disk, and
+ * the one test that could establish it could not be pointed at it. */
+static void cmd_blktest(const char* args) {
+    while (args && *args == ' ') args++;
+    const char* name = (args && *args) ? args : "vda";
+    struct block_device* dev = blk_find(name);
     if (!dev) {
-        console_write("blktest: /dev/vda not registered (no virtio-blk?)\n");
+        kprintf("blktest: no block device '%s' (try `lsblk`)\n", name);
         return;
     }
+    kprintf("blktest: %s, %u-byte sectors, %u sectors\n",
+            name, dev->sector_size, (unsigned)dev->sector_count);
 
     /* Use PMM-allocated frames as DMA buffers.  A kmalloc'd 512-byte
      * buffer could land at an offset that straddles a virtual page,
@@ -4245,7 +4235,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "cron "))    { cmd_cron(line + 5);   return; }
     if (streq(line, "crontab"))        { cron_list();          return; }
     if (starts_with(line, "crontab ")) { cron_list();          return; }  /* -l */
-    if (streq(line, "blktest"))        { cmd_blktest();  return; }
+    if (streq(line, "blktest"))        { cmd_blktest("");         return; }
+    if (starts_with(line, "blktest "))  { cmd_blktest(line + 8);   return; }
     if (streq(line, "bctest"))         { cmd_bctest();   return; }
     if (streq(line, "lsblk"))          { blk_list();     return; }
     if (streq(line, "lsnic"))          { net_list();     return; }
@@ -4282,8 +4273,8 @@ static void dispatch(struct vc* my_vc, const char* line) {
     if (starts_with(line, "rmmod "))   { modload_cmd_rmmod(line+6);  return; }
     if (streq(line, "ksyms"))          { ksym_list("");             return; }
     if (starts_with(line, "ksyms "))   { ksym_list(line + 6);       return; }
-    if (streq(line, "beep"))           { cmd_beep();     return; }
-    if (starts_with(line, "tone "))    { cmd_tone(line + 5); return; }
+    if (streq(line, "beep"))           { audio_cmd_beep();     return; }
+    if (starts_with(line, "tone "))    { audio_cmd_tone(line + 5); return; }
     /* §M23 stage 2 — the implementation lives in audio.c, not here, so the ARM
      * serial REPL runs the same one (§M24's rule). */
     if (starts_with(line, "play "))    { audio_cmd_play(line + 5); return; }

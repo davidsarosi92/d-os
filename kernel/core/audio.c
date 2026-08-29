@@ -1230,6 +1230,33 @@ void audio_cmd_rec(const char* args) {
     audio_record_wav(path, ms);
 }
 
+/* `beep` and `tone` — the §M23 smoke tests.
+ *
+ * THEY LIVED IN shell.c, so aarch64 — which runs its own `serial_shell.c` —
+ * had `lsaudio` and `play` and no way to generate a sound at all.  That is
+ * §M24's rule being broken in the usual direction: a command written in one
+ * shell can only run on the arches that build it, and the arch it was missing
+ * from is the one whose audio device is hardest to reach.  §M63 moved
+ * `setconf` for exactly this reason. */
+void audio_cmd_beep(void) {
+    if (!audio_primary()) { kprintf("beep: no audio device\n"); return; }
+    audio_play_tone(440, 400);
+}
+
+void audio_cmd_tone(const char* args) {
+    if (!audio_primary()) { kprintf("tone: no audio device\n"); return; }
+    while (args && *args == ' ') args++;
+    int freq = 0, ms = 0, i = 0;
+    if (args) {
+        while (args[i] >= '0' && args[i] <= '9') freq = freq * 10 + (args[i++] - '0');
+        while (args[i] == ' ') i++;
+        while (args[i] >= '0' && args[i] <= '9') ms = ms * 10 + (args[i++] - '0');
+    }
+    if (freq <= 0) freq = 440;
+    if (ms   <= 0) ms   = 400;
+    audio_play_tone((uint32_t)freq, (uint32_t)ms);
+}
+
 void audio_cmd_volume(const char* args) {
     while (args && *args == ' ') args++;
     int vol, muted;

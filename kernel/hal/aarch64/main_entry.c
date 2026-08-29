@@ -301,7 +301,13 @@ void aarch64_main_entry(uint64_t dtb) {
          * exFAT filesystem the shell's ls/cat/write/rm then operate on real,
          * persistent storage under /mnt. */
         bcache_init();
-        if (vfs_mount("exfat", "/mnt", "vda") == 0) {
+        const char* mounted_on = NULL;
+        if (blk_mount_first("exfat", "/mnt", &mounted_on) == 0) {
+            /* NAME THE WINNER.  On a machine with two disks "where do my
+             * settings live" is a real question, and the answer used to be a
+             * constant everybody could read in the source. */
+            kprintf("storage: /mnt is on %s — settings and shortcuts persist "
+                    "there\n", mounted_on ? mounted_on : "?");
             kprintf("aarch64: exFAT mounted at /mnt (persistent storage)\n");
             /* §M63 stage 0 — settings live on the first writable volume.  This
              * arch runs its OWN main_entry (the divergence PLAN_AARCH64 warns

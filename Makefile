@@ -721,6 +721,7 @@ CORE_C_SRCS := \
     kernel/drivers/watchdog/ib700.c \
     kernel/drivers/null/null.c \
     kernel/drivers/block/virtio_blk.c \
+    kernel/drivers/block/ahci.c \
     kernel/drivers/net/virtio_net.c \
     kernel/core/net.c \
     kernel/core/dhcp.c \
@@ -953,6 +954,7 @@ CORE_C_SRCS := \
     kernel/drivers/watchdog/ib700.c \
     kernel/drivers/null/null.c \
     kernel/drivers/block/virtio_blk.c \
+    kernel/drivers/block/ahci.c \
     kernel/drivers/net/virtio_net.c \
     kernel/core/net.c \
     kernel/core/dhcp.c \

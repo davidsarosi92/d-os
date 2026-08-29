@@ -60,4 +60,19 @@ void blk_for_each(blk_iter_fn fn, void* ctx);
  * command. */
 void blk_list(void);
 
+/* Mount the first registered device that carries filesystem `fs` at `at`.
+ *
+ * WHY THIS IS NOT "MOUNT vda": the boot path named the device by hand, which
+ * was correct while virtio-blk was the only block driver in the tree and became
+ * wrong the moment a second one existed.  On a PHYSICAL machine there is no
+ * `vda` — there is an AHCI disk registered as `sda` — so a hard-coded name
+ * means the driver written to give real hardware a persistent volume registers
+ * one that nothing ever mounts.  The AHCI work would have looked finished and
+ * delivered nothing, which is §M64's shortcut bug in a new place: true about
+ * the mechanism, false about the outcome.
+ *
+ * Returns 0 and writes the device's name through `out_name` (when non-NULL) on
+ * success; non-zero when no registered device carries that filesystem. */
+int blk_mount_first(const char* fs, const char* at, const char** out_name);
+
 #endif

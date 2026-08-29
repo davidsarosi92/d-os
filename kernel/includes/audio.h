@@ -238,6 +238,9 @@ int  audio_play_wav(const char* path);
  * implementation instead of a second one that drifts. */
 void audio_cmd_play(const char* args);
 void audio_cmd_volume(const char* args);
+/* §M24's rule: next to the subsystem, so BOTH shells run one copy. */
+void audio_cmd_beep(void);
+void audio_cmd_tone(const char* args);
 
 /* ---------------------------------------------------------------------------
  * Capture (§M23 stage 7).

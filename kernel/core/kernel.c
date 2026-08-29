@@ -305,7 +305,16 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      *          read back.  Across two boots this proves mount + read +
      *          write + persistence end-to-end on the serial log alone. */
     {
-        if (vfs_mount("exfat", "/mnt", "vda") == 0) {
+        /* THE VOLUME IS FOUND, NOT NAMED.  On a physical machine there is no
+         * `vda` — see blk_mount_first in block.h for why hard-coding the name
+         * would have made the AHCI driver a disk nothing ever mounts. */
+        const char* mounted_on = NULL;
+        if (blk_mount_first("exfat", "/mnt", &mounted_on) == 0) {
+            /* NAME THE WINNER.  On a machine with two disks "where do my
+             * settings live" is a real question, and the answer used to be a
+             * constant everybody could read in the source. */
+            kprintf("storage: /mnt is on %s — settings and shortcuts persist "
+                    "there\n", mounted_on ? mounted_on : "?");
             /* §M63 stage 0 — THE FIRST WRITABLE VOLUME IS WHERE SETTINGS LIVE.
              * config_init() ran ~125 lines above, and it had to: half of boot
              * reads config.  But `/` is ramfs, so until this point every

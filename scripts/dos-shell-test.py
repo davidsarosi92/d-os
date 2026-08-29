@@ -210,6 +210,31 @@ class Monitor:
             pass
 
 
+def audio_backend(a):
+    """Which host audio backend to attach, or None for "no sound card".
+
+    THE HARNESS HAD NO AUDIO DEVICE AT ALL, which is the fifth appearance of a
+    shape this project keeps paying for: the machine the tests run on and the
+    machine a person boots were different machines.  `run_qemu.sh` has attached
+    a sound card since §M23 and this did not, so every automated run booted a
+    box with no audio hardware — `lsaudio` empty, the taskbar indicator in its
+    "no device" state, and any regression in the audio path invisible here.
+
+    `none` is deliberately reachable rather than incidental: §M23's THIRD
+    indicator state IS the no-device machine, and a state nobody can boot into
+    is a state nobody has tested.  That is what --no-audio selects.
+
+    The default is `none` as a BACKEND, not as a device: an automated run has no
+    speakers and must not fight the host for its audio hardware, so the card is
+    attached to QEMU's null backend.  The guest sees a real sound card either
+    way, which is the thing under test — and `--audio-backend wav` is how a test
+    captures what was played (§M23 measured every one of its numbers that way).
+    """
+    if a.no_audio:
+        return None
+    return a.audio_backend
+
+
 def qemu_argv(a, sersock, monsock):
     if a.arch == "aarch64":
         argv = [
@@ -247,6 +272,14 @@ def qemu_argv(a, sersock, monsock):
         # needed persistent storage "failed" on this arch for no visible
         # reason.  On -M virt the drive has to be attached to a virtio-MMIO
         # slot explicitly (there is no if=virtio auto-wiring here).
+        # §M23 — the sound card, for the same reason as the NIC and the GPU
+        # above.  This arch has no AC97 (a PCI card, and `virt` has no slot for
+        # one), so it is virtio-sound on a virtio-MMIO slot — the same way this
+        # machine gets every other device.
+        be = audio_backend(a)
+        if be:
+            argv += ["-audiodev", "%s,id=snd0" % be,
+                     "-device", "virtio-sound-device,audiodev=snd0"]
         if a.disk:
             argv += ["-drive", "if=none,id=hd0,file=%s,format=raw" % a.disk,
                      "-device", "virtio-blk-device,drive=hd0"]
@@ -271,6 +304,13 @@ def qemu_argv(a, sersock, monsock):
             "-rtc", "base=localtime",
             "-device", "ib700", "-action", "watchdog=inject-nmi",
         ]
+        # §M23 — AC97, the codec both x86 arches drive.  `hda` is the other
+        # one and is a §M67 module here, so the built-in path is what an
+        # ordinary boot exercises and what this attaches.
+        be = audio_backend(a)
+        if be:
+            argv += ["-audiodev", "%s,id=snd0" % be,
+                     "-device", "AC97,audiodev=snd0"]
         if a.iommu:
             # §M33 stage 5 — a machine with DMA remapping hardware.
             #
@@ -326,6 +366,19 @@ def main():
                     help="boot on a machine that HAS DMA remapping hardware "
                          "(q35 + intel-iommu).  Off by default so the ordinary "
                          "no-IOMMU machine stays the one under test.")
+    ap.add_argument("--no-audio", action="store_true",
+                    help="attach NO sound card.  §M23's third taskbar indicator "
+                         "state is exactly this machine, and a state nobody can "
+                         "boot into is a state nobody has tested")
+    ap.add_argument("--audio-backend", default="none",
+                    help="host audio backend for the attached card "
+                         "(none | wav | coreaudio | pa | alsa).  Default `none` "
+                         "is QEMU's null backend: the GUEST still sees a real "
+                         "sound card, which is what is under test, while an "
+                         "automated run does not fight the host for its speakers. "
+                         "Use `wav` with -- -audiodev ... to CAPTURE what was "
+                         "played, which is how §M23 measured every one of its "
+                         "numbers")
     ap.add_argument("--no-display", action="store_true",
                     help="aarch64 only: attach no virtio-gpu, so the guest "
                          "boots the SERIAL shell (serial_shell.c) instead of "

@@ -10,6 +10,7 @@
  * ============================================================================= */
 
 #include "block.h"
+#include "vfs.h"
 #include "devfs.h"
 #include "printf.h"
 #include <stddef.h>
@@ -107,6 +108,25 @@ struct block_device* blk_find(const char* name) {
 void blk_for_each(blk_iter_fn fn, void* ctx) {
     if (!fn) return;
     for (struct block_device* d = head; d; d = d->next) fn(d, ctx);
+}
+
+/* Try every registered device until one mounts.  See block.h for why the boot
+ * path may not name the device.
+ *
+ * REGISTRATION ORDER IS THE PREFERENCE, and that is deliberate rather than
+ * incidental: drivers register in `driver_init_all` order, which is dependency
+ * order, so a machine with both a virtio disk and a SATA one keeps mounting the
+ * virtio one it mounted yesterday.  A rule that reordered volumes between boots
+ * would move where settings live without anybody asking. */
+int blk_mount_first(const char* fs, const char* at, const char** out_name) {
+    for (struct block_device* d = head; d; d = d->next) {
+        if (vfs_mount(fs, at, d->name) == 0) {
+            if (out_name) *out_name = d->name;
+            return 0;
+        }
+    }
+    if (out_name) *out_name = NULL;
+    return -1;
 }
 
 void blk_list(void) {

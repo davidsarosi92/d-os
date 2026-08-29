@@ -655,6 +655,8 @@ void serial_shell_entry(void) {
          * strictly better than "unknown command" telling the user the feature
          * does not exist.  virtio-sound is what fills the gap. */
         else if (s_eq(cmd, "lsaudio")) audio_list();
+        else if (s_eq(cmd, "beep"))    audio_cmd_beep();
+        else if (s_eq(cmd, "tone"))    audio_cmd_tone(args);
         else if (s_eq(cmd, "drv"))     driver_cmd(args);
         /* §M33 stage 5 — the same report both x86 shells give.  ONE copy, in
          * iommu.c, called from both: §M24's rule, and the case it was written
