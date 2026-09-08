@@ -692,6 +692,9 @@ CORE_C_SRCS := \
     kernel/gui/app_host.c \
     kernel/gui/gui_mode.c \
     kernel/gui/wm.c \
+    kernel/gui/compose.c \
+    kernel/gui/input.c \
+    kernel/gui/gui_diag.c \
     kernel/gui/dosgui.c \
     kernel/gui/widget.c \
     kernel/gui/ui.c \
@@ -866,6 +869,9 @@ CORE_C_SRCS := \
     kernel/gui/app_host.c \
     kernel/gui/gui_mode.c \
     kernel/gui/wm.c \
+    kernel/gui/compose.c \
+    kernel/gui/input.c \
+    kernel/gui/gui_diag.c \
     kernel/gui/dosgui.c \
     kernel/gui/widget.c \
     kernel/gui/ui.c \
@@ -979,6 +985,9 @@ CORE_C_SRCS := \
     kernel/gui/app_host.c \
     kernel/gui/gui_mode.c \
     kernel/gui/wm.c \
+    kernel/gui/compose.c \
+    kernel/gui/input.c \
+    kernel/gui/gui_diag.c \
     kernel/gui/dosgui.c \
     kernel/gui/widget.c \
     kernel/gui/ui.c \

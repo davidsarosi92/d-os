@@ -11661,19 +11661,132 @@ title bar and three title buttons, its four table columns with row separators, a
 scrollbar, both footer buttons and its taskbar button: `wm.c`, `app_host.c` and
 the item view all intact across the file boundary.
 
+#### 4.86.4 The compositor split, and the measurement that had to justify it
+
+§M70's first pass deliberately stopped short of gui.c's core, and said why: the
+compositor is the code every performance claim in §4.61, §M61 and §M69 was made
+against, so splitting it wanted its own before-and-after numbers rather than a
+hurried pass on the way to something else.  Those numbers were taken.
+
+**BASELINE, three runs of `gui bench` at 1920x1200 with full-screen damage:
+109792 / 108195 / 108079 us/frame** (216-219 ms), a 1.6 % spread — much tighter
+than §M69's ±19 % noise floor for incremental frames, because a full-screen
+repaint is dominated by memory bandwidth rather than by scheduling.
+
+**AFTER THE SPLIT, identical recipe: 105558 / 109973 / 102242 us/frame**
+(204-219 ms).  **THE HONEST READING IS "NO MEASURABLE CHANGE", NOT "2.5 %
+FASTER."**  The means differ by 2.5 % and the after-runs' own spread is 7.3 %,
+so the difference is inside the noise and is not a result.  What the measurement
+DOES establish is the thing worth establishing: no regression of the kind a bad
+split produces.  An extra indirection per pixel, a lost `static` that defeated
+inlining, or a hot field moved across a translation unit would show up far
+larger than this — §M56.2's rule, applied to a refactor instead of an
+optimisation.
+
+The remaining 1635 lines of gui.c are what actually belongs together: the
+session (`gui_start` / `gui_teardown` / `gui_stop`), the compositor task loop
+and its `apply_pending`, the desktop task and its panel, the app registry, and
+the two window-creation entry points.
+
+| file | lines | what it owns |
+|---|---|---|
+| `gui.c` | **1635** (was 5620) | the session, the compositor task loop, the desktop task |
+| `input.c` | 1079 | event rings, mouse, keyboard, Alt-Tab, the drag state machine |
+| `compose.c` | 757 | damage, scene painting, the page flip |
+| `wm.c` | 727 | window lifecycle, z-order, focus, title buttons, popups, modality |
+| `app_host.c` | 544 | the per-window host task |
+| `gterm.c` | 445 | the terminal: grid, scrollback, selection |
+| `gui_diag.c` | 346 | the instruments: stats, bench, relaytest, wheeltest, input debug |
+| `gui_mode.c` | 256 | §M61 runtime resolution change |
+| `gui_priv.h` | 607 | the definitions the eight share |
+
+**TWO SEAMS WERE MADE NARROWER RATHER THAN WIDER, and both for the same
+reason — an `extern` on a ring is an invitation to break the invariant that
+makes it lock-free.**  `pevq_pop()` bounds the desktop pointer queue's
+single-producer/single-consumer discipline to one file; §M69's own first
+eviction attempt broke exactly that invariant by walking the ring from the
+consumer's index inside the mouse IRQ, which is not a slow machine but a dead
+one.  And `gui_diag_service()` replaced five exported report flags: the reports
+are printed from the COMPOSITOR and not from the task that asked, because with
+the GUI up a kprintf on the requesting task goes to the suppressed console and
+the answer reaches nobody (§4.79's observation that `gui stats` printed nothing
+on serial while `shortcut list` did).
+
+**THE HEADER HAD TO BE CORRECTED TWICE DURING THE SPLIT, and the mistake is
+worth recording because the compiler only half-catches it:** block-copying a
+region of gui.c into `gui_priv.h` twice carried `static` DEFINITIONS along with
+the types.  A `static` definition in a header compiles — it silently gives every
+translation unit its OWN COPY, so `mv_hint` written by the input path and
+`mv_hint` read by the painter would have been different objects.  What surfaced
+it was a `-Wunused-variable` per including file, which is a warning about the
+symptom and not the cause: *the only reliable signal was that the same warning
+appeared once per translation unit.*
+
+**VERIFIED BY DRIVING THE MOUSE, not by a screenshot** — a picture proves the
+painter and says nothing about the router.  With `gui.input_debug` on: a driven
+click gives `ps2-mouse: buttons 0 -> 1` and
+`gui: press dispatched to 'Task Manager' at 301,227`, and the screenshot then
+shows the `compositor` row selected — the whole chain across five new file
+boundaries (input decode and routing, the host's dispatch, the item view's
+selection, the damage, the paint).  **A METHOD NOTE AT MY OWN EXPENSE:** the
+first driven run reported *2 device transitions, 0 dispatches*, which is
+precisely §4.85.8's "the WM swallowed it" signature — and was correct
+behaviour, because the click had landed on the wallpaper outside the window.
+*That three-outcome table only reads correctly when the POSITION is known*,
+which is the same thing `wheeltest`'s probe mode exists to supply.
+
+All three architectures build silent; i386 and x86_64 at `-smp 4` and aarch64 on
+both its boot paths report 0 faults, 0 NMI lockups and 0 softlockups.
+
 #### Open at the close of §M70
 
-`gui.c` is 3685 lines and still holds two things — the compositor proper
-(damage, occlusion, present, the page flip) and the input router (mouse and
-keyboard routing, Alt-Tab, the drag state machine).  Splitting those is the
-obvious next step and was deliberately NOT taken here: the compositor is the
-code every measurement in §M69 was made against, and a split of it wants its own
-before-and-after `gui.stats_ms` numbers rather than a hurried one on the way to
-something else.
+`input.c` at 1079 lines is now the largest of the compositor files, and
+`gui_mouse` alone is ~500 of them — one function carrying press, release,
+motion, drag-move, drag-resize, the title-button hit test, the taskbar, the
+desktop fallthrough and four modality gates.  It is a state machine and would
+read better as one, but that is a REWRITE of the most timing-sensitive code in
+the tree, not a move, and it wants its own falsifying test first.
 
 ---
 
 ## 8. Change log
+
+- **2026-09-08 — §M70 SECOND HALF: THE COMPOSITOR SPLIT, WITH THE MEASUREMENT
+  THAT HAD TO JUSTIFY IT (DOCS §4.86.4, all 3 arches).**  The first pass stopped
+  short of gui.c's core on purpose — it is the code every performance claim in
+  §4.61, §M61 and §M69 was made against.  **BASELINE, three `gui bench` runs at
+  1920x1200: 109792 / 108195 / 108079 us/frame, 1.6 % spread.  AFTER: 105558 /
+  109973 / 102242.**  *The honest reading is "no measurable change", not "2.5 %
+  faster"* — the means differ by 2.5 % and the after-spread alone is 7.3 %, so
+  the difference is inside the noise (§M56.2's rule, applied to a refactor
+  instead of an optimisation).  What it DOES establish is the absence of the
+  regression a bad split produces: an extra indirection per pixel or a hot field
+  moved across a translation unit would show up far larger.  **gui.c 5620 ->
+  1635**, plus input.c 1079, compose.c 757, wm.c 727, app_host.c 544, gterm.c
+  445, gui_diag.c 346, gui_mode.c 256.  **TWO SEAMS WERE MADE NARROWER RATHER
+  THAN WIDER, both because an `extern` on a ring invites breaking the invariant
+  that makes it lock-free:** `pevq_pop()` bounds the desktop queue's
+  single-producer discipline to one file (§M69's own first eviction attempt
+  broke exactly that from the mouse IRQ — not a slow machine but a dead one),
+  and `gui_diag_service()` replaced five exported report flags, because with the
+  GUI up a report printed on the REQUESTING task goes to the suppressed console
+  and reaches nobody.  **THE HEADER HAD TO BE CORRECTED TWICE, and the mistake
+  is worth recording:** a block copy carried `static` DEFINITIONS into
+  gui_priv.h, which COMPILES and silently gives every translation unit its own
+  copy — `mv_hint` written by the input path and read by the painter would have
+  been different objects.  The only reliable signal was the same
+  `-Wunused-variable` appearing once per including file.  **VERIFIED BY DRIVING
+  THE MOUSE, because a picture proves the painter and says nothing about the
+  router:** `ps2-mouse: buttons 0 -> 1` then `gui: press dispatched to 'Task
+  Manager' at 301,227`, with the screenshot showing the row selected — the whole
+  chain across five new file boundaries.  **A METHOD NOTE AT MY OWN EXPENSE:**
+  the first driven run gave *2 device transitions, 0 dispatches*, which is
+  exactly §4.85.8's "the WM swallowed it" signature and was correct behaviour —
+  the click had landed on the wallpaper.  *That table only reads correctly when
+  the POSITION is known.*  **OPEN:** input.c is now the largest compositor file
+  and `gui_mouse` alone is ~500 lines of state machine; reading better as one
+  would be a REWRITE of the most timing-sensitive code here, and wants its own
+  falsifying test first.
 
 - **2026-09-08 — §M70: THE SHELL BECAME A REGISTRY AND gui.c BECAME FIVE FILES
   (DOCS §4.86, all 3 arches).**  Asked for directly, and the answer began by

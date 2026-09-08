@@ -63,6 +63,56 @@ extern enum drag_mode     drag;
 extern struct gui_window* drag_win;
 extern int grab_dx, grab_dy;
 
+#define COL_WIN_BG (cp_current_theme()->surface)
+/* §M58 — selection wash.  Bright enough to be unambiguous over the terminal
+ * background, and the text flips to dark so it stays legible. */
+#define COL_SEL_BG (cp_current_theme()->sel_bg)
+#define COL_SEL_FG (cp_current_theme()->sel_fg)
+#define COL_WIN_FG (cp_current_theme()->text)
+#define COL_TITLE_F_TOP (cp_current_theme()->raised)
+#define COL_TITLE_F_BOT (cp_current_theme()->raised)
+#define COL_TITLE_U_TOP (cp_current_theme()->tray)
+#define COL_TITLE_U_BOT (cp_current_theme()->tray)
+#define COL_BORDER_F (cp_current_theme()->accent)
+#define COL_BORDER_U (cp_current_theme()->line)
+#define COL_TITLE_TEXT (cp_current_theme()->text)
+/* §M69 — the modal backdrop.  widget_specs.md §14 says black at 45 %, and
+ * 45 % of 255 is 115 = 0x73; written as the arithmetic rather than as a
+ * rounded-looking constant so the next person can check it against the spec
+ * instead of trusting it. */
+#define COL_MODAL_DIM   0x73000000u
+#define COL_RUBBER (cp_current_theme()->accent)
+#define COL_CLOSE_BG    0xFFC0392Bu
+#define COL_CLOSE_FG    0xFFF8ECEAu
+
+/* Title-button hover, and the panel's published popup extent.  Both are
+ * WRITTEN by the input path and READ by the painter — which is why they are
+ * shared state and not accessors.  §M23's lesson about the extent: a SECOND
+ * publisher is a second thing that can forget to clear it, and a stale extent
+ * swallows clicks over a window. */
+extern struct gui_window* volatile tb_hover_win;
+extern volatile int tb_hover_idx;
+extern volatile int pnl_pop_on, pnl_pop_x, pnl_pop_y, pnl_pop_w, pnl_pop_h;
+
+/* Pointer position and the resize rubber band: the input path writes them,
+ * the painter reads them. */
+extern int mx, my;
+extern int rubber_w, rubber_h;
+
+/* How many composites during a drag took the COPY path and how many fell
+ * back to the painter.  BOTH numbers matter: all-fast would mean the
+ * fallback is never exercised and therefore never tested, and all-slow would
+ * mean the optimisation is not running while the timing improved for some
+ * other reason (§4.61).  A real drag gives both — measured 37 copied, 3
+ * repainted over the self-refreshing Task Manager. */
+extern uint32_t drag_fast, drag_slow;
+
+/* Cursor sprite is 11x17 px; ±1 px margin, matching draw position. */
+#define CUR_DMG_X(cx)  ((cx) - 1)
+#define CUR_DMG_Y(cy)  ((cy) - 1)
+#define CUR_DMG_W      14
+#define CUR_DMG_H      20
+
 /* Chrome geometry and the themed colours a window's CONTENT is drawn in.
  * Read the LIVE theme on every use rather than caching: `gui.theme` can
  * change between two draws, and a value captured at construction is a copy
@@ -232,8 +282,94 @@ extern int  gmax_cols, gmax_rows;      /* terminal grid capacity, in cells    */
 extern volatile int need_frame;
 extern const struct desktop_shell* shell;
 
-/* ---- damage (damage_lock, gui.c) ---------------------------------------- */
+/* ---------------------------------------------------------------------------
+ * Damage and compositing (compose.c) — "which pixels", as against wm.c's
+ * "which window".
+ *
+ * Damage is a LIST OF DISJOINT RECTS, not a bounding box: compose() paints and
+ * presents each separately, so a table refresh and a far-away cursor stay two
+ * small blits instead of one large union (§4.61).
+ * ------------------------------------------------------------------------- */
+/* §perf — per-drag accounting, printed when the drag ends (gui.drag_stats=1).
+ *
+ * It has to be a REPORT rather than a command, because by the time anyone
+ * could type `gui stats` the drag is over and its cost has been averaged into
+ * everything else.  The figures are chosen to separate the two candidate
+ * explanations of "dragging lags": if `moved` is far below `motions` the
+ * window is being throttled, and if the compositor's own milliseconds fill the
+ * elapsed time the blit is the bottleneck. */
+/* §perf — THE MOVE HINT: "this window went from here to there, and nothing
+ * else changed".
+ *
+ * A dragged window's pixels do not change — only its position does — so the
+ * composited image can be COPIED from the old place to the new one instead of
+ * being rebuilt out of wallpaper, shadow, chrome and content.  Measured, that
+ * rebuild was 36 ms per frame for a 921x721 window against a 30 ms frame
+ * budget, which is precisely what "the window trails the pointer" is made of.
+ *
+ * The hint is passed OUT OF BAND rather than as damage, and that is what makes
+ * the optimisation safe: compose takes the fast path only when the damage list
+ * is otherwise EMPTY.  Anything else that changed this frame — an app
+ * repainting, a window raising, the panel — puts a rect in that list and the
+ * whole thing falls back to the ordinary painter.  The alternative (inspecting
+ * merged damage rects to guess whether they are "only the drag") cannot
+ * distinguish a window that moved from one that moved AND redrew, and the
+ * failure mode of guessing wrong is a stale image nobody can explain. */
+struct move_hint {
+    int  active;
+    struct gui_window* win;
+    int  ox, oy, nx, ny, w, h;
+};
+/* One-frame snapshot of the WM state, shared by every damage rect's draw. */
+struct scene_snapshot {
+    struct gui_window* zsnap[GUI_MAX_WINDOWS];
+    int   wx[GUI_MAX_WINDOWS], wy[GUI_MAX_WINDOWS],
+          ww[GUI_MAX_WINDOWS], wh[GUI_MAX_WINDOWS];
+    int   zn;
+    int   cx, cy;                       /* cursor */
+    enum  drag_mode dsnap;
+    struct gui_window* dwin;
+    int   rw, rh, rrx, rry;             /* resize rubber band */
+    struct gui_window* fsnap;
+    /* §M69 — index in zsnap[] of the modal window, or -1.  An INDEX and not a
+     * pointer because the backdrop has to be painted at a precise point in
+     * the stack — over everything below the modal and under the modal itself
+     * — and the paint loop is indexed. */
+    int   modal_idx;
+};
+
+#define COL_SHADOW      0x48000000u
+#define COL_POP_BG (cp_current_theme()->raised)
+#define COL_POP_EDGE (cp_current_theme()->line)
+#define COL_POP_HOVER (cp_current_theme()->hover)
+#define COL_POP_SEP (cp_current_theme()->line_soft)
+#define COL_POP_TEXT (cp_current_theme()->text)
+
+/* M22.7 — a damage rectangle (used by both the damage list and the page
+ * flip's previous-frame list). */
+struct rect { int x0, y0, x1, y1; };
+#define DMG_MAX 16
+
+/* `mv_hint` is how a MOVE reaches the compositor: out of band, never as
+ * damage.  Merged damage rects cannot tell a window that MOVED from one that
+ * moved AND redrew, and the failure mode of guessing is a stale image nobody
+ * can explain — so the copy path runs only when the damage list is otherwise
+ * empty, and anything else falls back to the painter. */
+extern struct move_hint mv_hint;          /* guarded by state_lock */
+extern volatile int panel_gen;            /* bumped on WM changes  */
+
 void gui_damage_win(struct gui_window* w);
+void compose(void);
+extern spinlock_t damage_lock;
+
+/* Frame accounting.  These are READ by the instruments (gui_diag.c) and
+ * written here — `gui stats` reports AREA as well as time, because a slow
+ * frame is either big or fixed-cost and those want opposite fixes; without the
+ * pixel count the two are indistinguishable (§M69). */
+extern uint32_t frames_full, frames_partial;
+extern uint64_t total_compose_ns, total_blit_px;
+extern uint32_t occluded_rects, painted_rects;
+extern int      g_occlude;
 
 /* ---- the terminal emulator (gterm.c) ------------------------------------ */
 
@@ -302,6 +438,7 @@ extern int flip_ok;
 extern struct gfx_surface flipbuf[2];
 extern int flip_front;
 extern int fb_flip_init(volatile uint32_t** buf0, volatile uint32_t** buf1);
+extern void fb_flip_to(int idx);
 
 /* ---- the desktop shell's panel strip (gui.c) ------------------------------
  * A BOTTOM STRIP and not a full-screen surface: the taskbar needs the bottom
@@ -382,5 +519,89 @@ extern volatile unsigned modal_dbg_seen, modal_dbg_missing;
 
 /* ---- small shared helper ------------------------------------------------- */
 void str_copy(char* dst, const char* src, int cap);
+
+/* ---------------------------------------------------------------------------
+ * The input router (input.c).  M22.7's rule: the IRQ only ENQUEUES — the
+ * widget hit test, the dispatch and anything that allocates run on the
+ * window's own app-host task.
+ * ------------------------------------------------------------------------- */
+
+/* The device-facing hooks the session installs (and clears FIRST on teardown:
+ * an event delivered into a compositor being torn down is the classic
+ * teardown crash). */
+void gui_mouse(int nx, int ny, unsigned buttons);
+void gui_wheel(int dz);
+int  gui_raw_key(uint8_t keycode, uint8_t mods);
+int  gui_kbd_hook(char c);
+
+/* Drained by the compositor once per frame. */
+void dispatch_events(void);
+void dispatch_keys(void);
+void dispatch_keycodes(void);
+void pump_hostless_input(void);
+
+/* §M46 Ctrl+Alt+X — close, then force, the top application. */
+extern volatile int sak_close_req;
+void sak_close_top_app(void);
+
+#define GRIP        14
+/* §perf — DRAG_MOVE recompose throttle.  Opaque window move re-blits the whole
+ * (possibly large) window every mouse packet; a fast drag of a big window (e.g.
+ * NetSurf) then floods the single CPU with multi-MB blits and starves everything
+ * else (cursor, cron, the app itself) — the "drag froze the system" the user hit.
+ * Cap the WINDOW move+damage to ~33 fps; skipped motions still move the cursor
+ * (cheap), so the pointer stays smooth while the window follows at a sane rate. */
+#define DRAG_FRAME_MS 30
+#define PEV_CLICK  0
+
+/* Does the DESKTOP hold keyboard focus?  §M64's gate is load-bearing: the GUI
+ * suppresses the console but keys still reach its VC, which is how a command
+ * is typed with the desktop up — and how this project's own harness drives
+ * every GUI build.  Consuming Enter unconditionally would have made the test
+ * that proves the feature its first casualty. */
+extern volatile int desk_focus;
+
+/* Panel input queue (compositor/IRQ produces, panel task consumes). */
+struct pev { uint8_t type; int16_t x, y; };
+
+#define PEV_MOTION 1
+/* §M64 — a click on the desktop background (no window, no chrome). */
+#define PEV_DESK_CLICK 2
+#define PEV_DESK_DBL   3
+/* §M64 tail — the desktop's pointer PHASES, carrying WPTR_* in the queue so
+ * the shell sees §M58's vocabulary and not a second one. */
+#define PEV_DESK_PRESS   4
+#define PEV_DESK_DRAG    5
+#define PEV_DESK_RELEASE 6
+/* §M64 tail — a keycode nothing else claimed; x carries the code, y the
+ * modifiers.  The queue's two fields are a point for the pointer events and a
+ * key here: one more event type, not one more queue. */
+#define PEV_DESK_KEY     7
+
+
+/* Queue a desktop-shell pointer event (taskbar, launcher, wallpaper). */
+/* The desktop shell's pointer queue: input.c PRODUCES, the desktop task
+ * CONSUMES.  A pop accessor rather than a shared ring, so the single-producer
+ * invariant that makes it lock-free stays enforceable in one file — §M69's own
+ * first eviction attempt broke exactly that by walking the ring from the
+ * consumer's index inside the mouse IRQ. */
+void pevq_push(uint8_t type, int x, int y);
+int  pevq_pop(struct pev* out);          /* 0 = queue empty */
+
+/* Ring statistics, reported by `gui stats`.  A dropped-event line is what
+ * makes the next occurrence of a silent drop name itself. */
+extern volatile unsigned evq_dropped, evq_coalesced;
+
+/* ---- the instruments (gui_diag.c) ----------------------------------------
+ * Drained once per frame by the compositor, for the reason in that file: a
+ * report printed on the REQUESTING task goes to the suppressed console. */
+void gui_diag_service(void);
+
+/* Desktop-task counters.  "The taskbar is not updating" has THREE causes that
+ * look identical from outside — the loop is not running, it never marks itself
+ * dirty, or its damage never reaches the compositor — so `gui stats` reports
+ * all three separately (§4.67.1). */
+extern volatile uint32_t desk_iters, desk_draws, desk_events;
+extern volatile uint32_t desk_ticks, desk_tick_dirty, desk_now_ms;
 
 #endif

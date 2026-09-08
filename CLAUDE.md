@@ -74,10 +74,44 @@ faults / 0 NMI / 0 softlockups on i386 and x86_64 at -smp 4 and on aarch64's
 BOTH boot paths; and the GUI checked BY PICTURE** (§M69's method note — every
 visual defect that port had was obvious in a screenshot and invisible in a pixel
 probe), with Task Manager rendering its title buttons, four table columns, row
-separators, scrollbar and footer intact across the new file boundary.  **OPEN:**
-gui.c still holds the compositor proper AND the input router; splitting those
-wants its own before-and-after `gui.stats_ms` numbers rather than a hurried pass
-on the way to something else.
+separators, scrollbar and footer intact across the new file boundary.  **AND THE COMPOSITOR SPLIT FOLLOWED, WITH THE MEASUREMENT THAT HAD TO JUSTIFY
+IT.**  The first pass stopped short of gui.c's core on purpose — it is the code
+every performance claim in §4.61, §M61 and §M69 was made against.  **BASELINE,
+three `gui bench` runs at 1920x1200: 109792 / 108195 / 108079 us/frame, 1.6 %
+spread.  AFTER: 105558 / 109973 / 102242.**  *The honest reading is "NO
+MEASURABLE CHANGE", not "2.5 % faster"* — the means differ by 2.5 % and the
+after-spread alone is 7.3 %, so the difference is inside the noise (§M56.2's
+rule, applied to a refactor instead of an optimisation).  What it DOES establish
+is the absence of the regression a bad split produces: an extra indirection per
+pixel, or a hot field moved across a translation unit, would show up far larger.
+**gui.c 5620 → 1635**, plus input.c 1079, compose.c 757, wm.c 727, app_host.c
+544, gterm.c 445, gui_diag.c 346, gui_mode.c 256, gui_priv.h 607.  **TWO SEAMS
+WERE MADE NARROWER RATHER THAN WIDER, both because an `extern` on a ring invites
+breaking the invariant that makes it lock-free:** `pevq_pop()` bounds the desktop
+queue's single-producer discipline to one file (§M69's own first eviction attempt
+broke exactly that from the mouse IRQ — *not a slow machine but a dead one*), and
+`gui_diag_service()` replaced five exported report flags, because with the GUI up
+a report printed on the REQUESTING task goes to the suppressed console and
+reaches nobody (§4.79).  **THE HEADER HAD TO BE CORRECTED TWICE, and the mistake
+is worth carrying:** a block copy took `static` DEFINITIONS into gui_priv.h,
+which **compiles** and silently gives every translation unit its OWN COPY — so
+`mv_hint` written by the input path and read by the painter would have been
+different objects.  The only reliable signal was the same `-Wunused-variable`
+appearing ONCE PER INCLUDING FILE, i.e. a warning about the symptom.
+**VERIFIED BY DRIVING THE MOUSE, because a picture proves the painter and says
+nothing about the router:** `ps2-mouse: buttons 0 -> 1` then `gui: press
+dispatched to 'Task Manager' at 301,227`, with the screenshot showing the row
+selected — the whole chain across five new file boundaries.  **A METHOD NOTE AT
+MY OWN EXPENSE:** the first driven run gave *2 device transitions, 0
+dispatches*, which is exactly §4.85.8's "the WM swallowed it" signature and was
+CORRECT behaviour — the click had landed on the wallpaper.  *That three-outcome
+table only reads correctly when the POSITION is known*, which is what
+`wheeltest`'s probe mode exists to supply.  **OPEN:** input.c is now the largest
+compositor file and `gui_mouse` alone is ~500 lines carrying press, release,
+motion, both drags, the title-button hit test, the taskbar, the desktop
+fallthrough and four modality gates.  It is a state machine and would read
+better as one — but that is a REWRITE of the most timing-sensitive code in the
+tree, not a move, and it wants its own falsifying test first.
 
 ✅ **§M69 — THE CONSOLE PLATE PORT, COMPLETE (2026-09-03).  REAL TYPEFACES,
 AND A MOUSE LAG WITH A NUMBER ON IT (2026-08-30,

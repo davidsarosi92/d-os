@@ -76,7 +76,6 @@
  * absolute numbers.  These are functions now, so a §M61 mode change moves the
  * chrome with the text instead of leaving one behind. */
 #define TITLE_H     cp_titlebar_h()
-#define GRIP        14
 #define PAD         3
 #define CLOSE_W     cp_window_btn()
 #define CLOSE_H     cp_window_btn()
@@ -119,39 +118,12 @@
  * than an index because two windows must not both look hovered; it is only ever
  * COMPARED against the compose snapshot, never dereferenced, so a window freed
  * between the two simply stops matching. */
-static struct gui_window* volatile tb_hover_win;
-static volatile int tb_hover_idx = -1;
+struct gui_window* volatile tb_hover_win;
+volatile int tb_hover_idx = -1;
 
-#define COL_WIN_BG (cp_current_theme()->surface)
-/* §M58 — selection wash.  Bright enough to be unambiguous over the terminal
- * background, and the text flips to dark so it stays legible. */
-#define COL_SEL_BG (cp_current_theme()->sel_bg)
-#define COL_SEL_FG (cp_current_theme()->sel_fg)
-#define COL_WIN_FG (cp_current_theme()->text)
-#define COL_TITLE_F_TOP (cp_current_theme()->raised)
-#define COL_TITLE_F_BOT (cp_current_theme()->raised)
-#define COL_TITLE_U_TOP (cp_current_theme()->tray)
-#define COL_TITLE_U_BOT (cp_current_theme()->tray)
-#define COL_BORDER_F (cp_current_theme()->accent)
-#define COL_BORDER_U (cp_current_theme()->line)
-#define COL_TITLE_TEXT (cp_current_theme()->text)
-#define COL_SHADOW      0x48000000u
-/* §M69 — the modal backdrop.  widget_specs.md §14 says black at 45 %, and
- * 45 % of 255 is 115 = 0x73; written as the arithmetic rather than as a
- * rounded-looking constant so the next person can check it against the spec
- * instead of trusting it. */
-#define COL_MODAL_DIM   0x73000000u
-#define COL_RUBBER (cp_current_theme()->accent)
-#define COL_CLOSE_BG    0xFFC0392Bu
-#define COL_CLOSE_FG    0xFFF8ECEAu
 /* §M65 popup palette — deliberately the same values the Start menu uses in
  * shell_vista.c: two menus that look different are two menus, and a shared
  * header for four colours would be a header for four colours. */
-#define COL_POP_BG (cp_current_theme()->raised)
-#define COL_POP_EDGE (cp_current_theme()->line)
-#define COL_POP_HOVER (cp_current_theme()->hover)
-#define COL_POP_SEP (cp_current_theme()->line_soft)
-#define COL_POP_TEXT (cp_current_theme()->text)
 
 /* -------------------------------------------------------------------------- */
 /* Window object.                                                              */
@@ -162,75 +134,14 @@ static volatile int tb_hover_idx = -1;
  * They are still PRIVATE — that header is only for the files that together
  * implement the compositor.  See its comment for the three-header split. */
 
-/* Double-click tracking (IRQ only). */
-static uint64_t lastclick_ms = 0;
-static int lastclick_x = -100, lastclick_y = -100;
-static struct gui_window* lastclick_win = NULL;
 
-struct gui_window windows[GUI_MAX_WINDOWS];
+struct move_hint mv_hint;               /* guarded by state_lock      */
 
-/* Z-order, bottom → top (state_lock). */
-struct gui_window* zorder[GUI_MAX_WINDOWS];
-int                zcount = 0;
-struct gui_window* focused_win = NULL;
-
-/* WM / pointer state (state_lock; IRQ writer). */
-spinlock_t state_lock;
-static int mx, my;
-static unsigned btn_prev = 0;
-enum drag_mode      drag = DRAG_NONE;
-struct gui_window*  drag_win = NULL;
-int grab_dx, grab_dy;
-static int rubber_w, rubber_h;
-/* §perf — DRAG_MOVE recompose throttle.  Opaque window move re-blits the whole
- * (possibly large) window every mouse packet; a fast drag of a big window (e.g.
- * NetSurf) then floods the single CPU with multi-MB blits and starves everything
- * else (cursor, cron, the app itself) — the "drag froze the system" the user hit.
- * Cap the WINDOW move+damage to ~33 fps; skipped motions still move the cursor
- * (cheap), so the pointer stays smooth while the window follows at a sane rate. */
-#define DRAG_FRAME_MS 30
-static uint64_t last_drag_frame_ms = 0;
-
-/* §perf — per-drag accounting, printed when the drag ends (gui.drag_stats=1).
- *
- * It has to be a REPORT rather than a command, because by the time anyone
- * could type `gui stats` the drag is over and its cost has been averaged into
- * everything else.  The figures are chosen to separate the two candidate
- * explanations of "dragging lags": if `moved` is far below `motions` the
- * window is being throttled, and if the compositor's own milliseconds fill the
- * elapsed time the blit is the bottleneck. */
-/* §perf — THE MOVE HINT: "this window went from here to there, and nothing
- * else changed".
- *
- * A dragged window's pixels do not change — only its position does — so the
- * composited image can be COPIED from the old place to the new one instead of
- * being rebuilt out of wallpaper, shadow, chrome and content.  Measured, that
- * rebuild was 36 ms per frame for a 921x721 window against a 30 ms frame
- * budget, which is precisely what "the window trails the pointer" is made of.
- *
- * The hint is passed OUT OF BAND rather than as damage, and that is what makes
- * the optimisation safe: compose takes the fast path only when the damage list
- * is otherwise EMPTY.  Anything else that changed this frame — an app
- * repainting, a window raising, the panel — puts a rect in that list and the
- * whole thing falls back to the ordinary painter.  The alternative (inspecting
- * merged damage rects to guess whether they are "only the drag") cannot
- * distinguish a window that moved from one that moved AND redrew, and the
- * failure mode of guessing wrong is a stale image nobody can explain. */
-struct move_hint {
-    int  active;
-    struct gui_window* win;
-    int  ox, oy, nx, ny, w, h;
-};
-static struct move_hint mv_hint;               /* guarded by state_lock      */
-
-static uint64_t drag_t0_ms, drag_compose0_ns;
-static uint32_t drag_motions, drag_frames, drag_f0;
 /* How many composites took the copy path and how many fell back.  Both
  * numbers matter: all-fast would mean the fallback is never exercised (and so
  * never tested), and all-slow would mean the optimisation is not running at
  * all while the timing appears to improve for some other reason. */
-static uint32_t drag_fast, drag_slow;
-static uint64_t drag_px0;
+uint32_t drag_fast, drag_slow;
 
 
 /* Scene. */
@@ -259,21 +170,26 @@ static unsigned close_grace_ms = 10000;
  * of blitting straight into the live scanout.  QEMU then never reads a
  * half-updated frame — no mid-scanout shear.  flip_ok==0 keeps the legacy
  * single-buffer direct blit (real hardware / non-Bochs display). */
-extern void fb_flip_to(int idx);
 
-/* M22.7 — a damage rectangle (used by both the damage list and the page
- * flip's previous-frame list). */
-struct rect { int x0, y0, x1, y1; };
-#define DMG_MAX 16
+struct gui_window windows[GUI_MAX_WINDOWS];
+
+/* Z-order, bottom → top (state_lock). */
+struct gui_window* zorder[GUI_MAX_WINDOWS];
+int                zcount = 0;
+struct gui_window* focused_win = NULL;
+
+/* WM / pointer state (state_lock; IRQ writer). */
+spinlock_t state_lock;
+int mx, my;
+enum drag_mode      drag = DRAG_NONE;
+struct gui_window*  drag_win = NULL;
+int grab_dx, grab_dy;
+int rubber_w, rubber_h;
+
 
 int flip_ok = 0;
 struct gfx_surface flipbuf[2];   /* alias the two scanout buffers  */
 int flip_front = 0;              /* buffer index currently visible */
-/* Last present's dirty rects.  A page flip has buffer-age 2: the hidden
- * buffer is stale outside the regions touched in the last TWO presents, so
- * each present copies this frame's rects ∪ last frame's rects. */
-static struct rect prev_dmg[DMG_MAX + 2];       /* +2 for the cursor rects   */
-static int         prev_dmg_n = 0;
 
 volatile int need_frame = 0;
 int gui_active = 0;
@@ -301,7 +217,7 @@ spinlock_t   panel_lock;
  * are parented here so they belong to the desktop session (M22.7). */
 int          desktop_pid = 0;
 volatile int panel_dirty = 1;            /* shell needs a redraw     */
-static volatile int panel_gen = 0;              /* bumped on WM changes     */
+volatile int panel_gen = 0;              /* bumped on WM changes     */
 /* ===========================================================================
  * §M65 — THE WINDOW POPUP: one overlay above every window.
  *
@@ -374,44 +290,17 @@ int modal_hit(int px, int py) {
 
 /* Published launcher-popup extent (set by the shell via gui_panel_set_popup)
  * — read by the compositor (what to composite) and input routing. */
-static volatile int pnl_pop_on = 0;
-static volatile int pnl_pop_x = 0, pnl_pop_y = 0, pnl_pop_w = 0, pnl_pop_h = 0;
+volatile int pnl_pop_on = 0;
+volatile int pnl_pop_x = 0, pnl_pop_y = 0, pnl_pop_w = 0, pnl_pop_h = 0;
 
-/* Panel input queue (compositor/IRQ produces, panel task consumes). */
-struct pev { uint8_t type; int16_t x, y; };
-#define PEV_CLICK  0
-#define PEV_MOTION 1
-/* §M64 — a click on the desktop background (no window, no chrome). */
-#define PEV_DESK_CLICK 2
-#define PEV_DESK_DBL   3
-/* §M64 tail — the desktop's pointer PHASES, carrying WPTR_* in the queue so
- * the shell sees §M58's vocabulary and not a second one. */
-#define PEV_DESK_PRESS   4
-#define PEV_DESK_DRAG    5
-#define PEV_DESK_RELEASE 6
-/* §M64 tail — a keycode nothing else claimed; x carries the code, y the
- * modifiers.  The queue's two fields are a point for the pointer events and a
- * key here: one more event type, not one more queue. */
-#define PEV_DESK_KEY     7
-#define PEVQ_SZ 32
-static struct pev        pevq[PEVQ_SZ];
-static volatile uint32_t pevq_h = 0, pevq_t = 0;
 
-/* §M64 tail — a desktop drag in progress.  Set on a press that hit no window
- * and no chrome, cleared on release.  While set, motion and release go to the
- * DESKTOP whatever the pointer is over: a drag that ends at the first window
- * it crosses is not a drag (§M58's grab, one layer up).
- *
- * A flag and not a pointer: the desktop is not an object that can be
- * destroyed mid-drag, which is exactly why the widget grab needed to be one. */
-static volatile int desk_grab = 0;
 
 /* §M64 tail — does the desktop hold the keyboard?  Published by the shell
  * whenever its icon selection appears or clears (gui_desktop_focus), and read
  * in the keyboard IRQ to decide whether Enter and Escape belong to a shortcut
  * or to the shell behind the desktop.  A flag rather than a query because the
  * reader is an interrupt handler and the writer is the desktop task. */
-static volatile int desk_focus = 0;
+volatile int desk_focus = 0;
 
 void gui_desktop_focus(int on) { desk_focus = on ? 1 : 0; }
 
@@ -426,139 +315,21 @@ static void gui_task_change_hook(void) {
     need_frame = 1;
 }
 
-/* M22.7 — damage tracking as a LIST of disjoint rects (was a single
- * bounding box).  A single box merged far-apart damages — a Task Manager
- * refresh in one corner and the cursor in another — into their bounding
- * box, so the compositor re-blitted a huge diagonal region every refresh
- * and the cursor visibly stuttered.  A list composites each small rect on
- * its own, so two disjoint updates stay two small blits.  Rects accumulate
- * under damage_lock (nested inside state_lock on the mouse path — never the
- * other way).  full/partial counters back the `gui stats` command. */
-static spinlock_t damage_lock;
-static struct rect dmg_list[DMG_MAX];
-static int         dmg_n = 0;
-static uint32_t frames_full = 0, frames_partial = 0;
-/* Read once at gui_start rather than per rect: this is consulted inside the
- * painter's inner path, and a config lookup there would cost more than the
- * skip saves. */
-static int g_occlude = 1;
-/* How often the skip actually fires.  Reported, because an optimisation whose
- * hit rate nobody can see is one nobody can defend when it turns out not to
- * apply to the case that hurts — which is exactly what happened to §4.61's
- * version of this. */
-static uint32_t occluded_rects = 0, painted_rects = 0;
-static uint64_t total_blit_px = 0;              /* M22.7 — avg damage/frame */
-/* §perf — how much TIME the compositor spends, not just how many pixels it
- * moves.  "The desktop lags when I drag a big window" is a statement about
- * duration, and pixels are only a proxy for it: the same rectangle costs a
- * different number of milliseconds on a 4 GHz core and under emulation. */
-static uint64_t total_compose_ns = 0;
 
-static int rects_overlap(const struct rect* r, int x0, int y0, int x1, int y1) {
-    return !(x0 >= r->x1 || x1 <= r->x0 || y0 >= r->y1 || y1 <= r->y0);
-}
-static void rect_grow(struct rect* r, int x0, int y0, int x1, int y1) {
-    if (x0 < r->x0) r->x0 = x0;
-    if (y0 < r->y0) r->y0 = y0;
-    if (x1 > r->x1) r->x1 = x1;
-    if (y1 > r->y1) r->y1 = y1;
-}
-static long rect_area(const struct rect* r) {
-    return (long)(r->x1 - r->x0) * (r->y1 - r->y0);
-}
 
-/* Add a damage rect: merge into an OVERLAPPING existing rect (so we never
- * composite the same pixels twice), else append; if the list is full, fold
- * it into the rect whose area grows least (bounded degradation). */
-static void damage_add_locked(int x0, int y0, int x1, int y1) {
-    if (x1 <= x0 || y1 <= y0) return;
-    for (int i = 0; i < dmg_n; i++)
-        if (rects_overlap(&dmg_list[i], x0, y0, x1, y1)) {
-            rect_grow(&dmg_list[i], x0, y0, x1, y1);
-            return;
-        }
-    if (dmg_n < DMG_MAX) {
-        dmg_list[dmg_n++] = (struct rect){ x0, y0, x1, y1 };
-        return;
-    }
-    int best = 0; long best_cost = -1;
-    for (int i = 0; i < dmg_n; i++) {
-        struct rect g = dmg_list[i];
-        rect_grow(&g, x0, y0, x1, y1);
-        long cost = rect_area(&g) - rect_area(&dmg_list[i]);
-        if (best_cost < 0 || cost < best_cost) { best_cost = cost; best = i; }
-    }
-    rect_grow(&dmg_list[best], x0, y0, x1, y1);
-}
 
-void gui_damage(int x, int y, int w, int h) {
-    if (w <= 0 || h <= 0) return;
-    uint32_t fl = spin_lock_irqsave(&damage_lock);
-    damage_add_locked(x, y, x + w, y + h);
-    spin_unlock_irqrestore(&damage_lock, fl);
-    need_frame = 1;
-}
 
-void gui_damage_all(void) {
-    uint32_t fl = spin_lock_irqsave(&damage_lock);
-    dmg_n = 0;                                  /* collapse to one full rect */
-    damage_add_locked(0, 0, fbsurf.w, fbsurf.h);
-    spin_unlock_irqrestore(&damage_lock, fl);
-    need_frame = 1;
-    panel_gen++;            /* M22.7-B — WM-ish change; nudge the taskbar */
-}
 
-/* Window rect + margin for border/shadow (+5 shadow, +2 safety). */
-void gui_damage_win(struct gui_window* w) {
-    gui_damage(w->x - 2, w->y - 2, w->w + 9, w->h + 9);
-}
 
-void gui_get_stats(uint32_t* full, uint32_t* partial, uint32_t* avg_kb) {
-    if (full)    *full    = frames_full;
-    if (partial) *partial = frames_partial;
-    if (avg_kb) {
-        uint32_t frames = frames_full + frames_partial;
-        *avg_kb = frames ? (uint32_t)(total_blit_px * 4 / 1024 / frames) : 0;
-    }
-}
 
 /* Active desktop shell (chosen once at gui_start). */
 const struct desktop_shell* shell = NULL;
 
-/* §M58 — POINTER GRAB.  From a press on a widget that wants the pointer
- * stream until the release, motion goes to THAT widget even when the pointer
- * has left it (or the window).  Without a grab a selection stops at the
- * widget's edge, which is precisely where a user drags to.
- *
- * Written by the mouse IRQ under state_lock, read there too; the compositor
- * only ever sees the events it produces. */
-static struct gui_window* grab_win = NULL;
 
 /* ---- IRQ → compositor queues (SPSC: IRQ produces, compositor consumes) ---- */
 
-struct gev {
-    struct gui_window* win;
-    int16_t x, y;                       /* content-relative              */
-    uint8_t dbl;
-    uint8_t btn, down;                  /* 0 = motion; else button + edge */
-    uint8_t ptr;                        /* §M58: 0 = none, else WPTR_*+1  */
-    uint8_t hover;                      /* 1 = pointer-over, no button     */
-    int8_t  dz;                         /* §M61: wheel delta, 0 = none    */
-};
-#define EVQ_SZ 32
-static struct gev        evq[EVQ_SZ];
-static volatile uint32_t evq_h = 0, evq_t = 0;
 
-#define KEYQ_SZ 32
-static volatile char     keyq[KEYQ_SZ];
-static volatile uint32_t keyq_h = 0, keyq_t = 0;
 
-/* M22.5 — raw keycode queue (nav/editing keys + Ctrl shortcuts for the
- * focused APP window).  Entry: kc | mods << 8.  Same SPSC shape as
- * keyq: keyboard IRQ produces, compositor consumes. */
-#define KCQ_SZ 32
-static volatile uint16_t kcq[KCQ_SZ];
-static volatile uint32_t kcq_h = 0, kcq_t = 0;
 
 /* App-launch queue + power request (shell chrome → compositor task). */
 #define LQ_SZ 8
@@ -575,26 +346,7 @@ static volatile uint32_t oq_h = 0, oq_t = 0;
 static volatile int power_req = 0;      /* 0 none / 1 reboot / 2 shutdown */
 static volatile int exit_req  = 0;      /* Start → Exit GUI: end the session   */
 static void gui_stop_main(void);        /* teardown task; defined by gui_stop  */
-static volatile int sak_close_req = 0;  /* §M46 Ctrl+Alt+X — close/force top app */
 
-/* `btn` 0 = plain motion; otherwise the button index, with `down` saying
- * press or release. */
-/* §M69 — COALESCE HOVERS IN THE GLOBAL RING TOO, and this is the one that
- * mattered.
- *
- * `aq` (per window) got this treatment first and the flood test still measured
- * ZERO drops — because the events were being discarded HERE, one ring earlier,
- * and never reached `aq` at all.  *An instrument placed on the wrong side of
- * the problem reports the problem as absent*, which is §4.61's lesson about
- * timing the wrong side of a blit, in a new place.
- *
- * A motion packet becomes a hover, a trackpad delivers them in bursts of
- * dozens, and this ring is 32 deep and shared by EVERY window.  `evq_push`
- * below — the one that carries a real button — then found it full and returned
- * silently.  Two queued hovers describe one pointer; the older one describes
- * where it is not any more, so the newer REPLACES it and the burst collapses
- * to one entry. */
-static volatile unsigned evq_dropped, evq_coalesced;
 
 /* §M69 — WRITE THE WHOLE SLOT, ALWAYS, AND NEVER FIELD BY FIELD.
  *
@@ -617,86 +369,12 @@ static volatile unsigned evq_dropped, evq_coalesced;
  * what the caller does not name and a field cannot be forgotten.  *A partial
  * write into a reused buffer is not a missing line; it is a value invented by
  * whatever ran before.* */
-static int evq_evict_hover(void);
 
-static void evq_store(struct gev e) {
-    uint32_t n = (evq_h + 1) % EVQ_SZ;
-    if (n == evq_t && evq_evict_hover()) n = (evq_h + 1) % EVQ_SZ;
-    if (n == evq_t) {
-        if (evq_dropped++ == 0)
-            kprintf("gui: INPUT EVENT DROPPED - the shared queue was full of "
-                    "events that all mattered (see `gui stats`)\n");
-        return;
-    }
-    evq[evq_h] = e;
-    evq_h = n;
-}
 
-static void evq_push_hover(struct gui_window* w, int cx, int cy) {
-    if (evq_h != evq_t) {
-        uint32_t last = (evq_h + EVQ_SZ - 1) % EVQ_SZ;
-        if (evq[last].hover && evq[last].win == w) {
-            evq[last].x = (int16_t)cx;
-            evq[last].y = (int16_t)cy;
-            evq_coalesced++;
-            return;
-        }
-    }
-    uint32_t n = (evq_h + 1) % EVQ_SZ;
-    if (n == evq_t) { evq_coalesced++; return; }   /* a stale hover, no loss */
-    struct gev e = { .win = w, .x = (int16_t)cx, .y = (int16_t)cy, .hover = 1 };
-    evq[evq_h] = e;
-    evq_h = n;
-}
 
-/* A BUTTON IS NEVER DROPPED WHILE A HOVER COULD GO INSTEAD.  This returned
- * silently on a full ring, and the ring is full of positions — so a click
- * arriving mid-gesture simply vanished.  That is the whole of *"sometimes a
- * button click does nothing, as if it were a refresh problem"*, and of the
- * arrows and the thumb and the slider: one press or one release that never
- * happened. */
-static int evq_evict_hover(void) {
-    for (uint32_t i = evq_t; i != evq_h; i = (i + 1) % EVQ_SZ) {
-        if (!evq[i].hover) continue;
-        for (uint32_t j = i; j != evq_t; j = (j + EVQ_SZ - 1) % EVQ_SZ)
-            evq[j] = evq[(j + EVQ_SZ - 1) % EVQ_SZ];
-        evq_t = (evq_t + 1) % EVQ_SZ;
-        evq_coalesced++;
-        return 1;
-    }
-    return 0;
-}
 
-static void evq_push(struct gui_window* w, int cx, int cy, int dbl,
-                     int btn, int down) {
-    struct gev e = { .win = w, .x = (int16_t)cx, .y = (int16_t)cy,
-                     .dbl = (uint8_t)dbl, .btn = (uint8_t)btn,
-                     .down = (uint8_t)down };
-    evq_store(e);
-}
 
-/* §M58 — push a pointer PHASE event (press / drag / release) for a widget
- * window.  Separate from evq_push because the two carry different meanings
- * through the same ring and conflating them is how a click becomes a drag.
- *
- * THIS ONE CARRIES THE PRESS THAT OPERATES EVERY SCROLLBAR, SLIDER AND
- * SELECTION IN THE TREE, and it used to be the least careful of the three: it
- * left `hover` from the previous tenant of the slot (see evq_store) and it
- * returned SILENTLY on a full ring, where evq_push had been taught to sacrifice
- * a hover instead.  A phase event is never expendable — a lost press is a
- * control that ignored you, and a lost RELEASE is a grab held forever. */
-static void evq_push_ptr(struct gui_window* w, int cx, int cy, int phase) {
-    struct gev e = { .win = w, .x = (int16_t)cx, .y = (int16_t)cy,
-                     .ptr = (uint8_t)(phase + 1) };
-    evq_store(e);
-}
 
-/* §M61 follow-up — a wheel event for the window under the pointer. */
-static void evq_push_wheel(struct gui_window* w, int cx, int cy, int dz) {
-    struct gev e = { .win = w, .x = (int16_t)cx, .y = (int16_t)cy,
-                     .dz = (int8_t)dz };
-    evq_store(e);
-}
 
 
 /* Mouse-wheel listener (IRQ).  Finds the window under the cursor and queues;
@@ -704,27 +382,6 @@ static void evq_push_wheel(struct gui_window* w, int cx, int cy, int dz) {
 /* Defined further down with the rest of the terminal-grid code; needed here by
  * the wheel listener, which is the IRQ half of the same feature. */
 
-static void gui_wheel(int dz) {
-    if (!gui_active || !dz) return;
-    uint32_t fl = spin_lock_irqsave(&state_lock);
-    struct gui_window* win = topmost_at(mx, my);
-    if (win && win->kind == WIN_APP && !win->minimized && my >= win->y + TITLE_H)
-        evq_push_wheel(win, mx - win->x - BORDER, my - win->y - TITLE_H, dz);
-    else if (win && win->kind == WIN_TERM && !win->minimized &&
-             my >= win->y + TITLE_H) {
-        /* §M58 — the wheel over a terminal moves its SCROLLBACK.  Three lines
-         * per notch is the convention everywhere else and the reason is that a
-         * notch is a coarse gesture: one line per notch makes reading a page of
-         * history a wrist exercise.
-         *
-         * The IRQ only moves the offset; the re-render (thousands of glyph
-         * blits) runs on the compositor through the same flag the selection
-         * uses (§M22.7's split — the interrupt records, the compositor works). */
-        if (gterm_view_scroll(win, dz > 0 ? 3 : -3)) term_sel_dirty = win;
-    }
-    spin_unlock_irqrestore(&state_lock, fl);
-    need_frame = 1;
-}
 
 /* -------------------------------------------------------------------------- */
 /* App registry walk helpers (gui_app.h).                                      */
@@ -841,13 +498,6 @@ void str_copy(char* dst, const char* src, int cap) {
     dst[i] = 0;
 }
 
-static void draw_rect_outline(struct gfx_surface* s, int x, int y, int w, int h,
-                              int t, uint32_t c) {
-    gfx_fill(s, x,         y,         w, t, c);
-    gfx_fill(s, x,         y + h - t, w, t, c);
-    gfx_fill(s, x,         y,         t, h, c);
-    gfx_fill(s, x + w - t, y,         t, h, c);
-}
 
 /* -------------------------------------------------------------------------- */
 /* Terminal-in-a-window ("gterm").                                             */
@@ -893,88 +543,13 @@ static void draw_rect_outline(struct gfx_surface* s, int x, int y, int w, int h,
 
 
 
-/* `gui.input_debug`, CACHED.  Both probes ask on the path a mouse packet takes
- * — one of them from the mouse driver — and `config_get_long` walks the store
- * comparing strings, which is nothing next to a compose and real work at
- * packet rate.  -1 = not read yet.
- *
- * THE BUG THIS LINE HELD FOR ONE SESSION, written down because the shape is
- * worth more than the typo: the cached read said
- *
- *     if (g_input_dbg < 0) g_input_dbg = (int)gui_input_debug();
- *
- * i.e. the accessor called ITSELF.  Unbounded recursion, 16 bytes of stack a
- * frame, on the FIRST call — and the first call is a BUTTON TRANSITION, because
- * `&&` short-circuits and both probe sites test something cheaper first.  So
- * pure motion never reached it and the machine died on the first CLICK, with a
- * smashed kernel stack: `EXCEPTION 14 ... eip == cr2` at a garbage address, i.e.
- * execution returning through whatever the overflow had written.
- *
- * IT WAS THE INSTRUMENT, WHICH IS WHY THE BISECT KEPT CLEARING EVERYTHING.  I
- * disabled the ring coalescing, the IRQ-side probe, the stale-latch sweep and
- * the measure/arrange split in turn, and the fault survived all four — because
- * none of them is this function, and every one of those experiments still went
- * through it.  *A bisect over features cannot find a bug in the thing doing the
- * measuring*, and the conclusion it produced ("older than this session") was
- * confident and wrong. */
-static int g_input_dbg = -1;
-
-int gui_input_debug(void) {
-    if (g_input_dbg < 0) g_input_dbg = (int)config_get_long("gui.input_debug", 0);
-    return g_input_dbg;
-}
-void gui_input_debug_refresh(void) { g_input_dbg = -1; }
-
-static void gui_input_debug_watch(const char* k, const char* v) {
-    (void)k; (void)v;
-    gui_input_debug_refresh();
-}
-
-/* …and the cache is only honest if something drops it.  Without this a
- * `setconf gui.input_debug 1` typed after the first packet would be recorded,
- * reported as set by `conf list`, and change nothing — the debug switch being
- * the one setting whose silent failure costs a whole round of diagnosis. */
-CONFIG_WATCH(cw_input_dbg) = {
-    .prefix = "gui.input_debug",
-    .changed = gui_input_debug_watch,
-};
-
-void gui_get_input_stats(unsigned* dropped, unsigned* coalesced) {
-    if (dropped)   *dropped = aq_dropped + evq_dropped;
-    if (coalesced) *coalesced = aq_coalesced + evq_coalesced;
-}
 
 
 
-/* The public half: an app whose `on_layout` BUILDS widgets calls this at the
- * top of it, so the rebuild replaces the old set instead of stacking on it.
- *
- * Explicit rather than automatic, because `on_layout` means two things in this
- * tree — build, or merely reposition — and clearing the list before a
- * repositioning one would hand it freed pointers to write coordinates into. */
-/* Per-window widget counts.
- *
- * THIS IS THE TEST FOR THE RE-LAYOUT BUG, and it has to be a COUNT because the
- * defect is invisible in a screenshot: a duplicated widget list draws the new
- * widget over the old one, so the window looks almost right — the only visible
- * trace is a strip of stale pixels where the geometry changed and a region that
- * answers clicks.  §M64 made the same argument for `shortcut check`: a view
- * that draws correctly and hit-tests wrongly cannot be photographed. */
-void gui_widget_report(void) {
-    int total = 0, wins = 0;
-    kprintf("gui widgets:\n");
-    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
-        struct gui_window* win = &windows[i];
-        if (!win->used || win->kind != WIN_APP) continue;
-        int n = 0;
-        for (struct widget* w = win->widgets; w; w = w->next) n++;
-        kprintf("  '%s'  %dx%d  %d widget(s)\n", win->title, win->w, win->h, n);
-        total += n;
-        wins++;
-    }
-    if (!wins) kprintf("  (no app windows open)\n");
-    else kprintf("  %d window(s), %d widget(s) total\n", wins, total);
-}
+
+
+
+
 
 /* Force a re-layout of every app window, as a resize would.  Exists so the
  * count above can be taken BEFORE and AFTER without a mouse: the harness cannot
@@ -1019,142 +594,15 @@ void gui_theme_changed(void) {
     if (n) kprintf("gui: theme change — %d window(s) invalidated\n", n);
 }
 
-void gui_relayout_all(void) {
-    int n = 0;
-    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
-        if (!windows[i].used || windows[i].kind != WIN_APP) continue;
-        windows[i].layout_pending = 1;
-        n++;
-    }
-    need_frame = 1;
-    kprintf("gui: re-layout requested for %d window(s)\n", n);
-}
 
-/* Filled by gui_relayout_test, printed by the compositor — see the note at the
- * end of that function for why the two are not the same task. */
-static volatile int g_relay_report, g_relay_wins, g_relay_before,
-                    g_relay_after, g_relay_rounds;
-/* Same trick, same reason: the shell's kprintf goes to its VC while the GUI is
- * up, so the compositor says the number. */
-static volatile int      g_bench_report, g_bench_w, g_bench_h;
-static volatile uint64_t g_bench_ns;
-static volatile uint32_t g_bench_fr;
 
-/* MEASURE THE REPORTED CASE, rather than reason about it.
- *
- * Reported from use: *"when a window is full size, the whole thing lags."*  The
- * compositor is software, and §4.61 already measured its fill rate — so the
- * question is not whether a full-screen window is expensive but WHERE the
- * pixels go, and a number is the only thing that answers that.
- *
- * Opens a window covering the whole screen (which is the case being reported),
- * forces N full-screen composites, and reports the per-frame cost.  Self-
- * contained for the same reason `gui relaytest` is: once a GUI window has focus
- * the harness cannot type a second command. */
-static void bench_open(void) {
-    int w = backsurf.w, h = backsurf.h;
-    struct gui_window* win =
-        gui_app_window_create("Bench", 0, 0, w, h, NULL, NULL);
-    (void)win;
-}
 
 CONFIG_KEY(ck_gui_occlude) = {
     .key = "gui.occlude", .group = "Display", .type = CFG_BOOL, .def = "1",
     .help = "skip painting what an opaque window completely covers",
 };
 
-void gui_compose_bench(int frames) {
-    if (frames <= 0) frames = 30;
-    g_occlude = (int)config_get_long("gui.occlude", 1);
-    occluded_rects = painted_rects = 0;
-    int had = 0;
-    for (int i = 0; i < GUI_MAX_WINDOWS; i++)
-        if (windows[i].used && windows[i].kind == WIN_APP) had = 1;
-    if (!had) { gui_queue_open(bench_open); task_msleep(1200); }
 
-    uint64_t ns0 = total_compose_ns;
-    uint32_t f0  = frames_full + frames_partial;
-    for (int i = 0; i < frames; i++) {
-        gui_damage_all();
-        need_frame = 1;
-        /* Let the compositor actually run: this task is not it, and a loop that
-         * only queued damage would measure nothing but its own speed. */
-        task_msleep(40);
-    }
-    uint64_t ns = total_compose_ns - ns0;
-    uint32_t fr = (frames_full + frames_partial) - f0;
-
-    g_bench_ns = ns;
-    g_bench_fr = fr;
-    g_bench_w  = backsurf.w;
-    g_bench_h  = backsurf.h;
-    g_bench_report = 1;
-    need_frame = 1;
-}
-
-/* The whole regression test, in ONE command.
- *
- * It has to be one command because of a harness limit this project has hit
- * before: once a GUI window takes focus the shell can no longer be typed at, so
- * "open a panel" and "then count its widgets" cannot be two commands here.  The
- * same constraint that made §M64's Send-to-desktop row unverifiable.
- *
- * Counts, re-layouts N times, counts again.  A stable total is the pass; a
- * total that grows by the same amount each round is exactly the bug — one extra
- * set of widgets per resize. */
-void gui_relayout_test(int rounds) {
-    if (rounds <= 0) rounds = 3;
-    int before = 0, after = 0, wins = 0;
-    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
-        if (!windows[i].used || windows[i].kind != WIN_APP) continue;
-        wins++;
-        for (struct widget* w = windows[i].widgets; w; w = w->next) before++;
-    }
-    if (!wins) {
-        /* OPEN ONE OURSELVES rather than telling the user to.  `launch` as a
-         * separate command cannot work here: it gives the new window focus, and
-         * from that moment the harness cannot type the test.  A regression test
-         * that only a human can run is one that stops being run. */
-        const struct gui_app_def* app = gui_app_find("Control Panel");
-        if (!app) { kprintf("relayout: no app to test with\n"); return; }
-        gui_queue_launch(app);
-        task_msleep(1200);
-        for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
-            if (!windows[i].used || windows[i].kind != WIN_APP) continue;
-            wins++;
-            for (struct widget* w = windows[i].widgets; w; w = w->next) before++;
-        }
-        if (!wins) { kprintf("relayout: the test window did not open\n"); return; }
-    }
-    for (int r = 0; r < rounds; r++) {
-        gui_relayout_all();
-        /* The re-layout runs on each window's OWN host task, so this has to
-         * wait for it rather than read straight back — a count taken before the
-         * host has run would pass no matter what. */
-        task_msleep(400);
-    }
-    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
-        if (!windows[i].used || windows[i].kind != WIN_APP) continue;
-        for (struct widget* w = windows[i].widgets; w; w = w->next) after++;
-    }
-    /* HAND THE VERDICT TO THE COMPOSITOR TO PRINT, which is not fussiness.
-     *
-     * While the GUI is up the SHELL's output goes to its VC through the
-     * per-task hook and never reaches the serial line — the standing note
-     * against `gui stats`, and every automated check in this project is a grep
-     * over that line.  The compositor has no VC bound, so its kprintf goes
-     * through the console sinks and out of the serial port, which is why its
-     * own messages are in every log above.
-     *
-     * So the test computes the numbers here and lets the task that CAN be heard
-     * say them.  *A test whose result cannot be read is not a test.* */
-    g_relay_wins   = wins;
-    g_relay_before = before;
-    g_relay_after  = after;
-    g_relay_rounds = rounds;
-    g_relay_report = 1;
-    need_frame = 1;
-}
 
 
 
@@ -1201,142 +649,26 @@ struct gui_window* top_visible_locked(void) {
 /* Cursor sprite.                                                              */
 /* -------------------------------------------------------------------------- */
 
-static const char* const cursor_rows[17] = {
-    "X          ",
-    "XX         ",
-    "X.X        ",
-    "X..X       ",
-    "X...X      ",
-    "X....X     ",
-    "X.....X    ",
-    "X......X   ",
-    "X.......X  ",
-    "X........X ",
-    "X.....XXXXX",
-    "X..X..X    ",
-    "X.X X..X   ",
-    "XX  X..X   ",
-    "X    X..X  ",
-    "     X..X  ",
-    "      XX   ",
-};
 
 
 
 
 
 
-/* §M69 — INJECT A WHEEL NOTCH AT A CONTENT COORDINATE.
- *
- * This harness cannot deliver a real one (measured: QEMU's monitor produces no
- * wheel for our 4-byte IntelliMouse decode), so every claim about wheel
- * ROUTING has had to be made by reading the code — and reading is exactly what
- * produced two wrong explanations of the same report.  A synthetic notch goes
- * through the identical dispatcher a device notch would, so what it proves is
- * everything above the packet decode.
- *
- * `x`/`y` are CONTENT coordinates, which is what the router works in, and the
- * point is the whole value of the command: "the wheel does not work on the
- * content but works on the scrollbar" is a claim about two POSITIONS, and a
- * test that cannot name a position cannot check it. */
-void gui_wheel_test(int x, int y, int dz) {
-    struct gui_window* win = focused_win;
-    if (!win || !win->used || win->kind != WIN_APP) {
-        kprintf("wheeltest: no focused app window\n");
-        return;
-    }
-    /* dz == 0 is PROBE MODE: report what is under the point and who would take
-     * a notch there, WITHOUT moving anything.
-     *
-     * A sweep of probes is a MAP, and a map is what the report needs: "the
-     * wheel works on the scrollbar and not on the content" is a claim about
-     * two positions, and injecting a real notch at each of them changes the
-     * layout between samples — so the second sample no longer describes the
-     * thing the first one did. */
-    if (dz == 0) {
-        struct widget* w = widget_at(win->widgets, x, y);
-        kprintf("wheelprobe: %d,%d -> widget %s scroll=%s\n", x, y,
-                w ? "yes" : "none",
-                (w && w->ops && w->ops->scroll) ? "YES (would take it)" : "no");
-        return;
-    }
-    kprintf("wheeltest: dz=%d at content %d,%d in '%s'\n", dz, x, y, win->title);
-    struct app_event e = {0};
-    e.type = AE_SCROLL;
-    e.x = (int16_t)x;
-    e.y = (int16_t)y;
-    e.phase = (uint8_t)(int8_t)dz;
-    aq_push(win, e);
-    need_frame = 1;
-}
 
 
-static void draw_popup(struct gfx_surface* dst) {
-    if (!popup.active) return;
-    gfx_blend_fill(dst, popup.x + 4, popup.y + 4, popup.w, popup.h, COL_SHADOW);
-    gfx_fill(dst, popup.x, popup.y, popup.w, popup.h, COL_POP_BG);
-    draw_rect_outline(dst, popup.x, popup.y, popup.w, popup.h, 1, COL_POP_EDGE);
-    for (int i = 0; i < popup.count; i++) {
-        int y = popup.y + 3 + i * POPUP_ROW_H;
-        if (popup.items[i][0] == '-' && !popup.items[i][1]) {
-            gfx_fill(dst, popup.x + 6, y + POPUP_ROW_H / 2, popup.w - 12, 1, COL_POP_SEP);
-            continue;
-        }
-        if (i == popup.hover)
-            gfx_fill(dst, popup.x + 2, y, popup.w - 4, POPUP_ROW_H, COL_POP_HOVER);
-        cp_text(dst, popup.x + 10, y + (POPUP_ROW_H - cp_fh()) / 2,
-                 popup.items[i], COL_POP_TEXT);
-    }
-}
 
-static void draw_cursor(struct gfx_surface* s, int cx, int cy) {
-    for (int j = 0; j < 17; j++) {
-        for (int i = 0; cursor_rows[j][i]; i++) {
-            char p = cursor_rows[j][i];
-            if (p == ' ') continue;
-            int x = cx + i, y = cy + j;
-            if (x < 0 || x >= s->w || y < 0 || y >= s->h) continue;
-            s->px[(size_t)y * s->stride + x] = (p == 'X') ? 0xFF000000u : 0xFFFFFFFFu;
-        }
-    }
-}
 
 /* -------------------------------------------------------------------------- */
 /* Composition.                                                                */
 /* -------------------------------------------------------------------------- */
 
-/* M22.4 — compositor-side cursor bookkeeping.  Where the cursor was
- * LAST DRAWN, updated only by compose().  Lesson learned (2026-07-04):
- * compose() snapshots the damage rect BEFORE the WM state, so an
- * IRQ-supplied cursor rect can describe an OLDER position than the
- * (cx,cy) we end up drawing — the cursor got erased at its old spot
- * but clipped away at its new one for that frame (visible flicker /
- * ghosting when gliding over contrasting chrome).  The fix: the mouse
- * IRQ never submits cursor rects at all (a glide is a bare need_frame
- * wake); compose() itself unions the previously-drawn and the freshly
- * snapshotted cursor rects into the clip region, so erase + redraw
- * always happen in the same frame with one consistent position. */
-static int last_cur_x = -100, last_cur_y = -100;
 
-/* Cursor sprite is 11x17 px; ±1 px margin, matching draw position. */
-#define CUR_DMG_X(cx)  ((cx) - 1)
-#define CUR_DMG_Y(cy)  ((cy) - 1)
-#define CUR_DMG_W      14
-#define CUR_DMG_H      20
 
 /* -------------------------------------------------------------------------- */
 /* M22.7-B — desktop shell / panel task.                                       */
 /* -------------------------------------------------------------------------- */
 
-static void pevq_push(uint8_t type, int x, int y) {
-    uint32_t n = (pevq_h + 1) % PEVQ_SZ;
-    if (n == pevq_t) return;
-    pevq[pevq_h].type = type;
-    pevq[pevq_h].x = (int16_t)x;
-    pevq[pevq_h].y = (int16_t)y;
-    pevq_h = n;
-    need_frame = 1;
-}
 
 /* The active shell publishes its launcher-popup extent here (0 = closed).
  * The compositor composites this rect on top of the windows while open, and
@@ -1361,13 +693,6 @@ void gui_panel_dirty(void) {
     need_frame = 1;
 }
 
-/* Is (x,y) over the shell's chrome — the taskbar strip or the open popup? */
-static int in_panel_region(int x, int y) {
-    if (y >= work_h) return 1;                  /* taskbar strip (bottom_reserve) */
-    if (pnl_pop_on && x >= pnl_pop_x && x < pnl_pop_x + pnl_pop_w &&
-        y >= pnl_pop_y && y < pnl_pop_y + pnl_pop_h) return 1;
-    return 0;
-}
 
 /* The desktop-shell task: renders the chrome into panelsurf and services
  * its input off the compositor.  shell->click/motion assume the WM lock is
@@ -1378,19 +703,10 @@ static void dispatch_launches(void);            /* defined below; run by desktop
  * updating" has exactly three causes — the loop is not running, it is running
  * but never marks itself dirty, or it draws and the damage never reaches the
  * compositor — and from outside the guest they look identical. */
-static volatile uint32_t desk_iters = 0, desk_draws = 0, desk_events = 0;
-static volatile uint32_t desk_ticks = 0, desk_tick_dirty = 0;
-static volatile uint32_t desk_now_ms = 0;
+volatile uint32_t desk_iters = 0, desk_draws = 0, desk_events = 0;
+volatile uint32_t desk_ticks = 0, desk_tick_dirty = 0;
+volatile uint32_t desk_now_ms = 0;
 
-void gui_get_desktop_stats(struct gui_desktop_stats* out) {
-    if (!out) return;
-    out->iters      = desk_iters;
-    out->draws      = desk_draws;
-    out->events     = desk_events;
-    out->ticks      = desk_ticks;
-    out->tick_dirty = desk_tick_dirty;
-    out->clock_ms   = desk_now_ms;
-}
 
 static void desktop_main(void) {
     kprintf("gui: desktop shell up on pid %d (shell '%s')\n",
@@ -1409,9 +725,8 @@ static void desktop_main(void) {
          * session, not of the display server (compositor). */
         dispatch_launches();
 
-        while (pevq_t != pevq_h) {
-            struct pev e = pevq[pevq_t];
-            pevq_t = (pevq_t + 1) % PEVQ_SZ;
+        struct pev e;
+        while (pevq_pop(&e)) {
             if (e.type == PEV_DESK_CLICK || e.type == PEV_DESK_DBL) {
                 /* §M64 — dispatched WITHOUT the WM lock, unlike the chrome
                  * events below.  A desktop click touches only the shell's own
@@ -1492,526 +807,8 @@ static void desktop_main(void) {
     }
 }
 
-/* One-frame snapshot of the WM state, shared by every damage rect's draw. */
-struct scene_snapshot {
-    struct gui_window* zsnap[GUI_MAX_WINDOWS];
-    int   wx[GUI_MAX_WINDOWS], wy[GUI_MAX_WINDOWS],
-          ww[GUI_MAX_WINDOWS], wh[GUI_MAX_WINDOWS];
-    int   zn;
-    int   cx, cy;                       /* cursor */
-    enum  drag_mode dsnap;
-    struct gui_window* dwin;
-    int   rw, rh, rrx, rry;             /* resize rubber band */
-    struct gui_window* fsnap;
-    /* §M69 — index in zsnap[] of the modal window, or -1.  An INDEX and not a
-     * pointer because the backdrop has to be painted at a precise point in
-     * the stack — over everything below the modal and under the modal itself
-     * — and the paint loop is indexed. */
-    int   modal_idx;
-};
 
-/* Paint the whole scene (wallpaper → windows → rubber → panel → cursor)
- * into backsurf, clipped to one damage rect.  Called once per rect. */
-static void draw_scene_rect(const struct scene_snapshot* s,
-                            int rx0, int ry0, int rx1, int ry1) {
-    gfx_set_clip(&backsurf, rx0, ry0, rx1 - rx0, ry1 - ry0);
 
-    /* SKIP WHAT AN OPAQUE WINDOW COMPLETELY COVERS.
-     *
-     * Reported from use: *"when a window is full size, the whole thing lags."*
-     * This function painted the wallpaper, then the desktop icons, then every
-     * window from the bottom up — so a full-screen window meant the whole
-     * screen was filled at least TWICE per frame, and everything under it was
-     * pixels computed and then thrown away.
-     *
-     * §4.61 measured skipping the wallpaper at 2% and moved on, and that
-     * measurement was right about the case it looked at: DURING A DRAG the
-     * damage rect is the window UNION the strip it vacated, so it is never
-     * fully covered and the skip almost never fires.  A maximized window is the
-     * opposite case — the damage rect is inside the window every time — which
-     * is why the same optimisation is worth nothing there and a great deal
-     * here.  *A measurement answers the case it was taken on.*
-     *
-     * The test is deliberately strict: the topmost window must cover this rect
-     * ENTIRELY, and only what is strictly below it is skipped.  A partial
-     * overlap paints normally, because "mostly covered" cannot be composited
-     * correctly without per-pixel coverage — and getting that wrong leaves
-     * stale pixels, which is the failure this file has already paid for twice.
-     *
-     * `gui.occlude = 0` turns it off, so both paths stay reachable and
-     * measurable rather than one becoming the only one anybody ever runs. */
-    int first = 0;
-    if (g_occlude) {
-        for (int i = s->zn - 1; i >= 0; i--) {
-            /* Opaque and covering: the CONTENT area plus its border, i.e. the
-             * whole outer rectangle, which is what this function paints. */
-            if (s->wx[i] <= rx0 && s->wy[i] <= ry0 &&
-                s->wx[i] + s->ww[i] >= rx1 && s->wy[i] + s->wh[i] >= ry1) {
-                first = i;
-                break;
-            }
-        }
-    }
-
-    if (first == 0) {
-        painted_rects++;
-        gfx_blit(&backsurf, 0, 0, &wallsurf, 0, 0, wallsurf.w, wallsurf.h);
-    } else {
-        occluded_rects++;
-    }
-
-    /* §M64 — the background LAYER: desktop icons sit on the wallpaper and
-     * under every window.  Painted per damage rect like everything else here,
-     * and clipped by the same clip box, so a shortcut only costs pixels when
-     * its rectangle is actually dirty. */
-    if (first == 0 && shell && shell->draw_under) shell->draw_under(&backsurf);
-
-    for (int i = first; i < s->zn; i++) {
-        struct gui_window* win = s->zsnap[i];
-        int x = s->wx[i], y = s->wy[i], w = s->ww[i], h = s->wh[i];
-        int focused = (win == s->fsnap);
-
-        /* §M69 gate 4 — THE MODAL BACKDROP, painted here rather than as a
-         * layer of its own because "under the modal and over everything else"
-         * is a position in THIS loop and nowhere else.  Whole surface, left to
-         * `clip_rect` inside gfx_blend_fill to bound it to the damage rect —
-         * so it costs the dirty area, not the screen (§4.61's discipline).
-         *
-         * The backdrop is what makes the three input gates legible.  Swallowed
-         * clicks with an undimmed screen behind them are indistinguishable
-         * from a machine that has stopped responding — which is the single
-         * most expensive way for this to be misread. */
-        if (i == s->modal_idx)
-            gfx_blend_fill(&backsurf, 0, 0, backsurf.w, backsurf.h, COL_MODAL_DIM);
-
-        gfx_blend_fill(&backsurf, x + 5, y + 5, w, h, COL_SHADOW);
-        draw_rect_outline(&backsurf, x, y, w, h, BORDER,
-                          focused ? COL_BORDER_F : COL_BORDER_U);
-        /* Flat title plate.  `raised` when focused, `tray` when not — the two
-         * surface layers the design gives a title bar, rather than two ends of
-         * a gradient.  The focused/unfocused difference now lives in the
-         * BORDER (accent vs line) as well, which is what carries it at a
-         * glance once the fills are flat. */
-        gfx_fill(&backsurf, x + BORDER, y + BORDER,
-                 w - 2 * BORDER, TITLE_H - BORDER,
-                 focused ? COL_TITLE_F_TOP : COL_TITLE_U_TOP);
-        cp_text(&backsurf, x + 8, y + (TITLE_H - cp_fh() + BORDER) / 2,
-                 lstr(win->title), COL_TITLE_TEXT);
-
-        {
-            /* THE THREE TITLE BUTTONS, AS THE DESIGN DRAWS THEM.
-             *
-             * They were M22's Windows chrome: a RED close box, a white filled
-             * square for maximize and a hardcoded 0xFF3A4A5E behind the other
-             * two.  The Console Plate demo puts all three in the SAME plate —
-             * `tray` with a 1 px `line` border — and draws each glyph as a thin
-             * `muted` stroke.  Uniformity is the point: the design gives the
-             * close button no special colour, because a red box in the title
-             * bar is a warning, and closing a window is not one.  It is the
-             * ordinary way out, and it earns emphasis only under the pointer.
-             *
-             * Glyphs are STROKES, not font characters: an "x" from an 8x8
-             * bitmap font is a letter and reads as one next to two geometric
-             * marks. */
-            const cp_theme* th = cp_current_theme();
-            int bx, by, bw, bh;
-            int hov = (win == tb_hover_win) ? tb_hover_idx : -1;
-
-            const int nbtn = title_btn_count(win);
-            for (int i = 0; i < nbtn; i++) {
-                title_btn_rect(x, y, w, i, &bx, &by, &bw, &bh);
-                /* Hover is the ONLY emphasis these get.  The design gives all
-                 * three the same resting plate, so without it there is no
-                 * feedback at all that the pointer is on a target — which is
-                 * what the close button's old red box used to supply by being
-                 * permanently loud. */
-                int on = (i == hov);
-                cp_plate(&backsurf, bx, by, bw, bh,
-                         on ? th->hover : th->tray, on ? th->accent : th->line);
-            }
-
-            const cp_color g0 = (hov == TB_CLOSE) ? th->text : th->muted;
-            const cp_color g1 = (hov == TB_MAX)   ? th->text : th->muted;
-            const cp_color g2 = (hov == TB_MIN)   ? th->text : th->muted;
-
-            /* close: two diagonals */
-            title_btn_rect(x, y, w, TB_CLOSE, &bx, &by, &bw, &bh);
-            {
-                int i0 = bw / 3, i1 = bw - bw / 3 - 1;
-                for (int k = i0; k <= i1; k++) {
-                    gfx_fill(&backsurf, bx + k, by + k, 1, 1, g0);
-                    gfx_fill(&backsurf, bx + k, by + (i0 + i1 - k), 1, 1, g0);
-                }
-            }
-            /* maximize: a square, or two offset squares when already maximized */
-            if (nbtn > TB_MAX) {
-            title_btn_rect(x, y, w, TB_MAX, &bx, &by, &bw, &bh);
-            if (win->maximized) {
-                draw_rect_outline(&backsurf, bx + bw/3 + 1, by + bw/4, bw/2, bh/2,
-                                  1, g1);
-                draw_rect_outline(&backsurf, bx + bw/4, by + bw/3 + 1, bw/2, bh/2,
-                                  1, g1);
-            } else {
-                draw_rect_outline(&backsurf, bx + bw/4, by + bh/4,
-                                  bw - bw/2, bh - bh/2, 1, g1);
-            }
-            }
-            /* minimize: one rule, centred rather than sitting on the floor of
-             * the box — the design's dash is a mark, not an underline */
-            if (nbtn > TB_MIN) {
-            title_btn_rect(x, y, w, TB_MIN, &bx, &by, &bw, &bh);
-            gfx_fill(&backsurf, bx + bw/4, by + bh/2, bw - bw/2, 1, g2);
-            }
-        }
-
-        spin_lock(&win->lock);
-        gfx_blit(&backsurf, x + BORDER, y + TITLE_H,
-                 &win->surf, 0, 0, win->surf.w, win->surf.h);
-        spin_unlock(&win->lock);
-
-        uint32_t gc = focused ? COL_BORDER_F : COL_BORDER_U;
-        for (int t = 0; t < 3; t++) {
-            int o = 4 + t * 4;
-            gfx_line(&backsurf, x + w - 3 - o, y + h - 4,
-                                x + w - 4,     y + h - 3 - o, gc);
-        }
-    }
-
-    if (s->dsnap == DRAG_RESIZE && s->dwin)
-        draw_rect_outline(&backsurf, s->rrx, s->rry, s->rw, s->rh, 2, COL_RUBBER);
-
-    /* M22.7-B — desktop chrome (taskbar always + open popup) from panelsurf. */
-    if (panel_ready) {
-        spin_lock(&panel_lock);
-        gfx_blit(&backsurf, 0, work_h, &panelsurf, 0, work_h,
-                 fbsurf.w, fbsurf.h - work_h);
-        if (pnl_pop_on) {
-            int py = pnl_pop_y, ph = pnl_pop_h;
-            if (py < panel_strip_top) { ph -= panel_strip_top - py; py = panel_strip_top; }
-            if (ph > 0)
-                gfx_blit(&backsurf, pnl_pop_x, py, &panelsurf,
-                         pnl_pop_x, py, pnl_pop_w, ph);
-        }
-        spin_unlock(&panel_lock);
-        /* §M69 — and the chrome is dimmed too, in a SECOND fill rather than
-         * the one above, because the panel is composited after the windows and
-         * would have painted straight over it.  The design's backdrop covers
-         * the whole viewport, and here that is also the honest picture: gate 2
-         * swallows taskbar clicks as well, so a bright, live-looking taskbar
-         * over a modal dialog would be an invitation to press something that
-         * does nothing.  The modal window itself never reaches this strip
-         * (windows live above `work_h`), so this cannot dim the dialog. */
-        if (s->modal_idx >= 0)
-            gfx_blend_fill(&backsurf, 0, work_h, fbsurf.w, fbsurf.h - work_h,
-                           COL_MODAL_DIM);
-    }
-
-    /* §M65 — the window popup sits above every window (and above the panel
-     * chrome, so a menu near the bottom edge is not eaten by the taskbar) and
-     * below the cursor, which is always last. */
-    draw_popup(&backsurf);
-
-    draw_cursor(&backsurf, s->cx, s->cy);
-}
-
-static void compose(void) {
-    uint64_t compose_t0 = timer_now_ns();
-    /* 1. Snapshot + clear the damage LIST: anything damaged while we paint
-     *    lands in the next frame. */
-    struct rect rl[DMG_MAX + 2];
-    int rn;
-    {
-        uint32_t dfl = spin_lock_irqsave(&damage_lock);
-        rn = dmg_n;
-        for (int i = 0; i < rn; i++) rl[i] = dmg_list[i];
-        dmg_n = 0;
-        spin_unlock_irqrestore(&damage_lock, dfl);
-    }
-
-    /* 2. Snapshot the WM state (shared across all rects). */
-    struct scene_snapshot s;
-    uint32_t fl = spin_lock_irqsave(&state_lock);
-    s.zn = 0;
-    s.modal_idx = -1;
-    for (int i = 0; i < zcount; i++) {
-        if (zorder[i]->minimized) continue;     /* M22.3 */
-        if (zorder[i] == modal_win) { s.modal_idx = s.zn; modal_dbg_seen++; }
-        s.zsnap[s.zn] = zorder[i];
-        s.wx[s.zn] = zorder[i]->x;  s.wy[s.zn] = zorder[i]->y;
-        s.ww[s.zn] = zorder[i]->w;  s.wh[s.zn] = zorder[i]->h;
-        s.zn++;
-    }
-    if (modal_win && s.modal_idx < 0) modal_dbg_missing++;
-    s.cx = mx; s.cy = my;
-    /* Report each condition ONCE — enough to tell the two causes apart, and
-     * a per-frame log would be its own denial of service on the serial line. */
-    {
-        static int said_seen, said_missing;
-        if (modal_dbg_seen && !said_seen) {
-            said_seen = 1;
-            kprintf("gui: modal visible to the compositor (z-index %d of %d)\n",
-                    s.modal_idx, s.zn);
-        }
-        if (modal_dbg_missing && !said_missing) {
-            said_missing = 1;
-            kprintf("gui: MODAL CLAIMED BUT NOT IN THE Z-ORDER (%d windows)\n",
-                    s.zn);
-        }
-    }
-    s.dsnap = drag; s.dwin = drag_win; s.rw = rubber_w; s.rh = rubber_h;
-    s.rrx = s.rry = 0;
-    if (s.dwin) { s.rrx = s.dwin->x; s.rry = s.dwin->y; }
-    s.fsnap = focused_win;
-    struct move_hint mh = mv_hint;
-    mv_hint.active = 0;                          /* consumed exactly once     */
-    spin_unlock_irqrestore(&state_lock, fl);
-
-    /* ---- can this frame be a COPY instead of a repaint? ------------------
-     *
-     * Every condition below is a way the copy could produce a wrong image, so
-     * each one is a fall-back to the ordinary painter rather than a fix-up:
-     *
-     *  - OTHER DAMAGE (rn != 0).  Something else changed and the merged rects
-     *    can no longer be attributed; repaint everything.
-     *  - NOT TOPMOST.  The source rectangle is only the dragged window's own
-     *    pixels if nothing is drawn over it.  Anything above would be dragged
-     *    along with it — a window that never moved, smearing across the screen.
-     *  - MINIMISED / GONE / not the window being dragged now.
-     *  - A ZERO move, which the copy would spend its whole cost on. */
-    int fast = 0;
-    int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;      /* the union (draw + present) */
-    if (mh.active && mh.win && mh.win == s.dwin && s.zn > 0 &&
-        s.zsnap[s.zn - 1] == mh.win &&           /* topmost visible           */
-        rn == 0 &&                               /* nothing else changed      */
-        (mh.nx != mh.ox || mh.ny != mh.oy)) {
-        fast = 1;
-        bx0 = (mh.ox < mh.nx ? mh.ox : mh.nx) - 2;
-        by0 = (mh.oy < mh.ny ? mh.oy : mh.ny) - 2;
-        bx1 = (mh.ox > mh.nx ? mh.ox : mh.nx) + mh.w + 7;   /* +5 shadow, +2  */
-        by1 = (mh.oy > mh.ny ? mh.oy : mh.ny) + mh.h + 7;
-    } else if (mh.active && mh.win) {
-        /* The slow path still has to REPAINT the move, so the rects the drag
-         * did not add now go in. */
-        int ax0 = (mh.ox < mh.nx ? mh.ox : mh.nx) - 2;
-        int ay0 = (mh.oy < mh.ny ? mh.oy : mh.ny) - 2;
-        int ax1 = (mh.ox > mh.nx ? mh.ox : mh.nx) + mh.w + 7;
-        int ay1 = (mh.oy > mh.ny ? mh.oy : mh.ny) + mh.h + 7;
-        if (rn < DMG_MAX) rl[rn++] = (struct rect){ ax0, ay0, ax1, ay1 };
-    }
-
-    /* 3. Cursor damage from HERE (M22.4): erase the last-drawn sprite and
-     *    draw the fresh one — two SEPARATE small rects, appended to the
-     *    list (not unioned with far-away window damage). */
-    int cur_moved = (s.cx != last_cur_x || s.cy != last_cur_y);
-    int prev_cur_x = last_cur_x, prev_cur_y = last_cur_y;
-    if (rn == 0 && !cur_moved && !fast) return; /* spurious wake */
-    if (cur_moved && rn < DMG_MAX + 2)
-        rl[rn++] = (struct rect){ CUR_DMG_X(last_cur_x), CUR_DMG_Y(last_cur_y),
-                                  CUR_DMG_X(last_cur_x) + CUR_DMG_W,
-                                  CUR_DMG_Y(last_cur_y) + CUR_DMG_H };
-    if (cur_moved && rn < DMG_MAX + 2)
-        rl[rn++] = (struct rect){ CUR_DMG_X(s.cx), CUR_DMG_Y(s.cy),
-                                  CUR_DMG_X(s.cx) + CUR_DMG_W,
-                                  CUR_DMG_Y(s.cy) + CUR_DMG_H };
-    last_cur_x = s.cx;  last_cur_y = s.cy;
-
-    /* 3b. THE COPY, and the small list of things that still have to be
-     *     painted around it.
-     *
-     * Order is load-bearing and there is only one correct one: COPY FIRST.
-     * The regions that need painting — the strip the window vacated, the
-     * cursor's old footprint — lie INSIDE the source rectangle, and the
-     * painter draws the scene as it is NOW (window already at its new
-     * position).  Painting any of them before the copy would feed the copy
-     * pixels that belong to the new frame, and the window would carry a band
-     * of wallpaper across the screen with it. */
-    int copy_x = 0, copy_y = 0, copy_w = 0, copy_h = 0;   /* what got filled  */
-    if (fast) {
-        int shx = mh.nx - mh.ox, shy = mh.ny - mh.oy;
-        /* The valid source window: on screen at BOTH ends, and above the
-         * panel — the taskbar is composited over the windows, so a source row
-         * inside the panel strip holds panel pixels, not the window's. */
-        int l = mh.ox, r = mh.ox + mh.w, t = mh.oy, b = mh.oy + mh.h;
-        if (l < 0) l = 0;
-        if (l < -shx) l = -shx;
-        if (t < 0) t = 0;
-        if (t < -shy) t = -shy;
-        if (r > fbsurf.w) r = fbsurf.w;
-        if (r > fbsurf.w - shx) r = fbsurf.w - shx;
-        if (b > work_h) b = work_h;
-        if (b > work_h - shy) b = work_h - shy;
-
-        if (r - l > 0 && b - t > 0) {
-            gfx_move_within(&backsurf, l, t, l + shx, t + shy, r - l, b - t);
-            copy_x = l + shx; copy_y = t + shy;
-            copy_w = r - l;   copy_h = b - t;
-        } else {
-            fast = 0;                            /* nothing worth copying     */
-        }
-    }
-
-    if (fast) drag_fast++;
-    if (mh.active && !fast) drag_slow++;
-
-    if (fast) {
-        /* Everything in the union EXCEPT what the copy just filled, as up to
-         * four rectangles: the vacated strips, the new shadow band, and any
-         * part of the destination the clipping above could not supply. */
-        struct rect keep = { copy_x, copy_y, copy_x + copy_w, copy_y + copy_h };
-        if (by0 < keep.y0 && rn < DMG_MAX + 2)
-            rl[rn++] = (struct rect){ bx0, by0, bx1, keep.y0 };
-        if (keep.y1 < by1 && rn < DMG_MAX + 2)
-            rl[rn++] = (struct rect){ bx0, keep.y1, bx1, by1 };
-        if (bx0 < keep.x0 && rn < DMG_MAX + 2)
-            rl[rn++] = (struct rect){ bx0, keep.y0, keep.x0, keep.y1 };
-        if (keep.x1 < bx1 && rn < DMG_MAX + 2)
-            rl[rn++] = (struct rect){ keep.x1, keep.y0, bx1, keep.y1 };
-
-        /* THE CURSOR CAME ALONG FOR THE RIDE.  draw_cursor paints the sprite
-         * INTO the back buffer, so the source rectangle had a cursor burned
-         * into it and the copy has just deposited a second one at
-         * (old cursor + the move).  It is a handful of pixels and it is inside
-         * the window, so repainting that one small rectangle removes it. */
-        int shx = mh.nx - mh.ox, shy = mh.ny - mh.oy;
-        if (rn < DMG_MAX + 2)
-            rl[rn++] = (struct rect){ CUR_DMG_X(prev_cur_x) + shx,
-                                      CUR_DMG_Y(prev_cur_y) + shy,
-                                      CUR_DMG_X(prev_cur_x) + shx + CUR_DMG_W,
-                                      CUR_DMG_Y(prev_cur_y) + shy + CUR_DMG_H };
-    }
-
-    /* 4. Clamp each rect to the screen; drop empties. */
-    struct rect fr[DMG_MAX + 2];
-    int fn = 0, any_full = 0;
-    for (int i = 0; i < rn; i++) {
-        int x0 = rl[i].x0, y0 = rl[i].y0, x1 = rl[i].x1, y1 = rl[i].y1;
-        if (x0 < 0) x0 = 0;
-        if (y0 < 0) y0 = 0;
-        if (x1 > fbsurf.w) x1 = fbsurf.w;
-        if (y1 > fbsurf.h) y1 = fbsurf.h;
-        if (x1 <= x0 || y1 <= y0) continue;
-        fr[fn++] = (struct rect){ x0, y0, x1, y1 };
-        if (x0 == 0 && y0 == 0 && x1 == fbsurf.w && y1 == fbsurf.h) any_full = 1;
-    }
-    /* The copied rectangle is not painted — but it MUST be presented, or the
-     * work stays in the back buffer and the screen shows the window still at
-     * its old place.  It goes in as a present-only entry, remembered by index
-     * so the draw pass below can step over exactly it. */
-    int skip_draw = -1;
-    if (fast && copy_w > 0 && copy_h > 0 && fn < DMG_MAX + 2) {
-        fr[fn] = (struct rect){ copy_x, copy_y, copy_x + copy_w, copy_y + copy_h };
-        skip_draw = fn++;
-    }
-
-    if (fn == 0) return;
-    if (any_full) frames_full++; else frames_partial++;
-    for (int k = 0; k < fn; k++)                 /* actual damage this frame */
-        total_blit_px += (uint64_t)(fr[k].x1 - fr[k].x0) * (fr[k].y1 - fr[k].y0);
-
-    /* 5. Draw pass — paint each rect into backsurf.  The copied rectangle is
-     *    skipped: its pixels are already correct, and repainting them is the
-     *    entire cost this path exists to avoid. */
-    for (int k = 0; k < fn; k++) {
-        if (k == skip_draw) continue;
-        draw_scene_rect(&s, fr[k].x0, fr[k].y0, fr[k].x1, fr[k].y1);
-    }
-    gfx_clear_clip(&backsurf);
-
-    /* 6. Present — blit each rect (M22.6 flip has buffer-age 2, so it also
-     *    replays LAST frame's rects into the hidden buffer to complete it). */
-    if (flip_ok) {
-        int hidden = flip_front ^ 1;
-        for (int k = 0; k < fn; k++)
-            gfx_blit(&flipbuf[hidden], fr[k].x0, fr[k].y0, &backsurf,
-                     fr[k].x0, fr[k].y0, fr[k].x1 - fr[k].x0, fr[k].y1 - fr[k].y0);
-        for (int k = 0; k < prev_dmg_n; k++)
-            gfx_blit(&flipbuf[hidden], prev_dmg[k].x0, prev_dmg[k].y0, &backsurf,
-                     prev_dmg[k].x0, prev_dmg[k].y0,
-                     prev_dmg[k].x1 - prev_dmg[k].x0,
-                     prev_dmg[k].y1 - prev_dmg[k].y0);
-        fb_flip_to(hidden);
-        flip_front = hidden;
-        prev_dmg_n = fn;
-        for (int k = 0; k < fn; k++) prev_dmg[k] = fr[k];
-    } else {
-        for (int k = 0; k < fn; k++) {
-            gfx_blit(&fbsurf, fr[k].x0, fr[k].y0, &backsurf,
-                     fr[k].x0, fr[k].y0, fr[k].x1 - fr[k].x0, fr[k].y1 - fr[k].y0);
-            /* Push the freshly-blitted rect to the scanout.  No-op on x86 (the
-             * linear FB is the scanout); on aarch64 this is the virtio-gpu
-             * transfer+flush that makes the compositor visible. */
-            fb_present_flush(fr[k].x0, fr[k].y0,
-                             fr[k].x1 - fr[k].x0, fr[k].y1 - fr[k].y0);
-        }
-    }
-
-    /* At the END, after the draw pass AND the present.  The first version of
-     * this accumulated before them and reported 15 microseconds a frame for
-     * megabytes of blitting — it was timing the bookkeeping, which is the
-     * cheapest thing in the function.  A measurement placed on the wrong side
-     * of the work does not merely understate it; it says the work is free. */
-    uint64_t this_ns = timer_now_ns() - compose_t0;
-    total_compose_ns += this_ns;
-
-    /* PERIODIC COMPOSE REPORT (gui.stats_ms, 0 = off).
-     *
-     * `gui stats` has always been able to answer "what does a frame cost" — and
-     * it has to be TYPED, which this project's own harness cannot do once a GUI
-     * window holds the focus (§4.74).  So the one measurement anybody actually
-     * wants, the cost of compositing a MAXIMIZED window, was the one that could
-     * not be taken: reaching the state to be measured destroyed the means of
-     * measuring it.
-     *
-     * A timed log has no such problem.  The worst frame is kept separately from
-     * the mean because lag is not an average — a run of cheap frames around one
-     * 40 ms frame reads as comfortable and feels like a stutter. */
-    static uint64_t rep_next_ms, rep_ns, rep_worst_ns;
-    static unsigned rep_frames, rep_px, rep_worst_px, rep_worst_rects;
-    /* RE-READ PERIODICALLY, never latched once.  The first version cached the
-     * key on the first composite — and the GUI autostarts at boot, so the value
-     * was read before anything could set it and the report could never be
-     * turned on at all.  `setconf` also does not fire §M63's watchers (only
-     * config_apply does), so a watcher would not have helped either. */
-    /* EVERY frame, not every 64th.  The first attempt polled every 64 composites
-     * to keep a config lookup off the hot path — but an idle desktop composites
-     * about once a second, so switching the report on took a minute and looked
-     * exactly like the feature not working.  A string lookup against a small
-     * table is noise next to the megabytes of blitting above it; the
-     * "optimisation" cost more than it saved and hid its own effect. */
-    int rep_every = (int)config_get_long("gui.stats_ms", 0);
-    if (rep_every > 0) {
-        rep_frames++;
-        rep_ns += this_ns;
-        /* AREA, NOT JUST TIME.  A slow frame is either big or fixed-cost, and
-         * those want opposite fixes — narrowing the damage helps the first and
-         * does nothing for the second.  Without the pixel count the two are
-         * indistinguishable in the log, which is how the last two attempts at
-         * this were each aimed at a guess. */
-        unsigned fpx = 0;
-        for (int k = 0; k < fn; k++)
-            fpx += (unsigned)((fr[k].x1 - fr[k].x0) * (fr[k].y1 - fr[k].y0));
-        rep_px += fpx;
-        if (this_ns > rep_worst_ns) {
-            rep_worst_ns = this_ns;
-            rep_worst_px = fpx;
-            rep_worst_rects = (unsigned)fn;
-        }
-        uint64_t now = timer_ticks_ms();
-        if (!rep_next_ms) rep_next_ms = now + (unsigned)rep_every;
-        else if (now >= rep_next_ms) {
-            kprintf("gui: %u frames in %u ms — %u us mean (%u kpx), "
-                    "worst %u us over %u kpx in %u rect(s)\n",
-                    rep_frames, (unsigned)rep_every,
-                    rep_frames ? (unsigned)(rep_ns / rep_frames / 1000) : 0u,
-                    rep_frames ? rep_px / rep_frames / 1000 : 0u,
-                    (unsigned)(rep_worst_ns / 1000),
-                    rep_worst_px / 1000, rep_worst_rects);
-            rep_frames = 0; rep_ns = 0; rep_worst_ns = 0;
-            rep_px = 0; rep_worst_px = 0; rep_worst_rects = 0;
-            rep_next_ms = now + (unsigned)rep_every;
-        }
-    }
-}
 
 /* -------------------------------------------------------------------------- */
 /* Window teardown (compositor task only).                                     */
@@ -2022,22 +819,6 @@ static void compose(void) {
 /* Queue dispatch — runs on the compositor task.                               */
 /* -------------------------------------------------------------------------- */
 
-/* §M46 Ctrl+Alt+X — close the top-most user app window.  A client-managed
- * (package) window's want_close makes apply_pending force-kill the client, so it
- * works even when the app is frozen; a normal app-host window gets a graceful
- * want_close.  Runs on the compositor task, so taking state_lock is safe. */
-static void sak_close_top_app(void) {
-    struct gui_window* target = NULL;
-    uint32_t fl = spin_lock_irqsave(&state_lock);
-    for (int i = zcount - 1; i >= 0; i--) {
-        struct gui_window* w = zorder[i];
-        if (w && w->used && w->kind == WIN_APP && !w->minimized) { target = w; break; }
-    }
-    if (target) target->want_close = 1;
-    spin_unlock_irqrestore(&state_lock, fl);
-    if (target) kprintf("gui: Ctrl+Alt+X — closing top app '%s'\n", target->title);
-    else        kprintf("gui: Ctrl+Alt+X — no app window to close\n");
-}
 
 void gui_queue_open(void (*open_fn)(void)) {
     if (!open_fn) return;
@@ -2089,63 +870,8 @@ static void dispatch_launches(void) {
     }
 }
 
-/* M22.7 — the compositor no longer touches widgets: it drains the IRQ-fed
- * global queues and re-routes each event into the target window's per-window
- * queue (aq).  The owning app-host does the widget hit-test + dispatch +
- * redraw off the compositor. */
-static void dispatch_events(void) {
-    while (evq_t != evq_h) {
-        struct gev e = evq[evq_t];
-        evq_t = (evq_t + 1) % EVQ_SZ;
-        struct gui_window* win = e.win;
-        if (!win || !win->used || win->kind != WIN_APP) continue;
-        struct app_event ae = { .type = e.hover ? AE_HOVER
-                                     : (e.dz ? AE_SCROLL
-                                     : (e.ptr ? AE_POINTER
-                                              : (e.btn ? AE_BUTTON : AE_MOUSE))),
-                                .x = e.x, .y = e.y, .dbl = e.dbl,
-                                .btn = e.btn, .down = e.down,
-                                .phase = (uint8_t)(e.dz ? (uint8_t)e.dz
-                                                        : (e.ptr ? e.ptr - 1 : 0)) };
-        aq_push(win, ae);
-    }
-}
 
-static void dispatch_keys(void) {
-    while (keyq_t != keyq_h) {
-        char c = keyq[keyq_t];
-        keyq_t = (keyq_t + 1) % KEYQ_SZ;
-        uint32_t fl = spin_lock_irqsave(&state_lock);
-        struct gui_window* win = focused_win;
-        spin_unlock_irqrestore(&state_lock, fl);
-        if (!win || !win->used || win->kind != WIN_APP) continue;
-        struct app_event ae = { .type = AE_KEY, .c = c };
-        aq_push(win, ae);
-    }
-}
 
-/* M22.5 — raw keycode events to the focused widget (see widget.h). */
-static void dispatch_keycodes(void) {
-    while (kcq_t != kcq_h) {
-        uint16_t e = kcq[kcq_t];
-        kcq_t = (kcq_t + 1) % KCQ_SZ;
-        uint32_t fl = spin_lock_irqsave(&state_lock);
-        struct gui_window* win = focused_win;
-        spin_unlock_irqrestore(&state_lock, fl);
-        if (!win || !win->used || win->kind != WIN_APP) {
-            /* §M64 tail — NOBODY ELSE WANTED IT, so the desktop gets it.
-             * These keycodes used to be dropped here, which is why the icon
-             * field could be reached only with a mouse.  Queued rather than
-             * called: Enter activates a shortcut, and that spawns an app-host
-             * task — the desktop task's job, not the compositor's. */
-            pevq_push(PEV_DESK_KEY, (int)(e & 0xFF), (int)(e >> 8));
-            continue;
-        }
-        struct app_event ae = { .type = AE_KEYCODE, .kc = (uint8_t)(e & 0xFF),
-                                .mods = (uint8_t)(e >> 8) };
-        aq_push(win, ae);
-    }
-}
 
 /* M22.7 — is `t` still referenced by any live window (app-host or the
  * terminal-shell task)?  Used to decide when an app-host can be reaped. */
@@ -2342,32 +1068,6 @@ void apply_pending(void) {
     }
 }
 
-/* §M40 — deliver queued input for a WIN_APP window that has an INPUT HOOK but
- * NO app-host task.
- *
- * A hook-backed window has no app-host that drains its queue: a Wayland window
- * is created by the server task, which then blocks reading its client's socket,
- * and a dosgui window (NetSurf) is client-managed with host_task cleared
- * outright.  Either way app_host_main never runs for it, so queued events
- * simply piled up and the hook was never called.  The §M26 demo hid this by
- * synthesising input directly, so it only surfaced once a REAL client asked for
- * a wl_seat.
- *
- * The compositor is the right owner: it is an ordinary task (the hook does a
- * socket send, which must not happen in the mouse IRQ) and a hook-backed window
- * has no widgets for anyone else to dispatch to. */
-static void pump_hostless_input(void) {
-    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
-        struct gui_window* win = &windows[i];
-        if (!win->used || win->kind != WIN_APP) continue;
-        if (!win->input_hook) continue;
-        while (win->aq_t != win->aq_h) {
-            struct app_event e = win->aq[win->aq_t];
-            win->aq_t = (win->aq_t + 1) % AQ_SZ;
-            app_dispatch_event(win, &e);
-        }
-    }
-}
 
 /* §M65 — DRAW the widgets of a window that has no host task.
  *
@@ -2406,27 +1106,10 @@ static void gui_compositor_main(void) {
         pump_hostless_input();
         pump_hostless_redraw();          /* §M65 — …and paint them */
         apply_pending();
-        if (g_bench_report) {
-            g_bench_report = 0;
-            uint32_t fr = g_bench_fr ? g_bench_fr : 1;
-            kprintf("compose: %ux%u, %u frame(s), %u us/frame total %u ms "
-                    "[occlusion %s: %u rect(s) skipped, %u painted]\n",
-                    g_bench_w, g_bench_h, g_bench_fr,
-                    (unsigned)((g_bench_ns / fr) / 1000ull),
-                    (unsigned)(g_bench_ns / 1000000ull),
-                    g_occlude ? "on" : "off",
-                    occluded_rects, painted_rects);
-            occluded_rects = painted_rects = 0;
-        }
-        if (g_relay_report) {
-            g_relay_report = 0;
-            kprintf("relayout: %d window(s), %d widget(s) before, %d after "
-                    "%d re-layout(s) — %s\n",
-                    g_relay_wins, g_relay_before, g_relay_after, g_relay_rounds,
-                    g_relay_before == g_relay_after
-                        ? "PASS (the set was replaced)"
-                        : "FAIL (widgets accumulated)");
-        }
+        /* §M70 — the instruments report from HERE, not from the task that
+         * asked: with the GUI up, a kprintf on the requesting task goes to the
+         * suppressed console and the answer reaches nobody. */
+        gui_diag_service();
         term_selection_service();       /* §M58 — repaint + copy */
         apply_mode_change();            /* §M61 — resolution, between frames */
         apply_mode_revert();            /* §M61 — …and the undo, same rule */
@@ -2487,722 +1170,10 @@ CONFIG_KEY(ck_scroll_invert) = {
     .help = "reverse the wheel direction (Mac-style natural scrolling)",
 };
 
-/* Read the gate ONCE.  This runs on the mouse path, and a string lookup in the
- * config store per drag is a cost the feature is supposed to be measuring. */
-static int drag_report_on(void) {
-    static int cached = -1;
-    if (cached < 0) cached = (int)config_get_long("gui.drag_stats", 0);
-    return cached;
-}
 
-static void gui_mouse(int dx, int dy, unsigned buttons) {
-    /* M22.4 — per-motion drag damage bookkeeping (filled under the
-     * lock, consumed after unlock so gui_damage isn't nested deeper
-     * than it has to be). */
-    int drag_moved = 0;
-    /* Only the ORIGIN is still needed here: where the window came from, for
-     * the move hint.  The rest of the old bookkeeping (size, destination)
-     * moved into the hint itself when the drag stopped raising damage rects. */
-    int drag_old_x = 0, drag_old_y = 0;
-    /* M22.7 — precise structural damage: the windows whose look changed
-     * (focus highlight, z-order raise, minimize) instead of the whole
-     * screen.  Captured under the lock, damaged after unlock. */
-    struct gui_window* clicked = NULL;
-    int wm_changed = 0;                          /* the click raised/restored it */
-    int force_full = 0;                          /* geometry change → full damage */
 
-    spin_lock(&state_lock);
-    struct gui_window* old_focus = focused_win;
 
-    mx += dx;  my += dy;
-    if (mx < 0) mx = 0;
-    if (my < 0) my = 0;
-    if (mx >= fbsurf.w) mx = fbsurf.w - 1;
-    if (my >= fbsurf.h) my = fbsurf.h - 1;
 
-    unsigned pressed  =  buttons & ~btn_prev;
-    unsigned released = ~buttons &  btn_prev;
-    btn_prev = buttons;
-
-    /* §M65 — window popup hover.  A plain integer store in the IRQ; the
-     * repaint is a damage request, not a draw (§M22.7's split).
-     *
-     * THE RECT IS THE POINT.  The first version set `need_frame` and nothing
-     * else — and a frame with an EMPTY damage list repaints only the cursor's
-     * own rectangle (§4.61: a pure glide is a bare wake).  So the highlight was
-     * painted into the cursor's footprint and never anywhere else: dragging
-     * down the menu left a trail of cursor-sized coloured patches instead of
-     * moving one highlighted row.  Reported from use, and exactly the symptom
-     * you would predict from "asked for a frame, claimed no area". */
-    int popup_hover_moved = 0;
-    if (popup.active) {
-        int r = popup_row_at(mx, my);
-        if (r != popup.hover) { popup.hover = r; popup_hover_moved = 1; }
-    }
-
-    /* Title-button hover.  Same shape as the popup's above: decide in the IRQ,
-     * damage the two boxes that changed, let the compositor paint.  Damaging
-     * only the buttons and not the title bar matters — a maximized window's
-     * title bar is 1920 px wide, and repainting it on every mouse packet that
-     * crosses it is the fill-rate wall §4.61 measured. */
-    int tb_ndmg = 0;
-    int tb_dmg[2][4];
-    {
-        struct gui_window* old_w = tb_hover_win;
-        int old_i = tb_hover_idx;
-        struct gui_window* hw = topmost_at(mx, my);
-        int idx = hw ? title_btn_at_n(hw->x, hw->y, hw->w, mx, my,
-                                      title_btn_count(hw)) : -1;
-        struct gui_window* nw = (idx >= 0) ? hw : NULL;
-        if (nw != old_w || idx != old_i) {
-            /* Both rectangles are resolved HERE, under state_lock, because
-             * gui_damage must be called outside it and a window pointer read
-             * after the unlock may name a window that has since gone. */
-            if (old_w && old_w->used && old_i >= 0) {
-                int* r = tb_dmg[tb_ndmg++];
-                title_btn_rect(old_w->x, old_w->y, old_w->w, old_i,
-                               &r[0], &r[1], &r[2], &r[3]);
-            }
-            if (nw) {
-                int* r = tb_dmg[tb_ndmg++];
-                title_btn_rect(nw->x, nw->y, nw->w, idx, &r[0], &r[1], &r[2], &r[3]);
-            }
-            tb_hover_win = nw;
-            tb_hover_idx = idx;
-        }
-    }
-
-    /* M22.7-B — chrome hover (launcher highlight): only meaningful while the
-     * popup is open; route it to the desktop task instead of running the
-     * shell in the IRQ. */
-    if (pnl_pop_on) pevq_push(PEV_MOTION, mx, my);
-
-    /* §M40 — a window that forwards its input to a CLIENT (Wayland) wants the
-     * whole pointer stream, not just clicks: `wl_pointer.motion` is how an
-     * application tracks the cursor at all.  Widget windows deliberately get
-     * motion only on click (a widget hit-test per mouse packet would be
-     * pointless work), so this is gated on the hook rather than made general. */
-    {
-        struct gui_window* hw = topmost_at(mx, my);
-        if (hw && hw->kind == WIN_APP && hw->input_hook && !hw->minimized)
-            evq_push(hw, mx - hw->x - BORDER, my - hw->y - TITLE_H, 0, 0, 0);
-        /* Widget windows: record the position for the host to resolve. */
-        else if (hw && hw->kind == WIN_APP && hw->widgets && !hw->minimized &&
-                 (dx || dy))
-            evq_push_hover(hw, mx - hw->x - BORDER, my - hw->y - TITLE_H);
-    }
-
-    /* §M58 — motion while a TERMINAL selection is in progress: extend the range
-     * and ask the compositor to re-render.  The comparison is what stops a
-     * motionless drag from re-rendering the grid on every mouse packet. */
-    if (term_sel_win && term_sel_win->used && (dx || dy)) {
-        struct gui_window* tw = term_sel_win;
-        int r, c;
-        gterm_cell_at(tw, mx - tw->x - BORDER, my - tw->y - TITLE_H, &r, &c);
-        if (r != tw->sel_br || c != tw->sel_bc || !tw->sel_on) {
-            tw->sel_br = r; tw->sel_bc = c;
-            tw->sel_on = (r != tw->sel_ar || c != tw->sel_ac);
-            term_sel_dirty = tw;
-        }
-    }
-
-    /* §M58 — motion while a widget holds the pointer grab.  Sent to the
-     * GRABBING window regardless of what is under the cursor now: a selection
-     * that stops at the widget's edge is not a selection. */
-    if (grab_win && grab_win->used && !grab_win->minimized && (dx || dy))
-        evq_push_ptr(grab_win, mx - grab_win->x - BORDER,
-                     my - grab_win->y - TITLE_H, WPTR_DRAG);
-
-    /* §M64 tail — motion while the DESKTOP holds the grab.  Queued rather than
-     * acted on: moving an icon re-lays the background layer and the release
-     * writes a file, and we are in the mouse IRQ under the WM lock. */
-    if (desk_grab && (dx || dy)) pevq_push(PEV_DESK_DRAG, mx, my);
-
-    /* §M58/§M59 — MIDDLE-CLICK PASTE of the primary selection into a terminal.
-     * This is the entire reason the primary selection is a separate slot: you
-     * select with the left button and paste with the middle one, without either
-     * touching what you deliberately copied with Ctrl+C.  Recorded here, done
-     * on the compositor (it reads the clipboard and pushes characters into a
-     * VC — neither is IRQ work). */
-    if (pressed & MOUSE_BTN_MIDDLE) {
-        struct gui_window* pw = topmost_at(mx, my);
-        if (pw && pw->kind == WIN_TERM && pw->vc && !pw->minimized &&
-            my >= pw->y + TITLE_H)
-            term_paste_win = pw;
-    }
-
-    /* Right press goes only to a client window, and only over its content —
-     * the desktop chrome has no right-click behaviour to compete with. */
-    if (pressed & MOUSE_BTN_RIGHT) {
-        struct gui_window* rw = topmost_at(mx, my);
-        if (rw && rw->kind == WIN_APP && rw->input_hook && !rw->minimized &&
-            my >= rw->y + TITLE_H)
-            evq_push(rw, mx - rw->x - BORDER, my - rw->y - TITLE_H, 0, 2, 1);
-    }
-
-    if (pressed & MOUSE_BTN_LEFT) {
-        /* §M69 gate 2 — A MODAL DIALOG OWNS EVERY PRESS, and this has to run
-         * BEFORE the chrome's first refusal below and before the desktop
-         * fallthrough at the end.  Gate 1 is not enough on its own: a press
-         * outside the modal makes `topmost_at` return NULL, and NULL is
-         * precisely how this function recognises a click on the WALLPAPER —
-         * so without this the taskbar would still open the Start menu and a
-         * double-click would still launch a shortcut behind the dialog.
-         *
-         * Swallowed in silence, not beeped at or bounced: the backdrop is
-         * already saying the rest of the screen is not available, and an
-         * error for pressing a disabled thing is noise. */
-        if (!modal_hit(mx, my)) goto drag_update;
-
-        /* Desktop chrome gets first refusal.  A click over the taskbar or
-         * the open popup is consumed and handed to the desktop task; a click
-         * elsewhere while the popup is open also goes there (to dismiss the
-         * menu) but still falls through to the windows below. */
-        if (in_panel_region(mx, my)) {
-            pevq_push(PEV_CLICK, mx, my);
-            goto drag_update;
-        }
-        /* §M65 — AN OPEN POPUP OWNS THE NEXT CLICK, wherever it lands.  Inside
-         * it is a choice; outside it is a dismissal — and in BOTH cases the
-         * click must not also reach the window underneath, or dismissing a
-         * menu would activate whatever happened to be behind it. */
-        if (popup.active) {
-            int row = popup_row_at(mx, my);
-            struct gui_window* ow = popup.owner;
-            int tag = popup.tag;
-            popup.active = 0;
-            popup.hover = -1;
-            if (ow && ow->used) {
-                struct app_event e = {0};
-                e.type = AE_POPUP;
-                e.x = (int16_t)row;         /* -1 = dismissed without a choice */
-                e.y = (int16_t)tag;
-                aq_push(ow, e);
-            }
-            spin_unlock(&state_lock);
-            gui_damage_all();
-            return;
-        }
-
-        if (pnl_pop_on) pevq_push(PEV_CLICK, mx, my);   /* dismiss, then windows */
-
-        struct gui_window* win = topmost_at(mx, my);
-        clicked = win;                          /* for precise structural damage */
-        if (win) {
-            wm_changed = gui_wm_focus_raise_locked(win);
-
-            /* ONE hit test, shared with the painter (title_btn_rect) — these
-             * three used to be open-coded here with different gaps and a
-             * different row, so the pressable box was not the drawn box. */
-            int tb = title_btn_at_n(win->x, win->y, win->w, mx, my,
-                                    title_btn_count(win));
-            int in_close = (tb == TB_CLOSE);
-            int in_max   = (tb == TB_MAX);                   /* M22.5 */
-            int in_min   = (tb == TB_MIN);
-            if (in_close) {
-                /* Second click on an already-requested close = "force it".
-                 * Runs in the mouse IRQ, so this is a plain volatile store; the
-                 * compositor acts on it (task_force_kill takes locks we must
-                 * not take here). */
-                if (win->want_close) win->close_force_now = 1;
-                win->want_close = 1;
-            } else if (in_max) {
-                toggle_maximize_locked(win);                 /* M22.5 */
-                force_full = 1;                              /* geometry change */
-            } else if (in_min) {
-                win->minimized = 1;
-                struct gui_window* nf = top_visible_locked();
-                focused_win = nf;
-                if (nf && nf->kind == WIN_TERM) vc_focus(nf->vc);
-            } else if (my < win->y + TITLE_H) {
-                /* M22.5 — double-click on the title bar toggles
-                 * maximize; a single click starts a drag (disabled
-                 * while maximized). */
-                uint64_t now = timer_ticks_ms();
-                int dbl = (win == lastclick_win &&
-                           now - lastclick_ms < 400 &&
-                           mx - lastclick_x < 6 && lastclick_x - mx < 6 &&
-                           my - lastclick_y < 6 && lastclick_y - my < 6);
-                lastclick_ms = now;
-                lastclick_x = mx; lastclick_y = my;
-                lastclick_win = win;
-                /* §M69 — a modal has no maximize BUTTON, so the double-click
-                 * shortcut for it must go too: leaving the gesture would be a
-                 * hidden way to reach a state the visible controls deny, which
-                 * is the same defect as a menu item with no keyboard route,
-                 * inverted. */
-                if (dbl && title_btn_count(win) > TB_MAX) {
-                    toggle_maximize_locked(win);
-                    force_full = 1;                          /* geometry change */
-                } else if (!win->maximized) {
-                    drag     = DRAG_MOVE;
-                    drag_win = win;
-                    grab_dx  = mx - win->x;
-                    grab_dy  = my - win->y;
-                    drag_t0_ms = timer_ticks_ms();
-                    drag_compose0_ns = total_compose_ns;
-                    drag_px0 = total_blit_px;
-                    drag_f0  = frames_full + frames_partial;
-                    drag_motions = drag_frames = 0;
-                    drag_fast = drag_slow = 0;
-                }
-            } else if (!win->maximized &&
-                       mx >= win->x + win->w - GRIP &&
-                       my >= win->y + win->h - GRIP) {
-                drag     = DRAG_RESIZE;
-                drag_win = win;
-                rubber_w = win->w;
-                rubber_h = win->h;
-            } else if (win->kind == WIN_APP) {
-                int cxr = mx - win->x - BORDER;
-                int cyr = my - win->y - TITLE_H;
-                uint64_t now = timer_ticks_ms();
-                int dbl = (win == lastclick_win &&
-                           now - lastclick_ms < 400 &&
-                           mx - lastclick_x < 6 && lastclick_x - mx < 6 &&
-                           my - lastclick_y < 6 && lastclick_y - my < 6);
-                lastclick_ms = now;
-                lastclick_x = mx; lastclick_y = my;
-                lastclick_win = win;
-                /* Motion first (so the client's pointer is where the click
-                 * happened), then the press itself.  A widget window ignores
-                 * the button event; a client window needs both. */
-                    /* §M69 — the DISPATCH end of the click probe; the other is
-                 * in ps2_mouse.c.  See there for why both are needed. */
-                if (gui_input_debug())
-                    kprintf("gui: press dispatched to '%s' at %d,%d%s\n",
-                            win->title, cxr, cyr, dbl ? " (double)" : "");
-                evq_push(win, cxr, cyr, dbl, 0, 0);
-                evq_push(win, cxr, cyr, dbl, 1, 1);
-                /* §M58 — and the phase stream, plus the grab that keeps it
-                 * coming after the pointer leaves the widget. */
-                evq_push_ptr(win, cxr, cyr, WPTR_PRESS);
-                grab_win = win;
-            } else if (win->kind == WIN_TERM && win->cells) {
-                /* §M58 — TEXT SELECTION in a terminal window.  A terminal is
-                 * not a widget window, so this cannot ride the widget pointer
-                 * path; it works directly on the CELL GRID the compositor
-                 * already owns.  Anchor here, extend in the motion handler,
-                 * copy on release — the IRQ only ever records a range.
-                 *
-                 * The branch had to be added: content clicks were gated on
-                 * `kind == WIN_APP`, so a press inside a terminal reached
-                 * nothing at all.  That is why every command's output — the
-                 * text people most want to copy — was the one thing that could
-                 * not be selected. */
-                int cxr = mx - win->x - BORDER;
-                int cyr = my - win->y - TITLE_H;
-                gterm_cell_at(win, cxr, cyr, &win->sel_ar, &win->sel_ac);
-                win->sel_br = win->sel_ar;
-                win->sel_bc = win->sel_ac;
-                if (win->sel_on) { win->sel_on = 0; term_sel_dirty = win; }
-                term_sel_win = win;
-            }
-        } else {
-            /* §M64 — nothing under the pointer: this is a click on the DESKTOP
-             * itself.  Hand it to the shell's desktop_click through the same
-             * queue the panel uses, because we are in the mouse IRQ with the
-             * WM lock held and a shortcut activation opens files and spawns
-             * tasks (M22.7's rule, and §M49 found the same class of bug when
-             * a console was bound outside its spawn).
-             *
-             * Double-click is detected HERE rather than in the shell: the
-             * timestamps and the previous click position already live in this
-             * file, and a second copy of the rule would drift from the title
-             * bar's. */
-            uint64_t now = timer_ticks_ms();
-            int dbl = (lastclick_win == NULL &&
-                       now - lastclick_ms < 400 &&
-                       mx - lastclick_x < 6 && lastclick_x - mx < 6 &&
-                       my - lastclick_y < 6 && lastclick_y - my < 6);
-            lastclick_ms = now;
-            lastclick_x = mx; lastclick_y = my;
-            lastclick_win = NULL;
-            pevq_push(dbl ? PEV_DESK_DBL : PEV_DESK_CLICK, mx, my);
-            /* §M64 tail — and the phase stream, plus the grab.  The press is
-             * pushed AFTER the click so the shell has already updated its
-             * selection when the drag begins: a drag moves the icon the user
-             * just pressed, and the two must agree on which one that is. */
-            pevq_push(PEV_DESK_PRESS, mx, my);
-            desk_grab = 1;
-        }
-    }
-
-drag_update:
-    if (drag == DRAG_MOVE && drag_win) {
-        /* M22.4 — rect-bounded drag damage: remember the old outer rect
-         * so the post-unlock path can damage old ∪ new instead of the
-         * whole screen.  Before this fix every motion event during a
-         * drag raised gui_damage_all() — a full 1280×800 recompose +
-         * ~4 MB blit per event, which made the scene "swim".
-         *
-         * §perf — THROTTLE: only actually move + damage the window every
-         * DRAG_FRAME_MS; intermediate motions just advance the cursor (the
-         * post-unlock `else` branch sets need_frame for a cheap cursor-only
-         * recompose).  This caps the big per-move blit to ~33 fps so a fast
-         * drag of a large window can't monopolise the CPU. */
-        int tgt_x = mx - grab_dx, tgt_y = my - grab_dy;
-        if (tgt_x < -(drag_win->w - 40)) tgt_x = -(drag_win->w - 40);
-        if (tgt_x > fbsurf.w - 40)       tgt_x = fbsurf.w - 40;
-        if (tgt_y < 0)                   tgt_y = 0;
-        if (tgt_y > work_h - TITLE_H)    tgt_y = work_h - TITLE_H;
-        uint64_t now = timer_ticks_ms();
-        drag_motions++;
-        if ((tgt_x != drag_win->x || tgt_y != drag_win->y) &&
-            (uint64_t)(now - last_drag_frame_ms) >= DRAG_FRAME_MS) {
-            drag_frames++;
-            last_drag_frame_ms = now;
-            drag_old_x = drag_win->x;  drag_old_y = drag_win->y;
-            drag_win->x = tgt_x;  drag_win->y = tgt_y;
-            drag_moved = 1;
-            /* Publish the move.  If several motions coalesce before the
-             * compositor runs, the LAST one wins and the origin stays the
-             * position the screen actually shows — an intermediate origin
-             * would name pixels that were never on screen. */
-            if (!mv_hint.active || mv_hint.win != drag_win) {
-                mv_hint.ox = drag_old_x;  mv_hint.oy = drag_old_y;
-            }
-            mv_hint.active = 1;
-            mv_hint.win = drag_win;
-            mv_hint.nx = tgt_x;  mv_hint.ny = tgt_y;
-            mv_hint.w  = drag_win->w;  mv_hint.h = drag_win->h;
-        }
-        /* else: coalesce — the window catches up on the next allowed frame;
-         * the cursor still glides (need_frame set below). */
-    } else if (drag == DRAG_RESIZE && drag_win) {
-        rubber_w = mx - drag_win->x + 2;
-        rubber_h = my - drag_win->y + 2;
-        if (rubber_w < MIN_W) rubber_w = MIN_W;
-        if (rubber_h < MIN_H) rubber_h = MIN_H;
-        if (rubber_w > fbsurf.w) rubber_w = fbsurf.w;
-        if (rubber_h > work_h)   rubber_h = work_h;
-    }
-
-    /* Button RELEASE.  A client needs the up edge as much as the down one —
-     * without it a link click never completes and a drag never ends. */
-    if (released & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT)) {
-        struct gui_window* rw = topmost_at(mx, my);
-        if (rw && rw->kind == WIN_APP && rw->input_hook && !rw->minimized &&
-            my >= rw->y + TITLE_H)
-            evq_push(rw, mx - rw->x - BORDER, my - rw->y - TITLE_H, 0,
-                     (released & MOUSE_BTN_LEFT) ? 1 : 2, 0);
-    }
-
-    if ((released & MOUSE_BTN_LEFT) && term_sel_win) {
-        /* Finish the selection.  The COPY happens on the compositor task
-         * (clipboard_set allocates), so all this does is mark it ready. */
-        if (term_sel_win->sel_on) term_sel_copy = term_sel_win;
-        term_sel_win = NULL;
-    }
-
-    if ((released & MOUSE_BTN_LEFT) && desk_grab) {
-        pevq_push(PEV_DESK_RELEASE, mx, my);
-        desk_grab = 0;
-    }
-
-    if ((released & MOUSE_BTN_LEFT) && grab_win) {
-        if (grab_win->used)
-            evq_push_ptr(grab_win, mx - grab_win->x - BORDER,
-                         my - grab_win->y - TITLE_H, WPTR_RELEASE);
-        grab_win = NULL;
-    }
-
-    if (released & MOUSE_BTN_LEFT) {
-        if (drag == DRAG_MOVE && drag_win && drag_report_on()) {
-            uint32_t ms  = (uint32_t)(timer_ticks_ms() - drag_t0_ms);
-            uint32_t cms = (uint32_t)((total_compose_ns - drag_compose0_ns) / 1000000ull);
-            uint32_t kb  = (uint32_t)(((total_blit_px - drag_px0) * 4) / 1024);
-            uint32_t fr  = (frames_full + frames_partial) - drag_f0;
-            kprintf("gui: drag %dx%d — %u motions, %u moved, %u frames "
-                    "(%u copied, %u repainted), %u KB, %u ms in compose of "
-                    "%u ms elapsed\n",
-                    drag_win->w, drag_win->h, drag_motions, drag_frames,
-                    fr, drag_fast, drag_slow, kb, cms, ms);
-        }
-        if (drag == DRAG_RESIZE) force_full = 1;       /* geometry changes */
-        if (drag == DRAG_RESIZE && drag_win &&
-            (rubber_w != drag_win->w || rubber_h != drag_win->h)) {
-            drag_win->pending_w = rubber_w;
-            drag_win->pending_h = rubber_h;
-        }
-        drag     = DRAG_NONE;
-        drag_win = NULL;
-    }
-
-    /* M22.7 — damage policy.  A resize rubber band spans the window and
-     * shrinks/grows, so it keeps the full recompose (rare — only while
-     * dragging the grip).  A press/release only changes focus + z-order:
-     * damage just the affected windows (old focus un-highlights, the
-     * clicked window raises + highlights) instead of the whole 9 MB
-     * screen.  DRAG_MOVE damages old∪new; a pure glide is a bare wake. */
-    struct gui_window* new_focus = focused_win;
-    int resizing   = (drag == DRAG_RESIZE);
-    int structural = (pressed || released) && !resizing && !force_full;
-    int pop_x = popup.x, pop_y = popup.y, pop_w = popup.w, pop_h = popup.h;
-    spin_unlock(&state_lock);
-
-    /* Outside the lock: gui_damage takes damage_lock, and nesting it inside
-     * state_lock is the one ordering this file does not allow. */
-    if (popup_hover_moved) gui_damage(pop_x, pop_y, pop_w, pop_h);
-    for (int i = 0; i < tb_ndmg; i++)
-        gui_damage(tb_dmg[i][0], tb_dmg[i][1], tb_dmg[i][2], tb_dmg[i][3]);
-
-    if (resizing || force_full) {
-        gui_damage_all();                       /* rubber band / geometry apply */
-    } else if (structural) {
-        /* §M69 — "STRUCTURAL" HAS TO MEAN *SOMETHING CHANGED*, NOT *A BUTTON
-         * MOVED*, and this line is most of a report: *"in Appearance the wheel
-         * scrolls fine, but clicking the scrollbar or its arrows freezes it
-         * for a couple of seconds and then works or does not."*
-         *
-         * The first of these three used to be UNCONDITIONAL — it damaged the
-         * focused window on every press AND every release, wherever the
-         * pointer was, whether or not the focus had moved.  So a click inside
-         * the window you are already working in cost TWO full-window repaints
-         * before any handler ran: measured on the Appearance panel at 431 kpx
-         * and 35-60 ms of compositing each, on a machine whose compositor also
-         * draws the cursor.  *That is why the wheel felt fine and the bar did
-         * not — the wheel has no button transition, so it never paid this.*
-         *
-         * A focus HIGHLIGHT changes only when the focus does; a raise or a
-         * restore is reported by the WM (`wm_changed`); and a click that
-         * lands on a window which is neither is exactly the case that needs
-         * nothing.  `clicked` keeps its own arm for the third case: a
-         * minimize button pressed on a window that was not focused. */
-        int hit = 0;
-        int focus_moved = (new_focus != old_focus);
-        if (focus_moved && old_focus && old_focus->used) {
-            gui_damage_win(old_focus); hit = 1;
-        }
-        if (focus_moved && new_focus && new_focus->used) {
-            gui_damage_win(new_focus); hit = 1;
-        }
-        if (clicked && clicked->used && (wm_changed || clicked != new_focus)) {
-            gui_damage_win(clicked); hit = 1;
-        }
-        panel_gen++;                            /* taskbar buttons may change */
-        if (!hit) need_frame = 1;               /* click on empty desktop */
-    } else if (drag_moved) {
-        /* NO damage rects for the move itself — the hint carries it, and
-         * compose decides whether it can copy the image instead of repainting
-         * it.  Damaging here as well would defeat the "nothing else changed"
-         * test the fast path is built on.  What is still needed is a FRAME:
-         * need_frame wakes the compositor without claiming any area. */
-        need_frame = 1;
-    } else {
-        need_frame = 1;                         /* cursor glide only */
-    }
-}
-
-/* M22.3 — Alt-Tab.  Raw keycode hook, runs in the keyboard IRQ before
- * keymap translation.  Rotate the top window to the bottom, then
- * activate the new top visible window — repeated presses cycle.
- *
- * M22.5 — the same hook also feeds the widget layer: navigation /
- * editing keys (arrows, Home/End, Delete, PgUp/PgDn, Insert) and
- * Ctrl+letter shortcuts are consumed here and queued as raw keycode
- * events whenever the focused window is an APP window.  TERMINAL
- * windows are untouched (their shells are char-based; unmapped
- * keycodes keep dying in keymap_translate as before). */
-static int kc_is_nav(uint8_t kc) {
-    return kc >= KC_INSERT && kc <= KC_UP;      /* 0x49..0x52 block */
-}
-
-static int gui_raw_key(uint8_t keycode, uint8_t mods) {
-    if (!gui_active) return 0;
-
-    /* §M65 — ESCAPE CLOSES AN OPEN POPUP, and consumes the key.  A menu you
-     * can only dismiss with the mouse is a menu that traps a keyboard user;
-     * the owner still hears about it (row -1) so a combo can put its old value
-     * back rather than leaving the control in a half-open state. */
-    if (popup.active && keycode == KC_ESC) {
-        struct gui_window* ow = popup.owner;
-        int tag = popup.tag;
-        popup.active = 0;
-        popup.hover = -1;
-        if (ow && ow->used) {
-            struct app_event e = {0};
-            e.type = AE_POPUP;
-            e.x = -1;
-            e.y = (int16_t)tag;
-            aq_push(ow, e);
-        }
-        gui_damage_all();
-        return 1;
-    }
-
-    /* §M69 gate 3 + THE ESCAPE HATCH.  Both are about a modal window, and both
-     * sit above every other binding in this function — but BELOW the popup's
-     * Escape above, because a combo opened inside a dialog must close with the
-     * first Esc and leave the dialog standing.
-     *
-     * Alt-Tab is refused outright: modality is a claim on the focus, and a
-     * window switcher that can walk away from it makes the claim advisory.
-     *
-     * Esc asks the modal to CLOSE, from the compositor, rather than being left
-     * to the dialog's own key hook.  That hook runs on the dialog's app-host
-     * task — so if that task ever wedges, the hook is exactly the thing that
-     * will not run, and the desktop would be locked behind a dialog with no
-     * way out.  Routing it through `want_close` reuses the X button's path,
-     * including its second-press force-kill (§4.38.1: the escalation is the
-     * USER's), so a wedged dialog costs two presses rather than a reboot. */
-    if (modal_win && modal_win->used) {
-        if (keycode == KC_TAB && (mods & KBD_MOD_LALT)) return 1;
-        if (keycode == KC_ESC) {
-            if (modal_win->want_close) modal_win->close_force_now = 1;
-            modal_win->want_close = 1;
-            need_frame = 1;
-            return 1;
-        }
-    }
-
-    /* §M58/§M59 — COPY AND PASTE IN A TERMINAL WINDOW, from the keyboard.
-     *
-     * Reported from use: *"I can't manage with the clipboard, the selection
-     * doesn't work either."*  Both worked in the automated test — and that test
-     * pasted with the MIDDLE BUTTON, which a trackpad does not have.  A feature
-     * whose only trigger is a button the user's hardware lacks is, from where
-     * they sit, a feature that does not exist.
-     *
-     * So the keyboard route, which is what people reach for anyway:
-     *   Ctrl+Shift+C / Ctrl+Insert — copy the selection to the clipboard
-     *   Ctrl+Shift+V / Shift+Insert — paste the clipboard into the terminal
-     *
-     * SHIFT is what keeps Ctrl+C free to remain the interrupt: a shell's Ctrl+C
-     * must not become "copy" just because something happens to be selected —
-     * that would make the most important key on a terminal depend on invisible
-     * state.  (The same reason every terminal emulator picked this binding.) */
-    {
-        struct gui_window* tw = focused_win;
-        if (tw && tw->used && tw->kind == WIN_TERM && tw->cells) {
-            int ctrl  = (mods & KBD_MOD_CTRL_MASK) != 0;
-            int shift = (mods & (KBD_MOD_LSHIFT | KBD_MOD_RSHIFT)) != 0;
-            int copy  = (ctrl && shift && keycode == KC_C) ||
-                        (ctrl && keycode == KC_INSERT);
-            int paste = (ctrl && shift && keycode == KC_V) ||
-                        (shift && keycode == KC_INSERT);
-            if (copy)  { term_sel_copy_to_clip = tw; need_frame = 1; return 1; }
-            if (paste) { term_paste_win = tw;        need_frame = 1; return 1; }
-
-            /* §M58 — SHIFT+PgUp/PgDn walks the scrollback a page at a time.
-             * Shift is load-bearing for the same reason it is on copy: plain
-             * PgUp/PgDn belong to whatever is running IN the terminal (an
-             * editor, a pager), and stealing them would break those programs
-             * in a way the user cannot see or turn off. */
-            if (shift && (keycode == KC_PGUP || keycode == KC_PGDN)) {
-                int page = tw->rows > 2 ? tw->rows - 2 : 1;
-                if (gterm_view_scroll(tw, keycode == KC_PGUP ? page : -page))
-                    term_sel_dirty = tw;
-                need_frame = 1;
-                return 1;
-            }
-
-            /* Anything else TYPED means the user is done reading history: snap
-             * back to the live bottom, exactly as every terminal does — output
-             * appearing somewhere the user cannot see is how a shell looks
-             * broken. */
-            /* (Bare modifiers never reach here — the PS/2 driver consumes
-             * shift/ctrl/alt make+break codes before translation — so this
-             * needs no exception for them.) */
-            if (tw->view_off > 0) {
-                tw->view_off = 0;
-                term_sel_dirty = tw;
-                need_frame = 1;
-            }
-        }
-    }
-
-    if (keycode != KC_TAB || !(mods & KBD_MOD_LALT)) {
-        /* Widget-bound keycodes?  focused_win is an atomic pointer
-         * read; kind/used are stable for live windows. */
-        struct gui_window* win = focused_win;
-        /* §M40 — widget windows only want the keycodes their widgets act on
-         * (nav + Ctrl-letter); a window forwarding to a CLIENT wants EVERY key,
-         * because `wl_keyboard.key` carries raw keycodes and the application
-         * does its own interpretation. */
-        if (win && win->used && win->kind == WIN_APP &&
-            (win->input_hook || kc_is_nav(keycode) ||
-             ((mods & KBD_MOD_CTRL_MASK) &&
-              keycode >= KC_A && keycode <= KC_Z))) {
-            uint32_t n = (kcq_h + 1) % KCQ_SZ;
-            if (n != kcq_t) {
-                kcq[kcq_h] = (uint16_t)(keycode | ((uint16_t)mods << 8));
-                kcq_h = n;
-            }
-            need_frame = 1;
-            /* A client window takes the raw keycode AND must still let the
-             * keymap run: returning 1 here consumed the key outright, so the
-             * cooked character was never produced and a client with no keymap
-             * of its own (NetSurf) could not receive letters at all.  Report
-             * "not consumed" for those, so ps2_keyboard goes on to translate
-             * and the character arrives as a second event. */
-            return win->input_hook ? 0 : 1;
-        }
-
-        /* §M64 tail — NO WINDOW WANTED IT: the desktop is the focus of last
-         * resort.  These keycodes were dropped here, which is why the icon
-         * field could only be reached with a mouse.
-         *
-         * ENTER AND ESCAPE ARE GATED ON THE DESKTOP ACTUALLY HAVING A
-         * SELECTION, and that gate is not fussiness: the GUI suppresses the
-         * boot shell's console but keys still reach its VC, so consuming
-         * Enter unconditionally would make it impossible to submit a shell
-         * command while the desktop is up — including for the test harness
-         * that drives this build.  So the rule is the one a person already
-         * expects: select something and the desktop has the keyboard; clear
-         * the selection and it goes back.  The arrows are safe either way —
-         * nothing else was ever going to receive them. */
-        int nav = (keycode == KC_LEFT || keycode == KC_RIGHT ||
-                   keycode == KC_UP   || keycode == KC_DOWN  ||
-                   keycode == KC_HOME || keycode == KC_END);
-        int claim = (desk_focus && (keycode == KC_ENTER || keycode == KC_ESC));
-        if (nav || claim) {
-            uint32_t n = (kcq_h + 1) % KCQ_SZ;
-            if (n != kcq_t) {
-                kcq[kcq_h] = (uint16_t)(keycode | ((uint16_t)mods << 8));
-                kcq_h = n;
-            }
-            need_frame = 1;
-            /* Consume only what we CLAIMED.  An arrow key nothing else uses
-             * may as well fall through; Enter must not, or it would both open
-             * a shortcut and submit a shell line. */
-            return claim ? 1 : 0;
-        }
-        return 0;
-    }
-    spin_lock(&state_lock);
-    if (zcount >= 2) {
-        /* Demote the currently ACTIVE (top visible) window to the
-         * bottom, then activate the next visible one — repeated
-         * presses walk the whole visible set.  Rotating the raw top
-         * would stall on minimized windows parked at the top of the
-         * z-order. */
-        struct gui_window* cur = top_visible_locked();
-        if (cur) {
-            int i;
-            for (i = 0; i < zcount && zorder[i] != cur; i++) ;
-            for (; i > 0; i--) zorder[i] = zorder[i - 1];
-            zorder[0] = cur;
-            struct gui_window* nf = top_visible_locked();
-            if (nf) gui_wm_focus_raise_locked(nf);
-        }
-    }
-    spin_unlock(&state_lock);
-    gui_damage_all();
-    return 1;
-}
-
-static int gui_kbd_hook(char c) {
-    if (!gui_active) return 0;
-    struct gui_window* win = focused_win;
-    if (!win || win->kind != WIN_APP) return 0;
-    uint32_t n = (keyq_h + 1) % KEYQ_SZ;
-    if (n != keyq_t) {
-        keyq[keyq_h] = c;
-        keyq_h = n;
-    }
-    return 1;
-}
 
 /* -------------------------------------------------------------------------- */
 /* Window creation + bring-up.                                                 */
@@ -3331,27 +1302,6 @@ static const struct desktop_shell* pick_shell(void) {
     return &__start_desktop_shells[0];
 }
 
-/* §M60 — fill the wallpaper surface from the configured source and stamp the
- * milestone label on top.  The label is drawn HERE rather than by wallpaper.c
- * on purpose: it is desktop chrome that must survive every source (a picture
- * must not swallow the version string), and its position depends on `work_h`,
- * which is the compositor's business and not the background's. */
-int paint_wallpaper(void) {
-    int rc = wallpaper_render(&wallsurf);
-
-    /* Desktop milestone label — sizes itself to the string so any DOS_MILESTONE
-     * length stays right-aligned (see kernel/includes/version.h). */
-    int lbl_w = 0; for (const char* p = DOS_LABEL; *p; p++) lbl_w++;
-    int lx = wallsurf.w - lbl_w * GFX_GLYPH_W - 12;
-    int ly = work_h - GFX_GLYPH_H - 8;
-    /* A photograph can be any colour under the text, so give the label its own
-     * dim backing rather than trusting contrast that the gradient guaranteed
-     * and an arbitrary image does not. */
-    gfx_blend_fill(&wallsurf, lx - 6, ly - 4,
-                   lbl_w * GFX_GLYPH_W + 12, GFX_GLYPH_H + 8, 0x80101820u);
-    gfx_text(&wallsurf, lx, ly, DOS_LABEL, 0xFF9FB6C9u);
-    return rc;
-}
 
 
 void gui_desktop_icons_changed(void) {
