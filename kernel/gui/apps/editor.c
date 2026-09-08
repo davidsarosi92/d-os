@@ -27,6 +27,7 @@
 #include "gui_app.h"
 #include "icons.h"
 #include "widget.h"
+#include "console_plate.h"
 #include "keymap.h"
 #include "vfs.h"
 #include "kmalloc.h"
@@ -152,7 +153,8 @@ static void show_output(const char* text) {
     struct outwin* o = (struct outwin*)kcalloc(1, sizeof *o);
     if (!o) return;
     struct gui_window* win =
-        gui_app_window_create("Output", 250, 150, 460, 280, outwin_layout, o);
+        gui_app_window_create("Output", 250, 150,
+                              cp_px(460), cp_px(280), outwin_layout, o);
     if (!win) { kfree(o); return; }
     o->ed = w_editor_create(win, 6, 6, 448, 268, o);
     if (!o->ed) { gui_window_close(win); return; }
@@ -219,15 +221,22 @@ static void ed_layout(struct gui_window* win) {
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
 
-    a->path_in->base.x = 8;   a->path_in->base.y = 6;
-    a->path_in->base.w = cw - 16 - 3 * 58;      /* room for Run/Open/Save */
+    const int pad = cp_px(8), gap = cp_px(6), rowh = cp_btn_h();
 
-    a->ed->base.x = 8;   a->ed->base.y = 30;
-    a->ed->base.w = cw - 16;
-    a->ed->base.h = ch - 30 - 22;
+    a->path_in->base.x = pad;   a->path_in->base.y = gap;
+    a->path_in->base.w = cw - 2 * pad;          /* narrowed below when the
+                                                 * window has a button row  */
+    a->path_in->base.h = rowh;
 
-    a->status->base.x = 8;   a->status->base.y = ch - 16;
-    a->status->base.w = cw - 16;
+    int top = gap + rowh + gap;
+    a->ed->base.x = pad;   a->ed->base.y = top;
+    a->ed->base.w = cw - 2 * pad;
+    a->ed->base.h = ch - top - gap - cp_row_h();
+    if (a->ed->base.h < rowh) a->ed->base.h = rowh;
+
+    a->status->base.x = pad;
+    a->status->base.y = ch - cp_row_h();
+    a->status->base.w = cw - 2 * pad;
 }
 
 /* The two buttons need layout too — stash them in the ctx. */
@@ -245,9 +254,29 @@ static void ed_layout_full(struct gui_window* win) {
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
     (void)ch;
-    af->run_btn->base.x  = cw - 8 - 3 * 54 - 12; af->run_btn->base.y  = 5;
-    af->open_btn->base.x = cw - 8 - 2 * 54 - 6;  af->open_btn->base.y = 5;
-    af->save_btn->base.x = cw - 8 - 54;          af->save_btn->base.y = 5;
+    const int pad = cp_px(8), gap = cp_px(6);
+
+    /* §M69 — RIGHT-ALIGNED, and measured RIGHT TO LEFT so the outer edge is
+     * the fixed one.  The old code placed all three from a literal 54 px
+     * width, so with a proportional face "Open" and "Save" sat inside boxes
+     * meant for a different font and the row no longer met the margin.
+     *
+     * Sized first, then positioned: the width is not known until the button
+     * has been asked, and the position of the one to its left depends on it. */
+    struct w_button* row[3] = { af->save_btn, af->open_btn, af->run_btn };
+    int x = cw - pad;
+    for (int i = 0; i < 3; i++) {
+        if (!row[i]) continue;
+        int bw = w_button_autosize(row[i], 0, gap);   /* measure */
+        x -= bw;
+        row[i]->base.x = x;
+        x -= gap;
+    }
+    /* Whatever the buttons left is the path bar's — so the two cannot overlap
+     * however long the labels become (a localised "Mentés" is wider). */
+    int avail = x + gap - pad - gap;
+    if (avail < cp_fw() * 8) avail = cp_fw() * 8;
+    af->a.path_in->base.w = avail;
 }
 
 static void editor_open_with(const char* path) {
@@ -255,16 +284,18 @@ static void editor_open_with(const char* path) {
     if (!af) return;
 
     struct gui_window* win =
-        gui_app_window_create("Editor", 180, 90, 620, 460, ed_layout_full, af);
+        gui_app_window_create("Editor", 180, 90,
+                              cp_px(620), cp_px(460), ed_layout_full, af);
     if (!win) { kfree(af); return; }
     af->a.win = win;
 
     af->a.path_in = w_textinput_create(win, 8, 6, 400, af);
-    af->run_btn   = w_button_create(win, 420, 5, 54, 18, "Run",
+    /* Geometry is ed_layout_full's, which runs before the first paint. */
+    af->run_btn   = w_button_create(win, 0, 0, 0, 0, "Run",
                                     ed_run_click, &af->a);
-    af->open_btn  = w_button_create(win, 480, 5, 54, 18, "Open",
+    af->open_btn  = w_button_create(win, 0, 0, 0, 0, "Open",
                                     ed_open_click, &af->a);
-    af->save_btn  = w_button_create(win, 540, 5, 54, 18, "Save",
+    af->save_btn  = w_button_create(win, 0, 0, 0, 0, "Save",
                                     ed_save_click, &af->a);
     af->a.ed      = w_editor_create(win, 8, 30, 588, 380, &af->a);
     af->a.status  = w_label_create(win, 8, 424, 588, "new buffer");
@@ -277,7 +308,7 @@ static void editor_open_with(const char* path) {
 
     af->a.path_in->on_submit = ed_path_submit;
     af->a.ed->on_shortcut    = ed_shortcut;
-    af->a.status->color      = 0xFF8C9AAAu;
+    af->a.status->color      = cp_current_theme()->muted;
 
     ed_layout_full(win);
 

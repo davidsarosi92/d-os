@@ -7,6 +7,11 @@
  * ============================================================================= */
 
 #include "widget.h"
+#include "console_plate.h"
+#include "locale.h"
+#include "scrollbar.h"
+#include "config.h"
+#include "printf.h"
 #include "gui.h"
 #include "gfx.h"
 #include "keymap.h"          /* M22.5: KC_* keycodes for navigation */
@@ -16,16 +21,16 @@
 #include <stddef.h>
 
 /* Palette — deliberately close to the window chrome in gui.c. */
-#define WCOL_TEXT       0xFFE0E0E0u
-#define WCOL_DIM        0xFF8C9AAAu
-#define WCOL_BTN_TOP    0xFF4A5B72u
-#define WCOL_BTN_BOT    0xFF334052u
-#define WCOL_BTN_EDGE   0xFF5F7089u
-#define WCOL_BOX_BG     0xFF0B1220u
-#define WCOL_BOX_EDGE   0xFF3A4A5Eu
-#define WCOL_BOX_FOCUS  0xFF3D7BD8u
-#define WCOL_SEL_BG     0xFF2C5B9Eu
-#define WCOL_ARROW      0xFFB8C4D2u
+#define WCOL_TEXT (cp_current_theme()->text)
+#define WCOL_DIM (cp_current_theme()->muted)
+#define WCOL_BTN_TOP (cp_current_theme()->raised)
+#define WCOL_BTN_BOT (cp_current_theme()->raised)
+#define WCOL_BTN_EDGE (cp_current_theme()->line)
+#define WCOL_BOX_BG (cp_current_theme()->sunken)
+#define WCOL_BOX_EDGE (cp_current_theme()->line)
+#define WCOL_BOX_FOCUS (cp_current_theme()->accent)
+#define WCOL_SEL_BG (cp_current_theme()->sel_bg)
+#define WCOL_ARROW (cp_current_theme()->muted)
 
 /* -------------------------------------------------------------------------- */
 /* Generic helpers.                                                            */
@@ -50,12 +55,20 @@ void widget_draw_all(struct widget* head, struct gfx_surface* s) {
         if (w->clip_w > 0) gfx_set_clip(s, w->clip_x, w->clip_y, w->clip_w, w->clip_h);
         else               gfx_set_clip(s, w->x, w->y, w->w, w->h);
         w->ops->draw(w, s);
+        /* DISABLED IS A COMPOSITE OVER THE FINISHED WIDGET (the design's rule),
+         * which is why it happens here and not inside each draw: tinting every
+         * element separately would need a disabled variant of every token, and
+         * the nine widgets would drift apart. */
+        if (w->disabled) cp_dim(s, w->x, w->y, w->w, w->h);
         gfx_clear_clip(s);
     }
 }
 
 struct widget* widget_at(struct widget* head, int lx, int ly) {
     struct widget* hit = NULL;                  /* last match wins (top-most) */
+    /* A disabled widget is skipped HERE rather than in each handler: a control
+     * that looks off and still reacts is worse than one that was never
+     * disabled, because the user has been told it is inert. */
     for (struct widget* w = head; w; w = w->next)
         if (lx >= w->x && lx < w->x + w->w && ly >= w->y && ly < w->y + w->h)
             hit = w;
@@ -80,11 +93,11 @@ void widget_init(struct widget* w, struct gui_window* win,
     gui_window_add_widget(win, w);
 }
 
+/* The Console Plate border: 1 px, with the corner pixels left out.  Every
+ * widget in this file already went through here, so routing it to cp_border is
+ * what gives the whole toolkit cut corners in one edit instead of nine. */
 static void outline(struct gfx_surface* s, int x, int y, int w, int h, uint32_t c) {
-    gfx_fill(s, x,         y,         w, 1, c);
-    gfx_fill(s, x,         y + h - 1, w, 1, c);
-    gfx_fill(s, x,         y,         1, h, c);
-    gfx_fill(s, x + w - 1, y,         1, h, c);
+    cp_border(s, x, y, w, h, c);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -93,10 +106,41 @@ static void outline(struct gfx_surface* s, int x, int y, int w, int h, uint32_t 
 
 static void label_draw(struct widget* w, struct gfx_surface* s) {
     struct w_label* l = (struct w_label*)w;
+    /* CAPTION STYLE — the design's label style, and cp_label's first caller.
+     * A column header or a section title is not body text: widget_specs.md
+     * gives it UPPERCASE, tracking and `muted`, sitting on a `tray` band with a
+     * 1 px `line` under it.  That is what separates a table's header from its
+     * first row, and without it a list reads as one undifferentiated block —
+     * which is exactly how the Task Manager looked next to the catalogue. */
+    if (l->caption) {
+        const cp_theme* t = cp_current_theme();
+        gfx_fill(s, w->x, w->y, w->w, w->h, t->tray);
+        /* The rule goes on the side facing the content: under a header, over a
+         * footer.  Both bands are `tray`, and without the rule on the right
+         * side a footer reads as a header for whatever is below the window. */
+        if (l->caption == 2) gfx_fill(s, w->x, w->y, w->w, 1, t->line);
+        else                 gfx_fill(s, w->x, w->y + w->h - 1, w->w, 1, t->line);
+        cp_label(s, w->x + 4, w->y + (w->h - cp_fh()) / 2, lstr(l->text));
+        /* The right-hand half, if there is one.  Measured with cp_label_width
+         * because a caption is TRACKED — spacing the letters out and then
+         * positioning with the untracked width puts the total off the right
+         * edge, which is the sort of thing that only shows on the longest
+         * string somebody ever produces. */
+        if (l->text2[0]) {
+            int tw = cp_label_width(l->text2);
+            cp_label(s, w->x + w->w - 4 - tw,
+                     w->y + (w->h - cp_fh()) / 2, l->text2);
+        }
+        return;
+    }
     /* §M65 — clipped to the label's own rect.  A label is the widget most
      * likely to be handed text longer than its box (a help line, a path), and
      * text that spills is text drawn over the widget next to it. */
-    ui_text_clipped(s, w, w->x, w->y + (w->h - GFX_GLYPH_H) / 2, l->text, l->color);
+    const cp_theme* lt = cp_current_theme();
+    uint32_t lc = l->color ? l->color
+                : (l->role == WLBL_MUTED  ? lt->muted
+                :  l->role == WLBL_ACCENT ? lt->accent : lt->text);
+    ui_text_clipped(s, w, w->x, w->y + (w->h - cp_fh()) / 2, lstr(l->text), lc);
 }
 
 static const struct widget_ops label_ops = {
@@ -107,15 +151,30 @@ struct w_label* w_label_create(struct gui_window* win, int x, int y, int w,
                                const char* text) {
     struct w_label* l = (struct w_label*)kcalloc(1, sizeof(*l));
     if (!l) return NULL;
-    widget_init(&l->base, win, x, y, w, GFX_GLYPH_H + 4, &label_ops, NULL, 0);
-    l->color = WCOL_TEXT;
+    widget_init(&l->base, win, x, y, w, cp_fh() + 4, &label_ops, NULL, 0);
+    l->color = 0;          /* 0 = the theme's `text`, resolved at draw */
     str_copy(l->text, text, (int)sizeof(l->text));
     return l;
+}
+
+void w_label_set_caption(struct w_label* l, int on) {
+    /* THE VALUE IS KEPT, NOT NORMALISED TO A BOOLEAN.  This was `on ? 1 : 0`,
+     * so the footer style (2) was stored as 1 and every footer in the toolkit
+     * drew its rule on the BOTTOM — under the last thing in the window, where
+     * it reads as a header for whatever comes next.  A parameter documented as
+     * taking three values and squashed into two is a setting that silently
+     * cannot be selected. */
+    if (l) l->caption = on;
 }
 
 void w_label_set(struct w_label* l, const char* text) {
     if (!l) return;
     str_copy(l->text, text, (int)sizeof(l->text));
+}
+
+void w_label_set_trailing(struct w_label* l, const char* text) {
+    if (!l) return;
+    str_copy(l->text2, text ? text : "", (int)sizeof(l->text2));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -124,12 +183,71 @@ void w_label_set(struct w_label* l, const char* text) {
 
 static void button_draw(struct widget* w, struct gfx_surface* s) {
     struct w_button* b = (struct w_button*)w;
-    gfx_vgradient(s, w->x, w->y, w->w, w->h, WCOL_BTN_TOP, WCOL_BTN_BOT);
-    outline(s, w->x, w->y, w->w, w->h, WCOL_BTN_EDGE);
-    int tw = 0;
-    while (b->text[tw]) tw++;
-    gfx_text(s, w->x + (w->w - tw * GFX_GLYPH_W) / 2,
-             w->y + (w->h - GFX_GLYPH_H) / 2, b->text, WCOL_TEXT);
+    const cp_theme* t = cp_current_theme();
+    const int focused = gui_widget_focused(w);
+    const int hot = w->hovered;
+    const int held = w->pressed;
+    uint32_t fg = t->text;
+
+    /* Flat throughout, per the design's own statement that the language is
+     * built from surface layers and 1 px borders rather than gradients. */
+    switch (b->emphasis) {
+    case CP_BTN_PRIMARY:
+        /* No border: the accent fill IS the edge, and outlining it as well
+         * makes the primary button look like a secondary one somebody
+         * coloured in. */
+        /* An accent-filled control cannot show hover by changing to `hover`
+         * (a surface colour) without ceasing to look primary.  The design's
+         * answer is a 1 px inner edge in `on_accent`, which reads as a
+         * highlight and keeps the fill. */
+        /* Pressed goes to `press` outright — the design darkens an accent
+         * fill rather than edging it, because a held button should read as
+         * pushed in, not as highlighted. */
+        cp_fill_plate(s, w->x, w->y, w->w, w->h, held ? t->press : t->accent);
+        if (hot && !held) cp_border(s, w->x + 1, w->y + 1, w->w - 2, w->h - 2,
+                                    t->on_accent);
+        fg = t->on_accent;
+        break;
+    case CP_BTN_GHOST:
+        /* Nothing at rest.  A focus ring still appears, because the design is
+         * explicit that no control may be unreachable-looking from the
+         * keyboard (widget_specs.md §0). */
+        if (held)             cp_fill_plate(s, w->x, w->y, w->w, w->h, t->press);
+        else if (hot || focused)
+            cp_fill_plate(s, w->x, w->y, w->w, w->h, t->hover);
+        break;
+    case CP_BTN_ICON:
+    case CP_BTN_SECONDARY:
+    default:
+        cp_plate(s, w->x, w->y, w->w, w->h,
+                 held ? t->press : (hot ? t->hover : t->raised), t->line);
+        break;
+    }
+
+    if (focused) cp_focus_ring(s, w->x, w->y, w->w, w->h);
+
+    /* Rule 3 (console_plate.h): centred on both axes, and measured in the face
+     * it is drawn in.  This was `tw * cp_fw()`, so with a proportional label
+     * the button's text sat off-centre by the difference between a digit's
+     * advance and the real one — worst on the widest labels, which is where it
+     * shows most. */
+    /* §M69 — RESOLVED AT DRAW TIME, not at creation.  A widget that stored
+     * the TRANSLATED string held a copy the catalogue could no longer reach,
+     * so changing the language only took effect at the next boot — reported
+     * from use, and the fix has to be here rather than a "re-create every
+     * widget" pass, because that would throw away every widget's state.
+     *
+     * Safe to apply to EVERY widget in the tree: `lstr` falls back to the key
+     * itself, so a caption that is a plain literal renders exactly as before.
+     * The cost is a small linear scan per drawn string; locale.c names the
+     * fix (a sorted table) if it ever measures. */
+    const char* btxt = lstr(b->text);
+    cp_text(s, w->x + (w->w - cp_text_w(btxt)) / 2,
+            w->y + (w->h - cp_fh()) / 2, btxt, fg);
+}
+
+void w_button_set_emphasis(struct w_button* b, int emphasis) {
+    if (b) b->emphasis = emphasis;
 }
 
 static void button_mouse(struct widget* w, int lx, int ly, int kind) {
@@ -154,47 +272,172 @@ struct w_button* w_button_create(struct gui_window* win, int x, int y,
     return b;
 }
 
+/* §M69 — PLACE A BUTTON AT THE SIZE IT ASKS FOR, and report the width so a
+ * caller can advance a cursor.
+ *
+ * The apps that predate the layout engine hand-place their button rows, and
+ * every one of them picked the size by eye in the 8x8 era: the file manager's
+ * row was seven buttons at a literal height of 18 and widths of 44/56/50/54
+ * chosen to fit a fixed 8 px advance.  With a proportional face at 137 %
+ * density the text is ~20 px tall, so THE FRAME CUT THROUGH ITS OWN LABEL —
+ * "MkDir" touched both edges and the descenders of "Copy" were sliced off.
+ *
+ * This is not a second layout engine and must not become one.  It is the one
+ * question those call sites never asked: `cls_button_measure` has known the
+ * right answer since §M69 wrote the convention down, and nothing outside the
+ * toolkit could reach it.  Porting these apps to `ui_build` is the real end
+ * state and a much larger change; this makes the interim honest rather than
+ * leaving nine windows contradicting a rule the header states in capitals. */
+static void cls_button_measure(struct widget* w, int avail_w, int* min_w,
+                               int* pref_w, int* pref_h);
+
+int w_button_autosize(struct w_button* b, int x, int y) {
+    if (!b) return 0;
+    int min_w = 0, pref_w = 0, pref_h = 0;
+    /* A generous `avail_w`: these are hand-placed rows, so the caller — not
+     * the button — decides what to do when the row runs out of room. */
+    cls_button_measure(&b->base, 1 << 20, &min_w, &pref_w, &pref_h);
+    b->base.x = x;
+    b->base.y = y;
+    b->base.w = pref_w;
+    b->base.h = pref_h;
+    return pref_w;
+}
+
 /* -------------------------------------------------------------------------- */
 /* List view.  Rows of text; right-edge 12px strip = scroll arrows.            */
 /* -------------------------------------------------------------------------- */
 
-#define LV_ARROW_W 12
+/* ONE width for the scrollbar, used by BOTH the draw and the hit test.  They
+ * were two different numbers — the bar was drawn CP_SCROLLBAR_W wide and the
+ * strip tested cp_fw()+4 — so an 8 px band looked like list and scrolled when
+ * clicked.  A view that draws one geometry and hit-tests another is the defect
+ * §M64 called invisible in a screenshot; the only fix is that there is nothing
+ * to keep in step. */
 
 static int lv_visible_rows(const struct w_listview* lv) {
     int r = (lv->base.h - 4) / WLIST_ROW_H;
     return r > 0 ? r : 1;
 }
 
-static void lv_draw_arrow(struct gfx_surface* s, int cx, int cy, int up) {
-    /* 7px wide triangle out of stacked hlines. */
-    for (int i = 0; i < 4; i++) {
-        int half = up ? i : 3 - i;
-        gfx_fill(s, cx - half, cy + i, half * 2 + 1, 1, WCOL_ARROW);
-    }
-}
+/* The end arrows are GONE, and that is the design's instruction rather than a
+ * simplification: widget_specs.md §10 says "nincs végnyíl" — a Console Plate
+ * scrollbar is a trough and a proportional thumb.  The compiler naming this
+ * function unused is what confirmed nothing else still drew them. */
+
+/* THE TABLE, AS THE DESIGN DRAWS IT (design/reference §06, and the rendered
+ * catalogue in OS_HTML_DES.html).
+ *
+ * The old version was a box with text in it: no row separation, a selection
+ * that stopped short of the scrollbar, and a scroll strip in a hardcoded
+ * colour that belonged to no theme.  Four things carry a Console Plate list
+ * and each is one fill:
+ *
+ *   - ROW SEPARATORS in `line_soft`, not alternating fills.  The design uses a
+ *     hairline between rows; banding would fight the selection for the same
+ *     visual job and win, which is why every row here has the same fill.
+ *   - THE SELECTION SPANS THE FULL ROW, right up to the scroll strip.  Stopping
+ *     short reads as a highlighted cell rather than a chosen row — and it is
+ *     the row that is chosen.
+ *   - THE SCROLL TROUGH IS `tray` AND THE THUMB IS `muted`, both from the
+ *     theme.  The literal 0xFF16202E it used before was invisible in the dark
+ *     theme and a dark bar down the side of the light one.
+ *   - THE THUMB IS PROPORTIONAL: viewport² / content, floored at the design's
+ *     CP_SCROLLBAR_THUMB_MIN.  A fixed-size thumb says nothing about how much
+ *     list there is, which is most of what a scrollbar is for. */
+static void lv_sb_metrics(const struct w_listview* lv, struct sb_metrics* m);
 
 static void listview_draw(struct widget* w, struct gfx_surface* s) {
     struct w_listview* lv = (struct w_listview*)w;
-    gfx_fill(s, w->x, w->y, w->w, w->h, WCOL_BOX_BG);
+    const cp_theme* t = cp_current_theme();
+
+    cp_fill_plate(s, w->x, w->y, w->w, w->h, WCOL_BOX_BG);
     outline(s, w->x, w->y, w->w, w->h, WCOL_BOX_EDGE);
 
+    const int sb = cp_scrollbar_w();
+    const int inner_w = w->w - sb - 2;
     int rows = lv_visible_rows(lv);
+
     for (int r = 0; r < rows; r++) {
         int idx = lv->scroll + r;
         if (idx >= lv->count) break;
         int ry = w->y + 2 + r * WLIST_ROW_H;
+
         if (idx == lv->sel)
-            gfx_fill(s, w->x + 2, ry, w->w - LV_ARROW_W - 4, WLIST_ROW_H,
-                     WCOL_SEL_BG);
-        gfx_text(s, w->x + 6, ry + (WLIST_ROW_H - GFX_GLYPH_H) / 2,
-                 lv->items[idx], WCOL_TEXT);
+            gfx_fill(s, w->x + 1, ry, inner_w, WLIST_ROW_H, t->sel_bg);
+        else if (r)                       /* no rule above the first row */
+            gfx_fill(s, w->x + 1, ry, inner_w, 1, t->line_soft);
+
+        (lv->mono ? cp_mono_text : cp_text)
+                  (s, w->x + 8, ry + (WLIST_ROW_H - cp_fh()) / 2,
+                lv->items[idx], idx == lv->sel ? t->sel_fg : t->text);
     }
 
-    /* Scroll strip. */
-    int ax = w->x + w->w - LV_ARROW_W;
-    gfx_fill(s, ax, w->y + 1, LV_ARROW_W - 1, w->h - 2, 0xFF16202Eu);
-    lv_draw_arrow(s, ax + LV_ARROW_W / 2 - 1, w->y + 5, 1);
-    lv_draw_arrow(s, ax + LV_ARROW_W / 2 - 1, w->y + w->h - 10, 0);
+    /* §M69 — ONE scrollbar (scrollbar.c): arrows, trough and a proportional
+     * thumb, computed by the same call the hit test uses so the drawn box and
+     * the pressable box cannot disagree. */
+    struct sb_metrics sbm;
+    lv_sb_metrics(lv, &sbm);
+    sb_draw(s, &sbm, lv->sb_part);
+}
+
+/* The bar's geometry, in WINDOW coordinates — one definition, called by the
+ * painter and by every input path. */
+static void lv_sb_metrics(const struct w_listview* lv, struct sb_metrics* m) {
+    const struct widget* w = &lv->base;
+    int sb = cp_scrollbar_w();
+    sb_metrics(m, w->x + w->w - sb - 1, w->y + 1, sb, w->h - 2,
+               lv->count, lv_visible_rows((struct w_listview*)lv), lv->scroll);
+}
+
+/* One band of rows as a damage rect, in window coordinates — THE SAME
+ * ARITHMETIC THE PAINTER USES (`w->y + 2 + r * WLIST_ROW_H` in listview_draw).
+ * Shared by the content diff and by the widget's own state changes so a row
+ * cannot be painted at one y and damaged at another; §M69 paid for that shape
+ * once already in the title buttons, where the painter and the hit test each
+ * computed the same box and disagreed by two pixels.  Returns 0 when the band
+ * is entirely outside the viewport. */
+static int lv_row_band(const struct w_listview* lv, int from, int n,
+                       int* ox, int* oy, int* ow, int* oh) {
+    int lo = from - lv->scroll;
+    if (lo < 0) { n += lo; lo = 0; }
+    if (n <= 0) return 0;
+    int y = lv->base.y + 2 + lo * WLIST_ROW_H;
+    int h = n * WLIST_ROW_H;
+    int bot = lv->base.y + lv->base.h;
+    if (y >= bot) return 0;
+    if (y + h > bot) h = bot - y;
+    if (h <= 0) return 0;
+    *ox = lv->base.x; *oy = y; *ow = lv->base.w; *oh = h;
+    return 1;
+}
+
+/* THE OWNER'S DIFF CANNOT SEE A SELECTION, AND MUST NOT BE ASKED TO.
+ *
+ * A self-refreshing owner (the Task Manager) repaints only the rows whose TEXT
+ * changed — the right question for content and the wrong one for state:
+ * choosing another row changes no text at all, only which row is drawn in the
+ * selection colours.  Under the old repaint-everything that was invisible;
+ * with a diff in place the highlight simply never moved, and a table whose
+ * selection does not follow the click is broken in the one way a user notices
+ * immediately.  *A speedup that costs correctness is not a speedup.*
+ *
+ * So the widget damages its OWN appearance changes, at the moment it makes
+ * them — this is the only place that knows both the row it left and the row it
+ * took, and it costs two rows rather than a table. */
+static void lv_damage_row(struct w_listview* lv, int idx) {
+    int x, y, w, h;
+    if (idx < 0 || idx >= lv->count) return;
+    if (lv_row_band(lv, idx, 1, &x, &y, &w, &h))
+        gui_window_request_redraw_rect(lv->base.win, x, y, w, h);
+}
+
+/* A scroll moves every row, so the honest damage is the whole widget — but the
+ * WIDGET, not the window: repainting the chrome, the buttons and the footer
+ * because a list scrolled is the cost this whole diff exists to avoid. */
+static void lv_damage_all(struct w_listview* lv) {
+    gui_window_request_redraw_rect(lv->base.win, lv->base.x, lv->base.y,
+                                   lv->base.w, lv->base.h);
 }
 
 static void listview_mouse(struct widget* w, int lx, int ly, int kind) {
@@ -203,17 +446,18 @@ static void listview_mouse(struct widget* w, int lx, int ly, int kind) {
 
     gui_window_focus_widget(w->win, w);         /* M22.5: keyboard nav */
 
-    if (lx >= w->w - LV_ARROW_W) {              /* scroll strip */
-        if (ly < w->h / 2) { if (lv->scroll > 0) lv->scroll--; }
-        else               { if (lv->scroll + rows < lv->count) lv->scroll++; }
-        return;
-    }
+    /* §M69 — the scrollbar is handled by the POINTER path (press/drag/release)
+     * so the thumb can be dragged; a click event alone cannot express that.
+     * This arm only has to keep the click from selecting a row underneath. */
+    if (lx >= w->w - cp_scrollbar_w() - 1) return;
 
     int r = (ly - 2) / WLIST_ROW_H;
     int idx = lv->scroll + r;
     if (r < 0 || r >= rows || idx >= lv->count) return;
 
+    int was = lv->sel;
     lv->sel = idx;
+    if (was != idx) { lv_damage_row(lv, was); lv_damage_row(lv, idx); }
     if (kind == 1) {
         if (lv->on_activate) lv->on_activate(lv, idx, w->ctx);
     } else {
@@ -250,8 +494,14 @@ static void listview_keycode(struct widget* w, uint8_t kc, uint8_t mods) {
     if (sel < 0) sel = 0;
     if (sel >= lv->count) sel = lv->count - 1;
     if (sel == lv->sel) return;
+    int was = lv->sel, was_scroll = lv->scroll;
     lv->sel = sel;
     lv_scroll_to_sel(lv);
+    /* Same rule as the click: the widget damages what it changed.  A keyboard
+     * move that also scrolled the viewport moved every row, so that case takes
+     * the whole widget; the ordinary case is two rows. */
+    if (lv->scroll != was_scroll) lv_damage_all(lv);
+    else { lv_damage_row(lv, was); lv_damage_row(lv, sel); }
     if (lv->on_select) lv->on_select(lv, sel, w->ctx);
 }
 
@@ -264,17 +514,84 @@ static void listview_key(struct widget* w, char c) {
 
 /* §M61 follow-up — the wheel, for the same reason the item view got one: with
  * no wheel a list ends at its last visible row.  Three rows per notch. */
-static void listview_scroll(struct widget* w, int dz) {
+/* §M69 — PRESS / DRAG / RELEASE on the scrollbar.
+ *
+ * All three parts of the report land here.  A press on an ARROW steps; on the
+ * TROUGH it pages toward the pointer (the design's own behaviour); on the
+ * THUMB it starts a drag, and gui.c's pointer GRAB is what keeps the motion
+ * arriving after the pointer has wandered off the narrow bar — without the
+ * grab a drag would stop the instant the hand strayed twelve pixels sideways,
+ * which is most of the time. */
+static void listview_pointer(struct widget* w, int lx, int ly, int phase) {
     struct w_listview* lv = (struct w_listview*)w;
-    lv->scroll -= dz * 3;
+    struct sb_metrics m;
+    lv_sb_metrics(lv, &m);
+    int px = w->x + lx, py = w->y + ly;          /* window coordinates */
+
+    if (phase == WPTR_PRESS) {
+        /* §M69 — a press starts a new gesture, so a latch still held from the
+         * last one is stale; see ui.c for why this must be self-healing rather
+         * than merely correct on the happy path. */
+        lv->sb_part = 0;
+        int part = sb_hit(&m, px, py);
+        if (gui_input_debug())
+            kprintf("lv: press at %d,%d bar %d,%d %dx%d part=%d\n",
+                    px, py, m.x, m.y, m.w, m.h, part);
+        if (part == SB_NONE) return;
+        lv->sb_part = part;
+        lv->sb_grab_dy = py - m.thumb_y;
+        int was = lv->scroll, rows = lv_visible_rows(lv);
+        int max = lv->count - rows;
+        if (max < 0) max = 0;
+        switch (part) {
+        case SB_UP:          lv->scroll--; break;
+        case SB_DOWN:        lv->scroll++; break;
+        case SB_TROUGH_UP:   lv->scroll -= sb_page(rows); break;
+        case SB_TROUGH_DOWN: lv->scroll += sb_page(rows); break;
+        default: break;                          /* SB_THUMB: grab only */
+        }
+        if (lv->scroll < 0)   lv->scroll = 0;
+        if (lv->scroll > max) lv->scroll = max;
+        if (lv->scroll != was) lv_damage_all(lv);
+        else                   gui_window_request_redraw(w->win);  /* the emphasis */
+        return;
+    }
+
+    if (phase == WPTR_DRAG) {
+        if (lv->sb_part != SB_THUMB) return;
+        int rows = lv_visible_rows(lv);
+        int ns = sb_scroll_from_thumb(&m, lv->count, rows, py - lv->sb_grab_dy);
+        if (ns != lv->scroll) { lv->scroll = ns; lv_damage_all(lv); }
+        return;
+    }
+
+    /* RELEASE — drop the grab and repaint, because the pressed arrow is drawn
+     * emphasised and would otherwise stay lit after the button came up. */
+    if (lv->sb_part) { lv->sb_part = 0; gui_window_request_redraw(w->win); }
+}
+
+static int listview_scroll(struct widget* w, int dz) {
+    struct w_listview* lv = (struct w_listview*)w;
+    /* §M69 — clamped to the LAST FULL SCREEN, not to `count - 1`.  The old
+     * bound let the wheel scroll a list until one row was left at the top with
+     * empty space under it, and the thumb then had nowhere sensible to sit. */
+    int rows = lv_visible_rows(lv);
+    int max = lv->count - rows;
+    if (max < 0) max = 0;
+    int was = lv->scroll;
+    /* §M69 — the same `gui.scroll_lines` the container uses, so one notch
+     * means the same amount of content wherever the pointer is. */
+    lv->scroll -= dz * ui_wheel_lines();
     if (lv->scroll < 0) lv->scroll = 0;
-    if (lv->scroll > lv->count - 1) lv->scroll = lv->count > 0 ? lv->count - 1 : 0;
+    if (lv->scroll > max) lv->scroll = max;
+    if (lv->scroll == was) return 0;      /* at the end — let the page have it */
     gui_window_request_redraw(w->win);
+    return 1;
 }
 
 static const struct widget_ops listview_ops = {
-    listview_draw, listview_mouse, listview_key, listview_keycode, NULL, NULL,
-    listview_scroll
+    listview_draw, listview_mouse, listview_key, listview_keycode, NULL,
+    listview_pointer, listview_scroll
 };
 
 struct w_listview* w_listview_create(struct gui_window* win, int x, int y,
@@ -295,8 +612,9 @@ void w_listview_clear(struct w_listview* lv) {
 
 int w_listview_add(struct w_listview* lv, const char* text, uint8_t tag) {
     if (!lv || lv->count >= WLIST_MAX_ITEMS) return -1;
-    str_copy(lv->items[lv->count], text, WLIST_ITEM_LEN);
-    lv->tags[lv->count] = tag;
+    int i = lv->count;
+    str_copy(lv->items[i], text, WLIST_ITEM_LEN);
+    lv->tags[i] = tag;
     return lv->count++;
 }
 
@@ -307,18 +625,19 @@ int w_listview_add(struct w_listview* lv, const char* text, uint8_t tag) {
 static void textinput_draw(struct widget* w, struct gfx_surface* s) {
     struct w_textinput* t = (struct w_textinput*)w;
     int focused = gui_widget_focused(w);
-    gfx_fill(s, w->x, w->y, w->w, w->h, WCOL_BOX_BG);
+    cp_fill_plate(s, w->x, w->y, w->w, w->h, WCOL_BOX_BG);
     outline(s, w->x, w->y, w->w, w->h, focused ? WCOL_BOX_FOCUS : WCOL_BOX_EDGE);
+    if (focused) cp_focus_ring(s, w->x, w->y, w->w, w->h);
 
     /* Right-align overflow: show the tail that fits. */
-    int maxch = (w->w - 10) / GFX_GLYPH_W;
+    int maxch = (w->w - 10) / cp_fw();
     const char* p = t->buf;
     if (t->len > maxch) p += t->len - maxch;
-    gfx_text(s, w->x + 5, w->y + (w->h - GFX_GLYPH_H) / 2, p, WCOL_TEXT);
+    cp_text(s, w->x + 5, w->y + (w->h - cp_fh()) / 2, p, WCOL_TEXT);
 
     if (focused) {                              /* caret after the text */
         int cw = t->len > maxch ? maxch : t->len;
-        gfx_fill(s, w->x + 5 + cw * GFX_GLYPH_W + 1, w->y + 3, 1, w->h - 6,
+        gfx_fill(s, w->x + 5 + cw * cp_fw() + 1, w->y + 3, 1, w->h - 6,
                  WCOL_TEXT);
     }
 }
@@ -404,11 +723,17 @@ static struct widget* cls_label_create(struct gui_window* win,
 static void cls_label_measure(struct widget* w, int avail_w, int* min_w,
                               int* pref_w, int* pref_h) {
     struct w_label* l = (struct w_label*)w;
-    int n = 0; while (l->text[n]) n++;
-    *min_w  = GFX_GLYPH_W * 4;
-    *pref_w = n * GFX_GLYPH_W;
+    /* `strlen * cp_fw()` is the habit the 8x8 font taught and console_plate.h
+     * warns about in capitals: cp_fw is a DIGIT's advance, correct for a column
+     * of numbers and approximate for anything else.  In a UI_GRID the label
+     * column is sized to the widest label's pref_w, so under-measuring by a few
+     * pixels clips the longest caption and only the longest — "SEGMENTED" came
+     * out as "SEGMENTEI" in the widget gallery while every shorter label fit,
+     * which reads as one bad string rather than as a measuring rule. */
+    *min_w  = cp_fw() * 4;
+    *pref_w = cp_text_w(lstr(l->text));
     if (*pref_w > avail_w) *pref_w = avail_w;
-    *pref_h = GFX_GLYPH_H + 4;
+    *pref_h = cp_fh() + 4;
 }
 static void cls_label_settext(struct widget* w, const char* t) {
     w_label_set((struct w_label*)w, t);
@@ -439,11 +764,16 @@ static struct widget* cls_button_create(struct gui_window* win,
 static void cls_button_measure(struct widget* w, int avail_w, int* min_w,
                                int* pref_w, int* pref_h) {
     struct w_button* b = (struct w_button*)w;
-    int n = 0; while (b->text[n]) n++;
-    *min_w  = 40;
-    *pref_w = n * GFX_GLYPH_W + 20;
+    /* Rules 1-3: content width plus the design's horizontal padding, the
+     * convention's control height.  The old `strlen * cp_fw() + 20` / 22 pair
+     * was two 8x8-era constants that stopped tracking the type in §M69. */
+    *min_w  = cp_ctrl_pad_x() * 2 + cp_fw() * 2;
+    /* Measured on the TRANSLATION, or the box is sized for the key and drawn
+     * with the text — which is how a button ends up clipping its own label in
+     * one language and not another. */
+    *pref_w = cp_text_w(lstr(b->text)) + 2 * cp_ctrl_pad_x();
     if (*pref_w > avail_w) *pref_w = avail_w;
-    *pref_h = 22;
+    *pref_h = cp_btn_h();                /* rule 0: a button is a TARGET */
 }
 static void cls_button_settext(struct widget* w, const char* t) {
     str_copy(((struct w_button*)w)->text, t, (int)sizeof ((struct w_button*)w)->text);
@@ -501,9 +831,15 @@ static struct widget* cls_text_create(struct gui_window* win,
 }
 static void cls_text_measure(struct widget* w, int avail_w, int* min_w,
                              int* pref_w, int* pref_h) {
-    *min_w  = 80;
+    /* §M69 rule 0 — a text box is AIMED AT (you click into it to type), so it
+     * takes the design's control height rather than the beside-text one.  The
+     * literal 22 was an 8x8-era count that did not move when the type became a
+     * runtime fact, and `w->h > 0 ? w->h : 22` quietly froze whatever the
+     * caller happened to construct it with. */
+    (void)w;
+    *min_w  = cp_fw() * 8;
     *pref_w = avail_w;
-    *pref_h = w->h > 0 ? w->h : 22;
+    *pref_h = cp_btn_h();
 }
 static void cls_text_settext(struct widget* w, const char* t) {
     w_textinput_set((struct w_textinput*)w, t);

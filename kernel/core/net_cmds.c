@@ -16,12 +16,34 @@
 
 #include "net.h"
 #include "net_cmds.h"
+#include "shellcmd.h"
+#include "cmd_util.h"
+#include "console.h"
+#include "vfs.h"
+#include "kmalloc.h"
+#include "proc.h"
+#include "config.h"   /* §M70 — the commands register themselves */
 #include "dhcp.h"
 #include "printf.h"
 #include "task.h"
 #include "timer.h"
+#include "pkg.h"
+#include "gui.h"
+#include "percpu.h"
+#include "smp.h"
 #include <stdint.h>
 #include <stddef.h>
+
+/* Blob symbols for the embedded ring-3 programs.  ALL WEAK: a tree built
+ * without the optional userland still links, and the command says "not
+ * embedded" instead of the linker failing.  Hence the NULL check in each. */
+extern const unsigned char _binary_user_wget_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_wget_muslelf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_netsurf_dynelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_netsurf_dynelf_end[]   __attribute__((weak));
+
+/* --- file-scope state these commands own (moved with them out of shell.c) --- */
+static volatile int g_nst_idx, g_nst_done;
 
 
 /* Two string helpers, local because this file must not depend on either
@@ -433,3 +455,338 @@ void netcmd_dhcp(const char* args) {
     if (dhcp_configure(dev) == 0) net_list();
 }
 
+
+/* ---------------------------------------------------------------------------
+ * §M70 — shell registrations.
+ *
+ * These used to be a dozen arms inside shell.c's dispatch chain, which is why
+ * they existed on x86 and had to be repeated by hand in the aarch64 serial
+ * REPL.  Declared here, next to the implementation, they are on every
+ * architecture that links this file — which is all three.
+ * ------------------------------------------------------------------------- */
+
+static void nc_netstat(const char* args) { (void)args; netcmd_netstat(); }
+static void nc_lsnic  (const char* args) { (void)args; net_list(); }
+
+SHELL_CMD(netstat) = { "netstat", "", "the TCP connection table",
+                       SHELL_G_NET, nc_netstat };
+SHELL_CMD(lsnic)   = { "lsnic",   "", "network interfaces",
+                       SHELL_G_NET, nc_lsnic };
+SHELL_CMD(dhcp)    = { "dhcp", "[dev|status]", "ask the network for an address",
+                       SHELL_G_NET, netcmd_dhcp };
+SHELL_CMD(tcptest) = { "tcptest", "[n]", "echo server + n concurrent clients over lo",
+                       SHELL_G_NET, netcmd_tcptest };
+SHELL_CMD(tcploss) = { "tcploss", "[permille] [kb]", "a stream that survives loss",
+                       SHELL_G_NET, netcmd_tcploss };
+SHELL_CMD(lo)      = { "lo", "drop <permille>", "the loopback device, and making it lose frames",
+                       SHELL_G_NET, netcmd_lo };
+
+/* `ping <ip> [count]` — ARP-resolve then ICMP-echo the target. */
+static void cmd_ping(const char* args) {
+    /* Parse "<ip>" and an optional trailing count. */
+    char ipbuf[32]; int i = 0;
+    while (args[i] && args[i] != ' ' && i < 31) { ipbuf[i] = args[i]; i++; }
+    ipbuf[i] = '\0';
+    if (i == 0) { console_write("usage: ping <ip> [count]\n"); return; }
+
+    uint32_t ip;
+    if (net_parse_ip(ipbuf, &ip) != 0) { console_write("ping: bad IP\n"); return; }
+
+    /* §M24.8 — the device follows from the DESTINATION now, not from "the only
+     * one we have": 127.0.0.1 must go to `lo` even on a box that also has a
+     * NIC, and on a box with no NIC at all it is the only reachable address. */
+    struct net_device* dev = net_route(ip);
+    if (!dev) { console_write("ping: no route to host\n"); return; }
+
+    int count = 3;
+    while (args[i] == ' ') i++;
+    if (args[i]) {
+        int c = 0; for (int j = i; args[j] >= '0' && args[j] <= '9'; j++) c = c * 10 + (args[j] - '0');
+        if (c > 0 && c <= 16) count = c;
+    }
+    net_ping(dev, ip, count);
+}
+
+/* `arp <ip>` — resolve and print the MAC. */
+static void cmd_arp(const char* args) {
+    uint32_t ip;
+    if (net_parse_ip(args, &ip) != 0) { console_write("usage: arp <ip>\n"); return; }
+    struct net_device* dev = net_route(ip);
+    if (!dev) { console_write("arp: no route to host\n"); return; }
+    uint8_t mac[6];
+    if (net_arp_resolve(dev, ip, mac) == 0) {
+        char ipb[16], macb[18]; net_fmt_ip(ip, ipb); net_fmt_mac(mac, macb);
+        kprintf("%s is at %s\n", ipb, macb);
+    } else {
+        console_write("arp: no reply (timeout)\n");
+    }
+}
+
+/* `nslookup <host>` — resolve a hostname to an IPv4 via the SLIRP DNS proxy. */
+static void cmd_dns(const char* args) {
+    struct net_device* dev = net_primary();
+    if (!dev) { console_write("nslookup: no network device\n"); return; }
+    if (!args[0]) { console_write("usage: nslookup <hostname>\n"); return; }
+    uint32_t ip;
+    if (net_dns_query(dev, args, &ip) == 0) {
+        char ipb[16]; net_fmt_ip(ip, ipb);
+        kprintf("%s has address %s\n", args, ipb);
+    } else {
+        kprintf("nslookup: could not resolve %s\n", args);
+    }
+}
+
+/* `netsurf [url]` — the NetSurf web browser (§M42).  Execs the musl dynamic PIE
+ * in ring 3 under the linux-abi personality (like wget); ld.so resolves its
+ * DT_NEEDED store .so's from /lib, and its runtime resources come from /res
+ * (provisioned into the VFS at boot).  With no argument it opens about:welcome. */
+static void cmd_netsurf(const char* args) {
+    /* §M62 follow-up — ~9 MiB of browser resources, unpacked on first launch
+     * rather than on every boot (see pkg.h for the measurement). */
+    pkg_ensure_netsurf_res();
+    if (!_binary_user_netsurf_dynelf_start) {
+        console_write("netsurf: not built — run `make ARCH=x86_64 netsurf`\n");
+        return;
+    }
+    /* The libnsfb "dos" surface needs the compositor; bring it up if the user
+     * hasn't run `gui` yet (idempotent), then give it a moment to be ready. */
+    gui_start();
+    task_msleep(300);
+    static char abuf[512];
+    int n = 0; while (args[n] && n < (int)sizeof abuf - 1) { abuf[n] = args[n]; n++; }
+    abuf[n] = '\0';
+    const char* argv[10]; int argc = 0;
+    argv[argc++] = "netsurf";
+    argv[argc++] = "-f";            /* select the d-os windowed surface backend */
+    argv[argc++] = "dos";
+    char* q = abuf;
+    while (*q && argc < 9) {
+        while (*q == ' ') q++;
+        if (!*q) break;
+        argv[argc++] = q;
+        while (*q && *q != ' ') q++;
+        if (*q) *q++ = '\0';
+    }
+    size_t len = (size_t)(_binary_user_netsurf_dynelf_end -
+                          _binary_user_netsurf_dynelf_start);
+    /* Spawn as an independent Linux-ABI user task (like the Start-menu launcher),
+     * NOT a synchronous excursion on the shell task — so a browser crash/wedge is
+     * torn down on its own and never takes down this shell. */
+    int pid = proc_spawn_argv("netsurf", _binary_user_netsurf_dynelf_start, len,
+                              argc, argv, 1 /* linux_abi */);
+    if (pid < 0) { kprintf("netsurf: failed to spawn (rc=%d)\n", pid); return; }
+    /* §M46 — per-package runaway auto-fkill policy (see netsurf_app.c). */
+    long ms = config_get_long("package.netsurf.auto_fkill_ms",
+                              config_get_long("package.auto_fkill_ms", 0));
+    if (ms > 0) task_set_auto_fkill(pid, (uint32_t)ms);
+    kprintf("netsurf: started as pid %d\n", pid);
+}
+
+/* `wget <url> [outfile]` — download over HTTP/HTTPS. */
+static void cmd_wget(const char* args) {
+    /* Prefer the userland musl wget (does TLS); fall back to kernel HTTP. */
+    if (_binary_user_wget_muslelf_start) {
+        /* Tokenize "<url> [outfile]" into an argv the program's crt0 reads. */
+        static char abuf[512];
+        int n = 0; while (args[n] && n < (int)sizeof abuf - 1) { abuf[n] = args[n]; n++; }
+        abuf[n] = '\0';
+        const char* argv[4]; int argc = 0;
+        argv[argc++] = "wget";
+        char* q = abuf;
+        while (*q && argc < 4) {
+            while (*q == ' ') q++;
+            if (!*q) break;
+            argv[argc++] = q;
+            while (*q && *q != ' ') q++;
+            if (*q) *q++ = '\0';
+        }
+        if (argc < 2) { console_write("usage: wget <url> [outfile]\n"); return; }
+        size_t len = (size_t)(_binary_user_wget_muslelf_end -
+                              _binary_user_wget_muslelf_start);
+        struct task* me = task_current();
+        int prev = me ? me->linux_abi : 0;
+        if (me) me->linux_abi = 1;
+        int rc = proc_exec_elf_argv(_binary_user_wget_muslelf_start, len, argc, argv);
+        if (me) me->linux_abi = prev;
+        kprintf("\nwget: exit rc=%d\n", rc);
+        return;
+    }
+
+    const char* url = args;
+    struct net_device* dev = net_primary();
+    if (!dev) { console_write("wget: no network device\n"); return; }
+
+    /* Strip an optional "http://" scheme. */
+    const char* p = url;
+    if (cmd_starts_with(p, "http://")) p += 7;
+
+    /* Split host[:port] and path. */
+    char host[128]; int hi = 0;
+    while (*p && *p != '/' && *p != ':' && hi < 127) host[hi++] = *p++;
+    host[hi] = '\0';
+    uint16_t port = 80;
+    if (*p == ':') { p++; int v = 0; while (*p >= '0' && *p <= '9') v = v*10 + (*p++ - '0'); port = (uint16_t)v; }
+    const char* path = (*p == '/') ? p : "/";
+    if (hi == 0) { console_write("usage: wget http://host[:port][/path]\n"); return; }
+
+    /* Resolve host: accept a literal dotted-quad, else DNS. */
+    uint32_t ip;
+    if (net_parse_ip(host, &ip) != 0) {
+        if (net_dns_query(dev, host, &ip) != 0) { kprintf("wget: cannot resolve %s\n", host); return; }
+    }
+    char ipb[16]; net_fmt_ip(ip, ipb);
+    kprintf("wget: connecting to %s (%s):%u ...\n", host, ipb, port);
+
+    int n = net_http_get(dev, ip, port, host, path);
+    if (n < 0) { console_write("wget: connection failed\n"); return; }
+
+    uint32_t blen; const uint8_t* body = net_http_body(&blen);
+    /* Print up to ~1 KiB of the response so a big page doesn't flood. */
+    uint32_t show = blen < 1024 ? blen : 1024;
+    for (uint32_t i = 0; i < show; i++) console_putchar((char)body[i]);
+    if (show < blen) kprintf("\n... [%u bytes total]\n", blen);
+    else             kprintf("\n[%u bytes]\n", blen);
+}
+
+static void netstorm_probe(void) {
+    int i = __atomic_fetch_add(&g_nst_idx, 1, __ATOMIC_ACQ_REL);
+    struct net_device* dev = net_primary();
+    if (dev) {
+        uint8_t mac[6];
+        /* Distinct unassigned addresses on our own subnet: on-link, so this
+         * really does emit an ARP request and really does wait for a reply
+         * that is never coming. */
+        net_arp_resolve(dev, IPV4(10, 0, 2, 200) + (uint32_t)(i & 31), mac);
+    }
+    __atomic_add_fetch(&g_nst_done, 1, __ATOMIC_ACQ_REL);
+}
+
+static void cmd_netstorm(const char* args) {
+    int n = 0;
+    while (*args == ' ') args++;
+    for (; *args >= '0' && *args <= '9'; args++) n = n * 10 + (*args - '0');
+    if (n <= 0) n = 6;
+    if (n > 16) n = 16;
+
+    if (!net_primary()) { console_write("netstorm: no net device\n"); return; }
+
+    __atomic_store_n(&g_nst_idx, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_nst_done, 0, __ATOMIC_RELEASE);
+
+    /* Sample aggregate CPU-busy across the storm.  This is the claim that
+     * matters — "waiting for the network is free" — and asserting it without
+     * measuring it is exactly the kind of comment §M52 was about. */
+    int ncpu = smp_ncpus(); if (ncpu > 32) ncpu = 32;
+    uint64_t busy0 = 0;
+    for (int i = 0; i < ncpu; i++) {
+        struct percpu* p = percpu_at(i);
+        if (p) busy0 += p->busy_ms;
+    }
+    struct net_poller_stats st0;
+    net_poller_stats(&st0);
+
+    uint64_t t0 = timer_ticks_ms();
+    int spawned = 0;
+    for (int i = 0; i < n; i++)
+        if (task_spawn_detached("net-probe", netstorm_probe)) spawned++;
+    kprintf("netstorm: %d probe(s) waiting on unanswerable addresses...\n", spawned);
+
+    /* Watch from the shell — which is NOT one of the waiters, so it can still
+     * report if they all wedge (the killstorm lesson: a test that hangs with
+     * the thing it tests reports nothing). */
+    int peak = 0;
+    for (int ms = 0; ms < 20000; ms += 50) {
+        struct net_poller_stats sn;
+        net_poller_stats(&sn);
+        int w = sn.waiters;
+        if (w > peak) peak = w;
+        if (__atomic_load_n(&g_nst_done, __ATOMIC_ACQUIRE) >= spawned) break;
+        task_msleep(50);
+    }
+    uint64_t elapsed = timer_ticks_ms() - t0;
+    int done = __atomic_load_n(&g_nst_done, __ATOMIC_ACQUIRE);
+
+    uint64_t busy1 = 0;
+    for (int i = 0; i < ncpu; i++) {
+        struct percpu* p = percpu_at(i);
+        if (p) busy1 += p->busy_ms;
+    }
+    uint64_t db  = busy1 > busy0 ? busy1 - busy0 : 0;
+    uint32_t pct = elapsed ? (uint32_t)((db * 100) / (elapsed * (uint64_t)ncpu)) : 0;
+
+    struct net_poller_stats st1;
+    net_poller_stats(&st1);
+
+    kprintf("netstorm: %d/%d finished in %u ms, peak waiters %d, "
+            "%u%% of %d CPUs busy while waiting, %u pumps, %u irqs\n",
+            done, spawned, (uint32_t)elapsed, peak, pct, ncpu,
+            st1.pumps - st0.pumps, st1.irqs - st0.irqs);
+    if (done < spawned)
+        console_write("netstorm: FAIL (a probe never returned)\n");
+    else if (peak < 2 && spawned > 1)
+        console_write("netstorm: FAIL (never more than one waiter — serialised)\n");
+    else
+        console_write("netstorm: PASS (concurrent waiters, one poller)\n");
+}
+
+/* `nettest` — self-contained §M24 check: ARP + ping the SLIRP gateway (§M24.1),
+ * a DNS resolve over UDP (§M24.2), and an HTTP GET over TCP (§M24.3).  Prints
+ * PASS/FAIL lines so a headless boot can grep the serial log. */
+static void cmd_nettest(void) {
+    struct net_device* dev = net_primary();
+    if (!dev) { console_write("nettest: FAIL (no net device)\n"); return; }
+    uint32_t gw = dev->gateway;
+    uint8_t mac[6];
+    if (net_arp_resolve(dev, gw, mac) != 0) { console_write("nettest: FAIL (ARP)\n"); return; }
+    int got = net_ping(dev, gw, 3);
+    if (got > 0) kprintf("nettest: PASS icmp (%d/3 echo replies)\n", got);
+    else         console_write("nettest: FAIL (no echo reply)\n");
+
+    /* §M24.2 — resolve a well-known name over UDP/DNS. */
+    uint32_t ip = 0;
+    if (net_dns_query(dev, "example.com", &ip) == 0) {
+        char ipb[16]; net_fmt_ip(ip, ipb);
+        kprintf("nettest: PASS dns (example.com -> %s)\n", ipb);
+    } else {
+        console_write("nettest: FAIL (dns)\n");
+    }
+
+    /* §M24.3 — HTTP GET over TCP to the resolved address. */
+    if (ip) {
+        int n = net_http_get(dev, ip, 80, "example.com", "/");
+        if (n > 0) {
+            uint32_t blen; const uint8_t* body = net_http_body(&blen);
+            /* Show just the status line. */
+            char status[64]; int si = 0;
+            for (uint32_t i = 0; i < blen && body[i] != '\r' && body[i] != '\n' && si < 63; i++)
+                status[si++] = (char)body[i];
+            status[si] = '\0';
+            kprintf("nettest: PASS tcp (%d bytes, \"%s\")\n", n, status);
+        } else {
+            console_write("nettest: FAIL (tcp)\n");
+        }
+    }
+}
+
+/* --- §M70 registrations for the commands moved here out of shell.c ---------
+ * §M24 already put the tcptest/tcploss/lo/netstat/dhcp family here so the ARM
+ * serial REPL would run the same implementation rather than a second copy.
+ * These seven were left behind in shell.c and were therefore x86-only in
+ * practice; moving them finishes the job that rule started. */
+
+static void nc_nettest(const char* a) { (void)a; cmd_nettest(); }
+
+SHELL_CMD(ping)     = { "ping", "<host>", "ICMP echo",
+                        SHELL_G_NET, cmd_ping };
+SHELL_CMD(arp)      = { "arp", "<ip>", "resolve an address on the link",
+                        SHELL_G_NET, cmd_arp };
+SHELL_CMD(nslookup) = { "nslookup", "<name>", "resolve a name over DNS",
+                        SHELL_G_NET, cmd_dns };
+SHELL_CMD(wget)     = { "wget", "<url>", "fetch a URL",
+                        SHELL_G_NET, cmd_wget };
+SHELL_CMD(netsurf)  = { "netsurf", "[url]", "the browser",
+                        SHELL_G_NET, cmd_netsurf };
+SHELL_CMD(nettest)  = { "nettest", "", "ICMP + DNS + TCP end to end",
+                        SHELL_G_TEST, nc_nettest };
+SHELL_CMD(netstorm) = { "netstorm", "[n]", "n tasks waiting on the network at once",
+                        SHELL_G_TEST, cmd_netstorm };

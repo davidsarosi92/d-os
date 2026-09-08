@@ -82,6 +82,18 @@ struct gfx_surface;
  * would be a second surface per panel and a second set of hit-test maths. */
 #define UI_SCROLL       0x0080
 
+/* §M69 — container: pack the children against the END of the main axis (right
+ * in a row, bottom in a column) instead of the start.
+ *
+ * Added for widget_specs.md §14's dialog, whose action row is right-aligned
+ * with the confirm button on the outer edge — an alignment this toolkit simply
+ * could not express, which is why every earlier "dialog" here hand-placed its
+ * buttons in absolute pixels.  It does nothing when a child carries a weight:
+ * a weighted child has already been given the slack, so there is none left to
+ * push with, and silently fighting over it would make two flags that each look
+ * as if they worked. */
+#define UI_ALIGN_END    0x0100
+
 struct ui_spec {
     int         id;         /* app-assigned, unique in the window; 0 = none  */
     int         parent;     /* container id; 0 = the window root             */
@@ -172,6 +184,12 @@ int  ui_build(struct gui_window* win, const struct ui_spec* specs, int n,
  * host on `on_layout` (i.e. after a resize) and by ui_build. */
 void ui_layout(struct gui_window* win);
 
+/* §M69 — re-ARRANGE with the last measurements, for changes that move things
+ * without resizing them (a scroll offset).  Measuring a label costs a
+ * catalogue lookup and a per-glyph width, and a scrollbar drag would otherwise
+ * pay for all of them on every motion packet. */
+void ui_reflow(struct gui_window* win);
+
 /* Scroll a UI_SCROLL container by `dl` pixels (positive = further down its
  * content).  Clamped to the content; returns non-zero if it actually moved,
  * so a caller only repaints when something changed. */
@@ -180,6 +198,20 @@ int  ui_scroll_by(struct gui_window* win, int id, int dl);
 /* Wheel routing: scroll whichever UI_SCROLL container is under (x,y) — content
  * coordinates.  Returns non-zero if something moved. */
 int  ui_scroll_at(struct gui_window* win, int x, int y, int dz);
+
+/* §M69 — press/drag/release on a scrolling container's SCROLLBAR.  A container
+ * is a node, not a widget, so nothing in the window's widget list sits under
+ * that strip and gui.c's ordinary routing found nobody: the settings panels
+ * drew a bar that could not be used at all.  gui.c asks here BEFORE resolving
+ * a widget, so a drag that wanders off the twelve-pixel bar keeps going
+ * instead of clicking whatever it passes over.  Non-zero = consumed. */
+int  ui_pointer_at(struct gui_window* win, int x, int y, int phase);
+
+/* §M69 — pixels moved by ONE wheel notch, from `gui.scroll_lines` (rows).
+ * Shared with the list widgets so a wheel means the same amount everywhere. */
+int  ui_wheel_step(void);
+/* The same setting in ROWS, for the widgets that scroll by row. */
+int  ui_wheel_lines(void);
 
 /* How many nodes this window's tree already has — 0 means "not built yet". */
 int  ui_node_count(struct gui_window* win);
@@ -257,6 +289,13 @@ int ui_size_class_for(int content_px_w);
 /* Diagnostic: print the registry and the window's laid-out tree.  `ui check`
  * uses it — a layout that draws correctly and measures wrongly is invisible in
  * a screenshot (§M64's lesson, applied to geometry). */
+/* Paint the toolkit's own furniture — today the scroll indicators — over a
+ * window's finished widgets.  Called by the window redraw paths in gui.c, not
+ * by apps: a container is a NODE and has no draw op of its own, so without this
+ * a scrolling panel has no way to say that there is more below. */
+struct gfx_surface;
+void ui_draw_overlay(struct gui_window* win, struct gfx_surface* s);
+
 void ui_dump(struct gui_window* win);
 
 /* The `ui` shell command: `ui` dumps the focused window's tree, `ui scroll [n]`

@@ -17,6 +17,8 @@
  * ============================================================================= */
 
 #include "icons.h"
+#include "vpath.h"
+#include "console_plate.h"
 #include "gfx.h"
 #include <stddef.h>
 
@@ -55,6 +57,22 @@ static void bars(struct gfx_surface* s, int x, int y, int w, int n,
 
 void icon_draw(struct gfx_surface* s, int x, int y, int n, int id) {
     if (!s || n < 8) return;
+
+    /* THE VECTOR SET FIRST — this is the seam this file's header named.
+     *
+     * The Console Plate icons (design/icons/) are single-colour line art, so
+     * they are filled in the theme's foreground and scale to whatever size the
+     * caller asks for: the same points serve 24, 32 and 48 px, which is the
+     * whole reason they are polygons and not masks.
+     *
+     * An id with no vector artwork falls through to the drawn forms below.
+     * That is not a leftover: the two silenced-audio indicators carry their
+     * meaning in COLOUR (§M23 — "off" and "broken" must not look alike), and a
+     * one-colour glyph cannot say that. */
+    if (id > ICON_NONE && id < ICON__COUNT && icon_vpaths[id]) {
+        vpath_fill(s, icon_vpaths[id], x, y, n, cp_current_theme()->text);
+        return;
+    }
 
     const int u = n / 16 > 0 ? n / 16 : 1;      /* one unit = 1/16 of the box */
     const int q = n / 4;

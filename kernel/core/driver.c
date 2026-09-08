@@ -13,6 +13,8 @@
  * ============================================================================= */
 
 #include "driver.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
+#include "crash.h"
 #include "kmalloc.h"
 #include "printf.h"
 #include "hal_api.h"
@@ -809,13 +811,33 @@ void driver_cmd(const char* args) {
  * that route silently skips it.  These two functions ARE the deliberate route;
  * the fault paths keep calling the HAL directly, on purpose.
  * ---------------------------------------------------------------------- */
+/* DISARMING THE UNCLEAN-SHUTDOWN MARKER BELONGS HERE, NOT AT EACH CALLER.
+ *
+ * Reported from use: "the crash reporter comes up after EVERY reboot".  It
+ * did.  §M47 arms an NVRAM marker at boot and clears it on an orderly exit,
+ * and `crash_boot_clean()` had exactly two callers — the SHELL's `reboot` and
+ * `shutdown` commands.  Every other way out of the system (the Start menu's
+ * Reboot and Shut Down, which come through here) left the marker armed, so the
+ * next boot correctly reported that the previous one had not ended cleanly.
+ *
+ * The detector was right; it was being told the truth about a shutdown nobody
+ * had disarmed.  §M66 built these two functions precisely so that shutdown is
+ * ONE route rather than five call sites — and then the marker was cleared at
+ * the call sites anyway.  This is that milestone's own lesson, applied to the
+ * thing it was written for.
+ *
+ * The FAULT paths deliberately do not come through here (§M66): a watchdog
+ * reboot runs from an interrupt with the machine in an unknown state, and it
+ * must NOT disarm the marker — an unclean boot is exactly what it is. */
 void system_power_off(void) {
     driver_shutdown_all();
+    crash_boot_clean();
     hal_shutdown();
 }
 
 void system_reboot(void) {
     driver_shutdown_all();
+    crash_boot_clean();
     hal_reboot();
 }
 
@@ -848,3 +870,11 @@ static void job_driver_rescan(void) {
 }
 
 CRON_JOB("driver-rescan", job_driver_rescan, 2000);
+
+/* --- §M70 shell registrations --------------------------------------------- */
+static void dv_lsdrv(const char* a) { (void)a; driver_list(); }
+SHELL_CMD(lsdrv) = { "lsdrv", "", "drivers and their state",
+                     SHELL_G_DEV, dv_lsdrv };
+SHELL_CMD(drv)   = { "drv", "start|stop|swap|rescan|domain|res|crash <name>",
+                     "driver lifecycle and placement",
+                     SHELL_G_DEV, driver_cmd };

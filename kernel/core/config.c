@@ -16,6 +16,7 @@
  * ============================================================================= */
 
 #include "config.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "vfs.h"
 #include "kmalloc.h"
 #include "printf.h"
@@ -381,3 +382,20 @@ void config_dump(void) {
         kprintf("  %s = %s\n", e->key, e->value);
     }
 }
+
+/* --- §M70 shell registrations ---------------------------------------------
+ * §4.63 moved these out of shell.c so the ARM serial REPL could reach the
+ * persistent store it was able to create and had no command able to write to.
+ * The registration is what removes the second dispatch arm entirely. */
+
+static void cf_config  (const char* a) { (void)a; config_dump(); }
+static void cf_saveconf(const char* a) { (void)a; config_cmd_saveconf(); }
+
+SHELL_CMD(config)   = { "config", "", "every config key currently in effect",
+                        SHELL_G_SYS, cf_config };
+SHELL_CMD(getconf)  = { "getconf", "<key>", "read one config key",
+                        SHELL_G_SYS, config_cmd_getconf };
+SHELL_CMD(setconf)  = { "setconf", "<key> <value>", "set a key (undeclared keys allowed)",
+                        SHELL_G_SYS, config_cmd_setconf };
+SHELL_CMD(saveconf) = { "saveconf", "", "persist the config to disk",
+                        SHELL_G_SYS, cf_saveconf };

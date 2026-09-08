@@ -61,8 +61,10 @@
 #include "gui_app.h"
 #include "icons.h"
 #include "widget.h"
+#include "console_plate.h"
 #include "itemview.h"
 #include "settings.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "config.h"
 #include "driver.h"
 #include "drvuser.h"
@@ -564,31 +566,49 @@ static void dm_layout(struct gui_window* win) {
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
 
-    const int bar = 30;                 /* the action row at the bottom */
+    /* §M69 — derived from the live density.  The literal 30/6/12/28/20 and the
+     * 54/78/66/68 x 22 buttons below were measured for the 8x8 font; at a
+     * runtime face the action row overlapped the detail line and every button
+     * frame cut through its own label. */
+    const int pad = cp_px(6), gap = cp_px(6);
+    const int bar = cp_btn_h() + 2 * gap;   /* the action row at the bottom */
     dm_rescan();
-    dm_view = w_itemview_create(win, 6, 6, cw - 12, ch - bar - 28,
+    dm_view = w_itemview_create(win, pad, pad, cw - 2 * pad,
+                                ch - bar - cp_row_h() - gap,
                                 &dm_model,
                                 config_get("devices.view", "table"), NULL);
     if (dm_view) dm_view->on_select = dm_on_select;
 
-    dm_detail = w_label_create(win, 6, ch - bar - 20, cw - 12, "Select a device.");
+    dm_detail = w_label_create(win, pad, ch - bar - cp_row_h(), cw - 2 * pad,
+                               "Select a device.");
 
-    int y = ch - bar + 2, x = 6;
-    w_button_create(win, x, y, 54, 22, "Start", act_start, NULL);   x += 58;
-    w_button_create(win, x, y, 54, 22, "Stop",  act_stop,  NULL);   x += 58;
-    w_button_create(win, x, y, 78, 22, "Move", act_domain, NULL);   x += 82;
-    w_button_create(win, x, y, 66, 22, "Update", act_update, NULL); x += 70;
-    w_button_create(win, x, y, 66, 22, "Browse", act_browse, NULL);
+    int y = ch - bar + gap, x = pad;
+    struct { const char* t; void (*fn)(struct w_button*, void*); } acts[] = {
+        { "Start", act_start }, { "Stop", act_stop }, { "Move", act_domain },
+        { "Update", act_update }, { "Browse", act_browse },
+    };
+    for (unsigned i = 0; i < sizeof acts / sizeof acts[0]; i++) {
+        struct w_button* b = w_button_create(win, 0, 0, 0, 0, acts[i].t,
+                                             acts[i].fn, NULL);
+        if (b) x += w_button_autosize(b, x, y) + gap;
+    }
     /* Crash sits at the far right, away from the others.  It is the one
      * control here whose whole purpose is to break something, and the gap is
      * the only thing standing between a curious click and a stopped device. */
-    w_button_create(win, cw - 74, y, 68, 22, "Crash", act_crash, NULL);
+    {
+        struct w_button* b = w_button_create(win, 0, 0, 0, 0, "Crash",
+                                             act_crash, NULL);
+        if (b) {
+            w_button_autosize(b, 0, y);
+            b->base.x = cw - pad - b->base.w;
+        }
+    }
 }
 
 static void devices_panel_open(void) {
     if (dm_win) { gui_window_raise(dm_win); return; }
     int ow, oh;
-    gui_window_outer_for_content(760, 380, &ow, &oh);
+    gui_window_outer_for_content(cp_px(760), cp_px(380), &ow, &oh);
     dm_win = gui_app_window_create("Devices", 120, 100, ow, oh, dm_layout, NULL);
     if (dm_win) {
         gui_window_set_on_close(dm_win, dm_on_close);
@@ -696,3 +716,10 @@ CONFIG_KEY(ck_devices_view) = {
     .values = "table list grid", .def = "table",
     .help = "how the device manager lays its devices out",
 };
+
+/* --- §M70 shell registration -----------------------------------------------
+ * §4.83's rule: this walks the PANEL's own cell() rather than the registry, so
+ * a command that reassembled the same facts by a second route cannot pass
+ * while the panel shows something else. */
+SHELL_CMD(devices) = { "devices", "[<name>]", "the device manager, on a console",
+                       SHELL_G_DEV, devices_cmd };

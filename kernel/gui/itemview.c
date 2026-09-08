@@ -14,14 +14,77 @@
 
 #include "itemview.h"
 #include "icons.h"
+#include "console_plate.h"
+#include "locale.h"
+#include "scrollbar.h"
 #include "gfx.h"
 #include <stddef.h>
 
-#define SEL_FILL    0x603D6FB8u         /* translucent selection wash     */
-#define SEL_EDGE    0xFF6E9BE0u
-#define LBL_FG      0xFFF2F5FAu
-#define LBL_DIM     0xFF8B94A6u
-#define SUB_FG      0xFFA9B4C8u
+/* §M69 — THE THEME, READ LIVE.  These were five literals, and they were
+ * light-on-dark: `LBL_FG` is very nearly white, so under the LIGHT theme the
+ * labels were white text on a light pane — reported from use as *"in the light
+ * theme the labels disappear."*  A palette that assumes one theme is not a
+ * palette, it is a second theme nobody can switch away from.
+ *
+ * Read per use rather than cached, for w_controls.c's reason: `gui.theme` can
+ * change between two draws and a cached copy is a rule somebody has to
+ * remember to refresh. */
+#define SEL_EDGE    (cp_current_theme()->accent)
+#define LBL_FG      (cp_current_theme()->text)
+#define LBL_DIM     (cp_current_theme()->muted)
+#define SUB_FG      (cp_current_theme()->muted)
+/* The grid's selection is a translucent WASH rather than a solid row fill —
+ * an icon sits on top of it and a solid block would swallow the artwork.  So
+ * the theme's selection colour with the design's alpha forced on, which keeps
+ * the intent and drops the hardcoded hue. */
+#define SEL_FILL    ((cp_current_theme()->sel_bg & 0x00FFFFFFu) | 0x60000000u)
+
+/* §M69 — THE EMPTY STATE, drawn once for every layout (widget_specs.md §11).
+ *
+ * In ONE place rather than in each of the three views, because it is the same
+ * picture in all of them and three copies would be three chances for one to
+ * drift — which is exactly what happened to the scrollbar, four times over,
+ * one file down.
+ *
+ * Returns non-zero when it painted, so a view can `return` immediately: an
+ * empty collection has no rows, no header worth showing and no scrollbar, and
+ * drawing chrome around nothing is what made a failed load and an empty folder
+ * look alike. */
+static int draw_empty(struct gfx_surface* s, int x, int y, int w, int h,
+                      const struct item_model* m) {
+    if (m && m->count && m->count(m->ctx) > 0) return 0;
+    /* THE OWNER DECIDES WHETHER EMPTINESS NEEDS EXPLAINING, and a model that
+     * says nothing gets nothing — exactly the behaviour before this existed.
+     *
+     * Reported from use within minutes of shipping: *"what is this dashed
+     * thing on the desktop?"*  The desktop is a GRID model too, so an empty
+     * icon field grew a placeholder box across the wallpaper.  It was wrong
+     * twice over: an empty desktop is a NORMAL state that needs no
+     * explanation, and the placeholder's whole visual argument — a dashed
+     * frame reading as "a container waiting for content" — depends on there
+     * being a container, which a field painted straight onto the wallpaper is
+     * not.  *A default that applies everywhere is a decision made for surfaces
+     * nobody looked at.* */
+    if (!m || !m->empty_text) return 0;
+    const cp_theme* t = cp_current_theme();
+    /* The design's inset, so the placeholder reads as sitting INSIDE the pane
+     * rather than as the pane's own border having gone dashed. */
+    int pad = cp_px(14);
+    int bx = x + pad, by = y + pad, bw = w - 2 * pad, bh = h - 2 * pad;
+    if (bw < cp_px(60) || bh < cp_row_h()) return 1;   /* too small to say so */
+    cp_border_dashed(s, bx, by, bw, bh, t->line);
+
+    const char* msg = lstr(m->empty_text);
+    const char* act = (m && m->empty_action) ? lstr(m->empty_action) : NULL;
+    int th = cp_fh();
+    int total = act ? th * 2 + cp_px(6) : th;
+    int ty = by + (bh - total) / 2;
+    cp_text(s, bx + (bw - cp_text_w(msg)) / 2, ty, msg, t->muted);
+    if (act)
+        cp_text(s, bx + (bw - cp_text_w(act)) / 2, ty + th + cp_px(6), act,
+                t->accent);
+    return 1;
+}
 
 /* Draw `text` at (x,y) truncated to `maxch` characters. */
 static void text_clipped(struct gfx_surface* s, int x, int y,
@@ -35,12 +98,12 @@ static void text_clipped(struct gfx_surface* s, int x, int y,
         if (n > 0) buf[n - 1] = '~';
     }
     buf[n] = '\0';
-    gfx_text(s, x, y, buf, col);
+    cp_text(s, x, y, buf, col);
 }
 
 /* Centre a string of `len` glyphs inside `w`. */
 static int centre_x(int w, int len) {
-    int px = len * GFX_GLYPH_W;
+    int px = len * cp_fw();
     return px >= w ? 0 : (w - px) / 2;
 }
 static int str_len(const char* s) { int n = 0; while (s && s[n]) n++; return n; }
@@ -49,10 +112,36 @@ static int str_len(const char* s) { int n = 0; while (s && s[n]) n++; return n; 
 /* GRID — icons in rows, label under each.  The desktop's default.       */
 /* ===================================================================== */
 
-#define G_CELL_W    96
-#define G_CELL_H    96
-#define G_ICON      48
-#define G_PAD       8
+/* §M69 — the grid cell tracks the icon and the type, not the 8x8 font.
+ *
+ * These were four flat pixel counts, and the label was the one that showed:
+ * a 96 px cell fits twelve 8 px characters, so "Appearance" and "Region and
+ * language" truncated to `Appeara~` in the Control Panel — the cell had been
+ * sized for a font the system stopped using in §M69.  Deriving the width from
+ * the ICON plus a margin keeps the cell square-ish at any density, and the
+ * label still truncates when it must, which is the honest behaviour for a
+ * grid: the alternative is cells of different widths, and then nothing lines
+ * up in either direction. */
+#define G_PAD       cp_px(8)
+#define G_GAP       cp_px(6)            /* icon to label                     */
+/* THE CELL IS SIZED FROM THE ICON THAT IS ACTUALLY DRAWN.
+ *
+ * Reported from use: *"the selection box is about twice the meaningful content
+ * (icon + title)."*  It was — and for a reason worth keeping: the cell was
+ * built around a constant 48 px icon while `grid_draw` draws `cp_icon_size()`,
+ * a §M63 SETTING whose default is 24.  So on a default desktop every cell
+ * reserved room for an icon twice the size of the one in it, and the selection
+ * wash — which fills the cell — advertised that empty space as part of the
+ * item.  *A constant and a setting describing the same thing is a mismatch
+ * waiting for somebody to change the setting.*
+ *
+ * Height is now exactly what the painter lays down: pad, icon, gap, one line
+ * of label, pad.  Width keeps a floor, because a cell narrower than its labels
+ * truncates every one of them — and the floor is the honest trade a grid makes
+ * (cells of different widths line up in neither direction). */
+#define G_CELL_H    (2 * G_PAD + cp_icon_size() + G_GAP + cp_fh())
+#define G_CELL_W    (cp_icon_size() + 4 * G_PAD > cp_px(96) \
+                     ? cp_icon_size() + 4 * G_PAD : cp_px(96))
 
 /* Ceiling on the free-slot walk in g_place().  A layout pass must terminate
  * even if the model reports nonsense (every slot claimed, a `pos` that answers
@@ -141,6 +230,39 @@ static int grid_rect(int i, int w, int h, const struct item_model* m, int scroll
     return 0;
 }
 
+/* §M69 — THE GRID SCROLLS IN ROWS, AND NOTHING KNEW THAT.
+ *
+ * Reported from use: *"the Control Panel scrolls although everything fits, and
+ * scrolling makes most icons vanish — as if the bottom row jumped to the
+ * top."*  Both halves are one bug.  `grid_rect` subtracts `scroll` from the
+ * ROW index, while `w_itemview`'s wheel clamped to `count - 1` in ITEMS — so
+ * one notch (three units) scrolled three ROWS off a two-row grid, and the
+ * clamp allowed it because there were six items.  *A number is not a unit, and
+ * two layers disagreeing about which one it is looks like a rendering bug.*
+ *
+ * Reporting the range here fixes both: the widget clamps in the view's own
+ * unit, and when the content fits the answer is "no bar, nothing to scroll",
+ * so the wheel does nothing at all. */
+static int grid_scrollbar(int w, int h, const struct item_model* m, int scroll,
+                          int* bx, int* by, int* bw, int* bh,
+                          int* content, int* viewport) {
+    (void)scroll;
+    if (!m || !m->count) return 0;
+    int n = m->count(m->ctx);
+    int cols = g_cols(w);
+    int rows_total = (n + cols - 1) / cols;
+    int rows_fit = h / G_CELL_H;
+    if (rows_fit < 1) rows_fit = 1;
+    if (rows_total <= rows_fit) return 0;        /* everything fits */
+    *bw = cp_scrollbar_w();
+    *bx = w - *bw;
+    *by = 0;
+    *bh = h;
+    *content = rows_total;
+    *viewport = rows_fit;
+    return 1;
+}
+
 static int grid_page(int w, int h) {
     int rows = h / G_CELL_H; if (rows < 1) rows = 1;
     return rows * g_cols(w);
@@ -149,6 +271,7 @@ static int grid_page(int w, int h) {
 static void grid_draw(struct gfx_surface* s, int x, int y, int w, int h,
                       const struct item_model* m, int sel, int scroll) {
     if (!m || !m->count || !m->get) return;
+    if (draw_empty(s, x, y, w, h, m)) return;
     int n = m->count(m->ctx);
     /* With slots the model's order and the screen's order are different
      * things, so every item is offered to `grid_rect` and IT decides what is
@@ -168,12 +291,19 @@ static void grid_draw(struct gfx_surface* s, int x, int y, int w, int h,
             gfx_line(s, cx + 2, cy + 2, cx + 2, cy + ch - 3, SEL_EDGE);
             gfx_line(s, cx + cw - 3, cy + 2, cx + cw - 3, cy + ch - 3, SEL_EDGE);
         }
-        icon_draw(s, cx + (cw - G_ICON) / 2, cy + G_PAD, G_ICON, e.icon);
+        /* §M63 gui.icon_size.  Read per draw rather than cached: the setting
+         * can change from the Appearance panel while the desktop is up, and a
+         * cached copy would need its own invalidation path for no gain. */
+        const int gi = cp_icon_size();
+        icon_draw(s, cx + (cw - gi) / 2, cy + G_PAD, gi, e.icon);
 
-        int maxch = (cw - 6) / GFX_GLYPH_W;
+        int maxch = (cw - 6) / cp_fw();
         int len   = str_len(e.label);
         if (len > maxch) len = maxch;
-        text_clipped(s, cx + centre_x(cw, len), cy + G_PAD + G_ICON + 6,
+        /* THE SAME ARITHMETIC AS G_CELL_H, not a second guess at it: the
+         * label used a literal 6 where the cell used G_GAP, so the two drifted
+         * the moment either changed. */
+        text_clipped(s, cx + centre_x(cw, len), cy + G_PAD + gi + G_GAP,
                      e.label, maxch, e.dim ? LBL_DIM : LBL_FG);
     }
 }
@@ -221,6 +351,7 @@ ITEM_VIEW(itemview_grid) = {
     .rect = grid_rect,
     .page = grid_page,
     .slot_at = grid_slot_at,        /* §M64 tail — the grid can be arranged */
+    .scrollbar = grid_scrollbar,
 };
 
 /* ===================================================================== */
@@ -251,6 +382,7 @@ static int list_page(int w, int h) {
 static void list_draw(struct gfx_surface* s, int x, int y, int w, int h,
                       const struct item_model* m, int sel, int scroll) {
     if (!m || !m->count || !m->get) return;
+    if (draw_empty(s, x, y, w, h, m)) return;
     int n = m->count(m->ctx);
     for (int i = scroll; i < n; i++) {
         int cx, cy, cw, ch;
@@ -262,16 +394,20 @@ static void list_draw(struct gfx_surface* s, int x, int y, int w, int h,
         if (i == sel)
             gfx_blend_fill(s, cx + 1, cy + 1, cw - 2, ch - 2, SEL_FILL);
 
-        icon_draw(s, cx + L_PAD, cy + (ch - L_ICON) / 2, L_ICON, e.icon);
+        /* Bounded by the row: the setting is a CEILING here, not a value.  A
+         * 48 px icon in a 40 px row would paint over its neighbours. */
+        int li = cp_icon_size();
+        if (li > L_ICON) li = L_ICON;
+        icon_draw(s, cx + L_PAD, cy + (ch - li) / 2, li, e.icon);
 
-        int tx = cx + L_PAD + L_ICON + L_PAD;
-        int maxch = (cw - (tx - cx) - L_PAD) / GFX_GLYPH_W;
+        int tx = cx + L_PAD + li + L_PAD;
+        int maxch = (cw - (tx - cx) - L_PAD) / cp_fw();
         if (e.sub) {
-            text_clipped(s, tx, cy + ch / 2 - GFX_GLYPH_H - 1, e.label, maxch,
+            text_clipped(s, tx, cy + ch / 2 - cp_fh() - 1, e.label, maxch,
                          e.dim ? LBL_DIM : LBL_FG);
             text_clipped(s, tx, cy + ch / 2 + 2, e.sub, maxch, SUB_FG);
         } else {
-            text_clipped(s, tx, cy + (ch - GFX_GLYPH_H) / 2, e.label, maxch,
+            text_clipped(s, tx, cy + (ch - cp_fh()) / 2, e.label, maxch,
                          e.dim ? LBL_DIM : LBL_FG);
         }
     }
@@ -285,7 +421,27 @@ static int list_hit(int px, int py, int w, int h,
     return idx < m->count(m->ctx) ? idx : -1;
 }
 
+/* The list scrolls in ROWS too — same reasoning as the grid's above. */
+static int list_scrollbar(int w, int h, const struct item_model* m, int scroll,
+                          int* bx, int* by, int* bw, int* bh,
+                          int* content, int* viewport) {
+    (void)scroll;
+    if (!m || !m->count) return 0;
+    int n = m->count(m->ctx);
+    int fit = h / L_ROW_H;
+    if (fit < 1) fit = 1;
+    if (n <= fit) return 0;
+    *bw = cp_scrollbar_w();
+    *bx = w - *bw;
+    *by = 0;
+    *bh = h;
+    *content = n;
+    *viewport = fit;
+    return 1;
+}
+
 ITEM_VIEW(itemview_list) = {
+    .scrollbar = list_scrollbar,
     .name = "list",
     .draw = list_draw,
     .hit  = list_hit,
@@ -338,18 +494,85 @@ const struct item_view* item_view_by_name(const char* name) {
 /* of numbers.                                                            */
 /* ===================================================================== */
 
-#define T_ROW_H   18
-#define T_HEAD_H  20
-#define T_PAD     6
-#define T_MIN_COL (8 * GFX_GLYPH_W)     /* below this a column is useless */
+/* THE ROW HEIGHT IS THE DENSITY'S AND THE COLOURS ARE THE THEME'S.
+ *
+ * These were 18 and 20 with five literal colours next to them — 2007 pixels and
+ * a palette belonging to no theme, which is the same defect §M69 fixed in the
+ * listview: at the design's type sizes an 18 px row is about half of what the
+ * spec gives (`row 40px` comfort / 32 compact), and a hardcoded header fill is
+ * a dark bar across the light theme.  The table was simply the last widget
+ * nobody had looked at. */
+#define T_ROW_H   cp_row_h()
+#define T_HEAD_H  (cp_fh() + cp_px(10))
+#define T_PAD     cp_px(6)
+#define T_MIN_COL (8 * cp_fw())     /* below this a column is useless */
 
-#define TCOL_HEAD   0xFF1B2434u
-#define TCOL_TEXT   0xFFDDE4EEu
-#define TCOL_DIM    0xFF93A1B4u
-#define TCOL_SEL    0xFF2C5B9Eu
-#define TCOL_RULE   0xFF2A3547u
+static int t_style(const struct item_model* m, int c) {
+    return m->col_style ? m->col_style(m->ctx, c) : 0;
+}
 
-static void t_cell(const struct item_model* m, int i, int c, char* out, int cap);
+/* A cell's width in the face it will actually be DRAWN in.  Measuring a
+ * proportional string as `strlen * cp_fw()` is the habit the 8x8 font taught
+ * (console_plate.h says so in capitals); getting it wrong here does not merely
+ * misjudge a column, it puts a right-aligned number in the wrong place. */
+static int t_text_w(const char* s, int style) {
+    if (!(style & ICOL_MONO)) return cp_text_w(s);
+    int n = 0;
+    while (s[n]) n++;
+    return n * cp_mono_cell_w();
+}
+
+/* §M69 — MARK A CUT CELL, the same as the header above and as the grid and
+ * list have done since M22.  The table clipped hard, so a truncated value
+ * ("no driver neede") read as data that was itself wrong rather than as data
+ * that did not fit — the distinction the reader needs and cannot make from a
+ * clipped glyph. */
+static void t_draw_cell(struct gfx_surface* s, int x, int y, const char* str,
+                        cp_color col, int style, int maxw) {
+    char buf[64];
+    int k = 0;
+    while (str[k] && k < (int)sizeof buf - 1) { buf[k] = str[k]; k++; }
+    buf[k] = 0;
+    if (maxw > 0)
+        while (k > 1 && t_text_w(buf, style) > maxw) { buf[--k - 1] = '~'; buf[k] = 0; }
+    (style & ICOL_MONO ? cp_mono_text : cp_text)(s, x, y, buf, col);
+}
+
+static int t_rows_fit(int h) {
+    int r = (h - T_HEAD_H) / T_ROW_H;
+    return r < 1 ? 1 : r;
+}
+
+/* THE TABLE HAD NO SCROLLBAR AT ALL — the listview has had one since M22, and
+ * the table simply never grew one, so a table with more rows than fit gave no
+ * sign that there were any.  *A view that silently shows a prefix of its data
+ * is worse than one that shows none, because nothing looks wrong.*  Returns the
+ * width to reserve, 0 when everything is visible. */
+static int t_scrollbar(const struct item_model* m, int h) {
+    int total = m->count ? m->count(m->ctx) : 0;
+    return (total > t_rows_fit(h)) ? cp_scrollbar_w() + 2 : 0;
+}
+
+/* §M69 — the bar's rect and what it scrolls, in the view's own coordinates.
+ * Below the header band on purpose: a header that scrolled away with the rows
+ * would take the column names with it, and then the numbers under them mean
+ * nothing. */
+static int table_scrollbar(int w, int h, const struct item_model* m, int scroll,
+                           int* bx, int* by, int* bw, int* bh,
+                           int* content, int* viewport) {
+    (void)scroll;
+    if (!m || !m->count) return 0;
+    int total = m->count(m->ctx);
+    int fit = t_rows_fit(h);
+    if (total <= fit) return 0;
+    *bw = cp_scrollbar_w();
+    *bx = w - *bw;
+    *by = T_HEAD_H;
+    *bh = h - T_HEAD_H;
+    *content = total;
+    *viewport = fit;
+    return 1;
+}
 
 static int t_cols(const struct item_model* m) {
     int n = (m->columns && m->cell) ? m->columns(m->ctx) : 1;
@@ -370,7 +593,7 @@ static int t_cols(const struct item_model* m) {
  * The scan is BOUNDED (T_SCAN rows): the column widths must not become a
  * function of how many rows a directory happens to have. */
 #define T_SCAN 64
-#define T_GAP  (2 * GFX_GLYPH_W)        /* never let two columns touch */
+#define T_GAP  (2 * cp_fw())        /* never let two columns touch */
 
 static int t_layout(const struct item_model* m, int w, int* xs, int* ws) {
     int n = t_cols(m);
@@ -380,17 +603,19 @@ static int t_layout(const struct item_model* m, int w, int* xs, int* ws) {
     int rows = m->count ? m->count(m->ctx) : 0;
     if (rows > T_SCAN) rows = T_SCAN;
     for (int c = 0; c < n; c++) {
+        int style = t_style(m, c);
         const char* t = m->col_title ? m->col_title(m->ctx, c) : "";
-        int longest = 0;
-        while (t && t[longest]) longest++;
+        /* The header is drawn in the ordinary face whatever the column is, so
+         * it is measured in that one — a mono column with a proportional title
+         * measured as mono comes out narrower than its own heading. */
+        int longest = t ? cp_text_w(t) : 0;
         for (int i = 0; i < rows; i++) {
             char buf[64];
-            t_cell(m, i, c, buf, (int)sizeof buf);
-            int k = 0;
-            while (buf[k]) k++;
+            item_cell_text(m, i, c, buf, (int)sizeof buf);
+            int k = t_text_w(buf, style);
             if (k > longest) longest = k;
         }
-        nat[c] = longest * GFX_GLYPH_W + T_GAP;
+        nat[c] = longest + T_GAP;
     }
 
     /* Drop from the RIGHT while what is left cannot be read.  Column 0 is
@@ -428,7 +653,7 @@ static int t_layout(const struct item_model* m, int w, int* xs, int* ws) {
 
 /* One cell's text: from the model's `cell` when it has one, otherwise the
  * entry's label — which is what makes an old single-column model render. */
-static void t_cell(const struct item_model* m, int i, int c, char* out, int cap) {
+void item_cell_text(const struct item_model* m, int i, int c, char* out, int cap) {
     out[0] = 0;
     if (m->cell && m->columns) { m->cell(m->ctx, i, c, out, cap); return; }
     if (c != 0) return;
@@ -443,21 +668,49 @@ static void t_cell(const struct item_model* m, int i, int c, char* out, int cap)
 static void table_draw(struct gfx_surface* s, int x, int y, int w, int h,
                        const struct item_model* m, int sel, int scroll) {
     if (!m || !m->count) return;
+    if (draw_empty(s, x, y, w, h, m)) return;
+    const cp_theme* t = cp_current_theme();
     int xs[8], ws[8];
-    int n = t_layout(m, w, xs, ws);
+    /* THE COLUMNS GET THE WIDTH THE SCROLLBAR DOES NOT.  Laying them out over
+     * the full width and then painting a bar on top clips the last column by
+     * exactly the bar — which is invisible until a value happens to be long. */
+    int sb = t_scrollbar(m, h);
+    int n = t_layout(m, w - sb, xs, ws);
 
     /* Header — drawn from the model, not from a caller's padded string.  The
      * file manager used to fake this with spaces in a label, which is exactly
      * the kind of thing that stops being aligned the moment a name is long. */
-    gfx_fill(s, x, y, w, T_HEAD_H, TCOL_HEAD);
+    gfx_fill(s, x, y, w, T_HEAD_H, t->tray);
     for (int c = 0; c < n; c++) {
-        const char* t = m->col_title ? m->col_title(m->ctx, c) : "";
-        if (!t) continue;
-        gfx_set_clip(s, x + xs[c], y, ws[c] - T_GAP, T_HEAD_H);
-        gfx_text(s, x + xs[c], y + (T_HEAD_H - GFX_GLYPH_H) / 2, t, TCOL_DIM);
+        const char* ct = m->col_title ? m->col_title(m->ctx, c) : "";
+        if (!ct) continue;
+        int style = t_style(m, c);
+        int cw = ws[c] - T_GAP;
+        /* THE HEADING SITS OVER ITS OWN COLUMN, INCLUDING ITS ALIGNMENT.  A
+         * right-aligned number column with a left-aligned heading reads as two
+         * different columns, which is exactly how the old padded-string header
+         * looked once the real typeface arrived. */
+        /* §M69 — A CUT HEADING IS MARKED, not merely clipped.  With more
+         * columns than fit, the widths are scaled down and a heading can end
+         * up narrower than its own word — and a hard clip mid-glyph produced
+         * `Isolatior`, which reads as a MISSPELLING rather than as a
+         * truncation.  *The reader has to be able to tell a short label from a
+         * wrong one.*  The cells have marked their cuts with `~` since M22;
+         * the header simply never did. */
+        char hbuf[32];
+        {
+            int k = 0;
+            while (ct[k] && k < (int)sizeof hbuf - 1) { hbuf[k] = ct[k]; k++; }
+            hbuf[k] = 0;
+            while (k > 1 && cp_text_w(hbuf) > cw) { hbuf[--k - 1] = '~'; hbuf[k] = 0; }
+        }
+        int hx = x + xs[c];
+        if (style & ICOL_RIGHT) hx += cw - cp_text_w(hbuf);
+        gfx_set_clip(s, x + xs[c], y, cw, T_HEAD_H);
+        cp_text(s, hx, y + (T_HEAD_H - cp_fh()) / 2, hbuf, t->muted);
         gfx_clear_clip(s);
     }
-    gfx_fill(s, x, y + T_HEAD_H - 1, w, 1, TCOL_RULE);
+    gfx_fill(s, x, y + T_HEAD_H - 1, w, 1, t->line);
 
     int total = m->count(m->ctx);
     int rows  = (h - T_HEAD_H) / T_ROW_H;
@@ -465,19 +718,49 @@ static void table_draw(struct gfx_surface* s, int x, int y, int w, int h,
         int i = scroll + r;
         if (i >= total) break;
         int ry = y + T_HEAD_H + r * T_ROW_H;
-        if (i == sel) gfx_fill(s, x, ry, w, T_ROW_H, TCOL_SEL);
+        /* A HAIRLINE BETWEEN ROWS, NOT ALTERNATING FILLS — the design's answer,
+         * and the same one the listview got: banding would compete with the
+         * selection for the one visual job the selection has.  No rule above
+         * the first row; the header's own rule is already there. */
+        if (i == sel)   gfx_fill(s, x, ry, w, T_ROW_H, t->sel_bg);
+        else if (r)     gfx_fill(s, x, ry, w, 1, t->line_soft);
+
         for (int c = 0; c < n; c++) {
             char buf[64];
-            t_cell(m, i, c, buf, (int)sizeof buf);
+            item_cell_text(m, i, c, buf, (int)sizeof buf);
             if (!buf[0]) continue;
+            int style = t_style(m, c);
+            int cw = ws[c] - T_GAP;
+
+            /* THE SELECTION OVERRIDES THE COLUMN'S ROLE COLOUR.  An accent PID
+             * drawn on the accent selection fill is invisible — the one row the
+             * user has chosen would be the one row that cannot be read. */
+            cp_color col = t->text;
+            if (i == sel)              col = t->sel_fg;
+            else if (style & ICOL_ACCENT) col = t->accent;
+            else if (style & ICOL_DIM)    col = t->muted;
+
+            int tx = x + xs[c];
+            if (style & ICOL_RIGHT) {
+                int tw = t_text_w(buf, style);
+                if (tw < cw) tx += cw - tw;   /* never push it out to the left */
+            }
             /* Clip each cell to its own column: a long name must not run into
              * the size column, which is the failure a padded string cannot
              * even detect. */
-            gfx_set_clip(s, x + xs[c], ry, ws[c] - T_GAP, T_ROW_H);
-            gfx_text(s, x + xs[c], ry + (T_ROW_H - GFX_GLYPH_H) / 2, buf, TCOL_TEXT);
+            gfx_set_clip(s, x + xs[c], ry, cw, T_ROW_H);
+            t_draw_cell(s, tx, ry + (T_ROW_H - cp_fh()) / 2, buf, col, style, cw);
             gfx_clear_clip(s);
         }
     }
+
+    /* §M69 — THE BAR IS NOT PAINTED HERE ANY MORE.  A view is stateless by
+     * construction (itemview.h), and a scrollbar has state the moment it can be
+     * used: which part is held, where inside the thumb the press landed.  So
+     * the view reserves the strip and REPORTS it (`.scrollbar`), and the widget
+     * — which owns `scroll` and the grab — paints it through scrollbar.c.
+     * The old copy here drew a thumb that nothing could touch. */
+    (void)sb;
 }
 
 static int table_hit(int px, int py, int w, int h, const struct item_model* m,
@@ -509,6 +792,7 @@ static int table_page(int w, int h) {
 }
 
 ITEM_VIEW(itemview_table) = {
+    .scrollbar = table_scrollbar,
     .name = "table",
     .draw = table_draw,
     .hit  = table_hit,

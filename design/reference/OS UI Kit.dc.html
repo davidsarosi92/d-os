@@ -1,0 +1,1089 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="ds-styles.css">
+<style>
+  body { margin: 0; background: #e4e4e7; font-family: "Barlow", system-ui, sans-serif; }
+  a { color: var(--color-accent-700); text-decoration: none; border-bottom: 1px solid currentColor; }
+  a:hover { color: var(--color-accent-800); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes bar { 0% { background-position: 0 0; } 100% { background-position: 24px 0; } }
+</style>
+</helmet>
+
+<section style="display: flex; flex-direction: column; gap: 32px; padding: 48px; background: #eeeef0; border-bottom: 1px solid #b7b7ba">
+  <header style="display: flex; flex-direction: column; gap: 8px; max-width: 900px">
+    <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #5d5d60">Turn 2 · 1b + 1c összeolvasztva</div>
+    <h1 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 44px; line-height: 1; letter-spacing: -0.01em; color: #1d1f20">CONSOLE PLATE</h1>
+    <p style="margin: 0; font-size: 15px; line-height: 1.5; color: #424244; text-wrap: pretty">Egy nyelv, két téma. A <a href="#1b">1b</a>-ből: kitöltött vezérlők, hajszálkeret, monospace mérőszámok, tömör sáv-magasságok. A <a href="#1c">1c</a>-ből: 4px lekerekítés, lemezes ablak, nagy találati felület, tálcás tabok, lágy elevációs árnyék. Geometria mindkét témában azonos — csak a színréteg cserél, így a dark/light pár bit-azonos elrendezésű.</p>
+    <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px">
+      <span class="tag tag-neutral" style="font-family: 'IBM Plex Mono', monospace">control 40px</span>
+      <span class="tag tag-neutral" style="font-family: 'IBM Plex Mono', monospace">radius 4</span>
+      <span class="tag tag-neutral" style="font-family: 'IBM Plex Mono', monospace">border 1px</span>
+      <span class="tag tag-neutral" style="font-family: 'IBM Plex Mono', monospace">row 40</span>
+      <span class="tag tag-neutral" style="font-family: 'IBM Plex Mono', monospace">scrollbar 12</span>
+      <span class="tag tag-neutral" style="font-family: 'IBM Plex Mono', monospace">touch target ≥ 44</span>
+    </div>
+  </header>
+
+  <div id="2a" style="display: flex; flex-wrap: wrap; gap: 40px; align-items: flex-start">
+
+    <!-- ---------- DARK ---------- -->
+    <div style="display: flex; flex-direction: column; gap: 14px; width: 720px">
+      <div style="display: flex; align-items: baseline; gap: 12px">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 3px 8px; background: #1d2d3d; color: #eef6ff">2a</span>
+        <h2 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 24px; letter-spacing: 0.02em; color: #1d1f20">DARK — alapértelmezett</h2>
+      </div>
+
+      <div style="background: #1d2d3d; color: #eef6ff; padding: 28px; display: flex; flex-direction: column; gap: 26px; border: 1px solid #2c455d; border-radius: 4px; font-family: 'Barlow', sans-serif">
+
+        <div style="display: flex; flex-direction: column; gap: 10px">
+          <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #94bce3">Ablakkeret · menüsáv</div>
+          <div style="border: 1px solid #416180; border-radius: 4px; background: #16232f; box-shadow: 0 3px 10px rgba(0,0,0,0.35)">
+            <div style="display: flex; align-items: center; justify-content: space-between; height: 40px; padding: 0 10px; background: #22374a; border-bottom: 1px solid #416180; border-radius: 3px 3px 0 0">
+              <span style="font-size: 14px; font-weight: 500">Fájlkezelő <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #94bce3">/usr/src</span></span>
+              <div style="display: flex; gap: 6px">
+                <button type="button" style="width: 28px; height: 28px; padding: 0; border: none; border-radius: 4px; background: #416180; color: #eef6ff; font-size: 12px; cursor: pointer" style-hover="background: #597ea3">–</button>
+                <button type="button" style="width: 28px; height: 28px; padding: 0; border: none; border-radius: 4px; background: #416180; color: #eef6ff; font-size: 12px; cursor: pointer" style-hover="background: #597ea3">□</button>
+                <button type="button" style="width: 28px; height: 28px; padding: 0; border: none; border-radius: 4px; background: #416180; color: #eef6ff; font-size: 12px; cursor: pointer" style-hover="background: #94bce3; color: #16232f">×</button>
+              </div>
+            </div>
+            <div style="display: flex; height: 36px; align-items: center; padding: 0 4px; border-bottom: 1px solid #2c455d; position: relative">
+              <button type="button" onClick="{{ d.tmenu }}" style="height: 28px; padding: 0 12px; border: none; border-radius: 4px; background: transparent; font: inherit; font-size: 14px; color: #eef6ff; cursor: pointer" style-hover="background: #22374a">Fájl</button>
+              <button type="button" style="height: 28px; padding: 0 12px; border: none; border-radius: 4px; background: transparent; font: inherit; font-size: 14px; color: #eef6ff; cursor: pointer" style-hover="background: #22374a">Szerkesztés</button>
+              <button type="button" style="height: 28px; padding: 0 12px; border: none; border-radius: 4px; background: transparent; font: inherit; font-size: 14px; color: #eef6ff; cursor: pointer" style-hover="background: #22374a">Nézet</button>
+              <sc-if value="{{ d.menu }}" hint-placeholder-val="{{ true }}">
+                <div style="position: absolute; top: 38px; left: 4px; width: 236px; z-index: 5; background: #22374a; border: 1px solid #416180; border-radius: 4px; box-shadow: 0 12px 32px rgba(0,0,0,0.5); padding: 6px">
+                  <div style="display: flex; justify-content: space-between; align-items: center; height: 36px; padding: 0 10px; border-radius: 4px; font-size: 14px; cursor: pointer" style-hover="background: #416180"><span>Új ablak</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #94bce3">Ctrl+N</span></div>
+                  <div style="display: flex; justify-content: space-between; align-items: center; height: 36px; padding: 0 10px; border-radius: 4px; font-size: 14px; cursor: pointer" style-hover="background: #416180"><span>Terminál itt</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #94bce3">Ctrl+T</span></div>
+                  <div style="height: 1px; background: #416180; margin: 4px 6px"></div>
+                  <div style="display: flex; justify-content: space-between; align-items: center; height: 36px; padding: 0 10px; font-size: 14px; opacity: 0.45"><span>Csatolás…</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px">Ctrl+M</span></div>
+                </div>
+              </sc-if>
+            </div>
+            <div style="height: 40px; background: repeating-linear-gradient(45deg, transparent 0 6px, rgba(148,188,227,0.07) 6px 7px); border-radius: 0 0 3px 3px"></div>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 10px">
+          <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #94bce3">Gombok · 40px</div>
+          <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center">
+            <button type="button" style="height: 40px; padding: 0 18px; border: 1px solid #94bce3; border-radius: 4px; background: #94bce3; color: #16232f; font: inherit; font-size: 15px; font-weight: 500; cursor: pointer" style-hover="background: #b5d9fd" style-active="background: #749dc4">Telepítés</button>
+            <button type="button" style="height: 40px; padding: 0 18px; border: 1px solid #416180; border-radius: 4px; background: #22374a; color: #eef6ff; font: inherit; font-size: 15px; cursor: pointer" style-hover="background: #416180">Mégse</button>
+            <button type="button" style="height: 40px; padding: 0 12px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: #94bce3; font: inherit; font-size: 15px; cursor: pointer" style-hover="background: rgba(148,188,227,0.14)">Részletek</button>
+            <button type="button" style="width: 40px; height: 40px; padding: 0; border: 1px solid #416180; border-radius: 4px; background: #22374a; color: #eef6ff; font-size: 17px; cursor: pointer" style-hover="background: #416180">+</button>
+            <button type="button" disabled="{{ true }}" style="height: 40px; padding: 0 18px; border: 1px solid #416180; border-radius: 4px; background: #22374a; color: #eef6ff; font: inherit; font-size: 15px; opacity: 0.45; cursor: not-allowed">Nem elérhető</button>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 40px; flex-wrap: wrap">
+          <div style="display: flex; flex-direction: column; gap: 4px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #94bce3">Checkbox</div>
+            <div role="checkbox" tabIndex="0" aria-checked="{{ d.c1 }}" onClick="{{ d.tc1 }}" onKeyDown="{{ d.kc1 }}" style="display: flex; align-items: center; gap: 11px; cursor: pointer; font-size: 15px; height: 40px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 4px; display: grid; place-items: center; border: 1px solid #416180; font-size: 13px; line-height: 1; color: #16232f; background: {{ d.c1bg }}">
+                <sc-if value="{{ d.c1 }}" hint-placeholder-val="{{ true }}"><span>✓</span></sc-if>
+              </span>
+              <span>Kernel modulok betöltése</span>
+            </div>
+            <div role="checkbox" tabIndex="0" aria-checked="{{ d.c2 }}" onClick="{{ d.tc2 }}" onKeyDown="{{ d.kc2 }}" style="display: flex; align-items: center; gap: 11px; cursor: pointer; font-size: 15px; height: 40px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 4px; display: grid; place-items: center; border: 1px solid #416180; font-size: 13px; line-height: 1; color: #16232f; background: {{ d.c2bg }}">
+                <sc-if value="{{ d.c2 }}" hint-placeholder-val="{{ true }}"><span>✓</span></sc-if>
+              </span>
+              <span>Hibakeresési naplózás</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 4px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #94bce3">Radio</div>
+            <div role="radio" tabIndex="0" aria-checked="{{ d.r0 }}" onClick="{{ d.sr0 }}" style="display: flex; align-items: center; gap: 11px; cursor: pointer; font-size: 15px; height: 40px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 50%; border: 1px solid #416180; box-shadow: {{ d.r0dot }}"></span><span>ext2</span>
+            </div>
+            <div role="radio" tabIndex="0" aria-checked="{{ d.r1 }}" onClick="{{ d.sr1 }}" style="display: flex; align-items: center; gap: 11px; cursor: pointer; font-size: 15px; height: 40px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 50%; border: 1px solid #416180; box-shadow: {{ d.r1dot }}"></span><span>FAT32</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 4px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #94bce3">Switch</div>
+            <div role="switch" tabIndex="0" aria-checked="{{ d.sw }}" onClick="{{ d.tsw }}" style="display: flex; align-items: center; gap: 11px; cursor: pointer; font-size: 15px; height: 40px">
+              <span style="position: relative; width: 48px; height: 26px; flex: none; border-radius: 13px; border: 1px solid #416180; background: {{ d.swbg }}; transition: background 120ms linear">
+                <span style="position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: {{ d.swknob }}; box-shadow: 0 1px 2px rgba(0,0,0,0.4); transition: transform 120ms linear; transform: {{ d.swx }}"></span>
+              </span>
+              <span>SMP</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #94bce3">{{ d.swtxt }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 20px; flex-wrap: wrap">
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 260px">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #94bce3">Csatolási pont</label>
+            <input value="/mnt/data" style="height: 40px; padding: 0 12px; border: 1px solid #416180; border-radius: 4px; background: #16232f; color: #eef6ff; font-family: 'IBM Plex Mono', monospace; font-size: 14px; caret-color: #94bce3" style-focus="border-color: #94bce3; outline: 2px solid rgba(148,188,227,0.35); outline-offset: 0">
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 220px; position: relative">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #94bce3">Ütemező</label>
+            <button type="button" onClick="{{ d.tdd }}" style="height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border: 1px solid #416180; border-radius: 4px; background: #16232f; color: #eef6ff; font: inherit; font-size: 15px; cursor: pointer" style-hover="border-color: #94bce3"><span>{{ d.ddval }}</span><span style="font-size: 10px; color: #94bce3">▼</span></button>
+            <sc-if value="{{ d.dd }}" hint-placeholder-val="{{ true }}">
+              <div style="position: absolute; top: 70px; left: 0; right: 0; z-index: 6; background: #22374a; border: 1px solid #416180; border-radius: 4px; box-shadow: 0 12px 32px rgba(0,0,0,0.5); padding: 6px">
+                <div onClick="{{ d.dd0 }}" style="height: 36px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 15px; cursor: pointer" style-hover="background: #416180">round-robin</div>
+                <div onClick="{{ d.dd1 }}" style="height: 36px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 15px; cursor: pointer" style-hover="background: #416180">CFS</div>
+                <div onClick="{{ d.dd2 }}" style="height: 36px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 15px; cursor: pointer" style-hover="background: #416180">prioritásos</div>
+              </div>
+            </sc-if>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-end">
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 260px">
+            <div style="display: flex; justify-content: space-between; font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #94bce3"><span>Csúszka</span><span style="font-family: 'IBM Plex Mono', monospace; letter-spacing: 0; color: #eef6ff">{{ d.sl }}%</span></div>
+            <div tabIndex="0" onPointerDown="{{ d.onsl }}" onKeyDown="{{ d.slkey }}" style="position: relative; height: 40px; display: flex; align-items: center; cursor: pointer">
+              <div style="position: absolute; left: 0; right: 0; height: 6px; border-radius: 3px; background: #16232f; border: 1px solid #416180"></div>
+              <div style="position: absolute; left: 0; height: 6px; border-radius: 3px; background: #94bce3; width: {{ d.slpct }}"></div>
+              <div style="position: absolute; width: 22px; height: 22px; border-radius: 50%; background: #eef6ff; border: 1px solid #416180; box-shadow: 0 1px 3px rgba(0,0,0,0.45); margin-left: -11px; left: {{ d.slpct }}"></div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 8px; width: 200px">
+            <div style="display: flex; justify-content: space-between; font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #94bce3"><span>Folyamat</span><span style="font-family: 'IBM Plex Mono', monospace; letter-spacing: 0; color: #eef6ff">64%</span></div>
+            <div style="height: 8px; border-radius: 4px; background: #16232f; border: 1px solid #416180; overflow: hidden"><div style="height: 100%; width: 64%; background: #94bce3"></div></div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px; height: 40px">
+            <span style="width: 20px; height: 20px; border-radius: 50%; border: 2px solid #416180; border-top-color: #94bce3; animation: spin 850ms linear infinite; display: block"></span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #94bce3">fsck…</span>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 10px">
+          <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #94bce3">Tabok · lista · scrollbar</div>
+          <div style="display: flex; gap: 4px; padding: 4px; background: #16232f; border: 1px solid #2c455d; border-radius: 4px; align-self: flex-start">
+            <button type="button" onClick="{{ d.st0 }}" style="height: 32px; padding: 0 16px; border: none; border-radius: 4px; font: inherit; font-size: 14px; cursor: pointer; background: {{ d.tb0 }}; color: {{ d.tc0 }}">Folyamatok</button>
+            <button type="button" onClick="{{ d.st1 }}" style="height: 32px; padding: 0 16px; border: none; border-radius: 4px; font: inherit; font-size: 14px; cursor: pointer; background: {{ d.tb1 }}; color: {{ d.tc1c }}">Eszközök</button>
+            <button type="button" onClick="{{ d.st2 }}" style="height: 32px; padding: 0 16px; border: none; border-radius: 4px; font: inherit; font-size: 14px; cursor: pointer; background: {{ d.tb2 }}; color: {{ d.tc2c }}">Napló</button>
+          </div>
+          <div style="display: flex; border: 1px solid #416180; border-radius: 4px; overflow: hidden; background: #16232f">
+            <div onWheel="{{ d.onwheel }}" style="flex: 1; height: 160px; overflow: hidden; position: relative">
+              <div style="position: absolute; inset: 0; transform: {{ d.scy }}">
+                <sc-for list="{{ rows }}" as="row" hint-placeholder-count="4">
+                  <div style="display: grid; grid-template-columns: 50px 1fr 90px 70px; align-items: center; gap: 10px; height: 40px; padding: 0 14px; border-bottom: 1px solid rgba(148,188,227,0.1); font-size: 14px" style-hover="background: #22374a">
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #94bce3">{{ row.pid }}</span>
+                    <span>{{ row.name }}</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #b5d9fd">{{ row.mem }}</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #94bce3">{{ row.st }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+            <div onPointerDown="{{ d.ontrack }}" style="width: 12px; flex: none; background: #1d2d3d; position: relative; cursor: pointer">
+              <div style="position: absolute; left: 2px; right: 2px; border-radius: 4px; background: #597ea3; height: {{ d.thh }}; top: {{ d.thtop }}"></div>
+            </div>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start">
+          <div style="display: flex; flex-direction: column; gap: 10px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #94bce3">Dialógus</div>
+            <div style="width: 320px; padding: 20px; background: #22374a; border: 1px solid #416180; border-radius: 4px; box-shadow: 0 14px 34px rgba(0,0,0,0.55); display: flex; flex-direction: column; gap: 12px">
+              <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 21px; letter-spacing: 0.02em">Partíció formázása</div>
+              <div style="font-size: 14px; line-height: 1.45; color: #b5d9fd">A <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px">/dev/sda2</span> minden adata törlődik. A művelet nem visszavonható.</div>
+              <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px">
+                <button type="button" style="height: 36px; padding: 0 16px; border: 1px solid #416180; border-radius: 4px; background: #2c455d; color: #eef6ff; font: inherit; font-size: 14px; cursor: pointer">Mégse</button>
+                <button type="button" style="height: 36px; padding: 0 16px; border: 1px solid #94bce3; border-radius: 4px; background: #94bce3; color: #16232f; font: inherit; font-size: 14px; font-weight: 500; cursor: pointer">Formázás</button>
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 10px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #94bce3">Értesítés</div>
+            <div style="width: 280px; background: #22374a; border: 1px solid #416180; border-left: 3px solid #94bce3; border-radius: 4px; box-shadow: 0 3px 10px rgba(0,0,0,0.4); padding: 14px; display: flex; flex-direction: column; gap: 3px">
+              <div style="font-size: 15px; font-weight: 500">Driver betöltve</div>
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #94bce3">e1000e · eth0 up</div>
+            </div>
+          </div>
+        </div>
+
+        <sc-if value="{{ showSpecs }}" hint-placeholder-val="{{ true }}">
+          <div style="border-top: 1px solid #2c455d; padding-top: 10px; font-family: 'IBM Plex Mono', monospace; font-size: 11px; line-height: 1.7; color: #94bce3">
+            surface #1d2d3d · sunken #16232f · raised #22374a · line #416180 · accent #94bce3 · text #eef6ff
+          </div>
+        </sc-if>
+      </div>
+    </div>
+
+    <!-- ---------- LIGHT ---------- -->
+    <div style="display: flex; flex-direction: column; gap: 14px; width: 720px">
+      <div style="display: flex; align-items: baseline; gap: 12px">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 3px 8px; background: #5980a6; color: #ffffff">2a</span>
+        <h2 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 24px; letter-spacing: 0.02em; color: #1d1f20">LIGHT — ugyanaz a geometria</h2>
+      </div>
+
+      <div style="background: #f5f5f8; color: #1d1f20; padding: 28px; display: flex; flex-direction: column; gap: 26px; border: 1px solid #d4d4d7; border-radius: 4px; font-family: 'Barlow', sans-serif">
+
+        <div style="display: flex; flex-direction: column; gap: 10px">
+          <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Ablakkeret · menüsáv</div>
+          <div style="border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; box-shadow: 0 3px 10px rgba(43,43,45,0.14)">
+            <div style="display: flex; align-items: center; justify-content: space-between; height: 40px; padding: 0 10px; background: #e7e7ea; border-bottom: 1px solid #d4d4d7; border-radius: 3px 3px 0 0">
+              <span style="font-size: 14px; font-weight: 500">Fájlkezelő <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #5d5d60">/usr/src</span></span>
+              <div style="display: flex; gap: 6px">
+                <button type="button" style="width: 28px; height: 28px; padding: 0; border: none; border-radius: 4px; background: #d4d4d7; color: #424244; font-size: 12px; cursor: pointer" style-hover="background: #b7b7ba">–</button>
+                <button type="button" style="width: 28px; height: 28px; padding: 0; border: none; border-radius: 4px; background: #d4d4d7; color: #424244; font-size: 12px; cursor: pointer" style-hover="background: #b7b7ba">□</button>
+                <button type="button" style="width: 28px; height: 28px; padding: 0; border: none; border-radius: 4px; background: #d4d4d7; color: #424244; font-size: 12px; cursor: pointer" style-hover="background: #5980a6; color: #ffffff">×</button>
+              </div>
+            </div>
+            <div style="display: flex; height: 36px; align-items: center; padding: 0 4px; border-bottom: 1px solid #e7e7ea; position: relative">
+              <button type="button" onClick="{{ e.tmenu }}" style="height: 28px; padding: 0 12px; border: none; border-radius: 4px; background: transparent; font: inherit; font-size: 14px; color: #1d1f20; cursor: pointer" style-hover="background: #e7e7ea">Fájl</button>
+              <button type="button" style="height: 28px; padding: 0 12px; border: none; border-radius: 4px; background: transparent; font: inherit; font-size: 14px; color: #1d1f20; cursor: pointer" style-hover="background: #e7e7ea">Szerkesztés</button>
+              <button type="button" style="height: 28px; padding: 0 12px; border: none; border-radius: 4px; background: transparent; font: inherit; font-size: 14px; color: #1d1f20; cursor: pointer" style-hover="background: #e7e7ea">Nézet</button>
+              <sc-if value="{{ e.menu }}" hint-placeholder-val="{{ true }}">
+                <div style="position: absolute; top: 38px; left: 4px; width: 236px; z-index: 5; background: #ffffff; border: 1px solid #d4d4d7; border-radius: 4px; box-shadow: 0 12px 32px rgba(43,43,45,0.22); padding: 6px">
+                  <div style="display: flex; justify-content: space-between; align-items: center; height: 36px; padding: 0 10px; border-radius: 4px; font-size: 14px; cursor: pointer" style-hover="background: #eef6ff"><span>Új ablak</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #7a7a7d">Ctrl+N</span></div>
+                  <div style="display: flex; justify-content: space-between; align-items: center; height: 36px; padding: 0 10px; border-radius: 4px; font-size: 14px; cursor: pointer" style-hover="background: #eef6ff"><span>Terminál itt</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #7a7a7d">Ctrl+T</span></div>
+                  <div style="height: 1px; background: #e7e7ea; margin: 4px 6px"></div>
+                  <div style="display: flex; justify-content: space-between; align-items: center; height: 36px; padding: 0 10px; font-size: 14px; opacity: 0.45"><span>Csatolás…</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px">Ctrl+M</span></div>
+                </div>
+              </sc-if>
+            </div>
+            <div style="height: 40px; background: repeating-linear-gradient(45deg, transparent 0 6px, rgba(29,31,32,0.04) 6px 7px); border-radius: 0 0 3px 3px"></div>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 10px">
+          <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Gombok · 40px</div>
+          <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center">
+            <button type="button" style="height: 40px; padding: 0 18px; border: 1px solid #5980a6; border-radius: 4px; background: #5980a6; color: #ffffff; font: inherit; font-size: 15px; font-weight: 500; cursor: pointer" style-hover="background: #597ea3" style-active="background: #416180">Telepítés</button>
+            <button type="button" style="height: 40px; padding: 0 18px; border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; color: #1d1f20; font: inherit; font-size: 15px; cursor: pointer" style-hover="background: #e7e7ea">Mégse</button>
+            <button type="button" style="height: 40px; padding: 0 12px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: #416180; font: inherit; font-size: 15px; cursor: pointer" style-hover="background: #eef6ff">Részletek</button>
+            <button type="button" style="width: 40px; height: 40px; padding: 0; border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; color: #1d1f20; font-size: 17px; cursor: pointer" style-hover="background: #e7e7ea">+</button>
+            <button type="button" disabled="{{ true }}" style="height: 40px; padding: 0 18px; border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; color: #1d1f20; font: inherit; font-size: 15px; opacity: 0.45; cursor: not-allowed">Nem elérhető</button>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 40px; flex-wrap: wrap">
+          <div style="display: flex; flex-direction: column; gap: 4px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Checkbox</div>
+            <div role="checkbox" tabIndex="0" aria-checked="{{ e.c1 }}" onClick="{{ e.tc1 }}" onKeyDown="{{ e.kc1 }}" style="display: flex; align-items: center; gap: 11px; cursor: pointer; font-size: 15px; height: 40px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 4px; display: grid; place-items: center; border: 1px solid #b7b7ba; font-size: 13px; line-height: 1; color: #ffffff; background: {{ e.c1bg }}">
+                <sc-if value="{{ e.c1 }}" hint-placeholder-val="{{ true }}"><span>✓</span></sc-if>
+              </span>
+              <span>Kernel modulok betöltése</span>
+            </div>
+            <div role="checkbox" tabIndex="0" aria-checked="{{ e.c2 }}" onClick="{{ e.tc2 }}" onKeyDown="{{ e.kc2 }}" style="display: flex; align-items: center; gap: 11px; cursor: pointer; font-size: 15px; height: 40px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 4px; display: grid; place-items: center; border: 1px solid #b7b7ba; font-size: 13px; line-height: 1; color: #ffffff; background: {{ e.c2bg }}">
+                <sc-if value="{{ e.c2 }}" hint-placeholder-val="{{ true }}"><span>✓</span></sc-if>
+              </span>
+              <span>Hibakeresési naplózás</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 4px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Radio</div>
+            <div role="radio" tabIndex="0" aria-checked="{{ e.r0 }}" onClick="{{ e.sr0 }}" style="display: flex; align-items: center; gap: 11px; cursor: pointer; font-size: 15px; height: 40px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 50%; border: 1px solid #b7b7ba; box-shadow: {{ e.r0dot }}"></span><span>ext2</span>
+            </div>
+            <div role="radio" tabIndex="0" aria-checked="{{ e.r1 }}" onClick="{{ e.sr1 }}" style="display: flex; align-items: center; gap: 11px; cursor: pointer; font-size: 15px; height: 40px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 50%; border: 1px solid #b7b7ba; box-shadow: {{ e.r1dot }}"></span><span>FAT32</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 4px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Switch</div>
+            <div role="switch" tabIndex="0" aria-checked="{{ e.sw }}" onClick="{{ e.tsw }}" style="display: flex; align-items: center; gap: 11px; cursor: pointer; font-size: 15px; height: 40px">
+              <span style="position: relative; width: 48px; height: 26px; flex: none; border-radius: 13px; border: 1px solid transparent; background: {{ e.swbg }}; transition: background 120ms linear">
+                <span style="position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: {{ e.swknob }}; box-shadow: 0 1px 2px rgba(43,43,45,0.35); transition: transform 120ms linear; transform: {{ e.swx }}"></span>
+              </span>
+              <span>SMP</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #7a7a7d">{{ e.swtxt }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 20px; flex-wrap: wrap">
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 260px">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Csatolási pont</label>
+            <input value="/mnt/data" style="height: 40px; padding: 0 12px; border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; color: #1d1f20; font-family: 'IBM Plex Mono', monospace; font-size: 14px; caret-color: #5980a6" style-focus="border-color: #5980a6; outline: 2px solid rgba(89,128,166,0.35); outline-offset: 0">
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 220px; position: relative">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Ütemező</label>
+            <button type="button" onClick="{{ e.tdd }}" style="height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; color: #1d1f20; font: inherit; font-size: 15px; cursor: pointer" style-hover="background: #e7e7ea"><span>{{ e.ddval }}</span><span style="font-size: 10px; color: #5980a6">▼</span></button>
+            <sc-if value="{{ e.dd }}" hint-placeholder-val="{{ true }}">
+              <div style="position: absolute; top: 70px; left: 0; right: 0; z-index: 6; background: #ffffff; border: 1px solid #d4d4d7; border-radius: 4px; box-shadow: 0 12px 32px rgba(43,43,45,0.22); padding: 6px">
+                <div onClick="{{ e.dd0 }}" style="height: 36px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 15px; cursor: pointer" style-hover="background: #eef6ff">round-robin</div>
+                <div onClick="{{ e.dd1 }}" style="height: 36px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 15px; cursor: pointer" style-hover="background: #eef6ff">CFS</div>
+                <div onClick="{{ e.dd2 }}" style="height: 36px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 15px; cursor: pointer" style-hover="background: #eef6ff">prioritásos</div>
+              </div>
+            </sc-if>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-end">
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 260px">
+            <div style="display: flex; justify-content: space-between; font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60"><span>Csúszka</span><span style="font-family: 'IBM Plex Mono', monospace; letter-spacing: 0; color: #416180">{{ e.sl }}%</span></div>
+            <div tabIndex="0" onPointerDown="{{ e.onsl }}" onKeyDown="{{ e.slkey }}" style="position: relative; height: 40px; display: flex; align-items: center; cursor: pointer">
+              <div style="position: absolute; left: 0; right: 0; height: 6px; border-radius: 3px; background: #e7e7ea; border: 1px solid #d4d4d7"></div>
+              <div style="position: absolute; left: 0; height: 6px; border-radius: 3px; background: #5980a6; width: {{ e.slpct }}"></div>
+              <div style="position: absolute; width: 22px; height: 22px; border-radius: 50%; background: #ffffff; border: 1px solid #d4d4d7; box-shadow: 0 1px 3px rgba(43,43,45,0.28); margin-left: -11px; left: {{ e.slpct }}"></div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 8px; width: 200px">
+            <div style="display: flex; justify-content: space-between; font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60"><span>Folyamat</span><span style="font-family: 'IBM Plex Mono', monospace; letter-spacing: 0; color: #416180">64%</span></div>
+            <div style="height: 8px; border-radius: 4px; background: #e7e7ea; border: 1px solid #d4d4d7; overflow: hidden"><div style="height: 100%; width: 64%; background: #5980a6"></div></div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px; height: 40px">
+            <span style="width: 20px; height: 20px; border-radius: 50%; border: 2px solid #d4d4d7; border-top-color: #5980a6; animation: spin 850ms linear infinite; display: block"></span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #5d5d60">fsck…</span>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 10px">
+          <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Tabok · lista · scrollbar</div>
+          <div style="display: flex; gap: 4px; padding: 4px; background: #e7e7ea; border: 1px solid #d4d4d7; border-radius: 4px; align-self: flex-start">
+            <button type="button" onClick="{{ e.st0 }}" style="height: 32px; padding: 0 16px; border: none; border-radius: 4px; font: inherit; font-size: 14px; cursor: pointer; background: {{ e.tb0 }}; color: {{ e.tc0 }}">Folyamatok</button>
+            <button type="button" onClick="{{ e.st1 }}" style="height: 32px; padding: 0 16px; border: none; border-radius: 4px; font: inherit; font-size: 14px; cursor: pointer; background: {{ e.tb1 }}; color: {{ e.tc1c }}">Eszközök</button>
+            <button type="button" onClick="{{ e.st2 }}" style="height: 32px; padding: 0 16px; border: none; border-radius: 4px; font: inherit; font-size: 14px; cursor: pointer; background: {{ e.tb2 }}; color: {{ e.tc2c }}">Napló</button>
+          </div>
+          <div style="display: flex; border: 1px solid #d4d4d7; border-radius: 4px; overflow: hidden; background: #ffffff">
+            <div onWheel="{{ e.onwheel }}" style="flex: 1; height: 160px; overflow: hidden; position: relative">
+              <div style="position: absolute; inset: 0; transform: {{ e.scy }}">
+                <sc-for list="{{ rows }}" as="row" hint-placeholder-count="4">
+                  <div style="display: grid; grid-template-columns: 50px 1fr 90px 70px; align-items: center; gap: 10px; height: 40px; padding: 0 14px; border-bottom: 1px solid #e7e7ea; font-size: 14px" style-hover="background: #eef6ff">
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #7a7a7d">{{ row.pid }}</span>
+                    <span>{{ row.name }}</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #416180">{{ row.mem }}</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #7a7a7d">{{ row.st }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+            <div onPointerDown="{{ e.ontrack }}" style="width: 12px; flex: none; background: #f5f5f8; position: relative; cursor: pointer">
+              <div style="position: absolute; left: 2px; right: 2px; border-radius: 4px; background: #b7b7ba; height: {{ e.thh }}; top: {{ e.thtop }}"></div>
+            </div>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start">
+          <div style="display: flex; flex-direction: column; gap: 10px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Dialógus</div>
+            <div style="width: 320px; padding: 20px; background: #ffffff; border: 1px solid #d4d4d7; border-radius: 4px; box-shadow: 0 12px 32px rgba(43,43,45,0.22); display: flex; flex-direction: column; gap: 12px">
+              <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 21px; letter-spacing: 0.02em">Partíció formázása</div>
+              <div style="font-size: 14px; line-height: 1.45; color: #424244">A <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px">/dev/sda2</span> minden adata törlődik. A művelet nem visszavonható.</div>
+              <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px">
+                <button type="button" style="height: 36px; padding: 0 16px; border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; font: inherit; font-size: 14px; cursor: pointer">Mégse</button>
+                <button type="button" style="height: 36px; padding: 0 16px; border: 1px solid #5980a6; border-radius: 4px; background: #5980a6; color: #ffffff; font: inherit; font-size: 14px; font-weight: 500; cursor: pointer">Formázás</button>
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 10px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Értesítés</div>
+            <div style="width: 280px; background: #ffffff; border: 1px solid #d4d4d7; border-left: 3px solid #5980a6; border-radius: 4px; box-shadow: 0 3px 10px rgba(43,43,45,0.16); padding: 14px; display: flex; flex-direction: column; gap: 3px">
+              <div style="font-size: 15px; font-weight: 500">Driver betöltve</div>
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #5d5d60">e1000e · eth0 up</div>
+            </div>
+          </div>
+        </div>
+
+        <sc-if value="{{ showSpecs }}" hint-placeholder-val="{{ true }}">
+          <div style="border-top: 1px solid #e7e7ea; padding-top: 10px; font-family: 'IBM Plex Mono', monospace; font-size: 11px; line-height: 1.7; color: #5d5d60">
+            surface #f5f5f8 · sunken/raised #ffffff · line #d4d4d7 · accent #5980a6 · text #1d1f20
+          </div>
+        </sc-if>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<section style="display: flex; flex-direction: column; gap: 32px; padding: 48px; background: #e4e4e7">
+  <header style="display: flex; flex-direction: column; gap: 8px; max-width: 900px">
+    <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #5d5d60">Turn 1 · Widget style directions</div>
+    <h1 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 44px; line-height: 1; letter-spacing: -0.01em; color: #1d1f20">OS widget nyelv — három irány</h1>
+    <p style="margin: 0; font-size: 15px; line-height: 1.5; color: #424244; text-wrap: pretty">Ugyanaz a komponenskör mindhárom irányban: gombok, választók, bevitel, csúszka, scrollbar, tabok, lista, ablakkeret, menü, dialógus, folyamat. Minden vezérlő kattintható. Válassz egyet (<a href="#1a">1a</a> / <a href="#1b">1b</a> / <a href="#1c">1c</a>), abból építem a teljes katalógust és az élő demó képernyőt.</p>
+  </header>
+
+  <div style="display: flex; flex-wrap: wrap; gap: 40px; align-items: flex-start">
+
+    <!-- ============ 1a BLUEPRINT ============ -->
+    <div id="1a" style="display: flex; flex-direction: column; gap: 14px; width: 720px">
+      <div style="display: flex; align-items: baseline; gap: 12px">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 3px 8px; background: #1d1f20; color: #f2f2f3">1a</span>
+        <h2 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 26px; letter-spacing: 0.02em; color: #1d1f20">BLUEPRINT</h2>
+        <span style="font-size: 13px; color: #5d5d60">Vonalrajz — hajszálvékony keret, szögletes, jelölőkeresztek. Egér + billentyűzet.</span>
+      </div>
+
+      <div class="blueprint" style="background: #f2f2f3; color: #1d1f20; padding: 28px; display: flex; flex-direction: column; gap: 26px; font-family: 'Barlow', sans-serif">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+
+        <!-- window + menubar -->
+        <div style="display: flex; flex-direction: column; gap: 9px">
+          <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a7a7d">Ablakkeret · menüsáv</div>
+          <div style="border: 1px solid rgba(29,31,32,0.16); background: #f2f2f3">
+            <div style="display: flex; align-items: center; justify-content: space-between; height: 30px; padding: 0 8px; border-bottom: 1px solid rgba(29,31,32,0.16)">
+              <span style="font-family: 'Barlow Condensed', sans-serif; font-size: 13px; letter-spacing: 0.1em; text-transform: uppercase">Fájlkezelő — /usr/src</span>
+              <div style="display: flex; gap: 6px">
+                <button type="button" style="width: 18px; height: 18px; padding: 0; border: 1px solid rgba(29,31,32,0.3); background: transparent; cursor: pointer; color: #1d1f20; font-size: 11px; line-height: 1" style-hover="background: rgba(29,31,32,0.08)">–</button>
+                <button type="button" style="width: 18px; height: 18px; padding: 0; border: 1px solid rgba(29,31,32,0.3); background: transparent; cursor: pointer; color: #1d1f20; font-size: 11px; line-height: 1" style-hover="background: rgba(29,31,32,0.08)">□</button>
+                <button type="button" style="width: 18px; height: 18px; padding: 0; border: 1px solid #5980a6; background: transparent; cursor: pointer; color: #416180; font-size: 11px; line-height: 1" style-hover="background: #5980a6; color: #f2f2f3">×</button>
+              </div>
+            </div>
+            <div style="display: flex; align-items: stretch; height: 26px; border-bottom: 1px solid rgba(29,31,32,0.16); position: relative">
+              <button type="button" onClick="{{ a.tmenu }}" style="padding: 0 10px; border: none; background: transparent; font: inherit; font-size: 13px; cursor: pointer; color: #1d1f20; border-bottom: 2px solid transparent" style-hover="background: rgba(89,128,166,0.12)">Fájl</button>
+              <button type="button" style="padding: 0 10px; border: none; background: transparent; font: inherit; font-size: 13px; cursor: pointer; color: #1d1f20" style-hover="background: rgba(89,128,166,0.12)">Szerkesztés</button>
+              <button type="button" style="padding: 0 10px; border: none; background: transparent; font: inherit; font-size: 13px; cursor: pointer; color: #1d1f20" style-hover="background: rgba(89,128,166,0.12)">Nézet</button>
+              <sc-if value="{{ a.menu }}" hint-placeholder-val="{{ true }}">
+                <div style="position: absolute; top: 26px; left: 0; width: 210px; z-index: 5; background: #f2f2f3; border: 1px solid rgba(29,31,32,0.3); box-shadow: 4px 4px 0 rgba(29,31,32,0.1); padding: 3px 0">
+                  <div style="display: flex; justify-content: space-between; padding: 5px 10px; font-size: 13px" style-hover="background: #5980a6; color: #f2f2f3"><span>Új ablak</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; opacity: 0.6">Ctrl+N</span></div>
+                  <div style="display: flex; justify-content: space-between; padding: 5px 10px; font-size: 13px" style-hover="background: #5980a6; color: #f2f2f3"><span>Terminál itt</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; opacity: 0.6">Ctrl+T</span></div>
+                  <div style="height: 1px; background: rgba(29,31,32,0.16); margin: 3px 0"></div>
+                  <div style="display: flex; justify-content: space-between; padding: 5px 10px; font-size: 13px; opacity: 0.45"><span>Csatolás…</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px">Ctrl+M</span></div>
+                </div>
+              </sc-if>
+            </div>
+            <div style="height: 34px; background: repeating-linear-gradient(45deg, transparent 0 6px, rgba(29,31,32,0.05) 6px 7px)"></div>
+          </div>
+        </div>
+
+        <!-- buttons -->
+        <div style="display: flex; flex-direction: column; gap: 9px">
+          <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a7a7d">Gombok</div>
+          <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center">
+            <button type="button" class="btn btn-primary blueprint" style="height: 32px; padding: 0 16px; font-size: 14px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>Telepítés</button>
+            <button type="button" class="btn btn-secondary" style="height: 32px; padding: 0 16px; font-size: 14px">Mégse</button>
+            <button type="button" class="btn btn-ghost" style="height: 32px; padding: 0 8px; font-size: 14px">Részletek</button>
+            <button type="button" class="btn btn-secondary" style="width: 32px; height: 32px; padding: 0; font-size: 15px">+</button>
+            <button type="button" class="btn btn-secondary" disabled="{{ true }}" style="height: 32px; padding: 0 16px; font-size: 14px">Nem elérhető</button>
+          </div>
+        </div>
+
+        <!-- choices -->
+        <div style="display: flex; gap: 40px; flex-wrap: wrap">
+          <div style="display: flex; flex-direction: column; gap: 9px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a7a7d">Checkbox</div>
+            <div role="checkbox" tabIndex="0" aria-checked="{{ a.c1 }}" onClick="{{ a.tc1 }}" onKeyDown="{{ a.kc1 }}" style="display: flex; align-items: center; gap: 9px; cursor: pointer; font-size: 14px">
+              <span style="width: 17px; height: 17px; flex: none; display: grid; place-items: center; border: 1px solid #5980a6; font-size: 12px; line-height: 1; color: #f2f2f3; background: {{ a.c1bg }}">
+                <sc-if value="{{ a.c1 }}" hint-placeholder-val="{{ true }}"><span>✓</span></sc-if>
+              </span>
+              <span>Kernel modulok betöltése</span>
+            </div>
+            <div role="checkbox" tabIndex="0" aria-checked="{{ a.c2 }}" onClick="{{ a.tc2 }}" onKeyDown="{{ a.kc2 }}" style="display: flex; align-items: center; gap: 9px; cursor: pointer; font-size: 14px">
+              <span style="width: 17px; height: 17px; flex: none; display: grid; place-items: center; border: 1px solid #5980a6; font-size: 12px; line-height: 1; color: #f2f2f3; background: {{ a.c2bg }}">
+                <sc-if value="{{ a.c2 }}" hint-placeholder-val="{{ true }}"><span>✓</span></sc-if>
+              </span>
+              <span>Hibakeresési naplózás</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a7a7d">Radio</div>
+            <div role="radio" tabIndex="0" aria-checked="{{ a.r0 }}" onClick="{{ a.sr0 }}" style="display: flex; align-items: center; gap: 9px; cursor: pointer; font-size: 14px">
+              <span style="width: 15px; height: 15px; flex: none; border-radius: 50%; border: 1.5px solid #5980a6; box-shadow: {{ a.r0dot }}"></span><span>ext2</span>
+            </div>
+            <div role="radio" tabIndex="0" aria-checked="{{ a.r1 }}" onClick="{{ a.sr1 }}" style="display: flex; align-items: center; gap: 9px; cursor: pointer; font-size: 14px">
+              <span style="width: 15px; height: 15px; flex: none; border-radius: 50%; border: 1.5px solid #5980a6; box-shadow: {{ a.r1dot }}"></span><span>FAT32</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a7a7d">Switch</div>
+            <div role="switch" tabIndex="0" aria-checked="{{ a.sw }}" onClick="{{ a.tsw }}" style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 14px">
+              <span style="position: relative; width: 40px; height: 20px; flex: none; border: 1px solid #5980a6; background: {{ a.swbg }}">
+                <span style="position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; background: {{ a.swknob }}; transition: transform 90ms linear; transform: {{ a.swx }}"></span>
+              </span>
+              <span>SMP</span>
+            </div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #7a7a7d">state: {{ a.swtxt }}</div>
+          </div>
+        </div>
+
+        <!-- input + select -->
+        <div style="display: flex; gap: 20px; flex-wrap: wrap">
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 260px">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a7a7d">Csatolási pont</label>
+            <input class="input" value="/mnt/data" style="height: 32px; font-size: 14px; font-family: 'IBM Plex Mono', monospace">
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 220px; position: relative">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a7a7d">Ütemező</label>
+            <button type="button" onClick="{{ a.tdd }}" style="height: 32px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border: 1px solid rgba(29,31,32,0.16); background: transparent; font: inherit; font-size: 14px; cursor: pointer; color: #1d1f20" style-hover="border-color: #5980a6"><span>{{ a.ddval }}</span><span style="font-size: 10px; color: #5980a6">▼</span></button>
+            <sc-if value="{{ a.dd }}" hint-placeholder-val="{{ true }}">
+              <div style="position: absolute; top: 58px; left: 0; right: 0; z-index: 6; background: #f2f2f3; border: 1px solid #5980a6; box-shadow: 4px 4px 0 rgba(29,31,32,0.1)">
+                <div onClick="{{ a.dd0 }}" style="padding: 6px 10px; font-size: 14px; cursor: pointer" style-hover="background: #5980a6; color: #f2f2f3">round-robin</div>
+                <div onClick="{{ a.dd1 }}" style="padding: 6px 10px; font-size: 14px; cursor: pointer" style-hover="background: #5980a6; color: #f2f2f3">CFS</div>
+                <div onClick="{{ a.dd2 }}" style="padding: 6px 10px; font-size: 14px; cursor: pointer" style-hover="background: #5980a6; color: #f2f2f3">prioritásos</div>
+              </div>
+            </sc-if>
+          </div>
+        </div>
+
+        <!-- slider + progress -->
+        <div style="display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-end">
+          <div style="display: flex; flex-direction: column; gap: 9px; width: 260px">
+            <div style="display: flex; justify-content: space-between; font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a7a7d"><span>Csúszka</span><span style="font-family: 'IBM Plex Mono', monospace; letter-spacing: 0; color: #416180">{{ a.sl }}%</span></div>
+            <div tabIndex="0" onPointerDown="{{ a.onsl }}" onKeyDown="{{ a.slkey }}" style="position: relative; height: 20px; display: flex; align-items: center; cursor: pointer">
+              <div style="position: absolute; left: 0; right: 0; height: 1px; background: rgba(29,31,32,0.3)"></div>
+              <div style="position: absolute; left: 0; height: 3px; background: #5980a6; width: {{ a.slpct }}"></div>
+              <div style="position: absolute; width: 11px; height: 17px; border: 1px solid #5980a6; background: #f2f2f3; margin-left: -5px; left: {{ a.slpct }}"></div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px; width: 200px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a7a7d">Folyamat</div>
+            <div style="height: 8px; border: 1px solid rgba(29,31,32,0.3)"><div style="height: 100%; width: 64%; background: repeating-linear-gradient(90deg, #5980a6 0 4px, transparent 4px 8px)"></div></div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px">
+            <span style="width: 18px; height: 18px; border: 2px solid rgba(29,31,32,0.2); border-top-color: #5980a6; animation: spin 900ms linear infinite; display: block"></span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #7a7a7d">fsck…</span>
+          </div>
+        </div>
+
+        <!-- tabs + list + scrollbar -->
+        <div style="display: flex; flex-direction: column; gap: 9px">
+          <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a7a7d">Tabok · lista · scrollbar</div>
+          <div style="display: flex; gap: 0; border-bottom: 1px solid rgba(29,31,32,0.16)">
+            <button type="button" onClick="{{ a.st0 }}" style="padding: 6px 14px; border: none; background: transparent; font: inherit; font-size: 14px; cursor: pointer; margin-bottom: -1px; border-bottom: 2px solid {{ a.tb0 }}; color: {{ a.tc0 }}">Folyamatok</button>
+            <button type="button" onClick="{{ a.st1 }}" style="padding: 6px 14px; border: none; background: transparent; font: inherit; font-size: 14px; cursor: pointer; margin-bottom: -1px; border-bottom: 2px solid {{ a.tb1 }}; color: {{ a.tc1c }}">Eszközök</button>
+            <button type="button" onClick="{{ a.st2 }}" style="padding: 6px 14px; border: none; background: transparent; font: inherit; font-size: 14px; cursor: pointer; margin-bottom: -1px; border-bottom: 2px solid {{ a.tb2 }}; color: {{ a.tc2c }}">Napló</button>
+          </div>
+          <div style="display: flex; border: 1px solid rgba(29,31,32,0.16); border-top: none">
+            <div onWheel="{{ a.onwheel }}" style="flex: 1; height: 136px; overflow: hidden; position: relative">
+              <div style="position: absolute; inset: 0; transform: {{ a.scy }}">
+                <sc-for list="{{ rows }}" as="row" hint-placeholder-count="4">
+                  <div style="display: grid; grid-template-columns: 44px 1fr 90px 70px; align-items: center; gap: 10px; height: 34px; padding: 0 10px; border-bottom: 1px solid rgba(29,31,32,0.08); font-size: 13px" style-hover="background: rgba(89,128,166,0.1)">
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #7a7a7d">{{ row.pid }}</span>
+                    <span>{{ row.name }}</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #416180">{{ row.mem }}</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #7a7a7d">{{ row.st }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+            <div onPointerDown="{{ a.ontrack }}" style="width: 12px; flex: none; border-left: 1px solid rgba(29,31,32,0.16); background: repeating-linear-gradient(0deg, transparent 0 3px, rgba(29,31,32,0.06) 3px 4px); position: relative; cursor: pointer">
+              <div style="position: absolute; left: 1px; right: 1px; background: #5980a6; height: {{ a.thh }}; top: {{ a.thtop }}"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- dialog + toast -->
+        <div style="display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start">
+          <div style="display: flex; flex-direction: column; gap: 9px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a7a7d">Dialógus</div>
+            <div class="blueprint" style="width: 300px; padding: 16px; background: #f2f2f3; box-shadow: 6px 6px 0 rgba(29,31,32,0.08); display: flex; flex-direction: column; gap: 10px">
+              <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+              <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 19px; letter-spacing: 0.02em">Partíció formázása</div>
+              <div style="font-size: 13px; line-height: 1.45; color: #424244">A /dev/sda2 minden adata törlődik. A művelet nem visszavonható.</div>
+              <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px">
+                <button type="button" class="btn btn-secondary" style="height: 30px; padding: 0 14px; font-size: 13px">Mégse</button>
+                <button type="button" class="btn btn-primary" style="height: 30px; padding: 0 14px; font-size: 13px">Formázás</button>
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a7a7d">Értesítés</div>
+            <div style="width: 280px; border: 1px solid #5980a6; border-left-width: 3px; background: #f2f2f3; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px">
+              <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 14px; letter-spacing: 0.08em; text-transform: uppercase">Driver betöltve</div>
+              <div style="font-size: 13px; color: #424244">e1000e · eth0 aktív</div>
+            </div>
+          </div>
+        </div>
+
+        <sc-if value="{{ showSpecs }}" hint-placeholder-val="{{ true }}">
+          <div style="border-top: 1px solid rgba(29,31,32,0.16); padding-top: 10px; font-family: 'IBM Plex Mono', monospace; font-size: 11px; line-height: 1.7; color: #5d5d60">
+            control-height 32 · border 1px · radius 0 · row 34 · scrollbar 12 · focus 2px accent outline
+          </div>
+        </sc-if>
+      </div>
+    </div>
+
+    <!-- ============ 1b CONSOLE ============ -->
+    <div id="1b" style="display: flex; flex-direction: column; gap: 14px; width: 720px">
+      <div style="display: flex; align-items: baseline; gap: 12px">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 3px 8px; background: #1d2d3d; color: #eef6ff">1b</span>
+        <h2 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 26px; letter-spacing: 0.02em; color: #1d1f20">CONSOLE</h2>
+        <span style="font-size: 13px; color: #5d5d60">Sötét, tömör felület — fejlesztői gépnek és ipari panelnek. Kitöltött vezérlők.</span>
+      </div>
+
+      <div style="background: #1d2d3d; color: #eef6ff; padding: 28px; display: flex; flex-direction: column; gap: 26px; border: 1px solid #2c455d; font-family: 'Barlow', sans-serif">
+
+        <div style="display: flex; flex-direction: column; gap: 9px">
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #94bce3">Ablakkeret · menüsáv</div>
+          <div style="border: 1px solid #416180; border-radius: 2px; background: #16232f">
+            <div style="display: flex; align-items: center; justify-content: space-between; height: 28px; padding: 0 8px; background: #2c455d; border-bottom: 1px solid #416180; border-radius: 1px 1px 0 0">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.08em; color: #eef6ff">fm — /usr/src</span>
+              <div style="display: flex; gap: 4px">
+                <button type="button" style="width: 16px; height: 16px; padding: 0; border: none; border-radius: 2px; background: #416180; color: #eef6ff; font-size: 10px; line-height: 1; cursor: pointer" style-hover="background: #597ea3">–</button>
+                <button type="button" style="width: 16px; height: 16px; padding: 0; border: none; border-radius: 2px; background: #416180; color: #eef6ff; font-size: 10px; line-height: 1; cursor: pointer" style-hover="background: #597ea3">□</button>
+                <button type="button" style="width: 16px; height: 16px; padding: 0; border: none; border-radius: 2px; background: #416180; color: #eef6ff; font-size: 10px; line-height: 1; cursor: pointer" style-hover="background: #94bce3; color: #16232f">×</button>
+              </div>
+            </div>
+            <div style="display: flex; height: 24px; background: #22374a; position: relative">
+              <button type="button" onClick="{{ b.tmenu }}" style="padding: 0 10px; border: none; background: transparent; font: inherit; font-size: 12px; color: #eef6ff; cursor: pointer" style-hover="background: #416180">Fájl</button>
+              <button type="button" style="padding: 0 10px; border: none; background: transparent; font: inherit; font-size: 12px; color: #eef6ff; cursor: pointer" style-hover="background: #416180">Szerkesztés</button>
+              <button type="button" style="padding: 0 10px; border: none; background: transparent; font: inherit; font-size: 12px; color: #eef6ff; cursor: pointer" style-hover="background: #416180">Nézet</button>
+              <sc-if value="{{ b.menu }}" hint-placeholder-val="{{ true }}">
+                <div style="position: absolute; top: 24px; left: 0; width: 210px; z-index: 5; background: #22374a; border: 1px solid #416180; border-radius: 2px; box-shadow: 0 8px 20px rgba(0,0,0,0.45); padding: 4px 0">
+                  <div style="display: flex; justify-content: space-between; padding: 5px 10px; font-size: 13px; color: #eef6ff" style-hover="background: #416180"><span>Új ablak</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #94bce3">Ctrl+N</span></div>
+                  <div style="display: flex; justify-content: space-between; padding: 5px 10px; font-size: 13px; color: #eef6ff" style-hover="background: #416180"><span>Terminál itt</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #94bce3">Ctrl+T</span></div>
+                  <div style="height: 1px; background: #416180; margin: 4px 0"></div>
+                  <div style="display: flex; justify-content: space-between; padding: 5px 10px; font-size: 13px; opacity: 0.45"><span>Csatolás…</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px">Ctrl+M</span></div>
+                </div>
+              </sc-if>
+            </div>
+            <div style="height: 34px; background: repeating-linear-gradient(45deg, transparent 0 6px, rgba(148,188,227,0.07) 6px 7px)"></div>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 9px">
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #94bce3">Gombok</div>
+          <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center">
+            <button type="button" style="height: 30px; padding: 0 16px; border: 1px solid #94bce3; border-radius: 2px; background: #94bce3; color: #16232f; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer" style-hover="background: #b5d9fd" style-active="background: #749dc4">Telepítés</button>
+            <button type="button" style="height: 30px; padding: 0 16px; border: 1px solid #416180; border-radius: 2px; background: #2c455d; color: #eef6ff; font: inherit; font-size: 13px; cursor: pointer" style-hover="background: #416180">Mégse</button>
+            <button type="button" style="height: 30px; padding: 0 8px; border: 1px solid transparent; border-radius: 2px; background: transparent; color: #94bce3; font: inherit; font-size: 13px; cursor: pointer" style-hover="background: rgba(148,188,227,0.14)">Részletek</button>
+            <button type="button" style="width: 30px; height: 30px; padding: 0; border: 1px solid #416180; border-radius: 2px; background: #2c455d; color: #eef6ff; font-size: 15px; cursor: pointer" style-hover="background: #416180">+</button>
+            <button type="button" disabled="{{ true }}" style="height: 30px; padding: 0 16px; border: 1px solid #416180; border-radius: 2px; background: #2c455d; color: #eef6ff; font: inherit; font-size: 13px; opacity: 0.45; cursor: not-allowed">Nem elérhető</button>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 40px; flex-wrap: wrap">
+          <div style="display: flex; flex-direction: column; gap: 9px">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #94bce3">Checkbox</div>
+            <div role="checkbox" tabIndex="0" aria-checked="{{ b.c1 }}" onClick="{{ b.tc1 }}" onKeyDown="{{ b.kc1 }}" style="display: flex; align-items: center; gap: 9px; cursor: pointer; font-size: 13px">
+              <span style="width: 16px; height: 16px; flex: none; border-radius: 2px; display: grid; place-items: center; border: 1px solid #416180; font-size: 11px; line-height: 1; color: #16232f; background: {{ b.c1bg }}">
+                <sc-if value="{{ b.c1 }}" hint-placeholder-val="{{ true }}"><span>✓</span></sc-if>
+              </span>
+              <span>Kernel modulok betöltése</span>
+            </div>
+            <div role="checkbox" tabIndex="0" aria-checked="{{ b.c2 }}" onClick="{{ b.tc2 }}" onKeyDown="{{ b.kc2 }}" style="display: flex; align-items: center; gap: 9px; cursor: pointer; font-size: 13px">
+              <span style="width: 16px; height: 16px; flex: none; border-radius: 2px; display: grid; place-items: center; border: 1px solid #416180; font-size: 11px; line-height: 1; color: #16232f; background: {{ b.c2bg }}">
+                <sc-if value="{{ b.c2 }}" hint-placeholder-val="{{ true }}"><span>✓</span></sc-if>
+              </span>
+              <span>Hibakeresési naplózás</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #94bce3">Radio</div>
+            <div role="radio" tabIndex="0" aria-checked="{{ b.r0 }}" onClick="{{ b.sr0 }}" style="display: flex; align-items: center; gap: 9px; cursor: pointer; font-size: 13px">
+              <span style="width: 14px; height: 14px; flex: none; border-radius: 50%; border: 1.5px solid #416180; box-shadow: {{ b.r0dot }}"></span><span>ext2</span>
+            </div>
+            <div role="radio" tabIndex="0" aria-checked="{{ b.r1 }}" onClick="{{ b.sr1 }}" style="display: flex; align-items: center; gap: 9px; cursor: pointer; font-size: 13px">
+              <span style="width: 14px; height: 14px; flex: none; border-radius: 50%; border: 1.5px solid #416180; box-shadow: {{ b.r1dot }}"></span><span>FAT32</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #94bce3">Switch</div>
+            <div role="switch" tabIndex="0" aria-checked="{{ b.sw }}" onClick="{{ b.tsw }}" style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 13px">
+              <span style="position: relative; width: 38px; height: 18px; flex: none; border-radius: 9px; border: 1px solid #416180; background: {{ b.swbg }}">
+                <span style="position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: {{ b.swknob }}; transition: transform 90ms linear; transform: {{ b.swx }}"></span>
+              </span>
+              <span>SMP</span>
+            </div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #94bce3">state: {{ b.swtxt }}</div>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 20px; flex-wrap: wrap">
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 260px">
+            <label style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #94bce3">Csatolási pont</label>
+            <input value="/mnt/data" style="height: 30px; padding: 0 9px; border: 1px solid #416180; border-radius: 2px; background: #16232f; color: #eef6ff; font-family: 'IBM Plex Mono', monospace; font-size: 13px; caret-color: #94bce3" style-focus="border-color: #94bce3; outline: none; box-shadow: 0 0 0 2px rgba(148,188,227,0.25)">
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 220px; position: relative">
+            <label style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #94bce3">Ütemező</label>
+            <button type="button" onClick="{{ b.tdd }}" style="height: 30px; display: flex; align-items: center; justify-content: space-between; padding: 0 9px; border: 1px solid #416180; border-radius: 2px; background: #16232f; color: #eef6ff; font: inherit; font-size: 13px; cursor: pointer" style-hover="border-color: #94bce3"><span>{{ b.ddval }}</span><span style="font-size: 9px; color: #94bce3">▼</span></button>
+            <sc-if value="{{ b.dd }}" hint-placeholder-val="{{ true }}">
+              <div style="position: absolute; top: 54px; left: 0; right: 0; z-index: 6; background: #22374a; border: 1px solid #416180; border-radius: 2px; box-shadow: 0 8px 20px rgba(0,0,0,0.45)">
+                <div onClick="{{ b.dd0 }}" style="padding: 6px 9px; font-size: 13px; cursor: pointer" style-hover="background: #416180">round-robin</div>
+                <div onClick="{{ b.dd1 }}" style="padding: 6px 9px; font-size: 13px; cursor: pointer" style-hover="background: #416180">CFS</div>
+                <div onClick="{{ b.dd2 }}" style="padding: 6px 9px; font-size: 13px; cursor: pointer" style-hover="background: #416180">prioritásos</div>
+              </div>
+            </sc-if>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-end">
+          <div style="display: flex; flex-direction: column; gap: 9px; width: 260px">
+            <div style="display: flex; justify-content: space-between; font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #94bce3"><span>Csúszka</span><span style="letter-spacing: 0; color: #eef6ff">{{ b.sl }}%</span></div>
+            <div tabIndex="0" onPointerDown="{{ b.onsl }}" onKeyDown="{{ b.slkey }}" style="position: relative; height: 18px; display: flex; align-items: center; cursor: pointer">
+              <div style="position: absolute; left: 0; right: 0; height: 4px; border-radius: 2px; background: #16232f; border: 1px solid #416180"></div>
+              <div style="position: absolute; left: 0; height: 4px; border-radius: 2px; background: #94bce3; width: {{ b.slpct }}"></div>
+              <div style="position: absolute; width: 14px; height: 14px; border-radius: 3px; background: #eef6ff; border: 1px solid #416180; margin-left: -7px; left: {{ b.slpct }}"></div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px; width: 200px">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #94bce3">Folyamat</div>
+            <div style="height: 6px; border-radius: 3px; background: #16232f; border: 1px solid #416180; overflow: hidden"><div style="height: 100%; width: 64%; background: #94bce3"></div></div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px">
+            <span style="width: 16px; height: 16px; border-radius: 50%; border: 2px solid #416180; border-top-color: #94bce3; animation: spin 800ms linear infinite; display: block"></span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #94bce3">fsck…</span>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 9px">
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #94bce3">Tabok · lista · scrollbar</div>
+          <div style="display: flex; gap: 4px">
+            <button type="button" onClick="{{ b.st0 }}" style="padding: 5px 13px; border: 1px solid #416180; border-radius: 2px; font: inherit; font-size: 13px; cursor: pointer; background: {{ b.tb0 }}; color: {{ b.tc0 }}">Folyamatok</button>
+            <button type="button" onClick="{{ b.st1 }}" style="padding: 5px 13px; border: 1px solid #416180; border-radius: 2px; font: inherit; font-size: 13px; cursor: pointer; background: {{ b.tb1 }}; color: {{ b.tc1c }}">Eszközök</button>
+            <button type="button" onClick="{{ b.st2 }}" style="padding: 5px 13px; border: 1px solid #416180; border-radius: 2px; font: inherit; font-size: 13px; cursor: pointer; background: {{ b.tb2 }}; color: {{ b.tc2c }}">Napló</button>
+          </div>
+          <div style="display: flex; border: 1px solid #416180; border-radius: 2px; overflow: hidden; background: #16232f">
+            <div onWheel="{{ b.onwheel }}" style="flex: 1; height: 136px; overflow: hidden; position: relative">
+              <div style="position: absolute; inset: 0; transform: {{ b.scy }}">
+                <sc-for list="{{ rows }}" as="row" hint-placeholder-count="4">
+                  <div style="display: grid; grid-template-columns: 44px 1fr 90px 70px; align-items: center; gap: 10px; height: 34px; padding: 0 10px; border-bottom: 1px solid rgba(148,188,227,0.1); font-size: 13px" style-hover="background: #22374a">
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #94bce3">{{ row.pid }}</span>
+                    <span>{{ row.name }}</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #b5d9fd">{{ row.mem }}</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #94bce3">{{ row.st }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+            <div onPointerDown="{{ b.ontrack }}" style="width: 10px; flex: none; background: #22374a; position: relative; cursor: pointer">
+              <div style="position: absolute; left: 2px; right: 2px; border-radius: 3px; background: #597ea3; height: {{ b.thh }}; top: {{ b.thtop }}"></div>
+            </div>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start">
+          <div style="display: flex; flex-direction: column; gap: 9px">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #94bce3">Dialógus</div>
+            <div style="width: 300px; padding: 16px; background: #22374a; border: 1px solid #416180; border-radius: 2px; box-shadow: 0 14px 34px rgba(0,0,0,0.5); display: flex; flex-direction: column; gap: 10px">
+              <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 19px; letter-spacing: 0.02em">Partíció formázása</div>
+              <div style="font-size: 13px; line-height: 1.45; color: #b5d9fd">A /dev/sda2 minden adata törlődik. A művelet nem visszavonható.</div>
+              <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px">
+                <button type="button" style="height: 28px; padding: 0 13px; border: 1px solid #416180; border-radius: 2px; background: #2c455d; color: #eef6ff; font: inherit; font-size: 13px; cursor: pointer">Mégse</button>
+                <button type="button" style="height: 28px; padding: 0 13px; border: 1px solid #94bce3; border-radius: 2px; background: #94bce3; color: #16232f; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer">Formázás</button>
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 9px">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #94bce3">Értesítés</div>
+            <div style="width: 280px; background: #22374a; border: 1px solid #416180; border-left: 3px solid #94bce3; border-radius: 2px; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px">
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #94bce3">Driver betöltve</div>
+              <div style="font-size: 13px; color: #eef6ff">e1000e · eth0 aktív</div>
+            </div>
+          </div>
+        </div>
+
+        <sc-if value="{{ showSpecs }}" hint-placeholder-val="{{ true }}">
+          <div style="border-top: 1px solid #416180; padding-top: 10px; font-family: 'IBM Plex Mono', monospace; font-size: 11px; line-height: 1.7; color: #94bce3">
+            control-height 30 · border 1px · radius 2 · row 34 · scrollbar 10 · focus 2px glow
+          </div>
+        </sc-if>
+      </div>
+    </div>
+
+    <!-- ============ 1c PLATE ============ -->
+    <div id="1c" style="display: flex; flex-direction: column; gap: 14px; width: 720px">
+      <div style="display: flex; align-items: baseline; gap: 12px">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 3px 8px; background: #5980a6; color: #ffffff">1c</span>
+        <h2 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 26px; letter-spacing: 0.02em; color: #1d1f20">PLATE</h2>
+        <span style="font-size: 13px; color: #5d5d60">44px találati felületek, lágy lemezek — tablethez és kioszkhoz, ujjal is.</span>
+      </div>
+
+      <div style="background: #f5f5f8; color: #1d1f20; padding: 28px; display: flex; flex-direction: column; gap: 26px; border: 1px solid #d4d4d7; border-radius: 4px; font-family: 'Barlow', sans-serif">
+
+        <div style="display: flex; flex-direction: column; gap: 10px">
+          <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Ablakkeret · menüsáv</div>
+          <div style="border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; box-shadow: 0 1px 2px rgba(43,43,45,0.14)">
+            <div style="display: flex; align-items: center; justify-content: space-between; height: 40px; padding: 0 10px; background: #e7e7ea; border-radius: 3px 3px 0 0">
+              <span style="font-size: 14px; font-weight: 500">Fájlkezelő — /usr/src</span>
+              <div style="display: flex; gap: 6px">
+                <button type="button" style="width: 26px; height: 26px; padding: 0; border: none; border-radius: 4px; background: #d4d4d7; color: #424244; font-size: 12px; cursor: pointer" style-hover="background: #b7b7ba">–</button>
+                <button type="button" style="width: 26px; height: 26px; padding: 0; border: none; border-radius: 4px; background: #d4d4d7; color: #424244; font-size: 12px; cursor: pointer" style-hover="background: #b7b7ba">□</button>
+                <button type="button" style="width: 26px; height: 26px; padding: 0; border: none; border-radius: 4px; background: #d4d4d7; color: #424244; font-size: 12px; cursor: pointer" style-hover="background: #5980a6; color: #ffffff">×</button>
+              </div>
+            </div>
+            <div style="display: flex; height: 36px; align-items: center; padding: 0 4px; border-top: 1px solid #e7e7ea; position: relative">
+              <button type="button" onClick="{{ c.tmenu }}" style="height: 28px; padding: 0 12px; border: none; border-radius: 4px; background: transparent; font: inherit; font-size: 14px; cursor: pointer; color: #1d1f20" style-hover="background: #e7e7ea">Fájl</button>
+              <button type="button" style="height: 28px; padding: 0 12px; border: none; border-radius: 4px; background: transparent; font: inherit; font-size: 14px; cursor: pointer; color: #1d1f20" style-hover="background: #e7e7ea">Szerkesztés</button>
+              <button type="button" style="height: 28px; padding: 0 12px; border: none; border-radius: 4px; background: transparent; font: inherit; font-size: 14px; cursor: pointer; color: #1d1f20" style-hover="background: #e7e7ea">Nézet</button>
+              <sc-if value="{{ c.menu }}" hint-placeholder-val="{{ true }}">
+                <div style="position: absolute; top: 38px; left: 4px; width: 230px; z-index: 5; background: #ffffff; border: 1px solid #d4d4d7; border-radius: 4px; box-shadow: 0 12px 32px rgba(43,43,45,0.22); padding: 6px">
+                  <div style="display: flex; justify-content: space-between; align-items: center; height: 40px; padding: 0 10px; border-radius: 4px; font-size: 14px; cursor: pointer" style-hover="background: #eef6ff"><span>Új ablak</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #7a7a7d">Ctrl+N</span></div>
+                  <div style="display: flex; justify-content: space-between; align-items: center; height: 40px; padding: 0 10px; border-radius: 4px; font-size: 14px; cursor: pointer" style-hover="background: #eef6ff"><span>Terminál itt</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #7a7a7d">Ctrl+T</span></div>
+                  <div style="height: 1px; background: #e7e7ea; margin: 4px 6px"></div>
+                  <div style="display: flex; justify-content: space-between; align-items: center; height: 40px; padding: 0 10px; font-size: 14px; opacity: 0.45"><span>Csatolás…</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px">Ctrl+M</span></div>
+                </div>
+              </sc-if>
+            </div>
+            <div style="height: 34px; background: repeating-linear-gradient(45deg, transparent 0 6px, rgba(29,31,32,0.04) 6px 7px)"></div>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 10px">
+          <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Gombok</div>
+          <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center">
+            <button type="button" style="height: 44px; padding: 0 20px; border: none; border-radius: 4px; background: #5980a6; color: #ffffff; font: inherit; font-size: 15px; font-weight: 500; cursor: pointer; box-shadow: 0 1px 2px rgba(43,43,45,0.18)" style-hover="background: #597ea3" style-active="background: #416180">Telepítés</button>
+            <button type="button" style="height: 44px; padding: 0 20px; border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; color: #1d1f20; font: inherit; font-size: 15px; cursor: pointer" style-hover="background: #e7e7ea">Mégse</button>
+            <button type="button" style="height: 44px; padding: 0 12px; border: none; border-radius: 4px; background: transparent; color: #416180; font: inherit; font-size: 15px; cursor: pointer" style-hover="background: #eef6ff">Részletek</button>
+            <button type="button" style="width: 44px; height: 44px; padding: 0; border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; color: #1d1f20; font-size: 18px; cursor: pointer" style-hover="background: #e7e7ea">+</button>
+            <button type="button" disabled="{{ true }}" style="height: 44px; padding: 0 20px; border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; color: #1d1f20; font: inherit; font-size: 15px; opacity: 0.45; cursor: not-allowed">Nem elérhető</button>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 40px; flex-wrap: wrap">
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Checkbox</div>
+            <div role="checkbox" tabIndex="0" aria-checked="{{ c.c1 }}" onClick="{{ c.tc1 }}" onKeyDown="{{ c.kc1 }}" style="display: flex; align-items: center; gap: 12px; cursor: pointer; font-size: 15px; height: 44px">
+              <span style="width: 22px; height: 22px; flex: none; border-radius: 4px; display: grid; place-items: center; border: 1.5px solid #5980a6; font-size: 14px; line-height: 1; color: #ffffff; background: {{ c.c1bg }}">
+                <sc-if value="{{ c.c1 }}" hint-placeholder-val="{{ true }}"><span>✓</span></sc-if>
+              </span>
+              <span>Kernel modulok betöltése</span>
+            </div>
+            <div role="checkbox" tabIndex="0" aria-checked="{{ c.c2 }}" onClick="{{ c.tc2 }}" onKeyDown="{{ c.kc2 }}" style="display: flex; align-items: center; gap: 12px; cursor: pointer; font-size: 15px; height: 44px">
+              <span style="width: 22px; height: 22px; flex: none; border-radius: 4px; display: grid; place-items: center; border: 1.5px solid #5980a6; font-size: 14px; line-height: 1; color: #ffffff; background: {{ c.c2bg }}">
+                <sc-if value="{{ c.c2 }}" hint-placeholder-val="{{ true }}"><span>✓</span></sc-if>
+              </span>
+              <span>Hibakeresési naplózás</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Radio</div>
+            <div role="radio" tabIndex="0" aria-checked="{{ c.r0 }}" onClick="{{ c.sr0 }}" style="display: flex; align-items: center; gap: 12px; cursor: pointer; font-size: 15px; height: 44px">
+              <span style="width: 22px; height: 22px; flex: none; border-radius: 50%; border: 1.5px solid #5980a6; box-shadow: {{ c.r0dot }}"></span><span>ext2</span>
+            </div>
+            <div role="radio" tabIndex="0" aria-checked="{{ c.r1 }}" onClick="{{ c.sr1 }}" style="display: flex; align-items: center; gap: 12px; cursor: pointer; font-size: 15px; height: 44px">
+              <span style="width: 22px; height: 22px; flex: none; border-radius: 50%; border: 1.5px solid #5980a6; box-shadow: {{ c.r1dot }}"></span><span>FAT32</span>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Switch</div>
+            <div role="switch" tabIndex="0" aria-checked="{{ c.sw }}" onClick="{{ c.tsw }}" style="display: flex; align-items: center; gap: 12px; cursor: pointer; font-size: 15px; height: 44px">
+              <span style="position: relative; width: 52px; height: 30px; flex: none; border-radius: 15px; background: {{ c.swbg }}; transition: background 120ms linear">
+                <span style="position: absolute; top: 3px; left: 3px; width: 24px; height: 24px; border-radius: 50%; background: #ffffff; box-shadow: 0 1px 2px rgba(43,43,45,0.3); transition: transform 120ms linear; transform: {{ c.swx }}"></span>
+              </span>
+              <span>SMP</span>
+            </div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #7a7a7d">state: {{ c.swtxt }}</div>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 20px; flex-wrap: wrap">
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 260px">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Csatolási pont</label>
+            <input value="/mnt/data" style="height: 44px; padding: 0 12px; border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; color: #1d1f20; font-family: 'IBM Plex Mono', monospace; font-size: 14px; caret-color: #5980a6" style-focus="border-color: #5980a6; outline: 2px solid rgba(89,128,166,0.3); outline-offset: 0">
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 220px; position: relative">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Ütemező</label>
+            <button type="button" onClick="{{ c.tdd }}" style="height: 44px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; color: #1d1f20; font: inherit; font-size: 15px; cursor: pointer" style-hover="background: #e7e7ea"><span>{{ c.ddval }}</span><span style="font-size: 10px; color: #5980a6">▼</span></button>
+            <sc-if value="{{ c.dd }}" hint-placeholder-val="{{ true }}">
+              <div style="position: absolute; top: 74px; left: 0; right: 0; z-index: 6; background: #ffffff; border: 1px solid #d4d4d7; border-radius: 4px; box-shadow: 0 12px 32px rgba(43,43,45,0.22); padding: 6px">
+                <div onClick="{{ c.dd0 }}" style="height: 40px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 15px; cursor: pointer" style-hover="background: #eef6ff">round-robin</div>
+                <div onClick="{{ c.dd1 }}" style="height: 40px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 15px; cursor: pointer" style-hover="background: #eef6ff">CFS</div>
+                <div onClick="{{ c.dd2 }}" style="height: 40px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 15px; cursor: pointer" style-hover="background: #eef6ff">prioritásos</div>
+              </div>
+            </sc-if>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-end">
+          <div style="display: flex; flex-direction: column; gap: 10px; width: 260px">
+            <div style="display: flex; justify-content: space-between; font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60"><span>Csúszka</span><span style="font-family: 'IBM Plex Mono', monospace; letter-spacing: 0; color: #416180">{{ c.sl }}%</span></div>
+            <div tabIndex="0" onPointerDown="{{ c.onsl }}" onKeyDown="{{ c.slkey }}" style="position: relative; height: 44px; display: flex; align-items: center; cursor: pointer">
+              <div style="position: absolute; left: 0; right: 0; height: 6px; border-radius: 3px; background: #d4d4d7"></div>
+              <div style="position: absolute; left: 0; height: 6px; border-radius: 3px; background: #5980a6; width: {{ c.slpct }}"></div>
+              <div style="position: absolute; width: 26px; height: 26px; border-radius: 50%; background: #ffffff; border: 1px solid #d4d4d7; box-shadow: 0 1px 3px rgba(43,43,45,0.28); margin-left: -13px; left: {{ c.slpct }}"></div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 10px; width: 200px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Folyamat</div>
+            <div style="height: 10px; border-radius: 5px; background: #e7e7ea; overflow: hidden"><div style="height: 100%; width: 64%; border-radius: 5px; background: #5980a6"></div></div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px">
+            <span style="width: 22px; height: 22px; border-radius: 50%; border: 3px solid #d4d4d7; border-top-color: #5980a6; animation: spin 900ms linear infinite; display: block"></span>
+            <span style="font-size: 13px; color: #5d5d60">fsck…</span>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 10px">
+          <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Tabok · lista · scrollbar</div>
+          <div style="display: flex; gap: 4px; padding: 4px; background: #e7e7ea; border-radius: 4px; align-self: flex-start">
+            <button type="button" onClick="{{ c.st0 }}" style="height: 36px; padding: 0 16px; border: none; border-radius: 4px; font: inherit; font-size: 14px; cursor: pointer; background: {{ c.tb0 }}; color: {{ c.tc0 }}">Folyamatok</button>
+            <button type="button" onClick="{{ c.st1 }}" style="height: 36px; padding: 0 16px; border: none; border-radius: 4px; font: inherit; font-size: 14px; cursor: pointer; background: {{ c.tb1 }}; color: {{ c.tc1c }}">Eszközök</button>
+            <button type="button" onClick="{{ c.st2 }}" style="height: 36px; padding: 0 16px; border: none; border-radius: 4px; font: inherit; font-size: 14px; cursor: pointer; background: {{ c.tb2 }}; color: {{ c.tc2c }}">Napló</button>
+          </div>
+          <div style="display: flex; border: 1px solid #d4d4d7; border-radius: 4px; overflow: hidden; background: #ffffff">
+            <div onWheel="{{ c.onwheel }}" style="flex: 1; height: 160px; overflow: hidden; position: relative">
+              <div style="position: absolute; inset: 0; transform: {{ c.scy }}">
+                <sc-for list="{{ rows }}" as="row" hint-placeholder-count="4">
+                  <div style="display: grid; grid-template-columns: 50px 1fr 90px 70px; align-items: center; gap: 10px; height: 40px; padding: 0 14px; border-bottom: 1px solid #e7e7ea; font-size: 14px" style-hover="background: #eef6ff">
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #7a7a7d">{{ row.pid }}</span>
+                    <span>{{ row.name }}</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #416180">{{ row.mem }}</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: #7a7a7d">{{ row.st }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+            <div onPointerDown="{{ c.ontrack }}" style="width: 14px; flex: none; background: #f5f5f8; position: relative; cursor: pointer">
+              <div style="position: absolute; left: 3px; right: 3px; border-radius: 4px; background: #b7b7ba; height: {{ c.thh }}; top: {{ c.thtop }}"></div>
+            </div>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start">
+          <div style="display: flex; flex-direction: column; gap: 10px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Dialógus</div>
+            <div style="width: 320px; padding: 20px; background: #ffffff; border: 1px solid #d4d4d7; border-radius: 4px; box-shadow: 0 12px 32px rgba(43,43,45,0.22); display: flex; flex-direction: column; gap: 12px">
+              <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 21px; letter-spacing: 0.02em">Partíció formázása</div>
+              <div style="font-size: 14px; line-height: 1.45; color: #424244">A /dev/sda2 minden adata törlődik. A művelet nem visszavonható.</div>
+              <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px">
+                <button type="button" style="height: 40px; padding: 0 16px; border: 1px solid #d4d4d7; border-radius: 4px; background: #ffffff; font: inherit; font-size: 14px; cursor: pointer">Mégse</button>
+                <button type="button" style="height: 40px; padding: 0 16px; border: none; border-radius: 4px; background: #5980a6; color: #ffffff; font: inherit; font-size: 14px; font-weight: 500; cursor: pointer">Formázás</button>
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 10px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #5d5d60">Értesítés</div>
+            <div style="width: 280px; background: #ffffff; border: 1px solid #d4d4d7; border-radius: 4px; box-shadow: 0 3px 10px rgba(43,43,45,0.16); padding: 14px; display: flex; gap: 12px; align-items: flex-start">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: #5980a6; margin-top: 6px; flex: none"></span>
+              <div style="display: flex; flex-direction: column; gap: 2px">
+                <div style="font-size: 15px; font-weight: 500">Driver betöltve</div>
+                <div style="font-size: 14px; color: #5d5d60">e1000e · eth0 aktív</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <sc-if value="{{ showSpecs }}" hint-placeholder-val="{{ true }}">
+          <div style="border-top: 1px solid #e7e7ea; padding-top: 10px; font-family: 'IBM Plex Mono', monospace; font-size: 11px; line-height: 1.7; color: #5d5d60">
+            control-height 44 · border 1px · radius 4 · row 40 · scrollbar 14 · focus 2px ring + offset
+          </div>
+        </sc-if>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1560,&quot;height&quot;:1400},&quot;showSpecs&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;}}">
+const TH = {
+  a: { on: "#5980a6", off: "transparent", knob: "#f2f2f3", knobOff: "#5980a6", swOn: "#5980a6", swOff: "transparent",
+       dotOn: "inset 0 0 0 3px #f2f2f3, inset 0 0 0 20px #5980a6", dotOff: "none",
+       tabOn: "#5980a6", tabOff: "transparent", tabTxtOn: "#1d1f20", tabTxtOff: "#7a7a7d",
+       vh: 136, rowH: 34 },
+  b: { on: "#94bce3", off: "#16232f", knob: "#16232f", knobOff: "#94bce3", swOn: "#94bce3", swOff: "#16232f",
+       dotOn: "inset 0 0 0 3px #16232f, inset 0 0 0 20px #94bce3", dotOff: "none",
+       tabOn: "#416180", tabOff: "#22374a", tabTxtOn: "#eef6ff", tabTxtOff: "#94bce3",
+       vh: 136, rowH: 34 },
+  c: { on: "#5980a6", off: "#ffffff", knob: "#ffffff", knobOff: "#ffffff", swOn: "#5980a6", swOff: "#b7b7ba",
+       dotOn: "inset 0 0 0 4px #ffffff, inset 0 0 0 20px #5980a6", dotOff: "none",
+       tabOn: "#ffffff", tabOff: "transparent", tabTxtOn: "#1d1f20", tabTxtOff: "#5d5d60",
+       vh: 160, rowH: 40 },
+  d: { on: "#94bce3", off: "#16232f", knob: "#ffffff", knobOff: "#eef6ff", swOn: "#94bce3", swOff: "#416180",
+       dotOn: "inset 0 0 0 4px #1d2d3d, inset 0 0 0 20px #94bce3", dotOff: "none",
+       tabOn: "#416180", tabOff: "transparent", tabTxtOn: "#eef6ff", tabTxtOff: "#94bce3",
+       swxOn: "translateX(22px)", vh: 160, rowH: 40 },
+  e: { on: "#5980a6", off: "#ffffff", knob: "#ffffff", knobOff: "#ffffff", swOn: "#5980a6", swOff: "#b7b7ba",
+       dotOn: "inset 0 0 0 4px #ffffff, inset 0 0 0 20px #5980a6", dotOff: "none",
+       tabOn: "#ffffff", tabOff: "transparent", tabTxtOn: "#1d1f20", tabTxtOff: "#5d5d60",
+       swxOn: "translateX(22px)", vh: 160, rowH: 40 }
+};
+const SCHED = ["round-robin", "CFS", "prioritásos"];
+const ROWS = [
+  { pid: "1", name: "init", mem: "1.2 MB", st: "run" },
+  { pid: "14", name: "kthreadd", mem: "0.4 MB", st: "sleep" },
+  { pid: "88", name: "vfs_worker", mem: "3.8 MB", st: "run" },
+  { pid: "121", name: "net_e1000e", mem: "2.1 MB", st: "run" },
+  { pid: "204", name: "tty_console", mem: "0.9 MB", st: "idle" },
+  { pid: "310", name: "compositor", mem: "12.6 MB", st: "run" },
+  { pid: "377", name: "pkg_daemon", mem: "5.4 MB", st: "sleep" },
+  { pid: "412", name: "shell", mem: "1.8 MB", st: "run" }
+];
+
+class Component extends DCLogic {
+  state = {
+    a: { c1: true, c2: false, r: 0, sw: true, tab: 0, sl: 62, sc: 0, dd: false, menu: false, sch: 1 },
+    b: { c1: true, c2: true, r: 1, sw: false, tab: 1, sl: 38, sc: 24, dd: false, menu: true, sch: 0 },
+    c: { c1: true, c2: false, r: 1, sw: true, tab: 2, sl: 75, sc: 0, dd: false, menu: false, sch: 2 },
+    d: { c1: true, c2: false, r: 0, sw: true, tab: 0, sl: 68, sc: 0, dd: false, menu: true, sch: 1 },
+    e: { c1: true, c2: false, r: 0, sw: true, tab: 0, sl: 68, sc: 0, dd: false, menu: false, sch: 1 }
+  };
+
+  set(o, k, v) { this.setState(s => ({ [o]: Object.assign({}, s[o], { [k]: v }) })); }
+  toggle(o, k) { this.set(o, k, !this.state[o][k]); }
+  keyToggle(o, k) {
+    return e => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); this.toggle(o, k); } };
+  }
+  slider(o) {
+    return e => {
+      const r = e.currentTarget.getBoundingClientRect();
+      const move = ev => {
+        const p = Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width));
+        this.set(o, "sl", Math.round(p * 100));
+      };
+      move(e);
+      const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    };
+  }
+  sliderKey(o) {
+    return e => {
+      const d = e.key === "ArrowLeft" ? -2 : e.key === "ArrowRight" ? 2 : e.key === "Home" ? -100 : e.key === "End" ? 100 : 0;
+      if (!d) return;
+      e.preventDefault();
+      this.set(o, "sl", Math.max(0, Math.min(100, this.state[o].sl + d)));
+    };
+  }
+  scrollTo(o, v, max) { this.set(o, "sc", Math.max(0, Math.min(max, v))); }
+  wheel(o, max) {
+    return e => { e.preventDefault(); this.scrollTo(o, this.state[o].sc + e.deltaY * 0.5, max); };
+  }
+  track(o, max, trackH, thumbH) {
+    return e => {
+      const r = e.currentTarget.getBoundingClientRect();
+      const move = ev => {
+        const p = Math.max(0, Math.min(1, (ev.clientY - r.top - thumbH / 2) / (trackH - thumbH)));
+        this.scrollTo(o, p * max, max);
+      };
+      move(e);
+      const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    };
+  }
+
+  opt(o) {
+    const s = this.state[o], t = TH[o];
+    const contentH = ROWS.length * t.rowH, vh = t.vh;
+    const max = Math.max(0, contentH - vh);
+    const thumbH = Math.max(24, Math.round(vh * vh / contentH));
+    const ratio = max ? s.sc / max : 0;
+    return {
+      c1: s.c1, c2: s.c2,
+      c1bg: s.c1 ? t.on : t.off, c2bg: s.c2 ? t.on : t.off,
+      tc1: () => this.toggle(o, "c1"), tc2: () => this.toggle(o, "c2"),
+      kc1: this.keyToggle(o, "c1"), kc2: this.keyToggle(o, "c2"),
+      r0: s.r === 0, r1: s.r === 1,
+      r0dot: s.r === 0 ? t.dotOn : t.dotOff, r1dot: s.r === 1 ? t.dotOn : t.dotOff,
+      sr0: () => this.set(o, "r", 0), sr1: () => this.set(o, "r", 1),
+      sw: s.sw, swbg: s.sw ? t.swOn : t.swOff, swknob: s.sw ? t.knob : t.knobOff,
+      swx: s.sw ? (t.swxOn || (o === "c" ? "translateX(22px)" : "translateX(20px)")) : "translateX(0)",
+      swtxt: s.sw ? "on" : "off", tsw: () => this.toggle(o, "sw"),
+      ddval: SCHED[s.sch], dd: s.dd, tdd: () => this.toggle(o, "dd"),
+      dd0: () => this.setState(st => ({ [o]: Object.assign({}, st[o], { sch: 0, dd: false }) })),
+      dd1: () => this.setState(st => ({ [o]: Object.assign({}, st[o], { sch: 1, dd: false }) })),
+      dd2: () => this.setState(st => ({ [o]: Object.assign({}, st[o], { sch: 2, dd: false }) })),
+      sl: s.sl, slpct: s.sl + "%", onsl: this.slider(o), slkey: this.sliderKey(o),
+      st0: () => this.set(o, "tab", 0), st1: () => this.set(o, "tab", 1), st2: () => this.set(o, "tab", 2),
+      tb0: s.tab === 0 ? t.tabOn : t.tabOff, tb1: s.tab === 1 ? t.tabOn : t.tabOff, tb2: s.tab === 2 ? t.tabOn : t.tabOff,
+      tc0: s.tab === 0 ? t.tabTxtOn : t.tabTxtOff, tc1c: s.tab === 1 ? t.tabTxtOn : t.tabTxtOff, tc2c: s.tab === 2 ? t.tabTxtOn : t.tabTxtOff,
+      scy: "translateY(" + -Math.round(s.sc) + "px)",
+      thh: thumbH + "px", thtop: Math.round(ratio * (vh - thumbH)) + "px",
+      onwheel: this.wheel(o, max), ontrack: this.track(o, max, vh, thumbH),
+      menu: s.menu, tmenu: () => this.toggle(o, "menu")
+    };
+  }
+
+  renderVals() {
+    return {
+      rows: ROWS,
+      showSpecs: this.props.showSpecs ?? true,
+      a: this.opt("a"), b: this.opt("b"), c: this.opt("c"), d: this.opt("d"), e: this.opt("e")
+    };
+  }
+}
+
+</script>
+</body>
+</html>

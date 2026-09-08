@@ -65,6 +65,7 @@
 #include "block_cache.h"
 #include "block.h"
 #include "config.h"
+#include "locale.h"
 #include "shortcut.h"        /* §M64 tail — shortcut_attach_persistent */
 #include "audio.h"           /* §M23 stage 3 — audio_devfs_init */
 #include "crash.h"     /* §M47 — unclean-shutdown marker */
@@ -325,6 +326,11 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
              * consumed a key (keymap, console colours) are notified rather
              * than left one boot behind. */
             config_attach_persistent("/mnt");
+            /* §M69 — AFTER the store is overlaid, on BOTH boot paths.  A
+             * language read before it would be the default for one boot and
+             * the saved value from the next — §M63's "one boot late" defect,
+             * and the reason config_attach_persistent exists at all. */
+            locale_init();
 
             /* §M64 tail — AND THE SHORTCUTS, for exactly the same reason.
              * `/desktop` was a constant pointing at ramfs, so "a shortcut is a

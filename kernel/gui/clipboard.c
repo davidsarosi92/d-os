@@ -8,6 +8,7 @@
  * ============================================================================= */
 
 #include "clipboard.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "lock.h"
 #include "kmalloc.h"
 #include "printf.h"
@@ -340,3 +341,8 @@ void clipboard_cmd(const char* args) {
 
     kprintf("clip: show | paste [primary] | copy <text> | type [mime] | promote\n");
 }
+
+/* --- §M70 shell registration ----------------------------------------------- */
+SHELL_CMD(clip) = { "clip", "[show|paste [primary]|copy <text>|promote|type <t>]",
+                    "the clipboard and the primary selection",
+                    SHELL_G_GUI, clipboard_cmd };

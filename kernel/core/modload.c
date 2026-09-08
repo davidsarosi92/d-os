@@ -56,6 +56,7 @@
  * ============================================================================= */
 
 #include "modload.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "module_abi.h"
 #include "ksym.h"
 #include "driver.h"
@@ -1217,3 +1218,17 @@ void modload_cmd_rmmod(const char* args) {
     buf[n] = 0;
     modload_unload(buf);
 }
+
+/* --- §M70 shell registrations --------------------------------------------- */
+static void ml_lsmod(const char* a) { (void)a; modload_list(); }
+static void ml_modupdate(const char* a) { modload_reload(a); }
+SHELL_CMD(lsmod)     = { "lsmod", "", "loaded modules",
+                         SHELL_G_DEV, ml_lsmod };
+SHELL_CMD(insmod)    = { "insmod", "<path.ko>", "load a module",
+                         SHELL_G_DEV, modload_cmd_insmod };
+SHELL_CMD(rmmod)     = { "rmmod", "<name>", "unload a module",
+                         SHELL_G_DEV, modload_cmd_rmmod };
+SHELL_CMD(modbrowse) = { "modbrowse", "[dir]", "modules available on disk",
+                         SHELL_G_DEV, modload_browse };
+SHELL_CMD(modupdate) = { "modupdate", "<name>", "reload a module in place",
+                         SHELL_G_DEV, ml_modupdate };

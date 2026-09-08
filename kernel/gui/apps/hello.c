@@ -12,6 +12,7 @@
 #include "gui_app.h"
 #include "icons.h"
 #include "widget.h"
+#include "console_plate.h"
 #include "kmalloc.h"
 #include <stddef.h>
 
@@ -38,7 +39,8 @@ static void hello_open(void) {
     if (!h) return;
 
     struct gui_window* w =
-        gui_app_window_create("Hello", 520, 200, 240, 130, NULL, h);
+        gui_app_window_create("Hello", 520, 200,
+                              cp_px(240), cp_px(130), NULL, h);
     if (!w) { kfree(h); return; }        /* not adopted as app_ctx on failure */
 
     w_label_create(w, 16, 10, 200, "Hello from the registry!");

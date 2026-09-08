@@ -24,7 +24,10 @@
  * ============================================================================= */
 
 #include "ui.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "widget.h"
+#include "console_plate.h"
+#include "scrollbar.h"
 #include "gui.h"
 #include "gui_internal.h"   /* gui_wm_focused — "this panel" means the focused one */
 #include "gfx.h"
@@ -32,6 +35,7 @@
 #include "printf.h"
 #include "klog.h"
 #include "config.h"
+#include "settings.h"
 #include <stddef.h>
 
 /* Registry bounds — see linker-<arch>.ld for the section. */
@@ -94,10 +98,31 @@ struct ui_state {
      * and a grid inside a viewport has none: its labels scrolled straight out
      * over the panel's title.  A clip that does not descend is not a clip. */
     int clip_x, clip_y, clip_w, clip_h;
+    /* §M69 — the container scrollbar's drag.  ONE latch per window, not per
+     * node, because a pointer grab is singular: while it is held every phase
+     * belongs to the node that took the press, whatever the pointer wanders
+     * over (a child widget, the wallpaper).  Without the latch a drag that
+     * strayed off the twelve-pixel bar would start clicking the controls it
+     * passed over — which is most of a settings panel. */
+    int sb_node;                        /* node id being dragged, 0 = none   */
+    int sb_part;                        /* enum sb_part                      */
+    int sb_grab_dy;
 };
 
 static struct ui_state* state_of(struct gui_window* win) {
     return (struct ui_state*)gui_window_ui(win);
+}
+
+/* §M69 — A SCROLL DAMAGES ITS VIEWPORT, NOT THE WINDOW.
+ *
+ * Everything that scrolls a container used to leave the repaint to the caller,
+ * and every caller asked for the WHOLE window: on the Appearance panel that is
+ * 431 kpx and ~50 ms of compositing for a 273 kpx viewport, with the header,
+ * the status line and the Save button — none of which moved — repainted every
+ * time.  The bar lives inside the viewport rect (arrange_scroll reserves the
+ * strip from the children's width), so one rect covers both. */
+static void ui_damage_node(struct gui_window* win, const struct ui_node* nd) {
+    gui_window_request_redraw_rect(win, nd->x, nd->y, nd->cw, nd->ch);
 }
 
 int ui_scroll_by(struct gui_window* win, int id, int dl) {
@@ -108,8 +133,10 @@ int ui_scroll_by(struct gui_window* win, int id, int dl) {
         int before = st->n[i].scroll;
         st->n[i].scroll += dl;
         if (st->n[i].scroll < 0) st->n[i].scroll = 0;
-        ui_layout(win);                 /* clamps against the current viewport */
-        return st->n[i].scroll != before;
+        ui_reflow(win);                 /* clamps against the current viewport */
+        if (st->n[i].scroll == before) return 0;
+        ui_damage_node(win, &st->n[i]);
+        return 1;
     }
     return 0;
 }
@@ -118,16 +145,71 @@ int ui_scroll_by(struct gui_window* win, int id, int dl) {
  * container is not a widget, so this cannot ride the widget scroll op — and
  * routing by POSITION rather than by focus is what every toolkit does and what
  * the hand expects (§M61's wheel lesson). */
+/* §M69 — HOW FAR ONE NOTCH GOES, in ROWS, from one config key that the list
+ * widgets read too.
+ *
+ * It was a literal 48 PIXELS here: density-blind (so it meant a different
+ * amount of content at every resolution) and not a multiple of anything, so
+ * every notch stopped mid-control and the panel showed half a row at the top
+ * and half at the bottom.  Reported from use as *"the scroll is chaotic"*, and
+ * that is what chaotic looks like — nothing lands where the eye expects.
+ *
+ * A KEY rather than a constant because the right value depends on the DEVICE:
+ * a mouse wheel sends one notch per click and wants three lines, a trackpad
+ * sends a stream of them and three lines each is a panel that flies past.
+ * Nobody can pick one number for both, which is the same argument
+ * `gui.scroll_invert` was added under. */
+int ui_wheel_lines(void) {
+    /* Cached for the same reason: this is read per wheel notch, and a trackpad
+     * sends them in bursts.  `gui.scroll_lines` changing is a settings action,
+     * not something that has to be seen within one gesture. */
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    long n = config_get_long("gui.scroll_lines", 3);
+    if (n < 1) n = 1;
+    if (n > 20) n = 20;
+    cached = (int)n;
+    return cached;
+}
+
+int ui_wheel_step(void) { return ui_wheel_lines() * cp_row_h(); }
+
+CONFIG_KEY(ck_scroll_lines) = {
+    .key = "gui.scroll_lines", .group = "Appearance", .type = CFG_INT,
+    .min = 1, .max = 10, .def = "3",
+    .help = "rows moved by one wheel notch",
+};
+
 int ui_scroll_at(struct gui_window* win, int x, int y, int dz) {
     struct ui_state* st = state_of(win);
     if (!st) return 0;
+    int only = -1, nscroll = 0;
     for (int i = 0; i < st->count; i++) {
         struct ui_node* nd = &st->n[i];
         if (!(nd->flags & UI_SCROLL)) continue;
+        nscroll++;
+        only = i;
         if (x < nd->x || x >= nd->x + nd->cw) continue;
         if (y < nd->y || y >= nd->y + nd->ch) continue;
-        return ui_scroll_by(win, nd->id, dz > 0 ? -48 : 48);
+        return ui_scroll_by(win, nd->id, dz > 0 ? -ui_wheel_step() : ui_wheel_step());
     }
+    /* §M69 — NOTHING UNDER THE POINTER, BUT THE PANEL HAS EXACTLY ONE SCROLL
+     * AREA: scroll that one.
+     *
+     * Reported from use as *"the scroll works only sometimes in Appearance, as
+     * if it were intermittent."*  It was not intermittent, it was POSITIONAL:
+     * a settings panel's group heading at the top and its status line and Save
+     * button at the bottom sit OUTSIDE the viewport, so a notch aimed at any
+     * of them matched no container and did nothing.  *From a chair, behaviour
+     * that depends on a few pixels of pointer position is indistinguishable
+     * from behaviour that is unreliable.*
+     *
+     * ONLY when there is exactly one, which is what keeps this from guessing:
+     * with two scroll areas the pointer is the only thing that says which is
+     * meant, and choosing for the user would be worse than doing nothing. */
+    if (nscroll == 1 && only >= 0)
+        return ui_scroll_by(win, st->n[only].id,
+                            dz > 0 ? -ui_wheel_step() : ui_wheel_step());
     return 0;
 }
 
@@ -181,7 +263,7 @@ void ui_dispatch_popup(struct gui_window* win, int row, int tag) {
  * ------------------------------------------------------------------------- */
 
 int ui_size_class_for(int content_px_w) {
-    int cells = content_px_w / GFX_GLYPH_W;
+    int cells = content_px_w / cp_fw();
     if (cells < 60)  return UI_SIZE_COMPACT;
     if (cells < 120) return UI_SIZE_REGULAR;
     return UI_SIZE_WIDE;
@@ -215,7 +297,7 @@ static int grid_col0(struct ui_state* st, struct ui_node* nd, int avail_w,
     }
     int cap = avail_w * 45 / 100;
     if (col0 > cap) col0 = cap;
-    if (col0 < GFX_GLYPH_W * 6) col0 = GFX_GLYPH_W * 6;
+    if (col0 < cp_fw() * 6) col0 = cp_fw() * 6;
     return col0;
 }
 
@@ -225,7 +307,7 @@ static void measure_grid(struct ui_state* st, int idx, int avail_w,
     int stacked = (size_class == UI_SIZE_COMPACT);
     int col0 = stacked ? 0 : grid_col0(st, nd, avail_w, size_class);
     int rest = stacked ? avail_w : avail_w - col0 - UI_GAP;
-    if (rest < GFX_GLYPH_W * 6) rest = GFX_GLYPH_W * 6;
+    if (rest < cp_fw() * 6) rest = cp_fw() * 6;
 
     int total_h = 0, seen = 0, row_h = 0;
     for (int i = 0; i < st->count; i++) {
@@ -271,7 +353,7 @@ static void measure_children(struct ui_state* st, int idx, int avail_w,
         if (nvis > 1) total += UI_GAP * (nvis - 1);
         nd->content_h = total;
         nd->pref_w = avail_w;
-        nd->pref_h = GFX_GLYPH_H * 4;      /* a floor; weight gives it the rest */
+        nd->pref_h = cp_fh() * 4;      /* a floor; weight gives it the rest */
         nd->min_w  = avail_w;
         return;
     }
@@ -362,7 +444,15 @@ static void arrange_grid(struct ui_state* st, int idx, int x, int y,
         struct ui_node* c = &st->n[i];
         int even = (seen & 1) == 0;
         if (stacked) {
-            arrange_node(st, i, x, cur, even ? w : w, c->pref_h, size_class);
+            /* Rule 2 again, in the branch a narrow screen takes: the LABEL
+             * spans (it is the row's heading), the CONTROL does not unless it
+             * asked to.  `even ? w : w` was the tell — both arms the same,
+             * which is how a line says it was meant to distinguish two cases
+             * and never did. */
+            int cwid = even || (c->flags & UI_FILL_W)
+                           ? w
+                           : (c->pref_w < w ? c->pref_w : w);
+            arrange_node(st, i, x, cur, cwid, c->pref_h, size_class);
             cur += c->pref_h + (even ? 2 : UI_GAP);
         } else if (even) {
             label_idx = i;
@@ -377,7 +467,19 @@ static void arrange_grid(struct ui_state* st, int idx, int x, int y,
                 int ly = cur + (row_h - l->pref_h) / 2;
                 arrange_node(st, label_idx, x, ly, col0, l->pref_h, size_class);
             }
-            arrange_node(st, i, x + col0 + UI_GAP, cur, rest, c->pref_h, size_class);
+            /* RULE 2 (console_plate.h): the control gets its OWN width, not the
+             * column's, unless it asked to fill.  This passed `rest`
+             * unconditionally, which is why a Save button came out as wide as
+             * the panel and a three-item segmented control stretched across a
+             * window — nobody chose either; it was simply what a grid's second
+             * column handed out.  A slider, a text box and a progress bar do
+             * want the width, and they say so with UI_FILL_W: a track that
+             * stops halfway says nothing about the range it represents. */
+            int cwid = (c->flags & UI_FILL_W)
+                           ? rest
+                           : (c->pref_w < rest ? c->pref_w : rest);
+            arrange_node(st, i, x + col0 + UI_GAP, cur, cwid, c->pref_h,
+                         size_class);
             cur += row_h + UI_GAP;
             label_idx = -1;
         }
@@ -415,11 +517,22 @@ static void arrange_scroll(struct ui_state* st, int idx, int x, int y,
     int sx = st->clip_x, sy = st->clip_y, sw = st->clip_w, sh = st->clip_h;
     st->clip_x = x; st->clip_y = y; st->clip_w = w; st->clip_h = h;
 
+    /* THE BAR'S WIDTH COMES OFF THE CONTENT, NOT OUT OF IT.  Laying the
+     * children out across the full viewport and then painting a bar on top
+     * covers whatever is under it — which is invisible until one child happens
+     * to be wide enough to reach the edge.  The table view learned the same
+     * thing today, one layer down. */
+    int inner = w - (content > h ? cp_scrollbar_w() + 2 : 0);
+    if (inner < cp_fw() * 4) inner = w;          /* too narrow to bother */
+
     int cur = y - nd->scroll;
     for (int i = 0; i < st->count; i++) {
         if (st->n[i].parent != nd->id || st->n[i].hidden) continue;
         struct ui_node* c = &st->n[i];
-        arrange_node(st, i, x, cur, w, c->pref_h, size_class);
+        int cwid = (c->flags & UI_FILL_W)
+                       ? inner
+                       : (c->pref_w < inner ? c->pref_w : inner);
+        arrange_node(st, i, x, cur, cwid, c->pref_h, size_class);
         cur += c->pref_h + UI_GAP;
     }
 
@@ -449,6 +562,11 @@ static void arrange_children(struct ui_state* st, int idx, int x, int y,
     if (space < 0) space = 0;
 
     int cur = row ? x : y;
+    /* §M69 — UI_ALIGN_END: start the run `space` further along, so the group
+     * finishes flush with the container's far edge.  Only when nothing is
+     * weighted: a weight has already consumed the slack, and pushing by it as
+     * well would double-count the same pixels. */
+    if ((nd->flags & UI_ALIGN_END) && weight_sum == 0) cur += space;
     int used_extra = 0, seen = 0;
     for (int i = 0; i < st->count; i++) {
         if (st->n[i].parent != nd->id || st->n[i].hidden) continue;
@@ -485,13 +603,31 @@ static void arrange_node(struct ui_state* st, int idx, int x, int y, int w, int 
         arrange_children(st, idx, x, y, w, h, size_class);
 }
 
-void ui_layout(struct gui_window* win) {
+/* §M69 — MEASURE ONCE, ARRANGE MANY, and this is a latency fix rather than
+ * tidiness.
+ *
+ * `ui_layout` MEASURES every node before arranging it, and measuring a label
+ * means a catalogue lookup plus a per-glyph text width.  Scrolling calls it —
+ * `ui_scroll_by` per notch, and the scrollbar DRAG per motion packet — so
+ * dragging the thumb across a settings panel re-measured every widget in it
+ * dozens of times a second.  Reported from use as *"during a drag it froze for
+ * a few seconds and then became usable again"*: not a stuck state, a starved
+ * one.
+ *
+ * A scroll changes no SIZE, only positions, so the measurements from the last
+ * real layout are still true.  `ui_reflow` re-arranges with them. */
+static int ui_layout_pass(struct gui_window* win, int do_measure);
+
+void ui_layout(struct gui_window* win) { ui_layout_pass(win, 1); }
+void ui_reflow(struct gui_window* win) { ui_layout_pass(win, 0); }
+
+static int ui_layout_pass(struct gui_window* win, int do_measure) {
     struct ui_state* st = state_of(win);
-    if (!st || st->count == 0) return;
+    if (!st || st->count == 0) return 0;
 
     int cw = 0, ch = 0;
     gui_window_content_size(win, &cw, &ch);
-    if (cw <= 2 * UI_PAD || ch <= 2 * UI_PAD) return;
+    if (cw <= 2 * UI_PAD || ch <= 2 * UI_PAD) return 0;
 
     st->clip_x = st->clip_y = st->clip_w = st->clip_h = 0;   /* no clip at the root */
     int sc = ui_size_class_for(cw);
@@ -510,7 +646,7 @@ void ui_layout(struct gui_window* win) {
         struct ui_node* c = &st->n[i];
         c->hidden = (c->flags & UI_HIDE_COMPACT) && sc == UI_SIZE_COMPACT;
         if (c->hidden) continue;
-        measure_node(st, i, inner_w, sc);
+        if (do_measure) measure_node(st, i, inner_w, sc);
         main += c->pref_h;
         nvis++;
     }
@@ -534,9 +670,20 @@ void ui_layout(struct gui_window* win) {
             used += extra;
         }
         int hgt = c->pref_h + extra;
-        arrange_node(st, i, UI_PAD, cur, inner_w, hgt, sc);
+        /* RULE 2 AT THE ROOT — the third copy of this defect, and the one that
+         * produced the reported symptom: the Control Panel's Save button asked
+         * for 78 px and was placed at 544, because this line handed every
+         * top-level child `inner_w` without ever consulting UI_FILL_W.  The
+         * grid had the same bug twice (its stacked and unstacked branches), so
+         * the layout engine stretched controls on all three of its paths and
+         * no caller could opt out anywhere. */
+        int wid = (c->flags & UI_FILL_W)
+                      ? inner_w
+                      : (c->pref_w < inner_w ? c->pref_w : inner_w);
+        arrange_node(st, i, UI_PAD, cur, wid, hgt, sc);
         cur += hgt + UI_GAP;
     }
+    return 1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -635,7 +782,7 @@ void ui_text_clipped(struct gfx_surface* s, const struct widget* w,
      * the panel's title.  Two mechanisms for one invariant, and the narrower
      * one lost.  Kept as a named call because the intent reads well at the
      * call sites — but the clipping happens in exactly one place. */
-    gfx_text(s, x, y, text, colour);
+    cp_text(s, x, y, text, colour);
 }
 
 /* ---------------------------------------------------------------------------
@@ -698,6 +845,183 @@ void ui_cmd(const char* args) {
     ui_dump(win);
 }
 
+/* THE SCROLL INDICATOR — drawn here rather than by a widget, because a
+ * container is a NODE and nodes have no draw op.
+ *
+ * WHY IT MUST EXIST.  `ui_dump` measured the settings panel's viewport at
+ * 242 px holding 1004 px of content: two thirds of every long settings group
+ * was unreachable with nothing on screen saying so, which is how a radio group
+ * with three options came to be reported as showing one.  *A view that silently
+ * shows a prefix of its data is worse than one that shows none, because nothing
+ * looks wrong.*  The table view got the same treatment today for the same
+ * reason, and the shape is deliberately identical: a `tray` trough, a
+ * proportional `muted` thumb, no end arrows (widget_specs.md §10).
+ *
+ * Painted AFTER the widgets and with no clip of its own: the children are
+ * clipped to the viewport, and the bar sits in the strip arrange_scroll kept
+ * clear for it. */
+static void ui_sb_metrics(const struct ui_node* nd, struct sb_metrics* m);
+
+void ui_draw_overlay(struct gui_window* win, struct gfx_surface* s) {
+    struct ui_state* st = win ? state_of(win) : NULL;
+    if (!st || !s) return;
+    const cp_theme* t = cp_current_theme();
+
+    for (int i = 0; i < st->count; i++) {
+        struct ui_node* nd = &st->n[i];
+        if (!(nd->flags & UI_SCROLL) || nd->hidden) continue;
+        if (nd->content_h <= nd->ch || nd->ch <= 0) continue;
+
+        /* §M69 — through the shared scrollbar, which is what gives the
+         * container's bar arrows and a thumb that can be grabbed.  The old
+         * copy here drew an indicator; nothing could touch it. */
+        struct sb_metrics m;
+        ui_sb_metrics(nd, &m);
+        sb_draw(s, &m, st->sb_node == nd->id ? st->sb_part : SB_NONE);
+    }
+    (void)t;
+}
+
+/* The container bar's metrics, in the same window coordinates its children
+ * live in.  One definition for the painter and the hit test. */
+static void ui_sb_metrics(const struct ui_node* nd, struct sb_metrics* m) {
+    int bw = cp_scrollbar_w();
+    sb_metrics(m, nd->x + nd->cw - bw, nd->y, bw, nd->ch,
+               nd->content_h, nd->ch, nd->scroll);
+}
+
+static struct ui_node* ui_node_by_id(struct ui_state* st, int id) {
+    for (int i = 0; i < st->count; i++)
+        if (st->n[i].id == id) return &st->n[i];
+    return NULL;
+}
+
+/* Damage the BAR alone — a strip about sixteen pixels wide, against the
+ * viewport's quarter of a megapixel.  What changes when a press latches or a
+ * release lets go is which part is drawn held, and nothing else on the panel
+ * moves; the two are separated because they differ by a factor of thirty. */
+static void ui_damage_bar(struct gui_window* win, const struct ui_node* nd) {
+    struct sb_metrics m;
+    ui_sb_metrics(nd, &m);
+    gui_window_request_redraw_rect(win, m.x, m.y, m.w, m.h);
+}
+
+/* §M69 — PRESS / DRAG / RELEASE on a scrolling container's bar.
+ *
+ * A container is a NODE and nodes have no widget, so nothing in the window's
+ * widget list sits under that strip and gui.c's ordinary pointer routing found
+ * nobody — the settings panels drew a scrollbar that could not be used at all.
+ * gui.c asks here BEFORE resolving a widget, so the latch above wins over
+ * whatever the drag passes over.
+ *
+ * Returns non-zero when the toolkit consumed the event. */
+int ui_pointer_at(struct gui_window* win, int x, int y, int phase) {
+    struct ui_state* st = state_of(win);
+    /* THE ENTRY HALF of the probe.  Without it, "no press was logged" cannot
+     * distinguish *the event never arrived* from *it arrived and matched no
+     * container* — the two causes of "I cannot grab the bar", and they live in
+     * different files. */
+    if (phase == WPTR_PRESS && gui_input_debug()) {
+        int nsc = 0;
+        if (st) for (int i = 0; i < st->count; i++) {
+            struct ui_node* n = &st->n[i];
+            if (!(n->flags & UI_SCROLL)) continue;
+            nsc++;
+            kprintf("ui_pointer_at: phase=%d at %d,%d  node %d rect %d,%d %dx%d "
+                    "content=%d scroll=%d\n", phase, x, y, n->id,
+                    n->x, n->y, n->cw, n->ch, n->content_h, n->scroll);
+        }
+        if (!nsc) kprintf("ui_pointer_at: phase=%d at %d,%d  no scroll node\n",
+                          phase, x, y);
+    }
+    if (!st) return 0;
+
+    /* §M69 — A LATCH THAT SURVIVES INTO THE NEXT PRESS IS STALE BY DEFINITION.
+     *
+     * Reported from use: *"I click and nothing happens, I do not know what it
+     * depends on, then suddenly it works"* and *"during a drag it froze in a
+     * lighter colour, as if it were active."*  Both are one state: the grab
+     * latched on a press and the RELEASE never arrived, after which this
+     * function consumed EVERY later event — including every press — and the
+     * window looked alive and answered nothing.
+     *
+     * The release can go missing for reasons this file cannot prevent (a full
+     * queue, a window closing mid-gesture), so the latch must be
+     * SELF-HEALING rather than merely correct on the happy path: a press is by
+     * definition the start of a new gesture, so anything still held when one
+     * arrives belongs to a gesture that ended without telling us.  *A recovery
+     * that depends on the event that went missing is not a recovery.* */
+    if (st->sb_node && phase == WPTR_PRESS) {
+        struct ui_node* old = ui_node_by_id(st, st->sb_node);
+        st->sb_node = st->sb_part = 0;
+        if (old) ui_damage_bar(win, old);       /* the held highlight, no more */
+    }
+
+    /* Mid-drag: the latched node owns every phase until the release. */
+    if (st->sb_node) {
+        struct ui_node* nd = ui_node_by_id(st, st->sb_node);
+        if (!nd) { st->sb_node = st->sb_part = 0; return 0; }
+        if (phase == WPTR_RELEASE) {
+            st->sb_node = st->sb_part = 0;
+            /* ONLY THE BAR CHANGED.  A release ends the highlight and moves
+             * nothing, so repainting the window here was the second of the
+             * four full-window repaints a single click used to cost. */
+            ui_damage_bar(win, nd);
+            return 1;
+        }
+        if (phase == WPTR_DRAG && st->sb_part == SB_THUMB) {
+            struct sb_metrics m;
+            ui_sb_metrics(nd, &m);
+            int ns = sb_scroll_from_thumb(&m, nd->content_h, nd->ch,
+                                          y - st->sb_grab_dy);
+            if (ns != nd->scroll) {
+                nd->scroll = ns;
+                ui_reflow(win);          /* positions only — see ui_layout_pass */
+                ui_damage_node(win, nd);
+            }
+        }
+        return 1;                        /* consumed either way while latched */
+    }
+
+    if (phase != WPTR_PRESS) return 0;
+
+    for (int i = 0; i < st->count; i++) {
+        struct ui_node* nd = &st->n[i];
+        if (!(nd->flags & UI_SCROLL) || nd->hidden) continue;
+        if (nd->content_h <= nd->ch || nd->ch <= 0) continue;
+        struct sb_metrics m;
+        ui_sb_metrics(nd, &m);
+        int part = sb_hit(&m, x, y);
+        if (gui_input_debug())
+            kprintf("ui: press at %d,%d over node %d bar %d,%d %dx%d part=%d\n",
+                    x, y, nd->id, m.x, m.y, m.w, m.h, part);
+        if (part == SB_NONE) continue;
+
+        st->sb_node = nd->id;
+        st->sb_part = part;
+        st->sb_grab_dy = y - m.thumb_y;
+        int step = cp_row_h();
+        int was = nd->scroll;
+        switch (part) {
+        case SB_UP:          nd->scroll -= step; break;
+        case SB_DOWN:        nd->scroll += step; break;
+        case SB_TROUGH_UP:   nd->scroll -= sb_page(nd->ch); break;
+        case SB_TROUGH_DOWN: nd->scroll += sb_page(nd->ch); break;
+        default: break;
+        }
+        int max = nd->content_h - nd->ch;
+        if (nd->scroll < 0)   nd->scroll = 0;
+        if (nd->scroll > max) nd->scroll = max;
+        /* The viewport when the content moved; otherwise only the bar, whose
+         * pressed part is now drawn held — an arrow at the end of its travel
+         * has to answer the click without repainting a thing under it. */
+        if (nd->scroll != was) { ui_reflow(win); ui_damage_node(win, nd); }
+        else                   ui_damage_bar(win, nd);
+        return 1;
+    }
+    return 0;
+}
+
 void ui_dump(struct gui_window* win) {
     kprintf("ui: %d class(es) registered:", ui_class_count());
     for (int i = 0; i < ui_class_count(); i++)
@@ -710,16 +1034,24 @@ void ui_dump(struct gui_window* win) {
     int cw = 0, ch = 0;
     gui_window_content_size(win, &cw, &ch);
     kprintf("ui: content %dx%d px = %d cells -> %s, %d node(s)\n",
-            cw, ch, cw / GFX_GLYPH_W, size_name(ui_size_class_for(cw)), st->count);
+            cw, ch, cw / cp_fw(), size_name(ui_size_class_for(cw)), st->count);
     for (int i = 0; i < st->count; i++) {
         struct ui_node* nd = &st->n[i];
         /* Plain %d/%s: this kernel's printf has no width or precision
          * specifiers, and "%-3d" is printed literally — which turned the first
          * version of this dump into garbage exactly when it was needed. */
-        kprintf("  id %d parent %d %s at %d,%d %dx%d%s%s\n",
+        /* THE PREFERRED SIZE IS PRINTED NEXT TO THE PLACED ONE, because the
+         * only question this dump is ever opened for is "did it get what it
+         * asked for" — and with only the placed size, a control stretched by
+         * its container and one that genuinely wants the width look identical.
+         * `fill` marks the ones that asked to span, so a surprise is visible as
+         * a wide box WITHOUT that word. */
+        kprintf("  id %d parent %d %s at %d,%d %dx%d (want %dx%d)%s%s%s\n",
                 nd->id, nd->parent,
                 nd->w ? (nd->cls ? nd->cls->name : "?") : "box",
                 nd->x, nd->y, nd->cw, nd->ch,
+                nd->pref_w, nd->pref_h,
+                (nd->flags & UI_FILL_W) ? "  fill" : "",
                 nd->hidden ? "  (hidden)" : "",
                 (nd->flags & UI_SCROLL) ? "  [viewport]" : "");
         if (nd->w && nd->w->clip_w > 0)
@@ -729,3 +1061,7 @@ void ui_dump(struct gui_window* win) {
             kprintf("        content %d px, scroll %d\n", nd->content_h, nd->scroll);
     }
 }
+
+/* --- §M70 shell registration ----------------------------------------------- */
+SHELL_CMD(ui) = { "ui", "[dump|classes]", "the widget-class registry and layout dumps",
+                  SHELL_G_GUI, ui_cmd };

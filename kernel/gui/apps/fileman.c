@@ -20,10 +20,11 @@
  *     Home/End + Enter-activates in the M22.5 widget work),
  *   - Ren (vfs_rename, same-directory) and Copy (vfs_copy) buttons
  *     driven by the name input,
- *   - Del deletes files immediately; a NON-EMPTY directory arms a
- *     two-step confirm — the second Del within 8 s runs
- *     vfs_unlink_recursive (mistake-proof by default, still one
- *     hand-motion to nuke a tree),
+ *   - Del deletes files immediately; a NON-EMPTY directory raises the
+ *     §M69 MODAL DIALOG and deletes the tree only on confirmation.  It
+ *     used to arm a two-step Del-within-8-seconds gesture — which was
+ *     not a design but the absence of one: there was nothing in this
+ *     system able to ask a question,
  *   - double-click / Enter on a file consults the GUI_APP_ASSOC
  *     registry (gui_app_for_path): .txt/.md/... open in the Editor,
  *     .bas lands in the BASIC window; anything unclaimed falls back
@@ -40,6 +41,9 @@
 #include "ui.h"        /* §M65 — the menu bar */
 #include "itemview.h"  /* §M65 — the list is a MODEL + a table view now */
 #include "shortcut.h"  /* §M64 tail — Send to desktop writes a .lnk */
+#include "dialog.h"    /* §M69 — the recursive delete asks, in words */
+#include "console_plate.h"
+#include "locale.h"
 #include "config.h"
 #include "vfs.h"
 #include "timer.h"
@@ -50,6 +54,7 @@
 #include <stdint.h>
 
 #define FM_PATH_MAX 224
+#define FM_NBTN     7                   /* Up MkDir Touch Ren Copy Del View */
 #define FM_NAME_COL 30                  /* listview name column width */
 
 struct fileman {
@@ -60,6 +65,9 @@ struct fileman {
     struct w_itemview*  iv;
     struct item_model   model;          /* per-window: ctx points at this fm  */
     struct w_textinput* name_in;
+    /* §M69 — held so fm_layout can size them from the live density; they used
+     * to be created at literal widths and never touched again. */
+    struct w_button*    btn[FM_NBTN];
     /* §M65 — THE ENTRIES ARE THE MODEL NOW.  They used to be pre-formatted
      * strings in the listview, with the name padded to a column and the size
      * appended — and a SEPARATE array of raw names, because path arithmetic
@@ -70,12 +78,13 @@ struct fileman {
     uint64_t sizes[WLIST_MAX_ITEMS];
     uint8_t  types[WLIST_MAX_ITEMS];
     int      count;
-    /* Two-step recursive-delete confirm. */
-    int      del_armed_idx;             /* -1 = not armed */
-    uint64_t del_armed_ms;
 };
 
 static struct gui_window* fm_win = NULL;         /* singleton */
+/* §M69 — the same singleton's CONTEXT, kept beside the window because a
+ * deferred dialog answer needs to know whether the app it belonged to is
+ * still there.  Both are cleared together in fm_on_close. */
+static struct fileman*    fm_ctx = NULL;
 
 /* -------------------------------------------------------------------------- */
 /* Small helpers.                                                              */
@@ -165,7 +174,7 @@ static void fm_m_activate(void* ctx, int i) { fm_activate_idx((struct fileman*)c
 static int fm_m_columns(void* ctx)  { (void)ctx; return 2; }
 static const char* fm_m_title(void* ctx, int c) {
     (void)ctx;
-    return c == 0 ? "NAME" : "SIZE";
+    return c == 0 ? lstr("col.name") : lstr("col.size");
 }
 static int fm_m_weight(void* ctx, int c) { (void)ctx; return c == 0 ? 3 : 1; }
 
@@ -189,6 +198,7 @@ static int fm_m_cell(void* ctx, int i, int c, char* out, int cap) {
 
 static struct item_model fm_model = {
     .count = fm_m_count, .get = fm_m_get, .activate = fm_m_activate,
+    .empty_text = "empty.folder", .empty_action = "empty.folder.act",
     .columns = fm_m_columns, .col_title = fm_m_title,
     .col_weight = fm_m_weight, .cell = fm_m_cell,
 };
@@ -197,7 +207,6 @@ static void fm_refresh(struct fileman* fm) {
     w_textinput_set(fm->path_in, fm->path);
     fm->count = 0;
     if (fm->iv) { fm->iv->sel = -1; fm->iv->scroll = 0; }
-    fm->del_armed_idx = -1;
 
     struct file* f = vfs_open(fm->path, VFS_RDONLY);
     if (!f) {
@@ -245,8 +254,8 @@ static void viewer_layout(struct gui_window* win) {
     if (!v || !v->lv) return;
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
-    v->lv->base.x = 6;  v->lv->base.y = 6;
-    v->lv->base.w = cw - 12;
+    v->lv->base.x = cp_px(6);  v->lv->base.y = cp_px(6);
+    v->lv->base.w = cw - 2 * cp_px(6);
     v->lv->base.h = ch - 12;
 }
 
@@ -260,7 +269,8 @@ static void viewer_open(const char* path, const char* name) {
     title[p] = 0;
 
     struct gui_window* win =
-        gui_app_window_create(title, 260, 140, 520, 380, viewer_layout, v);
+        gui_app_window_create(title, 260, 140,
+                              cp_px(520), cp_px(380), viewer_layout, v);
     if (!win) { kfree(v); return; }
     v->lv = w_listview_create(win, 6, 6, 508, 340, NULL);
     if (!v->lv) { gui_window_close(win); return; }
@@ -353,49 +363,121 @@ static void fm_create_common(struct fileman* fm, int (*op)(const char*),
 static void fm_mkdir(struct w_button* b, void* ctx) {
     (void)b;
     fm_create_common((struct fileman*)ctx, vfs_mkdir,
-                     "directory created", "mkdir failed (exists? read-only fs?)");
+                     "fm.mkdirok", "fm.mkdirfail");
 }
 
 static void fm_touch(struct w_button* b, void* ctx) {
     (void)b;
     fm_create_common((struct fileman*)ctx, vfs_create,
-                     "file created", "create failed (exists? read-only fs?)");
+                     "fm.touchok", "fm.touchfail");
 }
 
-/* Del: files (and empty dirs) go immediately; a non-empty directory
- * arms a two-step confirm and the second press within 8 s deletes the
- * whole tree (vfs_unlink_recursive). */
+/* §M69 — RECURSIVE DELETE NOW ASKS, IN WORDS.
+ *
+ * It used to arm a two-step confirm: press Del, read a status line, press Del
+ * again within eight seconds.  That was not a design choice — it was what a
+ * system with no way to ask a question does instead of asking one.  It is
+ * undiscoverable (nothing on screen suggests a second press), it is a hidden
+ * deadline, and the thing it guards is the single most destructive action this
+ * application has.
+ *
+ * THE ANSWER ARRIVES LATER, ON ANOTHER TASK, so nothing captured here may be
+ * dereferenced when it comes back.  The PATH is copied by value; the file
+ * manager is identified by its singleton window pointer, which is only ever
+ * COMPARED against the live `fm_win` and dereferenced solely when they match
+ * (§M56.2's rule for a cache that must survive its object dying — the same
+ * shape, one layer up).  If the user closed the file manager while the dialog
+ * was up, the delete still happens and the refresh simply does not. */
+static char fm_del_path[FM_PATH_MAX];
+static struct gui_window* fm_del_owner;
+/* Handed from the dialog's task to the file manager's; consumed in fm_layout,
+ * which is the only code here that runs on the owning host. */
+static volatile int fm_reload_pending;
+static const char*  fm_reload_msg;
+
+static void fm_del_answer(int answer, void* ctx) {
+    (void)ctx;
+    if (answer != GUI_DIALOG_OK) return;
+
+    /* THE DELETE HAPPENS HERE regardless of whether the file manager is still
+     * open: the user confirmed it, and an action that silently depends on a
+     * window still existing is one nobody can predict.  The VFS does not care
+     * which task calls it. */
+    int ok = (vfs_unlink_recursive(fm_del_path) == 0);
+    int live = (fm_win && fm_win == fm_del_owner && fm_ctx);
+    kprintf("fileman: recursive delete of '%s' %s (owner %s)\n", fm_del_path,
+            ok ? "ok" : "FAILED", live ? "live" : "gone");
+    if (!live) return;
+
+    /* THE WIDGETS ARE NOT OURS TO TOUCH.  This runs on the DIALOG's app-host
+     * task, and §M22.7's rule is that a window's widgets belong to the task
+     * that hosts it — writing a label from here is a cross-task mutation with
+     * no lock, and the visible half of it was worse than the invisible half:
+     * the first version really did call fm_refresh() from this task, the model
+     * really was reloaded, and NOTHING ON SCREEN CHANGED, because damaging a
+     * window is the host's job and nobody had asked for a repaint.  *A
+     * cross-task write that appears to do nothing is the most expensive kind:
+     * it looks like a missing feature, so the fix gets aimed at the wrong
+     * layer.*
+     *
+     * So the answer is handed over as DATA and the file manager's own task
+     * acts on it, woken by a layout request — the one existing route from any
+     * task into a window's host loop. */
+    fm_reload_msg = ok ? "fm.treedeleted" : "recursive delete failed";
+    fm_reload_pending = 1;
+    gui_window_request_layout(fm_win);
+}
+
+/* Del: files (and empty dirs) go immediately — that is reversible enough to
+ * be worth a click rather than a conversation; a non-empty directory raises
+ * the modal dialog above. */
 static void fm_del(struct w_button* b, void* ctx) {
     (void)b;
     struct fileman* fm = (struct fileman*)ctx;
     int sel = fm->iv ? fm->iv->sel : -1;
-    if (sel < 0) { w_label_set(fm->status, "select an entry first"); return; }
+    if (sel < 0) { w_label_set(fm->status, "fm.selectfirst"); return; }
 
     char np[FM_PATH_MAX];
     path_join(np, (int)sizeof(np), fm->path, fm->names[sel]);
 
-    if (fm->del_armed_idx == sel &&
-        timer_ticks_ms() - fm->del_armed_ms < 8000) {
-        if (vfs_unlink_recursive(np) == 0) {
-            w_label_set(fm->status, "tree deleted");
-            fm_refresh(fm);
-        } else {
-            w_label_set(fm->status, "recursive delete failed");
-            fm->del_armed_idx = -1;
-        }
-        return;
-    }
-
     int r = vfs_unlink(np);
     if (r == 0) {
-        w_label_set(fm->status, "deleted");
+        w_label_set(fm->status, "fm.deleted");
         fm_refresh(fm);
     } else if (r == -2) {
-        fm->del_armed_idx = sel;
-        fm->del_armed_ms  = timer_ticks_ms();
-        w_label_set(fm->status, "dir not empty - Del again deletes the TREE");
+        int i = 0;
+        while (np[i] && i < (int)sizeof fm_del_path - 1) { fm_del_path[i] = np[i]; i++; }
+        fm_del_path[i] = 0;
+        fm_del_owner = fm->win;
+
+        /* COMPOSED IN CODE, and marked as such (locale.h: there is no message
+         * formatter, on purpose).  Two catalogue lines joined with the newline
+         * the dialog splits on — so a translator still owns both sentences and
+         * neither has a placeholder in it. */
+        static char body[192];
+        {
+            const char* a = lstr("dlg.notempty");
+            const char* b = lstr("dlg.alsodeleted");
+            int n = 0;
+            while (*a && n < (int)sizeof body - 2) body[n++] = *a++;
+            if (n < (int)sizeof body - 2) body[n++] = '\n';
+            while (*b && n < (int)sizeof body - 1) body[n++] = *b++;
+            body[n] = 0;
+        }
+        struct gui_dialog_req req = {
+            .title = lstr("dlg.deletedir"),
+            .body  = body,
+            .info  = fm_del_path,
+            .ok_text = lstr("dlg.deletetree"),
+            .cancel_text = lstr("btn.cancel"),
+            .on_answer = fm_del_answer,
+        };
+        if (gui_dialog_open(&req) != 0)
+            w_label_set(fm->status, "fm.dlgbusy");
+        else
+            w_label_set(fm->status, "fm.confirm");
     } else {
-        w_label_set(fm->status, "delete failed (fs read-only?)");
+        w_label_set(fm->status, "fm.delfail");
     }
 }
 
@@ -414,7 +496,7 @@ static void fm_sendto(struct w_button* b, void* ctx) {
     (void)b;
     struct fileman* fm = (struct fileman*)ctx;
     int sel = fm->iv ? fm->iv->sel : -1;
-    if (sel < 0) { w_label_set(fm->status, "select an entry first"); return; }
+    if (sel < 0) { w_label_set(fm->status, "fm.selectfirst"); return; }
 
     char p[FM_PATH_MAX];
     path_join(p, (int)sizeof(p), fm->path, fm->names[sel]);
@@ -443,7 +525,7 @@ static void fm_ren(struct w_button* b, void* ctx) {
     (void)b;
     struct fileman* fm = (struct fileman*)ctx;
     int sel = fm->iv ? fm->iv->sel : -1;
-    if (sel < 0)              { w_label_set(fm->status, "select an entry first"); return; }
+    if (sel < 0)              { w_label_set(fm->status, "fm.selectfirst"); return; }
     if (fm->name_in->len == 0){ w_label_set(fm->status, "type the new name below"); return; }
 
     char op[FM_PATH_MAX], np[FM_PATH_MAX];
@@ -551,19 +633,19 @@ enum {
 };
 
 static const struct ui_menu_def fm_menu[] = {
-    { "File",   "New folder",  FM_CMD_MKDIR   },
-    { "File",   "New file",    FM_CMD_TOUCH   },
-    { "File",   "-",           0              },
-    { "File",   "Rename",      FM_CMD_REN     },
-    { "File",   "Copy",        FM_CMD_COPY    },
-    { "File",   "Delete",      FM_CMD_DEL     },
-    { "File",   "Send to desktop", FM_CMD_SENDTO },
-    { "File",   "-",           0              },
-    { "File",   "Close",       FM_CMD_CLOSE   },
-    { "View",   "Open",        FM_CMD_VIEW    },
-    { "View",   "Refresh",     FM_CMD_REFRESH },
-    { "Go",     "Up",          FM_CMD_UP      },
-    { "Go",     "Root",        FM_CMD_ROOT    },
+    { "menu.file",   "New folder",  FM_CMD_MKDIR   },
+    { "menu.file",   "New file",    FM_CMD_TOUCH   },
+    { "menu.file",   "-",           0              },
+    { "menu.file",   "Rename",      FM_CMD_REN     },
+    { "menu.file",   "Copy",        FM_CMD_COPY    },
+    { "menu.file",   "Delete",      FM_CMD_DEL     },
+    { "menu.file",   "Send to desktop", FM_CMD_SENDTO },
+    { "menu.file",   "-",           0              },
+    { "menu.file",   "Close",       FM_CMD_CLOSE   },
+    { "menu.view",   "Open",        FM_CMD_VIEW    },
+    { "menu.view",   "Refresh",     FM_CMD_REFRESH },
+    { "menu.go",     "Up",          FM_CMD_UP      },
+    { "menu.go",     "Root",        FM_CMD_ROOT    },
 };
 #define FM_MENU_N ((int)(sizeof fm_menu / sizeof fm_menu[0]))
 #define FM_MENU_ID   1
@@ -597,6 +679,18 @@ static void fm_ui_event(struct gui_window* win, int id, int type, int value,
 static void fm_layout(struct gui_window* win) {
     struct fileman* fm = (struct fileman*)gui_window_ctx(win);
     if (!fm || !fm->iv) return;                  /* widgets not built yet */
+
+    /* §M69 — a deferred dialog answer, delivered on THIS task.  A layout runs
+     * on a resize too, so consuming a flag here costs nothing when there is
+     * none, and the host repaints the window afterwards either way. */
+    if (fm_reload_pending) {
+        fm_reload_pending = 0;
+        /* Reload FIRST: fm_refresh writes its own status on failure, and a
+         * message set before it would be replaced by a less specific one. */
+        fm_refresh(fm);
+        w_label_set(fm->status, fm_reload_msg ? fm_reload_msg : "");
+    }
+
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
 
@@ -605,27 +699,54 @@ static void fm_layout(struct gui_window* win) {
      * wholesale is a separate change from giving it a menu). */
     ui_layout(win);
 
-    fm->path_in->base.x = 8;   fm->path_in->base.y = 4 + FM_MENU_H;
-    fm->path_in->base.w = cw - 16;
+    const int pad  = cp_px(8);
+    const int gap  = cp_px(6);
+    const int rowh = cp_btn_h();   /* rule 0: this row is buttons + a text box */
+    const int menu = FM_MENU_H;
 
-    /* Button row keeps fixed positions (set at build time). */
+    fm->path_in->base.x = pad;  fm->path_in->base.y = menu + gap;
+    fm->path_in->base.w = cw - 2 * pad;
+    fm->path_in->base.h = rowh;
 
-    fm->iv->base.x = 8;   fm->iv->base.y = 44 + FM_MENU_H;
-    fm->iv->base.w = cw - 16;
-    fm->iv->base.h = ch - 44 - FM_MENU_H - 48;
+    /* §M69 — each button takes the width its own label needs (rule 2), laid
+     * left to right.  A row that runs out of width DROPS from the right rather
+     * than overlapping: half a button is a control that looks pressable and
+     * hits its neighbour. */
+    int by = menu + gap + rowh + gap;
+    int bx = pad;
+    for (int i = 0; i < FM_NBTN; i++) {
+        if (!fm->btn[i]) continue;
+        int bw = w_button_autosize(fm->btn[i], bx, by);
+        fm->btn[i]->base.disabled = 0;
+        if (bx + bw > cw - pad) { fm->btn[i]->base.w = 0; continue; }
+        bx += bw + gap;
+    }
 
-    fm->name_in->base.x = 8;
-    fm->name_in->base.y = ch - 40;
-    fm->name_in->base.w = cw - 16;
+    int top = by + rowh + gap;
+    int bot = ch - pad - rowh - gap - cp_row_h();   /* name input + status */
+    fm->iv->base.x = pad;   fm->iv->base.y = top;
+    fm->iv->base.w = cw - 2 * pad;
+    fm->iv->base.h = bot - top;
+    if (fm->iv->base.h < rowh) fm->iv->base.h = rowh;
 
-    fm->status->base.x = 8;   fm->status->base.y = ch - 18;
-    fm->status->base.w = cw - 16;
+    fm->name_in->base.x = pad;
+    fm->name_in->base.y = bot + gap;
+    fm->name_in->base.w = cw - 2 * pad;
+    fm->name_in->base.h = rowh;
+
+    fm->status->base.x = pad;
+    fm->status->base.y = bot + gap + rowh + gap;
+    fm->status->base.w = cw - 2 * pad;
 }
 
 static void fm_on_close(struct gui_window* win) {
     (void)win;
     fm_win = NULL;                               /* ctx (struct fileman) is
                                                   * kfree'd by the window */
+    /* §M69 — and the context with it, in the SAME place.  A deferred dialog
+     * answer arriving after this point must find nothing to write into, and
+     * two pointers cleared in two places is one that eventually is not. */
+    fm_ctx = NULL;
 }
 
 void fileman_open(void) {
@@ -635,12 +756,13 @@ void fileman_open(void) {
     if (!fm) return;
     fm->path[0] = '/';
     fm->path[1] = 0;
-    fm->del_armed_idx = -1;
 
     struct gui_window* win =
-        gui_app_window_create("File Manager", 220, 100, 520, 460, fm_layout, fm);
+        gui_app_window_create("app.filemanager", 220, 100,
+                              cp_px(560), cp_px(460), fm_layout, fm);
     if (!win) { kfree(fm); return; }
     fm_win  = win;
+    fm_ctx  = fm;
     fm->win = win;
     gui_window_set_on_close(win, fm_on_close);
 
@@ -654,13 +776,17 @@ void fileman_open(void) {
     }
 
     fm->path_in = w_textinput_create(win, 8, 4 + FM_MENU_H, 480, fm);
-    w_button_create(win,   8, 24 + FM_MENU_H, 44, 18, "Up",    fm_up,    fm);
-    w_button_create(win,  56, 24 + FM_MENU_H, 56, 18, "MkDir", fm_mkdir, fm);
-    w_button_create(win, 116, 24 + FM_MENU_H, 56, 18, "Touch", fm_touch, fm);
-    w_button_create(win, 176, 24 + FM_MENU_H, 50, 18, "Ren",   fm_ren,   fm);
-    w_button_create(win, 230, 24 + FM_MENU_H, 54, 18, "Copy",  fm_copy,  fm);
-    w_button_create(win, 288, 24 + FM_MENU_H, 44, 18, "Del",   fm_del,   fm);
-    w_button_create(win, 336, 24 + FM_MENU_H, 50, 18, "View",  fm_view,  fm);
+    /* §M69 — the row is BUILT here and SIZED in fm_layout, which is the only
+     * place that knows the density is settled.  The literal 44/56/50/54 widths
+     * and the 18 px height they all shared were measured for the 8x8 font, and
+     * at a runtime face they cut through their own labels. */
+    fm->btn[0] = w_button_create(win, 0, 0, 0, 0, "btn.up",    fm_up,    fm);
+    fm->btn[1] = w_button_create(win, 0, 0, 0, 0, "btn.mkdir", fm_mkdir, fm);
+    fm->btn[2] = w_button_create(win, 0, 0, 0, 0, "btn.touch", fm_touch, fm);
+    fm->btn[3] = w_button_create(win, 0, 0, 0, 0, "btn.rename", fm_ren,   fm);
+    fm->btn[4] = w_button_create(win, 0, 0, 0, 0, "btn.copy",  fm_copy,  fm);
+    fm->btn[5] = w_button_create(win, 0, 0, 0, 0, "btn.delete", fm_del,   fm);
+    fm->btn[6] = w_button_create(win, 0, 0, 0, 0, "btn.view",  fm_view,  fm);
     /* §M65 — no hand-padded header label any more: the TABLE view draws its
      * own from the model, so the columns and their titles cannot drift apart
      * (the old one was a string with spaces in it, and it stopped lining up
@@ -683,7 +809,10 @@ void fileman_open(void) {
 
     fm->name_in->on_submit = fm_name_submit;
     fm->path_in->on_submit = fm_path_submit;
-    fm->status->color = 0xFF8C9AAAu;
+    /* §M69 — the theme's secondary text.  A literal grey-blue is a dark-theme
+     * value, and under the light theme a status line in it is nearly invisible
+     * against a light panel. */
+    fm->status->role = WLBL_MUTED;   /* theme-following, not a captured colour */
 
     fm_layout(win);
     fm_refresh(fm);

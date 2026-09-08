@@ -299,6 +299,53 @@ if [ ! -f "$ISO" ]; then
     exit 1
 fi
 
+# -----------------------------------------------------------------------------
+# IS THIS IMAGE OLDER THAN THE SOURCE IT WAS BUILT FROM?  (§M69)
+#
+# This script BOOTS; it does not build.  `scripts/build.sh` defaults to i386, so
+# the ordinary way to work — edit, build, run i386, then run x86_64 to check the
+# other arch — boots a STALE x86_64 image, silently, and every symptom is
+# attributed to the code that was just written.  That cost a round of chasing a
+# scrollbar bug that did not exist in the tree: on the arch that had actually
+# been rebuilt the fix worked, and the report said it did not.
+#
+# It is the shape this project has paid for five times (§M48's missing NIC,
+# §M49's missing -smp, §4.66's missing disk, §4.67.1's missing watchdog, and
+# §M60's ARM harness that had quietly stopped typing): *the path a person runs
+# and the path that is tested are not the same path.*  The difference here is
+# not a QEMU flag — it is the image itself.
+#
+# A warning and not a refusal: booting an old image on purpose is a legitimate
+# thing to do (bisecting, comparing against yesterday).  What is never
+# legitimate is doing it without knowing.
+# -----------------------------------------------------------------------------
+# `${VAR:-}` and not `$VAR`: this script runs under `set -eu` (line 9), so
+# testing an UNSET variable aborts it — which is what the first version of this
+# check did, and it took the run script down for every arch on every launch.
+# *A guard that stops the thing it was guarding is worse than the gap.*
+if [ -z "${DOS_NO_STALE_CHECK:-}" ]; then
+    NEWER=$(find kernel assets Makefile linker*.ld scripts/build.sh \
+                 -newer "$ISO" -type f \
+                 \( -name '*.c' -o -name '*.h' -o -name '*.s' -o -name '*.S' \
+                    -o -name 'Makefile' -o -name '*.ld' -o -name 'build.sh' \) \
+                 2>/dev/null | head -5)
+    if [ -n "$NEWER" ]; then
+        COUNT=$(find kernel assets Makefile linker*.ld scripts/build.sh \
+                     -newer "$ISO" -type f \
+                     \( -name '*.c' -o -name '*.h' -o -name '*.s' -o -name '*.S' \
+                        -o -name 'Makefile' -o -name '*.ld' -o -name 'build.sh' \) \
+                     2>/dev/null | wc -l | tr -d ' ')
+        echo "" >&2
+        echo "  !! STALE IMAGE: $ISO is older than $COUNT source file(s)." >&2
+        echo "     You are about to boot a build that does NOT contain your" >&2
+        echo "     latest changes.  Newest first:" >&2
+        echo "$NEWER" | sed 's/^/       /' >&2
+        echo "     Rebuild:  ARCH=$ARCH ./scripts/build.sh" >&2
+        echo "     Silence:  DOS_NO_STALE_CHECK=1 $0 ..." >&2
+        echo "" >&2
+    fi
+fi
+
 if command -v "$QEMU" >/dev/null 2>&1; then
     # -rtc base=localtime: the GUI taskbar clock reads the CMOS RTC;
     #   without this QEMU feeds it UTC.

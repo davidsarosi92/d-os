@@ -24,6 +24,7 @@
  * ============================================================================= */
 
 #include "service.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "bus.h"
 #include "task.h"
 #include "klog.h"
@@ -177,3 +178,11 @@ void svc_demo_wdtest(void) {
     kprintf("wdtest: hung task pid=%d detected+killed=%s\n",
             pid, killed ? "PASS" : "FAIL");
 }
+
+/* --- §M70 shell registrations --------------------------------------------- */
+static void sd_bustest(const char* a) { (void)a; svc_demo_bustest(); }
+static void sd_wdtest (const char* a) { (void)a; svc_demo_wdtest();  }
+SHELL_CMD(bustest) = { "bustest", "", "service-bus bind + contract check",
+                       SHELL_G_TEST, sd_bustest };
+SHELL_CMD(wdtest)  = { "wdtest", "", "per-task watchdog: miss a heartbeat on purpose",
+                       SHELL_G_TEST, sd_wdtest };

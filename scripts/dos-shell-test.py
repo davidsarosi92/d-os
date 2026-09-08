@@ -38,6 +38,43 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
+# -----------------------------------------------------------------------------
+# THE CRASH SCAN.  Every run greps the log for its OWN result string — and until
+# 2026-09-04 no run had ever grepped it for the machine having died.  A page
+# fault reproducible in half of runs survived a whole milestone that way: the
+# feature string was present, the screenshot taken before the fault looked
+# perfect, and nobody looked at the six lines in between.
+#
+# Same shape as §M48's missing NIC and §M60's silent ARM harness — the thing not
+# being checked was whether the box crashed — so the check belongs HERE, in the
+# one place every run passes through, and not in each caller's grep.
+#
+# A hit is reported LOUDLY and makes the run fail, whatever else it found: a
+# test that passes on a machine that faulted is not evidence about the feature,
+# it is evidence about the grep.  `--allow-crash` is for the tests that CAUSE
+# one on purpose (`hardlock`, `splash faultkernel`, `drv crash`, `faulttest`)
+# — deliberate, named, and never the default.
+CRASH_PATTERNS = [
+    re.compile(rb"!! EXCEPTION "),                 # ring-0 fault dump (both x86)
+    re.compile(rb"!! NMI HARD-LOCKUP"),            # §M31 L3 hardware watchdog
+    re.compile(rb"PREVIOUS BOOT ENDED UNCLEANLY"), # §M47 NVRAM breadcrumb
+    re.compile(rb"softlockup"),                    # §M31 L2 per-CPU sweep
+    re.compile(rb"spinlock deadlock"),             # §M46 lock-order report
+    re.compile(rb"INPUT EVENT DROPPED"),           # §M69 ring overflow, once
+    re.compile(rb"STILL QUEUED"),                  # §M57 runqueue audit
+]
+
+
+def scan_for_crashes(raw):
+    """Return the log lines that say this machine did not have a good time."""
+    hits = []
+    for line in raw.splitlines():
+        for pat in CRASH_PATTERNS:
+            if pat.search(line):
+                hits.append(line.decode("utf-8", "replace").rstrip())
+                break
+    return hits
+
 # QEMU `sendkey` names for the characters a shell command can contain.  Anything
 # not here is rejected loudly rather than silently dropped: a test that typed
 # half a command and then passed would be worse than one that failed.
@@ -392,6 +429,10 @@ def main():
                          "the framebuffer one — the only way to drive that "
                          "path, and the only way to read its output")
     ap.add_argument("--log", default="")
+    ap.add_argument("--allow-crash", action="store_true",
+                    help="do not fail the run on a fault/lockup in the log — "
+                         "for the tests that deliberately cause one (hardlock, "
+                         "splash faultkernel, drv crash, faulttest)")
     ap.add_argument("--monitor-cmd", action="append", default=[],
                     help="a raw QEMU monitor command to run after the shell "
                          "commands (repeatable) — mouse_move/mouse_button for "
@@ -503,7 +544,26 @@ def main():
             proc.kill()
 
     with open(log, "rb") as fh:
-        sys.stdout.write(fh.read().decode("utf-8", "replace"))
+        raw = fh.read()
+    sys.stdout.write(raw.decode("utf-8", "replace"))
+
+    # See CRASH_PATTERNS.  This runs AFTER the log is printed so the evidence is
+    # already on screen when the banner names it.
+    hits = scan_for_crashes(raw)
+    if hits and not a.allow_crash:
+        sys.stdout.write("\n" + "=" * 70 + "\n")
+        sys.stdout.write("!! THE GUEST CRASHED DURING THIS RUN (%d line(s))\n" % len(hits))
+        sys.stdout.write("   Whatever else this run measured, it measured it on a\n"
+                         "   machine that faulted.  Pass --allow-crash only if the\n"
+                         "   test is SUPPOSED to produce one.\n")
+        sys.stdout.write("=" * 70 + "\n")
+        for h in hits[:20]:
+            sys.stdout.write("   " + h + "\n")
+        if len(hits) > 20:
+            sys.stdout.write("   ... and %d more\n" % (len(hits) - 20))
+        return 3
+    if hits:
+        sys.stdout.write("\n(crash lines present and allowed: %d)\n" % len(hits))
     return rc
 
 

@@ -242,6 +242,42 @@ void gfx_vgradient(struct gfx_surface* s, int x, int y, int w, int h,
     }
 }
 
+/* Integer-scaled text, and tracking.
+ *
+ * ONE font exists here (8x8, one bit per pixel), so the only text sizes this
+ * renderer can produce are whole multiples of it — which is why `gui.font_scale`
+ * is an integer and not a point size (DESIGN_TARGET.md §4).  `extra` widens the
+ * advance per glyph: the Console Plate label style is UPPERCASE with tracking,
+ * and tracking is the one part of that style a bitmap font can honour exactly.
+ *
+ * `gfx_text` is this with scale 1 and no tracking; it stays a separate function
+ * because it is on the hot path for every terminal row and does not need the
+ * two extra multiplies per pixel.
+ *
+ * The splash (kernel/core/splash.c) hand-rolls this same block-grid loop
+ * because it runs before a surface exists; that copy predates this one. */
+void gfx_text_scaled(struct gfx_surface* s, int x, int y, const char* str,
+                     uint32_t fg, int scale, int extra) {
+    if (!s || !s->px || !str) return;
+    if (scale < 1) scale = 1;
+    const int adv = GFX_GLYPH_W * scale + extra;
+    for (; *str; str++, x += adv) {
+        if (x >= s->w) return;
+        const uint8_t* g = fb_font_glyph((unsigned char)*str);
+        for (int py = 0; py < GFX_GLYPH_H; py++) {
+            uint8_t bits = g[py];
+            if (!bits) continue;
+            for (int px = 0; px < GFX_GLYPH_W; px++) {
+                if (!(bits & (0x80u >> px))) continue;
+                /* One fill per source pixel rather than per destination pixel:
+                 * gfx_fill already clips, so a scaled glyph needs no bounds
+                 * arithmetic of its own. */
+                gfx_fill(s, x + px * scale, y + py * scale, scale, scale, fg);
+            }
+        }
+    }
+}
+
 void gfx_text(struct gfx_surface* s, int x, int y, const char* str, uint32_t fg) {
     if (!s || !s->px || !str) return;
     for (; *str; str++, x += GFX_GLYPH_W) {

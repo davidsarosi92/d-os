@@ -14,6 +14,7 @@
  * ============================================================================= */
 
 #include "cron.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "service.h"
 #include "task.h"
 #include "klog.h"
@@ -237,3 +238,8 @@ static void job_tick_log(void) {
     klog(KLOG_INFO, "cron.tick", "scheduled job fired\n");
 }
 CRON_JOB("tick-log", job_tick_log, 5000);
+
+/* --- §M70 shell registration ----------------------------------------------- */
+static void cr_crontab(const char* a) { (void)a; cron_list(); }   /* -l is the only form */
+SHELL_CMD(crontab) = { "crontab", "[-l]", "scheduled jobs",
+                       SHELL_G_SYS, cr_crontab };

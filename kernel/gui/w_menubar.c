@@ -20,6 +20,8 @@
 
 #include "ui.h"
 #include "widget.h"
+#include "console_plate.h"
+#include "locale.h"
 #include "gui.h"
 #include "gfx.h"
 #include "keymap.h"
@@ -31,9 +33,14 @@
 #define MB_MAX      8               /* top-level menus per window            */
 #define MB_TITLELEN 16
 
-#define MBCOL_BG    0xFF1B2434u
-#define MBCOL_TEXT  0xFFE6ECF5u
-#define MBCOL_HOT   0xFF2C5B9Eu
+/* §M69 — THE THEME, READ LIVE.  Three literals, and they were dark-theme
+ * values: under the light theme the bar stayed a navy band with its own dark
+ * text on it, which is the same defect the item views had one file over.
+ * widget_specs.md §13 puts the menu bar on `raised` with `text` on it and
+ * `hover` under the pointer. */
+#define MBCOL_BG    (cp_current_theme()->raised)
+#define MBCOL_TEXT  (cp_current_theme()->text)
+#define MBCOL_HOT   (cp_current_theme()->hover)
 
 struct w_menubar {
     struct widget base;
@@ -57,7 +64,12 @@ static int mb_len(const char* s) { int n = 0; while (s && s[n]) n++; return n; }
 static void mb_collect(struct w_menubar* m) {
     m->ntitles = 0;
     for (int i = 0; i < m->ndefs && m->ntitles < MB_MAX; i++) {
-        const char* t = m->defs[i].menu;
+        /* §M69 — THROUGH THE CATALOGUE.  Safe to apply to every menu in the
+         * tree because `lstr` falls back to the key itself: a plain English
+         * literal that is not a catalogue key renders as itself, so the
+         * catalogue can be adopted one string at a time instead of in one
+         * flag-day edit. */
+        const char* t = lstr(m->defs[i].menu);
         if (!t) continue;
         int seen = 0;
         for (int j = 0; j < m->ntitles; j++)
@@ -74,14 +86,14 @@ static void mb_collect(struct w_menubar* m) {
 static int mb_title_x(struct w_menubar* m, int idx) {
     int x = m->base.x + 4;
     for (int i = 0; i < idx && i < m->ntitles; i++)
-        x += mb_len(m->titles[i]) * GFX_GLYPH_W + MB_PAD * 2;
+        x += cp_text_w(m->titles[i]) + MB_PAD * 2;
     return x;
 }
 
 static int mb_title_at(struct w_menubar* m, int lx) {
     int x = 4;
     for (int i = 0; i < m->ntitles; i++) {
-        int w = mb_len(m->titles[i]) * GFX_GLYPH_W + MB_PAD * 2;
+        int w = cp_text_w(m->titles[i]) + MB_PAD * 2;
         if (lx >= x && lx < x + w) return i;
         x += w;
     }
@@ -93,10 +105,10 @@ static void mb_draw(struct widget* w, struct gfx_surface* s) {
     gfx_fill(s, w->x, w->y, w->w, MB_H, MBCOL_BG);
     for (int i = 0; i < m->ntitles; i++) {
         int tx = mb_title_x(m, i);
-        int tw = mb_len(m->titles[i]) * GFX_GLYPH_W + MB_PAD * 2;
+        int tw = mb_len(m->titles[i]) * cp_fw() + MB_PAD * 2;
         if (i == m->open_menu)
             gfx_fill(s, tx - MB_PAD, w->y, tw, MB_H, MBCOL_HOT);
-        gfx_text(s, tx, w->y + (MB_H - GFX_GLYPH_H) / 2, m->titles[i], MBCOL_TEXT);
+        cp_text(s, tx, w->y + (MB_H - cp_fh()) / 2, m->titles[i], MBCOL_TEXT);
     }
 }
 
@@ -108,7 +120,7 @@ static void mb_open(struct w_menubar* m, int idx) {
     int n = 0;
     for (int i = 0; i < m->ndefs; i++) {
         if (!mb_streq(m->defs[i].menu, m->titles[idx])) continue;
-        const char* it = m->defs[i].item ? m->defs[i].item : "-";
+        const char* it = lstr(m->defs[i].item) ? lstr(m->defs[i].item) : "-";
         for (int k = 0; it[k] && n < (int)sizeof buf - 2; k++) buf[n++] = it[k];
         if (n < (int)sizeof buf - 1) buf[n++] = '\n';
     }

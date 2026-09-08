@@ -80,6 +80,8 @@ void kprintf(const char* fmt, ...);
 #include "hwdev.h"
 #include "task.h"
 #include "printf.h"
+#include "config.h"
+#include "gui.h"
 #endif
 #include <stdint.h>
 #include <stddef.h>
@@ -164,8 +166,33 @@ void mouse_set_wheel_listener(mouse_wheel_t fn) { wheel_listener = fn; }
  * it.  The in-kernel packet assembler calls it, and so does the syscall a
  * ring-3 driver publishes through: the input stack cannot tell which, which is
  * the property that makes the placement a deployment decision. */
+/* `gui.input_debug` — one line per WHEEL notch, at the point the DEVICE
+ * produced it.
+ *
+ * The reason this probe has two halves (the other is in gui.c) is that the
+ * previous experiment could not tell two very different failures apart: a
+ * settings panel that did not scroll is equally consistent with "our routing
+ * drops the wheel" and with "the monitor cannot deliver one to a mouse
+ * decoding the 4-byte IntelliMouse packet".  Logging where the packet is
+ * DECODED and again where it is DISPATCHED separates them: a line here and no
+ * line there is our bug; no line here at all is the harness's limit. */
 void mouse_publish(int dx, int dy, unsigned buttons, int dz) {
+    /* §M69 — THE DEVICE END OF THE CLICK PROBE.  Reported as *"sometimes a
+     * click does nothing"*, and the queue fix above it is unproven because
+     * this harness cannot reproduce the load that causes it.  So log the
+     * button TRANSITION where the packet is decoded; gui.c logs where it is
+     * dispatched.  A press that appears here and not there is a queue that
+     * lost it; a press that appears in neither was never produced — and those
+     * two live in different files and need opposite fixes. */
+    {
+        static unsigned prev_btn;
+        if (buttons != prev_btn && gui_input_debug())
+            kprintf("ps2-mouse: buttons %x -> %x\n", prev_btn, buttons);
+        prev_btn = buttons;
+    }
     if (listener) listener(dx, dy, buttons);
+    if (dz && gui_input_debug())
+        kprintf("ps2-mouse: wheel dz=%d (device decoded it)\n", dz);
     if (dz && wheel_listener) wheel_listener(dz);
 }
 #endif

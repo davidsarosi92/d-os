@@ -46,7 +46,8 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "smp.h"
 #include "block.h"
 #include "block_cache.h"
-#include "config.h"          /* §M63 stage 0 — config_attach_persistent */
+#include "config.h"
+#include "locale.h"          /* §M63 stage 0 — config_attach_persistent */
 #include "iommu.h"           /* §M33 stage 5 — DMA remapping capability */
 #include "drvrt.h"          /* §M33 stage 2 — deferred driver tasks */
 #include "modload.h"        /* §M67 — modload_autoload() */
@@ -315,6 +316,11 @@ void aarch64_main_entry(uint64_t dtb) {
              * ARM would keep losing every setting at reboot while x86 kept
              * them — the same shape as the pkg_init duplication below. */
             config_attach_persistent("/mnt");
+            /* §M69 — AFTER the store is overlaid, on BOTH boot paths.  A
+             * language read before it would be the default for one boot and
+             * the saved value from the next — §M63's "one boot late" defect,
+             * and the reason config_attach_persistent exists at all. */
+            locale_init();
 
             /* §M64 tail — the shortcuts too, and the comment above is the
              * whole argument for why this line exists twice in this tree. */

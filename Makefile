@@ -640,6 +640,16 @@ ifeq ($(ARCH),i386)
 CORE_C_SRCS := \
     kernel/core/kernel.c \
     kernel/core/shell.c \
+    kernel/core/shellcmd.c \
+    kernel/core/cmd_util.c \
+    kernel/core/cmd_fs.c \
+    kernel/core/cmd_mem.c \
+    kernel/core/cmd_task.c \
+    kernel/core/cmd_sys.c \
+    kernel/core/cmd_desktop.c \
+    kernel/core/cmd_pkg.c \
+    kernel/core/cmd_wayland.c \
+    kernel/core/cmd_test.c \
     kernel/core/rescue_shell.c \
     kernel/core/printf.c \
     kernel/core/klog.c \
@@ -669,6 +679,7 @@ CORE_C_SRCS := \
     kernel/core/ksym.c \
     kernel/core/modload.c \
     kernel/core/config.c \
+    kernel/core/locale.c \
     kernel/core/task.c \
     kernel/core/block.c \
     kernel/core/block_cache.c \
@@ -677,10 +688,16 @@ CORE_C_SRCS := \
     kernel/core/vc.c \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
+    kernel/gui/gterm.c \
+    kernel/gui/app_host.c \
+    kernel/gui/gui_mode.c \
+    kernel/gui/wm.c \
     kernel/gui/dosgui.c \
     kernel/gui/widget.c \
     kernel/gui/ui.c \
     kernel/gui/w_controls.c \
+    kernel/gui/dialog.c \
+    kernel/gui/scrollbar.c \
     kernel/gui/w_menubar.c \
     kernel/gui/wayland.c \
     kernel/gui/wl_keymap.c \
@@ -689,7 +706,14 @@ CORE_C_SRCS := \
     kernel/gui/wallpaper.c \
     kernel/gui/vpath.c \
     assets/splash_logo.c \
+    assets/icons_vector.c \
+    kernel/gui/vfont.c \
+    assets/fonts/gen/vfont_ui.c \
+    assets/fonts/gen/vfont_label.c \
+    assets/fonts/gen/vfont_mono.c \
     kernel/gui/icons.c \
+    kernel/gui/theme.c \
+    kernel/gui/cp_draw.c \
     kernel/gui/itemview.c \
     kernel/gui/w_itemview.c \
     kernel/gui/shortcut.c \
@@ -704,6 +728,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/newshell.c \
     kernel/gui/apps/hello.c \
     kernel/gui/apps/taskman.c \
+    kernel/gui/apps/uikit.c \
     kernel/gui/apps/crashapp.c \
     kernel/gui/apps/editor.c \
     kernel/gui/apps/basic.c \
@@ -805,6 +830,7 @@ CORE_C_SRCS := \
     kernel/core/task.c \
     kernel/core/block_cache.c \
     kernel/core/config.c \
+    kernel/core/locale.c \
     kernel/core/driver.c \
     kernel/core/hwdev.c \
     kernel/core/domain.c \
@@ -819,6 +845,16 @@ CORE_C_SRCS := \
     kernel/core/layouts.c \
     kernel/core/vc.c \
     kernel/core/shell.c \
+    kernel/core/shellcmd.c \
+    kernel/core/cmd_util.c \
+    kernel/core/cmd_fs.c \
+    kernel/core/cmd_mem.c \
+    kernel/core/cmd_task.c \
+    kernel/core/cmd_sys.c \
+    kernel/core/cmd_desktop.c \
+    kernel/core/cmd_pkg.c \
+    kernel/core/cmd_wayland.c \
+    kernel/core/cmd_test.c \
     kernel/core/rescue_shell.c \
     kernel/core/basic.c \
     kernel/drivers/terminal/fb_terminal.c \
@@ -826,10 +862,16 @@ CORE_C_SRCS := \
     kernel/drivers/usb/usb_hid.c \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
+    kernel/gui/gterm.c \
+    kernel/gui/app_host.c \
+    kernel/gui/gui_mode.c \
+    kernel/gui/wm.c \
     kernel/gui/dosgui.c \
     kernel/gui/widget.c \
     kernel/gui/ui.c \
     kernel/gui/w_controls.c \
+    kernel/gui/dialog.c \
+    kernel/gui/scrollbar.c \
     kernel/gui/w_menubar.c \
     kernel/gui/wayland.c \
     kernel/gui/wl_keymap.c \
@@ -838,7 +880,14 @@ CORE_C_SRCS := \
     kernel/gui/wallpaper.c \
     kernel/gui/vpath.c \
     assets/splash_logo.c \
+    assets/icons_vector.c \
+    kernel/gui/vfont.c \
+    assets/fonts/gen/vfont_ui.c \
+    assets/fonts/gen/vfont_label.c \
+    assets/fonts/gen/vfont_mono.c \
     kernel/gui/icons.c \
+    kernel/gui/theme.c \
+    kernel/gui/cp_draw.c \
     kernel/gui/itemview.c \
     kernel/gui/w_itemview.c \
     kernel/gui/shortcut.c \
@@ -853,6 +902,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/newshell.c \
     kernel/gui/apps/hello.c \
     kernel/gui/apps/taskman.c \
+    kernel/gui/apps/uikit.c \
     kernel/gui/apps/crashapp.c \
     kernel/gui/apps/editor.c \
     kernel/gui/apps/basic.c \
@@ -877,6 +927,16 @@ else
 CORE_C_SRCS := \
     kernel/core/kernel.c \
     kernel/core/shell.c \
+    kernel/core/shellcmd.c \
+    kernel/core/cmd_util.c \
+    kernel/core/cmd_fs.c \
+    kernel/core/cmd_mem.c \
+    kernel/core/cmd_task.c \
+    kernel/core/cmd_sys.c \
+    kernel/core/cmd_desktop.c \
+    kernel/core/cmd_pkg.c \
+    kernel/core/cmd_wayland.c \
+    kernel/core/cmd_test.c \
     kernel/core/rescue_shell.c \
     kernel/core/printf.c \
     kernel/core/klog.c \
@@ -906,6 +966,7 @@ CORE_C_SRCS := \
     kernel/core/ksym.c \
     kernel/core/modload.c \
     kernel/core/config.c \
+    kernel/core/locale.c \
     kernel/core/task.c \
     kernel/core/block.c \
     kernel/core/block_cache.c \
@@ -914,10 +975,16 @@ CORE_C_SRCS := \
     kernel/core/vc.c \
     kernel/gui/gfx.c \
     kernel/gui/gui.c \
+    kernel/gui/gterm.c \
+    kernel/gui/app_host.c \
+    kernel/gui/gui_mode.c \
+    kernel/gui/wm.c \
     kernel/gui/dosgui.c \
     kernel/gui/widget.c \
     kernel/gui/ui.c \
     kernel/gui/w_controls.c \
+    kernel/gui/dialog.c \
+    kernel/gui/scrollbar.c \
     kernel/gui/w_menubar.c \
     kernel/gui/wayland.c \
     kernel/gui/wl_keymap.c \
@@ -926,7 +993,14 @@ CORE_C_SRCS := \
     kernel/gui/wallpaper.c \
     kernel/gui/vpath.c \
     assets/splash_logo.c \
+    assets/icons_vector.c \
+    kernel/gui/vfont.c \
+    assets/fonts/gen/vfont_ui.c \
+    assets/fonts/gen/vfont_label.c \
+    assets/fonts/gen/vfont_mono.c \
     kernel/gui/icons.c \
+    kernel/gui/theme.c \
+    kernel/gui/cp_draw.c \
     kernel/gui/itemview.c \
     kernel/gui/w_itemview.c \
     kernel/gui/shortcut.c \
@@ -941,6 +1015,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/newshell.c \
     kernel/gui/apps/hello.c \
     kernel/gui/apps/taskman.c \
+    kernel/gui/apps/uikit.c \
     kernel/gui/apps/crashapp.c \
     kernel/gui/apps/editor.c \
     kernel/gui/apps/basic.c \
@@ -2539,3 +2614,17 @@ clean-all:
 # The dependency files produced above.  `-include` (not `include`) so a fresh
 # tree with no .d files yet is not an error.
 -include $(shell find $(OBJ_DIR) -name '*.d' 2>/dev/null)
+
+# --- vector fonts (§M69) ---------------------------------------------------
+# The generated tables are COMMITTED, exactly like assets/icons_vector.c: an
+# ordinary build must not need Python, and a font file the converter cannot
+# reach must not be able to break a kernel build.  Regenerate with `make fonts`
+# after changing a face or the converter.
+.PHONY: fonts
+fonts:
+	python3 scripts/ttf2font.py assets/fonts/Barlow-Regular.ttf \
+	    assets/fonts/gen/vfont_ui.c vfont_ui
+	python3 scripts/ttf2font.py assets/fonts/BarlowCondensed-SemiBold.ttf \
+	    assets/fonts/gen/vfont_label.c vfont_label
+	python3 scripts/ttf2font.py assets/fonts/IBMPlexMono-Regular.ttf \
+	    assets/fonts/gen/vfont_mono.c vfont_mono --mono

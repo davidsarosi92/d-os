@@ -8,6 +8,7 @@
 #include "gui_app.h"
 #include "icons.h"
 #include "widget.h"
+#include "console_plate.h"
 #include <stddef.h>
 
 static struct gui_window* about_win = NULL;
@@ -21,7 +22,8 @@ static void about_open(void) {
     if (about_win) { gui_window_raise(about_win); return; }
 
     struct gui_window* w =
-        gui_app_window_create("About d-os", 490, 320, 300, 150, NULL, NULL);
+        gui_app_window_create("About d-os", 490, 320,
+                              cp_px(300), cp_px(150), NULL, NULL);
     if (!w) return;
     about_win = w;
     gui_window_set_on_close(w, about_on_close);
@@ -31,7 +33,7 @@ static void about_open(void) {
     w_label_create(w, 16, 50, 260, "desktop shells + app registry");
     struct w_label* d = w_label_create(w, 16, 78, 260,
                                        "i386 / x86_64 - PLAN.md M22");
-    if (d) d->color = 0xFF8C9AAAu;
+    if (d) d->role = WLBL_MUTED;   /* theme-following, not a captured colour */
     gui_window_request_redraw(w);
 }
 

@@ -89,6 +89,12 @@ void gfx_vgradient(struct gfx_surface* s, int x, int y, int w, int h,
  * a solid background is wanted. */
 void gfx_text(struct gfx_surface* s, int x, int y, const char* str, uint32_t fg);
 
+/* The same, at a whole-number scale and with `extra` pixels of tracking per
+ * glyph.  scale 1 / extra 0 is gfx_text.  See the implementation for why a
+ * bitmap font makes integer scaling the only honest text size here. */
+void gfx_text_scaled(struct gfx_surface* s, int x, int y, const char* str,
+                     uint32_t fg, int scale, int extra);
+
 /* Glyph cell size of the embedded font (8×8) — exported so layout math
  * in the GUI does not hard-code magic 8s. */
 #define GFX_GLYPH_W 8

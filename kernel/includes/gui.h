@@ -60,6 +60,22 @@ struct gui_desktop_stats {
 };
 void gui_get_desktop_stats(struct gui_desktop_stats* out);
 
+/* §M69 - per-window input queue health.  `dropped` must stay 0: it counts
+ * events thrown away because the ring was full of things that all mattered,
+ * and a dropped press is a click the user made and the machine did not see. */
+void gui_get_input_stats(unsigned* dropped, unsigned* coalesced);
+
+/* §M69 — `gui.input_debug`, CACHED.  The probes it gates sit on the mouse
+ * packet path, and one of them is in the IRQ: `config_get_long` walks the
+ * config store comparing strings, and doing that per packet is real work in
+ * interrupt context at trackpad rates.  §M69 wrote down that a string lookup
+ * "is noise next to megabytes of blitting" — true of a compose, false of an
+ * interrupt handler, and the difference is the rate.  Re-read on a change
+ * through gui_input_debug_refresh(); a debug gate does not need to be live to
+ * the millisecond. */
+int  gui_input_debug(void);
+void gui_input_debug_refresh(void);
+
 /* Boot-time: start the desktop if `gui.autostart` says so (default: yes).
  *
  * ONE function rather than the six lines at each call site, because there are
@@ -251,6 +267,27 @@ void gui_popup_open(struct gui_window* owner, int sx, int sy,
 void gui_popup_close(void);
 int  gui_popup_active(void);
 
+/* §M69 — SESSION-WIDE MODALITY.  While `win` holds it, it is topmost and
+ * focused, every pointer press landing outside it is swallowed (taskbar and
+ * desktop included), Alt-Tab is refused, and the compositor paints the
+ * design's 45 % backdrop over everything else.
+ *
+ * ONE holder: a second claim is REFUSED (-1) rather than queued, because
+ * modality is a claim on the next event and two claimants cannot settle it.
+ * The claim is released automatically when the window is destroyed, by ANY
+ * route — a claim that outlives its window locks the desktop.
+ *
+ * Escape asks the modal to close, trapped in the compositor rather than in the
+ * dialog's own key hook, so a wedged dialog still has a way out. */
+int  gui_window_set_modal(struct gui_window* win, int on);
+int  gui_modal_active(void);
+
+/* §M69 — `wheeltest <x> <y> <dz>`: push a wheel notch into the focused app
+ * window at a CONTENT coordinate, through the real dispatcher.  The only way
+ * to test wheel ROUTING here, because this harness cannot produce a device
+ * notch (§M69's measured IntelliMouse limit). */
+void gui_wheel_test(int x, int y, int dz);
+
 /* §M65 — the toolkit's per-window state slot (owned by ui.c, freed with the
  * window).  Accessors, not a field, so ui.c stays out of gui.c's internals. */
 /* Where the window's CONTENT starts on screen — widgets think in content
@@ -359,14 +396,31 @@ void gui_window_clear_widgets(struct gui_window* win);
  * screenshot, because the new widgets draw over the old ones. */
 void gui_widget_report(void);
 void gui_relayout_all(void);
+/* Invalidate everything after a palette change: every window redraws its own
+ * surface AND the whole screen is damaged.  Both halves are needed — see the
+ * implementation for the streak this fixed. */
+void gui_theme_changed(void);
 /* Count, re-layout N times, count again.  One command because a GUI window with
  * focus stops the harness typing the second one. */
 void gui_relayout_test(int rounds);
+
+/* Open the widget gallery — every registered class on one screen, next to
+ * which the design's own catalogue can be held.  See gui/apps/uikit.c for why
+ * it is a command rather than a Start-menu entry. */
+void uikit_command(void);
 
 /* Time N full-screen composites with a full-screen window open — the case
  * reported as "everything lags when a window is maximized". */
 void gui_compose_bench(int frames);
 
+/* A periodic callback on the window's own host task (~2 Hz).
+ *
+ * THE TICK DAMAGES WHAT IT CHANGED.  The host does NOT repaint the window
+ * afterwards — a hook that changes a label must call gui_window_request_redraw,
+ * one that changes a few rows should ask for those rows, and one that finds
+ * nothing to do should return having asked for nothing, which is what makes an
+ * idle window free.  The host used to repaint unconditionally, which quietly
+ * made every per-rect refresh in this tree a no-op (see app_host_main). */
 void gui_window_set_tick(struct gui_window* win,
                          void (*fn)(struct gui_window*));
 

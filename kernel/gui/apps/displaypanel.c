@@ -27,8 +27,10 @@
 #include "gui_app.h"
 #include "icons.h"
 #include "widget.h"
+#include "console_plate.h"
 #include "itemview.h"
 #include "settings.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "config.h"
 #include "fb_present.h"
 #include "ktimer.h"
@@ -160,10 +162,19 @@ static void dlg_layout(struct gui_window* win) {
     dlg_count = NULL;
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
-    w_label_create(win, 10, 8, cw - 20, "Keep this display mode?");
-    dlg_count = w_label_create(win, 10, 26, cw - 20, "");
-    w_button_create(win, cw - 150, ch - 34, 64, 24, "OK",     dlg_ok,     NULL);
-    w_button_create(win, cw - 80,  ch - 34, 70, 24, "Cancel", dlg_cancel, NULL);
+    const int pad = cp_px(10), gap = cp_px(6), row = cp_row_h();
+    w_label_create(win, pad, gap, cw - 2 * pad, "Keep this display mode?");
+    dlg_count = w_label_create(win, pad, gap + row, cw - 2 * pad, "");
+    /* §M69 — right-aligned and measured right to left, like every other action
+     * row now; the old 64/70 x 24 boxes cut through "Cancel" at a runtime face. */
+    {
+        int y = ch - gap - cp_btn_h(), x = cw - pad;
+        struct w_button* c = w_button_create(win, 0, 0, 0, 0, "Cancel",
+                                             dlg_cancel, NULL);
+        struct w_button* o = w_button_create(win, 0, 0, 0, 0, "OK", dlg_ok, NULL);
+        if (c) { x -= w_button_autosize(c, 0, y); c->base.x = x; x -= gap; }
+        if (o) { x -= w_button_autosize(o, 0, y); o->base.x = x; }
+    }
 }
 
 /* Opened FROM THE COMPOSITOR once the new mode is live (gui.c calls this
@@ -179,7 +190,7 @@ static int dlg_sw = 0, dlg_sh = 0;
 static void dlg_build(void) {
     if (dlg_win) return;
     int ow, oh;
-    gui_window_outer_for_content(320, 96, &ow, &oh);
+    gui_window_outer_for_content(cp_px(320), cp_px(96), &ow, &oh);
     dlg_win = gui_app_window_create("Display", (dlg_sw - ow) / 2, (dlg_sh - oh) / 3,
                                     ow, oh, dlg_layout, NULL);
     if (!dlg_win) {          /* no window → no way to confirm → revert now */
@@ -331,22 +342,24 @@ static void dp_layout(struct gui_window* win) {
     gui_window_clear_widgets(win);
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
+    const int pad = cp_px(8), gap = cp_px(6), row = cp_row_h();
     if (fb_mode_count() <= 1) {
-        w_label_create(win, 8, 8, cw - 16,
+        w_label_create(win, pad, gap, cw - 2 * pad,
                        "This display cannot change resolution.");
-        w_label_create(win, 8, 26, cw - 16,
+        w_label_create(win, pad, gap + row, cw - 2 * pad,
                        "(virtio-gpu: see fb_present.h)");
         return;
     }
-    w_label_create(win, 8, 6, cw - 16, "Double-click a resolution");
-    w_itemview_create(win, 8, 24, cw - 16, ch - 32, &dp_model,
+    w_label_create(win, pad, gap, cw - 2 * pad, "Double-click a resolution");
+    w_itemview_create(win, pad, gap + row, cw - 2 * pad,
+                      ch - gap - row - gap, &dp_model,
                       config_get("controlpanel.view", "list"), NULL);
 }
 
 static void display_panel_open(void) {
     if (dp_win) { gui_window_raise(dp_win); return; }
     int ow, oh;
-    gui_window_outer_for_content(360, 300, &ow, &oh);
+    gui_window_outer_for_content(cp_px(360), cp_px(300), &ow, &oh);
     dp_win = gui_app_window_create("Display", 200, 140, ow, oh, dp_layout, NULL);
     if (dp_win) gui_window_set_on_close(dp_win, dp_on_close);
 }
@@ -367,3 +380,10 @@ CONFIG_KEY(ck_mode) = {
     .key = "gui.mode", .group = "Display", .type = CFG_STRING, .def = "",
     .help = "confirmed resolution, e.g. 1280x800 (written by the OK button)",
 };
+
+/* --- §M70 shell registration -----------------------------------------------
+ * Both outcomes must be drivable headlessly: a revert nothing can trigger on
+ * purpose is a revert nobody has tested (§M61). */
+SHELL_CMD(mode) = { "mode", "[list|<w>x<h> [--force]|confirm|revert]",
+                    "display resolution",
+                    SHELL_G_GUI, display_cmd };

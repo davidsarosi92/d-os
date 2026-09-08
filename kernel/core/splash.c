@@ -12,6 +12,7 @@
  * ============================================================================= */
 
 #include "splash.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "gfx.h"
 #include "fb_present.h"
 #include "console.h"
@@ -493,3 +494,7 @@ int splash_key(void) {
     kprintf("splash: dismissed — showing the boot log\n");
     return 1;
 }
+
+/* --- §M70 shell registration ----------------------------------------------- */
+SHELL_CMD(splash) = { "splash", "[on|off|status|faultkernel]", "the boot screen",
+                      SHELL_G_SYS, splash_cmd };

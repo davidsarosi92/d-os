@@ -38,6 +38,7 @@
 #include "gui_app.h"
 #include "icons.h"
 #include "widget.h"
+#include "console_plate.h"
 #include "crash.h"
 #include "config.h"
 #include "kmalloc.h"
@@ -47,6 +48,9 @@
 struct crashapp {
     struct w_listview* lv;
     struct w_label*    status;
+    /* §M69 — held so ca_layout can size them from the live density. */
+    struct w_label*    hdr;
+    struct w_button*   refresh;
     int                last_seen;      /* crash_count() at the last refresh */
 };
 
@@ -168,11 +172,25 @@ static void ca_layout(struct gui_window* win) {
     struct crashapp* ca = (struct crashapp*)gui_window_ctx(win);
     int w = 0, h = 0;
     if (!ca || !gui_window_content_size(win, &w, &h)) return;
+    /* §M69 — derived from the live density.  The old 16/74/20 were 8x8-era
+     * pixel counts: at a runtime face the list overlapped the button row and
+     * the status line sat under the window's bottom edge. */
+    const int pad = cp_px(8), gap = cp_px(6), rowh = cp_btn_h();
+    const int head = cp_row_h();                 /* the column header label  */
+    int top = gap + head;
+    int bot = h - cp_row_h() - gap - rowh;       /* status + Refresh row     */
+    if (ca->hdr) { ca->hdr->base.x = pad; ca->hdr->base.y = gap;
+                   ca->hdr->base.w = w - 2 * pad; }
     if (ca->lv) {
-        ca->lv->base.w = w - 16;
-        ca->lv->base.h = h - 74;
+        ca->lv->base.x = pad;   ca->lv->base.y = top;
+        ca->lv->base.w = w - 2 * pad;
+        ca->lv->base.h = bot - top;
+        if (ca->lv->base.h < rowh) ca->lv->base.h = rowh;
     }
-    if (ca->status) { ca->status->base.y = h - 20; ca->status->base.w = w - 16; }
+    if (ca->refresh) w_button_autosize(ca->refresh, pad, bot + gap);
+    if (ca->status) { ca->status->base.x = pad;
+                      ca->status->base.y = h - cp_row_h();
+                      ca->status->base.w = w - 2 * pad; }
 }
 
 static void ca_on_close(struct gui_window* win) { (void)win; ca_win = NULL; }
@@ -184,18 +202,20 @@ static void crashapp_open(void) {
     if (!ca) return;
 
     struct gui_window* win =
-        gui_app_window_create("Crash Reports", 260, 160, 500, 300, ca_layout, ca);
+        gui_app_window_create("Crash Reports", 260, 160,
+                              cp_px(500), cp_px(300), ca_layout, ca);
     if (!win) { kfree(ca); return; }
     ca_win = win;
     gui_window_set_on_close(win, ca_on_close);
 
-    w_label_create(win, 8, 3, 400, "UPTIME KIND         PID  NAME  PC");
-    ca->lv = w_listview_create(win, 8, 26, 484, 200, ca);
-    w_button_create(win, 8, 232, 90, 18, "Refresh", ca_btn_refresh, ca);
-    ca->status = w_label_create(win, 8, 258, 484, "");
+    /* Geometry is ca_layout's; it runs before the first paint. */
+    ca->hdr = w_label_create(win, 0, 0, 0, "UPTIME KIND         PID  NAME  PC");
+    ca->lv = w_listview_create(win, 0, 0, 0, 0, ca);
+    ca->refresh = w_button_create(win, 0, 0, 0, 0, "Refresh", ca_btn_refresh, ca);
+    ca->status = w_label_create(win, 0, 0, 0, "");
     if (!ca->lv || !ca->status) { gui_window_close(win); return; }
     ca->lv->on_select = ca_select;
-    ca->status->color = 0xFF8C9AAAu;
+    ca->status->role = WLBL_MUTED;   /* theme-following, not a captured colour */
     ca->last_seen = -1;                         /* force the first refresh */
 
     gui_window_set_tick(win, ca_tick);

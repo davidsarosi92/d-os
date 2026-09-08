@@ -137,11 +137,32 @@ SECTIONS
         __stop_ui_classes = .;
     }
 
+    /* §M69 — the string catalogue: LOCALE_CATALOG() entries, one per language,
+       looked up BY KEY so adding a language is a FILE rather than an edit to a
+       switch in the middle of the toolkit. */
+    .locale_catalogs : ALIGN(8)
+    {
+        __start_locale_catalogs = .;
+        KEEP(*(locale_catalogs))
+        __stop_locale_catalogs = .;
+    }
+
     .config_keys : ALIGN(8)
     {
         __start_config_keys = .;
         KEEP(*(config_keys))
         __stop_config_keys = .;
+    }
+
+    /* §M70 — shell commands: SHELL_CMD() descriptors, looked up BY VERB.  A
+       command ships next to the code it drives, `help` is generated from this
+       section, and BOTH shells (shell.c and the aarch64 serial REPL) walk it —
+       so a command is no longer x86-only by accident. */
+    .shell_cmds : ALIGN(8)
+    {
+        __start_shell_cmds = .;
+        KEEP(*(shell_cmds))
+        __stop_shell_cmds = .;
     }
 
     /* Which PCI IDs a driver claims (hwdev.h) — declared NEXT TO THE DRIVER so

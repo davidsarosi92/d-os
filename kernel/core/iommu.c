@@ -36,6 +36,7 @@
  * ============================================================================= */
 
 #include "iommu.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "iommu_backend.h"
 #include "acpi.h"
 #include "printf.h"
@@ -1102,3 +1103,12 @@ int iommu_confine(uint16_t bdf, uint64_t base, uint64_t len) {
     return iommu_restrict(bdf, base, len);
 #endif
 }
+
+/* --- §M70 shell registration -----------------------------------------------
+ * Its own verb rather than a line in `lsdrv`, because the answer is a property
+ * of the MACHINE and not of any driver: it reads the same on a box with no
+ * drivers placed at all, which is exactly when somebody deciding whether to
+ * place one wants it. */
+SHELL_CMD(iommu) = { "iommu", "[limit|block|<dev>]",
+                     "what this machine can enforce against a device",
+                     SHELL_G_DEV, iommu_cmd };

@@ -19,7 +19,9 @@
 #include "config.h"
 #include "gui_app.h"
 #include "gui_internal.h"
-#include "gui.h"           /* gui_damage — the icon layer damages its own rects */
+#include "gui.h"
+#include "console_plate.h"
+#include "locale.h"           /* gui_damage — the icon layer damages its own rects */
 #include "widget.h"        /* WPTR_* — §M58's pointer phases, shared vocabulary */
 #include "klog.h"          /* a drag must leave evidence on the serial log */
 #include "icons.h"         /* ICON_APP — the item_entry's default glyph */
@@ -30,8 +32,20 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define TASKBAR_H   34
-#define START_W     74
+#define TASKBAR_H   cp_taskbar_h()
+/* DERIVED FROM THE FONT, NOT A CONSTANT.  These were sized for the 8x8 font
+ * and became wrong the moment `gui.font_scale` could move: the clock overran
+ * its box and drew over the element beside it, which is what the doubled date
+ * in the first 2x screenshot actually was.  A width that assumes a text size
+ * has to be recomputed when the text size becomes a setting. */
+/* §M69 — MEASURED IN THE FACE IT IS DRAWN IN.  This was `5 * cp_fw() + 24`:
+ * a character count times a DIGIT's advance, which is the habit the 8x8 font
+ * taught and which console_plate.h warns about in capitals.  With a
+ * proportional face the box is the wrong width AND the label inside it is
+ * off-centre by the difference — reported from use as "the Start caption
+ * should be in the middle".  One source for both, so they cannot disagree. */
+#define START_TEXT  lstr("taskbar.start")
+#define START_W     (cp_text_w(START_TEXT) + 2 * cp_ctrl_pad_x())
 #define TBTN_W      150
 /* Clock panel: "YYYY-MM-DD  HH:MM:SS" = 20 glyphs + padding.
  *
@@ -40,7 +54,19 @@
  * can drift.  The same argument the sound work made — the taskbar control and
  * the Control Panel page write the SAME keys, so there is one answer to "what
  * is the volume" rather than two. */
-#define CLOCK_W     180
+/* THE STATUS AREA IS SIZED FROM THE TYPE, AND SET IN MONO — widget_specs.md
+ * §16: "jobb oldalon mono 12px `muted` státuszok 16px réssel, az óra `text`
+ * színnel".  Everything here used to be a 2007 pixel count (icons 20 and
+ * cp_fw()+4, boxes 28 and 52) that did not move when §M69 made the type a
+ * runtime fact, which is what "the tray looks unfinished" was describing: a
+ * 20 px icon beside 20 px text reads as an afterthought, and a 15 px one reads
+ * as damage.
+ *
+ * ONE derived size for every tray glyph, so the two indicators cannot drift
+ * apart, and the clock measured in the face it is DRAWN in. */
+#define TRAY_ICON   (cp_fh() + cp_px(6))
+#define TRAY_GAP    cp_px(16)                  /* the design's status spacing */
+#define CLOCK_W     (19 * cp_mono_cell_w() + 2 * TRAY_GAP)
 /* §M67 tail — the keyboard-layout indicator, immediately LEFT of the sound one.
  * Same shape and the same rules: always drawn, one flyout at a time, the
  * geometry in one place so draw and hit-test cannot disagree.
@@ -50,23 +76,23 @@
  * the one question the indicator exists to answer — *which* layout — unanswered,
  * and a wrong layout is the single most confusing thing that can happen while
  * typing. */
-#define KBD_W       52
-#define KBD_ICON    20
+#define KBD_ICON    TRAY_ICON
+#define KBD_W       (TRAY_ICON + cp_px(4) + 3 * cp_mono_cell_w() + TRAY_GAP)
 #define KBDPOP_W    150
 #define KBDPOP_ROW  22
 #define KBD_MAX     8            /* layouts the flyout will show; see kbd_names */
 /* §M23 — the sound indicator, immediately left of the clock.  Square, so the
  * icon renderer gets the box it expects. */
-#define VOL_W       28
-#define VOL_ICON    20
+#define VOL_ICON    TRAY_ICON
+#define VOL_W       (TRAY_ICON + TRAY_GAP)
 /* The volume popup: a slider and a mute row.  Deliberately small — this is a
  * status indicator's flyout, not a settings page.  The Sound page in the
  * Control Panel is where the full set lives (§M63 renders it from the
  * CONFIG_KEY descriptors with no per-key UI code). */
 #define VOLPOP_W    180
 #define VOLPOP_H    76
-#define SM_W        210
-#define SM_ITEM_H   26
+#define SM_W        (18 * cp_fw() + 24)
+#define SM_ITEM_H   (cp_fh() + 12)
 /* §M63 — raised from 10.  The Control Panel made it eleven apps, and the cap
  * silently DROPS the overflow: the last registered app simply stops appearing
  * in the launcher, which looks like a broken registration rather than a full
@@ -75,23 +101,23 @@
  * written down instead of discovered. */
 #define SM_MAX_APPS 12                  /* menu rows before the power tail */
 
-#define COL_TB_TOP      0xFF4B5A70u
-#define COL_TB_BOT      0xFF222A37u
-#define COL_TB_HILITE   0xFF7C8CA4u
-#define COL_START_TOP   0xFF58A84Bu
-#define COL_START_BOT   0xFF2C6626u
-#define COL_START_EDGE  0xFF83C877u
-#define COL_TBTN_TOP    0xFF39465Au
-#define COL_TBTN_BOT    0xFF2A3444u
-#define COL_TBTN_F_TOP  0xFF5A83C0u
-#define COL_TBTN_F_BOT  0xFF39598Cu
-#define COL_TBTN_EDGE   0xFF55647Cu
-#define COL_SM_BG       0xFF2B3546u
-#define COL_SM_EDGE     0xFF55647Cu
-#define COL_SM_HOVER    0xFF3D5C92u
-#define COL_TEXT        0xFFF2F5FAu
+#define COL_TB_TOP (cp_current_theme()->raised)
+#define COL_TB_BOT (cp_current_theme()->raised)
+#define COL_TB_HILITE (cp_current_theme()->line)
+#define COL_START_TOP (cp_current_theme()->accent)
+#define COL_START_BOT (cp_current_theme()->accent)
+#define COL_START_EDGE (cp_current_theme()->line)
+#define COL_TBTN_TOP (cp_current_theme()->tray)
+#define COL_TBTN_BOT (cp_current_theme()->tray)
+#define COL_TBTN_F_TOP (cp_current_theme()->raised)
+#define COL_TBTN_F_BOT (cp_current_theme()->raised)
+#define COL_TBTN_EDGE (cp_current_theme()->line)
+#define COL_SM_BG (cp_current_theme()->raised)
+#define COL_SM_EDGE (cp_current_theme()->line)
+#define COL_SM_HOVER (cp_current_theme()->hover)
+#define COL_TEXT (cp_current_theme()->text)
 #define COL_SHADOW      0x48000000u
-#define COL_SEP         0xFF4A576Au
+#define COL_SEP (cp_current_theme()->line_soft)
 
 #define TB_MAX_BTNS 8
 
@@ -487,15 +513,23 @@ static const char* menu_label(int row) {
     if (apps > SM_MAX_APPS) apps = SM_MAX_APPS;
     if (row < apps) {
         const struct gui_app_def* a = gui_app_at(row);
-        return a ? a->name : "?";
+        /* §M69 — THE ENGLISH NAME IS THE KEY here, and that is a decision
+         * rather than laziness.  `gui_app_def.name` is a stable IDENTIFIER —
+         * §M64's shortcut resolver matches `app:File Manager` against it by
+         * name so a `.lnk` survives a rebuild — so it must not be translated
+         * at the registry.  Looking the identifier up in the catalogue gives a
+         * translated LABEL while the identity stays put, and `lstr`'s
+         * fall-back-to-the-key makes an app nobody has translated render
+         * exactly as before. */
+        return a ? lstr(a->name) : "?";
     }
     /* Three fixed tail items, in escalating order of what they end: the GUI
      * session, the kernel, the machine.  "Exit GUI" sits above Reboot because
      * leaving the desktop is the reversible one — `gui` at the shell brings it
      * straight back. */
-    if (row == apps)     return "Exit GUI";
-    if (row == apps + 1) return "Reboot";
-    return "Shut Down";
+    if (row == apps)     return lstr("menu.exitgui");
+    if (row == apps + 1) return lstr("menu.reboot");
+    return lstr("menu.shutdown");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -525,18 +559,17 @@ static int vista_bottom_reserve(void) { return TASKBAR_H; }
 static void vista_draw(struct gfx_surface* back) {
     int ty = scr_h - TASKBAR_H;
 
-    gfx_vgradient(back, 0, ty, scr_w, TASKBAR_H, COL_TB_TOP, COL_TB_BOT);
+    /* The panel is one flat `raised` strip with a 1 px `line` along its top —
+     * the design's panel, not a gradient bar. */
+    gfx_fill(back, 0, ty, scr_w, TASKBAR_H, COL_TB_TOP);
     gfx_fill(back, 0, ty, scr_w, 1, COL_TB_HILITE);
 
     /* Start button. */
-    gfx_vgradient(back, 4, ty + 4, START_W, TASKBAR_H - 8,
-                  menu_open ? COL_START_EDGE : COL_START_TOP, COL_START_BOT);
-    gfx_fill(back, 4, ty + 4, START_W, 1, COL_START_EDGE);
-    gfx_fill(back, 4, ty + TASKBAR_H - 5, START_W, 1, COL_START_EDGE);
-    gfx_fill(back, 4, ty + 4, 1, TASKBAR_H - 8, COL_START_EDGE);
-    gfx_fill(back, 4 + START_W - 1, ty + 4, 1, TASKBAR_H - 8, COL_START_EDGE);
-    gfx_text(back, 4 + (START_W - 5 * GFX_GLYPH_W) / 2,
-             ty + (TASKBAR_H - GFX_GLYPH_H) / 2, "Start", COL_TEXT);
+    cp_plate(back, 4, ty + 4, START_W, TASKBAR_H - 8,
+             menu_open ? cp_current_theme()->press : COL_START_TOP,
+             COL_START_EDGE);
+    cp_text(back, 4 + (START_W - cp_text_w(START_TEXT)) / 2,
+             ty + (TASKBAR_H - cp_fh()) / 2, START_TEXT, COL_TEXT);
 
     /* One button per open window. */
     struct gui_window* slots[TB_MAX_BTNS];
@@ -547,34 +580,38 @@ static void vista_draw(struct gfx_surface* back) {
     for (int i = 0; i < n; i++) {
         int f = (slots[i] == focused);
         int m = gui_window_minimized(slots[i]);
-        gfx_vgradient(back, x, ty + 5, bw, TASKBAR_H - 10,
-                      f ? COL_TBTN_F_TOP : (m ? COL_TB_BOT : COL_TBTN_TOP),
-                      f ? COL_TBTN_F_BOT : (m ? COL_TB_BOT : COL_TBTN_BOT));
-        gfx_fill(back, x, ty + 5, bw, 1, COL_TBTN_EDGE);
-        gfx_fill(back, x, ty + TASKBAR_H - 6, bw, 1, COL_TBTN_EDGE);
-        gfx_fill(back, x, ty + 5, 1, TASKBAR_H - 10, COL_TBTN_EDGE);
-        gfx_fill(back, x + bw - 1, ty + 5, 1, TASKBAR_H - 10, COL_TBTN_EDGE);
+        cp_plate(back, x, ty + 5, bw, TASKBAR_H - 10,
+                 f ? COL_TBTN_F_TOP : (m ? cp_current_theme()->tray
+                                         : COL_TBTN_TOP),
+                 COL_TBTN_EDGE);
 
         char t[20];
         const char* title = gui_window_title(slots[i]);
-        int maxch = (bw - 12) / GFX_GLYPH_W;
+        int maxch = (bw - 12) / cp_fw();
         if (maxch > (int)sizeof(t) - 1) maxch = (int)sizeof(t) - 1;
         int k = 0;
         for (; title[k] && k < maxch; k++) t[k] = title[k];
         t[k] = 0;
-        gfx_text(back, x + 6, ty + (TASKBAR_H - GFX_GLYPH_H) / 2, t, COL_TEXT);
+        cp_text(back, x + 6, ty + (TASKBAR_H - cp_fh()) / 2, t, COL_TEXT);
         x += bw + 6;
     }
 
     /* Clock. */
+    /* NO BEVELLED DIVIDER.  Two hardcoded 1 px fills used to stand here — an
+     * M22 Vista-era groove in literal colours belonging to no theme, and the
+     * bright line visible between the speaker and the date in every screenshot.
+     * The design separates status items with SPACE (TRAY_GAP), not with rules;
+     * a groove down a flat panel is the one gradient-era habit that survived
+     * the port because nobody was looking at that corner. */
     int cx = scr_w - CLOCK_W;
-    gfx_fill(back, cx - 1, ty + 6, 1, TASKBAR_H - 12, 0xFF141B26u);
-    gfx_fill(back, cx,     ty + 6, 1, TASKBAR_H - 12, COL_TB_HILITE);
     if (clock_str[0]) {
+        /* MONO, per §16 — a clock set in a proportional face changes width as
+         * the digits change, so the whole tray shifts once a second.  Centred
+         * with the mono advance, which is exact for it. */
         int len = 0;
         while (clock_str[len]) len++;
-        gfx_text(back, cx + (CLOCK_W - len * GFX_GLYPH_W) / 2,
-                 ty + (TASKBAR_H - GFX_GLYPH_H) / 2, clock_str, COL_TEXT);
+        cp_mono_text(back, cx + (CLOCK_W - len * cp_mono_cell_w()) / 2,
+                     ty + (TASKBAR_H - cp_fh()) / 2, clock_str, COL_TEXT);
     }
 
     /* §M23 — the sound indicator.  ALWAYS drawn, including when audio is
@@ -597,7 +634,7 @@ static void vista_draw(struct gfx_surface* back) {
     {
         int kx, ky, kw, kh;
         kbd_box(&kx, &ky, &kw, &kh);
-        icon_draw(back, kx + 2, ky, KBD_ICON, ICON_KEYBOARD);
+        icon_draw(back, kx + cp_px(2), ky, KBD_ICON, ICON_KEYBOARD);
         const char* kb = keymap_current();
         if (kb && kb[0]) {
             char up[4];
@@ -607,8 +644,8 @@ static void vista_draw(struct gfx_surface* back) {
                 up[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
             }
             up[i] = 0;
-            gfx_text(back, kx + KBD_ICON + 4,
-                     ty + (TASKBAR_H - GFX_GLYPH_H) / 2, up, COL_TEXT);
+            cp_mono_text(back, kx + KBD_ICON + cp_px(4),
+                         ty + (TASKBAR_H - cp_fh()) / 2, up, COL_TEXT);
         }
     }
 
@@ -623,7 +660,7 @@ static void vista_draw(struct gfx_surface* back) {
         gfx_fill(back, px, py, 1, ph, COL_TB_HILITE);
         gfx_fill(back, px + KBDPOP_W - 1, py, 1, ph, 0xFF141B26u);
 
-        gfx_text(back, px + 10, py + 8, "Keyboard layout", COL_TB_HILITE);
+        cp_text(back, px + 10, py + 8, "Keyboard layout", COL_TB_HILITE);
         gfx_fill(back, px + 8, py + 22, KBDPOP_W - 16, 1, COL_SEP);
 
         const char* cur = keymap_current();
@@ -636,11 +673,11 @@ static void vista_draw(struct gfx_surface* back) {
             /* The marker is a GLYPH, not just the highlight: a selection shown
              * only by a background colour is invisible in a screenshot taken
              * for a bug report, and this project's tests read pixels. */
-            gfx_text(back, px + 10, iy + 2, active ? "*" : " ", COL_TEXT);
-            gfx_text(back, px + 24, iy + 2, kbd_names[i], COL_TEXT);
+            cp_text(back, px + 10, iy + 2, active ? "*" : " ", COL_TEXT);
+            cp_text(back, px + 24, iy + 2, kbd_names[i], COL_TEXT);
         }
         if (kbd_count == 0)
-            gfx_text(back, px + 10, py + 28, "no layouts", COL_TB_HILITE);
+            cp_text(back, px + 10, py + 28, "no layouts", COL_TB_HILITE);
     }
 
     /* §M23 — the volume flyout. */
@@ -656,8 +693,8 @@ static void vista_draw(struct gfx_surface* back) {
         int pct = (vol * 100 + 128) / 256;
 
         if (!audio_available()) {
-            gfx_text(back, px + 10, py + 12, "No audio device", COL_TEXT);
-            gfx_text(back, px + 10, py + 30, "nothing to play through", COL_TB_HILITE);
+            cp_text(back, px + 10, py + 12, "No audio device", COL_TEXT);
+            cp_text(back, px + 10, py + 30, "nothing to play through", COL_TB_HILITE);
         } else {
             char line[24];
             int n = 0;
@@ -667,7 +704,7 @@ static void vista_draw(struct gfx_surface* back) {
             else if (pct >= 10) { line[n++] = (char)('0' + pct / 10); line[n++] = (char)('0' + pct % 10); }
             else line[n++] = (char)('0' + pct);
             line[n++] = '%'; line[n] = 0;
-            gfx_text(back, px + 10, py + 10, line, COL_TEXT);
+            cp_text(back, px + 10, py + 10, line, COL_TEXT);
 
             /* The slider: a track and a filled portion.  Drawn from the SAME
              * geometry the click handler reads back (vol_track_*), so the
@@ -679,7 +716,7 @@ static void vista_draw(struct gfx_surface* back) {
             gfx_fill(back, tx + (fill ? fill - 2 : 0), tyy - 3, 4, 12,
                      muted ? 0xFF8B94A6u : COL_TEXT);
 
-            gfx_text(back, px + 10, py + 52, muted ? "[ Unmute ]" : "[ Mute ]", COL_TEXT);
+            cp_text(back, px + 10, py + 52, muted ? "[ Unmute ]" : "[ Mute ]", COL_TEXT);
         }
     }
 
@@ -702,7 +739,7 @@ static void vista_draw(struct gfx_surface* back) {
                 gfx_fill(back, 10, iy - 1, SM_W - 12, 1, COL_SEP);
             if (i == menu_hover)
                 gfx_fill(back, 6, iy, SM_W - 4, SM_ITEM_H, COL_SM_HOVER);
-            gfx_text(back, 18, iy + (SM_ITEM_H - GFX_GLYPH_H) / 2,
+            cp_text(back, 18, iy + (SM_ITEM_H - cp_fh()) / 2,
                      menu_label(i), COL_TEXT);
         }
     }

@@ -16,6 +16,7 @@
 #include "config.h"
 #include "settings.h"
 #include "driver.h"
+#include "shellcmd.h"   /* §M70 — the audio commands register themselves */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -1407,3 +1408,26 @@ void audio_cmd_play(const char* args) {
 
     audio_play_wav(args);
 }
+
+/* ---------------------------------------------------------------------------
+ * §M70 — shell registrations.  §M23 stage 2 already put these implementations
+ * here rather than in shell.c so the ARM serial REPL would run the same ones;
+ * the registration is what finally makes that true without a second dispatch
+ * arm being written by hand.
+ * ------------------------------------------------------------------------- */
+
+static void ac_lsaudio(const char* args) { (void)args; audio_list(); }
+static void ac_beep   (const char* args) { (void)args; audio_cmd_beep(); }
+
+SHELL_CMD(lsaudio) = { "lsaudio", "", "audio devices",
+                       SHELL_G_AUDIO, ac_lsaudio };
+SHELL_CMD(beep)    = { "beep", "", "a short tone through the speaker",
+                       SHELL_G_AUDIO, ac_beep };
+SHELL_CMD(tone)    = { "tone", "<hz> [ms]", "square-wave test tone",
+                       SHELL_G_AUDIO, audio_cmd_tone };
+SHELL_CMD(play)    = { "play", "<path.wav>", "play a WAV file",
+                       SHELL_G_AUDIO, audio_cmd_play };
+SHELL_CMD(rec)     = { "rec", "<path.wav> [ms]", "record to a WAV file",
+                       SHELL_G_AUDIO, audio_cmd_rec };
+SHELL_CMD(volume)  = { "volume", "[0-100|mute|unmute]", "master volume",
+                       SHELL_G_AUDIO, audio_cmd_volume };

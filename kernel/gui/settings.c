@@ -26,11 +26,14 @@
  * ============================================================================= */
 
 #include "settings.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "icons.h"
 #include "config.h"
 #include "gui.h"
 #include "gui_app.h"
 #include "widget.h"
+#include "console_plate.h"
+#include "locale.h"
 #include "ui.h"           /* §M65 — the panel is built from specs now */
 #include "kmalloc.h"
 #include "printf.h"
@@ -122,7 +125,16 @@ int config_key_validate(const char* key, const char* value) {
  *
  * Now the DESCRIPTOR chooses the control and the layout places it:
  *
- *      CFG_BOOL              -> checkbox
+ *      CFG_BOOL              -> SWITCH, not a checkbox — and the distinction is
+ *                               the panel's whole semantics: everything here
+ *                               goes through config_apply the moment it moves,
+ *                               so the machine has ALREADY changed.  A checkbox
+ *                               says "this will happen when you confirm", which
+ *                               is a promise this panel does not make and has no
+ *                               button to keep (widget_specs.md §4: "azonnali
+ *                               hatás").  Rendering both states of affairs with
+ *                               one control tells the user the wrong thing about
+ *                               when their machine changed.
  *      CFG_ENUM              -> radio group (the `values` string is already
  *                               space-separated, which is exactly what the
  *                               control's spec wants)
@@ -140,6 +152,21 @@ struct genpanel {
     int   key_idx[GP_MAX_KEYS];         /* control id → config_key index    */
     int   n;
     int   status_id;
+    /* §M69 — PENDING EDITS.  Reported from use: *"the change has to happen
+     * when you click Save."*  This panel used to call `config_apply` the
+     * instant a control moved, and then offered a Save button that only
+     * WROTE THE FILE — so the machine had already changed and the button's
+     * label promised something it did not do.  *A form with a commit button
+     * that does not commit is the one arrangement that is worse than either
+     * design on its own.*
+     *
+     * A pending edit is the TEXT, not the widget's value: `config_apply` takes
+     * text, validation is defined on text, and a value would have to be
+     * re-interpreted per key type at Save time — a second place to get the
+     * enum-to-string mapping right. */
+    char  pending[GP_MAX_KEYS][64];
+    int   dirty[GP_MAX_KEYS];
+    int   ndirty;
 };
 
 /* Ids: rows get 100+i for their control, so an event names its key by
@@ -224,11 +251,25 @@ static void gp_event(struct gui_window* win, int id, int type, int value,
     (void)win;
 
     if (id == GP_ID_SAVE && type == UI_EV_CLICK) {
+        /* APPLY, THEN PERSIST — in that order and both here.  `config_apply`
+         * is what notifies the subsystem that read the key at boot (§M63's
+         * watchers), so applying is what makes the change take effect; saving
+         * is what makes it survive.  A Save that only wrote the file would
+         * leave the running system on the old values, which is the mirror of
+         * the defect this replaced. */
+        for (int k = 0; k < g->n; k++) {
+            if (!g->dirty[k]) continue;
+            const struct config_key_def* dk = config_key_at(g->key_idx[k]);
+            if (dk) config_apply(dk->key, g->pending[k]);
+            g->dirty[k] = 0;
+        }
+        int had = g->ndirty;
+        g->ndirty = 0;
         const char* p = config_persist_path();
-        gp_status(g, config_save() == 0
-                     ? (p ? "saved - survives a reboot"
-                          : "saved to RAM only - no writable volume")
-                     : "save FAILED");
+        if (config_save() != 0)      gp_status(g, "set.savefail");
+        else if (!p)                 gp_status(g, "set.applied_ram");
+        else if (had)                gp_status(g, "set.applied");
+        else                         gp_status(g, "set.nochange");
         return;
     }
 
@@ -250,13 +291,20 @@ static void gp_event(struct gui_window* win, int id, int type, int value,
     }
 
     if (config_key_validate(d->key, text) != 0) {
-        gp_status(g, "rejected - not a valid value for this setting");
+        gp_status(g, "set.rejected");
         return;
     }
-    /* config_apply, not config_set: the subsystem that read this key at boot
-     * has to hear about it — the entire reason §M63 stage 0 built watchers. */
-    config_apply(d->key, text);
-    gp_status(g, "applied - use Save to keep it across a reboot");
+    /* RECORDED, NOT APPLIED.  Nothing reaches the system until Save; see the
+     * `pending` field.  Validation still happens HERE rather than at Save,
+     * because a rejection has to point at the control the user just moved —
+     * three rejections reported together at the end name nothing. */
+    int k = i;
+    int j = 0;
+    while (text[j] && j < (int)sizeof g->pending[0] - 1) { g->pending[k][j] = text[j]; j++; }
+    g->pending[k][j] = 0;
+    if (!g->dirty[k]) { g->dirty[k] = 1; g->ndirty++; }
+    gp_status(g, g->ndirty > 1 ? "set.unsaved_n"
+                               : "set.unsaved_1");
 }
 
 static void gp_layout(struct gui_window* win) {
@@ -300,11 +348,47 @@ static void gp_layout(struct gui_window* win) {
          * reported from use as "it all runs together". */
         (void)row_id;
         sp[k++] = (struct ui_spec){ .id = 0, .parent = GP_ID_GRID, .cls = "label",
+                                    /* §M69 — THE KEY IS ITS OWN CATALOGUE
+                                     * KEY.  Reported from use: *"the Control
+                                     * Panel is full of untranslated labels
+                                     * like `gui.theme`."*  It was showing the
+                                     * raw identifier, which is right for a
+                                     * `conf set` argument and wrong for a
+                                     * label a person reads.
+                                     *
+                                     * No new descriptor field: `lstr` falls
+                                     * back to its argument, so a key with a
+                                     * catalogue entry shows a name and a key
+                                     * without one shows exactly what it shows
+                                     * today.  The identifier stays the
+                                     * identifier — only what is DRAWN
+                                     * changes. */
                                     .text = d->key };
 
-        struct ui_spec ctrl = { .id = GP_ID_CTRL(g->n), .parent = GP_ID_GRID,
-                                .flags = UI_FILL_W };
+        /* NO UI_FILL_W BY DEFAULT — rule 2 of the control convention
+         * (console_plate.h).  Every control here used to fill the row, so a
+         * switch and a radio group were as wide as the panel with their text
+         * stranded at the left; only the controls that REPRESENT A RANGE ask
+         * for the width below, because a half-width track says nothing about
+         * the range it stands for. */
+        struct ui_spec ctrl = { .id = GP_ID_CTRL(g->n), .parent = GP_ID_GRID };
         if (d->type == CFG_BOOL) {
+            /* §M69 — A CHECKBOX AGAIN, and the reversal is the point.
+             *
+             * This was changed to a `switch` on the argument that a switch
+             * says "the machine is like this NOW" while a checkbox promises
+             * "when you confirm" — and that this panel had no confirm to
+             * offer, because every control applied instantly.  **That premise
+             * is gone**: Save is the commit point now, by request, so the
+             * control that promises "when you confirm" is the honest one and
+             * the switch would be the lie.
+             *
+             * Written down rather than quietly flipped, because from outside
+             * it looks like drift.  *A decision derived from a premise has to
+             * be revisited when the premise moves; the alternative is a
+             * control that was right once.*  The `switch` class stays
+             * registered and is the right control wherever a change really is
+             * immediate (the volume flyout). */
             ctrl.cls = "checkbox";
             ctrl.text = d->help ? d->help : "";
             ctrl.value = (cur && cur[0] == '1');
@@ -322,9 +406,11 @@ static void gp_layout(struct gui_window* win) {
             ctrl.cls = "slider";
             ctrl.min = d->min; ctrl.max = d->max;
             ctrl.value = gp_atoi(cur);
+            ctrl.flags |= UI_FILL_W;        /* a track IS its range */
         } else {
             ctrl.cls = "textinput";
             ctrl.text = cur;
+            ctrl.flags |= UI_FILL_W;        /* a value can be any length */
         }
         sp[k++] = ctrl;
         g->key_idx[g->n++] = i;
@@ -335,12 +421,58 @@ static void gp_layout(struct gui_window* win) {
                                     .text = "(no settings declared for this group)" };
 
     sp[k++] = (struct ui_spec){ .id = GP_ID_STATUS, .cls = "label",
-                                .text = "change a setting, then Save",
+                                .text = "settings.hint",
                                 .flags = UI_FILL_W };
-    sp[k++] = (struct ui_spec){ .id = GP_ID_SAVE, .cls = "button", .text = "Save" };
+    sp[k++] = (struct ui_spec){ .id = GP_ID_SAVE, .cls = "button", .text = "btn.save" };
 
     ui_build(win, sp, k, gp_event, g);
     kfree(sp);
+
+    /* `gui.ui_dump` — the layout, on the serial line, at the moment it is built.
+     *
+     * THE HARNESS CANNOT TYPE ONCE A GUI WINDOW HAS FOCUS (§M64), so `ui dump`
+     * is unreachable for exactly the windows most worth dumping: a panel is
+     * opened by double-clicking, and from then on the keyboard belongs to it.
+     * A config key can be set BEFORE the GUI takes over, which makes the dump
+     * available on the one path that could not reach it. */
+    if (config_get_long("gui.ui_dump", 0)) ui_dump(win);
+
+    /* `gui.ui_scrolltest` — scroll the group's viewport from code, once, at
+     * build time.
+     *
+     * THE INPUT TRANSPORT IS A HARNESS LIMIT, THE SCROLLING IS NOT.  A two-point
+     * probe (ps2_mouse.c + gui.c) showed the QEMU monitor's `mouse_button 8/16`
+     * produces ZERO wheel notches for a mouse decoding §M69's 4-byte packet —
+     * so a wheel gesture cannot be delivered here at all, and "the panel did not
+     * scroll" says nothing whatever about our routing.  This drives the same
+     * model through `ui_scroll_by`, which is the half we own: if the offset
+     * moves and the indicator follows, then everything above the packet decode
+     * is working and exactly one link is untestable on this harness. */
+    if (config_get_long("gui.ui_scrolltest", 0)) {
+        int moved = ui_scroll_by(win, GP_ID_SCROLL, 400);
+        kprintf("settings: ui_scroll_by(400) -> %s\n",
+                moved ? "moved" : "declined");
+        ui_dump(win);
+    }
+
+    /* §M69 — `gui.wheeltest` drives the WHEEL ROUTER, which `ui_scrolltest`
+     * above deliberately does not: that one calls `ui_scroll_by` directly and
+     * therefore proves the container scrolls while saying nothing about
+     * whether a notch aimed at the CONTENT ever reaches it.  That distinction
+     * is the whole of the report — *"on the scrollbar it is perfect, on the
+     * content it is no good"* — and it is a claim about two POSITIONS, so the
+     * probe has to name one.  Fired here because the harness cannot type once
+     * a GUI window holds the focus (§4.74). */
+    if (config_get_long("gui.wheeltest", 0)) {
+        int cw = 0, ch = 0;
+        gui_window_content_size(win, &cw, &ch);
+        /* A MAP first: which points in this panel have a widget that would
+         * swallow a notch?  Then one real notch, so the two can be compared. */
+        /* Aim at the GROUP HEADING, which is outside the viewport: the point
+         * the report was actually about. */
+        kprintf("settings: wheeltest over the HEADING (%d,4)\n", cw / 3);
+        gui_wheel_test(cw / 3, 4, -1);
+    }
 }
 
 /* Open the generic panel for `group`. */
@@ -352,8 +484,19 @@ static void generic_panel_open(const char* group) {
      * group is one row per option, not one line of text.  Height that a
      * SCROLLING container should own — see the open item in DOCS §4.78. */
     int ow, oh;
-    gui_window_outer_for_content(560, 360, &ow, &oh);   /* the viewport scrolls */
+    gui_window_outer_for_content(cp_px(560), cp_px(360), &ow, &oh);   /* the viewport scrolls */
     gui_app_window_create(group, 140, 120, ow, oh, gp_layout, g);
+}
+
+/* `conf open` below hands the index over through a static because
+ * `gui_queue_open` takes a bare function pointer — the app-host task it spawns
+ * has no argument to carry one.  One request at a time, which is what a person
+ * typing a command produces. */
+static int g_open_idx = -1;
+static void open_queued_panel(void) {
+    int i = g_open_idx;
+    g_open_idx = -1;
+    if (i >= 0) settings_panel_open(i);
 }
 
 void settings_panel_open(int i) {
@@ -373,17 +516,17 @@ void settings_panel_open(int i) {
  * ===================================================================== */
 
 CONFIG_KEY(ck_shell) = {
-    .key = "gui.shell", .group = "Personalisation", .type = CFG_ENUM,
+    .key = "gui.shell", .group = "Appearance", .type = CFG_ENUM,
     .values = "vista bare", .def = "vista",
     .help = "desktop shell (takes effect at the next `gui` start)",
 };
 CONFIG_KEY(ck_desktop_view) = {
-    .key = "desktop.view", .group = "Personalisation", .type = CFG_ENUM,
+    .key = "desktop.view", .group = "Appearance", .type = CFG_ENUM,
     .values = "grid list table", .def = "grid",
     .help = "how desktop shortcuts are arranged",
 };
 CONFIG_KEY(ck_cp_view) = {
-    .key = "controlpanel.view", .group = "Personalisation", .type = CFG_ENUM,
+    .key = "controlpanel.view", .group = "Appearance", .type = CFG_ENUM,
     .values = "grid list table", .def = "grid",
     .help = "how the Control Panel arranges its categories",
 };
@@ -423,12 +566,12 @@ CONFIG_KEY(ck_pkgstore) = {
     .help = "package store: ram rebuilds it each boot (82 ms), disk reuses it (7.8 s of reads)",
 };
 CONFIG_KEY(ck_fmview) = {
-    .key = "fileman.view", .group = "Personalisation", .type = CFG_ENUM,
+    .key = "fileman.view", .group = "Appearance", .type = CFG_ENUM,
     .values = "table list grid", .def = "table",
     .help = "how the file manager shows a directory (applies to a new window)",
 };
 CONFIG_KEY(ck_scrollback) = {
-    .key = "gui.scrollback", .group = "Personalisation", .type = CFG_INT,
+    .key = "gui.scrollback", .group = "Appearance", .type = CFG_INT,
     .def = "500",
     .help = "lines of terminal history kept per window (0 = none; applies to new windows)",
 };
@@ -524,5 +667,50 @@ void settings_cmd(const char* args) {
         return;
     }
 
-    kprintf("conf: list | show <key> | set <key> <value>\n");
+    /* `conf open <name|index>` — open a settings panel WITHOUT A MOUSE.
+     *
+     * WHY THIS EXISTS.  This file's own header says every setting must be
+     * reachable from the shell because the automated checks here are greps over
+     * a serial log — and the PANEL was the one thing that was not: it is opened
+     * by double-clicking a category, so reaching it needed a driven pointer,
+     * and once it has focus the harness cannot type at all (§4.74).  A fault
+     * that only happens when a panel opens was therefore reproducible only by
+     * hand, which is most of why it survived a milestone.
+     *
+     * It goes through `gui_queue_open` and NOT a direct call: a window created
+     * on a task with no app-host loop never lays out and never ticks (§M61),
+     * so opening it from the shell task would produce a panel that LOOKS built
+     * and answers nothing — a second failure mode on top of the one being
+     * investigated. */
+    if (streq_(cmd, "open")) {
+        char which[48];
+        word_(rest, which, sizeof which);
+        if (!which[0]) { kprintf("conf: open <name|index>\n"); return; }
+        int idx = -1;
+        if (which[0] >= '0' && which[0] <= '9') {
+            idx = 0;
+            for (const char* p = which; *p >= '0' && *p <= '9'; p++)
+                idx = idx * 10 + (*p - '0');
+        } else {
+            for (int i = 0; i < settings_panel_count(); i++)
+                if (streq_(settings_panel_at(i)->name, which)) { idx = i; break; }
+        }
+        if (idx < 0 || idx >= settings_panel_count()) {
+            kprintf("conf: no panel '%s' (try `conf list`)\n", which);
+            return;
+        }
+        g_open_idx = idx;
+        kprintf("conf: opening panel %d '%s'\n", idx, settings_panel_at(idx)->name);
+        gui_queue_open(open_queued_panel);
+        return;
+    }
+
+    kprintf("conf: list | show <key> | set <key> <value> | open <name|index>\n");
 }
+
+/* --- §M70 shell registration -----------------------------------------------
+ * `conf set` VALIDATES against the CONFIG_KEY descriptors; `setconf` (config.c)
+ * deliberately does not, because it must stay able to reach undeclared keys. */
+SHELL_CMD(conf) = { "conf", "[list|show <key>|set <key> <value>|open <panel>]",
+                    "declared settings, validated",
+                    SHELL_G_SYS, settings_cmd };

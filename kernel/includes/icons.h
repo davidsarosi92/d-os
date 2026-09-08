@@ -61,10 +61,31 @@ enum icon_id {
     ICON_VOLUME_MUTED,  /* audio available, silenced by the user       */
     ICON_VOLUME_OFF,    /* no device / audio unavailable               */
     ICON_CHIP,          /* a device / the device manager               */
+    /* From the Console Plate icon set (design/icons/).  These have vector
+     * artwork and no drawn fallback — an id here that lost its vpath would
+     * render as nothing, which is why `icon_draw` says so rather than leaving
+     * an empty box for somebody to mistake for a layout bug. */
+    ICON_FIREWALL,      /* firewall                                    */
+    ICON_USERS,         /* users / accounts (§M32)                     */
+    ICON_STORAGE,       /* disks, volumes                              */
+    ICON_PRINTER,       /* printers                                    */
+    ICON_BLUETOOTH,     /* bluetooth                                   */
+    ICON_UPDATE,        /* updates                                     */
+    ICON_POWER,         /* power management                            */
+    ICON_MOUSE,         /* pointer settings                            */
+    ICON_LOCALE,        /* language and region                         */
+    ICON_ACCESS,        /* accessibility                               */
+    ICON_BACKUP,        /* backup                                      */
+    ICON_REMOTE,        /* remote desktop                              */
     ICON__COUNT
 };
 
 /* Paint icon `id` into the size×size box at (x,y). */
+struct vpath;
+/* Vector artwork per id, NULL where the design set has none.  Generated into
+ * assets/icons_vector.c by scripts/svgset2icons.py from design/icons/. */
+extern const struct vpath* const icon_vpaths[ICON__COUNT];
+
 void icon_draw(struct gfx_surface* s, int x, int y, int size, int id);
 
 /* Map a name to an id — used by shortcut files and config values, which are

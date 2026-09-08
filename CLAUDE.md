@@ -20,6 +20,1143 @@ focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M70 — THE SHELL BECAME A REGISTRY, AND gui.c BECAME FIVE FILES (2026-09-08,
+DOCS §4.86, all 3 arches).**  Asked for directly, and the answer began by
+NARROWING the question: the folder structure was already right and sixteen
+linker-section registries already made a driver, a config key, a widget class or
+a settings panel a FILE.  **The debt sat in two places and both were
+measurable.**  **THE SHELL WAS THE ONE SUBSYSTEM WITH NO REGISTRY** — 4467
+lines, ~80 command bodies, a `dispatch()` of **172 ordered `if` arms**, and a
+hand-written `help` listing about 60 of them, *so over a hundred commands
+existed and were documented nowhere*.  The ordering was load-bearing and nothing
+checked it (§4.67.1: a `"gui "` prefix arm above the exact `"gui stats"` made
+the latter answer "already running"), and every command written into shell.c was
+**x86-only by accident** — aarch64 runs its own REPL, and §M24's one-copy rule
+was honoured by a handful of files and broken by ~130 commands, *not as a
+decision but because writing into shell.c was the cheapest move*.  **`SHELL_CMD()`
+is the house shape, and ONE RULE MAKES THE ORDERING BUG UNREPRESENTABLE: A VERB
+OWNS ITS WHOLE ARGUMENT TAIL** — split at the first space, look the verb up
+EXACTLY, hand it everything after; there are no prefix arms to order, so there
+is no order to get wrong, and `gui` decides what `stats` means because `gui` is
+the only thing that can.  **`help` is GENERATED**, so a registered command is a
+listed command and there is no second place to forget.  **A COMMAND LIVES NEXT
+TO THE CODE IT DRIVES** (`play` in audio.c, `drv` in driver.c, `wallpaper` in
+gui/wallpaper.c), with `kernel/core/cmd_*.c` for the ones whose subject is the
+kernel itself.  **THE MIGRATION USED §M50's SHAPE AND THEN OBEYED §M56.1's
+RULE:** registry first with the old chain as fallback so commands moved one at a
+time — and when the last arm went, *the fallback went in the same change*,
+because a fallback kept past its usefulness is what made `sigprocmask` work on
+one arch and be silently unreachable on two.  **MEASURED: shell.c 4467 → 669
+lines (64 includes → 12), 172 dispatch arms → 0, serial_shell.c 736 → 214 with
+its 24 duplicate implementations deleted, and commands reachable on ARM ~60 →
+167** — `sched`, `crash`, `slabinfo`, `buddyinfo`, `abi`, `conf list` all run
+there for the first time, driven and checked.  The two genuinely arch-local
+commands (`usertest`, `blk`) register in an ARCH file and appear only there,
+which is the mechanism working rather than an exception to it.  **AND gui.c WAS
+SEVEN SUBSYSTEMS HELD TOGETHER BY PRIVATE STATE** — 5620 lines of window
+lifecycle, damage, two event queues, a whole terminal emulator, the app-host
+loop, the WM and the compositor.  *They were already separate things; what held
+them in one file was that `struct gui_window` and ninety-odd file-scope statics
+were private to it*, so the split needed a private header before anything else.
+**`gui_priv.h` makes the audience explicit** — gui.h for apps, gui_internal.h
+for desktop shells, gui_priv.h for the COMPOSITOR'S OWN FILES — and restates
+M22.7's threading contract, which is now read ACROSS files.  **gui.c 5620 →
+3685, plus wm.c 727, app_host.c 544, gterm.c 445, gui_mode.c 256.**  *`gterm.c`
+is the cleanest and that is the finding: it reaches the rest of the compositor
+through exactly TWO calls (`gui_damage_win`, `gui_window_raise`), so its having
+lived beside the compositor at all was an accident of where a struct was
+declared.*  **TWO THINGS WERE MOVED BACK DURING THE SPLIT, WHICH IS THE SPLIT
+WORKING:** `lastclick_*` looks like WM state and is double-click DETECTION, i.e.
+input routing; and the popup needed a NAMED type before a header could declare
+it — *an anonymous struct with one instance is exactly what stops it being
+referenced from elsewhere.*  **VERIFIED: all three arches build SILENT; 0
+faults / 0 NMI / 0 softlockups on i386 and x86_64 at -smp 4 and on aarch64's
+BOTH boot paths; and the GUI checked BY PICTURE** (§M69's method note — every
+visual defect that port had was obvious in a screenshot and invisible in a pixel
+probe), with Task Manager rendering its title buttons, four table columns, row
+separators, scrollbar and footer intact across the new file boundary.  **OPEN:**
+gui.c still holds the compositor proper AND the input router; splitting those
+wants its own before-and-after `gui.stats_ms` numbers rather than a hurried pass
+on the way to something else.
+
+✅ **§M69 — THE CONSOLE PLATE PORT, COMPLETE (2026-09-03).  REAL TYPEFACES,
+AND A MOUSE LAG WITH A NUMBER ON IT (2026-08-30,
+i386 measured, all 3 arches build).**  The Console Plate port had one font: 8x8,
+one bit per pixel, every glyph the same width — sharp at exactly one size, while
+§M61 made the resolution a runtime choice.  Same argument §M62 made for the boot
+logo, only more so, because text is most of what a screen is made of.  Now
+**Barlow / Barlow Condensed SemiBold / IBM Plex Mono** (OFL, vendored under
+`assets/fonts/` with their licences) as OUTLINES.  **THE SPLIT IS vpath.h's:**
+`scripts/ttf2font.py` reads the `glyf` tables on the host — cmap format 4,
+composite recursion, quadratic flattening — and ring 0 gets points and integers,
+so there is nothing to malform because there is no input.  **THE CHARACTER SET IS
+ISO-8859-2, INDEXED BY BYTE**, a drop-in for `font8x8[256]` (§4.66: ő and ű do
+not exist in Latin-1); a Unicode cmap here would have made this a UTF-8 project.
+**TWO THINGS DIFFER FROM vpath.c AND BOTH DECIDE LEGIBILITY:** the fill rule is
+**NON-ZERO** (a logo's contours never overlap, an accented composite's may —
+even-odd would punch a HOLE in exactly the Hungarian glyphs), and coverage is
+**EXACT HORIZONTALLY** (whole-pixel spans are fine at 600 px and a smear at 14).
+Both are affordable only because a glyph is rasterised ONCE per size and cached
+(1 MiB budget, LRU; measured 16 entries / 2251 bytes / 65 hits to 16 misses).
+`gui.font = vector|bitmap`, and the bitmap path is NOT dead — the boot console
+and the terminal grid still use it, and a face that rendered wrongly would leave
+a machine with no legible text and no way to ask it why.  **THE SIZE WAS WRONG
+TWICE, IN OPPOSITE DIRECTIONS, AND BOTH TIMES FOR ONE REASON: THE WRONG
+DENOMINATOR.**  First 2x, from comparing horizontal advance; then 27 % too small,
+from taking the design's 15 px as absolute.  **MEASURED OFF THE DESIGN'S OWN
+RENDER:** its canvas is 1400 px wide and its body text has an 8 px x-height
+(design.png rows 404..417), so 15 px is 1.07 % of the width — on 1920 the same
+number is 0.73 %.  The design's pixels are PROPORTIONS.  `cp_px()` derives the
+factor from the framebuffer AT RUN TIME (137 % at 1920, floored at 100, capped at
+200), because a constant would be wrong again at the next mode set.  **ONE RULE,
+STATED ONCE, because the alternative was already sprung today:** the DENSITY is
+delivered in DEVICE pixels, the raw `CP_*` macros are DESIGN pixels and must go
+through `cp_px()`.  **FOUR FALSIFIED HYPOTHESES IN ONE DAY, WHICH IS THE REAL
+CONTENT:** (1) `fixmul` already returns pixels and the callers shifted AGAIN —
+every glyph came out 3 px square, and *a scale applied twice does not look like a
+scale bug, it looks like the text was never drawn*; (2) the glyph blend was blamed
+for the compositor's 22 → 38 ms regression — removing three divisions per pixel
+moved nothing, and **two runs of the SAME binary spread 19 %**, so the benchmark
+is noise-dominated and text blending is NOT the dominant cost (§M56.2 again; the
+code was kept as simpler, claimed as nothing); (3) the per-window shadow was the
+next suspect and `gfx_blend_fill` calls `clip_rect`, so it is already bounded by
+the damage rect; (4) a BOUNDING RECT over the changed rows bought nothing,
+because in a process list the movers are scattered top and bottom and the band IS
+the table.  **THE MOUSE LAG, ROOT-CAUSED BY ISOLATION AND FIXED:** an idle desktop
+composites in **17.6–18.4 ms**, the same desktop with Task Manager in it takes
+**38–45 ms** — the table asked for its WHOLE listview once a second, and since the
+compositor also draws the CURSOR, every mouse packet arriving inside such a frame
+waits.  Replaced with **disjoint RUNS** (the shape §4.61 gave the compositor and
+the thing a bounding box had replaced): **27.6/30.1/27.2 and 25.6/30.4/27.9 ms**
+over two runs, beating the ±19 % noise floor.  **`gui.stats_ms` IS WHY ANY OF
+THIS IS A NUMBER:** `gui stats` must be TYPED, and this project's harness cannot
+type once a GUI window holds focus (§4.74) — *reaching the state to be measured
+destroyed the means of measuring it*.  It reports AREA as well as time, because a
+slow frame is either big or fixed-cost and those want opposite fixes; without the
+pixel count the two are indistinguishable, which is how two attempts were each
+aimed at a guess.  **AND THEN THE REMAINING STUTTER WAS ROOT-CAUSED, AND IT WAS NONE OF THE ABOVE
+(2026-08-31).**  The written-down next step — *"the row diff compares BY INDEX,
+transient tasks shift every row below them, so key the diff on pid"* — is
+**FALSIFIED, and the instrument that falsified it took four lines**: logging the
+run count per refresh shows the diff already reporting **0–4 dirty rows out of
+19 in 1–3 runs, never the table**, a transient task costing **3**.  *The
+hypothesis was also unimplementable as stated: index comparison asks "does what
+will be drawn at screen row i differ from what is drawn there now", which is
+exactly the right question for damage — a pid-keyed diff that skipped a moved
+row would leave it stale.*  **THE 447 kpx WAS THE WHOLE WINDOW, NOT THE
+LISTVIEW** (656x609 content + chrome), and one line asked for it:
+`app_host_main` folded the tick into `worked` and then called `app_redraw` —
+**an unconditional full-window repaint, 2-3 times a second, on top of every
+carefully damaged row.**  *An optimisation one layer below an unconditional
+repaint cannot be measured, only assumed*, which is how §M69 spent two attempts
+aiming at the wrong thing.  **THE SAME LOOP HELD A BIGGER ONE, AND IT IS THE
+MOUSE LAG ITSELF:** every drained event set `worked`, INCLUDING `AE_HOVER` —
+which arrives at motion-packet rate and which `app_hover_to` already damages
+exactly (two widgets, and nothing at all when the pointer has not left the
+widget it was on).  So **moving the pointer across a window repainted the whole
+window per packet**: measured, pointer in motion over the Task Manager,
+**33 frames/s at 214–235 kpx and 20.5–22.2 ms mean, worst 48.7 ms**.  **FIXED BY
+SPLITTING ONE FLAG INTO TWO** — `worked` (do not halt) vs `repaint` (pixels
+changed that nothing damaged) — with the contract now written in gui.h: *a tick
+damages what it changed*.  All four tick users already did.  A LAYOUT still
+repaints everything (it moves widgets, so the vacated pixels are stale where
+nothing will paint), and so does a click or a key (their callbacks may write
+into a label nothing damages, and both are user-paced).  **MEASURED, SAME
+RECIPE, i386 -smp 4:** table refreshing, pointer still — mean **26.8–38.2 ms /
+220–314 kpx → 7.9–9.9 ms / 61–65 kpx**, worst **42–68 ms → 14–21 ms**; pointer
+in motion — mean **20.5–22.2 ms / 214–235 kpx → 2.7–3.6 ms / 11–18 kpx**.  Both
+beat the ±19 % noise floor several times over.  **AND THE CORRECTNESS BUG WAS
+REAL BUT MASKED, WHICH IS WORTH MORE THAN THE BUG:** the diff is TEXT-only, so a
+selection change repaints nothing — and the unconditional repaint had been
+hiding it, i.e. *the defect and the thing making the frames expensive were the
+same line, so fixing one alone would have shipped the other.*  A widget now
+damages its OWN state changes (`lv_damage_row` on click and arrow-key, the whole
+widget on a scroll, since a scroll moves every row), which is two rows instead
+of a window; the footer compares before it writes; `w_listview_dirty_run` and
+the painter now share `lv_row_band` (the diff said `base.y + 1` where the
+painter draws at `+ 2`, so the last dirty row's bottom pixel fell outside its
+own damage rect).  **VERIFIED BY DRIVING THE MOUSE:** a click lands on the
+`shell` row, the row is highlighted, it is **still highlighted three seconds and
+six ticks later**, and the footer reads `19 TASKS - PID 19 SELECTED` — which is
+the new self-damaging path, because with the tick no longer repainting, a footer
+that did not damage itself would have frozen at the old text.  All 3 arches
+build clean.
+
+**THEN THE TABLE WAS MADE THE DESIGN'S TABLE, AND THE PICTURE IS THE TEST
+(2026-08-31).**  `scripts/design-annotate.py` stacks the design's §06 table and a
+live screenshot at one width with numbered callouts on both — *two pictures in
+two windows is not a comparison; the eye cannot hold a 40 px row in one and a
+44 px row in the other.*  It found five differences and **every one of them was
+the same defect: a row was a single space-padded STRING.**  A padded string can
+be left-aligned OR right-aligned, one face, one colour — so per-column
+anything was not a missing feature, it was unrepresentable.  **The Task Manager
+is a §M65 TABLE MODEL now**: four cells the view asks for, `PID | NAME | CPU |
+STATE`, and the §M27 process tree survives as an indent INSIDE the name cell —
+the one part of the old padded row doing real work.  New `item_model.col_style`
+(appended, §M58's scar): `ICOL_RIGHT | ICOL_MONO | ICOL_ACCENT | ICOL_DIM`, ONE
+callback returning a bitmask because the four are always decided together and a
+model answering three of four is a column styled half by its author.  **THE
+MODEL DECIDES, NOT THE VIEW** — a view that right-aligned anything numeric would
+right-align a version string, and one that guessed at colour would have to know
+what the columns MEAN.  **THE COLUMN ORDER IS ITSELF A FIX:** the wide name
+column was LAST and absorbed all the slack, so a third of the window was empty
+space to the right of left-aligned text; with it in the middle the right-aligned
+numbers land on the right edge.  It also decides what a narrow window loses,
+since `t_layout` drops from the right.  **THREE THINGS THE TABLE VIEW SIMPLY DID
+NOT HAVE, none of them noticed until a picture was put next to it:** row
+separators; the theme and the density (it was `T_ROW_H 18` and five literal
+colours — 2007 pixels and a palette belonging to no theme, in the one widget
+§M69 had not looked at); and **A SCROLLBAR AT ALL** — the listview has had one
+since M22, so a table showing 11 of 19 rows gave no sign there were any others.
+*A view that silently shows a prefix of its data is worse than one that shows
+none, because nothing looks wrong.*  **AND THE REFACTOR HAD TO CARRY THE MORNING'S
+WIN OR IT WOULD HAVE UNDONE IT:** `w_itemview` answered every event with a
+whole-WINDOW repaint, affordable only while the host repainted anyway.  Now
+`w_itemview_refresh` — a content diff **indexed by SCREEN SLOT, not by item**
+(the only question damage has an answer to, and asking it per item is what sent
+the first attempt chasing a pid-keyed diff), bounded by the VIEWPORT so a
+4000-entry directory costs what a 12-entry one does, **with the selection folded
+INTO the signature** so one mechanism covers both "the numbers moved" and
+"another row is chosen" instead of a second path somebody must remember to call.
+A changed scroll takes a whole-pane branch, because reporting thirty changed
+slots is true and costs more than the one rect they add up to.  **MEASURED:
+pointer in motion over the refactored window, 1.8-3.5 ms mean over 12-23 kpx —
+i.e. the table costs what the listview did, and the 20.5-22.2 ms / 214-235 kpx
+of the morning stays gone.**  **AND THE LISTVIEW'S OWN DIFF WAS DELETED, NOT
+LEFT AVAILABLE:** `w_listview_dirty_run` plus a **6.9 KiB `prev[96][72]` shadow
+copy in every listview** existed for one caller, which is now a table; keeping it
+would leave a mechanism that LOOKS ready and has never been exercised (§M52) —
+and whose stated conclusion was wrong anyway.  **TWO BUGS FOUND ON THE WAY, both
+of the kind only a second reader finds:** `w_label_set_caption` was
+`l->caption = on ? 1 : 0` while the header documents THREE values, so the footer
+style (2) was stored as 1 and **every footer in the toolkit drew its rule on the
+bottom** — under the last thing in the window, where it reads as a header for
+whatever comes next; and the Task Manager's button messages were written and then
+overwritten by `tm_refresh` IN THE SAME CALL, so the answer to a button press was
+never on screen for a single frame.  All 3 arches build clean; the file manager
+was already a table and inherited every one of these without an edit, which is
+the argument for the view being a view.  **STILL OPEN against the design:** tabs
+above the table, and the empty-state panel.
+
+**THE MISSING CONTROLS, AND THE INSTRUMENT THAT PROVED THEM (2026-08-31).**
+Three of §M69's seven undrawn controls now exist — **switch, segmented/tabs,
+progress** — and the first thing built was the thing that could FALSIFY them:
+`uikit`, a shell command opening a window with every registered class in one
+grid, printing the registry beside it (**12 registered, 10 shown**) so a class
+nobody instantiates is visible as a count rather than as a gap somebody has to
+notice.  *A shell command and not a GUI_APP on purpose: eleven of twelve
+Start-menu slots are taken, and a test harness has no business taking the last
+one.*  **THE ENABLER WAS A PRIMITIVE DESIGN_TARGET.md LISTS AS ABSENT:** there
+is no rounded rectangle, and `cp_fill_plate` is the radius-1 case hand-written —
+a switch is a STADIUM and its knob a CIRCLE, neither of which is one cut pixel.
+`cp_fill_round` draws it as a 1 px staircase, integer-only (§A2), one fill per
+row; **which is the design's OWN answer** ("radius 4 → sarok-levágás: 1px
+lépcső"), so it is the specified fallback rather than something invented at
+draw time.  Its other suggestion — a build-time 1-bit mask — was declined
+because §M61 made the resolution a runtime choice and a baked mask is right at
+one density and wrong at the other (§M62's argument for the vector logo, one
+control down).  **A SWITCH IS NOT A CHECKBOX WITH A DIFFERENT SKIN**, and the
+settings panel is where it matters: everything there goes through
+`config_apply` the instant it moves, so the machine has ALREADY changed — a
+checkbox promises "when you confirm", which that panel has no button to keep.
+`CFG_BOOL` renders as a switch now.  **PROGRESS IS DETERMINATE ONLY, said
+plainly:** the spec's indeterminate band and spinner are ANIMATIONS and there is
+no animation clock here, and a static band that cannot stop saying "working" is
+worse than not offering one.  **THE GALLERY EARNED ITSELF IN ITS FIRST
+SCREENSHOT — four defects, three of them pre-existing:** (1) my own `seg_draw`
+broke §M65's clip rule within an hour of it being quoted in this file — a
+per-item `gfx_set_clip`/`gfx_clear_clip` **threw the inherited viewport away**,
+so the labels drew across the window while their tray, a fill made before the
+clip was replaced, did not: *three words floating with nothing under them.*
+(2) `cls_label_measure` sized text as `strlen * cp_fw()`, and cp_fw is a
+DIGIT's advance — in a UI_GRID the label column is the widest label's width, so
+under-measuring clipped **only the longest caption** ("SEGMENTED" →
+"SEGMENTEI"), which reads as one bad string rather than as a measuring rule.
+(3) the checkbox measured its label the same way and reported a literal
+**`pref_h = 18`** — less than half the design's `control_h` — so its row clipped
+its own descenders; the radio and combo measured a CHARACTER COUNT and left the
+multiply to the caller, and *removing the multiply without changing what the
+variable holds was a second bug I wrote and the picture caught.*  (4) my window
+was `26 * cp_row_h()` = **1144 px at the measured 137 % density**, starting at
+y=100 on a 1200 px screen — nothing draws outside the framebuffer, so a window
+sized past the edge reads as a broken LAYOUT.  **FOUND AND DELIBERATELY NOT
+FIXED, with the evidence:** a `UI_SCROLL` container comes out about 100 px tall
+whatever its window's height, clipping everything below the third row; the same
+grid directly in the root column lays out correctly at the same size, which
+narrows it to the scroll container's height and no further.  *A layout-engine
+change wants its own measurement, not a hurried one on the way to a
+screenshot.*  All 3 arches build clean.
+
+**THE CONTROL SIZING CONVENTION (2026-08-31), REPORTED FROM USE:** *"the toggle
+is huge next to its text; the radio is tiny and sometimes does not fit; the
+Save button is a whole row and should not be."*  All three are one absence — a
+**RULE**, which is what was asked for: *lay one down, and flag the exceptions.*
+Now stated once in console_plate.h and referenced everywhere: **(1)** a control
+is as tall as the text beside it plus padding (`cp_ctrl_h()`), CAPPED at the
+density's `control_h` so it can never exceed the design's token — *in a labelled
+row the control may be only minimally larger than its explanation, and one twice
+the height of the sentence it belongs to reads as the important thing on the
+row, which it is not*; **(2)** a control is as wide as its CONTENT, and filling
+the row is the EXCEPTION, asked for with `UI_FILL_W`; **(3)** a button's label
+is centred on both axes and measured with `cp_text_w`; **(4)** anything square
+standing next to text is derived from `cp_fh()`.  **THE SWITCH KEEPS THE
+DESIGN'S 48:26 ASPECT AND TAKES ITS HEIGHT FROM THE RULE** — taking both from
+`cp_px()` is faithful to the reference and produced a 66x36 track beside 20 px
+text, so it still LOOKS like the design's switch and stops dominating its
+sentence.  **THE FULL-WIDTH CONTROLS WERE A LAYOUT-ENGINE DEFAULT NOBODY
+CHOSE:** `arrange_grid` handed the control column `rest` unconditionally, and
+its stacked branch read `even ? w : w` — *both arms the same, which is how a
+line says it meant to distinguish two cases and never did.*  Rule 2 is enforced
+there now, and the settings panel marks only the slider and the text box as
+filling (*a track that stops halfway says nothing about the range it stands
+for*).  **FOUR MORE 8x8-ERA CONSTANTS FELL WITH IT:** a button measured
+`strlen * cp_fw() + 20` and stood **22 px** tall, a radio dot was a literal
+**12**, `RG_ROW` was **18**, and the button CENTRED its label with `cp_fw()` —
+so with a proportional face the text sat off-centre by the difference between a
+digit's advance and the real one, worst on the widest labels.  **AND THEN THE REPORT WAS CORRECTED, WHICH CHANGED WHICH AXIS IT WAS ABOUT.**
+The first pass read *"the Save button is a whole row"* as WIDTH and fixed width;
+the correction was HEIGHT, with a second example that makes it unambiguous —
+*"packages loaded at boot: true/false — the toggle is significantly taller than
+the text next to it"*.  So rule 1's padding was tightened from 6 design px a
+side to **4** (about **1.5x** the text), and the SWITCH was taken off
+`cp_ctrl_h()` altogether and measured against the text directly at
+`cp_fh() + cp_px(2)` — about **1.15x** — because *a button CONTAINS its label
+and needs room around it, while a toggle STANDS BESIDE a sentence and only has
+to be findable*.  Measured at the 137 % density: text 20 px, control 30 px,
+switch track 23 px, against the 55 px a faithful `control_h` gives.  **THE
+DIVERGENCE FROM THE REFERENCE IS WRITTEN INTO console_plate.h** rather than left
+to be rediscovered: widget_specs.md §1 really does give a button `control_h`
+(2.7x its text), so somebody holding our screen against the catalogue will find
+our controls shorter, and that has to read as a decision rather than as drift.
+**VERIFIED IN THE GALLERY:** button, segmented and dropdown at content width
+with centred labels; slider, text, progress and list spanning because they asked
+to; the switch now reading as a control beside a sentence rather than as the
+row's headline.  **BOTH LEFTOVERS THEN FELL TO ONE DUMP, AND ONE OF MY OWN FINDINGS WAS
+FALSIFIED BY IT.**  `ui_dump` now prints what each node ASKED FOR beside what it
+got, plus a `fill` marker — *with only the placed size, a control stretched by
+its container and one that genuinely wants the width look identical*, which is
+why two rounds of reasoning had gone nowhere.  Reaching it needed a second
+thing: the harness cannot type once a GUI window has focus (§M64), and a
+settings panel is opened by double-clicking, so `ui dump` was unreachable for
+exactly the windows worth dumping — hence `gui.ui_dump`, a key that can be set
+BEFORE the GUI takes over.  **THE SAVE BUTTON: `want 78x32`, placed `544x32`,
+no `fill`.**  The implicit ROOT column passed `inner_w` unconditionally
+(ui.c) — *the THIRD copy of the same defect*, after the grid's stacked and
+unstacked branches, so the engine stretched controls on all three of its paths
+and no caller could opt out anywhere.  Fixed; measured again at `78x32`.
+**AND THE `UI_SCROLL` CLAIM WAS WRONG.**  This file recorded "the viewport comes
+out about 100 px tall whatever the window's height"; the dump says the settings
+panel's viewport is **242 px in a 360 px window — exactly the leftover it should
+get — holding 1004 px of content**.  It was never a sizing bug: the content
+really is taller, and there is **NO SCROLLBAR**, so nothing on screen says the
+rest exists.  That is also the whole of the "`kernel.fault_policy` shows one of
+three options" report — the radio measures and is placed at its full `80x96`,
+and the viewport cuts it.  *An instrument that produces a confident wrong
+explanation is worse than one that produces none*, which is what the
+wanted-vs-placed column exists to prevent.  **THE INDICATOR SHIPPED THE SAME DAY, AND IT IS DRAWN BY THE TOOLKIT RATHER
+THAN BY A WIDGET** — a container is a NODE and nodes have no draw op, so
+`ui_draw_overlay(win, surface)` runs from both window redraw paths in gui.c
+after `widget_draw_all`.  Same shape as the table's and the listview's: a
+`tray` trough, a proportional `muted` thumb, no end arrows.  **THE BAR'S WIDTH
+COMES OFF THE CONTENT, NOT OUT OF IT** — `arrange_scroll` reserves the strip
+before laying children out, because painting a bar over a full-width column
+covers whatever is under it and stays invisible until one child happens to
+reach the edge (the table learned this an hour earlier, one layer down); the
+same pass also stopped handing every scrolled child the full width, which was
+the FOURTH copy of the rule-2 defect.  **VERIFIED BY PICTURE:** the System
+panel's viewport now carries a thumb about a quarter of its track, which is
+242/1004 — it says there is more below, which is the whole job.  **AND THE WHEEL WAS SETTLED BY A
+TWO-POINT PROBE, WHICH IS THE ONLY REASON IT COULD BE.**  Driving
+`mouse_button 16` and diffing two frames gave a difference bounding box of
+`(1862,1162)-(1870,1177)` — the taskbar clock, nothing else — and *that single
+observation cannot distinguish "our routing drops the wheel" from "the monitor
+cannot deliver one"*.  So `gui.input_debug` logs at BOTH ends: where the packet
+is DECODED (ps2_mouse.c) and where it is DISPATCHED (gui.c).  Result with the
+panel demonstrably open (33 widgets logged): **zero device-side notches and
+zero dispatch-side lines**.  The QEMU monitor's `mouse_button 8/16` produces no
+wheel for a mouse decoding §M69's 4-byte IntelliMouse packet, so a wheel gesture
+cannot be delivered on this harness at all — our routing is UNTESTED, not
+broken, and the earlier "the panel did not scroll" says nothing about our code.
+**THE HALF WE OWN IS PROVEN:** `gui.ui_scrolltest` drives the same model through
+`ui_scroll_by`, which reports `moved`, the dump reads `content 1004 px, scroll
+400`, and the screenshot shows different settings with the thumb moved down its
+track.  *One link is untestable here and it is named; everything above the
+packet decode is measured.*
+
+**THE TASKBAR'S STATUS AREA, REPORTED FROM USE (2026-08-31):** *"the keyboard
+layout and volume indicators do not look finished, as if they slid under the
+taskbar."*  Three things, and the first two are the same 8x8-era habit found
+everywhere else today: the tray glyphs were literal pixel counts — icons **20**
+and **`cp_fw() + 4`**, boxes **28** and **52** — that did not move when §M69
+made the type a runtime fact, so a 20 px icon stood beside 20 px text and a
+15 px one read as damage.  Both derive from `TRAY_ICON = cp_fh() + cp_px(6)`
+now, one size for every tray glyph so the two indicators cannot drift apart.
+**AND A GRADIENT-ERA GROOVE SURVIVED THE WHOLE PORT IN THAT CORNER:** two
+hardcoded 1 px fills at `cx-1`/`cx` in literal colours belonging to no theme —
+the bright vertical line between the speaker and the date in every screenshot
+taken since the Console Plate work began.  widget_specs.md §16 separates status
+items with SPACE, not rules, so it is a `TRAY_GAP` now.  **THE CLOCK IS MONO,
+which the design also specifies** ("mono 12px státuszok … az óra `text`
+színnel") and which is load-bearing rather than stylistic: a clock set in a
+proportional face changes width as its digits change, so the whole tray shifts
+once a second.  Its centring used `strlen * cp_fw()` — the same measuring bug
+as everywhere else — and is exact under the mono advance.
+
+**THE SEVENTH CONTROL SHIPPED, AND IT WAS NEVER A CONTROL (2026-08-31).**
+widget_specs.md §14's dialog wants a modal backdrop, a right-aligned action row
+and focus TRAPPED inside the panel — so the work is **MODALITY, a compositor
+property this tree did not have**, and the panel on top of it is the easy half.
+**WHAT MODALITY IS, MECHANICALLY, IS FOUR GATES IN FOUR FUNCTIONS**, written
+down together in gui.c because a reader who finds one will conclude the feature
+is half built: `topmost_at` answers *"the modal, or nothing"* (which covers
+hover, the title-button highlight, the right/middle press and the drag start,
+because all four ask that same question); the left-press path swallows anything
+outside it **BEFORE** the taskbar's first refusal and the desktop fallthrough —
+*gate 1 alone is not enough, because `topmost_at` returning NULL is exactly how
+a click on the WALLPAPER is recognised, so without this a modal would still let
+you launch shortcuts behind it*; Alt-Tab is refused; and the 45 % backdrop is
+what makes the other three LEGIBLE — *swallowed clicks with an undimmed screen
+behind them are indistinguishable from a machine that has stopped responding.*
+**PLUS AN ESCAPE HATCH THAT IS NOT DECORATION:** Esc is trapped in the
+COMPOSITOR, not in the dialog's key hook — that hook runs on the dialog's own
+host task, so if that task ever wedges it is precisely the thing that will not
+run, and the desktop would be locked with no way out; routed through
+`want_close` it inherits the X button's second-press force (§4.38.1).
+Ctrl+Alt+Del is unaffected either way — §M46 traps it in the keyboard IRQ,
+above the GUI.  **THE CLAIM IS RELEASED IN `destroy_window`, on every route**,
+for the same reason `on_dispose` is fired there: a dialog leaves four ways and
+a screen-wide claim that survives one of them locks the desktop.  **A MODAL
+SHOWS ONLY ITS CLOSE BOX** — minimising one would hide the thing that cannot be
+got past — and that is a COUNT (`title_btn_count`), not three booleans, because
+the buttons are numbered from the right edge, so "show fewer" is "stop at a
+lower index" and the painter, the hit test and the click handler cannot
+disagree about which boxes exist (§4.79's dead top edge, avoided by
+construction).  The double-click maximize shortcut goes with the button: *a
+hidden gesture reaching a state the visible controls deny is the same defect as
+a menu item with no keyboard route, inverted.*  **TWO DELIBERATE DIVERGENCES,
+in dialog.c's header rather than left to be rediscovered:** the title is the
+WINDOW's title bar (a title inside a title bar is the same word twice, and it
+makes the X mean cancel for free), and the body does NOT wrap — lines split on
+`'\n'` and the caller picks the breaks, because a wrapping engine is real work
+and a hurried one would put the layout bug where nobody looks.  **THE ANSWER
+ARRIVES EXACTLY ONCE AND DEFAULTS TO CANCEL:** three of the four exits run no
+button handler, so it is delivered from `on_close`, which every route passes
+through — *if a dialog is torn down by something nobody predicted, the outcome
+that happens is the one that does nothing.*  `UI_ALIGN_END` had to be added to
+the toolkit (§14's action row is right-aligned with the confirm button on the
+outer edge — an alignment this layout engine could not express, which is why
+every earlier "dialog" here hand-placed its buttons in absolute pixels).
+**IT REPLACED A GESTURE STANDING IN FOR A SENTENCE:** the file manager asked
+about a recursive delete by requiring Del TWICE within eight seconds —
+undiscoverable, a hidden deadline, guarding the most destructive thing it can
+do.  *A system that cannot ask does not stop asking; it asks badly.*  **VERIFIED
+END TO END, i386 -smp 4, `dialog` + the real client:** the demo answers `OK` from
+a driven click and `CANCEL` from Esc; a click on the Start button while a modal
+is up opens nothing; and in the file manager `/aaa` → Del → *"Delete directory /
+This directory is not empty"* with the path in mono → Delete tree → **the entry
+is gone from the list and the status reads `tree deleted`**.  **THE BACKDROP WAS
+MEASURED, NOT EYEBALLED, AND THAT IS THE METHOD NOTE:** it looked absent in the
+screenshot and I was one edit from "fixing" it — the pixels say wallpaper
+140→76 and taskbar 148→81, i.e. exactly 54.5 % = 255−115 = the spec's 45 %
+black.  After Escape the screen is byte-identical to a no-dialog control at
+every probe including where the dialog stood.  *A bright wallpaper dimmed by
+45 % still looks bright; only the control says otherwise.*  **AND THE
+INSTRUMENT EARNED ITSELF TWICE:** modality is CLAIMED on one task and PAINTED
+on another, so "no backdrop" has two unrelated causes that look identical — a
+two-point probe (`modal CLAIMED by …` / `modal visible to the compositor
+(z-index N of M)`) settles it in one line.  **A BUG FOUND BY THIS, NOT LOOKED
+FOR, AND OLDER THAN THE DIALOG: A WINDOW WITH A TOOLKIT INTERFACE NEVER RAN ITS
+OWN `on_layout` AGAIN.**  The host's layout branch read `if (ui_state)
+ui_layout(); else if (on_layout) …` — so the file manager, which builds its menu
+bar with `ui_build` and hand-places everything else, has not repositioned its
+path bar, button row, list or status line on a RESIZE since §M65 gave it that
+menu.  It surfaced because `gui_window_request_layout` is the one route from
+any task into a window's host loop, which is what the dialog's deferred answer
+needed: the tree really was deleted and the file manager went on showing the
+deleted directory.  *A window that never re-lays out looks exactly like an app
+that ignored the event*, which is how it survived a milestone.  The order is
+INVERTED now (the app gets first refusal, the toolkit is the fallback), safe
+because ui.h's "build once, lay out many" already requires a ui_build app's
+hook to call `ui_layout` itself — and **FALSIFIED BY A CONTROL RUN**: rebuilt
+with the old order, the same drag grows the window while every hand-placed
+widget stays at its original 520 px and only the menu bar follows.  **AND THE
+CALLBACK MUST NOT TOUCH THE OTHER APP'S WIDGETS:** it runs on the DIALOG's
+host, and §M22.7 says a window's widgets belong to the task that hosts it — the
+first version called `fm_refresh()` from there, the model really was reloaded,
+and NOTHING ON SCREEN CHANGED, because damaging a window is the host's job.
+*A cross-task write that appears to do nothing is the most expensive kind: it
+looks like a missing feature, so the fix gets aimed at the wrong layer.*  The
+answer is handed over as DATA and consumed in `fm_layout`.
+
+**THE APPS CAME OFF THEIR 8x8 CONSTANTS (2026-09-02), AND THE ROW OF BUTTONS
+WAS THE PROOF.**  Nine windows still laid out in flat pixel counts while §M69
+made the type a runtime fact, and the file manager showed exactly what that
+costs: seven buttons at a literal height of **18** with widths of 44/56/50/54
+chosen for an 8 px advance, so at 137 % density **the frame cut through its own
+label** — "MkDir" touched both edges, the descenders of "Copy" were sliced off.
+*The defect was not that the numbers were wrong; it is that nobody had asked
+the control how big it is.*  `cls_button_measure` has known the answer since
+the convention was written down and nothing outside the toolkit could reach
+it — hence `w_button_autosize()`, which places a button at its own size and
+returns the width so a hand-placed row can advance a cursor.  **It is named as
+an INTERIM in its own header**: `ui_build` with a `UI_ROW` is the end state,
+and a second layout mechanism is what this tree keeps warning itself about.
+Ported: fileman (row laid left to right, dropping from the right rather than
+overlapping — *half a button looks pressable and hits its neighbour*), editor
+and displaypanel (right-aligned, measured RIGHT TO LEFT so the outer edge is
+the fixed one, with the path bar taking whatever the buttons leave — so a
+longer label, or a localised one, cannot overlap it), crashapp, devicepanel.
+**AND THE SAME DEFECT SAT ONE LEVEL UP:** every app's default window size was a
+design-era literal, so at 137 % the content grew and the window did not — which
+is why the file manager's "View" button fell off the end of its own toolbar.
+All of them go through `cp_px()` now.  **THE CONTROL PANEL'S HEADER WAS THE
+CLEAREST CASE OF THE SHAPE:** the label sat at `y=6` and the view at `y=24`,
+while a label is `cp_fh() + 4` tall — ~24 px at this density — so the view
+started six pixels INSIDE the label and painted over its descenders.  *Two
+offsets that agreed only at the font they were measured for.*  **A RADIO WAS
+DRAWING A SQUARE**, found by picture in the Appearance panel: not a styling
+slip, because the shape IS the affordance — a square says "several of these may
+be on" and a circle says "exactly one", so a radio group drawn as checkboxes
+tells the user the opposite of what the control does (§M69's switch-vs-checkbox
+argument, one control over).  Drawable only because the switch needed a stadium
+first: radius `RG_DOT/2` turns `cp_fill_round`'s staircase into a disc, no new
+primitive.  Also the grid cell (`96x96` fits twelve 8 px characters, which is
+why "Appearance" truncated to `Appeara~`) now derives from the icon and the
+row height; it still truncates, deliberately, because cells of different widths
+line up in neither direction.  **METHOD NOTE, PAID FOR TWICE TODAY:** a stray
+`cd` left the shell outside the project, so a verification run never executed
+and I read a 45-minute-old screenshot as if it were fresh — *a harness that
+silently does nothing is worse than one that crashes, because it is trusted*
+(§M57's lesson, self-inflicted).  The `struct cp_state` in controlpanel.c also
+collided with console_plate.h's `enum cp_state` the moment the header was
+included; renamed, because the `cp_` prefix belongs to the plate.  **THE SCROLLBAR WAS AN INDICATOR WEARING A CONTROL'S CLOTHES (2026-09-02,
+reported from use).**  *"Arrows above and below to step with; the wheel does
+nothing on it; press and hold does not drag it."*  All three true, and the
+cause is one shape: there were **FOUR copies** of the same arithmetic — the
+listview's, the table's, the item-view's and the UI_SCROLL overlay's — each
+computing `track * viewport / content` and each stopping there.  *Four
+implementations of a control and not one of them was a control*; they were
+pictures of scrollbars, which is worse than none, because the user reaches for
+them.  Now ONE `scrollbar.c`: metrics, painting and hit-testing from a single
+call, so the drawn box and the pressable box cannot disagree (§4.79's title
+buttons, avoided by construction).  **UNITS ARE THE CALLER'S** — rows for the
+list and the table, pixels for a container — because every formula is a ratio,
+so neither has to convert.  **THE ARROWS ARE A DELIBERATE DIVERGENCE, ASKED FOR
+EXPLICITLY:** widget_specs.md §10 says *"Nincs nyíl-gomb a végeken"*, and this
+draws them; written into scrollbar.h rather than left to be found by somebody
+holding our screen against the catalogue.  The design's own trough behaviour
+(click → page toward the pointer) is implemented as specified.  **THE SPLIT
+THAT MADE IT ONE CONTROL AND NOT FOUR: A VIEW IS STATELESS AND A USABLE
+SCROLLBAR HAS STATE.**  The table used to paint its own bar; a bar that can be
+grabbed needs to know which part is held and where inside the thumb the press
+landed, so the VIEW now only reports its rect (`item_view.scrollbar`, appended
+per §M58) and the WIDGET — which owns `scroll` — paints and drags it.  Without
+that, each of the four layouts would have grown its own press/drag/release,
+which is exactly how there came to be four bars.  **THE GRAB OFFSET IS NOT A
+DETAIL:** without it the thumb's top snaps to the pointer on the first motion
+event and the list lurches the moment you touch it.  **AND THE WORST CASE WAS
+THE CONTAINER'S BAR, WHICH HAD NO WIDGET UNDER IT AT ALL** — a UI_SCROLL
+container is a NODE, so gui.c's pointer routing found nobody and every settings
+panel drew a scrollbar that was pure decoration.  New `ui_pointer_at()`, asked
+**before** the widget lookup rather than after: once a container holds the
+grab, a drag that strays off the twelve-pixel bar must not press the controls
+it passes over.  **TWO CLAMPS WERE WRONG IN THE SAME WAY:** both wheel paths
+bounded scroll at `count - 1`, so the wheel could run a list until one row sat
+at the top with empty space under it — and the thumb then had nowhere sensible
+to be.  Bounded at the last FULL screen now.  **MEASURED BY DRIVING THE MOUSE,
+i386 -smp 4:** dragging the file manager's thumb moves the list from
+`bin/…modules/` to `lib/…usr/` with the thumb at the end of its track; three
+clicks on the down arrow step exactly three rows (`bin/` → `etc/`); six clicks
+on the Appearance panel's arrow scroll the container from `gui.wallpaper` to
+`gui.density` and bring `gui.shell` and `desktop.view` into view.  **THE WHEEL
+IS THE ONE PART STILL NOT DRIVEN HERE, AND IT IS NAMED:** §M69 already measured
+that this harness cannot deliver a notch to our 4-byte IntelliMouse decode, so
+the routing is confirmed by reading (`widget_at` → the widget's `scroll`;
+nothing under the pointer → `ui_scroll_at`, whose rect covers the reserved
+strip) and by `gui.ui_scrolltest`, not by a driven gesture.  **REPORTED AS "x64: THE SCROLL DOES NOT WORK, NEITHER THE ARROWS NOR THE
+DRAG" — AND IT IS THE HARNESS SHAPE FOR THE SIXTH TIME.**  Not reproducible:
+driven mouse on **x86_64**, the file manager's thumb drags the list from
+`bin/…modules/` to `lib/…usr/`, and six clicks on the Appearance panel's arrow
+scroll the container exactly as on i386 — two surfaces, both arches, identical
+results.  **THE DIFFERENCE IS NOT A QEMU FLAG, IT IS THE IMAGE:**
+`run-x86_64.sh` BOOTS and does not build, while `scripts/build.sh` defaults to
+**i386** — so the ordinary way to work (edit, build, run i386, then run x86_64
+to check the other arch) boots a STALE x86_64 image silently, and every symptom
+gets attributed to the code just written.  *On the arch that had actually been
+rebuilt the fix worked; on the other one the report was true and about a build
+from before it.*  §M48's missing NIC, §M49's missing `-smp`, §4.66's missing
+disk, §4.67.1's missing watchdog and §M60's ARM harness that had quietly
+stopped typing are all the same defect — **the path a person runs and the path
+that is tested are not the same path** — and this is the first time the
+difference was the image rather than the machine.  `run_qemu.sh` now compares
+the ISO's mtime against every source file and prints a loud **STALE IMAGE**
+banner naming the newest ones and the rebuild command.  **A WARNING, NOT A
+REFUSAL** (booting an old image on purpose is legitimate — bisecting, comparing
+against yesterday; doing it *without knowing* never is), with
+`DOS_NO_STALE_CHECK=1` to silence it.  Verified in BOTH directions, because a
+warning that always fires is a warning nobody reads: it names `scrollbar.c`
+after a touch, and is silent the moment the image is current.  **AND THE GUARD
+TOOK THE RUN SCRIPT DOWN ON ITS FIRST REAL USE:** `run_qemu.sh` runs under
+`set -eu`, so testing the UNSET `$DOS_NO_STALE_CHECK` aborted before QEMU
+launched, on every arch — *a guard that stops the thing it was guarding is
+worse than the gap it filled*, and the two-direction test above did not catch
+it because it exercised the logic outside the script's own shell options.
+`${VAR:-}` now, checked with the variable set, empty and unset.  **THE STALE
+THEORY WAS THEN FALSIFIED FOR THE REPORTED CASE:** the user's own build printed
+`make: Nothing to be done for 'iso'`, so their x86_64 image was already
+current — I had over-committed to the most familiar explanation.  What replaced
+it is an instrument rather than a second theory: `gui.input_debug` now logs
+where a scrollbar press LANDS (`iv:`/`lv:`/`ui: press at x,y … part=N`), which
+separates "the click never reached the bar" from "it reached it and nothing
+happened" — the two causes that look identical from a chair.  *The probe also
+caught the harness being unrepeatable: two identical driven runs put the press
+on the arrow once and nowhere the next time, which is exactly the shape that
+produced a confident wrong conclusion in §4.67.1.*  **FOUR REFINEMENTS FROM USE, AND ONE OF THEM CORRECTS AN EARLIER RULE OF MINE
+(2026-09-02).**  (1) *"The selection box is about twice the meaningful content
+(icon + title)."*  It was, and the cause outlives the symptom: the grid cell
+was built around a CONSTANT 48 px icon while `grid_draw` draws
+`cp_icon_size()`, a §M63 SETTING whose default is 24 — so every cell reserved
+room for an icon twice the size of the one in it, and the selection wash, which
+fills the cell, advertised that empty space as part of the item.  *A constant
+and a setting describing the same thing is a mismatch waiting for somebody to
+change the setting.*  Height is now exactly what the painter lays down (pad,
+icon, gap, one label line, pad), and the label's own offset uses `G_GAP` rather
+than the literal 6 it had drifted to.  (2) *"Scrolling on the content is no
+good; on the scrollbar it is perfect."*  `widget_ops.scroll` returned **void**
+and the router treated *"this widget has a scroll op"* as *"this widget took
+it"* — so a list already at its end SWALLOWED every further notch and the page
+it sits in never moved.  *"Has a handler" and "did something" are different
+facts, and routing on the first makes every nested scroll area a dead end.*  It
+returns int now (non-zero = consumed) and the router falls through to the
+container.  (3) *"The buttons are a bit hard to press."*  **THIS IS MY OWN
+EARLIER RULE, GENERALISED PAST THE CASE IT DESCRIBED.**  Rule 1 came from a
+report about a TOGGLE beside a sentence and I applied it to every control
+including buttons, which took them from the design's `control_h` down to
+text+padding.  Both reports were right; the mistake was the generalisation.
+console_plate.h now opens with **RULE 0: there are two kinds of control** — one
+that STANDS BESIDE a sentence (checkbox, radio, switch: only has to be
+findable) and one you AIM AT (button, dropdown, text box: judged by how easily
+the hand lands on it, `cp_btn_h()` = the design's token).  *A rule derived from
+one example is only as wide as that example.*  The text box also stopped
+freezing whatever height its constructor happened to pass (`w->h > 0 ? w->h :
+22`).  (4) **NEW SETTING `gui.scroll_invert`**, asked for explicitly: a Windows
+wheel moves the VIEW and a Mac trackpad moves the CONTENT, so somebody who uses
+both has one of them wrong all day and no default can be right for both.
+Applied at the ONE point every notch passes through, so four scroll handlers
+cannot disagree about direction; declared with `CONFIG_KEY` next to the router
+that reads it, so the Appearance panel renders it as a switch with no per-key
+UI code (`conf list` → `[Appearance] gui.scroll_invert (bool) = 0`).  **AND THE INSTRUMENT THAT FINALLY MADE THE WHEEL TESTABLE, PLUS THE BUG IT
+CAUGHT IN MY OWN PATCH (2026-09-03).**  Every claim about wheel ROUTING here
+had been made by READING the code, because this harness cannot deliver a device
+notch — and reading produced two wrong explanations of one report.  `wheeltest
+<x> <y> <dz>` injects a notch through the REAL dispatcher at a CONTENT
+coordinate, which is the thing that matters: *"the wheel works on the scrollbar
+and not on the content" is a claim about two POSITIONS, and a test that cannot
+name a position cannot check it.*  `dz == 0` is PROBE mode — it reports what is
+under the point and who would take a notch there WITHOUT moving anything, so a
+sweep is a MAP; injecting real notches to sample several points changes the
+layout between samples, and the second sample then describes something the
+first one did not.  Fired from a config key (`gui.wheeltest`) because the
+harness cannot type once a window holds focus (§4.74).  **WHAT THE MAP SAID
+ABOUT THE SETTINGS PANEL: nothing in it swallows the wheel** — eight probes
+across the Appearance panel all report `widget … scroll=no`, and a real notch
+at the content centre gives `ui_scroll_at TOOK it`.  So on i386 that path is
+proven end to end and the report is NOT reproducible here; what remains
+untestable is the notch's delivery, not its routing.  **THE CONTROL PANEL BUG
+WAS REAL AND IS FIXED:** *"it scrolls although everything fits, and most icons
+vanish — as if the bottom row jumped to the top."*  Both halves are one defect:
+`grid_rect` subtracts `scroll` from the ROW index while the wheel clamped to
+`count - 1` in ITEMS, so one notch (three units) scrolled three ROWS off a
+two-row grid and the clamp allowed it because there were six items.  *A number
+is not a unit, and two layers disagreeing about which one it is looks like a
+rendering bug.*  The grid and the list report their range in ROWS now
+(`.scrollbar`), and `iv_scroll_max` distinguishes **three** answers where the
+code had two — no op at all / "everything fits, the ceiling is ZERO" / a real
+range — because conflating the last two is precisely what let a grid with
+nothing to scroll scroll anyway.  **AND THE PROBE CAUGHT MY OWN PATCH NOT
+APPLYING:** the first attempt at that ceiling silently missed `iv_scroll` (an
+earlier edit had changed the text it matched on), the build was clean, and the
+notch still reported `took it` — *a patch that compiles and does nothing is
+indistinguishable from a wrong theory, and only running the path told them
+apart.*  Also: the Start button measured itself and centred its caption with
+`5 * cp_fw()` — a character count times a DIGIT's advance — so the box was the
+wrong width AND the label off-centre by the difference; one `cp_text_w` now
+serves both.  **LOCALISATION SHIPPED (2026-09-03), asked for explicitly and never begun.**
+This machine could TYPE Hungarian since §4.66 (ISO-8859-2 font, accented
+keymap) and could not SAY anything in it: every user-visible string was an
+English literal at its point of use.  Now `lstr("key")` against catalogues
+registered with **`LOCALE_CATALOG`** — the linker-section shape every other
+registry here uses, so adding a language is a FILE rather than an edit to a
+switch in the middle of the toolkit.  **FOUR DECISIONS, each a way this could
+have gone wrong:** (1) **lookup is by KEY, not by index** — an enum of message
+numbers makes every catalogue a positional list kept in step by hand (§M58's
+scar one layer up: insert a string in the middle and every language after it
+shifts by one, silently, because nothing in a build can tell "Cancel" from
+"Megse"); (2) **a missing string falls back to English and then TO THE KEY
+ITSELF, never to empty** — *a gap that shows what is missing is a to-do list; a
+gap that shows nothing is a bug report* — and that fallback turned out to be
+the feature that makes adoption incremental: **a plain English literal that is
+not a catalogue key renders as itself**, so `w_menubar` could be routed through
+`lstr` for EVERY menu in the tree in one edit without touching the menus nobody
+has translated yet; (3) the catalogue is DATA; (4) the language is a §M63
+`CONFIG_KEY`, so the Region panel gets it with no per-key UI code and the
+watcher re-lays out every open window — *a translated caption is a DIFFERENT
+WIDTH, and a layout computed for the old one leaves controls overlapping*.
+**WHAT IT DELIBERATELY IS NOT** is written into locale.h: no plurals, no
+gender, no positional message formatting, no date/number formatting — shipping
+an `lstrf()` would invite exactly the strings that cannot be translated
+correctly, so composed messages stay in code and are MARKED where they occur
+(the delete dialog joins two catalogue lines with the newline the dialog splits
+on, so a translator still owns both sentences and neither has a placeholder).
+**THE HUNGARIAN IS IN ISO-8859-2 ESCAPES, not UTF-8** — the font is indexed by
+byte and the two double-acute vowels do not exist in Latin-1, which is why
+§4.66 chose Latin-2.  **`locale_init` runs on BOTH boot paths AFTER the
+persistent store is overlaid**, or a saved language would apply one boot late
+(§M63's own defect).  **`locale` prints the registry AND a sample lookup**,
+because "is the catalogue registered" and "is it being used" have failed
+separately in this tree before (§M52's shape).  **VERIFIED BY PICTURE:** the
+whole file manager in Hungarian — translated title, menus and all seven toolbar
+buttons — with the buttons resizing themselves to the longer labels, which is
+rule 2 doing its job unprompted.  **TWO TRAPS ON THE WAY, both this file's
+own:** `%-4s` printed literally (*this printf has no width specifiers* — stated
+in CLAUDE.md, hit anyway), and the first `locale hu` switched the language TWICE
+by two different routes, one of which did not record it — *a path that changes
+a setting without recording it is how a setting stops surviving a reboot*.  One
+route now: `config_apply` -> watcher -> `locale_set`.  **THE SWEEP FOLLOWED THE SAME DAY**, and it produced the
+rule for identifiers: **an app's ENGLISH NAME IS ITS CATALOGUE KEY.**
+`gui_app_def.name` is a stable identifier — a `.lnk` stores it and §M64's
+resolver matches on it — so it must NOT be translated at the registry; looking
+the identifier up gives a translated LABEL while the identity stays put, and an
+app nobody has translated renders exactly as before.  The Start menu is the
+picture of that working: `Fájlkezelő`, `Feladatkezelő`, `Szerkesztő`,
+`Kilépés a felületről`, `Újraindítás`, `Leállítás` beside `About d-os`,
+`New Shell`, `BASIC`, `NetSurf` — *translated where a line exists, itself where
+none does, blank nowhere.*  Also swept: the taskbar, the Control Panel hint,
+the settings panels' Save and hint, the table column titles.  **STILL OPEN:**
+the remaining apps' own strings (editor, crash reports, device panel) and every
+status message — mechanical, which is the point of the seam.  **THE EMPTY STATE SHIPPED (2026-09-03, widget_specs.md §11).**  A view with
+no items drew NOTHING, so *"this folder is empty"*, *"the filter matched
+nothing"* and *"the model failed to load"* were one identical blank rectangle —
+**and the blank is the one a user reads as broken.**  Dashed 1 px border,
+centred `muted` message and an optional `accent` call to action, drawn in ONE
+place for all three layouts rather than in each (three copies would be three
+chances to drift — which is what the scrollbar did four times over, one file
+down).  The message is DATA on the model (`empty_text`, `empty_action`), not a
+callback, because there is nothing to compute; the fields hold CATALOGUE KEYS,
+so a language change updates the text without the model being rebuilt and a
+plain English literal still works.  Drawing it RETURNS from the view — an empty
+collection has no rows, no header worth showing and no scrollbar, and chrome
+around nothing is what made a failed load and an empty folder look alike.
+**AND IT IMMEDIATELY CAUGHT A BUG IN THE LOCALISATION IT DEPENDS ON:** the
+first screenshot rendered `app.filemanager`, `menu.file`, `btn.up`, `col.name`
+— every string as its own key, i.e. the ENGLISH catalogue was not being found
+either.  `locale_init` runs after the persistent store is overlaid, which is
+inside the *"the disk mounted"* branch, so on a machine with no writable volume
+it never ran and `g_active` stayed NULL.  *§M63 stage 0's defect in a new
+costume — initialisation hanging off a conditional path — and silent because
+the key fallback looked deliberate.*  `lstr` now resolves the built-in
+catalogue lazily on first use: **the default language must not depend on a
+disk**, and the linker section exists before the heap does, so it always can.
+The store's job is only to OVERRIDE.  **AND THE LANGUAGE NOW CHANGES WITHOUT A REBOOT — REPORTED FROM USE, AND MY
+DESIGN WAS AT FAULT.**  *"Switching the language currently needs a restart; it
+should change the moment you save."*  The watcher was already there; what was
+wrong is that **a widget stored the RESOLVED string**.  `w_button_create(...,
+lstr("btn.up"), ...)` copies the translation into the widget at construction,
+after which the catalogue can no longer reach it — so a relayout repositioned
+controls that were still holding English.  *A translation captured at build
+time is a copy, and a copy is exactly what a live setting cannot reach.*  The
+modular answer is the one the fallback already made possible: **store the KEY,
+resolve at DRAW.**  `cp_text(s, x, y, lstr(b->text), col)` is safe for every
+widget in the tree because `lstr` returns its argument when there is no entry,
+so a caption that is a plain literal renders unchanged — the same property that
+let one edit route every menu through the catalogue.  Measuring had to move
+with it (`cp_text_w(lstr(...))`), or a button is SIZED for the key and DRAWN
+with the translation, which clips its own label in one language and not
+another.  `gui_window_title` resolves in ONE place, because the title bar, the
+taskbar button and Alt-Tab all ask it and three lookups would be three chances
+for one to show a raw key.  **AND SAVE IS THE COMMIT POINT NOW, ASKED FOR
+EXPLICITLY — WHICH REVERSED AN EARLIER DECISION OF MINE, CORRECTLY.**  The
+settings panel called `config_apply` the instant a control moved and then
+offered a Save button that only WROTE THE FILE: the machine had already
+changed, and the button's label promised something it did not do.  *A form with
+a commit button that does not commit is the one arrangement worse than either
+design on its own.*  Controls record a PENDING TEXT now (text, not a value:
+`config_apply` and validation are both defined on text, and a value would have
+to be re-interpreted per key type at Save — a second place to get the
+enum-to-string mapping right), validation still fires at the CONTROL so a
+rejection can point at the thing just moved, and Save applies **then** persists
+— in that order, because `config_apply` is what notifies the subsystem that
+read the key at boot while `config_save` only makes it survive.  **THE
+CONSEQUENCE IS A CONTROL CHANGE, AND IT IS WRITTEN DOWN RATHER THAN QUIETLY
+FLIPPED:** `CFG_BOOL` renders as a CHECKBOX again.  §M69 had made it a switch
+on the argument that a switch says *"the machine is like this NOW"* while a
+checkbox promises *"when you confirm"* — and that this panel had no confirm to
+offer.  **That premise is gone**, so the checkbox is the honest control and the
+switch would now be the lie.  *A decision derived from a premise has to be
+revisited when the premise moves; the alternative is a control that was right
+once.*  The `switch` class stays registered and remains correct where a change
+really is immediate (the volume flyout).  **VERIFIED ON THE REAL PATH, not
+through a debug hook:** Control Panel → Region and input → click the `hu` radio
+→ **nothing changes**, status reads *"unsaved change - press Save to apply
+it"*, the button still says `Save`; click Save → `locale: hu (Magyar)` and the
+button reads **Mentés** in the same frame, with the status honest about
+persistence (*"applied - RAM only, no writable volume"* on a run with no disk).
+The rendering of `locale.language` as a radio group is itself §M63's payoff —
+no per-key UI code anywhere.  **THE TAIL CLOSED THE SAME DAY, and it forced one rule worth keeping: WHAT
+MAY BE TRANSLATED AND WHAT MAY NOT.**  Item labels are NOT routed through the
+catalogue in the item VIEW, even though that would be one edit and would cover
+every app at once — the view draws file names, task names and device names, and
+translating every label would rename a file called `Save` to `Mentés`.  *User
+DATA is not a message.*  Only a model that knows its items are interface labels
+may translate them, which is why the Control Panel's model does it and the file
+manager's does not.  The settings-group names follow the app-name rule for the
+same reason as the app names: `CONFIG_KEY.group` is MATCHED against
+`SETTINGS_PANEL.name`, so translating it at the registration would detach every
+setting from its panel — the English string is the key, resolved where it is
+displayed.  Status messages became keys too, which is what makes the whole
+Region panel Hungarian end to end: title, group header, *"alkalmazva - csak
+memóriában, nincs írható kötet"* and **Mentés**, with the config KEY names
+(`locale.language`) correctly left in English because they are identifiers.  **TABS ABOVE THE TABLE ARE NOT BUILT, AND
+DELIBERATELY:** the `segmented` control has existed since §M69's control work,
+so what the design's §06 shows is a USE of it, not a missing capability — and
+bolting tabs onto an app that has nothing to put behind them would be
+decoration answering a screenshot rather than a need (§M59's argument for
+declining `wl_data_device`).  **THE TERMINAL CAME OFF 8x8 (2026-09-03) — AND THE GRID STAYED.**  The
+staging note said the terminal was deliberate because gterm is a grid and
+§M58's selection is addressed in CELLS; what that reasoning got wrong is that
+the grid was never the problem.  **A fixed ADVANCE is not the same thing as a
+fixed SIZE.**  The cell is `cp_cell_w()` x `cp_cell_h()` now — the IBM Plex
+Mono advance and the runtime line height — and the glyph comes from
+`cp_mono_text`, so a terminal on a 1920 px screen is no longer rendering at the
+size a 1280 px screen wanted.  Everything above it is untouched: the selection
+still names cells, `gterm_row(abs)` still answers for the renderer, the hit
+test and the copy alike, and the scrollback ring is still rows of characters.
+The design says the same thing for its own reason — terminals and tabular data
+are set in mono precisely so a column means something.  **THE BOOT CONSOLE
+STAYS 8x8, and that is not the same decision deferred:** it prints before the
+vector rasteriser, its glyph cache and the heap they need exist, and it is the
+surface that has to work when something else has not.  *A boot console that
+depends on the font machinery cannot report a failure in the font machinery.*
+**AND THE EMPTY STATE HAD TO BE NARROWED WITHIN MINUTES, reported from use:**
+*"what is this dashed thing on the desktop?"*  The desktop is a GRID model too,
+so an empty icon field grew a placeholder box across the wallpaper.  Wrong
+twice over — an empty desktop is a NORMAL state that needs no explanation, and
+the placeholder's whole visual argument (a dashed frame reading as "a container
+awaiting content") depends on there BEING a container, which a field painted
+straight onto the wallpaper is not.  **THE OWNER DECIDES WHETHER EMPTINESS
+NEEDS EXPLAINING**: a model with no `empty_text` gets exactly the behaviour it
+had before the feature existed.  *A default that applies everywhere is a
+decision made for surfaces nobody looked at.*  **THE THREE LEFTOVERS CLEARED (2026-09-03), and two of them are the same
+defect: A CUT THAT IS NOT MARKED.**  The Devices table clipped its headings and
+its cells mid-glyph, so `Isolation` read as `Isolatior` and `no driver needed`
+as `no driver neede` — **a misspelling, not a truncation.**  *The reader has to
+be able to tell a short label from a wrong one*, and the grid and the list have
+marked their cuts with `~` since M22 while the table, added later, simply never
+did.  Both marked now, on the same rule.  **THE MODAL'S DEAD TASKBAR BUTTON IS
+GONE:** gate 2 swallows clicks over the chrome, so it was a control pointing at
+the one window you cannot miss and answering a press with nothing; excluded in
+`gui_wm_windows_locked`, which covers Alt-Tab in the same edit (it already
+refuses to move focus while a modal is up).  **AND THE DIALOG BODY WRAPS,
+WHICH REVERSES ITS OWN STATED DESIGN — because the premise did not survive
+localisation.**  It split only on `'\n'` and left the breaks to the caller, on
+the argument that a wrapping engine is real work: true of a general one, false
+here, where a dialog has ONE known width and wrapping is a greedy walk over
+spaces.  The moment the strings came from a catalogue the caller STOPPED BEING
+ABLE to pick the breaks, because a translation is a different length.  *A rule
+that depends on the author knowing the final text cannot survive translation.*
+An explicit `'\n'` still forces a break, and the demo body is deliberately one
+long sentence now — *a body the author has already broken proves nothing about
+what happens to a translated one.*  **THREE MORE FROM USE, AND EACH ONE NAMES A DIFFERENT KIND OF MISTAKE
+(2026-09-04).**  (1) *"The scroll works only sometimes in Appearance, as if it
+were intermittent."*  It was not intermittent, it was **POSITIONAL**: a
+settings panel's group heading, status line and Save button sit OUTSIDE the
+viewport, so a notch aimed at any of them matched no container and did nothing.
+*From a chair, behaviour that depends on a few pixels of pointer position is
+indistinguishable from behaviour that is unreliable.*  `ui_scroll_at` now falls
+back to the window's ONLY scroll area — only when there is exactly one, because
+with two the pointer is the only thing that says which is meant and choosing
+for the user would be worse than doing nothing.  Proven with `wheeltest` aimed
+at the heading (`y=4`): `ui_scroll_at TOOK it`, while the Control Panel — which
+genuinely has nothing to scroll — still declines, so the two cases stay
+distinguishable.  (2) *"The Control Panel is full of untranslated labels like
+`gui.theme`."*  It was drawing the raw identifier, which is right for a `conf
+set` argument and wrong for a label a person reads.  **THE KEY IS ITS OWN
+CATALOGUE KEY** — no new descriptor field, because `lstr` falls back to its
+argument: a named key shows a name, an unnamed one shows exactly what it showed
+before.  Twenty-eight settings named in both languages.  (3) *"The accent is
+broken in `duplán` and fine in the next word."*  **A LITERAL UTF-8 `á` (C3 A1)
+in one catalogue entry** while its neighbours used `\xE1` — the font is
+byte-indexed ISO-8859-2, so two bytes became two wrong glyphs.  The rule was
+already written in that file's own header, one screen above the mistake: *a
+rule stated in a header is not a rule the compiler checks.*  What finds it is a
+grep for any byte >= 0x80 on a line holding an entry, which is now recorded
+there, and the sweep says the file is clean.  **THE LIGHT THEME WAS NEVER FINISHED, AND ONE REPORT EXPOSED THE WHOLE OF
+IT (2026-09-04).**  *"In the light theme the labels disappear; in the file
+manager the colours are not in harmony — the blue is very telling."*  Both
+halves are hardcoded palettes that the Console Plate port never reached: the
+item views carried five literals (`LBL_FG` is very nearly WHITE, so under the
+light theme the labels were white text on a light pane), `w_itemview` painted
+its pane `0xFF223047` — the dark blue that was "very telling" — and the menu
+bar had three more of its own.  *A palette that assumes one theme is not a
+palette; it is a second theme nobody can switch away from.*  All read the live
+theme now, per use rather than cached, because `gui.theme` can change between
+two draws.  The apps' status labels went the same way.  **AND THE CHECKBOX WAS
+WRONG IN TWO WAYS, only one of which the report could see:** *"the tick is
+small and not the right size in the box."*  It was drawn from literals — 3, 7,
+4, 6, 9, 5 — measured for the 8x8 font, so the mark stayed ~11 px inside a
+~26 px box and sat off-centre.  The second error is the one a picture does not
+show: widget_specs.md §2 says a CHECKED box is filled `accent` with the tick in
+`on_accent`, and ours kept the `sunken` fill and drew an accent tick — so "on"
+read as a decorated "off" rather than as a filled state.  The tick is the
+spec's own path `(5,11) -> (8,14) -> (15,6)` scaled from its 20x20 reference,
+kept as that arithmetic so the next reader can check it against the catalogue.
+**AND THE "CHAOTIC" SCROLL HAD A LITERAL UNDER IT TOO:** one notch moved **48
+device pixels** — density-blind, so it meant a different amount of content at
+every resolution, and a multiple of nothing, so every notch stopped mid-control
+and left half a row at the top and half at the bottom.  *That is what chaotic
+looks like: nothing lands where the eye expects.*  It is `gui.scroll_lines`
+now, in ROWS, read by the container AND the list widgets so one notch means the
+same amount wherever the pointer is — **a KEY rather than a constant because
+the right value depends on the DEVICE**: a wheel sends one notch per click and
+wants three lines, a trackpad sends a stream and three lines each is a panel
+that flies past.  Nobody can pick one number for both, which is the argument
+`gui.scroll_invert` was added under.  **AND THE THIRD APPEARANCE OF ONE DEFECT, WITH A CLEAN REPRODUCTION
+(2026-09-04).**  *"If I change the theme the colours update, but the labels in
+the Appearance panel stay wrong until I close and reopen it."*  `w_label`'s
+constructor did `l->color = WCOL_TEXT` — a macro that READS the theme,
+evaluated ONCE — so every label held a copy of the colour current when it was
+built.  **This is the same defect as a widget storing a translated STRING
+instead of a key, and as the grid cell sized from a constant while the icon
+came from a setting: a value captured at construction is a copy the live
+source can no longer reach.**  Third time in one milestone, three different
+subsystems, one shape.  The fix is the same each time — resolve at DRAW: a
+label's colour is 0 by default and a `role` (text / muted / accent) is looked
+up against the live theme, with a raw colour still winning for the few callers
+that want one.  Verified through the user's own path: Appearance → Light →
+Save, **without closing the panel**, and every label is correct in that frame.
+**SETTING VALUES ARE TRANSLATED TOO**, asked for in the same breath: `light`,
+`dark`, `stretch`, `comfort`, `halt`… — and safely, because the value is an
+IDENTIFIER.  The radio and the dropdown both hand back an INDEX and the text
+written to the store comes from the descriptor, so what is DISPLAYED and what
+is WRITTEN are deliberately different things; the popup list shows `lstr` of
+each option while `config_apply` still stores `light`.  **THE SCROLLBAR WAS TOO SMALL TO AIM AT, AND THE PROBE'S OWN GREP HID IT FOR
+A ROUND (2026-09-04).**  *"I cannot click and drag the bar; the arrow works
+sometimes and sometimes not."*  Driven measurement says the MECHANISM is fine —
+press on the container's thumb reports `part=3`, the drag arrives and `scroll`
+goes 0 -> 143 — and my first reading of that same run said the press never
+arrived, because I grepped `^ui: press` and the serial line is not at the start
+of a line.  *An instrument read through the wrong filter is an instrument that
+lies, and it lied in the direction of a much more interesting bug.*  What the
+numbers actually showed is the real fault: **`bar 743,40 16x363`** — a 16 px
+wide bar with 16x16 arrow boxes.  The design's 12 px is right for the bar IT
+describes, which has no arrows and cannot be dragged; ours has both, which
+makes it a TARGET, and *a control whose hit area is too small is not a smaller
+control, it is an unreliable one.*  `CP_SCROLLBAR_W` is 16 design px now and
+the arrow boxes are **half again as tall as they are wide** — height is the
+axis with room to spare, so spending it there costs the track little.  **AND
+THE RADIO AND THE CHECKBOX DID NOT MATCH:** reported as *"there is a big
+difference between the radio and the checkbox size"*, and they were
+`cp_fh() + cp_px(4)` against `cp_fh() - 2` — about 26 against 18 — while
+widget_specs.md gives both a 20 px box (§2) and a 20 px circle (§3), i.e.
+deliberately identical.  One definition now, and the radio's dot is the spec's
+own `d=10 on 20`, i.e. half the diameter at any density.  **THE CATALOGUE IS
+NOW COMPLETE BY MEASUREMENT, NOT BY SAMPLING:** a script enumerates every
+`CONFIG_KEY` and every declared enum value in the tree and diffs them against
+the catalogue — 0 keys and 0 values missing, with the numeric icon sizes
+deliberately left alone (*a number is the same in every language, and an entry
+for one would be a translation nobody can get wrong and everybody has to
+maintain*).  **AND I WALKED INTO THE ISO-8859-2 TRAP AGAIN WHILE FIXING IT** —
+a literal accented letter in one new Hungarian string — caught this time by the
+tool rather than by a user, which is the argument for the byte >= 0x80 sweep
+being run every time rather than once.  **TWO SILENT INPUT DROPS CLOSED — AND THE BUG THEY MAY CAUSE IS *NOT*
+REPRODUCED HERE, WHICH IS SAID PLAINLY (2026-09-04).**  Reported as four
+separate faults — *"the arrow works sometimes"*, *"I cannot drag the thumb"*,
+*"the slider cannot be dragged however I click"*, *"sometimes a button click
+does nothing, as if it were a refresh problem"* — and one candidate explains
+all four: **a press that never arrived.**  Both event rings returned silently
+when full (`evq`, 32 deep and SHARED by every window; `aq`, 32 per window), and
+§M69 turned every motion packet into a hover, so a trackpad burst fills them
+and the click behind it is discarded.  *A queue that drops silently does not
+degrade under load; it becomes unpredictable, which is much harder to
+recognise.*  Now: a position REPLACES a queued position (a burst collapses to
+one entry), a full ring sacrifices the OLDEST hover rather than the newcomer,
+and only when neither is possible is anything dropped — counted, and announced
+ONCE on the console so the next occurrence names itself.  **THE FIRST ATTEMPT
+FIXED THE WRONG RING**: `aq` got the treatment and the flood test still
+measured ZERO, because the events were being discarded one ring EARLIER and
+never reached `aq` at all — *an instrument placed on the wrong side of the
+problem reports the problem as absent* (§4.61's mis-placed timer, in a new
+costume).  **AND THE CONTROL RUN DOES NOT REPRODUCE IT EITHER WAY:** with
+coalescing off, 120 driven motions still drop nothing, because the QEMU
+monitor paces them at 8 ms and the host drains faster than that.  So the drop
+path was REAL (a code fact) and whether it is the reported bug is UNPROVEN —
+what changed is that the next occurrence prints a line instead of presenting as
+four unreliable controls.  **TWO TARGETS WERE GENUINELY TOO SMALL, and those
+are certain:** the slider's whole widget was a literal `SL_H 18` — an 8x8-era
+count, a thin band inside a taller row, which is exactly what *"I cannot drag
+it"* feels like; it is `cp_btn_h()` now (rule 0: a slider is aimed at and then
+dragged) with the design's 4 px track centred inside it, so what grew is the
+part you can hit.  The scrollbar and its arrows the same.  **AND THE NEXT RUN WILL BE DECISIVE WHICHEVER HALF IT IS.**  A dropped-queue
+line answers only *"was it the queue"*; if it does not appear, the round ends
+with "not that" and nothing else — which is a wasted occurrence of an
+intermittent fault.  So `gui.input_debug` now logs the button TRANSITION where
+the packet is decoded (`ps2-mouse: buttons 0 -> 1`) as well as where the press
+is dispatched to a window (`gui: press dispatched to '<title>' at x,y`).  Both
+verified firing and pairing.  Three outcomes, three different files: **device
+line and no dispatch** = the WM swallowed it (queue, hit test, focus); **neither
+line** = it was never produced (the packet layer); **both lines and nothing
+happens** = the widget's own handler.  *An intermittent fault gives you one
+observation at a time, so the instrument has to be in place BEFORE it happens
+and has to distinguish every candidate at once* — the same two-ended shape that
+settled the wheel question and the modality question.  **AND THE DETAIL THAT NAMED IT: *"during a drag it froze in a lighter
+colour, as if it were active."*  THAT IS A STUCK GRAB, and it explains the rest
+of the report.**  A press latches the grab; if the RELEASE never arrives, the
+latch is held forever, after which the handler consumes EVERY later event —
+including every press — while the widget stays drawn in its held colour.  From
+outside: a window that looks alive and answers nothing, until something else
+happens to clear it.  *"I click and nothing happens, then suddenly it works."*
+**THE FIX IS SELF-HEALING, NOT MERELY CORRECT.**  The release can go missing
+for reasons these files cannot prevent — a full queue, a window closing
+mid-gesture — so recovery must not depend on the event that went missing: *a
+recovery that waits for the thing that was lost is not a recovery.*  A PRESS is
+by definition the start of a new gesture, so anything still held when one
+arrives belongs to a gesture that ended without saying so, and is cleared.
+Applied in all four places that hold one: the toolkit container's scrollbar
+latch, the listview's, the item view's, and `widget.pressed` in gui.c — which
+was cleared only on RELEASE and is exactly the "lighter colour" the report
+describes.  **THE CRASH WAS ROOT-CAUSED, AND IT WAS THE INSTRUMENT (2026-09-04).
+`gui_input_debug()` CALLED ITSELF.**  Reported as *"opening a settings panel by
+double-click kills the box"*: `EXCEPTION 14 (Page Fault) eip=0x808ca100 err=0
+cr2=0x808ca100 task=idle-1` — **`eip == cr2`, i.e. execution jumped through a
+garbage pointer** — then the §4.67 NMI, whose own report correctly warns that
+its `eip` is `hal_cpu_halt` on an idle core.  The cached accessor I added at the
+end of that same day read `if (g_input_dbg < 0) g_input_dbg =
+(int)gui_input_debug();` where it had to say `config_get_long`.  **UNBOUNDED
+RECURSION, 16 BYTES OF STACK A FRAME, ON THE FIRST CALL — AND THE FIRST CALL IS
+A BUTTON TRANSITION**, because `&&` short-circuits and both probe sites test
+something cheaper on the left (`buttons != prev_btn`, `dz`).  So pure MOTION
+never reached it, the cursor tracked perfectly, and the machine died on the
+first CLICK with a smashed kernel stack — which is what an `eip` equal to an
+unmapped `cr2` IS.  **WHY MY BISECT CLEARED EVERYTHING, WHICH IS THE PART WORTH
+KEEPING:** I disabled the ring coalescing, the IRQ-side probe, the stale-latch
+sweep and the measure/arrange split in turn and the fault survived all four, so
+I wrote down "very probably older than this session" — *confidently, and
+wrongly.*  **A bisect over FEATURES cannot find a bug in the thing doing the
+measuring**, and every one of those four experiments still ran through the
+broken accessor.  **PROVED BY A CONTROL RUN, not by reading:** the identical
+driven double-click (home the pointer, 4 hops to the first Control Panel cell,
+press/release/press/release) gives **0 button lines / 0 dispatches / the
+byte-identical `eip=cr2=0x808ca100` in 3 of 3 runs** with the one line reverted,
+and **4 button lines / 2 dispatches / 0 faults in 8 of 8** with it fixed, on
+i386 AND x86_64.  *The broken build produced no `ps2-mouse: buttons` line at
+all, though the cursor demonstrably moved — and the only code between the packet
+decode and that line is the accessor, which is what makes the reading airtight.*
+**A SECOND DEFECT IN THE SAME THREE LINES, and it is the one that would have
+hidden the first from the next person:** nothing dropped the cache, so a
+`setconf gui.input_debug 1` typed after the first packet was recorded, reported
+as set by `conf list`, and changed nothing — *the debug switch is the one
+setting whose silent failure costs a whole round of diagnosis.*  A
+`CONFIG_WATCH` now clears it, verified in BOTH directions: a wallpaper click
+with the key unset prints nothing, `setconf` in between, the same click then
+prints `buttons 0 -> 1`.  **AND THE HARNESS DISCIPLINE IS NOW THE HARNESS'S JOB,
+NOT MINE.**  Every run that day was grepped for the feature string it was
+testing and NEVER for `EXCEPTION` or `NMI` — *the same shape as §M48's missing
+NIC and §M60's silent ARM harness, except the thing not being checked was the
+machine crashing.*  `dos-shell-test.py` now scans every log for faults, NMI
+lockups, §M47's unclean-boot breadcrumb, softlockups, deadlock reports, dropped
+input events and §M57's runqueue audit, prints a banner naming them and **fails
+the run whatever else it found** — *a test that passes on a machine that faulted
+is not evidence about the feature, it is evidence about the grep.*
+`--allow-crash` is for the tests that cause one on purpose (`hardlock`,
+`splash faultkernel`, `drv crash`, `faulttest`): deliberate, named, never the
+default.  **THE REPRODUCTION NEEDED AN INSTRUMENT OF ITS OWN, and it is worth
+keeping:** a panel is opened by double-clicking a category, so reaching one
+needed a driven pointer, and once it has focus the harness cannot type at all
+(§4.74) — which is most of why this survived.  New **`conf open <name|index>`**
+opens a settings panel from the shell, through `gui_queue_open` and never a
+direct call (a window created on a task with no app-host loop never lays out and
+never ticks, §M61 — that would be a second failure mode on top of the one being
+investigated).  It is also what showed the fault is NOT in building a panel: six
+clean runs through `conf open` while the double-click died every time, which
+narrowed it to the CLICK before a single line was read.  **ONE MORE FIX THAT WAS
+ALREADY REAL:** my first queue eviction walked the ring from the consumer's
+index and MOVED IT from the mouse IRQ, breaking the single-producer invariant
+that makes the ring lock-free at all — an unterminated shift loop in interrupt
+context, which is not a slow machine but a dead one.  Removed; coalescing needs
+only the head.  *A safety net that violates the invariant it was added under is
+worse than the hole it was covering.*  **AND THE REPORT THAT ARRIVED NEXT WAS TWO BUGS WEARING ONE SENTENCE
+(2026-09-05):** *"the wheel scrolls the Appearance panel fine, but clicking the
+scrollbar or its arrows freezes it for a couple of seconds and then it works or
+it does not."*  **THE FREEZE IS FOUR FULL-WINDOW REPAINTS PER CLICK.**  A press
+arrives as THREE events — motion, button, pointer phase — and the release as
+more, and the app-host repainted the WHOLE window for every event that was not
+a hover; the toolkit's scrollbar then asked for the whole window again on top of
+it.  Measured on that panel: 4 repaints of 431 kpx at 35-70 ms of compositing
+each, i.e. about a quarter of a second per click on a machine whose compositor
+is also what draws the CURSOR.  *A wheel notch cost exactly ONE of those, which
+is the whole of "the wheel is fine and the bar is not" — the difference the user
+reported is a factor of four in frames, not two different broken paths, and
+reading the two code paths side by side would never have said so.*  **THE
+EXEMPTION IS A PROPERTY OF THE HANDLER, NOT OF THE EVENT TYPE**, which is what
+the hover rule had got right for one case and wrong as a rule:
+`app_dispatch_event` returns whether the thing it ran damaged precisely, the
+container damages its VIEWPORT (273 kpx) and a bar press damages the BAR
+(8 kpx), and **`AE_BUTTON`, which reaches NO handler at all on a widget window,
+stops demanding a repaint for a no-op**.  **THE COMPOSITOR HELD THE SAME SHAPE
+ONE LAYER UP:** the "precise structural damage" path repainted the focused
+window on EVERY press and EVERY release, wherever the pointer was — the first of
+its three arms had no condition on the focus having MOVED, so clicking inside
+the window you are already working in cost two full-window frames before any
+handler ran.  Gated on `new_focus != old_focus` now, with `raise_window`
+reporting whether the z-order actually changed so a raise still repaints.
+**MEASURED: 0 full repaints, ~36-52 ms per click against ~250, and a thumb drag
+at 13-18 ms mean over 272 kpx.**  **AND THE OTHER HALF WAS NOT ABOUT SPEED AT
+ALL — A PRESS WAS BEING DELIVERED AS A HOVER.**  `evq_push_ptr` and
+`evq_push_wheel` set seven of `struct gev`'s eight fields and left `hover` as
+the slot's PREVIOUS tenant had it, and `dispatch_events` tests that flag FIRST
+— so a press landing in a slot that last carried a hover arrived as a pointer
+MOVE.  Not dropped, not counted, not visible in any queue statistic: *it arrived
+wearing the wrong hat*, and whether it happened depended only on what had
+occupied one slot of thirty-two, which is precisely what "sometimes it works"
+looks like from a chair.  §M69's own ring work had hardened `evq_push` and left
+the pointer stream — the events that operate every scrollbar, slider and
+selection in this tree — both silently droppable and partially written.  Every
+producer assigns a COMPLETE struct now (so the compiler zeroes what the caller
+does not name and the field cannot be forgotten), and a phase event evicts a
+hover rather than vanishing.  **THE CONTROL RUN IS THE DIAGNOSIS:** six driven
+presses on the same arrow pixel give **4 dispatched in 3 of 3 runs with the old
+pusher and 6 in 3 of 3 with it fixed**, same binary otherwise, the scroll offset
+stepping 0/44/88/132/176/220 — on i386 AND x86_64.  Focus switching between two
+windows, the radio + Save path and the wheel router were re-verified by picture,
+because *a change that makes repaints conditional is exactly the change that
+leaves stale pixels somewhere nobody drove.*  **STILL OPEN in §M69:** the
+design's tabs above the table and its empty-state panel — plus, from this work:
+a modal still gets a (dead) taskbar button, the dialog does not wrap its body,
+the Devices table truncates its own column headers, and the GRID and LIST item
+views still report no scrollbar at all (`.scrollbar` NULL — they never drew
+one, so there is nothing to grab; the desktop and the Control Panel scroll by
+keyboard and wheel only).  Also shipped: the three title buttons got a hover AND **one shared
+`title_btn_rect()`** — the painter and the hit test had computed the same box
+differently (row 2 px off, gaps 3 vs 4), so the top edge of every button was dead
+and the strip above it live (§4.79's "draws correctly, hit-tests wrongly");
+listview `mono` flag, because space-padded columns only line up under a fixed
+advance, which is why the design sets tabular data in Plex Mono; and the `theme`
+command now names its own scale and reads the LIVE density — it was printing
+design pixels while the screen showed device pixels.  **OPEN, none of it started:**
+the terminal + boot console are still 8x8 (deliberate staging — gterm is a grid
+and §M58's selection is addressed in cells); the demo view's top panel, window
+tabs, filter input, accent PID column and toast; seven undrawn controls (switch,
+segmented, tabs, dropdown, slider, progress, dialog); the remaining apps still lay
+out with 8 px constants (fileman, editor, controlpanel, devicepanel, displaypanel,
+about, crashapp, basic, newshell); and LOCALIZATION — a string catalogue plus a
+language config key, asked for explicitly and not begun (the font already carries
+ISO-8859-2, so the glyphs are not the blocker).  **METHOD NOTE WORTH MORE THAN
+THE FEATURE:** the design ships a renderable HTML prototype, and
+`scripts/design-compare.sh` renders it beside a live guest screenshot — every
+visual defect this port had was obvious in a picture and invisible in a pixel
+probe.  `ttf2font.py --preview` does the same for glyphs on the HOST, which is
+why Ő Ű á é were proven correct BEFORE any kernel code existed.
+
 ✅ **THE DEVICE MANAGER — AND THE THREE DEFECTS A JOINED-UP VIEW FOUND
 (2026-08-29, DOCS §4.83, all 3 arches).**  §M33 shipped a great deal reachable
 only by typing: `lsdrv` for state, `drv domain` for placement and isolation,
@@ -2988,7 +4125,8 @@ Block / USB drivers are i386-only today; x86_64 boots without them
 | Concern                              | File                                  |
 |--------------------------------------|---------------------------------------|
 | Boot order, new milestone wiring     | `kernel/core/kernel.c`                |
-| Adding a shell command               | `kernel/core/shell.c`                 |
+| Adding a shell command               | `SHELL_CMD()` next to the code it drives — see `shellcmd.h`.  Kernel-subject ones go in `kernel/core/cmd_*.c`; NEVER back into `shell.c`, which is now only the REPL |
+| Adding a compositor subsystem        | `kernel/gui/` + `gui_priv.h` (compositor-private; apps use gui.h, shells use gui_internal.h) |
 | Adding a new .c to the build         | `Makefile` (C_SRCS or ASM_SRCS)       |
 | New linker section                   | `linker.ld`                           |
 | New driver class                     | `kernel/includes/<class>.h` + impl    |

@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="_ds/industry-f0acd734-fef8-4f93-bf7f-15093a390dde/styles.css">
+<style>
+  body { margin: 0; font-family: "Barlow", system-ui, sans-serif; background: #e4e4e7; }
+  a { color: var(--color-accent-700); text-decoration: none; border-bottom: 1px solid currentColor; }
+  a:hover { color: var(--color-accent-800); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes indet { 0% { transform: translateX(-100%); } 100% { transform: translateX(300%); } }
+</style>
+</helmet>
+
+<div style="--bg: {{ t.bg }}; --surface: {{ t.surface }}; --sunken: {{ t.sunken }}; --raised: {{ t.raised }}; --line: {{ t.line }}; --line-soft: {{ t.lineSoft }}; --text: {{ t.text }}; --muted: {{ t.muted }}; --accent: {{ t.accent }}; --on-accent: {{ t.onAccent }}; --hover: {{ t.hover }}; --press: {{ t.press }}; --tray: {{ t.tray }}; --focus: {{ t.focus }}; --shadow-sm: {{ t.shadowSm }}; --shadow-md: {{ t.shadowMd }}; --shadow-lg: {{ t.shadowLg }}; --ctl: {{ t.ctl }}; --ctlpx: {{ t.ctlPad }}; --row: {{ t.rowpx }}; --fs: {{ t.fs }}; --fsm: {{ t.fsm }}; min-height: 100vh; background: var(--bg); color: var(--text); font-size: var(--fs); transition: background 140ms linear, color 140ms linear">
+
+  <!-- ============ toolbar ============ -->
+  <div style="position: sticky; top: 0; z-index: 40; display: flex; flex-wrap: wrap; gap: 20px; align-items: center; justify-content: space-between; padding: 14px 28px; background: var(--raised); border-bottom: 1px solid var(--line); box-shadow: var(--shadow-sm)">
+    <div style="display: flex; align-items: baseline; gap: 12px">
+      <span style="font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 22px; letter-spacing: 0.06em; text-transform: uppercase">Console Plate</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">os widget kit · v0.1</span>
+    </div>
+    <div style="display: flex; flex-wrap: wrap; gap: 18px; align-items: center">
+      <div style="display: flex; align-items: center; gap: 8px">
+        <span style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Téma</span>
+        <div style="display: flex; gap: 3px; padding: 3px; background: var(--tray); border: 1px solid var(--line); border-radius: 4px">
+          <button type="button" onClick="{{ setDark }}" style="height: 28px; padding: 0 12px; border: none; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer; background: {{ th.darkBg }}; color: {{ th.darkFg }}">Dark</button>
+          <button type="button" onClick="{{ setLight }}" style="height: 28px; padding: 0 12px; border: none; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer; background: {{ th.lightBg }}; color: {{ th.lightFg }}">Light</button>
+        </div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 8px">
+        <span style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Sűrűség</span>
+        <div style="display: flex; gap: 3px; padding: 3px; background: var(--tray); border: 1px solid var(--line); border-radius: 4px">
+          <button type="button" onClick="{{ setComfort }}" style="height: 28px; padding: 0 12px; border: none; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer; background: {{ th.comfBg }}; color: {{ th.comfFg }}">40px</button>
+          <button type="button" onClick="{{ setCompact }}" style="height: 28px; padding: 0 12px; border: none; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer; background: {{ th.compBg }}; color: {{ th.compFg }}">32px</button>
+        </div>
+      </div>
+      <div style="display: flex; gap: 3px; padding: 3px; background: var(--tray); border: 1px solid var(--line); border-radius: 4px">
+        <button type="button" onClick="{{ setCat }}" style="height: 28px; padding: 0 14px; border: none; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer; background: {{ th.catBg }}; color: {{ th.catFg }}">Katalógus</button>
+        <button type="button" onClick="{{ setDemo }}" style="height: 28px; padding: 0 14px; border: none; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer; background: {{ th.demoBg }}; color: {{ th.demoFg }}">Demó</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ CATALOGUE ============ -->
+  <sc-if value="{{ isCat }}" hint-placeholder-val="{{ true }}">
+    <div style="padding: 36px 28px 80px; display: flex; flex-direction: column; gap: 40px; max-width: 1500px">
+
+      <!-- foundations -->
+      <div style="display: flex; flex-direction: column; gap: 14px">
+        <div style="display: flex; align-items: baseline; gap: 14px; border-bottom: 1px solid var(--line); padding-bottom: 8px">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--accent)">01</span>
+          <h2 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 26px; letter-spacing: 0.04em; text-transform: uppercase">Alapok</h2>
+          <span style="font-size: 14px; color: var(--muted)">négy felületréteg, egy accent, egy vonalszín</span>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px">
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <div style="height: 56px; background: var(--bg); border: 1px solid var(--line); border-radius: 4px"></div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">--bg · desktop</div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <div style="height: 56px; background: var(--surface); border: 1px solid var(--line); border-radius: 4px"></div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">--surface · panel</div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <div style="height: 56px; background: var(--sunken); border: 1px solid var(--line); border-radius: 4px"></div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">--sunken · input</div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <div style="height: 56px; background: var(--raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: var(--shadow-md)"></div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">--raised · menü</div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <div style="height: 56px; background: var(--accent); border-radius: 4px"></div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">--accent</div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <div style="height: 56px; background: var(--hover); border: 1px solid var(--line); border-radius: 4px"></div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">--hover</div>
+          </div>
+        </div>
+        <sc-if value="{{ showSpecs }}" hint-placeholder-val="{{ true }}">
+          <div style="display: flex; flex-wrap: wrap; gap: 8px 24px; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted); padding-top: 4px">
+            <span>radius 4 / 3 belső</span><span>border 1px</span><span>control {{ t.ctl }}</span><span>row {{ t.row }}px</span><span>scrollbar 12</span><span>fókusz 2px + 1px offset</span><span>type Barlow / Barlow Condensed / IBM Plex Mono</span>
+          </div>
+        </sc-if>
+      </div>
+
+      <!-- buttons -->
+      <div style="display: flex; flex-direction: column; gap: 14px">
+        <div style="display: flex; align-items: baseline; gap: 14px; border-bottom: 1px solid var(--line); padding-bottom: 8px">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--accent)">02</span>
+          <h2 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 26px; letter-spacing: 0.04em; text-transform: uppercase">Gombok</h2>
+          <span style="font-size: 14px; color: var(--muted)">négy hangsúly × öt állapot</span>
+        </div>
+        <div style="display: grid; grid-template-columns: 120px repeat(5, 1fr); gap: 10px 14px; align-items: center">
+          <span></span>
+          <span style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Alap</span>
+          <span style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Hover</span>
+          <span style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Lenyomva</span>
+          <span style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Fókusz</span>
+          <span style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Letiltva</span>
+
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">primary</span>
+          <button type="button" style="height: var(--ctl); padding: 0 var(--ctlpx); border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: var(--on-accent); font: inherit; font-size: var(--fs); font-weight: 500; cursor: pointer" style-hover="filter: brightness(1.08)" style-active="filter: brightness(0.9)" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">Telepítés</button>
+          <button type="button" style="height: var(--ctl); padding: 0 var(--ctlpx); border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: var(--on-accent); font: inherit; font-size: var(--fs); font-weight: 500; filter: brightness(1.08); cursor: pointer">Telepítés</button>
+          <button type="button" style="height: var(--ctl); padding: 0 var(--ctlpx); border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: var(--on-accent); font: inherit; font-size: var(--fs); font-weight: 500; filter: brightness(0.88); cursor: pointer">Telepítés</button>
+          <button type="button" style="height: var(--ctl); padding: 0 var(--ctlpx); border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: var(--on-accent); font: inherit; font-size: var(--fs); font-weight: 500; outline: 2px solid var(--focus); outline-offset: 1px; cursor: pointer">Telepítés</button>
+          <button type="button" disabled="{{ true }}" style="height: var(--ctl); padding: 0 var(--ctlpx); border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: var(--on-accent); font: inherit; font-size: var(--fs); font-weight: 500; opacity: 0.45; cursor: not-allowed">Telepítés</button>
+
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">secondary</span>
+          <button type="button" style="height: var(--ctl); padding: 0 var(--ctlpx); border: 1px solid var(--line); border-radius: 4px; background: var(--raised); color: var(--text); font: inherit; font-size: var(--fs); cursor: pointer" style-hover="background: var(--hover)" style-active="background: var(--press)" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">Mégse</button>
+          <button type="button" style="height: var(--ctl); padding: 0 var(--ctlpx); border: 1px solid var(--line); border-radius: 4px; background: var(--hover); color: var(--text); font: inherit; font-size: var(--fs); cursor: pointer">Mégse</button>
+          <button type="button" style="height: var(--ctl); padding: 0 var(--ctlpx); border: 1px solid var(--line); border-radius: 4px; background: var(--press); color: var(--text); font: inherit; font-size: var(--fs); cursor: pointer">Mégse</button>
+          <button type="button" style="height: var(--ctl); padding: 0 var(--ctlpx); border: 1px solid var(--accent); border-radius: 4px; background: var(--raised); color: var(--text); font: inherit; font-size: var(--fs); outline: 2px solid var(--focus); outline-offset: 1px; cursor: pointer">Mégse</button>
+          <button type="button" disabled="{{ true }}" style="height: var(--ctl); padding: 0 var(--ctlpx); border: 1px solid var(--line); border-radius: 4px; background: var(--raised); color: var(--text); font: inherit; font-size: var(--fs); opacity: 0.45; cursor: not-allowed">Mégse</button>
+
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">ghost</span>
+          <button type="button" style="height: var(--ctl); padding: 0 12px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--accent); font: inherit; font-size: var(--fs); cursor: pointer" style-hover="background: var(--hover)" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">Részletek</button>
+          <button type="button" style="height: var(--ctl); padding: 0 12px; border: 1px solid transparent; border-radius: 4px; background: var(--hover); color: var(--accent); font: inherit; font-size: var(--fs); cursor: pointer">Részletek</button>
+          <button type="button" style="height: var(--ctl); padding: 0 12px; border: 1px solid transparent; border-radius: 4px; background: var(--press); color: var(--accent); font: inherit; font-size: var(--fs); cursor: pointer">Részletek</button>
+          <button type="button" style="height: var(--ctl); padding: 0 12px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--accent); font: inherit; font-size: var(--fs); outline: 2px solid var(--focus); outline-offset: 1px; cursor: pointer">Részletek</button>
+          <button type="button" disabled="{{ true }}" style="height: var(--ctl); padding: 0 12px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--accent); font: inherit; font-size: var(--fs); opacity: 0.45; cursor: not-allowed">Részletek</button>
+
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">ikon</span>
+          <button type="button" style="width: var(--ctl); height: var(--ctl); padding: 0; border: 1px solid var(--line); border-radius: 4px; background: var(--raised); color: var(--text); font-size: 17px; cursor: pointer" style-hover="background: var(--hover)" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">+</button>
+          <button type="button" style="width: var(--ctl); height: var(--ctl); padding: 0; border: 1px solid var(--line); border-radius: 4px; background: var(--hover); color: var(--text); font-size: 17px; cursor: pointer">+</button>
+          <button type="button" style="width: var(--ctl); height: var(--ctl); padding: 0; border: 1px solid var(--line); border-radius: 4px; background: var(--press); color: var(--text); font-size: 17px; cursor: pointer">+</button>
+          <button type="button" style="width: var(--ctl); height: var(--ctl); padding: 0; border: 1px solid var(--accent); border-radius: 4px; background: var(--raised); color: var(--text); font-size: 17px; outline: 2px solid var(--focus); outline-offset: 1px; cursor: pointer">+</button>
+          <button type="button" disabled="{{ true }}" style="width: var(--ctl); height: var(--ctl); padding: 0; border: 1px solid var(--line); border-radius: 4px; background: var(--raised); color: var(--text); font-size: 17px; opacity: 0.45; cursor: not-allowed">+</button>
+        </div>
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding-top: 4px">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted); width: 120px">gombcsoport</span>
+          <div style="display: flex; border: 1px solid var(--line); border-radius: 4px; overflow: hidden">
+            <button type="button" style="height: var(--ctl); padding: 0 14px; border: none; border-right: 1px solid var(--line); background: var(--raised); color: var(--text); font: inherit; font-size: var(--fs); cursor: pointer" style-hover="background: var(--hover)">Csatolás</button>
+            <button type="button" style="height: var(--ctl); padding: 0 14px; border: none; border-right: 1px solid var(--line); background: var(--raised); color: var(--text); font: inherit; font-size: var(--fs); cursor: pointer" style-hover="background: var(--hover)">Leválasztás</button>
+            <button type="button" style="height: var(--ctl); padding: 0 14px; border: none; background: var(--raised); color: var(--text); font: inherit; font-size: var(--fs); cursor: pointer" style-hover="background: var(--hover)">Ellenőrzés</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- choices -->
+      <div style="display: flex; flex-direction: column; gap: 14px">
+        <div style="display: flex; align-items: baseline; gap: 14px; border-bottom: 1px solid var(--line); padding-bottom: 8px">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--accent)">03</span>
+          <h2 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 26px; letter-spacing: 0.04em; text-transform: uppercase">Választók</h2>
+          <span style="font-size: 14px; color: var(--muted)">Space / Enter kapcsol, nyilak léptetnek</span>
+        </div>
+        <div style="display: flex; gap: 48px; flex-wrap: wrap">
+          <div style="display: flex; flex-direction: column; gap: 2px; min-width: 260px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px">Checkbox</div>
+            <div role="checkbox" tabIndex="0" aria-checked="{{ c1 }}" onClick="{{ tc1 }}" onKeyDown="{{ kc1 }}" style="display: flex; align-items: center; gap: 11px; height: var(--ctl); cursor: pointer; border-radius: 4px" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 4px; display: grid; place-items: center; border: 1px solid var(--line); font-size: 13px; line-height: 1; color: var(--on-accent); background: {{ c1bg }}"><sc-if value="{{ c1 }}" hint-placeholder-val="{{ true }}"><span>✓</span></sc-if></span>
+              <span>SMP támogatás</span>
+            </div>
+            <div role="checkbox" tabIndex="0" aria-checked="{{ c2 }}" onClick="{{ tc2 }}" onKeyDown="{{ kc2 }}" style="display: flex; align-items: center; gap: 11px; height: var(--ctl); cursor: pointer; border-radius: 4px" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 4px; display: grid; place-items: center; border: 1px solid var(--line); font-size: 13px; line-height: 1; color: var(--on-accent); background: {{ c2bg }}"><sc-if value="{{ c2 }}" hint-placeholder-val="{{ true }}"><span>✓</span></sc-if></span>
+              <span>Hibakeresési naplózás</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 11px; height: var(--ctl)">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 4px; display: grid; place-items: center; border: 1px solid var(--line); background: var(--accent)"><span style="width: 10px; height: 2px; background: var(--on-accent)"></span></span>
+              <span>Részben kijelölt csoport</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 11px; height: var(--ctl); opacity: 0.45">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 4px; border: 1px solid var(--line); background: var(--sunken)"></span>
+              <span>Nem elérhető opció</span>
+            </div>
+          </div>
+
+          <div style="display: flex; flex-direction: column; gap: 2px; min-width: 200px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px">Radio · fájlrendszer</div>
+            <div role="radio" tabIndex="0" aria-checked="{{ r0 }}" onClick="{{ sr0 }}" onKeyDown="{{ rkey }}" style="display: flex; align-items: center; gap: 11px; height: var(--ctl); cursor: pointer; border-radius: 4px" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 50%; border: 1px solid var(--line); box-shadow: {{ r0dot }}"></span><span>ext2</span>
+            </div>
+            <div role="radio" tabIndex="0" aria-checked="{{ r1 }}" onClick="{{ sr1 }}" onKeyDown="{{ rkey }}" style="display: flex; align-items: center; gap: 11px; height: var(--ctl); cursor: pointer; border-radius: 4px" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 50%; border: 1px solid var(--line); box-shadow: {{ r1dot }}"></span><span>FAT32</span>
+            </div>
+            <div role="radio" tabIndex="0" aria-checked="{{ r2 }}" onClick="{{ sr2 }}" onKeyDown="{{ rkey }}" style="display: flex; align-items: center; gap: 11px; height: var(--ctl); cursor: pointer; border-radius: 4px" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">
+              <span style="width: 20px; height: 20px; flex: none; border-radius: 50%; border: 1px solid var(--line); box-shadow: {{ r2dot }}"></span><span>tmpfs</span>
+            </div>
+          </div>
+
+          <div style="display: flex; flex-direction: column; gap: 10px; min-width: 260px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Switch · azonnali hatás</div>
+            <div role="switch" tabIndex="0" aria-checked="{{ sw1 }}" onClick="{{ tsw1 }}" onKeyDown="{{ ksw1 }}" style="display: flex; align-items: center; gap: 12px; height: var(--ctl); cursor: pointer; border-radius: 4px" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">
+              <span style="position: relative; width: 48px; height: 26px; flex: none; border-radius: 13px; border: 1px solid var(--line); background: {{ sw1bg }}; transition: background 120ms linear">
+                <span style="position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: {{ sw1knob }}; box-shadow: var(--shadow-sm); transition: transform 120ms linear; transform: {{ sw1x }}"></span>
+              </span>
+              <span>Preemptív ütemezés</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted)">{{ sw1txt }}</span>
+            </div>
+            <div role="switch" tabIndex="0" aria-checked="{{ sw2 }}" onClick="{{ tsw2 }}" onKeyDown="{{ ksw2 }}" style="display: flex; align-items: center; gap: 12px; height: var(--ctl); cursor: pointer; border-radius: 4px" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">
+              <span style="position: relative; width: 48px; height: 26px; flex: none; border-radius: 13px; border: 1px solid var(--line); background: {{ sw2bg }}; transition: background 120ms linear">
+                <span style="position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: {{ sw2knob }}; box-shadow: var(--shadow-sm); transition: transform 120ms linear; transform: {{ sw2x }}"></span>
+              </span>
+              <span>Linux ABI réteg</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted)">{{ sw2txt }}</span>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 6px">
+              <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Szegmentált</div>
+              <div style="display: inline-flex; gap: 3px; padding: 3px; background: var(--tray); border: 1px solid var(--line); border-radius: 4px; align-self: flex-start">
+                <button type="button" onClick="{{ sg0 }}" style="height: 30px; padding: 0 14px; border: none; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer; background: {{ sg0bg }}; color: {{ sg0fg }}">Lista</button>
+                <button type="button" onClick="{{ sg1 }}" style="height: 30px; padding: 0 14px; border: none; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer; background: {{ sg1bg }}; color: {{ sg1fg }}">Rács</button>
+                <button type="button" onClick="{{ sg2 }}" style="height: 30px; padding: 0 14px; border: none; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer; background: {{ sg2bg }}; color: {{ sg2fg }}">Fa</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- inputs -->
+      <div style="display: flex; flex-direction: column; gap: 14px">
+        <div style="display: flex; align-items: baseline; gap: 14px; border-bottom: 1px solid var(--line); padding-bottom: 8px">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--accent)">04</span>
+          <h2 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 26px; letter-spacing: 0.04em; text-transform: uppercase">Bevitel</h2>
+          <span style="font-size: 14px; color: var(--muted)">útvonalak és értékek monospace-ben</span>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 20px; max-width: 1200px">
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Csatolási pont</label>
+            <input value="/mnt/data" style="height: var(--ctl); padding: 0 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--sunken); color: var(--text); font-family: 'IBM Plex Mono', monospace; font-size: var(--fsm); caret-color: var(--accent)" style-hover="border-color: var(--accent)" style-focus="border-color: var(--accent); outline: 2px solid var(--focus); outline-offset: 0">
+            <span style="font-size: 12px; color: var(--muted)">Absztrakt út, a VFS oldja fel.</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Címke</label>
+            <input value="rootfs" placeholder="max 16 karakter" style="height: var(--ctl); padding: 0 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--sunken); color: var(--text); font: inherit; font-size: var(--fs); caret-color: var(--accent)" style-focus="border-color: var(--accent); outline: 2px solid var(--focus); outline-offset: 0">
+            <span style="font-size: 12px; color: var(--muted)">6 / 16</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Blokkméret · hibás</label>
+            <input value="7000" style="height: var(--ctl); padding: 0 12px; border: 1px solid var(--accent); border-radius: 4px; background: var(--sunken); color: var(--text); font-family: 'IBM Plex Mono', monospace; font-size: var(--fsm); box-shadow: inset 3px 0 0 var(--accent)">
+            <span style="font-size: 12px; color: var(--accent)">Kettő hatványa kell: 512 / 1024 / 4096.</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Eszköz · letiltva</label>
+            <input value="/dev/sda1" disabled="{{ true }}" style="height: var(--ctl); padding: 0 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--sunken); color: var(--text); font-family: 'IBM Plex Mono', monospace; font-size: var(--fsm); opacity: 0.45">
+            <span style="font-size: 12px; color: var(--muted)">Csatolt kötet, zárolva.</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px; position: relative">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Ütemező</label>
+            <button type="button" onClick="{{ tdd }}" style="height: var(--ctl); display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--sunken); color: var(--text); font: inherit; font-size: var(--fs); cursor: pointer" style-hover="border-color: var(--accent)" style-focus="outline: 2px solid var(--focus); outline-offset: 1px"><span>{{ ddval }}</span><span style="font-size: 10px; color: var(--accent)">▼</span></button>
+            <sc-if value="{{ dd }}" hint-placeholder-val="{{ true }}">
+              <div style="position: absolute; top: 100%; margin-top: 4px; left: 0; right: 0; z-index: 20; background: var(--raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: var(--shadow-lg); padding: 6px">
+                <div onClick="{{ dd0 }}" style="height: 34px; display: flex; align-items: center; padding: 0 10px; border-radius: 3px; cursor: pointer" style-hover="background: var(--hover)">round-robin</div>
+                <div onClick="{{ dd1 }}" style="height: 34px; display: flex; align-items: center; padding: 0 10px; border-radius: 3px; cursor: pointer" style-hover="background: var(--hover)">CFS</div>
+                <div onClick="{{ dd2 }}" style="height: 34px; display: flex; align-items: center; padding: 0 10px; border-radius: 3px; cursor: pointer" style-hover="background: var(--hover)">prioritásos</div>
+              </div>
+            </sc-if>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px">
+            <label style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Keresés</label>
+            <div style="display: flex; align-items: center; gap: 8px; height: var(--ctl); padding: 0 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--sunken)">
+              <span style="width: 11px; height: 11px; border: 1.5px solid var(--muted); border-radius: 50%; flex: none"></span>
+              <input placeholder="szűrés név vagy pid szerint" style="flex: 1; min-width: 0; border: none; background: transparent; color: var(--text); font: inherit; font-size: var(--fs); outline: none">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- values -->
+      <div style="display: flex; flex-direction: column; gap: 14px">
+        <div style="display: flex; align-items: baseline; gap: 14px; border-bottom: 1px solid var(--line); padding-bottom: 8px">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--accent)">05</span>
+          <h2 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 26px; letter-spacing: 0.04em; text-transform: uppercase">Értékek</h2>
+          <span style="font-size: 14px; color: var(--muted)">csúszka, folyamat, várakozás</span>
+        </div>
+        <div style="display: flex; gap: 36px; flex-wrap: wrap; align-items: flex-end">
+          <div style="display: flex; flex-direction: column; gap: 4px; width: 280px">
+            <div style="display: flex; justify-content: space-between; font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)"><span>Swappiness</span><span style="font-family: 'IBM Plex Mono', monospace; letter-spacing: 0; color: var(--text)">{{ sl }}</span></div>
+            <div tabIndex="0" onPointerDown="{{ onsl }}" onKeyDown="{{ slkey }}" style="position: relative; height: var(--ctl); display: flex; align-items: center; cursor: pointer; border-radius: 4px" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">
+              <div style="position: absolute; left: 0; right: 0; height: 6px; border-radius: 3px; background: var(--sunken); border: 1px solid var(--line)"></div>
+              <div style="position: absolute; left: 0; height: 6px; border-radius: 3px; background: var(--accent); width: {{ slpct }}"></div>
+              <div style="position: absolute; width: 22px; height: 22px; border-radius: 50%; background: var(--raised); border: 1px solid var(--line); box-shadow: var(--shadow-sm); margin-left: -11px; left: {{ slpct }}"></div>
+            </div>
+            <div style="display: flex; justify-content: space-between; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)"><span>0</span><span>100</span></div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 10px; width: 240px">
+            <div style="display: flex; justify-content: space-between; font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)"><span>Másolás</span><span style="font-family: 'IBM Plex Mono', monospace; letter-spacing: 0; color: var(--text)">64%</span></div>
+            <div style="height: 8px; border-radius: 4px; background: var(--sunken); border: 1px solid var(--line); overflow: hidden"><div style="height: 100%; width: 64%; background: var(--accent)"></div></div>
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Ismeretlen hossz</div>
+            <div style="height: 8px; border-radius: 4px; background: var(--sunken); border: 1px solid var(--line); overflow: hidden; position: relative"><div style="position: absolute; top: 0; bottom: 0; width: 33%; background: var(--accent); animation: indet 1.4s ease-in-out infinite"></div></div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 14px">
+            <div style="display: flex; align-items: center; gap: 10px">
+              <span style="width: 20px; height: 20px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: spin 850ms linear infinite; display: block"></span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted)">fsck /dev/sda2…</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none"></span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted)">daemon: fut</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px">
+              <span style="width: 8px; height: 8px; border-radius: 50%; border: 1px solid var(--line); flex: none"></span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted)">daemon: leállítva</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- navigation + list -->
+      <div style="display: flex; flex-direction: column; gap: 14px">
+        <div style="display: flex; align-items: baseline; gap: 14px; border-bottom: 1px solid var(--line); padding-bottom: 8px">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--accent)">06</span>
+          <h2 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 26px; letter-spacing: 0.04em; text-transform: uppercase">Navigáció és lista</h2>
+          <span style="font-size: 14px; color: var(--muted)">tabok, menü, táblázat saját scrollbarral</span>
+        </div>
+        <div style="display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start">
+          <div style="flex: 1; min-width: 520px; display: flex; flex-direction: column; gap: 10px">
+            <div style="display: inline-flex; gap: 3px; padding: 3px; background: var(--tray); border: 1px solid var(--line); border-radius: 4px; align-self: flex-start">
+              <button type="button" onClick="{{ st0 }}" style="height: 32px; padding: 0 16px; border: none; border-radius: 3px; font: inherit; font-size: 14px; cursor: pointer; background: {{ tb0 }}; color: {{ tc0 }}">Folyamatok</button>
+              <button type="button" onClick="{{ st1 }}" style="height: 32px; padding: 0 16px; border: none; border-radius: 3px; font: inherit; font-size: 14px; cursor: pointer; background: {{ tb1 }}; color: {{ tc1 }}">Eszközök</button>
+              <button type="button" onClick="{{ st2 }}" style="height: 32px; padding: 0 16px; border: none; border-radius: 3px; font: inherit; font-size: 14px; cursor: pointer; background: {{ tb2 }}; color: {{ tc2 }}">Napló</button>
+            </div>
+            <div style="border: 1px solid var(--line); border-radius: 4px; background: var(--sunken); overflow: hidden">
+              <div style="display: grid; grid-template-columns: 60px 1fr 100px 90px 12px; align-items: center; gap: 10px; height: 32px; padding: 0 14px 0 14px; background: var(--tray); border-bottom: 1px solid var(--line); font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">
+                <span>PID</span><span>Név</span><span>Memória</span><span>Állapot</span><span></span>
+              </div>
+              <div style="display: flex">
+                <div onWheel="{{ onwheel }}" style="flex: 1; height: {{ vh }}; overflow: hidden; position: relative">
+                  <div style="position: absolute; inset: 0; transform: {{ scy }}">
+                    <sc-for list="{{ rows }}" as="row" hint-placeholder-count="6">
+                      <div style="display: grid; grid-template-columns: 60px 1fr 100px 90px; align-items: center; gap: 10px; height: var(--row); padding: 0 14px; border-bottom: 1px solid var(--line-soft); background: {{ row.bg }}; color: {{ row.fg }}; cursor: default" style-hover="background: var(--hover)">
+                        <span style="font-family: 'IBM Plex Mono', monospace; color: var(--muted)">{{ row.pid }}</span>
+                        <span>{{ row.name }}</span>
+                        <span style="font-family: 'IBM Plex Mono', monospace">{{ row.mem }}</span>
+                        <span style="font-family: 'IBM Plex Mono', monospace; color: var(--muted)">{{ row.st }}</span>
+                      </div>
+                    </sc-for>
+                  </div>
+                </div>
+                <div onPointerDown="{{ ontrack }}" style="width: 12px; flex: none; background: var(--tray); border-left: 1px solid var(--line-soft); position: relative; cursor: pointer">
+                  <div style="position: absolute; left: 2px; right: 2px; border-radius: 4px; background: var(--muted); opacity: 0.7; height: {{ thh }}; top: {{ thtop }}"></div>
+                </div>
+              </div>
+              <div style="display: flex; justify-content: space-between; align-items: center; height: 30px; padding: 0 14px; border-top: 1px solid var(--line); background: var(--tray); font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">
+                <span>12 folyamat · 1 kijelölve</span><span>28.6 MB</span>
+              </div>
+            </div>
+            <div style="display: flex; gap: 10px; align-items: center; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">
+              <span>üres állapot:</span>
+              <div style="flex: 1; border: 1px dashed var(--line); border-radius: 4px; padding: 14px; text-align: center; font-family: 'Barlow', sans-serif; font-size: 14px; color: var(--muted)">Nincs csatolt eszköz. <span style="color: var(--accent)">Keresés indítása</span></div>
+            </div>
+          </div>
+
+          <div style="width: 300px; display: flex; flex-direction: column; gap: 10px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Menü</div>
+            <div style="background: var(--raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: var(--shadow-lg); padding: 6px">
+              <div style="display: flex; justify-content: space-between; align-items: center; height: 34px; padding: 0 10px; border-radius: 3px; background: var(--hover)"><span>Új ablak</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">Ctrl+N</span></div>
+              <div style="display: flex; justify-content: space-between; align-items: center; height: 34px; padding: 0 10px; border-radius: 3px" style-hover="background: var(--hover)"><span>Terminál itt</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">Ctrl+T</span></div>
+              <div style="display: flex; justify-content: space-between; align-items: center; height: 34px; padding: 0 10px; border-radius: 3px" style-hover="background: var(--hover)"><span>Tulajdonságok</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">Alt+↵</span></div>
+              <div style="height: 1px; background: var(--line-soft); margin: 5px 6px"></div>
+              <div style="display: flex; justify-content: space-between; align-items: center; height: 34px; padding: 0 10px; border-radius: 3px" style-hover="background: var(--hover)"><span>Alárendelt menü</span><span style="font-size: 10px; color: var(--muted)">▶</span></div>
+              <div style="display: flex; justify-content: space-between; align-items: center; height: 34px; padding: 0 10px; opacity: 0.45"><span>Csatolás…</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px">Ctrl+M</span></div>
+            </div>
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin-top: 6px">Elérési út</div>
+            <div style="display: flex; align-items: center; gap: 6px; height: var(--ctl); padding: 0 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--sunken); font-family: 'IBM Plex Mono', monospace; font-size: var(--fsm); color: var(--muted); overflow: hidden">
+              <span>/</span><span style="color: var(--text)">usr</span><span>/</span><span style="color: var(--text)">src</span><span>/</span><span style="color: var(--accent)">kernel</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- overlays -->
+      <div style="display: flex; flex-direction: column; gap: 14px">
+        <div style="display: flex; align-items: baseline; gap: 14px; border-bottom: 1px solid var(--line); padding-bottom: 8px">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--accent)">07</span>
+          <h2 style="margin: 0; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 26px; letter-spacing: 0.04em; text-transform: uppercase">Átfedő elemek</h2>
+          <span style="font-size: 14px; color: var(--muted)">dialógus, értesítés, tooltip</span>
+        </div>
+        <div style="display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start">
+          <div style="width: 360px; padding: 20px; background: var(--raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: var(--shadow-lg); display: flex; flex-direction: column; gap: 12px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 22px; letter-spacing: 0.02em">Partíció formázása</div>
+            <div style="font-size: 14px; line-height: 1.5; color: var(--muted)">A <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--text)">/dev/sda2</span> minden adata törlődik. A művelet nem visszavonható.</div>
+            <div style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 4px; background: var(--sunken); font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted)">ext2 · 4096 B blokk · 32 GB</div>
+            <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px">
+              <button type="button" style="height: 36px; padding: 0 16px; border: 1px solid var(--line); border-radius: 4px; background: var(--raised); color: var(--text); font: inherit; font-size: 14px; cursor: pointer" style-hover="background: var(--hover)">Mégse</button>
+              <button type="button" style="height: 36px; padding: 0 16px; border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: var(--on-accent); font: inherit; font-size: 14px; font-weight: 500; cursor: pointer" style-hover="filter: brightness(1.08)">Formázás</button>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 12px; width: 300px">
+            <div style="background: var(--raised); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 4px; box-shadow: var(--shadow-md); padding: 14px; display: flex; flex-direction: column; gap: 3px">
+              <div style="font-size: 15px; font-weight: 500">Driver betöltve</div>
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--muted)">e1000e · eth0 up</div>
+            </div>
+            <div style="background: var(--raised); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 4px; box-shadow: var(--shadow-md); padding: 14px; display: flex; gap: 12px; align-items: flex-start">
+              <span style="width: 20px; height: 20px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: spin 850ms linear infinite; flex: none; margin-top: 2px"></span>
+              <div style="display: flex; flex-direction: column; gap: 3px">
+                <div style="font-size: 15px; font-weight: 500">Csomag telepítése</div>
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--muted)">gcc-toolchain · 3 / 9</div>
+              </div>
+            </div>
+            <div style="align-self: flex-start; padding: 6px 10px; background: var(--raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: var(--shadow-md); font-size: 13px">Leválasztás <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">Ctrl+U</span></div>
+          </div>
+          <div style="flex: 1; min-width: 260px; display: flex; flex-direction: column; gap: 10px">
+            <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Billentyűzet</div>
+            <div style="display: flex; flex-direction: column; gap: 8px; font-size: 14px; color: var(--muted)">
+              <div style="display: flex; gap: 10px"><span style="font-family: 'IBM Plex Mono', monospace; color: var(--text); min-width: 92px">Tab</span><span>következő vezérlő, mindig látható gyűrűvel</span></div>
+              <div style="display: flex; gap: 10px"><span style="font-family: 'IBM Plex Mono', monospace; color: var(--text); min-width: 92px">Space</span><span>checkbox / switch kapcsolása</span></div>
+              <div style="display: flex; gap: 10px"><span style="font-family: 'IBM Plex Mono', monospace; color: var(--text); min-width: 92px">← →</span><span>radio, szegmentált, csúszka léptetése</span></div>
+              <div style="display: flex; gap: 10px"><span style="font-family: 'IBM Plex Mono', monospace; color: var(--text); min-width: 92px">F10</span><span>menüsáv fókuszálása</span></div>
+              <div style="display: flex; gap: 10px"><span style="font-family: 'IBM Plex Mono', monospace; color: var(--text); min-width: 92px">Esc</span><span>menü, dialógus, dropdown bezárása</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </sc-if>
+
+  <!-- ============ DEMO ============ -->
+  <sc-if value="{{ isDemo }}" hint-placeholder-val="{{ true }}">
+    <div style="padding: 28px; display: flex; justify-content: center">
+      <div style="width: 1400px; height: 860px; position: relative; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; box-shadow: var(--shadow-lg)">
+        <div style="position: absolute; inset: 0; background: repeating-linear-gradient(45deg, transparent 0 14px, var(--line-soft) 14px 15px); opacity: 0.6"></div>
+
+        <!-- top panel -->
+        <div style="position: relative; z-index: 2; display: flex; align-items: center; justify-content: space-between; height: 34px; padding: 0 12px; background: var(--raised); border-bottom: 1px solid var(--line)">
+          <div style="display: flex; align-items: center; gap: 2px">
+            <span style="font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 14px; letter-spacing: 0.14em; text-transform: uppercase; padding-right: 10px">Sysm</span>
+            <button type="button" onClick="{{ tmenu }}" style="height: 26px; padding: 0 10px; border: none; border-radius: 3px; background: {{ menubg }}; color: var(--text); font: inherit; font-size: 13px; cursor: pointer" style-hover="background: var(--hover)">Fájl</button>
+            <button type="button" style="height: 26px; padding: 0 10px; border: none; border-radius: 3px; background: transparent; color: var(--text); font: inherit; font-size: 13px; cursor: pointer" style-hover="background: var(--hover)">Nézet</button>
+            <button type="button" style="height: 26px; padding: 0 10px; border: none; border-radius: 3px; background: transparent; color: var(--text); font: inherit; font-size: 13px; cursor: pointer" style-hover="background: var(--hover)">Súgó</button>
+          </div>
+          <div style="display: flex; align-items: center; gap: 16px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted)">
+            <span>load 0.42</span><span>mem 28.6 / 512 MB</span><span>eth0 up</span><span style="color: var(--text)">14:08</span>
+          </div>
+        </div>
+        <sc-if value="{{ menu }}" hint-placeholder-val="{{ true }}">
+          <div style="position: absolute; top: 36px; left: 56px; width: 236px; z-index: 30; background: var(--raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: var(--shadow-lg); padding: 6px">
+            <div style="display: flex; justify-content: space-between; align-items: center; height: 34px; padding: 0 10px; border-radius: 3px; cursor: pointer" style-hover="background: var(--hover)"><span>Új ablak</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">Ctrl+N</span></div>
+            <div onClick="{{ opendlg }}" style="display: flex; justify-content: space-between; align-items: center; height: 34px; padding: 0 10px; border-radius: 3px; cursor: pointer" style-hover="background: var(--hover)"><span>Partíció formázása…</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">Ctrl+F</span></div>
+            <div style="height: 1px; background: var(--line-soft); margin: 5px 6px"></div>
+            <div style="display: flex; justify-content: space-between; align-items: center; height: 34px; padding: 0 10px; border-radius: 3px; cursor: pointer" style-hover="background: var(--hover)"><span>Kilépés</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">Ctrl+Q</span></div>
+          </div>
+        </sc-if>
+
+        <!-- main window -->
+        <div style="position: absolute; top: 66px; left: 40px; width: 820px; z-index: 10; background: var(--surface); border: 1px solid var(--line); border-radius: 4px; box-shadow: var(--shadow-lg); display: flex; flex-direction: column">
+          <div style="display: flex; align-items: center; justify-content: space-between; height: 38px; padding: 0 10px; background: var(--raised); border-bottom: 1px solid var(--line); border-radius: 3px 3px 0 0">
+            <span style="font-size: 14px; font-weight: 500">Rendszerfigyelő</span>
+            <div style="display: flex; gap: 6px">
+              <button type="button" style="width: 26px; height: 26px; padding: 0; border: none; border-radius: 3px; background: var(--tray); color: var(--text); font-size: 12px; cursor: pointer" style-hover="background: var(--hover)">–</button>
+              <button type="button" style="width: 26px; height: 26px; padding: 0; border: none; border-radius: 3px; background: var(--tray); color: var(--text); font-size: 12px; cursor: pointer" style-hover="background: var(--hover)">□</button>
+              <button type="button" style="width: 26px; height: 26px; padding: 0; border: none; border-radius: 3px; background: var(--tray); color: var(--text); font-size: 12px; cursor: pointer" style-hover="background: var(--accent); color: var(--on-accent)">×</button>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid var(--line-soft)">
+            <div style="display: inline-flex; gap: 3px; padding: 3px; background: var(--tray); border: 1px solid var(--line); border-radius: 4px">
+              <button type="button" onClick="{{ st0 }}" style="height: 30px; padding: 0 14px; border: none; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer; background: {{ tb0 }}; color: {{ tc0 }}">Folyamatok</button>
+              <button type="button" onClick="{{ st1 }}" style="height: 30px; padding: 0 14px; border: none; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer; background: {{ tb1 }}; color: {{ tc1 }}">Eszközök</button>
+              <button type="button" onClick="{{ st2 }}" style="height: 30px; padding: 0 14px; border: none; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer; background: {{ tb2 }}; color: {{ tc2 }}">Napló</button>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--sunken); width: 220px">
+              <span style="width: 10px; height: 10px; border: 1.5px solid var(--muted); border-radius: 50%; flex: none"></span>
+              <input placeholder="szűrés" style="flex: 1; min-width: 0; border: none; background: transparent; color: var(--text); font: inherit; font-size: 13px; outline: none">
+            </div>
+          </div>
+          <div style="display: grid; grid-template-columns: 60px 1fr 100px 90px 12px; align-items: center; gap: 10px; height: 30px; padding: 0 14px; background: var(--tray); border-bottom: 1px solid var(--line); font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">
+            <span>PID</span><span>Név</span><span>Memória</span><span>Állapot</span><span></span>
+          </div>
+          <div style="display: flex; background: var(--sunken)">
+            <div onWheel="{{ onwheel }}" style="flex: 1; height: {{ vh }}; overflow: hidden; position: relative">
+              <div style="position: absolute; inset: 0; transform: {{ scy }}">
+                <sc-for list="{{ rows }}" as="row" hint-placeholder-count="6">
+                  <div style="display: grid; grid-template-columns: 60px 1fr 100px 90px; align-items: center; gap: 10px; height: var(--row); padding: 0 14px; border-bottom: 1px solid var(--line-soft); background: {{ row.bg }}; color: {{ row.fg }}" style-hover="background: var(--hover)">
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: var(--muted)">{{ row.pid }}</span>
+                    <span>{{ row.name }}</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace">{{ row.mem }}</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; color: var(--muted)">{{ row.st }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+            <div onPointerDown="{{ ontrack }}" style="width: 12px; flex: none; background: var(--tray); border-left: 1px solid var(--line-soft); position: relative; cursor: pointer">
+              <div style="position: absolute; left: 2px; right: 2px; border-radius: 4px; background: var(--muted); opacity: 0.7; height: {{ thh }}; top: {{ thtop }}"></div>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-top: 1px solid var(--line)">
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">12 folyamat · 1 kijelölve · 28.6 MB</span>
+            <div style="display: flex; gap: 8px">
+              <button type="button" style="height: 32px; padding: 0 14px; border: 1px solid var(--line); border-radius: 4px; background: var(--raised); color: var(--text); font: inherit; font-size: 13px; cursor: pointer" style-hover="background: var(--hover)">Prioritás…</button>
+              <button type="button" onClick="{{ opendlg }}" style="height: 32px; padding: 0 14px; border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: var(--on-accent); font: inherit; font-size: 13px; font-weight: 500; cursor: pointer" style-hover="filter: brightness(1.08)">Leállítás</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- settings window -->
+        <div style="position: absolute; top: 300px; right: 40px; width: 440px; z-index: 12; background: var(--surface); border: 1px solid var(--line); border-radius: 4px; box-shadow: var(--shadow-lg)">
+          <div style="display: flex; align-items: center; justify-content: space-between; height: 38px; padding: 0 10px; background: var(--raised); border-bottom: 1px solid var(--line); border-radius: 3px 3px 0 0">
+            <span style="font-size: 14px; font-weight: 500">Kernel beállítások</span>
+            <button type="button" style="width: 26px; height: 26px; padding: 0; border: none; border-radius: 3px; background: var(--tray); color: var(--text); font-size: 12px; cursor: pointer" style-hover="background: var(--accent); color: var(--on-accent)">×</button>
+          </div>
+          <div style="padding: 16px; display: flex; flex-direction: column; gap: 14px">
+            <div role="switch" tabIndex="0" aria-checked="{{ sw1 }}" onClick="{{ tsw1 }}" onKeyDown="{{ ksw1 }}" style="display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; border-radius: 4px" style-focus="outline: 2px solid var(--focus); outline-offset: 2px">
+              <span>Preemptív ütemezés</span>
+              <span style="position: relative; width: 48px; height: 26px; flex: none; border-radius: 13px; border: 1px solid var(--line); background: {{ sw1bg }}; transition: background 120ms linear">
+                <span style="position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: {{ sw1knob }}; box-shadow: var(--shadow-sm); transition: transform 120ms linear; transform: {{ sw1x }}"></span>
+              </span>
+            </div>
+            <div role="switch" tabIndex="0" aria-checked="{{ sw2 }}" onClick="{{ tsw2 }}" onKeyDown="{{ ksw2 }}" style="display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; border-radius: 4px" style-focus="outline: 2px solid var(--focus); outline-offset: 2px">
+              <span>Linux ABI réteg</span>
+              <span style="position: relative; width: 48px; height: 26px; flex: none; border-radius: 13px; border: 1px solid var(--line); background: {{ sw2bg }}; transition: background 120ms linear">
+                <span style="position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: {{ sw2knob }}; box-shadow: var(--shadow-sm); transition: transform 120ms linear; transform: {{ sw2x }}"></span>
+              </span>
+            </div>
+            <div style="height: 1px; background: var(--line-soft)"></div>
+            <div style="display: flex; flex-direction: column; gap: 4px">
+              <div style="display: flex; justify-content: space-between; font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)"><span>Swappiness</span><span style="font-family: 'IBM Plex Mono', monospace; letter-spacing: 0; color: var(--text)">{{ sl }}</span></div>
+              <div tabIndex="0" onPointerDown="{{ onsl }}" onKeyDown="{{ slkey }}" style="position: relative; height: 36px; display: flex; align-items: center; cursor: pointer; border-radius: 4px" style-focus="outline: 2px solid var(--focus); outline-offset: 1px">
+                <div style="position: absolute; left: 0; right: 0; height: 6px; border-radius: 3px; background: var(--sunken); border: 1px solid var(--line)"></div>
+                <div style="position: absolute; left: 0; height: 6px; border-radius: 3px; background: var(--accent); width: {{ slpct }}"></div>
+                <div style="position: absolute; width: 22px; height: 22px; border-radius: 50%; background: var(--raised); border: 1px solid var(--line); box-shadow: var(--shadow-sm); margin-left: -11px; left: {{ slpct }}"></div>
+              </div>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 6px; position: relative">
+              <span style="font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted)">Ütemező</span>
+              <button type="button" onClick="{{ tdd }}" style="height: 36px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--sunken); color: var(--text); font: inherit; font-size: 14px; cursor: pointer" style-hover="border-color: var(--accent)"><span>{{ ddval }}</span><span style="font-size: 10px; color: var(--accent)">▼</span></button>
+              <sc-if value="{{ dd }}" hint-placeholder-val="{{ true }}">
+                <div style="position: absolute; top: 100%; margin-top: 4px; left: 0; right: 0; z-index: 20; background: var(--raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: var(--shadow-lg); padding: 6px">
+                  <div onClick="{{ dd0 }}" style="height: 32px; display: flex; align-items: center; padding: 0 10px; border-radius: 3px; cursor: pointer" style-hover="background: var(--hover)">round-robin</div>
+                  <div onClick="{{ dd1 }}" style="height: 32px; display: flex; align-items: center; padding: 0 10px; border-radius: 3px; cursor: pointer" style-hover="background: var(--hover)">CFS</div>
+                  <div onClick="{{ dd2 }}" style="height: 32px; display: flex; align-items: center; padding: 0 10px; border-radius: 3px; cursor: pointer" style-hover="background: var(--hover)">prioritásos</div>
+                </div>
+              </sc-if>
+            </div>
+          </div>
+        </div>
+
+        <!-- toast -->
+        <div style="position: absolute; bottom: 62px; right: 40px; z-index: 14; width: 300px; background: var(--raised); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 4px; box-shadow: var(--shadow-lg); padding: 14px; display: flex; flex-direction: column; gap: 3px">
+          <div style="font-size: 15px; font-weight: 500">Driver betöltve</div>
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--muted)">e1000e · eth0 up</div>
+        </div>
+
+        <!-- taskbar -->
+        <div style="position: absolute; bottom: 0; left: 0; right: 0; z-index: 20; display: flex; align-items: center; justify-content: space-between; height: 46px; padding: 0 12px; background: var(--raised); border-top: 1px solid var(--line)">
+          <div style="display: flex; gap: 8px">
+            <button type="button" style="height: 32px; padding: 0 14px; border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: var(--on-accent); font: inherit; font-size: 13px; cursor: pointer">Rendszerfigyelő</button>
+            <button type="button" style="height: 32px; padding: 0 14px; border: 1px solid var(--line); border-radius: 4px; background: var(--tray); color: var(--text); font: inherit; font-size: 13px; cursor: pointer" style-hover="background: var(--hover)">Kernel beállítások</button>
+            <button type="button" style="height: 32px; padding: 0 14px; border: 1px solid var(--line); border-radius: 4px; background: var(--tray); color: var(--text); font: inherit; font-size: 13px; cursor: pointer" style-hover="background: var(--hover)">Terminál</button>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px">
+            <div style="width: 120px; height: 6px; border-radius: 3px; background: var(--sunken); border: 1px solid var(--line); overflow: hidden"><div style="height: 100%; width: 64%; background: var(--accent)"></div></div>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted)">pkg 3/9</span>
+          </div>
+        </div>
+
+        <!-- modal -->
+        <sc-if value="{{ dlg }}" hint-placeholder-val="{{ true }}">
+          <div style="position: absolute; inset: 0; z-index: 50; display: grid; place-items: center; background: rgba(0,0,0,0.45)">
+            <div style="width: 380px; padding: 20px; background: var(--raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: var(--shadow-lg); display: flex; flex-direction: column; gap: 12px">
+              <div style="font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 22px; letter-spacing: 0.02em">Folyamat leállítása</div>
+              <div style="font-size: 14px; line-height: 1.5; color: var(--muted)">A <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--text)">pkg_daemon</span> (pid 377) SIGTERM jelet kap. A mentés nélküli állapot elveszhet.</div>
+              <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px">
+                <button type="button" onClick="{{ closedlg }}" style="height: 36px; padding: 0 16px; border: 1px solid var(--line); border-radius: 4px; background: var(--raised); color: var(--text); font: inherit; font-size: 14px; cursor: pointer" style-hover="background: var(--hover)">Mégse</button>
+                <button type="button" onClick="{{ closedlg }}" style="height: 36px; padding: 0 16px; border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: var(--on-accent); font: inherit; font-size: 14px; font-weight: 500; cursor: pointer" style-hover="filter: brightness(1.08)">Leállítás</button>
+              </div>
+            </div>
+          </div>
+        </sc-if>
+      </div>
+    </div>
+  </sc-if>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;dark&quot;,&quot;light&quot;],&quot;default&quot;:&quot;dark&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;density&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;comfort&quot;,&quot;compact&quot;],&quot;default&quot;:&quot;comfort&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;view&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;catalogue&quot;,&quot;demo&quot;],&quot;default&quot;:&quot;catalogue&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;showSpecs&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;}}">
+const THEMES = {
+  dark: {
+    bg: "#16232f", surface: "#1d2d3d", sunken: "#16232f", raised: "#22374a",
+    line: "#416180", lineSoft: "#2c455d", text: "#eef6ff", muted: "#94bce3",
+    accent: "#94bce3", onAccent: "#16232f", hover: "#2c455d", press: "#416180", tray: "#1a2937",
+    focus: "rgba(148,188,227,0.5)",
+    shadowSm: "0 1px 2px rgba(0,0,0,0.4)", shadowMd: "0 3px 10px rgba(0,0,0,0.42)", shadowLg: "0 14px 34px rgba(0,0,0,0.55)",
+    knob: "#ffffff", knobOff: "#eef6ff", swOff: "#416180",
+    dotOn: "inset 0 0 0 4px #1d2d3d, inset 0 0 0 20px #94bce3",
+    selBg: "#416180", selFg: "#eef6ff", tabOn: "#416180", tabTxtOn: "#eef6ff", tabTxtOff: "#94bce3"
+  },
+  light: {
+    bg: "#e7e7ea", surface: "#f5f5f8", sunken: "#ffffff", raised: "#ffffff",
+    line: "#d4d4d7", lineSoft: "#e7e7ea", text: "#1d1f20", muted: "#5d5d60",
+    accent: "#5980a6", onAccent: "#ffffff", hover: "#eef6ff", press: "#d6ebff", tray: "#e7e7ea",
+    focus: "rgba(89,128,166,0.45)",
+    shadowSm: "0 1px 2px rgba(43,43,45,0.14)", shadowMd: "0 3px 10px rgba(43,43,45,0.16)", shadowLg: "0 12px 32px rgba(43,43,45,0.22)",
+    knob: "#ffffff", knobOff: "#ffffff", swOff: "#b7b7ba",
+    dotOn: "inset 0 0 0 4px #ffffff, inset 0 0 0 20px #5980a6",
+    selBg: "#d6ebff", selFg: "#1d1f20", tabOn: "#ffffff", tabTxtOn: "#1d1f20", tabTxtOff: "#5d5d60"
+  }
+};
+const DENS = {
+  comfort: { ctl: "40px", ctlPad: "18px", row: 40, fs: "15px", fsm: "14px" },
+  compact: { ctl: "32px", ctlPad: "14px", row: 32, fs: "14px", fsm: "13px" }
+};
+const SCHED = ["round-robin", "CFS", "prioritásos"];
+const ROWS = [
+  { pid: "1", name: "init", mem: "1.2 MB", st: "run" },
+  { pid: "14", name: "kthreadd", mem: "0.4 MB", st: "sleep" },
+  { pid: "88", name: "vfs_worker", mem: "3.8 MB", st: "run" },
+  { pid: "121", name: "net_e1000e", mem: "2.1 MB", st: "run" },
+  { pid: "204", name: "tty_console", mem: "0.9 MB", st: "idle" },
+  { pid: "310", name: "compositor", mem: "12.6 MB", st: "run" },
+  { pid: "377", name: "pkg_daemon", mem: "5.4 MB", st: "sleep" },
+  { pid: "412", name: "shell", mem: "1.8 MB", st: "run" },
+  { pid: "455", name: "logd", mem: "0.7 MB", st: "sleep" },
+  { pid: "501", name: "usb_hub", mem: "1.1 MB", st: "idle" },
+  { pid: "540", name: "fb_driver", mem: "4.2 MB", st: "run" },
+  { pid: "588", name: "abi_linux", mem: "6.9 MB", st: "run" }
+];
+
+class Component extends DCLogic {
+  state = {
+    theme: null, dens: null, view: null,
+    c1: true, c2: false, r: 0, sw1: true, sw2: false, seg: 0, tab: 0,
+    sl: 60, sc: 0, dd: false, sch: 1, menu: false, dlg: false, sel: 6
+  };
+
+  th() { return THEMES[this.state.theme || this.props.theme || "dark"]; }
+  dn() { return DENS[this.state.dens || this.props.density || "comfort"]; }
+  view() { return this.state.view || this.props.view || "catalogue"; }
+
+  set(k, v) { this.setState({ [k]: v }); }
+  toggle(k) { this.setState(s => ({ [k]: !s[k] })); }
+  keyToggle(k) { return e => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); this.toggle(k); } }; }
+
+  geo() {
+    const row = this.dn().row, vh = row * 7, content = ROWS.length * row;
+    const max = Math.max(0, content - vh);
+    const thumb = Math.max(28, Math.round(vh * vh / content));
+    return { row: row, vh: vh, max: max, thumb: thumb };
+  }
+
+  slider() {
+    return e => {
+      const r = e.currentTarget.getBoundingClientRect();
+      const move = ev => this.set("sl", Math.round(Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width)) * 100));
+      move(e);
+      const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    };
+  }
+  sliderKey() {
+    return e => {
+      const d = e.key === "ArrowLeft" ? -2 : e.key === "ArrowRight" ? 2 : e.key === "Home" ? -100 : e.key === "End" ? 100 : 0;
+      if (!d) return;
+      e.preventDefault();
+      this.set("sl", Math.max(0, Math.min(100, this.state.sl + d)));
+    };
+  }
+  radioKey() {
+    return e => {
+      const d = e.key === "ArrowUp" || e.key === "ArrowLeft" ? -1 : e.key === "ArrowDown" || e.key === "ArrowRight" ? 1 : 0;
+      if (!d) return;
+      e.preventDefault();
+      this.set("r", (this.state.r + d + 3) % 3);
+    };
+  }
+
+  renderVals() {
+    const t = this.th(), d = this.dn(), g = this.geo(), s = this.state;
+    const view = this.view();
+    const max = g.max, ratio = max ? s.sc / max : 0;
+    const segBg = i => (s.seg === i ? t.tabOn : "transparent");
+    const segFg = i => (s.seg === i ? t.tabTxtOn : t.tabTxtOff);
+    const tabBg = i => (s.tab === i ? t.tabOn : "transparent");
+    const tabFg = i => (s.tab === i ? t.tabTxtOn : t.tabTxtOff);
+    const pick = (on, a, b) => (on ? a : b);
+    const themeName = s.theme || this.props.theme || "dark";
+    const densName = s.dens || this.props.density || "comfort";
+    return {
+      t: {
+        bg: t.bg, surface: t.surface, sunken: t.sunken, raised: t.raised, line: t.line, lineSoft: t.lineSoft,
+        text: t.text, muted: t.muted, accent: t.accent, onAccent: t.onAccent, hover: t.hover, press: t.press,
+        tray: t.tray, focus: t.focus, shadowSm: t.shadowSm, shadowMd: t.shadowMd, shadowLg: t.shadowLg,
+        ctl: d.ctl, ctlPad: d.ctlPad, rowpx: d.row + "px", row: d.row, fs: d.fs, fsm: d.fsm
+      },
+      th: {
+        darkBg: pick(themeName === "dark", t.tabOn, "transparent"), darkFg: pick(themeName === "dark", t.tabTxtOn, t.tabTxtOff),
+        lightBg: pick(themeName === "light", t.tabOn, "transparent"), lightFg: pick(themeName === "light", t.tabTxtOn, t.tabTxtOff),
+        comfBg: pick(densName === "comfort", t.tabOn, "transparent"), comfFg: pick(densName === "comfort", t.tabTxtOn, t.tabTxtOff),
+        compBg: pick(densName === "compact", t.tabOn, "transparent"), compFg: pick(densName === "compact", t.tabTxtOn, t.tabTxtOff),
+        catBg: pick(view === "catalogue", t.tabOn, "transparent"), catFg: pick(view === "catalogue", t.tabTxtOn, t.tabTxtOff),
+        demoBg: pick(view === "demo", t.tabOn, "transparent"), demoFg: pick(view === "demo", t.tabTxtOn, t.tabTxtOff)
+      },
+      isCat: view === "catalogue", isDemo: view === "demo",
+      showSpecs: this.props.showSpecs ?? true,
+      setDark: () => this.set("theme", "dark"), setLight: () => this.set("theme", "light"),
+      setComfort: () => this.set("dens", "comfort"), setCompact: () => this.set("dens", "compact"),
+      setCat: () => this.set("view", "catalogue"), setDemo: () => this.set("view", "demo"),
+
+      c1: s.c1, c2: s.c2, c1bg: pick(s.c1, t.accent, t.sunken), c2bg: pick(s.c2, t.accent, t.sunken),
+      tc1: () => this.toggle("c1"), tc2: () => this.toggle("c2"), kc1: this.keyToggle("c1"), kc2: this.keyToggle("c2"),
+
+      r0: s.r === 0, r1: s.r === 1, r2: s.r === 2,
+      r0dot: pick(s.r === 0, t.dotOn, "none"), r1dot: pick(s.r === 1, t.dotOn, "none"), r2dot: pick(s.r === 2, t.dotOn, "none"),
+      sr0: () => this.set("r", 0), sr1: () => this.set("r", 1), sr2: () => this.set("r", 2), rkey: this.radioKey(),
+
+      sw1: s.sw1, sw1bg: pick(s.sw1, t.accent, t.swOff), sw1knob: pick(s.sw1, t.knob, t.knobOff),
+      sw1x: pick(s.sw1, "translateX(22px)", "translateX(0)"), sw1txt: pick(s.sw1, "on", "off"),
+      tsw1: () => this.toggle("sw1"), ksw1: this.keyToggle("sw1"),
+      sw2: s.sw2, sw2bg: pick(s.sw2, t.accent, t.swOff), sw2knob: pick(s.sw2, t.knob, t.knobOff),
+      sw2x: pick(s.sw2, "translateX(22px)", "translateX(0)"), sw2txt: pick(s.sw2, "on", "off"),
+      tsw2: () => this.toggle("sw2"), ksw2: this.keyToggle("sw2"),
+
+      sg0: () => this.set("seg", 0), sg1: () => this.set("seg", 1), sg2: () => this.set("seg", 2),
+      sg0bg: segBg(0), sg1bg: segBg(1), sg2bg: segBg(2), sg0fg: segFg(0), sg1fg: segFg(1), sg2fg: segFg(2),
+
+      st0: () => this.set("tab", 0), st1: () => this.set("tab", 1), st2: () => this.set("tab", 2),
+      tb0: tabBg(0), tb1: tabBg(1), tb2: tabBg(2), tc0: tabFg(0), tc1: tabFg(1), tc2: tabFg(2),
+
+      ddval: SCHED[s.sch], dd: s.dd, tdd: () => this.toggle("dd"),
+      dd0: () => this.setState({ sch: 0, dd: false }), dd1: () => this.setState({ sch: 1, dd: false }), dd2: () => this.setState({ sch: 2, dd: false }),
+
+      sl: s.sl, slpct: s.sl + "%", onsl: this.slider(), slkey: this.sliderKey(),
+
+      vh: g.vh + "px", scy: "translateY(" + -Math.round(s.sc) + "px)",
+      thh: g.thumb + "px", thtop: Math.round(ratio * (g.vh - g.thumb)) + "px",
+      onwheel: e => { e.preventDefault(); this.set("sc", Math.max(0, Math.min(max, s.sc + e.deltaY * 0.5))); },
+      ontrack: e => {
+        const r = e.currentTarget.getBoundingClientRect();
+        const move = ev => {
+          const p = Math.max(0, Math.min(1, (ev.clientY - r.top - g.thumb / 2) / (g.vh - g.thumb)));
+          this.set("sc", p * max);
+        };
+        move(e);
+        const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+        window.addEventListener("pointermove", move);
+        window.addEventListener("pointerup", up);
+      },
+
+      rows: ROWS.map((r, i) => ({
+        pid: r.pid, name: r.name, mem: r.mem, st: r.st,
+        bg: i === s.sel ? t.selBg : "transparent",
+        fg: i === s.sel ? t.selFg : t.text
+      })),
+
+      menu: s.menu, tmenu: () => this.toggle("menu"), menubg: pick(s.menu, t.hover, "transparent"),
+      dlg: s.dlg, opendlg: () => this.setState({ dlg: true, menu: false }), closedlg: () => this.set("dlg", false)
+    };
+  }
+}
+
+</script>
+</body>
+</html>

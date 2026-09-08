@@ -10,6 +10,7 @@
  * ============================================================================= */
 
 #include "block.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "vfs.h"
 #include "devfs.h"
 #include "printf.h"
@@ -140,3 +141,8 @@ void blk_list(void) {
                            (1024u * 1024u)));
     }
 }
+
+/* --- §M70 shell registration ----------------------------------------------- */
+static void bk_lsblk(const char* a) { (void)a; blk_list(); }
+SHELL_CMD(lsblk) = { "lsblk", "", "block devices",
+                     SHELL_G_DEV, bk_lsblk };

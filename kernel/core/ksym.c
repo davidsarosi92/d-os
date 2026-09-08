@@ -22,6 +22,7 @@
  * ============================================================================= */
 
 #include "ksym.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "printf.h"
 #include <stddef.h>
 
@@ -220,3 +221,7 @@ EXPORT_SYMBOL(__ashldi3);
 EXPORT_SYMBOL(__ashrdi3);
 EXPORT_SYMBOL(__lshrdi3);
 #endif
+
+/* --- §M70 shell registration ----------------------------------------------- */
+SHELL_CMD(ksyms) = { "ksyms", "[filter]", "symbols a module may call",
+                     SHELL_G_DEV, ksym_list };

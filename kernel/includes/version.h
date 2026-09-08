@@ -17,13 +17,16 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M67"                 /* highest completed number: §M67 loadable modules */
+#define DOS_MILESTONE  "M70"                 /* highest completed number: §M70 the shell registry + the gui.c split */
 
 /* An OLDER section completed after that number shipped.  Empty ("") when there
  * is nothing to say — and it must be CLEARED when the next numbered milestone
  * ships, because from then on the number itself is the newer news and a stale
  * note would advertise old work as fresh. */
-#define DOS_MILESTONE_NOTE  " (M33 complete)"    /* an OLDER section advanced after M67 */
+/* CLEARED, per this header's own rule: the note names an OLDER section
+ * finished after the number shipped, and once a newer number exists the number
+ * itself is the newer news.  §M33 completed before §M69 did. */
+#define DOS_MILESTONE_NOTE  ""
 
 /* Short architecture tag for the on-screen label.  Deliberately the FAMILIAR
  * short form ("x32"/"x64") rather than the toolchain triple — the wallpaper
@@ -49,6 +52,6 @@
  * the milestone; bump the patch for sub-milestone builds.
  * (Swappable units — packages, the runtime libc, the pkg backend — carry their
  * OWN versions; this is the baseline for the non-swappable core.) */
-#define DOS_VERSION    "0.47.1"   /* §M24 complete — see DOCS.md §4.59 */
+#define DOS_VERSION    "0.69.0"   /* §M69 complete — see DOCS.md §4.85 */
 
 #endif /* VERSION_H */

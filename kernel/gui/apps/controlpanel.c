@@ -18,6 +18,9 @@
 #include "gui_app.h"
 #include "icons.h"
 #include "widget.h"
+#include "console_plate.h"
+#include "locale.h"
+#include "printf.h"
 #include "itemview.h"
 #include "settings.h"
 #include "config.h"
@@ -28,7 +31,7 @@
  * second one's list would go stale the moment the first changed anything. */
 static struct gui_window* cp_win = NULL;
 
-struct cp_state {
+struct cpanel_state {
     struct w_itemview* iv;
 };
 
@@ -40,7 +43,17 @@ static int cp_get(void* ctx, int i, struct item_entry* out) {
     (void)ctx;
     const struct settings_panel* p = settings_panel_at(i);
     if (!p) return -1;
-    out->label = p->name;
+    /* §M69 — TRANSLATED HERE, IN THE MODEL, and deliberately not in the item
+     * VIEW.  The view draws file names, task names and device names too, and
+     * routing every item label through the catalogue would rename a file
+     * called "Save" to "Mentés" — user DATA is not a message.  Only a model
+     * that knows its items are interface labels may translate them.
+     *
+     * The registry name stays English because it is an IDENTIFIER: a
+     * CONFIG_KEY's `.group` is matched against it, so translating it at the
+     * registration would detach every setting from its panel.  Same rule as
+     * the app names in the Start menu — the English string is the key. */
+    out->label = lstr(p->name);
     out->sub   = p->summary;
     out->icon  = p->icon ? p->icon : ICON_SETTINGS;
     out->dim   = 0;
@@ -84,28 +97,44 @@ static const struct item_model cp_model = {
 static void cp_on_close(struct gui_window* win) { (void)win; cp_win = NULL; }
 
 static void cp_layout(struct gui_window* win) {
-    struct cp_state* st = (struct cp_state*)gui_window_ctx(win);
+    struct cpanel_state* st = (struct cpanel_state*)gui_window_ctx(win);
     if (!st) return;
     /* Builds its widgets — so replace the old set (gui_window_clear_widgets). */
     gui_window_clear_widgets(win);
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
 
-    w_label_create(win, 8, 6, cw - 16,
-                   "Settings - double-click a category");
-    st->iv = w_itemview_create(win, 8, 24, cw - 16, ch - 32,
+    /* §M69 — the header used to sit at y=6 and the view at y=24, while a label
+     * is `cp_fh() + 4` tall: at 137 % density that is ~24 px, so the view
+     * started 6 px INSIDE the label and painted over its descenders.  The two
+     * offsets agreed only at the 8x8 font they were measured for. */
+    const int pad = cp_px(8), gap = cp_px(6), row = cp_row_h();
+    w_label_create(win, pad, gap, cw - 2 * pad,
+                   "cp.hint");
+    st->iv = w_itemview_create(win, pad, gap + row, cw - 2 * pad,
+                               ch - gap - row - gap,
                                &cp_model,
                                config_get("controlpanel.view", "grid"), st);
+
+    /* §M69 — `gui.wheeltest`: fire one notch at the grid, on the surface the
+     * report was about.  Reported from use: *"the Control Panel scrolls even
+     * though everything fits, and most of the icons vanish."*  The harness
+     * cannot type once a window has focus (§4.74), so the panel triggers its
+     * own probe. */
+    if (st->iv && config_get_long("gui.wheeltest", 0)) {
+        kprintf("controlpanel: scroll=%d before the notch\n", st->iv->scroll);
+        gui_wheel_test(cw / 2, gap + row + cp_px(20), -1);
+    }
 }
 
 static void controlpanel_open(void) {
     if (cp_win) { gui_window_raise(cp_win); return; }
 
-    struct cp_state* st = (struct cp_state*)kcalloc(1, sizeof *st);
+    struct cpanel_state* st = (struct cpanel_state*)kcalloc(1, sizeof *st);
     if (!st) return;
 
     int ow, oh;
-    gui_window_outer_for_content(560, 340, &ow, &oh);
+    gui_window_outer_for_content(cp_px(560), cp_px(340), &ow, &oh);
     struct gui_window* win =
         gui_app_window_create("Control Panel", 180, 100, ow, oh, cp_layout, st);
     if (!win) { kfree(st); return; }
@@ -121,11 +150,13 @@ GUI_APP_ICON("Control Panel", controlpanel_open, ICON_SETTINGS);
  * declared next to the code that reads it, not here.
  * ============================================================================= */
 
-SETTINGS_PANEL(sp_personalisation) = {
-    .name    = "Personalisation",
-    .summary = "wallpaper, desktop layout, shell",
-    .icon    = ICON_BRUSH,
-};
+/* Personalisation was FOLDED INTO "Appearance" (kernel/gui/theme.c).
+ * It held exactly two keys — the wallpaper and its fit — and answered the same
+ * question the theme, density, text-size and icon-size keys answer: how does
+ * the desktop look.  Two pages meant two rows wanting the same icon, and the
+ * icon set has exactly one for "appearance"; picking a second, less accurate
+ * one to break the tie would have made the menu honest-looking and wrong.
+ * The keys are unchanged, so nothing anybody saved stops working. */
 
 SETTINGS_PANEL(sp_system) = {
     .name    = "System",

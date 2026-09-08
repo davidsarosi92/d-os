@@ -89,7 +89,48 @@ struct item_model {
      * Return 0 and fill the two outputs when the item is placed; non-zero when
      * it is not, and the view puts it in flow order. */
     int  (*pos)(void* ctx, int index, int* col, int* row);
+
+    /* HOW a column is set — appended, like everything since §M58's scar.
+     *
+     * The design's table is not a grid of identical text: the identity column
+     * is in the accent colour, the numbers are RIGHT-ALIGNED and set in the
+     * monospaced face so digits line up, the status column is muted.  Those are
+     * per-column facts the MODEL knows and the view cannot guess — a view that
+     * right-aligned anything numeric-looking would right-align a version
+     * string, and one that guessed at colour would have to know what the
+     * columns MEAN.
+     *
+     * One callback returning a bitmask rather than four callbacks: they are
+     * always decided together, and a model that answers three of four is a
+     * column styled half by its author and half by a default.
+     *
+     * NULL (or 0 for a column) is the old behaviour exactly — left-aligned,
+     * proportional, ordinary text — so no existing model changes. */
+    int  (*col_style)(void* ctx, int col);
+
+    /* §M69 — THE EMPTY STATE (widget_specs.md §11).  A view with no items drew
+     * NOTHING, so "this folder is empty", "the filter matched nothing" and
+     * "the model failed to load" were one identical blank rectangle — *and the
+     * blank is the one the user reads as broken.*
+     *
+     * DATA, NOT A CALLBACK, because there is nothing to compute: the message
+     * is a property of the collection.  They hold CATALOGUE KEYS and the view
+     * runs them through `lstr` — which also means a plain English literal
+     * works unchanged (locale.h's fallback), and that a language change
+     * updates the text without the model being rebuilt.
+     *
+     * `empty_action` is the design's `accent` call-to-action and is optional
+     * on its own: a list with nothing to do about being empty should not
+     * invent an instruction. */
+    const char* empty_text;
+    const char* empty_action;
 };
+
+/* Flags for item_model.col_style. */
+#define ICOL_RIGHT   0x01   /* right-align the cell inside its column        */
+#define ICOL_MONO    0x02   /* tabular face: a column of digits must line up */
+#define ICOL_ACCENT  0x04   /* the record's identity, in the accent colour   */
+#define ICOL_DIM     0x08   /* secondary information, in the muted colour    */
 
 /* A layout.  Stateless: everything it needs arrives as arguments. */
 struct item_view {
@@ -127,7 +168,33 @@ struct item_view {
      *
      * Returns 0 and fills the two outputs on success. */
     int  (*slot_at)(int px, int py, int w, int h, int* col, int* row);
+
+    /* §M69 — WHERE IS THIS VIEW'S SCROLLBAR, and what does it scroll?
+     *
+     * Appended, like every optional op since §M58's positional-initialiser
+     * scar.  The VIEW knows where it drew the bar (only it knows about its
+     * header band, its row height, its columns); the WIDGET owns `scroll` and
+     * therefore owns the drag.  Splitting it this way is what stops the four
+     * layouts each growing their own copy of press/drag/release — which is how
+     * the tree ended up with four scrollbars and no way to grab any of them.
+     *
+     * Fills the bar's rect plus the CONTENT and VIEWPORT in the view's own
+     * unit (rows for the list and the table), which is all `sb_metrics` needs.
+     * Returns 0 when the view has no bar — either it does not scroll, or
+     * everything already fits.  NULL means the layout has no scrollbar at all,
+     * which a caller must be able to tell from "there is nothing to scroll". */
+    int  (*scrollbar)(int w, int h, const struct item_model* m, int scroll,
+                      int* bx, int* by, int* bw, int* bh,
+                      int* content, int* viewport);
 };
+
+/* One cell's text, exactly as a view would draw it: from `cell` when the model
+ * has columns, otherwise the entry's label — which is what makes a plain list
+ * model render in the table.  Exported because the WIDGET needs the same answer
+ * for its content diff, and two copies of "cell or label" are two chances for
+ * the diff to compare something the painter never drew. */
+void item_cell_text(const struct item_model* m, int index, int col,
+                    char* out, int cap);
 
 extern struct item_view __start_item_views[];
 extern struct item_view __stop_item_views[];

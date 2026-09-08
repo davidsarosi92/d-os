@@ -18,6 +18,7 @@
  * ============================================================================= */
 
 #include "shortcut.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "itemview.h"
 #include "gfx.h"
 #include "icons.h"
@@ -644,3 +645,8 @@ void shortcut_cmd(const char* args) {
     kprintf("shortcut: list | add <name> <target> [icon] | rm <name> "
             "| open <name> | move <name> <col> <row> | check [view]\n");
 }
+
+/* --- §M70 shell registration ----------------------------------------------- */
+SHELL_CMD(shortcut) = { "shortcut", "[list|add <name> <target> [icon]|rm <name>|move|check]",
+                        "desktop shortcuts",
+                        SHELL_G_GUI, shortcut_cmd };

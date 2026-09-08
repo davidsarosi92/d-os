@@ -19,6 +19,7 @@
  * ============================================================================= */
 
 #include "wallpaper.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "gfx.h"
 #include "gui.h"
 #include "vfs.h"
@@ -490,12 +491,12 @@ const char* wallpaper_status(void) {
  * the whole point of a registry: adding a setting is a line here, not an edit
  * to the panel. */
 CONFIG_KEY(ck_wallpaper) = {
-    .key = "gui.wallpaper", .group = "Personalisation", .type = CFG_STRING,
+    .key = "gui.wallpaper", .group = "Appearance", .type = CFG_STRING,
     .def = WALLPAPER_DEFAULT_PATH,
     .help = "gradient | solid:RRGGBB | a path to a BMP",
 };
 CONFIG_KEY(ck_wallpaper_fit) = {
-    .key = "gui.wallpaper_fit", .group = "Personalisation", .type = CFG_ENUM,
+    .key = "gui.wallpaper_fit", .group = "Appearance", .type = CFG_ENUM,
     .values = "fill stretch center tile", .def = "fill",
     .help = "how the image is fitted to the screen",
 };
@@ -730,3 +731,10 @@ int wallpaper_write_test_bmp(const char* path, int w, int h) {
             path, w, h, 54u + data_sz);
     return 0;
 }
+
+/* --- §M70 shell registration -----------------------------------------------
+ * §M60 put the implementation here rather than in a shell precisely so the ARM
+ * serial REPL would run the same one; this is the other half of that. */
+SHELL_CMD(wallpaper) = { "wallpaper", "[gradient|solid:RRGGBB|<path.bmp>|fit <mode>|check]",
+                         "the desktop background",
+                         SHELL_G_GUI, wallpaper_cmd };

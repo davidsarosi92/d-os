@@ -36,7 +36,7 @@ const char*        gui_window_title(struct gui_window* w);
 /* ---- actions -------------------------------------------------------------- */
 
 /* Focus + raise (taskbar button click).  WM lock must be held. */
-void gui_wm_focus_raise_locked(struct gui_window* w);
+int gui_wm_focus_raise_locked(struct gui_window* w);
 
 /* M22.3 — Windows-style taskbar button semantics: minimized →
  * restore+focus, focused → minimize, else → focus+raise.  WM lock

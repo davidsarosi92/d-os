@@ -13,6 +13,7 @@
  * ============================================================================= */
 
 #include "console.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "printf.h"
 #include "task.h"
 #include "lock.h"
@@ -164,3 +165,8 @@ void console_list(void) {
                 x->active   ? "active" : "inactive");
     }
 }
+
+/* --- §M70 shell registration ----------------------------------------------- */
+static void cn_lsconsole(const char* a) { (void)a; console_list(); }
+SHELL_CMD(lsconsole) = { "lsconsole", "", "registered console sinks",
+                         SHELL_G_DEV, cn_lsconsole };

@@ -14,6 +14,7 @@
  * ============================================================================= */
 
 #include "watchdog.h"
+#include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "crash.h"      /* §M47 — record a hung task */
 #include "task.h"
 #include "lock.h"
@@ -338,3 +339,11 @@ void watchdog_init(void) {
     procfs_register(&nd_watchdog);
     task_spawn_detached("watchdog", watchdog_entry);
 }
+
+/* --- §M70 shell registration -----------------------------------------------
+ * DELIBERATELY HIDDEN FROM `help` (NULL help text): this wedges CPU 0 with
+ * interrupts off so the ib700 NMI has to fire and reboot the box.  The machine
+ * going down IS the pass.  Reachable for the test harness, not advertised to
+ * somebody reading the command list. */
+static void wd_hardlock(const char* a) { (void)a; watchdog_hardlock_test(); }
+SHELL_CMD(hardlock) = { "hardlock", "", 0, SHELL_G_TEST, wd_hardlock };
