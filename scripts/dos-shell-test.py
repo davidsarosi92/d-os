@@ -62,6 +62,14 @@ CRASH_PATTERNS = [
     re.compile(rb"spinlock deadlock"),             # §M46 lock-order report
     re.compile(rb"INPUT EVENT DROPPED"),           # §M69 ring overflow, once
     re.compile(rb"STILL QUEUED"),                  # §M57 runqueue audit
+    # §M71 — a runtime INVARIANT violation.  Distinct from a crash in kind and
+    # identical in consequence for a test result: a run in which a driver was
+    # executing in the wrong ring, or a dead driver still held its hardware, is
+    # not evidence about whatever feature the run was testing.  The audits are
+    # designed to be silent unless something is wrong, so this pattern costs
+    # nothing on a healthy machine.
+    re.compile(rb"!! AUDIT FAIL"),
+    re.compile(rb"!! audit "),                     # the individual violation lines
 ]
 
 

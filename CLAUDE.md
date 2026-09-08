@@ -20,6 +20,67 @@ focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
+(2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there
+something that finds bugs — a thing started in ring 0 that should have been in
+ring 3, memory leaks, security holes?"*  **THE ANSWER STARTS WITH WHY READING
+CANNOT DO IT, and this tree has the receipts:** §M52's note was TRUE when
+written and its premise moved out from under it across two green milestones;
+§M47.2's ring-3 pointer gate was never armed for the Linux ABI and *nothing
+failed visibly*, so it survived two more; §4.83's leaked grant stayed invisible
+because *the driver had failed, so nobody looked at what it was still holding.*
+None was found by inspection — inspection is how they were introduced.
+**`AUDIT()` is the house registry shape**, with four rules stated in audit.h: a
+check must be able to FAIL; it reports what it OBSERVED, not what it believes
+(§M33 stage 5's fault registers, not our counter); it distinguishes "cannot
+check" from "checked, clean"; and it does NOT FIX anything, because repairing
+destroys the evidence and turns a reproducible defect into an intermittent one.
+Three checks — **`driver-placement`** (every driver executes in the domain it
+was placed in, and reports the isolation the hardware actually gives it),
+**`driver-resources`** (every hardware grant is held by a driver that is
+actually running — §4.83's bug as a rule), **`ring3-boundary`** (the uaccess
+fixup table survived the link, the gate refuses kernel addresses, no kernel task
+carries the gate flag).  **IT RUNS FROM CRON AND NOT ONLY FROM A PROMPT**,
+because §4.74 says the harness cannot type once a GUI window holds focus — so
+*the runs most worth auditing are exactly the ones in which `audit` is
+unreachable*, the same wall `gui.stats_ms` was built to get around.
+`audit.interval_s` (default 0); measured with a deliberate leak, **8 violations
+over 8 seconds with nobody typing, and 0 lines on a healthy machine**.
+`dos-shell-test.py` fails a run on `!! AUDIT FAIL` exactly as on a fault.
+**TWO VIOLATIONS TURNED OUT UNREACHABLE BY ORDINARY MEANS, WHICH IS A RESULT
+ABOUT THE SYSTEM:** the supervisor's quarantine clears INITED and releases
+grants, so neither a killed placement nor `drv crash` can produce the bad
+state — **and the audit answered `SKIP — nothing to check` rather than `ok`**,
+rule 3 doing precisely its job.  So the falsifiers are SHIPPED (`leaktest`,
+`boundarytest`, hidden from `help` like `hardlock`), injecting a REAL bad row
+into the REAL table so they exercise DETECTION rather than reporting.  **THE
+BUG: `audit ring3-boundary` FAILED ON aarch64 ON A BARE BOOT** — `kernel task
+'kernel' (pid 0) carries the ring-3 pointer gate`.  **A ring-3 excursion leaves
+through the SYS_EXIT TELEPORT, which jumps straight back to the saved kernel
+context and NEVER UNWINDS THE DISPATCHER**, so `in_user_syscall = prev` does not
+run and the hosting task keeps the gate armed forever; every later in-kernel
+`sys_*` on that task then has its KERNEL buffers validated as USER pointers and
+refused — §M46's recorded failure, the one that "broke fdtest/socktest/polltest
+and, through ld.so's fstat of each shared object, NetSurf."  **`proc_exec_elf`
+HAD THE FIX, INLINE AND CORRECTLY DESCRIBED; the other two excursion paths never
+got it** (x86's `arch_ringtest`, aarch64's `aarch64_usertest`) — §M52's shape
+again, a hazard understood, written down, fixed in one place and its twins left.
+On ARM the untouched one runs from `main_entry`, so **pid 0 carried the gate
+from boot on every ARM machine.**  *THE DIAGNOSIS WAS A FALSIFIABLE PREDICTION,
+NOT AN INFERENCE:* if the teleport is the cause the ARCH is irrelevant and only
+the boot path differs, so `ringtest` on i386 must reproduce it — and it did,
+first try, which promoted "ARM is odd" to "one bug, three call sites".  Fixed as
+**ONE ROUTE** (`user_excursion_end()`, proc.h) rather than a third copy, so a
+fourth excursion path inherits it instead of needing to be remembered.
+**VERIFIED: i386 clean after `ringtest`, aarch64 clean at boot AND after a fresh
+`usertest`, x86_64 3/3 clean; all three arches build silent.**  **OPEN:** no
+owner tracking for frames or heap blocks (deliberate — the allocator has no
+in-band tagging and adding one would cost the hot path to catch a class this
+system has not suffered), and no check for IOMMU domains belonging to drivers
+that are gone (§4.83's third bug; wants an enumeration `iommu.h` does not
+offer).  Both absences are stated in the checks themselves so a pass is not read
+as more than it is.
+
 ✅ **§M70 — THE SHELL BECAME A REGISTRY, AND gui.c BECAME FIVE FILES (2026-09-08,
 DOCS §4.86, all 3 arches).**  Asked for directly, and the answer began by
 NARROWING the question: the folder structure was already right and sixteen
@@ -4160,6 +4221,7 @@ Block / USB drivers are i386-only today; x86_64 boots without them
 |--------------------------------------|---------------------------------------|
 | Boot order, new milestone wiring     | `kernel/core/kernel.c`                |
 | Adding a shell command               | `SHELL_CMD()` next to the code it drives — see `shellcmd.h`.  Kernel-subject ones go in `kernel/core/cmd_*.c`; NEVER back into `shell.c`, which is now only the REPL |
+| Adding a runtime invariant           | `AUDIT()` next to the code that must maintain it — see `audit.h`; it must ship a way to make it FAIL |
 | Adding a compositor subsystem        | `kernel/gui/` + `gui_priv.h` (compositor-private; apps use gui.h, shells use gui_internal.h) |
 | Adding a new .c to the build         | `Makefile` (C_SRCS or ASM_SRCS)       |
 | New linker section                   | `linker.ld`                           |

@@ -60,6 +60,12 @@ void ktimer_arm_after(struct ktimer* t, uint64_t delay_ns, ktimer_fn fn, void* a
  * a timer that has fired. */
 int ktimer_cancel(struct ktimer* t);
 
+/* Is `t` armed?  READ-ONLY — added in §M71 because `ktimer_cancel` was the only
+ * way to ask and it ANSWERS BY MUTATING, which an audit may not do (audit.h
+ * rule 4: a check that repairs what it finds destroys the evidence and turns a
+ * reproducible defect into an intermittent one). */
+int ktimer_armed(const struct ktimer* t);
+
 /* Fire everything now due.  Called from the timer-interrupt exit path; safe to
  * call from any CPU and at any rate — it does nothing when nothing is due. */
 void ktimer_expire(void);

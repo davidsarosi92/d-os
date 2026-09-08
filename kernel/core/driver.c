@@ -13,7 +13,8 @@
  * ============================================================================= */
 
 #include "driver.h"
-#include "shellcmd.h"   /* §M70 — the commands register themselves */
+#include "shellcmd.h"
+#include "drvrt.h"   /* §M70 — the commands register themselves */
 #include "crash.h"
 #include "kmalloc.h"
 #include "printf.h"
@@ -878,3 +879,11 @@ SHELL_CMD(lsdrv) = { "lsdrv", "", "drivers and their state",
 SHELL_CMD(drv)   = { "drv", "start|stop|swap|rescan|domain|res|crash <name>",
                      "driver lifecycle and placement",
                      SHELL_G_DEV, driver_cmd };
+
+/* §M71 — `drv leaktest on|off`: the resource audit's falsifier.  Hidden from
+ * `help` for the same reason `hardlock` is — reachable for the harness, not
+ * advertised to somebody reading the command list. */
+static void dv_leaktest(const char* a) {
+    drv_res_leaktest(!(a[0] == 'o' && a[1] == 'f'));
+}
+SHELL_CMD(leaktest) = { "leaktest", "on|off", 0, SHELL_G_TEST, dv_leaktest };

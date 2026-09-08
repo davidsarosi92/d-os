@@ -60,6 +60,10 @@ int ktimer_cancel(struct ktimer* t) {
     return was;
 }
 
+/* §M71 — the read-only form.  No lock: a single aligned int, and a caller that
+ * races an arm/cancel gets one of two answers that were both true. */
+int ktimer_armed(const struct ktimer* t) { return t && t->armed; }
+
 void ktimer_expire(void) {
     uint64_t now = timer_now_ns();
 

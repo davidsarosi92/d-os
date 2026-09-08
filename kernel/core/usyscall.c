@@ -40,6 +40,8 @@
 #include "timerfd.h"       /* §M53 stage 3 — timer descriptors */
 #include "epoll.h"          /* §M56 — readiness sets            */
 #include "vmm.h"
+#include "printf.h"
+#include "audit.h"     /* §M71 — the boundary audit registers here */
 #include "uaccess.h"   /* §1.1 — fault-safe user copies (exception table) */
 #include "pmm.h"
 #include "console.h"
@@ -1932,4 +1934,139 @@ long sys_recvfrom(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out) 
         if (port_out && copy_to_user((uintptr_t)port_out, &kport, sizeof kport) != 0) return -1;
     }
     return r;
+}
+
+
+/* §M71 — one task's share of violation D (see au_boundary). */
+struct au_leak_ctx { int bad; int verbose; };
+
+static void au_gate_leak_cb(const struct task* t, int is_current, void* ctx) {
+    struct au_leak_ctx* c = (struct au_leak_ctx*)ctx;
+    (void)is_current;
+    /* THE CURRENT TASK IS CHECKED TOO, and the first version of this skipped
+     * it — reasoning that probe C above arms the gate on ourselves.  It does,
+     * and it RESTORES it before this runs, so the exclusion protected nothing
+     * and cost everything: `audit` is typed FROM a shell, so the shell is the
+     * current task, so the one task a leaked flag could be observed on was the
+     * one being skipped.  The falsifier reported a clean pass against a
+     * deliberately broken machine, which is §M57's "a test that cannot fail is
+     * not evidence" reached by a different route. */
+    if (!t) return;
+    if (t->in_user_syscall && !t->user_task) {
+        kprintf("!! audit boundary: kernel task '%s' (pid %d) carries the ring-3 "
+                "pointer gate — a dispatcher did not restore it\n",
+                t->name ? t->name : "?", t->pid);
+        c->bad++;
+    }
+}
+
+/* =============================================================================
+ * §M71 — THE RING-3 POINTER BOUNDARY AUDIT.
+ *
+ * THE INVARIANT: the boundary §M46 built is actually in place, and no task is
+ * carrying the gate flag that should not be.
+ *
+ * §M47.2 IS WHY THIS EXISTS, and it is the sharpest example in the tree of a
+ * defect that reading cannot find: `linux_syscall_dispatch` never set
+ * `task->in_user_syscall` on EITHER x86 arch, so §M46's first boundary layer
+ * was OFF for every musl program — coreutils, sh, TLS, NetSurf, Wayland.
+ * **Nothing failed visibly**, which is exactly why it survived two milestones.
+ * A boundary that is declared, documented, tested by a self-test that happens
+ * to take the other path, and simply never armed, is indistinguishable from a
+ * working one until somebody attacks it.
+ *
+ * WHAT CAN AND CANNOT BE CHECKED FROM HERE, stated plainly because a pass must
+ * not be read as more than it is.  Whether every syscall ENTRY PATH arms the
+ * gate is a property of six dispatchers, and an audit running on some other
+ * task cannot observe it — `faulttest` is what exercises that, per personality.
+ * What IS checkable is everything that can silently REGRESS underneath it:
+ * whether the fixup table survived the link, whether the predicate still
+ * refuses a kernel address, and whether the flag is being leaked.
+ *
+ * HOW TO MAKE IT FAIL: `boundarytest` below arms the gate on this task and
+ * leaves it armed, which is precisely the leak violation D describes.
+ * =========================================================================== */
+
+static int au_boundary(int verbose) {
+    int bad = 0;
+
+    /* A — THE EXCEPTION TABLE SURVIVED THE LINK.  §M46's second layer is a
+     * `.ex_table` section built entirely out of entries nothing REFERENCES by
+     * name, so it exists only because the linker script says KEEP().  Lose
+     * that and every fault during a copy_from_user panics the kernel instead
+     * of returning -EFAULT — the failure §M46 exists to prevent, reintroduced
+     * by a link-script edit that no compiler would flag. */
+    long fixups = __stop_ex_table - __start_ex_table;
+    if (fixups <= 0) {
+        kprintf("!! audit boundary: the uaccess exception table is EMPTY — a "
+                "fault inside a user copy will panic instead of returning -EFAULT\n");
+        bad++;
+    } else if (verbose) {
+        kprintf("       exception table: %d fixup(s)\n", (int)fixups);
+    }
+
+    /* B — THE PREDICATE STILL REFUSES A KERNEL ADDRESS.  Probed rather than
+     * assumed: audit.h rule 2 says report what was observed.  Its own address
+     * is used as the kernel pointer, so the test needs nothing set up and
+     * cannot be defeated by a layout change. */
+    uintptr_t kaddr = (uintptr_t)&au_boundary;
+    if (vmm_user_access_ok(kaddr, 4, 0)) {
+        kprintf("!! audit boundary: vmm_user_access_ok ACCEPTED a kernel address "
+                "(%x) — the ring-3 pointer gate would pass kernel memory\n",
+                (unsigned)kaddr);
+        bad++;
+    } else if (verbose) {
+        kprintf("       gate refuses a kernel address: yes\n");
+    }
+
+    /* C — AND SO DOES THE COPY ITSELF.  Separate from B because they can
+     * diverge: the predicate is one function and `copy_from_user` is the path
+     * every syscall actually takes.  §M46's own lesson — *a validity CHECK is
+     * not a guarantee* — cuts both ways, so the wrapper is exercised too. */
+    struct task* me = task_current();
+    int prev = me ? me->in_user_syscall : 0;
+    if (me) me->in_user_syscall = 1;        /* pretend we came from ring 3 */
+    char sink[4];
+    int rc = copy_from_user(sink, kaddr, sizeof sink);
+    if (me) me->in_user_syscall = prev;
+    if (rc == 0) {
+        kprintf("!! audit boundary: copy_from_user SUCCEEDED from a kernel "
+                "address while the gate was armed\n");
+        bad++;
+    } else if (verbose) {
+        kprintf("       copy_from_user refuses a kernel address: yes\n");
+    }
+
+    /* D — NOBODY IS CARRYING THE FLAG WHO SHOULD NOT BE.  Every dispatcher
+     * saves the previous value and restores it on the way out; a KERNEL task
+     * left with the gate armed means one of those restores did not happen, and
+     * the consequence is not a security hole but its mirror image — every
+     * in-kernel caller of a shared `sys_*` starts failing, which is what broke
+     * fdtest/socktest/polltest and, through ld.so's fstat of each shared
+     * object, NetSurf. */
+    struct au_leak_ctx lc = { 0, verbose };
+    task_for_each(au_gate_leak_cb, &lc);
+    bad += lc.bad;
+
+    return bad ? bad : AUDIT_OK;
+}
+
+AUDIT(boundary) = {
+    "ring3-boundary",
+    "the uaccess fixup table is linked in, the pointer gate refuses kernel "
+    "addresses, and no kernel task is carrying the gate flag",
+    au_boundary
+};
+
+/* §M71 — the falsifier for violation D.  Arms the gate on this task and leaves
+ * it armed, which is exactly the leaked-flag state.  `boundarytest off` clears
+ * it again; leaving it set makes every in-kernel `sys_*` call on this shell
+ * start failing, which is itself worth seeing once. */
+void usyscall_boundary_test(int on) {
+    struct task* me = task_current();
+    if (!me) return;
+    me->in_user_syscall = on ? 1 : 0;
+    kprintf("boundarytest: gate %s on '%s' — `audit ring3-boundary` must %s\n",
+            on ? "LEFT ARMED" : "cleared", me->name ? me->name : "?",
+            on ? "fail" : "pass");
 }

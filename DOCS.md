@@ -11749,7 +11749,148 @@ the tree, not a move, and it wants its own falsifying test first.
 
 ---
 
+### 4.87 §M71 — runtime invariant audits, and the bug the first one found
+
+Asked for directly: *"is there something that finds bugs — something started in
+ring 0 during a run when it should have been in ring 3, memory leaks, security
+holes?"*  The answer begins with why READING cannot do it, and this tree has the
+receipts: §M52's `syscall_entry.s` documented its own limitation truthfully and
+the premise moved out from under it across two green milestones; §M47.2's
+ring-3 pointer gate was never armed for the Linux ABI and *nothing failed
+visibly*, so it survived two more; §4.83's leaked grant stayed invisible because
+*the driver had failed, so nobody looked at what it was still holding.*  None of
+the three was found by inspection — inspection is how they were introduced.
+
+**`AUDIT()` is a linker-section registry like every other extension point here.**
+An invariant ships next to the code that must maintain it; `audit.c` names none
+of them.  Four rules, in audit.h: it must be able to FAIL; it reports what it
+OBSERVED rather than what it believes; it distinguishes "cannot check" from
+"checked, clean"; and it does not FIX anything, because a check that repairs
+what it finds destroys the evidence and turns a reproducible defect into an
+intermittent one.
+
+| check | invariant | falsifier |
+|---|---|---|
+| `driver-placement` | every driver executes in the domain it was placed in, and reports the isolation the hardware actually gives it | `drv domain <n> kernel` while its ring-3 process is alive |
+| `driver-resources` | every hardware grant is held by a driver that is actually running | `leaktest on` |
+| `ring3-boundary` | the uaccess fixup table is linked in, the gate refuses kernel addresses, and no kernel task carries the gate flag | `boundarytest on` |
+
+**WHY IT RUNS FROM CRON AND NOT ONLY FROM A PROMPT.**  §4.74: the harness cannot
+type once a GUI window holds focus, so the runs most worth auditing — the ones
+that opened a window, placed a driver, crashed something — are exactly the runs
+in which `audit` is unreachable.  *Reaching the state to be checked destroys the
+means of checking it*, the same wall `gui.stats_ms` was built to get around.
+`audit.interval_s` (default 0) turns every second of a run into a check;
+measured with a deliberate leak, **8 violations reported over 8 seconds with
+nobody typing**, and **0 lines on a healthy machine**.  `dos-shell-test.py`
+treats `!! AUDIT FAIL` exactly as it treats a fault (§4.85.8): the run fails
+whatever else it found.
+
+#### 4.87.1 What the audits established about the system, including two non-findings
+
+Two violations turned out to be UNREACHABLE by ordinary means, and that is a
+result about the system rather than a gap in the check.  Killing a placed
+driver's process does not leave it "placed but in-kernel", because the
+supervisor quarantines it, which clears INITED; and `drv crash` does not leave
+grants behind, because the quarantine releases them.  **The audit reported
+`SKIP — nothing to check` rather than `ok` in the second case**, which is rule 3
+doing precisely its job: a check that never ran must not read as evidence.
+
+Because of that, the falsifiers are SHIPPED — `leaktest` and `boundarytest`,
+hidden from `help` exactly as `hardlock` and `drv crash` are.  They inject a
+REAL bad row into the REAL table, so they exercise the detection path; a
+synthetic "pretend you found something" would prove only that kprintf works.
+
+#### 4.87.2 THE BUG: a ring-3 excursion left the pointer gate armed forever
+
+`audit ring3-boundary` failed on its first run on aarch64, on a BARE BOOT:
+
+    !! audit boundary: kernel task 'kernel' (pid 0) carries the ring-3 pointer
+       gate — a dispatcher did not restore it
+
+**A ring-3 excursion leaves through the SYS_EXIT TELEPORT, which jumps straight
+back to the saved kernel context and therefore never unwinds the syscall
+dispatcher** — so `me->in_user_syscall = prev` does not run and the hosting
+task keeps the gate armed.  Every later in-kernel `sys_*` call on that task then
+has its KERNEL buffers validated as USER pointers and refused: the exact failure
+§M46 recorded, which "broke fdtest/socktest/polltest and, through ld.so's fstat
+of each shared object, NetSurf."
+
+**`proc_exec_elf` HAD THE FIX, INLINE AND CORRECTLY DESCRIBED.  The other two
+excursion paths never got it** — x86's `arch_ringtest` and aarch64's
+`aarch64_usertest`.  §M52's shape once more: a hazard understood, written down,
+fixed in one place, and its twins left alone.  On ARM the untouched one is
+called from `main_entry`, so **pid 0 carried the gate from boot on every ARM
+machine.**
+
+*The diagnosis was a falsifiable prediction rather than an inference.*  If the
+teleport is the cause then the arch is irrelevant and only the boot path
+differs, so `ringtest` on i386 must reproduce it — and it did, on the first try:
+`ok` before, `kernel task 'shell' (pid 19) carries the ring-3 pointer gate`
+after.  That is what promoted "ARM is odd" to "one bug, three call sites".
+
+The fix is ONE ROUTE (`user_excursion_end()`, proc.h) rather than a third copy
+of the line, so a fourth excursion path inherits it by calling one function
+instead of by somebody remembering.  **Verified: i386 clean after `ringtest`,
+aarch64 clean at boot AND after a fresh `usertest`, x86_64 3/3 clean.**
+
+#### Open at the close of §M71
+
+The audits cover placement, hardware grants and the pointer boundary.  They do
+NOT cover frames or heap blocks with no owner recorded anywhere (the allocator
+has no in-band tagging on purpose, and adding an owner to every allocation would
+put a write on the hot path to catch a class this system has not suffered), nor
+IOMMU domains belonging to drivers that are gone — §4.83's third bug, which
+wants an enumeration `iommu.h` does not offer today.  Both absences are stated
+in the checks themselves so a pass is not read as more than it is.
+
+---
+
 ## 8. Change log
+
+- **2026-09-08 — §M71: RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
+  (DOCS §4.87, all 3 arches).**  Asked for directly — *"something that finds a
+  thing started in ring 0 that should have been ring 3, memory leaks, security
+  holes"* — and the answer starts with why reading cannot: §M52's note outlived
+  its premise across two green milestones, §M47.2's pointer gate was never armed
+  for the Linux ABI and nothing failed visibly, §4.83's leaked grant was
+  invisible because *the driver had failed, so nobody looked at what it was
+  still holding.*  **`AUDIT()` is the house registry shape**, with four rules in
+  audit.h: a check must be able to FAIL, must report what it OBSERVED, must
+  distinguish "cannot check" from "checked clean", and must not FIX anything —
+  repairing destroys the evidence and turns a reproducible defect into an
+  intermittent one.  Three checks: `driver-placement`, `driver-resources`,
+  `ring3-boundary`.  **IT RUNS FROM CRON, NOT ONLY FROM A PROMPT**, because
+  §4.74 says the harness cannot type once a GUI window holds focus — so the runs
+  most worth auditing are the ones where `audit` is unreachable.  Measured with
+  a deliberate leak: **8 violations over 8 seconds with nobody typing, and 0
+  lines on a healthy machine.**  `dos-shell-test.py` fails a run on
+  `!! AUDIT FAIL` exactly as it does on a fault.  **TWO VIOLATIONS TURNED OUT
+  UNREACHABLE BY ORDINARY MEANS, which is a result about the system:** the
+  supervisor's quarantine clears INITED and releases grants, so neither a killed
+  placement nor `drv crash` can leave the bad state — **and the audit said
+  `SKIP — nothing to check` rather than `ok`**, rule 3 doing its job.  Hence the
+  falsifiers are SHIPPED (`leaktest`, `boundarytest`, hidden from `help` like
+  `hardlock`), injecting a REAL bad row so they exercise DETECTION and not
+  merely reporting.  **THE BUG: `audit ring3-boundary` failed on aarch64 on a
+  BARE BOOT — `kernel task 'kernel' (pid 0) carries the ring-3 pointer gate`.**
+  A ring-3 excursion leaves through the SYS_EXIT TELEPORT, which never unwinds
+  the dispatcher, so `in_user_syscall = prev` does not run and the hosting task
+  keeps the gate forever; every later in-kernel `sys_*` on it then has KERNEL
+  buffers refused as user pointers — §M46's recorded failure.  **`proc_exec_elf`
+  HAD the fix inline and correctly described; `arch_ringtest` and
+  `aarch64_usertest` never got it**, and on ARM the latter runs from
+  `main_entry`, so pid 0 carried it from boot on every ARM machine.  *Diagnosed
+  by a falsifiable prediction rather than an inference:* if the teleport is the
+  cause the arch is irrelevant, so `ringtest` on i386 must reproduce it — and
+  did, first try.  Fixed as ONE ROUTE (`user_excursion_end()`), so a fourth
+  excursion path inherits it instead of needing to remember.  **Verified: i386
+  clean after `ringtest`, aarch64 clean at boot and after `usertest`, x86_64 3/3
+  clean, all arches build silent.**  **OPEN:** no owner tracking for frames or
+  heap blocks (deliberate — the allocator has no in-band tagging and adding one
+  would cost the hot path for a class this system has not suffered), and no
+  check for IOMMU domains of drivers that are gone (§4.83's third bug; wants an
+  enumeration iommu.h does not offer).
 
 - **2026-09-08 — §M70 SECOND HALF: THE COMPOSITOR SPLIT, WITH THE MEASUREMENT
   THAT HAD TO JUSTIFY IT (DOCS §4.86.4, all 3 arches).**  The first pass stopped

@@ -26,6 +26,8 @@
 #include "iommu.h"    /* §M33 — a driver's buffers become its domain */
 #include "pci.h"
 #include "task.h"
+#include "audit.h"
+#include "driver.h"
 #include <stddef.h>
 
 #if defined(__i386__) || defined(__x86_64__)
@@ -39,6 +41,12 @@ void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
 void gic_enable_irq(uint32_t intid);
 void mmu_map_device_1gib(uint64_t va);
 #endif
+
+/* §M71 — the audit matches owners BY NAME (see au_resources for why). */
+static int streq_res(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
 
 enum res_kind { RES_PORTS = 1, RES_MMIO, RES_IRQ, RES_DMA };
 
@@ -759,4 +767,154 @@ void drv_res_dump(void) {
         }
     }
     if (!n) kprintf("no driver resources held\n");
+}
+
+/* =============================================================================
+ * §M71 — THE RESOURCE-LEAK AUDIT.
+ *
+ * THE INVARIANT: every grant in this table is held by a driver that is
+ * actually running.
+ *
+ * This is §4.83's second bug, stated as a rule.  `edu` showed a KERNEL `mmio`
+ * grant while running in ring 3 — left behind by a boot-time init that failed
+ * at the DMA step and returned without releasing.  It stayed invisible for the
+ * usual reason: *the driver had failed, so nobody looked at what it was still
+ * holding.*  The same milestone found two more of the shape (one driver under
+ * two names, and a restart loop widening an IOMMU boundary one grant at a
+ * time), and all three were found by BUILDING A JOINED-UP VIEW rather than by
+ * reading — a fact true in one place and absent from another stays invisible
+ * while nothing compares them.
+ *
+ * WHY THIS IS THE MEMORY-LEAK CHECK AND A MALLOC TRACER IS NOT.  The
+ * allocator deliberately has no in-band tagging (kmalloc.c says so), and
+ * adding an owner to every allocation would put a write on the hot path to
+ * catch a class of bug this system has not actually suffered.  What it HAS
+ * suffered is leaked RESOURCES — port ranges, IRQ lines, MMIO windows, DMA
+ * buffers — and those already have owners.  *Audit the ownership that exists
+ * rather than inventing ownership that does not.*
+ *
+ * WHAT IT DELIBERATELY DOES NOT COVER, said plainly so nobody reads a pass as
+ * more than it is: frames and heap blocks with no owner recorded anywhere, and
+ * IOMMU domains belonging to drivers that are gone (§4.83's third bug).  The
+ * second wants an enumeration `iommu.h` does not offer today.
+ *
+ * HOW TO MAKE IT FAIL: `drv crash <name>` faults a driver inside a guarded
+ * call.  With `driver.restart_max = 0` it is quarantined rather than restarted,
+ * and anything its bring-up took before the fault is still in this table.
+ * =========================================================================== */
+
+static int au_resources(int verbose) {
+    int bad = 0, held = 0;
+
+    for (int i = 0; i < DRVRT_MAX_RES; i++) {
+        struct drv_res* r = &g_res[i];
+        if (!r->used) continue;
+        held++;
+
+        const char* owner = r->owner ? r->owner : "?";
+        static const char* kind_name[] = { "?", "ports", "mmio", "irq", "dma" };
+        const char* kind = (r->kind >= 1 && r->kind <= 4) ? kind_name[r->kind] : "?";
+
+        /* Find the owning driver.  Matching BY NAME and not by pointer is
+         * deliberate: §4.83's first bug was ONE DRIVER UNDER TWO NAMES
+         * (`drv_rt_init(&rt, "ps2-mouse")` against a registry saying
+         * `ps2_mouse`), so it held its resources under a different owner than
+         * everything keyed on the owner could see.  A pointer comparison would
+         * have matched and hidden exactly that. */
+        struct driver* d = NULL;
+        for (int j = 0; j < driver_count_all(); j++) {
+            struct driver* c = driver_at(j);
+            if (c && c->name && r->owner && streq_res(c->name, r->owner)) { d = c; break; }
+        }
+
+        /* A — A GRANT WHOSE OWNER IS NOT A DRIVER AT ALL.  Either a stale
+         * `owner` pointer, or the two-names bug: something holds hardware and
+         * nothing in the registry answers for it. */
+        if (!d) {
+            kprintf("!! audit resources: %s grant held by '%s', which is not a "
+                    "registered driver — orphaned or registered under another name\n",
+                    kind, owner);
+            bad++;
+            continue;
+        }
+
+        /* B — HELD BY A DRIVER THAT IS NOT RUNNING.  §4.83's bug verbatim: a
+         * failed or stopped driver that kept what it took.  Note this catches
+         * a QUARANTINED driver too, which is the point — a driver removed for
+         * misbehaving is exactly the one whose holdings nobody checks. */
+        uint8_t st = driver_state(d);
+        if (!(st & DRV_S_INITED)) {
+            kprintf("!! audit resources: '%s' holds a %s grant (%s) while NOT "
+                    "running%s\n", owner, kind, r->why ? r->why : "?",
+                    (st & DRV_S_QUARANTINE) ? " (quarantined)" :
+                    (st & DRV_S_ADMIN_DOWN) ? " (stopped)" : "");
+            bad++;
+            continue;
+        }
+
+        /* C — AN EXCLUSIVE PORT CLAIM PAST ITS DEADLINE.  §M33 Tier 2 bounds
+         * the claim precisely so a crashed mouse driver cannot leave the
+         * keyboard's line masked forever; a claim still standing here means
+         * the reclaiming timer did not fire, which is the failure that looks
+         * like "the keyboard stopped working". */
+        if (r->excl && !ktimer_armed(&r->excl_t)) {
+            kprintf("!! audit resources: '%s' still holds an EXCLUSIVE claim on "
+                    "ports %x..%x with no deadline armed — the reclaim cannot fire\n",
+                    owner, (unsigned)r->base, (unsigned)(r->base + r->len - 1));
+            bad++;
+            continue;
+        }
+
+        if (verbose)
+            kprintf("       %s: %s (%s)\n", owner, kind, r->why ? r->why : "?");
+    }
+
+    if (!held) return AUDIT_SKIP;       /* nothing granted yet — not "clean" */
+    return bad ? bad : AUDIT_OK;
+}
+
+AUDIT(resources) = {
+    "driver-resources",
+    "every hardware grant is held by a driver that is actually running",
+    au_resources
+};
+
+/* -----------------------------------------------------------------------------
+ * §M71 — THE FALSIFIER for the resource audit.
+ *
+ * audit.h rule 1: a check nobody has seen fail is a check nobody has tested.
+ * The two violations above turned out to be UNREACHABLE by ordinary means on a
+ * healthy machine, which is the right answer about the system and the wrong
+ * answer about the check — §M57's first `schedstorm` reported `ok` against the
+ * very kernel it was written to break, and §M62's deliberate fault succeeded
+ * silently because `*(int*)0x4 =` does not fault here, so its pass and its
+ * failure looked identical.
+ *
+ * So the injector is shipped, exactly as `hardlock`, `drv crash`, `faulttest`
+ * and `killstorm` are.  It takes a REAL grant in the REAL table under an owner
+ * no driver answers for, which exercises the detection path rather than the
+ * reporting path — a synthetic "pretend you found something" would prove only
+ * that kprintf works.
+ *
+ * The port window is deliberately one nothing decodes (0x9000), so the grant is
+ * a bookkeeping entry and not a claim on hardware somebody else needs.
+ * -------------------------------------------------------------------------- */
+
+static struct drv_rt g_leak_rt;
+static drv_handle    g_leak_h;
+
+void drv_res_leaktest(int on) {
+    if (on) {
+        if (g_leak_h) { kprintf("leaktest: already leaking\n"); return; }
+        drv_rt_init(&g_leak_rt, "ghost-driver");
+        g_leak_h = drv_ports_request(&g_leak_rt, 0x9000, 4, "deliberate leak (§M71)");
+        if (!g_leak_h) { kprintf("leaktest: could not take the grant\n"); return; }
+        kprintf("leaktest: 'ghost-driver' now holds ports 9000..9003 and is not a "
+                "registered driver — `audit driver-resources` must fail\n");
+    } else {
+        if (!g_leak_h) { kprintf("leaktest: nothing leaking\n"); return; }
+        drv_release_all(&g_leak_rt);
+        g_leak_h = 0;
+        kprintf("leaktest: released\n");
+    }
 }

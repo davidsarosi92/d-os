@@ -248,6 +248,11 @@ int aarch64_usertest(void) {
     kprintf("usertest: dropping to EL0 at %p...\n", (void*)USER_CODE_VA);
     aarch64_vmm_switch(sp);
     aarch64_enter_user(USER_CODE_VA, USER_STACK_VA + 4096);   /* returns via SYS_EXIT */
+    /* §M71 — the teleport does not unwind aarch64_syscall, so without this the
+     * hosting task keeps the ring-3 pointer gate.  This one runs from
+     * main_entry at BOOT, so pid 0 carried it on every ARM machine until
+     * `audit ring3-boundary` reported it.  See proc.h. */
+    user_excursion_end();
     aarch64_vmm_kernel_switch();
     kprintf("usertest: back at EL1 (SYS_EXIT teleport OK)\n");
     return 0;

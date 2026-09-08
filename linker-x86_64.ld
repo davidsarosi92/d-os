@@ -161,6 +161,15 @@ SECTIONS
         __stop_shell_cmds = .;
     }
 
+    /* §M71 — runtime invariant checks: AUDIT() entries.  An invariant ships
+       next to the code that must maintain it; audit.c names none of them. */
+    .audits : ALIGN(8)
+    {
+        __start_audits = .;
+        KEEP(*(audits))
+        __stop_audits = .;
+    }
+
     /* Which PCI IDs a driver claims (hwdev.h) — declared NEXT TO THE DRIVER so
        the device manager never accumulates knowledge of the whole tree. */
     .driver_matches : ALIGN(8)

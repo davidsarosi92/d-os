@@ -317,11 +317,10 @@ static int proc_exec_common(const void* image, size_t len,
 
     enter_user_mode_wrap(lp.entry, user_sp);
 
-    /* §1.1 — the excursion left ring 3 through the SYS_EXIT teleport, which does
-     * NOT unwind the dispatcher, so clear the "arguments are user pointers" flag
-     * by hand.  Otherwise this kernel task would keep it set and every later
-     * in-kernel sys_* call (the shell's own self-tests) would be gated. */
-    if (me) me->in_user_syscall = 0;
+    /* §1.1/§M71 — the excursion left ring 3 through the SYS_EXIT teleport, which
+     * does NOT unwind the dispatcher.  One route now (proc.h), because the two
+     * other excursion paths never got this line. */
+    user_excursion_end();
 
     fd_close_all();                    /* reclaim any fds the program opened */
     vmm_space_switch(prev);
@@ -564,4 +563,10 @@ int proc_spawn_argv(const char* name, const void* image, size_t len,
 
 int proc_spawn(const char* name, const void* image, size_t len) {
     return proc_spawn_argv_under(name, image, len, 0, NULL, 0, -1);
+}
+
+/* §M71 — see proc.h for why this exists and what it costs when it is missed. */
+void user_excursion_end(void) {
+    struct task* me = task_current();
+    if (me) me->in_user_syscall = 0;
 }

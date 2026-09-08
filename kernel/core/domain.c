@@ -8,7 +8,10 @@
 
 #include "domain.h"
 #include "printf.h"
-#include "iommu.h"    /* §M33 stage 5 — the REASON, never the verdict */
+#include "iommu.h"
+#include "audit.h"
+#include "driver.h"
+#include "drvuser.h"    /* §M33 stage 5 — the REASON, never the verdict */
 #include <stddef.h>
 
 static int d_streq(const char* a, const char* b) {
@@ -201,3 +204,139 @@ const char* domain_isolation_name(enum domain_isolation i) {
     default:            return "none";
     }
 }
+
+/* =============================================================================
+ * §M71 — THE PLACEMENT AUDIT.
+ *
+ * THE INVARIANT: every driver is EXECUTING in the domain it was PLACED in.
+ *
+ * That sounds tautological and is not, because the two facts live in different
+ * places and are established at different times.  `driver_domain()` says what
+ * config asked for and this machine agreed to; `drvuser_pid()` says whether a
+ * ring-3 process actually exists.  Nothing has ever compared them.
+ *
+ * THIS BUG CLASS HAS ALREADY BITTEN, TWICE, IN THE MILESTONE THAT INTRODUCED
+ * PLACEMENT:
+ *
+ *   - `drv stop` ran the IN-KERNEL shutdown hook for a driver running in
+ *     ring 3.  §M33's own note: *a placement is only a placement if EVERY
+ *     lifecycle edge honours it, and the test is the LIVE PROCESS, not the
+ *     configured domain.*
+ *   - `drv start` and the rescan job could place ONE driver TWICE, after which
+ *     it quarantined itself fighting itself for the 8042.
+ *
+ * Both were found by reading a serial log after something visibly broke.  This
+ * finds them by asking, on demand, before anything breaks.
+ *
+ * WHY THE CHECK IS WORTH MORE THAN ITS SIZE: the failure it catches is the one
+ * §M33 refuses by name.  A driver configured `domain = user` that is in fact
+ * executing in ring 0 has not merely lost isolation — it has taken away the
+ * operator's ability to find that out, because every report keeps agreeing
+ * with the intention.  That is "isolation theatre", and the whole of domain.h
+ * exists to make it impossible to reach by accident.  An audit is what makes
+ * it impossible to reach by ACCIDENT TWICE.
+ *
+ * HOW TO MAKE IT FAIL (rule 1 in audit.h — a check nobody has seen fail is a
+ * check nobody has tested): `drv domain <name> user` on a machine where the
+ * placement is enforceable, then kill the placed process with `fkill <pid>`
+ * and run `audit` before the supervisor restarts it.  Violation A fires.
+ * =========================================================================== */
+
+static int au_placement(int verbose) {
+    int n = driver_count_all();
+    if (n <= 0) return AUDIT_SKIP;
+
+    int bad = 0, looked = 0;
+    for (int i = 0; i < n; i++) {
+        struct driver* d = driver_at(i);
+        if (!d || !d->name) continue;
+
+        uint8_t st = driver_state(d);
+        /* A driver that never came up has no domain to be in.  Skipping it is
+         * not leniency: `drv start` is what puts it in one, and auditing a
+         * driver that is deliberately stopped would report the operator's own
+         * decision as a fault (§M66's ADMIN_DOWN vs QUARANTINE distinction). */
+        if (!(st & DRV_S_INITED)) continue;
+
+        uint32_t placed = driver_domain(d);     /* what config asked and we agreed to */
+        int      pid    = drvuser_pid(d->name); /* what is actually executing         */
+        looked++;
+
+        /* A — PLACED OUT OF THE KERNEL, RUNNING IN IT.  The isolation-theatre
+         * case, and the one that must never be silent. */
+        if ((placed & (DOMAIN_USER | DOMAIN_ISOLATED)) && pid <= 0) {
+            kprintf("!! audit placement: '%s' is placed '%s' but has NO ring-3 "
+                    "process — it is executing in the kernel\n",
+                    d->name, domain_name(placed));
+            bad++;
+            continue;
+        }
+
+        /* B — PLACED IN THE KERNEL, A RING-3 PROCESS STILL ALIVE.  The reverse,
+         * and it is not harmless: that process still holds the grants its
+         * bring-up took, so the device now has two drivers. */
+        if (placed == DOMAIN_KERNEL && pid > 0) {
+            kprintf("!! audit placement: '%s' is placed 'kernel' but ring-3 pid "
+                    "%d is still alive — two drivers for one device\n",
+                    d->name, pid);
+            bad++;
+            continue;
+        }
+
+        /* C — RUNNING IN A DOMAIN THE CODE NEVER DECLARED.  `driver_domain()`
+         * already refuses to widen `.domains`, so reaching this means that
+         * guard did not hold — which is worth knowing precisely BECAUSE it
+         * should be impossible.  §M52's lesson: the checks that matter most
+         * are the ones protecting an assumption nothing re-tests. */
+        uint32_t declared = d->domains ? d->domains : DOMAIN_KERNEL;
+        if (!(declared & placed)) {
+            char set[48];
+            domain_set_str(declared, set, sizeof set);
+            kprintf("!! audit placement: '%s' runs '%s' but declares only '%s' "
+                    "— config widened a capability\n",
+                    d->name, domain_name(placed), set);
+            bad++;
+            continue;
+        }
+
+        /* D — CLAIMS FULL ISOLATION WITHOUT THE HARDWARE BACKING IT.  Not the
+         * same as C: here the placement is legal and the REPORT is wrong.
+         * §M33 stage 5's rule is that finding an IOMMU must not improve the
+         * verdict, so the verdict and the device's actual confinement have to
+         * be able to disagree — and when they do, the report is the fault. */
+        if (pid > 0) {
+            int confined = drvuser_confined(d->name);
+            int dma      = (d->flags & DRVF_DMA) ? 1 : 0;
+            enum domain_isolation say = domain_isolation_of(placed, dma, confined);
+            if (say == ISOL_FULL && dma && !confined) {
+                kprintf("!! audit placement: '%s' reports isolation 'full' while "
+                        "its device is NOT confined by an IOMMU\n", d->name);
+                bad++;
+                continue;
+            }
+        }
+
+        if (verbose) {
+            int dma = (d->flags & DRVF_DMA) ? 1 : 0;
+            kprintf("       %s: %s", d->name, domain_name(placed));
+            if (pid > 0) kprintf(" pid %d", pid);
+            kprintf(", isolation %s%s\n",
+                    domain_isolation_name(
+                        domain_isolation_of(placed, dma,
+                                            pid > 0 ? drvuser_confined(d->name) : 0)),
+                    dma ? ", DMA" : "");
+        }
+    }
+
+    /* NOTHING RUNNING IS NOT THE SAME AS NOTHING WRONG.  Rule 3: an audit with
+     * no rows to look at must say so rather than report a pass. */
+    if (!looked) return AUDIT_SKIP;
+    return bad ? bad : AUDIT_OK;
+}
+
+AUDIT(placement) = {
+    "driver-placement",
+    "every driver executes in the domain it was placed in, and reports the "
+    "isolation the hardware actually gives it",
+    au_placement
+};

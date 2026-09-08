@@ -87,4 +87,26 @@ struct user_regs;
 int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
                       uintptr_t tls, int* ctid_kaddr);
 
+/* §M71 — THE END OF A RING-3 EXCURSION.
+ *
+ * A ring-3 excursion leaves through the SYS_EXIT TELEPORT, which jumps straight
+ * back to the saved kernel context and therefore does NOT unwind the syscall
+ * dispatcher — so the dispatcher's `me->in_user_syscall = prev` never runs and
+ * the hosting kernel task keeps the ring-3 pointer gate armed FOREVER.  After
+ * that, every in-kernel `sys_*` call on that task has its KERNEL buffers
+ * validated as USER pointers and refused: the failure that broke
+ * fdtest/socktest/polltest and, through ld.so's fstat of each shared object,
+ * NetSurf.
+ *
+ * `proc_exec_elf` had this fix inline and CORRECTLY DESCRIBED, and the other
+ * two excursion paths — x86's `arch_ringtest` and aarch64's `aarch64_usertest`
+ * — never got it.  On ARM that one is called from `main_entry`, so pid 0
+ * carried the gate from boot on every ARM machine.  Found by `audit
+ * ring3-boundary` (§M71) on its first run on that arch; §M52's shape exactly,
+ * a hazard fixed in one place while its twins were left.
+ *
+ * It is a FUNCTION and not a repeated line so a fourth excursion path inherits
+ * it by calling one thing rather than by somebody remembering. */
+void user_excursion_end(void);
+
 #endif

@@ -17,7 +17,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE  "M70"                 /* highest completed number: §M70 the shell registry + the gui.c split */
+#define DOS_MILESTONE  "M71"                 /* highest completed number: §M71 runtime invariant audits */
 
 /* An OLDER section completed after that number shipped.  Empty ("") when there
  * is nothing to say — and it must be CLEARED when the next numbered milestone

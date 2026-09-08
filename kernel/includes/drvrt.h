@@ -322,4 +322,9 @@ void drv_res_dump(void);
  * own layout. */
 void drv_res_summary(const char* owner, char* out, int cap);
 
+/* §M71 — the resource audit's FALSIFIER.  Takes a real grant under an owner no
+ * driver answers for, so `audit driver-resources` has something to find.  See
+ * its definition for why an injector is shipped rather than a synthetic test. */
+void drv_res_leaktest(int on);
+
 #endif /* DRVRT_H */

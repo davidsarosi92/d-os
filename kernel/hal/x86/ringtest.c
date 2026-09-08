@@ -16,6 +16,7 @@
 #include "vmm.h"
 #include "console.h"
 #include "usermode.h"
+#include "proc.h"
 #include "syscall.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -94,6 +95,9 @@ int arch_ringtest(void) {
     /* Drop to ring 3.  Stack top is 0x40002000 (top of stack frame). */
     console_write("ringtest: dropping to ring 3...\n");
     enter_user_mode_wrap(0x40000000u, 0x40002000u);
+    /* §M71 — the SYS_EXIT teleport does not unwind the dispatcher, so the gate
+     * would stay armed on whatever task ran `ringtest`.  See proc.h. */
+    user_excursion_end();
     console_write("ringtest: back in ring 0\n");
 
     /* Cleanup. */

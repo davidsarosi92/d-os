@@ -870,3 +870,12 @@ SHELL_CMD(alarmtest)   = { "alarmtest",   "[ms]", "setitimer + SIGALRM delivery"
                            SHELL_G_TEST, cmd_alarmtest };
 SHELL_CMD(epolltest)   = { "epolltest",   "", "readiness sets, and the scan cost measured",
                            SHELL_G_TEST, sy_epolltest };
+
+/* §M71 — `boundarytest on|off`: the falsifier for the ring-3 boundary audit's
+ * leaked-flag violation.  Hidden from `help`, like `hardlock` and `leaktest`:
+ * reachable for the harness, not advertised. */
+void usyscall_boundary_test(int on);
+static void sy_boundarytest(const char* a) {
+    usyscall_boundary_test(!(a[0] == 'o' && a[1] == 'f'));
+}
+SHELL_CMD(boundarytest) = { "boundarytest", "on|off", 0, SHELL_G_TEST, sy_boundarytest };
