@@ -99,6 +99,72 @@ int blk_register(struct block_device* dev) {
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * §M75 — the request path, and the counters that live on it.
+ *
+ * See block.h for why these exist at all.  Two implementation notes:
+ *
+ * NOT LOCKED, AND THAT IS THE RIGHT TRADE.  These are diagnostic totals read
+ * once a second by a chart.  A lock on the request path to make a statistic
+ * exact would cost every I/O in the system to protect a number nobody makes a
+ * decision on; a relaxed atomic add is enough that two CPUs cannot lose each
+ * other's increment, and the read is a torn-free 64-bit load on every arch
+ * here.  *A counter that slows the thing it counts is measuring the wrong
+ * system.*
+ *
+ * COUNTED ON COMPLETION, NOT ON SUBMISSION, and errors counted separately: a
+ * device that fails every request would otherwise look busy rather than
+ * broken, which is the reading a chart makes most likely.
+ * ------------------------------------------------------------------------- */
+static struct blk_stats g_stats;
+
+static inline void stat_add(uint64_t* p, uint64_t v) {
+    __atomic_add_fetch(p, v, __ATOMIC_RELAXED);
+}
+
+int blk_read(struct block_device* dev, uint64_t lba, uint32_t count, void* buf) {
+    if (!dev || !dev->read) return -1;
+    int rc = dev->read(dev, lba, count, buf);
+    stat_add(&g_stats.reads, 1);
+    stat_add(&g_stats.sectors_read, count);
+    if (rc != 0) stat_add(&g_stats.errors, 1);
+    return rc;
+}
+
+int blk_write(struct block_device* dev, uint64_t lba, uint32_t count, const void* buf) {
+    if (!dev || !dev->write) return -1;
+    int rc = dev->write(dev, lba, count, buf);
+    stat_add(&g_stats.writes, 1);
+    stat_add(&g_stats.sectors_written, count);
+    if (rc != 0) stat_add(&g_stats.errors, 1);
+    return rc;
+}
+
+/* A device with no flush op is not an error — it is a device that does not
+ * cache writes, so the flush has already happened.  Returning 0 keeps every
+ * caller from having to know which kind it has. */
+int blk_flush(struct block_device* dev) {
+    if (!dev || !dev->flush) return 0;
+    int rc = dev->flush(dev);
+    stat_add(&g_stats.flushes, 1);
+    if (rc != 0) stat_add(&g_stats.errors, 1);
+    return rc;
+}
+
+void blk_get_stats(struct blk_stats* out) {
+    if (!out) return;
+    /* Field by field, relaxed: this is a snapshot of six independently moving
+     * counters and there is no moment at which all six are consistent.  Saying
+     * so here is cheaper than pretending otherwise with a lock that would
+     * still be stale by the time the caller drew the chart. */
+    out->reads           = __atomic_load_n(&g_stats.reads,           __ATOMIC_RELAXED);
+    out->writes          = __atomic_load_n(&g_stats.writes,          __ATOMIC_RELAXED);
+    out->flushes         = __atomic_load_n(&g_stats.flushes,         __ATOMIC_RELAXED);
+    out->sectors_read    = __atomic_load_n(&g_stats.sectors_read,    __ATOMIC_RELAXED);
+    out->sectors_written = __atomic_load_n(&g_stats.sectors_written, __ATOMIC_RELAXED);
+    out->errors          = __atomic_load_n(&g_stats.errors,          __ATOMIC_RELAXED);
+}
+
 struct block_device* blk_find(const char* name) {
     for (struct block_device* d = head; d; d = d->next) {
         if (streq(d->name, name)) return d;

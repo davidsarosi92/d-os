@@ -89,6 +89,7 @@
 #include "timer.h"          /* M22.3: per-task CPU-time accounting */
 #include "ktimer.h"         /* §M53 — deadline timers */
 #include "vmm.h"            /* M25: per-process address-space switch */
+#include "pmm.h"            /* §M75 — the machine's own used-frame figure    */
 #include "waitq.h"
 #include "crash.h"          /* §M47 — record a forced kill */
 #include "klog.h"           /* §M54 — report a corpse found in a runqueue */
@@ -1532,6 +1533,22 @@ static void sleep_timer_fired(struct ktimer* t) {
     waitq_unlock(wq, fl);
 }
 
+/* §M75.2 — see task.h.  Credits the halted span to BOTH the task and this
+ * CPU, because the two are read by different consumers: `task_cpu_ms_now` for
+ * the per-process column, `percpu.halt_ms` for §M75's machine-wide series.
+ * Crediting only one would leave the table and the chart disagreeing about the
+ * same machine, which is worse than either being wrong alone. */
+void task_halt_idle(void) {
+    struct task* self = task_current();
+    uint64_t t0 = timer_now_ns();          /* NS: a hlt is shorter than a tick */
+    hal_cpu_idle();
+    uint64_t d = timer_now_ns() - t0;
+    if (!d) return;
+    if (self && !self->is_idle) self->halt_ns += d;
+    struct percpu* p = this_cpu();
+    if (p) p->halt_ns += d;
+}
+
 int task_sleep_until_ns(uint64_t deadline_ns) {
     struct task* self = task_current();
     if (!self || self->is_idle) {
@@ -2487,7 +2504,15 @@ void schedule_check(void) {
 
 void task_list(void) {
     if (!master_head) { kprintf("ps: no tasks\n"); return; }
-    kprintf("PID  PPID  STATE  CPU  CPUMS  NAME\n");
+    kprintf("PID  PPID  STATE  CPU  CPUMS  MEMKB  NAME\n");
+
+    /* §M75 — the sum is printed at the end, and it is not decoration: the
+     * invariant that keeps the memory column meaningful is that every frame is
+     * claimed by AT MOST ONE task, so the total can never exceed the machine.
+     * Printing it beside the machine's own figure makes that falsifiable from
+     * a serial log rather than by inspection. */
+    uint64_t sum_priv = 0, sum_shared = 0;
+
     uint32_t fl = spin_lock_irqsave(&master_lock);
     struct task* t = master_head;
     do {
@@ -2496,13 +2521,29 @@ void task_list(void) {
         for (int i = 0; i < n; i++) {
             if (percpu_at(i) && percpu_at(i)->current == t) { running = 1; break; }
         }
-        kprintf("%d   %d   %s    %d   %u   %s%s\n",
+        uint64_t priv = 0, shared = 0; int owns = 0;
+        task_mem_bytes(t, &priv, &shared, &owns);
+        sum_priv   += priv;
+        sum_shared += shared;
+
+        kprintf("%d   %d   %s    %d   %u   %u   %s%s\n",
                 t->pid, t->ppid, state_name(t->state), t->cpu_home,
-                (unsigned)t->cpu_ms,        /* truncates past ~49 days — fine */
+                (unsigned)task_cpu_ms_now(t), /* truncates past ~49 days — fine */
+                (unsigned)(priv / 1024u),
                 t->name, running ? " (running)" : "");
         t = t->next;
     } while (t != master_head);
     spin_unlock_irqrestore(&master_lock, fl);
+
+    /* `used` here is the PMM's own figure — a second, independent witness.
+     * Our sum counts only what user address spaces hold; the kernel image,
+     * the heap and every driver buffer are in the PMM's number and not in
+     * ours, so `total private <= pmm used` is the check, not equality.
+     * Reporting both is what makes the difference readable instead of
+     * suspicious. */
+    kprintf("total: %u KB private in user spaces, %u KB shared; pmm has %u KB in use\n",
+            (unsigned)(sum_priv / 1024u), (unsigned)(sum_shared / 1024u),
+            (unsigned)((pmm_used_frames() * 4096ull) / 1024ull));
 }
 
 void task_for_each(task_iter_fn fn, void* ctx) {

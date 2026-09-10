@@ -122,7 +122,7 @@ struct bcache_buf* bcache_get(struct block_device* dev, uint64_t lba) {
 
     /* If the victim is dirty, write it back before repurposing. */
     if (b->valid && b->dirty && b->dev && b->dev->write) {
-        if (b->dev->write(b->dev, b->lba, 1, b->data) != 0) {
+        if (blk_write(b->dev, b->lba, 1, b->data) != 0) {
             return NULL;                                    /* keep entry — try later */
         }
         stats.flushes++;
@@ -132,7 +132,7 @@ struct bcache_buf* bcache_get(struct block_device* dev, uint64_t lba) {
     if (b->valid) stats.evictions++;
 
     /* Bring the requested sector in. */
-    if (dev->read(dev, lba, 1, b->data) != 0) {
+    if (blk_read(dev, lba, 1, b->data) != 0) {
         b->valid = 0;                                       /* leave slot empty on I/O fail */
         return NULL;
     }
@@ -162,14 +162,14 @@ int bcache_sync(struct block_device* dev) {
     for (uint32_t i = 0; i < BCACHE_SLOTS; i++) {
         struct bcache_buf* b = &slots[i];
         if (!b->valid || !b->dirty || b->dev != dev) continue;
-        if (dev->write(dev, b->lba, 1, b->data) != 0) {
+        if (blk_write(dev, b->lba, 1, b->data) != 0) {
             failed++;
             continue;
         }
         b->dirty = 0;
         stats.flushes++;
     }
-    if (dev->flush) dev->flush(dev);
+    blk_flush(dev);
     return failed ? -2 : 0;
 }
 

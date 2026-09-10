@@ -15,6 +15,7 @@
 #include "cmd_util.h"
 #include "console.h"
 #include "printf.h"
+#include "block.h"     /* §M75 — blkstat */
 #include "vfs.h"
 #include "kmalloc.h"
 #include <stdint.h>
@@ -205,3 +206,26 @@ SHELL_CMD(mount) = { "mount", "<fs> <path> [dev]", "mount a filesystem",      SH
 SHELL_CMD(cp)    = { "cp",    "<src> <dst>",       "copy a file",             SHELL_G_FS, cmd_cp };
 SHELL_CMD(rm)    = { "rm",    "[-r] <path>",       "remove a file or a tree", SHELL_G_FS, cmd_rm };
 SHELL_CMD(mv)    = { "mv",    "<src> <dst>",       "rename a file",           SHELL_G_FS, cmd_mv };
+
+/* ---------------------------------------------------------------------------
+ * §M75 — `blkstat`: the I/O counters, and the only way to check them headlessly.
+ *
+ * The Task Manager's I/O chart is drawn from these, and a chart is the one
+ * surface on which a broken counter still looks like a plausible measurement:
+ * a flat line reads as "the disk is idle", which is exactly what a counter
+ * that never increments produces.  So the numbers get a text surface too, and
+ * the test is a DIFFERENCE across a known amount of work — the same shape as
+ * §M75's memory column, for the same reason. */
+static void cmd_blkstat(const char* a) {
+    (void)a;
+    struct blk_stats s;
+    blk_get_stats(&s);
+    kprintf("blkstat: %u reads (%u sectors), %u writes (%u sectors), "
+            "%u flushes, %u errors\n",
+            (unsigned)s.reads, (unsigned)s.sectors_read,
+            (unsigned)s.writes, (unsigned)s.sectors_written,
+            (unsigned)s.flushes, (unsigned)s.errors);
+}
+
+SHELL_CMD(blkstat) = { "blkstat", "", "block-layer I/O counters since boot",
+                       SHELL_G_FS, cmd_blkstat };

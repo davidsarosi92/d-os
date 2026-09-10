@@ -62,7 +62,20 @@ static void read_line(char* buf, int cap) {
     int n = 0;
     for (;;) {
         int c = uart_early_getchar();
-        if (c < 0) { task_yield(); continue; }     /* idle: let others run   */
+        /* §M75.2 — HALT, don't spin.  `task_yield()` leaves this task RUNNABLE,
+         * so a REPL waiting for a keystroke stayed on a core for ever: §M75's
+         * chart measured **50 % of a 2-CPU ARM box** with nothing running but
+         * this prompt.  Unlike the x86 GUI loops — whose 50 % turned out to be
+         * halted time miscounted as busy — this one was REAL work: yielding in
+         * a tight loop is a spin with better manners.
+         *
+         * `task_halt_idle` halts until the next interrupt, which on this arch
+         * is the 100 Hz tick, so a keystroke is noticed within 10 ms.  That is
+         * invisible on a serial console and is why the same change would NOT
+         * be right for the compositor, where §M22.7 measured exactly this trade
+         * as visible cursor lag.  The real fix is a PL011 RX interrupt; this is
+         * the honest interim, and it costs latency rather than liveness. */
+        if (c < 0) { task_halt_idle(); continue; }
 
         if (c == '\r' || c == '\n') {
             kprintf("\n");
@@ -156,7 +169,7 @@ static void cmd_blk(const char* args) {
 
     uint64_t lba = parse_u64(args);
     static uint8_t sec[512];
-    if (dev->read(dev, lba, 1, sec) != 0) { kprintf("blk: read LBA %u failed\n", (unsigned)lba); return; }
+    if (blk_read(dev, lba, 1, sec) != 0) { kprintf("blk: read LBA %u failed\n", (unsigned)lba); return; }
 
     kprintf("vda LBA %u (%u sectors total), first 64 bytes:\n",
             (unsigned)lba, (unsigned)dev->sector_count);

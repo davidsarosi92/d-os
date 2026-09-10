@@ -156,12 +156,12 @@ static void cmd_blktest(const char* args) {
     for (int i = 0; i < 512; i++) rbuf[i] = 0x00;
 
     kprintf("blktest: writing 512 bytes of pattern to sector 1...\n");
-    if (dev->write(dev, 1, 1, wbuf) != 0) {
+    if (blk_write(dev, 1, 1, wbuf) != 0) {
         console_write("blktest: write failed\n");
         goto out;
     }
     kprintf("blktest: reading back...\n");
-    if (dev->read(dev, 1, 1, rbuf) != 0) {
+    if (blk_read(dev, 1, 1, rbuf) != 0) {
         console_write("blktest: read failed\n");
         goto out;
     }

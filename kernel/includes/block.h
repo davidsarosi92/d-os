@@ -43,6 +43,47 @@ struct block_device {
     struct block_device* next;              /* registry link */
 };
 
+/* ---------------------------------------------------------------------------
+ * §M75 — ISSUE A REQUEST THROUGH HERE, NOT THROUGH `dev->read` DIRECTLY.
+ *
+ * The struct above is a table of function pointers and every caller in the
+ * tree reached into it: the block cache, the exFAT probe, the `blk` shell
+ * command, two boot self-tests.  So there was **no place a request passed
+ * through**, and therefore nowhere to count one — the task manager's "I/O
+ * operations" chart had no source, and neither would a future scheduler,
+ * rate limiter, error counter or slow-device warning.
+ *
+ * *A layer whose callers all bypass it is not a layer; it is a naming
+ * convention.*  These three wrappers are the layer, and the counting is the
+ * first thing that needed it rather than the reason it should exist.
+ *
+ * They add one indirect call to a path that already crosses to hardware, and
+ * they are the ONLY place `struct block_device`'s ops should be invoked.
+ * Calling `dev->read` still compiles — nothing can prevent that in C — but it
+ * now means "deliberately not counted".
+ *
+ * EXACTLY ONE CALLER IS LEFT THAT WAY, and the reason is worth keeping: the
+ * aarch64 boot self-test in `main_entry.c` writes and reads a sector to prove
+ * the DRIVER works.  A driver test that went through this layer would report a
+ * bug in these wrappers as a bug in the driver — and it runs at boot, so its
+ * two operations would also be the first entries in a machine's I/O totals
+ * without any filesystem having asked for them.
+ * ------------------------------------------------------------------------- */
+int blk_read (struct block_device* dev, uint64_t lba, uint32_t count, void* buf);
+int blk_write(struct block_device* dev, uint64_t lba, uint32_t count, const void* buf);
+int blk_flush(struct block_device* dev);   /* 0 when the device has no flush op */
+
+/* Cumulative since boot, machine-wide.  Sectors as well as operations because
+ * the two answer different questions: one large request and a thousand small
+ * ones move the same data at wildly different cost, and a chart of operations
+ * alone cannot tell a busy disk from a badly-used one. */
+struct blk_stats {
+    uint64_t reads, writes, flushes;        /* operations */
+    uint64_t sectors_read, sectors_written;
+    uint64_t errors;                        /* ops whose driver returned != 0 */
+};
+void blk_get_stats(struct blk_stats* out);
+
 /* Append a device to the registry.  Each driver picks an unused name
  * (typical convention: virtio = "vda", "vdb", ...; SATA = "sda";
  * NVMe = "nvme0n1").  Returns 0 on success. */
