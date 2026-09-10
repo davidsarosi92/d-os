@@ -83,6 +83,11 @@ struct percpu {
      * counter that failure mode is invisible. */
     uint64_t     last_balance_ms;  /* §M49 — when this CPU last ran a balance pass */
     uint64_t     busy_ms;          /* ms spent running a NON-idle task */
+    /* §M75.2 — of `busy_ms`, how much was a task HALTED waiting for work.
+     * Subtracted by sysmon, so the CPU series reports execution rather than
+     * occupancy: an idle desktop measured 97 % of the compositor's turns
+     * inside `hlt` and reported it all as busy. */
+    uint64_t     halt_ns;   /* ns, not ms: a hlt is shorter than a tick */
     uint64_t     switches;         /* context switches performed here */
     uint64_t     migrations;       /* tasks pulled onto this CPU by the balancer */
 
