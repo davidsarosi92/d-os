@@ -51,9 +51,12 @@ struct widget_ops {
      * NOTHING ELSE, which is why nothing in this system could be selected with
      * a mouse: a drag had no transport, whatever a widget did.
      *
-     * DELIBERATELY LAST in the struct: every existing `widget_ops` in the tree
-     * is a POSITIONAL initialiser, so a field inserted in the middle silently
-     * re-binds each of them by one slot (the compiler warns about the type
+     * DELIBERATELY LAST in the struct.  (§M75.2: every table in the tree is a
+     * NAMED initialiser now, so a field in the middle no longer re-binds them
+     * — but appending stays the rule, because a name only protects the tables
+     * that have been converted and the next author will copy an old one.)
+     * The hazard, for the record: a positional field inserted in the middle
+     * silently re-binds each table by one slot (the compiler warns about the type
      * mismatches — and would NOT warn where two neighbours happen to share a
      * signature).  New optional ops go at the end.
      * NULL = the widget does not want the stream. */
@@ -68,6 +71,25 @@ struct widget_ops {
      * is no good, but on the scrollbar it is perfect."*  Non-zero = consumed;
      * 0 = pass it on to whatever contains me. */
     int  (*scroll)(struct widget* w, int dz);
+
+    /* §M75.2 — DOES HOVER CHANGE HOW I LOOK?  Non-zero = "no, or I damaged
+     * exactly what changed": the host then damages NOTHING for the hover.
+     * NULL, or 0, means the host repaints the whole widget, which is what
+     * every widget got before and is right for a button.
+     *
+     * Why it exists: `app_hover_to` damages TWO WIDGETS, which §M69 correctly
+     * called precise — and it is, WHILE A WIDGET IS SMALL.  The item view
+     * filling a maximized window is ~1.9 Mpx, and it renders no hover state at
+     * all, so every pointer movement across it repainted the screen to set a
+     * flag nothing draws.  Reported from use as *"maximize the Task Manager and
+     * the mouse lags terribly"*, and the compositor draws the cursor, so each
+     * of those frames is a packet the pointer waits for.
+     *
+     * *Precision measured in WIDGETS stops being precision when a widget is
+     * the size of the screen.*
+     *
+     * At the end of the struct, for the reason stated above. */
+    int  (*hover)(struct widget* w, int entering);
 };
 
 /* Phases for widget_ops.pointer. */
@@ -342,6 +364,9 @@ struct w_itemview {
     int  sb_part;                       /* enum sb_part, 0 = not dragging   */
     int  sb_grab_dy;                    /* press y minus the thumb's top    */
     int  sb_content, sb_viewport;
+    /* §M76.2 — the column geometry at the last refresh, so a content-driven
+     * re-layout can be noticed.  See iv_cols_moved in w_itemview.c. */
+    int colx[8], colw[8];
 };
 struct w_itemview* w_itemview_create(struct gui_window* win, int x, int y,
                                      int w, int h,
@@ -371,5 +396,12 @@ void widget_init(struct widget* w, struct gui_window* win,
 
 void widget_draw_all(struct widget* head, struct gfx_surface* s);
 struct widget* widget_at(struct widget* head, int lx, int ly);
+
+
+/* §M75 — a chart's data changes without the widget being told, so its OWNER
+ * damages it on its tick.  gui.h's contract since §M69 is that a tick damages
+ * what it changed; this damages exactly the chart's box and never the window.
+ * See kernel/gui/w_chart.c. */
+void w_chart_refresh(struct widget* w);
 
 #endif

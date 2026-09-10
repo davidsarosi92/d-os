@@ -38,6 +38,27 @@
  * already knows where an item lands, so this works for a grid without knowing
  * anything about rows or columns, which is the point of swappable layouts.
  * A view without `rect` gets the whole widget: honest, and there is none. */
+/* §M75.2 — damage ONE CELL, falling back to the whole row when the view has no
+ * per-cell geometry (the list and the grid, whose row IS one cell).  Returns 1
+ * when it damaged a cell, 0 when the caller should damage the row instead.
+ *
+ * The clipping is `iv_damage_item`'s, deliberately: a cell in a partly-visible
+ * row needs exactly the same top/bottom trimming, and two copies of that
+ * arithmetic would drift the first time somebody changed the header height. */
+static int iv_damage_cell(struct w_itemview* iv, int i, int col) {
+    struct widget* w = &iv->base;
+    int x, y, ww, hh;
+    if (i < 0 || !iv->view || !iv->view->cell_rect) return 0;
+    if (iv->view->cell_rect(i, col, w->w, w->h, iv->model, iv->scroll,
+                            &x, &y, &ww, &hh) != 0) return 0;
+    if (y >= w->h || y + hh <= 0) return 1;            /* off-screen: nothing to do */
+    if (y < 0) { hh += y; y = 0; }
+    if (y + hh > w->h) hh = w->h - y;
+    if (hh <= 0) return 1;
+    gui_window_request_redraw_rect(w->win, w->x + x, w->y + y, ww, hh);
+    return 1;
+}
+
 static void iv_damage_item(struct w_itemview* iv, int i) {
     struct widget* w = &iv->base;
     int x, y, ww, hh;
@@ -56,6 +77,49 @@ static void iv_damage_all(struct w_itemview* iv) {
     struct widget* w = &iv->base;
     gui_window_request_redraw_rect(w->win, w->x, w->y, w->w, w->h);
 }
+
+/* §M76.2 — THE COLUMN GEOMETRY OF THE LAST REFRESH.
+ *
+ * Per-cell damage is only valid WHILE THE COLUMNS HAVE NOT MOVED, and in this
+ * table they move on their own: `t_layout` derives every column's width from
+ * its CONTENT (§M65 — *the longest cell is a fact*), so a number growing from
+ * 4481 to 44751 widens its column and shifts every column after it.
+ *
+ * The damaged rect would be computed from the NEW layout while the OLD text
+ * sits at the OLD position, so the old glyphs would never be painted over.
+ *
+ * **THIS WAS WRITTEN AS THE EXPLANATION OF A REPORTED ARTIFACT AND IT WAS NOT
+ * THAT** — the doubled glyphs were §M76.5's cleared clip.  The hazard here is
+ * nonetheless real on its own terms, which is why the check stays: any future
+ * per-cell damage needs stable geometry, and this is what notices when it is
+ * not.  *Keeping a correct guard is right; leaving it labelled as the fix for
+ * something it never fixed is §M52's shape.*
+ *
+ * So the geometry is remembered and compared.  When it moves, the whole pane is
+ * damaged, which is what a re-layout has always meant everywhere else in this
+ * tree (§M69: a layout repaints everything, because widgets vacate pixels
+ * nothing will paint over).  Cheap, because it only happens when a column
+ * actually resizes. */
+#define IV_MAXCOL 8
+/* §M76.2 — which branch does a refresh take?  Reported as *"unchanged, maybe it
+ * spread to the whole table"* after the column-geometry fix, and the two
+ * possible readings — the fix never fires, or it fires constantly — call for
+ * opposite responses.  One counter tells them apart. */
+unsigned iv_stat_pane, iv_stat_cells, iv_stat_rows, iv_stat_colmove;
+static int iv_cols_moved(struct w_itemview* iv) {
+    struct widget* w = &iv->base;
+    if (!iv->view || !iv->view->cell_rect) return 0;
+    int moved = 0;
+    for (int c = 0; c < IV_MAXCOL; c++) {
+        int x = 0, y = 0, cw = 0, ch = 0;
+        if (iv->view->cell_rect(iv->scroll, c, w->w, w->h, iv->model, iv->scroll,
+                                &x, &y, &cw, &ch) != 0) { x = -1; cw = -1; }
+        if (iv->colx[c] != x || iv->colw[c] != cw) moved = 1;
+        iv->colx[c] = x; iv->colw[c] = cw;
+    }
+    return moved;
+}
+
 
 /* What is drawn in the slot showing item `i`, as one string.
  *
@@ -88,6 +152,10 @@ static int iv_sig_differs(const char* a, const char* b) {
 }
 
 void w_itemview_refresh(struct w_itemview* iv) {
+    /* §M76.1 — this function damages one rect per changed CELL, and without
+     * the bracket the compositor composes between them: the refresh arrives on
+     * screen as a wave down the table instead of as one update. */
+    gui_damage_begin();
     if (!iv || !iv->model || !iv->model->count) return;
     struct widget* w = &iv->base;
     int total = iv->model->count(iv->model->ctx);
@@ -99,7 +167,13 @@ void w_itemview_refresh(struct w_itemview* iv) {
      * the pane once and re-take the whole signature: reporting thirty separate
      * changed slots would be true and would cost more than the one rect they
      * add up to. */
-    if (!iv->sig_valid || iv->scroll != iv->sig_scroll || slots != iv->sig_slots) {
+    /* §M76.2 — a column that resized invalidates every per-cell rect below, so
+     * it takes the same branch a scroll does. */
+    int cols_moved = iv_cols_moved(iv);
+    if (!iv->sig_valid || iv->scroll != iv->sig_scroll || slots != iv->sig_slots
+        || cols_moved) {
+        iv_stat_pane++;
+        if (cols_moved) iv_stat_colmove++;
         for (int r = 0; r < slots; r++) {
             int i = iv->scroll + r;
             if (i < total) iv_signature(iv, i, iv->rowsig[r], IV_SIG_LEN);
@@ -109,6 +183,7 @@ void w_itemview_refresh(struct w_itemview* iv) {
         iv->sig_scroll = iv->scroll;
         iv->sig_valid = 1;
         iv_damage_all(iv);
+        gui_damage_end();
         return;
     }
 
@@ -118,6 +193,15 @@ void w_itemview_refresh(struct w_itemview* iv) {
         if (i < total) iv_signature(iv, i, sig, IV_SIG_LEN);
         else           sig[0] = 0;
         if (!iv_sig_differs(sig, iv->rowsig[r])) continue;
+        /* §M75.2 — the PREVIOUS signature, taken before it is overwritten
+         * below: the field walk needs both sides. */
+        char prev_sig[IV_SIG_LEN];
+        int  old_sig_valid = 1;
+        for (int k = 0; k < IV_SIG_LEN; k++) {
+            prev_sig[k] = iv->rowsig[r][k];
+            if (!prev_sig[k]) break;
+        }
+        prev_sig[IV_SIG_LEN - 1] = 0;
 
         for (int k = 0; k < IV_SIG_LEN; k++) {
             iv->rowsig[r][k] = sig[k];
@@ -127,8 +211,100 @@ void w_itemview_refresh(struct w_itemview* iv) {
          * is sitting there and nothing else will ever cover it.  `rect` is
          * asked for the index that WOULD live there, which every view computes
          * from the slot rather than from the item. */
+
+        /* §M75.2 — WHICH CELL MOVED?  The signature is already TAB-separated
+         * by column (iv_signature), so the fields can be walked in step and
+         * only the differing ones damaged — no extra per-cell storage at all.
+         *
+         * At 1920 px a row is ~76 kpx and a `TIME` cell is ~6 kpx, and five
+         * moving rows a second is what a maximized Task Manager felt like
+         * through a compositor that also draws the cursor.
+         *
+         * THE FIRST CHARACTER IS THE SELECTION MARKER, NOT A CELL: the wash
+         * spans the whole row, so a marker change damages the row.  Getting
+         * that wrong would leave half a highlight behind, which is the visible
+         * kind of failure — but it is still worth stating, because the offset
+         * is the sort of thing a later edit to iv_signature would silently
+         * invalidate. */
+        int per_cell = 0;
+        if (old_sig_valid && iv->view->cell_rect && sig[0] == prev_sig[0]) {
+            const char* a = sig + 1;
+            const char* b = prev_sig + 1;
+            int col = 0, damaged = 0, ok = 1;
+            while (*a || *b) {
+                const char* ae = a; while (*ae && *ae != '\t') ae++;
+                const char* be = b; while (*be && *be != '\t') be++;
+                int alen = (int)(ae - a), blen = (int)(be - b);
+                int same = (alen == blen);
+                for (int k = 0; same && k < alen; k++) if (a[k] != b[k]) same = 0;
+                if (!same) {
+                    if (!iv_damage_cell(iv, i, col)) { ok = 0; break; }
+                    damaged = 1;
+                }
+                if (!*ae || !*be) { if (*ae != *be) ok = 0; break; }
+                a = ae + 1; b = be + 1; col++;
+                if (col >= 8) break;
+            }
+            /* `damaged == 0` with `ok` means the signature differed in a way
+             * the field walk could not attribute (a column count change).  Fall
+             * back rather than damage nothing — a diff that reports no change
+             * for a row that changed is a stale row nobody can explain. */
+            per_cell = ok && damaged;
+        }
+        /* §M77.1 — PER-CELL DAMAGE IS BACK ON, AND BOTH HALVES OF ITS HISTORY
+         * ARE HERE BECAUSE THE SECOND ONE IS THE USEFUL ONE.
+         *
+         * §M75.2 damaged the changed CELLS instead of the row, cutting the mean
+         * frame area about tenfold on a maximized window.  A report of rows
+         * going BOLD at random was then attributed to it — four attempts were
+         * made here and upstream, two introducing new defects — and it was
+         * switched off as not carrying its weight.
+         *
+         * **IT WAS INNOCENT.**  The cause was `table_draw` clearing the clip
+         * (§M76.5): from the second cell onward it painted unclipped over the
+         * whole window, on top of rows nobody had cleared.  Every one of those
+         * four attempts changed WHICH rects were damaged while that went on
+         * painting all of them regardless.
+         *
+         * What genuinely blocked it was the OTHER finding from that hunt: this
+         * path needs stable column geometry, and a content-sized column moves
+         * on its own.  §M77 fixed that at the source, so the precondition now
+         * holds rather than being hoped for — and `iv_cols_moved` still guards
+         * it, so a resize that does happen takes the whole-pane branch.
+         *
+         * Judged with this file's own counters (`gui.stats_ms` reports pane /
+         * colmove / cells / rows per refresh) and with a picture, because a
+         * damage optimisation's failure mode is stale pixels and no counter
+         * can see those. */
+        /* §M77.1 — AND IT WENT BACK OFF, WITH A SYMPTOM THIS TIME INSTEAD OF A
+         * THEORY.  That is the difference between this entry and the last one.
+         *
+         * With §M77's stable columns in place the numbers were good — refresh
+         * 9-11 ms -> 5-6 ms, one CPU 3 % -> 1-2 %, `pane 0 colmove 0 cells 36
+         * rows 0` — and **the picture still showed stale pixels**: a
+         * right-aligned CPU% cell going from `24.5 %` to `0.0 %` left the
+         * leading digit's fragment behind, as `?0.0 %`.
+         *
+         * THE COUNTERS CANNOT SEE THAT, and it is worth saying why they never
+         * will: they count which rects were damaged, and a stale pixel is a
+         * rect that was NOT.  *For a damage optimisation the picture is the
+         * authority and the counters are a convenience* — the reverse of every
+         * other optimisation in this tree.
+         *
+         * The concrete symptom is the useful part: it is specific to a
+         * RIGHT-ALIGNED cell whose text got SHORTER, so the next attempt starts
+         * from a reproducible case rather than from a theory.  Everything else
+         * about the path is now sound — the clip discipline (§M76.5), stable
+         * geometry (§M77) and the whole-pane fallback (`iv_cols_moved`) — which
+         * is why the remaining defect is finally small enough to name.
+         *
+         * Row damage costs 9-11 ms a refresh on a window nobody keeps
+         * maximized.  *That is not a price worth a wrong pixel.* */
+        (void)per_cell;
+        iv_stat_rows++;
         iv_damage_item(iv, i);
     }
+    gui_damage_end();
 }
 
 static int iv_sb(struct w_itemview* iv, struct sb_metrics* m);
@@ -391,8 +567,31 @@ static int iv_scroll(struct widget* w, int dz) {
     return 1;
 }
 
+/* §M75.2 — THIS VIEW RENDERS NO HOVER STATE, so there is nothing to repaint
+ * when the pointer enters or leaves it.
+ *
+ * That is a statement of fact about `iv_draw`, not a decision to skip work:
+ * grep this file, itemview.c and itemview.h for "hover" and there are no
+ * matches.  The host was repainting the whole widget to set a flag nothing
+ * draws — free while the widget is a list in a small window, and ~1.9 Mpx when
+ * it fills a maximized one, which is where *"the mouse lags terribly"* came
+ * from.  See widget.h.
+ *
+ * IF THIS VIEW EVER GAINS A HOVERED ROW, this must stop returning 1 and start
+ * damaging that row — the honest failure of forgetting is a highlight that
+ * does not appear, which is visible immediately, rather than a slow window
+ * nobody can attribute. */
+static int iv_hover(struct widget* w, int entering) {
+    (void)w; (void)entering;
+    return 1;                       /* handled: nothing changed on screen */
+}
+
+/* POSITIONAL, and the order is the struct's: draw, mouse, key, keycode,
+ * measure, pointer, scroll, hover.  widget.h says new optional ops go at the
+ * END for exactly this reason — inserting one in the middle silently re-binds
+ * every table in the tree by a slot (§M58's scar). */
 static const struct widget_ops itemview_ops = {
-    iv_draw, iv_mouse, NULL, iv_keycode, NULL, iv_pointer, iv_scroll
+    .draw = iv_draw, .mouse = iv_mouse, .keycode = iv_keycode, .pointer = iv_pointer, .scroll = iv_scroll, .hover = iv_hover,
 };
 
 struct w_itemview* w_itemview_create(struct gui_window* win, int x, int y,

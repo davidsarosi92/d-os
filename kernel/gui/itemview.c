@@ -595,6 +595,43 @@ static int t_cols(const struct item_model* m) {
 #define T_SCAN 64
 #define T_GAP  (2 * cp_fw())        /* never let two columns touch */
 
+/* §M76.5 — NARROW THE CLIP AND PUT IT BACK; NEVER CLEAR IT.
+ *
+ * `gfx_clear_clip` resets to the WHOLE SURFACE, so a view that clears after
+ * clipping one cell has thrown away whatever its CALLER established — and the
+ * caller is `widget_draw_all`, which had narrowed the surface to the damaged
+ * rect.  From the second cell onward this table was painting **unclipped over
+ * the entire window**, including rows whose background nobody had cleared.
+ *
+ * Text drawn on top of text is what that looks like: the same value rendered
+ * BOLDER than its neighbours, in rows that change from one refresh to the next.
+ * Reported from use as *"they flicker completely at random, I am doing
+ * nothing"* — and it survived four attempts aimed at the damage path, all of
+ * which changed WHICH rects were damaged while this went on painting all of
+ * them regardless.
+ *
+ * §M65 wrote this rule down after `ui_text_clipped` did the same thing to a
+ * scrolling container's viewport, and §M76.1 found the third instance in
+ * `widget_draw_all` this same day.  *A clip is a stack discipline, and there is
+ * no API here that enforces it* — so the shape is spelled out at each site. */
+struct clip_save { int x0, y0, x1, y1; };
+static struct clip_save clip_push(struct gfx_surface* s, int x, int y, int w, int h) {
+    struct clip_save c = { s->clip_x0, s->clip_y0, s->clip_x1, s->clip_y1 };
+    /* INTERSECT, because gfx_set_clip replaces: a cell must never be allowed to
+     * paint outside the damage rect its caller narrowed the surface to. */
+    int nx0 = x   > c.x0 ? x   : c.x0;
+    int ny0 = y   > c.y0 ? y   : c.y0;
+    int nx1 = x+w < c.x1 ? x+w : c.x1;
+    int ny1 = y+h < c.y1 ? y+h : c.y1;
+    if (nx1 < nx0) nx1 = nx0;
+    if (ny1 < ny0) ny1 = ny0;
+    gfx_set_clip(s, nx0, ny0, nx1 - nx0, ny1 - ny0);
+    return c;
+}
+static void clip_pop(struct gfx_surface* s, struct clip_save c) {
+    gfx_set_clip(s, c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0);
+}
+
 static int t_layout(const struct item_model* m, int w, int* xs, int* ws) {
     int n = t_cols(m);
     int avail = w - 2 * T_PAD;
@@ -615,6 +652,32 @@ static int t_layout(const struct item_model* m, int w, int* xs, int* ws) {
             int k = t_text_w(buf, style);
             if (k > longest) longest = k;
         }
+        /* §M76.2 — QUANTISING A MONO COLUMN'S WIDTH WAS TRIED HERE AND
+         * REVERTED, and the reason is worth more than the attempt.
+         *
+         * The problem it aimed at is real and measured: a `TIME` value crossing
+         * 9999 -> 10000 widens its column, shifts every column after it and
+         * forces a full-table repaint — **twice in 25 seconds** on an idle
+         * desktop, because twenty rows all growing cross digit boundaries
+         * constantly.  Rounding the width up to whole 4-character steps did
+         * remove them completely (`colmove 0` over the same 25 s).
+         *
+         * NB: it was attempted while chasing a reported flicker and IS NOT its
+         * cause — that was §M76.5's cleared clip.  The re-layout churn is a
+         * separate, genuine cost that this would address.
+         *
+         * IT ALSO MADE THE TABLE WORSE, WHICH ONLY THE PICTURE SHOWED.  Wider
+         * columns pushed the total past the available width, so `t_layout`'s
+         * squeeze-and-drop logic took over and the TIME column began
+         * TRUNCATING: `29821 ~` where `29821 ms` belonged.  *A column that is
+         * stable and unreadable is not an improvement on one that moves.*
+         *
+         * The honest fix is not here: a column's width should be decided ONCE
+         * and kept, which is per-instance STATE, and this view is deliberately
+         * stateless (§M64 — selection and scroll live in the viewer so views
+         * stay stateless).  Giving the widget a sticky per-column width is the
+         * change, and it is a change to the item-view contract rather than to
+         * this function. */
         nat[c] = longest + T_GAP;
     }
 
@@ -633,6 +696,46 @@ static int t_layout(const struct item_model* m, int w, int* xs, int* ws) {
 
     int total_nat = 0;
     for (int c = 0; c < n; c++) total_nat += nat[c];
+
+    /* §M77 — SPEND SLACK ON MAKING MONO COLUMNS STOP MOVING.
+     *
+     * A column sized from its content resizes as its content grows, and every
+     * resize shifts every column after it and forces a full-table repaint —
+     * **measured at twice in 25 seconds** on an idle desktop, because twenty
+     * rows of milliseconds cross digit boundaries constantly.  That is a
+     * visible flash, and it is the last measured cost in this table.
+     *
+     * Rounding mono columns up to whole character cells removes it.  Doing so
+     * UNCONDITIONALLY was tried and reverted: it pushed the total past the
+     * available width, the squeeze-and-drop logic took over, and the TIME
+     * column began truncating (`29821 ~`).  *A column that is stable and
+     * unreadable is not an improvement on one that moves.*
+     *
+     * SO IT IS SPENT OUT OF SLACK THAT ALREADY EXISTS, and never borrowed:
+     * each mono column is widened to the next 4-character boundary only while
+     * the remaining slack covers it, and a table with no room to spare keeps
+     * exactly the layout it had before.  The stability is best where there is
+     * room for it and costs nothing where there is not — which is the right way
+     * round, because a cramped table's own width is already changing for
+     * bigger reasons.
+     *
+     * Four characters rather than one: a number crossing a digit boundary is
+     * the common case, and a one-character step would still move for every one
+     * of them. */
+    if (total_nat < avail) {
+        int cell = cp_cell_w();
+        int slack = avail - total_nat;
+        for (int c = 0; c < n && cell > 0 && slack > 0; c++) {
+            if (!(t_style(m, c) & ICOL_MONO)) continue;
+            int chars   = (nat[c] - T_GAP + cell - 1) / cell;
+            int rounded = ((chars + 3) / 4) * 4 * cell + T_GAP;
+            int extra   = rounded - nat[c];
+            if (extra <= 0 || extra > slack) continue;   /* never borrow */
+            nat[c] = rounded;
+            slack -= extra;
+            total_nat += extra;
+        }
+    }
 
     int x = T_PAD;
     for (int c = 0; c < n; c++) {
@@ -706,9 +809,9 @@ static void table_draw(struct gfx_surface* s, int x, int y, int w, int h,
         }
         int hx = x + xs[c];
         if (style & ICOL_RIGHT) hx += cw - cp_text_w(hbuf);
-        gfx_set_clip(s, x + xs[c], y, cw, T_HEAD_H);
+        struct clip_save hc = clip_push(s, x + xs[c], y, cw, T_HEAD_H);
         cp_text(s, hx, y + (T_HEAD_H - cp_fh()) / 2, hbuf, t->muted);
-        gfx_clear_clip(s);
+        clip_pop(s, hc);
     }
     gfx_fill(s, x, y + T_HEAD_H - 1, w, 1, t->line);
 
@@ -748,9 +851,9 @@ static void table_draw(struct gfx_surface* s, int x, int y, int w, int h,
             /* Clip each cell to its own column: a long name must not run into
              * the size column, which is the failure a padded string cannot
              * even detect. */
-            gfx_set_clip(s, x + xs[c], ry, cw, T_ROW_H);
+            struct clip_save cc = clip_push(s, x + xs[c], ry, cw, T_ROW_H);
             t_draw_cell(s, tx, ry + (T_ROW_H - cp_fh()) / 2, buf, col, style, cw);
-            gfx_clear_clip(s);
+            clip_pop(s, cc);
         }
     }
 
@@ -785,6 +888,38 @@ static int table_rect(int i, int w, int h, const struct item_model* m, int scrol
     return 0;
 }
 
+/* §M75.2 — one CELL's box, so the content diff can damage a changed number
+ * instead of the whole row it sits in.  See itemview.h for why.
+ *
+ * The geometry is `table_rect`'s row band intersected with `t_layout`'s column
+ * — the SAME `t_layout` the painter calls, which is what stops the damaged box
+ * and the painted box from drifting apart (§4.79's title buttons, where a
+ * painter and a hit test computed the same rectangle differently and the top
+ * edge of every button was dead).
+ *
+ * The band is widened by a pixel each side: a proportional glyph may overhang
+ * its measured advance, and a cell damaged exactly to its computed width can
+ * leave a column of stale pixels down the edge — visible as a faint seam that
+ * nothing ever repaints. */
+static int table_cell_rect(int i, int col, int w, int h, const struct item_model* m,
+                           int scroll, int* ox, int* oy, int* ow, int* oh) {
+    int rx, ry, rw, rh;
+    if (table_rect(i, w, h, m, scroll, &rx, &ry, &rw, &rh) != 0) return -1;
+
+    int xs[8], ws[8];
+    int n = t_layout(m, w, xs, ws);
+    if (col < 0 || col >= n) return -1;
+
+    int x0 = xs[col] - 1;
+    int x1 = xs[col] + ws[col] + 1;
+    if (x0 < rx) x0 = rx;
+    if (x1 > rx + rw) x1 = rx + rw;
+    if (x1 <= x0) return -1;
+
+    *ox = x0; *oy = ry; *ow = x1 - x0; *oh = rh;
+    return 0;
+}
+
 static int table_page(int w, int h) {
     (void)w;
     int rows = (h - T_HEAD_H) / T_ROW_H;
@@ -798,4 +933,5 @@ ITEM_VIEW(itemview_table) = {
     .hit  = table_hit,
     .rect = table_rect,
     .page = table_page,
+    .cell_rect = table_cell_rect,      /* §M75.2 — per-cell damage */
 };

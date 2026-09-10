@@ -45,6 +45,7 @@
 #include "mouse.h"
 #include "timer.h"
 #include "config.h"
+#include "shellcmd.h"   /* §M76 — gui.autorun dispatches one command */
 #include "locale.h"
 #include "settings.h"   /* CONFIG_KEY — gui.occlude is a declared setting */
 #include "wallpaper.h"          /* §M60: the desktop background source */
@@ -802,7 +803,7 @@ static void desktop_main(void) {
             last_pop_x = pnl_pop_x; last_pop_y = pnl_pop_y;
             last_pop_w = pnl_pop_w; last_pop_h = pnl_pop_h;
         }
-        if (!busy) hal_cpu_idle();       /* halt only when idle (see compositor) */
+        if (!busy) task_halt_idle();     /* §M75.2 accounted halt; see task.h */
         task_yield();
     }
 }
@@ -1092,6 +1093,10 @@ static void pump_hostless_redraw(void) {
     }
 }
 
+/* §M75.2 — compositor loop accounting; see the note in the loop body. */
+static uint64_t gl_work_ns, gl_halt_ns, gl_loop_ns, gl_since;
+static uint32_t gl_iters;
+
 static void gui_compositor_main(void) {
     kprintf("gui: compositor up on pid %d (shell '%s')\n",
             task_current() ? task_current()->pid : -1,
@@ -1145,11 +1150,56 @@ static void gui_compositor_main(void) {
          * around only every N ticks — visible cursor lag with the menu or
          * Task Manager open.  Under load need_frame stays set, so we spin
          * through the scheduler (fast); when truly idle we hlt (power save). */
+        /* §M75.2 — WHERE DOES THE COMPOSITOR'S TIME ACTUALLY GO?
+         *
+         * §M75's chart put a number on §M49's open item for the first time: an
+         * idle desktop reads ~50 % of a 4-CPU box, and `ps` attributes it to
+         * this task and the desktop task.  **But `busy_ms` is credited to
+         * whichever task is SCHEDULED, and this loop spends most of its turns
+         * halted inside `hal_cpu_idle()`** — so "50 % busy" may be 50 % of real
+         * work or 50 % of a task sitting in `hlt`, and those call for opposite
+         * fixes.  A waitq is the answer to the second and a waste of a risky
+         * change to the most timing-sensitive code in the tree if it is the
+         * first.
+         *
+         * So the loop times its own halt.  §M69's rule, paid for twice there:
+         * an optimisation aimed at a guess cannot be measured, only assumed. */
+        uint64_t l0 = timer_now_ns();
         if (need_frame) {
             need_frame = 0;
             compose();
+            gl_work_ns += timer_now_ns() - l0;
         } else {
-            hal_cpu_idle();
+            /* §M75.2 — TIME THE HALT ITSELF, not the branch around it.
+             *
+             * The first version stamped `l0` before the `if` and charged the
+             * whole else-arm to "halted", which reported 97 % in `hlt` — and
+             * that reading contradicted the task's own `cpu_ms`, which had not
+             * moved at all.  One of the two had to be lying, and it was the
+             * instrument: §4.61's lesson (a measurement placed on the wrong
+             * side of the work reports the work as free) with the sides
+             * swapped.  The halt is now bracketed exactly, and whatever is
+             * left over is loop overhead — which is the number that decides
+             * whether a waitq is worth the risk. */
+            uint64_t h0 = timer_now_ns();
+            task_halt_idle();
+            uint64_t h1 = timer_now_ns();
+            gl_halt_ns += h1 - h0;
+            gl_loop_ns += h1 - l0 - (h1 - h0);
+        }
+        gl_iters++;
+        if (!gl_since) gl_since = l0;
+        else if (config_get_long("gui.stats_ms", 0) > 0 &&
+                 timer_now_ns() - gl_since > 5000000000ull) {
+            uint64_t span = (timer_now_ns() - gl_since) / 1000000ull;
+            kprintf("compositor: %u loops in %u ms (%u/s) — %u %% composing, "
+                    "%u %% in hlt, %u %% loop overhead\n",
+                    (unsigned)gl_iters, (unsigned)span,
+                    (unsigned)((uint64_t)gl_iters * 1000ull / (span ? span : 1)),
+                    (unsigned)(gl_work_ns / 10000ull / (span ? span : 1)),
+                    (unsigned)(gl_halt_ns / 10000ull / (span ? span : 1)),
+                    (unsigned)(gl_loop_ns / 10000ull / (span ? span : 1)));
+            gl_since = timer_now_ns(); gl_work_ns = gl_halt_ns = gl_loop_ns = 0; gl_iters = 0;
         }
         task_yield();
     }
@@ -1429,6 +1479,28 @@ static int gui_teardown(void) {
     return 0;
 }
 
+/* §M76 — see the autorun note at the end of gui_start. */
+static const char* gui_autorun_cmd;
+static void gui_autorun_main(void) {
+    /* The desktop is up but its first frame may not have been composed yet;
+     * a moment's grace keeps the launched window's own layout out of the
+     * bring-up's damage list, which is tidier to read in a log and costs
+     * nothing a human would notice. */
+    task_msleep(300);
+    if (gui_autorun_cmd && !shell_cmd_dispatch(gui_autorun_cmd))
+        kprintf("gui: autorun — unknown command '%s'\n", gui_autorun_cmd);
+}
+
+CONFIG_KEY(ck_pageflip) = {
+    .key = "gui.page_flip", .group = "Display", .type = CFG_BOOL, .def = "1",
+    .help = "double-buffered present (off = single buffer; diagnostic)",
+};
+
+CONFIG_KEY(ck_autorun) = {
+    .key = "gui.autorun", .group = "System", .type = CFG_STRING, .def = "",
+    .help = "one shell command to run once the desktop is up (test hook)",
+};
+
 static void gui_stop_main(void) {
     gui_teardown();
     task_exit();
@@ -1530,8 +1602,27 @@ int gui_start(void) {
             flipbuf[0].px = (uint32_t*)(uintptr_t)b0;
             flipbuf[1].px = (uint32_t*)(uintptr_t)b1;
             flip_front = 0;
-            flip_ok = 1;
-            kprintf("gui: page-flip present enabled (Bochs-VBE double buffer)\n");
+            /* §M76.4 — `gui.page_flip = 0` forces the single-buffer path.
+             *
+             * An INSTRUMENT, not a setting anybody should need.  It was built
+             * to test one hypothesis about a reported flicker — that §M22.6's
+             * buffer-age-2 double buffer was letting two buffers disagree —
+             * and **THAT HYPOTHESIS WAS FALSIFIED BY IT**: single-buffered, the
+             * flicker was unchanged.  The cause was §M76.5's cleared clip in
+             * `table_draw`, one layer up.
+             *
+             * The key stays because the question recurs and because a negative
+             * answer took one boot: *a flicker that needs no input is either
+             * about presentation or about painting, and with the flip off the
+             * first cannot be true.*  Ruling a layer out is worth as much as
+             * finding one, and this is the switch that does it. */
+            if (config_get_long("gui.page_flip", 1)) {
+                flip_ok = 1;
+                kprintf("gui: page-flip present enabled (Bochs-VBE double buffer)\n");
+            } else {
+                kprintf("gui: page flip DISABLED by gui.page_flip — "
+                        "single-buffer present (may shear)\n");
+            }
         } else {
             kprintf("gui: no page flip — single-buffer present (may shear)\n");
         }
@@ -1631,5 +1722,34 @@ int gui_start(void) {
     kprintf("gui: up — %dx%d, %d windows, shell '%s', %d apps registered\n",
             fbsurf.w, fbsurf.h, zcount,
             shell ? shell->name : "none", gui_app_count());
+
+    /* §M76 — RUN ONE COMMAND NOW THAT THE DESKTOP EXISTS.
+     *
+     * §4.74: this project's harness cannot type once a GUI window holds focus,
+     * and on aarch64 it is worse — with `gui.autostart` on, the desktop is up
+     * before the first command lands, so NOTHING could be typed at all.
+     * Measured while trying to run §M76's own test client there: neither `ps`
+     * nor `uidemo` reached the shell.
+     *
+     * *A test that cannot be started is not a test*, which is why this tree
+     * already grew `conf open` (to reach a settings panel), `gui.wheeltest` (to
+     * reach the wheel router) and `gui.ui_dump` (to reach a layout).  Each
+     * solved one instance of the same wall.  This is the general one: a key set
+     * BEFORE the GUI takes over, naming a command to dispatch once it is up.
+     *
+     * ONCE, and on a DETACHED TASK.  Once, because a key that re-fires would
+     * relaunch on every mode change; detached, because the command may block
+     * (it usually spawns a window) and this runs on the task that brought the
+     * desktop up. */
+    const char* autorun = config_get("gui.autorun", "");
+    if (autorun && autorun[0]) {
+        static char ar[96];
+        int i = 0;
+        while (autorun[i] && i < (int)sizeof ar - 1) { ar[i] = autorun[i]; i++; }
+        ar[i] = 0;
+        kprintf("gui: autorun '%s'\n", ar);
+        gui_autorun_cmd = ar;
+        task_spawn_detached("gui-autorun", gui_autorun_main);
+    }
     return 0;
 }

@@ -186,6 +186,25 @@ struct item_view {
     int  (*scrollbar)(int w, int h, const struct item_model* m, int scroll,
                       int* bx, int* by, int* bw, int* bh,
                       int* content, int* viewport);
+
+    /* §M75.2 — WHERE IS ONE CELL?  Appended, like every optional op since
+     * §M58's scar.
+     *
+     * The content diff damages a changed ROW, which is precise while a window
+     * is small and is not when it is maximized: at 1920 px a row is ~76 kpx,
+     * so five moving rows are ~380 kpx of compositing a second — and the
+     * compositor also draws the cursor, which is what *"maximize the Task
+     * Manager and the mouse lags terribly"* is made of.  A changed `TIME` cell
+     * is ~6 kpx.
+     *
+     * OPTIONAL BECAUSE ONLY A COLUMNAR VIEW HAS CELLS.  The list and the grid
+     * leave it NULL and keep whole-row damage, which is correct for them —
+     * their "row" IS one cell.  A caller must therefore treat NULL as "ask for
+     * the row instead", never as an error.
+     *
+     * Returns 0 and fills the rect (relative to the box) on success. */
+    int  (*cell_rect)(int i, int col, int w, int h, const struct item_model* m,
+                      int scroll, int* ox, int* oy, int* ow, int* oh);
 };
 
 /* One cell's text, exactly as a view would draw it: from `cell` when the model

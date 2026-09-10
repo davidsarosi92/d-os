@@ -348,7 +348,20 @@ struct scene_snapshot {
 /* M22.7 — a damage rectangle (used by both the damage list and the page
  * flip's previous-frame list). */
 struct rect { int x0, y0, x1, y1; };
-#define DMG_MAX 16
+/* §M76.1 — 16 was chosen when damage was PER ROW, and §M75.2's per-cell diff
+ * naturally produces more: a Task Manager refresh damages ~15 cells, so the
+ * list filled and every rect after the sixteenth was MERGED into the cheapest
+ * existing one.  Measured maximized: 16 rects covering 983-1566 kpx, against
+ * 14-25 kpx when the same cells each had their own rect.
+ *
+ * *An overflow policy that merges is correct and is not free* — it trades area
+ * for slots silently, so the list being too short shows up as a compositor
+ * that got slower for no visible reason.
+ *
+ * 48 rects is 768 bytes.  More SMALL blits beat fewer LARGE ones here: the
+ * page flip presents once whatever the count (§M22.6), so the extra rects cost
+ * loop iterations and the merged ones cost megabytes of fill. */
+#define DMG_MAX 48
 
 /* `mv_hint` is how a MOVE reaches the compositor: out of band, never as
  * damage.  Merged damage rects cannot tell a window that MOVED from one that

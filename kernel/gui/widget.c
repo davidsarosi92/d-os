@@ -52,15 +52,45 @@ void widget_draw_all(struct widget* head, struct gfx_surface* s) {
          * page's help text did exactly that).  With a scrolling container the
          * clip is narrower still — its viewport — which is what makes a child
          * scrolled half out of view stop at the edge instead of spilling. */
-        if (w->clip_w > 0) gfx_set_clip(s, w->clip_x, w->clip_y, w->clip_w, w->clip_h);
-        else               gfx_set_clip(s, w->x, w->y, w->w, w->h);
+        /* §M76.1 — INTERSECT WITH THE CALLER'S CLIP; DO NOT REPLACE IT.
+         *
+         * `gfx_set_clip` REPLACES (§M65 paid for that once already, when
+         * `ui_text_clipped` threw a scrolling container's viewport away).  This
+         * loop replaced it too — so `gui_window_request_redraw_rect`, which
+         * narrows the surface to ONE damaged rect before calling here, had its
+         * rect discarded and every widget redrew its WHOLE box.
+         *
+         * Invisible on screen, because the compositor copies only the damaged
+         * rect: the picture was always right and the WORK was not.  It cost
+         * little while damage was a whole row, and §M75.2's per-cell damage
+         * multiplied it by the number of changed cells — which is what
+         * *"the refresh runs top to bottom in a wave, with a little lag"*
+         * looks like from a chair.
+         *
+         * A widget that does not intersect the damaged rect is SKIPPED
+         * outright: with a clip of zero width its draw would paint nothing
+         * anyway, and the point is not to run it. */
+        int cx0 = s->clip_x0, cy0 = s->clip_y0, cx1 = s->clip_x1, cy1 = s->clip_y1;
+        int wx0 = (w->clip_w > 0) ? w->clip_x : w->x;
+        int wy0 = (w->clip_w > 0) ? w->clip_y : w->y;
+        int wx1 = wx0 + ((w->clip_w > 0) ? w->clip_w : w->w);
+        int wy1 = wy0 + ((w->clip_h > 0) ? w->clip_h : w->h);
+        if (wx0 < cx0) wx0 = cx0;
+        if (wy0 < cy0) wy0 = cy0;
+        if (wx1 > cx1) wx1 = cx1;
+        if (wy1 > cy1) wy1 = cy1;
+        if (wx1 <= wx0 || wy1 <= wy0) continue;      /* outside the damage */
+        gfx_set_clip(s, wx0, wy0, wx1 - wx0, wy1 - wy0);
         w->ops->draw(w, s);
         /* DISABLED IS A COMPOSITE OVER THE FINISHED WIDGET (the design's rule),
          * which is why it happens here and not inside each draw: tinting every
          * element separately would need a disabled variant of every token, and
          * the nine widgets would drift apart. */
         if (w->disabled) cp_dim(s, w->x, w->y, w->w, w->h);
-        gfx_clear_clip(s);
+        /* RESTORE the caller's clip, do not CLEAR it: clearing resets to the
+         * whole surface, so the next widget in the loop would intersect against
+         * nothing and the narrowing above would work for exactly one widget. */
+        gfx_set_clip(s, cx0, cy0, cx1 - cx0, cy1 - cy0);
     }
 }
 
@@ -144,7 +174,7 @@ static void label_draw(struct widget* w, struct gfx_surface* s) {
 }
 
 static const struct widget_ops label_ops = {
-    label_draw, NULL, NULL, NULL, NULL, NULL, NULL
+    .draw = label_draw,
 };
 
 struct w_label* w_label_create(struct gui_window* win, int x, int y, int w,
@@ -257,7 +287,7 @@ static void button_mouse(struct widget* w, int lx, int ly, int kind) {
 }
 
 static const struct widget_ops button_ops = {
-    button_draw, button_mouse, NULL, NULL, NULL, NULL, NULL
+    .draw = button_draw, .mouse = button_mouse,
 };
 
 struct w_button* w_button_create(struct gui_window* win, int x, int y,
@@ -590,8 +620,7 @@ static int listview_scroll(struct widget* w, int dz) {
 }
 
 static const struct widget_ops listview_ops = {
-    listview_draw, listview_mouse, listview_key, listview_keycode, NULL,
-    listview_pointer, listview_scroll
+    .draw = listview_draw, .mouse = listview_mouse, .key = listview_key, .keycode = listview_keycode, .pointer = listview_pointer, .scroll = listview_scroll,
 };
 
 struct w_listview* w_listview_create(struct gui_window* win, int x, int y,
@@ -685,7 +714,7 @@ static void textinput_keycode(struct widget* w, uint8_t kc, uint8_t mods) {
 }
 
 static const struct widget_ops textinput_ops = {
-    textinput_draw, textinput_mouse, textinput_key, textinput_keycode, NULL, NULL, NULL
+    .draw = textinput_draw, .mouse = textinput_mouse, .key = textinput_key, .keycode = textinput_keycode,
 };
 
 struct w_textinput* w_textinput_create(struct gui_window* win, int x, int y,

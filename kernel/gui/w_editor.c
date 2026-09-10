@@ -419,7 +419,7 @@ static void editor_pointer(struct widget* w, int lx, int ly, int phase) {
 }
 
 static const struct widget_ops editor_ops = {
-    editor_draw, editor_mouse, editor_key, editor_keycode, editor_destroy, editor_pointer, NULL
+    .draw = editor_draw, .mouse = editor_mouse, .key = editor_key, .keycode = editor_keycode, .destroy = editor_destroy, .pointer = editor_pointer,
 };
 
 /* -------------------------------------------------------------------------- */

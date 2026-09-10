@@ -184,13 +184,21 @@ static void app_hover_to(struct gui_window* win, int lx, int ly) {
         if (w->hovered) { prev = w; break; }
     if (hit == prev) return;
 
+    /* §M75.2 — ASK THE WIDGET FIRST.  A widget that renders no hover state
+     * needs no repaint to stop being hovered, and repainting it anyway is what
+     * made a maximized Task Manager lag: its item view is ~1.9 Mpx and draws
+     * nothing for hover, so crossing it repainted the screen to set a flag.
+     * See widget.h; a NULL op keeps the old whole-widget behaviour, which is
+     * what a button wants. */
     if (prev) {
         prev->hovered = 0;
-        gui_window_request_redraw_rect(win, prev->x, prev->y, prev->w, prev->h);
+        if (!(prev->ops && prev->ops->hover && prev->ops->hover(prev, 0)))
+            gui_window_request_redraw_rect(win, prev->x, prev->y, prev->w, prev->h);
     }
     if (hit && !hit->disabled) {
         hit->hovered = 1;
-        gui_window_request_redraw_rect(win, hit->x, hit->y, hit->w, hit->h);
+        if (!(hit->ops && hit->ops->hover && hit->ops->hover(hit, 1)))
+            gui_window_request_redraw_rect(win, hit->x, hit->y, hit->w, hit->h);
     }
 }
 /* Returns non-zero when the event may have changed pixels that NOTHING
@@ -536,7 +544,10 @@ void app_host_main(void) {
             if (worked) busy = 1;
         }
         if (live == 0) break;             /* all my windows closed → exit */
-        if (!busy) hal_cpu_idle();        /* M22.7 — halt only when idle */
+        /* §M75.2 — the ACCOUNTED halt: a poll loop is SCHEDULED while it
+         * waits, so `hal_cpu_idle()` here made an idle app-host report ~25 %
+         * of a 4-CPU box.  See task.h. */
+        if (!busy) task_halt_idle();      /* M22.7 — halt only when idle */
         task_yield();
     }
     /* Host exits; init reaps it (not reap_owned).  Any windows it released

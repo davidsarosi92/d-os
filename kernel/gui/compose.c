@@ -99,6 +99,10 @@ uint64_t total_compose_ns = 0;
 /* Last present's dirty rects.  A page flip has buffer-age 2: the hidden
  * buffer is stale outside the regions touched in the last TWO presents, so
  * each present copies this frame's rects ∪ last frame's rects. */
+/* §M76.1/§M77.2 — non-zero while a caller is assembling a multi-rect update;
+ * see gui_damage_begin and the note at the top of compose(). */
+static volatile int dmg_hold;
+
 static struct rect prev_dmg[DMG_MAX + 2];       /* +2 for the cursor rects   */
 
 static int         prev_dmg_n = 0;
@@ -171,12 +175,43 @@ static void damage_add_locked(int x0, int y0, int x1, int y1) {
     }
     rect_grow(&dmg_list[best], x0, y0, x1, y1);
 }
+/* §M76.1 — HOLD THE FRAME WHILE ONE UPDATE IS STILL BEING ASSEMBLED.
+ *
+ * Reported from use: *"the table refresh runs top to bottom in a wave, and
+ * there is a little lag while it does."*  Both halves are one cause.  A refresh
+ * damages its changed cells ONE AT A TIME from the app-host task, and the
+ * compositor runs on ANOTHER CPU — so it wakes on the first rect and composes
+ * whatever has arrived, then again, and again.  The diff walks slots in order,
+ * so the partial frames march down the table.
+ *
+ * The rects themselves are right: §4.61 made damage a LIST of disjoint rects
+ * precisely so a small refresh and a far-away cursor stay two small blits.
+ * What was missing is that a caller assembling SEVERAL of them had no way to
+ * say "not yet".
+ *
+ * A COUNTER AND NOT A FLAG, because these nest: a widget's refresh may damage
+ * through a helper that brackets its own work, and a flag would let the inner
+ * end release a frame the outer one is still building.
+ *
+ * The rects are still added immediately — only the WAKE is deferred.  So a
+ * caller that forgets to end the bracket costs latency until the next
+ * unbracketed damage, never a lost update. */
+
+void gui_damage_begin(void) { __atomic_add_fetch(&dmg_hold, 1, __ATOMIC_ACQ_REL); }
+
+void gui_damage_end(void) {
+    if (__atomic_sub_fetch(&dmg_hold, 1, __ATOMIC_ACQ_REL) <= 0) {
+        __atomic_store_n(&dmg_hold, 0, __ATOMIC_RELEASE);
+        need_frame = 1;
+    }
+}
+
 void gui_damage(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
     uint32_t fl = spin_lock_irqsave(&damage_lock);
     damage_add_locked(x, y, x + w, y + h);
     spin_unlock_irqrestore(&damage_lock, fl);
-    need_frame = 1;
+    if (__atomic_load_n(&dmg_hold, __ATOMIC_ACQUIRE) == 0) need_frame = 1;
 }
 void gui_damage_all(void) {
     uint32_t fl = spin_lock_irqsave(&damage_lock);
@@ -437,6 +472,26 @@ static void draw_scene_rect(const struct scene_snapshot* s,
     draw_cursor(&backsurf, s->cx, s->cy);
 }
 void compose(void) {
+    /* §M77.2 — DO NOT PAINT A BATCH THAT IS STILL BEING ASSEMBLED.
+     *
+     * `gui_damage_begin/end` defers the WAKE, which is enough when nothing else
+     * is producing frames.  It is not enough during a CLICK: the pointer moves,
+     * the compositor draws the cursor, and frames are being produced anyway —
+     * so a compose can land between two rects of one update, take the first,
+     * and leave the second for the next frame.
+     *
+     * Reported from use, and the symptom names the mechanism exactly: selecting
+     * a row showed **two rows highlighted at once for a moment**.  A selection
+     * change damages TWO rows — the one losing the highlight and the one taking
+     * it — and if only one of them is in this frame, both look selected until
+     * the next.
+     *
+     * Returning here costs at most the length of one bracket, which is a single
+     * widget refresh; the wake is still pending, so the frame happens
+     * immediately afterwards.  *A frame that shows half an update is worse than
+     * a frame that waits for it.* */
+    if (__atomic_load_n(&dmg_hold, __ATOMIC_ACQUIRE) > 0) return;
+
     uint64_t compose_t0 = timer_now_ns();
     /* 1. Snapshot + clear the damage LIST: anything damaged while we paint
      *    lands in the next frame. */

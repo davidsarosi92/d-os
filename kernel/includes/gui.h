@@ -435,4 +435,12 @@ void gui_damage_all(void);
  * recomposes.  Backs the `gui stats` shell command. */
 void gui_get_stats(unsigned* full, unsigned* partial, unsigned* avg_kb);
 
+
+/* §M76.1 — bracket a multi-rect update so the compositor does not paint it half
+ * finished.  The rects are recorded immediately; only the WAKE is held, so a
+ * missing `end` costs latency and never a lost update.  Nests (a counter).
+ * See the note in compose.c. */
+void gui_damage_begin(void);
+void gui_damage_end(void);
+
 #endif
