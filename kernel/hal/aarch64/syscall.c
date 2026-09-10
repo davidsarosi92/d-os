@@ -23,6 +23,10 @@
 #include "usermode.h"
 #include "task.h"
 #include "proc.h"
+#include "vmm.h"        /* copy_str_from_user */
+#include "dosgui.h"     /* §M76 — the ring-3 GUI bridge */
+#include "drvuser.h"    /* §M76 — the ring-3 driver runtime */
+#include "hal_api.h"    /* hal_set_tls_base */
 #include "usermode.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -202,6 +206,223 @@ static void aarch64_syscall_body(struct trapframe* tf) {
              * syscall's result. */
             signal_sigreturn(tf);
             return;
+
+        /* §M75 — SYS_NANOSLEEP was missing here while both x86 dispatchers had
+         * it, so an in-tree-libc program that sleeps did not sleep on ARM: it
+         * got -1 back and span at full speed, printing "unknown number 35" on
+         * every iteration.  That is not a quiet degradation — a 60-second run
+         * of §M75's own memory falsifier produced 55 000 lines of it and buried
+         * the output the run existed to read.
+         *
+         * IT IS THE SMALL END OF A MUCH LARGER GAP, MEASURED AND WRITTEN DOWN
+         * RATHER THAN PATCHED OVER: this dispatcher answers 26 of the 60 cases
+         * i386 answers.  Sockets, stat/fstat/getdents, clone/futex/set_tls,
+         * getrandom and uname are all absent, which means every native program
+         * that uses them is silently x86-only — §M70's finding about shell
+         * commands, one layer down and never swept.  Closing that is its own
+         * piece of work (see PLAN.md); this fixes the one case that was
+         * actively drowning the log. */
+        case SYS_NANOSLEEP:
+            tf->x[0] = (uint64_t)sys_nanosleep((unsigned)tf->x[0]);
+            break;
+
+        /* =====================================================================
+         * §M76 — THE SWEEP.
+         *
+         * Before this, the list below did not exist here: `sys_*` cores that
+         * are entirely portable had no way in from a native ring-3 program on
+         * this architecture, so every program using one was silently x86-only.
+         * The failure is a log line and a -1, never a link error, which is why
+         * it survived from §M25 to §M75 without anybody noticing.
+         *
+         * Each of these is a thin argument shuffle over a core that already
+         * compiles here — x8 = number, x0..x5 = args, result in x0 — so the
+         * meaning of every one of them is defined in exactly one place, the
+         * same place i386 calls.  Nothing below is an aarch64 IMPLEMENTATION
+         * of anything; it is a doorway to one.
+         * =================================================================== */
+
+        /* --- M36 POSIX breadth ------------------------------------------- */
+        case SYS_STAT:
+            tf->x[0] = (uint64_t)sys_stat((const char*)tf->x[0], (struct kstat*)tf->x[1]);
+            break;
+        case SYS_FSTAT:
+            tf->x[0] = (uint64_t)sys_fstat((int)tf->x[0], (struct kstat*)tf->x[1]);
+            break;
+        case SYS_GETDENTS:
+            tf->x[0] = (uint64_t)sys_getdents((int)tf->x[0], (void*)tf->x[1],
+                                              (uint32_t)tf->x[2]);
+            break;
+        case SYS_UNAME:
+            tf->x[0] = (uint64_t)sys_uname((struct kutsname*)tf->x[0]);
+            break;
+        case SYS_CLOCK_GETTIME:
+            tf->x[0] = (uint64_t)sys_clock_gettime((int)tf->x[0],
+                                                   (struct ktimespec*)tf->x[1]);
+            break;
+        case SYS_GETRANDOM:
+            tf->x[0] = (uint64_t)sys_getrandom((void*)tf->x[0], (uint32_t)tf->x[1],
+                                               (unsigned)tf->x[2]);
+            break;
+
+        /* --- M24 stage 6 sockets ------------------------------------------
+         * The stack above the transport is arch-independent (net.c), so these
+         * are the same nine doorways i386 has.  Their absence is why nothing
+         * written against the NATIVE socket API could run on ARM, while musl
+         * programs — which arrive through §M50's Linux-ABI engine — could. */
+        case SYS_SOCKET:
+            tf->x[0] = (uint64_t)sys_socket((int)tf->x[0], (int)tf->x[1], (int)tf->x[2]);
+            break;
+        case SYS_BIND:
+            tf->x[0] = (uint64_t)sys_bind((int)tf->x[0], (uint32_t)tf->x[1], (int)tf->x[2]);
+            break;
+        case SYS_CONNECT:
+            tf->x[0] = (uint64_t)sys_connect((int)tf->x[0], (uint32_t)tf->x[1], (int)tf->x[2]);
+            break;
+        case SYS_LISTEN:
+            tf->x[0] = (uint64_t)sys_listen((int)tf->x[0], (int)tf->x[1]);
+            break;
+        case SYS_ACCEPT:
+            tf->x[0] = (uint64_t)sys_accept((int)tf->x[0], (uint32_t*)tf->x[1],
+                                            (int*)tf->x[2]);
+            break;
+        case SYS_SENDTO:
+            tf->x[0] = (uint64_t)sys_sendto((int)tf->x[0], (const void*)tf->x[1],
+                                            (uint32_t)tf->x[2], (uint32_t)tf->x[3],
+                                            (int)tf->x[4]);
+            break;
+        case SYS_RECVFROM:
+            tf->x[0] = (uint64_t)sys_recvfrom((int)tf->x[0], (void*)tf->x[1],
+                                              (uint32_t)tf->x[2], (uint32_t*)tf->x[3],
+                                              (int*)tf->x[4]);
+            break;
+        case SYS_GETSOCKNAME:
+            tf->x[0] = (uint64_t)sys_getsockname((int)tf->x[0], (uint32_t*)tf->x[1],
+                                                 (int*)tf->x[2]);
+            break;
+        case SYS_GETPEERNAME:
+            tf->x[0] = (uint64_t)sys_getpeername((int)tf->x[0], (uint32_t*)tf->x[1],
+                                                 (int*)tf->x[2]);
+            break;
+
+        /* --- M35 threads --------------------------------------------------
+         * `proc_clone` and the futex are portable; SET_TLS is NOT, and the
+         * difference is the interesting part.  On x86 a thread pointer is a
+         * SEGMENT DESCRIPTOR, so the call allocates a per-CPU GDT slot, pins
+         * the thread to that CPU and returns a SELECTOR.  On aarch64 it is a
+         * register — `TPIDR_EL0` — with no table, no pinning and no selector
+         * to return, which is also why §A3 found that forgetting to save it on
+         * a context switch was invisible until a forked musl child died. */
+        case SYS_CLONE:
+            tf->x[0] = (uint64_t)proc_clone((uintptr_t)tf->x[0], (uintptr_t)tf->x[1]);
+            break;
+        case SYS_FUTEX:
+            tf->x[0] = (uint64_t)sys_futex((int*)tf->x[0], (int)tf->x[1], (int)tf->x[2]);
+            break;
+        case SYS_SET_TLS: {
+            struct task* t = task_current();
+            if (!t) { tf->x[0] = 0; break; }
+            t->tls_base = (uintptr_t)tf->x[0];
+            t->has_tls  = 1;
+            hal_set_tls_base(t->tls_base);
+            /* Zero, not a selector: there is nothing here for a caller to load
+             * into a segment register.  The in-tree libc ignores the result on
+             * this arch; returning a plausible non-zero number would invite it
+             * not to. */
+            tf->x[0] = 0;
+            break;
+        }
+
+        /* --- §M42 the dosgui bridge ---------------------------------------
+         * These are what §M76's own test client needed: `uidemo` builds a
+         * toolkit interface from ring 3, and on this architecture its first
+         * call returned `unknown number 53328` and the program exited with
+         * "no window (is the GUI running?)" — a message about the GUI, from a
+         * program whose syscall had simply not been wired.  *The honest report
+         * of a missing doorway looks exactly like a broken subsystem.* */
+        case SYS_DOSGUI_CREATE: {
+            char title[64];
+            if (copy_str_from_user(title, tf->x[2], sizeof title) < 0) title[0] = 0;
+            tf->x[0] = (uint64_t)dosgui_create((int)tf->x[0], (int)tf->x[1], title);
+            break;
+        }
+        case SYS_DOSGUI_PRESENT:
+            tf->x[0] = (uint64_t)dosgui_present((int)tf->x[0], (const uint32_t*)tf->x[1],
+                                                (int)tf->x[2], (int)tf->x[3], (int)tf->x[4]);
+            break;
+        case SYS_DOSGUI_POLL:
+            tf->x[0] = (uint64_t)dosgui_poll((int)tf->x[0], (struct dosgui_event*)tf->x[1]);
+            break;
+        case SYS_DOSGUI_DESTROY:
+            dosgui_destroy((int)tf->x[0]);
+            tf->x[0] = 0;
+            break;
+        case SYS_DOSGUI_UI_BUILD:
+            tf->x[0] = (uint64_t)dosgui_ui_build((int)tf->x[0], (const void*)tf->x[1],
+                                                 (int)tf->x[2]);
+            break;
+
+        /* --- §M33 the ring-3 driver runtime -------------------------------
+         * The last ten, and they do NOT all get a doorway — which is the whole
+         * of §M33's honesty gate applied to an architecture instead of to a
+         * placement: *a boundary you believe in and do not have is worse than
+         * one you know you lack.*
+         *
+         * Seven of them are portable requests about memory, interrupts and
+         * devices, and they are wired.  **THREE ARE PORT I/O, AND THIS
+         * ARCHITECTURE HAS NO PORT I/O AT ALL** — there is no instruction, no
+         * address space and no bitmap for one.  They are REFUSED WITH A REASON
+         * rather than stubbed to success, because a driver that asked for a
+         * port window and was told "granted" would go on to fault at its first
+         * access, arbitrarily far from the call that lied to it. */
+        case SYS_DRV_MMIO:
+            tf->x[0] = (uint64_t)drvuser_sys_mmio((uint64_t)tf->x[0], (uint64_t)tf->x[1]);
+            break;
+        case SYS_DRV_DMA: {
+            uint64_t dev = 0;
+            long r = drvuser_sys_dma((int)tf->x[0], (int)tf->x[1], &dev);
+            if (r >= 0 && tf->x[2])
+                if (copy_to_user((uintptr_t)tf->x[2], &dev, sizeof dev) != 0) r = -1;
+            tf->x[0] = (uint64_t)r;
+            break;
+        }
+        case SYS_DRV_IRQ:
+            tf->x[0] = (uint64_t)drvuser_sys_irq((int)tf->x[0]);
+            break;
+        case SYS_DRV_IRQ_WAIT:
+            tf->x[0] = (uint64_t)drvuser_sys_irq_wait((int)tf->x[0], (int)tf->x[1]);
+            break;
+        case SYS_DRV_LOG: {
+            char msg[128];
+            int n = copy_str_from_user(msg, tf->x[0], sizeof msg);
+            tf->x[0] = (uint64_t)drvuser_sys_log(n < 0 ? NULL : msg);
+            break;
+        }
+        case SYS_DRV_WINDOW: {
+            uint64_t phys = 0, len = 0;
+            long r = drvuser_sys_window((int)tf->x[0], &phys, &len);
+            if (r == 0) {
+                uint64_t out[2] = { phys, len };
+                if (copy_to_user((uintptr_t)tf->x[1], out, sizeof out) != 0) r = -1;
+            }
+            tf->x[0] = (uint64_t)r;
+            break;
+        }
+        case SYS_DRV_INPUT:
+            tf->x[0] = (uint64_t)drvuser_sys_input((int)tf->x[0], (int)tf->x[1],
+                                                   (unsigned)tf->x[2], (int)tf->x[3]);
+            break;
+
+        case SYS_DRV_PORTS:
+        case SYS_DRV_PORTS_LOCK:
+        case SYS_DRV_PORTS_UNLOCK:
+            /* Named in the message, so the driver author learns WHICH request
+             * this machine cannot serve rather than that "a syscall failed". */
+            kprintf("drv: port I/O is not available on aarch64 — this "
+                    "architecture has no I/O address space (request %lu)\n",
+                    (unsigned long)num);
+            tf->x[0] = (uint64_t)-1;
+            break;
 
         default:
             kprintf("syscall: unknown number %lu\n", (unsigned long)num);

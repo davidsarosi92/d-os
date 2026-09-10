@@ -47,7 +47,8 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "block.h"
 #include "block_cache.h"
 #include "config.h"
-#include "locale.h"          /* §M63 stage 0 — config_attach_persistent */
+#include "locale.h"
+#include "crash.h"          /* §M63 stage 0 — config_attach_persistent */
 #include "iommu.h"           /* §M33 stage 5 — DMA remapping capability */
 #include "drvrt.h"          /* §M33 stage 2 — deferred driver tasks */
 #include "modload.h"        /* §M67 — modload_autoload() */
@@ -316,6 +317,13 @@ void aarch64_main_entry(uint64_t dtb) {
              * ARM would keep losing every setting at reboot while x86 kept
              * them — the same shape as the pkg_init duplication below. */
             config_attach_persistent("/mnt");
+            /* §M75.1 — and the crash log, on the SAME volume and by the
+             * same rule: a sink handed a path it merely hopes is writable
+             * swallows every future record in silence (§M63 stage 0,
+             * §M64's shortcuts).  BOTH boot paths call it, or the arch
+             * that misses it keeps losing crash records while the other
+             * keeps them. */
+            crash_file_attach_persistent("/mnt");
             /* §M69 — AFTER the store is overlaid, on BOTH boot paths.  A
              * language read before it would be the default for one boot and
              * the saved value from the next — §M63's "one boot late" defect,
