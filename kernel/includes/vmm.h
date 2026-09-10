@@ -33,30 +33,11 @@
 
 #include <stdint.h>
 
-/* Flags passed to `vmm_map`.  Present bit is implicit — unmap if you want
- * a P=0 entry.  These constants match the hardware bit positions in BOTH
- * i386 PTEs and x86_64 PTEs — Intel kept the low 12 bits compatible when
- * adding long mode, so the same values flow straight into either page
- * table format. */
-#define VMM_WRITABLE     0x002
-#define VMM_USER         0x004
-#define VMM_WRITE_THRU   0x008
-#define VMM_CACHE_DIS    0x010
-/* M25 — request an executable mapping.  Enforced where the arch has an
- * execute-permission bit (aarch64 UXN); on x86 today (no NX yet) pages are
- * executable regardless, so this is advisory there.  Sits in an
- * OS-available PTE bit on x86, masked out of the hardware entry. */
-#define VMM_EXEC         0x200
-/* M25 — a BORROWED mapping: the frame is owned by someone else (a shm object
- * shared between processes), so vmm_space_destroy must NOT free it — only
- * drop the mapping.  Stored in an OS-available PTE bit (x86 bit 10 / aarch64
- * software bit 55), invisible to the hardware walk. */
-#define VMM_SHARED       0x400
-/* M34 — a COPY-ON-WRITE mapping: the page is shared read-only between spaces
- * after fork; a write faults and vmm_cow_fault() gives the writer a private
- * copy.  Stored in PTE bit 11 (OS-available).  A per-frame refcount tracks how
- * many spaces still share it so the frame is freed only by the last owner. */
-#define VMM_COW          0x800
+/* The flag vocabulary + the §M75 walk callback.  They live in their own header
+ * because ONE file in the tree cannot include this one (aarch64's vmm.c —
+ * see vmm_flags.h for why), and hand-copied mirrors of a flag set are how a
+ * bit comes to mean two different things on two architectures. */
+#include "vmm_flags.h"
 
 /* Turn on paging + identity-map the kernel region.  On i386 this builds
  * the page directory and turns on CR0.PG; on x86_64 paging is already
@@ -200,5 +181,86 @@ void vmm_space_switch(struct vmm_space* space);
  * x86_64 return 1 GiB (0x40000000); aarch64 returns 4 GiB (its identity
  * map covers the low 4 GiB). */
 uintptr_t vmm_user_base(void);
+
+/* ===========================================================================
+ * §M75 — what does a space actually hold?
+ *
+ * A task manager has to answer "how much memory is this process using", and
+ * nothing here could: no `vmm.c` counted a space's resident pages.
+ *
+ * THE OBVIOUS FIX IS THE TRAP.  A counter bumped inside vmm_space_map/unmap
+ * would be THREE counters, because **`vmm.c` exists three times** (x86,
+ * x86_64, aarch64) — kept in step by hand, and the one that drifts is the one
+ * on the arch nobody happens to be running that week.  That is §M70's whole
+ * finding and §4.63's `setconf` shape.
+ *
+ * AND A COUNTER CANNOT ANSWER THIS QUESTION CORRECTLY ANYWAY.  Whether a COW
+ * frame is still shared changes when ANOTHER process forks or exits, so the
+ * owner's counter goes stale without the owner having done anything.  The
+ * number is a property of the moment, so it is MEASURED at the moment.
+ *
+ * So the split is: **each arch supplies the WALK; the POLICY lives in one
+ * portable place** (`kernel/mem/vmm_account.c`).  Page tables really are
+ * arch-specific, and each backend's traversal mirrors its own
+ * `vmm_space_destroy`, which already had to know precisely the same rules —
+ * which entries are kernel-shared, which are large pages, which are borrowed.
+ * What a page MEANS is then decided exactly once.
+ *
+ * THE WALKER REPORTS PORTABLE FLAGS, NOT RAW PTE BITS.  aarch64 keeps
+ * "borrowed" in bit 55 and "COW" in bit 56 while x86 uses 0x400 / 0x800; hand
+ * a raw entry to a shared policy and it silently tests the wrong bits on one
+ * architecture — which is three policies again, wearing one function's name.
+ * Each backend translates into VMM_SHARED / VMM_COW / VMM_WRITABLE / VMM_USER
+ * before it calls back.
+ *
+ * LOCKING, AND WHAT IT DOES **NOT** BUY.  The caller must hold whatever keeps
+ * the tasks alive — `task_for_each`'s master lock is what the accounting pass
+ * uses, and it is what stops a space being destroyed mid-walk.
+ *
+ * **IT DOES NOT STOP THE OWNER FROM MAPPING.**  `mmap` runs on the owning
+ * task's own CPU and takes no scheduler lock, so on an SMP box the walk reads
+ * a page table that is being written.  Two consequences, and they are
+ * different sizes:
+ *
+ *   - the FIGURE is a sample of a moving target.  A page mapped during the
+ *     walk is counted or not depending on where the walk had got to.  That is
+ *     acceptable and is why this is called a measurement rather than a total.
+ *
+ *   - the WALK must not be led off a cliff by a half-built table.  That is an
+ *     ordering question, and on aarch64 it was a real one: `next_table`
+ *     published a descriptor without a barrier after zeroing the frame behind
+ *     it, so another observer could read the pointer and then read whatever
+ *     the allocator had last left in that frame.  Fixed at the source (see the
+ *     note there); nothing here defends against it, because a reader that
+ *     tolerates a corrupt table is a reader that hides the corruption.
+ * =========================================================================== */
+
+/* `vmm_space_walk` and `vmm_frame_share_count` are declared in vmm_flags.h,
+ * beside the flag vocabulary they report in — the aarch64 backend implements
+ * both and cannot include THIS header.  Two things to know about them:
+ *
+ *   - the walk reports a space's PRIVATE region only; the kernel's own
+ *     mappings, which every space shares, are never visited;
+ *   - the share count DELIBERATELY DOES NOT CREATE the refcount table.  It is
+ *     a query, and a query that allocates fails exactly when memory is short —
+ *     which is precisely when somebody is reading a task manager.
+ *
+ * Portable accounting over them (kernel/mem/vmm_account.c).
+ *
+ * `private` = frames this space alone owns, i.e. **what would be handed back
+ * if the process exited now**.  That is the number a task manager wants, and
+ * it is the only one whose column can be SUMMED: reporting a frame in every
+ * space that maps it makes the total exceed the machine's memory, which is the
+ * kind of number that destroys trust in the whole window.
+ *
+ * `shared` = frames it maps but does not solely own (borrowed shm/memfd, and
+ * COW pages another space still holds).  Reported separately rather than
+ * dropped, so "this process is small" and "this process shares everything it
+ * touches" stay distinguishable.
+ *
+ * Either pointer may be NULL.  A NULL space (a kernel thread) yields zeroes —
+ * it has no private user region, which is a real answer and not a failure. */
+void vmm_space_resident(struct vmm_space* space,
+                        uint64_t* out_private, uint64_t* out_shared);
 
 #endif

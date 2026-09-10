@@ -300,6 +300,32 @@ struct task {
      * `cpu_ms`.  Feeds `ps` and the GUI task manager. */
     uint64_t cpu_ms;
     uint64_t sched_in_ms;
+    /* §M75.2 — time this task spent HALTED inside `task_halt_idle()`.
+     *
+     * `cpu_ms` is credited to whichever task is SCHEDULED, and a poll loop that
+     * halts waiting for work is scheduled the whole time it is asleep.  So an
+     * idle desktop reported ~50 % CPU on a 4-CPU box while measurement showed
+     * the compositor spending 97 % of its turns in `hlt` — the number was
+     * counting a task waiting, not a task working.
+     *
+     * Subtracted by `task_cpu_ms_now`, so every consumer of CPU% (the Task
+     * Manager column, `ps`, §M75's chart) is INTENDED to report time EXECUTING.
+     *
+     * IT SHIPPED INERT FOR AN AFTERNOON, and the reason is worth carrying:
+     * the subtraction was applied to `cpu_ms` BEFORE the in-flight slice was
+     * added — and a poll loop that owns its core is never switched out, so its
+     * `cpu_ms` is literally ZERO and all of its time is in that slice.  The
+     * halt was being subtracted from nothing.  See taskstat.c; what settled it
+     * was printing both counters side by side rather than reasoning about
+     * either alone.
+     *
+     * MEASURED IN NANOSECONDS, and that is not a detail: a `hlt` lasts until
+     * the next interrupt, which at a 1000 Hz tick is UNDER A MILLISECOND.
+     * The first version of this counter used `timer_ticks_ms` and every
+     * single halt rounded to zero — a correction that compiled, ran, and
+     * changed nothing, which is indistinguishable from a wrong theory until
+     * you measure again. */
+    uint64_t halt_ns;
     /* §M49 — RUNNABLE-time tracking, the load balancer's demand signal.
      *
      * `cpu_ms` above answers "how much CPU did this task GET", which on a
@@ -552,6 +578,43 @@ void task_for_each(task_iter_fn fn, void* ctx);
  * that pid.  Used by `taskset` and a future `kill`.  Walks the global
  * task list under the master scheduler lock. */
 struct task* task_find(int pid);
+
+/* ---------------------------------------------------------------------------
+ * §M75 — what a task is COSTING (kernel/core/taskstat.c).
+ *
+ * Written once because `ps` and the GUI task manager both need it, and because
+ * each of the three has a trap that a direct read of `struct task` walks into.
+ * Every one of them is safe to call from inside a `task_for_each` callback,
+ * which is where both consumers already are.
+ * ------------------------------------------------------------------------- */
+
+/* `cpu_ms` PLUS the slice currently in flight.  Raw `cpu_ms` is credited only
+ * at a context switch, so a task executing right now is under-reported — the
+ * bug §M49's `sched` shipped with and then fixed. */
+uint64_t task_cpu_ms_now(const struct task* t);
+
+/* §M75.2 — halt this CPU until the next interrupt, and DO NOT count the wait as
+ * CPU time.  A loop that polls-and-halts must call this instead of
+ * `hal_cpu_idle()`, or it reports itself as busy for as long as it waits.
+ *
+ * It is a task-level call and not a HAL one on purpose: the HAL cannot know
+ * whether a halt is a task waiting (do not count it) or the scheduler's own
+ * idle path (already excluded by `is_idle`). */
+void task_halt_idle(void);
+
+/* Private / shared resident bytes of the task's address space.
+ *
+ * `owns_mm` is 0 for a kernel thread (no space) AND for a cloned thread (it
+ * shares its creator's space), both of which report zero bytes — a thread that
+ * claimed its process's memory would have a four-thread program reporting its
+ * heap four times, and the column would stop summing to something real. */
+void task_mem_bytes(const struct task* t, uint64_t* out_private,
+                    uint64_t* out_shared, int* out_owns_mm);
+
+/* CPU share between two samples, in TENTHS OF A PERCENT (0..1000), scaled by
+ * CPU count so a task pinning one core of four reads 250 and not 1000.
+ * `elapsed_ms` must come from a clock, never from a count of refresh ticks. */
+uint32_t task_cpu_permille(uint64_t cpu_ms_delta, uint64_t elapsed_ms, int ncpus);
 
 /* M22.3 — request cooperative termination of `pid`.  Returns 0 if the
  * flag was set, -1 if no such task or it is protected (pid 0, idle

@@ -712,6 +712,57 @@ int vmm_space_protect(struct vmm_space* s, uintptr_t virt, uint32_t flags) {
     return 0;
 }
 
+/* §M75 — enumerate every present page in this space's PRIVATE region.
+ *
+ * Deliberately shaped as `free_subtree`'s twin: same descent, same three
+ * exclusions (kernel-shared entries, large pages, and — at the leaf — nothing,
+ * because the WALKER reports borrowed pages and lets the portable policy in
+ * vmm_account.c decide).  If the two ever disagree about which entries belong
+ * to a space, the accounting reports memory that teardown does not free, which
+ * is a leak that looks like a rounding error.
+ *
+ * `va` is threaded down so a caller can be told WHERE a page is.  No canonical
+ * sign extension is applied: only private (user, low-half) entries are ever
+ * descended into, so the upper half never arises here. */
+static void walk_subtree(uint64_t* tbl, uint64_t* ktbl, int depth, uintptr_t va,
+                         vmm_walk_fn cb, void* ctx) {
+    for (int i = 0; i < 512; i++) {
+        uint64_t e = tbl[i];
+        if (!(e & PTE_P))                 continue;
+        if (ktbl && e == ktbl[i])         continue;   /* shared with kernel   */
+        if (depth >= 1 && (e & PTE_PS))   continue;   /* large page — kernel  */
+
+        uintptr_t entry_va = va + ((uintptr_t)i << shift_for_depth[depth]);
+
+        if (depth < 3) {
+            uint64_t* kchild = (ktbl && (ktbl[i] & PTE_P) && !(ktbl[i] & PTE_PS))
+                             ? table_at((uintptr_t)ktbl[i]) : NULL;
+            walk_subtree(table_at((uintptr_t)e), kchild, depth + 1, entry_va,
+                         cb, ctx);
+        } else {
+            /* Leaf.  The low bits already ARE the portable VMM_* values — the
+             * i386 and x86_64 PTE layouts agree there, which is the whole
+             * reason vmm.h can define one set of flags for both. */
+            cb(ctx, entry_va, (uintptr_t)(e & PAGE_MASK_4K),
+                    (uint32_t)(e & ~PAGE_MASK_4K));
+        }
+    }
+}
+
+void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
+    if (!s || !cb) return;
+    walk_subtree(s->pml4, (uint64_t*)pml4, 0, 0, cb, ctx);
+}
+
+/* §M75 — see vmm.h: a QUERY, so it must not build the table.  `cow_slot`
+ * creates it on first use out of bootmem; calling that from a task manager
+ * would make reading the memory column allocate memory. */
+uint32_t vmm_frame_share_count(uintptr_t phys) {
+    if (!g_cow_ref) return 0;
+    uintptr_t fn = phys >> 12;
+    return (fn < g_cow_nr) ? (uint32_t)g_cow_ref[fn] : 0;
+}
+
 uintptr_t vmm_space_pd_phys(struct vmm_space* s) {
     return s ? s->pml4_phys : (uintptr_t)pml4;
 }

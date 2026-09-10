@@ -582,6 +582,44 @@ int vmm_space_protect(struct vmm_space* s, uintptr_t virt, uint32_t flags) {
     return protect_in_pd(pd, (uint32_t)virt, flags);
 }
 
+/* §M75 — enumerate every present page in this space's PRIVATE region.
+ *
+ * The traversal is `vmm_space_destroy`'s, minus the freeing: the rules for
+ * "which entries belong to this space" are identical, and they must stay
+ * identical — a walker that visited a page destroy does not free (or missed
+ * one it does) would report memory that is nobody's.  On i386 the low 12 bits
+ * of a PTE are already the portable VMM_* values (Intel kept them compatible
+ * across i386/x86_64, which is why vmm.h can define one set), so no
+ * translation is needed here — unlike aarch64, where it very much is. */
+void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
+    if (!s || !cb) return;
+
+    for (uint32_t i = 0; i < 1024; i++) {
+        uint32_t pde = s->pd[i];
+        if ((pde & PDE_P) == 0)         continue;
+        if (pde & PDE_PS)               continue;   /* PSE leaf — kernel      */
+        if (pde_is_kernel_shared(s, i)) continue;   /* shared kernel PT       */
+
+        uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
+        for (uint32_t j = 0; j < 1024; j++) {
+            uint32_t pte = pt[j];
+            if ((pte & PTE_P) == 0) continue;
+            cb(ctx, ((uintptr_t)i << 22) | ((uintptr_t)j << 12),
+                    (uintptr_t)(pte & PAGE_MASK),
+                    (uint32_t)(pte & ~PAGE_MASK));
+        }
+    }
+}
+
+/* §M75 — see vmm.h: a QUERY, so it must not build the table.  `cow_slot`
+ * creates it on first use out of bootmem; calling that from a task manager
+ * would make reading the memory column allocate memory. */
+uint32_t vmm_frame_share_count(uintptr_t phys) {
+    if (!g_cow_ref) return 0;
+    uint32_t fn = (uint32_t)phys >> 12;
+    return (fn < g_cow_nr) ? (uint32_t)g_cow_ref[fn] : 0;
+}
+
 uintptr_t vmm_space_pd_phys(struct vmm_space* s) {
     return s ? (uintptr_t)s->pd_phys : (uintptr_t)&kernel_pd[0];
 }

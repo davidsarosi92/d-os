@@ -18,6 +18,7 @@
 #include "multiboot.h"
 #include "lock.h"
 #include "hal_api.h"
+#include "proc.h"        /* §M75 — memhog spawns a ring-3 process */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -126,3 +127,38 @@ SHELL_CMD(buddyinfo) = { "buddyinfo", "", "buddy free lists by order",
                          SHELL_G_MEM,  mem_buddyinfo };
 SHELL_CMD(mmtest)    = { "mmtest",    "", "allocator self-test",
                          SHELL_G_TEST, mem_mmtest };
+
+/* ---------------------------------------------------------------------------
+ * §M75 — `memhog`: the falsifier for the per-process memory column.
+ *
+ * On a bare boot every task is a kernel thread, so the whole column reads 0.
+ * That is the TRUE answer and it is also indistinguishable from a walk that
+ * does not work, which is §M71's rule 3 one subsystem over.  `memhog` puts a
+ * real ring-3 address space on the machine that grows by a known amount on a
+ * known schedule, so two `ps` runs prove the column tracks reality by
+ * SUBTRACTION — see user/memhog.c for why a difference and not an absolute.
+ *
+ * It lives here, next to the memory commands, because that is what it is a
+ * test OF; it is spawned detached so the shell stays usable while it grows. */
+extern const unsigned char _binary_user_memhog_elf_start[]         __attribute__((weak));
+extern const unsigned char _binary_user_memhog_elf_end[]           __attribute__((weak));
+extern const unsigned char _binary_user_memhog_x86_64_elf_start[]  __attribute__((weak));
+extern const unsigned char _binary_user_memhog_x86_64_elf_end[]    __attribute__((weak));
+extern const unsigned char _binary_user_memhog_aarch64_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_memhog_aarch64_elf_end[]   __attribute__((weak));
+
+static void mem_memhog(const char* a) {
+    (void)a;
+    const unsigned char *s = 0, *e = 0;
+    if (_binary_user_memhog_elf_start)         { s = _binary_user_memhog_elf_start;         e = _binary_user_memhog_elf_end; }
+    else if (_binary_user_memhog_x86_64_elf_start)  { s = _binary_user_memhog_x86_64_elf_start;  e = _binary_user_memhog_x86_64_elf_end; }
+    else if (_binary_user_memhog_aarch64_elf_start) { s = _binary_user_memhog_aarch64_elf_start; e = _binary_user_memhog_aarch64_elf_end; }
+    if (!s || !e) { console_write("memhog: no ELF embedded for this arch\n"); return; }
+
+    int pid = proc_spawn("memhog", s, (size_t)(e - s));
+    if (pid < 0) { console_write("memhog: spawn failed\n"); return; }
+    kprintf("memhog: pid %d — `ps` twice and subtract; `kill %d` when done\n", pid, pid);
+}
+
+SHELL_CMD(memhog)    = { "memhog",    "", "ring-3 process that grows 1 MiB/2 s (memory-column falsifier)",
+                         SHELL_G_TEST, mem_memhog };

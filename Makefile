@@ -47,6 +47,7 @@ COMMON_CFLAGS := -ffreestanding -fno-stack-protector -fno-pie -nostdlib \
 # Ring-3 programs built against the IN-TREE libc (user/libc.c), whose syscall
 # shim covers all three arches.
 X86_USER_BLOBS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
+                  user/memhog_blob.o \
                   user/args_blob.o user/forktest_blob.o user/forkexec_blob.o \
                   user/pipetest_blob.o user/sigtest_blob.o \
                   user/dnstest_blob.o user/httptest_blob.o \
@@ -574,6 +575,7 @@ else ifeq ($(ARCH),aarch64)
   # in-tree-libc programs and the build rules are already arch-parameterised,
   # so adding them here is the whole change.
   ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
+                     user/memhog_blob.o \
                      user/forktest_blob.o user/pipetest_blob.o \
                      user/redirtest_blob.o user/uidemo_blob.o \
                      user/sigtest_blob.o user/muslhello_muslblob.o \
@@ -659,6 +661,7 @@ CORE_C_SRCS := \
     kernel/core/usyscall.c \
     kernel/core/uaccess.c \
       kernel/core/crash.c \
+    kernel/core/crash_file.c \
     kernel/core/fd.c \
     kernel/core/usock.c \
     kernel/core/service.c \
@@ -682,6 +685,8 @@ CORE_C_SRCS := \
     kernel/core/config.c \
     kernel/core/locale.c \
     kernel/core/task.c \
+    kernel/core/taskstat.c \
+    kernel/core/sysmon.c \
     kernel/core/block.c \
     kernel/core/block_cache.c \
     kernel/core/lock.c \
@@ -700,6 +705,7 @@ CORE_C_SRCS := \
     kernel/gui/widget.c \
     kernel/gui/ui.c \
     kernel/gui/w_controls.c \
+    kernel/gui/w_chart.c \
     kernel/gui/dialog.c \
     kernel/gui/scrollbar.c \
     kernel/gui/w_menubar.c \
@@ -780,6 +786,7 @@ CORE_C_SRCS := \
     kernel/fs/procfs.c \
     kernel/fs/exfat.c \
     kernel/mem/pmm.c \
+    kernel/mem/vmm_account.c \
     kernel/mem/kmalloc.c \
     kernel/mem/slab.c \
     kernel/core/random.c
@@ -802,6 +809,7 @@ CORE_C_SRCS := \
     kernel/core/usyscall.c \
     kernel/core/uaccess.c \
       kernel/core/crash.c \
+    kernel/core/crash_file.c \
     kernel/core/pkg.c \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
@@ -832,6 +840,8 @@ CORE_C_SRCS := \
     kernel/core/module.c \
     kernel/core/block.c \
     kernel/core/task.c \
+    kernel/core/taskstat.c \
+    kernel/core/sysmon.c \
     kernel/core/block_cache.c \
     kernel/core/config.c \
     kernel/core/locale.c \
@@ -878,6 +888,7 @@ CORE_C_SRCS := \
     kernel/gui/widget.c \
     kernel/gui/ui.c \
     kernel/gui/w_controls.c \
+    kernel/gui/w_chart.c \
     kernel/gui/dialog.c \
     kernel/gui/scrollbar.c \
     kernel/gui/w_menubar.c \
@@ -916,6 +927,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/basic.c \
     kernel/gui/apps/netsurf_app.c \
     kernel/mem/pmm.c \
+    kernel/mem/vmm_account.c \
     kernel/mem/slab.c \
     kernel/mem/kmalloc.c \
     kernel/fs/vfs.c \
@@ -954,6 +966,7 @@ CORE_C_SRCS := \
     kernel/core/usyscall.c \
     kernel/core/uaccess.c \
       kernel/core/crash.c \
+    kernel/core/crash_file.c \
     kernel/core/fd.c \
     kernel/core/usock.c \
     kernel/core/service.c \
@@ -977,6 +990,8 @@ CORE_C_SRCS := \
     kernel/core/config.c \
     kernel/core/locale.c \
     kernel/core/task.c \
+    kernel/core/taskstat.c \
+    kernel/core/sysmon.c \
     kernel/core/block.c \
     kernel/core/block_cache.c \
     kernel/core/lock.c \
@@ -995,6 +1010,7 @@ CORE_C_SRCS := \
     kernel/gui/widget.c \
     kernel/gui/ui.c \
     kernel/gui/w_controls.c \
+    kernel/gui/w_chart.c \
     kernel/gui/dialog.c \
     kernel/gui/scrollbar.c \
     kernel/gui/w_menubar.c \
@@ -1075,6 +1091,7 @@ CORE_C_SRCS := \
     kernel/fs/procfs.c \
     kernel/fs/exfat.c \
     kernel/mem/pmm.c \
+    kernel/mem/vmm_account.c \
     kernel/mem/kmalloc.c \
     kernel/mem/slab.c \
     kernel/core/random.c
@@ -1530,6 +1547,17 @@ user/wedge_$(ARCH).elf: user/libc.c user/wedge.c user/libc.h $(USER_CRT0_SRC)
 	$(CC) $(USER_CFLAGS) -c user/wedge.c -o $(OBJ_DIR)/user/wedge.o
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/wedge.o $(OBJ_DIR)/user/libc.o
+
+# §M75 — memhog: a ring-3 program that grows its resident memory in KNOWN steps,
+# so the task manager's memory column can be checked by DIFFERENCE rather than
+# by whether an absolute number looks plausible.  Same build shape as wedge.
+user/memhog_$(ARCH).elf: user/libc.c user/memhog.c user/libc.h $(USER_CRT0_SRC)
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/memhog.c -o $(OBJ_DIR)/user/memhog.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/memhog.o $(OBJ_DIR)/user/libc.o
 
 
 user/args_$(ARCH).elf: user/libc.c user/args.c user/libc.h $(USER_CRT0_SRC)

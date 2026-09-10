@@ -73,11 +73,42 @@ static uint64_t* alloc_table(void) {
     return t;
 }
 
-/* Descend into tbl[idx], allocating a next-level table if absent. */
+/* Descend into tbl[idx], allocating a next-level table if absent.
+ *
+ * **THE BARRIER IS NOT OPTIONAL, AND IT IS ARM-SPECIFIC.**  `alloc_table`
+ * zeroes the new frame and then this publishes a descriptor pointing at it —
+ * two stores that AArch64's memory model is free to make visible to another
+ * observer IN THE OTHER ORDER.  Whoever sees the descriptor first then reads
+ * whatever the frame held when the allocator handed it over, and interprets
+ * that as translation-table entries: a table pointer built out of stale bytes,
+ * followed by a read of an address that may not be memory at all.
+ *
+ * The observers are real, and there are two of them.  A sibling core sharing
+ * this `mm` (a cloned thread) has its own hardware walker; and since §M75 a
+ * task manager WALKS A LIVE SPACE IN SOFTWARE while its owner keeps mapping.
+ *
+ * **THIS BARRIER FIXES A CODE FACT AND NOT A KNOWN FAULT, AND THE DIFFERENCE
+ * IS RECORDED DELIBERATELY.**  It was added while chasing an intermittent EL1
+ * data abort on this arch, on the theory that a half-published table was being
+ * walked.  **That theory is FALSIFIED:** the abort reproduced twice in three
+ * runs afterwards, its `FAR_EL1` is the SAME fixed address every time
+ * (0x80000000 — not the varying garbage a corrupt table pointer would give),
+ * and its `ELR_EL1` lands inside `exc_dispatch`, i.e. in the exception
+ * REPORTING path rather than in any table walk.  That fault is somebody
+ * else's and is written down as open.
+ *
+ * The barrier stays because the ordering hazard is real when read on its own
+ * terms — but claiming it as the fix would be the §M52 shape: a note that was
+ * true about the author's intention and false about the machine.
+ *
+ * `dsb ishst` — store barrier, inner shareable: cheaper than a full `dsb ish`
+ * and exactly the guarantee needed (the zeroing stores land before the store
+ * that publishes them). */
 static uint64_t* next_table(uint64_t* tbl, uint64_t idx) {
     if (!(tbl[idx] & PTE_VALID)) {
         uint64_t* nt = alloc_table();
         if (!nt) return NULL;
+        __asm__ volatile ("dsb ishst" ::: "memory");
         tbl[idx] = ((uint64_t)(uintptr_t)nt) | PTE_VALID | PTE_TABLE;
     }
     return (uint64_t*)(uintptr_t)(tbl[idx] & PTE_ADDR_MASK);
@@ -203,11 +234,13 @@ int vmm_map_4mib(uint32_t va, uint32_t pa, int flags) {
  * at VA >= 4 GiB (l1[4..]).
  * =========================================================================== */
 
-/* Mirrors of vmm.h's flag bits (this file can't include vmm.h — its
- * vmm_map_4mib signature intentionally diverges from the header). */
-#define VMM_EXEC_BIT      0x200u
-#define VMM_SHARED_BIT    0x400u
-#define VMM_WRITABLE_BIT  0x002u
+/* The flag vocabulary comes from the header BOTH sides share.  It used to be
+ * three hand-copied `#define`s here, because this file cannot include vmm.h —
+ * its `vmm_map_4mib` signature intentionally diverges from the declared one.
+ * §M75 needed two more of them (VMM_COW, VMM_USER) for `vmm_space_walk`'s
+ * translation, and a fourth and fifth copy is how a bit comes to mean one
+ * thing on x86 and another here, silently, on the arch nobody is running. */
+#include "vmm_flags.h"
 /* Descriptor software-use bit (IGNORED by the hardware walk) marking a
  * BORROWED page — vmm_space_destroy leaves those frames for their owner. */
 #define PTE_SW_SHARED   (1ULL << 55)
@@ -449,8 +482,8 @@ void vmm_space_destroy(struct vmm_space* s) {
 
 int vmm_space_map(struct vmm_space* s, uintptr_t va, uintptr_t pa, uint32_t flags) {
     if (!s) return -1;                              /* kernel space not user-mappable */
-    int rc = aarch64_vmm_map_user(s, va, pa, 4096, (flags & VMM_EXEC_BIT) ? 1 : 0);
-    if (rc == 0 && (flags & VMM_SHARED_BIT)) {      /* tag borrowed frame in L3 */
+    int rc = aarch64_vmm_map_user(s, va, pa, 4096, (flags & VMM_EXEC) ? 1 : 0);
+    if (rc == 0 && (flags & VMM_SHARED)) {      /* tag borrowed frame in L3 */
         uint64_t e1 = s->l1[(va >> 30) & 0x1FF];
         uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
         uint64_t e2 = l2[(va >> 21) & 0x1FF];
@@ -494,13 +527,68 @@ int vmm_space_protect(struct vmm_space* s, uintptr_t va, uint32_t flags) {
     uint64_t e3 = l3[i];
     if (!(e3 & PTE_VALID)) return -1;
 
-    if (flags & VMM_WRITABLE_BIT) e3 &= ~PTE_AP_RO;  /* writable  */
+    if (flags & VMM_WRITABLE) e3 &= ~PTE_AP_RO;  /* writable  */
     else                      e3 |=  PTE_AP_RO;      /* read-only */
-    if (flags & VMM_EXEC_BIT) e3 &= ~PTE_UXN;        /* EL0-executable */
+    if (flags & VMM_EXEC) e3 &= ~PTE_UXN;        /* EL0-executable */
     else                      e3 |=  PTE_UXN;
     l3[i] = e3;
     __asm__ volatile ("dsb ish\ntlbi vmalle1\ndsb ish\nisb" ::: "memory");
     return 0;
+}
+
+/* §M75 — enumerate every present page in this space's PRIVATE region.
+ *
+ * **THIS IS THE BACKEND THE PORTABLE-FLAGS RULE EXISTS FOR.**  AArch64 keeps
+ * "borrowed" in bit 55 and "COW" in bit 56, where x86 uses 0x400 and 0x800; a
+ * walker that handed the raw descriptor to the shared policy in
+ * vmm_account.c would test bits that mean nothing here, report every page as
+ * private, and be wrong ONLY on this architecture — which is exactly the
+ * failure mode that made the accounting portable in the first place.  So the
+ * descriptor is translated into the VMM_* vocabulary before the callback.
+ *
+ * The traversal mirrors `vmm_space_destroy` / `free_l2_subtree`: the user
+ * region is l1[4..] (VA >= 4 GiB; l1[0..3] are the shared kernel identity
+ * blocks), and only TABLE entries are descended — the same restriction
+ * teardown applies, because `aarch64_vmm_map_user` only ever creates 4 KiB L3
+ * pages down here. */
+void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
+    if (!s || !cb) return;
+
+    for (uint64_t i = 4; i < 512; i++) {                /* user region only   */
+        uint64_t e1 = s->l1[i];
+        if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) continue;
+        uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+
+        for (uint64_t j = 0; j < 512; j++) {
+            uint64_t e2 = l2[j];
+            if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) continue;
+            uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+
+            for (uint64_t k = 0; k < 512; k++) {
+                uint64_t e3 = l3[k];
+                if (!(e3 & PTE_VALID)) continue;
+
+                uint32_t flags = 0;
+                if (e3 & PTE_SW_SHARED)   flags |= VMM_SHARED;
+                if (e3 & PTE_SW_COW)      flags |= VMM_COW;
+                if (e3 & PTE_AP_EL0)      flags |= VMM_USER;
+                if (!(e3 & PTE_AP_RO_BIT))flags |= VMM_WRITABLE;
+                if (!(e3 & PTE_UXN))      flags |= VMM_EXEC;
+
+                cb(ctx, (uintptr_t)((i << 30) | (j << 21) | (k << 12)),
+                        (uintptr_t)(e3 & PTE_ADDR_MASK), flags);
+            }
+        }
+    }
+}
+
+/* §M75 — see vmm.h: a QUERY, so it must not build the table.  `cow_slot`
+ * creates it on first use out of bootmem; calling that from a task manager
+ * would make reading the memory column allocate memory. */
+uint32_t vmm_frame_share_count(uintptr_t phys) {
+    if (!g_cow_ref) return 0;
+    uintptr_t fn = phys >> 12;
+    return (fn < g_cow_nr) ? (uint32_t)g_cow_ref[fn] : 0;
 }
 
 uintptr_t vmm_space_pd_phys(struct vmm_space* s) {
