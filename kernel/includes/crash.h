@@ -131,4 +131,11 @@ const char* crash_kind_name(int kind);
 void crash_boot_begin(void);
 void crash_boot_clean(void);
 
+
+/* §M75.1 — hand the on-disk crash sink its volume, right after the mount and on
+ * EVERY boot path.  Until this is called nothing is recorded to disk, and with
+ * no writable volume it says so once rather than writing into ramfs and looking
+ * healthy (§M64's shortcut bug, §M63 stage 0).  See kernel/core/crash_file.c. */
+void crash_file_attach_persistent(const char* dir);
+
 #endif /* CRASH_H */

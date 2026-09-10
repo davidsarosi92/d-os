@@ -326,6 +326,13 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
              * consumed a key (keymap, console colours) are notified rather
              * than left one boot behind. */
             config_attach_persistent("/mnt");
+            /* §M75.1 — and the crash log, on the SAME volume and by the
+             * same rule: a sink handed a path it merely hopes is writable
+             * swallows every future record in silence (§M63 stage 0,
+             * §M64's shortcuts).  BOTH boot paths call it, or the arch
+             * that misses it keeps losing crash records while the other
+             * keeps them. */
+            crash_file_attach_persistent("/mnt");
             /* §M69 — AFTER the store is overlaid, on BOTH boot paths.  A
              * language read before it would be the default for one boot and
              * the saved value from the next — §M63's "one boot late" defect,
