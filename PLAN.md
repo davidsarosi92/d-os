@@ -61,7 +61,7 @@
 | §M29 | Services / daemons — supervisor + SERVICE() registry + service bus (endpoint/contract/transport) — ✅ shipped (DOCS §4.21) | ~1895 |
 | §M30 | Task scheduling — cron service — ✅ shipped (DOCS §4.23) | ~1935 |
 | §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) — ✅ shipped L1+L2 (DOCS §4.22; L3 HW deferred) | ~1960 |
-| §M32 | Multi-user — identity, login, file perms, isolation | ~2160 |
+| §M32 | Multi-user — identity, login, file perms, isolation   **Extended 2026-09-10: whose process is this** — a tagged owner (kernel / system / user+session), zero meaning KERNEL because three of four `struct task` construction sites bypass `spawn_common`, immutable for the task's life so §M27's orphan re-parenting cannot launder a user's children into system processes.  **Plus a gap audit against the checklist**: no account lifecycle (`useradd`/`userdel`/`passwd` exist nowhere, and a reused uid inherits the previous owner's files), **no per-user settings at all** (`config.c` has no scope — one flat global file), `execve` missing from the permission-check list, and the only writable volume (exFAT) cannot store an owner | ~2160 |
 | §M33 | Execution domains — ✅ COMPLETE (DOCS §4.82): a driver runs in ring 3 from the same source, is supervised and restarted, and an IOMMU-confined device is refused outside its granted windows.  Remaining items all gated on named triggers | ~2265 |
 | §M34 | POSIX process & signals — ✅ shipped (i386): fork(COW)/execve/waitpid/pipe/dup2/signals (DOCS §4.27) | — |
 | §M35 | Threads & futex — ✅ shipped (i386, UP + SMP): clone/futex/thread_create + per-CPU TSS (DOCS §4.28) | — |
@@ -126,6 +126,12 @@ kmap / PAE; non-blocking fetcher `poll` |
 | §M64 | ✅ **Desktop shortcuts (SHIPPED, DOCS §4.64)** — icons on the wallpaper, shortcuts ONLY.  A shortcut is a FILE (`/desktop/*.lnk`) so the file manager, `ls` and `rm` already work on it; four target kinds behind one resolver; drawn by the desktop shell, damaged as small rects; drag-to-move needs §M58's press/motion/release.  **Real cost is the icons: there is no icon anywhere in this system and `GUI_APP` has no icon field.**  Never auto-populate | — |
 | §M65 | ✅ **Widget toolkit with a seam (SHIPPED, DOCS §4.78)** — `WIDGET_CLASS()` registry (name-addressed), `struct ui_spec` as DATA, one event sink per window, two-pass layout, three CELL-based size classes, checkbox/radio/slider/combo/menubar, a window popup, a table view, and the same toolkit from RING 3 over the dosgui bridge | — |
 | §M69 | ✅ **The Console Plate port (SHIPPED, DOCS §4.85)** — the design made real: vector typefaces (Barlow / Barlow Condensed / IBM Plex Mono, ISO-8859-2, rasterised in ring 0 from build-time outlines), a density derived from the framebuffer AT RUN TIME, the seven undrawn controls (switch, segmented, progress, **dialog** — which needed compositor MODALITY, not a widget), ONE shared scrollbar that can actually be used (arrows, trough paging, thumb drag, consume-or-pass-on wheel), the empty state, the control-sizing convention (rule 0: a control BESIDE text vs a control you AIM at), `gui.scroll_invert`, and **localisation** (`LOCALE_CATALOG`, key lookup, fall back to the key itself, live language switch on Save).  Nine apps came off their 8x8-era pixel constants; the terminal grid moved to a runtime mono cell and the boot console deliberately did not | — |
+| §M70 | ✅ **The shell became a registry, and gui.c became eight files (SHIPPED, DOCS §4.86)** — `SHELL_CMD()` in a linker section, one rule making the ordering bug unrepresentable (a verb owns its whole argument tail), `help` GENERATED, and both shells walking one registry: shell.c 4467 → 669, dispatch arms 172 → 0, commands reachable on ARM ~60 → 167.  The compositor split behind a THIRD header tier (`gui_priv.h`): gui.c 5620 → 1635 plus input/compose/wm/app_host/gterm/gui_diag/gui_mode, with a before/after benchmark reported honestly as **no measurable change** | — |
+| §M71 | ✅ **Runtime invariant audits (SHIPPED, DOCS §4.87)** — `AUDIT()` with four rules stated in its header (a check must be able to FAIL; it reports what it OBSERVED; it distinguishes "cannot check" from "checked, clean"; it does NOT fix anything).  Three checks + shipped falsifiers + a cron schedule, because the runs most worth auditing are the ones where `audit` cannot be typed.  **It found a real bug on its first run:** the SYS_EXIT teleport never unwinds the dispatcher, so a ring-3 excursion left the pointer gate armed forever — pid 0 carried it from boot on every ARM machine | — |
+| §M72 | **A reserve the system keeps, and a program you can pause** — design.  Today there is NO reserve (the whole policy is `PMM_ALLOC_FAIL`), no free-space reporting, no stopped state (`SIGSTOP` exists only in the comment saying it cannot be blocked) and **no swap or demand paging of any kind**.  A reserve that REFUSES, plus two controls over one contract: pause, and pause + evict (SWAP aimed by a user at one process — easier than a general pager because a stopped space is quiescent, and it goes in the non-present PTE because the software bits are spent).  Staged so the promise ships before the optimisation.  No blockers | ~4735 |
+| §M73 | **Containers — running a Docker image** — design + scoping.  The capability, not the impression: a per-process filesystem root (the one genuinely missing primitive), an image as a §M35.5 store artifact, identity from §M32, caps from §M49+§M72.  Docker compat is the validation target.  Network isolation is where the honest report has to say "not isolated" | ~4880 |
+| §M74 | **Swap and demand paging** — design.  §M72 builds the mechanism against a QUIESCENT process; this aims it by pressure at a RUNNING one, which brings back the race and adds the question §M72 never asks (*which page*).  Four rungs: an accessed-bit sweep (nothing reads the hardware's own usage data), a page cache, anonymous swap-out, thrash control.  **The reserve is never the swap nor on it** — pinned physical frames, swap excluded from the free-memory figure the watermark reads, and a writeout path that allocates nothing.  Off by default, size configurable and equal to the ceiling; `off` still reclaims clean pages | ~4880 |
+| §M75 | **Task Manager rework** — design.  Two new per-process columns (memory needs the one genuinely new accounting, and `vmm.c` exists THREE times — three counters would disagree invisibly), four system-wide 1 Hz charts (CPU/mem free, network per-device free, I/O needs counters `block.c` has none of), a Total under the table and not in it.  Each chart damages only itself, measured with `gui.stats_ms` | ~4880 |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -258,7 +264,7 @@ what); a session can pick a theme and push on it.
 | M29 | Services / daemons — SERVICE() registry + supervisor (autostart, restart policy) + service bus (endpoint / contract / transport, location-independent binding) | Architecture | ✅ DOCS §4.21 |
 | M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | ✅ DOCS §4.23 |
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | ✅ DOCS §4.22 (L1+L2; L3 HW deferred) |
-| M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation | Security | §M32 |
+| M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation.  **Gap audit 2026-09-10:** stages 1-7 cover identity + login + sessions and NOT the account lifecycle, per-user settings, the execute bit's enforcement point, or on-disk ownership.  Two premises in the section have moved (§M25 shipped, so isolation is no longer deferred; §M39 shipped entropy, so only a KDF is missing) | Security | §M32 |
 | M33 | Execution domains — a service's run location as a declared capability + config choice; driver placement is the flagship case | Reliability | ✅ COMPLETE 2026-08-29 (DOCS §4.82): Tier 0/1/2, shared-controller arbitration, IOMMU stage 5, and per-driver DMA domains proven by a driver in ring 3 whose device is refused outside its own buffer.  OPEN, none of it gating the claim: the modern virtio transport (legacy has no feature bit 33 — a virtio-driver item), a REAL DMA driver ported to drvrt, richer state replay |
 | **M46** | **Resilient control plane — SAK hotkeys + force-kill** — Ctrl+Alt+Del = always-live Task Manager, Ctrl+Alt+X = kill last/frozen app, window chrome (close/min/restore) works even when the app is wedged (close ⇒ force-kill), Task Manager force-quit; the enabler is a real force-kill of a wedged ring-3 process | Reliability / UX | ✅ DOCS §4.37 |
 | M58 | Text selection — pointer grab + press/motion/release, selection model (text bytes / terminal cells), word + line selection | UX | §M58 |
@@ -273,6 +279,13 @@ what); a session can pick a theme and push on it.
 | M65 | Widget toolkit with a seam — `WIDGET_CLASS()` registry, `ui_spec` as data, two-pass layout, one event sink, the same toolkit from ring 3 | UX / Architecture | ✅ DOCS §4.78 |
 | M69 | **The Console Plate port** — vector typefaces at a runtime density, the seven undrawn controls (the dialog needed compositor MODALITY), one usable scrollbar, the empty state, the control-sizing convention, `gui.scroll_invert`, and localisation with a live language switch | UX | ✅ DOCS §4.85 |
 | M64 | Desktop shortcuts — icons on the wallpaper, shortcut files, one resolver, swappable grid/list view | UX | ✅ DOCS §4.64 + §4.79 (drag-to-move, keyboard, Send to desktop, and the ramfs-persistence bug it exposed).  All four target kinds resolve |
+| M70 | **The shell became a registry, and gui.c became eight files** — `SHELL_CMD()` (a verb owns its argument tail, generated `help`, one copy for both shells: ARM went ~60 → 167 commands); the compositor split behind `gui_priv.h` | Architecture | ✅ DOCS §4.86 |
+| M71 | **Runtime invariant audits** — `AUDIT()` registry with four rules, three checks (driver placement / driver resources / ring-3 boundary), shipped falsifiers, cron-driven so the runs worth auditing are covered.  Found a real cross-arch bug: the SYS_EXIT teleport left the ring-3 pointer gate armed, so pid 0 carried it from boot on every ARM machine | Architecture / Security | ✅ DOCS §4.87 |
+| M72 | **A reserve the system keeps, and a program you can pause** — a memory/disk reserve that actually REFUSES; then TWO controls over one contract (*the program stops and stays resumable*): plain pause (`TASK_STOPPED` + real `SIGSTOP`/`SIGCONT` at a safe point) and **pause + evict**, which writes the private pages to a backing store and gives the frames back.  Evict degrades to pause, never the reverse | Resilience | §M72 — design, no blockers |
+| M73 | **Containers — running a Docker image** — the capability (per-process filesystem root, image as a store artifact, identity + resource caps), with Docker compat as the validation target rather than the specification.  §M32 is the gate | Userland / Security | §M73 — design + scoping |
+| M74 | **Swap and demand paging** — reclaim as a POLICY over §M72's mechanism.  Today: no swap, no demand paging, **no page cache**, and a file mapping is an eager private copy (two processes mapping the same `libc.so` get two copies).  The ladder's second rung — a page cache + demand-paged file mappings — is worth more than the swap and needs no disk to write to.  **Off by default** (`mem.swap_policy = off|emergency|normal`) and the size is the user's (`mem.swap_size_mb`, which IS the ceiling) — but `off` still reclaims, because clean file pages need no swap.  **Three hard rules: the reserve is pinned physical RAM, swap NEVER counts as free memory, and the writeout path allocates nothing.**  Explicit non-goal: running a workload larger than RAM | Memory | §M74 — design, gated on §M72 |
+| M75 | **Task Manager: what each process is costing** — ✅ **SHIPPED 2026-09-10 (DOCS §4.88)**: per-process MEM (portable policy over three arch walkers; verified by DIFFERENCE on all three, same 1028 KB constant) + CPU% (a delta over §M53's clock, keyed by PID where damage is keyed by slot), a `blk_read/write/flush` request path that did not exist, a kernel history ring sampled by a service so the window is a VIEW, `WIDGET_CLASS("chart")`, and the Total as the footer.  **Its own instrument found the biggest cost in the tree: the GUI is 50 % of a 4-CPU box AT REST** — §M49's open item, never before given a number.  OWNER still gated on §M32 | UX / Instrumentation | ✅ DOCS §4.88 |
+| M76 | **The aarch64 native syscall dispatcher — SWEPT** — ✅ **SHIPPED 2026-09-10 (DOCS §4.89)**: 26 of i386's 60 cases → **60 of 60**.  Found while §M75's own falsifier drowned an ARM log in `unknown number 35`; every native program using sockets, stat/getdents, threads, getrandom, uname or the dosgui bridge was **silently x86-only**, and the failure is a log line and a -1 rather than a link error, which is why it survived from §M25 to §M75.  **The blocker was the HARNESS, not the sweep** — `uidemo` could not be started on ARM at all (§4.74), so `gui.autorun` had to exist first.  Three cases are REFUSED WITH A REASON rather than wired: aarch64 has no I/O address space, and a driver told its port window was granted would fault at first access | Architecture | ✅ DOCS §4.89 |
 
 ### Cross-cutting constraints
 
@@ -3127,13 +3140,241 @@ metadata and gain teeth when M25 arrives.  Also builds on §M27
    process subtree (session-leader per user, owned by that uid).  A
    `ps` USER column; `whoami` / `id` / `su` / `login` commands.
 
+### Extension (2026-09-10) — whose process is this?
+
+**Asked for directly: track which process belongs to whom — a given USER, or
+the SYSTEM.**  Stage 1 above puts a uid on a task, and that is necessary and
+not sufficient, because **the interesting distinction is not "which uid" but
+"is there a person behind this at all".**
+
+**THREE KINDS, NOT A uid.**  This machine runs a great many tasks that belong
+to nobody: pid 0, the per-CPU idle tasks, init, the §M29 services (`cron`,
+`watchdog`, `netd`, the kworkers), the compositor and the desktop.  Folding
+them into "root" produces a task list where forty rows say `root` and the two
+that matter are lost among them — *a label that is true of everything
+distinguishes nothing.*  So a task's owner is a tagged value:
+
+- **`TASK_OWNER_KERNEL`** — a kernel thread.  No address space of its own, no
+  credentials in any meaningful sense.  `task.user_task` already distinguishes
+  these (Tier B), so the fact exists and is merely not surfaced.
+- **`TASK_OWNER_SYSTEM`** — a ring-3 process that is part of the system rather
+  than of a session: a §M29 service, anything init started that is not a login.
+- **`TASK_OWNER_USER`** + uid — a process in a user's session.
+
+**ZERO MUST MEAN `KERNEL`, AND THIS IS NOT A STYLE CHOICE.**  `task.c:198`
+already records the lesson in its own comment: **`struct task` is constructed in
+FOUR places and only one of them is `spawn_common`** — the other three are pid
+0, the BSP idle task and each AP's idle task, and when §M49 added a scheduling
+weight in `spawn_common` alone, the other three kept `kcalloc`'s zero and the
+first boot took a divide error.  Those three are *exactly* the tasks that must
+be kernel-owned.  **So the enum is ordered so that the zero every unattended
+construction site produces is the correct and safest answer** — whereas a bare
+uid field makes zero mean **root**, and every task those three sites create
+would silently become root's.  *A field whose default is the most privileged
+value is a laundering mechanism waiting for a caller who forgets.*
+
+**ONE ROUTE FOR INHERITANCE.**  A child takes its parent's owner inside
+`spawn_common`, under the same lock, never assigned by callers afterwards.
+§M57's `cpu_home` is the precedent and the warning: it was documented as a fact,
+assigned by callers at moments when they merely *intended* a placement, and four
+sites ended up mutating the wrong queue's ring.  Ownership has the same shape and
+a worse failure — a wrong answer here is a security statement.
+
+**RE-PARENTING MUST NOT LAUNDER OWNERSHIP, and this is the sharp edge.**  §M27's
+init re-parents orphans, so **killing a user's shell would hand its children to
+init — and if ownership followed the parent, those children would become SYSTEM
+processes.**  That is a privilege escalation with no attacker in it: an ordinary
+kill produces it.  Ownership is therefore captured at spawn and is **immutable
+for the life of the task**; re-parenting moves `ppid` and nothing else.  The only
+transition allowed is the deliberate one (a session leader dropping privilege at
+login), and it happens once, before the session's first child exists.
+
+**THE SESSION IS WHAT MAKES A PROCESS A USER'S, NOT THE uid.**  A service
+configured to run as a user's uid is still a system process; a `setuid` binary
+in that user's session is still theirs.  So `TASK_OWNER_USER` carries the
+session id (§M27's hierarchy, stage 3's session leader) and not only the number.
+
+**§M71 INVARIANT, shipped with a way to violate it:** *every task's owner is
+either inherited from its parent or is a root of a declared kind* — and
+separately, *no task's owner changed after its creation.*  The second is the one
+that catches the re-parenting bug, and it cannot be checked by reading, because
+the code that would introduce it looks like tidying up.
+
+**Surfaces:** `ps` gains a USER column, registered ONCE per §M70 so both shells
+and all three arches get it; `/proc/<pid>` reports the owner; and §M75's Task
+Manager gains the column (specified there).  **A kernel thread displays as
+`system`, never as `root`** — the whole point of the extension is that those are
+different answers.
+
+### Extension (2026-09-10, second) — the six things stages 1-7 do NOT cover
+
+**Asked from use, as a checklist: distinguishable users, login, sessions, a home
+directory each, SETTINGS each, creating and deleting accounts, rights ON the
+accounts, execution rights.**  Stages 1-7 cover the first three cleanly and the
+rest either partially or not at all.  What follows is the audit, with the state
+of the TREE measured rather than recalled — because four of the six gaps are
+invisible from the design text and obvious from the source.
+
+**A. THE ACCOUNT HAS NO LIFECYCLE.**  Stage 2 defines the file FORMAT and a
+lookup API and never says who WRITES it — there is no `useradd`, `userdel`,
+`passwd` or `usermod` anywhere in the plan, and none in the tree (measured: no
+such `SHELL_CMD` exists).  As written, the only way to create a user is to open
+`/etc/passwd` in the editor, which also means **the only way to set a password
+is to type a hash by hand.**  And creation is the easy half:
+
+- **DELETION IS THE HARD ONE, and it asks three questions the design never
+  does.**  What happens to the user's FILES (deleted, orphaned, or reassigned)?
+  To their RUNNING processes, if the account is deleted while they are logged
+  in?  To their SESSION?  §M27's `task_kill_tree` and the §M32 session leader
+  together make the process half answerable in one call — but only if the plan
+  says which answer it wants.
+- **A REUSED uid INHERITS EVERY FILE THE PREVIOUS OWNER LEFT BEHIND.**  Files
+  are owned by NUMBER, so if `userdel bob` frees uid 1001 and `useradd carol`
+  takes it, carol owns bob's files with no operation having granted them.  This
+  is a real and classic defect and it has exactly two honest fixes: a uid is
+  never reused while any file claims it, or deletion sweeps.  **Pick one in the
+  plan** — the failure mode of leaving it open is that both halves get written
+  by different people and neither sweeps.
+- **The home directory is a FIELD in stage 2 and nothing creates it.**  Which
+  also means nothing decides its mode (`0700` vs `0755` is the difference
+  between private-by-default and readable-by-everyone) or what is in it — a
+  skeleton, or nothing.
+
+**B. PER-USER SETTINGS DO NOT EXIST, AND THE STORE HAS NO CONCEPT OF SCOPE.**
+Measured: `kernel/core/config.c` has **no `uid`, no `user`, no `profile` and no
+`scope`** — one flat file, `<volume>/d-os.conf`, and every §M63 key in it is
+global.  So today `gui.wallpaper`, `gui.theme`, `locale.language` and
+`keyboard.layout` are machine-wide.  *A system where changing the wallpaper
+changes it for everybody is not a multi-user system; it is one desktop with
+several names for it* — and this is the item on the checklist that stages 1-7
+do not touch at any point.
+
+**THE MECHANISM ALREADY EXISTS AND IS THE ONE TO REUSE.**  §M63 stage 0 made
+the persistent store an OVERLAY over the compiled-in defaults; a user store is
+the same move a second time — defaults, then machine, then user, last writer
+wins, and `config_apply`'s watcher fires exactly as it does now, so a live
+language or theme switch keeps working with no per-key code (§4.85's argument,
+one layer up).
+
+**BUT WHICH KEYS ARE PER-USER IS A PROPERTY OF THE KEY, NOT OF THE STORE**, and
+this is the part that must not be skipped: `gui.wallpaper` is a preference,
+`mem.reserve_kb` (§M72) is a machine setting, and **without a scope on the
+descriptor an unprivileged user's store can override a machine policy** — the
+settings panel would render both identically and write both the same way.  So
+`CONFIG_KEY` gains a scope (`CFG_SCOPE_MACHINE` / `CFG_SCOPE_USER`), the
+generic panel refuses a machine key to a non-root session, and a user store that
+contains one is IGNORED WITH A LINE rather than obeyed — *silently dropping it
+and silently honouring it are both worse than saying so.*
+
+**C. THE EXECUTE BIT'S ENFORCEMENT POINT IS NOT IN STAGE 4'S LIST.**  Stage 4
+checks `vfs_open` / `unlink` / `rename` / `mkdir`.  **`execve` is absent**, and
+it is the one that cannot be inherited from the others: *a program is opened for
+READING in order to be executed*, so an open-time check cannot distinguish "may
+read this file" from "may run it" — the x bit has to be tested where the loader
+is, and nowhere else can do it.  Measured: `kernel/core/proc.c`'s exec path
+performs no permission check of any kind today.
+
+**AND THE COMPANION DECISION HAS TO BE MADE RATHER THAN INHERITED: setuid.**
+Stage 7 lists `su` among the commands while nothing in the design makes `su`
+possible — classically it is a setuid-root binary, and this plan has no setuid
+bit.  Two coherent answers, and the plan must choose:
+
+- **No setuid bit at all**, and `su` / `login` are KERNEL-mediated operations
+  reached through a syscall that re-authenticates.  Fewer moving parts, no
+  privilege-escalation surface on every writable filesystem, and it fits a tree
+  whose whole §M33 argument is that a boundary you cannot enforce should not be
+  claimed.  **This is the recommended one.**
+- **A real setuid bit**, which is a general privilege-transfer mechanism and
+  brings every one of its traps with it (`exec` must drop it on a
+  non-executable mount, on a fault, on a `ptrace`d process, and the persistent
+  volume — see D — cannot store it anyway).
+
+**D. THE ONLY WRITABLE VOLUME CANNOT EXPRESS OWNERSHIP — AND STAGE 4 SPENDS ONE
+CLAUSE ON IT.**  It says exFAT maps to "a mount-wide default owner", which is
+accurate and buries the consequence: **`/` is ramfs and `/mnt` is the only
+filesystem that survives a reboot**, so every home directory, every per-user
+settings file and all user data would live on the one filesystem with no owner,
+no mode and no place to put them.  Our VFS would enforce permissions held in
+RAM, and they would **evaporate at power-off** — after which our own next boot,
+or any other operating system, reads every user's files.
+
+*That is not a stage-4 detail; it decides whether §M32 is enforcement or the
+"isolation theatre" §M33 refuses by name.*  Three honest options, one of which
+the plan must adopt:
+
+1. **A side-car ownership map on the volume** — our own file mapping path →
+   (uid, gid, mode).  Consistent for us, honoured by nobody else, and it must be
+   written in the same operation as the file or the two drift.
+2. **A filesystem that has the fields** — ext2 read/write is a milestone of its
+   own and is the only option that makes the permissions real on disk.
+3. **Say it plainly: on-disk ownership is ADVISORY; only the RAM filesystems
+   enforce.**  Zero work, and it is honest — the §M33 gate applied to storage,
+   and it must then appear in `mount`'s own output, not only in this file.
+
+**E. TWO PREMISES IN THIS SECTION HAVE MOVED SINCE IT WAS WRITTEN — §M52's
+SHAPE, and it is why they are being restated rather than left.**
+
+- The opening dependency says *"today every task is a ring-0 kernel thread
+  sharing the kernel's address space, so 'users' could only ever be
+  advisory."*  **True when written and false now**: §M25 shipped per-process
+  address spaces, ring-3 processes and the ELF loader, and stage 6's "teeth"
+  precondition is therefore already satisfied.  The isolation half is no longer
+  deferred by anything.
+- *"A password hash placeholder … until a real crypto primitive lands."*
+  **Half stale.**  §M39 shipped a ChaCha20 CSPRNG and `/dev/urandom` in the
+  kernel (`kernel/core/random.c`), so the SALT is available today; a hash is
+  NOT — Mbed TLS is a ring-3 library and there is no SHA-256 in the kernel.  So
+  the honest statement is *"we have entropy and no KDF"*, which is a much
+  smaller gap than the one recorded, and it names precisely what to build: one
+  hash primitive, verified against published test vectors, and PBKDF2 over it.
+  **The verification is not optional** — a hash that is wrong in a way nobody
+  notices is a password file that anybody can forge, and a self-consistent
+  implementation cannot detect its own error.
+
+**F. THERE IS NO LOGIN SURFACE IN THE GUI, AND THAT IS A DECISION, NOT A
+WIDGET.**  `gui.autostart` boots straight to a desktop (§4.74).  Stage 3's login
+is a shell flow, so on the machine as it actually boots there is nowhere to log
+in at all.  What is missing first is not a dialogue box but the answer to *what
+IS the desktop before anyone has logged in* — the same question as the lock
+screen and as switching users, and the reason it is its own stage: a
+session-per-user compositor means the desktop task, the app hosts and the
+window list all become per-session, which is real work in the most
+timing-sensitive code in the tree (§M70's own note about `input.c`).
+
+**Stage numbering:** A → stage 2b, B → a new stage 8 (per-user settings), C →
+folded into stage 4 and stage 5, D → a decision recorded in stage 4, E →
+corrections to this section's preamble, F → a new stage 9 (GUI login + lock +
+switch user).  **B and F can be built independently of each other and of the
+rest; A and C are inside stages the plan already has.**
+
 **Definition of done:**
 - Two users log in (different panes or GUI sessions); each gets a shell
   running as their uid with their home; `ps` shows the USER column.
+- **Every task on a freshly booted machine has an owner, and the ~40 kernel
+  threads read `system` rather than `root`** — verified by counting, not by
+  spot-checking a screenshot.
+- **Killing a user's shell leaves its orphaned children owned by that user**,
+  re-parented to init and still attributed correctly.  This is the falsifier for
+  the laundering bug and is run deliberately.
 - User A cannot read user B's `0600` file; root can.  `chmod`/`chown`
   enforced.
 - A non-root user cannot reboot or kill root's / another user's process.
 - **(Post-M25)** user A's process cannot read user B's address space.
+- **`useradd` / `userdel` / `passwd` exist as commands**, and deleting a
+  logged-in user is a case that has been RUN rather than reasoned about: the
+  session goes, the processes go, and the plan's chosen answer for the files is
+  the one that happens.
+- **Two users see different wallpapers** — the falsifier for per-user settings,
+  chosen because it is the one preference that cannot be faked by looking at a
+  config file: the screen either differs or it does not.  And a non-root
+  session is REFUSED a machine-scoped key, with the refusal on screen.
+- **A file with mode `0644` and no `x` bit cannot be executed**, and the
+  refusal comes from the loader — verified by `exec`, not by `open`.
+- **`mount` reports whether the volume can hold ownership at all**, so the
+  answer to "are these permissions real after a reboot" is on the machine and
+  not only in this file.
+- The password hash is checked against **published test vectors** before any
+  account depends on it.
 - DOCS.md gains a "Users & permissions" chapter.
 
 **Out of scope (initially):** POSIX ACLs beyond rwx, PAM-style pluggable
@@ -4732,6 +4973,803 @@ with it.  It now describes code that arrives as a file.  The scope written into
 
 ---
 
+## §M72 — A reserve the system keeps, and a program you can pause
+
+**Status: design.  Asked for directly (2026-09-09), two requests in one
+sentence — and they belong in one milestone because they are the same subject
+seen from two ends: *the machine must stay operable while something is eating
+it.***  The reserve is what buys the time; the pause is what you do with that
+time.  Built separately they produce the classic pair of half-features — a
+watermark that fires and has nothing to do, and a suspend nobody can reach
+because the machine that would run it is already out of memory.
+
+### What is true today (measured, not recalled)
+
+- **There is no reserve of any kind.**  `pmm_alloc*` returns `PMM_ALLOC_FAIL`
+  and that is the whole of the policy — no watermark, no low-memory signal, no
+  notion of a caller who may take the last frame and one who may not.  The first
+  thing to discover that memory ran out is whichever allocation happened to be
+  next, which in this tree is as likely to be the compositor's back buffer or a
+  crash report's sink as it is the program that caused it.
+- **There is no free-space reporting at all** — no `statfs`, no `df`, and ramfs
+  has no quota, so a runaway writer fills RAM through the *filesystem* and the
+  first symptom is an allocator failure in an unrelated subsystem.
+- **There is no stopped state.**  `enum` in task.h is exactly
+  `TASK_RUNNABLE / TASK_SLEEPING / TASK_DEAD`.  `SIGSTOP` appears in all three
+  `signal.c` files *only* in the comment explaining that it cannot be blocked —
+  it is named, unblockable, and unimplemented, which is §M52's shape sitting in
+  the tree right now.
+
+**So today the only answer to "this program is consuming the machine" is
+`fkill` — destroy it.**  That is §M46's guarantee and it is the right last
+resort; it is a poor first one, because it throws away the state that would
+have explained what happened.
+
+### Part A — the reserve
+
+**The rule: a reserve is only real if something is REFUSED.**  A watermark that
+every caller may cross is a statistic.  So the allocation interface gains an
+intent, not a global mode:
+
+- `PMM_NORMAL` — ordinary work.  Refused once free memory is below the reserve.
+- `PMM_CRITICAL` — may take the reserve.  Whitelisted by construction and
+  ENUMERATED in one place, so "who may spend the last of it" is a list somebody
+  wrote (the §M67 export-list argument, applied to memory): the fault path, the
+  crash sinks, the console, the scheduler, the audit and the suspend/kill path
+  itself.
+- The reserve is a **§M63 `CONFIG_KEY`** (`mem.reserve_kb`, and a disk sibling
+  `fs.reserve_kb`) — the right value depends on the machine, and §M48 made the
+  memory size a runtime fact.
+- **THE RESERVE IS RESIDENT PHYSICAL MEMORY AND STAYS THAT WAY.**  It is never
+  backed by, measured against, or located on a swap area — see §M74's three
+  rules, which are written there because that is the milestone able to violate
+  them.  Recorded here too because the reserve is defined here: *a reserve
+  redeemable only through the disk requires I/O to collect, which requires
+  memory, which is the shortage it was created for.*
+
+**It must ANNOUNCE the transition, once, not per allocation** — a low-memory
+condition that prints per failure buries the log exactly when the log is the
+only instrument left.  And the report says what OBSERVED state it is in
+(free / reserve / how much, from the allocator, not from a counter we keep —
+audit rule 2).
+
+**The filesystem half is the same rule one layer up:** `statfs` first (there is
+nothing to reserve against while nothing can report free space), then a
+reserve honoured by `vfs_write`/`mkdir`, then `df`.  exFAT already tracks its
+allocation bitmap; ramfs needs a byte budget, which it has never had.
+
+**What it deliberately is NOT: this is not an OOM killer.**  Choosing a victim
+by heuristic is a policy that is wrong in public, and this tree's rule is that
+the destructive action is the USER's escalation (§M47.1's two-click close,
+§M46's `fkill`).  The reserve's job is to keep the machine able to ASK.
+
+### Part B — suspend and resume
+
+**THE CONTRACT, STATED FIRST, BECAUSE EVERYTHING BELOW IS SUBORDINATE TO IT:
+the program stops doing work and stays RESUMABLE.  Freeing its memory is an
+optimisation OF that contract, never a condition of it.**
+
+That single sentence decides the design of the two controls the request asks
+for — *"egy sima pause és egy ami pause + memória felszabadítása"* — and it
+decides which way they degrade.  They are not two independent features; they
+are one promise at two costs:
+
+| | what it does | cost to stop | cost to resume | when it is refused |
+|---|---|---|---|---|
+| **Pause** | off every runqueue, keeps every frame | instant | instant | never |
+| **Pause + evict** | writes private memory to the backing store, frees the frames | one write of the resident set | one read, paid as faults | no writable volume, or nothing evictable |
+
+**THE FALLBACK DIRECTION IS ONE-WAY AND IS THE WHOLE SAFETY ARGUMENT: pause +
+evict degrades to pause, and pause never degrades to anything.**  If the
+backing store is missing, full, or the address space turns out to hold nothing
+that may safely leave, the program is still stopped and still resumable — it
+merely kept its memory, and the report says so.  *A control that refuses to
+stop a runaway program because it could not also free its memory would fail at
+the one job both buttons exist for.*
+
+#### Level 1 — `TASK_STOPPED`, and the two things that make it honest
+
+1. **A stopped task is off every runqueue and holds nothing it took.**  The
+   §M57 rules apply unchanged — the transition is one step under the owning
+   queue's lock, and `task_rq_audit` gains the rule "a STOPPED task is on no
+   runqueue", so the invariant is CHECKED rather than intended (§M71's shape:
+   the check ships with the feature, and with a way to violate it).
+2. **A stop must not deadlock the machine.**  A task suspended while holding a
+   spinlock, the print lock, the stack lock or a VFS lock stops everything that
+   wants that lock — so the stop takes effect at a **safe point**, exactly like
+   §M46's force-kill does at the timer preemption boundary, and a task inside a
+   critical section is stopped when it leaves one.  `preempt_count != 0` is the
+   test this tree already trusts for "holds a lock" (§M33 Tier 0 uses it to
+   REFUSE recovery for the same reason).
+
+#### Level 2 — evicting the memory
+
+**What this is, named plainly: SWAP, aimed by a user at one process instead of
+by page pressure at the whole machine.**  There is no swap, no demand paging
+and no non-present-but-not-a-fault PTE anywhere in this tree today, so this is
+new machinery rather than a new caller of old machinery.
+
+**IT IS EASIER THAN A GENERAL SWAPPER IN THE ONE WAY THAT USUALLY MAKES THEM
+HARD, AND THAT IS WHY IT IS THE RIGHT FIRST CUSTOMER.**  A demand pager must
+write out a page that its owner may touch at any instant, which is where the
+races live.  Here the process is already stopped at a safe point, so **its
+address space is quiescent for the whole operation** — nothing it owns can
+change under the writer.  The remaining hazards are all about OTHER holders of
+those frames, and they are enumerable (below) rather than timing-dependent.
+
+**The mechanism.**  Walk the stopped task's `vmm_space`; for each private
+anonymous page: write the frame to the backing store, record where, clear the
+present bit, free the frame.  Resume is the inverse, driven by faults —
+`vmm_cow_fault`'s call site in the `#PF` path is exactly where the third case
+goes, so the fault handler learns one new answer rather than a new structure.
+
+**Where the backing-store offset lives, because the obvious answer is the
+wrong one.**  The software PTE bits are nearly spent — `VMM_SHARED` is 0x400
+and `VMM_COW` is 0x800 — so there is no room there for an offset.  There is no
+need for room: **a NOT-PRESENT PTE has every bit except bit 0 free to
+software**, because the hardware stops looking once present is clear.  The
+offset goes in the entry itself, which keeps the page tables the single record
+of what a mapping is.  *The alternative — a side table keyed by virtual
+address — is a second structure that must be kept in step with the page tables
+across fork, exec, mprotect and teardown, and this tree has a standing finding
+about facts kept in two places (§4.83's one driver under two names, §M65's file
+manager holding a directory in two representations).*
+
+**WHAT MUST NOT BE EVICTED — the list is the design, and each entry has a
+different reason:**
+
+- **The task's kernel stack.**  It holds the frame you would resume ONTO.
+  Evicting it is checkpointing, which is a different and much larger milestone;
+  a pause that cannot resume is a kill with extra steps.
+- **`VMM_SHARED` / memfd pages.**  Another process is using them right now.
+- **COW pages with a refcount above 1.**  Our reference may be dropped, but the
+  frame stays — §M48's per-frame refcount table is what makes this answerable,
+  and freeing a frame a live sibling still maps is the double-free that
+  milestone already paid for once.
+- **Device mappings** — framebuffer, MMIO windows.  Not memory; writing them to
+  a file and reading them back is meaningless.
+- **ANY PAGE A DEVICE MAY DMA INTO, and this is the one that would fail
+  silently.**  A frame named by a NIC's receive descriptor or an audio BDL
+  entry is written by hardware that has never heard of this feature: free it
+  and the device keeps writing into whatever the allocator hands out next.
+  §M33's IOMMU grants and `drv_res_note_dma` are the existing record of what a
+  device can reach, and §M71's `driver-resources` audit already walks it — so
+  the check has a home rather than needing a new one.
+
+**AND WHAT AN EVICTED PROCESS STILL HOLDS, which has to be in the report or
+"paused" will be read as "harmless":** its file descriptors, its sockets, its
+§M53 timers, its window.  **Evicting memory does not suspend the world around
+the process** — a TCP connection goes on ageing toward its timeout, an armed
+`ktimer` still fires, a held lock on a shared resource is still held.  So the
+result line names what was freed AND what was not, in those terms.
+
+**The backing store is a §M63 config key (`mem.suspend_store`) and its absence
+is an HONEST DECLINE**, the pattern §4.63 and §M60 both landed on: with no
+writable volume the evict half says so in words and the pause still happens.
+*A feature that silently does nothing on a machine with no disk is how a
+setting stops meaning anything* — and this tree's everyday i386 run had exactly
+that shape until §4.66.
+
+**THE SEAM (convention #5 — the final API shape even when the first
+implementation is one caller).**  Written this way, eviction and a future
+demand pager are ONE mechanism differing only in what aims it: a user's button
+here, the Part A watermark later.  That is the reason to build the harder
+control now rather than a special-case "suspend to disk" that a real swapper
+would have to replace.
+
+#### The controls
+
+`SIGSTOP`/`SIGCONT` carry level 1 — the names already exist in all three
+`signal.c` files and are already unblockable, so implementing them is what
+stops that comment being a lie.  Level 2 is an explicit action, not a signal:
+`stop <pid>` / `stop -e <pid>` / `cont <pid>` as `SHELL_CMD()`s, and **two rows
+in the Task Manager's context menu**, which is where a runaway program is
+actually noticed.
+
+**The Task Manager must SHOW all three states distinctly — running, stopped,
+stopped+evicted.**  A paused process that looks like a wedged one is worse than
+no pause at all, because the operator's next move is to force-kill it; and an
+evicted one that looks like a merely-stopped one hides the fact that its first
+instruction back will cost a disk read.  This is §M23's three-sound-icons
+argument and §M66's "the user turned it off" vs "it misbehaved": *states with
+different consequences must not share a picture.*
+
+1. **A stopped task is off every runqueue and holds nothing it took.**  The
+   §M57 rules apply unchanged — the transition is one step under the owning
+   queue's lock, and `task_rq_audit` gains the rule "a STOPPED task is on no
+   runqueue", so the invariant is CHECKED rather than intended (§M71's shape:
+   the check ships with the feature, and with a way to violate it).
+2. **A stop must not deadlock the machine.**  A task suspended while holding a
+   spinlock, the print lock, the stack lock or a VFS lock stops everything that
+   wants that lock — so the stop takes effect at a **safe point**, exactly like
+   §M46's force-kill does at the timer preemption boundary, and a task inside a
+   critical section is stopped when it leaves one.  `preempt_count != 0` is the
+   test this tree already trusts for "holds a lock" (§M33 Tier 0 uses it to
+   REFUSE recovery for the same reason).
+
+### Where the two parts meet
+
+When the reserve is crossed, the honest first offer is *"this task is using it
+— pause it, or pause it and take its memory back?"*, and both are decisions the
+user can reverse.  §M31's watchdog and §M46's `auto_fkill_ms` currently
+escalate straight to destruction; **Part B gives them two rungs below that**,
+and Part A is what keeps enough memory in hand to run the eviction at all — a
+writeout needs a buffer, and the moment you need it is the moment there is
+none.  *That dependency is the reason these are one milestone: an evict path
+that allocates on the way out fails exactly when it is called.*
+
+### Staging, and what may be cut
+
+**Stage 1 (Part A) — the reserve, `statfs`/`df`.**
+**Stage 2 — `TASK_STOPPED` + `SIGSTOP`/`SIGCONT` + the shell and Task Manager
+controls.**  *Shippable and useful on its own: it is the whole of the "the
+program stops and stays resumable" contract, at zero new risk to memory
+management.*
+**Stage 3 — eviction.**  The new machinery, and the stage that may slip
+without stages 1–2 losing their value.
+
+That ordering is deliberate: **stage 2 is the promise and stage 3 is the
+optimisation**, so the milestone's value does not sit behind its riskiest part.
+
+**Prerequisites:** stages 1–2 have none that are missing — §M34's signals,
+§M49's runqueue discipline, §M57's audit and §M63's config keys are all
+shipped.  Stage 3 needs a writable volume (§4.66/§4.73's exFAT create+write)
+and §M48's per-frame refcounts, both of which exist.  **This is the rare
+milestone with no blocker at all.**
+
+### Definition of done
+
+**Part A:**
+- With `mem.reserve_kb` set, a memory hog is REFUSED at the watermark while the
+  shell, the compositor and `crash` all still work — proven by a test that hogs
+  until failure and then still types a command.
+- The low-memory line appears exactly ONCE per crossing, and `audit` is clean.
+
+**Part B stage 2 (pause):**
+- `stop <pid>` on a spinning task drops its CPU use to zero; `ps` and the Task
+  Manager both read `stopped`; `cont` resumes it; and its accumulated `cpu_ms`
+  is **unchanged across the pause**, which is what proves it was suspended
+  rather than merely descheduled.
+- **The falsifier ships:** a deliberate `stop` aimed at a task inside a
+  critical section must not wedge the machine — verified to take effect only on
+  the way out.
+
+**Part B stage 3 (evict) — and these are numbers, not impressions:**
+- **The memory actually comes back.**  Free frames measured before the stop and
+  after the evict, with the difference matching the process's reported resident
+  set.  *Without that comparison, "pause + free memory" and "pause" produce the
+  same picture.*
+- **The memory comes back CORRECT.**  The test program checksums its own heap
+  before being stopped and re-checksums after `cont`; a mismatch fails the run.
+  *A resume that returns the wrong bytes looks exactly like a resume that
+  worked, until the program uses them.*
+- **The exclusions are exercised, not merely coded:** a process holding a
+  memfd shared with a live sibling, and one whose driver has an outstanding DMA
+  grant, are both evicted PARTIALLY with the untouched pages named in the
+  report — and the sibling's data is verified intact afterwards.
+- **The decline is verified in both directions:** with no writable volume,
+  `stop -e` still stops the process and says why it kept its memory; with one,
+  the same command frees it.  *A warning that never fires and a warning that
+  always fires are equally uninformative.*
+- `audit` gains the invariant **"no runnable task has a swapped-out page
+  table entry"**, with a shipped way to violate it.
+- All three arches.
+
+---
+
+## §M73 — Containers: running a Docker image, and what that actually costs
+
+**Status: design + scoping.  Asked for directly (2026-09-09): "docker
+futtatása valamilyen formában".**  The scoping is most of the value here,
+because "some form of Docker" spans a two-afternoon feature and a multi-year
+one, and this tree's own §DRV rule ("Linux-inspired, not Linux-bound — reject
+what is accidental history") means namespaces and cgroups have to EARN their
+way in rather than arrive because Linux has them.
+
+**The framing that makes it a d-os milestone rather than a Linux impression:**
+what is wanted is *an application arriving as an image, running against its own
+filesystem, unable to see or exhaust the rest of the machine.*  Docker
+compatibility is the **validation target** for that capability — exactly the
+role NetSurf plays for §M42 — not the specification of it.
+
+### The unfair advantage, stated first
+
+**d-os already executes unmodified Linux ELF binaries.**  §M36/§M41's
+personality plus §M50's translation engine mean the contents of an
+`ubuntu`-style image are not a porting problem here the way they would be on a
+fresh kernel; §M37 gives dynamic linking, §M39 gives TLS for a registry pull.
+That is the expensive half of "run a container" and it is already done.
+
+### The ladder, cheapest first — each rung is independently useful
+
+1. **A rootfs view.**  `chroot`-shaped: a per-task filesystem root, so a process
+   resolves `/` to a subtree.  **This is the one genuinely missing primitive** —
+   the VFS has a global root today, so there is no per-process filesystem view
+   at all, and every rung above depends on it.  It is also worth having on its
+   own: §M35.5's store profiles want it, and so does a build sandbox.
+2. **The image as a store artifact.**  An OCI image is layers of tar + a JSON
+   manifest.  §M35.5 is already a content-addressed store keyed by hash, which
+   is the same idea with a different serialisation — so an image unpacks into
+   `/store` and a container is a profile over it.  Needs tar + gzip (ring 3,
+   where §M42's codecs already live) and a small JSON reader.
+3. **Identity isolation** — a container runs as a uid that owns nothing outside
+   its rootfs.  **This is §M32, not new work**, which is the argument for §M32
+   landing first regardless.
+4. **Resource caps.**  Not cgroups — the CAPABILITY.  §M49 already has weights
+   and `nice` for CPU; §M72 (above) supplies the memory reserve and the
+   accounting a cap needs.  A cap is then a number on a task subtree
+   (§M27 already has subtrees) and not a new hierarchy.
+5. **Network isolation.**  §M24's stack is single-instance above the transport
+   with a static connection table; a per-container view is a real change to it
+   and the honest first answer is *shared network, said plainly* — the §M33
+   rule against isolation theatre applies to network namespaces exactly as it
+   did to execution domains.
+6. **The Docker CLI / daemon surface.**  A compatibility layer over the above,
+   and correctly the LAST rung: it is a protocol, not a capability.  Serving it
+   before rungs 1–4 exist would be the thing this tree refuses by name.
+
+### The verdict this section must produce before implementation
+
+**Rung 1 alone is a milestone worth shipping** (per-process filesystem root),
+and it is the only rung with no substitute.  Rungs 2–4 are mostly assembly of
+things already here.  **Rung 5 is where an honest report has to say "not
+isolated", and rung 6 is where it becomes possible to claim more than is
+true** — so the definition of done below is written to make the claim
+falsifiable rather than impressive.
+
+**What it deliberately is NOT:** not a VM, and not a security boundary against
+hostile code until §M32 and §M68 have both landed.  A container here isolates a
+FILESYSTEM VIEW and a RESOURCE SHARE, which is what most of the use is; saying
+more than that would be the same theatre §M33 spent a milestone refusing.
+
+**Definition of done (rung 1–3, the shippable slice):**
+- An OCI image's rootfs unpacks into the store; `run <image> <cmd>` executes an
+  **unmodified Linux binary from that image**, resolving `/` inside it, and
+  cannot open a file outside it — proven by a test that TRIES to.
+- The container runs as its own uid (§M32) and `ps` shows which container a task
+  belongs to.
+- `audit` gains a check: **no task's root escapes its container**, with a shipped
+  way to violate it (§M71 rule 1).
+- The report says, in words, what is NOT isolated — network and kernel — so a
+  reader of the output cannot conclude more than was built.
+
+**Prerequisites, in order:** §M32 (identity) → §M72 (accounting + reserve) →
+rung 1 (per-process root) → the rest.  **§M32 is the gate**, which is a second
+independent reason it should be the next milestone.
+
+---
+
+## §M74 — Swap and demand paging: reclaim as a policy, not a favour
+
+**Status: design.  Asked for directly (2026-09-09), immediately after §M72 —
+and correctly, because §M72 stage 3 builds most of a swapper's MACHINERY and
+none of its JUDGEMENT.**
+
+### Why this is not §M72 with a bigger scope
+
+§M72's evict is aimed **by a person, at a stopped process**.  This is aimed
+**by pressure, at a running one**, and that single difference brings back the
+hazard §M72 explicitly dodges: *the owner may touch the page while it is being
+written out.*  §M72 gets to say "the address space is quiescent for the whole
+operation"; a reclaim pass never can.  Add to that the question §M72 never has
+to answer — **which page** — and the two are a mechanism and a policy, not a
+small feature and a big one.
+
+**The seam is already written into §M72** (convention #5): the non-present-PTE
+encoding, the swap-in fault case beside `vmm_cow_fault`, the backing store and
+the exclusion list are built there and REUSED here.  §M74 adds what aims them.
+
+### What is true today (measured, not recalled)
+
+- **No swap, no demand paging, no page reclaim of any kind.**  Every mapped
+  page is resident from the moment it is mapped until the space is torn down.
+- **There is no page cache.**  `kernel/core/block_cache.c` caches disk BLOCKS
+  underneath the filesystem — a different object.  Nothing caches the pages of
+  a mapped file.
+- **A file mapping is an EAGER PRIVATE COPY.**  `sys_mmap`'s own comment says
+  it "reads `len` bytes from the file", so a file-backed mapping is `read()`
+  into fresh anonymous frames.  **Two processes mapping the same `libc.so` get
+  two full copies of it** — and after §M37/§M38 the ordinary case is a musl +
+  libstdc++ + Mesa stack mapped by every dynamic program on the machine.
+- **Nothing reads the hardware's own usage data.**  x86's PTE Accessed bit and
+  aarch64's Access Flag both exist and are referenced nowhere in `vmm.c`.
+
+### The honest question, asked before the design
+
+**Does this machine want swap?**  Swap's bad reputation is earned, and it is
+earned by one specific goal: *running a workload larger than RAM*, which does
+not run — it thrashes, and a thrashing machine is worse than one that refused
+the allocation, because the refusal names what happened.  §DRV's rule applies
+("reject what is accidental history"), so the goal has to be stated narrowly:
+
+**GOAL: reclaim memory that is COLD, so §M72's reserve has somewhere to come
+from and a long-lived desktop stops paying for pages nothing has touched in
+minutes.  EXPLICIT NON-GOAL: running a workload several times the size of
+RAM.**  A cap on how much may be swapped is therefore part of the design and
+not a tuning afterthought — *a swapper with no ceiling is a machine that will
+eventually choose to thrash rather than fail, on its own, without being asked.*
+
+### THE RESERVE IS NEVER THE SWAP, NOR ON IT — three rules, three different failures
+
+**Stated as a constraint on this milestone (2026-09-09): *"a rendszer
+tartaléka véletlenül se a swap vagy annak területén legyen."*  It is the right
+instinct and it decomposes into three independent rules — each of which is
+violated by a different everyday shortcut, and each of which fails in a
+different way.**
+
+**RULE 1 — THE RESERVE IS RESIDENT PHYSICAL MEMORY AND IS PINNED.**  Frames
+held by §M72's reserve, and frames handed to a `PMM_CRITICAL` caller, are never
+candidates for reclaim.  *If the reserve could be swapped out it would exist
+only as a promise redeemable through the disk — and redeeming it means I/O,
+which means buffers, which means memory, which is the thing you have run out
+of.*  That circle is not a corner case; it is the exact state the reserve was
+created for.  A reserve backed by swap is not a reserve, it is a second
+allocation of the same shortage.
+
+**RULE 2 — SWAP NEVER COUNTS AS FREE MEMORY.**  The watermark is measured
+against **physical free frames only**.  The tempting arithmetic —
+`free = RAM_free + swap_free` — makes the reserve satisfiable by disk, so the
+low-memory line never fires until the swap area itself is full, **by which
+point the machine is already thrashing and the warning has no time left to
+buy.**  This is the overcommit trap, and it is the reason systems that take it
+need an OOM killer to get out.  *A reserve measured in a currency that can be
+printed is not a reserve.*
+
+**RULE 3 — THE WRITEOUT PATH ALLOCATES NOTHING.**  Its buffers, its descriptor
+and its slot bitmap are allocated **once, at swap-enable time, and pinned** —
+because a reclaim that allocates in order to make progress fails precisely when
+it is called.  §M72 already states this shape for its evict path; here it is
+load-bearing rather than tidy, since the caller is the watermark itself.
+
+**All three are `AUDIT()` invariants, not comments** (§M71 rule 1 — each ships
+with a way to violate it): *no reserve frame carries a swap slot*, *the
+free-memory figure the watermark reads names no swap*, and *the writeout
+descriptor was allocated before the first reclaim.*  §M52's whole lesson is
+that a rule of this kind, written only in prose, survives exactly until a
+later milestone moves the premise out from under it.
+
+### Stability first: the order in which things are given up
+
+*"Mindent meg kell tenni a rendszer stabilizálásáért"* — as a design rule that
+means the order of sacrifice is FIXED and WRITTEN DOWN, so no reclaim decision
+is improvised under pressure:
+
+1. **Clean file-backed pages.**  Free to drop, re-readable from the file they
+   came from.  No swap needed, no data at risk.
+2. **Cold anonymous pages — only if swap is enabled**, and under the policy key
+   below.
+3. **Refuse the allocation** (§M72 Part A).  A refusal is a diagnosable event.
+4. **Never:** the reserve, the fault path, the crash sinks, the console, the
+   scheduler, or any page a device may DMA into.
+
+Each step announces itself once.  **Nothing on this list is a kill** — choosing
+a victim process remains the user's escalation, exactly as in §M46 and §M72.
+
+### The ladder — and the second rung is worth more than the swap
+
+1. **An accessed-bit sweep — the data a policy needs, which nothing collects.**
+   Walk the page tables periodically (on a §M49 workqueue, never an ISR),
+   fold each PTE's Accessed / AF bit into a per-frame age, clear it.  This is
+   the input to every decision below, and **without it any reclaim is random
+   eviction, which is worse than no reclaim at all** — it will pick the page a
+   loop is about to touch as readily as one nothing has read since boot.
+   *Shippable on its own as pure instrumentation:* `meminfo` gains "how much of
+   this machine's resident memory is actually being used", which is a question
+   nothing here can answer today.
+
+2. **A page cache, and demand-paged file mappings.**  **THIS IS THE RUNG WITH
+   THE LARGEST MEASURED WIN AND THE LEAST RISK, and it is not swap at all.**
+   A clean file-backed page is the cheapest thing in the world to reclaim: drop
+   it, and re-read it from the file it already came from — no swap area, no
+   writeback, no possibility of losing data.  It also fixes the double-copy
+   above: one cache entry per (file, offset) shared by every mapper, which is
+   what makes mapping the same `libc.so` twice cost once.  **The claim must be
+   MEASURED before it is believed** — resident bytes with two dynamic programs
+   running, before and after — because §M56.2's rule applies: an optimisation
+   whose falsifying measurement is not written first is an assumption.
+
+3. **Anonymous swap-out under pressure.**  The actual swapper, and by this
+   point it is mostly assembly: §M72 supplies the PTE encoding, the fault path,
+   the backing store and the exclusion list; rung 1 supplies the choice of
+   victim; the trigger is Part A's watermark.  **The one genuinely new problem
+   is the running owner** — a page being written out must be made non-present
+   FIRST and the writeout completed before the frame is reused, so a fault
+   arriving mid-flight waits for the write rather than reading a half-written
+   slot.  (TLB shootdown is already solved: §M51 built it for exactly this
+   class of weakening edit, and forgetting it here would be that milestone's
+   bug returning — a stale writable entry on another core, no fault, silent
+   corruption.)
+
+4. **Thrash control.**  The swap area's size IS the ceiling, and reaching it
+   produces a **refusal rather than a spiral**.  **This rung is what keeps the
+   non-goal above honest**, and it is the one most likely to be skipped, so it
+   has its own done-criterion below.
+
+### Where the swap area lives, how big it is, and who turns it on
+
+A **file on the exFAT volume**, not a partition: this machine's storage story
+is a mounted volume (§4.66), and a swap partition would need a second one
+nobody has.  §4.73's exFAT can create and size a file, and its `NoFatChain`
+contiguous runs are what make swap I/O one extent rather than a FAT walk per
+page — **so the area is allocated ONCE, contiguously, at enable time**, and a
+volume that cannot provide a contiguous run declines with the reason.
+
+**THE SIZE IS THE USER'S, AND IT IS ALSO THE CEILING.**  `mem.swap_size_mb`
+(§M63) allocates the file, and rung 4's refusal happens when that area is full
+— *one number with one meaning, rather than a size and a separate cap that must
+be kept in agreement; two numbers describing one limit is a second place to get
+it wrong, and this tree has a standing finding about facts kept twice.*  A
+change takes effect at the next enable, because the extent is allocated once.
+
+**IT IS OFF BY DEFAULT, AND THE POLICY IS THE USER'S TOO** — stated as a
+preference in the same breath as the constraint above (*"a swapet csak
+kritikus helyzetekre használnám, persze, lehet ez is opció, ki hogy akar élni
+vele"*), and it is the right default for this tree independently: §M33's IOMMU
+and §4.73's `DOS_DISK=none` are both deliberate non-defaults for the same
+reason — *making the heavier path standard is how the lighter one stops being
+tested.*
+
+`mem.swap_policy` = **`off`** (default) | **`emergency`** | **`normal`**:
+
+- **`off`** — no anonymous page is ever written out.
+- **`emergency`** — anonymous swap-out happens **only when the §M72 reserve is
+  actually threatened**, never as routine housekeeping.  This is the setting the
+  request describes, and it is the one that makes swap a stability mechanism
+  rather than a memory-size illusion.
+- **`normal`** — cold pages may be reclaimed proactively.
+
+**THE PROPERTY THAT MAKES THE DEFAULT DEFENSIBLE: `off` STILL RECLAIMS.**
+Rung 2 drops clean file-backed pages and re-reads them from the files they came
+from — no swap area, nothing written, no data at risk.  So the default
+configuration is not "no memory management", it is **"reclaim, but never write
+anything out"**, and a machine with no writable volume at all gets rungs 1 and 2
+in full.  *That is a third reason the page cache is the better first rung: it is
+the half that needs no disk to write to, and it is the half that is on for
+everybody.*
+
+### Relationship to the milestones around it
+
+- **§M72 is the prerequisite and ships first** — it builds the mechanism against
+  the easy case (a stopped, quiescent process) where a bug is reproducible.
+  *Building the general pager first would mean debugging the encoding, the
+  fault path and the reclaim policy simultaneously, with the races on.*
+- **§M72 Part A supplies the trigger.**  A reclaim pass with no watermark to
+  react to has nothing to tell it when to run.
+- **§M49 supplies where it runs** (deferred work, one sweep, never in an ISR).
+- **§M71 supplies the invariant:** *every swap slot is owned by exactly one
+  PTE.*  A slot leaked is a disk that fills with nothing in it; a slot owned
+  twice is two processes silently sharing one page's worth of corruption.
+  Ships with a way to violate it.
+
+### Definition of done
+
+- **Rung 1:** `meminfo` reports the resident set split by age, and the numbers
+  MOVE in the right direction under a synthetic workload that touches a known
+  fraction of its pages — *a usage metric that does not respond to usage is a
+  constant with a label.*
+- **Rung 2, as a measurement:** two dynamic programs sharing `libc.so` use
+  measurably less memory than the sum of their private copies, with the before
+  and after both recorded.  Mapping a file twice reads it from disk once.
+- **Rung 3:** a process whose cold pages have been swapped out produces
+  **correct output** afterwards (it checksums its own heap, as in §M72), the
+  free-frame count moved by the amount reported, and `audit` is clean.
+- **Rung 3's race, falsified deliberately:** a test that touches a page while
+  its writeout is in flight, run many times, with zero mismatches — *the one
+  failure §M72 cannot have and this milestone can.*
+- **Rung 4:** with `mem.swap_size_mb` set small, a deliberately oversized
+  workload is **REFUSED at the ceiling and the machine stays responsive**,
+  rather than swapping until it stops.  The test measures shell responsiveness
+  during the refusal, because "it did not crash" and "it was usable" are
+  different claims.
+- **The three reserve rules, each falsified on purpose:** a build that lets a
+  reserve frame be swapped must be shown to deadlock the low-memory path (rule
+  1); the free-memory figure the watermark reads must be shown NOT to move when
+  a swap file is enabled (rule 2); and the writeout path must complete with the
+  allocator forced to fail (rule 3).  *Each of these is a rule that would
+  otherwise look correct in every test that never runs out of memory — which is
+  every test that does not go looking.*
+- **The default is verified as a configuration, not assumed:** with
+  `mem.swap_policy = off` on a machine with no writable volume, rungs 1 and 2
+  still reclaim and the measured resident set still falls under pressure.
+- All three arches.
+
+### What it deliberately is NOT
+
+Not an overcommit policy, not a way to run more than RAM, and **not a
+substitute for §M72 Part A's reserve** — a reserve refuses, a swapper defers,
+and a machine that only defers eventually has nowhere left to defer to.  The
+three rules above exist to keep those two mechanisms from being quietly merged,
+because merging them is easy, looks like an optimisation, and removes the only
+part of the system that can still say no.
+
+---
+
+## §M75 — Task Manager: what each process is costing, and what the machine is doing
+
+**Status: design.  Asked for directly (2026-09-09):** per-process **memory and
+CPU usage** columns; **four small line charts** under the table — CPU, memory,
+I/O operations, network operations — refreshing once a second; and a **Total**
+line **directly under the table but not part of it**, always visible.
+
+### The scoping finding, first, because it decides the size of this milestone
+
+**The request as worded is much cheaper than it looks, and the reason is that
+the charts are asked for SYSTEM-WIDE while only two quantities are asked for
+PER PROCESS.**  Attributing I/O and network traffic to the process that caused
+it is the expensive part of a task manager — it needs an owner on every block
+request and every socket, threaded through layers that today have no idea who
+called them.  **That is not what was asked for.**  Four system-wide charts plus
+two per-process columns splits cleanly into "counters that already exist or are
+trivial" and "one genuinely new accounting", and nothing in it requires
+per-request attribution.
+
+*This is worth writing down because the obvious next request — "and show me
+which process is doing the I/O" — is a different and much larger milestone, and
+the boundary should be visible before somebody walks across it by accident.*
+
+### What is true today (measured, not recalled)
+
+- **The table has four columns — PID, NAME, CPU, STATE — and the CPU column is
+  `cpu_ms`: cumulative milliseconds since the task started.**  That is not CPU
+  usage; it is CPU *consumed*.  A process that ran hard for a minute an hour ago
+  and has slept since outranks one pinning a core right now.  **So the request's
+  "CPU használtság" is a genuinely new column, not a relabelling** — and the two
+  answer different questions, which is why both should exist.
+- **`task.demand` exists but is the wrong number for this.**  §M49 built it as
+  the balancer's *appetite* signal — the share of time a task was RUNNABLE —
+  and task.h says so explicitly: `cpu_ms` answers "how much CPU did this task
+  GET".  A task that wants a core and cannot have one has high demand and low
+  usage, and a task manager showing demand would report it as busy.
+- **There is no per-process memory accounting anywhere.**  Nothing in any
+  `vmm.c` counts a space's resident pages.
+- **There are no block-layer I/O counters at all.**
+- **Network counters exist and are per-DEVICE** (`net_device.rx_packets`,
+  `tx_packets`, `rx_bytes`, `tx_bytes`) — which is exactly the granularity the
+  chart needs, so that chart is nearly free.
+- **There is no chart or graph widget** (`w_controls`, `w_editor`, `w_itemview`,
+  `w_menubar` is the whole list), and no history ring for any of these values.
+
+### Part A — the two new columns
+
+**CPU % is a delta over wall-clock time, and must be measured as one.**
+`(cpu_ms now − cpu_ms at last sample) ÷ (ms elapsed)`, scaled by CPU count so a
+task pinning one core of four reads 25 % rather than 100 %.  **The elapsed time
+comes from §M53's clock, never from a count of refresh ticks** — §M61 paid for
+that distinction once already (*a counter counts events, a clock measures
+time*), and under emulation a missed or doubled tick lands straight in the
+number the user reads.
+
+**Memory per process is the one genuinely new accounting, and it has a trap
+this tree has been bitten by repeatedly: `vmm.c` EXISTS THREE TIMES** (x86,
+x86_64, aarch64).  A resident-page counter incremented in each is three
+counters that will disagree, and the disagreement will be invisible on whichever
+arch the developer happens to run — §M70's entire finding, and §4.63's
+`setconf` shape.  **So the count is maintained at ONE portable point** (the
+`vmm_space_map`/`unmap`/`clone`/`destroy` seam declared in `vmm.h`), or, if that
+proves impossible without touching all three, it is DERIVED by walking the space
+on demand and the cost is measured — *a slow honest number beats three fast ones
+that differ.*
+
+**Shared pages must not be counted three times** — a memfd mapped by three
+processes is one frame, and reporting 3× makes the column's total exceed the
+machine's memory, which is the kind of number that destroys trust in the whole
+window.  Report **private resident** bytes, and say that is what it is.
+
+**A third new column: OWNER — whose process this is (2026-09-10).**  Specified
+as an extension to §M32, and it is the column that changes what the window is
+FOR: without it a task list answers "what is running", with it "what is running,
+and on whose behalf".  It shows **`system` for a kernel thread or a service, and
+the user name for a session process — never `root` for a kernel thread**, since
+folding the machine's own ~40 tasks under a user name is what makes a task list
+unreadable (§M32's argument, and the reason the owner is a tagged kind rather
+than a bare uid).
+
+**§M32 GATES THIS COLUMN, AND THE WINDOW MUST NOT PRETEND OTHERWISE.**  Until
+ownership exists, the honest thing is to omit the column rather than fill it
+with a plausible constant — *a column reading `system` for everything looks
+implemented and is a decoration*, which is the failure §M33 named "isolation
+theatre" in a different costume.  Parts A–C below do not depend on it and ship
+first.
+
+**Column count is now seven, and `t_layout` drops from the RIGHT** (§M69), so
+the order decides what a narrow window loses.  Proposed: `PID | NAME | OWNER |
+MEM | CPU% | CPU(ms) | STATE` — identity, then "what is it doing now"; the
+cumulative total and the state are what go.  **OWNER sits high on purpose: it is
+a filtering column** — the question "which of these are mine" is asked before
+any of the numbers are read.
+
+### Part B — the four charts
+
+**They are a WIDGET (`WIDGET_CLASS("chart")`), not drawing code inside
+taskman.c.**  There are four of them in the first client alone; a chart drawn by
+its app is the shape that produced FOUR scrollbars and TWO shells in this tree,
+and the next thing that wants a graph is already visible (§M74's memory-pressure
+work, the audio meter).  It joins the `uikit` gallery in the same change, so an
+unused class is a visible count rather than a gap.
+
+**THE HISTORY IS A KERNEL RING, NOT WINDOW STATE.**  If the Task Manager owns
+the samples, closing it discards them and reopening shows a flat line until the
+history refills — *and the moment you most want a task manager is right after
+something went wrong, which is exactly when its history would be empty.*  A
+small ring (60 s at 1 Hz is ~240 bytes per series) sampled by a §M30 cron job or
+a §M49 work item, with the window as a VIEW of it — §M47's rule that the window
+is never the storage, applied one subsystem over.
+
+**The sample is taken on a DEADLINE**, for the same reason Part A's percentage
+is.
+
+**The four series, and what each costs:**
+
+| series | source | cost |
+|---|---|---|
+| CPU | per-CPU busy, which §M49's `sched` already computes | free |
+| Memory | `pmm` used/total | free |
+| I/O ops | **new counters in `block.c`** — reads + writes at the one place every request passes | small, and one place |
+| Network | sum of `net_device` rx/tx | free |
+
+**Axis scaling is not cosmetic.**  CPU and memory are percentages with a **fixed
+0–100 axis**, so two moments in time are comparable at a glance.  I/O and
+network are rates with no natural maximum and must **autoscale — and an
+autoscaled chart MUST print its current maximum**, or a flat line at 10 KB/s and
+one at 10 MB/s are the same picture.  *A graph whose scale is invisible is a
+shape, not a measurement.*
+
+**DAMAGE: EACH CHART DAMAGES ONLY ITSELF.**  A scrolling chart changes every
+pixel it owns once a second, so its damage is its own rect — small, four of
+them — and it must never mark the window.  §M69 spent a milestone removing
+exactly this cost (*an unconditional full-window repaint 2–3 times a second, on
+top of every carefully damaged row*), and four 1 Hz charts are the most natural
+way to put it straight back.  **The cost is MEASURED with `gui.stats_ms`,
+before and after**, not assumed.
+
+### Part C — the Total line
+
+**Asked for precisely, and the instinct is right: it is under the table and NOT
+part of it.**  A total row inside the table would sort with the rows, scroll out
+of view with them, and be selectable — three behaviours that are wrong for a
+summary, and all three follow automatically from it being a row.
+
+It is the window's **footer label** (§M69 fixed `w_label_set_caption`'s
+three-value style there, so the footer's rule draws above it rather than under
+the last thing in the window).  Today's footer carries `19 TASKS - PID 19
+SELECTED`; the totals join it, and the selection detail is what yields space
+when the window is narrow — *a total is about the machine and is always true,
+while a selection is about a transient choice.*
+
+### Definition of done
+
+- Six columns (seven with §M32's OWNER); CPU % **verified against a known
+  load** — a task deliberately
+  pinning one core reads `100/ncpu` %, and an idle one reads 0 while its
+  cumulative `cpu_ms` column keeps rising.  *Those two columns disagreeing in
+  the right direction is what proves they are different measurements.*
+- The memory column's sum does not exceed the machine's memory, and a memfd
+  shared by three processes is not counted three times.
+- All four charts move under a driven load (a CPU hog, a large file copy, a
+  `ping` flood), and each one's **scale is legible in the screenshot**.
+- **The history survives the window:** close the Task Manager, wait, reopen —
+  the chart shows the period it was closed for.  *This is the criterion that
+  proves the ring is not window state.*
+- **Compositing cost measured before and after** with `gui.stats_ms`, with the
+  charts refreshing and the pointer still.  §M69's numbers are the baseline;
+  a regression to whole-window repaints must be visible as a number, not
+  argued about.
+- **With §M32 present:** the OWNER column reads `system` for every kernel
+  thread and service and the user's name for their shell — and after killing
+  that shell, its orphaned children still read the user, not `system`.  Without
+  §M32 the column is ABSENT, not blank.
+- All three arches (the ARM Task Manager is the same app).
+
+### What it deliberately is NOT
+
+**Not per-process I/O or network attribution** — see the scoping finding.  Not a
+history that survives a reboot (a ring in RAM; persisting it is a different
+feature with a different cost).  And **not a second place that knows how to draw
+a graph**: if the chart is not a registered widget class, this milestone has
+failed its own structural test regardless of how the window looks.
+
+---
+
 ## How to use this document
 
 - **Start of every session:** open `PLAN.md`, find the first non-✅
@@ -6051,6 +7089,352 @@ of a big window over the icon field still composites at §4.61's measured cost.
 ---
 
 ## Change log
+
+- **2026-09-11 (fourth)** — **the selection no longer shows two highlighted rows,
+  and the ARM placement item turned into a fact about the device.**  Reported:
+  *"the selection lags — two rows were highlighted at once for a moment."*  A
+  selection change damages two rows, and §M76.1's bracket defers only the WAKE —
+  which is enough when nothing else makes frames and NOT during a click, where
+  the pointer is moving and the compositor is drawing the cursor anyway.  A
+  compose could land between the two rects.  `compose()` now returns while a
+  batch is open: *a frame that shows half an update is worse than one that waits
+  for it.*  Verified with three driven clicks, one highlight each.  **And §M76's
+  open item resolved into something more useful than a pass:** the only §M33
+  client, QEMU's `edu`, is present on `-M virt` and cannot initialise there —
+  it addresses DMA with 28 bits and this machine's RAM starts at 1 GiB, so no
+  allocation policy can satisfy it.  *That is a fact about the DEVICE, not about
+  the placement machinery*, and the two are recorded separately: the doorways
+  are open and untested, the DMA grant is untestable with this client, and
+  neither says whether a placed driver would work on ARM.  What it wants is a
+  real ARM device ported to drvrt — already §M33's own open item.
+
+- **2026-09-11 (third)** — **per-cell damage tried again with every
+  precondition finally met, and refused on the PICTURE.**  §M76.5's clip
+  discipline and §M77's stable columns removed both things that had blocked it,
+  so it went back on as a measured decision: refresh 9-11 ms -> 5-6 ms, one CPU
+  3 % -> 1-2 %, `pane 0 colmove 0 cells 36 rows 0`.  **And a right-aligned CPU%
+  cell going from `24.5 %` to `0.0 %` left its leading digit behind.**  The
+  counters cannot see that and never will — they count the rects that WERE
+  damaged, and a stale pixel is one that was not.  *For a damage optimisation
+  the picture is the authority and the counters are a convenience*, which is the
+  reverse of everything else here.  Off again, but this time recorded with a
+  REPRODUCIBLE SYMPTOM rather than a theory: right-aligned, text got shorter,
+  one refresh.  Row damage costs 9-11 ms on a window nobody keeps maximized, and
+  *that is not a price worth a wrong pixel.*
+
+- **2026-09-11 (second)** — **§M77: the table's columns stop moving.**  The last
+  measured cost after the clip fix: a content-sized column resizes as its
+  numbers grow, and each resize forces a full-table repaint — twice in 25
+  seconds on an idle desktop, which is a visible flash.  Quantising mono columns
+  to whole character cells removes it, and had already been tried and reverted
+  once because it pushed the total past the available width and the TIME column
+  started truncating.  **The difference is that it is now spent out of SLACK
+  THAT ALREADY EXISTS and never borrowed** — a table with no room to spare keeps
+  exactly the layout it had, so the stability is best where there is room for it
+  and free where there is not.  Measured `colmove 0` / `pane 0` over 25 s
+  (was 2 / 2), with the picture confirming no truncation.  *The same idea
+  failed once because of WHERE the width came from, not because it was wrong.*
+
+- **2026-09-11** — **§M76.5: the doubled glyphs, found after four wrong fixes,
+  and the comments those fixes left behind corrected.**  Reported as rows going
+  BOLD and back *"completely at random, with nothing being done"* — and that
+  sentence is what finally located it, by ruling out everything the previous
+  attempts had touched.  A flicker needing no input is not about which
+  rectangles get damaged; the page flip was then ruled out with a switch built
+  for the purpose (`gui.page_flip` — single-buffered, unchanged), leaving the
+  window surface.  **`table_draw` called `gfx_clear_clip` after each cell**,
+  which resets to the WHOLE SURFACE, so from the second cell onward it painted
+  unclipped over the entire window, on top of rows nobody had cleared.  Text on
+  text is exactly what that looks like.  **THE THIRD INSTANCE OF ONE MISTAKE** —
+  §M65's `ui_text_clipped`, §M76.1's `widget_draw_all` earlier the same day, and
+  this: *a clip is a stack discipline and no API here enforces it*, so every
+  nested narrowing must save and restore by hand (`clip_push`/`clip_pop`, which
+  intersect rather than replace).  **METHOD NOTE AT MY OWN EXPENSE:** four
+  changes went in on hypotheses without verifying against the symptom first, two
+  of them introducing new defects and one needing a revert; the day's own rule
+  — measure before changing — was broken exactly where it mattered.  **And the
+  comments those attempts left were corrected rather than left standing**: three
+  of them asserted a falsified theory as fact, which is §M52's shape in
+  same-day code.  Per-cell damage was INNOCENT and is recorded as such (it
+  stays off pending the sticky column width, which is a separate and real
+  constraint); the `gui.page_flip` note now says its hypothesis was falsified
+  BY it, which is why the switch is worth keeping.
+
+- **2026-09-10 (seventh)** — **§M76 SHIPPED (DOCS §4.89): aarch64's native
+  dispatcher went from 26 of i386's 60 cases to 60 of 60.**  Every native
+  program using sockets, stat/getdents, threads, getrandom, uname or the dosgui
+  bridge had been **silently x86-only** since §M25 — it built, linked and ran on
+  ARM and returned failure from a call the other two architectures serve,
+  because the failure is a log line and a -1 rather than a link error.  **THE
+  BLOCKER WAS THE HARNESS AND NOT THE SWEEP**, which is the transferable part:
+  `uidemo` is the one program exercising the missing dosgui calls and it could
+  not be STARTED on ARM at all — §4.74, and with autostart on, the desktop is up
+  before the first command lands, so neither it nor `ps` reached the shell.  *A
+  sweep whose result cannot be run is a sweep nobody can falsify.*  Hence
+  `gui.autorun`, the general form of a wall this tree had already worked around
+  three times (`conf open`, `gui.wheeltest`, `gui.ui_dump`) — and it produced
+  the falsifier on its first run rather than a claim.  **Two cases are not
+  doorways:** `SET_TLS` returns ZERO because a thread pointer is a register here
+  and there is no selector to hand back, and the three port-I/O calls are
+  **REFUSED WITH A REASON** because this architecture has no I/O address space —
+  granting a window a driver cannot use would fault at first access, far from
+  the call that lied.  §M33's honesty gate applied to an architecture.  **OPEN,
+  and not confused with the above:** the seven portable `SYS_DRV_*` doorways are
+  now reachable on ARM, but ring-3 driver PLACEMENT has never been exercised
+  there.
+
+- **2026-09-10 (sixth)** — **the fullscreen mouse lag, fixed in three measured
+  steps** (DOCS §4.88.1).  Mean frame area **182-220 kpx → 14-25 kpx**, mean
+  compositing 22-43 ms → 5-22 ms.  The first candidate turned out to be a third
+  of the problem, which is why each step was measured on its own rather than
+  applied together and credited to the whole.  (1) A chart redrew FOUR times per
+  new sample, because the owner's tick fires every 500 ms *and* on every task
+  spawn/reap — 3.6 refreshes a second against a 1 Hz sampler.  (2) **Hover
+  repainted a widget that draws no hover state at all**: `app_hover_to` damages
+  two widgets, which §M69 called precise — *and it is, while a widget is small*.
+  The item view filling a maximized window is ~1.9 Mpx and renders nothing for
+  hover, so every pointer movement across it repainted the screen to set a flag
+  nothing draws.  *Precision measured in WIDGETS stops being precision when a
+  widget is the size of the screen.*  (3) The content diff damaged a ROW: at
+  1920 px a row is ~76 kpx and a changed cell is ~6 kpx.  Per-cell damage needed
+  NO new storage, because `iv_signature` already separates columns with tabs —
+  only the previous signature had to be kept before being overwritten.  **A trap
+  walked into on the way:** the new `hover` op went in between `pointer` and
+  `scroll` while every `widget_ops` was POSITIONAL — §M58's scar, forbidden in
+  capitals two lines above the mistake.  All six tables became NAMED
+  initialisers, because appending `, NULL` would have left the identical trap
+  for the next optional op.
+
+- **2026-09-10 (fifth)** — **§M75.2: the 75 % CPU did not exist, and two
+  instruments lied before the truth came out.**  `busy_ms` is credited to
+  whichever task is SCHEDULED, and a poll loop halted in `hlt` is scheduled the
+  whole time it waits — so an idle GUI desktop reported ~50 % of a 4-CPU box
+  while doing ~1 % of work.  Fixed with an accounted halt; the idle CPU series
+  went **49.8 % → 0.0-1.5 %** and the compositor's `ps` figure **33509 ms →
+  294 ms**.  It also explains a much older oddity: `ps` had been showing the
+  compositor and the desktop with IDENTICAL cpu_ms to the millisecond, because
+  neither had ever been switched out and both were reporting the uptime.
+  **THE PROCESS IS THE POINT.**  The first instrument stamped its start before
+  the `if` and charged the whole else-arm to "halted" (§4.61's lesson with the
+  sides swapped); the second was the fix itself, which **shipped inert for an
+  afternoon** because the subtraction was applied to `cpu_ms` BEFORE the
+  in-flight slice was added — and a task that is never switched out has a
+  `cpu_ms` of literally zero, so the halt was subtracted from nothing.  *A
+  correction that compiles, runs and changes nothing is indistinguishable from a
+  wrong theory*; printing both counters side by side is what settled it.  **AND
+  IT PREVENTED THE WRONG FIX:** a waitq was about to be built into the most
+  timing-sensitive code in the tree against a 50 % figure that was not real.
+  Also measured, from a fresh report: a maximized Task Manager produces
+  **whole-screen composites of 2304 kpx taking 259 ms**, and since the
+  compositor draws the cursor every mouse packet inside one waits — §M69's
+  mechanism at four times the area.  Candidate named (the app-host's
+  whole-window repaint for events no handler damaged), not yet fixed.
+
+- **2026-09-10 (fourth)** — **§M75.1: the crash record survives the reboot.**
+  Asked for from use, and it names what §M47 left undone: every sink it shipped
+  is VOLATILE (klog is a RAM ring, `/proc/crash` reads that ring, the window is
+  a view of it), so a machine that reboots takes all three with it and the one
+  record worth having is the one guaranteed to be gone.  The 40-byte NVRAM
+  breadcrumb can say a fault happened and where; it cannot say what the machine
+  was doing beforehand, which is the question a person actually has.  A
+  `CRASH_SINK` writing `/mnt/crash.log` with the §M28 log tail — **and it needed
+  no fault-path change of any kind, which is §M47's whole claim finally tested
+  by somebody else's requirement rather than by its own author's intention.**
+  The volume is LEARNED on both boot paths (§M64's shortcuts wrote to ramfs
+  while every document said they survived, silent because the write succeeds);
+  the tail is taken at DELIVERY so it includes the fault dump itself; the file
+  is bounded and keeps the BEGINNING, because in a crash loop every record after
+  the first is the same record and the first is the one with the context that
+  led in.  Verified across a real reboot: boot 1 faults a driver, boot 2 on the
+  same disk reads the record and the whole fault sequence back.
+
+- **2026-09-10 (third)** — **§M75 SHIPPED (DOCS §4.88), and its own chart found
+  the largest cost in the tree.**  Per-process MEM and CPU% columns, four 1 Hz
+  charts as a registered widget class over a KERNEL history ring, and a Total in
+  the footer.  **Three structural findings.**  (1) A resident-page COUNTER
+  cannot answer the memory question at all — whether a COW frame is still shared
+  changes when ANOTHER process forks, so the owner's counter goes stale without
+  the owner acting; the figure is measured at the moment, with the WALK
+  per-arch and the POLICY in one portable file, and the walkers translate to
+  portable flags because aarch64 keeps "borrowed" in bit 55 where x86 uses
+  0x400.  Verified by DIFFERENCE (an absolute has an unknown constant in it),
+  and the constant came out byte-identical — 1028 KB — on all three arches,
+  with the PMM's own figure moving by the same 2048 KB as an independent
+  witness.  (2) **The block layer had no request path**: every caller reached
+  into `dev->read` directly, so there was nowhere to count one — *a layer whose
+  callers all bypass it is not a layer, it is a naming convention.*  (3) The
+  history is the kernel's, not the window's, because *the moment you most want a
+  task manager is right after something went odd, which is exactly when its
+  history would be empty* — which deliberately inverts §M55's "run only while
+  somebody is waiting".  **TWO DEFECTS THE PICTURES CAUGHT, both §M52's shape:**
+  the gallery's "10 shown" was a TYPED literal sitting next to a comment
+  promising it would notice an uninstantiated class (the truth was already 12),
+  and an idle disk drew a chart labelled `1` — the divide-by-zero guard leaking
+  onto the screen as a scale.  **AND THE REPORTED "75 % CPU" WAS NARROWED BY
+  CONTROLS RATHER THAN EXPLAINED:** GUI stopped 0.3-0.7 %, GUI with no Task
+  Manager **49.4-50.1 %**, with it 71.4 %.  So ~50 points predate this
+  milestone; the first hypothesis (the refresh runs too often) was measured and
+  FALSIFIED at 3.6/s and 10 % of one core, and the x86_64 window diagnoses the
+  rest in its own new column — `desktop`, `compositor` and the app-host each
+  pinning a core.  **That is §M49's own open item, written down there and never
+  given a number.**  Also found: `SYS_NANOSLEEP` missing on aarch64 (55 000 log
+  lines in one run, and fixing it removed an intermittent EL1 abort with it),
+  which is the small end of §M76.  **Reported and NOT reproduced:** a system-wide
+  crash after ~2 minutes with the Task Manager open — 160 s here at -smp 4 gave
+  0 faults, so it is recorded as unreproduced rather than explained.
+
+
+- **2026-09-10 (second)** — **§M32 audited against the checklist it is supposed
+  to satisfy, and four of the eight items were not in it.**  Asked as a
+  question — *distinguishable users, login, sessions, a home each, SETTINGS
+  each, account creation and deletion, rights on the accounts, execution
+  rights?* — and the honest answer is that stages 1-7 cover the first three and
+  either half-cover or omit the rest.  **The four findings are all measured
+  against the source rather than read out of the design text**, which is why
+  none of them was visible before: `config.c` has no `uid`, `user`, `profile`
+  or `scope` field of any kind, so **per-user settings do not exist as a
+  concept** and every §M63 key is machine-wide (*a system where changing the
+  wallpaper changes it for everybody is one desktop with several names for
+  it*); there is no `useradd` / `userdel` / `passwd` anywhere, so the only way
+  to create an account would be to type a password hash into a text editor —
+  and **a reused uid inherits every file the previous owner left behind**,
+  because files are owned by number; **`execve` is absent from stage 4's
+  enforcement list**, and it is the one check that cannot be inherited from
+  `vfs_open`, since a program is opened for READING in order to be executed
+  (`proc.c`'s exec path performs no permission check at all today); and stage
+  4's one clause about exFAT buries the consequence that **`/mnt` is the only
+  volume that survives a reboot and cannot store an owner**, so every home and
+  every per-user setting would sit on the one filesystem whose permissions
+  evaporate at power-off — the difference between enforcement and §M33's
+  "isolation theatre", stated as three options with one to be chosen.  **Two
+  premises in the section have also moved, §M52's shape:** its opening says
+  every task is a ring-0 kernel thread so users can only be advisory (§M25
+  shipped, so the isolation half is no longer deferred by anything), and its
+  password note defers a hash "until a real crypto primitive lands" when §M39
+  shipped a ChaCha20 CSPRNG — the salt exists, only the KDF is missing, which
+  is a much smaller and much more nameable gap.  Also recorded: **setuid is a
+  decision to make rather than inherit** (stage 7 lists `su` while nothing in
+  the design makes `su` possible; kernel-mediated re-authentication is
+  recommended over a setuid bit), and **the GUI has no login surface at all** —
+  `gui.autostart` boots straight to a desktop, so the missing piece is not a
+  dialogue but an answer to what the desktop IS before anyone logs in.
+
+- **2026-09-10** — **§M32 extended and §M75 given the column it produces:
+  whose process is this.**  Asked for directly, and the sharpening is that the
+  useful distinction is not *which uid* but *whether there is a person behind
+  this at all* — this machine runs ~40 tasks that belong to nobody (pid 0, the
+  idle tasks, init, the §M29 services, the compositor), and filing them under
+  `root` gives a list where the label is true of everything and therefore
+  distinguishes nothing.  Hence a tagged owner — kernel / system / user+session
+  — rather than a bare uid.  **Two findings come straight out of the existing
+  source.**  `task.c:198` already records that `struct task` is built in FOUR
+  places and only one is `spawn_common`; when §M49 added a weight there alone
+  the other three kept `kcalloc`'s zero and the first boot took a divide error.
+  Those three are exactly the tasks that must be kernel-owned — so **the enum is
+  ordered so zero means KERNEL**, whereas a bare uid field makes zero mean
+  *root* and every task those sites create silently becomes root's.  And §M27's
+  orphan re-parenting is a **laundering hole**: if ownership followed the
+  parent, killing a user's shell would promote its children to SYSTEM
+  processes — a privilege escalation with no attacker in it, produced by an
+  ordinary kill.  Ownership is therefore captured at spawn and immutable, with
+  a §M71 invariant (*no task's owner changed after creation*) whose falsifier is
+  that exact kill, because the code that would introduce the bug looks like
+  tidying up.  In §M75 the OWNER column sits high (it is a *filtering* column —
+  "which of these are mine" is asked before any number is read) and is **absent
+  rather than blank** until §M32 lands: a column reading `system` for
+  everything looks implemented and is a decoration.
+
+- **2026-09-09** — **§M75 added: Task Manager rework, asked for directly.**  The
+  scoping finding is the headline and it makes the milestone much smaller than
+  it looks: **the charts are asked for SYSTEM-WIDE and only two quantities PER
+  PROCESS**, so nothing here needs per-request I/O or socket attribution —
+  which is the expensive half of a task manager and a different milestone
+  entirely.  Measured while scoping: today's CPU column is **cumulative
+  `cpu_ms`**, i.e. CPU *consumed*, so a process that ran hard an hour ago
+  outranks one pinning a core now — the requested "CPU usage" is a new column,
+  not a relabelling; `task.demand` is the wrong number for it (§M49 built it as
+  runnable *appetite*, so a task that wants a core and cannot have one would
+  report as busy); there is **no per-process memory accounting anywhere**, and
+  `vmm.c` exists three times, so a counter added per-arch would be three
+  counters disagreeing invisibly on whichever arch nobody ran; `block.c` has
+  **no I/O counters at all**; and network counters already exist per DEVICE,
+  which is exactly the granularity the chart wants.  Three structural rules
+  written in: the chart is a **registered widget class** (four instances in the
+  first client alone — this is the shape that produced four scrollbars), **the
+  history is a kernel ring and not window state** (*the moment you most want a
+  task manager is right after something went wrong, which is exactly when its
+  own history would be empty*), and **each chart damages only itself**, because
+  four 1 Hz repaints are the most natural way to put back the whole-window
+  repaint §M69 spent a milestone removing.  The Total is correctly NOT a table
+  row — as a row it would sort, scroll away and be selectable.
+
+- **2026-09-09** — **§M72 and §M73 added to the plan, asked for directly.**
+  §M72 (a reserve the system keeps + a program you can pause) is two requests
+  in one sentence and they belong together: the reserve buys the time, the
+  pause is what you do with it — built separately they give a watermark with
+  nothing to do and a suspend you cannot reach.  **The pause was then defined
+  further the same day: it should be able to write the memory out and give the
+  frames back, with two controls — plain pause, and pause + free.**  That makes
+  Part B *swap, aimed by a user at one process*, and the section is written
+  around one sentence: **the program stops and stays RESUMABLE; freeing its
+  memory is an optimisation OF that contract, never a condition of it** — so
+  evict degrades to pause and pause degrades to nothing.  It is easier than a
+  general pager in the way that usually makes them hard (a stopped address
+  space is quiescent, so the races are gone and only OTHER holders of the
+  frames remain — shared, COW, device-mapped, and the one that would fail
+  silently: any page a device may DMA into).  The backing offset goes in the
+  NOT-PRESENT PTE, whose bits are all free to software, because the software
+  bits proper are spent (`VMM_SHARED` 0x400, `VMM_COW` 0x800) and a side table
+  would be a second record of what a mapping is.  Staged so the promise ships
+  before the optimisation, and the done-criteria are numbers: free frames
+  before/after, and the program checksumming its own heap across the resume.
+
+  **And §M74 (swap + demand paging) was added in the same breath, correctly** —
+  §M72 stage 3 builds most of a swapper's machinery and none of its judgement.
+  The split is mechanism vs policy: §M72 evicts a STOPPED process, so its
+  address space is quiescent; §M74 reclaims from a RUNNING one, which brings
+  back the race §M72 dodges and adds the question §M72 never has to ask —
+  *which page*.  Measured while scoping it: there is **no page cache at all**
+  (`block_cache.c` caches disk blocks, a different object) and `sys_mmap` reads
+  a file-backed mapping in eagerly, so **two processes mapping the same
+  `libc.so` hold two full copies** — after §M37/§M38 that is every dynamic
+  program on the machine.  Hence the finding that shaped the ladder: **its
+  second rung, a page cache, is worth more than the swap and is the only rung
+  that needs no disk to write to.**  Nothing anywhere reads the PTE Accessed
+  bit or aarch64's AF, so rung 1 is collecting the data a policy needs —
+  without it any reclaim is random eviction, which is worse than none.  The
+  goal is stated narrowly (reclaim COLD memory so the reserve has a source)
+  with an explicit non-goal (running a workload larger than RAM), because that
+  goal is what earns swap its reputation, and a ceiling is therefore part of
+  the design rather than tuning.  **Constrained further the same day, and the
+  constraint decomposed into three rules that fail differently:** the reserve
+  must be *pinned physical RAM* (one redeemable only through the disk needs I/O
+  to collect, which needs memory — the shortage it exists for); **swap must
+  never count as free memory**, or the watermark is measured in a currency that
+  can be printed and fires only once the area is full, which is the overcommit
+  trap that forces a system to grow an OOM killer; and the writeout path must
+  allocate nothing, its buffers pinned at enable time, since a reclaim that
+  allocates to make progress fails exactly when called.  All three are
+  `AUDIT()` invariants with shipped falsifiers rather than prose, per §M52.
+  Swap is **off by default** with `mem.swap_policy = off|emergency|normal`
+  (`emergency` — swap only when the reserve is threatened — is the setting the
+  request describes), the size is the user's and IS the ceiling (one number,
+  one meaning), and the property that makes the default defensible is that
+  **`off` still reclaims**: clean file-backed pages are dropped and re-read,
+  needing no swap area at all.  Also fixed: the order of sacrifice is written
+  down rather than improvised under pressure, and nothing on it is a kill.  Its "why" is measured rather
+  than recalled: there is no reserve anywhere (`PMM_ALLOC_FAIL` IS the policy),
+  no `statfs`/`df` at all, and `SIGSTOP` exists in all three `signal.c` files
+  **only in the comment explaining it cannot be blocked** — §M52's shape,
+  sitting in the tree today.  It has no blockers.  §M73 (containers) is mostly
+  SCOPING, because "some form of Docker" spans a two-afternoon feature and a
+  multi-year one: the ladder is written cheapest-first, the one genuinely
+  missing primitive is a per-process filesystem root, the unfair advantage is
+  that this kernel already runs unmodified Linux binaries, and the rungs where
+  an honest report has to say "not isolated" are named in advance so rung 6
+  cannot quietly claim more than was built.  **§M32 gates it**, which is now a
+  second independent reason for §M32 being next.  Also: the M70 and M71 rows
+  the session-etiquette rule owed the backlog after both shipped.
 
 - **2026-08-21** — **§M62 SHIPPED (DOCS §4.71) — the §M58–§M64 desktop-UX
   cluster is done.**  Six blocks in one run: wallpaper sources, persistent

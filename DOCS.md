@@ -11846,6 +11846,859 @@ in the checks themselves so a pass is not read as more than it is.
 
 ---
 
+### 4.88 §M75 — what each process is costing, and what the GUI turned out to cost
+
+**Shipped 2026-09-10, all three arches build silent; i386 and x86_64 verified by
+picture and by measurement, aarch64 verified headlessly.**
+
+Asked for directly: per-process **memory** and **CPU usage** columns, four
+1 Hz line charts under the table, and a **Total** directly below it but not part
+of it.
+
+#### The scoping finding that decided the size
+
+The charts are asked for SYSTEM-WIDE while only two quantities are asked for
+PER PROCESS.  Attributing I/O and network traffic to the process that caused it
+is the expensive half of a task manager — an owner on every block request and
+every socket, threaded through layers that have no idea who called them — **and
+that is not what was asked for.**  Written down because the obvious next
+request ("show me which process is doing the I/O") is a different and much
+larger milestone, and the boundary should be visible before somebody walks
+across it by accident.
+
+#### Per-process memory: the policy is portable, the walk is not
+
+Nothing in any `vmm.c` counted a space's resident pages.  The obvious fix — a
+counter in `vmm_space_map`/`unmap` — is the trap, because **`vmm.c` exists three
+times**: three counters kept in step by hand, and the one that drifts is the one
+on the arch nobody is running that week (§M70's finding).  **A counter also
+cannot answer the question at all**: whether a COW frame is still shared changes
+when ANOTHER process forks or exits, so the owner's counter goes stale without
+the owner doing anything.
+
+So each arch supplies a WALK (`vmm_space_walk`, mirroring its own
+`vmm_space_destroy` — the same three exclusions, because the two must agree
+about which entries belong to a space) and `kernel/mem/vmm_account.c` holds the
+POLICY.  **The walker reports PORTABLE FLAGS, not raw PTE bits** — aarch64 keeps
+"borrowed" in bit 55 and "COW" in bit 56 where x86 uses 0x400/0x800, and handing
+a raw entry to a shared policy is three policies again wearing one function's
+name.
+
+`private` = frames this space alone owns, i.e. **what would be handed back if
+the process exited**.  It is the only figure whose column can be SUMMED:
+reporting a frame in every space that maps it makes the total exceed the
+machine's memory, which is the kind of number that discredits every other figure
+in the window.  A **cloned thread reports zero** (`mm_shared`), or a four-thread
+process reports its heap four times.
+
+**VERIFIED BY DIFFERENCE, NOT BY PLAUSIBILITY.**  An absolute figure carries an
+unknown constant (the ELF image, the stack, the libc's first heap chunk), so
+`user/memhog.c` grows in KNOWN steps — 1 MiB every 2 s, announced as it happens
+— and the test subtracts:
+
+| | i386 | x86_64 | aarch64 |
+|---|---|---|---|
+| after 3 MiB touched | 4100 KB | 4100 KB | 4100 KB |
+| after 5/6 MiB touched | 6148 KB | 6148 KB | 7172 KB |
+| **delta vs touched** | **exact** | **exact** | **exact** |
+| implicit constant | 1028 KB | 1028 KB | **1028 KB** |
+
+The constant is byte-identical on all three, which is what proves the aarch64
+flag translation.  **And a second, independent witness agreed**: across the same
+two samples the PMM's own `used` figure moved by exactly the same 2048 KB, and
+it knows nothing about page tables (§M71 rule 2).
+
+#### CPU%: a delta over a clock, not over a count of ticks
+
+`cpu_ms` is CPU **consumed** since the task started — a process that ran hard an
+hour ago and has slept since outranks one pinning a core now.  Both facts are
+useful, so **both columns exist**; `task.demand` is §M49's *appetite* signal and
+is the wrong number for either.
+
+`task_cpu_ms_now()` adds the slice IN FLIGHT, because `cpu_ms` is credited only
+at a context switch — §M49's `sched` shipped with exactly this bug and reported
+a fully loaded core at 0 %.  `task_cpu_permille()` scales by CPU count and
+clamps at the machine's capacity, so a reused pid saturates visibly instead of
+printing a plausible wrong number.  The elapsed time comes from §M53's clock:
+*a counter counts events, a clock measures time* (§M61).
+
+**The delta is keyed by PID, and that is right where §M69's row diff is keyed by
+SLOT.**  Damage asks "does what will be drawn here differ from what is drawn
+here"; a rate asks about ONE TASK over time.  Different questions, different
+keys — comparing slot *i* to slot *i* would attribute a departed task's CPU to
+whatever moved up into its row.
+
+#### The block layer had no request path
+
+The design said "count at the one place every request passes".  **There was no
+such place**: every caller reached into `dev->read` directly — the block cache,
+the exFAT probe, the `blk` command, two boot self-tests.  *A layer whose callers
+all bypass it is not a layer; it is a naming convention.*
+
+`blk_read` / `blk_write` / `blk_flush` are the request path now, with relaxed
+atomics (a lock here would cost every I/O to protect a number nobody decides
+on), counted **on completion** and with errors counted separately — a device
+failing every request would otherwise look busy rather than broken.  Measured on
+a real exFAT volume: **15 reads / 21 writes** after boot, **16 / 26** after
+creating and reading one file.  The read count barely moves because **the
+counter sits BELOW the cache**, i.e. it measures device traffic rather than
+logical requests, which is the right layer for this chart.  Exactly one caller
+is left unrouted on purpose: the aarch64 boot self-test tests the DRIVER, and
+going through this layer would report a bug in these wrappers as a driver bug.
+
+#### The history is the kernel's, not the window's
+
+If the Task Manager owned the samples, closing it would discard them — *and the
+moment you most want a task manager is right after something went odd, which is
+exactly when its history would be empty.*  `kernel/core/sysmon.c` is a §M29
+service sampling four series once a second into a 60-entry ring; the window is a
+VIEW (§M47's rule that the window is never the storage).
+
+**This deliberately inverts §M55's rule** ("netd runs exactly while somebody is
+waiting"), and the inversion is the feature: a history that only exists while it
+is being watched is not a history.
+
+Three rules in the sampler: a rate is divided by the time that ACTUALLY passed
+(the sampler is sometimes late, and dividing by a nominal 1000 ms reports spikes
+that never happened); CPU busy includes the slice in flight; and every series is
+read from ONE instant, so the four charts describe one moment.  The deadline is
+absolute and never re-derived from `now` (§M53 stage 3).
+
+**Percent series are stored in TENTHS.**  Whole percents floor to zero on any
+machine with room to spare — the ARM box uses 18 MB of 3 GiB and its memory
+chart was a flat line on the floor for ever.  *Truthful and useless is the pair
+of properties a chart must never have.*
+
+**Verified by driving each series with its own stimulus, which is the point:**
+
+```
+CPU:      44 25 26 32 51 51 51 51 51 51     <- loop 4
+MEMORY:    7  7  7  7  7  7  7  7  7  7
+I/O:       0  0  0  0  0  6  0  9  0  0     <- two /mnt writes
+NETWORK:   0  0  0  0  0  0  0  0  8  0     <- ping
+```
+
+A sampler that moved all four together would be measuring one thing four times.
+
+#### The chart is a WIDGET CLASS
+
+`WIDGET_CLASS("chart")` in `kernel/gui/w_chart.c`, not drawing code inside
+taskman.c — there are FOUR in the first client alone, and the second copy of
+something that looked too small to share is this tree's most expensive recurring
+defect (four scrollbars, two shells, three item layouts).  The next caller is
+already visible: §M74's memory-pressure work wants this picture.
+
+**The widget owns no data** — a series number, and it asks sysmon at draw time.
+A percentage gets a FIXED 0..100 axis so two moments are comparable; a rate
+autoscales **and prints its ceiling**, because a flat line at 10 ops/s and one
+at 10000 are otherwise the same picture.
+
+**EACH CHART DAMAGES ONLY ITSELF** (`w_chart_refresh` from the owner's tick).
+§M69 spent a milestone removing an unconditional full-window repaint two or
+three times a second, and four 1 Hz charts are the most natural way to put it
+straight back.
+
+#### Two defects the pictures caught
+
+**The gallery's own count was a literal.**  `uikit` printed `"... registered, 10
+shown"` — typed, next to a comment promising that this number is how anybody
+notices a class nobody instantiates.  It could notice nothing: the truth was
+already 12 before the chart was added.  **§M52's shape, inside the instrument
+written against it** — *a count that is typed is not a count.*  It is derived
+now, and classes with no row are named (`dlginfo`, `menubar`) rather than left
+as a subtraction.
+
+**An internal guard leaked onto the screen.**  An idle disk drew an I/O chart
+labelled `1` — the divide-by-zero guard, presented as a scale.  *The most
+confusing kind of wrong number is the plausible one.*  It prints the measured
+maximum now, so an all-zero series honestly reads `0`.  And the chart header
+drew `NETWORK0 pkt/s` when four charts share a window: *a number that has run
+into a word is not a smaller label, it is an unreadable one* — the NAME wins
+when only one fits, because it says which chart this is.
+
+#### The Total is the footer, not a row
+
+A total ROW would sort with the rows, scroll out of view with them, and be
+selectable — three behaviours that are wrong for a summary and all three
+inherited automatically from being a row.  The machine's CPU in it comes from
+the sampler rather than from summing the rows: the rows' percentages are each a
+delta over the window's own refresh interval, and adding them would double-count
+anything that started or ended inside it.  The two figures are also a
+cross-check — a table whose rows sum to far less than the machine's load is a
+table missing a process.
+
+Column order is `PID | NAME | MEM | CPU% | TIME | STATE`, and it matters because
+`t_layout` drops from the RIGHT (§M69).  A seventh — **OWNER** — is specified in
+§M32 and **deliberately absent**: a column reading `system` for everything looks
+implemented and proves nothing, which is §M33's "isolation theatre" one window
+over.  It is missing rather than blank.
+
+#### The finding that matters most: the GUI costs half the machine
+
+Reported from use: *"with the Task Manager running the CPU is 75 % busy."*
+Confirmed, and then **narrowed by controls rather than explained**:
+
+| state | CPU (4-CPU i386) |
+|---|---|
+| GUI stopped | **0.3 – 0.7 %** |
+| GUI up, no Task Manager | **49.4 – 50.1 %** |
+| GUI + Task Manager | **71.4 %** |
+
+**So ~50 points predate §M75 entirely**, and the Task Manager adds ~21.  The
+first hypothesis — that the refresh runs far too often — was **measured and
+falsified**: `gui.stats_ms` now also reports the refresh, and it runs **3.6
+times a second at 22–30 ms, about 10 % of ONE core**.  Slow, and not the 71 %.
+
+**The x86_64 window diagnoses it in its own CPU% column**: `desktop 24.7 %`,
+`compositor 24.7 %`, `app:Task Manager 24.7 %` — three tasks each pinning
+roughly one core of four.  That is §M49's own open item, written down there and
+never given a number: *"the GUI compositor/app-host loops are still `hlt`+
+`yield` polls."*  **§M75's instrument is what finally put a number on it**, which
+is the most useful thing this milestone produced and is not a §M75 defect.
+
+**Compositing cost, measured before and after** (`gui.stats_ms 3000`, i386
+-smp 4, pointer still): idle desktop **4 frames / 3 s at 120 kpx**; with the
+Task Manager and four charts **58–74 frames / 3 s at 32–41 kpx**.  The frame
+count rises because four things now change every second — that is the feature.
+**The guard that matters holds**: the window is ~420 kpx and the mean frame is
+~36 kpx, so nothing is doing whole-window repaints (§M69's regression signature
+was 214–431 kpx frames).
+
+#### Two bugs found on the way, neither of them §M75's
+
+**`SYS_NANOSLEEP` was missing from aarch64's native dispatcher.**  An in-tree
+libc program that sleeps did not sleep on ARM — it got -1 and span at full
+speed, printing `syscall: unknown number 35` on every iteration: **55 000 lines
+in one 60-second run**, burying the output the run existed to read.  Fixing it
+also removed an intermittent EL1 abort that had appeared in 2 of 3 runs
+(`FAR_EL1` fixed at `0x80000000`, `ELR_EL1` inside `exc_dispatch`), so that
+fault was a consequence of the syscall flood rather than a separate defect —
+**why the reporting path breaks under that load was not separately
+investigated**, and is stated as such.
+
+**It is the small end of a much larger gap, measured:** that dispatcher answers
+**26 of the 60 cases i386 answers**.  Sockets, `stat`/`fstat`/`getdents`,
+`clone`/`futex`/`set_tls`, `getrandom` and `uname` are all absent, so every
+native program using them is silently x86-only — §M70's finding about shell
+commands, one layer down and never swept.  Recorded in PLAN.md as its own work.
+
+**An aarch64 ordering hazard was fixed at the source and NOT claimed as a fix
+for anything**: `next_table` published a table descriptor without a barrier
+after zeroing the frame behind it, so another observer could read the pointer
+and then read whatever the allocator had last left there.  It was added while
+chasing the abort above; **that theory was falsified** (the abort reproduced
+afterwards), and the barrier stays because the hazard is real on its own terms.
+Claiming it as the fix would be §M52's shape.
+
+#### §M75.1 — the crash record that survives the reboot
+
+Asked for from use, and it names a gap §M47 left: *"the crash report could leave
+a file on the backing store, so we know what happened before — then we would not
+necessarily need to reproduce the fault."*
+
+**Every existing sink is volatile.**  `klog` is a RAM ring, `/proc/crash` reads
+that ring, the Crash Reports window is a view of it — so a machine that reboots
+takes all three with it, and the one record worth having is the one guaranteed
+to be gone.  The NVRAM breadcrumb covers what nothing in the guest can log, but
+it is FORTY BYTES: it can say a fault happened and where, not what the machine
+was doing beforehand.
+
+`kernel/core/crash_file.c` is a `CRASH_SINK` and **needed no fault-path change
+of any kind** — which is §M47's whole claim, now tested by somebody else's
+requirement rather than by its own author's intention.  Four decisions:
+
+- **The volume is learned, not assumed** (`crash_file_attach_persistent`, on
+  BOTH boot paths).  §M64 shipped shortcuts writing to ramfs while every
+  document said they survived a reboot — true about the format, false about the
+  outcome, and silent because THE WRITE SUCCEEDS.  With no writable volume this
+  says so once and stays off.
+- **The log tail is the point, not the record.**  A record is eight numbers;
+  "what happened before" is §M28's ring.  The tail is taken at DELIVERY rather
+  than at capture, deliberately: delivery runs moments later on the watchdog
+  task, so it includes the fault dump itself — which is the useful part.
+- **Bounded, and it keeps the BEGINNING.**  In a crash loop every record after
+  the first is the same record; what has the context that led in is the first.
+- **No `O_APPEND` in this VFS, and that is fine**: the text lives in a fixed RAM
+  buffer READ BACK at attach and rewritten whole.  A cap was wanted anyway, so
+  the buffer is the cap — and reading it back is exactly what makes the file
+  span the reboot.
+
+**VERIFIED ACROSS A REAL REBOOT**, i386 + exFAT: boot 1 attaches
+(`recording to /mnt/crash.log`), `drv crash ps2_mouse` faults a driver; boot 2
+on the same disk reads it straight back —
+
+```
+=== crash #1  uptime 1458 ms  cpu 0
+  what : Page Fault
+  task : ps2_mouse  pid -1
+  pc   : 0x11a56c   addr 0xdead0000   code 0
+  --- last log lines before this was delivered ---
+  ...
+  [1457] !! DRIVER FAULT contained — 'ps2_mouse' died in crash-test: ...
+  [1458]    the driver is quarantined; the system is still running
+  [1459] drv: 'ps2_mouse' faulted: faulted in a driver entry point
+  [1482] drv: contained — the call unwound; we are still here
+```
+
+`crashlog` reads it back on the machine itself, `crashlog clear` empties it —
+*a person looking at a box that just rebooted should not have to mount its disk
+elsewhere to read why.*
+
+### 4.88.1 §M75.2 — the 50 % that was not there, and the two instruments that lied
+
+**The report was real and the number was not.**  *"With the Task Manager
+running the CPU is 75 % busy"* — reproduced at 71.4 %, with an idle GUI desktop
+reading ~50 % on a 4-CPU box and no GUI at all reading 0.3 %.
+
+**`busy_ms` is credited to whichever task is SCHEDULED, and a poll loop halted
+in `hlt` waiting for work is scheduled the whole time it waits.**  The machine
+was not working; it only looked like it.  After the fix:
+
+| | before | after |
+|---|---|---|
+| idle GUI, CPU series | 49.8 % | **0.0 – 1.5 %** |
+| `compositor` in `ps` | 33509 ms | **294 ms** |
+| `desktop` in `ps` | 33509 ms | **0 ms** |
+
+`task_halt_idle()` brackets the halt and credits it to the task AND to the CPU;
+`task_cpu_ms_now` and sysmon subtract it, so every CPU% surface reports time
+EXECUTING rather than time OCCUPYING.
+
+**IT ALSO EXPLAINS A MUCH OLDER ODDITY.**  `ps` had been showing the compositor
+and the desktop with IDENTICAL `cpu_ms` to the millisecond, run after run —
+because neither had ever been switched out, so both were reporting
+`now - sched_in_ms`, i.e. the uptime.
+
+#### Both instruments lied first, in opposite directions
+
+**The first** stamped its start time before the `if`, so the whole else-arm was
+charged to "halted": it reported 97 % in `hlt` and that reading contradicted the
+task's own `cpu_ms`, which had not moved at all.  §4.61's lesson with the sides
+swapped — *a measurement placed on the wrong side of the work reports the work
+as free.*  Bracketed tightly, the halt really is 97 % and loop overhead is 0 %.
+
+**The second was the fix itself, and it shipped inert for an afternoon.**
+`halt_ns` accumulated perfectly (24314 ms after 25 s) while nothing changed,
+because the subtraction was applied to `cpu_ms` BEFORE the in-flight slice was
+added — and a poll loop that owns its core is never switched out, so its
+`cpu_ms` is literally ZERO.  **The halt was being subtracted from nothing.**  A
+correction that compiles, runs and does nothing is indistinguishable from a
+wrong theory; what settled it was printing both counters side by side rather
+than reasoning about either alone.
+
+#### What this says about §M49's open item
+
+A waitq on the compositor's event queues was about to be built against a 50 %
+figure.  **That work would have recovered nothing, because nothing was being
+consumed.**  The loops still wake ~100 times a second and that is still worth
+tidying — but it is worth ~1 %, not ~50 %.  *The measurement did not speed up
+the fix; it prevented the wrong one.*
+
+#### And one of the 50 %s was real after all — on the other architecture
+
+The same §M75 chart, run on aarch64's serial boot path, still read **50.2 %**
+after the accounting fix.  It had not missed; **that machine's 50 % was
+genuine.**  Its REPL polls the PL011 with `task_yield()`, which leaves the task
+RUNNABLE — *a spin with better manners* — so a prompt waiting for a keystroke
+owned a core of two for ever.
+
+The x86 GUI loops and this one produced the same number for opposite reasons,
+which is exactly why the accounting had to be fixed BEFORE anything was
+optimised: without it both read 50 % and neither could be told from the other.
+`task_halt_idle()` here too: **50.2 % → 0.4 %**, with a keystroke noticed within
+one 100 Hz tick.  That trade is invisible on a serial console and would NOT be
+right for the compositor, where §M22.7 measured the same change as visible
+cursor lag.  The real fix is a PL011 RX interrupt; this is the honest interim,
+and it costs latency rather than liveness.
+
+*The gap is §M24's shape once more: a fix applied to the loops one architecture
+has, missing the loop only the other one runs.*
+
+#### The fullscreen mouse lag, measured
+
+Reported from use: *"maximize the Task Manager and the mouse lags terribly."*
+Driven pointer over a maximized window, `gui.stats_ms 3000`:
+
+```
+gui: 51 frames in 3000 ms — 22339 us mean (182 kpx), worst 258974 us over 2304 kpx in 1 rect
+gui: 54 frames in 3000 ms — 43215 us mean (220 kpx), worst 152762 us over 1817 kpx in 3 rects
+```
+
+**2304 kpx is the whole 1920x1200 screen in ONE rect, and it takes 259 ms.**
+The compositor also draws the CURSOR, so every mouse packet arriving inside such
+a frame waits up to a quarter of a second — which is exactly what the report
+describes, and exactly §M69's mechanism at four times the area.
+
+**Fixed in three steps, each measured separately**, because the first candidate
+turned out to be a third of the problem:
+
+| | mean frame area | worst after the maximize |
+|---|---|---|
+| baseline | 182 – 220 kpx | 1817 – 2304 kpx |
+| 1. chart damage gated on new data | 108 – 191 kpx | 337 – 1938 kpx |
+| 2. hover no longer repaints a hover-less widget | 79 – 187 kpx | 84 – 644 kpx |
+| 3. the content diff damages CELLS, not rows | **14 – 25 kpx** | **45 – 175 kpx** |
+
+Mean compositing time went 22 – 43 ms → 5 – 22 ms.  The single remaining
+2304 kpx frame is the maximize LAYOUT, which repaints everything by design (a
+re-layout moves widgets, so the pixels they vacated are stale where nothing will
+paint) and happens once.
+
+**1 — A CHART REDREW FOUR TIMES PER NEW SAMPLE.**  The owner's tick is not a
+1 Hz beat: the compositor sets it every 500 ms *and* immediately on every task
+spawn/kill/reap, and this machine's cron jobs produce several a second.
+Measured at **3.6 refreshes a second** against a sampler producing ONE — so
+three of four repaints drew an identical chart.  `w_chart_refresh` now damages
+only when the series advanced.  gui.h's contract since §M69 is that a tick
+damages what it CHANGED; a chart whose data has not moved has changed nothing.
+
+**2 — HOVER REPAINTED A WIDGET THAT DRAWS NO HOVER STATE.**  `app_hover_to`
+damages two widgets, which §M69 correctly called precise — *and it is, while a
+widget is small.*  Grep `w_itemview.c`, `itemview.c` and `itemview.h` for
+"hover": **no matches.**  The item view filling a maximized window is ~1.9 Mpx,
+and every pointer movement across it repainted that to set a flag nothing
+draws.  *Precision measured in WIDGETS stops being precision when a widget is
+the size of the screen.*  New optional `widget_ops.hover` — non-zero means "I
+look the same either way"; NULL keeps the old behaviour, which is what a button
+wants.  The item view's implementation says in its own comment that **if it ever
+gains a hovered row this must stop returning 1**, because the honest failure of
+forgetting is a highlight that does not appear — visible at once — rather than a
+slow window nobody can attribute.
+
+**3 — AND THE ONE THAT PAID MOST: THE DIFF DAMAGED A ROW.**  At 1920 px a row
+is ~76 kpx and a changed `TIME` cell is ~6 kpx, so five moving rows a second is
+~380 kpx of compositing in a loop that also draws the cursor.  New optional
+`item_view.cell_rect`; the table computes it from the SAME `t_layout` the
+painter uses, so the damaged box and the painted box cannot drift (§4.79's title
+buttons, avoided by construction).
+
+**It needed no new storage**: `iv_signature` already separates columns with
+`'\t'`, so the two sides can be walked field by field — only the previous
+signature had to be kept before it was overwritten.  Two things the code states
+because they are easy to get wrong: **the first character is the SELECTION
+MARKER, not a cell** (the wash spans the row, so a marker change damages the
+row), and a difference the field walk cannot attribute (a column-count change)
+**falls back to the whole row** — *a diff that reports no change for a row that
+changed leaves a stale row nobody can explain.*
+
+`cell_rect` is OPTIONAL because only a columnar view has cells: the list and the
+grid leave it NULL and keep row damage, which is correct for them — their row IS
+one cell.
+
+**VERIFIED BY PICTURE as well as by number**, because per-cell damage is exactly
+the change that leaves stale pixels: the maximized table renders with no stale
+cells, no seams at the column edges, and every column aligned.
+
+#### A trap walked into while fixing it
+
+The new `hover` op went in between `pointer` and `scroll` — and **every
+`widget_ops` in the tree was a POSITIONAL initialiser**, so `iv_scroll` would
+have bound to `hover`.  That is §M58's scar, and widget.h forbids it in capitals
+two lines above where the mistake was made.  So the op moved to the true end AND
+**all six positional tables became NAMED initialisers**: appending `, NULL` to
+each would have left the identical trap for the next optional op.  The header
+now also records that appending REMAINS the rule — a name only protects the
+tables that have been converted, and the next author will copy an old one.
+
+#### Open
+
+- **The GUI's idle cost** — §M49's documented open item.  **The 50 % figure was
+  an accounting artifact and is gone (§4.88.1); the real cost is ~1 %.**  The
+  poll loops still wake ~100 times a second, which is worth tidying and is no
+  longer urgent.
+- **The maximize LAYOUT still repaints the whole screen** (2304 kpx, ~250 ms),
+  once per maximize.  It is correct — a re-layout vacates pixels — but a window
+  that knew which widgets moved could damage less.
+- **A system-wide crash after ~2 minutes with the Task Manager open, reported
+  from use and NOT REPRODUCED HERE** (160 s at -smp 4, 0 faults).  The reporter's
+  machine rebooted and produced a §M47 crash report, so the record exists; what
+  it names is the next thing to read.  Stated as unreproduced rather than
+  explained.
+- The `TIME` column truncates (`1634 ~`) now that six columns share the width.
+- The OWNER column, gated on §M32.
+
+### 4.89 §M76 — the doorways aarch64 did not have
+
+**Shipped 2026-09-10.  26 of i386's 60 dispatcher cases → 60 of 60.**
+
+Found by accident: §M75's own memory falsifier called `nanosleep`, which this
+architecture's native dispatcher did not answer, and the program span at full
+speed printing `syscall: unknown number 35` — **55 000 lines in one 60-second
+run**.  Diffing the three dispatchers turned one missing case into thirty-four.
+
+**WHY IT SURVIVED FROM §M25 TO §M75: the failure is a log line and a -1, never
+a link error.**  A native program calling `socket`, `stat`, `getdents`,
+`clone`, `getrandom`, `uname` or the dosgui bridge was silently x86-only — it
+built for ARM, linked for ARM, ran on ARM, and returned failure from a call the
+other two architectures serve.  §M70's shell-command finding one layer down,
+never swept.
+
+#### The blocker was the harness, and that is the transferable part
+
+The one program that exercises the missing dosgui calls is `uidemo`, and **it
+could not be started on ARM at all.**  §4.74 says this harness cannot type once
+a GUI window holds focus; with `gui.autostart` on, aarch64's desktop is up
+before the first command lands, so neither `uidemo` NOR `ps` reached the shell —
+measured, not assumed.
+
+*A sweep whose result cannot be run is a sweep nobody can falsify.*  This tree
+had already solved one instance of the same wall three times — `conf open` for a
+settings panel, `gui.wheeltest` for the wheel router, `gui.ui_dump` for a
+layout.  **`gui.autorun` is the general one**: a config key set BEFORE the GUI
+takes over, naming one command to dispatch once the desktop exists, on a
+detached task and exactly once.
+
+It earned itself on its first run, producing the falsifier rather than a claim:
+
+```
+gui: autorun 'uidemo'
+uidemo: spawned pid 19
+syscall: unknown number 53328          <- SYS_DOSGUI_CREATE
+uidemo: no window (is the GUI running?)
+```
+
+*The honest report of a missing doorway looks exactly like a broken subsystem* —
+a program complaining about the GUI when its syscall had simply never been
+wired.  After the sweep the same boot prints `uidemo: widgets built from ring 3`.
+
+#### What is a doorway and what is an implementation
+
+Twenty-four of the cases are argument shuffles over `sys_*` cores that already
+compiled here — x8 = number, x0..x5 = args, result in x0.  **None of them is an
+aarch64 implementation of anything; each is a doorway to the one definition
+i386 also calls.**
+
+Two are genuinely different, and the difference is worth keeping:
+
+- **`SET_TLS` is not portable.**  On x86 a thread pointer is a SEGMENT
+  DESCRIPTOR, so the call allocates a per-CPU GDT slot, pins the thread to that
+  CPU and returns a SELECTOR.  On aarch64 it is a register (`TPIDR_EL0`) with no
+  table, no pinning and no selector.  It returns **zero, not a plausible
+  number**: there is nothing for a caller to load into a segment register, and a
+  non-zero answer would invite it to try.
+
+- **THREE CASES ARE REFUSED WITH A REASON.**  `DRV_PORTS`, `DRV_PORTS_LOCK` and
+  `DRV_PORTS_UNLOCK` are port I/O, and **this architecture has no I/O address
+  space at all** — no instruction, no bitmap, nothing to grant.  Wiring them to
+  success would hand a driver a window it cannot use, and it would fault at its
+  first access, arbitrarily far from the call that lied.  §M33's honesty gate
+  applied to an architecture instead of to a placement: *a boundary you believe
+  in and do not have is worse than one you know you lack.*  The message names
+  the request, so an author learns WHICH thing this machine cannot serve.
+
+**VERIFIED:** 60 = 60 against i386 by diff; `uidemo` builds widgets from ring 3
+on ARM; `forktest`, `pipetest`, `sigtest` and `redirtest` still pass on the
+serial path; 0 faults and 0 audit failures on both aarch64 boot paths.
+
+**OPEN:** the seven portable `SYS_DRV_*` doorways are now reachable on ARM, but
+**ring-3 driver PLACEMENT has never been exercised there** — §M33 measured it on
+both x86 arches only.  Reachable is not proven, and the two should not be
+confused.
+
+### 4.89.1 §M76.1/.2 — the wave, and the flicker that was the truth
+
+Two reports from use, one after the other, and each was a different kind of
+answer.
+
+#### The wave — and it was my own optimisation
+
+*"The table refresh runs top to bottom in a wave, with a little lag.  Could
+multithreading help?  It is odd that it starts at the top rather than happening
+at once."*
+
+**Multithreading could not help, and saying why is half the answer.**  This is
+not compute-bound — the whole GUI is ~1 % of a CPU (§4.88.1).  The problem was
+that ONE logical refresh was arriving as MANY visible updates: a single scanout,
+one `win->lock`, so more threads would deliver the same N pieces in a less
+predictable order.  **The axis is batching, not parallelism.**
+
+Two causes, both introduced or amplified by §M75.2's per-cell damage:
+
+**`widget_draw_all` REPLACED the caller's clip instead of intersecting it.**
+`gui_window_request_redraw_rect` narrows the surface to one damaged rect and
+then calls it — and it set the clip to each widget's own box, discarding the
+rect.  So damaging one cell redrew the WHOLE widget into the window surface.
+Invisible on screen, because the compositor copies only the damaged rect: *the
+picture was always right and the work was not.*  Cheap while damage was a whole
+row; multiplied by the cell count once it was not.  §M65 paid for the same
+REPLACE-versus-INTERSECT confusion once already, in `ui_text_clipped`.  It now
+intersects, and skips widgets that do not overlap the rect at all — with one
+trap worth recording: the trailing `gfx_clear_clip` reset to the FULL surface,
+so the narrowing would have worked for exactly one widget.  It restores the
+caller's clip instead.
+
+**And the compositor composed mid-refresh.**  A refresh damages its cells one at
+a time from the app-host task while the compositor runs on another CPU, so it
+woke on the first rect and painted whatever had arrived — repeatedly, marching
+down the table in slot order.  New `gui_damage_begin/end`: **the rects are still
+recorded immediately, only the WAKE is deferred**, so a caller that forgets to
+end the bracket costs latency and never a lost update.  A counter, not a flag,
+because these nest.
+
+**THE BATCHING THEN EXPOSED A THIRD THING.**  With ~15 cell rects in one frame
+the damage list overflowed — `DMG_MAX` was **16**, chosen when damage was per
+ROW, and every rect past the sixteenth is MERGED into the cheapest existing one.
+Measured maximized: 16 rects covering 983-1566 kpx, against 14-25 kpx when each
+cell had its own.  *An overflow policy that merges is correct and is not free:
+it trades area for slots silently, so a list that is too short shows up as a
+compositor that got slower for no visible reason.*  48 now (768 bytes) — the
+page flip presents ONCE whatever the count, so extra rects cost loop iterations
+while merged ones cost megabytes of fill.
+
+#### And underneath it, a REAL bug — mine, and the reporter had already named it
+
+The same report carried a second observation: *"where it jumps, the letters go
+lighter too."*  A screenshot settled it in one look — `4407531 mmss` where
+`4475 ms` belonged, `77 mss` for `7 ms`, a STATE column reading `JN` instead of
+`RUN`.  **Two strings drawn on top of each other**, which is what makes
+anti-aliased glyphs look lighter.
+
+**THE EXPLANATION BELOW WAS WRONG, AND IS KEPT BECAUSE THE HAZARD IT NAMES IS
+REAL.**  The doubled glyphs were §4.89.1's cleared clip in `table_draw`, found
+four attempts later; nothing in this subsection was their cause.  What follows
+is a genuine constraint on per-cell damage that was discovered while looking for
+them.
+
+**PER-CELL DAMAGE IS ONLY VALID WHILE THE COLUMNS HAVE NOT MOVED, and in this
+table they move on their own.**  `t_layout` derives every column's width from
+its CONTENT (§M65 — *the longest cell is a fact*), so a `TIME` value growing
+from 4481 to 44751 widens its column and shifts every column after it.  §M75.2's
+diff computed the damaged rect from the NEW layout while the OLD text sat at the
+OLD position — so the old glyphs were never painted over.
+
+The reporter's own guess — *"as if the row content were different because of
+the row length"* — fitted this so well that it kept the search here for three
+more attempts.  **A plausible explanation that the reporter and the author both
+believe is the most expensive kind of wrong**, because it stops either of them
+looking anywhere else.
+
+Fixed by remembering the column geometry and comparing it each refresh: a column
+that resized takes the same whole-pane branch a scroll does, which is what a
+re-layout has meant everywhere else in this tree since §M69.  It costs nothing
+in the common case, because it only fires when a column actually changes width.
+
+*The lesson is the one §M75.2 should have carried from the start: an
+optimisation that assumes stable geometry has to say so, and check it.*
+
+**AND THE FIX TRADED THE ARTIFACT FOR A BIGGER ONE, which the reporter saw
+before the counters did:** *"unchanged — maybe it spread to the whole table."*
+Correct.  Detecting the re-layout means repainting the whole pane when it
+happens, and it happens **twice in 25 seconds** on an idle desktop, because
+twenty rows all growing cross digit boundaries constantly.  The pixels became
+right and the experience got worse.
+
+**A second attempt then failed in a way only the PICTURE showed.**  Quantising a
+mono column's width to whole 4-character steps removed the re-layouts entirely
+(`colmove 0` over the same 25 s) — and pushed the total past the available
+width, so `t_layout`'s squeeze-and-drop logic truncated the TIME column:
+`29821 ~` where `29821 ms` belonged.  *A column that is stable and unreadable is
+not an improvement on one that moves.*  Reverted, with the reasoning left in
+place at the point somebody would try it again.
+
+**AND THEN IT WAS TURNED OFF — on reasoning that was itself mistaken.**
+Per-cell damage was innocent: see §4.89.1.  It remains off because re-enabling
+it is a measured decision needing the sticky column width below, not because it
+caused anything.  After all
+three fixes the reporter still saw doubled glyphs — the same value rendered
+BOLDER than its neighbours, one string composited on another at the same
+position.  I could not reproduce it in a still capture, and the counters said
+the branches were behaving (`pane=0, colmove=0, cells=33, rows=0`).  **So the
+honest position is that the optimisation had a defect I could not see and the
+user could.**
+
+Row-granular damage had shipped for a milestone with no complaints.  *A tenfold
+saving in frame area on a window nobody keeps maximized does not buy three
+visual regressions and a fourth nobody has explained — a correct picture is not
+a feature you trade for frame area.*  Measured after the revert, default window
+size: **51-75 kpx mean, 7-10 ms per frame**, which is what it was before any of
+this and is perfectly serviceable.
+
+Everything else from that work stands on its own and stays: the clip INTERSECT
+in `widget_draw_all` (strictly less drawing, and a real bug), the damage
+batching, `DMG_MAX` 48, the `hover` op, and pid-ordered rows.
+
+**WHAT THE RIGHT FIX WOULD BE, stated rather than attempted at the end of a
+session:**
+a column's width should be decided ONCE and kept, which is per-instance STATE —
+and this view is deliberately stateless (§M64 keeps selection and scroll in the
+viewer so views stay stateless).  A sticky per-column width belongs to the
+WIDGET, and it is a change to the item-view contract rather than to a layout
+function.  The counters to judge it by already exist (`gui.stats_ms` reports
+`pane`, `colmove`, `cells`, `rows` per refresh).
+
+#### §M76.5 — the actual cause, found after four wrong fixes
+
+*"They flicker completely at random.  I am doing nothing."*
+
+**That sentence is what finally located it**, by ruling out everything the four
+previous attempts had touched: a flicker that needs no input is not about which
+rectangles get damaged.  The page flip was ruled out next with a switch built
+for the purpose (`gui.page_flip`) — single-buffered, still flickering — which
+left the window surface itself.
+
+**`table_draw` CLEARED the clip after each cell instead of restoring it.**
+
+```c
+gfx_set_clip(s, x + xs[c], ry, cw, T_ROW_H);
+t_draw_cell(...);
+gfx_clear_clip(s);            /* resets to the WHOLE SURFACE */
+```
+
+`gfx_clear_clip` resets to the entire surface, so from the SECOND CELL ONWARD
+this table painted **unclipped over the whole window** — every remaining cell
+and every remaining row, including rows whose background nobody had cleared,
+because only the damaged row's rect had been filled.  Text drawn on top of text
+is exactly what that looks like: the same value rendered BOLDER than its
+neighbours, in whichever rows happened to follow the damaged one.
+
+**IT EXPLAINS WHY FOUR FIXES DID NOTHING.**  Every one of them changed WHICH
+rects were damaged, while this went on painting all of them regardless.  The
+symptom moved (row-granular, cell-granular, quantised columns, whole-pane) and
+never went away, because none of them was upstream of the actual defect.
+
+**AND IT IS THE THIRD INSTANCE OF ONE MISTAKE.**  §M65 found `ui_text_clipped`
+throwing away a scrolling container's viewport the same way; §M76.1 found
+`widget_draw_all` replacing its caller's clip earlier the same day; this is the
+third.  *A clip is a stack discipline and there is no API here that enforces
+it* — `gfx_set_clip` REPLACES and `gfx_clear_clip` RESETS, so every nested
+narrowing must save and restore by hand.  `clip_push`/`clip_pop` now spell that
+out at the two sites in itemview.c, intersecting rather than replacing.
+
+**METHOD NOTE, AT MY OWN EXPENSE.**  Four changes went in on a hypothesis and
+none was verified against the symptom before the next was attempted — two of
+them introduced NEW visual defects (a whole-table flash, truncated columns) and
+one had to be reverted.  What broke the loop was not a better guess but the
+reporter's own observation being taken literally: *with no input* excludes the
+input path, and everything downstream of it.
+
+#### §M77 — the last measured cost: columns that stop moving
+
+With the clip fixed, one measured cost remained: a column sized from its
+CONTENT resizes as its content grows, and every resize shifts every column
+after it and forces a full-table repaint — **twice in 25 seconds** on an idle
+desktop, because twenty rows of milliseconds cross digit boundaries constantly.
+A whole-table repaint is a visible flash.
+
+Rounding mono columns up to whole character cells removes it, and doing so
+UNCONDITIONALLY had already been tried and reverted: it pushed the total past
+the available width, the squeeze-and-drop logic took over, and the TIME column
+began truncating (`29821 ~`).
+
+**THE DIFFERENCE IS THAT THE ROUNDING IS NOW SPENT OUT OF SLACK THAT ALREADY
+EXISTS, AND NEVER BORROWED.**  Each mono column is widened to the next
+4-character boundary only while the remaining slack covers it; a table with no
+room to spare keeps exactly the layout it had.  *The stability is best where
+there is room for it and costs nothing where there is not* — which is the right
+way round, because a cramped table's width is already changing for bigger
+reasons.
+
+Four characters rather than one, because a number crossing a digit boundary is
+the common case and a one-character step would still move for every one of
+them.
+
+**MEASURED: `colmove 0` and `pane 0` over 25 seconds** (was 2 and 2), with the
+picture confirming no truncation — `29576 ms`, `12115 ms` and full `STATE`
+values, which is what the first attempt lost.
+
+#### §M77.1 — per-cell damage tried again, and refused with a SYMPTOM this time
+
+With §M76.5's clip discipline and §M77's stable columns both in place, the one
+thing that had genuinely blocked per-cell damage was gone, so it was switched
+back on as a measured decision.
+
+**The numbers were good**: refresh 9-11 ms → 5-6 ms, one CPU 3 % → 1-2 %,
+`pane 0 colmove 0 cells 36 rows 0` over 25 seconds.
+
+**The picture was not.**  A right-aligned CPU% cell going from `24.5 %` to
+`0.0 %` left the leading digit's fragment behind — `?0.0 %`.
+
+**THE COUNTERS CANNOT SEE THAT, AND NEVER WILL.**  They count which rects were
+damaged, and a stale pixel is a rect that was NOT.  *For a damage optimisation
+the picture is the authority and the counters are a convenience* — the reverse
+of every other optimisation in this tree, where a number settles what an
+impression cannot.
+
+Off again — but this entry differs from the last one in the way that matters:
+**it names a reproducible symptom instead of a theory.**  The defect is specific
+to a RIGHT-ALIGNED cell whose text got SHORTER, on a path whose other
+preconditions are now all sound.  The next attempt starts from a case that can
+be reproduced in one refresh rather than from a hypothesis about geometry.
+
+Row damage costs 9-11 ms per refresh on a window nobody keeps maximized.  *That
+is not a price worth a wrong pixel.*
+
+#### §M77.2 — two rows selected at once, and what the damage bracket did not buy
+
+Reported from use: *"the selection seems to lag — there was a moment when two
+rows were highlighted at once."*  **The symptom names the mechanism exactly.**
+A selection change damages TWO rows — the one losing the highlight and the one
+taking it — and if only one of them lands in this frame, both look selected
+until the next.
+
+`gui_damage_begin/end` (§M76.1) defers the WAKE, and that is enough when nothing
+else is producing frames.  **It is not enough during a click**: the pointer
+moves, the compositor draws the CURSOR, so frames are being produced anyway —
+and a compose can land between the two rects of one update, take the first and
+leave the second for the next frame.
+
+So `compose()` now returns immediately while a batch is open.  The cost is at
+most the length of one bracket — a single widget refresh — and the wake is still
+pending, so the frame happens straight after.  *A frame that shows half an
+update is worse than a frame that waits for it.*
+
+Verified by driving three clicks down the table: exactly one row highlighted
+after each, and the footer naming the pid it selected.
+
+#### §M77.3 — ring-3 driver placement on ARM: the doorway is open, the CLIENT cannot run
+
+§M76 wired the seven portable `SYS_DRV_*` calls on aarch64, and the open item it
+left was honest: *reachable is not proven.*  Testing it turned up something
+better than a pass or a fail.
+
+The only §M33 client is QEMU's `edu` device, and on `-M virt` it is present and
+its init FAILS:
+
+```
+edu: no DMA buffer at 28 address bits (-3) — this kernel has nothing free that low
+driver edu (misc) init failed: -1
+```
+
+**`edu` addresses DMA with 28 bits — 256 MiB — and this machine's RAM starts at
+1 GiB.**  There is no address below 2^28 at all, so the constraint cannot be met
+by any allocation policy.  §M33 shipped `page_alloc_below` precisely because
+this class of limit exists; here it has nothing to hand back.
+
+**That is a fact about the DEVICE, not about the placement machinery**, and the
+two must not be conflated: the syscall doorways are open and untested, the DMA
+grant is untestable with this client, and neither says anything about whether a
+placed driver would work on ARM.  What it needs is a client whose DMA fits — a
+real ARM device ported to `drvrt`, which §M33 already lists as its own open item
+(*"a synthetic client cannot answer whether the interface is pleasant for a
+COMPLICATED driver"*).
+
+#### The flicker — measured, and it was not a bug
+
+*"There is a very, very small moment where the lower part of the table changes
+and then goes back.  Maybe sorting would fix it — or maybe it is a bug."*
+
+**Measured before answering: the row count oscillates between 20 and 23 over
+five seconds.**  This machine's cron starts and reaps `audit`, `driver-rescan`
+and `tick-log` continuously, each living milliseconds, and a 2-3 Hz refresh
+catches some of them.  So the flicker is the table telling the truth about a
+busy machine — not a rendering fault.
+
+**The instinct about ordering was right about the part that WAS fixable.**
+Children were emitted in the master list's LINK order, so a task born a moment
+ago could appear ANYWHERE among its parent's children, pushing every later
+sibling — and their whole subtrees — down a row.  Emitted in PID order the
+newest task always sorts LAST among its siblings, so a long-lived row's position
+no longer depends on what was spawned since.  Roots likewise.
+
+**IT DOES NOT ABOLISH THE FLICKER AND IS NOT MEANT TO.**  A row inserted
+anywhere still displaces what follows it.  Removing it entirely would mean not
+showing short-lived tasks — hiding rather than ordering, and *the one moment a
+task manager must not lie is when something is spawning in a loop.*
+
 ## 8. Change log
 
 - **2026-09-08 — §M71: RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
