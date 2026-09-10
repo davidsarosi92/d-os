@@ -110,6 +110,14 @@ struct drv_manifest {
      * did not receive from here. */
     uint16_t    pci_vendor, pci_device;
     int         dma_bytes;           /* how much DMA it may be given, 0 = none */
+    /* §M78 — A FIXED MMIO WINDOW, for a driver that is not on a bus we can
+     * enumerate.  The manifest resolved windows from a PCI BAR, which assumed
+     * every placeable driver is a PCI driver — true while the only two were.
+     * The PL031 is a PLATFORM device at an address the board defines, so its
+     * window has to be DECLARED, and declaring it here rather than letting the
+     * driver name it is the manifest's whole point: *the bound must come from
+     * somewhere the driver cannot set.* */
+    uint64_t    mmio_phys, mmio_len; /* 0 = resolve from the PCI BAR instead */
     /* §M33 Tier 2 — what to tell this driver's CLIENTS when it dies.  See
      * quiesce_pointer below: a driver that vanishes mid-gesture has left state
      * latched in a client that will never hear the end of it, and only the
@@ -123,12 +131,18 @@ static const struct drv_manifest g_manifest[] = {
     /* The 8042 aux device: four registers at 0x60 and IRQ 12.  Exactly what
      * ps2_mouse.c asks the in-kernel backend for — the same numbers, now
      * written down where the driver cannot reach them. */
-    { "ps2_mouse", 0x60, 5, 12, 0, 0, 0, quiesce_pointer },
+    { "ps2_mouse", 0x60, 5, 12, 0, 0, 0, 0, 0, quiesce_pointer },
     /* The educational device: no ports at all, which is why it is the first
      * driver aarch64 can place.  Its window comes from its BAR and its DMA
      * ceiling is declared here rather than asked for, for the manifest's own
      * reason — the bound must come from somewhere the driver cannot set. */
-    { "edu", 0, 0, -1, 0x1234, 0x11E8, 4096, NULL },
+    { "edu", 0, 0, -1, 0x1234, 0x11E8, 4096, 0, 0, NULL },
+    /* §M78 — the ARM PL031 RTC: no ports (this architecture has none), no DMA
+     * (its RAM starts above every address `edu` can reach) and a window the
+     * BOARD defines rather than a bus.  What is left is exactly the question
+     * §M76 left open — does a driver placed in ring 3 on ARM get its device's
+     * registers and nothing else. */
+    { "pl031", 0, 0, -1, 0, 0, 0, 0x09010000ULL, 0x1000, NULL },
 };
 #define MANIFEST_N ((int)(sizeof g_manifest / sizeof g_manifest[0]))
 
@@ -328,6 +342,11 @@ extern const unsigned char _binary_user_ps2mouse_elf_start[] __attribute__((weak
 extern const unsigned char _binary_user_ps2mouse_elf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_edudrv_elf_start[]   __attribute__((weak));
 extern const unsigned char _binary_user_edudrv_elf_end[]     __attribute__((weak));
+/* §M78 — the first placeable driver on aarch64.  MMIO only, which is what that
+ * architecture can grant: it has no I/O space at all, and its RAM starts at
+ * 1 GiB so `edu`'s 28-bit DMA cannot be satisfied there by any policy. */
+extern const unsigned char _binary_user_pl031drv_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_pl031drv_elf_end[]   __attribute__((weak));
 
 struct drv_image { const char* name; const unsigned char** start; const unsigned char** end; };
 
@@ -335,6 +354,8 @@ static const unsigned char* ps2_s(void) { return _binary_user_ps2mouse_elf_start
 static const unsigned char* ps2_e(void) { return _binary_user_ps2mouse_elf_end; }
 static const unsigned char* edu_s(void) { return _binary_user_edudrv_elf_start; }
 static const unsigned char* edu_e(void) { return _binary_user_edudrv_elf_end; }
+static const unsigned char* pl031_s(void) { return _binary_user_pl031drv_elf_start; }
+static const unsigned char* pl031_e(void) { return _binary_user_pl031drv_elf_end; }
 
 /* Which image is this driver's?  A table keyed by name rather than a field on
  * `struct driver`, for the manifest's own reason: what may be placed in ring 3,
@@ -343,6 +364,7 @@ static int du_image(const char* name, const unsigned char** img,
                     const unsigned char** end) {
     if (du_name_eq(name, "ps2_mouse")) { *img = ps2_s(); *end = ps2_e(); }
     else if (du_name_eq(name, "edu"))  { *img = edu_s(); *end = edu_e(); }
+    else if (du_name_eq(name, "pl031")){ *img = pl031_s(); *end = pl031_e(); }
     else return -1;
     return *img ? 0 : -1;                   /* not embedded in this build */
 }
@@ -819,7 +841,20 @@ long drvuser_sys_log(const char* msg) {
  * base and length into a small user struct. */
 long drvuser_sys_window(int bar, uint64_t* out_phys, uint64_t* out_len) {
     struct drvuser* d = du_current();
-    if (!d || !d->mf->pci_vendor) return DRV_EBAD;
+    if (!d) return DRV_EBAD;
+    /* §M78 — a DECLARED window needs no bus walk.  Checked first, so a
+     * platform driver never reaches the PCI path and gets DRV_EBAD for not
+     * being something it never claimed to be. */
+    if (d->mf->mmio_len) {
+        d->win_phys = d->mf->mmio_phys;
+        d->win_len  = d->mf->mmio_len;
+        if (out_phys) *out_phys = d->win_phys;
+        if (out_len)  *out_len  = d->win_len;
+        kprintf("drv-user: '%s' window %x +%x (declared, not a bus)\n",
+                d->mf->name, (unsigned)d->win_phys, (unsigned)d->win_len);
+        return 0;
+    }
+    if (!d->mf->pci_vendor) return DRV_EBAD;
     if (bar < 0 || bar > 5) return DRV_EBAD;
 
     struct pci_device pd;

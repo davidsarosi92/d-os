@@ -30,6 +30,17 @@
 #include "libc.h"
 #include "drvrt.h"
 
+/* §M78 — does this architecture HAVE an I/O address space?  Decided once, at
+ * the top, because both the raw helpers and every entry point that would use
+ * them have to agree — and the first version defined it below its first use,
+ * which compiles to "no ports" on x86 and is exactly the silent wrong answer
+ * this flag exists to prevent. */
+#if defined(__i386__) || defined(__x86_64__)
+#define DRVRT_HAVE_PORTS 1
+#else
+#define DRVRT_HAVE_PORTS 0
+#endif
+
 #define SYS_DRV_PORTS    0xD060
 #define SYS_DRV_IRQ      0xD061
 #define SYS_DRV_IRQ_WAIT 0xD062
@@ -84,11 +95,31 @@ drv_handle drv_ports_request(struct drv_rt* rt, uint16_t base, uint16_t count,
  * for the same reason: a driver must get the same answer on both sides,
  * including when it asks for something outside its window. */
 static long port_at(drv_handle h, uint16_t off) {
+#if !DRVRT_HAVE_PORTS
+    /* DRV_ENOSYS, not a wrong number: "this machine has no such resource kind"
+     * is a different answer from "the offset is outside your window", and a
+     * driver author needs to be able to tell them apart. */
+    (void)h; (void)off; return DRV_ENOSYS;
+#endif
     if (h <= 0 || h > DRV_MAX_RES || !g_res[h - 1].used) return DRV_EBAD;
     if (off >= g_res[h - 1].count) return DRV_ERANGE;
     return (long)(g_res[h - 1].base + off);
 }
 
+/* §M78 — PORT I/O IS x86-ONLY, AND SO IS THIS BLOCK.
+ *
+ * These six helpers are `in`/`out` instructions.  aarch64 has no I/O address
+ * space at all — no instruction, no bitmap, nothing to address — so on that
+ * architecture they cannot exist rather than merely being unused.  Compiling
+ * them there is what kept this whole shim, and therefore every ring-3 driver,
+ * from building on ARM: §M76 opened the syscall doorways and the USERSPACE side
+ * still would not compile.
+ *
+ * The refusal matches the kernel's (hal/aarch64/syscall.c refuses DRV_PORTS
+ * with a reason): a driver that asks for ports on this machine is told so,
+ * rather than handed a success it would fault on.  §M33's honesty gate, on the
+ * other side of the same boundary. */
+#if DRVRT_HAVE_PORTS
 static inline unsigned char raw_in8(unsigned short p) {
     unsigned char v; __asm__ volatile ("inb %1, %0" : "=a"(v) : "Nd"(p)); return v;
 }
@@ -101,6 +132,17 @@ static inline unsigned raw_in32(unsigned short p) {
 static inline void raw_out8 (unsigned short p, unsigned char v)  { __asm__ volatile ("outb %0, %1" :: "a"(v), "Nd"(p)); }
 static inline void raw_out16(unsigned short p, unsigned short v) { __asm__ volatile ("outw %0, %1" :: "a"(v), "Nd"(p)); }
 static inline void raw_out32(unsigned short p, unsigned v)       { __asm__ volatile ("outl %0, %1" :: "a"(v), "Nd"(p)); }
+
+#else
+/* Never called — every port entry point below returns DRV_ENOSYS first — but
+ * declared so the file has one shape on both architectures. */
+static inline unsigned char  raw_in8 (unsigned short p) { (void)p; return 0; }
+static inline unsigned short raw_in16(unsigned short p) { (void)p; return 0; }
+static inline unsigned       raw_in32(unsigned short p) { (void)p; return 0; }
+static inline void raw_out8 (unsigned short p, unsigned char v)  { (void)p; (void)v; }
+static inline void raw_out16(unsigned short p, unsigned short v) { (void)p; (void)v; }
+static inline void raw_out32(unsigned short p, unsigned v)       { (void)p; (void)v; }
+#endif
 
 int  drv_in8 (drv_handle h, uint16_t off) { long p = port_at(h, off); return p < 0 ? (int)p : (int)raw_in8((unsigned short)p); }
 int  drv_in16(drv_handle h, uint16_t off) { long p = port_at(h, off); return p < 0 ? (int)p : (int)raw_in16((unsigned short)p); }

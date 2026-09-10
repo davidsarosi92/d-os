@@ -559,6 +559,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/virtio_input.c \
       kernel/hal/aarch64/virtio_snd.c \
       kernel/hal/aarch64/pl031_rtc.c \
+    kernel/drivers/rtc/pl031_drv.c \
       kernel/hal/aarch64/dtb.c \
       kernel/hal/aarch64/serial_shell.c \
       kernel/hal/aarch64/main_entry.c
@@ -576,6 +577,7 @@ else ifeq ($(ARCH),aarch64)
   # so adding them here is the whole change.
   ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
                      user/memhog_blob.o \
+                     user/pl031drv_blob.o \
                      user/forktest_blob.o user/pipetest_blob.o \
                      user/redirtest_blob.o user/uidemo_blob.o \
                      user/sigtest_blob.o user/muslhello_muslblob.o \
@@ -1619,6 +1621,22 @@ user/edudrv_$(ARCH).elf: user/libc.c user/drvrt_user.c kernel/drivers/misc/edu.c
 	    -c kernel/drivers/misc/edu.c -o $(OBJ_DIR)/user/edudrv.o
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/edudrv.o \
+	    $(OBJ_DIR)/user/drvrt_user.o $(OBJ_DIR)/user/libc.o
+
+# §M78 — the SAME PL031 source, built for ring 3.  It is the FIRST driver that
+# can be placed on aarch64: MMIO only, no DMA and no ports, which is precisely
+# what this architecture can grant (its RAM starts at 1 GiB, so `edu`'s 28-bit
+# DMA cannot be satisfied there by any policy, and it has no I/O space at all).
+user/pl031drv_$(ARCH).elf: user/libc.c user/drvrt_user.c kernel/drivers/rtc/pl031_drv.c user/libc.h $(USER_CRT0_SRC)
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -Ikernel/includes -c user/drvrt_user.c \
+	    -o $(OBJ_DIR)/user/drvrt_user.o
+	$(CC) $(USER_CFLAGS) -Ikernel/includes -DDRV_USERSPACE \
+	    -c kernel/drivers/rtc/pl031_drv.c -o $(OBJ_DIR)/user/pl031drv.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/pl031drv.o \
 	    $(OBJ_DIR)/user/drvrt_user.o $(OBJ_DIR)/user/libc.o
 
 user/drvtest_$(ARCH).elf: user/libc.c user/drvtest.c user/libc.h $(USER_CRT0_SRC)
