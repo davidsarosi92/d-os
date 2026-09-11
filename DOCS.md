@@ -12667,26 +12667,26 @@ paint col3 W=656 n=6 xs=349 ws=77      (paint:  349..426)
 paint col3 W=656 n=6 xs=344 ws=88      (an EARLIER layout)
 ```
 
-**W and n are identical**, so `t_layout` is deterministic and the two ends are
-not disagreeing about anything at the same instant.  **The stale pixels belong
-to an EARLIER LAYOUT** — text painted when the column began at 344, damaged
-later from a layout where it begins at 349.  The 344..348 strip belongs to no
-rect anybody computes.
+**AND THE READING TAKEN FROM THIS WAS WRONG, WHICH IS WHY IT IS KEPT.**  `W` and
+`n` looked identical, so the conclusion drawn was that `t_layout` is
+deterministic, the two ends never disagree at one instant, and the stale pixels
+must therefore belong to an EARLIER layout that `iv_cols_moved` had failed to
+catch.  Every step of that follows — from a number that was not the right one.
 
-**So per-cell damage is sound only if EVERY layout change repaints the whole
-pane**, and `iv_cols_moved` exists to do exactly that — it is therefore
-INCOMPLETE rather than wrong.  Finding out how is the remaining work; that it
-probes row `iv->scroll` only is the first hypothesis to test.
+**The probe printed each function's PARAMETER `w`, not the ARGUMENT handed to
+`t_layout`**, and the argument differed by the scrollbar's width (§M79.4).  The
+parameters really were both 656; the arguments were 656 and 656 − sb.  *An
+instrument that reports a neighbouring value is worse than none, because it is
+believed* — and it was believed for two more rounds.
 
-*Three theories killed by measurement and one confirmed, with the fix still not
-guessed at.*
+The other half of the same mistake: the paint line printed only when a width
+CHANGED, so the two samples being compared often came from different refresh
+cycles.  A refresh SEQUENCE NUMBER on both lines is what made the contradiction
+impossible to explain away, and the fix followed in minutes.
 
-The probe is kept and gated (`gui.iv_probe`, default off), because it is what
-produced a number after five rounds of argument did not.
-
-*The item went from "a defect I cannot see" to a deterministic reproduction and
-TWO theories killed by measurement rather than by argument — with the fix still
-not guessed at.  That is what the day's other five attempts did not do.*
+The probe is kept and gated (`gui.iv_probe`, default off), corrected to print
+the argument — because once it told the truth it settled in one run what five
+rounds of argument could not.
 
 Row damage costs 9-11 ms per refresh on a window nobody keeps maximized.  *That
 is not a price worth a wrong pixel.*
