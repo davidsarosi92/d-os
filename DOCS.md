@@ -12740,6 +12740,47 @@ real ARM device ported to `drvrt`, which §M33 already lists as its own open ite
 (*"a synthetic client cannot answer whether the interface is pleasant for a
 COMPLICATED driver"*).
 
+#### §M79.4 — FIXED.  One missing term, after five wrong theories
+
+`table_draw` lays the columns out over `w - sb` — the width the SCROLLBAR does
+not take — and `table_cell_rect` called `t_layout` with the full `w`.  Same
+model, same nominal width, **different column geometry**: the damage rect was
+computed for a layout the painter never used, so a right-aligned cell that
+SHRANK left a strip of its old glyph outside every rect anybody computed.
+
+```
+[3] rect  col3 xs=349 ws=110      <- damage, laid out over w
+[3] paint col3 xs=344 ws=88       <- paint,  laid out over w - sb
+```
+
+Both ends go through one `t_columns` now — *two copies of a layout cannot drift
+if there is only one of them.*  §4.79's shape for the third time in this file's
+history, after `ui_text_clipped` and `widget_draw_all`.
+
+**WHAT THE FIVE WRONG THEORIES HAVE IN COMMON:** each was argued from ONE end —
+the diff, the column geometry, the page flip, the clip, the batching.  Two of
+them changed code and introduced new defects.  None could have been right,
+because the defect was a DISAGREEMENT and a disagreement is invisible from
+either side alone.
+
+**AND THE INSTRUMENT LIED TWICE BEFORE IT TOLD THE TRUTH.**  `gui.iv_probe`
+printed both ends together and still did not settle it, because it printed each
+function's PARAMETER `w` — 656 at both ends — instead of the ARGUMENT handed to
+`t_layout`, which differed by the scrollbar.  *An instrument that reports a
+neighbouring value is worse than none, because it is believed.*  It was also
+filtered on one end only (printing the paint line just when a width changed),
+so the two samples being compared were often from different refresh cycles —
+which is what produced the earlier reading that the ends disagreed about
+geometry when they were simply not paired.  A refresh SEQUENCE NUMBER on both
+lines made the contradiction impossible to explain away, and the fix followed in
+minutes.
+
+**MEASURED:** refresh 9-11 ms → 6-8 ms, one CPU 3 % → 2 %, `rows=0` (the
+per-cell path always succeeds), and the driven case that reproduced the artifact
+every single time — `loop 4` → `loopstop` → a right-aligned cell shrinking — is
+clean in three consecutive runs.  All three arches build silent; the probe stays,
+gated off by default, because it is what produced the number.
+
 #### The flicker — measured, and it was not a bug
 
 *"There is a very, very small moment where the lower part of the table changes

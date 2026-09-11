@@ -638,6 +638,35 @@ static void clip_pop(struct gfx_surface* s, struct clip_save c) {
  * of them at a time. */
 int  iv_probe_on(void);
 void iv_probe(const char* fmt, ...);
+extern unsigned iv_probe_seq;   /* bumped per refresh; pairs the two ends */
+
+/* §M79.4 — THE COLUMN LAYOUT AS THE PAINTER SEES IT, and there is exactly one
+ * way to ask for it.
+ *
+ * `table_draw` lays the columns out over `w - sb` — the width the SCROLLBAR does
+ * not take — and `table_cell_rect` called `t_layout(m, w, ...)` directly,
+ * missing the subtraction.  Same model, same nominal width, different column
+ * geometry: the damage rect was computed for a layout the painter never used,
+ * so a right-aligned cell that shrank left a strip of its old glyph outside
+ * every rect anybody computed.
+ *
+ * §4.79's shape for the third time in this file's history — a painter and a
+ * hit test computing one rectangle differently — and the reason the fix is a
+ * SHARED FUNCTION rather than a copied `- sb`: the two cannot drift if there is
+ * only one of them.
+ *
+ * It cost five wrong theories, and every one of them was possible because the
+ * two ends were compared by reading rather than by printing the SAME expression
+ * from both.  The probe that found it printed the function's PARAMETER `w`
+ * instead of the ARGUMENT handed to `t_layout`, which is why they looked
+ * identical for two more rounds — *an instrument that reports a neighbouring
+ * value is worse than none, because it is believed.* */
+static int t_layout(const struct item_model* m, int w, int* xs, int* ws);
+static int t_scrollbar(const struct item_model* m, int h);
+
+static int t_columns(const struct item_model* m, int w, int h, int* xs, int* ws) {
+    return t_layout(m, w - t_scrollbar(m, h), xs, ws);
+}
 
 static int t_layout(const struct item_model* m, int w, int* xs, int* ws) {
     int n = t_cols(m);
@@ -784,8 +813,7 @@ static void table_draw(struct gfx_surface* s, int x, int y, int w, int h,
     /* THE COLUMNS GET THE WIDTH THE SCROLLBAR DOES NOT.  Laying them out over
      * the full width and then painting a bar on top clips the last column by
      * exactly the bar — which is invisible until a value happens to be long. */
-    int sb = t_scrollbar(m, h);
-    int n = t_layout(m, w - sb, xs, ws);
+    int n = t_columns(m, w, h, xs, ws);
 
     /* Header — drawn from the model, not from a caller's padded string.  The
      * file manager used to fake this with spaces in a label, which is exactly
@@ -861,15 +889,16 @@ static void table_draw(struct gfx_surface* s, int x, int y, int w, int h,
             /* §M79.2 — TEMPORARY PROBE: the paint's own numbers, printed only
              * when a right-aligned cell's width CHANGES, which is the one
              * moment the artifact appears. */
-            if ((style & ICOL_RIGHT) && iv_probe_on()) {
-                static int last_tw[8];
-                int tw2 = t_text_w(buf, style);
-                if (c < 8 && tw2 != last_tw[c]) {
-                    last_tw[c] = tw2;
-                    iv_probe("paint col%d W=%d n=%d xs=%d ws=%d tx=%d tw=%d\n",
-                             c, w, n, xs[c], ws[c], tx - x, tw2);
-                }
-            }
+            /* §M79.4 — PRINT EVERY TIME, for one column only.  The previous
+             * version printed only when the width CHANGED, which meant the
+             * damage line and the paint line could come from different refresh
+             * cycles — and comparing two unpaired samples is what produced the
+             * §M79.2 reading that the two ends disagree.  *A filter on one end
+             * of a two-ended probe makes the pair meaningless.* */
+            if (c == 3 && i == scroll && iv_probe_on())
+                iv_probe("[%u] paint col%d W=%d n=%d xs=%d ws=%d tx=%d tw=%d\n",
+                         iv_probe_seq, c, w, n, xs[c], ws[c], tx - x,
+                         t_text_w(buf, style));
             struct clip_save cc = clip_push(s, x + xs[c], ry, cw, T_ROW_H);
             t_draw_cell(s, tx, ry + (T_ROW_H - cp_fh()) / 2, buf, col, style, cw);
             clip_pop(s, cc);
@@ -882,7 +911,7 @@ static void table_draw(struct gfx_surface* s, int x, int y, int w, int h,
      * the view reserves the strip and REPORTS it (`.scrollbar`), and the widget
      * — which owns `scroll` and the grab — paints it through scrollbar.c.
      * The old copy here drew a thumb that nothing could touch. */
-    (void)sb;
+    /* the strip is reserved inside t_columns now; the widget paints the bar */
 }
 
 static int table_hit(int px, int py, int w, int h, const struct item_model* m,
@@ -926,10 +955,10 @@ static int table_cell_rect(int i, int col, int w, int h, const struct item_model
     if (table_rect(i, w, h, m, scroll, &rx, &ry, &rw, &rh) != 0) return -1;
 
     int xs[8], ws[8];
-    int n = t_layout(m, w, xs, ws);
+    int n = t_columns(m, w, h, xs, ws);      /* §M79.4 — the PAINTER's layout */
     if (col < 0 || col >= n) return -1;
     if (iv_probe_on())
-        iv_probe("rect  col%d W=%d n=%d xs=%d ws=%d\n", col, w, n, xs[col], ws[col]);
+        iv_probe("[%u] rect  col%d W=%d n=%d xs=%d ws=%d\n", iv_probe_seq, col, w, n, xs[col], ws[col]);
 
     int x0 = xs[col] - 1;
     int x1 = xs[col] + ws[col] + 1;

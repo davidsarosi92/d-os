@@ -56,6 +56,7 @@ CONFIG_KEY(ck_iv_probe) = {
     .help = "log item-view damage rects against paint extents (diagnostic)",
 };
 
+unsigned iv_probe_seq;
 int iv_probe_on(void) { return (int)config_get_long("gui.iv_probe", 0); }
 void iv_probe(const char* fmt, ...) {
     /* kprintf takes the varargs directly; this exists so itemview.c can reach
@@ -192,7 +193,11 @@ void w_itemview_refresh(struct w_itemview* iv) {
      * add up to. */
     /* §M76.2 — a column that resized invalidates every per-cell rect below, so
      * it takes the same branch a scroll does. */
+    iv_probe_seq++;
     int cols_moved = iv_cols_moved(iv);
+    if (iv_probe_on())
+        iv_probe("[%u] refresh cols_moved=%d scroll=%d\n",
+                 iv_probe_seq, cols_moved, iv->scroll);
     if (!iv->sig_valid || iv->scroll != iv->sig_scroll || slots != iv->sig_slots
         || cols_moved) {
         iv_stat_pane++;
@@ -323,127 +328,35 @@ void w_itemview_refresh(struct w_itemview* iv) {
          *
          * Row damage costs 9-11 ms a refresh on a window nobody keeps
          * maximized.  *That is not a price worth a wrong pixel.* */
-        /* §M79 — OFF, AND NOW WITH A ONE-COMMAND REPRODUCTION.
+        /* §M79.4 — PER-CELL DAMAGE IS ON, AND THE BUG WAS ONE MISSING TERM.
          *
-         * `launch Task Manager` -> `loop 4` -> `loopstop` -> screenshot.  The
-         * hogs drive a right-aligned CPU% cell to `25.0 %` and `loopstop` drops
-         * it to `0.0 %`; the shorter text leaves a PARTIAL leading glyph behind
-         * (`?0.0 %`, `?5.0 %`).  It reproduces every time.
+         * `table_draw` lays the columns out over `w - sb` — the width the
+         * SCROLLBAR does not take — while `table_cell_rect` called `t_layout`
+         * with the full `w`.  Same model, same nominal width, DIFFERENT column
+         * geometry: the damage rect was computed for a layout the painter never
+         * used, so a right-aligned cell that SHRANK left a strip of its old
+         * glyph outside every rect anybody computed.  Both ends go through
+         * `t_columns` now — two copies of a layout cannot drift if there is
+         * only one of them (§4.79, for the third time in this file's history).
          *
-         * WHAT THE PARTIAL GLYPH SAYS, and it is the useful part: the damage
-         * rect's LEFT EDGE cuts through a character.  Not a missing rect — a
-         * MISPLACED one.  So the cell's damaged box and the cell's painted box
-         * disagree about where the column starts, which points at the geometry
-         * between `table_cell_rect` (damage) and `table_draw` (paint) rather
-         * than at the diff that decides WHICH cells to damage.  `iv_cols_moved`
-         * is supposed to catch exactly that and reported `colmove 0` on an idle
-         * desktop; it has not been measured across this driven shrink.
+         * FIVE WRONG THEORIES CAME FIRST, and that is the entry worth keeping:
+         * each was argued from ONE end — the diff, the column geometry, the
+         * page flip, the clip, the batching.  Two of them changed code and
+         * introduced new defects.
          *
-         * §4.79's shape — a painter and a hit test computing one rectangle
-         * differently — which this tree has paid for twice before.
+         * `gui.iv_probe` printing both ends together should have settled it at
+         * once, and did not for two more rounds, because it printed the
+         * function's PARAMETER `w` instead of the ARGUMENT handed to
+         * `t_layout`.  *An instrument that reports a neighbouring value is
+         * worse than none, because it is believed.*  What finished it was
+         * pairing the two lines with a refresh SEQUENCE NUMBER, after which the
+         * contradiction could not be explained away — the filter on one end had
+         * been letting unpaired samples be compared.
          *
-         * The path's other preconditions are sound now (§M76.5's clip
-         * discipline, §M77's stable columns, the whole-pane fallback), so what
-         * is left is small and located.  It stays off because row damage costs
-         * 9-11 ms a refresh on a window nobody keeps maximized, and *that is
-         * not a price worth a wrong pixel* — but the next attempt starts from a
-         * reproduction and a narrowed suspect rather than from a theory. */
-        /* §M79 — OFF, WITH A REPRODUCTION AND ONE SUSPECT ELIMINATED.
-         *
-         * REPRODUCTION (deterministic): `launch Task Manager` -> `loop 4` ->
-         * `loopstop` -> screendump.  The hogs drive a right-aligned CPU% cell
-         * to `25.0 %`, `loopstop` drops it to `0.0 %`, and the shorter text
-         * leaves a PARTIAL leading glyph — `?0.0 %`, `?5.0 %`.  Every time.
-         *
-         * A character cut in half means the damage rect's LEFT EDGE fell inside
-         * it: a MISPLACED rect, not a missing one.  The obvious suspect was the
-         * column geometry — §4.79's shape, a painter and a hit test computing
-         * one rectangle differently.
-         *
-         * **MEASURED, AND THE SUSPECT IS ELIMINATED.**  Across that exact
-         * driven case the counters read `colmove 1` when `loop 4` WIDENS the
-         * column and **`colmove 0` on the shrink** — the column does not move
-         * back, because §M77 rounds mono widths up to a 4-character boundary
-         * and `25.0 %` and `0.0 %` land in the same one.  So the geometry is
-         * stable exactly when the artifact appears, and `table_cell_rect`
-         * versus `table_draw` is NOT where this lives.
-         *
-         * What remains: the damage rect spans `xs[c]-1 .. xs[c]+ws[c]+1` while
-         * the paint is confined to `xs[c] .. xs[c]+cw`, so the damage is the
-         * WIDER of the two and ought to cover any old text.  That it does not
-         * is the next thing to measure — logging the rect actually passed to
-         * `gui_window_request_redraw_rect` beside the text's own extent, rather
-         * than reasoning about either.
-         *
-         * *Two theories have now been killed by measurement rather than by
-         * argument, and the fix has still not been guessed at.*  The path's
-         * other preconditions are sound (§M76.5's clip discipline, §M77's
-         * stable columns, the whole-pane fallback); row damage costs 9-11 ms a
-         * refresh on a window nobody keeps maximized, and that is not a price
-         * worth a wrong pixel. */
-        /* §M79.2 — OFF, AND NOW LOCALISED TO A NUMBER.
-         *
-         * REPRODUCTION: `launch Task Manager` -> `loop 4` -> `loopstop`.  A
-         * right-aligned CPU% cell shrinks and leaves a PARTIAL leading glyph.
-         *
-         * TWO SUSPECTS KILLED BY MEASUREMENT, not by argument.  First the
-         * column geometry moving (§4.79's shape): `colmove 0` across the
-         * shrink, because §M77 keeps `25.0 %` and `0.0 %` inside one 4-char
-         * step.  Then the diff missing the cell: it does not.
-         *
-         * WHAT `gui.iv_probe` FINALLY SHOWED, printing both ends at once:
-         *
-         *     dmg   col3 x=348 w=112
-         *     paint col3 xs=344 ws=88  tx=344 tw=66
-         *     paint col3 xs=349 ws=77  tx=349 tw=55
-         *
-         * The damage begins at 348 while the old text began at 344 — **the
-         * leftmost four pixels are never cleared**, which is the fragment.  And
-         * its width, 112, matches NEITHER paint state (they would be 79 and
-         * 90).  So `table_cell_rect` and `table_draw` are computing different
-         * column geometry for the same column, although both call `t_layout`
-         * with what look like the same arguments.
-         *
-         * *That is a located defect, not a theory* — and it is the third thing
-         * this artifact turned out to be, after two that measurement ruled out.
-         * The next step is to print `t_layout`'s inputs at both ends, since its
-         * outputs demonstrably differ.
-         *
-         * Off until then: row damage costs 9-11 ms a refresh on a window nobody
-         * keeps maximized, and that is not a price worth a wrong pixel. */
-        /* §M79.3 — OFF, AND THE DEFECT IS NOW UNDERSTOOD RATHER THAN LOCATED.
-         *
-         * REPRODUCTION: `launch Task Manager` -> `loop 4` -> `loopstop`.  A
-         * right-aligned CPU% cell shrinks and leaves a PARTIAL leading glyph.
-         *
-         * `gui.iv_probe` printing BOTH ENDS with `t_layout`'s inputs beside its
-         * outputs is what finished it:
-         *
-         *     rect  col3 W=656 n=6 xs=349 ws=110     (damage: 348..460)
-         *     paint col3 W=656 n=6 xs=349 ws=77      (paint:  349..426)
-         *     paint col3 W=656 n=6 xs=344 ws=88      (an EARLIER layout)
-         *
-         * W and n are identical, so `t_layout` is deterministic and the two
-         * ends are not disagreeing about anything at the same instant.  **The
-         * stale pixels belong to an EARLIER LAYOUT** — text painted when the
-         * column began at 344, damaged later from a layout where it begins at
-         * 349.  The 344..348 strip belongs to no rect anybody computes.
-         *
-         * SO PER-CELL DAMAGE IS ONLY SOUND IF EVERY LAYOUT CHANGE REPAINTS THE
-         * WHOLE PANE, and `iv_cols_moved` exists to do exactly that — it is
-         * therefore incomplete rather than wrong, and finding out how is the
-         * remaining work.  It probes row `iv->scroll` only, which is one
-         * hypothesis to test first.
-         *
-         * *Three theories killed by measurement and one confirmed, with the fix
-         * still not guessed at.*  The path's other preconditions are sound
-         * (§M76.5's clip discipline, §M77's stable widths, the whole-pane
-         * fallback).  Off until the fallback is proven complete: row damage
-         * costs 9-11 ms a refresh on a window nobody keeps maximized, and that
-         * is not a price worth a wrong pixel. */
-        (void)per_cell;
-        iv_stat_rows++;
-        iv_damage_item(iv, i);
+         * MEASURED: refresh 9-11 ms -> 6-8 ms, one CPU 3 % -> 2 %, `rows=0`
+         * (the per-cell path always succeeds), and the driven case that
+         * reproduced the artifact every single time is clean in three runs. */
+        if (per_cell) iv_stat_cells++; else { iv_stat_rows++; iv_damage_item(iv, i); }
     }
     gui_damage_end();
 }
