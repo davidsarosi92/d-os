@@ -12619,10 +12619,25 @@ of every other optimisation in this tree, where a number settles what an
 impression cannot.
 
 Off again — but this entry differs from the last one in the way that matters:
-**it names a reproducible symptom instead of a theory.**  The defect is specific
-to a RIGHT-ALIGNED cell whose text got SHORTER, on a path whose other
-preconditions are now all sound.  The next attempt starts from a case that can
-be reproduced in one refresh rather than from a hypothesis about geometry.
+**it names a reproducible symptom instead of a theory.**
+
+**§M79 turned that into a ONE-COMMAND REPRODUCTION:** `launch Task Manager` ->
+`loop 4` -> `loopstop` -> screendump.  The hogs drive a right-aligned CPU% cell
+to `25.0 %`, `loopstop` drops it to `0.0 %`, and the shorter text leaves a
+PARTIAL leading glyph behind — `?0.0 %`, `?5.0 %`.  Every time.
+
+**AND THE PARTIAL GLYPH NARROWS IT FURTHER, which is the useful part.**  A
+character cut in half means the damage rect's LEFT EDGE fell inside it: not a
+MISSING rect but a MISPLACED one.  So the cell's damaged box and its painted box
+disagree about where the column starts — which points at the geometry between
+`table_cell_rect` and `table_draw`, not at the diff that decides which cells to
+damage.  §4.79's shape, a painter and a hit test computing one rectangle
+differently, which this tree has paid for twice before.  `iv_cols_moved` is
+meant to catch exactly that and reported `colmove 0` on an idle desktop; it has
+not been measured across this driven shrink.
+
+*The item went from "a defect I cannot see" to a reproduction and a named
+suspect, without the fix being guessed at.*
 
 Row damage costs 9-11 ms per refresh on a window nobody keeps maximized.  *That
 is not a price worth a wrong pixel.*

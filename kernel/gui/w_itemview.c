@@ -300,6 +300,31 @@ void w_itemview_refresh(struct w_itemview* iv) {
          *
          * Row damage costs 9-11 ms a refresh on a window nobody keeps
          * maximized.  *That is not a price worth a wrong pixel.* */
+        /* §M79 — OFF, AND NOW WITH A ONE-COMMAND REPRODUCTION.
+         *
+         * `launch Task Manager` -> `loop 4` -> `loopstop` -> screenshot.  The
+         * hogs drive a right-aligned CPU% cell to `25.0 %` and `loopstop` drops
+         * it to `0.0 %`; the shorter text leaves a PARTIAL leading glyph behind
+         * (`?0.0 %`, `?5.0 %`).  It reproduces every time.
+         *
+         * WHAT THE PARTIAL GLYPH SAYS, and it is the useful part: the damage
+         * rect's LEFT EDGE cuts through a character.  Not a missing rect — a
+         * MISPLACED one.  So the cell's damaged box and the cell's painted box
+         * disagree about where the column starts, which points at the geometry
+         * between `table_cell_rect` (damage) and `table_draw` (paint) rather
+         * than at the diff that decides WHICH cells to damage.  `iv_cols_moved`
+         * is supposed to catch exactly that and reported `colmove 0` on an idle
+         * desktop; it has not been measured across this driven shrink.
+         *
+         * §4.79's shape — a painter and a hit test computing one rectangle
+         * differently — which this tree has paid for twice before.
+         *
+         * The path's other preconditions are sound now (§M76.5's clip
+         * discipline, §M77's stable columns, the whole-pane fallback), so what
+         * is left is small and located.  It stays off because row damage costs
+         * 9-11 ms a refresh on a window nobody keeps maximized, and *that is
+         * not a price worth a wrong pixel* — but the next attempt starts from a
+         * reproduction and a narrowed suspect rather than from a theory. */
         (void)per_cell;
         iv_stat_rows++;
         iv_damage_item(iv, i);
