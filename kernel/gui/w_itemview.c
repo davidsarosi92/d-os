@@ -325,6 +325,39 @@ void w_itemview_refresh(struct w_itemview* iv) {
          * 9-11 ms a refresh on a window nobody keeps maximized, and *that is
          * not a price worth a wrong pixel* — but the next attempt starts from a
          * reproduction and a narrowed suspect rather than from a theory. */
+        /* §M79 — OFF, WITH A REPRODUCTION AND ONE SUSPECT ELIMINATED.
+         *
+         * REPRODUCTION (deterministic): `launch Task Manager` -> `loop 4` ->
+         * `loopstop` -> screendump.  The hogs drive a right-aligned CPU% cell
+         * to `25.0 %`, `loopstop` drops it to `0.0 %`, and the shorter text
+         * leaves a PARTIAL leading glyph — `?0.0 %`, `?5.0 %`.  Every time.
+         *
+         * A character cut in half means the damage rect's LEFT EDGE fell inside
+         * it: a MISPLACED rect, not a missing one.  The obvious suspect was the
+         * column geometry — §4.79's shape, a painter and a hit test computing
+         * one rectangle differently.
+         *
+         * **MEASURED, AND THE SUSPECT IS ELIMINATED.**  Across that exact
+         * driven case the counters read `colmove 1` when `loop 4` WIDENS the
+         * column and **`colmove 0` on the shrink** — the column does not move
+         * back, because §M77 rounds mono widths up to a 4-character boundary
+         * and `25.0 %` and `0.0 %` land in the same one.  So the geometry is
+         * stable exactly when the artifact appears, and `table_cell_rect`
+         * versus `table_draw` is NOT where this lives.
+         *
+         * What remains: the damage rect spans `xs[c]-1 .. xs[c]+ws[c]+1` while
+         * the paint is confined to `xs[c] .. xs[c]+cw`, so the damage is the
+         * WIDER of the two and ought to cover any old text.  That it does not
+         * is the next thing to measure — logging the rect actually passed to
+         * `gui_window_request_redraw_rect` beside the text's own extent, rather
+         * than reasoning about either.
+         *
+         * *Two theories have now been killed by measurement rather than by
+         * argument, and the fix has still not been guessed at.*  The path's
+         * other preconditions are sound (§M76.5's clip discipline, §M77's
+         * stable columns, the whole-pane fallback); row damage costs 9-11 ms a
+         * refresh on a window nobody keeps maximized, and that is not a price
+         * worth a wrong pixel. */
         (void)per_cell;
         iv_stat_rows++;
         iv_damage_item(iv, i);

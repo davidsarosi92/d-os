@@ -12636,8 +12636,23 @@ differently, which this tree has paid for twice before.  `iv_cols_moved` is
 meant to catch exactly that and reported `colmove 0` on an idle desktop; it has
 not been measured across this driven shrink.
 
-*The item went from "a defect I cannot see" to a reproduction and a named
-suspect, without the fix being guessed at.*
+**AND THE MEASUREMENT KILLED THAT SUSPECT TOO.**  Across the exact driven case
+the counters read `colmove 1` when `loop 4` WIDENS the column and **`colmove 0`
+on the shrink** — the column does not move back, because §M77 rounds mono widths
+up to a 4-character boundary and `25.0 %` and `0.0 %` land in the same one.  So
+the geometry is stable precisely when the artifact appears, and
+`table_cell_rect` versus `table_draw` is NOT where this lives.
+
+What remains is a genuine puzzle rather than a hunch: the damage rect spans
+`xs[c]-1 .. xs[c]+ws[c]+1` while the paint is confined to `xs[c] .. xs[c]+cw`,
+so the damage is the WIDER of the two and ought to cover any old text.  That it
+does not is the next measurement — logging the rect actually passed to
+`gui_window_request_redraw_rect` beside the text's own extent, rather than
+reasoning about either.
+
+*The item went from "a defect I cannot see" to a deterministic reproduction and
+TWO theories killed by measurement rather than by argument — with the fix still
+not guessed at.  That is what the day's other five attempts did not do.*
 
 Row damage costs 9-11 ms per refresh on a window nobody keeps maximized.  *That
 is not a price worth a wrong pixel.*
