@@ -866,8 +866,8 @@ static void table_draw(struct gfx_surface* s, int x, int y, int w, int h,
                 int tw2 = t_text_w(buf, style);
                 if (c < 8 && tw2 != last_tw[c]) {
                     last_tw[c] = tw2;
-                    iv_probe("paint col%d xs=%d ws=%d cw=%d tx=%d tw=%d\n",
-                             c, xs[c], ws[c], cw, tx - x, tw2);
+                    iv_probe("paint col%d W=%d n=%d xs=%d ws=%d tx=%d tw=%d\n",
+                             c, w, n, xs[c], ws[c], tx - x, tw2);
                 }
             }
             struct clip_save cc = clip_push(s, x + xs[c], ry, cw, T_ROW_H);
@@ -928,6 +928,8 @@ static int table_cell_rect(int i, int col, int w, int h, const struct item_model
     int xs[8], ws[8];
     int n = t_layout(m, w, xs, ws);
     if (col < 0 || col >= n) return -1;
+    if (iv_probe_on())
+        iv_probe("rect  col%d W=%d n=%d xs=%d ws=%d\n", col, w, n, xs[col], ws[col]);
 
     int x0 = xs[col] - 1;
     int x1 = xs[col] + ws[col] + 1;

@@ -12659,12 +12659,27 @@ paint col3 xs=349 ws=77  tx=349 tw=55
 pixels are never cleared, which is exactly the fragment.  And its width, 112,
 matches NEITHER paint state (they would be 79 and 90).
 
-So `table_cell_rect` and `table_draw` compute **different column geometry for
-the same column**, although both call `t_layout` with what look like the same
-arguments.  That is a located defect rather than a theory — and the third thing
-this artifact turned out to be, after two that measurement ruled out.  The next
-step is to print `t_layout`'s INPUTS at both ends, since its outputs
-demonstrably differ.
+Printing `t_layout`'s INPUTS beside its outputs finished it:
+
+```
+rect  col3 W=656 n=6 xs=349 ws=110     (damage: 348..460)
+paint col3 W=656 n=6 xs=349 ws=77      (paint:  349..426)
+paint col3 W=656 n=6 xs=344 ws=88      (an EARLIER layout)
+```
+
+**W and n are identical**, so `t_layout` is deterministic and the two ends are
+not disagreeing about anything at the same instant.  **The stale pixels belong
+to an EARLIER LAYOUT** — text painted when the column began at 344, damaged
+later from a layout where it begins at 349.  The 344..348 strip belongs to no
+rect anybody computes.
+
+**So per-cell damage is sound only if EVERY layout change repaints the whole
+pane**, and `iv_cols_moved` exists to do exactly that — it is therefore
+INCOMPLETE rather than wrong.  Finding out how is the remaining work; that it
+probes row `iv->scroll` only is the first hypothesis to test.
+
+*Three theories killed by measurement and one confirmed, with the fix still not
+guessed at.*
 
 The probe is kept and gated (`gui.iv_probe`, default off), because it is what
 produced a number after five rounds of argument did not.

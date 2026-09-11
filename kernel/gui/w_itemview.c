@@ -411,6 +411,36 @@ void w_itemview_refresh(struct w_itemview* iv) {
          *
          * Off until then: row damage costs 9-11 ms a refresh on a window nobody
          * keeps maximized, and that is not a price worth a wrong pixel. */
+        /* §M79.3 — OFF, AND THE DEFECT IS NOW UNDERSTOOD RATHER THAN LOCATED.
+         *
+         * REPRODUCTION: `launch Task Manager` -> `loop 4` -> `loopstop`.  A
+         * right-aligned CPU% cell shrinks and leaves a PARTIAL leading glyph.
+         *
+         * `gui.iv_probe` printing BOTH ENDS with `t_layout`'s inputs beside its
+         * outputs is what finished it:
+         *
+         *     rect  col3 W=656 n=6 xs=349 ws=110     (damage: 348..460)
+         *     paint col3 W=656 n=6 xs=349 ws=77      (paint:  349..426)
+         *     paint col3 W=656 n=6 xs=344 ws=88      (an EARLIER layout)
+         *
+         * W and n are identical, so `t_layout` is deterministic and the two
+         * ends are not disagreeing about anything at the same instant.  **The
+         * stale pixels belong to an EARLIER LAYOUT** — text painted when the
+         * column began at 344, damaged later from a layout where it begins at
+         * 349.  The 344..348 strip belongs to no rect anybody computes.
+         *
+         * SO PER-CELL DAMAGE IS ONLY SOUND IF EVERY LAYOUT CHANGE REPAINTS THE
+         * WHOLE PANE, and `iv_cols_moved` exists to do exactly that — it is
+         * therefore incomplete rather than wrong, and finding out how is the
+         * remaining work.  It probes row `iv->scroll` only, which is one
+         * hypothesis to test first.
+         *
+         * *Three theories killed by measurement and one confirmed, with the fix
+         * still not guessed at.*  The path's other preconditions are sound
+         * (§M76.5's clip discipline, §M77's stable widths, the whole-pane
+         * fallback).  Off until the fallback is proven complete: row damage
+         * costs 9-11 ms a refresh on a window nobody keeps maximized, and that
+         * is not a price worth a wrong pixel. */
         (void)per_cell;
         iv_stat_rows++;
         iv_damage_item(iv, i);
