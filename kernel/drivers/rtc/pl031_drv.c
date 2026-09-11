@@ -85,7 +85,25 @@ static inline uint32_t pl_rd(uint32_t off) {
 static int pl031_bringup(void) {
     drv_rt_init(&rt, "pl031");
 
-    h_mmio = drv_mmio_request(&rt, PL031_PHYS, PL031_LEN, "PL031 registers");
+    /* ASK FOR THE WINDOW BEFORE MAPPING IT, and the asymmetry between the two
+     * backends is the point rather than a wrinkle.
+     *
+     * A PLACED driver cannot know where its device is: it has no bus access
+     * and must not have any, so the kernel TELLS it — from the manifest, which
+     * for a platform device declares the address outright (§M78).  An
+     * in-kernel driver may use the board constant, because it is the kernel.
+     *
+     * So the window is asked for first and the constant is the FALLBACK, not
+     * the other way round.  Written this way so the placed path is the one
+     * exercised by default: a driver that used its constant first would work
+     * in ring 3 by accident and stop the moment the manifest disagreed with
+     * it — which is exactly the disagreement the manifest exists to catch. */
+    uint64_t win = PL031_PHYS, wlen = PL031_LEN;
+    if (drv_device_window(&rt, 0, &win, &wlen) != 0 || !win) {
+        win = PL031_PHYS; wlen = PL031_LEN;
+    }
+    h_mmio = drv_mmio_request(&rt, win, wlen < PL031_LEN ? PL031_LEN : wlen,
+                              "PL031 registers");
     if (h_mmio < 0) {
         kprintf("pl031: no MMIO window — refused\n");
         return -1;

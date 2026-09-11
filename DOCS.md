@@ -12699,6 +12699,93 @@ anywhere still displaces what follows it.  Removing it entirely would mean not
 showing short-lived tasks — hiding rather than ordering, and *the one moment a
 task manager must not lie is when something is spawning in a loop.*
 
+### 4.90 §M78 — a real ARM device in ring 3, and the gate whose premises had expired
+
+**Shipped 2026-09-11.  The first driver placed in ring 3 on aarch64.**
+
+§M76 left an item stated honestly: the portable `SYS_DRV_*` doorways are open on
+ARM, and *reachable is not proven*.  Testing it produced something better than a
+pass — §M33's only client, QEMU's `edu`, is PRESENT on `-M virt` and cannot
+initialise there: it addresses DMA with 28 bits and this machine's RAM starts at
+1 GiB, so no allocation policy can satisfy it.  **A fact about the DEVICE, not
+about the placement machinery.**
+
+#### The client: PL031, MMIO-only on purpose
+
+No DMA, no interrupt, no ports — the three things that are either impossible
+here or constrained by the memory map.  What is left is exactly the open item's
+question.  It is a REAL device (the taskbar clock reads it) and the SMALLEST
+real one, which makes it the right first.
+
+It identifies the device by peripheral ID before believing the address: **a
+placed driver is HANDED a window and cannot check the platform for itself**, so
+a wrong window would make every later read a plausible number from somewhere
+else.  And it asks for its window before mapping it, with the board constant as
+the FALLBACK — written that way so the placed path is the one exercised by
+default, since a driver that used its constant first would work in ring 3 by
+accident and stop the moment the manifest disagreed with it.
+
+#### Four things had to be fixed, each general in its description and x86 in its code
+
+1. **`user/drvrt_user.c` was `in`/`out` ASSEMBLY**, so the ring-3 shim — and
+   therefore every placed driver — could not compile on ARM at all.  §M76 opened
+   the syscall doorways and the userspace side still would not build.  Ports are
+   a declared capability now, and `port_at` returns DRV_ENOSYS where there is no
+   I/O space, matching the kernel's own refusal.  *The flag is defined at the
+   TOP of the file: the first version defined it below its first use, which
+   compiles to "no ports" on x86 — exactly the silent wrong answer it exists to
+   prevent.*
+
+2. **The MANIFEST resolved every window from a PCI BAR**, true while both
+   placeable drivers were PCI.  A platform device's window must be DECLARED, and
+   declaring it in the manifest rather than letting the driver name it is that
+   mechanism's whole point: *the bound must come from somewhere the driver
+   cannot set.*
+
+3. `drvuser`'s image table gained a third entry.
+
+4. **THE GATE, AND IT IS THE ENTRY THAT MATTERS.**  `domain_enforceable` refused
+   DOMAIN_USER on `#if defined(__i386__) || defined(__x86_64__)`, and **both of
+   its stated premises had expired**:
+
+   - *"aarch64 has no port space"* — still true, and irrelevant to a driver that
+     asks for no ports.  The gate conflated *this machine cannot grant ports*
+     with *this machine cannot place a driver*.
+   - *"mapping MMIO into a driver's own space is unwritten"* — it was written by
+     §M33 Tier 1, in `drvuser_sys_mmio`, and it is PORTABLE: `vmm_space_map`
+     with VMM_USER, which every architecture here implements.  **The note
+     outlived the code it described.**
+
+   §M52's shape, in the function §M33 appointed as the single place that knows
+   what is real.  *A gate is only as honest as its premises, and premises
+   expire.*  The arch check is now a PORT check asked PER DRIVER, through
+   `drvuser_needs_ports` — so the manifest answers, and the question cannot
+   drift from the grant.
+
+#### Measured
+
+```
+'pl031' running in DOMAIN_USER, pid 33
+drv-user: 'pl031' window 9010000 +1000 (declared, not a bus)
+drv-user: 'pl031' mapped its 1000-byte register window at 10000000 in ring 3
+drv-user: pl031: up, clock enabled
+drv-user: pl031: tick 1789085311 (reading DR from ring 3)
+drv-user: pl031: tick 1789085340 (reading DR from ring 3)
+[rtc] pl031 — OK  [ring 3, pid 33, 0 restart(s), 0 event(s)]
+  pl031: mmio 0x0000000009010000 +4096  (ring-3 register window)
+```
+
+**The two ticks are the proof, not the bring-up.**  Twenty-nine seconds of real
+clock advancing, read from a register mapped into the driver's own address
+space — CPU address `0x10000000`, physical `0x9010000`, which is what shows the
+mapping is the driver's and not the kernel's.  0 restarts, 0 faults.  x86
+placement re-checked unchanged.
+
+**OPEN:** the isolation VERDICT for a port-less, DMA-less driver is worth its own
+look — such a driver reaches no memory it was not given and commands no device
+that can, which may be the first `isolation full` on this architecture available
+without an IOMMU at all.
+
 ## 8. Change log
 
 - **2026-09-08 — §M71: RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND

@@ -554,7 +554,7 @@ uint32_t driver_domain(const struct driver* d) {
      * come up because of a stale setting" is a bad way to find that out. */
     uint32_t declared = d->domains ? d->domains : DOMAIN_KERNEL;
     if (!(declared & want)) return DOMAIN_KERNEL;
-    if (domain_enforceable(want, NULL) != 0) return DOMAIN_KERNEL;
+    if (domain_enforceable(want, d->name, NULL) != 0) return DOMAIN_KERNEL;
     return want;
 }
 
@@ -588,7 +588,7 @@ int driver_set_domain(const char* name, const char* domain_str) {
     }
 
     const char* why = NULL;
-    if (domain_enforceable(want, &why) != 0) {
+    if (domain_enforceable(want, name, &why) != 0) {
         kprintf("drv: cannot place '%s' in domain '%s' — %s\n",
                 name, domain_name(want), why ? why : "not available");
         kprintf("     REFUSED rather than accepted and quietly run in the "

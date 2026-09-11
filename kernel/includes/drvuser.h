@@ -20,6 +20,15 @@ struct drv_manifest;
 int  drvuser_placeable(const char* name);
 const struct drv_manifest* drvuser_manifest(const char* name);
 
+/* §M78.1 — DOES THIS DRIVER NEED PORT I/O?  Asked by name so the manifest stays
+ * private; answered from the manifest so the question cannot drift from the
+ * grant.  1 = yes, 0 = no, -1 = no manifest (not placeable at all).
+ *
+ * `domain_enforceable` asks it, because "can this MACHINE grant ports" and
+ * "does this DRIVER want any" are different questions and the gate used to
+ * answer the first when it meant the second. */
+int drvuser_needs_ports(const char* name);
+
 struct driver;
 
 /* Spawn this driver's ring-3 image and attach it to its manifest.  Called from

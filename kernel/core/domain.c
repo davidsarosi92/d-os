@@ -59,7 +59,8 @@ void domain_set_str(uint32_t domains, char* out, int cap) {
  * after the thing became possible, which is a feature that exists and cannot be
  * reached.
  * -------------------------------------------------------------------------- */
-int domain_enforceable(uint32_t domain, const char** why) {
+int domain_enforceable(uint32_t domain, const char* driver, const char** why) {
+    (void)driver;
     switch (domain) {
     case DOMAIN_KERNEL:
         /* Always available: it is where everything runs today, and it is the
@@ -86,8 +87,39 @@ int domain_enforceable(uint32_t domain, const char** why) {
          * is exactly the isolation theatre §M33 refuses by name.  Accepting
          * `user` and running the driver in ring 0 anyway would leave the user
          * believing in a boundary that is not there. */
-#if defined(__i386__) || defined(__x86_64__)
-        /* REAL NOW, on the arches that have an I/O permission mechanism.
+        /* §M78.1 — THE QUESTION IS WHAT THIS DRIVER NEEDS, NOT WHAT THE
+         * MACHINE CAN GRANT IN GENERAL.
+         *
+         * This used to be `#if defined(__i386__) || defined(__x86_64__)`, on
+         * the reasoning below — and BOTH of its premises have since stopped
+         * being true for some drivers:
+         *
+         *   "aarch64 has no port space" — still true, and irrelevant to a
+         *   driver that asks for no ports.  The gate conflated *this machine
+         *   cannot grant ports* with *this machine cannot place a driver*.
+         *
+         *   "mapping MMIO into a driver's own space is unwritten" — it was
+         *   written by §M33 Tier 1, in `drvuser_sys_mmio`, and it is PORTABLE:
+         *   `vmm_space_map` with VMM_USER, which every architecture here
+         *   implements.  The note outlived the code it described.
+         *
+         * §M52's shape, in the function this milestone appointed as the single
+         * place that knows what is real.  *A gate is only as honest as its
+         * premises, and premises expire.*
+         *
+         * So the arch check is now a PORT check, asked per driver.  §M78's
+         * PL031 is the case that exposed it: MMIO only, no DMA, no interrupt,
+         * no ports — nothing aarch64 cannot grant. */
+#if !defined(__i386__) && !defined(__x86_64__)
+        if (drvuser_needs_ports(driver) == 1) {
+            if (why) *why = "this driver needs port I/O and this architecture "
+                            "has no I/O address space — no instruction, no "
+                            "bitmap, nothing to grant";
+            return -1;
+        }
+#endif
+        /* REAL NOW.  On x86 for any driver; elsewhere for one that needs no
+         * ports.
          *
          * What makes it real rather than a claim: the driver's ports come from
          * a kernel-side manifest and are enforced by the CPU (an ungranted `in`
@@ -96,16 +128,6 @@ int domain_enforceable(uint32_t domain, const char** why) {
          * ring-3 image INSTEAD OF calling init — so nothing brings the device
          * up in the kernel as well. */
         return 0;
-#else
-        /* Still refused where there is nothing to enforce a hardware grant
-         * with.  "Placed in ring 3" with unconstrained device access is a
-         * location, not a boundary — and aarch64 has no port space, while
-         * mapping MMIO into a driver's own address space is unwritten. */
-        if (why) *why = "this arch has no mechanism to enforce a hardware grant "
-                        "(no port space; MMIO mapping into a driver's own space "
-                        "is unwritten)";
-        return -1;
-#endif
 
     case DOMAIN_ISOLATED:
         /* Strictly more than USER, so it fails for USER's reason first and for

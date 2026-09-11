@@ -70,7 +70,12 @@ void        domain_set_str(uint32_t domains, char* out, int cap);
 /* Can this machine actually enforce `domain` today?  Returns 0 if yes; a
  * negative code otherwise, and `*why` (if non-NULL) is set to a sentence
  * naming what is missing.  THE ONE PLACE that knows what is real. */
-int domain_enforceable(uint32_t domain, const char** why);
+/* `driver` may be NULL for a general query.  It exists because the answer is
+ * not a property of the machine alone: a driver that needs PORTS cannot be
+ * placed on an architecture that has no I/O space, and one that needs only MMIO
+ * can — and the gate used to answer the first question when it meant the
+ * second.  See §M78.1 in domain.c. */
+int domain_enforceable(uint32_t domain, const char* driver, const char** why);
 
 /* What isolation would a component placed in `domain` actually get, given
  * whether it drives DMA?  Separate from the above because "allowed" and

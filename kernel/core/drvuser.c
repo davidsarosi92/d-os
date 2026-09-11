@@ -146,6 +146,12 @@ static const struct drv_manifest g_manifest[] = {
 };
 #define MANIFEST_N ((int)(sizeof g_manifest / sizeof g_manifest[0]))
 
+int drvuser_needs_ports(const char* name) {
+    const struct drv_manifest* mf = drvuser_manifest(name);
+    if (!mf) return -1;
+    return mf->port_count ? 1 : 0;
+}
+
 const struct drv_manifest* drvuser_manifest(const char* name) {
     for (int i = 0; i < MANIFEST_N; i++) {
         const char* a = g_manifest[i].name; const char* b = name;

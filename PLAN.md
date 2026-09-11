@@ -7090,6 +7090,24 @@ of a big window over the icon field still composites at §4.61's measured cost.
 
 ## Change log
 
+- **2026-09-11 (fifth)** — **§M78: a real ARM device running in ring 3, and a
+  gate whose premises had expired** (DOCS §4.90).  §M76's open item — *reachable
+  is not proven* — resolved by porting the PL031 RTC to drvrt: MMIO only, no
+  DMA, no ports, which is exactly what aarch64 can grant.  Four things had to be
+  fixed first, each general in its description and x86 in its code: the ring-3
+  shim was `in`/`out` assembly so NO placed driver could compile on ARM; the
+  manifest resolved every window from a PCI BAR; the image table; **and the
+  honesty gate itself, which is the entry that matters.**  `domain_enforceable`
+  refused DOMAIN_USER on `#if x86`, and BOTH its premises had expired — "no port
+  space" is irrelevant to a driver asking for none, and "MMIO into a driver's
+  own space is unwritten" was written by §M33 Tier 1 in portable code.  *A gate
+  is only as honest as its premises, and premises expire* — §M52's shape in the
+  function §M33 appointed as the single place that knows what is real.  It asks
+  the manifest per driver now.  Measured: `pl031` in DOMAIN_USER pid 33, its
+  declared window mapped at 0x10000000 in its own space, and TWO TICKS 29
+  seconds apart read from the register — *the ticks are the proof, not the
+  bring-up.*  0 restarts, 0 faults, x86 placement unchanged.
+
 - **2026-09-11 (fourth)** — **the selection no longer shows two highlighted rows,
   and the ARM placement item turned into a fact about the device.**  Reported:
   *"the selection lags — two rows were highlighted at once for a moment."*  A
