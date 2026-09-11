@@ -12781,10 +12781,28 @@ space — CPU address `0x10000000`, physical `0x9010000`, which is what shows th
 mapping is the driver's and not the kernel's.  0 restarts, 0 faults.  x86
 placement re-checked unchanged.
 
-**OPEN:** the isolation VERDICT for a port-less, DMA-less driver is worth its own
-look — such a driver reaches no memory it was not given and commands no device
-that can, which may be the first `isolation full` on this architecture available
-without an IOMMU at all.
+#### And the verdict moves — to `full`, on a machine with no IOMMU
+
+```
+rtc  platform  pl031  OK  ring 3 pid 33  full  mmio
+```
+
+**The first `isolation full` on aarch64, and it needed no IOMMU** — because the
+driver commands no device that can DMA, so there is nothing for one to
+constrain.  It is isolated in both directions that matter: it cannot reach
+kernel memory (its address space is its own) and neither can its hardware
+(there is no hardware path at all).
+
+**NOTHING HAD TO CHANGE FOR THIS.**  `domain_isolation_of` already answered
+`ISOL_FULL` for a non-DMA driver and `ISOL_ADVISORY` for a DMA one, and
+deliberately does not consult `iommu_get` — *reporting better isolation because
+the CHIPSET is capable would be the most convincing kind of isolation theatre,
+since the capability is real and checkable.*  The verdict was correct from the
+day it was written; what was missing was a driver that could reach it.
+
+*That is the useful shape of this whole milestone: the honest answer was already
+in the code, and three x86-only mechanisms and one expired premise stood between
+it and a machine that could demonstrate it.*
 
 ## 8. Change log
 
