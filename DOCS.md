@@ -12643,12 +12643,31 @@ up to a 4-character boundary and `25.0 %` and `0.0 %` land in the same one.  So
 the geometry is stable precisely when the artifact appears, and
 `table_cell_rect` versus `table_draw` is NOT where this lives.
 
-What remains is a genuine puzzle rather than a hunch: the damage rect spans
-`xs[c]-1 .. xs[c]+ws[c]+1` while the paint is confined to `xs[c] .. xs[c]+cw`,
-so the damage is the WIDER of the two and ought to cover any old text.  That it
-does not is the next measurement — logging the rect actually passed to
-`gui_window_request_redraw_rect` beside the text's own extent, rather than
-reasoning about either.
+#### §M79.2 — and the two ends printed side by side located it
+
+`gui.iv_probe` prints the DAMAGE rect and the PAINT extent for the same cell.
+Four attempts at this artifact had been made by reasoning about one end at a
+time; the two numbers together settled it in one run:
+
+```
+dmg   col3 x=348 w=112
+paint col3 xs=344 ws=88  tx=344 tw=66
+paint col3 xs=349 ws=77  tx=349 tw=55
+```
+
+**The damage begins at 348 while the old text began at 344** — the leftmost four
+pixels are never cleared, which is exactly the fragment.  And its width, 112,
+matches NEITHER paint state (they would be 79 and 90).
+
+So `table_cell_rect` and `table_draw` compute **different column geometry for
+the same column**, although both call `t_layout` with what look like the same
+arguments.  That is a located defect rather than a theory — and the third thing
+this artifact turned out to be, after two that measurement ruled out.  The next
+step is to print `t_layout`'s INPUTS at both ends, since its outputs
+demonstrably differ.
+
+The probe is kept and gated (`gui.iv_probe`, default off), because it is what
+produced a number after five rounds of argument did not.
 
 *The item went from "a defect I cannot see" to a deterministic reproduction and
 TWO theories killed by measurement rather than by argument — with the fix still

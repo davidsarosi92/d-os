@@ -632,6 +632,13 @@ static void clip_pop(struct gfx_surface* s, struct clip_save c) {
     gfx_set_clip(s, c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0);
 }
 
+/* §M79.2 — a temporary two-ended probe.  The damage side and the paint side
+ * each print their own numbers, because the whole question is whether they
+ * agree — and four attempts at this artifact were made by reasoning about one
+ * of them at a time. */
+int  iv_probe_on(void);
+void iv_probe(const char* fmt, ...);
+
 static int t_layout(const struct item_model* m, int w, int* xs, int* ws) {
     int n = t_cols(m);
     int avail = w - 2 * T_PAD;
@@ -851,6 +858,18 @@ static void table_draw(struct gfx_surface* s, int x, int y, int w, int h,
             /* Clip each cell to its own column: a long name must not run into
              * the size column, which is the failure a padded string cannot
              * even detect. */
+            /* §M79.2 — TEMPORARY PROBE: the paint's own numbers, printed only
+             * when a right-aligned cell's width CHANGES, which is the one
+             * moment the artifact appears. */
+            if ((style & ICOL_RIGHT) && iv_probe_on()) {
+                static int last_tw[8];
+                int tw2 = t_text_w(buf, style);
+                if (c < 8 && tw2 != last_tw[c]) {
+                    last_tw[c] = tw2;
+                    iv_probe("paint col%d xs=%d ws=%d cw=%d tx=%d tw=%d\n",
+                             c, xs[c], ws[c], cw, tx - x, tw2);
+                }
+            }
             struct clip_save cc = clip_push(s, x + xs[c], ry, cw, T_ROW_H);
             t_draw_cell(s, tx, ry + (T_ROW_H - cp_fh()) / 2, buf, col, style, cw);
             clip_pop(s, cc);

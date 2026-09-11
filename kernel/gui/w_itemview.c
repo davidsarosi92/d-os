@@ -13,10 +13,12 @@
  * ============================================================================= */
 
 #include "widget.h"
+#include <stdarg.h>
 #include "console_plate.h"
 #include "scrollbar.h"
 #include "ui.h"
 #include "config.h"
+#include "settings.h"   /* CONFIG_KEY */
 #include "printf.h"
 #include "itemview.h"
 #include "gfx.h"
@@ -45,6 +47,24 @@
  * The clipping is `iv_damage_item`'s, deliberately: a cell in a partly-visible
  * row needs exactly the same top/bottom trimming, and two copies of that
  * arithmetic would drift the first time somebody changed the header height. */
+/* §M79.2 — the probe that located the defect, kept and gated.  It prints the
+ * DAMAGE rect and the PAINT extent for the same cell, which is the whole point:
+ * four attempts at this artifact were made by reasoning about one end at a
+ * time, and the two numbers side by side settled it in one run. */
+CONFIG_KEY(ck_iv_probe) = {
+    .key = "gui.iv_probe", .group = "System", .type = CFG_BOOL, .def = "0",
+    .help = "log item-view damage rects against paint extents (diagnostic)",
+};
+
+int iv_probe_on(void) { return (int)config_get_long("gui.iv_probe", 0); }
+void iv_probe(const char* fmt, ...) {
+    /* kprintf takes the varargs directly; this exists so itemview.c can reach
+     * the same gate without including config.h. */
+    va_list ap; va_start(ap, fmt);
+    kvprintf(fmt, ap);
+    va_end(ap);
+}
+
 static int iv_damage_cell(struct w_itemview* iv, int i, int col) {
     struct widget* w = &iv->base;
     int x, y, ww, hh;
@@ -55,6 +75,9 @@ static int iv_damage_cell(struct w_itemview* iv, int i, int col) {
     if (y < 0) { hh += y; y = 0; }
     if (y + hh > w->h) hh = w->h - y;
     if (hh <= 0) return 1;
+    if (iv_probe_on())
+        iv_probe("dmg   col%d x=%d w=%d (win %d..%d)\n",
+                 col, x, ww, w->x + x, w->x + x + ww);
     gui_window_request_redraw_rect(w->win, w->x + x, w->y + y, ww, hh);
     return 1;
 }
@@ -358,6 +381,36 @@ void w_itemview_refresh(struct w_itemview* iv) {
          * stable columns, the whole-pane fallback); row damage costs 9-11 ms a
          * refresh on a window nobody keeps maximized, and that is not a price
          * worth a wrong pixel. */
+        /* §M79.2 — OFF, AND NOW LOCALISED TO A NUMBER.
+         *
+         * REPRODUCTION: `launch Task Manager` -> `loop 4` -> `loopstop`.  A
+         * right-aligned CPU% cell shrinks and leaves a PARTIAL leading glyph.
+         *
+         * TWO SUSPECTS KILLED BY MEASUREMENT, not by argument.  First the
+         * column geometry moving (§4.79's shape): `colmove 0` across the
+         * shrink, because §M77 keeps `25.0 %` and `0.0 %` inside one 4-char
+         * step.  Then the diff missing the cell: it does not.
+         *
+         * WHAT `gui.iv_probe` FINALLY SHOWED, printing both ends at once:
+         *
+         *     dmg   col3 x=348 w=112
+         *     paint col3 xs=344 ws=88  tx=344 tw=66
+         *     paint col3 xs=349 ws=77  tx=349 tw=55
+         *
+         * The damage begins at 348 while the old text began at 344 — **the
+         * leftmost four pixels are never cleared**, which is the fragment.  And
+         * its width, 112, matches NEITHER paint state (they would be 79 and
+         * 90).  So `table_cell_rect` and `table_draw` are computing different
+         * column geometry for the same column, although both call `t_layout`
+         * with what look like the same arguments.
+         *
+         * *That is a located defect, not a theory* — and it is the third thing
+         * this artifact turned out to be, after two that measurement ruled out.
+         * The next step is to print `t_layout`'s inputs at both ends, since its
+         * outputs demonstrably differ.
+         *
+         * Off until then: row damage costs 9-11 ms a refresh on a window nobody
+         * keeps maximized, and that is not a price worth a wrong pixel. */
         (void)per_cell;
         iv_stat_rows++;
         iv_damage_item(iv, i);
