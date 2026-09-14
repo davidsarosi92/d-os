@@ -889,6 +889,11 @@ static struct task* spawn_common(const char* name, void (*entry)(void),
     return t;
 }
 
+struct task* task_spawn_arg_console(const char* name, void (*entry)(void),
+                                    void* arg, int ppid, void* console) {
+    return spawn_common(name, entry, ppid, arg, console);
+}
+
 struct task* task_spawn(const char* name, void (*entry)(void)) {
     return spawn_common(name, entry, -1, NULL, NULL);  /* parent = caller */
 }

@@ -312,7 +312,23 @@ struct file* vfs_open(const char* path, int flags) {
          * passes no mode bits at all is reading — several in this tree do, and
          * silently granting them nothing would refuse every one of them. */
         if (want == 0) want = VFS_PERM_READ;
-        if (!vfs_permitted(d->inode, want)) return NULL;
+        if (!vfs_permitted(d->inode, want)) {
+            /* A REFUSAL MUST NAME ITS REASON.  vfs_open can only return NULL,
+             * so the caller prints "open failed" — which reads as a broken file
+             * and sends the user looking for the wrong problem.  The reason
+             * goes to klog rather than the console because an open is also how
+             * code TESTS for existence, and a probe that printed a denial on
+             * screen would be noise on a healthy machine. `dmesg` has it. */
+            klog(KLOG_INFO, "vfs",
+                 "%s: permission denied for uid %d (wanted %s%s, mode %d%d%d%d, owner uid %d)\n",
+                 path, cred_uid(cred_current()),
+                 (want & VFS_PERM_READ) ? "r" : "",
+                 (want & VFS_PERM_WRITE) ? "w" : "",
+                 (int)((d->inode->mode >> 9) & 7), (int)((d->inode->mode >> 6) & 7),
+                 (int)((d->inode->mode >> 3) & 7), (int)(d->inode->mode & 7),
+                 d->inode->owner_uid);
+            return NULL;
+        }
     }
 
     /* VFS_TRUNC: logically empty the file by zeroing its size.  The
@@ -410,6 +426,29 @@ static int vfs_mutator(const char* path, int is_dir) {
     struct inode* ino = NULL;
     int r = op(parent->inode, last, &ino);
     if (r != 0 || !ino) return r ? r : -3;
+
+    /* §M32 — A NEW FILE BELONGS TO WHOEVER MADE IT.
+     *
+     * `vfs_inode_defaults` stamps root:root, which is the right answer for an
+     * inode a FILESYSTEM synthesises (a devfs node, procfs's synthetic files,
+     * an exFAT entry read off a volume that stores no owner) and the wrong one
+     * for an inode a USER just created.
+     *
+     * Found by driving it rather than by reading it: logged in as alice, a
+     * `write /home/alice/mine` created the file — so the parent-directory check
+     * had passed — and was then refused the WRITE to the thing it had just
+     * made, because the new inode was root's.  *A user who cannot write inside
+     * their own home is not a permission model, it is a broken one*, and no
+     * amount of staring at the defaults would have shown it: every path in the
+     * test suite ran as SYSTEM, which bypasses the check entirely. */
+    {
+        const struct cred* c = cred_current();
+        if (c->owner == TASK_OWNER_USER) {
+            ino->owner_uid = cred_uid(c);
+            ino->owner_gid = cred_gid(c);
+        }
+    }
+
     if (!vfs_attach_child(parent, last, ino)) return -4;
     return 0;
 }

@@ -497,6 +497,16 @@ struct task* task_spawn_under(const char* name, void (*entry)(void), int ppid);
 struct task* task_spawn_console(const char* name, void (*entry)(void),
                                 int ppid, void* console);
 
+/* §M32 — BOTH an argument and a console, bound at the spawn.
+ *
+ * `spawn_common` has always taken both; no wrapper exposed the combination,
+ * so a caller that needed both had to set one of them afterwards — which is
+ * the very race the comment above describes, just reached from the other side.
+ * A session leader needs both (its identity and the pane it talks to), so the
+ * combination is now a wrapper rather than a call site's problem. */
+struct task* task_spawn_arg_console(const char* name, void (*entry)(void),
+                                    void* arg, int ppid, void* console);
+
 /* Cooperative yield.  No-op if we're the only runnable task.  Returns
  * when this task is scheduled again. */
 void task_yield(void);

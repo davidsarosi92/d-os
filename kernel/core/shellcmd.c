@@ -174,3 +174,67 @@ SHELL_CMD(help) = {
     "help", "[command]", "list commands, or explain one",
     SHELL_G_SYS, cmd_help_entry
 };
+
+/* ---------------------------------------------------------------------------
+ * §M32 stage 4 — interactive input.  See shellcmd.h for why this is here and
+ * not in any one of the three shells.
+ * ------------------------------------------------------------------------- */
+
+#include "task.h"
+#include "vc.h"
+
+static int (*g_getch)(void);
+
+/* The default: whatever VC this task is bound to.  Both x86 shells bind one at
+ * spawn (§M49 moved that INTO the spawn precisely so it could not race), so a
+ * command running on either of them reads the pane the user is typing into
+ * rather than whichever pane happens to hold focus. */
+static int vc_source(void) {
+    struct task* t = task_current();
+    struct vc* v = t ? (struct vc*)t->out_console : NULL;
+    if (!v) return -1;
+    return (int)(unsigned char)vc_getchar(v);
+}
+
+void shell_set_input_source(int (*getch)(void)) { g_getch = getch; }
+
+static int read_into(const char* prompt, char* buf, int cap, int echo) {
+    int (*get)(void) = g_getch ? g_getch : vc_source;
+    int len = 0;
+    if (prompt) kprintf("%s", prompt);
+    for (;;) {
+        int ci = get();
+        if (ci < 0) {           /* no input source — refuse rather than spin */
+            buf[0] = 0;
+            return -1;
+        }
+        char c = (char)ci;
+        if (c == '\n' || c == '\r') {
+            console_write("\n");
+            buf[len] = 0;
+            return len;
+        }
+        if (c == '\b' || c == 127) {
+            if (len > 0) {
+                len--;
+                /* Erase on screen only when we were echoing.  A secret prints
+                 * nothing at all, so there is nothing to erase — and emitting
+                 * a backspace would betray that a character had been typed. */
+                if (echo) console_write("\b \b");
+            }
+            continue;
+        }
+        if (len < cap - 1) {
+            buf[len++] = c;
+            if (echo) { char s[2] = { c, 0 }; console_write(s); }
+        }
+    }
+}
+
+int shell_read_line(const char* prompt, char* buf, int cap) {
+    return read_into(prompt, buf, cap, 1);
+}
+
+int shell_read_secret(const char* prompt, char* buf, int cap) {
+    return read_into(prompt, buf, cap, 0);
+}

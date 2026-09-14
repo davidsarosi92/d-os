@@ -173,6 +173,11 @@ int  users_attach_persistent(const char* dir);
  * in RAM only — the caller is expected to SAY which, never to assume. */
 int  users_save(void);
 
+/* Create every account's home directory (0700, owned by the account).
+ * Called after the store is attached AND after ramfs is rebuilt at each boot:
+ * the database survives a reboot and `/` does not. */
+void users_ensure_homes(void);
+
 /* True while no account can log in.  See the bootstrap note in the header. */
 int  users_needs_setup(void);
 

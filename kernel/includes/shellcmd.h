@@ -119,6 +119,37 @@ const struct shell_cmd* shell_cmd_at(int i);
 /* Exact lookup by verb.  NULL when nothing claims it. */
 const struct shell_cmd* shell_cmd_find(const char* verb);
 
+/* ---------------------------------------------------------------------------
+ * §M32 stage 4 — INTERACTIVE INPUT FOR A COMMAND, AND WHY IT IS A REGISTRY.
+ *
+ * A command gets `args` and writes with kprintf; nothing in the §M70 contract
+ * lets one READ.  `login` needs to, and a password must not be echoed.
+ *
+ * There are THREE line readers in this tree — shell.c's (a VC), aarch64's
+ * serial_shell.c (the PL011 directly) and rescue_shell.c's — so putting the
+ * masked reader in any one of them would make `login` work on one shell and be
+ * silently absent on the others: §M24's rule, and exactly the shape §M70 spent
+ * a milestone removing.  Instead the SHELL declares how it reads a character
+ * and the reader is shared.
+ *
+ * The default source needs no registration: it reads the current task's bound
+ * VC (`task->out_console`), which is right for both x86 shells.  aarch64's
+ * serial REPL has no VC and overrides it.
+ * ------------------------------------------------------------------------- */
+
+/* Blocking, returns one character.  NULL restores the default VC source. */
+void shell_set_input_source(int (*getch)(void));
+
+/* Read a line, ECHOING it.  Returns the length. */
+int  shell_read_line(const char* prompt, char* buf, int cap);
+
+/* Read a line WITHOUT echoing it.  Returns the length.
+ *
+ * Nothing is printed per keystroke — not even a '*' per character, which would
+ * publish the length of the password to anyone watching the screen.  Backspace
+ * still edits, silently. */
+int  shell_read_secret(const char* prompt, char* buf, int cap);
+
 /* Split `line` into verb + argument tail and run the matching command.
  * Returns 1 when a command claimed the line, 0 when the verb is unknown —
  * the CALLER prints the "unknown command" message, because the two shells

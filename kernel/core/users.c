@@ -506,6 +506,21 @@ static int load_file(const char* path, void (*fn)(char*)) {
     return 0;
 }
 
+/* Make sure every account's home exists, with the right owner and 0700.
+ * Idempotent: an existing directory is left alone except for its ownership,
+ * which is re-asserted because ramfs is rebuilt at every boot while the
+ * account database survives. */
+void users_ensure_homes(void) {
+    vfs_mkdir("/home");
+    for (int i = 0; i < USER_MAX_ACCOUNTS; i++) {
+        struct user_account* u = &g_users[i];
+        if (!u->used || !u->home[0]) continue;
+        vfs_mkdir(u->home);                  /* -2 when it already exists */
+        vfs_chmod(u->home, 0700);
+        vfs_chown(u->home, u->uid, u->gid);
+    }
+}
+
 int users_attach_persistent(const char* dir) {
     if (!dir || !*dir) return -1;
 
@@ -516,11 +531,21 @@ int users_attach_persistent(const char* dir) {
     s_cat(g_passwd_path, "/d-os-passwd", sizeof g_passwd_path);
     s_cat(g_shadow_path, "/d-os-shadow", sizeof g_shadow_path);
 
+    /* EVERY ACCOUNT'S HOME, created here rather than only in user_add.
+     *
+     * root is built by users_init, which runs before the VFS exists — so
+     * `/root` was a field in the database that nothing ever made, and the
+     * first thing that tried to write there failed with "open failed", which
+     * reads as a permission problem and is not one.  *A home directory that is
+     * a string and not a directory is the §M64 shortcut bug in a new costume.*
+     * Accounts loaded from the store have the same problem: they were created
+     * on a previous boot, and `/` is ramfs. */
     int loaded = load_file(g_passwd_path, parse_passwd_line);
     if (loaded == 0) {
         load_file(g_shadow_path, parse_shadow_line);
         kprintf("users: account database %s loaded (%d account(s), %d group(s))\n",
                 g_passwd_path, user_count(), group_count());
+        users_ensure_homes();
         return 0;
     }
 
@@ -529,6 +554,7 @@ int users_attach_persistent(const char* dir) {
      * writable turned every later save into a silent failure. */
     if (users_save() == 0) {
         kprintf("users: account database %s created\n", g_passwd_path);
+        users_ensure_homes();
         return 0;
     }
 
@@ -536,6 +562,11 @@ int users_attach_persistent(const char* dir) {
     g_shadow_path[0] = 0;
     klog(KLOG_WARN, "users",
          "%s not writable — accounts will NOT survive a reboot\n", dir);
+    /* Homes are made even here.  They live on ramfs, so they were never going
+     * to survive anyway — but a machine with no disk must still be usable, and
+     * an account whose home is missing is one whose session opens with a
+     * warning for a reason that has nothing to do with the disk. */
+    users_ensure_homes();
     return -1;
 }
 

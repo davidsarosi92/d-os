@@ -17,6 +17,7 @@
 #include "printf.h"
 #include "block.h"     /* §M75 — blkstat */
 #include "vfs.h"
+#include "users.h"   /* §M32 — chown resolves a NAME to a uid */
 #include "kmalloc.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -262,3 +263,60 @@ static void cmd_blkstat(const char* a) {
 
 SHELL_CMD(blkstat) = { "blkstat", "", "block-layer I/O counters since boot",
                        SHELL_G_FS, cmd_blkstat };
+
+/* ---------------------------------------------------------------------------
+ * §M32 stage 5 — chmod / chown.
+ *
+ * The mode is typed in OCTAL, which is how every user of these commands has
+ * thought about it for fifty years, and it is parsed as octal rather than
+ * being "helpfully" accepted in decimal: `chmod 644` meaning 0o644 and
+ * `chmod 644` meaning 644 decimal (0o1204) differ in every bit that matters,
+ * and the second silently grants setuid-shaped bits nobody asked for.
+ * ------------------------------------------------------------------------- */
+
+static void cmd_chmod(const char* args) {
+    char path[128]; int pi = 0;
+    while (*args == ' ') args++;
+    while (*args && *args != ' ' && pi < (int)sizeof path - 1) path[pi++] = *args++;
+    path[pi] = 0;
+    while (*args == ' ') args++;
+    if (!pi || !*args) { console_write("usage: chmod <path> <octal-mode>\n"); return; }
+
+    uint32_t mode = 0;
+    int digits = 0;
+    for (; *args >= '0' && *args <= '7'; args++) { mode = mode * 8 + (uint32_t)(*args - '0'); digits++; }
+    if (!digits || digits > 4) {
+        console_write("chmod: the mode is one to four OCTAL digits (e.g. 644, 700)\n");
+        return;
+    }
+    int r = vfs_chmod(path, mode);
+    if (r == -1)      kprintf("chmod: %s: no such path\n", path);
+    else if (r == -2) kprintf("chmod: %s: only the owner or an administrator may change the mode\n", path);
+    else              kprintf("chmod: %s is now %d%d%d%d\n", path,
+                              (int)((mode >> 9) & 7), (int)((mode >> 6) & 7),
+                              (int)((mode >> 3) & 7), (int)(mode & 7));
+}
+
+static void cmd_chown(const char* args) {
+    char path[128]; int pi = 0;
+    char who[64];   int wi = 0;
+    while (*args == ' ') args++;
+    while (*args && *args != ' ' && pi < (int)sizeof path - 1) path[pi++] = *args++;
+    path[pi] = 0;
+    while (*args == ' ') args++;
+    while (*args && *args != ' ' && wi < (int)sizeof who - 1) who[wi++] = *args++;
+    who[wi] = 0;
+    if (!pi || !wi) { console_write("usage: chown <path> <user>\n"); return; }
+
+    const struct user_account* u = user_by_name(who);
+    if (!u) { kprintf("chown: no such account '%s'\n", who); return; }
+    int r = vfs_chown(path, u->uid, u->gid);
+    if (r == -1)      kprintf("chown: %s: no such path\n", path);
+    else if (r == -2) console_write("chown: only an administrator may give a file away\n");
+    else              kprintf("chown: %s now belongs to %s (uid %d)\n", path, u->name, u->uid);
+}
+
+SHELL_CMD(chmod) = { "chmod", "<path> <octal-mode>", "change a file's permission bits",
+                     SHELL_G_FS, cmd_chmod };
+SHELL_CMD(chown) = { "chown", "<path> <user>", "change a file's owner (admin only)",
+                     SHELL_G_FS, cmd_chown };
