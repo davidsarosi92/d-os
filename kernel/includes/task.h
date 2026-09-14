@@ -39,6 +39,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "hal_api.h"       /* HAL_FPU_STATE_SIZE — per-task FPU/SIMD blob */
+#include "cred.h"          /* §M32 — struct cred, embedded below           */
 
 /* Per-process address space (M25).  Opaque here — see vmm.h.  Forward
  * declared so `struct task` can hold one without pulling in the VMM. */
@@ -403,6 +404,32 @@ struct task {
      * inside the blob so this needs no special alignment here (struct task is
      * kcalloc'd, whose alignment we do not want to depend on).  See hal_api.h. */
     uint8_t   fpu_state[HAL_FPU_STATE_SIZE];
+    /* §M32 stage 1 — WHO THIS TASK BELONGS TO.  A tagged value, not a uid:
+     * see cred.h for why "is there a person behind this at all" is the
+     * question, and why TASK_OWNER_KERNEL is zero so the three sites that
+     * build a task by hand (pid 0, BSP idle, each AP idle) are correct by
+     * construction rather than by being remembered.
+     *
+     * Written in exactly two places: cred_inherit() inside spawn_common, and
+     * cred_become_user() at login.  Never assigned from a call site — §M57's
+     * cpu_home is the precedent and the warning. */
+    struct cred cred;
+    /* §M32 — what `cred` was AT CREATION, and how many sanctioned transitions
+     * it has had.  These exist for the audit and for nothing else.
+     *
+     * Two independent checks, because neither catches what the other does:
+     *   - `cred_seq` counts cred_become_user() calls, so a task that changed
+     *     identity twice (or that changed it after it had children) is
+     *     visible.  A DIRECT field write does not increment it.
+     *   - `owner_birth`/`uid_birth` are compared against the live values when
+     *     cred_seq is 0, which is what catches that direct write.
+     *
+     * The re-parenting laundering bug is invisible to reading — the code that
+     * would introduce it looks like tidying up — so it has to be checkable at
+     * runtime or it is not checked at all (§M71 rule 1). */
+    uint32_t  cred_seq;
+    int       owner_birth;
+    int       uid_birth;
 };
 
 /* Set up the scheduler and convert the current `kernel_main` context

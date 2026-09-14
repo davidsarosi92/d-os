@@ -141,6 +141,22 @@ struct inode {
     void*                   private;       /* fs-private data */
     const struct file_ops*  ops;           /* per-open operations */
     const struct inode_ops* dir_ops;       /* directory mutators (NULL = read-only / non-dir) */
+    /* §M32 stage 5 — ownership and permission bits.
+     *
+     * `mode` holds the usual rwx triples (0755, 0644, 0700).  **Mode 0 is a
+     * legal value meaning "nobody may do anything", which is why it must not
+     * also be what a forgotten initialiser produces** — the trick cred.h uses
+     * (arrange for kcalloc's zero to be the right answer) does not work here,
+     * because the safe answer would brick the machine rather than protect it.
+     *
+     * So every inode goes through `vfs_inode_defaults()`, the same one-
+     * initialiser-every-site shape as §M49's `task_sched_defaults`, and an
+     * audit checks at RUNTIME that nothing is walking around with mode 0.
+     * There are six construction sites across four filesystems; the audit is
+     * what makes the seventh visible. */
+    int      owner_uid;
+    int      owner_gid;
+    uint32_t mode;
 };
 
 /* Directory entry — name + inode pointer + tree links.  We keep an
@@ -172,6 +188,34 @@ struct fs_type {
      * filesystems that don't need one.  Returns 0 on success. */
     int (*mount)(struct block_device* dev, struct dentry* mountpoint);
     struct fs_type* next;                   /* registry link */
+    /* §M32 stage 5 — DOES THIS FILESYSTEM STORE OWNERSHIP ACROSS A REBOOT?
+     *
+     * A declared capability, in the shape §M33 gave driver domains: today
+     * EVERY filesystem here answers 0, and that uniform answer is doing real
+     * work rather than being a placeholder.  ramfs, devfs and procfs are
+     * volatile, so their modes die with the machine; exFAT has no owner field,
+     * no mode field and nowhere to put them, so what this kernel enforces on
+     * /mnt is true until the power goes off and invisible to every other
+     * operating system.
+     *
+     * The alternative was a side-car ownership map on the volume — a second
+     * source of truth that must be written in the same operation as the file
+     * or the two drift.  Declined on §M33's rule: a boundary that is not
+     * enforced must not be claimed.  What IS done instead is that `mount`
+     * prints this, so "are these permissions real after a reboot" is
+     * answerable on the machine rather than only in a design document.
+     *
+     * An ext2 implementation would be the first to answer 1, which is what
+     * this field is for.
+     *
+     * Every fs_type in the tree uses DESIGNATED initialisers, so a filesystem
+     * that does not mention this field gets 0 — and 0 is the conservative
+     * answer.  A new filesystem that forgets to declare is assumed NOT to
+     * persist ownership, which UNDER-claims: it reports permissions as
+     * advisory when they might be real, rather than promising enforcement it
+     * does not deliver.  The default errs in the direction that cannot become
+     * isolation theatre. */
+    int stores_ownership;
 };
 
 /* ------------------------------------------------------------------- */
@@ -223,6 +267,56 @@ int  vfs_copy(const char* src, const char* dst);
 /* M22.5 — remove a file or a directory TREE (depth-limited to 8).
  * Returns 0 on success; on failure the tree may be partially removed. */
 int  vfs_unlink_recursive(const char* path);
+
+/* ---------------------------------------------------------------------------
+ * §M32 stage 5 — ownership and permissions.
+ * ------------------------------------------------------------------------- */
+
+/* What a caller wants to do.  The same three bits as the mode's triples, so
+ * the check is a mask test rather than a translation. */
+#define VFS_PERM_READ  4
+#define VFS_PERM_WRITE 2
+#define VFS_PERM_EXEC  1
+
+/* THE ONE INITIALISER.  Every filesystem calls this immediately after
+ * allocating an inode — root-owned, 0755 for a directory and 0644 for
+ * anything else.  See the note on `mode` in struct inode for why this cannot
+ * be left to kcalloc. */
+void vfs_inode_defaults(struct inode* ino);
+
+/* May the CURRENT task do `want` to this inode?  1 = yes.
+ *
+ * Exported rather than private to vfs.c because the execute bit has an
+ * enforcement point that `open` cannot serve: a program is opened for READING
+ * in order to be run, so only the loader can distinguish "may read this file"
+ * from "may run it" (§M32 stage 6, proc.c). */
+int  vfs_permitted(const struct inode* ino, int want);
+
+/* chmod/chown.  Gated: only the owner or an admin may chmod, and only an admin
+ * may chown — giving a file away is how a quota or an audit trail is escaped,
+ * and there is no reason an ordinary user needs it. */
+int  vfs_chmod(const char* path, uint32_t mode);
+int  vfs_chown(const char* path, int uid, int gid);
+
+/* One mounted filesystem.  The VFS kept no record of its mounts before §M32,
+ * so nothing could answer "which filesystem is this path on" — the question
+ * ownership-persistence turns out to be. */
+struct vfs_mount {
+    char        path[64];
+    const char* fs_name;
+    int         stores_ownership;       /* copied from the fs_type at mount */
+};
+
+int  vfs_mount_count(void);
+const struct vfs_mount* vfs_mount_at(int i);
+/* Longest-prefix match: /mnt/foo answers with the exFAT mount, not the root. */
+const struct vfs_mount* vfs_mount_for(const char* path);
+
+/* Does the filesystem holding `path` actually STORE ownership, or are the bits
+ * above only true until the power goes off?  1 / 0, or -1 when the path is on
+ * no known mount.  Today every filesystem here answers 0 — see the note on
+ * `fs_type.stores_ownership`, and `mount`, which prints it. */
+int  vfs_ownership_is_persistent(const char* path);
 
 /* Internal helper exposed for filesystems implementing `mount` and
  * lazy `lookup`: attach a freshly-allocated dentry+inode pair under an

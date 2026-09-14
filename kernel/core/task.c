@@ -831,6 +831,7 @@ static struct task* spawn_common(const char* name, void (*entry)(void),
     str_copy_n(t->name, name, sizeof t->name);
     t->pid         = next_pid++;
     if (next_pid <= 0) next_pid = 1;        /* §4.6 — never wrap to a negative pid */
+    struct task* cur = task_current();       /* NULL very early in boot */
     /* M27 — parent: an explicit override (detached → init), else whoever
      * called (or pid 0 very early in boot, before there is a `current`). */
     if (ppid_override >= 0) {
@@ -840,10 +841,26 @@ static struct task* spawn_common(const char* name, void (*entry)(void),
          * launcher, so it must NOT be taken down as part of a parent's subtree. */
         if (g_init_pid > 0 && ppid_override == g_init_pid) t->survives_parent = 1;
     } else {
-        struct task* cur = task_current();
         t->ppid    = cur ? cur->pid : 0;
     }
     t->state       = TASK_RUNNABLE;
+    /* §M32 — identity, inherited HERE and nowhere else.  Assigning creds from
+     * a call site after spawn returns would be assigning them to a task another
+     * CPU may already be running; §M57's cpu_home is what that mistake looks
+     * like six months later, and here a wrong answer is a security statement.
+     *
+     * **IDENTITY COMES FROM THE CALLER, DELIBERATELY NOT FROM `ppid`.**  A
+     * detached task (`task_spawn_detached`, the GUI's "Detached Shell") has its
+     * PARENT overridden to init so it survives its launcher — but it is still
+     * the identity of whoever asked for it.  Inheriting from the overridden
+     * ppid instead would mean **a user could turn their own process into a
+     * SYSTEM one by detaching it**, which is precisely the laundering cred.h
+     * forbids, reached through a supported feature rather than a bug.  The two
+     * fields diverge here on purpose. */
+    cred_inherit(&t->cred, cur ? &cur->cred : NULL);
+    t->cred_seq    = 0;
+    t->owner_birth = t->cred.owner;
+    t->uid_birth   = t->cred.uid;
     t->last_yield_ms = timer_ticks_ms();     /* §M46 runaway detector baseline */
     t->esp         = hal_task_init_stack((char*)stack + TASK_KSTACK_SZ, entry);
     t->kstack_base = stack;
@@ -2504,7 +2521,7 @@ void schedule_check(void) {
 
 void task_list(void) {
     if (!master_head) { kprintf("ps: no tasks\n"); return; }
-    kprintf("PID  PPID  STATE  CPU  CPUMS  MEMKB  NAME\n");
+    kprintf("PID  PPID  STATE  CPU  CPUMS  MEMKB  USER  NAME\n");
 
     /* §M75 — the sum is printed at the end, and it is not decoration: the
      * invariant that keeps the memory column meaningful is that every frame is
@@ -2526,10 +2543,12 @@ void task_list(void) {
         sum_priv   += priv;
         sum_shared += shared;
 
-        kprintf("%d   %d   %s    %d   %u   %u   %s%s\n",
+        char ob[24];
+        kprintf("%d   %d   %s    %d   %u   %u   %s   %s%s\n",
                 t->pid, t->ppid, state_name(t->state), t->cpu_home,
                 (unsigned)task_cpu_ms_now(t), /* truncates past ~49 days — fine */
                 (unsigned)(priv / 1024u),
+                cred_owner_name(&t->cred, ob, sizeof ob),
                 t->name, running ? " (running)" : "");
         t = t->next;
     } while (t != master_head);

@@ -71,7 +71,40 @@ static void cmd_touch(const char* path) {
  * Useful for `mount exfat /mnt vda` once exFAT lands; for in-memory
  * filesystems the `dev` argument is omitted. */
 static void cmd_mount(const char* args) {
-    if (!args || !*args) { console_write("mount: missing args\n"); return; }
+    /* §M32 stage 5 — WITH NO ARGUMENTS, LIST WHAT IS MOUNTED AND SAY WHETHER
+     * ITS PERMISSIONS ARE REAL.
+     *
+     * This is not a convenience.  The whole ownership model is enforced from
+     * RAM, and on this machine NO filesystem stores an owner across a reboot:
+     * ramfs/devfs/procfs are volatile, and exFAT has no owner field, no mode
+     * field and nowhere to put them.  A user who sets a file to 0600 and
+     * reboots gets a world-readable file back, and our own next boot — or any
+     * other operating system — reads it.
+     *
+     * *That is a fact about the machine, so it belongs ON the machine and not
+     * only in a design document* — the §M33 honesty gate applied to storage.
+     * `mount` used to refuse an empty argument list; now the empty form is the
+     * one that answers the question. */
+    if (!args || !*args) {
+        int n = vfs_mount_count();
+        if (n == 0) { console_write("mount: nothing mounted\n"); return; }
+        console_write("PATH  FS  OWNERSHIP\n");
+        int any_advisory = 0;
+        for (int i = 0; i < n; i++) {
+            const struct vfs_mount* m = vfs_mount_at(i);
+            if (!m) continue;
+            kprintf("%s   %s   %s\n", m->path, m->fs_name,
+                    m->stores_ownership ? "stored on the volume"
+                                        : "ADVISORY — not stored, lost at power-off");
+            if (!m->stores_ownership) any_advisory = 1;
+        }
+        if (any_advisory)
+            console_write("mount: permissions on an ADVISORY volume are enforced by "
+                          "this kernel while it runs and are invisible to every "
+                          "other system; a filesystem with owner fields (ext2) is "
+                          "what would make them real.\n");
+        return;
+    }
     char fs[32];   int fi = 0;
     char path[64]; int pi = 0;
     char dev[32];  int di = 0;

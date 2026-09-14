@@ -76,6 +76,7 @@ static int attach_node(struct devfs_node* node) {
     if (!ino) return -1;
 
     ino->type    = INODE_DEVICE;
+    vfs_inode_defaults(ino);   /* §M32 — ONE initialiser, every site */
     ino->size    = 0;
     ino->ops     = &devfs_file_ops;
     ino->private = node;
