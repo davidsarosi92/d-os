@@ -1480,6 +1480,12 @@ static int gui_teardown(void) {
     return 0;
 }
 
+/* §M32 stage 10 — the lock instrument runs on its own task; see gui_start. */
+static const char* gui_locktest_creds;
+static void gui_locktest_main(void) {
+    if (gui_locktest_creds) gui_lock_test(gui_locktest_creds);
+}
+
 /* §M76 — see the autorun note at the end of gui_start. */
 static const char* gui_autorun_cmd;
 static void gui_autorun_main(void) {
@@ -1723,6 +1729,35 @@ int gui_start(void) {
     kprintf("gui: up — %dx%d, %d windows, shell '%s', %d apps registered\n",
             fbsurf.w, fbsurf.h, zcount,
             shell ? shell->name : "none", gui_app_count());
+
+    /* §M32 stage 10 — GATE THE DESKTOP, if the machine has anyone to ask.
+     *
+     * AFTER the compositor exists, because the lock is a WINDOW and there is
+     * nothing to draw it before that; and after `gui: up`, so a machine that
+     * fails to raise it still reports a working desktop rather than an
+     * ambiguous silence.
+     *
+     * It is off by default (`gui.login`).  A gate that defaults ON would be a
+     * gate this project's own harness cannot get past (§4.74), and the first
+     * casualty of turning it on by default would be every existing GUI test —
+     * §M46's argument for `hardlock` being reachable but not standard, applied
+     * to the thing that stands between a person and their desktop. */
+    if (config_get_long("gui.login", 0)) {
+        if (gui_lock_raise() != 0)
+            kprintf("gui: login was requested and could not be raised — the "
+                    "desktop is UNLOCKED\n");
+        /* And the instrument — on its OWN TASK, the same shape as autorun
+         * below.  It waits for the lock's fields to be laid out, and waiting
+         * here would block the bring-up that produces them: *an instrument
+         * that blocks the thing it is measuring measures a machine that does
+         * not exist.*  Read from a key because by the next line the lock owns
+         * the keyboard and nothing can be typed at it (§4.74). */
+        const char* lt = config_get("gui.locktest", "");
+        if (lt && lt[0]) {
+            gui_locktest_creds = lt;
+            task_spawn_detached("gui-locktest", gui_locktest_main);
+        }
+    }
 
     /* §M76 — RUN ONE COMMAND NOW THAT THE DESKTOP EXISTS.
      *

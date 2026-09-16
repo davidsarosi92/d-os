@@ -658,17 +658,26 @@ static void textinput_draw(struct widget* w, struct gfx_surface* s) {
     outline(s, w->x, w->y, w->w, w->h, focused ? WCOL_BOX_FOCUS : WCOL_BOX_EDGE);
     if (focused) cp_focus_ring(s, w->x, w->y, w->w, w->h);
 
-    /* Right-align overflow: show the tail that fits. */
     int maxch = (w->w - 10) / cp_fw();
-    const char* p = t->buf;
-    if (t->len > maxch) p += t->len - maxch;
-    cp_text(s, w->x + 5, w->y + (w->h - cp_fh()) / 2, p, WCOL_TEXT);
+    int cw;
+    if (t->secret) {
+        /* §M32 — ONE marker, whatever the length.  A row of bullets is a
+         * public statement of how many characters the password has, which is
+         * the one thing a shoulder-surfer cannot otherwise get. */
+        const char* mark = t->len ? "\xB7\xB7\xB7" : "";
+        cp_text(s, w->x + 5, w->y + (w->h - cp_fh()) / 2, mark, WCOL_TEXT);
+        cw = t->len ? 3 : 0;
+    } else {
+        /* Right-align overflow: show the tail that fits. */
+        const char* p = t->buf;
+        if (t->len > maxch) p += t->len - maxch;
+        cp_text(s, w->x + 5, w->y + (w->h - cp_fh()) / 2, p, WCOL_TEXT);
+        cw = t->len > maxch ? maxch : t->len;
+    }
 
-    if (focused) {                              /* caret after the text */
-        int cw = t->len > maxch ? maxch : t->len;
+    if (focused)                                /* caret after the text */
         gfx_fill(s, w->x + 5 + cw * cp_fw() + 1, w->y + 3, 1, w->h - 6,
                  WCOL_TEXT);
-    }
 }
 
 static void textinput_mouse(struct widget* w, int lx, int ly, int kind) {
@@ -699,6 +708,17 @@ static void textinput_keycode(struct widget* w, uint8_t kc, uint8_t mods) {
     struct w_textinput* t = (struct w_textinput*)w;
     if (!(mods & KBD_MOD_CTRL_MASK)) return;
     if (kc == KC_C || kc == KC_X) {
+        /* §M32 — A SECRET FIELD IS NOT COPYABLE.  Ctrl+C here would put the
+         * password on the SYSTEM clipboard, where §M59 makes it readable by
+         * `clip show`, by every other window and by any ring-3 program that
+         * opens /dev/clipboard.  *A field that hides its contents on screen and
+         * hands them to the clipboard hides nothing.*  Cut is refused with it:
+         * clearing the field is harmless, but the copy half is the point.
+         *
+         * Paste INTO one is still allowed — a password manager is exactly the
+         * kind of thing that would want it, and it moves a secret toward the
+         * field rather than away from it. */
+        if (t->secret) return;
         clipboard_set(t->buf, t->len);
         if (kc == KC_X) { t->len = 0; t->buf[0] = 0; }
     } else if (kc == KC_V) {
@@ -723,6 +743,10 @@ struct w_textinput* w_textinput_create(struct gui_window* win, int x, int y,
     if (!t) return NULL;
     widget_init(&t->base, win, x, y, w, 16, &textinput_ops, ctx, 1);
     return t;
+}
+
+void w_textinput_set_secret(struct w_textinput* t, int on) {
+    if (t) t->secret = on ? 1 : 0;
 }
 
 void w_textinput_set(struct w_textinput* t, const char* text) {

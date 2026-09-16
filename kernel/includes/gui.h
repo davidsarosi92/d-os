@@ -157,6 +157,16 @@ void gui_window_set_key_hook(struct gui_window* win,
  * apps parent under this so they appear under the desktop in the process tree. */
 int  gui_desktop_pid(void);
 
+/* §M32 stage 10 — the lock screen.  `raise` puts a modal authentication window
+ * over the desktop and refuses to be dismissed until somebody signs in;
+ * `active` is true while it is up.  See kernel/gui/apps/lockscreen.c for what
+ * this deliberately does NOT do (the desktop task stays SYSTEM-owned). */
+int  gui_lock_raise(void);
+int  gui_lock_active(void);
+/* Drive the lock's REAL submit path with "user:password".  See the comment on
+ * cmd_lock for why this has to be reachable from a config key. */
+void gui_lock_test(const char* creds);
+
 /* Queue an app launch onto the compositor.  The compositor spawns a
  * dedicated "app-host" task that runs the app (M22.7), so launching must
  * NOT call the app's open fn directly — that would run it on the caller's
