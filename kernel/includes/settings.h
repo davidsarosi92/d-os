@@ -86,7 +86,28 @@ struct config_key_def {
      * a text box.  Both zero = unknown, and the panel falls back to free text:
      * a slider over a range nobody declared would invent limits. */
     int         min, max;
+    /* §M32 stage 9 — IS THIS A PREFERENCE OR A MACHINE POLICY?
+     *
+     * *A system where changing the wallpaper changes it for everybody is not a
+     * multi-user system; it is one desktop with several names for it.*  So a
+     * user gets their own store — the §M63 overlay a second time — and the
+     * scope decides which keys it may contain.
+     *
+     * **WHICH KEYS ARE PER-USER IS A PROPERTY OF THE KEY, NOT OF THE STORE**,
+     * and skipping that is the whole danger: without it an unprivileged user's
+     * file could override a machine policy (`mem.reserve_kb`, `kernel.
+     * fault_policy`), and the settings panel would render both identically and
+     * write both the same way.
+     *
+     * ZERO IS MACHINE, which is the conservative direction: a key nobody has
+     * classified stays administrator-only.  That UNDER-delivers — a preference
+     * that could have been personal stays shared — where the opposite default
+     * would hand machine policy to anybody with a text editor. */
+    int         scope;
 };
+
+#define CFG_SCOPE_MACHINE 0   /* administrators only; one value for the box  */
+#define CFG_SCOPE_USER    1   /* a preference; each account keeps its own    */
 
 extern struct config_key_def __start_config_keys[];
 extern struct config_key_def __stop_config_keys[];
@@ -105,6 +126,11 @@ const struct config_key_def* config_key_find(const char* key);
  * simply undescribed).  This is what lets `setconf` refuse "fil" for a fit
  * mode instead of leaving the mistake to be found by whoever reads it. */
 int  config_key_validate(const char* key, const char* value);
+
+/* §M32 — the scope of `key`.  An UNDECLARED key answers MACHINE, for the same
+ * reason the field's zero does: `setconf` can still reach keys that have no
+ * descriptor, and those must not become a way past the rule. */
+int  config_key_scope(const char* key);
 
 /* The `conf` shell command: list descriptors, show one, or set with
  * validation.  Lives with the registry so both shells share it. */

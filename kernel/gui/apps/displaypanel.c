@@ -386,4 +386,4 @@ CONFIG_KEY(ck_mode) = {
  * purpose is a revert nobody has tested (§M61). */
 SHELL_CMD(mode) = { "mode", "[list|<w>x<h> [--force]|confirm|revert]",
                     "display resolution",
-                    SHELL_G_GUI, display_cmd };
+                    SHELL_G_GUI, display_cmd, SHELL_P_ADMIN };

@@ -14,6 +14,7 @@
 #include "pmm.h"
 #include "task.h"
 #include "usermode.h"
+#include "printf.h"
 #include "syscall.h"
 #include "kmalloc.h"
 #include "hal_api.h"
@@ -245,6 +246,11 @@ static int load_program(struct vmm_space* s, const void* image, size_t len,
     lp->interp_base = 0;
 
     if (lp->main.has_interp) {
+        /* §M32 — the INTERPRETER is required to be READABLE, not executable.
+         * ld.so is loaded the way a shared library is: the kernel maps it on
+         * behalf of a program that has already passed the x check above.
+         * Demanding x here would mean every `.so` in a closure needed one too,
+         * and then the bit would mean "is a file" rather than "may be run". */
         struct file* f = vfs_open(lp->main.interp, VFS_RDONLY);
         if (!f) return ELF_ENOLOAD;                   /* interpreter missing   */
         size_t isz = f->inode ? (size_t)f->inode->size : 0;
@@ -383,6 +389,23 @@ int proc_execve(const char* path, char* const uargv[]) {
     if (u_strcopy(kpath, path, sizeof kpath) < 0) { kfree(strbuf); return -1; }
     struct file* f = vfs_open(kpath, VFS_RDONLY);
     if (!f) { kfree(strbuf); return -1; }
+
+    /* §M32 stage 6 — THE EXECUTE BIT, AND THIS IS THE ONLY PLACE IT CAN LIVE.
+     *
+     * A program is opened for READING in order to be run, so an open-time
+     * check has no way to distinguish "may read this file" from "may run it":
+     * `vfs_open` above has already granted read, and it was right to.  The x
+     * bit is a statement about EXECUTION, and the loader is the only code that
+     * knows that is what is happening.
+     *
+     * It is also why it could not be inherited from stage 5's list of
+     * enforcement points, all of which are in vfs.c. */
+    if (f->inode && !vfs_permitted(f->inode, VFS_PERM_EXEC)) {
+        kprintf("exec: %s: not executable\n", kpath);
+        vfs_close(f);
+        kfree(strbuf);
+        return -1;
+    }
     size_t sz = f->inode ? (size_t)f->inode->size : 0;
     if (sz == 0 || sz > (16u << 20)) { vfs_close(f); kfree(strbuf); return -1; }
     uint8_t* img = (uint8_t*)kmalloc(sz);

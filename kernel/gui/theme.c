@@ -162,12 +162,14 @@ CONFIG_KEY(ck_theme) = {
     .key = "gui.theme", .group = "Appearance", .type = CFG_ENUM,
     .values = "dark light", .def = "dark",
     .help = "Console Plate colour theme",
+    .scope = CFG_SCOPE_USER,
 };
 
 CONFIG_KEY(ck_density) = {
     .key = "gui.density", .group = "Appearance", .type = CFG_ENUM,
     .values = "comfort compact", .def = "compact",
     .help = "control and row height (24 px / 16 px)",
+    .scope = CFG_SCOPE_USER,
 };
 
 /* TEXT SIZE.
@@ -204,12 +206,14 @@ CONFIG_KEY(ck_font_kind) = {
     .key = "gui.font", .group = "Appearance", .type = CFG_ENUM,
     .values = "vector bitmap", .def = "vector",
     .help = "outline typefaces, or the built-in 8x8 bitmap font",
+    .scope = CFG_SCOPE_USER,
 };
 
 CONFIG_KEY(ck_icon_size) = {
     .key = "gui.icon_size", .group = "Appearance", .type = CFG_ENUM,
     .values = "24 32 48", .def = "24",
     .help = "desktop and list icon size in pixels",
+    .scope = CFG_SCOPE_USER,
 };
 
 /* Local rather than reached for: this file needs exactly "leading digits, no
@@ -382,4 +386,4 @@ void cp_cmd_theme(const char* arg) {
 
 /* --- §M70 shell registration ----------------------------------------------- */
 SHELL_CMD(theme) = { "theme", "[light|dark]", "the active theme, and its live density",
-                     SHELL_G_GUI, cp_cmd_theme };
+                     SHELL_G_GUI, cp_cmd_theme, SHELL_P_ANY };

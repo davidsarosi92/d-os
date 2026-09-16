@@ -183,6 +183,6 @@ void svc_demo_wdtest(void) {
 static void sd_bustest(const char* a) { (void)a; svc_demo_bustest(); }
 static void sd_wdtest (const char* a) { (void)a; svc_demo_wdtest();  }
 SHELL_CMD(bustest) = { "bustest", "", "service-bus bind + contract check",
-                       SHELL_G_TEST, sd_bustest };
+                       SHELL_G_TEST, sd_bustest, SHELL_P_ADMIN };
 SHELL_CMD(wdtest)  = { "wdtest", "", "per-task watchdog: miss a heartbeat on purpose",
-                       SHELL_G_TEST, sd_wdtest };
+                       SHELL_G_TEST, sd_wdtest, SHELL_P_ADMIN };

@@ -242,4 +242,4 @@ CRON_JOB("tick-log", job_tick_log, 5000);
 /* --- §M70 shell registration ----------------------------------------------- */
 static void cr_crontab(const char* a) { (void)a; cron_list(); }   /* -l is the only form */
 SHELL_CMD(crontab) = { "crontab", "[-l]", "scheduled jobs",
-                       SHELL_G_SYS, cr_crontab };
+                       SHELL_G_SYS, cr_crontab, SHELL_P_ADMIN };

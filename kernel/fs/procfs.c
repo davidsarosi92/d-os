@@ -181,6 +181,7 @@ static struct dentry* proc_subdir(const char* name, size_t n) {
     struct inode* ino = (struct inode*)kcalloc(1, sizeof(struct inode));
     if (!ino) return NULL;
     ino->type = INODE_DIR;
+    vfs_inode_defaults(ino);   /* §M32 — ONE initialiser, every site */
     /* Borrow /proc's OWN directory operations.  A directory inode with no ops
      * can be walked (lookup follows dentry children, so `cat /proc/net/tcp`
      * works) but cannot be LISTED — `ls /proc/net` answered "readdir failed",
@@ -211,6 +212,7 @@ static int attach_node(struct procfs_node* node) {
     struct inode* ino = (struct inode*)kcalloc(1, sizeof(struct inode));
     if (!ino) return -1;
     ino->type    = INODE_FILE;
+    vfs_inode_defaults(ino);   /* §M32 — ONE initialiser, every site */
     ino->ops     = &procfs_file_ops;
     ino->private = node;
     if (!vfs_attach_child(parent, leaf, ino)) {
@@ -380,15 +382,21 @@ static const char* state_name(enum task_state s) {
 }
 static void cb_task(const struct task* t, int is_current, void* ctx) {
     struct procfs_writer* w = (struct procfs_writer*)ctx;
+    char ob[24];
     pw_put_uint(w, (unsigned)t->pid);  pw_putc(w, '\t');
     pw_put_uint(w, (unsigned)t->ppid); pw_putc(w, '\t');   /* M27 */
     pw_puts(w, state_name(t->state));  pw_putc(w, '\t');
+    /* §M32 — the owner, through cred.h's one formatter.  `ps`, this file and
+     * §M75's Task Manager all ask the same function: three renderings of an
+     * identity would be three chances for one of them to say `root` where the
+     * others say `system`. */
+    pw_puts(w, cred_owner_name(&t->cred, ob, sizeof ob)); pw_putc(w, '\t');
     pw_puts(w, t->name);
     if (is_current) pw_puts(w, " (running)");
     pw_putc(w, '\n');
 }
 static void gen_tasks(struct procfs_writer* w) {
-    pw_puts(w, "# pid  ppid  state  name\n");
+    pw_puts(w, "# pid  ppid  state  user  name\n");
     task_for_each(cb_task, w);
 }
 

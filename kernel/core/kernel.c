@@ -65,6 +65,7 @@
 #include "block_cache.h"
 #include "block.h"
 #include "config.h"
+#include "users.h"   /* §M32 — accounts */
 #include "locale.h"
 #include "shortcut.h"        /* §M64 tail — shortcut_attach_persistent */
 #include "audio.h"           /* §M23 stage 3 — audio_devfs_init */
@@ -169,6 +170,11 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     /* Configuration store: defaults + overlay from /etc/d-os.conf if
      * present.  Must run after the fs is mounted (module_init_all). */
     config_init();
+    /* §M32 — the identity model, before anything can ask about one.
+     * Built-in only: root, the admin and users groups, no disk touched.
+     * It cannot fail, which is the point — a machine that could not
+     * answer 'who is this' would have no way to report why. */
+    users_init();
 
     /* §M47 — arm the unclean-shutdown marker, and report if the PREVIOUS boot
      * never cleared it.  Must come after config (so the report is loggable) but
@@ -326,6 +332,13 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
              * consumed a key (keymap, console colours) are notified rather
              * than left one boot behind. */
             config_attach_persistent("/mnt");
+            /* §M32 — AND THE ACCOUNTS, by exactly the same rule and on
+             * BOTH boot paths.  `/` is ramfs, so a database written
+             * there is gone at power-off while every write SUCCEEDS —
+             * §M63 stage 0's defect, and on an account database it
+             * means every user the administrator created is missing
+             * after a reboot with nothing to say so. */
+            users_attach_persistent("/mnt");
             /* §M75.1 — and the crash log, on the SAME volume and by the
              * same rule: a sink handed a path it merely hopes is writable
              * swallows every future record in silence (§M63 stage 0,

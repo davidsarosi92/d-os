@@ -118,15 +118,15 @@ static void mem_buddyinfo(const char* a) { (void)a; cmd_buddyinfo(); }
 static void mem_mmtest   (const char* a) { (void)a; cmd_mmtest();    }
 
 SHELL_CMD(meminfo)   = { "meminfo",   "", "firmware map, buddy allocator and heap",
-                         SHELL_G_MEM,  mem_meminfo };
+                         SHELL_G_MEM,  mem_meminfo, SHELL_P_ANY };
 SHELL_CMD(memcheck)  = { "memcheck",  "", "validate the buddy free lists now",
-                         SHELL_G_MEM,  mem_memcheck };
+                         SHELL_G_MEM,  mem_memcheck, SHELL_P_ADMIN };
 SHELL_CMD(slabinfo)  = { "slabinfo",  "", "slab caches",
-                         SHELL_G_MEM,  mem_slabinfo };
+                         SHELL_G_MEM,  mem_slabinfo, SHELL_P_ANY };
 SHELL_CMD(buddyinfo) = { "buddyinfo", "", "buddy free lists by order",
-                         SHELL_G_MEM,  mem_buddyinfo };
+                         SHELL_G_MEM,  mem_buddyinfo, SHELL_P_ANY };
 SHELL_CMD(mmtest)    = { "mmtest",    "", "allocator self-test",
-                         SHELL_G_TEST, mem_mmtest };
+                         SHELL_G_TEST, mem_mmtest, SHELL_P_ADMIN };
 
 /* ---------------------------------------------------------------------------
  * §M75 — `memhog`: the falsifier for the per-process memory column.
@@ -161,4 +161,4 @@ static void mem_memhog(const char* a) {
 }
 
 SHELL_CMD(memhog)    = { "memhog",    "", "ring-3 process that grows 1 MiB/2 s (memory-column falsifier)",
-                         SHELL_G_TEST, mem_memhog };
+                         SHELL_G_TEST, mem_memhog, SHELL_P_ADMIN };

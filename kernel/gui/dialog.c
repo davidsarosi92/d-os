@@ -420,4 +420,4 @@ void dialog_command(const char* arg) {
 
 /* --- §M70 shell registration ----------------------------------------------- */
 SHELL_CMD(dialog) = { "dialog", "[demo]", "a modal dialog, and the modality behind it",
-                      SHELL_G_GUI, dialog_command };
+                      SHELL_G_GUI, dialog_command, SHELL_P_ANY };

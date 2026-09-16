@@ -494,11 +494,13 @@ CONFIG_KEY(ck_wallpaper) = {
     .key = "gui.wallpaper", .group = "Appearance", .type = CFG_STRING,
     .def = WALLPAPER_DEFAULT_PATH,
     .help = "gradient | solid:RRGGBB | a path to a BMP",
+    .scope = CFG_SCOPE_USER,
 };
 CONFIG_KEY(ck_wallpaper_fit) = {
     .key = "gui.wallpaper_fit", .group = "Appearance", .type = CFG_ENUM,
     .values = "fill stretch center tile", .def = "fill",
     .help = "how the image is fitted to the screen",
+    .scope = CFG_SCOPE_USER,
 };
 
 /* §M63 stage 0 — react to the keys changing by ANY route: the persistent store
@@ -737,4 +739,4 @@ int wallpaper_write_test_bmp(const char* path, int w, int h) {
  * serial REPL would run the same one; this is the other half of that. */
 SHELL_CMD(wallpaper) = { "wallpaper", "[gradient|solid:RRGGBB|<path.bmp>|fit <mode>|check]",
                          "the desktop background",
-                         SHELL_G_GUI, wallpaper_cmd };
+                         SHELL_G_GUI, wallpaper_cmd, SHELL_P_ANY };

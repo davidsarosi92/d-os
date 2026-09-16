@@ -169,4 +169,4 @@ void console_list(void) {
 /* --- §M70 shell registration ----------------------------------------------- */
 static void cn_lsconsole(const char* a) { (void)a; console_list(); }
 SHELL_CMD(lsconsole) = { "lsconsole", "", "registered console sinks",
-                         SHELL_G_DEV, cn_lsconsole };
+                         SHELL_G_DEV, cn_lsconsole, SHELL_P_ANY };

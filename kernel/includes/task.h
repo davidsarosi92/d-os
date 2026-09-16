@@ -39,6 +39,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "hal_api.h"       /* HAL_FPU_STATE_SIZE — per-task FPU/SIMD blob */
+#include "cred.h"          /* §M32 — struct cred, embedded below           */
 
 /* Per-process address space (M25).  Opaque here — see vmm.h.  Forward
  * declared so `struct task` can hold one without pulling in the VMM. */
@@ -74,9 +75,18 @@ struct ofile;
 uint32_t task_nice_to_weight(int nice);
 
 /* §M49 — set a task's nice value (clamped to the legal range) and derive
- * its weight.  Returns 0 on success, -1 if no such task.  Lowering nice
- * (more CPU) is unprivileged here: d-os has no multi-user model yet
- * (§M32), so there is nothing to protect it from. */
+ * its weight.  Returns 0 on success, -1 if no such task, -2 if refused.
+ *
+ * §M32 — THE PREMISE OF THIS COMMENT HAS MOVED, which is why it is rewritten
+ * rather than left.  It used to read "lowering nice is unprivileged here: d-os
+ * has no multi-user model yet (§M32), so there is nothing to protect it from",
+ * and every word was true when written.  There is now something to protect it
+ * from: a limited user who lowers their nice takes CPU from everybody else.
+ *
+ * So the rule is the classic asymmetric one — RAISING a priority (a more
+ * negative nice) needs an administrator, LOWERING it is anybody's — and it
+ * lives in the function body rather than in the SHELL_CMD privilege field,
+ * because that field gates a VERB and this depends on the ARGUMENT. */
 int task_set_nice(int pid, int nice);
 
 enum task_state {
@@ -403,6 +413,32 @@ struct task {
      * inside the blob so this needs no special alignment here (struct task is
      * kcalloc'd, whose alignment we do not want to depend on).  See hal_api.h. */
     uint8_t   fpu_state[HAL_FPU_STATE_SIZE];
+    /* §M32 stage 1 — WHO THIS TASK BELONGS TO.  A tagged value, not a uid:
+     * see cred.h for why "is there a person behind this at all" is the
+     * question, and why TASK_OWNER_KERNEL is zero so the three sites that
+     * build a task by hand (pid 0, BSP idle, each AP idle) are correct by
+     * construction rather than by being remembered.
+     *
+     * Written in exactly two places: cred_inherit() inside spawn_common, and
+     * cred_become_user() at login.  Never assigned from a call site — §M57's
+     * cpu_home is the precedent and the warning. */
+    struct cred cred;
+    /* §M32 — what `cred` was AT CREATION, and how many sanctioned transitions
+     * it has had.  These exist for the audit and for nothing else.
+     *
+     * Two independent checks, because neither catches what the other does:
+     *   - `cred_seq` counts cred_become_user() calls, so a task that changed
+     *     identity twice (or that changed it after it had children) is
+     *     visible.  A DIRECT field write does not increment it.
+     *   - `owner_birth`/`uid_birth` are compared against the live values when
+     *     cred_seq is 0, which is what catches that direct write.
+     *
+     * The re-parenting laundering bug is invisible to reading — the code that
+     * would introduce it looks like tidying up — so it has to be checkable at
+     * runtime or it is not checked at all (§M71 rule 1). */
+    uint32_t  cred_seq;
+    int       owner_birth;
+    int       uid_birth;
 };
 
 /* Set up the scheduler and convert the current `kernel_main` context
@@ -469,6 +505,16 @@ struct task* task_spawn_under(const char* name, void (*entry)(void), int ppid);
  * console just never got it. */
 struct task* task_spawn_console(const char* name, void (*entry)(void),
                                 int ppid, void* console);
+
+/* §M32 — BOTH an argument and a console, bound at the spawn.
+ *
+ * `spawn_common` has always taken both; no wrapper exposed the combination,
+ * so a caller that needed both had to set one of them afterwards — which is
+ * the very race the comment above describes, just reached from the other side.
+ * A session leader needs both (its identity and the pane it talks to), so the
+ * combination is now a wrapper rather than a call site's problem. */
+struct task* task_spawn_arg_console(const char* name, void (*entry)(void),
+                                    void* arg, int ppid, void* console);
 
 /* Cooperative yield.  No-op if we're the only runnable task.  Returns
  * when this task is scheduled again. */

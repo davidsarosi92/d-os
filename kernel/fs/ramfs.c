@@ -64,6 +64,7 @@ static struct inode* ramfs_alloc_inode(enum inode_type type) {
     if (!ino) return NULL;
     ino->type = type;
     ino->size = 0;
+    vfs_inode_defaults(ino);   /* §M32 — ONE initialiser, every site */
     if (type == INODE_DIR) {
         ino->ops     = &ramfs_dir_ops;
         ino->dir_ops = &ramfs_inode_ops;

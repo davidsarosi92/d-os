@@ -831,6 +831,7 @@ static struct task* spawn_common(const char* name, void (*entry)(void),
     str_copy_n(t->name, name, sizeof t->name);
     t->pid         = next_pid++;
     if (next_pid <= 0) next_pid = 1;        /* §4.6 — never wrap to a negative pid */
+    struct task* cur = task_current();       /* NULL very early in boot */
     /* M27 — parent: an explicit override (detached → init), else whoever
      * called (or pid 0 very early in boot, before there is a `current`). */
     if (ppid_override >= 0) {
@@ -840,10 +841,26 @@ static struct task* spawn_common(const char* name, void (*entry)(void),
          * launcher, so it must NOT be taken down as part of a parent's subtree. */
         if (g_init_pid > 0 && ppid_override == g_init_pid) t->survives_parent = 1;
     } else {
-        struct task* cur = task_current();
         t->ppid    = cur ? cur->pid : 0;
     }
     t->state       = TASK_RUNNABLE;
+    /* §M32 — identity, inherited HERE and nowhere else.  Assigning creds from
+     * a call site after spawn returns would be assigning them to a task another
+     * CPU may already be running; §M57's cpu_home is what that mistake looks
+     * like six months later, and here a wrong answer is a security statement.
+     *
+     * **IDENTITY COMES FROM THE CALLER, DELIBERATELY NOT FROM `ppid`.**  A
+     * detached task (`task_spawn_detached`, the GUI's "Detached Shell") has its
+     * PARENT overridden to init so it survives its launcher — but it is still
+     * the identity of whoever asked for it.  Inheriting from the overridden
+     * ppid instead would mean **a user could turn their own process into a
+     * SYSTEM one by detaching it**, which is precisely the laundering cred.h
+     * forbids, reached through a supported feature rather than a bug.  The two
+     * fields diverge here on purpose. */
+    cred_inherit(&t->cred, cur ? &cur->cred : NULL);
+    t->cred_seq    = 0;
+    t->owner_birth = t->cred.owner;
+    t->uid_birth   = t->cred.uid;
     t->last_yield_ms = timer_ticks_ms();     /* §M46 runaway detector baseline */
     t->esp         = hal_task_init_stack((char*)stack + TASK_KSTACK_SZ, entry);
     t->kstack_base = stack;
@@ -870,6 +887,11 @@ static struct task* spawn_common(const char* name, void (*entry)(void),
     task_enqueue(t);
     task_notify_change();                    /* M22.4 — new task appeared */
     return t;
+}
+
+struct task* task_spawn_arg_console(const char* name, void (*entry)(void),
+                                    void* arg, int ppid, void* console) {
+    return spawn_common(name, entry, ppid, arg, console);
 }
 
 struct task* task_spawn(const char* name, void (*entry)(void)) {
@@ -1766,10 +1788,30 @@ static void wake_blocked_task(struct task* t) {
     wake_waitq_sleeper(t);
 }
 
+/* §M32 stage 7 — MAY THE CALLER SIGNAL THIS TASK?
+ *
+ * One predicate, used by both kill paths.  A SYSTEM or KERNEL caller may
+ * (that is the supervisor, the reaper, the GUI's teardown and every service);
+ * an administrator may; a logged-in user may signal only tasks owned by the
+ * same uid.
+ *
+ * Note what it compares: the TARGET's owner, not its parent or its session.
+ * §M27's init re-parents orphans, so a user's orphaned child has init as its
+ * ppid while still belonging to that user — and a rule written against `ppid`
+ * would hand those tasks to nobody (or to everybody). */
+static int may_signal(const struct task* t) {
+    const struct cred* c = cred_current();
+    if (c->owner != TASK_OWNER_USER) return 1;
+    if (cred_is_admin(c)) return 1;
+    if (t->cred.owner != TASK_OWNER_USER) return 0;   /* a user may not kill a service */
+    return cred_uid(c) == t->cred.uid;
+}
+
 int task_kill(int pid) {
     if (pid == 0) return -1;                 /* pid 0 = kernel/BSP idle */
     struct task* t = task_find(pid);
     if (!t || t->is_idle || t->state == TASK_DEAD) return -1;
+    if (!may_signal(t)) return -2;           /* §M32 — not yours */
     t->kill_pending = 1;
     wake_blocked_task(t);                    /* so it notices now, not at its deadline */
     task_notify_change();                    /* M22.4 — liveness will change */
@@ -1794,6 +1836,11 @@ int task_force_kill(int pid) {
     if (pid == 0) return -1;
     struct task* t = task_find(pid);
     if (!t || t->is_idle || t->state == TASK_DEAD) return -1;
+    /* §M32 — the SAME ownership rule as the cooperative kill.  A force-kill
+     * that skipped it would be a way around the gate reached by typing a
+     * different verb, which is how a boundary comes to have a hole that nobody
+     * put there on purpose. */
+    if (!may_signal(t)) return -2;
     t->kill_pending = 1;
     t->kill_forced  = 1;
     wake_blocked_task(t);                    /* §M49 — see task_kill */
@@ -1949,6 +1996,14 @@ void task_set_reap_owned(struct task* t, int owned) {
 #define KILLTREE_MAX 64
 int task_kill_tree(int pid) {
     if (pid <= 0) return -1;
+    /* §M32 — the ROOT of the subtree decides.  Checking each member instead
+     * would let a user take down a tree by owning one leaf of it, and would
+     * half-kill a tree when the check failed partway: a subtree is killed as
+     * one decision or not at all. */
+    {
+        struct task* root_t = task_find(pid);
+        if (root_t && !may_signal(root_t)) return -2;
+    }
     int ids[KILLTREE_MAX];
     int n = 0;
     ids[n++] = pid;
@@ -2504,7 +2559,7 @@ void schedule_check(void) {
 
 void task_list(void) {
     if (!master_head) { kprintf("ps: no tasks\n"); return; }
-    kprintf("PID  PPID  STATE  CPU  CPUMS  MEMKB  NAME\n");
+    kprintf("PID  PPID  STATE  CPU  CPUMS  MEMKB  USER  NAME\n");
 
     /* §M75 — the sum is printed at the end, and it is not decoration: the
      * invariant that keeps the memory column meaningful is that every frame is
@@ -2526,10 +2581,12 @@ void task_list(void) {
         sum_priv   += priv;
         sum_shared += shared;
 
-        kprintf("%d   %d   %s    %d   %u   %u   %s%s\n",
+        char ob[24];
+        kprintf("%d   %d   %s    %d   %u   %u   %s   %s%s\n",
                 t->pid, t->ppid, state_name(t->state), t->cpu_home,
                 (unsigned)task_cpu_ms_now(t), /* truncates past ~49 days — fine */
                 (unsigned)(priv / 1024u),
+                cred_owner_name(&t->cred, ob, sizeof ob),
                 t->name, running ? " (running)" : "");
         t = t->next;
     } while (t != master_head);
@@ -2639,6 +2696,14 @@ int task_set_nice(int pid, int nice) {
     if (!t) return -1;
     if (nice < TASK_NICE_MIN) nice = TASK_NICE_MIN;
     if (nice > TASK_NICE_MAX) nice = TASK_NICE_MAX;
+
+    /* §M32 — the classic asymmetry, and the reason it is HERE (see task.h):
+     * the SHELL_CMD privilege field gates a verb, while this depends on the
+     * argument's SIGN.  Raising a priority takes CPU from everybody, so it is
+     * an administrator's; lowering your own is a courtesy anyone may extend.
+     * A user must also own the task either way. */
+    if (!may_signal(t)) return -2;
+    if (nice < t->nice && !cred_is_admin(cred_current())) return -2;
 
     /* The task's load contribution changes with its weight, so its
      * runqueue's published total has to be corrected under that queue's

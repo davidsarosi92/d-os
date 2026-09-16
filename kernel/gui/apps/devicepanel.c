@@ -722,4 +722,4 @@ CONFIG_KEY(ck_devices_view) = {
  * a command that reassembled the same facts by a second route cannot pass
  * while the panel shows something else. */
 SHELL_CMD(devices) = { "devices", "[<name>]", "the device manager, on a console",
-                       SHELL_G_DEV, devices_cmd };
+                       SHELL_G_DEV, devices_cmd, SHELL_P_ANY };

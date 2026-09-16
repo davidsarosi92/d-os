@@ -519,11 +519,13 @@ CONFIG_KEY(ck_shell) = {
     .key = "gui.shell", .group = "Appearance", .type = CFG_ENUM,
     .values = "vista bare", .def = "vista",
     .help = "desktop shell (takes effect at the next `gui` start)",
+    .scope = CFG_SCOPE_USER,
 };
 CONFIG_KEY(ck_desktop_view) = {
     .key = "desktop.view", .group = "Appearance", .type = CFG_ENUM,
     .values = "grid list table", .def = "grid",
     .help = "how desktop shortcuts are arranged",
+    .scope = CFG_SCOPE_USER,
 };
 CONFIG_KEY(ck_cp_view) = {
     .key = "controlpanel.view", .group = "Appearance", .type = CFG_ENUM,
@@ -534,6 +536,7 @@ CONFIG_KEY(ck_layout) = {
     .key = "keyboard.layout", .group = "Region and input", .type = CFG_ENUM,
     .values = "us hu", .def = "us",
     .help = "active keyboard layout - applies immediately",
+    .scope = CFG_SCOPE_USER,
 };
 CONFIG_KEY(ck_fault) = {
     .key = "kernel.fault_policy", .group = "System", .type = CFG_ENUM,
@@ -569,6 +572,7 @@ CONFIG_KEY(ck_fmview) = {
     .key = "fileman.view", .group = "Appearance", .type = CFG_ENUM,
     .values = "table list grid", .def = "table",
     .help = "how the file manager shows a directory (applies to a new window)",
+    .scope = CFG_SCOPE_USER,
 };
 CONFIG_KEY(ck_scrollback) = {
     .key = "gui.scrollback", .group = "Appearance", .type = CFG_INT,
@@ -713,4 +717,4 @@ void settings_cmd(const char* args) {
  * deliberately does not, because it must stay able to reach undeclared keys. */
 SHELL_CMD(conf) = { "conf", "[list|show <key>|set <key> <value>|open <panel>]",
                     "declared settings, validated",
-                    SHELL_G_SYS, settings_cmd };
+                    SHELL_G_SYS, settings_cmd, SHELL_P_ANY };

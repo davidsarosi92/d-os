@@ -48,6 +48,7 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "block_cache.h"
 #include "config.h"
 #include "locale.h"
+#include "users.h"
 #include "crash.h"          /* §M63 stage 0 — config_attach_persistent */
 #include "iommu.h"           /* §M33 stage 5 — DMA remapping capability */
 #include "drvrt.h"          /* §M33 stage 2 — deferred driver tasks */
@@ -228,6 +229,13 @@ void aarch64_main_entry(uint64_t dtb) {
      * scheduler task and drop pid 0 into the idle loop; the shell reads from
      * the PL011 and drives the PMM/scheduler/VFS.
      * ----------------------------------------------------------------------- */
+    /* §M32 — the identity model, before anything can ask about one.  This
+     * arch runs its OWN entry path and never calls config_init() either,
+     * which is exactly the shape §M63 paid for: a feature present on one
+     * boot path only, silently.  users_init is also idempotent and is
+     * called lazily from the lookups, so a THIRD entry path inherits a
+     * root account instead of having to remember one. */
+    users_init();
     vfs_init();
     module_init_all();
     kprintf("aarch64: VFS up — ramfs mounted at /\n");
@@ -317,6 +325,13 @@ void aarch64_main_entry(uint64_t dtb) {
              * ARM would keep losing every setting at reboot while x86 kept
              * them — the same shape as the pkg_init duplication below. */
             config_attach_persistent("/mnt");
+            /* §M32 — AND THE ACCOUNTS, by exactly the same rule and on
+             * BOTH boot paths.  `/` is ramfs, so a database written
+             * there is gone at power-off while every write SUCCEEDS —
+             * §M63 stage 0's defect, and on an account database it
+             * means every user the administrator created is missing
+             * after a reboot with nothing to say so. */
+            users_attach_persistent("/mnt");
             /* §M75.1 — and the crash log, on the SAME volume and by the
              * same rule: a sink handed a path it merely hopes is writable
              * swallows every future record in silence (§M63 stage 0,

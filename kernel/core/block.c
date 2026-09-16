@@ -211,4 +211,4 @@ void blk_list(void) {
 /* --- §M70 shell registration ----------------------------------------------- */
 static void bk_lsblk(const char* a) { (void)a; blk_list(); }
 SHELL_CMD(lsblk) = { "lsblk", "", "block devices",
-                     SHELL_G_DEV, bk_lsblk };
+                     SHELL_G_DEV, bk_lsblk, SHELL_P_ANY };

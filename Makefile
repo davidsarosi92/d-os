@@ -646,6 +646,10 @@ CORE_C_SRCS := \
     kernel/core/shell.c \
     kernel/core/shellcmd.c \
     kernel/core/audit.c \
+    kernel/core/cred.c \
+    kernel/core/sha256.c \
+    kernel/core/users.c \
+    kernel/core/login.c \
     kernel/core/cmd_util.c \
     kernel/core/cmd_fs.c \
     kernel/core/cmd_mem.c \
@@ -863,6 +867,10 @@ CORE_C_SRCS := \
     kernel/core/shell.c \
     kernel/core/shellcmd.c \
     kernel/core/audit.c \
+    kernel/core/cred.c \
+    kernel/core/sha256.c \
+    kernel/core/users.c \
+    kernel/core/login.c \
     kernel/core/cmd_util.c \
     kernel/core/cmd_fs.c \
     kernel/core/cmd_mem.c \
@@ -951,6 +959,10 @@ CORE_C_SRCS := \
     kernel/core/shell.c \
     kernel/core/shellcmd.c \
     kernel/core/audit.c \
+    kernel/core/cred.c \
+    kernel/core/sha256.c \
+    kernel/core/users.c \
+    kernel/core/login.c \
     kernel/core/cmd_util.c \
     kernel/core/cmd_fs.c \
     kernel/core/cmd_mem.c \

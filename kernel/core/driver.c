@@ -875,10 +875,10 @@ CRON_JOB("driver-rescan", job_driver_rescan, 2000);
 /* --- §M70 shell registrations --------------------------------------------- */
 static void dv_lsdrv(const char* a) { (void)a; driver_list(); }
 SHELL_CMD(lsdrv) = { "lsdrv", "", "drivers and their state",
-                     SHELL_G_DEV, dv_lsdrv };
+                     SHELL_G_DEV, dv_lsdrv, SHELL_P_ANY };
 SHELL_CMD(drv)   = { "drv", "start|stop|swap|rescan|domain|res|crash <name>",
                      "driver lifecycle and placement",
-                     SHELL_G_DEV, driver_cmd };
+                     SHELL_G_DEV, driver_cmd, SHELL_P_ADMIN };
 
 /* §M71 — `drv leaktest on|off`: the resource audit's falsifier.  Hidden from
  * `help` for the same reason `hardlock` is — reachable for the harness, not
@@ -886,4 +886,4 @@ SHELL_CMD(drv)   = { "drv", "start|stop|swap|rescan|domain|res|crash <name>",
 static void dv_leaktest(const char* a) {
     drv_res_leaktest(!(a[0] == 'o' && a[1] == 'f'));
 }
-SHELL_CMD(leaktest) = { "leaktest", "on|off", 0, SHELL_G_TEST, dv_leaktest };
+SHELL_CMD(leaktest) = { "leaktest", "on|off", 0, SHELL_G_TEST, dv_leaktest, SHELL_P_ADMIN };

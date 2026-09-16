@@ -222,6 +222,6 @@ void serial_shell_entry(void) {
 static void ar_usertest(const char* a) { (void)a; cmd_usertest(); }
 
 SHELL_CMD(usertest) = { "usertest", "", "run a program at EL0 and come back",
-                        SHELL_G_TEST, ar_usertest };
+                        SHELL_G_TEST, ar_usertest, SHELL_P_ADMIN };
 SHELL_CMD(blk)      = { "blk", "[dev]", "virtio-MMIO block device probe",
-                        SHELL_G_DEV, cmd_blk };
+                        SHELL_G_DEV, cmd_blk, SHELL_P_ADMIN };

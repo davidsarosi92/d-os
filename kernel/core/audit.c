@@ -103,8 +103,7 @@ static void cmd_audit(const char* args) {
 SHELL_CMD(audit) = {
     "audit", "[list|-q|<check>]",
     "run the runtime invariant checks",
-    SHELL_G_SYS, cmd_audit
-};
+    SHELL_G_SYS, cmd_audit, SHELL_P_ANY };
 
 /* =============================================================================
  * THE PERIODIC AUDIT — why it is not simply a command somebody types.

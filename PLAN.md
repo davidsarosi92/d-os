@@ -264,7 +264,7 @@ what); a session can pick a theme and push on it.
 | M29 | Services / daemons — SERVICE() registry + supervisor (autostart, restart policy) + service bus (endpoint / contract / transport, location-independent binding) | Architecture | ✅ DOCS §4.21 |
 | M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | ✅ DOCS §4.23 |
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | ✅ DOCS §4.22 (L1+L2; L3 HW deferred) |
-| M32 | Multi-user — credentials, user DB, login, file ownership/perms, per-user isolation.  **Gap audit 2026-09-10:** stages 1-7 cover identity + login + sessions and NOT the account lifecycle, per-user settings, the execute bit's enforcement point, or on-disk ownership.  Two premises in the section have moved (§M25 shipped, so isolation is no longer deferred; §M39 shipped entropy, so only a KDF is missing) | Security | §M32 |
+| M32 | **Multi-user — identity, accounts, permissions** | Security | ◐ **STAGES 1-9 SHIPPED 2026-09-16 (DOCS §4.91, all 3 arches).**  Tagged task ownership (KERNEL/SYSTEM/USER) with one inheritance route and a re-parenting-proof immutability rule; SHA-256/HMAC/PBKDF2 verified against PUBLISHED vectors; the account database with a PROTECTED root and a uid that is never reused; login as a NEW TASK (because ownership is immutable); VFS ownership + the execute bit at the LOADER; 152 commands declaring who may run them; per-operation elevation; per-user settings.  Three §M71 audits, each with a shipped falsifier.  **OPEN: stage 10 (GUI login / lock / switch user), deferred on VERIFIABILITY — §4.74's harness cannot type into a focused GUI window, and this milestone's standard is that every claim is measured.  Also open: simultaneous sessions (one config cache), and on-disk ownership (no filesystem here stores it — `mount` says so)** |
 | M33 | Execution domains — a service's run location as a declared capability + config choice; driver placement is the flagship case | Reliability | ✅ COMPLETE 2026-08-29 (DOCS §4.82): Tier 0/1/2, shared-controller arbitration, IOMMU stage 5, and per-driver DMA domains proven by a driver in ring 3 whose device is refused outside its own buffer.  OPEN, none of it gating the claim: the modern virtio transport (legacy has no feature bit 33 — a virtio-driver item), a REAL DMA driver ported to drvrt, richer state replay |
 | **M46** | **Resilient control plane — SAK hotkeys + force-kill** — Ctrl+Alt+Del = always-live Task Manager, Ctrl+Alt+X = kill last/frozen app, window chrome (close/min/restore) works even when the app is wedged (close ⇒ force-kill), Task Manager force-quit; the enabler is a real force-kill of a wedged ring-3 process | Reliability / UX | ✅ DOCS §4.37 |
 | M58 | Text selection — pointer grab + press/motion/release, selection model (text bytes / terminal cells), word + line selection | UX | §M58 |
@@ -7089,6 +7089,35 @@ of a big window over the icon field still composites at §4.61's measured cost.
 ---
 
 ## Change log
+
+- **2026-09-16** — **§M32 stages 1-9: users, permissions and the four things I
+  got wrong on the way** (DOCS §4.91, all 3 arches).  The identity question is
+  not "which uid" but *"is there a person behind this at all"*, so ownership is
+  a TAGGED value and KERNEL is zero — the three sites that build a task by hand
+  are exactly the ones that must be kernel-owned, and §M49's divide-by-zero is
+  the receipt.  Measured: every task owned, **zero rows say `root`**.
+  **Identity comes from the CALLER and not from `ppid`**, or a user could
+  launder their process into a SYSTEM one by DETACHING it.  The KDF is checked
+  against somebody else's arithmetic because *a self-consistent implementation
+  cannot detect its own error*.  root is protected against everybody including
+  root; a uid is retired forever (alice 1000 deleted → carol 1001).  A session
+  is a NEW TASK because ownership is immutable, so `logout` has somewhere to go
+  back to.  The execute bit is at the LOADER because an open-time check cannot
+  tell "may read" from "may run" — same file, same user: 0755 runs, 0644 does
+  not.  **`mount` now says no filesystem here stores ownership across a
+  reboot**, which is harsher than this plan's exFAT-only framing and belongs on
+  the machine.  **FOUR THINGS THIS MILESTONE GOT WRONG AND CORRECTED INSIDE
+  ITSELF:** a sweep whose CHECKER shared its blind spot (a macro with no
+  semicolon — found by `-Wmissing-field-initializers` pointing at the struct
+  definition, §M70's "a warning about the symptom"); `kill`/`fkill`/`nice`
+  marked ADMIN, which would have put their OWNERSHIP checks behind a gate that
+  already said no; the config verbs marked ADMIN, which made per-user
+  preferences unreachable by the people they exist for (*the question is not
+  "is this dangerous", it is "what does this verb reach"*); and a cleanup placed
+  after a `noreturn` call, which is not a cleanup.  **Stage 10 is deferred on
+  VERIFIABILITY, not difficulty**: §4.74's harness cannot type into a focused
+  GUI window, and a login screen nobody can drive would be the one asserted
+  claim in the milestone about who may do what.
 
 - **2026-09-11 (fifth)** — **§M78: a real ARM device running in ring 3, and a
   gate whose premises had expired** (DOCS §4.90).  §M76's open item — *reachable

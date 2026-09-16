@@ -457,6 +457,11 @@ static struct inode* build_inode(struct exfat_fs* fs,
         ino->ops     = &exfat_file_ops;
         ino->dir_ops = NULL;
     }
+    /* §M32 — exFAT has NO owner and NO mode on disk, so every inode is
+     * synthesised with the defaults at every mount.  That is the whole of what
+     * `fs_type.stores_ownership = 0` means, and `mount` says so out loud: what
+     * this kernel enforces on /mnt is true until the power goes off. */
+    vfs_inode_defaults(ino);
     return ino;
 }
 
@@ -1344,6 +1349,7 @@ static int exfat_mount(struct block_device* dev, struct dentry* mp) {
     rino->ops                  = &exfat_dir_ops;
     rino->dir_ops              = &exfat_inode_ops_dir;
     rino->private              = rei;
+    vfs_inode_defaults(rino);          /* §M32 — synthesised, see above */
     mp->inode                  = rino;
 
     kprintf("exfat: mounted dev=%s clusters=%u bps=%u spc=%u root=%u bitmap=%u (%u bytes)\n",

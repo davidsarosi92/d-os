@@ -469,17 +469,17 @@ static void nc_netstat(const char* args) { (void)args; netcmd_netstat(); }
 static void nc_lsnic  (const char* args) { (void)args; net_list(); }
 
 SHELL_CMD(netstat) = { "netstat", "", "the TCP connection table",
-                       SHELL_G_NET, nc_netstat };
+                       SHELL_G_NET, nc_netstat, SHELL_P_ANY };
 SHELL_CMD(lsnic)   = { "lsnic",   "", "network interfaces",
-                       SHELL_G_NET, nc_lsnic };
+                       SHELL_G_NET, nc_lsnic, SHELL_P_ANY };
 SHELL_CMD(dhcp)    = { "dhcp", "[dev|status]", "ask the network for an address",
-                       SHELL_G_NET, netcmd_dhcp };
+                       SHELL_G_NET, netcmd_dhcp, SHELL_P_ADMIN };
 SHELL_CMD(tcptest) = { "tcptest", "[n]", "echo server + n concurrent clients over lo",
-                       SHELL_G_NET, netcmd_tcptest };
+                       SHELL_G_NET, netcmd_tcptest, SHELL_P_ANY };
 SHELL_CMD(tcploss) = { "tcploss", "[permille] [kb]", "a stream that survives loss",
-                       SHELL_G_NET, netcmd_tcploss };
+                       SHELL_G_NET, netcmd_tcploss, SHELL_P_ANY };
 SHELL_CMD(lo)      = { "lo", "drop <permille>", "the loopback device, and making it lose frames",
-                       SHELL_G_NET, netcmd_lo };
+                       SHELL_G_NET, netcmd_lo, SHELL_P_ADMIN };
 
 /* `ping <ip> [count]` — ARP-resolve then ICMP-echo the target. */
 static void cmd_ping(const char* args) {
@@ -777,16 +777,16 @@ static void cmd_nettest(void) {
 static void nc_nettest(const char* a) { (void)a; cmd_nettest(); }
 
 SHELL_CMD(ping)     = { "ping", "<host>", "ICMP echo",
-                        SHELL_G_NET, cmd_ping };
+                        SHELL_G_NET, cmd_ping, SHELL_P_ANY };
 SHELL_CMD(arp)      = { "arp", "<ip>", "resolve an address on the link",
-                        SHELL_G_NET, cmd_arp };
+                        SHELL_G_NET, cmd_arp, SHELL_P_ANY };
 SHELL_CMD(nslookup) = { "nslookup", "<name>", "resolve a name over DNS",
-                        SHELL_G_NET, cmd_dns };
+                        SHELL_G_NET, cmd_dns, SHELL_P_ANY };
 SHELL_CMD(wget)     = { "wget", "<url>", "fetch a URL",
-                        SHELL_G_NET, cmd_wget };
+                        SHELL_G_NET, cmd_wget, SHELL_P_ANY };
 SHELL_CMD(netsurf)  = { "netsurf", "[url]", "the browser",
-                        SHELL_G_NET, cmd_netsurf };
+                        SHELL_G_NET, cmd_netsurf, SHELL_P_ANY };
 SHELL_CMD(nettest)  = { "nettest", "", "ICMP + DNS + TCP end to end",
-                        SHELL_G_TEST, nc_nettest };
+                        SHELL_G_TEST, nc_nettest, SHELL_P_ANY };
 SHELL_CMD(netstorm) = { "netstorm", "[n]", "n tasks waiting on the network at once",
-                        SHELL_G_TEST, cmd_netstorm };
+                        SHELL_G_TEST, cmd_netstorm, SHELL_P_ADMIN };

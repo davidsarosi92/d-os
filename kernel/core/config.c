@@ -16,6 +16,8 @@
  * ============================================================================= */
 
 #include "config.h"
+#include "settings.h"   /* §M32 — CONFIG_KEY descriptors carry the scope */
+#include "cred.h"       /* §M32 — who may change a machine setting */
 #include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "vfs.h"
 #include "kmalloc.h"
@@ -145,6 +147,27 @@ void config_notify(const char* key, const char* value) {
 
 int config_apply(const char* key, const char* value) {
     if (!key || !value) return -1;
+
+    /* §M32 stage 9 — WHO MAY CHANGE THIS.
+     *
+     * One decision point, because config_apply is what every route ends in:
+     * the `conf` command, the settings panel, a watcher's re-apply and the
+     * overlay loaders.  A rule placed in the panel instead would be a rule the
+     * shell walks past.
+     *
+     * A MACHINE key needs an administrator.  A USER key is anybody's — it only
+     * ever reaches their own store.  A SYSTEM context passes both, which is
+     * what keeps boot, the overlays and every service working. */
+    {
+        const struct cred* c = cred_current();
+        if (c->owner == TASK_OWNER_USER &&
+            config_key_scope(key) == CFG_SCOPE_MACHINE &&
+            !cred_is_admin(c)) {
+            kprintf("config: '%s' is a machine setting and needs an "
+                    "administrator\n", key);
+            return -2;
+        }
+    }
     /* Notify only on a REAL change.  Re-applying the same value happens all
      * the time (a config file overlaid onto identical defaults, a panel
      * re-writing what is already there), and a subsystem told to re-read on
@@ -162,6 +185,13 @@ int config_apply(const char* key, const char* value) {
         klog(KLOG_INFO, "config", "%s = %s (was %s)\n", key, value,
              old ? old : "unset");
         config_notify(key, value);
+        /* A preference changed BY a logged-in user belongs in that user's
+         * store, not in the machine's.  Writing it to the machine store is
+         * exactly the bug this stage exists to remove — it would make one
+         * person's wallpaper everybody's. */
+        if (config_user_active() >= 0 &&
+            config_key_scope(key) == CFG_SCOPE_USER)
+            config_user_save();
     }
     return rc;
 }
@@ -392,10 +422,157 @@ static void cf_config  (const char* a) { (void)a; config_dump(); }
 static void cf_saveconf(const char* a) { (void)a; config_cmd_saveconf(); }
 
 SHELL_CMD(config)   = { "config", "", "every config key currently in effect",
-                        SHELL_G_SYS, cf_config };
+                        SHELL_G_SYS, cf_config, SHELL_P_ADMIN };
 SHELL_CMD(getconf)  = { "getconf", "<key>", "read one config key",
-                        SHELL_G_SYS, config_cmd_getconf };
+                        SHELL_G_SYS, config_cmd_getconf, SHELL_P_ANY };
 SHELL_CMD(setconf)  = { "setconf", "<key> <value>", "set a key (undeclared keys allowed)",
-                        SHELL_G_SYS, config_cmd_setconf };
+                        SHELL_G_SYS, config_cmd_setconf, SHELL_P_ANY };
 SHELL_CMD(saveconf) = { "saveconf", "", "persist the config to disk",
-                        SHELL_G_SYS, cf_saveconf };
+                        SHELL_G_SYS, cf_saveconf, SHELL_P_ADMIN };
+
+/* =============================================================================
+ * §M32 stage 9 — PER-USER SETTINGS.
+ *
+ * The mechanism is §M63 stage 0's, used a second time: defaults, then the
+ * machine store, then the USER store, last writer wins — and `config_apply`'s
+ * watchers fire exactly as they do now, so a live theme or language switch
+ * keeps working with no per-key code.
+ *
+ * WHAT IS DELIBERATELY NOT SOLVED HERE, and it is a real limit rather than an
+ * oversight: the config cache is ONE cache for the machine, so a user's
+ * preferences are applied when their session opens and withdrawn when it
+ * closes.  With one session at a time that is correct.  **With two sessions at
+ * once it is not** — the second login's wallpaper would be on the first user's
+ * screen — and making it correct means a per-session view of the config, which
+ * is the same change as a per-session compositor (§M32 stage 10).  Said here
+ * because a reader who finds this working for one user must not conclude it
+ * works for two.
+ * ============================================================================= */
+
+static char user_path[96];
+static int  user_uid_active = -1;
+
+int config_key_scope(const char* key) {
+    const struct config_key_def* d = config_key_find(key);
+    /* An UNDECLARED key is MACHINE.  `setconf` can still reach keys with no
+     * descriptor, and treating those as personal would make "undescribed" a
+     * way past the rule rather than merely a gap in the documentation. */
+    return d ? d->scope : CFG_SCOPE_MACHINE;
+}
+
+/* Build "<vol>/d-os-user-<uid>.conf". */
+static void user_store_path(int uid, char* out, int cap) {
+    const char* base = config_persist_path();
+    int n = 0;
+    if (!base) { out[0] = 0; return; }
+    /* Reuse the machine store's directory by trimming its leaf. */
+    int last = -1;
+    for (int i = 0; base[i]; i++) if (base[i] == '/') last = i;
+    for (int i = 0; i < last && n < cap - 24; i++) out[n++] = base[i];
+    const char* leaf = "/d-os-user-";
+    for (int i = 0; leaf[i] && n < cap - 12; i++) out[n++] = leaf[i];
+    char num[12]; int m = 0, v = uid < 0 ? 0 : uid;
+    if (v == 0) num[m++] = '0';
+    while (v > 0 && m < 12) { num[m++] = (char)('0' + v % 10); v /= 10; }
+    while (m > 0 && n < cap - 6) out[n++] = num[--m];
+    const char* ext = ".conf";
+    for (int i = 0; ext[i] && n < cap - 1; i++) out[n++] = ext[i];
+    out[n] = 0;
+}
+
+int config_user_attach(int uid) {
+    user_uid_active = uid;
+    user_store_path(uid, user_path, sizeof user_path);
+    if (!user_path[0]) {
+        klog(KLOG_INFO, "config",
+             "uid %d has no writable volume — preferences are this session only\n", uid);
+        return -1;
+    }
+
+    struct file* f = vfs_open(user_path, VFS_RDONLY);
+    if (!f) return 0;                     /* no preferences yet: not an error */
+    static char buf[2048];
+    ssize_t got = vfs_read(f, buf, sizeof buf - 1);
+    vfs_close(f);
+    if (got <= 0) return 0;
+    buf[got] = 0;
+
+    char line[192];
+    int li = 0, applied = 0, refused = 0;
+    for (ssize_t i = 0; i <= got; i++) {
+        char ch = buf[i];
+        if (ch != '\n' && ch != 0) { if (li < (int)sizeof line - 1) line[li++] = ch; continue; }
+        line[li] = 0;
+        li = 0;
+        if (line[0] == '#' || line[0] == 0) { if (ch == 0) break; continue; }
+
+        /* "key = value" */
+        char k[96], v[96];
+        int ki = 0, vi = 0, p = 0;
+        while (line[p] && line[p] != ' ' && line[p] != '=' && ki < 95) k[ki++] = line[p++];
+        k[ki] = 0;
+        while (line[p] == ' ' || line[p] == '=') p++;
+        while (line[p] && vi < 95) v[vi++] = line[p++];
+        v[vi] = 0;
+
+        if (config_key_scope(k) != CFG_SCOPE_USER) {
+            /* IGNORED **WITH A LINE**.  Silently dropping it and silently
+             * honouring it are both worse than saying so: one hides a file
+             * somebody edited expecting it to work, the other is the privilege
+             * escalation this scope exists to prevent. */
+            klog(KLOG_WARN, "config",
+                 "%s: '%s' is a machine setting and was ignored in a user store\n",
+                 user_path, k);
+            refused++;
+            if (ch == 0) break;
+            continue;
+        }
+        config_apply(k, v);
+        applied++;
+        if (ch == 0) break;
+    }
+    kprintf("config: %d preference(s) applied for uid %d%s\n", applied, uid,
+            refused ? ", some machine settings ignored (see dmesg)" : "");
+    return 0;
+}
+
+int config_user_detach(void) {
+    if (user_uid_active < 0) return 0;
+    int uid = user_uid_active;
+    user_uid_active = -1;
+    user_path[0] = 0;
+
+    /* Put every USER-scoped key back to what the MACHINE store says (or to its
+     * compiled-in default when the machine store is silent).  Without this the
+     * last session's wallpaper stays on the screen after the logout — which is
+     * not merely untidy: it leaks one user's preferences to the next person at
+     * the console, and on a shared machine a preference can be a fact about
+     * somebody (their language, their layout). */
+    int n = config_key_count();
+    for (int i = 0; i < n; i++) {
+        const struct config_key_def* d = config_key_at(i);
+        if (!d || d->scope != CFG_SCOPE_USER) continue;
+        config_apply(d->key, d->def ? d->def : "");
+    }
+    kprintf("config: preferences for uid %d withdrawn\n", uid);
+    return 0;
+}
+
+int config_user_save(void) {
+    if (!user_path[0]) return -1;
+    struct file* f = vfs_open(user_path, VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+    if (!f) return -1;
+    const char* hdr = "# d-os per-user preferences — managed by config.c\n";
+    vfs_write(f, hdr, strlen_(hdr));
+    for (struct entry* e = head; e; e = e->next) {
+        if (config_key_scope(e->key) != CFG_SCOPE_USER) continue;
+        vfs_write(f, e->key, strlen_(e->key));
+        vfs_write(f, " = ", 3);
+        vfs_write(f, e->value, strlen_(e->value));
+        vfs_write(f, "\n", 1);
+    }
+    vfs_close(f);
+    return 0;
+}
+
+int config_user_active(void) { return user_uid_active; }
