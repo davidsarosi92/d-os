@@ -91,6 +91,15 @@ struct vc;
  * so a command added without thinking about this fails on the day it is added
  * rather than six months later.
  *
+ * A VERB THAT ADDRESSES BOTH KINDS OF THING MUST NOT BE GATED AS THE HARDER
+ * ONE.  `conf`, `setconf`, `wallpaper`, `theme` and `locale` set MACHINE
+ * settings and PERSONAL preferences through the same word, so marking them
+ * ADMIN would make per-user preferences unreachable by exactly the people they
+ * exist for.  They are SHELL_P_ANY, and `config_apply`'s scope check is the
+ * real gate — the same shape as `kill`, whose scope is ownership rather than
+ * rank.  *This milestone got that wrong four times before writing it down: the
+ * question is not "is this dangerous", it is "what does this verb reach".*
+ *
  * WHAT IT DOES NOT COVER, said plainly: this gates a VERB, not its arguments.
  * `nice` is the standing example — lowering a priority is unprivileged and
  * RAISING it is not — and a per-argument rule like that stays in the command

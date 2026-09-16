@@ -1218,6 +1218,7 @@ CONFIG_KEY(ck_scroll_invert) = {
     .key = "gui.scroll_invert", .group = "Appearance", .type = CFG_BOOL,
     .def = "0",
     .help = "reverse the wheel direction (Mac-style natural scrolling)",
+    .scope = CFG_SCOPE_USER,
 };
 
 

@@ -518,7 +518,51 @@ void users_ensure_homes(void) {
         vfs_mkdir(u->home);                  /* -2 when it already exists */
         vfs_chmod(u->home, 0700);
         vfs_chown(u->home, u->uid, u->gid);
+        users_ensure_pref_store(u->uid);
     }
+}
+
+/* §M32 stage 9 — CREATE THE USER'S PREFERENCE FILE, OWNED BY THEM.
+ *
+ * The store lives in the volume's root beside the machine's, and that root is
+ * root-owned 0755 — so a logged-in user cannot CREATE a file there, and their
+ * first `setconf` saved nothing.  Measured, not reasoned about: two users set
+ * two wallpapers and the second one's was still on screen for the third login.
+ *
+ * The file is therefore made HERE, by the system, while it still can, and
+ * handed to its owner at 0600 — the same trick as the home directory one
+ * function up.  *The alternative was to let the save bypass the permission
+ * check, which is a boundary with a door in it for the code that put the
+ * boundary there.* */
+void users_ensure_pref_store(int uid) {
+    const char* base = config_persist_path();
+    if (!base) return;                       /* no writable volume */
+    char path[96];
+    int n = 0, last = -1;
+    for (int i = 0; base[i]; i++) if (base[i] == '/') last = i;
+    for (int i = 0; i < last && n < (int)sizeof path - 24; i++) path[n++] = base[i];
+    const char* leaf = "/d-os-user-";
+    for (int i = 0; leaf[i]; i++) path[n++] = leaf[i];
+    char num[12]; int m = 0, v = uid < 0 ? 0 : uid;
+    if (v == 0) num[m++] = '0';
+    while (v > 0 && m < 12) { num[m++] = (char)('0' + v % 10); v /= 10; }
+    while (m > 0) path[n++] = num[--m];
+    const char* ext = ".conf";
+    for (int i = 0; ext[i]; i++) path[n++] = ext[i];
+    path[n] = 0;
+
+    struct file* f = vfs_open(path, VFS_RDONLY);
+    if (f) { vfs_close(f); }
+    else {
+        f = vfs_open(path, VFS_WRONLY | VFS_CREATE);
+        if (!f) return;
+        const char* hdr = "# d-os per-user preferences\n";
+        int hl = 0; while (hdr[hl]) hl++;
+        vfs_write(f, hdr, (size_t)hl);
+        vfs_close(f);
+    }
+    vfs_chmod(path, 0600);
+    vfs_chown(path, uid, uid);
 }
 
 int users_attach_persistent(const char* dir) {
@@ -673,6 +717,7 @@ int user_add(const char* name, int make_admin) {
         vfs_chown(u->home, u->uid, u->gid);
     }
 
+    users_ensure_pref_store(u->uid);
     kprintf("users: created '%s' uid %d, home %s%s\n",
             u->name, u->uid, u->home, make_admin ? ", ADMIN" : "");
     if (users_save() != 0)

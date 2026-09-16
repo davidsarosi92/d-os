@@ -283,7 +283,7 @@ SHELL_CMD(pane)      = { "pane", "[split horizontal|vertical]", "terminal panes"
 SHELL_CMD(lslayout)  = { "lslayout", "", "keyboard layouts",
                          SHELL_G_SYS, ds_lslayout, SHELL_P_ANY };
 SHELL_CMD(setlayout) = { "setlayout", "<us|hu|...>", "switch keyboard layout",
-                         SHELL_G_SYS, cmd_setlayout, SHELL_P_ADMIN };
+                         SHELL_G_SYS, cmd_setlayout, SHELL_P_ANY };
 
 SHELL_CMD(termcheck) = { "termcheck", "", "terminal scrollback self-test, in a GUI window",
                          SHELL_G_TEST, ds_termcheck, SHELL_P_ANY };

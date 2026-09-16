@@ -12,6 +12,7 @@
 #include "printf.h"
 #include "vc.h"
 #include "cred.h"   /* §M32 — the privilege gate */
+#include "users.h"  /* §M32 — auth_elevate */
 
 static int streq_(const char* a, const char* b) {
     while (*a && *a == *b) { a++; b++; }
@@ -85,9 +86,16 @@ int shell_cmd_dispatch(const char* line) {
                 "(see `audit command-privilege`)\n", c->name);
         return 1;
     }
-    if (c->priv == SHELL_P_ADMIN && !cred_is_admin(cred_current())) {
-        kprintf("%s: this needs an administrator\n", c->name);
-        return 1;
+    if (c->priv == SHELL_P_ADMIN) {
+        /* §M32 stage 8 — eligibility is not permission.  auth_elevate answers
+         * both questions in one call: a SYSTEM context proceeds, an eligible
+         * administrator re-authenticates, and anybody else is refused with the
+         * reason.  Splitting it into "are you an admin" here and "prove it"
+         * somewhere else would be two rules that can disagree. */
+        if (auth_elevate(c->name) != 0) {
+            kprintf("%s: refused\n", c->name);
+            return 1;
+        }
     }
 
     const char* args = line + n;

@@ -178,6 +178,11 @@ int  users_save(void);
  * the database survives a reboot and `/` does not. */
 void users_ensure_homes(void);
 
+/* Create uid's preference file on the persistent volume, owned by that account
+ * at 0600.  The volume root is root-owned, so a user cannot make it
+ * themselves — see the comment on the implementation. */
+void users_ensure_pref_store(int uid);
+
 /* True while no account can log in.  See the bootstrap note in the header. */
 int  users_needs_setup(void);
 
@@ -231,5 +236,14 @@ int  group_create(const char* name);
 int  group_destroy(const char* name);
 int  group_add_member(const char* gname, const char* uname);
 int  group_del_member(const char* gname, const char* uname);
+
+/* §M32 stage 8 — turn ELIGIBILITY into permission for ONE operation.
+ *
+ * Returns 0 when the caller may proceed and -1 when it may not, having said
+ * why.  A SYSTEM or KERNEL context always proceeds; a logged-in administrator
+ * re-authenticates; anybody else is refused.  `what` names the operation in
+ * the prompt, because "password:" with no subject is a prompt people answer
+ * without knowing what they are authorising. */
+int auth_elevate(const char* what);
 
 #endif /* USERS_H */

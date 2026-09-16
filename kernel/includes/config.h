@@ -142,4 +142,20 @@ void config_dump(void);
 typedef void (*config_iter_fn)(const char* key, const char* value, void* ctx);
 void config_for_each(config_iter_fn fn, void* ctx);
 
+
+/* ---------------------------------------------------------------------------
+ * §M32 stage 9 — per-user preferences.  See the block comment in config.c for
+ * the one thing this does NOT solve (two simultaneous sessions).
+ * ------------------------------------------------------------------------- */
+
+/* Overlay uid's preference store; call at login.  Keys that are not
+ * CFG_SCOPE_USER are ignored WITH a line rather than obeyed. */
+int config_user_attach(int uid);
+/* Withdraw them and restore the machine's values; call at logout. */
+int config_user_detach(void);
+/* Write the USER-scoped keys back to that store. */
+int config_user_save(void);
+/* The uid whose preferences are live, or -1. */
+int config_user_active(void);
+
 #endif

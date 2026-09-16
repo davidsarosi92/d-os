@@ -48,6 +48,7 @@
 #include "printf.h"
 #include "kmalloc.h"
 #include "vfs.h"
+#include "config.h"
 #include <stddef.h>
 
 /* Session ids start at 1: CRED_SESSION_NONE is 0, and a session numbered zero
@@ -88,6 +89,10 @@ static void session_entry(void) {
 
     kprintf("login: session %d opened for '%s' (uid %d) on pid %d\n",
             r->session, r->name, r->uid, me->pid);
+    /* §M32 stage 9 — the account's preferences.  AFTER the identity is
+     * adopted, because config_apply's watchers run as this task and a wallpaper
+     * applied while still SYSTEM would be the console's, not the user's. */
+    config_user_attach(r->uid);
     /* The home directory may not exist on a machine where the account was
      * created without a writable volume — say so rather than silently landing
      * somewhere else. */
@@ -100,6 +105,9 @@ static void session_entry(void) {
 
     const struct shell_provider* sp = shell_provider_active();
     if (sp && sp->entry) sp->entry();
+    /* NOTE: this point is NOT reached on the ordinary exit.  `logout` ends the
+     * session with task_exit_code(), which is `noreturn` — so the withdrawal
+     * lives in do_login, after task_wait.  See the comment there. */
 }
 
 /* Authenticate and open a session.  `name` and `password` may be NULL, in
@@ -161,6 +169,21 @@ static int do_login(const char* name_in, const char* pw_in) {
 
     int code = 0;
     task_wait(t->pid, &code);
+
+    /* §M32 stage 9 — WITHDRAW THE PREFERENCES HERE, and this placement is a
+     * corrected bug rather than a preference.
+     *
+     * The first version put it at the end of the session task, after the
+     * shell's entry returned, with a comment claiming it "covers every exit".
+     * It covered none of the common one: `logout` calls task_exit_code(),
+     * which is `noreturn`, so that line was unreachable — and the measurement
+     * said so plainly, with the second user's wallpaper still on screen for
+     * the third login.  *A cleanup placed after a call that never returns is
+     * not a cleanup.*
+     *
+     * `task_wait` is the point every exit passes through, because the login
+     * task is parked on it whatever kills the session. */
+    config_user_detach();
     console_write("login: session ended\n");
     return 0;
 }
@@ -244,3 +267,77 @@ SHELL_CMD(logout) = { "logout", "", "end this session", SHELL_G_SYS, cmd_logout,
 SHELL_CMD(whoami) = { "whoami", "", "print the current identity", SHELL_G_SYS, cmd_whoami, SHELL_P_ANY };
 SHELL_CMD(id)     = { "id",     "", "print identity, groups and privilege",
                       SHELL_G_SYS, cmd_id, SHELL_P_ANY };
+
+/* =============================================================================
+ * §M32 stage 8 — ELEVATION.
+ *
+ * An administrator is not automatically privileged: they are ELIGIBLE, and the
+ * account says how eligibility becomes permission.  Two modes are declared in
+ * users.h and one is implemented — per-operation, which is the default.
+ *
+ * WHY PER-OPERATION IS THE DEFAULT, in one sentence: it is what protects the
+ * administrator from their own browser.  An "always elevated" session runs
+ * everything it launches with the power to change the machine, and the thing
+ * most likely to be launched is the thing most likely to be attacked.
+ *
+ * NO TIMED WINDOW.  sudo's few-minute grace is state that has to be expired
+ * correctly — per session, across a logout, when the account is demoted — and
+ * every one of those is a way to keep a privilege that should have ended.
+ * There is nothing to get wrong in not having one, and the cost is a password
+ * per operation, which is a human-paced event on a machine whose PBKDF2 was
+ * measured at under half a second.
+ *
+ * A SYSTEM CONTEXT NEVER ELEVATES.  It is the machine; there is nobody to ask
+ * and nothing to ask for.  That is also what keeps every service, the boot
+ * console and the whole test harness working unchanged.
+ * ============================================================================= */
+
+int auth_elevate(const char* what) {
+    const struct cred* c = cred_current();
+
+    /* Not a logged-in user: the kernel, a service, the installer console. */
+    if (c->owner != TASK_OWNER_USER) return 0;
+
+    /* Not eligible at all.  It SAYS SO: an earlier version returned silently
+     * here, and the dispatcher's generic "refused" replaced the specific
+     * "this needs an administrator" that the gate used to print — a message
+     * regression introduced while making the rule single-sourced.  *Moving a
+     * decision into one place must not move its explanation out of the way.* */
+    if (!cred_is_admin(c)) {
+        kprintf("elevate: '%s' is not an administrator\n",
+                cred_owner_name(c, (char[24]){0}, 24));
+        return -1;
+    }
+
+    const struct user_account* u = user_by_uid(cred_uid(c));
+    if (!u) return -1;
+
+    if (u->elevation == USER_ELEV_ALWAYS) {
+        /* DECLARED, STORED, NOT IMPLEMENTED — and it says so every time rather
+         * than silently behaving like the other mode.  A setting that is
+         * accepted and ignored is the failure §M33's honesty gate is named
+         * after; a setting that announces the divergence is merely unfinished. */
+        kprintf("elevate: '%s' is set to always-elevated, which is not "
+                "implemented — re-authenticating instead\n", u->name);
+    }
+
+    char pw[128];
+    kprintf("elevate: %s needs administrator rights\n", what ? what : "this");
+    if (shell_read_secret("password: ", pw, sizeof pw) < 0) {
+        /* No input source — a GUI window with no console behind it, or a
+         * non-interactive caller.  REFUSE.  The alternative is to let an
+         * operation through because nobody could be asked, which is the one
+         * failure mode a confirmation must not have. */
+        console_write("elevate: no way to ask for a password here — refused\n");
+        return -1;
+    }
+
+    int ok = (user_check_password(u->name, pw) == 0);
+    for (int i = 0; i < (int)sizeof pw; i++) pw[i] = 0;
+    if (!ok) {
+        task_msleep(1000);
+        console_write("elevate: incorrect password\n");
+        return -1;
+    }
+    return 0;
+}

@@ -178,6 +178,7 @@ CONFIG_KEY(ck_scroll_lines) = {
     .key = "gui.scroll_lines", .group = "Appearance", .type = CFG_INT,
     .min = 1, .max = 10, .def = "3",
     .help = "rows moved by one wheel notch",
+    .scope = CFG_SCOPE_USER,
 };
 
 int ui_scroll_at(struct gui_window* win, int x, int y, int dz) {

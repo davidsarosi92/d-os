@@ -114,6 +114,7 @@ CONFIG_KEY(ck_language) = {
     .key = "locale.language", .group = "Region and input", .type = CFG_ENUM,
     .values = "en hu", .def = "en",
     .help = "interface language",
+    .scope = CFG_SCOPE_USER,
 };
 CONFIG_WATCH(cw_language) = { .prefix = "locale.language", .changed = locale_watch };
 
@@ -459,4 +460,4 @@ LOCALE_CATALOG(loc_hu) = {
 
 /* --- §M70 shell registration ----------------------------------------------- */
 SHELL_CMD(locale) = { "locale", "[<lang>]", "the string catalogue, and a sample lookup",
-                      SHELL_G_SYS, locale_cmd, SHELL_P_ADMIN };
+                      SHELL_G_SYS, locale_cmd, SHELL_P_ANY };
