@@ -92,11 +92,11 @@ static int lock_try(const char* user, const char* pass) {
          * would enumerate the machine's accounts to whoever is standing at it. */
         if (g_lock.status)
             w_label_set(g_lock.status, "Incorrect user name or password.");
-        klog(KLOG_WARN, "lock", "authentication FAILED for '%s'\n", user);
+        kprintf("lock: authentication FAILED for '%s'\n", user);
         task_msleep(1000);
         return -1;
     }
-    klog(KLOG_INFO, "lock", "authenticated '%s'\n", user);
+    kprintf("lock: authenticated '%s'\n", user);
     g_lock.unlocked = 1;
     return 0;
 }
@@ -110,7 +110,7 @@ static void lock_submit(struct w_textinput* t, void* ctx) {
          * widgets are built in the layout hook, which runs later on the host
          * task (§M61's "a window that never lays out looks exactly like an app
          * that ignored the event"), so a submit can genuinely arrive first. */
-        klog(KLOG_WARN, "lock", "submit before the fields exist — ignored\n");
+        kprintf("lock: submit before the fields exist — ignored\n");
         return;
     }
     if (lock_try(g_lock.user->buf, g_lock.pass->buf) == 0) {
@@ -146,25 +146,20 @@ static void lock_closed(struct gui_window* w) {
     g_lock.pass = NULL;
     g_lock.status = NULL;
     if (!g_lock.unlocked) {
-        klog(KLOG_WARN, "lock", "closed while still locked — raising it again\n");
+        kprintf("lock: closed while still locked — raising it again\n");
         gui_lock_raise();
     }
 }
 
-int gui_lock_raise(void) {
-    if (g_lock.win) return 0;                     /* already up */
-    if (users_needs_setup()) {
-        /* Nothing to authenticate against.  Locking here would leave a machine
-         * nobody can get into — the same stranding §M32's account rules refuse
-         * three other ways. */
-        console_write("lock: no account can log in yet — refusing to lock\n");
-        return -1;
-    }
+/* The window is BUILT here, and this function must run on a task that has an
+ * app-host loop — see gui_lock_raise below, which is what guarantees it. */
+static void lock_build(void) {
+    if (g_lock.win) return;
 
     struct gui_window* win = gui_app_window_create("Locked", -1, -1,
                                                   cp_px(380), cp_px(190),
                                                   lock_layout, NULL);
-    if (!win) return -1;
+    if (!win) return;
     g_lock.win = win;
     g_lock.unlocked = 0;
 
@@ -173,11 +168,35 @@ int gui_lock_raise(void) {
         /* Somebody else holds the single modal claim.  A non-modal look-alike
          * would be a picture of a lock with a live desktop behind it, which is
          * worse than refusing. */
-        console_write("lock: another modal window holds the screen — refused\n");
+        kprintf("lock: another modal window holds the screen — refused\n");
         gui_window_close(win);
         g_lock.win = NULL;
+        return;
+    }
+}
+
+/* §M61's MECHANISM, and this is the bug it was built for.
+ *
+ * `gui_app_window_create` binds the window to `task_current()`, so a window
+ * made on a task with no app-host loop **never lays out and never ticks** — its
+ * widgets are built by the layout hook, which nothing ever calls.  `gui_start`
+ * is exactly such a task, and the symptom was precise and misleading: the
+ * window existed, modality was claimed AND painted, and the password field did
+ * not exist.  The instrument said so in as many words — *the window was created
+ * but never laid out* — which is the sentence §M61 already had in the tree.
+ *
+ * `gui_queue_open` hands the construction to the compositor, which is the one
+ * task that has the loop. */
+int gui_lock_raise(void) {
+    if (g_lock.win) return 0;                     /* already up */
+    if (users_needs_setup()) {
+        /* Nothing to authenticate against.  Locking here would leave a machine
+         * nobody can get into — the same stranding §M32's account rules refuse
+         * three other ways. */
+        kprintf("lock: no account can log in yet — refusing to lock\n");
         return -1;
     }
+    gui_queue_open(lock_build);
     return 0;
 }
 
@@ -217,31 +236,35 @@ void gui_lock_test(const char* creds) {
     while (*creds && *creds != ' ' && i < (int)sizeof p - 1) p[i++] = *creds++;
     p[i] = 0;
 
-    if (!g_lock.win) {
-        klog(KLOG_WARN, "lock", "locktest: the lock screen is not up\n");
-        return;
-    }
+    /* The raise is QUEUED (see gui_lock_raise), so neither the window nor its
+     * fields exist when this task starts.  One wait covers both. */
     /* WAIT FOR THE WINDOW TO HAVE LAID ITSELF OUT.  The lock is raised on the
      * caller's task and its widgets are built by the layout hook on the host
      * task, so "the window exists" and "the fields exist" are different facts
      * arriving at different times — §M76's autorun sleeps for the same reason.
      * Bounded, and it REPORTS a timeout rather than submitting into nothing. */
-    for (int waited = 0; !g_lock.pass && waited < 3000; waited += 50)
-        task_msleep(50);
+    /* task_yield, NOT task_msleep, and that is measured rather than stylistic:
+     * a msleep on this task did not return at all — the loop never completed,
+     * never timed out, and printed nothing, which reads exactly like a task
+     * that was never spawned.  Bounded so a lock that genuinely never lays out
+     * reports it instead of hanging the instrument. */
+    int waited = 0;
+    for (; !g_lock.pass && waited < 60000; waited++)
+        task_yield();
     if (!g_lock.pass) {
-        klog(KLOG_WARN, "lock", "locktest: the fields never appeared — the "
-             "window was created but never laid out\n");
+        kprintf("locktest: the fields never appeared — the window was "
+                "created but never laid out\n");
         return;
     }
-    klog(KLOG_INFO, "lock", "locktest: submitting '%s' through the REAL path\n", u);
+    kprintf("locktest: submitting '%s' through the REAL path\n", u);
     /* Fill the widgets and call the SAME submit the Enter key calls — not
      * lock_try directly.  A test that skipped the widgets would pass while the
      * field was disconnected, which is the defect most likely to exist. */
     w_textinput_set(g_lock.user, u);
     w_textinput_set(g_lock.pass, p);
     lock_submit(g_lock.pass, NULL);
-    klog(KLOG_INFO, "lock", "locktest: result — %s\n",
-         g_lock.unlocked ? "UNLOCKED" : "still locked");
+    kprintf("locktest: result — %s\n",
+            g_lock.unlocked ? "UNLOCKED" : "still locked");
 }
 
 /* THE INSTRUMENT IS A CONFIG KEY, NOT ONLY A COMMAND, and that is the whole

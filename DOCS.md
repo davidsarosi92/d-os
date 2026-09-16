@@ -12911,10 +12911,8 @@ it and a machine that could demonstrate it.*
 
 ### 4.91 §M32 — Users & permissions
 
-**Shipped 2026-09-16, stages 1-9 of 10.  All three architectures build silent;
-every claim below was measured on a running machine.**  Stage 10 (GUI login,
-lock, switch user) is NOT shipped and the reason is in "What is deliberately
-absent" at the end.
+**Shipped 2026-09-17, all ten stages.  All three architectures build silent;
+every claim below was measured on a running machine.**
 
 #### The model, in three orthogonal facts
 
@@ -13190,6 +13188,79 @@ saved nothing.  The file is made by the system at account creation and handed
 over at 0600 — *the alternative was to let the save bypass the permission check,
 which is a boundary with a door in it for the code that built the boundary.*
 
+#### Stage 10 — the lock surface, and the instrument that made it provable
+
+`gui.login` (default OFF) raises a modal authentication window over the
+desktop.  **Modality is §M69's, and it is what makes this a lock rather than a
+window**: `topmost_at` answers "the modal, or nothing", the left-press path
+swallows clicks outside it BEFORE the desktop fallthrough (without which a
+click on the WALLPAPER would still launch shortcuts behind the lock), Alt-Tab
+is refused, and the 45 % backdrop is what makes the other three legible.
+
+**Dismissal is refused by RE-RAISING from `on_close`**, which needs no new
+compositor API: `gui_window_set_key_hook` returns void so a hook cannot consume
+Escape, and suppressing the close box would mean a `title_btn_count` setter for
+one caller.  Coming back says the same thing and covers every route into
+`destroy_window` rather than only the button.
+
+**The password field is SECRET, and that is two separate decisions.**  It draws
+ONE fixed marker rather than a bullet per character — a row of bullets
+publishes the LENGTH, the same reason `shell_read_secret` echoes nothing at
+all.  And **Ctrl+C / Ctrl+X are refused on it**: §M59 makes the system
+clipboard readable by `clip show`, by every other window and by any ring-3
+program that opens `/dev/clipboard`, so *a field that hides its contents on
+screen and hands them to the clipboard hides nothing.*  Paste INTO one is still
+allowed — that moves a secret toward the field rather than away from it.
+
+**MEASURED, THREE OUTCOMES ON THE REAL SUBMIT PATH** (i386, `-smp 4`, driven):
+the two-point probe reports `modal CLAIMED by 'Locked'` AND `modal visible to
+the compositor (z-index 0 of 1)` — claimed on one task and painted on another
+are different facts; then `alice:pw1` gives `lock: authenticated 'alice'` and
+`locktest: result — UNLOCKED`, while `alice:WRONG` and a nonexistent
+`mallory:pw1` both give `authentication FAILED` and `still locked`.
+
+**THE INSTRUMENT HAD TO BE A CONFIG KEY, AND THE FEATURE PROVED IT.**  §4.74
+says this harness cannot type once a GUI window holds focus — and raising the
+lock TAKES the keyboard, which is the feature.  So the shell that would type
+the test is exactly the shell that can no longer be typed into; the first
+version offered only `lock alice:pw1` and could never have worked.
+`gui.locktest` is read by `gui_start` after the lock is up, the §M69
+`gui.wheeltest` shape: *a key that can be set BEFORE the GUI takes over is the
+only kind of switch that can reach a state in which typing is impossible.*
+
+**AND THE ROOT CAUSE WAS ALREADY WRITTEN DOWN IN THIS TREE.**  For four driven
+runs the instrument produced NO OUTPUT AT ALL — not a success, not a failure,
+not the timeout message written for exactly that case, which reads precisely
+like code that never ran.  Three mistakes stacked:
+
+1. *An instrument that blocks the thing it is measuring measures a machine that
+   does not exist* — the wait sat inside `gui_start`, holding up the bring-up
+   that would have produced what it was waiting for.
+2. The reports were moved to `klog` on a misreading of §4.79.  **klog is a RING
+   that `dmesg` reads back; `kprintf` is what reaches the serial line live**, so
+   the change hid the output it was meant to rescue.  §4.79 never applied — the
+   instrument runs on a detached task with no VC bound.
+3. `task_msleep` on that task **did not return at all**, so the bounded wait
+   neither completed nor timed out.  `task_yield` does.
+
+What settled it was the cheapest possible question — one `kprintf` at the top
+of the task — which answered "the task runs" in a single run.  *Two changes at
+once (a new task AND a new output path) is what made a one-run question take
+four.*
+
+The defect underneath was §M61's, quoted almost verbatim by the instrument once
+it could speak: **`the window was created but never laid out`**.
+`gui_app_window_create` binds to `task_current()`, and `gui_start` has no
+app-host loop, so the layout hook that builds the widgets was never called —
+the window existed, modality was claimed AND painted, and the password field
+did not exist.  `gui_queue_open` is the mechanism §M61 built for exactly this,
+and using it is the whole fix.
+
+**Two real defects were found on the way and stand regardless:** `lock_submit`
+returned SILENTLY when the fields were NULL, which made a CORRECT password
+report "still locked" — a passing-looking failure whose cause was three layers
+away; and the raise had to move off the caller's task.
+
 #### Three §M71 audits, each with a shipped falsifier
 
 `task-identity` (owner set at creation and unchanged since; KERNEL is exactly
@@ -13200,16 +13271,13 @@ the real table so it exercises DETECTION rather than reporting.
 
 #### What is deliberately absent
 
-- **STAGE 10 — GUI LOGIN, LOCK AND SWITCH USER — IS NOT BUILT, and the reason
-  is verifiability rather than difficulty.**  §4.74 established that this
-  harness cannot type once a GUI window holds focus, which is precisely where a
-  password field would be.  Every other claim in this chapter was measured on a
-  running machine; a login screen nobody could drive would be the one feature
-  asserted rather than demonstrated, in the milestone whose whole subject is
-  who may do what.  *What it needs first is an instrument* — §M76's
-  `gui.autorun` is the shape — and then the real work the §M32 plan names:
-  **what IS the desktop before anyone has logged in**, which is the same
-  question as the lock screen and as switching users.
+- **THE DESKTOP DOES NOT BELONG TO WHOEVER UNLOCKED IT.**  Stage 10 ships the
+  lock surface (below), and it gates ACCESS to a running desktop; the desktop
+  task, the compositor and the app hosts stay SYSTEM-owned.  Making the desktop
+  a person's means the desktop task, the app hosts and the window list all
+  become per-session — the same restructuring as running two sessions at once.
+  *A lock screen that claimed to be a full multi-user desktop would be the
+  isolation theatre §M33 refuses by name*, so it says what it is.
 - **Simultaneous sessions.**  The config cache is ONE cache, so preferences are
   applied at login and withdrawn at logout.  With one session that is correct;
   with two at once the second login's wallpaper would be on the first user's
