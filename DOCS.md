@@ -12909,6 +12909,318 @@ day it was written; what was missing was a driver that could reach it.
 in the code, and three x86-only mechanisms and one expired premise stood between
 it and a machine that could demonstrate it.*
 
+### 4.91 §M32 — Users & permissions
+
+**Shipped 2026-09-16, stages 1-9 of 10.  All three architectures build silent;
+every claim below was measured on a running machine.**  Stage 10 (GUI login,
+lock, switch user) is NOT shipped and the reason is in "What is deliberately
+absent" at the end.
+
+#### The model, in three orthogonal facts
+
+Nothing here is derived from anything else, and that is the design:
+
+| Fact | Where it lives | Why it is not derived |
+|---|---|---|
+| Is there a person behind this account | `user_account.type` | root is a PERSON *and* a system identity; the two are different questions |
+| May it administer | membership in the admin group | not a second boolean — two ways to say one thing eventually disagree |
+| How it administers | `user_account.elevation` | per account, and orthogonal to the other two |
+
+A **limited user is not a fourth type**: it is a PERSON who is not in the admin
+group.  The refinement the §M32 plan promises (several groups, a capability set)
+grows along the second axis rather than by adding enum values.
+
+**uid ranges are an allocation policy, not a source of privilege.**  Persons are
+allocated from 1000 upward because it is a tidy convention; nothing anywhere
+asks whether a uid is "low".  *A privilege derived from a number range is a
+convention that does not fail when it is violated*, which is the worst kind.
+
+#### The owner tag, and why zero had to mean KERNEL
+
+The question a task list has to answer is not "which uid" but **"is there a
+person behind this at all"**.  This machine runs about forty tasks that belong
+to nobody, and folding them into "root" gives a list where forty rows say the
+same thing and the two that matter are lost among them — *a label that is true
+of everything distinguishes nothing.*
+
+So a task's owner is a tagged value: `TASK_OWNER_KERNEL` (pid 0 and the idle
+tasks — the scheduler's own scaffolding), `TASK_OWNER_SYSTEM` (init, a §M29
+service, the compositor), `TASK_OWNER_USER` (+ uid + session id).
+
+**KERNEL IS ZERO ON PURPOSE.**  `task.c` already records that `struct task` is
+constructed in FOUR places and only one is `spawn_common`; when §M49 added a
+scheduling weight in that one, the other three kept `kcalloc`'s zero and the
+first boot took a divide error.  *Those three sites are exactly the tasks that
+must be kernel-owned*, so the enum is ordered to make the zero they already
+produce the correct answer.  A bare uid field would make zero mean **root**.
+
+**Measured on a freshly booted machine, all three arches: every task has an
+owner and ZERO rows say `root`** — 5 `kernel` and 14 `system` on i386/x86_64 at
+`-smp 4`, 3 and 9 on aarch64 at `-smp 2`.
+
+**THE uid FIELD IS UNREACHABLE EXCEPT THROUGH `cred_uid()`**, because the same
+`kcalloc` zero makes it read 0, which is CRED_UID_ROOT.  The tag saves every
+gate in the tree, but a caller who reached past it and tested `c->uid == 0`
+would conclude the idle tasks are root.  `cred_uid()` answers CRED_UID_NONE for
+anything that is not a USER, whatever the field holds.
+
+#### Inheritance has one route, and re-parenting is not it
+
+A child takes its parent's credentials inside `spawn_common`, under the same
+lock, and no caller assigns them afterwards.  §M57's `cpu_home` is the
+precedent and the warning: documented as a fact, assigned by callers at moments
+when they merely INTENDED a placement, and four sites ended up mutating the
+wrong queue's ring.
+
+**Re-parenting must not launder ownership.**  §M27's init re-parents orphans, so
+killing a user's shell hands its children to init — and if ownership followed
+the parent those children would become SYSTEM tasks.  *That is a privilege
+escalation with no attacker in it: an ordinary kill produces it.*  Ownership is
+captured at spawn and immutable; re-parenting moves `ppid` and nothing else.
+
+**IDENTITY COMES FROM THE CALLER, DELIBERATELY NOT FROM `ppid`.**  A detached
+task (`task_spawn_detached`, the GUI's "Detached Shell") has its parent
+overridden to init.  Inheriting from the overridden ppid would mean **a user
+could turn their own process into a SYSTEM one by detaching it** — the same
+laundering, reached through a supported feature rather than a bug.
+
+**A KERNEL parent does not pass its tag on**: pid 0 spawns init, and init is not
+scaffolding, so inheritance from a KERNEL parent yields SYSTEM.  Stated because
+the alternative reads as a bug in the enum.
+
+#### The hash is checked against somebody else's arithmetic
+
+§M39 shipped entropy; what was missing was a hash, and Mbed TLS is a ring-3
+library while a login check runs in the kernel.  `sha256.c` is SHA-256, HMAC and
+PBKDF2, and the point of the file is the verification:
+
+**A self-consistent implementation cannot detect its own error.**  Ours would
+hash, store, re-hash at login and agree with itself perfectly while producing
+something that is not SHA-256 at all — *and that is a password file anybody can
+forge.*  `kdftest` runs PUBLISHED vectors: FIPS 180-2 (including the
+one-million-'a' case, which is the only one that pushes the length counter past
+what a 32-bit BYTE count would hold), RFC 4231 cases 1 and 2 (case 2's key is
+shorter than the block, which is the half of HMAC an implementation gets wrong),
+and RFC 7914 §11 for PBKDF2.  **PASS on all three arches.**
+
+**The cost was measured, not copied:** 10000 PBKDF2 iterations take 445 ms on
+emulated i386, 563 on x86_64 and 432 on aarch64, and that measurement is what
+chose the default.  `security.kdf_iterations` moves it.
+
+**What it is NOT, said plainly:** PBKDF2 is memory-cheap and barely
+inconveniences a GPU.  scrypt and argon2 exist because of that and neither is
+here.  "We hash passwords" and "our password hashing is hard to attack" are
+different claims.
+
+#### The account database: protected root, and a uid that is never reused
+
+Accounts and groups live in flat files on the persistent volume
+(`d-os-passwd`, `d-os-shadow`), attached after the mount exactly as §M63's
+config store is, with creation as the writability test.  **The hashes are in
+their own file** so stage 5 can give the two different modes: the account list
+is something every owner column needs, while the hashes are the one thing whose
+disclosure IS the compromise.
+
+**root is a PERSON and can log in** — because only root may delete an admin,
+and that decision requires root to be loginable.  It is protected against
+everybody INCLUDING root: it cannot be deleted, renamed, or removed from the
+admin group.  *Protection is a property of the account, not of who is asking.*
+
+**The consequence is a graceful one:** root is needed for exactly one
+irreversible operation, so losing its password leaves admins able to do
+everything else.
+
+**A uid IS NEVER REUSED.**  Files are owned by NUMBER, so `userdel bob` freeing
+1001 and `useradd carol` taking it would give carol every file bob left behind
+with no operation having granted them.  The high-water mark only increases and
+is **part of the database rather than derived** — recomputing it as max(uid)+1
+at load would hand the highest deleted account's uid to the next one created.
+Measured: alice took 1000, was deleted, and carol got **1001**.
+
+**A passwordless account cannot log in** — not "logs in without a password".
+Which makes the bootstrap explicit rather than accidental: while no account has
+a password, `users_needs_setup()` is true and the boot console runs as SYSTEM,
+which `cred_is_admin` answers 1 for.  **That console is the installer**, and it
+closes the moment any account can log in.  Measured: `usermod root noadmin` was
+refused with *"the machine has an administrator; log in as root to do this"*
+once alice had a password.
+
+**At least one admin who can actually log in must remain.**  Deletion, demotion
+and password removal are three roads to the same unadministrable machine, so
+the check lives in one place all three call.
+
+#### A session is a new task, because ownership is immutable
+
+The obvious implementation — authenticate, then re-tag the shell that asked — is
+wrong twice: a shell that can re-tag itself on login can re-tag itself on
+anything, and `logout` would have nothing to go back to, so *"this task belongs
+to alice" would be a statement with an expiry date* that every gate is reading.
+
+`login` spawns a session leader which adopts the identity **at its own entry
+point, before it has run anything** — the one moment `cred_become_user` permits
+(no children yet, nothing done under the old identity) — and waits for it.
+
+**Masked input needed a REGISTRY, not a function.**  There are three line
+readers in this tree (shell.c's VC, aarch64's PL011, rescue_shell.c), so putting
+the password prompt in any one would make `login` work on one shell and be
+silently absent on the others — §M24's rule.  Nothing is echoed at all, not even
+a `*` per character, which would publish the length.
+
+#### Permissions, and the one bit that cannot live in the VFS
+
+Inodes carry owner/group/mode through ONE initialiser every filesystem calls.
+**Mode 0 is a legal value meaning "nobody may do anything", so it must not also
+be what a forgotten initialiser produces** — cred.h's trick (arrange for
+kcalloc's zero to be right) does not work here, because the safe answer would
+brick the machine rather than protect it.  Hence `vfs_inode_defaults` at all six
+construction sites plus `audit inode-ownership`, which names the seventh.
+
+The checks are in `vfs_open` (against the file) and the namespace mutators
+(WRITE against the PARENT, which is why a read-only file in a writable
+directory can still be deleted, exactly as POSIX has it).
+
+**THE EXECUTE BIT HAS EXACTLY ONE POSSIBLE ENFORCEMENT POINT.**  A program is
+opened for READING in order to be run, so an open-time check cannot tell "may
+read this file" from "may run it" — `vfs_open` has already granted read and was
+right to.  It lives in the loader (`proc_execve`) and nowhere else.  The
+INTERPRETER needs only read: ld.so is mapped on behalf of a program that has
+already passed, and demanding x there would mean every `.so` needed one too,
+after which the bit would mean "is a file".
+
+The default for a new file stays 0644, so the three places that install a
+PROGRAM say so.  **Measured with an exact control — the same file, the same
+user, the same command:** `/bin/args` at 0755 runs (child exits status=2,
+argc=2); at 0644, `exec: /bin/args: not executable`.
+
+**A new file belongs to whoever made it.**  Found by driving rather than
+reading: logged in as alice, a write into her OWN home created the file and was
+then refused the write to the thing it had just made, because
+`vfs_inode_defaults` stamps root:root — right for an inode a filesystem
+synthesises, wrong for one a user just created.  *No amount of staring at the
+defaults would have shown it: every path in the test suite runs as SYSTEM,
+which bypasses the check entirely.*
+
+#### What `mount` now says, and why it is harsher than the plan
+
+**No filesystem on this machine stores ownership across a reboot.**
+ramfs/devfs/procfs are volatile; exFAT has no owner field, no mode field and
+nowhere to put them.  A side-car ownership map was the alternative and was
+declined: it is a second source of truth that must be written in the same
+operation as the file or the two drift.
+
+```
+PATH  FS  OWNERSHIP
+/      ramfs   ADVISORY — not stored, lost at power-off
+/mnt   exfat   ADVISORY — not stored, lost at power-off
+```
+
+*That is a fact about the machine, so it belongs ON the machine and not only in
+a design document* — §M33's honesty gate applied to storage.  `fs_type.
+stores_ownership` is a declared capability in the shape §M33 gave driver
+domains, and an ext2 implementation would be the first to answer 1.
+
+#### 152 commands that declare who may run them
+
+The privileged operations here are almost all shell commands, so the gate is a
+FIELD on the registration rather than an `if` at the top of forty bodies.
+**Zero is UNDECLARED and is refused**: had zero meant "anyone", all 152
+pre-existing registrations would have become unprivileged silently, including
+`insmod`, `drv crash` and `hardlock`; had it meant "admin", a thoughtless
+command would fail closed but be indistinguishable from a deliberate one.
+`audit command-privilege` fails on anything undeclared, so the 153rd command
+fails on the day it is added.
+
+**Measured:** audit `ok` on a clean boot; `privtest` clears one declaration and
+the audit reports DETECTED, then clean.  As alice (limited) `insmod` is refused;
+as bob (admin) the same command reaches its own logic — **two users, one
+command, two outcomes.**
+
+**THE SWEEP MISSED A MACRO, AND THE CHECKER SHARED ITS BLIND SPOT.**  39
+commands are generated by one `TEST(...)` macro whose body has no semicolon, so
+the regex that matched `SHELL_CMD(x) = { ... };` never saw it — and the script
+written to find what the sweep had missed used the SAME regex and reported the
+sweep complete.  *An instrument that shares the sweep's blind spot reports the
+sweep as finished.*  What found it was `-Wmissing-field-initializers`, pointing
+at the struct DEFINITION rather than at any offending initialiser: §M70's own
+observation that the only signal is a warning about the symptom.
+
+**FOUR COMMANDS WERE MISCLASSIFIED BY THIS MILESTONE AND CORRECTED IN IT**, and
+the rule is now in shellcmd.h: `kill`, `fkill` and `nice` were marked ADMIN for
+being dangerous, which would have put their OWNERSHIP checks behind a gate that
+already said no — a limited user could not have killed their own task.  And
+`conf`/`setconf`/`wallpaper`/`theme`/`locale` reach BOTH machine settings and
+personal preferences through one word, so ADMIN made per-user preferences
+unreachable by exactly the people they exist for.  ***The question is not "is
+this dangerous", it is "what does this verb reach".***
+
+#### Elevation: eligibility is not permission
+
+An administrator in the default mode re-authenticates per operation, which is
+what protects the administrator from their own browser.  **No timed window**:
+sudo's grace is state that must be expired correctly — per session, across a
+logout, when the account is demoted — and each is a way to keep a privilege that
+should have ended.  `always` is declared, stored, and announces that it is not
+implemented every time it is consulted.
+
+**Measured:** admin prompted and proceeds; wrong password → `elevate: incorrect
+password` then `insmod: refused`; a limited user → `elevate: 'alice' is not an
+administrator`.
+
+#### Settings that belong to a person
+
+*A system where changing the wallpaper changes it for everybody is not a
+multi-user system; it is one desktop with several names for it.*  §M63's overlay
+a second time — defaults, machine, user, last writer wins — **with the scope on
+the KEY, not on the store**, because without that an unprivileged user's file
+could override machine policy and the panel would render both identically.
+ZERO IS MACHINE: an unclassified key stays administrator-only, which
+under-delivers rather than handing policy to anyone with a text editor.
+
+**Measured round trip:** alice sets `solid:FF0000`, logs out (withdrawn, back to
+the machine default), logs back in — `2 preference(s) applied` and the wallpaper
+is red again.  `kernel.fault_policy` from her session is refused with the reason.
+
+**TWO BUGS OF MINE HERE, BOTH FOUND BY MEASURING.**  The withdrawal sat after
+the session shell's entry returned, under a comment claiming it "covers every
+exit" — it covered none of the common one, because `logout` calls
+`task_exit_code()`, which is `noreturn`.  *A cleanup placed after a call that
+never returns is not a cleanup.*  And a user could not CREATE their own
+preference file: the volume root is root-owned 0755, so the first `setconf`
+saved nothing.  The file is made by the system at account creation and handed
+over at 0600 — *the alternative was to let the save bypass the permission check,
+which is a boundary with a door in it for the code that built the boundary.*
+
+#### Three §M71 audits, each with a shipped falsifier
+
+`task-identity` (owner set at creation and unchanged since; KERNEL is exactly
+pid 0 and the idles), `inode-ownership` (every cached inode has a mode that was
+actually set), `command-privilege` (every command declares who may run it).
+Falsifiers: `credtest`, `inodetest`, `privtest` — each corrupts a real row in
+the real table so it exercises DETECTION rather than reporting.
+
+#### What is deliberately absent
+
+- **STAGE 10 — GUI LOGIN, LOCK AND SWITCH USER — IS NOT BUILT, and the reason
+  is verifiability rather than difficulty.**  §4.74 established that this
+  harness cannot type once a GUI window holds focus, which is precisely where a
+  password field would be.  Every other claim in this chapter was measured on a
+  running machine; a login screen nobody could drive would be the one feature
+  asserted rather than demonstrated, in the milestone whose whole subject is
+  who may do what.  *What it needs first is an instrument* — §M76's
+  `gui.autorun` is the shape — and then the real work the §M32 plan names:
+  **what IS the desktop before anyone has logged in**, which is the same
+  question as the lock screen and as switching users.
+- **Simultaneous sessions.**  The config cache is ONE cache, so preferences are
+  applied at login and withdrawn at logout.  With one session that is correct;
+  with two at once the second login's wallpaper would be on the first user's
+  screen.  Making it correct is the same change as a per-session compositor.
+- **No setuid bit**, by decision: `login` and elevation are kernel-mediated, so
+  there is no privilege-transfer mechanism sitting on every writable filesystem.
+- **On-disk ownership**, per the `mount` section above.
+- **`su`** as a separate verb: `login` from an existing session does the same
+  thing, and a second name for one mechanism is a second thing to gate.
+
+
 ## 8. Change log
 
 - **2026-09-08 — §M71: RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND

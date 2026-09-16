@@ -17,7 +17,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE "M76"
+#define DOS_MILESTONE "M79"
 
 /* An OLDER section completed after that number shipped.  Empty ("") when there
  * is nothing to say — and it must be CLEARED when the next numbered milestone
@@ -26,7 +26,7 @@
 /* CLEARED, per this header's own rule: the note names an OLDER section
  * finished after the number shipped, and once a newer number exists the number
  * itself is the newer news.  §M33 completed before §M69 did. */
-#define DOS_MILESTONE_NOTE ""
+#define DOS_MILESTONE_NOTE " (M32 1-9)"
 
 /* Short architecture tag for the on-screen label.  Deliberately the FAMILIAR
  * short form ("x32"/"x64") rather than the toolchain triple — the wallpaper
