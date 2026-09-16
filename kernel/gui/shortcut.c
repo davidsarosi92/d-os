@@ -649,4 +649,4 @@ void shortcut_cmd(const char* args) {
 /* --- §M70 shell registration ----------------------------------------------- */
 SHELL_CMD(shortcut) = { "shortcut", "[list|add <name> <target> [icon]|rm <name>|move|check]",
                         "desktop shortcuts",
-                        SHELL_G_GUI, shortcut_cmd };
+                        SHELL_G_GUI, shortcut_cmd, SHELL_P_ADMIN };

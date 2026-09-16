@@ -231,15 +231,15 @@ static void cmd_rm(const char* args) {
  * is a property of the command. */
 static void fs_ls(const char* a) { cmd_ls(a[0] ? a : "/"); }
 
-SHELL_CMD(ls)    = { "ls",    "[path]",            "list a directory",        SHELL_G_FS, fs_ls };
-SHELL_CMD(cat)   = { "cat",   "<path>",            "print a file",            SHELL_G_FS, cmd_cat };
-SHELL_CMD(mkdir) = { "mkdir", "<path>",            "create a directory",      SHELL_G_FS, cmd_mkdir };
-SHELL_CMD(touch) = { "touch", "<path>",            "create an empty file",    SHELL_G_FS, cmd_touch };
-SHELL_CMD(write) = { "write", "<path> <text>",     "write text to a file",    SHELL_G_FS, cmd_write };
-SHELL_CMD(mount) = { "mount", "<fs> <path> [dev]", "mount a filesystem",      SHELL_G_FS, cmd_mount };
-SHELL_CMD(cp)    = { "cp",    "<src> <dst>",       "copy a file",             SHELL_G_FS, cmd_cp };
-SHELL_CMD(rm)    = { "rm",    "[-r] <path>",       "remove a file or a tree", SHELL_G_FS, cmd_rm };
-SHELL_CMD(mv)    = { "mv",    "<src> <dst>",       "rename a file",           SHELL_G_FS, cmd_mv };
+SHELL_CMD(ls)    = { "ls",    "[path]",            "list a directory",        SHELL_G_FS, fs_ls, SHELL_P_ANY };
+SHELL_CMD(cat)   = { "cat",   "<path>",            "print a file",            SHELL_G_FS, cmd_cat, SHELL_P_ANY };
+SHELL_CMD(mkdir) = { "mkdir", "<path>",            "create a directory",      SHELL_G_FS, cmd_mkdir, SHELL_P_ANY };
+SHELL_CMD(touch) = { "touch", "<path>",            "create an empty file",    SHELL_G_FS, cmd_touch, SHELL_P_ANY };
+SHELL_CMD(write) = { "write", "<path> <text>",     "write text to a file",    SHELL_G_FS, cmd_write, SHELL_P_ANY };
+SHELL_CMD(mount) = { "mount", "<fs> <path> [dev]", "mount a filesystem",      SHELL_G_FS, cmd_mount, SHELL_P_ADMIN };
+SHELL_CMD(cp)    = { "cp",    "<src> <dst>",       "copy a file",             SHELL_G_FS, cmd_cp, SHELL_P_ANY };
+SHELL_CMD(rm)    = { "rm",    "[-r] <path>",       "remove a file or a tree", SHELL_G_FS, cmd_rm, SHELL_P_ANY };
+SHELL_CMD(mv)    = { "mv",    "<src> <dst>",       "rename a file",           SHELL_G_FS, cmd_mv, SHELL_P_ANY };
 
 /* ---------------------------------------------------------------------------
  * §M75 — `blkstat`: the I/O counters, and the only way to check them headlessly.
@@ -262,7 +262,7 @@ static void cmd_blkstat(const char* a) {
 }
 
 SHELL_CMD(blkstat) = { "blkstat", "", "block-layer I/O counters since boot",
-                       SHELL_G_FS, cmd_blkstat };
+                       SHELL_G_FS, cmd_blkstat, SHELL_P_ANY };
 
 /* ---------------------------------------------------------------------------
  * §M32 stage 5 — chmod / chown.
@@ -317,6 +317,6 @@ static void cmd_chown(const char* args) {
 }
 
 SHELL_CMD(chmod) = { "chmod", "<path> <octal-mode>", "change a file's permission bits",
-                     SHELL_G_FS, cmd_chmod };
+                     SHELL_G_FS, cmd_chmod, SHELL_P_ANY };
 SHELL_CMD(chown) = { "chown", "<path> <user>", "change a file's owner (admin only)",
-                     SHELL_G_FS, cmd_chown };
+                     SHELL_G_FS, cmd_chown, SHELL_P_ADMIN };

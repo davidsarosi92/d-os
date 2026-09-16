@@ -224,4 +224,4 @@ EXPORT_SYMBOL(__lshrdi3);
 
 /* --- §M70 shell registration ----------------------------------------------- */
 SHELL_CMD(ksyms) = { "ksyms", "[filter]", "symbols a module may call",
-                     SHELL_G_DEV, ksym_list };
+                     SHELL_G_DEV, ksym_list, SHELL_P_ANY };

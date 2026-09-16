@@ -346,4 +346,4 @@ void watchdog_init(void) {
  * going down IS the pass.  Reachable for the test harness, not advertised to
  * somebody reading the command list. */
 static void wd_hardlock(const char* a) { (void)a; watchdog_hardlock_test(); }
-SHELL_CMD(hardlock) = { "hardlock", "", 0, SHELL_G_TEST, wd_hardlock };
+SHELL_CMD(hardlock) = { "hardlock", "", 0, SHELL_G_TEST, wd_hardlock, SHELL_P_ADMIN };

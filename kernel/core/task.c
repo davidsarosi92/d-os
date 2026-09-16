@@ -1788,10 +1788,30 @@ static void wake_blocked_task(struct task* t) {
     wake_waitq_sleeper(t);
 }
 
+/* §M32 stage 7 — MAY THE CALLER SIGNAL THIS TASK?
+ *
+ * One predicate, used by both kill paths.  A SYSTEM or KERNEL caller may
+ * (that is the supervisor, the reaper, the GUI's teardown and every service);
+ * an administrator may; a logged-in user may signal only tasks owned by the
+ * same uid.
+ *
+ * Note what it compares: the TARGET's owner, not its parent or its session.
+ * §M27's init re-parents orphans, so a user's orphaned child has init as its
+ * ppid while still belonging to that user — and a rule written against `ppid`
+ * would hand those tasks to nobody (or to everybody). */
+static int may_signal(const struct task* t) {
+    const struct cred* c = cred_current();
+    if (c->owner != TASK_OWNER_USER) return 1;
+    if (cred_is_admin(c)) return 1;
+    if (t->cred.owner != TASK_OWNER_USER) return 0;   /* a user may not kill a service */
+    return cred_uid(c) == t->cred.uid;
+}
+
 int task_kill(int pid) {
     if (pid == 0) return -1;                 /* pid 0 = kernel/BSP idle */
     struct task* t = task_find(pid);
     if (!t || t->is_idle || t->state == TASK_DEAD) return -1;
+    if (!may_signal(t)) return -2;           /* §M32 — not yours */
     t->kill_pending = 1;
     wake_blocked_task(t);                    /* so it notices now, not at its deadline */
     task_notify_change();                    /* M22.4 — liveness will change */
@@ -1816,6 +1836,11 @@ int task_force_kill(int pid) {
     if (pid == 0) return -1;
     struct task* t = task_find(pid);
     if (!t || t->is_idle || t->state == TASK_DEAD) return -1;
+    /* §M32 — the SAME ownership rule as the cooperative kill.  A force-kill
+     * that skipped it would be a way around the gate reached by typing a
+     * different verb, which is how a boundary comes to have a hole that nobody
+     * put there on purpose. */
+    if (!may_signal(t)) return -2;
     t->kill_pending = 1;
     t->kill_forced  = 1;
     wake_blocked_task(t);                    /* §M49 — see task_kill */
@@ -1971,6 +1996,14 @@ void task_set_reap_owned(struct task* t, int owned) {
 #define KILLTREE_MAX 64
 int task_kill_tree(int pid) {
     if (pid <= 0) return -1;
+    /* §M32 — the ROOT of the subtree decides.  Checking each member instead
+     * would let a user take down a tree by owning one leaf of it, and would
+     * half-kill a tree when the check failed partway: a subtree is killed as
+     * one decision or not at all. */
+    {
+        struct task* root_t = task_find(pid);
+        if (root_t && !may_signal(root_t)) return -2;
+    }
     int ids[KILLTREE_MAX];
     int n = 0;
     ids[n++] = pid;
@@ -2663,6 +2696,14 @@ int task_set_nice(int pid, int nice) {
     if (!t) return -1;
     if (nice < TASK_NICE_MIN) nice = TASK_NICE_MIN;
     if (nice > TASK_NICE_MAX) nice = TASK_NICE_MAX;
+
+    /* §M32 — the classic asymmetry, and the reason it is HERE (see task.h):
+     * the SHELL_CMD privilege field gates a verb, while this depends on the
+     * argument's SIGN.  Raising a priority takes CPU from everybody, so it is
+     * an administrator's; lowering your own is a courtesy anyone may extend.
+     * A user must also own the task either way. */
+    if (!may_signal(t)) return -2;
+    if (nice < t->nice && !cred_is_admin(cred_current())) return -2;
 
     /* The task's load contribution changes with its weight, so its
      * runqueue's published total has to be corrected under that queue's

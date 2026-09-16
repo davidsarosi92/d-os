@@ -394,6 +394,14 @@ static void bin_install_one(const char* path, const unsigned char* s,
     if (!f) return;
     vfs_write(f, s, (size_t)(e - s));
     vfs_close(f);
+    /* §M32 stage 6 — THIS IS A PROGRAM, so it carries the execute bit.
+     *
+     * The default for a new file is 0644, deliberately: if everything were
+     * created executable the bit would mean "is a file" and the loader's check
+     * would be theatre.  So the places that install a PROGRAM say so, and
+     * there are exactly three — here, the package store, and a user's own
+     * chmod. */
+    vfs_chmod(path, 0755);
 }
 
 void bin_install(void) {

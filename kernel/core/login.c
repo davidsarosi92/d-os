@@ -239,8 +239,8 @@ static void cmd_logout(const char* args) {
 }
 
 SHELL_CMD(login)  = { "login",  "[name] [password]",
-                      "authenticate and open a session", SHELL_G_SYS, cmd_login };
-SHELL_CMD(logout) = { "logout", "", "end this session", SHELL_G_SYS, cmd_logout };
-SHELL_CMD(whoami) = { "whoami", "", "print the current identity", SHELL_G_SYS, cmd_whoami };
+                      "authenticate and open a session", SHELL_G_SYS, cmd_login, SHELL_P_ANY };
+SHELL_CMD(logout) = { "logout", "", "end this session", SHELL_G_SYS, cmd_logout, SHELL_P_ANY };
+SHELL_CMD(whoami) = { "whoami", "", "print the current identity", SHELL_G_SYS, cmd_whoami, SHELL_P_ANY };
 SHELL_CMD(id)     = { "id",     "", "print identity, groups and privilege",
-                      SHELL_G_SYS, cmd_id };
+                      SHELL_G_SYS, cmd_id, SHELL_P_ANY };

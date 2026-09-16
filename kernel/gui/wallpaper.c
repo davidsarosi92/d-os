@@ -737,4 +737,4 @@ int wallpaper_write_test_bmp(const char* path, int w, int h) {
  * serial REPL would run the same one; this is the other half of that. */
 SHELL_CMD(wallpaper) = { "wallpaper", "[gradient|solid:RRGGBB|<path.bmp>|fit <mode>|check]",
                          "the desktop background",
-                         SHELL_G_GUI, wallpaper_cmd };
+                         SHELL_G_GUI, wallpaper_cmd, SHELL_P_ADMIN };

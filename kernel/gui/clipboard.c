@@ -345,4 +345,4 @@ void clipboard_cmd(const char* args) {
 /* --- §M70 shell registration ----------------------------------------------- */
 SHELL_CMD(clip) = { "clip", "[show|paste [primary]|copy <text>|promote|type <t>]",
                     "the clipboard and the primary selection",
-                    SHELL_G_GUI, clipboard_cmd };
+                    SHELL_G_GUI, clipboard_cmd, SHELL_P_ANY };

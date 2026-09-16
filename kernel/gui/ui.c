@@ -1064,4 +1064,4 @@ void ui_dump(struct gui_window* win) {
 
 /* --- §M70 shell registration ----------------------------------------------- */
 SHELL_CMD(ui) = { "ui", "[dump|classes]", "the widget-class registry and layout dumps",
-                  SHELL_G_GUI, ui_cmd };
+                  SHELL_G_GUI, ui_cmd, SHELL_P_ANY };

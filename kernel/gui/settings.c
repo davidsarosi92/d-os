@@ -713,4 +713,4 @@ void settings_cmd(const char* args) {
  * deliberately does not, because it must stay able to reach undeclared keys. */
 SHELL_CMD(conf) = { "conf", "[list|show <key>|set <key> <value>|open <panel>]",
                     "declared settings, validated",
-                    SHELL_G_SYS, settings_cmd };
+                    SHELL_G_SYS, settings_cmd, SHELL_P_ADMIN };

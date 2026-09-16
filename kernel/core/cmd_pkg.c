@@ -175,12 +175,12 @@ static void pk_tcc(const char* a) {
 }
 
 SHELL_CMD(pkg)     = { "pkg", "[list|install <name>|gc|profile]", "the package store",
-                       SHELL_G_PKG, cmd_pkg };
+                       SHELL_G_PKG, cmd_pkg, SHELL_P_ADMIN };
 SHELL_CMD(pkgrun)  = { "pkgrun", "<name> [args]", "run a program from the store",
-                       SHELL_G_PKG, cmd_pkgrun };
+                       SHELL_G_PKG, cmd_pkgrun, SHELL_P_ANY };
 SHELL_CMD(exec)    = { "exec", "<path>", "run an ELF from the filesystem",
-                       SHELL_G_PKG, cmd_exec };
+                       SHELL_G_PKG, cmd_exec, SHELL_P_ADMIN };
 SHELL_CMD(tcc)     = { "tcc", "<src.c> -o <out> [args]", "compile C on the machine itself",
-                       SHELL_G_PKG, pk_tcc };
+                       SHELL_G_PKG, pk_tcc, SHELL_P_ADMIN };
 SHELL_CMD(pkgtest) = { "pkgtest", "", "store round trip: install, run, GC",
-                       SHELL_G_TEST, pk_pkgtest };
+                       SHELL_G_TEST, pk_pkgtest, SHELL_P_ADMIN };

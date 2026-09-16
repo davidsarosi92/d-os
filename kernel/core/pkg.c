@@ -311,6 +311,12 @@ int pkg_build(const char* id) {
         p = sappend(binp, sizeof binp, p, "/");
         sappend(binp, sizeof binp, p, r->name);
         write_file(binp, r->content, r->content_len);
+        /* §M32 stage 6 — a store artifact under bin/ IS the program the recipe
+         * names, so it is the second of the three places that mark one.  The
+         * lib/ branch above deliberately does not: a shared object is mapped
+         * on behalf of a program that already passed the check, and marking it
+         * would make the bit mean "is a file". */
+        vfs_chmod(binp, 0755);
     }
 
     /* .recipe (text). */

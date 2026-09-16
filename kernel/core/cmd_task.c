@@ -406,8 +406,10 @@ static void cmd_kill(const char* args) {
         console_write("kill: refusing to kill the calling shell\n");
         return;
     }
-    if (task_kill(pid) == 0) kprintf("kill: pid %d flagged (dies at next yield)\n", pid);
-    else                     kprintf("kill: pid %d not found or protected\n", pid);
+    int r = task_kill(pid);
+    if (r == 0)       kprintf("kill: pid %d flagged (dies at next yield)\n", pid);
+    else if (r == -2) kprintf("kill: pid %d belongs to somebody else\n", pid);
+    else              kprintf("kill: pid %d not found or protected\n", pid);
 }
 
 /* §M46 — force-kill: reclaims a WEDGED ring-3 task (one spinning in userland
@@ -422,7 +424,9 @@ static void cmd_fkill(const char* args) {
         console_write("fkill: refusing to kill the calling shell\n");
         return;
     }
-    if (task_force_kill(pid) == 0) kprintf("fkill: pid %d force-killed\n", pid);
+    int fr = task_force_kill(pid);
+    if (fr == -2) { kprintf("fkill: pid %d belongs to somebody else\n", pid); return; }
+    if (fr == 0) kprintf("fkill: pid %d force-killed\n", pid);
     else                          kprintf("fkill: pid %d not found or protected\n", pid);
 }
 
@@ -725,7 +729,15 @@ static void cmd_nice(const char* args) {
     for (; *args >= '0' && *args <= '9'; args++) { val = val * 10 + (*args - '0'); hasval = 1; }
     if (!hasval) { console_write("nice: missing value (-20..19)\n"); return; }
     if (neg) val = -val;
-    if (task_set_nice(pid, val) != 0) { kprintf("nice: no task with pid %u\n", pid); return; }
+    /* §M32 — a refusal and a missing task are DIFFERENT answers.  This line
+     * used to print "no task with pid" for every non-zero return, which was
+     * harmless while the only failure was a bad pid and becomes a lie the
+     * moment a permission check can fail: the user goes looking for the wrong
+     * problem, which is the failure mode this milestone keeps closing. */
+    int nr = task_set_nice(pid, val);
+    if (nr == -1) { kprintf("nice: no task with pid %u\n", pid); return; }
+    if (nr == -2) { console_write("nice: refused — raising a priority needs an "
+                                  "administrator, and the task must be yours\n"); return; }
     struct task* t = task_find(pid);
     kprintf("nice: pid %d nice=%d weight=%u (%u%% of a default task's share)\n",
             pid, t ? t->nice : val, t ? t->weight : 0, t ? t->weight : 0);
@@ -781,41 +793,54 @@ static void tk_wedge    (const char* a) { (void)a; cmd_wedge();  }
 static void tk_lscpu    (const char* a) { (void)a; cmd_lscpu();  }
 
 SHELL_CMD(ps)         = { "ps", "", "running tasks, as a process tree",
-                          SHELL_G_TASK, tk_ps };
+                          SHELL_G_TASK, tk_ps, SHELL_P_ANY };
 SHELL_CMD(yield)      = { "yield", "", "give up the rest of this quantum",
-                          SHELL_G_TASK, tk_yield };
+                          SHELL_G_TASK, tk_yield, SHELL_P_ANY };
+/* §M32 — kill and fkill are SHELL_P_ANY, and that is a CORRECTION of this
+ * milestone's own first sweep, which marked them ADMIN for being dangerous.
+ *
+ * Their scope is not a rank, it is OWNERSHIP: `task_kill` refuses a task that
+ * belongs to somebody else (may_signal in task.c), so a limited user may end
+ * their own work and nobody else's.  Marking the verb ADMIN would have made
+ * that check unreachable for exactly the people it was written for — a rule
+ * derived from "is this dangerous" instead of "whose is it". */
 SHELL_CMD(kill)       = { "kill", "<pid>", "ask a task to exit",
-                          SHELL_G_TASK, cmd_kill };
+                          SHELL_G_TASK, cmd_kill, SHELL_P_ANY };
 SHELL_CMD(fkill)      = { "fkill", "<pid>", "force-kill a wedged ring-3 task",
-                          SHELL_G_TASK, cmd_fkill };
+                          SHELL_G_TASK, cmd_fkill, SHELL_P_ANY };
+/* §M32 — ANY, for the same reason as `kill`, and it is the third correction of
+ * the same misjudgement: this verb's scope is the ARGUMENT's sign and the
+ * task's owner, both of which task_set_nice checks.  Marking it ADMIN would
+ * put the asymmetric rule (lowering is anybody's, raising is not) behind a
+ * gate that already answered no. */
 SHELL_CMD(nice)       = { "nice", "<pid> <-20..19>", "scheduling priority",
-                          SHELL_G_TASK, cmd_nice };
+                          SHELL_G_TASK, cmd_nice, SHELL_P_ANY };
 SHELL_CMD(taskset)    = { "taskset", "<pid> <hexmask>", "pin a task to a CPU set",
-                          SHELL_G_TASK, cmd_taskset };
+                          SHELL_G_TASK, cmd_taskset, SHELL_P_ADMIN };
 SHELL_CMD(sched)      = { "sched", "[ms]", "how work is spread over the CPUs",
-                          SHELL_G_TASK, cmd_sched };
+                          SHELL_G_TASK, cmd_sched, SHELL_P_ANY };
 SHELL_CMD(lscpu)      = { "lscpu", "", "CPUs, topology and NUMA nodes",
-                          SHELL_G_TASK, tk_lscpu };
+                          SHELL_G_TASK, tk_lscpu, SHELL_P_ANY };
 SHELL_CMD(spawn)      = { "spawn", "", "spawn a ticker task",
-                          SHELL_G_TASK, tk_spawn };
+                          SHELL_G_TASK, tk_spawn, SHELL_P_ADMIN };
 SHELL_CMD(loop)       = { "loop", "[n]", "spawn n CPU hogs",
-                          SHELL_G_TASK, cmd_loop };
+                          SHELL_G_TASK, cmd_loop, SHELL_P_ADMIN };
 SHELL_CMD(loopstop)   = { "loopstop", "", "stop the hogs `loop` started",
-                          SHELL_G_TASK, tk_loopstop };
+                          SHELL_G_TASK, tk_loopstop, SHELL_P_ADMIN };
 
 /* Deliberately NOT hidden: these are the falsifiers, and a test nobody can
  * find is a test nobody runs. */
 SHELL_CMD(killstorm)  = { "killstorm", "[rounds] [tasks]",
                           "kill blocked tasks under SMP, repeatedly",
-                          SHELL_G_TEST, cmd_killstorm };
+                          SHELL_G_TEST, cmd_killstorm, SHELL_P_ADMIN };
 SHELL_CMD(rqcheck)    = { "rqcheck", "", "check the runqueue invariant now",
-                          SHELL_G_TEST, cmd_rqcheck };
+                          SHELL_G_TEST, cmd_rqcheck, SHELL_P_ANY };
 SHELL_CMD(schedstorm) = { "schedstorm", "[rounds]", "affinity + nice churn, audited",
-                          SHELL_G_TEST, cmd_schedstorm };
+                          SHELL_G_TEST, cmd_schedstorm, SHELL_P_ADMIN };
 SHELL_CMD(wqtest)     = { "wqtest", "[n]", "deferred-work pool over every CPU",
-                          SHELL_G_TEST, cmd_wqtest };
+                          SHELL_G_TEST, cmd_wqtest, SHELL_P_ANY };
 
 /* `wedge` runs away in ring 3 on purpose so `fkill` has something to kill.
  * Not hidden — the point of it is to be reachable. */
 SHELL_CMD(wedge)      = { "wedge", "", "start a runaway ring-3 task",
-                          SHELL_G_TEST, tk_wedge };
+                          SHELL_G_TEST, tk_wedge, SHELL_P_ADMIN };

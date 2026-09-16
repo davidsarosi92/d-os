@@ -369,4 +369,4 @@ static void cmd_credtest(const char* args) {
 
 SHELL_CMD(credtest) = { "credtest", "",
                         NULL,              /* hidden, like hardlock */
-                        SHELL_G_TEST, cmd_credtest };
+                        SHELL_G_TEST, cmd_credtest, SHELL_P_ADMIN };

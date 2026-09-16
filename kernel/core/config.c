@@ -392,10 +392,10 @@ static void cf_config  (const char* a) { (void)a; config_dump(); }
 static void cf_saveconf(const char* a) { (void)a; config_cmd_saveconf(); }
 
 SHELL_CMD(config)   = { "config", "", "every config key currently in effect",
-                        SHELL_G_SYS, cf_config };
+                        SHELL_G_SYS, cf_config, SHELL_P_ADMIN };
 SHELL_CMD(getconf)  = { "getconf", "<key>", "read one config key",
-                        SHELL_G_SYS, config_cmd_getconf };
+                        SHELL_G_SYS, config_cmd_getconf, SHELL_P_ANY };
 SHELL_CMD(setconf)  = { "setconf", "<key> <value>", "set a key (undeclared keys allowed)",
-                        SHELL_G_SYS, config_cmd_setconf };
+                        SHELL_G_SYS, config_cmd_setconf, SHELL_P_ADMIN };
 SHELL_CMD(saveconf) = { "saveconf", "", "persist the config to disk",
-                        SHELL_G_SYS, cf_saveconf };
+                        SHELL_G_SYS, cf_saveconf, SHELL_P_ADMIN };

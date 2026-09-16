@@ -830,46 +830,46 @@ static void sy_reboot(const char* a) {
 }
 
 SHELL_CMD(about)    = { "about",   "",          "what this machine is running",
-                        SHELL_G_SYS, sy_about };
+                        SHELL_G_SYS, sy_about, SHELL_P_ANY };
 SHELL_CMD(uptime)   = { "uptime",  "",          "how long it has been up",
-                        SHELL_G_SYS, sy_uptime };
+                        SHELL_G_SYS, sy_uptime, SHELL_P_ANY };
 SHELL_CMD(clear)    = { "clear",   "",          "clear this terminal",
-                        SHELL_G_SYS, sy_clear };
+                        SHELL_G_SYS, sy_clear, SHELL_P_ANY };
 SHELL_CMD(echo)     = { "echo",    "<text>",    "print its arguments",
-                        SHELL_G_SYS, sy_echo };
+                        SHELL_G_SYS, sy_echo, SHELL_P_ANY };
 SHELL_CMD(dmesg)    = { "dmesg",   "[-l <level>]", "the kernel log",
-                        SHELL_G_SYS, cmd_dmesg };
+                        SHELL_G_SYS, cmd_dmesg, SHELL_P_ANY };
 SHELL_CMD(crash)    = { "crash",   "",          "what has gone wrong, including on earlier boots",
-                        SHELL_G_SYS, sy_crash };
+                        SHELL_G_SYS, sy_crash, SHELL_P_ADMIN };
 SHELL_CMD(service)  = { "service", "[list|start|stop <name>]", "supervised services",
-                        SHELL_G_SYS, cmd_service };
+                        SHELL_G_SYS, cmd_service, SHELL_P_ADMIN };
 SHELL_CMD(cron)     = { "cron",    "[list|run <name>]", "scheduled jobs",
-                        SHELL_G_SYS, cmd_cron };
+                        SHELL_G_SYS, cmd_cron, SHELL_P_ADMIN };
 SHELL_CMD(abi)      = { "abi",     "",          "the guest-ABI number spaces, side by side",
-                        SHELL_G_SYS, sy_abi };
+                        SHELL_G_SYS, sy_abi, SHELL_P_ANY };
 SHELL_CMD(ktime)    = { "ktime",   "",          "the monotonic clock: source and resolution",
-                        SHELL_G_SYS, sy_ktime };
+                        SHELL_G_SYS, sy_ktime, SHELL_P_ANY };
 SHELL_CMD(ktimer)   = { "ktimer",  "",          "deadline-timer accuracy over a spread of sleeps",
-                        SHELL_G_SYS, sy_ktimer };
+                        SHELL_G_SYS, sy_ktimer, SHELL_P_ANY };
 SHELL_CMD(shutdown) = { "shutdown","",          "power off",
-                        SHELL_G_SYS, sy_shutdown };
+                        SHELL_G_SYS, sy_shutdown, SHELL_P_ADMIN };
 SHELL_CMD(reboot)   = { "reboot",  "",          "restart the machine",
-                        SHELL_G_SYS, sy_reboot };
+                        SHELL_G_SYS, sy_reboot, SHELL_P_ADMIN };
 
 SHELL_CMD(ringtest)    = { "ringtest",    "", "ring 3 / EL0 excursion",
-                           SHELL_G_TEST, sy_ringtest };
+                           SHELL_G_TEST, sy_ringtest, SHELL_P_ADMIN };
 SHELL_CMD(archtest)    = { "archtest",    "", "the ELF architecture gate",
-                           SHELL_G_TEST, sy_archtest };
+                           SHELL_G_TEST, sy_archtest, SHELL_P_ADMIN };
 SHELL_CMD(fputest)     = { "fputest",     "", "per-task FP/SIMD register file",
-                           SHELL_G_TEST, sy_fputest };
+                           SHELL_G_TEST, sy_fputest, SHELL_P_ANY };
 SHELL_CMD(faulttest)   = { "faulttest",   "", "bad ring-3 pointers, through all three layers",
-                           SHELL_G_TEST, sy_faultt };
+                           SHELL_G_TEST, sy_faultt, SHELL_P_ADMIN };
 SHELL_CMD(timerfdtest) = { "timerfdtest", "[ms]", "timerfd drift against the original start",
-                           SHELL_G_TEST, cmd_timerfdtest };
+                           SHELL_G_TEST, cmd_timerfdtest, SHELL_P_ANY };
 SHELL_CMD(alarmtest)   = { "alarmtest",   "[ms]", "setitimer + SIGALRM delivery",
-                           SHELL_G_TEST, cmd_alarmtest };
+                           SHELL_G_TEST, cmd_alarmtest, SHELL_P_ANY };
 SHELL_CMD(epolltest)   = { "epolltest",   "", "readiness sets, and the scan cost measured",
-                           SHELL_G_TEST, sy_epolltest };
+                           SHELL_G_TEST, sy_epolltest, SHELL_P_ANY };
 
 /* §M71 — `boundarytest on|off`: the falsifier for the ring-3 boundary audit's
  * leaked-flag violation.  Hidden from `help`, like `hardlock` and `leaktest`:
@@ -878,4 +878,4 @@ void usyscall_boundary_test(int on);
 static void sy_boundarytest(const char* a) {
     usyscall_boundary_test(!(a[0] == 'o' && a[1] == 'f'));
 }
-SHELL_CMD(boundarytest) = { "boundarytest", "on|off", 0, SHELL_G_TEST, sy_boundarytest };
+SHELL_CMD(boundarytest) = { "boundarytest", "on|off", 0, SHELL_G_TEST, sy_boundarytest, SHELL_P_ADMIN };

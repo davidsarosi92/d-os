@@ -1064,8 +1064,23 @@ T0(netmusl)   T0(httpstest) T0(cpptest)    T0(thrdyn)     T0(solibtest)
 T0(dlopentest) T0(bctest)
 #undef T0
 
+/* §M32 stage 7 — the whole TEST family is SHELL_P_ADMIN.  These drive the
+ * kernel's own self-test battery (ring-3 excursions, deliberate faults,
+ * allocator torture); a limited user has no business in any of them.
+ *
+ * THE SWEEP THAT ADDED THAT FIELD DID NOT SEE THIS MACRO.  It matched the
+ * literal `SHELL_CMD(x) = { ... };`, and a macro BODY has no semicolon, so 39
+ * commands kept the zero — and the checker written to find what the sweep had
+ * missed used the SAME regex, so it reported the sweep complete.  *An
+ * instrument that shares the sweep's blind spot reports the sweep as
+ * finished.*  What found it was -Wmissing-field-initializers, pointing (as
+ * §M70 also recorded) at the struct DEFINITION rather than at any offending
+ * initialiser: a warning about the symptom.
+ *
+ * The comment lives ABOVE the #define and not inside it — a continued macro
+ * body cannot carry one, which is a second mistake this line has now had. */
 #define TEST(verb, fn, use, txt) \
-    SHELL_CMD(verb) = { #verb, use, txt, SHELL_G_TEST, fn }
+    SHELL_CMD(verb) = { #verb, use, txt, SHELL_G_TEST, fn, SHELL_P_ADMIN }
 
 TEST(elftest,       t_elftest,       "", "load an ELF built at run time");
 TEST(userrun,       t_userrun,       "", "a ring-3 excursion and back");

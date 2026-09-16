@@ -459,4 +459,4 @@ LOCALE_CATALOG(loc_hu) = {
 
 /* --- §M70 shell registration ----------------------------------------------- */
 SHELL_CMD(locale) = { "locale", "[<lang>]", "the string catalogue, and a sample lookup",
-                      SHELL_G_SYS, locale_cmd };
+                      SHELL_G_SYS, locale_cmd, SHELL_P_ADMIN };

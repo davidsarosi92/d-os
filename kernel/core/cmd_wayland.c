@@ -229,24 +229,24 @@ static void wy_wayapp   (const char* a) { (void)a; cmd_wayapp();           }
 static void wy_waykeymap(const char* a) { (void)a; cmd_waykeymap();        }
 
 SHELL_CMD(waytest)     = { "waytest", "", "wire protocol + registry handshake",
-                           SHELL_G_TEST, wy_waytest };
+                           SHELL_G_TEST, wy_waytest, SHELL_P_ANY };
 SHELL_CMD(waydemo)     = { "waydemo", "", "a surface straight to the framebuffer",
-                           SHELL_G_TEST, wy_waydemo };
+                           SHELL_G_TEST, wy_waydemo, SHELL_P_ANY };
 SHELL_CMD(waywin)      = { "waywin", "", "a surface inside a WM-managed window",
-                           SHELL_G_TEST, wy_waywin };
+                           SHELL_G_TEST, wy_waywin, SHELL_P_ANY };
 SHELL_CMD(wayinput)    = { "wayinput", "", "wl_seat: keys and pointer motion",
-                           SHELL_G_TEST, wy_wayinput };
+                           SHELL_G_TEST, wy_wayinput, SHELL_P_ANY };
 SHELL_CMD(waycomp)     = { "waycomp", "", "server-per-surface, input routed back",
-                           SHELL_G_TEST, wy_waycomp };
+                           SHELL_G_TEST, wy_waycomp, SHELL_P_ANY };
 SHELL_CMD(wayclient)   = { "wayclient", "", "a real ring-3 client on the wire",
-                           SHELL_G_TEST, wy_wayclient };
+                           SHELL_G_TEST, wy_wayclient, SHELL_P_ANY };
 SHELL_CMD(wayapp)      = { "wayapp", "", "the mini client library",
-                           SHELL_G_TEST, wy_wayapp };
+                           SHELL_G_TEST, wy_wayapp, SHELL_P_ANY };
 SHELL_CMD(waykeymap)   = { "waykeymap", "", "an xkb keymap generated from the live layout",
-                           SHELL_G_TEST, wy_waykeymap };
+                           SHELL_G_TEST, wy_waykeymap, SHELL_P_ANY };
 SHELL_CMD(wayupstream) = { "wayupstream", "[win]", "UNMODIFIED upstream libwayland-client",
-                           SHELL_G_TEST, cmd_wayupstream };
+                           SHELL_G_TEST, cmd_wayupstream, SHELL_P_ANY };
 SHELL_CMD(simpleshm)   = { "simpleshm", "[win]", "weston's own reference client, unpatched",
-                           SHELL_G_TEST, cmd_simpleshm };
+                           SHELL_G_TEST, cmd_simpleshm, SHELL_P_ANY };
 SHELL_CMD(egltri)      = { "egltri", "[win]", "Mesa EGL + GLES2 on softpipe",
-                           SHELL_G_TEST, cmd_egltri };
+                           SHELL_G_TEST, cmd_egltri, SHELL_P_ANY };

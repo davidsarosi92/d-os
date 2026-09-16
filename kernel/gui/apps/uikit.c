@@ -241,4 +241,4 @@ void uikit_command(void) {
  * and a test harness has no business taking its last slot. */
 static void uk_uikit(const char* a) { (void)a; uikit_command(); }
 SHELL_CMD(uikit) = { "uikit", "", "every registered widget class in one window",
-                     SHELL_G_GUI, uk_uikit };
+                     SHELL_G_GUI, uk_uikit, SHELL_P_ANY };

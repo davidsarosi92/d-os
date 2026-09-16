@@ -1111,4 +1111,4 @@ int iommu_confine(uint16_t bdf, uint64_t base, uint64_t len) {
  * place one wants it. */
 SHELL_CMD(iommu) = { "iommu", "[limit|block|<dev>]",
                      "what this machine can enforce against a device",
-                     SHELL_G_DEV, iommu_cmd };
+                     SHELL_G_DEV, iommu_cmd, SHELL_P_ADMIN };

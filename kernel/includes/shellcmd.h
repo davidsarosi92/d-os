@@ -72,12 +72,44 @@ struct vc;
  * `group` sorts the listing.  Use one of the SHELL_G_* strings below rather
  * than a new one, or the listing grows a section per author.
  * ------------------------------------------------------------------------- */
+/* §M32 stage 7 — WHO MAY RUN THIS COMMAND.
+ *
+ * The privileged operations on this machine are almost all shell commands, so
+ * the gate is a FIELD ON THE REGISTRATION rather than an `if` at the top of
+ * forty command bodies.  Same argument as `help` being generated: one place to
+ * state it, and no second place to forget.
+ *
+ * **ZERO IS `UNDECLARED`, AND IT IS REFUSED.**  If zero meant "anyone", the
+ * 152 registrations that existed before this field would all have become
+ * unprivileged silently, including `insmod`, `drv crash` and `hardlock`.  If
+ * zero simply meant "admin", a new command would fail closed — safe, but
+ * indistinguishable from one whose author deliberately chose admin.  Three
+ * values keep those apart, which is §M71 rule 3 (an audit must distinguish
+ * "cannot check" from "checked, clean") applied to a declaration.
+ *
+ * The audit `command-privilege` therefore checks that NOTHING is UNDECLARED,
+ * so a command added without thinking about this fails on the day it is added
+ * rather than six months later.
+ *
+ * WHAT IT DOES NOT COVER, said plainly: this gates a VERB, not its arguments.
+ * `nice` is the standing example — lowering a priority is unprivileged and
+ * RAISING it is not — and a per-argument rule like that stays in the command
+ * body.  A field that looked as though it covered everything would be worse
+ * than one whose limit is written down. */
+#define SHELL_P_UNDECLARED 0
+#define SHELL_P_ANY        1   /* anybody, including a limited user          */
+#define SHELL_P_ADMIN      2   /* an administrator (or a SYSTEM context)     */
+
 struct shell_cmd {
     const char* name;
     const char* usage;
     const char* help;
     const char* group;
     void      (*run)(const char* args);
+    /* Appended at the END.  Every registration in this tree is a POSITIONAL
+     * initialiser, so a field inserted anywhere else would silently re-bind
+     * `run` — §M58's scar, and here it would re-bind a function pointer. */
+    int priv;
 };
 
 /* The groups `help` prints, in this order.  Anything else is listed last

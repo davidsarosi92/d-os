@@ -382,4 +382,4 @@ void cp_cmd_theme(const char* arg) {
 
 /* --- §M70 shell registration ----------------------------------------------- */
 SHELL_CMD(theme) = { "theme", "[light|dark]", "the active theme, and its live density",
-                     SHELL_G_GUI, cp_cmd_theme };
+                     SHELL_G_GUI, cp_cmd_theme, SHELL_P_ADMIN };

@@ -11,6 +11,7 @@
 #include "console.h"
 #include "printf.h"
 #include "vc.h"
+#include "cred.h"   /* §M32 — the privilege gate */
 
 static int streq_(const char* a, const char* b) {
     while (*a && *a == *b) { a++; b++; }
@@ -68,6 +69,26 @@ int shell_cmd_dispatch(const char* line) {
 
     const struct shell_cmd* c = shell_cmd_find(verb);
     if (!c || !c->run) return 0;
+
+    /* §M32 stage 7 — THE PRIVILEGE GATE, in one place for every command.
+     *
+     * `cred_is_admin()` answers 1 for a KERNEL or SYSTEM context, so the boot
+     * console, every service and every script are unaffected — the gate bites
+     * exactly one case, a LOGGED-IN user who is not an administrator, which is
+     * the case it was built for.
+     *
+     * UNDECLARED is refused rather than waved through.  A command whose author
+     * did not think about this is not a command whose author meant "anybody";
+     * the audit names it, and until somebody decides, nobody runs it. */
+    if (c->priv == SHELL_P_UNDECLARED) {
+        kprintf("%s: this command has not declared who may run it — refused "
+                "(see `audit command-privilege`)\n", c->name);
+        return 1;
+    }
+    if (c->priv == SHELL_P_ADMIN && !cred_is_admin(cred_current())) {
+        kprintf("%s: this needs an administrator\n", c->name);
+        return 1;
+    }
 
     const char* args = line + n;
     while (*args == ' ') args++;                /* handlers never see leading  */
@@ -172,8 +193,7 @@ static void cmd_help_entry(const char* args) { shell_cmd_help(args); }
 
 SHELL_CMD(help) = {
     "help", "[command]", "list commands, or explain one",
-    SHELL_G_SYS, cmd_help_entry
-};
+    SHELL_G_SYS, cmd_help_entry, SHELL_P_ANY };
 
 /* ---------------------------------------------------------------------------
  * §M32 stage 4 — interactive input.  See shellcmd.h for why this is here and
@@ -238,3 +258,65 @@ int shell_read_line(const char* prompt, char* buf, int cap) {
 int shell_read_secret(const char* prompt, char* buf, int cap) {
     return read_into(prompt, buf, cap, 0);
 }
+
+/* ---------------------------------------------------------------------------
+ * §M71 — every command has declared who may run it.
+ *
+ * The sweep that introduced `priv` covered 152 registrations; the point of this
+ * check is the 153rd.  A command added without a declaration is refused at
+ * runtime (see shell_cmd_dispatch) AND named here, so it fails on the day it is
+ * added rather than the day somebody needed it.
+ *
+ * HOW TO MAKE IT FAIL: `privtest`, which clears one registration's declaration
+ * in place — §M71 rule 1, detection rather than reporting.
+ * ------------------------------------------------------------------------- */
+
+#include "audit.h"
+
+/* The registration is `const`, so the falsifier cannot write through the
+ * ordinary pointer; it takes the section's own address instead.  Deliberate:
+ * a test that needed the table to be mutable would have made it mutable for
+ * everybody. */
+static int au_command_privilege(int verbose) {
+    int n = shell_cmd_count();
+    if (n == 0) return AUDIT_SKIP;
+    int bad = 0, admin = 0, anyone = 0;
+    for (int i = 0; i < n; i++) {
+        const struct shell_cmd* c = shell_cmd_at(i);
+        if (!c) continue;
+        if (c->priv == SHELL_P_UNDECLARED) {
+            kprintf("  !! '%s' has not declared who may run it\n", c->name);
+            bad++;
+        } else if (c->priv == SHELL_P_ADMIN) admin++;
+        else anyone++;
+    }
+    if (verbose)
+        kprintf("  %d command(s): %d admin, %d unrestricted, %d undeclared\n",
+                n, admin, anyone, bad);
+    return bad;
+}
+
+AUDIT(command_privilege) = {
+    "command-privilege",
+    "every registered shell command declares who may run it",
+    au_command_privilege
+};
+
+static void cmd_privtest(const char* args) {
+    (void)args;
+    struct shell_cmd* t = (struct shell_cmd*)shell_cmd_at(0);
+    if (!t) { console_write("privtest: no commands registered\n"); return; }
+    int saved = t->priv;
+    t->priv = SHELL_P_UNDECLARED;
+    kprintf("privtest: cleared '%s' declaration — `audit command-privilege` "
+            "must FAIL\n", t->name);
+    int v = audit_run_one("command-privilege", 0);
+    kprintf("privtest: audit reported %d violation(s) — %s\n",
+            v, v > 0 ? "DETECTED" : "NOT DETECTED (the check is broken)");
+    t->priv = saved;
+    v = audit_run_one("command-privilege", 0);
+    kprintf("privtest: restored; audit reports %d violation(s) — %s\n",
+            v, v == 0 ? "clean" : "STILL DIRTY");
+}
+
+SHELL_CMD(privtest) = { "privtest", "", NULL, SHELL_G_TEST, cmd_privtest, SHELL_P_ADMIN };

@@ -252,4 +252,4 @@ static void cmd_sysmon(const char* args) {
 }
 
 SHELL_CMD(sysmon) = { "sysmon", "", "recent CPU / memory / I/O / network history",
-                      SHELL_G_SYS, cmd_sysmon };
+                      SHELL_G_SYS, cmd_sysmon, SHELL_P_ANY };

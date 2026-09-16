@@ -1026,18 +1026,18 @@ static void cmd_groupmod(const char* args) {
 }
 
 SHELL_CMD(users)    = { "users",    "",  "list accounts and groups",
-                        SHELL_G_SYS, cmd_users };
+                        SHELL_G_SYS, cmd_users, SHELL_P_ANY };
 SHELL_CMD(useradd)  = { "useradd",  "<name> [admin]", "create an account",
-                        SHELL_G_SYS, cmd_useradd };
+                        SHELL_G_SYS, cmd_useradd, SHELL_P_ADMIN };
 SHELL_CMD(userdel)  = { "userdel",  "<name>", "delete an account",
-                        SHELL_G_SYS, cmd_userdel };
+                        SHELL_G_SYS, cmd_userdel, SHELL_P_ADMIN };
 SHELL_CMD(passwd)   = { "passwd",   "<name> <password>", "set or clear a password",
-                        SHELL_G_SYS, cmd_passwd };
+                        SHELL_G_SYS, cmd_passwd, SHELL_P_ADMIN };
 SHELL_CMD(usermod)  = { "usermod",  "<name> admin|noadmin|elev-perop|elev-always",
-                        "change an account", SHELL_G_SYS, cmd_usermod };
+                        "change an account", SHELL_G_SYS, cmd_usermod, SHELL_P_ADMIN };
 SHELL_CMD(groupadd) = { "groupadd", "<name>", "create a group",
-                        SHELL_G_SYS, cmd_groupadd };
+                        SHELL_G_SYS, cmd_groupadd, SHELL_P_ADMIN };
 SHELL_CMD(groupdel) = { "groupdel", "<name>", "destroy a group",
-                        SHELL_G_SYS, cmd_groupdel };
+                        SHELL_G_SYS, cmd_groupdel, SHELL_P_ADMIN };
 SHELL_CMD(groupmod) = { "groupmod", "<group> add|del <user>", "change group membership",
-                        SHELL_G_SYS, cmd_groupmod };
+                        SHELL_G_SYS, cmd_groupmod, SHELL_P_ADMIN };

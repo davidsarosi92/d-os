@@ -258,4 +258,4 @@ static void cmd_crashlog(const char* args) {
 
 SHELL_CMD(crashlog) = { "crashlog", "[clear]",
                         "crash records kept on disk, with the log that led to them",
-                        SHELL_G_SYS, cmd_crashlog };
+                        SHELL_G_SYS, cmd_crashlog, SHELL_P_ADMIN };

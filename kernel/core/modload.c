@@ -1223,12 +1223,12 @@ void modload_cmd_rmmod(const char* args) {
 static void ml_lsmod(const char* a) { (void)a; modload_list(); }
 static void ml_modupdate(const char* a) { modload_reload(a); }
 SHELL_CMD(lsmod)     = { "lsmod", "", "loaded modules",
-                         SHELL_G_DEV, ml_lsmod };
+                         SHELL_G_DEV, ml_lsmod, SHELL_P_ANY };
 SHELL_CMD(insmod)    = { "insmod", "<path.ko>", "load a module",
-                         SHELL_G_DEV, modload_cmd_insmod };
+                         SHELL_G_DEV, modload_cmd_insmod, SHELL_P_ADMIN };
 SHELL_CMD(rmmod)     = { "rmmod", "<name>", "unload a module",
-                         SHELL_G_DEV, modload_cmd_rmmod };
+                         SHELL_G_DEV, modload_cmd_rmmod, SHELL_P_ADMIN };
 SHELL_CMD(modbrowse) = { "modbrowse", "[dir]", "modules available on disk",
-                         SHELL_G_DEV, modload_browse };
+                         SHELL_G_DEV, modload_browse, SHELL_P_ADMIN };
 SHELL_CMD(modupdate) = { "modupdate", "<name>", "reload a module in place",
-                         SHELL_G_DEV, ml_modupdate };
+                         SHELL_G_DEV, ml_modupdate, SHELL_P_ADMIN };

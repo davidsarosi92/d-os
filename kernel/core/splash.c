@@ -497,4 +497,4 @@ int splash_key(void) {
 
 /* --- §M70 shell registration ----------------------------------------------- */
 SHELL_CMD(splash) = { "splash", "[on|off|status|faultkernel]", "the boot screen",
-                      SHELL_G_SYS, splash_cmd };
+                      SHELL_G_SYS, splash_cmd, SHELL_P_ADMIN };

@@ -356,4 +356,4 @@ static void cmd_kdftest(const char* args) {
 
 SHELL_CMD(kdftest) = { "kdftest", "",
                        "check SHA-256 / HMAC / PBKDF2 against published vectors",
-                       SHELL_G_TEST, cmd_kdftest };
+                       SHELL_G_TEST, cmd_kdftest, SHELL_P_ANY };

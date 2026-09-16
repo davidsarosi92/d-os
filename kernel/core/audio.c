@@ -1420,14 +1420,14 @@ static void ac_lsaudio(const char* args) { (void)args; audio_list(); }
 static void ac_beep   (const char* args) { (void)args; audio_cmd_beep(); }
 
 SHELL_CMD(lsaudio) = { "lsaudio", "", "audio devices",
-                       SHELL_G_AUDIO, ac_lsaudio };
+                       SHELL_G_AUDIO, ac_lsaudio, SHELL_P_ANY };
 SHELL_CMD(beep)    = { "beep", "", "a short tone through the speaker",
-                       SHELL_G_AUDIO, ac_beep };
+                       SHELL_G_AUDIO, ac_beep, SHELL_P_ANY };
 SHELL_CMD(tone)    = { "tone", "<hz> [ms]", "square-wave test tone",
-                       SHELL_G_AUDIO, audio_cmd_tone };
+                       SHELL_G_AUDIO, audio_cmd_tone, SHELL_P_ANY };
 SHELL_CMD(play)    = { "play", "<path.wav>", "play a WAV file",
-                       SHELL_G_AUDIO, audio_cmd_play };
+                       SHELL_G_AUDIO, audio_cmd_play, SHELL_P_ANY };
 SHELL_CMD(rec)     = { "rec", "<path.wav> [ms]", "record to a WAV file",
-                       SHELL_G_AUDIO, audio_cmd_rec };
+                       SHELL_G_AUDIO, audio_cmd_rec, SHELL_P_ANY };
 SHELL_CMD(volume)  = { "volume", "[0-100|mute|unmute]", "master volume",
-                       SHELL_G_AUDIO, audio_cmd_volume };
+                       SHELL_G_AUDIO, audio_cmd_volume, SHELL_P_ANY };

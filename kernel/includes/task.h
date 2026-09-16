@@ -75,9 +75,18 @@ struct ofile;
 uint32_t task_nice_to_weight(int nice);
 
 /* §M49 — set a task's nice value (clamped to the legal range) and derive
- * its weight.  Returns 0 on success, -1 if no such task.  Lowering nice
- * (more CPU) is unprivileged here: d-os has no multi-user model yet
- * (§M32), so there is nothing to protect it from. */
+ * its weight.  Returns 0 on success, -1 if no such task, -2 if refused.
+ *
+ * §M32 — THE PREMISE OF THIS COMMENT HAS MOVED, which is why it is rewritten
+ * rather than left.  It used to read "lowering nice is unprivileged here: d-os
+ * has no multi-user model yet (§M32), so there is nothing to protect it from",
+ * and every word was true when written.  There is now something to protect it
+ * from: a limited user who lowers their nice takes CPU from everybody else.
+ *
+ * So the rule is the classic asymmetric one — RAISING a priority (a more
+ * negative nice) needs an administrator, LOWERING it is anybody's — and it
+ * lives in the function body rather than in the SHELL_CMD privilege field,
+ * because that field gates a VERB and this depends on the ARGUMENT. */
 int task_set_nice(int pid, int nice);
 
 enum task_state {

@@ -806,4 +806,4 @@ static void cmd_inodetest(const char* args) {
             v, v == 0 ? "clean" : "STILL DIRTY");
 }
 
-SHELL_CMD(inodetest) = { "inodetest", "", NULL, SHELL_G_TEST, cmd_inodetest };
+SHELL_CMD(inodetest) = { "inodetest", "", NULL, SHELL_G_TEST, cmd_inodetest, SHELL_P_ADMIN };

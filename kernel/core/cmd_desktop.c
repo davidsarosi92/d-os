@@ -273,22 +273,22 @@ static void ds_wheeltest(const char* a) {
 
 SHELL_CMD(gui)       = { "gui", "[stop|stats|widgets|relayout|bench]",
                          "the compositor and the desktop session",
-                         SHELL_G_GUI, ds_gui };
+                         SHELL_G_GUI, ds_gui, SHELL_P_ANY };
 SHELL_CMD(launch)    = { "launch", "[app]", "start a registered GUI app",
-                         SHELL_G_GUI, cmd_launch };
+                         SHELL_G_GUI, cmd_launch, SHELL_P_ADMIN };
 SHELL_CMD(run)       = { "run", "<path.bas>", "run a Tiny-BASIC program",
-                         SHELL_G_GUI, ds_run };
+                         SHELL_G_GUI, ds_run, SHELL_P_ANY };
 SHELL_CMD(pane)      = { "pane", "[split horizontal|vertical]", "terminal panes",
-                         SHELL_G_GUI, ds_pane };
+                         SHELL_G_GUI, ds_pane, SHELL_P_ANY };
 SHELL_CMD(lslayout)  = { "lslayout", "", "keyboard layouts",
-                         SHELL_G_SYS, ds_lslayout };
+                         SHELL_G_SYS, ds_lslayout, SHELL_P_ANY };
 SHELL_CMD(setlayout) = { "setlayout", "<us|hu|...>", "switch keyboard layout",
-                         SHELL_G_SYS, cmd_setlayout };
+                         SHELL_G_SYS, cmd_setlayout, SHELL_P_ADMIN };
 
 SHELL_CMD(termcheck) = { "termcheck", "", "terminal scrollback self-test, in a GUI window",
-                         SHELL_G_TEST, ds_termcheck };
+                         SHELL_G_TEST, ds_termcheck, SHELL_P_ANY };
 SHELL_CMD(uidemo)    = { "uidemo", "", "the toolkit driven from a ring-3 client",
-                         SHELL_G_TEST, ds_uidemo };
+                         SHELL_G_TEST, ds_uidemo, SHELL_P_ANY };
 SHELL_CMD(wheeltest) = { "wheeltest", "<x> <y> <dz>",
                          "inject (dz=0: probe) a wheel notch at a content point",
-                         SHELL_G_TEST, ds_wheeltest };
+                         SHELL_G_TEST, ds_wheeltest, SHELL_P_ANY };
