@@ -264,7 +264,7 @@ what); a session can pick a theme and push on it.
 | M29 | Services / daemons — SERVICE() registry + supervisor (autostart, restart policy) + service bus (endpoint / contract / transport, location-independent binding) | Architecture | ✅ DOCS §4.21 |
 | M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | ✅ DOCS §4.23 |
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | ✅ DOCS §4.22 (L1+L2; L3 HW deferred) |
-| M32 | **Multi-user — identity, accounts, permissions** | Security | ◐ **STAGES 1-9 SHIPPED 2026-09-16 (DOCS §4.91, all 3 arches).**  Tagged task ownership (KERNEL/SYSTEM/USER) with one inheritance route and a re-parenting-proof immutability rule; SHA-256/HMAC/PBKDF2 verified against PUBLISHED vectors; the account database with a PROTECTED root and a uid that is never reused; login as a NEW TASK (because ownership is immutable); VFS ownership + the execute bit at the LOADER; 152 commands declaring who may run them; per-operation elevation; per-user settings.  Three §M71 audits, each with a shipped falsifier.  **OPEN: stage 10 (GUI login / lock / switch user), deferred on VERIFIABILITY — §4.74's harness cannot type into a focused GUI window, and this milestone's standard is that every claim is measured.  Also open: simultaneous sessions (one config cache), and on-disk ownership (no filesystem here stores it — `mount` says so)** |
+| M32 | **Multi-user — identity, accounts, permissions** | Security | ◐ **STAGES 1-9 SHIPPED 2026-09-16 (DOCS §4.91, all 3 arches).**  Tagged task ownership (KERNEL/SYSTEM/USER) with one inheritance route and a re-parenting-proof immutability rule; SHA-256/HMAC/PBKDF2 verified against PUBLISHED vectors; the account database with a PROTECTED root and a uid that is never reused; login as a NEW TASK (because ownership is immutable); VFS ownership + the execute bit at the LOADER; 152 commands declaring who may run them; per-operation elevation; per-user settings.  Three §M71 audits, each with a shipped falsifier.  **Stage 10 SHIPPED 2026-09-17**: a modal lock surface with a secret field that refuses the clipboard, dismissal refused by re-raising, and `gui.locktest` — an instrument that HAD to be a config key, because raising the lock takes the keyboard from the shell that would type the test.  Root cause of four silent runs was §M61's own sentence, `the window was created but never laid out`.  **OPEN: simultaneous sessions (one config cache), and on-disk ownership (no filesystem here stores it — `mount` says so)** |
 | M33 | Execution domains — a service's run location as a declared capability + config choice; driver placement is the flagship case | Reliability | ✅ COMPLETE 2026-08-29 (DOCS §4.82): Tier 0/1/2, shared-controller arbitration, IOMMU stage 5, and per-driver DMA domains proven by a driver in ring 3 whose device is refused outside its own buffer.  OPEN, none of it gating the claim: the modern virtio transport (legacy has no feature bit 33 — a virtio-driver item), a REAL DMA driver ported to drvrt, richer state replay |
 | **M46** | **Resilient control plane — SAK hotkeys + force-kill** — Ctrl+Alt+Del = always-live Task Manager, Ctrl+Alt+X = kill last/frozen app, window chrome (close/min/restore) works even when the app is wedged (close ⇒ force-kill), Task Manager force-quit; the enabler is a real force-kill of a wedged ring-3 process | Reliability / UX | ✅ DOCS §4.37 |
 | M58 | Text selection — pointer grab + press/motion/release, selection model (text bytes / terminal cells), word + line selection | UX | §M58 |
@@ -7089,6 +7089,26 @@ of a big window over the icon field still composites at §4.61's measured cost.
 ---
 
 ## Change log
+
+- **2026-09-17** — **§M32 stage 10: the lock surface, and a silence that took
+  four runs to read.**  A modal authentication window (`gui.login`), a SECRET
+  text field that draws one marker rather than one bullet per character (a row
+  of bullets publishes the length) and REFUSES Ctrl+C — *a field that hides its
+  contents on screen and hands them to the clipboard hides nothing* — with
+  dismissal refused by re-raising from `on_close`, which needs no new
+  compositor API.  Measured on the real submit path: correct password →
+  UNLOCKED, wrong password and unknown account → still locked, with modality
+  confirmed CLAIMED *and* PAINTED.  **THE INSTRUMENT HAD TO BE A CONFIG KEY AND
+  THE FEATURE PROVED IT:** raising the lock takes the keyboard, so the shell
+  that would type the test is the one that can no longer be typed into.  Four
+  driven runs produced no output at all; three mistakes stacked (a wait inside
+  `gui_start` — *an instrument that blocks the thing it is measuring measures a
+  machine that does not exist*; reports moved to klog, which is a RING and not
+  the live line; and a `task_msleep` that never returned).  One `kprintf` at the
+  top of the task settled it in a single run, and the defect underneath was
+  §M61's own sentence: **the window was created but never laid out** —
+  `gui_app_window_create` binds to `task_current()` and `gui_start` has no
+  app-host loop, so `gui_queue_open` is the whole fix.
 
 - **2026-09-16** — **§M32 stages 1-9: users, permissions and the four things I
   got wrong on the way** (DOCS §4.91, all 3 arches).  The identity question is

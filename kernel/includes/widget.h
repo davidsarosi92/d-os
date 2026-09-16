@@ -296,10 +296,24 @@ struct w_textinput {
     char buf[64];
     int  len;
     void (*on_submit)(struct w_textinput* t, void* ctx);   /* Enter */
+    /* §M32 stage 10 — a SECRET field draws nothing of what was typed.
+     *
+     * Not one bullet per character: that publishes the LENGTH to anybody
+     * looking at the screen, which is the same reason the shell's
+     * `shell_read_secret` echoes nothing at all.  A single fixed marker says
+     * "something is here" without saying how much.
+     *
+     * Appended at the END of the struct (§M58's rule for optional fields), and
+     * zero is the ordinary visible field, so every existing text input is
+     * unchanged by construction. */
+    int  secret;
 };
 struct w_textinput* w_textinput_create(struct gui_window* win, int x, int y,
                                        int w, void* ctx);
 void w_textinput_set(struct w_textinput* t, const char* text);
+/* Make this field a password field.  See `secret` above for why it does not
+ * draw one mark per character. */
+void w_textinput_set_secret(struct w_textinput* t, int on);
 
 /* ---- Multiline text editor (M22.5, w_editor.c) -------------------------------
  * Scrollable text buffer with cursor, selection (Shift+arrows),
