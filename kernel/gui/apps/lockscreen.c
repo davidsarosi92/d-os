@@ -279,9 +279,21 @@ static void lock_closed(struct gui_window* w) {
 static void lock_build(void) {
     if (g_lock.win) return;
 
-    struct gui_window* win = gui_app_window_create("Locked", -1, -1,
-                                                  cp_px(400), cp_px(300),
-                                                  lock_layout, NULL);
+    /* CENTRED EXPLICITLY.  `window_alloc` stores x and y verbatim — there is no
+     * "-1 means you pick" convention anywhere in the WM, and passing -1 put
+     * this window at literally (-1,-1), i.e. off the top-left corner.  It had
+     * therefore NEVER been visible, and the two-point probe did not catch it:
+     * `modal visible to the compositor (z-index 0 of 1)` reports the Z-ORDER,
+     * not the pixels, and I read it as the latter for several rounds.
+     *
+     * *A probe that answers a neighbouring question is the one most likely to
+     * be believed* — §M79's own lesson, met again. */
+    int ow, oh;
+    gui_window_outer_for_content(cp_px(400), cp_px(300), &ow, &oh);
+    int sw = gui_screen_w(), sh = gui_screen_h();
+    struct gui_window* win = gui_app_window_create("Locked",
+                                                   (sw - ow) / 2, (sh - oh) / 3,
+                                                   ow, oh, lock_layout, NULL);
     if (!win) return;
     g_lock.win = win;
     g_lock.unlocked = 0;

@@ -204,21 +204,40 @@ static int is_me(const struct user_account* u) {
     return u && c->owner == TASK_OWNER_USER && cred_uid(c) == u->uid;
 }
 
+/* WHAT IS GREYED, AND IT IS DELIBERATELY LESS THAN WHAT IS REFUSED.
+ *
+ * Corrected from use: *"the Set password button is shown disabled for root, yet
+ * I can still click it — it is right that it works, but it should not look
+ * disabled.  Only a non-admin should be blocked, and only on accounts that are
+ * not their own."*
+ *
+ * The first version mirrored ALL of users.h's rules, including "only root may
+ * change an administrator's password".  That was wrong twice: it greyed a
+ * control for an administrator who is entitled to TRY (and whose attempt the
+ * gate would explain), and it made the panel a second copy of a rule that is
+ * allowed to change.
+ *
+ * So the greying now answers ONE question — *is this row yours to touch at
+ * all* — and everything finer is left to users.h, which refuses with a reason.
+ * That is also devicepanel.c's rule back in force: a live control whose refusal
+ * explains itself teaches more than a dead one. */
 static int may_set_password(const struct user_account* u) {
     if (!u) return 0;
-    if (is_me(u)) return 1;                       /* your own, always */
-    if (user_is_admin_uid(u->uid)) return me_is_root();
-    return me_is_admin();
+    if (me_is_admin()) return 1;        /* entitled to try; the gate decides */
+    return is_me(u);                    /* a standard user: their own row    */
 }
 static int may_delete(const struct user_account* u) {
     if (!u) return 0;
-    if (u->uid == CRED_UID_ROOT) return 0;        /* protected, for everybody */
-    return user_is_admin_uid(u->uid) ? me_is_root() : me_is_admin();
+    /* root is the one exception kept here, because it is not a permission
+     * question: NOBODY may delete it, including root, so the control can never
+     * come alive and a live one would be a promise the gate always breaks. */
+    if (u->uid == CRED_UID_ROOT) return 0;
+    return me_is_admin();
 }
 static int may_toggle_admin(const struct user_account* u) {
     if (!u) return 0;
-    if (u->uid == CRED_UID_ROOT) return 0;
-    return me_is_root();
+    if (u->uid == CRED_UID_ROOT) return 0;   /* protected, for the same reason */
+    return me_is_admin();
 }
 
 /* ---------------------------------------------------------------- */
@@ -299,9 +318,15 @@ static void pr_closed(struct gui_window* w) {
 }
 
 static void pr_build(void) {
+    /* Centred explicitly — see lockscreen.c: `window_alloc` takes x/y verbatim
+     * and -1 is not a convention, so this prompt was landing off-screen too.
+     * The same mistake in two files written the same day, which is what a
+     * wrong assumption about a shared API does. */
     int ow, oh;
     gui_window_outer_for_content(cp_px(340), cp_px(130), &ow, &oh);
-    pr_win = gui_app_window_create("Account", -1, -1, ow, oh, pr_layout, NULL);
+    int sw = gui_screen_w(), sh = gui_screen_h();
+    pr_win = gui_app_window_create("Account", (sw - ow) / 2, (sh - oh) / 3,
+                                   ow, oh, pr_layout, NULL);
     if (!pr_win) return;
     gui_window_set_on_close(pr_win, pr_closed);
     gui_window_set_modal(pr_win, 1);
