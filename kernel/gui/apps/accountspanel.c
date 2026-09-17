@@ -338,7 +338,37 @@ static void done_new_name(const char* name) {
 static void done_password(const char* pw) {
     const struct user_account* u = ac_selected();
     if (!u) return;
-    user_set_password(u->name, (pw && pw[0]) ? pw : NULL);
+    /* AN EMPTY FIELD IS NOT A REQUEST TO REMOVE THE PASSWORD.
+     *
+     * `user_set_password(name, NULL)` DISABLES sign-in, and the first version
+     * reached it by pressing OK on an empty box — so a keystroke that failed to
+     * land (or a mis-click) silently turned an account into one that refuses
+     * every password, and the explanation went to the console, which the GUI
+     * suppresses (§4.79).  Reported from use as *"I set the password in the
+     * Control Panel and it always says wrong password"*, which is exactly what
+     * that looks like from a chair.
+     *
+     * The shell keeps the destructive form because it is EXPLICIT there
+     * (`passwd <name> -`).  A blank field is an accident, not a sentence. */
+    if (!pw || !pw[0]) {
+        if (ac_detail)
+            w_label_set(ac_detail, "No password typed — nothing was changed. "
+                                   "(To disable sign-in, use `passwd <name> -` "
+                                   "at a shell.)");
+        if (ac_win) gui_window_request_redraw(ac_win);
+        return;
+    }
+    user_set_password(u->name, pw);
+    /* SAY IT HERE.  users.c prints to the console and the GUI suppresses it,
+     * so a panel that relied on that message reports nothing at all. */
+    if (ac_detail) {
+        static char m[120];
+        int n = ac_put(m, sizeof m, 0, "Password set for ");
+        n = ac_put(m, sizeof m, n, u->name);
+        n = ac_put(m, sizeof m, n, ".  They can sign in with it now.");
+        (void)n;
+        w_label_set(ac_detail, m);
+    }
     ac_refresh();
 }
 

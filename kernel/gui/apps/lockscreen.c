@@ -54,6 +54,8 @@
 
 #include "gui.h"
 #include "widget.h"
+#include "itemview.h"
+#include "icons.h"
 #include "users.h"
 #include "cred.h"
 #include "console_plate.h"
@@ -68,10 +70,61 @@
 
 struct lock_state {
     struct gui_window*   win;
-    struct w_textinput*  user;
+    struct w_itemview*   picker;     /* the accounts that can sign in       */
     struct w_textinput*  pass;
     struct w_label*      status;
     int                  unlocked;
+};
+
+/* ---------------------------------------------------------------------------
+ * THE PICKER: the accounts that can actually sign in.
+ *
+ * A text field asked the person at a locked machine to remember a name; a list
+ * asks them to recognise one, which is the easier question and the one every
+ * other sign-in screen asks.  It is also the honest set: an account with no
+ * password CANNOT sign in (users.h), so offering it would be a row that
+ * refuses every password typed into it.
+ *
+ * Names are not a secret — the Control Panel lists them, and so does every
+ * owner column in the system — so showing them costs nothing that is not
+ * already public.  The PASSWORD is the secret, and it is the field below. */
+static int lk_signable(const struct user_account* u) {
+    return u && u->used && u->type == USER_TYPE_PERSON && u->has_password;
+}
+
+static int lk_count(void* ctx) {
+    (void)ctx;
+    int n = 0;
+    for (int i = 0; i < user_count(); i++)
+        if (lk_signable(user_at(i))) n++;
+    return n;
+}
+
+static const struct user_account* lk_at(int idx) {
+    int n = 0;
+    for (int i = 0; i < user_count(); i++) {
+        const struct user_account* u = user_at(i);
+        if (!lk_signable(u)) continue;
+        if (n++ == idx) return u;
+    }
+    return NULL;
+}
+
+static int lk_get(void* ctx, int i, struct item_entry* out) {
+    (void)ctx;
+    const struct user_account* u = lk_at(i);
+    if (!u) return -1;
+    out->label = u->name;
+    out->sub   = NULL;
+    out->icon  = ICON_APP;
+    out->dim   = 0;
+    return 0;
+}
+
+static void lk_activate(void* ctx, int i);
+
+static const struct item_model lk_model = {
+    .count = lk_count, .get = lk_get, .activate = lk_activate, .ctx = NULL,
 };
 
 static struct lock_state g_lock;
@@ -102,6 +155,34 @@ int gui_lock_active(void);
  * never takes (§M64's `shortcut check` argument: a command that reassembles the
  * same facts by a second route would agree with itself and not with the
  * screen). */
+/* WHO IS SELECTED HAS ONE ANSWER, AND IT IS THE PICKER'S.
+ *
+ * The first version kept a `chosen` name beside the list and set it from
+ * on_select — two sources of truth for one fact, and they disagreed on the
+ * first driven run: the instrument chose `alice`, the item view's own initial
+ * selection then fired on_select for row 0, and the machine authenticated
+ * `root` while the log said it was submitting alice.  *A cached copy of a
+ * widget's state is a second answer waiting to be the wrong one*, which is the
+ * same shape as §M69's widget storing a resolved string instead of a key.
+ *
+ * So there is no copy: the submit reads `picker->sel`. */
+static void lk_choose(int idx) {
+    if (!g_lock.picker) return;
+    g_lock.picker->sel = idx;
+    /* The password field takes focus the moment a name is chosen: choosing is
+     * the first half of one gesture, and making the person click again to type
+     * is a step that exists only because the window has two widgets. */
+    if (g_lock.win && g_lock.pass)
+        gui_window_focus_widget(g_lock.win, (struct widget*)g_lock.pass);
+}
+
+static void lk_activate(void* ctx, int i) { (void)ctx; lk_choose(i); }
+
+static void lk_on_select(struct w_itemview* iv, int idx, void* c) {
+    (void)iv; (void)c;
+    lk_choose(idx);
+}
+
 static int lock_try(const char* user, const char* pass) {
     if (user_check_password(user, pass) != 0) {
         /* One message for both causes — a lock screen that distinguished them
@@ -109,7 +190,18 @@ static int lock_try(const char* user, const char* pass) {
         if (g_lock.status)
             w_label_set(g_lock.status, "Incorrect user name or password.");
         kprintf("lock: authentication FAILED for '%s'\n", user);
-        task_msleep(1000);
+        /* NO SLEEP HERE.  The shell's login delays a failed attempt on the
+         * SHELL's task, which is the thing waiting anyway.  This runs on the
+         * lock window's APP-HOST task, and sleeping it stops that window's
+         * event loop — so a few wrong passwords made the desktop appear to
+         * seize up.  Reported from use as *"after several attempts the GUI
+         * starts to lag"*, and it was not lag: it was the window not running.
+         *
+         * The cost of losing it is small and named: this surface is reached by
+         * a person at the keyboard, and PBKDF2 already puts ~0.5 s between
+         * attempts (measured, users.h).  A real rate limit belongs in
+         * `user_check_password`, where every caller inherits it — which is
+         * where it should have gone in the first place. */
         return -1;
     }
     kprintf("lock: authenticated '%s'\n", user);
@@ -125,7 +217,7 @@ static int lock_try(const char* user, const char* pass) {
 
 static void lock_submit(struct w_textinput* t, void* ctx) {
     (void)t; (void)ctx;
-    if (!g_lock.user || !g_lock.pass) {
+    if (!g_lock.picker || !g_lock.pass) {
         /* SAYS SO.  This returned silently in the first version, and the
          * instrument then reported "still locked" for a CORRECT password —
          * a passing-looking failure whose cause was three layers away.  The
@@ -135,7 +227,16 @@ static void lock_submit(struct w_textinput* t, void* ctx) {
         kprintf("lock: submit before the fields exist — ignored\n");
         return;
     }
-    if (lock_try(g_lock.user->buf, g_lock.pass->buf) == 0) {
+    const struct user_account* who = lk_at(g_lock.picker->sel);
+    if (!who) {
+        /* Nothing chosen.  SAYS SO rather than authenticating against an empty
+         * name, which would fail for a reason that has nothing to do with the
+         * password the person just typed. */
+        if (g_lock.status) w_label_set(g_lock.status, "Choose an account first.");
+        if (g_lock.win) gui_window_request_redraw(g_lock.win);
+        return;
+    }
+    if (lock_try(who->name, g_lock.pass->buf) == 0) {
         /* Scrub the password out of the widget before the window goes: the
          * struct is freed, not zeroed, and a freed heap block holding a
          * password is a password on the heap. */
@@ -164,7 +265,7 @@ static void lock_layout(struct gui_window* win);
 static void lock_closed(struct gui_window* w) {
     (void)w;
     g_lock.win = NULL;
-    g_lock.user = NULL;
+    g_lock.picker = NULL;
     g_lock.pass = NULL;
     g_lock.status = NULL;
     if (!g_lock.unlocked) {
@@ -179,7 +280,7 @@ static void lock_build(void) {
     if (g_lock.win) return;
 
     struct gui_window* win = gui_app_window_create("Locked", -1, -1,
-                                                  cp_px(380), cp_px(190),
+                                                  cp_px(400), cp_px(300),
                                                   lock_layout, NULL);
     if (!win) return;
     g_lock.win = win;
@@ -225,26 +326,48 @@ int gui_lock_raise(void) {
 /* Widgets are built in the LAYOUT hook, which is where gui.h says an app window
  * must build them: the content size is not established until it runs. */
 static void lock_layout(struct gui_window* win) {
-    if (g_lock.user) return;                      /* build once (ui.h's rule) */
+    if (g_lock.picker) return;                    /* build once (ui.h's rule) */
+    int cw, ch;
+    gui_window_content_size(win, &cw, &ch);
+    const int pad = cp_px(18);
     int y = cp_px(14);
-    w_label_create(win, cp_px(18), y, cp_px(340),
-                   "This screen is locked.  Sign in to continue.");
-    y += cp_row_h() + cp_px(8);
-    w_label_create(win, cp_px(18), y, cp_px(90), "User");
-    g_lock.user = w_textinput_create(win, cp_px(112), y, cp_px(240), NULL);
-    /* Offer the default account (`users.default_user`).  Pre-filling a NAME is
-     * not a secret — the account list is visible in the Control Panel and in
-     * every owner column — and it saves the one piece of typing somebody at a
-     * locked machine should not have to guess. */
-    w_textinput_set(g_lock.user, users_default_name());
+
+    w_label_create(win, pad, y, cw - 2 * pad,
+                   "This screen is locked.  Choose an account and sign in.");
     y += cp_row_h() + cp_px(6);
-    w_label_create(win, cp_px(18), y, cp_px(90), "Password");
-    g_lock.pass = w_textinput_create(win, cp_px(112), y, cp_px(240), NULL);
+
+    int list_h = ch - y - 2 * cp_row_h() - cp_px(26);
+    if (list_h < cp_row_h() * 2) list_h = cp_row_h() * 2;
+    g_lock.picker = w_itemview_create(win, pad, y, cw - 2 * pad, list_h,
+                                      &lk_model, "list", NULL);
+    if (g_lock.picker) g_lock.picker->on_select = lk_on_select;
+    y += list_h + cp_px(8);
+
+    w_label_create(win, pad, y, cp_px(90), "Password");
+    g_lock.pass = w_textinput_create(win, pad + cp_px(96), y,
+                                     cw - pad - cp_px(96) - pad, NULL);
     w_textinput_set_secret(g_lock.pass, 1);
     if (g_lock.pass) g_lock.pass->on_submit = lock_submit;
-    y += cp_row_h() + cp_px(10);
-    g_lock.status = w_label_create(win, cp_px(18), y, cp_px(340), "");
-    gui_window_focus_widget(win, (struct widget*)g_lock.user);
+    y += cp_row_h() + cp_px(8);
+    g_lock.status = w_label_create(win, pad, y, cw - 2 * pad, "");
+
+    /* Pre-choose the default account (`users.default_user`) when it can sign
+     * in, so the common case is one password away.  A NAME is not a secret;
+     * pre-filling it saves the one thing somebody at a locked machine should
+     * not have to guess. */
+    {
+        const char* d = users_default_name();
+        for (int i = 0; i < lk_count(NULL); i++) {
+            const struct user_account* u = lk_at(i);
+            int same = 1;
+            for (int k = 0; ; k++) {
+                if (u->name[k] != d[k]) { same = 0; break; }
+                if (!d[k]) break;
+            }
+            if (same) { lk_choose(i); break; }
+        }
+    }
+    gui_window_focus_widget(win, (struct widget*)g_lock.pass);
 }
 
 /* ---------------------------------------------------------------------------
@@ -287,7 +410,26 @@ void gui_lock_test(const char* creds) {
     /* Fill the widgets and call the SAME submit the Enter key calls — not
      * lock_try directly.  A test that skipped the widgets would pass while the
      * field was disconnected, which is the defect most likely to exist. */
-    w_textinput_set(g_lock.user, u);
+    /* Choose through the PICKER rather than writing the name into a field —
+     * the field is gone, and a test that set state the user interface no longer
+     * offers would pass over a broken picker. */
+    {
+        int found = -1;
+        for (int i = 0; i < lk_count(NULL); i++) {
+            const struct user_account* a = lk_at(i);
+            int same = 1;
+            for (int k = 0; ; k++) {
+                if (a->name[k] != u[k]) { same = 0; break; }
+                if (!u[k]) break;
+            }
+            if (same) { found = i; break; }
+        }
+        if (found < 0) {
+            kprintf("locktest: '%s' is not an account that can sign in\n", u);
+            return;
+        }
+        lk_choose(found);
+    }
     w_textinput_set(g_lock.pass, p);
     lock_submit(g_lock.pass, NULL);
     kprintf("locktest: result — %s\n",
