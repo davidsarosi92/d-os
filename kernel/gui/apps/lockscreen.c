@@ -76,6 +76,22 @@ struct lock_state {
 
 static struct lock_state g_lock;
 
+/* WHO SIGNED IN AT THIS SCREEN.
+ *
+ * The desktop task is SYSTEM-owned (see the header), so `cred_current()` on
+ * the panel or the Start menu answers "system" and cannot name a person.  That
+ * is the honest answer for the TASK and the wrong one for the chrome, which is
+ * reporting who is at the keyboard.  The lock screen is the only place that
+ * knows, so it records it — and it is a NAME rather than a cred, precisely so
+ * nothing mistakes it for an identity that grants anything. */
+static char g_session_user[USER_NAME_MAX + 1];
+
+const char* gui_session_user(void) {
+    return g_session_user[0] ? g_session_user : NULL;
+}
+
+void gui_session_clear(void) { g_session_user[0] = 0; }
+
 /* Raising re-enters from on_close (a lock that was dismissed comes back), so
  * the two refer to each other and one of them has to be declared first. */
 int gui_lock_raise(void);
@@ -97,6 +113,12 @@ static int lock_try(const char* user, const char* pass) {
         return -1;
     }
     kprintf("lock: authenticated '%s'\n", user);
+    {
+        int i = 0;
+        for (; user[i] && i < (int)sizeof g_session_user - 1; i++)
+            g_session_user[i] = user[i];
+        g_session_user[i] = 0;
+    }
     g_lock.unlocked = 1;
     return 0;
 }

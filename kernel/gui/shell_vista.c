@@ -118,6 +118,11 @@
 #define COL_TEXT (cp_current_theme()->text)
 #define COL_SHADOW      0x48000000u
 #define COL_SEP (cp_current_theme()->line_soft)
+/* §M32 — the Start menu's account band.  `tray` is the token the design gives
+ * a table header and a tab tray, which is what this band is: a caption over a
+ * list, not one of its entries. */
+#define COL_SM_HEAD (cp_current_theme()->tray)
+#define COL_ACCENT  (cp_current_theme()->accent)
 
 #define TB_MAX_BTNS 8
 
@@ -473,13 +478,46 @@ static int volpop_y(void) { return scr_h - TASKBAR_H - VOLPOP_H; }
 /* Geometry helpers shared by draw + hit-test.                                 */
 /* -------------------------------------------------------------------------- */
 
+/* THE TAIL IS A TABLE, and that is a fix as much as an addition.
+ *
+ * Its rows used to be open-coded as `apps`, `apps + 1`, `apps + 2` in FOUR
+ * places — the row count, the label, the separator and the click handler — so
+ * adding an item meant editing all four in step.  That is §4.79's shape, the
+ * one that produces a menu which draws correctly and hit-tests wrongly, and it
+ * was one edit away from happening here.  One list now, read by all four. */
+/* Lock ends nothing: the session stays, the screen is covered.  Sign out
+ * additionally FORGETS who was here, so the next person is asked rather than
+ * shown the previous one's name in the header. */
+static void sm_lock(void)    { gui_lock_raise(); }
+static void sm_signout(void) { gui_session_clear(); gui_lock_raise(); }
+static void sm_exitgui(void)  { gui_queue_exit(); }
+static void sm_reboot(void)   { gui_queue_power(1); }
+static void sm_shutdown(void) { gui_queue_power(0); }
+
+static const struct { const char* key; void (*act)(void); } sm_tail[] = {
+    /* Escalating order of what each one ends: the screen, the session, the
+     * desktop, the kernel, the machine.  Lock is first because it is the one
+     * that ends nothing at all. */
+    { "menu.lock",     sm_lock     },
+    { "menu.signout",  sm_signout  },
+    { "menu.exitgui",  sm_exitgui  },
+    { "menu.reboot",   sm_reboot   },
+    { "menu.shutdown", sm_shutdown },
+};
+#define SM_TAIL_N ((int)(sizeof sm_tail / sizeof sm_tail[0]))
+
+/* The header band: who is signed in.  Not a row — it cannot be clicked, and
+ * giving it a row index would put a non-action into the same arithmetic as the
+ * actions. */
+#define SM_HEAD_H (cp_fh() + cp_px(14))
+
 static int menu_rows(void) {
     int apps = gui_app_count();
     if (apps > SM_MAX_APPS) apps = SM_MAX_APPS;
-    return apps + 3;                    /* + Exit GUI + Reboot + Shut Down */
+    return apps + SM_TAIL_N;
 }
 
-static int menu_h(void)   { return menu_rows() * SM_ITEM_H + 12; }
+static int menu_h(void)   { return menu_rows() * SM_ITEM_H + 12 + SM_HEAD_H; }
 static int menu_top(void) { return scr_h - TASKBAR_H - menu_h(); }
 
 /* M22.7-B — tell the compositor the popup's on-screen rect so it composites
@@ -523,13 +561,19 @@ static const char* menu_label(int row) {
          * exactly as before. */
         return a ? lstr(a->name) : "?";
     }
-    /* Three fixed tail items, in escalating order of what they end: the GUI
-     * session, the kernel, the machine.  "Exit GUI" sits above Reboot because
-     * leaving the desktop is the reversible one — `gui` at the shell brings it
-     * straight back. */
-    if (row == apps)     return lstr("menu.exitgui");
-    if (row == apps + 1) return lstr("menu.reboot");
-    return lstr("menu.shutdown");
+    int t = row - apps;
+    if (t >= 0 && t < SM_TAIL_N) return lstr(sm_tail[t].key);
+    return "?";
+}
+
+/* WHAT THE HEADER SAYS.  `gui_session_user()` when somebody signed in at the
+ * lock screen; otherwise the desktop is running as the system and says so —
+ * the same word `ps`, /proc and the Task Manager use, because inventing a
+ * friendlier one here would be the only place in the tree where that identity
+ * has a different name. */
+static const char* menu_user(void) {
+    const char* u = gui_session_user();
+    return u ? u : "system";
 }
 
 /* -------------------------------------------------------------------------- */
@@ -733,9 +777,18 @@ static void vista_draw(struct gfx_surface* back) {
         gfx_fill(back, 4, myy, 1, mh, COL_SM_EDGE);
         gfx_fill(back, 4 + SM_W - 1, myy, 1, mh, COL_SM_EDGE);
 
+        /* THE HEADER: the account, set apart rather than listed.  It is drawn
+         * on its own band with the accent colour and a rule under it, because
+         * it is not a thing you can choose — a name sitting in the same column
+         * as "Shut Down", in the same colour, reads as another command. */
+        gfx_fill(back, 5, myy + 1, SM_W - 2, SM_HEAD_H - 1, COL_SM_HEAD);
+        cp_text(back, 18, myy + 1 + (SM_HEAD_H - 1 - cp_fh()) / 2,
+                menu_user(), COL_ACCENT);
+        gfx_fill(back, 10, myy + SM_HEAD_H, SM_W - 12, 1, COL_SEP);
+
         for (int i = 0; i < menu_rows(); i++) {
-            int iy = myy + 6 + i * SM_ITEM_H;
-            if (i == apps)               /* separator above the power tail */
+            int iy = myy + 6 + SM_HEAD_H + i * SM_ITEM_H;
+            if (i == apps)               /* separator above the session tail */
                 gfx_fill(back, 10, iy - 1, SM_W - 12, 1, COL_SEP);
             if (i == menu_hover)
                 gfx_fill(back, 6, iy, SM_W - 4, SM_ITEM_H, COL_SM_HOVER);
@@ -750,8 +803,9 @@ static void vista_motion(int x, int y) {
     int myy = menu_top();
     int nh;
     if (x >= 4 && x < 4 + SM_W &&
-        y >= myy + 6 && y < myy + 6 + menu_rows() * SM_ITEM_H)
-        nh = (y - myy - 6) / SM_ITEM_H;
+        y >= myy + 6 + SM_HEAD_H &&
+        y < myy + 6 + SM_HEAD_H + menu_rows() * SM_ITEM_H)
+        nh = (y - myy - 6 - SM_HEAD_H) / SM_ITEM_H;
     else
         nh = -1;
     if (nh != menu_hover) {
@@ -886,17 +940,16 @@ static int vista_click(int x, int y) {
     if (menu_open) {
         int myy = menu_top();
         if (x >= 4 && x < 4 + SM_W && y >= myy && y < ty) {
-            int idx = (y - myy - 6) / SM_ITEM_H;
+            int idx = (y - myy - 6 - SM_HEAD_H) / SM_ITEM_H;
             int apps = gui_app_count();
             if (apps > SM_MAX_APPS) apps = SM_MAX_APPS;
+            /* A click on the header band gives a NEGATIVE index and falls
+             * through every arm — it is not a row, and it must not become one
+             * by rounding. */
             if (idx >= 0 && idx < apps)
                 gui_queue_launch(gui_app_at(idx));
-            else if (idx == apps)
-                gui_queue_exit();               /* back to the text shell */
-            else if (idx == apps + 1)
-                gui_queue_power(1);
-            else if (idx == apps + 2)
-                gui_queue_power(0);
+            else if (idx >= apps && idx - apps < SM_TAIL_N)
+                sm_tail[idx - apps].act();
             menu_open = 0;
             publish_popup();
             return 1;

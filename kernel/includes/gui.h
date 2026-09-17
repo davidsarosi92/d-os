@@ -166,6 +166,12 @@ int  gui_lock_active(void);
 /* Drive the lock's REAL submit path with "user:password".  See the comment on
  * cmd_lock for why this has to be reachable from a config key. */
 void gui_lock_test(const char* creds);
+/* The account that signed in at the lock screen, or NULL when nobody has.
+ * The chrome asks this rather than `cred_current()`: the desktop task is
+ * SYSTEM-owned, so the task's identity is not the person's. */
+const char* gui_session_user(void);
+/* Forget it — signing out. */
+void gui_session_clear(void);
 
 /* Queue an app launch onto the compositor.  The compositor spawns a
  * dedicated "app-host" task that runs the app (M22.7), so launching must
