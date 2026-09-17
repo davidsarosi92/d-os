@@ -383,14 +383,26 @@ static void done_password(const char* pw) {
         if (ac_win) gui_window_request_redraw(ac_win);
         return;
     }
-    user_set_password(u->name, pw);
-    /* SAY IT HERE.  users.c prints to the console and the GUI suppresses it,
-     * so a panel that relied on that message reports nothing at all. */
+    /* CHECK THE RETURN VALUE.  The first version called this and then reported
+     * success unconditionally — so a refusal (which users.c prints to the
+     * console, and the GUI suppresses) came out of this panel as *"Password set
+     * for david"*.  **A panel that reports the outcome it hoped for is worse
+     * than one that reports nothing**, because the user then goes looking for
+     * the fault everywhere except where it is. */
+    int rc = user_set_password(u->name, pw);
     if (ac_detail) {
-        static char m[120];
-        int n = ac_put(m, sizeof m, 0, "Password set for ");
-        n = ac_put(m, sizeof m, n, u->name);
-        n = ac_put(m, sizeof m, n, ".  They can sign in with it now.");
+        static char m[140];
+        int n;
+        if (rc == 0) {
+            n = ac_put(m, sizeof m, 0, "Password set for ");
+            n = ac_put(m, sizeof m, n, u->name);
+            n = ac_put(m, sizeof m, n, ".  They can sign in with it now.");
+        } else {
+            n = ac_put(m, sizeof m, 0, "REFUSED — the password for ");
+            n = ac_put(m, sizeof m, n, u->name);
+            n = ac_put(m, sizeof m, n, " was NOT changed.  (An administrator's "
+                                       "password needs root.)");
+        }
         (void)n;
         w_label_set(ac_detail, m);
     }
