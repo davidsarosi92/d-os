@@ -345,8 +345,21 @@ int app_dispatch_event(struct gui_window* win, const struct app_event* e) {
                     p->pressed = 0;
                     gui_window_request_redraw_rect(win, p->x, p->y, p->w, p->h);
                 }
+            /* §M32 — A DISABLED WIDGET RECEIVES NO INPUT AT ALL.
+             *
+             * `widget.disabled` was honoured in exactly one place here — the
+             * pressed HIGHLIGHT — while the grab below, the ordinary click
+             * (AE_MOUSE) and both keyboard paths dispatched to it regardless.
+             * So a greyed control looked dead and ACTED, which is worse than
+             * either: reported from use as *"the button is shown disabled and I
+             * can still click it"*.
+             *
+             * Four dispatch points, one rule, checked at each — the same shape
+             * as §4.79's title buttons, where the painter and the hit test had
+             * computed the same box differently. */
             struct widget* hit = widget_at(win->widgets, e->x, e->y);
-            if (hit && !hit->disabled) {
+            if (hit && hit->disabled) hit = NULL;
+            if (hit) {
                 hit->pressed = 1;
                 gui_window_request_redraw_rect(win, hit->x, hit->y,
                                                hit->w, hit->h);
@@ -374,6 +387,7 @@ int app_dispatch_event(struct gui_window* win, const struct app_event* e) {
     }
     if (e->type == AE_MOUSE) {
         struct widget* w = widget_at(win->widgets, e->x, e->y);
+        if (w && w->disabled) return 0;                  /* see AE_POINTER */
         if (!w || !w->ops || !w->ops->mouse) return 0;   /* nothing ran */
         w->ops->mouse(w, e->x - w->x, e->y - w->y, e->dbl);
     } else if (e->type == AE_KEY) {
@@ -383,6 +397,7 @@ int app_dispatch_event(struct gui_window* win, const struct app_event* e) {
          * is the only input the user can aim. */
         if (win->key_hook) { win->key_hook(win, e->c); return 1; }
         struct widget* w = win->focusw;
+        if (w && w->disabled) return 1;                  /* see AE_POINTER */
         if (w && w->ops && w->ops->key) w->ops->key(w, e->c);
     } else if (e->type == AE_KEYCODE) {
         /* §M65 — TAB CYCLES FOCUS, at the WINDOW level, before the focused
@@ -397,6 +412,7 @@ int app_dispatch_event(struct gui_window* win, const struct app_event* e) {
             return 1;
         }
         struct widget* w = win->focusw;
+        if (w && w->disabled) return 1;                  /* see AE_POINTER */
         if (w && w->ops && w->ops->keycode) w->ops->keycode(w, e->kc, e->mods);
     } else {
         /* AE_BUTTON REACHES NO HANDLER ON A WIDGET WINDOW — and demanding a

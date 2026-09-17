@@ -119,7 +119,14 @@ struct widget {
      * forces every panel to fake it — by hiding the control, which moves the
      * layout, or by leaving it live and ignoring the result.  One flag, honoured
      * in the two places that matter (draw and hit-test), rather than in each
-     * widget's own code where four of nine would forget. */
+     * widget's own code where four of nine would forget.
+     *
+     * §M32 — AND IT MEANS NO INPUT AT ALL, not merely a dimmer drawing.  It was
+     * honoured in the painter and in ONE of app_host.c's four dispatch points,
+     * so a greyed control looked dead and ACTED — worse than either, because a
+     * user who has been told a control is off does not expect it to fire.  All
+     * four check it now (pointer, mouse, key, keycode), and a fifth dispatch
+     * path must too. */
     int disabled;
     /* Pointer-over, resolved on the app-host task from an AE_HOVER position.
      * Not set for a disabled widget: the design's state row is exclusive, and
