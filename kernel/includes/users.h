@@ -114,6 +114,25 @@
  * `security.kdf_iterations` moves it for a board where that is wrong. */
 #define USER_KDF_ITERS_DEFAULT 10000
 
+/* §M32 — THE DEFAULT ACCOUNT.
+ *
+ * A machine that boots with no usable account is a machine nobody can log
+ * into, and the bootstrap console (below) is a workaround rather than an
+ * answer.  So root ships WITH a password, and the tension that creates is
+ * resolved rather than hidden:
+ *
+ *   - A DEFAULT CREDENTIAL THAT IS SILENT IS A BACKDOOR.  This one is
+ *     announced on the console at EVERY boot until it is changed, and the
+ *     account is marked so the system knows the difference.
+ *   - `users_needs_setup()` stays true while root still carries it, so the
+ *     installer console keeps working out of the box.  *The machine is not
+ *     "configured" because an account exists; it is configured when somebody
+ *     has chosen a secret.*
+ *
+ * `users.default_user` names the account the login surfaces offer first. */
+#define USER_DEFAULT_NAME     "root"
+#define USER_DEFAULT_PASSWORD "dos"
+
 enum user_type {
     USER_TYPE_PERSON = 0,       /* someone may log in as this               */
     USER_TYPE_SYSTEM = 1,       /* an identity for files/services; no login */
@@ -143,6 +162,12 @@ struct user_account {
     /* Password material.  `has_password == 0` means LOGIN REFUSED, which is
      * not the same as an empty password and must never become it. */
     int      has_password;
+    /* Set while the password is still the shipped default.  A separate fact
+     * from has_password: "cannot log in", "can log in with a secret somebody
+     * chose" and "can log in with the password printed in the manual" are three
+     * different states, and collapsing the last two is what turns a
+     * convenience into a backdoor. */
+    int      pw_is_default;
     uint32_t kdf_iters;
     char     salt_hex[USER_SALT_BYTES * 2 + 1];
     char     hash_hex[64 + 1];
@@ -185,6 +210,13 @@ void users_ensure_pref_store(int uid);
 
 /* True while no account can log in.  See the bootstrap note in the header. */
 int  users_needs_setup(void);
+
+/* Is any account still carrying the shipped default password? */
+int  users_default_password_in_use(void);
+/* The account the login surfaces offer first (`users.default_user`). */
+const char* users_default_name(void);
+/* Print the standing warning.  Called from both boot paths, every boot. */
+void users_warn_default_password(void);
 
 /* ---------------------------------------------------------------------------
  * Lookup.  These are read-only and ungated: who exists is not a secret, and

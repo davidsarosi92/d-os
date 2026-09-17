@@ -688,7 +688,20 @@ void settings_cmd(const char* args) {
      * investigated. */
     if (streq_(cmd, "open")) {
         char which[48];
-        word_(rest, which, sizeof which);
+        /* §M32 — the WHOLE tail, not the first word.  §M70's rule is that a
+         * verb owns its argument tail, and `conf open` had been taking one
+         * word: every panel named so far happened to be a single word, and
+         * "User accounts" was the first that was not — `conf: no panel 'User'`.
+         * *A parser that is correct for every input tried so far is not a
+         * parser, it is a coincidence.* */
+        {
+            int wi = 0;
+            const char* r = rest;
+            while (*r == ' ') r++;
+            while (*r && wi < (int)sizeof which - 1) which[wi++] = *r++;
+            while (wi > 0 && which[wi - 1] == ' ') wi--;   /* trailing spaces */
+            which[wi] = 0;
+        }
         if (!which[0]) { kprintf("conf: open <name|index>\n"); return; }
         int idx = -1;
         if (which[0] >= '0' && which[0] <= '9') {

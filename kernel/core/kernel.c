@@ -339,6 +339,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
              * means every user the administrator created is missing
              * after a reboot with nothing to say so. */
             users_attach_persistent("/mnt");
+            users_warn_default_password();
             /* §M75.1 — and the crash log, on the SAME volume and by the
              * same rule: a sink handed a path it merely hopes is writable
              * swallows every future record in silence (§M63 stage 0,

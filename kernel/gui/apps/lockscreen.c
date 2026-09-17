@@ -210,6 +210,11 @@ static void lock_layout(struct gui_window* win) {
     y += cp_row_h() + cp_px(8);
     w_label_create(win, cp_px(18), y, cp_px(90), "User");
     g_lock.user = w_textinput_create(win, cp_px(112), y, cp_px(240), NULL);
+    /* Offer the default account (`users.default_user`).  Pre-filling a NAME is
+     * not a secret — the account list is visible in the Control Panel and in
+     * every owner column — and it saves the one piece of typing somebody at a
+     * locked machine should not have to guess. */
+    w_textinput_set(g_lock.user, users_default_name());
     y += cp_row_h() + cp_px(6);
     w_label_create(win, cp_px(18), y, cp_px(90), "Password");
     g_lock.pass = w_textinput_create(win, cp_px(112), y, cp_px(240), NULL);

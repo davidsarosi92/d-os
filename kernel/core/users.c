@@ -15,6 +15,7 @@
 #include "printf.h"
 #include "klog.h"
 #include "config.h"
+#include "settings.h"
 #include <stddef.h>
 
 /* ---------------------------------------------------------------------------
@@ -383,6 +384,8 @@ static int save_shadow(const char* path) {
         s_cat(line, u->salt_hex, sizeof line);
         s_cat(line, ":", sizeof line);
         s_cat(line, u->hash_hex, sizeof line);
+        s_cat(line, ":", sizeof line);
+        s_itoa(u->pw_is_default, num, sizeof num); s_cat(line, num, sizeof line);
         s_cat(line, "\n", sizeof line);
         write_line(f, line);
     }
@@ -471,7 +474,8 @@ static void parse_passwd_line(char* line) {
 static void parse_shadow_line(char* line) {
     if (line[0] == '#' || line[0] == 0) return;
     char* f[6];
-    if (split(line, f, 6, ':') < 4) return;
+    int n = split(line, f, 6, ':');
+    if (n < 4) return;
     const struct user_account* ex = user_by_name(f[0]);
     if (!ex) return;
     struct user_account* u = (struct user_account*)ex;
@@ -479,6 +483,11 @@ static void parse_shadow_line(char* line) {
     s_copy(u->salt_hex, f[2], sizeof u->salt_hex);
     s_copy(u->hash_hex, f[3], sizeof u->hash_hex);
     u->has_password = 1;
+    /* Field 4 is optional: a store written before this flag existed simply has
+     * no fifth column, and the absent value means "not the default" — which is
+     * the safe reading, because it under-claims (it will not warn about a
+     * password somebody actually chose). */
+    u->pw_is_default = (n >= 5) ? s_atoi(f[4]) : 0;
 }
 
 static int load_file(const char* path, void (*fn)(char*)) {
@@ -646,16 +655,52 @@ void users_init(void) {
     r->type      = USER_TYPE_PERSON;
     r->elevation = USER_ELEV_PER_OP;
     s_copy(r->home, "/root", sizeof r->home);
-    r->has_password = 0;
     r->kdf_iters    = USER_KDF_ITERS_DEFAULT;
+
+    /* THE DEFAULT CREDENTIAL (users.h).  Set here so a freshly built machine
+     * has an account somebody can actually sign in as — the bootstrap console
+     * is a way to CONFIGURE a machine, not a way to use one. */
+    {
+        uint8_t salt[USER_SALT_BYTES];
+        random_bytes(salt, sizeof salt);
+        to_hex(salt, USER_SALT_BYTES, r->salt_hex);
+        derive(USER_DEFAULT_PASSWORD, r->salt_hex, r->kdf_iters, r->hash_hex);
+        r->has_password  = 1;
+        r->pw_is_default = 1;
+    }
 }
 
 int users_needs_setup(void) {
     if (!g_inited) users_init();
+    /* "Somebody has CHOSEN a secret", not "an account exists".  root ships with
+     * a default password (users.h), so counting that as configured would close
+     * the installer console on a machine nobody has set up yet — and the
+     * console is how it gets set up. */
     for (int i = 0; i < USER_MAX_ACCOUNTS; i++)
         if (g_users[i].used && g_users[i].type == USER_TYPE_PERSON &&
-            g_users[i].has_password) return 0;
+            g_users[i].has_password && !g_users[i].pw_is_default) return 0;
     return 1;
+}
+
+int users_default_password_in_use(void) {
+    if (!g_inited) users_init();
+    for (int i = 0; i < USER_MAX_ACCOUNTS; i++)
+        if (g_users[i].used && g_users[i].pw_is_default) return 1;
+    return 0;
+}
+
+const char* users_default_name(void) {
+    return config_get("users.default_user", USER_DEFAULT_NAME);
+}
+
+void users_warn_default_password(void) {
+    if (!users_default_password_in_use()) return;
+    /* EVERY BOOT, until it is changed.  A default credential nobody is told
+     * about is a backdoor; one that announces itself is a task on a list. */
+    kprintf("\n!! '%s' still has the SHIPPED DEFAULT PASSWORD (\"%s\").\n"
+            "!! Anybody who knows this system can sign in.  Change it with "
+            "`passwd %s <new>`.\n\n",
+            USER_DEFAULT_NAME, USER_DEFAULT_PASSWORD, USER_DEFAULT_NAME);
 }
 
 /* ---------------------------------------------------------------------------
@@ -795,7 +840,8 @@ int user_set_password(const char* name, const char* password) {
         to_hex(salt, USER_SALT_BYTES, u->salt_hex);
         u->kdf_iters = kdf_iterations();
         derive(password, u->salt_hex, u->kdf_iters, u->hash_hex);
-        u->has_password = 1;
+        u->has_password  = 1;
+        u->pw_is_default = 0;          /* somebody has now chosen a secret */
         kprintf("users: password set for '%s' (pbkdf2-sha256, %u iterations)\n",
                 u->name, u->kdf_iters);
     }
@@ -995,9 +1041,20 @@ static void cmd_users(const char* args) {
         if (!any) kprintf(" (empty)");
         kprintf("\n");
     }
-    if (users_needs_setup())
-        console_write("users: NO ACCOUNT CAN LOG IN YET — this console is the "
-                      "installer; set a password with `passwd root`\n");
+    if (users_needs_setup()) {
+        /* This sentence used to read "NO ACCOUNT CAN LOG IN YET", which was
+         * true until root started shipping with a default password and became
+         * false in the same change — the exact §M52 shape this milestone keeps
+         * closing, so it is corrected rather than left. */
+        if (users_default_password_in_use())
+            kprintf("users: THIS MACHINE IS NOT SET UP — '%s' still has the "
+                    "shipped default password, so this console is the "
+                    "installer.  Change it with `passwd %s <new>`.\n",
+                    USER_DEFAULT_NAME, USER_DEFAULT_NAME);
+        else
+            console_write("users: no account can sign in — this console is the "
+                          "installer; set a password with `passwd root <new>`\n");
+    }
 }
 
 static void cmd_useradd(const char* args) {
@@ -1086,3 +1143,10 @@ SHELL_CMD(groupdel) = { "groupdel", "<name>", "destroy a group",
                         SHELL_G_SYS, cmd_groupdel, SHELL_P_ADMIN };
 SHELL_CMD(groupmod) = { "groupmod", "<group> add|del <user>", "change group membership",
                         SHELL_G_SYS, cmd_groupmod, SHELL_P_ADMIN };
+
+CONFIG_KEY(ck_default_user) = {
+    .key = "users.default_user", .group = "System", .type = CFG_STRING,
+    .def = USER_DEFAULT_NAME,
+    .help = "the account the sign-in surfaces offer first",
+    .scope = CFG_SCOPE_MACHINE,
+};
