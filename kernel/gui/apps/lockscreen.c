@@ -185,10 +185,32 @@ static void lk_on_select(struct w_itemview* iv, int idx, void* c) {
 
 static int lock_try(const char* user, const char* pass) {
     if (user_check_password(user, pass) != 0) {
-        /* One message for both causes — a lock screen that distinguished them
-         * would enumerate the machine's accounts to whoever is standing at it. */
-        if (g_lock.status)
-            w_label_set(g_lock.status, "Incorrect user name or password.");
+        /* NAME THE ACCOUNT IT TRIED.
+         *
+         * The generic "incorrect user name or password" is the right message
+         * where a login prompt would otherwise ENUMERATE accounts — and that
+         * argument does not apply to a picker that is already listing every one
+         * of them on screen.  What it cost instead was a debugging session in
+         * which "I chose david and typed his password" and "it submitted a
+         * different row" produced identical evidence.
+         *
+         * It also reports whether anything was typed, because "wrong password"
+         * and "no password reached the field" are different problems and the
+         * mask (fixed-width by design) cannot tell them apart. */
+        if (g_lock.status) {
+            static char m[96];
+            int n = 0;
+            const char* a = "Incorrect password for '";
+            for (int i = 0; a[i] && n < 94; i++) m[n++] = a[i];
+            for (int i = 0; user[i] && n < 92; i++) m[n++] = user[i];
+            m[n++] = '\'';
+            if (!pass || !pass[0]) {
+                const char* b = " (nothing was typed)";
+                for (int i = 0; b[i] && n < 94; i++) m[n++] = b[i];
+            }
+            m[n++] = '.'; m[n] = 0;
+            w_label_set(g_lock.status, m);
+        }
         kprintf("lock: authentication FAILED for '%s'\n", user);
         /* NO SLEEP HERE.  The shell's login delays a failed attempt on the
          * SHELL's task, which is the thing waiting anyway.  This runs on the
