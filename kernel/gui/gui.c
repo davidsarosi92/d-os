@@ -675,6 +675,27 @@ struct gui_window* top_visible_locked(void) {
  * The compositor composites this rect on top of the windows while open, and
  * the mouse IRQ routes clicks inside it to the panel. */
 void gui_panel_set_popup(int on, int x, int y, int w, int h) {
+    /* §M32 — A POPUP THAT DOES NOT FIT THE STRIP SAYS SO.
+     *
+     * `panelsurf` is addressed in SCREEN coordinates but only the bottom strip
+     * is backed, and the clip quietly discards anything above it.  A shell that
+     * grew its menu past the reserve therefore lost the TOP of it — rows that
+     * were drawn, hit-tested and simply never appeared — and the symptom points
+     * at whatever was added last rather than at the strip.
+     *
+     * Once, on the console, because this is a geometry fact and not an event:
+     * it is the same every frame the menu is open, and a line per frame would
+     * bury the log the moment somebody left the menu up. */
+    if (on && y < panel_strip_top) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            kprintf("gui: POPUP TOO TALL — its top row %d is above the panel "
+                    "strip at %d, so %d pixel(s) are being CLIPPED AWAY.  "
+                    "Raise PANEL_POPUP_MAX (gui_priv.h).\n",
+                    y, panel_strip_top, panel_strip_top - y);
+        }
+    }
     pnl_pop_x = x; pnl_pop_y = y; pnl_pop_w = w; pnl_pop_h = h;
     pnl_pop_on = on ? 1 : 0;
     panel_dirty = 1;

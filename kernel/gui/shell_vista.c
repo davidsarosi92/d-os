@@ -507,21 +507,19 @@ static const struct { const char* key; void (*act)(void); } sm_tail[] = {
 };
 #define SM_TAIL_N ((int)(sizeof sm_tail / sizeof sm_tail[0]))
 
-/* §M32 — THE ACCOUNT HEADER IS NOT BUILT, and the reason is measured rather
- * than guessed.  A band drawn at `menu_top()` with the rows offset below it
- * came out in the wrong place: the runtime values are myy=540, head=41, and
- * the box lands on screen at ~650 — a constant ~110 px that belongs to the
- * PANEL SURFACE's own origin (`panelsurf` is a bottom strip, not the screen),
- * which every other element here happens to be insensitive to because they are
- * all positioned relative to the same `myy`.
+/* The header band: who is signed in.  Not a row — it cannot be clicked, and
+ * giving it a row index would put a non-action into the same arithmetic as the
+ * actions.
  *
- * What the band would SAY is settled and costs nothing to restate when it is
- * built: `gui_session_user()` when somebody signed in at the lock screen, and
- * otherwise "system" — the same word `ps`, /proc and the Task Manager use,
- * because the desktop task really is SYSTEM-owned and inventing a friendlier
- * name here would make this the only place in the tree where that identity has
- * a different one.  The honest fix is to find the strip's origin rather than to
- * add a magic offset; until then a half-placed band is worse than none. */
+ * IT WAS WITHDRAWN ONCE AND THE REASON WAS A DIFFERENT BUG.  The band appeared
+ * nowhere, and the measured geometry (myy=540, head=41, box on screen at ~650)
+ * looked like a coordinate-system problem.  It was not: `panelsurf` is backed
+ * only below `panel_strip_top`, and adding Lock + Sign out had already pushed
+ * the menu past PANEL_POPUP_MAX, so the strip's clip was silently removing the
+ * TOP of it — two application rows first (Control Panel and File Manager
+ * vanished and nobody noticed), the header after.  *A clip that removes what
+ * you just added looks exactly like what you just added not working.* */
+#define SM_HEAD_H (cp_fh() + cp_px(14))
 
 static int menu_rows(void) {
     int apps = gui_app_count();
@@ -529,7 +527,7 @@ static int menu_rows(void) {
     return apps + SM_TAIL_N;
 }
 
-static int menu_h(void)   { return menu_rows() * SM_ITEM_H + 12; }
+static int menu_h(void)   { return menu_rows() * SM_ITEM_H + 12 + SM_HEAD_H; }
 static int menu_top(void) { return scr_h - TASKBAR_H - menu_h(); }
 
 /* M22.7-B — tell the compositor the popup's on-screen rect so it composites
@@ -576,6 +574,16 @@ static const char* menu_label(int row) {
     int t = row - apps;
     if (t >= 0 && t < SM_TAIL_N) return lstr(sm_tail[t].key);
     return "?";
+}
+
+/* WHAT THE HEADER SAYS.  `gui_session_user()` when somebody signed in at the
+ * lock screen; otherwise the desktop is running as the system and says so —
+ * the same word `ps`, /proc and the Task Manager use, because inventing a
+ * friendlier one here would make this the only place in the tree where that
+ * identity has a different name. */
+static const char* menu_user(void) {
+    const char* u = gui_session_user();
+    return u ? u : "system";
 }
 
 
@@ -780,8 +788,17 @@ static void vista_draw(struct gfx_surface* back) {
         gfx_fill(back, 4, myy, 1, mh, COL_SM_EDGE);
         gfx_fill(back, 4 + SM_W - 1, myy, 1, mh, COL_SM_EDGE);
 
+        /* THE HEADER: the account, set apart rather than listed.  Its own band
+         * and the accent colour, with a rule under it — a name sitting in the
+         * same column as "Shut Down", in the same colour, reads as another
+         * command. */
+        gfx_fill(back, 5, myy + 1, SM_W - 2, SM_HEAD_H - 1, COL_SM_HEAD);
+        cp_text(back, 18, myy + 1 + (SM_HEAD_H - 1 - cp_fh()) / 2,
+                menu_user(), COL_ACCENT);
+        gfx_fill(back, 10, myy + SM_HEAD_H, SM_W - 12, 1, COL_SEP);
+
         for (int i = 0; i < menu_rows(); i++) {
-            int iy = myy + 6 + i * SM_ITEM_H;
+            int iy = myy + 6 + SM_HEAD_H + i * SM_ITEM_H;
             if (i == apps)               /* separator above the session tail */
                 gfx_fill(back, 10, iy - 1, SM_W - 12, 1, COL_SEP);
             if (i == menu_hover)
@@ -797,8 +814,9 @@ static void vista_motion(int x, int y) {
     int myy = menu_top();
     int nh;
     if (x >= 4 && x < 4 + SM_W &&
-        y >= myy + 6 && y < myy + 6 + menu_rows() * SM_ITEM_H)
-        nh = (y - myy - 6) / SM_ITEM_H;
+        y >= myy + 6 + SM_HEAD_H &&
+        y < myy + 6 + SM_HEAD_H + menu_rows() * SM_ITEM_H)
+        nh = (y - myy - 6 - SM_HEAD_H) / SM_ITEM_H;
     else
         nh = -1;
     if (nh != menu_hover) {
@@ -933,7 +951,10 @@ static int vista_click(int x, int y) {
     if (menu_open) {
         int myy = menu_top();
         if (x >= 4 && x < 4 + SM_W && y >= myy && y < ty) {
-            int idx = (y - myy - 6) / SM_ITEM_H;
+            /* A click on the header band gives a NEGATIVE index and falls
+             * through every arm — it is not a row, and must not become one by
+             * rounding. */
+            int idx = (y - myy - 6 - SM_HEAD_H) / SM_ITEM_H;
             int apps = gui_app_count();
             if (apps > SM_MAX_APPS) apps = SM_MAX_APPS;
             if (idx >= 0 && idx < apps)

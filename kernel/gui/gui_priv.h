@@ -455,8 +455,24 @@ extern void fb_flip_to(int idx);
 
 /* ---- the desktop shell's panel strip (gui.c) ------------------------------
  * A BOTTOM STRIP and not a full-screen surface: the taskbar needs the bottom
- * rows and a full-screen second surface costs ~5 MiB for pixels nothing draws. */
-#define PANEL_POPUP_MAX 480
+ * rows and a full-screen second surface costs ~5 MiB for pixels nothing draws.
+ *
+ * §M32 — RAISED FROM 480, AND THE OLD VALUE WAS ALREADY WRONG AT THIS DENSITY.
+ *
+ * The number has to cover the TALLEST popup the shell can produce, and the
+ * Start menu's height is `rows * (cp_fh() + 12) + 12`.  §M69 made the type a
+ * runtime fact, so `cp_fh()` is ~22 at the measured 137 % and up to ~32 at the
+ * 200 % cap; with `SM_MAX_APPS` (12) plus the session tail that is
+ * 17 * 44 + 12 = 760 in the worst case.  480 covered the 8x8-era menu and
+ * nothing since.
+ *
+ * WHAT IT COST TO FIND: adding two menu items pushed the menu past 480, the
+ * strip's clip silently removed its TOP — two application rows and, later, an
+ * account header — and the symptom was a menu that simply started at its third
+ * entry.  *A clip that removes the thing you just added looks exactly like the
+ * thing you just added not working*, which is three runs of chasing the wrong
+ * file.  `gui_panel_set_popup` now REFUSES to be silent about it. */
+#define PANEL_POPUP_MAX 768
 extern struct gfx_surface panelsurf;
 extern uint32_t*  panel_buf;
 extern int        panel_strip_top;
