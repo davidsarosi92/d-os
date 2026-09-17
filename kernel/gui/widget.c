@@ -663,8 +663,21 @@ static void textinput_draw(struct widget* w, struct gfx_surface* s) {
     if (t->secret) {
         /* §M32 — ONE marker, whatever the length.  A row of bullets is a
          * public statement of how many characters the password has, which is
-         * the one thing a shoulder-surfer cannot otherwise get. */
-        const char* mark = t->len ? "\xB7\xB7\xB7" : "";
+         * the one thing a shoulder-surfer cannot otherwise get.
+         *
+         * PLAIN ASCII, AND THAT IS THE §4.66 TRAP AGAIN.  The first version used
+         * 0xB7 for a middle dot, which is what it is in LATIN-1 — and this
+         * font is byte-indexed **ISO-8859-2**, where 0xB7 is a CARON.  The
+         * field therefore drew three hooks, reported from use as "some squiggle
+         * gets in", and it raised a much worse suspicion than the bug deserved:
+         * that the MASK was being submitted instead of the value.  It is not —
+         * drawing never touches `buf` — but a password field that displays
+         * something inexplicable has already cost the user their confidence in
+         * it, which is most of what such a field is for.
+         *
+         * CLAUDE.md records this trap twice before (a literal UTF-8 `á`, and a
+         * Hungarian string added while fixing the first).  Third time. */
+        const char* mark = t->len ? "***" : "";
         cp_text(s, w->x + 5, w->y + (w->h - cp_fh()) / 2, mark, WCOL_TEXT);
         cw = t->len ? 3 : 0;
     } else {
