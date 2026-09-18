@@ -53,6 +53,9 @@
 #include "config.h"
 #include "dialog.h"
 #include "printf.h"
+#include "shellcmd.h"
+#include "console.h"
+#include "task.h"
 #include <stddef.h>
 
 /* ---------------------------------------------------------------- */
@@ -598,3 +601,70 @@ SETTINGS_PANEL(accounts) = {
     ICON_APP,
     accounts_panel_open
 };
+
+/* ===========================================================================
+ * `accttest <user>:<password>` — drive the panel's REAL password chain.
+ *
+ * The lock screen got `gui.locktest` and this path never got its equivalent,
+ * which is why three rounds of reading looked in the wrong file: the shell's
+ * `passwd` works, the lock screen's input works, and the ONE untested link was
+ * the prompt's submit -> done_password.  A path with no instrument is a path
+ * whose failure is indistinguishable from every other path's.
+ *
+ * It fills the prompt's field and calls `pr_submit` — the same function the
+ * Enter key calls — rather than calling `done_password` directly: a test that
+ * skipped the submit would pass over exactly the code under suspicion.
+ * ========================================================================= */
+
+/* ON ITS OWN TASK.  With the GUI up, a kprintf from the SHELL's task goes to
+ * the suppressed console and reaches nobody (§4.79) — the first run of this
+ * test produced complete silence for exactly that reason, which is the same
+ * trap `gui.locktest` had to be moved out of. */
+static char at_user[64], at_pass[64];
+
+static void accttest_main(void) {
+    const char* u = at_user;
+    const char* p = at_pass;
+    /* Select the row the way a click does. */
+    int k = 0;
+    for (; u[k] && k < (int)sizeof ac_sel_name - 1; k++) ac_sel_name[k] = u[k];
+    ac_sel_name[k] = 0;
+    const struct user_account* sel = ac_selected();
+    if (!sel) { kprintf("accttest: no account '%s'\n", u); return; }
+    kprintf("accttest: selected '%s' (uid %d)\n", sel->name, sel->uid);
+
+    /* Raise the prompt exactly as the button does, wait for its field, fill it
+     * and submit through the REAL path. */
+    ac_prompt("test", 1, done_password);
+    int waited = 0;
+    for (; !pr_field && waited < 60000; waited++) task_yield();
+    if (!pr_field) { console_write("accttest: the prompt's field never appeared\n"); return; }
+
+    w_textinput_set(pr_field, p);
+    kprintf("accttest: field now holds %d character(s)\n", pr_field->len);
+    pr_submit(pr_field, NULL);
+
+    /* And CHECK it, here, against the same function login uses — so the answer
+     * is about the stored hash rather than about what we think we wrote. */
+    kprintf("accttest: user_check_password('%s', typed) -> %s\n", u,
+            user_check_password(u, p) == 0 ? "OK" : "MISMATCH");
+}
+
+static void cmd_accttest(const char* args) {
+    int i = 0;
+    while (*args == ' ') args++;
+    while (*args && *args != ':' && i < (int)sizeof at_user - 1) at_user[i++] = *args++;
+    at_user[i] = 0;
+    if (*args == ':') args++;
+    i = 0;
+    while (*args && *args != ' ' && i < (int)sizeof at_pass - 1) at_pass[i++] = *args++;
+    at_pass[i] = 0;
+    if (!at_user[0]) {
+        console_write("accttest: usage: accttest <user>:<password>\n");
+        return;
+    }
+    task_spawn_detached("accttest", accttest_main);
+}
+
+SHELL_CMD(accttest) = { "accttest", "<user>:<password>", NULL,
+                        SHELL_G_TEST, cmd_accttest, SHELL_P_ADMIN };
