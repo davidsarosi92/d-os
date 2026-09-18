@@ -291,7 +291,6 @@ void gui_window_request_redraw_rect(struct gui_window* win,
     gfx_set_clip(&win->surf, cx, cy, cw, ch);
     gfx_fill(&win->surf, cx, cy, cw, ch, COL_WIN_BG);
     widget_draw_all(win->widgets, &win->surf);  /* clip keeps it to the rect */
-    ui_draw_overlay(win, &win->surf);
     gfx_clear_clip(&win->surf);
     spin_unlock(&win->lock);
     gui_damage(win->x + BORDER + cx, win->y + TITLE_H + cy, cw, ch);

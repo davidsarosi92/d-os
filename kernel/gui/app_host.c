@@ -79,7 +79,6 @@ void app_redraw(struct gui_window* win) {
     spin_lock(&win->lock);
     gfx_fill(&win->surf, 0, 0, win->surf.w, win->surf.h, COL_WIN_BG);
     widget_draw_all(win->widgets, &win->surf);
-    ui_draw_overlay(win, &win->surf);
     spin_unlock(&win->lock);
     gui_damage_win(win);
     if (t0) kprintf("gui: full repaint of '%s' %dx%d - %u us\n", win->title,
@@ -324,15 +323,12 @@ int app_dispatch_event(struct gui_window* win, const struct app_event* e) {
          * look held while the button is down, which is the whole point of the
          * state.  Tracked here rather than in each widget for the same reason
          * the hover is: nine widgets would be nine chances to forget. */
-        /* §M69 — THE TOOLKIT GETS FIRST REFUSAL.  A scrolling container's
-         * scrollbar has no widget under it, so without this the bar the panel
-         * draws is decoration.  It also has to come before the widget lookup
-         * rather than after it: once a container has the grab, a drag that
-         * strays over a control must not press that control. */
-        if (ui_pointer_at(win, e->x, e->y, e->phase)) {
-            if (e->phase == WPTR_RELEASE) win->grabw = NULL;
-            return 0;                   /* it damaged exactly what it changed */
-        }
+        /* §M81 — THE TOOLKIT'S PRE-ROUTE STOOD HERE AND IS GONE.  §M69 had to
+         * ask `ui_pointer_at()` BEFORE the widget lookup, because a scrolling
+         * container's scrollbar had no widget under it and the bar a panel drew
+         * was therefore decoration.  The container is a widget now, its rect IS
+         * that strip, and the lookup below finds it — with the grab, the drag
+         * and the release handled by the same code that serves a slider. */
         if (e->phase == WPTR_PRESS) {
             /* §M69 — CLEAR ANY STALE `pressed` FIRST.  It used to be cleared
              * only on RELEASE, so a release that went missing left a widget
@@ -377,8 +373,15 @@ int app_dispatch_event(struct gui_window* win, const struct app_event* e) {
         struct widget* w = win->grabw;
         int ran = 0;
         if (w && w->ops && w->ops->pointer) {
-            w->ops->pointer(w, e->x - w->x, e->y - w->y, e->phase);
-            ran = 1;
+            /* §M81 — ASK WHAT THE HANDLER LEFT BEHIND (widget.h's WH_*).  This
+             * used to set `ran = 1` merely because the op existed, which was
+             * right for the four widgets that had one and would be wrong for a
+             * container: a press on the empty background inside a scrolling box
+             * would cost a whole-window repaint for an event nothing acted on,
+             * and a bar drag would cost one per motion packet — the exact 431
+             * kpx §M69 spent a milestone removing. */
+            ran = w->ops->pointer(w, e->x - w->x, e->y - w->y, e->phase)
+                      == WH_REPAINT;
         }
         if (e->phase == WPTR_RELEASE) win->grabw = NULL;
         /* The pressed/hover highlights above damage their own rects, so a

@@ -552,7 +552,13 @@ static void listview_key(struct widget* w, char c) {
  * arriving after the pointer has wandered off the narrow bar — without the
  * grab a drag would stop the instant the hand strayed twelve pixels sideways,
  * which is most of the time. */
-static void listview_pointer(struct widget* w, int lx, int ly, int phase) {
+/* §M81 — the op returns WH_* now (widget.h).  WH_REPAINT everywhere is
+ * EXACTLY what this did before it had a return value: the host set
+ * `ran = 1` whenever a pointer op existed.  Kept identical on purpose, so
+ * the only behaviour step 1 changes is the container's — several of these
+ * paths already damage precisely and are candidates for WH_DAMAGED, which
+ * is a saving with its own measurement. */
+static int listview_pointer(struct widget* w, int lx, int ly, int phase) {
     struct w_listview* lv = (struct w_listview*)w;
     struct sb_metrics m;
     lv_sb_metrics(lv, &m);
@@ -567,7 +573,7 @@ static void listview_pointer(struct widget* w, int lx, int ly, int phase) {
         if (gui_input_debug())
             kprintf("lv: press at %d,%d bar %d,%d %dx%d part=%d\n",
                     px, py, m.x, m.y, m.w, m.h, part);
-        if (part == SB_NONE) return;
+        if (part == SB_NONE) return WH_REPAINT;
         lv->sb_part = part;
         lv->sb_grab_dy = py - m.thumb_y;
         int was = lv->scroll, rows = lv_visible_rows(lv);
@@ -584,20 +590,21 @@ static void listview_pointer(struct widget* w, int lx, int ly, int phase) {
         if (lv->scroll > max) lv->scroll = max;
         if (lv->scroll != was) lv_damage_all(lv);
         else                   gui_window_request_redraw(w->win);  /* the emphasis */
-        return;
+        return WH_REPAINT;
     }
 
     if (phase == WPTR_DRAG) {
-        if (lv->sb_part != SB_THUMB) return;
+        if (lv->sb_part != SB_THUMB) return WH_REPAINT;
         int rows = lv_visible_rows(lv);
         int ns = sb_scroll_from_thumb(&m, lv->count, rows, py - lv->sb_grab_dy);
         if (ns != lv->scroll) { lv->scroll = ns; lv_damage_all(lv); }
-        return;
+        return WH_REPAINT;
     }
 
     /* RELEASE — drop the grab and repaint, because the pressed arrow is drawn
      * emphasised and would otherwise stay lit after the button came up. */
     if (lv->sb_part) { lv->sb_part = 0; gui_window_request_redraw(w->win); }
+    return WH_REPAINT;
 }
 
 static int listview_scroll(struct widget* w, int dz) {

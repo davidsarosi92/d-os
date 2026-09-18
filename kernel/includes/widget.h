@@ -59,8 +59,20 @@ struct widget_ops {
      * silently re-binds each table by one slot (the compiler warns about the type
      * mismatches — and would NOT warn where two neighbours happen to share a
      * signature).  New optional ops go at the end.
-     * NULL = the widget does not want the stream. */
-    void (*pointer)(struct widget* w, int lx, int ly, int phase);
+     * NULL = the widget does not want the stream.
+     *
+     * §M81 — RETURNS WH_* (below), not void.  The host needs THREE answers and
+     * a void op could give it one: it assumed that a widget with a `pointer`
+     * op had both handled the event and left the window needing a full
+     * repaint.  That was true of the four widgets that had one, and it stopped
+     * being true the moment a CONTAINER grew the op — a press landing on the
+     * empty background inside a scrolling box would have cost a whole-window
+     * repaint for an event nothing acted on.
+     *
+     * This is §M69's `scroll` lesson generalised: *"has a handler" and "did
+     * something" are different facts* — and "did something" and "and damaged
+     * exactly what it changed" are a third. */
+    int  (*pointer)(struct widget* w, int lx, int ly, int phase);
     /* §M61 follow-up — mouse WHEEL over this widget.  `dz` is positive for
      * wheel-up.  Also at the end, for the reason above.
      *
@@ -96,6 +108,27 @@ struct widget_ops {
 #define WPTR_PRESS    0
 #define WPTR_DRAG     1
 #define WPTR_RELEASE  2
+
+/* §M81 — WHAT A HANDLER LEAVES BEHIND.  Three answers, because the host has
+ * three different things to do with them and every earlier version of this
+ * question shipped with only two.
+ *
+ *   WH_IGNORED  nothing here wanted the event.  The host owes nothing, and a
+ *               router above may offer it to something else.
+ *   WH_DAMAGED  handled, and the handler damaged precisely the pixels it
+ *               changed (gui_window_request_redraw_rect).  The host owes
+ *               nothing — this is the answer that keeps a scrollbar drag at
+ *               ~8 kpx instead of a window's worth.
+ *   WH_REPAINT  handled, and the handler may have written somewhere nothing
+ *               damaged (a caption, a status line).  The host repaints the
+ *               window.
+ *
+ * WH_REPAINT is the conservative answer and the right default for a widget
+ * whose handler runs app code; WH_IGNORED must never be returned by a handler
+ * that changed something, because the pixels would simply never be painted. */
+#define WH_IGNORED   0
+#define WH_DAMAGED   1
+#define WH_REPAINT   2
 
 struct widget {
     int x, y, w, h;                     /* inside window content        */
@@ -137,6 +170,73 @@ struct widget {
      * whole time the mouse is down on it. */
     int pressed;
 };
+
+/* ---- Container (§M81, w_box.c) ---------------------------------------------
+ * THE CONTAINER IS A WIDGET NOW, AND THAT IS THE WHOLE OF §M81's FIRST STEP.
+ *
+ * It was a NODE with `w == NULL`: it had geometry in the toolkit's tree and no
+ * presence in the window's widget list.  So it could not draw and could not be
+ * hit, and every consequence of that had to be worked around somewhere else:
+ *
+ *   - `ui_draw_overlay(win, surface)` existed purely so a UI_SCROLL container
+ *     could get a scrollbar painted, called from BOTH window redraw paths
+ *     because a container had no draw op to be called through.
+ *   - `ui_pointer_at()` was asked BEFORE the widget lookup, and carried its own
+ *     hand-rolled grab latch (`sb_node`/`sb_part`/`sb_grab_dy`) plus its own
+ *     self-healing rule for a release that never arrived — a second copy of
+ *     what `win->grabw` already does for every other widget.
+ *
+ * Both are gone.  The box draws through `widget_draw_all` like everything else
+ * and is grabbed through the host's ordinary press/drag/release routing, so the
+ * scrollbar of a scrolling container is now the SAME control, reached the SAME
+ * way, as the scrollbar of a list.
+ *
+ * ORDERING IS WHAT MAKES IT SAFE, and it is a property the build already had:
+ * `ui_build` requires a parent to be declared before its children and
+ * `gui_window_add_widget` APPENDS, so a container is always EARLIER in the
+ * widget list than the things inside it.  `widget_at` takes the LAST match, so
+ * a child always wins the hit test and the box answers only where no child
+ * covers the point — which is exactly the reserved scrollbar strip.
+ *
+ * A CONTAINER'S WIDGET RECT IS ITS CHROME, NOT ITS LAYOUT BOX, and that
+ * distinction is what keeps the unification from costing anything.  The box's
+ * `base.x/y/w/h` is the scrollbar strip — 16 px wide, or ZERO when there is
+ * nothing to scroll.  Its layout box lives in the node tree, where it always
+ * did, and `vx..vh` below is the copy the box itself needs.
+ *
+ * Give the widget the whole layout box instead and two things follow, both of
+ * them regressions this toolkit has already paid for once: `widget_at` returns
+ * the container for every press that lands in a gap between children, and the
+ * host's `pressed` highlight then damages the CONTAINER — a settings panel's
+ * viewport is 273 kpx, which is the exact cost §M69 spent a milestone removing.
+ * A zero-size rect when nothing scrolls means a plain UI_ROW/UI_COL box is
+ * never drawn and never hit, i.e. costs precisely what it did as a node. */
+struct w_box {
+    struct widget base;
+    int flags;                  /* the UI_* flags of its node               */
+    int scroll;                 /* UI_SCROLL: offset into the content, px   */
+    int content_h;              /* UI_SCROLL: measured height of children   */
+    int vx, vy, vw, vh;         /* the VIEWPORT — the node's arranged box   */
+    /* The same two the listview keeps, for the same reason: a grab must
+     * remember where inside the thumb the press landed, or the first motion
+     * snaps the thumb's top to the pointer and the panel lurches. */
+    int sb_part;                /* enum sb_part, 0 = not dragging           */
+    int sb_grab_dy;
+};
+
+/* Tell the box where the layout put it, and how tall its content came out.
+ * Called by ui.c's arrange pass, which is the only thing that knows; it also
+ * clamps the scroll and sizes the widget rect to the bar (or to nothing). */
+void w_box_placed(struct widget* w, int x, int y, int cw, int ch, int content_h);
+
+int  w_box_scroll(const struct widget* w);
+int  w_box_content(const struct widget* w);
+
+/* Move by `dl` pixels, re-arrange, and repaint what changed; non-zero if it
+ * actually moved.  ONE implementation of "scroll this container", shared by the
+ * wheel, the bar and `ui_scroll_by` — the three routes that used to compute it
+ * separately. */
+int  w_box_scroll_by(struct widget* w, int dl);
 
 /* ---- Label ---------------------------------------------------------------- */
 struct w_label {

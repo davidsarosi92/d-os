@@ -711,6 +711,7 @@ CORE_C_SRCS := \
     kernel/gui/widget.c \
     kernel/gui/ui.c \
     kernel/gui/w_controls.c \
+    kernel/gui/w_box.c \
     kernel/gui/w_chart.c \
     kernel/gui/dialog.c \
     kernel/gui/scrollbar.c \
@@ -900,6 +901,7 @@ CORE_C_SRCS := \
     kernel/gui/widget.c \
     kernel/gui/ui.c \
     kernel/gui/w_controls.c \
+    kernel/gui/w_box.c \
     kernel/gui/w_chart.c \
     kernel/gui/dialog.c \
     kernel/gui/scrollbar.c \
@@ -1028,6 +1030,7 @@ CORE_C_SRCS := \
     kernel/gui/widget.c \
     kernel/gui/ui.c \
     kernel/gui/w_controls.c \
+    kernel/gui/w_box.c \
     kernel/gui/w_chart.c \
     kernel/gui/dialog.c \
     kernel/gui/scrollbar.c \

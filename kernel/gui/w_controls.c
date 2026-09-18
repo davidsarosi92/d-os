@@ -410,10 +410,16 @@ static void sl_mouse(struct widget* w, int lx, int ly, int kind) {
 
 /* §M58's pointer stream: a slider is the control a DRAG was invented for, and
  * implementing this op is also what asks gui.c for the pointer grab. */
-static void sl_pointer(struct widget* w, int lx, int ly, int phase) {
+/* §M81 — WH_REPAINT everywhere is EXACTLY what this returned before the op had
+ * a return value: the host set `ran = 1` whenever a pointer op existed.  Kept
+ * identical on purpose, so the only behaviour this step changes is the
+ * container's.  Narrowing it to WH_DAMAGED is a real saving and a separate
+ * measurement — the slider's own callback may write into a label. */
+static int sl_pointer(struct widget* w, int lx, int ly, int phase) {
     (void)ly;
     if (phase == WPTR_PRESS || phase == WPTR_DRAG)
         sl_set_from_x((struct w_slider*)w, lx);
+    return WH_REPAINT;
 }
 
 static void sl_keycode(struct widget* w, uint8_t kc, uint8_t mods) {

@@ -75,9 +75,13 @@ const struct widget_class* ui_class_find(const char* name) {
 #define UI_GAP        6                 /* between siblings, px                */
 
 struct ui_node {
-    struct widget* w;                   /* NULL for a pure container           */
-    int scroll;                         /* UI_SCROLL: offset into the content  */
-    int content_h;                      /* UI_SCROLL: measured child height    */
+    struct widget* w;                   /* every node has one (§M81)           */
+    /* §M81 — a container is a `w_box` widget, and the scroll offset and content
+     * height live ON IT rather than here.  They were node fields while a
+     * container had no widget to put them on, and that is precisely what made
+     * the scrollbar unreachable: the thing holding the state was not the thing
+     * the draw loop and the hit test walk. */
+    int container;                      /* this node is a box                  */
     const struct widget_class* cls;
     int id, parent;
     int weight, flags;
@@ -98,45 +102,30 @@ struct ui_state {
      * and a grid inside a viewport has none: its labels scrolled straight out
      * over the panel's title.  A clip that does not descend is not a clip. */
     int clip_x, clip_y, clip_w, clip_h;
-    /* §M69 — the container scrollbar's drag.  ONE latch per window, not per
-     * node, because a pointer grab is singular: while it is held every phase
-     * belongs to the node that took the press, whatever the pointer wanders
-     * over (a child widget, the wallpaper).  Without the latch a drag that
-     * strayed off the twelve-pixel bar would start clicking the controls it
-     * passed over — which is most of a settings panel. */
-    int sb_node;                        /* node id being dragged, 0 = none   */
-    int sb_part;                        /* enum sb_part                      */
-    int sb_grab_dy;
+    /* §M81 — THE SCROLLBAR'S GRAB LATCH USED TO LIVE HERE and does not any
+     * more.  It was `sb_node`/`sb_part`/`sb_grab_dy` plus a self-healing rule
+     * for a release that never arrived — a second copy of what `win->grabw`
+     * does for every other widget, needed only because a container was not one.
+     * It is the box's now, held by the host's ordinary grab. */
 };
 
 static struct ui_state* state_of(struct gui_window* win) {
     return (struct ui_state*)gui_window_ui(win);
 }
 
-/* §M69 — A SCROLL DAMAGES ITS VIEWPORT, NOT THE WINDOW.
+/* §M81 — ONE IMPLEMENTATION OF "SCROLL THIS CONTAINER", on the box.
  *
- * Everything that scrolls a container used to leave the repaint to the caller,
- * and every caller asked for the WHOLE window: on the Appearance panel that is
- * 431 kpx and ~50 ms of compositing for a 273 kpx viewport, with the header,
- * the status line and the Save button — none of which moved — repainted every
- * time.  The bar lives inside the viewport rect (arrange_scroll reserves the
- * strip from the children's width), so one rect covers both. */
-static void ui_damage_node(struct gui_window* win, const struct ui_node* nd) {
-    gui_window_request_redraw_rect(win, nd->x, nd->y, nd->cw, nd->ch);
-}
-
+ * It was three: this function, the wheel route below, and the bar's own drag in
+ * `ui_pointer_at` — each clamping and damaging in its own way, which is how the
+ * wheel's two paths came to bound the scroll differently (§M69).  The damage
+ * rule they now share is the one that mattered: *a scroll damages its VIEWPORT,
+ * not the window* — on the Appearance panel 273 kpx rather than 431. */
 int ui_scroll_by(struct gui_window* win, int id, int dl) {
     struct ui_state* st = state_of(win);
     if (!st) return 0;
     for (int i = 0; i < st->count; i++) {
         if (st->n[i].id != id || !(st->n[i].flags & UI_SCROLL)) continue;
-        int before = st->n[i].scroll;
-        st->n[i].scroll += dl;
-        if (st->n[i].scroll < 0) st->n[i].scroll = 0;
-        ui_reflow(win);                 /* clamps against the current viewport */
-        if (st->n[i].scroll == before) return 0;
-        ui_damage_node(win, &st->n[i]);
-        return 1;
+        return w_box_scroll_by(st->n[i].w, dl);
     }
     return 0;
 }
@@ -192,7 +181,7 @@ int ui_scroll_at(struct gui_window* win, int x, int y, int dz) {
         only = i;
         if (x < nd->x || x >= nd->x + nd->cw) continue;
         if (y < nd->y || y >= nd->y + nd->ch) continue;
-        return ui_scroll_by(win, nd->id, dz > 0 ? -ui_wheel_step() : ui_wheel_step());
+        return w_box_scroll_by(nd->w, dz > 0 ? -ui_wheel_step() : ui_wheel_step());
     }
     /* §M69 — NOTHING UNDER THE POINTER, BUT THE PANEL HAS EXACTLY ONE SCROLL
      * AREA: scroll that one.
@@ -209,8 +198,8 @@ int ui_scroll_at(struct gui_window* win, int x, int y, int dz) {
      * with two scroll areas the pointer is the only thing that says which is
      * meant, and choosing for the user would be worse than doing nothing. */
     if (nscroll == 1 && only >= 0)
-        return ui_scroll_by(win, st->n[only].id,
-                            dz > 0 ? -ui_wheel_step() : ui_wheel_step());
+        return w_box_scroll_by(st->n[only].w,
+                               dz > 0 ? -ui_wheel_step() : ui_wheel_step());
     return 0;
 }
 
@@ -280,7 +269,7 @@ int ui_size_class(const struct gui_window* win) {
  * Measure.
  * ------------------------------------------------------------------------- */
 
-static int is_container(const struct ui_node* nd) { return nd->w == NULL; }
+static int is_container(const struct ui_node* nd) { return nd->container; }
 
 static void measure_node(struct ui_state* st, int idx, int avail_w, int size_class);
 
@@ -341,18 +330,16 @@ static void measure_children(struct ui_state* st, int idx, int avail_w,
         /* A viewport asks for whatever it is given and keeps its content's
          * height separately: reporting the CONTENT height would make the
          * parent grow to fit it, which is the opposite of scrolling. */
-        int total = 0, nvis = 0;
         for (int i = 0; i < st->count; i++) {
             if (st->n[i].parent != nd->id) continue;
             struct ui_node* c = &st->n[i];
             c->hidden = (c->flags & UI_HIDE_COMPACT) && size_class == UI_SIZE_COMPACT;
             if (c->hidden) continue;
             measure_node(st, i, avail_w, size_class);
-            total += c->pref_h;
-            nvis++;
         }
-        if (nvis > 1) total += UI_GAP * (nvis - 1);
-        nd->content_h = total;
+        /* The content HEIGHT is arrange's to record (w_box_placed), not
+         * measure's: `ui_reflow` skips this pass entirely, and a number kept in
+         * two passes is a number that can be stale in one of them. */
         nd->pref_w = avail_w;
         nd->pref_h = cp_fh() * 4;      /* a floor; weight gives it the rest */
         nd->min_w  = avail_w;
@@ -420,6 +407,15 @@ static void place_widget(struct ui_state* st, struct ui_node* nd,
     if (!nd->w) return;
     nd->w->clip_x = st->clip_x; nd->w->clip_y = st->clip_y;
     nd->w->clip_w = st->clip_w; nd->w->clip_h = st->clip_h;
+    if (nd->container) {
+        /* §M81 — A CONTAINER'S WIDGET RECT IS ITS CHROME, and by default it has
+         * none: zero-sized, so `widget_draw_all` skips it and `widget_at` never
+         * returns it.  `arrange_scroll` grows it to the scrollbar strip for the
+         * one kind of container that owns furniture.  See widget.h for what
+         * giving it the whole layout box would cost. */
+        nd->w->x = x; nd->w->y = y; nd->w->w = 0; nd->w->h = 0;
+        return;
+    }
     if (nd->hidden) {
         /* Off-surface rather than zero-sized: a zero-width widget still draws
          * its text (the M22 controls do not clip themselves), and a hit test
@@ -506,12 +502,10 @@ static void arrange_scroll(struct ui_state* st, int idx, int x, int y,
         nvis++;
     }
     if (nvis > 1) content += UI_GAP * (nvis - 1);
-    nd->content_h = content;
 
-    int max_scroll = content - h;
-    if (max_scroll < 0) max_scroll = 0;
-    if (nd->scroll > max_scroll) nd->scroll = max_scroll;
-    if (nd->scroll < 0) nd->scroll = 0;
+    /* Hand the box its geometry: it clamps the scroll, and sizes its own widget
+     * rect to the bar (or to nothing, when the content fits). */
+    w_box_placed(nd->w, x, y, w, h, content);
 
     /* The viewport is in force for the WHOLE subtree, not just the direct
      * children — see the note on ui_state.clip_*. */
@@ -526,7 +520,7 @@ static void arrange_scroll(struct ui_state* st, int idx, int x, int y,
     int inner = w - (content > h ? cp_scrollbar_w() + 2 : 0);
     if (inner < cp_fw() * 4) inner = w;          /* too narrow to bother */
 
-    int cur = y - nd->scroll;
+    int cur = y - w_box_scroll(nd->w);
     for (int i = 0; i < st->count; i++) {
         if (st->n[i].parent != nd->id || st->n[i].hidden) continue;
         struct ui_node* c = &st->n[i];
@@ -713,15 +707,15 @@ int ui_build(struct gui_window* win, const struct ui_spec* specs, int n,
         nd->weight = sp->weight;
         nd->flags  = sp->flags;
         nd->hidden = 0;
-
-        if (streq(sp->cls, "box")) {
-            /* A container is a NODE with no widget: it draws nothing, cannot
-             * be hit and costs no allocation.  Making it a widget would mean a
-             * transparent widget on every hit test for no benefit. */
-            nd->w = NULL; nd->cls = NULL;
-            st->count++; built++;
-            continue;
-        }
+        /* §M81 — a container goes through the registry like every other class.
+         * It used to be special-cased into a node with no widget, on the
+         * argument that "making it a widget would mean a transparent widget on
+         * every hit test for no benefit."  The benefit turned out to be the two
+         * mechanisms that had to exist because it was not one — the draw
+         * overlay and the pointer pre-route — and the transparency is kept
+         * anyway: an ordinary box is a ZERO-SIZED widget, so it is in neither
+         * loop's way. */
+        nd->container = streq(sp->cls, "box");
 
         const struct widget_class* cls = ui_class_find(sp->cls);
         if (!cls || !cls->create) {
@@ -748,10 +742,11 @@ int ui_build(struct gui_window* win, const struct ui_spec* specs, int n,
         struct ui_state* s2 = state_of(win);
         for (int i = 0; s2 && i < s2->count; i++) {
             if (!(s2->n[i].flags & UI_SCROLL)) continue;
+            int content = w_box_content(s2->n[i].w);
             klog(KLOG_INFO, "ui", "%d widget(s); viewport id %d: %d px of "
                  "content in %d px%s\n", built, s2->n[i].id,
-                 s2->n[i].content_h, s2->n[i].ch,
-                 s2->n[i].content_h > s2->n[i].ch ? " (scrolls)" : "");
+                 content, s2->n[i].ch,
+                 content > s2->n[i].ch ? " (scrolls)" : "");
             break;
         }
     }
@@ -831,11 +826,11 @@ void ui_cmd(const char* args) {
         if (!st) { kprintf("ui: no toolkit window focused\n"); return; }
         for (int i = 0; i < st->count; i++) {
             if (!(st->n[i].flags & UI_SCROLL)) continue;
-            int before = st->n[i].scroll;
+            int before = w_box_scroll(st->n[i].w);
             int moved  = ui_scroll_by(win, st->n[i].id, delta);
             kprintf("ui: viewport id %d — content %d px in %d px, scroll %d -> %d (%s)\n",
-                    st->n[i].id, st->n[i].content_h, st->n[i].ch,
-                    before, st->n[i].scroll, moved ? "moved" : "clamped");
+                    st->n[i].id, w_box_content(st->n[i].w), st->n[i].ch,
+                    before, w_box_scroll(st->n[i].w), moved ? "moved" : "clamped");
             gui_window_request_redraw(win);
             return;
         }
@@ -846,182 +841,29 @@ void ui_cmd(const char* args) {
     ui_dump(win);
 }
 
-/* THE SCROLL INDICATOR — drawn here rather than by a widget, because a
- * container is a NODE and nodes have no draw op.
+/* §M81 — `ui_draw_overlay()` AND `ui_pointer_at()` STOOD HERE, AND BOTH ARE
+ * GONE.  Together they were ~150 lines whose entire justification was one
+ * sentence the old code repeated at both of them: *"a container is a NODE and
+ * nodes have no draw op."*
  *
- * WHY IT MUST EXIST.  `ui_dump` measured the settings panel's viewport at
- * 242 px holding 1004 px of content: two thirds of every long settings group
- * was unreachable with nothing on screen saying so, which is how a radio group
- * with three options came to be reported as showing one.  *A view that silently
- * shows a prefix of its data is worse than one that shows none, because nothing
- * looks wrong.*  The table view got the same treatment today for the same
- * reason, and the shape is deliberately identical: a `tray` trough, a
- * proportional `muted` thumb, no end arrows (widget_specs.md §10).
+ *   ui_draw_overlay  painted the scrolling container's bar, called from BOTH
+ *                    window redraw paths (wm.c and app_host.c) because there
+ *                    was no draw op to be called through.  It also ran over
+ *                    every node on every PARTIAL repaint, since it sat outside
+ *                    the loop that skips widgets missing the damaged rect.
+ *   ui_pointer_at    hit-tested that bar, asked BEFORE the widget lookup, and
+ *                    carried its own grab latch plus its own self-healing rule
+ *                    for a release that never arrived — a second copy of what
+ *                    `win->grabw` already does for every widget in the tree.
  *
- * Painted AFTER the widgets and with no clip of its own: the children are
- * clipped to the viewport, and the bar sits in the strip arrange_scroll kept
- * clear for it. */
-static void ui_sb_metrics(const struct ui_node* nd, struct sb_metrics* m);
-
-void ui_draw_overlay(struct gui_window* win, struct gfx_surface* s) {
-    struct ui_state* st = win ? state_of(win) : NULL;
-    if (!st || !s) return;
-    const cp_theme* t = cp_current_theme();
-
-    for (int i = 0; i < st->count; i++) {
-        struct ui_node* nd = &st->n[i];
-        if (!(nd->flags & UI_SCROLL) || nd->hidden) continue;
-        if (nd->content_h <= nd->ch || nd->ch <= 0) continue;
-
-        /* §M69 — through the shared scrollbar, which is what gives the
-         * container's bar arrows and a thumb that can be grabbed.  The old
-         * copy here drew an indicator; nothing could touch it. */
-        struct sb_metrics m;
-        ui_sb_metrics(nd, &m);
-        sb_draw(s, &m, st->sb_node == nd->id ? st->sb_part : SB_NONE);
-    }
-    (void)t;
-}
-
-/* The container bar's metrics, in the same window coordinates its children
- * live in.  One definition for the painter and the hit test. */
-static void ui_sb_metrics(const struct ui_node* nd, struct sb_metrics* m) {
-    int bw = cp_scrollbar_w();
-    sb_metrics(m, nd->x + nd->cw - bw, nd->y, bw, nd->ch,
-               nd->content_h, nd->ch, nd->scroll);
-}
-
-static struct ui_node* ui_node_by_id(struct ui_state* st, int id) {
-    for (int i = 0; i < st->count; i++)
-        if (st->n[i].id == id) return &st->n[i];
-    return NULL;
-}
-
-/* Damage the BAR alone — a strip about sixteen pixels wide, against the
- * viewport's quarter of a megapixel.  What changes when a press latches or a
- * release lets go is which part is drawn held, and nothing else on the panel
- * moves; the two are separated because they differ by a factor of thirty. */
-static void ui_damage_bar(struct gui_window* win, const struct ui_node* nd) {
-    struct sb_metrics m;
-    ui_sb_metrics(nd, &m);
-    gui_window_request_redraw_rect(win, m.x, m.y, m.w, m.h);
-}
-
-/* §M69 — PRESS / DRAG / RELEASE on a scrolling container's bar.
+ * Both now happen in w_box.c through the ops every other widget uses.  What is
+ * left here is the LAYOUT, which is what this file was always for.
  *
- * A container is a NODE and nodes have no widget, so nothing in the window's
- * widget list sits under that strip and gui.c's ordinary pointer routing found
- * nobody — the settings panels drew a scrollbar that could not be used at all.
- * gui.c asks here BEFORE resolving a widget, so the latch above wins over
- * whatever the drag passes over.
- *
- * Returns non-zero when the toolkit consumed the event. */
-int ui_pointer_at(struct gui_window* win, int x, int y, int phase) {
-    struct ui_state* st = state_of(win);
-    /* THE ENTRY HALF of the probe.  Without it, "no press was logged" cannot
-     * distinguish *the event never arrived* from *it arrived and matched no
-     * container* — the two causes of "I cannot grab the bar", and they live in
-     * different files. */
-    if (phase == WPTR_PRESS && gui_input_debug()) {
-        int nsc = 0;
-        if (st) for (int i = 0; i < st->count; i++) {
-            struct ui_node* n = &st->n[i];
-            if (!(n->flags & UI_SCROLL)) continue;
-            nsc++;
-            kprintf("ui_pointer_at: phase=%d at %d,%d  node %d rect %d,%d %dx%d "
-                    "content=%d scroll=%d\n", phase, x, y, n->id,
-                    n->x, n->y, n->cw, n->ch, n->content_h, n->scroll);
-        }
-        if (!nsc) kprintf("ui_pointer_at: phase=%d at %d,%d  no scroll node\n",
-                          phase, x, y);
-    }
-    if (!st) return 0;
-
-    /* §M69 — A LATCH THAT SURVIVES INTO THE NEXT PRESS IS STALE BY DEFINITION.
-     *
-     * Reported from use: *"I click and nothing happens, I do not know what it
-     * depends on, then suddenly it works"* and *"during a drag it froze in a
-     * lighter colour, as if it were active."*  Both are one state: the grab
-     * latched on a press and the RELEASE never arrived, after which this
-     * function consumed EVERY later event — including every press — and the
-     * window looked alive and answered nothing.
-     *
-     * The release can go missing for reasons this file cannot prevent (a full
-     * queue, a window closing mid-gesture), so the latch must be
-     * SELF-HEALING rather than merely correct on the happy path: a press is by
-     * definition the start of a new gesture, so anything still held when one
-     * arrives belongs to a gesture that ended without telling us.  *A recovery
-     * that depends on the event that went missing is not a recovery.* */
-    if (st->sb_node && phase == WPTR_PRESS) {
-        struct ui_node* old = ui_node_by_id(st, st->sb_node);
-        st->sb_node = st->sb_part = 0;
-        if (old) ui_damage_bar(win, old);       /* the held highlight, no more */
-    }
-
-    /* Mid-drag: the latched node owns every phase until the release. */
-    if (st->sb_node) {
-        struct ui_node* nd = ui_node_by_id(st, st->sb_node);
-        if (!nd) { st->sb_node = st->sb_part = 0; return 0; }
-        if (phase == WPTR_RELEASE) {
-            st->sb_node = st->sb_part = 0;
-            /* ONLY THE BAR CHANGED.  A release ends the highlight and moves
-             * nothing, so repainting the window here was the second of the
-             * four full-window repaints a single click used to cost. */
-            ui_damage_bar(win, nd);
-            return 1;
-        }
-        if (phase == WPTR_DRAG && st->sb_part == SB_THUMB) {
-            struct sb_metrics m;
-            ui_sb_metrics(nd, &m);
-            int ns = sb_scroll_from_thumb(&m, nd->content_h, nd->ch,
-                                          y - st->sb_grab_dy);
-            if (ns != nd->scroll) {
-                nd->scroll = ns;
-                ui_reflow(win);          /* positions only — see ui_layout_pass */
-                ui_damage_node(win, nd);
-            }
-        }
-        return 1;                        /* consumed either way while latched */
-    }
-
-    if (phase != WPTR_PRESS) return 0;
-
-    for (int i = 0; i < st->count; i++) {
-        struct ui_node* nd = &st->n[i];
-        if (!(nd->flags & UI_SCROLL) || nd->hidden) continue;
-        if (nd->content_h <= nd->ch || nd->ch <= 0) continue;
-        struct sb_metrics m;
-        ui_sb_metrics(nd, &m);
-        int part = sb_hit(&m, x, y);
-        if (gui_input_debug())
-            kprintf("ui: press at %d,%d over node %d bar %d,%d %dx%d part=%d\n",
-                    x, y, nd->id, m.x, m.y, m.w, m.h, part);
-        if (part == SB_NONE) continue;
-
-        st->sb_node = nd->id;
-        st->sb_part = part;
-        st->sb_grab_dy = y - m.thumb_y;
-        int step = cp_row_h();
-        int was = nd->scroll;
-        switch (part) {
-        case SB_UP:          nd->scroll -= step; break;
-        case SB_DOWN:        nd->scroll += step; break;
-        case SB_TROUGH_UP:   nd->scroll -= sb_page(nd->ch); break;
-        case SB_TROUGH_DOWN: nd->scroll += sb_page(nd->ch); break;
-        default: break;
-        }
-        int max = nd->content_h - nd->ch;
-        if (nd->scroll < 0)   nd->scroll = 0;
-        if (nd->scroll > max) nd->scroll = max;
-        /* The viewport when the content moved; otherwise only the bar, whose
-         * pressed part is now drawn held — an arrow at the end of its travel
-         * has to answer the click without repainting a thing under it. */
-        if (nd->scroll != was) { ui_reflow(win); ui_damage_node(win, nd); }
-        else                   ui_damage_bar(win, nd);
-        return 1;
-    }
-    return 0;
-}
+ * ONE THING THE FLAT LIST STILL CANNOT DO is walk OUT from a child: when a
+ * wheel notch lands on a control inside a viewport, the control declines and
+ * somebody has to find the container around it.  That is `ui_scroll_at` above,
+ * and it is honest work for the node tree rather than a workaround — a parent
+ * link is exactly what a list of siblings does not have. */
 
 void ui_dump(struct gui_window* win) {
     kprintf("ui: %d class(es) registered:", ui_class_count());
@@ -1032,10 +874,16 @@ void ui_dump(struct gui_window* win) {
     struct ui_state* st = win ? state_of(win) : NULL;
     if (!st) { kprintf("ui: this window has no toolkit tree\n"); return; }
 
-    int cw = 0, ch = 0;
+    int cw = 0, ch = 0, ox = 0, oy = 0;
     gui_window_content_size(win, &cw, &ch);
-    kprintf("ui: content %dx%d px = %d cells -> %s, %d node(s)\n",
-            cw, ch, cw / cp_fw(), size_name(ui_size_class_for(cw)), st->count);
+    /* §M81 — THE SCREEN ORIGIN, because every rect below is in CONTENT
+     * coordinates and the only way to check one is to point at it.  Without
+     * this line a dump says where a scrollbar is in a space no input device
+     * speaks, so driving the thing it describes means guessing. */
+    gui_window_content_origin(win, &ox, &oy);
+    kprintf("ui: content %dx%d px at screen %d,%d = %d cells -> %s, %d node(s)\n",
+            cw, ch, ox, oy, cw / cp_fw(),
+            size_name(ui_size_class_for(cw)), st->count);
     for (int i = 0; i < st->count; i++) {
         struct ui_node* nd = &st->n[i];
         /* Plain %d/%s: this kernel's printf has no width or precision
@@ -1059,7 +907,9 @@ void ui_dump(struct gui_window* win) {
             kprintf("        clipped to %d,%d %dx%d\n", nd->w->clip_x,
                     nd->w->clip_y, nd->w->clip_w, nd->w->clip_h);
         if (nd->flags & UI_SCROLL)
-            kprintf("        content %d px, scroll %d\n", nd->content_h, nd->scroll);
+            kprintf("        content %d px, scroll %d, bar %d,%d %dx%d\n",
+                    w_box_content(nd->w), w_box_scroll(nd->w),
+                    nd->w->x, nd->w->y, nd->w->w, nd->w->h);
     }
 }
 

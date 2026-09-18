@@ -199,13 +199,10 @@ int  ui_scroll_by(struct gui_window* win, int id, int dl);
  * coordinates.  Returns non-zero if something moved. */
 int  ui_scroll_at(struct gui_window* win, int x, int y, int dz);
 
-/* §M69 — press/drag/release on a scrolling container's SCROLLBAR.  A container
- * is a node, not a widget, so nothing in the window's widget list sits under
- * that strip and gui.c's ordinary routing found nobody: the settings panels
- * drew a bar that could not be used at all.  gui.c asks here BEFORE resolving
- * a widget, so a drag that wanders off the twelve-pixel bar keeps going
- * instead of clicking whatever it passes over.  Non-zero = consumed. */
-int  ui_pointer_at(struct gui_window* win, int x, int y, int phase);
+/* §M81 — `ui_pointer_at()` WAS DECLARED HERE.  A container is a WIDGET now
+ * (w_box.c), so its scrollbar is pressed and dragged through the host's
+ * ordinary grab, and there is nothing left for a caller to ask before the
+ * widget lookup.  See the note in ui.c where it stood. */
 
 /* §M69 — pixels moved by ONE wheel notch, from `gui.scroll_lines` (rows).
  * Shared with the list widgets so a wheel means the same amount everywhere. */
@@ -289,12 +286,11 @@ int ui_size_class_for(int content_px_w);
 /* Diagnostic: print the registry and the window's laid-out tree.  `ui check`
  * uses it — a layout that draws correctly and measures wrongly is invisible in
  * a screenshot (§M64's lesson, applied to geometry). */
-/* Paint the toolkit's own furniture — today the scroll indicators — over a
- * window's finished widgets.  Called by the window redraw paths in gui.c, not
- * by apps: a container is a NODE and has no draw op of its own, so without this
- * a scrolling panel has no way to say that there is more below. */
+/* §M81 — `ui_draw_overlay()` WAS DECLARED HERE, and the reason given for it was
+ * *"a container is a NODE and has no draw op of its own"*.  It has one now, so
+ * the scrolling container's bar is painted by `widget_draw_all` along with
+ * everything else and both window redraw paths lost a special case. */
 struct gfx_surface;
-void ui_draw_overlay(struct gui_window* win, struct gfx_surface* s);
 
 void ui_dump(struct gui_window* win);
 

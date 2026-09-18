@@ -423,11 +423,17 @@ static int iv_sb(struct w_itemview* iv, struct sb_metrics* m) {
 /* §M61 fix — pointer DRAG past the top or bottom edge scrolls, which is the
  * other half of "scroll works": with no wheel, dragging is how a mouse user
  * reaches an item that is not on screen. */
-static void iv_pointer(struct widget* w, int lx, int ly, int phase) {
+/* §M81 — the op returns WH_* now (widget.h).  WH_REPAINT everywhere is
+ * EXACTLY what this did before it had a return value: the host set
+ * `ran = 1` whenever a pointer op existed.  Kept identical on purpose, so
+ * the only behaviour step 1 changes is the container's — several of these
+ * paths already damage precisely and are candidates for WH_DAMAGED, which
+ * is a saving with its own measurement. */
+static int iv_pointer(struct widget* w, int lx, int ly, int phase) {
     struct w_itemview* iv = (struct w_itemview*)w;
-    if (!iv->view) return;
+    if (!iv->view) return WH_REPAINT;
     int n = (iv->model && iv->model->count) ? iv->model->count(iv->model->ctx) : 0;
-    if (n <= 0) return;
+    if (n <= 0) return WH_REPAINT;
     int px = w->x + lx, py = w->y + ly;
     struct sb_metrics m;
     int has_sb = iv_sb(iv, &m);
@@ -462,25 +468,25 @@ static void iv_pointer(struct widget* w, int lx, int ly, int phase) {
             if (iv->scroll > max) iv->scroll = max;
             if (iv->scroll != was) w_itemview_refresh(iv);
             else gui_window_request_redraw(w->win);   /* the held emphasis */
-            return;
+            return WH_REPAINT;
         }
     }
 
     if (phase == WPTR_DRAG && iv->sb_part) {
-        if (iv->sb_part != SB_THUMB) return;      /* an arrow steps once */
-        if (!has_sb) return;
+        if (iv->sb_part != SB_THUMB) return WH_REPAINT;      /* an arrow steps once */
+        if (!has_sb) return WH_REPAINT;
         int ns = sb_scroll_from_thumb(&m, iv->sb_content, iv->sb_viewport,
                                       py - iv->sb_grab_dy);
         if (ns != iv->scroll) { iv->scroll = ns; w_itemview_refresh(iv); }
-        return;
+        return WH_REPAINT;
     }
 
     if (phase == WPTR_RELEASE) {
         if (iv->sb_part) { iv->sb_part = 0; gui_window_request_redraw(w->win); }
-        return;
+        return WH_REPAINT;
     }
 
-    if (phase != WPTR_DRAG) return;
+    if (phase != WPTR_DRAG) return WH_REPAINT;
 
     /* §M61 — dragging past an edge scrolls, which is the other half of "scroll
      * works" for a mouse with no wheel. */
@@ -492,6 +498,7 @@ static void iv_pointer(struct widget* w, int lx, int ly, int phase) {
         if (idx >= 0) iv->sel = idx;
     }
     w_itemview_refresh(iv);       /* the diff covers both: a scroll and a move */
+    return WH_REPAINT;
 }
 
 static void iv_mouse(struct widget* w, int lx, int ly, int kind) {

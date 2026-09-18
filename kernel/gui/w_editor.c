@@ -392,9 +392,15 @@ static void editor_destroy(struct widget* w) {
  *
  * Note the shared helper: `ed_move_to(e, off, keep_anchor)` is the same call
  * Shift+arrow uses, so keyboard and mouse selection cannot drift apart. */
-static void editor_pointer(struct widget* w, int lx, int ly, int phase) {
+/* §M81 — the op returns WH_* now (widget.h).  WH_REPAINT everywhere is
+ * EXACTLY what this did before it had a return value: the host set
+ * `ran = 1` whenever a pointer op existed.  Kept identical on purpose, so
+ * the only behaviour step 1 changes is the container's — several of these
+ * paths already damage precisely and are candidates for WH_DAMAGED, which
+ * is a saving with its own measurement. */
+static int editor_pointer(struct widget* w, int lx, int ly, int phase) {
     struct w_editor* e = (struct w_editor*)w;
-    if (phase == WPTR_RELEASE) return;
+    if (phase == WPTR_RELEASE) return WH_REPAINT;
 
     int line = e->scroll_line + (ly - ED_PAD_Y) / WED_ROW_H;
     int col  = e->scroll_col  + (lx - ED_PAD_X + GFX_GLYPH_W / 2) / GFX_GLYPH_W;
@@ -416,6 +422,7 @@ static void editor_pointer(struct widget* w, int lx, int ly, int phase) {
         ed_move_to(e, ls + col, 1);     /* keep the anchor → extend */
     }
     gui_window_request_redraw(w->win);
+    return WH_REPAINT;
 }
 
 static const struct widget_ops editor_ops = {
