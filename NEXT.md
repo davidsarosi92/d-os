@@ -63,12 +63,30 @@ previously all looked like "wrong password":
 - the accounts panel checks `user_set_password`'s return value instead of
   reporting the outcome it hoped for
 
-## Next milestone: §M81 (PLAN.md)
+## §M81 (PLAN.md) — step 1 SHIPPED, step 2 next
 
 The agreed design is written up there in full — **one hierarchy → one
 constructor → window-as-widget**, with the threading rule (the widget tree lives
 on ONE task; data crosses boundaries, not references), the four risks, and the
 first measurement table that is also the proof of work when re-measured.
 
-First step: **make the container a widget**, so `ui_draw_overlay` disappears and
-`UI_SCROLL` paints its own scrollbar.
+**Step 1 is done and on `main` (`86c53d1`): the container is a widget.**
+`w_box.c`; ui.c is 322 lines lighter; `ui_draw_overlay()` and `ui_pointer_at()`
+are deleted rather than ported, because `widget_draw_all` and `win->grabw` now
+do both jobs.  `widget_ops.pointer` returns `WH_IGNORED`/`WH_DAMAGED`/
+`WH_REPAINT` instead of void.  Proven by a driven mouse on i386 and x86_64, and
+by a control run against the pre-change code in which the same gesture leaves
+the panel's 378131 pixels **byte-identical**.
+
+**Step 2: ONE CONSTRUCTOR for the window lifecycle.**  The first measurement
+found twelve hand-rolled copies of it, and three conventions that are remembered
+rather than enforced — the `-1,-1` placement (copied wrong into two files in one
+day, which is how the lock screen landed off-screen), `gui_queue_open` versus a
+direct create (a window built the wrong way silently never lays out), and "clear
+the widgets first in the layout hook".  Re-measure the coupling table after it:
+the entangled band (9–17) is the number that has to move.
+
+The metric itself is reproducible — count the DISTINCT symbols defined in
+`gui.c`/`wm.c`/`compose.c`/`input.c` that a file calls, and check that
+`gterm.c` comes out at exactly 2 (§M70's own claim).  *A metric that cannot
+reproduce a known answer is measuring something else.*

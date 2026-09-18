@@ -5099,9 +5099,56 @@ absent, and everything else follows from fixing it.
 
 #### The order of work, each step with existing clients and a number
 
-1. **THE CONTAINER BECOMES A WIDGET.**  One hierarchy; `ui_draw_overlay`
-   disappears; `UI_SCROLL` paints its own bar.  Clients today: every settings
-   panel.
+1. ✅ **THE CONTAINER BECOMES A WIDGET (2026-09-18, all 3 arches, i386 +
+   x86_64 driven).**  `kernel/gui/w_box.c`; **ui.c 322 lines lighter**, and the
+   two mechanisms that existed only because a container was not a widget are
+   **deleted, not ported**: `ui_draw_overlay()` (painted the scrolling
+   container's bar, called from BOTH window redraw paths, and ran over every
+   node on every PARTIAL repaint because it sat outside the loop that skips
+   widgets missing the damaged rect) and `ui_pointer_at()` (hit-tested that bar
+   BEFORE the widget lookup, carrying its own grab latch *and* its own
+   self-healing rule for a release that never arrived — a second copy of what
+   `win->grabw` does for every other widget).  **A CONTAINER'S WIDGET RECT IS
+   ITS CHROME, NOT ITS LAYOUT BOX**, which is what makes the unification free:
+   the box's rect is the 16 px scrollbar strip, or **ZERO** when nothing
+   scrolls, while its layout box stays in the node tree.  Give the widget the
+   whole box instead and `widget_at` returns the container for every press
+   landing in a gap between children, after which the host's `pressed`
+   highlight damages a 273 kpx viewport — *the exact cost §M69 spent a
+   milestone removing.*  **ORDERING makes it safe and the build already had
+   it:** `ui_build` requires a parent before its children and
+   `gui_window_add_widget` APPENDS, so a container is always earlier in the
+   list and `widget_at`'s last-match rule gives every child priority.
+   **`widget_ops.pointer` RETURNS `WH_*` NOW instead of void** — the host
+   needed three answers and a void op gave it one, assuming that a widget with
+   a pointer op had both handled the event and left the window owing a full
+   repaint; true of the four widgets that had one, false the moment a container
+   grew it.  `WH_IGNORED` / `WH_DAMAGED` / `WH_REPAINT`, i.e. §M69's `scroll`
+   lesson generalised: *"has a handler" and "did something" are different
+   facts, and "did something" and "and cleaned up after itself" are a third.*
+   All four existing implementations return `WH_REPAINT`, which is exactly what
+   they did before, **so the only behaviour this step changes is the
+   container's.**  **MEASURED BY DRIVING THE MOUSE, with a control run against
+   the pre-change code:** three clicks on the down arrow give `part=2` and
+   scroll **0 / 44 / 88** — one row each — with **ZERO full repaints for the
+   gesture** (both in the log are the panel's build); a thumb drag gives
+   `part=3` and moves the thumb in the screenshot from y 249..353 to
+   **y 429..533, i.e. 180 px for the 180 px injected**, so the grab offset
+   survived and the arrows stayed put; and **the same gesture on the old and
+   the new code leaves the panel's 378131 pixels BYTE-IDENTICAL.**  A panel
+   whose content FITS reports `bar 8,40 0x0` — a zero-sized widget, invisible
+   to the draw loop and unreachable by the hit test, which closes §M69's *"the
+   Control Panel scrolls although everything fits"* **by construction rather
+   than by a clamp.**  §M69's press probe moved INTO the box rather than being
+   lost with the function that carried it (it was added after a diagnosis went
+   the wrong way, and it is what caught the bar being too small to aim at), and
+   `ui_dump` now prints the window's **SCREEN ORIGIN** — every rect it prints
+   is in content coordinates, and without that line the dump describes a
+   scrollbar in a space no input device speaks.  The coupling table is
+   unchanged for the app↔compositor seam, which is honest: this step was about
+   the toolkit's INTERNAL duplication.  **`w_box.c` itself lands at 1** —
+   `gui_window_request_redraw_rect`, nothing else — i.e. in the component band
+   beside `gterm.c`.
 2. **ONE CONSTRUCTOR for the window lifecycle** (see the measurement above):
    content size + a placement INTENT (centred / cascaded / explicit) + a layout
    fn.  Twelve hand-rolled copies drop to one call each, and three conventions
