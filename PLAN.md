@@ -5059,6 +5059,116 @@ twelve callers drop to one call each, the three conventions above become
 unrepresentable, and the number that says whether it worked is this same table
 re-measured.
 
+### THE AGREED DESIGN (2026-09-18) — one hierarchy, one constructor, window-as-widget
+
+Asked for directly: *"build a finished system — describe abstractly what a
+widget is, how it is constructed, what its output is, how it may behave; let
+them contain each other (a window holds a menubar, a menubar holds a dropdown,
+a view holds icons and the DESKTOP can use that same view, list items that the
+Start menu can use too) — one system instead of spaghetti."*
+
+**AGREED ON THE DIRECTION, WITH TWO CORRECTIONS OF FACT.**
+
+#### 1. Do not rebuild what §M65 already built
+
+The "abstract thing" exists: `WIDGET_CLASS()` registration, identity by NAME,
+the description as **DATA** (`ui_spec` = ints and strings), one event sink per
+window (id, type, value).  That shape was not chosen for elegance — **a name and
+an integer cross a process boundary and a function pointer does not**, and the
+ring-3 requirement decided the API from the first line.  Any new abstraction
+that puts pointers where data is today silently becomes kernel-only and throws
+away §M65's most valuable property.
+
+The shared view also exists: `item_model` + `ITEM_VIEW()` already separate model
+from view, and **the desktop, the Control Panel and the file manager already use
+the same one** (`desktop.view = grid|list`).  §M64 built it for exactly the
+reason now being proposed.
+
+#### 2. The real defect is TWO HIERARCHIES, and the tree says so itself
+
+- `widget.h`: *"the DRAW loop walks the window's **flat widget list**"*
+- `ui.h`: *"is a **node, not a widget**, so nothing in the window's widget list
+  sits under it"*
+- `ui.h`: *"a container is a **NODE and has no draw op of its own**"*
+
+So layout lives in a node tree and drawing/input live in a flat list, and the
+symptom is already in the log: `UI_SCROLL`'s scrollbar had to be painted from
+**gui.c** (`ui_draw_overlay`) because a container cannot draw itself.  *That gap
+is what "widgets containing widgets" means here* — composition is genuinely
+absent, and everything else follows from fixing it.
+
+#### The order of work, each step with existing clients and a number
+
+1. **THE CONTAINER BECOMES A WIDGET.**  One hierarchy; `ui_draw_overlay`
+   disappears; `UI_SCROLL` paints its own bar.  Clients today: every settings
+   panel.
+2. **ONE CONSTRUCTOR for the window lifecycle** (see the measurement above):
+   content size + a placement INTENT (centred / cascaded / explicit) + a layout
+   fn.  Twelve hand-rolled copies drop to one call each, and three conventions
+   become unrepresentable — the `-1,-1` placement (copied wrong into two files
+   in one day), `gui_queue_open` versus a direct create (a window built the
+   wrong way silently never lays out), and "clear the widgets first in the
+   layout hook".
+3. **THE WINDOW ITSELF BECOMES A WIDGET.**  Only then are the Start menu, the
+   desktop and the sign-in screen ordinary compositions rather than hand-drawn
+   chrome.
+
+#### Mandatory versus optional behaviour
+
+`widget_ops` already has the slots; what is missing is a STATEMENT of which a
+class must implement.  Declared per class, and checked the way this tree checks
+anything that must not drift: an `AUDIT()` — *every registered class implements
+its mandatory ops* — with a shipped falsifier.  A comment cannot fail a test
+(§M52).
+
+#### THE THREADING RULE, stated so it cannot be broken by accident
+
+**Multithreading is not something to add — it is already here and it is
+load-bearing.**  §M22.7: the compositor, the desktop shell and EVERY `WIN_APP`
+window each run on their own task, and the app-host does that window's widget
+dispatch, rendering and ticking.
+
+**THE WIDGET TREE LIVES ENTIRELY ON ONE TASK.**  Composition inside a window
+crosses no boundary and adds no concurrency.  Where a boundary really is crossed
+— the desktop task drawing the panel strip the compositor composites, the Start
+menu popup, one window wanting to change another's state — **the answer is
+passed as DATA and consumed by the owning host**, never as a parent-child link.
+
+The receipt: §M69's dialog answered on the DIALOG's host and called the file
+manager's `fm_refresh()` directly.  The model really was reloaded and **nothing
+on screen changed**, because damaging a window is the host's job.  *A cross-task
+write that appears to do nothing is the most expensive kind: it looks like a
+missing feature, so the fix gets aimed at the wrong layer.*  Same principle as
+§M65's data-not-pointers, one boundary lower.
+
+Checkable, in §M71's shape: *a widget's parent and its host are the same task.*
+
+**AND THREADS ARE NOT THE PERFORMANCE ANSWER.**  §M75.2 falsified this
+milestone-family's own "the GUI is 50 % of a 4-CPU box at rest" — an accounting
+artefact; the real cost is ~1 %.  What was expensive was DAMAGE AREA and
+unconditional full-window repaints, which §M69 and §M79 brought from 22 ms to
+6-8 ms with row- then cell-level damage.  A generic composite tree with
+per-node dispatch can undo exactly that, which is why §M70's rule applies:
+measure before and after, and expect "no measurable change" as the honest
+result.
+
+#### The four risks, carried from this tree's own history
+
+1. **An abstraction with no client.**  §M59 declined `wl_data_device` because
+   *shipping a protocol surface with no client to falsify it against is how a
+   feature "works" until the first real user.*  A whole system built ahead of
+   its users is the largest version of that, which is why the order above gives
+   every step an existing caller.
+2. **The §M22.7 threading contract** — above.
+3. **The damage budget** — above.
+4. **The ring-3 seam** — §M65's data-not-pointers.
+
+#### Proof of work
+
+The table measured above, RE-MEASURED after each step, plus `gui bench` before
+and after.  *A split that moves code without naming a contract has produced a
+second place to look, not a component.*
+
 ### The questions this milestone must answer, each with evidence
 
 1. **WHAT IS ACTUALLY A COMPONENT?**  `gterm.c` was the model: §M70 found it
