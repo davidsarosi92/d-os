@@ -286,6 +286,7 @@ what); a session can pick a theme and push on it.
 | M74 | **Swap and demand paging** — reclaim as a POLICY over §M72's mechanism.  Today: no swap, no demand paging, **no page cache**, and a file mapping is an eager private copy (two processes mapping the same `libc.so` get two copies).  The ladder's second rung — a page cache + demand-paged file mappings — is worth more than the swap and needs no disk to write to.  **Off by default** (`mem.swap_policy = off|emergency|normal`) and the size is the user's (`mem.swap_size_mb`, which IS the ceiling) — but `off` still reclaims, because clean file pages need no swap.  **Three hard rules: the reserve is pinned physical RAM, swap NEVER counts as free memory, and the writeout path allocates nothing.**  Explicit non-goal: running a workload larger than RAM | Memory | §M74 — design, gated on §M72 |
 | M75 | **Task Manager: what each process is costing** — ✅ **SHIPPED 2026-09-10 (DOCS §4.88)**: per-process MEM (portable policy over three arch walkers; verified by DIFFERENCE on all three, same 1028 KB constant) + CPU% (a delta over §M53's clock, keyed by PID where damage is keyed by slot), a `blk_read/write/flush` request path that did not exist, a kernel history ring sampled by a service so the window is a VIEW, `WIDGET_CLASS("chart")`, and the Total as the footer.  **Its own instrument found the biggest cost in the tree: the GUI is 50 % of a 4-CPU box AT REST** — §M49's open item, never before given a number.  OWNER still gated on §M32 | UX / Instrumentation | ✅ DOCS §4.88 |
 | M76 | **The aarch64 native syscall dispatcher — SWEPT** — ✅ **SHIPPED 2026-09-10 (DOCS §4.89)**: 26 of i386's 60 cases → **60 of 60**.  Found while §M75's own falsifier drowned an ARM log in `unknown number 35`; every native program using sockets, stat/getdents, threads, getrandom, uname or the dosgui bridge was **silently x86-only**, and the failure is a log line and a -1 rather than a link error, which is why it survived from §M25 to §M75.  **The blocker was the HARNESS, not the sweep** — `uidemo` could not be started on ARM at all (§4.74), so `gui.autorun` had to exist first.  Three cases are REFUSED WITH A REASON rather than wired: aarch64 has no I/O address space, and a driver told its port window was granted would fault at first access | Architecture | ✅ DOCS §4.89 |
+| M81 | **The GUI's seams — an audit of how it is assembled** — the compositor, the widget toolkit and the apps have grown by accretion, and §M32's GUI work spent three rounds in the wrong file because of it: an undocumented placement convention, a flag honoured in one of four dispatch paths, a strip that clipped a popup silently, and a window that lays out only if it was created the right way.  **The deliverable is a VERDICT with measurements, not a rewrite**: which seams are real, which are conventions nobody wrote down, and which communications with the kernel should become declared interfaces | UX / Architecture | §M81 — audit, verdict required |
 
 ### Cross-cutting constraints
 
@@ -4972,6 +4973,95 @@ with it.  It now describes code that arrives as a file.  The scope written into
 §M68 steps 2–3 (the verdict) → implementation only if the verdict says so.
 
 ---
+
+## §M81 — The GUI's seams: an audit of how it is assembled
+
+**Status: proposed (2026-09-18).  Asked for directly after §M32's GUI work:
+*review the GUI's components, the system, how the GUI is put together, the
+widgets too — including where they talk to the system.  How far can we
+decompose into components and abstract?***
+
+**THE DELIVERABLE IS A VERDICT WITH MEASUREMENTS, NOT A REWRITE.**  §M70 already
+split gui.c into eight files and made the shell a registry, and it did so on a
+measurement (`gui bench` before and after, 1.6 % spread, "no measurable change"
+rather than "2.5 % faster").  This milestone is the same discipline applied to
+the SEAMS rather than the file boundaries: *a split that moves code without
+naming a contract has produced a second place to look, not a component.*
+
+### Why now, and the receipts
+
+Every item below cost real time inside §M32, and none was found by reading:
+
+- **A placement convention nobody wrote down.**  `gui_app_window_create(...,
+  -1, -1, ...)` was assumed to mean "you pick"; `window_alloc` stores x and y
+  VERBATIM.  The lock screen was off-screen from the day it was written, in two
+  files, because one wrong assumption about a shared call was made twice.
+- **A flag honoured in ONE of four dispatch paths.**  `widget.disabled` dimmed
+  the drawing and blocked the pressed highlight, while the grab, `AE_MOUSE`,
+  `AE_KEY` and `AE_KEYCODE` all dispatched to the widget anyway — so a greyed
+  control looked dead and ACTED.  §4.79's shape, in the toolkit rather than the
+  chrome.
+- **A surface that clips in silence.**  `panelsurf` is addressed in screen
+  coordinates and backed only below `panel_strip_top`, so a Start menu that grew
+  past `PANEL_POPUP_MAX` lost its TOP — two application rows vanished and
+  nothing said so.  The constant was sized for the 8x8 era and never revisited
+  after §M69 made the type a runtime fact.
+- **A window that lays out only if it was created the right way.**
+  `gui_app_window_create` binds to `task_current()`, so a window built on a task
+  with no app-host loop never lays out and never ticks (§M61 recorded this; §M32
+  met it again).  `gui_queue_open` is the fix and is a CONVENTION rather than a
+  type distinction — nothing stops the wrong call.
+- **Three shells, three line readers**, which is why an interactive password
+  prompt needed a registry before it could exist at all (§M24's rule).
+- **Output that reaches nobody.**  With the GUI up, a report printed on the
+  requesting task goes to the suppressed console (§4.79).  Three instruments in
+  §M32 were silent for this reason before they were moved to their own task —
+  *and a silent instrument is indistinguishable from the code under test not
+  running.*
+
+### The questions this milestone must answer, each with evidence
+
+1. **WHAT IS ACTUALLY A COMPONENT?**  `gterm.c` was the model: §M70 found it
+   reaches the rest of the compositor through exactly TWO calls, so its having
+   lived beside the compositor was an accident of where a struct was declared.
+   *Count the calls across each proposed seam and say the number.*  A seam with
+   two calls is a component; one with forty is a file boundary.
+2. **WHICH CONVENTIONS SHOULD BE TYPES?**  The placement rule, "build widgets in
+   the layout hook", "a window needs an app-host", "a tick damages what it
+   changed" (gui.h) are all rules a caller can break silently.  For each: can it
+   be made unrepresentable, or must it stay a rule with an AUDIT behind it?
+3. **WHERE DOES THE TOOLKIT TALK TO THE KERNEL, AND IS IT DECLARED?**  Widgets
+   reach config, locale, the clipboard, users and the VFS directly today.  §M65
+   already proved the interesting half — `ui_spec` is DATA, so a ring-3 client
+   drives the same toolkit — and the question is which of those reaches should
+   go through that seam rather than around it.
+4. **WHAT WOULD A SECOND IMPLEMENTATION COST?**  The registries answer this
+   honestly: a second desktop shell exists (`shell_bare`), a second item view
+   exists, a second scrollbar was DELETED because four had drifted.  *A seam
+   nobody has crossed twice is a seam nobody has tested.*
+
+### Definition of done
+
+- A written verdict per seam: component / file boundary / convention, with the
+  CALL COUNT that justifies it.
+- Every convention that survives as a convention has an `AUDIT()` or is
+  explicitly declared uncheckable, with the reason.
+- The defects this audit finds are FIXED with falsifiers, in the §M71 shape —
+  the four above are the starting list and are already closed.
+- **A measurement before and after**, per §M70's rule: a refactor that cannot
+  show the absence of a regression has not been verified, and "no measurable
+  change" is the honest result to expect.
+- No rewrite of `input.c`'s `gui_mouse` unless the audit produces a falsifying
+  test for it first — §M70 named that as wanted and explicitly not started,
+  and it is still the most timing-sensitive code in the tree.
+
+### What it is NOT
+
+Not a visual redesign (that was §M69), not a second toolkit, and not a
+decomposition for its own sake: *the measure of a component here is whether a
+defect can be localised to it*, which is exactly what §M32's GUI work could not
+do four times in a row.
+
 
 ## §M72 — A reserve the system keeps, and a program you can pause
 
