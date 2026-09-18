@@ -5149,13 +5149,53 @@ absent, and everything else follows from fixing it.
    the toolkit's INTERNAL duplication.  **`w_box.c` itself lands at 1** —
    `gui_window_request_redraw_rect`, nothing else — i.e. in the component band
    beside `gterm.c`.
-2. **ONE CONSTRUCTOR for the window lifecycle** (see the measurement above):
-   content size + a placement INTENT (centred / cascaded / explicit) + a layout
-   fn.  Twelve hand-rolled copies drop to one call each, and three conventions
-   become unrepresentable — the `-1,-1` placement (copied wrong into two files
-   in one day), `gui_queue_open` versus a direct create (a window built the
-   wrong way silently never lays out), and "clear the widgets first in the
-   layout hook".
+2. ✅ **ONE CONSTRUCTOR for the window lifecycle (2026-09-18, all 3 arches,
+   i386 driven).**  `gui_app_open(&spec)` — content size, a placement INTENT, a
+   layout fn, an optional tick, and the caller's singleton pointer.  **THREE
+   CONVENTIONS BECAME UNREPRESENTABLE, and each had already cost real time.**
+   **PLACEMENT:** `window_alloc` stores x/y verbatim, so `-1,-1` is not
+   "centre" — it is one pixel off the corner; copied wrong into TWO files on
+   the same day, and the sign-in screen was invisible for several rounds
+   because *"modal visible to the compositor (z-index 0 of 1)"* reports
+   Z-ORDER, not pixels.  `GUI_PLACE_CASCADE | CENTER | DIALOG | AT` — and
+   `GUI_PLACE_DIALOG` is now the DEFINITION of a sentence three files each
+   carried as a comment above their own copy of `(sw-ow)/2, (sh-oh)/3`.
+   **THE SINGLETON:** twelve raise-or-create tests paired with twelve one-line
+   `on_close` handlers whose whole job was to null a static — *a pairing that
+   was a convention, so either half could be forgotten alone.*  `spec.slot` is
+   filled on create, honoured on reopen and cleared on EVERY close route,
+   through the new `win_run_on_close` that both the host's graceful path and
+   `destroy_window` call.  **THE HOSTING TASK:** a window created on a task
+   with no app-host loop never lays out and never ticks (§M61) — a convention,
+   not a type distinction, so it fails SILENTLY.  It cannot be made impossible
+   without taking creation away from the apps, but it is LOUD now, naming the
+   task and the pid.  **MEASURED with the same metric, validated the same way
+   (`gterm.c == 2`): the 9–17 entangled band went from 8 files to 4** —
+   accountspanel 13→7, lockscreen 12→8, displaypanel 12→8, dialog 11→7,
+   devicepanel 8→4, controlpanel 7→4, taskman 8→6 — **and the cluster is GONE
+   rather than moved:** `gui_window_outer_for_content` survives in ONE file,
+   `gui_window_set_on_close` in one (a terminal window, a different API), and
+   `gui_app_window_create` in three, all DECLARED exceptions in gui.h (the
+   Wayland bridge hosts on the server task and draws its own pixels; `gui
+   bench` must not measure the lifecycle; dosgui is client-managed).  The four
+   files left in the band are left for honest reasons — wayland.c and
+   shell_vista.c call the SURFACE and CHROME APIs, not the lifecycle, and
+   **shell_vista at 17 is step 3's subject.**  **TWO FALSIFIERS SHIPPED**
+   (§M71's rule 1): `gui hosttest` makes the hosting mistake on purpose and the
+   window it produces has **NO WIDGETS** — the consequence rather than the
+   complaint; `gui slottest` reports FILLED / *"same window RAISED (no second
+   built)"* / CLEARED, and with the clear deliberately disabled reports
+   **"STILL SET — a later open would raise a dead window"**, so the passing run
+   means something.  **AND SLOTTEST CAUGHT ITS OWN FIRST VERSION, which is
+   worth more than the pass:** it opened, closed and polled all inside the
+   app-host's open fn — *waiting, on the host task, for the host loop its own
+   polling had blocked* — and reported `slot STILL SET`, a confident wrong bug
+   report about the product.  *An observer running inside the thing it observes
+   cannot see it work* (§M55's poller-inside-the-poll, in a new costume).
+   **VERIFIED:** all seven settings panels open with 0 host warnings and 0
+   faults; dialog, uikit and taskman likewise; the file manager checked BY
+   PICTURE with its menu bar, toolbar, table headers, row separators,
+   scrollbar and status line intact.
 3. **THE WINDOW ITSELF BECOMES A WIDGET.**  Only then are the Start menu, the
    desktop and the sign-in screen ordinary compositions rather than hand-drawn
    chrome.

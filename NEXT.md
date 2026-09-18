@@ -78,13 +78,26 @@ do both jobs.  `widget_ops.pointer` returns `WH_IGNORED`/`WH_DAMAGED`/
 by a control run against the pre-change code in which the same gesture leaves
 the panel's 378131 pixels **byte-identical**.
 
-**Step 2: ONE CONSTRUCTOR for the window lifecycle.**  The first measurement
-found twelve hand-rolled copies of it, and three conventions that are remembered
-rather than enforced — the `-1,-1` placement (copied wrong into two files in one
-day, which is how the lock screen landed off-screen), `gui_queue_open` versus a
-direct create (a window built the wrong way silently never lays out), and "clear
-the widgets first in the layout hook".  Re-measure the coupling table after it:
-the entangled band (9–17) is the number that has to move.
+**Step 2 is done and on `main` (`0cc1abe`): `gui_app_open(&spec)`.**  Placement
+is an INTENT, the singleton is a `slot` the compositor clears on every close
+route, and a window built on a task with no app-host loop is named instead of
+failing silently.  **The entangled band went from 8 files to 4**, and the
+lifecycle cluster survives only in three declared exceptions.  Two falsifiers
+ship with it — `gui hosttest` and `gui slottest`, both hidden from `help`.
+
+**Step 3: THE WINDOW ITSELF BECOMES A WIDGET.**  `shell_vista.c` is the file the
+table still puts at **17**, and it is the right one: it calls the CHROME APIs
+(`gui_panel_*`, `gui_wm_*`, `gui_queue_*`) because the taskbar, the Start menu
+and the desktop icon field are hand-drawn surfaces rather than compositions.
+Only after the window is a widget do those become ordinary ones — which is also
+what the user asked for (*"a window widget contains a menubar widget, a menubar
+contains a dropdown; a view widget holds the icons and the desktop can use the
+same one; list items the Start menu can use too"*).
+
+Still to do in the milestone, from the agreed design: mandatory-vs-optional
+`widget_ops` declared per class plus an `AUDIT()` with a shipped falsifier, and
+the checkable threading rule (*a widget's parent and its host are the same
+task*).
 
 The metric itself is reproducible — count the DISTINCT symbols defined in
 `gui.c`/`wm.c`/`compose.c`/`input.c` that a file calls, and check that
