@@ -85,19 +85,27 @@ failing silently.  **The entangled band went from 8 files to 4**, and the
 lifecycle cluster survives only in three declared exceptions.  Two falsifiers
 ship with it — `gui hosttest` and `gui slottest`, both hidden from `help`.
 
-**Step 3: THE WINDOW ITSELF BECOMES A WIDGET.**  `shell_vista.c` is the file the
-table still puts at **17**, and it is the right one: it calls the CHROME APIs
-(`gui_panel_*`, `gui_wm_*`, `gui_queue_*`) because the taskbar, the Start menu
-and the desktop icon field are hand-drawn surfaces rather than compositions.
-Only after the window is a widget do those become ordinary ones — which is also
-what the user asked for (*"a window widget contains a menubar widget, a menubar
-contains a dropdown; a view widget holds the icons and the desktop can use the
-same one; list items the Start menu can use too"*).
+**Step 3 is started and on `main` (`bab9013`): the Start menu is an
+`item_model` drawn by the shared list view.**  Its row geometry went from THREE
+copies (painter / click / hover) to one, and the conversion needed three
+optional additions — `item_entry.group_start`, `item_view.height_for`,
+`item_model.row_h`.  It also exposed two pre-existing defects in the shared
+view: a density-blind `L_ROW_H 40`, and a row too short for the two lines the
+view itself draws (the Control Panel's list had every sub-label painted across
+the next row's label).
 
-Still to do in the milestone, from the agreed design: mandatory-vs-optional
-`widget_ops` declared per class plus an `AUDIT()` with a shipped falsifier, and
-the checkable threading rule (*a widget's parent and its host are the same
-task*).
+**Still hand-drawn, and the rest of step 3:** the taskbar, the volume and
+keyboard flyouts, the desktop icon field's chrome, and the sign-in screen.
+`shell_vista.c` stays at **17** on the coupling table and that is correct — its
+calls are `gui_wm_*` / `gui_panel_*` / `gui_queue_*`, the chrome and WM APIs,
+which the menu conversion never touched.  *Use the right metric per step:* the
+table measures app↔compositor coupling, and a step that removes duplication
+INSIDE a file has to be measured as duplication.
+
+Still to do in the milestone, from the agreed design: `struct gui_window` as a
+widget; mandatory-vs-optional `widget_ops` declared per class plus an `AUDIT()`
+with a shipped falsifier; and the checkable threading rule (*a widget's parent
+and its host are the same task*).
 
 The metric itself is reproducible — count the DISTINCT symbols defined in
 `gui.c`/`wm.c`/`compose.c`/`input.c` that a file calls, and check that
