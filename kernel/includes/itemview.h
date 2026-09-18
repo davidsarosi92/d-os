@@ -48,6 +48,19 @@ struct item_entry {
     const char* sub;            /* optional second line; NULL = none      */
     int         icon;           /* enum icon_id                           */
     int         dim;            /* non-zero = draw as unavailable         */
+    /* §M81 — THIS ROW STARTS A NEW GROUP: draw a rule above it.
+     *
+     * Appended, and zero is the old behaviour exactly, which is the rule since
+     * §M58's scar (this struct is filled with positional initialisers inside
+     * the views themselves).
+     *
+     * It exists because a MENU is a list with divisions in it, and the Start
+     * menu had been drawing its own rule from its own row arithmetic — a
+     * second copy of the geometry the view already owns, which is the shape
+     * §4.79 paid for in the title buttons: the painter and the hit test
+     * computing the same box separately.  A model that says WHERE a group
+     * begins leaves the geometry in one place. */
+    int         group_start;
 };
 
 struct item_model {
@@ -89,6 +102,24 @@ struct item_model {
      * Return 0 and fill the two outputs when the item is placed; non-zero when
      * it is not, and the view puts it in flow order. */
     int  (*pos)(void* ctx, int index, int* col, int* row);
+
+    /* §M81 — HOW TALL A ROW OF MINE SHOULD BE, or 0 for the density's `row_h`.
+     * Appended, like everything since §M58's scar.
+     *
+     * THE MODEL DECIDES, NOT THE VIEW — the same argument §M69 made for
+     * `col_style`.  A file list and a MENU are both lists, and the design gives
+     * them different heights: a table row is a hit target with a rhythm
+     * (`row_h`), a menu item is text with padding.  A view that hard-coded one
+     * would be right for the file manager and wrong for the Start menu, and a
+     * view that took the height as a parameter would put the number back in
+     * every caller — which is what this whole milestone is removing.
+     *
+     * It is not cosmetic.  With `SM_MAX_APPS` (12) plus the session tail, a
+     * menu drawn at `row_h` comes to 1088 px at the 200 % density cap, i.e.
+     * past both `PANEL_POPUP_MAX` and the screen — so the wrong answer here is
+     * a menu whose top rows are silently clipped, which is exactly the §M32
+     * defect this file's neighbours already paid for. */
+    int  (*row_h)(void* ctx);
 
     /* HOW a column is set — appended, like everything since §M58's scar.
      *
@@ -205,6 +236,20 @@ struct item_view {
      * Returns 0 and fills the rect (relative to the box) on success. */
     int  (*cell_rect)(int i, int col, int w, int h, const struct item_model* m,
                       int scroll, int* ox, int* oy, int* ow, int* oh);
+
+    /* §M81 — HOW TALL MUST THE BOX BE TO SHOW `n` ITEMS?  The honest inverse of
+     * `page`, and appended for the reason everything since §M58 is.
+     *
+     * Every caller so far is GIVEN a box and asks how much of the model fits.
+     * A MENU is the other way round: it sizes itself to its contents, so it has
+     * to ask the view rather than keep its own copy of the row height.  The
+     * Start menu kept one (`SM_ITEM_H`) and computed its rows in three separate
+     * places — the painter, the hit test and the hover — which is exactly the
+     * divergence this whole milestone is about.
+     *
+     * NULL means "this layout cannot size itself to its content", which a
+     * caller must be able to tell from a height of zero. */
+    int  (*height_for)(int w, int n, const struct item_model* m);
 };
 
 /* One cell's text, exactly as a view would draw it: from `cell` when the model

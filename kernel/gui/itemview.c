@@ -280,7 +280,7 @@ static void grid_draw(struct gfx_surface* s, int x, int y, int w, int h,
     for (int i = m->pos ? 0 : scroll; i < n; i++) {
         int cx, cy, cw, ch;
         if (grid_rect(i, w, h, m, scroll, &cx, &cy, &cw, &ch) != 0) continue;
-        struct item_entry e = { 0, 0, ICON_APP, 0 };
+        struct item_entry e = { .icon = ICON_APP };
         if (m->get(m->ctx, i, &e) != 0) continue;
 
         cx += x; cy += y;
@@ -358,24 +358,69 @@ ITEM_VIEW(itemview_grid) = {
 /* LIST — one item per row, small icon, label + optional sub-label.      */
 /* ===================================================================== */
 
-#define L_ROW_H     40
-#define L_ICON      28
-#define L_PAD       8
+/* §M81 — THE ROW HEIGHT IS THE DENSITY'S, not a literal.
+ *
+ * It was a flat `40`, which is the design's comfort-density row in DESIGN
+ * pixels — so at §M69's measured 137 % the list drew 40 px rows while every
+ * other row in the tree was 44, and one wheel notch (`cp_row_h()` per line)
+ * stopped a fraction of a row short each time.  The same class of defect §M69
+ * swept out of nine windows, still standing in the shared view because nothing
+ * had put a list next to a panel and looked. */
+#define L_ICON      cp_px(28)
+#define L_PAD       cp_px(8)
+
+/* §M81 — THE ROW HEIGHT COMES FROM THE MODEL, falling back to the density's.
+ *
+ * It was a flat `40` — the design's comfort row in DESIGN pixels — so at
+ * §M69's measured 137 % the list drew 40 px rows while every other row in the
+ * tree was 44.  The same density-blind literal §M69 swept out of nine windows,
+ * still standing in the shared view because nothing had put a list next to a
+ * panel and looked.
+ *
+ * And it is the MODEL's answer rather than a constant because a menu and a file
+ * list are both lists with different rows — see item_model.row_h. */
+static int list_row_h(const struct item_model* m) {
+    int h = (m && m->row_h) ? m->row_h(m->ctx) : 0;
+    if (h > 0) return h;                /* the model asked for a height */
+
+    /* §M81 — THE DEFAULT MUST FIT WHAT THIS VIEW DRAWS, and it did not.
+     *
+     * `list_draw` puts a SECOND LINE under the label when the model supplies
+     * `sub`, which needs `2 * cp_fh() + 3` — about 47 px at §M69's measured
+     * 137 % — while the row was a flat 40.  So every two-line row overran its
+     * box and its sub-label was painted across the NEXT row's label: found by
+     * PICTURE in the Control Panel's list mode, where "Theme, density, text and
+     * icon size" sat on top of "System".
+     *
+     * *A view that draws more than its own row height is the layout bug a
+     * measure exists to prevent* — and it survived because the only caller that
+     * supplies `sub` is the Control Panel, whose default view is the grid.
+     *
+     * The floor applies to the DEFAULT only: a model that names its own height
+     * gets it, because the Start menu's rows are one line and must stay short
+     * enough for the whole menu to fit the panel strip. */
+    int two = 2 * cp_fh() + cp_px(6);
+    int row = cp_row_h();
+    return row > two ? row : two;
+}
 
 static int list_rect(int i, int w, int h, const struct item_model* m, int scroll,
                      int* ox, int* oy, int* ow, int* oh) {
-    (void)m;
+    int rh = list_row_h(m);
     int idx = i - scroll;
     if (idx < 0) return -1;
-    int y = idx * L_ROW_H;
+    int y = idx * rh;
     if (y >= h) return -1;
-    *ox = 0; *oy = y; *ow = w; *oh = L_ROW_H;
+    *ox = 0; *oy = y; *ow = w; *oh = rh;
     return 0;
 }
 
+/* `page` has no model to ask, so it answers for the density's row — which is
+ * what every caller of it draws with.  A model with its own row height sizes
+ * itself through `height_for` instead. */
 static int list_page(int w, int h) {
     (void)w;
-    int rows = h / L_ROW_H;
+    int rows = h / cp_row_h();
     return rows < 1 ? 1 : rows;
 }
 
@@ -387,10 +432,17 @@ static void list_draw(struct gfx_surface* s, int x, int y, int w, int h,
     for (int i = scroll; i < n; i++) {
         int cx, cy, cw, ch;
         if (list_rect(i, w, h, m, scroll, &cx, &cy, &cw, &ch) != 0) continue;
-        struct item_entry e = { 0, 0, ICON_APP, 0 };
+        struct item_entry e = { .icon = ICON_APP };
         if (m->get(m->ctx, i, &e) != 0) continue;
 
         cx += x; cy += y;
+        /* §M81 — the group rule, from the MODEL's `group_start`.  Drawn on the
+         * row's own top edge, so the divider and the row it divides cannot end
+         * up computed from two different numbers.  Never above the first
+         * visible row: a rule with nothing above it reads as the box's border. */
+        if (e.group_start && i > scroll)
+            gfx_fill(s, cx + L_PAD, cy, cw - 2 * L_PAD, 1,
+                     cp_current_theme()->line);
         if (i == sel)
             gfx_blend_fill(s, cx + 1, cy + 1, cw - 2, ch - 2, SEL_FILL);
 
@@ -417,7 +469,7 @@ static int list_hit(int px, int py, int w, int h,
                     const struct item_model* m, int scroll) {
     if (!m || !m->count) return -1;
     if (px < 0 || py < 0 || px >= w || py >= h) return -1;
-    int idx = scroll + py / L_ROW_H;
+    int idx = scroll + py / list_row_h(m);
     return idx < m->count(m->ctx) ? idx : -1;
 }
 
@@ -428,7 +480,7 @@ static int list_scrollbar(int w, int h, const struct item_model* m, int scroll,
     (void)scroll;
     if (!m || !m->count) return 0;
     int n = m->count(m->ctx);
-    int fit = h / L_ROW_H;
+    int fit = h / list_row_h(m);
     if (fit < 1) fit = 1;
     if (n <= fit) return 0;
     *bw = cp_scrollbar_w();
@@ -440,8 +492,15 @@ static int list_scrollbar(int w, int h, const struct item_model* m, int scroll,
     return 1;
 }
 
+/* §M81 — the inverse of `page`: the box height that shows exactly `n` rows. */
+static int list_height_for(int w, int n, const struct item_model* m) {
+    (void)w;
+    return n > 0 ? n * list_row_h(m) : 0;
+}
+
 ITEM_VIEW(itemview_list) = {
     .scrollbar = list_scrollbar,
+    .height_for = list_height_for,
     .name = "list",
     .draw = list_draw,
     .hit  = list_hit,

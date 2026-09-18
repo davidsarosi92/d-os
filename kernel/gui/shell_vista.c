@@ -266,7 +266,7 @@ static void icon_select(int idx) {
      * (§M60's reason for `wallpaper check`).  One line per deliberate user
      * action, so the keyboard path and the mouse path are both observable on
      * the serial log. */
-    struct item_entry e = { 0, 0, ICON_APP, 0 };
+    struct item_entry e = { .icon = ICON_APP };
     const struct item_model* m = shortcut_model();
     if (idx >= 0 && m->get && m->get(m->ctx, idx, &e) == 0)
         klog(KLOG_INFO, "gui", "desktop: selected %d (%s)\n", idx, e.label);
@@ -495,15 +495,24 @@ static void sm_exitgui(void)  { gui_queue_exit(); }
 static void sm_reboot(void)   { gui_queue_power(1); }
 static void sm_shutdown(void) { gui_queue_power(0); }
 
-static const struct { const char* key; void (*act)(void); } sm_tail[] = {
+static const struct {
+    const char* key;
+    void (*act)(void);
+    int  icon;
+} sm_tail[] = {
     /* Escalating order of what each one ends: the screen, the session, the
      * desktop, the kernel, the machine.  Lock is first because it is the one
-     * that ends nothing at all. */
-    { "menu.lock",     sm_lock     },
-    { "menu.signout",  sm_signout  },
-    { "menu.exitgui",  sm_exitgui  },
-    { "menu.reboot",   sm_reboot   },
-    { "menu.shutdown", sm_shutdown },
+     * that ends nothing at all.
+     *
+     * §M81 — THE ICON IS DATA HERE TOO.  The rows are drawn by the shared list
+     * view now, which draws one per item, so the alternative was a fourth
+     * open-coded `row < apps ? … : …` in the painter — the very shape the
+     * comment above this table warns about. */
+    { "menu.lock",     sm_lock,     ICON_USERS    },
+    { "menu.signout",  sm_signout,  ICON_USERS    },
+    { "menu.exitgui",  sm_exitgui,  ICON_TERMINAL },
+    { "menu.reboot",   sm_reboot,   ICON_UPDATE   },
+    { "menu.shutdown", sm_shutdown, ICON_POWER    },
 };
 #define SM_TAIL_N ((int)(sizeof sm_tail / sizeof sm_tail[0]))
 
@@ -527,8 +536,116 @@ static int menu_rows(void) {
     return apps + SM_TAIL_N;
 }
 
-static int menu_h(void)   { return menu_rows() * SM_ITEM_H + 12 + SM_HEAD_H; }
+/* ---------------------------------------------------------------------------
+ * §M81 — THE START MENU IS AN ITEM MODEL, AND THE SHARED LIST VIEW DRAWS IT.
+ *
+ * Asked for directly: *"list items, which the Start menu could also use."*
+ * The desktop's icon field, the Control Panel and the file manager have shared
+ * `item_model` + `ITEM_VIEW()` since §M64; the menu was the list that did not,
+ * and it paid the usual price — its row arithmetic
+ * (`myy + 6 + SM_HEAD_H + i * SM_ITEM_H`) existed in THREE places: the
+ * painter, the click handler and the hover.  That is §4.79's shape exactly,
+ * and this file's own comment above `sm_tail` says so about the row TABLE
+ * while the row GEOMETRY stayed triplicated one screen below it.
+ *
+ * What the conversion needed from the view, both appended and optional:
+ * `item_entry.group_start` (a menu is a list with divisions) and
+ * `item_view.height_for` (a menu sizes itself to its contents, where every
+ * other caller is given a box and asks how much fits).
+ * ------------------------------------------------------------------------- */
+
+static int sm_count(void* c) { (void)c; return menu_rows(); }
+
+static int sm_apps(void) {
+    int apps = gui_app_count();
+    return apps > SM_MAX_APPS ? SM_MAX_APPS : apps;
+}
+
+static int sm_get(void* c, int i, struct item_entry* out) {
+    (void)c;
+    int apps = sm_apps();
+    if (i < 0) return -1;
+    if (i < apps) {
+        const struct gui_app_def* a = gui_app_at(i);
+        if (!a) return -1;
+        /* §M69 — THE ENGLISH NAME IS THE KEY.  `gui_app_def.name` is a stable
+         * IDENTIFIER (§M64's shortcut resolver matches `app:File Manager`
+         * against it, so a `.lnk` survives a rebuild), which is why it is not
+         * translated at the registry: looking it up gives a translated LABEL
+         * while the identity stays put. */
+        out->label = lstr(a->name);
+        out->icon  = a->icon ? a->icon : ICON_APP;
+        return 0;
+    }
+    int t = i - apps;
+    if (t >= SM_TAIL_N) return -1;
+    out->label = lstr(sm_tail[t].key);
+    out->icon  = sm_tail[t].icon;
+    /* The rule above the session tail — the model saying where a group begins,
+     * rather than the painter counting rows a second time. */
+    out->group_start = (t == 0);
+    return 0;
+}
+
+static void sm_activate(void* c, int i) {
+    (void)c;
+    int apps = sm_apps();
+    if (i < 0) return;
+    if (i < apps) { gui_queue_launch(gui_app_at(i)); return; }
+    int t = i - apps;
+    if (t < SM_TAIL_N) sm_tail[t].act();
+}
+
+/* A MENU ROW IS NOT A TABLE ROW, and the model is what knows that.  At the
+ * density's `row_h` a full menu comes to 1088 px at the 200 % cap — past
+ * `PANEL_POPUP_MAX` and past the screen — so the clip would silently eat the
+ * top rows, which is §M32's defect verbatim.  Text plus padding, as it always
+ * was here. */
+static int sm_row_h(void* c) { (void)c; return SM_ITEM_H; }
+
+static const struct item_model sm_model = {
+    .count = sm_count, .get = sm_get, .activate = sm_activate,
+    .row_h = sm_row_h,
+};
+
+/* The list view, looked up once.  It is a linker-section registration compiled
+ * into every build, so a NULL here means the registry itself is broken — which
+ * is worth saying out loud rather than papering over with a fallback that
+ * recomputes the row geometry.  *A fallback kept past its usefulness is what
+ * makes one path work and its twin silently not* (§M52), and the whole point of
+ * this conversion is that the geometry has ONE owner. */
+static const struct item_view* sm_view(void) {
+    static const struct item_view* v;
+    static int moaned;
+    if (!v) v = item_view_by_name("list");
+    if (!v && !moaned) {
+        moaned = 1;
+        kprintf("vista: the 'list' item view is not registered — "
+                "the Start menu cannot be drawn\n");
+    }
+    return v;
+}
+
+static int menu_list_h(void) {
+    const struct item_view* v = sm_view();
+    if (!v || !v->height_for) return 0;
+    return v->height_for(SM_W, menu_rows(), &sm_model);
+}
+
+static int menu_h(void)   { return menu_list_h() + 12 + SM_HEAD_H; }
 static int menu_top(void) { return scr_h - TASKBAR_H - menu_h(); }
+
+/* THE MENU'S LIST BOX, IN ONE PLACE.  The painter, the hit test and the hover
+ * all take it from here, which is the whole point of the conversion: three
+ * copies of `myy + 6 + SM_HEAD_H + i * SM_ITEM_H` could disagree and one
+ * cannot. */
+static void menu_list_box(int* x, int* y, int* w, int* h) {
+    int myy = menu_top();
+    *x = 6;
+    *y = myy + 6 + SM_HEAD_H;
+    *w = SM_W - 4;
+    *h = menu_list_h();
+}
 
 /* M22.7-B — tell the compositor the popup's on-screen rect so it composites
  * (and hit-routes) it while open.  Called whenever menu_open changes. */
@@ -553,27 +670,6 @@ static int tbtn_width(int nslots) {
     if (w > TBTN_W) w = TBTN_W;
     if (w < 48)     w = 48;
     return w;
-}
-
-/* Label for a menu row: an app name, or a power tail item. */
-static const char* menu_label(int row) {
-    int apps = gui_app_count();
-    if (apps > SM_MAX_APPS) apps = SM_MAX_APPS;
-    if (row < apps) {
-        const struct gui_app_def* a = gui_app_at(row);
-        /* §M69 — THE ENGLISH NAME IS THE KEY here, and that is a decision
-         * rather than laziness.  `gui_app_def.name` is a stable IDENTIFIER —
-         * §M64's shortcut resolver matches `app:File Manager` against it by
-         * name so a `.lnk` survives a rebuild — so it must not be translated
-         * at the registry.  Looking the identifier up in the catalogue gives a
-         * translated LABEL while the identity stays put, and `lstr`'s
-         * fall-back-to-the-key makes an app nobody has translated render
-         * exactly as before. */
-        return a ? lstr(a->name) : "?";
-    }
-    int t = row - apps;
-    if (t >= 0 && t < SM_TAIL_N) return lstr(sm_tail[t].key);
-    return "?";
 }
 
 /* WHAT THE HEADER SAYS.  `gui_session_user()` when somebody signed in at the
@@ -778,8 +874,6 @@ static void vista_draw(struct gfx_surface* back) {
     /* Start menu overlay. */
     if (menu_open) {
         int mh = menu_h(), myy = menu_top();
-        int apps = gui_app_count();
-        if (apps > SM_MAX_APPS) apps = SM_MAX_APPS;
 
         gfx_blend_fill(back, 8, myy + 4, SM_W, mh, COL_SHADOW);
         gfx_fill(back, 4, myy, SM_W, mh, COL_SM_BG);
@@ -797,28 +891,32 @@ static void vista_draw(struct gfx_surface* back) {
                 menu_user(), COL_ACCENT);
         gfx_fill(back, 10, myy + SM_HEAD_H, SM_W - 12, 1, COL_SEP);
 
-        for (int i = 0; i < menu_rows(); i++) {
-            int iy = myy + 6 + SM_HEAD_H + i * SM_ITEM_H;
-            if (i == apps)               /* separator above the session tail */
-                gfx_fill(back, 10, iy - 1, SM_W - 12, 1, COL_SEP);
-            if (i == menu_hover)
-                gfx_fill(back, 6, iy, SM_W - 4, SM_ITEM_H, COL_SM_HOVER);
-            cp_text(back, 18, iy + (SM_ITEM_H - cp_fh()) / 2,
-                     menu_label(i), COL_TEXT);
+        /* §M81 — THE ROWS ARE THE SHARED LIST VIEW'S NOW.  The separator comes
+         * from the model's `group_start` and the highlight from `sel`, so the
+         * three things this loop used to compute — the row box, the divider and
+         * the hover band — are one piece of geometry owned by the view.  The
+         * icons are new and come for free: the view draws one per item, and the
+         * registry has had them since §M64. */
+        {
+            int bx, by, bw, bh;
+            menu_list_box(&bx, &by, &bw, &bh);
+            const struct item_view* v = sm_view();
+            if (v && v->draw)
+                v->draw(back, bx, by, bw, bh, &sm_model, menu_hover, 0);
         }
     }
 }
 
 static void vista_motion(int x, int y) {
     if (!menu_open) return;
-    int myy = menu_top();
-    int nh;
-    if (x >= 4 && x < 4 + SM_W &&
-        y >= myy + 6 + SM_HEAD_H &&
-        y < myy + 6 + SM_HEAD_H + menu_rows() * SM_ITEM_H)
-        nh = (y - myy - 6 - SM_HEAD_H) / SM_ITEM_H;
-    else
-        nh = -1;
+    /* §M81 — the third copy of the row arithmetic, now the same call the
+     * painter and the click make.  A hover that highlighted a different row
+     * from the one a click would run is precisely the defect a shared view
+     * makes unrepresentable. */
+    int bx, by, bw, bh;
+    menu_list_box(&bx, &by, &bw, &bh);
+    const struct item_view* v = sm_view();
+    int nh = (v && v->hit) ? v->hit(x - bx, y - by, bw, bh, &sm_model, 0) : -1;
     if (nh != menu_hover) {
         menu_hover = nh;
         gui_panel_dirty();          /* chrome-only repaint (M22.7 — was a
@@ -951,16 +1049,16 @@ static int vista_click(int x, int y) {
     if (menu_open) {
         int myy = menu_top();
         if (x >= 4 && x < 4 + SM_W && y >= myy && y < ty) {
-            /* A click on the header band gives a NEGATIVE index and falls
-             * through every arm — it is not a row, and must not become one by
-             * rounding. */
-            int idx = (y - myy - 6 - SM_HEAD_H) / SM_ITEM_H;
-            int apps = gui_app_count();
-            if (apps > SM_MAX_APPS) apps = SM_MAX_APPS;
-            if (idx >= 0 && idx < apps)
-                gui_queue_launch(gui_app_at(idx));
-            else if (idx >= apps && idx - apps < SM_TAIL_N)
-                sm_tail[idx - apps].act();
+            /* §M81 — the VIEW answers.  A click on the header band is outside
+             * the list box, so `hit` returns -1 and nothing runs: the header is
+             * not a row, and it cannot become one by rounding — which is what a
+             * division by the row height did before. */
+            int bx, by, bw, bh;
+            menu_list_box(&bx, &by, &bw, &bh);
+            const struct item_view* v = sm_view();
+            int idx = (v && v->hit) ? v->hit(x - bx, y - by, bw, bh, &sm_model, 0)
+                                    : -1;
+            if (idx >= 0) sm_activate(NULL, idx);
             menu_open = 0;
             publish_popup();
             return 1;
