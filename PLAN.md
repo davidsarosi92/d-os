@@ -5196,9 +5196,56 @@ absent, and everything else follows from fixing it.
    faults; dialog, uikit and taskman likewise; the file manager checked BY
    PICTURE with its menu bar, toolbar, table headers, row separators,
    scrollbar and status line intact.
-3. **THE WINDOW ITSELF BECOMES A WIDGET.**  Only then are the Start menu, the
-   desktop and the sign-in screen ordinary compositions rather than hand-drawn
-   chrome.
+3. ◐ **THE CHROME BECOMES COMPOSITIONS — the Start menu first (2026-09-18,
+   all 3 arches, i386 + x86_64 driven).**  Asked for directly: *"list items,
+   which the Start menu could also use."*  The desktop's icon field, the
+   Control Panel and the file manager have shared `item_model` + `ITEM_VIEW()`
+   since §M64; **the Start menu was the list that did not**, and it paid the
+   usual price — its row geometry (`myy + 6 + SM_HEAD_H + i * SM_ITEM_H`)
+   existed in **THREE places**: the painter, the click handler and the hover.
+   That is §4.79's shape, and *this file's own comment above `sm_tail` says
+   exactly that about the row TABLE while the row GEOMETRY stayed triplicated
+   one screen below it.*  Now `sm_model` + `menu_list_box()`: **one geometry,
+   asked by all three**, and `SM_ITEM_H` has ONE use left — the model's answer
+   to "how tall is a row of mine".  **THREE THINGS THE VIEW NEEDED, all
+   optional and appended (§M58's rule):** `item_entry.group_start` (a menu is a
+   list with divisions; the MODEL says where a group begins so the divider and
+   the row it divides come from one piece of arithmetic),
+   `item_view.height_for` (the honest inverse of `page` — every caller so far is
+   GIVEN a box and asks how much fits, while a menu sizes itself to its
+   contents), and `item_model.row_h` — **the model decides, not the view**,
+   §M69's `col_style` argument verbatim, because a file list and a menu are both
+   lists with different rows.  *Not cosmetic:* at the density's `row_h` a full
+   menu is 1088 px at the 200 % cap, past both `PANEL_POPUP_MAX` and the screen,
+   so the wrong answer is a menu whose top rows are **silently clipped** —
+   §M32's defect verbatim.  **TWO PRE-EXISTING DEFECTS IN THE SHARED VIEW, both
+   found because a second client finally put a list where somebody looked at
+   it:** `L_ROW_H` was a flat **40** — the design's comfort row in DESIGN
+   pixels — so the list drew 40 px rows while every other row in the tree was
+   44, *the same density-blind literal §M69 swept out of nine windows, still
+   standing in the shared view*; **and the row did not fit what the view
+   DRAWS** — `list_draw` puts a second line under the label when the model
+   supplies `sub`, needing `2*cp_fh() + 3` ≈ 47 px, so **every two-line row
+   overran its box and painted its sub-label ACROSS THE NEXT ROW'S LABEL**.
+   Found BY PICTURE in the Control Panel's list mode ("Theme, density, text and
+   icon size" sitting on top of "System") and invisible until now because the
+   only model supplying `sub` defaults to the grid.  **VERIFIED BY DRIVING THE
+   MOUSE:** the menu by picture (icons on every row — new, the registry has had
+   them since §M64 and the menu never drew one — the `system` header band, the
+   hover on the row under the pointer, the separator above Lock from
+   `group_start`); **hover and click agree** (the pointer highlights BASIC at
+   y=809 and a press at the same y launches Task Manager); and **the header is
+   not a row** (a press on the `system` band gives 2 device presses and 0 apps
+   launched — it cannot become one by rounding, which a division by the row
+   height could).  **THE COUPLING TABLE DOES NOT MOVE for shell_vista.c, and
+   that is the honest reading rather than a disappointment:** its 17 calls are
+   `gui_wm_*`, `gui_panel_*` and `gui_queue_*` — the CHROME and WM APIs — which
+   this step never touched.  What it removed is duplication INSIDE the file, so
+   the metric is **3 copies of the row geometry going to 1**; the file did not
+   shrink (1052 → 1138 lines, most of it the model and its reasoning).  **STILL
+   OPEN in this step:** the taskbar, the volume and keyboard flyouts and the
+   sign-in screen are still hand-drawn, and `struct gui_window` is not itself a
+   widget.
 
 #### Mandatory versus optional behaviour
 
