@@ -152,9 +152,11 @@ static void show_output(const char* text) {
     int len = 0; while (text[len]) len++;
     struct outwin* o = (struct outwin*)kcalloc(1, sizeof *o);
     if (!o) return;
-    struct gui_window* win =
-        gui_app_window_create("Output", 250, 150,
-                              cp_px(460), cp_px(280), outwin_layout, o);
+    struct gui_window* win = gui_app_open(&(struct gui_app_spec){
+        .title = "Output",
+        .content_w = cp_px(460), .content_h = cp_px(280),
+        .layout = outwin_layout, .ctx = o,
+    });
     if (!win) { kfree(o); return; }
     o->ed = w_editor_create(win, 6, 6, 448, 268, o);
     if (!o->ed) { gui_window_close(win); return; }
@@ -283,9 +285,11 @@ static void editor_open_with(const char* path) {
     struct edapp_full* af = (struct edapp_full*)kcalloc(1, sizeof(*af));
     if (!af) return;
 
-    struct gui_window* win =
-        gui_app_window_create("Editor", 180, 90,
-                              cp_px(620), cp_px(460), ed_layout_full, af);
+    struct gui_window* win = gui_app_open(&(struct gui_app_spec){
+        .title = "Editor",
+        .content_w = cp_px(620), .content_h = cp_px(460),
+        .layout = ed_layout_full, .ctx = af,
+    });
     if (!win) { kfree(af); return; }
     af->a.win = win;
 

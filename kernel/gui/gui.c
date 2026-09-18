@@ -1347,6 +1347,102 @@ struct gui_window* gui_app_window_create(const char* title, int x, int y,
     return win;
 }
 
+/* ---------------------------------------------------------------------------
+ * §M81 step 2 — the window lifecycle, once.  See gui.h for the measurement
+ * this replaces: twenty hand-rolled copies of the same six lines, and every
+ * §M32 GUI defect living in them rather than in the compositor.
+ * ------------------------------------------------------------------------- */
+
+/* Turn a placement INTENT into a position, clamped so the result is on screen.
+ *
+ * The clamp is not a tidiness: `window_alloc` stores x/y VERBATIM, so nothing
+ * below this line would have refused a window placed off the edge — which is
+ * how `-1,-1` produced a sign-in screen nobody could see, and how a window
+ * sized past the bottom of a 1200 px framebuffer read as a broken layout
+ * (§M69's own gallery, at the measured 137 % density). */
+static void place_for(int intent, int ow, int oh, int ax, int ay,
+                      int* out_x, int* out_y) {
+    int sw = gui_screen_w(), sh = gui_screen_h();
+    int x, y;
+    switch (intent) {
+    case GUI_PLACE_CENTER:
+        x = (sw - ow) / 2; y = (sh - oh) / 2;
+        break;
+    case GUI_PLACE_DIALOG:
+        x = (sw - ow) / 2; y = (sh - oh) / 3;
+        break;
+    case GUI_PLACE_AT:
+        x = ax; y = ay;
+        break;
+    default: {
+        /* CASCADE — the next slot in a stagger.  Every app used to carry its
+         * own literal origin (180,100 / 140,110 / 120,100 / 300,120 …), each
+         * approximating this by hand and none of them aware of the others, so
+         * two panels opened in a row could land exactly on top of each other.
+         * The counter never resets, which is right: what matters is that two
+         * CONSECUTIVE opens differ, not where the series began. */
+        static int nth;
+        int step = cp_px(28);
+        x = cp_px(120) + (nth % 8) * step;
+        y = cp_px(80)  + (nth % 8) * step;
+        nth++;
+        break;
+    }
+    }
+    /* Clamp last, so an intent that computes an off-screen position for a
+     * window larger than the screen still yields a visible title bar. */
+    if (x + ow > sw) x = sw - ow;
+    if (y + oh > sh) y = sh - oh;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    *out_x = x; *out_y = y;
+}
+
+struct gui_window* gui_app_open(const struct gui_app_spec* sp) {
+    if (!sp) return NULL;
+
+    /* THE SINGLETON, once.  Twelve copies of this test existed, each paired
+     * with a one-line `on_close` handler whose only job was to null the same
+     * pointer — and the pairing was a convention, so either half could be
+     * forgotten independently. */
+    if (sp->slot && *sp->slot) {
+        gui_window_raise(*sp->slot);
+        return *sp->slot;
+    }
+
+    /* THE HOSTING TASK, NAMED RATHER THAN ASSUMED.  A window binds to
+     * `task_current()`, and one created on a task with no app-host loop never
+     * lays out and never ticks — it just sits there looking like an app that
+     * ignored its own events (§M61).  This cannot be made impossible without
+     * taking the creation call away from the apps, but it can be made LOUD:
+     * the failure is silent, and a silent failure is what cost the diagnosis
+     * last time.  Reported, not refused — `gui bench` and the Wayland bridge
+     * legitimately create windows outside a host. */
+    if (!app_host_is_host_task(task_current())) {
+        struct task* t = task_current();
+        kprintf("gui: '%s' is being created on '%s' (pid %d), which runs no "
+                "app-host loop — it will never lay out or tick.  Open it "
+                "through gui_queue_open().\n",
+                sp->title ? sp->title : "?", t ? t->name : "?", t ? t->pid : -1);
+    }
+
+    int ow = 0, oh = 0;
+    gui_window_outer_for_content(sp->content_w, sp->content_h, &ow, &oh);
+    int x = 0, y = 0;
+    place_for(sp->place, ow, oh, sp->x, sp->y, &x, &y);
+
+    struct gui_window* win = gui_app_window_create(sp->title, x, y, ow, oh,
+                                                  sp->layout, sp->ctx);
+    if (!win) return NULL;
+
+    win->app_slot = sp->slot;
+    win->on_close = sp->on_close;
+    if (sp->tick)  gui_window_set_tick(win, sp->tick);
+    if (sp->modal) gui_window_set_modal(win, 1);
+    if (sp->slot)  *sp->slot = win;
+    return win;
+}
+
 int gui_is_active(void) { return gui_active; }
 
 /* §M42 — the desktop/session task pid (0 until gui_start spawns it).  A GUI app

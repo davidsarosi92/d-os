@@ -552,9 +552,12 @@ static void dm_tick(struct gui_window* win) {
     gui_window_request_redraw(win);
 }
 
+/* §M81 — `dm_win = NULL` is gone from here: the singleton is the spec's `slot`
+ * and the compositor clears it on every close route.  What is left is the state
+ * that is genuinely this panel's. */
 static void dm_on_close(struct gui_window* w) {
     (void)w;
-    dm_win = NULL; dm_view = NULL; dm_detail = NULL;
+    dm_view = NULL; dm_detail = NULL;
     dm_sel = -1; dm_sel_name[0] = 0;
 }
 
@@ -606,14 +609,13 @@ static void dm_layout(struct gui_window* win) {
 }
 
 static void devices_panel_open(void) {
-    if (dm_win) { gui_window_raise(dm_win); return; }
-    int ow, oh;
-    gui_window_outer_for_content(cp_px(760), cp_px(380), &ow, &oh);
-    dm_win = gui_app_window_create("Devices", 120, 100, ow, oh, dm_layout, NULL);
-    if (dm_win) {
-        gui_window_set_on_close(dm_win, dm_on_close);
-        gui_window_set_tick(dm_win, dm_tick);
-    }
+    struct gui_app_spec sp = {
+        .title = "Devices",
+        .content_w = cp_px(760), .content_h = cp_px(380),
+        .layout = dm_layout, .tick = dm_tick,
+        .on_close = dm_on_close, .slot = &dm_win,
+    };
+    gui_app_open(&sp);
 }
 
 /* ---------------------------------------------------------------- */

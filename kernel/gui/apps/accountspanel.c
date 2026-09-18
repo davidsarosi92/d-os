@@ -316,23 +316,19 @@ static void pr_layout(struct gui_window* win) {
 }
 
 static void pr_closed(struct gui_window* w) {
-    (void)w;
-    pr_win = NULL; pr_field = NULL;
+    (void)w;                            /* pr_win is the spec's slot (§M81) */
+    pr_field = NULL;
 }
 
 static void pr_build(void) {
-    /* Centred explicitly — see lockscreen.c: `window_alloc` takes x/y verbatim
-     * and -1 is not a convention, so this prompt was landing off-screen too.
-     * The same mistake in two files written the same day, which is what a
-     * wrong assumption about a shared API does. */
-    int ow, oh;
-    gui_window_outer_for_content(cp_px(340), cp_px(130), &ow, &oh);
-    int sw = gui_screen_w(), sh = gui_screen_h();
-    pr_win = gui_app_window_create("Account", (sw - ow) / 2, (sh - oh) / 3,
-                                   ow, oh, pr_layout, NULL);
-    if (!pr_win) return;
-    gui_window_set_on_close(pr_win, pr_closed);
-    gui_window_set_modal(pr_win, 1);
+    /* The second file that wrote `-1,-1` meaning "centre" on the same day.  Now
+     * it says what it means — see gui.h's GUI_PLACE_*. */
+    gui_app_open(&(struct gui_app_spec){
+        .title = "Account",
+        .content_w = cp_px(340), .content_h = cp_px(130),
+        .place = GUI_PLACE_DIALOG, .modal = 1,
+        .layout = pr_layout, .on_close = pr_closed, .slot = &pr_win,
+    });
 }
 
 static void ac_prompt(const char* title, int secret, void (*done)(const char*)) {
@@ -559,8 +555,8 @@ static void ac_on_select(struct w_itemview* iv, int idx, void* c) {
 }
 
 static void ac_on_close(struct gui_window* w) {
-    (void)w;
-    ac_win = NULL; ac_view = NULL; ac_detail = NULL;
+    (void)w;                            /* ac_win is the spec's slot (§M81) */
+    ac_view = NULL; ac_detail = NULL;
     ac_btn_new = ac_btn_pw = ac_btn_admin = ac_btn_del = NULL;
     ac_sel_name[0] = 0;
 }
@@ -603,12 +599,12 @@ static void ac_layout(struct gui_window* win) {
 }
 
 static void accounts_panel_open(void) {
-    if (ac_win) { gui_window_raise(ac_win); return; }
-    int ow, oh;
-    gui_window_outer_for_content(cp_px(720), cp_px(360), &ow, &oh);
-    ac_win = gui_app_window_create("User accounts", 140, 110, ow, oh,
-                                   ac_layout, NULL);
-    if (ac_win) gui_window_set_on_close(ac_win, ac_on_close);
+    struct gui_app_spec sp = {
+        .title = "User accounts",
+        .content_w = cp_px(720), .content_h = cp_px(360),
+        .layout = ac_layout, .on_close = ac_on_close, .slot = &ac_win,
+    };
+    gui_app_open(&sp);
 }
 
 SETTINGS_PANEL(accounts) = {

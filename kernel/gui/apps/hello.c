@@ -38,9 +38,10 @@ static void hello_open(void) {
     struct hello* h = (struct hello*)kcalloc(1, sizeof(*h));
     if (!h) return;
 
-    struct gui_window* w =
-        gui_app_window_create("Hello", 520, 200,
-                              cp_px(240), cp_px(130), NULL, h);
+    struct gui_window* w = gui_app_open(&(struct gui_app_spec){
+        .title = "Hello",
+        .content_w = cp_px(240), .content_h = cp_px(130), .ctx = h,
+    });
     if (!w) { kfree(h); return; }        /* not adopted as app_ctx on failure */
 
     w_label_create(w, 16, 10, 200, "Hello from the registry!");

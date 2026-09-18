@@ -250,8 +250,6 @@ static void dlg_layout(struct gui_window* win) {
  * window built on the caller's task would have no host loop to drain its
  * events (§M61 paid for this one). */
 static void dlg_build(void) {
-    int sw = gui_screen_w(), sh = gui_screen_h();
-
     /* §14: panel width 380–440 design px.  400 through cp_px(), so it tracks
      * the density like everything else — a constant here would be right at one
      * resolution and wrong at the next (§M62's argument for the vector logo). */
@@ -261,13 +259,16 @@ static void dlg_build(void) {
            + rows * cp_row_h()
            + cp_px(12) + cp_btn_h();             /* gap + the action row      */
 
-    int ow, oh;
-    gui_window_outer_for_content(cw, ch, &ow, &oh);
-    /* A third of the way down rather than centred: a dialog sitting exactly in
-     * the middle covers whatever it is asking about. */
-    struct gui_window* w = gui_app_window_create(dlg.title,
-                                                 (sw - ow) / 2, (sh - oh) / 3,
-                                                 ow, oh, dlg_layout, NULL);
+    /* GUI_PLACE_DIALOG is "a third of the way down rather than centred": a
+     * dialog sitting exactly in the middle covers whatever it is asking about.
+     * That sentence used to be a comment above hand-written arithmetic in each
+     * of three files; it is the intent's definition now (gui.h). */
+    struct gui_window* w = gui_app_open(&(struct gui_app_spec){
+        .title = dlg.title,
+        .content_w = cw, .content_h = ch,
+        .place = GUI_PLACE_DIALOG,
+        .layout = dlg_layout, .on_close = dlg_closed,
+    });
     if (!w) {
         /* No window means no way to ask, so the answer is the safe one and it
          * is delivered immediately — a caller left waiting for a callback that
@@ -278,7 +279,6 @@ static void dlg_build(void) {
     }
     dlg.win = w;
     gui_window_set_key_hook(w, dlg_key);
-    gui_window_set_on_close(w, dlg_closed);
     if (gui_window_set_modal(w, 1) != 0) {
         /* Refused: somebody else holds the claim.  Close what we just made and
          * answer CANCEL rather than leaving a non-modal look-alike on screen

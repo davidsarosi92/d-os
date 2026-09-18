@@ -310,17 +310,20 @@ static void lock_build(void) {
      *
      * *A probe that answers a neighbouring question is the one most likely to
      * be believed* — §M79's own lesson, met again. */
-    int ow, oh;
-    gui_window_outer_for_content(cp_px(400), cp_px(300), &ow, &oh);
-    int sw = gui_screen_w(), sh = gui_screen_h();
-    struct gui_window* win = gui_app_window_create("Locked",
-                                                   (sw - ow) / 2, (sh - oh) / 3,
-                                                   ow, oh, lock_layout, NULL);
+    /* §M81 — the intent, not the arithmetic.  The comment above is kept because
+     * it is the receipt: `-1,-1` was written here meaning "centre", and there
+     * is no such convention in the WM.  GUI_PLACE_DIALOG is that intent, and
+     * the wrong answer can no longer be spelled. */
+    struct gui_window* win = gui_app_open(&(struct gui_app_spec){
+        .title = "Locked",
+        .content_w = cp_px(400), .content_h = cp_px(300),
+        .place = GUI_PLACE_DIALOG,
+        .layout = lock_layout, .on_close = lock_closed,
+    });
     if (!win) return;
     g_lock.win = win;
     g_lock.unlocked = 0;
 
-    gui_window_set_on_close(win, lock_closed);
     if (gui_window_set_modal(win, 1) != 0) {
         /* Somebody else holds the single modal claim.  A non-modal look-alike
          * would be a picture of a lock with a live desktop behind it, which is

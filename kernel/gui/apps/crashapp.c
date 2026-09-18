@@ -193,7 +193,6 @@ static void ca_layout(struct gui_window* win) {
                       ca->status->base.w = w - 2 * pad; }
 }
 
-static void ca_on_close(struct gui_window* win) { (void)win; ca_win = NULL; }
 
 static void crashapp_open(void) {
     if (ca_win) { gui_window_raise(ca_win); ca_refresh(ca_win); return; }
@@ -201,12 +200,13 @@ static void crashapp_open(void) {
     struct crashapp* ca = (struct crashapp*)kcalloc(1, sizeof(*ca));
     if (!ca) return;
 
-    struct gui_window* win =
-        gui_app_window_create("Crash Reports", 260, 160,
-                              cp_px(500), cp_px(300), ca_layout, ca);
+    struct gui_app_spec spec = {
+        .title = "Crash Reports",
+        .content_w = cp_px(500), .content_h = cp_px(300),
+        .layout = ca_layout, .ctx = ca, .slot = &ca_win,
+    };
+    struct gui_window* win = gui_app_open(&spec);
     if (!win) { kfree(ca); return; }
-    ca_win = win;
-    gui_window_set_on_close(win, ca_on_close);
 
     /* Geometry is ca_layout's; it runs before the first paint. */
     ca->hdr = w_label_create(win, 0, 0, 0, "UPTIME KIND         PID  NAME  PC");

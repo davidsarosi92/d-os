@@ -203,6 +203,11 @@ struct gui_window {
     void (*key_hook)(struct gui_window*, char);  /* §M61 window-level keys */
     void (*on_layout)(struct gui_window*);
     void (*on_close) (struct gui_window*);
+    /* §M81 — the OWNER'S singleton pointer, nulled when this window closes.
+     * It was twelve one-line `on_close` handlers, each existing only to write
+     * NULL into one static, and each a place the rule could be forgotten.
+     * Cleared through `win_run_on_close`, which both close routes call. */
+    struct gui_window** app_slot;
     void* app_ctx;
     /* §M65 — the toolkit's per-window state (ui.c).  A pointer rather than a
      * side table keyed by window, so it cannot outlive the window it describes:
@@ -425,6 +430,23 @@ void aq_push(struct gui_window* w, struct app_event e);
 
 void app_widgets_free(struct gui_window* win);
 void app_widgets_reset(struct gui_window* win);
+
+/* §M81 — RUN THE CLOSE NOTIFICATION, on whichever route got here, and clear the
+ * owner's singleton pointer first.
+ *
+ * There are exactly TWO places a window's `on_close` is invoked — the host's
+ * graceful path (app_host.c) and the compositor's teardown (`destroy_window`,
+ * for a window the host never released) — and the slot has to be nulled on both
+ * or the app raises a window that is being torn down.  One function, called
+ * from both, rather than the rule written twice. */
+void win_run_on_close(struct gui_window* win);
+
+/* §M81 — is `t` a task running the app-host loop?  `gui_app_open` asks, because
+ * a window created anywhere else never lays out and never ticks (§M61) and
+ * fails SILENTLY.  A window is the wrong place to learn that from. */
+struct task;
+int  app_host_is_host_task(struct task* t);
+void app_host_note_task(struct task* t);
 int  app_dispatch_event(struct gui_window* win, const struct app_event* e);
 void app_redraw(struct gui_window* win);
 

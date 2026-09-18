@@ -228,6 +228,98 @@ struct gui_window* gui_app_window_create(const char* title, int x, int y,
                                          void (*on_layout)(struct gui_window*),
                                          void* app_ctx);
 
+/* ---------------------------------------------------------------------------
+ * §M81 step 2 — THE WINDOW LIFECYCLE, ONCE.
+ *
+ * §M81's first measurement counted how many compositor-core symbols each GUI
+ * file calls, and found that the entangled files are entangled THE SAME WAY:
+ * they all reach for one cluster — outer_for_content, app_window_create,
+ * set_on_close, raise, screen_w/h, queue_open.  *That cluster is the missing
+ * abstraction.*  There is no "app window" component here; there are TWENTY
+ * hand-rolled copies of one lifecycle, each spelling out:
+ *
+ *     if (X_win) { gui_window_raise(X_win); return; }
+ *     int ow, oh;
+ *     gui_window_outer_for_content(cp_px(W), cp_px(H), &ow, &oh);
+ *     X_win = gui_app_window_create("X", 140, 110, ow, oh, X_layout, ctx);
+ *     if (X_win) gui_window_set_on_close(X_win, X_on_close);
+ *   … plus, elsewhere in the file:
+ *     static void X_on_close(struct gui_window* w) { (void)w; X_win = NULL; }
+ *
+ * EVERY GUI DEFECT §M32 HIT LIVED IN THAT BOILERPLATE RATHER THAN IN THE
+ * COMPOSITOR, which is the argument for replacing it rather than tidying it:
+ *
+ *   - PLACEMENT.  `gui_app_window_create` stores x/y VERBATIM, so `-1,-1` is
+ *     not "centre" — it is one pixel off the top-left corner.  Copied wrong
+ *     into two files on the same day, and the sign-in screen was invisible for
+ *     several rounds because "modal visible to the compositor (z-index 0 of 1)"
+ *     reports Z-ORDER, not whether anything is on screen.  Here placement is an
+ *     INTENT, so the wrong answer cannot be written down.
+ *   - THE SINGLETON.  Twelve copies of a raise-or-create test and twelve
+ *     one-line `on_close` handlers whose whole job is to null a pointer.  Pass
+ *     the pointer instead: `gui_app_open` tests it, fills it, and clears it on
+ *     EVERY close route.
+ *   - THE HOSTING TASK.  A window created on a task with no app-host loop never
+ *     lays out and never ticks (§M61) — a convention, not a type distinction,
+ *     so a window built the wrong way fails SILENTLY.  It is detected and named
+ *     now; see `gui_app_open`.
+ *
+ * SIZES AND POSITIONS HERE ARE DEVICE PIXELS, the same units
+ * `gui_window_outer_for_content` already takes — deliberately NOT design
+ * pixels.  It is tempting to apply `cp_px()` inside so a caller cannot forget
+ * the density, and it would be wrong: half the callers size themselves from
+ * FONT METRICS (`58 * cp_fw() + 20`, `10 * cp_row_h() + …`), which are device
+ * pixels already, so the helpful scaling would silently double it for them.
+ * *A convenience that is right for half the callers is a bug for the other
+ * half* — and §M69 has already swept the density question through every one of
+ * these windows.
+ * ------------------------------------------------------------------------- */
+
+/* WHERE a window goes — an intent, not coordinates. */
+enum gui_place {
+    /* The next slot in a stagger, so two windows opened in a row do not land
+     * exactly on top of each other.  The default, and what the literal x/y
+     * scattered through the apps were each approximating by hand. */
+    GUI_PLACE_CASCADE = 0,
+    GUI_PLACE_CENTER,       /* centred on the screen                          */
+    /* Centred horizontally, a third of the way down: where a dialog belongs,
+     * and what three files were computing as `(sw - ow) / 2, (sh - oh) / 3`. */
+    GUI_PLACE_DIALOG,
+    GUI_PLACE_AT,           /* explicit `x`/`y`, in DESIGN pixels             */
+};
+
+struct gui_app_spec {
+    const char* title;
+    int   content_w, content_h;         /* DEVICE px — see above             */
+    int   place;                        /* enum gui_place                    */
+    int   x, y;                         /* GUI_PLACE_AT only, DEVICE px      */
+    void (*layout)(struct gui_window*);
+    void* ctx;                          /* kfree'd on close, as ever         */
+    void (*tick)(struct gui_window*);   /* optional                          */
+    void (*on_close)(struct gui_window*); /* optional, AFTER the slot clears */
+    /* The caller's singleton pointer, or NULL for a window that may exist
+     * several times over.  When non-NULL: a live window there is raised and
+     * returned instead of a second one being built, and it is set to NULL on
+     * every close route — so "the singleton is stale" stops being something
+     * each app has to remember. */
+    struct gui_window** slot;
+    int   modal;                        /* claim the screen (dialog.c)       */
+};
+
+/* WHAT DELIBERATELY DOES NOT GO THROUGH HERE, so the exceptions read as
+ * decisions rather than as conversions somebody missed:
+ *
+ *   wayland.c    a client's window is hosted by the Wayland SERVER task, not by
+ *                an app-host, and it has no layout fn because the client draws
+ *                its own pixels.  Every field of the spec would be empty.
+ *   gui_diag.c   `gui bench` makes a bare surface to composite against and
+ *                never shows a widget.  Routing it through the app-window
+ *                lifecycle would make the benchmark measure the lifecycle.
+ *
+ * Both are the raw `gui_app_window_create` above, which stays public for
+ * exactly them. */
+struct gui_window* gui_app_open(const struct gui_app_spec* spec);
+
 /* Ask for an app window to be closed (same path as its X button).
  * Actual teardown happens on the compositor task. */
 void gui_window_close(struct gui_window* win);
@@ -428,6 +520,19 @@ void uikit_command(void);
 /* Time N full-screen composites with a full-screen window open — the case
  * reported as "everything lags when a window is maximized". */
 void gui_compose_bench(int frames);
+
+/* §M81 — `gui hosttest`: open a window from the CALLING task, which is exactly
+ * the mistake `gui_app_open` warns about, so the warning can be seen to fire.
+ * §M71's rule 1 — a check that has never failed is a check nobody can rely on.
+ * Hidden from `help`, like `hardlock` and `leaktest`. */
+void gui_host_test(void);
+
+/* §M81 — `gui slottest`: create / reopen / close a window through
+ * `gui_app_open`'s singleton `slot` and report each step.  The one that fails
+ * silently is the CLOSE: a slot left pointing at a destroyed window means the
+ * panel never opens again, which reads as a Start-menu entry that stopped
+ * working rather than as a lifetime bug.  Hidden from `help`. */
+void gui_slot_test(void);
 
 /* A periodic callback on the window's own host task (~2 Hz).
  *

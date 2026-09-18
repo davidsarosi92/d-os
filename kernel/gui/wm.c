@@ -531,10 +531,26 @@ int popup_row_at(int sx, int sy) {
     if (popup.items[i][0] == '-' && !popup.items[i][1]) return -1;
     return i;
 }
+/* §M81 — the close notification, on whichever route reached it.
+ *
+ * THE SLOT IS CLEARED BEFORE THE CALLBACK RUNS, and the order matters: an
+ * `on_close` may open something, and a handler that found its own singleton
+ * still pointing at the window being torn down would raise a corpse.  Same
+ * argument as `on_dispose` firing before any teardown (§M54) — the owner has to
+ * be told the object is gone while it is still safe to be told. */
+void win_run_on_close(struct gui_window* win) {
+    if (!win) return;
+    if (win->app_slot) {
+        if (*win->app_slot == win) *win->app_slot = NULL;
+        win->app_slot = NULL;                   /* fire once, never re-enter */
+    }
+    if (win->on_close) win->on_close(win);
+}
+
 void destroy_window(struct gui_window* win) {
     /* M22.7 — a released WIN_APP already ran on_close + freed its widgets on
      * its host task; don't repeat it here.  WIN_TERM keeps the old path. */
-    if (win->on_close && !win->host_released) win->on_close(win);
+    if (!win->host_released) win_run_on_close(win);
 
     /* §M54 — tell the handle owner the window is going away.  Unconditional and
      * BEFORE any teardown, because the whole point is that it must not depend

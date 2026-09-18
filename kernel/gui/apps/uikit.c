@@ -116,15 +116,15 @@ static void uikit_open(void) {
          * it is written down as a known hazard rather than as an arrangement
          * that works, and the row count and the term below must move
          * together. */
-        gui_app_window_create("Widget kit", 200, 60,
-                              72 * cp_fw() + 40,
-                              10 * cp_current_density()->control_h
-                                  + 12 * cp_fh()
-                                  + cp_px(70) + cp_row_h(),   /* the chart row */
-                              uk_layout, NULL);
+        gui_app_open(&(struct gui_app_spec){
+            .title = "Widget kit",
+            .content_w = 72 * cp_fw() + 40,
+            .content_h = 10 * cp_current_density()->control_h
+                             + 12 * cp_fh()
+                             + cp_px(70) + cp_row_h(),   /* the chart row */
+            .layout = uk_layout, .slot = &uk_win,
+        });
     if (!win) return;
-    uk_win = win;
-    gui_window_set_on_close(win, NULL);
 
     const int cap = 32;
     struct ui_spec* sp = (struct ui_spec*)kcalloc((size_t)cap, sizeof *sp);

@@ -707,30 +707,23 @@ static void tm_layout(struct gui_window* win) {
     tm->status->base.w = cw;  tm->status->base.h = cp_fh() + 6;
 }
 
-static void tm_on_close(struct gui_window* win) {
-    (void)win;
-    tm_win = NULL;
-}
-
 static void taskman_open(void) {
-    if (tm_win) { gui_window_raise(tm_win); return; }
-
     struct taskman* tm = (struct taskman*)kcalloc(1, sizeof(*tm));
     if (!tm) return;
 
-    struct gui_window* win =
+    struct gui_app_spec spec = {
+        .title = "Task Manager",
         /* Tall enough for TEN rows at the density's row height, plus the header
          * band, the button row, the footer and the title bar.  The old height
          * was derived from the font and showed four rows once a row became a
          * design-sized 32 px. */
-        gui_app_window_create("Task Manager", 300, 120,
-                              58 * cp_fw() + 20,
-                              10 * cp_row_h() + 3 * cp_current_density()->control_h
-                                  + 3 * cp_fh() + 24,
-                              tm_layout, tm);
+        .content_w = 58 * cp_fw() + 20,
+        .content_h = 10 * cp_row_h() + 3 * cp_current_density()->control_h
+                         + 3 * cp_fh() + 24,
+        .layout = tm_layout, .ctx = tm, .slot = &tm_win,
+    };
+    struct gui_window* win = gui_app_open(&spec);
     if (!win) { kfree(tm); return; }
-    tm_win = win;
-    gui_window_set_on_close(win, tm_on_close);
 
     /* THE HEADER IS THE TABLE'S NOW, not a label with spaces in it.
      * `"pid   st     cpu    name"` lined up under one fixed advance and under

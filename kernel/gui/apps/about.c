@@ -13,20 +13,21 @@
 
 static struct gui_window* about_win = NULL;
 
-static void about_on_close(struct gui_window* win) {
-    (void)win;
-    about_win = NULL;
-}
-
 static void about_open(void) {
+    /* This window has no `on_layout`: its labels are created once, right here.
+     * So the "already open" case has to RETURN rather than fall through — the
+     * slot makes gui_app_open raise and hand back the same window, and building
+     * a second set of labels on it is exactly the duplicate-widget bug §M70
+     * found in the resize path.  Apps with a layout fn (every panel) do not
+     * need this, because their widgets are rebuilt from scratch each time. */
     if (about_win) { gui_window_raise(about_win); return; }
 
-    struct gui_window* w =
-        gui_app_window_create("About d-os", 490, 320,
-                              cp_px(300), cp_px(150), NULL, NULL);
+    struct gui_window* w = gui_app_open(&(struct gui_app_spec){
+        .title = "About d-os",
+        .content_w = cp_px(300), .content_h = cp_px(150),
+        .slot = &about_win,
+    });
     if (!w) return;
-    about_win = w;
-    gui_window_set_on_close(w, about_on_close);
 
     w_label_create(w, 16, 12, 260, "d-os — hobby teaching kernel");
     w_label_create(w, 16, 34, 260, "M22.2: modular GUI — swappable");

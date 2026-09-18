@@ -185,19 +185,18 @@ static void dlg_layout(struct gui_window* win) {
  * app window is built. */
 static int dlg_secs = 15;
 
-static int dlg_sw = 0, dlg_sh = 0;
-
 static void dlg_build(void) {
     if (dlg_win) return;
-    int ow, oh;
-    gui_window_outer_for_content(cp_px(320), cp_px(96), &ow, &oh);
-    dlg_win = gui_app_window_create("Display", (dlg_sw - ow) / 2, (dlg_sh - oh) / 3,
-                                    ow, oh, dlg_layout, NULL);
+    gui_app_open(&(struct gui_app_spec){
+        .title = "Display",
+        .content_w = cp_px(320), .content_h = cp_px(96),
+        .place = GUI_PLACE_DIALOG,
+        .layout = dlg_layout, .tick = dlg_tick, .slot = &dlg_win,
+    });
     if (!dlg_win) {          /* no window → no way to confirm → revert now */
         gui_mode_revert();
         return;
     }
-    gui_window_set_tick(dlg_win, dlg_tick);
     gui_window_set_key_hook(dlg_win, dlg_key);
     dlg_deadline_ns = timer_now_ns() + (uint64_t)dlg_secs * 1000000000ull;
     dlg_left = dlg_secs;
@@ -210,7 +209,11 @@ static void dlg_build(void) {
 /* Called by the compositor once the new mode is live: hand the build to a
  * fresh app-host task (gui_queue_open) rather than doing it here. */
 static void dlg_open_now(int sw, int sh) {
-    dlg_sw = sw; dlg_sh = sh;
+    /* §M81 — the captured size is gone: GUI_PLACE_DIALOG reads the screen when
+     * the window is BUILT, which is on the fresh app-host below, i.e. after the
+     * mode is live.  That is what the comment above `dlg_build` asked for, and
+     * carrying the pair here was the hand-rolled version of it. */
+    (void)sw; (void)sh;
     gui_queue_open(dlg_build);
 }
 
@@ -335,8 +338,6 @@ static const struct item_model dp_model = {
 };
 
 static struct gui_window* dp_win = NULL;
-static void dp_on_close(struct gui_window* w) { (void)w; dp_win = NULL; }
-
 static void dp_layout(struct gui_window* win) {
     /* Builds its widgets — replace, do not stack (gui_window_clear_widgets). */
     gui_window_clear_widgets(win);
@@ -357,11 +358,11 @@ static void dp_layout(struct gui_window* win) {
 }
 
 static void display_panel_open(void) {
-    if (dp_win) { gui_window_raise(dp_win); return; }
-    int ow, oh;
-    gui_window_outer_for_content(cp_px(360), cp_px(300), &ow, &oh);
-    dp_win = gui_app_window_create("Display", 200, 140, ow, oh, dp_layout, NULL);
-    if (dp_win) gui_window_set_on_close(dp_win, dp_on_close);
+    gui_app_open(&(struct gui_app_spec){
+        .title = "Display",
+        .content_w = cp_px(360), .content_h = cp_px(300),
+        .layout = dp_layout, .slot = &dp_win,
+    });
 }
 
 SETTINGS_PANEL(sp_display) = {

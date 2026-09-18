@@ -268,9 +268,11 @@ static void viewer_open(const char* path, const char* name) {
     for (int i = 0; name[i] && p < (int)sizeof(title) - 1; i++) title[p++] = name[i];
     title[p] = 0;
 
-    struct gui_window* win =
-        gui_app_window_create(title, 260, 140,
-                              cp_px(520), cp_px(380), viewer_layout, v);
+    struct gui_window* win = gui_app_open(&(struct gui_app_spec){
+        .title = title,
+        .content_w = cp_px(520), .content_h = cp_px(380),
+        .layout = viewer_layout, .ctx = v,
+    });
     if (!win) { kfree(v); return; }
     v->lv = w_listview_create(win, 6, 6, 508, 340, NULL);
     if (!v->lv) { gui_window_close(win); return; }
@@ -740,12 +742,10 @@ static void fm_layout(struct gui_window* win) {
 }
 
 static void fm_on_close(struct gui_window* win) {
-    (void)win;
-    fm_win = NULL;                               /* ctx (struct fileman) is
-                                                  * kfree'd by the window */
-    /* §M69 — and the context with it, in the SAME place.  A deferred dialog
-     * answer arriving after this point must find nothing to write into, and
-     * two pointers cleared in two places is one that eventually is not. */
+    (void)win;              /* fm_win is the spec's slot; the compositor
+                             * clears it, and `ctx` is kfree'd by the window */
+    /* §M69 — the context goes with it.  A deferred dialog answer arriving
+     * after this point must find nothing to write into. */
     fm_ctx = NULL;
 }
 
@@ -757,14 +757,15 @@ void fileman_open(void) {
     fm->path[0] = '/';
     fm->path[1] = 0;
 
-    struct gui_window* win =
-        gui_app_window_create("app.filemanager", 220, 100,
-                              cp_px(560), cp_px(460), fm_layout, fm);
+    struct gui_window* win = gui_app_open(&(struct gui_app_spec){
+        .title = "app.filemanager",
+        .content_w = cp_px(560), .content_h = cp_px(460),
+        .layout = fm_layout, .ctx = fm,
+        .on_close = fm_on_close, .slot = &fm_win,
+    });
     if (!win) { kfree(fm); return; }
-    fm_win  = win;
     fm_ctx  = fm;
     fm->win = win;
-    gui_window_set_on_close(win, fm_on_close);
 
     /* The menu bar goes in FIRST, through the toolkit: it is the only widget
      * here the layout engine owns, and it must sit above everything else. */

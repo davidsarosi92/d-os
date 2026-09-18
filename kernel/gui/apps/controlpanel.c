@@ -94,7 +94,6 @@ static const struct item_model cp_model = {
 
 /* ---- window ------------------------------------------------------------- */
 
-static void cp_on_close(struct gui_window* win) { (void)win; cp_win = NULL; }
 
 static void cp_layout(struct gui_window* win) {
     struct cpanel_state* st = (struct cpanel_state*)gui_window_ctx(win);
@@ -128,18 +127,14 @@ static void cp_layout(struct gui_window* win) {
 }
 
 static void controlpanel_open(void) {
-    if (cp_win) { gui_window_raise(cp_win); return; }
-
     struct cpanel_state* st = (struct cpanel_state*)kcalloc(1, sizeof *st);
     if (!st) return;
-
-    int ow, oh;
-    gui_window_outer_for_content(cp_px(560), cp_px(340), &ow, &oh);
-    struct gui_window* win =
-        gui_app_window_create("Control Panel", 180, 100, ow, oh, cp_layout, st);
-    if (!win) { kfree(st); return; }
-    cp_win = win;
-    gui_window_set_on_close(win, cp_on_close);
+    struct gui_app_spec sp = {
+        .title = "Control Panel",
+        .content_w = cp_px(560), .content_h = cp_px(340),
+        .layout = cp_layout, .ctx = st, .slot = &cp_win,
+    };
+    if (!gui_app_open(&sp)) kfree(st);
 }
 
 GUI_APP_ICON("Control Panel", controlpanel_open, ICON_SETTINGS);

@@ -483,9 +483,12 @@ static void generic_panel_open(const char* group) {
     /* Taller than the old panel because the controls are real now: a radio
      * group is one row per option, not one line of text.  Height that a
      * SCROLLING container should own — see the open item in DOCS §4.78. */
-    int ow, oh;
-    gui_window_outer_for_content(cp_px(560), cp_px(360), &ow, &oh);   /* the viewport scrolls */
-    gui_app_window_create(group, 140, 120, ow, oh, gp_layout, g);
+    if (!gui_app_open(&(struct gui_app_spec){
+            .title = group,
+            .content_w = cp_px(560), .content_h = cp_px(360),  /* it scrolls */
+            .layout = gp_layout, .ctx = g,
+        }))
+        kfree(g);
 }
 
 /* `conf open` below hands the index over through a static because

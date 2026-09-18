@@ -163,6 +163,123 @@ static void bench_open(void) {
         gui_app_window_create("Bench", 0, 0, w, h, NULL, NULL);
     (void)win;
 }
+/* §M81 — THE FALSIFIER FOR THE HOSTING-TASK CHECK.
+ *
+ * `gui_app_open` warns when a window is built on a task with no app-host loop,
+ * because such a window never lays out and never ticks and there is nothing on
+ * screen to say so.  §M71's first rule applies: *a check must be able to FAIL*,
+ * and a warning nobody has ever seen fire is a warning nobody can rely on.
+ *
+ * So this makes the mistake ON PURPOSE, from whatever task typed the command —
+ * a shell, which is exactly the wrong place — and the proof is two facts
+ * together: the warning names that task, and the window it produces is EMPTY,
+ * because its layout hook is never called.  A window that merely looked odd
+ * would not distinguish "the check fired" from "the check is noise". */
+static void hosttest_layout(struct gui_window* win) {
+    gui_window_clear_widgets(win);
+    w_label_create(win, 8, 8, 200, "if you can read this, it laid out");
+    kprintf("hosttest: layout RAN — this window has a host after all\n");
+}
+
+void gui_host_test(void) {
+    if (!gui_is_active()) { kprintf("hosttest: the GUI is not running\n"); return; }
+    kprintf("hosttest: opening a window from '%s' — expect a warning\n",
+            task_current() ? task_current()->name : "?");
+    struct gui_window* w = gui_app_open(&(struct gui_app_spec){
+        .title = "hosttest",
+        .content_w = cp_px(240), .content_h = cp_px(80),
+        .place = GUI_PLACE_DIALOG,
+        .layout = hosttest_layout,
+    });
+    if (!w) { kprintf("hosttest: no window\n"); return; }
+    /* Give a host, if there were one, every chance to run the hook before we
+     * report.  There is not one, which is the point. */
+    task_msleep(600);
+    kprintf("hosttest: window is up, widgets = %s\n",
+            w->widgets ? "PRESENT (check did not reproduce)"
+                       : "NONE — it never laid out, as warned");
+    gui_window_close(w);
+}
+
+/* §M81 — THE SINGLETON SLOT, DRIVEN.
+ *
+ * `gui_app_open`'s `slot` replaced twelve copies of a raise-or-create test and
+ * twelve one-line `on_close` handlers that existed only to null a static.  The
+ * claim it makes is that the pointer is filled on create, honoured on a second
+ * open, and CLEARED on close — and the third is the one that fails silently:
+ * a slot left pointing at a destroyed window means the panel never opens again
+ * (it "raises" a corpse), which from a chair is a Start-menu entry that has
+ * stopped working.
+ *
+ * Run on a REAL app-host task, because that is where the interesting close
+ * route is: the host's graceful path calls `win_run_on_close` itself, and the
+ * compositor's `destroy_window` calls it only for a window the host never
+ * released.  Testing on the caller's task would exercise the easier half. */
+static struct gui_window* slot_win;
+static int slot_layouts;
+
+static void slottest_layout(struct gui_window* win) {
+    gui_window_clear_widgets(win);
+    w_label_create(win, 8, 8, 200, "slottest");
+    slot_layouts++;
+}
+
+/* THE OPEN HALF RUNS ON THE HOST; THE OBSERVING HALF MUST NOT — and the first
+ * version of this test got that wrong, which is worth keeping.
+ *
+ * `app_host_main` calls the open fn and THEN enters its loop, so a test that
+ * opened, closed and polled all inside the open fn was waiting, on the host
+ * task, for the host loop to process the close.  It never could: the loop is
+ * the code the polling had blocked.  It reported `slot STILL SET` and
+ * `layouts ran: 0` — a confident, wrong bug report about the product.
+ *
+ * *An observer running inside the thing it observes cannot see it work* —
+ * §M55's poller-inside-the-poll in a new costume. */
+static void slottest_open(void) {
+    slot_layouts = 0;
+    gui_app_open(&(struct gui_app_spec){
+        .title = "slottest",
+        .content_w = cp_px(220), .content_h = cp_px(70),
+        .place = GUI_PLACE_DIALOG,
+        .layout = slottest_layout, .slot = &slot_win,
+    });
+    /* The SECOND open, here, is the raise-or-create half: same task, same spec,
+     * and it must hand back the window just built rather than a second one. */
+    struct gui_window* first = slot_win;
+    struct gui_window* again = gui_app_open(&(struct gui_app_spec){
+        .title = "slottest",
+        .content_w = cp_px(220), .content_h = cp_px(70),
+        .place = GUI_PLACE_DIALOG,
+        .layout = slottest_layout, .slot = &slot_win,
+    });
+    kprintf("slottest: create   -> slot %s\n",
+            first ? "FILLED" : "EMPTY (the create did not take)");
+    kprintf("slottest: reopen   -> %s\n",
+            (again && again == first) ? "same window RAISED (no second built)"
+                                      : "A SECOND WINDOW — slot not honoured");
+}
+
+void gui_slot_test(void) {
+    if (!gui_is_active()) { kprintf("slottest: the GUI is not running\n"); return; }
+    slot_win = NULL;
+    gui_queue_open(slottest_open);      /* a real app-host, see above */
+
+    /* Wait for the window to exist, then close it FROM HERE — the shell task —
+     * so the host loop is free to run its graceful close path. */
+    for (int i = 0; i < 100 && !slot_win; i++) task_msleep(20);
+    if (!slot_win) { kprintf("slottest: no window appeared\n"); return; }
+    kprintf("slottest: laid out -> %s\n",
+            slot_layouts ? "yes (it has a host)" : "NO — no host loop ran it");
+
+    gui_window_close(slot_win);
+    /* Poll rather than sleep a fixed time: a fixed wait that happened to be
+     * long enough here would prove nothing about the next machine. */
+    for (int i = 0; i < 100 && slot_win; i++) task_msleep(20);
+    kprintf("slottest: close    -> slot %s\n",
+            slot_win ? "STILL SET — a later open would raise a dead window"
+                     : "CLEARED");
+}
+
 void gui_compose_bench(int frames) {
     if (frames <= 0) frames = 30;
     g_occlude = (int)config_get_long("gui.occlude", 1);

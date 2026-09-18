@@ -434,9 +434,41 @@ int app_dispatch_event(struct gui_window* win, const struct app_event* e) {
 /* The app-host task entry.  start_arg is the app's launch (open) function;
  * it runs HERE (creating the window(s) + widgets on this task), then this
  * loop services every window the app owns until they all close. */
+/* §M81 — WHICH TASKS RUN AN APP-HOST LOOP.
+ *
+ * A window binds to `task_current()` at creation, and one created on a task
+ * with no host loop never lays out and never ticks — it simply sits there, and
+ * §M61 recorded that as a convention to remember (`gui_queue_open`, never a
+ * direct create from a shell or the compositor).  *A convention is not a type
+ * distinction, so a window built the wrong way fails silently*, which is
+ * exactly how it cost a round of diagnosis during §M32.
+ *
+ * A bounded table rather than a flag on `struct task`: this is the GUI's
+ * business, one entry per host, and the scheduler has no reason to carry it.
+ * A dead task's slot is simply overwritten — the table answers "is this task a
+ * host", which a stale entry can only get wrong for a task that no longer
+ * exists and therefore cannot be asking. */
+#define APP_HOST_MAX (GUI_MAX_WINDOWS * 2)
+static struct task* g_hosts[APP_HOST_MAX];
+static int g_hosts_next;
+
+void app_host_note_task(struct task* t) {
+    if (!t) return;
+    for (int i = 0; i < APP_HOST_MAX; i++) if (g_hosts[i] == t) return;
+    g_hosts[g_hosts_next] = t;
+    g_hosts_next = (g_hosts_next + 1) % APP_HOST_MAX;
+}
+
+int app_host_is_host_task(struct task* t) {
+    if (!t) return 0;
+    for (int i = 0; i < APP_HOST_MAX; i++) if (g_hosts[i] == t) return 1;
+    return 0;
+}
+
 void app_host_main(void) {
     void (*open_fn)(void) = (void (*)(void))task_start_arg();
     struct task* self = task_current();
+    app_host_note_task(self);                   /* before open_fn creates any */
     kprintf("gui: app-host '%s' up (pid %d)\n",
             self ? self->name : "?", self ? self->pid : -1);
     if (open_fn) open_fn();                     /* creates windows on this task */
@@ -450,7 +482,7 @@ void app_host_main(void) {
             if (win->host_released) continue;   /* handed to the compositor */
 
             if (win->want_close) {              /* graceful, on the host */
-                if (win->on_close) win->on_close(win);
+                win_run_on_close(win);   /* §M81: clears the owner's slot too */
                 app_widgets_free(win);
                 win->host_released = 1;         /* compositor disposes the struct */
                 need_frame = 1;

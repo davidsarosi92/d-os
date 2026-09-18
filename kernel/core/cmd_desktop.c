@@ -233,6 +233,11 @@ static void ds_gui(const char* a) {
     if (cmd_streq(a, "relayout"))  { gui_relayout_all();   return; }
     if (cmd_streq(a, "relaytest")) { gui_relayout_test(3); return; }
     if (cmd_streq(a, "bench"))     { gui_compose_bench(6); return; }
+    /* §M81's falsifier — deliberately makes the mistake `gui_app_open` warns
+     * about.  Hidden from `help` like `hardlock` and `leaktest`: it is a way to
+     * see a check fail, not a thing to do. */
+    if (cmd_streq(a, "hosttest"))  { gui_host_test();      return; }
+    if (cmd_streq(a, "slottest"))  { gui_slot_test();      return; }
     cmd_gui(a);                                  /* "" = start, "stop" = stop */
 }
 
