@@ -5019,6 +5019,46 @@ Every item below cost real time inside §M32, and none was found by reading:
   *and a silent instrument is indistinguishable from the code under test not
   running.*
 
+### FIRST MEASUREMENT (2026-09-18) — the seam is narrow, the APPS are not
+
+Counted: how many distinct COMPOSITOR-CORE symbols (`gui.c`, `wm.c`,
+`compose.c`, `input.c`) each file calls.  The metric is validated by
+reproducing §M70's own claim — `gterm.c` comes out at exactly **2**
+(`gui_damage_win`, `gui_window_raise`), which is what that milestone said and
+which a broader "any GUI symbol" count does NOT reproduce.  *A metric that
+cannot reproduce a known answer is measuring something else.*
+
+| band | files | reading |
+|---|---|---|
+| **0–3 calls** | gfx, icons, itemview, scrollbar, vfont, vpath, clipboard, wl_keymap, cp_draw, theme, gterm, wallpaper, gui_mode, w_menubar, w_chart | **genuine components.**  They could be lifted out with a header and a handful of calls |
+| **4–8** | widget.c, w_itemview, w_controls, ui.c, app_host, settings, dosgui, shortcut, taskman, editor, devicepanel, controlpanel | **clients of a small stable surface** — the toolkit.  Healthy |
+| **9–17** | wayland, fileman, dialog, crashapp, displaypanel, lockscreen, accountspanel, shell_vista | **entangled** |
+
+**AND THE ENTANGLED ONES ARE ENTANGLED IN THE SAME WAY, WHICH IS THE FINDING.**
+They do not each reach a different corner of the compositor; they all call the
+same cluster: `gui_app_window_create`, `gui_window_outer_for_content`,
+`gui_window_content_size`, `gui_window_clear_widgets`, `gui_window_close`,
+`gui_window_raise`, `gui_queue_open`, `gui_screen_w/h`,
+`gui_window_set_on_close`.
+
+*That cluster IS the missing abstraction.*  There is no "app window" component;
+there are **twelve hand-rolled copies of one window lifecycle** — compute the
+outer size, place it, create it, set on_close, maybe set modal, clear and
+rebuild widgets in the layout hook.  And every §M32 GUI defect lived in that
+boilerplate rather than in the compositor:
+
+- placement (`-1,-1` is not "centre") — copied wrong into TWO files the same day
+- `gui_queue_open` vs a direct create — a convention, not a type distinction, so
+  a window built the wrong way never lays out
+- "clear the widgets first in the layout hook" — remembered, not enforced
+
+**So the first proposed deliverable is not a split but a CONSTRUCTOR**: one
+`gui_panel_*` (or `app_window_open`) that takes a content size, a placement
+intent (centred / cascaded / explicit) and a layout fn, and does the rest.  The
+twelve callers drop to one call each, the three conventions above become
+unrepresentable, and the number that says whether it worked is this same table
+re-measured.
+
 ### The questions this milestone must answer, each with evidence
 
 1. **WHAT IS ACTUALLY A COMPONENT?**  `gterm.c` was the model: §M70 found it
