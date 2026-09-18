@@ -641,6 +641,10 @@ static void accttest_main(void) {
     if (!pr_field) { console_write("accttest: the prompt's field never appeared\n"); return; }
 
     w_textinput_set(pr_field, p);
+    /* The LENGTH, because it is the one thing the mask deliberately hides: it
+     * is fixed-width so it cannot leak how long a password is, which also means
+     * it cannot distinguish one character from three.  Printed only by this
+     * test, never by the field. */
     kprintf("accttest: field now holds %d character(s)\n", pr_field->len);
     pr_submit(pr_field, NULL);
 
