@@ -383,6 +383,7 @@ static void done_password(const char* pw) {
             w_label_set(ac_detail, "No password typed — nothing was changed. "
                                    "(To disable sign-in, use `passwd <name> -` "
                                    "at a shell.)");
+        kprintf("accounts: done_password received 0 characters\n");
         if (ac_win) gui_window_request_redraw(ac_win);
         return;
     }
@@ -392,6 +393,19 @@ static void done_password(const char* pw) {
      * for david"*.  **A panel that reports the outcome it hoped for is worse
      * than one that reports nothing**, because the user then goes looking for
      * the fault everywhere except where it is. */
+    /* §M81 — HOW MANY CHARACTERS ACTUALLY ARRIVED, on screen and on the wire.
+     *
+     * The chain from here down is PROVEN (`accttest`: field -> submit ->
+     * user_set_password -> user_check_password OK), and a report of *"the GUI
+     * change password still does not work"* therefore has to be about what
+     * reaches this function.  The mask cannot answer it — it is fixed width by
+     * design, so one character and three look identical — and the detail line
+     * is the only surface the user can read while the GUI suppresses the
+     * console.  The COUNT, never the content. */
+    int plen = 0;
+    while (pw[plen]) plen++;
+    kprintf("accounts: done_password received %d character(s) for '%s'\n",
+            plen, u->name);
     int rc = user_set_password(u->name, pw);
     if (ac_detail) {
         static char m[140];
@@ -399,7 +413,9 @@ static void done_password(const char* pw) {
         if (rc == 0) {
             n = ac_put(m, sizeof m, 0, "Password set for ");
             n = ac_put(m, sizeof m, n, u->name);
-            n = ac_put(m, sizeof m, n, ".  They can sign in with it now.");
+            n = ac_put(m, sizeof m, n, " (");
+            n = ac_put_int(m, sizeof m, n, plen);
+            n = ac_put(m, sizeof m, n, " characters).  They can sign in now.");
         } else {
             n = ac_put(m, sizeof m, 0, "REFUSED — the password for ");
             n = ac_put(m, sizeof m, n, u->name);
