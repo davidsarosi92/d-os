@@ -20,6 +20,7 @@
 #include "gui_app.h"
 #include "gui_internal.h"
 #include "gui.h"
+#include "cred.h"
 #include "console_plate.h"
 #include "locale.h"           /* gui_damage — the icon layer damages its own rects */
 #include "widget.h"        /* WPTR_* — §M58's pointer phases, shared vocabulary */
@@ -799,9 +800,59 @@ static void tbtn_rect(int i, int n, int* x, int* y, int* w, int* h) {
  * the same word `ps`, /proc and the Task Manager use, because inventing a
  * friendlier one here would make this the only place in the tree where that
  * identity has a different name. */
+/* §M81 — WHO THIS SESSION ACTUALLY RUNS AS, and who signed in, when they are
+ * not the same thing.
+ *
+ * They are not the same thing today, and this header was reporting the wrong
+ * one.  `gui_session_user()` is a STRING the lock screen records after checking
+ * a password; it is not an identity.  `cred_become_user` — the only call that
+ * gives a task one — is reached from the shell's `login` and from NOTHING in
+ * the GUI, so the desktop, the compositor and every app-host stay SYSTEM after
+ * a successful sign-in.
+ *
+ * Reported from use, and the reporter had to work it out from a refusal: they
+ * turned on `gui.login`, rebooted, signed in as root, and the accounts panel
+ * still answered *"sign in as root first.  Acting as system."*  The panel was
+ * telling the truth; THIS was the line claiming otherwise.
+ *
+ * *A report that agrees with the intention rather than with the machine is the
+ * most expensive kind of wrong* — §4.83's IOMMU boundary that widened while
+ * `drv domain` went on saying `isolation full`, one subsystem over.  So until
+ * the GUI session really adopts an identity (see gui.h), this says both. */
+static char menu_user_buf[56];
+
 static const char* menu_user(void) {
-    const char* u = gui_session_user();
-    return u ? u : "system";
+    /* THE RETURN VALUE, NOT THE BUFFER.  cred.h says it plainly — *"takes a
+     * caller-owned buffer and RETURNS IT (or a string literal, when the answer
+     * is a constant)"* — and the constant cases are `kernel`, `system` and
+     * `root`, i.e. every case that matters here.  Reading the buffer instead
+     * printed uninitialised stack, which came out as `?`. */
+    char buf[40];
+    const char* real = cred_owner_name(cred_current(), buf, sizeof buf);
+    const char* signed_in = gui_session_user();
+
+    int n = 0;
+    for (const char* p = real; *p && n < (int)sizeof menu_user_buf - 1; p++)
+        menu_user_buf[n++] = *p;
+    /* Only when they disagree — a machine where they agree should not carry a
+     * permanent parenthetical about a distinction that is not being made. */
+    if (signed_in) {
+        int same = 1;
+        for (int i = 0; ; i++) {
+            if (real[i] != signed_in[i]) { same = 0; break; }
+            if (!real[i]) break;
+        }
+        if (!same) {
+            const char* a = " (signed in: ";
+            for (int i = 0; a[i] && n < (int)sizeof menu_user_buf - 2; i++)
+                menu_user_buf[n++] = a[i];
+            for (int i = 0; signed_in[i] && n < (int)sizeof menu_user_buf - 2; i++)
+                menu_user_buf[n++] = signed_in[i];
+            menu_user_buf[n++] = ')';
+        }
+    }
+    menu_user_buf[n] = 0;
+    return menu_user_buf;
 }
 
 

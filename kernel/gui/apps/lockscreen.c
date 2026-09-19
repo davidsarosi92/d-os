@@ -267,7 +267,32 @@ static int lock_try(const char* user, const char* pass) {
          * where it should have gone in the first place. */
         return -1;
     }
-    kprintf("lock: authenticated '%s'\n", user);
+    /* §M81 — SAY WHAT THIS DID AND WHAT IT DID NOT.
+     *
+     * It checked a password.  It did NOT give this session an identity:
+     * `cred_become_user` is reached from the shell's `login` and from nothing
+     * here, so the desktop, the compositor and every app-host keep the
+     * credentials they were spawned with — SYSTEM, on the usual boot.
+     *
+     * That is authentication without authorisation, which is the shape §M33
+     * refuses by name one subsystem over ("isolation theatre": *a boundary you
+     * believe in and do not have is worse than one you know you lack*).  It was
+     * found by a user who turned `gui.login` on, signed in as root, and was
+     * then refused an administrator's password — the refusal was correct and
+     * the sign-in was the lie.
+     *
+     * Until the session really adopts the account (gui.h names the design), the
+     * line says so on every successful sign-in rather than once in a header
+     * nobody reads at the moment it matters. */
+    {
+        char buf[40];
+        /* The RETURN value — see cred.h, and shell_vista.c for what reading the
+         * buffer instead looks like on screen. */
+        const char* who = cred_owner_name(cred_current(), buf, sizeof buf);
+        kprintf("lock: authenticated '%s' - password CHECKED; this session "
+                "still runs as '%s' (the GUI does not yet adopt an account, "
+                "see gui.h)\n", user, who);
+    }
     {
         int i = 0;
         for (; user[i] && i < (int)sizeof g_session_user - 1; i++)

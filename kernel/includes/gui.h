@@ -115,6 +115,56 @@ int  gui_wallpaper_reload(void);
  * boot shell before `gui`. */
 void gui_desktop_icons_changed(void);
 
+/* =============================================================================
+ * §M81 — THE GUI SIGN-IN CHECKS A PASSWORD AND GRANTS NO IDENTITY.  NOT FIXED.
+ *
+ * Stated here, at the top of the compositor's public surface, because it is a
+ * SECURITY property this tree currently claims and does not have — and because
+ * the two places that could have said so (the Start menu header and the lock
+ * screen's own log line) were the places saying the opposite.
+ *
+ * WHAT HAPPENS TODAY.  `gui.login = 1` raises the lock screen before the
+ * desktop can be used.  A correct password sets `g_lock.unlocked` and records
+ * the account's NAME in a string.  `cred_become_user` — the only call that
+ * gives a task an identity — is reached from the shell's `login` and from
+ * NOTHING in the GUI.  So the desktop, the compositor and every app-host keep
+ * what they were spawned with, which on an ordinary boot is TASK_OWNER_SYSTEM.
+ *
+ * WHAT THAT COSTS, exactly.  SYSTEM counts as an administrator (cred.h: the
+ * kernel's own services must not have to authenticate to do their job) and
+ * stops counting as root the moment any account has a chosen secret (users.h:
+ * the bootstrap console closes when the machine has an administrator).  So
+ * after signing in as root the desktop can change a standard user's password
+ * and CANNOT change an administrator's — which is exactly the refusal that
+ * exposed this, and the refusal was right.
+ *
+ * WHY IT CANNOT BE PATCHED IN PLACE.  `cred_become_user` refuses a task that
+ * already has children, deliberately: §M32 captures ownership at spawn and
+ * makes it immutable so that re-parenting cannot launder it (cred.h).  By the
+ * time the lock screen runs, the session has a compositor and app-hosts under
+ * it.  There is no honest way to change what they are.
+ *
+ * THE DESIGN, which is a display manager's and is why one is shaped that way:
+ * the greeter is not the session.  On a correct password the lock must
+ *
+ *   1. record the account to adopt,
+ *   2. tear the session down — §M64 already built and verified this for
+ *      Start -> Exit GUI, on its own detached task, because the teardown kills
+ *      the compositor that dispatched the click,
+ *   3. spawn a fresh SESSION LEADER that calls `cred_become_user` at its own
+ *      entry, before it has children, and only then calls `gui_start()`.
+ *
+ * Everything under it then inherits the identity through `spawn_common`, which
+ * is the one route §M32 allows — no new mechanism, and `login.c` is the worked
+ * example of step 3.
+ *
+ * THE TWO THINGS TO GET RIGHT, named so they are not discovered:
+ *   - the new session must NOT raise the lock again (it is already
+ *     authenticated), or sign-in loops;
+ *   - "Sign out" is cosmetic today for the same reason and must go through the
+ *     same restart, or it leaves a session running as the previous user.
+ * ============================================================================= */
+
 /* §M64 tail — the desktop shell says whether it currently holds the keyboard
  * (i.e. something on the icon field is selected).  While it does, Enter and
  * Escape are delivered to the shell's `desktop_key` instead of falling through
