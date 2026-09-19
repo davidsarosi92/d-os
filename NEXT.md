@@ -102,10 +102,27 @@ which the menu conversion never touched.  *Use the right metric per step:* the
 table measures app↔compositor coupling, and a step that removes duplication
 INSIDE a file has to be measured as duplication.
 
+**The widget contract is done and on `main` (`0ed84c1`).**  widget.h states
+which ops are mandatory (`draw`; `key` or `keycode` if focusable; construction
+through `widget_init`) and `audit widget-contract` checks it — the registry half
+statically, so it reaches a class nobody instantiated, and the live half by
+walking open windows, so it reaches a widget from a hand-rolled constructor.
+`gui contracttest` is the falsifier (needs `--allow-crash`).
+
+It found that **two constructors had been bypassing `widget_init` for three
+milestones** — `w_itemview_create` and `w_editor_create`, the very defect §M65
+exported that function to prevent.  Both go through it now.
+
 Still to do in the milestone, from the agreed design: `struct gui_window` as a
-widget; mandatory-vs-optional `widget_ops` declared per class plus an `AUDIT()`
-with a shipped falsifier; and the checkable threading rule (*a widget's parent
-and its host are the same task*).
+widget; the taskbar and the flyouts as compositions; and the checkable threading
+rule (*a widget's parent and its host are the same task*).
+
+**A pattern worth keeping:** every instrument this milestone shipped caught the
+FIRST VERSION of the next one.  `slottest` polled on the host task it had
+blocked; `contracttest` built its window on the shell, so the layout hook never
+ran and it reported "the check is broken" about a check that was fine — and step
+2's hosting warning named the cause in the same log.  *The half that builds runs
+on the host; the half that observes must not.*
 
 The metric itself is reproducible — count the DISTINCT symbols defined in
 `gui.c`/`wm.c`/`compose.c`/`input.c` that a file calls, and check that

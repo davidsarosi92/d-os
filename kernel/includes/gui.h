@@ -536,7 +536,13 @@ void gui_slot_test(void);
 
 /* §M81 — `gui contracttest`: put a widget that breaks each half of widget.h's
  * contract into a real window, so `audit widget-contract` can be seen to
- * detect them, and take them away again.  §M71's rule 1.  Hidden from `help`. */
+ * detect them, and take them away again.  §M71's rule 1.  Hidden from `help`.
+ *
+ * It makes the audit FAIL on purpose, so a harness run that includes it needs
+ * `--allow-crash`: `dos-shell-test.py` fails a run on `!! AUDIT FAIL` exactly
+ * as on a fault, which is the right default and wrong for this one.  Same list
+ * as `hardlock`, `leaktest` and `drv crash` — deliberate, named, never the
+ * default. */
 void gui_contract_test(void);
 
 /* A periodic callback on the window's own host task (~2 Hz).
