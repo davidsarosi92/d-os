@@ -204,9 +204,42 @@ static int lock_try(const char* user, const char* pass) {
             for (int i = 0; a[i] && n < 94; i++) m[n++] = a[i];
             for (int i = 0; user[i] && n < 92; i++) m[n++] = user[i];
             m[n++] = '\'';
-            if (!pass || !pass[0]) {
-                const char* b = " (nothing was typed)";
-                for (int i = 0; b[i] && n < 94; i++) m[n++] = b[i];
+            /* HOW MANY CHARACTERS ARRIVED, and whether the account has a secret
+             * at all.  The COUNT, never the content.
+             *
+             * WHY IT IS ON SCREEN AND NOT IN THE LOG: the GUI suppresses the
+             * console (§4.79), so everything this function already printed
+             * reaches nobody who is looking at the lock screen — which is the
+             * whole of why *"the Control Panel sets a password and sign-in says
+             * it is wrong"* survived several rounds with instruments on both
+             * ends of the chain.
+             *
+             * IT IS THE OTHER HALF OF A TWO-POINT PROBE.  The accounts panel
+             * reports how many characters it SET; this reports how many arrived
+             * here.  Three outcomes, three different files:
+             *   same count, still refused  -> set and check disagree
+             *   different counts           -> the keystrokes, not the hashing
+             *   "has no sign-in secret"    -> the set never reached the record
+             * A single number on one end can only ever halve the search. */
+            {
+                const struct user_account* u = user_by_name(user);
+                int plen = 0;
+                while (pass && pass[plen]) plen++;
+                const char* b = (u && !u->has_password)
+                    ? " - that account has no sign-in secret"
+                    : " - ";
+                for (int i = 0; b[i] && n < 88; i++) m[n++] = b[i];
+                if (!(u && !u->has_password)) {
+                    if (plen == 0) {
+                        const char* z = "nothing was typed";
+                        for (int i = 0; z[i] && n < 92; i++) m[n++] = z[i];
+                    } else {
+                        if (plen >= 10) m[n++] = (char)('0' + plen / 10);
+                        m[n++] = (char)('0' + plen % 10);
+                        const char* z = " character(s) received";
+                        for (int i = 0; z[i] && n < 92; i++) m[n++] = z[i];
+                    }
+                }
             }
             m[n++] = '.'; m[n] = 0;
             w_label_set(g_lock.status, m);
