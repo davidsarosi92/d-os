@@ -79,8 +79,11 @@
  * typing. */
 #define KBD_ICON    TRAY_ICON
 #define KBD_W       (TRAY_ICON + cp_px(4) + 3 * cp_mono_cell_w() + TRAY_GAP)
-#define KBDPOP_W    150
-#define KBDPOP_ROW  22
+/* §M81 — through cp_px(), like everything §M69 swept out of the apps.  These
+ * were flat 150 and 22: an 8x8-era box and an 8x8-era row, in the chrome, which
+ * is the one place that sweep did not reach.  The row is the MODEL's answer
+ * now (kb_row_h), so this constant is only the box. */
+#define KBDPOP_W    cp_px(150)
 #define KBD_MAX     8            /* layouts the flyout will show; see kbd_names */
 /* §M23 — the sound indicator, immediately left of the clock.  Square, so the
  * icon renderer gets the box it expects. */
@@ -457,9 +460,90 @@ static void kbd_box(int* x, int* y, int* w, int* h) {
     *h = KBD_ICON;
 }
 
-static int kbdpop_h(void) {
+/* ---------------------------------------------------------------------------
+ * §M81 — THE KEYBOARD FLYOUT IS A LIST TOO, and the shared view draws it.
+ *
+ * The same shape the Start menu had one conversion earlier: a box, a title, and
+ * one row per registered layout — with `py + 26 + i * KBDPOP_ROW` computed in
+ * the painter AND in the hit test.  Two copies rather than the menu's three,
+ * and the same §4.79 defect: the row you see highlighted and the row a click
+ * runs are two different calculations that happen to agree.
+ *
+ * THE ACTIVE LAYOUT IS THE SELECTION, which is not a trick — it is what the
+ * list means here, so the view's `sel` highlight is exactly right.  The old
+ * code also drew a `*`, and its reason is worth keeping: *"a selection shown
+ * only by a background colour is invisible in a screenshot taken for a bug
+ * report, and this project's tests read pixels."*  So the active row carries
+ * the keyboard ICON and the others carry none — a GLYPH difference, which
+ * survives a screenshot, through the view's own icon column.
+ * ------------------------------------------------------------------------- */
+
+/* The chrome's list view — the Start menu and this flyout are both lists, and
+ * one lookup serves both.  Defined with the menu below. */
+static const struct item_view* sm_view(void);
+
+static int kb_count(void* c) { (void)c; return kbd_count; }
+
+static int kb_active(void) {
+    const char* cur = keymap_current();
+    for (int i = 0; i < kbd_count; i++)
+        if (cur && kbd_names[i] &&
+            cur[0] == kbd_names[i][0] && cur[1] == kbd_names[i][1])
+            return i;
+    return -1;
+}
+
+static int kb_get(void* c, int i, struct item_entry* out) {
+    (void)c;
+    if (i < 0 || i >= kbd_count || !kbd_names[i]) return -1;
+    out->label = kbd_names[i];
+    out->icon  = (i == kb_active()) ? ICON_KEYBOARD : ICON_NONE;
+    return 0;
+}
+
+static void kb_activate(void* c, int i) {
+    (void)c;
+    if (i < 0 || i >= kbd_count || !kbd_names[i]) return;
+    /* `config_apply`, NOT `keymap_select` — §M63 stage 0's whole point.
+     * `keymap_select` changes the live layout and nothing else, so the setting
+     * would revert at the next boot while the panel and the store both said
+     * otherwise.  This records the decision and NOTIFIES; the keymap watcher
+     * does the switch, so this control, `setlayout` and the Control Panel's
+     * Region page cannot disagree about what the layout is. */
+    config_apply("keyboard.layout", kbd_names[i]);
+}
+
+/* A flyout row is a menu row, not a table row — see the Start menu's
+ * `sm_row_h` for why the model is what answers this. */
+static int kb_row_h(void* c) { (void)c; return SM_ITEM_H; }
+
+static const struct item_model kb_model = {
+    .count = kb_count, .get = kb_get, .activate = kb_activate,
+    .row_h = kb_row_h,
+};
+
+/* The title band above the list: its own height, so the list box below it and
+ * the rule under it come from one number. */
+#define KBDPOP_HEAD (cp_fh() + cp_px(14))
+
+static int kb_list_h(void) {
+    const struct item_view* v = sm_view();
     int rows = kbd_count > 0 ? kbd_count : 1;
-    return rows * KBDPOP_ROW + 26;          /* + title row + padding */
+    return (v && v->height_for) ? v->height_for(KBDPOP_W, rows, &kb_model) : 0;
+}
+
+static int kbdpop_h(void) { return KBDPOP_HEAD + kb_list_h() + cp_px(6); }
+static int kbdpop_x(void);
+static int kbdpop_y(void);
+
+/* THE FLYOUT'S LIST BOX, IN ONE PLACE — the painter and the hit test both take
+ * it from here.  That is the entire conversion: `py + 26 + i * KBDPOP_ROW` was
+ * written out twice, and two calculations that happen to agree are §4.79. */
+static void kbd_list_box(int* x, int* y, int* w, int* h) {
+    *x = kbdpop_x() + cp_px(4);
+    *y = kbdpop_y() + KBDPOP_HEAD;
+    *w = KBDPOP_W - cp_px(8);
+    *h = kb_list_h();
 }
 static int kbdpop_x(void) {
     int x = scr_w - CLOCK_W - VOL_W - KBDPOP_W;
@@ -811,24 +895,26 @@ static void vista_draw(struct gfx_surface* back) {
         gfx_fill(back, px, py, 1, ph, COL_TB_HILITE);
         gfx_fill(back, px + KBDPOP_W - 1, py, 1, ph, 0xFF141B26u);
 
-        cp_text(back, px + 10, py + 8, "Keyboard layout", COL_TB_HILITE);
-        gfx_fill(back, px + 8, py + 22, KBDPOP_W - 16, 1, COL_SEP);
+        cp_text(back, px + cp_px(10), py + cp_px(7), lstr("tray.kbdlayout"),
+                COL_TB_HILITE);
+        gfx_fill(back, px + cp_px(8), py + KBDPOP_HEAD - 1,
+                 KBDPOP_W - cp_px(16), 1, COL_SEP);
 
-        const char* cur = keymap_current();
-        for (int i = 0; i < kbd_count; i++) {
-            int iy = py + 26 + i * KBDPOP_ROW;
-            int active = cur && kbd_names[i] &&
-                         cur[0] == kbd_names[i][0] && cur[1] == kbd_names[i][1];
-            if (active) gfx_fill(back, px + 4, iy - 2, KBDPOP_W - 8, KBDPOP_ROW,
-                                 COL_SM_HOVER);
-            /* The marker is a GLYPH, not just the highlight: a selection shown
-             * only by a background colour is invisible in a screenshot taken
-             * for a bug report, and this project's tests read pixels. */
-            cp_text(back, px + 10, iy + 2, active ? "*" : " ", COL_TEXT);
-            cp_text(back, px + 24, iy + 2, kbd_names[i], COL_TEXT);
+        if (kbd_count == 0) {
+            cp_text(back, px + cp_px(10), py + KBDPOP_HEAD + cp_px(4),
+                    lstr("tray.nolayouts"), COL_TB_HILITE);
+        } else {
+            /* §M81 — the rows are the shared list view's.  The ACTIVE layout is
+             * the `sel`, which is what the highlight means here, and the active
+             * row's keyboard ICON is the glyph the old `*` was: a selection
+             * shown only by a background colour is invisible in a screenshot,
+             * and this project's tests read pixels. */
+            int bx, by, bw, bh;
+            kbd_list_box(&bx, &by, &bw, &bh);
+            const struct item_view* v = sm_view();
+            if (v && v->draw) v->draw(back, bx, by, bw, bh, &kb_model,
+                                      kb_active(), 0);
         }
-        if (kbd_count == 0)
-            cp_text(back, px + 10, py + 28, "no layouts", COL_TB_HILITE);
     }
 
     /* §M23 — the volume flyout. */
@@ -990,19 +1076,17 @@ static int vista_click(int x, int y) {
         int px = kbdpop_x(), py = kbdpop_y(), ph = kbdpop_h();
         int inside = (x >= px && x < px + KBDPOP_W && y >= py && y < py + ph);
         if (inside) {
-            int idx = (y - (py + 26)) / KBDPOP_ROW;
-            if (idx >= 0 && idx < kbd_count && kbd_names[idx]) {
-                /* config_apply, NOT keymap_select.
-                 *
-                 * The difference is the whole reason §M63 stage 0 exists.
-                 * `keymap_select` changes the live layout and nothing else, so
-                 * the setting would revert at the next boot while the panel and
-                 * the store both said otherwise.  `config_apply` records the
-                 * decision and NOTIFIES — the keymap watcher does the actual
-                 * switch — so this control, `setlayout`, and the Control
-                 * Panel's Region page all go through one path and cannot
-                 * disagree about what the layout is. */
-                config_apply("keyboard.layout", kbd_names[idx]);
+            /* §M81 — the VIEW answers.  A click on the title band is outside
+             * the list box, so `hit` returns -1 and only the dismissal below
+             * runs: the title is not a row and cannot become one by rounding,
+             * which a division by the row height could do. */
+            int bx, by, bw, bh;
+            kbd_list_box(&bx, &by, &bw, &bh);
+            const struct item_view* v = sm_view();
+            int idx = (v && v->hit) ? v->hit(x - bx, y - by, bw, bh, &kb_model, 0)
+                                    : -1;
+            if (idx >= 0) {
+                kb_activate(NULL, idx);
                 kbd_pop_open = 0;
                 publish_popup();
                 gui_request_frame();

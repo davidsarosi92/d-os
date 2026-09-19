@@ -57,6 +57,14 @@ static void bars(struct gfx_surface* s, int x, int y, int w, int n,
 
 void icon_draw(struct gfx_surface* s, int x, int y, int n, int id) {
     if (!s || n < 8) return;
+    /* §M81 — ICON_NONE DRAWS NOTHING, which is what its name says and what it
+     * did not do.  It fell through to the `default` arm and painted the generic
+     * window tile, so a model that meant "this row has no icon" got the same
+     * glyph as one whose icon id was a typo — *and an unknown launchable and a
+     * deliberate blank are exactly the two things that default exists to keep
+     * apart.*  Found while giving the keyboard flyout an optional icon column;
+     * nothing in the tree asked for a blank before, which is why it survived. */
+    if (id == ICON_NONE) return;
 
     /* THE VECTOR SET FIRST — this is the seam this file's header named.
      *
