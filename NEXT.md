@@ -120,11 +120,24 @@ exported that function to prevent.  Both go through it now.
 existing tree is clean**.  The registry is 8 audits now, and on aarch64's serial
 boot `widget-contract` correctly SKIPs while `widget-threading` reports ok.
 
-Still to do in the milestone: `struct gui_window` as a widget; the taskbar, the
-volume and keyboard flyouts as compositions (the keyboard flyout is the obvious
-next one — it is literally *"one row per registered layout"*, hand-drawn, with
-its draw and its hit test computing `py + 26 + i * KBDPOP_ROW` separately: the
-same defect the Start menu had).
+**The keyboard flyout followed (`32769a4`).**  Same shape, two copies instead
+of the menu's three, and the chrome's row-geometry copies are now **0 in code**.
+The active layout is the view's `sel`, and it carries the keyboard ICON while
+the others carry none — the glyph difference the old `*` existed for, since this
+project's tests read pixels.  Driven end to end: a click on `hu` gives
+`keyboard.layout = hu (was us)` and the tray reads **HU** in the screenshot.
+
+It also exposed **`ICON_NONE` drawing the generic window tile** — an enum member
+named NONE that painted something, because it fell through to the `default` arm.
+So "this row has no icon" and "this icon id is a typo" rendered identically,
+which is the one distinction that default exists to make.  Fixed; nothing had
+asked for a blank icon before.
+
+Still to do in the milestone: `struct gui_window` as a widget, and the taskbar
+itself (the Start button, the window buttons, the clock and the tray are still
+imperative).  **The volume flyout deliberately stays hand-drawn** — it is a
+slider and a mute row, not a list, and forcing it through the item view would be
+the abstraction-with-no-client risk §M59 declined `wl_data_device` under.
 
 **A pattern worth keeping:** every instrument this milestone shipped caught the
 FIRST VERSION of the next one.  `slottest` polled on the host task it had
