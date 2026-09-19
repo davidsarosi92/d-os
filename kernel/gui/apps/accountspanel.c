@@ -465,10 +465,27 @@ static void done_password(const char* pw) {
                                                : ", VERIFY FAILED - the record did not take).");
             }
         } else {
-            n = ac_put(m, sizeof m, 0, "REFUSED - the password for ");
-            n = ac_put(m, sizeof m, n, u->name);
-            n = ac_put(m, sizeof m, n, " was NOT changed.  (An administrator's "
-                                       "password needs root.)");
+            /* §M81 — THE REASON THAT ACTUALLY FIRED, and WHO WE ARE.
+             *
+             * This said "(An administrator's password needs root.)" — a GUESS
+             * at one of four possible refusals, and wrong for the other three.
+             * `users_last_refusal()` is the gate's own words.
+             *
+             * And the identity, because the report that found this came with
+             * exactly the right question attached: *"the GUI comes up - which
+             * user is this?  It should be root but it never asked for a
+             * password."*  It is a SYSTEM session — `gui.login` is off by
+             * default — which counts as an administrator and NOT as root once
+             * any account has a chosen secret.  A panel that refuses an action
+             * without saying who it was acting as leaves the user to deduce the
+             * one thing the machine already knows. */
+            char who[40];
+            n = ac_put(m, sizeof m, 0, "NOT changed - ");
+            n = ac_put(m, sizeof m, n, users_last_refusal());
+            n = ac_put(m, sizeof m, n, ".  Acting as ");
+            n = ac_put(m, sizeof m, n,
+                       cred_owner_name(cred_current(), who, sizeof who));
+            n = ac_put(m, sizeof m, n, ".");
         }
         (void)n;
         ac_say(m);

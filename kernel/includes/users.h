@@ -274,6 +274,14 @@ int  user_check_password(const char* name, const char* password);
  * `out` gets three bytes: two hex digits and a NUL. */
 void user_secret_fingerprint(const char* text, char out[3]);
 
+/* §M81 — WHY THE LAST GATE SAID NO, in the words it used.
+ *
+ * Every refusal here is printed AND recorded, because with the GUI up the
+ * console is suppressed (§4.79) and a panel that can only see `-1` has to guess
+ * at the reason — which it did, and the guess was one of four possibilities.
+ * A caller shows this instead of what it expected to be true. */
+const char* users_last_refusal(void);
+
 /* ---------------------------------------------------------------------------
  * Lifecycle.  Every one of these gates on cred_current() (see the header) and
  * prints the reason when it refuses.  0 on success.

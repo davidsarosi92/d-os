@@ -222,10 +222,48 @@ static int usable_admin_count(int excluding_uid) {
     return n;
 }
 
+/* §M81 — A REFUSAL THAT ONLY REACHES THE CONSOLE REACHES NOBODY.
+ *
+ * Every gate below printed its reason with `kprintf` and returned -1.  That is
+ * the right place to SAY it and the wrong place to LEAVE it: with the GUI up
+ * the console is suppressed (§4.79), so the accounts panel could only report
+ * that something was refused and then GUESS at why — it guessed "an
+ * administrator's password needs root", which happens to be one of four
+ * reasons and is simply wrong for the other three.
+ *
+ * Reported from use as *"REFUSED - the password for david was not changed"*
+ * followed by exactly the right question: **"the GUI comes up — which user is
+ * this?  It should be root but it never asked for a password."**  It is a
+ * SYSTEM session (`gui.login` is off by default), which `cred_is_admin` answers
+ * 1 for and `actor_is_root` answers 0 for once any account has a chosen secret
+ * — so a non-admin's password can be changed from it and an admin's cannot.
+ * Every word of that was on the console and none of it on the screen.
+ *
+ * The reason is RECORDED as well as printed, so a caller can show the one that
+ * actually fired instead of the one it expected. */
+static char g_refusal[192];
+
+/* TWO TEXTS, and the split is the point.  `brief` is what a one-line label can
+ * hold and what the user can ACT on; `full` is the explanation, and it goes to
+ * the console where there is room for it.  The first version recorded the long
+ * one and the accounts panel clipped it mid-sentence — so the actionable half
+ * ("sign in as root") fell off the right-hand edge, which is the same defect as
+ * printing nothing, dressed up as a message. */
+static void refuse(const char* brief, const char* full) {
+    int i = 0;
+    for (; brief[i] && i < (int)sizeof g_refusal - 1; i++) g_refusal[i] = brief[i];
+    g_refusal[i] = 0;
+    kprintf("users: refused - %s\n", full);
+}
+
+const char* users_last_refusal(void) {
+    return g_refusal[0] ? g_refusal : "no reason was recorded";
+}
+
 static int would_strand_machine(int uid_losing_admin) {
     if (usable_admin_count(uid_losing_admin) > 0) return 0;
-    kprintf("users: refused — that would leave the machine with no administrator "
-            "who can log in\n");
+    refuse("it would leave nobody able to administer this machine",
+           "that would leave the machine with no administrator who can log in");
     return 1;
 }
 
@@ -235,7 +273,8 @@ static int would_strand_machine(int uid_losing_admin) {
 
 static int actor_is_admin(void) {
     if (cred_is_admin(cred_current())) return 1;
-    kprintf("users: refused — this needs an administrator\n");
+    refuse("this needs an administrator",
+           "this needs an administrator, and this session is not one");
     return 0;
 }
 
@@ -248,13 +287,14 @@ static int actor_is_root(void) {
      * way around every account on the machine. */
     if (c->owner != TASK_OWNER_USER) {
         if (users_needs_setup()) return 1;
-        kprintf("users: refused — the machine has an administrator; log in as "
-                "root to do this\n");
+        refuse("sign in as root first",
+               "the machine already has an administrator, so this SYSTEM "
+               "session no longer counts as root - sign in as root to do this");
         return 0;
     }
     if (cred_is_root(c)) return 1;
-    kprintf("users: refused — only root may do this, and only while logged in "
-            "as root\n");
+    refuse("only root may do this",
+           "only root may do this, and only while signed in as root");
     return 0;
 }
 
