@@ -10,7 +10,36 @@ Everything below is measured unless it says otherwise.
   default account, the Start-menu header + Lock/Sign out, the lock screen's
   user picker, §M81's first measurement, and the fixes listed below.
 
-## The one open DEFECT
+## The password DEFECT — measured, and it does not reproduce (2026-09-20)
+
+Driven end to end on **i386 and x86_64**: Control Panel -> select `david` ->
+Set password -> one character -> Enter -> Start -> Sign out -> pick `david` ->
+same character:
+
+    accounts: done_password received 1 character(s) for 'david'
+    users: password set for 'david' (pbkdf2-sha256, 10000 iterations)
+    lock: authenticated 'david'
+
+**Not claimed fixed** — I do not know which change closed it.  If it still
+fails on a running machine, the first thing to check is a **stale image**:
+`run-x86_64.sh` boots without building, which is §M69's own trap and is why the
+STALE IMAGE banner exists.
+
+**Two real defects were found by the report, both from its second sentence**
+(*"it writes three asterisks straight away"*):
+
+- the password mask drew a FIXED `***`, so one character and five looked
+  identical and the field gave no sign a key had landed.  §M32's reasoning —
+  "a row of bullets publishes the length" — is reversed: anyone close enough to
+  count bullets can count keystrokes.  **One mark per character** now.
+- `" — uid "` was a literal UTF-8 em-dash in a DRAWN string, and the font is
+  byte-indexed ISO-8859-2 — which is the *"david á uid 1000"* in the reporter's
+  screenshot.  **95 such literals in 22 GUI files**; `devicepanel.c` had
+  thirteen and a comment one screen away explaining the trap.
+  `scripts/check-drawn-strings.py` now checks it, and its own first version
+  cried wolf on wrapped `kprintf` calls before it learned to track call spans.
+
+## The previous open DEFECT (superseded by the above)
 
 **Changing a password from the Control Panel does not take effect.**  Reported
 from use and reproduced by the reporter with a clean isolation:
