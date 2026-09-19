@@ -133,11 +133,51 @@ So "this row has no icon" and "this icon id is a typo" rendered identically,
 which is the one distinction that default exists to make.  Fixed; nothing had
 asked for a blank icon before.
 
-Still to do in the milestone: `struct gui_window` as a widget, and the taskbar
-itself (the Start button, the window buttons, the clock and the tray are still
-imperative).  **The volume flyout deliberately stays hand-drawn** — it is a
-slider and a mute row, not a list, and forcing it through the item view would be
-the abstraction-with-no-client risk §M59 declined `wl_data_device` under.
+## THE CORRECTION THAT REFRAMED THE REST (2026-09-19)
+
+Reported mid-work: *not everything into a list — only what belongs in a list;
+that was just an example.  **The point is widgets that nest into each other
+sensibly.*** So: measure before building.
+
+| | count |
+|---|---|
+| windows that COMPOSE (`ui_build` with a spec tree) | **4** — settings, dialog, uikit, the file manager's menu bar |
+| windows that HAND-PLACE | **12** |
+
+*The mechanism exists and three quarters of the tree does not use it* — §M81's
+finding restated one layer up: unconverted clients, not a missing abstraction.
+
+**One piece WAS genuinely missing, and it is the one named in the brief: the
+VIEW widget.**  `w_itemview` had ops and no `WIDGET_CLASS`, so no spec could name
+it.  It is the `"view"` class now; the model is attached afterwards through
+`ui_by_id`, because a spec is DATA (a ring-3 client sends the same array) and a
+model is a pointer.
+
+**The accounts panel is composed** — the first window with a real table to be —
+and a weighted empty box replaces writing `base.x = cw - pad - w` for the
+right-aligned Delete.
+
+**AND THE CONVERSION HIT A TRAP THE TOOLKIT HAD DOCUMENTED RATHER THAN REMOVED.**
+`ui_build` APPENDED, with ui.h carrying a convention ("build once, layout many")
+that the two existing composers honour and the third did not.  The symptom is
+not a duplicate control — the node table fills at 64 and the window goes EMPTY,
+with stale nodes pointing at freed widgets.  `ui_build` REBUILDS now (widgets
+and nodes together, the only safe order) and asks for a REDRAW rather than a
+re-LAYOUT — the latter made a window whose `on_layout` IS the builder loop
+forever.  Driven resize: 986x493 → 1232x609 with the node count still 8.
+
+## Still open in §M81
+
+- `struct gui_window` as a widget — **and worth questioning before building**:
+  the container is a widget, the view is a class, and composition now works
+  end to end.  What a window-as-widget buys beyond that has no named client yet
+  (§M59's rule).
+- the taskbar's own content (Start button, window buttons, clock, tray) is still
+  imperative — though its two geometry duplications are gone.
+- the remaining 11 hand-placed windows.  The accounts panel is the worked
+  example; each of the others is the same shape.
+- **The volume flyout deliberately stays hand-drawn** — a slider and a mute row,
+  not a list.
 
 **A pattern worth keeping:** every instrument this milestone shipped caught the
 FIRST VERSION of the next one.  `slottest` polled on the host task it had
