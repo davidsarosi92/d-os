@@ -174,8 +174,33 @@ forever.  Driven resize: 986x493 → 1232x609 with the node count still 8.
   (§M59's rule).
 - the taskbar's own content (Start button, window buttons, clock, tray) is still
   imperative — though its two geometry duplications are gone.
-- the remaining 11 hand-placed windows.  The accounts panel is the worked
-  example; each of the others is the same shape.
+- the remaining **10** hand-placed windows.  The accounts panel and the Devices
+  panel are converted, and the second one proved the first was a PATTERN rather
+  than a one-off: it was mechanical, with nothing new needed from the toolkit.
+  The accounts file still hand-places its PROMPT window.
+
+### THE TASK MANAGER NEEDS TWO THINGS THE LAYOUT ENGINE CANNOT EXPRESS
+
+Found by attempting the conversion, and **written down rather than built**,
+because adding two layout features and converting the most timing-sensitive app
+in one pass is where half-verified things come from:
+
+1. **A child that is DROPPED when the window is too short.**  `UI_HIDE_COMPACT`
+   drops on the SIZE CLASS, which is a fact about WIDTH; this is about the
+   height left over, and a window can be wide and short.  The client is the
+   chart strip, whose own comment is the argument: *"a chart below some height
+   is a box with a header and no room for a line — which reads as a broken
+   control, while its absence reads as a small window."*  (A `UI_DROP_TIGHT`
+   flag was written and then REVERTED when gap 2 appeared: §M59's rule, applied
+   to myself — a mechanism with no client to falsify it against is how a feature
+   "works" until the first real user.)
+2. **A child that runs EDGE TO EDGE.**  The root column always insets by
+   `UI_PAD`, and the Task Manager's table deliberately does not: *"the design's
+   table is a pane, not a box floating in a margin."*
+
+Build both, then convert the Task Manager, then **measure the damage budget** —
+§M81's own risk list says a composition tree is exactly what can undo §M69's and
+§M79's work.
 - **The volume flyout deliberately stays hand-drawn** — a slider and a mute row,
   not a list.
 
