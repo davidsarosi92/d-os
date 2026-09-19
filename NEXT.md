@@ -113,9 +113,18 @@ It found that **two constructors had been bypassing `widget_init` for three
 milestones** — `w_itemview_create` and `w_editor_create`, the very defect §M65
 exported that function to prevent.  Both go through it now.
 
-Still to do in the milestone, from the agreed design: `struct gui_window` as a
-widget; the taskbar and the flyouts as compositions; and the checkable threading
-rule (*a widget's parent and its host are the same task*).
+**The threading rule is checked too (`9eeb449`).**  `audit widget-threading` —
+§M22.7's *a window's widgets belong to the task that hosts it*, observed in
+`widget_init`, announced where the cause is and counted for cron.
+`gui threadtest` is §M69's dialog bug in two lines and it is DETECTED; **the
+existing tree is clean**.  The registry is 8 audits now, and on aarch64's serial
+boot `widget-contract` correctly SKIPs while `widget-threading` reports ok.
+
+Still to do in the milestone: `struct gui_window` as a widget; the taskbar, the
+volume and keyboard flyouts as compositions (the keyboard flyout is the obvious
+next one — it is literally *"one row per registered layout"*, hand-drawn, with
+its draw and its hit test computing `py + 26 + i * KBDPOP_ROW` separately: the
+same defect the Start menu had).
 
 **A pattern worth keeping:** every instrument this milestone shipped caught the
 FIRST VERSION of the next one.  `slottest` polled on the host task it had
