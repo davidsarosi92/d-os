@@ -249,6 +249,17 @@ int window_set_size(struct gui_window* win, int outer_w, int outer_h) {
         win->layout_pending = 1;
     return 0;
 }
+int gui_window_hosted_by_current(struct gui_window* win) {
+    if (!win || !win->used) return 1;           /* nothing to violate */
+    if (!win->host_task) return 1;              /* client-managed — no host */
+    return win->host_task == task_current();
+}
+
+const char* gui_window_host_name(struct gui_window* win) {
+    if (!win || !win->host_task) return "(none)";
+    return win->host_task->name;
+}
+
 void gui_window_add_widget(struct gui_window* win, struct widget* w) {
     if (!win || win->kind != WIN_APP || !w) return;
     struct widget** p = &win->widgets;

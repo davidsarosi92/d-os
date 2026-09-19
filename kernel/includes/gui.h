@@ -364,6 +364,30 @@ void gui_window_set_on_close(struct gui_window* win,
 /* Append a widget to the window's list (constructors call this). */
 void gui_window_add_widget(struct gui_window* win, struct widget* w);
 
+/* §M81 — IS THE CALLING TASK THE ONE THAT HOSTS THIS WINDOW?
+ *
+ * §M22.7's rule, made askable: *a window's widgets belong to the task that
+ * hosts it.*  Every window runs its own app-host, which drains that window's
+ * events, runs its layout and tick, and renders into its surface — so a widget
+ * touched from anywhere else races the loop that owns it, and the visible
+ * result is nothing at all.
+ *
+ * THE RECEIPT IS §M69's: the delete dialog's answer arrived on the DIALOG's
+ * host and called the file manager's `fm_refresh()` directly.  The model really
+ * was reloaded and NOTHING ON SCREEN CHANGED, because damaging a window is the
+ * host's job.  *A cross-task write that appears to do nothing is the most
+ * expensive kind: it looks like a missing feature, so the fix gets aimed at the
+ * wrong layer.*  The answer is handed over as DATA and consumed by the owning
+ * host — but that was a convention, and this is what checks it.
+ *
+ * Returns 1 when the caller may touch this window's widgets: it hosts it, or
+ * the window is CLIENT-MANAGED (the dosgui/Wayland bridge deliberately clears
+ * `host_task`, so there is no host to be wrong about), or the window is still
+ * being constructed.  0 means a real violation. */
+int gui_window_hosted_by_current(struct gui_window* win);
+/* Who does host it — for the report.  "(none)" for a client-managed window. */
+const char* gui_window_host_name(struct gui_window* win);
+
 /* §M65 — THE WINDOW POPUP: one overlay above every window, used by the menu
  * bar and the combo box.  `items` is one string with '\n' between entries and
  * "-" for a separator — flat, because the same call has to survive being sent
@@ -544,6 +568,12 @@ void gui_slot_test(void);
  * as `hardlock`, `leaktest` and `drv crash` — deliberate, named, never the
  * default. */
 void gui_contract_test(void);
+
+/* §M81 — `gui threadtest`: create a widget for a window from a task that does
+ * not host it, so `audit widget-threading` can be seen to detect §M22.7's
+ * violation.  §M69's dialog bug, reduced to two lines.  Needs `--allow-crash`
+ * for the same reason `contracttest` does.  Hidden from `help`. */
+void gui_thread_test(void);
 
 /* A periodic callback on the window's own host task (~2 Hz).
  *

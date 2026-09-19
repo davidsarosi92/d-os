@@ -574,6 +574,12 @@ void widget_init(struct widget* w, struct gui_window* win,
                  int x, int y, int ww, int hh,
                  const struct widget_ops* ops, void* ctx, int focusable);
 
+/* §M81 — how many widgets have been created on a task that does not host their
+ * window (§M22.7), and the last pair of names.  Read by
+ * `audit widget-threading`; see widget.c. */
+extern unsigned widget_cross_task;
+void widget_threading_last(const char** from, const char** host);
+
 void widget_draw_all(struct widget* head, struct gfx_surface* s);
 struct widget* widget_at(struct widget* head, int lx, int ly);
 

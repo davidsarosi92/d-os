@@ -17,6 +17,7 @@
 #include "keymap.h"          /* M22.5: KC_* keycodes for navigation */
 #include "clipboard.h"       /* M22.5: Ctrl+C/V in textinput */
 #include "kmalloc.h"
+#include "task.h"
 #include "ui.h"             /* §M65 — ui_text_clipped + the class registry */
 #include <stddef.h>
 
@@ -105,6 +106,31 @@ struct widget* widget_at(struct widget* head, int lx, int ly) {
     return hit;
 }
 
+/* §M81 — CROSS-TASK WIDGET CREATION, COUNTED.
+ *
+ * §M22.7's rule is that a window's widgets belong to the task that hosts it,
+ * and until now that was a CONVENTION — written in three headers and checked
+ * nowhere.  `widget_init` is the one route every widget is born through (the
+ * contract in widget.h, enforced since §M81), which makes it the one place the
+ * rule can be observed without instrumenting every caller.
+ *
+ * Announced at the moment it happens AND counted, for the same reason
+ * `gui_app_open`'s hosting warning is both: the violation's SYMPTOM is that
+ * nothing appears, arbitrarily later and in another file, so the line has to be
+ * printed where the cause is.  Counted so `audit widget-threading` can report
+ * it on a machine nobody was watching — §M71's argument for running from cron.
+ *
+ * NOT refused, only reported: refusing would turn a rendering bug into a
+ * missing control, and §M71 rule 4 says an audit does not fix what it finds. */
+unsigned widget_cross_task;
+static const char* wx_last_from = "(none)";
+static const char* wx_last_host = "(none)";
+
+void widget_threading_last(const char** from, const char** host) {
+    if (from) *from = wx_last_from;
+    if (host) *host = wx_last_host;
+}
+
 /* §M65 — EXPORTED as widget_init.  It was static, so every widget outside this
  * file hand-rolled its own initialisation — and w_itemview.c's copy forgot to
  * set `win`, which is why keyboard navigation had never worked in an item view
@@ -113,6 +139,16 @@ struct widget* widget_at(struct widget* head, int lx, int ly) {
 void widget_init(struct widget* w, struct gui_window* win,
                  int x, int y, int ww, int hh,
                  const struct widget_ops* ops, void* ctx, int focusable) {
+    if (win && !gui_window_hosted_by_current(win)) {
+        struct task* me = task_current();
+        wx_last_from = me ? me->name : "(?)";
+        wx_last_host = gui_window_host_name(win);
+        if (widget_cross_task++ == 0)
+            kprintf("gui: a widget is being created on '%s' for a window hosted "
+                    "by '%s' — §M22.7 says the host owns them, and a cross-task "
+                    "write here appears to do NOTHING (see gui.h)\n",
+                    wx_last_from, wx_last_host);
+    }
     w->x = x; w->y = y; w->w = ww; w->h = hh;
     w->ops = ops;
     w->win = win;

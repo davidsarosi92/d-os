@@ -473,6 +473,96 @@ void gui_contract_test(void) {
             after == before ? "back to where it started" : "STILL DIRTY");
 }
 
+/* §M81 — `audit widget-threading`: §M22.7's ownership rule, checked.
+ *
+ * *A window's widgets belong to the task that hosts it.*  That sentence is in
+ * three headers and was checked nowhere, and §M69 paid for it: the delete
+ * dialog's answer arrived on the DIALOG's host and called the file manager's
+ * `fm_refresh()` directly — the model really was reloaded and NOTHING ON SCREEN
+ * CHANGED, because damaging a window is the host's job.  *A cross-task write
+ * that appears to do nothing is the most expensive kind: it looks like a
+ * missing feature, so the fix gets aimed at the wrong layer.*
+ *
+ * WHAT IS OBSERVED, not believed: `widget_init` is the one route a widget is
+ * born through, and it compares the creating task against the window's host at
+ * that moment.  The audit reports the count and the last pair of names — the
+ * count because a violation's symptom appears arbitrarily later and elsewhere,
+ * the names because "some task did this to some window" is not a lead.
+ *
+ * NEVER SKIP.  Unlike the contract check this needs no windows and no GUI: the
+ * counter is zero on a machine that has never drawn anything, and that is a
+ * real "checked, clean" rather than a "could not look". */
+static int au_widget_threading(int verbose) {
+    const char *from = "(none)", *host = "(none)";
+    widget_threading_last(&from, &host);
+    if (widget_cross_task) {
+        kprintf("  %u widget(s) created off their window's host task; the last "
+                "was made on '%s' for a window hosted by '%s'\n",
+                widget_cross_task, from, host);
+        /* One violation, however many times it happened: the count is the
+         * evidence and a per-occurrence tally would make a busy app look
+         * catastrophic next to a rare one. */
+        return 1;
+    }
+    if (verbose)
+        kprintf("  every widget so far was created on its window's host task\n");
+    return AUDIT_OK;
+}
+
+AUDIT(widget_threading) = {
+    "widget-threading",
+    "every widget is created on the task that hosts its window (§M22.7)",
+    au_widget_threading
+};
+
+/* THE FALSIFIER.  Two tasks are needed to break this rule, so the test opens a
+ * window on a real app-host and then builds a widget into it FROM THE CALLING
+ * TASK — which is exactly §M69's dialog, reduced to its two lines.
+ *
+ * The widget is deliberately left where it lands: tearing it down would need
+ * the host's cooperation, which is the whole point of the rule.  Closing the
+ * window disposes of it on the ordinary path. */
+static struct gui_window* th_win;
+
+static void th_layout(struct gui_window* win) {
+    gui_window_clear_widgets(win);      /* on the host — legitimate */
+    w_label_create(win, 4, 4, 200, "threadtest");
+}
+
+static void th_open(void) {
+    gui_app_open(&(struct gui_app_spec){
+        .title = "threadtest",
+        .content_w = cp_px(200), .content_h = cp_px(70),
+        .place = GUI_PLACE_DIALOG,
+        .layout = th_layout, .slot = &th_win,
+    });
+}
+
+void gui_thread_test(void) {
+    if (!gui_is_active()) { kprintf("threadtest: the GUI is not running\n"); return; }
+    th_win = NULL;
+    kprintf("threadtest: %d violation(s) before\n",
+            audit_run_one("widget-threading", 0));
+
+    gui_queue_open(th_open);            /* the window gets a REAL host */
+    for (int i = 0; i < 100 && !th_win; i++) task_msleep(20);
+    if (!th_win) { kprintf("threadtest: no window appeared\n"); return; }
+    task_msleep(300);
+
+    /* THE VIOLATION: this is the shell task, and that window is hosted by an
+     * app-host.  §M69's dialog did precisely this and the screen did not move. */
+    w_label_create(th_win, 4, cp_px(40), 200, "made on the wrong task");
+
+    int during = audit_run_one("widget-threading", 0);
+    kprintf("threadtest: %d violation(s) after the cross-task create — %s\n",
+            during, during > 0 ? "DETECTED"
+                               : "NOT DETECTED (the check is broken)");
+    gui_window_close(th_win);
+    for (int i = 0; i < 100 && th_win; i++) task_msleep(20);
+    kprintf("threadtest: the counter does not reset — it is a record of what "
+            "happened, not a live state\n");
+}
+
 void gui_compose_bench(int frames) {
     if (frames <= 0) frames = 30;
     g_occlude = (int)config_get_long("gui.occlude", 1);
