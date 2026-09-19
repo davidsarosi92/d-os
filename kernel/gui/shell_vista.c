@@ -747,6 +747,34 @@ static void publish_popup(void) {
     else                   gui_panel_set_popup(0, 0, 0, 0, 0);
 }
 
+/* ---------------------------------------------------------------------------
+ * §M81 — THE TASKBAR'S TWO BOXES, EACH IN ONE PLACE.
+ *
+ * The last of the chrome's §4.79 duplications.  The Start button was drawn at
+ * `(4, ty + 4, START_W, TASKBAR_H - 8)` and hit-tested as `x >= 4 && x < 4 +
+ * START_W` — the same box written twice, and the second copy never mentioned
+ * the vertical extent at all.  The window buttons were worse: a whole strip
+ * (`x = START_W + 12; … x += bw + 6`) laid out in the painter and laid out
+ * AGAIN in the click handler.
+ *
+ * THE TWO COPIES ALSO TOOK SEPARATE SNAPSHOTS OF THE WINDOW LIST, and that is
+ * the part with teeth: `bw` is `avail / n`, so a window opening or closing
+ * between the paint and the click changes every button's width and the strip
+ * shifts under the pointer.  One geometry cannot remove the race, but it does
+ * make the two ends agree about what they were given — and the shared function
+ * takes `n` as an ARGUMENT for exactly that reason, so the caller's count is
+ * visibly the one being used.
+ * ------------------------------------------------------------------------- */
+
+/* The Start button, including its vertical extent — which the hit test used to
+ * leave out entirely. */
+static void start_box(int* x, int* y, int* w, int* h) {
+    *x = cp_px(4);
+    *y = scr_h - TASKBAR_H + cp_px(4);
+    *w = START_W;
+    *h = TASKBAR_H - cp_px(8);
+}
+
 static int tbtn_width(int nslots) {
     int avail = scr_w - (START_W + 12) - CLOCK_W - 8;
     if (nslots <= 0) return TBTN_W;
@@ -754,6 +782,16 @@ static int tbtn_width(int nslots) {
     if (w > TBTN_W) w = TBTN_W;
     if (w < 48)     w = 48;
     return w;
+}
+
+/* ONE window button's rect.  `n` is the caller's own count, so the two ends
+ * cannot silently be sizing against different window lists. */
+static void tbtn_rect(int i, int n, int* x, int* y, int* w, int* h) {
+    int bw = tbtn_width(n);
+    *w = bw;
+    *x = START_W + cp_px(12) + i * (bw + cp_px(6));
+    *y = scr_h - TASKBAR_H + cp_px(5);
+    *h = TASKBAR_H - cp_px(10);
 }
 
 /* WHAT THE HEADER SAYS.  `gui_session_user()` when somebody signed in at the
@@ -799,23 +837,28 @@ static void vista_draw(struct gfx_surface* back) {
     gfx_fill(back, 0, ty, scr_w, TASKBAR_H, COL_TB_TOP);
     gfx_fill(back, 0, ty, scr_w, 1, COL_TB_HILITE);
 
-    /* Start button. */
-    cp_plate(back, 4, ty + 4, START_W, TASKBAR_H - 8,
-             menu_open ? cp_current_theme()->press : COL_START_TOP,
-             COL_START_EDGE);
-    cp_text(back, 4 + (START_W - cp_text_w(START_TEXT)) / 2,
-             ty + (TASKBAR_H - cp_fh()) / 2, START_TEXT, COL_TEXT);
+    /* Start button — the box from start_box(), which the hit test also uses. */
+    {
+        int sx, sy, sw, sh;
+        start_box(&sx, &sy, &sw, &sh);
+        cp_plate(back, sx, sy, sw, sh,
+                 menu_open ? cp_current_theme()->press : COL_START_TOP,
+                 COL_START_EDGE);
+        cp_text(back, sx + (sw - cp_text_w(START_TEXT)) / 2,
+                ty + (TASKBAR_H - cp_fh()) / 2, START_TEXT, COL_TEXT);
+    }
 
     /* One button per open window. */
     struct gui_window* slots[TB_MAX_BTNS];
     int n  = gui_wm_windows(slots, TB_MAX_BTNS);
     int bw = tbtn_width(n);
-    int x  = START_W + 12;
     struct gui_window* focused = gui_wm_focused();
     for (int i = 0; i < n; i++) {
         int f = (slots[i] == focused);
         int m = gui_window_minimized(slots[i]);
-        cp_plate(back, x, ty + 5, bw, TASKBAR_H - 10,
+        int x, by, bh;
+        tbtn_rect(i, n, &x, &by, &bw, &bh);
+        cp_plate(back, x, by, bw, bh,
                  f ? COL_TBTN_F_TOP : (m ? cp_current_theme()->tray
                                          : COL_TBTN_TOP),
                  COL_TBTN_EDGE);
@@ -1155,27 +1198,31 @@ static int vista_click(int x, int y) {
 
     if (y < ty) return 0;               /* not our chrome */
 
-    /* Start button. */
-    if (x >= 4 && x < 4 + START_W) {
+    /* Start button — the SAME box the painter drew (start_box), vertical
+     * extent included. */
+    {
+        int sx, sy, sw, sh;
+        start_box(&sx, &sy, &sw, &sh);
+        if (x >= sx && x < sx + sw && y >= sy && y < sy + sh) {
         menu_open = !menu_open;
         menu_hover = -1;
         vol_pop_open = 0;
         kbd_pop_open = 0;
         publish_popup();
         return 1;
+        }
     }
 
-    /* Window buttons. */
+    /* Window buttons — the same strip the painter laid out. */
     struct gui_window* slots[TB_MAX_BTNS];
-    int n  = gui_wm_windows_locked(slots, TB_MAX_BTNS);
-    int bw = tbtn_width(n);
-    int bx = START_W + 12;
+    int n = gui_wm_windows_locked(slots, TB_MAX_BTNS);
     for (int i = 0; i < n; i++) {
-        if (x >= bx && x < bx + bw) {
+        int bx, by, bw, bh;
+        tbtn_rect(i, n, &bx, &by, &bw, &bh);
+        if (x >= bx && x < bx + bw && y >= by && y < by + bh) {
             gui_wm_taskbar_activate_locked(slots[i]);   /* M22.3 */
             return 1;
         }
-        bx += bw + 6;
     }
     return 1;                           /* dead taskbar area still consumed */
 }
