@@ -172,6 +172,35 @@ static const struct item_model ac_model = {
 static struct gui_window* ac_win;
 static struct w_itemview* ac_view;
 static struct w_label*    ac_detail;
+
+/* §M81 — AN ANSWER SURVIVES THE REFRESH THAT FOLLOWS IT.
+ *
+ * `ac_update_controls` rewrites the detail line from the SELECTION ("david -
+ * uid 1000 ..."), and every action here ends with `ac_refresh()`.  So a handler
+ * that reported its outcome into that label had it overwritten before a single
+ * frame was drawn: the password really was set, and the panel said NOTHING.
+ * Reported from use in exactly those words — *"I type it, press OK, everything
+ * disappears and it writes nothing"* — and it is why a working change read as a
+ * broken one.
+ *
+ * THIS FILE'S NEIGHBOUR ALREADY HAD THIS BUG.  §M69: *"the Task Manager's
+ * button messages were written and then overwritten by `tm_refresh` IN THE SAME
+ * CALL, so the answer to a button press was never on screen for a single
+ * frame."*  Same shape, same file family, found again by a user rather than by
+ * the fix that was written for it.
+ *
+ * So the answer is not "remember to order the two calls correctly" — that is
+ * the convention that just failed.  A pending ANSWER is state: `ac_update_controls`
+ * shows it instead of the selection line, once, and clears it.  A handler that
+ * sets one cannot have it eaten, whatever it calls afterwards. */
+static char ac_answer[160];
+
+static void ac_say(const char* msg) {
+    int i = 0;
+    for (; msg && msg[i] && i < (int)sizeof ac_answer - 1; i++) ac_answer[i] = msg[i];
+    ac_answer[i] = 0;
+}
+
 static struct w_button*   ac_btn_new;
 static struct w_button*   ac_btn_pw;
 static struct w_button*   ac_btn_admin;
@@ -377,9 +406,8 @@ static void done_password(const char* pw) {
      * (`passwd <name> -`).  A blank field is an accident, not a sentence. */
     if (!pw || !pw[0]) {
         if (ac_detail)
-            w_label_set(ac_detail, "No password typed - nothing was changed. "
-                                   "(To disable sign-in, use `passwd <name> -` "
-                                   "at a shell.)");
+            ac_say("No password typed - nothing was changed. "
+               "(To disable sign-in, use `passwd <name> -` at a shell.)");
         kprintf("accounts: done_password received 0 characters\n");
         if (ac_win) gui_window_request_redraw(ac_win);
         return;
@@ -404,7 +432,7 @@ static void done_password(const char* pw) {
     kprintf("accounts: done_password received %d character(s) for '%s'\n",
             plen, u->name);
     int rc = user_set_password(u->name, pw);
-    if (ac_detail) {
+    {
         static char m[140];
         int n;
         if (rc == 0) {
@@ -412,7 +440,30 @@ static void done_password(const char* pw) {
             n = ac_put(m, sizeof m, n, u->name);
             n = ac_put(m, sizeof m, n, " (");
             n = ac_put_int(m, sizeof m, n, plen);
-            n = ac_put(m, sizeof m, n, " characters).  They can sign in now.");
+            n = ac_put(m, sizeof m, n, " chars, fp ");
+            /* §M81 — THE FINGERPRINT, and the panel VERIFIES ITS OWN WORK.
+             *
+             * When both ends of the chain report ONE character and the sign-in
+             * is still refused, a length has said all it can.  Two things are
+             * left, and this line separates them: `fp` is 8 irreversible bits
+             * of what was typed, so a lock screen showing a DIFFERENT fp proves
+             * the keystrokes differ rather than the hashing — and
+             * `keyboard.layout` is a per-user setting, which applies inside a
+             * session and not at the lock screen.
+             *
+             * And `ok`/`MISMATCH` is the panel checking the record it just
+             * wrote, immediately, through the same function the lock screen
+             * calls.  *A panel that reports the outcome it hoped for is worse
+             * than one that reports nothing* — this reports the outcome it
+             * MEASURED, one line after causing it. */
+            {
+                char fp[3];
+                user_secret_fingerprint(pw, fp);
+                n = ac_put(m, sizeof m, n, fp);
+                n = ac_put(m, sizeof m, n, user_check_password(u->name, pw) == 0
+                                               ? ", verified ok).  They can sign in now."
+                                               : ", VERIFY FAILED - the record did not take).");
+            }
         } else {
             n = ac_put(m, sizeof m, 0, "REFUSED - the password for ");
             n = ac_put(m, sizeof m, n, u->name);
@@ -420,7 +471,7 @@ static void done_password(const char* pw) {
                                        "password needs root.)");
         }
         (void)n;
-        w_label_set(ac_detail, m);
+        ac_say(m);
     }
     ac_refresh();
 }
@@ -498,6 +549,12 @@ static void ac_update_controls(void) {
     if (ac_btn_del)   ac_btn_del->base.disabled   = !may_delete(u);
 
     if (!ac_detail) return;
+    /* A pending answer wins over the selection description, exactly once. */
+    if (ac_answer[0]) {
+        w_label_set(ac_detail, ac_answer);
+        ac_answer[0] = 0;
+        return;                 /* the buttons were updated above */
+    }
     static char msg[224];
     int n = 0;
     if (!u) {

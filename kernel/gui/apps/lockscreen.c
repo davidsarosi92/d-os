@@ -236,8 +236,16 @@ static int lock_try(const char* user, const char* pass) {
                     } else {
                         if (plen >= 10) m[n++] = (char)('0' + plen / 10);
                         m[n++] = (char)('0' + plen % 10);
-                        const char* z = " character(s) received";
+                        const char* z = " char(s) received, fp ";
                         for (int i = 0; z[i] && n < 92; i++) m[n++] = z[i];
+                        /* The other end of the fingerprint — see users.h.  If
+                         * this differs from the one the accounts panel printed,
+                         * the same physical keys produced different characters,
+                         * and the search moves to the keyboard layout rather
+                         * than to the hashing. */
+                        char fp[3];
+                        user_secret_fingerprint(pass, fp);
+                        for (int i = 0; fp[i] && n < 92; i++) m[n++] = fp[i];
                     }
                 }
             }

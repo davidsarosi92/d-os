@@ -255,6 +255,25 @@ int  user_is_admin_uid(int uid);
  * becomes a way to enumerate accounts. */
 int  user_check_password(const char* name, const char* password);
 
+/* §M81 — AN 8-BIT FINGERPRINT OF A TYPED SECRET, for comparing the two ENDS of
+ * the sign-in chain without ever showing what was typed.
+ *
+ * The problem it solves: the accounts panel reports how many characters it SET
+ * and the lock screen how many it RECEIVED, and when BOTH say ONE and the
+ * sign-in is still refused, the counts have said everything they can.  The
+ * remaining question — *is it the same character?* — cannot be answered by a
+ * length and must not be answered by printing the password.
+ *
+ * So: the first byte of SHA-256(text), as two hex digits.  Irreversible, and
+ * eight bits is worth nothing to somebody who can already see the screen —
+ * while two ends that DISAGREE prove the keystrokes differ (`keyboard.layout`
+ * is a per-user setting, so it applies inside a session and not at the lock
+ * screen), and two that AGREE prove they do not, which moves the search to the
+ * stored record.
+ *
+ * `out` gets three bytes: two hex digits and a NUL. */
+void user_secret_fingerprint(const char* text, char out[3]);
+
 /* ---------------------------------------------------------------------------
  * Lifecycle.  Every one of these gates on cred_current() (see the header) and
  * prints the reason when it refuses.  0 on success.

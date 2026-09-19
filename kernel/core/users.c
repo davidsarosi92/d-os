@@ -284,6 +284,17 @@ static void derive(const char* password, const char* salt_hex,
     to_hex(dk, SHA256_DIGEST_LEN, out_hex);
 }
 
+void user_secret_fingerprint(const char* text, char out[3]) {
+    static const char hex[] = "0123456789abcdef";
+    uint8_t d[SHA256_DIGEST_LEN];
+    int n = 0;
+    while (text && text[n]) n++;
+    sha256(text ? text : "", (size_t)n, d);
+    out[0] = hex[(d[0] >> 4) & 0xF];
+    out[1] = hex[d[0] & 0xF];
+    out[2] = 0;
+}
+
 int user_check_password(const char* name, const char* password) {
     const struct user_account* u = user_by_name(name);
     /* One answer for "no such user" and "wrong password".  Distinguishing them
