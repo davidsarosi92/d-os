@@ -377,7 +377,7 @@ static void done_password(const char* pw) {
      * (`passwd <name> -`).  A blank field is an accident, not a sentence. */
     if (!pw || !pw[0]) {
         if (ac_detail)
-            w_label_set(ac_detail, "No password typed — nothing was changed. "
+            w_label_set(ac_detail, "No password typed - nothing was changed. "
                                    "(To disable sign-in, use `passwd <name> -` "
                                    "at a shell.)");
         kprintf("accounts: done_password received 0 characters\n");
@@ -414,7 +414,7 @@ static void done_password(const char* pw) {
             n = ac_put_int(m, sizeof m, n, plen);
             n = ac_put(m, sizeof m, n, " characters).  They can sign in now.");
         } else {
-            n = ac_put(m, sizeof m, 0, "REFUSED — the password for ");
+            n = ac_put(m, sizeof m, 0, "REFUSED - the password for ");
             n = ac_put(m, sizeof m, n, u->name);
             n = ac_put(m, sizeof m, n, " was NOT changed.  (An administrator's "
                                        "password needs root.)");
@@ -508,7 +508,7 @@ static void ac_update_controls(void) {
                        "change your own password and nothing else.");
     } else {
         n = ac_put(msg, sizeof msg, 0, u->name);
-        n = ac_put(msg, sizeof msg, n, " — uid ");
+        n = ac_put(msg, sizeof msg, n, " - uid ");
         n = ac_put_int(msg, sizeof msg, n, u->uid);
         if (!u->has_password)
             n = ac_put(msg, sizeof msg, n, ", cannot sign in (no password)");
@@ -522,7 +522,7 @@ static void ac_update_controls(void) {
                        "by anyone, including root.");
         else if (user_is_admin_uid(u->uid) && !me_is_root())
             n = ac_put(msg, sizeof msg, n,
-                       ".  This is an administrator — only root may change or "
+                       ".  This is an administrator - only root may change or "
                        "remove one.");
         else if (!me_is_admin() && !is_me(u))
             n = ac_put(msg, sizeof msg, n,

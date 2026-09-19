@@ -150,7 +150,7 @@ void widget_init(struct widget* w, struct gui_window* win,
         wx_last_host = gui_window_host_name(win);
         if (widget_cross_task++ == 0)
             kprintf("gui: a widget is being created on '%s' for a window hosted "
-                    "by '%s' — §M22.7 says the host owns them, and a cross-task "
+                    "by '%s' - §M22.7 says the host owns them, and a cross-task "
                     "write here appears to do NOTHING (see gui.h)\n",
                     wx_last_from, wx_last_host);
     }
@@ -168,7 +168,7 @@ void widget_init(struct widget* w, struct gui_window* win,
      * when both facts are in hand. */
     if (focusable && ops && !ops->key && !ops->keycode) {
         if (widget_focus_traps++ == 0)
-            kprintf("gui: a FOCUSABLE widget was built with no key handler — "
+            kprintf("gui: a FOCUSABLE widget was built with no key handler - "
                     "Tab will land on it and the keyboard will stop there "
                     "(see widget.h's contract)\n");
     }
@@ -720,25 +720,44 @@ static void textinput_draw(struct widget* w, struct gfx_surface* s) {
     int maxch = (w->w - 10) / cp_fw();
     int cw;
     if (t->secret) {
-        /* §M32 — ONE marker, whatever the length.  A row of bullets is a
-         * public statement of how many characters the password has, which is
-         * the one thing a shoulder-surfer cannot otherwise get.
+        /* §M81 — ONE MARK PER CHARACTER, WHICH REVERSES §M32's DECISION HERE.
          *
-         * PLAIN ASCII, AND THAT IS THE §4.66 TRAP AGAIN.  The first version used
-         * 0xB7 for a middle dot, which is what it is in LATIN-1 — and this
-         * font is byte-indexed **ISO-8859-2**, where 0xB7 is a CARON.  The
-         * field therefore drew three hooks, reported from use as "some squiggle
-         * gets in", and it raised a much worse suspicion than the bug deserved:
-         * that the MASK was being submitted instead of the value.  It is not —
-         * drawing never touches `buf` — but a password field that displays
-         * something inexplicable has already cost the user their confidence in
-         * it, which is most of what such a field is for.
+         * §M32 drew a FIXED `***` whatever the length, on the argument that a
+         * row of bullets publishes how many characters the password has — "the
+         * one thing a shoulder-surfer cannot otherwise get".
          *
-         * CLAUDE.md records this trap twice before (a literal UTF-8 `á`, and a
-         * Hungarian string added while fixing the first).  Third time. */
-        const char* mark = t->len ? "***" : "";
-        cp_text(s, w->x + 5, w->y + (w->h - cp_fh()) / 2, mark, WCOL_TEXT);
-        cw = t->len ? 3 : 0;
+         * THAT PREMISE IS WEAK AND THE COST WAS NOT.  Anyone close enough to
+         * count bullets is close enough to count KEYSTROKES, so the secret was
+         * never really being kept; meanwhile the field gave NO SIGN that a key
+         * had landed, because one character and five looked identical.
+         *
+         * Reported from use twice, the second time as the thing that finally
+         * named it: *"interesting that it writes three asterisks into the input
+         * straight away."*  It had not — one keystroke drew three marks — but
+         * from a chair those are the same observation, and it is why a working
+         * password change was reported as broken through several rounds: the
+         * only feedback the field offered was a constant.
+         *
+         * *A control that cannot show that it received your input is not
+         * protecting a secret; it is hiding its own state.*  Bounded by the
+         * width like any other text, so a long password does not draw past the
+         * box.
+         *
+         * THE MASK IS STILL PLAIN ASCII, and that is the §4.66 trap: the first
+         * version used 0xB7 for a middle dot, which is what it is in LATIN-1 —
+         * and this font is byte-indexed ISO-8859-2, where 0xB7 is a CARON.  The
+         * field drew three hooks, reported as "some squiggle gets in", and it
+         * raised a far worse suspicion than the bug deserved: that the MASK was
+         * being submitted instead of the value.  It is not; drawing never
+         * touches `buf`.  `scripts/check-drawn-strings.py` is the check that
+         * came out of meeting that trap a fourth time. */
+        char mask[64];
+        int nm = t->len > maxch ? maxch : t->len;
+        if (nm > (int)sizeof mask - 1) nm = (int)sizeof mask - 1;
+        for (int i = 0; i < nm; i++) mask[i] = '*';
+        mask[nm] = 0;
+        cp_text(s, w->x + 5, w->y + (w->h - cp_fh()) / 2, mask, WCOL_TEXT);
+        cw = nm;
     } else {
         /* Right-align overflow: show the tail that fits. */
         const char* p = t->buf;

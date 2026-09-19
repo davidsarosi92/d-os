@@ -277,7 +277,7 @@ void gui_window_add_widget(struct gui_window* win, struct widget* w) {
     if (!win || win->kind != WIN_APP || !w) return;
     if (w->inited != WIDGET_INITED) {
         if (widget_uninited++ == 0)
-            kprintf("gui: a widget was added to '%s' WITHOUT widget_init — its "
+            kprintf("gui: a widget was added to '%s' WITHOUT widget_init - its "
                     "base fields were assembled by hand, which is how keyboard "
                     "navigation silently never worked in an item view (§M63)\n",
                     win->title);
@@ -530,7 +530,7 @@ int gui_window_set_modal(struct gui_window* win, int on) {
     if (on) {
         if (modal_win && modal_win->used && modal_win != win) {
             spin_unlock_irqrestore(&state_lock, fl);
-            kprintf("gui: modal refused for '%s' — '%s' already holds it\n",
+            kprintf("gui: modal refused for '%s' - '%s' already holds it\n",
                     win->title, modal_win->title);
             return -1;
         }

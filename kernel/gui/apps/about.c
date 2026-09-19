@@ -29,8 +29,8 @@ static void about_open(void) {
     });
     if (!w) return;
 
-    w_label_create(w, 16, 12, 260, "d-os — hobby teaching kernel");
-    w_label_create(w, 16, 34, 260, "M22.2: modular GUI — swappable");
+    w_label_create(w, 16, 12, 260, "d-os - hobby teaching kernel");
+    w_label_create(w, 16, 34, 260, "M22.2: modular GUI - swappable");
     w_label_create(w, 16, 50, 260, "desktop shells + app registry");
     struct w_label* d = w_label_create(w, 16, 78, 260,
                                        "i386 / x86_64 - PLAN.md M22");

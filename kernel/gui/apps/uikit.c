@@ -176,7 +176,7 @@ static void uikit_open(void) {
      * control that did not appear. */
     int built = ui_build(win, sp, k, uk_event, NULL);
     if (built != k)
-        kprintf("uikit: %d of %d specs built — %d control(s) MISSING\n",
+        kprintf("uikit: %d of %d specs built - %d control(s) MISSING\n",
                 built, k, k - built);
 
     /* The class NAMES are string literals, so keeping the pointers is enough —
@@ -217,7 +217,7 @@ static void uikit_open(void) {
         int used = 0;
         for (int j = 0; j < k; j++)
             if (sp_cls[j] && nm && streq_(sp_cls[j], nm)) { used = 1; break; }
-        kprintf("uikit:   %s%s\n", nm, used ? "" : "   (NO ROW — unproven)");
+        kprintf("uikit:   %s%s\n", nm, used ? "" : "   (NO ROW - unproven)");
     }
 
     kfree(sp_cls);

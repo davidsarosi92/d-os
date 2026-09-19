@@ -431,7 +431,7 @@ int wallpaper_render(struct gfx_surface* dst) {
         st_add(&pos, "gradient (fallback: \"");
         st_add(&pos, spec);
         st_add(&pos, "\" is not a hex colour)");
-        klog(KLOG_WARN, "gui", "wallpaper: bad solid colour '%s' — using gradient\n", spec);
+        klog(KLOG_WARN, "gui", "wallpaper: bad solid colour '%s' - using gradient\n", spec);
         return -1;
     }
 
@@ -454,10 +454,10 @@ int wallpaper_render(struct gfx_surface* dst) {
     paint_gradient(dst);
     st_add(&pos, "gradient (fallback: ");
     st_add(&pos, spec);
-    st_add(&pos, " — ");
+    st_add(&pos, " - ");
     st_add(&pos, why);
     st_add(&pos, ")");
-    klog(KLOG_WARN, "gui", "wallpaper: %s — %s; using gradient\n", spec, why);
+    klog(KLOG_WARN, "gui", "wallpaper: %s - %s; using gradient\n", spec, why);
     return -1;
 }
 
@@ -471,7 +471,7 @@ const char* wallpaper_status(void) {
      * what boot will use instead, and mark it as not-yet-painted. */
     int pos = 0;
     status[0] = '\0';
-    st_add(&pos, "not rendered yet — configured: ");
+    st_add(&pos, "not rendered yet - configured: ");
     st_add(&pos, config_get("gui.wallpaper", "gradient"));
     st_add(&pos, " (");
     st_add(&pos, config_get("gui.wallpaper_fit", "fill"));
@@ -610,7 +610,7 @@ void wallpaper_cmd(const char* args) {
         int h = parse_int(&p); if (h < 0) h = 200;
         struct gfx_surface tmp;
         if (w <= 0 || h <= 0 || gfx_surface_init(&tmp, w, h) != 0) {
-            kprintf("wallpaper: check %dx%d — cannot allocate surface\n", w, h);
+            kprintf("wallpaper: check %dx%d - cannot allocate surface\n", w, h);
             return;
         }
         int rc = wallpaper_render(&tmp);
@@ -651,14 +651,14 @@ void wallpaper_cmd(const char* args) {
     /* Anything else is a source spec. */
     int rc = wallpaper_set(args);
     if (rc == -2) {
-        kprintf("wallpaper: rejected '%s' (bad spec — nothing changed)\n", args);
+        kprintf("wallpaper: rejected '%s' (bad spec - nothing changed)\n", args);
         return;
     }
     /* rc == -1 means it fell back; the status line says why, so print it
      * either way rather than a bare "ok"/"failed" that hides the reason. */
     kprintf("wallpaper: %s\n", wallpaper_status());
     if (!gui_is_active())
-        kprintf("  (GUI not running — takes effect when `gui` starts)\n");
+        kprintf("  (GUI not running - takes effect when `gui` starts)\n");
 }
 
 /* ------------------------------------------------------------------- */

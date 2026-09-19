@@ -842,7 +842,7 @@ int ui_build(struct gui_window* win, const struct ui_spec* specs, int n,
             /* Report and SKIP.  A panel missing one control is more useful
              * than a window that refuses to open, and the name is printed so
              * the typo is findable. */
-            kprintf("ui: unknown widget class '%s' (id %d) — skipped\n",
+            kprintf("ui: unknown widget class '%s' (id %d) - skipped\n",
                     sp->cls ? sp->cls : "(null)", sp->id);
             continue;
         }
@@ -959,7 +959,7 @@ void ui_cmd(const char* args) {
             if (!(st->n[i].flags & UI_SCROLL)) continue;
             int before = w_box_scroll(st->n[i].w);
             int moved  = ui_scroll_by(win, st->n[i].id, delta);
-            kprintf("ui: viewport id %d — content %d px in %d px, scroll %d -> %d (%s)\n",
+            kprintf("ui: viewport id %d - content %d px in %d px, scroll %d -> %d (%s)\n",
                     st->n[i].id, w_box_content(st->n[i].w), st->n[i].ch,
                     before, w_box_scroll(st->n[i].w), moved ? "moved" : "clamped");
             gui_window_request_redraw(win);

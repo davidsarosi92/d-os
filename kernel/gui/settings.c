@@ -629,7 +629,7 @@ void settings_cmd(const char* args) {
         kprintf("settings panels (%d):\n", settings_panel_count());
         for (int i = 0; i < settings_panel_count(); i++) {
             const struct settings_panel* p = settings_panel_at(i);
-            kprintf("  %s%s — %s\n", p->name, p->open ? " (own window)" : "",
+            kprintf("  %s%s - %s\n", p->name, p->open ? " (own window)" : "",
                     p->summary ? p->summary : "");
         }
         kprintf("declared keys (%d):\n", config_key_count());

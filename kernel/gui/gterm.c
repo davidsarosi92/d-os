@@ -278,7 +278,7 @@ void term_selection_service(void) {
                 kfree(buf);
             }
         } else if (k->used) {
-            kprintf("gui: nothing selected — drag across the text first\n");
+            kprintf("gui: nothing selected - drag across the text first\n");
         }
     }
 
@@ -296,7 +296,7 @@ void term_selection_service(void) {
                 spin_unlock(&c->lock);
                 if (n > 0) {
                     clipboard_set_primary(buf, n);
-                    kprintf("gui: selected %d byte(s) — Ctrl+Shift+C to copy, "
+                    kprintf("gui: selected %d byte(s) - Ctrl+Shift+C to copy, "
                             "Ctrl+Shift+V or middle-click to paste\n", n);
                 }
                 kfree(buf);
@@ -396,7 +396,7 @@ void gui_term_check(void) {
     int target = base + 3;
     int onscreen = gterm_screen_row(win, target);
     const char* row = gterm_row(win, target);
-    kprintf("termcheck: line abs %d — on screen: %s, in history: %s\n",
+    kprintf("termcheck: line abs %d - on screen: %s, in history: %s\n",
             target, onscreen >= 0 ? "yes" : "no", row ? "yes" : "no");
 
     /* Select that whole line THROUGH THE SAME PATH the mouse uses, and copy. */
@@ -414,7 +414,7 @@ void gui_term_check(void) {
     spin_unlock(&win->lock);
 
     kprintf("termcheck: copied %d byte(s) from that line: \"%s\"\n", got, buf);
-    kprintf("termcheck: expected \"SBLINE 3\" — %s\n",
+    kprintf("termcheck: expected \"SBLINE 3\" - %s\n",
             (buf[0] == 'S' && buf[1] == 'B' && buf[7] == '3' && got == 8)
             ? "PASS (absolute addressing reaches history)"
             : "FAIL (the selection is not naming the line it was given)");

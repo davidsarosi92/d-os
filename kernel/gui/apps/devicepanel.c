@@ -145,7 +145,7 @@ static void dp_where(struct driver* d, char* out, int cap) {
     } else {
         n = put(out, cap, n, "kernel");
         if (driver_domain(d) == DOMAIN_USER)
-            n = put(out, cap, n, " (→ring 3 on restart)");
+            n = put(out, cap, n, " (->ring 3 on restart)");
     }
     (void)n;
 }
@@ -195,7 +195,7 @@ static int dm_get(void* ctx, int i, struct item_entry* out) {
      * decide whether this row needs attention: what it is, and whether
      * anything is driving it. */
     int n = put(dm_label, sizeof dm_label, 0, h->name);
-    n = put(dm_label, sizeof dm_label, n, " — ");
+    n = put(dm_label, sizeof dm_label, n, " - ");
     if (!h->online)   n = put(dm_label, sizeof dm_label, n, "not present");
     else if (!d)      n = put(dm_label, sizeof dm_label, n,
                              (h->is_pci &&
@@ -401,7 +401,7 @@ static void dm_refresh_detail(void) {
     int n = put(msg, sizeof msg, 0, h->name);
 
     if (!h->online) {
-        n = put(msg, sizeof msg, n, " — not present; the driver is here if it "
+        n = put(msg, sizeof msg, n, " - not present; the driver is here if it "
                                     "ever is");
         (void)n;
         w_label_set(dm_detail, msg);
@@ -412,15 +412,15 @@ static void dm_refresh_detail(void) {
          * than a state word. */
         if (h->is_pci && !hw_needs_driver(h->class_code, h->subclass))
             n = put(msg, sizeof msg, n,
-                    " — present; nothing drives it and nothing should");
+                    " - present; nothing drives it and nothing should");
         else
-            n = put(msg, sizeof msg, n, " — present, and nothing here drives it");
+            n = put(msg, sizeof msg, n, " - present, and nothing here drives it");
         (void)n;
         w_label_set(dm_detail, msg);
         return;
     }
 
-    n = put(msg, sizeof msg, n, " — driver ");
+    n = put(msg, sizeof msg, n, " - driver ");
     n = put(msg, sizeof msg, n, d->name);
     n = put(msg, sizeof msg, n, " v");
     n = put(msg, sizeof msg, n, d->version ? d->version : "?");
@@ -433,13 +433,13 @@ static void dm_refresh_detail(void) {
     if (d->flags & DRVF_DMA) {
         const char* why = domain_isolation_reason(1);
         if (why && drvuser_confined(d->name) == 0) {
-            n = put(msg, sizeof msg, n, " — DMA: ");
+            n = put(msg, sizeof msg, n, " - DMA: ");
             n = put(msg, sizeof msg, n, why);
         } else {
-            n = put(msg, sizeof msg, n, " — DMA, device confined");
+            n = put(msg, sizeof msg, n, " - DMA, device confined");
         }
     } else if (d->flags & DRVF_BOOT_CRITICAL) {
-        n = put(msg, sizeof msg, n, " — boot-critical, cannot be moved");
+        n = put(msg, sizeof msg, n, " - boot-critical, cannot be moved");
     }
     (void)n;
     w_label_set(dm_detail, msg);
@@ -498,7 +498,7 @@ static void act_update(struct w_button* b, void* ctx) {
     struct driver* d = dm_selected();
     if (!d) return;
     if (modload_reload(d->name) != 0)
-        kprintf("devices: '%s' is built into the kernel — nothing to reload\n",
+        kprintf("devices: '%s' is built into the kernel - nothing to reload\n",
                 d->name);
     dm_dirty = 1;
 }
@@ -656,7 +656,7 @@ void devices_cmd(const char* args) {
     while (args && *args == ' ') args++;
 
     if (args && *args && !dev_streq(args, "list")) {
-        kprintf("devices — the hardware in this machine, and what drives it\n");
+        kprintf("devices - the hardware in this machine, and what drives it\n");
         kprintf("usage: devices [list]\n");
         kprintf("(actions live on `drv`: start | stop | domain | crash)\n");
         return;
@@ -688,8 +688,8 @@ void devices_cmd(const char* args) {
             if (!!dm_hw[i].online != want_online) continue;
             if (!shown) {
                 kprintf("\n%s:\n", want_online
-                        ? "PRESENT — hardware this machine has"
-                        : "NOT PRESENT — hardware we could drive and have not got");
+                        ? "PRESENT - hardware this machine has"
+                        : "NOT PRESENT - hardware we could drive and have not got");
                 for (int c = 0; c < COL__COUNT; c++) {
                     /* The offline half has no bus address and no IDs, so its
                      * header does not pretend to. */

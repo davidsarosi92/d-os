@@ -246,7 +246,7 @@ static void lock_submit(struct w_textinput* t, void* ctx) {
          * widgets are built in the layout hook, which runs later on the host
          * task (§M61's "a window that never lays out looks exactly like an app
          * that ignored the event"), so a submit can genuinely arrive first. */
-        kprintf("lock: submit before the fields exist — ignored\n");
+        kprintf("lock: submit before the fields exist - ignored\n");
         return;
     }
     const struct user_account* who = lk_at(g_lock.picker->sel);
@@ -291,7 +291,7 @@ static void lock_closed(struct gui_window* w) {
     g_lock.pass = NULL;
     g_lock.status = NULL;
     if (!g_lock.unlocked) {
-        kprintf("lock: closed while still locked — raising it again\n");
+        kprintf("lock: closed while still locked - raising it again\n");
         gui_lock_raise();
     }
 }
@@ -328,7 +328,7 @@ static void lock_build(void) {
         /* Somebody else holds the single modal claim.  A non-modal look-alike
          * would be a picture of a lock with a live desktop behind it, which is
          * worse than refusing. */
-        kprintf("lock: another modal window holds the screen — refused\n");
+        kprintf("lock: another modal window holds the screen - refused\n");
         gui_window_close(win);
         g_lock.win = NULL;
         return;
@@ -353,7 +353,7 @@ int gui_lock_raise(void) {
         /* Nothing to authenticate against.  Locking here would leave a machine
          * nobody can get into — the same stranding §M32's account rules refuse
          * three other ways. */
-        kprintf("lock: no account can log in yet — refusing to lock\n");
+        kprintf("lock: no account can log in yet - refusing to lock\n");
         return -1;
     }
     gui_queue_open(lock_build);
@@ -439,7 +439,7 @@ void gui_lock_test(const char* creds) {
     for (; !g_lock.pass && waited < 60000; waited++)
         task_yield();
     if (!g_lock.pass) {
-        kprintf("locktest: the fields never appeared — the window was "
+        kprintf("locktest: the fields never appeared - the window was "
                 "created but never laid out\n");
         return;
     }
@@ -469,7 +469,7 @@ void gui_lock_test(const char* creds) {
     }
     w_textinput_set(g_lock.pass, p);
     lock_submit(g_lock.pass, NULL);
-    kprintf("locktest: result — %s\n",
+    kprintf("locktest: result - %s\n",
             g_lock.unlocked ? "UNLOCKED" : "still locked");
 }
 

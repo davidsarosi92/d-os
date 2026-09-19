@@ -639,7 +639,7 @@ static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
         send_keyboard_keymap(c);          /* before any key event can arrive */
 
     } else {
-        kprintf("wayland: object %u (iface %u) opcode %u — unhandled\n", obj, iface, op);
+        kprintf("wayland: object %u (iface %u) opcode %u - unhandled\n", obj, iface, op);
     }
     return 1;
 }
@@ -828,7 +828,7 @@ void wl_selftest(void) {
     }
     struct ofile* buf_of = buf ? ofile_from_shm(buf) : NULL;
 
-    kprintf("waytest: stage 2 — shm buffer -> surface commit (fill=%x)\n", COLOR);
+    kprintf("waytest: stage 2 - shm buffer -> surface commit (fill=%x)\n", COLOR);
     client_bind(cli, 1, "wl_compositor", 4, WLC_COMPOSITOR);
     client_bind(cli, 2, "wl_shm",        1, WLC_SHM);
     wl_conn_dispatch(&conn); wl_conn_dispatch(&conn);
@@ -859,7 +859,7 @@ void wl_selftest(void) {
     /* Stage 3 — give the surface an xdg_shell top-level role. -----------------
      * bind xdg_wm_base → get_xdg_surface(surface) → get_toplevel → the server
      * sends the initial configure pair → set_title → ack_configure. */
-    kprintf("waytest: stage 3 — xdg_shell top-level role\n");
+    kprintf("waytest: stage 3 - xdg_shell top-level role\n");
     client_bind(cli, 3, "xdg_wm_base", 2, WLC_XDG_WM_BASE);
     wl_conn_dispatch(&conn);
     { uint32_t a[] = { WLC_XDG_SURFACE, WLC_SURFACE };
@@ -1001,7 +1001,7 @@ void wl_input_demo(void) {
     if (usock_pair(&cli, &srv) != 0) { kprintf("wayinput: usock_pair failed\n"); return; }
     struct wl_conn conn;
     wl_conn_init(&conn, srv);
-    kprintf("wayinput: wl_seat — keyboard + pointer\n");
+    kprintf("wayinput: wl_seat - keyboard + pointer\n");
 
     client_send1(cli, WL_DISPLAY_REQ_GET_REGISTRY, WLC_REGISTRY);
     wl_conn_dispatch(&conn); client_drain(cli);

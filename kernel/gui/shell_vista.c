@@ -704,7 +704,7 @@ static const struct item_view* sm_view(void) {
     if (!v) v = item_view_by_name("list");
     if (!v && !moaned) {
         moaned = 1;
-        kprintf("vista: the 'list' item view is not registered — "
+        kprintf("vista: the 'list' item view is not registered - "
                 "the Start menu cannot be drawn\n");
     }
     return v;

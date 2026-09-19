@@ -776,7 +776,7 @@ void compose(void) {
         uint64_t now = timer_ticks_ms();
         if (!rep_next_ms) rep_next_ms = now + (unsigned)rep_every;
         else if (now >= rep_next_ms) {
-            kprintf("gui: %u frames in %u ms — %u us mean (%u kpx), "
+            kprintf("gui: %u frames in %u ms - %u us mean (%u kpx), "
                     "worst %u us over %u kpx in %u rect(s)\n",
                     rep_frames, (unsigned)rep_every,
                     rep_frames ? (unsigned)(rep_ns / rep_frames / 1000) : 0u,

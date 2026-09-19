@@ -289,8 +289,8 @@ void display_cmd(const char* args) {
     }
     int rc = display_set_mode(w, h, force);
     if (rc != 0) { kprintf("mode: refused (%d)\n", rc); return; }
-    if (force) kprintf("mode: %dx%d (forced — no confirmation)\n", w, h);
-    else       kprintf("mode: %dx%d — confirm within %ld s or it reverts "
+    if (force) kprintf("mode: %dx%d (forced - no confirmation)\n", w, h);
+    else       kprintf("mode: %dx%d - confirm within %ld s or it reverts "
                        "(`mode confirm` / `mode revert`)\n",
                        w, h, config_get_long("gui.mode_confirm_s", 15));
 }

@@ -180,7 +180,7 @@ static void ed_run(struct edapp* a) {
     int rc = dos_run_elf_cap("/tmp.run.elf", cap, cap ? 8192 : 0);
     if (cap) { show_output(cap); kfree(cap); }   /* w_editor_set_text copies it */
 
-    char st[48] = "compiled OK — ran, rc=";
+    char st[48] = "compiled OK - ran, rc=";
     int p = 22, v = rc < 0 ? -rc : rc;           /* small-int formatter */
     char tmp[12]; int d = 0;
     if (rc < 0) st[p++] = '-';

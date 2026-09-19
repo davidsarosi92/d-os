@@ -224,7 +224,7 @@ int shortcut_reload(void) {
      * worth copying from an existing caller (cmd_ls) rather than assuming. */
     while (vfs_readdir(d, &de) > 0) {
         if (list_n >= SHORTCUT_MAX) {
-            klog(KLOG_WARN, "gui", "shortcut: more than %d in %s — ignoring the rest\n",
+            klog(KLOG_WARN, "gui", "shortcut: more than %d in %s - ignoring the rest\n",
                  SHORTCUT_MAX, shortcut_dir());
             break;
         }
@@ -239,7 +239,7 @@ int shortcut_reload(void) {
         path[p] = '\0';
 
         if (read_lnk(path, &list[list_n]) == 0) list_n++;
-        else klog(KLOG_WARN, "gui", "shortcut: %s is malformed — skipped\n", path);
+        else klog(KLOG_WARN, "gui", "shortcut: %s is malformed - skipped\n", path);
     }
     vfs_close(d);
     return list_n;
@@ -506,7 +506,7 @@ void shortcut_cmd(const char* args) {
             kprintf("  %s  ->  %s  [%s]\n", list[i].name, list[i].target,
                     icon_name(list[i].icon));
         if (!list_n)
-            kprintf("  (none — `shortcut add <name> <target> [icon]`)\n");
+            kprintf("  (none - `shortcut add <name> <target> [icon]`)\n");
         kprintf("  targets: app:<name> | file:<path> | run:<cmd> | store:<pkg>\n");
         kprintf("  also: shortcut open <name> | move <name> <col> <row> "
                 "| check [view]\n");

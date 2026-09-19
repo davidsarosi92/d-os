@@ -592,7 +592,7 @@ void gui_theme_changed(void) {
     gui_damage_all();
     /* Quiet when there is no GUI: this watcher also fires at boot, when the
      * persistent store is overlaid and no window exists yet. */
-    if (n) kprintf("gui: theme change — %d window(s) invalidated\n", n);
+    if (n) kprintf("gui: theme change - %d window(s) invalidated\n", n);
 }
 
 
@@ -690,7 +690,7 @@ void gui_panel_set_popup(int on, int x, int y, int w, int h) {
         static int warned = 0;
         if (!warned) {
             warned = 1;
-            kprintf("gui: POPUP TOO TALL — its top row %d is above the panel "
+            kprintf("gui: POPUP TOO TALL - its top row %d is above the panel "
                     "strip at %d, so %d pixel(s) are being CLIPPED AWAY.  "
                     "Raise PANEL_POPUP_MAX (gui_priv.h).\n",
                     y, panel_strip_top, panel_strip_top - y);
@@ -982,7 +982,7 @@ void apply_pending(void) {
             win->host_task == NULL && win->client_pid > 0) {
             struct task* ct = task_find(win->client_pid);
             if (!ct || ct->state == TASK_DEAD) {
-                kprintf("gui: client-managed window '%s' orphaned (pid %d gone) — disposing\n",
+                kprintf("gui: client-managed window '%s' orphaned (pid %d gone) - disposing\n",
                         win->title, win->client_pid);
                 win->host_released = 1;   /* client gone; nothing to coordinate */
                 win->want_close    = 1;   /* teardown below disposes it */
@@ -1009,14 +1009,14 @@ void apply_pending(void) {
             } else if (close_forces_kill && !ct->kill_forced) {
                 uint64_t now = timer_ticks_ms();
                 if (win->close_force_now) {
-                    kprintf("gui: second close click on '%s' → force-killing "
+                    kprintf("gui: second close click on '%s' -> force-killing "
                             "client pid %d\n", win->title, win->client_pid);
                     task_force_kill(win->client_pid);
                 } else if (!win->close_deadline_ms) {
                     /* First pass: start the backstop and let the client quit. */
                     win->close_deadline_ms = now + close_grace_ms;
                 } else if (now >= win->close_deadline_ms) {
-                    kprintf("gui: '%s' did not close within %ums → force-killing "
+                    kprintf("gui: '%s' did not close within %ums -> force-killing "
                             "client pid %d\n", win->title, close_grace_ms,
                             win->client_pid);
                     task_force_kill(win->client_pid);
@@ -1213,7 +1213,7 @@ static void gui_compositor_main(void) {
         else if (config_get_long("gui.stats_ms", 0) > 0 &&
                  timer_now_ns() - gl_since > 5000000000ull) {
             uint64_t span = (timer_now_ns() - gl_since) / 1000000ull;
-            kprintf("compositor: %u loops in %u ms (%u/s) — %u %% composing, "
+            kprintf("compositor: %u loops in %u ms (%u/s) - %u %% composing, "
                     "%u %% in hlt, %u %% loop overhead\n",
                     (unsigned)gl_iters, (unsigned)span,
                     (unsigned)((uint64_t)gl_iters * 1000ull / (span ? span : 1)),
@@ -1421,7 +1421,7 @@ struct gui_window* gui_app_open(const struct gui_app_spec* sp) {
     if (!app_host_is_host_task(task_current())) {
         struct task* t = task_current();
         kprintf("gui: '%s' is being created on '%s' (pid %d), which runs no "
-                "app-host loop — it will never lay out or tick.  Open it "
+                "app-host loop - it will never lay out or tick.  Open it "
                 "through gui_queue_open().\n",
                 sp->title ? sp->title : "?", t ? t->name : "?", t ? t->pid : -1);
     }
@@ -1545,7 +1545,7 @@ static int gui_teardown(void) {
         for (int i = 0; i < 400 && task_find(dp); i++) task_msleep(5);
         if (task_find(dp))
             klog(KLOG_WARN, "gui", "desktop pid %d outlived the teardown "
-                                   "deadline — freeing anyway\n", dp);
+                                   "deadline - freeing anyway\n", dp);
     }
 
     /* 5. Windows.  Their hosts are dead, so nothing will run on_close on its
@@ -1612,7 +1612,7 @@ static void gui_autorun_main(void) {
      * nothing a human would notice. */
     task_msleep(300);
     if (gui_autorun_cmd && !shell_cmd_dispatch(gui_autorun_cmd))
-        kprintf("gui: autorun — unknown command '%s'\n", gui_autorun_cmd);
+        kprintf("gui: autorun - unknown command '%s'\n", gui_autorun_cmd);
 }
 
 CONFIG_KEY(ck_pageflip) = {
@@ -1695,13 +1695,13 @@ int gui_start(void) {
             if (fb_mode_set((uint32_t)w, (uint32_t)h, 32) == 0)
                 kprintf("gui: mode %dx%d (from gui.mode)\n", w, h);
             else
-                klog(KLOG_WARN, "gui", "gui.mode=%s refused by the display — "
+                klog(KLOG_WARN, "gui", "gui.mode=%s refused by the display - "
                                        "using the boot mode\n", m);
         }
     }
 
     if (gfx_fb_surface(&fbsurf) != 0) {
-        kprintf("gui: no 32-bpp framebuffer — GUI unavailable\n");
+        kprintf("gui: no 32-bpp framebuffer - GUI unavailable\n");
         return -1;
     }
     if (gfx_surface_init(&backsurf, fbsurf.w, fbsurf.h) != 0 ||
@@ -1744,11 +1744,11 @@ int gui_start(void) {
                 flip_ok = 1;
                 kprintf("gui: page-flip present enabled (Bochs-VBE double buffer)\n");
             } else {
-                kprintf("gui: page flip DISABLED by gui.page_flip — "
+                kprintf("gui: page flip DISABLED by gui.page_flip - "
                         "single-buffer present (may shear)\n");
             }
         } else {
-            kprintf("gui: no page flip — single-buffer present (may shear)\n");
+            kprintf("gui: no page flip - single-buffer present (may shear)\n");
         }
     }
 
@@ -1788,7 +1788,7 @@ int gui_start(void) {
                      COL_WALL_BOT);
             panel_ready = 1;
         } else {
-            kprintf("gui: panel surface OOM — taskbar disabled\n");
+            kprintf("gui: panel surface OOM - taskbar disabled\n");
         }
     }
 
@@ -1822,12 +1822,12 @@ int gui_start(void) {
          * the desktop), which is the "parent dies → children die" rule. */
         struct task* dt = task_spawn_detached("desktop", desktop_main);
         if (dt) desktop_pid = dt->pid;
-        else    kprintf("gui: desktop task spawn failed — taskbar static\n");
+        else    kprintf("gui: desktop task spawn failed - taskbar static\n");
     }
 
     int sess = desktop_pid > 0 ? desktop_pid : -1;   /* session parent, or caller */
     if (!task_spawn_under("compositor", gui_compositor_main, sess)) {
-        kprintf("gui: FATAL — compositor spawn failed\n");
+        kprintf("gui: FATAL - compositor spawn failed\n");
         vc_set_kbd_hook(NULL);
         vc_set_raw_kbd_hook(NULL);
         task_set_change_hook(NULL);
@@ -1843,7 +1843,7 @@ int gui_start(void) {
      * is a supported state — focus is simply NULL until one is opened. */
     gui_damage_all();
 
-    kprintf("gui: up — %dx%d, %d windows, shell '%s', %d apps registered\n",
+    kprintf("gui: up - %dx%d, %d windows, shell '%s', %d apps registered\n",
             fbsurf.w, fbsurf.h, zcount,
             shell ? shell->name : "none", gui_app_count());
 
@@ -1861,7 +1861,7 @@ int gui_start(void) {
      * to the thing that stands between a person and their desktop. */
     if (config_get_long("gui.login", 0)) {
         if (gui_lock_raise() != 0)
-            kprintf("gui: login was requested and could not be raised — the "
+            kprintf("gui: login was requested and could not be raised - the "
                     "desktop is UNLOCKED\n");
         /* And the instrument — on its OWN TASK, the same shape as autorun
          * below.  It waits for the lock's fields to be laid out, and waiting

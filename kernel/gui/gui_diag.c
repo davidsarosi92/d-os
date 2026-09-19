@@ -180,12 +180,12 @@ static void bench_open(void) {
 static void hosttest_layout(struct gui_window* win) {
     gui_window_clear_widgets(win);
     w_label_create(win, 8, 8, 200, "if you can read this, it laid out");
-    kprintf("hosttest: layout RAN — this window has a host after all\n");
+    kprintf("hosttest: layout RAN - this window has a host after all\n");
 }
 
 void gui_host_test(void) {
     if (!gui_is_active()) { kprintf("hosttest: the GUI is not running\n"); return; }
-    kprintf("hosttest: opening a window from '%s' — expect a warning\n",
+    kprintf("hosttest: opening a window from '%s' - expect a warning\n",
             task_current() ? task_current()->name : "?");
     struct gui_window* w = gui_app_open(&(struct gui_app_spec){
         .title = "hosttest",
@@ -199,7 +199,7 @@ void gui_host_test(void) {
     task_msleep(600);
     kprintf("hosttest: window is up, widgets = %s\n",
             w->widgets ? "PRESENT (check did not reproduce)"
-                       : "NONE — it never laid out, as warned");
+                       : "NONE - it never laid out, as warned");
     gui_window_close(w);
 }
 
@@ -258,7 +258,7 @@ static void slottest_open(void) {
             first ? "FILLED" : "EMPTY (the create did not take)");
     kprintf("slottest: reopen   -> %s\n",
             (again && again == first) ? "same window RAISED (no second built)"
-                                      : "A SECOND WINDOW — slot not honoured");
+                                      : "A SECOND WINDOW - slot not honoured");
 }
 
 void gui_slot_test(void) {
@@ -271,14 +271,14 @@ void gui_slot_test(void) {
     for (int i = 0; i < 100 && !slot_win; i++) task_msleep(20);
     if (!slot_win) { kprintf("slottest: no window appeared\n"); return; }
     kprintf("slottest: laid out -> %s\n",
-            slot_layouts ? "yes (it has a host)" : "NO — no host loop ran it");
+            slot_layouts ? "yes (it has a host)" : "NO - no host loop ran it");
 
     gui_window_close(slot_win);
     /* Poll rather than sleep a fixed time: a fixed wait that happened to be
      * long enough here would prove nothing about the next machine. */
     for (int i = 0; i < 100 && slot_win; i++) task_msleep(20);
     kprintf("slottest: close    -> slot %s\n",
-            slot_win ? "STILL SET — a later open would raise a dead window"
+            slot_win ? "STILL SET - a later open would raise a dead window"
                      : "CLEARED");
 }
 
@@ -313,7 +313,7 @@ static int au_widget_contract(int verbose) {
         const struct widget_class* c = ui_class_at(i);
         if (!c) continue;
         if (!c->create) {
-            kprintf("  class '%s' has no create fn — ui_build cannot make one\n",
+            kprintf("  class '%s' has no create fn - ui_build cannot make one\n",
                     c->name ? c->name : "(unnamed)");
             bad++;
             continue;
@@ -323,13 +323,13 @@ static int au_widget_contract(int verbose) {
              * class's ops at all unless somebody instantiates it, so an
              * undeclared class is a hole in the check rather than a style
              * lapse. */
-            kprintf("  class '%s' declares no ops table — its contract is "
+            kprintf("  class '%s' declares no ops table - its contract is "
                     "UNCHECKABLE\n", c->name);
             bad++;
             continue;
         }
         if (!c->ops->draw) {
-            kprintf("  class '%s' has no draw op — it is laid out, given space "
+            kprintf("  class '%s' has no draw op - it is laid out, given space "
                     "and hit-tested, and paints nothing\n", c->name);
             bad++;
         }
@@ -357,12 +357,12 @@ static int au_widget_contract(int verbose) {
      * The walk was wrong on its own terms, which is why it went whether or not
      * it was the cause.) */
     if (widget_uninited) {
-        kprintf("  %u widget(s) were added to a window WITHOUT widget_init — "
+        kprintf("  %u widget(s) were added to a window WITHOUT widget_init - "
                 "hand-rolled constructors (§M63)\n", widget_uninited);
         bad++;
     }
     if (widget_focus_traps) {
-        kprintf("  %u focusable widget(s) were built with no key handler — Tab "
+        kprintf("  %u focusable widget(s) were built with no key handler - Tab "
                 "lands on them and the keyboard stops\n", widget_focus_traps);
         bad++;
     }
@@ -437,7 +437,7 @@ static void ct_open(void) {
 void gui_contract_test(void) {
     if (!gui_is_active()) { kprintf("contracttest: the GUI is not running\n"); return; }
     ct_win = NULL;
-    kprintf("contracttest: a clean machine first —\n");
+    kprintf("contracttest: a clean machine first -\n");
     int before = audit_run_one("widget-contract", 0);
     kprintf("contracttest: %d violation(s) before\n", before);
 
@@ -447,7 +447,7 @@ void gui_contract_test(void) {
     task_msleep(400);                           /* let its host lay it out */
 
     int during = audit_run_one("widget-contract", 0);
-    kprintf("contracttest: %d violation(s) with the bad widgets up — %s\n",
+    kprintf("contracttest: %d violation(s) with the bad widgets up - %s\n",
             during, during > before ? "DETECTED"
                                     : "NOT DETECTED (the check is broken)");
 
@@ -458,7 +458,7 @@ void gui_contract_test(void) {
      * reports what this boot has seen — not what happens to be on screen when
      * somebody asks.  A live sample would answer "clean" for a window that had
      * already closed, which is how a defect gets closed as unreproducible. */
-    kprintf("contracttest: %d violation(s) after closing the window — the "
+    kprintf("contracttest: %d violation(s) after closing the window - the "
             "counters are a RECORD of this boot, not a live state\n",
             audit_run_one("widget-contract", 0));
 }
@@ -501,7 +501,7 @@ static int au_widget_threading(int verbose) {
 
 AUDIT(widget_threading) = {
     "widget-threading",
-    "every widget is created on the task that hosts its window (§M22.7)",
+    "every widget is created on the task that hosts its window (M22.7)",
     au_widget_threading
 };
 
@@ -544,12 +544,12 @@ void gui_thread_test(void) {
     w_label_create(th_win, 4, cp_px(40), 200, "made on the wrong task");
 
     int during = audit_run_one("widget-threading", 0);
-    kprintf("threadtest: %d violation(s) after the cross-task create — %s\n",
+    kprintf("threadtest: %d violation(s) after the cross-task create - %s\n",
             during, during > 0 ? "DETECTED"
                                : "NOT DETECTED (the check is broken)");
     gui_window_close(th_win);
     for (int i = 0; i < 100 && th_win; i++) task_msleep(20);
-    kprintf("threadtest: the counter does not reset — it is a record of what "
+    kprintf("threadtest: the counter does not reset - it is a record of what "
             "happened, not a live state\n");
 }
 
@@ -727,7 +727,7 @@ void gui_diag_service(void) {
         if (g_relay_report) {
             g_relay_report = 0;
             kprintf("relayout: %d window(s), %d widget(s) before, %d after "
-                    "%d re-layout(s) — %s\n",
+                    "%d re-layout(s) - %s\n",
                     g_relay_wins, g_relay_before, g_relay_after, g_relay_rounds,
                     g_relay_before == g_relay_after
                         ? "PASS (the set was replaced)"

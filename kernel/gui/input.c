@@ -271,8 +271,8 @@ void sak_close_top_app(void) {
     }
     if (target) target->want_close = 1;
     spin_unlock_irqrestore(&state_lock, fl);
-    if (target) kprintf("gui: Ctrl+Alt+X — closing top app '%s'\n", target->title);
-    else        kprintf("gui: Ctrl+Alt+X — no app window to close\n");
+    if (target) kprintf("gui: Ctrl+Alt+X - closing top app '%s'\n", target->title);
+    else        kprintf("gui: Ctrl+Alt+X - no app window to close\n");
 }
 /* M22.7 — the compositor no longer touches widgets: it drains the IRQ-fed
  * global queues and re-routes each event into the target window's per-window
@@ -780,7 +780,7 @@ drag_update:
             uint32_t cms = (uint32_t)((total_compose_ns - drag_compose0_ns) / 1000000ull);
             uint32_t kb  = (uint32_t)(((total_blit_px - drag_px0) * 4) / 1024);
             uint32_t fr  = (frames_full + frames_partial) - drag_f0;
-            kprintf("gui: drag %dx%d — %u motions, %u moved, %u frames "
+            kprintf("gui: drag %dx%d - %u motions, %u moved, %u frames "
                     "(%u copied, %u repainted), %u KB, %u ms in compose of "
                     "%u ms elapsed\n",
                     drag_win->w, drag_win->h, drag_motions, drag_frames,

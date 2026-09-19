@@ -274,7 +274,7 @@ static void dlg_build(void) {
         /* No window means no way to ask, so the answer is the safe one and it
          * is delivered immediately — a caller left waiting for a callback that
          * will never arrive is a hung feature, not a failed dialog. */
-        kprintf("dialog: no window available — answering CANCEL\n");
+        kprintf("dialog: no window available - answering CANCEL\n");
         dlg_closed(NULL);
         return;
     }
@@ -296,11 +296,11 @@ static void copy_into(char* dst, int cap, const char* src, const char* fallback)
 int gui_dialog_open(const struct gui_dialog_req* req) {
     if (!req) return -1;
     if (dlg.open) {
-        kprintf("dialog: refused — one is already open ('%s')\n", dlg.title);
+        kprintf("dialog: refused - one is already open ('%s')\n", dlg.title);
         return -1;
     }
     if (!gui_is_active()) {
-        kprintf("dialog: refused — no GUI session\n");
+        kprintf("dialog: refused - no GUI session\n");
         return -1;
     }
 
@@ -415,7 +415,7 @@ void dialog_command(const char* arg) {
         .on_answer = dlg_demo_answer,
     };
     if (gui_dialog_open(&r) == 0)
-        kprintf("dialog: open — Enter confirms, Esc cancels, clicks elsewhere "
+        kprintf("dialog: open - Enter confirms, Esc cancels, clicks elsewhere "
                 "are swallowed\n");
 }
 

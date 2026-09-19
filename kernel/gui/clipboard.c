@@ -335,7 +335,7 @@ void clipboard_cmd(const char* args) {
         n = clipboard_get_primary(buf, n + 1);
         clipboard_set(buf, n);
         kfree(buf);
-        kprintf("clip: primary → clipboard (%d bytes)\n", n);
+        kprintf("clip: primary -> clipboard (%d bytes)\n", n);
         return;
     }
 
