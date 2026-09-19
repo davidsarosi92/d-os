@@ -627,84 +627,89 @@ static void tm_tick(struct gui_window* win) {
         if (tm->charts[i]) w_chart_refresh(tm->charts[i]);
 }
 
+/* §M81 — COMPOSED.  The last hand-placed window with real structure, and the
+ * one that needed two capabilities the layout engine did not have.
+ *
+ * What it replaces is a function of pure arithmetic: `status_y = ch - cp_fh()
+ * - 6`, `btn_y = status_y - BTN_H - 4`, `charts_y = btn_y - 6 - CHART_H`, a
+ * chart strip whose widths were `(cw - gap * (N + 1)) / N`, and a table sized
+ * from whichever of those survived.  Each number encoded a decision the spec
+ * below states instead.
+ *
+ * THE TWO NEW FLAGS ARE BOTH HERE, and both came from this window:
+ *
+ *   UI_EDGE       the table and the footer are PANES.  The design's table is
+ *                 not a box floating in a margin, and the footer is a
+ *                 full-width `tray` strip with a rule above it — a margin turns
+ *                 that into a floating bar.
+ *   UI_DROP_TIGHT the chart strip goes entirely when the window is too short,
+ *                 rather than being squeezed: *a chart below some height is a
+ *                 box with a header and no room for a line, which reads as a
+ *                 broken control, while its absence reads as a small window.*
+ *                 The old code did this by hand and parked the charts at
+ *                 x = -10000, because "this toolkit has no visibility flag".
+ *                 Now it has one that means what it says.
+ *
+ * The widgets are re-fetched after every build: `ui_build` REBUILDS (§M81), so
+ * the pointers the tick and the refresh use are only valid until the next
+ * layout.  That is the same contract every composed panel here follows. */
+enum {
+    TM_ID_TABLE = 1, TM_ID_CHARTS, TM_ID_ROW, TM_ID_END, TM_ID_FKILL,
+    TM_ID_STATUS, TM_ID_CHART0,     /* …CHART0 + SYSMON_NSERIES - 1 */
+};
+
+static void tm_ui_event(struct gui_window* win, int id, int type, int value,
+                        void* ctx) {
+    (void)win; (void)value;
+    struct taskman* tm = (struct taskman*)ctx;
+    if (type != UI_EV_CLICK) return;
+    if (id == TM_ID_END)   tm_kill(NULL, tm);
+    if (id == TM_ID_FKILL) tm_kill_force(NULL, tm);
+}
+
 static void tm_layout(struct gui_window* win) {
     struct taskman* tm = (struct taskman*)gui_window_ctx(win);
-    if (!tm || !tm->iv) return;
-    int cw, ch;
-    gui_window_content_size(win, &cw, &ch);
-    /* Bottom band, top → bottom: [ button row ][ status footer ].
-     * The table fills the rest — and it draws its OWN column header now, so
-     * there is no separate header label to leave room for. */
-    /* DERIVED FROM THE FONT.  These were 18 and 100 — one glyph-height plus
-     * padding, and twelve 8 px characters — so at `gui.font_scale` 2 the label
-     * was wider than its button and got clipped at BOTH ends ("nd tas" for
-     * "End task").  The widest label decides the width; a button sized for a
-     * text size it no longer has is a button with the text cut out of it.
-     *
-     * NOTE FOR THE NEXT APP: the constructor's sizes do not survive — this
-     * function overwrites them on every layout, which is why fixing
-     * w_button_create alone changed nothing. */
-    /* A button is `control_h` tall, like every other control in the design —
-     * not glyph-plus-padding.  Same argument as the row height. */
-    const int BTN_H = cp_current_density()->control_h;
-    const int BTN_W = 11 * cp_fw() + 12;        /* "Force kill" + padding */
-    const int GAP   = 8;
-    int status_y = ch - cp_fh() - 6;
-    int btn_y    = status_y - BTN_H - 4;
+    if (!tm) return;
 
-    /* §M75 — the chart strip sits between the table and the button row: four
-     * of them side by side, the design's §06 layout.
-     *
-     * IT IS DROPPED ENTIRELY WHEN THE WINDOW IS SHORT, rather than squeezed.
-     * A chart below some height is a box with a header in it and no room for
-     * a line — which reads as a broken control, while its absence reads as a
-     * small window.  Same rule the toolbar follows when it drops a button off
-     * the right: half a control is worse than none (§4.85.7). */
-    const int CHART_H = cp_px(70);
-    int charts_y = 0;
-    int have_charts = (btn_y - 6 - CHART_H) > cp_row_h() * 4;
-    if (have_charts) {
-        charts_y = btn_y - 6 - CHART_H;
-        int gap = cp_px(4);
-        int cwid = (cw - gap * (SYSMON_NSERIES + 1)) / SYSMON_NSERIES;
-        for (int i = 0; i < SYSMON_NSERIES; i++) {
-            if (!tm->charts[i]) continue;
-            tm->charts[i]->x = gap + i * (cwid + gap);
-            tm->charts[i]->y = charts_y;
-            tm->charts[i]->w = cwid;
-            tm->charts[i]->h = CHART_H;
-        }
-    } else {
-        /* Off-screen rather than hidden: this toolkit has no visibility flag,
-         * and a widget parked outside the content box is clipped away by
-         * `widget_draw_all` without a special case anywhere. */
-        for (int i = 0; i < SYSMON_NSERIES; i++)
-            if (tm->charts[i]) { tm->charts[i]->x = -10000; tm->charts[i]->w = 1; }
+    struct ui_spec spec[8 + SYSMON_NSERIES];
+    int n = 0;
+    spec[n++] = (struct ui_spec){ .id = TM_ID_TABLE, .cls = "view",
+        .text = "table", .weight = 1, .flags = UI_EDGE | UI_FOCUSABLE };
+    spec[n++] = (struct ui_spec){ .id = TM_ID_CHARTS, .cls = "box",
+        .flags = UI_ROW | UI_FILL_W | UI_DROP_TIGHT };
+    for (int i = 0; i < SYSMON_NSERIES; i++)
+        spec[n++] = (struct ui_spec){ .id = TM_ID_CHART0 + i,
+            .parent = TM_ID_CHARTS, .cls = "chart", .value = i,
+            .weight = 1, .flags = UI_FILL_W };
+    spec[n++] = (struct ui_spec){ .id = TM_ID_ROW, .cls = "box",
+        .flags = UI_ROW | UI_FILL_W };
+    spec[n++] = (struct ui_spec){ .id = TM_ID_END, .parent = TM_ID_ROW,
+        .cls = "button", .text = "End task" };
+    spec[n++] = (struct ui_spec){ .id = TM_ID_FKILL, .parent = TM_ID_ROW,
+        .cls = "button", .text = "Force kill" };
+    spec[n++] = (struct ui_spec){ .id = TM_ID_STATUS, .cls = "label",
+        .flags = UI_EDGE };
+
+    ui_build(win, spec, n, tm_ui_event, tm);
+
+    tm->iv        = (struct w_itemview*)ui_by_id(win, TM_ID_TABLE);
+    tm->btn_end   = (struct w_button*)  ui_by_id(win, TM_ID_END);
+    tm->btn_fkill = (struct w_button*)  ui_by_id(win, TM_ID_FKILL);
+    tm->status    = (struct w_label*)   ui_by_id(win, TM_ID_STATUS);
+    for (int i = 0; i < SYSMON_NSERIES; i++)
+        tm->charts[i] = ui_by_id(win, TM_ID_CHART0 + i);
+
+    if (tm->iv) {
+        w_itemview_set_model(&tm->iv->base, &tm->model, tm);
+        tm->iv->sel = -1;
     }
-    /* THE TABLE STARTS AT THE TOP EDGE AND RUNS TO BOTH SIDES.  The design's
-     * table is a pane, not a box floating in a margin, and giving it the full
-     * width is half of fixing "the right 40 % is empty" — the other half is the
-     * columns themselves, which now share that width. */
-    tm->iv->base.x = 0;   tm->iv->base.y = 0;
-    tm->iv->base.w = cw;
-    tm->iv->base.h = have_charts ? (charts_y - 6) : (btn_y - 6);
-    if (tm->iv->base.h < cp_row_h() * 2) tm->iv->base.h = cp_row_h() * 2;
-    /* A resize changes how many slots there are, so the cached signature stops
-     * describing the pane; the widget notices and takes its whole-pane branch. */
-    tm->iv->sig_valid = 0;
-    /* Two action buttons below the list: End task (cooperative) + Force kill. */
-    if (tm->btn_end) {
-        tm->btn_end->base.x = 8;              tm->btn_end->base.y = btn_y;
-        tm->btn_end->base.w = BTN_W;          tm->btn_end->base.h = BTN_H;
-    }
-    if (tm->btn_fkill) {
-        tm->btn_fkill->base.x = 8 + BTN_W + GAP; tm->btn_fkill->base.y = btn_y;
-        tm->btn_fkill->base.w = BTN_W;           tm->btn_fkill->base.h = BTN_H;
-    }
-    /* The footer band, as the catalogue draws it: a full-width `tray` strip
-     * with a rule above and the summary in caption style. */
-    tm->status->base.x = 0;  tm->status->base.y = status_y;
-    tm->status->base.w = cw;  tm->status->base.h = cp_fh() + 6;
+    if (tm->status) w_label_set_caption(tm->status, 2);   /* 2 = footer */
+    /* The action this window exists for carries the accent; the escalation
+     * beside it stays a plate.  The catalogue's dialog does exactly this with
+     * "Formázás" (primary) next to "Mégse" (secondary). */
+    if (tm->btn_end) w_button_set_emphasis(tm->btn_end, CP_BTN_PRIMARY);
+
+    tm_refresh(win);
 }
 
 static void taskman_open(void) {
@@ -738,51 +743,18 @@ static void taskman_open(void) {
     tm->model.col_title = tm_m_col_title;
     tm->model.cell      = tm_m_cell;
     tm->model.col_style = tm_m_col_style;
-    tm->iv = w_itemview_create(win, 0, 0, 100, 100, &tm->model, "table", tm);
 
-    /* Two action buttons below the list (positioned by tm_layout): the
-     * cooperative "End task" and the §M46 "Force kill" hammer. */
-    /* The action this window exists for gets the accent; the escalation next
-     * to it stays a plate.  The design's dialog does exactly this with
-     * "Formázás" and "Mégse". */
-    tm->btn_end   = w_button_create(win, 8, 19 * cp_fh() + 14,
-                                    10 * cp_fw() + 8, cp_fh() + 8, "End task",
-                                    tm_kill, tm);
-    tm->btn_fkill = w_button_create(win, 12 * cp_fw() + 16, 19 * cp_fh() + 14,
-                                    12 * cp_fw() + 8, cp_fh() + 8, "Force kill",
-                                    tm_kill_force, tm);
-    /* §M75 — the four charts, created THROUGH THE REGISTRY by name.
+    /* §M81 — THE WIDGETS ARE THE LAYOUT'S NOW, not this function's.
      *
-     * `ui_class_find("chart")` rather than a direct call into w_chart.c: that
-     * is what makes the class swappable and what makes a missing one a
-     * reported absence instead of a link error.  The same route the settings
-     * panel uses for every control it renders (§M65). */
-    {
-        const struct widget_class* cc = ui_class_find("chart");
-        for (int i = 0; i < SYSMON_NSERIES; i++) {
-            if (!cc || !cc->create) { tm->charts[i] = NULL; continue; }
-            struct ui_spec sp = (struct ui_spec){ .cls = "chart", .value = i };
-            tm->charts[i] = cc->create(win, &sp);
-        }
-        /* NOT a reason to refuse to open.  A task manager with no charts is
-         * still the window you go to when something is wrong, and failing to
-         * open it because a decoration could not be built would be the worst
-         * possible trade (§M46's argument for chrome that survives a wedged
-         * app).  The layout already copes: a NULL chart is simply skipped. */
-        if (!cc) kprintf("taskman: no 'chart' widget class — charts omitted\n");
-    }
-
-    tm->status = w_label_create(win, 0, 0, 900, "");
-    if (tm->status) w_label_set_caption(tm->status, 2);   /* 2 = footer */
-    /* The action this window exists for carries the accent; the escalation
-     * beside it stays a plate.  The catalogue's dialog does exactly this with
-     * "Formázás" (primary) next to "Mégse" (secondary). */
-    if (tm->btn_end) w_button_set_emphasis(tm->btn_end, CP_BTN_PRIMARY);
-    if (!tm->iv || !tm->status || !tm->btn_end || !tm->btn_fkill) {
-        gui_window_close(win); return;
-    }
-    tm->iv->sel = -1;
-
+     * They used to be built here and merely REPOSITIONED by `tm_layout`, which
+     * is the other thing `on_layout` means in this tree — and it is why the old
+     * layout had to write `base.x`/`base.w` into six widgets by hand.  A
+     * composed window builds in its layout hook, so a resize rebuilds and the
+     * spec is the only description of the window that exists.
+     *
+     * Nothing is checked for NULL here any more either: a missing widget used
+     * to close the window, and with the toolkit building them the honest
+     * failure is `ui_build` reporting the class it could not find. */
     gui_window_set_tick(win, tm_tick);
     tm_layout(win);
     tm_refresh(win);

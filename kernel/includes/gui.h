@@ -385,6 +385,10 @@ void gui_window_add_widget(struct gui_window* win, struct widget* w);
  * `host_task`, so there is no host to be wrong about), or the window is still
  * being constructed.  0 means a real violation. */
 int gui_window_hosted_by_current(struct gui_window* win);
+/* §M81 — does this window have an app-host at all?  A client-managed one
+ * (dosgui/Wayland) deliberately has none, and the difference decides who owes
+ * it a repaint. */
+int gui_window_hosted(struct gui_window* win);
 /* Who does host it — for the report.  "(none)" for a client-managed window. */
 const char* gui_window_host_name(struct gui_window* win);
 

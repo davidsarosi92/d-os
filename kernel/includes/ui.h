@@ -94,6 +94,43 @@ struct gfx_surface;
  * as if they worked. */
 #define UI_ALIGN_END    0x0100
 
+/* §M81 — child: DROP ME IF THERE IS NO ROOM, rather than be squeezed.
+ *
+ * `UI_HIDE_COMPACT` above drops on the SIZE CLASS, which is a fact about the
+ * window's WIDTH.  This is about the height actually left over, and they are
+ * different questions: a window can be wide and short.
+ *
+ * The client is the Task Manager's chart strip, and its own comment is the
+ * argument: *"a chart below some height is a box with a header in it and no
+ * room for a line — which reads as a broken control, while its absence reads as
+ * a small window."*  Same rule the file manager's toolbar follows when it drops
+ * a button off the right instead of overlapping: **half a control is worse than
+ * none** (§4.85.7).
+ *
+ * HONOURED AT THE WINDOW'S TOP LEVEL ONLY, and that is a real limit rather than
+ * an oversight: a nested container does not know its own height until its
+ * parent arranges it, which is after measuring — so a flag honoured there would
+ * have to guess.  "Drop it if the window is too short" is a decision about the
+ * window, which is where it is taken.  Children are dropped LAST-DECLARED
+ * FIRST, so the order in the spec is the order they are given up. */
+#define UI_DROP_TIGHT   0x0200
+
+/* §M81 — child: I RUN TO THE CONTENT'S EDGE, ignoring the window's inset.
+ *
+ * The layout engine insets every top-level child by `UI_PAD`, which is right
+ * for a form and wrong for a PANE.  The Task Manager's table says so in its own
+ * comment — *"the design's table is a pane, not a box floating in a margin"* —
+ * and the footer band is the same: a full-width `tray` strip with a rule above
+ * it, which a margin turns into a floating bar.
+ *
+ * WHAT IT AFFECTS, precisely, because a flag that quietly means four things is
+ * worse than four flags: the CROSS axis always (x = 0, width = the full
+ * content), and the MAIN axis only at the ends — the top inset is dropped if
+ * the FIRST top-level child carries it, the bottom inset if the LAST one does.
+ * A middle child cannot reach the top of the window without going through the
+ * children above it, so there is nothing sensible for the flag to mean there. */
+#define UI_EDGE         0x0400
+
 struct ui_spec {
     int         id;         /* app-assigned, unique in the window; 0 = none  */
     int         parent;     /* container id; 0 = the window root             */

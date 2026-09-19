@@ -353,14 +353,45 @@ static void measure_children(struct ui_state* st, int idx, int avail_w,
     if (row && (nd->flags & UI_WRAP_COMPACT) && size_class == UI_SIZE_COMPACT)
         row = 0;
 
-    int main = 0, cross = 0, nvis = 0;
+    /* §M81 — A ROW MEASURES EACH CHILD AGAINST ITS SHARE, NOT THE WHOLE WIDTH.
+     *
+     * This line read `row ? avail_w : avail_w` — the third instance in this
+     * engine of the tell §M69 named in `arrange_grid` (`even ? w : w`): *both
+     * arms the same, which is how a line says it was meant to distinguish two
+     * cases and never did.*  The comment beside it said "refined during
+     * arrange", and arrange cannot refine a measurement that has already been
+     * taken.
+     *
+     * It was harmless while every child of a row measured itself from its own
+     * CONTENT — a button is `cp_text_w(label) + padding` whatever it is
+     * offered.  It stopped being harmless the moment a class answered `*pref_w
+     * = avail_w`, which is exactly what a CHART does and says why: *"wide by
+     * preference — four of these sit in a row under a table."*  Four of them
+     * each asked for the whole row, the row measured 2586 px inside 642, and
+     * three charts were laid out off the end of the window.
+     *
+     * A share, counted first: the children have to be counted before any of
+     * them can be measured, which is why this is two passes over the same
+     * list rather than one. */
+    int nkids = 0;
     for (int i = 0; i < st->count; i++) {
         if (st->n[i].parent != nd->id) continue;
         struct ui_node* c = &st->n[i];
         c->hidden = (c->flags & UI_HIDE_COMPACT) && size_class == UI_SIZE_COMPACT;
+        if (!c->hidden) nkids++;
+    }
+    int share = avail_w;
+    if (row && nkids > 1) {
+        share = (avail_w - UI_GAP * (nkids - 1)) / nkids;
+        if (share < cp_fw() * 2) share = cp_fw() * 2;
+    }
+
+    int main = 0, cross = 0, nvis = 0;
+    for (int i = 0; i < st->count; i++) {
+        if (st->n[i].parent != nd->id) continue;
+        struct ui_node* c = &st->n[i];
         if (c->hidden) continue;
-        int child_avail = row ? avail_w : avail_w;   /* refined during arrange */
-        measure_node(st, i, child_avail, size_class);
+        measure_node(st, i, share, size_class);
         nvis++;
         if (row) {
             main  += c->pref_w;
@@ -627,7 +658,25 @@ static int ui_layout_pass(struct gui_window* win, int do_measure) {
 
     st->clip_x = st->clip_y = st->clip_w = st->clip_h = 0;   /* no clip at the root */
     int sc = ui_size_class_for(cw);
-    int inner_w = cw - 2 * UI_PAD, inner_h = ch - 2 * UI_PAD;
+    int inner_w = cw - 2 * UI_PAD;
+
+    /* §M81 — UI_EDGE at the ENDS drops the window's inset there.  Decided
+     * before anything is measured, because `inner_h` is what the measure pass
+     * is budgeting against. */
+    int first_edge = 0, last_edge = 0;
+    {
+        int first = -1, last = -1;
+        for (int i = 0; i < st->count; i++) {
+            if (st->n[i].parent != 0) continue;
+            if (first < 0) first = i;
+            last = i;
+        }
+        if (first >= 0) first_edge = (st->n[first].flags & UI_EDGE) != 0;
+        if (last  >= 0) last_edge  = (st->n[last].flags  & UI_EDGE) != 0;
+    }
+    int pad_top = first_edge ? 0 : UI_PAD;
+    int pad_bot = last_edge  ? 0 : UI_PAD;
+    int inner_h = ch - pad_top - pad_bot;
 
     /* Root nodes are the ones whose parent id names no node — measured and
      * arranged as if they were children of one implicit column. */
@@ -648,13 +697,55 @@ static int ui_layout_pass(struct gui_window* win, int do_measure) {
     }
     if (nvis > 1) main += UI_GAP * (nvis - 1);
 
+    /* §M81 — UI_DROP_TIGHT: give up the droppable children, last declared
+     * first, until the rest fit.  Done BEFORE the slack is computed, so a
+     * dropped child returns its height to whatever is left rather than merely
+     * disappearing.  Top level only; see ui.h. */
+    if (main > inner_h) {
+        for (int i = st->count - 1; i >= 0 && main > inner_h; i--) {
+            struct ui_node* c = &st->n[i];
+            if (c->parent != 0 || c->hidden) continue;
+            if (!(c->flags & UI_DROP_TIGHT)) continue;
+            c->hidden = 1;
+            main -= c->pref_h + (nvis > 1 ? UI_GAP : 0);
+            nvis--;
+        }
+    }
+
+    /* A HIDDEN CONTAINER TAKES ITS CHILDREN WITH IT.  `arrange` skips a hidden
+     * node entirely, so its children are never re-placed and keep the
+     * coordinates they had at the previous size — which happened to be off the
+     * bottom of a shrunken window, i.e. invisible BY LUCK rather than by
+     * design.  The next resize in the other direction would have put them back
+     * on screen inside a container that is not there.
+     *
+     * `ui_build` requires a parent to be declared before its children, so one
+     * forward pass propagates. */
+    for (int i = 0; i < st->count; i++) {
+        if (st->n[i].hidden || st->n[i].parent == 0) continue;
+        for (int p = 0; p < i; p++)
+            if (st->n[p].id == st->n[i].parent && st->n[p].hidden) {
+                st->n[i].hidden = 1;
+                break;
+            }
+    }
+    /* …and a hidden widget is parked OFF-SURFACE, because nothing below will
+     * visit it: the same trick `place_widget` uses, applied where arrange
+     * cannot reach.  Off-surface rather than zero-sized, since the M22 controls
+     * do not clip themselves and a zero-width one still draws its text. */
+    for (int i = 0; i < st->count; i++) {
+        if (!st->n[i].hidden || !st->n[i].w) continue;
+        st->n[i].w->x = -10000; st->n[i].w->y = -10000;
+        st->n[i].w->w = 1;      st->n[i].w->h = 1;
+    }
+
     int space = inner_h - main;
     if (space < 0) space = 0;
     int weight_sum = 0;
     for (int i = 0; i < st->count; i++)
         if (st->n[i].parent == 0 && !st->n[i].hidden) weight_sum += st->n[i].weight;
 
-    int cur = UI_PAD, used = 0, seen = 0;
+    int cur = pad_top, used = 0, seen = 0;
     for (int i = 0; i < st->count; i++) {
         if (st->n[i].parent != 0 || st->n[i].hidden) continue;
         struct ui_node* c = &st->n[i];
@@ -673,10 +764,14 @@ static int ui_layout_pass(struct gui_window* win, int do_measure) {
          * grid had the same bug twice (its stacked and unstacked branches), so
          * the layout engine stretched controls on all three of its paths and
          * no caller could opt out anywhere. */
-        int wid = (c->flags & UI_FILL_W)
-                      ? inner_w
-                      : (c->pref_w < inner_w ? c->pref_w : inner_w);
-        arrange_node(st, i, UI_PAD, cur, wid, hgt, sc);
+        /* UI_EDGE takes the whole content width from x = 0; everything else
+         * lives inside the window's inset. */
+        int edge = (c->flags & UI_EDGE) != 0;
+        int avail = edge ? cw : inner_w;
+        int wid = (c->flags & (UI_FILL_W | UI_EDGE))
+                      ? avail
+                      : (c->pref_w < avail ? c->pref_w : avail);
+        arrange_node(st, i, edge ? 0 : UI_PAD, cur, wid, hgt, sc);
         cur += hgt + UI_GAP;
     }
     return 1;
@@ -781,18 +876,22 @@ int ui_build(struct gui_window* win, const struct ui_spec* specs, int n,
      * raised ("is that label inside the viewport?") is one line of numbers. */
     if (config_get_long("gui.ui_debug", 0)) ui_dump(win);
 
-    /* ASK FOR A PAINT, NOT A LAYOUT — and the difference is a hang.
+    /* §M81 — AND ONLY WHEN NOBODY ELSE WILL.  A HOSTED window is repainted by
+     * its app-host after every layout (app_host.c: *"a layout still repaints
+     * everything — it MOVES widgets, so the vacated pixels are stale"*), and
+     * `ui_build` is called either FROM that layout hook or from an open fn that
+     * the host's first layout pass follows.  Either way the repaint below is a
+     * second one.
      *
-     * This said `gui_window_request_layout`, which sets `layout_pending` and
-     * makes the host call `on_layout` AGAIN.  For a window whose `on_layout` IS
-     * the builder — the natural way to write a composed app — that is an
-     * infinite loop: build, ask for a layout, build, ask for a layout.  It went
-     * unnoticed because the two existing composers return early on their second
-     * entry, so their loop stopped after one extra pass.
+     * MEASURED, which is why it is here at all: converting the Task Manager
+     * took its full-window repaints from **0 to 3** under a driven pointer
+     * sweep — 22 ms of compositing for frames nothing needed.  §M69 spent a
+     * milestone removing exactly those, and a composition tree quietly adding
+     * them back is the risk §M81's own plan named.
      *
-     * `ui_layout` has just run, three lines up.  There is nothing left to lay
-     * out; what is left is to show it. */
-    gui_window_request_redraw(win);
+     * A HOSTLESS window (a ring-3 client's, §M54) has nobody to do it, so it
+     * still gets the request. */
+    if (!gui_window_hosted(win)) gui_window_request_redraw(win);
     return built;
 }
 
