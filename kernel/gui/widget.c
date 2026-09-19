@@ -123,6 +123,11 @@ struct widget* widget_at(struct widget* head, int lx, int ly) {
  * NOT refused, only reported: refusing would turn a rendering bug into a
  * missing control, and §M71 rule 4 says an audit does not fix what it finds. */
 unsigned widget_cross_task;
+/* §M81 — the other two observations, recorded where they HAPPEN rather than by
+ * an audit walking live windows.  See gui_window_add_widget for why that walk
+ * was removed: it was itself a cross-task read of a list the host rebuilds. */
+unsigned widget_uninited;
+unsigned widget_focus_traps;
 static const char* wx_last_from = "(none)";
 static const char* wx_last_host = "(none)";
 
@@ -157,6 +162,16 @@ void widget_init(struct widget* w, struct gui_window* win,
     w->clip_x = w->clip_y = w->clip_w = w->clip_h = 0;   /* §M65: unrestricted */
     w->next = NULL;
     w->inited = WIDGET_INITED;          /* §M81 — see widget.h */
+    /* FOCUSABLE AND DEAF: Tab cycles focus through this widget and then the
+     * keyboard does nothing, with nothing on screen to say why.  The silent
+     * half of widget.h's contract, observed at construction because that is
+     * when both facts are in hand. */
+    if (focusable && ops && !ops->key && !ops->keycode) {
+        if (widget_focus_traps++ == 0)
+            kprintf("gui: a FOCUSABLE widget was built with no key handler — "
+                    "Tab will land on it and the keyboard will stop there "
+                    "(see widget.h's contract)\n");
+    }
     gui_window_add_widget(win, w);
 }
 

@@ -548,6 +548,12 @@ struct w_itemview {
      * re-layout can be noticed.  See iv_cols_moved in w_itemview.c. */
     int colx[8], colw[8];
 };
+/* §M81 — attach a model to a `view` built by `ui_build`.  The spec carries the
+ * LAYOUT's name and cannot carry the model, because a spec is data and a model
+ * is a pointer (§M65) — so the owner does this once after building. */
+void w_itemview_set_model(struct widget* w, const struct item_model* m,
+                          void* ctx);
+
 struct w_itemview* w_itemview_create(struct gui_window* win, int x, int y,
                                      int w, int h,
                                      const struct item_model* model,
@@ -578,6 +584,11 @@ void widget_init(struct widget* w, struct gui_window* win,
  * window (§M22.7), and the last pair of names.  Read by
  * `audit widget-threading`; see widget.c. */
 extern unsigned widget_cross_task;
+/* Widgets added to a window without `widget_init` (a hand-rolled constructor),
+ * and focusable widgets built with no key handler.  Both recorded where they
+ * happen; see widget.c. */
+extern unsigned widget_uninited;
+extern unsigned widget_focus_traps;
 void widget_threading_last(const char** from, const char** host);
 
 void widget_draw_all(struct widget* head, struct gfx_surface* s);

@@ -260,8 +260,24 @@ const char* gui_window_host_name(struct gui_window* win) {
     return win->host_task->name;
 }
 
+/* §M81 — CAUGHT AT THE DOOR, not by walking the room later.
+ *
+ * `widget_init` stamps `inited` and THEN calls this, so a widget arriving here
+ * unstamped was assembled by hand — the §M63 constructor defect.  Checking it
+ * here rather than by walking live windows from an audit matters for a reason
+ * the audit itself got wrong first: *walking another task's widget list is
+ * exactly the §M22.7 violation the neighbouring audit checks for*, and the
+ * list is rebuilt wholesale on the host at every layout.  A check that has to
+ * break a rule to observe it is not a check. */
 void gui_window_add_widget(struct gui_window* win, struct widget* w) {
     if (!win || win->kind != WIN_APP || !w) return;
+    if (w->inited != WIDGET_INITED) {
+        if (widget_uninited++ == 0)
+            kprintf("gui: a widget was added to '%s' WITHOUT widget_init — its "
+                    "base fields were assembled by hand, which is how keyboard "
+                    "navigation silently never worked in an item view (§M63)\n",
+                    win->title);
+    }
     struct widget** p = &win->widgets;
     while (*p) p = &(*p)->next;
     *p = w;

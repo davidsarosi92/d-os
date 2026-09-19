@@ -29,6 +29,7 @@
 #include "console_plate.h"
 #include "scrollbar.h"
 #include "gui.h"
+#include "gui_priv.h"       /* §M81 — app_widgets_reset, for the rebuild */
 #include "gui_internal.h"   /* gui_wm_focused — "this panel" means the focused one */
 #include "gfx.h"
 #include "kmalloc.h"
@@ -695,6 +696,30 @@ int ui_build(struct gui_window* win, const struct ui_spec* specs, int n,
         if (!st) return 0;
         gui_window_set_ui(win, st);
     }
+
+    /* §M81 — BUILDING AGAIN REBUILDS.  It used to APPEND, and ui.h carried a
+     * convention to work around that: *"build once, layout many — use
+     * ui_node_count() to tell the two calls apart and call ui_layout() for the
+     * second."*  Both existing composers honour it and the third one written
+     * (the accounts panel) did not, which is what a convention is: a rule the
+     * compiler cannot state.
+     *
+     * The symptom was not a second copy of the controls.  `on_layout` fires,
+     * the builder calls `ui_build`, and the node table grows by eight — until
+     * at 64 it is FULL, every further build produces NOTHING, and the window is
+     * simply EMPTY.  Worse, the stale entries still point at widgets
+     * `gui_window_clear_widgets` has already freed, so the layout walks freed
+     * memory.
+     *
+     * Clearing both halves together is the only safe order: the node table
+     * holds widget pointers, so dropping the widgets without dropping the nodes
+     * is precisely the dangling state above. */
+    if (st->count) {
+        app_widgets_reset(win);         /* frees the widgets */
+        st->count = 0;                  /* …and the nodes that referred to them */
+        st->popup_src = NULL;
+    }
+
     st->on_event = on_event;
     st->ctx = ctx;
 
@@ -756,11 +781,18 @@ int ui_build(struct gui_window* win, const struct ui_spec* specs, int n,
      * raised ("is that label inside the viewport?") is one line of numbers. */
     if (config_get_long("gui.ui_debug", 0)) ui_dump(win);
 
-    /* Ask for a paint.  On an app-host window the host does it; on a hostless
-     * one (a ring-3 client's) the compositor does — either way the request is
-     * the same flag, which is what keeps ui_build indifferent to which kind of
-     * window it was handed. */
-    gui_window_request_layout(win);
+    /* ASK FOR A PAINT, NOT A LAYOUT — and the difference is a hang.
+     *
+     * This said `gui_window_request_layout`, which sets `layout_pending` and
+     * makes the host call `on_layout` AGAIN.  For a window whose `on_layout` IS
+     * the builder — the natural way to write a composed app — that is an
+     * infinite loop: build, ask for a layout, build, ask for a layout.  It went
+     * unnoticed because the two existing composers return early on their second
+     * entry, so their loop stopped after one extra pass.
+     *
+     * `ui_layout` has just run, three lines up.  There is nothing left to lay
+     * out; what is left is to show it. */
+    gui_window_request_redraw(win);
     return built;
 }
 

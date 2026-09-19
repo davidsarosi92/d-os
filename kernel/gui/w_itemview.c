@@ -681,3 +681,58 @@ struct w_itemview* w_itemview_create(struct gui_window* win, int x, int y,
     iv->scroll = 0;
     return iv;
 }
+
+/* ---------------------------------------------------------------------------
+ * §M81 — THE VIEW WIDGET, COMPOSABLE.
+ *
+ * Asked for directly: *"let there be a view widget with the icons on it — the
+ * desktop could use that same view widget; it can hold list items, which the
+ * Start menu could use too."*  Two of those three were already true, and the
+ * third — putting one INSIDE a composition — was not possible at all: this
+ * widget had `widget_ops` and no `WIDGET_CLASS`, so no `ui_spec` could name it
+ * and every window holding one had to hand-place it.
+ *
+ * THE OBSTACLE WAS REAL AND THE ANSWER IS §M65's OWN: a spec is DATA (ints and
+ * strings, so it can cross a process boundary) and a MODEL is a pointer.  So
+ * the class builds the view with NO model and the owner attaches one
+ * afterwards through `ui_by_id`.  The spec carries what it CAN — the layout's
+ * name in `text` ("grid" / "list" / "table") — which is the same string
+ * `desktop.view` and `controlpanel.view` already hold, so choosing a layout
+ * stays a config change rather than an app change.
+ *
+ * A view with no model yet is not a broken widget: it draws its empty state,
+ * which is exactly what §M69 built the empty state for. */
+static struct widget* iv_class_create(struct gui_window* win,
+                                      const struct ui_spec* sp) {
+    struct w_itemview* iv = w_itemview_create(win, 0, 0, 0, 0, NULL,
+                                              sp && sp->text ? sp->text : "list",
+                                              NULL);
+    return iv ? &iv->base : NULL;
+}
+
+/* A view takes what it is given: it scrolls, so it has no natural height, and a
+ * caller that wants it to fill says so with a `weight`. */
+static void iv_class_measure(struct widget* w, int avail_w, int* min_w,
+                             int* pref_w, int* pref_h) {
+    (void)w;
+    *min_w = *pref_w = avail_w;
+    *pref_h = cp_row_h() * 4;           /* a floor; weight gives it the rest */
+}
+
+void w_itemview_set_model(struct widget* w, const struct item_model* m,
+                          void* ctx) {
+    struct w_itemview* iv = (struct w_itemview*)w;
+    if (!iv) return;
+    iv->model = m;
+    iv->base.ctx = ctx;
+    iv->sel = -1;
+    iv->scroll = 0;
+    iv->sig_valid = 0;                  /* the content diff must start over */
+}
+
+WIDGET_CLASS(wc_itemview) = {
+    .name = "view",
+    .create = iv_class_create,
+    .measure = iv_class_measure,
+    .ops = &itemview_ops,
+};

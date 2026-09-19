@@ -44,6 +44,7 @@
 
 #include "gui.h"
 #include "widget.h"
+#include "ui.h"
 #include "itemview.h"
 #include "settings.h"
 #include "users.h"
@@ -561,39 +562,81 @@ static void ac_on_close(struct gui_window* w) {
     ac_sel_name[0] = 0;
 }
 
+/* §M81 — THIS PANEL IS COMPOSED, NOT HAND-PLACED, and it is the first window
+ * with a real table to be.
+ *
+ * What it looked like before is in the history: a `w_itemview_create` at
+ * computed pixels, a label under it at `ch - bar - cp_row_h()`, and four
+ * buttons walked across with a cursor and `w_button_autosize` — the last of
+ * them then pushed to the right edge by writing `base.x` directly.  Every one
+ * of those numbers is the app doing the layout engine's job, and widget.h has
+ * said since §M69 that `w_button_autosize` is an INTERIM with `ui_build` and a
+ * `UI_ROW` as the end state.
+ *
+ * TWO THINGS MADE IT POSSIBLE, both from §M81.  A container is a WIDGET, so the
+ * tree is one hierarchy; and `w_itemview` is a registered CLASS ("view"), so a
+ * table can appear in a spec at all — it had ops and no class, which is why
+ * every window holding one had to place it by hand.
+ *
+ * THE MODEL IS ATTACHED AFTERWARDS, on purpose: a spec is DATA so that a ring-3
+ * client can send the same array (§M65), and a model is a pointer.  The spec
+ * carries the LAYOUT's name, which is the same string `accounts.view` holds, so
+ * table-versus-list stays a config change.
+ *
+ * `UI_ALIGN_END` on the Delete button's own row is what replaces writing
+ * `base.x = cw - pad - w`: Delete sits apart from the others because *the gap is
+ * the only thing standing between a curious click and something that cannot be
+ * undone* — and that intent is now expressed rather than computed. */
+enum {
+    AC_ID_VIEW = 1, AC_ID_DETAIL, AC_ID_ROW, AC_ID_SPACER,
+    AC_ID_NEW, AC_ID_PW, AC_ID_ADMIN, AC_ID_DEL,
+};
+
+static void ac_event(struct gui_window* win, int id, int type, int value,
+                     void* ctx) {
+    (void)win; (void)value; (void)ctx;
+    if (type == UI_EV_ACTIVATE && id == AC_ID_VIEW) { ac_on_select(ac_view, value, NULL); return; }
+    if (type != UI_EV_CLICK) return;
+    switch (id) {
+    case AC_ID_NEW:   act_new(NULL, NULL);      break;
+    case AC_ID_PW:    act_password(NULL, NULL); break;
+    case AC_ID_ADMIN: act_admin(NULL, NULL);    break;
+    case AC_ID_DEL:   act_delete(NULL, NULL);   break;
+    default: break;
+    }
+}
+
 static void ac_layout(struct gui_window* win) {
     gui_window_clear_widgets(win);
     ac_view = NULL; ac_detail = NULL;
     ac_btn_new = ac_btn_pw = ac_btn_admin = ac_btn_del = NULL;
 
-    int cw, ch;
-    gui_window_content_size(win, &cw, &ch);
-    const int pad = cp_px(6), gap = cp_px(6);
-    const int bar = cp_btn_h() + 2 * gap;
+    static const struct ui_spec spec[] = {
+        { .id = AC_ID_VIEW,   .cls = "view",  .weight = 1,
+          .text = "table",    .flags = UI_FILL_W | UI_FOCUSABLE },
+        { .id = AC_ID_DETAIL, .cls = "label", .text = "Select an account.",
+          .flags = UI_FILL_W },
+        { .id = AC_ID_ROW,    .cls = "box",   .flags = UI_ROW | UI_FILL_W },
+        { .id = AC_ID_NEW,    .parent = AC_ID_ROW, .cls = "button", .text = "New" },
+        { .id = AC_ID_PW,     .parent = AC_ID_ROW, .cls = "button", .text = "Set password" },
+        { .id = AC_ID_ADMIN,  .parent = AC_ID_ROW, .cls = "button", .text = "Toggle admin" },
+        /* A weighted empty box is the gap: it takes the slack, so Delete ends
+         * up hard against the right edge whatever the other three measure. */
+        { .id = AC_ID_SPACER, .parent = AC_ID_ROW, .cls = "box", .weight = 1 },
+        { .id = AC_ID_DEL,    .parent = AC_ID_ROW, .cls = "button", .text = "Delete" },
+    };
+    ui_build(win, spec, (int)(sizeof spec / sizeof spec[0]), ac_event, NULL);
 
-    ac_view = w_itemview_create(win, pad, pad, cw - 2 * pad,
-                                ch - bar - cp_row_h() - gap, &ac_model,
-                                config_get("accounts.view", "table"), NULL);
-    if (ac_view) ac_view->on_select = ac_on_select;
+    ac_view   = (struct w_itemview*)ui_by_id(win, AC_ID_VIEW);
+    ac_detail = (struct w_label*)   ui_by_id(win, AC_ID_DETAIL);
+    ac_btn_new   = (struct w_button*)ui_by_id(win, AC_ID_NEW);
+    ac_btn_pw    = (struct w_button*)ui_by_id(win, AC_ID_PW);
+    ac_btn_admin = (struct w_button*)ui_by_id(win, AC_ID_ADMIN);
+    ac_btn_del   = (struct w_button*)ui_by_id(win, AC_ID_DEL);
 
-    ac_detail = w_label_create(win, pad, ch - bar - cp_row_h(), cw - 2 * pad,
-                               "Select an account.");
-
-    int y = ch - bar + gap, x = pad;
-    ac_btn_new = w_button_create(win, 0, 0, 0, 0, "New", act_new, NULL);
-    if (ac_btn_new) x += w_button_autosize(ac_btn_new, x, y) + gap;
-    ac_btn_pw = w_button_create(win, 0, 0, 0, 0, "Set password", act_password, NULL);
-    if (ac_btn_pw) x += w_button_autosize(ac_btn_pw, x, y) + gap;
-    ac_btn_admin = w_button_create(win, 0, 0, 0, 0, "Toggle admin", act_admin, NULL);
-    if (ac_btn_admin) x += w_button_autosize(ac_btn_admin, x, y) + gap;
-
-    /* Delete sits at the far right, away from the others — devicepanel.c puts
-     * `Crash` there on the same reasoning: the gap is the only thing standing
-     * between a curious click and something that cannot be undone. */
-    ac_btn_del = w_button_create(win, 0, 0, 0, 0, "Delete", act_delete, NULL);
-    if (ac_btn_del) {
-        w_button_autosize(ac_btn_del, 0, y);
-        ac_btn_del->base.x = cw - pad - ac_btn_del->base.w;
+    if (ac_view) {
+        w_itemview_set_model(&ac_view->base, &ac_model, NULL);
+        ac_view->on_select = ac_on_select;
     }
     ac_update_controls();
 }

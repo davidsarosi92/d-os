@@ -335,55 +335,40 @@ static int au_widget_contract(int verbose) {
         }
     }
 
-    if (!gui_is_active()) {
-        if (verbose)
-            kprintf("  %d class(es) checked; no windows to walk (the GUI is "
-                    "not running)\n", n);
-        return bad ? bad : AUDIT_SKIP;
+    /* THE LIVE HALF IS A COUNTER, NOT A WALK — and the first version of this
+     * function got that wrong in a way worth writing down.
+     *
+     * It walked every open window's widget list to look for widgets that had
+     * skipped `widget_init` and for focusable widgets with no key handler.  That
+     * walk runs on whatever task calls the audit — cron, usually — while the
+     * OWNING host rebuilds the whole list at every layout (`app_widgets_reset`
+     * frees each node).  *That is precisely the §M22.7 violation the
+     * neighbouring audit checks for, committed by the checker.*  A check that
+     * has to break a rule in order to observe it is not a check.
+     *
+     * Both facts are now recorded where they HAPPEN, by the code that is
+     * already holding them: `widget_init` sees `focusable` and the ops table,
+     * and `gui_window_add_widget` sees an unstamped widget arriving.  No walk,
+     * no race, and the observation is exact rather than a sample of whatever
+     * happened to be open when the audit ran.
+     *
+     * (A one-off page fault on `cron` was what sent me looking here.  It did
+     * NOT reproduce in six further runs and is NOT root-caused — said plainly.
+     * The walk was wrong on its own terms, which is why it went whether or not
+     * it was the cause.) */
+    if (widget_uninited) {
+        kprintf("  %u widget(s) were added to a window WITHOUT widget_init — "
+                "hand-rolled constructors (§M63)\n", widget_uninited);
+        bad++;
     }
-
-    int widgets = 0, uninit = 0, traps = 0;
-    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
-        struct gui_window* win = &windows[i];
-        if (!win->used || win->kind != WIN_APP) continue;
-        for (struct widget* w = win->widgets; w; w = w->next) {
-            widgets++;
-            /* THE STAMP, not a plausibility test.  `widget_init` writes it and
-             * nothing else does, so its absence means a constructor assigned
-             * the base fields by hand — the §M63 defect, which cost a whole
-             * milestone of "the mouse works and the keyboard does nothing". */
-            if (w->inited != WIDGET_INITED) {
-                kprintf("  window '%s': a widget at %d,%d %dx%d did NOT come "
-                        "through widget_init\n", win->title, w->x, w->y,
-                        w->w, w->h);
-                uninit++;
-                continue;       /* its other fields cannot be trusted either */
-            }
-            /* FOCUSABLE AND DEAF.  Tab cycles focus through this widget and
-             * then the keyboard does nothing, with nothing on screen to say
-             * why — the silent half of the contract. */
-            if (w->focusable && w->ops &&
-                !w->ops->key && !w->ops->keycode) {
-                kprintf("  window '%s': a focusable widget at %d,%d handles no "
-                        "keys — Tab lands on it and the keyboard stops\n",
-                        win->title, w->x, w->y);
-                traps++;
-            }
-        }
+    if (widget_focus_traps) {
+        kprintf("  %u focusable widget(s) were built with no key handler — Tab "
+                "lands on them and the keyboard stops\n", widget_focus_traps);
+        bad++;
     }
-    bad += uninit + traps;
-    if (verbose) {
-        kprintf("  %d class(es) checked\n", n);
-        /* RULE 3, at the granularity that is true here: the registry half ran,
-         * the live half had nothing to look at.  Saying "ok" without saying
-         * that would claim more than was checked. */
-        if (!widgets)
-            kprintf("  no app windows are open — the live-widget half of this "
-                    "check did not run\n");
-        else
-            kprintf("  %d live widget(s): %d un-initialised, %d focus trap(s)\n",
-                    widgets, uninit, traps);
-    }
+    if (verbose)
+        kprintf("  %d class(es) checked; %u hand-rolled, %u focus trap(s) "
+                "observed since boot\n", n, widget_uninited, widget_focus_traps);
     return bad;
 }
 
@@ -468,9 +453,14 @@ void gui_contract_test(void) {
 
     gui_window_close(ct_win);
     for (int i = 0; i < 100 && ct_win; i++) task_msleep(20);
-    int after = audit_run_one("widget-contract", 0);
-    kprintf("contracttest: %d violation(s) after — %s\n", after,
-            after == before ? "back to where it started" : "STILL DIRTY");
+    /* THE COUNT DOES NOT GO BACK DOWN, and that is the design rather than a
+     * leak.  Both facts are RECORDED WHERE THEY HAPPEN now, so the audit
+     * reports what this boot has seen — not what happens to be on screen when
+     * somebody asks.  A live sample would answer "clean" for a window that had
+     * already closed, which is how a defect gets closed as unreproducible. */
+    kprintf("contracttest: %d violation(s) after closing the window — the "
+            "counters are a RECORD of this boot, not a live state\n",
+            audit_run_one("widget-contract", 0));
 }
 
 /* §M81 — `audit widget-threading`: §M22.7's ownership rule, checked.
