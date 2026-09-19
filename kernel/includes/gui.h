@@ -534,6 +534,11 @@ void gui_host_test(void);
  * working rather than as a lifetime bug.  Hidden from `help`. */
 void gui_slot_test(void);
 
+/* §M81 — `gui contracttest`: put a widget that breaks each half of widget.h's
+ * contract into a real window, so `audit widget-contract` can be seen to
+ * detect them, and take them away again.  §M71's rule 1.  Hidden from `help`. */
+void gui_contract_test(void);
+
 /* A periodic callback on the window's own host task (~2 Hz).
  *
  * THE TICK DAMAGES WHAT IT CHANGED.  The host does NOT repaint the window

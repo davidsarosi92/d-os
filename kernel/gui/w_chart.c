@@ -212,6 +212,7 @@ static void ch_set(struct widget* w, int v) {
 }
 
 WIDGET_CLASS(wc_chart) = {
+    .ops = &ch_ops,
     .name = "chart", .create = ch_create, .measure = ch_measure,
     .get_value = ch_get, .set_value = ch_set,
 };

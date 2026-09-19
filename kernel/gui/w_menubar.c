@@ -183,6 +183,7 @@ static void mb_measure(struct widget* w, int avail_w, int* min_w, int* pref_w,
 }
 
 WIDGET_CLASS(wc_menubar) = {
+    .ops = &mb_ops,
     .name = "menubar", .create = mb_create, .measure = mb_measure,
     .popup_pick = mb_popup_pick,
 };

@@ -188,6 +188,7 @@ static void cb_settext(struct widget* w, const char* t) {
 }
 
 WIDGET_CLASS(wc_checkbox) = {
+    .ops = &cb_ops,
     .name = "checkbox", .create = cb_create, .measure = cb_measure,
     .get_value = cb_get, .set_value = cb_set, .set_text = cb_settext,
 };
@@ -345,6 +346,7 @@ static int rg_gettext(struct widget* w, char* out, int cap) {
 }
 
 WIDGET_CLASS(wc_radio) = {
+    .ops = &rg_ops,
     .name = "radio", .create = rg_create, .measure = rg_measure,
     .get_value = rg_get, .set_value = rg_set,
     .set_text = rg_settext, .get_text = rg_gettext,
@@ -472,6 +474,7 @@ static void sl_setv(struct widget* w, int v) {
 }
 
 WIDGET_CLASS(wc_slider) = {
+    .ops = &sl_ops,
     .name = "slider", .create = sl_create, .measure = sl_measure,
     .get_value = sl_get, .set_value = sl_setv,
 };
@@ -617,6 +620,7 @@ static int co_gettext(struct widget* w, char* out, int cap) {
 }
 
 WIDGET_CLASS(wc_combo) = {
+    .ops = &co_ops,
     .name = "combo", .create = co_create, .measure = co_measure,
     .get_value = co_get, .set_value = co_set,
     .set_text = co_settext, .get_text = co_gettext,
@@ -733,6 +737,7 @@ static void sw_settext(struct widget* w, const char* t) {
 }
 
 WIDGET_CLASS(wc_switch) = {
+    .ops = &sw_ops,
     .name = "switch", .create = sw_create, .measure = sw_measure,
     .get_value = sw_get, .set_value = sw_set, .set_text = sw_settext,
 };
@@ -881,6 +886,7 @@ static int seg_gettext(struct widget* w, char* out, int cap) {
 }
 
 WIDGET_CLASS(wc_segmented) = {
+    .ops = &seg_ops,
     .name = "segmented", .create = seg_create, .measure = seg_measure,
     .get_value = seg_get, .set_value = seg_set,
     .set_text = seg_settext, .get_text = seg_gettext,
@@ -948,6 +954,7 @@ static void pg_set(struct widget* w, int v) {
 }
 
 WIDGET_CLASS(wc_progress) = {
+    .ops = &pg_ops,
     .name = "progress", .create = pg_create, .measure = pg_measure,
     .get_value = pg_get, .set_value = pg_set,
 };

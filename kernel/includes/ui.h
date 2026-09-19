@@ -149,6 +149,23 @@ struct widget_class {
      * same transport, different meaning, which is exactly why this is one op
      * on the class and not two mechanisms. */
     void (*popup_pick)(struct widget* w, int tag, int row);
+
+    /* §M81 — THE OPS TABLE THIS CLASS'S INSTANCES GET.  Appended, optional in
+     * the C sense and MANDATORY by the contract in widget.h.
+     *
+     * It exists so the contract can be checked for a class NOBODY HAS
+     * INSTANTIATED.  The ops live on the instance, so without this the only way
+     * to see a class's table is to build one — and `uikit` already reports that
+     * two registered classes have no row in the gallery, i.e. exactly the ones
+     * an instance-only check would never reach.  *An audit that can only see
+     * the classes somebody happened to use is measuring the app, not the
+     * toolkit.*
+     *
+     * It is a second statement of something the `create` fn also knows, which
+     * is a drift hazard — and that is the point: `audit widget-contract`
+     * compares this declaration against the widgets actually built, so the two
+     * disagreeing is a finding rather than a silent lie. */
+    const struct widget_ops* ops;
 };
 
 #define WIDGET_CLASS(_var)                                               \

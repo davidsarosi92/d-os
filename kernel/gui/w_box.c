@@ -238,6 +238,7 @@ static struct widget* box_create(struct gui_window* win, const struct ui_spec* s
  * for what it is given) and that arithmetic is the layout's, not the widget's.
  * A measure here would be a second answer to one question. */
 WIDGET_CLASS(cls_box) = {
+    .ops = &box_ops,
     .name = "box",
     .create = box_create,
 };

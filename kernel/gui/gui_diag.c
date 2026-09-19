@@ -39,6 +39,7 @@
  * =========================================================================== */
 
 #include "gui_priv.h"
+#include "audit.h"   /* §M81 — the widget-contract check */
 #include "gui.h"
 #include "gui_internal.h"
 #include "gui_app.h"
@@ -51,6 +52,7 @@
 #include "timer.h"
 #include "printf.h"
 #include "config.h"
+#include "kmalloc.h"
 #include <stdint.h>
 #include <stddef.h>
 #include "console.h"
@@ -278,6 +280,197 @@ void gui_slot_test(void) {
     kprintf("slottest: close    -> slot %s\n",
             slot_win ? "STILL SET — a later open would raise a dead window"
                      : "CLEARED");
+}
+
+/* =============================================================================
+ * §M81 — `audit widget-contract`: every class implements what widget.h says it
+ * must, and every live widget came through the shared initialiser.
+ *
+ * The contract itself is in widget.h.  This is the half that can FAIL, because
+ * a contract stated only in a comment is the §M52 shape — and this tree has the
+ * receipt one layer down: §M65 exported `widget_init` precisely so constructors
+ * would stop hand-rolling the base fields, and TWO of them went on doing it for
+ * three milestones.  Nothing was checking.
+ *
+ * TWO HALVES, because neither alone covers the toolkit:
+ *
+ *   the REGISTRY, statically.  Reaches a class nobody has instantiated, which
+ *     an instance-only check never could — `uikit` already reports two
+ *     registered classes with no row in its gallery, i.e. exactly those.
+ *   the LIVE WINDOWS, by walking them.  Reaches what the registry cannot: a
+ *     widget built by a hand-rolled constructor is in no class's table at all,
+ *     which is how `w_itemview_create` stayed outside the rule.
+ *
+ * AUDIT_SKIP when the GUI is not running — there are no windows to walk, and
+ * reporting a pass for a check that only half ran is rule 3's failure mode.
+ * The registry half still runs and is reported, so "the GUI is down" does not
+ * hide a class with no draw op.
+ * ========================================================================= */
+static int au_widget_contract(int verbose) {
+    int bad = 0, n = ui_class_count();
+
+    for (int i = 0; i < n; i++) {
+        const struct widget_class* c = ui_class_at(i);
+        if (!c) continue;
+        if (!c->create) {
+            kprintf("  class '%s' has no create fn — ui_build cannot make one\n",
+                    c->name ? c->name : "(unnamed)");
+            bad++;
+            continue;
+        }
+        if (!c->ops) {
+            /* Not pedantry: without the declaration this audit cannot see the
+             * class's ops at all unless somebody instantiates it, so an
+             * undeclared class is a hole in the check rather than a style
+             * lapse. */
+            kprintf("  class '%s' declares no ops table — its contract is "
+                    "UNCHECKABLE\n", c->name);
+            bad++;
+            continue;
+        }
+        if (!c->ops->draw) {
+            kprintf("  class '%s' has no draw op — it is laid out, given space "
+                    "and hit-tested, and paints nothing\n", c->name);
+            bad++;
+        }
+    }
+
+    if (!gui_is_active()) {
+        if (verbose)
+            kprintf("  %d class(es) checked; no windows to walk (the GUI is "
+                    "not running)\n", n);
+        return bad ? bad : AUDIT_SKIP;
+    }
+
+    int widgets = 0, uninit = 0, traps = 0;
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+        struct gui_window* win = &windows[i];
+        if (!win->used || win->kind != WIN_APP) continue;
+        for (struct widget* w = win->widgets; w; w = w->next) {
+            widgets++;
+            /* THE STAMP, not a plausibility test.  `widget_init` writes it and
+             * nothing else does, so its absence means a constructor assigned
+             * the base fields by hand — the §M63 defect, which cost a whole
+             * milestone of "the mouse works and the keyboard does nothing". */
+            if (w->inited != WIDGET_INITED) {
+                kprintf("  window '%s': a widget at %d,%d %dx%d did NOT come "
+                        "through widget_init\n", win->title, w->x, w->y,
+                        w->w, w->h);
+                uninit++;
+                continue;       /* its other fields cannot be trusted either */
+            }
+            /* FOCUSABLE AND DEAF.  Tab cycles focus through this widget and
+             * then the keyboard does nothing, with nothing on screen to say
+             * why — the silent half of the contract. */
+            if (w->focusable && w->ops &&
+                !w->ops->key && !w->ops->keycode) {
+                kprintf("  window '%s': a focusable widget at %d,%d handles no "
+                        "keys — Tab lands on it and the keyboard stops\n",
+                        win->title, w->x, w->y);
+                traps++;
+            }
+        }
+    }
+    bad += uninit + traps;
+    if (verbose) {
+        kprintf("  %d class(es) checked\n", n);
+        /* RULE 3, at the granularity that is true here: the registry half ran,
+         * the live half had nothing to look at.  Saying "ok" without saying
+         * that would claim more than was checked. */
+        if (!widgets)
+            kprintf("  no app windows are open — the live-widget half of this "
+                    "check did not run\n");
+        else
+            kprintf("  %d live widget(s): %d un-initialised, %d focus trap(s)\n",
+                    widgets, uninit, traps);
+    }
+    return bad;
+}
+
+AUDIT(widget_contract) = {
+    "widget-contract",
+    "every widget class implements its mandatory ops, and every live widget "
+    "came through widget_init",
+    au_widget_contract
+};
+
+/* THE FALSIFIER (§M71 rule 1).  Two violations, one of each kind, built into a
+ * real window so the audit meets them exactly where it would meet the real
+ * thing: a widget assembled WITHOUT `widget_init` (the §M63 constructor bug),
+ * and a focusable widget with no key handler (the focus trap).
+ *
+ * Both are torn down again by closing the window, so the machine is left as it
+ * was — an audit falsifier that leaves the box dirty is one nobody will run
+ * twice. */
+static void ct_draw(struct widget* w, struct gfx_surface* s) {
+    cp_text(s, w->x + 4, w->y + 4, "contracttest", cp_current_theme()->text);
+}
+static const struct widget_ops ct_bad_ops = { .draw = ct_draw };   /* no keys */
+
+static struct gui_window* ct_win;
+
+static void ct_build(struct gui_window* win) {
+    gui_window_clear_widgets(win);
+
+    /* (1) FOCUSABLE AND DEAF — through widget_init, so only the second rule is
+     * broken and the audit's two findings stay distinguishable. */
+    struct widget* deaf = (struct widget*)kcalloc(1, sizeof *deaf);
+    if (deaf) widget_init(deaf, win, 4, 4, 120, cp_ctrl_h(), &ct_bad_ops, NULL, 1);
+
+    /* (2) NEVER INITIALISED — the hand-rolled constructor, assembled exactly
+     * the way `w_itemview_create` used to be. */
+    struct widget* raw = (struct widget*)kcalloc(1, sizeof *raw);
+    if (raw) {
+        raw->x = 4; raw->y = 4 + 2 * cp_ctrl_h();
+        raw->w = 120; raw->h = cp_ctrl_h();
+        raw->ops = &ct_bad_ops;
+        raw->win = win;
+        gui_window_add_widget(win, raw);        /* …and no widget_init */
+    }
+}
+
+/* THE WINDOW IS OPENED ON A REAL APP-HOST, and the first version of this test
+ * was not — it called `gui_app_open` straight from the shell task, so
+ * `ct_build` (the LAYOUT hook) never ran, the bad widgets were never built, and
+ * the falsifier reported *"NOT DETECTED (the check is broken)"* about a check
+ * that was fine.
+ *
+ * §M81 step 2's hosting warning named the cause in the same log — `'contracttest'
+ * is being created on 'shell' (pid 20), which runs no app-host loop` — which is
+ * the first time one of these instruments caught another.  Same lesson as
+ * `slottest`'s first version, one layer over: *the half that builds runs on the
+ * host, the half that observes must not.* */
+static void ct_open(void) {
+    gui_app_open(&(struct gui_app_spec){
+        .title = "contracttest",
+        .content_w = cp_px(200), .content_h = cp_px(90),
+        .place = GUI_PLACE_DIALOG,
+        .layout = ct_build, .slot = &ct_win,
+    });
+}
+
+void gui_contract_test(void) {
+    if (!gui_is_active()) { kprintf("contracttest: the GUI is not running\n"); return; }
+    ct_win = NULL;
+    kprintf("contracttest: a clean machine first —\n");
+    int before = audit_run_one("widget-contract", 0);
+    kprintf("contracttest: %d violation(s) before\n", before);
+
+    gui_queue_open(ct_open);
+    for (int i = 0; i < 100 && !ct_win; i++) task_msleep(20);
+    if (!ct_win) { kprintf("contracttest: no window appeared\n"); return; }
+    task_msleep(400);                           /* let its host lay it out */
+
+    int during = audit_run_one("widget-contract", 0);
+    kprintf("contracttest: %d violation(s) with the bad widgets up — %s\n",
+            during, during > before ? "DETECTED"
+                                    : "NOT DETECTED (the check is broken)");
+
+    gui_window_close(ct_win);
+    for (int i = 0; i < 100 && ct_win; i++) task_msleep(20);
+    int after = audit_run_one("widget-contract", 0);
+    kprintf("contracttest: %d violation(s) after — %s\n", after,
+            after == before ? "back to where it started" : "STILL DIRTY");
 }
 
 void gui_compose_bench(int frames) {

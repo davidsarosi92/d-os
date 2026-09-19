@@ -26,6 +26,52 @@ struct gfx_surface;
 struct gui_window;
 struct widget;
 
+/* =============================================================================
+ * §M81 — WHICH OPS A CLASS MUST IMPLEMENT, AND WHICH IT MAY.
+ *
+ * Asked for directly: *"let every widget have the events you described, some of
+ * which are mandatory to implement (close) and some not (hover)."*  The slots
+ * below have existed since M22; what was missing is a STATEMENT of which are
+ * required — and a statement in a comment is exactly what §M52 says cannot hold
+ * (`syscall_entry.s` documented its own limitation truthfully and two green
+ * milestones invalidated it).  So the contract is written here AND checked by
+ * `audit widget-contract`, with `gui contracttest` to make it fail.
+ *
+ * MANDATORY, for every registered class:
+ *
+ *   draw      A widget with no `draw` still takes part in the LAYOUT — it is
+ *             measured, given space, and hit-tested — so what it produces is a
+ *             hole in the window that answers clicks.  That reads as a
+ *             rendering bug anywhere except where it is.
+ *
+ * MANDATORY, conditionally — and these are the ones that fail silently:
+ *
+ *   key OR keycode, IF the widget is FOCUSABLE.  Tab cycles focus through every
+ *             focusable widget (§M65); one that handles no keys is a hole the
+ *             focus ring falls into, after which the keyboard does nothing and
+ *             nothing on screen says why.
+ *   widget_init, ALWAYS.  Not an op but the same class of rule: every widget
+ *             must be constructed through it.  §M63 paid for the alternative —
+ *             `w_itemview_create` assigned the base fields by hand, missed
+ *             `win`, and keyboard navigation had NEVER worked in an item view;
+ *             the mouse worked and the keyboard did not.  §M65 exported
+ *             `widget_init` so that would stop happening, and two constructors
+ *             went on not calling it until §M81.  *A shared initialiser only
+ *             helps the callers that use it, and nothing was checking.*
+ *
+ * OPTIONAL, and a NULL is a real answer rather than an omission:
+ *
+ *   mouse     a widget that is only looked at (a label, a progress bar).
+ *   pointer   only a widget that wants the press/drag/release stream.
+ *   scroll    returns whether it CONSUMED the notch — see below.
+ *   hover     "does hovering change how I look?"  NULL means "repaint me",
+ *             which is right for a button and wrong for a full-screen view.
+ *   destroy   only a widget owning heap of its own.
+ *   popup_pick (on the class) only a widget that opens one.
+ *   measure   (on the class) NULL means "keep the size my constructor gave me",
+ *             which is what lets the M22 controls take part in a laid-out
+ *             window without being rewritten.
+ * ============================================================================= */
 struct widget_ops {
     void (*draw) (struct widget* w, struct gfx_surface* s);
     /* (lx,ly) relative to the widget; kind: 0 = click, 1 = double. */
@@ -169,7 +215,20 @@ struct widget {
      * feel connected to the screen: without it a button looks identical the
      * whole time the mouse is down on it. */
     int pressed;
+
+    /* §M81 — CONSTRUCTED THROUGH `widget_init`?  Stamped there and nowhere
+     * else, so `audit widget-contract` can walk a live window and say whether
+     * every widget in it came through the shared initialiser.
+     *
+     * A magic number rather than a boolean: this is read off a struct the
+     * auditor did not allocate, and `1` is a value uninitialised memory
+     * produces all the time while this constant is not.  It answers "did
+     * widget_init run", which is a different question from "is this pointer
+     * plausible" — and conflating them is how a check comes to pass on
+     * garbage. */
+    unsigned inited;
 };
+#define WIDGET_INITED 0x57494447u       /* 'WIDG' */
 
 /* ---- Container (§M81, w_box.c) ---------------------------------------------
  * THE CONTAINER IS A WIDGET NOW, AND THAT IS THE WHOLE OF §M81's FIRST STEP.

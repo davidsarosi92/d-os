@@ -238,6 +238,7 @@ static void ds_gui(const char* a) {
      * see a check fail, not a thing to do. */
     if (cmd_streq(a, "hosttest"))  { gui_host_test();      return; }
     if (cmd_streq(a, "slottest"))  { gui_slot_test();      return; }
+    if (cmd_streq(a, "contracttest")) { gui_contract_test(); return; }
     cmd_gui(a);                                  /* "" = start, "stop" = stop */
 }
 

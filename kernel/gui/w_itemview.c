@@ -661,23 +661,23 @@ struct w_itemview* w_itemview_create(struct gui_window* win, int x, int y,
                                      const char* view_name, void* ctx) {
     struct w_itemview* iv = (struct w_itemview*)kcalloc(1, sizeof *iv);
     if (!iv) return NULL;
-    iv->base.x = x; iv->base.y = y; iv->base.w = w; iv->base.h = h;
-    iv->base.ops = &itemview_ops;
-    iv->base.ctx = ctx;
-    iv->base.focusable = 1;
-    /* §M63 fix — `win` is what `gui_window_focus_widget(w->win, w)` and
-     * `gui_window_request_redraw(w->win)` are given, and this hand-written
-     * constructor did not set it.  Every other widget goes through widget.c's
-     * shared `widget_init`, which does; writing a constructor by hand skipped
-     * the one line nothing else needed.  The symptom was specific and
-     * confusing: the mouse worked (selection followed clicks) and the KEYBOARD
-     * did nothing, because focus was set on a NULL window and the keycode had
-     * no focused widget to reach. */
-    iv->base.win = win;
+    /* §M81 — THROUGH `widget_init`, like everything else.
+     *
+     * This constructor used to assign the six base fields by hand, and §M63
+     * records what that cost: it did not set `win`, so `gui_window_focus_widget`
+     * focused a NULL window and keyboard navigation had NEVER worked in an item
+     * view — the mouse worked and the keyboard did nothing.  §M65 then exported
+     * `widget_init` precisely so that stops happening, and this file went on
+     * not calling it, which is the §M52 shape: a rule written down after the
+     * defect, and a caller that still does not obey it.
+     *
+     * `audit widget-contract` now fails on a widget that did not come through
+     * here, so the next hand-rolled constructor is caught rather than
+     * discovered by its symptom. */
+    widget_init(&iv->base, win, x, y, w, h, &itemview_ops, ctx, 1);
     iv->model = model;
     iv->view  = item_view_by_name(view_name);
     iv->sel = -1;
     iv->scroll = 0;
-    gui_window_add_widget(win, &iv->base);
     return iv;
 }

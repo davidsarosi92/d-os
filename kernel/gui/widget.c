@@ -120,6 +120,7 @@ void widget_init(struct widget* w, struct gui_window* win,
     w->focusable = focusable;
     w->clip_x = w->clip_y = w->clip_w = w->clip_h = 0;   /* §M65: unrestricted */
     w->next = NULL;
+    w->inited = WIDGET_INITED;          /* §M81 — see widget.h */
     gui_window_add_widget(win, w);
 }
 
@@ -818,6 +819,7 @@ static int cls_label_gettext(struct widget* w, char* out, int cap) {
     return i;
 }
 WIDGET_CLASS(wc_label) = {
+    .ops = &label_ops,
     .name = "label", .create = cls_label_create, .measure = cls_label_measure,
     .set_text = cls_label_settext, .get_text = cls_label_gettext,
 };
@@ -852,6 +854,7 @@ static void cls_button_settext(struct widget* w, const char* t) {
     str_copy(((struct w_button*)w)->text, t, (int)sizeof ((struct w_button*)w)->text);
 }
 WIDGET_CLASS(wc_button) = {
+    .ops = &button_ops,
     .name = "button", .create = cls_button_create, .measure = cls_button_measure,
     .set_text = cls_button_settext,
 };
@@ -886,6 +889,7 @@ static void cls_list_set(struct widget* w, int v) {
     if (v >= 0 && v < lv->count) lv->sel = v;
 }
 WIDGET_CLASS(wc_listview) = {
+    .ops = &listview_ops,
     .name = "listview", .create = cls_list_create, .measure = cls_list_measure,
     .get_value = cls_list_get, .set_value = cls_list_set,
 };
@@ -924,6 +928,7 @@ static int cls_text_gettext(struct widget* w, char* out, int cap) {
     return i;
 }
 WIDGET_CLASS(wc_textinput) = {
+    .ops = &textinput_ops,
     .name = "textinput", .create = cls_text_create, .measure = cls_text_measure,
     .set_text = cls_text_settext, .get_text = cls_text_gettext,
 };

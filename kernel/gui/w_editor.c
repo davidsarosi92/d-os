@@ -438,18 +438,22 @@ struct w_editor* w_editor_create(struct gui_window* win, int x, int y,
     struct w_editor* e = (struct w_editor*)kcalloc(1, sizeof(*e));
     if (!e) return NULL;
 
-    e->base.x = x; e->base.y = y; e->base.w = w; e->base.h = h;
-    e->base.ops = &editor_ops;
-    e->base.win = win;
-    e->base.ctx = ctx;
-    e->base.focusable = 1;
     e->anchor  = -1;
     e->pref_col = -1;
 
+    /* THE BUFFER FIRST, THEN `widget_init` — and the ORDER is the point.
+     * `widget_init` puts the widget on the window's list, so a failure after it
+     * cannot simply `kfree(e)`: the window would be left holding a dangling
+     * pointer that the next draw walks.  The hand-rolled version this replaces
+     * happened to be safe for exactly that reason, and moving the shared
+     * initialiser to the top of the function would have quietly introduced a
+     * use-after-free on the OOM path. */
     if (ed_grow(e, 0) != 0) { kfree(e); return NULL; }
     e->buf[0] = 0;
 
-    gui_window_add_widget(win, &e->base);
+    /* §M81 — through `widget_init` (see w_itemview.c for what hand-rolling
+     * this cost once). */
+    widget_init(&e->base, win, x, y, w, h, &editor_ops, ctx, 1);
     return e;
 }
 

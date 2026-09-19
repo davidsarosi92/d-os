@@ -123,6 +123,7 @@ static struct widget* dlginfo_create_spec(struct gui_window* win,
 }
 
 WIDGET_CLASS(wc_dlginfo) = {
+    .ops = &dlginfo_ops,
     .name = "dlginfo", .create = dlginfo_create_spec, .measure = dlginfo_measure,
 };
 
