@@ -5247,13 +5247,58 @@ absent, and everything else follows from fixing it.
    sign-in screen are still hand-drawn, and `struct gui_window` is not itself a
    widget.
 
-#### Mandatory versus optional behaviour
+#### Mandatory versus optional behaviour — ✅ SHIPPED (2026-09-19)
 
-`widget_ops` already has the slots; what is missing is a STATEMENT of which a
-class must implement.  Declared per class, and checked the way this tree checks
-anything that must not drift: an `AUDIT()` — *every registered class implements
-its mandatory ops* — with a shipped falsifier.  A comment cannot fail a test
-(§M52).
+`widget_ops` already had the slots; what was missing was a STATEMENT of which a
+class must implement.  It is in widget.h now AND checked by
+**`audit widget-contract`**, with **`gui contracttest`** as the falsifier — *a
+comment cannot fail a test* (§M52).
+
+**MANDATORY:** `draw` (a widget without one is still measured, given space and
+hit-tested, so what it produces is a hole in the window that answers clicks);
+**`key` or `keycode` IF FOCUSABLE** (Tab cycles focus through it and then the
+keyboard does nothing, with nothing on screen saying why); and construction
+through `widget_init`, always.
+
+**AND THE LAST ONE WAS ALREADY BROKEN, BY TWO FILES, FOR THREE MILESTONES.**
+§M63 paid for it once — `w_itemview_create` assigned the base fields by hand,
+missed `win`, and keyboard navigation had NEVER worked in an item view — and
+§M65 exported `widget_init` so it would stop happening.  `w_itemview_create`
+and `w_editor_create` went on not calling it.  *A shared initialiser only helps
+the callers that use it, and nothing was checking.*  (The editor's buffer is
+allocated BEFORE `widget_init` now: that call puts the widget on the window's
+list, so the OOM path's `kfree` would otherwise leave the window walking a
+dangling pointer — the hand-rolled version was accidentally safe for exactly
+that reason.)
+
+**THE AUDIT HAS TWO HALVES** because neither alone covers the toolkit: the
+REGISTRY half is static and reaches a class **nobody has instantiated** (`uikit`
+reports two such), for which `widget_class.ops` was added — deliberately a
+second statement of what `create` also knows, so the audit comparing them is the
+point; the LIVE-WINDOW half walks what the registry cannot, since a widget from
+a hand-rolled constructor is in no class's table at all.  `widget.inited` is a
+MAGIC rather than a boolean: it is read off a struct the auditor did not
+allocate, and 1 is a value uninitialised memory produces while 0x57494447 is
+not.  **Rule 3 at the right granularity:** with no windows open the registry
+half still runs and the line says the live half did not.
+
+**AND THE THREADING RULE WITH IT (`audit widget-threading`).**  §M22.7's *a
+window's widgets belong to the task that hosts it* lived in three headers and
+was checked nowhere; §M69 paid for it when the delete dialog called the file
+manager's `fm_refresh()` from the DIALOG's host — the model really was reloaded
+and nothing on screen changed.  `widget_init` compares the creating task against
+the window's host and both ANNOUNCES and COUNTS a mismatch.  **`gui threadtest`
+is that bug reduced to two lines**, and it is DETECTED; **the existing tree is
+clean** across uikit, the dialog, the file manager, the Control Panel, the Task
+Manager, three settings panels and a driven Start-menu click.
+
+**EVERY INSTRUMENT THIS MILESTONE SHIPPED CAUGHT THE FIRST VERSION OF THE NEXT
+ONE**, which is the process finding worth more than any of them: `slottest`
+polled on the host task its own polling had blocked, and `contracttest` built
+its window on the shell so the layout hook never ran — it reported *"NOT
+DETECTED (the check is broken)"* about a check that was fine, and step 2's
+hosting warning named the cause in the same log.  *The half that builds runs on
+the host; the half that observes must not.*
 
 #### THE THREADING RULE, stated so it cannot be broken by accident
 
