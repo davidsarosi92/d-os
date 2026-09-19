@@ -179,7 +179,34 @@ forever.  Driven resize: 986x493 → 1232x609 with the node count still 8.
   than a one-off: it was mechanical, with nothing new needed from the toolkit.
   The accounts file still hand-places its PROMPT window.
 
-### THE TASK MANAGER NEEDS TWO THINGS THE LAYOUT ENGINE CANNOT EXPRESS
+### ✅ THE TASK MANAGER IS COMPOSED (`5f26ae5`) — AND IT COST SOMETHING
+
+Both capabilities below are built, with the Task Manager as the client in the
+same change.  The conversion found three real defects: `row ? avail_w :
+avail_w` (a ROW measured every child against the FULL width — the **third**
+instance of §M69's `even ? w : w` tell, and fatal for the charts, which answer
+`*pref_w = avail_w`); a hidden container that did not take its children with it;
+and `ui_build` full-repainting a window its host repaints anyway (**0 → 3 → 1**
+full repaints).
+
+**⚠ THE OPEN NUMBER, and it is the next thing to work on.**  Twelve samples each
+side, same driven pointer sweep:
+
+| | median us/frame | range | area |
+|---|---|---|---|
+| hand-placed | **1386** | 828..3673 | 7..33 kpx |
+| composed | **2428** | 1781..3730 | 14..34 kpx |
+
+The distributions overlap only at the tails, so this is **not** the ±19 % noise
+floor §M69 measured — it is a real per-frame increase, and the AREA moved with
+it, so more is being DAMAGED rather than pixels being slower.  **Not
+root-caused.**  §M81's own risk list predicted exactly this; the next session
+should find it before converting any more windows.
+
+Candidates not yet excluded: the frame COUNT also rose (20-36 → 21-44 per 2 s),
+so something is generating more damage events under an identical gesture.
+
+### The two capabilities, now built
 
 Found by attempting the conversion, and **written down rather than built**,
 because adding two layout features and converting the most timing-sensitive app
