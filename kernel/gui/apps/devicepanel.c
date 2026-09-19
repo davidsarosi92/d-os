@@ -61,6 +61,7 @@
 #include "gui_app.h"
 #include "icons.h"
 #include "widget.h"
+#include "ui.h"
 #include "console_plate.h"
 #include "itemview.h"
 #include "settings.h"
@@ -561,50 +562,64 @@ static void dm_on_close(struct gui_window* w) {
     dm_sel = -1; dm_sel_name[0] = 0;
 }
 
-static void dm_layout(struct gui_window* win) {
-    /* This layout BUILDS its widgets, so it must replace the old set rather
-     * than stack a new one on top — see gui_window_clear_widgets. */
-    gui_window_clear_widgets(win);
-    dm_view = NULL; dm_detail = NULL;
-    int cw, ch;
-    gui_window_content_size(win, &cw, &ch);
+/* §M81 — COMPOSED, and the point of doing a SECOND panel this way is to find
+ * out whether the first one was a pattern or a one-off.  It was mechanical:
+ * the same `UI_COL { view, label, UI_ROW { buttons, spacer, Crash } }` as the
+ * accounts panel, with nothing new needed from the toolkit.
+ *
+ * What the numbers in the old version were doing is worth remembering, because
+ * every one of them was the app performing the layout engine's job: a view at
+ * `ch - bar - cp_row_h() - gap`, a label at `ch - bar - cp_row_h()`, five
+ * buttons walked across with a cursor, and `Crash` pushed to the right edge by
+ * assigning `base.x` — the last of which is now a weighted empty box, because
+ * *the gap is the only thing standing between a curious click and a stopped
+ * device* and that is an intent rather than an arithmetic. */
+enum {
+    DM_ID_VIEW = 1, DM_ID_DETAIL, DM_ID_ROW, DM_ID_SPACER,
+    DM_ID_START, DM_ID_STOP, DM_ID_MOVE, DM_ID_UPDATE, DM_ID_BROWSE,
+    DM_ID_CRASH,
+};
 
-    /* §M69 — derived from the live density.  The literal 30/6/12/28/20 and the
-     * 54/78/66/68 x 22 buttons below were measured for the 8x8 font; at a
-     * runtime face the action row overlapped the detail line and every button
-     * frame cut through its own label. */
-    const int pad = cp_px(6), gap = cp_px(6);
-    const int bar = cp_btn_h() + 2 * gap;   /* the action row at the bottom */
-    dm_rescan();
-    dm_view = w_itemview_create(win, pad, pad, cw - 2 * pad,
-                                ch - bar - cp_row_h() - gap,
-                                &dm_model,
-                                config_get("devices.view", "table"), NULL);
-    if (dm_view) dm_view->on_select = dm_on_select;
-
-    dm_detail = w_label_create(win, pad, ch - bar - cp_row_h(), cw - 2 * pad,
-                               "Select a device.");
-
-    int y = ch - bar + gap, x = pad;
-    struct { const char* t; void (*fn)(struct w_button*, void*); } acts[] = {
-        { "Start", act_start }, { "Stop", act_stop }, { "Move", act_domain },
-        { "Update", act_update }, { "Browse", act_browse },
-    };
-    for (unsigned i = 0; i < sizeof acts / sizeof acts[0]; i++) {
-        struct w_button* b = w_button_create(win, 0, 0, 0, 0, acts[i].t,
-                                             acts[i].fn, NULL);
-        if (b) x += w_button_autosize(b, x, y) + gap;
+static void dm_event(struct gui_window* win, int id, int type, int value,
+                     void* ctx) {
+    (void)win; (void)value; (void)ctx;
+    if (type != UI_EV_CLICK) return;
+    switch (id) {
+    case DM_ID_START:  act_start(NULL, NULL);  break;
+    case DM_ID_STOP:   act_stop(NULL, NULL);   break;
+    case DM_ID_MOVE:   act_domain(NULL, NULL); break;
+    case DM_ID_UPDATE: act_update(NULL, NULL); break;
+    case DM_ID_BROWSE: act_browse(NULL, NULL); break;
+    case DM_ID_CRASH:  act_crash(NULL, NULL);  break;
+    default: break;
     }
-    /* Crash sits at the far right, away from the others.  It is the one
-     * control here whose whole purpose is to break something, and the gap is
-     * the only thing standing between a curious click and a stopped device. */
-    {
-        struct w_button* b = w_button_create(win, 0, 0, 0, 0, "Crash",
-                                             act_crash, NULL);
-        if (b) {
-            w_button_autosize(b, 0, y);
-            b->base.x = cw - pad - b->base.w;
-        }
+}
+
+static void dm_layout(struct gui_window* win) {
+    dm_view = NULL; dm_detail = NULL;
+    dm_rescan();
+
+    static const struct ui_spec spec[] = {
+        { .id = DM_ID_VIEW,   .cls = "view", .text = "table", .weight = 1,
+          .flags = UI_FILL_W | UI_FOCUSABLE },
+        { .id = DM_ID_DETAIL, .cls = "label", .text = "Select a device.",
+          .flags = UI_FILL_W },
+        { .id = DM_ID_ROW,    .cls = "box",   .flags = UI_ROW | UI_FILL_W },
+        { .id = DM_ID_START,  .parent = DM_ID_ROW, .cls = "button", .text = "Start" },
+        { .id = DM_ID_STOP,   .parent = DM_ID_ROW, .cls = "button", .text = "Stop" },
+        { .id = DM_ID_MOVE,   .parent = DM_ID_ROW, .cls = "button", .text = "Move" },
+        { .id = DM_ID_UPDATE, .parent = DM_ID_ROW, .cls = "button", .text = "Update" },
+        { .id = DM_ID_BROWSE, .parent = DM_ID_ROW, .cls = "button", .text = "Browse" },
+        { .id = DM_ID_SPACER, .parent = DM_ID_ROW, .cls = "box", .weight = 1 },
+        { .id = DM_ID_CRASH,  .parent = DM_ID_ROW, .cls = "button", .text = "Crash" },
+    };
+    ui_build(win, spec, (int)(sizeof spec / sizeof spec[0]), dm_event, NULL);
+
+    dm_view   = (struct w_itemview*)ui_by_id(win, DM_ID_VIEW);
+    dm_detail = (struct w_label*)   ui_by_id(win, DM_ID_DETAIL);
+    if (dm_view) {
+        w_itemview_set_model(&dm_view->base, &dm_model, NULL);
+        dm_view->on_select = dm_on_select;
     }
 }
 
