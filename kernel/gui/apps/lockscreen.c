@@ -284,22 +284,31 @@ static int lock_try(const char* user, const char* pass) {
      * Until the session really adopts the account (gui.h names the design), the
      * line says so on every successful sign-in rather than once in a header
      * nobody reads at the moment it matters. */
-    {
-        char buf[40];
-        /* The RETURN value — see cred.h, and shell_vista.c for what reading the
-         * buffer instead looks like on screen. */
-        const char* who = cred_owner_name(cred_current(), buf, sizeof buf);
-        kprintf("lock: authenticated '%s' - password CHECKED; this session "
-                "still runs as '%s' (the GUI does not yet adopt an account, "
-                "see gui.h)\n", user, who);
-    }
+    kprintf("lock: authenticated '%s' - opening a session for it\n", user);
     {
         int i = 0;
         for (; user[i] && i < (int)sizeof g_session_user - 1; i++)
             g_session_user[i] = user[i];
         g_session_user[i] = 0;
     }
+    /* §M81 — A SESSION, NOT A FLAG.
+     *
+     * This used to set `unlocked` and stop, which checked a password and gave
+     * the desktop nothing: every task in it kept the SYSTEM identity it was
+     * spawned with, so a desktop "signed in as root" could not change an
+     * administrator's password — reported from use as exactly that, and the
+     * refusal was right while this line was the lie.
+     *
+     * `cred_become_user` cannot be applied to a session that already has a
+     * compositor and app-hosts under it (§M32 captures ownership at spawn so
+     * re-parenting cannot launder it), so the session is REBUILT on a task that
+     * adopts the account before it has children.  See gui.h.
+     *
+     * `unlocked` is still set, and not as a leftover: the restart is queued and
+     * runs on the compositor's next pass, so between here and the teardown this
+     * window must stop swallowing input as a modal. */
     g_lock.unlocked = 1;
+    gui_session_restart_as(user);
     return 0;
 }
 

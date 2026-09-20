@@ -31,6 +31,8 @@
 
 #include "gui.h"
 #include "gui_priv.h"
+#include "users.h"
+#include "cred.h"
 #include "console_plate.h"
 #include "gui_app.h"
 #include "desktop.h"
@@ -346,6 +348,32 @@ static void (* volatile openq[LQ_SZ])(void);
 static volatile uint32_t oq_h = 0, oq_t = 0;
 static volatile int power_req = 0;      /* 0 none / 1 reboot / 2 shutdown */
 static volatile int exit_req  = 0;      /* Start → Exit GUI: end the session   */
+
+/* §M81 — RESTART THE SESSION, POSSIBLY AS SOMEBODY.
+ *
+ * The GUI sign-in used to set a flag and copy a NAME into a string, which is
+ * authentication without authorisation: `cred_become_user` is the only call
+ * that gives a task an identity, and nothing in the GUI reached it — so a
+ * desktop "signed in as root" ran every one of its tasks as SYSTEM.
+ *
+ * It cannot be fixed in place.  `cred_become_user` refuses a task that already
+ * has children, deliberately, because §M32 captures ownership at SPAWN and
+ * makes it immutable so that re-parenting cannot launder it — and by the time
+ * the lock screen runs, the session has a compositor and app-hosts under it.
+ *
+ * So the greeter is not the session, which is why every display manager is
+ * shaped this way: tear the session down and build a new one on a task that
+ * adopted the account BEFORE it had children.  `login.c`'s `session_entry` is
+ * the worked example and this is the same three steps. */
+static void gui_session_main(void);
+static volatile int restart_req = 0;
+static int  pend_uid = -1, pend_gid, pend_session;
+static int  pend_ngroups, pend_groups[CRED_MAX_GROUPS];
+static char pend_name[USER_NAME_MAX + 1];
+/* The new session is already authenticated; raising the lock again would ask
+ * for the password that just worked, forever. */
+static int  skip_lock_once = 0;
+static int  gui_next_session = 1;
 static void gui_stop_main(void);        /* teardown task; defined by gui_stop  */
 
 
@@ -889,6 +917,13 @@ static void dispatch_launches(void) {
         exit_req = 0;
         if (!task_spawn_detached("gui-stop", gui_stop_main))
             kprintf("gui: cannot spawn the teardown task - session stays up\n");
+    }
+    if (restart_req) {
+        /* Same reasoning, same escape: the restart TEARS DOWN this compositor
+         * before it builds the next session, so it cannot run here. */
+        restart_req = 0;
+        if (!task_spawn_detached("gui-session", gui_session_main))
+            kprintf("gui: cannot spawn the session task - session stays up\n");
     }
 }
 
@@ -1625,6 +1660,69 @@ CONFIG_KEY(ck_autorun) = {
     .help = "one shell command to run once the desktop is up (test hook)",
 };
 
+/* §M81 — THE GUI'S SESSION LEADER.  Three steps, in this order, and the order
+ * is the whole design:
+ *
+ *   1. TEAR THE OLD SESSION DOWN.  §M64 built and verified this for Start ->
+ *      Exit GUI; it kills the compositor, which is why this runs on a detached
+ *      task outside the session rather than on the one that asked.
+ *   2. ADOPT THE ACCOUNT, before this task has spawned anything.  That is the
+ *      one moment `cred_become_user` permits, and the reason a display
+ *      manager's greeter is not its session.
+ *   3. BUILD THE NEW SESSION.  `spawn_common` takes a child's identity from its
+ *      CALLER (§M32: deliberately not from `ppid`, or detaching would launder
+ *      it), so the desktop, the compositor and every app-host spawned from here
+ *      inherit the account without any of them knowing about login.
+ *
+ * A FAILED ADOPTION DOES NOT FALL BACK TO SYSTEM.  `login.c` refuses to run the
+ * session in that case, and the argument is the same one: *a session running
+ * with the console's identity is precisely the privilege the login was supposed
+ * to drop.*  Here that would be worse, because the desktop would come up
+ * looking signed in. */
+static void gui_session_main(void) {
+    gui_teardown();
+
+    if (pend_uid >= 0) {
+        struct task* me = task_current();
+        if (!me || cred_become_user(me->pid, pend_uid, pend_gid, pend_groups,
+                                    pend_ngroups, pend_session) != 0) {
+            kprintf("gui: could not adopt '%s' - REFUSING to open the desktop "
+                    "(a session that cannot become the user must not look like "
+                    "one that did)\n", pend_name);
+            pend_uid = -1;
+            return;
+        }
+        /* §M32 stage 9 — the account's preferences, AFTER the identity, because
+         * `config_apply`'s watchers run as this task and a wallpaper applied
+         * while still SYSTEM would be the console's rather than the user's. */
+        config_user_attach(pend_uid);
+        kprintf("gui: session %d opened for '%s' (uid %d) on pid %d\n",
+                pend_session, pend_name, pend_uid, me->pid);
+        skip_lock_once = 1;             /* it just authenticated */
+        pend_uid = -1;
+    }
+    gui_start();
+}
+
+void gui_session_restart_as(const char* name) {
+    pend_uid = -1;
+    pend_name[0] = 0;
+    if (name) {
+        const struct user_account* u = user_by_name(name);
+        if (!u) {
+            kprintf("gui: no account '%s' - not restarting the session\n", name);
+            return;
+        }
+        pend_uid     = u->uid;
+        pend_gid     = u->gid;
+        pend_session = gui_next_session++;
+        pend_ngroups = user_groups_of(u->uid, pend_groups, CRED_MAX_GROUPS);
+        str_copy(pend_name, u->name, sizeof pend_name);
+    }
+    restart_req = 1;
+    need_frame  = 1;
+}
+
 static void gui_stop_main(void) {
     gui_teardown();
     task_exit();
@@ -1859,7 +1957,17 @@ int gui_start(void) {
      * casualty of turning it on by default would be every existing GUI test —
      * §M46's argument for `hardlock` being reachable but not standard, applied
      * to the thing that stands between a person and their desktop. */
-    if (config_get_long("gui.login", 0)) {
+    /* §M81 — …UNLESS THIS SESSION WAS JUST AUTHENTICATED.  The sign-in rebuilds
+     * the session (see gui_session_main), so without this the new desktop would
+     * immediately ask for the password that had just opened it, forever.
+     *
+     * ONE-SHOT, and cleared whether or not the lock was going to be raised: a
+     * flag that survives its own session is a machine that skips the NEXT
+     * sign-in too, which is the only failure mode here worth worrying about. */
+    if (skip_lock_once) {
+        skip_lock_once = 0;
+        kprintf("gui: session already authenticated - not locking\n");
+    } else if (config_get_long("gui.login", 0)) {
         if (gui_lock_raise() != 0)
             kprintf("gui: login was requested and could not be raised - the "
                     "desktop is UNLOCKED\n");

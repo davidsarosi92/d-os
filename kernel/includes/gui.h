@@ -115,19 +115,31 @@ int  gui_wallpaper_reload(void);
  * boot shell before `gui`. */
 void gui_desktop_icons_changed(void);
 
+/* §M81 — END THIS SESSION AND OPEN A NEW ONE, optionally AS `name`.
+ *
+ * The only way the GUI can hand a session an identity, and the reason is in the
+ * note below: `cred_become_user` refuses a task that already has children, so
+ * the account has to be adopted by a task that has none — which means a new
+ * session rather than a change to the running one.  `name == NULL` restarts as
+ * SYSTEM, which is what signing OUT means.
+ *
+ * QUEUED.  The restart tears down the compositor, so it runs on a detached task
+ * outside the session (the same escape §M64's Exit GUI needed). */
+void gui_session_restart_as(const char* name);
+
 /* =============================================================================
- * §M81 — THE GUI SIGN-IN CHECKS A PASSWORD AND GRANTS NO IDENTITY.  NOT FIXED.
+ * §M81 — THE GUI SIGN-IN USED TO CHECK A PASSWORD AND GRANT NO IDENTITY.
  *
  * Stated here, at the top of the compositor's public surface, because it is a
  * SECURITY property this tree currently claims and does not have — and because
  * the two places that could have said so (the Start menu header and the lock
  * screen's own log line) were the places saying the opposite.
  *
- * WHAT HAPPENS TODAY.  `gui.login = 1` raises the lock screen before the
- * desktop can be used.  A correct password sets `g_lock.unlocked` and records
+ * WHAT IT USED TO DO.  `gui.login = 1` raises the lock screen before the
+ * desktop can be used.  A correct password set `g_lock.unlocked` and recorded
  * the account's NAME in a string.  `cred_become_user` — the only call that
- * gives a task an identity — is reached from the shell's `login` and from
- * NOTHING in the GUI.  So the desktop, the compositor and every app-host keep
+ * gives a task an identity — was reached from the shell's `login` and from
+ * NOTHING in the GUI.  So the desktop, the compositor and every app-host kept
  * what they were spawned with, which on an ordinary boot is TASK_OWNER_SYSTEM.
  *
  * WHAT THAT COSTS, exactly.  SYSTEM counts as an administrator (cred.h: the
@@ -144,25 +156,25 @@ void gui_desktop_icons_changed(void);
  * time the lock screen runs, the session has a compositor and app-hosts under
  * it.  There is no honest way to change what they are.
  *
- * THE DESIGN, which is a display manager's and is why one is shaped that way:
- * the greeter is not the session.  On a correct password the lock must
+ * THE FIX, which is a display manager's and is why one is shaped that way:
+ * the greeter is not the session.  On a correct password the lock
  *
- *   1. record the account to adopt,
- *   2. tear the session down — §M64 already built and verified this for
+ *   1. records the account to adopt,
+ *   2. tears the session down — §M64 already built and verified this for
  *      Start -> Exit GUI, on its own detached task, because the teardown kills
  *      the compositor that dispatched the click,
- *   3. spawn a fresh SESSION LEADER that calls `cred_become_user` at its own
+ *   3. spawns a fresh SESSION LEADER that calls `cred_become_user` at its own
  *      entry, before it has children, and only then calls `gui_start()`.
  *
  * Everything under it then inherits the identity through `spawn_common`, which
  * is the one route §M32 allows — no new mechanism, and `login.c` is the worked
  * example of step 3.
  *
- * THE TWO THINGS TO GET RIGHT, named so they are not discovered:
+ * THE TWO THINGS THAT HAD TO BE GOT RIGHT, and both are handled:
  *   - the new session must NOT raise the lock again (it is already
  *     authenticated), or sign-in loops;
- *   - "Sign out" is cosmetic today for the same reason and must go through the
- *     same restart, or it leaves a session running as the previous user.
+ *   - "Sign out" was cosmetic for the same reason and goes through the same
+ *     restart, or it would leave a session running as the previous user.
  * ============================================================================= */
 
 /* §M64 tail — the desktop shell says whether it currently holds the keyboard

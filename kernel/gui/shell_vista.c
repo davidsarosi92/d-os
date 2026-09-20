@@ -575,7 +575,14 @@ static int volpop_y(void) { return scr_h - TASKBAR_H - VOLPOP_H; }
  * additionally FORGETS who was here, so the next person is asked rather than
  * shown the previous one's name in the header. */
 static void sm_lock(void)    { gui_lock_raise(); }
-static void sm_signout(void) { gui_session_clear(); gui_lock_raise(); }
+/* §M81 — SIGNING OUT ENDS THE SESSION, it does not merely cover it.
+ *
+ * This was `gui_session_clear(); gui_lock_raise();` — forget the name, show the
+ * lock — which left every task of the previous user's session running
+ * underneath, including their app windows.  That was survivable only while the
+ * session had no identity to leave behind; now that it does, covering the
+ * screen and calling it a sign-out would be the same lie one layer up. */
+static void sm_signout(void) { gui_session_clear(); gui_session_restart_as(NULL); }
 static void sm_exitgui(void)  { gui_queue_exit(); }
 static void sm_reboot(void)   { gui_queue_power(1); }
 static void sm_shutdown(void) { gui_queue_power(0); }
