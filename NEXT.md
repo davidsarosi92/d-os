@@ -1,4 +1,15 @@
-# Where things stand (2026-09-18)
+# Where things stand (2026-09-20)
+
+## §M82 is written up in PLAN.md — the session as a first-class thing
+
+Asked for right after §M81 made the GUI sign-in real: separate the greeter and
+the lock from the session; per-user program list, icon list and wallpaper;
+system-wide and per-user `PATH` with the user's overriding; and sign-out saving
+what needs saving.  **Designed, not started.**  The one piece that may already
+work and has never been measured is the per-user WALLPAPER — `gui.wallpaper` is
+`CFG_SCOPE_USER` and `gui_start` now runs after `config_user_attach`, so measure
+before building.
+
 
 A short, durable note so work can resume without re-deriving the session.
 Everything below is measured unless it says otherwise.
