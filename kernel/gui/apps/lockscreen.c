@@ -88,8 +88,23 @@ struct lock_state {
  * Names are not a secret — the Control Panel lists them, and so does every
  * owner column in the system — so showing them costs nothing that is not
  * already public.  The PASSWORD is the secret, and it is the field below. */
+/* §M81 — A PASSWORDLESS ACCOUNT IS SIGNABLE, and leaving it out was what made
+ * `users.autologin` unreachable.
+ *
+ * It used to require `has_password`, on the reasonable-sounding grounds that an
+ * account which cannot authenticate cannot sign in.  But "no password" here
+ * does not mean "any password works" — users.h is explicit that it means LOGIN
+ * REFUSED for the shell's `login`, which is right there and wrong on a desktop
+ * a person is sitting at: the machine is theirs, the account was created
+ * deliberately, and hiding it from the list is not a security measure but a
+ * missing row.
+ *
+ * It also has to be here for `users.autologin` to mean anything: an account the
+ * picker will not show and the autologin will open is a machine with two
+ * different ideas about who may use it.  Choosing one by hand and autologin now
+ * grant exactly the same thing. */
 static int lk_signable(const struct user_account* u) {
-    return u && u->used && u->type == USER_TYPE_PERSON && u->has_password;
+    return u && u->used && u->type == USER_TYPE_PERSON;
 }
 
 static int lk_count(void* ctx) {
@@ -184,7 +199,13 @@ static void lk_on_select(struct w_itemview* iv, int idx, void* c) {
 }
 
 static int lock_try(const char* user, const char* pass) {
-    if (user_check_password(user, pass) != 0) {
+    /* An account with NO password is entered by choosing it.  Not "any password
+     * is accepted" — there is nothing to check, and pretending to check would
+     * put a box on screen whose contents change nothing. */
+    const struct user_account* acc = user_by_name(user);
+    int open_account = acc && acc->type == USER_TYPE_PERSON && !acc->has_password;
+
+    if (!open_account && user_check_password(user, pass) != 0) {
         /* NAME THE ACCOUNT IT TRIED.
          *
          * The generic "incorrect user name or password" is the right message

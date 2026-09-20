@@ -205,10 +205,16 @@ static struct w_button*   ac_btn_new;
 static struct w_button*   ac_btn_pw;
 static struct w_button*   ac_btn_admin;
 static struct w_button*   ac_btn_del;
+static struct w_button*   ac_btn_auto;
 /* The selection is remembered BY NAME, not by index — §M66's slot-table lesson
  * applies here too: creating or deleting an account renumbers the list, and an
  * index captured before an action can name a different row after it. */
 static char ac_sel_name[USER_NAME_MAX + 1];
+
+static int s_same(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
 
 static const struct user_account* ac_selected(void) {
     return ac_sel_name[0] ? user_by_name(ac_sel_name) : NULL;
@@ -528,6 +534,41 @@ static void del_answered(int answer, void* ctx) {
     ac_refresh();
 }
 
+/* §M81 — SIGN THIS ACCOUNT IN WITHOUT ASKING.
+ *
+ * Asked for from use, with the condition attached: *only a passwordless account
+ * may be chosen for this.*  That is the right condition and it is enforced by
+ * `users_autologin_account()` as well, because a gate the BUTTON keeps is a
+ * gate that only applies to people who use the button — `setconf` reaches the
+ * same key.
+ *
+ * ONE BUTTON, BOTH DIRECTIONS, like the admin toggle beside it: a pair would
+ * always have one member greyed, and a control whose only state is disabled is
+ * one nobody learns. */
+static void act_autologin(struct w_button* b, void* ctx) {
+    (void)b; (void)ctx;
+    const struct user_account* u = ac_selected();
+    if (!u) return;
+    const char* cur = config_get("users.autologin", "");
+    int already = cur && cur[0] && s_same(cur, u->name);
+
+    config_apply("users.autologin", already ? "" : u->name);
+
+    static char m[160];
+    int n;
+    if (already) {
+        n = ac_put(m, sizeof m, 0, "Auto sign-in is off.  The picker will ask.");
+    } else {
+        n = ac_put(m, sizeof m, 0, "Signing in to ");
+        n = ac_put(m, sizeof m, n, u->name);
+        n = ac_put(m, sizeof m, n, " automatically from now on (it has no "
+                                   "password, so there is nothing to ask).");
+    }
+    (void)n;
+    ac_say(m);
+    ac_refresh();
+}
+
 static void act_delete(struct w_button* b, void* ctx) {
     (void)b; (void)ctx;
     const struct user_account* u = ac_selected();
@@ -564,6 +605,10 @@ static void ac_update_controls(void) {
     if (ac_btn_pw)    ac_btn_pw->base.disabled    = !may_set_password(u);
     if (ac_btn_admin) ac_btn_admin->base.disabled = !may_toggle_admin(u);
     if (ac_btn_del)   ac_btn_del->base.disabled   = !may_delete(u);
+    /* Only a passwordless account, and only an admin may decide it — the same
+     * two facts `users_autologin_account()` re-checks at boot. */
+    if (ac_btn_auto)  ac_btn_auto->base.disabled =
+        !(u && !u->has_password && me_is_admin());
 
     if (!ac_detail) return;
     /* A pending answer wins over the selection description, exactly once. */
@@ -663,7 +708,7 @@ static void ac_on_close(struct gui_window* w) {
  * undone* — and that intent is now expressed rather than computed. */
 enum {
     AC_ID_VIEW = 1, AC_ID_DETAIL, AC_ID_ROW, AC_ID_SPACER,
-    AC_ID_NEW, AC_ID_PW, AC_ID_ADMIN, AC_ID_DEL,
+    AC_ID_NEW, AC_ID_PW, AC_ID_ADMIN, AC_ID_AUTO, AC_ID_DEL,
 };
 
 static void ac_event(struct gui_window* win, int id, int type, int value,
@@ -675,6 +720,7 @@ static void ac_event(struct gui_window* win, int id, int type, int value,
     case AC_ID_NEW:   act_new(NULL, NULL);      break;
     case AC_ID_PW:    act_password(NULL, NULL); break;
     case AC_ID_ADMIN: act_admin(NULL, NULL);    break;
+    case AC_ID_AUTO:  act_autologin(NULL, NULL); break;
     case AC_ID_DEL:   act_delete(NULL, NULL);   break;
     default: break;
     }
@@ -694,6 +740,7 @@ static void ac_layout(struct gui_window* win) {
         { .id = AC_ID_NEW,    .parent = AC_ID_ROW, .cls = "button", .text = "New" },
         { .id = AC_ID_PW,     .parent = AC_ID_ROW, .cls = "button", .text = "Set password" },
         { .id = AC_ID_ADMIN,  .parent = AC_ID_ROW, .cls = "button", .text = "Toggle admin" },
+        { .id = AC_ID_AUTO,   .parent = AC_ID_ROW, .cls = "button", .text = "Auto sign-in" },
         /* A weighted empty box is the gap: it takes the slack, so Delete ends
          * up hard against the right edge whatever the other three measure. */
         { .id = AC_ID_SPACER, .parent = AC_ID_ROW, .cls = "box", .weight = 1 },
@@ -706,6 +753,7 @@ static void ac_layout(struct gui_window* win) {
     ac_btn_new   = (struct w_button*)ui_by_id(win, AC_ID_NEW);
     ac_btn_pw    = (struct w_button*)ui_by_id(win, AC_ID_PW);
     ac_btn_admin = (struct w_button*)ui_by_id(win, AC_ID_ADMIN);
+    ac_btn_auto  = (struct w_button*)ui_by_id(win, AC_ID_AUTO);
     ac_btn_del   = (struct w_button*)ui_by_id(win, AC_ID_DEL);
 
     if (ac_view) {

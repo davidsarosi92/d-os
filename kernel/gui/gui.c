@@ -374,6 +374,9 @@ static char pend_name[USER_NAME_MAX + 1];
  * for the password that just worked, forever. */
 static int  skip_lock_once = 0;
 static int  gui_next_session = 1;
+/* Set only while the session leader is calling gui_start, so the autologin
+ * hand-off in gui_start does not route its own session back to itself. */
+static int  in_session_leader = 0;
 static void gui_stop_main(void);        /* teardown task; defined by gui_stop  */
 
 
@@ -1701,7 +1704,9 @@ static void gui_session_main(void) {
         skip_lock_once = 1;             /* it just authenticated */
         pend_uid = -1;
     }
+    in_session_leader = 1;
     gui_start();
+    in_session_leader = 0;
 }
 
 void gui_session_restart_as(const char* name) {
@@ -1718,6 +1723,16 @@ void gui_session_restart_as(const char* name) {
         pend_session = gui_next_session++;
         pend_ngroups = user_groups_of(u->uid, pend_groups, CRED_MAX_GROUPS);
         str_copy(pend_name, u->name, sizeof pend_name);
+    }
+    /* WHO ACTS ON THIS depends on whether a session is up.  With one running,
+     * the restart must NOT happen on the caller — it tears down the compositor
+     * that dispatched the click — so it is queued and the compositor hands it
+     * to a detached task.  With none (boot, autologin), there is nothing to
+     * queue it to and nothing to tear down, so the leader starts directly. */
+    if (!gui_active) {
+        if (!task_spawn_detached("gui-session", gui_session_main))
+            kprintf("gui: cannot spawn the session task\n");
+        return;
     }
     restart_req = 1;
     need_frame  = 1;
@@ -1751,6 +1766,25 @@ int gui_stop(void) {
 
 int gui_start(void) {
     if (gui_active) return 0;
+
+    /* §M81 — AUTOLOGIN IS DECIDED BEFORE ANYTHING IS SPAWNED, and HERE rather
+     * than in `gui_autostart`, because that is the BOOT path only — the `gui`
+     * command calls this directly, and the first version put the check in the
+     * other one, so typing `gui` produced a picker on a machine configured to
+     * open itself.  *A decision that exists on one of two ways in is a
+     * behaviour nobody can predict from the setting.*
+     *
+     * A session's identity can only be adopted by a task with no children
+     * (§M32), so it cannot be decided later: by the time this function returns
+     * there is a desktop and a compositor and both already ARE somebody. */
+    if (!in_session_leader) {
+        const char* al = users_autologin_account();
+        if (al) {
+            kprintf("gui: autologin to '%s' (it has no password)\n", al);
+            gui_session_restart_as(al);
+            return 0;
+        }
+    }
 
     /* §M46 — whether the X button on a client-managed (package) window
      * force-kills a wedged client instead of only requesting a cooperative
@@ -1967,7 +2001,19 @@ int gui_start(void) {
     if (skip_lock_once) {
         skip_lock_once = 0;
         kprintf("gui: session already authenticated - not locking\n");
-    } else if (config_get_long("gui.login", 0)) {
+    /* §M81 — ASK WHEN THERE IS SOMEBODY TO ASK.
+     *
+     * `gui.login` used to be the only way in, defaulting OFF because a gate
+     * that defaults ON is one this project's own harness cannot get past
+     * (§4.74).  That argument still holds for a machine where nobody has chosen
+     * a secret — every GUI test in the tree boots with root carrying the
+     * SHIPPED DEFAULT — and it stops holding the moment a real password exists:
+     * a desktop that opens itself on a machine with accounts is the same
+     * authentication theatre this milestone just removed, one layer up.
+     *
+     * So the gate is `users_anyone_can_sign_in()` OR the explicit key, and the
+     * harness is unaffected because a default password is not a chosen one. */
+    } else if (users_anyone_can_sign_in() || config_get_long("gui.login", 0)) {
         if (gui_lock_raise() != 0)
             kprintf("gui: login was requested and could not be raised - the "
                     "desktop is UNLOCKED\n");

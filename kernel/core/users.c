@@ -744,6 +744,80 @@ const char* users_default_name(void) {
     return config_get("users.default_user", USER_DEFAULT_NAME);
 }
 
+/* §M81 — MAY THIS MACHINE SIGN SOMEBODY IN WITHOUT ASKING?
+ *
+ * Asked for from use: *"a default user setting — if it has no password, sign in
+ * to it automatically; only passwordless accounts may be chosen.  If every
+ * account has a password, show the picker.  If there is more than one user, the
+ * picker too."*
+ *
+ * THE THIRD RULE IS THE ONE THAT DECIDES THE SHAPE, and it is the safe reading:
+ * never sign somebody in when the machine cannot know who is sitting at it.  So
+ * all three conditions must hold, and each is a different way of being sure:
+ *
+ *   - the named account EXISTS and is a PERSON — a system identity is not
+ *     something to open a desktop as;
+ *   - it has NO PASSWORD, which is the setting's whole meaning.  An account
+ *     with one is saying it wants to be asked, and honouring an autologin over
+ *     that would make the password decorative;
+ * A THIRD CONDITION WAS WRITTEN AND REMOVED, because building it proved it
+ * wrong: "…and it is the only person account."  That reading of *"if there is
+ * more than one user, the picker too"* is the safe-looking one, and it makes
+ * the feature UNREACHABLE — `passwd root -` is refused by the invariant that
+ * the machine must keep an administrator who can log in, so the sole account
+ * can never be passwordless, and with two the rule forbade it.  A setting that
+ * cannot be satisfied is not a cautious setting.
+ *
+ * What replaces it is where the caution belongs: the PICKER lists passwordless
+ * accounts too and lets them in without asking, so choosing one by hand and
+ * autologin grant exactly the same thing.  *An account with no password has no
+ * secret to protect; autologin to it gives away nothing that the list does
+ * not.*
+ *
+ * Returns the account name, or NULL — and on a REFUSAL it says why, because a
+ * setting that silently does nothing is worse than one that is absent. */
+const char* users_autologin_account(void) {
+    const char* want = config_get("users.autologin", "");
+    if (!want || !want[0]) return NULL;
+
+    const struct user_account* u = user_by_name(want);
+    if (!u || u->type != USER_TYPE_PERSON) {
+        kprintf("users: autologin names '%s', which is not an account that can "
+                "own a session - asking instead\n", want);
+        return NULL;
+    }
+    if (u->has_password) {
+        kprintf("users: autologin names '%s', which HAS a password - asking "
+                "instead (an account with a password is asking to be asked)\n",
+                want);
+        return NULL;
+    }
+    return u->name;
+}
+
+/* Is there anybody to ask?
+ *
+ * A CHOSEN secret, not merely A secret — and that distinction is the whole
+ * usefulness of the answer.  Every account ships able to sign in, because root
+ * carries the SHIPPED DEFAULT PASSWORD (users.h: a machine nobody can log into
+ * is worse, and the default announces itself at every boot).  So "has a
+ * password" is true on a machine straight out of the box, and gating a lock
+ * screen on it would put one in front of every fresh boot — including every GUI
+ * test in this tree, which is the §4.74 problem `gui.login` defaulted off to
+ * avoid.
+ *
+ * `pw_is_default` is cleared the moment somebody sets one, which is exactly the
+ * moment the machine acquires a person worth asking about. */
+int users_anyone_can_sign_in(void) {
+    for (int i = 0; ; i++) {
+        const struct user_account* u = user_at(i);
+        if (!u) break;
+        if (u->type == USER_TYPE_PERSON && u->has_password && !u->pw_is_default)
+            return 1;
+    }
+    return 0;
+}
+
 void users_warn_default_password(void) {
     if (!users_default_password_in_use()) return;
     /* EVERY BOOT, until it is changed.  A default credential nobody is told
@@ -1194,6 +1268,14 @@ SHELL_CMD(groupdel) = { "groupdel", "<name>", "destroy a group",
                         SHELL_G_SYS, cmd_groupdel, SHELL_P_ADMIN };
 SHELL_CMD(groupmod) = { "groupmod", "<group> add|del <user>", "change group membership",
                         SHELL_G_SYS, cmd_groupmod, SHELL_P_ADMIN };
+
+CONFIG_KEY(ck_autologin) = {
+    .key = "users.autologin", .group = "System", .type = CFG_STRING,
+    .def = "",
+    .help = "sign in to this account without asking (it must have no password, "
+            "and be the only account)",
+    .scope = CFG_SCOPE_MACHINE,
+};
 
 CONFIG_KEY(ck_default_user) = {
     .key = "users.default_user", .group = "System", .type = CFG_STRING,

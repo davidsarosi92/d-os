@@ -215,6 +215,14 @@ int  users_needs_setup(void);
 int  users_default_password_in_use(void);
 /* The account the login surfaces offer first (`users.default_user`). */
 const char* users_default_name(void);
+
+/* §M81 — the account to open a session as WITHOUT asking, or NULL.  All three
+ * conditions in the implementation must hold; see users.c for why the third
+ * ("it is the only account") is what makes this safe rather than convenient. */
+const char* users_autologin_account(void);
+
+/* Can anybody actually sign in?  What makes a picker meaningful. */
+int users_anyone_can_sign_in(void);
 /* Print the standing warning.  Called from both boot paths, every boot. */
 void users_warn_default_password(void);
 
