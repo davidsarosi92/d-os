@@ -16,10 +16,9 @@ Everything below is measured unless it says otherwise.
 
 ## Branches
 
-- `main` — §M32 (users, permissions) stages 1–10, merged.
-- `m32-gui-login` — **current work, NOT merged.**  The accounts panel, the
+- `main` — everything, including `m32-gui-login` (the accounts panel, the
   default account, the Start-menu header + Lock/Sign out, the lock screen's
-  user picker, §M81's first measurement, and the fixes listed below.
+  user picker, the GUI sign-in and autologin), which is merged.
 
 ## The password DEFECT — measured, and it does not reproduce (2026-09-20)
 
@@ -229,22 +228,44 @@ instance of §M69's `even ? w : w` tell, and fatal for the charts, which answer
 and `ui_build` full-repainting a window its host repaints anyway (**0 → 3 → 1**
 full repaints).
 
-**⚠ THE OPEN NUMBER, and it is the next thing to work on.**  Twelve samples each
-side, same driven pointer sweep:
+**THE OPEN NUMBER — RE-MEASURED 2026-09-23 AND NOT REPRODUCED.**  §M81 recorded
+this, twelve samples a side, and did not record the gesture:
 
 | | median us/frame | range | area |
 |---|---|---|---|
-| hand-placed | **1386** | 828..3673 | 7..33 kpx |
-| composed | **2428** | 1781..3730 | 14..34 kpx |
+| hand-placed (as recorded) | 1386 | 828..3673 | 7..33 kpx |
+| composed (as recorded) | 2428 | 1781..3730 | 14..34 kpx |
 
-The distributions overlap only at the tails, so this is **not** the ±19 % noise
-floor §M69 measured — it is a real per-frame increase, and the AREA moved with
-it, so more is being DAMAGED rather than pixels being slower.  **Not
-root-caused.**  §M81's own risk list predicted exactly this; the next session
-should find it before converting any more windows.
+Re-measured with one fixed, written-down sweep (`scripts/bench-taskman-sweep.sh`,
+i386 -smp 4, only the 2 s windows with >= 24 frames), three ways — the two
+revisions of `5f26ae5` itself, and HEAD with the conversion reverted, which
+isolates the Task Manager as the one variable on today's engine:
 
-Candidates not yet excluded: the frame COUNT also rose (20-36 → 21-44 per 2 s),
-so something is generating more damage events under an identical gesture.
+| | windows | median us/frame | range | area |
+|---|---|---|---|---|
+| `e4e187e` hand-placed | 5 | 2693 | 2224..3050 | 18..25 kpx |
+| `5f26ae5` composed | 5 | 2993 | 2644..3425 | 21..24 kpx |
+| HEAD, conversion reverted | 16 | **2965** | 1568..5402 | 18..46 kpx |
+| HEAD, composed | 15 | **2964** | 2565..4532 | 20..40 kpx |
+
+**No difference beyond §M69's ±19 % noise floor, and the AREA did not move.**
+A temporary per-call damage log (`gui_window_request_redraw_rect` +
+`app_redraw`, caller by `__builtin_return_address`, mapped with `dos-sym.sh`)
+gives the same profile on both sides: per tick, four `w_chart_refresh` rects
+(156x96 vs 158x96), two or three `iv_damage_cell` cells (the CPU% and TIME
+columns, 44 px rows), the footer from `tm_refresh`; one `app_redraw` and 2-3
+`iv_damage_all` in the whole run, i.e. at open and layout, not per frame.  The
+table itself damages NOTHING under the moving pointer (`iv_hover` returns 1),
+and an empty `box` is zero-sized, so it cannot be hit and cannot be hovered.
+The footer was damaged more often on the composed run (54 vs 30), and that is
+DATA, not structure: it compares its text before it writes, and the CPU total in
+it changes on most refreshes.
+
+**So the recorded regression is most probably a different GESTURE, not a
+different build**, and it cannot be settled because the original was never
+written down.  *A benchmark whose recipe is not a file can be re-guessed, not
+re-run* — hence the script.  **Converting the remaining hand-placed windows is
+not blocked by this any more**; re-run the script before and after each one.
 
 ### The two capabilities, now built
 
