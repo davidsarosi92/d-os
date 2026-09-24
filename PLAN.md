@@ -288,6 +288,7 @@ what); a session can pick a theme and push on it.
 | M76 | **The aarch64 native syscall dispatcher — SWEPT** — ✅ **SHIPPED 2026-09-10 (DOCS §4.89)**: 26 of i386's 60 cases → **60 of 60**.  Found while §M75's own falsifier drowned an ARM log in `unknown number 35`; every native program using sockets, stat/getdents, threads, getrandom, uname or the dosgui bridge was **silently x86-only**, and the failure is a log line and a -1 rather than a link error, which is why it survived from §M25 to §M75.  **The blocker was the HARNESS, not the sweep** — `uidemo` could not be started on ARM at all (§4.74), so `gui.autorun` had to exist first.  Three cases are REFUSED WITH A REASON rather than wired: aarch64 has no I/O address space, and a driver told its port window was granted would fault at first access | Architecture | ✅ DOCS §4.89 |
 | M81 | **The GUI's seams — an audit of how it is assembled** — the compositor, the widget toolkit and the apps have grown by accretion, and §M32's GUI work spent three rounds in the wrong file because of it: an undocumented placement convention, a flag honoured in one of four dispatch paths, a strip that clipped a popup silently, and a window that lays out only if it was created the right way.  **The deliverable is a VERDICT with measurements, not a rewrite**: which seams are real, which are conventions nobody wrote down, and which communications with the kernel should become declared interfaces | UX / Architecture | §M81 — audit, verdict required |
 | M82 | **The SESSION becomes a first-class thing** — §M81 gave the GUI a real identity (`cred_become_user` on a session leader) and stopped there.  What the identity does not yet carry is a *desktop*: every user should have their own program list, icon field, wallpaper and environment, and the greeter and the lock should be SEPARATE from the session rather than windows inside it.  Includes per-user and system-wide `PATH`, with the user's overriding, and saving a session's state at sign-out | UX / Security | §M82 — designed, not started |
+| M83 | **Everything is a package, and the tree splits along the package lines** — asked for directly: *what can be, goes into its own repository; everything modular; everything manageable from `pkg` — desktop, compositor, GUI, Wayland, everything.*  Today no package can come from OUTSIDE the kernel image (every payload is a blob compiled into the 61 MB `kernel.bin`, and `/store` is ramfs rebuilt per boot), 21 registries are linker sections that only a build can fill, and a §M67 module can carry exactly one `struct driver` against 41 exported symbols.  Apps are proposed as RING-3 programs (§M65's `dosgui_ui_build` already exists), gui-core / shells / Wayland as module packages.  Staged so the REPOSITORY split comes LAST, gated on a green boundary audit — a split along lines the code does not yet respect is a refactor done across repositories | Architecture / Packaging | §M83 — designed, not started |
 
 ### Cross-cutting constraints
 
@@ -8466,3 +8467,175 @@ So "their own icons" is enforced by the path and not by the filesystem — which
 is fine and must be STATED, because the difference between "another user cannot
 see these" and "another user is not shown these" is exactly the isolation
 theatre §M33 refuses by name.
+
+## §M83 — Everything is a package, and the tree splits along the package lines
+
+Asked for directly (2026-09-24): *"what can be, has to be organised into
+separate repositories.  Everything should be modular.  Everything should be
+manageable from `pkg` — desktop, compositor, GUI, Wayland, and so on.
+Everything."*
+
+**Status: designed, not started.**
+
+### WHERE THE TREE ACTUALLY IS (measured 2026-09-24, not recalled)
+
+| fact | number |
+|---|---|
+| one git repository | 510 tracked files; ports under `third_party/` are fetched, not tracked |
+| `kernel/gui` (compositor, WM, toolkit, Wayland server, desktop shells) | ~21 600 lines, ring 0 |
+| `kernel/gui/apps` (15 apps) | ~5 500 lines, ring 0 |
+| `kernel.bin` (i386) | **61 MB**, almost all of it package payloads compiled in as blobs |
+| where `/store` lives | ramfs, rebuilt from the embedded recipes every boot (`pkg.store = disk` exists, not default — §4.72) |
+| linker-section registries (`__start_*` in `linker-i386.ld`) | **21**, all filled at LINK time only |
+| what a §M67 module can register | **one `struct driver`** (the `.dosmod` descriptor) |
+| symbols a module may call (`EXPORT_SYMBOL`) | **41** on i386 |
+
+So today the answer to "can `pkg` manage the desktop?" is *no, and for three
+separate reasons*, each of which has to be removed on its own:
+
+1. **A package cannot come from outside the image.**  `struct pkg_recipe`
+   carries `content` + `content_len`, a pointer into the kernel's own data.
+   There is no package FILE, so there is nothing to download, copy onto `/mnt`,
+   or update without rebuilding the kernel.  This also means the image size IS
+   the package set, which is why ~80 % of boot is GRUB reading 61 MB (§4.68).
+2. **Registries are closed at link time.**  A `GUI_APP()`, `DESKTOP_SHELL()`,
+   `WIDGET_CLASS()`, `SETTINGS_PANEL()`, `CONFIG_KEY()`, `LOCALE_CATALOG()` or
+   `SHELL_CMD()` exists only if it was linked in.  §M67 opened exactly one of
+   the 21 (drivers, through `driver_attach`).
+3. **The GUI is in ring 0.**  Loading it as a module is possible in principle,
+   but §M67 is explicit that a module is *as trusted as the kernel* — so "any
+   app from `pkg`" through that route would mean "any app in ring 0", which is
+   the thing §M33 and §M46 were built to stop.
+
+### THE ONE DECISION THIS MILESTONE HAS TO MAKE UP FRONT
+
+**What kind of package is each part of the GUI?**  There are three kinds, and
+they differ in trust rather than in format:
+
+| kind | runs in | trusted | exists today |
+|---|---|---|---|
+| **program / library** | ring 3 | no | ✅ (`pkgrun`, ld.so, musl) |
+| **kernel module** | ring 0 | as the kernel (§M67) | ◐ drivers only, never through `pkg` |
+| **boot set** | ring 0, in the image | as the kernel | ✅ (everything, today) |
+
+The proposed assignment, and why:
+
+- **Apps → ring-3 programs.**  §M65 already lets a ring-3 client build a real
+  toolkit interface (`dosgui_ui_build`: a spec as ints + a string pool, events
+  back on the queue), and `uidemo` proves it.  An app from a package is
+  third-party code, and third-party code does not belong in ring 0.  This is
+  also the cheapest part: the mechanism exists, the 15 apps are its clients.
+- **Compositor + WM + toolkit (`gui-core`) → a kernel module, for now.**  It
+  owns the framebuffer, the page flip and the input rings, and §M69/§M79's
+  frame budget was measured with it in ring 0.  Moving it to ring 3 is the
+  right long-term shape (it is what Wayland assumes) but it is a SEPARATE
+  milestone with its own measurement — doing both at once is how half-verified
+  things ship.  As a module it is still *managed by `pkg`*: versioned,
+  installed, replaced, and removable after `gui stop`.
+- **Desktop shells (`vista`, `bare`) → modules** registering into
+  `DESKTOP_SHELL`, chosen by `gui.shell` exactly as now.
+- **The Wayland server → a module first, a ring-3 program later.**  It is a
+  protocol server over sockets and shm; nothing in it needs ring 0 except that
+  it lives there today.
+- **The boot set stays in the image and is named.**  HAL, memory, the
+  scheduler, VFS, and the block + filesystem drivers needed to READ the store
+  cannot be packages, because the package manager needs them to exist.  With
+  `--no-disk` there is no store to read, so the boot set must also be able to
+  carry a default GUI — which makes "GUI in the image" a BUILD CHOICE (a list),
+  not a code property.
+
+*This assignment is a recommendation, not a decision already taken.*  The
+alternative — everything as ring-0 modules — is faster and gives up the one
+property that makes "install anything from `pkg`" safe.
+
+### STAGES, IN THE ORDER THE DEPENDENCIES ALLOW
+
+0. **THE MAP, BEFORE ANY CODE.**  For every candidate package (gui-core, each
+   desktop shell, each app, wayland, audio, net, each driver): which kernel
+   symbols it calls, which registries it fills, which headers it includes.
+   §M81's coupling metric is the tool (distinct symbols called across a
+   boundary, reproducing `gterm.c = 2` as the calibration).  **Deliverable: a
+   table with numbers**, because the export list in stage 3 is sized by it,
+   and a guessed export list is §M67's warning — an accidental ABI.
+
+1. **A PACKAGE IS A FILE.**  A package archive (manifest + payload files +
+   content hash), `pkg install <path>`, and the store on the persistent volume
+   by default when one exists.  The manifest carries what `pkg_recipe` carries
+   today (name, version, deps, abi, arch) plus a **kind** (program / library /
+   module) and, for a module, the **ABI namespaces it needs**.  Verified by
+   installing a package the image does not contain, rebooting, and running it.
+   *The embedded recipes become the boot set's packages*, not a second
+   mechanism.
+
+2. **`pkg` MANAGES MODULES.**  Installing a module package puts the `.ko` in
+   the store and loads it (`modules.autoload` already exists); removing it
+   calls `rmmod`, which already REFUSES while the module is in use (§M66's
+   lifetime rule).  Upgrade = load new + stop old, and the same refusal decides
+   whether that can happen live or needs a restart — said at the moment of the
+   command, never discovered later.
+
+3. **THE REGISTRIES OPEN, ONE AT A TIME.**  Generalise the `.dosmod`
+   descriptor from "one driver" to "a list of registrations", and give each
+   registry a runtime add/remove next to its linker section (the section stays:
+   it is how the boot set registers).  Each registry must answer the removal
+   question itself — *can this entry leave while something holds it?* — because
+   that is where every lifetime bug in this tree has come from (§M54, §M57,
+   §M66).  Order: the ones gui-core and a desktop shell need (`ui_classes`,
+   `item_views`, `desktop_shells`, `config_keys`, `config_watches`,
+   `settings_panels`, `locale_catalogs`, `shell_cmds`, `audits`).
+   **`ex_table` and `ksyms` never open** — a module does not get to add
+   exception fixups or exports for others.
+
+4. **THE EXPORT SURFACE GETS NAMESPACES.**  41 symbols will become hundreds
+   once gui-core is a module.  `EXPORT_SYMBOL_NS(gui, …)` plus a per-namespace
+   ABI fingerprint (§M67's structural check, scoped), so an app module is
+   checked against the `gui` interface and a driver against `driver`, and
+   deleting a line from either list is a visible breaking change.  Every
+   namespace is VERSIONED (the standing rule: everything versioned, so
+   everything can be updated).
+
+5. **THE APPS LEAVE RING 0.**  Each app becomes a ring-3 program on
+   `dosgui_ui_build`, one at a time, with the in-kernel copy deleted in the
+   same change (§M56.1's rule: a fallback kept past its usefulness is how a
+   feature works on one path and is silently unreachable on another).  The
+   Start menu already reads a registry, so a ring-3 app registers through the
+   same `GUI_APP` entry the package installs.  Measure each with
+   `bench-taskman-sweep.sh` before and after, because crossing the ring
+   boundary per event is a new cost.
+
+6. **gui-core, the shells and Wayland become module packages.**  The first
+   time the desktop is something `pkg list` shows and `pkg remove` refuses to
+   remove while it is running.
+
+7. **ONLY NOW: THE REPOSITORIES.**  Candidate split, one repo per package
+   line: `d-os-kernel` (boot set), `d-os-gui` (gui-core + shells + Wayland),
+   `d-os-apps`, `d-os-userland` (native libc, in-tree programs), `d-os-ports`
+   (the NetSurf / Mesa / musl / Wayland build recipes that `scripts/` holds
+   today), `d-os-assets` (fonts, wallpaper, logo), `d-os-tools` (the test
+   harness), and an **image manifest** repo that pins one version of each and
+   assembles the ISO.  **The precondition is a check, not a feeling:** an
+   include/symbol boundary audit in the monorepo that is GREEN — each future
+   repo builds against the published SDK only (headers + namespaced export
+   lists + fingerprints).  When it is green the split is `git filter-repo`
+   preserving history; when it is not, the split would be a refactor carried
+   out across repositories, where every cross-cutting change becomes N commits
+   that must land together.
+
+### THE RISKS THIS ONE CARRIES
+
+- **The monorepo is how this project tests itself.**  Every `dos-shell-test.py`
+  run assumes one tree and one build.  After the split, a change in
+  `d-os-kernel` must still be tested against the pinned GUI, and the image
+  manifest is where that happens — without it, each repo is green alone and
+  the image is broken, which is §M48's "the tested path and the used path are
+  different paths" at repository scale.
+- **A module GUI is still ring 0.**  Stage 6 makes the desktop MANAGEABLE, not
+  ISOLATED.  The report (`pkg info`, `lsmod`) must say which kind a package is,
+  because "installed from `pkg`" will otherwise be read as "sandboxed".
+- **Boot without a disk.**  If the GUI is only in the store, a `--no-disk` boot
+  has no desktop.  That must be a stated property of the chosen boot set, not a
+  surprise.
+- **Build time.**  Per-package builds against an SDK remove the "one make
+  builds everything" property.  The artifact cache (`build/.userartifacts`,
+  §M46) is the start of per-package caching and should be generalised rather
+  than replaced.

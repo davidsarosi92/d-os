@@ -1,15 +1,39 @@
-# Where things stand (2026-09-20)
+# Where things stand (2026-09-24)
 
-## §M82 is written up in PLAN.md — the session as a first-class thing
+## §M83 is written up in PLAN.md — everything a package, repos split last
 
-Asked for right after §M81 made the GUI sign-in real: separate the greeter and
-the lock from the session; per-user program list, icon list and wallpaper;
-system-wide and per-user `PATH` with the user's overriding; and sign-out saving
-what needs saving.  **Designed, not started.**  The one piece that may already
-work and has never been measured is the per-user WALLPAPER — `gui.wallpaper` is
-`CFG_SCOPE_USER` and `gui_start` now runs after `config_user_attach`, so measure
-before building.
+Asked for directly: separate repositories where possible, everything modular,
+everything (desktop, compositor, GUI, Wayland) manageable from `pkg`.
+**Designed, not started.**  The measured starting point: no package can come
+from outside the 61 MB kernel image, 21 registries are link-time only, and a
+module carries one `struct driver` against 41 exports.  The OPEN DECISION the
+plan states and recommends: apps as ring-3 programs (§M65's
+`dosgui_ui_build`), gui-core / shells / Wayland as module packages.  Stage 0
+is a coupling map with numbers; the repository split is stage 7, gated on a
+green boundary audit.
 
+## §M82 — started measuring, two findings, nothing built
+
+- **The GUI session path never withdraws the previous user's preferences.**
+  `config_user_detach` is called only by the TEXT `logout` (`login.c`);
+  `gui_session_main`, Sign out and `gui stop` never call it.  So user B's
+  session starts with every user-scoped key user A set and B did not — and
+  because `config_apply` writes the WHOLE user-scoped cache to the active
+  user's store, B's first preference change would copy A's values into B's
+  file.  **Read from the code, NOT yet shown by a run**: the harness loses
+  keystrokes across GUI start/stop (typed commands arrive merged, e.g.
+  `guitconf`), so the two-user scenario needs a non-typed driver
+  (`gui.autorun`-style) before it can be measured.  `config_user_detach` also
+  resets to the COMPILED default, while its own comment says "what the MACHINE
+  store says" — a machine-set wallpaper would be lost on sign-out.
+- **An NMI hard-lockup, once, not reproduced in 3 more runs.**  i386 -smp 2,
+  text console after `gui stop`: both CPUs' tick counters stopped at the same
+  moment (+0x193 / +0x18c since the sweep), CPU1 in `hal_cpu_halt`, CPU0 in
+  `lapic_w`.  Both stopping together looks like a guest-wide stall (or a host
+  stall under TCG), not one wedged core — §4.67.1's intermittent lockup again.
+  The report prints only `eip`; adding EFLAGS.IF and a short frame-pointer
+  backtrace is the cheap next step so the next occurrence names its cause.
+  Log kept at `/tmp/claude-501/m82/r3.log` (scratch, not durable).
 
 A short, durable note so work can resume without re-deriving the session.
 Everything below is measured unless it says otherwise.
