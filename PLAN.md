@@ -288,7 +288,7 @@ what); a session can pick a theme and push on it.
 | M76 | **The aarch64 native syscall dispatcher — SWEPT** — ✅ **SHIPPED 2026-09-10 (DOCS §4.89)**: 26 of i386's 60 cases → **60 of 60**.  Found while §M75's own falsifier drowned an ARM log in `unknown number 35`; every native program using sockets, stat/getdents, threads, getrandom, uname or the dosgui bridge was **silently x86-only**, and the failure is a log line and a -1 rather than a link error, which is why it survived from §M25 to §M75.  **The blocker was the HARNESS, not the sweep** — `uidemo` could not be started on ARM at all (§4.74), so `gui.autorun` had to exist first.  Three cases are REFUSED WITH A REASON rather than wired: aarch64 has no I/O address space, and a driver told its port window was granted would fault at first access | Architecture | ✅ DOCS §4.89 |
 | M81 | **The GUI's seams — an audit of how it is assembled** — the compositor, the widget toolkit and the apps have grown by accretion, and §M32's GUI work spent three rounds in the wrong file because of it: an undocumented placement convention, a flag honoured in one of four dispatch paths, a strip that clipped a popup silently, and a window that lays out only if it was created the right way.  **The deliverable is a VERDICT with measurements, not a rewrite**: which seams are real, which are conventions nobody wrote down, and which communications with the kernel should become declared interfaces | UX / Architecture | §M81 — audit, verdict required |
 | M82 | **The SESSION becomes a first-class thing** — §M81 gave the GUI a real identity (`cred_become_user` on a session leader) and stopped there.  What the identity does not yet carry is a *desktop*: every user should have their own program list, icon field, wallpaper and environment, and the greeter and the lock should be SEPARATE from the session rather than windows inside it.  Includes per-user and system-wide `PATH`, with the user's overriding, and saving a session's state at sign-out | UX / Security | §M82 — designed, not started |
-| M83 | **Everything is a package, and the tree splits along the package lines** — asked for directly: *what can be, goes into its own repository; everything modular; everything manageable from `pkg` — desktop, compositor, GUI, Wayland, everything.*  Today no package can come from OUTSIDE the kernel image (every payload is a blob compiled into the 61 MB `kernel.bin`, and `/store` is ramfs rebuilt per boot), 21 registries are linker sections that only a build can fill, and a §M67 module can carry exactly one `struct driver` against 41 exported symbols.  Apps are proposed as RING-3 programs (§M65's `dosgui_ui_build` already exists), gui-core / shells / Wayland as module packages.  Staged so the REPOSITORY split comes LAST, gated on a green boundary audit — a split along lines the code does not yet respect is a refactor done across repositories | Architecture / Packaging | §M83 — designed, not started |
+| M83 | **Everything is a package, and the tree splits along the package lines** — asked for directly: *what can be, goes into its own repository; everything modular; everything manageable from `pkg` — desktop, compositor, GUI, Wayland, everything.*  Today no package can come from OUTSIDE the kernel image (every payload is a blob compiled into the 61 MB `kernel.bin`, and `/store` is ramfs rebuilt per boot), 21 registries are linker sections that only a build can fill, and a §M67 module can carry exactly one `struct driver` against 41 exported symbols.  Apps are proposed as RING-3 programs (§M65's `dosgui_ui_build` already exists), gui-core / shells / Wayland as module packages — and **every ring-0 component is reviewed** (must stay / could move / unknown cost, with the reason and a measured boundary-crossing cost), because most of them are in the kernel by history rather than by requirement.  Staged so the REPOSITORY split comes LAST, gated on a green boundary audit — a split along lines the code does not yet respect is a refactor done across repositories | Architecture / Packaging | §M83 — designed, not started |
 
 ### Cross-cutting constraints
 
@@ -8544,13 +8544,60 @@ The proposed assignment, and why:
   carry a default GUI — which makes "GUI in the image" a BUILD CHOICE (a list),
   not a code property.
 
-*This assignment is a recommendation, not a decision already taken.*  The
+*This assignment is a recommendation, not a decision already taken — and it
+is itself subject to the ring-0 review below.*  The
 alternative — everything as ring-0 modules — is faster and gives up the one
 property that makes "install anything from `pkg`" safe.
 
+### EVERY RING-0 COMPONENT IS UNDER REVIEW — NOT ONLY THE GUI
+
+Added at the user's request (2026-09-24): *"every case that is in ring 0 has to
+be reviewed.  Not everything necessarily has to be there, I think — but right
+now I cannot say anything about it."*
+
+So the assignment above is a starting hypothesis for the GUI alone, and the
+question is wider: **for each thing that runs in ring 0 today, is ring 0 a
+REQUIREMENT or an ACCIDENT of where it was first written?**  Almost everything
+here landed in the kernel because the kernel was the only place with a build,
+a heap and a framebuffer at the time — which is a reason about history, not
+about the component.  That is convention #6's test (Linux-inspired, not
+Linux-bound: adopt what solves a problem we have, reject accidental history)
+applied to the ring boundary.
+
+**The review is a deliverable of stage 0, and its output is a table, not an
+opinion**: one row per ring-0 component (every `kernel/core` subsystem, every
+driver, the network stack, the audio mixer, the package manager itself, the
+shell and its commands, the config store, cron, the service supervisor, the
+crash sinks, the GUI pieces), each with:
+
+- **the verdict**: MUST stay in ring 0 / COULD move to ring 3 / COULD move but
+  the cost is unknown — and the third answer is allowed, because a forced
+  verdict is a guess wearing a table;
+- **the reason**, in terms of what it touches: privileged instructions, page
+  tables, interrupt context, the boot path before a store exists, the fault
+  path (§M47: capture must not allocate or block), or none of these;
+- **what moving it would cost**, measured where a measurement is possible —
+  the per-call cost of crossing the ring boundary is the number every row
+  depends on, and it has never been measured in this tree;
+- **what moving it would buy**: isolation (§M33's vocabulary — and the honest
+  report of what the hardware really enforces, §M68), independent update
+  through `pkg`, or nothing.
+
+**§M33 already did this for DRIVERS** — `.domains` as a declared capability,
+the kernel/user/isolated placements, and the refusal to report isolation the
+machine does not give.  The review extends the same question to everything
+else, and a component that turns out to belong in ring 3 should reuse that
+machinery (declared placement, supervisor, restart) rather than grow its own.
+
+**What is deliberately NOT decided here:** which rows actually move.  The review
+produces the evidence; each move is its own step with its own before/after
+measurement, and a component whose row says "unknown cost" is measured before
+it is moved, never moved to find out.
+
 ### STAGES, IN THE ORDER THE DEPENDENCIES ALLOW
 
-0. **THE MAP, BEFORE ANY CODE.**  For every candidate package (gui-core, each
+0. **THE MAP AND THE RING-0 REVIEW, BEFORE ANY CODE.**  The review table
+   described above, for every ring-0 component, plus the map below.  For every candidate package (gui-core, each
    desktop shell, each app, wayland, audio, net, each driver): which kernel
    symbols it calls, which registries it fills, which headers it includes.
    §M81's coupling metric is the tool (distinct symbols called across a

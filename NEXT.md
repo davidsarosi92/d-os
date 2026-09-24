@@ -9,8 +9,10 @@ from outside the 61 MB kernel image, 21 registries are link-time only, and a
 module carries one `struct driver` against 41 exports.  The OPEN DECISION the
 plan states and recommends: apps as ring-3 programs (§M65's
 `dosgui_ui_build`), gui-core / shells / Wayland as module packages.  Stage 0
-is a coupling map with numbers; the repository split is stage 7, gated on a
-green boundary audit.
+is a coupling map with numbers PLUS a review of EVERY ring-0 component (must
+stay / could move / unknown cost, with the reason) — asked for explicitly,
+because most of the kernel is there by history rather than by requirement.
+The repository split is stage 7, gated on a green boundary audit.
 
 ## §M82 — started measuring, two findings, nothing built
 
