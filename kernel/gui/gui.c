@@ -47,6 +47,7 @@
 #include "mouse.h"
 #include "timer.h"
 #include "config.h"
+#include "vfs.h"            /* §M82 sessiontest reads the stores back */
 #include "shellcmd.h"   /* §M76 — gui.autorun dispatches one command */
 #include "locale.h"
 #include "settings.h"   /* CONFIG_KEY — gui.occlude is a declared setting */
@@ -1571,19 +1572,46 @@ static int gui_teardown(void) {
      *    kill_tree takes the compositor, the app-hosts and every terminal with
      *    it — the same "parent dies → children die" rule the GUI is built on. */
     int dp = desktop_pid;
-    if (dp > 0) task_kill_tree(dp);
+    int sess[TASK_KILLTREE_MAX];
+    int nsess = dp > 0 ? task_kill_tree_pids(dp, sess, TASK_KILLTREE_MAX) : 0;
+    if (nsess < 0) nsess = 0;
 
-    /* 4. WAIT for the session to actually be gone.  Freeing a surface while the
-     *    compositor is mid-compose is a use-after-free of several megabytes,
-     *    and "we asked it to die" is not the same statement as "it is dead".
-     *    Poll for the task's DISAPPEARANCE rather than task_wait()ing on it:
-     *    init is a universal reaper and may collect it first, and waiting on a
-     *    child somebody else reaped never completes (§M57). */
-    if (dp > 0) {
-        for (int i = 0; i < 400 && task_find(dp); i++) task_msleep(5);
-        if (task_find(dp))
-            klog(KLOG_WARN, "gui", "desktop pid %d outlived the teardown "
-                                   "deadline - freeing anyway\n", dp);
+    /* 4. WAIT for the WHOLE session to actually be gone.  Freeing a surface
+     *    while the compositor is mid-compose is a use-after-free of several
+     *    megabytes, and "we asked it to die" is not the same statement as "it
+     *    is dead".  Poll for DISAPPEARANCE rather than task_wait()ing: init is
+     *    a universal reaper and may collect a task first, and waiting on a
+     *    child somebody else reaped never completes (§M57).
+     *
+     *    §M82 — EVERY MEMBER, NOT THE ROOT.  This used to wait for the desktop
+     *    alone, and the desktop dying says nothing about the compositor under
+     *    it — which is exactly the task the paragraph above is about.  The
+     *    compositor regularly outlived it (logs show `reaped 'compositor'`
+     *    AFTER `session ended`); a full-screen composite in flight then blitted
+     *    ~9 MB of wallpaper into a freed back buffer, and whatever the heap
+     *    handed out next — the NEW session's kernel stacks among it — was
+     *    overwritten.  Measured as a GPF at rip = 0xff0000ffff0000ff (two
+     *    wallpaper pixels) and as NMIs with the CPUs executing inside the font
+     *    DATA tables, 3 runs in 3 on x86_64 with a theme change mid-session
+     *    (which makes every frame full-screen and so widens the window).
+     *    The membership is captured AT KILL TIME because once the root is dead
+     *    its children are re-parented to init and cannot be found from it. */
+    {
+        int alive = 0;
+        for (int round = 0; round < 400; round++) {
+            alive = 0;
+            for (int k = 0; k < nsess; k++) if (task_find(sess[k])) alive++;
+            if (!alive) break;
+            task_msleep(5);
+        }
+        if (alive) {
+            for (int k = 0; k < nsess; k++) {
+                struct task* t = task_find(sess[k]);
+                if (t) klog(KLOG_WARN, "gui", "session task '%s' (pid %d) outlived the "
+                                             "teardown deadline - freeing anyway\n",
+                            t->name, t->pid);
+            }
+        }
     }
 
     /* 5. Windows.  Their hosts are dead, so nothing will run on_close on its
@@ -1685,6 +1713,15 @@ CONFIG_KEY(ck_autorun) = {
 static void gui_session_main(void) {
     gui_teardown();
 
+    /* §M82 — THE PREVIOUS USER LEAVES BEFORE THE NEXT ONE ARRIVES.  Every route
+     * that replaces a session passes through here (a sign-in over another
+     * session, Sign out, the lock screen's switch), and only the TEXT logout
+     * used to withdraw preferences — so the next person, or the greeter,
+     * inherited every choice the last one made, and the next user's first
+     * change copied them into their own store.  Measured by `sessiontest`.
+     * A no-op when nobody was attached. */
+    config_user_detach();
+
     if (pend_uid >= 0) {
         struct task* me = task_current();
         if (!me || cred_become_user(me->pid, pend_uid, pend_gid, pend_groups,
@@ -1738,8 +1775,232 @@ void gui_session_restart_as(const char* name) {
     need_frame  = 1;
 }
 
+/* §M82 — `sessiontest <a> <b>`: THE PREFERENCE BOUNDARY BETWEEN TWO SESSIONS,
+ * DRIVEN WITHOUT TYPING.
+ *
+ * Why it exists: the question "does user B see user A's wallpaper?" needs two
+ * sessions in a row, and this project's harness loses keystrokes across a GUI
+ * start/stop (§4.74's wall, one layer over — a typed `gui stop` arrived merged
+ * with the next command).  So the scenario runs on its OWN task through the
+ * REAL route (`gui_session_restart_as`, the call the lock screen and Sign out
+ * make) and prints one verdict per property.
+ *
+ * Password checking is deliberately NOT part of it: that is `gui.locktest`'s
+ * job, and folding it in would make a failure here ambiguous between "the
+ * login refused" and "the preferences leaked".
+ *
+ * What it checks, each a separate line so one failure cannot hide another:
+ *   1. B's session does not show a preference A set and B did not;
+ *   2. B's store on disk holds only what B set (not A's, not the machine's);
+ *   3. saving the MACHINE store during B's session does not write B's choice
+ *      into it (one person's wallpaper would become everybody's);
+ *   4. after sign-out the machine's own value is back — not the compiled
+ *      default, which would silently discard what an administrator chose.
+ *
+ * It CHANGES the machine's state (two user stores and the machine store), so
+ * it is hidden from `help` like the other falsifiers and wants a scratch disk. */
+static char st_a[32], st_b[32];
+
+static int st_wait_uid(int uid, int want_gui) {
+    for (int i = 0; i < 400; i++) {                 /* 400 x 50 ms = 20 s */
+        if (config_user_active() == uid && (!want_gui || gui_active)) return 0;
+        task_msleep(50);
+    }
+    return -1;
+}
+
+/* Does `path` contain the line prefix `key` + " ="?  A file that cannot be
+ * opened answers "no", which is what a missing store means. */
+static int st_file_has_value(const char* path, const char* key, const char* val) {
+    static char buf[2048];
+    struct file* f = vfs_open(path, VFS_RDONLY);
+    if (!f) return 0;
+    ssize_t n = vfs_read(f, buf, sizeof buf - 1);
+    vfs_close(f);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    int kl = 0; while (key[kl]) kl++;
+    for (ssize_t i = 0; i < n; i++) {
+        if (i && buf[i - 1] != '\n') continue;
+        int k = 0;
+        while (k < kl && buf[i + k] == key[k]) k++;
+        if (k != kl || (buf[i + k] != ' ' && buf[i + k] != '=')) continue;
+        if (!val) return 1;
+        int p = i + k;
+        while (buf[p] == ' ' || buf[p] == '=') p++;
+        int j = 0;
+        while (val[j] && buf[p + j] == val[j]) j++;
+        if (!val[j] && (buf[p + j] == '\n' || buf[p + j] == 0)) return 1;
+    }
+    return 0;
+}
+static int st_file_has(const char* path, const char* key) {
+    return st_file_has_value(path, key, NULL);
+}
+
+static int st_same(const char* a, const char* b) {
+    if (!a || !b) return a == b;
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+static void st_user_path(int uid, char* out, int cap) {
+    /* Mirrors config.c's layout: "<dir of the machine store>/d-os-user-<uid>.conf".
+     * Rebuilt here rather than exported because a test that asks the code
+     * under test where to look can only ever agree with it. */
+    const char* base = config_persist_path();
+    int n = 0, last = -1;
+    out[0] = 0;
+    if (!base) return;
+    for (int i = 0; base[i]; i++) if (base[i] == '/') last = i;
+    for (int i = 0; i < last && n < cap - 32; i++) out[n++] = base[i];
+    const char* leaf = "/d-os-user-";
+    for (int i = 0; leaf[i] && n < cap - 16; i++) out[n++] = leaf[i];
+    char num[12]; int m = 0, v = uid < 0 ? 0 : uid;
+    if (v == 0) num[m++] = '0';
+    while (v > 0 && m < 12) { num[m++] = (char)('0' + v % 10); v /= 10; }
+    while (m > 0 && n < cap - 6) out[n++] = num[--m];
+    const char* ext = ".conf";
+    for (int i = 0; ext[i] && n < cap - 1; i++) out[n++] = ext[i];
+    out[n] = 0;
+}
+
+static void gui_sessiontest_main(void) {
+    const struct user_account* ua = user_by_name(st_a);
+    const struct user_account* ub = user_by_name(st_b);
+    if (!ua || !ub) { kprintf("sessiontest: no such account\n"); return; }
+    int uida = ua->uid, uidb = ub->uid;
+    const char* mp = config_persist_path();
+    if (!mp) { kprintf("sessiontest: no writable volume - nothing to test\n"); return; }
+
+    /* The machine's own values, captured BEFORE any session touches them. */
+    static char m_wall[160], m_theme[32];
+    str_copy(m_wall,  config_get("gui.wallpaper", ""), sizeof m_wall);
+    str_copy(m_theme, config_get("gui.theme", ""),     sizeof m_theme);
+    kprintf("sessiontest: machine gui.wallpaper='%s' gui.theme='%s'\n", m_wall, m_theme);
+
+    int fails = 0;
+
+    gui_session_restart_as(st_a);
+    if (st_wait_uid(uida, 1)) { kprintf("sessiontest: '%s' never became active\n", st_a); return; }
+    config_apply("gui.wallpaper", "solid:FF0000");        /* A's choice */
+
+    gui_session_restart_as(st_b);
+    if (st_wait_uid(uidb, 1)) { kprintf("sessiontest: '%s' never became active\n", st_b); return; }
+
+    const char* w = config_get("gui.wallpaper", "");
+    int ok1 = st_same(w, m_wall);
+    kprintf("sessiontest: 1 %s - '%s' sees gui.wallpaper='%s' (machine '%s')\n",
+            ok1 ? "ok  " : "FAIL", st_b, w, m_wall);
+    fails += !ok1;
+
+    config_apply("gui.theme", "light");                   /* B's choice */
+    char pb[96]; st_user_path(uidb, pb, sizeof pb);
+    int leak_a = st_file_has(pb, "gui.wallpaper");
+    int leak_m = st_file_has(pb, "keyboard.layout");
+    int has_b  = st_file_has(pb, "gui.theme");
+    int ok2 = has_b && !leak_a && !leak_m;
+    kprintf("sessiontest: 2 %s - %s holds gui.theme:%s gui.wallpaper:%s keyboard.layout:%s\n",
+            ok2 ? "ok  " : "FAIL", pb, has_b ? "yes" : "NO",
+            leak_a ? "YES (A's)" : "no", leak_m ? "YES (never set by B)" : "no");
+    fails += !ok2;
+
+    config_save();                                        /* a machine save mid-session */
+    int ok3 = !st_same(m_theme, "light") ? !st_file_has_value(mp, "gui.theme", "light") : 1;
+    kprintf("sessiontest: 3 %s - machine store %s gui.theme=light after a save in '%s''s session\n",
+            ok3 ? "ok  " : "FAIL", ok3 ? "does not carry" : "CARRIES", st_b);
+    fails += !ok3;
+
+    gui_session_restart_as(NULL);                         /* Sign out */
+    if (st_wait_uid(-1, 1)) { kprintf("sessiontest: sign-out never withdrew '%s'\n", st_b); fails++; }
+    const char* w2 = config_get("gui.wallpaper", "");
+    const char* t2 = config_get("gui.theme", "");
+    int ok4 = st_same(w2, m_wall) && st_same(t2, m_theme);
+    kprintf("sessiontest: 4 %s - after sign-out gui.wallpaper='%s' gui.theme='%s'\n",
+            ok4 ? "ok  " : "FAIL", w2, t2);
+    fails += !ok4;
+
+    kprintf("sessiontest: %s (%d failure(s))\n", fails ? "FAIL" : "PASS", fails);
+}
+
+static void cmd_sessiontest(const char* args) {
+    int i = 0;
+    while (args && *args == ' ') args++;
+    while (args && *args && *args != ' ' && i < (int)sizeof st_a - 1) st_a[i++] = *args++;
+    st_a[i] = 0; i = 0;
+    while (args && *args == ' ') args++;
+    while (args && *args && *args != ' ' && i < (int)sizeof st_b - 1) st_b[i++] = *args++;
+    st_b[i] = 0;
+    if (!st_a[0] || !st_b[0]) { kprintf("usage: sessiontest <user-a> <user-b>\n"); return; }
+    if (!task_spawn_detached("sessiontest", gui_sessiontest_main))
+        kprintf("sessiontest: cannot spawn\n");
+}
+SHELL_CMD(sessiontest) = { "sessiontest", "<user-a> <user-b>", 0, SHELL_G_TEST,
+                           cmd_sessiontest, SHELL_P_ADMIN };
+
+/* §M82 — `sessionstorm <a> <b> <n>`: REPLACE THE SESSION n TIMES, FAST.
+ *
+ * Found while measuring the preference boundary: on x86_64, both with and
+ * without that fix, a machine left idle after a session switch took a GPF in
+ * the compositor at `rip = 0xff0000ffff0000ff` (two wallpaper pixels) or an NMI
+ * with the CPUs executing inside the font DATA tables — i.e. a code pointer
+ * read out of memory that has since been reused.  One switch reproduces it
+ * perhaps half the time, which is too slow to bisect with; this does many,
+ * alternating A, B and a sign-out, with uneven pauses so a race is not always
+ * sampled at the same phase.  Same shape as `killstorm` (§M54): a bug that
+ * needs a person and a reboot is a bug nobody can work on. */
+static int storm_n, storm_mode;   /* mode: 1 = paint a wallpaper, 2 = flip the theme */
+static void gui_sessionstorm_main(void) {
+    const struct user_account* ua = user_by_name(st_a);
+    const struct user_account* ub = user_by_name(st_b);
+    if (!ua || !ub) { kprintf("sessionstorm: no such account\n"); return; }
+    for (int i = 0; i < storm_n; i++) {
+        const char* who = (i % 3 == 0) ? st_a : (i % 3 == 1) ? st_b : NULL;
+        int uid = (i % 3 == 0) ? ua->uid : (i % 3 == 1) ? ub->uid : -1;
+        gui_session_restart_as(who);
+        if (st_wait_uid(uid, 1)) {
+            kprintf("sessionstorm: round %d - session for %s never came up\n",
+                    i, who ? who : "(signed out)");
+            return;
+        }
+        kprintf("sessionstorm: round %d up (%s)\n", i, who ? who : "signed out");
+        /* What `sessiontest` does mid-session, from a task that is not the
+         * compositor — each separately switchable, to bisect the corruption. */
+        if (storm_mode & 1) config_apply("gui.wallpaper", (i & 1) ? "solid:FF0000" : "solid:00FF00");
+        if (storm_mode & 2) config_apply("gui.theme", (i & 1) ? "light" : "dark");
+        task_msleep(150 + (uint32_t)((i * 137) % 900));
+    }
+    kprintf("sessionstorm: %d rounds done\n", storm_n);
+}
+
+static void cmd_sessionstorm(const char* args) {
+    int i = 0;
+    while (args && *args == ' ') args++;
+    while (args && *args && *args != ' ' && i < (int)sizeof st_a - 1) st_a[i++] = *args++;
+    st_a[i] = 0; i = 0;
+    while (args && *args == ' ') args++;
+    while (args && *args && *args != ' ' && i < (int)sizeof st_b - 1) st_b[i++] = *args++;
+    st_b[i] = 0;
+    while (args && *args == ' ') args++;
+    storm_n = 0;
+    while (args && *args >= '0' && *args <= '9') storm_n = storm_n * 10 + (*args++ - '0');
+    while (args && *args == ' ') args++;
+    storm_mode = 0;
+    while (args && *args >= '0' && *args <= '9') storm_mode = storm_mode * 10 + (*args++ - '0');
+    if (!st_a[0] || !st_b[0] || storm_n <= 0) {
+        kprintf("usage: sessionstorm <user-a> <user-b> <rounds>\n"); return;
+    }
+    if (!task_spawn_detached("sessionstorm", gui_sessionstorm_main))
+        kprintf("sessionstorm: cannot spawn\n");
+}
+SHELL_CMD(sessionstorm) = { "sessionstorm", "<user-a> <user-b> <rounds> [mode]", 0,
+                            SHELL_G_TEST, cmd_sessionstorm, SHELL_P_ADMIN };
+
 static void gui_stop_main(void) {
     gui_teardown();
+    /* Leaving the GUI ends the session it was running: the text console
+     * behind it was never that user's (§M82, same reason as above). */
+    config_user_detach();
     task_exit();
 }
 

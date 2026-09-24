@@ -8468,6 +8468,33 @@ is fine and must be STATED, because the difference between "another user cannot
 see these" and "another user is not shown these" is exactly the isolation
 theatre §M33 refuses by name.
 
+### PROGRESS — 2026-09-24: THE PREFERENCE BOUNDARY, AND A TEARDOWN BUG UNDER IT
+
+"Measure before building" on the per-user wallpaper found that the boundary
+itself was broken, not merely unbuilt:
+
+- **the GUI never withdrew a user.**  `config_user_detach` ran only on the text
+  `logout`; every GUI route that replaces a session now calls it
+  (`gui_session_main`, and `gui stop`).
+- **the cache had one layer.**  A user value overwrote the machine's, so
+  withdrawal fell back to the compiled default, the user's file was a snapshot
+  of every user-scoped key, and a machine save mid-session wrote the user's
+  choice into the machine store.  Entries now carry the machine value aside
+  (`user_set` / `machine`).
+- **the GUI teardown freed the screen while the compositor still drew on it.**
+  It waited for the session ROOT only; once that is dead its children are
+  re-parented to init and cannot be found from it.  `task_kill_tree_pids()`
+  captures the subtree at kill time and the teardown waits for all of it.  This
+  was the x86_64 GPF / NMI seen during the measurement, and very probably the
+  unexplained i386 NMI after `gui stop`.
+
+Two hidden falsifiers ship with it: `sessiontest <a> <b>` (four checks on the
+real `gui_session_restart_as`) and `sessionstorm <a> <b> <n> [mode]` (many
+session replacements, optionally painting a wallpaper and flipping the theme
+from a foreign task).  **The four pieces of §M82 proper are still not
+started**; the wallpaper question they began with is now answered: it IS
+per-user, and with this fix it stays that way across a switch.
+
 ## §M83 — Everything is a package, and the tree splits along the package lines
 
 Asked for directly (2026-09-24): *"what can be, has to be organised into

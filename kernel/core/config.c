@@ -53,9 +53,28 @@ static int is_space(char c) { return c == ' ' || c == '\t'; }
 /* Cache state.                                                         */
 /* ------------------------------------------------------------------- */
 
+/* §M82 — TWO LAYERS IN ONE ENTRY.
+ *
+ * `value` is what everybody reads: the user's choice while one is attached,
+ * the machine's otherwise.  When a signed-in user first overrides a
+ * USER-scoped key, the machine's value is moved aside into `machine`
+ * (`has_machine` = 0 means the machine had set nothing at all) and `user_set`
+ * marks the override.  Three things depend on that record and were wrong
+ * without it, each measured by `sessiontest`:
+ *   - sign-out restores what the MACHINE says, not the compiled default (and
+ *     only the keys the user actually changed);
+ *   - the user's store holds only what the user set, rather than a snapshot of
+ *     every user-scoped key in the cache — which froze machine values into the
+ *     file and carried the previous user's choices into the next user's;
+ *   - the machine store written during a session carries the machine's value,
+ *     never the signed-in user's — otherwise one person's wallpaper becomes
+ *     everybody's the first time an administrator presses Save. */
 struct entry {
     char* key;
     char* value;
+    char* machine;       /* the machine layer while `user_set`; else NULL  */
+    uint8_t has_machine; /* 0 = the machine had no value for this key      */
+    uint8_t user_set;    /* the active user overrides this key             */
     struct entry* next;
 };
 static struct entry* head = NULL;
@@ -100,6 +119,12 @@ long config_get_long(const char* key, long def) {
     return neg ? -v : v;
 }
 
+static struct entry* find_entry(const char* key) {
+    for (struct entry* e = head; e; e = e->next)
+        if (streq(e->key, key)) return e;
+    return NULL;
+}
+
 int config_set(const char* key, const char* value) {
     if (!key || !value) return -1;
     /* Replace existing. */
@@ -117,6 +142,9 @@ int config_set(const char* key, const char* value) {
     if (!e) return -3;
     e->key   = strdup_(key);
     e->value = strdup_(value);
+    e->machine = NULL;
+    e->has_machine = 0;
+    e->user_set = 0;
     e->next  = head;
     head     = e;
     return 0;
@@ -175,7 +203,31 @@ int config_apply(const char* key, const char* value) {
      * is the whole defaults table. */
     const char* old = config_get(key, (const char*)0);
     int same = old && streq(old, value);
+
+    /* §M82 — a user override moves the machine's value aside FIRST, while it
+     * is still the value in the cache.  Recorded even when the new value is
+     * the same, because "the user chose this" is a fact about the store even
+     * when it is not a change on screen. */
+    int user_layer = config_user_active() >= 0 &&
+                     config_key_scope(key) == CFG_SCOPE_USER;
+    char* moved = NULL;
+    int   had   = 0;
+    struct entry* pe = find_entry(key);
+    if (user_layer && !(pe && pe->user_set)) {
+        had = pe != NULL;
+        if (had) { moved = strdup_(pe->value); if (!moved) return -3; }
+    }
     int rc = config_set(key, value);
+    if (rc == 0 && user_layer) {
+        struct entry* ne = find_entry(key);
+        if (ne && !ne->user_set) {
+            ne->user_set    = 1;
+            ne->has_machine = (uint8_t)had;
+            ne->machine     = moved;
+            moved = NULL;
+        }
+    }
+    if (moved) kfree(moved);
     if (rc == 0 && !same) {
         /* LOG the decision.  A settings change is a change to how the machine
          * behaves, and until now the only trace of one was whatever the
@@ -252,9 +304,15 @@ static int save_to(const char* path) {
     vfs_write(f, hdr, strlen_(hdr));
 
     for (struct entry* e = head; e; e = e->next) {
+        /* The MACHINE's value, never the signed-in user's override (§M82). */
+        const char* v = e->value;
+        if (e->user_set) {
+            if (!e->has_machine) continue;      /* the machine never set it */
+            v = e->machine;
+        }
         vfs_write(f, e->key,  strlen_(e->key));
         vfs_write(f, " = ",   3);
-        vfs_write(f, e->value, strlen_(e->value));
+        vfs_write(f, v, strlen_(v));
         vfs_write(f, "\n",    1);
     }
     vfs_close(f);
@@ -542,19 +600,43 @@ int config_user_detach(void) {
     user_uid_active = -1;
     user_path[0] = 0;
 
-    /* Put every USER-scoped key back to what the MACHINE store says (or to its
-     * compiled-in default when the machine store is silent).  Without this the
+    /* Put every key THIS USER overrode back to what the MACHINE says — and
+     * where the machine had set nothing, back to unset, so every reader falls
+     * to its own default exactly as before the session.  Without this the
      * last session's wallpaper stays on the screen after the logout — which is
      * not merely untidy: it leaks one user's preferences to the next person at
      * the console, and on a shared machine a preference can be a fact about
-     * somebody (their language, their layout). */
-    int n = config_key_count();
-    for (int i = 0; i < n; i++) {
-        const struct config_key_def* d = config_key_at(i);
-        if (!d || d->scope != CFG_SCOPE_USER) continue;
-        config_apply(d->key, d->def ? d->def : "");
+     * somebody (their language, their layout).
+     *
+     * §M82: this used to reset EVERY user-scoped key to its compiled default,
+     * which threw away the administrator's machine-wide choice on every
+     * sign-out and touched keys the user had never changed. */
+    int restored = 0;
+    struct entry** pp = &head;
+    while (*pp) {
+        struct entry* e = *pp;
+        if (!e->user_set) { pp = &e->next; continue; }
+        restored++;
+        if (e->has_machine) {
+            kfree(e->value);
+            e->value = e->machine;
+            e->machine = NULL;
+            e->user_set = 0;
+            e->has_machine = 0;
+            klog(KLOG_INFO, "config", "%s = %s (machine value, user withdrawn)\n",
+                 e->key, e->value);
+            config_notify(e->key, e->value);
+            pp = &e->next;
+        } else {
+            *pp = e->next;
+            const struct config_key_def* d = config_key_find(e->key);
+            const char* def = (d && d->def) ? d->def : "";
+            klog(KLOG_INFO, "config", "%s unset (user withdrawn)\n", e->key);
+            config_notify(e->key, def);
+            kfree(e->key); kfree(e->value); kfree(e);
+        }
     }
-    kprintf("config: preferences for uid %d withdrawn\n", uid);
+    kprintf("config: preferences for uid %d withdrawn (%d key(s))\n", uid, restored);
     return 0;
 }
 
@@ -565,7 +647,9 @@ int config_user_save(void) {
     const char* hdr = "# d-os per-user preferences — managed by config.c\n";
     vfs_write(f, hdr, strlen_(hdr));
     for (struct entry* e = head; e; e = e->next) {
-        if (config_key_scope(e->key) != CFG_SCOPE_USER) continue;
+        /* Only what THIS user chose (§M82) — not a snapshot of every
+         * user-scoped key the cache happens to hold. */
+        if (!e->user_set) continue;
         vfs_write(f, e->key, strlen_(e->key));
         vfs_write(f, " = ", 3);
         vfs_write(f, e->value, strlen_(e->value));

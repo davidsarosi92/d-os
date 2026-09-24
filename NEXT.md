@@ -14,28 +14,35 @@ stay / could move / unknown cost, with the reason) — asked for explicitly,
 because most of the kernel is there by history rather than by requirement.
 The repository split is stage 7, gated on a green boundary audit.
 
-## §M82 — started measuring, two findings, nothing built
+## §M82 — the preference boundary FIXED, and the teardown use-after-free under it
 
-- **The GUI session path never withdraws the previous user's preferences.**
-  `config_user_detach` is called only by the TEXT `logout` (`login.c`);
-  `gui_session_main`, Sign out and `gui stop` never call it.  So user B's
-  session starts with every user-scoped key user A set and B did not — and
-  because `config_apply` writes the WHOLE user-scoped cache to the active
-  user's store, B's first preference change would copy A's values into B's
-  file.  **Read from the code, NOT yet shown by a run**: the harness loses
-  keystrokes across GUI start/stop (typed commands arrive merged, e.g.
-  `guitconf`), so the two-user scenario needs a non-typed driver
-  (`gui.autorun`-style) before it can be measured.  `config_user_detach` also
-  resets to the COMPILED default, while its own comment says "what the MACHINE
-  store says" — a machine-set wallpaper would be lost on sign-out.
-- **An NMI hard-lockup, once, not reproduced in 3 more runs.**  i386 -smp 2,
-  text console after `gui stop`: both CPUs' tick counters stopped at the same
-  moment (+0x193 / +0x18c since the sweep), CPU1 in `hal_cpu_halt`, CPU0 in
-  `lapic_w`.  Both stopping together looks like a guest-wide stall (or a host
-  stall under TCG), not one wedged core — §4.67.1's intermittent lockup again.
-  The report prints only `eip`; adding EFLAGS.IF and a short frame-pointer
-  backtrace is the cheap next step so the next occurrence names its cause.
-  Log kept at `/tmp/claude-501/m82/r3.log` (scratch, not durable).
+"Measure before building" on the per-user wallpaper found three defects in the
+boundary and one memory-corruption bug in the GUI teardown.  All fixed; see
+DOCS.md (§M32 "Settings that belong to a person", the §M82 correction) and the
+PROGRESS note in PLAN §M82.
+
+- `config.c` now keeps the MACHINE value aside when a user overrides a key;
+  withdrawal restores it (or unsets), the user store holds only overrides, the
+  machine store only machine values.
+- the GUI withdraws the previous user on every session replacement and on
+  `gui stop` (it never did — only the text `logout` did).
+- `gui_teardown` waited for the desktop only; the compositor (its child,
+  re-parented to init once the desktop died) kept compositing into the freed
+  back buffer.  That was the x86_64 GPF at `rip=0xff0000ffff0000ff` and the NMIs
+  inside the font tables, and very probably the i386 NMI seen after `gui stop`.
+  `task_kill_tree_pids()` + wait for every member.
+
+Falsifiers (hidden from `help`, need two accounts and a scratch disk):
+`sessiontest <a> <b>` and `sessionstorm <a> <b> <n> [mode]` — mode 2 (theme
+flip from a foreign task) is the reproducer for the teardown bug.
+
+**The harness still loses keystrokes across a GUI start/stop** (a typed
+`gui stop` arrived merged with the next command as `guitconf`).  Not fixed —
+the two commands above exist to route around it; the harness itself is worth a
+look before the next GUI-session test that needs typing.
+
+**§M82 proper (greeter, per-user desktop dir, PATH, program list, sign-out
+saving) is NOT started.**  Next in that order.
 
 A short, durable note so work can resume without re-deriving the session.
 Everything below is measured unless it says otherwise.

@@ -13188,6 +13188,47 @@ saved nothing.  The file is made by the system at account creation and handed
 over at 0600 — *the alternative was to let the save bypass the permission check,
 which is a boundary with a door in it for the code that built the boundary.*
 
+**§M82 CORRECTION (2026-09-24): THE OVERLAY HAD ONE LAYER, AND THE GUI NEVER
+WITHDREW IT.**  The round trip above is the TEXT login; the GUI sign-in (§M81)
+replaced sessions without calling `config_user_detach` at all, so the next user
+— or the greeter — inherited every preference the last one set.  Underneath it,
+the cache had no layers: a user's value simply OVERWROTE the machine's, so
+(1) withdrawal could only fall back to the COMPILED default, discarding the
+administrator's machine-wide choice; (2) the user's file was a snapshot of every
+user-scoped key in the cache, which froze machine values into it and carried the
+previous user's choices into the next user's file; and (3) a machine save during
+a session wrote the signed-in user's choice into the machine store — one
+person's wallpaper, everybody's.  Now an entry records the machine's value
+(`machine`, `has_machine`) the first time a user overrides it (`user_set`);
+the user store holds only overrides, the machine store only machine values, and
+withdrawal restores the machine's value or unsets the key.  The GUI withdraws on
+every route that replaces a session (`gui_session_main`) and on `gui stop`.
+**Measured by `sessiontest <a> <b>`** (hidden, drives the real
+`gui_session_restart_as`, four checks): FAIL / FAIL / FAIL on the old code, all
+four ok after, with a machine wallpaper of `solid:0000FF` restored on sign-out
+and the screen reading `(0,0,255)`.
+
+**AND THE SAME MEASUREMENT FOUND A USE-AFTER-FREE IN THE GUI TEARDOWN.**
+`gui_teardown` killed the session tree and then waited for the ROOT (the
+desktop) alone — the paragraph above that wait says "freeing a surface while the
+compositor is mid-compose is a use-after-free", and the code did not wait for
+the compositor.  Once the desktop is dead its children are re-parented to init,
+so they cannot be found from it; the log shows `reaped 'compositor' (…, ppid 7)`
+AFTER `session ended`.  A full-screen composite in flight then wrote ~9 MB of
+wallpaper into the freed back buffer, and whatever the heap handed out next was
+overwritten: a GPF at `rip = 0xff0000ffff0000ff` (two wallpaper pixels) and NMIs
+with the CPUs executing inside the font DATA tables — 3 runs in 3 on x86_64
+with a theme change mid-session (which makes every frame full-screen and so
+widens the window), and the unexplained i386 NMI after a `gui stop` fits the
+same shape.  `task_kill_tree_pids()` now returns the whole subtree captured AT
+KILL TIME, and the teardown waits for every member.  **`sessionstorm <a> <b>
+<n> [mode]`** (hidden; mode 1 = paint a wallpaper, 2 = flip the theme, from a
+foreign task, each round) is the reproducer: mode 2 died at round 11 before,
+20 of 20 rounds clean after; with both modes, 30 of 30 on x86_64 and 24 on
+i386 (the run's time limit) with no fault, and in every log no session task
+outlived the teardown and no compositor was reaped after `session ended`.
+`sessiontest` passes 3/3 on x86_64 and 2/2 on i386; aarch64 builds silent.
+
 #### Stage 10 — the lock surface, and the instrument that made it provable
 
 `gui.login` (default OFF) raises a modal authentication window over the

@@ -1993,8 +1993,18 @@ void task_set_reap_owned(struct task* t, int owned) {
  * subtree's pids under the lock, then flag them after releasing it.  The
  * subtree is grown to a fixpoint — each pass adopts tasks whose parent is
  * already marked — which handles arbitrary depth in a few cheap passes. */
-#define KILLTREE_MAX 64
-int task_kill_tree(int pid) {
+#define KILLTREE_MAX TASK_KILLTREE_MAX   /* one number, task.h owns it */
+/* §M82 — kill a subtree AND say who was in it.
+ *
+ * `task_kill_tree` answers "how many did I ask to die", which is not enough for
+ * a caller that must wait for the whole subtree to be GONE before freeing what
+ * it used.  Waiting for the ROOT alone is the trap the GUI teardown fell into:
+ * the root dying says nothing about its children, and once it is dead they are
+ * re-parented to init (§M27), so they can no longer be found by walking down
+ * from it.  The membership therefore has to be captured HERE, at kill time,
+ * while the tree is still a tree.  Returns the number of pids written to `out`
+ * (the whole subtree, root first), or a negative value if the root refused. */
+static int kill_tree_impl(int pid, int* out, int max, int* killed) {
     if (pid <= 0) return -1;
     /* §M32 — the ROOT of the subtree decides.  Checking each member instead
      * would let a user take down a tree by owning one leaf of it, and would
@@ -2031,10 +2041,22 @@ int task_kill_tree(int pid) {
     }
     spin_unlock_irqrestore(&master_lock, fl);
 
+    int k = 0;
+    for (int i = 0; i < n; i++) if (task_kill(ids[i]) == 0) k++;
+    if (killed) *killed = k;
+    int w = 0;
+    for (int i = 0; i < n && out && w < max; i++) out[w++] = ids[i];
+    return w;
+}
+
+int task_kill_tree_pids(int pid, int* out, int max) {
+    return kill_tree_impl(pid, out, max, NULL);
+}
+
+int task_kill_tree(int pid) {
     int killed = 0;
-    for (int i = 0; i < n; i++)
-        if (task_kill(ids[i]) == 0) killed++;
-    return killed;
+    int rc = kill_tree_impl(pid, NULL, 0, &killed);
+    return rc < 0 ? rc : killed;      /* unchanged contract: how many were killed */
 }
 
 /* ---- init / reaper task --------------------------------------------- */

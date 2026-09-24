@@ -577,6 +577,11 @@ void task_exit_code(int code) __attribute__((noreturn));
 void task_start_init(void);
 int  task_reaper_pid(void);
 int  task_kill_tree(int pid);
+/* §M82 — the same kill, reporting every pid in the subtree (root first) so a
+ * caller can wait for ALL of them to be gone; see task.c.  Returns the count
+ * written to `out`, or < 0 if the root refused. */
+int  task_kill_tree_pids(int pid, int* out, int max);
+#define TASK_KILLTREE_MAX 64
 void task_set_reap_owned(struct task* t, int owned);
 
 /* Tier A.2 — block until a child exits, POSIX waitpid-shaped.
