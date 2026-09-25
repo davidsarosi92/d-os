@@ -20,6 +20,24 @@ focus, `pane split h|v` to split).
 
 ## Status (update when a milestone ships)
 
+🔧 **BUG-FIX ROUND (2026-09-24/25) — see NEXT.md "Known defects" for the full
+triage.**  Four root causes, each behind several symptoms: (1) **virtio-blk left
+its SHARED LEVEL IRQ (10) asserted** — it polls and never said so — so CPU 0 took
+an interrupt storm that starved the PIT and the keyboard ("the harness loses
+keystrokes", stalled `task_msleep`/cron, the §M23/§M67 HDA replay); fixed at the
+source, and `irq_install` now CHAINS handlers instead of silently replacing the
+previous one.  (2) **The x86 ms clock COUNTED PIT INTERRUPTS and ran at 80 % under
+QEMU** — every x86 timing figure measured before 2026-09-25 (incl. §M53's lateness
+and the LAPIC/TSC calibrations) is self-consistent, not true; it now reads the
+ACPI PM timer.  (3) **GUI teardown waited for the session ROOT only** and freed
+the screen under a still-running compositor.  (4) **config had one layer**, so
+preferences leaked between GUI sessions.  New instruments: `!! PIT STARVED`
+(falsifier `pitstarvetest`), an NMI report that names task/IF/in-service
+vector/stack, `sessiontest`, `sessionstorm`, `scripts/wav-analyze.py`,
+`scripts/bench-taskman-sweep.sh`, monitor replies in `<log>.mon`.  **NEXT (user
+requirement): sign-out and shutdown must stop programs GRACEFULLY, IN ORDER** —
+today one `kill_tree` takes the session down at once.
+
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there
 something that finds bugs — a thing started in ring 0 that should have been in
