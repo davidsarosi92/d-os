@@ -99,6 +99,42 @@ static inline void lapic_w(uint32_t off, uint32_t v) {
     *(volatile uint32_t*)(g_lapic_mmio + off) = v;
 }
 
+/* §M82 session — WHAT IS THIS CPU STILL SERVICING?
+ *
+ * The in-service register (ISR, eight 32-bit words at 0x100..0x170) holds one
+ * bit per vector whose handler has been entered and not yet EOI'd.  A vector
+ * stuck there blocks every vector of its own priority class and below — which
+ * is exactly how a level-triggered PCI line nobody acknowledged starved the PIT
+ * and the keyboard for good, with the LAPIC timer (a higher class) still
+ * ticking and so no NMI.  QEMU's `info lapic` read "ISR 42, IRR 32, PPR 0x20"
+ * and that one line was the whole diagnosis; these two accessors put the same
+ * facts into the kernel's own reports.  Plain MMIO reads: safe from NMI. */
+int lapic_isr_highest_below(int limit) {
+    if (!g_lapic_mmio) return -1;
+    for (int w = 7; w >= 0; w--) {
+        uint32_t v = lapic_r(0x100u + (uint32_t)w * 0x10u);
+        if (!v) continue;
+        for (int b = 31; b >= 0; b--) {
+            int vec = w * 32 + b;
+            if ((v & (1u << b)) && vec < limit) return vec;
+        }
+    }
+    return -1;
+}
+int lapic_isr_highest(void) { return lapic_isr_highest_below(256); }
+uint32_t lapic_tpr(void) {
+    return g_lapic_mmio ? lapic_r(0x80u) : 0;
+}
+uint32_t lapic_ppr(void) {
+    return g_lapic_mmio ? lapic_r(0xA0u) : 0;
+}
+/* Task priority: vectors whose class is <= tpr >> 4 are held off on this CPU.
+ * Exists for ONE caller, the starvation falsifier (`pitstarvetest`), which
+ * uses it to reproduce the §M82-session storm's effect on purpose. */
+void lapic_set_tpr(uint32_t tpr) {
+    if (g_lapic_mmio) lapic_w(0x80u, tpr);
+}
+
 /* IA32_APIC_BASE MSR (0x1B): bit 11 = APIC global enable. */
 static inline uint64_t rdmsr(uint32_t msr) {
     uint32_t lo, hi;
@@ -294,3 +330,47 @@ void lapic_timer_stop(void) {
     lapic_w(LAPIC_REG_LVT_TIMER, LAPIC_LVT_MASKED);
     lapic_w(LAPIC_REG_INITCNT, 0);
 }
+
+/* ---------------------------------------------------------------------------
+ * §M82 session — `pitstarvetest`: the starvation detector's FALSIFIER.
+ *
+ * `pit_starvation_check` (idt.c) claims to notice the ms clock stopping while
+ * the LAPIC keeps ticking.  A check nobody has made fail is a comment, so this
+ * reproduces the storm's EFFECT on purpose and reversibly: raise CPU 0's task
+ * priority to 0x2F, which holds off exactly the 0x20 class (the PIT, the
+ * keyboard, every ISA line) while the LAPIC timer at 0x40 still gets through —
+ * the same shape the unacknowledged virtio-blk line produced, minus the device.
+ *
+ * Pinned to CPU 0 because the PIT is delivered only there, and preemption is
+ * off for the duration so the task cannot migrate away with CPU 0's TPR still
+ * raised (restoring it on another CPU would leave CPU 0 deaf for good).
+ * Interrupts stay ON — the detector runs from the LAPIC tick, which is the
+ * point.  Hidden from `help`: it deliberately freezes the clock for 1.5 s.
+ * ------------------------------------------------------------------------- */
+#include "task.h"
+#include "lock.h"
+#include "shellcmd.h"
+#include "percpu.h"
+
+static void pitstarvetest(const char* args) {
+    (void)args;
+    extern volatile uint32_t g_pit_starved;
+    struct task* me = task_current();
+    if (me) task_set_affinity(me, 1u << 0);
+    int cpu = -1;
+    for (int i = 0; i < 100 && (cpu = this_cpu_id()) != 0; i++) task_yield();
+    if (cpu != 0) { kprintf("pitstarvetest: could not pin to CPU 0 (on %d)\n", cpu); return; }
+
+    uint32_t before = g_pit_starved;
+    uint64_t t0 = timer_now_ns();
+    preempt_disable();
+    lapic_set_tpr(0x2F);
+    while (timer_now_ns() - t0 < 1500000000ull) hal_cpu_pause();
+    lapic_set_tpr(0);
+    preempt_enable();
+    uint32_t after = g_pit_starved;
+    kprintf("pitstarvetest: held the 0x20 class off on CPU 0 for 1500 ms - the "
+            "detector reported %u episode(s): %s\n", after - before,
+            after != before ? "PASS" : "FAIL (a starved clock would go unnoticed)");
+}
+SHELL_CMD(pitstarvetest) = { "pitstarvetest", "", 0, SHELL_G_TEST, pitstarvetest, SHELL_P_ADMIN };

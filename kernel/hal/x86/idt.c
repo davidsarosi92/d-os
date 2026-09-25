@@ -424,6 +424,93 @@ static void ring0_fault_policy(int sig) {
  * C-side dispatch.  Called from the common asm stub with a pointer to the
  * frame on the kernel stack.
  * -------------------------------------------------------------------------- */
+
+/* §M82 session — THE MILLISECOND CLOCK MUST NOT STOP WHILE THE CPU TICKS.
+ *
+ * On x86 the kernel's ms clock is the PIT (IRQ0, vector 0x20) while the
+ * scheduler tick is the LAPIC timer (vector 0x40, a HIGHER priority class).  So
+ * anything that holds the 0x20 class off — a level-triggered line that is never
+ * acknowledged, an ISR that never EOIs — stops the ms clock and the keyboard
+ * while every CPU keeps ticking: `task_msleep` never returns, cron never fires,
+ * keystrokes overflow the 8042, and the hardware watchdog is petted from the
+ * LAPIC tick, so nothing ever says NMI.  It was diagnosed from outside, with
+ * QEMU's `info lapic`, because nothing inside could see it: the watchdog sweep
+ * that would have noticed sleeps on the very clock that had stopped.
+ *
+ * So the check lives HERE, on the BSP's LAPIC tick, and compares the PIT
+ * against that tick (see the function for why not the TSC).  It is reported
+ * ONCE per episode, lock-free, with the in-service vector that is doing the
+ * blocking — the line that names today's cause in one read. */
+volatile uint32_t g_pit_starved;          /* episodes, for audits / tests */
+static void pit_starvation_check(void) {
+    /* A RATE, MEASURED AGAINST THE LAPIC ITSELF — and each word of that was
+     * paid for.  The first version reported only a clock that did not move at
+     * all, and on the real storm it stayed silent: IRQ0 still got through now
+     * and then, so the clock CRAWLED, which kills sleeps, cron and the keyboard
+     * just as surely.  The second measured the crawl against the TSC, and its
+     * "one second" turned out to be ten or twenty: under emulation the TSC is
+     * calibrated at boot against the very PIT this check watches, and the
+     * calibration came out absurd (17.8 GHz on an i386 guest).  A reference
+     * that depends on the thing being checked is not a reference.  The third
+     * counted a FIXED 256 LAPIC ticks per window — and the LAPIC here ticks at
+     * ~77 Hz, not the nominal rate, so a window was 3.3 s and a 1.5 s
+     * starvation diluted below the threshold (its own falsifier caught that).
+     *
+     * So the WINDOW SIZE is learned: after boot, count this CPU's LAPIC ticks
+     * until the PIT has advanced PIT_WIN_MS; that count is the window, and the
+     * healthy advance per window is what was measured, not what either device
+     * nominally promises.  Less than half of it is an episode, reported once;
+     * back above 90 % re-arms it. */
+    #define PIT_WIN_MS 500u
+    #define PIT_CHK_CPUS 64
+    /* PER CPU, because the CPU that owns IRQ0 is exactly the one a storm can
+     * swallow whole: with the unfixed virtio-blk the BSP stopped taking its own
+     * LAPIC tick too, so a check that ran only there went silent with it.
+     * Every CPU keeps its own window over the one global ms clock; whichever
+     * notices first reports, once, for the whole machine. */
+    static uint32_t n_ticks[PIT_CHK_CPUS], win[PIT_CHK_CPUS];
+    static uint64_t w_ms[PIT_CHK_CPUS], base[PIT_CHK_CPUS];
+    static uint8_t  started[PIT_CHK_CPUS];
+    static volatile int in_episode;
+    extern uint64_t timer_ticks_ms(void);
+    int c = this_cpu_id();
+    if (c < 0 || c >= PIT_CHK_CPUS) return;
+    uint64_t ms = timer_ticks_ms();
+    if (!started[c]) { started[c] = 1; w_ms[c] = ms; return; }
+    n_ticks[c]++;
+    if (!win[c]) {                        /* learning this CPU's window */
+        if (ms - w_ms[c] >= PIT_WIN_MS) {
+            win[c] = n_ticks[c] < 8 ? 8 : n_ticks[c];
+            base[c] = ms - w_ms[c]; n_ticks[c] = 0; w_ms[c] = ms;
+        }
+        return;
+    }
+    if (n_ticks[c] < win[c]) return;
+    n_ticks[c] = 0;
+    uint64_t d = ms - w_ms[c];
+    w_ms[c] = ms;
+    if (d * 10 >= base[c] * 9) { if (c == 0) in_episode = 0; return; }
+    if (d * 2 >= base[c]) return;
+    if (__atomic_exchange_n(&in_episode, 1, __ATOMIC_ACQ_REL)) return;
+    g_pit_starved++;
+    extern void serial_write(const char* s);
+    serial_write("\n!! PIT STARVED (seen by cpu ");
+    ser_hex((uint32_t)c);
+    serial_write("): the ms clock advanced ");
+    ser_hex((uint32_t)d);
+    serial_write(" ms in a window that normally takes ");
+    ser_hex((uint32_t)base[c]);
+    serial_write(" (hex) while this CPU's LAPIC timer kept ticking - an interrupt "
+                 "is holding IRQ0 off on the CPU that owns it.  Here: in-service "
+                 "vector (below 0x40)=");
+    ser_hex((uint32_t)lapic_isr_highest_below(0x40));
+    serial_write(" tpr=");
+    ser_hex(lapic_tpr());
+    serial_write(" ppr=");
+    ser_hex(lapic_ppr());
+    serial_write("\n");
+}
+
 void isr_handler(struct int_frame* f) {
     /* §M31 L3 — NMI (vector 2) is our HARD-LOCKUP alarm: the ib700 hardware
      * watchdog fires it (via QEMU `-action watchdog=inject-nmi`) when the kernel
@@ -459,6 +546,34 @@ void isr_handler(struct int_frame* f) {
         ser_hex(f->eip);
         serial_write(" cs="); ser_hex(f->cs);
         serial_write(" cpu="); ser_hex((uint32_t)this_cpu_id());
+        /* §M82 session — the four facts today's lockup hunt had to fetch from
+         * OUTSIDE the guest: whether interrupts were on, which task, what the
+         * LAPIC was still servicing, and where in the code this CPU came from. */
+        serial_write(" if="); serial_write((f->eflags & (1u << 9)) ? "1" : "0");
+        serial_write(" task="); serial_write(cur ? cur->name : "?");
+        serial_write(" isr-vec="); ser_hex((uint32_t)lapic_isr_highest());
+        serial_write(" ppr="); ser_hex((uint32_t)lapic_ppr());
+        serial_write("\n   stack:");
+        {
+            /* Words on this task's kernel stack that point into .text — the
+             * return addresses, give or take a stale one; map them with
+             * scripts/dos-sym.sh.  Bounded by the stack itself, so a wild
+             * stack pointer prints nothing rather than faulting in an NMI. */
+            extern char __text_start[], __text_end[];
+            uintptr_t lo = cur && cur->kstack_base ? (uintptr_t)cur->kstack_base : 0;
+            uintptr_t hi = lo ? lo + TASK_KSTACK_SZ : 0;
+            uintptr_t p  = (uintptr_t)f;       /* the frame is ON the stack */
+            int shown = 0;
+            if (f->cs & 3) p = 0;              /* ring 3: not a kernel stack */
+            for (; lo && p >= lo && p + sizeof(uintptr_t) <= hi && shown < 12;
+                 p += sizeof(uintptr_t)) {
+                uintptr_t v = *(uintptr_t*)p;
+                if (v >= (uintptr_t)__text_start && v < (uintptr_t)__text_end) {
+                    serial_write(" "); ser_hex((uint32_t)v); shown++;
+                }
+            }
+            if (!shown) serial_write(" (none found)");
+        }
         serial_write("\n");
 
         /* WHICH CPU ACTUALLY STOPPED.  The alarm interrupts ONE cpu, and §4.67
@@ -669,6 +784,7 @@ void isr_handler(struct int_frame* f) {
 
     if (f->int_no == 0x40 || f->int_no == 0x41) {
         if (f->int_no == 0x40) schedule_request();
+        if (f->int_no == 0x40) pit_starvation_check();
         lapic_eoi();
         task_force_kill_point((f->cs & 3) == 3);   /* §M46 — see IRQ block above */
         schedule_check();

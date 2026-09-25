@@ -34,8 +34,10 @@ SECTIONS
 
     .text BLOCK(4K) : ALIGN(4K)
     {
+        __text_start = .;       /* NMI stack scan: "is this a return address?" */
         *(.text)
         *(.text.*)
+        __text_end = .;
     }
 
     .rodata BLOCK(4K) : ALIGN(4K)

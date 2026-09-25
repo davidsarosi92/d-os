@@ -13265,6 +13265,30 @@ The harness now keeps monitor replies in `<log>.mon` — the `pmemsave` that
 failed silently during this hunt could not say why because its reply was
 discarded.
 
+**AND THE NEXT ONE NAMES ITSELF (2026-09-25).**  Every CPU's LAPIC tick now
+compares the PIT's progress against its own window (`pit_starvation_check`,
+both x86 `idt.c`) and reports `!! PIT STARVED` once per episode with the local
+in-service vector, TPR and PPR; the harness fails a run on it.  **Three
+versions, each falsified:** "no advance for a second" missed a clock that
+CRAWLED; measuring against the TSC used a reference calibrated at boot against
+the very PIT under test (it read 1.26 GHz in one boot and 17.8 GHz in another);
+a fixed 256-tick window assumed a nominal LAPIC rate the machine does not have
+(it runs ~80 Hz for a 100 Hz target).  The window is now LEARNED at boot — the
+number of LAPIC ticks in which the PIT advances 500 ms — and the check runs on
+EVERY CPU, because with the real storm the BSP stopped taking its own LAPIC tick
+as well.  `pitstarvetest` (hidden) is the falsifier: it raises CPU 0's TPR to
+0x2F for 1.5 s, holding off exactly the 0x20 class, and the detector reports
+`tpr=0x2f, in-service none` — i.e. the report distinguishes a priority raise
+from a stuck vector.  PASS on i386 and x86_64; no report on healthy busy runs.
+**What it did NOT do, said plainly:** run against the unfixed virtio-blk, no
+report came out — ALL serial output stopped a few seconds into the storm (CPU 1
+was found inside its own tick handler, spinning on the UART), so the in-guest
+path is proven only on the falsifier's shape.  The NMI report gained the four
+facts this hunt had to fetch from outside: `if=`, `task=`, `isr-vec=`/`ppr=` and
+a scan of the kernel stack for return addresses (bounded by the task's own
+stack); `hardlock` shows `task=shell` and the chain
+`watchdog_hardlock_test <- wd_hardlock <- shell_cmd_dispatch`.
+
 #### Stage 10 — the lock surface, and the instrument that made it provable
 
 `gui.login` (default OFF) raises a modal authentication window over the

@@ -38,6 +38,16 @@ void lapic_init_ap(void);
  * vectors delivered via IOAPIC. */
 void lapic_eoi(void);
 
+/* §M82 session — diagnostics: the highest vector in service on THIS CPU (-1 if
+ * none) and the processor-priority register.  Read-only, NMI-safe. */
+int      lapic_isr_highest(void);
+/* The same, ignoring vectors >= limit — for a check that runs INSIDE a
+ * handler, whose own vector is in service and would otherwise name itself. */
+int      lapic_isr_highest_below(int limit);
+uint32_t lapic_tpr(void);
+uint32_t lapic_ppr(void);
+void     lapic_set_tpr(uint32_t tpr);
+
 /* This CPU's APIC ID — read from LAPIC ID register (offset 0x20). */
 uint8_t lapic_id(void);
 

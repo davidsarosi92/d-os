@@ -57,6 +57,7 @@ ROOT = os.path.dirname(HERE)
 CRASH_PATTERNS = [
     re.compile(rb"!! EXCEPTION "),                 # ring-0 fault dump (both x86)
     re.compile(rb"!! NMI HARD-LOCKUP"),            # §M31 L3 hardware watchdog
+    re.compile(rb"!! PIT STARVED"),                # §M82 session: IRQ0 held off
     re.compile(rb"PREVIOUS BOOT ENDED UNCLEANLY"), # §M47 NVRAM breadcrumb
     re.compile(rb"softlockup"),                    # §M31 L2 per-CPU sweep
     re.compile(rb"spinlock deadlock"),             # §M46 lock-order report
