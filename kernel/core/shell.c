@@ -610,10 +610,10 @@ void bin_install(void) {
 static void dispatch(struct vc* my_vc, const char* line) {
     if (line[0] == '\0') return;                       /* empty line → no-op */
 
-    /* The VC is set BEFORE dispatch, not passed as an argument: three of ~170
-     * commands address the terminal rather than the machine, and it is NULL on
-     * the ARM serial REPL.  See shellcmd.h. */
-    shell_set_current_vc(my_vc);
+    /* The VC is not passed to the handler: three of ~170 commands address the
+     * terminal rather than the machine, and they ask shell_current_vc(), which
+     * answers from THIS task's binding (see shellcmd.c for why not a global). */
+    (void)my_vc;
 
     if (shell_cmd_dispatch(line)) return;
 

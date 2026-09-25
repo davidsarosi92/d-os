@@ -761,6 +761,7 @@ CORE_C_SRCS := \
     kernel/core/layouts.c \
     kernel/core/percpu.c \
     kernel/drivers/serial/serial.c \
+    kernel/drivers/serial/serial_cmd.c \
     kernel/drivers/terminal/fb_terminal.c \
     kernel/drivers/terminal/vga_terminal.c \
     kernel/drivers/keyboard/ps2_keyboard.c \
@@ -1080,6 +1081,7 @@ CORE_C_SRCS := \
     kernel/core/layouts.c \
     kernel/core/percpu.c \
     kernel/drivers/serial/serial.c \
+    kernel/drivers/serial/serial_cmd.c \
     kernel/drivers/terminal/fb_terminal.c \
     kernel/drivers/terminal/vga_terminal.c \
     kernel/drivers/keyboard/ps2_keyboard.c \

@@ -215,7 +215,6 @@ void shell_cmd_help(const char* args);
  * three of them read and that is NULL on one architecture.  A command that
  * needs a VC asks for one and says so when there is none.
  * ------------------------------------------------------------------------- */
-struct vc* shell_current_vc(void);
-void       shell_set_current_vc(struct vc* v);
+struct vc* shell_current_vc(void);   /* the CALLING task's VC, or NULL */
 
 #endif

@@ -38,16 +38,27 @@ const struct shell_cmd* shell_cmd_find(const char* verb) {
 
 /* ---- the current VC ------------------------------------------------------
  *
- * One global rather than per-task state: a VC-bound command runs on the shell
- * task that set it, and the two REPLs in this tree are the only writers.  A
- * second shell on a second VC sets it around its own dispatch, so the value is
- * correct for the duration of a handler — which is all any handler reads it
- * for.  (If shells ever run commands concurrently on two panes this becomes a
- * per-task field; the accessor is here so that is one edit.) */
-static struct vc* g_cur_vc;
+ * PER TASK, NOT A GLOBAL (2026-09-25).  This used to be one global that each
+ * REPL set around its own dispatch, with a note that it would have to become
+ * per-task "if shells ever run commands concurrently on two panes".  They
+ * always could: every pane is its own shell task, and a command that SLEEPS
+ * (anything touching the disk, the network or a timer) lets another pane
+ * dispatch and overwrite the global — after which the first command's
+ * `clear` clears somebody else's terminal.  The serial command channel made
+ * the concurrency explicit (a command arriving on COM1 runs beside whatever
+ * the focused pane is doing), so the note's condition is now simply true.
+ *
+ * The answer was already recorded where it cannot race: every x86 shell task
+ * is spawned with its VC bound as `out_console` (§M49 moved that INTO the
+ * spawn), which is also what `vc_source` below reads for input.  A task with
+ * no VC — the ARM serial REPL, the COM1 command channel, a service — gets
+ * NULL, which is what those handlers already treat as "no terminal here". */
+#include "task.h"
 
-struct vc* shell_current_vc(void)          { return g_cur_vc; }
-void       shell_set_current_vc(struct vc* v) { g_cur_vc = v; }
+struct vc* shell_current_vc(void) {
+    struct task* t = task_current();
+    return t ? (struct vc*)t->out_console : NULL;
+}
 
 /* ---- dispatch -------------------------------------------------------------
  *

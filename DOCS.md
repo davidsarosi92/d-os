@@ -114,6 +114,7 @@ when sections are added.)
 | 4.72 | Where the package store lives, and what boot pays for it | 8060 |
 | 4.73 | exFAT can create and remove now (§M12 gap); storage modes | 8073 |
 | 4.74 | The desktop is where boot ends; leaving it lands on a shell | 8228 |
+| 4.74.1 | A command channel on COM1 (harness vs. GUI focus) | 8946 |
 | 4.75 | Terminal scrollback; a selection is an absolute line (§M58) | 8402 |
 | 4.76 | Redirection: fds 0/1/2 were not descriptors (§M59) | 8469 |
 | 4.77 | aarch64 can change resolution now (§M61 complete) | 8537 |
@@ -8943,6 +8944,64 @@ commands* — the keyboard hook consumes them, correctly.  A test that needs bot
 must issue its shell commands before opening a window, and drive the rest with
 the mouse.
 
+### 4.74.1 A command channel on COM1 — the harness talks to the machine whatever holds focus (2026-09-25)
+
+**The limit it removes.**  §4.74 recorded it and half the GUI work since has
+routed around it: the x86 shell reads the KEYBOARD, the harness types through
+the same keyboard (`sendkey`), and once a desktop window holds focus every key
+goes to that window.  So the states most worth checking — a panel open, a
+dialog up, an app running — were exactly the states in which no command could
+be issued, and each measurement grew its own pre-set config key (`gui.stats_ms`,
+`gui.ui_dump`, `gui.wheeltest`, `gui.autorun`, `audit.interval_s`).  Each was a
+right answer to "measure X without typing"; none answered "how does a test talk
+to the machine".  aarch64 never had the problem, because its serial REPL is the
+UART.
+
+**What it is.**  `kernel/drivers/serial/serial_cmd.c` (both x86 arches): the
+`serial-cmd` service arms the UART's receive interrupt (IRQ 4; OUT2 was already
+set), the ISR moves the FIFO into a 512-byte ring and wakes the task — two
+things and no third, because a command can sleep and an interrupt may not.  The
+task assembles lines and runs them through `shell_cmd_dispatch`, the one
+registry every shell uses, echoing each as `serial-cmd> <line>` so a log reads
+as a transcript.  A 100 ms backstop also polls the FIFO, so a UART whose IRQ is
+not routed makes the channel slower, not dead.  `serialcmd` prints the counters
+(irqs vs. dropped bytes).
+
+**What a command gets.**  Output goes where kprintf goes for a task with no VC
+(serial + klog).  There is no input source, so a command that asks for a line is
+refused by `shell_read_line` instead of blocking on a keyboard it is not attached
+to.  `shell_current_vc()` answers NULL: `pane` says there are no panes, `clear`
+sends the ANSI sequence down the UART — the ARM serial REPL's behaviour.
+
+**Trust, stated.**  A serial command runs in a SYSTEM context, like the boot
+console and the ARM REPL — whoever holds the line holds the machine, which is the
+trust the physical console has today.  So `console.serial_commands` defaults to
+1 and is read PER LINE (turning it off over the channel itself takes effect on
+the next line).  Once §M82 puts a login on the console, this channel must require
+the same authentication or be off; that is a deployment decision, which is why
+it is a key.
+
+**Harness.**  `dos-shell-test.py --via serial` sends every `--cmd` over COM1
+instead of typing it; `--monitor-cmd "serial <line>"` sends one at THAT point of
+the monitor sequence, i.e. after the mouse has put the desktop into the state to
+be inspected.  The keyboard stays the default, because keyboard tests are tests
+of the keyboard path.
+
+**A bug it made visible.**  `shell_current_vc()` was a GLOBAL each REPL set
+around its dispatch, with a note that it would have to become per-task "if
+shells ever run commands concurrently on two panes".  They always could — every
+pane is its own shell task, and any command that sleeps lets another pane
+dispatch and overwrite it, after which the first command's `clear` clears the
+other terminal.  The serial channel made that concurrency explicit; the accessor
+now answers from the calling task's `out_console`, which §M49 binds at spawn.
+
+**Verified** (i386 and x86_64): Task Manager launched and focused, then
+`uptime`, `serialcmd` (`irqs 2, dropped 0`), an unknown verb and `clear` sent
+over COM1 — all answered, screenshot shows the window still focused and the VC
+untouched.  Keyboard path: `uptime`, `pane split v` (pane 2 comes up — the
+per-task VC), `echo` on both arches; aarch64 serial REPL: `pane` → "this shell
+has no panes".  All three arches build silent.
+
 ### 4.75 Terminal scrollback, and why a selection is an absolute line number (§M58)
 
 **Files:** `kernel/gui/gui.c` (`gterm_row`, `gterm_sb_push`, `gterm_view_scroll`,
@@ -13606,6 +13665,13 @@ locking, `diskstorm 4 20` took 23 s and corrupted another file on the volume.
 
 ## 8. Change log
 
+- **2026-09-25 — A COMMAND CHANNEL ON COM1 (DOCS §4.74.1, i386 + x86_64).**
+  Lines arriving on the serial port run through the command registry whatever
+  holds GUI focus (`serial-cmd` service, `console.serial_commands`, SYSTEM
+  trust); `dos-shell-test.py --via serial` and `--monitor-cmd "serial <line>"`.
+  Removes §4.74's "the harness cannot type once a window has focus".  Also:
+  `shell_current_vc()` answers per task instead of from a global that concurrent
+  panes overwrote.
 - **2026-09-08 — §M71: RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
   (DOCS §4.87, all 3 arches).**  Asked for directly — *"something that finds a
   thing started in ring 0 that should have been ring 3, memory leaks, security

@@ -49,7 +49,14 @@ and **`task_current()` could return ANOTHER task** (CPU id and `current` read
 non-atomically) — fixed.  The config store and the glyph cache
 were unlocked too (`confstorm`: ~4000 of 8000 read-backs wrong) — fixed; an
 intermittent x86_64 NMI after many session switches is probably that (NEXT.md
-#2b, watched by a per-switch `!! KSTACK` check).
+#2b, watched by a per-switch `!! KSTACK` check).  **THEN the harness can talk to the machine
+whatever holds focus** (DOCS §4.74.1): lines arriving on COM1 are dispatched
+through the command registry by the `serial-cmd` service (`console.serial_commands`,
+default on — same SYSTEM trust as the console; must require auth once §M82 puts
+a login on it); `dos-shell-test.py --via serial` and `--monitor-cmd "serial <line>"`
+use it.  The keyboard path stays the default, because keyboard tests test it.
+On the way: `shell_current_vc()` was a GLOBAL set around each dispatch while
+every pane runs its own shell task — it answers from the calling task now.
 
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there

@@ -62,6 +62,7 @@ established; "open" rows were checked against today's tree, not copied forward.
 | AC97 capture "at 80 % of real time" (§M23 stage 7 open item) | `rec` warned FASTER | not a codec bug — the clock above; `rec 2000` now 2008–2020 ms |
 | GUI teardown freed surfaces while the compositor still drew | x86_64 GPF at rip=`0xff0000ffff0000ff`, NMIs in font tables | `3fce70f` |
 | config had one layer (user overwrote machine; leaked across sessions) | `sessiontest` FAIL×3 | `3fce70f` |
+| harness could not issue a command once a GUI window held focus (§4.74) | every GUI-state test needed a pre-set config key (`gui.autorun`, `gui.stats_ms`…) | COM1 command channel (`serial_cmd.c`) + `--via serial` / `--monitor-cmd "serial …"`; `shell_current_vc()` made per-task |
 
 Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI report with
 `if=`/`task=`/`isr-vec=`/stack scan, monitor replies kept in `<log>.mon`,
@@ -74,7 +75,6 @@ Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI
 | 1 | ~~Sign-out / shutdown kill the session tree at once~~ | — | **FIXED 2026-09-25** (DOCS §4.92): close requests with a grace, forced by name after it, then desktop, then compositor; power-off goes through it; Editor asks and keeps a `.unsaved` copy.  Only the Editor has a close guard so far |
 | 2 | ~~virtio-blk busy-waits for every request~~ | — | **FIXED 2026-09-25** (DOCS §4.93) — and it uncovered worse: the whole storage stack was unlocked (`diskstorm`: corrupted another file on the volume), and `task_current()` could return another task.  All fixed.  aarch64's virtio-mmio-blk is locked and bounded but still POLLED (no interrupt wired) |
 | 2b | Intermittent x86_64 NMI after many session switches (both CPUs inside `vfont_label_pts`) | watch | **probably fixed 2026-09-25**: 2 crashes in ~180 storm rounds before the config store and glyph cache were locked, 0 in 120 x86_64 + 80 i386 rounds after (1-2 were expected — suggestive, not proof).  Most likely cause: the unlocked config store (a concurrent double free corrupts the heap).  `!! KSTACK` now checks every context switch, so a recurrence names the task |
-| 3 | **Harness cannot type once a GUI window holds focus** (§4.74) | medium (tooling) | routed around with `gui.autorun`, `sessiontest`; the next GUI test will hit it again |
 | 4 | `ktimer` deadlines expire only from the PIT interrupt → 2.5–3.3 ms worst lateness under emulation | low | now a true number (was hidden by the slow clock); could also expire from the LAPIC tick |
 | 5 | Real storm case: no in-guest report escaped (all serial output stopped) | low | the cause is fixed; the `PIT STARVED` path is proven only on its falsifier |
 | 6 | §4.67.1 "host-load dependent" NMI lockup, and today's i386 NMI after `gui stop` | watch | very probably the storm (a disk is attached on every everyday run since §4.66); not proven — the NMI report now names task, IF, in-service vector and stack |

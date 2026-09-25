@@ -453,6 +453,15 @@ def main():
                     help="do not fail the run on a fault/lockup in the log — "
                          "for the tests that deliberately cause one (hardlock, "
                          "splash faultkernel, drv crash, faulttest)")
+    ap.add_argument("--via", default="keys", choices=["keys", "serial"],
+                    help="x86: how --cmd reaches the guest.  'keys' (default) "
+                         "types through the emulated keyboard, i.e. the path a "
+                         "person uses, so keyboard tests stay tests of it; "
+                         "'serial' writes the line to COM1, where the kernel's "
+                         "command channel runs it regardless of which window "
+                         "holds focus (the fix for 'cannot type once a GUI "
+                         "window has focus').  Output of a serial command is "
+                         "echoed as 'serial-cmd> <line>'.")
     ap.add_argument("--monitor-cmd", action="append", default=[],
                     help="a raw QEMU monitor command to run after the shell "
                          "commands (repeatable) — mouse_move/mouse_button for "
@@ -537,7 +546,10 @@ def main():
             time.sleep(1.5)
             for c in a.cmd:
                 print("+ typing: %s" % c, file=sys.stderr)
-                if a.arch == "aarch64":
+                # --via serial: the COM1 command channel (serial_cmd.c), which
+                # runs a line whatever holds keyboard focus.  aarch64's shell
+                # IS the serial line, so it always goes this way.
+                if a.arch == "aarch64" or a.via == "serial":
                     ser.write(c + "\r")
                 else:
                     mon.type_line(c, a.key_delay, ser)
@@ -546,6 +558,15 @@ def main():
             for mc in a.monitor_cmd:
                 if mc.startswith("sleep "):
                     time.sleep(float(mc.split()[1]))
+                    continue
+                # "serial <line>" — send a command over COM1 at THIS point in
+                # the monitor sequence, i.e. after the mouse has put the
+                # desktop into the state to be inspected.  (x86 only; the
+                # kernel's serial_cmd.c runs it whatever holds focus.)
+                if mc.startswith("serial "):
+                    print("+ serial: %s" % mc[7:], file=sys.stderr)
+                    ser.write(mc[7:] + "\r")
+                    time.sleep(a.between)
                     continue
                 mon.cmd(mc)
                 # Mouse MOTION is paced fast on purpose: a real mouse delivers
