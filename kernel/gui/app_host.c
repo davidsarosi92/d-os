@@ -472,6 +472,20 @@ void app_host_main(void) {
     kprintf("gui: app-host '%s' up (pid %d)\n",
             self ? self->name : "?", self ? self->pid : -1);
     if (open_fn) open_fn();                     /* creates windows on this task */
+    /* A host started by gui_queue_open() has no app name to go by; take its
+     * first window's title so the Task Manager says what is running. */
+    if (self && self->name[0] == 'a' && self->name[4] == 'o' &&
+        self->name[5] == 'p' && self->name[6] == 'e' && self->name[7] == 'n' &&
+        self->name[8] == 0) {
+        for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+            struct gui_window* w = &windows[i];
+            if (!w->used || w->host_task != self) continue;
+            int p = 4;
+            for (int j = 0; w->title[j] && p < TASK_NAME_MAX; j++) self->name[p++] = w->title[j];
+            self->name[p] = 0;
+            break;
+        }
+    }
 
     for (;;) {
         int live = 0, busy = 0;
@@ -481,6 +495,18 @@ void app_host_main(void) {
                 continue;
             if (win->host_released) continue;   /* handed to the compositor */
 
+            /* ORDERLY CLOSE — the app's guard may keep the window, once per
+             * request.  It runs HERE, on the host, because it may touch the
+             * app's widgets and open a dialog; refusing clears the request
+             * and leaves the window live, and the app finishes the close
+             * itself with gui_window_close_now(). */
+            if (win->want_close && win->close_guard && !win->close_confirmed &&
+                !win->close_guard(win, win->close_reason)) {
+                kprintf("gui: '%s' asked to stay open (%s close)\n", win->title,
+                        win->close_reason == GUI_CLOSE_SESSION ? "session" : "user");
+                win->want_close = 0;
+                win->close_reason = GUI_CLOSE_USER;
+            }
             if (win->want_close) {              /* graceful, on the host */
                 win_run_on_close(win);   /* §M81: clears the owner's slot too */
                 app_widgets_free(win);

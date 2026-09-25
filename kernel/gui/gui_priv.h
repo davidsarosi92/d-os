@@ -266,6 +266,20 @@ struct gui_window {
      * there to click a second time.  0 = no close in flight. */
     uint64_t close_deadline_ms;
     volatile int close_force_now;
+
+    /* ORDERLY CLOSE (2026-09-25).  A window is identified across its lifetime
+     * by `serial` (a slot is reused, a serial never is), which is how the
+     * session end knows that the "unsaved changes?" dialog one app opened is
+     * not one of the windows it asked to close.  `close_guard` lets an app say
+     * "not yet" to a close request — it runs on the HOST, is given the reason
+     * (GUI_CLOSE_USER / GUI_CLOSE_SESSION), and an app that refuses is then
+     * responsible for calling gui_window_close_now() when it is ready.
+     * `close_confirmed` bypasses the guard: set by close_now, and by the
+     * session end when its deadline has passed. */
+    uint32_t serial;
+    int (*close_guard)(struct gui_window*, int reason);
+    volatile int close_reason;
+    volatile int close_confirmed;
 };
 
 /* ---------------------------------------------------------------------------
@@ -502,6 +516,7 @@ extern int        panel_ready;
 /* The desktop-shell task.  A window launched from the Start menu is parented
  * to it, so leaving the session closes what the session started. */
 extern int        desktop_pid;
+extern int        compositor_pid;     /* for the ordered session end */
 extern spinlock_t panel_lock;
 
 #define COL_WALL_TOP (cp_current_theme()->bg)

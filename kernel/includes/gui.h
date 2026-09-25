@@ -390,6 +390,26 @@ void gui_window_close(struct gui_window* win);
  * driven WIN_APP (NetSurf via the dosgui bridge) checks this to quit itself. */
 int  gui_window_want_close(struct gui_window* win);
 
+/* ORDERLY CLOSE (2026-09-25).  A close request — the X button, or the session
+ * ending (sign-out, Exit GUI, reboot, shut down) — first asks the window's
+ * guard, ON ITS HOST TASK.  Return non-zero to let it close now; return 0 to
+ * keep it (to ask "save your changes?", say), and call gui_window_close_now()
+ * once the app is ready.  A session end waits for such a window up to
+ * `gui.logout_grace_ms` and then closes it regardless — so an app that holds
+ * data should ALSO keep it safe in its on_close, which runs on every route.
+ * No guard = the window closes at once, exactly as before. */
+#define GUI_CLOSE_USER    0
+#define GUI_CLOSE_SESSION 1
+void gui_window_set_close_guard(struct gui_window* win,
+                                int (*guard)(struct gui_window* win, int reason));
+void gui_window_close_now(struct gui_window* win);
+/* Non-zero while the session is being ended in order — an app must not open
+ * new windows then (the lock screen's re-raise is the case this is for). */
+int  gui_session_ending(void);
+/* Lifetime identity: is `win` still the window whose serial was `serial`? */
+uint32_t gui_window_serial(struct gui_window* win);
+int      gui_window_alive(struct gui_window* win, uint32_t serial);
+
 /* §M42 — client-managed WIN_APP window lifecycle (the dosgui bridge).  The
  * client is a detached, init-reaped ring-3 task, NOT a compositor app-host:
  *   set_client_managed — sever host_task so the compositor never reads/reaps it;

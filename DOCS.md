@@ -13428,6 +13428,83 @@ the real table so it exercises DETECTION rather than reporting.
   thing, and a second name for one mechanism is a second thing to gate.
 
 
+### 4.92 The orderly session end
+
+Asked for directly (2026-09-25): *"on sign-out and shutdown, programs have to be
+stopped properly, in order."*  They were not.  Every route out of a session —
+Sign out, Exit GUI, `gui stop`, switching user — ended in one `task_kill_tree`
+of the desktop, so an app with unsaved work was stopped at its next yield like
+any other thread; and the Start menu's **Reboot / Shut Down did not even do
+that**: they called `system_power_off()` straight from the compositor.
+
+**One route.**  Every way out ends in `gui_teardown`, and power-off reaches it
+too: the Start menu hands the request to a `gui-power` task (the end stops the
+compositor, so it cannot run there), and `system_power_off` / `system_reboot`
+call a weak `session_end_for_power()` that the GUI provides — so the shell's
+`shutdown` ends the session in order, and a future power route inherits it.
+
+**The order:**
+
+1. every window the session owns is asked to close — the X button's request,
+   with the reason `GUI_CLOSE_SESSION` — **while input and the compositor still
+   work**, because an app that asks "save your changes?" needs somebody able to
+   answer.  It waits up to `gui.logout_grace_ms` (System panel, default 15 s);
+2. what is still open is closed regardless, **by name in the log**: its guard
+   is bypassed, its `on_close` still runs — where an app keeps unsaved data;
+3. input is disconnected and the remaining session tasks are stopped;
+4. then the desktop;
+5. and the compositor last, since it disposes the windows the earlier steps
+   close.
+
+Each step waits until what it stopped is GONE, naming anything that outlives its
+deadline.  The membership is captured before anything is stopped
+(`task_tree_pids`), because once the root is gone its children cannot be found
+from it.  A detached shell (started to outlive the session) is not asked.
+
+**The app's side is one optional hook.**  `gui_window_set_close_guard(win, fn)`
+runs on the window's HOST for every close request, given the reason; returning 0
+keeps the window and makes the app responsible for `gui_window_close_now()`.  No
+guard = the old behaviour, so nothing else changed.  Windows carry a `serial`
+(`gui_window_alive(win, serial)`), because the session end must not mistake the
+"unsaved changes?" dialog an app opened — possibly in a reused slot — for one of
+the windows it asked to close.
+
+**The Editor is the first client.**  With unsaved text its guard asks "Save" /
+"Keep editing" — the SAFE answer is the default, so Escape or the dialog's X
+never throws work away — and `ed_on_close` writes `<file>.unsaved` (or
+`<persistent volume>/untitled.unsaved`, since `/` is ramfs and would not survive
+the power-off this also runs on) whenever it closes with changes nobody saved.
+The answer crosses tasks through a two-reference ticket, not a pointer to the
+app: it arrives on the dialog's host, possibly after the Editor was closed by a
+session end that stopped waiting.
+
+**The lock screen** refuses dismissal by re-raising itself from `on_close`; it
+now does not while the session is ending (`gui_session_ending()`), or the end
+would open a new window in the middle of the teardown.
+
+**Measured** (`logouttest`, hidden; i386 and x86_64):
+- two windows, "LT Saver" (saves, then agrees) and "LT Stubborn" (never agrees),
+  3 s grace: the Saver's file exists; the Stubborn window closes 3025 ms after
+  sign-out with its `on_close` run; order windows +3034 → rest +3035 → desktop
+  +3050 → compositor +3228 ms; the whole end 3250 ms.
+- `logouttest editor`: nobody answers → `kept them in /edtest.txt.unsaved (31
+  bytes)` after 3039 ms; Enter on the dialog → `/edtest.txt` saved and the window
+  closed after 1429 ms, before the grace ran out.
+- `logouttest power` / `menu` (the shell's route and the Start menu's): the
+  session-end lines and the Editor's recovery line precede `drivers: 7 stopped`.
+- with a LOCKED lock screen up, repeated sign-outs end cleanly and the next
+  session raises its own lock — no re-raise mid-teardown.
+
+Also fixed on the way: every `gui_queue_open` host ran as `app:dialog` (settings
+panels, the Editor, tests); it is named after its first window now.
+
+**Open:** a kernel app whose HOST is wedged cannot run its guard or `on_close`
+until its task is stopped in step 3 — its window then goes with the compositor's
+disposal path, which does run `on_close`.  Ring-3 (dosgui) clients keep §M46's
+contract: asked to close, force-killed after `gui.close_grace_ms`.  Only the
+Editor has a guard so far.
+
+
 ## 8. Change log
 
 - **2026-09-08 — §M71: RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND

@@ -71,7 +71,7 @@ Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI
 
 | # | defect | severity | notes |
 |---|---|---|---|
-| 1 | **Sign-out / shutdown kill the session tree at once** — apps are not asked to close and save, in order | high | user requirement (2026-09-25): stop programs *gracefully, in order*.  Belongs to §M82 point 5 |
+| 1 | ~~Sign-out / shutdown kill the session tree at once~~ | — | **FIXED 2026-09-25** (DOCS §4.92): close requests with a grace, forced by name after it, then desktop, then compositor; power-off goes through it; Editor asks and keeps a `.unsaved` copy.  Only the Editor has a close guard so far |
 | 2 | **virtio-blk busy-waits for every request** (`hal_cpu_pause` spin, timeout counted in iterations, not time) | medium | a CPU burned per disk I/O; the §M49/§M55 lesson not yet applied to storage |
 | 3 | **Harness cannot type once a GUI window holds focus** (§4.74) | medium (tooling) | routed around with `gui.autorun`, `sessiontest`; the next GUI test will hit it again |
 | 4 | `ktimer` deadlines expire only from the PIT interrupt → 2.5–3.3 ms worst lateness under emulation | low | now a true number (was hidden by the slow clock); could also expire from the LAPIC tick |

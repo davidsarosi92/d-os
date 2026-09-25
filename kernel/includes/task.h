@@ -581,6 +581,8 @@ int  task_kill_tree(int pid);
  * caller can wait for ALL of them to be gone; see task.c.  Returns the count
  * written to `out`, or < 0 if the root refused. */
 int  task_kill_tree_pids(int pid, int* out, int max);
+/* Membership only, nothing killed — to stop a subtree in a chosen ORDER. */
+int  task_tree_pids(int pid, int* out, int max);
 #define TASK_KILLTREE_MAX 64
 void task_set_reap_owned(struct task* t, int owned);
 

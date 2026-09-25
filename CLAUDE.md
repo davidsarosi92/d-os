@@ -34,9 +34,13 @@ the screen under a still-running compositor.  (4) **config had one layer**, so
 preferences leaked between GUI sessions.  New instruments: `!! PIT STARVED`
 (falsifier `pitstarvetest`), an NMI report that names task/IF/in-service
 vector/stack, `sessiontest`, `sessionstorm`, `scripts/wav-analyze.py`,
-`scripts/bench-taskman-sweep.sh`, monitor replies in `<log>.mon`.  **NEXT (user
-requirement): sign-out and shutdown must stop programs GRACEFULLY, IN ORDER** —
-today one `kill_tree` takes the session down at once.
+`scripts/bench-taskman-sweep.sh`, monitor replies in `<log>.mon`.  **THEN (asked for): sign-out and
+shutdown stop programs GRACEFULLY, IN ORDER** (DOCS §4.92) — close requests with
+`gui.logout_grace_ms`, stragglers forced BY NAME, then desktop, then compositor;
+the Start menu's power entries and the shell's `shutdown` go through it; apps opt
+in with `gui_window_set_close_guard` (the Editor asks "save?" and keeps a
+`.unsaved` copy on any forced route).  Falsifier: `logouttest [editor|power|menu]`.
+**NEXT:** virtio-blk still busy-waits every request (NEXT.md defect #2).
 
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there

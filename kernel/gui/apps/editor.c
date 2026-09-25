@@ -32,6 +32,9 @@
 #include "vfs.h"
 #include "kmalloc.h"
 #include "devtools.h"          /* §M43 — Compile & Run */
+#include "dialog.h"            /* "save your changes?" on close */
+#include "config.h"            /* config_persist_path: where a recovery copy survives */
+#include "printf.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -242,16 +245,125 @@ static void ed_layout(struct gui_window* win) {
 }
 
 /* The two buttons need layout too — stash them in the ctx. */
+/* The answer to "save your changes?", shared between this window and the
+ * dialog that asks.  A TICKET WITH TWO REFERENCES, not a pointer to the app:
+ * the answer arrives on the DIALOG's host task, possibly after this window was
+ * closed by a session end that stopped waiting — and a pointer to a freed app
+ * is where that would write.  Each side drops its reference when done; the
+ * last one frees it; the answer is only ever READ on the editor's own host. */
+struct ed_close_ticket {
+    volatile int answer;                 /* -1 = not yet; else GUI_DIALOG_*   */
+    volatile int refs;
+    struct gui_window* win;
+    uint32_t           serial;
+};
+static void ed_ticket_put(struct ed_close_ticket* t) {
+    if (t && __atomic_sub_fetch(&t->refs, 1, __ATOMIC_ACQ_REL) == 0) kfree(t);
+}
+
 struct edapp_full {
     struct edapp a;
     struct w_button* run_btn;
     struct w_button* open_btn;
     struct w_button* save_btn;
+    struct ed_close_ticket* ticket;      /* a close question in flight       */
 };
+
+/* ---- closing with unsaved changes (2026-09-25) ------------------------------
+ *
+ * A close — the X button, or the session ending — first asks this guard.  With
+ * nothing unsaved it simply agrees.  Otherwise it asks, and the SAFE answer is
+ * the default: the dialog's Cancel (also Escape and its own X) keeps editing,
+ * because a dismissal that discarded work would lose it on a stray keypress.
+ * If the session gives up waiting, ed_on_close still keeps the text (below). */
+static void ed_close_answer(int answer, void* ctx) {
+    struct ed_close_ticket* t = (struct ed_close_ticket*)ctx;
+    t->answer = answer;
+    /* The only route into another task's host loop; a no-op if the window has
+     * gone (and a harmless relayout if its slot was reused). */
+    if (gui_window_alive(t->win, t->serial)) gui_window_request_layout(t->win);
+    ed_ticket_put(t);
+}
+
+static int ed_close_guard(struct gui_window* win, int reason) {
+    struct edapp_full* af = (struct edapp_full*)gui_window_ctx(win);
+    if (!af || !af->a.ed || !af->a.ed->modified) return 1;
+    if (af->ticket) return 0;                    /* already asking */
+    struct ed_close_ticket* t = (struct ed_close_ticket*)kcalloc(1, sizeof *t);
+    if (!t) return 0;                            /* keep it; on_close still saves */
+    t->answer = -1; t->refs = 2; t->win = win; t->serial = gui_window_serial(win);
+    struct gui_dialog_req req = {
+        .title = "Unsaved changes",
+        .body  = reason == GUI_CLOSE_SESSION
+                   ? "The session is ending. Save the changes to this file first?"
+                   : "Save the changes to this file before closing?",
+        .info  = af->a.path_in->len ? af->a.path_in->buf : "(no file name yet)",
+        .ok_text = "Save", .cancel_text = "Keep editing",
+        .on_answer = ed_close_answer, .ctx = t,
+    };
+    if (gui_dialog_open(&req) != 0) { kfree(t); return 0; }
+    af->ticket = t;
+    kprintf("editor: unsaved changes - asking before closing\n");
+    return 0;
+}
+
+/* Runs on the editor's host, from its layout hook: consume a delivered answer. */
+static void ed_take_close_answer(struct edapp_full* af) {
+    struct ed_close_ticket* t = af->ticket;
+    if (!t || t->answer < 0) return;
+    int answer = t->answer;
+    af->ticket = NULL;
+    ed_ticket_put(t);
+    if (answer != GUI_DIALOG_OK) return;         /* keep editing */
+    ed_save(&af->a);
+    if (!af->a.ed->modified) gui_window_close_now(af->a.win);
+}
+
+/* EVERY close route passes here — the guard's, the session end that stopped
+ * waiting, a host that was killed — so this is where unsaved work is kept when
+ * nobody got to answer: a copy next to the file, never over it. */
+static void ed_on_close(struct gui_window* win) {
+    struct edapp_full* af = (struct edapp_full*)gui_window_ctx(win);
+    if (!af) return;
+    if (af->ticket) { ed_ticket_put(af->ticket); af->ticket = NULL; }
+    if (!af->a.ed || !af->a.ed->modified) return;
+    char path[160];
+    int n = 0;
+    if (af->a.path_in && af->a.path_in->len) {
+        const char* base = af->a.path_in->buf;
+        for (; base[n] && n < (int)sizeof path - 10; n++) path[n] = base[n];
+    } else {
+        /* A buffer with no file: keep it where it SURVIVES a power-off.  This
+         * runs on shutdown as well as sign-out, and "/" is ramfs — a recovery
+         * copy there is gone by the time anybody could look for it. */
+        const char* pp = config_persist_path();       /* "<vol>/d-os.conf" */
+        int last = -1;
+        for (int i = 0; pp && pp[i]; i++) if (pp[i] == '/') last = i;
+        for (int i = 0; i < last && n < 120; i++) path[n++] = pp[i];
+        const char* leaf = "/untitled";
+        for (int i = 0; leaf[i]; i++) path[n++] = leaf[i];
+    }
+    const char* ext = ".unsaved";
+    for (int i = 0; ext[i]; i++) path[n++] = ext[i];
+    path[n] = 0;
+    int len = 0;
+    const char* data = w_editor_text(af->a.ed, &len);
+    struct file* f = vfs_open(path, VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+    if (!f) { kprintf("editor: closed with unsaved changes and could not keep them (%s)\n", path); return; }
+    int off = 0;
+    while (off < len) {
+        ssize_t r = vfs_write(f, data + off, (size_t)(len - off));
+        if (r <= 0) break;
+        off += (int)r;
+    }
+    vfs_close(f);
+    kprintf("editor: closed with unsaved changes - kept them in %s (%d bytes)\n", path, off);
+}
 
 static void ed_layout_full(struct gui_window* win) {
     struct edapp_full* af = (struct edapp_full*)gui_window_ctx(win);
     if (!af || !af->a.ed) return;
+    ed_take_close_answer(af);
     ed_layout(win);
     int cw, ch;
     gui_window_content_size(win, &cw, &ch);
@@ -281,6 +393,8 @@ static void ed_layout_full(struct gui_window* win) {
     af->a.path_in->base.w = avail;
 }
 
+static int ed_test_unsaved;              /* see editor_open_test_unsaved */
+
 static void editor_open_with(const char* path) {
     struct edapp_full* af = (struct edapp_full*)kcalloc(1, sizeof(*af));
     if (!af) return;
@@ -289,9 +403,11 @@ static void editor_open_with(const char* path) {
         .title = "Editor",
         .content_w = cp_px(620), .content_h = cp_px(460),
         .layout = ed_layout_full, .ctx = af,
+        .on_close = ed_on_close,
     });
     if (!win) { kfree(af); return; }
     af->a.win = win;
+    gui_window_set_close_guard(win, ed_close_guard);
 
     af->a.path_in = w_textinput_create(win, 8, 6, 400, af);
     /* Geometry is ed_layout_full's, which runs before the first paint. */
@@ -316,7 +432,12 @@ static void editor_open_with(const char* path) {
 
     ed_layout_full(win);
 
-    if (path && *path) {
+    if (ed_test_unsaved) {
+        static const char txt[] = "typed before the session ended\n";
+        w_textinput_set(af->a.path_in, "/edtest.txt");
+        w_editor_set_text(af->a.ed, txt, (int)sizeof txt - 1);
+        af->a.ed->modified = 1;
+    } else if (path && *path) {
         w_textinput_set(af->a.path_in, path);
         ed_load(&af->a);
     } else {
@@ -325,6 +446,17 @@ static void editor_open_with(const char* path) {
     gui_window_request_redraw(win);
 }
 
+/* For `logouttest editor` (gui.c): an Editor holding UNSAVED text, built on the
+ * editor's own host — the harness cannot type into a GUI window (§4.74), and
+ * setting the text from the test task would break the §M22.7 ownership rule
+ * the close path is careful to keep. */
+void editor_open_test_unsaved(void) {
+    vfs_unlink("/edtest.txt");
+    vfs_unlink("/edtest.txt.unsaved");
+    ed_test_unsaved = 1;
+    editor_open_with(NULL);
+    ed_test_unsaved = 0;
+}
 static void editor_launch(void)                { editor_open_with(NULL); }
 static void editor_open_path(const char* path) { editor_open_with(path); }
 

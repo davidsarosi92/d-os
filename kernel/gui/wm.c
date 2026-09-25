@@ -363,6 +363,24 @@ void gui_window_close(struct gui_window* win) {
         need_frame = 1;
     }
 }
+/* Orderly close (2026-09-25) — see gui_priv.h's `close_guard`. */
+void gui_window_set_close_guard(struct gui_window* win,
+                                int (*guard)(struct gui_window*, int reason)) {
+    if (win) win->close_guard = guard;
+}
+/* A window's lifetime identity for code outside the compositor (apps see the
+ * struct as opaque): a slot is reused, a serial never is. */
+uint32_t gui_window_serial(struct gui_window* win) { return win ? win->serial : 0; }
+int gui_window_alive(struct gui_window* win, uint32_t serial) {
+    return win && win->used && win->serial == serial;
+}
+void gui_window_close_now(struct gui_window* win) {
+    if (win && win->used) {
+        win->close_confirmed = 1;
+        win->want_close = 1;
+        need_frame = 1;
+    }
+}
 /* §M42 — a CLIENT-MANAGED WIN_APP window (the dosgui bridge for a ring-3 client
  * like NetSurf).  Sever the host_task binding: the client is a DETACHED task
  * reaped by init, not a compositor-owned app-host, so the compositor must NOT
@@ -723,6 +741,13 @@ struct gui_window* window_alloc(const char* title, enum win_kind kind,
     win->input_ctx  = NULL;
     win->aq_h = win->aq_t = 0;
     win->tick_pending = win->layout_pending = win->host_released = 0;
+    {
+        static uint32_t g_win_serial;                  /* under state_lock */
+        win->serial = ++g_win_serial;
+    }
+    win->close_guard = NULL;
+    win->close_reason = 0;
+    win->close_confirmed = 0;
     spin_lock_init(&win->lock);
     str_copy(win->title, title, (int)sizeof(win->title));
     win->used = 1;

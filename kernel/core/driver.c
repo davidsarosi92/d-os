@@ -830,13 +830,20 @@ void driver_cmd(const char* args) {
  * The FAULT paths deliberately do not come through here (§M66): a watchdog
  * reboot runs from an interrupt with the machine in an unknown state, and it
  * must NOT disarm the marker — an unclean boot is exactly what it is. */
+/* The session above the drivers ends first, in order (GUI apps asked to close,
+ * then desktop, then compositor).  WEAK here so a build without a GUI links;
+ * gui.c provides the real one. */
+__attribute__((weak)) void session_end_for_power(void) { }
+
 void system_power_off(void) {
+    session_end_for_power();
     driver_shutdown_all();
     crash_boot_clean();
     hal_shutdown();
 }
 
 void system_reboot(void) {
+    session_end_for_power();
     driver_shutdown_all();
     crash_boot_clean();
     hal_reboot();

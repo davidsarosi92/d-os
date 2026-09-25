@@ -379,6 +379,8 @@ static int  gui_next_session = 1;
  * hand-off in gui_start does not route its own session back to itself. */
 static int  in_session_leader = 0;
 static void gui_stop_main(void);        /* teardown task; defined by gui_stop  */
+static void gui_power_main(void);       /* orderly end, then power (2026-09-25) */
+static volatile int gui_power_kind;     /* 1 = reboot, 2 = power off           */
 
 
 /* §M69 — WRITE THE WHOLE SLOT, ALWAYS, AND NEVER FIELD BY FIELD.
@@ -888,7 +890,10 @@ static void dispatch_launches(void) {
         void (*fn)(void) = openq[oq_t];
         oq_t = (oq_t + 1) % LQ_SZ;
         if (!fn) continue;
-        struct task* host = task_spawn_arg("app:dialog", app_host_main,
+        /* Named after its first window once it has one (app_host_main); every
+         * queued open used to run as "app:dialog" — a settings panel, the
+         * Editor, a test — which is what the Task Manager then showed. */
+        struct task* host = task_spawn_arg("app:open", app_host_main,
                                            (void*)(uintptr_t)fn);
         if (host) task_set_reap_owned(host, 1);
     }
@@ -913,8 +918,16 @@ static void dispatch_launches(void) {
          * keep init off it, same contract as WIN_TERM shells. */
         task_set_reap_owned(host, 1);
     }
-    if (power_req == 1) system_reboot();
-    if (power_req == 2) system_power_off();
+    if (power_req == 1 || power_req == 2) {
+        /* NOT here either: the orderly session end stops THIS task, so a
+         * power-off started on the compositor could never get past it.  The
+         * Start menu used to call system_power_off() right here — which is
+         * how "Shut Down" stopped every app without asking any of them. */
+        gui_power_kind = power_req;
+        power_req = 0;
+        if (!task_spawn_detached("gui-power", gui_power_main))
+            kprintf("gui: cannot spawn the power-off task - staying up\n");
+    }
     if (exit_req) {
         /* Not here: this is the compositor, and the teardown kills it.  Hand
          * the job to a task outside the session (see gui_teardown). */
@@ -1546,10 +1559,144 @@ int gui_wallpaper_reload(void) {
  * certainly cannot outlive its own kill_tree to do the tidying afterwards.
  * ========================================================================== */
 
+/* ==========================================================================
+ * THE ORDERLY SESSION END (2026-09-25).
+ *
+ * Asked for directly: *"on sign-out and shutdown the programs have to be
+ * stopped properly, in order."*  They were not.  Every route out of a session
+ * — Sign out, Exit GUI, `gui stop`, switching user, and the Start menu's
+ * Reboot / Shut Down — ended in one `task_kill_tree` of the desktop, so an app
+ * with unsaved work was stopped at its next yield like any other thread, and
+ * the power entries did not even do that: they called system_power_off()
+ * straight from the compositor.
+ *
+ * The order is now:
+ *   0. every window the session owns is asked to close — the same request the
+ *      X button makes, with the reason SESSION — while input and the
+ *      compositor still work, because an app that asks "save your changes?"
+ *      needs somebody to be able to answer.  Up to `gui.logout_grace_ms`.
+ *   1. what is still open after the deadline is closed REGARDLESS, by name, in
+ *      the log (its guard is bypassed, its on_close still runs — an app keeps
+ *      unsaved data safe there);
+ *   2. input is disconnected; every remaining session task is stopped;
+ *   3. then the desktop (taskbar, menus);
+ *   4. and the compositor LAST, since it is what disposes the windows the
+ *      earlier steps close.
+ * Each step waits until what it stopped is actually GONE (§M82 session's
+ * lesson: "we asked it to die" is not "it is dead").
+ * ========================================================================== */
+int compositor_pid;
+static volatile int teardown_busy;
+/* When each step of the last session end finished (ms clock) — read by
+ * `logouttest`, which checks the ORDER rather than trusting the log's. */
+static volatile uint64_t te_windows_ms, te_rest_ms, te_desktop_ms, te_comp_ms;
+
+CONFIG_KEY(ck_logout_grace) = {
+    .key = "gui.logout_grace_ms", .group = "System", .type = CFG_INT, .def = "15000",
+    .help = "how long signing out / shutting down waits for apps to close (ms)",
+};
+
+int gui_session_ending(void) { return teardown_busy; }
+
+static int pid_in(const int* v, int n, int pid) {
+    for (int i = 0; i < n; i++) if (v[i] == pid) return 1;
+    return 0;
+}
+
+/* Wait for every pid in `v` to disappear; name whoever outlives `ms`. */
+static int session_wait_gone(const int* v, int n, uint32_t ms, const char* what) {
+    int alive = 0;
+    for (uint32_t waited = 0; ; waited += 5) {
+        alive = 0;
+        for (int k = 0; k < n; k++) if (v[k] > 0 && task_find(v[k])) alive++;
+        if (!alive || waited >= ms) break;
+        task_msleep(5);
+    }
+    for (int k = 0; alive && k < n; k++) {
+        struct task* t = v[k] > 0 ? task_find(v[k]) : NULL;
+        if (t) klog(KLOG_WARN, "gui", "%s '%s' (pid %d) outlived its %u ms deadline - "
+                                     "going on without it\n", what, t->name, t->pid, ms);
+    }
+    return alive;
+}
+
+static int window_still_open(int slot, uint32_t serial) {
+    return windows[slot].used && windows[slot].serial == serial;
+}
+
+/* Steps 0 and 1 above. */
+static void session_close_windows(const int* sess, int nsess) {
+    uint32_t grace = (uint32_t)config_get_long("gui.logout_grace_ms", 15000);
+    int      slot[GUI_MAX_WINDOWS];
+    uint32_t ser[GUI_MAX_WINDOWS];
+    int n = 0;
+
+    uint32_t fl = spin_lock_irqsave(&state_lock);
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+        struct gui_window* w = &windows[i];
+        if (!w->used) continue;
+        /* A DETACHED shell was started to outlive the session (M27's
+         * "nohup in a GUI") — its window goes with the screen, but the shell is
+         * not ours to stop. */
+        if (w->kind == WIN_TERM && w->vc && w->vc->task &&
+            !pid_in(sess, nsess, w->vc->task->pid)) continue;
+        w->close_reason = GUI_CLOSE_SESSION;
+        w->want_close = 1;
+        slot[n] = i; ser[n] = w->serial; n++;
+    }
+    spin_unlock_irqrestore(&state_lock, fl);
+    need_frame = 1;
+    if (!n) return;
+    kprintf("gui: session end - asked %d window(s) to close (grace %u ms)\n", n, grace);
+
+    uint64_t t0 = timer_ticks_ms();
+    int left = n;
+    while (left && timer_ticks_ms() - t0 < grace) {
+        task_msleep(20);
+        left = 0;
+        for (int k = 0; k < n; k++) left += window_still_open(slot[k], ser[k]);
+    }
+    if (left) {
+        for (int k = 0; k < n; k++) {
+            if (!window_still_open(slot[k], ser[k])) continue;
+            struct gui_window* w = &windows[slot[k]];
+            kprintf("gui: session end - '%s' did not close within %u ms - closing it "
+                    "anyway\n", w->title, grace);
+            w->close_confirmed = 1;
+            w->close_reason = GUI_CLOSE_SESSION;
+            w->want_close = 1;
+        }
+        need_frame = 1;
+        uint64_t t1 = timer_ticks_ms();
+        while (left && timer_ticks_ms() - t1 < 3000) {
+            task_msleep(20);
+            left = 0;
+            for (int k = 0; k < n; k++) left += window_still_open(slot[k], ser[k]);
+        }
+        if (left)
+            kprintf("gui: session end - %d window(s) still open; their tasks will be "
+                    "stopped\n", left);
+    }
+    kprintf("gui: session end - windows closed in %u ms\n",
+            (unsigned)(timer_ticks_ms() - t0));
+    te_windows_ms = timer_ticks_ms();
+}
+
 static int gui_teardown(void) {
     if (!gui_active) return -1;
+    if (__atomic_exchange_n(&teardown_busy, 1, __ATOMIC_ACQ_REL)) return -1;
 
-    /* 1. INPUT FIRST.  An event delivered into a compositor that is being torn
+    int dp = desktop_pid, cp = compositor_pid;
+    int sess[TASK_KILLTREE_MAX];
+    int nsess = dp > 0 ? task_tree_pids(dp, sess, TASK_KILLTREE_MAX) : 0;
+    if (nsess < 0) nsess = 0;
+
+    /* 0-1. THE APPLICATIONS, POLITELY, WHILE EVERYTHING STILL WORKS. */
+    te_windows_ms = te_rest_ms = te_desktop_ms = te_comp_ms = 0;
+    session_close_windows(sess, nsess);
+    if (!te_windows_ms) te_windows_ms = timer_ticks_ms();
+
+    /* 2. INPUT.  An event delivered into a compositor that is being torn
      *    down is the classic teardown crash: the queues it drains, the windows
      *    it routes to and the surfaces it draws into are all about to go away,
      *    and the mouse IRQ does not know that. */
@@ -1559,7 +1706,7 @@ static int gui_teardown(void) {
     vc_set_raw_kbd_hook(NULL);
     task_set_change_hook(NULL);
 
-    /* 2. Hand every app-host's REAP back to init before its owner dies.  The
+    /*    Hand every app-host's REAP back to init before its owner dies.  The
      *    compositor claims the reap of the hosts it spawns (window-teardown
      *    ordering, apply_pending); with the compositor gone, a host still
      *    marked reap_owned would be a corpse nobody is allowed to collect —
@@ -1568,50 +1715,28 @@ static int gui_teardown(void) {
         if (windows[i].used && windows[i].host_task)
             task_set_reap_owned(windows[i].host_task, 0);
 
-    /* 3. Kill the session.  The desktop is the session root (gui_start), so one
-     *    kill_tree takes the compositor, the app-hosts and every terminal with
-     *    it — the same "parent dies → children die" rule the GUI is built on. */
-    int dp = desktop_pid;
-    int sess[TASK_KILLTREE_MAX];
-    int nsess = dp > 0 ? task_kill_tree_pids(dp, sess, TASK_KILLTREE_MAX) : 0;
-    if (nsess < 0) nsess = 0;
-
-    /* 4. WAIT for the WHOLE session to actually be gone.  Freeing a surface
-     *    while the compositor is mid-compose is a use-after-free of several
-     *    megabytes, and "we asked it to die" is not the same statement as "it
-     *    is dead".  Poll for DISAPPEARANCE rather than task_wait()ing: init is
-     *    a universal reaper and may collect a task first, and waiting on a
-     *    child somebody else reaped never completes (§M57).
+    /* 2-4. THE REST OF THE SESSION, IN ORDER, each waited for until it is GONE.
      *
-     *    §M82 — EVERY MEMBER, NOT THE ROOT.  This used to wait for the desktop
-     *    alone, and the desktop dying says nothing about the compositor under
-     *    it — which is exactly the task the paragraph above is about.  The
-     *    compositor regularly outlived it (logs show `reaped 'compositor'`
-     *    AFTER `session ended`); a full-screen composite in flight then blitted
-     *    ~9 MB of wallpaper into a freed back buffer, and whatever the heap
-     *    handed out next — the NEW session's kernel stacks among it — was
-     *    overwritten.  Measured as a GPF at rip = 0xff0000ffff0000ff (two
-     *    wallpaper pixels) and as NMIs with the CPUs executing inside the font
-     *    DATA tables, 3 runs in 3 on x86_64 with a theme change mid-session
-     *    (which makes every frame full-screen and so widens the window).
-     *    The membership is captured AT KILL TIME because once the root is dead
-     *    its children are re-parented to init and cannot be found from it. */
+     *    §M82 — every member, not the root.  This once waited for the desktop
+     *    alone, and the compositor (its child, re-parented to init the moment
+     *    the desktop died) went on compositing into buffers step 5 frees: a
+     *    GPF at rip = 0xff0000ffff0000ff (two wallpaper pixels) and NMIs in the
+     *    font tables.  The membership is captured BEFORE anything is stopped,
+     *    because once the root is gone its children cannot be found from it. */
     {
-        int alive = 0;
-        for (int round = 0; round < 400; round++) {
-            alive = 0;
-            for (int k = 0; k < nsess; k++) if (task_find(sess[k])) alive++;
-            if (!alive) break;
-            task_msleep(5);
-        }
-        if (alive) {
-            for (int k = 0; k < nsess; k++) {
-                struct task* t = task_find(sess[k]);
-                if (t) klog(KLOG_WARN, "gui", "session task '%s' (pid %d) outlived the "
-                                             "teardown deadline - freeing anyway\n",
-                            t->name, t->pid);
-            }
-        }
+        int rest[TASK_KILLTREE_MAX], nr = 0;
+        for (int k = 0; k < nsess; k++)
+            if (sess[k] != dp && sess[k] != cp) { task_kill(sess[k]); rest[nr++] = sess[k]; }
+        session_wait_gone(rest, nr, 2000, "session task");
+        kprintf("gui: session end - %d remaining session task(s) stopped\n", nr);
+        te_rest_ms = timer_ticks_ms();
+        if (dp > 0) { task_kill(dp); session_wait_gone(&dp, 1, 2000, "desktop"); }
+        kprintf("gui: session end - desktop stopped\n");
+        te_desktop_ms = timer_ticks_ms();
+        if (cp > 0) { task_kill(cp); session_wait_gone(&cp, 1, 2000, "compositor"); }
+        kprintf("gui: session end - compositor stopped\n");
+        te_comp_ms = timer_ticks_ms();
+        compositor_pid = 0;
     }
 
     /* 5. Windows.  Their hosts are dead, so nothing will run on_close on its
@@ -1668,6 +1793,7 @@ static int gui_teardown(void) {
      *    teardown passes through cannot be missed by the next route. */
     config_user_detach();
 
+    __atomic_store_n(&teardown_busy, 0, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -2004,9 +2130,182 @@ static void cmd_sessionstorm(const char* args) {
 SHELL_CMD(sessionstorm) = { "sessionstorm", "<user-a> <user-b> <rounds> [mode]", 0,
                             SHELL_G_TEST, cmd_sessionstorm, SHELL_P_ADMIN };
 
+/* ---------------------------------------------------------------------------
+ * `logouttest` — the orderly session end's FALSIFIER (hidden).
+ *
+ * Two windows on their own app-host: "LT Saver" writes its state to a file when
+ * the session asks it to close, then lets it close; "LT Stubborn" never agrees.
+ * Then a real Sign out (the route the Start menu takes) with a 3 s grace, and
+ * four checks, each its own line:
+ *   1. the Saver's file exists — the app got to save before it was stopped;
+ *   2. the Stubborn window was closed only AFTER the grace, and its on_close
+ *      still ran (the forced route keeps an app's last chance to save);
+ *   3. the order: windows, then the rest of the session, then the desktop,
+ *      then the compositor — read from the teardown's own timestamps;
+ *   4. the whole end took roughly the grace, not the default 15 s.
+ * ------------------------------------------------------------------------- */
+#define LT_FILE "/logouttest.saved"
+static volatile int lt_ready, lt_stub_closed;
+static volatile uint64_t lt_stub_closed_ms;
+
+static int lt_saver_guard(struct gui_window* w, int reason) {
+    (void)w;
+    if (reason != GUI_CLOSE_SESSION) return 1;
+    struct file* f = vfs_open(LT_FILE, VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+    if (f) { vfs_write(f, "saved at session end\n", 21); vfs_close(f); }
+    kprintf("logouttest: 'LT Saver' saved its state and agreed to close\n");
+    return 1;
+}
+static int lt_stub_guard(struct gui_window* w, int reason) { (void)w; (void)reason; return 0; }
+static void lt_stub_on_close(struct gui_window* w) {
+    (void)w;
+    lt_stub_closed = 1;
+    lt_stub_closed_ms = timer_ticks_ms();
+}
+static void lt_open(void) {
+    struct gui_window* a = gui_app_window_create("LT Saver", 120, 120, 320, 140, NULL, NULL);
+    struct gui_window* b = gui_app_window_create("LT Stubborn", 480, 120, 320, 140, NULL, NULL);
+    if (a) gui_window_set_close_guard(a, lt_saver_guard);
+    if (b) { gui_window_set_close_guard(b, lt_stub_guard); b->on_close = lt_stub_on_close; }
+    lt_ready = (a && b);
+}
+
+/* `logouttest editor`: the real app.  An Editor with unsaved text, then a Sign
+ * out with a 3 s grace.  Whether anybody answers its "save?" dialog is the
+ * harness's choice (Enter confirms), so the verdict names what happened:
+ *   answered Save -> /edtest.txt written, window closed BEFORE the grace ran out;
+ *   no answer     -> the session closes it anyway and ed_on_close keeps the text
+ *                    in /edtest.txt.unsaved — nothing is lost either way. */
+extern void editor_open_test_unsaved(void);
+static int lt_editor_mode;
+static int file_exists(const char* p) {
+    struct file* f = vfs_open(p, VFS_RDONLY);
+    if (f) vfs_close(f);
+    return f != NULL;
+}
+static void logouttest_editor(void) {
+    config_set("gui.logout_grace_ms", "3000");
+    gui_queue_open(editor_open_test_unsaved);
+    task_msleep(1500);
+    uint64_t t0 = timer_ticks_ms();
+    gui_session_restart_as(NULL);
+    for (int i = 0; i < 500 && !teardown_busy; i++) task_msleep(10);
+    for (int i = 0; i < 3000 && teardown_busy; i++) task_msleep(10);
+    config_set("gui.logout_grace_ms", "15000");
+    int saved = file_exists("/edtest.txt"), kept = file_exists("/edtest.txt.unsaved");
+    unsigned wc = (unsigned)(te_windows_ms - t0);
+    const char* what = saved && !kept && wc < 3000 ? "SAVED by the user's answer"
+                     : kept && !saved && wc >= 3000 ? "KEPT after nobody answered"
+                     : "LOST OR INCONSISTENT";
+    kprintf("logouttest editor: saved=%d kept=%d, windows closed after %u ms - %s\n",
+            saved, kept, wc, what);
+    kprintf("logouttest editor: %s\n", (saved || kept) && !(saved && kept) ? "PASS" : "FAIL");
+}
+
+/* `logouttest power` / `logouttest menu`: the two ways to power off with an
+ * unsaved Editor open.  `power` is the shell's route (system_power_off from a
+ * task outside the session, which must end the session first through the
+ * hook); `menu` is exactly what the Start menu's Shut Down calls.  The machine
+ * goes down, so the evidence is the serial log: the session-end lines and the
+ * Editor's recovery line must come BEFORE the drivers stop. */
+static void logouttest_power(int via_menu) {
+    config_set("gui.logout_grace_ms", "2000");
+    gui_queue_open(editor_open_test_unsaved);
+    task_msleep(1500);
+    kprintf("logouttest %s: powering off now\n", via_menu ? "menu" : "power");
+    if (via_menu) gui_queue_power(0);
+    else          system_power_off();
+}
+
+static void logouttest_main(void) {
+    if (lt_editor_mode == 2) { logouttest_power(0); return; }
+    if (lt_editor_mode == 3) { logouttest_power(1); return; }
+    if (lt_editor_mode) { logouttest_editor(); return; }
+    vfs_unlink(LT_FILE);
+    lt_ready = 0; lt_stub_closed = 0;
+    const uint32_t grace = 3000;
+    config_set("gui.logout_grace_ms", "3000");
+    gui_queue_open(lt_open);
+    for (int i = 0; i < 250 && !lt_ready; i++) task_msleep(20);
+    if (!lt_ready) { kprintf("logouttest: the test windows never opened\n"); return; }
+    task_msleep(500);
+
+    uint64_t t0 = timer_ticks_ms();
+    gui_session_restart_as(NULL);                         /* Sign out */
+    for (int i = 0; i < 500 && !teardown_busy; i++) task_msleep(10);
+    for (int i = 0; i < 3000 && teardown_busy; i++) task_msleep(10);
+    uint64_t took = timer_ticks_ms() - t0;
+    config_set("gui.logout_grace_ms", "15000");
+
+    int fails = 0;
+    struct file* f = vfs_open(LT_FILE, VFS_RDONLY);
+    int ok1 = f != NULL;
+    if (f) vfs_close(f);
+    kprintf("logouttest: 1 %s - the app saved before it was stopped (%s %s)\n",
+            ok1 ? "ok  " : "FAIL", LT_FILE, ok1 ? "exists" : "MISSING");
+    fails += !ok1;
+
+    uint64_t stub_after = lt_stub_closed ? lt_stub_closed_ms - t0 : 0;
+    int ok2 = lt_stub_closed && stub_after >= grace;
+    kprintf("logouttest: 2 %s - the stubborn window closed %u ms after sign-out "
+            "(grace %u), on_close %s\n", ok2 ? "ok  " : "FAIL",
+            (unsigned)stub_after, grace, lt_stub_closed ? "ran" : "NEVER RAN");
+    fails += !ok2;
+
+    int ok3 = te_windows_ms && te_windows_ms <= te_rest_ms &&
+              te_rest_ms <= te_desktop_ms && te_desktop_ms <= te_comp_ms;
+    kprintf("logouttest: 3 %s - order: windows +%u, rest +%u, desktop +%u, "
+            "compositor +%u ms\n", ok3 ? "ok  " : "FAIL",
+            (unsigned)(te_windows_ms - t0), (unsigned)(te_rest_ms - t0),
+            (unsigned)(te_desktop_ms - t0), (unsigned)(te_comp_ms - t0));
+    fails += !ok3;
+
+    int ok4 = took >= grace && took < grace + 8000;
+    kprintf("logouttest: 4 %s - the session end took %u ms for a %u ms grace\n",
+            ok4 ? "ok  " : "FAIL", (unsigned)took, grace);
+    fails += !ok4;
+    kprintf("logouttest: %s (%d failure(s))\n", fails ? "FAIL" : "PASS", fails);
+}
+static void cmd_logouttest(const char* a) {
+    while (a && *a == ' ') a++;
+    lt_editor_mode = !a || !a[0] ? 0 : a[0] == 'e' ? 1 : a[0] == 'p' ? 2 : a[0] == 'm' ? 3 : 0;
+    if (!gui_active) { kprintf("logouttest: the GUI is not running\n"); return; }
+    if (!task_spawn_detached("logouttest", logouttest_main))
+        kprintf("logouttest: cannot spawn\n");
+}
+SHELL_CMD(logouttest) = { "logouttest", "[editor|power|menu]", 0, SHELL_G_TEST, cmd_logouttest, SHELL_P_ADMIN };
+
 static void gui_stop_main(void) {
     gui_teardown();
     task_exit();
+}
+
+/* Reboot / Shut Down from the Start menu: end the session in order FIRST.
+ * system_reboot/system_power_off also call session_end_for_power() below, which
+ * finds the GUI already gone and does nothing — the hook exists for the routes
+ * that do not start here (the shell's `shutdown`, `reboot`). */
+static void gui_power_main(void) {
+    int kind = gui_power_kind;
+    kprintf("gui: %s requested - ending the session first\n",
+            kind == 1 ? "reboot" : "shut down");
+    gui_teardown();
+    if (kind == 1) system_reboot();
+    else           system_power_off();
+    task_exit();
+}
+
+/* The power routes' hook (driver.c, weak there).  A shell `shutdown` typed
+ * while the desktop is up must end the session in order too — ONE route, so a
+ * new way to power off inherits this rather than having to remember it. */
+void session_end_for_power(void) {
+    if (!gui_active) return;
+    struct task* me = task_current();
+    if (me && (me->pid == compositor_pid || me->pid == desktop_pid)) {
+        kprintf("gui: power-off from inside the session - the orderly end cannot "
+                "run on the task it would stop\n");
+        return;
+    }
+    gui_teardown();
 }
 
 int gui_autostart(void) {
@@ -2224,7 +2523,9 @@ int gui_start(void) {
     }
 
     int sess = desktop_pid > 0 ? desktop_pid : -1;   /* session parent, or caller */
-    if (!task_spawn_under("compositor", gui_compositor_main, sess)) {
+    struct task* comp_task = task_spawn_under("compositor", gui_compositor_main, sess);
+    compositor_pid = comp_task ? comp_task->pid : 0;
+    if (!comp_task) {
         kprintf("gui: FATAL - compositor spawn failed\n");
         vc_set_kbd_hook(NULL);
         vc_set_raw_kbd_hook(NULL);

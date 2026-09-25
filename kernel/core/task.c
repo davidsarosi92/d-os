@@ -2004,7 +2004,7 @@ void task_set_reap_owned(struct task* t, int owned) {
  * from it.  The membership therefore has to be captured HERE, at kill time,
  * while the tree is still a tree.  Returns the number of pids written to `out`
  * (the whole subtree, root first), or a negative value if the root refused. */
-static int kill_tree_impl(int pid, int* out, int max, int* killed) {
+static int kill_tree_impl(int pid, int* out, int max, int* killed, int do_kill) {
     if (pid <= 0) return -1;
     /* §M32 — the ROOT of the subtree decides.  Checking each member instead
      * would let a user take down a tree by owning one leaf of it, and would
@@ -2042,7 +2042,7 @@ static int kill_tree_impl(int pid, int* out, int max, int* killed) {
     spin_unlock_irqrestore(&master_lock, fl);
 
     int k = 0;
-    for (int i = 0; i < n; i++) if (task_kill(ids[i]) == 0) k++;
+    if (do_kill) for (int i = 0; i < n; i++) if (task_kill(ids[i]) == 0) k++;
     if (killed) *killed = k;
     int w = 0;
     for (int i = 0; i < n && out && w < max; i++) out[w++] = ids[i];
@@ -2050,12 +2050,19 @@ static int kill_tree_impl(int pid, int* out, int max, int* killed) {
 }
 
 int task_kill_tree_pids(int pid, int* out, int max) {
-    return kill_tree_impl(pid, out, max, NULL);
+    return kill_tree_impl(pid, out, max, NULL, 1);
+}
+
+/* The same membership WITHOUT killing — for a caller that must stop a subtree
+ * in an ORDER (the GUI session end: apps, then the desktop, then the
+ * compositor).  Same root permission check, same snapshot semantics. */
+int task_tree_pids(int pid, int* out, int max) {
+    return kill_tree_impl(pid, out, max, NULL, 0);
 }
 
 int task_kill_tree(int pid) {
     int killed = 0;
-    int rc = kill_tree_impl(pid, NULL, 0, &killed);
+    int rc = kill_tree_impl(pid, NULL, 0, &killed, 1);
     return rc < 0 ? rc : killed;      /* unchanged contract: how many were killed */
 }
 

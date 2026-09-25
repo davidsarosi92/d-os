@@ -386,7 +386,11 @@ static void lock_closed(struct gui_window* w) {
     g_lock.picker = NULL;
     g_lock.pass = NULL;
     g_lock.status = NULL;
-    if (!g_lock.unlocked) {
+    /* NOT while the session is ending: the orderly end asks every window to
+     * close, this one included, and a lock that came straight back would be a
+     * new window opened in the middle of the teardown, for a session that is
+     * about to be gone.  The next session raises its own. */
+    if (!g_lock.unlocked && !gui_session_ending()) {
         kprintf("lock: closed while still locked - raising it again\n");
         gui_lock_raise();
     }
@@ -445,6 +449,7 @@ static void lock_build(void) {
  * task that has the loop. */
 int gui_lock_raise(void) {
     if (g_lock.win) return 0;                     /* already up */
+    if (gui_session_ending()) return -1;          /* see lock_closed */
     if (users_needs_setup()) {
         /* Nothing to authenticate against.  Locking here would leave a machine
          * nobody can get into — the same stranding §M32's account rules refuse
