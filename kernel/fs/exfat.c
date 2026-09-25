@@ -344,18 +344,47 @@ struct dir_iter {
      * and fsck.exfat reported the volume CLEAN, because the stray entries lie
      * outside every directory it walks). */
     uint64_t limit;
+    /* Where the last access landed in the chain: cluster number `pos_n` of the
+     * directory is disk cluster `pos_c` (valid when pos_c != 0).  A FAT-chained
+     * lookup of entry i otherwise walks the FAT from the FIRST cluster every
+     * time, which makes one pass over a directory quadratic in its length —
+     * and a create makes two such passes (the duplicate check and the slot
+     * search).  Measured before this: 1060 creates in one directory took
+     * 512 s under emulation (NEXT.md #8b). */
+    uint32_t pos_n, pos_c;
     uint32_t entry_index;                 /* next entry to fetch (0-based) */
 };
 
 /* Fetch the entry at `idx` into `out` (32 bytes).  Returns 0 on success,
  * non-zero on I/O error or chain end. */
+/* The sector holding byte `off` of the directory, resuming the chain walk
+ * from the iterator's last position when it lies at or before `off`. */
+static struct bcache_buf* dir_iter_sector(struct dir_iter* it, uint64_t off,
+                                          uint32_t* within) {
+    struct exfat_fs* fs = it->fs;
+    uint32_t n = (uint32_t)(off / fs->bytes_per_cluster);
+    uint32_t cur;
+    if (it->no_fat_chain) {
+        cur = it->first_cluster + n;
+    } else {
+        uint32_t from_n = 0, from_c = it->first_cluster;
+        if (it->pos_c && it->pos_n <= n) { from_n = it->pos_n; from_c = it->pos_c; }
+        cur = chain_skip(fs, from_c, n - from_n, 0);
+        if (cur >= EXFAT_FAT_EOC_FIRST) return NULL;
+        it->pos_n = n;
+        it->pos_c = cur;
+    }
+    uint32_t within_clu = (uint32_t)(off % fs->bytes_per_cluster);
+    uint64_t lba = cluster_first_lba(fs, cur) + within_clu / fs->bytes_per_sector;
+    *within = within_clu % fs->bytes_per_sector;
+    return bcache_get(fs->dev, lba);
+}
+
 static int dir_entry_read(struct dir_iter* it, uint32_t idx, uint8_t* out) {
     uint64_t off = (uint64_t)idx * EXFAT_ENTRY_SIZE;
     if (it->limit && off >= it->limit) return -1;         /* past the directory */
     uint32_t within;
-    struct bcache_buf* b = cluster_chain_get_sector(it->fs, it->first_cluster,
-                                                    it->no_fat_chain, off,
-                                                    &within);
+    struct bcache_buf* b = dir_iter_sector(it, off, &within);
     if (!b) return -1;
     memcpy_(out, b->data + within, EXFAT_ENTRY_SIZE);
     bcache_release(b);
@@ -367,9 +396,7 @@ static int dir_entry_write(struct dir_iter* it, uint32_t idx, const uint8_t* in)
     uint64_t off = (uint64_t)idx * EXFAT_ENTRY_SIZE;
     if (it->limit && off >= it->limit) return -1;         /* past the directory */
     uint32_t within;
-    struct bcache_buf* b = cluster_chain_get_sector(it->fs, it->first_cluster,
-                                                    it->no_fat_chain, off,
-                                                    &within);
+    struct bcache_buf* b = dir_iter_sector(it, off, &within);
     if (!b) return -1;
     memcpy_(b->data + within, in, EXFAT_ENTRY_SIZE);
     bcache_mark_dirty(b);

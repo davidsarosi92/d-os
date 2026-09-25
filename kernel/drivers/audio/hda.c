@@ -161,6 +161,11 @@ struct hda {
     int       running;
     volatile uint32_t submitted, completed;
     volatile int irq_seen;
+    /* The ring ran past everything queued (see hda_irq): the next play must
+     * restart the stream rather than queue behind a DMA engine that is
+     * already beyond `head`. */
+    volatile int      starved;
+    volatile uint32_t underruns;
 };
 
 static struct hda       g_hda;
@@ -205,12 +210,27 @@ static void hda_irq(struct int_frame* f) {
      * writes a slot when it is `head`, which is ahead of every completed slot
      * and returns to this one only after a full revolution.  4 KiB of stores
      * per ~21 ms period. */
-    if (h->pcm && h->completed < h->submitted) {
-        uint32_t slot = h->completed & (HDA_NBUF - 1);
-        int16_t* p = h->pcm + (size_t)slot * HDA_BUF_FRAMES * 2;
-        for (uint32_t i = 0; i < HDA_BUF_FRAMES * 2; i++) p[i] = 0;
+    /* ONLY A SUBMITTED BUFFER COMPLETES (2026-09-25, NEXT.md #7).  Every BDL
+     * entry carries IOC, and a cyclic stream does not stop when the queue
+     * runs dry: if the pump is late, the engine plays on through the silenced
+     * slots and raises a completion for each.  Counting those made `completed`
+     * overtake `submitted`, `submitted - completed` wrapped to four billion,
+     * and hda_play saw a queue that could never drain: every later period was
+     * dropped ("queue stuck") and a 1000 ms tone under `loop 12` came back as
+     * its first 85 ms and then nothing.  Past the queue is an UNDERRUN — a
+     * gap, which is what a starved audio path should produce — and it is
+     * recorded so the next play restarts the stream at a known position. */
+    if (h->completed < h->submitted) {
+        if (h->pcm) {
+            uint32_t slot = h->completed & (HDA_NBUF - 1);
+            int16_t* p = h->pcm + (size_t)slot * HDA_BUF_FRAMES * 2;
+            for (uint32_t i = 0; i < HDA_BUF_FRAMES * 2; i++) p[i] = 0;
+        }
+        h->completed++;
+    } else if (h->running) {
+        h->starved = 1;
+        h->underruns++;
     }
-    h->completed++;
     h->irq_seen = 1;
 }
 
@@ -342,6 +362,7 @@ static void hda_stream_reset(struct hda* h) {
     h->head = 0;
     h->running = 0;
     h->submitted = h->completed = 0;
+    h->starved = 0;
 }
 
 /* How many buffers the controller has not finished with.  Without an interrupt
@@ -419,6 +440,19 @@ static int hda_play(struct audio_dev* dev, const int16_t* frames, uint32_t nfram
     if (nframes > HDA_BUF_FRAMES) nframes = HDA_BUF_FRAMES;
     if (nframes == 0) return 0;
 
+    /* The engine ran past everything queued: stop it, and let the reset below
+     * start again from slot 0 — queueing behind it would put this period a
+     * whole ring revolution (682.7 ms) late. */
+    if (h->running && h->starved) {
+        mw8(sd_reg(h), SD_CTL, 0);
+        h->running = 0;
+        static uint32_t told;
+        if (h->underruns != told) {
+            told = h->underruns;
+            kprintf("hda: underrun (%u so far) - the pump fell behind; stream "
+                    "restarted\n", (unsigned)h->underruns);
+        }
+    }
     if (!h->running) hda_stream_reset(h);
 
     uint64_t deadline = timer_ticks_ms() +

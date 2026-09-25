@@ -64,6 +64,9 @@
 #include "timer.h"
 #include "task.h"
 #include "lock.h"
+#include "block_cache.h"
+#include "percpu.h"
+#include "shellcmd.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -361,8 +364,16 @@ static int vblk_request(struct virtio_blk* v, uint32_t type, uint64_t lba,
     return rc;
 }
 
+/* `blkstormtest` (below) sets this to re-create the §M82-session interrupt
+ * storm ON PURPOSE: the handler returns without reading the ISR register, so
+ * the level-triggered line stays asserted exactly as it did when nothing read
+ * it at all. */
+static volatile int vblk_test_noack;
+static volatile uint32_t vblk_test_hits;
+
 static void vblk_irq(struct int_frame* f) {
     (void)f;
+    if (vblk_test_noack) { vblk_test_hits++; return; }
     if (!g_vblk.io_base) return;
     uint8_t isr = inb(g_vblk.io_base + VBLK_OFF_ISR_STATUS);   /* read-to-clear */
     if (!(isr & 1)) return;                                    /* not ours      */
@@ -435,7 +446,7 @@ static int vblk_request_unlocked(struct virtio_blk* v, uint32_t type, uint64_t l
     /* Read-to-clear the ISR register, so that even a device which ignores
      * NO_INTERRUPT drops the shared line instead of leaving it asserted for
      * whichever driver owns the vector (see the note at the ring setup). */
-    (void)inb(v->io_base + VBLK_OFF_ISR_STATUS);
+    if (!vblk_test_noack) (void)inb(v->io_base + VBLK_OFF_ISR_STATUS);
 
     /* 6. Check status. */
     uint8_t st = *v->req_status;
@@ -575,3 +586,63 @@ DRIVER_MATCH(m_vblk) = { .driver = "virtio_blk",
 
 DRIVER_EX(virtio_blk, "block", &vblk_ops, NULL,
           DOMAIN_KERNEL, DRVF_BOOT_CRITICAL | DRVF_DMA);
+
+/* ---------------------------------------------------------------------------
+ * `blkstormtest [ms]` — the REAL storm, re-created on purpose (NEXT.md #5).
+ *
+ * `!! PIT STARVED` was proven only on its falsifier (`pitstarvetest`, which
+ * raises the TPR — a model of the storm, not the storm).  The case it was built
+ * for is a level-triggered line nobody acknowledges: the vector re-fires after
+ * every EOI, and everything of a lower priority class on that CPU — the PIT,
+ * the keyboard — starves.  This does exactly that for a bounded time: stop
+ * acknowledging, issue one disk read so the device raises the line, hold it
+ * for `ms`, then acknowledge again.
+ *
+ * The test runs on ANOTHER CPU and WAITS BY SPINNING on the ns clock: the
+ * line is routed to the BSP, and ktimers expire from the BSP's PIT — which is
+ * the thing being starved — so a task_msleep here would never return.  It
+ * needs two CPUs for the same reason, and refuses on one.  The hardware
+ * watchdog is petted from the BSP's tick too, so the window stays under its
+ * ~4 s budget; 2000 ms is the default.
+ * ------------------------------------------------------------------------- */
+static void blkstormtest(const char* args) {
+    extern volatile uint32_t g_pit_starved;
+    unsigned ms = 0;
+    while (args && *args >= '0' && *args <= '9') ms = ms * 10 + (unsigned)(*args++ - '0');
+    if (ms == 0 || ms > 3000) ms = 2000;
+    if (!g_vblk.io_base) { kprintf("blkstormtest: no virtio-blk disk attached\n"); return; }
+    struct task* me = task_current();
+    if (me) task_set_affinity(me, 1u << 1);
+    int cpu = -1;
+    for (int i = 0; i < 100 && (cpu = this_cpu_id()) != 1; i++) task_yield();
+    if (cpu != 1) { kprintf("blkstormtest: needs a second CPU (run with -smp 2+)\n"); return; }
+
+    uint32_t before = g_pit_starved;
+    uint64_t irqs0 = vblk_irqs;
+    vblk_test_hits = 0;
+    vblk_test_noack = 1;
+    /* A read of the LAST sector — not one the block cache is likely to hold,
+     * so it really reaches the device and the device really raises the line. */
+    struct block_device* dev = blk_find("vda");
+    if (dev) {
+        struct bcache_buf* b = bcache_get(dev, dev->sector_count - 1);
+        if (b) bcache_release(b);
+    }
+    uint64_t t0 = timer_now_ns();
+    while (timer_now_ns() - t0 < (uint64_t)ms * 1000000ull) hal_cpu_pause();
+    vblk_test_noack = 0;
+    /* The next invocation of the handler reads ISR and lowers the line. */
+    uint64_t t1 = timer_now_ns();
+    while (timer_now_ns() - t1 < 300000000ull) hal_cpu_pause();
+    uint32_t after = g_pit_starved;
+    kprintf("blkstormtest: left the disk's interrupt unacknowledged for %u ms - "
+            "%u unacknowledged invocation(s), the detector reported %u episode(s), "
+            "%u completion interrupt(s) after: %s\n",
+            ms, vblk_test_hits, after - before, (unsigned)(vblk_irqs - irqs0),
+            vblk_test_hits < 1000 ? "INCONCLUSIVE (no storm happened)" :
+            after != before ? "PASS (the storm was named)"
+                            : "FAIL (a real storm went unreported)");
+    if (me) task_set_affinity(me, 0xFFFFFFFFu);
+}
+SHELL_CMD(blkstormtest) = { "blkstormtest", "[ms]", 0, SHELL_G_TEST, blkstormtest, SHELL_P_ADMIN };
+

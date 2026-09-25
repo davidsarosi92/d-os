@@ -31,8 +31,42 @@
 #include "kmutex.h"
 #include <stddef.h>
 
-#define BCACHE_SLOTS    64u
+/* SIZED FOR A DIRECTORY, NOT FOR A FEW FILES (2026-09-25, NEXT.md #8b).
+ *
+ * This was 64 slots, each a whole 4 KiB frame for one 512-byte sector — 32 KiB
+ * of sectors held in 256 KiB of memory.  A directory of 1060 files is 265
+ * sectors, so every pass over it missed the cache on every sector, and a file
+ * create makes two such passes: 1060 creates in one directory took 512 s.
+ * Now a frame holds EIGHT sectors (a 512-byte slot at a 512-byte offset never
+ * straddles a page, so the DMA address stays one contiguous run), 1024 slots
+ * cost 128 frames = 512 KiB, and lookup goes through a hash — a linear scan of
+ * 1024 slots on every access would have traded the disk reads for a loop.
+ *
+ * A device with sectors larger than a slot is refused, loudly, rather than
+ * overrunning the slot: every device here is 512-byte today, and a 4 KiB-sector
+ * disk (a future AHCI drive) is the day this needs a second slot size. */
+#define BCACHE_SLOTS    1024u
+#define BC_SECTOR       512u
 #define FRAME_SIZE      4096u           /* PMM grain — matches one frame */
+#define BC_PER_FRAME    (FRAME_SIZE / BC_SECTOR)
+#define BC_BUCKETS      256u
+
+static struct bcache_buf* buckets[BC_BUCKETS];
+static inline uint32_t bc_hash(struct block_device* dev, uint64_t lba) {
+    return (uint32_t)(lba ^ (lba >> 11) ^ ((uintptr_t)dev >> 4)) & (BC_BUCKETS - 1);
+}
+static void bc_unlink(struct bcache_buf* b) {
+    struct bcache_buf** pp = &buckets[bc_hash(b->dev, b->lba)];
+    while (*pp) {
+        if (*pp == b) { *pp = b->hnext; b->hnext = NULL; return; }
+        pp = &(*pp)->hnext;
+    }
+}
+static void bc_link(struct bcache_buf* b) {
+    uint32_t h = bc_hash(b->dev, b->lba);
+    b->hnext = buckets[h];
+    buckets[h] = b;
+}
 
 static struct bcache_buf slots[BCACHE_SLOTS];
 static int       initialized   = 0;
@@ -46,22 +80,26 @@ static struct bcache_stats stats;
 int bcache_init(void) {
     if (initialized) return 0;
 
+    static pmm_phys_t frames[BCACHE_SLOTS / BC_PER_FRAME];
     for (uint32_t i = 0; i < BCACHE_SLOTS; i++) {
-        pmm_phys_t f = pmm_alloc_frame();
-        if (!f) {
-            /* Roll back what we already allocated so the system can
-             * boot without a cache (the fs layer falls back to direct
-             * I/O via dev->read/write). */
-            for (uint32_t j = 0; j < i; j++) {
-                pmm_free_frame((pmm_phys_t)(uintptr_t)slots[j].data);
-                slots[j].data = NULL;
+        if (i % BC_PER_FRAME == 0) {
+            pmm_phys_t f = pmm_alloc_frame();
+            if (!f) {
+                /* Roll back what we already allocated so the system can
+                 * boot without a cache (the fs layer falls back to direct
+                 * I/O via dev->read/write). */
+                for (uint32_t j = 0; j < i / BC_PER_FRAME; j++) pmm_free_frame(frames[j]);
+                for (uint32_t j = 0; j < i; j++) slots[j].data = NULL;
+                kprintf("bcache: init failed at slot %u (pmm OOM)\n", i);
+                return -1;
             }
-            kprintf("bcache: init failed at slot %u (pmm OOM)\n", i);
-            return -1;
+            frames[i / BC_PER_FRAME] = f;
         }
         slots[i].dev      = NULL;
         slots[i].lba      = 0;
-        slots[i].data     = (uint8_t*)phys_to_virt(f);    /* kernel direct map */
+        slots[i].data     = (uint8_t*)phys_to_virt(frames[i / BC_PER_FRAME]) +
+                            (i % BC_PER_FRAME) * BC_SECTOR;     /* kernel direct map */
+        slots[i].hnext    = NULL;
         slots[i].refcount = 0;
         slots[i].dirty    = 0;
         slots[i].lru_tick = 0;
@@ -70,8 +108,8 @@ int bcache_init(void) {
 
     stats.slots = BCACHE_SLOTS;
     initialized = 1;
-    kprintf("bcache: %u slots, %u KiB total\n",
-            BCACHE_SLOTS, (BCACHE_SLOTS * FRAME_SIZE) / 1024u);
+    kprintf("bcache: %u slots of %u bytes, %u KiB total\n",
+            BCACHE_SLOTS, BC_SECTOR, (BCACHE_SLOTS * BC_SECTOR) / 1024u);
     return 0;
 }
 
@@ -81,10 +119,8 @@ int bcache_init(void) {
 
 /* Look up an existing entry for (dev, lba).  Returns NULL on miss. */
 static struct bcache_buf* find_entry(struct block_device* dev, uint64_t lba) {
-    for (uint32_t i = 0; i < BCACHE_SLOTS; i++) {
-        struct bcache_buf* b = &slots[i];
+    for (struct bcache_buf* b = buckets[bc_hash(dev, lba)]; b; b = b->hnext)
         if (b->valid && b->dev == dev && b->lba == lba) return b;
-    }
     return NULL;
 }
 
@@ -123,6 +159,15 @@ struct bcache_buf* bcache_get(struct block_device* dev, uint64_t lba) {
 
 static struct bcache_buf* bcache_get_unlocked(struct block_device* dev, uint64_t lba) {
     if (!initialized || !dev || !dev->read) return NULL;
+    if (dev->sector_size > BC_SECTOR) {
+        static int told;
+        if (!told) {
+            told = 1;
+            kprintf("bcache: %s has %u-byte sectors, larger than a %u-byte slot - "
+                    "not cached\n", dev->name, dev->sector_size, BC_SECTOR);
+        }
+        return NULL;
+    }
 
     struct bcache_buf* b = find_entry(dev, lba);
     if (b) {
@@ -145,7 +190,7 @@ static struct bcache_buf* bcache_get_unlocked(struct block_device* dev, uint64_t
         b->dirty = 0;
     }
 
-    if (b->valid) stats.evictions++;
+    if (b->valid) { stats.evictions++; bc_unlink(b); b->valid = 0; }
 
     /* Bring the requested sector in. */
     if (blk_read(dev, lba, 1, b->data) != 0) {
@@ -159,6 +204,7 @@ static struct bcache_buf* bcache_get_unlocked(struct block_device* dev, uint64_t
     b->dirty    = 0;
     b->valid    = 1;
     b->lru_tick = ++lru_counter;
+    bc_link(b);
     return b;
 }
 

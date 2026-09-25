@@ -8911,6 +8911,18 @@ deleted (4096 deleted entries ahead of 36 live ones) — the rmdir is refused (-
 (each create scans the whole directory twice: the duplicate check and the slot
 search), so `rmdirtest`'s 1060 creates take ~8.5 minutes under emulation.
 
+
+**And the create was slow for a reason one layer down (NEXT.md #8b).**  The
+block cache held 64 sectors, each in a whole 4 KiB frame, and a 1060-file
+directory is 265 sectors — so every pass over it missed on every sector, and a
+create makes two passes.  Now 1024 slots packed eight to a frame (512 KiB; a
+512-byte slot at a 512-byte offset never straddles a page, so DMA stays one
+run), looked up through a 256-bucket hash, and the directory iterator resumes
+its FAT-chain position instead of walking from the first cluster for every
+entry.  A device with sectors larger than a slot is refused loudly.  Measured:
+`rmdirtest` 512 s → **29 s**, `diskstorm 4 20` 1447 → 609 ms, `fsck.exfat`
+clean on all three arches.
+
 ### 4.74 The desktop is where boot ends — and leaving it lands on a shell
 
 **Files:** `kernel/gui/gui.c` (`gui_autostart`, `gui_queue_exit`, `gui_teardown`,
@@ -13757,6 +13769,7 @@ read-backs), `killstorm` 20/20, `fsck.exfat` clean.
 
 ## 8. Change log
 
+- **2026-09-25 — Block cache 16× larger in half the memory (packed + hashed); `blkstormtest` proves the storm detector on the REAL storm; HDA no longer goes silent for good after an underrun (NEXT.md #5, #7, #8b).**
 - **2026-09-25 — exFAT: a full directory no longer writes into its neighbour's data; directories grow; `dir_is_empty` scans all of it (DOCS §4.73.1).**
 - **2026-09-25 — The serial command channel is portable; aarch64's display boot path can be driven (DOCS §4.74.1).**
 - **2026-09-25 — aarch64 virtio-mmio-blk sleeps on its completion interrupt (DOCS §4.93).**

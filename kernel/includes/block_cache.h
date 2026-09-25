@@ -56,6 +56,7 @@ struct bcache_buf {
     int       dirty;                /* set by bcache_mark_dirty */
     uint64_t  lru_tick;             /* monotonic access timestamp */
     int       valid;                /* 0 until first read populates `data` */
+    struct bcache_buf* hnext;       /* hash-bucket chain (valid entries only) */
 };
 
 /* One-shot init.  Allocates the slot pool and per-slot frames.  Must
