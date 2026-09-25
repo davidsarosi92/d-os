@@ -44,6 +44,54 @@ section, the 2026-09-25 paragraph).  Typing across `gui stop` is reliable again.
 **§M82 proper (greeter, per-user desktop dir, PATH, program list, sign-out
 saving) is NOT started.**  Next in that order.
 
+## Known defects — triaged 2026-09-25
+
+Only DEFECTS (wrong behaviour), not missing features.  Each row says how it was
+established; "open" rows were checked against today's tree, not copied forward.
+
+### Fixed in this round
+
+| defect | how it showed | fix |
+|---|---|---|
+| virtio-blk left its shared level IRQ (10) asserted → interrupt storm on CPU 0 | "harness loses keystrokes" after `gui stop`; `task_msleep`/cron stopped; no NMI | `c75756f` — NO_INTERRUPT + ISR ack; chained `irq_install` |
+| `irq_install` REPLACED the previous handler on a shared line | (the mechanism of the above) | `c75756f` — up to 4 chained handlers |
+| PS/2 mouse drain read and discarded keyboard bytes, also from its 1 s backstop | occasional lost keystroke | `c75756f` |
+| `gui stop` command bypassed the §M82 preference withdrawal | previous user's prefs stayed on the console | `c75756f` — withdrawal inside `gui_teardown` |
+| HDA replayed the sound every 682.7 ms / split it (the §M23/§M67 "intermittent HDA defect") | 3/8 runs on the old kernel, 0/8 after | cause was the storm (`c75756f`); ring now plays silence when stalled (`fe9f19f`) |
+| x86 ms clock counted PIT interrupts and ran at **80 %** of real time | `uptime` 16.35 s per 20.4 s; LAPIC 80 Hz; TSC 1.26–17.8 GHz | `70f6bd6` — derived from the ACPI PM timer |
+| AC97 capture "at 80 % of real time" (§M23 stage 7 open item) | `rec` warned FASTER | not a codec bug — the clock above; `rec 2000` now 2008–2020 ms |
+| GUI teardown freed surfaces while the compositor still drew | x86_64 GPF at rip=`0xff0000ffff0000ff`, NMIs in font tables | `3fce70f` |
+| config had one layer (user overwrote machine; leaked across sessions) | `sessiontest` FAIL×3 | `3fce70f` |
+
+Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI report with
+`if=`/`task=`/`isr-vec=`/stack scan, monitor replies kept in `<log>.mon`,
+`scripts/wav-analyze.py`, `sessiontest`, `sessionstorm`.
+
+### Open — measured or read from today's tree
+
+| # | defect | severity | notes |
+|---|---|---|---|
+| 1 | **Sign-out / shutdown kill the session tree at once** — apps are not asked to close and save, in order | high | user requirement (2026-09-25): stop programs *gracefully, in order*.  Belongs to §M82 point 5 |
+| 2 | **virtio-blk busy-waits for every request** (`hal_cpu_pause` spin, timeout counted in iterations, not time) | medium | a CPU burned per disk I/O; the §M49/§M55 lesson not yet applied to storage |
+| 3 | **Harness cannot type once a GUI window holds focus** (§4.74) | medium (tooling) | routed around with `gui.autorun`, `sessiontest`; the next GUI test will hit it again |
+| 4 | `ktimer` deadlines expire only from the PIT interrupt → 2.5–3.3 ms worst lateness under emulation | low | now a true number (was hidden by the slow clock); could also expire from the LAPIC tick |
+| 5 | Real storm case: no in-guest report escaped (all serial output stopped) | low | the cause is fixed; the `PIT STARVED` path is proven only on its falsifier |
+| 6 | §4.67.1 "host-load dependent" NMI lockup, and today's i386 NMI after `gui stop` | watch | very probably the storm (a disk is attached on every everyday run since §4.66); not proven — the NMI report now names task, IF, in-service vector and stack |
+| 7 | HDA sound splits when its pump task is starved | low | only under starvation; the gap is silence, not stale audio |
+| 8 | exFAT `dir_is_empty` scans at most 4096 entries | low | a limitation, stated in the code |
+| 9 | aarch64 does not publish `/dev/vda` (its block driver initialises after `devfs_init`) | low | not chased |
+| 10 | `load_balance_pull` counts a migration attempt whose insert can be refused | cosmetic | diagnostic counter only |
+
+### Checked and no longer open
+
+- §M50-era `sh -c` SMP failure — fixed by §M51/§M52.
+- §M54 reap-sweep "STILL QUEUED" and the i386 `killstorm` hang — `killstorm` 20/20 rounds,
+  160/160 killed at `-smp 4`, shell answers after (2026-09-25).
+- exFAT `rename` — implemented (`exfat_rename`).
+- GRID / LIST item views without a scrollbar — both have one now.
+- §M81 Task Manager per-frame regression — not reproducible (`bench-taskman-sweep.sh`).
+- `gui stats` printing to the suppressed console — replaced by `gui_diag_service` (§M70).
+
 A short, durable note so work can resume without re-deriving the session.
 Everything below is measured unless it says otherwise.
 
