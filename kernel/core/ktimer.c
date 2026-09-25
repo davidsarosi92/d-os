@@ -114,10 +114,11 @@ void ktimer_expire(void) {
         t->armed = 0;
         if (g_pending) g_pending--;
         g_fired++;
-        /* Lateness is measured, not assumed.  Its floor is the tick period
-         * until a one-shot hardware deadline replaces the periodic tick, and
-         * the only way to know whether that upgrade is worth doing is to have
-         * the number. */
+        /* Lateness is measured, not assumed.  Its floor is the tick period —
+         * and, under emulation, the emulator's own timer dispatch: a one-shot
+         * LAPIC deadline was built, measured and removed (DOCS §4.53.1)
+         * because its own interrupt arrived 1.6-1.7 ms late, no better than
+         * the PIT path it would have replaced. */
         uint64_t late = now - t->deadline_ns;
         if (late > g_max_late_ns) g_max_late_ns = late;
         ktimer_fn fn = t->fn;
@@ -131,6 +132,15 @@ void ktimer_expire(void) {
         /* `t` may already have been re-armed, freed, or reused by the callback
          * — never touch it again here. */
     }
+}
+
+/* Zero the worst-lateness figure, so a measurement is not polluted by
+ * whatever happened during boot (the worst figure is a maximum since the last
+ * reset, and boot is when the machine is busiest). */
+void ktimer_stats_reset(void) {
+    uint32_t fl = spin_lock_irqsave(&g_lock);
+    g_max_late_ns = 0;
+    spin_unlock_irqrestore(&g_lock, fl);
 }
 
 void ktimer_stats(uint32_t* pending, uint64_t* fired, uint64_t* max_late_ns) {

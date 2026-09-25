@@ -574,6 +574,10 @@ static void cmd_ktimer(void) {
     kprintf("ktimer: %u pending, %u fired, worst lateness %u us\n",
             pending, (unsigned)fired, (unsigned)(late / 1000ull));
 
+    /* The since-boot worst figure includes boot, the busiest time the machine
+     * has; the spread below is measured from a clean slate. */
+    ktimer_stats_reset();
+    unsigned worst_us = 0;
     static const unsigned req_us[] = { 500, 1000, 5000, 20000, 100000 };
     kprintf("  requested   actual    error\n");
     for (unsigned i = 0; i < sizeof req_us / sizeof req_us[0]; i++) {
@@ -582,13 +586,15 @@ static void cmd_ktimer(void) {
         task_sleep_until_ns(t0 + want);
         uint64_t got = timer_now_ns() - t0;
         long err = (long)((int64_t)got - (int64_t)want) / 1000;
+        if (err > 0 && (unsigned)err > worst_us) worst_us = (unsigned)err;
         kprintf("  %u us      %u us     %s%u us\n", req_us[i],
                 (unsigned)(got / 1000ull), err < 0 ? "-" : "+",
                 (unsigned)(err < 0 ? -err : err));
     }
     ktimer_stats(&pending, &fired, &late);
-    kprintf("  after: %u fired, worst lateness %u us (floor = one tick)\n",
-            (unsigned)fired, (unsigned)(late / 1000ull));
+    kprintf("  after: %u fired, expiry lateness %u us, worst sleep error +%u us"
+            " (floor: the tick, or the emulator's timer dispatch)\n",
+            (unsigned)fired, (unsigned)(late / 1000ull), worst_us);
 }
 
 static void cmd_ktime(void) {

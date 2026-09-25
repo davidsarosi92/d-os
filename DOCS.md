@@ -93,6 +93,7 @@ when sections are added.)
 | 4.51 | The broadcast x86 does not have (M51 — TLB shootdown) | 5419 |
 | 4.52 | The note that outlived its premise (M52 — per-CPU SYSCALL) | 5523 |
 | 4.53 | Time, in nanoseconds (M53 stages 1–2) | 5608 |
+| 4.53.1 | The one-shot deadline — built, measured, removed | 6279 |
 | 4.54 | A task the scheduler was still standing on (M54) | 5720 |
 | 4.55 | A deadline you can wait on (M53 stage 3) | 5900 |
 | 4.56 | Waiting for the network without spending a CPU on it (M55) | 6066 |
@@ -6275,6 +6276,36 @@ interrupt, so under emulation the floor is the interrupt's real jitter, not one
 nominal tick.
 
 ---
+
+### 4.53.1 The one-shot deadline — built, measured, removed (2026-09-25)
+
+NEXT.md #4 said ktimer deadlines expire only from the PIT interrupt and proposed
+expiring them from the LAPIC too.  The LAPIC timer is the 100 Hz scheduler tick,
+so expiring from it would have been COARSER; the real version is a one-shot
+deadline: the LAPIC runs in one-shot mode and each expiry reprograms it for
+whichever comes first, this CPU's next quantum or the earliest armed ktimer
+(with the scheduler-tick work done only when a quantum has actually elapsed, so
+everything that counts ticks keeps its rate).  It was built that way on both x86
+arches, with a control key, and measured.
+
+**It bought nothing on this harness, and the instrument says why.**  A probe of
+the LAPIC interrupt's own lateness against the programmed expiry read **up to
+1.6-1.7 ms** — the emulator dispatches its timers no more precisely than that
+on the macOS host, so the hardware deadline arrived as late as the PIT path it
+was meant to beat (worst expiry lateness 1.1-1.35 ms with it, 1.2-1.6 ms
+without).  It also cost something: at `-smp 4` the extra expiries raised a
+false `!! PIT STARVED`, because the starvation check compares IRQ0 deliveries
+with LAPIC ticks and the two now drifted under load.  **So it was removed**
+rather than left behind a default-off key — a mechanism nobody runs is one that
+looks ready and has never been exercised (§M52).  The design is recorded here so
+it can be rebuilt where it would pay: on real hardware, where the LAPIC delivers
+in microseconds, and on a machine where IRQ0 can be starved (the one real
+robustness argument for it — timers that do not depend on the BSP's IRQ0).
+
+**Kept:** `ktimer` now measures from a clean slate (`ktimer_stats_reset`, since
+the since-boot worst figure is dominated by boot) and reports the worst SLEEP
+error of its spread beside the expiry lateness.  Measured after: i386 -smp 4
+expiry 1.2 ms / sleep +1.3 ms, x86_64 expiry 1.6 ms / sleep +1.8 ms.
 
 ### 4.54 A task the scheduler was still standing on (M54)
 
@@ -13665,6 +13696,10 @@ locking, `diskstorm 4 20` took 23 s and corrupted another file on the volume.
 
 ## 8. Change log
 
+- **2026-09-25 — A ONE-SHOT TIMER DEADLINE, MEASURED AND REMOVED (DOCS §4.53.1).**
+  The LAPIC's own interrupt arrived 1.6-1.7 ms late under the emulator, no better
+  than the PIT path, and the extra expiries tripped a false `PIT STARVED` at
+  `-smp 4`.  Reverted; `ktimer` now measures from a clean slate.
 - **2026-09-25 — A COMMAND CHANNEL ON COM1 (DOCS §4.74.1, i386 + x86_64).**
   Lines arriving on the serial port run through the command registry whatever
   holds GUI focus (`serial-cmd` service, `console.serial_commands`, SYSTEM

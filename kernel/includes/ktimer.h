@@ -74,7 +74,8 @@ void ktimer_expire(void);
  * have ever fired, and the worst observed lateness (fire time minus deadline).
  * Lateness is the number that says whether the timer service is actually
  * meeting its deadlines or merely keeping a list — the tick period is its floor
- * until a one-shot hardware deadline replaces the periodic tick. */
+ * (and under emulation the emulator's timer dispatch, DOCS §4.53.1). */
 void ktimer_stats(uint32_t* pending, uint64_t* fired, uint64_t* max_late_ns);
+void ktimer_stats_reset(void);     /* zero the worst-lateness maximum */
 
 #endif
