@@ -79,6 +79,7 @@
 
 #include "task.h"
 #include "watchdog.h"   /* §M31 L3 — hw_watchdog_pet from the tick */
+#include "kmutex.h"
 #include "syscall.h"   /* sys_futex — CLONE_CHILD_CLEARTID wake */
 #include "kmalloc.h"
 #include "printf.h"
@@ -2197,8 +2198,25 @@ int task_wait(int pid, int* code) {
 /* Per-task accessors (M14).                                            */
 /* ------------------------------------------------------------------- */
 
+/* WHICH CPU AND ITS CURRENT TASK MUST BE READ AS ONE STEP (2026-09-25).
+ *
+ * This was `this_cpu()->current`: find the CPU, then read its `current` — two
+ * steps with preemption possible between them.  A task preempted there and
+ * migrated read the OLD CPU's current task, i.e. SOMEBODY ELSE, and asked "who
+ * am I?" got a wrong answer.  Found by the storage locking: kmutex records its
+ * owner with task_current(), and under `diskstorm 8 50` on 4 CPUs it logged
+ * "unlock by 'diskstorm2' but owner is 'diskstorm7'" — two tasks had each
+ * believed they held one lock, the volume lock among them.  Everything that
+ * asks task_current() — credentials, kill checks, the ownership of every lock
+ * that records one — had the same exposure, rare only because migration is.
+ * Preemption here comes only from interrupts, so reading both with interrupts
+ * off makes them one observation. */
 struct task* task_current(void) {
-    return this_cpu() ? this_cpu()->current : NULL;
+    uint32_t fl = hal_intr_save();
+    struct percpu* p = this_cpu();
+    struct task* t = p ? p->current : NULL;
+    hal_intr_restore(fl);
+    return t;
 }
 
 void task_set_out_console(struct task* t, void* console) {
@@ -2873,3 +2891,76 @@ int task_rq_audit(struct rq_audit* out) {
      * `bad_load` are reported but not counted here. */
     return a.bad_home + a.orphan_home + a.bad_count + a.broken_ring;
 }
+
+
+/* ---- kmutex (see kmutex.h) ------------------------------------------------ */
+
+/* Early boot has no current task; the owner is then this sentinel, so "held"
+ * and "free" stay distinguishable. */
+#define KMUTEX_BOOT_OWNER ((struct task*)1)
+
+static struct task* kmutex_me(void) {
+    struct task* t = task_current();
+    return t ? t : KMUTEX_BOOT_OWNER;
+}
+
+static int kmutex_may_sleep(void) {
+    struct task* t = task_current();
+    return t && !t->is_idle && preempt_count() == 0;
+}
+
+void kmutex_init(struct kmutex* m, const char* name) {
+    waitq_init(&m->wq);
+    m->owner = NULL;
+    m->depth = 0;
+    m->name  = name;
+}
+
+void kmutex_lock(struct kmutex* m) {
+    struct task* me = kmutex_me();
+    /* Decided BEFORE the waitq lock: that lock is a spinlock, spinlocks count
+     * as preemption-off, and asking "may I sleep?" while holding one always
+     * answered no — so every waiter spun, which is what made the first locked
+     * `diskstorm` burn 20 s of CPU per task. */
+    int may_sleep = kmutex_may_sleep();
+    uint32_t fl = waitq_lock(&m->wq);
+    if (m->owner == me) { m->depth++; waitq_unlock(&m->wq, fl); return; }
+    while (m->owner) {
+        if (may_sleep) {
+            waitq_block(&m->wq);           /* returns with the lock re-taken */
+        } else {
+            waitq_unlock(&m->wq, fl);
+            hal_cpu_pause();
+            fl = waitq_lock(&m->wq);
+        }
+    }
+    m->owner = me;
+    m->depth = 1;
+    waitq_unlock(&m->wq, fl);
+}
+
+void kmutex_unlock(struct kmutex* m) {
+    uint32_t fl = waitq_lock(&m->wq);
+    if (m->owner != kmutex_me()) {
+        struct task* ow = m->owner;
+        struct task* me = kmutex_me();
+        int depth = m->depth;
+        waitq_unlock(&m->wq, fl);
+        kprintf("kmutex '%s': unlock by '%s' (pid %d) but owner is %s%s (depth %d) "
+                "- ignored\n", m->name ? m->name : "?",
+                me && me != KMUTEX_BOOT_OWNER ? me->name : "?",
+                me && me != KMUTEX_BOOT_OWNER ? me->pid : -1,
+                ow == NULL ? "nobody" : ow == KMUTEX_BOOT_OWNER ? "boot" : "'",
+                ow && ow != KMUTEX_BOOT_OWNER ? ow->name : "", depth);
+        extern void spin_report_where(void);
+        spin_report_where();
+        return;
+    }
+    if (--m->depth == 0) {
+        m->owner = NULL;
+        waitq_wake_all(&m->wq);            /* under the lock, per waitq.h */
+    }
+    waitq_unlock(&m->wq, fl);
+}
+
+int kmutex_held_by_me(struct kmutex* m) { return m->owner == kmutex_me(); }

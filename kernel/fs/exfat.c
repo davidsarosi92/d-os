@@ -46,6 +46,7 @@
 #include "vfs.h"
 #include "block.h"
 #include "block_cache.h"
+#include "kmutex.h"
 #include "kmalloc.h"
 #include "printf.h"
 #include "module.h"
@@ -106,6 +107,17 @@ struct exfat_fs {
     /* Discovered at mount-time by scanning the root directory. */
     uint32_t  bitmap_cluster;
     uint64_t  bitmap_size;               /* bytes */
+
+    /* ONE LOCK PER MOUNTED VOLUME (2026-09-25).  Every entry point from the
+     * VFS takes it (the *_locked wrappers at the ops tables), so the FAT, the
+     * allocation bitmap and the directory entry sets are only ever changed by
+     * one task at a time.  Unlocked, `diskstorm` got 17 wrong read-backs in 80
+     * rounds on 4 CPUs, and `fsck.exfat` found another file's cluster marked
+     * FREE — the bitmap is a read-modify-write of shared sectors, and two
+     * allocators interleaving is exactly how a live cluster gets handed out
+     * twice.  Coarse on purpose: correctness first, and the disk under it
+     * serialises requests anyway. */
+    struct kmutex lock;
 };
 
 /* Per-inode private.  For directories, `dirent_*` fields are unused (the
@@ -1215,26 +1227,66 @@ static int exfat_rename(struct inode* dir, const char* oldname,
 /* Tables.                                                                 */
 /* ---------------------------------------------------------------------- */
 
+/* ---- the volume lock at every VFS entry point (see struct exfat_fs) ---- */
+static struct exfat_fs* fs_of_inode(struct inode* ino) {
+    struct exfat_inode* ei = ino ? (struct exfat_inode*)ino->private : NULL;
+    return ei ? ei->fs : NULL;
+}
+#define FS_LOCKED(fs, call) ({                                    \
+        struct exfat_fs* _fs = (fs);                               \
+        if (_fs) kmutex_lock(&_fs->lock);                          \
+        __typeof__(call) _r = (call);                              \
+        if (_fs) kmutex_unlock(&_fs->lock);                        \
+        _r; })
+
+static ssize_t exfat_read_locked(struct file* f, void* buf, size_t n, uint64_t off) {
+    return FS_LOCKED(fs_of_inode(f->inode), exfat_read(f, buf, n, off));
+}
+static ssize_t exfat_write_locked(struct file* f, const void* buf, size_t n, uint64_t off) {
+    return FS_LOCKED(fs_of_inode(f->inode), exfat_write(f, buf, n, off));
+}
+static int exfat_readdir_locked(struct file* f, struct dirent* out) {
+    return FS_LOCKED(fs_of_inode(f->inode), exfat_readdir(f, out));
+}
+static int exfat_close_locked(struct file* f) {
+    return FS_LOCKED(fs_of_inode(f->inode), exfat_close(f));
+}
+static int exfat_lookup_locked(struct inode* dir, const char* name, struct inode** out) {
+    return FS_LOCKED(fs_of_inode(dir), exfat_lookup(dir, name, out));
+}
+static int exfat_create_locked(struct inode* dir, const char* name, struct inode** out) {
+    return FS_LOCKED(fs_of_inode(dir), exfat_create(dir, name, out));
+}
+static int exfat_mkdir_locked(struct inode* dir, const char* name, struct inode** out) {
+    return FS_LOCKED(fs_of_inode(dir), exfat_mkdir(dir, name, out));
+}
+static int exfat_unlink_locked(struct inode* dir, const char* name, struct inode* child) {
+    return FS_LOCKED(fs_of_inode(dir), exfat_unlink(dir, name, child));
+}
+static int exfat_rename_locked(struct inode* dir, const char* o, const char* n, struct inode* child) {
+    return FS_LOCKED(fs_of_inode(dir), exfat_rename(dir, o, n, child));
+}
+
 static const struct file_ops exfat_file_ops = {
-    .read    = exfat_read,
-    .write   = exfat_write,
+    .read    = exfat_read_locked,
+    .write   = exfat_write_locked,
     .readdir = NULL,
-    .close   = exfat_close,
+    .close   = exfat_close_locked,
 };
 
 static const struct file_ops exfat_dir_ops = {
     .read    = NULL,
     .write   = NULL,
-    .readdir = exfat_readdir,
-    .close   = exfat_close,
+    .readdir = exfat_readdir_locked,
+    .close   = exfat_close_locked,
 };
 
 static const struct inode_ops exfat_inode_ops_dir = {
-    .lookup = exfat_lookup,
-    .create = exfat_create,
-    .mkdir  = exfat_mkdir,
-    .unlink = exfat_unlink,
-    .rename = exfat_rename,
+    .lookup = exfat_lookup_locked,
+    .create = exfat_create_locked,
+    .mkdir  = exfat_mkdir_locked,
+    .unlink = exfat_unlink_locked,
+    .rename = exfat_rename_locked,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -1305,6 +1357,7 @@ static int exfat_mount(struct block_device* dev, struct dentry* mp) {
     if (!fs) { bcache_release(boot); return -5; }
 
     fs->dev                     = dev;
+    kmutex_init(&fs->lock, "exfat");
     fs->fat_offset              = le32(bs + 0x50);
     fs->fat_length              = le32(bs + 0x54);
     fs->cluster_heap_offset     = le32(bs + 0x58);

@@ -24,6 +24,7 @@
  * ============================================================================= */
 
 #include "vfs.h"
+#include "kmutex.h"
 #include "cred.h"
 #include "audit.h"
 #include "shellcmd.h"
@@ -45,6 +46,20 @@ struct dentry* vfs_root(void) { return root; }
 /* ------------------------------------------------------------------- */
 /* String helpers — no libc.                                            */
 /* ------------------------------------------------------------------- */
+
+/* THE NAMESPACE LOCK (2026-09-25).  The dentry tree — every parent's
+ * `children` list, the mount table, attach/detach — was mutated by any task
+ * with no lock, and `diskstorm` on 4 CPUs turned that into a livelock: four
+ * tasks spinning in streq() over a sibling list that concurrent inserts and
+ * removals had left circular.  Every public entry point that WALKS OR CHANGES
+ * the tree takes this; it is recursive, so the VFS calling itself (vfs_copy ->
+ * vfs_open, vfs_open -> vfs_create) is fine.  Deliberately NOT taken by
+ * vfs_read / vfs_write: those only reach the file's own inode, and a blocking
+ * device read (a terminal, /dev/dsp) must not stall every open on the machine.
+ * Order: this, then a filesystem's own lock, then the block cache, then the
+ * driver. */
+static struct kmutex ns_lock = KMUTEX_INIT("vfs-namespace");
+#define NS_LOCKED(T, call) ({ kmutex_lock(&ns_lock); T _r = (call); kmutex_unlock(&ns_lock); _r; })
 
 static int streq_n(const char* a, const char* b, size_t n) {
     for (size_t i = 0; i < n; i++) {
@@ -185,7 +200,7 @@ static struct dentry* resolve_path(const char* path,
 /* Tree manipulation — used by filesystems and create/mkdir helpers.    */
 /* ------------------------------------------------------------------- */
 
-struct dentry* vfs_attach_child(struct dentry* parent, const char* name,
+static struct dentry* vfs_attach_child_unlocked(struct dentry* parent, const char* name,
                                 struct inode* inode) {
     if (!parent || !name || !inode) return NULL;
 
@@ -197,6 +212,9 @@ struct dentry* vfs_attach_child(struct dentry* parent, const char* name,
     d->sibling  = parent->children;             /* push to head */
     parent->children = d;
     return d;
+}
+struct dentry* vfs_attach_child(struct dentry* parent, const char* name, struct inode* inode) {
+    return NS_LOCKED(struct dentry*, vfs_attach_child_unlocked(parent, name, inode));
 }
 
 /* ------------------------------------------------------------------- */
@@ -215,7 +233,7 @@ struct dentry* vfs_attach_child(struct dentry* parent, const char* name,
 static struct vfs_mount g_mounts[VFS_MAX_MOUNTS];
 static int g_nmounts;
 
-int vfs_mount(const char* fs_name, const char* path, const char* dev_name) {
+static int vfs_mount_unlocked(const char* fs_name, const char* path, const char* dev_name) {
     if (!fs_name || !path) return -1;
 
     /* Find the fs implementation. */
@@ -279,12 +297,15 @@ int vfs_mount(const char* fs_name, const char* path, const char* dev_name) {
     else          kprintf("vfs: mounted %s at %s\n", fs_name, path);
     return 0;
 }
+int vfs_mount(const char* fs_name, const char* path, const char* dev_name) {
+    return NS_LOCKED(int, vfs_mount_unlocked(fs_name, path, dev_name));
+}
 
 /* ------------------------------------------------------------------- */
 /* Open / read / write / close / readdir / mkdir / create.              */
 /* ------------------------------------------------------------------- */
 
-struct file* vfs_open(const char* path, int flags) {
+static struct file* vfs_open_unlocked(const char* path, int flags) {
     struct dentry*  parent;
     const char*     last;
     struct dentry*  d = resolve_path(path, &parent, &last);
@@ -346,6 +367,9 @@ struct file* vfs_open(const char* path, int flags) {
     f->pos    = 0;
     return f;
 }
+struct file* vfs_open(const char* path, int flags) {
+    return NS_LOCKED(struct file*, vfs_open_unlocked(path, flags));
+}
 
 int vfs_close(struct file* f) {
     if (!f) return -1;
@@ -368,9 +392,12 @@ ssize_t vfs_write(struct file* f, const void* buf, size_t n) {
     return r;
 }
 
-int vfs_readdir(struct file* f, struct dirent* out) {
+static int vfs_readdir_unlocked(struct file* f, struct dirent* out) {
     if (!f || !f->inode || !f->inode->ops || !f->inode->ops->readdir) return -1;
     return f->inode->ops->readdir(f, out);
+}
+int vfs_readdir(struct file* f, struct dirent* out) {
+    return NS_LOCKED(int, vfs_readdir_unlocked(f, out));
 }
 
 /* Split a path into "parent dir path" and "last component".  Caller
@@ -399,7 +426,11 @@ static int split_parent(const char* path, char* parent_buf, size_t cap,
 /* Dispatch a namespace mutator to the parent inode's dir_ops.  Returns
  * 0 on success.  Walks the path, attaches the freshly-created child
  * inode (returned by the fs) under the parent dentry. */
+static int vfs_mutator_unlocked(const char* path, int is_dir);
 static int vfs_mutator(const char* path, int is_dir) {
+    return NS_LOCKED(int, vfs_mutator_unlocked(path, is_dir));
+}
+static int vfs_mutator_unlocked(const char* path, int is_dir) {
     char buf[256];
     const char* last;
     if (split_parent(path, buf, sizeof buf, &last) != 0) return -1;
@@ -460,7 +491,7 @@ int vfs_mkdir (const char* path) { return vfs_mutator(path, 1); }
  * then detach + free the dentry.  Mount roots refuse removal because
  * their parent belongs to a different fs (dir_ops mismatch would
  * corrupt the foreign inode's accounting). */
-int vfs_unlink(const char* path) {
+static int vfs_unlink_unlocked(const char* path) {
     char buf[256];
     const char* last;
     if (split_parent(path, buf, sizeof buf, &last) != 0) return -1;
@@ -489,12 +520,15 @@ int vfs_unlink(const char* path) {
     kfree(d);
     return 0;
 }
+int vfs_unlink(const char* path) {
+    return NS_LOCKED(int, vfs_unlink_unlocked(path));
+}
 
 /* ------------------------------------------------------------------- */
 /* M22.5 — rename / copy / recursive delete.                            */
 /* ------------------------------------------------------------------- */
 
-int vfs_rename(const char* oldpath, const char* newpath) {
+static int vfs_rename_unlocked(const char* oldpath, const char* newpath) {
     char obuf[256], nbuf[256];
     const char *olast, *nlast;
     if (split_parent(oldpath, obuf, sizeof obuf, &olast) != 0) return -1;
@@ -525,6 +559,9 @@ int vfs_rename(const char* oldpath, const char* newpath) {
     for (; nlast[i] && i < sizeof(d->name) - 1; i++) d->name[i] = nlast[i];
     d->name[i] = 0;
     return 0;
+}
+int vfs_rename(const char* oldpath, const char* newpath) {
+    return NS_LOCKED(int, vfs_rename_unlocked(oldpath, newpath));
 }
 
 int vfs_copy(const char* src, const char* dst) {
@@ -605,12 +642,15 @@ static int unlink_rec(char* path, size_t cap, int depth) {
     return vfs_unlink(path);
 }
 
-int vfs_unlink_recursive(const char* path) {
+static int vfs_unlink_recursive_unlocked(const char* path) {
     char buf[256];
     size_t len = strlen_(path);
     if (len == 0 || len >= sizeof buf) return -1;
     memcpy_(buf, path, len + 1);
     return unlink_rec(buf, sizeof buf, 0);
+}
+int vfs_unlink_recursive(const char* path) {
+    return NS_LOCKED(int, vfs_unlink_recursive_unlocked(path));
 }
 
 /* =============================================================================
@@ -672,7 +712,7 @@ int vfs_permitted(const struct inode* ino, int want) {
     return ((int)bits & want) == want;
 }
 
-int vfs_chmod(const char* path, uint32_t mode) {
+static int vfs_chmod_unlocked(const char* path, uint32_t mode) {
     struct dentry* d = resolve_path(path, NULL, NULL);
     if (!d || !d->inode) return -1;
     const struct cred* c = cred_current();
@@ -684,8 +724,11 @@ int vfs_chmod(const char* path, uint32_t mode) {
     d->inode->mode = mode & 07777u;
     return 0;
 }
+int vfs_chmod(const char* path, uint32_t mode) {
+    return NS_LOCKED(int, vfs_chmod_unlocked(path, mode));
+}
 
-int vfs_chown(const char* path, int uid, int gid) {
+static int vfs_chown_unlocked(const char* path, int uid, int gid) {
     struct dentry* d = resolve_path(path, NULL, NULL);
     if (!d || !d->inode) return -1;
     const struct cred* c = cred_current();
@@ -696,6 +739,9 @@ int vfs_chown(const char* path, int uid, int gid) {
     if (uid != CRED_UID_NONE) d->inode->owner_uid = uid;
     if (gid != CRED_UID_NONE) d->inode->owner_gid = gid;
     return 0;
+}
+int vfs_chown(const char* path, int uid, int gid) {
+    return NS_LOCKED(int, vfs_chown_unlocked(path, uid, gid));
 }
 
 /* Which mount does `path` fall under?  Longest matching prefix wins, so

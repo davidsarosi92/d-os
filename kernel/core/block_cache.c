@@ -28,6 +28,7 @@
 #include "block.h"
 #include "pmm.h"
 #include "printf.h"
+#include "kmutex.h"
 #include <stddef.h>
 
 #define BCACHE_SLOTS    64u
@@ -105,7 +106,22 @@ static struct bcache_buf* pick_victim(void) {
 /* Public API.                                                             */
 /* ----------------------------------------------------------------------- */
 
+/* THE CACHE'S LIST AND COUNTERS ARE SHARED BY EVERY CALLER (2026-09-25).
+ * They were unlocked; a sleeping lock because a miss does disk I/O while
+ * holding it.  Lock order: a filesystem's own lock, then this, then the
+ * driver's.  The DATA in a buffer that has been handed out is the caller's to
+ * protect (exFAT holds its volume lock for as long as it uses one). */
+static struct kmutex bc_lock = KMUTEX_INIT("bcache");
+
+static struct bcache_buf* bcache_get_unlocked(struct block_device* dev, uint64_t lba);
 struct bcache_buf* bcache_get(struct block_device* dev, uint64_t lba) {
+    kmutex_lock(&bc_lock);
+    struct bcache_buf* b = bcache_get_unlocked(dev, lba);
+    kmutex_unlock(&bc_lock);
+    return b;
+}
+
+static struct bcache_buf* bcache_get_unlocked(struct block_device* dev, uint64_t lba) {
     if (!initialized || !dev || !dev->read) return NULL;
 
     struct bcache_buf* b = find_entry(dev, lba);
@@ -148,7 +164,9 @@ struct bcache_buf* bcache_get(struct block_device* dev, uint64_t lba) {
 
 void bcache_release(struct bcache_buf* b) {
     if (!b) return;
+    kmutex_lock(&bc_lock);
     if (b->refcount > 0) b->refcount--;
+    kmutex_unlock(&bc_lock);
 }
 
 void bcache_mark_dirty(struct bcache_buf* b) {
@@ -156,7 +174,15 @@ void bcache_mark_dirty(struct bcache_buf* b) {
     b->dirty = 1;
 }
 
+static int bcache_sync_unlocked(struct block_device* dev);
 int bcache_sync(struct block_device* dev) {
+    kmutex_lock(&bc_lock);
+    int rc = bcache_sync_unlocked(dev);
+    kmutex_unlock(&bc_lock);
+    return rc;
+}
+
+static int bcache_sync_unlocked(struct block_device* dev) {
     if (!initialized || !dev || !dev->write) return -1;
     int failed = 0;
     for (uint32_t i = 0; i < BCACHE_SLOTS; i++) {

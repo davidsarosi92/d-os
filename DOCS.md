@@ -13505,6 +13505,83 @@ contract: asked to close, force-killed after `gui.close_grace_ms`.  Only the
 Editor has a guard so far.
 
 
+### 4.93 Storage under concurrency — the stack that had no locks
+
+Started as "virtio-blk busy-waits every request" (NEXT.md defect #2) and turned
+out to be a larger defect underneath: **nothing in the persistent-storage stack
+was locked, and the kernel had no lock one could hold while sleeping.**
+virtio-blk used ONE descriptor chain and ONE header for every request; the block
+cache's slots and counters, exFAT's FAT / allocation bitmap / directory entry
+sets, and the VFS dentry tree were all mutated by any task, on any CPU.  The
+busy-wait was hiding it by making the windows short, not closed.
+
+**Measured before touching anything** — `diskstorm [tasks] [rounds]` (hidden):
+N workers each write their own multi-cluster file with a (worker, round,
+offset) pattern, read it back, compare, and churn directory entries; then the
+host's `fsck.exfat -n` gives the second opinion.  At `-smp 4`, 4 × 20:
+**17 wrong read-backs, 3 I/O errors, and `fsck` found ANOTHER file — a user's
+settings, `/d-os-user-0.conf` — with its cluster marked FREE.**  One worker:
+40 rounds clean.  The corruption is concurrency, and it reaches files nobody was
+writing.
+
+**The fix, bottom to top, in one lock order** (namespace → filesystem → block
+cache → driver):
+
+- **`kmutex`** (`kmutex.h`, in task.c beside the waitq it is built on): one
+  owner, waiters BLOCK rather than spin, RECURSIVE for the owner (filesystem
+  paths re-enter themselves), and a waiter spins only where it may not sleep
+  (boot, the idle task, preemption off).
+- **virtio-blk** (x86): requests serialised; completion by INTERRUPT on the
+  shared line (possible now that `irq_install` chains), the handler reading the
+  device's ISR register to acknowledge and wake; the wait sleeps with a 2 ms
+  backstop timer and a 5 s real-time deadline instead of a 50-million-iteration
+  spin.  The wait polls until the first interrupt PROVES the line (§M55's
+  rule), and says so once: `virtio-blk: completion interrupts work`.
+- **virtio-mmio-blk** (aarch64): serialised, and its completion loop — which
+  had NO bound at all — gets the same 5 s deadline and yields while it waits.
+  Its interrupt is not wired yet.
+- **block cache**: one kmutex over its slots and counters.
+- **exFAT**: one kmutex per mounted volume, taken at every VFS entry point.
+- **VFS namespace**: one recursive kmutex over every function that walks or
+  changes the dentry tree (open, mount, readdir, create/mkdir, unlink, rename,
+  chmod/chown, attach).  **Deliberately NOT over `vfs_read`/`vfs_write`**: a
+  blocking device read (a terminal, `/dev/dsp`) must not stall every open.  The
+  first diskstorm after the lower layers were locked LIVELOCKED here — four
+  tasks spinning in `streq` over a sibling list concurrent inserts had made
+  circular — which is how this layer was found.
+
+**And a timer bug under all of it: `ktimer_cancel` did not wait for a callback
+that was already running.**  `ktimer_expire` unlinks a timer, drops its lock,
+then calls it — so a cancel that found the timer unlinked returned at once, and
+a timer living in the caller's stack frame (`task_sleep_until_ns`, the network
+waits, virtio-blk's backstop) was then read by a callback still running on
+another CPU, out of a frame already reused.  Seen as `SPINLOCK STUCK` in
+`vblk_backstop <- ktimer_expire` on a stale stack address (the report now scans
+the waiter's stack, which is how the chain was read).  `ktimer_cancel` now waits
+for the callback on every other CPU and repeats if it re-armed itself — Linux's
+`del_timer_sync`.  The backstop only made a latent race frequent; every on-stack
+timer in the tree had it.
+
+**And the lock itself found a kernel-wide bug: `task_current()` could return
+ANOTHER task.**  It was `this_cpu()->current` — find the CPU, then read its
+current task — two steps with preemption possible between them; a task migrated
+there read the old CPU's current task.  The kmutex records its owner with it, and
+`diskstorm 8 50` logged `unlock by 'diskstorm2' but owner is 'diskstorm7'` (the
+report prints owner, caller, depth and the caller's stack for exactly this):
+two tasks had each believed they held one lock, and the machine hung behind the
+lost release.  Credentials (`cred_current`), kill checks and every lock that
+records an owner shared the exposure, rare only because migration is.  Both
+reads now happen with interrupts off — the only way this kernel preempts.
+(`preempt_disable` / `preempt_enable` already did exactly that; the identity
+function had not.)  Also in the kmutex: it decided "may I sleep?" while holding
+the waitq's spinlock, which counts as preemption-off, so every waiter SPUN —
+now decided before the lock.
+
+**Measured after:** `diskstorm 8 50` at `-smp 4`, 5/5 runs: 400 rounds each,
+0 wrong read-backs, `fsck` clean, no kmutex report, 6.4–11.8 s.  Before the
+locking, `diskstorm 4 20` took 23 s and corrupted another file on the volume.
+
+
 ## 8. Change log
 
 - **2026-09-08 — §M71: RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND

@@ -72,7 +72,8 @@ Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI
 | # | defect | severity | notes |
 |---|---|---|---|
 | 1 | ~~Sign-out / shutdown kill the session tree at once~~ | — | **FIXED 2026-09-25** (DOCS §4.92): close requests with a grace, forced by name after it, then desktop, then compositor; power-off goes through it; Editor asks and keeps a `.unsaved` copy.  Only the Editor has a close guard so far |
-| 2 | **virtio-blk busy-waits for every request** (`hal_cpu_pause` spin, timeout counted in iterations, not time) | medium | a CPU burned per disk I/O; the §M49/§M55 lesson not yet applied to storage |
+| 2 | ~~virtio-blk busy-waits for every request~~ | — | **FIXED 2026-09-25** (DOCS §4.93) — and it uncovered worse: the whole storage stack was unlocked (`diskstorm`: corrupted another file on the volume), and `task_current()` could return another task.  All fixed.  aarch64's virtio-mmio-blk is locked and bounded but still POLLED (no interrupt wired) |
+| 2b | **Intermittent x86_64 NMI after many session switches** — 1 of 4 `sessionstorm … 15 3` runs (2026-09-25): both CPUs executing inside `vfont_label_pts` (DATA), IF=1, tasks compositor/desktop, after the storm had finished | high | the "code pointer read from reused memory" signature again; 3 reruns clean.  The new NMI report named task/IF/stack; not yet root-caused |
 | 3 | **Harness cannot type once a GUI window holds focus** (§4.74) | medium (tooling) | routed around with `gui.autorun`, `sessiontest`; the next GUI test will hit it again |
 | 4 | `ktimer` deadlines expire only from the PIT interrupt → 2.5–3.3 ms worst lateness under emulation | low | now a true number (was hidden by the slow clock); could also expire from the LAPIC tick |
 | 5 | Real storm case: no in-guest report escaped (all serial output stopped) | low | the cause is fixed; the `PIT STARVED` path is proven only on its falsifier |

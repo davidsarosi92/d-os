@@ -25,6 +25,10 @@
 
 #include "block.h"
 #include "printf.h"
+#include "kmutex.h"
+#include "task.h"
+#include "timer.h"
+#include "lock.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -96,8 +100,25 @@ static inline void     w32(uint32_t off, uint32_t v) { *(volatile uint32_t*)(g_b
 static inline uint32_t r32(uint32_t off)             { return *(volatile uint32_t*)(g_base + off); }
 static inline void dsb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
 
-/* ---- one synchronous block request ----------------------------------------- */
+/* ---- one synchronous block request ----------------------------------------- *
+ *
+ * 2026-09-25, the same two defects as the x86 driver: ONE descriptor chain and
+ * header with NO lock (two tasks on two cores wrote each other's requests), and
+ * a completion wait with NO bound at all.  Now serialised by a kmutex, bounded
+ * by 5 s of real time, and yielding the CPU while it waits where it may.  The
+ * completion interrupt is not wired on this arch — polled, but no longer a
+ * spin that can never end. */
+static struct kmutex vmb_lock = KMUTEX_INIT("virtio-mmio-blk");
+
+static int vmb_rw_unlocked(uint64_t lba, uint32_t count, void* buf, int is_write);
 static int vmb_rw(uint64_t lba, uint32_t count, void* buf, int is_write) {
+    kmutex_lock(&vmb_lock);
+    int rc = vmb_rw_unlocked(lba, count, buf, is_write);
+    kmutex_unlock(&vmb_lock);
+    return rc;
+}
+
+static int vmb_rw_unlocked(uint64_t lba, uint32_t count, void* buf, int is_write) {
     q_hdr.type     = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
     q_hdr.reserved = 0;
     q_hdr.sector   = lba;
@@ -127,8 +148,16 @@ static int vmb_rw(uint64_t lba, uint32_t count, void* buf, int is_write) {
 
     w32(R_QUEUENOTIFY, 0);                  /* kick queue 0                   */
 
-    /* Poll for completion (QEMU services it promptly). */
-    while (*(volatile uint16_t*)&q_used.idx == g_last_used) dsb();
+    uint64_t deadline = timer_ticks_ms() + 5000;
+    while (*(volatile uint16_t*)&q_used.idx == g_last_used) {
+        dsb();
+        if (timer_ticks_ms() > deadline) {
+            kprintf("virtio-mmio-blk: request timed out after 5000 ms\n");
+            return -1;
+        }
+        struct task* me = task_current();
+        if (me && !me->is_idle && preempt_count() == 0) task_yield();
+    }
     g_last_used++;
     dsb();
 

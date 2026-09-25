@@ -42,9 +42,11 @@ SECTIONS
      * address, which some minimal loaders assume. */
     .text : ALIGN(4K)
     {
+        __text_start = .;       /* stack scans in lock.c / fault reports */
         KEEP(*(.text.boot))
         *(.text)
         *(.text.*)
+        __text_end = .;
     }
 
     .rodata : ALIGN(4K)

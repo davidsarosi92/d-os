@@ -58,6 +58,12 @@
 #include "driver.h"
 #include "hwdev.h"
 #include "devfs.h"
+#include "idt.h"      /* irq_install — the completion interrupt */
+#include "kmutex.h"
+#include "ktimer.h"
+#include "timer.h"
+#include "task.h"
+#include "lock.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -259,6 +265,11 @@ static int vblk_init_queue(struct virtio_blk* v) {
      *
      * This flag is advisory in the spec — hence the ISR read after every
      * completion below as well. */
+    /* 2026-09-25: interrupts are WANTED now — the driver sleeps on them (see
+     * vblk_wait) and ACKNOWLEDGES each one by reading the ISR register in
+     * vblk_irq, which is the half that was missing above.  Until the first
+     * interrupt arrives the flag stays set and the wait polls, so a machine
+     * whose line never fires loses latency, not the disk. */
     v->avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
 
     /* Tell the device where the queue is.  QUEUE_PFN is the page-frame
@@ -285,7 +296,83 @@ static int vblk_init_buffers(struct virtio_blk* v) {
 
 /* ----------------------- Sync request issue ------------------------------- */
 
+/* ----------------------- Completion: interrupt, then sleep ---------------- *
+ *
+ * ONE REQUEST AT A TIME, BY A LOCK.  The driver owns a single descriptor chain
+ * and a single header/status pair; two tasks inside vblk_request would write
+ * each other's descriptors.  Nothing prevented that — it survived because the
+ * busy-wait made the window short, not closed, and `diskstorm` on 4 CPUs is
+ * where short stopped being enough.
+ *
+ * THE INTERRUPT is shared (PIIX routes PIRQA/B to one level line) and chained
+ * (idt.c), so the handler reads THIS device's ISR register — which is also what
+ * lowers the line — and returns quietly when the bit is not ours.  It does two
+ * things and no third: acknowledge and wake (§M55's rule for ISRs).  The wait
+ * learns that interrupts work by RECEIVING one; until then, and whenever it
+ * may not sleep (boot, preemption off), it polls, and it never sleeps without a
+ * 2 ms backstop — a lost interrupt costs latency, never the request. */
+#define VBLK_TIMEOUT_MS  5000u
+static struct kmutex     vblk_lock = KMUTEX_INIT("virtio-blk");
+static struct waitq      vblk_wq   = WAITQ_INIT;
+static volatile uint32_t vblk_irqs;
+
+static void vblk_irq(struct int_frame* f);
+static int vblk_may_sleep(void) {
+    struct task* t = task_current();
+    return t && !t->is_idle && preempt_count() == 0;
+}
+static void vblk_backstop(struct ktimer* t) {
+    struct waitq* wq = (struct waitq*)t->arg;
+    uint32_t fl = waitq_lock(wq);
+    waitq_wake_all(wq);
+    waitq_unlock(wq, fl);
+}
+static int vblk_wait(struct virtio_blk* v) {
+    uint64_t deadline = timer_ticks_ms() + VBLK_TIMEOUT_MS;
+    while (*(volatile uint16_t*)&v->used->idx == v->last_used_idx) {
+        if (timer_ticks_ms() > deadline) return -1;
+        if (!vblk_irqs || !vblk_may_sleep()) { hal_cpu_pause(); continue; }
+        {
+            static int told;
+            if (!told) {
+                told = 1;
+                kprintf("virtio-blk: completion interrupts work - requests now "
+                        "sleep instead of polling (%u so far)\n", vblk_irqs);
+            }
+        }
+        struct ktimer t = { 0, 0, 0, 0, 0 };
+        ktimer_arm_after(&t, 2000000ull, vblk_backstop, &vblk_wq);
+        uint32_t fl = waitq_lock(&vblk_wq);
+        if (*(volatile uint16_t*)&v->used->idx == v->last_used_idx)
+            waitq_block(&vblk_wq);
+        waitq_unlock(&vblk_wq, fl);
+        ktimer_cancel(&t);
+    }
+    return 0;
+}
+
+static int vblk_request_unlocked(struct virtio_blk* v, uint32_t type, uint64_t lba,
+                                 void* buf, uint32_t nsectors);
 static int vblk_request(struct virtio_blk* v, uint32_t type, uint64_t lba,
+                        void* buf, uint32_t nsectors) {
+    kmutex_lock(&vblk_lock);
+    int rc = vblk_request_unlocked(v, type, lba, buf, nsectors);
+    kmutex_unlock(&vblk_lock);
+    return rc;
+}
+
+static void vblk_irq(struct int_frame* f) {
+    (void)f;
+    if (!g_vblk.io_base) return;
+    uint8_t isr = inb(g_vblk.io_base + VBLK_OFF_ISR_STATUS);   /* read-to-clear */
+    if (!(isr & 1)) return;                                    /* not ours      */
+    vblk_irqs++;           /* the first one proves the line: the wait may sleep */
+    uint32_t fl = waitq_lock(&vblk_wq);
+    waitq_wake_all(&vblk_wq);
+    waitq_unlock(&vblk_wq, fl);
+}
+
+static int vblk_request_unlocked(struct virtio_blk* v, uint32_t type, uint64_t lba,
                         void* buf, uint32_t nsectors) {
     /* 1. Fill header. */
     v->req_hdr->type     = type;
@@ -332,18 +419,16 @@ static int vblk_request(struct virtio_blk* v, uint32_t type, uint64_t lba,
     /* 4. Kick the device. */
     outw(v->io_base + VBLK_OFF_QUEUE_NOTIFY, 0);
 
-    /* 5. Poll until the used ring's idx changes — i.e. the device
-     *    completed our request.  Bounded so a misconfigured device
-     *    doesn't hang the whole shell forever; ~5–50s of `pause`. */
-    uint32_t spins = 0;
-    while (v->used->idx == v->last_used_idx) {
-        hal_cpu_pause();
-        if (++spins > 50000000u) {
-            kprintf("vblk: timeout (isr=%x dev_status=%x)\n",
-                    inb(v->io_base + VBLK_OFF_ISR_STATUS),
-                    inb(v->io_base + VBLK_OFF_DEV_STATUS));
-            return -1;
-        }
+    /* 5. Wait for the used ring's idx to change — the device completed our
+     *    request.  SLEEPING, not spinning (2026-09-25): this was a
+     *    `hal_cpu_pause` loop with a timeout of 50 million iterations, so every
+     *    disk request burned a CPU for its whole duration and the deadline was
+     *    a different number of seconds on every machine.  Bounded in TIME now. */
+    if (vblk_wait(v) != 0) {
+        kprintf("vblk: timeout after %u ms (isr=%x dev_status=%x)\n", VBLK_TIMEOUT_MS,
+                inb(v->io_base + VBLK_OFF_ISR_STATUS),
+                inb(v->io_base + VBLK_OFF_DEV_STATUS));
+        return -1;
     }
     v->last_used_idx = v->used->idx;
 
@@ -438,6 +523,16 @@ static int vblk_init(void* ctx) {
     /* Driver is ready. */
     vblk_write_status(io, VSTAT_ACKNOWLEDGE | VSTAT_DRIVER
                         | VSTAT_FEATURES_OK | VSTAT_DRIVER_OK);
+
+    /* The completion interrupt — only on a real, routed line: a hot-added
+     * device may have none, and line 0 is the TIMER (§M66's lesson).  With it
+     * installed, ask the device to interrupt; the wait still polls until the
+     * first one proves the line (vblk_irq), so a line that never fires costs
+     * latency and nothing else.  Without it, completions stay polled. */
+    if (pd.irq_line != 0xFF && pd.irq_line != 0) {
+        irq_install(pd.irq_line, vblk_irq);
+        g_vblk.avail->flags = 0;
+    }
 
     /* Register the abstract block device. */
     g_vda.name         = "vda";

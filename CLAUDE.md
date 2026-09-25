@@ -40,7 +40,14 @@ shutdown stop programs GRACEFULLY, IN ORDER** (DOCS §4.92) — close requests w
 the Start menu's power entries and the shell's `shutdown` go through it; apps opt
 in with `gui_window_set_close_guard` (the Editor asks "save?" and keeps a
 `.unsaved` copy on any forced route).  Falsifier: `logouttest [editor|power|menu]`.
-**NEXT:** virtio-blk still busy-waits every request (NEXT.md defect #2).
+**THEN the storage stack under concurrency** (DOCS §4.93): nothing in it was
+locked and there was no sleeping lock — `diskstorm` corrupted ANOTHER file on the
+volume.  New `kmutex`; virtio-blk serialised and interrupt-driven (no more
+busy-wait); block cache, exFAT volume and VFS namespace locked; `ktimer_cancel`
+now waits for a running callback (every on-stack timer had a use-after-return);
+and **`task_current()` could return ANOTHER task** (CPU id and `current` read
+non-atomically) — fixed.  **OPEN:** an intermittent x86_64 NMI after many session
+switches (NEXT.md #2b).
 
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there

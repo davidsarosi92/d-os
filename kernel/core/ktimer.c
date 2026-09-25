@@ -4,11 +4,17 @@
  * ============================================================================= */
 
 #include "ktimer.h"
+#include "percpu.h"   /* this_cpu_id: the running-callback table */
+#include "hal_api.h"  /* hal_cpu_pause */
 #include "timer.h"
 #include "lock.h"
 #include <stddef.h>
 
 static spinlock_t      g_lock;
+#define KT_MAX_CPUS 64
+/* Which timer each CPU is running a callback for, if any — ktimer_cancel waits
+ * on it.  Written by the expiring CPU only; read by cancellers on others. */
+static struct ktimer* volatile g_running[KT_MAX_CPUS];
 static struct ktimer*  g_head;          /* sorted by deadline, earliest first */
 static uint32_t        g_pending;
 static uint64_t        g_fired;
@@ -52,11 +58,35 @@ void ktimer_arm_after(struct ktimer* t, uint64_t delay_ns, ktimer_fn fn, void* a
     ktimer_arm(t, timer_now_ns() + delay_ns, fn, arg);
 }
 
+/* A CANCEL THAT RETURNS WHILE THE CALLBACK IS STILL RUNNING IS NOT A CANCEL
+ * (2026-09-25).  ktimer_expire takes a timer off the list, drops the lock and
+ * THEN calls it — so "not on the list" also means "possibly executing right
+ * now on another CPU".  This used to return at once, and the caller, told the
+ * timer was gone, returned from its function; a timer that lived in that stack
+ * frame (task_sleep_until_ns, the network waits, virtio-blk's backstop) was
+ * then read by a callback still running on another CPU, out of a frame already
+ * reused.  Seen as `SPINLOCK STUCK` in vblk_backstop <- ktimer_expire on a
+ * waitq address that was a stale stack slot.  Linux calls the fix
+ * del_timer_sync; this is that.  It waits for the callback on every OTHER CPU
+ * (a callback cancelling its own timer must not wait for itself), and repeats
+ * if the callback re-armed the timer meanwhile. */
 int ktimer_cancel(struct ktimer* t) {
     if (!t) return 0;
-    uint32_t fl = spin_lock_irqsave(&g_lock);
-    int was = unlink_locked(t);
-    spin_unlock_irqrestore(&g_lock, fl);
+    int was = 0;
+    int me = this_cpu_id();
+    for (int round = 0; round < 8; round++) {
+        uint32_t fl = spin_lock_irqsave(&g_lock);
+        was |= unlink_locked(t);
+        spin_unlock_irqrestore(&g_lock, fl);
+        int busy;
+        do {
+            busy = 0;
+            for (int c = 0; c < KT_MAX_CPUS; c++)
+                if (c != me && __atomic_load_n(&g_running[c], __ATOMIC_ACQUIRE) == t) busy = 1;
+            if (busy) hal_cpu_pause();
+        } while (busy);
+        if (!ktimer_armed(t)) break;          /* re-armed by its callback: again */
+    }
     return was;
 }
 
@@ -91,9 +121,13 @@ void ktimer_expire(void) {
         uint64_t late = now - t->deadline_ns;
         if (late > g_max_late_ns) g_max_late_ns = late;
         ktimer_fn fn = t->fn;
+        int cpu = this_cpu_id();
+        if (cpu >= 0 && cpu < KT_MAX_CPUS) g_running[cpu] = t;   /* see ktimer_cancel */
         spin_unlock_irqrestore(&g_lock, fl);
 
         if (fn) fn(t);
+        if (cpu >= 0 && cpu < KT_MAX_CPUS)
+            __atomic_store_n(&g_running[cpu], (struct ktimer*)0, __ATOMIC_RELEASE);
         /* `t` may already have been re-armed, freed, or reused by the callback
          * — never touch it again here. */
     }

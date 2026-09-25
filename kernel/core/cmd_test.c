@@ -1123,3 +1123,98 @@ TEST(blktest,       cmd_blktest,     "[dev]", "the block layer, write then read 
 TEST(bctest,        t_bctest,        "", "the block cache");
 
 #undef TEST
+
+/* ---------------------------------------------------------------------------
+ * `diskstorm [tasks] [rounds]` — concurrent file I/O on the persistent volume.
+ *
+ * Written (2026-09-25) to answer one question before changing the storage
+ * stack: is it safe for two tasks to use the disk at once?  Nothing in it was
+ * locked — not virtio-blk (ONE shared descriptor chain and header), not the
+ * block cache, not exFAT, not the VFS — and there was no sleeping lock in the
+ * kernel to lock them with.  Each worker writes its OWN multi-cluster file with
+ * a pattern unique to (worker, round, offset), reads it back and compares, and
+ * churns directory entries with a create/unlink of a scratch file, so both data
+ * and metadata paths overlap across CPUs.  The host's `fsck.exfat -n` on the
+ * image afterwards is the second opinion: our own reader agreeing with our own
+ * writer would only prove they share a misunderstanding (§4.73).
+ * ------------------------------------------------------------------------- */
+#define DS_MAX 8
+static volatile int ds_done, ds_bad, ds_ioerr, ds_rounds_done;
+static int ds_rounds = 20, ds_size = 9000;
+
+static uint8_t ds_byte(int w, int r, int k) { return (uint8_t)(w * 31 + r * 7 + k * 13 + (k >> 8)); }
+
+static void ds_worker(void) {
+    int w = (int)(uintptr_t)task_start_arg();
+    char path[32] = "/mnt/ds0.bin", tmp[32] = "/mnt/ds0-t.tmp";
+    path[7] = (char)('0' + w); tmp[7] = (char)('0' + w);
+    uint8_t* buf = (uint8_t*)kmalloc((size_t)ds_size);
+    if (!buf) { __atomic_add_fetch(&ds_ioerr, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&ds_done, 1, __ATOMIC_RELEASE); return; }
+    for (int r = 0; r < ds_rounds; r++) {
+        for (int k = 0; k < ds_size; k++) buf[k] = ds_byte(w, r, k);
+        struct file* f = vfs_open(path, VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+        if (!f) { __atomic_add_fetch(&ds_ioerr, 1, __ATOMIC_RELAXED); continue; }
+        for (int off = 0; off < ds_size; off += 1000) {
+            int n = ds_size - off < 1000 ? ds_size - off : 1000;
+            if (vfs_write(f, buf + off, (size_t)n) != n) { __atomic_add_fetch(&ds_ioerr, 1, __ATOMIC_RELAXED); break; }
+        }
+        vfs_close(f);
+
+        struct file* t = vfs_open(tmp, VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+        if (t) { vfs_write(t, "x", 1); vfs_close(t); vfs_unlink(tmp); }
+
+        for (int k = 0; k < ds_size; k++) buf[k] = 0;
+        f = vfs_open(path, VFS_RDONLY);
+        if (!f) { __atomic_add_fetch(&ds_ioerr, 1, __ATOMIC_RELAXED); continue; }
+        int got = 0;
+        for (;;) {
+            ssize_t n = vfs_read(f, buf + got, (size_t)(ds_size - got));
+            if (n <= 0) break;
+            got += (int)n;
+            if (got >= ds_size) break;
+        }
+        vfs_close(f);
+        int bad = got != ds_size;
+        for (int k = 0; !bad && k < ds_size; k++) if (buf[k] != ds_byte(w, r, k)) bad = 1;
+        if (bad) {
+            __atomic_add_fetch(&ds_bad, 1, __ATOMIC_RELAXED);
+            kprintf("diskstorm: worker %d round %d - read back %d of %d bytes, "
+                    "CONTENT WRONG\n", w, r, got, ds_size);
+        }
+        __atomic_add_fetch(&ds_rounds_done, 1, __ATOMIC_RELAXED);
+    }
+    kfree(buf);
+    __atomic_add_fetch(&ds_done, 1, __ATOMIC_RELEASE);
+}
+
+static void ds_main(void) {
+    int n = (int)(uintptr_t)task_start_arg();
+    ds_done = ds_bad = ds_ioerr = ds_rounds_done = 0;
+    uint64_t t0 = timer_ticks_ms();
+    for (int i = 0; i < n; i++) {
+        char nm[16] = "diskstorm0";
+        nm[9] = (char)('0' + i);
+        if (!task_spawn_arg(nm, ds_worker, (void*)(uintptr_t)i))
+            __atomic_add_fetch(&ds_done, 1, __ATOMIC_RELEASE);
+    }
+    while (__atomic_load_n(&ds_done, __ATOMIC_ACQUIRE) < n &&
+           timer_ticks_ms() - t0 < 600000u)
+        task_msleep(50);
+    kprintf("diskstorm: %d tasks x %d rounds (%d done) of %d bytes in %u ms - "
+            "%d wrong read-back(s), %d I/O error(s): %s\n",
+            n, ds_rounds, ds_rounds_done, ds_size, (unsigned)(timer_ticks_ms() - t0),
+            ds_bad, ds_ioerr, (ds_bad || ds_ioerr) ? "FAIL" : "PASS");
+}
+
+static void t_diskstorm(const char* a) {
+    int n = 4;
+    while (a && *a == ' ') a++;
+    if (a && *a >= '1' && *a <= '8') { n = *a - '0'; a++; }
+    while (a && *a == ' ') a++;
+    if (a && *a >= '0' && *a <= '9') { ds_rounds = 0; while (*a >= '0' && *a <= '9') ds_rounds = ds_rounds * 10 + (*a++ - '0'); }
+    if (ds_rounds <= 0) ds_rounds = 20;
+    if (!task_spawn_arg("diskstorm", ds_main, (void*)(uintptr_t)n))
+        kprintf("diskstorm: cannot spawn\n");
+}
+SHELL_CMD(diskstorm) = { "diskstorm", "[tasks 1-8] [rounds]", "concurrent file I/O on /mnt, verified",
+                         SHELL_G_TEST, t_diskstorm, SHELL_P_ADMIN };

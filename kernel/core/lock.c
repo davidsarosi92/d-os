@@ -81,6 +81,37 @@ static void spin_serial_hex(uintptr_t v) {
     }
 }
 
+/* WHO IS STUCK, AND HOW THEY GOT HERE (2026-09-25).  `caller` names the
+ * function that asked for the lock — for a waitq that is always waitq_lock,
+ * which says nothing.  The waiter's own stack does: scan it for words that
+ * point into .text (return addresses, give or take a stale one; map them with
+ * scripts/dos-sym.sh).  Bounded by the task's stack, lock-free, like the NMI
+ * report's scan in idt.c. */
+#include "task.h"
+void spin_report_where(void) {
+    extern char __text_start[], __text_end[];
+    struct task* t = task_current();
+    serial_write("   cpu=");
+    spin_serial_hex((uintptr_t)this_cpu_id());
+    serial_write(" task=");
+    serial_write(t ? t->name : "?");
+    serial_write("\n   stack:");
+    uintptr_t lo = t && t->kstack_base ? (uintptr_t)t->kstack_base : 0;
+    uintptr_t hi = lo ? lo + TASK_KSTACK_SZ : 0;
+    uintptr_t p  = (uintptr_t)&lo;
+    int shown = 0;
+    if (!lo || p < lo || p >= hi) {             /* the boot stack: scan 2 KiB up */
+        lo = p; hi = p + 2048;
+    }
+    for (; p + sizeof(uintptr_t) <= hi && shown < 12; p += sizeof(uintptr_t)) {
+        uintptr_t v = *(uintptr_t*)p;
+        if (v >= (uintptr_t)__text_start && v < (uintptr_t)__text_end) {
+            serial_write(" "); spin_serial_hex(v); shown++;
+        }
+    }
+    serial_write("\n");
+}
+
 static inline void spin_acquire(spinlock_t* l, void* caller) {
     unsigned long spins = 0;
     while (!atomic_cmpxchg(&l->locked, 0, 1)) {
@@ -91,6 +122,7 @@ static inline void spin_acquire(spinlock_t* l, void* caller) {
             serial_write(" caller=");
             spin_serial_hex((uintptr_t)caller);
             serial_write(" — probable deadlock\n");
+            spin_report_where();
             /* §M47 — also record it.  The serial line above is lock-free and
              * always works; the record is what a GUI/file/network sink can
              * surface to the user later. */
