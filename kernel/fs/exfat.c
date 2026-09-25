@@ -131,6 +131,8 @@ struct exfat_inode {
     /* Parent dir entry location (regular files only). */
     uint32_t parent_first_cluster;       /* enclosing directory chain head */
     int      parent_no_fat_chain;
+    uint64_t parent_size;                /* parent's DataLength when this was
+                                            built: bounds a NoFatChain parent */
     uint32_t dirent_index;               /* 0-based index of File entry within parent */
     uint8_t  sec_count;                  /* SecondaryCount from File entry */
 };
@@ -328,6 +330,20 @@ struct dir_iter {
     struct exfat_fs* fs;
     uint32_t first_cluster;
     int      no_fat_chain;
+    /* The directory's DataLength in bytes; 0 = unbounded (follow the FAT
+     * chain to its end — only valid for a FAT-chained directory).
+     *
+     * THE BOUND IS NOT OPTIONAL FOR A NoFatChain DIRECTORY (2026-09-25).  Such
+     * a directory is a contiguous run, and cluster_chain_get_sector turns an
+     * index into a cluster by ADDITION — nothing stops it walking off the end
+     * into whatever the next cluster on the disk belongs to.  That is exactly
+     * what happened: a directory this driver created owns one cluster, and
+     * when it filled up, the slot search went on into the neighbouring
+     * clusters and wrote directory entries over another file's data
+     * (`dirfilltest`: 6143 of 16384 bytes of a neighbouring file destroyed,
+     * and fsck.exfat reported the volume CLEAN, because the stray entries lie
+     * outside every directory it walks). */
+    uint64_t limit;
     uint32_t entry_index;                 /* next entry to fetch (0-based) */
 };
 
@@ -335,6 +351,7 @@ struct dir_iter {
  * non-zero on I/O error or chain end. */
 static int dir_entry_read(struct dir_iter* it, uint32_t idx, uint8_t* out) {
     uint64_t off = (uint64_t)idx * EXFAT_ENTRY_SIZE;
+    if (it->limit && off >= it->limit) return -1;         /* past the directory */
     uint32_t within;
     struct bcache_buf* b = cluster_chain_get_sector(it->fs, it->first_cluster,
                                                     it->no_fat_chain, off,
@@ -348,6 +365,7 @@ static int dir_entry_read(struct dir_iter* it, uint32_t idx, uint8_t* out) {
 /* Write a 32-byte entry at `idx`.  Marks the buffer dirty. */
 static int dir_entry_write(struct dir_iter* it, uint32_t idx, const uint8_t* in) {
     uint64_t off = (uint64_t)idx * EXFAT_ENTRY_SIZE;
+    if (it->limit && off >= it->limit) return -1;         /* past the directory */
     uint32_t within;
     struct bcache_buf* b = cluster_chain_get_sector(it->fs, it->first_cluster,
                                                     it->no_fat_chain, off,
@@ -442,7 +460,8 @@ struct parsed_file {
 static struct inode* build_inode(struct exfat_fs* fs,
                                  const struct parsed_file* pf,
                                  uint32_t parent_first_cluster,
-                                 int parent_no_fat_chain) {
+                                 int parent_no_fat_chain,
+                                 uint64_t parent_size) {
     struct inode* ino = (struct inode*)kcalloc(1, sizeof(struct inode));
     struct exfat_inode* ei = (struct exfat_inode*)kcalloc(1, sizeof(*ei));
     if (!ino || !ei) {
@@ -455,6 +474,7 @@ static struct inode* build_inode(struct exfat_fs* fs,
     ei->no_fat_chain           = (pf->stream_flags & EXFAT_STREAM_NO_FAT_CHAIN) ? 1 : 0;
     ei->parent_first_cluster   = parent_first_cluster;
     ei->parent_no_fat_chain    = parent_no_fat_chain;
+    ei->parent_size            = parent_size;
     ei->dirent_index           = pf->dirent_index;
     ei->sec_count              = pf->sec_count;
 
@@ -490,12 +510,13 @@ typedef int (*dir_visit_fn)(const char* name, const struct parsed_file* pf,
                             void* ctx);
 
 static int scan_directory(struct exfat_fs* fs, uint32_t parent_first_cluster,
-                          int parent_no_fat_chain, dir_visit_fn visit,
-                          void* ctx) {
+                          int parent_no_fat_chain, uint64_t limit,
+                          dir_visit_fn visit, void* ctx) {
     struct dir_iter it = {
         .fs            = fs,
         .first_cluster = parent_first_cluster,
         .no_fat_chain  = parent_no_fat_chain,
+        .limit         = limit,
     };
 
     uint32_t idx = 0;
@@ -557,6 +578,7 @@ struct lookup_ctx {
     struct exfat_fs* fs;
     uint32_t parent_first_cluster;
     int parent_no_fat_chain;
+    uint64_t parent_size;
     struct inode* found;
 };
 
@@ -564,7 +586,7 @@ static int lookup_visit(const char* name, const struct parsed_file* pf, void* ct
     struct lookup_ctx* ctx = (struct lookup_ctx*)ctx_;
     if (!streq_(name, ctx->target)) return 0;
     ctx->found = build_inode(ctx->fs, pf, ctx->parent_first_cluster,
-                             ctx->parent_no_fat_chain);
+                             ctx->parent_no_fat_chain, ctx->parent_size);
     return 1;
 }
 
@@ -575,9 +597,10 @@ static int exfat_lookup(struct inode* dir, const char* name, struct inode** out)
         .fs = dei->fs,
         .parent_first_cluster = dei->first_cluster,
         .parent_no_fat_chain = dei->no_fat_chain,
+        .parent_size = dir->size,
         .found = NULL,
     };
-    scan_directory(dei->fs, dei->first_cluster, dei->no_fat_chain,
+    scan_directory(dei->fs, dei->first_cluster, dei->no_fat_chain, dir->size,
                    lookup_visit, &ctx);
     if (!ctx.found) return -1;
     *out = ctx.found;
@@ -656,7 +679,7 @@ static int exfat_readdir(struct file* f, struct dirent* out) {
         .out        = out,
         .found      = 0,
     };
-    scan_directory(ei->fs, ei->first_cluster, ei->no_fat_chain,
+    scan_directory(ei->fs, ei->first_cluster, ei->no_fat_chain, f->inode->size,
                    readdir_visit, &ctx);
     if (!ctx.found) return 0;
     f->pos++;
@@ -682,6 +705,7 @@ static int exfat_write_meta(struct inode* fi) {
         .fs            = ei->fs,
         .first_cluster = ei->parent_first_cluster,
         .no_fat_chain  = ei->parent_no_fat_chain,
+        .limit         = ei->parent_size,
     };
 
     int total = 1 + ei->sec_count;
@@ -815,11 +839,13 @@ static int exfat_close(struct file* f) {
  * (uint32_t)-1 if we ran past the chain (caller should grow the dir). */
 static uint32_t find_free_dir_slot(struct exfat_fs* fs,
                                    uint32_t parent_first_cluster,
-                                   int parent_no_fat_chain, int need) {
+                                   int parent_no_fat_chain, uint64_t limit,
+                                   int need) {
     struct dir_iter it = {
         .fs            = fs,
         .first_cluster = parent_first_cluster,
         .no_fat_chain  = parent_no_fat_chain,
+        .limit         = limit,
     };
     uint32_t run_start = 0;
     int run_len = 0;
@@ -835,11 +861,11 @@ static uint32_t find_free_dir_slot(struct exfat_fs* fs,
             run_len = 0;
         }
         idx++;
-        /* Sanity bound: if we've walked past the first directory cluster
-         * with no luck, grow logic should kick in.  For now M12 keeps it
-         * simple and accepts only fitting in the existing cluster. */
-        if ((uint64_t)idx * EXFAT_ENTRY_SIZE >= (uint64_t)fs->bytes_per_cluster * 4)
-            return (uint32_t)-1;
+        /* The end of the directory is where dir_entry_read fails (its
+         * DataLength, or the FAT chain's end).  This used to be "four
+         * clusters", a guess that for a one-cluster NoFatChain directory
+         * meant three clusters of SOMEBODY ELSE'S data (see struct dir_iter).
+         * When nothing fits, the caller grows the directory (dir_grow). */
     }
 }
 
@@ -919,9 +945,9 @@ static void chain_free(struct exfat_fs* fs, uint32_t start, int no_fat_chain,
 
 /* Mark the whole entry set at `slot` as not-in-use. */
 static int dirent_set_delete(struct exfat_fs* fs, uint32_t dir_cluster,
-                             int dir_nofat, uint32_t slot) {
+                             int dir_nofat, uint64_t limit, uint32_t slot) {
     struct dir_iter it = { .fs = fs, .first_cluster = dir_cluster,
-                           .no_fat_chain = dir_nofat };
+                           .no_fat_chain = dir_nofat, .limit = limit };
     uint8_t e[EXFAT_ENTRY_SIZE];
     if (dir_entry_read(&it, slot, e) != 0) return -1;
     if (e[0] != EXFAT_TYPE_FILE) return -1;
@@ -935,16 +961,103 @@ static int dirent_set_delete(struct exfat_fs* fs, uint32_t dir_cluster,
 }
 
 /* Is this directory empty?  Any in-use File entry means no. */
-static int dir_is_empty(struct exfat_fs* fs, uint32_t cluster, int no_fat) {
+/* Is the directory empty?  Answers 1 only when it has PROVED it.
+ *
+ * NOT A SAMPLE (2026-09-25, NEXT.md #8).  This used to look at the first 4096
+ * entries and then answer "empty" — so a directory whose first 4096 slots were
+ * DELETED entries (exFAT marks a removed set by clearing bit 7, it does not
+ * compact) and whose live files sat behind them was reported empty, and
+ * `rm` removed it: the live files' clusters stayed allocated and nothing
+ * pointed at them any more.  Now the scan covers the directory's whole
+ * DataLength, and every way of not finishing — a read failure before the end,
+ * a length past exFAT's own 256 MiB directory limit — answers "not empty".
+ * Refusing an rmdir is recoverable; orphaning a file is not. */
+#define EXFAT_DIR_MAX_ENTRIES (256u * 1024u * 1024u / EXFAT_ENTRY_SIZE)
+static int dir_is_empty(struct exfat_fs* fs, uint32_t cluster, int no_fat,
+                        uint64_t size) {
     struct dir_iter it = { .fs = fs, .first_cluster = cluster,
-                           .no_fat_chain = no_fat };
+                           .no_fat_chain = no_fat, .limit = size };
     uint8_t e[EXFAT_ENTRY_SIZE];
-    for (uint32_t i = 0; i < 4096; i++) {
-        if (dir_entry_read(&it, i, e) != 0) break;
-        if (e[0] == 0x00) break;                    /* end of directory */
+    uint64_t n = size / EXFAT_ENTRY_SIZE;
+    if (n > EXFAT_DIR_MAX_ENTRIES) return 0;        /* corrupt length: refuse */
+    for (uint32_t i = 0; i < (uint32_t)n; i++) {
+        if (dir_entry_read(&it, i, e) != 0) return 0;   /* could not look */
+        if (e[0] == 0x00) return 1;                 /* end of directory */
         if (e[0] == EXFAT_TYPE_FILE) return 0;      /* an in-use file/dir */
     }
     return 1;
+}
+
+/* ----------------------------------------------------------------------
+ * Directory growth (2026-09-25).
+ *
+ * A directory this driver creates starts as ONE cluster marked NoFatChain.
+ * When no run of free slots is left, it gets another, ZEROED cluster (an
+ * all-zero entry is "end of directory", so an unzeroed one would be a
+ * directory full of whatever the disk held before).  NoFatChain describes a
+ * contiguous run, and the new cluster need not be contiguous, so the first
+ * growth converts the directory to a FAT chain: the existing run is written
+ * into the FAT link by link (so its old entries resolve exactly as before),
+ * then the new cluster is appended.  Finally the directory's own Stream
+ * Extension in ITS parent gets the new DataLength and flags — exfat_write_meta
+ * is that update for a file, and a directory is recorded the same way.  The
+ * root directory has no parent entry; it is always FAT-chained and its size is
+ * its chain, so appending is all it needs.
+ *
+ * Before deciding anything, the directory's in-memory view is refreshed from
+ * its on-disk entry: two inodes for one directory would otherwise each believe
+ * the directory still contiguous, and the second conversion would rewrite FAT
+ * links the first had already pointed elsewhere.
+ * ---------------------------------------------------------------------- */
+static void dir_refresh(struct inode* dir) {
+    struct exfat_inode* dei = (struct exfat_inode*)dir->private;
+    if (!dei || dei->parent_first_cluster < 2) return;      /* root */
+    struct dir_iter it = { .fs = dei->fs, .first_cluster = dei->parent_first_cluster,
+                           .no_fat_chain = dei->parent_no_fat_chain,
+                           .limit = dei->parent_size };
+    uint8_t st[EXFAT_ENTRY_SIZE];
+    if (dir_entry_read(&it, dei->dirent_index + 1, st) != 0) return;
+    if (st[0] != EXFAT_TYPE_STREAM) return;
+    dei->no_fat_chain = (st[1] & EXFAT_STREAM_NO_FAT_CHAIN) ? 1 : 0;
+    uint64_t len = 0;
+    for (int b = 7; b >= 0; b--) len = (len << 8) | st[0x18 + b];
+    if (len) dir->size = len;
+}
+
+static int dir_grow(struct inode* dir) {
+    struct exfat_inode* dei = (struct exfat_inode*)dir->private;
+    struct exfat_fs* fs = dei->fs;
+    uint32_t c = bitmap_alloc(fs);
+    if (!c) return -1;                                   /* volume full */
+    if (cluster_zero(fs, c) != 0) { bitmap_free(fs, c); return -1; }
+    fat_set(fs, c, EXFAT_FAT_EOC);
+
+    if (dei->no_fat_chain) {
+        uint32_t n = (uint32_t)(dir->size / fs->bytes_per_cluster);
+        if (n == 0) n = 1;
+        for (uint32_t i = 0; i + 1 < n; i++)
+            fat_set(fs, dei->first_cluster + i, dei->first_cluster + i + 1);
+        fat_set(fs, dei->first_cluster + n - 1, c);
+        dei->no_fat_chain = 0;
+    } else {
+        fat_set(fs, chain_tail(fs, dei->first_cluster), c);
+    }
+    if (dir->size) dir->size += fs->bytes_per_cluster;   /* root: size 0 = its chain */
+    if (dei->parent_first_cluster >= 2 && exfat_write_meta(dir) != 0) return -1;
+    bcache_sync(fs->dev);
+    return 0;
+}
+
+/* A slot for `need` entries in `dir`, growing it once when it is full. */
+static uint32_t dir_find_or_grow(struct inode* dir, int need) {
+    struct exfat_inode* dei = (struct exfat_inode*)dir->private;
+    dir_refresh(dir);
+    uint32_t slot = find_free_dir_slot(dei->fs, dei->first_cluster, dei->no_fat_chain,
+                                       dir->size, need);
+    if (slot != (uint32_t)-1) return slot;
+    if (dir_grow(dir) != 0) return (uint32_t)-1;
+    return find_free_dir_slot(dei->fs, dei->first_cluster, dei->no_fat_chain,
+                              dir->size, need);
 }
 
 /* ----------------------------------------------------------------------
@@ -1006,6 +1119,7 @@ static int exfat_make(struct inode* dir, const char* name, struct inode** out,
 
     int name_len = (int)strlen_(name);
     if (name_len == 0 || name_len > EXFAT_MAX_NAME) return -1;
+    dir_refresh(dir);           /* see dir_grow: the on-disk shape is the truth */
 
     /* REFUSE AN EXISTING NAME.
      *
@@ -1028,9 +1142,8 @@ static int exfat_make(struct inode* dir, const char* name, struct inode** out,
     int sec_count    = 1 + name_entries;            /* stream + name entries */
     int total_e      = 1 + sec_count;               /* + file entry */
 
-    /* Find a slot in the parent directory. */
-    uint32_t slot = find_free_dir_slot(fs, dei->first_cluster, dei->no_fat_chain,
-                                       total_e);
+    /* Find a slot in the parent directory, growing it when it is full. */
+    uint32_t slot = dir_find_or_grow(dir, total_e);
     if (slot == (uint32_t)-1) return -2;
 
     /* Build the entries in a local buffer. */
@@ -1063,6 +1176,7 @@ static int exfat_make(struct inode* dir, const char* name, struct inode** out,
         .fs            = fs,
         .first_cluster = dei->first_cluster,
         .no_fat_chain  = dei->no_fat_chain,
+        .limit         = dir->size,
     };
     for (int i = 0; i < total_e; i++) {
         if (dir_entry_write(&it, slot + i, set + i * EXFAT_ENTRY_SIZE) != 0)
@@ -1083,7 +1197,8 @@ static int exfat_make(struct inode* dir, const char* name, struct inode** out,
         .data_length   = as_dir ? fs->bytes_per_cluster : 0,
         .dirent_index  = slot,
     };
-    struct inode* ino = build_inode(fs, &pf, dei->first_cluster, dei->no_fat_chain);
+    struct inode* ino = build_inode(fs, &pf, dei->first_cluster, dei->no_fat_chain,
+                                    dir->size);
     if (!ino) return -4;
     if (out) *out = ino;
     return 0;
@@ -1114,10 +1229,10 @@ static int exfat_unlink(struct inode* dir, const char* name,
     if (!tei) return -1;
 
     if (target->type == INODE_DIR &&
-        !dir_is_empty(fs, tei->first_cluster, tei->no_fat_chain))
+        !dir_is_empty(fs, tei->first_cluster, tei->no_fat_chain, target->size))
         return -2;                              /* not empty */
 
-    if (dirent_set_delete(fs, dei->first_cluster, dei->no_fat_chain,
+    if (dirent_set_delete(fs, dei->first_cluster, dei->no_fat_chain, dir->size,
                           tei->dirent_index) != 0)
         return -1;
     chain_free(fs, tei->first_cluster, tei->no_fat_chain, target->size);
@@ -1188,14 +1303,14 @@ static int exfat_rename(struct inode* dir, const char* oldname,
                                   tei->first_cluster, target->size, flags);
     if (total_e < 0) return -1;
 
-    uint32_t slot = find_free_dir_slot(fs, dei->first_cluster, dei->no_fat_chain,
-                                       total_e);
-    if (slot == (uint32_t)-1) return -3;                   /* directory full */
+    uint32_t slot = dir_find_or_grow(dir, total_e);
+    if (slot == (uint32_t)-1) return -3;                   /* volume full */
 
     struct dir_iter it = {
         .fs            = fs,
         .first_cluster = dei->first_cluster,
         .no_fat_chain  = dei->no_fat_chain,
+        .limit         = dir->size,
     };
     for (int i = 0; i < total_e; i++) {
         if (dir_entry_write(&it, slot + i, set + i * EXFAT_ENTRY_SIZE) != 0)
@@ -1203,11 +1318,11 @@ static int exfat_rename(struct inode* dir, const char* oldname,
     }
 
     /* The old set goes only once the new one is on the disk. */
-    if (dirent_set_delete(fs, dei->first_cluster, dei->no_fat_chain,
+    if (dirent_set_delete(fs, dei->first_cluster, dei->no_fat_chain, dir->size,
                           tei->dirent_index) != 0) {
         /* The new set is already written; leaving both would be a cross-link,
          * so undo it and report failure rather than half-renaming. */
-        dirent_set_delete(fs, dei->first_cluster, dei->no_fat_chain, slot);
+        dirent_set_delete(fs, dei->first_cluster, dei->no_fat_chain, dir->size, slot);
         bcache_sync(fs->dev);
         return -4;
     }
@@ -1218,6 +1333,11 @@ static int exfat_rename(struct inode* dir, const char* oldname,
      * renamed and then silently stop growing. */
     tei->dirent_index = slot;
     tei->sec_count    = (uint8_t)(total_e - 1);
+    /* And the parent's SHAPE, which dir_find_or_grow may just have changed:
+     * the new slot can lie in a cluster the directory gained a moment ago,
+     * beyond the size (and past the NoFatChain run) this inode remembers. */
+    tei->parent_size         = dir->size;
+    tei->parent_no_fat_chain = dei->no_fat_chain;
 
     bcache_sync(fs->dev);
     return 0;

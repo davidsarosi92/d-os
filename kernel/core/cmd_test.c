@@ -1284,3 +1284,107 @@ static void t_confstorm(const char* a) {
 }
 SHELL_CMD(confstorm) = { "confstorm", "[tasks 1-8] [iterations]", "the config store under concurrency",
                          SHELL_G_TEST, t_confstorm, SHELL_P_ADMIN };
+
+/* ---------------------------------------------------------------------------
+ * `rmdirtest` — the falsifier for exFAT's "is this directory empty" answer
+ * (NEXT.md #8).  exFAT does not compact a directory when a file is removed; the
+ * entries are only marked deleted.  So: 1060 files (4 entries each at a
+ * 30-character name), delete the first 1024 — 4096 deleted entries with 36
+ * live files BEHIND them — and ask the VFS to remove the directory.  It must
+ * refuse.  The old answer scanned 4096 entries, saw no live file, and removed
+ * it, orphaning all 36.
+ * ------------------------------------------------------------------------- */
+static void rdt_name(char* out, const char* dir, int i) {
+    int k = 0;
+    while (dir[k]) { out[k] = dir[k]; k++; }
+    out[k++] = '/';
+    const char* pad = "rmdirtest-padding-name-";   /* 23 chars + 4 digits + 3 */
+    while (*pad) out[k++] = *pad++;
+    out[k++] = 'n';
+    out[k++] = (char)('0' + (i / 1000) % 10);
+    out[k++] = (char)('0' + (i / 100) % 10);
+    out[k++] = (char)('0' + (i / 10) % 10);
+    out[k++] = (char)('0' + i % 10);
+    out[k++] = 'x';
+    out[k++] = 'y';
+    out[k] = 0;
+}
+
+static void t_rmdirtest(const char* a) {
+    (void)a;
+    const char* d = "/mnt/rmdirtest";
+    enum { N = 1060, K = 1024 };
+    char p[96];
+    vfs_unlink_recursive(d);                     /* a leftover from a crash */
+    if (vfs_mkdir(d) != 0) {
+        kprintf("rmdirtest: cannot create %s (no writable disk?)\n", d);
+        return;
+    }
+    uint64_t t0 = timer_ticks_ms();
+    int made = 0, gone = 0;
+    for (int i = 0; i < N; i++) { rdt_name(p, d, i); if (vfs_create(p) == 0) made++; }
+    for (int i = 0; i < K; i++) { rdt_name(p, d, i); if (vfs_unlink(p) == 0) gone++; }
+    int rc = vfs_unlink(d);
+    kprintf("rmdirtest: %d created, %d deleted (%d deleted entries ahead of %d live files) "
+            "in %u ms; removing the directory returned %d: %s\n",
+            made, gone, gone * 4, made - gone, (unsigned)(timer_ticks_ms() - t0), rc,
+            (made == N && gone == K)
+                ? (rc != 0 ? "PASS (refused - it is not empty)"
+                           : "FAIL (a non-empty directory was removed; its files are orphaned)")
+                : "INCONCLUSIVE (setup did not complete)");
+    vfs_unlink_recursive(d);
+}
+SHELL_CMD(rmdirtest) = { "rmdirtest", "", "exFAT: rmdir must refuse a directory with live files behind deleted ones",
+                         SHELL_G_TEST, t_rmdirtest, SHELL_P_ADMIN };
+
+/* ---------------------------------------------------------------------------
+ * `dirfilltest [keep]` — the falsifier for exFAT directory GROWTH.
+ *
+ * A directory this driver creates owns ONE cluster (NoFatChain).  When it was
+ * full, the slot search walked on into the clusters that FOLLOW it on the disk
+ * — somebody else's — because a NoFatChain lookup is arithmetic with no bound.
+ * So: a directory, then a victim file whose clusters are allocated right after
+ * it, filled with a known pattern; then enough entries to fill several
+ * clusters of directory.  The victim must read back intact and every entry
+ * must be listed.  `keep` leaves both behind for fsck.exfat.
+ * ------------------------------------------------------------------------- */
+static void t_dirfilltest(const char* a) {
+    int keep = a && a[0] == 'k';
+    const char* d = "/mnt/dirfill";
+    const char* v = "/mnt/dirfill-victim";
+    enum { N = 200, VSZ = 16384 };
+    char p[96];
+    vfs_unlink_recursive(d);
+    vfs_unlink(v);
+    if (vfs_mkdir(d) != 0) { kprintf("dirfilltest: cannot create %s\n", d); return; }
+
+    static uint8_t buf[VSZ];
+    for (int i = 0; i < VSZ; i++) buf[i] = (uint8_t)(0xA5 ^ (i * 7));
+    struct file* f = vfs_open(v, VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+    if (!f) { kprintf("dirfilltest: cannot create %s\n", v); return; }
+    vfs_write(f, buf, VSZ);
+    vfs_close(f);
+
+    int made = 0;
+    for (int i = 0; i < N; i++) { rdt_name(p, d, i); if (vfs_create(p) == 0) made++; }
+
+    /* Read the victim back through a fresh open. */
+    int bad = 0;
+    static uint8_t rb[VSZ];
+    f = vfs_open(v, VFS_RDONLY);
+    ssize_t got = f ? vfs_read(f, rb, VSZ) : -1;
+    if (f) vfs_close(f);
+    for (int i = 0; i < VSZ && got == VSZ; i++) if (rb[i] != buf[i]) bad++;
+
+    int listed = 0;
+    f = vfs_open(d, VFS_RDONLY);
+    if (f) { struct dirent de; while (vfs_readdir(f, &de) > 0) listed++; vfs_close(f); }
+
+    int ok = (made == N && listed >= N && got == VSZ && bad == 0);
+    kprintf("dirfilltest: %d/%d created, %d listed, victim read %d bytes with %d "
+            "corrupted: %s\n", made, N, listed, (int)got, bad,
+            ok ? "PASS" : "FAIL");
+    if (!keep) { vfs_unlink_recursive(d); vfs_unlink(v); }
+}
+SHELL_CMD(dirfilltest) = { "dirfilltest", "[keep]", "exFAT: a directory grows without writing into its neighbours",
+                           SHELL_G_TEST, t_dirfilltest, SHELL_P_ADMIN };

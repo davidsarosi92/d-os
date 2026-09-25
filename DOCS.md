@@ -8877,6 +8877,40 @@ walk of the chain; and `pkg.store = disk` is now genuinely usable but still not
 the default — see §4.72 for the measurement (82 ms vs 7823 ms), which the
 directory support does not change.
 
+
+#### 4.73.1 A full directory wrote into its neighbour's data (2026-09-25)
+
+Found while writing a falsifier for NEXT.md #8, and much worse than #8.  A
+directory this driver creates owns ONE cluster, marked NoFatChain (contiguous).
+A NoFatChain lookup turns an entry index into a cluster by ADDITION, with
+nothing bounding it by the directory's DataLength, and the free-slot search
+stopped at a guessed "four clusters".  So when the first cluster filled (~32
+files with 30-character names at 4 KiB clusters), new entries were written into
+the three clusters that FOLLOW the directory on the disk — whoever owned them.
+**`dirfilltest` on the old code: 80 of 200 files created, 33 listed, and 6143 of
+16384 bytes of a neighbouring file overwritten — while `fsck.exfat` reported the
+volume CLEAN**, because the stray entries lie outside every directory it walks.
+
+Fixed in three parts.  **Every directory walk is bounded** by the directory's
+DataLength (`dir_iter.limit`; a child inode remembers its parent's size for its
+metadata rewrites).  **A full directory GROWS**: a new zeroed cluster, the
+contiguous run converted to a FAT chain link by link (so existing entries
+resolve exactly as before), the new cluster appended, and the directory's own
+Stream Extension rewritten in its parent (new DataLength, NoFatChain cleared);
+the directory's in-memory shape is re-read from disk first, so two inodes of one
+directory cannot both "convert" it.  And **`dir_is_empty` scans the whole
+directory** (#8: it answered "empty" after 4096 entries, so live files behind
+4096 deleted entries were orphaned by `rm`); any way of not finishing answers
+"not empty".
+
+**Measured:** `dirfilltest` 200/200 created and listed, the neighbour intact,
+`fsck.exfat` clean with 207 files, and after a REBOOT all 200 listed and the
+directory 28672 bytes (7 clusters); `rmdirtest` — 1060 files, the first 1024
+deleted (4096 deleted entries ahead of 36 live ones) — the rmdir is refused (-2).
+**Found on the way, not fixed:** creating N files in one directory is O(N²)
+(each create scans the whole directory twice: the duplicate check and the slot
+search), so `rmdirtest`'s 1060 creates take ~8.5 minutes under emulation.
+
 ### 4.74 The desktop is where boot ends — and leaving it lands on a shell
 
 **Files:** `kernel/gui/gui.c` (`gui_autostart`, `gui_queue_exit`, `gui_teardown`,
@@ -13723,6 +13757,7 @@ read-backs), `killstorm` 20/20, `fsck.exfat` clean.
 
 ## 8. Change log
 
+- **2026-09-25 — exFAT: a full directory no longer writes into its neighbour's data; directories grow; `dir_is_empty` scans all of it (DOCS §4.73.1).**
 - **2026-09-25 — The serial command channel is portable; aarch64's display boot path can be driven (DOCS §4.74.1).**
 - **2026-09-25 — aarch64 virtio-mmio-blk sleeps on its completion interrupt (DOCS §4.93).**
 - **2026-09-25 — A ONE-SHOT TIMER DEADLINE, MEASURED AND REMOVED (DOCS §4.53.1).**

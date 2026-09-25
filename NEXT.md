@@ -79,8 +79,9 @@ Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI
 | 5 | Real storm case: no in-guest report escaped (all serial output stopped) | low | the cause is fixed; the `PIT STARVED` path is proven only on its falsifier |
 | 6 | §4.67.1 "host-load dependent" NMI lockup, and today's i386 NMI after `gui stop` | watch | very probably the storm (a disk is attached on every everyday run since §4.66); not proven — the NMI report now names task, IF, in-service vector and stack |
 | 7 | HDA sound splits when its pump task is starved | low | only under starvation; the gap is silence, not stale audio |
-| 8 | exFAT `dir_is_empty` scans at most 4096 entries | low | a limitation, stated in the code |
-| 9 | aarch64 does not publish `/dev/vda` (its block driver initialises after `devfs_init`) | low | not chased |
+| 8 | ~~exFAT `dir_is_empty` scans at most 4096 entries~~ | — | **FIXED 2026-09-25** (DOCS §4.73.1) — and it uncovered worse: a directory past ~32 files wrote its entries into the NEIGHBOURING file's clusters (fsck said clean).  Directories are bounded and grow now |
+| 8b | Creating N files in one exFAT directory is O(N²) | low | two full scans per create; 1060 creates ≈ 8.5 min emulated |
+| 9 | ~~aarch64 does not publish `/dev/vda`~~ | — | already fixed (`e2973b2`, the block layer publishes); verified on both ARM boot paths 2026-09-25 |
 | 10 | `load_balance_pull` counts a migration attempt whose insert can be refused | cosmetic | diagnostic counter only |
 
 ### Checked and no longer open
