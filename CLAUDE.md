@@ -62,7 +62,13 @@ path too, where the harness previously could not type at all; aarch64's serial
 path keeps its REPL (the channel stands aside there).  aarch64 virtio-mmio-blk
 now sleeps on its completion interrupt; a one-shot LAPIC timer deadline was
 built, measured (no gain: the emulator's own timer dispatch is the 1.2-1.8 ms
-floor) and removed (DOCS §4.53.1).
+floor) and removed (DOCS §4.53.1).  **THEN the defect list was closed in order**: a full exFAT directory
+wrote its entries into the NEIGHBOURING file's clusters while fsck said clean
+(DOCS §4.73.1 — directories are bounded and grow now); the block cache is 1024
+packed+hashed slots (1060 creates 512 s → 29 s); `blkstormtest` proves the
+storm detector on the real storm; HDA no longer goes silent for good after an
+underrun.  NEXT.md's open list is empty apart from the emulator's timer floor.
+PLAN gained §M84 (phone), §M85 (sbsa-ref), §M86 (memory past 4 GiB on i386/ARM).
 
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there

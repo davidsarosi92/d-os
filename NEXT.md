@@ -82,7 +82,7 @@ Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI
 | 8 | ~~exFAT `dir_is_empty` scans at most 4096 entries~~ | — | **FIXED 2026-09-25** (DOCS §4.73.1) — and it uncovered worse: a directory past ~32 files wrote its entries into the NEIGHBOURING file's clusters (fsck said clean).  Directories are bounded and grow now |
 | 8b | ~~Creating N files in one exFAT directory is O(N²)~~ | — | **FIXED 2026-09-25**: the block cache held 64 sectors (in 64 whole frames) and a 1060-file directory is 265, so every pass missed; now 1024 slots packed 8 per frame + a hash, and the directory walk resumes its FAT position.  `rmdirtest` 512 s → 29 s, `diskstorm` 1447 → 609 ms.  Still two passes per create (duplicate check + slot search) |
 | 9 | ~~aarch64 does not publish `/dev/vda`~~ | — | already fixed (`e2973b2`, the block layer publishes); verified on both ARM boot paths 2026-09-25 |
-| 10 | `load_balance_pull` counts a migration attempt whose insert can be refused | cosmetic | diagnostic counter only |
+| 10 | ~~`load_balance_pull` counts a refused migration~~ | — | already fixed by §M57: the insert happens inside `load_steal_one` under both locks and a refusal returns NULL, so `migrations++` counts only completed moves (read 2026-09-25) |
 
 ### Checked and no longer open
 
