@@ -291,6 +291,7 @@ what); a session can pick a theme and push on it.
 | M83 | **Everything is a package, and the tree splits along the package lines** — asked for directly: *what can be, goes into its own repository; everything modular; everything manageable from `pkg` — desktop, compositor, GUI, Wayland, everything.*  Today no package can come from OUTSIDE the kernel image (every payload is a blob compiled into the 61 MB `kernel.bin`, and `/store` is ramfs rebuilt per boot), 21 registries are linker sections that only a build can fill, and a §M67 module can carry exactly one `struct driver` against 41 exported symbols.  Apps are proposed as RING-3 programs (§M65's `dosgui_ui_build` already exists), gui-core / shells / Wayland as module packages — and **every ring-0 component is reviewed** (must stay / could move / unknown cost, with the reason and a measured boundary-crossing cost), because most of them are in the kernel by history rather than by requirement.  Staged so the REPOSITORY split comes LAST, gated on a green boundary audit — a split along lines the code does not yet respect is a refactor done across repositories | Architecture / Packaging | §M83 — designed, not started |
 | M84 | **A mobile interface — d-os must run on a PHONE** — asked for directly (2026-09-25), with the reason stated: *this is also why everything has to be modular.*  A phone is a different desktop SHELL (§M22's `DESKTOP_SHELL()` registry already makes that a file), a different INPUT model (touch, gestures, an on-screen keyboard — there is no touch input anywhere in the tree today), a different FORM FACTOR (portrait, small, high density — §M65's size classes and §M69's `cp_px()` density are the start), and different HARDWARE (SoC, device tree, panel, battery, modem).  Staged: a mobile shell + touch on emulated hardware first, a phone-shaped `virt` second, a real device last.  Depends on §M83 (the mobile shell, keyboard and apps as packages chosen per device, not a second kernel build) and on §M85 (no hardcoded board) | UX / Platform | §M84 — designed, not started |
 | M85 | **aarch64 beyond `virt`: QEMU `sbsa-ref`** — asked for directly (2026-09-25).  The ARM port knows exactly ONE machine: ten places hardcode `virt`'s map (GICv2 at `0x08000000`, PL011 at `0x09000000`, virtio-mmio at `0x0a000000`, ECAM at `0x40_1000_0000`, RAM at `0x4000_0000`, the DTB loaded at `0x4800_0000`).  `sbsa-ref` is the reference for a STANDARD ARM server: firmware boot (TF-A + EDK2, UEFI), ACPI instead of a device tree, GICv3, devices on PCIe rather than virtio-mmio.  The deliverable is a port that DISCOVERS its board — which is also the precondition for any real phone (§M84) | Platform / Portability | §M85 — designed, not started |
+| M86 | **Memory beyond the 4 GiB line on i386 and aarch64** — asked for directly (2026-09-25).  x86_64 already discovers its ceiling (§M48, verified to 128 GiB).  i386 manages only what its 1 GiB identity map covers (473 MiB free on a 512 MiB box; RAM past 1 GiB unused) and cannot address physical memory above 4 GiB at all without PAE; aarch64's early MMU identity-maps 0-4 GiB in 1 GiB blocks with RAM from `0x4000_0000`, so at most ~3 GiB is usable and `hal_extend_identity_map` caps at 4 GiB | Memory / Portability | §M86 — designed, not started |
 
 ### Cross-cutting constraints
 
@@ -8829,4 +8830,53 @@ channel — and a `drv` / `iommu` / `lsnic` report on each that says what it
 found rather than what it expected.  **Relation to §M84:** a real phone is a
 third board with its own map; §M85's stage 1 is what makes that a device tree
 instead of a port.
+
+
+## §M86 — Memory beyond the 4 GiB line on i386 and aarch64
+
+Asked for directly (2026-09-25): *"the max-4 GB problem has to be solved on
+32-bit and on ARM too."*
+
+**Status: designed, not started.**  x86_64 is the reference: §M48 made its
+memory ceiling DISCOVERED rather than compiled in, moved the kernel's physical
+window to a direct map in the upper half (`KERNEL_DIRECT_MAP_BASE`,
+`phys_to_virt`) and verified 1 GiB-128 GiB.  The other two arches stop short,
+for different reasons — read from the tree, 2026-09-25:
+
+| arch | what limits it | where |
+|---|---|---|
+| i386 | the kernel reaches RAM only through a **1 GiB identity map** (`IDENTITY_MAP_MIB 1024`, 256 PSE PDEs), because user space starts at 1 GiB; `pmm_init` asks `hal_extend_identity_map` and stops where it answers — measured 473 MiB free of 512 | `kernel/hal/x86/vmm.c`, `kernel/mem/pmm.c` |
+| i386 | above 4 GiB PHYSICAL there is nothing to extend: 32-bit page tables carry 32-bit frame numbers.  That is **PAE** (3-level tables, 64-bit entries, 36-bit physical, up to 64 GiB) — a different page-table FORMAT, not a bigger constant | the whole i386 VMM |
+| aarch64 | the Phase-A MMU identity-maps **0-4 GiB in 1 GiB blocks** (index 0 device, 1-3 RAM) and `hal_extend_identity_map` returns at most 4 GiB; `virt` RAM starts at `0x4000_0000`, so ~3 GiB is the most the PMM can manage | `kernel/hal/aarch64/mmu.c`, `hal_arch.c` |
+| aarch64 | user mappings live at VA >= 4 GiB in the SAME TTBR0 as the kernel identity blocks — a kernel map that grows past 4 GiB would collide with user space | `mmu.c`, `vmm.c` |
+| aarch64 | the RAM map is handed to the PMM through a synthesised multiboot structure whose `mmap_addr` is 32-bit | `stubs.c` |
+
+### Staging
+
+1. **i386 highmem (the §M19.5.1 item, finally).**  Frames above the identity
+   map become usable through TEMPORARY mappings (`kmap`/`kunmap`, a small
+   per-CPU window) — the PMM hands them out as `ZONE_HIGHMEM`, only for users
+   that go through kmap (page cache, user pages), never for kernel structures.
+   Result: all RAM up to 4 GiB is usable.  The falsifier is `-m 3G` with the
+   free count reported and a fill test that touches every frame.
+2. **i386 PAE**, as a SELECTABLE page-table format behind the existing VMM
+   interface (the non-PAE path stays for CPUs without it): 64-bit PTEs,
+   PDPT + PD + PT.  Only then can physical memory above 4 GiB exist on i386.
+   NX comes with it (bit 63), which is also §M67's missing W^X on this arch.
+3. **aarch64: a real kernel half.**  Move the kernel's view of RAM to TTBR1 (a
+   direct map in the upper half, exactly §M48's x86_64 shape, with
+   `phys_to_virt` doing the work) and leave TTBR0 wholly to user space; build
+   the map from the DTB's memory nodes (several ranges, above 4 GiB included)
+   with 2 MiB / 4 KiB granules where 1 GiB blocks do not fit.  This is shared
+   work with §M85, whose first stage already takes the board layout from the
+   DTB.
+4. **The handoff itself:** replace the synthesised 32-bit multiboot map on ARM
+   with a native memory-range list, so nothing on that path truncates.
+
+**Acceptance:** i386 at `-m 3G` (all of it free, highmem stage) and `-m 8G`
+(PAE stage); aarch64 at `-m 8G` and `-m 16G`; each with the free count
+reported, a fill-and-verify pass over every frame, and `forktest` / `musltest`
+/ `diskstorm` green — §M48's lesson is that a ceiling raised without running
+userland over it hides the bug that matters (x86_64 exec failed on every machine
+with more than 1 GiB until someone booted one).
 
