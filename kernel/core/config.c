@@ -23,6 +23,7 @@
 #include "kmalloc.h"
 #include "printf.h"
 #include "klog.h"
+#include "lock.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -79,6 +80,34 @@ struct entry {
 };
 static struct entry* head = NULL;
 
+/* THE STORE IS SHARED BY EVERY TASK, AND WAS UNLOCKED (2026-09-25).  The
+ * compositor reads it every frame, the desktop and every app read it, and a
+ * settings panel, a shell or a session switch writes it from yet another task.
+ * Two defects followed: `config_set` FREED the old value while a reader was
+ * still holding the string `config_get` had just returned, and the list was
+ * spliced (a new entry at the head, a user's override removed at sign-out)
+ * under concurrent traversal — which can lose an entry or resurrect a freed
+ * one that a later write then scribbles into.
+ *
+ * So: the list is walked and changed only under `cfg_lock`; and memory that a
+ * reader may still be using — an old value, a removed entry — is RETIRED into
+ * a small ring and freed only when the ring comes round, CFG_RETIRE changes
+ * later.  A reader would have to hold a returned pointer across that many
+ * config changes on other tasks to see it go, which no caller in this tree
+ * does (they read, parse, and let go).  Nothing blocking or re-entrant runs
+ * under the lock: file writes work from a snapshot, watchers are told after. */
+static spinlock_t cfg_lock = SPINLOCK_INIT;
+#define CFG_RETIRE 256
+static void*    cfg_retired[CFG_RETIRE];
+static unsigned cfg_retire_i;
+static void* retire_locked(void* p) {          /* returns what is now safe to free */
+    if (!p) return NULL;
+    void* old = cfg_retired[cfg_retire_i];
+    cfg_retired[cfg_retire_i] = p;
+    cfg_retire_i = (cfg_retire_i + 1) % CFG_RETIRE;
+    return old;
+}
+
 /* ------------------------------------------------------------------- */
 /* Built-in defaults.  Add new keys here so consumers always have a     */
 /* sensible value even on a fresh system.                               */
@@ -98,10 +127,13 @@ static const struct config_default builtin_defaults[] = {
 
 const char* config_get(const char* key, const char* default_value) {
     if (!key) return default_value;
+    const char* v = default_value;
+    uint32_t fl = spin_lock_irqsave(&cfg_lock);
     for (struct entry* e = head; e; e = e->next) {
-        if (streq(e->key, key)) return e->value;
+        if (streq(e->key, key)) { v = e->value; break; }
     }
-    return default_value;
+    spin_unlock_irqrestore(&cfg_lock, fl);
+    return v;                        /* stays valid: values are retired, not freed */
 }
 
 /* Parse a config value as a base-10 (long) integer, returning `def` when the
@@ -119,35 +151,87 @@ long config_get_long(const char* key, long def) {
     return neg ? -v : v;
 }
 
+/* Caller holds cfg_lock. */
 static struct entry* find_entry(const char* key) {
     for (struct entry* e = head; e; e = e->next)
         if (streq(e->key, key)) return e;
     return NULL;
 }
 
-int config_set(const char* key, const char* value) {
-    if (!key || !value) return -1;
-    /* Replace existing. */
-    for (struct entry* e = head; e; e = e->next) {
-        if (streq(e->key, key)) {
-            char* nv = strdup_(value);
-            if (!nv) return -2;
-            kfree(e->value);
-            e->value = nv;
-            return 0;
-        }
+/* Caller holds cfg_lock; `*freeable` receives memory that may now be freed
+ * (after the lock is dropped). */
+static int set_locked(const char* key, const char* value, void** freeable) {
+    *freeable = NULL;
+    struct entry* e = find_entry(key);
+    if (e) {
+        char* nv = strdup_(value);
+        if (!nv) return -2;
+        *freeable = retire_locked(e->value);
+        e->value = nv;
+        return 0;
     }
     /* Append new — push to head so most-recently-set are found fastest. */
-    struct entry* e = (struct entry*)kmalloc(sizeof *e);
+    e = (struct entry*)kmalloc(sizeof *e);
     if (!e) return -3;
     e->key   = strdup_(key);
     e->value = strdup_(value);
+    if (!e->key || !e->value) {
+        if (e->key) kfree(e->key);
+        if (e->value) kfree(e->value);
+        kfree(e);
+        return -3;
+    }
     e->machine = NULL;
     e->has_machine = 0;
     e->user_set = 0;
     e->next  = head;
     head     = e;
     return 0;
+}
+
+/* "key = value\n" for the entries `mode` selects, built under cfg_lock so a
+ * writer that sleeps (the VFS) never runs inside it.  mode 0 = the MACHINE's
+ * values (the machine store), 1 = the user's overrides (the user store),
+ * 2 = everything as currently seen (config_dump).  Caller kfree()s. */
+static char* snapshot_text(int mode, size_t* out_len) {
+    uint32_t fl = spin_lock_irqsave(&cfg_lock);
+    size_t n = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        char* buf = NULL;
+        if (pass == 1) {
+            buf = (char*)kmalloc(n + 1);
+            if (!buf) { spin_unlock_irqrestore(&cfg_lock, fl); *out_len = 0; return NULL; }
+        }
+        size_t k = 0;
+        for (struct entry* e = head; e; e = e->next) {
+            const char* v = e->value;
+            if (mode == 0 && e->user_set) { if (!e->has_machine) continue; v = e->machine; }
+            if (mode == 1 && !e->user_set) continue;
+            const char* parts[4] = { mode == 2 ? "  " : "", e->key, " = ", v };
+            for (int q = 0; q < 4; q++)
+                for (const char* c = parts[q]; *c; c++) { if (buf) buf[k] = *c; k++; }
+            if (buf) buf[k] = '\n';
+            k++;
+        }
+        if (pass == 0) { n = k; continue; }
+        buf[k] = 0;
+        spin_unlock_irqrestore(&cfg_lock, fl);
+        *out_len = k;
+        return buf;
+    }
+    spin_unlock_irqrestore(&cfg_lock, fl);
+    *out_len = 0;
+    return NULL;
+}
+
+int config_set(const char* key, const char* value) {
+    if (!key || !value) return -1;
+    void* fr;
+    uint32_t fl = spin_lock_irqsave(&cfg_lock);
+    int rc = set_locked(key, value, &fr);
+    spin_unlock_irqrestore(&cfg_lock, fl);
+    if (fr) kfree(fr);
+    return rc;
 }
 
 /* ------------------------------------------------------------------- */
@@ -201,7 +285,9 @@ int config_apply(const char* key, const char* value) {
      * re-writing what is already there), and a subsystem told to re-read on
      * every no-op change would rebuild its state for nothing — at boot, that
      * is the whole defaults table. */
-    const char* old = config_get(key, (const char*)0);
+    uint32_t cfl = spin_lock_irqsave(&cfg_lock);
+    struct entry* pe0 = find_entry(key);
+    const char* old = pe0 ? pe0->value : (const char*)0;   /* retired, not freed */
     int same = old && streq(old, value);
 
     /* §M82 — a user override moves the machine's value aside FIRST, while it
@@ -212,12 +298,16 @@ int config_apply(const char* key, const char* value) {
                      config_key_scope(key) == CFG_SCOPE_USER;
     char* moved = NULL;
     int   had   = 0;
-    struct entry* pe = find_entry(key);
+    struct entry* pe = pe0;
     if (user_layer && !(pe && pe->user_set)) {
         had = pe != NULL;
-        if (had) { moved = strdup_(pe->value); if (!moved) return -3; }
+        if (had) {
+            moved = strdup_(pe->value);
+            if (!moved) { spin_unlock_irqrestore(&cfg_lock, cfl); return -3; }
+        }
     }
-    int rc = config_set(key, value);
+    void* fr = NULL;
+    int rc = set_locked(key, value, &fr);
     if (rc == 0 && user_layer) {
         struct entry* ne = find_entry(key);
         if (ne && !ne->user_set) {
@@ -227,6 +317,8 @@ int config_apply(const char* key, const char* value) {
             moved = NULL;
         }
     }
+    spin_unlock_irqrestore(&cfg_lock, cfl);
+    if (fr) kfree(fr);
     if (moved) kfree(moved);
     if (rc == 0 && !same) {
         /* LOG the decision.  A settings change is a change to how the machine
@@ -303,18 +395,11 @@ static int save_to(const char* path) {
     const char* hdr = "# d-os configuration — managed by config.c\n";
     vfs_write(f, hdr, strlen_(hdr));
 
-    for (struct entry* e = head; e; e = e->next) {
-        /* The MACHINE's value, never the signed-in user's override (§M82). */
-        const char* v = e->value;
-        if (e->user_set) {
-            if (!e->has_machine) continue;      /* the machine never set it */
-            v = e->machine;
-        }
-        vfs_write(f, e->key,  strlen_(e->key));
-        vfs_write(f, " = ",   3);
-        vfs_write(f, v, strlen_(v));
-        vfs_write(f, "\n",    1);
-    }
+    /* The MACHINE's values, never the signed-in user's overrides (§M82) —
+     * taken as a snapshot so the file write runs outside cfg_lock. */
+    size_t len = 0;
+    char* text = snapshot_text(0, &len);
+    if (text) { vfs_write(f, text, len); kfree(text); }
     vfs_close(f);
     return 0;
 }
@@ -459,16 +544,28 @@ void config_init(void) {
 
 void config_for_each(config_iter_fn fn, void* ctx) {
     if (!fn) return;
-    for (struct entry* e = head; e; e = e->next) fn(e->key, e->value, ctx);
+    /* Pointers snapshotted under the lock, the callback run outside it (it may
+     * print, or read config itself).  Keys and values are retired rather than
+     * freed, so the pointers outlive the snapshot. */
+    uint32_t fl = spin_lock_irqsave(&cfg_lock);
+    int n = 0;
+    for (struct entry* e = head; e; e = e->next) n++;
+    const char** kv = (const char**)kmalloc(sizeof(char*) * 2 * (size_t)(n ? n : 1));
+    int k = 0;
+    if (kv) for (struct entry* e = head; e && k < n; e = e->next) { kv[2*k] = e->key; kv[2*k+1] = e->value; k++; }
+    spin_unlock_irqrestore(&cfg_lock, fl);
+    if (!kv) return;
+    for (int i = 0; i < k; i++) fn(kv[2*i], kv[2*i+1], ctx);
+    kfree(kv);
 }
 
 void config_dump(void) {
+    size_t len = 0;
+    char* text = snapshot_text(2, &len);
     int n = 0;
-    for (struct entry* e = head; e; e = e->next) n++;
+    for (size_t i = 0; text && i < len; i++) if (text[i] == '\n') n++;
     kprintf("config (%d entries):\n", n);
-    for (struct entry* e = head; e; e = e->next) {
-        kprintf("  %s = %s\n", e->key, e->value);
-    }
+    if (text) { kprintf("%s", text); kfree(text); }
 }
 
 /* --- §M70 shell registrations ---------------------------------------------
@@ -611,30 +708,50 @@ int config_user_detach(void) {
      * §M82: this used to reset EVERY user-scoped key to its compiled default,
      * which threw away the administrator's machine-wide choice on every
      * sign-out and touched keys the user had never changed. */
+    /* Changed under cfg_lock, announced after it: a watcher may read config
+     * (or repaint), and neither may run inside a spinlock.  The keys and
+     * values handed to the watchers were RETIRED, so they stay readable. */
+    #define DETACH_MAX 128
+    const char* nkey[DETACH_MAX];
+    const char* nval[DETACH_MAX];
+    int         nunset[DETACH_MAX];
+    void*       tofree[3 * DETACH_MAX];
+    int nn = 0, nf = 0;
     int restored = 0;
+    uint32_t fl = spin_lock_irqsave(&cfg_lock);
     struct entry** pp = &head;
     while (*pp) {
         struct entry* e = *pp;
         if (!e->user_set) { pp = &e->next; continue; }
         restored++;
         if (e->has_machine) {
-            kfree(e->value);
+            void* x = retire_locked(e->value);
+            if (x && nf < 3 * DETACH_MAX) tofree[nf++] = x;
             e->value = e->machine;
             e->machine = NULL;
             e->user_set = 0;
             e->has_machine = 0;
-            klog(KLOG_INFO, "config", "%s = %s (machine value, user withdrawn)\n",
-                 e->key, e->value);
-            config_notify(e->key, e->value);
+            if (nn < DETACH_MAX) { nkey[nn] = e->key; nval[nn] = e->value; nunset[nn] = 0; nn++; }
             pp = &e->next;
         } else {
             *pp = e->next;
             const struct config_key_def* d = config_key_find(e->key);
-            const char* def = (d && d->def) ? d->def : "";
-            klog(KLOG_INFO, "config", "%s unset (user withdrawn)\n", e->key);
-            config_notify(e->key, def);
-            kfree(e->key); kfree(e->value); kfree(e);
+            if (nn < DETACH_MAX) {
+                nkey[nn] = e->key; nval[nn] = (d && d->def) ? d->def : ""; nunset[nn] = 1; nn++;
+            }
+            void* x;
+            if ((x = retire_locked(e->key))   && nf < 3 * DETACH_MAX) tofree[nf++] = x;
+            if ((x = retire_locked(e->value)) && nf < 3 * DETACH_MAX) tofree[nf++] = x;
+            if ((x = retire_locked(e))        && nf < 3 * DETACH_MAX) tofree[nf++] = x;
         }
+    }
+    spin_unlock_irqrestore(&cfg_lock, fl);
+    for (int i = 0; i < nf; i++) kfree(tofree[i]);
+    for (int i = 0; i < nn; i++) {
+        if (nunset[i]) klog(KLOG_INFO, "config", "%s unset (user withdrawn)\n", nkey[i]);
+        else klog(KLOG_INFO, "config", "%s = %s (machine value, user withdrawn)\n",
+                  nkey[i], nval[i]);
+        config_notify(nkey[i], nval[i]);
     }
     kprintf("config: preferences for uid %d withdrawn (%d key(s))\n", uid, restored);
     return 0;
@@ -646,15 +763,10 @@ int config_user_save(void) {
     if (!f) return -1;
     const char* hdr = "# d-os per-user preferences — managed by config.c\n";
     vfs_write(f, hdr, strlen_(hdr));
-    for (struct entry* e = head; e; e = e->next) {
-        /* Only what THIS user chose (§M82) — not a snapshot of every
-         * user-scoped key the cache happens to hold. */
-        if (!e->user_set) continue;
-        vfs_write(f, e->key, strlen_(e->key));
-        vfs_write(f, " = ", 3);
-        vfs_write(f, e->value, strlen_(e->value));
-        vfs_write(f, "\n", 1);
-    }
+    /* Only what THIS user chose (§M82). */
+    size_t len = 0;
+    char* text = snapshot_text(1, &len);
+    if (text) { vfs_write(f, text, len); kfree(text); }
     vfs_close(f);
     return 0;
 }

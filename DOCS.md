@@ -13577,6 +13577,28 @@ function had not.)  Also in the kmutex: it decided "may I sleep?" while holding
 the waitq's spinlock, which counts as preemption-off, so every waiter SPUN —
 now decided before the lock.
 
+**Two more shared stores that were unlocked, found while hunting the next
+crash:**
+
+- **the config store** — read every frame by the compositor and by every app,
+  written from panels, shells and session switches.  `config_set` freed the old
+  value while a reader still held the string `config_get` had returned, and the
+  list was spliced at its head, and at sign-out, under concurrent traversal.
+  **`confstorm` (hidden) measured it: 4 tasks × 2000 set/get pairs on the old
+  store gave ~4000 wrong read-backs out of 8000, 3 runs in 3** — concurrent head
+  inserts losing whole entries, i.e. a setting somebody had just saved silently
+  gone.  Now a spinlock over every walk and splice, with old values and removed
+  entries RETIRED into a 256-slot ring and freed only when it comes round (a
+  reader would have to hold a returned pointer across 256 changes to see it go);
+  file writes work from a snapshot and watchers run after the lock is dropped.
+  0 wrong read-backs, 2 runs in 2.
+- **the glyph cache** — `get_glyph` handed out an entry after dropping its lock
+  and the caller blitted from `bm`/`w`/`h` unlocked, while another task's
+  eviction could free the bitmap or give the slot to a different glyph.  The
+  desktop, the compositor and every app-host draw text concurrently.  Entries now
+  carry a use count; an entry being blitted is never evicted, and a cache full
+  of in-use entries goes over budget rather than spinning.
+
 **Measured after:** `diskstorm 8 50` at `-smp 4`, 5/5 runs: 400 rounds each,
 0 wrong read-backs, `fsck` clean, no kmutex report, 6.4–11.8 s.  Before the
 locking, `diskstorm 4 20` took 23 s and corrupted another file on the volume.

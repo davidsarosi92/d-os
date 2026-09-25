@@ -1218,3 +1218,69 @@ static void t_diskstorm(const char* a) {
 }
 SHELL_CMD(diskstorm) = { "diskstorm", "[tasks 1-8] [rounds]", "concurrent file I/O on /mnt, verified",
                          SHELL_G_TEST, t_diskstorm, SHELL_P_ADMIN };
+
+/* ---------------------------------------------------------------------------
+ * `confstorm [tasks] [iterations]` — the config store under concurrency.
+ *
+ * The store was unlocked (2026-09-25), and its readers are everywhere — the
+ * compositor asks it something every frame.  Each worker writes its OWN key
+ * with a value unique to (worker, iteration) and reads it back through
+ * config_get; every worker also writes one SHARED key and creates a fresh key
+ * per iteration, so the list is spliced at the head while others walk it.  A
+ * read-back that differs is a lost or torn update; a crash is the list.
+ * ------------------------------------------------------------------------- */
+static volatile int cs_done, cs_bad;
+static int cs_iters = 2000;
+static void cs_worker(void) {
+    int w = (int)(uintptr_t)task_start_arg();
+    char key[24] = "test.cs.w0", val[24], fresh[32];
+    key[9] = (char)('0' + w);
+    for (int i = 0; i < cs_iters; i++) {
+        int n = 0, v = i * 8 + w;
+        char tmp[12]; int t = 0;
+        do { tmp[t++] = (char)('0' + v % 10); v /= 10; } while (v);
+        while (t) val[n++] = tmp[--t];
+        val[n] = 0;
+        config_set(key, val);
+        config_set("test.cs.shared", val);
+        const char* got = config_get(key, "");
+        int same = 1;
+        for (int k = 0; ; k++) { if (got[k] != val[k]) { same = 0; break; } if (!val[k]) break; }
+        if (!same) __atomic_add_fetch(&cs_bad, 1, __ATOMIC_RELAXED);
+        (void)config_get_long("test.cs.shared", 0);
+        if ((i & 63) == 0) {
+            int f = 0; const char* pfx = "test.cs.fresh.";
+            for (; pfx[f]; f++) fresh[f] = pfx[f];
+            fresh[f++] = (char)('0' + w); fresh[f++] = '.';
+            for (int k = 0; val[k] && f < 30; k++) fresh[f++] = val[k];
+            fresh[f] = 0;
+            config_set(fresh, "1");
+        }
+    }
+    __atomic_add_fetch(&cs_done, 1, __ATOMIC_RELEASE);
+}
+static void cs_main(void) {
+    int n = (int)(uintptr_t)task_start_arg();
+    cs_done = cs_bad = 0;
+    uint64_t t0 = timer_ticks_ms();
+    for (int i = 0; i < n; i++) {
+        char nm[16] = "confstorm0"; nm[9] = (char)('0' + i);
+        if (!task_spawn_arg(nm, cs_worker, (void*)(uintptr_t)i)) __atomic_add_fetch(&cs_done, 1, __ATOMIC_RELEASE);
+    }
+    while (__atomic_load_n(&cs_done, __ATOMIC_ACQUIRE) < n && timer_ticks_ms() - t0 < 120000u) task_msleep(20);
+    kprintf("confstorm: %d tasks x %d iterations in %u ms - %d wrong read-back(s), %s: %s\n",
+            n, cs_iters, (unsigned)(timer_ticks_ms() - t0), cs_bad,
+            cs_done < n ? "NOT ALL FINISHED" : "all finished",
+            (cs_bad || cs_done < n) ? "FAIL" : "PASS");
+}
+static void t_confstorm(const char* a) {
+    int n = 4;
+    while (a && *a == ' ') a++;
+    if (a && *a >= '1' && *a <= '8') { n = *a - '0'; a++; }
+    while (a && *a == ' ') a++;
+    if (a && *a >= '0' && *a <= '9') { cs_iters = 0; while (*a >= '0' && *a <= '9') cs_iters = cs_iters * 10 + (*a++ - '0'); }
+    if (cs_iters <= 0) cs_iters = 2000;
+    if (!task_spawn_arg("confstorm", cs_main, (void*)(uintptr_t)n)) kprintf("confstorm: cannot spawn\n");
+}
+SHELL_CMD(confstorm) = { "confstorm", "[tasks 1-8] [iterations]", "the config store under concurrency",
+                         SHELL_G_TEST, t_confstorm, SHELL_P_ADMIN };

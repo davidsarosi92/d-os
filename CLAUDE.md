@@ -46,8 +46,10 @@ volume.  New `kmutex`; virtio-blk serialised and interrupt-driven (no more
 busy-wait); block cache, exFAT volume and VFS namespace locked; `ktimer_cancel`
 now waits for a running callback (every on-stack timer had a use-after-return);
 and **`task_current()` could return ANOTHER task** (CPU id and `current` read
-non-atomically) — fixed.  **OPEN:** an intermittent x86_64 NMI after many session
-switches (NEXT.md #2b).
+non-atomically) — fixed.  The config store and the glyph cache
+were unlocked too (`confstorm`: ~4000 of 8000 read-backs wrong) — fixed; an
+intermittent x86_64 NMI after many session switches is probably that (NEXT.md
+#2b, watched by a per-switch `!! KSTACK` check).
 
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there

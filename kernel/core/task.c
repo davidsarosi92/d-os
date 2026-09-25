@@ -99,6 +99,32 @@
 
 extern void context_switch(uintptr_t* save_esp_to, uintptr_t new_esp);
 
+/* A TASK MUST BE ON ITS OWN STACK (2026-09-25).  An intermittent x86_64 NMI
+ * left both CPUs executing inside the label font's point table — the signature
+ * of RETURNING through a stack slot that held a pointer into it, i.e. a stack
+ * two tasks were using at once, or one that overflowed into a neighbour.  So
+ * every switch checks that the task being left is running inside its own
+ * kernel stack and that the task being entered will resume inside its own.
+ * Reported once per kind, lock-free, with names — cheap, and the first
+ * occurrence names the culprit instead of an NMI much later.  Tasks with no
+ * heap stack (the boot task, idle) are not checked. */
+static void kstack_check(struct task* t, uintptr_t sp, const char* when) {
+    static int told;
+    if (!t || !t->kstack_base || told >= 4) return;
+    uintptr_t lo = (uintptr_t)t->kstack_base, hi = lo + TASK_KSTACK_SZ;
+    if (sp >= lo + 64 && sp < hi) return;
+    told++;
+    extern void serial_write(const char*);
+    extern void spin_report_where(void);
+    serial_write("\n!! KSTACK: task '");
+    serial_write(t->name);
+    serial_write(sp < lo && sp >= lo - 4096 ? "' OVERFLOWED its kernel stack ("
+                                            : "' is not on its own kernel stack (");
+    serial_write(when);
+    serial_write(")\n");
+    spin_report_where();
+}
+
 /* ------------------------------------------------------------------- */
 /* Master list state.                                                   */
 /* ------------------------------------------------------------------- */
@@ -1453,6 +1479,8 @@ static void schedule_locked(struct percpu* me) {
     hal_fpu_save(prev->fpu_state);
     hal_fpu_restore(next->fpu_state);
     vmm_space_switch(next->mm);
+    kstack_check(prev, (uintptr_t)__builtin_frame_address(0), "leaving");
+    kstack_check(next, next->esp, "entering");
     context_switch(&prev->esp, next->esp);
     /* Resumes here when `prev` is scheduled back in by SOME CPU. */
 

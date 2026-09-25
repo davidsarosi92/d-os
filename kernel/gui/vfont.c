@@ -41,6 +41,13 @@ struct centry {
     int16_t  w, h, bx, by;   /* bitmap size and its offset from the pen        */
     uint8_t* bm;
     uint32_t stamp;          /* for eviction; see pick_victim                  */
+    /* Tasks blitting from this entry right now (2026-09-25).  get_glyph hands
+     * the entry out AFTER dropping the lock, and the caller reads `bm`, `w`
+     * and `h` without it — so another task's eviction could free the bitmap,
+     * or hand the slot to a different glyph, mid-blit.  The desktop, the
+     * compositor and every app-host draw text concurrently.  An entry with
+     * users is never evicted; vfont_draw drops its use after the blit. */
+    uint16_t users;
 };
 
 static struct centry cache[CACHE_SLOTS];
@@ -197,20 +204,28 @@ static unsigned slot_of(const struct vfont* f, unsigned gid, unsigned px) {
  * list: the list would need updating on every HIT, which is the one path that
  * must stay cheap, and at this scale the difference between "least recently
  * used" and "old" is not worth a pointer per entry. */
-static void evict_one_locked(void) {
+static int evict_one_locked(void) {
     unsigned best = CACHE_SLOTS;
     uint32_t oldest = 0xFFFFFFFFu;
     for (unsigned i = 0; i < CACHE_SLOTS; i++) {
-        if (!cache[i].bm) continue;
+        if (!cache[i].bm || cache[i].users) continue;
         if (cache[i].stamp < oldest) { oldest = cache[i].stamp; best = i; }
     }
-    if (best == CACHE_SLOTS) return;
+    if (best == CACHE_SLOTS) return 0;          /* everything is in use */
     cache_bytes -= (unsigned)(cache[best].w * cache[best].h);
     kfree(cache[best].bm);
     cache[best].bm = NULL;
     cache[best].f = NULL;
     cache_n--;
     cache_evict++;
+    return 1;
+}
+
+static void glyph_put(struct centry* e) {
+    if (!e) return;
+    spin_lock(&cache_lock);
+    if (e->users) e->users--;
+    spin_unlock(&cache_lock);
 }
 
 /* Find or build the cached bitmap for one glyph.  The rasterisation happens
@@ -226,6 +241,7 @@ static struct centry* get_glyph(const struct vfont* f, unsigned gid, int px) {
         if (!e->f) break;                        /* empty: definitely absent */
         if (e->f == f && e->gid == gid && e->px == px) {
             e->stamp = ++cache_clock;
+            e->users++;
             cache_hit++;
             spin_unlock(&cache_lock);
             return e;
@@ -244,14 +260,17 @@ static struct centry* get_glyph(const struct vfont* f, unsigned gid, int px) {
     for (unsigned i = 0; i < CACHE_SLOTS; i++) {
         struct centry* e = &cache[(start + i) & (CACHE_SLOTS - 1)];
         if (e->f == f && e->gid == gid && e->px == px) {
+            e->users++;
             spin_unlock(&cache_lock);
             if (bm) kfree(bm);
             return e;
         }
         if (e->f) continue;
 
-        while (bm && cache_bytes + (unsigned)(w * h) > CACHE_BYTES)
-            evict_one_locked();
+        /* Over budget with every candidate in use: go over rather than spin —
+         * the entries being blitted will be evictable a moment from now. */
+        while (bm && cache_bytes + (unsigned)(w * h) > CACHE_BYTES &&
+               evict_one_locked()) { }
 
         e->f = f;
         e->gid = (uint16_t)gid;
@@ -260,6 +279,7 @@ static struct centry* get_glyph(const struct vfont* f, unsigned gid, int px) {
         e->bx = (int16_t)bx; e->by = (int16_t)by;
         e->bm = bm;
         e->stamp = ++cache_clock;
+        e->users = 1;
         cache_n++;
         if (bm) cache_bytes += (unsigned)(w * h);
         spin_unlock(&cache_lock);
@@ -370,6 +390,7 @@ int vfont_draw(struct gfx_surface* dst, const struct vfont* f, int px,
         unsigned gid = gid_of(f, *p);
         struct centry* e = get_glyph(f, gid, px);
         blit_glyph(dst, e, pen, y, colour);
+        glyph_put(e);
         pen += advance_px(f, gid, px);
     }
     return pen - x;
