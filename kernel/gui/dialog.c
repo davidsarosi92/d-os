@@ -44,6 +44,7 @@
  * ========================================================================= */
 
 #include "gui.h"
+#include "locale.h"
 #include "gui_app.h"
 #include "dialog.h"
 #include "shellcmd.h"   /* §M70 — the commands register themselves */
@@ -195,7 +196,7 @@ static void dlg_closed(struct gui_window* win) {
      * exit routes produced this answer" is unanswerable from a screenshot;
      * without the line, a client that never acts on OK and a dialog that
      * reported CANCEL look exactly alike. */
-    kprintf("dialog: '%s' answered %s%s\n", dlg.title,
+    kprintf("dialog: '%s' answered %s%s\n", lstr(dlg.title),
             answer == GUI_DIALOG_OK ? "OK" : "CANCEL",
             cb ? "" : " (no client listening)");
     if (cb) cb(answer, ctx);
@@ -339,7 +340,15 @@ int gui_dialog_open(const struct gui_dialog_req* req) {
      * Explicit '\n' still forces a break. */
     {
         const int avail = cp_px(400) - 2 * cp_px(20);
-        const char* p = req->body ? req->body : "";
+        /* WRAP THE TEXT THAT WILL BE DRAWN (2026-09-25).  The body may be a
+         * catalogue KEY — every caller that follows the store-the-key rule
+         * passes one — and a key has no spaces, so wrapping the key found no
+         * break at all and the translated sentence ran off the panel's edge
+         * (seen first on the settings panel's "save on close?" question).
+         * The lines are the resolved text: a language change while a dialog
+         * is up does not re-wrap it, which is the price of wrapping at all
+         * and harmless for something answered in seconds. */
+        const char* p = req->body ? lstr(req->body) : "";
         while (*p && dlg.nlines < DLG_MAX_LINES) {
             char* out = dlg.body[dlg.nlines];
             int i = 0, last_space = -1;

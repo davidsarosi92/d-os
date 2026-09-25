@@ -13657,6 +13657,23 @@ contract: asked to close, force-killed after `gui.close_grace_ms`.  Only the
 Editor has a guard so far.
 
 
+
+**Settings panels ask too (2026-09-25).**  Since Save became the commit point
+(§M69), a settings panel can hold edits the machine has not seen — and every
+close route threw them away silently.  A panel with pending edits now has a
+close guard: *"These settings have not been applied yet — save them?"* with
+**Save / Discard**.  The default is the OPPOSITE of the Editor's, on purpose:
+an Editor's unsaved text is work, so dismissing keeps editing; a panel's pending
+setting has not been applied, so discarding leaves the machine exactly as it
+was — the outcome that does nothing, which is the dialog's rule for an
+unanswered question.  The answer is handed over through the Editor's
+two-reference ticket and acted on the panel's own host.  Two defects fixed on
+the way: the panel's state (`struct genpanel`) was never freed on close, and
+**the dialog wrapped the catalogue KEY rather than the text it draws** — a key
+has no spaces, so a translated body ran off the panel's edge.  Falsifier
+`logouttest settings`: unanswered → `DISCARDED` (value unchanged, window closed
+at the 3 s grace); Enter → `SAVED` (value applied, closed after 1.2 s).
+
 ### 4.93 Storage under concurrency — the stack that had no locks
 
 Started as "virtio-blk busy-waits every request" (NEXT.md defect #2) and turned

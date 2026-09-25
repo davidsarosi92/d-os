@@ -36,6 +36,7 @@
 #include "locale.h"
 #include "ui.h"           /* §M65 — the panel is built from specs now */
 #include "kmalloc.h"
+#include "dialog.h"
 #include "printf.h"
 #include "klog.h"
 #include <stddef.h>
@@ -167,7 +168,37 @@ struct genpanel {
     char  pending[GP_MAX_KEYS][64];
     int   dirty[GP_MAX_KEYS];
     int   ndirty;
+    struct gp_ticket* ticket;           /* a "save these settings?" in flight */
+    /* `logouttest settings` only: a pending edit injected once the controls
+     * exist (see settings_open_test_pending). */
+    const char* test_key;
+    const char* test_value;
 };
+
+/* CLOSING WITH UNSAVED SETTINGS (2026-09-25, NEXT.md #1's leftover).
+ *
+ * Since Save became the commit point, a panel can hold edits the machine has
+ * not seen yet — and a sign-out, a shutdown or the X button used to throw them
+ * away without a word.  The close guard asks.  The same TWO-REFERENCE TICKET
+ * as the Editor's: the answer arrives on the DIALOG's host, possibly after
+ * this window was closed by a session end that stopped waiting, so it is
+ * handed over as data and acted on here, on the panel's own host.
+ *
+ * THE DEFAULT IS "DISCARD", deliberately the opposite of the Editor's "keep
+ * editing": a pending setting has not been applied, so dropping it leaves the
+ * machine exactly as it was — the outcome that does nothing, which is what an
+ * unanswered or dismissed dialog must produce (the dialog's own rule).  An
+ * Editor's unsaved text is WORK; a panel's unsaved setting is a question the
+ * user had not finished asking. */
+struct gp_ticket {
+    volatile int answer;                 /* -1 = not yet; else GUI_DIALOG_*   */
+    volatile int refs;
+    struct gui_window* win;
+    uint32_t           serial;
+};
+static void gp_ticket_put(struct gp_ticket* t) {
+    if (t && __atomic_sub_fetch(&t->refs, 1, __ATOMIC_ACQ_REL) == 0) kfree(t);
+}
 
 /* Ids: rows get 100+i for their control, so an event names its key by
  * arithmetic instead of a lookup table that could drift from the build. */
@@ -242,6 +273,10 @@ static int gp_atoi(const char* s) {
     return neg ? -v : v;
 }
 
+static void gp_save(struct genpanel* g);
+static void gp_edit(struct genpanel* g, struct gui_window* win, int id, int type,
+                    int value);
+
 /* ONE event sink for the whole window: (id, type, value).  This is the shape
  * that can cross a process boundary later — a per-widget callback pointer
  * cannot — and it is why the toolkit was built this way. */
@@ -251,6 +286,15 @@ static void gp_event(struct gui_window* win, int id, int type, int value,
     (void)win;
 
     if (id == GP_ID_SAVE && type == UI_EV_CLICK) {
+        gp_save(g);
+        return;
+    }
+    gp_edit(g, win, id, type, value);
+}
+
+/* Save: apply every pending edit, then persist. */
+static void gp_save(struct genpanel* g) {
+    {
         /* APPLY, THEN PERSIST — in that order and both here.  `config_apply`
          * is what notifies the subsystem that read the key at boot (§M63's
          * watchers), so applying is what makes the change take effect; saving
@@ -270,9 +314,12 @@ static void gp_event(struct gui_window* win, int id, int type, int value,
         else if (!p)                 gp_status(g, "set.applied_ram");
         else if (had)                gp_status(g, "set.applied");
         else                         gp_status(g, "set.nochange");
-        return;
     }
+}
 
+/* A control moved: record its text as a pending edit. */
+static void gp_edit(struct genpanel* g, struct gui_window* win, int id, int type,
+                    int value) {
     int i = id - 100;
     if (i < 0 || i >= g->n) return;
     const struct config_key_def* d = config_key_at(g->key_idx[i]);
@@ -307,10 +354,70 @@ static void gp_event(struct gui_window* win, int id, int type, int value,
                                : "set.unsaved_1");
 }
 
+static void gp_close_answer(int answer, void* ctx) {
+    struct gp_ticket* t = (struct gp_ticket*)ctx;
+    t->answer = answer;
+    if (gui_window_alive(t->win, t->serial)) gui_window_request_layout(t->win);
+    gp_ticket_put(t);
+}
+
+static int gp_close_guard(struct gui_window* win, int reason) {
+    struct genpanel* g = (struct genpanel*)gui_window_ctx(win);
+    if (!g || g->ndirty == 0) return 1;
+    if (g->ticket) return 0;                     /* already asking */
+    struct gp_ticket* t = (struct gp_ticket*)kcalloc(1, sizeof *t);
+    if (!t) return 1;                            /* cannot ask: discard (safe) */
+    t->answer = -1; t->refs = 2; t->win = win; t->serial = gui_window_serial(win);
+    struct gui_dialog_req req = {
+        .title = "set.close_title",
+        .body  = reason == GUI_CLOSE_SESSION ? "set.close_body_session"
+                                             : "set.close_body",
+        .info  = g->group,
+        .ok_text = "btn.save", .cancel_text = "btn.discard",
+        .on_answer = gp_close_answer, .ctx = t,
+    };
+    if (gui_dialog_open(&req) != 0) { kfree(t); return 1; }
+    g->ticket = t;
+    kprintf("settings: %d unsaved change(s) in '%s' - asking before closing\n",
+            g->ndirty, g->group);
+    return 0;
+}
+
+/* On the panel's own host (from its layout hook): act on a delivered answer. */
+static void gp_take_close_answer(struct genpanel* g) {
+    struct gp_ticket* t = g->ticket;
+    if (!t || t->answer < 0) return;
+    int answer = t->answer;
+    g->ticket = NULL;
+    gp_ticket_put(t);
+    if (answer == GUI_DIALOG_OK) {
+        gp_save(g);
+        kprintf("settings: '%s' saved on close\n", g->group);
+    } else {
+        for (int k = 0; k < g->n; k++) g->dirty[k] = 0;
+        g->ndirty = 0;
+        kprintf("settings: '%s' - pending change(s) discarded on close\n", g->group);
+    }
+    gui_window_close_now(g->win);
+}
+
+/* Every close route ends here — the guard's, a session end that stopped
+ * waiting, a killed host.  The panel owns `g`, and nothing else frees it. */
+static void gp_on_close(struct gui_window* win) {
+    struct genpanel* g = (struct genpanel*)gui_window_ctx(win);
+    if (!g) return;
+    if (g->ticket) { gp_ticket_put(g->ticket); g->ticket = NULL; }
+    if (g->ndirty)
+        kprintf("settings: '%s' closed with %d unsaved change(s) - discarded, the "
+                "machine was not changed\n", g->group, g->ndirty);
+    kfree(g);
+}
+
 static void gp_layout(struct gui_window* win) {
     struct genpanel* g = (struct genpanel*)gui_window_ctx(win);
     if (!g) return;
     g->win = win;
+    gp_take_close_answer(g);
 
     /* on_layout fires on every resize.  The controls already exist by then —
      * re-running the build would add a second set of them (see ui.h) — so a
@@ -428,6 +535,26 @@ static void gp_layout(struct gui_window* win) {
     ui_build(win, sp, k, gp_event, g);
     kfree(sp);
 
+    if (g->test_key) {                   /* logouttest settings, see below */
+        for (int j = 0; j < g->n; j++) {
+            const struct config_key_def* dj = config_key_at(g->key_idx[j]);
+            if (!dj || !dj->key) continue;
+            const char* a = dj->key; const char* b = g->test_key;
+            while (*a && *a == *b) { a++; b++; }
+            if (*a || *b) continue;
+            int m = 0;
+            while (g->test_value[m] && m < (int)sizeof g->pending[0] - 1) {
+                g->pending[j][m] = g->test_value[m]; m++;
+            }
+            g->pending[j][m] = 0;
+            g->dirty[j] = 1; g->ndirty = 1;
+            gp_status(g, "set.unsaved_1");
+            kprintf("settings: test - pending %s=%s (not applied)\n",
+                    g->test_key, g->test_value);
+        }
+        g->test_key = NULL;
+    }
+
     /* `gui.ui_dump` — the layout, on the serial line, at the moment it is built.
      *
      * THE HARNESS CANNOT TYPE ONCE A GUI WINDOW HAS FOCUS (§M64), so `ui dump`
@@ -483,12 +610,37 @@ static void generic_panel_open(const char* group) {
     /* Taller than the old panel because the controls are real now: a radio
      * group is one row per option, not one line of text.  Height that a
      * SCROLLING container should own — see the open item in DOCS §4.78. */
-    if (!gui_app_open(&(struct gui_app_spec){
+    struct gui_window* win = gui_app_open(&(struct gui_app_spec){
             .title = group,
             .content_w = cp_px(560), .content_h = cp_px(360),  /* it scrolls */
             .layout = gp_layout, .ctx = g,
-        }))
-        kfree(g);
+            .on_close = gp_on_close,
+        });
+    if (!win) { kfree(g); return; }
+    gui_window_set_close_guard(win, gp_close_guard);
+}
+
+/* `logouttest settings` — a panel holding one pending, unapplied edit to
+ * `gui.scroll_lines`.  The value that would be written is published so the
+ * test can tell "saved", "discarded" and "applied without Save" apart. */
+const char* settings_test_value;
+void settings_open_test_pending(void) {
+    const struct config_key_def* d = config_key_find("gui.scroll_lines");
+    if (!d) return;
+    settings_test_value = config_get_long("gui.scroll_lines", 3) == 7 ? "5" : "7";
+    struct genpanel* g = (struct genpanel*)kcalloc(1, sizeof *g);
+    if (!g) return;
+    g->group = d->group;
+    g->test_key = d->key;
+    g->test_value = settings_test_value;
+    struct gui_window* win = gui_app_open(&(struct gui_app_spec){
+            .title = d->group,
+            .content_w = cp_px(560), .content_h = cp_px(360),
+            .layout = gp_layout, .ctx = g,
+            .on_close = gp_on_close,
+        });
+    if (!win) { kfree(g); return; }
+    gui_window_set_close_guard(win, gp_close_guard);
 }
 
 /* `conf open` below hands the index over through a static because

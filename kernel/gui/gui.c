@@ -2217,7 +2217,36 @@ static void logouttest_power(int via_menu) {
     else          system_power_off();
 }
 
+/* `logouttest settings`: a settings panel with one pending, UNAPPLIED edit,
+ * then Sign out with a 3 s grace.  Nobody answers -> the edit is discarded and
+ * the running value is unchanged; Enter answered Save -> the value is the new
+ * one.  The one outcome that must never happen is the third: applied although
+ * nobody said Save (or lost although somebody did). */
+extern void settings_open_test_pending(void);
+extern const char* settings_test_value;
+static void logouttest_settings(void) {
+    config_set("gui.logout_grace_ms", "3000");
+    long before = config_get_long("gui.scroll_lines", 3);
+    gui_queue_open(settings_open_test_pending);
+    task_msleep(1500);
+    uint64_t t0 = timer_ticks_ms();
+    gui_session_restart_as(NULL);
+    for (int i = 0; i < 500 && !teardown_busy; i++) task_msleep(10);
+    for (int i = 0; i < 3000 && teardown_busy; i++) task_msleep(10);
+    config_set("gui.logout_grace_ms", "15000");
+    long after = config_get_long("gui.scroll_lines", 3);
+    long want = settings_test_value ? (long)(settings_test_value[0] - '0') : -1;
+    unsigned wc = (unsigned)(te_windows_ms - t0);
+    const char* what = after == want && wc < 3000   ? "SAVED by the user's answer"
+                     : after == before && wc >= 3000 ? "DISCARDED after nobody answered"
+                     : "INCONSISTENT";
+    kprintf("logouttest settings: gui.scroll_lines %d -> %d (pending %d), windows "
+            "closed after %u ms - %s\n", (int)before, (int)after, (int)want, wc, what);
+    kprintf("logouttest settings: %s\n", what[0] == 'I' ? "FAIL" : "PASS");
+}
+
 static void logouttest_main(void) {
+    if (lt_editor_mode == 4) { logouttest_settings(); return; }
     if (lt_editor_mode == 2) { logouttest_power(0); return; }
     if (lt_editor_mode == 3) { logouttest_power(1); return; }
     if (lt_editor_mode) { logouttest_editor(); return; }
@@ -2268,12 +2297,13 @@ static void logouttest_main(void) {
 }
 static void cmd_logouttest(const char* a) {
     while (a && *a == ' ') a++;
-    lt_editor_mode = !a || !a[0] ? 0 : a[0] == 'e' ? 1 : a[0] == 'p' ? 2 : a[0] == 'm' ? 3 : 0;
+    lt_editor_mode = !a || !a[0] ? 0 : a[0] == 'e' ? 1 : a[0] == 'p' ? 2 : a[0] == 'm' ? 3
+                   : a[0] == 's' ? 4 : 0;
     if (!gui_active) { kprintf("logouttest: the GUI is not running\n"); return; }
     if (!task_spawn_detached("logouttest", logouttest_main))
         kprintf("logouttest: cannot spawn\n");
 }
-SHELL_CMD(logouttest) = { "logouttest", "[editor|power|menu]", 0, SHELL_G_TEST, cmd_logouttest, SHELL_P_ADMIN };
+SHELL_CMD(logouttest) = { "logouttest", "[editor|power|menu|settings]", 0, SHELL_G_TEST, cmd_logouttest, SHELL_P_ADMIN };
 
 static void gui_stop_main(void) {
     gui_teardown();
