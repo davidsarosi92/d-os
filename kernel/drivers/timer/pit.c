@@ -37,6 +37,7 @@
 #include "task.h"
 #include "usb.h"
 #include "printf.h"
+#include "lock.h"
 #include <stdint.h>
 
 #define PIT_CH0   0x40
@@ -53,15 +54,96 @@
 /* `volatile`: the IRQ writes, consumer code reads on the main thread.
  * Without volatile the compiler is allowed to cache the value across
  * the busy-wait loop of `timer_msleep`. */
-static volatile uint64_t ticks_ms = 0;
+static volatile uint64_t ticks_ms = 0;     /* PIT INTERRUPTS delivered — see below */
 
-uint64_t timer_ticks_ms(void) {
-    return ticks_ms;
+/* ---------------------------------------------------------------------------
+ * THE MILLISECOND CLOCK COMES FROM A COUNTER, NOT FROM COUNTING INTERRUPTS.
+ *
+ * `ticks_ms` counts PIT interrupts, and an interrupt count is not a clock: an
+ * interrupt that is late, coalesced by the emulator or held off by a
+ * higher-priority one is simply never counted.  Measured on QEMU/TCG with the
+ * guest's own `uptime` against the host's wall clock: 16.35 s of guest time for
+ * 20.4 s of real time — the clock ran at 80 %.  Everything downstream inherited
+ * it: every sleep and timeout 25 % long, `rec` reporting a correct capture as
+ * "faster than real time" (803 ms for 1000), and both boot calibrations, which
+ * measure against this clock, off by the same 1/0.8 — the LAPIC timer at 80 Hz
+ * for a 100 Hz target (78362 ticks/ms measured against 62500 real), the TSC at
+ * anything from 1.26 to 17.8 GHz from one boot to the next.  aarch64 never had
+ * the problem because it reads CNTPCT, a counter.  (§M82 session, 2026-09-25.)
+ *
+ * So once ACPI names the PM timer — a free-running 3.579545 MHz counter every
+ * PIIX4/ICH chipset has, and QEMU's too — the ms clock is DERIVED from it and the
+ * interrupt only drives the scheduler.  The switch is continuous (it resumes
+ * from the value the interrupt count had reached, so nothing sees time go
+ * backwards), and without a PM timer nothing changes.
+ *
+ * The 24-bit counter wraps every 4.69 s, so it is EXTENDED to 64 bits on every
+ * read: any caller may update the extension, under a TRYLOCK, and one that
+ * finds it busy (a nested interrupt, an NMI) reads the published value through a
+ * sequence count instead — bounded, never blocking, never a deadlock in a path
+ * that cannot wait.  Every tick reads it, so a wrap cannot be missed while the
+ * machine runs at all. */
+#define PM_TIMER_HZ 3579545ull
+static volatile uint16_t pm_port;           /* 0 = no PM timer: count interrupts */
+static uint32_t          pm_mask;
+static spinlock_t        pm_lock = SPINLOCK_INIT;
+static volatile uint32_t pm_seq;
+static volatile uint32_t pm_last_raw;
+static volatile uint64_t pm_acc;            /* extended counter, PM ticks        */
+static uint64_t          pm_acc0, pm_ms0;   /* the continuity offset at switch   */
+
+static uint64_t pm_ms_from(uint64_t acc) {
+    return pm_ms0 + ((acc - pm_acc0) * 1000ull) / PM_TIMER_HZ;
 }
 
+void timer_use_pm_timer(uint16_t port, int bits32) {
+    if (!port || pm_port) return;
+    uint32_t fl = spin_lock_irqsave(&pm_lock);
+    pm_mask     = bits32 ? 0xFFFFFFFFu : 0x00FFFFFFu;
+    pm_last_raw = inl(port) & pm_mask;
+    pm_acc      = 0;
+    pm_acc0     = 0;
+    pm_ms0      = ticks_ms;
+    pm_port     = port;
+    spin_unlock_irqrestore(&pm_lock, fl);
+    kprintf("timer: ms clock now derived from the ACPI PM timer at io %x (%u-bit) "
+            "instead of counting PIT interrupts\n", port, bits32 ? 32u : 24u);
+}
+
+uint64_t timer_ticks_ms(void) {
+    if (!pm_port) return ticks_ms;
+    if (spin_trylock(&pm_lock)) {
+        uint32_t fl = hal_intr_save();
+        __atomic_add_fetch(&pm_seq, 1, __ATOMIC_ACQ_REL);         /* odd: writing */
+        uint32_t raw = inl(pm_port) & pm_mask;
+        pm_acc += (uint32_t)((raw - pm_last_raw) & pm_mask);
+        pm_last_raw = raw;
+        uint64_t acc = pm_acc;
+        __atomic_add_fetch(&pm_seq, 1, __ATOMIC_ACQ_REL);         /* even: stable */
+        hal_intr_restore(fl);
+        spin_unlock(&pm_lock);
+        return pm_ms_from(acc);
+    }
+    /* Busy: read the published pair consistently, plus what has passed since. */
+    for (int tries = 0; tries < 64; tries++) {
+        uint32_t s0 = __atomic_load_n(&pm_seq, __ATOMIC_ACQUIRE);
+        if (s0 & 1) continue;
+        uint64_t acc = pm_acc;
+        uint32_t last = pm_last_raw;
+        if (__atomic_load_n(&pm_seq, __ATOMIC_ACQUIRE) != s0) continue;
+        uint32_t raw = inl(pm_port) & pm_mask;
+        return pm_ms_from(acc + (uint32_t)((raw - last) & pm_mask));
+    }
+    return pm_ms_from(pm_acc);             /* the writer is this CPU, mid-update */
+}
+
+/* The raw INTERRUPT count, for the one thing that must measure delivery rather
+ * than time: the IRQ0 starvation check in idt.c. */
+uint64_t timer_pit_irqs(void) { return ticks_ms; }
+
 void timer_msleep(uint32_t ms) {
-    uint64_t deadline = ticks_ms + ms;
-    while (ticks_ms < deadline) {
+    uint64_t deadline = timer_ticks_ms() + ms;
+    while (timer_ticks_ms() < deadline) {
         /* Atomic enable+halt — sleep until the next interrupt arrives,
          * including our own IRQ0.  Cheap idle for now; could be
          * replaced by `task_yield()` for tighter scheduling. */
@@ -98,6 +180,7 @@ static uint32_t usb_poll_count = 0;
 static void pit_irq(struct int_frame* f) {
     (void)f;
     ticks_ms++;
+    if (pm_port && !(ticks_ms & 255)) (void)timer_ticks_ms();   /* keep the 24-bit extension fresh */
 
     /* §M53 — fire due deadline timers HERE, on the real tick.
      *

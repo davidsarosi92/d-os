@@ -411,10 +411,15 @@ static void pit_starvation_check(void) {
     static uint64_t w_ms[PIT_CHK_CPUS], base[PIT_CHK_CPUS];
     static uint8_t  started[PIT_CHK_CPUS];
     static volatile int in_episode;
-    extern uint64_t timer_ticks_ms(void);
+    extern uint64_t timer_pit_irqs(void);
     int c = this_cpu_id();
     if (c < 0 || c >= PIT_CHK_CPUS) return;
-    uint64_t ms = timer_ticks_ms();
+    /* IRQ0 DELIVERIES, not the ms clock: since the ms clock became a counter
+     * (pit.c), a held-off IRQ0 no longer stops it — which is the point — so
+     * the thing to watch is whether the interrupt is still arriving.  (One
+     * PIT interrupt per nominal millisecond, so the numbers still read as
+     * milliseconds.) */
+    uint64_t ms = timer_pit_irqs();
     if (!started[c]) { started[c] = 1; w_ms[c] = ms; return; }
     n_ticks[c]++;
     if (!win[c]) {                        /* learning this CPU's window */
@@ -435,9 +440,9 @@ static void pit_starvation_check(void) {
     extern void serial_write(const char* s);
     serial_write("\n!! PIT STARVED (seen by cpu ");
     ser_hex64((uint64_t)c);
-    serial_write("): the ms clock advanced ");
+    serial_write("): IRQ0 was delivered ");
     ser_hex64((uint64_t)d);
-    serial_write(" ms in a window that normally takes ");
+    serial_write(" times in a window that normally sees ");
     ser_hex64((uint64_t)base[c]);
     serial_write(" (hex) while this CPU's LAPIC timer kept ticking - an interrupt "
                  "is holding IRQ0 off on the CPU that owns it.  Here: in-service "

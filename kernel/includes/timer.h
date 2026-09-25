@@ -22,6 +22,12 @@
  * up. */
 uint64_t timer_ticks_ms(void);
 
+/* x86: derive the ms clock from the ACPI PM timer from now on (see pit.c).
+ * Called by acpi_init once the FADT names it; a no-op on a second call. */
+void     timer_use_pm_timer(uint16_t port, int bits32);
+/* x86: PIT interrupts delivered — a DELIVERY count, not a clock. */
+uint64_t timer_pit_irqs(void);
+
 /* §M53 — the same clock, in nanoseconds, from whatever source the machine
  * actually has: the ARM system counter, an invariant x86 TSC, or (if neither is
  * usable) the millisecond tick scaled up.  Callers never learn which.

@@ -36,6 +36,7 @@
  * =========================================================================== */
 
 #include "acpi.h"
+#include "timer.h"   /* timer_use_pm_timer */
 #include "hal.h"
 #include "printf.h"
 #include "vmm.h"        /* §1.1/freeze — map ACPI tables that sit above the
@@ -608,6 +609,26 @@ int acpi_init(void) {
      * in practice; cast explicitly to avoid a warning later. */
     g_pm1a_cnt = (uint16_t)g_fadt->pm1a_control_block;
     g_pm1b_cnt = (uint16_t)g_fadt->pm1b_control_block;
+
+    /* §M82 session — THE PM TIMER, the clock the kernel should have been using.
+     * PM_TMR_BLK sits at offset 76 of the FADT and FLAGS at 112 (bit 8,
+     * TMR_VAL_EXT: 32 bits instead of 24).  Read by OFFSET against the table's
+     * own length, not through a longer struct: a revision-1 FADT is shorter
+     * than the fields, and a struct would read past its end.  The timer is a
+     * free-running counter, which is exactly what counting PIT interrupts is
+     * not — see pit.c for what that cost. */
+    {
+        const uint8_t* fb = (const uint8_t*)g_fadt;
+        uint32_t len = g_fadt->header.length;
+        uint32_t tmr = len >= 80 ? *(const uint32_t*)(fb + 76) : 0;
+        uint8_t  tlen = len >= 92 ? fb[91] : 0;
+        uint32_t flags = len >= 116 ? *(const uint32_t*)(fb + 112) : 0;
+        if (tmr && tmr <= 0xFFFFu && (tlen == 4 || tlen == 0))
+            timer_use_pm_timer((uint16_t)tmr, (flags >> 8) & 1);
+        else
+            kprintf("ACPI: no usable PM timer (blk=%x len=%u) - the ms clock "
+                    "keeps counting PIT interrupts\n", tmr, tlen);
+    }
 
     const struct sdt_header* dsdt = acpi_reach_table(g_fadt->dsdt);
     if (!dsdt || !sig4(dsdt->signature, "DSDT") || !checksum_ok(dsdt, dsdt->length)) {

@@ -6235,6 +6235,44 @@ has a number behind it instead of an intuition.
   emulation on i386).  Linux precomputes a multiply-and-shift; worth doing if a
   caller ever reads the clock in a hot loop.
 
+#### Correction (2026-09-25): the x86 millisecond clock counted interrupts
+
+**It ran at 80 % of real time under QEMU/TCG, and everything measured against
+it inherited that.**  `timer_ticks_ms` was the number of PIT interrupts
+delivered — and an interrupt count is not a clock: an interrupt the emulator
+coalesces, delivers late or that a higher-priority one holds off is simply never
+counted.  Measured with the guest's `uptime` against the host: **16.35 s of
+guest time for ~20.4 s of real time.**  Downstream: every sleep and timeout ~25 %
+long; `rec` flagging a correct AC97 capture as "faster than real time" (803 ms
+for 1000 — the §M23 stage-7 open item, which was never the codec); and both boot
+calibrations, which measure against this clock, off by the same 1/0.8 — the
+LAPIC timer calibrated to **78362 ticks/ms against a real 62500** (so it ran
+~80 Hz for a 100 Hz target) and the TSC anywhere from **1.26 to 17.8 GHz** from
+one boot to the next, which is what `timer_now_ns` then used.  The accuracy
+figures earlier in this section (sleep lateness, `ktimer`) were measured with
+the same instrument and should be read as "self-consistent", not "true".
+aarch64 never had the defect: CNTPCT is a counter.
+
+**Fixed by deriving the clock from a counter:** the ACPI PM timer (a
+free-running 3.579545 MHz counter on every PIIX4/ICH chipset, QEMU's included),
+located from the FADT (`PM_TMR_BLK` at offset 76, `TMR_VAL_EXT` in FLAGS bit 8 —
+read by offset against the table's own length, so a short revision-1 FADT is
+never over-read).  The switch happens in `acpi_init`, continuously from the
+value the interrupt count had reached; the 24-bit counter is extended to 64
+bits on every read under a trylock, with a sequence-counted fallback so a
+nested interrupt or an NMI never blocks.  Without a PM timer nothing changes.
+The PIT interrupt still drives the scheduler, and `timer_pit_irqs()` keeps the
+raw delivery count for the one caller that must measure delivery rather than
+time (the IRQ0 starvation check).  **Measured after:** `uptime` advances 20.62 s
+across a ~20.6 s host wait; the LAPIC calibrates to 62506 ticks/ms; the TSC to
+~1.0 GHz; `rec 2000` takes 2008-2020 ms with no warning, on both x86 arches.
+**And one number got WORSE, which is the correction working:** `ktimer`'s worst
+lateness now reads 2.5-3.3 ms where this section recorded 0.84-0.95 ms — the
+old figure was measured by the clock that ran slow, which shrank every interval
+it measured, lateness included.  Timers still expire only from the PIT
+interrupt, so under emulation the floor is the interrupt's real jitter, not one
+nominal tick.
+
 ---
 
 ### 4.54 A task the scheduler was still standing on (M54)
