@@ -186,6 +186,30 @@ static void hda_irq(struct int_frame* f) {
     uintptr_t sd = h->mmio + HDA_SD_BASE + (uintptr_t)h->out_sd * HDA_SD_STRIDE;
     uint8_t ss = mr8(sd, SD_STS);
     mw8(sd, SD_STS, ss);                             /* RWC: write to clear */
+
+    /* A PLAYED BUFFER IS SILENCED THE MOMENT IT IS PLAYED.
+     *
+     * An HDA stream is cyclic: if nothing stops it, it plays the whole ring
+     * again, and a ring still full of the last sound REPLAYS it every 682.7 ms
+     * for as long as the stall lasts — the §M67 symptom.  The cause found then
+     * was a drain that could not run (the §M82-session interrupt storm starved
+     * the ms clock that `task_msleep` waits on, and the pump task with it: 3 of
+     * 8 runs replayed or split the sound on the old kernel, 0 of 8 on the fixed
+     * one).  That cause is gone; this makes the next one harmless.  Whatever
+     * stalls the driver — a starved task, a lost interrupt, a wedged pump — the
+     * ring now plays SILENCE rather than the sound again, which is how a
+     * stalled audio path should fail.
+     *
+     * Safe here: buffers complete in submission order from the stream reset, so
+     * the one just finished is `completed` modulo the ring, and the pump only
+     * writes a slot when it is `head`, which is ahead of every completed slot
+     * and returns to this one only after a full revolution.  4 KiB of stores
+     * per ~21 ms period. */
+    if (h->pcm && h->completed < h->submitted) {
+        uint32_t slot = h->completed & (HDA_NBUF - 1);
+        int16_t* p = h->pcm + (size_t)slot * HDA_BUF_FRAMES * 2;
+        for (uint32_t i = 0; i < HDA_BUF_FRAMES * 2; i++) p[i] = 0;
+    }
     h->completed++;
     h->irq_seen = 1;
 }

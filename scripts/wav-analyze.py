@@ -35,11 +35,28 @@ def main():
     ap.add_argument("--expect-ms", type=float, default=0.0)
     a = ap.parse_args()
 
-    w = wave.open(a.path, "rb")
-    ch, sw, rate, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+    try:
+        w = wave.open(a.path, "rb")
+        ch, sw, rate, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+        raw = w.readframes(n)
+    except (wave.Error, EOFError):
+        # QEMU writes the RIFF and data LENGTHS only when it shuts the audio
+        # backend down cleanly; a run that ends by `quit` can leave both at 0,
+        # which Python's wave module rejects outright.  The samples are all
+        # there — take the format from the fmt chunk and the rest as data.
+        blob = open(a.path, "rb").read()
+        if blob[:4] != b"RIFF" or blob[8:12] != b"WAVE":
+            sys.exit("not a WAV file")
+        fmt = blob.find(b"fmt ")
+        ch, rate = struct.unpack_from("<HI", blob, fmt + 10)
+        sw = struct.unpack_from("<H", blob, fmt + 22)[0] // 8
+        data = blob.find(b"data", fmt)
+        raw = blob[data + 8:]
+        raw = raw[:len(raw) - len(raw) % (ch * sw)]
+        n = len(raw) // (ch * sw)
+        print("(unfinalised header — lengths taken from the file size)")
     if sw != 2:
         sys.exit("only 16-bit PCM is supported (got %d-byte samples)" % sw)
-    raw = w.readframes(n)
     s = struct.unpack("<%dh" % (len(raw) // 2), raw)
     L = s[0::ch]
     R = s[1::ch] if ch > 1 else L
