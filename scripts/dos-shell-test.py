@@ -172,10 +172,21 @@ class Monitor:
         time.sleep(0.3)
         self._drain()
 
+    # Where monitor REPLIES go.  They used to be read and thrown away, so a
+    # monitor command that failed (a `pmemsave` with a bad argument) failed in
+    # silence and an inspection command (`info registers`) had no way to report
+    # anything.  Set by main() from --log: <log>.mon.
+    reply_log = None
+
     def _drain(self):
         try:
-            while self.sock.recv(65536):
-                pass
+            while True:
+                b = self.sock.recv(65536)
+                if not b:
+                    break
+                if self.reply_log:
+                    with open(self.reply_log, "ab") as f:
+                        f.write(b)
         except (socket.timeout, BlockingIOError, OSError):
             pass
 
@@ -504,6 +515,7 @@ def main():
     ser = None
     try:
         ser = Serial(sersock, log)
+        Monitor.reply_log = log + ".mon"
         mon = Monitor(monsock)
 
         rx = re.compile(a.boot_marker)

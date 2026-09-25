@@ -88,6 +88,7 @@
 #define VRING_DESC_F_NEXT    0x01
 #define VRING_DESC_F_WRITE   0x02      /* device writes to this buffer */
 #define VRING_DESC_F_INDIRECT 0x04
+#define VRING_AVAIL_F_NO_INTERRUPT 0x01   /* "do not interrupt me on completion" */
 
 /* Block request types. */
 #define VIRTIO_BLK_T_IN      0          /* read */
@@ -241,6 +242,25 @@ static int vblk_init_queue(struct virtio_blk* v) {
     v->used  = (struct virtq_used*) (q + 4096 * 2); /* page 2 — matches qsize=256 */
     v->last_used_idx = 0;
 
+    /* WE POLL, SO ASK THE DEVICE NOT TO INTERRUPT.  This driver waits for a
+     * completion by watching the used ring and never installed an interrupt
+     * handler — but it never told the device that, so every completed request
+     * RAISED the PCI line anyway.  On QEMU's PIIX that line is IRQ 10, shared
+     * (PIRQA/PIRQB), LEVEL-triggered, and nobody read this device's ISR
+     * register, which is what lowers it.  The line stayed asserted, and
+     * whichever driver did own vector 42 took an interrupt storm: EOI, re-fire,
+     * forever.  Vector 42 outranks the PIT (32) and the keyboard (33), so both
+     * starved — the millisecond clock stopped (every task_msleep and cron job
+     * with it) and PS/2 bytes overflowed QEMU's queue, which is what "the
+     * harness loses keystrokes after `gui stop`" actually was.  The LAPIC timer
+     * (vector 64) outranks it, so the BSP kept petting the hardware watchdog
+     * and nothing ever said NMI.  Measured with QEMU's `info lapic`: ISR=42,
+     * IRR=32, PPR=0x20; `info pic`: pin 10 Remote IRR set.  (§M82 session.)
+     *
+     * This flag is advisory in the spec — hence the ISR read after every
+     * completion below as well. */
+    v->avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
+
     /* Tell the device where the queue is.  QUEUE_PFN is the page-frame
      * number (phys >> 12). */
     outl(io + VBLK_OFF_QUEUE_PFN, phys >> 12);
@@ -326,6 +346,11 @@ static int vblk_request(struct virtio_blk* v, uint32_t type, uint64_t lba,
         }
     }
     v->last_used_idx = v->used->idx;
+
+    /* Read-to-clear the ISR register, so that even a device which ignores
+     * NO_INTERRUPT drops the shared line instead of leaving it asserted for
+     * whichever driver owns the vector (see the note at the ring setup). */
+    (void)inb(v->io_base + VBLK_OFF_ISR_STATUS);
 
     /* 6. Check status. */
     uint8_t st = *v->req_status;

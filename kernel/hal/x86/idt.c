@@ -70,7 +70,24 @@ static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_ptr   idtr;
 
 /* C-callable handler table for the 16 PIC IRQs (vectors 32..47). */
-static irq_handler_t irq_handlers[16] = { 0 };
+/* A LINE IS SHARED, SO A LINE HOLDS A CHAIN (§M82 session).
+ *
+ * This was one slot per line and a second `irq_install` silently REPLACED the
+ * first.  PCI INTx lines are shared by design — QEMU's PIIX routes PIRQA and
+ * PIRQB both to IRQ 10 — so two devices on one line meant one of them lost its
+ * handler with no trace anywhere, and a level-triggered line whose owner is
+ * the wrong driver is how an interrupt storm is made.  Every handler on a line
+ * is now called; each one must check its own device's status and return
+ * quietly when the interrupt is not its own (they already do — reading an ISR
+ * register is how a virtio or AC97 handler knows).  A full chain is REFUSED
+ * with a message, never overwritten. */
+#define IRQ_CHAIN_MAX 4
+static irq_handler_t irq_handlers[16][IRQ_CHAIN_MAX];
+
+static int irq_line_has_handler(int irq) {
+    for (int k = 0; k < IRQ_CHAIN_MAX; k++) if (irq_handlers[irq][k]) return 1;
+    return 0;
+}
 
 /* APIC mode flag (M18).  Until M18 brings up LAPIC + IOAPIC, IRQs are
  * delivered via the 8259 PIC and EOIs go to it.  Once `idt_use_apic`
@@ -283,8 +300,23 @@ void irq_set_masked(int irq, int masked) {
 
 void irq_install(int irq, irq_handler_t handler) {
     if (irq < 0 || irq > 15) return;
-    irq_handlers[irq] = handler;
-    if (!handler) return;
+    if (!handler) {                        /* legacy "remove": clears the line */
+        for (int k = 0; k < IRQ_CHAIN_MAX; k++) irq_handlers[irq][k] = 0;
+        return;
+    }
+    int slot = -1;
+    for (int k = 0; k < IRQ_CHAIN_MAX; k++) {
+        if (irq_handlers[irq][k] == handler) return;       /* already there */
+        if (!irq_handlers[irq][k] && slot < 0) slot = k;
+    }
+    if (slot < 0) {
+        kprintf("irq: line %d already carries %d handlers - REFUSING another "
+                "(its device will not get interrupts)\n", irq, IRQ_CHAIN_MAX);
+        return;
+    }
+    irq_handlers[irq][slot] = handler;
+    if (slot > 0)
+        kprintf("irq: line %d is shared - %d handlers chained\n", irq, slot + 1);
     if (g_apic_mode) {
         /* Route via IOAPIC to BSP, vector = 0x20+irq.  ACPI ISO overrides
          * are honored inside ioapic_route_isa. */
@@ -292,6 +324,12 @@ void irq_install(int irq, irq_handler_t handler) {
     } else {
         pic_unmask(irq);
     }
+}
+
+void irq_uninstall(int irq, irq_handler_t handler) {
+    if (irq < 0 || irq > 15 || !handler) return;
+    for (int k = 0; k < IRQ_CHAIN_MAX; k++)
+        if (irq_handlers[irq][k] == handler) irq_handlers[irq][k] = 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -309,7 +347,7 @@ void idt_use_apic(uint8_t bsp_apic_id) {
     /* Re-route any IRQ that already has a handler — these were
      * installed under the 8259 path and want IOAPIC entries instead. */
     for (int irq = 0; irq < 16; irq++) {
-        if (irq_handlers[irq]) {
+        if (irq_line_has_handler(irq)) {
             ioapic_route_isa(irq, (uint8_t)(0x20 + irq), bsp_apic_id);
         }
     }
@@ -591,7 +629,10 @@ void isr_handler(struct int_frame* f) {
 
     if (f->int_no >= 32 && f->int_no < 48) {
         int irq = (int)f->int_no - 32;
-        if (irq_handlers[irq]) irq_handlers[irq](f);
+        for (int k = 0; k < IRQ_CHAIN_MAX; k++) {
+            irq_handler_t h = irq_handlers[irq][k];   /* one load: a racing uninstall */
+            if (h) h(f);
+        }
         /* EOI: LAPIC for vectors delivered via IOAPIC, 8259 otherwise.
          * Switching at this single point keeps the rest of the handler
          * dispatch path arch-agnostic. */

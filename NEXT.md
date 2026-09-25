@@ -36,10 +36,10 @@ Falsifiers (hidden from `help`, need two accounts and a scratch disk):
 `sessiontest <a> <b>` and `sessionstorm <a> <b> <n> [mode]` — mode 2 (theme
 flip from a foreign task) is the reproducer for the teardown bug.
 
-**The harness still loses keystrokes across a GUI start/stop** (a typed
-`gui stop` arrived merged with the next command as `guitconf`).  Not fixed —
-the two commands above exist to route around it; the harness itself is worth a
-look before the next GUI-session test that needs typing.
+**The "harness loses keystrokes" was an IRQ storm that starved the clock** —
+virtio-blk left its shared level line (IRQ 10) asserted; fixed, plus chained
+IRQ handlers and a mouse drain that ate keyboard bytes.  See DOCS.md (§M32
+section, the 2026-09-25 paragraph).  Typing across `gui stop` is reliable again.
 
 **§M82 proper (greeter, per-user desktop dir, PATH, program list, sign-out
 saving) is NOT started.**  Next in that order.

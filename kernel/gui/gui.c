@@ -1660,6 +1660,14 @@ static int gui_teardown(void) {
      * one.  Feed it an empty line so a prompt appears immediately instead of
      * the user having to press Enter at an apparently dead screen. */
     vc_kbd_push('\n');
+    /* 9. §M82 — END THE ACCOUNT'S SESSION HERE, where every route ends one.
+     *    The first version of the fix put the withdrawal in gui_stop_main,
+     *    which is only the Start menu's "Exit GUI" route; the `gui stop`
+     *    COMMAND calls gui_teardown directly and so kept the last user's
+     *    preferences on the console.  One call in the one function every
+     *    teardown passes through cannot be missed by the next route. */
+    config_user_detach();
+
     return 0;
 }
 
@@ -1998,9 +2006,6 @@ SHELL_CMD(sessionstorm) = { "sessionstorm", "<user-a> <user-b> <rounds> [mode]",
 
 static void gui_stop_main(void) {
     gui_teardown();
-    /* Leaving the GUI ends the session it was running: the text console
-     * behind it was never that user's (§M82, same reason as above). */
-    config_user_detach();
     task_exit();
 }
 

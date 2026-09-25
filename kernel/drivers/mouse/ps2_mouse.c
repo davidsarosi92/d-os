@@ -207,8 +207,17 @@ static void mouse_drain(void) {
         if (sti < 0) break;                      /* handle went away */
         uint8_t st = (uint8_t)sti;
         if ((st & ST_OUT_FULL) == 0) break;
+        /* A KEYBOARD BYTE AT THE FRONT IS LEFT WHERE IT IS.  This used to read
+         * it and throw it away ("not ours" — true, and exactly why it must not
+         * be consumed): the 8042 has ONE output buffer, and a byte read from
+         * the data port is gone for everybody.  This loop also runs from the
+         * mouse task's one-second backstop, i.e. with no mouse interrupt at
+         * all, so a keystroke that happened to be waiting at that instant was
+         * silently eaten.  The keyboard handler already makes the mirror-image
+         * choice (it stops at an AUX byte); the 8042 raises IRQ1 for the byte,
+         * so leaving it is what gets it delivered. */
+        if ((st & ST_AUX_DATA) == 0) break;      /* keyboard byte — not ours */
         uint8_t b = (uint8_t)drv_in8(h_ports, PS2_DATA);
-        if ((st & ST_AUX_DATA) == 0) continue;   /* keyboard byte — not ours */
 
         if (pkt_idx == 0 && (b & 0x08) == 0)
             continue;                            /* out of sync — resync on header */

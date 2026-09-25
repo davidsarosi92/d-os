@@ -101,10 +101,13 @@ void idt_init(void);
  * start accepting interrupts on their own LAPIC. */
 void idt_load(void);
 
-/* Register a handler for IRQ line `irq` (0..15).  Passing NULL removes a
- * previously registered handler.  Multiple registrations on the same IRQ
- * overwrite each other — there is no chaining today. */
+/* Register a handler for IRQ line `irq` (0..15).  A line may carry several
+ * handlers (PCI INTx lines are SHARED): every one is called on each interrupt
+ * and must check its own device and return quietly when it was not the cause.
+ * Registering the same handler twice is a no-op; a full chain is refused with a
+ * message.  Passing NULL clears the whole line (legacy); prefer irq_uninstall. */
 void irq_install(int irq, irq_handler_t handler);
+void irq_uninstall(int irq, irq_handler_t handler);
 
 /* §M33 Tier 2 — mask or unmask a single line, on whichever interrupt controller
  * is live.  Exists for SHARED-CONTROLLER ARBITRATION: the 8042 has one output

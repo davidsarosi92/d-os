@@ -13229,6 +13229,42 @@ i386 (the run's time limit) with no fault, and in every log no session task
 outlived the teardown and no compositor was reaped after `session ended`.
 `sessiontest` passes 3/3 on x86_64 and 2/2 on i386; aarch64 builds silent.
 
+**AND "THE HARNESS LOSES KEYSTROKES" WAS AN INTERRUPT STORM THAT STARVED THE
+CLOCK (2026-09-25).**  After a `gui stop` on a machine with a disk, typed
+commands arrived mangled (`echolm`, `guitconf`), a 25 s `task_msleep` never
+returned, cron went quiet — and no NMI, no softlockup, no fault.  Neither the
+harness nor the keyboard: QEMU's `info lapic` on CPU 0 read **ISR 42 (level),
+IRR 32, PPR 0x20** and `info pic` showed IOAPIC pin 10 with Remote IRR set.
+**virtio-blk polls for completion and never installed an interrupt handler —
+but never told the device so**, and every completed request raised its PCI
+line: on QEMU's PIIX that is IRQ 10, SHARED (PIRQA/PIRQB) and LEVEL-triggered,
+and nobody read the device's ISR register, which is what lowers it.  Vector 42
+then re-fired after every EOI.  It outranks the PIT (vector 32) and the keyboard
+(33), so the millisecond clock stopped (every `task_msleep`, every cron job,
+every `ktimer`) and PS/2 bytes overflowed QEMU's queue; the LAPIC timer (vector
+64) outranks it, so the BSP kept petting the hardware watchdog and nothing ever
+said NMI.  *The CPU-0 register samples on a HEALTHY machine showed the storm
+too (`inb`/`isr_common`, IF=0) — which is why it read as normal: it had been
+there on every run with a disk since the NIC got its interrupt.*  Whether it
+became a visible freeze depended on how much time was left over for IRQ0.
+**Fixed at the source** (`VRING_AVAIL_F_NO_INTERRUPT` on the queue, and a
+read-to-clear of the ISR register after every completion, since the flag is
+advisory) **and in the mechanism that made it possible:** `irq_install` held ONE
+handler per line and a second registration silently REPLACED the first, so two
+devices on one shared INTx line meant one lost its handler with no trace.  A line
+now holds a chain of up to four, every handler is called, a full chain is
+refused with a message, and `irq_uninstall` removes one by identity.  **Also a
+real keystroke thief found on the way:** the PS/2 mouse drain read a byte with
+AUX clear and threw it away ("not ours") — from its one-second backstop too, so a
+keystroke waiting at that instant was eaten.  It now stops at a keyboard byte,
+the mirror of what the keyboard handler already does.  **Verified:** six typed
+lines after `gui stop`, 3/3 runs 6/6 on i386 and x86_64 (before: 2/6 typical),
+a 25 s sleep armed from the teardown wakes, `info lapic` shows `ISR (none)`,
+driven mouse clicks still arrive and dispatch, `sessiontest` passes on both.
+The harness now keeps monitor replies in `<log>.mon` — the `pmemsave` that
+failed silently during this hunt could not say why because its reply was
+discarded.
+
 #### Stage 10 — the lock surface, and the instrument that made it provable
 
 `gui.login` (default OFF) raises a modal authentication window over the
