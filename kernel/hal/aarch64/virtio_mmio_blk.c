@@ -29,6 +29,8 @@
 #include "task.h"
 #include "timer.h"
 #include "lock.h"
+#include "waitq.h"
+#include "ktimer.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -92,6 +94,7 @@ static struct virtio_blk_req_hdr q_hdr         __attribute__((aligned(16)));
 static volatile uint8_t   q_status             __attribute__((aligned(16)));
 
 static uintptr_t g_base;
+static int       g_slot = -1;   /* transport slot, for its SPI */
 static uint16_t  g_last_used;
 static struct block_device g_vda;
 
@@ -105,10 +108,49 @@ static inline void dsb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
  * 2026-09-25, the same two defects as the x86 driver: ONE descriptor chain and
  * header with NO lock (two tasks on two cores wrote each other's requests), and
  * a completion wait with NO bound at all.  Now serialised by a kmutex, bounded
- * by 5 s of real time, and yielding the CPU while it waits where it may.  The
- * completion interrupt is not wired on this arch — polled, but no longer a
- * spin that can never end. */
-static struct kmutex vmb_lock = KMUTEX_INIT("virtio-mmio-blk");
+ * by 5 s of real time, and yielding the CPU while it waits where it may.
+ *
+ * THE COMPLETION INTERRUPT (2026-09-25, NEXT.md #2's leftover).  The x86
+ * driver sleeps on its interrupt; this one polled with task_yield, which on an
+ * otherwise idle CPU is a busy loop by another name — the waiting task is the
+ * only runnable one, so yield returns at once and the core never halts.  Same
+ * shape as virtio-blk on x86 and virtio-snd here: the SPI for this transport
+ * slot (INTID 48 + slot on QEMU `virt`) acknowledges InterruptStatus (which is
+ * what lowers the level line) and wakes the waiter — two things and no third.
+ * The wait learns interrupts work by RECEIVING one; until then, and whenever it
+ * may not sleep, it polls as before, and it never sleeps without a 2 ms
+ * backstop, so a lost interrupt costs latency, never the request. */
+#define VIRTIO_MMIO_INTID_BASE 48
+void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
+void gic_enable_irq(uint32_t intid);
+
+static struct kmutex     vmb_lock = KMUTEX_INIT("virtio-mmio-blk");
+static struct waitq      vmb_wq   = WAITQ_INIT;
+static volatile uint32_t vmb_irqs;
+
+static void vmb_irq(uint32_t intid) {
+    (void)intid;
+    if (!g_base) return;
+    uint32_t st = r32(R_INTSTATUS);
+    if (!st) return;                                  /* not ours */
+    w32(R_INTACK, st);
+    vmb_irqs++;            /* the first one proves the line: the wait may sleep */
+    uint32_t fl = waitq_lock(&vmb_wq);
+    waitq_wake_all(&vmb_wq);
+    waitq_unlock(&vmb_wq, fl);
+}
+
+static void vmb_backstop(struct ktimer* t) {
+    struct waitq* wq = (struct waitq*)t->arg;
+    uint32_t fl = waitq_lock(wq);
+    waitq_wake_all(wq);
+    waitq_unlock(wq, fl);
+}
+
+static int vmb_done(void) {
+    dsb();
+    return *(volatile uint16_t*)&q_used.idx != g_last_used;
+}
 
 static int vmb_rw_unlocked(uint64_t lba, uint32_t count, void* buf, int is_write);
 static int vmb_rw(uint64_t lba, uint32_t count, void* buf, int is_write) {
@@ -149,14 +191,31 @@ static int vmb_rw_unlocked(uint64_t lba, uint32_t count, void* buf, int is_write
     w32(R_QUEUENOTIFY, 0);                  /* kick queue 0                   */
 
     uint64_t deadline = timer_ticks_ms() + 5000;
-    while (*(volatile uint16_t*)&q_used.idx == g_last_used) {
-        dsb();
+    while (!vmb_done()) {
         if (timer_ticks_ms() > deadline) {
             kprintf("virtio-mmio-blk: request timed out after 5000 ms\n");
             return -1;
         }
         struct task* me = task_current();
-        if (me && !me->is_idle && preempt_count() == 0) task_yield();
+        int may_sleep = me && !me->is_idle && preempt_count() == 0;
+        if (!vmb_irqs || !may_sleep) {
+            if (may_sleep) task_yield();
+            continue;
+        }
+        {
+            static int told;
+            if (!told) {
+                told = 1;
+                kprintf("virtio-mmio-blk: completion interrupts work - requests "
+                        "now sleep instead of polling (%u so far)\n", vmb_irqs);
+            }
+        }
+        struct ktimer t = { 0, 0, 0, 0, 0 };
+        ktimer_arm_after(&t, 2000000ull, vmb_backstop, &vmb_wq);
+        uint32_t fl = waitq_lock(&vmb_wq);
+        if (!vmb_done()) waitq_block(&vmb_wq);
+        waitq_unlock(&vmb_wq, fl);
+        ktimer_cancel(&t);
     }
     g_last_used++;
     dsb();
@@ -194,6 +253,7 @@ int virtio_mmio_blk_init(void) {
         kprintf("virtio-mmio: slot %d dev=%u ver=%u\n", i, dev, ver);
         if (dev != 2 || ver != 2) continue;      /* want a modern block device */
         g_base = base;
+        g_slot = i;
         break;
     }
     if (!g_base) return -1;                      /* no virtio-blk attached     */
@@ -231,6 +291,11 @@ int virtio_mmio_blk_init(void) {
     w32(R_QUEUEREADY, 1);
 
     w32(R_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
+
+    /* The completion interrupt: handler first, then unmask (the install-then-
+     * unmask split gic.c mirrors from x86). */
+    gic_register_handler(VIRTIO_MMIO_INTID_BASE + (uint32_t)g_slot, vmb_irq);
+    gic_enable_irq(VIRTIO_MMIO_INTID_BASE + (uint32_t)g_slot);
 
     /* Capacity (sectors) is the first u64 of the block config space. */
     uint64_t cap = (uint64_t)r32(R_CONFIG) | ((uint64_t)r32(R_CONFIG + 4) << 32);

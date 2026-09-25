@@ -13694,8 +13694,20 @@ crash:**
 locking, `diskstorm 4 20` took 23 s and corrupted another file on the volume.
 
 
+
+**aarch64 caught up (2026-09-25).**  virtio-mmio-blk had the lock and the 5 s
+bound but still POLLED, with `task_yield` — which on an otherwise idle core is a
+busy loop by another name, since the waiting task is the only runnable one.  It
+now takes its SPI (INTID 48 + transport slot on `virt`), whose handler
+acknowledges `InterruptStatus` and wakes the waiter, and the wait sleeps exactly
+like the x86 driver's: only after the first interrupt has proved the line, never
+without a 2 ms backstop.  Verified on the serial boot path at `-smp 2`:
+`completion interrupts work`, `diskstorm 4 20` and `2 20` PASS (0 wrong
+read-backs), `killstorm` 20/20, `fsck.exfat` clean.
+
 ## 8. Change log
 
+- **2026-09-25 — aarch64 virtio-mmio-blk sleeps on its completion interrupt (DOCS §4.93).**
 - **2026-09-25 — A ONE-SHOT TIMER DEADLINE, MEASURED AND REMOVED (DOCS §4.53.1).**
   The LAPIC's own interrupt arrived 1.6-1.7 ms late under the emulator, no better
   than the PIT path, and the extra expiries tripped a false `PIT STARVED` at
