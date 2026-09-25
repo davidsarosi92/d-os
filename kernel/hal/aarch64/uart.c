@@ -86,5 +86,46 @@ void uart_early_puthex(uint64_t v) {
  * forwarding to the early-UART primitives above.  (Without these the portable
  * core simply does not link on aarch64 — that is how this gap surfaced.)
  * ------------------------------------------------------------------------- */
+/* ---- receive interrupt, for the serial command channel (serial.h) --------
+ *
+ * The PL011's RX interrupt (SPI 1 = INTID 33 on `virt`) has two causes that
+ * matter: RXIM ("the FIFO reached its trigger level") and RTIM ("data has sat
+ * in the FIFO for a while") — without RTIM a line shorter than the trigger
+ * level would never raise anything.  The core drains through
+ * uart_early_getchar; the handler then clears both causes in UARTICR. */
+#define UART_IMSC    0x38
+#define UART_ICR     0x44
+#define UART_RXIM    (1u << 4)
+#define UART_RTIM    (1u << 6)
+#define PL011_INTID  33
+
+void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
+void gic_enable_irq(uint32_t intid);
+
+static void (*rx_fn)(void);
+
+static void pl011_rx_isr(uint32_t intid) {
+    (void)intid;
+    void (*fn)(void) = rx_fn;
+    if (fn) fn();
+    mmio_write32(PL011_BASE + UART_ICR, UART_RXIM | UART_RTIM);
+}
+
+int hal_serial_rx_getc(void) { return uart_early_getchar(); }
+
+int hal_serial_rx_enable(void (*fn)(void)) {
+    if (!fn) {
+        mmio_write32(PL011_BASE + UART_IMSC, 0);
+        rx_fn = 0;
+        return 0;
+    }
+    rx_fn = fn;
+    gic_register_handler(PL011_INTID, pl011_rx_isr);
+    mmio_write32(PL011_BASE + UART_ICR, UART_RXIM | UART_RTIM);
+    mmio_write32(PL011_BASE + UART_IMSC, UART_RXIM | UART_RTIM);
+    gic_enable_irq(PL011_INTID);
+    return 1;
+}
+
 void serial_putchar(char c) { uart_early_putc(c); }
 void serial_write(const char* s) { uart_early_puts(s); }

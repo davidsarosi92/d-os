@@ -9033,6 +9033,22 @@ untouched.  Keyboard path: `uptime`, `pane split v` (pane 2 comes up — the
 per-task VC), `echo` on both arches; aarch64 serial REPL: `pane` → "this shell
 has no panes".  All three arches build silent.
 
+
+**On aarch64 too (2026-09-25).**  ARM's DISPLAY boot path had the x86 problem
+exactly — its shell is on a VC behind virtio-input and the harness can only
+reach the UART — so nothing that draws could be driven there.  The channel is
+now PORTABLE (`kernel/core/serial_cmd.c`): the architecture supplies
+`hal_serial_rx_getc` and `hal_serial_rx_enable` (serial.h) — COM1/IRQ 4 on x86,
+the PL011 on ARM (SPI 1 = INTID 33, with RXIM *and* RTIM, since without the
+receive-timeout cause a line shorter than the FIFO trigger level would never
+raise anything).  On ARM's SERIAL boot path `serial_shell.c` already owns the
+UART, so `main_entry` calls `serial_cmd_disable()` and the service parks
+(`serialcmd` says "standing aside") instead of racing the REPL for every byte.
+Verified: ARM with a display at `-smp 2` — `uptime`, `serialcmd` (irqs 9),
+`diskstorm 4 20` PASS, `launch Task Manager`, and a command after the window
+took focus, with the screenshot showing the window; ARM without a display — the
+REPL unaffected; x86_64 and i386 — serial and keyboard paths both still work.
+
 ### 4.75 Terminal scrollback, and why a selection is an absolute line number (§M58)
 
 **Files:** `kernel/gui/gui.c` (`gterm_row`, `gterm_sb_push`, `gterm_view_scroll`,
@@ -13707,6 +13723,7 @@ read-backs), `killstorm` 20/20, `fsck.exfat` clean.
 
 ## 8. Change log
 
+- **2026-09-25 — The serial command channel is portable; aarch64's display boot path can be driven (DOCS §4.74.1).**
 - **2026-09-25 — aarch64 virtio-mmio-blk sleeps on its completion interrupt (DOCS §4.93).**
 - **2026-09-25 — A ONE-SHOT TIMER DEADLINE, MEASURED AND REMOVED (DOCS §4.53.1).**
   The LAPIC's own interrupt arrived 1.6-1.7 ms late under the emulator, no better

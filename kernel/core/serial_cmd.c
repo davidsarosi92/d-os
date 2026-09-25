@@ -1,5 +1,13 @@
 /* =============================================================================
- * serial_cmd.c — a command channel on COM1 (x86), independent of GUI focus.
+ * serial_cmd.c — a command channel on the serial line, independent of GUI focus.
+ *
+ * PORTABLE since 2026-09-25: the line discipline, ring, dispatch and policy
+ * live here; an architecture supplies two primitives (serial.h's
+ * hal_serial_rx_getc / hal_serial_rx_enable) — COM1 on x86 (serial.c), the
+ * PL011 on aarch64 (uart.c).  aarch64's DISPLAY boot path had exactly the
+ * x86 problem (its shell is on a VC, the harness can only reach the UART), and
+ * its SERIAL boot path is the one place this channel must stand aside, because
+ * serial_shell.c already owns the UART there (serial_cmd_disable()).
  *
  * WHY THIS EXISTS (2026-09-25, NEXT.md #3, DOCS §4.74's standing limit).
  *
@@ -52,8 +60,6 @@
  * deploys the machine, not to this file.
  * ============================================================================= */
 
-#include "hal.h"
-#include "idt.h"
 #include "waitq.h"
 #include "ktimer.h"
 #include "task.h"
@@ -62,16 +68,9 @@
 #include "settings.h"
 #include "shellcmd.h"
 #include "printf.h"
+#include "serial.h"
 #include <stdint.h>
 #include <stddef.h>
-
-#define COM1       0x3F8
-#define UART_DATA  (COM1 + 0)
-#define UART_IER   (COM1 + 1)
-#define UART_LSR   (COM1 + 5)
-#define LSR_DATA_READY 0x01
-#define IER_RX_AVAIL   0x01
-#define COM1_IRQ       4
 
 #define SC_RING   512            /* bytes; a power of two (index masking)  */
 #define SC_LINE   256            /* longest command line accepted          */
@@ -91,27 +90,32 @@ static uint8_t           sc_ring[SC_RING];
 static volatile uint32_t sc_head, sc_tail;          /* head = write, tail = read */
 static volatile uint32_t sc_irqs, sc_dropped;
 
-/* Drain the UART FIFO into the ring.  Caller holds sc_wq's lock (which also
- * means IRQs are off here).  A full ring DROPS and counts — never blocks,
- * because the caller may be an interrupt. */
+static volatile int       sc_disabled;
+
+/* Drain the UART into the ring.  Caller holds sc_wq's lock (which also means
+ * IRQs are off here).  A full ring DROPS and counts — never blocks, because
+ * the caller may be an interrupt. */
 static void sc_pull_locked(void) {
-    int budget = 64;                                 /* bounded: a stuck LSR */
-    while ((inb(UART_LSR) & LSR_DATA_READY) && budget-- > 0) {
-        uint8_t b = inb(UART_DATA);
+    int budget = 64;                                 /* bounded: a stuck UART */
+    int b;
+    while (budget-- > 0 && (b = hal_serial_rx_getc()) >= 0) {
         if (sc_head - sc_tail >= SC_RING) { sc_dropped++; continue; }
-        sc_ring[sc_head & (SC_RING - 1)] = b;
+        sc_ring[sc_head & (SC_RING - 1)] = (uint8_t)b;
         sc_head++;
     }
 }
 
-static void sc_irq(struct int_frame* f) {
-    (void)f;
+/* Called by the architecture's receive interrupt (see serial.h). */
+void serial_cmd_rx_irq(void) {
+    if (sc_disabled) return;
     uint32_t fl = waitq_lock(&sc_wq);
     sc_irqs++;
     sc_pull_locked();
     waitq_wake_all(&sc_wq);
     waitq_unlock(&sc_wq, fl);
 }
+
+void serial_cmd_disable(void) { sc_disabled = 1; }
 
 static void sc_backstop(struct ktimer* t) {
     struct waitq* wq = (struct waitq*)t->arg;
@@ -123,7 +127,7 @@ static void sc_backstop(struct ktimer* t) {
 /* Next byte, blocking.  Returns -1 when the task was asked to stop. */
 static int sc_getc(void) {
     for (;;) {
-        if (task_should_stop()) return -1;
+        if (task_should_stop() || sc_disabled) return -1;
         struct ktimer t = { 0, 0, 0, 0, 0 };
         ktimer_arm_after(&t, 100000000ull, sc_backstop, &sc_wq);   /* 100 ms */
         uint32_t fl = waitq_lock(&sc_wq);
@@ -142,10 +146,18 @@ static int sc_getc(void) {
 }
 
 static void serial_cmd_entry(void) {
-    /* Arm the receive interrupt.  OUT2 (MCR bit 3, set by serial_init) is what
-     * lets the UART's interrupt reach the PIC/IOAPIC at all. */
-    irq_install(COM1_IRQ, sc_irq);
-    outb(UART_IER, IER_RX_AVAIL);
+    /* Somebody else owns the line (aarch64's serial REPL): stand aside, and
+     * stay parked rather than exiting — the supervisor restarts a service
+     * that returns, and a crash-looping service to express "not needed here"
+     * would be noise in every log. */
+    if (sc_disabled) {
+        while (!task_should_stop()) task_msleep(60000);
+        return;
+    }
+    /* Arm the receive interrupt.  Returns 0 when this arch cannot deliver one;
+     * the 100 ms backstop poll in sc_getc then carries the channel alone. */
+    if (!hal_serial_rx_enable(serial_cmd_rx_irq))
+        kprintf("serial-cmd: no receive interrupt on this machine - polling every 100 ms\n");
 
     char line[SC_LINE];
     int  len = 0, overflow = 0;
@@ -181,8 +193,7 @@ static void serial_cmd_entry(void) {
         if (len < SC_LINE - 1) line[len++] = (char)c;
         else overflow = 1;
     }
-    outb(UART_IER, 0);
-    irq_uninstall(COM1_IRQ, sc_irq);
+    hal_serial_rx_enable(NULL);
 }
 
 SERVICE("serial-cmd", serial_cmd_entry, 1, SVC_RESTART_ALWAYS);
@@ -193,6 +204,7 @@ SERVICE("serial-cmd", serial_cmd_entry, 1, SVC_RESTART_ALWAYS);
 static void cmd_serialcmd(const char* args) {
     (void)args;
     kprintf("serial-cmd: %s, irqs %u, dropped %u byte(s), ring %u/%u\n",
+            sc_disabled ? "standing aside (another shell owns the line)" :
             config_get_long("console.serial_commands", 1) ? "enabled" : "disabled",
             sc_irqs, sc_dropped, sc_head - sc_tail, (unsigned)SC_RING);
 }

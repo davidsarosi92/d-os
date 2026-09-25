@@ -31,4 +31,22 @@ void serial_write(const char* s);
  * module-framework iteration. */
 int serial_module_init(void);
 
+/* ---- receive side, for the serial command channel (core/serial_cmd.c) ----
+ *
+ * The two primitives an architecture supplies — COM1 on x86 (serial.c), the
+ * PL011 on aarch64 (uart.c):
+ *
+ *   hal_serial_rx_getc()     the next received byte, or -1; never blocks.
+ *   hal_serial_rx_enable(fn) arm the receive interrupt so that it calls fn
+ *                            (IRQ context, with nothing drained — fn pulls
+ *                            the bytes through hal_serial_rx_getc).  fn NULL
+ *                            disarms.  Returns 1 when an interrupt is wired,
+ *                            0 when the caller must poll.
+ *
+ * And the core's side of it: */
+int  hal_serial_rx_getc(void);
+int  hal_serial_rx_enable(void (*fn)(void));
+void serial_cmd_rx_irq(void);
+void serial_cmd_disable(void);   /* somebody else owns the line (ARM REPL) */
+
 #endif

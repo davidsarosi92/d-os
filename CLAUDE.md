@@ -56,7 +56,13 @@ default on — same SYSTEM trust as the console; must require auth once §M82 pu
 a login on it); `dos-shell-test.py --via serial` and `--monitor-cmd "serial <line>"`
 use it.  The keyboard path stays the default, because keyboard tests test it.
 On the way: `shell_current_vc()` was a GLOBAL set around each dispatch while
-every pane runs its own shell task — it answers from the calling task now.
+every pane runs its own shell task — it answers from the calling task now.  The channel is portable
+(core/serial_cmd.c + two HAL primitives) and runs on aarch64's DISPLAY boot
+path too, where the harness previously could not type at all; aarch64's serial
+path keeps its REPL (the channel stands aside there).  aarch64 virtio-mmio-blk
+now sleeps on its completion interrupt; a one-shot LAPIC timer deadline was
+built, measured (no gain: the emulator's own timer dispatch is the 1.2-1.8 ms
+floor) and removed (DOCS §4.53.1).
 
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there

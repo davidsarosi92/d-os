@@ -562,6 +562,7 @@ else ifeq ($(ARCH),aarch64)
     kernel/drivers/rtc/pl031_drv.c \
       kernel/hal/aarch64/dtb.c \
       kernel/hal/aarch64/serial_shell.c \
+      kernel/core/serial_cmd.c \
       kernel/hal/aarch64/main_entry.c
 
   ARCH_ASM_SRCS := \
@@ -761,7 +762,7 @@ CORE_C_SRCS := \
     kernel/core/layouts.c \
     kernel/core/percpu.c \
     kernel/drivers/serial/serial.c \
-    kernel/drivers/serial/serial_cmd.c \
+    kernel/core/serial_cmd.c \
     kernel/drivers/terminal/fb_terminal.c \
     kernel/drivers/terminal/vga_terminal.c \
     kernel/drivers/keyboard/ps2_keyboard.c \
@@ -1081,7 +1082,7 @@ CORE_C_SRCS := \
     kernel/core/layouts.c \
     kernel/core/percpu.c \
     kernel/drivers/serial/serial.c \
-    kernel/drivers/serial/serial_cmd.c \
+    kernel/core/serial_cmd.c \
     kernel/drivers/terminal/fb_terminal.c \
     kernel/drivers/terminal/vga_terminal.c \
     kernel/drivers/keyboard/ps2_keyboard.c \

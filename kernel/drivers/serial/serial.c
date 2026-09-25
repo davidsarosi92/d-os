@@ -15,8 +15,8 @@
  *   +7   scratch
  *
  * We set 38400 baud, 8 data bits, no parity, 1 stop bit, FIFO on, and poll
- * the transmit-empty bit before every byte.  The driver is output-only;
- * receive could be added trivially but isn't needed yet.
+ * the transmit-empty bit before every byte.  Receive (bottom of the file) is
+ * used by the serial command channel, core/serial_cmd.c.
  * ============================================================================= */
 
 #include "serial.h"
@@ -24,6 +24,7 @@
 #include "console.h"
 #include "module.h"
 #include "devfs.h"
+#include "idt.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -118,5 +119,43 @@ int serial_module_init(void) {
 }
 
 MODULE("com1-serial", "console", serial_module_init);
+
+/* -------------------------------------------------------------------------- */
+/* Receive side — the two primitives core/serial_cmd.c needs (serial.h).      */
+/*                                                                            */
+/* IRQ 4 is the UART's "received data available" (IER bit 0); OUT2 (MCR bit   */
+/* 3, set in serial_init) is what lets it reach the interrupt controller at   */
+/* all.  The handler drains nothing itself: the core pulls the bytes through  */
+/* hal_serial_rx_getc under its own lock, so there is one reader of the FIFO. */
+/* -------------------------------------------------------------------------- */
+#define LSR_DATA_READY 0x01
+#define IER_RX_AVAIL   0x01
+#define COM1_IRQ       4
+
+static void (*rx_fn)(void);
+
+static void serial_rx_isr(struct int_frame* f) {
+    (void)f;
+    void (*fn)(void) = rx_fn;
+    if (fn) fn();
+}
+
+int hal_serial_rx_getc(void) {
+    if (!(inb(UART_LSR) & LSR_DATA_READY)) return -1;
+    return (int)inb(UART_DATA);
+}
+
+int hal_serial_rx_enable(void (*fn)(void)) {
+    if (!fn) {
+        outb(UART_IER, 0x00);
+        irq_uninstall(COM1_IRQ, serial_rx_isr);
+        rx_fn = NULL;
+        return 0;
+    }
+    rx_fn = fn;
+    irq_install(COM1_IRQ, serial_rx_isr);
+    outb(UART_IER, IER_RX_AVAIL);
+    return 1;
+}
 
 

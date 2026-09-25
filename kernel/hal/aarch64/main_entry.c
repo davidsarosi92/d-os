@@ -57,6 +57,7 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "gui.h"             /* gui_autostart — was an IMPLICIT declaration */
 #include "vc.h"
 #include "shell_provider.h"
+#include "serial.h"
 #include "service.h"
 #include "bus.h"
 #include "watchdog.h"
@@ -427,6 +428,9 @@ void aarch64_main_entry(uint64_t dtb) {
          * must find the sound device exactly as a graphical one does. */
         virtio_snd_init();
         kprintf("aarch64: no framebuffer — UART serial shell (pid 0 → idle).\n");
+        /* The REPL owns the UART on this path; the command channel
+         * (core/serial_cmd.c) would otherwise race it for every byte. */
+        serial_cmd_disable();
         if (!task_spawn("shell", serial_shell_entry))
             kprintf("aarch64: FATAL — failed to spawn serial shell\n");
     }
