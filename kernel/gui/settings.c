@@ -402,7 +402,15 @@ static void gp_take_close_answer(struct genpanel* g) {
 }
 
 /* Every close route ends here — the guard's, a session end that stopped
- * waiting, a killed host.  The panel owns `g`, and nothing else frees it. */
+ * waiting, a killed host.
+ *
+ * `g` IS NOT FREED HERE.  It is the window's `app_ctx`, and the framework frees
+ * that itself (app_widgets_free on the host, destroy_window on the compositor)
+ * AFTER this runs.  A kfree here was added once on the belief that the panel
+ * leaked its state; it did not, and the second free corrupted the heap — an
+ * x86_64 NMI with a CPU executing the font tables ~30 s after a session end,
+ * 4 of 7 runs, 0 of 3 without it.  An owner-frees-it rule has to be read off
+ * the code that frees, not inferred from the code that allocates. */
 static void gp_on_close(struct gui_window* win) {
     struct genpanel* g = (struct genpanel*)gui_window_ctx(win);
     if (!g) return;
@@ -410,7 +418,6 @@ static void gp_on_close(struct gui_window* win) {
     if (g->ndirty)
         kprintf("settings: '%s' closed with %d unsaved change(s) - discarded, the "
                 "machine was not changed\n", g->group, g->ndirty);
-    kfree(g);
 }
 
 static void gp_layout(struct gui_window* win) {

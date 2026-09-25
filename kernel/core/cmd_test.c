@@ -1388,3 +1388,47 @@ static void t_dirfilltest(const char* a) {
 }
 SHELL_CMD(dirfilltest) = { "dirfilltest", "[keep]", "exFAT: a directory grows without writing into its neighbours",
                            SHELL_G_TEST, t_dirfilltest, SHELL_P_ADMIN };
+
+/* ---------------------------------------------------------------------------
+ * `ktimerexittest` — the falsifier for ktimer_cancel_range (hidden).
+ *
+ * A task arms a timer ON ITS OWN STACK and exits without cancelling it — the
+ * shape of a wait loop that task_yield()s its way out on a pending kill.  The
+ * exit path must cancel it (and say so with `!! KTIMER`); without that, the
+ * deadline would call into a freed and reused stack 200 ms later.  So the test
+ * then churns tasks through the reaper to REUSE the stack, and waits past the
+ * deadline.  The pass needs BOTH: nothing fired, and the pending count did not
+ * grow.  The control run (net removed) is why the second half exists: the
+ * orphan did not fire in 400 ms — its stack's reuse had overwritten the
+ * deadline — but it was still LISTED, a live list node inside freed memory,
+ * which is the state that eventually fires into the font tables.  Run it with --allow-crash, since the report is deliberate.
+ * ------------------------------------------------------------------------- */
+#include "ktimer.h"
+static volatile int kte_fired;
+static void kte_fn(struct ktimer* t) { (void)t; kte_fired++; }
+static void kte_task(void) {
+    struct ktimer t = { 0, 0, 0, 0, 0 };
+    ktimer_arm_after(&t, 200000000ull, kte_fn, NULL);
+    task_exit();                                  /* no cancel, on purpose */
+}
+static void kte_churn(void) { task_exit(); }
+static void t_ktimerexittest(const char* a) {
+    (void)a;
+    kte_fired = 0;
+    uint32_t pending0 = 0; uint64_t f0 = 0, l0 = 0;
+    ktimer_stats(&pending0, &f0, &l0);
+    task_spawn_detached("kte", kte_task);
+    task_msleep(50);
+    for (int i = 0; i < 16; i++) task_spawn_detached("kte-churn", kte_churn);
+    task_msleep(400);
+    uint32_t pending1 = 0; uint64_t f1 = 0, l1 = 0;
+    ktimer_stats(&pending1, &f1, &l1);
+    kprintf("ktimerexittest: callback fired %d time(s), pending %u -> %u: %s\n",
+            kte_fired, pending0, pending1,
+            kte_fired != 0          ? "FAIL (a timer on a dead stack fired)"
+            : pending1 > pending0   ? "FAIL (the timer is still LISTED - a list entry "
+                                      "inside a freed stack, waiting for its bytes to "
+                                      "be reused)"
+            : "PASS (the exit cancelled the orphaned timer)");
+}
+SHELL_CMD(ktimerexittest) = { "ktimerexittest", "", 0, SHELL_G_TEST, t_ktimerexittest, SHELL_P_ADMIN };

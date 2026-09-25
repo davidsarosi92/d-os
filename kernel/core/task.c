@@ -2287,6 +2287,23 @@ void task_exit_code(int code) {
         sys_futex(p, 1 /* FUTEX_WAKE */, 0x7fffffff);
     }
 
+    /* NO ARMED TIMER MAY OUTLIVE THE STACK IT LIVES ON (2026-09-25).  See
+     * ktimer_cancel_range: a task leaving from inside a wait (task_yield exits
+     * on a pending kill) never runs the frame that would have cancelled its
+     * on-stack timer, and the tick later calls into a stack that has been
+     * freed and reused.  Cancelled here, while the stack is still ours — and
+     * REPORTED, because every hit is a wait loop that exits the wrong way. */
+    if (self->kstack_base) {
+        ktimer_fn fn = NULL;
+        uintptr_t lo = (uintptr_t)self->kstack_base;
+        int n = ktimer_cancel_range(lo, lo + TASK_KSTACK_SZ, &fn);
+        if (n)
+            kprintf("!! KTIMER: '%s' (pid %d) exited with %d armed timer(s) on its "
+                    "own stack (first callback %p) - cancelled; the wait that "
+                    "armed it exits without cancelling\n",
+                    self->name, self->pid, n, (void*)fn);
+    }
+
     /* §M57 — DEAD IS PUBLISHED AT THE END OF THIS FUNCTION, NOT HERE.
      *
      * It used to be set right at the top, and that is the last §M54 residual —

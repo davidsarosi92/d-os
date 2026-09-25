@@ -134,6 +134,55 @@ void ktimer_expire(void) {
     }
 }
 
+/* Cancel every armed timer whose STRUCT lies in [lo, hi) — the kernel stack
+ * of a task that is exiting.  Returns how many were still armed and, through
+ * `first_fn`, the callback of the first, so the caller can name the bug.
+ *
+ * WHY THIS EXISTS (2026-09-25).  An on-stack timer is cancelled by the frame
+ * that armed it, on its way out — unless the task never gets back to that
+ * frame.  task_yield() EXITS a task with a pending kill, from wherever it is
+ * called, and a wait loop that yields while its timer is armed (net.c's
+ * no-poller fallback did) therefore left a live list entry pointing into a
+ * stack that the reaper then freed and the allocator handed to somebody else.
+ * When the deadline came, the tick called whatever those bytes now held: an
+ * x86_64 NMI with the CPU executing inside the font tables, after a session
+ * end — the §M82-session signature (NEXT.md #2b) that "locking the config
+ * store" had only made rarer.  Cancelling here makes every such path safe, and
+ * the caller's report makes every such path name itself. */
+int ktimer_cancel_range(uintptr_t lo, uintptr_t hi, ktimer_fn* first_fn) {
+    int n = 0;
+    int me = this_cpu_id();
+    uint32_t fl = spin_lock_irqsave(&g_lock);
+    struct ktimer** pp = &g_head;
+    while (*pp) {
+        struct ktimer* t = *pp;
+        if ((uintptr_t)t >= lo && (uintptr_t)t < hi) {
+            if (!n && first_fn) *first_fn = t->fn;
+            *pp = t->next;
+            t->next = NULL;
+            t->armed = 0;
+            if (g_pending) g_pending--;
+            n++;
+            continue;
+        }
+        pp = &t->next;
+    }
+    spin_unlock_irqrestore(&g_lock, fl);
+    /* And a callback already RUNNING on another CPU from that range must
+     * finish before the stack can be given away (ktimer_cancel's rule). */
+    int busy;
+    do {
+        busy = 0;
+        for (int c = 0; c < KT_MAX_CPUS; c++) {
+            if (c == me) continue;
+            uintptr_t r = (uintptr_t)__atomic_load_n(&g_running[c], __ATOMIC_ACQUIRE);
+            if (r >= lo && r < hi) busy = 1;
+        }
+        if (busy) hal_cpu_pause();
+    } while (busy);
+    return n;
+}
+
 /* Zero the worst-lateness figure, so a measurement is not polluted by
  * whatever happened during boot (the worst figure is a maximum since the last
  * reset, and boot is when the machine is busiest). */

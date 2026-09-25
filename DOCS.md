@@ -13667,12 +13667,18 @@ an Editor's unsaved text is work, so dismissing keeps editing; a panel's pending
 setting has not been applied, so discarding leaves the machine exactly as it
 was — the outcome that does nothing, which is the dialog's rule for an
 unanswered question.  The answer is handed over through the Editor's
-two-reference ticket and acted on the panel's own host.  Two defects fixed on
-the way: the panel's state (`struct genpanel`) was never freed on close, and
-**the dialog wrapped the catalogue KEY rather than the text it draws** — a key
+two-reference ticket and acted on the panel's own host.  One defect fixed on the
+way — **the dialog wrapped the catalogue KEY rather than the text it draws** — a key
 has no spaces, so a translated body ran off the panel's edge.  Falsifier
 `logouttest settings`: unanswered → `DISCARDED` (value unchanged, window closed
 at the 3 s grace); Enter → `SAVED` (value applied, closed after 1.2 s).
+**And a correction, at my own expense:** the first version also "fixed a leak"
+by freeing the panel's state in its `on_close`.  There was no leak — the state
+is the window's `app_ctx`, which the framework frees after `on_close` — so that
+was a DOUBLE FREE, and it surfaced 20-30 s later as an x86_64 NMI with a CPU
+executing the font tables (4 of 7 session-end runs; 0 of 3 without the free).
+*An ownership rule has to be read off the code that frees, not inferred from
+the code that allocates.*
 
 ### 4.93 Storage under concurrency — the stack that had no locks
 

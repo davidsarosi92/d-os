@@ -517,7 +517,12 @@ int net_wait_cond(int (*cond)(void*), void* arg, uint32_t timeout_ms) {
             g_inline_pumps++;
             if (net_pump_locked()) waitq_wake_all(&g_netwq);
             net_unlock(f);
-            task_yield();
+            /* schedule(), NOT task_yield(): task_yield EXITS a task with a
+             * pending kill, from right here — past the ktimer_cancel below,
+             * leaving `t` armed on a stack about to be freed (see
+             * ktimer_cancel_range).  The loop's own task_should_stop() check
+             * is the exit, and it runs the cancel. */
+            schedule();
             f = net_lock();
         }
     }

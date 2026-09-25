@@ -78,4 +78,8 @@ void ktimer_expire(void);
 void ktimer_stats(uint32_t* pending, uint64_t* fired, uint64_t* max_late_ns);
 void ktimer_stats_reset(void);     /* zero the worst-lateness maximum */
 
+/* Cancel every armed timer stored in [lo, hi) — an exiting task's stack.
+ * Returns the count; `first_fn` (may be NULL) receives the first callback. */
+int ktimer_cancel_range(uintptr_t lo, uintptr_t hi, ktimer_fn* first_fn);
+
 #endif
