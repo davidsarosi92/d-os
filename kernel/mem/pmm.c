@@ -110,9 +110,14 @@ extern uint8_t kernel_end[];
 static inline pmm_phys_t pfn_to_phys(uint32_t pfn) { return (pmm_phys_t)pfn << PMM_FRAME_SHIFT; }
 static inline uint32_t   phys_to_pfn(pmm_phys_t p)  { return (uint32_t)(p >> PMM_FRAME_SHIFT); }
 
+/* §M86 — the first frame the kernel cannot reach directly.  Equal to
+ * pmm_nr_frames wherever the direct map covers all RAM (x86_64, aarch64). */
+static uint32_t pmm_direct_end_pfn;
+
 /* Which zone owns this pfn?  Returns zone index, or -1 if out of range. */
 static int zone_of_pfn(uint32_t pfn) {
     if (pfn >= pmm_nr_frames) return -1;
+    if (pfn >= pmm_direct_end_pfn)     return ZONE_HIGHMEM;
     if (pfn <  ZONE_DMA_FRAME_LIMIT)   return ZONE_DMA;
     if (pfn <  ZONE_DMA32_FRAME_LIMIT) return ZONE_DMA32;
     return ZONE_NORMAL;
@@ -149,7 +154,20 @@ static int ceil_log2(uint32_t n) {
 /* temporary mapping.                                                         */
 /* -------------------------------------------------------------------------- */
 
+/* The intrusive free-list link lives IN the free frame.  A highmem frame has
+ * no permanent address, so its link is reached through kmap — which is what
+ * lets the ordinary buddy manage highmem at all (§M86). */
+#include "kmap.h"
+static inline int frame_is_direct(pmm_phys_t phys) {
+    return (phys >> PMM_FRAME_SHIFT) < pmm_direct_end_pfn;
+}
 static inline pmm_phys_t link_load(pmm_phys_t phys) {
+    if (!frame_is_direct(phys)) {
+        volatile pmm_phys_t* p = (volatile pmm_phys_t*)kmap_frame(phys);
+        pmm_phys_t v = *p;
+        kunmap_frame((void*)p);
+        return v;
+    }
     return *(volatile pmm_phys_t*)phys_to_virt(phys);
 }
 static inline void link_store(pmm_phys_t phys, pmm_phys_t next) {
@@ -168,6 +186,12 @@ static inline void link_store(pmm_phys_t phys, pmm_phys_t next) {
         kprintf("PMM-GUARD: link_store 0x%x INTO kernel image [0x%x,0x%x) "
                 "pfn=%u caller=%p\n", phys, (uint32_t)ks, (uint32_t)ke,
                 phys >> PMM_FRAME_SHIFT, __builtin_return_address(0));
+    }
+    if (!frame_is_direct(phys)) {
+        volatile pmm_phys_t* p = (volatile pmm_phys_t*)kmap_frame(phys);
+        *p = next;
+        kunmap_frame((void*)p);
+        return;
     }
     *(volatile pmm_phys_t*)phys_to_virt(phys) = next;
 }
@@ -322,6 +346,9 @@ void pmm_init(void) {
                 /* Clamp to the sanity ceiling — a bogus map must not size
                  * gigabytes of metadata.  This is the ONLY fixed limit left. */
                 uint64_t cap = (uint64_t)BUDDY_FRAME_HARD_CAP * PMM_FRAME_SIZE;
+                /* §M86 — a 32-bit physical address cannot name a frame past
+                 * 4 GiB (that is PAE's job, a different page-table format). */
+                if (sizeof(pmm_phys_t) == 4 && cap > 0xFFFFF000ull) cap = 0xFFFFF000ull;
                 if (hi > cap) hi = cap;
                 if (hi > max_phys) max_phys = hi;
             }
@@ -331,8 +358,10 @@ void pmm_init(void) {
     uint64_t covered = hal_extend_identity_map((uintptr_t)max_phys);
     if (covered > max_phys) covered = max_phys;   /* never claim past real RAM */
     if (covered < max_phys) {
-        kprintf("pmm: identity map caps at %u MiB (RAM goes up to %u MiB) — "
-                "HIGHMEM frames will be skipped\n",
+        /* §M86 — no longer skipped: managed as ZONE_HIGHMEM and reached
+         * through kmap (kmap.h).  Only user pages come from there. */
+        kprintf("pmm: direct map ends at %u MiB (RAM goes up to %u MiB) — "
+                "the rest is HIGHMEM, for user pages\n",
                 (unsigned)(covered >> 20), (unsigned)(max_phys >> 20));
     } else if (covered > (uint64_t)1 * 1024 * 1024 * 1024) {
         kprintf("pmm: identity map extended to %u MiB\n",
@@ -341,8 +370,10 @@ void pmm_init(void) {
 
     /* §M48 — the frame ceiling, discovered.  Everything reachable gets
      * metadata; nothing beyond it does. */
-    pmm_nr_frames = (uint32_t)(covered / PMM_FRAME_SIZE);
+    pmm_nr_frames = (uint32_t)(max_phys / PMM_FRAME_SIZE);
     if (pmm_nr_frames > BUDDY_FRAME_HARD_CAP) pmm_nr_frames = BUDDY_FRAME_HARD_CAP;
+    pmm_direct_end_pfn = (uint32_t)(covered / PMM_FRAME_SIZE);
+    if (pmm_direct_end_pfn > pmm_nr_frames) pmm_direct_end_pfn = pmm_nr_frames;
 
     /* Boot arena, sized for every structure that scales with RAM:
      *   page_state[]            1 byte  / frame  (pmm)
@@ -362,9 +393,9 @@ void pmm_init(void) {
     page_state = (uint8_t*)pmm_bootmem_alloc(pmm_nr_frames);
     if (!page_state) { pmm_nr_frames = 0; return; }
 
-    kprintf("pmm: %u MiB usable, %u frames, %u KiB metadata at %p\n",
-            (unsigned)(covered >> 20), pmm_nr_frames, arena >> 10,
-            (void*)arena_base);
+    kprintf("pmm: %u MiB directly mapped of %u MiB, %u frames, %u KiB metadata at %p\n",
+            (unsigned)(covered >> 20), (unsigned)(max_phys >> 20), pmm_nr_frames,
+            arena >> 10, (void*)arena_base);
 
     /* Set up zone descriptors. */
     zones[ZONE_DMA].name        = "DMA";
@@ -374,17 +405,24 @@ void pmm_init(void) {
 
     zones[ZONE_DMA32].name      = "DMA32";
     zones[ZONE_DMA32].start_pfn = ZONE_DMA_FRAME_LIMIT;
-    zones[ZONE_DMA32].end_pfn   = pmm_nr_frames < ZONE_DMA32_FRAME_LIMIT
-                                ? pmm_nr_frames : ZONE_DMA32_FRAME_LIMIT;
+    zones[ZONE_DMA32].end_pfn   = pmm_direct_end_pfn < ZONE_DMA32_FRAME_LIMIT
+                                ? pmm_direct_end_pfn : ZONE_DMA32_FRAME_LIMIT;
     spin_lock_init(&zones[ZONE_DMA32].lock);
 
     /* Empty whenever the machine has 4 GiB or less — which is ALWAYS on i386,
      * where 32-bit page tables cannot express a higher address anyway. */
     zones[ZONE_NORMAL].name      = "NORMAL";
     zones[ZONE_NORMAL].start_pfn = ZONE_DMA32_FRAME_LIMIT;
-    zones[ZONE_NORMAL].end_pfn   = pmm_nr_frames > ZONE_DMA32_FRAME_LIMIT
-                                 ? pmm_nr_frames : ZONE_DMA32_FRAME_LIMIT;
+    zones[ZONE_NORMAL].end_pfn   = pmm_direct_end_pfn > ZONE_DMA32_FRAME_LIMIT
+                                 ? pmm_direct_end_pfn : ZONE_DMA32_FRAME_LIMIT;
     spin_lock_init(&zones[ZONE_NORMAL].lock);
+
+    /* §M86 — everything past the direct map.  Empty on x86_64 and aarch64,
+     * where the direct map covers all RAM. */
+    zones[ZONE_HIGHMEM].name      = "HIGHMEM";
+    zones[ZONE_HIGHMEM].start_pfn = pmm_direct_end_pfn;
+    zones[ZONE_HIGHMEM].end_pfn   = pmm_nr_frames;
+    spin_lock_init(&zones[ZONE_HIGHMEM].lock);
 
     /* Initialize every frame as PS_NONE (doesn't exist).  The mmap walk
      * flips bits to PS_USED for frames inside AVAILABLE regions, then
@@ -396,8 +434,9 @@ void pmm_init(void) {
      * AVAILABLE region stays PS_NONE.  Cap at `covered` so we never
      * try to dereference a frame the HAL didn't make reachable (i386:
      * stuck at 256 MiB until kmap lands; x86_64: extended above). */
-    uint32_t cover_frames = (uint32_t)(covered / PMM_FRAME_SIZE);
-    if (cover_frames > pmm_nr_frames) cover_frames = pmm_nr_frames;
+    /* §M86 — every frame is managed now, reachable or not; only the SEEDING
+     * of an unreachable frame goes through kmap (link_store). */
+    uint32_t cover_frames = pmm_nr_frames;
 
     uintptr_t p   = mbi->mmap_addr;
     uintptr_t end = mbi->mmap_addr + mbi->mmap_length;
@@ -408,10 +447,9 @@ void pmm_init(void) {
             uint64_t base = e->base;
             uint64_t len  = e->length;
 
-            /* Don't even consider regions starting above the identity
-             * cap — we can't address them. */
-            if (base >= (uint64_t)covered) { p += e->size + 4; continue; }
-            if (base + len > (uint64_t)covered) len = (uint64_t)covered - base;
+            uint64_t top = (uint64_t)pmm_nr_frames * PMM_FRAME_SIZE;
+            if (base >= top) { p += e->size + 4; continue; }
+            if (base + len > top) len = top - base;
 
             uint32_t first = (uint32_t)((base + PMM_FRAME_SIZE - 1) / PMM_FRAME_SIZE);
             uint32_t last  = (uint32_t)((base + len) / PMM_FRAME_SIZE);
@@ -497,10 +535,12 @@ void pmm_init(void) {
         }
     }
 
-    kprintf("pmm: buddy ready — DMA m=%u f=%u, DMA32 m=%u f=%u, NORMAL m=%u f=%u (%u MiB total free)\n",
+    kprintf("pmm: buddy ready — DMA m=%u f=%u, DMA32 m=%u f=%u, NORMAL m=%u f=%u, "
+            "HIGHMEM m=%u f=%u (%u MiB total free)\n",
             zones[ZONE_DMA].managed,    zones[ZONE_DMA].free_frames,
             zones[ZONE_DMA32].managed,  zones[ZONE_DMA32].free_frames,
             zones[ZONE_NORMAL].managed, zones[ZONE_NORMAL].free_frames,
+            zones[ZONE_HIGHMEM].managed, zones[ZONE_HIGHMEM].free_frames,
             (initially_free * 4) / 1024);
 }
 
@@ -642,10 +682,16 @@ pmm_phys_t page_alloc(int order, int zone_hint) {
      * asked for DMA32 must not be handed a 40-bit address just because NORMAL
      * has room, which is exactly the corruption the zone split exists to
      * prevent.  The scarcer memory is spent last. */
-    int try_order[3] = { -1, -1, -1 };
+    int try_order[4] = { -1, -1, -1, -1 };
     int n = 0;
 
-    if (zone_hint == ZONE_DMA) {
+    if (zone_hint == ZONE_HIGHMEM) {
+        /* Only on request: a highmem frame has no permanent address. */
+        try_order[n++] = ZONE_HIGHMEM;
+        try_order[n++] = ZONE_NORMAL;
+        try_order[n++] = ZONE_DMA32;
+        try_order[n++] = ZONE_DMA;
+    } else if (zone_hint == ZONE_DMA) {
         try_order[n++] = ZONE_DMA;
     } else if (zone_hint == ZONE_DMA32) {
         try_order[n++] = ZONE_DMA32;
@@ -681,6 +727,35 @@ void page_free(pmm_phys_t phys, int order) {
 
 pmm_phys_t pmm_alloc_frame(void) {
     return page_alloc(0, ZONE_DEFAULT);
+}
+
+/* §M86 — see kmap.h.  Highmem first: low memory is what the kernel itself can
+ * use, so a user page taking it when highmem has room wastes the scarcer
+ * resource. */
+int pmm_frame_is_highmem(pmm_phys_t frame) { return !frame_is_direct(frame); }
+
+pmm_phys_t pmm_alloc_frame_user(void) {
+    return page_alloc(0, ZONE_HIGHMEM);
+}
+
+/* The portable half of kmap: where every frame is directly mapped (x86_64,
+ * aarch64) a frame's address IS its pointer.  i386's vmm.c overrides these. */
+void* kmap_frame(pmm_phys_t frame) __attribute__((weak));
+void* kmap_frame(pmm_phys_t frame) { return phys_to_virt(frame); }
+void  kunmap_frame(void* p) __attribute__((weak));
+void  kunmap_frame(void* p) { (void)p; }
+
+void kmap_zero_frame(pmm_phys_t frame) {
+    uint32_t* d = (uint32_t*)kmap_frame(frame);
+    for (uint32_t i = 0; i < PMM_FRAME_SIZE / 4; i++) d[i] = 0;
+    kunmap_frame(d);
+}
+void kmap_copy_frame(pmm_phys_t dst, pmm_phys_t src) {
+    const uint32_t* s = (const uint32_t*)kmap_frame(src);
+    uint32_t* d = (uint32_t*)kmap_frame(dst);
+    for (uint32_t i = 0; i < PMM_FRAME_SIZE / 4; i++) d[i] = s[i];
+    kunmap_frame(d);                               /* LIFO: last mapped first */
+    kunmap_frame((void*)s);
 }
 
 pmm_phys_t pmm_alloc_contiguous(uint32_t n) {
@@ -722,11 +797,11 @@ void pmm_free_contiguous(pmm_phys_t addr, uint32_t n) {
 
 uint32_t pmm_managed_frames(void) {
     return zones[ZONE_DMA].managed + zones[ZONE_DMA32].managed
-         + zones[ZONE_NORMAL].managed;
+         + zones[ZONE_NORMAL].managed + zones[ZONE_HIGHMEM].managed;
 }
 uint32_t pmm_free_frames(void) {
     return zones[ZONE_DMA].free_frames + zones[ZONE_DMA32].free_frames
-         + zones[ZONE_NORMAL].free_frames;
+         + zones[ZONE_NORMAL].free_frames + zones[ZONE_HIGHMEM].free_frames;
 }
 uint32_t pmm_used_frames(void) {
     return pmm_managed_frames() - pmm_free_frames();
@@ -790,10 +865,11 @@ void pmm_validate(const char* tag) {
 void pmm_print_stats(void) {
     uint32_t total_mgr  = pmm_managed_frames();
     uint32_t total_free = pmm_free_frames();
-    kprintf("pmm: managed=%u free=%u used=%u (%u/%u MiB free) | DMA: m=%u f=%u | DMA32: m=%u f=%u | NORMAL: m=%u f=%u\n",
+    kprintf("pmm: managed=%u free=%u used=%u (%u/%u MiB free) | DMA: m=%u f=%u | DMA32: m=%u f=%u | NORMAL: m=%u f=%u | HIGHMEM: m=%u f=%u\n",
             total_mgr, total_free, total_mgr - total_free,
             (total_free * 4) / 1024, (total_mgr * 4) / 1024,
             zones[ZONE_DMA].managed,    zones[ZONE_DMA].free_frames,
             zones[ZONE_DMA32].managed,  zones[ZONE_DMA32].free_frames,
-            zones[ZONE_NORMAL].managed, zones[ZONE_NORMAL].free_frames);
+            zones[ZONE_NORMAL].managed, zones[ZONE_NORMAL].free_frames,
+            zones[ZONE_HIGHMEM].managed, zones[ZONE_HIGHMEM].free_frames);
 }

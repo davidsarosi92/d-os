@@ -12,6 +12,7 @@
 #include "elf.h"
 #include "vmm.h"
 #include "pmm.h"
+#include "kmap.h"
 #include "task.h"
 #include "usermode.h"
 #include "printf.h"
@@ -144,7 +145,11 @@ static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
     if (argc < 0) argc = 0;
     if (argc > PROC_MAX_ARGV) argc = PROC_MAX_ARGV;
 
-    uint8_t* base = (uint8_t*)phys_to_virt(frame_phys); /* kernel direct map    */
+    /* §M86 — the stack is a USER page and may be highmem: written through a
+     * kmap, released at the single return below.  Nothing in between sleeps
+     * (random_bytes takes a spinlock), which the kmap contract requires. */
+    uint8_t* base = (uint8_t*)kmap_frame(frame_phys);
+    if (!base) return 0;
     for (uint32_t i = 0; i < PAGE_SIZE; i++) base[i] = 0;
 
     /* 1. Copy the argument strings to the top of the page, recording each
@@ -222,6 +227,7 @@ static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
     w[k++] = AT_BASE;  w[k++] = lp ? lp->interp_base    : 0;
     w[k++] = AT_ENTRY; w[k++] = lp ? lp->main.entry     : 0;
     w[k++] = AT_NULL;  w[k++] = 0;                     /* auxv terminator       */
+    kunmap_frame(base);
     return stack_va + koff;
 }
 
@@ -281,10 +287,9 @@ static pmm_phys_t map_user_stack(struct vmm_space* s, uintptr_t* stack_va_out) {
     pmm_phys_t top_frame = 0;
     for (uint32_t i = 0; i < PROC_STACK_PAGES; i++) {
         uintptr_t va = top_page - (uintptr_t)i * PAGE_SIZE;
-        pmm_phys_t fr = pmm_alloc_frame();
+        pmm_phys_t fr = pmm_alloc_frame_user();          /* §M86 — may be highmem */
         if (!fr) return 0;
-        uint8_t* p = (uint8_t*)phys_to_virt(fr);
-        for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = 0;
+        kmap_zero_frame(fr);
         if (vmm_space_map(s, va, fr, VMM_USER | VMM_WRITABLE) != 0) {
             pmm_free_frame(fr);
             return 0;

@@ -19,6 +19,8 @@
 #include "lock.h"
 #include "hal_api.h"
 #include "proc.h"        /* §M75 — memhog spawns a ring-3 process */
+#include "timer.h"
+#include "task.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -36,7 +38,7 @@ static void cmd_slabinfo(void) {
 }
 
 static void cmd_buddyinfo(void) {
-    const char* zone_names[NR_ZONES] = { "DMA", "DMA32", "NORMAL" };
+    const char* zone_names[NR_ZONES] = { "DMA", "DMA32", "NORMAL", "HIGHMEM" };
     uint32_t order_counts[BUDDY_MAX_ORDER + 1];
     kprintf("ZONE     MANAGED  FREE-BLOCKS-PER-ORDER (0..%u)\n",
             BUDDY_MAX_ORDER);
@@ -162,3 +164,67 @@ static void mem_memhog(const char* a) {
 
 SHELL_CMD(memhog)    = { "memhog",    "", "ring-3 process that grows 1 MiB/2 s (memory-column falsifier)",
                          SHELL_G_TEST, mem_memhog, SHELL_P_ADMIN };
+
+/* ---------------------------------------------------------------------------
+ * §M86 — `highmemtest`: every frame of ZONE_HIGHMEM, filled and verified.
+ *
+ * The acceptance test in PLAN §M86 is "a fill-and-verify pass over every
+ * frame", and §M48's lesson is why: a ceiling raised without touching what is
+ * above it hides the bug that matters.  So: take user frames until the
+ * allocator starts handing out LOW memory (highmem exhausted), write a
+ * frame-specific pattern into each through kmap, read every one back, free
+ * them all, and report the counts.  A pattern that depends on the frame
+ * number is what catches two frames aliasing one window slot.  The frame list
+ * itself is kept IN the frames (a chain through word 1), so the test needs no
+ * allocation proportional to what it tests.
+ * ------------------------------------------------------------------------- */
+#include "kmap.h"
+static void cmd_highmemtest(const char* args) {
+    (void)args;
+    uint32_t mgr = 0;
+    pmm_zone_stats(ZONE_HIGHMEM, NULL, &mgr);
+    if (!mgr) { kprintf("highmemtest: no HIGHMEM on this machine (all RAM directly mapped)\n"); return; }
+    uint64_t t0 = timer_ticks_ms();
+    pmm_phys_t head = 0, low = 0;
+    uint32_t n = 0;
+    for (;;) {
+        pmm_phys_t f = pmm_alloc_frame_user();
+        if (!f) break;
+        /* Asked, not inferred: comparing the kmap address with the frame's
+         * number looks like "is it direct?" and is wrong exactly once — the
+         * first highmem frame, 0x3FC00000, IS the address of CPU 0's first
+         * window slot.  That coincidence stopped the first version at 2016
+         * frames while 525 280 were free. */
+        if (!pmm_frame_is_highmem(f)) { low = f; break; }  /* highmem is exhausted */
+        uint32_t* p = (uint32_t*)kmap_frame(f);
+        if (!p) { pmm_free_frame(f); break; }
+        uint32_t pat = (uint32_t)(f >> 12) * 2654435761u;
+        for (int i = 2; i < 1024; i++) p[i] = pat ^ (uint32_t)i;
+        p[0] = 0xC0DEF00Du;
+        p[1] = (uint32_t)head;                    /* chain: previous frame */
+        kunmap_frame(p);
+        head = f;
+        n++;
+    }
+    if (low) pmm_free_frame(low);
+    uint32_t bad = 0, checked = 0;
+    while (head) {
+        uint32_t* p = (uint32_t*)kmap_frame(head);
+        uint32_t pat = (uint32_t)(head >> 12) * 2654435761u;
+        int ok = p[0] == 0xC0DEF00Du;
+        for (int i = 2; ok && i < 1024; i++) if (p[i] != (pat ^ (uint32_t)i)) ok = 0;
+        pmm_phys_t next = (pmm_phys_t)p[1];
+        kunmap_frame(p);
+        if (!ok) bad++;
+        checked++;
+        pmm_free_frame(head);
+        head = next;
+        if ((checked & 4095) == 0) task_yield();
+    }
+    kprintf("highmemtest: %u of %u HIGHMEM frames (%u MiB) filled, %u verified, %u bad, "
+            "in %u ms: %s\n", n, mgr, (n * 4) / 1024, checked, bad,
+            (unsigned)(timer_ticks_ms() - t0),
+            (bad == 0 && checked == n && n > 0) ? "PASS" : "FAIL");
+}
+SHELL_CMD(highmemtest) = { "highmemtest", "", "fill and verify every HIGHMEM frame (kmap)",
+                           SHELL_G_TEST, cmd_highmemtest, SHELL_P_ADMIN };

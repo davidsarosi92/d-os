@@ -43,6 +43,7 @@
 #include "vmm.h"
 #include "hal_api.h"   /* §M51 — hal_tlb_shootdown */
 #include "pmm.h"
+#include "kmap.h"
 #include "printf.h"
 #include "kmalloc.h"
 #include "task.h"
@@ -81,8 +82,26 @@
  * start at PDE 256 and are untouched.  Going FURTHER is not possible without
  * moving user space, which the small code model forbids — past this point the
  * i386 answer is kmap or PAE, not a bigger constant. */
-#define IDENTITY_MAP_MIB 1024
+/* §M86 — 1020, not 1024: the TOP 4 MiB of the kernel's window is the kmap
+ * window (below), which is how RAM past this line is reached at all.  Giving
+ * up 4 MiB of direct map buys access to everything up to 4 GiB. */
+#define IDENTITY_MAP_MIB 1020
 #define IDENTITY_PDES    (IDENTITY_MAP_MIB / 4)   /* 4 MiB per PSE PDE */
+
+/* §M86 — THE kmap WINDOW (kmap.h).  PDE 255 = VA 0x3FC00000..0x3FFFFFFF, still
+ * below user space (1 GiB), so it is part of the kernel snapshot every address
+ * space copies and one page table serves them all.  Each CPU owns KMAP_PER_CPU
+ * consecutive slots used as a stack (nested maps unmap in reverse); the slots
+ * occupy the LOW half of the table, and the high half stays available to
+ * vmm_map (ACPI maps tables that sit at the very top of a 1 GiB machine's RAM
+ * there, identity-style). */
+#define KMAP_PDE        IDENTITY_PDES
+#define KMAP_BASE       ((uint32_t)KMAP_PDE << 22)
+#define KMAP_PER_CPU    8
+#define KMAP_CPUS       64
+static uint32_t kmap_pt[1024] __attribute__((aligned(4096)));
+static int      kmap_depth[KMAP_CPUS];
+static int      kmap_paging_on;
 
 /* ------------------------------------------------------------------------- */
 /* Page directory.  Must be 4 KiB aligned — the low 12 bits of CR3 are
@@ -141,6 +160,9 @@ void vmm_init(void) {
         uint32_t phys = (uint32_t)i << 22;
         kernel_pd[i] = phys | PDE_P | PDE_RW | PDE_PS;
     }
+    /* §M86 — the kmap window: a regular page table, supervisor-only. */
+    for (int i = 0; i < 1024; i++) kmap_pt[i] = 0;
+    kernel_pd[KMAP_PDE] = (uint32_t)(uintptr_t)&kmap_pt[0] | PDE_P | PDE_RW;
 
     /* Enable 4 MiB pages in CR4 before switching on paging.  Doing it
      * the other way round would leave our PDEs misinterpreted. */
@@ -154,6 +176,7 @@ void vmm_init(void) {
      * current EIP sits in the identity-mapped 1 GiB, execution
      * continues seamlessly. */
     write_cr0(read_cr0() | 0x80000000u);        /* CR0.PG */
+    kmap_paging_on = 1;
 
     kprintf("vmm: paging on, identity %d MiB (PSE), pd @ %p\n",
             IDENTITY_MAP_MIB, (void*)&kernel_pd[0]);
@@ -503,11 +526,10 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
                 }
             } else {
                 /* Read-only (code) → eager private copy (cheap, rarely large). */
-                pmm_phys_t nf = pmm_alloc_frame();
+                /* §M86 — both frames are user pages and may be highmem. */
+                pmm_phys_t nf = pmm_alloc_frame_user();
                 if (!nf) { vmm_space_destroy(child); return NULL; }
-                const uint32_t* src = (const uint32_t*)(uintptr_t)frame;
-                uint32_t* dst = (uint32_t*)(uintptr_t)nf;
-                for (int k = 0; k < 1024; k++) dst[k] = src[k];
+                kmap_copy_frame(nf, frame);
                 if (map_in_pd(child->pd, virt, nf, VMM_USER) != 0) {
                     pmm_free_frame(nf); vmm_space_destroy(child); return NULL;
                 }
@@ -551,11 +573,9 @@ int vmm_cow_fault(uintptr_t fault_va) {
         if (rc) *rc = 0;
     } else {
         (*rc)--;                                        /* one fewer sharer   */
-        pmm_phys_t nf = pmm_alloc_frame();
+        pmm_phys_t nf = pmm_alloc_frame_user();         /* §M86 — may be highmem */
         if (!nf) { (*rc)++; return 0; }                 /* OOM → real fault    */
-        const uint32_t* src = (const uint32_t*)(uintptr_t)old;
-        uint32_t* dst = (uint32_t*)(uintptr_t)nf;
-        for (int k = 0; k < 1024; k++) dst[k] = src[k];
+        kmap_copy_frame(nf, old);
         pt[pti] = (nf & PAGE_MASK) | PTE_P | PTE_US | PTE_RW;
     }
     /* §M51 — the page now points at a DIFFERENT frame (or became writable in
@@ -645,3 +665,62 @@ uintptr_t vmm_space_mmap_cursor(struct vmm_space* s) {
 void vmm_space_set_mmap_cursor(struct vmm_space* s, uintptr_t v) {
     if (s) s->mmap_cursor = v;
 }
+
+/* ---------------------------------------------------------------------------
+ * §M86 — kmap_frame / kunmap_frame for i386 (contract in kmap.h).
+ *
+ * A directly-mapped frame is its own address.  Anything else gets this CPU's
+ * next window slot: write the PTE, flush THIS CPU's entry for it, and keep
+ * preemption off until the matching kunmap, so the task cannot migrate away
+ * from the slot it is using.  No cross-CPU shootdown is needed, for the same
+ * reason: no other CPU ever uses this CPU's slots, and a stale entry another
+ * CPU might hold for one of them is never dereferenced there.
+ *
+ * Before paging is on (pmm_init seeds the free lists before vmm_init) every
+ * physical address below 4 GiB is directly addressable, so the frame is
+ * returned as-is — a window address would mean something else entirely then.
+ * ------------------------------------------------------------------------- */
+#include "percpu.h"
+#include "lock.h"
+
+void* kmap_frame(pmm_phys_t frame) {
+    uint32_t f = (uint32_t)frame & PAGE_MASK;
+    if (!kmap_paging_on || f < (uint32_t)IDENTITY_MAP_MIB * 1024u * 1024u)
+        return (void*)(uintptr_t)frame;
+    preempt_disable();
+    uint32_t fl = hal_intr_save();
+    int c = this_cpu_id();
+    if (c < 0 || c >= KMAP_CPUS) c = 0;
+    int d = kmap_depth[c];
+    if (d >= KMAP_PER_CPU) {
+        /* A nesting deeper than any caller needs is a leak of kunmaps. */
+        hal_intr_restore(fl);
+        preempt_enable();
+        kprintf("!! KMAP: cpu %d has %d mappings open - a kunmap_frame is "
+                "missing\n", c, d);
+        return NULL;
+    }
+    kmap_depth[c] = d + 1;
+    uint32_t idx = (uint32_t)(c * KMAP_PER_CPU + d);
+    uint32_t va  = KMAP_BASE + (idx << 12);
+    kmap_pt[idx] = f | PTE_P | PTE_RW;
+    invlpg(va);
+    hal_intr_restore(fl);
+    return (void*)(uintptr_t)(va | ((uint32_t)frame & 0xFFFu));
+}
+
+void kunmap_frame(void* p) {
+    uint32_t va = (uint32_t)(uintptr_t)p & PAGE_MASK;
+    if (va < KMAP_BASE || va >= KMAP_BASE + (uint32_t)(KMAP_CPUS * KMAP_PER_CPU) * 4096u)
+        return;                                   /* a direct address: nothing */
+    uint32_t fl = hal_intr_save();
+    int c = this_cpu_id();
+    if (c < 0 || c >= KMAP_CPUS) c = 0;
+    uint32_t idx = (va - KMAP_BASE) >> 12;
+    kmap_pt[idx] = 0;
+    invlpg(va);
+    if (kmap_depth[c] > 0) kmap_depth[c]--;
+    hal_intr_restore(fl);
+    preempt_enable();
+}
+

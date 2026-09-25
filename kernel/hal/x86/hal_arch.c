@@ -140,7 +140,9 @@ void hal_arch_early_init(void) {
  * --------------------------------------------------------------------------- */
 uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
     (void)end_phys;
-    return (uintptr_t)1024u * 1024u * 1024u;    /* IDENTITY_MAP_MIB in vmm.c */
+    /* §M86 — IDENTITY_MAP_MIB in vmm.c.  RAM past it is no longer ignored: the
+     * PMM manages it as ZONE_HIGHMEM and reaches it through kmap (kmap.h). */
+    return (uintptr_t)1020u * 1024u * 1024u;
 }
 
 /* ---------------------------------------------------------------------------

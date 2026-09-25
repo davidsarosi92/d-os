@@ -83,6 +83,8 @@ Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI
 | 8b | ~~Creating N files in one exFAT directory is O(N²)~~ | — | **FIXED 2026-09-25**: the block cache held 64 sectors (in 64 whole frames) and a 1060-file directory is 265, so every pass missed; now 1024 slots packed 8 per frame + a hash, and the directory walk resumes its FAT position.  `rmdirtest` 512 s → 29 s, `diskstorm` 1447 → 609 ms.  Still two passes per create (duplicate check + slot search) |
 | 9 | ~~aarch64 does not publish `/dev/vda`~~ | — | already fixed (`e2973b2`, the block layer publishes); verified on both ARM boot paths 2026-09-25 |
 | 10 | ~~`load_balance_pull` counts a refused migration~~ | — | already fixed by §M57: the insert happens inside `load_steal_one` under both locks and a refusal returns NULL, so `migrations++` counts only completed moves (read 2026-09-25) |
+| 11 | The synchronous ring-3 EXCURSION (`proc_exec_elf`: forktest, musltest, threadtest…) traps onto a per-CPU SHARED syscall stack and keeps its resume point in GLOBAL `saved_esp`/`saved_eip` | medium (test path) | found 2026-09-26 by the `!! KSTACK` check: a program that blocks in a syscall (forktest's waitpid) leaves its frames on the CPU's shared stack, where another excursion on that CPU overwrites them; two excursions at once overwrite each other's resume point.  Real programs use `proc_spawn`, which is correct |
+| 12 | aarch64: one `diskstorm 2 20` took 5.6 s (normally ~0.2 s) after forktest+musltest | watch | not reproduced in 6 runs; the first run after `musltest` is ~0.5 s (cold cache) |
 
 ### Checked and no longer open
 

@@ -112,7 +112,11 @@ typedef uint32_t pmm_phys_t;
 #define ZONE_DMA            0
 #define ZONE_DMA32          1
 #define ZONE_NORMAL         2
-#define NR_ZONES            3
+/* §M86 — frames the kernel cannot address directly (i386: above its 1020 MiB
+ * identity map).  Handed out ONLY on request (pmm_alloc_frame_user, kmap.h);
+ * ZONE_DEFAULT never falls into it.  Empty wherever everything is mapped. */
+#define ZONE_HIGHMEM        3
+#define NR_ZONES            4
 #define ZONE_DEFAULT        (-1)
 
 /* Frame index of the 4 GiB line — the DMA32 / NORMAL boundary. */

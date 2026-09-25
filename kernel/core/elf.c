@@ -12,6 +12,7 @@
 #include "elf.h"
 #include "vmm.h"
 #include "pmm.h"
+#include "kmap.h"
 #include "printf.h"
 #include "hal_api.h"   /* hal_elf_can_exec — "is this image for this machine?" */
 #include <stdint.h>
@@ -91,9 +92,12 @@ static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len
     uintptr_t span = page_off + p->memsz;
 
     for (uintptr_t off = 0; off < span; off += PAGE_SIZE) {
-        pmm_phys_t frame = pmm_alloc_frame();
+        /* §M86 — a USER page, so it may come from highmem, and the kernel
+         * writes it through a short kmap rather than the direct map. */
+        pmm_phys_t frame = pmm_alloc_frame_user();
         if (!frame) return ELF_ENOMEM;
-        uint8_t* dst = (uint8_t*)phys_to_virt(frame);   /* kernel direct map */
+        uint8_t* dst = (uint8_t*)kmap_frame(frame);
+        if (!dst) { pmm_free_frame(frame); return ELF_ENOMEM; }
         for (int i = 0; i < (int)PAGE_SIZE; i++) dst[i] = 0;
 
         /* Copy the slice of file data that lands in this page.  `fpos` is
@@ -108,6 +112,7 @@ static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len
             uintptr_t n      = avail < room ? avail : room;
             copy_bytes(dst + dst_lo, image + p->offset + seg_lo, (size_t)n);
         }
+        kunmap_frame(dst);
 
         if (vmm_space_map(space, va_base + off, frame, flags) != 0) {
             pmm_free_frame(frame);

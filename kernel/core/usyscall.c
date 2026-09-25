@@ -44,6 +44,7 @@
 #include "audit.h"     /* §M71 — the boundary audit registers here */
 #include "uaccess.h"   /* §1.1 — fault-safe user copies (exception table) */
 #include "pmm.h"
+#include "kmap.h"
 #include "console.h"
 #include "vc.h"
 #include "waitq.h"
@@ -449,10 +450,9 @@ long sys_mmap(size_t len, int fd) {
 
     if (fd < 0) {
         for (int i = 0; i < n; i++) {
-            pmm_phys_t fr = pmm_alloc_frame();
+            pmm_phys_t fr = pmm_alloc_frame_user();   /* §M86 — may be highmem */
             if (!fr) return -1;
-            uint8_t* p = (uint8_t*)phys_to_virt(fr);
-            for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = 0;
+            kmap_zero_frame(fr);
             if (vmm_space_map(t->mm, va + (uintptr_t)i * PAGE_SIZE, fr,
                               VMM_USER | VMM_WRITABLE) != 0) {
                 pmm_free_frame(fr);
@@ -554,17 +554,29 @@ long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
          * the fresh frame maps cleanly. */
         if (flags & MAP_FIXED) vmm_space_unmap(t->mm, page_va);
 
-        pmm_phys_t fr = pmm_alloc_frame();
+        /* §M86 — a USER page, so it may be highmem.  A file-backed page is
+         * READ first into a kernel bounce page and only then copied through a
+         * kmap: vfs_read can sleep on the disk, and a kmap must not be held
+         * across a sleep (kmap.h). */
+        pmm_phys_t fr = pmm_alloc_frame_user();
         if (!fr) return -1;
-        uint8_t* p = (uint8_t*)phys_to_virt(fr);      /* kernel direct map     */
-        for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = 0;
+        kmap_zero_frame(fr);
 
         if (file) {
+            uint8_t* bounce = (uint8_t*)kmalloc(PAGE_SIZE);
+            if (!bounce) { pmm_free_frame(fr); return -1; }
+            for (int b = 0; b < (int)PAGE_SIZE; b++) bounce[b] = 0;
             /* Positioned read; restore the fd cursor (musl owns it). */
             uint64_t save = file->pos;
             file->pos = offset + (uint64_t)i * PAGE_SIZE;
-            vfs_read(file, p, PAGE_SIZE);             /* short tail → stays 0  */
+            vfs_read(file, bounce, PAGE_SIZE);        /* short tail → stays 0  */
             file->pos = save;
+            uint8_t* p = (uint8_t*)kmap_frame(fr);
+            if (p) {
+                for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = bounce[b];
+                kunmap_frame(p);
+            }
+            kfree(bounce);
         }
 
         if (vmm_space_map(t->mm, page_va, fr, vf) != 0) {

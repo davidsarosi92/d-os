@@ -116,6 +116,7 @@ when sections are added.)
 | 4.73 | exFAT can create and remove now (§M12 gap); storage modes | 8073 |
 | 4.74 | The desktop is where boot ends; leaving it lands on a shell | 8228 |
 | 4.74.1 | A command channel on COM1 (harness vs. GUI focus) | 8946 |
+| 4.94 | i386 highmem through kmap (§M86 stage 1) | 13800 |
 | 4.75 | Terminal scrollback; a selection is an absolute line (§M58) | 8402 |
 | 4.76 | Redirection: fds 0/1/2 were not descriptors (§M59) | 8469 |
 | 4.77 | aarch64 can change resolution now (§M61 complete) | 8537 |
@@ -13790,8 +13791,51 @@ without a 2 ms backstop.  Verified on the serial boot path at `-smp 2`:
 `completion interrupts work`, `diskstorm 4 20` and `2 20` PASS (0 wrong
 read-backs), `killstorm` 20/20, `fsck.exfat` clean.
 
+
+### 4.94 i386 highmem — all RAM up to 4 GiB, through kmap (§M86 stage 1, 2026-09-26)
+
+**Before:** the i386 kernel reached RAM only through its 1 GiB identity map
+(user space starts at 1 GiB), and `pmm_init` ignored every frame above it —
+a 3 GiB machine managed 1 GiB.  **After:** the PMM manages all of it; the part
+past the direct map is `ZONE_HIGHMEM`, reached through **`kmap_frame` /
+`kunmap_frame`** (`kmap.h`).
+
+- **The window** is the top 4 MiB of the old identity map (PDE 255, VA
+  `0x3FC00000`), so the direct map is now **1020 MiB**.  It is below user space,
+  so it is part of the kernel snapshot every address space copies — one page
+  table serves them all.  Each CPU owns 8 consecutive slots used as a stack;
+  a mapping holds preemption off until it is released, so the task cannot
+  migrate off its slot, and no cross-CPU shootdown is needed.  Before paging
+  is on (the PMM seeds its lists first) a frame is returned as-is.
+- **The buddy needed no second allocator:** its free-list links live inside
+  the free frames, and `link_load`/`link_store` go through kmap for a highmem
+  frame.  `memcheck` walks every list through the same path.
+- **Only USER pages come from highmem** (`pmm_alloc_frame_user()`; the default
+  allocator never falls into it): ELF segments, user stacks, anonymous and
+  file-backed mmap, and the fork/COW copies.  Everything the kernel
+  dereferences by frame address — page tables, the heap, DMA buffers, the
+  block cache, shm/memfd frames (the Wayland/dosgui bridges read them directly)
+  — stays low.  File-backed mmap reads into a kernel bounce page first,
+  because `vfs_read` may sleep and a kmap must not be held across a sleep.
+- A 32-bit `pmm_phys_t` cannot name a frame past 4 GiB, so the i386 ceiling is
+  4 GiB until PAE (stage 2).
+
+**Measured, i386 `-m 3G`:** `pmm: buddy ready — DMA32 m=244674, HIGHMEM
+m=525280` (3007 MiB managed, was ~1020); **`highmemtest`** fills every one of
+the 525 280 highmem frames with a frame-specific pattern through kmap and reads
+it back — 2051 MiB, 0 bad, 20 s; `memcheck` consistent afterwards; a running
+`memhog` visibly draws from HIGHMEM (525 280 → 523 231 free); `forktest`,
+`musltest`, `threadtest`, `diskstorm 4 20`, `killstorm` and the GUI all pass
+at `-smp 4`.  x86_64 and aarch64 (whose direct maps cover everything) report
+"no HIGHMEM" and pass the same set.  **A test bug worth keeping:** the first
+`highmemtest` stopped at 2016 frames, because it decided "is this frame
+direct?" by comparing the kmap address with the frame number — and the first
+highmem frame, `0x3FC00000`, IS the address of CPU 0's first window slot.  It
+asks the PMM now (`pmm_frame_is_highmem`).
+
 ## 8. Change log
 
+- **2026-09-26 — §M86 stage 1: i386 manages all RAM up to 4 GiB (ZONE_HIGHMEM + kmap) (DOCS §4.94).**
 - **2026-09-25 — Block cache 16× larger in half the memory (packed + hashed); `blkstormtest` proves the storm detector on the REAL storm; HDA no longer goes silent for good after an underrun (NEXT.md #5, #7, #8b).**
 - **2026-09-25 — exFAT: a full directory no longer writes into its neighbour's data; directories grow; `dir_is_empty` scans all of it (DOCS §4.73.1).**
 - **2026-09-25 — The serial command channel is portable; aarch64's display boot path can be driven (DOCS §4.74.1).**
