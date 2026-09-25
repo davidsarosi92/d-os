@@ -289,6 +289,8 @@ what); a session can pick a theme and push on it.
 | M81 | **The GUI's seams — an audit of how it is assembled** — the compositor, the widget toolkit and the apps have grown by accretion, and §M32's GUI work spent three rounds in the wrong file because of it: an undocumented placement convention, a flag honoured in one of four dispatch paths, a strip that clipped a popup silently, and a window that lays out only if it was created the right way.  **The deliverable is a VERDICT with measurements, not a rewrite**: which seams are real, which are conventions nobody wrote down, and which communications with the kernel should become declared interfaces | UX / Architecture | §M81 — audit, verdict required |
 | M82 | **The SESSION becomes a first-class thing** — §M81 gave the GUI a real identity (`cred_become_user` on a session leader) and stopped there.  What the identity does not yet carry is a *desktop*: every user should have their own program list, icon field, wallpaper and environment, and the greeter and the lock should be SEPARATE from the session rather than windows inside it.  Includes per-user and system-wide `PATH`, with the user's overriding, and saving a session's state at sign-out | UX / Security | §M82 — designed, not started |
 | M83 | **Everything is a package, and the tree splits along the package lines** — asked for directly: *what can be, goes into its own repository; everything modular; everything manageable from `pkg` — desktop, compositor, GUI, Wayland, everything.*  Today no package can come from OUTSIDE the kernel image (every payload is a blob compiled into the 61 MB `kernel.bin`, and `/store` is ramfs rebuilt per boot), 21 registries are linker sections that only a build can fill, and a §M67 module can carry exactly one `struct driver` against 41 exported symbols.  Apps are proposed as RING-3 programs (§M65's `dosgui_ui_build` already exists), gui-core / shells / Wayland as module packages — and **every ring-0 component is reviewed** (must stay / could move / unknown cost, with the reason and a measured boundary-crossing cost), because most of them are in the kernel by history rather than by requirement.  Staged so the REPOSITORY split comes LAST, gated on a green boundary audit — a split along lines the code does not yet respect is a refactor done across repositories | Architecture / Packaging | §M83 — designed, not started |
+| M84 | **A mobile interface — d-os must run on a PHONE** — asked for directly (2026-09-25), with the reason stated: *this is also why everything has to be modular.*  A phone is a different desktop SHELL (§M22's `DESKTOP_SHELL()` registry already makes that a file), a different INPUT model (touch, gestures, an on-screen keyboard — there is no touch input anywhere in the tree today), a different FORM FACTOR (portrait, small, high density — §M65's size classes and §M69's `cp_px()` density are the start), and different HARDWARE (SoC, device tree, panel, battery, modem).  Staged: a mobile shell + touch on emulated hardware first, a phone-shaped `virt` second, a real device last.  Depends on §M83 (the mobile shell, keyboard and apps as packages chosen per device, not a second kernel build) and on §M85 (no hardcoded board) | UX / Platform | §M84 — designed, not started |
+| M85 | **aarch64 beyond `virt`: QEMU `sbsa-ref`** — asked for directly (2026-09-25).  The ARM port knows exactly ONE machine: ten places hardcode `virt`'s map (GICv2 at `0x08000000`, PL011 at `0x09000000`, virtio-mmio at `0x0a000000`, ECAM at `0x40_1000_0000`, RAM at `0x4000_0000`, the DTB loaded at `0x4800_0000`).  `sbsa-ref` is the reference for a STANDARD ARM server: firmware boot (TF-A + EDK2, UEFI), ACPI instead of a device tree, GICv3, devices on PCIe rather than virtio-mmio.  The deliverable is a port that DISCOVERS its board — which is also the precondition for any real phone (§M84) | Platform / Portability | §M85 — designed, not started |
 
 ### Cross-cutting constraints
 
@@ -8713,3 +8715,118 @@ it is moved, never moved to find out.
   builds everything" property.  The artifact cache (`build/.userartifacts`,
   §M46) is the start of per-package caching and should be generalised rather
   than replaced.
+
+
+## §M84 — A mobile interface: d-os on a phone
+
+Asked for directly (2026-09-25): *"a mobile interface — that is also why it has
+to be modular — it has to run on a phone too."*
+
+**Status: designed, not started.**
+
+### Why this is the modularity argument, not a separate feature
+
+A phone and a desktop share the kernel, the scheduler, the filesystem, the
+network stack and most of the toolkit — and differ in the SHELL, the INPUT, the
+DENSITY and the HARDWARE.  If each of those is a swappable unit, a phone is a
+different SELECTION of packages on the same kernel; if they are not, it is a
+fork.  That is why this depends on §M83: the mobile shell, the on-screen
+keyboard and the phone apps must be packages a device chooses, not code a build
+flag compiles in.
+
+### What exists today (read from the tree, 2026-09-25)
+
+| piece | state |
+|---|---|
+| desktop shell as a unit | ✅ `DESKTOP_SHELL()` registry, `gui.shell` key (vista, bare) |
+| responsive layout | ◐ §M65 size classes (`UI_SIZE_COMPACT` < 60 cells), `UI_WRAP_COMPACT` |
+| density-independent sizes | ◐ §M69 `cp_px()` derives density from the framebuffer width — a phone's small, dense, PORTRAIT panel is the case it was not measured on |
+| runtime resolution | ✅ §M61 (x86 + aarch64 virtio-gpu) |
+| touch input | ❌ none — pointer input is relative mouse deltas (PS/2, virtio-input mouse); no absolute pointer, no multi-touch, no gesture layer |
+| on-screen keyboard | ❌ none |
+| aarch64 port | ✅ but on ONE board only (§M85) |
+| power: suspend, battery, backlight | ❌ none |
+| telephony, SMS, mobile data, sensors | ❌ none |
+
+### Staging (each stage usable on its own)
+
+1. **A mobile shell + touch, emulated.**  A third `DESKTOP_SHELL()` (full-screen
+   apps, a launcher grid, a status bar, a back gesture) — plus an ABSOLUTE
+   pointer path through the whole input stack (virtio-input tablet /
+   multi-touch on QEMU: `ABS_MT_*`), a gesture layer (tap, long press, swipe,
+   pinch) that produces the SAME widget events a mouse does, and an on-screen
+   keyboard as a package that feeds the existing keycode path.  Falsifiable in
+   QEMU with the §4.74.1 serial channel + injected touch events.
+2. **A phone-shaped machine.**  `virt` at a portrait panel (e.g. 720×1440) with
+   only touch attached — no keyboard, no mouse.  Every app checked at that
+   size by PICTURE (§M69's method): what does not fit is the finding.
+3. **A real device.**  Chosen for mainline support, not popularity (a
+   PinePhone-class device, or a Raspberry Pi with a DSI touch panel as the
+   stepping stone): device-tree-driven drivers for the SoC's display, touch
+   controller, storage and power — which is exactly where §M85's "discover
+   the board" and §M33's driver placement pay off.  Telephony is the LAST item,
+   not the first: a modem is a large, closed, safety-relevant peripheral.
+
+### Open questions (to answer with measurements before building)
+
+- One shell that adapts, or two shells?  §M65 argued for three size classes and
+  one rule; a phone may simply be the COMPACT class taken seriously.
+- Where does the gesture recogniser live — compositor (one place, every app
+  gets it) or toolkit (apps can override)?  The §M22.7 split suggests the
+  compositor for system gestures and the toolkit for in-app ones.
+- Power: a phone that cannot suspend is not a phone.  Suspend/resume touches
+  every driver's lifecycle (§M66) — its cost should be measured early.
+
+## §M85 — aarch64 beyond `virt`: QEMU `sbsa-ref`
+
+Asked for directly (2026-09-25): *"next to virt we will also need sbsa-ref."*
+
+**Status: designed, not started.**
+
+### Why: the port knows exactly one machine
+
+QEMU's `virt` is a convenience board, and the ARM port is written against its
+memory map as constants (read from the tree, 2026-09-25):
+
+| what | where it is hardcoded |
+|---|---|
+| GICv2 distributor / CPU interface `0x0800_0000` / `0x0801_0000` | `gic.c`, `smp.c` |
+| PL011 `0x0900_0000`, its SPI 33 | `uart.c` |
+| virtio-mmio slots from `0x0a00_0000`, SPI 48 + slot | `virtio_{gpu,input,snd,mmio_blk,mmio_net}.c` |
+| PCIe ECAM `0x40_1000_0000` | `pci.c` |
+| RAM base `0x4000_0000` | `stubs.c`, the link address |
+| DTB loaded at `0x4800_0000` by `-device loader` | `dtb.c` (and it is read for RAM size + CPU count only) |
+
+`sbsa-ref` is QEMU's reference machine for the Arm **Server Base System
+Architecture**: the machine a STANDARD ARM computer looks like.  It boots
+through FIRMWARE (TF-A + EDK2 — a UEFI environment, not a raw `-kernel` load),
+describes itself with **ACPI** rather than a device tree, has a **GICv3**, and
+puts its devices on **PCIe** rather than virtio-mmio.  Every one of those is
+something this port does not do today — which is precisely why it is worth
+doing: a port that runs on two boards has had to stop assuming one.
+
+### Staging
+
+1. **Discover, do not assume — on `virt` first.**  Take every constant above
+   from the DTB (`virt` already provides one), so the `virt` port keeps
+   working with nothing hardcoded.  The measurable result: the same image
+   boots `virt` with a different memory layout (`-m`, a moved device) unchanged.
+2. **GICv3.**  `virt,gic-version=3` exercises it without changing boards, so
+   the interrupt controller is proven before anything else moves.
+3. **UEFI boot + ACPI.**  An EFI stub (or GRUB-efi) entry, and an ACPI table
+   walk for ARM (MADT's GICC/GICD entries, GTDT for the timer, MCFG for ECAM,
+   SPCR for the console) — x86 already parses ACPI (`kernel/acpi/`), so the
+   parser is shared and only the ARM table types are new.
+4. **`sbsa-ref` itself.**  Its devices on PCIe: the storage controller (AHCI,
+   which CLAUDE.md already names as the next storage item — no storage on real
+   hardware today), xHCI (already portable, §M21 M), and a PCIe NIC.  The
+   exact device set is to be READ from the running machine when this starts,
+   not recalled.
+
+**The acceptance test** is one aarch64 image that boots `virt` (DTB) and
+`sbsa-ref` (ACPI) and reaches a shell on both, driven by the §4.74.1 serial
+channel — and a `drv` / `iommu` / `lsnic` report on each that says what it
+found rather than what it expected.  **Relation to §M84:** a real phone is a
+third board with its own map; §M85's stage 1 is what makes that a device tree
+instead of a port.
+

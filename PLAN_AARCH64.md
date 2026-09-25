@@ -266,3 +266,11 @@ and doing it before A5 costs less than doing it after.
 a feature added to `kernel_main` reaches two arches, not three.  Converging
 the entry paths is not required by any stage above, but every stage will be
 cheaper if it happens first.
+
+## Beyond `virt` — see PLAN.md §M85
+
+`sbsa-ref` (UEFI + ACPI + GICv3 + PCIe devices) is planned as §M85 in
+PLAN.md (2026-09-25).  Its first stage is on this port: take every `virt`
+constant (GIC, PL011, virtio-mmio, ECAM, RAM base, DTB address) from the device
+tree instead of the source, so the port discovers its board.  §M84 (a phone)
+builds on the same stage.
