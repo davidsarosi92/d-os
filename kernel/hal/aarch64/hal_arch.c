@@ -14,6 +14,7 @@
  * ============================================================================= */
 
 #include "hal_api.h"
+#include "board.h"
 #include <stdint.h>
 
 /* Provided by exceptions.c / mmu.c. */
@@ -28,17 +29,31 @@ void hal_cpu_halt(void) {
     __asm__ volatile ("wfi");
 }
 
-/* Power off / reboot via PSCI (same HVC conduit smp.c uses for CPU_ON).  The
- * x86 ports poke ACPI / the keyboard controller; on QEMU `virt` firmware
- * exposes PSCI SYSTEM_OFF (0x84000008) and SYSTEM_RESET (0x84000009). */
+/* ONE PSCI call, through whichever conduit the board description names
+ * (§M85 stage 3).  It was `hvc #0` written out in three places — right for
+ * QEMU `virt`, whose PSCI answers at EL2, and wrong on any machine whose PSCI
+ * is TF-A at EL3 (sbsa-ref, real boards), where an HVC with no EL2 handler is
+ * an undefined-instruction exception, not an error code. */
+long psci_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3) {
+    register uint64_t x0 __asm__("x0") = fn;
+    register uint64_t x1 __asm__("x1") = a1;
+    register uint64_t x2 __asm__("x2") = a2;
+    register uint64_t x3 __asm__("x3") = a3;
+    if (g_board.psci_smc)
+        __asm__ volatile ("smc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
+    else
+        __asm__ volatile ("hvc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
+    return (long)x0;
+}
+
+/* Power off / reboot via PSCI SYSTEM_OFF (0x84000008) / SYSTEM_RESET
+ * (0x84000009).  The x86 ports poke ACPI / the keyboard controller. */
 void hal_shutdown(void) {
-    register uint64_t x0 __asm__("x0") = 0x84000008;   /* PSCI_SYSTEM_OFF */
-    __asm__ volatile ("hvc #0" : "+r"(x0) :: "memory");
+    psci_call(0x84000008, 0, 0, 0);
     for (;;) __asm__ volatile ("wfi");
 }
 void hal_reboot(void) {
-    register uint64_t x0 __asm__("x0") = 0x84000009;   /* PSCI_SYSTEM_RESET */
-    __asm__ volatile ("hvc #0" : "+r"(x0) :: "memory");
+    psci_call(0x84000009, 0, 0, 0);
     for (;;) __asm__ volatile ("wfi");
 }
 

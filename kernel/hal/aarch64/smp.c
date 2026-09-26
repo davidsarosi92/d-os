@@ -87,16 +87,8 @@ void smp_set_lapic_timer_count(uint32_t c) { (void)c; }
 #define PSCI_CPU_ON_AARCH64 0xC4000003u
 
 static long psci_cpu_on(uint64_t target_mpidr, uint64_t entry, uint64_t ctx) {
-    register uint64_t x0 __asm__("x0") = PSCI_CPU_ON_AARCH64;
-    register uint64_t x1 __asm__("x1") = target_mpidr;
-    register uint64_t x2 __asm__("x2") = entry;
-    register uint64_t x3 __asm__("x3") = ctx;
-    /* QEMU `virt` (guest at EL1, no EL3) uses the HVC conduit for PSCI. */
-    __asm__ volatile ("hvc #0"
-                      : "+r"(x0)
-                      : "r"(x1), "r"(x2), "r"(x3)
-                      : "memory");
-    return (long)x0;
+    /* The conduit (HVC on `virt`, SMC under EL3 firmware) is the board's. */
+    return psci_call(PSCI_CPU_ON_AARCH64, target_mpidr, entry, ctx);
 }
 
 /* ---- secondary CPU C entry ------------------------------------------------- */

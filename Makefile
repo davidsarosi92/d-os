@@ -562,6 +562,7 @@ else ifeq ($(ARCH),aarch64)
     kernel/drivers/rtc/pl031_drv.c \
       kernel/hal/aarch64/dtb.c \
       kernel/hal/aarch64/board.c \
+      kernel/hal/aarch64/acpi_arm.c \
       kernel/hal/aarch64/serial_shell.c \
       kernel/core/serial_cmd.c \
       kernel/hal/aarch64/main_entry.c
@@ -2652,6 +2653,40 @@ $(OBJ_DIR)/user/modules_blob.o: user/modules.bin
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LIBGCC)
+
+# §M85 stage 3 — the aarch64 EFI stub (kernel/boot/efi/).  A UEFI firmware
+# (EDK2 on `virt`, sbsa-ref's, a real board's) boots BOOTAA64.EFI, which
+# carries the kernel as a flat image and starts it at its link address.  Part
+# of `all` on purpose: an EFI image built from yesterday's kernel is the
+# stale-image defect §M69 already paid for once.  The span (kernel_start ..
+# kernel_end, i.e. with .bss) comes from the ELF, so the stub claims the
+# memory the kernel will actually use, not just the bytes of the file.
+ifeq ($(ARCH),aarch64)
+EFI_STUB   := $(BUILD_DIR)/BOOTAA64.EFI
+KERNEL_IMG := $(BUILD_DIR)/kernel.img
+EFI_CFLAGS := -O2 -ffreestanding -fpie -fno-plt -fno-stack-protector -fno-builtin \
+              -fno-tree-loop-distribute-patterns -mgeneral-regs-only \
+              -fvisibility=hidden -fno-asynchronous-unwind-tables -Ikernel/includes
+all: $(EFI_STUB)
+kernel: $(EFI_STUB)     # scripts/build.sh builds `kernel` for this arch
+efi: $(EFI_STUB)
+$(KERNEL_IMG): $(KERNEL_BIN)
+	$(CROSS)objcopy -O binary $< $@
+$(EFI_STUB): kernel/boot/efi/efistub.c kernel/boot/efi/efistub_head.S \
+             kernel/boot/efi/efistub.ld kernel/includes/efi_bootinfo.h $(KERNEL_IMG)
+	@mkdir -p $(OBJ_DIR)/efi
+	s=$$($(CROSS)nm $(KERNEL_BIN) | awk '$$3=="kernel_start"{print $$1}'); \
+	e=$$($(CROSS)nm $(KERNEL_BIN) | awk '$$3=="kernel_end"{print $$1}'); \
+	$(CC) $(EFI_CFLAGS) -DDOS_KERNEL_LOAD=0x$$s -DDOS_KERNEL_SPAN=$$((0x$$e - 0x$$s)) \
+	    -c kernel/boot/efi/efistub.c -o $(OBJ_DIR)/efi/efistub.o
+	$(CC) -DKERNEL_IMG_PATH='"$(KERNEL_IMG)"' -c kernel/boot/efi/efistub_head.S \
+	    -o $(OBJ_DIR)/efi/efistub_head.o
+	$(CROSS)ld -nostdlib -static -T kernel/boot/efi/efistub.ld -o $(BUILD_DIR)/efistub.elf \
+	    $(OBJ_DIR)/efi/efistub_head.o $(OBJ_DIR)/efi/efistub.o
+	@if $(CROSS)readelf -r $(BUILD_DIR)/efistub.elf | grep -q "Relocation section"; then \
+	    echo "efistub: the stub has relocations - it would run wrongly off its link address"; exit 1; fi
+	$(CROSS)objcopy -O binary $(BUILD_DIR)/efistub.elf $@
+endif
 
 iso: $(ISO)
 

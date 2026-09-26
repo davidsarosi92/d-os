@@ -293,6 +293,44 @@ def audio_backend(a):
     return a.audio_backend
 
 
+QEMU_SHARE = os.environ.get("QEMU_SHARE") or next(
+    (d for d in ("/opt/homebrew/share/qemu", "/usr/local/share/qemu", "/usr/share/qemu")
+     if os.path.isdir(d)), "/usr/share/qemu")
+
+
+def aarch64_uefi_args(a, argv):
+    """Boot through FIRMWARE instead of `-kernel` (§M85 stage 3).
+
+    The machine then describes itself the way a real ARM server does — EDK2 on
+    `virt` publishes ACPI, not a device tree — and the kernel arrives through
+    build/aarch64/BOOTAA64.EFI on an ESP (a host directory QEMU presents as a
+    FAT disk).  No DTB is loaded: the firmware owns that RAM, and the point is
+    to see what the kernel learns WITHOUT one.  --uefi-fw picks another
+    firmware (a pair: CODE,VARS)."""
+    import shutil
+    code, vars_src = (a.uefi_fw.split(",") if a.uefi_fw else
+                      (os.path.join(QEMU_SHARE, "edk2-aarch64-code.fd"),
+                       os.path.join(QEMU_SHARE, "edk2-arm-vars.fd")))
+    work = "build/aarch64/uefi-%d" % os.getpid()
+    os.makedirs(work + "/esp/EFI/BOOT", exist_ok=True)
+    shutil.copy("build/aarch64/BOOTAA64.EFI", work + "/esp/EFI/BOOT/BOOTAA64.EFI")
+    shutil.copy(vars_src, work + "/vars.fd")
+    out = []
+    skip = 0
+    for i, x in enumerate(argv):
+        if skip:
+            skip -= 1
+            continue
+        if x == "-kernel":
+            skip = 1
+            continue
+        out.append(x)
+    return out + ["-drive", "if=pflash,format=raw,readonly=on,file=" + code,
+                  "-drive", "if=pflash,format=raw,file=" + work + "/vars.fd",
+                  "-drive", "file=fat:rw:%s/esp,format=raw,if=none,id=esp" % work,
+                  "-device", "virtio-blk-device,drive=esp"]
+
+
 def aarch64_dtb_args(a):
     """The device tree for THIS run's machine, loaded where the kernel looks.
 
@@ -471,6 +509,12 @@ def main():
                          "Use `wav` with -- -audiodev ... to CAPTURE what was "
                          "played, which is how §M23 measured every one of its "
                          "numbers")
+    ap.add_argument("--uefi", action="store_true",
+                    help="aarch64 only: boot through UEFI firmware (EDK2) and the "
+                         "EFI stub instead of -kernel, so the machine is described "
+                         "by ACPI (§M85)")
+    ap.add_argument("--uefi-fw", default="",
+                    help="with --uefi: CODE.fd,VARS.fd to use instead of QEMU's EDK2")
     ap.add_argument("--no-display", action="store_true",
                     help="aarch64 only: attach no virtio-gpu, so the guest "
                          "boots the SERIAL shell (serial_shell.c) instead of "
@@ -546,7 +590,9 @@ def main():
             pass
 
     argv = qemu_argv(a, sersock, monsock)
-    if a.arch == "aarch64":
+    if a.arch == "aarch64" and a.uefi:
+        argv = aarch64_uefi_args(a, argv)
+    elif a.arch == "aarch64":
         argv += aarch64_dtb_args(a)
     print("+ " + " ".join(argv), file=sys.stderr)
     proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

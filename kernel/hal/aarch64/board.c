@@ -78,6 +78,7 @@ static void cmd_board(const char* args) {
             (void*)(uintptr_t)g_board.gicd, g_board.gic_version == 3 ? "redist" : "cpuif",
             (void*)(uintptr_t)(g_board.gic_version == 3 ? g_board.gicr : g_board.gicc), src_of(D_GIC));
     kprintf("  timer    INTID %u   [%s]\n", g_board.timer_intid, src_of(D_TIMER));
+    kprintf("  psci     via %s\n", g_board.psci_smc ? "SMC" : "HVC");
     kprintf("  uart     %p  INTID %u   [%s]\n", (void*)(uintptr_t)g_board.uart,
             g_board.uart_intid, src_of(D_UART));
     kprintf("  rtc      %p   [%s]\n", (void*)(uintptr_t)g_board.rtc, g_board.rtc ? src_of(D_RTC) : "none");

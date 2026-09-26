@@ -14096,8 +14096,56 @@ GICv2 and the serial boot path unchanged.
 two test rounds ran the previous image — my output filter matched `error` and
 `make` prints `Error`.  The build's exit status is checked now, not its text.
 
+### 4.100 UEFI boot and ACPI on aarch64 (§M85 stage 3, 2026-09-26)
+
+A real ARM server — and `sbsa-ref` — does not load a kernel with `-kernel`: it
+starts in firmware (UEFI) and describes itself with ACPI.  Both now work on
+`virt` with the EDK2 QEMU ships (`dos-shell-test.py --uefi`).
+
+**The EFI stub** (`kernel/boot/efi/`, built into `build/aarch64/BOOTAA64.EFI`
+by the ordinary aarch64 build, so it cannot go stale) is a PE32+ image whose
+header is written BY HAND in assembly and produced with `objcopy -O binary` —
+Linux's arm64 Image and gnu-efi do the same.  It is position independent and
+relocation-free (the build FAILS if the linked stub has relocations), carries
+the kernel as a flat image, and in order: finds the ACPI RSDP and/or a device
+tree among the configuration tables; claims the kernel's link range and copies
+it there; gets the memory map and EXITS BOOT SERVICES (the map buffer is
+allocated first — allocating after GetMemoryMap changes the key); converts the
+map by arithmetic alone; cleans the data cache over everything the kernel will
+read with its MMU off; turns this EL's MMU off; jumps with x0 = a
+`struct dos_bootinfo` (efi_bootinfo.h).  **Under UEFI the EFI map is the
+authority on RAM**, not a tree's /memory: the firmware keeps runtime services
+and ACPI tables inside that bank.
+
+**ACPI on ARM** (`kernel/hal/aarch64/acpi_arm.c`) fills the same `struct
+board` dtb.c does: MADT (GIC v2/v3, CPUs), GTDT (timer), SPCR (console), MCFG
+(ECAM + bus range), FADT (PSCI conduit), and a DELIBERATELY NARROW AML reader
+for what only the DSDT describes — `Device()` blocks with a string/EISA `_HID`
+and a static-Buffer `_CRS` (virtio-mmio `LNRO0005`, the PCIe host's 32-bit
+window, a PL031).  It executes no AML and says how many devices it saw versus
+used, so "the firmware has none" and "this reader could not read it" differ.
+
+**PSCI is ONE call through the board's conduit** (`psci_call`): it was `hvc #0`
+written out three times, right for `virt` and an undefined-instruction
+exception on any machine whose PSCI is TF-A at EL3.
+
+**The bug the EL2 run found:** firmware starts SECONDARY cores at the EL it
+runs at, and `smp_entry.S` assumed EL1 — the secondary configured EL1's
+registers while executing at EL2 with its MMU off, took the zone lock with
+non-cacheable accesses, and the boot CPU waited forever (`!! SPINLOCK STUCK` in
+`buddy_alloc_in_zone`, "1 CPU online").  The EL2→EL1 descent is one macro now
+(`el2_drop.h`) used by both entry paths.
+
+**Verified:** `virt` + EDK2 at EL1 and at EL2 (`virtualization=on,
+gic-version=3`), 2 CPUs: `board` reports every field `[acpi]` (GIC v2 or v3 +
+redistributor, timer 30, PL011 33, 32 virtio transports, ECAM + window, PSCI
+HVC resp. SMC, no RTC — virt's ACPI names none, and the report says so);
+fork, musl, ping, sound, `excstorm`, `killstorm` green; the display path boots
+too.  The raw `-kernel` path is unchanged on GICv2, GICv3 and EL2.
+
 ## 8. Change log
 
+- **2026-09-26 — §M85 stage 3: aarch64 boots through UEFI (hand-made PE stub) and reads ACPI (MADT/GTDT/SPCR/MCFG/FADT + a narrow DSDT reader); one PSCI conduit; secondaries leave EL2 too (DOCS §4.100).**
 - **2026-09-26 — §M85 stages 1-2: the aarch64 board is read from the device tree (`board` names each source); GICv3 with enabled SGIs (DOCS §4.99).**
 - **2026-09-26 — §M86 COMPLETE, stage 4: every RAM range and reservation in the device tree reaches the PMM; reserved map entries are carved out of overlapping RAM on every arch; the direct map skips holes (DOCS §4.98).**
 - **2026-09-26 — §M86 stage 3: aarch64 reaches RAM through a TTBR1 direct map (8 and 16 GiB verified); the user-pointer gate refuses the upper half; the aarch64 harness finally loads a DTB for the machine it boots (DOCS §4.97).**

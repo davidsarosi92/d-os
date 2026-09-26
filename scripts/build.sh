@@ -128,7 +128,8 @@ printf '%s\n' "$ARCH" > "$STAMP"
 # The AArch64 cross toolchain conflicts with gcc-multilib (i386 -m32), so it
 # lives in a SEPARATE image built from Dockerfile.aarch64.  x86 targets are
 # packaged as a bootable GRUB ISO; the AArch64 port is booted as a raw ELF via
-# QEMU `-M virt -kernel` (no GRUB), so it only needs the `kernel` target.
+# QEMU `-M virt -kernel` (no GRUB), so it only needs the `kernel` target —
+# which also produces build/aarch64/BOOTAA64.EFI, the UEFI entry (§M85).
 case "$ARCH" in
     aarch64)
         IMAGE=d-os-build-aarch64

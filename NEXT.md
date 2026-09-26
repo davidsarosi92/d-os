@@ -72,6 +72,8 @@ established; "open" rows were checked against today's tree, not copied forward.
 | `dtb.c` kept only the LAST `/memory` range | two NUMA nodes: 1014 of 4096 MiB managed | DOCS §4.98 — all ranges + `/memreserve/` |
 | `pmm.c` skipped reserved map entries instead of carving them out of overlapping RAM | (latent on x86; how a DTB reservation is expressed) | DOCS §4.98 |
 | GICv3 SGIs never enabled — cross-CPU reschedule dropped, wakeups waited a tick | `diskstorm` 22.5 s on v3 vs 0.74 s on v2 | DOCS §4.99 |
+| secondary CPUs started at EL2 by firmware ran the EL1-only entry | `!! SPINLOCK STUCK` in buddy_alloc_in_zone, 1 CPU online | DOCS §4.100 — shared `el2_drop.h` |
+| PSCI hard-coded to HVC in three places | (would UNDEF under EL3 firmware) | DOCS §4.100 — `psci_call` |
 
 Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI report with
 `if=`/`task=`/`isr-vec=`/stack scan, monitor replies kept in `<log>.mon`,

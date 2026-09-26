@@ -2,7 +2,7 @@
  * smp_entry.S — AArch64 secondary-core entry trampoline (M21 Phase E).
  *
  * PSCI CPU_ON releases a secondary vCPU here (physical entry point) with the
- * MMU OFF, caches cold, at EL1.  There is no shared low-memory trampoline like
+ * MMU OFF, caches cold — at EL1 on raw `virt`, at EL2 under firmware.  There is no shared low-memory trampoline like
  * x86's AP_BOOT_ADDR — the entry is just our linked address, reachable because
  * the kernel is identity-mapped.
  *
@@ -14,10 +14,15 @@
  *      scheduler.  It never returns; park just in case.
  * ============================================================================= */
 
+#include "el2_drop.h"
+
 .section .text
 .global smp_secondary_entry
 
 smp_secondary_entry:
+    /* Firmware may start a secondary at EL2 (see el2_drop.h). */
+    DROP_TO_EL1 .Lap_el1
+.Lap_el1:
     /* MMU-off SCTLR with the architecturally-RES1 bits set (same value the
      * BSP uses in boot.S before enabling the MMU). */
     ldr     x0, =0x30d00800

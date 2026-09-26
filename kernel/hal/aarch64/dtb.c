@@ -25,6 +25,10 @@
 
 #include "printf.h"
 #include "board.h"
+#include "efi_bootinfo.h"
+
+int acpi_arm_init(uint64_t rsdp_phys);
+int acpi_arm_ncpu(void);
 #include <stdint.h>
 #include <stddef.h>
 
@@ -131,6 +135,7 @@ struct fdt_node {
     const uint8_t* reg;     uint32_t reg_len;
     const uint8_t* intr;    uint32_t intr_len;
     const uint8_t* ranges;  uint32_t ranges_len;
+    const char*    method;                   /* /psci: "hvc" or "smc"         */
     int            disabled;
     uint32_t       acells, scells;          /* for this node's children      */
 };
@@ -183,6 +188,9 @@ static void node_commit(const struct fdt_node* n, uint32_t ac, uint32_t sc) {
         if (reg_tuple(n, ac, sc, 0, &b0, &sz) == 0 && reg_tuple(n, ac, sc, 1, &b1, &sz1) == 0) {
             g_board.gic_version = 2; g_board.gicd = b0; g_board.gicc = b1;
         }
+    } else if (compat_has(n, "arm,psci-1.0") || compat_has(n, "arm,psci-0.2") ||
+               compat_has(n, "arm,psci")) {
+        if (n->method) g_board.psci_smc = str_prefix(n->method, "smc");
     } else if (compat_has(n, "arm,armv8-timer")) {
         /* Specifiers: secure phys, NON-SECURE PHYS, virtual, hypervisor. */
         uint32_t id = intr_intid(n, 1);
@@ -214,6 +222,8 @@ static void node_commit(const struct fdt_node* n, uint32_t ac, uint32_t sc) {
         }
     }
 }
+
+static int g_have_bi_mem;       /* RAM came from the EFI map: ignore /memory */
 
 /* Parse the structure block: /memory, /cpus, /model and the devices. */
 static void fdt_parse(const struct fdt_header* h) {
@@ -274,7 +284,16 @@ static void fdt_parse(const struct fdt_header* h) {
                 if (str_prefix(pname, "#address-cells") && len == 4) acells = rd32(val);
                 if (str_prefix(pname, "#size-cells")    && len == 4) scells = rd32(val);
             }
-            if (depth == 1 && str_prefix(pname, "model") && pname[5] == 0) g_board.model = (const char*)val;
+            if (depth == 1 && str_prefix(pname, "model") && pname[5] == 0) {
+                /* COPIED: the tree lives in RAM the allocator will reuse (the
+                 * raw boot's 0x4800_0000, or firmware boot-services memory), so
+                 * a pointer into it is a dangling pointer by the first shell. */
+                static char model[64];
+                uint32_t k = 0;
+                while (k + 1 < sizeof model && k < len && val[k]) { model[k] = (char)val[k]; k++; }
+                model[k] = 0;
+                g_board.model = model;
+            }
             if (depth >= 1 && depth <= 8) {
                 struct fdt_node* nd = &nodes[depth - 1];
                 if (str_prefix(pname, "#address-cells") && len == 4) nd->acells = rd32(val);
@@ -283,6 +302,7 @@ static void fdt_parse(const struct fdt_header* h) {
                 else if (str_prefix(pname, "reg") && pname[3] == 0)        { nd->reg = val; nd->reg_len = len; }
                 else if (str_prefix(pname, "interrupts") && pname[10] == 0) { nd->intr = val; nd->intr_len = len; }
                 else if (str_prefix(pname, "ranges") && pname[6] == 0)     { nd->ranges = val; nd->ranges_len = len; }
+                else if (str_prefix(pname, "method") && pname[6] == 0)     nd->method = (const char*)val;
                 else if (str_prefix(pname, "status") && pname[6] == 0 &&
                          !str_prefix((const char*)val, "okay") && !str_prefix((const char*)val, "ok"))
                     nd->disabled = 1;
@@ -290,7 +310,7 @@ static void fdt_parse(const struct fdt_header* h) {
             /* /memory@.../reg = one or more <base size> tuples. */
             const char* cur = (depth >= 1 && depth <= 8) ? namestk[depth - 1] : "";
             uint32_t tup = 4 * (acells + scells);
-            if (depth == 2 && str_prefix(cur, "memory") && str_prefix(pname, "reg") &&
+            if (depth == 2 && !g_have_bi_mem && str_prefix(cur, "memory") && str_prefix(pname, "reg") &&
                 acells >= 1 && acells <= 2 && scells >= 1 && scells <= 2) {
                 for (uint32_t o = 0; o + tup <= len; o += tup) {
                     uint64_t b0 = rd_cells(val + o, acells);
@@ -313,9 +333,50 @@ static void fdt_parse(const struct fdt_header* h) {
 
 /* Public: discover the machine from the DTB.  Called early (after the console
  * is up).  Safe to call even if no DTB is found — leaves the getters at 0. */
+/* §M85 stage 3 — booted through the EFI stub (efi_bootinfo.h)? */
+static struct dos_bootinfo g_bi;
+static int g_have_bi;
+
 void dtb_init(uint64_t x0) {
-    const struct fdt_header* h = fdt_find(x0);
+    const struct fdt_header* h;
+    if (x0 && *(const volatile uint64_t*)(uintptr_t)x0 == DOS_BOOTINFO_MAGIC) {
+        /* Copied before anything allocates: the page is the stub's, and the
+         * allocator is entitled to it once it exists. */
+        const struct dos_bootinfo* bi = (const struct dos_bootinfo*)(uintptr_t)x0;
+        uint8_t* d = (uint8_t*)&g_bi;
+        for (uint32_t i = 0; i < sizeof g_bi; i++) d[i] = ((const uint8_t*)bi)[i];
+        g_have_bi = 1;
+        kprintf("efi: booted by '%s' (entered at EL%u): %u usable range(s) from %u "
+                "descriptors, ACPI %p, device tree %p\n", g_bi.fw_vendor, g_bi.entered_el,
+                g_bi.nmem, g_bi.efi_entries, (void*)(uintptr_t)g_bi.rsdp,
+                (void*)(uintptr_t)g_bi.dtb);
+        /* Only the tree the FIRMWARE named — never a scan of RAM for a magic
+         * number, which on a board that is not `virt` reads whatever device
+         * happens to live at 0x4000_0000 (sbsa-ref: the GIC). */
+        h = (g_bi.dtb && be32(((const struct fdt_header*)(uintptr_t)g_bi.dtb)->magic) == FDT_MAGIC)
+            ? (const struct fdt_header*)(uintptr_t)g_bi.dtb : NULL;
+    } else {
+        h = fdt_find(x0);
+    }
+    if (g_have_bi) {
+        /* UNDER UEFI THE MEMORY MAP IS THE FIRMWARE'S, NOT THE TREE'S.  A
+         * /memory node describes the whole bank; runtime services, ACPI tables
+         * and the firmware's own reservations sit inside it, and only the EFI
+         * map says which pages are really free.  Taken first, so a tree parsed
+         * below can add devices but not RAM. */
+        for (uint32_t i = 0; i < g_bi.nmem && g_nmem < DTB_MAX_RANGES; i++) {
+            g_mem_base[g_nmem] = g_bi.mem[i].base; g_mem_size[g_nmem] = g_bi.mem[i].size; g_nmem++;
+        }
+        g_have_bi_mem = g_bi.nmem > 0;
+        if (g_bi.nmem > DTB_MAX_RANGES)
+            kprintf("efi: %u usable ranges, only %d kept\n", g_bi.nmem, DTB_MAX_RANGES);
+    }
     if (!h) {
+        if (g_have_bi && g_bi.rsdp && acpi_arm_init(g_bi.rsdp) == 0) {
+            g_ncpu = acpi_arm_ncpu();
+            board_finish();
+            return;
+        }
         kprintf("dtb: no device tree found (using built-in defaults)\n");
         board_finish();
         return;

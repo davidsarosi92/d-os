@@ -53,6 +53,12 @@ struct board {
     uint64_t  pci_mmio32;             /* 32-bit memory window for BARs          */
     uint64_t  pci_mmio32_size;
 
+    /* PSCI conduit: 0 = HVC (firmware at EL2, or QEMU's own PSCI on `virt`),
+     * 1 = SMC (firmware at EL3: TF-A on sbsa-ref and real boards).  The wrong
+     * one is not an error code — an SMC with no EL3 is UNDEFINED, an HVC with
+     * no EL2 handler likewise — so it is read, never assumed where described. */
+    int       psci_smc;
+
     const char* model;                /* the tree's /model, if any              */
     enum board_src src;               /* where the fields above came from       */
 };
@@ -67,5 +73,8 @@ static inline uint32_t board_virtio_intid(int i)  { return g_board.virtio_intid[
 /* Called by dtb.c (and later the ACPI walker) before any device is touched;
  * fills in the `virt` defaults for whatever the description did not name. */
 void board_finish(void);
+
+/* One PSCI call through the board's conduit (hal_arch.c). */
+long psci_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3);
 
 #endif /* DOS_AARCH64_BOARD_H */
