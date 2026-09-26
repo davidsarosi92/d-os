@@ -29,7 +29,8 @@
 #include "fb_present.h"
 #include "pmm.h"
 #include "printf.h"
-#include "hal_api.h"   /* kptr_phys — device addresses are PHYSICAL (§M86) */
+#include "hal_api.h"
+#include "board.h"   /* §M85 — virtio slots from the device tree */   /* kptr_phys — device addresses are PHYSICAL (§M86) */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -38,9 +39,6 @@ extern int fb_term_init_direct(uint64_t phys, uint32_t width, uint32_t height,
                                uint32_t pitch_bytes);
 
 /* ---- MMIO transport map (QEMU `virt`, shared with virtio_mmio_blk.c) ------- */
-#define VIRTIO_MMIO_BASE    0x0a000000UL
-#define VIRTIO_MMIO_STRIDE  0x200
-#define VIRTIO_MMIO_SLOTS   32
 
 #define R_MAGIC        0x000
 #define R_VERSION      0x004
@@ -434,8 +432,8 @@ void fb_present_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 /* ---- bring-up -------------------------------------------------------------- */
 
 static int gpu_transport_init(void) {
-    for (int i = 0; i < VIRTIO_MMIO_SLOTS; i++) {
-        uintptr_t base = VIRTIO_MMIO_BASE + (uintptr_t)i * VIRTIO_MMIO_STRIDE;
+    for (int i = 0; i < board_virtio_count(); i++) {
+        uintptr_t base = (uintptr_t)board_virtio_base(i);
         if (*(volatile uint32_t*)(base + R_MAGIC) != VIRTIO_MAGIC) continue;
         uint32_t ver = *(volatile uint32_t*)(base + R_VERSION);
         uint32_t dev = *(volatile uint32_t*)(base + R_DEVICEID);

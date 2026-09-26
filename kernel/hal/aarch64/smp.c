@@ -25,6 +25,7 @@
 #include "task.h"
 #include "hal_api.h"
 void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
+#include "board.h"   /* §M85 — the machine, discovered */
 #include <stdint.h>
 
 /* Number of CPUs the kernel is built to manage.  MUST match the QEMU `-smp`
@@ -37,6 +38,7 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 /* From mmu.c / gic.c / exceptions.c / timer.c. */
 void mmu_enable_this_cpu(void);
 void gic_cpu_init(void);
+void gic_send_sgi(int cpu, uint32_t sgi);
 void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
 void timer_init(uint32_t hz);
 
@@ -69,15 +71,12 @@ int     acpi_cpu_node(int slot)     { (void)slot; return 0; }
 /* GICv2 distributor software-generated-interrupt register + our reschedule
  * SGI id.  Sending SGI `n` to CPU `c` sets that core's need_resched via the
  * SGI handler; used by the scheduler to kick a remote CPU. */
-#define GICD_SGIR   (0x08000000UL + 0xF00)
 #define RESCHED_SGI 0
 
 void smp_send_reschedule(int cpu_index) {
     if (cpu_index < 0 || cpu_index >= AARCH64_MAX_CPUS) return;
-    /* GICD_SGIR: TargetListFilter=0 (use list), CPUTargetList = 1<<cpu,
-     * SGIINTID = RESCHED_SGI. */
-    *(volatile uint32_t*)GICD_SGIR =
-        ((1u << cpu_index) << 16) | RESCHED_SGI;
+    /* §M85 — gic.c knows which GIC this is (v2: GICD_SGIR; v3: ICC_SGI1R). */
+    gic_send_sgi(cpu_index, RESCHED_SGI);
 }
 
 /* x86 leftover — the generic timer needs no shared calibration constant. */

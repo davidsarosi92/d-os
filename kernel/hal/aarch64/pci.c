@@ -20,22 +20,37 @@
 
 #include "pci.h"
 #include "printf.h"
+#include "board.h"   /* §M85 — the machine, discovered */
 #include <stdint.h>
 #include <stddef.h>
 
 void mmu_map_device_1gib(uint64_t va);          /* mmu.c */
 
 /* QEMU `virt` PCIe host-bridge windows (stable for the board; see virt.c). */
-#define ECAM_BASE   0x4010000000ULL             /* config space (bus 0..255)   */
-#define MMIO_BASE   0x10000000UL                /* 32-bit MMIO window (Device) */
-#define MMIO_LIMIT  0x3eff0000UL
+/* §M85 stage 1 — from the board description, no longer `virt` constants. */
+#define ECAM_BASE   (g_board.ecam)                              /* config space  */
+#define MMIO_BASE   ((uintptr_t)g_board.pci_mmio32)             /* 32-bit window */
+#define MMIO_LIMIT  ((uintptr_t)(g_board.pci_mmio32 + g_board.pci_mmio32_size))
 
-static uint64_t g_mmio_next = MMIO_BASE;        /* bump allocator for BARs     */
+static uint64_t g_mmio_next;                     /* bump allocator for BARs     */
 static int      g_mapped;
 
+/* 1 when the board has a PCIe ECAM at all.  A board description that names
+ * none means there is none: config reads then answer "no device" (all ones)
+ * instead of dereferencing address 0 plus a bus offset. */
+static int pci_present(void) { return ECAM_BASE != 0; }
+
+/* A bus the ECAM window actually covers (1 MiB of config space per bus).  The
+ * window is the board's, not always 256 buses: `virt,highmem=off` gives 16 MiB
+ * at 0x3f00_0000, which ENDS where RAM begins — so bus 16 there is the kernel
+ * image, and a config WRITE to it (BAR sizing writes all-ones) would land in
+ * our own code. */
+static int bus_ok(uint8_t bus) { return ((uint64_t)bus << 20) < g_board.ecam_size; }
+
 static void pci_map_ecam(void) {
-    if (g_mapped) return;
+    if (g_mapped || !pci_present()) return;
     mmu_map_device_1gib(ECAM_BASE);             /* reach the config space       */
+    g_mmio_next = MMIO_BASE;
     g_mapped = 1;
 }
 
@@ -47,18 +62,23 @@ static inline volatile void* cfg(uint8_t bus, uint8_t slot, uint8_t func, uint32
 
 /* ---- config accessors (ECAM supports sub-dword MMIO access) ----------------- */
 uint32_t pci_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
+    if (!pci_present() || !bus_ok(bus)) return 0xFFFFFFFFu;
     pci_map_ecam(); return *(volatile uint32_t*)cfg(bus, slot, func, off & 0xFC);
 }
 uint16_t pci_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
+    if (!pci_present() || !bus_ok(bus)) return 0xFFFFu;
     pci_map_ecam(); return *(volatile uint16_t*)cfg(bus, slot, func, off & 0xFE);
 }
 uint8_t pci_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
+    if (!pci_present() || !bus_ok(bus)) return 0xFFu;
     pci_map_ecam(); return *(volatile uint8_t*)cfg(bus, slot, func, off);
 }
 void pci_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint32_t v) {
+    if (!pci_present() || !bus_ok(bus)) return;
     pci_map_ecam(); *(volatile uint32_t*)cfg(bus, slot, func, off & 0xFC) = v;
 }
 void pci_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint16_t v) {
+    if (!pci_present() || !bus_ok(bus)) return;
     pci_map_ecam(); *(volatile uint16_t*)cfg(bus, slot, func, off & 0xFE) = v;
 }
 
@@ -121,6 +141,7 @@ static void fill_device(struct pci_device* d, uint8_t bus, uint8_t slot, uint8_t
 /* Enumerate the root bus (bus 0 — QEMU `virt` has no bridges we care about),
  * assign BARs, and hand each function to the visitor. */
 void pci_scan(pci_visit_fn fn, void* ctx) {
+    if (!pci_present()) return;
     pci_map_ecam();
     for (int slot = 0; slot < 32; slot++) {
         if (pci_read16(0, slot, 0, PCI_VENDOR_ID) == 0xFFFF) continue;

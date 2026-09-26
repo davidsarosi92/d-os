@@ -31,14 +31,12 @@
 #include "lock.h"
 #include "waitq.h"
 #include "ktimer.h"
-#include "hal_api.h"   /* kptr_phys — device addresses are PHYSICAL (§M86) */
+#include "hal_api.h"
+#include "board.h"   /* §M85 — virtio slots from the device tree */   /* kptr_phys — device addresses are PHYSICAL (§M86) */
 #include <stdint.h>
 #include <stddef.h>
 
 /* ---- MMIO transport map (QEMU `virt`) -------------------------------------- */
-#define VIRTIO_MMIO_BASE    0x0a000000UL
-#define VIRTIO_MMIO_STRIDE  0x200
-#define VIRTIO_MMIO_SLOTS   32
 
 #define R_MAGIC        0x000   /* 'virt' = 0x74726976                         */
 #define R_VERSION      0x004   /* 2 = modern                                  */
@@ -121,7 +119,6 @@ static inline void dsb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
  * The wait learns interrupts work by RECEIVING one; until then, and whenever it
  * may not sleep, it polls as before, and it never sleeps without a 2 ms
  * backstop, so a lost interrupt costs latency, never the request. */
-#define VIRTIO_MMIO_INTID_BASE 48
 void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
 void gic_enable_irq(uint32_t intid);
 
@@ -244,8 +241,8 @@ static int vmb_write(struct block_device* dev, uint64_t lba, uint32_t count, con
  * negotiate features, set up queue 0, and register it as /dev/vda.  Called
  * once from the aarch64 bring-up; a no-op (returns -1) if no disk is attached. */
 int virtio_mmio_blk_init(void) {
-    for (int i = 0; i < VIRTIO_MMIO_SLOTS; i++) {
-        uintptr_t base = VIRTIO_MMIO_BASE + (uintptr_t)i * VIRTIO_MMIO_STRIDE;
+    for (int i = 0; i < board_virtio_count(); i++) {
+        uintptr_t base = (uintptr_t)board_virtio_base(i);
         uint32_t magic = *(volatile uint32_t*)(base + R_MAGIC);
         if (magic != VIRTIO_MAGIC) continue;
         uint32_t ver = *(volatile uint32_t*)(base + R_VERSION);
@@ -295,8 +292,8 @@ int virtio_mmio_blk_init(void) {
 
     /* The completion interrupt: handler first, then unmask (the install-then-
      * unmask split gic.c mirrors from x86). */
-    gic_register_handler(VIRTIO_MMIO_INTID_BASE + (uint32_t)g_slot, vmb_irq);
-    gic_enable_irq(VIRTIO_MMIO_INTID_BASE + (uint32_t)g_slot);
+    gic_register_handler(board_virtio_intid(g_slot), vmb_irq);
+    gic_enable_irq(board_virtio_intid(g_slot));
 
     /* Capacity (sectors) is the first u64 of the block config space. */
     uint64_t cap = (uint64_t)r32(R_CONFIG) | ((uint64_t)r32(R_CONFIG + 4) << 32);

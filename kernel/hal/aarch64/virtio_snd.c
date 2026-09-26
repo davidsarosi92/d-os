@@ -59,14 +59,12 @@
 /* gic.c — this is the first virtio-mmio driver here to take an interrupt. */
 void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
 void gic_enable_irq(uint32_t intid);
-#include "hal_api.h"   /* kptr_phys — device addresses are PHYSICAL (§M86) */
+#include "hal_api.h"
+#include "board.h"   /* §M85 — virtio slots from the device tree */   /* kptr_phys — device addresses are PHYSICAL (§M86) */
 #include <stdint.h>
 #include <stddef.h>
 
 /* ---- MMIO transport (shared layout with the other four) -------------------- */
-#define VIRTIO_MMIO_BASE    0x0a000000UL
-#define VIRTIO_MMIO_STRIDE  0x200
-#define VIRTIO_MMIO_SLOTS   32
 
 #define R_MAGIC 0x000
 #define R_VERSION 0x004
@@ -110,7 +108,6 @@ void gic_enable_irq(uint32_t intid);
  * and the honest place for that assumption is next to the other one.  If it is
  * wrong the driver still works — the backstop below turns a missing interrupt
  * into latency, never into silence (§M55's rule). */
-#define VIRTIO_MMIO_INTID_BASE 48
 
 /* How long a wait may go without hearing from the device.  A missed interrupt
  * then costs one backstop of latency instead of a hung task. */
@@ -679,15 +676,15 @@ static int snd_dev_init(struct snd_dev* d, uintptr_t base) {
  * portable audio core.  Returns the number of devices found (0 or 1 — one
  * output stream is what §M23 is scoped to). */
 int virtio_snd_init(void) {
-    for (int i = 0; i < VIRTIO_MMIO_SLOTS; i++) {
-        uintptr_t base = VIRTIO_MMIO_BASE + (uintptr_t)i * VIRTIO_MMIO_STRIDE;
+    for (int i = 0; i < board_virtio_count(); i++) {
+        uintptr_t base = (uintptr_t)board_virtio_base(i);
         if (*(volatile uint32_t*)(base + R_MAGIC) != VIRTIO_MAGIC) continue;
         if (*(volatile uint32_t*)(base + R_VERSION) != 2) continue;
         if (*(volatile uint32_t*)(base + R_DEVICEID) != VIRTIO_DEVID_SOUND) continue;
 
         waitq_init(&g_sndwq);
-        gic_register_handler(VIRTIO_MMIO_INTID_BASE + (uint32_t)i, snd_irq);
-        gic_enable_irq(VIRTIO_MMIO_INTID_BASE + (uint32_t)i);
+        gic_register_handler(board_virtio_intid(i), snd_irq);
+        gic_enable_irq(board_virtio_intid(i));
 
         if (snd_dev_init(&g_snd, base) != 0) {
             kprintf("virtio-snd: device at slot %d failed to start\n", i);
@@ -713,7 +710,7 @@ int virtio_snd_init(void) {
         g_audio.priv = &g_snd;
         kprintf("virtio-snd: up at slot %d (base %p), stream %u, INTID %u\n",
                 i, (void*)base, (unsigned)g_snd.stream_id,
-                (unsigned)(VIRTIO_MMIO_INTID_BASE + i));
+                (unsigned)board_virtio_intid(i));
         return 1;
     }
     return 0;

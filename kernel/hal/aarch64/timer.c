@@ -23,6 +23,7 @@
  * ============================================================================= */
 
 #include "ktimer.h"
+#include "board.h"   /* §M85 — the machine, discovered */
 #include <stdint.h>
 
 void uart_early_puts(const char* s);
@@ -44,7 +45,7 @@ void xhci_poll(void) { }
 int  this_cpu_id(void);                 /* percpu.c */
 
 /* GIC INTID of the non-secure EL1 physical timer on QEMU `virt` (PPI 14). */
-#define TIMER_INTID 30
+#define TIMER_INTID (g_board.timer_intid)          /* §M85: from the board */
 
 /* CNTP_CTL_EL0 bits. */
 #define CNTP_CTL_ENABLE (1u << 0)

@@ -561,6 +561,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/pl031_rtc.c \
     kernel/drivers/rtc/pl031_drv.c \
       kernel/hal/aarch64/dtb.c \
+      kernel/hal/aarch64/board.c \
       kernel/hal/aarch64/serial_shell.c \
       kernel/core/serial_cmd.c \
       kernel/hal/aarch64/main_entry.c

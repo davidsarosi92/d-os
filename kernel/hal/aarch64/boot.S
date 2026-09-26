@@ -62,6 +62,26 @@ _start:
     msr     cnthctl_el2, x0
     msr     cntvoff_el2, xzr
 
+    /* §M85 stage 2 — a GICv3 system-register interface is reachable from EL1
+     * only if EL2 says so: ICC_SRE_EL2.Enable (bit 3) lets EL1 use
+     * ICC_SRE_EL1, and SRE (bit 0) selects the register interface.  Without
+     * it EL1's ICC_* accesses trap to EL2 — which, once we have left it, has
+     * no handler.  UEFI firmware (sbsa-ref) enters us at EL2, so this is the
+     * path that board takes.  Guarded by ID_AA64PFR0_EL1.GIC (bits 27:24):
+     * a CPU without the interface would UNDEF on the msr. */
+    mrs     x0, id_aa64pfr0_el1
+    ubfx    x0, x0, #24, #4
+    cbz     x0, 1f
+    mrs     x0, S3_4_C12_C9_5              /* ICC_SRE_EL2 */
+    mov     x1, #0x9                       /* Enable | SRE — 0b1001 is not a
+                                            * valid logical immediate, so it
+                                            * goes through a register */
+    orr     x0, x0, x1
+    msr     S3_4_C12_C9_5, x0
+    isb
+    msr     S3_4_C12_C11_0, xzr            /* ICH_HCR_EL2: no virtual CPU IF */
+1:
+
     /* A sane SCTLR_EL1 with the MMU still OFF.  0x30d00800 sets the
      * architecturally-RES1 bits and leaves caches + MMU disabled; mmu.c
      * later flips M/C/I on. */

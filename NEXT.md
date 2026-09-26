@@ -71,6 +71,7 @@ established; "open" rows were checked against today's tree, not copied forward.
 | aarch64 user-pointer gate indexed bits 38..30 only — an upper-half kernel address could fold onto a user mapping | found reading the gate for the TTBR1 move | DOCS §4.97 — refuse beyond 2^39 |
 | `dtb.c` kept only the LAST `/memory` range | two NUMA nodes: 1014 of 4096 MiB managed | DOCS §4.98 — all ranges + `/memreserve/` |
 | `pmm.c` skipped reserved map entries instead of carving them out of overlapping RAM | (latent on x86; how a DTB reservation is expressed) | DOCS §4.98 |
+| GICv3 SGIs never enabled — cross-CPU reschedule dropped, wakeups waited a tick | `diskstorm` 22.5 s on v3 vs 0.74 s on v2 | DOCS §4.99 |
 
 Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI report with
 `if=`/`task=`/`isr-vec=`/stack scan, monitor replies kept in `<log>.mon`,

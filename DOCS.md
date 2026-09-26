@@ -14046,8 +14046,59 @@ emits one; `DOS_DTB=<file>` makes the harness load it) → managed frames drop b
 (display, sound, network, disk, EL0, audit) green; i386 and x86_64 counts
 identical to before.
 
+### 4.99 aarch64 learns the board from the tree, and GICv3 (§M85 stages 1-2, 2026-09-26)
+
+**Stage 1 — nothing about `virt` is a constant any more.**  The GIC, the PL011
+and its interrupt, the PL031, all thirty-two virtio-mmio transports and their
+interrupts, the PCIe ECAM and its 32-bit memory window, and the timer's
+interrupt now come from the device tree into ONE description
+(`kernel/hal/aarch64/board.h`), which every driver asks.  The `virt` values
+survive only as defaults for a boot with no tree at all, and **`board` reports
+where each field came from** (`[dtb]` or `DEFAULT (virt)`) — "the machine told
+us" and "we assumed" must not look alike, or a wrong assumption on a new board
+reads as a fact about it.  Details that decide correctness:
+
+- a node's properties are COLLECTED while it is open and acted on at its end,
+  because its `compatible` may follow its `reg`; `reg` is sized by the
+  PARENT's cells, `ranges`' child side by the node's own;
+- interrupt specifiers are decoded (SPI 32+n, PPI 16+n), not assumed;
+- the virtio transports are sorted by address, so "slot n" in logs still means
+  what it meant (QEMU emits them in DESCENDING order);
+- a description that names NO RTC or NO PCIe means there is none — a default
+  there would read registers the board may use for something else — and PCIe
+  config accesses are bounded by the ECAM window: `virt,highmem=off` gives
+  16 MiB at 0x3f00_0000, which ends where RAM begins, so "bus 16" there is the
+  kernel image and BAR sizing writes all-ones.
+
+**Measured:** plain `virt` → every field `[dtb]`; the same image on
+`-machine highmem=off` finds the ECAM at **0x3f00_0000 (16 MiB)** instead of
+0x40_1000_0000 and an xHCI + USB keyboard enumerate there.
+
+**Stage 2 — GICv3.**  A system-register CPU interface (ICC_SRE/PMR/BPR1/CTLR/
+IGRPEN1, IAR1/EOIR1, SGI1R), per-CPU redistributors found by matching
+GICR_TYPER's affinity and WOKEN before use, SPIs in group 1 routed by affinity,
+and `boot.S` enabling ICC_SRE_EL2 when entered at EL2 (UEFI firmware does that;
+guarded by ID_AA64PFR0_EL1.GIC).  **The bug worth keeping:** on GICv2 the SGIs
+are permanently enabled, so the port had never enabled one; on v3 they are
+ordinary per-CPU bits, and left clear the cross-CPU reschedule SGI is dropped
+without a sound — a task woken for another CPU waits for that CPU's next tick.
+Nothing failed; `diskstorm` took **22 512 ms on v3 against 740 ms on v2**, and
+**786 ms** once the SGIs were enabled.  ICC_CTLR_EL1.EOImode is also written
+explicitly: its reset value is implementation defined, and with 1 every EOI
+would leave the interrupt active for good.
+
+**Verified on `virt,gic-version=3 -smp 2`:** `board` reports v3 with the
+redistributor at 0x080a_0000, timer + UART + virtio-blk/net/snd interrupts
+live, `diskstorm`, `excstorm`, `killstorm`, `forktest`, sound and ping green;
+GICv2 and the serial boot path unchanged.
+
+**Method note, paid for again:** a boot.S edit failed to ASSEMBLE and the next
+two test rounds ran the previous image — my output filter matched `error` and
+`make` prints `Error`.  The build's exit status is checked now, not its text.
+
 ## 8. Change log
 
+- **2026-09-26 — §M85 stages 1-2: the aarch64 board is read from the device tree (`board` names each source); GICv3 with enabled SGIs (DOCS §4.99).**
 - **2026-09-26 — §M86 COMPLETE, stage 4: every RAM range and reservation in the device tree reaches the PMM; reserved map entries are carved out of overlapping RAM on every arch; the direct map skips holes (DOCS §4.98).**
 - **2026-09-26 — §M86 stage 3: aarch64 reaches RAM through a TTBR1 direct map (8 and 16 GiB verified); the user-pointer gate refuses the upper half; the aarch64 harness finally loads a DTB for the machine it boots (DOCS §4.97).**
 - **2026-09-26 — §M86 stage 2: i386 PAE, physical memory above 4 GiB (8 GiB verified); x86_64 DMA drivers stop dereferencing physical addresses; ac97 drain no longer times out after every sound; task_reap claims under the lock (DOCS §4.96).**

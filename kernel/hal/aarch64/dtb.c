@@ -24,6 +24,7 @@
  * ============================================================================= */
 
 #include "printf.h"
+#include "board.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -117,7 +118,104 @@ static const struct fdt_header* fdt_find(uint64_t x0) {
     return NULL;
 }
 
-/* Parse the structure block for /memory reg + a /cpus cpu@* count. */
+/* ---- §M85 stage 1: the devices, from the tree ------------------------------
+ *
+ * A property describes the node it sits in, but that node's meaning (its
+ * `compatible`) may arrive after its `reg` — so each node's interesting
+ * properties are COLLECTED while it is open and acted on at its END.  The
+ * cells that size a node's `reg` are its PARENT's #address-cells/#size-cells;
+ * a node's own values size its CHILDREN (and its `ranges` child side). */
+struct fdt_node {
+    const char*    name;
+    const uint8_t* compat;  uint32_t compat_len;
+    const uint8_t* reg;     uint32_t reg_len;
+    const uint8_t* intr;    uint32_t intr_len;
+    const uint8_t* ranges;  uint32_t ranges_len;
+    int            disabled;
+    uint32_t       acells, scells;          /* for this node's children      */
+};
+
+/* Does the NUL-separated compatible list contain `want`? */
+static int compat_has(const struct fdt_node* n, const char* want) {
+    const char* c = (const char*)n->compat;
+    uint32_t off = 0;
+    while (c && off < n->compat_len) {
+        const char* s0 = c + off;
+        uint32_t k = 0;
+        while (off + k < n->compat_len && s0[k]) k++;
+        uint32_t w = 0; while (want[w]) w++;
+        if (k == w) {
+            uint32_t i = 0; while (i < w && s0[i] == want[i]) i++;
+            if (i == w) return 1;
+        }
+        off += k + 1;
+    }
+    return 0;
+}
+
+/* reg tuple `i` of node n, with the parent's cells. */
+static int reg_tuple(const struct fdt_node* n, uint32_t ac, uint32_t sc, int i,
+                     uint64_t* base, uint64_t* size) {
+    uint32_t tup = 4 * (ac + sc);
+    if (!n->reg || ac < 1 || ac > 2 || sc > 2 || (uint32_t)(i + 1) * tup > n->reg_len) return -1;
+    *base = rd_cells(n->reg + i * tup, ac);
+    *size = sc ? rd_cells(n->reg + i * tup + 4 * ac, sc) : 0;
+    return 0;
+}
+
+/* GIC-style `interrupts` specifier `i` (3 cells: type, number, flags) as an
+ * INTID: an SPI is 32 + n, a PPI 16 + n.  0 = none. */
+static uint32_t intr_intid(const struct fdt_node* n, int i) {
+    if (!n->intr || (uint32_t)(i + 1) * 12 > n->intr_len) return 0;
+    uint32_t type = rd32(n->intr + i * 12), num = rd32(n->intr + i * 12 + 4);
+    return type == 1 ? num + 16 : num + 32;
+}
+
+static void node_commit(const struct fdt_node* n, uint32_t ac, uint32_t sc) {
+    if (n->disabled || !n->compat) return;
+    uint64_t b0, sz, b1, sz1;
+    if (compat_has(n, "arm,gic-v3")) {
+        if (reg_tuple(n, ac, sc, 0, &b0, &sz) == 0 && reg_tuple(n, ac, sc, 1, &b1, &sz1) == 0) {
+            g_board.gic_version = 3; g_board.gicd = b0; g_board.gicr = b1; g_board.gicr_size = sz1;
+        }
+    } else if (compat_has(n, "arm,cortex-a15-gic") || compat_has(n, "arm,gic-400") ||
+               compat_has(n, "arm,cortex-a9-gic")  || compat_has(n, "arm,cortex-a7-gic")) {
+        if (reg_tuple(n, ac, sc, 0, &b0, &sz) == 0 && reg_tuple(n, ac, sc, 1, &b1, &sz1) == 0) {
+            g_board.gic_version = 2; g_board.gicd = b0; g_board.gicc = b1;
+        }
+    } else if (compat_has(n, "arm,armv8-timer")) {
+        /* Specifiers: secure phys, NON-SECURE PHYS, virtual, hypervisor. */
+        uint32_t id = intr_intid(n, 1);
+        if (id) g_board.timer_intid = id;
+    } else if (compat_has(n, "arm,pl011")) {
+        if (!g_board.uart && reg_tuple(n, ac, sc, 0, &b0, &sz) == 0) {
+            g_board.uart = b0; g_board.uart_intid = intr_intid(n, 0);
+        }
+    } else if (compat_has(n, "arm,pl031")) {
+        if (!g_board.rtc && reg_tuple(n, ac, sc, 0, &b0, &sz) == 0) g_board.rtc = b0;
+    } else if (compat_has(n, "virtio,mmio")) {
+        if (g_board.nvirtio < BOARD_MAX_VIRTIO && reg_tuple(n, ac, sc, 0, &b0, &sz) == 0) {
+            g_board.virtio_base[g_board.nvirtio]  = b0;
+            g_board.virtio_intid[g_board.nvirtio] = intr_intid(n, 0);
+            g_board.nvirtio++;
+        }
+    } else if (compat_has(n, "pci-host-ecam-generic")) {
+        if (reg_tuple(n, ac, sc, 0, &b0, &sz) == 0) { g_board.ecam = b0; g_board.ecam_size = sz; }
+        /* ranges = <child-addr (the node's own #address-cells, 3 for PCI)
+         *           parent-addr (ac)  size (the node's own #size-cells)>.
+         * The top cell's bits 25:24 are the space: 2 = 32-bit memory. */
+        uint32_t cac = n->acells, csc = n->scells;
+        uint32_t ent = 4 * (cac + ac + csc);
+        for (uint32_t o = 0; n->ranges && cac == 3 && o + ent <= n->ranges_len; o += ent) {
+            uint32_t space = (rd32(n->ranges + o) >> 24) & 3;
+            uint64_t cpu = rd_cells(n->ranges + o + 4 * cac, ac);
+            uint64_t len = rd_cells(n->ranges + o + 4 * (cac + ac), csc);
+            if (space == 2 && !g_board.pci_mmio32) { g_board.pci_mmio32 = cpu; g_board.pci_mmio32_size = len; }
+        }
+    }
+}
+
+/* Parse the structure block: /memory, /cpus, /model and the devices. */
 static void fdt_parse(const struct fdt_header* h) {
     const uint8_t* base    = (const uint8_t*)h;
     const uint8_t* strings = base + be32(h->off_dt_strings);
@@ -133,6 +231,7 @@ static void fdt_parse(const struct fdt_header* h) {
      * constant would be right on the board it was written for and silently
      * wrong on the next — the same shape as a hard-coded stream count. */
     uint32_t acells = 2, scells = 1;
+    struct fdt_node nodes[8];
 
     int guard = 0;
     while (p < end && guard++ < 100000) {
@@ -142,7 +241,11 @@ static void fdt_parse(const struct fdt_header* h) {
             size_t n = 0; while (p[n]) n++;
             p += n + 1;
             p = (const uint8_t*)(((uintptr_t)p + 3) & ~(uintptr_t)3);
-            if (depth < 8) namestk[depth] = name;
+            if (depth < 8) {
+                namestk[depth] = name;
+                struct fdt_node* nd = &nodes[depth];
+                *nd = (struct fdt_node){ .name = name, .acells = 2, .scells = 1 };
+            }
             depth++;
             if (str_prefix(name, "cpus") && (name[4] == 0 || name[4] == '@')) {
                 in_cpus = 1; cpus_depth = depth;   /* children are at depth+1 */
@@ -152,6 +255,12 @@ static void fdt_parse(const struct fdt_header* h) {
             }
         } else if (tok == FDT_END_NODE) {
             if (in_cpus && depth == cpus_depth) in_cpus = 0;
+            /* Only the root's children are committed: that is where `virt`
+             * (and sbsa-ref's tree, when it has one) put their devices.  A board
+             * that nests them under a /soc bus with `ranges` translation would
+             * need that translation applied first — refused rather than read
+             * with untranslated addresses. */
+            if (depth == 2) node_commit(&nodes[1], nodes[0].acells, nodes[0].scells);
             depth--;
         } else if (tok == FDT_PROP) {
             uint32_t len     = rd32(p); p += 4;
@@ -164,6 +273,19 @@ static void fdt_parse(const struct fdt_header* h) {
             if (depth == 1 && pname[0] == '#') {
                 if (str_prefix(pname, "#address-cells") && len == 4) acells = rd32(val);
                 if (str_prefix(pname, "#size-cells")    && len == 4) scells = rd32(val);
+            }
+            if (depth == 1 && str_prefix(pname, "model") && pname[5] == 0) g_board.model = (const char*)val;
+            if (depth >= 1 && depth <= 8) {
+                struct fdt_node* nd = &nodes[depth - 1];
+                if (str_prefix(pname, "#address-cells") && len == 4) nd->acells = rd32(val);
+                else if (str_prefix(pname, "#size-cells") && len == 4) nd->scells = rd32(val);
+                else if (str_prefix(pname, "compatible") && pname[10] == 0) { nd->compat = val; nd->compat_len = len; }
+                else if (str_prefix(pname, "reg") && pname[3] == 0)        { nd->reg = val; nd->reg_len = len; }
+                else if (str_prefix(pname, "interrupts") && pname[10] == 0) { nd->intr = val; nd->intr_len = len; }
+                else if (str_prefix(pname, "ranges") && pname[6] == 0)     { nd->ranges = val; nd->ranges_len = len; }
+                else if (str_prefix(pname, "status") && pname[6] == 0 &&
+                         !str_prefix((const char*)val, "okay") && !str_prefix((const char*)val, "ok"))
+                    nd->disabled = 1;
             }
             /* /memory@.../reg = one or more <base size> tuples. */
             const char* cur = (depth >= 1 && depth <= 8) ? namestk[depth - 1] : "";
@@ -193,9 +315,15 @@ static void fdt_parse(const struct fdt_header* h) {
  * is up).  Safe to call even if no DTB is found — leaves the getters at 0. */
 void dtb_init(uint64_t x0) {
     const struct fdt_header* h = fdt_find(x0);
-    if (!h) { kprintf("dtb: no device tree found (using built-in defaults)\n"); return; }
+    if (!h) {
+        kprintf("dtb: no device tree found (using built-in defaults)\n");
+        board_finish();
+        return;
+    }
 
+    g_board.src = BOARD_DTB;
     fdt_parse(h);
+    board_finish();
 
     /* The reservation block: (address, size) pairs of 64-bit big-endian values,
      * ended by a zero pair.  Firmware puts things there it expects to survive
@@ -215,6 +343,8 @@ void dtb_init(uint64_t x0) {
     }
     kprintf("dtb: found @ %p - RAM %u MiB in %d range(s), %d reserved, %d CPU(s)\n",
             (void*)h, (unsigned)(g_ram_size >> 20), g_nmem, g_nrsv, g_ncpu);
+    kprintf("dtb:   gic v%d @ %p, %d virtio, ecam %p\n", g_board.gic_version,
+            (void*)(uintptr_t)g_board.gicd, g_board.nvirtio, (void*)(uintptr_t)g_board.ecam);
     for (int i = 0; i < g_nmem; i++)
         kprintf("dtb:   ram %p .. %p (%u MiB)\n", (void*)(uintptr_t)g_mem_base[i],
                 (void*)(uintptr_t)(g_mem_base[i] + g_mem_size[i]),

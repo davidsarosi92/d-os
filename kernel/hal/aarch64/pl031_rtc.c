@@ -14,13 +14,14 @@
  * ============================================================================= */
 
 #include "rtc.h"
+#include "board.h"   /* §M85 — the machine, discovered */
 #include <stdint.h>
 
-#define PL031_BASE  0x09010000UL
+#define PL031_BASE  ((uintptr_t)g_board.rtc)       /* §M85: 0 = none */
 #define PL031_DR    0x000               /* data register: seconds since epoch */
 
 int rtc_read(struct rtc_time* out) {
-    if (!out) return -1;
+    if (!out || !PL031_BASE) return -1;     /* the board has no PL031 */
 
     uint32_t secs = *(volatile uint32_t*)(PL031_BASE + PL031_DR);
     uint32_t days = secs / 86400u;

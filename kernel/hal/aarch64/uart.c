@@ -19,10 +19,13 @@
  * file is arch-specific and lives under kernel/hal/aarch64/).
  * ============================================================================= */
 
+#include "board.h"   /* §M85 — the machine, discovered */
 #include <stdint.h>
 
-/* PL011 register block base on QEMU `virt`. */
-#define PL011_BASE   0x09000000UL
+/* PL011 register block base: the board's (§M85), or `virt`'s before the device
+ * tree has been read — this UART is the one that reports everything that
+ * happens BEFORE that, so it cannot wait for it. */
+#define PL011_BASE   (g_board.uart ? (uintptr_t)g_board.uart : 0x09000000UL)
 
 /* Register offsets (Arm PrimeCell PL011 TRM, DDI 0183). */
 #define UART_DR      0x00      /* Data register.                              */
@@ -97,7 +100,7 @@ void uart_early_puthex(uint64_t v) {
 #define UART_ICR     0x44
 #define UART_RXIM    (1u << 4)
 #define UART_RTIM    (1u << 6)
-#define PL011_INTID  33
+#define PL011_INTID  (g_board.uart_intid ? g_board.uart_intid : 33u)
 
 void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
 void gic_enable_irq(uint32_t intid);
