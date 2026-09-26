@@ -99,8 +99,13 @@ SHELL_CMD(board) = { "board", "", "what this aarch64 machine is, and where each 
 
 /* §M85 — hal_api.h.  The only platform device a portable driver asks about so
  * far is the PL031; a new one is a new name here, not a new constant there. */
+int acpi_arm_find(const char* hid, int nth, uint64_t* mem, uint32_t* irq);
 static int streq(const char* a, const char* b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
 int hal_platform_window(const char* name, uint64_t* base, uint64_t* len) {
     if (streq(name, "pl031") && g_board.rtc) { *base = g_board.rtc; *len = 0x1000; return 0; }
+    /* Controllers on a SYSTEM bus (sbsa-ref), named only by ACPI _HID. */
+    uint32_t irq;
+    if (streq(name, "ahci") && acpi_arm_find("LNRO001E", 0, base, &irq) == 0) { *len = 0x1000; return 0; }
+    if (streq(name, "xhci") && acpi_arm_find("PNP0D10", 0, base, &irq) == 0)  { *len = 0x4000; return 0; }
     return -1;
 }

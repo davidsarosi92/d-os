@@ -356,7 +356,11 @@ def aarch64_sbsa_args(a, sersock, monsock):
             "-monitor", "unix:%s,server,nowait" % monsock,
             "-drive", "if=pflash,format=raw,readonly=on,file=" + os.path.join(fw, "SBSA_FLASH0.fd"),
             "-drive", "if=pflash,format=raw,file=" + work + "/flash1.fd",
-            "-drive", "file=fat:rw:%s/esp,format=raw,if=ide" % work] + list(a.extra)
+            # The DATA disk (if any) on AHCI port 0, the ESP on port 1: the
+            # driver takes the first ATA disk it finds, and the ESP is a
+            # read-mostly FAT image the firmware only needs to find.
+            ] + (["-drive", "file=%s,format=raw,if=ide,index=0" % a.disk] if a.disk else []) + [
+            "-drive", "file=fat:rw:%s/esp,format=raw,if=ide,index=1" % work] + list(a.extra)
 
 
 def aarch64_dtb_args(a):

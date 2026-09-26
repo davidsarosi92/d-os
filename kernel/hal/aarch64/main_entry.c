@@ -294,7 +294,13 @@ void aarch64_main_entry(uint64_t dtb) {
         kprintf("aarch64: no virtio-net device attached (loopback only)\n");
     net_procfs_init();
 
-    if (virtio_mmio_blk_init() == 0) {
+    /* §M85 — the MOUNT does not depend on virtio-blk any more: on sbsa-ref the
+     * disk is behind the machine's AHCI controller (/dev/sda, registered by
+     * driver_init_all above), and a mount gated on `vda` existing left that
+     * machine with no persistent storage although its disk worked.  The
+     * virtio self-test still runs only where there is a virtio disk. */
+    virtio_mmio_blk_init();
+    {
         struct block_device* d = blk_find("vda");
         if (d && d->sector_count > 200) {
             static uint8_t wbuf[512], rbuf[512];

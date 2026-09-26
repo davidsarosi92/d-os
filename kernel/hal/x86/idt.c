@@ -533,9 +533,13 @@ void isr_handler(struct int_frame* f) {
         extern volatile uint32_t g_nmi_lockups;
         g_nmi_lockups++;
         struct task* cur = task_current();
+        /* §M85 session — decided FIRST, so a host stall is neither reported
+         * as a hard lockup nor recorded as a crash (see the recovery below). */
+        int nmi_spurious = ((f->cs & 3) != 3) && watchdog_nmi_is_spurious();
         /* §M47 — a hard lockup is precisely the failure the user would
          * otherwise experience as "it just froze": record it so the reason
          * survives the recovery (kill or reboot). */
+        if (!nmi_spurious)
         crash_report(CRASH_HARD_LOCKUP, cur ? cur->pid : -1,
                      cur ? cur->name : "?", (uintptr_t)f->eip, 0,
                      (int)((f->cs & 3) == 3),
@@ -547,7 +551,7 @@ void isr_handler(struct int_frame* f) {
          * bug this path exists to report (§4.67).  Bounded + lock-free, so a
          * holder that never releases still lets the next CPU print. */
         crash_dump_begin();
-        serial_write("\n!! NMI HARD-LOCKUP eip=");
+        serial_write(nmi_spurious ? "\n!! NMI WATCHDOG ALARM eip=" : "\n!! NMI HARD-LOCKUP eip=");
         ser_hex(f->eip);
         serial_write(" cs="); ser_hex(f->cs);
         serial_write(" cpu="); ser_hex((uint32_t)this_cpu_id());
@@ -627,6 +631,18 @@ void isr_handler(struct int_frame* f) {
          * attempt already failed once (g_nmi_lockups >= 2 — the counter is reset
          * to 0 by the watchdog task whenever the system is healthy). */
         int from_user = (f->cs & 3) == 3;
+        /* §M85 session — the FIRST alarm while every CPU is still ticking is
+         * not a hard lockup (watchdog.c, watchdog_every_cpu_progressed): the
+         * host stalled the emulator past the device's window.  Re-arm and give
+         * it one more window; a genuinely frozen machine cannot reset the
+         * escalation counter, so the next alarm reboots exactly as before. */
+        if (nmi_spurious) {
+            serial_write("!! NMI watchdog alarm while EVERY CPU made progress since the last sweep"
+                         " - not a guest lockup (host stall?); re-armed, a second alarm reboots\n");
+            { extern void hw_watchdog_pet(void); hw_watchdog_pet(); }
+            crash_dump_end();
+            return;
+        }
         if (!from_user || g_nmi_lockups >= 2) {
             serial_write("!! NMI HARD-LOCKUP: kernel-mode or persistent — rebooting\n");
             crash_dump_end();

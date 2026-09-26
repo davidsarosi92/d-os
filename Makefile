@@ -564,6 +564,8 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/board.c \
       kernel/hal/aarch64/acpi_arm.c \
       kernel/hal/aarch64/modmem.c \
+      kernel/drivers/block/ahci.c \
+      kernel/drivers/net/e1000e.c \
       kernel/hal/aarch64/serial_shell.c \
       kernel/core/serial_cmd.c \
       kernel/hal/aarch64/main_entry.c
@@ -657,6 +659,7 @@ CORE_C_SRCS := \
     kernel/core/cmd_util.c \
     kernel/core/cmd_fs.c \
     kernel/core/cmd_mem.c \
+    kernel/core/cmd_pci.c \
     kernel/core/cmd_task.c \
     kernel/core/cmd_sys.c \
     kernel/core/cmd_desktop.c \
@@ -776,6 +779,7 @@ CORE_C_SRCS := \
     kernel/drivers/block/ahci.c \
     kernel/drivers/block/ide.c \
     kernel/drivers/net/virtio_net.c \
+    kernel/drivers/net/e1000e.c \
     kernel/core/net.c \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \
@@ -882,6 +886,7 @@ CORE_C_SRCS := \
     kernel/core/cmd_util.c \
     kernel/core/cmd_fs.c \
     kernel/core/cmd_mem.c \
+    kernel/core/cmd_pci.c \
     kernel/core/cmd_task.c \
     kernel/core/cmd_sys.c \
     kernel/core/cmd_desktop.c \
@@ -977,6 +982,7 @@ CORE_C_SRCS := \
     kernel/core/cmd_util.c \
     kernel/core/cmd_fs.c \
     kernel/core/cmd_mem.c \
+    kernel/core/cmd_pci.c \
     kernel/core/cmd_task.c \
     kernel/core/cmd_sys.c \
     kernel/core/cmd_desktop.c \
@@ -1096,6 +1102,7 @@ CORE_C_SRCS := \
     kernel/drivers/block/ahci.c \
     kernel/drivers/block/ide.c \
     kernel/drivers/net/virtio_net.c \
+    kernel/drivers/net/e1000e.c \
     kernel/core/net.c \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \

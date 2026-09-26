@@ -14209,8 +14209,89 @@ exists), the bochs display on PCIe, and the PCIe host window (the DSDT's
 PCI0 `_CRS` is not the static shape the narrow reader handles).  Also: the
 machine has NO memory below 4 GiB, so every "DMA32" allocation fails there.
 
+### 4.102 sbsa-ref's devices: disk, USB, network (§M85 stage 4b, 2026-09-26)
+
+After stage 4 sbsa-ref reached a shell with nothing attached to it.  Now its
+disk, its USB keyboard and its network work — and each needed the same two
+things, which is the finding: **a device that no bus enumerates**, and **DMA
+with no memory below 4 GiB**.
+
+- **`acpi` lists what the DSDT describes** (`_HID`, window, interrupt, used or
+  not).  On sbsa-ref: `ARMH0011` UART, `LNRO001E` AHCI at 0x6010_0000 (IRQ
+  42), `PNP0D10` xHCI at 0x6011_0000 (IRQ 43), `PNP0A08` PCIe root, four
+  `PNP0C0F` interrupt links.  Drivers ask for a platform device by role through
+  `hal_platform_window("ahci" | "xhci" | "pl031")`; on ACPI machines the board
+  answers from this table (`acpi_arm_find`).
+- **`pmm_alloc_contiguous_dma(n, addr_bits)`**: a controller that can address
+  64 bits takes any frame; only a narrower one is confined to DMA32.  AHCI asks
+  its CAP.S64A, xHCI its HCCPARAMS1.AC64.
+- **AHCI** found as a platform controller (PCI unchanged), 64-bit DMA.  The
+  aarch64 `/mnt` mount no longer depends on virtio-blk existing — it was gated
+  on `vda`, so a machine whose disk is `sda` had none.
+- **xHCI made 64-bit end to end** — its own header had said so since M20.6.2
+  ("when HIGHMEM arrives the fields must widen and the `_HI` writes carry the
+  real high half").  Every ring, context and TRB pointer now does.  The first
+  run hung on the first command because an old `erst[1] = 0` line survived
+  after the new one: the event ring's high half was zeroed, and the controller
+  wrote its completions below 4 GiB, where sbsa-ref has nothing.
+- **e1000e** (`kernel/drivers/net/e1000e.c`, new, portable): 82574L, legacy
+  descriptors, 64-bit DMA, MAC from the card's own RAL/RAH, POLLED through
+  netd's backstop — routing a PCI INTx to a GIC SPI on an ACPI machine needs
+  the `_PRT`, i.e. AML this reader does not execute; stated, not hidden.  Also
+  comes up on x86_64 (q35 + `-device e1000e`).
+- **PCI BARs the firmware assigned are kept** (aarch64 `pci.c` reassigned from
+  its own bump pointer, which under UEFI moves devices the ACPI tables still
+  describe at the old address), and **`lspci`** exists, portably.
+
+**Verified on sbsa-ref:** `sda` on AHCI, exFAT mounted at `/mnt`, `diskstorm`
+PASS and `fsck.exfat` clean afterwards; USB keyboard key delivered; `eth0`
+(e1000e) ping 3/3, DHCP bound, DNS resolves a real name, `tcptest` 4/4; fork,
+musl, `excstorm`, audit green.  The `virt` paths (raw, UEFI EL2/GICv3), i386
+with qemu-xhci + USB keyboard, and x86_64 — green.
+
+**Open:** sbsa-ref's DISPLAY (bochs-display on PCIe: its framebuffer is a BAR,
+not RAM, so it needs a Normal-NC mapping at 2 MiB granularity — the same GiB
+holds the e1000e's registers, which must stay Device — plus a DISPI driver and
+an fb_present backend); PCI INTx → GIC routing (`_PRT`); the DSDT's PCIe host
+window (its `_CRS` is not the static shape the narrow reader handles).
+
+### 4.102.1 The hardware watchdog stopped rebooting a machine that was making progress (2026-09-26)
+
+The final regression round rebooted i386 and x86_64 at `-smp 4` in a cluster of
+runs — `!! NMI HARD-LOCKUP … rebooting` with the report's own lines showing
+EVERY CPU +23..+26 ticks since the last sweep, i.e. a healthy machine.  Chased
+by measurement, not theory: a control build of the old xHCI (0/3) against the
+new (2/7) said "noise", and the x86_64 run hit it with no xHCI at all.  **It
+reproduces on demand by pausing the emulator** (`kill -STOP` the QEMU process
+for 12 s): the ib700's 4 s window passes while the guest is frozen by its HOST,
+and the NMI handler rebooted it on the first alarm from ring 0 — §4.67's shape
+again, the safety net killing the healthy patient, this time for a host stall
+instead of a slow boot.
+
+**The rule now:** a hard lockup shows at least one CPU with NO ticks since the
+last sweep (the sweep runs on the healthy ones and refreshes their snapshots).
+An alarm while EVERY CPU progressed is reported as `!! NMI WATCHDOG ALARM`,
+re-armed, and NOT recorded as a crash; a genuinely frozen machine cannot run
+the watchdog task that resets the escalation counter, so the next alarm
+reboots exactly as before.  **The decision is made once per ALARM, not per
+CPU** (`watchdog_nmi_is_spurious`): QEMU injects the NMI into every CPU at
+once, and the first version let each count itself — by the time the first
+handler asked "first alarm?", four had counted.  Episodes are identified by an
+interrupt-free clock (a frozen CPU 0's tick count would make every later alarm
+look like the same excused one), and a three-state handshake closes two races
+the second version still had.
+
+**Falsified both ways:** a 12 s host stall → 4 of 4 runs survive with the
+alarm reported and the shell answering (i386 and x86_64); `hardlock` at
+`-smp 1` → first alarm excused (its snapshot predates the freeze), second
+alarm 4 s later `HARD-LOCKUP` → reboot.  Still true and still written down:
+at `-smp 4` `hardlock` produces a softlockup report and no NMI, because the
+watchdog task on another CPU keeps petting — the per-CPU sweep is what reports
+that case.
+
 ## 8. Change log
 
+- **2026-09-26 — §M85 stage 4b: sbsa-ref has a disk (AHCI on the system bus), USB (xHCI, now 64-bit end to end) and a network (new e1000e driver); `acpi`, `lspci`; the hardware watchdog no longer reboots a machine whose every CPU is ticking (DOCS §4.102).**
 - **2026-09-26 — §M85 stage 4: the aarch64 kernel runs at a fixed VA and loads anywhere; offset direct map and PMM base; modules within reach; sbsa-ref boots to a shell (DOCS §4.101).**
 - **2026-09-26 — §M85 stage 3: aarch64 boots through UEFI (hand-made PE stub) and reads ACPI (MADT/GTDT/SPCR/MCFG/FADT + a narrow DSDT reader); one PSCI conduit; secondaries leave EL2 too (DOCS §4.100).**
 - **2026-09-26 — §M85 stages 1-2: the aarch64 board is read from the device tree (`board` names each source); GICv3 with enabled SGIs (DOCS §4.99).**

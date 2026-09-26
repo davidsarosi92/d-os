@@ -184,6 +184,8 @@ void       pmm_free_frame(pmm_phys_t addr);
  * working device and silent memory corruption. */
 pmm_phys_t pmm_alloc_frame_dma32(void);
 pmm_phys_t pmm_alloc_contiguous_dma32(uint32_t n);
+/* Contiguous frames reachable by a device with `addr_bits` of DMA address. */
+pmm_phys_t pmm_alloc_contiguous_dma(uint32_t n, int addr_bits);
 
 /* Release a run obtained from pmm_alloc_contiguous* .
  *

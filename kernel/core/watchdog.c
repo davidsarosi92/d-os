@@ -29,6 +29,7 @@
 
 /* §M31 L3 — NMI hard-lockup escalation counter (see idt.c NMI handler). */
 volatile uint32_t g_nmi_lockups = 0;
+extern volatile uint32_t g_nmi_alarms;
 
 /* Hardware-watchdog contract, WEAK + no-op by default: a board that has one
  * (x86 + `-device ib700`, kernel/drivers/watchdog/ib700.c) provides the strong
@@ -193,6 +194,73 @@ int watchdog_cpu_tick_state(int cpu, uint64_t* now_ticks, uint64_t* last_seen) {
     return 0;
 }
 
+/* §M85 session (2026-09-26) — did EVERY online CPU take ticks since the last
+ * sweep?  The hard-lockup NMI used to reboot on the first alarm from ring 0 —
+ * and the alarm's own report showed, in clusters of runs on a busy host, every
+ * CPU with +23..+26 ticks since the sweep: a machine demonstrably making
+ * progress, killed by the device that exists to catch one that is not.  What
+ * fires the ib700 there is the HOST not running the emulator for its 4 s
+ * window, not the guest.  A real hard lockup shows at least one CPU at +0 (the
+ * sweep runs on the healthy ones and refreshes their snapshots) — and if the
+ * whole machine froze, the watchdog task that resets the escalation counter
+ * cannot run either, so the NEXT alarm still reboots.  Plain reads: NMI-safe. */
+int watchdog_every_cpu_progressed(void) {
+    int n = smp_ncpus(), seen_any = 0;
+    if (n > WD_MAX_CPUS) n = WD_MAX_CPUS;
+    for (int i = 0; i < n; i++) {
+        uint64_t nowt, last;
+        if (watchdog_cpu_tick_state(i, &nowt, &last) != 0) continue;
+        if (nowt == last) return 0;
+        seen_any = 1;
+    }
+    return seen_any;
+}
+
+/* ONE DECISION PER ALARM, not per CPU.  QEMU's ib700 injects its NMI into
+ * EVERY CPU at once, and each bumps g_nmi_lockups — so by the time the first
+ * handler asked "is this the first alarm?", four had already counted and the
+ * answer was always no (measured: a 7 s SIGSTOP of the emulator, every CPU
+ * +0x1f..+0x23 ticks since the sweep, rebooted anyway).  The first CPU of an
+ * episode decides and publishes; the others read; an episode is one second of
+ * the interrupt-free clock (one injection lands within microseconds, the next
+ * alarm is 4 s later).  The alarm counter is reset by the
+ * watchdog task on every healthy sweep, like g_nmi_lockups. */
+static volatile uint64_t g_nmi_ep_ns;
+static volatile int      g_nmi_ep_state;     /* 0 idle, 1 deciding, 2 real, 3 spurious */
+volatile uint32_t        g_nmi_alarms;
+int watchdog_nmi_is_spurious(void) {
+    /* The episode is identified by a clock that runs WITHOUT interrupts (TSC /
+     * PM timer): CPU 0's tick count would freeze exactly when CPU 0 is the
+     * wedged one, and then every later alarm would look like the same, already
+     * excused, episode — a machine that never reboots.
+     *
+     * Three states, because the first version had two races that each turned
+     * an excused alarm into a reboot on the NEXT CPU of the same injection:
+     * it compared `now >= prev` (a CPU that read the clock before the winner
+     * published sees a "past" episode), and it published the episode's time
+     * before its verdict (a CPU in between read the previous verdict).  Now a
+     * CPU that finds a decision in progress waits for it — briefly and
+     * boundedly, in NMI context — and distance is absolute. */
+    uint64_t now = timer_now_ns();
+    for (int tries = 0; tries < 1000000; tries++) {
+        int st = g_nmi_ep_state;
+        if (st == 1) { __asm__ volatile ("" ::: "memory"); continue; }
+        if (st >= 2) {
+            uint64_t ep = g_nmi_ep_ns;
+            uint64_t d = now > ep ? now - ep : ep - now;
+            if (d < 1000000000ull) return st == 3;
+        }
+        if (!__sync_bool_compare_and_swap(&g_nmi_ep_state, st, 1)) continue;
+        g_nmi_ep_ns = now;
+        uint32_t n = __sync_add_and_fetch(&g_nmi_alarms, 1);
+        int sp = (n < 2) && watchdog_every_cpu_progressed();
+        __sync_synchronize();
+        g_nmi_ep_state = sp ? 3 : 2;
+        return sp;
+    }
+    return 0;                                   /* undecidable: treat as real */
+}
+
 /* Layer 3 (§M46): RUNAWAY user tasks.  A ring-3 package that opted in
  * (auto_fkill_ms > 0) but hogs the CPU that long WITHOUT voluntarily yielding /
  * blocking — a frozen browser stuck in a loop does no syscalls, so it never
@@ -252,6 +320,7 @@ static void watchdog_entry(void) {
          * NMI hard-lockup escalation counter, so a past (recovered) lockup does
          * not make a future, unrelated one reboot on its first alarm. */
         g_nmi_lockups = 0;
+        g_nmi_alarms = 0;
         task_msleep(WD_SWEEP_MS);
         if (hw) hw_watchdog_pet();
         sweep_heartbeats();

@@ -85,4 +85,10 @@ extern volatile uint32_t g_nmi_lockups;
  * than whichever CPU the alarm happened to interrupt (§4.67). */
 int watchdog_cpu_tick_state(int cpu, uint64_t* now_ticks, uint64_t* last_seen);
 
+/* NMI-safe: 1 when every online CPU took ticks since the last sweep — i.e. a
+ * hardware-watchdog alarm that is not a guest lockup (see watchdog.c). */
+int watchdog_every_cpu_progressed(void);
+/* NMI-safe: the per-ALARM decision (every CPU of one injection agrees). */
+int watchdog_nmi_is_spurious(void);
+
 #endif

@@ -876,6 +876,18 @@ pmm_phys_t pmm_alloc_frame_dma32(void) {
     return page_alloc(0, ZONE_DMA32);
 }
 
+/* §M85 — contiguous frames a device with `addr_bits` of DMA address can
+ * reach.  A 64-bit-capable controller takes any frame; only a narrower one is
+ * confined to DMA32.  Drivers that asked for DMA32 unconditionally could not
+ * run at all on a machine with no memory below 4 GiB (sbsa-ref: RAM at 1 TiB),
+ * although their hardware would have reached any address. */
+pmm_phys_t pmm_alloc_contiguous_dma(uint32_t n, int addr_bits) {
+    if (n == 0) return PMM_ALLOC_FAIL;
+    int order = ceil_log2(n);
+    if (order > BUDDY_MAX_ORDER) return PMM_ALLOC_FAIL;
+    return page_alloc(order, addr_bits > 32 ? ZONE_NORMAL : ZONE_DMA32);
+}
+
 pmm_phys_t pmm_alloc_contiguous_dma32(uint32_t n) {
     if (n == 0) return PMM_ALLOC_FAIL;
     int order = ceil_log2(n);

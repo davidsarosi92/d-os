@@ -252,7 +252,11 @@ static void port_start(int port) {
  *   +2048  command table   256 bytes, 128 B aligned
  */
 static int alloc_structs(void) {
-    pmm_phys_t f = pmm_alloc_contiguous_dma32(1);
+    /* §M85 — the controller says how far it can reach: CAP.S64A (bit 31) is
+     * 64-bit addressing.  Only without it must the structures be below 4 GiB
+     * — and on sbsa-ref there is no memory below 4 GiB at all. */
+    int bits = (hr32(HBA_CAP) & (1u << 31)) ? 64 : 32;
+    pmm_phys_t f = pmm_alloc_contiguous_dma(1, bits);
     if (!f) { kprintf("ahci: no DMA32 frame for the command list\n"); return -1; }
     g_ahci.struct_frames = f;
 
@@ -266,7 +270,7 @@ static int alloc_structs(void) {
     g_ahci.ctab      = (struct ahci_cmd_table*)(base + 2048);
     g_ahci.ctab_phys = (uint64_t)f + 2048;
 
-    pmm_phys_t d = pmm_alloc_contiguous_dma32(AHCI_DMA_BYTES / 4096);
+    pmm_phys_t d = pmm_alloc_contiguous_dma(AHCI_DMA_BYTES / 4096, bits);
     if (!d) {
         kprintf("ahci: no %d-byte DMA buffer\n", AHCI_DMA_BYTES);
         pmm_free_contiguous(f, 1);
@@ -419,6 +423,10 @@ static int ahci_flush(struct block_device* dev) {
  * different vendor IDs and the same programming interface. */
 static int ahci_found;
 static struct pci_device ahci_pd;
+/* §M85 — a controller NO BUS enumerates: sbsa-ref's sits on its system bus and
+ * only the firmware's description names it.  Then there is no config space to
+ * touch, and the ABAR is the platform window. */
+static uint64_t ahci_platform_base;
 
 static void ahci_visit(const struct pci_device* d, void* ctx) {
     (void)ctx;
@@ -433,6 +441,10 @@ static int ahci_probe(void* ctx) {
     (void)ctx;
     ahci_found = 0;
     pci_scan(ahci_visit, NULL);
+    if (!ahci_found) {
+        uint64_t len;
+        if (hal_platform_window("ahci", &ahci_platform_base, &len) == 0) ahci_found = 2;
+    }
     return ahci_found ? 0 : -1;
 }
 
@@ -456,15 +468,21 @@ static int ahci_init(void* ctx) {
     if (!ahci_found && ahci_probe(NULL) != 0) return -1;
     g_ahci.pd = ahci_pd;
 
-    uint16_t cmd = pci_read16(ahci_pd.bus, ahci_pd.slot, ahci_pd.func, PCI_COMMAND);
-    cmd |= PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER;
-    pci_write16(ahci_pd.bus, ahci_pd.slot, ahci_pd.func, PCI_COMMAND, cmd);
+    uint32_t abar;
+    if (ahci_found == 2) {
+        abar = (uint32_t)ahci_platform_base;
+        kprintf("ahci: platform controller (no bus) at %x, from the firmware's description\n", abar);
+    } else {
+        uint16_t cmd = pci_read16(ahci_pd.bus, ahci_pd.slot, ahci_pd.func, PCI_COMMAND);
+        cmd |= PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER;
+        pci_write16(ahci_pd.bus, ahci_pd.slot, ahci_pd.func, PCI_COMMAND, cmd);
 
-    /* ABAR is BAR5, always — the one BAR whose index the specification fixes. */
-    uint32_t bar5 = ahci_pd.bar[5];
-    if (bar5 & 0x1) { kprintf("ahci: BAR5 is I/O space (%x)?\n", bar5); return -1; }
-    uint32_t abar = bar5 & ~0xFu;
-    if (!abar) { kprintf("ahci: BAR5 is not programmed\n"); return -1; }
+        /* ABAR is BAR5, always — the one BAR whose index the specification fixes. */
+        uint32_t bar5 = ahci_pd.bar[5];
+        if (bar5 & 0x1) { kprintf("ahci: BAR5 is I/O space (%x)?\n", bar5); return -1; }
+        abar = bar5 & ~0xFu;
+        if (!abar) { kprintf("ahci: BAR5 is not programmed\n"); return -1; }
+    }
 
     /* Map it uncached.  §M33 stage 5 paid for the second half of that: a device
      * register read through a cached mapping returns whatever the CPU cached
@@ -481,10 +499,15 @@ static int ahci_init(void* ctx) {
     int nports   = (int)((cap & 0x1F) + 1);
     int nslots   = (int)(((cap >> 8) & 0x1F) + 1);
 
-    kprintf("ahci: controller at %x:%x.%x, ABAR %x, %d port(s), %d slot(s), "
-            "AHCI %x\n",
-            ahci_pd.bus, ahci_pd.slot, ahci_pd.func, abar, nports, nslots,
-            hr32(HBA_VS));
+    if (ahci_found == 2)
+        kprintf("ahci: controller on the system bus, ABAR %x, %d port(s), %d slot(s), "
+                "AHCI %x, %d-bit DMA\n", abar, nports, nslots, hr32(HBA_VS),
+                (cap & (1u << 31)) ? 64 : 32);
+    else
+        kprintf("ahci: controller at %x:%x.%x, ABAR %x, %d port(s), %d slot(s), "
+                "AHCI %x\n",
+                ahci_pd.bus, ahci_pd.slot, ahci_pd.func, abar, nports, nslots,
+                hr32(HBA_VS));
 
     /* Find the first port with an ATA device on it.  ATAPI is REFUSED by name
      * rather than attempted: a CD-ROM speaks packet commands, its "sectors" are

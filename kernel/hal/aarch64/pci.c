@@ -103,6 +103,15 @@ static void assign_bars(uint8_t bus, uint8_t slot, uint8_t func) {
         uint32_t bar = pci_read32(bus, slot, func, off);
         if (bar & 0x1) continue;                        /* I/O BAR — skip       */
         int is64 = ((bar >> 1) & 0x3) == 0x2;
+        /* §M85 — a BAR the FIRMWARE already programmed is left alone.  On a raw
+         * `virt` boot nothing has touched the bus and every BAR reads 0; under
+         * UEFI (EDK2 on `virt`, sbsa-ref) the firmware enumerated it, and
+         * reassigning from our own bump pointer would move a device the
+         * firmware — and its ACPI tables — still describe at the old address. */
+        if ((bar & ~0xFu) || (is64 && pci_read32(bus, slot, func, off + 4))) {
+            if (is64) i++;
+            continue;
+        }
 
         /* Size the BAR: write all-ones, read the mask back, restore. */
         pci_write32(bus, slot, func, off, 0xFFFFFFFFu);

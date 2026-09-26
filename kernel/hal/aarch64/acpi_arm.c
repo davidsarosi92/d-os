@@ -157,6 +157,14 @@ static int str_eq(const char* a, const char* b) { while (*a && *a == *b) { a++; 
 
 static int g_aml_devices, g_aml_used;
 
+/* Every Device() the reader saw, for the `acpi` command — so "which device is
+ * this machine's disk controller" is answered by the machine, not recalled. */
+#define ACPI_MAX_DEV 64
+struct acpi_dev { char hid[9]; uint64_t mem; uint32_t irq; uint8_t used; };
+static struct acpi_dev g_dev[ACPI_MAX_DEV];
+static int g_ndev;
+int acpi_arm_find(const char* hid, int nth, uint64_t* mem, uint32_t* irq);
+
 /* Walk one resource template: the first fixed memory range and the first
  * interrupt, plus (for a PCIe host) the first 32-bit memory address space. */
 static void crs(const uint8_t* p, uint32_t n, uint64_t* mem, uint32_t* irq,
@@ -208,6 +216,7 @@ static void aml_scan(const uint8_t* a, uint32_t n) {
                     crs(b + skip, blen - nb2 - skip, &mem, &irq, &m32, &m32len);
             }
         }
+        int used0 = g_aml_used;
         if (str_eq(hid, "LNRO0005") && mem && g_board.nvirtio < BOARD_MAX_VIRTIO) {
             g_board.virtio_base[g_board.nvirtio]  = mem;
             g_board.virtio_intid[g_board.nvirtio] = irq;
@@ -216,6 +225,11 @@ static void aml_scan(const uint8_t* a, uint32_t n) {
             g_board.pci_mmio32 = m32; g_board.pci_mmio32_size = m32len; g_aml_used++;
         } else if (str_eq(hid, "LNRO0004") && mem && !g_board.rtc) {   /* PL031 */
             g_board.rtc = mem; g_aml_used++;
+        }
+        if (g_ndev < ACPI_MAX_DEV && hid[0]) {
+            struct acpi_dev* dv = &g_dev[g_ndev++];
+            for (int c = 0; c < 9; c++) dv->hid[c] = hid[c];
+            dv->mem = mem; dv->irq = irq; dv->used = g_aml_used != used0;
         }
     }
 }
@@ -254,3 +268,27 @@ int acpi_arm_init(uint64_t rsdp_phys) {
     }
     return 0;
 }
+
+/* A device the DSDT describes by _HID (the nth one), for drivers of platform
+ * devices that no bus enumerates — sbsa-ref's AHCI and xHCI sit on its system
+ * bus.  0 and its window + interrupt, or -1. */
+int acpi_arm_find(const char* hid, int nth, uint64_t* mem, uint32_t* irq) {
+    for (int i = 0; i < g_ndev; i++)
+        if (str_eq(g_dev[i].hid, hid) && g_dev[i].mem && nth-- == 0) {
+            *mem = g_dev[i].mem; *irq = g_dev[i].irq; g_dev[i].used = 1;
+            return 0;
+        }
+    return -1;
+}
+
+#include "shellcmd.h"
+static void cmd_acpi(const char* args) {
+    (void)args;
+    if (g_board.src != BOARD_ACPI) { kprintf("acpi: this machine was not described by ACPI\n"); return; }
+    kprintf("acpi: %d device(s) in the DSDT (%d seen, reader limit %d)\n", g_ndev, g_aml_devices, ACPI_MAX_DEV);
+    for (int i = 0; i < g_ndev; i++)
+        kprintf("  %s  mem %p  irq %u  %s\n", g_dev[i].hid, (void*)(uintptr_t)g_dev[i].mem,
+                g_dev[i].irq, g_dev[i].used ? "used" : "-");
+}
+SHELL_CMD(acpi) = { "acpi", "", "the devices this machine's ACPI tables describe",
+                    SHELL_G_DEV, cmd_acpi, SHELL_P_ANY };

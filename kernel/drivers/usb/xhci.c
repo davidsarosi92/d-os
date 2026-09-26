@@ -169,6 +169,11 @@ struct xhci_trb {
 
 /* Ring state — applies to Command Ring, Transfer Rings, and Event Ring.
  *
+ * §M85 (2026-09-26): DONE — every address below is 64-bit and every `_HI`
+ * write carries the real high half; frames come from pmm_alloc_contiguous_dma
+ * sized by HCCPARAMS1.AC64.  sbsa-ref has no RAM below 4 GiB, so the "opt into
+ * <4 GiB DMA" choice below stopped being available rather than being unwise.
+ *
  * M20.6.2 audit (2026-06-30): `phys` stays uint32_t because PMM only
  * manages low memory (BUDDY_MAX_FRAMES * 4 KiB ≤ 1 GiB today on both
  * archs).  When §M19.5.1 populates HIGHMEM the field needs to widen
@@ -178,8 +183,8 @@ struct xhci_trb {
  * 1.2 §5.4.2 "DCBAAP", §5.5.2.3.3 "ERDP", etc.) — we're just opting
  * into <4 GiB DMA on day one to keep the diff small. */
 struct xhci_ring {
-    struct xhci_trb* trbs;          /* virt = phys (identity-mapped frame) */
-    uint32_t         phys;
+    struct xhci_trb* trbs;          /* through the kernel direct map       */
+    uint64_t         phys;          /* §M85: 64-bit — see the note above    */
     uint32_t         size;          /* TRB count (last slot is Link for cmd/tr) */
     uint32_t         enqueue;       /* index of next TRB to fill */
     uint32_t         dequeue;       /* index of next TRB to consume (event ring) */
@@ -202,15 +207,15 @@ static struct {
 
     struct xhci_ring cmd_ring;
     struct xhci_ring evt_ring;
-    uint32_t         erst_phys;     /* Event Ring Segment Table base (phys) */
+    uint64_t         erst_phys;     /* Event Ring Segment Table base (phys) */
 
     /* The single enumerated device — slot 1's EP0 + HID Interrupt IN. */
     int              slot_id;
     int              device_addressed;
     uint8_t*         input_ctx;
     uint8_t*         dev_ctx;
-    uint32_t         input_ctx_phys;
-    uint32_t         dev_ctx_phys;
+    uint64_t         input_ctx_phys;
+    uint64_t         dev_ctx_phys;
 
     struct xhci_ring ep0_ring;
     struct xhci_ring intr_in_ring;
@@ -218,7 +223,8 @@ static struct {
     int              hid_ep_num;        /* 1..15 endpoint number */
     uint32_t         hid_pkt_size;
     uint8_t*         intr_in_buf;       /* 8-byte HID report DMA target */
-    uint32_t         intr_in_buf_phys;
+    uint64_t         intr_in_buf_phys;
+    int              ac64;              /* HCCPARAMS1.AC64: 64-bit DMA */
 } xhc;
 
 /* ---------------------------------------------------------------------------
@@ -243,8 +249,12 @@ static inline uint16_t mmio_r16(volatile uint8_t* base, uint32_t off) {
  * back to TRB 0; for the Event Ring we don't (HC follows ERST entries).
  * --------------------------------------------------------------------------- */
 
+/* A DMA frame the controller can reach: any frame when HCCPARAMS1.AC64 says
+ * 64-bit addressing, a DMA32 one otherwise (§M85). */
+static pmm_phys_t xhci_frame(void) { return pmm_alloc_contiguous_dma(1, xhc.ac64 ? 64 : 32); }
+
 static int ring_alloc(struct xhci_ring* r, int with_link_trb) {
-    pmm_phys_t frame = pmm_alloc_frame_dma32();
+    pmm_phys_t frame = xhci_frame();
     if (!frame) return -1;
     r->trbs    = (struct xhci_trb*)phys_to_virt(frame);
     r->phys    = frame;
@@ -260,8 +270,8 @@ static int ring_alloc(struct xhci_ring* r, int with_link_trb) {
         /* Last TRB = Link to TRB 0 with Toggle Cycle, so the producer
          * cycle inverts on wrap and the consumer can tell new from old. */
         struct xhci_trb* link = &r->trbs[r->size - 1];
-        link->param_lo = r->phys;
-        link->param_hi = 0;
+        link->param_lo = (uint32_t)r->phys;
+        link->param_hi = (uint32_t)(r->phys >> 32);
         link->status   = 0;
         link->control  = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC_BIT;
         /* No cycle bit on Link initially; cycle gets set when we wrap. */
@@ -334,7 +344,7 @@ static int evt_drain(struct xhci_trb* out_completion) {
                 usb_hid_kbd_handle_report(xhc.intr_in_buf);
                 /* Re-arm: queue another Normal TRB on the interrupt ring. */
                 ring_enqueue(&xhc.intr_in_ring,
-                             xhc.intr_in_buf_phys, 0,
+                             (uint32_t)xhc.intr_in_buf_phys, (uint32_t)(xhc.intr_in_buf_phys >> 32),
                              xhc.hid_pkt_size,
                              (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC_BIT);
                 /* Ring this endpoint's doorbell.  EP0=1; EP1 IN=3 (2*N+1).
@@ -355,10 +365,10 @@ static int evt_drain(struct xhci_trb* out_completion) {
     /* Update ERDP — write the current dequeue pointer with the Event
      * Handler Busy bit (bit 3) set to clear it. */
     if (n > 0) {
-        uint32_t erdp_phys = xhc.evt_ring.phys
+        uint64_t erdp_phys = xhc.evt_ring.phys
                            + xhc.evt_ring.dequeue * sizeof(struct xhci_trb);
-        mmio_w32(xhc.rt, XHCI_RT_IR0_ERDP_LO, erdp_phys | (1u << 3));
-        mmio_w32(xhc.rt, XHCI_RT_IR0_ERDP_HI, 0);
+        mmio_w32(xhc.rt, XHCI_RT_IR0_ERDP_LO, (uint32_t)erdp_phys | (1u << 3));
+        mmio_w32(xhc.rt, XHCI_RT_IR0_ERDP_HI, (uint32_t)(erdp_phys >> 32));
     }
     return n;
 }
@@ -415,7 +425,7 @@ static int cmd_submit_wait(uint32_t plo, uint32_t phi,
  * --------------------------------------------------------------------------- */
 static int ep0_control_xfer(uint8_t bmRequestType, uint8_t bRequest,
                             uint16_t wValue, uint16_t wIndex, uint16_t wLength,
-                            void* data_buf, uint32_t data_phys) {
+                            void* data_buf, uint64_t data_phys) {
     /* Setup Stage TRB — 8 bytes of setup packet packed into the param
      * field (Immediate Data).  We hand-pack rather than using the
      * struct to avoid endian games. */
@@ -434,7 +444,7 @@ static int ep0_control_xfer(uint8_t bmRequestType, uint8_t bRequest,
     if (wLength > 0) {
         uint32_t ctrl = (TRB_TYPE_DATA << TRB_TYPE_SHIFT);
         if (bmRequestType & USB_DIR_IN) ctrl |= TRB_DIR_IN;
-        ring_enqueue(&xhc.ep0_ring, data_phys, 0, wLength, ctrl);
+        ring_enqueue(&xhc.ep0_ring, (uint32_t)data_phys, (uint32_t)(data_phys >> 32), wLength, ctrl);
     }
 
     /* Status Stage TRB — direction is opposite of the data direction;
@@ -466,10 +476,10 @@ static int ep0_control_xfer(uint8_t bmRequestType, uint8_t bRequest,
                 xhc.evt_ring.dequeue = 0;
                 xhc.evt_ring.cycle ^= 1;
             }
-            uint32_t erdp_phys = xhc.evt_ring.phys
+            uint64_t erdp_phys = xhc.evt_ring.phys
                                + xhc.evt_ring.dequeue * sizeof(struct xhci_trb);
-            mmio_w32(xhc.rt, XHCI_RT_IR0_ERDP_LO, erdp_phys | (1u << 3));
-            mmio_w32(xhc.rt, XHCI_RT_IR0_ERDP_HI, 0);
+            mmio_w32(xhc.rt, XHCI_RT_IR0_ERDP_LO, (uint32_t)erdp_phys | (1u << 3));
+            mmio_w32(xhc.rt, XHCI_RT_IR0_ERDP_HI, (uint32_t)(erdp_phys >> 32));
 
             if (type == TRB_TYPE_TRANSFER_EVENT) {
                 uint32_t cc = (evt.status >> 24) & 0xFF;
@@ -492,6 +502,7 @@ static int xhci_reset_and_init(void) {
     uint32_t hcs1  = mmio_r32(xhc.mmio, XHCI_CAP_HCSPARAMS1);
     uint32_t hcs2  = mmio_r32(xhc.mmio, XHCI_CAP_HCSPARAMS2);
     uint32_t hcc1  = mmio_r32(xhc.mmio, XHCI_CAP_HCCPARAMS1);
+    xhc.ac64 = (int)(hcc1 & 1u);
     uint32_t dboff = mmio_r32(xhc.mmio, XHCI_CAP_DBOFF) & ~0x3u;
     uint32_t rtsoff= mmio_r32(xhc.mmio, XHCI_CAP_RTSOFF) & ~0x1Fu;
 
@@ -537,38 +548,38 @@ static int xhci_reset_and_init(void) {
     mmio_w32(xhc.op, XHCI_OP_CONFIG, xhc.max_slots);
 
     /* DCBAA — single frame, zeroed. */
-    pmm_phys_t dcbaa_frame = pmm_alloc_frame_dma32();
+    pmm_phys_t dcbaa_frame = xhci_frame();
     if (!dcbaa_frame) return -1;
     xhc.dcbaa = (uint64_t*)phys_to_virt(dcbaa_frame);
     for (int i = 0; i < 512; i++) xhc.dcbaa[i] = 0;
-    mmio_w32(xhc.op, XHCI_OP_DCBAAP_LO, dcbaa_frame);
-    mmio_w32(xhc.op, XHCI_OP_DCBAAP_HI, 0);
+    mmio_w32(xhc.op, XHCI_OP_DCBAAP_LO, (uint32_t)dcbaa_frame);
+    mmio_w32(xhc.op, XHCI_OP_DCBAAP_HI, (uint32_t)((uint64_t)dcbaa_frame >> 32));
 
     /* Command Ring. */
     if (ring_alloc(&xhc.cmd_ring, 1) != 0) return -1;
-    mmio_w32(xhc.op, XHCI_OP_CRCR_LO, xhc.cmd_ring.phys | 1 /* RCS=1 */);
-    mmio_w32(xhc.op, XHCI_OP_CRCR_HI, 0);
+    mmio_w32(xhc.op, XHCI_OP_CRCR_LO, (uint32_t)xhc.cmd_ring.phys | 1 /* RCS=1 */);
+    mmio_w32(xhc.op, XHCI_OP_CRCR_HI, (uint32_t)(xhc.cmd_ring.phys >> 32));
 
     /* Event Ring + 1-entry ERST (lives in same frame as ERST trick:
      * dedicate a frame to the segment and a tiny ERST nearby).  We
      * just allocate a separate frame for the ERST. */
     if (ring_alloc(&xhc.evt_ring, 0) != 0) return -1;
-    pmm_phys_t erst_frame = pmm_alloc_frame_dma32();
+    pmm_phys_t erst_frame = xhci_frame();
     if (!erst_frame) return -1;
     uint32_t* erst = (uint32_t*)phys_to_virt(erst_frame);
     for (int i = 0; i < 1024; i++) erst[i] = 0;
-    erst[0] = xhc.evt_ring.phys;          /* segment base low */
-    erst[1] = 0;                          /* base high */
+    erst[0] = (uint32_t)xhc.evt_ring.phys;          /* segment base low  */
+    erst[1] = (uint32_t)(xhc.evt_ring.phys >> 32);  /* segment base high */
     erst[2] = xhc.evt_ring.size;          /* segment size in TRBs */
     erst[3] = 0;
     xhc.erst_phys = erst_frame;
 
     mmio_w32(xhc.rt, XHCI_RT_IR0_ERSTSZ, 1);
     /* ERDP must be set BEFORE ERSTBA per spec — clears Event Handler Busy. */
-    mmio_w32(xhc.rt, XHCI_RT_IR0_ERDP_LO, xhc.evt_ring.phys | (1u << 3));
-    mmio_w32(xhc.rt, XHCI_RT_IR0_ERDP_HI, 0);
-    mmio_w32(xhc.rt, XHCI_RT_IR0_ERSTBA_LO, erst_frame);
-    mmio_w32(xhc.rt, XHCI_RT_IR0_ERSTBA_HI, 0);
+    mmio_w32(xhc.rt, XHCI_RT_IR0_ERDP_LO, (uint32_t)xhc.evt_ring.phys | (1u << 3));
+    mmio_w32(xhc.rt, XHCI_RT_IR0_ERDP_HI, (uint32_t)(xhc.evt_ring.phys >> 32));
+    mmio_w32(xhc.rt, XHCI_RT_IR0_ERSTBA_LO, (uint32_t)erst_frame);
+    mmio_w32(xhc.rt, XHCI_RT_IR0_ERSTBA_HI, (uint32_t)((uint64_t)erst_frame >> 32));
 
     /* Disable interrupts on the interrupter — we poll. */
     mmio_w32(xhc.rt, XHCI_RT_IR0_IMAN, 0);
@@ -626,14 +637,14 @@ static uint32_t default_maxpkt0(uint32_t speed) {
 /* Fill an Endpoint Context for an Interrupt IN endpoint.  Offsets per
  * xHCI 6.2.3. */
 static void fill_ep_ctx(uint8_t* ep_ctx, uint32_t ep_type, uint32_t max_pkt,
-                        uint32_t tr_phys) {
+                        uint64_t tr_phys) {
     uint32_t* w = (uint32_t*)ep_ctx;
     w[0] = 0;
     w[1] = (3u << 1)            /* CErr = 3 */
          | (ep_type << 3)        /* EP Type (4 = Interrupt IN, 7 if OUT diff bit) */
          | (max_pkt << 16);
-    w[2] = (tr_phys | 1u);       /* DCS = 1, TR Dequeue Ptr low */
-    w[3] = 0;
+    w[2] = ((uint32_t)tr_phys | 1u);       /* DCS = 1, TR Dequeue Ptr low */
+    w[3] = (uint32_t)(tr_phys >> 32);
     w[4] = max_pkt;              /* Average TRB length = packet size */
     w[5] = 0;
     w[6] = 0;
@@ -658,9 +669,9 @@ static int enumerate_root_device(void) {
     kprintf("xhci: slot %u assigned\n", slot);
 
     /* Allocate Device Context and Input Context (one frame each). */
-    pmm_phys_t dev_frame = pmm_alloc_frame_dma32();
-    pmm_phys_t ic_frame  = pmm_alloc_frame_dma32();
-    uint32_t tr_frame_addr; /* later */
+    pmm_phys_t dev_frame = xhci_frame();
+    pmm_phys_t ic_frame  = xhci_frame();
+    uint64_t tr_frame_addr; /* later */
     if (!dev_frame || !ic_frame) {
         kprintf("xhci: OOM for contexts\n"); return -1;
     }
@@ -700,7 +711,7 @@ static int enumerate_root_device(void) {
 
     /* Address Device command — Input Context pointer in param.  Slot ID
      * in control[31..24]. */
-    cc = cmd_submit_wait(ic_frame, 0, 0,
+    cc = cmd_submit_wait((uint32_t)ic_frame, (uint32_t)((uint64_t)ic_frame >> 32), 0,
                          (TRB_TYPE_ADDRESS_DEVICE << TRB_TYPE_SHIFT)
                          | (slot << TRB_SLOT_SHIFT),
                          NULL);
@@ -718,10 +729,10 @@ static int enumerate_root_device(void) {
 
 static int enumerate_and_configure(void) {
     /* Allocate a DMA buffer for descriptors (one frame). */
-    pmm_phys_t buf_frame = pmm_alloc_frame_dma32();
+    pmm_phys_t buf_frame = xhci_frame();
     if (!buf_frame) return -1;
     uint8_t* buf = (uint8_t*)phys_to_virt(buf_frame);
-    uint32_t buf_phys = buf_frame;
+    uint64_t buf_phys = buf_frame;
 
     /* Get the full Device Descriptor (18 bytes). */
     if (ep0_control_xfer(USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE,
@@ -825,7 +836,7 @@ static int enumerate_and_configure(void) {
     uint8_t* ep_ctx = xhc.input_ctx + (1 + dci) * 32;
     fill_ep_ctx(ep_ctx, 7 /* Interrupt IN */, hid_pkt, xhc.intr_in_ring.phys);
 
-    int cc = cmd_submit_wait(xhc.input_ctx_phys, 0, 0,
+    int cc = cmd_submit_wait((uint32_t)xhc.input_ctx_phys, (uint32_t)(xhc.input_ctx_phys >> 32), 0,
                              (TRB_TYPE_CONFIG_EP << TRB_TYPE_SHIFT)
                              | (xhc.slot_id << TRB_SLOT_SHIFT),
                              NULL);
@@ -835,7 +846,7 @@ static int enumerate_and_configure(void) {
     }
 
     /* DMA buffer for the periodic report. */
-    pmm_phys_t rb_frame = pmm_alloc_frame_dma32();
+    pmm_phys_t rb_frame = xhci_frame();
     if (!rb_frame) return -1;
     xhc.intr_in_buf = (uint8_t*)phys_to_virt(rb_frame);
     xhc.intr_in_buf_phys = rb_frame;
@@ -848,7 +859,7 @@ static int enumerate_and_configure(void) {
      * doorbell — the HC will DMA the next report into our buffer and
      * post a Transfer Event. */
     ring_enqueue(&xhc.intr_in_ring,
-                 xhc.intr_in_buf_phys, 0,
+                 (uint32_t)xhc.intr_in_buf_phys, (uint32_t)(xhc.intr_in_buf_phys >> 32),
                  hid_pkt,
                  (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC_BIT);
     uint32_t db_target = (hid_ep_num * 2) + 1;
@@ -947,26 +958,41 @@ static void xhci_pci_visit(const struct pci_device* d, void* ctx_) {
     }
 }
 
+/* §M85 — a controller on a SYSTEM bus (sbsa-ref's), named only by the
+ * firmware's description: no config space, the window is the platform's. */
+static uint64_t xhci_platform_base;
+
 static int xhci_probe(void* ctx) {
     (void)ctx;
     /* xHCI: class=0x0C (Serial Bus), subclass=0x03 (USB), prog_if=0x30. */
     xhci_pci_found = 0;
     pci_scan(xhci_pci_visit, NULL);
+    if (!xhci_pci_found) {
+        uint64_t len;
+        if (hal_platform_window("xhci", &xhci_platform_base, &len) == 0) xhci_pci_found = 2;
+    }
     return xhci_pci_found ? 0 : -1;
 }
 
 static int xhci_init(void* ctx) {
     (void)ctx;
-    /* Enable bus mastering + memory space on the device. */
-    uint16_t cmd = pci_read16(xhci_pci.bus, xhci_pci.slot, xhci_pci.func, PCI_COMMAND);
-    cmd |= PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER;
-    pci_write16(xhci_pci.bus, xhci_pci.slot, xhci_pci.func, PCI_COMMAND, cmd);
+    uint32_t mmio_phys;
+    if (xhci_pci_found == 2) {
+        mmio_phys = (uint32_t)xhci_platform_base;
+        kprintf("xhci: platform controller (no bus) at %x, from the firmware's description\n",
+                mmio_phys);
+    } else {
+        /* Enable bus mastering + memory space on the device. */
+        uint16_t cmd = pci_read16(xhci_pci.bus, xhci_pci.slot, xhci_pci.func, PCI_COMMAND);
+        cmd |= PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER;
+        pci_write16(xhci_pci.bus, xhci_pci.slot, xhci_pci.func, PCI_COMMAND, cmd);
 
-    /* BAR0 = MMIO base, 64-bit on xHCI (BAR0 low + BAR1 high).  We
-     * mask the low bits per BAR rules. */
-    uint32_t bar0 = xhci_pci.bar[0];
-    if (bar0 & 0x1) { kprintf("xhci: BAR0 is I/O? %x\n", bar0); return -1; }
-    uint32_t mmio_phys = bar0 & ~0xFu;
+        /* BAR0 = MMIO base, 64-bit on xHCI (BAR0 low + BAR1 high).  We
+         * mask the low bits per BAR rules. */
+        uint32_t bar0 = xhci_pci.bar[0];
+        if (bar0 & 0x1) { kprintf("xhci: BAR0 is I/O? %x\n", bar0); return -1; }
+        mmio_phys = bar0 & ~0xFu;
+    }
 
     /* Map a generous window (one 4 MiB PSE PDE) so all of cap/op/rt/db
      * regions land in a single contiguous virtual range. */

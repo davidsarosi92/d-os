@@ -84,9 +84,11 @@ never reach the harness (the socket connects after them) — read them with
 at a fixed VA (top of TTBR1) loaded anywhere — QEMU sbsa-ref (firmware from
 `scripts/build-sbsa-firmware.sh`, harness `--sbsa`) boots to a shell with RAM at
 1 TiB.**  aarch64 rules now: RAM only via `phys_to_virt`/`kptr_phys` (low memory
-is DEVICE-only), early boot is PC-relative, modules come from `modmem.c`.  Next:
-§M85 stage 4b (sbsa-ref devices), then the phone emulator — which becomes the
-FOURTH standard test machine.
+is DEVICE-only), early boot is PC-relative, modules come from `modmem.c`.  Stage 4b (DOCS §4.102): sbsa-ref has disk (AHCI),
+USB (xHCI, 64-bit) and network (new e1000e); `acpi` and `lspci` exist; and the
+hardware watchdog no longer reboots on a host stall while every CPU ticks (per-
+ALARM decision, second alarm reboots).  Next: the phone emulator — which becomes
+the FOURTH standard test machine.
 
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there

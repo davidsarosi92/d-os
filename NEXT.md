@@ -76,6 +76,9 @@ established; "open" rows were checked against today's tree, not copied forward.
 | PSCI hard-coded to HVC in three places | (would UNDEF under EL3 firmware) | DOCS §4.100 — `psci_call` |
 | aarch64 modules unloadable after the image moved high (heap out of CALL26 range) | `insmod: ... out of range` | DOCS §4.101 — `modmem.c` arena |
 | PL031 driver assumed virt's address | external abort on sbsa-ref (contained) | DOCS §4.101 — `hal_platform_window` |
+| hardware watchdog rebooted a healthy machine on a host stall (every CPU ticking) | `!! NMI HARD-LOCKUP` in clustered regression runs; reproducible by pausing QEMU 12 s | DOCS §4.102.1 — per-alarm decision, second alarm reboots |
+| xHCI 32-bit only (`_HI` writes 0) | Enable Slot timed out on sbsa-ref (RAM at 1 TiB) | DOCS §4.102 |
+| aarch64 `/mnt` mount gated on virtio-blk existing | sbsa-ref (AHCI `sda`) had no persistent storage | DOCS §4.102 |
 
 Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI report with
 `if=`/`task=`/`isr-vec=`/stack scan, monitor replies kept in `<log>.mon`,
