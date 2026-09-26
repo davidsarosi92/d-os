@@ -76,7 +76,10 @@ exposed four x86_64 DMA drivers dereferencing physical addresses (use
 `phys_to_virt`, always).  **Stage 3 SHIPPED too (DOCS §4.97): aarch64 RAM is a TTBR1
 direct map at 0xFFFFFF80_00000000, 8 and 16 GiB verified — and the aarch64 harness
 had never loaded a DTB, so `--mem` was silently ignored on ARM until now.**
-Next: §M86 stage 4 (multi-range `/memory`), then §M85.
+**Stage 4 too (DOCS §4.98): every DTB RAM range and reservation reaches the
+PMM — §M86 COMPLETE** (open from it: NX on i386 PAE).  Early aarch64 boot lines
+never reach the harness (the socket connects after them) — read them with
+`dmesg`; `DOS_DTB=<file>` loads a hand-edited tree.  Next: §M85 sbsa-ref.
 
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there

@@ -48,10 +48,37 @@ struct fdt_header {
 #define FDT_NOP          0x4
 #define FDT_END          0x9
 
-/* Discovered machine facts (0 = unknown). */
-static uint64_t g_ram_base;
-static uint64_t g_ram_size;
+/* Discovered machine facts (0 = unknown).
+ *
+ * §M86 stage 4 (2026-09-26): RAM is a LIST of ranges.  This used to keep one
+ * (base, size) and overwrite it at every `reg` it met, so a tree with two
+ * /memory nodes — a NUMA machine, sbsa-ref, most real boards — handed the PMM
+ * whichever node came LAST.  Measured with two QEMU NUMA nodes (1 GiB + 3 GiB):
+ * 1014 MiB managed of 4096, and the kept range was not even the one holding
+ * the kernel image.  Every `reg` tuple of every memory node is collected now,
+ * and the reservation block is read so firmware-reserved RAM is never handed
+ * out. */
+#define DTB_MAX_RANGES 16
+static uint64_t g_mem_base[DTB_MAX_RANGES], g_mem_size[DTB_MAX_RANGES];
+static int      g_nmem;
+static uint64_t g_rsv_base[DTB_MAX_RANGES], g_rsv_size[DTB_MAX_RANGES];
+static int      g_nrsv;
+static uint64_t g_ram_base;              /* lowest range's base (legacy getter) */
+static uint64_t g_ram_size;              /* TOTAL RAM across all ranges         */
 static int      g_ncpu;
+
+static uint32_t rd32(const uint8_t* p);
+
+/* A value of `cells` 32-bit cells, big-endian (1 or 2 in practice).  Built on
+ * rd32 and NOT on `p[0] << 24`: that expression is an int, so a cell whose top
+ * byte is >= 0x80 sign-extends into the upper word — the first version read
+ * the bank at 0x8000_0000 as 0xFFFF_FFFF_8000_0000 and handed the PMM a range
+ * ending before it began. */
+static uint64_t rd_cells(const uint8_t* p, uint32_t cells) {
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < cells; i++) v = (v << 32) | (uint64_t)rd32(p + 4 * i);
+    return v;
+}
 
 static inline uint32_t be32(uint32_t v) { return __builtin_bswap32(v); }
 
@@ -101,6 +128,11 @@ static void fdt_parse(const struct fdt_header* h) {
     const char* namestk[8];
     int depth = 0;
     int in_cpus = 0, cpus_depth = -1;
+    /* The root's #address-cells / #size-cells govern a /memory node's `reg`
+     * (the spec's defaults are 2 and 1).  `virt` uses 2/2; taking that as a
+     * constant would be right on the board it was written for and silently
+     * wrong on the next — the same shape as a hard-coded stream count. */
+    uint32_t acells = 2, scells = 1;
 
     int guard = 0;
     while (p < end && guard++ < 100000) {
@@ -129,13 +161,26 @@ static void fdt_parse(const struct fdt_header* h) {
             p += len;
             p = (const uint8_t*)(((uintptr_t)p + 3) & ~(uintptr_t)3);
 
-            /* /memory@.../reg = <base_hi base_lo size_hi size_lo> (2/2 cells). */
+            if (depth == 1 && pname[0] == '#') {
+                if (str_prefix(pname, "#address-cells") && len == 4) acells = rd32(val);
+                if (str_prefix(pname, "#size-cells")    && len == 4) scells = rd32(val);
+            }
+            /* /memory@.../reg = one or more <base size> tuples. */
             const char* cur = (depth >= 1 && depth <= 8) ? namestk[depth - 1] : "";
-            if (str_prefix(cur, "memory") && str_prefix(pname, "reg") && len >= 16) {
-                uint64_t bhi = rd32(val), blo = rd32(val + 4);
-                uint64_t shi = rd32(val + 8), slo = rd32(val + 12);
-                g_ram_base = (bhi << 32) | blo;
-                g_ram_size = (shi << 32) | slo;
+            uint32_t tup = 4 * (acells + scells);
+            if (depth == 2 && str_prefix(cur, "memory") && str_prefix(pname, "reg") &&
+                acells >= 1 && acells <= 2 && scells >= 1 && scells <= 2) {
+                for (uint32_t o = 0; o + tup <= len; o += tup) {
+                    uint64_t b0 = rd_cells(val + o, acells);
+                    uint64_t sz = rd_cells(val + o + 4 * acells, scells);
+                    if (!sz) continue;
+                    if (g_nmem == DTB_MAX_RANGES) {
+                        kprintf("dtb: more than %d RAM ranges - ignoring %p+%u MiB\n",
+                                DTB_MAX_RANGES, (void*)(uintptr_t)b0, (unsigned)(sz >> 20));
+                        continue;
+                    }
+                    g_mem_base[g_nmem] = b0; g_mem_size[g_nmem] = sz; g_nmem++;
+                }
             }
         } else if (tok == FDT_END) {
             break;
@@ -151,10 +196,44 @@ void dtb_init(uint64_t x0) {
     if (!h) { kprintf("dtb: no device tree found (using built-in defaults)\n"); return; }
 
     fdt_parse(h);
-    kprintf("dtb: found @ %p — RAM %u MiB @ %p, %d CPU(s)\n",
-            (void*)h, (unsigned)(g_ram_size >> 20), (void*)(uintptr_t)g_ram_base, g_ncpu);
+
+    /* The reservation block: (address, size) pairs of 64-bit big-endian values,
+     * ended by a zero pair.  Firmware puts things there it expects to survive
+     * (spin tables, secure-world carve-outs); handing one to the allocator is a
+     * corruption nobody on this side would see coming. */
+    const uint8_t* rv = (const uint8_t*)h + be32(h->off_mem_rsvmap);
+    for (int i = 0; i < 64; i++, rv += 16) {
+        uint64_t b0 = rd_cells(rv, 2), sz = rd_cells(rv + 8, 2);
+        if (!b0 && !sz) break;
+        if (g_nrsv < DTB_MAX_RANGES) { g_rsv_base[g_nrsv] = b0; g_rsv_size[g_nrsv] = sz; g_nrsv++; }
+    }
+
+    g_ram_base = 0; g_ram_size = 0;
+    for (int i = 0; i < g_nmem; i++) {
+        if (!g_ram_base || g_mem_base[i] < g_ram_base) g_ram_base = g_mem_base[i];
+        g_ram_size += g_mem_size[i];
+    }
+    kprintf("dtb: found @ %p - RAM %u MiB in %d range(s), %d reserved, %d CPU(s)\n",
+            (void*)h, (unsigned)(g_ram_size >> 20), g_nmem, g_nrsv, g_ncpu);
+    for (int i = 0; i < g_nmem; i++)
+        kprintf("dtb:   ram %p .. %p (%u MiB)\n", (void*)(uintptr_t)g_mem_base[i],
+                (void*)(uintptr_t)(g_mem_base[i] + g_mem_size[i]),
+                (unsigned)(g_mem_size[i] >> 20));
+    for (int i = 0; i < g_nrsv; i++)
+        kprintf("dtb:   reserved %p + %u KiB\n", (void*)(uintptr_t)g_rsv_base[i],
+                (unsigned)(g_rsv_size[i] >> 10));
 }
 
 uint64_t dtb_ram_base(void) { return g_ram_base; }
 uint64_t dtb_ram_size(void) { return g_ram_size; }
+int dtb_mem_count(void) { return g_nmem; }
+int dtb_mem_range(int i, uint64_t* base, uint64_t* size) {
+    if (i < 0 || i >= g_nmem) return -1;
+    *base = g_mem_base[i]; *size = g_mem_size[i]; return 0;
+}
+int dtb_rsv_count(void) { return g_nrsv; }
+int dtb_rsv_range(int i, uint64_t* base, uint64_t* size) {
+    if (i < 0 || i >= g_nrsv) return -1;
+    *base = g_rsv_base[i]; *size = g_rsv_size[i]; return 0;
+}
 int      dtb_ncpu(void)     { return g_ncpu; }

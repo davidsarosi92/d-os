@@ -536,6 +536,25 @@ void pmm_init(void) {
      * unconditionally so even AVAILABLE-marked frames inside the
      * carve-out range disappear from the pool. */
 
+    /* (a0) Every NON-available map entry wins over an available one it
+     *      overlaps (§M86 stage 4, 2026-09-26).  Pass 1 only ever SKIPPED
+     *      them, which is enough while the map's entries are disjoint (the
+     *      common x86 firmware case) and wrong the moment a reservation sits
+     *      inside a RAM range — which is how a device tree describes one: the
+     *      /memory node covers the whole bank and /memreserve/ carves pieces
+     *      out of it.  Seeding those frames hands firmware's memory to the
+     *      allocator. */
+    {
+        uintptr_t q = mbi->mmap_addr;
+        int budget = 64;
+        while (q < end && budget-- > 0) {
+            const struct mboot_mmap_entry* e = (const struct mboot_mmap_entry*)q;
+            if (e->type != MMAP_TYPE_AVAILABLE && e->length)
+                carve_out_range((pmm_phys_t)e->base, (pmm_phys_t)(e->base + e->length));
+            q += e->size + 4;
+        }
+    }
+
     /* (a) Frame 0 — NULL safety. */
     page_state[0] = PS_NONE;
 

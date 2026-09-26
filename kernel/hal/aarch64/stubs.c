@@ -44,8 +44,19 @@
 /* Machine facts discovered from the device tree (dtb.c); 0 if no DTB. */
 uint64_t dtb_ram_base(void);
 uint64_t dtb_ram_size(void);
+int dtb_mem_count(void);
+int dtb_mem_range(int i, uint64_t* base, uint64_t* size);
+int dtb_rsv_count(void);
+int dtb_rsv_range(int i, uint64_t* base, uint64_t* size);
 
-static struct mboot_mmap_entry aarch64_mmap[1];
+/* §M86 stage 4 — one entry per DTB RAM range plus one per reservation.  The
+ * multiboot entry format stays as the interchange shape on purpose: its
+ * base/length are 64-bit, pmm.c already walks several entries of mixed types
+ * on x86, and its one 32-bit field (mmap_addr) points at THIS static array in
+ * the kernel image, which is always below 4 GiB.  What was actually wrong was
+ * the count — one range — not the format. */
+#define AARCH64_MMAP_MAX 32
+static struct mboot_mmap_entry aarch64_mmap[AARCH64_MMAP_MAX];
 static struct mboot_info       aarch64_mbi;
 
 /* Build the fake multiboot info + register it so mboot_get_info() returns a
@@ -54,16 +65,36 @@ static struct mboot_info       aarch64_mbi;
 void aarch64_boot_meminfo_init(void) {
     /* Prefer the device-tree-discovered RAM window; fall back to the built-in
      * `virt` defaults if no DTB was found. */
-    uint64_t base = dtb_ram_base() ? dtb_ram_base() : VIRT_RAM_BASE;
-    uint64_t size = dtb_ram_size() ? dtb_ram_size() : VIRT_RAM_SIZE;
-
-    aarch64_mmap[0].size   = sizeof(struct mboot_mmap_entry) - 4;  /* excl. size */
-    aarch64_mmap[0].base   = base;
-    aarch64_mmap[0].length = size;
-    aarch64_mmap[0].type   = MMAP_TYPE_AVAILABLE;
+    int n = 0;
+    uint64_t b0, sz;
+    for (int i = 0; i < dtb_mem_count() && n < AARCH64_MMAP_MAX; i++) {
+        if (dtb_mem_range(i, &b0, &sz) != 0) continue;
+        aarch64_mmap[n].size   = sizeof(struct mboot_mmap_entry) - 4;  /* excl. size */
+        aarch64_mmap[n].base   = b0;
+        aarch64_mmap[n].length = sz;
+        aarch64_mmap[n].type   = MMAP_TYPE_AVAILABLE;
+        n++;
+    }
+    if (n == 0) {                        /* no DTB: the built-in `virt` window */
+        aarch64_mmap[0].size   = sizeof(struct mboot_mmap_entry) - 4;
+        aarch64_mmap[0].base   = VIRT_RAM_BASE;
+        aarch64_mmap[0].length = VIRT_RAM_SIZE;
+        aarch64_mmap[0].type   = MMAP_TYPE_AVAILABLE;
+        n = 1;
+    }
+    /* Reservations AFTER the RAM: pmm.c subtracts every non-available entry
+     * from the available ones, whichever order they arrive in. */
+    for (int i = 0; i < dtb_rsv_count() && n < AARCH64_MMAP_MAX; i++) {
+        if (dtb_rsv_range(i, &b0, &sz) != 0) continue;
+        aarch64_mmap[n].size   = sizeof(struct mboot_mmap_entry) - 4;
+        aarch64_mmap[n].base   = b0;
+        aarch64_mmap[n].length = sz;
+        aarch64_mmap[n].type   = 2;       /* reserved */
+        n++;
+    }
 
     aarch64_mbi.flags       = MBI_FLAG_MMAP;
-    aarch64_mbi.mmap_length = sizeof(aarch64_mmap);
+    aarch64_mbi.mmap_length = (uint32_t)(n * sizeof(aarch64_mmap[0]));
     aarch64_mbi.mmap_addr   = (uint32_t)(uintptr_t)aarch64_mmap;
 
     mboot_init(MB1_MAGIC, (uintptr_t)&aarch64_mbi);

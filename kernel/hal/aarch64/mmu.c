@@ -70,6 +70,21 @@ static uint64_t dm_block(uint64_t i) {
  * covered (capped at the 512 GiB one table can describe).  Blocks are only ever
  * ADDED to an invalid slot, so no live translation changes and no other CPU can
  * hold a stale entry for them — the TLBI is for this CPU's walk caches. */
+/* Map only the slots that overlap [base, base+size) — used for each RAM range
+ * the device tree names (§M86 stage 4).  A 1 GiB slot between two banks is
+ * left UNMAPPED rather than mapped as Normal memory: on a real board that gap
+ * may be a device window, and a cacheable alias of MMIO is something the CPU
+ * may speculate into. */
+void mmu_direct_map_range(uint64_t base, uint64_t size) {
+    const uint64_t cap = 512ULL << 30;
+    if (!size || base >= cap) return;
+    uint64_t end = base + size;
+    if (end > cap) end = cap;
+    for (uint64_t i = base >> 30; i < ((end + (1ULL << 30) - 1) >> 30); i++)
+        if (!(l1_ttbr1[i] & DESC_BLOCK)) l1_ttbr1[i] = dm_block(i);
+    __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");
+}
+
 uint64_t mmu_direct_map_extend(uint64_t end_phys) {
     const uint64_t cap = 512ULL << 30;
     if (end_phys > cap) end_phys = cap;
@@ -164,9 +179,11 @@ void mmu_init(void) {
                     | DESC_BLOCK | DESC_AF | DESC_SH_INNER | DESC_ATTR(ATTR_NORMAL);
     }
 
-    /* The direct map's first 4 GiB, so phys_to_virt works from the very first
-     * allocation; the rest arrives with hal_extend_identity_map. */
-    mmu_direct_map_extend(4ULL << 30);
+    /* Only the peripheral slot, as DEVICE memory, before the RAM is known.
+     * RAM slots arrive with hal_extend_identity_map, which pmm_init calls
+     * before its first phys_to_virt; pre-mapping "the first 4 GiB" blindly
+     * would map non-RAM as Normal on any machine with less (§M86 stage 4). */
+    mmu_direct_map_range(0, 1ULL << 30);
 
     mmu_enable_this_cpu();
     uart_early_puts("aarch64: MMU + caches enabled (identity + TTBR1 direct map)\n");

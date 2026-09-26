@@ -96,8 +96,20 @@ void hal_arch_early_init(void) {
  * ~3 GiB was ever managed; the "identity" in the name is historical — what the
  * PMM needs to know is how far `phys_to_virt` reaches. */
 uint64_t mmu_direct_map_extend(uint64_t end_phys);
+void     mmu_direct_map_range(uint64_t base, uint64_t size);
+int dtb_mem_count(void);
+int dtb_mem_range(int i, uint64_t* base, uint64_t* size);
 uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
-    return (uintptr_t)mmu_direct_map_extend((uint64_t)end_phys);
+    /* With a device tree, map exactly its RAM ranges (holes stay unmapped —
+     * see mmu_direct_map_range); without one, the old contiguous extension. */
+    int n = dtb_mem_count();
+    if (n <= 0) return (uintptr_t)mmu_direct_map_extend((uint64_t)end_phys);
+    for (int i = 0; i < n; i++) {
+        uint64_t b, sz;
+        if (dtb_mem_range(i, &b, &sz) == 0) mmu_direct_map_range(b, sz);
+    }
+    uint64_t cap = 512ULL << 30;
+    return (uintptr_t)(end_phys < cap ? end_phys : cap);
 }
 
 /* ---- syscall epilogue (EL0 userspace) -------------------------------------- */

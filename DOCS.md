@@ -14003,8 +14003,52 @@ unchanged.
 is all `virt` has; a board with several ranges (sbsa-ref, §M85, real hardware)
 needs them all passed through natively.
 
+### 4.98 Every RAM range the device tree names (§M86 stage 4, 2026-09-26)
+
+`dtb.c` kept ONE (base, size) and overwrote it at every `reg` it met, so a tree
+with several `/memory` nodes — a NUMA machine, sbsa-ref, most real boards —
+gave the PMM whichever came last.  **Measured first:** two QEMU NUMA nodes
+(1 GiB at 0x4000_0000 + 3 GiB at 0x8000_0000) → **1014 MiB managed of 4096**,
+and the range kept was not even the one holding the kernel image.
+
+- **Every tuple of every memory node** is collected (up to 16), interpreted
+  with the root's `#address-cells`/`#size-cells` rather than an assumed 2/2 —
+  right on `virt`, silently wrong on the next board.
+- **The reservation block (`/memreserve/`) is read**, and `pmm.c` now carves
+  every NON-available map entry out of any available one it overlaps.  Pass 1
+  had only ever skipped them — enough while firmware maps are disjoint (x86,
+  whose managed counts are unchanged: i386 8G 2079128, x86_64 2G 484974) and
+  wrong the moment a reservation sits inside a bank, which is how a device
+  tree expresses one.
+- **The TTBR1 direct map covers exactly the RAM ranges**: a 1 GiB slot between
+  banks stays unmapped rather than becoming a cacheable alias of whatever
+  lives there, and `mmu_init` no longer pre-maps "the first 4 GiB" blindly —
+  only the peripheral slot, as Device memory, until the PMM asks.
+- **The multiboot entry format stays as the interchange shape, deliberately:**
+  its base/length are 64-bit, `pmm.c` already walks many entries of mixed
+  types on x86, and its one 32-bit field points at a static array in the
+  kernel image.  What was wrong was the COUNT, not the format — so the plan's
+  "native memory-range list" would have been a second format with nothing to
+  gain.
+
+**The instrument caught my own bug first:** the cell reader built values from
+`p[0] << 24`, an `int`, so the bank at 0x8000_0000 read as
+0xFFFF_FFFF_8000_0000 and the second run managed LESS (760 MiB).  `dmesg`'s
+per-range lines showed it in one look (the harness cannot see the first lines of
+an ARM boot — the serial socket connects after them — so `dmesg` is how early
+boot is read there).
+
+**Verified:** the NUMA machine → both ranges, **4083 MiB managed of 4096**,
+`highmemtest all` over every frame up to 5119 MiB clean, fork/musl/memcheck
+green.  A hand-edited tree with `/memreserve/ 0x50000000 16 MiB` (QEMU never
+emits one; `DOS_DTB=<file>` makes the harness load it) → managed frames drop by
+**exactly 4096** against the same tree without it.  The ordinary aarch64 boot
+(display, sound, network, disk, EL0, audit) green; i386 and x86_64 counts
+identical to before.
+
 ## 8. Change log
 
+- **2026-09-26 — §M86 COMPLETE, stage 4: every RAM range and reservation in the device tree reaches the PMM; reserved map entries are carved out of overlapping RAM on every arch; the direct map skips holes (DOCS §4.98).**
 - **2026-09-26 — §M86 stage 3: aarch64 reaches RAM through a TTBR1 direct map (8 and 16 GiB verified); the user-pointer gate refuses the upper half; the aarch64 harness finally loads a DTB for the machine it boots (DOCS §4.97).**
 - **2026-09-26 — §M86 stage 2: i386 PAE, physical memory above 4 GiB (8 GiB verified); x86_64 DMA drivers stop dereferencing physical addresses; ac97 drain no longer times out after every sound; task_reap claims under the lock (DOCS §4.96).**
 - **2026-09-26 — Concurrent processes: per-task excursion state, a race-free atomic COW table, O(1) buddy removal, spinners answer shootdowns, a private ringtest space, a page_alloc_below leak (DOCS §4.95).**

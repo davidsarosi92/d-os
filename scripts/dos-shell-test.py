@@ -305,11 +305,17 @@ def aarch64_dtb_args(a):
     path under test was not the machine asked for).  The tree is dumped from
     the same -M/-cpu/-smp/-m every run, because those are exactly the facts the
     kernel reads from it (/memory, /cpus); a DTB made once for one size is
-    wrong for every other size."""
+    wrong for every other size.  The extra QEMU arguments go in too, because
+    `-numa`/`-object` change the /memory nodes (§M86 stage 4's falsifier)."""
+    if os.environ.get("DOS_DTB"):
+        # A hand-edited tree (e.g. with a /memreserve/ QEMU never emits), so a
+        # path the emulator cannot produce can still be exercised.
+        return ["-device", "loader,file=%s,addr=0x48000000,force-raw=on"
+                % os.environ["DOS_DTB"]]
     dtb = "build/aarch64/test-%d.dtb" % os.getpid()
     subprocess.run(["qemu-system-aarch64", "-M", "virt,gic-version=2,dumpdtb=" + dtb,
                     "-cpu", "cortex-a72", "-smp", str(a.smp), "-m", a.mem,
-                    "-display", "none"],
+                    "-display", "none"] + list(a.extra),
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return ["-device", "loader,file=%s,addr=0x48000000,force-raw=on" % dtb]
 
