@@ -27,6 +27,13 @@
  * happens BEFORE that, so it cannot wait for it. */
 #define PL011_BASE   (g_board.uart ? (uintptr_t)g_board.uart : 0x09000000UL)
 
+/* §M85 — on a FIRMWARE boot the console's address is not known until the
+ * description has been read, and `virt`'s default is the wrong device on any
+ * other board (on sbsa-ref, nothing at all).  mmu.c sets this when a boot info
+ * arrived; output is held (klog still keeps it — `dmesg` shows those lines)
+ * until board_finish names the UART. */
+extern int aarch64_uart_hold;
+
 /* Register offsets (Arm PrimeCell PL011 TRM, DDI 0183). */
 #define UART_DR      0x00      /* Data register.                              */
 #define UART_FR      0x18      /* Flag register.                              */
@@ -43,6 +50,7 @@ static inline uint32_t mmio_read32(uintptr_t addr) {
 
 /* Block until the transmit FIFO can accept a byte, then push it. */
 void uart_early_putc(char c) {
+    if (aarch64_uart_hold && !g_board.uart) return;
     while (mmio_read32(PL011_BASE + UART_FR) & UART_FR_TXFF) {
         /* spin — FIFO full */
     }

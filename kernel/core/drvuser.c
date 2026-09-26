@@ -854,6 +854,10 @@ long drvuser_sys_window(int bar, uint64_t* out_phys, uint64_t* out_len) {
     if (d->mf->mmio_len) {
         d->win_phys = d->mf->mmio_phys;
         d->win_len  = d->mf->mmio_len;
+        /* §M85 — the machine's own description wins over the constant the
+         * manifest was written with (which is `virt`'s). */
+        uint64_t hb, hl;
+        if (hal_platform_window(d->mf->name, &hb, &hl) == 0) { d->win_phys = hb; d->win_len = hl; }
         if (out_phys) *out_phys = d->win_phys;
         if (out_len)  *out_len  = d->win_len;
         kprintf("drv-user: '%s' window %x +%x (declared, not a bus)\n",

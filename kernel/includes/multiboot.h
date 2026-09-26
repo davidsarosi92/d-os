@@ -100,4 +100,10 @@ const struct mboot_info* mboot_get_info(void);
  * Used by the `meminfo` shell command. */
 void mboot_print_meminfo(void);
 
+/* The memory map as a POINTER (§M85).  mmap_addr is a 32-bit physical
+ * address — a pointer on x86, where the kernel reaches low memory directly;
+ * aarch64 keeps its synthesised map in the (high-VA) kernel image and
+ * overrides this weak default.  Every walker of the map goes through it. */
+uintptr_t mboot_mmap_ptr(const struct mboot_info* mbi);
+
 #endif

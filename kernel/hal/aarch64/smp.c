@@ -36,7 +36,6 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #define AARCH64_MAX_CPUS 2
 
 /* From mmu.c / gic.c / exceptions.c / timer.c. */
-void mmu_enable_this_cpu(void);
 void gic_cpu_init(void);
 void gic_send_sgi(int cpu, uint32_t sgi);
 void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
@@ -97,10 +96,8 @@ static volatile int cpus_online = 1;    /* BSP counts as 1 */
 
 /* Called (with the MMU still off) from smp_entry.S on each secondary core. */
 void smp_secondary_main(uint64_t cpu) {
-    /* Turn the MMU + caches on FIRST — before any shared cacheable access, so
-     * this core is coherent with the others (spinlocks live in Normal WB
-     * shareable memory). */
-    mmu_enable_this_cpu();
+    /* The MMU is already on: smp_entry.S turned it on before jumping to the
+     * image's virtual address (§M85), so every access from here is coherent. */
 
     /* Install the (shared) exception vector table for this core. */
     extern char vector_table[];
@@ -136,7 +133,9 @@ void smp_secondary_main(uint64_t cpu) {
 /* Start every secondary core (1..N-1) via PSCI.  Returns the number of CPUs
  * now online (including the BSP). */
 int smp_boot_aps(void) {
-    uint64_t entry = (uint64_t)(uintptr_t)&smp_secondary_entry;
+    /* PSCI starts the core with its MMU off, so the entry is PHYSICAL (§M85:
+     * the image runs at a virtual address unrelated to where it was loaded). */
+    uint64_t entry = kptr_phys(&smp_secondary_entry);
 
     /* Handler for the cross-CPU reschedule SGI (registry is global, so one
      * registration covers every core). */
@@ -144,6 +143,13 @@ int smp_boot_aps(void) {
 
     for (int cpu = 1; cpu < AARCH64_MAX_CPUS; cpu++) {
         ap_sp[cpu] = (uint64_t)(uintptr_t)&ap_stacks[cpu][sizeof ap_stacks[cpu]];
+        /* The secondary reads ap_sp[] and the image offset with its MMU (and
+         * so its caches) OFF: clean both to the point of coherency, or it may
+         * read memory the stores have not reached yet.  (QEMU's TCG has no
+         * caches and would never show this; hardware does.) */
+        __asm__ volatile ("dc cvac, %0" :: "r"(&ap_sp[cpu]) : "memory");
+        __asm__ volatile ("dc cvac, %0" :: "r"(&aarch64_kimage_voffset) : "memory");
+        __asm__ volatile ("dsb sy" ::: "memory");
         /* Target MPIDR = linear Aff0 = cpu index (QEMU `virt` topology). */
         long rc = psci_cpu_on((uint64_t)cpu, entry, 0);
         if (rc != 0) {

@@ -79,7 +79,14 @@ had never loaded a DTB, so `--mem` was silently ignored on ARM until now.**
 **Stage 4 too (DOCS §4.98): every DTB RAM range and reservation reaches the
 PMM — §M86 COMPLETE** (open from it: NX on i386 PAE).  Early aarch64 boot lines
 never reach the harness (the socket connects after them) — read them with
-`dmesg`; `DOS_DTB=<file>` loads a hand-edited tree.  Next: §M85 sbsa-ref.
+`dmesg`; `DOS_DTB=<file>` loads a hand-edited tree.  **§M85 (2026-09-26, DOCS §4.99-§4.101): the aarch64 board is DISCOVERED
+(DTB or ACPI), GICv3, UEFI boot through a hand-made PE stub, and the kernel runs
+at a fixed VA (top of TTBR1) loaded anywhere — QEMU sbsa-ref (firmware from
+`scripts/build-sbsa-firmware.sh`, harness `--sbsa`) boots to a shell with RAM at
+1 TiB.**  aarch64 rules now: RAM only via `phys_to_virt`/`kptr_phys` (low memory
+is DEVICE-only), early boot is PC-relative, modules come from `modmem.c`.  Next:
+§M85 stage 4b (sbsa-ref devices), then the phone emulator — which becomes the
+FOURTH standard test machine.
 
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there

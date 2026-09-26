@@ -563,6 +563,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/dtb.c \
       kernel/hal/aarch64/board.c \
       kernel/hal/aarch64/acpi_arm.c \
+      kernel/hal/aarch64/modmem.c \
       kernel/hal/aarch64/serial_shell.c \
       kernel/core/serial_cmd.c \
       kernel/hal/aarch64/main_entry.c
@@ -2675,9 +2676,12 @@ $(KERNEL_IMG): $(KERNEL_BIN)
 $(EFI_STUB): kernel/boot/efi/efistub.c kernel/boot/efi/efistub_head.S \
              kernel/boot/efi/efistub.ld kernel/includes/efi_bootinfo.h $(KERNEL_IMG)
 	@mkdir -p $(OBJ_DIR)/efi
-	s=$$($(CROSS)nm $(KERNEL_BIN) | awk '$$3=="kernel_start"{print $$1}'); \
-	e=$$($(CROSS)nm $(KERNEL_BIN) | awk '$$3=="kernel_end"{print $$1}'); \
-	$(CC) $(EFI_CFLAGS) -DDOS_KERNEL_LOAD=0x$$s -DDOS_KERNEL_SPAN=$$((0x$$e - 0x$$s)) \
+	# Only the LOW 8 hex digits: the image is linked at 0xffffffffc0080000,
+	# and dash's $$(( )) clamps anything above INT64_MAX — the first stub got
+	# TEXT_OFFSET 0x1fffff and a span of 0 (no room for .bss) that way.
+	s=$$($(CROSS)nm $(KERNEL_BIN) | awk '$$3=="kernel_start"{print substr($$1,9)}'); \
+	e=$$($(CROSS)nm $(KERNEL_BIN) | awk '$$3=="kernel_end"{print substr($$1,9)}'); \
+	$(CC) $(EFI_CFLAGS) -DDOS_KERNEL_TEXT_OFFSET=$$((0x$$s & 0x1FFFFF)) -DDOS_KERNEL_SPAN=$$((0x$$e - 0x$$s)) \
 	    -c kernel/boot/efi/efistub.c -o $(OBJ_DIR)/efi/efistub.o
 	$(CC) -DKERNEL_IMG_PATH='"$(KERNEL_IMG)"' -c kernel/boot/efi/efistub_head.S \
 	    -o $(OBJ_DIR)/efi/efistub_head.o

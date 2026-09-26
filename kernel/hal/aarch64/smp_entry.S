@@ -23,24 +23,40 @@ smp_secondary_entry:
     /* Firmware may start a secondary at EL2 (see el2_drop.h). */
     DROP_TO_EL1 .Lap_el1
 .Lap_el1:
-    /* MMU-off SCTLR with the architecturally-RES1 bits set (same value the
-     * BSP uses in boot.S before enabling the MMU). */
+    /* MMU-off SCTLR with the architecturally-RES1 bits set. */
     ldr     x0, =0x30d00800
     msr     sctlr_el1, x0
     isb
 
     /* cpu index = MPIDR_EL1.Aff0 (linear on QEMU `virt`). */
-    mrs     x9, mpidr_el1
-    and     x9, x9, #0xff
+    mrs     x20, mpidr_el1
+    and     x20, x20, #0xff
 
-    /* sp = ap_sp[cpu]  (ap_sp is a global uint64_t[] filled by the BSP). */
-    ldr     x10, =ap_sp
-    lsl     x11, x9, #3
-    ldr     x12, [x10, x11]
+    /* §M85 — this runs at the image's PHYSICAL address with the MMU off, so
+     * the stack pointer the BSP published (a virtual address) is converted
+     * with the image offset first; both are read PC-relatively, and smp.c
+     * cleaned them to the point of coherency before CPU_ON, because this core
+     * reads them uncached. */
+    adrp    x10, ap_sp
+    add     x10, x10, :lo12:ap_sp
+    ldr     x12, [x10, x20, lsl #3]
+    adrp    x11, aarch64_kimage_voffset
+    ldr     x11, [x11, :lo12:aarch64_kimage_voffset]
+    sub     x12, x12, x11
     mov     sp, x12
 
+    /* MMU on (identity map + kernel half), then up to the virtual address. */
+    bl      aarch64_mmu_enable_this_cpu
+    ldr     x0, =.Lap_high
+    br      x0
+.Lap_high:
+    ldr     x10, =ap_sp
+    ldr     x12, [x10, x20, lsl #3]
+    mov     sp, x12
+    bl      aarch64_mmu_drop_idmap
+
     /* smp_secondary_main(cpu). */
-    mov     x0, x9
+    mov     x0, x20
     bl      smp_secondary_main
 
 1:  wfe

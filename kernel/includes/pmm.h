@@ -197,6 +197,8 @@ void       pmm_free_contiguous(pmm_phys_t addr, uint32_t n);
 /* Statistics.  `managed` is the total count of frames the PMM knows
  * about (sum of AVAILABLE mmap regions in frames).  `free` and `used`
  * always add up to `managed`. */
+/* §M85 — the lowest pfn the metadata covers (0 unless RAM starts high). */
+extern uint32_t pmm_pfn_base;
 uint32_t pmm_managed_frames(void);
 uint32_t pmm_free_frames(void);
 uint32_t pmm_used_frames(void);

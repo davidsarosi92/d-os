@@ -42,18 +42,20 @@ _start:
 
 .Lin_el1:
     /* -----------------------------------------------------------------------
-     * Common EL1 bring-up.
+     * Common EL1 bring-up — at the image's PHYSICAL address, MMU off (§M85).
+     *
+     * The image is linked at KIMAGE_VBASE and may be loaded anywhere, so until
+     * the MMU is on every address here is formed PC-RELATIVELY (adrp/add): an
+     * absolute `ldr =sym` would be the link-time VIRTUAL address, which with
+     * the MMU off is just a physical address somewhere else — on sbsa-ref, in
+     * the middle of the GIC.
      * ----------------------------------------------------------------------- */
 
-    /* Initial stack.  __stack_top is 16-byte aligned by the linker; SP on
-     * AArch64 must be 16-byte aligned at every public boundary. */
-    ldr     x0, =__stack_top
-    mov     sp, x0
-
-    /* Zero .bss: [__bss_start, __bss_end) in 8-byte strides.  The linker
-     * guarantees both symbols are 8-byte aligned and end >= start. */
-    ldr     x0, =__bss_start
-    ldr     x1, =__bss_end
+    /* Zero .bss first: the page tables built next live in it. */
+    adrp    x0, __bss_start
+    add     x0, x0, :lo12:__bss_start
+    adrp    x1, __bss_end
+    add     x1, x1, :lo12:__bss_end
 .Lbss_zero:
     cmp     x0, x1
     b.hs    .Lbss_done
@@ -61,7 +63,30 @@ _start:
     b       .Lbss_zero
 .Lbss_done:
 
-    /* Hand the DTB pointer to C and go.  aarch64_main_entry never returns. */
+    /* The boot stack, at its physical address for now. */
+    adrp    x0, __stack_top
+    add     x0, x0, :lo12:__stack_top
+    mov     sp, x0
+
+    /* Build the tables and turn the MMU on (mmu.c): x0 = where _start IS,
+     * x1 = where it was LINKED, x2 = what the loader handed us. */
+    adrp    x0, _start
+    add     x0, x0, :lo12:_start
+    ldr     x1, =_start
+    mov     x2, x19
+    bl      aarch64_mmu_early
+
+    /* MMU on, still executing at the physical address through the identity
+     * map; jump to the same code at its virtual address. */
+    ldr     x0, =.Lhigh
+    br      x0
+.Lhigh:
+    ldr     x0, =__stack_top
+    mov     sp, x0
+    bl      aarch64_mmu_drop_idmap
+
+    /* Hand the loader's argument (a PHYSICAL address: DTB or boot info) to C
+     * and go.  aarch64_main_entry never returns. */
     mov     x0, x19
     bl      aarch64_main_entry
 

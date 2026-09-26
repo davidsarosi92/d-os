@@ -99,8 +99,9 @@ void hal_intr_restore(uint32_t cookie) {
  * MMU + caches on.  The ARM analogue of x86 gdt/idt/tss init.  After this,
  * IRQs may safely be unmasked and hal_intr_save is well-defined. */
 void hal_arch_early_init(void) {
+    /* The MMU is already on — boot.S did it before calling C at the image's
+     * virtual address (§M85, mmu.c). */
     exceptions_init();
-    mmu_init();
 }
 
 /* ---- identity-map extension (M19.5.1 hook) --------------------------------- */
@@ -123,7 +124,10 @@ uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
         uint64_t b, sz;
         if (dtb_mem_range(i, &b, &sz) == 0) mmu_direct_map_range(b, sz);
     }
-    uint64_t cap = 512ULL << 30;
+    /* The direct map starts at aarch64_phys_offset, not at 0 (§M85 stage 4):
+     * its reach ends 511 GiB above THAT (slot 511 is the kernel image). */
+    extern uint64_t aarch64_phys_offset;
+    uint64_t cap = aarch64_phys_offset + (511ULL << 30);
     return (uintptr_t)(end_phys < cap ? end_phys : cap);
 }
 

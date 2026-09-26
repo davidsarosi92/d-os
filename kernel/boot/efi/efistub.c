@@ -5,9 +5,9 @@
  * What it does, in the order that matters:
  *   1. find the ACPI RSDP and/or a device tree among the firmware's
  *      configuration tables;
- *   2. claim the kernel's physical load range (the kernel is linked to run at
- *      one address — DOS_KERNEL_LOAD — with the MMU off) and copy the embedded
- *      image there; the .bss beyond the file is zeroed by the kernel itself;
+ *   2. place the kernel anywhere 2 MiB-aligned (+ its TEXT_OFFSET) and copy
+ *      the embedded image there; the .bss beyond the file is zeroed by the
+ *      kernel itself, which maps and relocates itself (mmu.c, §M85 stage 4);
  *   3. get the memory map and EXIT BOOT SERVICES — after which no firmware
  *      call but the runtime ones may be made, so everything that needs one
  *      happens before, and the map is converted afterwards by pure arithmetic;
@@ -159,27 +159,29 @@ efi_status efi_main(void* image, struct efi_system_table* st) {
     puts8("  acpi rsdp "); puthex(rsdp); puts8("  dtb "); puthex(dtb); puts8("\n");
 
     /* --- 2. the kernel's load range --------------------------------------- */
+    /* ANYWHERE, 2 MiB-aligned + TEXT_OFFSET (§M85 stage 4): the kernel maps
+     * its image with 2 MiB blocks and runs at a fixed virtual address, so the
+     * physical placement only has to keep that alignment.  It used to be a
+     * fixed address, which does not exist as RAM on most machines. */
     uint64_t img = (uint64_t)(kernel_payload_end - kernel_payload);
     uint64_t span = DOS_KERNEL_SPAN > img ? DOS_KERNEL_SPAN : img;
-    uint64_t pages = (span + 0xFFF) >> 12;
-    uint64_t load = DOS_KERNEL_LOAD;
-    efi_status s = st->boot->allocate_pages(AllocateAddress, EfiLoaderData, pages, &load);
+    uint64_t pages = (span + DOS_KERNEL_TEXT_OFFSET + 0x200000 + 0xFFF) >> 12;
+    uint64_t region = 0;
+    efi_status s = st->boot->allocate_pages(AllocateAnyPages, EfiLoaderData, pages, &region);
     if (s != EFI_SUCCESS) {
-        /* The kernel is not relocatable yet: it runs where it was linked.  On a
-         * machine whose firmware owns that range, or which has no RAM there,
-         * this is where the boot stops — and it says so. */
-        puts8("d-os EFI stub: cannot claim the kernel load range at ");
-        puthex(DOS_KERNEL_LOAD); puts8(" (status "); puthex(s); puts8(")\n");
+        puts8("d-os EFI stub: no room for the kernel ("); puthex(pages); puts8(" pages, status ");
+        puthex(s); puts8(")\n");
         return s;
     }
+    uint64_t load = ((region + 0x1FFFFF) & ~0x1FFFFFull) + DOS_KERNEL_TEXT_OFFSET;
     mcpy((void*)(uintptr_t)load, kernel_payload, img);
     puts8("  kernel "); puthex(img); puts8(" bytes at "); puthex(load); puts8("\n");
 
     /* --- 3. boot info + memory map, then leave boot services -------------- */
     struct dos_bootinfo* bi = 0;
-    uint64_t bi_addr = 0xFFFFFFFFull;          /* below 4 GiB: the kernel reads it
-                                                * through its low identity map */
-    if (st->boot->allocate_pages(AllocateMaxAddress, EfiLoaderData,
+    uint64_t bi_addr = 0;                      /* anywhere: the kernel copies it
+                                                * with its MMU off (mmu.c) */
+    if (st->boot->allocate_pages(AllocateAnyPages, EfiLoaderData,
                                  (sizeof *bi + 0xFFF) >> 12, &bi_addr) != EFI_SUCCESS) {
         puts8("d-os EFI stub: no page for the boot info\n");
         return 1;

@@ -169,6 +169,40 @@ uintptr_t hal_extend_identity_map(uintptr_t end_phys);
 #  define KERNEL_DIRECT_MAP_BASE  0UL
 #endif
 
+#if defined(__aarch64__)
+/* §M85 stage 4 (2026-09-26) — aarch64's kernel no longer runs where it was
+ * loaded.  Two offsets, both fixed during early boot (mmu.c) and never again:
+ *
+ *   aarch64_phys_offset     the PHYSICAL address the direct map's first byte
+ *                           maps: the 1 GiB-aligned bottom of the RAM the
+ *                           kernel was loaded into.  On `virt` 0x4000_0000; on
+ *                           sbsa-ref 0x100_0000_0000 — 1 TiB, which is why the
+ *                           direct map cannot simply be phys + base: TTBR1 with
+ *                           T1SZ = 25 spans 512 GiB, and that machine's RAM
+ *                           does not START until 1 TiB.
+ *   aarch64_kimage_voffset  kernel IMAGE virtual minus physical.  The image is
+ *                           linked at KIMAGE_VBASE (the top 1 GiB of TTBR1) and
+ *                           loaded wherever the loader could put it.
+ *
+ * So there are three kinds of kernel address, and kptr_phys tells them apart:
+ * image (≥ KIMAGE_VBASE), direct map (≥ KERNEL_DIRECT_MAP_BASE), and the low
+ * identity window (device registers only, since this change). */
+#define KIMAGE_VBASE 0xFFFFFFFFC0000000UL
+extern uint64_t aarch64_phys_offset;
+extern uint64_t aarch64_kimage_voffset;
+static inline void* phys_to_virt(uint64_t phys) {
+    return (void*)(uintptr_t)(phys - aarch64_phys_offset + KERNEL_DIRECT_MAP_BASE);
+}
+static inline uint64_t virt_to_phys(const void* v) {
+    return (uint64_t)(uintptr_t)v - KERNEL_DIRECT_MAP_BASE + aarch64_phys_offset;
+}
+static inline uint64_t kptr_phys(const void* v) {
+    uintptr_t a = (uintptr_t)v;
+    if (a >= KIMAGE_VBASE)                    return (uint64_t)(a - aarch64_kimage_voffset);
+    if (a >= KERNEL_DIRECT_MAP_BASE)          return virt_to_phys(v);
+    return (uint64_t)a;
+}
+#else
 /* Kernel-virtual pointer for a physical address.  Valid once the direct map is
  * installed (hal_extend_identity_map, called from pmm_init). */
 static inline void* phys_to_virt(uint64_t phys) {
@@ -199,6 +233,7 @@ static inline uint64_t kptr_phys(const void* v) {
 #endif
     return (uint64_t)a;
 }
+#endif /* !__aarch64__ */
 
 /* ---------------------------------------------------------------------------
  * Syscall epilogue helper.
@@ -381,5 +416,12 @@ uint32_t hal_io_bitmap_bytes(void);
  * bitmap's address is reused by the very next allocation — so a driver restart
  * without this leaves the CPU holding the dead driver's permissions. */
 void     hal_io_bitmap_forget(const void* bm);
+
+/* §M85 — where a PLATFORM device (one no bus enumerates) lives on THIS
+ * machine: 0 and the window, or -1 if the machine has none.  aarch64 answers
+ * from its board description; everywhere else the weak default says -1.
+ * Drivers ask this instead of carrying one board's constant — the PL031 read
+ * `virt`'s 0x0901_0000 on sbsa-ref, where nothing answers there. */
+int hal_platform_window(const char* name, uint64_t* base, uint64_t* len);
 
 #endif

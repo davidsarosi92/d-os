@@ -14143,8 +14143,75 @@ HVC resp. SMC, no RTC — virt's ACPI names none, and the report says so);
 fork, musl, ping, sound, `excstorm`, `killstorm` green; the display path boots
 too.  The raw `-kernel` path is unchanged on GICv2, GICv3 and EL2.
 
+### 4.101 The aarch64 kernel leaves its load address; sbsa-ref reaches a shell (§M85 stage 4, 2026-09-26)
+
+**`sbsa-ref` — QEMU's reference STANDARD ARM server — boots d-os to a shell**:
+TF-A → EDK2 → the EFI stub → the kernel, which runs above 1 TiB of physical
+address space, reads its machine from ACPI (GICv3 at 0x4006_0000, PL011 at
+0x6000_0000, ECAM at 0xf000_0000, PSCI over SMC), brings up both CPUs, loads a
+module and runs ring-3 programs.  The same image boots `virt` from a device
+tree, raw or through UEFI.  Firmware is built from source
+(`scripts/build-sbsa-firmware.sh`, pinned TF-A/EDK2); the harness boots it with
+`--sbsa`.
+
+**What had to change, and why each piece:**
+- **The image runs at a fixed VIRTUAL address and loads anywhere.**  It was
+  linked at, and identity-mapped at, 0x4008_0000 — RAM on `virt`, the GIC on
+  sbsa-ref, whose RAM starts at 1 TiB (which a 39-bit identity map cannot even
+  reach).  Now VMA = the top 1 GiB of TTBR1 (`KIMAGE_VBASE`), LMA = 0x4008_0000
+  for a raw boot, anywhere 2 MiB-aligned for the stub.  Until the MMU is on,
+  `boot.S` and `mmu.c`'s early half run at the PHYSICAL address with every
+  reference PC-relative (an absolute `ldr =sym` is the link-time VA, which with
+  the MMU off is a physical address somewhere else), strict-aligned (MMU-off
+  accesses are Device memory), and silent (the console is unknown on a
+  firmware boot).  The switch uses a temporary 4-level identity map (T0SZ = 16)
+  so any load address works, then drops it.
+- **The direct map is OFFSET by the RAM's base** (`aarch64_phys_offset`), so
+  1 TiB-based RAM fits a 512 GiB half; `kptr_phys` knows three kinds of kernel
+  address (image, direct map, low device identity).  The base is the LOWEST
+  RAM, not the image's GiB — the first sbsa-ref run put the PMM's metadata in
+  the GiB below the image and faulted at DM_BASE − 1 GiB.
+- **Low memory is DEVICE-only now** in the TTBR0 template; RAM is never reached
+  through the identity map.
+- **The PMM's metadata starts at the lowest RAM** (`pmm_pfn_base`): tables
+  cover `[base, end)` through offset pointers, so `page_state[pfn]` is
+  unchanged at every use (also kmalloc's side table and the COW counts on all
+  three arches).  Without it sbsa-ref needed 256 MiB of state for the empty
+  terabyte below its RAM, and the frame cap cut the RAM off entirely.
+- **Secondary CPUs take the same path** (PC-relative entry, MMU on through the
+  identity map, jump high); the BSP cleans the stack slot and image offset to
+  the point of coherency first, because the secondary reads them uncached.
+- **Modules get memory within reach** (`modmem.c`): the small code model's
+  calls reach ±128 MiB and the heap is ~509 GiB from the image, so an 8 MiB
+  arena inside the image replaces kmalloc for module text on aarch64
+  (`module_mem_alloc`, weak default = heap elsewhere).  Every module was
+  refused "out of range" on `virt` too until this.
+- **Platform devices are asked for** (`hal_platform_window`): the PL031 driver
+  read `virt`'s 0x0901_0000 on sbsa-ref and took an external abort (contained
+  by §M33); it is `absent` now on a machine that describes none.
+- **The TCR's physical address size comes from the CPU** (PARange) — it was a
+  constant 40 bits, exactly one short of sbsa-ref's RAM.
+
+**Harness/build traps paid for:** `dash`'s `$(( ))` clamps a 64-bit address
+above INT64_MAX, so the stub's TEXT_OFFSET came out 0x1FFFFF and its span 0;
+and an apostrophe in a comment inside a `bash -c '...'` block ran half the
+firmware build on the HOST.
+
+**Verified:** sbsa-ref (2 CPUs, 2 GiB): `board` all `[acpi]`, 2023 MiB free,
+fork/musl/`excstorm`/audit green, `loopback.ko` loaded and pinging.  `virt`
+raw (disk, modules, fork, musl, excstorm, diskstorm, audit), `virt` + UEFI at
+EL1 and EL2, `virt` 8 GiB; i386 8 GiB (PAE) and 3 GiB (`highmemtest` both
+modes, memcheck), x86_64 2 GiB — all green.
+
+**Open (stage 4b):** sbsa-ref's DEVICES — AHCI and xHCI on its system bus (the
+DSDT names them; this reader does not use them yet), an e1000e NIC (no driver
+exists), the bochs display on PCIe, and the PCIe host window (the DSDT's
+PCI0 `_CRS` is not the static shape the narrow reader handles).  Also: the
+machine has NO memory below 4 GiB, so every "DMA32" allocation fails there.
+
 ## 8. Change log
 
+- **2026-09-26 — §M85 stage 4: the aarch64 kernel runs at a fixed VA and loads anywhere; offset direct map and PMM base; modules within reach; sbsa-ref boots to a shell (DOCS §4.101).**
 - **2026-09-26 — §M85 stage 3: aarch64 boots through UEFI (hand-made PE stub) and reads ACPI (MADT/GTDT/SPCR/MCFG/FADT + a narrow DSDT reader); one PSCI conduit; secondaries leave EL2 too (DOCS §4.100).**
 - **2026-09-26 — §M85 stages 1-2: the aarch64 board is read from the device tree (`board` names each source); GICv3 with enabled SGIs (DOCS §4.99).**
 - **2026-09-26 — §M86 COMPLETE, stage 4: every RAM range and reservation in the device tree reaches the PMM; reserved map entries are carved out of overlapping RAM on every arch; the direct map skips holes (DOCS §4.98).**

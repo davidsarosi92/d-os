@@ -325,7 +325,7 @@ static uint16_t* cow_slot(uintptr_t phys) {
     static spinlock_t cow_build_lock = SPINLOCK_INIT;
     if (!cow_table_get(&g_cow_ref, &g_cow_nr, &cow_build_lock)) return NULL;
     uintptr_t fn = phys >> 12;
-    return (fn < g_cow_nr) ? &g_cow_ref[fn] : NULL;
+    return (fn >= pmm_pfn_base && fn < g_cow_nr) ? &g_cow_ref[fn] : NULL;
 }
 
 /* Drop a reference to a COW frame; free it when the last holder lets go.
@@ -600,7 +600,7 @@ void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
 uint32_t vmm_frame_share_count(uintptr_t phys) {
     if (!g_cow_ref) return 0;
     uintptr_t fn = phys >> 12;
-    return (fn < g_cow_nr) ? (uint32_t)g_cow_ref[fn] : 0;
+    return (fn >= pmm_pfn_base && fn < g_cow_nr) ? (uint32_t)g_cow_ref[fn] : 0;
 }
 
 uintptr_t vmm_space_pd_phys(struct vmm_space* s) {

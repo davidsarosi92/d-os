@@ -64,7 +64,7 @@ cp trusted-firmware-a/build/qemu_sbsa/release/fip.bin edk2-non-osi/Platform/Qemu
 
 echo "== EDK2 ($EDK2_TAG)"
 export WORKSPACE=/w PACKAGES_PATH=/w/edk2:/w/edk2-platforms:/w/edk2-non-osi
-# The C tools only: BaseTools' own Python test suite fails on a bind-mounted
+# The C tools only: the BaseTools Python test suite fails on a bind-mounted
 # host directory (it rmtree()s through a symlink) and tests nothing we use.
 make -s -C edk2/BaseTools/Source/C >/dev/null
 set +u; . edk2/edksetup.sh >/dev/null; set -u

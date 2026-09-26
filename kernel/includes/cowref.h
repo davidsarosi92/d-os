@@ -44,11 +44,15 @@ static inline uint16_t* cow_table_get(uint16_t** tbl, uint32_t* nr, spinlock_t* 
     uint32_t fl = spin_lock_irqsave(lk);
     t = *tbl;
     if (!t) {
-        uint32_t n = pmm_nr_frames;
+        /* Covers [pmm_pfn_base, pmm_nr_frames) and is indexed by ABSOLUTE pfn
+         * through an offset pointer (§M85 — see pmm.c).  *nr is the absolute
+         * END; callers must also refuse fn < pmm_pfn_base. */
+        uint32_t n = pmm_nr_frames - pmm_pfn_base;
         uint16_t* a = (uint16_t*)pmm_bootmem_alloc(n * (uint32_t)sizeof(uint16_t));
         if (a) {
             for (uint32_t i = 0; i < n; i++) a[i] = 0;
-            *nr = n;
+            *nr = pmm_nr_frames;
+            a -= pmm_pfn_base;
             __atomic_store_n(tbl, a, __ATOMIC_RELEASE);
             t = a;
         }

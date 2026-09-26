@@ -59,6 +59,7 @@ void task_msleep(unsigned ms);
 
 #ifndef DRV_USERSPACE
 #include "driver.h"
+#include "hal_api.h"
 #include "printf.h"
 #include "config.h"
 #endif
@@ -100,7 +101,12 @@ static int pl031_bringup(void) {
      * it — which is exactly the disagreement the manifest exists to catch. */
     uint64_t win = PL031_PHYS, wlen = PL031_LEN;
     if (drv_device_window(&rt, 0, &win, &wlen) != 0 || !win) {
+#ifndef DRV_USERSPACE
+        /* In the kernel: the BOARD's answer (§M85), not `virt`'s constant. */
+        if (hal_platform_window("pl031", &win, &wlen) != 0) return -1;
+#else
         win = PL031_PHYS; wlen = PL031_LEN;
+#endif
     }
     h_mmio = drv_mmio_request(&rt, win, wlen < PL031_LEN ? PL031_LEN : wlen,
                               "PL031 registers");
@@ -170,6 +176,11 @@ int main(void) {
  * ------------------------------------------------------------------------- */
 static int pl031_probe(void* ctx) {
     (void)ctx;
+    /* §M85 — only if THIS machine describes one.  "This board always has
+     * one" was true of `virt` only; on sbsa-ref the driver read 0x0901_0fe0,
+     * found no device and took an external abort (contained by §M33). */
+    uint64_t b, l;
+    if (hal_platform_window("pl031", &b, &l) != 0) return -1;
     /* This board always has one, and a probe that reads the register before the
      * window is granted would be reading through the identity map — which is
      * exactly the assumption a placed driver may not make.  So the probe says

@@ -331,6 +331,34 @@ def aarch64_uefi_args(a, argv):
                   "-device", "virtio-blk-device,drive=esp"]
 
 
+def aarch64_sbsa_args(a, sersock, monsock):
+    """QEMU's `sbsa-ref`: the reference machine for a STANDARD ARM server
+    (§M85).  Firmware only — TF-A + EDK2 from build/firmware/sbsa, built by
+    scripts/build-sbsa-firmware.sh — ACPI instead of a device tree, GICv3,
+    RAM at 1 TiB, and its devices on a system bus and PCIe rather than
+    virtio-mmio.  The EFI stub arrives on an ESP attached to the machine's own
+    AHCI controller.  A different machine, not a variant of `virt`, so the
+    command line is built from scratch."""
+    import shutil
+    fw = "build/firmware/sbsa"
+    for f in ("SBSA_FLASH0.fd", "SBSA_FLASH1.fd"):
+        if not os.path.exists(os.path.join(fw, f)):
+            sys.exit("!! %s/%s missing - run scripts/build-sbsa-firmware.sh" % (fw, f))
+    work = "build/aarch64/sbsa-%d" % os.getpid()
+    os.makedirs(work + "/esp/EFI/BOOT", exist_ok=True)
+    shutil.copy("build/aarch64/BOOTAA64.EFI", work + "/esp/EFI/BOOT/BOOTAA64.EFI")
+    # Flash 0 is read-only firmware, flash 1 its variable store — copied, so a
+    # run never changes the next one's starting state.
+    shutil.copy(os.path.join(fw, "SBSA_FLASH1.fd"), work + "/flash1.fd")
+    return ["qemu-system-aarch64", "-M", "sbsa-ref", "-smp", str(a.smp), "-m", a.mem,
+            "-display", "none", "-no-reboot",
+            "-serial", "unix:%s,server,nowait" % sersock,
+            "-monitor", "unix:%s,server,nowait" % monsock,
+            "-drive", "if=pflash,format=raw,readonly=on,file=" + os.path.join(fw, "SBSA_FLASH0.fd"),
+            "-drive", "if=pflash,format=raw,file=" + work + "/flash1.fd",
+            "-drive", "file=fat:rw:%s/esp,format=raw,if=ide" % work] + list(a.extra)
+
+
 def aarch64_dtb_args(a):
     """The device tree for THIS run's machine, loaded where the kernel looks.
 
@@ -509,6 +537,9 @@ def main():
                          "Use `wav` with -- -audiodev ... to CAPTURE what was "
                          "played, which is how §M23 measured every one of its "
                          "numbers")
+    ap.add_argument("--sbsa", action="store_true",
+                    help="aarch64 only: boot QEMU's sbsa-ref (a standard ARM server: "
+                         "TF-A + EDK2, ACPI, GICv3, RAM at 1 TiB) - §M85")
     ap.add_argument("--uefi", action="store_true",
                     help="aarch64 only: boot through UEFI firmware (EDK2) and the "
                          "EFI stub instead of -kernel, so the machine is described "
@@ -590,7 +621,9 @@ def main():
             pass
 
     argv = qemu_argv(a, sersock, monsock)
-    if a.arch == "aarch64" and a.uefi:
+    if a.arch == "aarch64" and a.sbsa:
+        argv = aarch64_sbsa_args(a, sersock, monsock)
+    elif a.arch == "aarch64" and a.uefi:
         argv = aarch64_uefi_args(a, argv)
     elif a.arch == "aarch64":
         argv += aarch64_dtb_args(a)

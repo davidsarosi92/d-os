@@ -95,7 +95,10 @@ void aarch64_boot_meminfo_init(void) {
 
     aarch64_mbi.flags       = MBI_FLAG_MMAP;
     aarch64_mbi.mmap_length = (uint32_t)(n * sizeof(aarch64_mmap[0]));
-    aarch64_mbi.mmap_addr   = (uint32_t)(uintptr_t)aarch64_mmap;
+    /* The 32-bit field cannot hold this array's address any more (the image
+     * lives at a high virtual address since §M85); pmm.c reaches the array
+     * through mboot_mmap_ptr() below instead. */
+    aarch64_mbi.mmap_addr   = 0;
 
     mboot_init(MB1_MAGIC, (uintptr_t)&aarch64_mbi);
 }
@@ -120,4 +123,11 @@ static struct console_sink pl011_sink = {
 /* Register the PL011 as a console sink so kprintf() reaches the serial log. */
 void aarch64_serial_console_init(void) {
     console_sink_register(&pl011_sink);
+}
+
+/* §M85 stage 4 — pmm.c's way to the memory map (the weak default reads the
+ * 32-bit multiboot field, which is a physical address on x86). */
+uintptr_t mboot_mmap_ptr(const struct mboot_info* mbi) {
+    (void)mbi;
+    return (uintptr_t)aarch64_mmap;
 }

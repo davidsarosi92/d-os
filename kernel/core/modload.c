@@ -62,6 +62,18 @@
 #include "driver.h"
 #include "hwdev.h"
 #include "kmalloc.h"
+
+/* §M85 — WHERE A MODULE'S CODE MAY LIVE.  A relocation can only reach so far:
+ * aarch64's kernel is the small code model (a call reaches +-128 MiB), and once
+ * its image moved to the top of TTBR1 the heap was ~509 GiB away — every
+ * module was refused with "out of range".  An arch whose heap is not within
+ * reach of its image provides these (aarch64: an arena inside the image); the
+ * weak defaults are the heap, which is right where the image is identity- or
+ * low-mapped (x86, and x86_64's modules are -mcmodel=large). */
+void* module_mem_alloc(size_t n) __attribute__((weak));
+void  module_mem_free(void* p) __attribute__((weak));
+void* module_mem_alloc(size_t n) { return kmalloc(n); }
+void  module_mem_free(void* p)   { kfree(p); }
 #include "printf.h"
 #include "klog.h"
 #include "vfs.h"
@@ -608,7 +620,7 @@ int modload_load(const char* path) {
     /* Over-align the image to the STRICTEST section alignment, not a constant.
      * kmalloc makes no promise past its own granularity, so the slack has to
      * cover the worst request the module actually made. */
-    image = kmalloc(total + maxalign);
+    image = module_mem_alloc(total + maxalign);
     if (!image) { kprintf("insmod: out of memory (%d bytes)\n", (int)total); goto out; }
     uintptr_t base = ((uintptr_t)image + maxalign - 1) & ~(uintptr_t)(maxalign - 1);
 
@@ -852,7 +864,7 @@ int modload_load(const char* path) {
     rc = 0;
 
 out:
-    if (image) kfree(image);
+    if (image) module_mem_free(image);
     if (place) kfree(place);
     kfree(img);
     return rc;
@@ -902,7 +914,7 @@ int modload_unload(const char* name) {
      * nobody withdraws — in a table that did not exist when that was fixed. */
     if (m->matches) hw_matches_remove(m->matches);
 
-    kfree(m->image);
+    module_mem_free(m->image);
     kprintf("rmmod: unloaded '%s'\n", m->name);
     klog(KLOG_INFO, "mod", "unloaded %s", m->name);
     m_memset(m, 0, sizeof *m);

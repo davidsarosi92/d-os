@@ -918,3 +918,10 @@ void drv_res_leaktest(int on) {
         kprintf("leaktest: released\n");
     }
 }
+
+/* §M85 — hal_api.h: no platform-device table on this arch. */
+int hal_platform_window(const char* name, uint64_t* base, uint64_t* len) __attribute__((weak));
+int hal_platform_window(const char* name, uint64_t* base, uint64_t* len) {
+    (void)name; (void)base; (void)len;
+    return -1;
+}

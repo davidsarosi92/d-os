@@ -27,20 +27,34 @@
 
 OUTPUT_FORMAT("elf64-littleaarch64")
 OUTPUT_ARCH(aarch64)
-ENTRY(_start)
+/* §M85 stage 4 (2026-09-26) — the kernel runs at a fixed VIRTUAL address and
+ * may be LOADED anywhere 2 MiB-aligned (+ TEXT_OFFSET).  It used to be linked
+ * at its load address, 0x4008_0000, which exists as RAM on `virt` only: on
+ * sbsa-ref that address is the GIC, and its RAM starts at 1 TiB.
+ *
+ *   VMA  KIMAGE_VBASE + TEXT_OFFSET — the top 1 GiB of TTBR1 (hal_api.h);
+ *   LMA  LOAD_PA — where a raw `-kernel` boot on `virt` places the image.  A
+ *        firmware boot (the EFI stub) places it wherever it can.
+ *
+ * Until the MMU is on the code runs at its PHYSICAL address, so boot.S and
+ * mmu_early.c are PC-relative throughout; see boot.S. */
+KIMAGE_VBASE = 0xFFFFFFFFC0000000;
+TEXT_OFFSET  = 0x80000;
+LOAD_PA      = 0x40080000;
 
-/* QEMU `virt` RAM base is 0x40000000; leave the low 512 KiB free. */
-LOAD_ADDR = 0x40080000;
+/* The ELF entry is the PHYSICAL address of _start: QEMU starts a `-kernel` ELF
+ * at e_entry with the MMU off. */
+ENTRY(_start_pa)
 
 SECTIONS
 {
-    . = LOAD_ADDR;
+    . = KIMAGE_VBASE + TEXT_OFFSET;
     PROVIDE(kernel_start = .);
 
     /* .text.boot is force-placed first so the ELF entry (_start) is the very
      * first byte of the image — makes the entry address trivially the load
      * address, which some minimal loaders assume. */
-    .text : ALIGN(4K)
+    .text : AT(LOAD_PA)
     {
         __text_start = .;       /* stack scans in lock.c / fault reports */
         KEEP(*(.text.boot))
@@ -268,4 +282,5 @@ SECTIONS
     }
 
     PROVIDE(kernel_end = .);
+    _start_pa = _start - (KIMAGE_VBASE + TEXT_OFFSET) + LOAD_PA;
 }

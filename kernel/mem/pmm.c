@@ -80,6 +80,13 @@
  * then, so a pre-init caller reads nothing. */
 static uint8_t* page_state;
 uint32_t pmm_nr_frames;                     /* one past the highest managed pfn */
+/* §M85 stage 4 — the LOWEST managed pfn.  Metadata covers [pmm_pfn_base,
+ * pmm_nr_frames) only: a machine whose RAM starts at 1 TiB (sbsa-ref) would
+ * otherwise need 256 MiB of state for the terabyte BELOW its RAM, where there
+ * is nothing.  PFNs stay absolute everywhere; the tables are allocated for the
+ * span and their POINTERS are offset by the base, so `page_state[pfn]` is
+ * unchanged at every use.  0 on every machine whose RAM starts low. */
+uint32_t pmm_pfn_base;
 
 /* Boot-time bump arena backing page_state[] and kmalloc's side table. */
 static uintptr_t bootmem_next, bootmem_end;
@@ -103,6 +110,18 @@ static struct zone zones[NR_ZONES];
 extern uint8_t kernel_start[];
 extern uint8_t kernel_end[];
 
+/* §M85 stage 4 — the kernel image's PHYSICAL extent.  `kernel_start` is a link
+ * address: equal to the physical one on x86 (identity-mapped image), and a
+ * virtual address in the top of TTBR1 on aarch64, where the image runs at a
+ * fixed VA wherever it was loaded.  Every carve-out and conflict check here is
+ * about physical memory, so it asks kptr_phys. */
+#define KIMG_PS  ((uint64_t)kptr_phys(kernel_start))
+#define KIMG_PE  ((uint64_t)kptr_phys(kernel_end))
+
+/* The boot memory map as a POINTER (multiboot.h, mboot_mmap_ptr). */
+#define MMAP_P(mbi)   mboot_mmap_ptr(mbi)
+#define MMAP_PS(mbi)  ((uint64_t)kptr_phys((const void*)MMAP_P(mbi)))
+
 /* -------------------------------------------------------------------------- */
 /* Tiny helpers.                                                              */
 /* -------------------------------------------------------------------------- */
@@ -116,7 +135,7 @@ static uint32_t pmm_direct_end_pfn;
 
 /* Which zone owns this pfn?  Returns zone index, or -1 if out of range. */
 static int zone_of_pfn(uint32_t pfn) {
-    if (pfn >= pmm_nr_frames) return -1;
+    if (pfn >= pmm_nr_frames || pfn < pmm_pfn_base) return -1;
     if (pfn >= pmm_direct_end_pfn)     return ZONE_HIGHMEM;
     if (pfn <  ZONE_DMA_FRAME_LIMIT)   return ZONE_DMA;
     if (pfn <  ZONE_DMA32_FRAME_LIMIT) return ZONE_DMA32;
@@ -189,8 +208,8 @@ static inline void link_store_at(pmm_phys_t phys, int slot, pmm_phys_t next) {
      * truncated a PAE frame above 4 GiB on i386, so 0x203bad000 "landed in"
      * the image at 0x3bad000 — a false alarm on every such free, and noise
      * of exactly the kind that hides the real one this guard exists for. */
-    pmm_phys_t ks = (pmm_phys_t)(uintptr_t)kernel_start,
-               ke = (pmm_phys_t)(uintptr_t)kernel_end;
+    pmm_phys_t ks = (pmm_phys_t)KIMG_PS,
+               ke = (pmm_phys_t)KIMG_PE;
     if (phys >= ks && phys < ke) {
         kprintf("PMM-GUARD: link_store 0x%llx INTO kernel image [0x%x,0x%x) "
                 "pfn=%u caller=%p\n", (unsigned long long)phys, (uint32_t)ks,
@@ -268,6 +287,7 @@ static void carve_out_range(pmm_phys_t start, pmm_phys_t end) {
     uint32_t s = (uint32_t)(start / PMM_FRAME_SIZE);
     uint32_t e = (uint32_t)((end + PMM_FRAME_SIZE - 1) / PMM_FRAME_SIZE);
     if (e > pmm_nr_frames) e = pmm_nr_frames;
+    if (s < pmm_pfn_base) s = pmm_pfn_base;
     for (uint32_t i = s; i < e; i++) page_state[i] = PS_NONE;
 }
 
@@ -275,7 +295,7 @@ static void carve_out_range(pmm_phys_t start, pmm_phys_t end) {
  * tag it PS_USED (= "allocated") so seeding can later free it via
  * the normal coalescing path.  This keeps the seed loop simple. */
 static void seed_mark_available(uint32_t pfn) {
-    if (pfn >= pmm_nr_frames) return;
+    if (pfn >= pmm_nr_frames || pfn < pmm_pfn_base) return;
     /* Only flip if not already carved out. */
     if (page_state[pfn] == PS_NONE) page_state[pfn] = PS_USED;
 }
@@ -290,9 +310,9 @@ static int boot_range_conflicts(const struct mboot_info* mbi,
                                 uint64_t s, uint64_t e) {
     struct { uint64_t s, e; } bad[] = {
         { 0, 0x100000 },                                        /* BIOS / VGA / EBDA */
-        { (uintptr_t)kernel_start, (uintptr_t)kernel_end },      /* kernel image */
-        { (uintptr_t)mbi, (uintptr_t)mbi + sizeof(*mbi) },       /* multiboot info */
-        { mbi->mmap_addr, mbi->mmap_addr + mbi->mmap_length },   /* the map itself */
+        { KIMG_PS, KIMG_PE },                                     /* kernel image */
+        { kptr_phys(mbi), kptr_phys(mbi) + sizeof(*mbi) },        /* multiboot info */
+        { MMAP_PS(mbi), MMAP_PS(mbi) + mbi->mmap_length },        /* the map itself */
         { 0x8000, 0x8000 + 0x4000 },                             /* AP trampoline */
     };
     for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
@@ -306,7 +326,7 @@ static int boot_range_conflicts(const struct mboot_info* mbi,
  * Returns the base address, or 0 if nothing fits. */
 static uintptr_t bootmem_reserve(const struct mboot_info* mbi,
                                  uint64_t covered, uint32_t size) {
-    uintptr_t p = mbi->mmap_addr, end = mbi->mmap_addr + mbi->mmap_length;
+    uintptr_t p = MMAP_P(mbi), end = MMAP_P(mbi) + mbi->mmap_length;
     int budget = 64;
     while (p < end && budget-- > 0) {
         const struct mboot_mmap_entry* e = (const struct mboot_mmap_entry*)p;
@@ -325,9 +345,9 @@ static uintptr_t bootmem_reserve(const struct mboot_info* mbi,
              * we are currently colliding with; re-align and retry. */
             uint64_t nxt = rs + PMM_FRAME_SIZE;
             uint64_t cand[] = {
-                0x100000, (uintptr_t)kernel_end,
-                (uintptr_t)mbi + sizeof(*mbi),
-                mbi->mmap_addr + mbi->mmap_length, 0x8000 + 0x4000,
+                0x100000, KIMG_PE,
+                kptr_phys(mbi) + sizeof(*mbi),
+                MMAP_PS(mbi) + mbi->mmap_length, 0x8000 + 0x4000,
             };
             for (unsigned i = 0; i < sizeof(cand) / sizeof(cand[0]); i++)
                 if (cand[i] > rs && cand[i] > nxt) nxt = cand[i];
@@ -407,10 +427,10 @@ void pmm_init(void) {
      * We do this BEFORE the marking pass below so that all frames we
      * subsequently dereference (zero, free-list-link) are reachable
      * through the kernel virtual address space. */
-    uint64_t max_phys = 0;
+    uint64_t max_phys = 0, min_phys = ~0ull;
     {
-        uintptr_t wp = mbi->mmap_addr;
-        uintptr_t wend = mbi->mmap_addr + mbi->mmap_length;
+        uintptr_t wp = MMAP_P(mbi);
+        uintptr_t wend = MMAP_P(mbi) + mbi->mmap_length;
         int wb = 64;
         while (wp < wend && wb-- > 0) {
             const struct mboot_mmap_entry* e = (const struct mboot_mmap_entry*)wp;
@@ -418,12 +438,12 @@ void pmm_init(void) {
                 uint64_t hi = e->base + e->length;
                 /* Clamp to the sanity ceiling — a bogus map must not size
                  * gigabytes of metadata.  This is the ONLY fixed limit left. */
-                uint64_t cap = (uint64_t)BUDDY_FRAME_HARD_CAP * PMM_FRAME_SIZE;
                 /* §M86 — what the paging hardware can express: i386 without
-                 * PAE stops at 4 GiB whatever RAM exists. */
-                if (cap > hal_phys_limit()) cap = hal_phys_limit();
-                if (hi > cap) hi = cap;
+                 * PAE stops at 4 GiB whatever RAM exists.  (The metadata cap
+                 * is applied to the SPAN below, once the base is known.) */
+                if (hi > hal_phys_limit()) hi = hal_phys_limit();
                 if (hi > max_phys) max_phys = hi;
+                if (e->length && e->base < min_phys) min_phys = e->base;
             }
             wp += e->size + 4;
         }
@@ -442,9 +462,14 @@ void pmm_init(void) {
     }
 
     /* §M48 — the frame ceiling, discovered.  Everything reachable gets
-     * metadata; nothing beyond it does. */
+     * metadata; nothing beyond it does.  §M85 — and nothing BELOW the lowest
+     * RAM either: the base is 1 GiB-aligned, which keeps every buddy block
+     * (at most 2^BUDDY_MAX_ORDER frames) aligned in absolute pfns too. */
+    if (min_phys == ~0ull || min_phys < (1ull << 30)) min_phys = 0;
+    pmm_pfn_base  = (uint32_t)((min_phys & ~((1ull << 30) - 1)) / PMM_FRAME_SIZE);
     pmm_nr_frames = (uint32_t)(max_phys / PMM_FRAME_SIZE);
-    if (pmm_nr_frames > BUDDY_FRAME_HARD_CAP) pmm_nr_frames = BUDDY_FRAME_HARD_CAP;
+    if (pmm_nr_frames - pmm_pfn_base > BUDDY_FRAME_HARD_CAP)
+        pmm_nr_frames = pmm_pfn_base + BUDDY_FRAME_HARD_CAP;
     pmm_direct_end_pfn = (uint32_t)(covered / PMM_FRAME_SIZE);
     if (pmm_direct_end_pfn > pmm_nr_frames) pmm_direct_end_pfn = pmm_nr_frames;
 
@@ -453,7 +478,7 @@ void pmm_init(void) {
      *   big_alloc_order[]       1 byte  / frame  (kmalloc)
      *   g_cow_ref[]             2 bytes / frame  (vmm, fork refcounts)
      * plus a page of slack for whatever comes next. */
-    uint32_t arena = pmm_nr_frames * 4u + PMM_FRAME_SIZE;
+    uint32_t arena = (pmm_nr_frames - pmm_pfn_base) * 4u + PMM_FRAME_SIZE;
     uintptr_t arena_base = bootmem_reserve(mbi, covered, arena);
     if (!arena_base) {
         kprintf("pmm: cannot place %u KiB boot arena — PMM disabled\n", arena >> 10);
@@ -463,8 +488,9 @@ void pmm_init(void) {
     bootmem_next = arena_base;
     bootmem_end  = arena_base + arena;
 
-    page_state = (uint8_t*)pmm_bootmem_alloc(pmm_nr_frames);
+    page_state = (uint8_t*)pmm_bootmem_alloc(pmm_nr_frames - pmm_pfn_base);
     if (!page_state) { pmm_nr_frames = 0; return; }
+    page_state -= pmm_pfn_base;              /* index by ABSOLUTE pfn */
 
     kprintf("pmm: %u MiB directly mapped of %u MiB, %u frames, %u KiB metadata at %p\n",
             (unsigned)(covered >> 20), (unsigned)(max_phys >> 20), pmm_nr_frames,
@@ -501,7 +527,7 @@ void pmm_init(void) {
      * flips bits to PS_USED for frames inside AVAILABLE regions, then
      * the reservation pass carves out kernel image / low memory etc.
      * Finally the seeding loop frees the remainder. */
-    for (uint32_t i = 0; i < pmm_nr_frames; i++) page_state[i] = PS_NONE;
+    for (uint32_t i = pmm_pfn_base; i < pmm_nr_frames; i++) page_state[i] = PS_NONE;
 
     /* Pass 1: tag AVAILABLE frames as PS_USED.  Anything outside an
      * AVAILABLE region stays PS_NONE.  Cap at `covered` so we never
@@ -511,8 +537,8 @@ void pmm_init(void) {
      * of an unreachable frame goes through kmap (link_store). */
     uint32_t cover_frames = pmm_nr_frames;
 
-    uintptr_t p   = mbi->mmap_addr;
-    uintptr_t end = mbi->mmap_addr + mbi->mmap_length;
+    uintptr_t p   = MMAP_P(mbi);
+    uintptr_t end = MMAP_P(mbi) + mbi->mmap_length;
     int entry_budget = 64;
     while (p < end && entry_budget-- > 0) {
         const struct mboot_mmap_entry* e = (const struct mboot_mmap_entry*)p;
@@ -545,7 +571,7 @@ void pmm_init(void) {
      *      out of it.  Seeding those frames hands firmware's memory to the
      *      allocator. */
     {
-        uintptr_t q = mbi->mmap_addr;
+        uintptr_t q = MMAP_P(mbi);
         int budget = 64;
         while (q < end && budget-- > 0) {
             const struct mboot_mmap_entry* e = (const struct mboot_mmap_entry*)q;
@@ -556,20 +582,19 @@ void pmm_init(void) {
     }
 
     /* (a) Frame 0 — NULL safety. */
-    page_state[0] = PS_NONE;
+    if (pmm_pfn_base == 0) page_state[0] = PS_NONE;
 
     /* (b) Everything below 1 MiB (BIOS / VGA / EBDA / option ROMs). */
     carve_out_range(0, 0x100000);
 
     /* (c) Kernel image bounds from linker.ld. */
-    carve_out_range((pmm_phys_t)(uintptr_t)kernel_start,
-                    (pmm_phys_t)(uintptr_t)kernel_end);
+    carve_out_range((pmm_phys_t)KIMG_PS, (pmm_phys_t)KIMG_PE);
 
     /* (d) Multiboot info + the attached memory map (lives outside
      *     the kernel image, can land anywhere in low memory). */
-    carve_out_range((pmm_phys_t)(uintptr_t)mbi,
-                    (pmm_phys_t)(uintptr_t)mbi + sizeof(struct mboot_info));
-    carve_out_range(mbi->mmap_addr, mbi->mmap_addr + mbi->mmap_length);
+    carve_out_range((pmm_phys_t)kptr_phys(mbi),
+                    (pmm_phys_t)kptr_phys(mbi) + sizeof(struct mboot_info));
+    carve_out_range(MMAP_PS(mbi), MMAP_PS(mbi) + mbi->mmap_length);
 
     /* (e) AP trampoline destination + per-AP info (M18 puts these at
      *     fixed low addresses).  Reserving a generous 16 KiB window
@@ -604,7 +629,7 @@ void pmm_init(void) {
      * right after vmm_init, through kmap. */
     uint32_t seed_to = pmm_nr_frames;
     if (sizeof(void*) == 4 && seed_to > (1u << 20)) seed_to = 1u << 20;
-    uint32_t initially_free = seed_range(0, seed_to);
+    uint32_t initially_free = seed_range(pmm_pfn_base, seed_to);
     pmm_deferred_from = seed_to;
 
     kprintf("pmm: buddy ready — DMA m=%u f=%u, DMA32 m=%u f=%u, NORMAL m=%u f=%u, "
@@ -671,7 +696,7 @@ static void buddy_free_in_zone(struct zone* z, uint32_t pfn, int order) {
 
         /* Buddy must exist and be in the SAME zone — never coalesce
          * across DMA/NORMAL boundary. */
-        if (buddy_pfn >= pmm_nr_frames) break;
+        if (buddy_pfn >= pmm_nr_frames || buddy_pfn < pmm_pfn_base) break;
         if (buddy_pfn <  z->start_pfn || buddy_pfn >= z->end_pfn) break;
 
         /* Buddy must be free at the same order. */
@@ -914,7 +939,7 @@ void pmm_validate(const char* tag) {
                     return;
                 }
                 uint32_t pfn = phys_to_pfn(cur);
-                if (pfn >= pmm_nr_frames) {
+                if (pfn >= pmm_nr_frames || pfn < pmm_pfn_base) {
                     kprintf("PMMCHK[%s]: z%d o%d node pfn=%x OUT OF RANGE (phys=%llx)\n", tag, zi, o, pfn,
                             (unsigned long long)cur);
                     return;

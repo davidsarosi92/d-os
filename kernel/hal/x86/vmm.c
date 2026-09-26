@@ -392,7 +392,7 @@ static inline uint16_t* cow_slot(uint64_t phys) {
     static spinlock_t cow_build_lock = SPINLOCK_INIT;
     if (!cow_table_get(&g_cow_ref, &g_cow_nr, &cow_build_lock)) return NULL;
     uint32_t fn = (uint32_t)(phys >> 12);
-    return (fn < g_cow_nr) ? &g_cow_ref[fn] : NULL;
+    return (fn >= pmm_pfn_base && fn < g_cow_nr) ? &g_cow_ref[fn] : NULL;
 }
 
 void vmm_space_destroy(struct vmm_space* s) {
@@ -540,7 +540,7 @@ void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
 uint32_t vmm_frame_share_count(uint64_t phys) {
     if (!g_cow_ref) return 0;
     uint32_t fn = (uint32_t)(phys >> 12);
-    return (fn < g_cow_nr) ? (uint32_t)g_cow_ref[fn] : 0;
+    return (fn >= pmm_pfn_base && fn < g_cow_nr) ? (uint32_t)g_cow_ref[fn] : 0;
 }
 
 uintptr_t vmm_space_pd_phys(struct vmm_space* s) {

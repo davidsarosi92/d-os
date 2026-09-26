@@ -74,6 +74,8 @@ established; "open" rows were checked against today's tree, not copied forward.
 | GICv3 SGIs never enabled — cross-CPU reschedule dropped, wakeups waited a tick | `diskstorm` 22.5 s on v3 vs 0.74 s on v2 | DOCS §4.99 |
 | secondary CPUs started at EL2 by firmware ran the EL1-only entry | `!! SPINLOCK STUCK` in buddy_alloc_in_zone, 1 CPU online | DOCS §4.100 — shared `el2_drop.h` |
 | PSCI hard-coded to HVC in three places | (would UNDEF under EL3 firmware) | DOCS §4.100 — `psci_call` |
+| aarch64 modules unloadable after the image moved high (heap out of CALL26 range) | `insmod: ... out of range` | DOCS §4.101 — `modmem.c` arena |
+| PL031 driver assumed virt's address | external abort on sbsa-ref (contained) | DOCS §4.101 — `hal_platform_window` |
 
 Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI report with
 `if=`/`task=`/`isr-vec=`/stack scan, monitor replies kept in `<log>.mon`,

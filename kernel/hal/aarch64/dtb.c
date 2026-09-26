@@ -26,6 +26,11 @@
 #include "printf.h"
 #include "board.h"
 #include "efi_bootinfo.h"
+#include "hal_api.h"
+
+extern struct dos_bootinfo aarch64_bootinfo;   /* mmu.c copied it at PA */
+extern int aarch64_have_bootinfo;
+void mmu_direct_map_range(uint64_t base, uint64_t size);
 
 int acpi_arm_init(uint64_t rsdp_phys);
 int acpi_arm_ncpu(void);
@@ -103,22 +108,27 @@ static int str_prefix(const char* s, const char* pfx) {
  * an in-memory DTB of its own. */
 #define DTB_LOAD_ADDR 0x48000000
 
+/* A physical tree address as a pointer: through the direct map (§M85 — RAM is
+ * no longer identity-mapped), mapping its GiB first.  Addresses below the
+ * direct map's base cannot be reached and yield NULL. */
+static const struct fdt_header* fdt_at(uint64_t pa) {
+    extern uint64_t aarch64_phys_offset;
+    if (!pa || pa < aarch64_phys_offset) return NULL;
+    mmu_direct_map_range(pa, 0x100000);
+    const struct fdt_header* h = (const struct fdt_header*)phys_to_virt(pa);
+    return be32(h->magic) == FDT_MAGIC ? h : NULL;
+}
+
 static const struct fdt_header* fdt_find(uint64_t x0) {
+    const struct fdt_header* h;
     /* 1. Firmware-passed pointer (x0), if valid. */
-    if (x0) {
-        const struct fdt_header* h = (const struct fdt_header*)(uintptr_t)x0;
-        if (be32(h->magic) == FDT_MAGIC) return h;
-    }
+    if ((h = fdt_at(x0))) return h;
     /* 2. The run-script load address. */
-    {
-        const struct fdt_header* h = (const struct fdt_header*)DTB_LOAD_ADDR;
-        if (be32(h->magic) == FDT_MAGIC) return h;
-    }
-    /* 3. Fallback: scan the first 256 MiB of RAM (always present). */
-    for (uintptr_t a = 0x40000000; a < 0x50000000; a += 0x1000) {
-        const struct fdt_header* h = (const struct fdt_header*)a;
-        if (be32(h->magic) == FDT_MAGIC) return h;
-    }
+    if ((h = fdt_at(DTB_LOAD_ADDR))) return h;
+    /* 3. Fallback: scan the first 256 MiB of `virt` RAM — only reachable, and
+     *    only meaningful, when that is where the image was loaded. */
+    for (uint64_t a = 0x40000000; a < 0x50000000; a += 0x1000)
+        if ((h = fdt_at(a))) return h;
     return NULL;
 }
 
@@ -333,19 +343,18 @@ static void fdt_parse(const struct fdt_header* h) {
 
 /* Public: discover the machine from the DTB.  Called early (after the console
  * is up).  Safe to call even if no DTB is found — leaves the getters at 0. */
-/* §M85 stage 3 — booted through the EFI stub (efi_bootinfo.h)? */
-static struct dos_bootinfo g_bi;
-static int g_have_bi;
+/* §M85 stage 3 — booted through the EFI stub (efi_bootinfo.h)?  The boot
+ * info was copied into the image by mmu.c while it was still reachable at its
+ * physical address (stage 4). */
+#define g_bi       aarch64_bootinfo
+#define g_have_bi  aarch64_have_bootinfo
 
 void dtb_init(uint64_t x0) {
     const struct fdt_header* h;
-    if (x0 && *(const volatile uint64_t*)(uintptr_t)x0 == DOS_BOOTINFO_MAGIC) {
-        /* Copied before anything allocates: the page is the stub's, and the
-         * allocator is entitled to it once it exists. */
-        const struct dos_bootinfo* bi = (const struct dos_bootinfo*)(uintptr_t)x0;
-        uint8_t* d = (uint8_t*)&g_bi;
-        for (uint32_t i = 0; i < sizeof g_bi; i++) d[i] = ((const uint8_t*)bi)[i];
-        g_have_bi = 1;
+    if (g_have_bi) {
+        /* RAM first: the tree and the ACPI tables below live in it and are
+         * read through the direct map. */
+        for (uint32_t i = 0; i < g_bi.nmem; i++) mmu_direct_map_range(g_bi.mem[i].base, g_bi.mem[i].size);
         kprintf("efi: booted by '%s' (entered at EL%u): %u usable range(s) from %u "
                 "descriptors, ACPI %p, device tree %p\n", g_bi.fw_vendor, g_bi.entered_el,
                 g_bi.nmem, g_bi.efi_entries, (void*)(uintptr_t)g_bi.rsdp,
@@ -353,8 +362,7 @@ void dtb_init(uint64_t x0) {
         /* Only the tree the FIRMWARE named — never a scan of RAM for a magic
          * number, which on a board that is not `virt` reads whatever device
          * happens to live at 0x4000_0000 (sbsa-ref: the GIC). */
-        h = (g_bi.dtb && be32(((const struct fdt_header*)(uintptr_t)g_bi.dtb)->magic) == FDT_MAGIC)
-            ? (const struct fdt_header*)(uintptr_t)g_bi.dtb : NULL;
+        h = fdt_at(g_bi.dtb);
     } else {
         h = fdt_find(x0);
     }

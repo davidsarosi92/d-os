@@ -85,8 +85,9 @@ void kmalloc_init(void) {
      * explicitly even though fresh memory may read as zero — 0x00 is a
      * valid order (= one frame), so we'd misidentify every never-touched
      * frame as a 1-page big-alloc page.  Manual fill it is. */
+    /* Absolute-pfn indexed over [pmm_pfn_base, pmm_nr_frames) — §M85. */
     big_alloc_nr    = pmm_nr_frames;
-    big_alloc_order = (uint8_t*)pmm_bootmem_alloc(big_alloc_nr);
+    big_alloc_order = (uint8_t*)pmm_bootmem_alloc(pmm_nr_frames - pmm_pfn_base);
     if (!big_alloc_order) {
         /* Without the side table kfree cannot tell a big allocation from a
          * stray pointer, so every >2 KiB block would leak.  Say so loudly
@@ -96,7 +97,8 @@ void kmalloc_init(void) {
         big_alloc_nr = 0;
         return;
     }
-    for (uint32_t i = 0; i < big_alloc_nr; i++) big_alloc_order[i] = BIG_NONE;
+    for (uint32_t i = 0; i < pmm_nr_frames - pmm_pfn_base; i++) big_alloc_order[i] = BIG_NONE;
+    big_alloc_order -= pmm_pfn_base;          /* index by ABSOLUTE pfn */
 
     slab_init();
     initialized = 1;
@@ -124,7 +126,7 @@ void* kmalloc(size_t size) {
     /* The table spans every frame the PMM manages, so a frame it just handed
      * us is in range by construction — checked anyway, because leaking one
      * block beats corrupting whatever follows the table. */
-    if ((phys >> 12) >= big_alloc_nr) {
+    if ((phys >> 12) >= big_alloc_nr || (phys >> 12) < pmm_pfn_base) {
         kprintf("kmalloc: frame %u outside the %u-frame side table\n",
                 (unsigned)(phys >> 12), big_alloc_nr);
         page_free(phys, order);
@@ -180,7 +182,7 @@ void kfree(void* p) {
     }
 
     uint32_t pfn = (uint32_t)(virt_to_phys(p) >> 12);
-    if (pfn >= big_alloc_nr || big_alloc_order[pfn] == BIG_NONE) {
+    if (pfn >= big_alloc_nr || pfn < pmm_pfn_base || big_alloc_order[pfn] == BIG_NONE) {
         kprintf("kfree: pointer %p not from kmalloc\n", p);
         return;
     }

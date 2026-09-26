@@ -96,3 +96,11 @@ static void cmd_board(const char* args) {
 }
 SHELL_CMD(board) = { "board", "", "what this aarch64 machine is, and where each fact came from",
                      SHELL_G_DEV, cmd_board, SHELL_P_ANY };
+
+/* §M85 — hal_api.h.  The only platform device a portable driver asks about so
+ * far is the PL031; a new one is a new name here, not a new constant there. */
+static int streq(const char* a, const char* b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
+int hal_platform_window(const char* name, uint64_t* base, uint64_t* len) {
+    if (streq(name, "pl031") && g_board.rtc) { *base = g_board.rtc; *len = 0x1000; return 0; }
+    return -1;
+}

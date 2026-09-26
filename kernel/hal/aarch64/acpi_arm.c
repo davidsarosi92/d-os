@@ -24,12 +24,12 @@
  * firmware has none" and "this reader could not read it" stay different
  * answers.
  *
- * Tables are reached through the low identity map (they sit below 4 GiB on
- * `virt`); a table above it is refused BY NAME rather than dereferenced.
+ * Tables are reached through the direct map (reach()).
  * ============================================================================= */
 
 #include "board.h"
 #include "printf.h"
+#include "hal_api.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -44,16 +44,21 @@ static uint16_t r16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t r32(const uint8_t* p) { return (uint32_t)r16(p) | ((uint32_t)r16(p + 2) << 16); }
 static uint64_t r64(const uint8_t* p) { return (uint64_t)r32(p) | ((uint64_t)r32(p + 4) << 32); }
 
-/* A physical table address as a pointer, or NULL if it is outside the part of
- * memory reachable this early. */
+/* A physical table address as a pointer, through the direct map (§M85 stage 4:
+ * RAM is no longer identity-mapped, and on sbsa-ref the tables sit above
+ * 1 TiB).  Its GiB is mapped first; a table below the direct map's base cannot
+ * be reached and is refused by name. */
+void mmu_direct_map_range(uint64_t base, uint64_t size);
+extern uint64_t aarch64_phys_offset;
 static const uint8_t* reach(uint64_t phys, const char* what) {
     if (!phys) return NULL;
-    if (phys >= (4ULL << 30)) {
-        kprintf("acpi: %s at %p is above the early identity map - not read\n",
+    if (phys < aarch64_phys_offset) {
+        kprintf("acpi: %s at %p is below the direct map - not read\n",
                 what, (void*)(uintptr_t)phys);
         return NULL;
     }
-    return (const uint8_t*)(uintptr_t)phys;
+    mmu_direct_map_range(phys, 0x10000);
+    return (const uint8_t*)phys_to_virt(phys);
 }
 
 static int csum_ok(const uint8_t* p, uint32_t n) {

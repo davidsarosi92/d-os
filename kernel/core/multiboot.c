@@ -73,10 +73,10 @@ void mboot_print_meminfo(void) {
     }
 
     kprintf("memory map (%u bytes @ %p):\n",
-            g_mbi->mmap_length, (void*)(uintptr_t)g_mbi->mmap_addr);
+            g_mbi->mmap_length, (void*)mboot_mmap_ptr(g_mbi));
 
-    uintptr_t p   = g_mbi->mmap_addr;
-    uintptr_t end = g_mbi->mmap_addr + g_mbi->mmap_length;
+    uintptr_t p   = mboot_mmap_ptr(g_mbi);
+    uintptr_t end = p + g_mbi->mmap_length;
     int idx = 0;
     uint64_t total_available = 0;
 
@@ -103,3 +103,6 @@ void mboot_print_meminfo(void) {
     uint32_t avail_mib = (uint32_t)(total_available / (1024ull * 1024ull));
     kprintf("available: ~%u MiB\n", avail_mib);
 }
+
+uintptr_t mboot_mmap_ptr(const struct mboot_info* mbi) __attribute__((weak));
+uintptr_t mboot_mmap_ptr(const struct mboot_info* mbi) { return (uintptr_t)mbi->mmap_addr; }
