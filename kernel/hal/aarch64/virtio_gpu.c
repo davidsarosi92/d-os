@@ -29,6 +29,7 @@
 #include "fb_present.h"
 #include "pmm.h"
 #include "printf.h"
+#include "hal_api.h"   /* kptr_phys — device addresses are PHYSICAL (§M86) */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -200,12 +201,12 @@ static inline void dsb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
 /* Submit the command currently staged in g_cmd (cmd_len bytes) and poll for
  * completion.  Returns the response type (VIRTIO_GPU_RESP_OK_NODATA on ok). */
 static uint32_t gpu_submit(uint32_t cmd_len) {
-    q_desc[0].addr  = (uint64_t)(uintptr_t)g_cmd;
+    q_desc[0].addr  = kptr_phys(g_cmd);
     q_desc[0].len   = cmd_len;
     q_desc[0].flags = VRING_DESC_F_NEXT;
     q_desc[0].next  = 1;
 
-    q_desc[1].addr  = (uint64_t)(uintptr_t)&g_resp;
+    q_desc[1].addr  = kptr_phys(&g_resp);
     q_desc[1].len   = sizeof g_resp;
     q_desc[1].flags = VRING_DESC_F_WRITE;
     q_desc[1].next  = 0;
@@ -394,7 +395,7 @@ int fb_mode_set(uint32_t w, uint32_t h, uint32_t bpp) {
     /* The console + GUI read the geometry from fb_terminal, so tell it before
      * anything draws — a renderer using the old pitch writes diagonal stripes,
      * which looks like a device bug and is arithmetic. */
-    fb_adopt_mode((volatile uint32_t*)(uintptr_t)nfb, w, h, pitch);
+    fb_adopt_mode((volatile uint32_t*)phys_to_virt(nfb), w, h, pitch);
     if (old_fb != PMM_ALLOC_FAIL && old_frames)
         pmm_free_contiguous(old_fb, old_frames);
 
@@ -461,9 +462,9 @@ static int gpu_transport_init(void) {
     if (r32(R_QUEUEREADY) != 0) { kprintf("virtio-gpu: queue busy\n"); return -1; }
     if (r32(R_QUEUENUMMAX) < QSIZE) { kprintf("virtio-gpu: QueueNumMax too small\n"); return -1; }
     w32(R_QUEUENUM, QSIZE);
-    uint64_t d = (uint64_t)(uintptr_t)q_desc;
-    uint64_t a = (uint64_t)(uintptr_t)&q_avail;
-    uint64_t u = (uint64_t)(uintptr_t)&q_used;
+    uint64_t d = kptr_phys(q_desc);
+    uint64_t a = kptr_phys(&q_avail);
+    uint64_t u = kptr_phys(&q_used);
     w32(R_QDESC_LO, (uint32_t)d);  w32(R_QDESC_HI, (uint32_t)(d >> 32));
     w32(R_QDRV_LO,  (uint32_t)a);  w32(R_QDRV_HI,  (uint32_t)(a >> 32));
     w32(R_QDEV_LO,  (uint32_t)u);  w32(R_QDEV_HI,  (uint32_t)(u >> 32));

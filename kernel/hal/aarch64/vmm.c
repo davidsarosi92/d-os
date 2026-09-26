@@ -27,6 +27,7 @@
  * ============================================================================= */
 
 #include "pmm.h"
+#include "hal_api.h"   /* phys_to_virt / kptr_phys — the TTBR1 direct map */
 #include "cowref.h"
 #include "kmalloc.h"
 #include "printf.h"
@@ -64,12 +65,18 @@ struct vmm_space {
     uintptr_t mmap_cursor;
 };
 
-/* Allocate a zeroed 4 KiB translation table.  RAM is identity-mapped, so the
- * physical frame address is directly usable as the kernel pointer. */
+/* Allocate a zeroed 4 KiB translation table, reached through the TTBR1
+ * direct map (§M86 stage 3, 2026-09-26).  RAM used to be identity-mapped in
+ * TTBR0, so a frame's physical address WAS its kernel pointer — true only for
+ * RAM below 4 GiB, which is all the Phase-A identity blocks covered.  Every
+ * table is therefore addressed as `phys_to_virt(phys)` and every descriptor or
+ * TTBR value is built from `kptr_phys(pointer)`: the two directions are now
+ * different numbers, and a cast in either direction is a bug that only shows
+ * on a machine with RAM above the line. */
 static uint64_t* alloc_table(void) {
     pmm_phys_t pa = pmm_alloc_frame();
     if (pa == PMM_ALLOC_FAIL) return NULL;
-    uint64_t* t = (uint64_t*)(uintptr_t)pa;
+    uint64_t* t = (uint64_t*)phys_to_virt(pa);
     for (int i = 0; i < 512; i++) t[i] = 0;
     return t;
 }
@@ -110,9 +117,9 @@ static uint64_t* next_table(uint64_t* tbl, uint64_t idx) {
         uint64_t* nt = alloc_table();
         if (!nt) return NULL;
         __asm__ volatile ("dsb ishst" ::: "memory");
-        tbl[idx] = ((uint64_t)(uintptr_t)nt) | PTE_VALID | PTE_TABLE;
+        tbl[idx] = kptr_phys(nt) | PTE_VALID | PTE_TABLE;
     }
-    return (uint64_t*)(uintptr_t)(tbl[idx] & PTE_ADDR_MASK);
+    return (uint64_t*)phys_to_virt(tbl[idx] & PTE_ADDR_MASK);
 }
 
 /* §M46/security — is [va, va+len) fully mapped + EL0-accessible in the ACTIVE
@@ -124,20 +131,28 @@ int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
     if (len == 0) return 1;
     if (va < vmm_user_base()) return 0;
     if (va + len < va)        return 0;
+    /* THE TOP OF THE TTBR0 RANGE (§M86 stage 3, 2026-09-26).  The walk below
+     * indexes with `(p >> 30) & 0x1FF`, i.e. it looks only at bits 38..30 —
+     * so a kernel direct-map address (0xFFFFFF80_xxxxxxxx, TTBR1) folds onto
+     * an L1 slot of the USER table and would pass whenever the user happens
+     * to have something mapped at the same low bits.  Before the direct map
+     * moved up there was nothing above 2^39 to fold; now there is the whole
+     * of RAM.  Anything the TTBR0 walk cannot translate is not user memory. */
+    if (va + len > (1ULL << 39)) return 0;
     uint64_t ttbr0;
     __asm__ volatile ("mrs %0, ttbr0_el1" : "=r"(ttbr0));
-    uint64_t* l1 = (uint64_t*)(uintptr_t)(ttbr0 & PTE_ADDR_MASK);
+    uint64_t* l1 = (uint64_t*)phys_to_virt(ttbr0 & PTE_ADDR_MASK);
     for (uintptr_t p = va & ~0xFFFUL; p < va + len; p += 0x1000) {
         uint64_t e1 = l1[(p >> 30) & 0x1FF];
         if (!(e1 & PTE_VALID) || !(e1 & PTE_TABLE)) return 0;
-        uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+        uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
         uint64_t e2 = l2[(p >> 21) & 0x1FF];
         if (!(e2 & PTE_VALID)) return 0;
         uint64_t leaf;
         if (!(e2 & PTE_TABLE)) {                       /* 2 MiB block at L2 */
             leaf = e2;
         } else {
-            uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+            uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
             leaf = l3[(p >> 12) & 0x1FF];
             if (!(leaf & PTE_VALID)) return 0;
         }
@@ -191,7 +206,7 @@ void aarch64_vmm_switch(struct vmm_space* s) {
         "tlbi vmalle1\n"
         "dsb ish\n"
         "isb\n"
-        :: "r"((uint64_t)(uintptr_t)s->l1) : "memory");
+        :: "r"(kptr_phys(s->l1)) : "memory");
 }
 
 /* Restore the shared kernel identity map as the active TTBR0 (used after a
@@ -203,7 +218,7 @@ void aarch64_vmm_kernel_switch(void) {
         "tlbi vmalle1\n"
         "dsb ish\n"
         "isb\n"
-        :: "r"((uint64_t)(uintptr_t)mmu_kernel_l1()) : "memory");
+        :: "r"(kptr_phys(mmu_kernel_l1())) : "memory");
 }
 
 /* The `vmm` shell command's status dump.  The x86 vmm.c prints page-directory
@@ -211,8 +226,12 @@ void aarch64_vmm_kernel_switch(void) {
  * file (per-process EL0 spaces), so report that shape.  Keeps shell.c portable
  * (it just calls vmm_print_status). */
 void vmm_print_status(void) {
-    kprintf("aarch64 MMU: 4 KiB granule, 39-bit VA; kernel = TTBR0 identity "
-            "(1 GiB blocks); per-process EL0 spaces via vmm.c (VA >= 4 GiB)\n");
+    uint64_t tcr;
+    __asm__ volatile ("mrs %0, tcr_el1" : "=r"(tcr));
+    kprintf("aarch64 MMU: 4 KiB granule, 39-bit VA; image + devices = TTBR0 identity "
+            "(low 4 GiB); RAM = TTBR1 direct map @ %p (%s); per-process EL0 "
+            "spaces via vmm.c (VA >= 4 GiB)\n", (void*)KERNEL_DIRECT_MAP_BASE,
+            (tcr & (1ULL << 23)) ? "WALKS DISABLED" : "on");
 }
 
 /* x86 drivers (xhci.c) call vmm_map_4mib to identity-map an MMIO BAR window.
@@ -265,12 +284,12 @@ uintptr_t vmm_translate(uintptr_t va) {
     if (!(e1 & PTE_VALID)) return 0;
     if (!(e1 & PTE_TABLE))                          /* 1 GiB block */
         return (uintptr_t)((e1 & PTE_ADDR_MASK & ~0x3FFFFFFFULL) | (va & 0x3FFFFFFF));
-    uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+    uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
     uint64_t e2 = l2[(va >> 21) & 0x1FF];
     if (!(e2 & PTE_VALID)) return 0;
     if (!(e2 & PTE_TABLE))                          /* 2 MiB block */
         return (uintptr_t)((e2 & PTE_ADDR_MASK & ~0x1FFFFFULL) | (va & 0x1FFFFF));
-    uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+    uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
     uint64_t e3 = l3[(va >> 12) & 0x1FF];
     if (!(e3 & PTE_VALID)) return 0;
     return (uintptr_t)((e3 & PTE_ADDR_MASK) | (va & 0xFFF));
@@ -357,7 +376,7 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     for (int i1 = 4; i1 < 512; i1++) {                  /* user region only */
         uint64_t e1 = parent->l1[i1];
         if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) continue;
-        uint64_t* pl2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+        uint64_t* pl2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
         uint64_t* cl2 = next_table(s->l1, (uint64_t)i1);
         if (!cl2) { vmm_space_destroy(s); return NULL; }
 
@@ -373,7 +392,7 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
                 vmm_space_destroy(s);
                 return NULL;
             }
-            uint64_t* pl3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+            uint64_t* pl3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
             uint64_t* cl3 = next_table(cl2, (uint64_t)i2);
             if (!cl3) { vmm_space_destroy(s); return NULL; }
             for (int i3 = 0; i3 < 512; i3++)
@@ -404,10 +423,10 @@ int vmm_cow_fault(uintptr_t fault_va) {
 
     uint64_t e1 = l1[(fault_va >> 30) & 0x1FF];
     if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) return 0;
-    uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+    uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
     uint64_t e2 = l2[(fault_va >> 21) & 0x1FF];
     if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) return 0;
-    uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+    uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
     unsigned i3 = (unsigned)((fault_va >> 12) & 0x1FF);
     uint64_t pte = l3[i3];
     if (!(pte & PTE_VALID) || !(pte & PTE_SW_COW)) return 0;   /* not a COW page */
@@ -422,8 +441,8 @@ int vmm_cow_fault(uintptr_t fault_va) {
     } else {
         pmm_phys_t nf = pmm_alloc_frame();
         if (nf == PMM_ALLOC_FAIL) return 0;             /* OOM → a real fault */
-        const uint8_t* src = (const uint8_t*)(uintptr_t)old;
-        uint8_t* dst = (uint8_t*)(uintptr_t)nf;
+        const uint8_t* src = (const uint8_t*)phys_to_virt(old);
+        uint8_t* dst = (uint8_t*)phys_to_virt(nf);
         for (int b = 0; b < 4096; b++) dst[b] = src[b];
         l3[i3] = (((uint64_t)nf & PTE_ADDR_MASK) | (pte & ~PTE_ADDR_MASK))
                  & ~PTE_AP_RO_BIT & ~PTE_SW_COW;
@@ -442,7 +461,7 @@ static void free_l2_subtree(uint64_t* l2) {
     for (int i = 0; i < 512; i++) {
         uint64_t e = l2[i];
         if ((e & PTE_VALID) && (e & PTE_TABLE)) {
-            uint64_t* l3 = (uint64_t*)(uintptr_t)(e & PTE_ADDR_MASK);
+            uint64_t* l3 = (uint64_t*)phys_to_virt(e & PTE_ADDR_MASK);
             for (int j = 0; j < 512; j++) {
                 uint64_t pte = l3[j];
                 if (!(pte & PTE_VALID) || (pte & PTE_SW_SHARED)) continue;
@@ -464,12 +483,12 @@ void vmm_space_destroy(struct vmm_space* s) {
     for (int i = 4; i < 512; i++) {                 /* user region = VA >= 4 GiB */
         uint64_t e = s->l1[i];
         if ((e & PTE_VALID) && (e & PTE_TABLE)) {
-            uint64_t* l2 = (uint64_t*)(uintptr_t)(e & PTE_ADDR_MASK);
+            uint64_t* l2 = (uint64_t*)phys_to_virt(e & PTE_ADDR_MASK);
             free_l2_subtree(l2);
             pmm_free_frame((pmm_phys_t)(e & PTE_ADDR_MASK));           /* L2 table */
         }
     }
-    pmm_free_frame((pmm_phys_t)(uintptr_t)s->l1);                      /* L1 table */
+    pmm_free_frame((pmm_phys_t)kptr_phys(s->l1));                      /* L1 table */
     kfree(s);
 }
 
@@ -478,9 +497,9 @@ int vmm_space_map(struct vmm_space* s, uintptr_t va, uintptr_t pa, uint32_t flag
     int rc = aarch64_vmm_map_user(s, va, pa, 4096, (flags & VMM_EXEC) ? 1 : 0);
     if (rc == 0 && (flags & VMM_SHARED)) {      /* tag borrowed frame in L3 */
         uint64_t e1 = s->l1[(va >> 30) & 0x1FF];
-        uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+        uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
         uint64_t e2 = l2[(va >> 21) & 0x1FF];
-        uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+        uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
         l3[(va >> 12) & 0x1FF] |= PTE_SW_SHARED;
     }
     return rc;
@@ -490,10 +509,10 @@ void vmm_space_unmap(struct vmm_space* s, uintptr_t va) {
     if (!s) return;
     uint64_t e1 = s->l1[(va >> 30) & 0x1FF];
     if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) return;
-    uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+    uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
     uint64_t e2 = l2[(va >> 21) & 0x1FF];
     if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) return;
-    uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+    uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
     l3[(va >> 12) & 0x1FF] = 0;
     __asm__ volatile ("dsb ish\ntlbi vmalle1\ndsb ish\nisb" ::: "memory");
 }
@@ -512,10 +531,10 @@ int vmm_space_protect(struct vmm_space* s, uintptr_t va, uint32_t flags) {
     if (!l1) return -1;
     uint64_t e1 = l1[(va >> 30) & 0x1FF];
     if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) return -1;
-    uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+    uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
     uint64_t e2 = l2[(va >> 21) & 0x1FF];
     if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) return -1;
-    uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+    uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
     unsigned i = (unsigned)((va >> 12) & 0x1FF);
     uint64_t e3 = l3[i];
     if (!(e3 & PTE_VALID)) return -1;
@@ -550,12 +569,12 @@ void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
     for (uint64_t i = 4; i < 512; i++) {                /* user region only   */
         uint64_t e1 = s->l1[i];
         if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) continue;
-        uint64_t* l2 = (uint64_t*)(uintptr_t)(e1 & PTE_ADDR_MASK);
+        uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
 
         for (uint64_t j = 0; j < 512; j++) {
             uint64_t e2 = l2[j];
             if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) continue;
-            uint64_t* l3 = (uint64_t*)(uintptr_t)(e2 & PTE_ADDR_MASK);
+            uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
 
             for (uint64_t k = 0; k < 512; k++) {
                 uint64_t e3 = l3[k];
@@ -585,11 +604,11 @@ uint32_t vmm_frame_share_count(uintptr_t phys) {
 }
 
 uintptr_t vmm_space_pd_phys(struct vmm_space* s) {
-    return (uintptr_t)(s ? s->l1 : mmu_kernel_l1());
+    return (uintptr_t)kptr_phys(s ? s->l1 : mmu_kernel_l1());
 }
 
 void vmm_space_switch(struct vmm_space* s) {
-    uint64_t target = (uint64_t)(uintptr_t)(s ? s->l1 : mmu_kernel_l1());
+    uint64_t target = kptr_phys(s ? s->l1 : mmu_kernel_l1());
     uint64_t cur;
     __asm__ volatile ("mrs %0, ttbr0_el1" : "=r"(cur));
     /* Skip the (expensive) TTBR0 reload + full TLBI when the space is

@@ -458,8 +458,8 @@ int aarch64_usertest(void) {
         kprintf("usertest: pmm OOM\n"); return -1;
     }
 
-    /* Copy the stub into the code frame (identity map: PA == kernel VA). */
-    uint8_t* code = (uint8_t*)(uintptr_t)code_pa;
+    /* Copy the stub into the code frame, through the direct map (§M86). */
+    uint8_t* code = (uint8_t*)phys_to_virt(code_pa);
     for (uint64_t i = 0; i < stub_sz; i++) code[i] = ((uint8_t*)user_stub_start)[i];
 
     if (aarch64_vmm_map_user(sp, USER_CODE_VA,  code_pa, 4096, 1) != 0 ||

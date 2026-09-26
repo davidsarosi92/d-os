@@ -67,6 +67,8 @@ established; "open" rows were checked against today's tree, not copied forward.
 | `ac97: drain timeout` after every `play` (sound itself exact) | one BCIS for two finished buffers → count one behind | DOCS §4.96 — halted engine (DCH) is authoritative |
 | two reapers could both work on one DEAD task (`task_reap` claimed only at unlink) | the GUI host sweep reaped fork children; double reap → hang | DOCS §4.96 — `reaping` claimed under the master lock |
 | PMM-GUARD compared phys at pointer width | false "INTO kernel image" per free above 4 GiB | DOCS §4.96 |
+| aarch64 harness never loaded a DTB — `--mem`/`--smp` silently ignored, every ARM run at 247 MiB; `run_qemu.sh` used a hand-made 256M tree | first `--mem 8G` run managed 247 MiB | DOCS §4.97 — tree dumped per run |
+| aarch64 user-pointer gate indexed bits 38..30 only — an upper-half kernel address could fold onto a user mapping | found reading the gate for the TTBR1 move | DOCS §4.97 — refuse beyond 2^39 |
 
 Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI report with
 `if=`/`task=`/`isr-vec=`/stack scan, monitor replies kept in `<log>.mon`,

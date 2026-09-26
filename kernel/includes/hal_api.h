@@ -148,13 +148,23 @@ uintptr_t hal_extend_identity_map(uintptr_t end_phys);
  * half, and physical dereferences go through `phys_to_virt`.  Low addresses
  * then belong entirely to user space, whatever the RAM size.
  *
- * On i386 and aarch64 the direct map base is 0, so this is the identity
- * mapping those ports already have and the calls compile away to nothing.
+ * aarch64 does the same since §M86 stage 3 (TTBR1).  On i386 the direct map
+ * base is 0, so this is the identity mapping that port already has (plus kmap
+ * for highmem) and the calls compile away to nothing.
  * --------------------------------------------------------------------------- */
 #if defined(__x86_64__)
 /* Canonical upper half, PML4 slot 256.  Physical memory is capped well below
  * the 512 GiB a single PDPT of 1 GiB pages covers. */
 #  define KERNEL_DIRECT_MAP_BASE  0xFFFF800000000000UL
+#elif defined(__aarch64__)
+/* §M86 stage 3 (2026-09-26) — the bottom of the TTBR1 range with T1SZ = 25
+ * (a 39-bit upper half, 2^64 - 2^39): one level-1 table of 1 GiB blocks maps
+ * up to 512 GiB of RAM there, kernel-only.  Before this the kernel reached RAM
+ * through 1 GiB identity blocks in TTBR0, which stopped at 4 GiB because user
+ * mappings start there — the same collision x86_64 had (§M48), solved the
+ * same way.  The kernel IMAGE and the device window stay identity-mapped in
+ * TTBR0's low 4 GiB; everything physical goes through here. */
+#  define KERNEL_DIRECT_MAP_BASE  0xFFFFFF8000000000UL
 #else
 #  define KERNEL_DIRECT_MAP_BASE  0UL
 #endif

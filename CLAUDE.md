@@ -73,7 +73,10 @@ manages all RAM through `ZONE_HIGHMEM` + kmap, and with PAE (a second page-table
 format behind the same VMM accessors, classic kept for CPUs without it) physical
 memory above 4 GiB — `-m 8G` verified frame by frame.**  Raising the ceiling
 exposed four x86_64 DMA drivers dereferencing physical addresses (use
-`phys_to_virt`, always).  Next: §M86 stage 3 (aarch64 TTBR1 direct map).
+`phys_to_virt`, always).  **Stage 3 SHIPPED too (DOCS §4.97): aarch64 RAM is a TTBR1
+direct map at 0xFFFFFF80_00000000, 8 and 16 GiB verified — and the aarch64 harness
+had never loaded a DTB, so `--mem` was silently ignored on ARM until now.**
+Next: §M86 stage 4 (multi-range `/memory`), then §M85.
 
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there

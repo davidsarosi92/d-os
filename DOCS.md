@@ -13949,8 +13949,63 @@ work on it (a GUI sweep reaping fork children was the one that did).
 **Not done:** NX (PTE bit 63, which PAE makes possible and which is W^X for
 §M67's modules) — the format carries it and nothing sets it yet.
 
+### 4.97 aarch64 TTBR1 direct map — RAM above 4 GiB (§M86 stage 3, 2026-09-26)
+
+aarch64 reached RAM through 1 GiB identity blocks in TTBR0, which had to stop at
+4 GiB because user mappings start there; with `virt`'s RAM at 1 GiB, ~3 GiB was
+the most ever managed.  **The kernel's view of RAM now lives in TTBR1** —
+§M48's x86_64 shape: `KERNEL_DIRECT_MAP_BASE = 0xFFFFFF80_00000000` (T1SZ = 25,
+a 39-bit upper half), one level-1 table of 1 GiB blocks reaching 512 GiB, shared
+by every CPU and owned by no process.  TTBR0's low 4 GiB keep the kernel image
+and the device window identity-mapped; user space is untouched.
+
+- **TCR:** EPD1 cleared, T1SZ 25, walk attributes as TTBR0, and **TG1 = 0b10**
+  for 4 KiB — TG1's encoding differs from TG0's, and 0b00 there is RESERVED,
+  which the CPU does not report; the walks simply go wrong.
+- **Slot 0 of the direct map is DEVICE memory**, like TTBR0's — a Normal alias
+  of the peripheral window lets the CPU speculate into device registers.
+  Blocks are UXN and not PXN (the heap lives here and §M67 loads modules into
+  it).  `mmu_init` maps the first 4 GiB so `phys_to_virt` works from the first
+  allocation; `hal_extend_identity_map` (the PMM's hook) extends it to the end
+  of RAM, adding blocks only to empty slots.
+- **The arch code stopped treating an address as a pointer.**  `vmm.c` reads
+  every table through `phys_to_virt` and builds every descriptor and TTBR0
+  value from `kptr_phys`; the five virtio-mmio drivers hand the device
+  `kptr_phys(buffer)` (right for a static array in the image AND a kmalloc'd
+  buffer); the framebuffer and `usertest` go through the direct map.
+- **A hole this opened, closed in the same change:** `vmm_user_access_ok`
+  indexes the user table with bits 38..30 only, so a direct-map address folds
+  onto a user L1 slot and would pass whenever the user had something mapped at
+  the same low bits.  Nothing lived above 2^39 before; now all of RAM does.
+  The gate refuses anything past the TTBR0 range (`audit ring3-boundary` ok).
+
+**AND THE HARNESS HAD NEVER GIVEN ARM THE MACHINE IT ASKED FOR — the seventh
+appearance of that shape.**  QEMU's direct-ELF boot passes no DTB, the kernel
+falls back to 256 MiB unless one is loaded at 0x48000000, and
+`dos-shell-test.py` never loaded one: **`--mem` and `--smp` were silently
+ignored on aarch64**, and the first `--mem 8G` run of this work managed 247 MiB
+while saying 8 GiB.  `run_qemu.sh` loaded a tree generated ONCE, by hand, for
+256M/-smp 2.  Both now dump the tree from the same `-smp`/`-m` on every run
+(`DOS_MEM`/`DOS_SMP` for the run script).
+
+`highmemtest all` fills and verifies every frame the user allocator hands out
+(leaving a 16 MiB reserve), for machines whose RAM is all directly mapped.
+
+**Verified:** aarch64 `-m 8G` — 8155 MiB free, `highmemtest all` 2 083 615 of
+2 083 615 frames up to 9203 MiB physical filled and verified, 0 bad;
+`memcheck`, `forktest`, `musltest`, `excstorm` green.  `-m 16G` — 16338 MiB
+free; `memcheck`, `forktest`, `musltest`, `diskstorm`, `ping`, `usertest` and
+all eight audits ok.  The serial boot path (`--no-display`) green.  i386 at 3G
+(both `highmemtest` modes) and x86_64 at 2G (`highmemtest all`, fork, musl)
+unchanged.
+
+**Open (stage 4):** `dtb.c` reads only the FIRST `reg` pair of `/memory`, which
+is all `virt` has; a board with several ranges (sbsa-ref, §M85, real hardware)
+needs them all passed through natively.
+
 ## 8. Change log
 
+- **2026-09-26 — §M86 stage 3: aarch64 reaches RAM through a TTBR1 direct map (8 and 16 GiB verified); the user-pointer gate refuses the upper half; the aarch64 harness finally loads a DTB for the machine it boots (DOCS §4.97).**
 - **2026-09-26 — §M86 stage 2: i386 PAE, physical memory above 4 GiB (8 GiB verified); x86_64 DMA drivers stop dereferencing physical addresses; ac97 drain no longer times out after every sound; task_reap claims under the lock (DOCS §4.96).**
 - **2026-09-26 — Concurrent processes: per-task excursion state, a race-free atomic COW table, O(1) buddy removal, spinners answer shootdowns, a private ringtest space, a page_alloc_below leak (DOCS §4.95).**
 - **2026-09-26 — §M86 stage 1: i386 manages all RAM up to 4 GiB (ZONE_HIGHMEM + kmap) (DOCS §4.94).**

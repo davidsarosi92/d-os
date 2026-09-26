@@ -59,6 +59,7 @@
 /* gic.c — this is the first virtio-mmio driver here to take an interrupt. */
 void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
 void gic_enable_irq(uint32_t intid);
+#include "hal_api.h"   /* kptr_phys — device addresses are PHYSICAL (§M86) */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -327,11 +328,11 @@ static int ctrl_request(struct snd_dev* d, const void* req, uint32_t reqlen,
     for (uint32_t i = 0; i < reqlen && i < sizeof d->req; i++) d->req[i] = s[i];
     for (uint32_t i = 0; i < resplen && i < sizeof d->resp; i++) d->resp[i] = 0;
 
-    d->cdesc[0].addr  = (uint64_t)(uintptr_t)d->req;
+    d->cdesc[0].addr  = kptr_phys(d->req);
     d->cdesc[0].len   = reqlen;
     d->cdesc[0].flags = VRING_DESC_F_NEXT;
     d->cdesc[0].next  = 1;
-    d->cdesc[1].addr  = (uint64_t)(uintptr_t)d->resp;
+    d->cdesc[1].addr  = kptr_phys(d->resp);
     d->cdesc[1].len   = resplen;
     d->cdesc[1].flags = VRING_DESC_F_WRITE;
     d->cdesc[1].next  = 0;
@@ -418,15 +419,15 @@ static int snd_play(struct audio_dev* dev, const int16_t* frames, uint32_t nfram
      * Chain `slot` owns descriptors 3*slot .. 3*slot+2, so two buffers in
      * flight never share a descriptor. */
     uint32_t b = slot * 3;
-    d->tdesc[b + 0].addr  = (uint64_t)(uintptr_t)&d->xfer[slot];
+    d->tdesc[b + 0].addr  = kptr_phys(&d->xfer[slot]);
     d->tdesc[b + 0].len   = sizeof d->xfer[slot];
     d->tdesc[b + 0].flags = VRING_DESC_F_NEXT;
     d->tdesc[b + 0].next  = (uint16_t)(b + 1);
-    d->tdesc[b + 1].addr  = (uint64_t)(uintptr_t)d->pcm[slot];
+    d->tdesc[b + 1].addr  = kptr_phys(d->pcm[slot]);
     d->tdesc[b + 1].len   = nframes * 4;
     d->tdesc[b + 1].flags = VRING_DESC_F_NEXT;
     d->tdesc[b + 1].next  = (uint16_t)(b + 2);
-    d->tdesc[b + 2].addr  = (uint64_t)(uintptr_t)&d->status[slot];
+    d->tdesc[b + 2].addr  = kptr_phys(&d->status[slot]);
     d->tdesc[b + 2].len   = sizeof d->status[slot];
     d->tdesc[b + 2].flags = VRING_DESC_F_WRITE;
     d->tdesc[b + 2].next  = 0;
@@ -452,15 +453,15 @@ static void snd_rx_post(struct snd_dev* d, uint32_t slot) {
     uint32_t b = slot * 3;
     d->rxfer[slot].stream_id = d->in_stream_id;
     d->rstatus[slot].status = 0;
-    d->rdesc[b + 0].addr  = (uint64_t)(uintptr_t)&d->rxfer[slot];
+    d->rdesc[b + 0].addr  = kptr_phys(&d->rxfer[slot]);
     d->rdesc[b + 0].len   = sizeof d->rxfer[slot];
     d->rdesc[b + 0].flags = VRING_DESC_F_NEXT;
     d->rdesc[b + 0].next  = (uint16_t)(b + 1);
-    d->rdesc[b + 1].addr  = (uint64_t)(uintptr_t)d->rpcm[slot];
+    d->rdesc[b + 1].addr  = kptr_phys(d->rpcm[slot]);
     d->rdesc[b + 1].len   = SND_PERIOD_FRAMES * 4;
     d->rdesc[b + 1].flags = VRING_DESC_F_WRITE | VRING_DESC_F_NEXT;
     d->rdesc[b + 1].next  = (uint16_t)(b + 2);
-    d->rdesc[b + 2].addr  = (uint64_t)(uintptr_t)&d->rstatus[slot];
+    d->rdesc[b + 2].addr  = kptr_phys(&d->rstatus[slot]);
     d->rdesc[b + 2].len   = sizeof d->rstatus[slot];
     d->rdesc[b + 2].flags = VRING_DESC_F_WRITE;
     d->rdesc[b + 2].next  = 0;
@@ -540,9 +541,9 @@ static int queue_setup(struct snd_dev* d, uint32_t q, struct virtq_desc* desc,
     uint32_t nmax = r32(d->base, R_QUEUENUMMAX);
     if (nmax == 0) return -1;
     w32(d->base, R_QUEUENUM, (nmax < QSIZE) ? nmax : QSIZE);
-    uint64_t dd = (uint64_t)(uintptr_t)desc;
-    uint64_t aa = (uint64_t)(uintptr_t)avail;
-    uint64_t uu = (uint64_t)(uintptr_t)used;
+    uint64_t dd = kptr_phys(desc);
+    uint64_t aa = kptr_phys(avail);
+    uint64_t uu = kptr_phys(used);
     w32(d->base, R_QDESC_LO, (uint32_t)dd); w32(d->base, R_QDESC_HI, (uint32_t)(dd >> 32));
     w32(d->base, R_QDRV_LO,  (uint32_t)aa); w32(d->base, R_QDRV_HI,  (uint32_t)(aa >> 32));
     w32(d->base, R_QDEV_LO,  (uint32_t)uu); w32(d->base, R_QDEV_HI,  (uint32_t)(uu >> 32));

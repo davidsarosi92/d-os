@@ -293,6 +293,27 @@ def audio_backend(a):
     return a.audio_backend
 
 
+def aarch64_dtb_args(a):
+    """The device tree for THIS run's machine, loaded where the kernel looks.
+
+    §M86 stage 3 (2026-09-26): QEMU's direct-ELF `-kernel` entry passes no DTB,
+    so the kernel falls back to a built-in 256 MiB / default-CPU picture unless
+    one is loaded at 0x48000000 — and this harness never loaded one.  So
+    `--mem` and `--smp` were SILENTLY IGNORED on aarch64: every ARM run, at any
+    size, managed 247 MiB, and the first `--mem 8G` run tested a quarter of a
+    gigabyte while saying 8.  The seventh appearance of the harness shape (the
+    path under test was not the machine asked for).  The tree is dumped from
+    the same -M/-cpu/-smp/-m every run, because those are exactly the facts the
+    kernel reads from it (/memory, /cpus); a DTB made once for one size is
+    wrong for every other size."""
+    dtb = "build/aarch64/test-%d.dtb" % os.getpid()
+    subprocess.run(["qemu-system-aarch64", "-M", "virt,gic-version=2,dumpdtb=" + dtb,
+                    "-cpu", "cortex-a72", "-smp", str(a.smp), "-m", a.mem,
+                    "-display", "none"],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return ["-device", "loader,file=%s,addr=0x48000000,force-raw=on" % dtb]
+
+
 def qemu_argv(a, sersock, monsock):
     if a.arch == "aarch64":
         argv = [
@@ -519,6 +540,8 @@ def main():
             pass
 
     argv = qemu_argv(a, sersock, monsock)
+    if a.arch == "aarch64":
+        argv += aarch64_dtb_args(a)
     print("+ " + " ".join(argv), file=sys.stderr)
     proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 

@@ -36,6 +36,7 @@
 
 #include "net.h"
 #include "printf.h"
+#include "hal_api.h"   /* kptr_phys — device addresses are PHYSICAL (§M86) */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -118,9 +119,9 @@ static void vq_program(struct vq* q, uint32_t sel) {
     uint32_t qmax = r32(R_QUEUENUMMAX);
     if (qmax < QSIZE) { kprintf("virtio-net: QueueNumMax %u < %u\n", qmax, QSIZE); return; }
     w32(R_QUEUENUM, QSIZE);
-    uint64_t d = (uint64_t)(uintptr_t)q->desc;
-    uint64_t a = (uint64_t)(uintptr_t)&q->avail;
-    uint64_t u = (uint64_t)(uintptr_t)&q->used;
+    uint64_t d = kptr_phys(q->desc);
+    uint64_t a = kptr_phys(&q->avail);
+    uint64_t u = kptr_phys(&q->used);
     w32(R_QDESC_LO, (uint32_t)d); w32(R_QDESC_HI, (uint32_t)(d >> 32));
     w32(R_QDRV_LO,  (uint32_t)a); w32(R_QDRV_HI,  (uint32_t)(a >> 32));
     w32(R_QDEV_LO,  (uint32_t)u); w32(R_QDEV_HI,  (uint32_t)(u >> 32));
@@ -130,7 +131,7 @@ static void vq_program(struct vq* q, uint32_t sel) {
 
 /* Hand one empty buffer back to the device. */
 static void rx_post(uint16_t idx) {
-    g_rxq.desc[idx].addr  = (uint64_t)(uintptr_t)g_rxbuf[idx];
+    g_rxq.desc[idx].addr  = kptr_phys(g_rxbuf[idx]);
     g_rxq.desc[idx].len   = BUF_BYTES;
     g_rxq.desc[idx].flags = VRING_DESC_F_WRITE;
     g_rxq.desc[idx].next  = 0;
@@ -152,7 +153,7 @@ static int vnet_transmit(struct net_device* dev, const void* frame, uint32_t len
     const uint8_t* p = (const uint8_t*)frame;
     for (uint32_t i = 0; i < len; i++) g_txbuf[VNET_HDR + i] = p[i];
 
-    g_txq.desc[0].addr  = (uint64_t)(uintptr_t)g_txbuf;
+    g_txq.desc[0].addr  = kptr_phys(g_txbuf);
     g_txq.desc[0].len   = VNET_HDR + len;
     g_txq.desc[0].flags = 0;
     g_txq.desc[0].next  = 0;

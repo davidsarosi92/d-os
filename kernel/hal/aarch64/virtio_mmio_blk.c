@@ -31,6 +31,7 @@
 #include "lock.h"
 #include "waitq.h"
 #include "ktimer.h"
+#include "hal_api.h"   /* kptr_phys — device addresses are PHYSICAL (§M86) */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -165,17 +166,17 @@ static int vmb_rw_unlocked(uint64_t lba, uint32_t count, void* buf, int is_write
     q_hdr.reserved = 0;
     q_hdr.sector   = lba;
 
-    q_desc[0].addr = (uint64_t)(uintptr_t)&q_hdr;
+    q_desc[0].addr = kptr_phys(&q_hdr);
     q_desc[0].len  = sizeof q_hdr;
     q_desc[0].flags = VRING_DESC_F_NEXT;
     q_desc[0].next = 1;
 
-    q_desc[1].addr = (uint64_t)(uintptr_t)buf;
+    q_desc[1].addr = kptr_phys(buf);
     q_desc[1].len  = count * SECTOR;
     q_desc[1].flags = VRING_DESC_F_NEXT | (is_write ? 0 : VRING_DESC_F_WRITE);
     q_desc[1].next = 2;
 
-    q_desc[2].addr = (uint64_t)(uintptr_t)&q_status;
+    q_desc[2].addr = kptr_phys((const void*)&q_status);
     q_desc[2].len  = 1;
     q_desc[2].flags = VRING_DESC_F_WRITE;
     q_desc[2].next = 0;
@@ -282,9 +283,9 @@ int virtio_mmio_blk_init(void) {
     if (qmax < QSIZE) { kprintf("virtio-mmio: QueueNumMax %u < %u\n", qmax, QSIZE); return -1; }
     w32(R_QUEUENUM, QSIZE);
 
-    uint64_t d = (uint64_t)(uintptr_t)q_desc;
-    uint64_t a = (uint64_t)(uintptr_t)&q_avail;
-    uint64_t u = (uint64_t)(uintptr_t)&q_used;
+    uint64_t d = kptr_phys(q_desc);
+    uint64_t a = kptr_phys(&q_avail);
+    uint64_t u = kptr_phys(&q_used);
     w32(R_QDESC_LO, (uint32_t)d);  w32(R_QDESC_HI, (uint32_t)(d >> 32));
     w32(R_QDRV_LO,  (uint32_t)a);  w32(R_QDRV_HI,  (uint32_t)(a >> 32));
     w32(R_QDEV_LO,  (uint32_t)u);  w32(R_QDEV_HI,  (uint32_t)(u >> 32));

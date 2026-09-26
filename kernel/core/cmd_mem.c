@@ -179,11 +179,23 @@ SHELL_CMD(memhog)    = { "memhog",    "", "ring-3 process that grows 1 MiB/2 s (
  * allocation proportional to what it tests.
  * ------------------------------------------------------------------------- */
 #include "kmap.h"
+/* `highmemtest all` (§M86 stage 3, 2026-09-26) tests EVERY frame the user
+ * allocator will hand out, not just the HIGHMEM zone — which is the question
+ * on a machine whose RAM is all directly mapped (x86_64, and aarch64 since its
+ * TTBR1 direct map): there the frames above 4 GiB are ordinary frames, and
+ * whether the direct map really reaches them is exactly what needs proving.
+ * It leaves a reserve (ALL_RESERVE frames) so the rest of the machine can
+ * still allocate while the test holds everything else. */
+#define ALL_RESERVE 4096u                          /* 16 MiB */
 static void cmd_highmemtest(const char* args) {
-    (void)args;
+    int all = args && args[0] == 'a';
     uint32_t mgr = 0;
     pmm_zone_stats(ZONE_HIGHMEM, NULL, &mgr);
-    if (!mgr) { kprintf("highmemtest: no HIGHMEM on this machine (all RAM directly mapped)\n"); return; }
+    if (all) mgr = pmm_free_frames();
+    if (!mgr) { kprintf("highmemtest: no HIGHMEM on this machine (all RAM directly mapped) - try `highmemtest all`\n"); return; }
+    if (all && mgr <= ALL_RESERVE) { kprintf("highmemtest: too little free memory\n"); return; }
+    if (all) mgr -= ALL_RESERVE;
+    pmm_phys_t top = 0;
     uint64_t t0 = timer_ticks_ms();
     pmm_phys_t head = 0, low = 0;
     uint32_t n = 0;
@@ -195,7 +207,9 @@ static void cmd_highmemtest(const char* args) {
          * first highmem frame, 0x3FC00000, IS the address of CPU 0's first
          * window slot.  That coincidence stopped the first version at 2016
          * frames while 525 280 were free. */
-        if (!pmm_frame_is_highmem(f)) { low = f; break; }  /* highmem is exhausted */
+        if (!all && !pmm_frame_is_highmem(f)) { low = f; break; }  /* highmem is exhausted */
+        if (all && n >= mgr) { low = f; break; }            /* keep the reserve  */
+        if (f > top) top = f;
         uint32_t* p = (uint32_t*)kmap_frame(f);
         if (!p) { pmm_free_frame(f); break; }
         uint32_t pat = (uint32_t)(f >> 12) * 2654435761u;
@@ -210,6 +224,7 @@ static void cmd_highmemtest(const char* args) {
         kunmap_frame(p);
         head = f;
         n++;
+        if ((n & 4095) == 0) task_yield();   /* seconds of work: offer the CPU */
     }
     if (low) pmm_free_frame(low);
     uint32_t bad = 0, checked = 0;
@@ -226,10 +241,11 @@ static void cmd_highmemtest(const char* args) {
         head = next;
         if ((checked & 4095) == 0) task_yield();
     }
-    kprintf("highmemtest: %u of %u HIGHMEM frames (%u MiB) filled, %u verified, %u bad, "
-            "in %u ms: %s\n", n, mgr, (n * 4) / 1024, checked, bad,
+    kprintf("highmemtest: %u of %u %s frames (%u MiB, highest at %u MiB) filled, %u verified, %u bad, "
+            "in %u ms: %s\n", n, mgr, all ? "free" : "HIGHMEM", (n * 4) / 1024,
+            (unsigned)(top >> 20), checked, bad,
             (unsigned)(timer_ticks_ms() - t0),
             (bad == 0 && checked == n && n > 0) ? "PASS" : "FAIL");
 }
-SHELL_CMD(highmemtest) = { "highmemtest", "", "fill and verify every HIGHMEM frame (kmap)",
+SHELL_CMD(highmemtest) = { "highmemtest", "[all]", "fill and verify every HIGHMEM frame (kmap)",
                            SHELL_G_TEST, cmd_highmemtest, SHELL_P_ADMIN };

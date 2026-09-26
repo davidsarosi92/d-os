@@ -46,6 +46,40 @@ void uart_early_puts(const char* s);
  * it can go straight into TTBR0_EL1.  Lives in .bss (zeroed by boot.S). */
 static uint64_t l1_table[512] __attribute__((aligned(4096)));
 
+/* §M86 stage 3 — the TTBR1 level-1 table: the kernel's DIRECT MAP of physical
+ * memory at KERNEL_DIRECT_MAP_BASE (hal_api.h).  Entry i maps PA [i GiB,
+ * i+1 GiB).  Filled for the first 4 GiB here (so phys_to_virt works from the
+ * first allocation) and extended to the end of RAM by hal_extend_identity_map
+ * once the PMM knows where that is.  Shared by every CPU and never switched:
+ * TTBR1 is the one half of the address space no process owns. */
+static uint64_t l1_ttbr1[512] __attribute__((aligned(4096)));
+
+/* Direct-map block for 1 GiB slot `i`.  Slot 0 is the peripheral window on
+ * `virt` and must stay DEVICE memory here too — a Normal alias of MMIO lets the
+ * CPU speculate into device registers.  UXN: EL0 can never reach TTBR1 (AP=00)
+ * but execute-never says so twice.  NOT PXN: the kernel heap lives here now and
+ * §M67 loads modules into it. */
+static uint64_t dm_block(uint64_t i) {
+    if (i == 0)
+        return (i << 30) | DESC_BLOCK | DESC_AF | DESC_ATTR(ATTR_DEVICE) | (1ULL << 54);
+    return (i << 30) | DESC_BLOCK | DESC_AF | DESC_SH_INNER | DESC_ATTR(ATTR_NORMAL)
+         | (1ULL << 54);
+}
+
+/* Extend the direct map to cover [0, end_phys).  Returns the end actually
+ * covered (capped at the 512 GiB one table can describe).  Blocks are only ever
+ * ADDED to an invalid slot, so no live translation changes and no other CPU can
+ * hold a stale entry for them — the TLBI is for this CPU's walk caches. */
+uint64_t mmu_direct_map_extend(uint64_t end_phys) {
+    const uint64_t cap = 512ULL << 30;
+    if (end_phys > cap) end_phys = cap;
+    uint64_t n = (end_phys + (1ULL << 30) - 1) >> 30;
+    for (uint64_t i = 0; i < n; i++)
+        if (!(l1_ttbr1[i] & DESC_BLOCK)) l1_ttbr1[i] = dm_block(i);
+    __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");
+    return end_phys;
+}
+
 /* Program THIS CPU's stage-1 translation registers from the (already-built)
  * level-1 table and enable the MMU + caches.  The translation table is shared
  * (one identity map for all CPUs), but MAIR/TCR/TTBR0/SCTLR are per-CPU system
@@ -58,8 +92,11 @@ void mmu_enable_this_cpu(void) {
                   | (0xFFULL << (8 * ATTR_NORMAL));
     __asm__ volatile ("msr mair_el1, %0" :: "r"(mair));
 
-    /* TTBR0_EL1 = physical base of the shared level-1 table. */
+    /* TTBR0_EL1 = physical base of the shared level-1 table (the image is
+     * identity-mapped, so its address IS its physical address). */
     __asm__ volatile ("msr ttbr0_el1, %0" :: "r"((uint64_t)(uintptr_t)l1_table));
+    /* TTBR1_EL1 = the direct map (§M86 stage 3). */
+    __asm__ volatile ("msr ttbr1_el1, %0" :: "r"((uint64_t)(uintptr_t)l1_ttbr1));
 
     /* TCR_EL1:
      *   T0SZ  = 25   → 39-bit VA (level-1 start, 1 GiB blocks)
@@ -67,14 +104,24 @@ void mmu_enable_this_cpu(void) {
      *   ORGN0 = 01   → walk memory outer write-back
      *   SH0   = 11   → walk memory inner shareable
      *   TG0   = 00   → 4 KiB granule
-     *   EPD1  = 1    → disable the TTBR1 (upper-half) walks; we use TTBR0 only
+     *   T1SZ  = 25   → the upper half is 39-bit too (§M86 stage 3: the direct
+     *                  map lives there; before, EPD1 disabled it altogether)
+     *   EPD1  = 0    → TTBR1 walks ENABLED
+     *   IRGN1/ORGN1 = 01, SH1 = 11 → same walk attributes as TTBR0
+     *   TG1   = 10   → 4 KiB granule (TG1's encoding differs from TG0's:
+     *                  00 is RESERVED there, and a reserved granule is not an
+     *                  error the CPU reports — the walks just go wrong)
      *   IPS   = 010  → 40-bit intermediate physical address (1 TiB) */
     uint64_t tcr = (25ULL)
                  | (1ULL << 8)
                  | (1ULL << 10)
                  | (3ULL << 12)
                  | (0ULL << 14)
-                 | (1ULL << 23)
+                 | (25ULL << 16)
+                 | (1ULL << 24)
+                 | (1ULL << 26)
+                 | (3ULL << 28)
+                 | (2ULL << 30)
                  | (2ULL << 32);
     __asm__ volatile ("msr tcr_el1, %0" :: "r"(tcr));
 
@@ -117,6 +164,10 @@ void mmu_init(void) {
                     | DESC_BLOCK | DESC_AF | DESC_SH_INNER | DESC_ATTR(ATTR_NORMAL);
     }
 
+    /* The direct map's first 4 GiB, so phys_to_virt works from the very first
+     * allocation; the rest arrives with hal_extend_identity_map. */
+    mmu_direct_map_extend(4ULL << 30);
+
     mmu_enable_this_cpu();
-    uart_early_puts("aarch64: MMU + caches enabled (identity map)\n");
+    uart_early_puts("aarch64: MMU + caches enabled (identity + TTBR1 direct map)\n");
 }

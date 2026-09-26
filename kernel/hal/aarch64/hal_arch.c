@@ -90,13 +90,14 @@ void hal_arch_early_init(void) {
 
 /* ---- identity-map extension (M19.5.1 hook) --------------------------------- */
 
-/* The Phase-A MMU already identity-maps the whole 0..4 GiB window with 1 GiB
- * blocks (device below 0x4000_0000, Normal RAM above), so any physical frame
- * the PMM manages is already mapped.  Just report the requested end back
- * (capped at the 4 GiB we cover). */
+/* §M86 stage 3 — the kernel reaches RAM through the TTBR1 direct map
+ * (mmu.c), which one level-1 table extends to 512 GiB.  This used to report
+ * the TTBR0 identity window's 4 GiB, so on `virt` (RAM from 1 GiB) at most
+ * ~3 GiB was ever managed; the "identity" in the name is historical — what the
+ * PMM needs to know is how far `phys_to_virt` reaches. */
+uint64_t mmu_direct_map_extend(uint64_t end_phys);
 uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
-    const uintptr_t covered = 0x100000000ULL;   /* 4 GiB */
-    return end_phys < covered ? end_phys : covered;
+    return (uintptr_t)mmu_direct_map_extend((uint64_t)end_phys);
 }
 
 /* ---- syscall epilogue (EL0 userspace) -------------------------------------- */

@@ -233,7 +233,9 @@ if [ "$ARCH" = "aarch64" ]; then
     #   in scripts/dos-shell-test.py deliberately — §M48 found a whole class of
     #   bug in the gap between the path the tests take and the path a person
     #   takes, and an absent NIC is exactly that gap.
-    QEMU_MACHINE="-M virt,gic-version=2 -cpu cortex-a72 -smp 2 -m 256M \
+    A64_SMP=${DOS_SMP:-2}
+    A64_MEM=${DOS_MEM:-256M}
+    QEMU_MACHINE="-M virt,gic-version=2 -cpu cortex-a72 -smp $A64_SMP -m $A64_MEM \
         -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
         -serial mon:stdio -rtc base=localtime \
         -device virtio-gpu-device -device virtio-keyboard-device \
@@ -266,12 +268,18 @@ if [ "$ARCH" = "aarch64" ]; then
     # M21 Phase H: QEMU's direct-ELF `-kernel` entry passes no DTB pointer (x0=0)
     #   and places no DTB in RAM, so load one at a fixed address (0x48000000) for
     #   the kernel's device-tree parser to discover RAM size + CPU count.  The
-    #   kernel falls back to built-in defaults if it is absent.  Generate the DTB
-    #   for THIS machine config once with:
-    #     qemu-system-aarch64 -M virt,gic-version=2 -cpu cortex-a72 -smp 2 \
-    #        -m 256M -machine dumpdtb=build/aarch64/virt.dtb
+    #   kernel falls back to built-in defaults if it is absent.
+    # §M86 stage 3 (2026-09-26): the tree is DUMPED EVERY RUN from the same
+    #   -smp/-m this run uses.  It used to be generated once, by hand, for
+    #   256M/-smp 2 — so changing either here changed the machine and NOT what
+    #   the kernel was told about it.  DOS_MEM / DOS_SMP set both at once.
     DTB="build/aarch64/virt.dtb"
     DTB_ARGS=""
+    if command -v "$QEMU" >/dev/null 2>&1 && \
+       "$QEMU" -M "virt,gic-version=2,dumpdtb=$DTB" -cpu cortex-a72 \
+               -smp "$A64_SMP" -m "$A64_MEM" -display none >/dev/null 2>&1; then
+        :
+    fi
     if [ -f "$DTB" ]; then
         DTB_ARGS="-device loader,file=$DTB,addr=0x48000000,force-raw=on"
     fi

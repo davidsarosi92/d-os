@@ -26,6 +26,7 @@
 #include "mouse.h"
 #include "printf.h"
 #include "task.h"
+#include "hal_api.h"   /* kptr_phys — device addresses are PHYSICAL (§M86) */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -231,7 +232,7 @@ static void dispatch_event(struct virtio_input_event* e) {
 
 /* ---- virtqueue receive-buffer posting -------------------------------------- */
 static void post_buffer(struct in_dev* d, int i) {
-    d->desc[i].addr  = (uint64_t)(uintptr_t)&d->ev[i];
+    d->desc[i].addr  = kptr_phys(&d->ev[i]);
     d->desc[i].len   = sizeof d->ev[i];
     d->desc[i].flags = VRING_DESC_F_WRITE;          /* device writes the event */
     d->desc[i].next  = 0;
@@ -287,9 +288,9 @@ static int input_dev_init(struct in_dev* d, uintptr_t base) {
     if (nmax == 0) return -1;
     d->qsz = (nmax < QSIZE) ? (uint16_t)nmax : QSIZE; /* clamp to the device's ring */
     w32(base, R_QUEUENUM, d->qsz);
-    uint64_t dd = (uint64_t)(uintptr_t)d->desc;
-    uint64_t aa = (uint64_t)(uintptr_t)&d->avail;
-    uint64_t uu = (uint64_t)(uintptr_t)&d->used;
+    uint64_t dd = kptr_phys(d->desc);
+    uint64_t aa = kptr_phys(&d->avail);
+    uint64_t uu = kptr_phys(&d->used);
     w32(base, R_QDESC_LO, (uint32_t)dd); w32(base, R_QDESC_HI, (uint32_t)(dd >> 32));
     w32(base, R_QDRV_LO,  (uint32_t)aa); w32(base, R_QDRV_HI,  (uint32_t)(aa >> 32));
     w32(base, R_QDEV_LO,  (uint32_t)uu); w32(base, R_QDEV_HI,  (uint32_t)(uu >> 32));

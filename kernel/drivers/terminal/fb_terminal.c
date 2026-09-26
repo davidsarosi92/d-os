@@ -30,6 +30,7 @@
 #include "console.h"
 #include "module.h"
 #include "fb_present.h"                           /* map + flush backend */
+#include "hal_api.h"                              /* phys_to_virt */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -518,7 +519,9 @@ int fb_term_init_direct(uint64_t phys, uint32_t width, uint32_t height,
                         uint32_t pitch_bytes) {
     if (fb_present_map(phys, (uint64_t)pitch_bytes * height) != 0) return -1;
 
-    fb_pixels      = (volatile uint32_t*)(uintptr_t)phys;
+    /* RAM-backed (the only caller allocates it from the PMM), so it is reached
+     * through the direct map — on aarch64 that is TTBR1 since §M86 stage 3. */
+    fb_pixels      = (volatile uint32_t*)phys_to_virt(phys);
     fb_phys_base   = (uint32_t)phys;
     fb_width       = width;
     fb_height      = height;
