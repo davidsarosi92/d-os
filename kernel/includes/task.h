@@ -124,6 +124,9 @@ struct task {
     int      ppid;
     int      exit_code;
     int      reap_owned;
+    /* 2026-09-26 — set under master_lock by the ONE task_reap that claims this
+     * struct; any other reaper then leaves it alone (see task_reap). */
+    int      reaping;
     /* Process-model policy: when a task dies it takes its subtree down (its
      * children are killed), UNLESS the child set survives_parent — a daemon /
      * detached task (task_spawn_detached) that outlives its launcher and is
@@ -491,6 +494,12 @@ void* task_start_arg(void);
 /* task_spawn_arg + an explicit parent pid (>= 0), or the caller (< 0).  Lets a
  * GUI launcher parent a spawned package to the long-lived desktop task rather
  * than the transient app-host that ran the launch fn. */
+/* Build a task that does NOT run until task_release(t): for a creator (fork,
+ * clone) that still has fields to copy onto it.  Nothing set after a plain
+ * spawn is safe, because the task may already be running. */
+struct task* task_spawn_arg_held(const char* name, void (*entry)(void), void* arg);
+void         task_release(struct task* t);
+
 struct task* task_spawn_arg_under(const char* name, void (*entry)(void),
                                   void* arg, int ppid);
 

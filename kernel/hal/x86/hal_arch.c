@@ -232,3 +232,32 @@ int hal_nvram_write(unsigned idx, uint8_t val) {
     outb(CMOS_DATA_PORT, val);
     return 1;
 }
+
+/* ---------------------------------------------------------------------------
+ * §M86 — does this CPU have PAE, and how far can physical memory reach?
+ *
+ * PAE is CPUID.1:EDX bit 6.  The physical-address width comes from
+ * CPUID.80000008:EAX[7:0] when the CPU reports it, else 36 bits — PAE's
+ * original width.  Without PAE the answer is 4 GiB, whatever RAM exists.
+ * pmm_init asks this BEFORE paging is on (it sizes its metadata), and
+ * vmm_init asks the same question, so the two cannot disagree.
+ * ------------------------------------------------------------------------- */
+static void cpuid4(uint32_t leaf, uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d) {
+    __asm__ volatile ("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(0u));
+}
+int x86_cpu_has_pae(void) {
+    uint32_t a, b, c, d;
+    cpuid4(1, &a, &b, &c, &d);
+    return (d >> 6) & 1u;
+}
+uint64_t hal_phys_limit(void) {
+    if (!x86_cpu_has_pae()) return 1ull << 32;
+    uint32_t a, b, c, d, bits = 36;
+    cpuid4(0x80000000u, &a, &b, &c, &d);
+    if (a >= 0x80000008u) {
+        cpuid4(0x80000008u, &a, &b, &c, &d);
+        if ((a & 0xFF) >= 32 && (a & 0xFF) <= 52) bits = a & 0xFF;
+    }
+    return 1ull << bits;
+}
+

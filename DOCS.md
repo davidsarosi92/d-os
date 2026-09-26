@@ -13886,8 +13886,72 @@ threads, ring 3, `diskstorm`, `killstorm`, `highmemtest`, both `logouttest`
 variants) green on all three arches with `!! KSTACK`, `!! KTIMER` and
 `PIT STARVED` absent.
 
+### 4.96 i386 PAE — physical memory above 4 GiB (§M86 stage 2, 2026-09-26)
+
+32-bit page tables carry 32-bit frame numbers, so until now nothing above the
+4 GiB physical line could exist for i386 however its identity map was grown.
+**PAE is a second page-table FORMAT behind the same VMM interface**, chosen once
+at `vmm_init` from CPUID.1:EDX[6]; the classic 1024-entry format stays for CPUs
+without it (verified with `-cpu qemu32,-pae`).
+
+- **Accessors, not two copies of the VMM.** `kernel/hal/x86/vmm.c` reaches a
+  table only through `npde()/npte()/pde_shift()`, `pde_get/pde_set`,
+  `pte_get/pte_set` and `kroot()`; map, unmap, protect, clone, destroy, the COW
+  fault and the page walk are written once and serve both formats.
+- **PAE layout:** a 4-entry PDPT (32-byte aligned, below 4 GiB; its entries may
+  carry ONLY the present bit — RW/US there are reserved and #GP the load of
+  CR3), four 512-entry page directories, 2 MiB leaves for the identity map and
+  512-entry page tables.  An address space shares PDPT[0] (the kernel's
+  identity + kmap window) and gets private copies of PDs 1-3.  CR4 gains PAE
+  (`vmm_cr4_bits()`), and APs take the same bits through the trampoline's
+  `ap_info.cr4_or` — an AP that loaded a PAE root without CR4.PAE would read the
+  PDPT as a page directory.
+- **Physical addresses are 64-bit everywhere they travel:** `vmm_map`,
+  `vmm_space_map`, `vmm_walk_fn`, `vmm_frame_share_count`, `pmm_phys_t`.
+  `hal_phys_limit()` (4 GiB without PAE, CPUID 0x80000008's width with it) caps
+  what the PMM takes from the firmware map, so a non-PAE CPU on a large machine
+  never receives a frame it cannot map.
+- **Frames above 4 GiB are seeded AFTER paging is on** (`pmm_seed_deferred`):
+  the buddy links live IN free frames, reached through kmap, and kmap needs the
+  page tables `vmm_init` builds.
+
+**Four defects found on the way, none in the format itself:**
+1. **The x86_64 DMA drivers dereferenced physical addresses as pointers**
+   (`ac97`, `hda`, `virtio-net`, `xhci`'s contexts).  Correct only while the
+   frame fell inside the low identity window; at `-m 2G` the allocator handed
+   ac97 a DMA32 frame above it and init faulted (§M33 contained it — the
+   quarantine report is how it was seen).  All go through `phys_to_virt` now,
+   which compiles to nothing on i386.
+2. **The PMM-GUARD compared at pointer width**, so a free frame at 0x203bad000
+   "landed in" the kernel image at 0x3bad000 — a false alarm per free, noise of
+   exactly the kind that hides the real report.
+3. **`highmemtest` chained its frames through a 32-bit ADDRESS word**, which
+   truncates above 4 GiB: the first run "verified" 520 196 of 1 836 000 frames
+   and freed frames it had never allocated.  It chains frame numbers now.
+4. **`ac97: drain timeout` after every `play`** (older than this work — the
+   same on HEAD): BCIS is one status bit, so two buffers finishing before the
+   ISR ran counted once and `submitted - completed` never reached zero.  The
+   sound was exact (captured 2 x 300.0 ms, 443.3 Hz), only the 585 ms wait was
+   wrong.  A halted engine (DCH) is now the authoritative "nothing
+   outstanding" and resynchronises the count.
+
+**Verified:** i386 `-m 8G -smp 4` with PAE — 8043 of 8121 MiB free,
+`highmemtest` 1 836 000 of 1 836 000 HIGHMEM frames (7171 MiB, most above
+4 GiB) filled and verified, 0 bad, free count unchanged afterwards; `memcheck`,
+`forktest`, `excstorm`, `musltest`, `pipetest`, `pthreadtest`, `diskstorm`
+green; no fault, NMI, guard or starvation line.  i386 `-m 1G` (PAE, the
+ordinary machine) and `-m 3G -cpu qemu32,-pae` (classic format: 2051 MiB of
+HIGHMEM, every frame verified) green; x86_64 `-m 2G` with USB, audio, network,
+musl and `excstorm` green; aarch64 builds.  `task_reap` also claims its task
+under the master lock now, so two reapers finding one DEAD task cannot both
+work on it (a GUI sweep reaping fork children was the one that did).
+
+**Not done:** NX (PTE bit 63, which PAE makes possible and which is W^X for
+§M67's modules) — the format carries it and nothing sets it yet.
+
 ## 8. Change log
 
+- **2026-09-26 — §M86 stage 2: i386 PAE, physical memory above 4 GiB (8 GiB verified); x86_64 DMA drivers stop dereferencing physical addresses; ac97 drain no longer times out after every sound; task_reap claims under the lock (DOCS §4.96).**
 - **2026-09-26 — Concurrent processes: per-task excursion state, a race-free atomic COW table, O(1) buddy removal, spinners answer shootdowns, a private ringtest space, a page_alloc_below leak (DOCS §4.95).**
 - **2026-09-26 — §M86 stage 1: i386 manages all RAM up to 4 GiB (ZONE_HIGHMEM + kmap) (DOCS §4.94).**
 - **2026-09-25 — Block cache 16× larger in half the memory (packed + hashed); `blkstormtest` proves the storm detector on the REAL storm; HDA no longer goes silent for good after an underrun (NEXT.md #5, #7, #8b).**

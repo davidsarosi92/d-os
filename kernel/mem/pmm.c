@@ -185,8 +185,13 @@ static inline void link_store_at(pmm_phys_t phys, int slot, pmm_phys_t next) {
      * silent even under forced early order-6..8 allocation sweeps — the carve
      * pass provably excludes the image, so the buddy is exonerated.  The guard
      * remains as a regression detector.) */
-    uintptr_t ks = (uintptr_t)kernel_start, ke = (uintptr_t)kernel_end;
-    if ((uintptr_t)phys >= ks && (uintptr_t)phys < ke) {
+    /* Compared at PHYSICAL width (2026-09-26).  Casting phys to uintptr_t
+     * truncated a PAE frame above 4 GiB on i386, so 0x203bad000 "landed in"
+     * the image at 0x3bad000 — a false alarm on every such free, and noise
+     * of exactly the kind that hides the real one this guard exists for. */
+    pmm_phys_t ks = (pmm_phys_t)(uintptr_t)kernel_start,
+               ke = (pmm_phys_t)(uintptr_t)kernel_end;
+    if (phys >= ks && phys < ke) {
         kprintf("PMM-GUARD: link_store 0x%llx INTO kernel image [0x%x,0x%x) "
                 "pfn=%u caller=%p\n", (unsigned long long)phys, (uint32_t)ks,
                 (uint32_t)ke, (unsigned)(phys >> PMM_FRAME_SHIFT),
@@ -332,6 +337,61 @@ static uintptr_t bootmem_reserve(const struct mboot_info* mbi,
     return 0;
 }
 
+/* Cover every usable frame in [from, to) with the largest aligned blocks that
+ * fit, zone by zone (see pass 3 in pmm_init).  Returns the frames freed. */
+static uint32_t pmm_deferred_from;
+static uint32_t seed_range(uint32_t from, uint32_t to) {
+    uint32_t freed = 0;
+    uint32_t pfn = from;
+    while (pfn < to) {
+        if (page_state[pfn] != PS_USED) { pfn++; continue; }
+
+        int zi = zone_of_pfn(pfn);
+        if (zi < 0) { pfn++; continue; }
+        struct zone* z = &zones[zi];
+
+        uint32_t run_end = pfn;
+        while (run_end < z->end_pfn && run_end < to && page_state[run_end] == PS_USED)
+            run_end++;
+
+        while (pfn < run_end) {
+            /* Largest order that is both alignment-legal at pfn and fits. */
+            int order = BUDDY_MAX_ORDER;
+            while (order > 0) {
+                uint32_t sz = 1u << order;
+                if ((pfn & (sz - 1)) == 0 && pfn + sz <= run_end) break;
+                order--;
+            }
+            uint32_t sz = 1u << order;
+            uint32_t fl = spin_lock_irqsave(&z->lock);
+            zone_push(z, pfn, order);
+            z->free_frames += sz;
+            z->managed     += sz;
+            spin_unlock_irqrestore(&z->lock, fl);
+            freed += sz;
+            pfn += sz;
+        }
+    }
+    return freed;
+}
+
+/* §M86 — seed the frames pmm_init could not reach (see there).  Called once,
+ * right after vmm_init; a no-op wherever nothing was deferred. */
+void pmm_seed_deferred(void) {
+    if (!page_state || pmm_deferred_from >= pmm_nr_frames) return;
+    uint32_t n = seed_range(pmm_deferred_from, pmm_nr_frames);
+    pmm_deferred_from = pmm_nr_frames;
+    kprintf("pmm: %u MiB above 4 GiB seeded through kmap — HIGHMEM m=%u f=%u\n",
+            (n * 4) / 1024, zones[ZONE_HIGHMEM].managed,
+            zones[ZONE_HIGHMEM].free_frames);
+}
+
+/* §M86 — the physical-address ceiling the paging hardware can express.  The
+ * arch answers (i386: 4 GiB without PAE, 36+ bits with); the default is
+ * "no limit beyond the metadata cap". */
+uint64_t hal_phys_limit(void) __attribute__((weak));
+uint64_t hal_phys_limit(void) { return ~0ull; }
+
 void pmm_init(void) {
     const struct mboot_info* mbi = mboot_get_info();
     if (!mbi || (mbi->flags & MBI_FLAG_MMAP) == 0 || mbi->mmap_length == 0) {
@@ -359,9 +419,9 @@ void pmm_init(void) {
                 /* Clamp to the sanity ceiling — a bogus map must not size
                  * gigabytes of metadata.  This is the ONLY fixed limit left. */
                 uint64_t cap = (uint64_t)BUDDY_FRAME_HARD_CAP * PMM_FRAME_SIZE;
-                /* §M86 — a 32-bit physical address cannot name a frame past
-                 * 4 GiB (that is PAE's job, a different page-table format). */
-                if (sizeof(pmm_phys_t) == 4 && cap > 0xFFFFF000ull) cap = 0xFFFFF000ull;
+                /* §M86 — what the paging hardware can express: i386 without
+                 * PAE stops at 4 GiB whatever RAM exists. */
+                if (cap > hal_phys_limit()) cap = hal_phys_limit();
                 if (hi > cap) hi = cap;
                 if (hi > max_phys) max_phys = hi;
             }
@@ -519,34 +579,14 @@ void pmm_init(void) {
      * straddling one (the coalescing path refuses those merges for the same
      * reason).  Frames in a run are already PS_USED from pass 1, so only the
      * block head needs stamping, and zone_push does that. */
-    uint32_t initially_free = 0;
-    uint32_t pfn = 0;
-    while (pfn < pmm_nr_frames) {
-        if (page_state[pfn] != PS_USED) { pfn++; continue; }
-
-        int zi = zone_of_pfn(pfn);
-        if (zi < 0) { pfn++; continue; }
-        struct zone* z = &zones[zi];
-
-        uint32_t run_end = pfn;
-        while (run_end < z->end_pfn && page_state[run_end] == PS_USED) run_end++;
-
-        while (pfn < run_end) {
-            /* Largest order that is both alignment-legal at pfn and fits. */
-            int order = BUDDY_MAX_ORDER;
-            while (order > 0) {
-                uint32_t sz = 1u << order;
-                if ((pfn & (sz - 1)) == 0 && pfn + sz <= run_end) break;
-                order--;
-            }
-            uint32_t sz = 1u << order;
-            zone_push(z, pfn, order);
-            z->free_frames += sz;
-            z->managed     += sz;
-            initially_free += sz;
-            pfn += sz;
-        }
-    }
+    /* §M86 — on a 32-bit kernel, a frame at or above 4 GiB cannot be reached
+     * before paging is on (seeding writes a link INTO each free block, and a
+     * 32-bit pointer cannot name it).  Those are seeded by pmm_seed_deferred()
+     * right after vmm_init, through kmap. */
+    uint32_t seed_to = pmm_nr_frames;
+    if (sizeof(void*) == 4 && seed_to > (1u << 20)) seed_to = 1u << 20;
+    uint32_t initially_free = seed_range(0, seed_to);
+    pmm_deferred_from = seed_to;
 
     kprintf("pmm: buddy ready — DMA m=%u f=%u, DMA32 m=%u f=%u, NORMAL m=%u f=%u, "
             "HIGHMEM m=%u f=%u (%u MiB total free)\n",

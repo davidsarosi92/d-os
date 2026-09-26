@@ -1,44 +1,33 @@
 /* =============================================================================
- * vmm.c — enable paging and manage 4 KiB page mappings.
+ * vmm.c — enable paging and manage 4 KiB page mappings (i386).
  *
- * The initial state after `vmm_init` is:
+ * TWO PAGE-TABLE FORMATS, CHOSEN AT BOOT (§M86 stage 2, 2026-09-26).
  *
- *   - CR4.PSE = 1  (4 MiB pages enabled)
- *   - CR3 points at `kernel_pd` (the single kernel page directory)
- *   - CR0.PG = 1
- *   - The first IDENTITY_MAP_MIB (256) megabytes of virtual address space
- *     are identity-mapped via 4 MiB PSE PDEs: virt == phys, RW, supervisor.
+ *   - classic 32-bit paging: a 1024-entry page directory, 4 MiB PSE pages
+ *     for the identity map, 1024-entry page tables, 32-bit entries.  Physical
+ *     addresses stop at 4 GiB.
+ *   - PAE: a 4-entry PDPT → four 512-entry page directories → 512-entry page
+ *     tables, 64-bit entries, 2 MiB pages for the identity map.  Physical
+ *     addresses reach past 4 GiB (36+ bits), which is the whole point.
  *
- * Because our kernel image, stack, heap, and any physical memory the PMM
- * hands us today all live below 1 GiB, every pointer we already hold
- * keeps working the instant paging turns on — no pointer rewriting, no
- * higher-half magic, no relocation.  That simplicity is the whole reason
- * for the 1 GiB identity map; later milestones may swap this out for a
- * higher-half kernel mapping when we want to reclaim the low virtual
- * addresses for user space.
+ * PAE is used whenever the CPU has it (CPUID.1:EDX bit 6 — every x86 since the
+ * Pentium Pro); the classic format stays for the CPUs that do not, and is
+ * reachable on purpose with `qemu -cpu qemu32,-pae` so it keeps being tested.
+ * The VIRTUAL layout is identical in both, and every function below works on
+ * both through one abstraction: a flat "PDE index" (1024 of 4 MiB, or 2048 of
+ * 2 MiB), with the entry width hidden in pde_get/pte_get.
  *
- * -------------------- PDE / PTE bit layout (§4.3) -------------------------
- *   bit 0    P   — Present
- *   bit 1    RW  — 0 = read-only, 1 = read/write
- *   bit 2    US  — 0 = supervisor only, 1 = user accessible
- *   bit 3    PWT — Write-through
- *   bit 4    PCD — Cache disabled
- *   bit 5    A   — Accessed (CPU sets)
- *   bit 6    D   — Dirty (PTE only; CPU sets)
- *   bit 7    PS  — Page Size.  In a PDE: 1 = this entry maps a 4 MiB page
- *                  directly.  In a PTE: ignored.
- *   bit 8    G   — Global (sticky TLB entry across CR3 reloads)
- *   bits 9..11   Available for OS use
- *   bits 12..31  Page frame / page-table base address (4 KiB aligned)
+ *   0 .. 1020 MiB     identity map (kernel image, heap, page tables, DMA)
+ *   1020 .. 1024 MiB  the kmap window (kmap.h) — highmem is reached here
+ *   1 GiB .. 4 GiB    user space, plus kernel MMIO mappings (LAPIC, framebuffer)
+ *                     that vmm_map puts in the kernel's tables and every new
+ *                     address space copies by value
  *
- * For 4 MiB PSE PDEs the base is aligned to 4 MiB, so bits 12..21 must be
- * zero and bits 22..31 hold the 4 MiB page base.
+ * Every page table and directory lives in low (identity-mapped) memory, so
+ * the kernel always reaches them directly; only USER PAGES may be highmem.
  *
- * -------------------- Address breakdown ----------------------------------
- *   virt[31:22]  Page directory index (10 bits → 1024 PDEs)
- *   virt[21:12]  Page table index    (10 bits → 1024 PTEs)
- *   virt[11:0]   Offset inside the 4 KiB page
- * ========================================================================= */
+ * Paging reference: Intel SDM Vol 3 §4.3 (32-bit), §4.4 (PAE).
+ * ============================================================================= */
 
 #include "vmm.h"
 #include "hal_api.h"   /* §M51 — hal_tlb_shootdown */
@@ -48,97 +37,103 @@
 #include "printf.h"
 #include "kmalloc.h"
 #include "task.h"
+#include "percpu.h"
+#include "lock.h"
 #include <stdint.h>
 #include <stddef.h>
 
 /* ------------------------------------------------------------------------- */
-/* Bit helpers and macros.                                                   */
+/* Entry bits — the low 12 are the same in both formats.                     */
 /* ------------------------------------------------------------------------- */
 
-#define PDE_P   0x001
-#define PDE_RW  0x002
-#define PDE_US  0x004
-#define PDE_PS  0x080                   /* 4 MiB page when set in a PDE */
+#define E_P    0x001ull
+#define E_RW   0x002ull
+#define E_US   0x004ull
+#define E_PS   0x080ull                        /* large page (PDE only) */
+#define E_OS   (0x400ull | 0x800ull)           /* VMM_SHARED | VMM_COW  */
 
-#define PTE_P   0x001
-#define PTE_RW  0x002
-#define PTE_US  0x004
+#define PAGE_MASK32   0xFFFFF000ull
+#define PAGE_MASK64   0x000FFFFFFFFFF000ull    /* bits 12..51 */
+#define LARGE_MASK32  0xFFC00000ull            /* 4 MiB PSE base */
+#define LARGE_MASK64  0x000FFFFFFFE00000ull    /* 2 MiB PAE base */
 
-#define PAGE_MASK   0xFFFFF000u         /* keep base, drop flags (4 KiB aligned) */
-#define PSE_MASK    0xFFC00000u         /* 4 MiB page base mask */
-
-#define PD_IDX(v)  (((v) >> 22) & 0x3FF)
-#define PT_IDX(v)  (((v) >> 12) & 0x3FF)
-
-/* §M48 — the identity map runs right up to where user space begins.
- *
- * It used to stop at 256 MiB "because we have no pressure for more", which
- * left three quarters of the reachable window unused: `vmm_user_base()` is
- * 1 GiB, so everything below that is the kernel's to map and NOTHING can
- * collide with it.  The old cap was the reason a 512 MiB i386 box managed only
- * 234 MiB, and the reason a ported library that allocates generously (Mesa)
- * ran out of memory on a machine that had plenty.
- *
- * 1 GiB / 4 MiB = 256 PSE PDEs, a quarter of the page directory; user mappings
- * start at PDE 256 and are untouched.  Going FURTHER is not possible without
- * moving user space, which the small code model forbids — past this point the
- * i386 answer is kmap or PAE, not a bigger constant. */
-/* §M86 — 1020, not 1024: the TOP 4 MiB of the kernel's window is the kmap
- * window (below), which is how RAM past this line is reached at all.  Giving
- * up 4 MiB of direct map buys access to everything up to 4 GiB. */
+/* §M48 / §M86 — the identity map runs to 1020 MiB; the top 4 MiB of the
+ * kernel's first gigabyte is the kmap window. */
 #define IDENTITY_MAP_MIB 1020
-#define IDENTITY_PDES    (IDENTITY_MAP_MIB / 4)   /* 4 MiB per PSE PDE */
+#define KMAP_BASE        0x3FC00000u
+#define KMAP_PER_CPU     8
+#define KMAP_CPUS        64                     /* 512 slots: one PAE PT */
 
-/* §M86 — THE kmap WINDOW (kmap.h).  PDE 255 = VA 0x3FC00000..0x3FFFFFFF, still
- * below user space (1 GiB), so it is part of the kernel snapshot every address
- * space copies and one page table serves them all.  Each CPU owns KMAP_PER_CPU
- * consecutive slots used as a stack (nested maps unmap in reverse); the slots
- * occupy the LOW half of the table, and the high half stays available to
- * vmm_map (ACPI maps tables that sit at the very top of a 1 GiB machine's RAM
- * there, identity-style). */
-#define KMAP_PDE        IDENTITY_PDES
-#define KMAP_BASE       ((uint32_t)KMAP_PDE << 22)
-#define KMAP_PER_CPU    8
-#define KMAP_CPUS       64
-static uint32_t kmap_pt[1024] __attribute__((aligned(4096)));
-static int      kmap_depth[KMAP_CPUS];
-static int      kmap_paging_on;
+static int g_pae;                               /* chosen once, in vmm_init */
 
-/* ------------------------------------------------------------------------- */
-/* Page directory.  Must be 4 KiB aligned — the low 12 bits of CR3 are
- * control flags, not part of the address.                                   */
-/* ------------------------------------------------------------------------- */
-static uint32_t kernel_pd[1024] __attribute__((aligned(4096)));
+/* classic format */
+static uint32_t kernel_pd[1024]  __attribute__((aligned(4096)));
+static uint32_t kmap_pt32[1024]  __attribute__((aligned(4096)));
+/* PAE format */
+static uint64_t k_pdpt[4]        __attribute__((aligned(32)));
+static uint64_t k_pd[4][512]     __attribute__((aligned(4096)));
+static uint64_t kmap_pt64[512]   __attribute__((aligned(4096)));
 
-/* Phys address of the page directory — needed by the AP boot trampoline
- * (M18) so each AP can load CR3 before enabling paging.  The kernel is
- * identity-mapped, so virt = phys for the array itself.  Returned as
- * uintptr_t for arch-API symmetry with the x86_64 vmm.c; the SMP code
- * truncates to uint32_t when patching the AP info area (i386 PD is in
- * the low 4 GiB by construction). */
-uintptr_t vmm_kernel_pd_phys(void) { return (uintptr_t)&kernel_pd[0]; }
+static int kmap_depth[KMAP_CPUS];
+static int kmap_paging_on;
 
 /* ------------------------------------------------------------------------- */
-/* Low-level helpers — tiny inline asm wrappers to read/write CRx and
- * invalidate a single TLB entry.  Keeping them `static inline` lets the
- * compiler fold them into callers while still documenting each access.    */
+/* Format-neutral accessors.                                                 */
+/* ------------------------------------------------------------------------- */
+
+static inline uint32_t npde(void)     { return g_pae ? 2048u : 1024u; }
+static inline uint32_t npte(void)     { return g_pae ? 512u  : 1024u; }
+static inline uint32_t pde_shift(void){ return g_pae ? 21u   : 22u;   }
+static inline uint64_t addr_mask(void){ return g_pae ? PAGE_MASK64 : PAGE_MASK32; }
+static inline uint64_t large_mask(void){ return g_pae ? LARGE_MASK64 : LARGE_MASK32; }
+static inline uint32_t pde_index(uint32_t va) { return va >> pde_shift(); }
+static inline uint32_t pte_index(uint32_t va) { return (va >> 12) & (npte() - 1); }
+
+/* A "root" is the thing CR3 names: the page directory (classic) or the PDPT
+ * (PAE).  Both are reachable through the identity map. */
+static inline void* kroot(void) { return g_pae ? (void*)k_pdpt : (void*)kernel_pd; }
+static inline uint32_t kroot_phys(void) { return (uint32_t)(uintptr_t)kroot(); }
+
+static inline uint64_t* pae_pd(void* root, uint32_t gi) {
+    uint64_t pdpte = ((uint64_t*)root)[gi >> 9];
+    return (uint64_t*)(uintptr_t)(pdpte & PAGE_MASK64);
+}
+static inline uint64_t pde_get(void* root, uint32_t gi) {
+    if (g_pae) return pae_pd(root, gi)[gi & 511];
+    return ((uint32_t*)root)[gi];
+}
+static inline void pde_set(void* root, uint32_t gi, uint64_t v) {
+    if (g_pae) pae_pd(root, gi)[gi & 511] = v;
+    else       ((uint32_t*)root)[gi] = (uint32_t)v;
+}
+static inline uint64_t pte_get(uint64_t pt, uint32_t j) {
+    if (g_pae) return ((uint64_t*)(uintptr_t)pt)[j];
+    return ((uint32_t*)(uintptr_t)pt)[j];
+}
+static inline void pte_set(uint64_t pt, uint32_t j, uint64_t v) {
+    if (g_pae) ((uint64_t*)(uintptr_t)pt)[j] = v;
+    else       ((uint32_t*)(uintptr_t)pt)[j] = (uint32_t)v;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Low-level helpers.                                                        */
 /* ------------------------------------------------------------------------- */
 
 static inline void invlpg(uint32_t virt) {
     __asm__ volatile ("invlpg (%0)" : : "r"(virt) : "memory");
 }
-
-static inline void load_cr3(uint32_t pd_phys) {
-    __asm__ volatile ("mov %0, %%cr3" : : "r"(pd_phys) : "memory");
+static inline void load_cr3(uint32_t root_phys) {
+    __asm__ volatile ("mov %0, %%cr3" : : "r"(root_phys) : "memory");
 }
-
+static inline uint32_t read_cr3(void) {
+    uint32_t v; __asm__ volatile ("mov %%cr3, %0" : "=r"(v)); return v;
+}
 static inline uint32_t read_cr0(void) {
     uint32_t v; __asm__ volatile ("mov %%cr0, %0" : "=r"(v)); return v;
 }
 static inline void write_cr0(uint32_t v) {
     __asm__ volatile ("mov %0, %%cr0" : : "r"(v));
 }
-
 static inline uint32_t read_cr4(void) {
     uint32_t v; __asm__ volatile ("mov %%cr4, %0" : "=r"(v)); return v;
 }
@@ -146,213 +141,181 @@ static inline void write_cr4(uint32_t v) {
     __asm__ volatile ("mov %0, %%cr4" : : "r"(v));
 }
 
+/* Physical address of the kernel's root table — the AP boot trampoline loads
+ * it into CR3 (M18).  With PAE that is the PDPT, 32-byte aligned and in low
+ * memory, which is what CR3 requires. */
+uintptr_t vmm_kernel_pd_phys(void) { return (uintptr_t)kroot_phys(); }
+
+/* The CR4 bits an AP must set before it enables paging: PSE always (the
+ * classic identity map uses it; PAE ignores it), PAE when the BSP chose it —
+ * an AP that walked a PDPT as a page directory would be lost at once. */
+uint32_t vmm_cr4_bits(void) { return 0x10u | (g_pae ? 0x20u : 0u); }
+int      vmm_pae_active(void) { return g_pae; }
+
 /* ------------------------------------------------------------------------- */
 /* Init.                                                                     */
 /* ------------------------------------------------------------------------- */
 
+extern int x86_cpu_has_pae(void);                /* hal_arch.c */
+
 void vmm_init(void) {
-    /* Clear every PDE first so entries we don't explicitly populate stay
-     * "not present" and cause clean page faults if touched. */
-    for (int i = 0; i < 1024; i++) kernel_pd[i] = 0;
+    g_pae = x86_cpu_has_pae();
 
-    /* Identity-map the first IDENTITY_PDES × 4 MiB with PSE PDEs.  Each
-     * entry's base address occupies bits [31:22]; lower bits are flags. */
-    for (int i = 0; i < IDENTITY_PDES; i++) {
-        uint32_t phys = (uint32_t)i << 22;
-        kernel_pd[i] = phys | PDE_P | PDE_RW | PDE_PS;
+    if (!g_pae) {
+        for (int i = 0; i < 1024; i++) kernel_pd[i] = 0;
+        for (int i = 0; i < IDENTITY_MAP_MIB / 4; i++)
+            kernel_pd[i] = ((uint32_t)i << 22) | (uint32_t)(E_P | E_RW | E_PS);
+        for (int i = 0; i < 1024; i++) kmap_pt32[i] = 0;
+        kernel_pd[KMAP_BASE >> 22] = (uint32_t)(uintptr_t)&kmap_pt32[0] | (uint32_t)(E_P | E_RW);
+        write_cr4(read_cr4() | 0x10u);                        /* CR4.PSE */
+    } else {
+        for (int d = 0; d < 4; d++)
+            for (int i = 0; i < 512; i++) k_pd[d][i] = 0;
+        for (int i = 0; i < IDENTITY_MAP_MIB / 2; i++)
+            k_pd[0][i] = ((uint64_t)i << 21) | E_P | E_RW | E_PS;
+        for (int i = 0; i < 512; i++) kmap_pt64[i] = 0;
+        k_pd[0][KMAP_BASE >> 21 & 511] = (uint64_t)(uintptr_t)&kmap_pt64[0] | E_P | E_RW;
+        /* A PDPTE carries ONLY the present bit (and caching bits): RW/US are
+         * RESERVED there, and setting them makes the CR3 load itself #GP. */
+        for (int d = 0; d < 4; d++) k_pdpt[d] = (uint64_t)(uintptr_t)&k_pd[d][0] | E_P;
+        write_cr4(read_cr4() | 0x10u | 0x20u);                /* PSE + PAE */
     }
-    /* §M86 — the kmap window: a regular page table, supervisor-only. */
-    for (int i = 0; i < 1024; i++) kmap_pt[i] = 0;
-    kernel_pd[KMAP_PDE] = (uint32_t)(uintptr_t)&kmap_pt[0] | PDE_P | PDE_RW;
 
-    /* Enable 4 MiB pages in CR4 before switching on paging.  Doing it
-     * the other way round would leave our PDEs misinterpreted. */
-    write_cr4(read_cr4() | (1u << 4));          /* CR4.PSE */
-
-    /* Install the page directory. */
-    load_cr3((uint32_t)(uintptr_t)&kernel_pd[0]);
-
-    /* Flip the master switch.  The instruction right after this one is
-     * fetched from EIP, now translated via kernel_pd.  Because the
-     * current EIP sits in the identity-mapped 1 GiB, execution
-     * continues seamlessly. */
-    write_cr0(read_cr0() | 0x80000000u);        /* CR0.PG */
+    load_cr3(kroot_phys());
+    write_cr0(read_cr0() | 0x80000000u);                      /* CR0.PG */
     kmap_paging_on = 1;
 
-    kprintf("vmm: paging on, identity %d MiB (PSE), pd @ %p\n",
-            IDENTITY_MAP_MIB, (void*)&kernel_pd[0]);
+    kprintf("vmm: paging on (%s), identity %d MiB, root @ %p\n",
+            g_pae ? "PAE, 64-bit entries, 2 MiB pages"
+                  : "classic 32-bit, 4 MiB PSE pages",
+            IDENTITY_MAP_MIB, (void*)(uintptr_t)kroot_phys());
 }
 
 /* ------------------------------------------------------------------------- */
-/* Mapping operations.                                                       */
 /* §M46/security — is the user range [va, va+len) fully mapped AND user-
- * accessible in the CURRENTLY ACTIVE address space (the process's own CR3, which
- * is loaded during a syscall)?  This is the guard a syscall must apply before
- * the kernel dereferences a ring-3 pointer: without it a bad pointer causes a
- * kernel-mode #PF (→ the fault policy halts the box — a package freezing the
- * whole system) or lets a program read/write kernel memory (the U/S bit check
- * rejects kernel mappings).  Walks the active PD via CR3 (every PD/PT lives in
- * the identity-mapped low region).  `want_write` also requires the R/W bit.
- * Returns 1 if the whole range is safe, 0 otherwise. */
+ * accessible in the CURRENTLY ACTIVE address space?  Walks the tables CR3
+ * names.  `want_write` also requires the R/W bit.                          */
+/* ------------------------------------------------------------------------- */
 int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
     if (len == 0) return 1;
     if (va < vmm_user_base()) return 0;             /* reject kernel/low addrs */
     if (va + len < va)        return 0;             /* overflow */
-    uint32_t cr3;
-    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-    uint32_t* pd = (uint32_t*)(uintptr_t)(cr3 & PAGE_MASK);
+    void* root = (void*)(uintptr_t)(read_cr3() & (g_pae ? ~0x1Fu : ~0xFFFu));
     for (uintptr_t p = va & ~0xFFFu; p < va + len; p += 0x1000) {
-        uint32_t pde = pd[PD_IDX(p)];
-        if (!(pde & PDE_P) || !(pde & PTE_US)) return 0;     /* absent / kernel */
-        if (pde & PDE_PS) {                                   /* 4 MiB page */
-            if (want_write && !(pde & PDE_RW)) return 0;
+        uint64_t pde = pde_get(root, pde_index((uint32_t)p));
+        if (!(pde & E_P) || !(pde & E_US)) return 0;      /* absent / kernel */
+        if (pde & E_PS) {
+            if (want_write && !(pde & E_RW)) return 0;
             continue;
         }
-        uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
-        uint32_t pte = pt[PT_IDX(p)];
-        if (!(pte & PTE_P) || !(pte & PTE_US)) return 0;
-        if (want_write && !(pte & PTE_RW)) return 0;
+        uint64_t pte = pte_get(pde & addr_mask(), pte_index((uint32_t)p));
+        if (!(pte & E_P) || !(pte & E_US)) return 0;
+        if (want_write && !(pte & E_RW)) return 0;
     }
     return 1;
 }
 
 /* ------------------------------------------------------------------------- */
+/* Core map / unmap / protect, parameterised by the root.                    */
+/* ------------------------------------------------------------------------- */
 
-/* Core 4 KiB map, parameterised by the target page directory.  Both the
- * kernel PD (vmm_map) and a per-process space's PD (vmm_space_map, M25)
- * share this exact walk.  `pd` points at a 1024-entry PDE array reachable
- * through the identity map (every PD we allocate lives below 1 GiB). */
 /* `notify` = should a remap of an already-present entry be broadcast to the
- * other CPUs?  Every ordinary caller says yes.  vmm_space_clone says NO — it
- * rewrites the parent's ENTIRE user space one page at a time and then issues a
- * single whole-space shootdown, because doing it per page is thousands of IPI
- * round trips to achieve exactly the same end state.  (Getting that wrong is
- * not subtle: a fork went from microseconds to never finishing.) */
-static int map_in_pd_ex(uint32_t* pd, uint32_t virt, uint32_t phys,
-                        uint32_t flags, int notify) {
-    uint32_t pdi = PD_IDX(virt);
-    uint32_t pti = PT_IDX(virt);
-    uint32_t pde = pd[pdi];
+ * other CPUs?  Every ordinary caller says yes; vmm_space_clone says no and
+ * issues ONE whole-space shootdown instead (§M51: per page it is thousands of
+ * IPI round trips for the same end state). */
+static int map_in_root_ex(void* root, uint32_t virt, uint64_t phys,
+                          uint32_t flags, int notify) {
+    uint32_t gi = pde_index(virt), j = pte_index(virt);
+    uint64_t pde = pde_get(root, gi);
 
-    /* Refuse to punch a 4 KiB hole through a 4 MiB PSE entry.  A future
-     * milestone could split the PSE into a regular PT on demand. */
-    if ((pde & PDE_P) && (pde & PDE_PS)) return -1;
+    /* Refuse to punch a 4 KiB hole through a large page. */
+    if ((pde & E_P) && (pde & E_PS)) return -1;
 
-    uint32_t* pt;
-    if ((pde & PDE_P) == 0) {
-        /* No table here yet — carve one out of physical memory.  Today
-         * the PMM only ever returns frames below 1 GiB, so we can
-         * reach the new table through the identity map and zero it. */
+    uint64_t pt;
+    if (!(pde & E_P)) {
+        /* Tables always come from LOW memory: the kernel walks them directly. */
         pmm_phys_t pt_phys = pmm_alloc_frame();
         if (!pt_phys) return -2;
-
-        pt = (uint32_t*)(uintptr_t)pt_phys;
-        for (int i = 0; i < 1024; i++) pt[i] = 0;
-
-        /* PDE points at PT; USER bit on the PDE propagates from the
-         * caller's flags so a user mapping stays user-accessible. */
-        pd[pdi] = pt_phys | PDE_P | PDE_RW | (flags & PDE_US);
+        uint32_t* z = (uint32_t*)(uintptr_t)pt_phys;
+        for (int i = 0; i < 1024; i++) z[i] = 0;
+        /* USER on the directory entry propagates from the caller's flags so a
+         * user mapping stays user-accessible. */
+        pde_set(root, gi, (uint64_t)pt_phys | E_P | E_RW | (flags & E_US));
+        pt = pt_phys;
     } else {
-        pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
+        pt = pde & addr_mask();
     }
 
-    /* VMM_SHARED (0x400) / VMM_COW (0x800) ride along in PTE OS-available bits
-     * 10/11 so vmm_space_destroy + the COW fault path can classify the frame. */
-    /* §M51 — a remap (overwriting a PRESENT entry) can weaken or redirect an
-     * existing translation, so every CPU has to be told.  A fresh map cannot:
-     * a CPU with nothing cached will walk the table and find the new entry.
-     * The distinction matters — `map_in_pd` runs once per page of every ELF
-     * load and every mmap, and an IPI round trip on each would be brutal. */
-    int was_present = (pt[pti] & PTE_P) != 0;
-    pt[pti] = (phys & PAGE_MASK) | PTE_P | (flags & (PTE_RW | PTE_US | VMM_SHARED | VMM_COW));
+    /* §M51 — a remap (overwriting a PRESENT entry) can weaken or redirect a
+     * translation, so every CPU has to be told; a fresh map cannot be cached
+     * anywhere, so it need not be. */
+    int was_present = (pte_get(pt, j) & E_P) != 0;
+    pte_set(pt, j, (phys & addr_mask()) | E_P | (flags & (E_RW | E_US | E_OS)));
     if (was_present && notify) hal_tlb_shootdown(0, virt);
     else                       invlpg(virt);
     return 0;
 }
-
-static int map_in_pd(uint32_t* pd, uint32_t virt, uint32_t phys, uint32_t flags) {
-    return map_in_pd_ex(pd, virt, phys, flags, /*notify*/1);
+static int map_in_root(void* root, uint32_t virt, uint64_t phys, uint32_t flags) {
+    return map_in_root_ex(root, virt, phys, flags, /*notify*/1);
 }
 
-/* Core unmap, parameterised by the target page directory. */
-static void unmap_in_pd(uint32_t* pd, uint32_t virt) {
-    uint32_t pdi = PD_IDX(virt);
-    uint32_t pti = PT_IDX(virt);
-    uint32_t pde = pd[pdi];
-
-    if ((pde & PDE_P) == 0) return;             /* already unmapped */
-    if (pde & PDE_PS) return;                   /* PSE region — refuse */
-
-    uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
-    pt[pti] = 0;
-    hal_tlb_shootdown(0, virt);          /* §M51 — weakening: every CPU */
+static void unmap_in_root(void* root, uint32_t virt) {
+    uint64_t pde = pde_get(root, pde_index(virt));
+    if (!(pde & E_P) || (pde & E_PS)) return;
+    pte_set(pde & addr_mask(), pte_index(virt), 0);
+    hal_tlb_shootdown(0, virt);                     /* §M51 — weakening */
 }
 
-/* Change the protection of an already-mapped page WITHOUT touching its frame
- * (the mprotect primitive — §M37: musl's mallocng maps a PROT_NONE reservation
- * then mprotects the used part to R/W, and ld.so tightens RELRO to read-only).
- * Preserves the OS-available SHARED/COW bits.  Returns 0, or -1 if unmapped. */
-static int protect_in_pd(uint32_t* pd, uint32_t virt, uint32_t flags) {
-    uint32_t pdi = PD_IDX(virt);
-    uint32_t pti = PT_IDX(virt);
-    uint32_t pde = pd[pdi];
-    if ((pde & PDE_P) == 0) return -1;          /* no table → not mapped */
-    if (pde & PDE_PS) return -1;                /* PSE region — refuse */
-    uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
-    uint32_t pte = pt[pti];
-    if ((pte & PTE_P) == 0) return -1;          /* not present */
-    pt[pti] = (pte & PAGE_MASK) | PTE_P |
-              (flags & (PTE_RW | PTE_US)) | (pte & (VMM_SHARED | VMM_COW));
-    hal_tlb_shootdown(0, virt);          /* §M51 — may drop PTE_RW */
+/* The mprotect primitive: change protection WITHOUT touching the frame;
+ * preserves the OS-available SHARED/COW bits.  0, or -1 if not mapped. */
+static int protect_in_root(void* root, uint32_t virt, uint32_t flags) {
+    uint64_t pde = pde_get(root, pde_index(virt));
+    if (!(pde & E_P) || (pde & E_PS)) return -1;
+    uint64_t pt = pde & addr_mask();
+    uint32_t j = pte_index(virt);
+    uint64_t pte = pte_get(pt, j);
+    if (!(pte & E_P)) return -1;
+    pte_set(pt, j, (pte & addr_mask()) | E_P | (flags & (E_RW | E_US)) | (pte & E_OS));
+    hal_tlb_shootdown(0, virt);                     /* §M51 — may drop RW */
     return 0;
 }
 
-int vmm_map(uintptr_t virt32, uintptr_t phys32, uint32_t flags) {
-    /* On i386 uintptr_t == uint32_t so the casts are no-ops; making them
-     * explicit keeps the arch-portable interface obvious. */
-    return map_in_pd(kernel_pd, (uint32_t)virt32, (uint32_t)phys32, flags);
+int vmm_map(uintptr_t virt, uint64_t phys, uint32_t flags) {
+    return map_in_root(kroot(), (uint32_t)virt, phys, flags);
 }
 
+/* One 4 MiB large mapping (framebuffer, xHCI/AHCI MMIO).  PAE's large page is
+ * 2 MiB, so there it is two of them — same contract for the caller. */
 int vmm_map_4mib(uintptr_t virt32, uintptr_t phys32, uint32_t flags) {
-    uint32_t virt = (uint32_t)virt32;
-    uint32_t phys = (uint32_t)phys32;
-    /* PSE requires the low 22 bits of both `virt` and `phys` to be zero. */
-    if (virt & 0x003FFFFFu) return -1;
-    if (phys & 0x003FFFFFu) return -1;
-
-    uint32_t pdi = PD_IDX(virt);
-    uint32_t pde = kernel_pd[pdi];
-
-    /* Refuse to clobber a regular (non-PSE) page table that might be
-     * backing finer-grained mappings.  Caller must pick an unused PDE. */
-    if ((pde & PDE_P) && (pde & PDE_PS) == 0) return -2;
-
-    kernel_pd[pdi] = (phys & PSE_MASK) | PDE_P | PDE_PS
-                   | (flags & (PDE_RW | PDE_US));
-    /* invlpg of any address in the 4 MiB range flushes the entry. */
-    invlpg(virt);
+    uint32_t virt = (uint32_t)virt32, phys = (uint32_t)phys32;
+    if ((virt | phys) & 0x003FFFFFu) return -1;          /* 4 MiB aligned */
+    uint32_t n = g_pae ? 2 : 1, step = g_pae ? 0x200000u : 0x400000u;
+    for (uint32_t k = 0; k < n; k++) {
+        uint64_t pde = pde_get(kroot(), pde_index(virt + k * step));
+        if ((pde & E_P) && !(pde & E_PS)) return -2;      /* a PT lives here */
+    }
+    for (uint32_t k = 0; k < n; k++) {
+        pde_set(kroot(), pde_index(virt + k * step),
+                ((uint64_t)(phys + k * step) & large_mask()) | E_P | E_PS |
+                (flags & (E_RW | E_US)));
+        invlpg(virt + k * step);
+    }
     return 0;
 }
 
-void vmm_unmap(uintptr_t virt32) {
-    unmap_in_pd(kernel_pd, (uint32_t)virt32);
-}
+void vmm_unmap(uintptr_t virt) { unmap_in_root(kroot(), (uint32_t)virt); }
 
 uintptr_t vmm_translate(uintptr_t virt32) {
     uint32_t virt = (uint32_t)virt32;
-    uint32_t pdi = PD_IDX(virt);
-    uint32_t pde = kernel_pd[pdi];
-    if ((pde & PDE_P) == 0) return 0;
-
-    if (pde & PDE_PS) {
-        /* 4 MiB PSE page — low 22 bits are the offset. */
-        return (uintptr_t)((pde & PSE_MASK) | (virt & 0x003FFFFFu));
+    uint64_t pde = pde_get(kroot(), pde_index(virt));
+    if (!(pde & E_P)) return 0;
+    if (pde & E_PS) {
+        uint32_t off = virt & ((1u << pde_shift()) - 1u);
+        return (uintptr_t)((pde & large_mask()) | off);
     }
-
-    uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
-    uint32_t pte = pt[PT_IDX(virt)];
-    if ((pte & PTE_P) == 0) return 0;
-    return (uintptr_t)((pte & PAGE_MASK) | (virt & 0x00000FFFu));
+    uint64_t pte = pte_get(pde & addr_mask(), pte_index(virt));
+    if (!(pte & E_P)) return 0;
+    return (uintptr_t)((pte & addr_mask()) | (virt & 0xFFFu));
 }
 
 void vmm_print_status(void) {
@@ -360,117 +323,105 @@ void vmm_print_status(void) {
     __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
     __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
     __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
-    kprintf("vmm: cr0=%x cr3=%x cr4=%x (paging=%s, pse=%s)\n",
-            cr0, cr3, cr4,
-            (cr0 & 0x80000000u) ? "on" : "off",
-            (cr4 & (1u << 4))   ? "on" : "off");
+    kprintf("vmm: cr0=%x cr3=%x cr4=%x (paging=%s, format=%s)\n",
+            cr0, cr3, cr4, (cr0 & 0x80000000u) ? "on" : "off",
+            (cr4 & 0x20u) ? "PAE" : ((cr4 & 0x10u) ? "classic+PSE" : "classic"));
 }
 
 /* ===========================================================================
- * Per-process address spaces (M25 stage 1).
+ * Per-process address spaces (M25).
  *
- * On i386 a `vmm_space` is a private 1024-entry page directory.  It is
- * created by *snapshotting* the kernel PD (so the identity map + every
- * boot-time kernel high-mapping stays reachable after a CR3 switch — the
- * kernel code and stack keep resolving) and then receives the process's
- * own user-region PTs on top.  Because the kernel region below 1 GiB is
- * PSE leaves (no shared PT pages) and the high mappings are static and
- * boot-time, the snapshot copy is sufficient — see the vmm.h note on the
- * stage-1 kernel-mapping limitation.
+ * Classic: a private page directory, a snapshot of the kernel's.  PAE: a
+ * private PDPT whose entry 0 is the KERNEL's first directory (the identity map
+ * and the kmap window — nothing user-private lives below 1 GiB), and whose
+ * entries 1..3 are PRIVATE directories initialised from the kernel's, so kernel
+ * MMIO page tables are shared by pointer and user page tables are the space's
+ * own.  In both formats "is this directory entry shared with the kernel?" is
+ * "is it identical to the kernel's entry at that index".
  * =========================================================================== */
 
 struct vmm_space {
-    uint32_t* pd;           /* 4 KiB page directory (identity: virt == phys) */
-    uint32_t  pd_phys;      /* == (uint32_t)pd, cached for CR3 loads */
-    /* §M48 — the mmap bump cursor lives with the ADDRESS SPACE, not with the
-     * task.  It used to be per-task, so a cloned thread started at zero, reset
-     * it to the region base, and handed out addresses ON TOP OF the mappings
-     * its own process was already using.  A snapshot copied at clone time is
-     * no better: two threads then bump independent copies toward the same
-     * addresses.  One space, one cursor. */
+    void*     root;         /* PD (classic) or PDPT (PAE); identity-mapped   */
+    uint32_t  root_phys;    /* == (uint32_t)root, what CR3 is loaded with    */
+    /* §M48 — the mmap bump cursor lives with the ADDRESS SPACE, not the task:
+     * one space, one cursor, whichever thread bumps it. */
     uintptr_t mmap_cursor;
 };
 
-static inline uint32_t read_cr3(void) {
-    uint32_t v; __asm__ volatile ("mov %%cr3, %0" : "=r"(v)); return v;
-}
-
-/* Is PDE index `i` part of the shared kernel region?  A user space only
- * ever adds mappings whose PDE differs from the kernel snapshot; anything
- * still identical to kernel_pd[i] is shared kernel and must not be freed. */
-static int pde_is_kernel_shared(struct vmm_space* s, uint32_t i) {
-    return s->pd[i] == kernel_pd[i];
+static int pde_is_kernel_shared(struct vmm_space* s, uint32_t gi) {
+    return pde_get(s->root, gi) == pde_get(kroot(), gi);
 }
 
 struct vmm_space* vmm_space_create(void) {
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
     if (!s) return NULL;
-    /* kmalloc does not zero: an uninitialised bump cursor is handed straight
-     * back to the program as an mmap address. */
     s->mmap_cursor = 0;
 
-    pmm_phys_t pd_phys = pmm_alloc_frame();       /* one 4 KiB frame = 1024 PDEs */
-    if (!pd_phys) { kfree(s); return NULL; }
+    pmm_phys_t rf = pmm_alloc_frame();            /* low memory: CR3 needs it */
+    if (!rf) { kfree(s); return NULL; }
+    s->root = (void*)(uintptr_t)rf;
+    s->root_phys = (uint32_t)rf;
 
-    s->pd      = (uint32_t*)(uintptr_t)pd_phys; /* reachable via identity map */
-    s->pd_phys = pd_phys;
-
-    /* Snapshot the kernel directory: identity map + all boot-time high
-     * mappings.  The private user region (high PDEs) is 0 in kernel_pd,
-     * so it starts empty here too. */
-    for (int i = 0; i < 1024; i++) s->pd[i] = kernel_pd[i];
+    if (!g_pae) {
+        uint32_t* pd = (uint32_t*)s->root;
+        for (int i = 0; i < 1024; i++) pd[i] = kernel_pd[i];
+        return s;
+    }
+    uint64_t* pdpt = (uint64_t*)s->root;
+    pdpt[0] = k_pdpt[0];                          /* shared kernel directory */
+    for (int d = 1; d < 4; d++) {
+        pmm_phys_t pf = pmm_alloc_frame();
+        if (!pf) {
+            for (int e = 1; e < d; e++) pmm_free_frame(pdpt[e] & PAGE_MASK64);
+            pmm_free_frame(rf); kfree(s); return NULL;
+        }
+        uint64_t* pd = (uint64_t*)(uintptr_t)pf;
+        for (int i = 0; i < 512; i++) pd[i] = k_pd[d][i];
+        pdpt[d] = (uint64_t)pf | E_P;
+    }
     return s;
 }
 
-/* M34 — per-frame COW reference counts, indexed by frame number (phys >> 12).
- * A count of 0 means "not COW-shared" (a normally-owned page freed by its
- * single owner); a page made COW by fork starts at 2.
- *
- * §M48 — sized at boot to every frame the PMM manages, not to a fixed window.
- * The old 256 MiB array exactly matched the i386 identity cap, so no frame was
- * ever out of range and the gap never showed; the moment the cap moves, an
- * untracked frame becomes a DOUBLE FREE, because fork shares the page in both
- * spaces while free_subtree, seeing no refcount, releases it from each.  (That
- * is not hypothetical — it is what the x86_64 twin did once its own window was
- * exceeded.)  Sizing from pmm_nr_frames removes the failure mode rather than
- * relying on a coincidence between two constants. */
+/* M34 — per-frame COW reference counts (cowref.h: built once, updated
+ * atomically), indexed by frame number, covering every frame the PMM manages
+ * — which with PAE includes frames above 4 GiB. */
 static uint16_t* g_cow_ref;
 static uint32_t  g_cow_nr;
 
-static inline uint16_t* cow_slot(uint32_t phys) {
+static inline uint16_t* cow_slot(uint64_t phys) {
     static spinlock_t cow_build_lock = SPINLOCK_INIT;
     if (!cow_table_get(&g_cow_ref, &g_cow_nr, &cow_build_lock)) return NULL;
-    uint32_t fn = phys >> 12;
+    uint32_t fn = (uint32_t)(phys >> 12);
     return (fn < g_cow_nr) ? &g_cow_ref[fn] : NULL;
 }
 
 void vmm_space_destroy(struct vmm_space* s) {
     if (!s) return;
-
     /* Free every page table + user frame this space added on top of the
-     * kernel snapshot.  Kernel-shared PDEs (identical to kernel_pd) and
-     * PSE leaves are left alone. */
-    for (uint32_t i = 0; i < 1024; i++) {
-        uint32_t pde = s->pd[i];
-        if ((pde & PDE_P) == 0) continue;
-        if (pde & PDE_PS)            continue;  /* PSE leaf — never ours */
-        if (pde_is_kernel_shared(s, i)) continue;  /* shared kernel PT */
-
-        uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
-        for (int j = 0; j < 1024; j++) {
-            uint32_t pte = pt[j];
-            if (!(pte & PTE_P))   continue;
-            if (pte & VMM_SHARED) continue;     /* borrowed shm — owner frees   */
+     * kernel snapshot.  Kernel-shared entries and large pages are left alone. */
+    for (uint32_t gi = 0; gi < npde(); gi++) {
+        uint64_t pde = pde_get(s->root, gi);
+        if (!(pde & E_P) || (pde & E_PS)) continue;
+        if (pde_is_kernel_shared(s, gi)) continue;
+        uint64_t pt = pde & addr_mask();
+        for (uint32_t j = 0; j < npte(); j++) {
+            uint64_t pte = pte_get(pt, j);
+            if (!(pte & E_P))        continue;
+            if (pte & VMM_SHARED)    continue;     /* borrowed shm — owner frees */
+            uint64_t fr = pte & addr_mask();
             if (pte & VMM_COW) {
-                /* COW-shared: free the frame only when the last owner leaves. */
-                uint16_t* rc = cow_slot(pte & PAGE_MASK);
+                uint16_t* rc = cow_slot(fr);
                 if (rc && !cow_ref_drop(rc)) continue;   /* others still hold it */
             }
-            pmm_free_frame(pte & PAGE_MASK);     /* owned user page */
+            pmm_free_frame(fr);                   /* owned user page */
         }
-        pmm_free_frame(pde & PAGE_MASK);        /* the page table itself */
+        pmm_free_frame(pt);                       /* the page table itself */
     }
-    pmm_free_frame(s->pd_phys);                 /* the directory */
+    if (g_pae) {
+        uint64_t* pdpt = (uint64_t*)s->root;
+        for (int d = 1; d < 4; d++) pmm_free_frame(pdpt[d] & PAGE_MASK64);
+    }
+    pmm_free_frame(s->root_phys);
     kfree(s);
 }
 
@@ -478,70 +429,47 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     if (!parent) return NULL;
     struct vmm_space* child = vmm_space_create();     /* kernel snapshot only */
     if (!child) return NULL;
-    /* fork(): the child inherits the parent's mappings, so it must inherit the
-     * cursor too — restarting at the region base would re-issue addresses the
-     * child already has mapped. */
     child->mmap_cursor = parent->mmap_cursor;
 
-    /* Walk the parent's private user mappings.  WRITABLE pages become
-     * copy-on-write (shared read-only in BOTH spaces, ref-counted); read-only
-     * pages (code) are eagerly copied; borrowed shm pages stay shared. */
-    for (uint32_t i = 0; i < 1024; i++) {
-        uint32_t pde = parent->pd[i];
-        if ((pde & PDE_P) == 0)          continue;
-        if (pde & PDE_PS)                continue;   /* PSE leaf — kernel      */
-        if (pde_is_kernel_shared(parent, i)) continue;
-
-        uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
-        for (uint32_t j = 0; j < 1024; j++) {
-            uint32_t pte = pt[j];
-            if ((pte & PTE_P) == 0) continue;
-            uint32_t virt  = (i << 22) | (j << 12);
-            uint32_t frame = pte & PAGE_MASK;
+    /* WRITABLE (or already COW) pages become copy-on-write in BOTH spaces,
+     * ref-counted; read-only pages (code) are copied eagerly; borrowed shm
+     * pages stay shared.  (Catching "already COW" matters: a second fork must
+     * re-share, never mistake it for read-only code.) */
+    for (uint32_t gi = 0; gi < npde(); gi++) {
+        uint64_t pde = pde_get(parent->root, gi);
+        if (!(pde & E_P) || (pde & E_PS)) continue;
+        if (pde_is_kernel_shared(parent, gi)) continue;
+        uint64_t pt = pde & addr_mask();
+        for (uint32_t j = 0; j < npte(); j++) {
+            uint64_t pte = pte_get(pt, j);
+            if (!(pte & E_P)) continue;
+            uint32_t virt  = (gi << pde_shift()) | (j << 12);
+            uint64_t frame = pte & addr_mask();
 
             if (pte & VMM_SHARED) {
-                /* Borrowed shm frame — share it verbatim (don't own/copy). */
-                uint32_t fl = VMM_USER | VMM_SHARED | (pte & PTE_RW ? VMM_WRITABLE : 0);
-                if (map_in_pd(child->pd, virt, frame, fl) != 0) {
+                uint32_t fl = VMM_USER | VMM_SHARED | ((pte & E_RW) ? VMM_WRITABLE : 0);
+                if (map_in_root(child->root, virt, frame, fl) != 0) {
                     vmm_space_destroy(child); return NULL;
                 }
-            } else if ((pte & PTE_RW) || (pte & VMM_COW)) {
-                /* Writable → COW.  This MUST also catch a page that is already
-                 * COW from a PRIOR fork (RW=0 but VMM_COW set): such a page is
-                 * logically writable-shared, not read-only code, so it must be
-                 * re-shared COW (ref bumped), never eager-copied as RO — else a
-                 * second fork whose parent hasn't yet resolved the page would
-                 * hand the child a read-only copy that faults hard on write.
-                 * Share the frame read-only in both spaces. */
+            } else if ((pte & E_RW) || (pte & VMM_COW)) {
                 uint16_t* rc = cow_slot(frame);
                 if (rc) cow_ref_share(rc);
-                map_in_pd_ex(parent->pd, virt, frame, VMM_USER | VMM_COW,
-                             /*notify*/0);                  /* parent RO+COW */
-                if (map_in_pd(child->pd, virt, frame, VMM_USER | VMM_COW) != 0) {
+                map_in_root_ex(parent->root, virt, frame, VMM_USER | VMM_COW, /*notify*/0);
+                if (map_in_root(child->root, virt, frame, VMM_USER | VMM_COW) != 0) {
                     vmm_space_destroy(child); return NULL;
                 }
             } else {
-                /* Read-only (code) → eager private copy (cheap, rarely large). */
-                /* §M86 — both frames are user pages and may be highmem. */
-                pmm_phys_t nf = pmm_alloc_frame_user();
+                pmm_phys_t nf = pmm_alloc_frame_user();   /* §M86 — may be highmem */
                 if (!nf) { vmm_space_destroy(child); return NULL; }
                 kmap_copy_frame(nf, frame);
-                if (map_in_pd(child->pd, virt, nf, VMM_USER) != 0) {
+                if (map_in_root(child->root, virt, nf, VMM_USER) != 0) {
                     pmm_free_frame(nf); vmm_space_destroy(child); return NULL;
                 }
             }
         }
     }
-    /* §M51 — the loop above took write access AWAY from the parent, one entry
-     * at a time, and the parent may be runnable on another core RIGHT NOW
-     * (that is precisely the window between fork and the child's execve).
-     * That core still holds writable entries for the pages we just protected,
-     * so its next write does NOT fault: it lands in the frame the child now
-     * shares, and the two processes scribble on each other silently.
-     *
-     * One whole-space shootdown rather than one per page: the pages number in
-     * the thousands and every remote CPU flushes everything anyway, so per-page
-     * IPIs would cost thousands of round trips to achieve the same thing. */
+    /* §M51 — write access was taken AWAY from the parent, which may be
+     * running on another core right now: one whole-space shootdown. */
     hal_tlb_shootdown(0, 0);
     return child;
 }
@@ -551,147 +479,117 @@ int vmm_cow_fault(uintptr_t fault_va) {
     if (!t || !t->mm) return 0;
     struct vmm_space* s = t->mm;
 
-    uint32_t va  = (uint32_t)fault_va;
-    uint32_t pdi = PD_IDX(va), pti = PT_IDX(va);
-    uint32_t pde = s->pd[pdi];
-    if (!(pde & PDE_P) || (pde & PDE_PS)) return 0;
+    uint32_t va = (uint32_t)fault_va;
+    uint64_t pde = pde_get(s->root, pde_index(va));
+    if (!(pde & E_P) || (pde & E_PS)) return 0;
+    uint64_t pt = pde & addr_mask();
+    uint32_t j  = pte_index(va);
+    uint64_t pte = pte_get(pt, j);
+    if (!(pte & E_P) || !(pte & VMM_COW)) return 0;   /* not COW → real fault */
 
-    uint32_t* pt  = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
-    uint32_t  pte = pt[pti];
-    if (!(pte & PTE_P) || !(pte & VMM_COW)) return 0;   /* not a COW page → real fault */
-
-    uint32_t old = pte & PAGE_MASK;
+    uint64_t old = pte & addr_mask();
     uint16_t* rc = cow_slot(old);
-
     if (!rc || cow_ref_sole(rc)) {
-        /* Last (or untracked) sharer — just make it writable in place. */
-        pt[pti] = old | PTE_P | PTE_US | PTE_RW;
+        /* Last (or untracked) sharer — writable in place. */
+        pte_set(pt, j, old | E_P | E_US | E_RW);
         if (rc) __atomic_store_n(rc, 0, __ATOMIC_RELEASE);
     } else {
-        pmm_phys_t nf = pmm_alloc_frame_user();         /* §M86 — may be highmem */
-        if (!nf) return 0;                              /* OOM → real fault    */
+        pmm_phys_t nf = pmm_alloc_frame_user();       /* §M86 — may be highmem */
+        if (!nf) return 0;                            /* OOM → real fault */
         kmap_copy_frame(nf, old);
-        pt[pti] = (nf & PAGE_MASK) | PTE_P | PTE_US | PTE_RW;
-        /* Only now give up our share (cowref.h); if the other holder left
-         * meanwhile, we were the last and the original is ours to free. */
+        pte_set(pt, j, (nf & addr_mask()) | E_P | E_US | E_RW);
+        /* Give up our share only after the copy (cowref.h). */
         if (cow_ref_put_copy(rc)) pmm_free_frame(old);
     }
-    /* §M51 — the page now points at a DIFFERENT frame (or became writable in
-     * place).  A sibling thread on another core still holds the old, read-only
-     * entry; without this it keeps faulting on a page we already resolved, or
-     * worse, keeps reading the pre-copy frame. */
-    hal_tlb_shootdown(0, va & PAGE_MASK);
+    hal_tlb_shootdown(0, va & ~0xFFFu);             /* §M51 */
     return 1;
 }
 
-int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
-                  uint32_t flags) {
-    if (!s) return vmm_map(virt, phys, flags); /* NULL == kernel space */
-    return map_in_pd(s->pd, (uint32_t)virt, (uint32_t)phys, flags);
+int vmm_space_map(struct vmm_space* s, uintptr_t virt, uint64_t phys, uint32_t flags) {
+    if (!s) return vmm_map(virt, phys, flags);      /* NULL == kernel space */
+    return map_in_root(s->root, (uint32_t)virt, phys, flags);
 }
 
 void vmm_space_unmap(struct vmm_space* s, uintptr_t virt) {
-    if (!s) { vmm_unmap(virt); return; }
-    unmap_in_pd(s->pd, (uint32_t)virt);
+    unmap_in_root(s ? s->root : kroot(), (uint32_t)virt);
 }
 
 int vmm_space_protect(struct vmm_space* s, uintptr_t virt, uint32_t flags) {
-    uint32_t* pd = s ? s->pd : kernel_pd;
-    return protect_in_pd(pd, (uint32_t)virt, flags);
+    return protect_in_root(s ? s->root : kroot(), (uint32_t)virt, flags);
 }
 
-/* §M75 — enumerate every present page in this space's PRIVATE region.
- *
- * The traversal is `vmm_space_destroy`'s, minus the freeing: the rules for
- * "which entries belong to this space" are identical, and they must stay
- * identical — a walker that visited a page destroy does not free (or missed
- * one it does) would report memory that is nobody's.  On i386 the low 12 bits
- * of a PTE are already the portable VMM_* values (Intel kept them compatible
- * across i386/x86_64, which is why vmm.h can define one set), so no
- * translation is needed here — unlike aarch64, where it very much is. */
+/* §M75 — enumerate every present page in this space's PRIVATE region; the
+ * traversal is vmm_space_destroy's minus the freeing, and must stay so. */
 void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
     if (!s || !cb) return;
-
-    for (uint32_t i = 0; i < 1024; i++) {
-        uint32_t pde = s->pd[i];
-        if ((pde & PDE_P) == 0)         continue;
-        if (pde & PDE_PS)               continue;   /* PSE leaf — kernel      */
-        if (pde_is_kernel_shared(s, i)) continue;   /* shared kernel PT       */
-
-        uint32_t* pt = (uint32_t*)(uintptr_t)(pde & PAGE_MASK);
-        for (uint32_t j = 0; j < 1024; j++) {
-            uint32_t pte = pt[j];
-            if ((pte & PTE_P) == 0) continue;
-            cb(ctx, ((uintptr_t)i << 22) | ((uintptr_t)j << 12),
-                    (uintptr_t)(pte & PAGE_MASK),
-                    (uint32_t)(pte & ~PAGE_MASK));
+    for (uint32_t gi = 0; gi < npde(); gi++) {
+        uint64_t pde = pde_get(s->root, gi);
+        if (!(pde & E_P) || (pde & E_PS)) continue;
+        if (pde_is_kernel_shared(s, gi)) continue;
+        uint64_t pt = pde & addr_mask();
+        for (uint32_t j = 0; j < npte(); j++) {
+            uint64_t pte = pte_get(pt, j);
+            if (!(pte & E_P)) continue;
+            cb(ctx, ((uintptr_t)gi << pde_shift()) | ((uintptr_t)j << 12),
+               pte & addr_mask(), (uint32_t)(pte & 0xFFFu));
         }
     }
 }
 
-/* §M75 — see vmm.h: a QUERY, so it must not build the table.  `cow_slot`
- * creates it on first use out of bootmem; calling that from a task manager
- * would make reading the memory column allocate memory. */
-uint32_t vmm_frame_share_count(uintptr_t phys) {
+/* §M75 — a QUERY: must not build the table (cow_slot would). */
+uint32_t vmm_frame_share_count(uint64_t phys) {
     if (!g_cow_ref) return 0;
-    uint32_t fn = (uint32_t)phys >> 12;
+    uint32_t fn = (uint32_t)(phys >> 12);
     return (fn < g_cow_nr) ? (uint32_t)g_cow_ref[fn] : 0;
 }
 
 uintptr_t vmm_space_pd_phys(struct vmm_space* s) {
-    return s ? (uintptr_t)s->pd_phys : (uintptr_t)&kernel_pd[0];
+    return s ? (uintptr_t)s->root_phys : (uintptr_t)kroot_phys();
 }
+uintptr_t vmm_space_root_phys(struct vmm_space* s) { return vmm_space_pd_phys(s); }
 
 void vmm_space_switch(struct vmm_space* s) {
-    uint32_t target = s ? s->pd_phys : (uint32_t)(uintptr_t)&kernel_pd[0];
-    /* Reload CR3 only on an actual change — switching between kernel
-     * threads (all target == kernel_pd) costs nothing and avoids a
-     * needless TLB flush. */
+    uint32_t target = s ? s->root_phys : kroot_phys();
+    /* Reload only on a change.  With PAE a CR3 load also re-reads the four
+     * PDPTEs; ours never change after a space is built, so skipping the
+     * reload when CR3 already matches is still correct. */
     if (read_cr3() != target) load_cr3(target);
 }
 
-/* User region base: 1 GiB, comfortably above the 256 MiB identity map. */
+/* User region base: 1 GiB, above the identity map and the kmap window. */
 uintptr_t vmm_user_base(void) { return 0x40000000u; }
 
-
-/* §M48 — the address space's mmap bump cursor.  Policy (where the region
- * starts, how far it may grow) stays in usyscall.c; the SPACE only owns the
- * storage, so every task sharing an mm shares one cursor. */
-uintptr_t vmm_space_mmap_cursor(struct vmm_space* s) {
-    return s ? s->mmap_cursor : 0;
-}
-void vmm_space_set_mmap_cursor(struct vmm_space* s, uintptr_t v) {
-    if (s) s->mmap_cursor = v;
-}
+/* §M48 — the space's mmap bump cursor (policy stays in usyscall.c). */
+uintptr_t vmm_space_mmap_cursor(struct vmm_space* s) { return s ? s->mmap_cursor : 0; }
+void vmm_space_set_mmap_cursor(struct vmm_space* s, uintptr_t v) { if (s) s->mmap_cursor = v; }
 
 /* ---------------------------------------------------------------------------
  * §M86 — kmap_frame / kunmap_frame for i386 (contract in kmap.h).
  *
  * A directly-mapped frame is its own address.  Anything else gets this CPU's
- * next window slot: write the PTE, flush THIS CPU's entry for it, and keep
- * preemption off until the matching kunmap, so the task cannot migrate away
- * from the slot it is using.  No cross-CPU shootdown is needed, for the same
- * reason: no other CPU ever uses this CPU's slots, and a stale entry another
- * CPU might hold for one of them is never dereferenced there.
+ * next window slot: write the PTE, flush THIS CPU's entry, and keep
+ * preemption off until the matching kunmap so the task cannot migrate away
+ * from its slot — which is also why no cross-CPU shootdown is needed.  With
+ * PAE the frame may lie above 4 GiB; the window is the only way to reach it.
  *
- * Before paging is on (pmm_init seeds the free lists before vmm_init) every
- * physical address below 4 GiB is directly addressable, so the frame is
- * returned as-is — a window address would mean something else entirely then.
+ * Before paging is on, a frame below 4 GiB is directly addressable and comes
+ * back as-is; one above 4 GiB cannot be reached at all, which is why the PMM
+ * seeds those only after vmm_init (pmm_seed_deferred).
  * ------------------------------------------------------------------------- */
-#include "percpu.h"
-#include "lock.h"
-
 void* kmap_frame(pmm_phys_t frame) {
-    uint32_t f = (uint32_t)frame & PAGE_MASK;
-    if (!kmap_paging_on || f < (uint32_t)IDENTITY_MAP_MIB * 1024u * 1024u)
+    uint64_t f = (uint64_t)frame & ~0xFFFull;
+    if (f < (uint64_t)IDENTITY_MAP_MIB * 1024u * 1024u)
         return (void*)(uintptr_t)frame;
+    if (!kmap_paging_on) {
+        if (f >> 32) return NULL;                 /* unreachable before paging */
+        return (void*)(uintptr_t)frame;
+    }
     preempt_disable();
     uint32_t fl = hal_intr_save();
     int c = this_cpu_id();
     if (c < 0 || c >= KMAP_CPUS) c = 0;
     int d = kmap_depth[c];
     if (d >= KMAP_PER_CPU) {
-        /* A nesting deeper than any caller needs is a leak of kunmaps. */
         hal_intr_restore(fl);
         preempt_enable();
         kprintf("!! KMAP: cpu %d has %d mappings open - a kunmap_frame is "
@@ -701,24 +599,25 @@ void* kmap_frame(pmm_phys_t frame) {
     kmap_depth[c] = d + 1;
     uint32_t idx = (uint32_t)(c * KMAP_PER_CPU + d);
     uint32_t va  = KMAP_BASE + (idx << 12);
-    kmap_pt[idx] = f | PTE_P | PTE_RW;
+    if (g_pae) kmap_pt64[idx] = f | E_P | E_RW;
+    else       kmap_pt32[idx] = (uint32_t)f | (uint32_t)(E_P | E_RW);
     invlpg(va);
     hal_intr_restore(fl);
     return (void*)(uintptr_t)(va | ((uint32_t)frame & 0xFFFu));
 }
 
 void kunmap_frame(void* p) {
-    uint32_t va = (uint32_t)(uintptr_t)p & PAGE_MASK;
+    uint32_t va = (uint32_t)(uintptr_t)p & ~0xFFFu;
     if (va < KMAP_BASE || va >= KMAP_BASE + (uint32_t)(KMAP_CPUS * KMAP_PER_CPU) * 4096u)
         return;                                   /* a direct address: nothing */
     uint32_t fl = hal_intr_save();
     int c = this_cpu_id();
     if (c < 0 || c >= KMAP_CPUS) c = 0;
     uint32_t idx = (va - KMAP_BASE) >> 12;
-    kmap_pt[idx] = 0;
+    if (g_pae) kmap_pt64[idx] = 0;
+    else       kmap_pt32[idx] = 0;
     invlpg(va);
     if (kmap_depth[c] > 0) kmap_depth[c]--;
     hal_intr_restore(fl);
     preempt_enable();
 }
-

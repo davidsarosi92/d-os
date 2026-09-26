@@ -99,7 +99,7 @@ int proc_fork(struct user_regs* parent_regs) {
     for (int i = 0; i < TASK_MAX_FDS; i++)
         b->fds[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
 
-    struct task* child = task_spawn_arg("forked", fork_child_bootstrap, b);
+    struct task* child = task_spawn_arg_held("forked", fork_child_bootstrap, b);
     if (!child) {
         for (int i = 0; i < TASK_MAX_FDS; i++)
             if (b->fds[i]) ofile_unref(b->fds[i]);
@@ -125,5 +125,6 @@ int proc_fork(struct user_regs* parent_regs) {
     /* Claim the reap so init leaves the child as a POSIX zombie for the
      * parent's waitpid() (task_wait). */
     task_set_reap_owned(child, 1);
+    task_release(child);                /* §4.96: built completely, now it may run */
     return child->pid;                       /* parent: fork() returns child pid */
 }

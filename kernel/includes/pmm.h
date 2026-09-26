@@ -170,6 +170,10 @@ void       page_free (pmm_phys_t phys, int order);
  * dispatches to page_alloc / page_free.
  * --------------------------------------------------------------------------- */
 pmm_phys_t pmm_alloc_frame(void);
+
+/* §M86 — seed the frames that were unreachable at pmm_init (a 32-bit kernel's
+ * RAM above 4 GiB).  kernel_main calls it right after vmm_init. */
+void pmm_seed_deferred(void);
 pmm_phys_t pmm_alloc_contiguous(uint32_t n);
 void       pmm_free_frame(pmm_phys_t addr);
 

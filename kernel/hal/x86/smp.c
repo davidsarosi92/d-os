@@ -55,6 +55,7 @@ struct ap_info {
     uint32_t c_entry;
     uint16_t gdtr_limit;
     uint32_t gdtr_base;
+    uint32_t cr4_or;        /* §M86 — CR4 bits to set before paging (PSE, PAE) */
 } __attribute__((packed));
 
 /* Forward decl — the C entry the trampoline jumps to. */
@@ -164,6 +165,10 @@ int smp_boot_aps(void) {
          * because the AP reads it through bin-format absolute address. */
         struct ap_info* info = (struct ap_info*)AP_INFO_ADDR;
         info->page_directory_phys = vmm_kernel_pd_phys();
+        {
+            extern uint32_t vmm_cr4_bits(void);
+            info->cr4_or = vmm_cr4_bits();
+        }
         info->stack_top           = (uint32_t)(uintptr_t)stack + 4096;
         info->c_entry             = (uint32_t)(uintptr_t)ap_main;
         uint8_t* gdtr_src = (uint8_t*)gdt_get_ptr_struct();

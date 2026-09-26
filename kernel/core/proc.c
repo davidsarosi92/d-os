@@ -536,7 +536,7 @@ int proc_clone(uintptr_t entry, uintptr_t stack) {
     for (int i = 0; i < TASK_MAX_FDS; i++)
         b->fds[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
 
-    struct task* t = task_spawn_arg("thread", clone_bootstrap, b);
+    struct task* t = task_spawn_arg_held("thread", clone_bootstrap, b);
     if (!t) {
         for (int i = 0; i < TASK_MAX_FDS; i++) if (b->fds[i]) ofile_unref(b->fds[i]);
         kfree(b);
@@ -544,6 +544,7 @@ int proc_clone(uintptr_t entry, uintptr_t stack) {
     }
     t->mm_shared = 1;               /* set early too (before it may run) */
     task_set_reap_owned(t, 1);      /* the creator joins it with waitpid() */
+    task_release(t);                /* §4.96: built completely, now it may run */
     return t->pid;
 }
 

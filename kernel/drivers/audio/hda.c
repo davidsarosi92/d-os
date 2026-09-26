@@ -622,8 +622,8 @@ static int hda_init(void* ctx) {
         g_hda.rec_bdl_phys = pmm_alloc_frame_dma32();
         g_hda.rec_pcm_phys = pmm_alloc_contiguous_dma32(32);
         if (g_hda.rec_bdl_phys && g_hda.rec_pcm_phys) {
-            g_hda.rec_bdl = (struct bdl_entry*)(uintptr_t)g_hda.rec_bdl_phys;
-            g_hda.rec_pcm = (int16_t*)(uintptr_t)g_hda.rec_pcm_phys;
+            g_hda.rec_bdl = (struct bdl_entry*)phys_to_virt(g_hda.rec_bdl_phys);
+            g_hda.rec_pcm = (int16_t*)phys_to_virt(g_hda.rec_pcm_phys);
         } else {
             kprintf("hda: no DMA for capture — recording unavailable\n");
             g_hda.has_input = 0;
@@ -633,8 +633,8 @@ static int hda_init(void* ctx) {
     g_hda.bdl_phys = pmm_alloc_frame_dma32();
     g_hda.pcm_phys = pmm_alloc_contiguous_dma32(32);
     if (!g_hda.bdl_phys || !g_hda.pcm_phys) { kprintf("hda: DMA OOM\n"); return -5; }
-    g_hda.bdl = (struct bdl_entry*)(uintptr_t)g_hda.bdl_phys;
-    g_hda.pcm = (int16_t*)(uintptr_t)g_hda.pcm_phys;
+    g_hda.bdl = (struct bdl_entry*)phys_to_virt(g_hda.bdl_phys);
+    g_hda.pcm = (int16_t*)phys_to_virt(g_hda.pcm_phys);
     for (uint32_t i = 0; i < HDA_NBUF; i++) {
         g_hda.bdl[i].addr_lo = g_hda.pcm_phys + i * HDA_BUF_FRAMES * 4;
         g_hda.bdl[i].addr_hi = 0;

@@ -841,8 +841,16 @@ static void task_notify_change(void) {
  * M22.7 — `arg` is stashed in t->start_arg BEFORE the task is enqueued
  * (so it is visible even if another CPU picks the task up immediately),
  * readable by the entry via task_start_arg(). */
+static struct task* spawn_common_ex(const char* name, void (*entry)(void),
+                                    int ppid_override, void* arg, void* console,
+                                    int hold);
 static struct task* spawn_common(const char* name, void (*entry)(void),
                                  int ppid_override, void* arg, void* console) {
+    return spawn_common_ex(name, entry, ppid_override, arg, console, 0);
+}
+static struct task* spawn_common_ex(const char* name, void (*entry)(void),
+                                    int ppid_override, void* arg, void* console,
+                                    int hold) {
     struct task* t = (struct task*)kcalloc(1, sizeof(struct task));
     if (!t) return NULL;
 
@@ -909,11 +917,33 @@ static struct task* spawn_common(const char* name, void (*entry)(void),
     master_insert_locked(t);
     spin_unlock_irqrestore(&master_lock, fl);
 
+    /* A HELD task is complete but not runnable yet: its creator still has
+     * fields to fill (task_spawn_arg_held). */
+    if (hold) return t;
+
     /* Pick a CPU and enqueue.  task_enqueue does the affinity-respecting
      * lightest-load selection. */
     task_enqueue(t);
     task_notify_change();                    /* M22.4 — new task appeared */
     return t;
+}
+
+/* A TASK THAT CANNOT RUN UNTIL ITS CREATOR HAS FINISHED BUILDING IT
+ * (2026-09-26).  fork() used to spawn the child and THEN copy the parent's
+ * signal handlers, ABI personality, TLS base, FPU state and reap claim onto
+ * it — by which time the child could already be running on another CPU
+ * without them.  The one that showed was the reap claim: a child that exited
+ * before task_set_reap_owned() ran was reaped by init, and the parent's
+ * waitpid() returned -1 (`excstorm`, one family in four).  §M49 already moved
+ * the console binding INTO the spawn for this reason; this is the general
+ * form: build held, fill in, then task_release(). */
+struct task* task_spawn_arg_held(const char* name, void (*entry)(void), void* arg) {
+    return spawn_common_ex(name, entry, -1, arg, NULL, 1);
+}
+void task_release(struct task* t) {
+    if (!t) return;
+    task_enqueue(t);
+    task_notify_change();
 }
 
 struct task* task_spawn_arg_console(const char* name, void (*entry)(void),
@@ -1899,14 +1929,41 @@ void task_force_kill_point(int from_user) {
 int task_reap(int pid) {
     if (!master_head) return -1;
 
+    /* ONE REAPER PER TASK, CLAIMED UNDER THE LOCK (2026-09-26).  The unlink
+     * below was the only claim, and it came after this function had already
+     * read and WRITTEN the task (its queues, cpu_home) — so a second reaper
+     * that found the same pid could be doing that to a struct the first had
+     * just freed.  Two reapers of one task was not hypothetical: the GUI's
+     * host sweep reaped fork children their parents were waiting for, and the
+     * same pid was reaped twice (`excstorm`; an x86_64 NMI followed).  The
+     * claim now happens in the same critical section as the lookup, so a task
+     * found by two reapers is taken by exactly one. */
+    struct task* t = NULL;
+    {
+        uint32_t cf = spin_lock_irqsave(&master_lock);
+        struct task* c = master_head;
+        if (c) {
+            do {
+                if (c->pid == pid) { t = c; break; }
+                c = c->next;
+            } while (c != master_head);
+        }
+        if (t && (t->state != TASK_DEAD || t->reaping)) t = NULL;
+        if (t) t->reaping = 1;
+        spin_unlock_irqrestore(&master_lock, cf);
+    }
+    if (!t) return -1;
+
     /* Refuse while the victim is still current anywhere — DEAD is set
      * just before its final context_switch, so there is a short window
-     * where the stack is still in use.  Caller retries. */
-    struct task* t = task_find(pid);
-    if (!t || t->state != TASK_DEAD) return -1;
+     * where the stack is still in use.  Caller retries (the claim is
+     * released so the retry can take it). */
     int n = smp_ncpus();
     for (int i = 0; i < n; i++)
-        if (percpu_at(i) && percpu_at(i)->current == t) return -1;
+        if (percpu_at(i) && percpu_at(i)->current == t) {
+            __atomic_store_n(&t->reaping, 0, __ATOMIC_RELEASE);
+            return -1;
+        }
 
     /* §M54 — and NOT current is not the same as NOT RUNNING.  The scheduler
      * publishes the incoming task as `current` before it swaps stacks, so a
@@ -1917,7 +1974,10 @@ int task_reap(int pid) {
      * signature was a jump to address 0x3, from a kernel with no clue why).
      * on_cpu is cleared by the task that takes the CPU over, i.e. strictly
      * after the swap.  Caller retries, exactly as for the `current` test. */
-    if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) return -1;
+    if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&t->reaping, 0, __ATOMIC_RELEASE);
+        return -1;
+    }
 
     /* §M54 — THE LAST LINE OF DEFENCE: never free a task that is still linked
      * in a runqueue.
@@ -1980,7 +2040,8 @@ int task_reap(int pid) {
 
     struct task* prev = master_head;
     while (prev->next != t && prev->next != master_head) prev = prev->next;
-    if (prev->next != t) {                   /* raced away — bail */
+    if (prev->next != t) {                   /* cannot happen with the claim */
+        t->reaping = 0;
         spin_unlock_irqrestore(&master_lock, fl);
         return -1;
     }

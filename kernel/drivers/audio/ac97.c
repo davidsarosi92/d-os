@@ -205,8 +205,20 @@ static void ac97_engine_reset(struct ac97* a) {
  * unambiguous rather than "full or empty, cannot tell". */
 static uint32_t ac97_outstanding(struct ac97* a) {
     if (!a->running) return 0;
-    /* The exact answer, once the interrupt has proved itself. */
-    if (a->irq_seen) return a->submitted - a->completed;
+    /* The exact answer, once the interrupt has proved itself — EXCEPT that a
+     * count of interrupts is not a count of buffers (2026-09-26).  BCIS is one
+     * status bit: two buffers that finish before the ISR runs raise it once,
+     * the ISR clears it once, and `completed` falls one behind for good.  Every
+     * `play` then ended with `ac97: drain timeout` — 585 ms spent waiting for a
+     * buffer that had played long ago (captured audio exact, 300.0 ms), which
+     * is how it hid: the sound was right and only the wait was wrong.  A
+     * HALTED engine is the authoritative answer: it stops only after the last
+     * valid buffer, so DCH means nothing is outstanding, and the count is
+     * resynchronised so the next sound starts from the truth. */
+    if (a->irq_seen) {
+        if (inw(a->nabm + PO_SR) & SR_DCH) { a->completed = a->submitted; return 0; }
+        return a->submitted - a->completed;
+    }
     if (inw(a->nabm + PO_SR) & SR_DCH) return 0;      /* halted: nothing left */
     uint32_t civ = (uint32_t)inb(a->nabm + PO_CIV) & (AC97_NBUF - 1);
     return (a->head - civ) & (AC97_NBUF - 1);
@@ -420,21 +432,24 @@ static int ac97_init(void* ctx) {
     outw(nam + NAM_PCM_ADC_RATE, AC97_RATE);           /* capture rate too    */
 
     /* DMA memory: one frame for the BDL, contiguous frames for the PCM
-     * buffer.  PMM-backed → phys == virt in the identity map. */
+     * buffer.  Reached through phys_to_virt, NOT by casting the address
+     * (2026-09-26): on x86_64 a DMA32 frame can sit above the low identity
+     * window and is only mapped in the direct map — the cast faulted in init
+     * the first time a 2 GiB machine handed out such a frame. */
     g_ac97.rec_bdl_phys = pmm_alloc_frame_dma32();
     g_ac97.rec_pcm_phys = pmm_alloc_contiguous_dma32(32);    /* 128 KB capture */
     g_ac97.bdl_phys = pmm_alloc_frame_dma32();
     g_ac97.pcm_phys = pmm_alloc_contiguous_dma32(32);        /* 128 KB               */
     if (!g_ac97.bdl_phys || !g_ac97.pcm_phys) { kprintf("ac97: DMA OOM\n"); return -3; }
-    g_ac97.bdl = (struct bdl_entry*)(uintptr_t)g_ac97.bdl_phys;
+    g_ac97.bdl = (struct bdl_entry*)phys_to_virt(g_ac97.bdl_phys);
     if (g_ac97.rec_bdl_phys && g_ac97.rec_pcm_phys) {
-        g_ac97.rec_bdl = (struct bdl_entry*)(uintptr_t)g_ac97.rec_bdl_phys;
-        g_ac97.rec_pcm = (int16_t*)(uintptr_t)g_ac97.rec_pcm_phys;
+        g_ac97.rec_bdl = (struct bdl_entry*)phys_to_virt(g_ac97.rec_bdl_phys);
+        g_ac97.rec_pcm = (int16_t*)phys_to_virt(g_ac97.rec_pcm_phys);
     } else {
         /* Capture is optional: a box short of DMA memory should still PLAY. */
         kprintf("ac97: no DMA for capture — recording unavailable\n");
     }
-    g_ac97.pcm = (int16_t*)(uintptr_t)g_ac97.pcm_phys;
+    g_ac97.pcm = (int16_t*)phys_to_virt(g_ac97.pcm_phys);
     for (int i = 0; i < BDL_ENTRIES; i++) { g_ac97.bdl[i].addr = 0; g_ac97.bdl[i].samples = 0; g_ac97.bdl[i].control = 0; }
 
     /* The completion interrupt.  NOTE the tree's own warning: `irq_install`

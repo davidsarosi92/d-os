@@ -210,7 +210,7 @@ static int vnet_transmit(struct net_device* dev, const void* frame, uint32_t len
     if (len > ETH_FRAME_MAX) return -1;
 
     /* Assemble [virtio_net_hdr | ethernet frame] into the TX buffer. */
-    uint8_t* buf = (uint8_t*)(uintptr_t)v->tx_buf_phys;
+    uint8_t* buf = (uint8_t*)phys_to_virt(v->tx_buf_phys);
     for (int i = 0; i < VNET_HDR_LEN; i++) buf[i] = 0;   /* zeroed header      */
     const uint8_t* f = (const uint8_t*)frame;
     for (uint32_t i = 0; i < len; i++) buf[VNET_HDR_LEN + i] = f[i];
@@ -255,7 +255,7 @@ static void vnet_poll(struct net_device* dev) {
         uint32_t wlen = e->len;                  /* virtio hdr + frame bytes   */
 
         if (di < RX_BUFFERS && wlen > VNET_HDR_LEN) {
-            const uint8_t* buf = (const uint8_t*)(uintptr_t)v->rx_buf_phys[di];
+            const uint8_t* buf = (const uint8_t*)phys_to_virt(v->rx_buf_phys[di]);
             net_rx(dev, buf + VNET_HDR_LEN, wlen - VNET_HDR_LEN);
         }
 

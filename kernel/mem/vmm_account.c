@@ -44,7 +44,7 @@ struct resident_acc {
  * "private" means "would be handed back on exit" and two spaces cannot both
  * hand back the same frame.
  * ------------------------------------------------------------------------- */
-static void resident_visit(void* ctx, uintptr_t va, uintptr_t phys,
+static void resident_visit(void* ctx, uintptr_t va, uint64_t phys,
                            uint32_t flags) {
     struct resident_acc* a = (struct resident_acc*)ctx;
     (void)va;

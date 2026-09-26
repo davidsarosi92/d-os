@@ -22,6 +22,7 @@
 ;   AP_INFO_ADDR + 4   uint32  stack_top
 ;   AP_INFO_ADDR + 8   uint32  c_entry (= address of ap_main)
 ;   AP_INFO_ADDR + 12  6 bytes GDTR (limit:2 + base:4)
+;   AP_INFO_ADDR + 18  uint32  CR4 bits to set before paging (PSE, PAE — §M86)
 ;
 ; The trampoline reads from there at well-known offsets.  Keep this
 ; layout in sync with smp.c.
@@ -85,9 +86,11 @@ ap_pm_entry:
     mov eax, [AP_INFO_ADDR + 0]
     mov cr3, eax
 
-    ; Enable PSE (CR4 bit 4) so the BSP's 4 MiB identity map works.
+    ; CR4 bits the BSP's page tables need: PSE for the classic 4 MiB identity
+    ; map, and PAE when the BSP chose PAE — an AP walking a PDPT as a page
+    ; directory would be lost the instant paging turned on.  §M86.
     mov eax, cr4
-    or  eax, 0x10
+    or  eax, [AP_INFO_ADDR + 18]
     mov cr4, eax
 
     ; Enable paging (CR0 bit 31).  After this instruction, EIP is

@@ -539,7 +539,7 @@ static int xhci_reset_and_init(void) {
     /* DCBAA — single frame, zeroed. */
     pmm_phys_t dcbaa_frame = pmm_alloc_frame_dma32();
     if (!dcbaa_frame) return -1;
-    xhc.dcbaa = (uint64_t*)(uintptr_t)dcbaa_frame;
+    xhc.dcbaa = (uint64_t*)phys_to_virt(dcbaa_frame);
     for (int i = 0; i < 512; i++) xhc.dcbaa[i] = 0;
     mmio_w32(xhc.op, XHCI_OP_DCBAAP_LO, dcbaa_frame);
     mmio_w32(xhc.op, XHCI_OP_DCBAAP_HI, 0);
@@ -555,7 +555,7 @@ static int xhci_reset_and_init(void) {
     if (ring_alloc(&xhc.evt_ring, 0) != 0) return -1;
     pmm_phys_t erst_frame = pmm_alloc_frame_dma32();
     if (!erst_frame) return -1;
-    uint32_t* erst = (uint32_t*)(uintptr_t)erst_frame;
+    uint32_t* erst = (uint32_t*)phys_to_virt(erst_frame);
     for (int i = 0; i < 1024; i++) erst[i] = 0;
     erst[0] = xhc.evt_ring.phys;          /* segment base low */
     erst[1] = 0;                          /* base high */
@@ -664,8 +664,8 @@ static int enumerate_root_device(void) {
     if (!dev_frame || !ic_frame) {
         kprintf("xhci: OOM for contexts\n"); return -1;
     }
-    xhc.dev_ctx = (uint8_t*)(uintptr_t)dev_frame;
-    xhc.input_ctx = (uint8_t*)(uintptr_t)ic_frame;
+    xhc.dev_ctx = (uint8_t*)phys_to_virt(dev_frame);
+    xhc.input_ctx = (uint8_t*)phys_to_virt(ic_frame);
     xhc.dev_ctx_phys = dev_frame;
     xhc.input_ctx_phys = ic_frame;
     /* Zero. */
@@ -720,7 +720,7 @@ static int enumerate_and_configure(void) {
     /* Allocate a DMA buffer for descriptors (one frame). */
     pmm_phys_t buf_frame = pmm_alloc_frame_dma32();
     if (!buf_frame) return -1;
-    uint8_t* buf = (uint8_t*)(uintptr_t)buf_frame;
+    uint8_t* buf = (uint8_t*)phys_to_virt(buf_frame);
     uint32_t buf_phys = buf_frame;
 
     /* Get the full Device Descriptor (18 bytes). */
@@ -837,7 +837,7 @@ static int enumerate_and_configure(void) {
     /* DMA buffer for the periodic report. */
     pmm_phys_t rb_frame = pmm_alloc_frame_dma32();
     if (!rb_frame) return -1;
-    xhc.intr_in_buf = (uint8_t*)(uintptr_t)rb_frame;
+    xhc.intr_in_buf = (uint8_t*)phys_to_virt(rb_frame);
     xhc.intr_in_buf_phys = rb_frame;
     for (int i = 0; i < (int)hid_pkt; i++) xhc.intr_in_buf[i] = 0;
     xhc.hid_pkt_size = hid_pkt;

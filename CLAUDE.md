@@ -68,7 +68,12 @@ wrote its entries into the NEIGHBOURING file's clusters while fsck said clean
 packed+hashed slots (1060 creates 512 s → 29 s); `blkstormtest` proves the
 storm detector on the real storm; HDA no longer goes silent for good after an
 underrun.  NEXT.md's open list is empty apart from the emulator's timer floor.
-PLAN gained §M84 (phone), §M85 (sbsa-ref), §M86 (memory past 4 GiB on i386/ARM).
+PLAN gained §M84 (phone), §M85 (sbsa-ref), §M86 (memory past 4 GiB on i386/ARM).  **§M86 stages 1-2 SHIPPED (2026-09-26, DOCS §4.94/§4.96): i386
+manages all RAM through `ZONE_HIGHMEM` + kmap, and with PAE (a second page-table
+format behind the same VMM accessors, classic kept for CPUs without it) physical
+memory above 4 GiB — `-m 8G` verified frame by frame.**  Raising the ceiling
+exposed four x86_64 DMA drivers dereferencing physical addresses (use
+`phys_to_virt`, always).  Next: §M86 stage 3 (aarch64 TTBR1 direct map).
 
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there

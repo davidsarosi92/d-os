@@ -58,10 +58,10 @@ struct vmm_space;
  * carries the VMM_* bits above, translated by the backend where the hardware
  * layout differs.  Declared here rather than in vmm.h so the aarch64 backend
  * can implement `vmm_space_walk` without including a header it cannot. */
-typedef void (*vmm_walk_fn)(void* ctx, uintptr_t va, uintptr_t phys,
+typedef void (*vmm_walk_fn)(void* ctx, uintptr_t va, uint64_t phys,
                             uint32_t flags);
 
 void vmm_space_walk(struct vmm_space* space, vmm_walk_fn cb, void* ctx);
-uint32_t vmm_frame_share_count(uintptr_t phys);
+uint32_t vmm_frame_share_count(uint64_t phys);   /* 64-bit: i386 PAE frames */
 
 #endif

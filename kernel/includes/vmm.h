@@ -48,7 +48,9 @@ void vmm_init(void);
 /* Install a mapping from virtual `virt` to physical `phys`, both 4 KiB
  * aligned.  Returns 0 on success, non-zero if the relevant entry is
  * already a large page or a page-table allocation fails. */
-int vmm_map(uintptr_t virt, uintptr_t phys, uint32_t flags);
+/* `phys` is 64-bit on every arch (§M86): with i386 PAE a frame may lie above
+ * 4 GiB, and a uintptr_t would silently truncate it to a different page. */
+int vmm_map(uintptr_t virt, uint64_t phys, uint32_t flags);
 
 /* Physical address of the top-level page table.  Returned as uintptr_t
  * so it works on both archs.  Used by the AP boot trampoline (M18) so
@@ -151,7 +153,7 @@ int vmm_cow_fault(uintptr_t fault_va);
 
 /* Map / unmap a page in a *specific* space's user region.  Same flag
  * semantics as vmm_map (pass VMM_USER for a ring-3-accessible page). */
-int  vmm_space_map(struct vmm_space* space, uintptr_t virt, uintptr_t phys,
+int  vmm_space_map(struct vmm_space* space, uintptr_t virt, uint64_t phys,
                    uint32_t flags);
 void vmm_space_unmap(struct vmm_space* space, uintptr_t virt);
 

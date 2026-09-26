@@ -973,9 +973,19 @@ static void reap_gui_host(struct task* host) {
  * A terminal shell mid-teardown is still referenced (win->vc->task), so
  * this never races the WIN_TERM reap path. */
 struct gui_host_scan { int pids[GUI_MAX_WINDOWS * 2]; int n; };
+extern int compositor_pid;
 static void gui_host_scan_cb(const struct task* t, int is_current, void* ctx) {
     struct gui_host_scan* s = (struct gui_host_scan*)ctx;
     if (is_current || t->state != TASK_DEAD || !t->reap_owned) return;
+    /* ONLY THE GUI'S OWN HOSTS (2026-09-26).  "reap_owned" means "somebody
+     * other than init will reap this", not "the GUI will": every forked child
+     * is reap_owned too, held for its parent's waitpid().  This sweep used to
+     * take ANY of them no window referenced — so while a desktop was up, a
+     * process's child could be reaped under it and waitpid() returned -1
+     * (`excstorm`: one fork in three; DBGREAP named `reap_dead_gui_hosts`).
+     * App hosts are children of the desktop or the compositor; nothing else
+     * is this sweep's to take. */
+    if (t->ppid <= 0 || (t->ppid != desktop_pid && t->ppid != compositor_pid)) return;
     if (s->n < (int)(sizeof s->pids / sizeof s->pids[0])) s->pids[s->n++] = t->pid;
 }
 static void reap_dead_gui_hosts(void) {

@@ -201,7 +201,12 @@ static void cmd_highmemtest(const char* args) {
         uint32_t pat = (uint32_t)(f >> 12) * 2654435761u;
         for (int i = 2; i < 1024; i++) p[i] = pat ^ (uint32_t)i;
         p[0] = 0xC0DEF00Du;
-        p[1] = (uint32_t)head;                    /* chain: previous frame */
+        /* The chain holds the previous FRAME NUMBER, not its address: with
+         * PAE a frame lives above 4 GiB and a 32-bit address word truncates
+         * it — the first version walked into low memory after the first
+         * such frame, "verified" 520 196 of 1 836 000 and freed frames it
+         * had never allocated.  A pfn fits 32 bits up to 16 TiB. */
+        p[1] = (uint32_t)(head >> 12);            /* chain: previous frame */
         kunmap_frame(p);
         head = f;
         n++;
@@ -213,7 +218,7 @@ static void cmd_highmemtest(const char* args) {
         uint32_t pat = (uint32_t)(head >> 12) * 2654435761u;
         int ok = p[0] == 0xC0DEF00Du;
         for (int i = 2; ok && i < 1024; i++) if (p[i] != (pat ^ (uint32_t)i)) ok = 0;
-        pmm_phys_t next = (pmm_phys_t)p[1];
+        pmm_phys_t next = (pmm_phys_t)p[1] << 12;
         kunmap_frame(p);
         if (!ok) bad++;
         checked++;

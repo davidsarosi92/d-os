@@ -63,6 +63,10 @@ established; "open" rows were checked against today's tree, not copied forward.
 | GUI teardown freed surfaces while the compositor still drew | x86_64 GPF at rip=`0xff0000ffff0000ff`, NMIs in font tables | `3fce70f` |
 | config had one layer (user overwrote machine; leaked across sessions) | `sessiontest` FAIL×3 | `3fce70f` |
 | harness could not issue a command once a GUI window held focus (§4.74) | every GUI-state test needed a pre-set config key (`gui.autorun`, `gui.stats_ms`…) | COM1 command channel (`serial_cmd.c`) + `--via serial` / `--monitor-cmd "serial …"`; `shell_current_vc()` made per-task |
+| x86_64 DMA drivers (ac97, hda, virtio-net, xhci contexts) dereferenced PHYSICAL addresses | ac97 faulted in init at `-m 2G` (contained by §M33) | DOCS §4.96 — `phys_to_virt` |
+| `ac97: drain timeout` after every `play` (sound itself exact) | one BCIS for two finished buffers → count one behind | DOCS §4.96 — halted engine (DCH) is authoritative |
+| two reapers could both work on one DEAD task (`task_reap` claimed only at unlink) | the GUI host sweep reaped fork children; double reap → hang | DOCS §4.96 — `reaping` claimed under the master lock |
+| PMM-GUARD compared phys at pointer width | false "INTO kernel image" per free above 4 GiB | DOCS §4.96 |
 
 Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI report with
 `if=`/`task=`/`isr-vec=`/stack scan, monitor replies kept in `<log>.mon`,

@@ -109,6 +109,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     /* Memory management — physical bitmap, paging, then the kernel heap. */
     pmm_init();
     vmm_init();
+    pmm_seed_deferred();   /* §M86 — frames only reachable once paging is on */
     kmalloc_init();
 
     /* VFS root must exist before any fs module's `register_fs` /
