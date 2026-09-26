@@ -72,7 +72,7 @@ struct klog_record {
 /* Structured emit: format through kprintf (so it also hits the console)
  * and stamp the committed record with `level` + `tag`.  End `fmt` with a
  * '\n' so the line commits with the intended level/tag. */
-void klog(int level, const char* tag, const char* fmt, ...);
+void klog(int level, const char* tag, const char* fmt, ...) __attribute__((format(printf, 3, 4)));
 
 /* Tee hook, called by printf.c's emit() for every output byte.  Assembles
  * a line in the staging buffer; on '\n' commits a record.  Not called by

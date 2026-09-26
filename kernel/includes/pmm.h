@@ -84,14 +84,12 @@
  * compare against BUDDY_MAX_FRAMES compares against this. */
 extern uint32_t pmm_nr_frames;
 
-/* Physical address width.  i386's page tables hold 32-bit physical addresses,
- * so widening the type there would buy nothing but code size; the 64-bit
- * arches must reach past 4 GiB or the ceiling above is decorative. */
-#if defined(__x86_64__) || defined(__aarch64__)
+/* Physical address width: 64 bits on EVERY arch (§M86, 2026-09-26).  i386 kept
+ * it at 32 while its page tables could only hold 32-bit addresses; PAE's hold
+ * 64, and a frame above 4 GiB has to be nameable before it can be managed.
+ * kprintf is format-checked so a `%x` of one is a compile warning, not an
+ * argument that silently shifts every later one. */
 typedef uint64_t pmm_phys_t;
-#else
-typedef uint32_t pmm_phys_t;
-#endif
 
 /* Zone identifiers, ordered by how CONSTRAINED the memory is: a lower zone can
  * satisfy anything a higher one can, but not vice versa.  A hint therefore

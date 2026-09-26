@@ -432,7 +432,7 @@ static void cmd_faulttest(void) {
             cp_in, cp_out, str_in,
             (cp_in < 0 && cp_out < 0 && str_in < 0) ? "PASS" : "FAIL");
     kprintf("faulttest: bounce write(valid)=%ld write(straddle)=%ld mid-copy=%d partial=%d -> %s\n",
-            w_ok, w_strad, cp_partial, partial_ok,
+            w_ok, w_strad, (int)cp_partial, partial_ok,
             (w_ok == 5 && w_strad < 0 && cp_partial < 0 && partial_ok) ? "PASS" : "FAIL");
     console_write("faulttest: the box is still running — that IS the test.\n");
 }

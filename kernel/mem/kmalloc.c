@@ -126,7 +126,7 @@ void* kmalloc(size_t size) {
      * block beats corrupting whatever follows the table. */
     if ((phys >> 12) >= big_alloc_nr) {
         kprintf("kmalloc: frame %u outside the %u-frame side table\n",
-                phys >> 12, big_alloc_nr);
+                (unsigned)(phys >> 12), big_alloc_nr);
         page_free(phys, order);
         return NULL;
     }

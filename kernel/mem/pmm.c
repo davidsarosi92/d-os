@@ -187,9 +187,10 @@ static inline void link_store_at(pmm_phys_t phys, int slot, pmm_phys_t next) {
      * remains as a regression detector.) */
     uintptr_t ks = (uintptr_t)kernel_start, ke = (uintptr_t)kernel_end;
     if ((uintptr_t)phys >= ks && (uintptr_t)phys < ke) {
-        kprintf("PMM-GUARD: link_store 0x%x INTO kernel image [0x%x,0x%x) "
-                "pfn=%u caller=%p\n", phys, (uint32_t)ks, (uint32_t)ke,
-                phys >> PMM_FRAME_SHIFT, __builtin_return_address(0));
+        kprintf("PMM-GUARD: link_store 0x%llx INTO kernel image [0x%x,0x%x) "
+                "pfn=%u caller=%p\n", (unsigned long long)phys, (uint32_t)ks,
+                (uint32_t)ke, (unsigned)(phys >> PMM_FRAME_SHIFT),
+                __builtin_return_address(0));
     }
     if (!frame_is_direct(phys)) {
         volatile pmm_phys_t* p = (volatile pmm_phys_t*)kmap_frame(phys);
@@ -849,12 +850,14 @@ void pmm_validate(const char* tag) {
             uint32_t guard = z->nr_at_order[o] + 4;
             while (cur) {
                 if (cur & (PMM_FRAME_SIZE - 1)) {
-                    kprintf("PMMCHK[%s]: z%d o%d node phys=%x NOT frame-aligned\n", tag, zi, o, cur);
+                    kprintf("PMMCHK[%s]: z%d o%d node phys=%llx NOT frame-aligned\n", tag, zi, o,
+                            (unsigned long long)cur);
                     return;
                 }
                 uint32_t pfn = phys_to_pfn(cur);
                 if (pfn >= pmm_nr_frames) {
-                    kprintf("PMMCHK[%s]: z%d o%d node pfn=%x OUT OF RANGE (phys=%x)\n", tag, zi, o, pfn, cur);
+                    kprintf("PMMCHK[%s]: z%d o%d node pfn=%x OUT OF RANGE (phys=%llx)\n", tag, zi, o, pfn,
+                            (unsigned long long)cur);
                     return;
                 }
                 if (page_state[pfn] != (uint8_t)o) {

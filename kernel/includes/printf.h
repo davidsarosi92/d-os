@@ -10,7 +10,11 @@
 
 #include <stdarg.h>
 
-void kprintf(const char* fmt, ...);
+/* Format-checked (2026-09-26): making pmm_phys_t 64-bit on i386 (§M86 PAE)
+ * turned every `%x` of a physical address into an argument that shifts every
+ * later one — a `%s` after it reads garbage as a pointer.  The compiler can
+ * find all of those; nothing else reliably can. */
+void kprintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /* va_list form of kprintf — same formatting + console/klog teeing.
  * Used by klog() (klog.c) so structured log lines format through the
