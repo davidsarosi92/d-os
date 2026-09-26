@@ -1449,7 +1449,7 @@ static void schedule_locked(struct percpu* me) {
      * stack. */
     hal_set_kernel_stack((next->user_task && next->kstack_base)
                          ? (uintptr_t)next->kstack_base + TASK_KSTACK_SZ
-                         : 0);
+                         : next->exc_kstack);   /* #11: an excursion's own stack, or 0 */
     /* §M33 Tier 1 — and the incoming task's PORT GRANT, for the same reason
      * and at the same moment: a ring-3 IN/OUT after this point must consult
      * this task's permission and not the previous one's.  NULL for everything

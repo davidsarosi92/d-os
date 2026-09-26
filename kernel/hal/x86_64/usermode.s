@@ -12,7 +12,7 @@
 ;
 ; The SYS_EXIT teleport trick is identical: when ring 3 issues int 0x80
 ; with rax = SYS_EXIT, syscall_dispatch calls hal_syscall_exit_to_kernel
-; which restores rsp = saved_rsp and jumps to saved_rip — landing on the
+; which restores rsp/rip from the task's exc_resume (#11) — landing on the
 ; `.return` label below and unwinding normally.
 ;
 ; The dedicated syscall stack (TSS.RSP0 → syscall_stack in tss.c) is
@@ -24,23 +24,19 @@
 bits 64
 section .text
 
-global enter_user_mode_wrap
+global arch_enter_user_wrap
 global enter_user_mode
-global saved_rsp
-global saved_rip
 
 ; Internal storage exported so syscall.c can read them.  qwords because
 ; we're storing 64-bit register values.
 section .data
 align 8
-saved_rsp: dq 0
-saved_rip: dq 0
 
 section .text
 
-; void enter_user_mode_wrap(uintptr_t user_rip, uintptr_t user_rsp);
-;   System V AMD64: rdi = user_rip, rsi = user_rsp.
-enter_user_mode_wrap:
+; void arch_enter_user_wrap(uintptr_t user_rip, uintptr_t user_rsp, uintptr_t* resume);
+;   System V AMD64: rdi = user_rip, rsi = user_rsp, rdx = resume (#11: per task).
+arch_enter_user_wrap:
     ; Save callee-saved regs the caller expects preserved across the
     ; call.  System V AMD64: rbx, rbp, r12..r15 (6 regs, 48 B).
     push rbx
@@ -50,10 +46,11 @@ enter_user_mode_wrap:
     push r14
     push r15
 
-    ; Stash kernel context for the SYS_EXIT teleport.
-    mov [rel saved_rsp], rsp
+    ; Stash kernel context for the SYS_EXIT teleport — in the task's
+    ; exc_resume (rdx), not in globals (#11).
+    mov [rdx], rsp
     lea rax, [rel .return]
-    mov [rel saved_rip], rax
+    mov [rdx + 8], rax
 
     ; Build a 5-quadword iretq frame.  Order (low-addr last, since
     ; iretq pops from rsp upward):

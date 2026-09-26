@@ -5,53 +5,53 @@
 ;
 ;   enter_user_mode_wrap(uint32_t eip, uint32_t esp):
 ;     - pushes callee-saved regs + EBP
-;     - stashes the resulting kernel ESP into `saved_esp`
-;     - stashes the address of the `.return` label into `saved_eip`
+;     - stashes the resulting kernel ESP and the address of the `.return`
+;       label into the caller-supplied resume[0..1] (the task's exc_resume, #11)
 ;     - builds a ring-3 iret frame (SS, ESP, EFLAGS, CS, EIP)
 ;     - executes `iret` — CPU now runs in ring 3 at `eip` with stack `esp`
 ;
 ;   The ring-3 program runs until it issues `int 0x80` with EAX = 1
 ;   (the SYS_EXIT syscall).  syscall.c handles that by setting ESP =
-;   `saved_esp` and jumping to `saved_eip` — i.e. into our `.return`
+;   the task's exc_resume[0] and jumping to exc_resume[1] — i.e. into our `.return`
 ;   label below — bypassing the normal iret-back-to-user path.
 ;
 ;   `.return` then pops the saved callee regs and `ret`s to whoever
 ;   called `enter_user_mode_wrap`.  From the caller's point of view,
 ;   the function ran a ring-3 program and returned normally.
 ;
-; The kernel stack used by syscall handler is TSS.esp0 (a separate 4 KiB
-; buffer in tss.c), so the syscall doesn't trample the kernel state we
-; saved here.  See tss.c for the rationale.
+; The kernel stack used by the syscall handler is TSS.esp0, which
+; enter_user_mode_wrap (proc.c) points at the task's OWN stack 512 bytes below
+; the caller, so the syscall doesn't trample the kernel state saved here (#11;
+; it used to be a per-CPU shared buffer in tss.c).
 ; =============================================================================
 
 bits 32
 section .text
 
-global enter_user_mode_wrap
+global arch_enter_user_wrap
 global enter_user_mode
 global enter_user_mode_regs
-global saved_esp
-global saved_eip
 
 extern resume_kernel_after_syscall_exit
 
-; Internal storage exported as global so syscall.c can reach them.
+; #11 — the resume point is stored where the CALLER says (the task's
+; exc_resume), not in globals: two excursions at once used to overwrite each
+; other's saved ESP/EIP here.
 section .data
 align 4
-saved_esp: dd 0
-saved_eip: dd 0
 global g_entry_gs
 g_entry_gs: dw 0x23                              ; ring-3 %gs for enter_user_mode_regs
 
 section .text
 
-; void enter_user_mode_wrap(uint32_t eip, uint32_t esp);
-;   Stack on entry:  [esp+0]=ret_addr, [esp+4]=eip, [esp+8]=esp
-enter_user_mode_wrap:
+; void arch_enter_user_wrap(uint32_t eip, uint32_t esp, uint32_t* resume);
+;   Stack on entry:  [esp+0]=ret_addr, [esp+4]=eip, [esp+8]=esp, [esp+12]=resume
+arch_enter_user_wrap:
     pushad                                      ; save 8 GP regs (32 bytes)
 
-    mov [saved_esp], esp                        ; remember kernel ESP
-    mov dword [saved_eip], .return              ; remember resume label
+    mov ecx, [esp + 44]                         ; resume (after pushad: +32)
+    mov [ecx], esp                              ; resume[0] = kernel ESP
+    mov dword [ecx + 4], .return                ; resume[1] = resume label
 
     ; Pull args off the stack.  After pushad, args are at +36, +40
     mov eax, [esp + 36]                         ; eip

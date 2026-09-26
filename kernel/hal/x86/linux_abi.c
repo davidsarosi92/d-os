@@ -35,8 +35,7 @@
 #include <stddef.h>
 
 /* Excursion teleport-back (shared with the native path, usermode.s). */
-extern uint32_t saved_esp;
-extern uint32_t saved_eip;
+#include "usermode.h"
 
 /* Linux i386 syscall numbers we understand (grows toward the musl-required
  * set).  Anything else returns -ENOSYS and is logged once. */
@@ -630,7 +629,7 @@ static void linux_exit(struct int_frame* f, int code) {
         fd_close_all();
         task_exit_code(code);
     }
-    hal_syscall_exit_to_kernel(saved_esp, saved_eip);
+    user_excursion_teleport();   /* #11: the task's own resume point */
     (void)f;
 }
 

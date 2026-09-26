@@ -21,6 +21,16 @@
 
 void enter_user_mode_wrap(uintptr_t user_ip, uintptr_t user_sp);
 
+/* The arch half (usermode.s / usermode.S): save the kernel resume point into
+ * resume[0] (sp) and resume[1] (pc), then drop to ring 3 / EL0.  Called only
+ * by the portable enter_user_mode_wrap (proc.c), which owns the per-task
+ * state around it. */
+void arch_enter_user_wrap(uintptr_t user_ip, uintptr_t user_sp, uintptr_t* resume);
+
+/* SYS_EXIT of an excursion: resume the kernel where enter_user_mode_wrap left
+ * off, from the CURRENT task's saved point.  Does not return. */
+void user_excursion_teleport(void) __attribute__((noreturn));
+
 /* Tier B — ONE-WAY drop to ring 3 / EL0 for an independent user process.
  * Unlike enter_user_mode_wrap it saves no kernel resume context: the calling
  * user-task bootstrap never returns; the task re-enters the kernel only via

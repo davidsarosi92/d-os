@@ -106,10 +106,9 @@ uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
  * usermode.S globals, so this HAL entry just delegates to the teleport helper
  * (the args are accepted for a uniform HAL signature but unused here).  Kept so
  * the portable syscall shape is identical across the three arches. */
-void aarch64_user_exit(void);
+void aarch64_user_exit_to(uint64_t sp, uint64_t lr);
 void hal_syscall_exit_to_kernel(uintptr_t saved_sp, uintptr_t saved_pc) {
-    (void)saved_sp; (void)saved_pc;
-    aarch64_user_exit();                 /* does not return */
+    aarch64_user_exit_to((uint64_t)saved_sp, (uint64_t)saved_pc);   /* no return */
     __builtin_unreachable();
 }
 

@@ -33,6 +33,7 @@
 #include "vmm.h"
 #include "hal_api.h"   /* §M51 — hal_tlb_shootdown */
 #include "pmm.h"
+#include "cowref.h"
 #include "printf.h"
 #include "kmalloc.h"
 #include "task.h"      /* task_current — COW resolves in the current space */
@@ -458,15 +459,8 @@ static uint16_t* g_cow_ref;
 static uint32_t  g_cow_nr;
 
 static uint16_t* cow_slot(uintptr_t phys) {
-    if (!g_cow_ref) {
-        /* First use — after pmm_init, so the frame count is known.  Bootmem
-         * memory is not zeroed; a stale nonzero refcount would pin frames
-         * forever, so clear it explicitly. */
-        g_cow_nr  = pmm_nr_frames;
-        g_cow_ref = (uint16_t*)pmm_bootmem_alloc(g_cow_nr * (uint32_t)sizeof(uint16_t));
-        if (!g_cow_ref) { g_cow_nr = 0; return NULL; }
-        for (uint32_t i = 0; i < g_cow_nr; i++) g_cow_ref[i] = 0;
-    }
+    static spinlock_t cow_build_lock = SPINLOCK_INIT;
+    if (!cow_table_get(&g_cow_ref, &g_cow_nr, &cow_build_lock)) return NULL;
     uintptr_t fn = phys >> 12;
     return (fn < g_cow_nr) ? &g_cow_ref[fn] : NULL;
 }
@@ -496,8 +490,7 @@ static void free_subtree(uint64_t* tbl, uint64_t* ktbl, int depth) {
             uintptr_t fphys = (uintptr_t)e & PAGE_MASK_4K;
             if (e & VMM_COW) {
                 uint16_t* rc = cow_slot(fphys);
-                if (rc && *rc > 1) { (*rc)--; continue; }
-                if (rc) *rc = 0;
+                if (rc && !cow_ref_drop(rc)) continue;   /* others still hold it */
             }
             pmm_free_frame((pmm_phys_t)fphys);
         }
@@ -555,7 +548,7 @@ static uintptr_t clone_subtree(uint64_t* ptbl, uint64_t* ktbl, int depth,
             if ((e & PTE_RW) || (e & VMM_COW)) {
                 /* → copy-on-write in BOTH spaces (read-only + VMM_COW). */
                 uint16_t* rc = cow_slot(fphys_old);
-                if (rc) *rc = (*rc == 0) ? 2 : (uint16_t)(*rc + 1);
+                if (rc) cow_ref_share(rc);
                 uint64_t cow_e = (e & ~(uint64_t)PTE_RW) | VMM_COW;
                 ptbl[i] = cow_e;                  /* parent loses write access  */
                 ntbl[i] = cow_e;                  /* child shares it read-only  */
@@ -647,10 +640,10 @@ int vmm_cow_fault(uintptr_t fault_va) {
     uintptr_t old = (uintptr_t)pte & PAGE_MASK_4K;
     uint16_t* rc = cow_slot(old);
 
-    if (rc && *rc <= 1) {
+    if (rc && cow_ref_sole(rc)) {
         /* Last tracked sharer — grant write in place, no copy needed. */
         pt[pti] = (pte | PTE_RW) & ~(uint64_t)VMM_COW;
-        *rc = 0;
+        __atomic_store_n(rc, 0, __ATOMIC_RELEASE);
     } else {
         /* Shared (or untracked → always copy, see cow_slot): private copy. */
         pmm_phys_t nf = pmm_alloc_frame();
@@ -658,9 +651,10 @@ int vmm_cow_fault(uintptr_t fault_va) {
         const uint8_t* src = (const uint8_t*)phys_to_virt(old);
         uint8_t* dst = (uint8_t*)phys_to_virt(nf);
         for (int b = 0; b < 4096; b++) dst[b] = src[b];
-        if (rc) (*rc)--;
         pt[pti] = ((uint64_t)nf & PAGE_MASK_4K)
                 | ((((pte & ~PAGE_MASK_4K) | PTE_RW) & ~(uint64_t)VMM_COW));
+        /* Give up our share only after the copy (cowref.h). */
+        if (rc && cow_ref_put_copy(rc)) pmm_free_frame((pmm_phys_t)old);
     }
     /* §M51 — the entry now points at a different frame (or became writable in
      * place); a sibling thread on another core still holds the old read-only
@@ -787,3 +781,7 @@ uintptr_t vmm_space_mmap_cursor(struct vmm_space* s) {
 void vmm_space_set_mmap_cursor(struct vmm_space* s, uintptr_t v) {
     if (s) s->mmap_cursor = v;
 }
+
+/* The CR3 value of a space (0 for NULL = the kernel's).  For fault reports. */
+uintptr_t vmm_space_root_phys(struct vmm_space* s) { return s ? (uintptr_t)s->pml4_phys : 0; }
+

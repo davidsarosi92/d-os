@@ -10,7 +10,7 @@
  *     - `eret` — the CPU is now at EL0 running `entry`.
  *
  *   The EL0 program runs until it issues `svc #0` with x8 = SYS_EXIT (1).
- *   syscall.c handles that by calling aarch64_user_exit(), which restores the
+ *   syscall.c handles that by calling user_excursion_teleport(), which restores the
  *   stashed kernel SP + LR and `ret`s — so from the caller's point of view
  *   aarch64_enter_user ran an EL0 program and returned normally.  This bypasses
  *   the normal RESTORE_TRAPFRAME/eret-back-to-EL0 path, exactly like the x86
@@ -22,23 +22,16 @@
  * task's own kernel stack (SP_EL1 at eret time) is used.
  * ============================================================================= */
 
-.section .data
-.balign 8
-uk_sp:  .quad 0                 /* kernel SP to resume on SYS_EXIT   */
-uk_lr:  .quad 0                 /* kernel return address (LR)        */
-
 .section .text
 
-/* void aarch64_enter_user(uint64_t entry_va, uint64_t user_sp); */
+/* void aarch64_enter_user(uint64_t entry_va, uint64_t user_sp, uint64_t* resume);
+ * #11 — the resume point goes where the caller says (the task's exc_resume),
+ * not into globals: two excursions at once used to overwrite each other's. */
 .global aarch64_enter_user
 aarch64_enter_user:
     mov     x9, sp
-    adrp    x10, uk_sp
-    add     x10, x10, :lo12:uk_sp
-    str     x9, [x10]                   /* save caller SP  */
-    adrp    x11, uk_lr
-    add     x11, x11, :lo12:uk_lr
-    str     x30, [x11]                  /* save caller LR  */
+    str     x9,  [x2]                   /* resume[0] = caller SP */
+    str     x30, [x2, #8]               /* resume[1] = caller LR */
 
     msr     sp_el0,  x1                 /* user stack      */
     msr     elr_el1, x0                 /* user entry PC   */
@@ -47,25 +40,20 @@ aarch64_enter_user:
     isb
     eret
 
-/* void aarch64_user_exit(void);  — teleport back to aarch64_enter_user's caller.
- * Runs at EL1 inside the SVC handler; abandons the exception frames by restoring
- * the stashed SP, then `ret`s to the stashed LR. */
-.global aarch64_user_exit
-aarch64_user_exit:
-    adrp    x10, uk_sp
-    add     x10, x10, :lo12:uk_sp
-    ldr     x9, [x10]
-    adrp    x11, uk_lr
-    add     x11, x11, :lo12:uk_lr
-    ldr     x30, [x11]
-    mov     sp, x9
+/* void aarch64_user_exit_to(uint64_t sp, uint64_t lr);  — teleport back to
+ * aarch64_enter_user's caller.  Runs at EL1 inside the SVC handler; abandons
+ * the exception frames by installing the saved SP, then `ret`s to the saved LR. */
+.global aarch64_user_exit_to
+aarch64_user_exit_to:
+    mov     sp, x0
+    mov     x30, x1
     ret
 
 /* -----------------------------------------------------------------------------
  * void enter_user_mode(uint64_t entry_va, uint64_t user_sp);  — Tier B, ONE-WAY.
  *
  * The concurrent-user-process EL0 entry: unlike aarch64_enter_user it saves NO
- * kernel resume context (no uk_sp/uk_lr, which are shared globals unsafe under
+ * kernel resume context (the excursion's resume point is per task now, #11 — this path needs none,
  * concurrency).  The user-task bootstrap never returns; the task re-enters the
  * kernel only via svc/IRQ (on its own SP_EL1 = its kernel stack, tracked by
  * context_switch), and SYS_EXIT ends the task via task_exit().

@@ -41,8 +41,7 @@
 #include <stddef.h>
 
 /* Excursion teleport-back (shared with the native path, usermode.s). */
-extern uint64_t saved_rsp;
-extern uint64_t saved_rip;
+#include "usermode.h"
 
 /* ---- Linux x86_64 syscall numbers (unistd_64.h) --------------------------- */
 #define LNX_read              0
@@ -491,7 +490,7 @@ static void linux_exit(struct int_frame* f, int code) {
         fd_close_all();
         task_exit_code(code);
     }
-    hal_syscall_exit_to_kernel((uintptr_t)saved_rsp, (uintptr_t)saved_rip);
+    user_excursion_teleport();   /* #11: the task's own resume point */
     (void)f;
 }
 

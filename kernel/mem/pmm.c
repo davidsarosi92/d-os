@@ -161,16 +161,20 @@ static int ceil_log2(uint32_t n) {
 static inline int frame_is_direct(pmm_phys_t phys) {
     return (phys >> PMM_FRAME_SHIFT) < pmm_direct_end_pfn;
 }
-static inline pmm_phys_t link_load(pmm_phys_t phys) {
+/* Slot 0 of a free block is its NEXT link, slot 1 its PREV link (2026-09-26:
+ * the list is doubly linked so a removal is O(1) — see zone_remove). */
+static inline pmm_phys_t link_load_at(pmm_phys_t phys, int slot) {
     if (!frame_is_direct(phys)) {
         volatile pmm_phys_t* p = (volatile pmm_phys_t*)kmap_frame(phys);
-        pmm_phys_t v = *p;
+        pmm_phys_t v = p[slot];
         kunmap_frame((void*)p);
         return v;
     }
-    return *(volatile pmm_phys_t*)phys_to_virt(phys);
+    return ((volatile pmm_phys_t*)phys_to_virt(phys))[slot];
 }
-static inline void link_store(pmm_phys_t phys, pmm_phys_t next) {
+static inline pmm_phys_t link_load(pmm_phys_t phys) { return link_load_at(phys, 0); }
+static inline void link_store_at(pmm_phys_t phys, int slot, pmm_phys_t v);
+static inline void link_store_at(pmm_phys_t phys, int slot, pmm_phys_t next) {
     /* Invariant guard (cheap, permanent).  The intrusive free-list link is
      * written INTO the freed page, so a free frame must NEVER alias the live
      * kernel image.  If this ever fires, the buddy pool wrongly contains a
@@ -189,43 +193,49 @@ static inline void link_store(pmm_phys_t phys, pmm_phys_t next) {
     }
     if (!frame_is_direct(phys)) {
         volatile pmm_phys_t* p = (volatile pmm_phys_t*)kmap_frame(phys);
-        *p = next;
+        p[slot] = next;
         kunmap_frame((void*)p);
         return;
     }
-    *(volatile pmm_phys_t*)phys_to_virt(phys) = next;
+    ((volatile pmm_phys_t*)phys_to_virt(phys))[slot] = next;
 }
+static inline void link_store(pmm_phys_t phys, pmm_phys_t next) { link_store_at(phys, 0, next); }
 
 /* Push a free block of `order` onto a zone's free list.  Caller holds
  * zone->lock.  Stamps the head pfn's state with the order so coalesce
  * can recognize it as the same-order partner. */
 static void zone_push(struct zone* z, uint32_t pfn, int order) {
     pmm_phys_t phys = pfn_to_phys(pfn);
-    link_store(phys, z->free_lists[order]);
+    pmm_phys_t head = z->free_lists[order];
+    link_store_at(phys, 0, head);
+    link_store_at(phys, 1, 0);
+    if (head) link_store_at(head, 1, phys);
     z->free_lists[order]   = phys;
     z->nr_at_order[order] += 1;
     page_state[pfn]        = (uint8_t)order;
 }
 
-/* Remove a specific (pfn, order) from the zone's free list.  O(list_len)
- * walk; only invoked during coalesce, where the buddy we're trying to
- * pull off is generally near the head.  Caller holds zone->lock. */
+/* Remove a specific (pfn, order) from the zone's free list.  Caller holds
+ * zone->lock and has checked page_state[pfn] == order (the block IS free at
+ * that order, so it is on that list).
+ *
+ * O(1), BECAUSE THE LIST IS DOUBLY LINKED (2026-09-26).  This used to walk the
+ * list from its head to find the predecessor — "the buddy we're trying to pull
+ * off is generally near the head".  It is not, once a list is long: a busy
+ * order-0 list holds thousands of blocks, and the walk ran with the zone lock
+ * held and interrupts OFF.  Highmem made it visible — every step is a kmap
+ * there — as `!! PIT STARVED` during `excstorm` at -m 3G (and never at 1G):
+ * the timer interrupt held off for hundreds of milliseconds by a list walk. */
 static int zone_remove(struct zone* z, uint32_t pfn, int order) {
     pmm_phys_t target = pfn_to_phys(pfn);
-    pmm_phys_t prev   = 0;
-    pmm_phys_t cur    = z->free_lists[order];
-    while (cur) {
-        pmm_phys_t next = link_load(cur);
-        if (cur == target) {
-            if (prev) link_store(prev, next);
-            else      z->free_lists[order] = next;
-            z->nr_at_order[order] -= 1;
-            return 0;
-        }
-        prev = cur;
-        cur  = next;
-    }
-    return -1;
+    pmm_phys_t next = link_load_at(target, 0);
+    pmm_phys_t prev = link_load_at(target, 1);
+    if (prev) link_store_at(prev, 0, next);
+    else if (z->free_lists[order] == target) z->free_lists[order] = next;
+    else return -1;                              /* not on this list: refuse */
+    if (next) link_store_at(next, 1, prev);
+    z->nr_at_order[order] -= 1;
+    return 0;
 }
 
 /* Pop the head of a zone's free list at `order`.  Returns pfn, or 0 if
@@ -233,7 +243,9 @@ static int zone_remove(struct zone* z, uint32_t pfn, int order) {
 static uint32_t zone_pop(struct zone* z, int order) {
     pmm_phys_t head = z->free_lists[order];
     if (!head) return 0;
-    z->free_lists[order] = link_load(head);
+    pmm_phys_t next = link_load(head);
+    z->free_lists[order] = next;
+    if (next) link_store_at(next, 1, 0);
     z->nr_at_order[order] -= 1;
     return phys_to_pfn(head);
 }
@@ -657,7 +669,11 @@ pmm_phys_t page_alloc_below(int order, pmm_phys_t limit) {
         for (int o = order; o <= BUDDY_MAX_ORDER; o++) {
             for (pmm_phys_t cur = z->free_lists[o]; cur; cur = link_load(cur)) {
                 if ((uint64_t)cur + bytes - 1 > (uint64_t)limit) continue;
-                if (!zone_remove(z, phys_to_pfn(cur), o)) continue;
+                /* zone_remove returns 0 on SUCCESS.  This read `if (!…) continue`,
+                 * i.e. it skipped exactly the blocks it had just removed — each
+                 * fitting block left its free list and was never handed out: a
+                 * leak per call, found while making removal O(1) (2026-09-26). */
+                if (zone_remove(z, phys_to_pfn(cur), o) != 0) continue;
                 /* Give back the halves we do not need, highest first so the
                  * free lists keep the shape buddy_free expects. */
                 for (int k = o; k > order; k--)
@@ -828,6 +844,7 @@ void pmm_validate(const char* tag) {
         struct zone* z = &zones[zi];
         for (int o = 0; o <= BUDDY_MAX_ORDER; o++) {
             pmm_phys_t cur = z->free_lists[o];
+            pmm_phys_t prevnode = 0;
             uint32_t walked = 0;
             uint32_t guard = z->nr_at_order[o] + 4;
             while (cur) {
@@ -845,6 +862,16 @@ void pmm_validate(const char* tag) {
                             tag, zi, o, pfn, page_state[pfn], o);
                     return;
                 }
+                /* The PREV link must name the node we came from (doubly
+                 * linked since 2026-09-26; a stale prev corrupts the next
+                 * O(1) removal silently). */
+                if (link_load_at(cur, 1) != prevnode) {
+                    kprintf("PMMCHK[%s]: z%d o%d node pfn=%x has prev=%x, expected %x\n",
+                            tag, zi, o, pfn, (unsigned)link_load_at(cur, 1),
+                            (unsigned)prevnode);
+                    return;
+                }
+                prevnode = cur;
                 cur = link_load(cur);
                 if (++walked > guard) {
                     kprintf("PMMCHK[%s]: z%d o%d chain OVERRUNS nr_at_order=%u (cycle?)\n",

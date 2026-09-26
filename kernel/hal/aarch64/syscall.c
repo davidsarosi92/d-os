@@ -12,7 +12,7 @@
  *
  * SYS_EXIT is special: instead of returning to EL0 (which the normal
  * RESTORE_TRAPFRAME/eret path would do) it teleports back to the kernel context
- * that aarch64_enter_user saved, via aarch64_user_exit() — same idea as the x86
+ * that aarch64_enter_user saved, via user_excursion_teleport() — same idea as the x86
  * SYS_EXIT teleport.
  * ============================================================================= */
 
@@ -40,8 +40,9 @@ struct trapframe {
 };
 
 /* usermode.S — EL0 entry + the SYS_EXIT teleport. */
-void aarch64_enter_user(uint64_t entry_va, uint64_t user_sp);
-void aarch64_user_exit(void);
+void aarch64_enter_user(uint64_t entry_va, uint64_t user_sp, uint64_t* resume);
+#include "usermode.h"
+#include "task.h"
 
 /* vmm.c — per-process address spaces + EL0 mappings. */
 struct vmm_space* aarch64_vmm_create(void);
@@ -94,7 +95,7 @@ static void aarch64_syscall_body(struct trapframe* tf) {
                 fd_close_all();
                 task_exit_code((int)tf->x[0]);
             }
-            aarch64_user_exit();        /* excursion self-tests: teleport back */
+            user_excursion_teleport();  /* excursion self-tests: teleport back */
             break;                      /* unreachable */
         }
 
@@ -468,7 +469,7 @@ int aarch64_usertest(void) {
 
     kprintf("usertest: dropping to EL0 at %p...\n", (void*)USER_CODE_VA);
     aarch64_vmm_switch(sp);
-    aarch64_enter_user(USER_CODE_VA, USER_STACK_VA + 4096);   /* returns via SYS_EXIT */
+    enter_user_mode_wrap(USER_CODE_VA, USER_STACK_VA + 4096);  /* returns via SYS_EXIT */
     /* §M71 — the teleport does not unwind aarch64_syscall, so without this the
      * hosting task keeps the ring-3 pointer gate.  This one runs from
      * main_entry at BOOT, so pid 0 carried it on every ARM machine until
@@ -497,6 +498,6 @@ size_t arch_user_hello(uint8_t* buf, size_t cap, uintptr_t base) {
 
 /* Portable ring-3/EL0 entry name (usermode.h): x86 provides its own
  * enter_user_mode_wrap; on aarch64 it maps onto the EL0 drop. */
-void enter_user_mode_wrap(uintptr_t ip, uintptr_t sp) {
-    aarch64_enter_user((uint64_t)ip, (uint64_t)sp);
+void arch_enter_user_wrap(uintptr_t ip, uintptr_t sp, uintptr_t* resume) {
+    aarch64_enter_user((uint64_t)ip, (uint64_t)sp, (uint64_t*)resume);
 }

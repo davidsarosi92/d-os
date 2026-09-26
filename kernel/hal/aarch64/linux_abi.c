@@ -34,7 +34,7 @@ struct trapframe {
     uint64_t spsr;
 };
 
-void aarch64_user_exit(void);          /* usermode.S — excursion teleport */
+#include "usermode.h"                  /* user_excursion_teleport */
 
 #define LNX_ENOSYS 38
 
@@ -61,7 +61,7 @@ void linux_syscall_dispatch(struct trapframe* tf) {
 
     if (nr == LNX_ARM64_exit || nr == LNX_ARM64_exit_group) {
         if (me && me->user_task) { fd_close_all(); task_exit_code((int)tf->x[0]); }
-        aarch64_user_exit();                     /* excursion: teleport back */
+        user_excursion_teleport();               /* excursion: teleport back */
         if (me) me->in_user_syscall = prev;      /* unreachable */
         return;
     }

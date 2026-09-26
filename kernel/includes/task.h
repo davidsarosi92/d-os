@@ -179,6 +179,16 @@ struct task {
      * syscalls arrive through the same dispatcher; proc.c clears the flag when
      * the excursion returns.) */
     int           in_user_syscall;
+    /* #11 (2026-09-26) — the synchronous ring-3 EXCURSION (proc_exec_elf and
+     * the self-tests) keeps its state ON THE TASK.  It used to be two GLOBALS
+     * (saved_esp/saved_eip) plus a per-CPU shared trap stack, so an excursion
+     * that blocked in a syscall left its frames where another excursion on
+     * that CPU would overwrite them, and two at once overwrote each other's
+     * resume point.  exc_resume = {kernel sp, pc} for the SYS_EXIT teleport;
+     * exc_kstack = where ring 3 traps into (x86 TSS.esp0), below the frame
+     * that started the excursion, on the task's OWN stack; 0 = no excursion. */
+    uintptr_t     exc_resume[2];
+    uintptr_t     exc_kstack;
     /* M35 — thread: this task SHARES its `mm` with its creator (clone), so its
      * reap must NOT destroy the address space (the thread group still uses it).
      * 0 for a process that owns its mm; 1 for a cloned thread. */

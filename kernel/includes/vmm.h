@@ -174,6 +174,8 @@ void      vmm_space_set_mmap_cursor(struct vmm_space* space, uintptr_t v);
  * Loads CR3 (x86) / TTBR0 (aarch64) only when it actually changes, so
  * switching between kernel threads is free. */
 void vmm_space_switch(struct vmm_space* space);
+/* The hardware root (CR3/TTBR0 value) of a space, for diagnostics. */
+uintptr_t vmm_space_root_phys(struct vmm_space* space);
 
 /* Base virtual address of the per-process user region on this arch — the
  * first address a loader/self-test may hand to vmm_space_map for VMM_USER

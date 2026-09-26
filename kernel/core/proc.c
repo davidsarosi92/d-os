@@ -598,3 +598,41 @@ void user_excursion_end(void) {
     struct task* me = task_current();
     if (me) me->in_user_syscall = 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * #11 (2026-09-26) — THE EXCURSION'S STATE LIVES ON THE TASK.
+ *
+ * A synchronous excursion (proc_exec_elf, the self-tests) drops to ring 3 from
+ * the middle of a kernel call and comes back at SYS_EXIT.  Two things have to
+ * survive the trip, and both used to be shared:
+ *   - WHERE TO COME BACK TO was two globals (saved_esp/eip, x86 and ARM alike),
+ *     so two excursions at once overwrote each other's — whichever exited
+ *     second resumed on the other's stack;
+ *   - WHERE RING 3 TRAPS TO was, on x86, a per-CPU fixed stack (tss.c).  An
+ *     excursion that BLOCKS in a syscall (forktest's waitpid) left its frames
+ *     there, and the next excursion trapping on that CPU overwrote them; a
+ *     migration made it another CPU's stack outright.  The `!! KSTACK` check
+ *     named it: "task 'serial-cmd' is not on its own kernel stack".
+ * Now the resume point is the task's `exc_resume`, and traps land on the
+ * task's OWN kernel stack, 512 bytes below the frame that started the trip
+ * (the arch pushes its saved registers just below the caller, and that must
+ * stay intact for the return).  The scheduler re-installs `exc_kstack` on
+ * every switch-in, so a migrated or preempted excursion keeps it.  aarch64
+ * already trapped onto the task's own stack (SP_EL1 at eret); only the
+ * resume point was shared there. */
+void enter_user_mode_wrap(uintptr_t user_ip, uintptr_t user_sp) {
+    struct task* me = task_current();
+    if (!me) return;
+    uintptr_t prev_k = me->exc_kstack;
+    me->exc_kstack = ((uintptr_t)__builtin_frame_address(0) - 512u) & ~(uintptr_t)15;
+    hal_set_kernel_stack(me->exc_kstack);
+    arch_enter_user_wrap(user_ip, user_sp, me->exc_resume);
+    me->exc_kstack = prev_k;
+    hal_set_kernel_stack(prev_k);        /* 0 = the arch default */
+}
+
+void user_excursion_teleport(void) {
+    struct task* me = task_current();
+    hal_syscall_exit_to_kernel(me->exc_resume[0], me->exc_resume[1]);
+    for (;;) { }                         /* not reached */
+}

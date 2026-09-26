@@ -27,6 +27,7 @@
  * ============================================================================= */
 
 #include "pmm.h"
+#include "cowref.h"
 #include "kmalloc.h"
 #include "printf.h"
 #include "task.h"   /* §A1 — vmm_cow_fault needs the current task's space */
@@ -302,12 +303,8 @@ static uint32_t  g_cow_nr  = 0;
  * always COPIED rather than shared-in-place — the conservative direction: it
  * wastes a page, where guessing the other way loses data. */
 static uint16_t* cow_slot(uintptr_t phys) {
-    if (!g_cow_ref) {
-        g_cow_nr  = pmm_nr_frames;
-        g_cow_ref = (uint16_t*)pmm_bootmem_alloc(g_cow_nr * (uint32_t)sizeof(uint16_t));
-        if (!g_cow_ref) { g_cow_nr = 0; return NULL; }
-        for (uint32_t i = 0; i < g_cow_nr; i++) g_cow_ref[i] = 0;
-    }
+    static spinlock_t cow_build_lock = SPINLOCK_INIT;
+    if (!cow_table_get(&g_cow_ref, &g_cow_nr, &cow_build_lock)) return NULL;
     uintptr_t fn = phys >> 12;
     return (fn < g_cow_nr) ? &g_cow_ref[fn] : NULL;
 }
@@ -316,11 +313,10 @@ static uint16_t* cow_slot(uintptr_t phys) {
  * Called from the teardown path for every page carrying PTE_SW_COW. */
 static void cow_release(uintptr_t phys) {
     uint16_t* rc = cow_slot(phys);
-    if (rc && *rc > 1) { (*rc)--; return; }   /* someone else still holds it */
+    if (rc && !cow_ref_drop(rc)) return;      /* someone else still holds it */
     /* Last holder (rc 0 or 1), or an untracked frame.  `*rc > 0` here instead of
      * `> 1` would decrement the final reference and return WITHOUT freeing —
      * a silent leak of every page a fork ever shared.  Matches the x86_64 twin. */
-    if (rc) *rc = 0;
     pmm_free_frame((pmm_phys_t)phys);
 }
 
@@ -336,11 +332,7 @@ static uint64_t cow_share_leaf(uint64_t* parent_slot) {
     if (pte & PTE_SW_SHARED) return pte;
 
     uint16_t* rc = cow_slot(phys);
-    if (rc) {
-        /* First time this frame is shared, it has one holder already. */
-        if (*rc == 0) *rc = 1;
-        (*rc)++;
-    }
+    if (rc) cow_ref_share(rc);   /* 0 (one untracked holder) -> 2, n -> n+1 */
     /* Read-only in BOTH spaces: the parent must fault on its own next write
      * too, or it would silently edit the child's memory. */
     uint64_t shared = (pte | PTE_AP_RO_BIT | PTE_SW_COW);
@@ -423,19 +415,20 @@ int vmm_cow_fault(uintptr_t fault_va) {
     uintptr_t old = (uintptr_t)(pte & PTE_ADDR_MASK);
     uint16_t* rc  = cow_slot(old);
 
-    if (rc && *rc <= 1) {
+    if (rc && cow_ref_sole(rc)) {
         /* Last tracked sharer — grant write in place, no copy needed. */
         l3[i3] = (pte & ~PTE_AP_RO_BIT) & ~PTE_SW_COW;
-        *rc = 0;
+        __atomic_store_n(rc, 0, __ATOMIC_RELEASE);
     } else {
         pmm_phys_t nf = pmm_alloc_frame();
         if (nf == PMM_ALLOC_FAIL) return 0;             /* OOM → a real fault */
         const uint8_t* src = (const uint8_t*)(uintptr_t)old;
         uint8_t* dst = (uint8_t*)(uintptr_t)nf;
         for (int b = 0; b < 4096; b++) dst[b] = src[b];
-        if (rc && *rc > 0) (*rc)--;
         l3[i3] = (((uint64_t)nf & PTE_ADDR_MASK) | (pte & ~PTE_ADDR_MASK))
                  & ~PTE_AP_RO_BIT & ~PTE_SW_COW;
+        /* Give up our share only after the copy (cowref.h). */
+        if (rc && cow_ref_put_copy(rc)) pmm_free_frame((pmm_phys_t)old);
     }
     /* Inner-shareable: another core may share this mm (threads) and still hold
      * the read-only entry we just replaced.  See vmm_space_clone. */

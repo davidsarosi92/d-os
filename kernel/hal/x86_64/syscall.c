@@ -53,8 +53,7 @@
 
 /* Imports from kernel/hal/x86_64/usermode.s — the saved kernel context
  * that lets SYS_EXIT teleport back. */
-extern uint64_t saved_rsp;
-extern uint64_t saved_rip;
+#include "usermode.h"
 
 /* The SYSCALL-instruction entry point (syscall_entry.s) — installed into the
  * IA32_LSTAR MSR so `syscall` from ring 3 lands there. */
@@ -173,8 +172,7 @@ static void syscall_dispatch_body(struct int_frame* f) {
             }
             /* Excursion-model self-tests: teleport back to enter_user_mode_wrap's
              * saved kernel context. */
-            hal_syscall_exit_to_kernel((uintptr_t)saved_rsp,
-                                       (uintptr_t)saved_rip);
+            user_excursion_teleport();   /* #11: the task's own resume point */
         }
 
         case SYS_GETPID:

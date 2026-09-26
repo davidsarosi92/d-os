@@ -112,10 +112,25 @@ void spin_report_where(void) {
     serial_write("\n");
 }
 
+/* A SPINNER MUST STILL ANSWER A TLB SHOOTDOWN (2026-09-26, NEXT.md #11).
+ *
+ * x86 has no broadcast invalidation; a shootdown (§M51) IPIs every CPU and
+ * WAITS for each to flush.  A CPU spinning here with interrupts off never takes
+ * that IPI — and if the lock it wants is held by the CPU that is waiting for it
+ * to flush, neither moves: CPU 3 in hal_tlb_shootdown, CPUs 0-2 with no tick at
+ * all, one `excstorm` away.  §M51 made the SHOOTDOWN's own wait loop service
+ * requests for exactly this reason; the same answer belongs in every other
+ * loop that waits with interrupts off, and this is the one they all share.
+ * Servicing is just a local flush, safe in any context.  (Weak no-op where the
+ * hardware broadcasts invalidation — aarch64's `tlbi ...is`.) */
+void hal_tlb_service_pending(void) __attribute__((weak));
+void hal_tlb_service_pending(void) { }
+
 static inline void spin_acquire(spinlock_t* l, void* caller) {
     unsigned long spins = 0;
     while (!atomic_cmpxchg(&l->locked, 0, 1)) {
         hal_cpu_pause();
+        hal_tlb_service_pending();
         if (++spins >= SPIN_STUCK_THRESHOLD) {
             serial_write("\n!! SPINLOCK STUCK lock=");
             spin_serial_hex((uintptr_t)l);

@@ -43,6 +43,7 @@
 #include "vmm.h"
 #include "hal_api.h"   /* §M51 — hal_tlb_shootdown */
 #include "pmm.h"
+#include "cowref.h"
 #include "kmap.h"
 #include "printf.h"
 #include "kmalloc.h"
@@ -437,12 +438,8 @@ static uint16_t* g_cow_ref;
 static uint32_t  g_cow_nr;
 
 static inline uint16_t* cow_slot(uint32_t phys) {
-    if (!g_cow_ref) {
-        g_cow_nr  = pmm_nr_frames;
-        g_cow_ref = (uint16_t*)pmm_bootmem_alloc(g_cow_nr * (uint32_t)sizeof(uint16_t));
-        if (!g_cow_ref) { g_cow_nr = 0; return NULL; }
-        for (uint32_t i = 0; i < g_cow_nr; i++) g_cow_ref[i] = 0;
-    }
+    static spinlock_t cow_build_lock = SPINLOCK_INIT;
+    if (!cow_table_get(&g_cow_ref, &g_cow_nr, &cow_build_lock)) return NULL;
     uint32_t fn = phys >> 12;
     return (fn < g_cow_nr) ? &g_cow_ref[fn] : NULL;
 }
@@ -467,8 +464,7 @@ void vmm_space_destroy(struct vmm_space* s) {
             if (pte & VMM_COW) {
                 /* COW-shared: free the frame only when the last owner leaves. */
                 uint16_t* rc = cow_slot(pte & PAGE_MASK);
-                if (rc && *rc > 1) { (*rc)--; continue; }
-                if (rc) *rc = 0;
+                if (rc && !cow_ref_drop(rc)) continue;   /* others still hold it */
             }
             pmm_free_frame(pte & PAGE_MASK);     /* owned user page */
         }
@@ -518,7 +514,7 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
                  * hand the child a read-only copy that faults hard on write.
                  * Share the frame read-only in both spaces. */
                 uint16_t* rc = cow_slot(frame);
-                if (rc) { *rc = (*rc == 0) ? 2 : (uint16_t)(*rc + 1); }
+                if (rc) cow_ref_share(rc);
                 map_in_pd_ex(parent->pd, virt, frame, VMM_USER | VMM_COW,
                              /*notify*/0);                  /* parent RO+COW */
                 if (map_in_pd(child->pd, virt, frame, VMM_USER | VMM_COW) != 0) {
@@ -567,16 +563,18 @@ int vmm_cow_fault(uintptr_t fault_va) {
     uint32_t old = pte & PAGE_MASK;
     uint16_t* rc = cow_slot(old);
 
-    if (!rc || *rc <= 1) {
+    if (!rc || cow_ref_sole(rc)) {
         /* Last (or untracked) sharer — just make it writable in place. */
         pt[pti] = old | PTE_P | PTE_US | PTE_RW;
-        if (rc) *rc = 0;
+        if (rc) __atomic_store_n(rc, 0, __ATOMIC_RELEASE);
     } else {
-        (*rc)--;                                        /* one fewer sharer   */
         pmm_phys_t nf = pmm_alloc_frame_user();         /* §M86 — may be highmem */
-        if (!nf) { (*rc)++; return 0; }                 /* OOM → real fault    */
+        if (!nf) return 0;                              /* OOM → real fault    */
         kmap_copy_frame(nf, old);
         pt[pti] = (nf & PAGE_MASK) | PTE_P | PTE_US | PTE_RW;
+        /* Only now give up our share (cowref.h); if the other holder left
+         * meanwhile, we were the last and the original is ours to free. */
+        if (cow_ref_put_copy(rc)) pmm_free_frame(old);
     }
     /* §M51 — the page now points at a DIFFERENT frame (or became writable in
      * place).  A sibling thread on another core still holds the old, read-only

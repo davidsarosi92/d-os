@@ -101,6 +101,12 @@ void x86_tlb_ipi(void) {
     x86_tlb_service_local();
 }
 
+/* lock.c's spin loop calls this, so a CPU waiting for a lock with interrupts
+ * off still answers a shootdown aimed at it (see there). */
+void hal_tlb_service_pending(void) {
+    x86_tlb_service_local();
+}
+
 /* Invalidate `va` (or, with va == 0, everything) in the address space rooted at
  * `root_phys`, on this CPU and on every other online CPU.
  *

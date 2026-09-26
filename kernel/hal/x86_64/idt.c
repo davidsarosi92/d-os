@@ -601,11 +601,18 @@ void isr_handler(struct int_frame* f) {
         if ((f->cs & 3) == 3 && task_current()) {
             struct task* t = task_current();
             int sig = fault_signal((int)f->int_no);
+            uint64_t ucr2 = 0, ucr3 = 0;
+            __asm__ volatile ("mov %%cr2, %0" : "=r"(ucr2));
+            __asm__ volatile ("mov %%cr3, %0" : "=r"(ucr3));
+            /* cr2 names the address, cr3 the address space the CPU was in —
+             * "a page is missing" and "the task ran in somebody else's space"
+             * look identical without the second. */
             kprintf("\nfault: user EXCEPTION %u (%s) pid %d '%s' "
-                    "cs:rip=%lx:%p err=%lx — killing process\n",
+                    "cs:rip=%lx:%p err=%lx cr2=%p cr3=%p mm_root=%p — killing process\n",
                     (unsigned)f->int_no, exception_name[f->int_no], t->pid, t->name,
                     (unsigned long)f->cs, (void*)(uintptr_t)f->rip,
-                    (unsigned long)f->err_code);
+                    (unsigned long)f->err_code, (void*)(uintptr_t)ucr2,
+                    (void*)(uintptr_t)ucr3, (void*)vmm_space_root_phys(t->mm));
             /* §M47 — record it for the reporting sinks (see the i386 twin). */
             crash_report(CRASH_USER_FAULT, t->pid, t->name,
                          (uintptr_t)f->rip, 0, sig, exception_name[f->int_no]);

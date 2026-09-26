@@ -117,6 +117,7 @@ when sections are added.)
 | 4.74 | The desktop is where boot ends; leaving it lands on a shell | 8228 |
 | 4.74.1 | A command channel on COM1 (harness vs. GUI focus) | 8946 |
 | 4.94 | i386 highmem through kmap (§M86 stage 1) | 13800 |
+| 4.95 | Concurrent processes: excursion state, COW table, O(1) buddy | 13860 |
 | 4.75 | Terminal scrollback; a selection is an absolute line (§M58) | 8402 |
 | 4.76 | Redirection: fds 0/1/2 were not descriptors (§M59) | 8469 |
 | 4.77 | aarch64 can change resolution now (§M61 complete) | 8537 |
@@ -13833,8 +13834,61 @@ direct?" by comparing the kmap address with the frame number — and the first
 highmem frame, `0x3FC00000`, IS the address of CPU 0's first window slot.  It
 asks the PMM now (`pmm_frame_is_highmem`).
 
+
+### 4.95 Concurrent processes: the excursion, the COW table, and a free list you could walk forever (2026-09-26)
+
+NEXT.md #11 started as "the self-test excursion uses shared state"; the falsifier
+written for it (`excstorm [n]`: n tasks running the fork+waitpid program as
+synchronous excursions AT ONCE) found five defects, three of which hit ordinary
+programs, not just the tests.  In the order they were found:
+
+1. **The excursion's state was shared** (the reported #11).  Its SYS_EXIT
+   resume point was two globals and, on x86, ring 3 trapped onto a per-CPU
+   shared stack; an excursion blocked in `waitpid` left its frames where the
+   next one overwrote them (`!! KSTACK: task 'serial-cmd' is not on its own
+   kernel stack`).  Now `task.exc_resume` + `task.exc_kstack` (512 bytes below
+   the frame that started the trip, re-installed by the scheduler), one
+   portable `enter_user_mode_wrap` in proc.c and one `user_excursion_teleport`
+   for all six SYS_EXIT sites on three arches.
+2. **`ringtest` mapped into the KERNEL directory** and unmapped only the pages,
+   so every later address space shared its leftover page tables for the bottom
+   of user space; on x86_64 `pipetest` after `ringtest` read 0 bytes every time.
+   It has its own space now.
+3. **A spinner could not answer a TLB shootdown**: CPUs waiting for a lock with
+   interrupts off never take the §M51 IPI, so a shootdown issued by the lock's
+   holder waited forever (i386 NMI hard lockup, three CPUs without a tick).
+   `spin_acquire` now services pending shootdown requests while it waits —
+   §M51 already did this in the shootdown's own wait loop, for the same reason.
+4. **The COW reference table was built lazily with no lock, on all three
+   arches** — two CPUs forking for the first time together each built it, or
+   one used it before the other had zeroed it.  Counts from garbage are double
+   frees; a double free makes a buddy free list a CYCLE; the next walk of it
+   never ends, with the zone lock held and interrupts off.  That was the x86_64
+   NMI (holder in `zone_remove`, everyone else spinning in `buddy_free_in_zone`),
+   5 of 6 runs.  The table is built once under a lock and published after it
+   is zeroed (`cowref.h`), and the count itself is updated atomically
+   (`cow_ref_share` / `cow_ref_drop` / `cow_ref_put_copy` — the COW fault gives
+   up its share only after the copy, and frees the original if it turned out
+   to be last).  0 of 6 after.
+5. **`zone_remove` walked the free list from its head** to find a block's
+   predecessor, with interrupts off.  Harmless while lists were short and
+   links cheap; with highmem (§4.94) every step is a kmap, and at `-m 3G`
+   `excstorm` raised `!! PIT STARVED` every run (never at 1G).  The buddy free
+   lists are DOUBLY linked now — removal is O(1) — and `memcheck` verifies the
+   back links.  Making that change exposed a leak older than all of it:
+   `page_alloc_below` tested `if (!zone_remove(...)) continue`, and zone_remove
+   returns 0 on success, so every block it found was removed from its list and
+   never handed out.
+
+**Verified:** `excstorm 8` twice + `memcheck` clean on x86_64 6/6, i386 3/3
+(and at 3G), aarch64 2/2; the whole self-test set (fork, pipe, signals, musl,
+threads, ring 3, `diskstorm`, `killstorm`, `highmemtest`, both `logouttest`
+variants) green on all three arches with `!! KSTACK`, `!! KTIMER` and
+`PIT STARVED` absent.
+
 ## 8. Change log
 
+- **2026-09-26 — Concurrent processes: per-task excursion state, a race-free atomic COW table, O(1) buddy removal, spinners answer shootdowns, a private ringtest space, a page_alloc_below leak (DOCS §4.95).**
 - **2026-09-26 — §M86 stage 1: i386 manages all RAM up to 4 GiB (ZONE_HIGHMEM + kmap) (DOCS §4.94).**
 - **2026-09-25 — Block cache 16× larger in half the memory (packed + hashed); `blkstormtest` proves the storm detector on the REAL storm; HDA no longer goes silent for good after an underrun (NEXT.md #5, #7, #8b).**
 - **2026-09-25 — exFAT: a full directory no longer writes into its neighbour's data; directories grow; `dir_is_empty` scans all of it (DOCS §4.73.1).**

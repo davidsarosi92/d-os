@@ -1432,3 +1432,34 @@ static void t_ktimerexittest(const char* a) {
             : "PASS (the exit cancelled the orphaned timer)");
 }
 SHELL_CMD(ktimerexittest) = { "ktimerexittest", "", 0, SHELL_G_TEST, t_ktimerexittest, SHELL_P_ADMIN };
+
+/* ---------------------------------------------------------------------------
+ * `excstorm [n]` — the falsifier for NEXT.md #11 (hidden).
+ *
+ * n tasks run the fork+waitpid program as SYNCHRONOUS EXCURSIONS at the same
+ * time.  Each one blocks in ring 3's waitpid, so their kernel frames and their
+ * resume points must survive other excursions trapping and exiting meanwhile.
+ * With the old shared state (global resume point, per-CPU trap stack) one
+ * excursion's SYS_EXIT resumed on another's stack.  Every excursion must come
+ * back with rc 0, and the command then reports how many did.
+ * ------------------------------------------------------------------------- */
+static volatile int exs_ok, exs_done;
+static void exs_worker(void) {
+    size_t len = (size_t)(_binary_user_forktest_elf_end - _binary_user_forktest_elf_start);
+    int rc = proc_exec_elf(_binary_user_forktest_elf_start, len);
+    if (rc == 0) __atomic_add_fetch(&exs_ok, 1, __ATOMIC_ACQ_REL);
+    __atomic_add_fetch(&exs_done, 1, __ATOMIC_ACQ_REL);
+}
+static void t_excstorm(const char* a) {
+    int n = 0;
+    while (a && *a >= '0' && *a <= '9') n = n * 10 + (*a++ - '0');
+    if (n <= 0 || n > 16) n = 4;
+    if (!_binary_user_forktest_elf_start) { kprintf("excstorm: forktest not embedded\n"); return; }
+    exs_ok = exs_done = 0;
+    for (int i = 0; i < n; i++) task_spawn_detached("excstorm", exs_worker);
+    uint64_t t0 = timer_ticks_ms();
+    while (exs_done < n && timer_ticks_ms() - t0 < 20000) task_msleep(50);
+    kprintf("excstorm: %d concurrent excursions, %d came back, %d with rc 0: %s\n",
+            n, exs_done, exs_ok, exs_ok == n ? "PASS" : "FAIL");
+}
+SHELL_CMD(excstorm) = { "excstorm", "[n]", 0, SHELL_G_TEST, t_excstorm, SHELL_P_ADMIN };
