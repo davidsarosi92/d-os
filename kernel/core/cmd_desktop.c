@@ -166,6 +166,15 @@ static void cmd_gui_stats(void) {
  * second invocation is a no-op — the compositor is a singleton. */
 static void cmd_gui(const char* args) {
     while (args && *args == ' ') args++;
+    if (args && cmd_starts_with(args, "signout")) {
+        /* §M82 fix — the Start menu's Sign out, from the shell: the same route
+         * (gui_session_restart_as(NULL)), so a test drives the real thing. */
+        if (!gui_is_active()) { console_write("gui: not running\n"); return; }
+        gui_session_clear();
+        gui_session_restart_as(NULL);
+        console_write("gui: signing out\n");
+        return;
+    }
     if (args && cmd_starts_with(args, "stop")) {
         /* The other direction, from the shell side.  It exists because the
          * Start menu's "Exit GUI" is unreachable when the desktop is what went
@@ -278,7 +287,7 @@ static void ds_wheeltest(const char* a) {
     gui_wheel_test(v[0], v[1], v[2]);
 }
 
-SHELL_CMD(gui)       = { "gui", "[stop|stats|widgets|relayout|bench]",
+SHELL_CMD(gui)       = { "gui", "[stop|signout|stats|widgets|relayout|bench]",
                          "the compositor and the desktop session",
                          SHELL_G_GUI, ds_gui, SHELL_P_ANY };
 SHELL_CMD(launch)    = { "launch", "[app]", "start a registered GUI app",

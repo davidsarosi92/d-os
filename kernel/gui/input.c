@@ -914,6 +914,10 @@ int gui_raw_key(uint8_t keycode, uint8_t mods) {
     if (modal_win && modal_win->used) {
         if (keycode == KC_TAB && (mods & KBD_MOD_LALT)) return 1;
         if (keycode == KC_ESC) {
+            /* The lock screen is the one modal Esc must not dismiss: a lock
+             * that a key closes is not a lock (it re-raised itself, but the
+             * desktop was usable in between). */
+            if (modal_win->no_close) return 1;
             if (modal_win->want_close) modal_win->close_force_now = 1;
             modal_win->want_close = 1;
             need_frame = 1;

@@ -13554,6 +13554,54 @@ returned SILENTLY when the fields were NULL, which made a CORRECT password
 report "still locked" — a passing-looking failure whose cause was three layers
 away; and the raise had to move off the caller's task.
 
+#### Stage 10.1 — the desktop asks who you are (2026-09-27, reported from use)
+
+*"Sign-in and sign-out do not work; it never asks which user at start."*  True,
+and the reason was one condition.  The lock was raised only when
+`users_anyone_can_sign_in() || gui.login` — and `users_anyone_can_sign_in()`
+answered FALSE for accounts WITHOUT a password, which is exactly what a fresh
+second account is.  So a machine with `root` and `bob` booted straight into
+whichever session autologin picked, and **`logout` in the GUI had nowhere to
+go**: it ended the session and nothing asked for the next one.
+
+**The rule now, in one function (`users_greeter_needed`):** the desktop asks
+UNLESS the machine is still in its first-run state — exactly one person
+account, `root`, holding the shipped default password.  That one case signs in
+as root and SAYS so on the console (`gui: first run - signing in as 'root'`),
+because a greeter with one row and a password printed in the manual is a
+ceremony, not a boundary.  Anything else — a second account, a changed root
+password — and the greeter comes up.  Otherwise the lock is always raised; the
+old `gui.login` gate is gone, because *a sign-in screen that appears only when
+somebody set a key is a sign-in screen nobody sees.*
+
+**Three defects in the lock window itself, all found by picture:**
+
+- The close box was DRAWN though `title_btn_count` said zero buttons: compose.c
+  painted the X glyph unconditionally.  So the lock carried a close box that did
+  nothing when pressed.  The glyph is now gated on the count, and
+  `gui_window_set_uncloseable()` sets that count to 0.  The re-raise from
+  `on_close` stays as the safety net.
+- **Esc closed it.**  The compositor's modal Esc trap (§M69) routes through
+  `want_close`, which exists so a WEDGED dialog can always be escaped — correct
+  for a dialog, fatal for a lock.  An uncloseable modal now swallows Esc.
+- There was no button.  The only way to submit was Enter in the password field,
+  and a passwordless account has nothing to type.  Now there is a **Sign in**
+  button (`lock_submit` with the field's contents).  The password field is as
+  tall as a button (`w_textinput_create` uses `cp_btn_h()`, not the literal
+  16): it is a control you aim at, rule 0.  The file manager and the editor set
+  their fields' heights during layout, so they are unaffected.
+
+The lock also refused to rise when `users_needs_setup()` said so, which
+counted passwordless accounts as "not set up".  It now refuses only when NO
+account can sign in (`lk_count == 0`), logged as such.  New `gui signout` ends
+the session and raises the greeter from the shell — the harness's route to the
+state being tested.
+
+**Verified, i386 and x86_64:** fresh disk → `first run … root`, session uid 0;
+with `bob` (no password) on the disk → greeter listing `root` and `bob`, no
+close box, Esc ignored; `lock bob:` → `session 1 opened for 'bob' (uid 1000)`;
+`gui signout` → `session ended` then `modal CLAIMED by 'Locked'`.  0 faults.
+
 #### Three §M71 audits, each with a shipped falsifier
 
 `task-identity` (owner set at creation and unchanged since; KERNEL is exactly
@@ -14291,6 +14339,7 @@ that case.
 
 ## 8. Change log
 
+- **2026-09-27 — The desktop asks who you are: a greeter whenever more than the first-run root exists, an uncloseable lock (no X, Esc ignored), a Sign in button, `gui signout` (DOCS §4.91 stage 10.1).**
 - **2026-09-26 — §M85 stage 4b: sbsa-ref has a disk (AHCI on the system bus), USB (xHCI, now 64-bit end to end) and a network (new e1000e driver); `acpi`, `lspci`; the hardware watchdog no longer reboots a machine whose every CPU is ticking (DOCS §4.102).**
 - **2026-09-26 — §M85 stage 4: the aarch64 kernel runs at a fixed VA and loads anywhere; offset direct map and PMM base; modules within reach; sbsa-ref boots to a shell (DOCS §4.101).**
 - **2026-09-26 — §M85 stage 3: aarch64 boots through UEFI (hand-made PE stub) and reads ACPI (MADT/GTDT/SPCR/MCFG/FADT + a narrow DSDT reader); one PSCI conduit; secondaries leave EL2 too (DOCS §4.100).**

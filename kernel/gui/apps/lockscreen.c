@@ -424,6 +424,8 @@ static void lock_build(void) {
     g_lock.win = win;
     g_lock.unlocked = 0;
 
+    /* No X, no Esc (§M82 fix): the only way past this window is a sign-in. */
+    gui_window_set_uncloseable(win, 1);
     if (gui_window_set_modal(win, 1) != 0) {
         /* Somebody else holds the single modal claim.  A non-modal look-alike
          * would be a picture of a lock with a live desktop behind it, which is
@@ -450,11 +452,15 @@ static void lock_build(void) {
 int gui_lock_raise(void) {
     if (g_lock.win) return 0;                     /* already up */
     if (gui_session_ending()) return -1;          /* see lock_closed */
-    if (users_needs_setup()) {
-        /* Nothing to authenticate against.  Locking here would leave a machine
-         * nobody can get into — the same stranding §M32's account rules refuse
-         * three other ways. */
-        kprintf("lock: no account can log in yet - refusing to lock\n");
+    /* Refuse only if NOBODY could get past it — the stranding §M32's account
+     * rules refuse three other ways.  The question is "can anyone sign in",
+     * and it was being answered with users_needs_setup(), which asks whether
+     * anyone has CHOSEN a password (the installer console's question): a
+     * machine whose accounts have no password, or only the shipped one, CAN be
+     * signed into, and the lock refused to appear there (§M82 fix, 2026-09-27).
+     * An account the picker lists is one that can sign in (lk_count). */
+    if (lk_count(NULL) == 0) {
+        kprintf("lock: no account can sign in - refusing to lock\n");
         return -1;
     }
     gui_queue_open(lock_build);
@@ -463,6 +469,11 @@ int gui_lock_raise(void) {
 
 /* Widgets are built in the LAYOUT hook, which is where gui.h says an app window
  * must build them: the content size is not established until it runs. */
+static void lock_button(struct w_button* b, void* ctx) {
+    (void)b; (void)ctx;
+    if (g_lock.pass) lock_submit(g_lock.pass, NULL);
+}
+
 static void lock_layout(struct gui_window* win) {
     if (g_lock.picker) return;                    /* build once (ui.h's rule) */
     int cw, ch;
@@ -471,23 +482,35 @@ static void lock_layout(struct gui_window* win) {
     int y = cp_px(14);
 
     w_label_create(win, pad, y, cw - 2 * pad,
-                   "This screen is locked.  Choose an account and sign in.");
+                   "lock.prompt");
     y += cp_row_h() + cp_px(6);
 
-    int list_h = ch - y - 2 * cp_row_h() - cp_px(26);
+    int list_h = ch - y - 2 * cp_btn_h() - cp_px(26);
     if (list_h < cp_row_h() * 2) list_h = cp_row_h() * 2;
     g_lock.picker = w_itemview_create(win, pad, y, cw - 2 * pad, list_h,
                                       &lk_model, "list", NULL);
     if (g_lock.picker) g_lock.picker->on_select = lk_on_select;
     y += list_h + cp_px(8);
 
-    w_label_create(win, pad, y, cp_px(90), "Password");
+    w_label_create(win, pad, y, cp_px(90), "lock.password");
     g_lock.pass = w_textinput_create(win, pad + cp_px(96), y,
                                      cw - pad - cp_px(96) - pad, NULL);
     w_textinput_set_secret(g_lock.pass, 1);
     if (g_lock.pass) g_lock.pass->on_submit = lock_submit;
-    y += cp_row_h() + cp_px(8);
-    g_lock.status = w_label_create(win, pad, y, cw - 2 * pad, "");
+    y += cp_btn_h() + cp_px(8);
+
+    /* §M82 fix (2026-09-27) — a SIGN-IN BUTTON.  Enter was the only way to
+     * submit, so with a pointer there was nothing to press: the window asked a
+     * question and offered no way to answer it by clicking.  Same submit as
+     * Enter (lock_submit), measured at its own size (the sizing rule) and
+     * placed on the outer edge, where a dialog's confirm lives (§14). */
+    {
+        struct w_button* b = w_button_create(win, 0, 0, 0, 0, "lock.signin",
+                                             lock_button, NULL);
+        int bw = b ? w_button_autosize(b, 0, y) : 0;
+        if (b) w_button_autosize(b, cw - pad - bw, y);
+        g_lock.status = w_label_create(win, pad, y, cw - 3 * pad - bw, "");
+    }
 
     /* Pre-choose the default account (`users.default_user`) when it can sign
      * in, so the common case is one password away.  A NAME is not a secret;

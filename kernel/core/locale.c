@@ -324,6 +324,10 @@ static const struct locale_entry en_strings[] = {
     { "Task Manager",     "Task Manager" },
     { "Control Panel",    "Control Panel" },
     { "Editor",           "Editor" },
+    { "Locked", "Locked" },
+    { "lock.prompt", "This screen is locked.  Choose an account and sign in." },
+    { "lock.password", "Password" },
+    { "lock.signin", "Sign in" },
 };
 
 LOCALE_CATALOG(loc_en) = {
@@ -468,6 +472,10 @@ static const struct locale_entry hu_strings[] = {
     { "Task Manager",     "Feladatkezel\xF5" },
     { "Control Panel",    "Vez\xE9rl\xF5pult" },
     { "Editor",           "Szerkeszt\xF5" },
+    { "Locked", "Z\xE1rolva" },
+    { "lock.prompt", "A k\xE9perny\xF5 z\xE1rolva van.  V\xE1lasszon fi\xF3kot, \xE9s jelentkezzen be." },
+    { "lock.password", "Jelsz\xF3" },
+    { "lock.signin", "Bejelentkez\xE9s" },
 };
 
 LOCALE_CATALOG(loc_hu) = {

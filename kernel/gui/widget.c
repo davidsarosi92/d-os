@@ -832,7 +832,11 @@ struct w_textinput* w_textinput_create(struct gui_window* win, int x, int y,
                                        int w, void* ctx) {
     struct w_textinput* t = (struct w_textinput*)kcalloc(1, sizeof(*t));
     if (!t) return NULL;
-    widget_init(&t->base, win, x, y, w, 16, &textinput_ops, ctx, 1);
+    /* §M82 fix — rule 0's height (a text box is AIMED AT), not the 8x8-era
+     * 16 px: every caller that lays itself out already set cp_btn_h(), and the
+     * one that trusted this default (the lock screen) drew its password field
+     * as a thin line. */
+    widget_init(&t->base, win, x, y, w, cp_btn_h(), &textinput_ops, ctx, 1);
     return t;
 }
 

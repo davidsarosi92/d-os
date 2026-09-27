@@ -313,4 +313,8 @@ int  group_del_member(const char* gname, const char* uname);
  * without knowing what they are authorising. */
 int auth_elevate(const char* what);
 
+/* §M82 fix — 1 unless the machine is still exactly as shipped (one person
+ * account, the default one, with the default password): the desktop must ask. */
+int users_greeter_needed(void);
+
 #endif /* USERS_H */

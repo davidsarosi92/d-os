@@ -818,6 +818,32 @@ int users_anyone_can_sign_in(void) {
     return 0;
 }
 
+/* §M82 fix (2026-09-27) — must the desktop ASK who is sitting here?
+ *
+ * users_anyone_can_sign_in() answers a narrower question ("has anybody CHOSEN
+ * a password"), and gui_start used it as the gate — so a machine with a second
+ * account and no chosen password, or with passwordless accounts only, never
+ * asked, opened a desktop that belonged to NOBODY (SYSTEM, uid -1), and "Sign
+ * out" rebuilt that same nobody-desktop: from a chair, sign-out did nothing.
+ * Reported as "sign-in and sign-out do not work and it never offers a choice
+ * of user".
+ *
+ * The honest answer is "yes" unless the machine is still exactly as shipped —
+ * one person account, the default one, carrying the default password — which
+ * is the first-run case gui_start signs into directly. */
+int users_greeter_needed(void) {
+    int persons = 0, untouched_root = 0;
+    for (int i = 0; ; i++) {
+        const struct user_account* u = user_at(i);
+        if (!u) break;
+        if (u->type != USER_TYPE_PERSON) continue;
+        persons++;
+        if (s_eq(u->name, USER_DEFAULT_NAME) && u->has_password && u->pw_is_default)
+            untouched_root = 1;
+    }
+    return !(persons == 1 && untouched_root);
+}
+
 void users_warn_default_password(void) {
     if (!users_default_password_in_use()) return;
     /* EVERY BOOT, until it is changed.  A default credential nobody is told

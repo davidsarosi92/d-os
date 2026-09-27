@@ -392,9 +392,11 @@ static void draw_scene_rect(const struct scene_snapshot* s,
             const cp_color g1 = (hov == TB_MAX)   ? th->text : th->muted;
             const cp_color g2 = (hov == TB_MIN)   ? th->text : th->muted;
 
-            /* close: two diagonals */
+            /* close: two diagonals — only if there IS a close button (the lock
+             * screen has none; its glyph used to be drawn anyway, a close box
+             * that looked real and did nothing). */
             title_btn_rect(x, y, w, TB_CLOSE, &bx, &by, &bw, &bh);
-            {
+            if (nbtn > TB_CLOSE) {
                 int i0 = bw / 3, i1 = bw - bw / 3 - 1;
                 for (int k = i0; k <= i1; k++) {
                     gfx_fill(&backsurf, bx + k, by + k, 1, 1, g0);

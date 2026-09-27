@@ -258,6 +258,11 @@ struct gui_window {
     /* IRQ → compositor handoff (state_lock). */
     int  pending_w, pending_h;
     volatile int want_close;
+    /* §M82 fix (2026-09-27) — a window that cannot be dismissed: no title
+     * buttons, Esc swallowed.  Only the lock screen sets it.  Its close box
+     * used to close and immediately re-raise the lock, and between the two the
+     * desktop behind it was live and clickable. */
+    int no_close;
 
     /* §M47.1 — closing a CLIENT-MANAGED window is a TWO-CLICK escalation:
      *   1st X click → want_close (a polite request the client should honour);

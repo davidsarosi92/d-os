@@ -90,6 +90,8 @@ hardware watchdog no longer reboots on a host stall while every CPU ticks (per-
 ALARM decision, second alarm reboots).  Next: the phone emulator — which becomes
 the FOURTH standard test machine.
 
+🔧 **SIGN-IN FIXED (2026-09-27, DOCS §4.91 stage 10.1).**  The greeter was raised only when an account HAD a password or `gui.login` was set, so a machine with a passwordless second account never asked who you are and sign-out led nowhere.  Now `users_greeter_needed()`: only the first-run state (root alone, default password) signs in automatically, and says so; otherwise the lock always rises.  The lock is uncloseable (`gui_window_set_uncloseable` — the X glyph was drawn regardless of the button count, and the modal Esc trap closed it), has a Sign in button, and `gui signout` drives it from the shell.
+
 ✅ **§M71 — RUNTIME INVARIANT AUDITS, AND THE BUG THE FIRST ONE FOUND
 (2026-09-08, DOCS §4.87, all 3 arches).**  Asked for directly: *"is there
 something that finds bugs — a thing started in ring 0 that should have been in

@@ -2389,6 +2389,20 @@ int gui_start(void) {
             gui_session_restart_as(al);
             return 0;
         }
+        /* §M82 fix (2026-09-27) — A DESKTOP ALWAYS BELONGS TO SOMEBODY.  The
+         * only case that does not ask is the machine exactly as shipped: then
+         * the one account signs in, and the boot's default-password warning
+         * already says how to change that.  Everything else falls through to
+         * the lock below, which now ALWAYS rises for an unauthenticated
+         * session — it used to rise only when some password had been chosen,
+         * and otherwise the desktop ran as nobody (SYSTEM, uid -1). */
+        if (!users_greeter_needed()) {
+            kprintf("gui: first run - signing in as '%s' (the only account; "
+                    "create one or change its password and the desktop will ask)\n",
+                    USER_DEFAULT_NAME);
+            gui_session_restart_as(USER_DEFAULT_NAME);
+            return 0;
+        }
     }
 
     /* §M46 — whether the X button on a client-managed (package) window
@@ -2620,7 +2634,12 @@ int gui_start(void) {
      *
      * So the gate is `users_anyone_can_sign_in()` OR the explicit key, and the
      * harness is unaffected because a default password is not a chosen one. */
-    } else if (users_anyone_can_sign_in() || config_get_long("gui.login", 0)) {
+    /* §M82 fix — every session that was not just authenticated asks: the
+     * boot path reaches here only when users_greeter_needed() said so (see the
+     * first-run case above), and a Sign out ALWAYS reaches here, because
+     * leaving is a request to hand the machine to somebody — previously it
+     * rebuilt the same unowned desktop and looked like it had done nothing. */
+    } else {
         if (gui_lock_raise() != 0)
             kprintf("gui: login was requested and could not be raised - the "
                     "desktop is UNLOCKED\n");

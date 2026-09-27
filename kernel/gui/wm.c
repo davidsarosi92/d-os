@@ -99,7 +99,15 @@ int title_btn_at_n(int wx, int wy, int ww, int px, int py, int count) {
     return -1;
 }
 int title_btn_count(const struct gui_window* win) {
+    if (win && win->no_close) return 0;        /* the lock: nothing to press */
     return (win && win == modal_win) ? 1 : TB_COUNT;
+}
+
+/* §M82 fix — see gui_priv.h's `no_close`. */
+int gui_window_set_uncloseable(struct gui_window* win, int on) {
+    if (!win || !win->used) return -1;
+    win->no_close = on ? 1 : 0;
+    return 0;
 }
 /* §M65 — the toolkit's per-window slot.  Accessors rather than a public field
  * so ui.c does not need gui.c's private window struct. */
@@ -748,6 +756,7 @@ struct gui_window* window_alloc(const char* title, enum win_kind kind,
     win->close_guard = NULL;
     win->close_reason = 0;
     win->close_confirmed = 0;
+    win->no_close = 0;                  /* §M82 — a reused slot is closeable */
     spin_lock_init(&win->lock);
     str_copy(win->title, title, (int)sizeof(win->title));
     win->used = 1;

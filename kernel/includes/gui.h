@@ -498,6 +498,8 @@ int  gui_popup_active(void);
  * Escape asks the modal to close, trapped in the compositor rather than in the
  * dialog's own key hook, so a wedged dialog still has a way out. */
 int  gui_window_set_modal(struct gui_window* win, int on);
+/* A window with no title buttons whose Esc does nothing — the lock screen. */
+int  gui_window_set_uncloseable(struct gui_window* win, int on);
 int  gui_modal_active(void);
 
 /* §M69 — `wheeltest <x> <y> <dz>`: push a wheel notch into the focused app
