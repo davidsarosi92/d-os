@@ -18,6 +18,8 @@
 #include "printf.h"
 #include "task.h"
 #include "swap.h"
+#include "memage.h"
+#include "timer.h"
 #include "block_cache.h"
 #include "block.h"
 #include "pmm.h"
@@ -564,12 +566,8 @@ static void cmd_evicttest(const char* args) {
     swap_evict_task(t, &rep);
     uint32_t f1 = pmm_free_frames();
     int clean_paused = swap_audit(0);        /* want 0: paused, counts agree */
-    /* The falsifier: make the evicted task LOOK runnable to the audit.  Safe
-     * because we hold the swap claim (nothing may resume it) and SLEEPING is
-     * never picked; it goes back to STOPPED on the next line. */
-    t->state = TASK_SLEEPING;
-    int seen = swap_audit(0);
-    t->state = TASK_STOPPED;
+    /* The falsifier: a slot no page names must be caught (swap-slots). */
+    int seen = swap_audit_selftest() == 10;
     task_swap_release(t, 1);
     uint32_t out = t->swapped_pages;
     if (rep.result == SWAP_DECLINED && rep.evicted == 0) {
@@ -587,7 +585,7 @@ static void cmd_evicttest(const char* args) {
         return;
     }
     kprintf("evicttest: evicted %u page(s), free frames +%d, kept %u copy-on-write; "
-            "audit paused=%d, made-runnable=%d; time copy %u ms, store I/O %u ms, unmap %u ms\n",
+            "audit paused=%d, orphan slot caught=%d; time copy %u ms, store I/O %u ms, unmap %u ms\n",
             rep.evicted, (int)(f1 - f0), rep.kept_cow, clean_paused, seen,
             rep.copy_us / 1000u, rep.io_us / 1000u, rep.map_us / 1000u);
     task_msleep(1500);                       /* it must print nothing while paused */
@@ -723,6 +721,55 @@ static void cmd_swapfaulttest(const char* args) {
             rep.evicted, back, left, used, ok ? "PASS" : "FAIL");
 }
 SHELL_CMD(swapfaulttest) = { "swapfaulttest", "", 0, SHELL_G_TEST, cmd_swapfaulttest, SHELL_P_ADMIN };
+
+/* `swapracetest` (hidden, §M74 rung 3) — the race §M72 could not have and
+ * pressure eviction can: pages written out while their owner is RUNNING and
+ * writing them.  memhog churn stamps every page each pass and checks the last
+ * pass's stamps; `swap.test_min_age = 0` makes the normal policy evict pages
+ * that are in use, every sweep, for eight seconds.  Pass = many pages went out
+ * and came back, the program never printed CORRUPT and is still running, and
+ * the slot audit is clean. */
+static void cmd_swapracetest(const char* args) {
+    (void)args;
+    const unsigned char *s = 0, *e = 0;
+    if (_binary_user_memhog_elf_start)             { s = _binary_user_memhog_elf_start;         e = _binary_user_memhog_elf_end; }
+    else if (_binary_user_memhog_x86_64_elf_start) { s = _binary_user_memhog_x86_64_elf_start;  e = _binary_user_memhog_x86_64_elf_end; }
+    else if (_binary_user_memhog_aarch64_elf_start){ s = _binary_user_memhog_aarch64_elf_start; e = _binary_user_memhog_aarch64_elf_end; }
+    if (!s) { kprintf("swapracetest: no memhog embedded\n"); return; }
+    const char* argv[2] = { "memhog", "churn" };
+    int pid = proc_spawn_argv("race-prog", s, (size_t)(e - s), 2, argv, 0);
+    if (pid < 0) { kprintf("swapracetest: spawn failed\n"); return; }
+    task_msleep(800);
+    uint32_t in0 = swap_in_count(), o0, p0, f0;
+    swap_pressure_stats(&o0, &p0, &f0);
+    config_set("swap.test_min_age", "0");
+    config_set("mem.swap_policy", "normal");
+    /* Drive the evictor directly, a sweep and a pass every ~10 ms, so the
+     * program meets a write-out in progress hundreds of times rather than a
+     * few dozen (the 200 ms service alone gave 64). */
+    uint64_t end = timer_ticks_ms() + 8000;
+    while (timer_ticks_ms() < end) {
+        memage_sweep();
+        swap_pressure(0);
+        task_msleep(10);
+    }
+    config_set("mem.swap_policy", "off");
+    config_set("swap.test_min_age", "");
+    task_msleep(1500);                              /* let the last pages come home */
+    uint32_t o1, p1, f1;
+    swap_pressure_stats(&o1, &p1, &f1);
+    uint32_t out = o1 - o0, back = swap_in_count() - in0;
+    struct task* t = task_find(pid);
+    int alive = t && t->state != TASK_DEAD;
+    int audit = swap_audit(0);
+    task_kill_tree(pid);
+    int ok = back >= 500 && alive && audit <= 0;
+    kprintf("swapracetest: %u page(s) written out while the program ran, %u of them came back "
+            "because it touched them, program %s, slot audit %d -> %s (the program prints "
+            "\"memhog: CORRUPT\" if a stamp was lost)\n",
+            out, back, alive ? "still running" : "DIED", audit, ok ? "PASS" : "FAIL");
+}
+SHELL_CMD(swapracetest) = { "swapracetest", "", 0, SHELL_G_TEST, cmd_swapracetest, SHELL_P_ADMIN };
 
 SHELL_CMD(evicttest) = { "evicttest", "", 0, SHELL_G_TEST, cmd_evicttest, SHELL_P_ADMIN };
 

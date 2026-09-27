@@ -852,9 +852,10 @@ int vmm_space_mark_swapped(struct vmm_space* s, uintptr_t va, uint32_t slot, uin
     uint64_t* pt = walk_to_pt_root(s->pml4, va, /*create*/0, 0);
     if (!pt) return -1;
     if (!(pt[IDX_PT(va)] & PTE_P)) return -1;
-    pt[IDX_PT(va)] = ((uint64_t)slot << 12) | VMM_SWPE_MARK |
-                     ((flags & VMM_WRITABLE) ? VMM_SWPE_W : 0) |
-                     ((flags & VMM_EXEC) ? VMM_SWPE_X : 0);
+    /* §M74 — atomic: the owner may be running (see the i386 twin). */
+    __atomic_exchange_n(&pt[IDX_PT(va)], ((uint64_t)slot << 12) | VMM_SWPE_MARK |
+                        ((flags & VMM_WRITABLE) ? VMM_SWPE_W : 0) |
+                        ((flags & VMM_EXEC) ? VMM_SWPE_X : 0), __ATOMIC_ACQ_REL);
     hal_tlb_shootdown(0, va);            /* §M51 — present -> absent */
     return 0;
 }
@@ -879,6 +880,28 @@ static void walk_swapped_subtree(uint64_t* tbl, uint64_t* ktbl, int depth, uintp
         walk_swapped_subtree(table_at((uintptr_t)e), kchild, depth + 1, entry_va, cb, ctx);
     }
 }
+int vmm_space_swap_out(struct vmm_space* s, uintptr_t va, uint32_t slot,
+                       uint64_t* old_raw, uint64_t* old_phys, uint32_t* old_flags, int flush) {
+    if (!s) return -1;
+    uint64_t* pt = walk_to_pt_root(s->pml4, va, /*create*/0, 0);
+    if (!pt) return -1;
+    uint64_t cur = pt[IDX_PT(va)];
+    if (!(cur & PTE_P) || !(cur & PTE_US)) return -1;
+    uint64_t mark = ((uint64_t)slot << 12) | VMM_SWPE_MARK | ((cur & PTE_RW) ? VMM_SWPE_W : 0) |
+                    ((cur & PTE_NX) ? 0 : VMM_SWPE_X);
+    uint64_t was = __atomic_exchange_n(&pt[IDX_PT(va)], mark, __ATOMIC_ACQ_REL);
+    if (!(was & PTE_P)) { __atomic_store_n(&pt[IDX_PT(va)], was, __ATOMIC_RELEASE); return -1; }
+    if (flush) hal_tlb_shootdown(0, va);
+    *old_raw = was;
+    *old_phys = was & PAGE_MASK_4K;
+    *old_flags = (uint32_t)(was & 0xFFFu) | ((was & PTE_NX) ? 0u : (uint32_t)VMM_EXEC);
+    return 0;
+}
+void vmm_space_swap_undo(struct vmm_space* s, uintptr_t va, uint64_t raw) {
+    uint64_t* pt = walk_to_pt_root(s->pml4, va, /*create*/0, 0);
+    if (pt) __atomic_store_n(&pt[IDX_PT(va)], raw, __ATOMIC_RELEASE);
+}
+
 int vmm_space_swapped_entry(struct vmm_space* s, uintptr_t va, uint32_t* slot, uint32_t* flags) {
     if (!s) return -1;
     uint64_t* pt = walk_to_pt_root(s->pml4, va, /*create*/0, 0);

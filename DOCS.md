@@ -15178,8 +15178,102 @@ service gave back all 706 cached pages (`memory low - gave back …`).
 - A program exec'd from the VFS still has its own image copied (only the
   interpreter goes through the cache today).
 
+### 4.114 Swap under pressure, with a ceiling — and a wake-up that never preempted (§M74 rungs 3-4, 2026-09-27)
+
+**§M74 is complete.**  Rung 3 aims §M72's mechanism at a RUNNING program by
+pressure; rung 4 makes the area's size a ceiling that refuses instead of
+spiralling.
+
+**Swap-in by fault** (three arches).  A fault on an evicted entry
+(`vmm_space_swapped_entry`) reads the page back and retries (`swap_in_fault`).
+It may sleep only when the fault came from user mode, or from a kernel access
+made with interrupts on and no spinlock held (the arch decides from the saved
+flags and the per-CPU preempt count).  Once the store is open it reads directly
+under the swap mutex, with no worker round trip.  `task_cont_lazy` resumes
+without an eager restore.
+
+**Eviction does not pause its victim.**  An idle program sleeps inside a system
+call and never reaches a ring-3 safe point, so pausing would reach the warm
+memory and never the cold.  Instead, per page:
+1. `vmm_space_swap_out` swaps the entry for the evicted marker ATOMICALLY and
+   shoots the TLB down, so from then on any access faults and waits on the swap
+   mutex the evictor holds.
+2. Only then is the frame copied (no write can race the copy) and written.
+3. It returns what WAS in the entry, so a concurrent `munmap`/`mmap` by the
+   owner cannot make the evictor free the wrong frame; a shared, COW, device or
+   DMA page found only then is put back exactly (`vmm_space_swap_undo`).
+
+The victim's space is pinned (`task_swap_pin`), so the reaper and `execve` wait
+before destroying it.  Candidates are private pages rung 1 has seen idle
+(`memage_frame_age`).
+
+**The policy** (`memage` service):
+- `mem.swap_policy` = `off` (default) | `emergency` | `normal`.
+- The order of sacrifice is fixed: clean page-cache pages first, then idle
+  anonymous pages, then the reserve refuses.
+- `emergency` acts only below the watermark (2× reserve + 1 MiB); `normal` also
+  writes out pages that are cold without pressure.
+- **`mem.swap_size_mb` is the area and the ceiling in one number**; reaching it
+  is a refusal.
+
+`swap` reports policy, use, pages out and back.  **The slot invariant replaces
+§M72's audit:** `AUDIT(swap-slots)` checks that every slot is owned by exactly
+one evicted entry. It reports a slot named twice, an entry naming a free slot,
+and an orphan (falsifier: `swap_audit_selftest`, run inside `evicttest`).
+
+**The three reserve rules, each shown:**
+- **Rule 2:** turning swap on moved the free figure the watermark reads by
+  0 frames.
+- **Rule 3:** an eviction pass with the calling task's allocations forced to
+  fail (`task->alloc_fail`, checked by `kmalloc` and the frame allocator) still
+  wrote 64 pages; the candidate list is static and pressure never opens the
+  store.
+- **Rule 1** holds by construction (the reserve is a count of free frames, which
+  eviction only raises, and only user spaces are walked). It is shown by a
+  kernel allocation succeeding during the refusal.
+
+**Measured, all three arches:**
+- `swapfaulttest`: 2049/2049 pages back by fault, the program's checksums clean.
+- `swapracetest`: **~4 500–8 800 pages written out while the program was running
+  and writing them, and brought back when it touched them, with zero lost
+  stamps**; the slot audit clean.
+- `thrashtest` (256 MiB machine, an 8 MB area, `memhog press` retrying forever):
+  2047 pages out, the area full at its ceiling, **refusals holding past it**,
+  worst scheduling lateness **11–13 ms**, and the shell answering afterwards.
+
+**Found on the way, all fixed:**
+- **A wake-up never preempted anything (pre-existing, confirmed on the §M72
+  commit).**  `task_enqueue` sent the cross-CPU kick but set nothing, and the
+  receiver's `schedule_check` returns at once without `need_resched`. So a task
+  woken for a BUSY CPU, or woken on the same CPU from an interrupt, waited out
+  the running task's quantum.  On aarch64 (100 Hz tick, all disk completions on
+  CPU 0) `diskstorm` took **4.7–7 s on two CPUs against 513 ms on one**.  Now
+  there are two reasons for a reschedule: `tick_due` charges a quantum, and
+  `wake_kick` ends the running task's turn with a fresh budget (it loses
+  latency, not share).  Before, `schedule_check` also charged a quantum on every
+  call, whatever caused it.  **aarch64 `diskstorm` → 457 ms; swap-in 165 →
+  1.8 ms/page on ARM, 2.4 → 0.47 ms on x86.**
+- **The block cache read one sector per disk request** (8 per page).  A miss now
+  reads the run of uncached sectors up to a page in one request.  The first
+  version kept only one of them, because `pick_victim` handed back the very slot
+  being filled; that slot is pinned now.  A speculative sector never forces a
+  dirty write-back: that trade had made `diskstorm` 3× slower.
+- **One TLB shootdown per evicted page** starved CPU 0 of emulated time under
+  i386 TCG until the ib700 went four seconds unfed. That happened twice, both
+  in heavy eviction, both reported as "host stall?"; CPU 0 had ticked 47 times
+  in a 500 ms sweep.  A pass now marks every page first, flushes ONCE, then
+  copies and writes: no NMI in 5 of 5 reruns, and ~1.7× the pages per second.
+- `blkbench` and `sgistat` stay as instruments. They are what separated "the disk
+  is slow" from "the waiter is not woken", and "the kick never arrives" from
+  "the kick is ignored".
+
+**Open:** victims are single-owner spaces (a thread shares its creator's pin);
+the store is a file (a full volume refuses, no smaller eviction); no swap
+compression; hardware Access Flag management on ARM is not used.
+
 ## 8. Change log
 
+- **2026-09-27 — §M74 COMPLETE, rungs 3-4: swap-in by fault; eviction of RUNNING programs by pressure (atomic mark, one flush, then write), `mem.swap_policy` + `mem.swap_size_mb` as the ceiling, `swap`, `AUDIT(swap-slots)`; the three reserve rules shown.  Fixed: a wake-up never preempted (aarch64 `diskstorm` 4.7-7 s -> 457 ms), block-cache read-ahead, per-page shootdowns starving CPU 0 (DOCS §4.114).**
 - **2026-09-27 — §M74 rung 2: a page cache; private file mappings and the interpreter (musl's libc.so) are shared copy-on-write — the second dynamic program costs 580-620 KB less; reclaim of unmapped cache pages under pressure with no disk; `unmap` releases what it held and `munmap` is real.  Fixed: x86_64 `map` dropped `VMM_COW`, aarch64 `map` made every user page writable (DOCS §4.113).**
 - **2026-09-27 — §M74 rung 1: the accessed-bit sweep (`vmm_space_age` on three arches, ARM access-flag faults, `memage`, `mem.age_ms`/`mem.cold_ms`, `agetest`).  Fixed: aarch64 `eret` with interrupts enabled (a nested IRQ clobbered ELR/SPSR), `mprotect(PROT_WRITE)` on fork-shared COW pages (write-through; x86_64 lost the COW mark), an unlocked `execve` mm swap under the space walkers, a parent's death force-killing (and crash-reporting) its children (DOCS §4.112).**
 - **2026-09-27 — §M72: a memory and a disk reserve that refuse, `df`; pause (`TASK_STOPPED`, `stop`/`cont`, SIGSTOP/SIGCONT); pause + evict to a swap store with the record in the PTE (`stop -e`, Task Manager, `AUDIT(swap-runnable)`, `evicttest`).  Fixed on the way: O(n²) exFAT chain walks, the block cache reading sectors about to be overwritten, `kill` of a sleeping program spinning it forever, ARM crt0 ignoring argv, an implicitly declared 64-bit allocator, ring-3 edu DMA out of reach (DOCS §4.111).**

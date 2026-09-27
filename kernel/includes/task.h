@@ -345,6 +345,9 @@ struct task {
      * would free them.  Claimed and released only through task_swap_claim /
      * task_swap_release, under the same lock as resume. */
     volatile int swap_busy;
+    /* §M74 — test-only: make THIS task's kernel and frame allocations fail
+     * (rule 3's falsifier: the swap write-out must not need memory). */
+    volatile int alloc_fail;
     /* M22.3 — CPU time accounting: ms actually spent on a CPU.
      * `sched_in_ms` stamps switch-in; switch-out accumulates into
      * `cpu_ms`.  Feeds `ps` and the GUI task manager. */
@@ -752,6 +755,8 @@ int  task_stop_audit_selftest(int pid);   /* §M72 — `stoptest` */
  * die.  A cont that arrives while it is held is refused (-5). */
 int  task_swap_claim(struct task* t);
 void task_swap_release(struct task* t, int resume_if_killed);
+int  task_swap_pin(struct task* t);
+int  alloc_fail_injected(void);           /* §M74 — the current task's alloc_fail */       /* §M74 — any live state; see task.c */
 
 /* §M46 — opt a user task (pid) into runaway auto-force-kill after `ms` of CPU
  * hogging with no voluntary yield (0 disables).  Set by a launcher per package. */

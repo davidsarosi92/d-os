@@ -506,6 +506,9 @@ int proc_execve(const char* path, char* const uargv[]) {
     me->sig_pending = 0;
     struct vmm_space* old = task_swap_mm(me, ns);   /* under the walkers' lock */
     vmm_space_switch(ns);
+    /* §M74 — a pressure eviction may be inside the OLD space; it pinned this
+     * task and releases in a bounded batch. */
+    while (__atomic_load_n(&me->swap_busy, __ATOMIC_ACQUIRE)) task_msleep(2);
     if (old) vmm_space_destroy(old);
     kfree(img);
     kfree(strbuf);

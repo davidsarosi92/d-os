@@ -603,6 +603,36 @@ static uint64_t* user_l3_of(struct vmm_space* s, uintptr_t va) {
     return (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
 }
 
+int vmm_space_swap_out(struct vmm_space* s, uintptr_t va, uint32_t slot,
+                       uint64_t* old_raw, uint64_t* old_phys, uint32_t* old_flags, int flush) {
+    if (!s || va < (4ull << 30) || (va >> 39)) return -1;
+    uint64_t* l3 = user_l3_of(s, va);
+    if (!l3) return -1;
+    unsigned i = (unsigned)((va >> 12) & 0x1FF);
+    uint64_t cur = l3[i];
+    if (!(cur & PTE_VALID) || !(cur & PTE_AP_EL0)) return -1;
+    uint64_t mark = ((uint64_t)slot << 12) | VMM_SWPE_MARK |
+                    ((cur & PTE_AP_RO_BIT) ? 0 : VMM_SWPE_W) | ((cur & PTE_UXN) ? 0 : VMM_SWPE_X);
+    uint64_t was = __atomic_exchange_n(&l3[i], mark, __ATOMIC_ACQ_REL);
+    if (!(was & PTE_VALID)) { __atomic_store_n(&l3[i], was, __ATOMIC_RELEASE); return -1; }
+    if (flush) __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");
+    uint32_t fl = VMM_USER;
+    if (was & PTE_SW_SHARED)   fl |= VMM_SHARED;
+    if (was & PTE_SW_COW)      fl |= VMM_COW;
+    if (!(was & PTE_AP_RO_BIT))fl |= VMM_WRITABLE;
+    if (!(was & PTE_UXN))      fl |= VMM_EXEC;
+    *old_raw = was;
+    *old_phys = was & PTE_ADDR_MASK;
+    *old_flags = fl;
+    return 0;
+}
+void vmm_space_swap_undo(struct vmm_space* s, uintptr_t va, uint64_t raw) {
+    uint64_t* l3 = user_l3_of(s, va);
+    if (!l3) return;
+    __atomic_store_n(&l3[(va >> 12) & 0x1FF], raw, __ATOMIC_RELEASE);
+    __asm__ volatile ("dsb ishst\nisb" ::: "memory");
+}
+
 int vmm_space_swapped_entry(struct vmm_space* s, uintptr_t va, uint32_t* slot, uint32_t* flags) {
     if (!s || ((va >> 30) & 0x1FF) < 4 || (va >> 39)) return -1;
     uint64_t* l3 = user_l3_of(s, va);
@@ -619,9 +649,11 @@ int vmm_space_mark_swapped(struct vmm_space* s, uintptr_t va, uint32_t slot, uin
     if (!l3) return -1;
     unsigned i = (unsigned)((va >> 12) & 0x1FF);
     if (!(l3[i] & PTE_VALID)) return -1;
-    l3[i] = ((uint64_t)slot << 12) | VMM_SWPE_MARK |
-            ((flags & VMM_WRITABLE) ? VMM_SWPE_W : 0) |
-            ((flags & VMM_EXEC) ? VMM_SWPE_X : 0);
+    /* §M74 — atomic: the owner may be running, and vmm_af_fault ORs into
+     * live entries from another CPU (see the x86 twins). */
+    __atomic_exchange_n(&l3[i], ((uint64_t)slot << 12) | VMM_SWPE_MARK |
+                        ((flags & VMM_WRITABLE) ? VMM_SWPE_W : 0) |
+                        ((flags & VMM_EXEC) ? VMM_SWPE_X : 0), __ATOMIC_ACQ_REL);
     __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");
     return 0;
 }

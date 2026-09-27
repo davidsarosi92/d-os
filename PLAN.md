@@ -225,7 +225,7 @@ fixed first, whatever it touches.
 | §M81 | steps 1-2, step 3 in part | chrome still hand-drawn; the verdict |
 | §M82 | ✅ complete (§4.110) | — (two live desktops at once) |
 | §M72 | ✅ complete (§4.111) | — (eviction faults pages back: §M74) |
-| §M74 | rungs 1-2 ✅ (§4.112, §4.113) | rungs 3-4: anonymous swap-out, thrash control |
+| §M74 | ✅ complete (§4.112-§4.114) | — (multi-threaded victims, swap compression) |
 | §M73 | — | designed, not started |
 | §M68 | — | investigation, not started |
 | §M83, §M84 | — | designed, not started |
@@ -305,7 +305,7 @@ what); a session can pick a theme and push on it.
 | M71 | **Runtime invariant audits** — `AUDIT()` registry with four rules, three checks (driver placement / driver resources / ring-3 boundary), shipped falsifiers, cron-driven so the runs worth auditing are covered.  Found a real cross-arch bug: the SYS_EXIT teleport left the ring-3 pointer gate armed, so pid 0 carried it from boot on every ARM machine | Architecture / Security | ✅ DOCS §4.87 |
 | M72 | ✅ **A reserve the system keeps, and a program you can pause** — shipped, DOCS §4.111 | Resilience | §M72 |
 | M73 | **Containers — running a Docker image** — the capability (per-process filesystem root, image as a store artifact, identity + resource caps), with Docker compat as the validation target rather than the specification.  §M32 is the gate | Userland / Security | §M73 — design + scoping |
-| M74 | **Swap and demand paging** — reclaim as a POLICY over §M72's mechanism.  Today: no swap, no demand paging, **no page cache**, and a file mapping is an eager private copy (two processes mapping the same `libc.so` get two copies).  The ladder's second rung — a page cache + demand-paged file mappings — is worth more than the swap and needs no disk to write to.  **Off by default** (`mem.swap_policy = off|emergency|normal`) and the size is the user's (`mem.swap_size_mb`, which IS the ceiling) — but `off` still reclaims, because clean file pages need no swap.  **Three hard rules: the reserve is pinned physical RAM, swap NEVER counts as free memory, and the writeout path allocates nothing.**  Explicit non-goal: running a workload larger than RAM | Memory | §M74 — design, unblocked (§M72 shipped) |
+| M74 | ✅ **Swap and demand paging** — shipped, DOCS §4.112-§4.114 | Memory | §M74 |
 | M75 | **Task Manager: what each process is costing** — ✅ **SHIPPED 2026-09-10 (DOCS §4.88)**: per-process MEM (portable policy over three arch walkers; verified by DIFFERENCE on all three, same 1028 KB constant) + CPU% (a delta over §M53's clock, keyed by PID where damage is keyed by slot), a `blk_read/write/flush` request path that did not exist, a kernel history ring sampled by a service so the window is a VIEW, `WIDGET_CLASS("chart")`, and the Total as the footer.  **Its own instrument found the biggest cost in the tree: the GUI is 50 % of a 4-CPU box AT REST** — §M49's open item, never before given a number.  OWNER still gated on §M32 | UX / Instrumentation | ✅ DOCS §4.88 |
 | M76 | **The aarch64 native syscall dispatcher — SWEPT** — ✅ **SHIPPED 2026-09-10 (DOCS §4.89)**: 26 of i386's 60 cases → **60 of 60**.  Found while §M75's own falsifier drowned an ARM log in `unknown number 35`; every native program using sockets, stat/getdents, threads, getrandom, uname or the dosgui bridge was **silently x86-only**, and the failure is a log line and a -1 rather than a link error, which is why it survived from §M25 to §M75.  **The blocker was the HARNESS, not the sweep** — `uidemo` could not be started on ARM at all (§4.74), so `gui.autorun` had to exist first.  Three cases are REFUSED WITH A REASON rather than wired: aarch64 has no I/O address space, and a driver told its port window was granted would fault at first access | Architecture | ✅ DOCS §4.89 |
 | M81 | **The GUI's seams — an audit of how it is assembled** — the compositor, the widget toolkit and the apps have grown by accretion, and §M32's GUI work spent three rounds in the wrong file because of it: an undocumented placement convention, a flag honoured in one of four dispatch paths, a strip that clipped a popup silently, and a window that lays out only if it was created the right way.  **The deliverable is a VERDICT with measurements, not a rewrite**: which seams are real, which are conventions nobody wrote down, and which communications with the kernel should become declared interfaces | UX / Architecture | ◐ steps 1-2 ✅ (container is a widget; one window constructor `gui_app_open`), mandatory/optional behaviour ✅, step 3 ◐ (Start menu, keyboard and network flyouts are item-view lists).  **OPEN: taskbar, volume flyout and sign-in still hand-drawn; `struct gui_window` is not a widget; the written per-seam VERDICT with call counts** |
@@ -5802,9 +5802,12 @@ independent reason it should be the next milestone.
 
 ## §M74 — Swap and demand paging: reclaim as a policy, not a favour
 
-**Status: rungs 1-2 SHIPPED 2026-09-27 (DOCS §4.112, §4.113) — the accessed-bit
-sweep, and a page cache that shares file pages copy-on-write (the second
-dynamic program costs ~600 KB less).  Rungs 3-4 open.**  Lessons from
+**Status: SHIPPED 2026-09-27 — DOCS §4.112 (accessed-bit sweep), §4.113 (page
+cache), §4.114 (swap-in by fault, pressure eviction of running programs, the
+ceiling, the three rules).**  Lessons: pausing the victim reaches only warm
+memory (idle programs sleep in syscalls), so eviction marks-flushes-writes
+instead; and the scheduler's wake-up "kick" had never preempted anything, which
+only a 1-CPU vs 2-CPU measurement of swap-in exposed.  Lessons from
 rung 1: an aarch64 `eret` taken with interrupts enabled (a nested IRQ
 overwrote ELR/SPSR — found only because the sweep's extra exception traffic
 made it common), and `mprotect(PROT_WRITE)` on fork-shared COW pages writing

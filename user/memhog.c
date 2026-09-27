@@ -120,10 +120,68 @@ static int age_mode(void) {
     return 0;
 }
 
+/* §M74 rung 3 — `memhog churn`: the in-flight race falsifier.  2 MiB; every
+ * pass stamps generation G into the first and last word of every page and
+ * checks that the previous pass's stamps are still there.  With eviction
+ * forced onto pages that are in use, a write that races a page being written
+ * out must fault, wait for the write, come back and land — or a stamp goes
+ * missing and this prints CORRUPT. */
+#define CHURN_BYTES (2u * STEP_BYTES)
+static int churn_mode(void) {
+    unsigned* p = (unsigned*)mmap(CHURN_BYTES, -1);
+    if (!p) { printf("memhog: no memory\n"); return 1; }
+    unsigned words = 4096u / 4u, pages = CHURN_BYTES / 4096u;
+    printf("memhog: pid %d churning %u KB\n", getpid(), CHURN_BYTES / 1024u);
+    for (unsigned pg = 0; pg < pages; pg++) {            /* generation 0 */
+        p[pg * words] = pg;
+        p[pg * words + words - 1] = pg;
+    }
+    for (unsigned g = 1;; g++) {
+        for (unsigned pg = 0; pg < pages; pg++) {
+            unsigned* a = p + pg * words;
+            unsigned want = g - 1;
+            if (a[0] != want * 7919u + pg || a[words - 1] != want * 104729u + pg) {
+                printf("memhog: CORRUPT page %u in pass %u (%x %x)\n", pg, g, a[0], a[words - 1]);
+                return 1;
+            }
+            a[0] = g * 7919u + pg;
+            a[words - 1] = g * 104729u + pg;
+        }
+        if (g % 20 == 0) printf("memhog: churn pass %u ok\n", g);
+        nanosleep_ms(20);
+    }
+    return 0;
+}
+
+/* §M74 rung 4 — `memhog press`: the oversized workload that does not give up.
+ * Grows 1 MiB at a time; when refused it waits and tries again, forever.
+ * With swap on, eviction keeps making room from its older (idle) pages, so it
+ * grows past physical memory — until the swap area's ceiling, after which the
+ * refusals must stay refusals.  It never touches old memory again, which is
+ * what makes those pages idle. */
+static int press_mode(void) {
+    printf("memhog: pid %d pressing 1 MiB at a time, retrying when refused\n", getpid());
+    unsigned held_kb = 0, refusals = 0;
+    for (;;) {
+        unsigned char* p = (unsigned char*)mmap(STEP_BYTES, -1);
+        if (!p) {
+            if (refusals++ % 20 == 0) printf("memhog: refused at %u KB (%u times)\n", held_kb, refusals);
+            nanosleep_ms(200);
+            continue;
+        }
+        for (unsigned off = 0; off < STEP_BYTES; off += 4096) p[off] = 1;
+        held_kb += STEP_BYTES / 1024u;
+        nanosleep_ms(5);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && argv[1][0] == 'f') return fill_mode();
     if (argc > 1 && argv[1][0] == 'v') return verify_mode();
     if (argc > 1 && argv[1][0] == 'a') return age_mode();
+    if (argc > 1 && argv[1][0] == 'c') return churn_mode();
+    if (argc > 1 && argv[1][0] == 'p') return press_mode();
     unsigned held_kb = 0;
 
     printf("memhog: pid %d — 1 MiB every 2 s, up to %d MiB\n",

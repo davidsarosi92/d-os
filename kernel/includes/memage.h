@@ -19,6 +19,8 @@ struct memage_stats {
 
 void memage_sweep(void);
 void memage_stats(struct memage_stats* out);
+int  memage_frame_age(uint64_t phys);
+uint32_t memage_cold_rounds(void);
 int  memage_task_split(int pid, uint64_t* hot, uint64_t* warm, uint64_t* cold);
 
 #endif

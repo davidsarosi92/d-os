@@ -110,8 +110,10 @@ void kmalloc_init(void) {
 /* Allocation.                                                                */
 /* -------------------------------------------------------------------------- */
 
+int alloc_fail_injected(void);
 void* kmalloc(size_t size) {
     if (!initialized || size == 0) return NULL;
+    if (alloc_fail_injected()) return NULL;     /* §M74 — rule 3's falsifier */
 
     /* Fast path: size class cache. */
     struct slab_cache* c = slab_lookup_cache(size);

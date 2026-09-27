@@ -1916,6 +1916,24 @@ int task_swap_claim(struct task* t) {
     return ok ? 0 : -1;
 }
 
+/* §M74 rung 3 — the same exclusive right for a task that is RUNNING or
+ * sleeping (pressure eviction does not pause its victim): what the pin buys is
+ * that the address space outlives the eviction — task_reap and execve wait
+ * for it before destroying a space.  0, or -1 if the task is dead or already
+ * held. */
+int alloc_fail_injected(void) {
+    struct task* t = task_current();
+    return t && t->alloc_fail;
+}
+
+int task_swap_pin(struct task* t) {
+    uint32_t fl = spin_lock_irqsave(&stop_lock);
+    int ok = (t->state != TASK_DEAD && !t->swap_busy && t->mm && !t->mm_shared);
+    if (ok) t->swap_busy = 1;
+    spin_unlock_irqrestore(&stop_lock, fl);
+    return ok ? 0 : -1;
+}
+
 void task_swap_release(struct task* t, int resume_if_killed) {
     uint32_t fl = spin_lock_irqsave(&stop_lock);
     t->swap_busy = 0;
@@ -2250,6 +2268,9 @@ int task_reap(int pid) {
      * closed at SYS_EXIT while it was still current.)  A kernel thread's mm is
      * NULL / borrowed, so only user_task owns one to free. */
     if (t->user_task && t->mm && !t->mm_shared) {
+        /* §M74 — an eviction may still be walking this space (it pinned the
+         * task, not the space); it finishes in a bounded batch. */
+        while (__atomic_load_n(&t->swap_busy, __ATOMIC_ACQUIRE)) task_msleep(2);
         vmm_space_destroy(t->mm);
         t->mm = NULL;
     }

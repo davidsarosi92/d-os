@@ -97,6 +97,18 @@ typedef void (*vmm_swapped_fn)(void* ctx, uintptr_t va, uint32_t slot, uint32_t 
 int  vmm_space_mark_swapped(struct vmm_space* space, uintptr_t va, uint32_t slot,
                             uint32_t flags);
 void vmm_space_walk_swapped(struct vmm_space* space, vmm_swapped_fn cb, void* ctx);
+/* §M74 rung 3 — EVICTING A PAGE WHOSE OWNER MAY BE RUNNING.  swap_out swaps
+ * the entry for the evicted marker ATOMICALLY and shoots the TLB down, then
+ * reports what WAS there (raw entry, frame, VMM_* flags): the caller works only
+ * with that frame, because a concurrent munmap/mmap/mprotect by the owner can
+ * have changed the entry since any earlier walk.  -1 (entry unchanged) if the
+ * page was not present.  swap_undo puts the raw entry back exactly (a shared,
+ * COW or device page discovered only now, or a failed write). */
+int  vmm_space_swap_out(struct vmm_space* space, uintptr_t va, uint32_t slot,
+                        uint64_t* old_raw, uint64_t* old_phys, uint32_t* old_flags,
+                        int flush);   /* 0: the caller flushes the batch (vmm_age_flush) */
+void vmm_space_swap_undo(struct vmm_space* space, uintptr_t va, uint64_t old_raw);
+
 /* §M74 rung 3 — the one entry at `va`: 0 and its slot + VMM_* flags if it is
  * an evicted page, -1 otherwise.  The swap-in fault asks this. */
 int  vmm_space_swapped_entry(struct vmm_space* space, uintptr_t va,

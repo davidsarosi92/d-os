@@ -839,6 +839,8 @@ int pmm_local_node(void) {
 }
 
 pmm_phys_t page_alloc(int order, int zone_hint) {
+    { extern int alloc_fail_injected(void);
+      if (alloc_fail_injected()) return PMM_ALLOC_FAIL; }   /* §M74 — rule 3 */
     return page_alloc_node(order, zone_hint, pmm_local_node());
 }
 

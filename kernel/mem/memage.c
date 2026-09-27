@@ -52,6 +52,7 @@
 #include "lock.h"
 #include "proc.h"
 #include "pcache.h"
+#include "swap.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -158,6 +159,18 @@ void memage_sweep(void) {
     spin_unlock_irqrestore(&g_st_lock, fl);
 }
 
+/* §M74 rung 3 — a frame's age in sweeps since last seen used, or -1 when the
+ * sweep has no opinion (not tracked, or not seen this round). */
+int memage_frame_age(uint64_t phys) {
+    if (!g_age) return -1;
+    uint64_t pfn = phys >> 12;
+    if (pfn < pmm_pfn_base || pfn - pmm_pfn_base >= g_n) return -1;
+    uint32_t i = (uint32_t)(pfn - pmm_pfn_base);
+    if (g_round[i] != g_cur) return -1;
+    return g_age[i];
+}
+uint32_t memage_cold_rounds(void) { return cold_rounds(); }
+
 void memage_stats(struct memage_stats* out) {
     uint32_t fl = spin_lock_irqsave(&g_st_lock);
     *out = g_st;
@@ -207,11 +220,30 @@ static void pressure_reclaim(void) {
     pmm_reserve_stats(&rkb, NULL, &low);
     uint32_t water = (rkb / 4u) * 2u + 256u;           /* frames: 2x reserve + 1 MiB */
     static int told;
-    if (pmm_free_frames() >= water) { told = 0; return; }
+    int pressure = pmm_free_frames() < water;
+    /* RULE 2 — the watermark reads PHYSICAL free frames only; swap never
+     * counts as free memory, or the line would not fire until the swap area
+     * itself was full (and the machine already thrashing). */
+    if (!pressure) {
+        told = 0;
+        swap_pressure(0);                        /* normal policy: cold pages only */
+        return;
+    }
+    /* The order of sacrifice (§M74): clean file pages first — nothing is
+     * lost — then idle anonymous pages if swap is on, then the reserve
+     * refuses. */
     uint32_t n = pcache_reclaim(256);
-    if (n && !told) {
+    uint32_t s = 0;
+    /* Under real pressure one batch is 256 KB — repeat while it helps. */
+    for (int k = 0; k < 32 && pmm_free_frames() < water; k++) {
+        uint32_t got = swap_pressure(1);
+        s += got;
+        if (!got) break;
+    }
+    if ((n || s) && !told) {
         told = 1;
-        kprintf("memage: memory low - gave back %u cached file page(s)\n", n);
+        kprintf("memage: memory low - gave back %u cached file page(s), wrote out %u idle "
+                "page(s)\n", n, s);
     }
 }
 

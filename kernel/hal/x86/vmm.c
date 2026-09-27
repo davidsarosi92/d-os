@@ -674,9 +674,56 @@ int vmm_space_mark_swapped(struct vmm_space* s, uintptr_t va, uint32_t slot, uin
     uint64_t e = ((uint64_t)slot << 12) | VMM_SWPE_MARK |
                  ((flags & VMM_WRITABLE) ? VMM_SWPE_W : 0) |
                  ((flags & VMM_EXEC) ? VMM_SWPE_X : 0);
-    pte_set(pt, j, e);
+    /* §M74 — ATOMICALLY, because the owner may be RUNNING (pressure eviction
+     * does not pause it): a plain store can race another CPU's hardware
+     * setting A/D in the same entry.  The marker fits in the low word (slot <
+     * 65536), so clearing the present bit is one 32-bit exchange in both
+     * formats; the hardware only updates a PRESENT entry, and in PAE the high
+     * word (NX, upper address bits) is zeroed after P is already clear. */
+    uint32_t* lo = g_pae ? (uint32_t*)(uintptr_t)pt + 2 * j : (uint32_t*)(uintptr_t)pt + j;
+    __atomic_exchange_n(lo, (uint32_t)e, __ATOMIC_ACQ_REL);
+    if (g_pae) ((volatile uint32_t*)lo)[1] = 0;
     hal_tlb_shootdown(0, v);                        /* §M51 — present -> absent */
     return 0;
+}
+
+int vmm_space_swap_out(struct vmm_space* s, uintptr_t va, uint32_t slot,
+                       uint64_t* old_raw, uint64_t* old_phys, uint32_t* old_flags, int flush) {
+    if (!s) return -1;
+    uint32_t v = (uint32_t)va, gi = pde_index(v);
+    if (pde_is_kernel_shared(s, gi)) return -1;
+    uint64_t pde = pde_get(s->root, gi);
+    if (!(pde & E_P) || (pde & E_PS)) return -1;
+    uint64_t pt = pde & addr_mask();
+    uint32_t j = pte_index(v);
+    uint32_t* lo = g_pae ? (uint32_t*)(uintptr_t)pt + 2 * j : (uint32_t*)(uintptr_t)pt + j;
+    uint64_t cur = pte_get(pt, j);
+    if (!(cur & E_P) || !(cur & E_US)) return -1;
+    uint32_t mark = (slot << 12) | VMM_SWPE_MARK | ((cur & E_RW) ? VMM_SWPE_W : 0) |
+                    (exec_of(cur) ? VMM_SWPE_X : 0);
+    uint32_t was_lo = __atomic_exchange_n(lo, mark, __ATOMIC_ACQ_REL);
+    uint64_t hi = g_pae ? ((volatile uint32_t*)lo)[1] : 0;
+    if (!(was_lo & E_P)) {                      /* changed under us: put it back */
+        __atomic_store_n(lo, was_lo, __ATOMIC_RELEASE);
+        return -1;
+    }
+    if (g_pae) ((volatile uint32_t*)lo)[1] = 0;
+    if (flush) hal_tlb_shootdown(0, v);         /* §M51 — before anyone copies */
+    uint64_t raw = (hi << 32) | was_lo;
+    *old_raw = raw;
+    *old_phys = raw & addr_mask();
+    *old_flags = (uint32_t)(raw & 0xFFFu & ~(uint64_t)VMM_EXEC) | exec_of(raw);
+    return 0;
+}
+void vmm_space_swap_undo(struct vmm_space* s, uintptr_t va, uint64_t raw) {
+    uint32_t v = (uint32_t)va;
+    uint64_t pde = pde_get(s->root, pde_index(v));
+    if (!(pde & E_P) || (pde & E_PS)) return;
+    uint64_t pt = pde & addr_mask();
+    uint32_t j = pte_index(v);
+    uint32_t* lo = g_pae ? (uint32_t*)(uintptr_t)pt + 2 * j : (uint32_t*)(uintptr_t)pt + j;
+    if (g_pae) ((volatile uint32_t*)lo)[1] = (uint32_t)(raw >> 32);   /* high first */
+    __atomic_store_n(lo, (uint32_t)raw, __ATOMIC_RELEASE);          /* P last */
 }
 
 void vmm_space_walk_swapped(struct vmm_space* s, vmm_swapped_fn cb, void* ctx) {
