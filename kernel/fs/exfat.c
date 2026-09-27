@@ -174,6 +174,16 @@ struct exfat_inode {
     uint32_t dirent_index;               /* 0-based index of File entry within parent */
     uint8_t  sec_count;                  /* SecondaryCount from File entry */
     int      has_owner_rec;              /* its set carries our Vendor Extension */
+    /* §M72 stage 3 — WALK CACHES, because a FAT chain is a linked list and
+     * every read or write used to walk it from the head: a sequential pass
+     * over an N-cluster file cost N²/2 FAT lookups (plus the same again per
+     * write to count and find the tail).  Found writing an 8 MiB swap store,
+     * which took minutes.  Both caches are keyed on the chain's FIRST cluster:
+     * this driver only ever grows a chain at its tail or frees it whole, so
+     * an index -> cluster mapping, once learned, stays true for as long as the
+     * chain has that head — and a freed-and-reused head is a different inode. */
+    uint32_t hint_first, hint_idx, hint_clu; /* last cluster reached by index */
+    uint32_t len_first, len_n, len_tail;     /* chain length and its last cluster */
 };
 
 /* ---------------------------------------------------------------------- */
@@ -359,6 +369,40 @@ static struct bcache_buf* cluster_chain_get_sector(struct exfat_fs* fs,
                    within_clu / fs->bytes_per_sector;
     *out_within_sector = within_clu % fs->bytes_per_sector;
     return bcache_get(fs->dev, lba);
+}
+
+/* The same for a FILE, through its walk cache: resume from the last cluster
+ * reached when the wanted one lies at or after it (the sequential case), and
+ * remember where this lookup ended.  A contiguous (NoFatChain) file needs no
+ * cache — its walk is arithmetic. */
+static struct bcache_buf* inode_get_sector(struct exfat_fs* fs, struct exfat_inode* ei,
+                                           uint64_t off, uint32_t* out_within_sector,
+                                           int whole) {
+    if (ei->no_fat_chain && !whole)
+        return cluster_chain_get_sector(fs, ei->first_cluster, 1, off, out_within_sector);
+    if (ei->no_fat_chain) {
+        uint32_t cur = chain_skip(fs, ei->first_cluster,
+                                  (uint32_t)(off / fs->bytes_per_cluster), 1);
+        if (cur >= EXFAT_FAT_EOC_FIRST) return NULL;
+        uint32_t wc = (uint32_t)(off % fs->bytes_per_cluster);
+        *out_within_sector = wc % fs->bytes_per_sector;
+        return bcache_get_overwrite(fs->dev, cluster_first_lba(fs, cur) + wc / fs->bytes_per_sector);
+    }
+    uint32_t cluster_no = (uint32_t)(off / fs->bytes_per_cluster);
+    uint32_t within_clu = (uint32_t)(off % fs->bytes_per_cluster);
+    uint32_t cur, from;
+    if (ei->hint_first == ei->first_cluster && ei->hint_clu >= 2 && cluster_no >= ei->hint_idx) {
+        cur = ei->hint_clu; from = ei->hint_idx;
+    } else {
+        cur = ei->first_cluster; from = 0;
+    }
+    cur = chain_skip(fs, cur, cluster_no - from, 0);
+    if (cur >= EXFAT_FAT_EOC_FIRST) return NULL;
+    ei->hint_first = ei->first_cluster; ei->hint_idx = cluster_no; ei->hint_clu = cur;
+    uint64_t lba = cluster_first_lba(fs, cur) + within_clu / fs->bytes_per_sector;
+    *out_within_sector = within_clu % fs->bytes_per_sector;
+    /* `whole`: the caller replaces the entire sector, so do not read it. */
+    return whole ? bcache_get_overwrite(fs->dev, lba) : bcache_get(fs->dev, lba);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -726,9 +770,7 @@ static ssize_t exfat_read(struct file* f, void* buf, size_t n, uint64_t off) {
     size_t   total = 0;
     while (n > 0) {
         uint32_t within;
-        struct bcache_buf* b = cluster_chain_get_sector(fs, ei->first_cluster,
-                                                        ei->no_fat_chain,
-                                                        off, &within);
+        struct bcache_buf* b = inode_get_sector(fs, ei, off, &within, 0);
         if (!b) return total ? (ssize_t)total : -1;
         uint32_t chunk = fs->bytes_per_sector - within;
         if (chunk > n) chunk = (uint32_t)n;
@@ -868,13 +910,20 @@ static ssize_t exfat_write(struct file* f, const void* buf, size_t n,
     } else {
         clusters_have = 1;
         if (!ei->no_fat_chain) {
-            /* count via FAT walk */
-            uint32_t cur = ei->first_cluster;
-            for (;;) {
-                uint32_t nxt = fat_next(fs, cur);
-                if (nxt >= EXFAT_FAT_EOC_FIRST) break;
-                cur = nxt;
-                clusters_have++;
+            if (ei->len_first == ei->first_cluster && ei->len_n) {
+                clusters_have = ei->len_n;               /* the walk cache */
+            } else {
+                /* count via FAT walk, once, and remember the answer */
+                uint32_t cur = ei->first_cluster;
+                for (;;) {
+                    uint32_t nxt = fat_next(fs, cur);
+                    if (nxt >= EXFAT_FAT_EOC_FIRST) break;
+                    cur = nxt;
+                    clusters_have++;
+                }
+                ei->len_first = ei->first_cluster;
+                ei->len_n = (uint32_t)clusters_have;
+                ei->len_tail = cur;
             }
         }
     }
@@ -883,10 +932,15 @@ static ssize_t exfat_write(struct file* f, const void* buf, size_t n,
         uint64_t to_add = clusters_need - clusters_have;
         if (!fs_reserve_allows(fs, to_add)) return -1;   /* §M72 — nothing written */
         uint32_t prev_tail = (ei->first_cluster < 2) ? 0
-                                                     : chain_tail(fs, ei->first_cluster);
+                           : (!ei->no_fat_chain && ei->len_first == ei->first_cluster && ei->len_n)
+                             ? ei->len_tail : chain_tail(fs, ei->first_cluster);
         for (uint64_t i = 0; i < to_add; i++) {
             uint32_t c = bitmap_alloc(fs);
-            if (!c) return -1;          /* out of space; nothing written yet */
+            if (!c) {                   /* out of space; nothing written yet */
+                ei->len_n = 0;          /* the chain may have grown part-way:
+                                           the length cache no longer knows */
+                return -1;
+            }
             fat_set(fs, c, EXFAT_FAT_EOC);
             if (prev_tail) {
                 fat_set(fs, prev_tail, c);
@@ -896,6 +950,11 @@ static ssize_t exfat_write(struct file* f, const void* buf, size_t n,
             }
             prev_tail = c;
         }
+        if (!ei->no_fat_chain) {         /* the chain grew at its tail */
+            ei->len_first = ei->first_cluster;
+            ei->len_n = (uint32_t)clusters_need;
+            ei->len_tail = prev_tail;
+        }
     }
 
     /* Copy bytes through bcache, sector by sector. */
@@ -903,9 +962,10 @@ static ssize_t exfat_write(struct file* f, const void* buf, size_t n,
     size_t total = 0;
     while (n > 0) {
         uint32_t within;
-        struct bcache_buf* b = cluster_chain_get_sector(fs, ei->first_cluster,
-                                                        ei->no_fat_chain,
-                                                        off, &within);
+        /* A write that starts on a sector boundary and covers the whole
+         * sector need not read it first. */
+        int whole = (off % fs->bytes_per_sector) == 0 && n >= fs->bytes_per_sector;
+        struct bcache_buf* b = inode_get_sector(fs, ei, off, &within, whole);
         if (!b) return total ? (ssize_t)total : -1;
         uint32_t chunk = fs->bytes_per_sector - within;
         if (chunk > n) chunk = (uint32_t)n;

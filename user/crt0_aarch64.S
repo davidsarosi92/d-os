@@ -4,7 +4,14 @@
  * The ELF entry: call main(), then SYS_EXIT.  Syscall ABI: x8 = number,
  * x0..x5 = args; the kernel's SVC dispatcher reads x8 = SYS_EXIT and takes the
  * exit code from x0.  main() returns its value in w0/x0, so it is already the
- * exit code — just set x8 and svc.  No argc/argv/env.
+ * exit code — just set x8 and svc.
+ *
+ * argc/argv (2026-09-27): the kernel lays the SysV initial stack out here as
+ * on x86 — [sp] = argc, [sp+8..] = argv[] — and musl programs have always read
+ * it; this crt0 did not, so every in-tree program on ARM ran with whatever x0
+ * and x1 happened to hold and silently took its DEFAULT mode (found by
+ * `evicttest`: `memhog verify` ran as the plain hog; `memhog fill` had done the
+ * same since §M72 stage 1).  x86_64's crt0 had the identical gap (§4.39).
  * ============================================================================= */
 
 .section .text
@@ -30,6 +37,8 @@ __thread_exit_tramp:
 2:  b       2b                  /* unreachable */
 
 _start:
+    ldr     x0, [sp]            /* argc                                    */
+    add     x1, sp, #8          /* argv                                    */
     bl      main                /* main() → return value in x0 (= exit code) */
     mov     x8, #1              /* SYS_EXIT */
     svc     #0

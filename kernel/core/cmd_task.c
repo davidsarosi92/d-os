@@ -17,6 +17,8 @@
 #include "console.h"
 #include "printf.h"
 #include "task.h"
+#include "swap.h"
+#include "pmm.h"
 #include "percpu.h"
 #include "lock.h"
 #include "timer.h"
@@ -444,10 +446,33 @@ static void cmd_kill(const char* args) {
  * it.  The program keeps every frame it holds and stays resumable; it stops
  * at its next moment in ring 3, where it holds no kernel lock — so a program
  * in the middle of a system call finishes that call first. */
+/* §M72 stage 3 — `stop -e`: pause, wait for the pause to take effect, then
+ * write the program's private memory to the swap store and free it.  The
+ * report says what was freed AND what was kept and why, because "evicted 3
+ * pages" of a program that holds 3000 is only honest with the rest beside it. */
+static void stop_and_evict(int pid) {
+    uint32_t before = pmm_free_frames();
+    struct swap_report rep;
+    int rc = swap_stop_evict(pid, &rep);
+    uint32_t after = pmm_free_frames();
+    if (rc == -2) { kprintf("stop: pid %d %s - nothing evicted\n", pid, rep.why); return; }
+    kprintf("stop: pid %d evicted %u page(s) (%u KB), free memory +%d KB; kept %u shared, "
+            "%u copy-on-write, %u device, %u DMA",
+            pid, rep.evicted, rep.evicted * 4u, (int)(after - before) * 4,
+            rep.kept_shared, rep.kept_cow, rep.kept_device, rep.kept_dma);
+    if (rep.why) kprintf(" - %s", rep.why);
+    kprintf("\n");
+    kprintf("stop: it still holds its descriptors, sockets, timers and windows; "
+            "`cont %d` reads the pages back first\n", pid);
+}
+
 static void cmd_stop(const char* args) {
-    int pid = 0;
+    int pid = 0, evict = 0;
+    while (*args == ' ') args++;
+    if (args[0] == '-' && args[1] == 'e' && (args[2] == ' ' || !args[2])) { evict = 1; args += 2; }
     if (resolve_pid(args, "stop", &pid) != 0) return;
     int r = task_stop(pid);
+    if (r == 0 && evict) { stop_and_evict(pid); return; }
     if (r == 0)       kprintf("stop: pid %d will stop at its next moment in user mode\n", pid);
     else if (r == -2) kprintf("stop: pid %d belongs to somebody else\n", pid);
     else if (r == -3) kprintf("stop: pid %d is a kernel thread - only programs can be "
@@ -462,6 +487,8 @@ static void cmd_cont(const char* args) {
     if (r == 0)       kprintf("cont: pid %d resumed\n", pid);
     else if (r == 1)  kprintf("cont: pid %d was not stopped (any pending stop cancelled)\n", pid);
     else if (r == -2) kprintf("cont: pid %d belongs to somebody else\n", pid);
+    else if (r == -4) kprintf("cont: pid %d stays paused (see above)\n", pid);
+    else if (r == -5) kprintf("cont: pid %d is being swapped right now - try again\n", pid);
     else              kprintf("cont: pid %d not found\n", pid);
 }
 /* §M72 — `stoptest`: the falsifier set for the pause.  (1) a program blocked
@@ -505,9 +532,104 @@ static void cmd_stoptest(const char* args) {
             stopped ? "yes" : "NO", rule7 == 10 ? "saw it and cleared" : "WRONG",
             ok ? "PASS" : "FAIL");
 }
+/* §M72 stage 3 — `evicttest`: the eviction's falsifier set.  memhog verify
+ * holds 8 MiB under an address-dependent pattern plus 64 KiB it shares
+ * copy-on-write with a forked child.  Pause, evict, and check four things the
+ * kernel can see: the free-frame count rose by about what was evicted, the
+ * COW pages were KEPT, the audit is clean while the task is paused and FAILS
+ * when the task is made to look runnable on purpose, and after `cont` every
+ * page is back.  The fifth — the bytes are right — is the program's own:
+ * "pass N ok" lines keep coming after the resume, and "CORRUPT" never does. */
+static void cmd_evicttest(const char* args) {
+    while (args && *args == ' ') args++;
+    int kill_mode = args && args[0] == 'k';  /* `evicttest kill`: evict, then kill */
+    const unsigned char *s = 0, *e = 0;
+    if (_binary_user_memhog_elf_start)             { s = _binary_user_memhog_elf_start;         e = _binary_user_memhog_elf_end; }
+    else if (_binary_user_memhog_x86_64_elf_start) { s = _binary_user_memhog_x86_64_elf_start;  e = _binary_user_memhog_x86_64_elf_end; }
+    else if (_binary_user_memhog_aarch64_elf_start){ s = _binary_user_memhog_aarch64_elf_start; e = _binary_user_memhog_aarch64_elf_end; }
+    if (!s) { kprintf("evicttest: no memhog embedded\n"); return; }
+    const char* argv[2] = { "memhog", "verify" };
+    int pid = proc_spawn_argv("evict-prog", s, (size_t)(e - s), 2, argv, 0);
+    if (pid < 0) { kprintf("evicttest: spawn failed\n"); return; }
+    task_msleep(2500);                       /* filled, forked, first passes done */
+    task_stop(pid);
+    struct task* t = task_find(pid);
+    for (int i = 0; i < 100 && t && t->state != TASK_STOPPED; i++) { task_msleep(20); t = task_find(pid); }
+    if (!t || t->state != TASK_STOPPED) { kprintf("evicttest: did not stop - FAIL\n"); task_kill_tree(pid); return; }
+    uint32_t f0 = pmm_free_frames();
+    struct swap_report rep;
+    if (task_swap_claim(t) != 0) { kprintf("evicttest: claim refused - FAIL\n"); return; }
+    swap_evict_task(t, &rep);
+    uint32_t f1 = pmm_free_frames();
+    int clean_paused = swap_audit(0);        /* want 0: paused, counts agree */
+    /* The falsifier: make the evicted task LOOK runnable to the audit.  Safe
+     * because we hold the swap claim (nothing may resume it) and SLEEPING is
+     * never picked; it goes back to STOPPED on the next line. */
+    t->state = TASK_SLEEPING;
+    int seen = swap_audit(0);
+    t->state = TASK_STOPPED;
+    task_swap_release(t, 1);
+    uint32_t out = t->swapped_pages;
+    if (rep.result == SWAP_DECLINED && rep.evicted == 0) {
+        /* The honest decline: no store.  The program must still be PAUSED,
+         * must still hold its memory, and must resume as if nothing happened. */
+        int still = t->state == TASK_STOPPED && t->swapped_pages == 0 &&
+                    (int)(f1 - f0) == 0;
+        int rc = task_cont(pid);
+        task_msleep(1500);
+        int ran = t->state != TASK_STOPPED;
+        task_kill_tree(pid);
+        kprintf("evicttest: DECLINED - %s; stayed paused with its memory %s, resumed %s -> %s\n",
+                rep.why ? rep.why : "(no reason given)", still ? "yes" : "NO",
+                rc == 0 && ran ? "yes" : "NO", still && rc == 0 && ran ? "PASS (decline)" : "FAIL");
+        return;
+    }
+    kprintf("evicttest: evicted %u page(s), free frames +%d, kept %u copy-on-write; "
+            "audit paused=%d, made-runnable=%d; time copy %u ms, store I/O %u ms, unmap %u ms\n",
+            rep.evicted, (int)(f1 - f0), rep.kept_cow, clean_paused, seen,
+            rep.copy_us / 1000u, rep.io_us / 1000u, rep.map_us / 1000u);
+    task_msleep(1500);                       /* it must print nothing while paused */
+    if (kill_mode) {
+        /* Killed while its pages are out: it must die WITHOUT running ring-3
+         * code on them (stop_self exits it), and the space teardown must hand
+         * every slot back. */
+        uint32_t used0 = 0, used1 = 0;
+        swap_stats(&used0, 0);
+        task_kill_tree(pid);
+        for (int i = 0; i < 100 && task_find(pid) && task_find(pid)->state != TASK_DEAD; i++)
+            task_msleep(20);
+        task_msleep(300);                    /* the reaper frees the space */
+        swap_stats(&used1, 0);
+        struct task* d = task_find(pid);
+        int dead = !d || d->state == TASK_DEAD;
+        int kok = rep.evicted >= 2048 && used0 >= rep.evicted && used1 == 0 && dead;
+        kprintf("evicttest kill: slots in use %u while evicted, %u after the kill; died %s -> %s\n",
+                used0, used1, dead ? "yes" : "NO", kok ? "PASS" : "FAIL");
+        return;
+    }
+    kprintf("evicttest: resuming\n");
+    int rc = task_cont(pid);
+    uint32_t f2 = pmm_free_frames();
+    task_msleep(2500);                       /* passes on the restored memory */
+    int back = t->swapped_pages == 0 && t->state != TASK_STOPPED;
+    int after = swap_audit(0);
+    uint32_t used = 0;
+    swap_stats(&used, 0);
+    task_kill_tree(pid);
+    int ok = rep.evicted >= 2048 && out == rep.evicted &&
+             (int)(f1 - f0) >= (int)rep.evicted - 64 && rep.kept_cow >= 16 &&
+             clean_paused == 0 && seen >= 1 && rc == 0 && back && after <= 0 &&
+             (int)(f1 - f2) >= (int)rep.evicted - 64;
+    kprintf("evicttest: cont rc %d, all pages back %s, frames taken back %d, audit after %d, "
+            "slots in use %u -> %s (the program's own 'pass N ok' after the resume is "
+            "the byte check)\n",
+            rc, back ? "yes" : "NO", (int)(f1 - f2), after, used, ok ? "PASS" : "FAIL");
+}
+SHELL_CMD(evicttest) = { "evicttest", "", 0, SHELL_G_TEST, cmd_evicttest, SHELL_P_ADMIN };
+
 SHELL_CMD(stoptest) = { "stoptest", "", 0, SHELL_G_TEST, cmd_stoptest, SHELL_P_ADMIN };
 
-SHELL_CMD(stop) = { "stop", "<pid|name>", "pause a program (keeps its memory, resumable)",
+SHELL_CMD(stop) = { "stop", "[-e] <pid|name>", "pause a program (-e: also write its memory out)",
                     SHELL_G_TASK, cmd_stop, SHELL_P_ANY };
 SHELL_CMD(cont) = { "cont", "<pid|name>", "resume a paused program",
                     SHELL_G_TASK, cmd_cont, SHELL_P_ANY };

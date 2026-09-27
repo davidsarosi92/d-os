@@ -336,6 +336,15 @@ struct task {
     volatile int kill_forced;
     /* §M72 — pause requested; honoured at the next ring-3 safe point. */
     volatile int stop_pending;
+    /* §M72 stage 3 — pages of this (stopped) program written to the swap
+     * store and not yet brought back.  Nonzero only while STOPPED. */
+    volatile uint32_t swapped_pages;
+    /* §M72 stage 3 — the swap worker is walking this task's address space
+     * (evicting or restoring).  While set, nothing may resume it: a resumed
+     * task would run on tables being rewritten under it, and a killed one
+     * would free them.  Claimed and released only through task_swap_claim /
+     * task_swap_release, under the same lock as resume. */
+    volatile int swap_busy;
     /* M22.3 — CPU time accounting: ms actually spent on a CPU.
      * `sched_in_ms` stamps switch-in; switch-out accumulates into
      * `cpu_ms`.  Feeds `ps` and the GUI task manager. */
@@ -732,6 +741,12 @@ int  task_force_kill(int pid);
 int  task_stop(int pid);
 int  task_cont(int pid);
 int  task_stop_audit_selftest(int pid);   /* §M72 — `stoptest` */
+/* §M72 stage 3 — exclusive right to rewrite a STOPPED task's pages.  claim
+ * returns 0 if the task is stopped and nobody else holds it, -1 otherwise;
+ * release drops it and, if a kill arrived meanwhile, lets the task run to
+ * die.  A cont that arrives while it is held is refused (-5). */
+int  task_swap_claim(struct task* t);
+void task_swap_release(struct task* t, int resume_if_killed);
 
 /* §M46 — opt a user task (pid) into runaway auto-force-kill after `ms` of CPU
  * hogging with no voluntary yield (0 disables).  Set by a launcher per package. */

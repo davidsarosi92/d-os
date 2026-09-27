@@ -54,8 +54,56 @@ static int fill_mode(void) {
     return 0;
 }
 
+/* §M72 stage 3 — `memhog verify`: the falsifier for eviction.  A pattern that
+ * depends on every word's ADDRESS (so a page brought back in the wrong place,
+ * or a page of zeros, cannot pass) is re-checked twice a second, forever.  A
+ * program paused, evicted and resumed must go on printing "ok"; one byte
+ * wrong prints where.
+ *
+ * Before the private region, a small one is written and then FORKED over: the
+ * child keeps reading it, so in the parent those pages stay copy-on-write —
+ * shared with another process — and eviction must leave them alone (the
+ * report counts them as kept).  The child checks its copy too, so a page that
+ * was evicted anyway and came back wrong would show on the OTHER side. */
+#define VFY_PRIV   (8u * STEP_BYTES)
+#define VFY_SHARED (64u * 1024u)
+static unsigned vfy_word(const unsigned* p) { return (unsigned)(unsigned long)p ^ 0x5A17C0DEu; }
+static int vfy_check(unsigned* base, unsigned bytes, const char* who, int pass) {
+    for (unsigned i = 0; i < bytes / 4; i++)
+        if (base[i] != vfy_word(&base[i])) {
+            printf("memhog: %s CORRUPT at +%u (pass %d)\n", who, i * 4, pass);
+            return -1;
+        }
+    return 0;
+}
+static int verify_mode(void) {
+    unsigned* sh = (unsigned*)mmap(VFY_SHARED, -1);
+    if (!sh) { printf("memhog: no memory\n"); return 1; }
+    for (unsigned i = 0; i < VFY_SHARED / 4; i++) sh[i] = vfy_word(&sh[i]);
+    int child = fork();
+    if (child == 0) {
+        for (int pass = 1;; pass++) {
+            if (vfy_check(sh, VFY_SHARED, "child", pass) == 0 && pass % 10 == 0)
+                printf("memhog: child pass %d ok\n", pass);
+            nanosleep_ms(500);
+        }
+    }
+    unsigned* pv = (unsigned*)mmap(VFY_PRIV, -1);
+    if (!pv) { printf("memhog: no memory\n"); return 1; }
+    for (unsigned i = 0; i < VFY_PRIV / 4; i++) pv[i] = vfy_word(&pv[i]);
+    printf("memhog: pid %d verifying %u KB private + %u KB shared with child %d\n",
+           getpid(), VFY_PRIV / 1024u, VFY_SHARED / 1024u, child);
+    for (int pass = 1;; pass++) {
+        int bad = vfy_check(pv, VFY_PRIV, "private", pass) | vfy_check(sh, VFY_SHARED, "shared", pass);
+        if (!bad) printf("memhog: pass %d ok\n", pass);
+        nanosleep_ms(500);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && argv[1][0] == 'f') return fill_mode();
+    if (argc > 1 && argv[1][0] == 'v') return verify_mode();
     unsigned held_kb = 0;
 
     printf("memhog: pid %d — 1 MiB every 2 s, up to %d MiB\n",

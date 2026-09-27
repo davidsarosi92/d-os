@@ -219,10 +219,14 @@ static int edu_init(void* ctx) {
       if (n >= 20 && n <= 64) dma_bits = n; }
 #else
     /* No config reader in ring 3, and inventing one for a single integer would
-     * be a second configuration system.  The placed build asks for the width the
-     * kernel's manifest is prepared to serve; if the device is narrower than
-     * that, the placement is refused rather than silently truncating. */
-    dma_bits = 32;
+     * be a second configuration system.  So the placed build asks for the
+     * DEVICE's documented width, exactly as the kernel build's default does,
+     * and the kernel applies `driver.edu.dma_bits` on its behalf when the key
+     * is set (drvuser_sys_dma).  It used to ask for 32 here — wider than QEMU's
+     * 28-bit edu — and on a machine with RAM above 256 MiB the buffer landed
+     * where the device could not reach: `edutest: FAIL — 255 of 256 bytes came
+     * back wrong`, the silent truncation this comment claimed was refused. */
+    dma_bits = 28;
 #endif
     h_dma = drv_dma_request(&rt, EDU_DMA_BYTES, dma_bits, "edu transfer buffer");
     if (h_dma < 0) {

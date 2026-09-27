@@ -14947,8 +14947,109 @@ account (the layout pre-chose it AFTER creating the field the test waited for �
 
 **Not done:** two live desktops at once (fast user switching).
 
+### 4.111 A reserve the system keeps, and a program you can pause (§M72, 2026-09-27)
+
+Three stages, one contract: **the program stops and stays resumable; freeing
+its memory is an optimisation of that contract, never a condition of it.**
+
+**Stage 1 — the reserves.**  `mem.reserve_kb` (default 4096): every user-page
+allocation site (`pmm_alloc_frame_user*` — anonymous mmap, brk, stack, ELF
+segments, COW on all three arches, memfd) is refused below the reserve, so a
+runaway program is stopped by the kernel while the shell, `crash` and `audit`
+still get memory.  The crossing is announced once per crossing and the state is
+OBSERVED (`meminfo`, `/proc/meminfo`), not remembered.  Measured: `memhog fill`
+is refused at the reserve and the machine answers; the control run (reserve 0)
+cannot even start the Task Manager.  `fs.reserve_kb` (default 1024): exFAT
+keeps a free-cluster count (checked by `AUDIT(exfat-free)`, falsifier
+`exfatfreetest`) and refuses a USER's write below it while system writes pass.
+`df`.  Homes are created when a session opens, so a diskless boot has them.
+
+**Stage 2 — pause.**  `TASK_STOPPED` (appended after `TASK_DEAD`): off every
+runqueue, keeps its memory.  `task_stop` only REQUESTS it; it takes effect at a
+ring-3 safe point — the timer preemption point and the return from every system
+call, on all three arches — so a stopped task holds no kernel lock.  Kernel
+threads are refused (a paused kernel thread could hold a lock the machine
+needs).  `cont` resumes through a claim, so racing callers resume once;
+`kill`/`fkill` resume a stopped task so it can die.  `SIGSTOP`/`SIGTSTP`/
+`SIGCONT` act on the scheduler.  Runqueue audit rule 7: a STOPPED task on a
+runqueue (falsifier `stoptest`, which also proves a program blocked in a system
+call stops only on its way out).  Task Manager: `STOP` and Pause/Resume.
+
+**Stage 3 — pause + evict** (`kernel/mem/swap.c`, `swap.h`).  `stop -e
+<pid|name>`, and the Task Manager's *Pause + free memory*, write a paused
+program's private pages to a store and free the frames; `cont` reads them all
+back BEFORE the program may run again.
+
+- **The record is the page-table entry.**  A not-present entry has every bit
+  but bit 0 free, so an evicted page is `slot << 12 | MARK | W? | X?` in its
+  own PTE on all three arches (`vmm_space_mark_swapped`,
+  `vmm_space_walk_swapped`); the page tables stay the one record of a mapping,
+  and `vmm_space_destroy` hands the slots of a dying space back.
+- **What is never evicted, each for its own reason, and counted in the
+  report:** a frame the allocator does not manage (a device window), a frame a
+  device can DMA into (drvrt's grant table), a `VMM_SHARED` frame (another
+  process maps it now), a `VMM_COW` frame (the other side of a fork shares it).
+- **Every failure degrades to "paused, memory kept" and says why**: no
+  writable volume (`mem.suspend_store` empty and nothing persistent — the
+  honest decline), the store full, a write failed.  A resume that cannot get
+  its memory back (the reserve applies to it like any user page) leaves the
+  program PAUSED, and `cont` says so (-4).
+- **Resume is eager**; faulting pages back in is §M74's.  `AUDIT(swap-runnable)`:
+  no task that can run has an evicted page, and every paused one's counter
+  matches its tables.
+- **Races.** The swap worker holds a per-task claim (`task_swap_claim`), decided
+  under the same lock as resume: while it is held a `cont` is refused (-5) and a
+  kill waits for the release.  A task killed while its pages are out dies
+  straight from the stop point, never running ring-3 code on them.
+- **The I/O runs on a kworker (SYSTEM)** — the store holds other programs'
+  memory and is 0600 — one request at a time behind a kmutex.
+
+**Measured (`evicttest`, hidden; i386/x86_64/aarch64, -smp 2 and 4):** 8 MiB
+under an address-dependent pattern plus 64 KiB shared copy-on-write with a
+forked child → **2049 pages evicted, free frames +2049, 273 COW pages kept**;
+the audit is clean while paused and **fails when the task is made to look
+runnable on purpose**; after `cont` all 2049 frames are taken back, slots in use
+0, and the program's own checksum passes keep printing `ok` with no `CORRUPT`
+anywhere.  `evicttest kill`: 2049 slots held while evicted, **0 after the
+kill**, exit 143.  No disk: `DECLINED - no writable volume to put it on`,
+stayed paused with its memory, resumed.  **DMA exclusion, driven:** `edu` placed
+in ring 3, `stop -e edu` → 259 pages evicted, **256 device pages (its register
+window) and 1 DMA page kept**, `cont` resumes it.  Time for 8 MiB: copy
+56–60 ms, unmap 46–91 ms, store I/O **1.8–5.4 s** (after the two fixes below;
+26 s before).
+
+**Five defects found on the way, all fixed:**
+1. **exFAT walked the FAT chain from the head on every access** — to count the
+   clusters, to find the tail, and once per SECTOR to find the offset — so a
+   sequential pass over an N-cluster file cost N²/2 lookups.  Per-inode walk
+   caches keyed on the chain's first cluster (valid because this driver only
+   grows a chain at its tail or frees it whole; invalidated if an append fails
+   part-way).
+2. **The block cache read every missing sector before handing it out**, even to
+   a caller about to overwrite all of it: `bcache_get_overwrite`, used by exFAT
+   for whole-sector writes.  Store I/O 26 s → 1.8 s.
+3. **A plain `kill` never killed a sleeping ring-3 program.**  It was honoured
+   only in `task_yield`, which a program never calls; the kill woke its
+   nanosleep, which returned at once, forever — a killed `memhog` child reached
+   "pass 557280".  Now honoured at the ring-3 safe point too, quietly, exit 143.
+4. **The ARM crt0 never read `argc`/`argv`**, so every in-tree program on aarch64
+   ran its default mode (`memhog verify`, and stage 1's `memhog fill`).
+5. **`pmm_alloc_frame_user` was declared only in `kmap.h`**, which the x86_64
+   and aarch64 VMMs do not include — called through an implicit `int`, a 64-bit
+   physical address truncated.  Declared in `pmm.h`.
+6. **Ring-3 `edu` asked for 32 DMA address bits on a 28-bit device** —
+   `edutest: FAIL — 255 of 256 bytes came back wrong` on i386 without an IOMMU.
+   Both builds ask for the device's 28; the kernel applies
+   `driver.<name>.dma_bits` for a placed driver (one configuration system).
+   Also: aarch64's user unmap/protect invalidated the TLB on the local CPU only
+   (`tlbi … is` now).
+
+**Open:** faulting pages back on demand (§M74); the store is a file, so a volume
+that fills up is a refusal, not a smaller eviction; no compression.
+
 ## 8. Change log
 
+- **2026-09-27 — §M72: a memory and a disk reserve that refuse, `df`; pause (`TASK_STOPPED`, `stop`/`cont`, SIGSTOP/SIGCONT); pause + evict to a swap store with the record in the PTE (`stop -e`, Task Manager, `AUDIT(swap-runnable)`, `evicttest`).  Fixed on the way: O(n²) exFAT chain walks, the block cache reading sectors about to be overwritten, `kill` of a sleeping program spinning it forever, ARM crt0 ignoring argv, an implicitly declared 64-bit allocator, ring-3 edu DMA out of reach (DOCS §4.111).**
 - **2026-09-27 — §M82: persistent homes, a desktop and a program list per account (enforced at launch), `env.PATH`/`HOME`, open programs restored at sign-in, a greeter shell; the Start menu's power/Exit-GUI rows and the console behind the desktop were privilege holes — closed (DOCS §4.110).**
 - **2026-09-27 — §M32 closed: owner and mode stored on exFAT in a Vendor Extension entry inside each file's entry set; `setattr` dir-op; `stat`; verified across reboots and a Linux mount; `cat`/`ls` say `permission denied` (DOCS §4.109).**
 - **2026-09-27 — §M32: simultaneous sessions — one config layer per signed-in account, resolved by the caller; the desktop takes the seat, a text login beside it runs in the background (`seattest`); one session-id allocator (DOCS §4.108).**

@@ -35,6 +35,7 @@
 #include "itemview.h"
 extern unsigned iv_stat_pane, iv_stat_cells, iv_stat_rows, iv_stat_colmove;
 #include "task.h"
+#include "swap.h"
 #include "timer.h"       /* §M75 — the delta is over a CLOCK  */
 #include "percpu.h"      /* §M75 — smp_ncpus: CPU%% is scaled by core count */
 #include "sysmon.h"      /* §M75 — the four charts + the total  */
@@ -54,6 +55,7 @@ struct tm_row {
     char name[TASK_NAME_MAX + 1];
     char is_current;
     char emitted;
+    char swapped;           /* §M72 stage 3 — paused with pages in the store */
 };
 
 /* §M75 — the previous refresh's CPU totals, so the percentage is a DELTA.
@@ -148,6 +150,7 @@ static void tm_collect(const struct task* t, int is_current, void* ctx) {
     if (tm->nrows >= WLIST_MAX_ITEMS) return;
     struct tm_row* r = &tm->rows[tm->nrows++];
     r->pid = t->pid; r->ppid = t->ppid; r->st = t->state;
+    r->swapped = t->swapped_pages != 0;
     /* §M75 — `task_cpu_ms_now` and not `t->cpu_ms`: the raw field is credited
      * only at a context switch, so a task executing right now is short by
      * however long it has been on its CPU.  Small, and it is the quantity a
@@ -306,7 +309,12 @@ static int tm_m_cell(void* ctx, int index, int col, char* out, int cap) {
         p = put_u32_pad(out, p, cap, (uint32_t)r->pid, 0);
         break;
     case TM_COL_STATE:
-        p = put_str(out, p, cap, state_short(r->st));
+        /* §M72 stage 3 — SWAP, not STOP, for a paused program whose memory is
+         * in the store: resuming it costs a read of everything it held, and a
+         * STOP that is secretly a SWAP hides that its first moment back is
+         * slow. */
+        p = put_str(out, p, cap, r->swapped && r->st == TASK_STOPPED ? "SWAP"
+                                                                     : state_short(r->st));
         break;
     case TM_COL_CPU:
         p = put_u32_pad(out, p, cap, r->cpu_ms, 0);
@@ -360,6 +368,12 @@ static int tm_pid_present(struct taskman* tm, int pid) {
     for (int i = 0; i < tm->nrows; i++) if (tm->rows[i].pid == pid) return 1;
     return 0;
 }
+
+/* §M72 stage 3 — the Evict helper's hand-off (see tm_evict). */
+static volatile int  tm_evict_pid = -1;
+static char          tm_evict_msg[96];
+static volatile int  tm_evict_done;
+static void tm_say(struct taskman* tm, const char* msg);
 
 static void tm_refresh(struct gui_window* win) {
     struct taskman* tm = (struct taskman*)gui_window_ctx(win);
@@ -505,6 +519,10 @@ static void tm_refresh(struct gui_window* win) {
      * every table in this system inherits it instead of each app writing its
      * own diff.  What this used to do by hand is w_itemview_refresh. */
     w_itemview_refresh(tm->iv);
+
+    /* LAST, so nothing above overwrites the answer in the same call (the
+     * footer did exactly that to every button message once — §M69). */
+    if (tm_evict_done) { tm_evict_done = 0; tm_say(tm, tm_evict_msg); }
 }
 
 /* ---- callbacks --------------------------------------------------------------- */
@@ -574,6 +592,49 @@ static void tm_kill_force(struct w_button* b, void* ctx) {
  * half greyed out, and a control whose usual state is disabled is one nobody
  * learns).  A paused program keeps all its memory and resumes exactly where
  * it stopped; this is the rung below "End task". */
+/* §M72 stage 3 — Evict runs on its OWN task: writing a program's memory out
+ * takes seconds (1.8 s for 8 MiB measured), and this window's host must keep
+ * drawing and answering meanwhile.  The helper posts its result back as DATA
+ * (§M22.7: a window's widgets belong to its host task), consumed by the tick. */
+
+static void tm_evict_task(void) {
+    int pid = tm_evict_pid;
+    struct swap_report rep;
+    int rc = swap_stop_evict(pid, &rep);
+    int n = 0;
+    const char* a = rc == 0 ? "evicted - " : "paused, memory kept - ";
+    while (*a && n < 60) tm_evict_msg[n++] = *a++;
+    if (rc == 0) {
+        char num[12]; int k = 0; uint32_t v = rep.evicted * 4u;
+        do { num[k++] = (char)('0' + v % 10); v /= 10; } while (v && k < 11);
+        while (k && n < 80) tm_evict_msg[n++] = num[--k];
+        a = " KB freed";
+    } else {
+        a = rep.why ? rep.why : "nothing could be written out";
+    }
+    while (*a && n < 95) tm_evict_msg[n++] = *a++;
+    tm_evict_msg[n] = 0;
+    tm_evict_done = 1;
+    tm_evict_pid = -1;
+}
+
+static void tm_evict(void) {
+    struct taskman* tm = (struct taskman*)gui_window_ctx(tm_win);
+    if (!tm) return;
+    int pid = tm_selected_pid(tm);
+    if (pid < 0) return;
+    if (tm_evict_pid >= 0) { tm_say(tm, "an eviction is already running"); return; }
+    struct task* t = task_find(pid);
+    if (!t || !t->user_task) { tm_say(tm, "only programs can be paused"); return; }
+    tm_evict_pid = pid;
+    if (!task_spawn_detached("tm-evict", tm_evict_task)) {
+        tm_evict_pid = -1;
+        tm_say(tm, "could not start the eviction");
+        return;
+    }
+    tm_say(tm, "pausing and writing its memory out...");
+}
+
 static void tm_pause(struct w_button* b, void* ctx) {
     (void)b; (void)ctx;
     struct taskman* tm = (struct taskman*)gui_window_ctx(tm_win);
@@ -683,6 +744,7 @@ static void tm_tick(struct gui_window* win) {
  * layout.  That is the same contract every composed panel here follows. */
 enum {
     TM_ID_TABLE = 1, TM_ID_CHARTS, TM_ID_ROW, TM_ID_END, TM_ID_FKILL, TM_ID_PAUSE,
+    TM_ID_EVICT,
     TM_ID_STATUS, TM_ID_CHART0,     /* …CHART0 + SYSMON_NSERIES - 1 */
 };
 
@@ -694,13 +756,14 @@ static void tm_ui_event(struct gui_window* win, int id, int type, int value,
     if (id == TM_ID_END)   tm_kill(NULL, tm);
     if (id == TM_ID_FKILL) tm_kill_force(NULL, tm);
     if (id == TM_ID_PAUSE) tm_pause(NULL, tm);
+    if (id == TM_ID_EVICT) tm_evict();
 }
 
 static void tm_layout(struct gui_window* win) {
     struct taskman* tm = (struct taskman*)gui_window_ctx(win);
     if (!tm) return;
 
-    struct ui_spec spec[9 + SYSMON_NSERIES];
+    struct ui_spec spec[10 + SYSMON_NSERIES];
     int n = 0;
     spec[n++] = (struct ui_spec){ .id = TM_ID_TABLE, .cls = "view",
         .text = "table", .weight = 1, .flags = UI_EDGE | UI_FOCUSABLE };
@@ -716,6 +779,8 @@ static void tm_layout(struct gui_window* win) {
         .cls = "button", .text = "End task" };
     spec[n++] = (struct ui_spec){ .id = TM_ID_PAUSE, .parent = TM_ID_ROW,
         .cls = "button", .text = "Pause / Resume" };
+    spec[n++] = (struct ui_spec){ .id = TM_ID_EVICT, .parent = TM_ID_ROW,
+        .cls = "button", .text = "Evict" };
     spec[n++] = (struct ui_spec){ .id = TM_ID_FKILL, .parent = TM_ID_ROW,
         .cls = "button", .text = "Force kill" };
     spec[n++] = (struct ui_spec){ .id = TM_ID_STATUS, .cls = "label",

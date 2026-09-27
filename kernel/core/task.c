@@ -78,6 +78,7 @@
  * ============================================================================= */
 
 #include "task.h"
+#include "swap.h"
 #include "watchdog.h"   /* §M31 L3 — hw_watchdog_pet from the tick */
 #include "kmutex.h"
 #include "syscall.h"   /* sys_futex — CLONE_CHILD_CLEARTID wake */
@@ -1860,14 +1861,43 @@ static void wake_blocked_task(struct task* t) {
 
 /* §M72 — STOPPED -> RUNNABLE, exactly once however many callers race: the
  * state is the claim (CAS), and whoever wins the claim enqueues. */
+/* §M72 stage 3 — the swap claim and the resume are decided under ONE lock:
+ * otherwise "resume saw no claim" and "claim saw a stopped task" can both be
+ * true at once, and the worker rewrites the tables of a task that is running. */
+static spinlock_t stop_lock = SPINLOCK_INIT;
+
 static int resume_stopped(struct task* t) {
-    int want = TASK_STOPPED;
+    uint32_t fl = spin_lock_irqsave(&stop_lock);
     t->stop_pending = 0;
-    if (!__atomic_compare_exchange_n((int*)&t->state, &want, (int)TASK_RUNNABLE, 0,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    if (t->swap_busy) {                      /* stays paused; release decides */
+        spin_unlock_irqrestore(&stop_lock, fl);
         return 0;
+    }
+    int want = TASK_STOPPED;
+    int won = __atomic_compare_exchange_n((int*)&t->state, &want, (int)TASK_RUNNABLE, 0,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    spin_unlock_irqrestore(&stop_lock, fl);
+    if (!won) return 0;
     task_enqueue(t);
     return 1;
+}
+
+int task_swap_claim(struct task* t) {
+    uint32_t fl = spin_lock_irqsave(&stop_lock);
+    int ok = (t->state == TASK_STOPPED && !t->swap_busy);
+    if (ok) t->swap_busy = 1;
+    spin_unlock_irqrestore(&stop_lock, fl);
+    return ok ? 0 : -1;
+}
+
+void task_swap_release(struct task* t, int resume_if_killed) {
+    uint32_t fl = spin_lock_irqsave(&stop_lock);
+    t->swap_busy = 0;
+    spin_unlock_irqrestore(&stop_lock, fl);
+    /* A kill that arrived while the worker held the task was not allowed to
+     * resume it; do that now, so it can run to its death (stop_self exits it
+     * without returning to ring 3 if pages are still out). */
+    if (resume_if_killed && t->kill_pending) resume_stopped(t);
 }
 
 /* §M32 stage 7 — MAY THE CALLER SIGNAL THIS TASK?
@@ -1958,6 +1988,11 @@ static void stop_self(struct task* self) {
     task_notify_change();
     hal_intr_restore(fl);
     schedule();                          /* off every queue until task_cont */
+    /* §M72 stage 3 — only a KILL resumes a task whose pages are still in the
+     * swap store (task_cont brings them back first).  It must not go back to
+     * ring 3 and touch them: it dies here, and the space teardown hands the
+     * slots back.  Same place and context as the forced-kill exit. */
+    if (self->kill_pending && self->swapped_pages) task_exit_code(self->kill_forced ? 137 : 143);
 }
 
 int task_stop(int pid) {
@@ -1994,6 +2029,21 @@ int task_cont(int pid) {
     struct task* t = task_find(pid);
     if (!t || t->state == TASK_DEAD) return -1;
     if (!may_signal(t)) return -2;
+    /* §M72 stage 3 — an evicted program gets its memory back BEFORE it may
+     * run; if that cannot be done it stays paused and the caller says why. */
+    if (t->swapped_pages) {
+        if (task_swap_claim(t) != 0) return -5;       /* the worker holds it */
+        struct swap_report rep;
+        int rc = swap_restore_task(t, &rep);
+        task_swap_release(t, 0);
+        if (rc != 0) {
+            kprintf("cont: pid %d stays paused - %s (%u of its pages brought back)\n",
+                    t->pid, rep.why ? rep.why : "restore failed", rep.restored);
+            return -4;
+        }
+    } else if (t->swap_busy) {
+        return -5;
+    }
     int was = resume_stopped(t);
     task_notify_change();
     return was ? 0 : 1;                  /* 1 = it was not stopped (request cancelled) */
@@ -2015,6 +2065,19 @@ void task_force_kill_point(int from_user) {
                      "unresponsive task reclaimed by force");
         task_exit_code(137);                 /* 128 + SIGKILL, conventional */
     }
+    /* A PLAIN kill of a program (2026-09-27).  The cooperative kill was
+     * honoured only in task_yield — and a ring-3 program never calls that: it
+     * sleeps through nanosleep/poll, which the kill wakes and makes return at
+     * once.  So `kill <pid>` of a sleeping program turned it into a program
+     * that spun at full speed and never died (found by §M72's evicttest:
+     * memhog's child reached "pass 557280" after being killed; memhog's own
+     * "`kill` me" hint had been wrong since §M75).  Here, in user mode, the
+     * task holds no kernel lock — this is the safe point the forced kill
+     * uses — so the flag is honoured, quietly: a kill that was asked for is
+     * not a crash.  143 = 128 + SIGTERM, the signal `kill` sends by default. */
+    if (self && self->kill_pending && self->user_task && !self->is_idle &&
+        self->state != TASK_DEAD)
+        task_exit_code(143);
 }
 
 int task_reap(int pid) {

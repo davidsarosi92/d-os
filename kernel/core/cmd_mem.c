@@ -207,15 +207,18 @@ static void mem_memhog(const char* a) {
     if (!s || !e) { console_write("memhog: no ELF embedded for this arch\n"); return; }
 
     /* §M72 — `memhog fill`: grow until refused (the reserve's falsifier). */
-    int fill = a && a[0] == 'f';
-    const char* argv[2] = { "memhog", "fill" };
+    /* §M72 stage 3 — `memhog verify`: a checksummed region that must survive
+     * being paused, evicted and resumed (the eviction's falsifier). */
+    while (a && *a == ' ') a++;
+    int fill = a && (a[0] == 'f' || a[0] == 'v');
+    const char* argv[2] = { "memhog", a && a[0] == 'v' ? "verify" : "fill" };
     int pid = fill ? proc_spawn_argv("memhog", s, (size_t)(e - s), 2, argv, 0)
                    : proc_spawn("memhog", s, (size_t)(e - s));
     if (pid < 0) { console_write("memhog: spawn failed\n"); return; }
     kprintf("memhog: pid %d — `ps` twice and subtract; `kill %d` when done\n", pid, pid);
 }
 
-SHELL_CMD(memhog)    = { "memhog",    "[fill]", "ring-3 process that grows 1 MiB/2 s (memory-column falsifier)",
+SHELL_CMD(memhog)    = { "memhog",    "[fill|verify]", "ring-3 process that grows 1 MiB/2 s (memory-column falsifier)",
                          SHELL_G_TEST, mem_memhog, SHELL_P_ADMIN };
 
 /* ---------------------------------------------------------------------------

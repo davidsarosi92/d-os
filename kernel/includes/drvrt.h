@@ -320,6 +320,9 @@ drv_handle drv_res_note_mmio(struct drv_rt* rt, uint64_t phys, uint64_t len,
 drv_handle drv_res_note_dma(struct drv_rt* rt, uint64_t phys, uint64_t len,
                             uintptr_t va, uint64_t dev, const char* why);
 
+/* §M72 — 1 if a DMA grant or MMIO window covers `phys` (eviction skips it). */
+int drv_res_phys_in_dma(uint64_t phys);
+
 /* Diagnostics: print what a driver is holding.  Backs `drv res`. */
 void drv_res_dump(void);
 

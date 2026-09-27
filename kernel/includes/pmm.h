@@ -231,8 +231,13 @@ void       pmm_node_stats(int node, struct pmm_node_info* out);
 void       pmm_node_zone_stats(int node, int zone, uint32_t* out_free_per_order,
                                uint32_t* out_managed);
 
-/* §M72 — user memory, refused below `mem.reserve_kb` (pmm.c). */
+/* §M72 — user memory, refused below `mem.reserve_kb` (pmm.c).  BOTH live
+ * here: pmm_alloc_frame_user was declared only in kmap.h, so the x86_64 and
+ * aarch64 VMMs (which do not include it) called it through an implicit `int`
+ * declaration — a 64-bit physical address truncated to 32 bits, silently. */
+pmm_phys_t pmm_alloc_frame_user(void);
 pmm_phys_t pmm_alloc_frame_user_low(void);
+int pmm_frame_is_managed(pmm_phys_t phys);      /* RAM the allocator owns? */
 void pmm_reserve_changed(void);
 void pmm_reserve_stats(uint32_t* reserve_kb, uint32_t* refused, int* low);
 

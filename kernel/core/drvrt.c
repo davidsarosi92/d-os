@@ -721,6 +721,19 @@ drv_handle drv_res_note_dma(struct drv_rt* rt, uint64_t phys, uint64_t len,
     return h;
 }
 
+/* §M72 — may a DEVICE reach this frame?  A frame named by a driver's DMA grant
+ * (or inside an MMIO window) is written by hardware that has never heard of
+ * eviction; freeing it would let the device write into whatever the allocator
+ * hands out next.  This table is the existing record of what devices reach. */
+int drv_res_phys_in_dma(uint64_t phys) {
+    for (int i = 0; i < DRVRT_MAX_RES; i++) {
+        struct drv_res* r = &g_res[i];
+        if (!r->used || (r->kind != RES_DMA && r->kind != RES_MMIO)) continue;
+        if (phys >= r->base && phys < r->base + r->len) return 1;
+    }
+    return 0;
+}
+
 /* ---- diagnostics ---------------------------------------------------------- */
 
 /* One driver's holdings as a short string.  See drvrt.h for why this exists

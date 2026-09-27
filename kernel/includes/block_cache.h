@@ -67,6 +67,11 @@ int  bcache_init(void);
  * from disk on cache miss.  Returns NULL on I/O error or cache exhaustion
  * (every slot already pinned).  Caller MUST pair with `bcache_release`. */
 struct bcache_buf* bcache_get(struct block_device* dev, uint64_t lba);
+/* The same, for a caller that will overwrite the WHOLE sector: on a miss the
+ * slot is zeroed instead of read from disk.  (A hit returns the cached data as
+ * usual.)  The caller MUST mark it dirty after writing, or zeros are what a
+ * later reader gets back from the cache. */
+struct bcache_buf* bcache_get_overwrite(struct block_device* dev, uint64_t lba);
 
 /* Release a buffer obtained via `bcache_get`.  Lowers the refcount; the
  * entry remains in cache (and can be evicted later) but the contents

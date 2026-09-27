@@ -820,6 +820,7 @@ CORE_C_SRCS := \
     kernel/fs/procfs.c \
     kernel/fs/exfat.c \
     kernel/mem/pmm.c \
+    kernel/mem/swap.c \
     kernel/mem/vmm_account.c \
     kernel/mem/kmalloc.c \
     kernel/mem/slab.c \
@@ -977,6 +978,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/basic.c \
     kernel/gui/apps/netsurf_app.c \
     kernel/mem/pmm.c \
+    kernel/mem/swap.c \
     kernel/mem/vmm_account.c \
     kernel/mem/slab.c \
     kernel/mem/kmalloc.c \
@@ -1159,6 +1161,7 @@ CORE_C_SRCS := \
     kernel/fs/procfs.c \
     kernel/fs/exfat.c \
     kernel/mem/pmm.c \
+    kernel/mem/swap.c \
     kernel/mem/vmm_account.c \
     kernel/mem/kmalloc.c \
     kernel/mem/slab.c \

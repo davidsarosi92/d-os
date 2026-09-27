@@ -64,4 +64,33 @@ typedef void (*vmm_walk_fn)(void* ctx, uintptr_t va, uint64_t phys,
 void vmm_space_walk(struct vmm_space* space, vmm_walk_fn cb, void* ctx);
 uint32_t vmm_frame_share_count(uint64_t phys);   /* 64-bit: i386 PAE frames */
 
+/* ---------------------------------------------------------------------------
+ * §M72 stage 3 — AN EVICTED PAGE IS RECORDED IN ITS OWN PAGE-TABLE ENTRY.
+ *
+ * A not-present entry has every bit but bit 0 free to software, so the slot
+ * the page was written to lives there, with the page's permissions — the page
+ * tables stay the ONE record of what a mapping is (a side table keyed by VA
+ * would have to be kept in step across fork, exec, mprotect and teardown).
+ * The same encoding on every arch:
+ *     slot << 12  |  VMM_SWPE_MARK  |  VMM_SWPE_W?  |  VMM_SWPE_X?
+ * and bit 0 (present / valid) clear.
+ *
+ *  vmm_space_mark_swapped  a PRESENT user page becomes that entry, with the
+ *                          TLB invalidated everywhere (a weakening, §M51).
+ *                          The frame is the CALLER's to free afterwards.
+ *                          0, or -1 if the page is not present.
+ *  vmm_space_walk_swapped  every such entry in the private region.
+ *  swap_slot_release       called by vmm_space_destroy for each one, so a
+ *                          process that exits while evicted gives its slots
+ *                          back (swap.c; a weak no-op where it is absent).
+ * Bringing a page back is the ordinary vmm_space_map over the entry. */
+#define VMM_SWPE_MARK   0x200u
+#define VMM_SWPE_W      0x100u
+#define VMM_SWPE_X      0x080u
+typedef void (*vmm_swapped_fn)(void* ctx, uintptr_t va, uint32_t slot, uint32_t flags);
+int  vmm_space_mark_swapped(struct vmm_space* space, uintptr_t va, uint32_t slot,
+                            uint32_t flags);
+void vmm_space_walk_swapped(struct vmm_space* space, vmm_swapped_fn cb, void* ctx);
+void swap_slot_release(uint32_t slot);
+
 #endif

@@ -464,6 +464,10 @@ static void free_l2_subtree(uint64_t* l2) {
             uint64_t* l3 = (uint64_t*)phys_to_virt(e & PTE_ADDR_MASK);
             for (int j = 0; j < 512; j++) {
                 uint64_t pte = l3[j];
+                if (!(pte & PTE_VALID) && (pte & VMM_SWPE_MARK)) {   /* §M72 */
+                    swap_slot_release((uint32_t)(pte >> 12));
+                    continue;
+                }
                 if (!(pte & PTE_VALID) || (pte & PTE_SW_SHARED)) continue;
                 uintptr_t pa = (uintptr_t)(pte & PTE_ADDR_MASK);
                 /* §A1 — a COW frame may still belong to the other side of a
@@ -514,7 +518,11 @@ void vmm_space_unmap(struct vmm_space* s, uintptr_t va) {
     if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) return;
     uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
     l3[(va >> 12) & 0x1FF] = 0;
-    __asm__ volatile ("dsb ish\ntlbi vmalle1\ndsb ish\nisb" ::: "memory");
+    /* INNER-SHAREABLE (2026-09-27, found writing §M72's eviction): the local
+     * `tlbi vmalle1` left a sibling core — another thread of the same process
+     * — holding the translation after munmap.  §M51 moved the COW paths to
+     * `vmalle1is` and this one and mprotect were missed. */
+    __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");
 }
 
 /* Change the permissions of an already-mapped user page (the arch half of
@@ -544,8 +552,52 @@ int vmm_space_protect(struct vmm_space* s, uintptr_t va, uint32_t flags) {
     if (flags & VMM_EXEC) e3 &= ~PTE_UXN;        /* EL0-executable */
     else                      e3 |=  PTE_UXN;
     l3[i] = e3;
-    __asm__ volatile ("dsb ish\ntlbi vmalle1\ndsb ish\nisb" ::: "memory");
+    __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");   /* see unmap */
     return 0;
+}
+
+/* §M72 stage 3 — see vmm_flags.h.  An INVALID descriptor (bit 0 clear) has
+ * all other bits free to software, so the same encoding as x86 fits. */
+static uint64_t* user_l3_of(struct vmm_space* s, uintptr_t va) {
+    uint64_t e1 = s->l1[(va >> 30) & 0x1FF];
+    if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) return NULL;
+    uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
+    uint64_t e2 = l2[(va >> 21) & 0x1FF];
+    if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) return NULL;
+    return (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
+}
+int vmm_space_mark_swapped(struct vmm_space* s, uintptr_t va, uint32_t slot, uint32_t flags) {
+    if (!s || va < (4ull << 30)) return -1;         /* user region only */
+    uint64_t* l3 = user_l3_of(s, va);
+    if (!l3) return -1;
+    unsigned i = (unsigned)((va >> 12) & 0x1FF);
+    if (!(l3[i] & PTE_VALID)) return -1;
+    l3[i] = ((uint64_t)slot << 12) | VMM_SWPE_MARK |
+            ((flags & VMM_WRITABLE) ? VMM_SWPE_W : 0) |
+            ((flags & VMM_EXEC) ? VMM_SWPE_X : 0);
+    __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");
+    return 0;
+}
+void vmm_space_walk_swapped(struct vmm_space* s, vmm_swapped_fn cb, void* ctx) {
+    if (!s || !cb) return;
+    for (uint64_t i = 4; i < 512; i++) {
+        uint64_t e1 = s->l1[i];
+        if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) continue;
+        uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
+        for (uint64_t j = 0; j < 512; j++) {
+            uint64_t e2 = l2[j];
+            if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) continue;
+            uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
+            for (uint64_t k = 0; k < 512; k++) {
+                uint64_t e3 = l3[k];
+                if ((e3 & PTE_VALID) || !(e3 & VMM_SWPE_MARK)) continue;
+                uint32_t fl = VMM_USER | ((e3 & VMM_SWPE_W) ? VMM_WRITABLE : 0) |
+                              ((e3 & VMM_SWPE_X) ? VMM_EXEC : 0);
+                cb(ctx, (uintptr_t)((i << 30) | (j << 21) | (k << 12)),
+                   (uint32_t)(e3 >> 12), fl);
+            }
+        }
+    }
 }
 
 /* §M75 — enumerate every present page in this space's PRIVATE region.

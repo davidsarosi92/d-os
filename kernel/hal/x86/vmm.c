@@ -440,7 +440,11 @@ void vmm_space_destroy(struct vmm_space* s) {
         uint64_t pt = pde & addr_mask();
         for (uint32_t j = 0; j < npte(); j++) {
             uint64_t pte = pte_get(pt, j);
-            if (!(pte & E_P))        continue;
+            if (!(pte & E_P)) {
+                /* §M72 — an evicted page: its slot goes back, nothing else. */
+                if (pte & VMM_SWPE_MARK) swap_slot_release((uint32_t)(pte >> 12));
+                continue;
+            }
             if (pte & VMM_SHARED)    continue;     /* borrowed shm — owner frees */
             uint64_t fr = pte & addr_mask();
             if (pte & VMM_COW) {
@@ -569,6 +573,42 @@ void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
             cb(ctx, ((uintptr_t)gi << pde_shift()) | ((uintptr_t)j << 12),
                pte & addr_mask(), (uint32_t)(pte & 0xFFFu & ~(uint64_t)VMM_EXEC) |
                                   exec_of(pte));
+        }
+    }
+}
+
+/* §M72 stage 3 — see vmm_flags.h. */
+int vmm_space_mark_swapped(struct vmm_space* s, uintptr_t va, uint32_t slot, uint32_t flags) {
+    if (!s) return -1;
+    uint32_t v = (uint32_t)va, gi = pde_index(v);
+    if (pde_is_kernel_shared(s, gi)) return -1;
+    uint64_t pde = pde_get(s->root, gi);
+    if (!(pde & E_P) || (pde & E_PS)) return -1;
+    uint64_t pt = pde & addr_mask();
+    uint32_t j = pte_index(v);
+    if (!(pte_get(pt, j) & E_P)) return -1;
+    uint64_t e = ((uint64_t)slot << 12) | VMM_SWPE_MARK |
+                 ((flags & VMM_WRITABLE) ? VMM_SWPE_W : 0) |
+                 ((flags & VMM_EXEC) ? VMM_SWPE_X : 0);
+    pte_set(pt, j, e);
+    hal_tlb_shootdown(0, v);                        /* §M51 — present -> absent */
+    return 0;
+}
+
+void vmm_space_walk_swapped(struct vmm_space* s, vmm_swapped_fn cb, void* ctx) {
+    if (!s || !cb) return;
+    for (uint32_t gi = 0; gi < npde(); gi++) {
+        uint64_t pde = pde_get(s->root, gi);
+        if (!(pde & E_P) || (pde & E_PS)) continue;
+        if (pde_is_kernel_shared(s, gi)) continue;
+        uint64_t pt = pde & addr_mask();
+        for (uint32_t j = 0; j < npte(); j++) {
+            uint64_t pte = pte_get(pt, j);
+            if ((pte & E_P) || !(pte & VMM_SWPE_MARK)) continue;
+            uint32_t fl = VMM_USER | ((pte & VMM_SWPE_W) ? VMM_WRITABLE : 0) |
+                          ((pte & VMM_SWPE_X) ? VMM_EXEC : 0);
+            cb(ctx, ((uintptr_t)gi << pde_shift()) | ((uintptr_t)j << 12),
+               (uint32_t)(pte >> 12), fl);
         }
     }
 }

@@ -1214,6 +1214,15 @@ void pmm_zone_stats(int zone, uint32_t* out_free_per_order, uint32_t* out_manage
     }
 }
 
+/* §M72 — is this a RAM frame the allocator manages?  A device mapping (a
+ * framebuffer, an MMIO window) is not, and must never be written to a swap
+ * file and "restored" into a fresh frame. */
+int pmm_frame_is_managed(pmm_phys_t phys) {
+    uint32_t pfn = phys_to_pfn(phys);
+    return page_state && pfn >= pmm_pfn_base && pfn < pmm_nr_frames &&
+           page_state[pfn] != PS_NONE;
+}
+
 /* §M19.5.3 — the per-node views. */
 int pmm_node_of(pmm_phys_t phys) { return node_of_pfn(phys_to_pfn(phys)); }
 int pmm_node_count(void) { return g_nr_nodes; }

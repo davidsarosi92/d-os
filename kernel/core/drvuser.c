@@ -942,6 +942,26 @@ long drvuser_sys_dma(int bytes, int addr_bits, uint64_t* out_dev) {
         return DRV_EBUSY;
     }
     if (addr_bits <= 0 || addr_bits > 64) addr_bits = 32;
+    /* The device's width is a DEPLOYMENT fact (QEMU's edu takes a dma_mask),
+     * set with `driver.<name>.dma_bits`.  A placed driver cannot read config,
+     * so the kernel applies the key for it — the same key the in-kernel build
+     * reads, so a driver is configured once whichever side it runs on. */
+    {
+        char key[64];
+        int k = 0;
+        const char* a = "driver.";
+        while (*a && k < 40) key[k++] = *a++;
+        for (const char* n = d->mf->name; *n && k < 52; n++) key[k++] = *n;
+        a = ".dma_bits";
+        while (*a && k < 63) key[k++] = *a++;
+        key[k] = 0;
+        const char* v = config_get(key, 0);
+        if (v && *v) {
+            int n = 0;
+            for (; *v >= '0' && *v <= '9'; v++) n = n * 10 + (*v - '0');
+            if (n >= 20 && n <= 64) addr_bits = n;
+        }
+    }
 
     uint32_t frames = (uint32_t)((bytes + 4095) / 4096);
     uint64_t limit = (addr_bits >= 64) ? ~0ull : ((1ull << addr_bits) - 1);

@@ -478,7 +478,11 @@ static uint16_t* cow_slot(uintptr_t phys) {
 static void free_subtree(uint64_t* tbl, uint64_t* ktbl, int depth) {
     for (int i = 0; i < 512; i++) {
         uint64_t e = tbl[i];
-        if (!(e & PTE_P)) continue;
+        if (!(e & PTE_P)) {
+            /* §M72 — an evicted leaf: give its swap slot back. */
+            if (depth == 3 && (e & VMM_SWPE_MARK)) swap_slot_release((uint32_t)(e >> 12));
+            continue;
+        }
         if (ktbl && e == ktbl[i]) continue;          /* shared with kernel */
         if (depth >= 1 && (e & PTE_PS)) continue;    /* large page, not ours to free */
 
@@ -769,6 +773,45 @@ static void walk_subtree(uint64_t* tbl, uint64_t* ktbl, int depth, uintptr_t va,
 void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
     if (!s || !cb) return;
     walk_subtree(s->pml4, (uint64_t*)pml4, 0, 0, cb, ctx);
+}
+
+/* §M72 stage 3 — see vmm_flags.h.  Only a leaf of a PRIVATE table may be
+ * marked (the same rule the walker applies), and the page must be present. */
+int vmm_space_mark_swapped(struct vmm_space* s, uintptr_t va, uint32_t slot, uint32_t flags) {
+    if (!s) return -1;
+    uint64_t* pt = walk_to_pt_root(s->pml4, va, /*create*/0, 0);
+    if (!pt) return -1;
+    if (!(pt[IDX_PT(va)] & PTE_P)) return -1;
+    pt[IDX_PT(va)] = ((uint64_t)slot << 12) | VMM_SWPE_MARK |
+                     ((flags & VMM_WRITABLE) ? VMM_SWPE_W : 0) |
+                     ((flags & VMM_EXEC) ? VMM_SWPE_X : 0);
+    hal_tlb_shootdown(0, va);            /* §M51 — present -> absent */
+    return 0;
+}
+
+static void walk_swapped_subtree(uint64_t* tbl, uint64_t* ktbl, int depth, uintptr_t va,
+                                 vmm_swapped_fn cb, void* ctx) {
+    for (int i = 0; i < 512; i++) {
+        uint64_t e = tbl[i];
+        uintptr_t entry_va = va + ((uintptr_t)i << shift_for_depth[depth]);
+        if (depth == 3) {
+            if ((e & PTE_P) || !(e & VMM_SWPE_MARK)) continue;
+            uint32_t fl = VMM_USER | ((e & VMM_SWPE_W) ? VMM_WRITABLE : 0) |
+                          ((e & VMM_SWPE_X) ? VMM_EXEC : 0);
+            cb(ctx, entry_va, (uint32_t)(e >> 12), fl);
+            continue;
+        }
+        if (!(e & PTE_P))                 continue;
+        if (ktbl && e == ktbl[i])         continue;
+        if (depth >= 1 && (e & PTE_PS))   continue;
+        uint64_t* kchild = (ktbl && (ktbl[i] & PTE_P) && !(ktbl[i] & PTE_PS))
+                         ? table_at((uintptr_t)ktbl[i]) : NULL;
+        walk_swapped_subtree(table_at((uintptr_t)e), kchild, depth + 1, entry_va, cb, ctx);
+    }
+}
+void vmm_space_walk_swapped(struct vmm_space* s, vmm_swapped_fn cb, void* ctx) {
+    if (!s || !cb) return;
+    walk_swapped_subtree(s->pml4, (uint64_t*)pml4, 0, 0, cb, ctx);
 }
 
 /* §M75 — see vmm.h: a QUERY, so it must not build the table.  `cow_slot`

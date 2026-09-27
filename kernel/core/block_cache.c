@@ -149,15 +149,21 @@ static struct bcache_buf* pick_victim(void) {
  * protect (exFAT holds its volume lock for as long as it uses one). */
 static struct kmutex bc_lock = KMUTEX_INIT("bcache");
 
-static struct bcache_buf* bcache_get_unlocked(struct block_device* dev, uint64_t lba);
+static struct bcache_buf* bcache_get_unlocked(struct block_device* dev, uint64_t lba, int no_read);
 struct bcache_buf* bcache_get(struct block_device* dev, uint64_t lba) {
     kmutex_lock(&bc_lock);
-    struct bcache_buf* b = bcache_get_unlocked(dev, lba);
+    struct bcache_buf* b = bcache_get_unlocked(dev, lba, 0);
+    kmutex_unlock(&bc_lock);
+    return b;
+}
+struct bcache_buf* bcache_get_overwrite(struct block_device* dev, uint64_t lba) {
+    kmutex_lock(&bc_lock);
+    struct bcache_buf* b = bcache_get_unlocked(dev, lba, 1);
     kmutex_unlock(&bc_lock);
     return b;
 }
 
-static struct bcache_buf* bcache_get_unlocked(struct block_device* dev, uint64_t lba) {
+static struct bcache_buf* bcache_get_unlocked(struct block_device* dev, uint64_t lba, int no_read) {
     if (!initialized || !dev || !dev->read) return NULL;
     if (dev->sector_size > BC_SECTOR) {
         static int told;
@@ -192,8 +198,12 @@ static struct bcache_buf* bcache_get_unlocked(struct block_device* dev, uint64_t
 
     if (b->valid) { stats.evictions++; bc_unlink(b); b->valid = 0; }
 
-    /* Bring the requested sector in. */
-    if (blk_read(dev, lba, 1, b->data) != 0) {
+    /* Bring the requested sector in — unless the caller is about to replace
+     * all of it (bcache_get_overwrite): reading 512 bytes only to overwrite
+     * them doubled the I/O of every sequential write. */
+    if (no_read) {
+        for (uint32_t i = 0; i < BC_SECTOR; i++) b->data[i] = 0;
+    } else if (blk_read(dev, lba, 1, b->data) != 0) {
         b->valid = 0;                                       /* leave slot empty on I/O fail */
         return NULL;
     }
