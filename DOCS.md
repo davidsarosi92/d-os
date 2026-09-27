@@ -15271,8 +15271,125 @@ and an orphan (falsifier: `swap_audit_selftest`, run inside `evicttest`).
 the store is a file (a full volume refuses, no smaller eviction); no swap
 compression; hardware Access Flag management on ARM is not used.
 
+### 4.115 Containers — a Docker image run against its own root (§M73, 2026-09-28)
+
+**§M73 is complete (rungs 1-3 of PLAN's ladder).**  A real OCI archive — the
+multi-platform `busybox:musl` image, `docker save` output, embedded as
+`assets/images/busybox-musl.tar` — is imported and its unmodified binaries run
+inside their own filesystem root, as their own uid, on all three arches.
+
+**What a container is here, said first because the second half is the part a
+reader would otherwise assume.**  ISOLATED: the filesystem view (every task in
+it resolves `/` to the image's rootfs) and the identity (uid `20000 + id`,
+which owns its rootfs and nothing else).  NOT isolated: the network (one
+shared stack), the kernel, the process list (visible from the host), devices
+(the image has no `/dev` or `/proc`).  `ctr run` prints exactly that before it
+starts a program.
+
+**Rung 1 — a per-task root.**  `cred.root` (a dentry; NULL = the machine's) sits
+in the credential, so every spawn, fork and clone inherits it through the one
+copy that already passes on the uid (`cred_inherit`), and `cred_become_user`
+keeps it.  `resolve_path` starts from `cred_fs_root()` — the only place a path
+starts.  `cred.container` tags the task; `ps` prints `[container N]`.
+
+**The working directory** lives beside it as a canonical path (`cred.cwd`, not
+a dentry: nothing counts dentry references, so a removed directory must become
+a path that no longer resolves, not a dangling pointer).  `vfs_canon` joins a
+relative path to it and applies `.`/`..` LEXICALLY, with `..` at the root
+staying at the root — chroot's rule, and what makes the container's `/` a floor.
+`split_parent` canonicalises into its caller's buffer, so every mutator (mkdir,
+create, unlink, link, rename) takes relative paths too.  `chdir` checks the
+target is a directory; `getcwd` answers from the credential.
+
+**Rung 2 — the image.**  `ctr import [name] [archive]` writes the archive to
+`/images`, runs ring-3 `user/ociunpack.c` (untrusted input is parsed OUTSIDE the
+kernel): `index.json` → the manifest for THIS CPU (linux/386, amd64, arm64) →
+config + layers, every blob checked against its sha256, gzip inflated with its
+CRC checked, tar with PAX headers, hard links (busybox's `/bin` is one binary
+and ~400 links — `vfs_link` + ramfs link counts), symlinks turned into links,
+whiteouts applied.  It writes `image.conf` (Entrypoint + Cmd).  The kernel then
+gives the tree to the container's uid (`vfs_chown_tree`).
+
+**Rung 3 — identity.**  A container's init (`ctr:<name>`, a kernel thread) puts
+ITSELF into the container first — root, then `cred_become_user` with a fresh
+session — and only then reads the program THROUGH that root and spawns it.  So
+a program never runs, even for an instruction, with the machine's `/` or the
+machine's identity.  `argv[0]` is found on the image's own PATH.
+
+**The claim, made falsifiable: `ctrescapetest`.**  From inside: the image's
+`/etc/passwd` reads (status 0); the host's settings file by its host path, the
+same climbed to with `..`, and the host's `/containers` tree all fail.
+`AUDIT(container-root)` — every container task resolves `/` to its container's
+root — is clean while a container task runs and catches a root deliberately
+swapped for the machine's (§M71 rule 1).  PASS on i386, x86_64, aarch64.
+
+**Measured with the image's own tools:** `id` → `uid=20001 gid=20001
+groups=20001`; `ls -l` shows real owners and modes (`shadow` 0600); a `sh -c`
+script doing `cd /etc … cd ../../.. … mkdir d; cd d; echo y > z; cat ./z ../d/z;
+ls -l ../etc/../d; exit 7` prints what it should and exits 7, on all three.
+
+**The Linux ABI, consolidated rather than extended three times.**  busybox on
+ARM could not open a file: arm64's map had no open/stat/getdents/clock at all,
+while both x86 layers had them as hand-written switch cases.  They are §M50
+operations now — `OPEN(AT)`, `STAT`/`FSTAT`/`FSTATAT` (lstat = stat: no
+symlinks), `GETDENTS64`, `FCNTL`, `ACCESS(AT)`, `READLINK(AT)`, `SENDFILE`,
+`UNAME`, `DUP`/`DUP2`/`DUP3`, `CLOCK_GETTIME(64)`, `GETTIMEOFDAY`,
+`(CLOCK_)NANOSLEEP`, `GETCWD`, `CHDIR`, the uid/gid calls, `GETGROUPS`, and the
+accept-and-ignore Linux `rt_sigaction` — with every guest difference as DATA in
+the map: **`abi_stat_layout`** (three `struct stat` layouts as field offsets and
+widths; i386's stat64 even carries the inode twice) and **`o_directory`** (the
+one open flag whose bit differs).  The x86 duplicates were deleted in the same
+change (~400 lines).  Stat reads the INODE (`sys_stat_full_k`), not an open: it
+needs no read permission and reports owner, mode and a real inode number.
+
+**Found and fixed on the way:**
+- **stat's inode number was `size + 1`**, so any two equally sized files looked
+  like ONE file to anything comparing dev/ino (cp's "same file" check, tar's
+  hard-link detection, ld.so's already-loaded dedup).
+- **x86_64 Linux `getuid` returned 0 for everyone**; i386 and arm64 had none.
+- **x86_64 `rt_sigaction` ran the fcntl body** (shared case label):
+  `fcntl(signo, act_pointer, …)`.
+- **The console could not be duplicated** — an empty std slot means "console",
+  and an empty slot cannot be copied — so a shell could not save stdout before
+  a redirection (`fcntl(1, F_DUPFD, 10)` → EINVAL).  New `FD_CONSOLE` ofile,
+  made only when a std slot is duplicated (`fd_dup_source`).
+- **Readiness answered a REDIRECTED stdin from the keyboard** (`fd_readiness`
+  never looked up fds 0-2).
+- **An absolute `CLOCK_REALTIME` sleep** was measured on the monotonic timeline
+  — a sleep that never ends.
+- **`vfork` was missing** (served as a fork, which POSIX permits); on arm64 it
+  is `clone(CLONE_VM|CLONE_VFORK)` with no stack.
+- **`task_wait` never retried a refused reap.**  `task_reap` refuses while the
+  dead child is still on its CPU and says "caller retries"; the waiter is woken
+  by that very exit, so it lands in the window routinely, and a reap-owned child
+  was never freed (`ps` showed finished unpackers holding 5 MB each).
+- **`task_exit_code` read "which CPU, then its current" in two steps** — the
+  exact race the 2026-09-25 note on `task_current()` fixed, left in its twin.  A
+  task migrated between the two marked SOMEBODY ELSE DEAD: under `killstorm` on
+  i386 -smp 4 it killed memage once and svc-supervisor once (restarted by their
+  supervisor, "prev code 0"), left a CPU with nobody to run ("no runnable task
+  after exit") and stalled whole storms.  Before: 14 of 36 storms finished
+  cleanly across 5 boots; after: 18/18 on i386, 12/12 on x86_64 and on aarch64,
+  0 warnings, 0 service restarts.  The wake-up kick added in §M74 had the same
+  shape and reads both with interrupts off now.
+- **`ctr` truncated arguments silently** — a long `-c` script lost its tail and
+  its last command, now a bare `cat`, waited on stdin forever.  Arguments share
+  one pool and an overlong line or list is REFUSED, never shortened.
+
+**Instruments added:** `strace <pid|ctr|off>` (every guest call with its result,
+at the one dispatch point all three arches share — calls the engine does not
+name are printed as "-> arch switch" so a trace has no gaps), and `ps` naming
+the guest syscall a sleeping task is in (`in sys #239`).  The second exists
+because the first changed the timing enough to hide the hang it was built for.
+
+**Open:** no network namespace (shared, and said so); no resource caps per
+container yet (§M72's reserve and §M49's weights are the pieces); no registry
+pull (the image arrives as a file); Linux signal handlers are accepted and not
+delivered; `nlink` reports 1 for files (ramfs keeps the count private).
+
 ## 8. Change log
 
+- **2026-09-28 — §M73 COMPLETE: containers — a real OCI image (`busybox:musl`) unpacked in ring 3 (`ociunpack`, sha256/gzip/tar/links/whiteouts), run as its own uid against its own root (`cred.root`), a working directory (`cred.cwd`, lexical `..` clamped at the root), `ctr import|run|list`, `ctrescapetest`, `AUDIT(container-root)`; the Linux file/time/identity calls as shared §M50 operations with per-guest stat layouts as data (arm64 could not open a file); `strace`.  Fixed: stat inode = size+1, x86_64 getuid always 0, rt_sigaction running fcntl, the console not duplicable, redirected stdin polled from the keyboard, absolute realtime sleeps, `task_wait` leaking reap-owned children, and `task_exit_code` marking ANOTHER task dead after a migration (DOCS §4.115).**
 - **2026-09-27 — §M74 COMPLETE, rungs 3-4: swap-in by fault; eviction of RUNNING programs by pressure (atomic mark, one flush, then write), `mem.swap_policy` + `mem.swap_size_mb` as the ceiling, `swap`, `AUDIT(swap-slots)`; the three reserve rules shown.  Fixed: a wake-up never preempted (aarch64 `diskstorm` 4.7-7 s -> 457 ms), block-cache read-ahead, per-page shootdowns starving CPU 0 (DOCS §4.114).**
 - **2026-09-27 — §M74 rung 2: a page cache; private file mappings and the interpreter (musl's libc.so) are shared copy-on-write — the second dynamic program costs 580-620 KB less; reclaim of unmapped cache pages under pressure with no disk; `unmap` releases what it held and `munmap` is real.  Fixed: x86_64 `map` dropped `VMM_COW`, aarch64 `map` made every user page writable (DOCS §4.113).**
 - **2026-09-27 — §M74 rung 1: the accessed-bit sweep (`vmm_space_age` on three arches, ARM access-flag faults, `memage`, `mem.age_ms`/`mem.cold_ms`, `agetest`).  Fixed: aarch64 `eret` with interrupts enabled (a nested IRQ clobbered ELR/SPSR), `mprotect(PROT_WRITE)` on fork-shared COW pages (write-through; x86_64 lost the COW mark), an unlocked `execve` mm swap under the space walkers, a parent's death force-killing (and crash-reporting) its children (DOCS §4.112).**

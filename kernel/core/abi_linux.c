@@ -86,6 +86,25 @@ static const struct abi_nument linux_i386_ents[] = {
     { 364, ABI_ACCEPT4     },   /* i386 has no plain accept(2)                */
     { 365, ABI_GETSOCKOPT  },
     { 366, ABI_SETSOCKOPT  },
+    /* §M73 — directory calls (i386: mkdir 39, link 9, chmod 15, unlink 10,
+     * mkdirat 296, linkat 303, fchmodat 306, unlinkat 301). */
+    {  39, ABI_MKDIR }, { 296, ABI_MKDIRAT }, {   9, ABI_LINK }, { 303, ABI_LINKAT },
+    {  15, ABI_CHMOD }, { 306, ABI_FCHMODAT }, { 10, ABI_UNLINK }, { 301, ABI_UNLINKAT },
+    /* §M73 — i386 identity: the 32-bit-uid calls (getuid32 199, getgid32 200,
+     * geteuid32 201, getegid32 202, setuid32 213, setgid32 214). */
+    { 199, ABI_GETUID }, { 200, ABI_GETGID }, { 201, ABI_GETEUID }, { 202, ABI_GETEGID },
+    { 213, ABI_SETUID }, { 214, ABI_SETGID }, { 205, ABI_GETGROUPS },
+    /* §M73 — files and time (i386 numbers; the *64 stat calls are the ones
+     * musl uses, with struct stat64). */
+    {   5, ABI_OPEN }, { 295, ABI_OPENAT },
+    { 195, ABI_STAT }, { 196, ABI_STAT /* lstat64 */ }, { 197, ABI_FSTAT }, { 300, ABI_FSTATAT },
+    { 220, ABI_GETDENTS64 }, {  55, ABI_FCNTL }, { 221, ABI_FCNTL /* fcntl64 */ },
+    {  33, ABI_ACCESS }, { 307, ABI_FACCESSAT }, {  85, ABI_READLINK }, { 305, ABI_READLINKAT },
+    { 239, ABI_SENDFILE /* sendfile64 */ }, { 122, ABI_UNAME },
+    {  41, ABI_DUP }, {  63, ABI_DUP2 }, { 330, ABI_DUP3 },
+    { 265, ABI_CLOCK_GETTIME }, { 403, ABI_CLOCK_GETTIME64 }, {  78, ABI_GETTIMEOFDAY },
+    { 162, ABI_NANOSLEEP }, { 267, ABI_CLOCK_NANOSLEEP },
+    { 183, ABI_GETCWD }, {  12, ABI_CHDIR }, { 174, ABI_LNX_SIGACTION },
     { 367, ABI_GETSOCKNAME },
     { 368, ABI_GETPEERNAME },
     { 369, ABI_SENDTO      },
@@ -150,6 +169,24 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  52, ABI_GETPEERNAME },
     {  54, ABI_SETSOCKOPT  },
     {  55, ABI_GETSOCKOPT  },
+    /* §M73 — x86_64: mkdir 83, link 86, chmod 90, unlink 87, mkdirat 258,
+     * linkat 265, fchmodat 268, unlinkat 263. */
+    {  83, ABI_MKDIR }, { 258, ABI_MKDIRAT }, {  86, ABI_LINK }, { 265, ABI_LINKAT },
+    {  90, ABI_CHMOD }, { 268, ABI_FCHMODAT }, { 87, ABI_UNLINK }, { 263, ABI_UNLINKAT },
+    /* §M73 — x86_64 identity: getuid 102, getgid 104, setuid 105, setgid 106,
+     * geteuid 107, getegid 108. */
+    { 102, ABI_GETUID }, { 104, ABI_GETGID }, { 105, ABI_SETUID }, { 106, ABI_SETGID },
+    { 107, ABI_GETEUID }, { 108, ABI_GETEGID }, { 115, ABI_GETGROUPS },
+    /* §M73 — files and time (x86_64 numbers). */
+    {   2, ABI_OPEN }, { 257, ABI_OPENAT },
+    {   4, ABI_STAT }, {   6, ABI_STAT /* lstat */ }, {   5, ABI_FSTAT }, { 262, ABI_FSTATAT },
+    { 217, ABI_GETDENTS64 }, {  72, ABI_FCNTL },
+    {  21, ABI_ACCESS }, { 269, ABI_FACCESSAT }, {  89, ABI_READLINK }, { 267, ABI_READLINKAT },
+    {  40, ABI_SENDFILE }, {  63, ABI_UNAME },
+    {  32, ABI_DUP }, {  33, ABI_DUP2 }, { 292, ABI_DUP3 },
+    { 228, ABI_CLOCK_GETTIME }, {  96, ABI_GETTIMEOFDAY },
+    {  35, ABI_NANOSLEEP }, { 230, ABI_CLOCK_NANOSLEEP },
+    {  79, ABI_GETCWD }, {  80, ABI_CHDIR }, {  13, ABI_LNX_SIGACTION },
     { 288, ABI_ACCEPT4     },
     /* §M65 — d-os display-bridge op; the SAME number on every guest,
      * because it is ours to choose (Linux has no such call). */
@@ -203,6 +240,22 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 207, ABI_RECVFROM    },
     { 208, ABI_SETSOCKOPT  },
     { 209, ABI_GETSOCKOPT  },
+    /* §M73 — arm64 has only the *at forms: mkdirat 34, linkat 37,
+     * fchmodat 53, unlinkat 35. */
+    {  34, ABI_MKDIRAT }, {  37, ABI_LINKAT }, {  53, ABI_FCHMODAT }, {  35, ABI_UNLINKAT },
+    /* §M73 — arm64 identity: setgid 144, setuid 146, getuid 174, geteuid 175,
+     * getgid 176, getegid 177. */
+    { 144, ABI_SETGID }, { 146, ABI_SETUID }, { 174, ABI_GETUID }, { 175, ABI_GETEUID },
+    { 176, ABI_GETGID }, { 177, ABI_GETEGID }, { 158, ABI_GETGROUPS },
+    /* §M73 — files and time (arm64 numbers: only the *at forms exist). */
+    {  56, ABI_OPENAT }, {  79, ABI_FSTATAT }, {  80, ABI_FSTAT },
+    {  61, ABI_GETDENTS64 }, {  25, ABI_FCNTL },
+    {  48, ABI_FACCESSAT }, {  78, ABI_READLINKAT },
+    {  71, ABI_SENDFILE }, { 160, ABI_UNAME },
+    {  23, ABI_DUP }, {  24, ABI_DUP3 },
+    { 113, ABI_CLOCK_GETTIME }, { 169, ABI_GETTIMEOFDAY },
+    { 101, ABI_NANOSLEEP }, { 115, ABI_CLOCK_NANOSLEEP },
+    {  17, ABI_GETCWD }, {  49, ABI_CHDIR }, { 134, ABI_LNX_SIGACTION },
     { 210, ABI_SHUTDOWN    },
     { 242, ABI_ACCEPT4     },
     /* §M65 — d-os display-bridge op; the SAME number on every guest,
@@ -218,12 +271,21 @@ static const struct abi_nument linux_arm64_ents[] = {
  * 16 on arm64, where it is unpacked and the u64 aligns to 8.  Deriving the
  * struct size from the word size would therefore be correct on exactly one of
  * these three. */
+/* §M73 — the three `struct stat` layouts, as data (see abi_stat_layout).
+ *               bytes dev ino w  ino32 mode nlink w  uid gid size blksz w blocks atime mtime ctime w */
+static const struct abi_stat_layout stat_i386_stat64 =   /* packed, asm/stat.h */
+               {  96,   0, 88, 8, 12,  16,  20,  4,  24, 28,  44,  52,  4,  56,   64,   72,   80, 4 };
+static const struct abi_stat_layout stat_amd64 =
+               { 144,   0,  8, 8, 0xFF, 24, 16,  8,  28, 32,  48,  56,  8,  64,   72,   88,  104, 8 };
+static const struct abi_stat_layout stat_generic64 =     /* asm-generic: arm64 */
+               { 128,   0,  8, 8, 0xFF, 16, 20,  4,  24, 28,  48,  56,  4,  64,   72,   88,  104, 8 };
+
 const struct abi_map abi_map_linux_i386 = {
-    "linux/i386",  linux_i386_ents,  ARRAY_N(linux_i386_ents),  4, 12
+    "linux/i386",  linux_i386_ents,  ARRAY_N(linux_i386_ents),  4, 12, &stat_i386_stat64, 0200000
 };
 const struct abi_map abi_map_linux_amd64 = {
-    "linux/amd64", linux_amd64_ents, ARRAY_N(linux_amd64_ents), 8, 12
+    "linux/amd64", linux_amd64_ents, ARRAY_N(linux_amd64_ents), 8, 12, &stat_amd64, 0200000
 };
 const struct abi_map abi_map_linux_arm64 = {
-    "linux/arm64", linux_arm64_ents, ARRAY_N(linux_arm64_ents), 8, 16
+    "linux/arm64", linux_arm64_ents, ARRAY_N(linux_arm64_ents), 8, 16, &stat_generic64, 040000
 };

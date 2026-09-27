@@ -73,6 +73,11 @@ void linux_syscall_dispatch(struct trapframe* tf) {
      * needs.  The thread flavour is A4. */
     if (nr == LNX_ARM64_clone) {
         unsigned long flags = tf->x[0];
+        /* §M73 — musl's vfork() on arm64 IS clone(CLONE_VM|CLONE_VFORK|SIGCHLD)
+         * with no new stack.  A fork is a correct vfork (POSIX leaves the
+         * shared-memory half undefined and nothing portable relies on it), and
+         * without it a shell cannot run a single command. */
+        if ((flags & 0x4000 /* CLONE_VFORK */) && tf->x[1] == 0) flags &= ~LNX_CLONE_VM;
         if (!(flags & LNX_CLONE_VM)) {
             struct user_regs r;
             for (int i = 0; i < 31; i++) r.x[i] = tf->x[i];

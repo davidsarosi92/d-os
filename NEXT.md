@@ -1,4 +1,14 @@
-# Where things stand (2026-09-27)
+# Where things stand (2026-09-28)
+
+## §M73 shipped — containers (DOCS §4.115)
+
+`ctr import busybox`, `ctr run busybox <cmd…>`, `ctr list`, `ctrescapetest`,
+`strace <pid|ctr|off>`.  A real `busybox:musl` OCI archive runs as uid 20001
+against its own root on all three arches; the escape test and
+`AUDIT(container-root)` pass.  **Next, in order:** the queued UI items below
+(swap page, translations, system summary), then §M81's verdict, then §M88
+(monitors) and §M89 (Java — scoped in PLAN.md: an address-space layer, Linux
+signal delivery and arm64 threads are the real work; the JDK comes with it).
 
 ## §M87 shipped — network and storage in the Control Panel (DOCS §4.103)
 
@@ -8,11 +18,30 @@ mount / unmount / format / RAM disks.  `locale missing on` + `locale missing`
 measures untranslated strings as they are drawn.  Agreed order (2026-09-27, see PLAN "Open work — exact state"):
 1. finish the half-done milestones — §M26/§M59
    all done: §M32 sessions §4.108 + ownership §4.109  (§M86 NX: done, §4.104; §M19.5 NUMA zones: done, §4.106; `wl_data_device`: done, §4.107);
-2. then §M82 (DONE, §4.110), §M72 (DONE, §4.111), §M74 (DONE, §4.112-§4.114), §M73 next;
+2. then §M82 (DONE, §4.110), §M72 (DONE, §4.111), §M74 (DONE, §4.112-§4.114), §M73 (DONE, §4.115);
 3. then §M81 (the GUI seams verdict).
 Any defect found on the way is fixed first, whatever it touches.
 Also open from §M87: a second virtio-blk disk, partition tables, a real Wi-Fi
 driver.  The phone emulator (§M84) is not in the agreed list yet.
+
+
+## Queued from use (2026-09-27) — asked for, not started
+
+1. **Swap in the Control Panel.** `mem.swap_policy` / `mem.swap_size_mb` (and
+   `mem.pagecache`, `mem.age_ms`, `mem.cold_ms`, `mem.reserve_kb`) are declared
+   keys, so the System panel already lists them raw — they want a "Memory" page
+   of their own with readable names, the live `swap`/`memage` figures beside
+   them, and translations.
+2. **Translations, again.** Measure with `locale missing on` + a static sweep;
+   everything added today (swap, page cache, memage, stop/cont, Evict) is a
+   suspect, and labels are the known gap.
+3. **A system summary page** — the machine described: CPUs and topology, memory
+   and NUMA nodes, disks and volumes, network adapters, display modes,
+   board/firmware (DTB/ACPI), kernel version and milestone.
+4. **Multiple monitors** — planned as §M88 in PLAN.md.
+5. **Java** (2026-09-28) — a JRE, and the JDK with it: §M89 in PLAN.md, with
+   the estimate (large, but under the largest milestone so far) and the list of
+   what is missing.
 
 
 ## §M83 is written up in PLAN.md — everything a package, repos split last

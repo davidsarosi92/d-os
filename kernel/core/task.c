@@ -684,6 +684,9 @@ static void task_enqueue(struct task* t) {
      * aarch64 (100 Hz tick, every disk completion on CPU 0): `diskstorm` took
      * 513 ms on one CPU and 4.7-7 s on two, each I/O-bound wakeup waiting out
      * someone else's time slice.  Set it first, then kick. */
+    /* Which CPU we are on and who runs on it: one observation (interrupts
+     * off), for the reason task_current() spells out. */
+    uint32_t kfl = hal_intr_save();
     if (cpu != this_cpu_id()) {
         struct percpu* target = percpu_at(cpu);
         if (target) {
@@ -702,6 +705,7 @@ static void task_enqueue(struct task* t) {
         __atomic_store_n(&me->wake_kick, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&me->need_resched, 1, __ATOMIC_RELEASE);
     }
+    hal_intr_restore(kfl);
 }
 
 /* ------------------------------------------------------------------- */
@@ -2482,7 +2486,18 @@ int task_wait(int pid, int* code) {
              * but we already hold the exit code, so we still return it. */
             waitq_unlock(&child_exit_wq, f);
             if (code) *code = dead_code;
-            task_reap(dead_pid);
+            /* §M73 — task_reap REFUSES while the child is still on its CPU
+             * (DEAD is published just before its last context switch) and says
+             * "caller retries" — and this caller did not.  A waiter is woken by
+             * that very exit, so it lands in the window routinely, and the
+             * child, reap-owned so init leaves it alone, was then never freed:
+             * `ps` showed finished unpackers holding 5 MB each.  Retry until it
+             * is reaped or somebody else (init, racing us) has it. */
+            for (int tries = 0; task_reap(dead_pid) != 0; tries++) {
+                /* gone = reaped by somebody else; the pointer is not read */
+                if (!task_find(dead_pid) || tries > 10000) break;
+                task_yield();
+            }
             return dead_pid;
         }
         if (!any_alive) {
@@ -2545,8 +2560,18 @@ void task_finish_first_switch(void) {
 void task_exit(void) { task_exit_code(0); }
 
 void task_exit_code(int code) {
-    struct percpu* me = this_cpu();
-    struct task* self = me->current;
+    /* WHO IS EXITING, READ AS ONE OBSERVATION (§M73, 2026-09-28).  This was
+     * `me = this_cpu(); self = me->current;` — the two-step read the
+     * 2026-09-25 note on task_current() describes, left behind in its twin.
+     * A task preempted between the two and migrated read the OLD CPU's
+     * current, i.e. some other task, and then marked THAT task DEAD: under
+     * `killstorm` on i386 -smp 4 a victim's exit killed memage once and
+     * svc-supervisor once (their supervisor restarted them, "prev code 0"),
+     * the CPU was left with no one to switch to ("no runnable task after
+     * exit"), and one storm stalled outright.  `me` is re-read with interrupts
+     * off at the point of no return below; nothing before that uses it. */
+    struct task* self = task_current();
+    struct percpu* me;
 
     /* §M40 — CLONE_CHILD_CLEARTID.  musl's pthread_join parks on a futex at
      * this address, and the contract is that the KERNEL zeroes it and wakes the
@@ -2735,6 +2760,27 @@ void task_exit_code(int code) {
         extern void serial_write(const char* s);
         serial_write("\n!! task_exit_code: no runnable task after exit "
                      "(idle missing?) — idling with IRQs on, NOT a hard freeze\n");
+        /* WHICH of schedule_locked's three refusals it was — the message above
+         * alone could not tell them apart.  Lock-free formatting: this runs
+         * with interrupts off at the end of an exit. */
+        {
+            char b[160]; int n = 0;
+            const char* h = "0123456789abcdef";
+            #define PUT(str) do { for (const char* _q = (str); *_q && n < 150; _q++) b[n++] = *_q; } while (0)
+            #define HEX(v)   do { unsigned long _v = (unsigned long)(v); for (int _i = (int)sizeof(long) * 8 - 4; _i >= 0; _i -= 4) b[n++] = h[(_v >> _i) & 15]; } while (0)
+            struct percpu* c = this_cpu();
+            PUT("!!   cpu "); HEX(this_cpu_id());
+            PUT(" self "); HEX(self->pid);
+            PUT(" current "); HEX(c && c->current ? c->current->pid : -1);
+            PUT(" idle "); HEX(c && c->idle ? c->idle->pid : -1);
+            PUT(" idle-state "); HEX(c && c->idle ? (long)c->idle->state : -1);
+            PUT(" idle-on_cpu "); HEX(c && c->idle ? (long)c->idle->on_cpu : -1);
+            PUT("\n");
+            #undef PUT
+            #undef HEX
+            b[n] = 0;
+            serial_write(b);
+        }
     }
     for (;;) { hal_cpu_idle(); schedule(); }
 }
@@ -2963,12 +3009,17 @@ void task_list(void) {
         sum_shared += shared;
 
         char ob[24];
-        kprintf("%d   %d   %s    %d   %u   %u   %s   %s%s\n",
+        kprintf("%d   %d   %s    %d   %u   %u   %s   %s%s",
                 t->pid, t->ppid, state_name(t->state), t->cpu_home,
                 (unsigned)task_cpu_ms_now(t), /* truncates past ~49 days — fine */
                 (unsigned)(priv / 1024u),
                 cred_owner_name(&t->cred, ob, sizeof ob),
                 t->name, running ? " (running)" : "");
+        /* §M73 — which container, when it is in one: a task whose "/" is not
+         * the machine's must not look like any other. */
+        if (t->cred.container) kprintf("  [container %d]", t->cred.container);
+        if (t->guest_nr && t->state == TASK_SLEEPING) kprintf("  in sys #%d", t->guest_nr - 1);
+        kprintf("\n");
         t = t->next;
     } while (t != master_head);
     spin_unlock_irqrestore(&master_lock, fl);

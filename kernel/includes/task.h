@@ -446,6 +446,11 @@ struct task {
      * — with a lock held on every frame.  A depth counter is cheaper and more
      * honest than trying to detect the cycle. */
     int       epoll_depth;
+    /* §M73 — the guest (Linux-ABI) syscall number this task last entered, +1
+     * (0 = never).  Written on entry and never cleared, so for a task asleep
+     * in the kernel it names the call it is asleep IN — `ps` shows it.  Found
+     * necessary when a busybox shell hung only while NOT being traced. */
+    int       guest_nr;
     uintptr_t sig_handler[32];          /* NSIG (syscall.h) */
     uintptr_t sig_restorer;
     /* Per-task FPU / SIMD register file (2026-08-01).  The integer context

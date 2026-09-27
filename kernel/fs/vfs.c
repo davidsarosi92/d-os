@@ -45,6 +45,28 @@ static struct dentry*  root     = NULL;
 
 struct dentry* vfs_root(void) { return root; }
 
+/* §M73 — the dentry a path names, resolved from the CALLER's root (the
+ * machine's for the shell, the container's for a container task).  NULL if it
+ * does not exist.  Needed by whoever sets up a container: its root is a dentry,
+ * and the only safe way to get one is the same resolution everything else
+ * uses. */
+static struct dentry* resolve_path(const char* path, struct dentry** out_parent,
+                                   const char** out_last_name);
+struct dentry* vfs_resolve(const char* path);
+struct dentry* vfs_resolve(const char* path) {
+    return resolve_path(path, NULL, NULL);
+}
+
+/* §M73 — give a whole tree to one owner (in memory; a container's rootfs lives
+ * on ramfs, which stores nothing).  Bounded depth: a tree deeper than this is
+ * not a filesystem this kernel made. */
+static void chown_walk(struct dentry* d, int uid, int gid, int depth) {
+    if (!d || depth > 32) return;
+    if (d->inode) { d->inode->owner_uid = uid; d->inode->owner_gid = gid; }
+    for (struct dentry* c = d->children; c; c = c->sibling) chown_walk(c, uid, gid, depth + 1);
+}
+void vfs_chown_tree(struct dentry* d, int uid, int gid) { chown_walk(d, uid, gid, 0); }
+
 /* ------------------------------------------------------------------- */
 /* String helpers — no libc.                                            */
 /* ------------------------------------------------------------------- */
@@ -161,17 +183,92 @@ static struct dentry* lookup_child(struct dentry* parent,
 /* Walk a path, returning the dentry of the LAST component, or NULL on
  * any failure.  If `out_parent` is non-NULL, returns the parent dentry
  * of the last component (useful for create/mkdir). */
+/* §M73 — a path made CANONICAL: a relative one joined to the task's working
+ * directory, and "." / ".." applied LEXICALLY, with ".." at the root staying
+ * at the root (chroot's rule — which is what makes a container's "/" a floor
+ * and not a starting point).  Returns `path` itself when there is nothing to
+ * do (the common case: absolute, no dot components), `buf` otherwise, NULL if
+ * the result does not fit. */
+static const char* vfs_canon(const char* path, char* buf, size_t cap) {
+    int dots = 0;
+    for (const char* q = path; *q; q++)
+        if (*q == '.' && (q == path || q[-1] == '/') &&
+            (q[1] == 0 || q[1] == '/' || (q[1] == '.' && (q[2] == 0 || q[2] == '/'))))
+            { dots = 1; break; }
+    if (path[0] == '/' && !dots) return path;
+    char tmp[256];
+    size_t n = 0;
+    if (path[0] != '/') {                       /* relative: from the working directory */
+        const char* cwd = cred_fs_cwd();
+        for (size_t i = 0; cwd[i] && n + 1 < sizeof tmp; i++) tmp[n++] = cwd[i];
+        if (n + 1 < sizeof tmp) tmp[n++] = '/';
+    }
+    for (size_t i = 0; path[i]; i++) { if (n + 1 >= sizeof tmp) return NULL; tmp[n++] = path[i]; }
+    tmp[n] = 0;
+    /* Walk the components into buf, popping on "..". */
+    size_t o = 0;
+    const char* p = tmp;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char* e = p;
+        while (*e && *e != '/') e++;
+        size_t len = (size_t)(e - p);
+        if (len == 1 && p[0] == '.') { p = e; continue; }
+        if (len == 2 && p[0] == '.' && p[1] == '.') {
+            while (o > 0 && buf[o - 1] != '/') o--;
+            if (o > 0) o--;                     /* drop the slash too; at "/" it stays "/" */
+            p = e; continue;
+        }
+        if (o + 1 + len + 1 > cap) return NULL;
+        buf[o++] = '/';
+        for (size_t i = 0; i < len; i++) buf[o++] = p[i];
+        p = e;
+    }
+    if (o == 0) buf[o++] = '/';
+    buf[o] = 0;
+    return buf;
+}
+
+int vfs_canonical(const char* path, char* out, size_t cap) {
+    if (!path || !*path || !out) return -1;
+    const char* c = vfs_canon(path, out, cap);
+    if (!c) return -1;
+    if (c != out) { size_t n = strlen_(c); if (n + 1 > cap) return -1; memcpy_(out, c, n + 1); }
+    return 0;
+}
+
 static struct dentry* resolve_path(const char* path,
                                    struct dentry** out_parent,
                                    const char**    out_last_name) {
+    if (!path || !path[0]) return NULL;
+    /* §M73 — relative paths and dot components, made canonical first.  When
+     * that rewrote the path, *out_last_name would point into this frame's
+     * buffer, so it is reported only as "there is a last name" (the one caller
+     * that asks, vfs_open, uses it for exactly that). */
+    char cb[256];
+    const char* orig = path;
+    path = vfs_canon(path, cb, sizeof cb);
     if (!path || path[0] != '/') return NULL;
+    if (path != orig && out_last_name) {
+        /* the canonical path is absolute and dot-free, so this call takes the
+         * fast branch and does not come back here */
+        struct dentry* r = resolve_path(path, out_parent, NULL);
+        *out_last_name = (out_parent && *out_parent) ? "" : NULL;
+        return r;
+    }
+    /* §M73 — "/" is the calling task's root: the machine's, or its
+     * container's.  The only place a path starts, so the only place this has
+     * to be decided. */
+    struct dentry* base = cred_fs_root();
+    if (!base) base = root;
     if (path[1] == 0) {                         /* exactly "/" */
         if (out_parent)    *out_parent    = NULL;
         if (out_last_name) *out_last_name = NULL;
-        return root;
+        return base;
     }
 
-    struct dentry* cur = root;
+    struct dentry* cur = base;
     const char* p = path + 1;                   /* skip leading '/' */
     const char* last_start = p;
 
@@ -484,22 +581,36 @@ int vfs_readdir(struct file* f, struct dirent* out) {
  * provides a buffer for the parent path (mutable copy). */
 static int split_parent(const char* path, char* parent_buf, size_t cap,
                         const char** last_out) {
-    size_t len = strlen_(path);
-    if (len == 0 || len >= cap)  return -1;
+    /* §M73 — canonical first (relative → from the working directory; "." and
+     * ".." applied), INTO parent_buf, which then holds "parent\0last". */
+    if (cap < 4) return -1;
+    const char* c = vfs_canon(path, parent_buf + 1, cap - 1);
+    if (!c) return -1;
+    size_t len = strlen_(c);
+    if (len == 0 || len + 2 > cap) return -1;
+    if (c != parent_buf + 1) memcpy_(parent_buf + 1, c, len + 1);
+    char* s = parent_buf + 1;                   /* the canonical path */
 
-    /* Find the last '/'.  Path must start with '/'. */
     int last_slash = -1;
-    for (size_t i = 0; i < len; i++) if (path[i] == '/') last_slash = (int)i;
-    if (last_slash < 0) return -1;
+    for (size_t i = 0; i < len; i++) if (s[i] == '/') last_slash = (int)i;
+    if (last_slash < 0 || s[last_slash + 1] == 0) return -1;   /* "/" has no last name */
 
     if (last_slash == 0) {
+        /* "/name": the parent is "/", so the layout is "/\0name" — which is
+         * the canonical string shifted left by one with its slash kept. */
         parent_buf[0] = '/';
         parent_buf[1] = 0;
+        *last_out = s + 1;                      /* name still sits after it */
     } else {
-        memcpy_(parent_buf, path, (size_t)last_slash);
+        for (int i = 0; i < last_slash; i++) parent_buf[i] = s[i];
         parent_buf[last_slash] = 0;
+        /* the name: copy it just past the parent's terminator */
+        const char* nm = s + last_slash + 1;
+        size_t nl = strlen_(nm);
+        char* dst = parent_buf + last_slash + 1;
+        for (size_t i = 0; i <= nl; i++) dst[i] = nm[i];   /* forward copy: dst <= nm */
+        *last_out = dst;
     }
-    *last_out = path + last_slash + 1;
     return 0;
 }
 
@@ -608,6 +719,30 @@ static int vfs_unlink_unlocked(const char* path) {
 }
 int vfs_unlink(const char* path) {
     return NS_LOCKED(int, vfs_unlink_unlocked(path));
+}
+
+/* §M73 — a second name for an existing regular file, in a directory of the
+ * SAME filesystem (a link cannot cross one: it is the same inode).  -2 if the
+ * new name exists, -5 if the directory may not be written. */
+static int vfs_link_unlocked(const char* oldpath, const char* newpath) {
+    struct dentry* src = resolve_path(oldpath, NULL, NULL);
+    if (!src || !src->inode || src->inode->type != INODE_FILE) return -1;
+    char buf[256];
+    const char* last;
+    if (split_parent(newpath, buf, sizeof buf, &last) != 0 || !*last) return -1;
+    if (strlen_(last) > VFS_NAME_MAX) return -1;
+    struct dentry* parent = resolve_path(buf, NULL, NULL);
+    if (!parent || !parent->inode || parent->inode->type != INODE_DIR) return -1;
+    if (!parent->inode->dir_ops || !parent->inode->dir_ops->link) return -1;
+    if (parent->inode->dir_ops != src->parent->inode->dir_ops) return -1;   /* same fs */
+    if (!vfs_permitted(parent->inode, VFS_PERM_WRITE)) return -5;
+    for (struct dentry* c = parent->children; c; c = c->sibling)
+        if (streq(c->name, last)) return -2;
+    if (parent->inode->dir_ops->link(parent->inode, last, src->inode) != 0) return -1;
+    return vfs_attach_child_unlocked(parent, last, src->inode) ? 0 : -1;
+}
+int vfs_link(const char* oldpath, const char* newpath) {
+    return NS_LOCKED(int, vfs_link_unlocked(oldpath, newpath));
 }
 
 /* ------------------------------------------------------------------- */

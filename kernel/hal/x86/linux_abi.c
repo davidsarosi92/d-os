@@ -41,6 +41,7 @@
  * set).  Anything else returns -ENOSYS and is logged once. */
 #define LNX_exit             1
 #define LNX_fork             2
+#define LNX_vfork          190   /* §M73 — served as a fork (see the case) */
 #define LNX_clone         120
 #define LNX_futex         240
 /* clone() flag bits we care about (linux/sched.h). */
@@ -187,20 +188,6 @@ struct lnx_sockaddr_in {
 #define LO_ACCMODE  00000003
 #define LAT_FDCWD   (-100)
 
-/* Map Linux open flags → d-os VFS_* flags (isolated here — the ONE place the
- * two flag namespaces are reconciled).  O_APPEND/O_LARGEFILE/O_CLOEXEC/… have
- * no d-os equivalent yet and are simply dropped. */
-static int linux_open_flags(int lf) {
-    int vf;
-    switch (lf & LO_ACCMODE) {
-        case LO_WRONLY: vf = VFS_WRONLY; break;
-        case LO_RDWR:   vf = VFS_RDWR;   break;
-        default:        vf = VFS_RDONLY; break;   /* O_RDONLY == 0 → VFS_RDONLY */
-    }
-    if (lf & LO_CREAT) vf |= VFS_CREATE;
-    if (lf & LO_TRUNC) vf |= VFS_TRUNC;
-    return vf;
-}
 
 /* Linux i386 struct iovec (for writev). */
 struct lnx_iovec { void* iov_base; uint32_t iov_len; };
@@ -279,37 +266,10 @@ struct lnx_msghdr {
     int               msg_flags;       /* out: MSG_TRUNC/… (we report 0)       */
 };
 
-/* Linux i386 `struct stat64` (asm/stat.h) — the layout SYS_fstat64 fills and
- * musl copies from.  ld.so's map_library fstats a .so to learn its size before
- * mmapping it, so st_size (offset 44) is the field that matters; st_mode marks
- * it a regular file, st_dev/st_ino let musl dedup already-loaded objects. */
-struct lnx_stat64 {
-    uint64_t st_dev;        uint32_t __pad0;
-    uint32_t __st_ino;      uint32_t st_mode;      uint32_t st_nlink;
-    uint32_t st_uid;        uint32_t st_gid;
-    uint64_t st_rdev;       uint32_t __pad3;
-    int64_t  st_size;       uint32_t st_blksize;   uint64_t st_blocks;
-    uint32_t st_atime;      uint32_t st_atime_nsec;
-    uint32_t st_mtime;      uint32_t st_mtime_nsec;
-    uint32_t st_ctime;      uint32_t st_ctime_nsec;
-    uint64_t st_ino;
-} __attribute__((packed));
 
 #define LNX_S_IFREG 0100000u
 #define LNX_S_IFDIR 0040000u
 
-/* Fill a Linux stat64 from d-os's kstat (translated in one place). */
-static void fill_stat64(struct lnx_stat64* s, const struct kstat* k) {
-    for (unsigned i = 0; i < sizeof *s; i++) ((uint8_t*)s)[i] = 0;
-    s->st_mode    = (k->type == 1 /*INODE_DIR*/ ? LNX_S_IFDIR : LNX_S_IFREG) | 0755u;
-    s->st_nlink   = 1;
-    s->st_size    = (int64_t)(uint32_t)k->size;
-    s->st_blksize = 4096;
-    s->st_blocks  = ((uint64_t)(uint32_t)k->size + 511) / 512;
-    s->st_dev     = 1;
-    s->__st_ino   = (uint32_t)k->size + 1;   /* crude but stable-per-file id */
-    s->st_ino     = s->__st_ino;
-}
 
 /* --------------------------------------------------------------------------
  * User-pointer discipline in this dispatcher (§1.1).
@@ -328,18 +288,6 @@ static int lnx_w_ok(uintptr_t uptr, uintptr_t len) {   /* ring-3 write target */
 }
 static int lnx_r_ok(uintptr_t uptr, uintptr_t len) {   /* ring-3 read source  */
     return uptr && vmm_user_access_ok(uptr, len, 0);
-}
-/* stat() a ring-3 path: copy the string in (validated), then run the core. */
-static int lnx_stat_upath(uintptr_t upath, struct kstat* out) {
-    char kp[256];
-    if (copy_str_from_user(kp, upath, sizeof kp) < 0) return -1;
-    return sys_stat_k(kp, out);
-}
-/* Write a kstat out as a Linux stat64 at a validated ring-3 address. */
-static int lnx_put_stat64(uintptr_t ustat, const struct kstat* k) {
-    if (!lnx_w_ok(ustat, sizeof(struct lnx_stat64))) return -1;
-    fill_stat64((struct lnx_stat64*)ustat, k);
-    return 0;
 }
 
 
@@ -604,21 +552,6 @@ static long linux_socketcall(int call, const uint32_t* uargs) {
 #define LNX_F_SETFL          4
 #define LNX_O_NONBLOCK   04000
 
-static long linux_fcntl(int fd, int cmd, long arg) {
-    if (cmd == LNX_F_DUPFD || cmd == LNX_F_DUPFD_CLOEXEC) {
-        int nfd = sys_dupfd(fd, (int)arg);
-        return (nfd < 0) ? -LNX_EINVAL : nfd;
-    }
-    if (cmd == LNX_F_SETFL) {
-        sys_socket_setnonblock(fd, (arg & LNX_O_NONBLOCK) ? 1 : 0);
-        return 0;                          /* not a socket → accept and ignore */
-    }
-    if (cmd == LNX_F_GETFL) {
-        int nb = sys_socket_getnonblock(fd);
-        return (nb > 0) ? LNX_O_NONBLOCK : 0;
-    }
-    return 0;                              /* CLOEXEC etc: accepted, untracked */
-}
 
 /* End a Linux process/excursion: an independent user task exits for good;
  * an excursion teleports back to proc_exec_*'s caller (identical to the native
@@ -736,73 +669,10 @@ static void linux_syscall_body(struct int_frame* f) {
             f->eax = 0;
             return;
 
-        case LNX_open: {
-            /* open(path=ebx, flags=ecx, mode=edx) — translate flags, ignore mode.
-             * On failure return -ENOENT (not a generic -1): musl's library search
-             * loop only advances to the next candidate path on ENOENT-class
-             * errors, so a generic error would abort the search. */
-            long r = sys_open((const char*)f->ebx, linux_open_flags((int)f->ecx));
-            f->eax = (r < 0) ? (uint32_t)-LNX_ENOENT : (uint32_t)r;
-            return;
-        }
-
-        case LNX_openat: {
-            /* openat(dirfd=ebx, path=ecx, flags=edx, mode=esi).  We support the
-             * AT_FDCWD form (absolute paths / cwd-relative), which is what musl
-             * uses for open(); a real dirfd is a follow-up. */
-            int dirfd = (int)f->ebx;
-            if (dirfd != LAT_FDCWD) { f->eax = (uint32_t)-LNX_ENOSYS; return; }
-            long r = sys_open((const char*)f->ecx, linux_open_flags((int)f->edx));
-            f->eax = (r < 0) ? (uint32_t)-LNX_ENOENT : (uint32_t)r;
-            return;
-        }
         case LNX_close:
             f->eax = (uint32_t)sys_close((int)f->ebx);
             return;
 
-        case LNX_clock_gettime64: {
-            /* clock_gettime64(clockid=ebx, __kernel_timespec*=ecx): s64 tv_sec@0,
-             * s64 tv_nsec@8.  musl on i386 (time64) routes time()/gettimeofday
-             * here — without it mbedTLS's x509 date check fatals (gmtime bad). */
-            struct ktimespec ts;
-            sys_clock_gettime_k((int)f->ebx, &ts);
-            if (!lnx_w_ok(f->ecx, 16)) { f->eax = (uint32_t)-LNX_EFAULT; return; }
-            uint32_t* p = (uint32_t*)f->ecx;
-            p[0] = ts.sec; p[1] = 0; p[2] = ts.nsec; p[3] = 0;
-            f->eax = 0;
-            return;
-        }
-        case LNX_clock_gettime: {
-            /* 32-bit timespec { long tv_sec; long tv_nsec; }. */
-            struct ktimespec ts;
-            sys_clock_gettime_k((int)f->ebx, &ts);
-            if (!lnx_w_ok(f->ecx, 8)) { f->eax = (uint32_t)-LNX_EFAULT; return; }
-            uint32_t* p = (uint32_t*)f->ecx;
-            p[0] = ts.sec; p[1] = ts.nsec;
-            f->eax = 0;
-            return;
-        }
-        case LNX_gettimeofday: {
-            /* struct timeval { long tv_sec; long tv_usec; } at ebx. */
-            struct ktimespec ts;
-            sys_clock_gettime_k(CLOCK_REALTIME, &ts);
-            if (!lnx_w_ok(f->ebx, 8)) { f->eax = (uint32_t)-LNX_EFAULT; return; }
-            uint32_t* p = (uint32_t*)f->ebx;
-            p[0] = ts.sec; p[1] = ts.nsec / 1000;
-            f->eax = 0;
-            return;
-        }
-        case LNX_unlink:
-            /* unlink(path=ebx) — tcc removes the output file before writing.
-             * §1.1 — copy the client path into the kernel before the VFS sees it. */
-            {
-                char kp[256];
-                if (copy_str_from_user(kp, f->ebx, sizeof kp) < 0) {
-                    f->eax = (uint32_t)-LNX_EFAULT; return;
-                }
-                f->eax = (uint32_t)vfs_unlink(kp);
-            }
-            return;
         case LNX_lseek:
             /* lseek(fd=ebx, offset=ecx, whence=edx) → new offset. */
             f->eax = (uint32_t)sys_lseek((int)f->ebx, (long)f->ecx, (int)f->edx);
@@ -852,37 +722,6 @@ static void linux_syscall_body(struct int_frame* f) {
                                              (unsigned)f->edx);
             return;
 
-        case LNX_fstat64: {
-            /* fstat64(fd=ebx, statbuf=ecx).  ld.so's map_library fstats a .so to
-             * learn its size before mmapping it.  Translate d-os kstat → Linux
-             * stat64.  (statx (383) is left ENOSYS; musl falls back to this.) */
-            struct kstat k;
-            if (sys_fstat_k((int)f->ebx, &k) != 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
-            if (lnx_put_stat64(f->ecx, &k) != 0) { f->eax = (uint32_t)-LNX_EFAULT; return; }
-            f->eax = 0;
-            return;
-        }
-
-        case LNX_stat64:
-        case LNX_lstat64: {
-            /* stat64/lstat64(path=ebx, statbuf=ecx) — path-based; musl falls back
-             * to these when statx (383) returns ENOSYS.  No symlinks, so lstat
-             * == stat.  NetSurf stats its resource + font files. */
-            struct kstat k;
-            if (lnx_stat_upath(f->ebx, &k) != 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
-            if (lnx_put_stat64(f->ecx, &k) != 0) { f->eax = (uint32_t)-LNX_EFAULT; return; }
-            f->eax = 0;
-            return;
-        }
-        case LNX_fstatat64: {
-            /* fstatat64(dirfd=ebx, path=ecx, statbuf=edx, flags=esi) — AT_FDCWD
-             * only (absolute/relative-to-cwd paths, which is all NetSurf uses). */
-            struct kstat k;
-            if (lnx_stat_upath(f->ecx, &k) != 0) { f->eax = (uint32_t)-LNX_ENOENT; return; }
-            if (lnx_put_stat64(f->edx, &k) != 0) { f->eax = (uint32_t)-LNX_EFAULT; return; }
-            f->eax = 0;
-            return;
-        }
         case LNX_statx:
             /* Deliberately ENOSYS: musl (incl. ld.so's library dedup) falls back
              * to stat64, which we implement correctly.  A hand-rolled statx
@@ -892,24 +731,11 @@ static void linux_syscall_body(struct int_frame* f) {
              * and silent (no log line here). */
             f->eax = (uint32_t)-LNX_ENOSYS;
             return;
-        case LNX_newuname:
-            /* uname(buf=ebx) — NetSurf builds its User-Agent from it. */
-            f->eax = (uint32_t)sys_uname((struct kutsname*)f->ebx);
-            return;
-        case LNX_rt_sigaction:
-            /* Accept + ignore: NetSurf installs SIGCHLD/SIGPIPE handlers it never
-             * needs headless.  Real delivery is a later item (as on x86_64). */
-            f->eax = 0;
-            return;
-
-        case LNX_getdents64:
-            /* readdir — musl packs the Linux dirent64 layout (sys_getdents64). */
-            f->eax = (uint32_t)sys_getdents64((int)f->ebx, (void*)f->ecx, (size_t)f->edx);
-            return;
         case LNX_getpid:
             f->eax = (uint32_t)(task_current() ? task_current()->pid : -1);
             return;
 
+        case LNX_vfork:     /* §M73 — a fork is a correct vfork; busybox sh uses it */
         case LNX_fork: {
             /* Same as the native SYS_FORK: snapshot the user frame (child gets
              * eax=0) and clone.  proc_fork copies task->linux_abi to the child,
@@ -1032,11 +858,6 @@ static void linux_syscall_body(struct int_frame* f) {
             f->eax = (uint32_t)sys_futex((int*)f->ebx, (int)f->ecx, (int)f->edx);
             return;
 
-        case LNX_fcntl64:
-        case LNX_fcntl:
-            f->eax = (uint32_t)linux_fcntl((int)f->ebx, (int)f->ecx, (long)f->edx);
-            return;
-
         case LNX_mmap2: {
             /* i386 mmap2(addr=ebx, len=ecx, prot=edx, flags=esi, fd=edi,
              * pgoff=ebp) — pgoff is in PAGES.  §M37: full mmap so musl's ld.so
@@ -1079,29 +900,6 @@ static void linux_syscall_body(struct int_frame* f) {
             return;
         }
 
-        case LNX_readlink:
-        case LNX_readlinkat: {
-            /* No symlinks in the VFS → -EINVAL for an existing path (musl
-             * realpath() treats it as "use as-is"), -ENOENT if missing.
-             * Unblocks NetSurf's realpath()-based resource/font lookup. */
-            const char* path = (f->eax == LNX_readlink)
-                                   ? (const char*)f->ebx    /* readlink: path=ebx */
-                                   : (const char*)f->ecx;   /* readlinkat: path=ecx */
-            struct kstat k;
-            f->eax = (lnx_stat_upath((uintptr_t)path, &k) != 0) ? (uint32_t)-LNX_ENOENT
-                                                                : (uint32_t)-LNX_EINVAL;
-            return;
-        }
-        case LNX_access:
-        case LNX_faccessat: {
-            /* Existence check (no per-file perms yet): 0 if it stats OK. */
-            const char* path = (f->eax == LNX_access)
-                                   ? (const char*)f->ebx    /* access: path=ebx */
-                                   : (const char*)f->ecx;   /* faccessat: path=ecx */
-            struct kstat k;
-            f->eax = (lnx_stat_upath((uintptr_t)path, &k) != 0) ? (uint32_t)-LNX_ENOENT : 0;
-            return;
-        }
         case LNX_madvise:
             f->eax = 0;                              /* advisory — accept + ignore */
             return;
@@ -1128,23 +926,6 @@ static void linux_syscall_body(struct int_frame* f) {
             return;
         }
 
-        case LNX_nanosleep:
-        case LNX_clock_nanosleep: {
-            /* Yield the CPU for the requested duration.  NetSurf's fb event loop
-             * sleeps here when idle; without it the browser busy-spins and
-             * starves the compositor (the desktop appears frozen).  timespec =
-             * {long tv_sec; long tv_nsec}; nanosleep's req is arg0 (ebx),
-             * clock_nanosleep's is arg2 (edx, after clockid + flags). */
-            uintptr_t ureq = (f->eax == LNX_nanosleep) ? f->ebx : f->edx;
-            if (ureq && !lnx_r_ok(ureq, 2 * sizeof(int32_t))) {   /* §1.1 */
-                f->eax = (uint32_t)-LNX_EFAULT; return;
-            }
-            const int32_t* req = (const int32_t*)ureq;
-            long ms = req ? ((long)req[0] * 1000 + req[1] / 1000000) : 0;
-            task_msleep(ms > 0 ? (uint32_t)ms : 1u);
-            f->eax = 0;
-            return;
-        }
         case LNX_sched_yield:
             task_msleep(1);                          /* cooperative yield */
             f->eax = 0;

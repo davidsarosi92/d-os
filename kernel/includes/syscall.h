@@ -88,6 +88,11 @@
 #define SYS_ACCEPT       45     /* (fd, u32* ip, int* port) → new fd / -1      */
 #define SYS_GETSOCKNAME  46     /* (fd, u32* ip, int* port) → 0 / -1           */
 #define SYS_GETPEERNAME  47     /* (fd, u32* ip, int* port) → 0 / -1           */
+/* §M73 — directory calls (a container image has to be unpacked from ring 3). */
+#define SYS_MKDIR        48     /* (path, mode) → 0 / <0                        */
+#define SYS_LINK         49     /* (old, new) → 0 / <0 — a hard link            */
+#define SYS_CHMOD        50     /* (path, mode) → 0 / <0                        */
+#define SYS_UNLINK       51     /* (path) → 0 / <0                              */
 
 /* §M65 — THE DISPLAY BRIDGE, reachable from BOTH personalities under ONE
  * number space.  These are d-os operations (Linux has no such calls), so the
@@ -221,6 +226,10 @@ long sys_mmap (size_t len, int fd);     /* map anon (fd<0) or a memfd's frames *
 /* §M37 — full mmap (addr+MAP_FIXED, prot→VMM flags, file-backed at offset) for
  * the Linux ABI / ld.so loading shared objects. */
 long sys_munmap(uintptr_t addr, size_t len);   /* §M74 */
+int  sys_mkdir(const char* upath, int mode);   /* §M73 */
+int  sys_link(const char* uold, const char* unew);
+int  sys_chmod(const char* upath, int mode);
+int  sys_unlink(const char* upath);
 long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
                    int fd, uint64_t offset);
 long sys_mprotect(uintptr_t addr, size_t len, int prot);  /* §M37 */
@@ -309,6 +318,28 @@ int  sys_poll (struct pollfd* fds, int nfds, int timeout);
  * path in with copy_str_from_user first.
  * ------------------------------------------------------------------------- */
 int  sys_stat_k(const char* kpath, struct kstat* out);
+/* §M73 — everything a foreign stat layout can carry, for the ABI engine ONLY.
+ * Deliberately NOT `struct kstat`: that one is the native ring-3 ABI, and
+ * growing it would make the kernel write past the end of every buffer a native
+ * program already compiled declares.  `ino` is the inode's own identity, so two
+ * names for one file (a hard link) report the same number and two different
+ * files never do — the old "size + 1" answer made every pair of equally sized
+ * files look like the same file to cp, tar and find. */
+struct kstat_full {
+    uint64_t size;
+    uint64_t ino;
+    uint32_t mode;          /* S_IF* type bits | rwx permission bits          */
+    int      uid, gid;      /* the owner the VFS records (0 where none is)    */
+    uint32_t nlink;
+};
+#define KS_IFMT   0170000u
+#define KS_IFSOCK 0140000u
+#define KS_IFREG  0100000u
+#define KS_IFDIR  0040000u
+#define KS_IFCHR  0020000u
+#define KS_IFIFO  0010000u
+int  sys_stat_full_k(const char* kpath, struct kstat_full* out);   /* -1: none */
+int  sys_fstat_full_k(int fd, struct kstat_full* out);             /* -1: EBADF */
 int  sys_fstat_k(int fd, struct kstat* out);
 int  sys_clock_gettime_k(int which, struct ktimespec* out);
 long sys_recvfrom_k(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out);

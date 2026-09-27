@@ -122,6 +122,10 @@ enum task_owner_kind {
  * while it is being constructed. */
 #define CRED_SESSION_NONE 0
 
+struct dentry;
+struct dentry* cred_fs_root(void);   /* §M73 — the current task's "/" (NULL = the machine's) */
+const char* cred_fs_cwd(void);       /* §M73 — its working directory, canonical ("" = "/") */
+
 struct cred {
     int owner;                      /* enum task_owner_kind; 0 = KERNEL       */
     /* MEANINGFUL ONLY WHEN owner == TASK_OWNER_USER.  Read it through
@@ -144,6 +148,23 @@ struct cred {
     int ngroups;
     int groups[CRED_MAX_GROUPS];    /* supplementary groups                   */
     int session;                    /* §M32 session id; 0 = none              */
+    /* §M73 — WHERE THIS TASK'S "/" IS.  NULL = the machine's root.  Part of
+     * the identity rather than of the task because an identity is what every
+     * spawn, fork and clone already inherits (cred_inherit): a container's
+     * root is therefore passed on by the same copy that passes on its uid,
+     * and there is no second place to forget.  Absolute paths are the only
+     * kind the VFS resolves and it has no "..", so a task cannot walk out of
+     * the subtree this names — there is nothing to walk with. */
+    struct dentry* root;
+    int container;                  /* §M73 — container id; 0 = none          */
+    /* §M73 — the WORKING DIRECTORY, as a canonical path within `root` ("" =
+     * "/").  Beside `root` for the same reason root is here: it is part of the
+     * filesystem view every fork and spawn inherits.  A path rather than a
+     * dentry because nothing here counts references to dentries — a pointer
+     * to a directory somebody removed would be a dangling one, while a path
+     * to it is merely a path that no longer resolves, which is what Linux
+     * reports for a deleted cwd too. */
+    char cwd[96];
 };
 
 /* The uid this identity really has: CRED_UID_NONE for anything that is not a

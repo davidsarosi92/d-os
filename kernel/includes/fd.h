@@ -20,11 +20,22 @@ struct file;                    /* vfs.h  */
 struct shm;                     /* below  */
 struct usock;                   /* unix socket endpoint (stage 5)          */
 
-enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER, FD_EPOLL };
+/* FD_CONSOLE (§M73) is appended: the console as an OBJECT.  An empty slot
+ * 0/1/2 still means "the console" (that default is what keeps every
+ * non-redirecting program unchanged, §M59), but a shell saves its stdout with
+ * `fcntl(1, F_DUPFD, 10)` before redirecting and restores it with
+ * `dup2(10, 1)` afterwards — and an empty slot cannot be copied anywhere.  So a
+ * dup of an empty std slot yields an FD_CONSOLE ofile, which reads and writes
+ * exactly as the empty slot would. */
+enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER, FD_EPOLL, FD_CONSOLE };
 
 struct netsock;                 /* network (AF_INET) socket — usyscall.c        */
 struct timerfd;                 /* §M53 stage 3 — a deadline behind a descriptor */
 struct epoll;                   /* §M56 — a readiness set behind a descriptor   */
+struct ofile;
+/* §M73 — the ofile to duplicate for `fd`: its table entry, or for an empty
+ * std slot a NEW console ofile (*fresh set: the caller owns that reference). */
+struct ofile* fd_dup_source(int fd, int* fresh);
 
 struct ofile {
     enum fd_kind kind;

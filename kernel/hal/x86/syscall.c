@@ -246,6 +246,11 @@ static void syscall_dispatch_body(struct int_frame* f) {
         case SYS_GETPEERNAME:
             f->eax = (uint32_t)sys_getpeername((int)f->ebx, (uint32_t*)f->ecx, (int*)f->edx);
             return;
+        /* §M73 — directory calls. */
+        case SYS_MKDIR:  f->eax = (uint32_t)sys_mkdir((const char*)f->ebx, (int)f->ecx); return;
+        case SYS_LINK:   f->eax = (uint32_t)sys_link((const char*)f->ebx, (const char*)f->ecx); return;
+        case SYS_CHMOD:  f->eax = (uint32_t)sys_chmod((const char*)f->ebx, (int)f->ecx); return;
+        case SYS_UNLINK: f->eax = (uint32_t)sys_unlink((const char*)f->ebx); return;
 
         /* M35 — threads. */
         case SYS_CLONE:

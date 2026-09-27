@@ -47,7 +47,7 @@ COMMON_CFLAGS := -ffreestanding -fno-stack-protector -fno-pie -nostdlib \
 # Ring-3 programs built against the IN-TREE libc (user/libc.c), whose syscall
 # shim covers all three arches.
 X86_USER_BLOBS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
-                  user/memhog_blob.o \
+                  user/memhog_blob.o user/ociunpack_blob.o \
                   user/args_blob.o user/forktest_blob.o user/forkexec_blob.o \
                   user/pipetest_blob.o user/sigtest_blob.o \
                   user/dnstest_blob.o user/httptest_blob.o \
@@ -132,6 +132,11 @@ ifeq ($(ARCH),i386)
   # §M67 — the loadable modules archive.  Unconditional: `modules` is a
   # first-class build product, not an optional asset.
   ARCH_EXTRA_OBJS += user/modules_blob.o
+  # §M73 — a real multi-platform OCI image (busybox:musl, `docker save`),
+  # the container validation target; imported by `ctr import` at first use.
+  ifneq ($(wildcard assets/images/busybox-musl.tar),)
+    ARCH_EXTRA_OBJS += assets/busyboximg_blob.o
+  endif
   ifneq ($(wildcard assets/wallpaper-default.bmp),)
     ARCH_EXTRA_OBJS += assets/wallpaper_blob.o
   endif
@@ -333,6 +338,11 @@ else ifeq ($(ARCH),x86_64)
   # §M67 — the loadable modules archive.  Unconditional: `modules` is a
   # first-class build product, not an optional asset.
   ARCH_EXTRA_OBJS += user/modules_blob.o
+  # §M73 — a real multi-platform OCI image (busybox:musl, `docker save`),
+  # the container validation target; imported by `ctr import` at first use.
+  ifneq ($(wildcard assets/images/busybox-musl.tar),)
+    ARCH_EXTRA_OBJS += assets/busyboximg_blob.o
+  endif
   ifneq ($(wildcard assets/wallpaper-default.bmp),)
     ARCH_EXTRA_OBJS += assets/wallpaper_blob.o
   endif
@@ -589,7 +599,7 @@ else ifeq ($(ARCH),aarch64)
   # in-tree-libc programs and the build rules are already arch-parameterised,
   # so adding them here is the whole change.
   ARCH_EXTRA_OBJS := user/hello_blob.o user/spin_blob.o user/wedge_blob.o \
-                     user/memhog_blob.o \
+                     user/memhog_blob.o user/ociunpack_blob.o \
                      user/pl031drv_blob.o \
                      user/forktest_blob.o user/pipetest_blob.o \
                      user/redirtest_blob.o user/uidemo_blob.o \
@@ -603,6 +613,11 @@ else ifeq ($(ARCH),aarch64)
   # §M67 — the loadable modules archive.  Unconditional: `modules` is a
   # first-class build product, not an optional asset.
   ARCH_EXTRA_OBJS += user/modules_blob.o
+  # §M73 — a real multi-platform OCI image (busybox:musl, `docker save`),
+  # the container validation target; imported by `ctr import` at first use.
+  ifneq ($(wildcard assets/images/busybox-musl.tar),)
+    ARCH_EXTRA_OBJS += assets/busyboximg_blob.o
+  endif
   ifneq ($(wildcard assets/wallpaper-default.bmp),)
     ARCH_EXTRA_OBJS += assets/wallpaper_blob.o
   endif
@@ -669,6 +684,7 @@ CORE_C_SRCS := \
     kernel/core/cmd_mem.c \
     kernel/core/cmd_pci.c \
     kernel/core/cmd_task.c \
+    kernel/core/container.c \
     kernel/core/cmd_sys.c \
     kernel/core/cmd_desktop.c \
     kernel/core/cmd_pkg.c \
@@ -911,6 +927,7 @@ CORE_C_SRCS := \
     kernel/core/cmd_mem.c \
     kernel/core/cmd_pci.c \
     kernel/core/cmd_task.c \
+    kernel/core/container.c \
     kernel/core/cmd_sys.c \
     kernel/core/cmd_desktop.c \
     kernel/core/cmd_pkg.c \
@@ -1014,6 +1031,7 @@ CORE_C_SRCS := \
     kernel/core/cmd_mem.c \
     kernel/core/cmd_pci.c \
     kernel/core/cmd_task.c \
+    kernel/core/container.c \
     kernel/core/cmd_sys.c \
     kernel/core/cmd_desktop.c \
     kernel/core/cmd_pkg.c \
@@ -1636,6 +1654,14 @@ user/memhog_$(ARCH).elf: user/libc.c user/memhog.c user/libc.h $(USER_CRT0_SRC)
 	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
 	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/memhog.o $(OBJ_DIR)/user/libc.o
 
+# §M73 — ociunpack: an OCI image archive becomes a root filesystem, in ring 3.
+user/ociunpack_$(ARCH).elf: user/libc.c user/ociunpack.c user/libc.h $(USER_CRT0_SRC)
+	@mkdir -p $(OBJ_DIR)/user
+	$(USER_CRT0_BUILD)
+	$(CC) $(USER_CFLAGS) -c user/libc.c -o $(OBJ_DIR)/user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/ociunpack.c -o $(OBJ_DIR)/user/ociunpack.o
+	$(LD) $(USER_LDEMU) -N -Ttext $(USER_BASE) -e _start -o $@ \
+	    $(OBJ_DIR)/user/crt0.o $(OBJ_DIR)/user/ociunpack.o $(OBJ_DIR)/user/libc.o
 
 user/args_$(ARCH).elf: user/libc.c user/args.c user/libc.h $(USER_CRT0_SRC)
 	@mkdir -p $(OBJ_DIR)/user
@@ -2049,6 +2075,11 @@ $(OBJ_DIR)/third_party/cacert_blob.o: third_party/cacert.pem
 # needs no image tooling at all, on any host.
 # $(USER_OBJCOPY), not bare objcopy — the aarch64 container carries only the
 # cross binutils (the lesson the muslblob rule below already records).
+$(OBJ_DIR)/assets/busyboximg_blob.o: assets/images/busybox-musl.tar
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) \
+	    assets/images/busybox-musl.tar $@
+
 $(OBJ_DIR)/assets/wallpaper_blob.o: assets/wallpaper-default.bmp
 	@mkdir -p $(@D)
 	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) \

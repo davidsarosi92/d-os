@@ -19,7 +19,16 @@
 #include "proc.h"
 #include "kmalloc.h"
 #include "vmm.h"        /* vmm_user_access_ok — guest-pointer validation */
+#include "vfs.h"        /* §M73 — VFS_* open flags */
+#include "shellcmd.h"   /* §M73 — strace */
 #include <stddef.h>
+
+/* Linux errno values the guests share (the ones the engine returns). */
+#define ABI_ENOTTY 25
+#define ABI_ENOSYS 38
+#define ABI_EFAULT 14
+#define ABI_EINVAL 22
+#define ABI_ENOMEM 12
 
 /* --- canonical handlers ---------------------------------------------------
  *
@@ -44,6 +53,36 @@ static long h_close(struct abi_ctx* c) {
 static long h_seek(struct abi_ctx* c) {
     return sys_lseek((int)c->a[0], (long)c->a[1], (int)c->a[2]);
 }
+/* §M73 — directory calls.  The VFS answers -1 (not found), -2 (exists) or -5
+ * (not permitted); a Linux program wants ENOENT / EEXIST / EACCES. */
+#define AT_FDCWD_ (-100)
+static long lnx_err(int r) {
+    if (r >= 0) return r;
+    if (r == -2) return -17;             /* EEXIST */
+    if (r == -5) return -13;             /* EACCES */
+    return -2;                           /* ENOENT */
+}
+static long h_mkdir(struct abi_ctx* c)   { return lnx_err(sys_mkdir((const char*)c->a[0], (int)c->a[1])); }
+static long h_mkdirat(struct abi_ctx* c) {
+    if ((int)c->a[0] != AT_FDCWD_) return -38;           /* ENOSYS */
+    return lnx_err(sys_mkdir((const char*)c->a[1], (int)c->a[2]));
+}
+static long h_link(struct abi_ctx* c)    { return lnx_err(sys_link((const char*)c->a[0], (const char*)c->a[1])); }
+static long h_linkat(struct abi_ctx* c) {
+    if ((int)c->a[0] != AT_FDCWD_ || (int)c->a[2] != AT_FDCWD_) return -38;
+    return lnx_err(sys_link((const char*)c->a[1], (const char*)c->a[3]));
+}
+static long h_chmod(struct abi_ctx* c)   { return lnx_err(sys_chmod((const char*)c->a[0], (int)c->a[1])); }
+static long h_fchmodat(struct abi_ctx* c) {
+    if ((int)c->a[0] != AT_FDCWD_) return -38;
+    return lnx_err(sys_chmod((const char*)c->a[1], (int)c->a[2]));
+}
+static long h_unlink(struct abi_ctx* c)  { return lnx_err(sys_unlink((const char*)c->a[0])); }
+static long h_unlinkat(struct abi_ctx* c) {
+    if ((int)c->a[0] != AT_FDCWD_) return -38;
+    return lnx_err(sys_unlink((const char*)c->a[1]));   /* AT_REMOVEDIR: the VFS unlinks both */
+}
+
 static long h_mprotect(struct abi_ctx* c) {
     return sys_mprotect((uintptr_t)c->a[0], (size_t)c->a[1], (int)c->a[2]);
 }
@@ -71,6 +110,297 @@ static long h_getppid(struct abi_ctx* c) {
     return t ? t->ppid : 0;
 }
 
+#define ABI_EPERM 1
+
+/* §M73 — "who am I", from the credential.  A task that is nobody's (a SYSTEM
+ * or kernel identity, CRED_UID_NONE) answers 0: in a POSIX program's terms it
+ * has root's power, and a value outside uid_t's meaning would be worse. */
+static int guest_uid(void) {
+    struct task* t = task_current();
+    int u = t ? cred_uid(&t->cred) : 0;
+    return u < 0 ? 0 : u;
+}
+static int guest_gid(void) {
+    struct task* t = task_current();
+    int g = t ? cred_gid(&t->cred) : 0;
+    return g < 0 ? 0 : g;
+}
+static long h_getuid(struct abi_ctx* c) { (void)c; return guest_uid(); }
+static long h_getgid(struct abi_ctx* c) { (void)c; return guest_gid(); }
+static long h_setuid(struct abi_ctx* c) { return (int)c->a[0] == guest_uid() ? 0 : -ABI_EPERM; }
+static long h_setgid(struct abi_ctx* c) { return (int)c->a[0] == guest_gid() ? 0 : -ABI_EPERM; }
+
+static unsigned long abi_get_word(const struct abi_ctx* c, unsigned long p, int i);
+
+/* §M73 — the file and time calls.  See the ABI_OPEN comment in abi.h for why
+ * they live here; everything below that differs between guests is read from
+ * the map. */
+#define ABI_ENOENT  2
+#define ABI_EBADF   9
+#define ABI_ENOTDIR 20
+static int abi_w_ok(unsigned long p, unsigned long n) { return p && vmm_user_access_ok((uintptr_t)p, (uintptr_t)n, 1); }
+static int abi_r_ok(unsigned long p, unsigned long n) { return p && vmm_user_access_ok((uintptr_t)p, (uintptr_t)n, 0); }
+
+/* Copy a guest path in.  0 on success. */
+static int abi_path(unsigned long up, char* k, unsigned cap) {
+    return (up && copy_str_from_user(k, (uintptr_t)up, cap) >= 0) ? 0 : -1;
+}
+
+/* Linux open flags → VFS flags.  The access mode, O_CREAT and O_TRUNC share
+ * their bits on every guest we speak; O_DIRECTORY does not, so the caller
+ * checks it against the map. */
+static int abi_open_flags(unsigned long lf) {
+    int vf;
+    switch (lf & 3u) {
+        case 1:  vf = VFS_WRONLY; break;
+        case 2:  vf = VFS_RDWR;   break;
+        default: vf = VFS_RDONLY; break;
+    }
+    if (lf & 0100u)  vf |= VFS_CREATE;
+    if (lf & 01000u) vf |= VFS_TRUNC;
+    return vf;
+}
+static long abi_open_common(struct abi_ctx* c, unsigned long upath, unsigned long flags) {
+    char kp[256];
+    if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
+    if (c->map && c->map->o_directory && (flags & c->map->o_directory)) {
+        struct kstat_full st;
+        if (sys_stat_full_k(kp, &st) != 0) return -ABI_ENOENT;
+        if ((st.mode & KS_IFMT) != KS_IFDIR) return -ABI_ENOTDIR;
+    }
+    /* sys_open copies from a RING-3 path, which is what upath is. */
+    long r = sys_open((const char*)upath, abi_open_flags(flags));
+    return r < 0 ? -ABI_ENOENT : r;
+}
+static long h_open(struct abi_ctx* c)   { return abi_open_common(c, c->a[0], c->a[1]); }
+static long h_openat(struct abi_ctx* c) {
+    if ((int)c->a[0] != AT_FDCWD_) return -ABI_ENOSYS;   /* no directory descriptors */
+    return abi_open_common(c, c->a[1], c->a[2]);
+}
+
+/* Write one field of the guest's struct stat. */
+static void st_put(uint8_t* b, uint8_t off, uint8_t w, uint64_t v) {
+    if (off == 0xFF) return;
+    for (int i = 0; i < w; i++) b[off + i] = (uint8_t)(v >> (8 * i));
+}
+static long abi_put_stat(struct abi_ctx* c, unsigned long up, const struct kstat_full* k) {
+    const struct abi_stat_layout* L = c->map ? c->map->stat : NULL;
+    if (!L) return -ABI_ENOSYS;
+    if (!abi_w_ok(up, L->bytes)) return -ABI_EFAULT;
+    uint8_t* b = (uint8_t*)(uintptr_t)up;
+    for (int i = 0; i < L->bytes; i++) b[i] = 0;
+    st_put(b, L->dev, 8, 1);
+    st_put(b, L->ino, L->ino_w, k->ino);
+    st_put(b, L->ino32, 4, k->ino);
+    st_put(b, L->mode, 4, k->mode);
+    st_put(b, L->nlink, L->nlink_w, k->nlink);
+    st_put(b, L->uid, 4, (uint32_t)k->uid);
+    st_put(b, L->gid, 4, (uint32_t)k->gid);
+    st_put(b, L->size, 8, k->size);
+    st_put(b, L->blksize, L->blksize_w, 4096);
+    st_put(b, L->blocks, 8, (k->size + 511) / 512);
+    return 0;
+}
+static long abi_stat_path(struct abi_ctx* c, unsigned long upath, unsigned long ubuf) {
+    char kp[256];
+    if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
+    struct kstat_full k;
+    if (sys_stat_full_k(kp, &k) != 0) return -ABI_ENOENT;
+    return abi_put_stat(c, ubuf, &k);
+}
+static long h_stat(struct abi_ctx* c)  { return abi_stat_path(c, c->a[0], c->a[1]); }
+static long h_fstat(struct abi_ctx* c) {
+    struct kstat_full k;
+    if (sys_fstat_full_k((int)c->a[0], &k) != 0) return -ABI_EBADF;
+    return abi_put_stat(c, c->a[1], &k);
+}
+#define ABI_AT_EMPTY_PATH 0x1000
+static long h_fstatat(struct abi_ctx* c) {
+    if (c->a[3] & ABI_AT_EMPTY_PATH) {           /* fstatat(fd, "", st, AT_EMPTY_PATH) == fstat */
+        char kp[4];
+        if (abi_path(c->a[1], kp, sizeof kp) == 0 && kp[0] == 0) {
+            struct kstat_full k;
+            if (sys_fstat_full_k((int)c->a[0], &k) != 0) return -ABI_EBADF;
+            return abi_put_stat(c, c->a[2], &k);
+        }
+    }
+    if ((int)c->a[0] != AT_FDCWD_) return -ABI_ENOSYS;
+    return abi_stat_path(c, c->a[1], c->a[2]);
+}
+static long h_getdents64(struct abi_ctx* c) {
+    return sys_getdents64((int)c->a[0], (void*)c->a[1], (size_t)c->a[2]);
+}
+
+/* fcntl: F_DUPFD must really duplicate (libwayland dups every fd it sends,
+ * and a "successful" 0 is a dup to fd 0); O_NONBLOCK is honoured; the rest
+ * (CLOEXEC, locks) is accepted and not tracked.  The command numbers are the
+ * same on every guest we speak (asm-generic). */
+static long h_fcntl(struct abi_ctx* c) {
+    int fd = (int)c->a[0], cmd = (int)c->a[1];
+    long arg = (long)c->a[2];
+    if (cmd == 0 || cmd == 1030) {                          /* F_DUPFD, F_DUPFD_CLOEXEC */
+        int nfd = sys_dupfd(fd, (int)arg);
+        return nfd < 0 ? -ABI_EINVAL : nfd;
+    }
+    if (cmd == 4) { sys_socket_setnonblock(fd, (arg & 04000) ? 1 : 0); return 0; }   /* F_SETFL */
+    if (cmd == 3) return sys_socket_getnonblock(fd) > 0 ? 04000 : 0;                /* F_GETFL */
+    return 0;
+}
+
+/* access: an existence check plus the permission the VFS would enforce. */
+static long abi_access_path(unsigned long upath) {
+    char kp[256];
+    if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
+    struct kstat_full k;
+    return sys_stat_full_k(kp, &k) == 0 ? 0 : -ABI_ENOENT;
+}
+static long h_access(struct abi_ctx* c)    { return abi_access_path(c->a[0]); }
+static long h_faccessat(struct abi_ctx* c) {
+    if ((int)c->a[0] != AT_FDCWD_) return -ABI_ENOSYS;
+    return abi_access_path(c->a[1]);
+}
+/* readlink: this VFS has no symlinks, so an existing path is "not a link"
+ * (EINVAL) and a missing one ENOENT — exactly what realpath() needs to walk. */
+static long abi_readlink_path(unsigned long upath) {
+    char kp[256];
+    if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
+    struct kstat_full k;
+    return sys_stat_full_k(kp, &k) == 0 ? -ABI_EINVAL : -ABI_ENOENT;
+}
+static long h_readlink(struct abi_ctx* c)   { return abi_readlink_path(c->a[0]); }
+static long h_readlinkat(struct abi_ctx* c) { return abi_readlink_path(c->a[1]); }
+
+/* sendfile(out, in, off*, count) — a read/write loop through a kernel buffer.
+ * With an offset the input's own cursor is left untouched (seek, copy, seek
+ * back); the offset is a 64-bit loff_t on every guest we speak. */
+static long h_sendfile(struct abi_ctx* c) {
+    int out = (int)c->a[0], in = (int)c->a[1];
+    unsigned long offp = c->a[2];
+    size_t count = (size_t)c->a[3];
+    long saved = -1;
+    if (offp) {
+        if (!abi_w_ok(offp, 8)) return -ABI_EFAULT;
+        saved = sys_lseek(in, 0, 1);
+        if (saved < 0 || sys_lseek(in, (long)*(uint64_t*)(uintptr_t)offp, 0) < 0) return -ABI_EINVAL;
+    }
+    static const size_t CH = 4096;
+    uint8_t* buf = (uint8_t*)kmalloc(CH);
+    if (!buf) return -ABI_ENOMEM;
+    long total = 0;
+    while ((size_t)total < count) {
+        size_t want = count - (size_t)total > CH ? CH : count - (size_t)total;
+        long r = sys_read_k(in, buf, want);
+        if (r <= 0) { if (!total && r < 0) total = -ABI_EINVAL; break; }
+        long w = sys_write_k(out, buf, (size_t)r);
+        if (w <= 0) { if (!total) total = -ABI_EINVAL; break; }
+        total += w;
+        if (w < r) break;
+    }
+    kfree(buf);
+    if (offp) {
+        if (total > 0) *(uint64_t*)(uintptr_t)offp += (uint64_t)total;
+        sys_lseek(in, saved, 0);
+    }
+    return total;
+}
+static long h_uname(struct abi_ctx* c) { return sys_uname((struct kutsname*)c->a[0]); }
+static long h_dup(struct abi_ctx* c) {
+    int nfd = sys_dupfd((int)c->a[0], 0);
+    return nfd < 0 ? -ABI_EBADF : nfd;
+}
+static long h_dup2(struct abi_ctx* c) {
+    if ((int)c->a[0] == (int)c->a[1]) return (int)c->a[1];
+    int r = sys_dup2((int)c->a[0], (int)c->a[1]);
+    return r < 0 ? -ABI_EBADF : r;
+}
+static long h_dup3(struct abi_ctx* c) {                 /* flags: only O_CLOEXEC, untracked */
+    if ((int)c->a[0] == (int)c->a[1]) return -ABI_EINVAL;
+    int r = sys_dup2((int)c->a[0], (int)c->a[1]);
+    return r < 0 ? -ABI_EBADF : r;
+}
+static long h_getcwd(struct abi_ctx* c) {
+    const char* cwd = cred_fs_cwd();
+    if (!cwd[0]) cwd = "/";
+    unsigned long n = 0; while (cwd[n]) n++;
+    if (c->a[1] < n + 1) return -34;                   /* ERANGE */
+    if (!abi_w_ok(c->a[0], n + 1)) return -ABI_EFAULT;
+    for (unsigned long i = 0; i <= n; i++) ((char*)(uintptr_t)c->a[0])[i] = cwd[i];
+    return (long)(n + 1);                               /* bytes, NUL included */
+}
+static long h_chdir(struct abi_ctx* c) {
+    char kp[256], canon[96];
+    if (abi_path(c->a[0], kp, sizeof kp) != 0) return -ABI_EFAULT;
+    if (vfs_canonical(kp, canon, sizeof canon) != 0) return -36;       /* ENAMETOOLONG */
+    struct kstat_full st;
+    if (sys_stat_full_k(canon, &st) != 0) return -ABI_ENOENT;
+    if ((st.mode & KS_IFMT) != KS_IFDIR) return -ABI_ENOTDIR;
+    struct task* t = task_current();
+    if (!t) return -ABI_EINVAL;
+    for (unsigned i = 0; i < sizeof t->cred.cwd; i++) { t->cred.cwd[i] = canon[i]; if (!canon[i]) break; }
+    return 0;
+}
+static long h_lnx_sigaction(struct abi_ctx* c) { (void)c; return 0; }
+static long h_getgroups(struct abi_ctx* c) {
+    /* The primary group is the one supplementary group we report: `id` and
+     * friends refuse an error here, and an empty list is a lie about admins. */
+    int size = (int)c->a[0];
+    if (size == 0) return 1;
+    if (size < 0) return -ABI_EINVAL;
+    if (!abi_w_ok(c->a[1], 4)) return -ABI_EFAULT;
+    *(uint32_t*)(uintptr_t)c->a[1] = (uint32_t)guest_gid();
+    return 1;
+}
+
+/* Time: timespec/timeval are two guest words.  CLOCK_GETTIME64 is i386's
+ * time64 variant — the same meaning with 64-bit words whatever the guest. */
+static long abi_put_ts(struct abi_ctx* c, unsigned long up, int wide, uint64_t s, uint64_t sub) {
+    int w = (wide || !c->map || c->map->word_bytes != 4) ? 8 : 4;
+    if (!abi_w_ok(up, 2u * (unsigned)w)) return -ABI_EFAULT;
+    if (w == 8) { ((uint64_t*)(uintptr_t)up)[0] = s; ((uint64_t*)(uintptr_t)up)[1] = sub; }
+    else        { ((uint32_t*)(uintptr_t)up)[0] = (uint32_t)s; ((uint32_t*)(uintptr_t)up)[1] = (uint32_t)sub; }
+    return 0;
+}
+static long h_clock_gettime(struct abi_ctx* c) {
+    struct ktimespec ts;
+    sys_clock_gettime_k((int)c->a[0], &ts);
+    return abi_put_ts(c, c->a[1], 0, ts.sec, ts.nsec);
+}
+static long h_clock_gettime64(struct abi_ctx* c) {
+    struct ktimespec ts;
+    sys_clock_gettime_k((int)c->a[0], &ts);
+    return abi_put_ts(c, c->a[1], 1, ts.sec, ts.nsec);
+}
+static long h_gettimeofday(struct abi_ctx* c) {
+    if (!c->a[0]) return 0;
+    struct ktimespec ts;
+    sys_clock_gettime_k(CLOCK_REALTIME, &ts);
+    return abi_put_ts(c, c->a[0], 0, ts.sec, ts.nsec / 1000);
+}
+static long abi_sleep(struct abi_ctx* c, int which, int abs, unsigned long ureq) {
+    unsigned w = (!c->map || c->map->word_bytes != 4) ? 8 : 4;
+    if (!abi_r_ok(ureq, 2 * w)) return -ABI_EFAULT;
+    uint64_t s  = abi_get_word(c, ureq, 0);
+    uint64_t ns = abi_get_word(c, ureq, 1);
+    uint64_t t = s * 1000000000ull + ns;
+    if (abs && which == CLOCK_REALTIME) {
+        /* An absolute WALL-CLOCK deadline: the kernel's sleep timeline is the
+         * monotonic one, so convert to "how long from now" here — otherwise a
+         * 2026 deadline on a since-boot timeline is a sleep that never ends. */
+        struct ktimespec now;
+        sys_clock_gettime_k(CLOCK_REALTIME, &now);
+        uint64_t n = (uint64_t)now.sec * 1000000000ull + now.nsec;
+        t = t > n ? t - n : 0;
+        abs = 0;
+    }
+    long r = sys_clock_nanosleep_ns(which, abs, t);
+    return r < 0 ? -4 /* EINTR */ : 0;
+}
+static long h_nanosleep(struct abi_ctx* c)       { return abi_sleep(c, 1, 0, c->a[0]); }
+static long h_clock_nanosleep(struct abi_ctx* c) {
+    long r = abi_sleep(c, (int)c->a[0], (c->a[1] & 1) ? 1 : 0, c->a[2]);   /* TIMER_ABSTIME */
+    return r < 0 ? -r : 0;                    /* clock_nanosleep returns the error, not -1 */
+}
+
 /* --- operations whose translation is NOT one-to-one ------------------------
  *
  * These are the ones that justify having a canonical vocabulary at all: each
@@ -81,11 +411,7 @@ static long h_getppid(struct abi_ctx* c) {
 /* Linux errno values the guests share.  Only the handful the engine itself
  * returns; a guest ABI whose errno space differs would translate in its own
  * adapter rather than here. */
-#define ABI_ENOTTY 25
-#define ABI_ENOSYS 38
-#define ABI_EFAULT 14
-#define ABI_EINVAL 22
-#define ABI_ENOMEM 12
+/* (the errno values themselves are defined at the top of the file) */
 
 /* Is [uptr, uptr+len) a writable GUEST address in the active space?  The check
  * lives here, in the handler, because this is where the pointer's ORIGIN is
@@ -776,6 +1102,45 @@ static const struct {
     [ABI_SHUTDOWN]     = { "shutdown",     h_shutdown     },
     [ABI_SETSOCKOPT]   = { "setsockopt",   h_setsockopt   },
     [ABI_GETSOCKOPT]   = { "getsockopt",   h_getsockopt   },
+    [ABI_MKDIR]        = { "mkdir",        h_mkdir        },
+    [ABI_MKDIRAT]      = { "mkdirat",      h_mkdirat      },
+    [ABI_LINK]         = { "link",         h_link         },
+    [ABI_LINKAT]       = { "linkat",       h_linkat       },
+    [ABI_CHMOD]        = { "chmod",        h_chmod        },
+    [ABI_FCHMODAT]     = { "fchmodat",     h_fchmodat     },
+    [ABI_UNLINK]       = { "unlink",       h_unlink       },
+    [ABI_UNLINKAT]     = { "unlinkat",     h_unlinkat     },
+    [ABI_GETUID]       = { "getuid",       h_getuid       },
+    [ABI_GETEUID]      = { "geteuid",      h_getuid       },
+    [ABI_GETGID]       = { "getgid",       h_getgid       },
+    [ABI_GETEGID]      = { "getegid",      h_getgid       },
+    [ABI_SETUID]       = { "setuid",       h_setuid       },
+    [ABI_SETGID]       = { "setgid",       h_setgid       },
+    [ABI_GETGROUPS]    = { "getgroups",    h_getgroups    },
+    [ABI_GETCWD]       = { "getcwd",       h_getcwd       },
+    [ABI_CHDIR]        = { "chdir",        h_chdir        },
+    [ABI_LNX_SIGACTION] = { "rt_sigaction", h_lnx_sigaction },
+    [ABI_OPEN]         = { "open",         h_open         },
+    [ABI_OPENAT]       = { "openat",       h_openat       },
+    [ABI_STAT]         = { "stat",         h_stat         },
+    [ABI_FSTAT]        = { "fstat",        h_fstat        },
+    [ABI_FSTATAT]      = { "fstatat",      h_fstatat      },
+    [ABI_GETDENTS64]   = { "getdents64",   h_getdents64   },
+    [ABI_FCNTL]        = { "fcntl",        h_fcntl        },
+    [ABI_ACCESS]       = { "access",       h_access       },
+    [ABI_FACCESSAT]    = { "faccessat",    h_faccessat    },
+    [ABI_READLINK]     = { "readlink",     h_readlink     },
+    [ABI_READLINKAT]   = { "readlinkat",   h_readlinkat   },
+    [ABI_SENDFILE]     = { "sendfile",     h_sendfile     },
+    [ABI_UNAME]        = { "uname",        h_uname        },
+    [ABI_DUP]          = { "dup",          h_dup          },
+    [ABI_DUP2]         = { "dup2",         h_dup2         },
+    [ABI_DUP3]         = { "dup3",         h_dup3         },
+    [ABI_CLOCK_GETTIME]   = { "clock_gettime",   h_clock_gettime   },
+    [ABI_CLOCK_GETTIME64] = { "clock_gettime64", h_clock_gettime64 },
+    [ABI_GETTIMEOFDAY]    = { "gettimeofday",    h_gettimeofday    },
+    [ABI_NANOSLEEP]       = { "nanosleep",       h_nanosleep       },
+    [ABI_CLOCK_NANOSLEEP] = { "clock_nanosleep", h_clock_nanosleep },
 };
 
 enum abi_op abi_lookup(const struct abi_map* map, unsigned long nr) {
@@ -795,19 +1160,60 @@ int abi_invoke(enum abi_op op, struct abi_ctx* c, long* out) {
     return 1;
 }
 
+/* §M73 — `strace`: every guest call of the traced task(s), with its result.
+ * 0 = off, >0 = that pid, -1 = every task in a container.  Built the day a
+ * busybox shell sat asleep in the kernel with nothing to say which call had
+ * put it there; a guest program is exactly the code this kernel did not
+ * write, so "what did it ask for" is the first question and deserves a
+ * permanent answer.  Calls the engine does not name are still printed (as
+ * "-> arch switch"), so a trace has no gaps. */
+static volatile int g_trace;
+static int abi_traced(void) {
+    int t = g_trace;
+    if (!t) return 0;
+    struct task* me = task_current();
+    if (!me) return 0;
+    return t > 0 ? me->pid == t : me->cred.container != 0;
+}
+
 int abi_dispatch(const struct abi_map* map, unsigned long nr,
                  unsigned long a0, unsigned long a1, unsigned long a2,
                  unsigned long a3, unsigned long a4, unsigned long a5,
                  long* out) {
     enum abi_op op = abi_lookup(map, nr);
-    if (op == ABI_OP_NONE) return 0;
+    { struct task* me = task_current(); if (me) me->guest_nr = (int)nr + 1; }
+    int tr = abi_traced();
+    if (op == ABI_OP_NONE) {
+        if (tr) kprintf("strace[%d] #%lu(%lx, %lx, %lx) -> arch switch\n",
+                        task_current()->pid, nr, a0, a1, a2);
+        return 0;
+    }
     struct abi_ctx c;
     c.a[0] = a0; c.a[1] = a1; c.a[2] = a2;
     c.a[3] = a3; c.a[4] = a4; c.a[5] = a5;
     c.nr   = nr;
     c.map  = map;
-    return abi_invoke(op, &c, out);
+    if (tr) kprintf("strace[%d] %s(%lx, %lx, %lx, %lx) ...\n", task_current()->pid,
+                    g_ops[op].name ? g_ops[op].name : "?", a0, a1, a2, a3);
+    int ran = abi_invoke(op, &c, out);
+    if (tr) kprintf("strace[%d]   = %ld\n", task_current()->pid, ran ? *out : -38L);
+    return ran;
 }
+
+static void cmd_strace(const char* args) {
+    const char* a = args ? args : "";
+    while (*a == ' ') a++;
+    if (!*a) { kprintf("strace: %s\n", g_trace == 0 ? "off" : g_trace < 0 ? "every container task" : "one pid"); return; }
+    if (a[0] == 'c') { g_trace = -1; kprintf("strace: tracing every task in a container\n"); return; }
+    if (a[0] == 'o') { g_trace = 0;  kprintf("strace: off\n"); return; }
+    int v = 0;
+    while (*a >= '0' && *a <= '9') v = v * 10 + (*a++ - '0');
+    g_trace = v;
+    kprintf("strace: %s\n", v ? "tracing that pid" : "off");
+}
+SHELL_CMD(strace) = { "strace", "[<pid> | ctr | off]",
+                      "print every guest (Linux-ABI) syscall of a task, with its result",
+                      SHELL_G_TASK, cmd_strace, SHELL_P_ADMIN };
 
 void abi_stats(int* ops_with_handlers, int* ops_total) {
     int n = 0;

@@ -82,6 +82,15 @@ struct ofile* ofile_ref(struct ofile* o) {
     return o;
 }
 
+struct ofile* fd_dup_source(int fd, int* fresh) {
+    *fresh = 0;
+    struct ofile* o = fd_lookup(fd);
+    if (o || fd < 0 || fd > 2) return o;
+    o = ofile_alloc(FD_CONSOLE);
+    if (o) *fresh = 1;
+    return o;
+}
+
 void ofile_unref(struct ofile* o) {
     if (!o) return;
     if (--o->refcount > 0) return;
@@ -92,6 +101,7 @@ void ofile_unref(struct ofile* o) {
         case FD_NETSOCK: if (o->nsock) netsock_close(o->nsock); break;
         case FD_TIMER:   if (o->tfd)   timerfd_close(o->tfd);    break;
         case FD_EPOLL:   if (o->ep)    epoll_close(o->ep);       break;
+        case FD_CONSOLE: break;                   /* nothing behind it */
     }
     kfree(o);
 }

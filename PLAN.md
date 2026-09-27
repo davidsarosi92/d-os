@@ -129,8 +129,8 @@ kmap / PAE; non-blocking fetcher `poll` |
 | §M70 | ✅ **The shell became a registry, and gui.c became eight files (SHIPPED, DOCS §4.86)** — `SHELL_CMD()` in a linker section, one rule making the ordering bug unrepresentable (a verb owns its whole argument tail), `help` GENERATED, and both shells walking one registry: shell.c 4467 → 669, dispatch arms 172 → 0, commands reachable on ARM ~60 → 167.  The compositor split behind a THIRD header tier (`gui_priv.h`): gui.c 5620 → 1635 plus input/compose/wm/app_host/gterm/gui_diag/gui_mode, with a before/after benchmark reported honestly as **no measurable change** | — |
 | §M71 | ✅ **Runtime invariant audits (SHIPPED, DOCS §4.87)** — `AUDIT()` with four rules stated in its header (a check must be able to FAIL; it reports what it OBSERVED; it distinguishes "cannot check" from "checked, clean"; it does NOT fix anything).  Three checks + shipped falsifiers + a cron schedule, because the runs most worth auditing are the ones where `audit` cannot be typed.  **It found a real bug on its first run:** the SYS_EXIT teleport never unwinds the dispatcher, so a ring-3 excursion left the pointer gate armed forever — pid 0 carried it from boot on every ARM machine | — |
 | §M72 | ✅ **A reserve the system keeps, and a program you can pause** — SHIPPED 2026-09-27, DOCS §4.111: `mem.reserve_kb` / `fs.reserve_kb` refuse, `df`; `TASK_STOPPED` + `stop`/`cont`; pause + evict with the slot in the non-present PTE, `AUDIT(swap-runnable)`, `evicttest` | ~4735 |
-| §M73 | **Containers — running a Docker image** — design + scoping.  The capability, not the impression: a per-process filesystem root (the one genuinely missing primitive), an image as a §M35.5 store artifact, identity from §M32, caps from §M49+§M72.  Docker compat is the validation target.  Network isolation is where the honest report has to say "not isolated" | ~4880 |
-| §M74 | **Swap and demand paging** — design.  §M72 builds the mechanism against a QUIESCENT process; this aims it by pressure at a RUNNING one, which brings back the race and adds the question §M72 never asks (*which page*).  Four rungs: an accessed-bit sweep (nothing reads the hardware's own usage data), a page cache, anonymous swap-out, thrash control.  **The reserve is never the swap nor on it** — pinned physical frames, swap excluded from the free-memory figure the watermark reads, and a writeout path that allocates nothing.  Off by default, size configurable and equal to the ceiling; `off` still reclaims clean pages | ~4880 |
+| §M73 | ✅ **Containers — running a Docker image (SHIPPED, DOCS §4.115)** —  The capability, not the impression: a per-process filesystem root (the one genuinely missing primitive), an image as a §M35.5 store artifact, identity from §M32, caps from §M49+§M72.  Docker compat is the validation target.  Network isolation is where the honest report has to say "not isolated" | ~4880 |
+| §M74 | ✅ **Swap and demand paging (SHIPPED, DOCS §4.112-§4.114)** —  §M72 builds the mechanism against a QUIESCENT process; this aims it by pressure at a RUNNING one, which brings back the race and adds the question §M72 never asks (*which page*).  Four rungs: an accessed-bit sweep (nothing reads the hardware's own usage data), a page cache, anonymous swap-out, thrash control.  **The reserve is never the swap nor on it** — pinned physical frames, swap excluded from the free-memory figure the watermark reads, and a writeout path that allocates nothing.  Off by default, size configurable and equal to the ceiling; `off` still reclaims clean pages | ~4880 |
 | §M75 | **Task Manager rework** — design.  Two new per-process columns (memory needs the one genuinely new accounting, and `vmm.c` exists THREE times — three counters would disagree invisibly), four system-wide 1 Hz charts (CPU/mem free, network per-device free, I/O needs counters `block.c` has none of), a Total under the table and not in it.  Each chart damages only itself, measured with `gui.stats_ms` | ~4880 |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
@@ -211,7 +211,9 @@ backlog.
 ### Open work — exact state (2026-09-27)
 
 Agreed order: **(1) finish what is half done**, **(2) §M82, §M72, §M74, §M73**
-(any order; §M74 is gated on §M72), **(3) §M81**.  A defect found on the way is
+(any order; §M74 is gated on §M72) — ALL DONE 2026-09-28, **(3) the queued UI
+items (swap page, translations, system summary), then §M81**, then §M88
+(monitors) and §M89 (Java).  A defect found on the way is
 fixed first, whatever it touches.
 
 | Milestone | Done | Open |
@@ -226,7 +228,10 @@ fixed first, whatever it touches.
 | §M82 | ✅ complete (§4.110) | — (two live desktops at once) |
 | §M72 | ✅ complete (§4.111) | — (eviction faults pages back: §M74) |
 | §M74 | ✅ complete (§4.112-§4.114) | — (multi-threaded victims, swap compression) |
-| §M73 | — | designed, not started |
+| §M73 | ✅ complete — rungs 1-3 (§4.115) | — (resource caps per container, network namespace, registry pull) |
+| queued UI | — | Memory/swap page in the Control Panel; translations re-measured; a system summary page (NEXT.md "Queued from use") |
+| §M88 | — | multiple monitors — asked for 2026-09-27, not designed yet |
+| §M89 | — | Java: a JRE (and the JDK with it) — asked for 2026-09-28, scoped below; in the queue after §M81 and §M88 |
 | §M68 | — | investigation, not started |
 | §M83, §M84 | — | designed, not started |
 
@@ -304,7 +309,7 @@ what); a session can pick a theme and push on it.
 | M70 | **The shell became a registry, and gui.c became eight files** — `SHELL_CMD()` (a verb owns its argument tail, generated `help`, one copy for both shells: ARM went ~60 → 167 commands); the compositor split behind `gui_priv.h` | Architecture | ✅ DOCS §4.86 |
 | M71 | **Runtime invariant audits** — `AUDIT()` registry with four rules, three checks (driver placement / driver resources / ring-3 boundary), shipped falsifiers, cron-driven so the runs worth auditing are covered.  Found a real cross-arch bug: the SYS_EXIT teleport left the ring-3 pointer gate armed, so pid 0 carried it from boot on every ARM machine | Architecture / Security | ✅ DOCS §4.87 |
 | M72 | ✅ **A reserve the system keeps, and a program you can pause** — shipped, DOCS §4.111 | Resilience | §M72 |
-| M73 | **Containers — running a Docker image** — the capability (per-process filesystem root, image as a store artifact, identity + resource caps), with Docker compat as the validation target rather than the specification.  §M32 is the gate | Userland / Security | §M73 — design + scoping |
+| M73 | ✅ **Containers — running a Docker image** — shipped, DOCS §4.115: a real OCI image as its own root and uid, `ctrescapetest`, `AUDIT(container-root)` | Userland / Security | §M73 |
 | M74 | ✅ **Swap and demand paging** — shipped, DOCS §4.112-§4.114 | Memory | §M74 |
 | M75 | **Task Manager: what each process is costing** — ✅ **SHIPPED 2026-09-10 (DOCS §4.88)**: per-process MEM (portable policy over three arch walkers; verified by DIFFERENCE on all three, same 1028 KB constant) + CPU% (a delta over §M53's clock, keyed by PID where damage is keyed by slot), a `blk_read/write/flush` request path that did not exist, a kernel history ring sampled by a service so the window is a VIEW, `WIDGET_CLASS("chart")`, and the Total as the footer.  **Its own instrument found the biggest cost in the tree: the GUI is 50 % of a 4-CPU box AT REST** — §M49's open item, never before given a number.  OWNER still gated on §M32 | UX / Instrumentation | ✅ DOCS §4.88 |
 | M76 | **The aarch64 native syscall dispatcher — SWEPT** — ✅ **SHIPPED 2026-09-10 (DOCS §4.89)**: 26 of i386's 60 cases → **60 of 60**.  Found while §M75's own falsifier drowned an ARM log in `unknown number 35`; every native program using sockets, stat/getdents, threads, getrandom, uname or the dosgui bridge was **silently x86-only**, and the failure is a log line and a -1 rather than a link error, which is why it survived from §M25 to §M75.  **The blocker was the HARNESS, not the sweep** — `uidemo` could not be started on ARM at all (§4.74), so `gui.autorun` had to exist first.  Three cases are REFUSED WITH A REASON rather than wired: aarch64 has no I/O address space, and a driver told its port window was granted would fault at first access | Architecture | ✅ DOCS §4.89 |
@@ -315,6 +320,7 @@ what); a session can pick a theme and push on it.
 | M85 | **aarch64 beyond `virt`: QEMU `sbsa-ref`** — asked for directly (2026-09-25).  The ARM port knows exactly ONE machine: ten places hardcode `virt`'s map (GICv2 at `0x08000000`, PL011 at `0x09000000`, virtio-mmio at `0x0a000000`, ECAM at `0x40_1000_0000`, RAM at `0x4000_0000`, the DTB loaded at `0x4800_0000`).  `sbsa-ref` is the reference for a STANDARD ARM server: firmware boot (TF-A + EDK2, UEFI), ACPI instead of a device tree, GICv3, devices on PCIe rather than virtio-mmio.  The deliverable is a port that DISCOVERS its board — which is also the precondition for any real phone (§M84) | Platform / Portability | ✅ COMPLETE (DOCS §4.99-§4.102, §4.105): board discovery, GICv3, UEFI + ACPI, relocatable kernel, disk/USB/network, bochs-display, PCI INTx routing (`_PRT` / `interrupt-map`).  Left for later: a real clock on sbsa-ref (UEFI runtime GetTime), a Normal-NC framebuffer mapping |
 | M86 | **Memory beyond the 4 GiB line on i386 and aarch64** — asked for directly (2026-09-25).  x86_64 already discovers its ceiling (§M48, verified to 128 GiB).  i386 manages only what its 1 GiB identity map covers (473 MiB free on a 512 MiB box; RAM past 1 GiB unused) and cannot address physical memory above 4 GiB at all without PAE; aarch64's early MMU identity-maps 0-4 GiB in 1 GiB blocks with RAM from `0x4000_0000`, so at most ~3 GiB is usable and `hal_extend_identity_map` caps at 4 GiB | Memory / Portability | ✅ COMPLETE (highmem §4.94, PAE §4.96, aarch64 TTBR1 §4.97, multi-range DTB §4.98, user no-execute on x86 §4.104).  Kernel pages stay executable (modules run from the heap) |
 | M87 | **Network and storage in the Control Panel** — asked for directly (2026-09-27): a Network page, a taskbar network indicator with a Wi-Fi chooser, disk management with its functions, and the missing translations | UX / Network / Storage | §M87 — ✅ SHIPPED (DOCS §4.103): six-state network status, link state, admin down, static config keys, a simulated Wi-Fi adapter (QEMU has no Wi-Fi), `vfs_umount` + holds, an exFAT formatter (fsck-clean), RAM disks, `locale missing`; open: a real Wi-Fi driver, partition tables, a second virtio disk |
+| M89 | **Java — a JRE, and the JDK with it** — asked for directly (2026-09-28): Alpine's musl-built OpenJDK as a §M73 image on x86_64 + aarch64 (i386: no current JDK exists).  Needs a real address-space layer (reservations, demand-zero, PROT_NONE, lazy file maps), Linux signal delivery with siginfo/ucontext, arm64 threads, and a bulk of small calls | Userland | §M89 — scoped, not started |
 
 ### Cross-cutting constraints
 
@@ -5720,7 +5726,20 @@ milestone with no blocker at all.**
 
 ## §M73 — Containers: running a Docker image, and what that actually costs
 
-**Status: design + scoping.  Asked for directly (2026-09-09): "docker
+**Status: SHIPPED 2026-09-28 — rungs 1-3, DOCS §4.115.**  A real `busybox:musl`
+OCI archive unpacked in ring 3, run as its own uid against its own root, with a
+working directory, `ctrescapetest` and `AUDIT(container-root)` on all three
+arches.  Lessons: the Linux ABI had to be CONSOLIDATED (arm64 could not open a
+file; x86 had the calls as two hand-written copies) — the stat layout became
+data in the guest map; and two races only the storm found — `task_wait` never
+retrying a refused reap, and `task_exit_code` reading "which CPU, then its
+current" in two steps, marking another task dead after a migration (the
+2026-09-25 `task_current()` fix, missed in its twin).  A silently truncating
+argument buffer looked exactly like a kernel hang; limits refuse now.  Open:
+per-container resource caps (rung 4), network (rung 5, shared and said so), a
+registry pull.
+
+**Original status: design + scoping.  Asked for directly (2026-09-09): "docker
 futtatása valamilyen formában".**  The scoping is most of the value here,
 because "some form of Docker" spans a two-afternoon feature and a multi-year
 one, and this tree's own §DRV rule ("Linux-inspired, not Linux-bound — reject
@@ -5797,6 +5816,90 @@ more than that would be the same theatre §M33 spent a milestone refusing.
 **Prerequisites, in order:** §M32 (identity) → §M72 (accounting + reserve) →
 rung 1 (per-process root) → the rest.  **§M32 is the gate**, which is a second
 independent reason it should be the next milestone.
+
+---
+
+## §M89 — Java: a JRE, and the JDK with it
+
+**Status: scoped, not started.  Asked for 2026-09-28: "JRE futtatás valamilyen
+formában, hogy java programok el tudjanak indulni; ha nem sokkal nagyobb
+effort, akkor JDK is" — to be queued only if it is not larger than the largest
+milestone so far.**
+
+### The estimate, and the verdict on the size rule
+
+**It is large — one of the five biggest things in this plan — but NOT larger
+than the largest so far**, which are M21 (the whole aarch64 port, stages A-M)
+and §M69 (the Console Plate port: fonts, controls, localisation, scrolling).  So
+it is queued.  **The JDK is nearly free once the JRE runs**: `javac` is a Java
+program inside the same VM (the `jdk.compiler` module), so the JDK costs a
+larger image and more memory, not more kernel work — and `java Hello.java` (the
+single-file source launcher, which compiles in memory) is the natural test, so
+the milestone targets the JDK directly.
+
+### The route: not a port — an image, through §M73
+
+Porting OpenJDK would be the wrong first move.  **Alpine's OpenJDK is already
+built against musl**, and §M73 runs unmodified musl binaries from an OCI image.
+So the route is: `eclipse-temurin:<n>-jdk-alpine` (x86_64 and aarch64) as a
+container, `java -version`, then `java Hello.java`.  **i386 is out of scope,
+stated rather than discovered**: OpenJDK removed its 32-bit x86 Linux port
+(deprecated in 24, removed in 25), and no current Alpine JDK ships for it.
+
+### What is missing, measured against the tree (2026-09-28)
+
+HotSpot is the most demanding ordinary Linux program there is — it treats the
+virtual-memory system and the signal system as parts of its own machinery.
+
+1. **A real address-space layer (the big one).**  Today an anonymous `mmap`
+   allocates and zeroes EVERY frame up front, one mapping is capped at 256 MB,
+   addresses come from a bump cursor that is never reused, and `PROT_NONE` maps
+   a present page.  HotSpot RESERVES large ranges (heap, code cache, metaspace —
+   hundreds of MB to GBs of address space) with `PROT_NONE`/`MAP_NORESERVE` and
+   commits pieces with `mprotect`; its guard pages below every thread stack
+   must FAULT.  Needed: a VMA list per space (mmap/munmap/mprotect over ranges,
+   address reuse, holes), demand-zero anonymous pages (the fault path §M74
+   already has for swap-in is the model), true `PROT_NONE`, and lazy file
+   mappings for the ~130 MB `lib/modules` jimage (§M74's page cache is the
+   backing).  Useful on its own: it ends the bump-allocator leak and makes every
+   large program cheaper.
+2. **Linux signals, delivered.**  `rt_sigaction` is accepted and ignored today,
+   and a ring-3 fault kills the process.  HotSpot installs SIGSEGV/SIGBUS
+   handlers and EXPECTS them to run: stack banging and guard pages, implicit
+   null checks in compiled code, safepoint polls, and inter-thread signals
+   (SR_signum) for suspend/resume.  Needed per arch: `siginfo_t` + `ucontext_t`
+   with the machine context, `rt_sigreturn`, `sigaltstack`, SA_SIGINFO /
+   SA_RESTART / SA_ONSTACK, synchronous fault → signal with `si_addr`, and
+   `tgkill` to a specific thread.  The native §M34 signals are the skeleton.
+3. **Threads on arm64.**  `clone(CLONE_VM)` still says "threads are A4" on ARM;
+   x86_64 has them (§M40 stage 9).  The JVM starts ~15 threads before `main`.
+4. **The small surface, in bulk:** `readlink("/proc/self/exe")` (the launcher
+   finds JAVA_HOME this way — readlink answers EINVAL for everything today),
+   `/proc/self/maps`, `/proc/cpuinfo`, `/proc/meminfo`, `sysinfo`,
+   `prlimit64`/`getrlimit`, `sched_getcpu`, `membarrier` for real, `madvise
+   (MADV_DONTNEED)` that actually drops pages, `statfs`, `ftruncate` on files,
+   `pread`/`pwrite` everywhere, symlinks tolerated in the image.
+5. **Getting the image in.**  A JDK image is 150-200 MB unpacked — it cannot
+   ride in the kernel like busybox.  Either a host script that copies an OCI
+   archive onto the exFAT disk image, or a registry pull over §M39's TLS (the
+   §M73 rung-6 work, done properly).  The first is enough for the milestone.
+6. **Memory:** a JVM with `-Xmx64m` wants ~250-300 MB resident; the harness
+   default must grow, and §M74's swap is the cushion.
+
+### Rungs, each shippable
+
+1. The VMA layer + demand-zero + PROT_NONE (all three arches; `mmaptest` that
+   reserves 4 GB and touches three pages).
+2. Linux signal delivery with siginfo/ucontext (a musl test that catches its
+   own SIGSEGV, reads `si_addr`, fixes the page and returns).
+3. arm64 Linux threads.
+4. The JDK image on the disk; `java -version`; then `java Hello.java`; then a
+   program that spawns threads and allocates past a GC.
+5. Measure: startup time, resident memory, and what `-Xint` vs the JIT costs
+   under emulation — the honest report of how usable it is.
+
+**What it deliberately is NOT:** not a Java port, not a JVM written here, and
+not i386.
 
 ---
 
@@ -7562,6 +7665,15 @@ of a big window over the icon field still composites at §4.61's measured cost.
 ---
 
 ## Change log
+
+- **2026-09-28** — **§M73 shipped (DOCS §4.115); §M89 (Java) scoped and
+  queued.**  Containers run a real busybox image as their own root and uid on
+  all three arches; the Linux file/time/identity calls became shared §M50
+  operations with the guest's `struct stat` as data.  Two scheduler races fixed
+  on the way (`task_wait` never retrying a refused reap; `task_exit_code`'s
+  two-step "which CPU, then its current" marking another task dead).  §M89 is
+  judged large but not larger than M21 or §M69, so it is queued; the JDK rides
+  along because `javac` is a Java program.
 
 - **2026-09-17** — **§M32 stage 10: the lock surface, and a silence that took
   four runs to read.**  A modal authentication window (`gui.login`), a SECRET

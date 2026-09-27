@@ -168,6 +168,40 @@ enum abi_op {
     ABI_SHUTDOWN,
     ABI_SETSOCKOPT,
     ABI_GETSOCKOPT,
+    /* §M73 — directory calls, each in its plain and *at form (the *at forms
+     * accept only AT_FDCWD: this VFS has no directory descriptors). */
+    ABI_MKDIR, ABI_MKDIRAT, ABI_LINK, ABI_LINKAT, ABI_CHMOD, ABI_FCHMODAT,
+    ABI_UNLINK, ABI_UNLINKAT,
+    /* §M73 — identity.  The answer is the task's §M32 credential: a container
+     * program asks "who am I" and must hear its container's uid, not a
+     * constant.  set* change nothing — they succeed only when asked for the
+     * identity already held (what a program dropping privileges it never had
+     * does) and refuse anything else, because ring 3 never picks its uid. */
+    ABI_GETUID, ABI_GETEUID, ABI_GETGID, ABI_GETEGID, ABI_SETUID, ABI_SETGID,
+    ABI_GETGROUPS,
+    /* §M73 — the file and time calls, moved out of the per-arch switches.
+     * They were written TWICE (i386, amd64) and not at all for arm64, which is
+     * why an unmodified busybox on ARM could not open a file.  Every layout
+     * difference between the guests is DATA in the map (abi_stat_layout, the
+     * word size, O_DIRECTORY's bit), so there is one handler per meaning. */
+    ABI_OPEN, ABI_OPENAT,
+    ABI_STAT, ABI_FSTAT, ABI_FSTATAT,      /* lstat == stat: this VFS has no symlinks */
+    ABI_GETDENTS64,
+    ABI_FCNTL,
+    ABI_ACCESS, ABI_FACCESSAT,
+    ABI_READLINK, ABI_READLINKAT,
+    ABI_SENDFILE,
+    ABI_UNAME,
+    ABI_DUP, ABI_DUP2, ABI_DUP3,
+    ABI_CLOCK_GETTIME, ABI_CLOCK_GETTIME64, ABI_GETTIMEOFDAY,   /* timespec/timeval at the guest's word size */
+    ABI_NANOSLEEP, ABI_CLOCK_NANOSLEEP,
+    /* The working directory: cred.cwd, a canonical path the VFS joins every
+     * relative path to.  chdir checks the target is a directory first. */
+    ABI_GETCWD, ABI_CHDIR,
+    /* Linux signal handlers are accepted and NOT delivered (the native §M34
+     * signals are; the Linux-ABI half is an open item).  One answer for every
+     * guest, where it used to be two switch cases and a gap on arm64. */
+    ABI_LNX_SIGACTION,
 
     ABI_OP_MAX
 };
@@ -206,6 +240,19 @@ struct abi_nument {
     uint16_t op;                /* enum abi_op */
 };
 
+/* §M73 — where each `struct stat` field lives in a guest, and how wide it
+ * is.  Three guests, three layouts (i386's stat64 even carries the inode
+ * number twice), and the only honest way to share one handler across them is
+ * to describe the layout rather than to #ifdef it.  0xFF = the guest has no
+ * such field.  Widths are in bytes. */
+struct abi_stat_layout {
+    uint8_t bytes;                          /* sizeof(struct stat) in the guest */
+    uint8_t dev, ino, ino_w, ino32;         /* ino32: i386's legacy low word    */
+    uint8_t mode, nlink, nlink_w, uid, gid;
+    uint8_t size, blksize, blksize_w, blocks;
+    uint8_t atime, mtime, ctime, time_w;    /* seconds fields                   */
+};
+
 struct abi_map {
     const char*             name;       /* "linux/amd64" — appears in diagnostics */
     const struct abi_nument* ents;
@@ -225,6 +272,10 @@ struct abi_map {
      * so it is not derivable from the word size and never was.  See the
      * ABI_EPOLL_* note above. */
     uint8_t                 epoll_event_bytes;
+    /* §M73 — the guest's struct stat, and the one open flag whose bit differs
+     * between the guests (O_DIRECTORY: 0200000 on x86, 040000 on arm64). */
+    const struct abi_stat_layout* stat;
+    uint32_t                o_directory;
 };
 
 /* Look up a guest number.  Returns ABI_OP_NONE when the map does not name it,

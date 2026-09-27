@@ -302,6 +302,11 @@ static void syscall_dispatch_body(struct int_frame* f) {
             f->rax = (uint64_t)sys_getpeername((int)f->rbx, (uint32_t*)(uintptr_t)f->rcx,
                                                (int*)(uintptr_t)f->rdx);
             return;
+        /* §M73 — directory calls. */
+        case SYS_MKDIR:  f->rax = (uint64_t)(int64_t)sys_mkdir((const char*)(uintptr_t)f->rbx, (int)f->rcx); return;
+        case SYS_LINK:   f->rax = (uint64_t)(int64_t)sys_link((const char*)(uintptr_t)f->rbx, (const char*)(uintptr_t)f->rcx); return;
+        case SYS_CHMOD:  f->rax = (uint64_t)(int64_t)sys_chmod((const char*)(uintptr_t)f->rbx, (int)f->rcx); return;
+        case SYS_UNLINK: f->rax = (uint64_t)(int64_t)sys_unlink((const char*)(uintptr_t)f->rbx); return;
         case SYS_CONNECT:
             f->rax = (uint64_t)sys_connect((int)f->rbx, (uint32_t)f->rcx, (int)f->rdx);
             return;

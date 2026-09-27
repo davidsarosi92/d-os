@@ -35,6 +35,7 @@
 struct ramfs_file {
     char*  data;
     size_t cap;
+    int    nlink;      /* §M73 — names pointing at this file; freed at 0 */
 };
 
 /* ------------------------------------------------------------------- */
@@ -75,6 +76,7 @@ static struct inode* ramfs_alloc_inode(enum inode_type type) {
         if (!rf) { kfree(ino); return NULL; }
         rf->data = NULL;
         rf->cap  = 0;
+        rf->nlink = 1;
         ino->private = rf;
     }
     return ino;
@@ -111,6 +113,8 @@ static int rfs_unlink_op(struct inode* dir, const char* name,
     if (!child) return -1;
     if (child->type == INODE_FILE) {
         struct ramfs_file* rf = (struct ramfs_file*)child->private;
+        /* §M73 — another name still points here: only this one goes. */
+        if (rf && rf->nlink > 1) { rf->nlink--; return 0; }
         if (rf) {
             if (rf->data) kfree(rf->data);
             kfree(rf);
@@ -128,12 +132,22 @@ static int rfs_rename_op(struct inode* dir, const char* oldname,
     return child ? 0 : -1;
 }
 
+static int rfs_link_op(struct inode* dir, const char* name, struct inode* target) {
+    (void)dir; (void)name;
+    if (!target || target->type != INODE_FILE) return -1;
+    struct ramfs_file* rf = (struct ramfs_file*)target->private;
+    if (!rf) return -1;
+    rf->nlink++;
+    return 0;
+}
+
 static const struct inode_ops ramfs_inode_ops = {
     .lookup = NULL,                  /* eager tree */
     .create = rfs_create_op,
     .mkdir  = rfs_mkdir_op,
     .unlink = rfs_unlink_op,         /* M22.1 — file manager Delete */
     .rename = rfs_rename_op,         /* M22.5 — file manager Rename */
+    .link   = rfs_link_op,           /* §M73 — hard links */
 };
 
 /* ------------------------------------------------------------------- */

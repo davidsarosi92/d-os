@@ -51,6 +51,20 @@ void cred_init_kernel(struct cred* c) {
     c->ngroups = 0;
     c->session = CRED_SESSION_NONE;
     for (int i = 0; i < CRED_MAX_GROUPS; i++) c->groups[i] = CRED_UID_NONE;
+    c->root = NULL;
+    c->container = 0;
+    c->cwd[0] = 0;
+}
+
+/* §M73 — the filesystem root the CURRENT task resolves "/" against; NULL
+ * means the machine's.  The VFS asks this once per path. */
+struct dentry* cred_fs_root(void) {
+    struct task* t = task_current();
+    return t ? t->cred.root : NULL;
+}
+const char* cred_fs_cwd(void) {
+    struct task* t = task_current();
+    return t ? t->cred.cwd : "";
 }
 
 void cred_inherit(struct cred* child, const struct cred* parent) {
@@ -137,6 +151,11 @@ int cred_become_user(int pid, int uid, int gid,
         nc.groups[nc.ngroups++] = groups[i];
     }
 
+    /* §M73 — becoming a user does not leave a container: the root and the
+     * container id belong to where the task runs, not to who it is. */
+    nc.root = t->cred.root;
+    nc.container = t->cred.container;
+    for (unsigned i = 0; i < sizeof nc.cwd; i++) nc.cwd[i] = t->cred.cwd[i];
     t->cred = nc;
     t->cred_seq++;
     return 0;
@@ -231,7 +250,8 @@ const struct cred* cred_current(void) {
         TASK_OWNER_KERNEL, CRED_UID_NONE, CRED_UID_NONE, 0,
         { CRED_UID_NONE, CRED_UID_NONE, CRED_UID_NONE, CRED_UID_NONE,
           CRED_UID_NONE, CRED_UID_NONE, CRED_UID_NONE, CRED_UID_NONE },
-        CRED_SESSION_NONE
+        CRED_SESSION_NONE,
+        NULL, 0, ""                      /* §M73 — the machine's root, no container, cwd "/" */
     };
     struct task* t = task_current();
     /* Before task_init, or on a CPU that has not taken a task yet.  "There is

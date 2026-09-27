@@ -139,6 +139,13 @@ struct inode_ops {
      * back rather than enforce something the disk will forget.  NULL = the
      * fs does not store ownership (then fs_type.stores_ownership is 0). */
     int (*setattr)(struct inode* dir, const char* name, struct inode* child);
+    /* §M73 (2026-09-27) — OPTIONAL, APPENDED.  A second NAME for an existing
+     * regular file in `dir` (a hard link).  The fs counts names so that unlink
+     * frees the data only with the last one; the VFS attaches the dentry.
+     * NULL = unsupported (exFAT has no links).  Needed because a container
+     * image's /bin is one busybox and hundreds of links to it — copies would
+     * be hundreds of megabytes. */
+    int (*link)(struct inode* dir, const char* name, struct inode* target);
 };
 
 /* Inode — owned by the fs that created it.  `private` is fs-defined. */
@@ -273,6 +280,7 @@ int     vfs_readdir(struct file* f, struct dirent* out);
 /* Convenience operations on paths (no need to keep a file handle).
  * They dispatch through `parent_inode->dir_ops`. */
 int  vfs_mkdir(const char* path);
+int  vfs_link(const char* oldpath, const char* newpath);   /* §M73 — a hard link */
 int  vfs_create(const char* path);          /* zero-byte regular file */
 
 /* Remove a regular file or an EMPTY directory.  Returns 0 on success,
@@ -390,5 +398,10 @@ struct dentry* vfs_attach_child(struct dentry* parent, const char* name,
 
 /* Diagnostic — used by the `ls` shell command at root. */
 struct dentry* vfs_root(void);
+struct dentry* vfs_resolve(const char* path);          /* §M73 — from the caller's root */
+/* §M73 — `path` made canonical: relative → joined to the caller's working
+ * directory, "." / ".." applied, ".." at the root stays there.  0 on success. */
+int vfs_canonical(const char* path, char* out, size_t cap);
+void           vfs_chown_tree(struct dentry* d, int uid, int gid);   /* §M73 */
 
 #endif

@@ -248,7 +248,8 @@ static long netsock_read (struct netsock* ns, void* buf, size_t n);
 long sys_write_k(int fd, const void* buf, size_t n) {
     /* A REDIRECTED std stream is just an ofile; the console is what a slot with
      * nothing in it means. */
-    if ((fd == 1 || fd == 2) && !fd_lookup(fd)) {
+    struct ofile* wo = fd_lookup(fd);
+    if (((fd == 1 || fd == 2) && !wo) || (wo && wo->kind == FD_CONSOLE)) {
         const char* s = (const char*)buf;
         /* §M43: also capture into the task's buffer if one is set (Editor
          * "Compile & Run" reads it back), leaving room for a NUL terminator. */
@@ -336,8 +337,8 @@ static long stdin_read_line(char* buf, size_t cap) {
 /* Core: `buf` is always KERNEL memory (see the *_k note in syscall.h). */
 long sys_read_k(int fd, void* buf, size_t n) {
     struct ofile* o = fd_lookup(fd);
-    if (!o) {
-        if (fd == 0) return stdin_read_line((char*)buf, n);   /* cooked stdin */
+    if (!o || o->kind == FD_CONSOLE) {
+        if (o || fd == 0) return stdin_read_line((char*)buf, n);   /* cooked stdin */
         return -1;                       /* console out is not readable */
     }
     if (o->kind == FD_VFS)  return (long)vfs_read(o->file, buf, n);
@@ -411,6 +412,33 @@ int sys_open(const char* path, int flags) {
     int fd = fd_install(o);
     if (fd < 0) { ofile_unref(o); return -1; }
     return fd;
+}
+
+/* §M73 — the directory calls ring 3 never had.  Each copies its path(s) in
+ * first (§1.1) and answers 0 or the negative error the VFS's refusal means:
+ * -1 not found, -2 exists, -5 not permitted (the VFS's own codes). */
+int sys_mkdir(const char* upath, int mode) {
+    char kp[256];
+    if (!upath || strncpy_from_user(kp, upath, sizeof kp) < 0) return -1;
+    int r = vfs_mkdir(kp);
+    if (r == 0 && mode > 0) vfs_chmod(kp, (uint32_t)mode & 07777u);
+    return r;
+}
+int sys_link(const char* uold, const char* unew) {
+    char ko[256], kn[256];
+    if (!uold || !unew || strncpy_from_user(ko, uold, sizeof ko) < 0 ||
+        strncpy_from_user(kn, unew, sizeof kn) < 0) return -1;
+    return vfs_link(ko, kn);
+}
+int sys_chmod(const char* upath, int mode) {
+    char kp[256];
+    if (!upath || strncpy_from_user(kp, upath, sizeof kp) < 0) return -1;
+    return vfs_chmod(kp, (uint32_t)mode & 07777u);
+}
+int sys_unlink(const char* upath) {
+    char kp[256];
+    if (!upath || strncpy_from_user(kp, upath, sizeof kp) < 0) return -1;
+    return vfs_unlink(kp);
 }
 
 int sys_close(int fd) {
@@ -720,15 +748,16 @@ int sys_pipe_k(int* fds) {
 /* M34 — dup2(oldfd, newfd): make newfd refer to oldfd's object (closing any
  * prior newfd).  Real fds only (>= 3); the std streams have no ofile yet. */
 int sys_dup2(int oldfd, int newfd) {
-    struct ofile* o = fd_lookup(oldfd);
+    if (oldfd == newfd) return (fd_lookup(oldfd) || (oldfd >= 0 && oldfd <= 2)) ? newfd : -1;
+    int fresh;
+    struct ofile* o = fd_dup_source(oldfd, &fresh);
     if (!o) return -1;
-    if (oldfd == newfd) return newfd;
     /* 0/1/2 included: `dup2(fd, 1)` is exactly how every shell implements `>`.
      * Refusing it is what made redirection impossible (see fd_lookup). */
-    if (newfd < 0 || newfd >= TASK_MAX_FDS) return -1;
+    if (newfd < 0 || newfd >= TASK_MAX_FDS) { if (fresh) ofile_unref(o); return -1; }
     struct task* t = task_current();
     if (t->fds[newfd]) { ofile_unref(t->fds[newfd]); t->fds[newfd] = NULL; }
-    t->fds[newfd] = ofile_ref(o);
+    t->fds[newfd] = fresh ? o : ofile_ref(o);
     return newfd;
 }
 
@@ -742,10 +771,11 @@ int sys_dup2(int oldfd, int newfd) {
  * so the failure was completely silent — the pool arrived carrying descriptor
  * zero.  Unimplemented commands that yield a DESCRIPTOR must fail loudly. */
 int sys_dupfd(int fd, int minfd) {
-    struct ofile* o = fd_lookup(fd);
+    int fresh;
+    struct ofile* o = fd_dup_source(fd, &fresh);   /* an empty std slot → the console */
     if (!o) return -1;
     struct task* t = task_current();
-    if (!t) return -1;
+    if (!t) { if (fresh) ofile_unref(o); return -1; }
     /* 0/1/2 are RESERVED for the console and deliberately absent from the table
      * (fd_lookup rejects them, fd_install starts at 3).  A dup must obey the
      * same convention: handing back 0 produces a descriptor that looks valid to
@@ -754,9 +784,10 @@ int sys_dupfd(int fd, int minfd) {
     if (minfd < 3) minfd = 3;
     for (int i = minfd; i < TASK_MAX_FDS; i++) {
         if (t->fds[i]) continue;
-        t->fds[i] = ofile_ref(o);
+        t->fds[i] = fresh ? o : ofile_ref(o);
         return i;
     }
+    if (fresh) ofile_unref(o);
     return -1;
 }
 
@@ -832,6 +863,46 @@ int sys_stat_k(const char* kpath, struct kstat* out) {
     } else { out->size = 0; out->type = 0; out->mode = 0644; }
     vfs_close(f);
     return 0;
+}
+
+/* §M73 — the full answer, from the INODE rather than from an open (a stat
+ * needs no read permission on the file itself, only the lookup). */
+static void stat_full_of(const struct inode* in, struct kstat_full* o) {
+    o->size  = in->size;
+    o->ino   = (uint64_t)((uintptr_t)in >> 3);
+    o->nlink = in->type == INODE_DIR ? 2 : 1;          /* ramfs keeps the true count private */
+    uint32_t perm = in->mode ? (in->mode & 07777u) : (in->type == INODE_DIR ? 0755u : 0644u);
+    uint32_t fmt  = in->type == INODE_DIR ? KS_IFDIR
+                  : in->type == INODE_DEVICE ? KS_IFCHR : KS_IFREG;
+    o->mode = fmt | perm;
+    o->uid  = in->owner_uid < 0 ? 0 : in->owner_uid;
+    o->gid  = in->owner_gid < 0 ? 0 : in->owner_gid;
+}
+int sys_stat_full_k(const char* kpath, struct kstat_full* out) {
+    if (!kpath || !out) return -1;
+    struct dentry* d = vfs_resolve(kpath);
+    if (!d || !d->inode) return -1;
+    stat_full_of(d->inode, out);
+    return 0;
+}
+int sys_fstat_full_k(int fd, struct kstat_full* out) {
+    if (!out) return -1;
+    for (unsigned i = 0; i < sizeof *out; i++) ((uint8_t*)out)[i] = 0;
+    struct ofile* o = fd_lookup(fd);
+    if (!o) {
+        if (fd >= 0 && fd <= 2) { out->mode = KS_IFCHR | 0620u; out->nlink = 1; return 0; }  /* the console */
+        return -1;
+    }
+    out->nlink = 1;
+    out->ino   = (uint64_t)((uintptr_t)o >> 3);
+    switch (o->kind) {
+    case FD_VFS:
+        if (o->file && o->file->inode) { stat_full_of(o->file->inode, out); return 0; }
+        out->mode = KS_IFREG | 0644u; return 0;
+    case FD_SOCK: case FD_NETSOCK: out->mode = KS_IFSOCK | 0777u; return 0;
+    case FD_CONSOLE:               out->mode = KS_IFCHR | 0620u;  return 0;
+    default:                       out->mode = KS_IFREG | 0600u; return 0;   /* shm, timer, epoll */
+    }
 }
 
 int sys_fstat_k(int fd, struct kstat* out) {
@@ -1172,15 +1243,21 @@ void fd_readiness_signal(void) {
 
 /* See fd.h — the single definition of readiness, shared by poll and epoll. */
 uint32_t fd_readiness(int fd) {
-    /* fd 0/1/2 have no ofile, so the lookup is skipped for them by the
-     * `_of` form itself; passing what we have avoids doing it twice. */
-    return fd_readiness_of(fd, (fd >= 3) ? fd_lookup(fd) : NULL);
+    /* §M73 — 0/1/2 are looked up too: since §M59 they are ordinary slots, and
+     * skipping the lookup answered a stdin REDIRECTED to a pipe from the
+     * keyboard. */
+    return fd_readiness_of(fd, fd_lookup(fd));
 }
 
 uint32_t fd_readiness_of(int fd, struct ofile* o) {
     uint32_t r = 0;
 
-    if (fd == 0) {
+    if (o && o->kind == FD_CONSOLE) {           /* §M73 — a dup of the console */
+        struct vc* v = vc_focused();
+        if (v && vc_can_read_line(v)) r |= POLLIN;
+        return r | POLLOUT;
+    }
+    if (fd == 0 && !o) {
         /* stdin is COOKED (stdin_read_line blocks until Enter), so it becomes
          * readable when a whole LINE is buffered, not when a byte is.  Saying
          * "readable" on the first keystroke would be worse than saying nothing:
@@ -1191,7 +1268,7 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
         if (v && vc_can_read_line(v)) r |= POLLIN;
         return r;
     }
-    if ((fd == 1 || fd == 2) && !fd_lookup(fd))
+    if ((fd == 1 || fd == 2) && !o)
         return POLLOUT;                         /* console out: always writable */
 
     /* POLLNVAL is the honest answer for a descriptor that is not open, and it
