@@ -172,7 +172,7 @@ static void syscall_dispatch_body(struct int_frame* f) {
             }
             /* Excursion-model self-tests: teleport back to enter_user_mode_wrap's
              * saved kernel context. */
-            user_excursion_teleport();   /* #11: the task's own resume point */
+            user_excursion_exit((int)f->rbx);   /* #11: the task's own resume point */
         }
 
         case SYS_GETPID:

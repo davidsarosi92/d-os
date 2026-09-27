@@ -100,6 +100,11 @@ static const struct abi_nument linux_i386_ents[] = {
     /* §M65 — d-os display-bridge op; the SAME number on every guest,
      * because it is ours to choose (Linux has no such call). */
     { 0xD054, ABI_UI_BUILD },
+    /* §M59 — pipe was missing on i386 entirely: musl's pipe() returned
+     * ENOSYS and every program that pipes (a Wayland paste, a shell
+     * pipeline) failed on the one arch that had never been asked. */
+    {  42, ABI_PIPE   },
+    { 331, ABI_PIPE2  },
 };
 
 /* ---- Linux / amd64 -------------------------------------------------------- */
@@ -118,6 +123,8 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  12, ABI_BRK      },
     { 218, ABI_SET_TID_ADDRESS },
     { 186, ABI_GETTID   },
+    {  22, ABI_PIPE     },
+    { 293, ABI_PIPE2    },
     /* §M53 stage 3 — timing. */
     { 283, ABI_TIMERFD_CREATE  },
     { 286, ABI_TIMERFD_SETTIME },
@@ -169,6 +176,7 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 135, ABI_SIGPROCMASK },
     { 260, ABI_WAIT     },          /* wait4 */
     { 221, ABI_EXECVE   },
+    {  59, ABI_PIPE2    },          /* arm64 has only pipe2 */
     /* §M53 stage 3 — timing. */
     {  85, ABI_TIMERFD_CREATE  },
     {  86, ABI_TIMERFD_SETTIME },

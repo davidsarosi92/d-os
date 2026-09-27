@@ -487,6 +487,30 @@ static long h_sigpending(struct abi_ctx* c) {
     return 0;
 }
 
+/* §M59 — pipe(fds) / pipe2(fds, flags).  The pair is created in the kernel
+ * and the two numbers COPIED to the guest's array after it is validated —
+ * x86_64's old switch arm handed the guest pointer straight to sys_pipe,
+ * which stores through it with no check at all (§M46's boundary, missed in
+ * one place).  pipe2 honours O_NONBLOCK (0x800 on every Linux arch here) on
+ * both ends; O_CLOEXEC is accepted and meaningless until exec closes fds. */
+#define ABI_O_NONBLOCK 0x800
+static long pipe_common(struct abi_ctx* c, unsigned long flags) {
+    if (!abi_user_w_ok(c->a[0], 2 * sizeof(int))) return -ABI_EFAULT;
+    int k[2];
+    if (sys_pipe_k(k) != 0) return -24;                 /* EMFILE */
+    if (flags & ABI_O_NONBLOCK) {
+        struct ofile* a = fd_lookup(k[0]);
+        struct ofile* b = fd_lookup(k[1]);
+        if (a) a->nonblock = 1;
+        if (b) b->nonblock = 1;
+    }
+    ((int*)(uintptr_t)c->a[0])[0] = k[0];
+    ((int*)(uintptr_t)c->a[0])[1] = k[1];
+    return 0;
+}
+static long h_pipe(struct abi_ctx* c)  { return pipe_common(c, 0); }
+static long h_pipe2(struct abi_ctx* c) { return pipe_common(c, c->a[1]); }
+
 static long h_wait(struct abi_ctx* c) {
     int code = 0;
     int pid = task_wait((int)c->a[0], &code);
@@ -737,6 +761,8 @@ static const struct {
     [ABI_EPOLL_WAIT]      = { "epoll_wait",      h_epoll_wait      },
     [ABI_SIGPENDING]      = { "sigpending",      h_sigpending      },
     [ABI_WAIT]            = { "wait",            h_wait },
+    [ABI_PIPE]            = { "pipe",            h_pipe },
+    [ABI_PIPE2]           = { "pipe2",           h_pipe2 },
     [ABI_EXECVE]          = { "execve",          h_execve },
     /* §M24 — the socket surface, shared by all three arches at once. */
     [ABI_SOCKET]       = { "socket",       h_socket       },

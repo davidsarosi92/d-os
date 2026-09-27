@@ -30,6 +30,8 @@ void arch_enter_user_wrap(uintptr_t user_ip, uintptr_t user_sp, uintptr_t* resum
 /* SYS_EXIT of an excursion: resume the kernel where enter_user_mode_wrap left
  * off, from the CURRENT task's saved point.  Does not return. */
 void user_excursion_teleport(void) __attribute__((noreturn));
+/* §M59 — the same, recording the program's exit status first (proc.c). */
+void user_excursion_exit(int code) __attribute__((noreturn));
 
 /* Tier B — ONE-WAY drop to ring 3 / EL0 for an independent user process.
  * Unlike enter_user_mode_wrap it saves no kernel resume context: the calling

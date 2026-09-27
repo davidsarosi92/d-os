@@ -82,6 +82,29 @@ struct wl_conn {
      * never revoked (one surface per connection). */
     int                 ptr_entered, kbd_entered;
     int                 keymap_sent;    /* wl_keyboard.keymap delivered once */
+
+    /* §M59 — sending.  `stalled`: a send timed out waiting for the client to
+     * drain its socket, so later sends do not wait (see wl_send). */
+    int                 stalled;
+    uint32_t            dropped;        /* whole messages dropped while stalled */
+
+    /* §M59 — wl_data_device: copy and paste.  The selection is the d-os
+     * clipboard itself (one per machine), so a connection only remembers what
+     * it has TOLD its client and which of the client's sources it last took. */
+    uint32_t            ddev_id;        /* the client's wl_data_device (0 none) */
+#define WL_MAX_SOURCES 4
+#define WL_MAX_MIMES   6
+    struct {
+        uint32_t id;                    /* 0 = free slot                        */
+        int      nmime;
+        char     mime[WL_MAX_MIMES][48];
+    } src[WL_MAX_SOURCES];
+    uint32_t            sel_src;        /* our client's source that set the     */
+    uint32_t            sel_set_gen;    /*   clipboard, and the generation then */
+    uint32_t            sel_seen_gen;   /* clipboard generation last announced  */
+    uint32_t            offer_id;       /* the current server-created offer     */
+    uint32_t            offer_gen;      /* ... and the generation it describes  */
+    uint32_t            next_srv_id;    /* next server-allocated object id      */
 };
 
 /* Initialise a connection over `sock` (registers wl_display as object 1). */

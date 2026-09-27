@@ -95,7 +95,7 @@ static void aarch64_syscall_body(struct trapframe* tf) {
                 fd_close_all();
                 task_exit_code((int)tf->x[0]);
             }
-            user_excursion_teleport();  /* excursion self-tests: teleport back */
+            user_excursion_exit((int)tf->x[0]);  /* excursion self-tests: teleport back */
             break;                      /* unreachable */
         }
 

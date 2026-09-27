@@ -60,6 +60,7 @@
  * deploys the machine, not to this file.
  * ============================================================================= */
 
+#include "charset.h"
 #include "waitq.h"
 #include "ktimer.h"
 #include "task.h"
@@ -169,6 +170,20 @@ static void serial_cmd_entry(void) {
             int too_long = overflow;
             len = 0; overflow = 0;
             if (line[0] == 0 && !too_long) continue;    /* CRLF: the LF is empty */
+            /* §M59 — a host terminal types UTF-8; d-os text is ISO-8859-2.
+             * Without this, `clip copy árvíz` over COM1 stored two bytes per
+             * accented letter and every later consumer showed mojibake.  Only
+             * a line that IS valid UTF-8 with a multi-byte character is
+             * converted, so ASCII and raw Latin-2 pass untouched. */
+            {
+                int n = 0; while (line[n]) n++;
+                if (charset_is_utf8_text(line, n)) {
+                    char l2[SC_LINE];
+                    int m = charset_utf8_to_latin2(line, n, l2, SC_LINE - 1);
+                    for (int i = 0; i < m; i++) line[i] = l2[i];
+                    line[m] = 0;
+                }
+            }
             if (too_long) {
                 kprintf("serial-cmd: line longer than %d bytes — refused\n",
                         SC_LINE - 1);

@@ -15,6 +15,7 @@
 
 #ifndef CLIPBOARD_H
 #define CLIPBOARD_H
+#include <stdint.h>
 
 /* Replace the clipboard content with `text[0..len)`.  len < 0 means
  * "text is NUL-terminated, measure it".  Returns 0, or -1 on OOM. */
@@ -48,6 +49,9 @@ int clipboard_set_primary(const char* text, int len);
 int clipboard_set_typed(const char* text, int len, const char* type);
 int clipboard_set_primary_typed(const char* text, int len, const char* type);
 const char* clipboard_type(void);
+/* §M59 — change counter (every set bumps it) and a consistent text+type read. */
+uint32_t clipboard_gen(void);
+int clipboard_get_typed(char* dst, int cap, char* type, int tcap);
 const char* clipboard_primary_type(void);
 int clipboard_get_primary(char* dst, int cap);
 int clipboard_primary_len(void);

@@ -223,6 +223,8 @@ long sys_mprotect(uintptr_t addr, size_t len, int prot);  /* §M37 */
 int  sys_memfd(size_t size);            /* create a shared-memory fd           */
 int  sys_socketpair(int* fds);          /* fds[0],fds[1] = connected unix pair */
 int  sys_pipe(int* fds);                /* fds[0]=read, fds[1]=write            */
+int  sys_pipe_k(int* fds);              /* kernel array (§M59)                 */
+int  sys_socketpair_k(int* fds);
 int  sys_dup2(int oldfd, int newfd);    /* redirect a descriptor               */
 int  sys_kill(int pid, int sig);        /* post a signal to a task             */
 /* §M53 stage 3 — see the SYS_TIMERFD_* notes above. */

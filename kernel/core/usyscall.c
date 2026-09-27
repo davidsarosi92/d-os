@@ -252,11 +252,19 @@ long sys_write_k(int fd, const void* buf, size_t n) {
         /* §M43: also capture into the task's buffer if one is set (Editor
          * "Compile & Run" reads it back), leaving room for a NUL terminator. */
         struct task* me = task_current();
+        /* §M59 — the same serialisation kprintf has had since §M57.  Without
+         * it a program's write and a kernel message on another CPU interleaved
+         * CHARACTER BY CHARACTER ("wlclipin: it: rofeaped 'wl-server'..."),
+         * which is §M57's shredded-log hazard on the path §M57 did not cover.
+         * The payload is bounded by sys_write's staging chunk. */
+        uint32_t cfl;
+        int held = console_out_begin(&cfl);
         for (size_t i = 0; i < n; i++) {
             if (me && me->cap_buf && me->cap_len < me->cap_cap - 1)
                 me->cap_buf[me->cap_len++] = s[i];
             console_putchar(s[i]);
         }
+        console_out_end(cfl, held);
         if (me && me->cap_buf && me->cap_len < me->cap_cap)
             me->cap_buf[me->cap_len] = '\0';
         return (long)n;
@@ -627,6 +635,15 @@ int sys_memfd_resize(int fd, size_t size) {
 
 int sys_socketpair(int* fds) {
     if (!fds || !user_w(fds, 2 * sizeof(int))) return -1;   /* §1.1/2.4 */
+    return sys_socketpair_k(fds);
+}
+
+/* The core, for a caller whose `fds` is a KERNEL array (the §M50 pipe handler
+ * copies the pair out itself).  §M46's rule: the check belongs where the
+ * pointer's origin is known, so the gated wrapper above checks and this does
+ * not — calling the wrapper with a kernel array from inside a ring-3 syscall
+ * is refused, which is how musl's pipe() came to fail on i386 (§M59). */
+int sys_socketpair_k(int* fds) {
     struct usock *ua, *ub;
     if (usock_pair(&ua, &ub) != 0) return -1;
 
@@ -653,6 +670,9 @@ int sys_socketpair(int* fds) {
  * so the classic "child writes, parent reads" works. */
 int sys_pipe(int* fds) {
     return sys_socketpair(fds);
+}
+int sys_pipe_k(int* fds) {
+    return sys_socketpair_k(fds);
 }
 
 /* M34 — dup2(oldfd, newfd): make newfd refer to oldfd's object (closing any

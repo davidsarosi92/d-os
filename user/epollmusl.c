@@ -116,6 +116,31 @@ int main(void) {
 
     sigprocmask(SIG_SETMASK, &old_set, 0);
 
+    /* --- pipe(), through the shared ABI op (§M59) -------------------------
+     * musl's pipe() is SYS_pipe on i386/amd64 and SYS_pipe2 on arm64.  i386
+     * had neither until 2026-09-27, and a program that pipes failed with
+     * ENOSYS there; this is the check that runs on all three. */
+    int pp[2] = { -1, -1 };
+    if (pipe(pp) != 0) {
+        printf("epollmusl: FAIL - pipe() failed\n");
+        ok = 0;
+    } else {
+        struct epoll_event pev = { .events = EPOLLIN, .data.u64 = 0x5050 };
+        epoll_ctl(ep, EPOLL_CTL_ADD, pp[0], &pev);
+        write(pp[1], "pipe!", 5);
+        struct epoll_event got[2];
+        int pn = epoll_wait(ep, got, 2, 500);
+        int seen = 0;
+        for (int i = 0; i < pn; i++) if (got[i].data.u64 == 0x5050) seen = 1;
+        char rb[8] = { 0 };
+        long r = read(pp[0], rb, 5);
+        printf("epollmusl: pipe fds %d/%d, readable=%d, read %ld '%s'\n",
+               pp[0], pp[1], seen, r, rb);
+        if (!seen || r != 5 || memcmp(rb, "pipe!", 5)) ok = 0;
+        epoll_ctl(ep, EPOLL_CTL_DEL, pp[0], 0);
+        close(pp[0]); close(pp[1]);
+    }
+
     close(tfd);
     close(ep);
     printf("epollmusl: %s\n", ok ? "ok" : "FAILED");

@@ -61,7 +61,7 @@ void linux_syscall_dispatch(struct trapframe* tf) {
 
     if (nr == LNX_ARM64_exit || nr == LNX_ARM64_exit_group) {
         if (me && me->user_task) { fd_close_all(); task_exit_code((int)tf->x[0]); }
-        user_excursion_teleport();               /* excursion: teleport back */
+        user_excursion_exit((int)tf->x[0]);      /* excursion: teleport back */
         if (me) me->in_user_syscall = prev;      /* unreachable */
         return;
     }

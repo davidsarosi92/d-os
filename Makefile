@@ -172,6 +172,7 @@ ifeq ($(ARCH),i386)
   # §M40 (i386) — the upstream libwayland client (`make wayland`).
   ifneq ($(wildcard third_party/wayland-i386/lib/libwayland-client.a),)
     ARCH_EXTRA_OBJS += user/wlupstream_muslblob.o
+    ARCH_EXTRA_OBJS += user/wlclip_muslblob.o
     ifneq ($(wildcard third_party/weston/clients/simple-shm.c),)
       ARCH_EXTRA_OBJS += user/simpleshm_muslblob.o
     endif
@@ -397,6 +398,7 @@ else ifeq ($(ARCH),x86_64)
   # §M40 (x86_64) — the upstream libwayland client (`make ARCH=x86_64 wayland`).
   ifneq ($(wildcard third_party/wayland-x86_64/lib/libwayland-client.a),)
     ARCH_EXTRA_OBJS += user/wlupstream_muslblob.o
+    ARCH_EXTRA_OBJS += user/wlclip_muslblob.o
     ifneq ($(wildcard third_party/weston/clients/simple-shm.c),)
       ARCH_EXTRA_OBJS += user/simpleshm_muslblob.o
     endif
@@ -735,6 +737,7 @@ CORE_C_SRCS := \
     kernel/gui/wl_keymap.c \
     kernel/gui/w_editor.c \
     kernel/gui/clipboard.c \
+    kernel/core/charset.c \
     kernel/gui/wallpaper.c \
     kernel/gui/vpath.c \
     assets/splash_logo.c \
@@ -936,6 +939,7 @@ CORE_C_SRCS := \
     kernel/gui/wl_keymap.c \
     kernel/gui/w_editor.c \
     kernel/gui/clipboard.c \
+    kernel/core/charset.c \
     kernel/gui/wallpaper.c \
     kernel/gui/vpath.c \
     assets/splash_logo.c \
@@ -1070,6 +1074,7 @@ CORE_C_SRCS := \
     kernel/gui/wl_keymap.c \
     kernel/gui/w_editor.c \
     kernel/gui/clipboard.c \
+    kernel/core/charset.c \
     kernel/gui/wallpaper.c \
     kernel/gui/vpath.c \
     assets/splash_logo.c \
@@ -1957,6 +1962,13 @@ user/egltri.dynelf: user/egltri.c $(WL_PREFIX)/lib/libwayland-client.a \
 # %.muslelf) because it links libwayland-client + libffi and needs the generated
 # protocol headers.  Guarded by the arch's built library, like every other port.
 user/wlupstream.muslelf: user/wlupstream.c $(WL_PREFIX)/lib/libwayland-client.a
+	@mkdir -p $(OBJ_DIR)/user
+	$(MUSL_ELF_CC) -static -no-pie -Os -Wall -I$(WL_PREFIX)/include \
+	    -Wl,-Ttext-segment=$(USER_BASE) $< -o $@ \
+	    $(WL_PREFIX)/lib/libwayland-client.a $(FFI_PREFIX)/lib/libffi.a
+
+# §M59 — wl_data_device's test client (copy / paste), same link as wlupstream.
+user/wlclip.muslelf: user/wlclip.c $(WL_PREFIX)/lib/libwayland-client.a
 	@mkdir -p $(OBJ_DIR)/user
 	$(MUSL_ELF_CC) -static -no-pie -Os -Wall -I$(WL_PREFIX)/include \
 	    -Wl,-Ttext-segment=$(USER_BASE) $< -o $@ \

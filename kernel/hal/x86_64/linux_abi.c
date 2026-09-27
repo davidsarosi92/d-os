@@ -490,7 +490,7 @@ static void linux_exit(struct int_frame* f, int code) {
         fd_close_all();
         task_exit_code(code);
     }
-    user_excursion_teleport();   /* #11: the task's own resume point */
+    user_excursion_exit(code);   /* #11: the task's own resume point */
     (void)f;
 }
 
@@ -915,12 +915,7 @@ static void linux_syscall_body(struct int_frame* f) {
             f->rax = (uint64_t)pid;
             return;
         }
-        case LNX_pipe:
-        case LNX_pipe2:
-            /* pipe(fds=rdi) / pipe2(fds=rdi, flags=rsi) — flags (CLOEXEC/
-             * NONBLOCK) not tracked yet; the fd pair is what matters. */
-            f->rax = (uint64_t)sys_pipe((int*)a0);
-            return;
+        /* pipe / pipe2 moved to the shared engine (§M59, abi_engine.c). */
         case LNX_dup2:
             f->rax = (uint64_t)sys_dup2((int)a0, (int)a1);
             return;

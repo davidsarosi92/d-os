@@ -88,6 +88,8 @@ void        shm_unref (struct shm* s);   /* frees frames at refcount 0 */
 
 int  usock_pair (struct usock** a, struct usock** b);
 long usock_send (struct usock* s, const void* buf, size_t n, struct ofile* passfile);
+/* §M59 — all of n bytes or none (0 = no room now, -1 = peer closed). */
+long usock_send_whole(struct usock* s, const void* buf, size_t n, struct ofile* passfile);
 /* Tier A.3 — `block`: when non-zero and the endpoint has nothing to receive
  * (no bytes, no passed fd) but the peer is still open, park the caller on the
  * endpoint's read wait-queue until usock_send/usock_close wakes it, then

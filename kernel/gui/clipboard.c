@@ -21,6 +21,10 @@ static spinlock_t clip_lock;            /* zero-initialized = unlocked */
 static char* clip_buf = NULL;
 static int   clip_cap = 0;
 static int   clip_len = 0;
+/* §M59 — bumped on every change, so a reader that mirrors the clipboard
+ * somewhere else (the Wayland bridge) can tell "changed" from "the same". */
+static uint32_t clip_gen = 0;
+uint32_t clipboard_gen(void) { return __atomic_load_n(&clip_gen, __ATOMIC_ACQUIRE); }
 
 /* §M59 — A TYPED OFFER.  What is on a clipboard is not just bytes: a paste
  * target has to be able to ask "what IS this?" and decline what it cannot use.
@@ -47,9 +51,29 @@ int clipboard_set_typed(const char* text, int len, const char* type) {
     if (rc == 0) {
         uint32_t fl = spin_lock_irqsave(&clip_lock);
         type_copy(clip_type, type);
+        /* Again, AFTER the type: a mirror that read the text at the first
+         * bump may have read the old type with it. */
+        __atomic_add_fetch(&clip_gen, 1, __ATOMIC_RELEASE);
         spin_unlock_irqrestore(&clip_lock, fl);
     }
     return rc;
+}
+
+/* The type and the text together, under one lock — clipboard_type() alone
+ * returns the live buffer, which a concurrent set can rewrite mid-read. */
+int clipboard_get_typed(char* dst, int cap, char* type, int tcap) {
+    if (!dst || cap <= 0) return 0;
+    uint32_t fl = spin_lock_irqsave(&clip_lock);
+    int n = clip_len < cap - 1 ? clip_len : cap - 1;
+    for (int i = 0; i < n; i++) dst[i] = clip_buf[i];
+    if (type && tcap > 0) {
+        int i = 0;
+        for (; clip_type[i] && i < tcap - 1; i++) type[i] = clip_type[i];
+        type[i] = 0;
+    }
+    spin_unlock_irqrestore(&clip_lock, fl);
+    dst[n] = 0;
+    return n;
 }
 
 int clipboard_set_primary_typed(const char* text, int len, const char* type) {
@@ -87,6 +111,7 @@ int clipboard_set(const char* text, int len) {
     if (len > clip_cap) len = clip_cap;         /* paranoid re-clamp */
     for (int i = 0; i < len; i++) clip_buf[i] = text[i];
     clip_len = len;
+    __atomic_add_fetch(&clip_gen, 1, __ATOMIC_RELEASE);
     spin_unlock_irqrestore(&clip_lock, fl);
     if (old) kfree(old);                        /* free outside the lock */
     return 0;

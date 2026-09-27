@@ -629,7 +629,7 @@ static void linux_exit(struct int_frame* f, int code) {
         fd_close_all();
         task_exit_code(code);
     }
-    user_excursion_teleport();   /* #11: the task's own resume point */
+    user_excursion_exit(code);   /* #11: the task's own resume point */
     (void)f;
 }
 

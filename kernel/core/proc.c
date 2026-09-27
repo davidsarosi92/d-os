@@ -326,7 +326,7 @@ static int proc_exec_common(const void* image, size_t len,
     if (me) me->mm = s;              /* a fresh space carries a fresh cursor */
     vmm_space_switch(s);
 
-    if (me) me->exc_fault = 0;
+    if (me) { me->exc_fault = 0; me->exc_code = 0; }
     enter_user_mode_wrap(lp.entry, user_sp);
 
     /* §1.1/§M71 — the excursion left ring 3 through the SYS_EXIT teleport, which
@@ -340,7 +340,9 @@ static int proc_exec_common(const void* image, size_t len,
     vmm_space_switch(prev);
     if (me) me->mm = prev;
     vmm_space_destroy(s);
-    return fault ? -(128 + fault) : 0;
+    int code = me ? me->exc_code : 0;
+    if (me) me->exc_code = 0;
+    return fault ? -(128 + fault) : code;
 }
 
 int proc_exec_elf(const void* image, size_t len) {
@@ -645,6 +647,12 @@ void user_excursion_teleport(void) {
     hal_intr_enable();
     hal_syscall_exit_to_kernel(me->exc_resume[0], me->exc_resume[1]);
     for (;;) { }                         /* not reached */
+}
+
+void user_excursion_exit(int code) {
+    struct task* me = task_current();
+    if (me) me->exc_code = code & 0xFF;          /* the 8 bits a status carries */
+    user_excursion_teleport();
 }
 
 void user_excursion_fault(int sig) {

@@ -147,6 +147,12 @@ enum abi_op {
      * gain it at once instead of three switch arms drifting apart. */
     ABI_UI_BUILD,
 
+    /* §M59 — pipe and pipe2 (the flag word is ignored by pipe, so ONE op
+     * reading a[1] would read garbage for plain pipe: two ops, per the arity
+     * rule above). */
+    ABI_PIPE,
+    ABI_PIPE2,
+
     ABI_SOCKET,
     ABI_BIND,
     ABI_CONNECT,

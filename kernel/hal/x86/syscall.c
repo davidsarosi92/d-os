@@ -89,7 +89,7 @@ static void syscall_dispatch_body(struct int_frame* f) {
              * `enter_user_mode_wrap` and resume there (teleport-back).  Bypasses
              * the iret-back-to-ring-3 path; the syscall-stack frame is abandoned,
              * fine because TSS.esp0 resets it for the next transition. */
-            user_excursion_teleport();   /* #11: the task's own resume point */
+            user_excursion_exit((int)f->ebx);   /* #11: the task's own resume point */
         }
 
         /* §M65 — the display bridge, under the SAME numbers the Linux

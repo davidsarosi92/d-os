@@ -197,6 +197,12 @@ struct task {
      * dies and the TASK THAT HOSTED IT (a shell, the serial-cmd service) does
      * not.  proc_exec_* returns -(128 + exc_fault).  0 = exited normally. */
     int           exc_fault;
+    /* §M59 — the exit status a synchronous excursion's program asked for
+     * (exit/exit_group).  It used to be dropped at the teleport, so every
+     * excursion reported rc=0 whatever the program returned — a failing
+     * test client looked exactly like a passing one to anything but a grep
+     * for its own PASS line. */
+    int           exc_code;
     /* M35 — thread: this task SHARES its `mm` with its creator (clone), so its
      * reap must NOT destroy the address space (the thread group still uses it).
      * 0 for a process that owns its mm; 1 for a cloned thread. */

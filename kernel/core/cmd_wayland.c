@@ -40,6 +40,8 @@ extern const unsigned char _binary_user_wlupstream_muslelf_start[] __attribute__
 extern const unsigned char _binary_user_wlupstream_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_simpleshm_muslelf_start[]  __attribute__((weak));
 extern const unsigned char _binary_user_simpleshm_muslelf_end[]    __attribute__((weak));
+extern const unsigned char _binary_user_wlclip_muslelf_start[]  __attribute__((weak));
+extern const unsigned char _binary_user_wlclip_muslelf_end[]    __attribute__((weak));
 extern const unsigned char _binary_user_egltri_dynelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_egltri_dynelf_end[]   __attribute__((weak));
 
@@ -160,6 +162,29 @@ static void cmd_simpleshm(const char* args) {
                     windowed, 1, argv);
 }
 
+/* §M59 — `wlclip copy <text>` / `wlclip paste`: the Wayland clipboard,
+ * through an upstream-libwayland client (user/wlclip.c).  The selection is
+ * the d-os clipboard, so `clip show` / `clip copy` are the other half of
+ * every check. */
+static void cmd_wlclip(const char* args) {
+    const unsigned char* sp = _binary_user_wlclip_muslelf_start;
+    if (!sp) { console_write("wlclip: not embedded - `make ARCH=<arch> wayland` then rebuild\n"); return; }
+    static char buf[256];
+    const char* argv[16];
+    int argc = 0;
+    argv[argc++] = "wlclip";
+    int n = 0;
+    while (args && args[n] && n < (int)sizeof buf - 1) { buf[n] = args[n]; n++; }
+    buf[n] = 0;
+    for (char* p = buf; *p && argc < 15; ) {
+        while (*p == ' ') *p++ = 0;
+        if (!*p) break;
+        argv[argc++] = p;
+        while (*p && *p != ' ') p++;
+    }
+    run_upstream_wl("wlclip", sp, _binary_user_wlclip_muslelf_end, 0, argc, argv);
+}
+
 static void cmd_wayupstream(const char* args) {
     /* `wayupstream win` runs the server in SERVER-PER-SURFACE mode, so the
      * client's xdg_toplevel becomes a real desktop window and its commits are
@@ -246,6 +271,8 @@ SHELL_CMD(waykeymap)   = { "waykeymap", "", "an xkb keymap generated from the li
                            SHELL_G_TEST, wy_waykeymap, SHELL_P_ANY };
 SHELL_CMD(wayupstream) = { "wayupstream", "[win]", "UNMODIFIED upstream libwayland-client",
                            SHELL_G_TEST, cmd_wayupstream, SHELL_P_ANY };
+SHELL_CMD(wlclip)      = { "wlclip", "copy <text>|paste", "Wayland copy/paste (wl_data_device)",
+                           SHELL_G_TEST, cmd_wlclip, SHELL_P_ANY };
 SHELL_CMD(simpleshm)   = { "simpleshm", "[win]", "weston's own reference client, unpatched",
                            SHELL_G_TEST, cmd_simpleshm, SHELL_P_ANY };
 SHELL_CMD(egltri)      = { "egltri", "[win]", "Mesa EGL + GLES2 on softpipe",

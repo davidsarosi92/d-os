@@ -7,7 +7,7 @@ Network page + taskbar network indicator + Wi-Fi chooser (a SIMULATED adapter,
 mount / unmount / format / RAM disks.  `locale missing on` + `locale missing`
 measures untranslated strings as they are drawn.  Agreed order (2026-09-27, see PLAN "Open work — exact state"):
 1. finish the half-done milestones — §M26/§M59
-   `wl_data_device`, §M32 simultaneous sessions + on-disk ownership  (§M86 NX: done, §4.104; §M19.5 NUMA zones: done, §4.106);
+   §M32 simultaneous sessions + on-disk ownership  (§M86 NX: done, §4.104; §M19.5 NUMA zones: done, §4.106; `wl_data_device`: done, §4.107);
 2. then §M82, §M72, §M74, §M73 (any order; §M74 needs §M72);
 3. then §M81 (the GUI seams verdict).
 Any defect found on the way is fixed first, whatever it touches.

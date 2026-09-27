@@ -26,6 +26,8 @@
 #include "task.h"        /* task_msleep / task_start_arg                        */
 #include "kmalloc.h"     /* the per-connection wl_conn for a server task        */
 #include "printf.h"
+#include "clipboard.h"   /* §M59 — the selection IS the d-os clipboard      */
+#include "charset.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -33,7 +35,8 @@
 enum { WLI_NONE = 0, WLI_DISPLAY, WLI_REGISTRY, WLI_CALLBACK,
        WLI_COMPOSITOR, WLI_SHM, WLI_SHM_POOL, WLI_BUFFER, WLI_SURFACE,
        WLI_XDG_WM_BASE, WLI_XDG_SURFACE, WLI_XDG_TOPLEVEL,
-       WLI_SEAT, WLI_POINTER, WLI_KEYBOARD, WLI_OUTPUT };
+       WLI_SEAT, WLI_POINTER, WLI_KEYBOARD, WLI_OUTPUT,
+       WLI_DATA_DEVICE_MANAGER, WLI_DATA_SOURCE, WLI_DATA_DEVICE };
 
 /* Real Wayland opcodes (from wayland.xml).  request = client→server. */
 enum { WL_DISPLAY_REQ_SYNC = 0, WL_DISPLAY_REQ_GET_REGISTRY = 1 };
@@ -70,6 +73,21 @@ enum { WL_KEYBOARD_EVT_KEYMAP = 0, WL_KEYBOARD_EVT_ENTER = 1,
        WL_KEYBOARD_EVT_LEAVE = 2, WL_KEYBOARD_EVT_KEY = 3,
        WL_KEYBOARD_EVT_MODIFIERS = 4 };
 enum { WL_KEY_RELEASED = 0, WL_KEY_PRESSED = 1 };
+/* §M59 — wl_data_device_manager v3 and its three objects (wayland.xml). */
+enum { WL_DDM_REQ_CREATE_DATA_SOURCE = 0, WL_DDM_REQ_GET_DATA_DEVICE = 1 };
+enum { WL_DATA_SOURCE_REQ_OFFER = 0, WL_DATA_SOURCE_REQ_DESTROY = 1,
+       WL_DATA_SOURCE_REQ_SET_ACTIONS = 2 };
+enum { WL_DATA_SOURCE_EVT_TARGET = 0, WL_DATA_SOURCE_EVT_SEND = 1,
+       WL_DATA_SOURCE_EVT_CANCELLED = 2 };
+enum { WL_DATA_DEVICE_REQ_START_DRAG = 0, WL_DATA_DEVICE_REQ_SET_SELECTION = 1,
+       WL_DATA_DEVICE_REQ_RELEASE = 2 };
+enum { WL_DATA_DEVICE_EVT_DATA_OFFER = 0, WL_DATA_DEVICE_EVT_SELECTION = 5 };
+enum { WL_DATA_OFFER_REQ_ACCEPT = 0, WL_DATA_OFFER_REQ_RECEIVE = 1,
+       WL_DATA_OFFER_REQ_DESTROY = 2, WL_DATA_OFFER_REQ_FINISH = 3,
+       WL_DATA_OFFER_REQ_SET_ACTIONS = 4 };
+enum { WL_DATA_OFFER_EVT_OFFER = 0 };
+/* Ids the SERVER allocates (a data_offer) start here, per the protocol. */
+#define WL_SERVER_ID_BASE 0xff000000u
 
 /* wl_shm pixel formats (subset). */
 enum { WL_SHM_FORMAT_ARGB8888 = 0, WL_SHM_FORMAT_XRGB8888 = 1 };
@@ -82,6 +100,7 @@ static const struct wl_global g_globals[] = {
     { 3, "xdg_wm_base",   2 },
     { 4, "wl_seat",       5 },
     { 5, "wl_output",     2 },
+    { 6, "wl_data_device_manager", 3 },
 };
 #define WL_NGLOBALS (int)(sizeof g_globals / sizeof g_globals[0])
 
@@ -97,6 +116,36 @@ static uint32_t get32(const uint8_t* p) {
 }
 static uint32_t align4(uint32_t n) { return (n + 3u) & ~3u; }
 static uint32_t cstrlen(const char* s) { uint32_t n = 0; while (s[n]) n++; return n; }
+
+/* §M59 — every server→client message goes through here.  It sends the WHOLE
+ * message or none of it (usock_send_whole): a short write used to leave half
+ * an event in the stream whenever the 4 KiB ring was full — a burst of pointer
+ * motion at a client that was busy drawing was enough — and the next event's
+ * header then landed mid-message, which libwayland treats as fatal.  If there
+ * is no room it waits (bounded) for the client to drain; a client that does
+ * not drain within the bound is STALLED, and further messages are dropped
+ * without waiting until one fits again, so a wedged client costs the
+ * compositor (which sends input on its own task) one timeout, not one per
+ * event.  Dropped messages are counted and announced once. */
+#define WL_SEND_WAIT_MS 500
+static long wl_send(struct wl_conn* c, const void* m, uint32_t n, struct ofile* pf) {
+    uint64_t deadline = timer_ticks_ms() + (c->stalled ? 0 : WL_SEND_WAIT_MS);
+    for (;;) {
+        long r = usock_send_whole(c->sock, m, n, pf);
+        if (r != 0) {                               /* sent, or peer gone */
+            if (r > 0) c->stalled = 0;
+            return r;
+        }
+        if (timer_ticks_ms() >= deadline) break;
+        task_msleep(1);
+    }
+    if (!c->stalled)
+        kprintf("wayland: client is not reading its socket - dropping events "
+                "until it does\n");
+    c->stalled = 1;
+    c->dropped++;
+    return 0;
+}
 
 /* Read EXACTLY n bytes (the message framing is by the size field, so we always
  * know how many to pull).  Returns n, or <n on EOF/peer-close. */
@@ -126,7 +175,7 @@ static void send_global(struct wl_conn* c, const struct wl_global* g) {
     for (uint32_t i = slen; i < align4(slen); i++) msg[o + i] = 0;   /* pad */
     o += align4(slen);
     put32(msg + o, g->version);
-    usock_send(c->sock, msg, size, NULL);
+    wl_send(c, msg, size, NULL);
 }
 
 /* Emit wl_callback.done(serial) on object `cb`. */
@@ -135,7 +184,7 @@ static void send_callback_done(struct wl_conn* c, uint32_t cb, uint32_t data) {
     put32(msg + 0, cb);
     put32(msg + 4, (12u << 16) | WL_CALLBACK_EVT_DONE);
     put32(msg + 8, data);
-    usock_send(c->sock, msg, 12, NULL);
+    wl_send(c, msg, 12, NULL);
 }
 
 /* Emit wl_display.delete_id(id) — tells the client the server released `id`. */
@@ -144,7 +193,7 @@ static void send_delete_id(struct wl_conn* c, uint32_t id) {
     put32(msg + 0, WL_DISPLAY_ID);
     put32(msg + 4, (12u << 16) | WL_DISPLAY_EVT_DELETE_ID);
     put32(msg + 8, id);
-    usock_send(c->sock, msg, 12, NULL);
+    wl_send(c, msg, 12, NULL);
 }
 
 /* Emit wl_shm.format(format) on the client's wl_shm object. */
@@ -153,7 +202,7 @@ static void send_shm_format(struct wl_conn* c, uint32_t shm_id, uint32_t fmt) {
     put32(msg + 0, shm_id);
     put32(msg + 4, (12u << 16) | WL_SHM_EVT_FORMAT);
     put32(msg + 8, fmt);
-    usock_send(c->sock, msg, 12, NULL);
+    wl_send(c, msg, 12, NULL);
 }
 
 /* Emit wl_buffer.release(buffer) — the server is done reading the buffer, so
@@ -162,7 +211,7 @@ static void send_buffer_release(struct wl_conn* c, uint32_t buffer_id) {
     uint8_t msg[8];
     put32(msg + 0, buffer_id);
     put32(msg + 4, (8u << 16) | WL_BUFFER_EVT_RELEASE);
-    usock_send(c->sock, msg, 8, NULL);
+    wl_send(c, msg, 8, NULL);
 }
 
 /* Emit xdg_toplevel.configure(width, height, states[]) — an empty state array
@@ -175,7 +224,7 @@ static void send_xdg_toplevel_configure(struct wl_conn* c, uint32_t tl,
     put32(msg + 8, w);
     put32(msg + 12, h);
     put32(msg + 16, 0);                          /* states: array of length 0  */
-    usock_send(c->sock, msg, 20, NULL);
+    wl_send(c, msg, 20, NULL);
 }
 
 /* Emit xdg_surface.configure(serial) — the client must ack_configure(serial). */
@@ -184,7 +233,7 @@ static void send_xdg_surface_configure(struct wl_conn* c, uint32_t xs, uint32_t 
     put32(msg + 0, xs);
     put32(msg + 4, (12u << 16) | XDG_SURFACE_EVT_CONFIGURE);
     put32(msg + 8, serial);
-    usock_send(c->sock, msg, 12, NULL);
+    wl_send(c, msg, 12, NULL);
 }
 
 /* Describe the one output we have: geometry + current mode + scale + done.
@@ -225,7 +274,7 @@ static void send_output_info(struct wl_conn* c, uint32_t out) {
         for (uint32_t i = 0; i < mdp; i++) msg[o + i] = (i < mdl) ? (uint8_t)md[i] : 0;
         o += mdp;
         put32(msg + o, 0); o += 4;                   /* transform: normal     */
-        usock_send(c->sock, msg, o, NULL);
+        wl_send(c, msg, o, NULL);
     }
 
     /* mode(flags, width, height, refresh_mHz) */
@@ -236,18 +285,18 @@ static void send_output_info(struct wl_conn* c, uint32_t out) {
     put32(m + 12, (uint32_t)sw);
     put32(m + 16, (uint32_t)sh);
     put32(m + 20, 60000);                            /* 60 Hz in mHz          */
-    usock_send(c->sock, m, 24, NULL);
+    wl_send(c, m, 24, NULL);
 
     uint8_t sc[12];
     put32(sc + 0, out);
     put32(sc + 4, (12u << 16) | WL_OUTPUT_EVT_SCALE);
     put32(sc + 8, 1);
-    usock_send(c->sock, sc, 12, NULL);
+    wl_send(c, sc, 12, NULL);
 
     uint8_t dn[8];
     put32(dn + 0, out);
     put32(dn + 4, (8u << 16) | WL_OUTPUT_EVT_DONE);
-    usock_send(c->sock, dn, 8, NULL);
+    wl_send(c, dn, 8, NULL);
 
     kprintf("wayland: wl_output -> %dx%d @60Hz scale 1\n", sw, sh);
 }
@@ -258,7 +307,7 @@ static void send_seat_capabilities(struct wl_conn* c, uint32_t seat, uint32_t ca
     put32(msg + 0, seat);
     put32(msg + 4, (12u << 16) | WL_SEAT_EVT_CAPABILITIES);
     put32(msg + 8, caps);
-    usock_send(c->sock, msg, 12, NULL);
+    wl_send(c, msg, 12, NULL);
 }
 
 /* ---- focus: the events a toolkit waits for before it believes any input -----
@@ -282,7 +331,7 @@ static void send_pointer_enter(struct wl_conn* c) {
     put32(msg + 12, c->surface_id);
     put32(msg + 16, 0);                       /* surface_x, 24.8 fixed */
     put32(msg + 20, 0);                       /* surface_y             */
-    usock_send(c->sock, msg, 24, NULL);
+    wl_send(c, msg, 24, NULL);
     c->ptr_entered = 1;
 }
 
@@ -293,7 +342,7 @@ static void send_pointer_frame(struct wl_conn* c) {
     uint8_t msg[8];
     put32(msg + 0, c->pointer_id);
     put32(msg + 4, (8u << 16) | WL_POINTER_EVT_FRAME);
-    usock_send(c->sock, msg, 8, NULL);
+    wl_send(c, msg, 8, NULL);
 }
 
 /* wl_keyboard.keymap(format, fd, size) — the keymap travels as a DESCRIPTOR
@@ -311,7 +360,7 @@ static void send_keyboard_keymap(struct wl_conn* c) {
     put32(msg + 4, (16u << 16) | WL_KEYBOARD_EVT_KEYMAP);
     put32(msg + 8, 1);                    /* format: XKB_V1                   */
     put32(msg + 12, size);
-    usock_send(c->sock, msg, 16, km);     /* the fd rides the same message    */
+    wl_send(c, msg, 16, km);     /* the fd rides the same message    */
     ofile_unref(km);                      /* the travelling reference is sent */
     c->keymap_sent = 1;
 }
@@ -324,7 +373,7 @@ static void send_keyboard_enter(struct wl_conn* c) {
     put32(msg + 8, ++c->serial);
     put32(msg + 12, c->surface_id);
     put32(msg + 16, 0);                       /* keys: array of length 0 */
-    usock_send(c->sock, msg, 20, NULL);
+    wl_send(c, msg, 20, NULL);
     /* modifiers must follow enter — a client that never sees one assumes an
      * unknown modifier state and may ignore keys. */
     /* modifiers(serial, depressed, latched, locked, group) — FIVE uints, so 28
@@ -336,7 +385,7 @@ static void send_keyboard_enter(struct wl_conn* c) {
     put32(m + 4, (28u << 16) | WL_KEYBOARD_EVT_MODIFIERS);
     put32(m + 8, ++c->serial);
     put32(m + 12, 0); put32(m + 16, 0); put32(m + 20, 0); put32(m + 24, 0);
-    usock_send(c->sock, m, 28, NULL);
+    wl_send(c, m, 28, NULL);
     c->kbd_entered = 1;
 }
 
@@ -351,7 +400,7 @@ void wl_send_key(struct wl_conn* c, uint32_t key, int pressed) {
     put32(msg + 12, 0);                          /* time   */
     put32(msg + 16, key);
     put32(msg + 20, pressed ? WL_KEY_PRESSED : WL_KEY_RELEASED);
-    usock_send(c->sock, msg, 24, NULL);
+    wl_send(c, msg, 24, NULL);
 }
 
 /* Emit wl_pointer.motion(time, x, y) — coordinates are 24.8 fixed-point. */
@@ -364,7 +413,7 @@ void wl_send_motion(struct wl_conn* c, int x, int y) {
     put32(msg + 8, 0);                            /* time            */
     put32(msg + 12, (uint32_t)(x << 8));          /* surface_x fixed */
     put32(msg + 16, (uint32_t)(y << 8));          /* surface_y fixed */
-    usock_send(c->sock, msg, 20, NULL);
+    wl_send(c, msg, 20, NULL);
     send_pointer_frame(c);
 }
 
@@ -389,6 +438,12 @@ void wl_conn_init(struct wl_conn* c, struct usock* sock) {
     c->wm_mode = 0;
     c->title[0] = '\0';
     c->frame_cb = 0;
+    c->stalled = 0; c->dropped = 0;
+    c->ddev_id = 0;
+    for (int i = 0; i < WL_MAX_SOURCES; i++) c->src[i].id = 0;
+    c->sel_src = c->sel_set_gen = c->sel_seen_gen = 0;
+    c->offer_id = c->offer_gen = 0;
+    c->next_srv_id = WL_SERVER_ID_BASE;
 }
 
 /* §M26 — forward a WM-managed window's input to the Wayland client (wl_seat).
@@ -473,6 +528,211 @@ static void wl_surface_commit(struct wl_conn* c) {
 }
 
 /* Process one request whose 8-byte header has already been read. */
+/* ---- §M59 — wl_data_device: the clipboard, over Wayland ---------------------
+ *
+ * ONE SELECTION PER MACHINE, AND IT IS THE d-os CLIPBOARD.  Each Wayland client
+ * here has its own connection served by its own task (there is no shared
+ * compositor socket), so "the selection" cannot live in a connection: it lives
+ * in clipboard.c, where the terminal's Ctrl+Shift+C, the editor and
+ * `/dev/clipboard` already put it.  The bridge has two directions:
+ *
+ *   IN  (a client copies): set_selection(source) → we send the source a `send`
+ *       event carrying the write end of a pipe, read the data out of the read
+ *       end (bounded wait) and store it with clipboard_set_typed.  The data is
+ *       taken EAGERLY, at set_selection, rather than when somebody pastes:
+ *       the consumers are kernel code (a terminal paste, `clip show`) that
+ *       cannot wait on a client, and a client that exits after copying — the
+ *       ordinary `wl-copy` shape — would otherwise take its selection with it.
+ *   OUT (a client pastes): whenever the clipboard generation differs from what
+ *       this client was last told, a fresh wl_data_offer is announced
+ *       (data_offer + offer(mime)... + selection); `receive(mime, fd)` writes
+ *       the clipboard into that fd and closes it.
+ *
+ * Announcements happen on the connection's OWN task, at the next request it
+ * reads (and at get_data_device), because two tasks writing one socket is what
+ * the whole-message rule in wl_send exists to survive, not something to add
+ * more of.  So a client learns of an outside change when it next talks to us
+ * — which any toolkit does on its next frame — not the instant it happens.
+ *
+ * TEXT IS CONVERTED.  d-os text is ISO-8859-2 (charset.c); the world is UTF-8.
+ * A text selection is offered as text/plain;charset=utf-8 (converted), plus
+ * UTF8_STRING and text/plain for old clients; incoming UTF-8 is converted back.
+ * A non-text type (clipboard_type() not text/...) passes through as raw bytes
+ * under its own name.
+ *
+ * NOT DONE: drag and drop (start_drag is answered with `cancelled`, which a
+ * client handles as a drag the compositor refused) and the primary selection
+ * (zwp_primary_selection is a separate protocol). */
+#define WL_CLIP_MAX (64 * 1024)
+#define WL_PIPE_WAIT_MS 2000
+
+static int is_text_type(const char* t) {
+    return t[0]=='t' && t[1]=='e' && t[2]=='x' && t[3]=='t' && t[4]=='/';
+}
+static int str_eq(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+static int mime_is_utf8(const char* m) {
+    return str_eq(m, "text/plain;charset=utf-8") || str_eq(m, "UTF8_STRING");
+}
+static int mime_is_text(const char* m) {
+    return mime_is_utf8(m) || str_eq(m, "text/plain") || str_eq(m, "TEXT") ||
+           str_eq(m, "STRING");
+}
+
+/* One event carrying a single string argument (offer / send share the shape). */
+static void send_string_event(struct wl_conn* c, uint32_t obj, uint32_t op,
+                              const char* str, struct ofile* pf) {
+    uint8_t msg[8 + 4 + 64];
+    uint32_t slen = cstrlen(str) + 1;
+    if (slen > 64) slen = 64;
+    uint32_t size = 8 + 4 + align4(slen);
+    put32(msg + 0, obj);
+    put32(msg + 4, (size << 16) | op);
+    put32(msg + 8, slen);
+    for (uint32_t i = 0; i < align4(slen); i++)
+        msg[12 + i] = i < slen - 1 ? (uint8_t)str[i] : 0;
+    wl_send(c, msg, size, pf);
+}
+static void send_u32_event(struct wl_conn* c, uint32_t obj, uint32_t op, uint32_t v) {
+    uint8_t msg[12];
+    put32(msg + 0, obj);
+    put32(msg + 4, (12u << 16) | op);
+    put32(msg + 8, v);
+    wl_send(c, msg, 12, NULL);
+}
+
+/* Tell the client what is on the clipboard now (and, if the client's own
+ * source was replaced by something else, that it no longer owns it). */
+static void dd_announce(struct wl_conn* c) {
+    uint32_t gen = clipboard_gen();
+    c->sel_seen_gen = gen;
+    if (c->sel_src && gen != c->sel_set_gen) {
+        send_u32_event(c, c->sel_src, WL_DATA_SOURCE_EVT_CANCELLED, 0);
+        c->sel_src = 0;
+    }
+    if (!c->ddev_id) return;
+    if (clipboard_len() == 0) {                       /* nothing to paste */
+        send_u32_event(c, c->ddev_id, WL_DATA_DEVICE_EVT_SELECTION, 0);
+        c->offer_id = 0;
+        return;
+    }
+    char type[64];
+    char dummy[1];
+    clipboard_get_typed(dummy, 1, type, sizeof type);
+    uint32_t id = c->next_srv_id++;
+    c->offer_id = id; c->offer_gen = gen;
+    send_u32_event(c, c->ddev_id, WL_DATA_DEVICE_EVT_DATA_OFFER, id);
+    if (is_text_type(type)) {
+        send_string_event(c, id, WL_DATA_OFFER_EVT_OFFER, "text/plain;charset=utf-8", NULL);
+        send_string_event(c, id, WL_DATA_OFFER_EVT_OFFER, "UTF8_STRING", NULL);
+        send_string_event(c, id, WL_DATA_OFFER_EVT_OFFER, "text/plain", NULL);
+    } else {
+        send_string_event(c, id, WL_DATA_OFFER_EVT_OFFER, type, NULL);
+    }
+    send_u32_event(c, c->ddev_id, WL_DATA_DEVICE_EVT_SELECTION, id);
+}
+
+/* Write all of buf into a pipe the client handed us (bounded: a client that
+ * never reads its paste must not hold this connection forever). */
+static void pipe_write_all(struct usock* s, const char* buf, int n) {
+    uint64_t deadline = timer_ticks_ms() + WL_PIPE_WAIT_MS;
+    int off = 0;
+    while (off < n) {
+        long w = usock_send(s, buf + off, (size_t)(n - off), NULL);
+        if (w < 0) return;                                /* reader gone */
+        off += (int)w;
+        if (off < n) {
+            if (timer_ticks_ms() >= deadline) return;
+            task_msleep(1);
+        }
+    }
+}
+
+/* offer.receive(mime, fd): serve the clipboard into the client's pipe. */
+static void dd_receive(struct wl_conn* c, uint32_t offer, const char* mime,
+                       struct ofile* pf) {
+    if (!pf) { kprintf("wayland: receive without a descriptor\n"); return; }
+    if (pf->kind != FD_SOCK) { ofile_unref(pf); return; }
+    int n = 0, out = 0;
+    char* raw = (char*)kmalloc(WL_CLIP_MAX + 1);
+    char* conv = raw ? (char*)kmalloc(WL_CLIP_MAX * 3 / 2 + 4) : NULL;
+    char type[64];
+    /* A STALE offer (the clipboard has changed since it was announced) gets
+     * nothing: serving the new contents under the old offer would paste
+     * something the user did not choose at the moment they chose to paste. */
+    if (raw && conv && offer == c->offer_id && c->offer_gen == clipboard_gen()) {
+        n = clipboard_get_typed(raw, WL_CLIP_MAX + 1, type, sizeof type);
+        if (is_text_type(type) && mime_is_utf8(mime)) {
+            out = charset_latin2_to_utf8(raw, n, conv, WL_CLIP_MAX * 3 / 2 + 4);
+            pipe_write_all(pf->sock, conv, out);
+        } else {
+            out = n;
+            pipe_write_all(pf->sock, raw, n);
+        }
+        kprintf("wayland: paste served - %d bytes as %s\n", out, mime);
+    } else {
+        kprintf("wayland: paste refused - offer %x is stale\n", offer);
+    }
+    if (raw) kfree(raw);
+    if (conv) kfree(conv);
+    ofile_unref(pf);                          /* our end closed: the client sees EOF */
+}
+
+/* set_selection(source): take the client's data now (see the header). */
+static void dd_take_selection(struct wl_conn* c, uint32_t source) {
+    int si = -1;
+    for (int i = 0; i < WL_MAX_SOURCES; i++) if (c->src[i].id == source) si = i;
+    if (si < 0 || c->src[si].nmime == 0) {
+        kprintf("wayland: set_selection with an unknown or empty source %u\n", source);
+        return;
+    }
+    /* Prefer UTF-8 text, then any text, then whatever came first. */
+    int pick = -1;
+    for (int k = 0; k < c->src[si].nmime && pick < 0; k++)
+        if (mime_is_utf8(c->src[si].mime[k])) pick = k;
+    for (int k = 0; k < c->src[si].nmime && pick < 0; k++)
+        if (mime_is_text(c->src[si].mime[k])) pick = k;
+    if (pick < 0) pick = 0;
+    const char* mime = c->src[si].mime[pick];
+
+    struct usock *rd, *wr;
+    if (usock_pair(&rd, &wr) != 0) return;
+    struct ofile* wr_of = ofile_from_sock(wr);
+    if (!wr_of) { usock_close(rd); usock_close(wr); return; }
+    send_string_event(c, source, WL_DATA_SOURCE_EVT_SEND, mime, wr_of);
+    ofile_unref(wr_of);                      /* only the client's reference remains */
+
+    char* buf = (char*)kmalloc(WL_CLIP_MAX);
+    int n = 0, complete = 0;
+    uint64_t deadline = timer_ticks_ms() + WL_PIPE_WAIT_MS;
+    while (buf) {
+        long r = usock_recv(rd, buf + n, (size_t)(WL_CLIP_MAX - n), 0, NULL);
+        if (r > 0) { n += (int)r; if (n >= WL_CLIP_MAX) { complete = 1; break; } continue; }
+        if (!usock_peer_open(rd)) { complete = 1; break; }   /* writer closed: EOF */
+        if (timer_ticks_ms() >= deadline) break;
+        task_msleep(1);
+    }
+    usock_close(rd);
+    if (!buf) return;
+    if (!complete)
+        kprintf("wayland: copy timed out after %d bytes - the client never closed its end\n", n);
+    if (mime_is_text(mime)) {
+        char* l2 = (char*)kmalloc((size_t)n + 1);
+        int m = 0;
+        if (l2 && mime_is_utf8(mime)) m = charset_utf8_to_latin2(buf, n, l2, n);
+        else if (l2) for (; m < n; m++) l2[m] = buf[m];
+        if (l2) { clipboard_set_typed(l2, m, "text/plain"); kfree(l2); }
+    } else {
+        clipboard_set_typed(buf, n, mime);
+    }
+    kfree(buf);
+    c->sel_src = source;
+    c->sel_set_gen = clipboard_gen();
+    kprintf("wayland: copy taken - %d bytes as %s\n", n, mime);
+}
+
 static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
     uint32_t obj  = get32(hdr);
     uint32_t w2   = get32(hdr + 4);
@@ -485,6 +745,9 @@ static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
     if (blen && recv_exact(c->sock, body, (long)blen) != (long)blen) return -1;
 
     uint8_t iface = (obj < WL_MAX_OBJECTS) ? c->obj_iface[obj] : WLI_NONE;
+
+    /* §M59 — the clipboard changed since this client was last told. */
+    if (c->ddev_id && clipboard_gen() != c->sel_seen_gen) dd_announce(c);
 
     if (iface == WLI_DISPLAY && op == WL_DISPLAY_REQ_GET_REGISTRY && blen >= 4) {
         uint32_t reg = get32(body);
@@ -509,7 +772,8 @@ static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
                      (name == 2) ? WLI_SHM :
                      (name == 3) ? WLI_XDG_WM_BASE :
                      (name == 4) ? WLI_SEAT :
-                     (name == 5) ? WLI_OUTPUT : WLI_NONE;
+                     (name == 5) ? WLI_OUTPUT :
+                     (name == 6) ? WLI_DATA_DEVICE_MANAGER : WLI_NONE;
         if (new_id < WL_MAX_OBJECTS) c->obj_iface[new_id] = bi;
         kprintf("wayland: bind(name=%u) -> object %u\n", name, new_id);
         if (bi == WLI_SHM) {                             /* advertise formats */
@@ -637,6 +901,79 @@ static int wl_process(struct wl_conn* c, const uint8_t* hdr) {
         c->keyboard_id = nid;
         kprintf("wayland: get_keyboard -> object %u\n", nid);
         send_keyboard_keymap(c);          /* before any key event can arrive */
+
+    /* ---- §M59 — wl_data_device_manager / source / device / offer ---- */
+    } else if (iface == WLI_DATA_DEVICE_MANAGER && op == WL_DDM_REQ_CREATE_DATA_SOURCE && blen >= 4) {
+        uint32_t nid = get32(body);
+        int slot = -1;
+        for (int i = 0; i < WL_MAX_SOURCES; i++) if (!c->src[i].id) { slot = i; break; }
+        if (slot < 0) {           /* reuse the oldest that is not the selection */
+            for (int i = 0; i < WL_MAX_SOURCES; i++)
+                if (c->src[i].id != c->sel_src) { slot = i; break; }
+        }
+        if (nid < WL_MAX_OBJECTS) c->obj_iface[nid] = WLI_DATA_SOURCE;
+        if (slot >= 0) { c->src[slot].id = nid; c->src[slot].nmime = 0; }
+
+    } else if (iface == WLI_DATA_DEVICE_MANAGER && op == WL_DDM_REQ_GET_DATA_DEVICE && blen >= 8) {
+        uint32_t nid = get32(body);
+        if (nid < WL_MAX_OBJECTS) c->obj_iface[nid] = WLI_DATA_DEVICE;
+        c->ddev_id = nid;
+        kprintf("wayland: data device %u - announcing the clipboard\n", nid);
+        dd_announce(c);
+
+    } else if (iface == WLI_DATA_SOURCE && op == WL_DATA_SOURCE_REQ_OFFER && blen >= 4) {
+        uint32_t slen = get32(body);
+        for (int i = 0; i < WL_MAX_SOURCES; i++) {
+            if (c->src[i].id != obj || c->src[i].nmime >= WL_MAX_MIMES) continue;
+            char* d = c->src[i].mime[c->src[i].nmime++];
+            uint32_t k = 0;
+            for (; k + 1 < 48 && k + 1 < slen && 4 + k < blen && body[4 + k]; k++)
+                d[k] = (char)body[4 + k];
+            d[k] = 0;
+        }
+
+    } else if (iface == WLI_DATA_SOURCE && op == WL_DATA_SOURCE_REQ_DESTROY) {
+        for (int i = 0; i < WL_MAX_SOURCES; i++) if (c->src[i].id == obj) c->src[i].id = 0;
+        if (c->sel_src == obj) c->sel_src = 0;
+        c->obj_iface[obj] = WLI_NONE;
+        send_delete_id(c, obj);
+
+    } else if (iface == WLI_DATA_SOURCE && op == WL_DATA_SOURCE_REQ_SET_ACTIONS) {
+        /* drag-and-drop actions: no drag support, nothing to record */
+
+    } else if (iface == WLI_DATA_DEVICE && op == WL_DATA_DEVICE_REQ_SET_SELECTION && blen >= 8) {
+        uint32_t source = get32(body);
+        if (source) dd_take_selection(c, source);
+        else kprintf("wayland: selection cleared by the client (the clipboard keeps its contents)\n");
+        dd_announce(c);                   /* the client sees its own selection too */
+
+    } else if (iface == WLI_DATA_DEVICE && op == WL_DATA_DEVICE_REQ_START_DRAG && blen >= 16) {
+        uint32_t source = get32(body);
+        kprintf("wayland: drag and drop is not supported - drag cancelled\n");
+        if (source) send_u32_event(c, source, WL_DATA_SOURCE_EVT_CANCELLED, 0);
+
+    } else if (iface == WLI_DATA_DEVICE && op == WL_DATA_DEVICE_REQ_RELEASE) {
+        if (c->ddev_id == obj) c->ddev_id = 0;
+        c->obj_iface[obj] = WLI_NONE;
+        send_delete_id(c, obj);
+
+    } else if (obj >= WL_SERVER_ID_BASE && op == WL_DATA_OFFER_REQ_RECEIVE && blen >= 4) {
+        /* receive(mime_type, fd) — the fd travels out of band. */
+        uint32_t slen = get32(body);
+        char mime[48];
+        uint32_t k = 0;
+        for (; k + 1 < sizeof mime && k + 1 < slen && 4 + k < blen && body[4 + k]; k++)
+            mime[k] = (char)body[4 + k];
+        mime[k] = 0;
+        struct ofile* pf = NULL; uint8_t d;
+        usock_recv(c->sock, &d, 0, 0, &pf);
+        dd_receive(c, obj, mime, pf);
+
+    } else if (obj >= WL_SERVER_ID_BASE &&
+               (op == WL_DATA_OFFER_REQ_ACCEPT || op == WL_DATA_OFFER_REQ_DESTROY ||
+                op == WL_DATA_OFFER_REQ_FINISH || op == WL_DATA_OFFER_REQ_SET_ACTIONS)) {
+        /* accept/finish/set_actions are drag-and-drop; destroy of a server-
+         * created object needs no delete_id (that is for client ids). */
 
     } else {
         kprintf("wayland: object %u (iface %u) opcode %u - unhandled\n", obj, iface, op);

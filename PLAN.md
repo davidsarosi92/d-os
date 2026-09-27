@@ -218,7 +218,7 @@ fixed first, whatever it touches.
 |-----------|------|------|
 | §M19.5 | ✅ complete — per-node zones (§4.106) | — (per-node slab caches: later) |
 | §M23 | ✅ complete (the virtio-sound interrupt was already in place — measured) | — |
-| §M26 / §M59 | Wayland core + upstream clients; two clipboards, `/dev/clipboard` | `wl_data_device` |
+| §M26 / §M59 | ✅ complete — `wl_data_device` bridged to the d-os clipboard (§4.107) | — (drag and drop, primary selection over Wayland: later) |
 | §M32 | stages 1-10.1 | simultaneous sessions; on-disk ownership |
 | §M85 | ✅ complete (§4.105) | — (sbsa-ref clock via UEFI runtime: later) |
 | §M86 | ✅ RAM above 4 GiB; user no-execute on x86 (§4.104) | — |
@@ -277,7 +277,7 @@ what); a session can pick a theme and push on it.
 | M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | ✅ COMPLETE (DOCS §4.26, §4.26.1): AC97, HDA (module, §M67), virtio-sound (ARM, completion interrupt — measured 2026-09-27: 4 → 18 interrupts across a 300 ms `play dsptest`), WAV, `/dev/dsp`, mixer, master volume, tray indicator, capture.  I2S waits for a board that has it (§M84) |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | ✅ DOCS §4.25 + §4.59 (complete: connection table, server role, retransmit, DHCP, /proc/net, all 3 arches) |
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | ✅ §M25 (stages 1–7) + Tier B (concurrent user processes + full-arch libc, DOCS §4.24) |
-| M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | ✅ core (DOCS §4.32) + upstream libwayland, weston-simple-shm, Mesa EGL (§M40, DOCS §4.40/§4.40.1).  **OPEN: `wl_data_device` (clipboard over Wayland — see §M59)** |
+| M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | ✅ core (DOCS §4.32) + upstream libwayland, weston-simple-shm, Mesa EGL (§M40, DOCS §4.40/§4.40.1).  `wl_data_device` (DOCS §4.107) |
 | M27 | Process model — init, parent/child hierarchy, always-on reaper, kill-tree | Concurrency | ✅ DOCS §4.15 |
 | M28 | System log — klog ring buffer, severity levels, /proc/kmsg, dmesg | Observability | ✅ DOCS §4.18 |
 | Tier A | Blocking primitives — wait-queue (block/wake), task_wait, blocking socket read + poll | Concurrency | ✅ DOCS §4.20 |
@@ -288,7 +288,7 @@ what); a session can pick a theme and push on it.
 | M33 | Execution domains — a service's run location as a declared capability + config choice; driver placement is the flagship case | Reliability | ✅ COMPLETE 2026-08-29 (DOCS §4.82): Tier 0/1/2, shared-controller arbitration, IOMMU stage 5, and per-driver DMA domains proven by a driver in ring 3 whose device is refused outside its own buffer.  OPEN, none of it gating the claim: the modern virtio transport (legacy has no feature bit 33 — a virtio-driver item), a REAL DMA driver ported to drvrt, richer state replay |
 | **M46** | **Resilient control plane — SAK hotkeys + force-kill** — Ctrl+Alt+Del = always-live Task Manager, Ctrl+Alt+X = kill last/frozen app, window chrome (close/min/restore) works even when the app is wedged (close ⇒ force-kill), Task Manager force-quit; the enabler is a real force-kill of a wedged ring-3 process | Reliability / UX | ✅ DOCS §4.37 |
 | M58 | Text selection — pointer grab + press/motion/release, selection model (text bytes / terminal cells), word + line selection | UX | ✅ DOCS §4.69 (pointer grab, terminal + editor selection) + §4.75 (scrollback-anchored selection) |
-| M59 | Clipboard, system-wide — typed offers, ring-3 ops + `/dev/clipboard`, Wayland `wl_data_device`, primary selection | UX | ◐ DOCS §4.69 + §4.76: two slots, `/dev/clipboard`, ring-3 redirection, typed offers, keyboard bindings.  **OPEN: Wayland `wl_data_device`** (needs a client that copies and pastes to falsify it) |
+| M59 | Clipboard, system-wide — typed offers, ring-3 ops + `/dev/clipboard`, Wayland `wl_data_device`, primary selection | UX | ✅ DOCS §4.69 + §4.76: two slots, `/dev/clipboard`, ring-3 redirection, typed offers, keyboard bindings.  Wayland `wl_data_device` (DOCS §4.107, falsified by `wlclip`) |
 | M60 | Wallpaper — image background, fit modes, config + `wallpaper` cmd, gradient fallback | UX | ✅ DOCS §4.62 (panel → §M63) |
 | M61 | Resolution switching at runtime — `fb_mode_set`, scene resize, `mode` cmd, Display panel, confirm-or-revert dialog | UX / Devices | ✅ DOCS §4.70 (x86) + §4.77 (aarch64) |
 | M62 | Boot splash, switchable — `boot.splash`, drawn splash, log suppressed not discarded, torn down by any fault | UX / Reliability | ✅ DOCS §4.71 |

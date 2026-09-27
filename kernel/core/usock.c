@@ -93,6 +93,33 @@ long usock_send(struct usock* s, const void* buf, size_t n, struct ofile* passfi
     return (long)wrote;
 }
 
+/* §M59 — send ALL of `n` bytes or NONE of them (returns n, 0 = no room yet,
+ * -1 = peer gone).  A message protocol over a byte ring cannot survive a short
+ * write: half a Wayland event followed by the next event's header is a stream
+ * the client can never resynchronise, and libwayland drops the connection.
+ * Deciding under the peer's lock also makes two SENDERS safe — the Wayland
+ * server's own task and the compositor (input events) both write the same
+ * socket, and "check the space, then write" as two steps lets the other fill
+ * the gap in between. */
+long usock_send_whole(struct usock* s, const void* buf, size_t n, struct ofile* passfile) {
+    if (!s || !s->peer) return -1;
+    struct usock* p = s->peer;
+    uint32_t f = waitq_lock(&p->readers);
+    if ((size_t)(USOCK_BUF - p->count) < n || (passfile && p->fdq_count >= USOCK_FDQ)) {
+        waitq_unlock(&p->readers, f);
+        return 0;
+    }
+    const uint8_t* src = (const uint8_t*)buf;
+    for (size_t i = 0; i < n; i++)
+        p->rx[(p->head + p->count + i) % USOCK_BUF] = src[i];
+    p->count += n;
+    if (passfile) p->fdq[p->fdq_count++] = ofile_ref(passfile);
+    waitq_wake_all(&p->readers);
+    waitq_unlock(&p->readers, f);
+    fd_readiness_changed(p->owner);
+    return (long)n;
+}
+
 /* Receive: drain up to `n` bytes from this endpoint's ring into `buf`.  If
  * `block` and nothing is available (no bytes, no passed fd) while the peer is
  * still open, park on this endpoint's read wait-queue until a send/close wakes

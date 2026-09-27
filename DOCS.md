@@ -14695,8 +14695,77 @@ when it is allocated, but a cached object is handed to whichever CPU asks);
 the EFI boot path on aarch64 carries no affinity (its memory map has none) —
 an ACPI SRAT reader there is the way, when a NUMA ARM board needs it.
 
+### 4.107 Copy and paste over Wayland: `wl_data_device`, bridged to the d-os clipboard (§M26/§M59 closed, 2026-09-27)
+
+§M59 declined `wl_data_device` because nothing would exercise it.  So the
+first thing built was the thing that could: **`user/wlclip.c`**, a client on
+the upstream libwayland (public API only, the calls wl-copy / wl-paste and
+every toolkit make): `wlclip copy <text>` offers `text/plain;charset=utf-8` +
+`text/plain` and serves the compositor's `send`; `wlclip paste` waits for the
+`selection` event, `receive`s the offer through a pipe and prints the text AND
+its hex.  Each prints its own PASS/FAIL.
+
+**The selection IS the d-os clipboard.**  Every Wayland client here has its own
+connection on its own server task (no shared compositor socket), so a
+selection cannot live in a connection.  `wl_data_device_manager` v3 is
+advertised as global 6 and bridges both ways (kernel/gui/wayland.c):
+- **in:** `set_selection(source)` sends the source a `send` with the write end
+  of a pipe, reads the data (bounded, 2 s) and stores it with
+  `clipboard_set_typed`.  EAGERLY, not at paste time, because the consumers are
+  kernel code (a terminal paste, `clip`) that cannot wait on a client, and a
+  client that exits after copying — wl-copy's shape — would take the selection
+  with it.
+- **out:** whenever `clipboard_gen()` (new: every set bumps it) differs from
+  what a client was last told, it gets a fresh `data_offer` + `offer`s +
+  `selection`; `receive(mime, fd)` writes the clipboard into the fd.  A stale
+  offer gets nothing rather than contents the user did not choose.  The
+  client's own source gets `cancelled` when something else replaces it.
+- Announcements happen on the connection's own task at its next request, so a
+  client learns of an outside change when it next talks to us (any toolkit
+  does, every frame).
+- **Text is converted:** d-os text is ISO-8859-2, the offer says UTF-8 and
+  means it — new `kernel/core/charset.c` (Latin-2 ↔ UTF-8, unmappable → '?').
+- Not done: drag and drop (`start_drag` is answered `cancelled`) and the primary
+  selection over Wayland (a separate protocol).
+
+**Verified, i386 and x86_64 -smp 2:** `clip copy Őz és ű` → `wlclip paste` gets
+`c5 90 7a 20 c3 a9 73 20 c5 b1` (Ő, é, ű as UTF-8); `wlclip copy árvíztűrő
+tükörfúrógép` → 31 UTF-8 bytes in, 22 Latin-2 bytes in the d-os clipboard,
+`wlclip paste` gets the identical 31 back; ASCII round trip; `wayupstream win`
+still receives keys through the compositor.
+
+**Found on the way, all fixed:**
+1. **The Wayland server wrote half-messages.**  All 19 sends ignored a short
+   write, so a full 4 KiB ring (pointer motion at a client busy drawing) left
+   half an event in the stream — fatal to libwayland.  And two tasks write the
+   socket (the server, and the compositor forwarding input).  New
+   `usock_send_whole` (all or nothing, decided under the peer's lock) behind
+   `wl_send`, which waits a bounded 500 ms and then marks the client STALLED,
+   dropping whole messages without waiting until it drains again.
+2. **i386 had no `pipe` in the Linux ABI at all** — musl's `pipe()` was ENOSYS.
+   Now shared §M50 ops `ABI_PIPE`/`ABI_PIPE2` on all three arches (arm64 only
+   has pipe2), honouring O_NONBLOCK; x86_64's switch arm removed in the same
+   change — it handed the guest pointer straight to `sys_pipe` unchecked.  And
+   `sys_socketpair` refused a KERNEL array inside a ring-3 syscall (§M46's gate),
+   so `sys_pipe_k`/`sys_socketpair_k` are the cores now.  `epollmusltest` gained
+   a pipe case (readable through epoll, data intact) that runs on all three.
+3. **Every synchronous excursion returned rc=0 whatever the program exited
+   with** — the exit status was dropped at the teleport.  `user_excursion_exit
+   (code)` records it on all six exit paths; `proc_exec_*` returns it.
+4. **A program's console write and a kernel message interleaved character by
+   character** ("wlclipin: it: rofeaped…") — §M57 serialised kprintf and not
+   the console path of `write(2)`.  Both use `console_out_begin/end` now.
+5. **UTF-8 typed on COM1 was stored as mojibake** — `serial-cmd` now converts a
+   line that is valid UTF-8 with a multi-byte character to Latin-2 (ASCII and
+   raw Latin-2 untouched).
+
+**Open:** a Linux-personality program receives its argv in Latin-2 and its
+console output is shown as Latin-2 — the personality boundary does not
+convert encodings (wlclip converts its own argument).
+
 ## 8. Change log
 
+- **2026-09-27 — §M26/§M59 closed: `wl_data_device` bridged to the d-os clipboard (UTF-8 ↔ Latin-2), `wlclip`; whole-message Wayland sends; `pipe`/`pipe2` as shared ABI ops (i386 had none); excursions return the exit status; program output no longer interleaves with kernel messages; UTF-8 on COM1 becomes Latin-2 (DOCS §4.107).**
 - **2026-09-27 — §M19.5 closed: per-NUMA-node PMM zones (SRAT on x86, `numa-node-id` on aarch64), node-major fallback, per-node counters in `/proc/meminfo` + `buddyinfo`, `numatest`; the scheduler no longer keeps a task on a CPU its affinity excludes (DOCS §4.106).**
 - **2026-09-27 — §M85 closed: sbsa-ref's bochs-display (fb_present backends), PCI INTx routing from ACPI `_PRT` and DT `interrupt-map`, the host bridge window; `hal_irq_attach`; interrupt-driven e1000e; drvrt level-triggered lines; edu on its interrupt; `edutest` restored; a clock slot that says when there is no clock (DOCS §4.105).**
 - **2026-09-27 — §M86 closed: no-execute for user pages on i386 PAE and x86_64 (`nxtest`, harness CPU `qemu32,+nx`); ELF loader keeps a page shared by two segments; x86_64 crash records carry the fault address; aarch64 lets EL0 maintain its caches; a faulting excursion no longer kills its host task (DOCS §4.104).**
