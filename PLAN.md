@@ -217,7 +217,7 @@ fixed first, whatever it touches.
 | Milestone | Done | Open |
 |-----------|------|------|
 | §M19.5 | highmem, slab caching, SRAT parser | per-NUMA-node PMM zones |
-| §M23 | AC97, HDA, virtio-sound, mixer, capture | virtio-sound completion interrupt |
+| §M23 | ✅ complete (the virtio-sound interrupt was already in place — measured) | — |
 | §M26 / §M59 | Wayland core + upstream clients; two clipboards, `/dev/clipboard` | `wl_data_device` |
 | §M32 | stages 1-10.1 | simultaneous sessions; on-disk ownership |
 | §M85 | sbsa-ref boots with disk, USB, network | display; PCI INTx routing; DSDT PCIe window |
@@ -274,7 +274,7 @@ what); a session can pick a theme and push on it.
 | M22.5 | Desktop apps — text editor, BASIC interpreter, file manager 2.0, maximize/restore | UX | ✅ DOCS §4.13 |
 | M22.6 | Tear-free present — Bochs-VBE page flip + display-scaling fix | UX | ✅ DOCS §4.13 |
 | M22.7 | Per-task GUI apps (each WIN_APP on its own task) + panel-as-task | UX | ✅ DOCS §4.16 |
-| M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | ◐ stages 1-7 (DOCS §4.26, §4.26.1): AC97 + HDA (module, §M67) + virtio-sound (ARM), WAV, `/dev/dsp`, mixer, master volume, tray indicator, capture.  The "AC97 captures at 80 %" item was the x86 CLOCK, not the codec (NEXT.md, fixed 2026-09-25); HDA underrun fixed.  **OPEN: virtio-sound completion interrupt (ARM is polled); I2S has no target hardware yet** |
+| M23 | Audio subsystem (AC97 / HDA / I2S)              | Devices          | ✅ COMPLETE (DOCS §4.26, §4.26.1): AC97, HDA (module, §M67), virtio-sound (ARM, completion interrupt — measured 2026-09-27: 4 → 18 interrupts across a 300 ms `play dsptest`), WAV, `/dev/dsp`, mixer, master volume, tray indicator, capture.  I2S waits for a board that has it (§M84) |
 | M24 | Network stack (NIC → TCP/IP → sockets)          | Networking       | ✅ DOCS §4.25 + §4.59 (complete: connection table, server role, retransmit, DHCP, /proc/net, all 3 arches) |
 | M25 | Userland foundation — per-process VMM, ELF, fd, unix sockets, mmap | Architecture | ✅ §M25 (stages 1–7) + Tier B (concurrent user processes + full-arch libc, DOCS §4.24) |
 | M26 | Wayland server — wire protocol over M22 compositor + M25 substrate | UX | ✅ core (DOCS §4.32) + upstream libwayland, weston-simple-shm, Mesa EGL (§M40, DOCS §4.40/§4.40.1).  **OPEN: `wl_data_device` (clipboard over Wayland — see §M59)** |
@@ -2355,10 +2355,12 @@ internal API instead of the wire protocol.
   shell: the desktop itself — the boot shell is the launcher.  A
   dedicated login/session-manager root is §M32 territory.)
 
-## §M23 — Audio subsystem — ◐ stages 1-7 shipped (all 3 arches)
+## §M23 — Audio subsystem — ✅ complete (all 3 arches)
 
-**STATUS 2026-09-27:** see the status table — only the virtio-sound completion
-interrupt is open; the historical notes below describe the stages as they landed.
+**STATUS 2026-09-27: COMPLETE.**  The last listed item, the virtio-sound completion
+interrupt, turned out to be in place already (measured: 4 → 18 interrupts over
+one `play dsptest`); I2S waits for hardware that has it.  The notes below describe
+the stages as they landed.
 
 **Status (2026-07-11): AC97 PCM output SHIPPED on i386 — see DOCS.md §4.26.**
 `audio_dev` registry (block/net-shaped) + an AC97 codec driver (BDL bus-master

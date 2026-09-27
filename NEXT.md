@@ -6,7 +6,7 @@ Network page + taskbar network indicator + Wi-Fi chooser (a SIMULATED adapter,
 `wifisim on`, because QEMU has no Wi-Fi), Disks page (`disk` on a console):
 mount / unmount / format / RAM disks.  `locale missing on` + `locale missing`
 measures untranslated strings as they are drawn.  Agreed order (2026-09-27, see PLAN "Open work — exact state"):
-1. finish the half-done milestones — §M23 virtio-sound IRQ, §M26/§M59
+1. finish the half-done milestones — §M26/§M59
    `wl_data_device`, §M32 simultaneous sessions + on-disk ownership, §M85
    sbsa-ref display + INTx routing, §M19.5 NUMA zones  (§M86 NX: done, §4.104);
 2. then §M82, §M72, §M74, §M73 (any order; §M74 needs §M72);
