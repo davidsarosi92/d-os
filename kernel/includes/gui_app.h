@@ -40,7 +40,22 @@ struct gui_app_def {
      * stated", and every consumer substitutes ICON_APP for it: adding the
      * field must not turn every existing registration into a blank tile. */
     int         icon;
+    /* §M82 — APPENDED.  An essential app cannot be taken off an account's
+     * program list: the Task Manager is §M46's control plane (Ctrl+Alt+Del),
+     * and a restriction that could remove the way out of a wedged session
+     * would be a denial of service written as a policy. */
+    int         essential;
 };
+
+/* §M82 — the per-account program list (gui.c).  PERMITTED is the machine's
+ * decision (`apps.allow.<account>`, administrators only) and is ENFORCED at
+ * launch; VISIBLE additionally drops what the account chose to hide
+ * (`gui.apps.hide`, a preference).  One list that some accounts see less of —
+ * not a second registry that can disagree with the first. */
+int gui_app_permitted(const struct gui_app_def* app);
+int gui_app_allowed_for(const char* account, const struct gui_app_def* app);
+int gui_app_visible_count(void);
+const struct gui_app_def* gui_app_visible_at(int idx);
 
 extern struct gui_app_def __start_gui_apps[];
 extern struct gui_app_def __stop_gui_apps[];
@@ -64,6 +79,17 @@ extern struct gui_app_def __stop_gui_apps[];
         .name   = (_name),                                              \
         .launch = (_launchfn),                                          \
         .icon   = (_icon),                                              \
+    }
+
+/* §M82 — an app no account restriction can remove (see `essential`). */
+#define GUI_APP_ESSENTIAL(_name, _launchfn, _icon)                      \
+    static const struct gui_app_def                                     \
+    __attribute__((used, section("gui_apps"), aligned(4)))              \
+    __gui_app_##_launchfn = {                                           \
+        .name      = (_name),                                           \
+        .launch    = (_launchfn),                                       \
+        .icon      = (_icon),                                           \
+        .essential = 1,                                                 \
     }
 
 /* M22.5 — registration WITH a file-type association. */

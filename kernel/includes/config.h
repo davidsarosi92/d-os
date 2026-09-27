@@ -162,6 +162,8 @@ int config_user_attach(int uid, int seat);
 int config_user_detach(int uid, int token);
 /* The uid holding the console (whose preferences the screen shows), or -1. */
 int config_user_active(void);
+/* §M82 — the machine layer's value, ignoring any account's override. */
+const char* config_get_machine(const char* key, const char* default_value);
 /* `config` prints this: the machine layer and every live account layer. */
 void config_layers_dump(void);
 

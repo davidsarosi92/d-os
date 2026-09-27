@@ -22,6 +22,10 @@
 #include "vfs.h"
 #include "fd.h"
 #include "random.h"
+#include "config.h"
+#include "settings.h"
+#include "cred.h"
+#include "users.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -139,6 +143,56 @@ void proc_set_exec_env(const char* kv) {
     }
 }
 
+
+/* ---------------------------------------------------------------------------
+ * §M82 — the environment a program starts with.
+ *
+ * PATH IS A SETTING WITH TWO LAYERS, and the rule between them is decided here
+ * rather than left to folklore: an account's `env.PATH` REPLACES the machine's,
+ * except that a literal `$PATH` inside it expands to the machine's value — so
+ * `/home/bob/bin:$PATH` PREPENDS and `/opt/x` REPLACES, and the difference is
+ * visible in the value itself.  This is the shell convention, which is why it
+ * was chosen over "always prepend": a user who wants the system's programs
+ * GONE (a kiosk account) has a way to say so.
+ * ------------------------------------------------------------------------- */
+CONFIG_KEY(ck_env_path) = {
+    .key = "env.PATH", .group = "System", .type = CFG_STRING, .def = "/bin",
+    .help = "program search path; an account's value replaces the machine's, "
+            "and $PATH inside it stands for the machine's value",
+    .scope = CFG_SCOPE_USER,
+};
+
+static void env_put(char* out, int cap, int* n, const char* s) {
+    while (*s && *n < cap - 1) out[(*n)++] = *s++;
+    out[*n] = 0;
+}
+
+static void env_path_for_exec(char* out, int cap) {
+    const char* mine = config_get("env.PATH", "/bin");
+    const char* mach = config_get_machine("env.PATH", "/bin");
+    int n = 0;
+    out[0] = 0;
+    env_put(out, cap, &n, "PATH=");
+    for (const char* p = mine; *p && n < cap - 1; ) {
+        if (p[0] == '$' && p[1] == 'P' && p[2] == 'A' && p[3] == 'T' && p[4] == 'H') {
+            env_put(out, cap, &n, mach);
+            p += 5;
+        } else {
+            out[n++] = *p++;
+            out[n] = 0;
+        }
+    }
+}
+
+static void env_home_for_exec(char* out, int cap) {
+    const struct cred* c = cred_current();
+    const struct user_account* u = c->owner == TASK_OWNER_USER ? user_by_uid(c->uid) : NULL;
+    int n = 0;
+    out[0] = 0;
+    env_put(out, cap, &n, "HOME=");
+    env_put(out, cap, &n, u ? user_home(u) : "/");
+}
+
 static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
                                      int argc, const char* const argv[],
                                      const struct loaded_prog* lp) {
@@ -166,7 +220,13 @@ static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
     /* 1a. Copy a minimal default ENVIRONMENT below the args (a real per-exec
      *     env is a follow-up; this makes getenv()/`env` meaningful).  Native
      *     crt0 ignores envp; musl reads it. */
-    static const char* const default_env[] = { "PATH=/bin", "HOME=/", "TERM=d-os" };
+    /* §M82 — PATH and HOME come from the session, not from a table: PATH is
+     * the `env.PATH` setting as THIS task sees it (its account's value over the
+     * machine's — config.c's layers), and HOME is its account's real home. */
+    char path_var[160], home_var[96];
+    env_path_for_exec(path_var, sizeof path_var);
+    env_home_for_exec(home_var, sizeof home_var);
+    const char* const default_env[] = { path_var, home_var, "TERM=d-os" };
     const int base_env = (int)(sizeof default_env / sizeof default_env[0]);
     /* §M40 — plus at most ONE caller-supplied variable for this exec (see
      * proc_set_exec_env).  The launcher of a Wayland client has to pass

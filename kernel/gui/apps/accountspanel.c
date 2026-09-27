@@ -149,7 +149,7 @@ static int ac_cell(void* ctx, int i, int c, char* out, int cap) {
         case AC_LOGIN:
             n = ac_put(out, cap, 0, lstr(u->has_password ? "yes" : "no password"));
             break;
-        case AC_HOME:  n = ac_put(out, cap, 0, u->home); break;
+        case AC_HOME:  n = ac_put(out, cap, 0, user_home(u)); break;
     }
     (void)n;
     return 0;

@@ -171,7 +171,17 @@ struct user_account {
     uint32_t kdf_iters;
     char     salt_hex[USER_SALT_BYTES * 2 + 1];
     char     hash_hex[64 + 1];
+    /* §M82 (2026-09-27) — where the home ACTUALLY is.  `home` is the logical
+     * path the database stores (`/home/bob`); on a machine with a writable
+     * volume the directory lives on that volume (`/mnt/home/bob`), because
+     * `/` is ramfs and a home that evaporates at every boot is not a home.
+     * Computed at attach time, never stored — the same database must work on a
+     * boot with no disk.  Read it through user_home(). */
+    char     home_real[USER_PATH_MAX + 8];
 };
+
+/* The directory a session uses as its home (see home_real). */
+const char* user_home(const struct user_account* u);
 
 struct group_entry {
     int  used;

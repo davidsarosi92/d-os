@@ -806,6 +806,12 @@ static const struct {
     const char* key;
     void (*act)(void);
     int  icon;
+    /* §M82 (2026-09-27) — rows only an administrator is SHOWN (and the
+     * compositor refuses them to anyone else, gui.c).  Reboot and Shut Down
+     * end the machine for everybody; Exit GUI drops to the text console,
+     * whose shell runs as SYSTEM — so offering it to an ordinary account was
+     * a one-click privilege escalation, not a convenience. */
+    int  admin_only;
 } sm_tail[] = {
     /* Escalating order of what each one ends: the screen, the session, the
      * desktop, the kernel, the machine.  Lock is first because it is the one
@@ -815,13 +821,30 @@ static const struct {
      * view now, which draws one per item, so the alternative was a fourth
      * open-coded `row < apps ? … : …` in the painter — the very shape the
      * comment above this table warns about. */
-    { "menu.lock",     sm_lock,     ICON_USERS    },
-    { "menu.signout",  sm_signout,  ICON_USERS    },
-    { "menu.exitgui",  sm_exitgui,  ICON_TERMINAL },
-    { "menu.reboot",   sm_reboot,   ICON_UPDATE   },
-    { "menu.shutdown", sm_shutdown, ICON_POWER    },
+    { "menu.lock",     sm_lock,     ICON_USERS,    0 },
+    { "menu.signout",  sm_signout,  ICON_USERS,    0 },
+    { "menu.exitgui",  sm_exitgui,  ICON_TERMINAL, 1 },
+    { "menu.reboot",   sm_reboot,   ICON_UPDATE,   1 },
+    { "menu.shutdown", sm_shutdown, ICON_POWER,    1 },
 };
-#define SM_TAIL_N ((int)(sizeof sm_tail / sizeof sm_tail[0]))
+#define SM_TAIL_ALL ((int)(sizeof sm_tail / sizeof sm_tail[0]))
+
+/* The rows THIS session is shown, in order.  One mapping read by the count,
+ * the label and the click, so they cannot disagree about what row t is. */
+static int sm_tail_ok(int k) {
+    return !sm_tail[k].admin_only || cred_is_admin(cred_current());
+}
+static int sm_tail_n(void) {
+    int n = 0;
+    for (int k = 0; k < SM_TAIL_ALL; k++) if (sm_tail_ok(k)) n++;
+    return n;
+}
+static int sm_tail_index(int t) {                 /* visible row -> table row */
+    for (int k = 0; k < SM_TAIL_ALL; k++)
+        if (sm_tail_ok(k) && t-- == 0) return k;
+    return -1;
+}
+#define SM_TAIL_N (sm_tail_n())
 
 /* The header band: who is signed in.  Not a row — it cannot be clicked, and
  * giving it a row index would put a non-action into the same arithmetic as the
@@ -838,7 +861,7 @@ static const struct {
 #define SM_HEAD_H (cp_fh() + cp_px(14))
 
 static int menu_rows(void) {
-    int apps = gui_app_count();
+    int apps = gui_app_visible_count();      /* §M82 — this account's list */
     if (apps > SM_MAX_APPS) apps = SM_MAX_APPS;
     return apps + SM_TAIL_N;
 }
@@ -864,7 +887,7 @@ static int menu_rows(void) {
 static int sm_count(void* c) { (void)c; return menu_rows(); }
 
 static int sm_apps(void) {
-    int apps = gui_app_count();
+    int apps = gui_app_visible_count();
     return apps > SM_MAX_APPS ? SM_MAX_APPS : apps;
 }
 
@@ -873,7 +896,7 @@ static int sm_get(void* c, int i, struct item_entry* out) {
     int apps = sm_apps();
     if (i < 0) return -1;
     if (i < apps) {
-        const struct gui_app_def* a = gui_app_at(i);
+        const struct gui_app_def* a = gui_app_visible_at(i);
         if (!a) return -1;
         /* §M69 — THE ENGLISH NAME IS THE KEY.  `gui_app_def.name` is a stable
          * IDENTIFIER (§M64's shortcut resolver matches `app:File Manager`
@@ -884,8 +907,8 @@ static int sm_get(void* c, int i, struct item_entry* out) {
         out->icon  = a->icon ? a->icon : ICON_APP;
         return 0;
     }
-    int t = i - apps;
-    if (t >= SM_TAIL_N) return -1;
+    int t = sm_tail_index(i - apps);
+    if (t < 0) return -1;
     out->label = lstr(sm_tail[t].key);
     out->icon  = sm_tail[t].icon;
     /* The rule above the session tail — the model saying where a group begins,
@@ -898,9 +921,9 @@ static void sm_activate(void* c, int i) {
     (void)c;
     int apps = sm_apps();
     if (i < 0) return;
-    if (i < apps) { gui_queue_launch(gui_app_at(i)); return; }
-    int t = i - apps;
-    if (t < SM_TAIL_N) sm_tail[t].act();
+    if (i < apps) { gui_queue_launch(gui_app_visible_at(i)); return; }
+    int t = sm_tail_index(i - apps);
+    if (t >= 0) sm_tail[t].act();
 }
 
 /* A MENU ROW IS NOT A TABLE ROW, and the model is what knows that.  At the

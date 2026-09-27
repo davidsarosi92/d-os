@@ -31,6 +31,7 @@
 
 #include "gui.h"
 #include "gui_priv.h"
+#include "shortcut.h"
 #include "users.h"
 #include "cred.h"
 #include "console_plate.h"
@@ -53,10 +54,12 @@
  * release point, called from every route that ends a desktop session. */
 static int gui_cfg_uid = -1, gui_cfg_token;
 static void gui_cfg_release(void) {
+    vc_console_seal(0);                  /* the session (or greeter) is ending */
     if (gui_cfg_uid < 0) return;
     config_user_detach(gui_cfg_uid, gui_cfg_token);
     gui_cfg_uid = -1;
     gui_cfg_token = 0;
+    shortcut_use_account(NULL);          /* §M82 — back to the machine's icons */
 }
 #include "vfs.h"            /* §M82 sessiontest reads the stores back */
 #include "shellcmd.h"   /* §M76 — gui.autorun dispatches one command */
@@ -390,6 +393,7 @@ static int  skip_lock_once = 0;
 static int  in_session_leader = 0;
 static void gui_stop_main(void);        /* teardown task; defined by gui_stop  */
 static void gui_power_main(void);       /* orderly end, then power (2026-09-25) */
+static int  greeter_mode(void);           /* §M82 — nobody signed in (pick_shell) */
 static volatile int gui_power_kind;     /* 1 = reboot, 2 = power off           */
 
 
@@ -440,6 +444,91 @@ static volatile int gui_power_kind;     /* 1 = reboot, 2 = power off           *
 int gui_app_count(void) {
     return (int)(__stop_gui_apps - __start_gui_apps);
 }
+
+/* ---- §M82: the per-account program list --------------------------------- */
+
+/* Is `name` in a comma/space separated list?  Case-insensitive, and '-' in the
+ * list matches ' ' in the name (so `Task-Manager` can be typed in a shell). */
+static int list_has_app(const char* list, const char* name) {
+    if (!list) return 0;
+    const char* p = list;
+    while (*p) {
+        while (*p == ',' || *p == ' ') p++;
+        if (!*p) break;
+        const char* s = p;
+        while (*p && *p != ',') p++;
+        const char* e = p;
+        while (e > s && e[-1] == ' ') e--;
+        int i = 0, ok = 1;
+        for (const char* q = s; q < e; q++, i++) {
+            char a = *q, b = name[i];
+            if (a == '-') a = ' ';
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+            if (!b || a != b) { ok = 0; break; }
+        }
+        if (ok && name[i] == 0) return 1;
+        if (*p == ',') p++;
+    }
+    return 0;
+}
+
+/* The account this task acts for, or NULL for a system context. */
+static const char* session_account(void) {
+    const struct cred* c = cred_current();
+    if (c->owner != TASK_OWNER_USER) return NULL;
+    return user_name_of(c->uid);
+}
+
+int gui_app_permitted(const struct gui_app_def* app) {
+    return gui_app_allowed_for(session_account(), app);
+}
+
+/* The rule itself, for a named account (NULL = a system context). */
+int gui_app_allowed_for(const char* who, const struct gui_app_def* app) {
+    if (!app) return 0;
+    if (app->essential) return 1;
+    if (!who) return 1;                     /* system context: everything */
+    char key[64];
+    int n = 0;
+    const char* pre = "apps.allow.";
+    for (int i = 0; pre[i] && n < (int)sizeof key - 1; i++) key[n++] = pre[i];
+    for (int i = 0; who[i] && n < (int)sizeof key - 1; i++) key[n++] = who[i];
+    key[n] = 0;
+    /* The MACHINE layer on purpose: this is the administrator's decision about
+     * the account, and no account layer may hold it (an undeclared key is
+     * machine-scoped, config.c). */
+    const char* allow = config_get_machine(key, NULL);
+    if (!allow || !allow[0] || (allow[0] == '*' && !allow[1])) return 1;
+    return list_has_app(allow, app->name);
+}
+
+static int app_visible(const struct gui_app_def* app) {
+    if (!gui_app_permitted(app)) return 0;
+    if (app->essential) return 1;       /* cannot be hidden either: it is the way out */
+    return !list_has_app(config_get("gui.apps.hide", ""), app->name);
+}
+
+int gui_app_visible_count(void) {
+    int n = 0;
+    for (int i = 0; i < gui_app_count(); i++) if (app_visible(gui_app_at(i))) n++;
+    return n;
+}
+const struct gui_app_def* gui_app_visible_at(int idx) {
+    for (int i = 0; i < gui_app_count(); i++) {
+        const struct gui_app_def* a = gui_app_at(i);
+        if (!app_visible(a)) continue;
+        if (idx-- == 0) return a;
+    }
+    return NULL;
+}
+
+CONFIG_KEY(ck_apps_hide) = {
+    .key = "gui.apps.hide", .group = "Personalisation", .type = CFG_STRING, .def = "",
+    .help = "programs to leave off your Start menu (comma separated); hiding is "
+            "not a restriction, an administrator sets those with `apps`",
+    .scope = CFG_SCOPE_USER,
+};
 
 const struct gui_app_def* gui_app_at(int idx) {
     if (idx < 0 || idx >= gui_app_count()) return NULL;
@@ -911,6 +1000,21 @@ static void dispatch_launches(void) {
         const struct gui_app_def* app = launchq[lq_t];
         lq_t = (lq_t + 1) % LQ_SZ;
         if (!app || !app->launch) continue;
+        /* §M82 — THE ENFORCEMENT POINT.  Every route (Start menu, shortcut,
+         * `launch`, a file association, Ctrl+Alt+Del) ends in this queue, and
+         * the compositor draining it runs as the session's account — so a
+         * restriction here cannot be walked around by choosing another door. */
+        /* §M82 — no session, no programs: at the sign-in screen every door
+         * (Ctrl+Alt+Del, a queued launch) would open one as SYSTEM. */
+        if (shell && shell->name[0] == 'g' && greeter_mode()) {
+            kprintf("gui: '%s' not started - nobody is signed in\n", app->name);
+            continue;
+        }
+        if (!gui_app_permitted(app)) {
+            kprintf("gui: '%s' is not on %s's program list - not started\n",
+                    app->name, session_account() ? session_account() : "?");
+            continue;
+        }
         /* M22.7 — each app runs on its OWN task.  Spawn an app-host and hand
          * it the launch fn via start_arg; the host runs it (creating the
          * window(s) + widgets on that task) then services them.  A singleton
@@ -927,6 +1031,20 @@ static void dispatch_launches(void) {
         /* The compositor owns the host's reap (window-teardown ordering) —
          * keep init off it, same contract as WIN_TERM shells. */
         task_set_reap_owned(host, 1);
+    }
+    /* §M82 (2026-09-27) — ENDING THE MACHINE OR THE DESKTOP IS AN
+     * ADMINISTRATOR'S DECISION, decided HERE, where the request is carried out
+     * on the session's own task.  The Start menu hides the rows from anyone
+     * else, but a hidden row is not a gate: this is.  The shell's `reboot`,
+     * `shutdown` and `gui stop` were already SHELL_P_ADMIN; the menu route
+     * bypassed all three, and Exit GUI leaves the person at a console whose
+     * shell runs as SYSTEM. */
+    if ((power_req || exit_req) && !cred_is_admin(cred_current())) {
+        kprintf("gui: %s refused - '%s' is not an administrator\n",
+                exit_req ? "Exit GUI" : (power_req == 1 ? "Reboot" : "Shut Down"),
+                session_account() ? session_account() : "?");
+        power_req = 0;
+        exit_req = 0;
     }
     if (power_req == 1 || power_req == 2) {
         /* NOT here either: the orderly session end stops THIS task, so a
@@ -1525,11 +1643,22 @@ int gui_desktop_pid(void) { return desktop_pid; }
 
 /* Pick the desktop shell: `gui.shell` config value, matched against the
  * registry; falls back to "vista", then to the first registration. */
+/* §M82 — the sign-in screen with no session behind it. */
+static int greeter_mode(void) {
+    return gui_cfg_uid < 0 && !skip_lock_once && users_greeter_needed();
+}
+int gui_greeter_active(void) {
+    return gui_active && shell && shell->name[0] == 'g' && greeter_mode();
+}
+
 static const struct desktop_shell* pick_shell(void) {
     int n = (int)(__stop_desktop_shells - __start_desktop_shells);
     if (n == 0) return NULL;
 
     const char* want = config_get("gui.shell", "vista");
+    /* §M82 — nobody signed in and somebody must be asked: the GREETER, not a
+     * desktop for nobody (shell_greeter.c). */
+    if (greeter_mode()) want = "greeter";
     for (int pass = 0; pass < 2; pass++) {
         const char* name = pass == 0 ? want : "vista";
         for (int i = 0; i < n; i++) {
@@ -1644,12 +1773,87 @@ static int window_still_open(int slot, uint32_t serial) {
     return windows[slot].used && windows[slot].serial == serial;
 }
 
+/* §M82 — WHAT SIGNING OUT SAVES, ENUMERATED rather than hoped for:
+ *   - preferences: written to the account's store on every change (config.c);
+ *   - desktop icons and their places: each is a .lnk in `<home>/desktop`,
+ *     rewritten on every drop (shortcut.c);
+ *   - unsaved documents: an app with a close guard is ASKED (§4.92) and keeps
+ *     a `.unsaved` copy on any forced route (the Editor);
+ *   - WHICH PROGRAMS WERE OPEN: recorded HERE, into the account's
+ *     `gui.session.apps`, and started again at its next sign-in unless
+ *     `gui.session.restore` is off.  The only item that had no home before.
+ * Only programs started as programs are recorded (their host task is named
+ * `app:<name>` and the name is in the registry) — a dialog or a panel opened
+ * from inside one is part of that program, not a program of its own. */
+static void session_record_apps(void) {
+    if (gui_cfg_uid < 0) return;               /* nobody's session: nothing to keep */
+    const char* names[GUI_MAX_WINDOWS];
+    int n = 0;
+    uint32_t fl = spin_lock_irqsave(&state_lock);
+    for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
+        struct gui_window* w = &windows[i];
+        if (!w->used || w->kind != WIN_APP || !w->host_task) continue;
+        const char* tn = w->host_task->name;
+        if (tn[0] != 'a' || tn[1] != 'p' || tn[2] != 'p' || tn[3] != ':') continue;
+        const struct gui_app_def* a = gui_app_find(tn + 4);
+        if (!a) continue;
+        int dup = 0;
+        for (int k = 0; k < n; k++) if (names[k] == a->name) dup = 1;
+        if (!dup) names[n++] = a->name;
+    }
+    spin_unlock_irqrestore(&state_lock, fl);
+    char list[256];
+    int p = 0;
+    for (int k = 0; k < n; k++) {
+        for (const char* c = names[k]; *c && p < (int)sizeof list - 2; c++) list[p++] = *c;
+        if (k + 1 < n && p < (int)sizeof list - 2) list[p++] = ',';
+    }
+    list[p] = 0;
+    /* Applied on this (system) task: it lands in the CONSOLE user's layer,
+     * which is this session's account until the seat is released below. */
+    config_apply("gui.session.apps", list);
+    kprintf("gui: session end - %d program(s) recorded for the next sign-in%s%s\n",
+            n, n ? ": " : "", list);
+}
+
+/* §M82 — start what the account had open when it last signed out. */
+static void session_restore_apps(void) {
+    if (!config_get_long("gui.session.restore", 1)) return;
+    const char* list = config_get("gui.session.apps", "");
+    char one[48];
+    int started = 0;
+    for (const char* p = list; p && *p; ) {
+        int k = 0;
+        while (*p && *p != ',' && k < (int)sizeof one - 1) one[k++] = *p++;
+        one[k] = 0;
+        if (*p == ',') p++;
+        const struct gui_app_def* a = one[0] ? gui_app_find(one) : NULL;
+        if (!a) continue;
+        gui_queue_launch(a);          /* the program list still applies (drain) */
+        started++;
+    }
+    if (started) kprintf("gui: restored %d program(s) from the last session\n", started);
+}
+
+CONFIG_KEY(ck_session_apps) = {
+    .key = "gui.session.apps", .group = "System", .type = CFG_STRING, .def = "",
+    .help = "programs that were open at the last sign-out (written by the system)",
+    .scope = CFG_SCOPE_USER,
+};
+CONFIG_KEY(ck_session_restore) = {
+    .key = "gui.session.restore", .group = "Personalisation", .type = CFG_BOOL, .def = "1",
+    .help = "reopen the programs you had open when you signed out",
+    .scope = CFG_SCOPE_USER,
+};
+
 /* Steps 0 and 1 above. */
 static void session_close_windows(const int* sess, int nsess) {
     uint32_t grace = (uint32_t)config_get_long("gui.logout_grace_ms", 15000);
     int      slot[GUI_MAX_WINDOWS];
     uint32_t ser[GUI_MAX_WINDOWS];
     int n = 0;
+
+    session_record_apps();
 
     uint32_t fl = spin_lock_irqsave(&state_lock);
     for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
@@ -1804,6 +2008,7 @@ static int gui_teardown(void) {
     /* The shell is blocked reading a LINE; it prints its prompt after it gets
      * one.  Feed it an empty line so a prompt appears immediately instead of
      * the user having to press Enter at an apparently dead screen. */
+    vc_console_seal(0);        /* §M82 — the console is the admin's again */
     vc_kbd_push('\n');
     /* 9. §M82 — END THE ACCOUNT'S SESSION HERE, where every route ends one.
      *    The first version of the fix put the withdrawal in gui_stop_main,
@@ -1894,6 +2099,9 @@ static void gui_session_main(void) {
          * background and keeps its own preferences). */
         gui_cfg_token = config_user_attach(pend_uid, CFG_SEAT_TAKE);
         gui_cfg_uid   = pend_uid;
+        vc_console_seal(!cred_is_admin(cred_current()));   /* §M82, vc.c */
+        /* §M82 — and the account's own desktop icons. */
+        shortcut_use_account(user_home(user_by_uid(pend_uid)));
         kprintf("gui: session %d opened for '%s' (uid %d) on pid %d\n",
                 pend_session, pend_name, pend_uid, me->pid);
         skip_lock_once = 1;             /* it just authenticated */
@@ -1902,6 +2110,7 @@ static void gui_session_main(void) {
     in_session_leader = 1;
     gui_start();
     in_session_leader = 0;
+    if (gui_cfg_uid >= 0) session_restore_apps();
 }
 
 void gui_session_restart_as(const char* name) {
@@ -2320,6 +2529,7 @@ static int file_exists(const char* p) {
     return f != NULL;
 }
 static void logouttest_editor(void) {
+    int uid = gui_cfg_uid;             /* whose home a fallback copy lands in */
     config_set("gui.logout_grace_ms", "3000");
     gui_queue_open(editor_open_test_unsaved);
     task_msleep(1500);
@@ -2329,6 +2539,17 @@ static void logouttest_editor(void) {
     for (int i = 0; i < 3000 && teardown_busy; i++) task_msleep(10);
     config_set("gui.logout_grace_ms", "15000");
     int saved = file_exists("/edtest.txt"), kept = file_exists("/edtest.txt.unsaved");
+    if (!kept && uid >= 0 && user_by_uid(uid)) {          /* §M82 — the home fallback */
+        char alt[128];
+        int m = 0;
+        const char* h = user_home(user_by_uid(uid));
+        for (int i = 0; h[i] && m < 100; i++) alt[m++] = h[i];
+        const char* leaf = "/edtest.txt.unsaved";
+        for (int i = 0; leaf[i]; i++) alt[m++] = leaf[i];
+        alt[m] = 0;
+        kept = file_exists(alt);
+        if (kept) kprintf("logouttest editor: kept in %s\n", alt);
+    }
     unsigned wc = (unsigned)(te_windows_ms - t0);
     const char* what = saved && !kept && wc < 3000 ? "SAVED by the user's answer"
                      : kept && !saved && wc >= 3000 ? "KEPT after nobody answered"
@@ -2766,6 +2987,10 @@ int gui_start(void) {
      * leaving is a request to hand the machine to somebody — previously it
      * rebuilt the same unowned desktop and looked like it had done nothing. */
     } else {
+        /* §M82 — the greeter is up and nobody is signed in: the system console
+         * behind it is sealed too (vc.c), or the person at the sign-in screen
+         * could type past it into a SYSTEM shell. */
+        if (gui_cfg_uid < 0) vc_console_seal(1);
         if (gui_lock_raise() != 0)
             kprintf("gui: login was requested and could not be raised - the "
                     "desktop is UNLOCKED\n");

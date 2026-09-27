@@ -761,6 +761,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/accountspanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
+    kernel/gui/shell_greeter.c \
     kernel/gui/apps/fileman.c \
     kernel/gui/apps/about.c \
     kernel/gui/apps/newshell.c \
@@ -963,6 +964,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/accountspanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
+    kernel/gui/shell_greeter.c \
     kernel/gui/apps/fileman.c \
     kernel/gui/apps/about.c \
     kernel/gui/apps/newshell.c \
@@ -1098,6 +1100,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/accountspanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
+    kernel/gui/shell_greeter.c \
     kernel/gui/apps/fileman.c \
     kernel/gui/apps/about.c \
     kernel/gui/apps/newshell.c \

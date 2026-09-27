@@ -697,6 +697,9 @@ static const struct locale_entry en_strings[] = {
     { "nothing was typed", "nothing was typed" },
     { " char(s) received, fp ", " char(s) received, fp " },
     { "tray.noclock", "no clock device" },
+    { "greeter.title", "d-os - sign in to continue" },
+    { "Sign in", "Sign in" },
+    { "lock.prompt.signin", "Nobody is signed in.  Choose an account and sign in." },
 };
 
 LOCALE_CATALOG(loc_en) = {
@@ -1168,6 +1171,9 @@ static const struct locale_entry hu_strings[] = {
     { "nothing was typed", "nem \xEDrt be semmit" },
     { " char(s) received, fp ", " karakter \xE9rkezett, fp " },
     { "tray.noclock", "nincs \xF3ra" },
+    { "greeter.title", "d-os - jelentkezz be a folytat\xE1shoz" },
+    { "Sign in", "Bejelentkez\xE9s" },
+    { "lock.prompt.signin", "Senki nincs bejelentkezve.  V\xE1lasszon fi\xF3kot, \xE9s jelentkezzen be." },
 };
 
 LOCALE_CATALOG(loc_hu) = {

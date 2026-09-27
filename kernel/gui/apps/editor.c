@@ -23,6 +23,8 @@
  * All callbacks run on the compositor task — VFS use is fine.
  * ============================================================================= */
 
+#include "users.h"
+#include "cred.h"
 #include "gui.h"
 #include "gui_app.h"
 #include "icons.h"
@@ -349,6 +351,31 @@ static void ed_on_close(struct gui_window* win) {
     int len = 0;
     const char* data = w_editor_text(af->a.ed, &len);
     struct file* f = vfs_open(path, VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+    if (!f) {
+        /* §M82 (2026-09-27) — NEXT TO THE FILE IS NOT ALWAYS WRITABLE.  An
+         * ordinary account editing a file in a directory it does not own
+         * (a root-owned `/`, somebody else's folder) cannot create a sibling,
+         * and its work was simply lost — invisible while every test ran as an
+         * administrator.  The account's own home can always be written. */
+        const struct cred* c = cred_current();
+        const struct user_account* u = c->owner == TASK_OWNER_USER ? user_by_uid(c->uid) : NULL;
+        if (u) {
+            char alt[160];
+            int m = 0;
+            const char* h = user_home(u);
+            for (int i = 0; h[i] && m < 100; i++) alt[m++] = h[i];
+            alt[m++] = '/';
+            int last = -1;
+            for (int i = 0; path[i]; i++) if (path[i] == '/') last = i;
+            for (int i = last + 1; path[i] && m < (int)sizeof alt - 1; i++) alt[m++] = path[i];
+            alt[m] = 0;
+            f = vfs_open(alt, VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+            if (f) {
+                kprintf("editor: %s is not writable - keeping the unsaved text in your home\n", path);
+                for (int i = 0; i <= m; i++) path[i] = alt[i];
+            }
+        }
+    }
     if (!f) { kprintf("editor: closed with unsaved changes and could not keep them (%s)\n", path); return; }
     int off = 0;
     while (off < len) {

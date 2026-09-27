@@ -570,14 +570,46 @@ static int load_file(const char* path, void (*fn)(char*)) {
  * Idempotent: an existing directory is left alone except for its ownership,
  * which is re-asserted because ramfs is rebuilt at every boot while the
  * account database survives. */
+/* §M82 — the volume homes live on ("" = none: they stay on ramfs). */
+static char g_home_vol[32];
+
+static void compute_home_real(struct user_account* u) {
+    u->home_real[0] = 0;
+    if (g_home_vol[0]) s_copy(u->home_real, g_home_vol, sizeof u->home_real);
+    s_cat(u->home_real, u->home, sizeof u->home_real);
+}
+const char* user_home(const struct user_account* u) {
+    if (!u) return "/";
+    return u->home_real[0] ? u->home_real : u->home;
+}
+
+/* Create a home and every missing parent, mode 0755 for the parents (the
+ * same as `/home` on any Unix) and 0700 owned by the account for the home. */
+static void make_home(struct user_account* u) {
+    compute_home_real(u);
+    char p[USER_PATH_MAX + 8];
+    s_copy(p, u->home_real, sizeof p);
+    for (int i = 1; p[i]; i++) {
+        if (p[i] != '/') continue;
+        p[i] = 0; vfs_mkdir(p); p[i] = '/';
+    }
+    vfs_mkdir(u->home_real);                 /* -2 when it already exists */
+    /* Mode and owner are re-asserted only when they are WRONG: on a volume
+     * that stores ownership each change is a directory write, and a boot that
+     * rewrites every home's entry set for nothing is a boot that wears the
+     * disk to say what it already says. */
+    struct vfs_stat st;
+    if (vfs_stat(u->home_real, &st) == 0 &&
+        (st.mode & 07777u) == 0700u && st.uid == u->uid && st.gid == u->gid) return;
+    vfs_chmod(u->home_real, 0700);
+    vfs_chown(u->home_real, u->uid, u->gid);
+}
+
 void users_ensure_homes(void) {
-    vfs_mkdir("/home");
     for (int i = 0; i < USER_MAX_ACCOUNTS; i++) {
         struct user_account* u = &g_users[i];
         if (!u->used || !u->home[0]) continue;
-        vfs_mkdir(u->home);                  /* -2 when it already exists */
-        vfs_chmod(u->home, 0700);
-        vfs_chown(u->home, u->uid, u->gid);
+        make_home(u);
         users_ensure_pref_store(u->uid);
     }
 }
@@ -644,6 +676,12 @@ int users_attach_persistent(const char* dir) {
      * a string and not a directory is the §M64 shortcut bug in a new costume.*
      * Accounts loaded from the store have the same problem: they were created
      * on a previous boot, and `/` is ramfs. */
+    /* §M82 — homes live on THIS volume from now on (see home_real). */
+    s_copy(g_home_vol, dir, sizeof g_home_vol);
+    {
+        int m = s_len(g_home_vol);
+        if (m > 0 && g_home_vol[m - 1] == '/') g_home_vol[m - 1] = 0;
+    }
     int loaded = load_file(g_passwd_path, parse_passwd_line);
     if (loaded == 0) {
         load_file(g_shadow_path, parse_shadow_line);
@@ -664,6 +702,7 @@ int users_attach_persistent(const char* dir) {
 
     g_passwd_path[0] = 0;
     g_shadow_path[0] = 0;
+    g_home_vol[0] = 0;                /* not writable: homes stay on ramfs */
     klog(KLOG_WARN, "users",
          "%s not writable — accounts will NOT survive a reboot\n", dir);
     /* Homes are made even here.  They live on ramfs, so they were never going
@@ -907,15 +946,11 @@ int user_add(const char* name, int make_admin) {
      * Mode 0700 — private by default.  The difference between 0700 and 0755 is
      * the difference between a home and a public directory, and a default that
      * is readable by everybody is one nobody will notice is wrong. */
-    vfs_mkdir("/home");
-    if (vfs_mkdir(u->home) == 0) {
-        vfs_chmod(u->home, 0700);
-        vfs_chown(u->home, u->uid, u->gid);
-    }
+    make_home(u);
 
     users_ensure_pref_store(u->uid);
     kprintf("users: created '%s' uid %d, home %s%s\n",
-            u->name, u->uid, u->home, make_admin ? ", ADMIN" : "");
+            u->name, u->uid, user_home(u), make_admin ? ", ADMIN" : "");
     if (users_save() != 0)
         kprintf("users: (RAM only — no writable volume, this will not survive a reboot)\n");
     return 0;
@@ -1168,7 +1203,7 @@ static void cmd_users(const char* args) {
                  * invariant readable: an admin with no password is a name. */
                 u->has_password ? "yes" : "NO-PASSWORD",
                 u->elevation == USER_ELEV_ALWAYS ? "always" : "per-op",
-                u->home);
+                user_home(u));
     }
     kprintf("groups:\n");
     for (int i = 0; i < group_count(); i++) {

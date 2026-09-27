@@ -47,7 +47,10 @@ static int list_n = 0;
  * onto the persistent volume by shortcut_attach_persistent() — see the header
  * for why this is not a compile-time constant (it was, and shortcuts silently
  * did not survive a reboot). */
-static char sc_dir[64] = SHORTCUT_DIR;
+static char sc_dir[80] = SHORTCUT_DIR;
+/* §M82 — the MACHINE's desktop directory, kept aside while an account's is in
+ * use, so signing out puts back exactly what was there before. */
+static char sc_machine[80] = SHORTCUT_DIR;
 
 const char* shortcut_dir(void) { return sc_dir; }
 
@@ -200,7 +203,43 @@ int shortcut_attach_persistent(const char* mount) {
     vfs_close(d);
 
     copy_(sc_dir, sizeof sc_dir, dir);
+    copy_(sc_machine, sizeof sc_machine, dir);
     return shortcut_reload() >= 0 ? 0 : -1;
+}
+
+/* §M82 — every account has its OWN desktop: `<home>/desktop`.  Called by the
+ * session leader after it has become the account, so the directory it creates
+ * is the account's (the VFS stamps a user's create with the user); NULL goes
+ * back to the machine's.  The arrangement comes along for free — §M64 stores
+ * each icon's slot IN its .lnk, and the .lnk is now in the account's home.
+ *
+ * It starts EMPTY for a new account, on purpose: §M64's rule that the desktop
+ * is never auto-populated applies per person too. */
+int shortcut_use_account(const char* home) {
+    if (!home || !*home) {
+        copy_(sc_dir, sizeof sc_dir, sc_machine);
+    } else {
+        char dir[80];
+        copy_(dir, sizeof dir, home);
+        int p = len_(dir);
+        while (p > 0 && dir[p - 1] == '/') dir[--p] = '\0';
+        const char* leaf = "/desktop";
+        for (int i = 0; leaf[i] && p < (int)sizeof dir - 1; i++) dir[p++] = leaf[i];
+        dir[p] = '\0';
+        vfs_mkdir(dir);
+        struct file* d = vfs_open(dir, VFS_RDONLY);
+        if (!d) {
+            kprintf("desktop: %s cannot be opened - this session shows the machine's desktop\n", dir);
+            copy_(sc_dir, sizeof sc_dir, sc_machine);
+            shortcut_reload();
+            return -1;
+        }
+        vfs_close(d);
+        copy_(sc_dir, sizeof sc_dir, dir);
+    }
+    int n = shortcut_reload();
+    kprintf("desktop: shortcuts from %s (%d)\n", sc_dir, n < 0 ? 0 : n);
+    return n >= 0 ? 0 : -1;
 }
 
 int shortcut_reload(void) {

@@ -177,6 +177,18 @@ const char* config_get(const char* key, const char* default_value) {
     return v;                        /* stays valid: values are retired, not freed */
 }
 
+/* §M82 — the MACHINE layer's value, whoever asks (a user's `$PATH` expands to
+ * this).  Same lifetime rule as config_get. */
+const char* config_get_machine(const char* key, const char* default_value) {
+    if (!key) return default_value;
+    const char* v = default_value;
+    uint32_t fl = spin_lock_irqsave(&cfg_lock);
+    struct entry* e = find_in(head, key);
+    if (e) v = e->value;
+    spin_unlock_irqrestore(&cfg_lock, fl);
+    return v;
+}
+
 /* Parse a config value as a base-10 (long) integer, returning `def` when the
  * key is missing or the value is not a valid number.  Leading spaces and an
  * optional sign are accepted; parsing stops at the first non-digit. */

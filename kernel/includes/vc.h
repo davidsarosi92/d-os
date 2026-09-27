@@ -189,4 +189,8 @@ void vc_set_kbd_hook(int (*fn)(char c));
 void vc_set_raw_kbd_hook(int (*fn)(uint8_t keycode, uint8_t mods));
 int  vc_raw_kbd_dispatch(uint8_t keycode, uint8_t mods);
 
+/* §M82 — drop keys that would reach the system console behind a desktop
+ * held by an ordinary account (vc.c). */
+void vc_console_seal(int on);
+
 #endif

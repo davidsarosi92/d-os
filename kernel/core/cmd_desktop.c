@@ -308,3 +308,49 @@ SHELL_CMD(uidemo)    = { "uidemo", "", "the toolkit driven from a ring-3 client"
 SHELL_CMD(wheeltest) = { "wheeltest", "<x> <y> <dz>",
                          "inject (dz=0: probe) a wheel notch at a content point",
                          SHELL_G_TEST, ds_wheeltest, SHELL_P_ANY };
+
+/* §M82 — `apps [<account> [allow <list>|all]]`: an account's program list.
+ * Writes the MACHINE key `apps.allow.<account>` (administrators only — the
+ * config gate refuses anyone else) and saves the machine store, so the
+ * restriction survives a reboot.  Essential apps are always on the list. */
+static void cmd_apps(const char* args) {
+    char who[40] = {0}, verb[16] = {0}, rest[160] = {0};
+    int i = 0;
+    while (args && *args == ' ') args++;
+    while (args && *args && *args != ' ' && i < (int)sizeof who - 1) who[i++] = *args++;
+    i = 0;
+    while (args && *args == ' ') args++;
+    while (args && *args && *args != ' ' && i < (int)sizeof verb - 1) verb[i++] = *args++;
+    i = 0;
+    while (args && *args == ' ') args++;
+    while (args && *args && i < (int)sizeof rest - 1) rest[i++] = *args++;
+    if (!who[0]) {
+        kprintf("usage: apps <account> [allow <app,app,...>|all]\n");
+        return;
+    }
+    char key[64] = "apps.allow.";
+    int n = 11;
+    for (int k = 0; who[k] && n < (int)sizeof key - 1; k++) key[n++] = who[k];
+    key[n] = 0;
+    if (verb[0]) {
+        if (verb[0] != 'a' || verb[1] != 'l') { kprintf("apps: allow <list>|all\n"); return; }
+        const char* v = rest;
+        if (rest[0] == 'a' && rest[1] == 'l' && rest[2] == 'l' && !rest[3]) v = "*";
+        if (config_apply(key, v) != 0) { kprintf("apps: refused\n"); return; }
+        config_save();
+    }
+    const char* cur = config_get_machine(key, "*");
+    kprintf("apps: %s may start: %s  (essential apps always)\n", who,
+            (cur[0] == '*' && !cur[1]) ? "everything" : cur);
+    for (int k = 0; k < gui_app_count(); k++) {
+        const struct gui_app_def* a = gui_app_at(k);
+        int ok = a->essential || !cur[0] || (cur[0] == '*' && !cur[1]);
+        if (!ok) {
+            /* the same match rule as gui_app_permitted, via a probe */
+            ok = gui_app_allowed_for(who, a);
+        }
+        kprintf("  %s %s%s\n", ok ? "+" : "-", a->name, a->essential ? " (essential)" : "");
+    }
+}
+SHELL_CMD(apps) = { "apps", "<account> [allow <list>|all]",
+                    "which programs an account may start", SHELL_G_GUI, cmd_apps, SHELL_P_ADMIN };

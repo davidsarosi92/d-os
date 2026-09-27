@@ -223,7 +223,7 @@ fixed first, whatever it touches.
 | §M85 | ✅ complete (§4.105) | — (sbsa-ref clock via UEFI runtime: later) |
 | §M86 | ✅ RAM above 4 GiB; user no-execute on x86 (§4.104) | — |
 | §M81 | steps 1-2, step 3 in part | chrome still hand-drawn; the verdict |
-| §M82 | preference boundary | per-user desktop, PATH, separate greeter, save at sign-out |
+| §M82 | ✅ complete (§4.110) | — (two live desktops at once) |
 | §M72, §M73, §M74 | — | designed, not started |
 | §M68 | — | investigation, not started |
 | §M83, §M84 | — | designed, not started |
@@ -307,7 +307,7 @@ what); a session can pick a theme and push on it.
 | M75 | **Task Manager: what each process is costing** — ✅ **SHIPPED 2026-09-10 (DOCS §4.88)**: per-process MEM (portable policy over three arch walkers; verified by DIFFERENCE on all three, same 1028 KB constant) + CPU% (a delta over §M53's clock, keyed by PID where damage is keyed by slot), a `blk_read/write/flush` request path that did not exist, a kernel history ring sampled by a service so the window is a VIEW, `WIDGET_CLASS("chart")`, and the Total as the footer.  **Its own instrument found the biggest cost in the tree: the GUI is 50 % of a 4-CPU box AT REST** — §M49's open item, never before given a number.  OWNER still gated on §M32 | UX / Instrumentation | ✅ DOCS §4.88 |
 | M76 | **The aarch64 native syscall dispatcher — SWEPT** — ✅ **SHIPPED 2026-09-10 (DOCS §4.89)**: 26 of i386's 60 cases → **60 of 60**.  Found while §M75's own falsifier drowned an ARM log in `unknown number 35`; every native program using sockets, stat/getdents, threads, getrandom, uname or the dosgui bridge was **silently x86-only**, and the failure is a log line and a -1 rather than a link error, which is why it survived from §M25 to §M75.  **The blocker was the HARNESS, not the sweep** — `uidemo` could not be started on ARM at all (§4.74), so `gui.autorun` had to exist first.  Three cases are REFUSED WITH A REASON rather than wired: aarch64 has no I/O address space, and a driver told its port window was granted would fault at first access | Architecture | ✅ DOCS §4.89 |
 | M81 | **The GUI's seams — an audit of how it is assembled** — the compositor, the widget toolkit and the apps have grown by accretion, and §M32's GUI work spent three rounds in the wrong file because of it: an undocumented placement convention, a flag honoured in one of four dispatch paths, a strip that clipped a popup silently, and a window that lays out only if it was created the right way.  **The deliverable is a VERDICT with measurements, not a rewrite**: which seams are real, which are conventions nobody wrote down, and which communications with the kernel should become declared interfaces | UX / Architecture | ◐ steps 1-2 ✅ (container is a widget; one window constructor `gui_app_open`), mandatory/optional behaviour ✅, step 3 ◐ (Start menu, keyboard and network flyouts are item-view lists).  **OPEN: taskbar, volume flyout and sign-in still hand-drawn; `struct gui_window` is not a widget; the written per-seam VERDICT with call counts** |
-| M82 | **The SESSION becomes a first-class thing** — §M81 gave the GUI a real identity (`cred_become_user` on a session leader) and stopped there.  What the identity does not yet carry is a *desktop*: every user should have their own program list, icon field, wallpaper and environment, and the greeter and the lock should be SEPARATE from the session rather than windows inside it.  Includes per-user and system-wide `PATH`, with the user's overriding, and saving a session's state at sign-out | UX / Security | ◐ preference boundary + teardown use-after-free fixed (2026-09-24, PROGRESS note below).  **OPEN: per-user icon field and program list, system/user `PATH`, greeter and lock separate from the session, save-at-sign-out** |
+| M82 | **The SESSION becomes a first-class thing** — §M81 gave the GUI a real identity (`cred_become_user` on a session leader) and stopped there.  What the identity does not yet carry is a *desktop*: every user should have their own program list, icon field, wallpaper and environment, and the greeter and the lock should be SEPARATE from the session rather than windows inside it.  Includes per-user and system-wide `PATH`, with the user's overriding, and saving a session's state at sign-out | UX / Security | ✅ 2026-09-27, DOCS §4.110: persistent homes, per-account desktop, program list enforced at launch, `env.PATH`/`HOME`, greeter shell, open programs saved and restored; two privilege holes closed on the way |
 | M83 | **Everything is a package, and the tree splits along the package lines** — asked for directly: *what can be, goes into its own repository; everything modular; everything manageable from `pkg` — desktop, compositor, GUI, Wayland, everything.*  Today no package can come from OUTSIDE the kernel image (every payload is a blob compiled into the 61 MB `kernel.bin`, and `/store` is ramfs rebuilt per boot), 21 registries are linker sections that only a build can fill, and a §M67 module can carry exactly one `struct driver` against 41 exported symbols.  Apps are proposed as RING-3 programs (§M65's `dosgui_ui_build` already exists), gui-core / shells / Wayland as module packages — and **every ring-0 component is reviewed** (must stay / could move / unknown cost, with the reason and a measured boundary-crossing cost), because most of them are in the kernel by history rather than by requirement.  Staged so the REPOSITORY split comes LAST, gated on a green boundary audit — a split along lines the code does not yet respect is a refactor done across repositories | Architecture / Packaging | §M83 — designed, not started |
 | M84 | **A mobile interface — d-os must run on a PHONE** — asked for directly (2026-09-25), with the reason stated: *this is also why everything has to be modular.*  A phone is a different desktop SHELL (§M22's `DESKTOP_SHELL()` registry already makes that a file), a different INPUT model (touch, gestures, an on-screen keyboard — there is no touch input anywhere in the tree today), a different FORM FACTOR (portrait, small, high density — §M65's size classes and §M69's `cp_px()` density are the start), and different HARDWARE (SoC, device tree, panel, battery, modem).  Staged: a mobile shell + touch on emulated hardware first, a phone-shaped `virt` second, a real device last.  Depends on §M83 (the mobile shell, keyboard and apps as packages chosen per device, not a second kernel build) and on §M85 (no hardcoded board) | UX / Platform | §M84 — designed, not started |
 | M85 | **aarch64 beyond `virt`: QEMU `sbsa-ref`** — asked for directly (2026-09-25).  The ARM port knows exactly ONE machine: ten places hardcode `virt`'s map (GICv2 at `0x08000000`, PL011 at `0x09000000`, virtio-mmio at `0x0a000000`, ECAM at `0x40_1000_0000`, RAM at `0x4000_0000`, the DTB loaded at `0x4800_0000`).  `sbsa-ref` is the reference for a STANDARD ARM server: firmware boot (TF-A + EDK2, UEFI), ACPI instead of a device tree, GICv3, devices on PCIe rather than virtio-mmio.  The deliverable is a port that DISCOVERS its board — which is also the precondition for any real phone (§M84) | Platform / Portability | ✅ COMPLETE (DOCS §4.99-§4.102, §4.105): board discovery, GICv3, UEFI + ACPI, relocatable kernel, disk/USB/network, bochs-display, PCI INTx routing (`_PRT` / `interrupt-map`).  Left for later: a real clock on sbsa-ref (UEFI runtime GetTime), a Normal-NC framebuffer mapping |
@@ -8415,110 +8415,13 @@ of a big window over the icon field still composites at §4.61's measured cost.
 
 ## §M82 — The session becomes a first-class thing
 
-Asked for directly, straight after §M81 made the GUI sign-in real: *"the sign-in
-screen has to be SEPARATED.  Every user has their own desktop environment too —
-their own program list, their own icon list, their own wallpaper.  The
-environment variables (PATH) belong here as well: per-user and system-wide, and
-a user may override the system one in their own account.  The lock is worth
-separating the same way, and signing out should save everything that needs
-saving."*
-
-### WHAT §M81 LEFT, PRECISELY
-
-§M81 fixed WHO a session is: the lock screen rebuilds the session on a leader
-task that calls `cred_become_user` before it has children, so the desktop, the
-compositor and every app-host carry the account (`ps` shows `root` where all
-three said `system`).  What it did not touch is WHAT a session is.  Today it is
-one global desktop that happens to be owned by somebody:
-
-- the icon field is `/desktop/*.lnk` — **one directory for the machine**, so two
-  users share one set of shortcuts and one arrangement;
-- the wallpaper is `gui.wallpaper`, already `CFG_SCOPE_USER` (§M32 marked 13
-  preference keys), and it is read by `gui_start` — which now runs on the
-  session leader AFTER `config_user_attach`, so this half may already work and
-  **has never been measured**;
-- the Start menu is the `GUI_APP()` registry, which is a LINKER SECTION: every
-  account sees every compiled-in app, and "their own program list" is not
-  expressible at all;
-- there is no `PATH`.  `pkg_run` resolves `/bin` by convention (§4.31), and
-  nothing anywhere reads an environment from the account.
-
-### THE FOUR PIECES, IN THE ORDER THEIR DEPENDENCIES ALLOW
-
-1. **THE GREETER IS NOT THE SESSION — structurally, not only in effect.**
-   §M81 made the sign-in *behave* like a display manager (authenticate, tear
-   down, rebuild) while the lock screen is still a `GUI_APP` window inside the
-   session it is about to replace.  That works and it is the wrong shape: the
-   greeter needs the compositor, and the compositor is what the teardown kills.
-   The seam to find is whether a minimal compositor can host the greeter with no
-   session behind it — which is also what makes a LOCK (same screen, session
-   still running underneath) and a SIGN-IN (no session yet) two states of one
-   surface rather than two code paths.
-
-2. **PER-USER DESKTOP STATE.**  The shortcut directory becomes the account's
-   (`~/.desktop` or `/home/<user>/desktop`), with the machine's as a fallback
-   for a session with no home — §M32 already creates homes and already has the
-   "no writable volume" path to be honest about.  The wallpaper needs measuring
-   before anything is built.  *The icon ARRANGEMENT is per-user by construction
-   once the directory is*, because §M64 stores the slot in the `.lnk`.
-
-3. **THE PROGRAM LIST.**  The hard one, and the one to design before coding: a
-   linker-section registry is a machine fact and cannot become per-user without
-   a second mechanism.  The honest shape is probably a per-account ALLOW/DENY
-   over the registry plus the §M35.5 store's installed packages, rather than a
-   second registry — *one list that some accounts see less of, not two lists
-   that can disagree.*
-
-4. **ENVIRONMENT, SYSTEM AND USER.**  `PATH` first because it has a client
-   (`pkgrun`'s hard-coded `/bin`).  The layering is exactly `config`'s — defaults,
-   machine store, user store (§M63/§M32) — so the mechanism exists and what is
-   missing is the NAME and a reader.  A user's value overrides the machine's;
-   whether it REPLACES or PREPENDS must be decided once and written down,
-   because both are defensible and silently picking one is how a `PATH` becomes
-   folklore.
-
-5. **SIGN-OUT SAVES.**  §M81 made signing out real (it restarts the session
-   rather than covering it), which is precisely what makes this necessary: the
-   previous user's tasks are now KILLED, so anything unsaved is gone.  What
-   needs saving has to be enumerated rather than guessed — icon positions
-   (already a file), open windows, per-user config that `config_user_detach`
-   already writes — and the enumeration is the deliverable, not a hook.
-
-### THE RISK THIS ONE CARRIES
-
-**A per-user desktop is a per-user FILE PATH, and `/mnt` is exFAT, which cannot
-store ownership at all** (users.h says so for uid reuse; it applies here too).
-So "their own icons" is enforced by the path and not by the filesystem — which
-is fine and must be STATED, because the difference between "another user cannot
-see these" and "another user is not shown these" is exactly the isolation
-theatre §M33 refuses by name.
-
-### PROGRESS — 2026-09-24: THE PREFERENCE BOUNDARY, AND A TEARDOWN BUG UNDER IT
-
-"Measure before building" on the per-user wallpaper found that the boundary
-itself was broken, not merely unbuilt:
-
-- **the GUI never withdrew a user.**  `config_user_detach` ran only on the text
-  `logout`; every GUI route that replaces a session now calls it
-  (`gui_session_main`, and `gui stop`).
-- **the cache had one layer.**  A user value overwrote the machine's, so
-  withdrawal fell back to the compiled default, the user's file was a snapshot
-  of every user-scoped key, and a machine save mid-session wrote the user's
-  choice into the machine store.  Entries now carry the machine value aside
-  (`user_set` / `machine`).
-- **the GUI teardown freed the screen while the compositor still drew on it.**
-  It waited for the session ROOT only; once that is dead its children are
-  re-parented to init and cannot be found from it.  `task_kill_tree_pids()`
-  captures the subtree at kill time and the teardown waits for all of it.  This
-  was the x86_64 GPF / NMI seen during the measurement, and very probably the
-  unexplained i386 NMI after `gui stop`.
-
-Two hidden falsifiers ship with it: `sessiontest <a> <b>` (four checks on the
-real `gui_session_restart_as`) and `sessionstorm <a> <b> <n> [mode]` (many
-session replacements, optionally painting a wallpaper and flipping the theme
-from a foreign task).  **The four pieces of §M82 proper are still not
-started**; the wallpaper question they began with is now answered: it IS
-per-user, and with this fix it stays that way across a switch.
+✅ Shipped 2026-09-27, see DOCS.md §4.110 (the 2026-09-24 preference-boundary
+work is §4.91/§4.108).  **Lessons learned:** (1) a hidden menu row is not a
+gate — the power and Exit-GUI rows had to be refused where they are carried
+out, because Exit GUI hands the person a SYSTEM console; (2) the console behind
+a desktop is a second door to the same place (keys no window wants reach it);
+(3) every GUI test ran as an administrator, so an ordinary account's lost
+`.unsaved` copy was invisible until a test signed in as one.
 
 ## §M83 — Everything is a package, and the tree splits along the package lines
 

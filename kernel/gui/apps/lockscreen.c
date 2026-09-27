@@ -75,6 +75,12 @@ struct lock_state {
     struct w_textinput*  pass;
     struct w_label*      status;
     int                  unlocked;
+    /* §M82 (2026-09-27) — set LAST by lock_layout, after the default account
+     * has been pre-chosen.  The instrument used to wait for `pass`, which the
+     * layout creates BEFORE it pre-chooses — so a test's choice could land
+     * first and be overwritten by the default, submitting bob's password for
+     * root (seen as "authentication FAILED for 'root'" one run in two). */
+    volatile int         ready;
 };
 
 /* ---------------------------------------------------------------------------
@@ -163,6 +169,7 @@ void gui_session_clear(void) { g_session_user[0] = 0; }
 
 /* Raising re-enters from on_close (a lock that was dismissed comes back), so
  * the two refer to each other and one of them has to be declared first. */
+int gui_greeter_active(void);          /* §M82 — gui.c */
 int gui_lock_raise(void);
 int gui_lock_active(void);
 
@@ -387,6 +394,7 @@ static void lock_closed(struct gui_window* w) {
     g_lock.picker = NULL;
     g_lock.pass = NULL;
     g_lock.status = NULL;
+    g_lock.ready = 0;
     /* NOT while the session is ending: the orderly end asks every window to
      * close, this one included, and a lock that came straight back would be a
      * new window opened in the middle of the teardown, for a session that is
@@ -416,7 +424,10 @@ static void lock_build(void) {
      * is no such convention in the WM.  GUI_PLACE_DIALOG is that intent, and
      * the wrong answer can no longer be spelled. */
     struct gui_window* win = gui_app_open(&(struct gui_app_spec){
-        .title = "Locked",
+        /* §M82 — ONE SURFACE, TWO STATES, and the words say which: over a
+         * running session it is a lock ("this screen is locked"); with nobody
+         * signed in there is nothing to unlock, it is the sign-in. */
+        .title = gui_greeter_active() ? "Sign in" : "Locked",
         .content_w = cp_px(400), .content_h = cp_px(300),
         .place = GUI_PLACE_DIALOG,
         .layout = lock_layout, .on_close = lock_closed,
@@ -483,7 +494,7 @@ static void lock_layout(struct gui_window* win) {
     int y = cp_px(14);
 
     w_label_create(win, pad, y, cw - 2 * pad,
-                   "lock.prompt");
+                   gui_greeter_active() ? "lock.prompt.signin" : "lock.prompt");
     y += cp_row_h() + cp_px(6);
 
     int list_h = ch - y - 2 * cp_btn_h() - cp_px(26);
@@ -530,6 +541,7 @@ static void lock_layout(struct gui_window* win) {
         }
     }
     gui_window_focus_widget(win, (struct widget*)g_lock.pass);
+    __atomic_store_n(&g_lock.ready, 1, __ATOMIC_RELEASE);
 }
 
 /* ---------------------------------------------------------------------------
@@ -561,9 +573,9 @@ void gui_lock_test(const char* creds) {
      * that was never spawned.  Bounded so a lock that genuinely never lays out
      * reports it instead of hanging the instrument. */
     int waited = 0;
-    for (; !g_lock.pass && waited < 60000; waited++)
+    for (; !__atomic_load_n(&g_lock.ready, __ATOMIC_ACQUIRE) && waited < 60000; waited++)
         task_yield();
-    if (!g_lock.pass) {
+    if (!g_lock.ready || !g_lock.pass) {
         kprintf("locktest: the fields never appeared - the window was "
                 "created but never laid out\n");
         return;
@@ -612,7 +624,17 @@ void gui_lock_test(const char* creds) {
  * GUI takes over is the only kind of switch that can reach a state in which
  * typing is impossible.  The command form stays for a human at a second pane. */
 static void cmd_lock(const char* args) {
-    if (args && args[0]) { gui_lock_test(args); return; }
+    if (args && args[0]) {
+        /* The command form must RAISE the lock first.  It used to go straight
+         * to gui_lock_test, which only waits for fields that exist while the
+         * lock is up — so on an unlocked desktop it waited a minute and
+         * reported "never laid out", about a window nobody had asked for.  The
+         * `gui.locktest` key hid it: that path runs after the boot lock is
+         * already up (§M82, 2026-09-27). */
+        if (gui_is_active() && !gui_lock_active()) gui_lock_raise();
+        gui_lock_test(args);
+        return;
+    }
     if (!gui_is_active()) { console_write("lock: the desktop is not running\n"); return; }
     if (gui_lock_raise() == 0) console_write("lock: screen locked\n");
 }

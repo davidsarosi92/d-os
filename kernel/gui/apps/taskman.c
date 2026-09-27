@@ -760,4 +760,4 @@ static void taskman_open(void) {
     tm_refresh(win);
 }
 
-GUI_APP_ICON("Task Manager", taskman_open, ICON_CHART);
+GUI_APP_ESSENTIAL("Task Manager", taskman_open, ICON_CHART);

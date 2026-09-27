@@ -59,7 +59,7 @@ struct session_req {
     int  ngroups;
     int  groups[CRED_MAX_GROUPS];
     char name[USER_NAME_MAX + 1];
-    char home[USER_PATH_MAX + 1];
+    char home[USER_PATH_MAX + 8];
     int* cfg_token;             /* where the session reports its seat token */
 };
 
@@ -162,7 +162,10 @@ static int do_login(const char* name_in, const char* pw_in) {
     r->session = cred_session_alloc();
     r->ngroups = user_groups_of(u->uid, r->groups, CRED_MAX_GROUPS);
     for (int i = 0; u->name[i] && i < (int)sizeof r->name - 1; i++) r->name[i] = u->name[i];
-    for (int i = 0; u->home[i] && i < (int)sizeof r->home - 1; i++) r->home[i] = u->home[i];
+    {   /* §M82 — the REAL home (on the volume when there is one). */
+        const char* h = user_home(u);
+        for (int i = 0; h[i] && i < (int)sizeof r->home - 1; i++) r->home[i] = h[i];
+    }
 
     /* Bind the SAME console the caller is using, at spawn.  §M49 moved console
      * binding into the spawn because doing it afterwards is an SMP race: the

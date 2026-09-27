@@ -39,6 +39,7 @@
  * (no `pane kill` yet — tracked as an M14 follow-up in PLAN.md).
  * ============================================================================= */
 
+#include "klog.h"
 #include "vc.h"
 #include "splash.h"
 #include "fd.h"                       /* fd_readiness_signal (§M56) */
@@ -411,6 +412,21 @@ void vc_kbd_push_to(struct vc* v, char c) {
     if (c == '\n') fd_readiness_signal();
 }
 
+/* §M82 (2026-09-27) — THE CONSOLE BEHIND A DESKTOP IS SEALED while an
+ * ordinary account holds that desktop.  Keystrokes no window wants fall
+ * through to the focused VC, which behind the GUI is the boot console — a
+ * shell running as SYSTEM.  That is how the harness types with the desktop
+ * up, and it was also how anybody signed in to the desktop could type
+ * commands, unseen, into a shell with the machine's privileges.  An
+ * administrator's session leaves it open (the harness, and nothing an admin
+ * could not do anyway); a non-admin's drops those keys and says so once. */
+static volatile int console_sealed;
+static int sealed_said;
+void vc_console_seal(int on) {
+    console_sealed = on;
+    sealed_said = 0;
+}
+
 void vc_kbd_push(char c) {
     /* §M62 — any key drops the boot splash.  A boot screen you cannot get out
      * of hides the answer exactly when it is wanted; the key is consumed so it
@@ -418,6 +434,14 @@ void vc_kbd_push(char c) {
     if (splash_active()) { splash_key(); return; }
 
     if (kbd_hook && kbd_hook(c)) return;        /* consumed by the GUI */
+    if (console_sealed) {
+        if (!sealed_said) {
+            sealed_said = 1;
+            klog(KLOG_NOTICE, "vc", "key for the system console dropped - "
+                 "the desktop belongs to an ordinary account\n");
+        }
+        return;
+    }
     struct vc* v = focused;             /* snapshot — pointer-sized atomic */
     vc_kbd_push_to(v, c);
 }

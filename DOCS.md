@@ -14868,8 +14868,88 @@ travels is only as private as the least careful system that touches it.
 **Found on the way:** `cat` and `ls` printed `not found` for a file that exists
 and was refused — they say `permission denied` now.
 
+### 4.110 The session is a person's: home, desktop, program list, PATH, sign-in screen (§M82, 2026-09-27)
+
+§M81 gave the GUI session an identity; §M82 gives it the things a person
+expects to be theirs.  Five pieces, each measured.
+
+**1. Homes that survive.**  `/home` was on ramfs, so every home evaporated at
+each boot while the account database survived.  With a writable volume a home
+now lives there (`/mnt/home/<name>`, `/mnt/root`): the database keeps the
+logical `/home/<name>`, and `user_home()` answers the real path, computed at
+attach time so a boot with no disk still works.  Created 0700 and owned by the
+account — stored on disk since §4.109.  `users` shows the real path.
+
+**2. A desktop per account.**  `shortcut_use_account(home)`: the session
+leader, after becoming the account, switches the icon field to
+`<home>/desktop` (created by the account, so it is theirs); sign-out switches
+back to the machine's.  Icon positions come along, since §M64 stores them in
+each `.lnk`.  A new account's desktop starts empty (§M64's no-auto-populate
+rule, per person).  *Measured:* alice adds an icon; bob's desktop has none;
+back to alice, it is there.
+
+**3. The program list.**  One registry that some accounts see less of:
+- `apps.allow.<account>` — a MACHINE key (undeclared, so administrators only):
+  `*`/absent = everything, otherwise a list.  `apps <account> allow <list>|all`.
+- `gui.apps.hide` — the account's own preference (not a restriction).
+- **Enforced at launch**, in the compositor's queue drain (which runs as the
+  session's account): Start menu, shortcuts, `launch`, file associations and
+  Ctrl+Alt+Del all end there.  **Essential apps** (`GUI_APP_ESSENTIAL`, today the
+  Task Manager — §M46's way out of a wedged session) cannot be removed or
+  hidden.
+- *Measured:* bob limited to File Manager + Editor → his Start menu shows those
+  and the Task Manager (picture), `launch Control Panel` → `not on bob's
+  program list - not started`.
+
+**4. Environment.**  `env.PATH` is a USER-scoped setting with machine default
+`/bin`; an account's value REPLACES the machine's, and a literal `$PATH` in it
+stands for the machine's value (so `~/bin:$PATH` prepends and `/opt/x` replaces
+— the shell convention, and the choice is visible in the value).  `HOME` is the
+account's real home.  Built per exec from the caller's config layer.
+*Measured:* bob's `env` prints `PATH=/home/bob/bin:/bin HOME=/mnt/home/bob`, the
+system shell's stays `/bin` and `/`.
+
+**5. Signing out saves — enumerated:** preferences (on every change), icons
+(their `.lnk`), unsaved documents (asked, `.unsaved` on a forced route), and
+now **the open programs**: the orderly end records them into the account's
+`gui.session.apps` and the next sign-in starts them again (`gui.session.restore`,
+default on; the program list still applies).  *Measured:* alice's File Manager +
+Editor recorded, nothing started for bob, both back for alice.
+
+**6. The sign-in screen is not a desktop for nobody.**  With no account in the
+session and a greeter needed, `pick_shell` chooses the new `greeter` shell:
+wallpaper, a strip with the time, the sign-in window — no Start menu, no tray,
+no icons.  No program starts at the greeter (every launch door would run one as
+SYSTEM).  The window says which state it is in: **Sign in / "Nobody is signed
+in"** at the greeter, **Locked** over a running session — one window, one
+submit, two backdrops.
+
+**Found on the way — two privilege holes, both closed and measured:**
+- **The Start menu's Reboot, Shut Down and Exit GUI were ungated**, while the
+  shell's `reboot`/`shutdown`/`gui stop` require an administrator — and **Exit
+  GUI drops to the text console, whose shell runs as SYSTEM**: a one-click
+  escalation for any account.  Those rows are shown to administrators only, and
+  the compositor REFUSES them for anyone else where they are carried out
+  (`gui: Shut Down refused - 'bob' is not an administrator`).
+- **Keys no window wanted reached the SYSTEM console behind the desktop** (that
+  is how the harness types with a desktop up — and how anybody at the desktop
+  could).  `vc_console_seal()`: sealed while an ordinary account holds the
+  desktop, and at the greeter.  *Measured with a control:* the same typed
+  `useradd evil` creates the account in root's session and is dropped in bob's.
+
+**Also found and fixed:** the Editor's forced-close copy went next to the file
+and was simply lost when that directory was not the account's — it falls back
+to `<home>/<name>.unsaved` (`logouttest editor` PASS as an ordinary account and
+as root); `lock user:pw` never raised the lock, so it waited a minute for fields
+nobody had asked for; and the lock instrument could submit into the default
+account (the layout pre-chose it AFTER creating the field the test waited for —
+`ready` is set last now).
+
+**Not done:** two live desktops at once (fast user switching).
+
 ## 8. Change log
 
+- **2026-09-27 — §M82: persistent homes, a desktop and a program list per account (enforced at launch), `env.PATH`/`HOME`, open programs restored at sign-in, a greeter shell; the Start menu's power/Exit-GUI rows and the console behind the desktop were privilege holes — closed (DOCS §4.110).**
 - **2026-09-27 — §M32 closed: owner and mode stored on exFAT in a Vendor Extension entry inside each file's entry set; `setattr` dir-op; `stat`; verified across reboots and a Linux mount; `cat`/`ls` say `permission denied` (DOCS §4.109).**
 - **2026-09-27 — §M32: simultaneous sessions — one config layer per signed-in account, resolved by the caller; the desktop takes the seat, a text login beside it runs in the background (`seattest`); one session-id allocator (DOCS §4.108).**
 - **2026-09-27 — §M26/§M59 closed: `wl_data_device` bridged to the d-os clipboard (UTF-8 ↔ Latin-2), `wlclip`; whole-message Wayland sends; `pipe`/`pipe2` as shared ABI ops (i386 had none); excursions return the exit status; program output no longer interleaves with kernel messages; UTF-8 on COM1 becomes Latin-2 (DOCS §4.107).**

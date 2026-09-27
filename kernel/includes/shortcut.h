@@ -68,6 +68,8 @@ struct item_model;
 /* Re-read `/desktop` into the in-memory list.  Cheap and idempotent; called at
  * GUI start and after any change.  Returns the number of shortcuts. */
 int  shortcut_reload(void);
+/* §M82 — use `<home>/desktop` (the account's own), or the machine's for NULL. */
+int  shortcut_use_account(const char* home);
 
 /* The item model over the loaded shortcuts — hand this to any item_view. */
 const struct item_model* shortcut_model(void);
