@@ -15119,8 +15119,68 @@ for ~2300–4600 pages.
 present; the round marker is 8 bits (a frame unmapped for exactly 256 rounds
 keeps a stale age once).
 
+### 4.113 One copy of a file page: the page cache (§M74 rung 2, 2026-09-27)
+
+**What was true:** every file mapping was an eager private copy, and so was the
+kernel's load of the interpreter, which **in musl IS libc.so**. So every dynamic
+program carried its own copy of musl (and of libstdc++, Mesa, NetSurf's
+libraries).  There was no page cache: `block_cache.c` caches disk sectors under
+the filesystem.
+
+**Now (`kernel/mem/pcache.c`):** a (file, page) → frame cache.  A private file
+mapping, and the ELF loader when its image came from a file (the interpreter;
+`elf_load_ex_file`), map the cached frame **copy-on-write**.  The frame's COW
+share count is the whole lifetime story, so no new page-table semantics were
+needed:
+- the cache holds one share and each mapping another;
+- a write copies first, so the cached frame is never written through;
+- teardown, `munmap` and a `MAP_FIXED` overlay drop a share, and fork adds one;
+- §M72's eviction keeps COW pages, and `mprotect` keeps them COW.
+
+The cache drops a page only when it is the sole holder (and frees it). A
+still-mapped page is **detached**: the mappings keep the frame and the last of
+them frees it.  The key is an id given to the inode on first use, not its
+address (inodes are allocated zeroed, so a reused address never hits a dead
+file).  Invalidated by a write, truncation on open, unlink and unmount.  The
+loader shares only a segment's middle pages: the first and last may be merged
+with a neighbouring segment by writing into them.  `mem.pagecache` (default on);
+`pcache [drop]`.
+
+**Measured** (`sharetest`, hidden): two dynamic programs, the cache off and then
+on. The second program costs **1760 → 1140 KB on i386 (620 KB less) and
+1704 → 1124 KB on x86_64 (580 KB less)**, reading 0 pages from files (155 / 145
+cache hits).  NetSurf starts and renders with 7843 of its pages mapped from the
+cache.  `pcachetest` (hidden, all three arches): one frame and one read for two
+lookups, a write drops the page, only unmapped pages are reclaimable.
+**Reclaim under pressure, in the default configuration and with no disk:** on
+a 512 MiB machine, `memhog fill` drove memory to the reserve and the `memage`
+service gave back all 706 cached pages (`memory low - gave back …`).
+
+**Defects found on the way, all fixed:**
+- **x86_64 `vmm_space_map` masked off `VMM_COW`**, so a COW mapping made
+  through it became a plain read-only page and the first write killed the
+  program (`solibtest` → SIGSEGV).  Fork writes its entries directly, which is
+  why nothing had hit it.
+- **aarch64 `vmm_space_map` mapped every user page WRITABLE** whatever it was
+  asked, and dropped `VMM_COW`: a read-only mapping on ARM had never been
+  read-only, and a cache mapping would have let a program write into everyone's
+  copy.
+- **The loader's first draft passed the source file through a global**, which
+  two CPUs loading at once would share; it is a parameter.
+
+**Deliberate limits, written into pcache.c:**
+- Not demand paging: pages are mapped when the file is mapped (mapping on fault
+  needs VMAs).
+- A mapped cache page is not reclaimable (that needs a reverse map).
+- A write to a READ-ONLY file page gets a private writable copy instead of
+  SIGSEGV, because classic i386 has no spare PTE bit to remember "never
+  writable".
+- A program exec'd from the VFS still has its own image copied (only the
+  interpreter goes through the cache today).
+
 ## 8. Change log
 
+- **2026-09-27 — §M74 rung 2: a page cache; private file mappings and the interpreter (musl's libc.so) are shared copy-on-write — the second dynamic program costs 580-620 KB less; reclaim of unmapped cache pages under pressure with no disk; `unmap` releases what it held and `munmap` is real.  Fixed: x86_64 `map` dropped `VMM_COW`, aarch64 `map` made every user page writable (DOCS §4.113).**
 - **2026-09-27 — §M74 rung 1: the accessed-bit sweep (`vmm_space_age` on three arches, ARM access-flag faults, `memage`, `mem.age_ms`/`mem.cold_ms`, `agetest`).  Fixed: aarch64 `eret` with interrupts enabled (a nested IRQ clobbered ELR/SPSR), `mprotect(PROT_WRITE)` on fork-shared COW pages (write-through; x86_64 lost the COW mark), an unlocked `execve` mm swap under the space walkers, a parent's death force-killing (and crash-reporting) its children (DOCS §4.112).**
 - **2026-09-27 — §M72: a memory and a disk reserve that refuse, `df`; pause (`TASK_STOPPED`, `stop`/`cont`, SIGSTOP/SIGCONT); pause + evict to a swap store with the record in the PTE (`stop -e`, Task Manager, `AUDIT(swap-runnable)`, `evicttest`).  Fixed on the way: O(n²) exFAT chain walks, the block cache reading sectors about to be overwritten, `kill` of a sleeping program spinning it forever, ARM crt0 ignoring argv, an implicitly declared 64-bit allocator, ring-3 edu DMA out of reach (DOCS §4.111).**
 - **2026-09-27 — §M82: persistent homes, a desktop and a program list per account (enforced at launch), `env.PATH`/`HOME`, open programs restored at sign-in, a greeter shell; the Start menu's power/Exit-GUI rows and the console behind the desktop were privilege holes — closed (DOCS §4.110).**

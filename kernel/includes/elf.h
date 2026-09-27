@@ -63,6 +63,11 @@ struct elf_load_info {
  * caller should destroy `space` to reclaim any frames already mapped). */
 int elf_load_ex(struct vmm_space* space, const void* image, size_t len,
                 uintptr_t load_bias, struct elf_load_info* out);
+/* §M74 — the same, for an image read whole from `src`: pages that can be
+ * shared come from the page cache (copy-on-write) instead of being copied. */
+struct file;
+int elf_load_ex_file(struct vmm_space* space, const void* image, size_t len,
+                     uintptr_t load_bias, struct elf_load_info* out, struct file* src);
 
 /* Back-compat thin wrapper: load a static/native image at its own vaddrs and
  * hand back just the entry point (the pre-§M37 contract). */

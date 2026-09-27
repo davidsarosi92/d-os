@@ -51,6 +51,7 @@
 #include "timer.h"
 #include "lock.h"
 #include "proc.h"
+#include "pcache.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -197,13 +198,31 @@ int memage_task_split(int pid, uint64_t* hot, uint64_t* warm, uint64_t* cold) {
 
 /* ---- the service ----------------------------------------------------------- */
 
+/* §M74 rung 2 — reclaim under pressure, the rung that works with swap off and
+ * with no disk at all: when free memory has fallen to within twice the reserve,
+ * unmapped page-cache pages go back (they are copies of files; nothing is
+ * lost).  Announced once per crossing. */
+static void pressure_reclaim(void) {
+    uint32_t rkb = 0; int low = 0;
+    pmm_reserve_stats(&rkb, NULL, &low);
+    uint32_t water = (rkb / 4u) * 2u + 256u;           /* frames: 2x reserve + 1 MiB */
+    static int told;
+    if (pmm_free_frames() >= water) { told = 0; return; }
+    uint32_t n = pcache_reclaim(256);
+    if (n && !told) {
+        told = 1;
+        kprintf("memage: memory low - gave back %u cached file page(s)\n", n);
+    }
+}
+
 static void memage_main(void) {
     for (;;) {
         int ms = cfg_ms("mem.age_ms", 1000);
-        if (ms <= 0) { task_msleep(1000); continue; }  /* off: look again later */
+        if (ms <= 0) { task_msleep(1000); pressure_reclaim(); continue; }
         if (ms < 50) ms = 50;
         task_msleep((uint32_t)ms);
         memage_sweep();
+        pressure_reclaim();
     }
 }
 SERVICE("memage", memage_main, /*autostart*/1, SVC_RESTART_ALWAYS);

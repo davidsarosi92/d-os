@@ -164,6 +164,10 @@ struct inode {
     int      owner_uid;
     int      owner_gid;
     uint32_t mode;
+    /* §M74 rung 2 — this file's identity in the page cache, given on first
+     * use.  0 until then, and every filesystem allocates inodes zeroed, so a
+     * new inode at a reused address can never match a dead file's pages. */
+    uint32_t pc_id;
 };
 
 /* Directory entry — name + inode pointer + tree links.  We keep an

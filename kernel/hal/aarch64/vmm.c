@@ -499,12 +499,24 @@ void vmm_space_destroy(struct vmm_space* s) {
 int vmm_space_map(struct vmm_space* s, uintptr_t va, uintptr_t pa, uint32_t flags) {
     if (!s) return -1;                              /* kernel space not user-mappable */
     int rc = aarch64_vmm_map_user(s, va, pa, 4096, (flags & VMM_EXEC) ? 1 : 0);
-    if (rc == 0 && (flags & VMM_SHARED)) {      /* tag borrowed frame in L3 */
+    /* THE WRITE BIT AND THE COW MARK ARE HONOURED (2026-09-27).  This mapped
+     * every user page WRITABLE whatever it was asked, and dropped VMM_COW — so
+     * on ARM a read-only mapping was never read-only, and a COW mapping made
+     * through this call (§M74's page cache: one frame shared by every program
+     * that maps the file) would have let a program write straight into
+     * everybody's copy.  Fork's clone writes its entries directly, which is
+     * why nothing had noticed. */
+    if (rc == 0 && (flags & (VMM_SHARED | VMM_COW) || !(flags & VMM_WRITABLE))) {
         uint64_t e1 = s->l1[(va >> 30) & 0x1FF];
         uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
         uint64_t e2 = l2[(va >> 21) & 0x1FF];
         uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
-        l3[(va >> 12) & 0x1FF] |= PTE_SW_SHARED;
+        uint64_t e = l3[(va >> 12) & 0x1FF];
+        if (flags & VMM_SHARED) e |= PTE_SW_SHARED;           /* borrowed frame */
+        if (flags & VMM_COW)    e |= PTE_SW_COW;
+        if (!(flags & VMM_WRITABLE) || (flags & VMM_COW)) e |= PTE_AP_RO_BIT;
+        l3[(va >> 12) & 0x1FF] = e;
+        __asm__ volatile ("dsb ishst" ::: "memory");
     }
     return rc;
 }

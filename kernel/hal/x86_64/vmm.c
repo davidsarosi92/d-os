@@ -699,8 +699,14 @@ int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
      * or redirect an existing translation, and only that needs every CPU told.
      * A fresh map is free — nothing has it cached. */
     int was_present = (pt[IDX_PT(virt)] & PTE_P) != 0;
+    /* VMM_COW rides in bit 11 like VMM_SHARED in bit 10 (2026-09-27): it was
+     * masked off here, so a COW mapping made through this call became a plain
+     * read-only page and the first write killed the program (found by §M74's
+     * page cache, whose mappings are COW; fork's clone writes its entries
+     * directly and never hit it).  A COW page is never writable in the entry. */
+    if (flags & VMM_COW) flags &= ~(uint32_t)PTE_RW;
     pt[IDX_PT(virt)] = ((uint64_t)phys & PAGE_MASK_4K)
-                     | PTE_P | ((uint64_t)flags & (PTE_RW | PTE_US | VMM_SHARED))
+                     | PTE_P | ((uint64_t)flags & (PTE_RW | PTE_US | VMM_SHARED | VMM_COW))
                      | nx_bits(flags);
     if (was_present) hal_tlb_shootdown(0, virt);
     else             invlpg(virt);

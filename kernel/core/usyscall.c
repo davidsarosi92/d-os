@@ -40,6 +40,7 @@
 #include "timerfd.h"       /* §M53 stage 3 — timer descriptors */
 #include "epoll.h"          /* §M56 — readiness sets            */
 #include "vmm.h"
+#include "pcache.h"
 #include "printf.h"
 #include "audit.h"     /* §M71 — the boundary audit registers here */
 #include "uaccess.h"   /* §1.1 — fault-safe user copies (exception table) */
@@ -495,6 +496,7 @@ long sys_mmap(size_t len, int fd) {
 #define PROT_READ   0x1
 #define PROT_WRITE  0x2
 #define PROT_EXEC   0x4
+#define MAP_SHARED      0x01      /* §M74 — Linux value, same on all three arches */
 #define MAP_FIXED       0x10
 #define MAP_ANONYMOUS   0x20
 
@@ -554,6 +556,27 @@ long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
         }
         if (o->kind != FD_VFS || !o->file) return -1;
         file = o->file;
+    }
+
+    /* §M74 rung 2 — a PRIVATE file mapping shares the page cache's frames
+     * copy-on-write (pcache.c): two programs mapping libc.so hold one copy of
+     * it, and a write by either copies first.  A MAP_SHARED file mapping, an
+     * unaligned offset and the cache switched off keep the eager private copy
+     * below. */
+    if (file && !(flags & MAP_SHARED) && !(offset & (PAGE_SIZE - 1)) &&
+        pcache_enabled()) {
+        for (int i = 0; i < n; i++) {
+            uintptr_t page_va = va + (uintptr_t)i * PAGE_SIZE;
+            if (flags & MAP_FIXED) vmm_space_unmap(t->mm, page_va);
+            pmm_phys_t fr;
+            if (pcache_map_page(file, offset / PAGE_SIZE + (uint64_t)i, &fr) != 0) return -1;
+            if (vmm_space_map(t->mm, page_va, fr,
+                              (vf & ~(uint32_t)VMM_WRITABLE) | VMM_COW) != 0) {
+                if (vmm_frame_unshare(fr)) pmm_free_frame(fr);   /* cannot be last */
+                return -1;
+            }
+        }
+        return (long)va;
     }
 
     for (int i = 0; i < n; i++) {

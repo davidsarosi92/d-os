@@ -103,9 +103,18 @@ static struct placed_page* placed_find(struct placed_set* ps, uintptr_t va) {
     return NULL;
 }
 
+/* §M74 rung 2 — the FILE the image was read from, when there is one (an
+ * interpreter, a program exec'd from the VFS).  A page lying wholly inside a
+ * segment's file data at a page-aligned file offset then comes from the page
+ * cache, mapped copy-on-write, instead of being copied: every program started
+ * through the same ld.so / libc.so shares one copy of its text.  A PARAMETER,
+ * not a load-scoped global: two CPUs load programs at once, and a global would
+ * map one file's pages into the other's program. */
+#include "pcache.h"
+
 static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len,
                        const struct phdr_norm* p, uintptr_t bias,
-                       struct placed_set* placed) {
+                       struct placed_set* placed, struct file* src) {
     if (p->offset + p->filesz < p->offset) return ELF_ESEGBOUND;   /* overflow */
     if (p->offset + p->filesz > len)       return ELF_ESEGBOUND;
 
@@ -121,6 +130,23 @@ static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len
         /* §M86 — a USER page, so it may come from highmem, and the kernel
          * writes it through a short kmap rather than the direct map. */
         uintptr_t va = va_base + off;
+        /* §M74 — from the page cache, when it is safe to share: a MIDDLE page
+         * of the segment (the first and last may be merged with a neighbour
+         * segment below, which writes into them), wholly file data, at a
+         * page-aligned file offset. */
+        if (src && off != 0 && off + PAGE_SIZE < span && off >= page_off &&
+            (off - page_off) + PAGE_SIZE <= p->filesz &&
+            !((p->offset + (off - page_off)) & (PAGE_SIZE - 1)) &&
+            !placed_find(placed, va) && pcache_enabled()) {
+            pmm_phys_t fr;
+            if (pcache_map_page(src, (p->offset + (off - page_off)) / PAGE_SIZE, &fr) == 0) {
+                if (vmm_space_map(space, va, fr,
+                                  (flags & ~(uint32_t)VMM_WRITABLE) | VMM_COW) == 0)
+                    continue;
+                if (vmm_frame_unshare(fr)) pmm_free_frame(fr);
+            }
+            /* no cache page: fall through to the private copy */
+        }
         struct placed_page* prev = placed_find(placed, va);
         pmm_phys_t frame = prev ? prev->frame : pmm_alloc_frame_user();
         if (!frame) return ELF_ENOMEM;
@@ -164,8 +190,8 @@ static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len
     return ELF_OK;
 }
 
-int elf_load_ex(struct vmm_space* space, const void* image_v, size_t len,
-                uintptr_t load_bias, struct elf_load_info* out) {
+static int elf_load_impl(struct vmm_space* space, const void* image_v, size_t len,
+                         uintptr_t load_bias, struct elf_load_info* out, struct file* src) {
     const uint8_t* image = (const uint8_t*)image_v;
     struct placed_set placed;                   /* §M86 — shared boundary pages */
     placed.n = 0;
@@ -264,7 +290,7 @@ int elf_load_ex(struct vmm_space* space, const void* image_v, size_t len,
             eh.phoff < p.offset + p.filesz)
             phdr_from_load = p.vaddr + bias + (eh.phoff - p.offset);
 
-        int rc = map_segment(space, image, len, &p, bias, &placed);
+        int rc = map_segment(space, image, len, &p, bias, &placed, src);
         if (rc != ELF_OK) return rc;
         loaded++;
     }
@@ -278,6 +304,17 @@ int elf_load_ex(struct vmm_space* space, const void* image_v, size_t len,
         out->phdr_uva = phdr_from_pt ? phdr_from_pt : phdr_from_load;
     }
     return ELF_OK;
+}
+
+/* §M74 — elf_load_ex with the file the image was read from (see g_elf_src).
+ * The image must be the file's whole contents, byte for byte. */
+int elf_load_ex_file(struct vmm_space* space, const void* image, size_t len,
+                     uintptr_t load_bias, struct elf_load_info* out, struct file* src) {
+    return elf_load_impl(space, image, len, load_bias, out, src);
+}
+int elf_load_ex(struct vmm_space* space, const void* image, size_t len,
+                uintptr_t load_bias, struct elf_load_info* out) {
+    return elf_load_impl(space, image, len, load_bias, out, NULL);
 }
 
 int elf_load(struct vmm_space* space, const void* image, size_t len,

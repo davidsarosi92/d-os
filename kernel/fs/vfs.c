@@ -24,6 +24,7 @@
  * ============================================================================= */
 
 #include "vfs.h"
+#include "pcache.h"
 #include "block_cache.h"
 #include "kmutex.h"
 #include "cred.h"
@@ -422,6 +423,7 @@ static struct file* vfs_open_unlocked(const char* path, int flags) {
      * overwrite from the start, and the next save round-trip is clean. */
     if ((flags & VFS_TRUNC) && d->inode->type == INODE_FILE) {
         d->inode->size = 0;
+        pcache_invalidate(d->inode);             /* §M74 — its pages are gone */
     }
 
     struct file* f = (struct file*)kcalloc(1, sizeof(struct file));
@@ -463,6 +465,10 @@ ssize_t vfs_write(struct file* f, const void* buf, size_t n) {
     if (!f || !f->inode || !f->inode->ops || !f->inode->ops->write) return -1;
     ssize_t r = f->inode->ops->write(f, buf, n, f->pos);
     if (r > 0) f->pos += (uint64_t)r;
+    /* §M74 — the file changed: a cached copy of it is now wrong.  After the
+     * write and outside the filesystem's lock (the cache reads through the
+     * filesystem, so the order is always cache -> fs, never the reverse). */
+    if (r > 0 && f->inode->pc_id) pcache_invalidate(f->inode);
     return r;
 }
 
@@ -592,6 +598,7 @@ static int vfs_unlink_unlocked(const char* path) {
     if (d->inode->type == INODE_DIR && d->children) return -2;   /* not empty */
     if (d->inode->type == INODE_DEVICE) return -1;               /* devfs nodes */
 
+    pcache_invalidate(d->inode);                 /* §M74 — before the inode goes */
     int r = parent->inode->dir_ops->unlink(parent->inode, last, d->inode);
     if (r != 0) return r;
 
@@ -964,7 +971,12 @@ static int vfs_umount_unlocked(const char* path) {
     return 0;
 }
 int vfs_umount(const char* path) {
-    return NS_LOCKED(int, vfs_umount_unlocked(path));
+    int r = NS_LOCKED(int, vfs_umount_unlocked(path));
+    /* §M74 — the volume's inodes are gone; nothing may still hit their pages.
+     * The cache has no per-filesystem index, and an unmount is rare, so the
+     * whole cache goes (mapped pages are detached, not freed). */
+    if (r == 0) pcache_drop_all();
+    return r;
 }
 
 int vfs_mount_hold(const char* path, const char* who) {

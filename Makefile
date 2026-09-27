@@ -77,7 +77,7 @@ MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o \
 MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
                    user/libgreet_blob.o user/solibtest_dynblob.o \
                    user/thrdyn_dynblob.o \
-                   user/dlopentest_dynblob.o
+                   user/dlopentest_dynblob.o user/dynhold_dynblob.o
 # §M38 C++ runtime artifacts (cpptest = exceptions across a .so + the .so's).
 CXX_RUNTIME_BLOBS := user/cpptest_cxxblob.o user/libcpplib_blob.o \
                      user/libstdcxx_blob.o user/libgccs_blob.o
@@ -822,6 +822,7 @@ CORE_C_SRCS := \
     kernel/mem/pmm.c \
     kernel/mem/swap.c \
     kernel/mem/memage.c \
+    kernel/mem/pcache.c \
     kernel/mem/vmm_account.c \
     kernel/mem/kmalloc.c \
     kernel/mem/slab.c \
@@ -981,6 +982,7 @@ CORE_C_SRCS := \
     kernel/mem/pmm.c \
     kernel/mem/swap.c \
     kernel/mem/memage.c \
+    kernel/mem/pcache.c \
     kernel/mem/vmm_account.c \
     kernel/mem/slab.c \
     kernel/mem/kmalloc.c \
@@ -1165,6 +1167,7 @@ CORE_C_SRCS := \
     kernel/mem/pmm.c \
     kernel/mem/swap.c \
     kernel/mem/memage.c \
+    kernel/mem/pcache.c \
     kernel/mem/vmm_account.c \
     kernel/mem/kmalloc.c \
     kernel/mem/slab.c \

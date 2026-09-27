@@ -324,12 +324,15 @@ static int load_program(struct vmm_space* s, const void* image, size_t len,
         uint8_t* iimg = (uint8_t*)kmalloc(isz);
         if (!iimg) { vfs_close(f); return ELF_ENOMEM; }
         ssize_t ird = vfs_read(f, iimg, isz);
-        vfs_close(f);
-        if (ird < (ssize_t)isz) { kfree(iimg); return ELF_ENOLOAD; }
+        if (ird < (ssize_t)isz) { vfs_close(f); kfree(iimg); return ELF_ENOLOAD; }
 
+        /* §M74 — with the file, so ld.so (which in musl IS libc.so) is shared
+         * through the page cache by every dynamic program instead of copied
+         * into each.  The file stays open until the load is done. */
         struct elf_load_info ii;
-        rc = elf_load_ex(s, iimg, isz,
-                         vmm_user_base() + PROC_INTERP_OFFSET, &ii);
+        rc = elf_load_ex_file(s, iimg, isz,
+                              vmm_user_base() + PROC_INTERP_OFFSET, &ii, f);
+        vfs_close(f);
         kfree(iimg);
         if (rc != ELF_OK) return rc;
         lp->interp_base = ii.load_bias;               /* AT_BASE               */
