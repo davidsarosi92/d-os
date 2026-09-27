@@ -299,6 +299,25 @@ static void unmap_in_root(void* root, uint32_t virt) {
     hal_tlb_shootdown(0, virt);                     /* §M51 — weakening */
 }
 
+/* What a USER entry owned, released by the rules vmm_space_destroy applies to
+ * a leaf — one decision, two callers, so an unmap and a teardown cannot
+ * disagree about who frees a frame.  Called AFTER the entry is cleared and the
+ * TLB shot down: another CPU may still be reading the frame until then. */
+static inline uint16_t* cow_slot(uint64_t phys);
+static void release_user_entry(uint64_t pte) {
+    if (!(pte & E_P)) {
+        if (pte & VMM_SWPE_MARK) swap_slot_release((uint32_t)(pte >> 12));  /* §M72 */
+        return;
+    }
+    if (pte & VMM_SHARED) return;                  /* borrowed — its owner frees */
+    uint64_t fr = pte & addr_mask();
+    if (pte & VMM_COW) {
+        uint16_t* rc = cow_slot(fr);
+        if (rc && !cow_ref_drop(rc)) return;       /* others still hold it */
+    }
+    pmm_free_frame(fr);
+}
+
 /* The mprotect primitive: change protection WITHOUT touching the frame;
  * preserves the OS-available SHARED/COW bits.  0, or -1 if not mapped. */
 static int protect_in_root(void* root, uint32_t virt, uint32_t flags) {
@@ -558,8 +577,36 @@ int vmm_space_map(struct vmm_space* s, uintptr_t virt, uint64_t phys, uint32_t f
     return map_in_root(s->root, (uint32_t)virt, phys, flags);
 }
 
+/* §M74 (2026-09-27) — a USER space's unmap RELEASES what the entry held.  It
+ * used to clear the entry only, so every MAP_FIXED overlay leaked the frame it
+ * covered (never freed, not even at exit) and a COW frame's share count never
+ * came down.  The kernel space (s == NULL) keeps the old behaviour: its
+ * mappings are device windows and identity pages nobody allocated per-map. */
 void vmm_space_unmap(struct vmm_space* s, uintptr_t virt) {
-    unmap_in_root(s ? s->root : kroot(), (uint32_t)virt);
+    if (!s) { unmap_in_root(kroot(), (uint32_t)virt); return; }
+    uint32_t v = (uint32_t)virt;
+    if (pde_is_kernel_shared(s, pde_index(v))) return;   /* never a user page */
+    uint64_t pde = pde_get(s->root, pde_index(v));
+    if (!(pde & E_P) || (pde & E_PS)) return;
+    uint64_t pt = pde & addr_mask();
+    uint64_t pte = pte_get(pt, pte_index(v));
+    if (!pte) return;
+    /* Only a USER page (or an evicted user page) is this space's to drop: a
+     * kernel entry in a shared table would vanish for every space at once. */
+    if ((pte & E_P) ? !(pte & E_US) : !(pte & VMM_SWPE_MARK)) return;
+    pte_set(pt, pte_index(v), 0);
+    hal_tlb_shootdown(0, v);                        /* §M51 — before the free */
+    release_user_entry(pte);
+}
+
+/* §M74 — the page cache holds a frame as one more COW sharer (see pcache.c). */
+void vmm_frame_share(uint64_t phys) {
+    uint16_t* rc = cow_slot(phys);
+    if (rc) cow_ref_share(rc);
+}
+int vmm_frame_unshare(uint64_t phys) {
+    uint16_t* rc = cow_slot(phys);
+    return rc ? cow_ref_drop(rc) : 1;
 }
 
 int vmm_space_protect(struct vmm_space* s, uintptr_t virt, uint32_t flags) {

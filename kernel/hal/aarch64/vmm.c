@@ -517,12 +517,34 @@ void vmm_space_unmap(struct vmm_space* s, uintptr_t va) {
     uint64_t e2 = l2[(va >> 21) & 0x1FF];
     if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) return;
     uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
+    uint64_t e3 = l3[(va >> 12) & 0x1FF];
+    if (!e3) return;
+    if ((e3 & PTE_VALID) ? !(e3 & PTE_AP_EL0) : !(e3 & VMM_SWPE_MARK)) return;  /* user pages only */
     l3[(va >> 12) & 0x1FF] = 0;
     /* INNER-SHAREABLE (2026-09-27, found writing §M72's eviction): the local
      * `tlbi vmalle1` left a sibling core — another thread of the same process
      * — holding the translation after munmap.  §M51 moved the COW paths to
      * `vmalle1is` and this one and mprotect were missed. */
     __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");
+    /* §M74 — release what the entry held, as teardown does (see the i386
+     * twin: a MAP_FIXED overlay used to leak the frame it covered). */
+    if (!(e3 & PTE_VALID)) {
+        if (e3 & VMM_SWPE_MARK) swap_slot_release((uint32_t)(e3 >> 12));
+        return;
+    }
+    if (e3 & PTE_SW_SHARED) return;
+    uint64_t pa = e3 & PTE_ADDR_MASK;
+    if (e3 & PTE_SW_COW) cow_release(pa);
+    else                 pmm_free_frame((pmm_phys_t)pa);
+}
+
+void vmm_frame_share(uint64_t phys) {
+    uint16_t* rc = cow_slot((uintptr_t)phys);
+    if (rc) cow_ref_share(rc);
+}
+int vmm_frame_unshare(uint64_t phys) {
+    uint16_t* rc = cow_slot((uintptr_t)phys);
+    return rc ? cow_ref_drop(rc) : 1;
 }
 
 /* Change the permissions of an already-mapped user page (the arch half of

@@ -707,12 +707,41 @@ int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
     return 0;
 }
 
+/* §M74 (2026-09-27) — a user space's unmap RELEASES what the entry held, by
+ * the same rules free_subtree applies to a leaf (see the i386 twin: every
+ * MAP_FIXED overlay used to leak the frame it covered).  Cleared and shot
+ * down FIRST, freed after. */
 void vmm_space_unmap(struct vmm_space* s, uintptr_t virt) {
     if (!s) { vmm_unmap(virt); return; }
     uint64_t* pt = walk_to_pt_root(s->pml4, virt, /*create*/0, 0);
     if (!pt) return;
+    uint64_t e = pt[IDX_PT(virt)];
+    if (!e) return;
+    /* Only a user page (or an evicted one) — a kernel entry reached through a
+     * table shared by value with the kernel would vanish for everybody. */
+    if ((e & PTE_P) ? !(e & PTE_US) : !(e & VMM_SWPE_MARK)) return;
     pt[IDX_PT(virt)] = 0;
     hal_tlb_shootdown(0, virt);          /* §M51 — present → absent */
+    if (!(e & PTE_P)) {
+        if (e & VMM_SWPE_MARK) swap_slot_release((uint32_t)(e >> 12));
+        return;
+    }
+    if (e & VMM_SHARED) return;
+    uintptr_t fphys = (uintptr_t)e & PAGE_MASK_4K;
+    if (e & VMM_COW) {
+        uint16_t* rc = cow_slot(fphys);
+        if (rc && !cow_ref_drop(rc)) return;
+    }
+    pmm_free_frame((pmm_phys_t)fphys);
+}
+
+void vmm_frame_share(uint64_t phys) {
+    uint16_t* rc = cow_slot((uintptr_t)phys);
+    if (rc) cow_ref_share(rc);
+}
+int vmm_frame_unshare(uint64_t phys) {
+    uint16_t* rc = cow_slot((uintptr_t)phys);
+    return rc ? cow_ref_drop(rc) : 1;
 }
 
 /* Change the protection of an already-mapped page WITHOUT touching its frame

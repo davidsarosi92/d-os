@@ -595,6 +595,25 @@ long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
     return (long)va;
 }
 
+/* §M74 — munmap(addr, len): drop the pages, releasing what each held
+ * (vmm_space_unmap: a private frame is freed, a COW or page-cache frame loses
+ * one sharer, a borrowed shm frame is left to its owner).  Until 2026-09-27
+ * this was a success that did nothing: memory a program gave back stayed
+ * mapped until it exited.  The address space itself is still a bump
+ * allocator — the range is not reused — so this reclaims FRAMES, not
+ * addresses. */
+long sys_munmap(uintptr_t addr, size_t len) {
+    struct task* t = task_current();
+    if (!t || !t->mm) return -1;
+    if (addr & (PAGE_SIZE - 1)) return -22;            /* EINVAL, as POSIX says */
+    if (len == 0) return -22;
+    uintptr_t end = addr + ((len + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1));
+    if (end < addr || addr < vmm_user_base()) return -22;
+    for (uintptr_t va = addr; va < end; va += PAGE_SIZE)
+        vmm_space_unmap(t->mm, va);
+    return 0;
+}
+
 /* §M37 — mprotect(addr,len,prot): change protection of already-mapped user
  * pages (musl's mallocng maps PROT_NONE then mprotects to R/W; ld.so tightens
  * RELRO to read-only after relocation).  Pages not mapped are skipped. */

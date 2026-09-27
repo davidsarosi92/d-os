@@ -48,13 +48,9 @@ static long h_mprotect(struct abi_ctx* c) {
     return sys_mprotect((uintptr_t)c->a[0], (size_t)c->a[1], (int)c->a[2]);
 }
 static long h_munmap(struct abi_ctx* c) {
-    /* There is no sys_munmap: user mmap is a bump allocator that does not
-     * reclaim yet, so unmapping succeeds and leaks (a small, bounded leak the
-     * x86 layers have always had).  Encoded here as the truth rather than
-     * dressed up as a call, so the gap stays visible in one place instead of
-     * being rediscovered per arch. */
-    (void)c;
-    return 0;
+    /* §M74 — real now (it used to succeed and do nothing): the frames go back;
+     * the addresses do not (mmap is still a bump allocator). */
+    return sys_munmap((uintptr_t)c->a[0], (size_t)c->a[1]);
 }
 /* §M65 — build the shared widget toolkit inside a dosgui window.  The blob
  * pointer is a ring-3 address; dosgui_ui_build copies it in before reading a

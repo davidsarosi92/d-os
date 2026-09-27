@@ -119,4 +119,11 @@ void     vmm_age_flush(void);
  * hardware sets the bit itself, as on x86). */
 uint64_t vmm_af_fault_count(void);
 
+/* §M74 rung 2 — one more holder of a frame, in the same count COW uses (the
+ * page cache is "one more sharer": a mapping of a cached page is a COW mapping,
+ * so a write copies and teardown frees only the last holder).  unshare returns
+ * 1 when the caller was the LAST holder and must free the frame itself. */
+void vmm_frame_share(uint64_t phys);
+int  vmm_frame_unshare(uint64_t phys);
+
 #endif

@@ -216,10 +216,50 @@ static void mem_cowprotecttest(const char* a) {
     vmm_space_destroy(p);
 }
 
+/* `unmaptest` (hidden, 2026-09-27) — does an unmap give back what it should,
+ * and only that?  Judged by the free-frame count and the share count. */
+static void mem_unmaptest(const char* a) {
+    (void)a;
+    int bad = 0;
+    struct vmm_space* p = vmm_space_create();
+    pmm_phys_t fa = pmm_alloc_frame_user(), fb = pmm_alloc_frame_user(), fc = pmm_alloc_frame_user();
+    if (!p || !fa || !fb || !fc) { kprintf("unmaptest: setup failed\n"); return; }
+    uintptr_t base = vmm_user_base() + 0x20000000u;
+    vmm_space_map(p, base,         fa, VMM_USER | VMM_WRITABLE);                 /* private */
+    vmm_space_map(p, base + 4096,  fb, VMM_USER | VMM_WRITABLE);                 /* to share */
+    vmm_space_map(p, base + 8192,  fc, VMM_USER | VMM_WRITABLE | VMM_SHARED);    /* borrowed */
+    struct vmm_space* c = vmm_space_clone(p);          /* fb -> COW in both, count 2 */
+    if (!c) { kprintf("unmaptest: clone failed\n"); return; }
+    /* (the private page fa was writable, so the clone made it COW too — unmap
+     * it from the child first so the parent's is truly private again) */
+    vmm_space_unmap(c, base);
+    uint32_t f0 = pmm_free_frames();
+    vmm_space_unmap(p, base);                           /* now sole -> freed      */
+    uint32_t f1 = pmm_free_frames();
+    if (f1 != f0 + 1) { kprintf("unmaptest: private page not freed (%d)\n", (int)(f1 - f0)); bad++; }
+    vmm_space_unmap(c, base + 4096);                    /* one sharer gone        */
+    uint32_t f2 = pmm_free_frames();
+    if (f2 != f1) { kprintf("unmaptest: a SHARED COW frame was freed while mapped\n"); bad++; }
+    if (vmm_frame_share_count(fb) > 1) { kprintf("unmaptest: share count did not come down\n"); bad++; }
+    vmm_space_unmap(p, base + 4096);                    /* the last sharer: freed */
+    uint32_t f3 = pmm_free_frames();
+    if (f3 != f2 + 1) { kprintf("unmaptest: last COW sharer did not free (%d)\n", (int)(f3 - f2)); bad++; }
+    vmm_space_unmap(p, base + 8192);                    /* borrowed: owner frees  */
+    vmm_space_unmap(c, base + 8192);
+    uint32_t f4 = pmm_free_frames();
+    if (f4 != f3) { kprintf("unmaptest: a BORROWED frame was freed by unmap\n"); bad++; }
+    pmm_free_frame(fc);
+    vmm_space_destroy(c);
+    vmm_space_destroy(p);
+    kprintf("unmaptest: private freed, COW freed by its last holder only, borrowed left "
+            "to its owner -> %s\n", bad ? "FAIL" : "PASS");
+}
+
 static void mem_slabinfo (const char* a) { (void)a; cmd_slabinfo();  }
 static void mem_buddyinfo(const char* a) { (void)a; cmd_buddyinfo(); }
 static void mem_mmtest   (const char* a) { (void)a; cmd_mmtest();    }
 
+SHELL_CMD(unmaptest) = { "unmaptest", "", 0, SHELL_G_TEST, mem_unmaptest, SHELL_P_ADMIN };
 SHELL_CMD(cowprotecttest) = { "cowprotecttest", "", 0, SHELL_G_TEST, mem_cowprotecttest, SHELL_P_ADMIN };
 SHELL_CMD(meminfo)   = { "meminfo",   "", "firmware map, buddy allocator and heap",
                          SHELL_G_MEM,  mem_meminfo, SHELL_P_ANY };

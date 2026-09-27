@@ -220,6 +220,7 @@ long sys_lseek(int fd, long off, int whence);
 long sys_mmap (size_t len, int fd);     /* map anon (fd<0) or a memfd's frames */
 /* §M37 — full mmap (addr+MAP_FIXED, prot→VMM flags, file-backed at offset) for
  * the Linux ABI / ld.so loading shared objects. */
+long sys_munmap(uintptr_t addr, size_t len);   /* §M74 */
 long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
                    int fd, uint64_t offset);
 long sys_mprotect(uintptr_t addr, size_t len, int prot);  /* §M37 */
