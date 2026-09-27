@@ -383,7 +383,7 @@ static int proc_exec_common(const void* image, size_t len,
      * mode.  Control returns here when the program issues SYS_EXIT. */
     struct task* me = task_current();
     struct vmm_space* prev = me ? me->mm : NULL;
-    if (me) me->mm = s;              /* a fresh space carries a fresh cursor */
+    if (me) task_swap_mm(me, s);     /* a fresh space carries a fresh cursor */
     vmm_space_switch(s);
 
     if (me) { me->exc_fault = 0; me->exc_code = 0; }
@@ -398,7 +398,7 @@ static int proc_exec_common(const void* image, size_t len,
     if (me) me->exc_fault = 0;
     fd_close_all();                    /* reclaim any fds the program opened */
     vmm_space_switch(prev);
-    if (me) me->mm = prev;
+    if (me) task_swap_mm(me, prev);
     vmm_space_destroy(s);
     int code = me ? me->exc_code : 0;
     if (me) me->exc_code = 0;
@@ -501,8 +501,7 @@ int proc_execve(const char* path, char* const uargv[]) {
      *    the old image); the restorer is re-registered by the new program. */
     for (int i = 0; i < NSIG; i++) me->sig_handler[i] = SIG_DFL;
     me->sig_pending = 0;
-    struct vmm_space* old = me->mm;
-    me->mm = ns;
+    struct vmm_space* old = task_swap_mm(me, ns);   /* under the walkers' lock */
     vmm_space_switch(ns);
     if (old) vmm_space_destroy(old);
     kfree(img);

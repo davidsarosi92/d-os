@@ -12,6 +12,8 @@
 #include "console.h"
 #include "printf.h"
 #include "pmm.h"
+#include "memage.h"
+#include "kmap.h"
 #include "vmm.h"
 #include "kmalloc.h"
 #include "slab.h"
@@ -115,6 +117,13 @@ static void mem_meminfo(const char* a) {
     kprintf("kheap: %u/%u bytes used (%u chunks, %u free)\n",
             (unsigned)ks.used_bytes, (unsigned)ks.total_bytes,
             ks.chunk_count, ks.free_chunk_count);
+    /* §M74 rung 1 — resident user memory by use, from the last sweep. */
+    struct memage_stats ms;
+    memage_stats(&ms);
+    if (ms.sweeps)
+        kprintf("user memory in use: hot %u KB, warm %u KB, cold %u KB (`memage` for more)\n",
+                (unsigned)(ms.hot_bytes >> 10), (unsigned)(ms.warm_bytes >> 10),
+                (unsigned)(ms.cold_bytes >> 10));
 }
 
 /* Walk every buddy free list and report the first inconsistency — a diagnostic
@@ -163,10 +172,55 @@ static void mem_numatest(const char* a) {
     kprintf("numatest: %s\n", bad ? "FAIL" : "PASS");
 }
 
+/* `cowprotecttest` (hidden, 2026-09-27) — mprotect on a page fork shared.
+ *
+ * After fork a writable page is COPY-ON-WRITE in both spaces: read-only, the
+ * frame shared, a refcount deciding who frees it.  mprotect(PROT_WRITE) on
+ * such a page — which allocators and loaders do to memory that is already
+ * theirs — used to turn it WRITABLE IN PLACE on i386 and aarch64 (the next
+ * write lands in the frame the other process still maps), and on x86_64 to
+ * DROP the COW mark altogether (so teardown frees a frame the other side still
+ * uses).  The rule: a COW page keeps its mark and stays write-protected; write
+ * access comes only through the COW fault, which copies first.
+ *
+ * Built on the real primitives rather than a ring-3 program so it runs on all
+ * three arches from one source and asks the page table itself. */
+struct cpt_find { uintptr_t va; uint64_t phys; uint32_t flags; int found; };
+static void cpt_visit(void* c, uintptr_t va, uint64_t phys, uint32_t flags) {
+    struct cpt_find* f = (struct cpt_find*)c;
+    if (va == f->va) { f->phys = phys; f->flags = flags; f->found = 1; }
+}
+static void mem_cowprotecttest(const char* a) {
+    (void)a;
+    struct vmm_space* p = vmm_space_create();
+    pmm_phys_t fr = pmm_alloc_frame_user();
+    if (!p || fr == PMM_ALLOC_FAIL) { kprintf("cowprotecttest: setup failed\n"); return; }
+    kmap_zero_frame(fr);
+    uintptr_t va = vmm_user_base() + 0x20000000u;
+    vmm_space_map(p, va, fr, VMM_USER | VMM_WRITABLE);
+    struct vmm_space* c = vmm_space_clone(p);                 /* what fork does */
+    if (!c) { kprintf("cowprotecttest: clone failed\n"); vmm_space_destroy(p); return; }
+    vmm_space_protect(c, va, VMM_USER | VMM_WRITABLE);        /* mprotect(RW)   */
+    struct cpt_find f = { va, 0, 0, 0 };
+    vmm_space_walk(c, cpt_visit, &f);
+    int shares   = f.found && f.phys == (uint64_t)fr;
+    int writable = (f.flags & VMM_WRITABLE) != 0;
+    int cow      = (f.flags & VMM_COW) != 0;
+    int ok = f.found && shares && !writable && cow;
+    kprintf("cowprotecttest: after mprotect(RW) the child's page %s the parent's frame, "
+            "is %s, COW mark %s -> %s\n",
+            shares ? "still shares" : "no longer shares",
+            writable ? "WRITABLE" : "write-protected", cow ? "kept" : "LOST",
+            ok ? "PASS" : "FAIL");
+    vmm_space_destroy(c);
+    vmm_space_destroy(p);
+}
+
 static void mem_slabinfo (const char* a) { (void)a; cmd_slabinfo();  }
 static void mem_buddyinfo(const char* a) { (void)a; cmd_buddyinfo(); }
 static void mem_mmtest   (const char* a) { (void)a; cmd_mmtest();    }
 
+SHELL_CMD(cowprotecttest) = { "cowprotecttest", "", 0, SHELL_G_TEST, mem_cowprotecttest, SHELL_P_ADMIN };
 SHELL_CMD(meminfo)   = { "meminfo",   "", "firmware map, buddy allocator and heap",
                          SHELL_G_MEM,  mem_meminfo, SHELL_P_ANY };
 SHELL_CMD(memcheck)  = { "memcheck",  "", "validate the buddy free lists now",
@@ -234,7 +288,6 @@ SHELL_CMD(memhog)    = { "memhog",    "[fill|verify]", "ring-3 process that grow
  * itself is kept IN the frames (a chain through word 1), so the test needs no
  * allocation proportional to what it tests.
  * ------------------------------------------------------------------------- */
-#include "kmap.h"
 /* `highmemtest all` (§M86 stage 3, 2026-09-26) tests EVERY frame the user
  * allocator will hand out, not just the HIGHMEM zone — which is the question
  * on a machine whose RAM is all directly mapped (x86_64, and aarch64 since its

@@ -15047,8 +15047,81 @@ window) and 1 DMA page kept**, `cont` resumes it.  Time for 8 MiB: copy
 **Open:** faulting pages back on demand (§M74); the store is a file, so a volume
 that fills up is a refusal, not a smaller eviction; no compression.
 
+### 4.112 How much memory is actually in use: the accessed-bit sweep (§M74 rung 1, 2026-09-27)
+
+§M74's first rung, shipped alone as instrumentation, because every later rung
+(which page to reclaim) needs its answer, and a reclaim without it is random
+eviction.  **Nothing in this tree had ever read the hardware's own usage data**:
+x86's PTE Accessed bit and ARM's Access Flag were referenced nowhere.
+
+- **One primitive per arch, `vmm_space_age`** (vmm_flags.h): report every
+  present page in a space's private region with `VMM_ACCESSED` as it WAS, and
+  clear the bit ATOMICALLY (the owner may be running on another CPU while its
+  hardware sets the dirty bit in the same entry).  On i386 the clear is a 32-bit
+  atomic on the entry's low word in both formats (bit 5 lives there in PAE too).
+  **No TLB flush inside it:** the sweep does ONE full flush afterwards
+  (`vmm_age_flush`), outside the task-list lock, because waiting for other CPUs
+  while one of them spins on that lock with interrupts off would deadlock.
+- **aarch64 has no hardware flag management here**, so a cleared Access Flag
+  makes the next access fault; `vmm_af_fault` sets it again, handled BEFORE the
+  COW check and the uaccess fixup (a kernel copy into such a page continues
+  rather than unwinding as `-EFAULT`).  The cost is counted
+  (`vmm_af_fault_count`, printed by `memage`): 34601 faults over one `agetest`.
+- **The policy is portable** (`kernel/mem/memage.c`): a per-frame age (sweeps
+  since last seen accessed), updated once per round on the first visit, reset by
+  any mapping that saw the bit set (a COW or shared frame is used if EITHER side
+  touches it).  A frame seen this round but not the last is NEW (age 0), so a
+  reallocated frame does not inherit the old page's age.
+- **The `memage` service** sweeps every `mem.age_ms` (default 1000, 0 = off);
+  `mem.cold_ms` (default 30 000) defines COLD.  `memage`, a line in `meminfo`,
+  and `age.kib.{hot,warm,cold}` in `/proc/meminfo`.
+
+**Measured, differentially** (`agetest`, hidden, i386/x86_64/aarch64): memhog's
+`age` mode writes 8 MiB and then keeps touching the first 25 %, later 75 %.  The
+process's in-use memory goes **2056 → 6152 KB and its cold memory falls by exactly
+4096 KB**, on all three arches.  The program also holds ~1 MiB it never touches
+again, which is exactly why the claim is about what MOVES.  Sweep cost 4.5–10 ms
+for ~2300–4600 pages.
+
+**Five defects found on the way, all fixed:**
+1. **aarch64 exception return with interrupts enabled.**  `exc_dispatch` wrote
+   ELR_EL1/SPSR_EL1 and then reloaded sixteen register pairs before `eret`, and
+   the syscall path returns from C with interrupts ON.  An IRQ in that window
+   took a nested exception that overwrote ELR/SPSR, and the outer `eret` jumped
+   to a kernel address.  Seen as a freshly started program faulting at EL0 with
+   ELR inside `exc_dispatch` (3 times in 3 stress boots), and once as the restore
+   reading off the top of a stack.  Now `msr daifset, #0xf` before every restore
+   and in all three `eret`-to-EL0 paths of `usermode.S`: 0 faults in 3 boots after.
+   x86 cannot have it (its return state is on the stack; `iret` is atomic).
+   Found with a new check (`BAD EL0 RETURN FRAME`, run before every return to
+   EL0), which stayed silent and so proved the frame intact when C returned,
+   putting the fault in the assembly after it.
+2. **`mprotect(PROT_WRITE)` on a page fork shared copy-on-write** made the shared
+   frame writable in place on i386 and aarch64 (the child's writes appear in the
+   parent), and on x86_64 also **dropped the COW mark**, so teardown freed a frame
+   the other process still mapped.  A COW page now keeps its mark and stays
+   write-protected; write access comes only through the COW fault, which copies
+   first (`cowprotecttest`, FAIL before on both x86 arches, PASS after on all
+   three).  Known cost, written into the code: a COW page mprotected read-only is
+   still granted write on its next write fault (classic i386 has no spare bit).
+3. **`execve` swapped `t->mm` and freed the old space without the task-list
+   lock**, while `ps`'s memory column and the Task Manager walk other tasks'
+   spaces under it: a use-after-free window since §M75.  `task_swap_mm` now
+   swaps under the lock and returns the old space to be destroyed after.
+4. **A dying task FORCE-killed its ring-3 children**, filing each as a crash
+   ("unresponsive task reclaimed by force") — killing a program that had forked
+   produced a crash report for its innocent child.  Plain kill now, which the
+   ring-3 safe point honours (§4.111).
+5. A test-harness race (`task_wait` vs init's reaper) fixed in the new
+   `killusertest` by claiming the reap.
+
+**Open:** hardware Access Flag management (FEAT_HAFDBS) is not used even where
+present; the round marker is 8 bits (a frame unmapped for exactly 256 rounds
+keeps a stale age once).
+
 ## 8. Change log
 
+- **2026-09-27 — §M74 rung 1: the accessed-bit sweep (`vmm_space_age` on three arches, ARM access-flag faults, `memage`, `mem.age_ms`/`mem.cold_ms`, `agetest`).  Fixed: aarch64 `eret` with interrupts enabled (a nested IRQ clobbered ELR/SPSR), `mprotect(PROT_WRITE)` on fork-shared COW pages (write-through; x86_64 lost the COW mark), an unlocked `execve` mm swap under the space walkers, a parent's death force-killing (and crash-reporting) its children (DOCS §4.112).**
 - **2026-09-27 — §M72: a memory and a disk reserve that refuse, `df`; pause (`TASK_STOPPED`, `stop`/`cont`, SIGSTOP/SIGCONT); pause + evict to a swap store with the record in the PTE (`stop -e`, Task Manager, `AUDIT(swap-runnable)`, `evicttest`).  Fixed on the way: O(n²) exFAT chain walks, the block cache reading sectors about to be overwritten, `kill` of a sleeping program spinning it forever, ARM crt0 ignoring argv, an implicitly declared 64-bit allocator, ring-3 edu DMA out of reach (DOCS §4.111).**
 - **2026-09-27 — §M82: persistent homes, a desktop and a program list per account (enforced at launch), `env.PATH`/`HOME`, open programs restored at sign-in, a greeter shell; the Start menu's power/Exit-GUI rows and the console behind the desktop were privilege holes — closed (DOCS §4.110).**
 - **2026-09-27 — §M32 closed: owner and mode stored on exFAT in a Vendor Extension entry inside each file's entry set; `setattr` dir-op; `stat`; verified across reboots and a Linux mount; `cat`/`ls` say `permission denied` (DOCS §4.109).**

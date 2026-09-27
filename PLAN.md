@@ -225,7 +225,8 @@ fixed first, whatever it touches.
 | §M81 | steps 1-2, step 3 in part | chrome still hand-drawn; the verdict |
 | §M82 | ✅ complete (§4.110) | — (two live desktops at once) |
 | §M72 | ✅ complete (§4.111) | — (eviction faults pages back: §M74) |
-| §M73, §M74 | — | designed, not started |
+| §M74 | rung 1 ✅ (§4.112) | rungs 2-4: page cache, anonymous swap-out, thrash control |
+| §M73 | — | designed, not started |
 | §M68 | — | investigation, not started |
 | §M83, §M84 | — | designed, not started |
 
@@ -5801,7 +5802,15 @@ independent reason it should be the next milestone.
 
 ## §M74 — Swap and demand paging: reclaim as a policy, not a favour
 
-**Status: design.  Asked for directly (2026-09-09), immediately after §M72 —
+**Status: rung 1 SHIPPED 2026-09-27 (DOCS §4.112) — the accessed-bit sweep,
+measured differentially on three arches.  Rungs 2-4 open.**  Lessons from
+rung 1: an aarch64 `eret` taken with interrupts enabled (a nested IRQ
+overwrote ELR/SPSR — found only because the sweep's extra exception traffic
+made it common), and `mprotect(PROT_WRITE)` on fork-shared COW pages writing
+through (x86_64 lost the COW mark) — rung 2's shared file mappings rest on
+exactly that COW discipline, so it had to be right first.
+
+**Original status: design.  Asked for directly (2026-09-09), immediately after §M72 —
 and correctly, because §M72 stage 3 builds most of a swapper's MACHINERY and
 none of its JUDGEMENT.**
 

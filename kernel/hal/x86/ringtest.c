@@ -117,7 +117,7 @@ int arch_ringtest(void) {
 
     struct task* me = task_current();
     struct vmm_space* prev = me ? me->mm : NULL;
-    if (me) me->mm = sp;                 /* the scheduler keeps CR3 across a switch */
+    if (me) task_swap_mm(me, sp);        /* the scheduler keeps CR3 across a switch */
     vmm_space_switch(sp);
 
     /* Drop to ring 3.  Stack top is 0x40002000 (top of stack frame). */
@@ -129,7 +129,7 @@ int arch_ringtest(void) {
     console_write("ringtest: back in ring 0\n");
 
     vmm_space_switch(prev);
-    if (me) me->mm = prev;
+    if (me) task_swap_mm(me, prev);
     vmm_space_destroy(sp);
     return 0;
 }

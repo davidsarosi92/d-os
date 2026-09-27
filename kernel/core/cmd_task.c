@@ -625,6 +625,45 @@ static void cmd_evicttest(const char* args) {
             "the byte check)\n",
             rc, back ? "yes" : "NO", (int)(f1 - f2), after, used, ok ? "PASS" : "FAIL");
 }
+/* `killusertest [n]` (hidden, 2026-09-27) — n rounds of: spawn `memhog
+ * verify` (it forks), let it run a moment, plain-kill the tree, and collect
+ * the exit status.  143 is a kill honoured at the ring-3 safe point; 139 is
+ * the program FAULTING — which is how a corrupted return frame presents (a
+ * task "starting" at a kernel address).  Written to reproduce an aarch64
+ * failure seen once after §M72/§M74 made plain kills of sleeping programs
+ * actually complete; the sweep can be switched off around it
+ * (`setconf mem.age_ms 0`) to tell the two suspects apart. */
+static void cmd_killusertest(const char* args) {
+    int n = 0;
+    while (args && *args == ' ') args++;
+    for (; args && *args >= '0' && *args <= '9'; args++) n = n * 10 + (*args - '0');
+    if (n <= 0) n = 20;
+    const unsigned char *s = 0, *e = 0;
+    if (_binary_user_memhog_elf_start)             { s = _binary_user_memhog_elf_start;         e = _binary_user_memhog_elf_end; }
+    else if (_binary_user_memhog_x86_64_elf_start) { s = _binary_user_memhog_x86_64_elf_start;  e = _binary_user_memhog_x86_64_elf_end; }
+    else if (_binary_user_memhog_aarch64_elf_start){ s = _binary_user_memhog_aarch64_elf_start; e = _binary_user_memhog_aarch64_elf_end; }
+    if (!s) { kprintf("killusertest: no memhog embedded\n"); return; }
+    int clean = 0, faulted = 0, other = 0;
+    for (int r = 0; r < n; r++) {
+        const char* argv[2] = { "memhog", "verify" };
+        int pid = proc_spawn_argv("kut-prog", s, (size_t)(e - s), 2, argv, 0);
+        if (pid < 0) { other++; continue; }
+        /* Claim the reap, or init's universal reaper may collect the task
+         * before task_wait does and the exit status is lost (§M57). */
+        { struct task* kt = task_find(pid); if (kt) task_set_reap_owned(kt, 1); }
+        task_msleep(250 + (uint32_t)(r % 5) * 70);
+        task_kill_tree(pid);
+        int code = -1;
+        task_wait(pid, &code);
+        if (code == 143) clean++;
+        else if (code == 139) { faulted++; kprintf("killusertest: round %d - pid %d FAULTED\n", r, pid); }
+        else { other++; kprintf("killusertest: round %d - pid %d exit %d\n", r, pid, code); }
+    }
+    kprintf("killusertest: %d rounds - %d killed cleanly, %d faulted, %d other -> %s\n",
+            n, clean, faulted, other, faulted || other ? "FAIL" : "PASS");
+}
+SHELL_CMD(killusertest) = { "killusertest", "", 0, SHELL_G_TEST, cmd_killusertest, SHELL_P_ADMIN };
+
 SHELL_CMD(evicttest) = { "evicttest", "", 0, SHELL_G_TEST, cmd_evicttest, SHELL_P_ADMIN };
 
 SHELL_CMD(stoptest) = { "stoptest", "", 0, SHELL_G_TEST, cmd_stoptest, SHELL_P_ADMIN };

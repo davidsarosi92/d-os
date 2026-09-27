@@ -81,6 +81,18 @@ static void dump_and_halt(const char* what, struct trapframe* tf) {
     uart_early_puthex(tf->x[1]); uart_early_puts(" ");
     uart_early_puthex(tf->x[2]); uart_early_puts(" ");
     uart_early_puthex(tf->x[3]);
+    /* The stack pointer and the task: a fault while RESTORING a trapframe (the
+     * dispatcher's own ldp) is a fault about the stack itself, and without sp
+     * the dump cannot say which stack or how close to its edge it was. */
+    {
+        struct task* ct = task_current();
+        uart_early_puts("\n  sp      = "); uart_early_puthex((uint64_t)(uintptr_t)tf);
+        uart_early_puts("  task = "); uart_early_puts(ct ? ct->name : "?");
+        if (ct && ct->kstack_base) {
+            uart_early_puts("  kstack ");
+            uart_early_puthex((uint64_t)(uintptr_t)ct->kstack_base);
+        }
+    }
     /* §M47 — record it BEFORE applying the policy: halt and reboot both never
      * return, so a record written afterwards would never exist. */
     {
@@ -118,6 +130,26 @@ static void dump_and_halt(const char* what, struct trapframe* tf) {
     for (;;) __asm__ volatile ("wfe");
 }
 
+/* THE RETURN FRAME, CHECKED BEFORE IT IS USED (2026-09-27).  Seen once in
+ * ~20 boots: a program that had just started faulted at its first return to
+ * EL0 with ELR pointing INTO THE KERNEL (exc_dispatch) — its trapframe had been
+ * overwritten.  A corrupted frame used silently presents as the program's own
+ * crash, far from whatever wrote it; checked here it names the task and the
+ * stack at the moment of return.  Cheap: two comparisons per exception. */
+static void check_el0_return(struct trapframe* tf, const char* path) {
+    if ((tf->spsr & 0xF) != 0) return;                 /* not returning to EL0 */
+    if (!(tf->elr >> 48)) return;                      /* a user address: fine */
+    struct task* ct = task_current();
+    uart_early_puts("\n!! BAD EL0 RETURN FRAME (");  uart_early_puts(path);
+    uart_early_puts(") task="); uart_early_puts(ct ? ct->name : "?");
+    uart_early_puts(" elr="); uart_early_puthex(tf->elr);
+    uart_early_puts(" spsr="); uart_early_puthex(tf->spsr);
+    uart_early_puts(" frame="); uart_early_puthex((uint64_t)(uintptr_t)tf);
+    if (ct) { uart_early_puts(" kstack="); uart_early_puthex((uint64_t)(uintptr_t)ct->kstack_base); }
+    uart_early_puts(" x30="); uart_early_puthex(tf->x[30]);
+    uart_early_puts("\n");
+}
+
 void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
     switch (type) {
         case EXC_IRQ:
@@ -128,6 +160,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
              * right here.  SPSR_EL1.M[3:0]==0 means "came from EL0". */
             task_force_kill_point((tf->spsr & 0xF) == 0);
             signal_deliver(tf);           /* §A1 — same return-to-EL0 hook */
+            check_el0_return(tf, "irq");
             return;                       /* return → RESTORE_TRAPFRAME → eret */
         case EXC_FIQ:
             /* We route everything through IRQ; a real FIQ is unexpected. */
@@ -158,6 +191,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                  * syscall so the handler frame captures the syscall's result
                  * in x0 and sigreturn restores it. */
                 signal_deliver(tf);
+                check_el0_return(tf, "svc");
                 return;                       /* → RESTORE_TRAPFRAME → eret to EL0 */
             }
             /* §A1 — copy-on-write.  After a fork() both parent and child hold
@@ -175,6 +209,26 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
              * right answer is to resolve the COW and continue, not to unwind
              * the copy with -EFAULT.  Reversing these two makes fork+write
              * through a syscall fail in a way that looks like a bad pointer. */
+            /* §M74 — an ACCESS-FLAG fault (FSC 0b0010LL) on a valid page is
+             * not an error: the accessed-bit sweep cleared AF and this is the
+             * page's next access, which is precisely the event the sweep wants
+             * recorded.  Set AF and retry.  First of all, for the same reason
+             * COW is checked before the uaccess fixup: a kernel copy into such
+             * a page must continue, not unwind as -EFAULT.  Instruction aborts
+             * too — code pages age like any other. */
+            {
+                uint64_t ec = esr >> 26;
+                if ((ec == 0x20 || ec == 0x21 || ec == 0x24 || ec == 0x25) &&
+                    (esr & 0x3C) == 0x08) {
+                    extern int vmm_af_fault(uintptr_t va);
+                    uint64_t far;
+                    __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
+                    if (vmm_af_fault((uintptr_t)far)) {              /* retry */
+                        check_el0_return(tf, "access-flag");
+                        return;
+                    }
+                }
+            }
             {
                 uint64_t ec = esr >> 26;
                 if (ec == 0x24 || ec == 0x25) {

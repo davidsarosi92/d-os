@@ -547,8 +547,10 @@ int vmm_space_protect(struct vmm_space* s, uintptr_t va, uint32_t flags) {
     uint64_t e3 = l3[i];
     if (!(e3 & PTE_VALID)) return -1;
 
-    if (flags & VMM_WRITABLE) e3 &= ~PTE_AP_RO;  /* writable  */
-    else                      e3 |=  PTE_AP_RO;      /* read-only */
+    /* COW pages stay read-only whatever mprotect asks (see the i386 twin):
+     * write access comes only through vmm_cow_fault, which copies first. */
+    if ((flags & VMM_WRITABLE) && !(e3 & PTE_SW_COW)) e3 &= ~PTE_AP_RO;  /* writable  */
+    else                                              e3 |=  PTE_AP_RO;  /* read-only */
     if (flags & VMM_EXEC) e3 &= ~PTE_UXN;        /* EL0-executable */
     else                      e3 |=  PTE_UXN;
     l3[i] = e3;
@@ -638,12 +640,77 @@ void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
                 if (e3 & PTE_AP_EL0)      flags |= VMM_USER;
                 if (!(e3 & PTE_AP_RO_BIT))flags |= VMM_WRITABLE;
                 if (!(e3 & PTE_UXN))      flags |= VMM_EXEC;
+                if (e3 & PTE_AF)          flags |= VMM_ACCESSED;   /* §M74 */
 
                 cb(ctx, (uintptr_t)((i << 30) | (j << 21) | (k << 12)),
                         (uintptr_t)(e3 & PTE_ADDR_MASK), flags);
             }
         }
     }
+}
+
+/* §M74 — see vmm_flags.h.  ARM's Access Flag is the accessed bit, and with no
+ * hardware management (FEAT_HAFDBS not used here) a CLEARED flag makes the
+ * next access take an access-flag fault, which vmm_af_fault answers by setting
+ * it again — so "was it touched since the sweep" is exactly "did it fault". */
+uint32_t vmm_space_age(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
+    if (!s) return 0;
+    uint32_t cleared = 0;
+    for (uint64_t i = 4; i < 512; i++) {
+        uint64_t e1 = s->l1[i];
+        if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) continue;
+        uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
+        for (uint64_t j = 0; j < 512; j++) {
+            uint64_t e2 = l2[j];
+            if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) continue;
+            uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
+            for (uint64_t k = 0; k < 512; k++) {
+                if (!(l3[k] & PTE_VALID)) continue;
+                uint64_t e3 = __atomic_fetch_and(&l3[k], ~PTE_AF, __ATOMIC_RELAXED);
+                if (e3 & PTE_AF) cleared++;
+                if (!cb) continue;
+                uint32_t flags = 0;
+                if (e3 & PTE_SW_SHARED)   flags |= VMM_SHARED;
+                if (e3 & PTE_SW_COW)      flags |= VMM_COW;
+                if (e3 & PTE_AP_EL0)      flags |= VMM_USER;
+                if (!(e3 & PTE_AP_RO_BIT))flags |= VMM_WRITABLE;
+                if (!(e3 & PTE_UXN))      flags |= VMM_EXEC;
+                if (e3 & PTE_AF)          flags |= VMM_ACCESSED;
+                cb(ctx, (uintptr_t)((i << 30) | (j << 21) | (k << 12)),
+                        (uintptr_t)(e3 & PTE_ADDR_MASK), flags);
+            }
+        }
+    }
+    return cleared;
+}
+void vmm_age_flush(void) {
+    __asm__ volatile ("dsb ishst\n tlbi vmalle1is\n dsb ish\n isb" ::: "memory");
+}
+
+/* §M74 — an access-flag fault: the sweep cleared AF on a valid page and this
+ * is its next access.  Set it again and retry.  Returns 1 if handled (the
+ * address is a valid page in the CURRENT space's user region), 0 otherwise —
+ * in which case the fault is whatever else it is.  Setting AF strengthens the
+ * entry, so no TLB maintenance is needed beyond making the store visible. */
+static volatile uint64_t g_af_faults;
+uint64_t vmm_af_fault_count(void) { return g_af_faults; }
+int vmm_af_fault(uintptr_t va) {
+    struct task* t = task_current();
+    if (!t || !t->mm) return 0;
+    struct vmm_space* s = t->mm;
+    uint64_t i = (va >> 30) & 511, j = (va >> 21) & 511, k = (va >> 12) & 511;
+    if (i < 4 || (va >> 39)) return 0;
+    uint64_t e1 = s->l1[i];
+    if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) return 0;
+    uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
+    uint64_t e2 = l2[j];
+    if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) return 0;
+    uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
+    if (!(l3[k] & PTE_VALID)) return 0;
+    __atomic_fetch_or(&l3[k], PTE_AF, __ATOMIC_RELAXED);
+    __asm__ volatile ("dsb ishst\n isb" ::: "memory");
+    __atomic_add_fetch(&g_af_faults, 1, __ATOMIC_RELAXED);
+    return 1;
 }
 
 /* §M75 — see vmm.h: a QUERY, so it must not build the table.  `cow_slot`

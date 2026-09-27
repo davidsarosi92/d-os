@@ -31,6 +31,7 @@
 #include "timer.h"
 #include "klog.h"
 #include "pmm.h"
+#include "memage.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -259,6 +260,14 @@ static void gen_meminfo(struct procfs_writer* w) {
         pw_puts(w, "pmm.reserve.kib:    "); pw_put_uint(w, rkb);     pw_putc(w, '\n');
         pw_puts(w, "pmm.reserve.low:    "); pw_put_uint(w, (unsigned)low); pw_putc(w, '\n');
         pw_puts(w, "pmm.reserve.refused:"); pw_put_uint(w, refused); pw_putc(w, '\n');
+    }
+    {   /* §M74 rung 1 — how much of the resident user memory is IN USE */
+        struct memage_stats ms;
+        memage_stats(&ms);
+        pw_puts(w, "age.sweeps:         "); pw_put_uint(w, ms.sweeps); pw_putc(w, '\n');
+        pw_puts(w, "age.kib.hot:        "); pw_put_uint(w, (unsigned)(ms.hot_bytes >> 10));  pw_putc(w, '\n');
+        pw_puts(w, "age.kib.warm:       "); pw_put_uint(w, (unsigned)(ms.warm_bytes >> 10)); pw_putc(w, '\n');
+        pw_puts(w, "age.kib.cold:       "); pw_put_uint(w, (unsigned)(ms.cold_bytes >> 10)); pw_putc(w, '\n');
     }
     /* §M19.5.3 — per NUMA node: size, free, and how many allocations were
      * served from the asking CPU's own node vs had to fall back elsewhere. */

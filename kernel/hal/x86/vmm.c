@@ -308,6 +308,14 @@ static int protect_in_root(void* root, uint32_t virt, uint32_t flags) {
     uint32_t j = pte_index(virt);
     uint64_t pte = pte_get(pt, j);
     if (!(pte & E_P)) return -1;
+    /* A COPY-ON-WRITE page never becomes writable here (2026-09-27): its frame
+     * is still mapped by the other side of a fork, so write access may only
+     * come through vmm_cow_fault, which copies first.  mprotect(PROT_WRITE) on
+     * one used to make the SHARED frame writable in place (`cowprotecttest`).
+     * The known cost: a COW page mprotected read-only is still granted write
+     * on its next write fault — there is no spare PTE bit on classic i386 to
+     * remember "read-only after the copy". */
+    if (pte & VMM_COW) flags &= ~(uint32_t)E_RW;
     pte_set(pt, j, (pte & addr_mask()) | E_P | (flags & (E_RW | E_US)) | (pte & E_OS) |
                    nx_bits(flags | (uint32_t)(pte & E_US)));
     hal_tlb_shootdown(0, virt);                     /* §M51 — may drop RW */
@@ -576,6 +584,35 @@ void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
         }
     }
 }
+
+/* §M74 — see vmm_flags.h.  The clear is a 32-bit atomic AND on the entry's LOW
+ * word in both formats: bit 5 lives there in a PAE entry too (little-endian),
+ * and a 64-bit atomic on i386 would need cmpxchg8b through libatomic. */
+uint32_t vmm_space_age(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
+    if (!s) return 0;
+    uint32_t cleared = 0;
+    for (uint32_t gi = 0; gi < npde(); gi++) {
+        uint64_t pde = pde_get(s->root, gi);
+        if (!(pde & E_P) || (pde & E_PS)) continue;
+        if (pde_is_kernel_shared(s, gi)) continue;
+        uint64_t pt = pde & addr_mask();
+        for (uint32_t j = 0; j < npte(); j++) {
+            uint64_t pte = pte_get(pt, j);
+            if (!(pte & E_P)) continue;
+            uint32_t* lo = g_pae ? (uint32_t*)(uintptr_t)pt + 2 * j
+                                 : (uint32_t*)(uintptr_t)pt + j;
+            uint32_t was = __atomic_fetch_and(lo, ~(uint32_t)VMM_ACCESSED, __ATOMIC_RELAXED);
+            if (was & VMM_ACCESSED) cleared++;
+            if (cb) cb(ctx, ((uintptr_t)gi << pde_shift()) | ((uintptr_t)j << 12),
+                       pte & addr_mask(),
+                       (uint32_t)((pte & 0xFFFu & ~(uint64_t)(VMM_EXEC | VMM_ACCESSED)) |
+                                  exec_of(pte) | (was & VMM_ACCESSED)));
+        }
+    }
+    return cleared;
+}
+void vmm_age_flush(void) { hal_tlb_shootdown(0, 0); }
+uint64_t vmm_af_fault_count(void) { return 0; }   /* x86 sets A itself */   /* full, everywhere */
 
 /* §M72 stage 3 — see vmm_flags.h. */
 int vmm_space_mark_swapped(struct vmm_space* s, uintptr_t va, uint32_t slot, uint32_t flags) {

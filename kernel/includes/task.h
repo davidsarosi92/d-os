@@ -672,6 +672,10 @@ int  task_count(void);
  * currently scheduled task.  Used by procfs to render `/proc/tasks`. */
 typedef void (*task_iter_fn)(const struct task* t, int is_current, void* ctx);
 void task_for_each(task_iter_fn fn, void* ctx);
+/* Swap `t->mm` under the task-list lock; returns the old space, which the
+ * caller destroys afterwards.  Every write of another walker-visible task's
+ * `mm` goes through this (see task.c). */
+struct vmm_space* task_swap_mm(struct task* t, struct vmm_space* ns);
 
 /* M18.6.3 — find a task by pid.  Returns NULL if no live task carries
  * that pid.  Used by `taskset` and a future `kill`.  Walks the global

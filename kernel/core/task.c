@@ -2583,9 +2583,17 @@ void task_exit_code(int code) {
             } while (c != master_head);
         }
         spin_unlock_irqrestore(&master_lock, f2);
+        /* A PLAIN kill for every child now, ring-3 ones included (2026-09-27).
+         * The force was there because a plain kill used to be honoured only
+         * in task_yield, which a wedged ring-3 task never reaches; the ring-3
+         * safe point honours it now — from the timer too, so a child spinning
+         * in user mode still dies within a tick.  And the force had a cost:
+         * every such child was filed as a CRASH ("unresponsive task reclaimed
+         * by force"), so killing a program that had forked produced a crash
+         * report for a child that had done nothing wrong. */
         for (int i = 0; i < nk; i++) {
-            if (kforce[i]) task_force_kill(kids[i]);
-            else           task_kill(kids[i]);
+            (void)kforce[i];
+            task_kill(kids[i]);
         }
     }
 
@@ -2908,6 +2916,22 @@ void task_list(void) {
     kprintf("total: %u KB private in user spaces, %u KB shared; pmm has %u KB in use\n",
             (unsigned)(sum_priv / 1024u), (unsigned)(sum_shared / 1024u),
             (unsigned)((pmm_used_frames() * 4096ull) / 1024ull));
+}
+
+/* Replace a task's address space POINTER under the task-list lock, and hand
+ * back the old one for the caller to destroy AFTER this returns (2026-09-27).
+ * Every walker of other tasks' spaces — `ps`'s memory column (§M75), the Task
+ * Manager, §M74's accessed-bit sweep — reads `t->mm` inside task_for_each,
+ * i.e. under this lock, and walks it there.  execve used to write the pointer
+ * and free the old space with no lock at all, so a walker could be inside a
+ * space while it was being freed.  Taking the lock here means the swap waits
+ * for any walk in progress, and no walker can start on the old space after. */
+struct vmm_space* task_swap_mm(struct task* t, struct vmm_space* ns) {
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    struct vmm_space* old = t->mm;
+    t->mm = ns;
+    spin_unlock_irqrestore(&master_lock, fl);
+    return old;
 }
 
 void task_for_each(task_iter_fn fn, void* ctx) {

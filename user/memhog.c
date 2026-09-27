@@ -101,9 +101,29 @@ static int verify_mode(void) {
     return 0;
 }
 
+/* §M74 rung 1 — `memhog age`: the accessed-bit sweep's falsifier.  8 MiB,
+ * all written once; then the first 25 % is touched every 50 ms for ~6 s, and
+ * after that the first 75 %.  The kernel's per-process split must follow. */
+#define AGE_BYTES (8u * STEP_BYTES)
+static int age_mode(void) {
+    unsigned char* p = (unsigned char*)mmap(AGE_BYTES, -1);
+    if (!p) { printf("memhog: no memory\n"); return 1; }
+    for (unsigned off = 0; off < AGE_BYTES; off += 4096) p[off] = 1;
+    printf("memhog: pid %d touching 25%% of %u KB, then 75%%\n", getpid(), AGE_BYTES / 1024u);
+    volatile unsigned sink = 0;
+    for (unsigned it = 0;; it++) {
+        unsigned span = it < 120 ? AGE_BYTES / 4u : (AGE_BYTES / 4u) * 3u;
+        if (it == 120) printf("memhog: now touching 75%%\n");
+        for (unsigned off = 0; off < span; off += 4096) sink += p[off];   /* a READ */
+        nanosleep_ms(50);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && argv[1][0] == 'f') return fill_mode();
     if (argc > 1 && argv[1][0] == 'v') return verify_mode();
+    if (argc > 1 && argv[1][0] == 'a') return age_mode();
     unsigned held_kb = 0;
 
     printf("memhog: pid %d — 1 MiB every 2 s, up to %d MiB\n",

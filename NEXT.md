@@ -8,7 +8,7 @@ mount / unmount / format / RAM disks.  `locale missing on` + `locale missing`
 measures untranslated strings as they are drawn.  Agreed order (2026-09-27, see PLAN "Open work — exact state"):
 1. finish the half-done milestones — §M26/§M59
    all done: §M32 sessions §4.108 + ownership §4.109  (§M86 NX: done, §4.104; §M19.5 NUMA zones: done, §4.106; `wl_data_device`: done, §4.107);
-2. then §M82 (DONE, §4.110), §M72 (DONE, §4.111), §M74, §M73 (any order);
+2. then §M82 (DONE, §4.110), §M72 (DONE, §4.111), §M74 (rung 1 DONE, §4.112; rungs 2-4 next), §M73;
 3. then §M81 (the GUI seams verdict).
 Any defect found on the way is fixed first, whatever it touches.
 Also open from §M87: a second virtio-blk disk, partition tables, a real Wi-Fi

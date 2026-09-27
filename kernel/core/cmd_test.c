@@ -354,7 +354,7 @@ static void cmd_shmtest(void) {
     struct vmm_space* s = vmm_space_create();
     if (!s) { console_write("shmtest: no space\n"); return; }
     struct vmm_space* prev = me->mm;
-    me->mm = s;
+    task_swap_mm(me, s);
     vmm_space_switch(s);
 
     long a = sys_mmap(8192, -1);                     /* anonymous, 2 pages */
@@ -376,7 +376,7 @@ static void cmd_shmtest(void) {
     if (fd >= 0) sys_close(fd);                       /* frees shm frames once */
 
     vmm_space_switch(prev);
-    me->mm = prev;
+    task_swap_mm(me, prev);
     vmm_space_destroy(s);                             /* frees anon; skips shm */
 
     kprintf("shmtest: anon-mmap=%s shm-shared=%s (a=%p m1=%p m2=%p)\n",
@@ -408,7 +408,7 @@ static void cmd_socktest(void) {
     struct vmm_space* s = vmm_space_create();
     if (!s) { console_write("socktest: no space\n"); return; }
     struct vmm_space* prev = me->mm;
-    me->mm = s;
+    task_swap_mm(me, s);
     vmm_space_switch(s);
 
     int fds[2] = { -1, -1 };
@@ -443,7 +443,7 @@ static void cmd_socktest(void) {
     if (fds[1] >= 0) sys_close(fds[1]);
 
     vmm_space_switch(prev);
-    me->mm = prev;
+    task_swap_mm(me, prev);
     vmm_space_destroy(s);
 
     kprintf("socktest: pair+data=%s fd-passing(shared mem)=%s (passed fd=%d)\n",

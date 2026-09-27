@@ -725,9 +725,13 @@ int vmm_space_protect(struct vmm_space* s, uintptr_t virt, uint32_t flags) {
     if (!pt) return -1;
     uint64_t pte = pt[IDX_PT(virt)];
     if ((pte & PTE_P) == 0) return -1;             /* not present */
+    /* COW pages: keep the mark and stay write-protected (see the i386 twin).
+     * This version also DROPPED VMM_COW, after which teardown freed a frame
+     * the other side of the fork still mapped (`cowprotecttest`). */
+    if (pte & VMM_COW) flags &= ~(uint32_t)PTE_RW;
     pt[IDX_PT(virt)] = (pte & PAGE_MASK_4K) | PTE_P
                      | ((uint64_t)flags & (PTE_RW | PTE_US))
-                     | (pte & VMM_SHARED)
+                     | (pte & (VMM_SHARED | VMM_COW))
                      | nx_bits(flags | (uint32_t)(pte & PTE_US));
     hal_tlb_shootdown(0, virt);          /* §M51 — may drop PTE_RW */
     return 0;
@@ -774,6 +778,37 @@ void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
     if (!s || !cb) return;
     walk_subtree(s->pml4, (uint64_t*)pml4, 0, 0, cb, ctx);
 }
+
+/* §M74 — see vmm_flags.h: the walk above, clearing the accessed bit
+ * atomically on each leaf as it goes. */
+static uint32_t age_subtree(uint64_t* tbl, uint64_t* ktbl, int depth, uintptr_t va,
+                            vmm_walk_fn cb, void* ctx) {
+    uint32_t cleared = 0;
+    for (int i = 0; i < 512; i++) {
+        uint64_t e = tbl[i];
+        if (!(e & PTE_P))                 continue;
+        if (ktbl && e == ktbl[i])         continue;
+        if (depth >= 1 && (e & PTE_PS))   continue;
+        uintptr_t entry_va = va + ((uintptr_t)i << shift_for_depth[depth]);
+        if (depth < 3) {
+            uint64_t* kchild = (ktbl && (ktbl[i] & PTE_P) && !(ktbl[i] & PTE_PS))
+                             ? table_at((uintptr_t)ktbl[i]) : NULL;
+            cleared += age_subtree(table_at((uintptr_t)e), kchild, depth + 1, entry_va, cb, ctx);
+        } else {
+            uint64_t was = __atomic_fetch_and(&tbl[i], ~(uint64_t)VMM_ACCESSED, __ATOMIC_RELAXED);
+            if (was & VMM_ACCESSED) cleared++;
+            if (cb) cb(ctx, entry_va, (uintptr_t)(was & PAGE_MASK_4K),
+                       (uint32_t)(was & 0xFFFu) | ((was & PTE_NX) ? 0u : (uint32_t)VMM_EXEC));
+        }
+    }
+    return cleared;
+}
+uint32_t vmm_space_age(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
+    if (!s) return 0;
+    return age_subtree(s->pml4, (uint64_t*)pml4, 0, 0, cb, ctx);
+}
+void vmm_age_flush(void) { hal_tlb_shootdown(0, 0); }
+uint64_t vmm_af_fault_count(void) { return 0; }   /* x86 sets A itself */
 
 /* §M72 stage 3 — see vmm_flags.h.  Only a leaf of a PRIVATE table may be
  * marked (the same rule the walker applies), and the page must be present. */

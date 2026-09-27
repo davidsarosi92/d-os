@@ -33,6 +33,8 @@ aarch64_enter_user:
     str     x9,  [x2]                   /* resume[0] = caller SP */
     str     x30, [x2, #8]               /* resume[1] = caller LR */
 
+    msr     daifset, #0xf               /* no IRQ between msr elr/spsr and eret
+                                         * (see vectors.S exc_dispatch) */
     msr     sp_el0,  x1                 /* user stack      */
     msr     elr_el1, x0                 /* user entry PC   */
     mov     x2, #0                      /* SPSR = EL0t, DAIF clear */
@@ -62,6 +64,8 @@ aarch64_user_exit_to:
  * --------------------------------------------------------------------------- */
 .global enter_user_mode
 enter_user_mode:
+    msr     daifset, #0xf               /* no IRQ between msr elr/spsr and eret
+                                         * (see vectors.S exc_dispatch) */
     msr     sp_el0,  x1                 /* user stack           */
     msr     elr_el1, x0                 /* user entry PC        */
     mov     x2, #0                      /* SPSR = EL0t, DAIF clear (IRQs on) */
@@ -111,6 +115,8 @@ enter_user_mode_regs:
     mov     x9, x0                      /* frame pointer, out of the way */
 
     ldr     x10, [x9, #0xF8]            /* SP_EL0  */
+    msr     daifset, #0xf               /* no IRQ between msr elr/spsr and eret
+                                         * (see vectors.S exc_dispatch) */
     msr     sp_el0, x10
     ldr     x10, [x9, #0x100]           /* PC      */
     msr     elr_el1, x10

@@ -372,7 +372,7 @@ static void cmd_faulttest(void) {
     if (!s) { console_write("faulttest: no space\n"); return; }
     struct vmm_space* prev = me->mm;
     int prev_gate = me->in_user_syscall;
-    me->mm = s;
+    task_swap_mm(me, s);
     vmm_space_switch(s);
     me->in_user_syscall = 1;                 /* pretend we came from ring 3 */
 
@@ -422,7 +422,7 @@ static void cmd_faulttest(void) {
     }
 
     vmm_space_switch(prev);
-    me->mm = prev;
+    task_swap_mm(me, prev);
     vmm_space_destroy(s);
 
     kprintf("faulttest: gate   write(kernel ptr)=%ld open(unmapped)=%d stat(unmapped)=%d -> %s\n",

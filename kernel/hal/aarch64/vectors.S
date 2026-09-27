@@ -154,5 +154,17 @@ el0_32_serror:
 exc_dispatch:
     mov     x1, sp
     bl      aarch64_exception_handler
+    /* MASK EVERYTHING BEFORE THE RESTORE (2026-09-27).  RESTORE_TRAPFRAME
+     * writes ELR_EL1 and SPSR_EL1 FIRST and reloads sixteen register pairs
+     * after — and the handler may return with interrupts ENABLED (the syscall
+     * path unmasks them to run the call; a return through the scheduler can
+     * too).  An IRQ in that window takes a nested exception, which overwrites
+     * ELR_EL1/SPSR_EL1 with ITS return state, and the outer `eret` then jumps
+     * to a kernel address: seen as a program faulting at EL0 with ELR inside
+     * exc_dispatch, or as the restore itself reading off the stack.  x86 cannot
+     * have this — its return state lives on the stack and iret is atomic.
+     * `eret` reinstates PSTATE (and so the interrupt mask) from SPSR_EL1, so
+     * masking here costs nothing on the way out. */
+    msr     daifset, #0xf
     RESTORE_TRAPFRAME
     eret
