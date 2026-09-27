@@ -203,6 +203,18 @@ volatile void* drv_mmio_ptr(drv_handle h);
  * ---------------------------------------------------------------------- */
 drv_handle drv_irq_request(struct drv_rt* rt, int line, const char* why);
 
+/* §M85 — the same, for a LEVEL-triggered line (a PCI INTx).  A level line
+ * stays asserted until the DRIVER acknowledges its device, and the driver
+ * runs in a task — possibly in ring 3 — so an ISR that only counted and woke
+ * would be re-entered until that task got a CPU, which on the CPU taking the
+ * interrupt is never (the virtio-blk storm of 2026-09-25, in another shape).
+ * With DRV_IRQ_LEVEL the ISR MASKS the line as it wakes the driver, and the
+ * driver's NEXT drv_irq_wait unmasks it — by then it has acknowledged the
+ * device.  Edge lines (ISA: PS/2) must not use it: an IOAPIC drops an edge
+ * that arrives while its line is masked. */
+#define DRV_IRQ_LEVEL 0x1
+drv_handle drv_irq_request_ex(struct drv_rt* rt, int line, const char* why, int flags);
+
 /* Block until the line fires, or until `timeout_ms` passes (0 = no wait, <0 =
  * forever).  Returns the number of interrupts observed since the last call —
  * NOT a boolean, because a driver that slept through three of them needs to

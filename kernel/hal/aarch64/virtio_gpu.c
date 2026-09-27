@@ -27,6 +27,7 @@
  * ============================================================================= */
 
 #include "fb_present.h"
+#include "fb_backend.h"
 #include "pmm.h"
 #include "printf.h"
 #include "hal_api.h"
@@ -231,20 +232,12 @@ static uint32_t gpu_submit(uint32_t cmd_len) {
 
 /* The framebuffer is ordinary RAM the boot page tables already map Normal-WB,
  * so there is nothing to do — virt == phys and it is writable. */
-int fb_present_map(uint64_t phys, uint64_t size) {
-    (void)phys; (void)size;
-    return 0;
-}
 
 /* Bochs-VBE double-buffer page flip (compositor).  virtio-gpu has no such
  * hardware pan, so report "unavailable" — gui.c then keeps its single-buffer
  * blit, which on ARM is followed by fb_present_flush() to push the dirty rect
  * to the scanout.  These stubs let the portable gui.c link on aarch64. */
-int fb_flip_init(volatile uint32_t** buf0, volatile uint32_t** buf1) {
-    (void)buf0; (void)buf1;
-    return -1;
-}
-void fb_flip_to(int idx) { (void)idx; }
+/* (map / page flip: fb_present.c answers for every backend — §M85.) */
 
 /* ==========================================================================
  * §M61 — MODE SETTING on virtio-gpu.
@@ -276,28 +269,28 @@ static const struct fb_mode gpu_modes[] = {
 };
 #define N_GPU_MODES ((int)(sizeof gpu_modes / sizeof gpu_modes[0]))
 
-int fb_mode_count(void) {
+static int vgpu_mode_count(void) {
     /* Without a device there is exactly one mode: whatever we booted with.
      * Callers read a count of 1 as "this display cannot be asked to change"
      * (fb_present.h), which is still the honest answer here. */
     return g_ready ? N_GPU_MODES : 1;
 }
 
-int fb_mode_current(struct fb_mode* out) {
+static int vgpu_mode_current(struct fb_mode* out) {
     if (!out) return -1;
     out->w = (uint16_t)g_w; out->h = (uint16_t)g_h; out->bpp = 32;
     return 0;
 }
 
-int fb_mode_get(int index, struct fb_mode* out) {
+static int vgpu_mode_get(int index, struct fb_mode* out) {
     if (!out) return -1;
-    if (!g_ready) return index == 0 ? fb_mode_current(out) : -1;
+    if (!g_ready) return index == 0 ? vgpu_mode_current(out) : -1;
     if (index < 0 || index >= N_GPU_MODES) return -1;
     *out = gpu_modes[index];
     return 0;
 }
 
-int fb_mode_set(uint32_t w, uint32_t h, uint32_t bpp) {
+static int vgpu_mode_set(uint32_t w, uint32_t h, uint32_t bpp) {
     if (!g_ready) return -2;                 /* no device — cannot change     */
     if (bpp != 32) return -3;                /* one pixel format on purpose   */
     if (w < 320 || h < 200 || w > 4096 || h > 4096) return -4;
@@ -405,7 +398,7 @@ int fb_mode_set(uint32_t w, uint32_t h, uint32_t bpp) {
 /* Copy a dirty rect out of guest RAM into the host resource, then present it.
  * fb_terminal calls this after every render primitive.  Rects are clamped to
  * the framebuffer; a degenerate rect is ignored. */
-void fb_present_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+static void vgpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     if (!g_ready) return;
     if (x >= g_w || y >= g_h || w == 0 || h == 0) return;
     if (x + w > g_w) w = g_w - x;
@@ -515,6 +508,20 @@ int virtio_gpu_init(void) {
     if (gpu_submit(sizeof *s) != VIRTIO_GPU_RESP_OK_NODATA) { kprintf("virtio-gpu: set_scanout failed\n"); return -1; }
 
     g_ready = 1;
+    {
+        /* §M85 — behind fb_present.h through the backend table, so another
+         * display (sbsa-ref's bochs-display) can take the same seam. */
+        static const struct fb_backend vgpu_backend = {
+            .name = "virtio-gpu", .flush = vgpu_flush,
+            .mode_count = vgpu_mode_count, .mode_get = vgpu_mode_get,
+            .mode_current = vgpu_mode_current, .mode_set = vgpu_mode_set,
+        };
+        if (fb_backend_register(&vgpu_backend) != 0) {
+            kprintf("virtio-gpu: another display is already active - standing aside\n");
+            g_ready = 0;
+            return -1;
+        }
+    }
     kprintf("virtio-gpu: %dx%d scanout up, FB @ %p (%u frames) at slot base %p\n",
             FB_WIDTH, FB_HEIGHT, (void*)(uintptr_t)g_fb_phys, nframes, (void*)g_base);
 

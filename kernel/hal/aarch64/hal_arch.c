@@ -206,3 +206,28 @@ void hal_tlb_shootdown(uintptr_t root_phys, uintptr_t va) {
 void     hal_set_io_bitmap(const void* bm) { (void)bm; }
 uint32_t hal_io_bitmap_bytes(void)         { return 0; }
 void     hal_io_bitmap_forget(const void* bm) { (void)bm; }
+
+/* §M85 — hal_irq_attach (hal_api.h): the GIC INTID a portable driver was
+ * given in pci_device.irq_line.  Several callbacks per INTID, because a PCI
+ * INTx line is level-triggered and shared. */
+void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
+void gic_enable_irq(uint32_t intid);
+#define IRQA_MAX 8
+static struct { uint32_t intid; void (*fn)(void); } g_irqa[IRQA_MAX];
+static void irqa_tramp(uint32_t intid) {
+    for (int k = 0; k < IRQA_MAX; k++)
+        if (g_irqa[k].fn && g_irqa[k].intid == intid) g_irqa[k].fn();
+}
+int hal_irq_attach(int line, void (*fn)(void)) {
+    if (line < 16 || line > 1019 || !fn) return -1;
+    int first = 1;
+    for (int k = 0; k < IRQA_MAX; k++) if (g_irqa[k].fn && g_irqa[k].intid == (uint32_t)line) first = 0;
+    for (int k = 0; k < IRQA_MAX; k++) {
+        if (g_irqa[k].fn) continue;
+        g_irqa[k].intid = (uint32_t)line;
+        g_irqa[k].fn = fn;
+        if (first) { gic_register_handler((uint32_t)line, irqa_tramp); gic_enable_irq((uint32_t)line); }
+        return 0;
+    }
+    return -1;
+}

@@ -143,6 +143,22 @@ static void fill_device(struct pci_device* d, uint8_t bus, uint8_t slot, uint8_t
     d->class_code  = pci_read8 (bus, slot, func, PCI_CLASS);
     d->header_type = pci_read8 (bus, slot, func, PCI_HEADER_TYPE);
     d->irq_line    = pci_read8 (bus, slot, func, PCI_INTERRUPT_LINE);
+    /* §M85 — on ARM nothing programs INTERRUPT_LINE (it is a PC BIOS
+     * convention), so the byte is meaningless here.  On an ACPI machine the
+     * host bridge's _PRT says where the function's INTx pin lands; 0xFF means
+     * "not routed" (the x86 drivers' own sentinel), so a driver falls back to
+     * polling rather than hooking whatever number was left in the register. */
+    d->irq_line = 0xFF;
+    {
+        extern int acpi_arm_pci_intx(uint8_t slot, uint8_t pin);
+        extern int dtb_pci_intx(uint8_t slot, uint8_t pin);
+        uint8_t pin = pci_read8(bus, slot, func, 0x3D);
+        int gsi = -1;
+        if (bus == 0 && pin)
+            gsi = (g_board.src == BOARD_ACPI) ? acpi_arm_pci_intx(slot, pin)
+                                               : dtb_pci_intx(slot, pin);
+        if (gsi > 0 && gsi < 0xFF) d->irq_line = (uint8_t)gsi;
+    }
     for (int i = 0; i < 6; i++)
         d->bar[i] = pci_read32(bus, slot, func, PCI_BAR0 + i * 4);
 }

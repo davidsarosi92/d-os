@@ -165,6 +165,12 @@ drv_handle drv_irq_request(struct drv_rt* rt, int line, const char* why) {
     (void)rt; (void)why;
     return (drv_handle)dos_syscall3(SYS_DRV_IRQ, line, 0, 0);
 }
+/* The placed (ring-3) path: the kernel side of SYS_DRV_IRQ owns the line;
+ * level handling there is the kernel's (drvuser.c), so the flag is not sent. */
+drv_handle drv_irq_request_ex(struct drv_rt* rt, int line, const char* why, int flags) {
+    (void)flags;
+    return drv_irq_request(rt, line, why);
+}
 
 /* Set once the kernel has asked this driver to stop.  Sticky on purpose: the
  * request is delivered exactly once, on whichever wait happened to be in

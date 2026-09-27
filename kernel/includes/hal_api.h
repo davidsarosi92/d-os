@@ -169,6 +169,16 @@ uintptr_t hal_extend_identity_map(uintptr_t end_phys);
 #  define KERNEL_DIRECT_MAP_BASE  0UL
 #endif
 
+/* §M85 — hook a device interrupt LINE with a plain callback, from a portable
+ * driver.  `line` is what pci_device.irq_line holds on this arch (x86: the
+ * legacy IRQ number; aarch64: the GIC INTID the firmware tables route the
+ * INTx pin to).  The callback runs in interrupt context and must do what an
+ * ISR does here and no more: acknowledge the device, wake somebody.  Lines are
+ * SHARED (x86 irq_install chains; PCI INTx on ARM is level-triggered and
+ * shared by design), so a callback must check that it was its device.
+ * 0 on success, -1 on a line out of range or the table full. */
+int hal_irq_attach(int line, void (*fn)(void));
+
 #if defined(__aarch64__)
 /* §M85 stage 4 (2026-09-26) — aarch64's kernel no longer runs where it was
  * loaded.  Two offsets, both fixed during early boot (mmu.c) and never again:

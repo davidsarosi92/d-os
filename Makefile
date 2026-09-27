@@ -103,6 +103,7 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/vmm.c \
       kernel/hal/x86/fb_present.c \
       kernel/hal/x86/ringtest.c \
+      kernel/hal/x86/irq_attach.c \
       kernel/hal/x86/pci.c \
       kernel/hal/x86/hal_arch.c \
       kernel/hal/x86/task_arch.c \
@@ -314,7 +315,8 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/pci.c \
       kernel/hal/x86/fb_present.c \
-      kernel/hal/x86/ringtest.c
+      kernel/hal/x86/ringtest.c \
+      kernel/hal/x86/irq_attach.c
 
   ARCH_ASM_SRCS := \
       kernel/hal/x86_64/boot.s \
@@ -557,6 +559,8 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/virtio_mmio_blk.c \
     kernel/hal/aarch64/virtio_mmio_net.c \
       kernel/hal/aarch64/virtio_gpu.c \
+      kernel/hal/aarch64/fb_present.c \
+      kernel/hal/aarch64/bochs_display.c \
       kernel/hal/aarch64/virtio_input.c \
       kernel/hal/aarch64/virtio_snd.c \
       kernel/hal/aarch64/pl031_rtc.c \

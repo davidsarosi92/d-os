@@ -28,8 +28,6 @@
 #include "console.h"
 #include "kmalloc.h"
 #include "printf.h"
-void edu_test(void);
-void edu_escape(uint64_t phys);
 #include "vfs.h"
 #include "config.h"
 #include "task.h"

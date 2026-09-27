@@ -14550,8 +14550,76 @@ welcome page — all unchanged.
    next command runs, on all three arches.
 
 
+### 4.105 sbsa-ref's display, PCI interrupt routing, and the host bridge's window (§M85 closed, 2026-09-27)
+
+§M85's three open items, and three defects found beside them.
+
+**The display.**  sbsa-ref has no virtio: its screen is a `bochs-display`
+(PCI 1234:1111) — a linear framebuffer in BAR0 and the Bochs DISPI registers
+memory-mapped at BAR2 + 0x500.  `fb_present.h` had exactly one implementation
+on this arch (virtio_gpu.c defined it directly), so it became a small backend
+table (`fb_backend.h`, `fb_present.c`): the first display that comes up
+registers, and nothing above the seam can tell the two apart.  The new driver
+draws into a RAM SHADOW and `flush` copies the dirty rectangle into the BAR with
+aligned 32-bit stores — low memory is Device memory on this port and Device
+memory forbids the unaligned accesses the portable renderer makes freely; a
+Normal-NC mapping of the BAR would remove the copy, needs a 2 MiB carve-out of
+a 1 GiB block shared with other registers, and can come later without touching
+a caller.  Mode setting works (the device's geometry is read BACK, as on x86).
+Verified by picture: the desktop at 1280x800, then `mode 1024x768`.
+
+**PCI INTx → GIC.**  On ARM nothing programs `INTERRUPT_LINE`, so drivers read
+a meaningless byte (the edu driver was asking for INTID 0 — an SGI).  Now:
+- ACPI: the narrow AML reader parses the host bridge's `_PRT` (a static
+  package: slot, pin, link or GSI) and the PCI link devices' `_PRS` (their
+  `_CRS` is a method returning it) — sbsa-ref: 128 entries, 4 links, the e1000e
+  on GSI 36.  Its table has a quirk worth knowing: slot 0 lists INTA four times
+  and B-D not at all; first match wins and B-D report unrouted.
+- Device tree: the bridge's `interrupt-map` (+ mask), decoded when a driver asks
+  because an entry's length depends on the GIC's own `#address-cells`.  `virt`:
+  edu in slot 1 → INTID 36 = 32 + 3 + (1 + 0) % 4, as QEMU wires it.
+- `irq_line` is 0xFF when unrouted, so drivers poll instead of hooking junk.
+  `lspci` shows the line; `acpi` prints the routing table.
+
+**The host bridge's window.**  `aml_scan` stopped reading a device's names at
+its FIRST nested `Device()`.  sbsa-ref's PCI0 declares four link devices before
+its `_PRT` and `_CRS`, so both were invisible — the "_CRS is not the static
+shape" diagnosis in §4.102 was wrong; nested devices are now skipped by length.
+The 32-bit window (0x8000_0000, 1.75 GiB) is found.
+
+**Clients that prove it.**  A portable `hal_irq_attach(line, fn)` (x86: over
+`irq_install`, chained; aarch64: the GIC) lets a portable driver take an
+interrupt without arch code.  **e1000e** is interrupt-driven when its line is
+routed (ICR read = acknowledge, then wake netd): sbsa-ref 6 interrupts / 0
+backstops / 0 missed with ping and DNS working; x86_64 `-device e1000e` on line
+10, ping 3/3 through it.  **drvrt gained LEVEL-triggered lines**
+(`drv_irq_request_ex(..., DRV_IRQ_LEVEL)`): a PCI INTx stays asserted until the
+DRIVER acknowledges its device, and a driver is a task — possibly in ring 3 —
+so an ISR that only counted would be re-entered until that task ran, which on
+the interrupted CPU is never (the virtio-blk storm's shape).  The ISR masks the
+line, the driver's next `drv_irq_wait` unmasks it, and teardown unmasks a line
+left held (it may be shared).  Edge lines keep the old path — an IOAPIC drops
+an edge that arrives masked.  **edu** now waits on its completion interrupt:
+ARM 6 fired over two `edutest`s; i386 on the SHARED line 10 with virtio-blk,
+and `diskstorm` PASS afterwards.
+
+**Found and fixed:**
+1. `edutest` (and the escape probe) had been UNREACHABLE since §M70 moved the
+   shell to a registry — shell.c kept the prototypes and nothing registered a
+   verb, so §M33's proof of DMA confinement could not be run on any arch.  A
+   sweep of every `...test` DOCS.md names against the registry found this one
+   and no other.  `eduescape` now REFUSES a missing address rather than
+   defaulting to 0 (the device would write there on a machine with no IOMMU).
+2. No RTC on sbsa-ref (the firmware owns its PL031 and the DSDT does not
+   describe it) left the taskbar's clock slot EMPTY — "there is no icon" again.
+   It says "no clock device" now.  Reading the time through UEFI runtime
+   services is the way to a real clock there, and is not done.
+3. The edu IRQ request on ARM pointed at INTID 0 (see above).
+
+
 ## 8. Change log
 
+- **2026-09-27 — §M85 closed: sbsa-ref's bochs-display (fb_present backends), PCI INTx routing from ACPI `_PRT` and DT `interrupt-map`, the host bridge window; `hal_irq_attach`; interrupt-driven e1000e; drvrt level-triggered lines; edu on its interrupt; `edutest` restored; a clock slot that says when there is no clock (DOCS §4.105).**
 - **2026-09-27 — §M86 closed: no-execute for user pages on i386 PAE and x86_64 (`nxtest`, harness CPU `qemu32,+nx`); ELF loader keeps a page shared by two segments; x86_64 crash records carry the fault address; aarch64 lets EL0 maintain its caches; a faulting excursion no longer kills its host task (DOCS §4.104).**
 - **2026-09-27 — §M87: Network, Wi-Fi (with a simulated adapter) and Disks pages in the Control Panel; a taskbar network indicator with a chooser; `vfs_umount`, an exFAT formatter (fsck-clean), RAM disks, link state; the module fingerprint covers `net_device`; the translation gap measured (`locale missing`) and closed (DOCS §4.103).**
 - **2026-09-27 — The desktop asks who you are: a greeter whenever more than the first-run root exists, an uncloseable lock (no X, Esc ignored), a Sign in button, `gui signout` (DOCS §4.91 stage 10.1).**

@@ -236,7 +236,9 @@ static int edu_init(void* ctx) {
      * the command register, so a driver that never gets the line degrades to
      * polling rather than to silence (§M55's rule). */
     if (pd.irq_line != 0xFF) {
-        h_irq = drv_irq_request(&rt, pd.irq_line, "edu completion");
+        /* A PCI INTx: LEVEL-triggered, so drvrt holds it off between the fire
+         * and our acknowledgement (drvrt.h). */
+        h_irq = drv_irq_request_ex(&rt, pd.irq_line, "edu completion", DRV_IRQ_LEVEL);
         if (h_irq < 0) kprintf("edu: no IRQ grant (%d) — polling instead\n", h_irq);
     }
 #endif
@@ -309,9 +311,34 @@ DRIVER_EX(edu, "misc", &edu_ops, NULL, DOMAIN_KERNEL | DOMAIN_USER, DRVF_DMA);
  * it BACK, and compare.  Both directions on purpose: a one-way test passes on a
  * device that ignores the transfer entirely and leaves the buffer alone.
  * ---------------------------------------------------------------------- */
+/* §M85 — the completion INTERRUPT when the line is routed (the edu raises it
+ * for a DMA command carrying EDU_DMA_IRQ), and polling otherwise.  The ISR
+ * held the level line off; acknowledging the device here and coming back into
+ * drv_irq_wait is what releases it.  A missed interrupt costs a 20 ms wait per
+ * round, never correctness: the command register is checked either way. */
+static uint32_t dma_irq_flag(void) {
+#ifndef DRV_USERSPACE
+    return h_irq >= 0 ? EDU_DMA_IRQ : 0;
+#else
+    return 0;
+#endif
+}
+
 static int dma_wait(void) {
     for (int i = 0; i < 200; i++) {
-        if (!(r32(EDU_DMA_CMD) & EDU_DMA_START)) return 0;
+        if (!(r32(EDU_DMA_CMD) & EDU_DMA_START)) {
+            uint32_t st = r32(EDU_IRQ_STATUS);
+            if (st) w32(EDU_IRQ_ACK, st);
+            return 0;
+        }
+#ifndef DRV_USERSPACE
+        if (h_irq >= 0) {
+            drv_irq_wait(h_irq, 20);
+            uint32_t st = r32(EDU_IRQ_STATUS);
+            if (st) w32(EDU_IRQ_ACK, st);
+            continue;
+        }
+#endif
         task_msleep(5);
     }
     return -1;
@@ -348,7 +375,7 @@ void edu_test(void) {
     w64(EDU_DMA_SRC, dev);
     w64(EDU_DMA_DST, EDU_DEV_BUFFER);
     w64(EDU_DMA_CNT, 256);
-    w32(EDU_DMA_CMD, EDU_DMA_START | EDU_DMA_TO_DEV);
+    w32(EDU_DMA_CMD, EDU_DMA_START | EDU_DMA_TO_DEV | dma_irq_flag());
     if (dma_wait() != 0) { kprintf("edutest: FAIL — transfer to the device never finished\n"); return; }
 
     for (int i = 0; i < 256; i++) cpu[i] = 0;
@@ -356,7 +383,7 @@ void edu_test(void) {
     w64(EDU_DMA_SRC, EDU_DEV_BUFFER);
     w64(EDU_DMA_DST, dev);
     w64(EDU_DMA_CNT, 256);
-    w32(EDU_DMA_CMD, EDU_DMA_START | EDU_DMA_FROM_DEV);
+    w32(EDU_DMA_CMD, EDU_DMA_START | EDU_DMA_FROM_DEV | dma_irq_flag());
     if (dma_wait() != 0) { kprintf("edutest: FAIL — transfer back never finished\n"); return; }
 
     int bad = 0;
@@ -398,7 +425,7 @@ void edu_test(void) {
     w64(EDU_DMA_SRC, EDU_DEV_BUFFER);
     w64(EDU_DMA_DST, outside);
     w64(EDU_DMA_CNT, 256);
-    w32(EDU_DMA_CMD, EDU_DMA_START | EDU_DMA_FROM_DEV);
+    w32(EDU_DMA_CMD, EDU_DMA_START | EDU_DMA_FROM_DEV | dma_irq_flag());
     dma_wait();
 #ifndef DRV_USERSPACE
     uint32_t after = iommu_fault_count();
@@ -444,12 +471,42 @@ void edu_escape(uint64_t phys) {
     w64(EDU_DMA_SRC, EDU_DEV_BUFFER);
     w64(EDU_DMA_DST, phys);
     w64(EDU_DMA_CNT, 256);
-    w32(EDU_DMA_CMD, EDU_DMA_START | EDU_DMA_FROM_DEV);
+    w32(EDU_DMA_CMD, EDU_DMA_START | EDU_DMA_FROM_DEV | dma_irq_flag());
     if (dma_wait() != 0)
         kprintf("edu: the transfer did not complete — consistent with a refusal\n");
     else
         kprintf("edu: the transfer COMPLETED — nothing stopped it\n");
 }
+
+#ifndef DRV_USERSPACE
+/* 2026-09-27 — THE COMMANDS WERE LOST in §M70's move to the command registry:
+ * shell.c kept the two prototypes and nothing registered a verb, so the round
+ * trip and the escape — §M33's proof that a confined DMA driver is confined —
+ * could not be run on any arch.  Found by a sweep of every `...test` DOCS.md
+ * names against the registry; this was the only one missing. */
+#include "shellcmd.h"
+static void cmd_edutest(const char* a) { (void)a; edu_test(); }
+static void cmd_eduescape(const char* a) {
+    uint64_t v = 0;
+    while (a && *a == ' ') a++;
+    if (a && a[0] == '0' && (a[1] == 'x' || a[1] == 'X')) a += 2;
+    for (; a && *a; a++) {
+        char c = *a;
+        int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+              : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+        if (d < 0) break;
+        v = (v << 4) | (uint64_t)d;
+    }
+    /* No default target: on a machine without an IOMMU the device WILL write
+     * there, so the address is always the typist's explicit choice. */
+    if (!v) { kprintf("usage: eduescape <phys hex>  (edutest runs a safe one)\n"); return; }
+    edu_escape(v);
+}
+SHELL_CMD(edutest)   = { "edutest", "", "edu DMA round trip + the escape the IOMMU must stop",
+                         SHELL_G_TEST, cmd_edutest, SHELL_P_ADMIN };
+SHELL_CMD(eduescape) = { "eduescape", "[phys]", "aim edu's DMA engine at an address it was never given",
+                         SHELL_G_TEST, cmd_eduescape, SHELL_P_ADMIN };
+#endif
 
 #ifdef DRV_USERSPACE
 /* The ring-3 entry point.  Everything above is the same source the kernel

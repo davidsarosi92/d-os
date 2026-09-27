@@ -203,6 +203,18 @@ void gic_enable_irq(uint32_t intid) {
     mmio_w32(GICD_BASE + GICD_ISENABLER + (intid / 32) * 4, 1u << (intid % 32));
 }
 
+/* §M85 — MASK one interrupt at the distributor (the inverse of the above).
+ * drvrt holds a LEVEL-triggered line off between its firing and the driver
+ * acknowledging the device — see drv_irq_request_ex. */
+void gic_disable_irq(uint32_t intid) {
+    if (gic3() && intid < 32) {
+        uintptr_t rd = gicr_this_cpu();
+        if (rd) mmio_w32(rd + GICR_ISENABLER0 + 0x80, 1u << intid);   /* ICENABLER0 */
+        return;
+    }
+    mmio_w32(GICD_BASE + GICD_ISENABLER + 0x80 + (intid / 32) * 4, 1u << (intid % 32));
+}
+
 /* Per-CPU CPU-interface bring-up.  GICC (and the banked SGI/PPI registers) are
  * private to each core, so EVERY CPU — the BSP and each PSCI-started secondary
  * — must run this to start receiving interrupts.  PMR = 0xF0 lets every

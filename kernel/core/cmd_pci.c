@@ -28,9 +28,13 @@ static int g_n;
 static void visit(const struct pci_device* d, void* ctx) {
     (void)ctx;
     g_n++;
-    kprintf("  %u:%u.%u  %x:%x  class %x.%x  %s  bar0 %x\n", d->bus, d->slot, d->func,
+    kprintf("  %u:%u.%u  %x:%x  class %x.%x  %s  bar0 %x", d->bus, d->slot, d->func,
             d->vendor_id, d->device_id, d->class_code, d->subclass,
             cls_name(d->class_code, d->subclass), d->bar[0]);
+    /* §M85 — the interrupt line the platform routes this function's INTx to
+     * (x86: the legacy IRQ; aarch64: the GIC INTID from _PRT / interrupt-map). */
+    if (d->irq_line == 0xFF) kprintf("  irq -\n");
+    else                     kprintf("  irq %u\n", d->irq_line);
 }
 
 static void cmd_lspci(const char* args) {

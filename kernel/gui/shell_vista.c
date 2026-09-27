@@ -1632,7 +1632,19 @@ static int net_tray_tick(void) {
 static int vista_second_tick(void) {
     int net_dirty = net_tray_tick();
     struct rtc_time t;
-    if (rtc_read(&t) != 0) return net_dirty;
+    if (rtc_read(&t) != 0) {
+        /* NO CLOCK DEVICE (§M85: sbsa-ref's RTC belongs to the firmware and the
+         * DSDT does not describe it).  An empty slot where the time should be
+         * is the tray's "there is no icon" failure, which §M23 already ruled
+         * out for the sound indicator: say it, in the catalogue's words. */
+        const char* nc = lstr("tray.noclock");
+        int k = 0;
+        for (; nc[k] && k < CLOCK_STR_MAX - 1; k++) {
+            if (clock_str[k] != nc[k]) { clock_str[k] = nc[k]; net_dirty = 1; }
+        }
+        if (clock_str[k]) { clock_str[k] = 0; net_dirty = 1; }
+        return net_dirty;
+    }
 
     /* "YYYY-MM-DD  HH:MM:SS" — ISO date (unambiguous in every locale) and the
      * wall clock.  The keyboard layout USED to be appended here and now has its

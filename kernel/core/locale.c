@@ -696,6 +696,7 @@ static const struct locale_entry en_strings[] = {
     { " - that account has no sign-in secret", " - that account has no sign-in secret" },
     { "nothing was typed", "nothing was typed" },
     { " char(s) received, fp ", " char(s) received, fp " },
+    { "tray.noclock", "no clock device" },
 };
 
 LOCALE_CATALOG(loc_en) = {
@@ -1166,6 +1167,7 @@ static const struct locale_entry hu_strings[] = {
     { " - that account has no sign-in secret", " - ennek a fi\xF3knak nincs jelszava" },
     { "nothing was typed", "nem \xEDrt be semmit" },
     { " char(s) received, fp ", " karakter \xE9rkezett, fp " },
+    { "tray.noclock", "nincs \xF3ra" },
 };
 
 LOCALE_CATALOG(loc_hu) = {

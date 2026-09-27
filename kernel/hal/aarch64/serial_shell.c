@@ -37,7 +37,6 @@
 #include "audio.h"
 #include "driver.h"
 #include "iommu.h"
-void edu_test(void);      /* §M23 stage 2 — lsaudio / play, from the core */
 #include "modload.h"   /* §M67 — insmod / rmmod / lsmod */
 #include "ksym.h"      /* §M67 — ksyms */
 #include "syscall.h"   /* §M53 stage 3 — timerfd + setitimer self-tests */

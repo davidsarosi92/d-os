@@ -145,6 +145,8 @@ struct fdt_node {
     const uint8_t* reg;     uint32_t reg_len;
     const uint8_t* intr;    uint32_t intr_len;
     const uint8_t* ranges;  uint32_t ranges_len;
+    const uint8_t* imap;    uint32_t imap_len;       /* §M85 interrupt-map      */
+    const uint8_t* imask;   uint32_t imask_len;      /* interrupt-map-mask      */
     const char*    method;                   /* /psci: "hvc" or "smc"         */
     int            disabled;
     uint32_t       acells, scells;          /* for this node's children      */
@@ -186,6 +188,38 @@ static uint32_t intr_intid(const struct fdt_node* n, int i) {
     return type == 1 ? num + 16 : num + 32;
 }
 
+/* §M85 — PCI legacy interrupts on a DEVICE-TREE machine: the host bridge's
+ * `interrupt-map`.  Copied out (the DTB's memory is not ours to keep), and
+ * decoded only when a driver asks, because an entry's length depends on the
+ * interrupt controller's own #address-cells, which may be parsed after the
+ * bridge.  Entry = child unit address (3 cells) + child specifier (1: the
+ * pin) + parent phandle (1) + parent unit address (GIC #address-cells) +
+ * parent specifier (3: type, number, flags). */
+#define IMAP_MAX 1024
+static uint8_t  g_imap[IMAP_MAX];
+static uint32_t g_imap_len;
+static uint32_t g_imask[4];
+static int      g_have_imask;
+static uint32_t g_gic_acells = 2;
+
+int dtb_pci_intx(uint8_t slot, uint8_t pin) {
+    if (!g_imap_len || pin < 1 || pin > 4) return -1;
+    uint32_t cells = 3 + 1 + 1 + g_gic_acells + 3;
+    uint32_t stride = 4 * cells;
+    uint32_t hi = (uint32_t)slot << 11;
+    uint32_t mhi = g_have_imask ? g_imask[0] : 0xF800u;
+    uint32_t mpin = g_have_imask ? g_imask[3] : 7u;
+    for (uint32_t o = 0; o + stride <= g_imap_len; o += stride) {
+        uint32_t ehi  = rd32(g_imap + o);
+        uint32_t epin = rd32(g_imap + o + 12);
+        if ((ehi & mhi) != (hi & mhi) || (epin & mpin) != (pin & mpin)) continue;
+        const uint8_t* ps = g_imap + o + 4 * (3 + 1 + 1 + g_gic_acells);
+        uint32_t type = rd32(ps), num = rd32(ps + 4);
+        return (int)(type == 1 ? num + 16 : num + 32);
+    }
+    return -1;
+}
+
 static void node_commit(const struct fdt_node* n, uint32_t ac, uint32_t sc) {
     if (n->disabled || !n->compat) return;
     uint64_t b0, sz, b1, sz1;
@@ -193,11 +227,13 @@ static void node_commit(const struct fdt_node* n, uint32_t ac, uint32_t sc) {
         if (reg_tuple(n, ac, sc, 0, &b0, &sz) == 0 && reg_tuple(n, ac, sc, 1, &b1, &sz1) == 0) {
             g_board.gic_version = 3; g_board.gicd = b0; g_board.gicr = b1; g_board.gicr_size = sz1;
         }
+        g_gic_acells = n->acells;
     } else if (compat_has(n, "arm,cortex-a15-gic") || compat_has(n, "arm,gic-400") ||
                compat_has(n, "arm,cortex-a9-gic")  || compat_has(n, "arm,cortex-a7-gic")) {
         if (reg_tuple(n, ac, sc, 0, &b0, &sz) == 0 && reg_tuple(n, ac, sc, 1, &b1, &sz1) == 0) {
             g_board.gic_version = 2; g_board.gicd = b0; g_board.gicc = b1;
         }
+        g_gic_acells = n->acells;
     } else if (compat_has(n, "arm,psci-1.0") || compat_has(n, "arm,psci-0.2") ||
                compat_has(n, "arm,psci")) {
         if (n->method) g_board.psci_smc = str_prefix(n->method, "smc");
@@ -219,6 +255,14 @@ static void node_commit(const struct fdt_node* n, uint32_t ac, uint32_t sc) {
         }
     } else if (compat_has(n, "pci-host-ecam-generic")) {
         if (reg_tuple(n, ac, sc, 0, &b0, &sz) == 0) { g_board.ecam = b0; g_board.ecam_size = sz; }
+        if (n->imap && n->imap_len <= IMAP_MAX) {
+            for (uint32_t k = 0; k < n->imap_len; k++) g_imap[k] = n->imap[k];
+            g_imap_len = n->imap_len;
+        }
+        if (n->imask && n->imask_len == 16) {
+            for (int k = 0; k < 4; k++) g_imask[k] = rd32(n->imask + 4 * k);
+            g_have_imask = 1;
+        }
         /* ranges = <child-addr (the node's own #address-cells, 3 for PCI)
          *           parent-addr (ac)  size (the node's own #size-cells)>.
          * The top cell's bits 25:24 are the space: 2 = 32-bit memory. */
@@ -312,6 +356,8 @@ static void fdt_parse(const struct fdt_header* h) {
                 else if (str_prefix(pname, "reg") && pname[3] == 0)        { nd->reg = val; nd->reg_len = len; }
                 else if (str_prefix(pname, "interrupts") && pname[10] == 0) { nd->intr = val; nd->intr_len = len; }
                 else if (str_prefix(pname, "ranges") && pname[6] == 0)     { nd->ranges = val; nd->ranges_len = len; }
+                else if (str_prefix(pname, "interrupt-map-mask"))          { nd->imask = val; nd->imask_len = len; }
+                else if (str_prefix(pname, "interrupt-map") && pname[13] == 0) { nd->imap = val; nd->imap_len = len; }
                 else if (str_prefix(pname, "method") && pname[6] == 0)     nd->method = (const char*)val;
                 else if (str_prefix(pname, "status") && pname[6] == 0 &&
                          !str_prefix((const char*)val, "okay") && !str_prefix((const char*)val, "ok"))

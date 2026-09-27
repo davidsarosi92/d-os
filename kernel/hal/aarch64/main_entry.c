@@ -49,6 +49,7 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "config.h"
 #include "locale.h"
 #include "users.h"
+#include "fb_backend.h"
 #include "crash.h"          /* §M63 stage 0 — config_attach_persistent */
 #include "iommu.h"           /* §M33 stage 5 — DMA remapping capability */
 #include "drvrt.h"          /* §M33 stage 2 — deferred driver tasks */
@@ -156,10 +157,17 @@ void aarch64_main_entry(uint64_t dtb) {
      * in which case the serial console stays the only sink.
      * ----------------------------------------------------------------------- */
     int have_fb = (virtio_gpu_init() == 0);
+    /* §M85 — sbsa-ref has no virtio: its display is a bochs-display on PCIe.
+     * Tried second, so `virt` with both attached keeps the virtio-gpu. */
+    if (!have_fb) {
+        extern int bochs_display_init(void);
+        have_fb = (bochs_display_init() == 0);
+    }
     if (have_fb)
-        kprintf("aarch64: virtio-gpu framebuffer console up\n");
+        kprintf("aarch64: framebuffer console up (%s)\n",
+                fb_backend_active() ? fb_backend_active()->name : "?");
     else
-        kprintf("aarch64: no virtio-gpu device — serial console only\n");
+        kprintf("aarch64: no display device — serial console only\n");
 
     /* Scheduler (Phase C): synthesise pid 0 from this context + an idle task. */
     task_init();

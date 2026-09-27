@@ -14,11 +14,13 @@
  *     has no RAM below 4 GiB, so a driver that assumed 32-bit DMA would have
  *     no memory to give the card at all (the same lesson AHCI and xHCI paid
  *     for in this stage).
- *   - POLLED.  The stack's poller (netd, §M55) calls ->poll with a 10 ms
- *     backstop when no interrupt arrives, so correctness does not depend on an
- *     IRQ — and routing a PCI INTx to a GIC SPI on an ACPI machine needs the
- *     _PRT, i.e. more AML than the narrow reader executes.  Stated, not hidden:
- *     latency is up to one backstop period.
+ *   - INTERRUPT-DRIVEN WHEN THE LINE IS KNOWN (2026-09-27).  The stack's poller
+ *     (netd, §M55) calls ->poll with a 10 ms backstop, so correctness never
+ *     depended on an IRQ; with pci_device.irq_line routed (the ACPI _PRT on
+ *     sbsa-ref, the legacy line on x86) the ISR reads ICR — which is what
+ *     deasserts the level-triggered INTx — and wakes netd, so a frame is
+ *     picked up when it arrives instead of at the next backstop.  An unrouted
+ *     line (0xFF) keeps the old polled behaviour, and says so.
  *   - The MAC comes from RAL0/RAH0, which the card loads from its EEPROM at
  *     reset; nothing is invented.
  *
@@ -46,7 +48,11 @@
 #define R_CTRL    0x0000
 #define R_STATUS  0x0008
 #define R_ICR     0x00C0
+#define R_IMS     0x00D0
 #define R_IMC     0x00D8
+/* Interrupt causes this driver asks for: link change, RX descriptors low,
+ * RX overrun, RX timer (a frame arrived). */
+#define IMS_WANT  ((1u << 2) | (1u << 4) | (1u << 6) | (1u << 7))
 #define R_RCTL    0x0100
 #define R_TCTL    0x0400
 #define R_TIPG    0x0410
@@ -153,6 +159,17 @@ static int e1000e_link(struct net_device* dev) {
     return (rd(R_STATUS) & STATUS_LU) != 0;
 }
 
+/* The ISR does two things and no third (§M55): ACK (reading ICR clears the
+ * causes and drops the shared level line) and WAKE the poller.  It does not
+ * drain the ring — draining runs the stack, which may transmit and wait.
+ * A zero ICR means the line was raised by a device sharing it. */
+static void e1000e_irq(void) {
+    if (!g_e.regs) return;
+    uint32_t icr = rd(R_ICR);
+    if (!icr || !g_e.present) return;
+    net_rx_irq(&g_dev);
+}
+
 static int e1000e_probe(void* ctx) {
     (void)ctx;
     return pci_find_device(E1000_VENDOR, E1000E_82574L, &g_e.pd) == 0 ? 0 : -1;
@@ -224,10 +241,20 @@ static int e1000e_init(void* ctx) {
     net_register(&g_dev);
     g_e.present = 1;
 
+    int irq_ok = 0;
+    if (pd->irq_line != 0xFF && pd->irq_line != 0 &&
+        hal_irq_attach(pd->irq_line, e1000e_irq) == 0) {
+        (void)rd(R_ICR);                          /* nothing stale pending */
+        wr(R_IMS, IMS_WANT);
+        irq_ok = 1;
+    }
+
     kprintf("e1000e: %s up at PCI %u:%u.%u, regs %x, mac %x:%x:%x:%x:%x:%x, link %s, "
-            "polled (netd backstop)\n", g_dev.name, pd->bus, pd->slot, pd->func, mmio,
+            "%s %u\n", g_dev.name, pd->bus, pd->slot, pd->func, mmio,
             g_dev.mac[0], g_dev.mac[1], g_dev.mac[2], g_dev.mac[3], g_dev.mac[4], g_dev.mac[5],
-            (rd(R_STATUS) & STATUS_LU) ? "up" : "down");
+            (rd(R_STATUS) & STATUS_LU) ? "up" : "down",
+            irq_ok ? "interrupt on line" : "polled (no routed INTx), line",
+            (unsigned)pd->irq_line);
     return 0;
 }
 
@@ -235,6 +262,7 @@ static int e1000e_shutdown(void* ctx) {
     (void)ctx;
     if (!g_e.present) return 0;
     if (net_unregister(&g_dev) != 0) return -1;
+    wr(R_IMC, 0xFFFFFFFFu);                       /* the ISR stays attached: quiet it */
     wr(R_RCTL, 0); wr(R_TCTL, 0);
     g_e.present = 0;
     return 0;

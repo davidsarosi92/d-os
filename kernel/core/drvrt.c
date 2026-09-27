@@ -65,6 +65,8 @@ struct drv_res {
     struct waitq   wq;
     volatile uint32_t count;           /* total fires                        */
     volatile uint32_t seen;            /* what the driver has consumed       */
+    int            level;              /* DRV_IRQ_LEVEL: mask on fire        */
+    volatile int   masked;             /* the ISR holds the line off         */
 
     /* PORTS only — §M33 Tier 2's shared-controller claim.  See
      * drv_ports_lock: `excl_irq` is the line held off while the claim
@@ -325,11 +327,25 @@ volatile void* drv_mmio_ptr(drv_handle h) {
  * so no ported driver can get it wrong — which is the point of moving the shape
  * into the API rather than leaving it as advice.  §M49's xHCI drain and §M55's
  * NIC pump are both this lesson learnt the expensive way. */
+static void drvrt_line_mask(int line, int masked) {
+#if DRVRT_HAS_PORTS
+    irq_set_masked(line, masked);
+#else
+    extern void gic_disable_irq(uint32_t intid);
+    if (masked) gic_disable_irq((uint32_t)line);
+    else        gic_enable_irq((uint32_t)line);
+#endif
+}
+
 static void drvrt_isr_common(int line) {
     if (line < 0 || line >= DRVRT_MAX_IRQ) return;
     struct drv_res* r = g_irq[line];
     if (!r) return;
     r->count++;
+    if (r->level && !r->masked) {       /* hold it off until the driver acks */
+        r->masked = 1;
+        drvrt_line_mask(line, 1);
+    }
     /* waitq's own contract: the wake takes the lock.  §M23 stage 4 broke this
      * rule in three places and it presented as an NMI hard lockup. */
     uint32_t fl = waitq_lock(&r->wq);
@@ -346,6 +362,10 @@ static void drvrt_isr_arm(uint32_t intid) { drvrt_isr_common((int)intid); }
 #endif
 
 drv_handle drv_irq_request(struct drv_rt* rt, int line, const char* why) {
+    return drv_irq_request_ex(rt, line, why, 0);
+}
+
+drv_handle drv_irq_request_ex(struct drv_rt* rt, int line, const char* why, int flags) {
     if (line < 0 || line >= DRVRT_MAX_IRQ) return DRV_ERANGE;
     if (g_irq[line]) {
         kprintf("drv-rt: '%s' wants IRQ %d for %s — held by '%s' (%s)\n",
@@ -357,6 +377,8 @@ drv_handle drv_irq_request(struct drv_rt* rt, int line, const char* why) {
     if (h < 0) return h;
     struct drv_res* r = res_of(h);
     r->base = (uint64_t)line;
+    r->level = (flags & DRV_IRQ_LEVEL) ? 1 : 0;
+    r->masked = 0;
     waitq_init(&r->wq);
     g_irq[line] = r;
 #if DRVRT_HAS_PORTS
@@ -386,6 +408,12 @@ int drv_irq_wait(drv_handle h, int timeout_ms) {
      * through three interrupts must be told three, or it processes one and
      * silently loses two — and under load that is the normal case, not the
      * exception. */
+    /* A level line the ISR held off is released HERE: the driver is back for
+     * more, so it has acknowledged whatever the device raised last time. */
+    if (r->level && r->masked) {
+        r->masked = 0;
+        drvrt_line_mask((int)r->base, 0);
+    }
     uint32_t n = r->count - r->seen;
     if (n) { r->seen = r->count; return (int)n; }
     /* Asked BEFORE blocking as well as after.  Only checking afterwards meant a
@@ -553,6 +581,14 @@ void drv_release_all(struct drv_rt* rt) {
         if (!r || !r->used) continue;
         if (r->kind == RES_IRQ && r->base < DRVRT_MAX_IRQ) {
             g_irq[r->base] = NULL;
+            /* A level line the ISR was holding off goes back on: it may be
+             * SHARED (x86 PCI lines are), and leaving it masked because the
+             * driver died between the fire and its acknowledgement would
+             * silence every other device on it. */
+            if (r->level && r->masked) {
+                r->masked = 0;
+                drvrt_line_mask((int)r->base, 0);
+            }
             /* The handler stays installed: `irq_install` has no uninstall in
              * this tree, and inventing one here would be a change to the
              * interrupt path smuggled in under a driver API.  Clearing the
