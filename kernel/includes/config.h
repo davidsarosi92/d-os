@@ -144,18 +144,25 @@ void config_for_each(config_iter_fn fn, void* ctx);
 
 
 /* ---------------------------------------------------------------------------
- * §M32 stage 9 — per-user preferences.  See the block comment in config.c for
- * the one thing this does NOT solve (two simultaneous sessions).
+ * §M32 — per-user preferences, one LAYER per signed-in account.  The caller
+ * decides which layer answers (a user's task: its own; a SYSTEM task: the
+ * console user's) — see the block comment in config.c.
  * ------------------------------------------------------------------------- */
 
-/* Overlay uid's preference store; call at login.  Keys that are not
- * CFG_SCOPE_USER are ignored WITH a line rather than obeyed. */
-int config_user_attach(int uid);
-/* Withdraw them and restore the machine's values; call at logout. */
-int config_user_detach(void);
-/* Write the USER-scoped keys back to that store. */
-int config_user_save(void);
-/* The uid whose preferences are live, or -1. */
+/* Seat policy for config_user_attach. */
+#define CFG_SEAT_TAKE    1      /* the GUI: whoever signs in owns the screen  */
+#define CFG_SEAT_IF_FREE 2      /* a text login: only if nobody is at the seat */
+
+/* A session of `uid` begins: the account's layer is created (store loaded)
+ * or its session count raised.  Returns a positive TOKEN if this session now
+ * holds the console, 0 if it runs in the background, <0 on failure. */
+int config_user_attach(int uid, int seat);
+/* That session ends.  Pass the token attach returned: the seat is released
+ * only if this session's claim is still the current one. */
+int config_user_detach(int uid, int token);
+/* The uid holding the console (whose preferences the screen shows), or -1. */
 int config_user_active(void);
+/* `config` prints this: the machine layer and every live account layer. */
+void config_layers_dump(void);
 
 #endif

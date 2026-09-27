@@ -174,6 +174,12 @@ void cred_inherit(struct cred* child, const struct cred* parent);
 int cred_become_user(int pid, int uid, int gid,
                      const int* groups, int ngroups, int session);
 
+/* A new session id, unique across EVERY kind of session (§M32, 2026-09-27).
+ * The desktop and the text login used to count separately, so the first of
+ * each were both "session 1" — and a session id is what attributes a process
+ * to a sign-in.  Starts at 1: CRED_SESSION_NONE is 0. */
+int cred_session_alloc(void);
+
 /* ---------------------------------------------------------------------------
  * Predicates.  Every privilege gate in the tree asks through these.
  * ------------------------------------------------------------------------- */

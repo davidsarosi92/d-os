@@ -51,9 +51,6 @@
 #include "config.h"
 #include <stddef.h>
 
-/* Session ids start at 1: CRED_SESSION_NONE is 0, and a session numbered zero
- * would be indistinguishable from "not in one" in every field that carries it. */
-static int g_next_session = 1;
 
 struct session_req {
     int  uid;
@@ -63,6 +60,7 @@ struct session_req {
     int  groups[CRED_MAX_GROUPS];
     char name[USER_NAME_MAX + 1];
     char home[USER_PATH_MAX + 1];
+    int* cfg_token;             /* where the session reports its seat token */
 };
 
 /* The session leader's entry point.
@@ -92,7 +90,12 @@ static void session_entry(void) {
     /* §M32 stage 9 — the account's preferences.  AFTER the identity is
      * adopted, because config_apply's watchers run as this task and a wallpaper
      * applied while still SYSTEM would be the console's, not the user's. */
-    config_user_attach(r->uid);
+    /* §M32 (2026-09-27) — a text login takes the console's seat only if
+     * nobody holds it; beside a signed-in desktop it is a BACKGROUND session
+     * whose preferences are its own (config.c, "layers").  The token goes back
+     * to do_login, which is where every exit of this session is observed. */
+    int tok = config_user_attach(r->uid, CFG_SEAT_IF_FREE);
+    if (r->cfg_token) *r->cfg_token = tok;
     /* The home directory may not exist on a machine where the account was
      * created without a writable volume — say so rather than silently landing
      * somewhere else. */
@@ -147,12 +150,16 @@ static int do_login(const char* name_in, const char* pw_in) {
 
     const struct user_account* u = user_by_name(name);
     if (!u) return -1;
+    /* Copied: the account may be deleted while its session runs (`userdel`
+     * of a signed-in user is a case §M32 runs), and `u` points into the
+     * account table. */
+    int s_uid = u->uid;
 
     struct session_req* r = (struct session_req*)kcalloc(1, sizeof *r);
     if (!r) { console_write("login: out of memory\n"); return -1; }
     r->uid     = u->uid;
     r->gid     = u->gid;
-    r->session = g_next_session++;
+    r->session = cred_session_alloc();
     r->ngroups = user_groups_of(u->uid, r->groups, CRED_MAX_GROUPS);
     for (int i = 0; u->name[i] && i < (int)sizeof r->name - 1; i++) r->name[i] = u->name[i];
     for (int i = 0; u->home[i] && i < (int)sizeof r->home - 1; i++) r->home[i] = u->home[i];
@@ -161,6 +168,8 @@ static int do_login(const char* name_in, const char* pw_in) {
      * binding into the spawn because doing it afterwards is an SMP race: the
      * task may already be running on another core.  A session shell that came
      * up with no VC would print its prompt to nobody. */
+    int cfg_token = 0;                 /* written by the session, read after it */
+    r->cfg_token = &cfg_token;
     struct task* me = task_current();
     struct task* t = task_spawn_arg_console("session", session_entry, r,
                                             me ? me->pid : -1,
@@ -183,7 +192,7 @@ static int do_login(const char* name_in, const char* pw_in) {
      *
      * `task_wait` is the point every exit passes through, because the login
      * task is parked on it whatever kills the session. */
-    config_user_detach();
+    config_user_detach(s_uid, cfg_token);
     console_write("login: session ended\n");
     return 0;
 }

@@ -13619,10 +13619,8 @@ the real table so it exercises DETECTION rather than reporting.
   become per-session — the same restructuring as running two sessions at once.
   *A lock screen that claimed to be a full multi-user desktop would be the
   isolation theatre §M33 refuses by name*, so it says what it is.
-- **Simultaneous sessions.**  The config cache is ONE cache, so preferences are
-  applied at login and withdrawn at logout.  With one session that is correct;
-  with two at once the second login's wallpaper would be on the first user's
-  screen.  Making it correct is the same change as a per-session compositor.
+- ~~**Simultaneous sessions.**~~  Done 2026-09-27 — see §4.108: one config
+  layer per signed-in account, answered by who asks.
 - **No setuid bit**, by decision: `login` and elevation are kernel-mediated, so
   there is no privilege-transfer mechanism sitting on every writable filesystem.
 - **On-disk ownership**, per the `mount` section above.
@@ -14763,8 +14761,61 @@ still receives keys through the compositor.
 console output is shown as Latin-2 — the personality boundary does not
 convert encodings (wlclip converts its own argument).
 
+### 4.108 Two people at once: a config layer per account, and who asks decides (§M32, 2026-09-27)
+
+§4.91 recorded simultaneous sessions as blocked on a per-session compositor.
+**The blocker was narrower: the config cache.**  Preferences were applied INTO
+the one cache at login (the machine's value moved aside) and withdrawn at
+logout, so a second login overwrote the first person's choices — bob signing in
+on a text console put bob's wallpaper on alice's desktop.
+
+**Now (kernel/core/config.c):** the machine layer (`head`) holds only machine
+values, and every signed-in account has its own LAYER — reference-counted by its
+sessions, loaded from `<vol>/d-os-user-<uid>.conf`, holding only its USER-scoped
+overrides.  **A lookup answers from the caller's layer:** a task owned by a user
+reads its own account's; a SYSTEM/KERNEL task reads the CONSOLE user's (whoever
+holds the seat).  Since §M81 the desktop session's tasks — compositor, app hosts
+— are owned by the signed-in user, so the screen reads its own person's layer
+with no special case.
+
+**The seat.**  `config_user_attach(uid, seat)`: the desktop TAKES it
+(`CFG_SEAT_TAKE`), a text login takes it only if free (`CFG_SEAT_IF_FREE`),
+otherwise it is a BACKGROUND session whose preferences are its own.  Attach
+returns a token; `config_user_detach(uid, token)` releases the seat only if that
+session's claim is still the current one — a text session overtaken by a desktop
+sign-in cannot take the seat away from the desktop by logging out.
+
+**Watchers follow the console:** a change reaches subsystems only when it
+changes what the console sees (a user key in the console user's layer, a machine
+value the console does not override, or the seat changing hands — then every key
+either layer overrides is re-announced).  A background session's change is
+logged `(background session)`.  `config` prints the layers and which one is the
+console.
+
+**`seattest <a> <b>`** (hidden, scratch disk): `a` signs in to the desktop, `b`
+opens a background session, each sets a wallpaper; it checks what `b` reads,
+what the console reads, **what the compositor actually rendered**
+(`wallpaper_status`), who holds the seat, both stores, and that `b` leaving
+changes nothing for `a`.  **PASS on i386 and x86_64; falsified** by letting a
+background session take the seat — `2 FAIL the console reads 'solid:0000FF'`,
+`3 FAIL the screen shows 'solid 0000FF'`, i.e. exactly the old bug.
+`sessiontest` (4/4) and `sessionstorm 6 3` unchanged.  A real text login typed
+at the console beside a signed-in desktop: `a BACKGROUND session`, `setconf
+gui.theme light` → `for uid 1000 (background session)`, and after `logout` the
+console's value is back.
+
+**Found on the way: two sessions numbered 1.**  The desktop and `login` counted
+session ids separately, so root's desktop and bob's text login were both
+"session 1" — and a session id is what attributes a process to a sign-in.  One
+allocator now (`cred_session_alloc`).
+
+**Still single-seat:** the screen belongs to one person at a time; a second
+person signing in to the DESKTOP replaces the first (fast user switching — two
+live desktops — is the per-session compositor, not done).
+
 ## 8. Change log
 
+- **2026-09-27 — §M32: simultaneous sessions — one config layer per signed-in account, resolved by the caller; the desktop takes the seat, a text login beside it runs in the background (`seattest`); one session-id allocator (DOCS §4.108).**
 - **2026-09-27 — §M26/§M59 closed: `wl_data_device` bridged to the d-os clipboard (UTF-8 ↔ Latin-2), `wlclip`; whole-message Wayland sends; `pipe`/`pipe2` as shared ABI ops (i386 had none); excursions return the exit status; program output no longer interleaves with kernel messages; UTF-8 on COM1 becomes Latin-2 (DOCS §4.107).**
 - **2026-09-27 — §M19.5 closed: per-NUMA-node PMM zones (SRAT on x86, `numa-node-id` on aarch64), node-major fallback, per-node counters in `/proc/meminfo` + `buddyinfo`, `numatest`; the scheduler no longer keeps a task on a CPU its affinity excludes (DOCS §4.106).**
 - **2026-09-27 — §M85 closed: sbsa-ref's bochs-display (fb_present backends), PCI INTx routing from ACPI `_PRT` and DT `interrupt-map`, the host bridge window; `hal_irq_attach`; interrupt-driven e1000e; drvrt level-triggered lines; edu on its interrupt; `edutest` restored; a clock slot that says when there is no clock (DOCS §4.105).**

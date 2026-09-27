@@ -221,6 +221,11 @@ const char* cred_owner_name(const struct cred* c, char* buf, int cap) {
     return buf;
 }
 
+int cred_session_alloc(void) {
+    static int next = 0;
+    return __atomic_add_fetch(&next, 1, __ATOMIC_RELAXED);
+}
+
 const struct cred* cred_current(void) {
     static const struct cred kernel_identity = {
         TASK_OWNER_KERNEL, CRED_UID_NONE, CRED_UID_NONE, 0,

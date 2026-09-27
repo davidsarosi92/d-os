@@ -47,6 +47,17 @@
 #include "mouse.h"
 #include "timer.h"
 #include "config.h"
+
+/* §M32 (2026-09-27) — the desktop session's claim on the config layers: which
+ * account it attached and the seat token it holds (config.c, "layers").  One
+ * release point, called from every route that ends a desktop session. */
+static int gui_cfg_uid = -1, gui_cfg_token;
+static void gui_cfg_release(void) {
+    if (gui_cfg_uid < 0) return;
+    config_user_detach(gui_cfg_uid, gui_cfg_token);
+    gui_cfg_uid = -1;
+    gui_cfg_token = 0;
+}
 #include "vfs.h"            /* §M82 sessiontest reads the stores back */
 #include "shellcmd.h"   /* §M76 — gui.autorun dispatches one command */
 #include "locale.h"
@@ -374,7 +385,6 @@ static char pend_name[USER_NAME_MAX + 1];
 /* The new session is already authenticated; raising the lock again would ask
  * for the password that just worked, forever. */
 static int  skip_lock_once = 0;
-static int  gui_next_session = 1;
 /* Set only while the session leader is calling gui_start, so the autologin
  * hand-off in gui_start does not route its own session back to itself. */
 static int  in_session_leader = 0;
@@ -1801,7 +1811,7 @@ static int gui_teardown(void) {
      *    COMMAND calls gui_teardown directly and so kept the last user's
      *    preferences on the console.  One call in the one function every
      *    teardown passes through cannot be missed by the next route. */
-    config_user_detach();
+    gui_cfg_release();
 
     __atomic_store_n(&teardown_busy, 0, __ATOMIC_RELEASE);
     return 0;
@@ -1864,7 +1874,7 @@ static void gui_session_main(void) {
      * inherited every choice the last one made, and the next user's first
      * change copied them into their own store.  Measured by `sessiontest`.
      * A no-op when nobody was attached. */
-    config_user_detach();
+    gui_cfg_release();
 
     if (pend_uid >= 0) {
         struct task* me = task_current();
@@ -1879,7 +1889,11 @@ static void gui_session_main(void) {
         /* §M32 stage 9 — the account's preferences, AFTER the identity, because
          * `config_apply`'s watchers run as this task and a wallpaper applied
          * while still SYSTEM would be the console's rather than the user's. */
-        config_user_attach(pend_uid);
+        /* The desktop TAKES the seat: whoever signs in to the screen is the
+         * person the screen is for (a text session that held it goes to the
+         * background and keeps its own preferences). */
+        gui_cfg_token = config_user_attach(pend_uid, CFG_SEAT_TAKE);
+        gui_cfg_uid   = pend_uid;
         kprintf("gui: session %d opened for '%s' (uid %d) on pid %d\n",
                 pend_session, pend_name, pend_uid, me->pid);
         skip_lock_once = 1;             /* it just authenticated */
@@ -1901,7 +1915,7 @@ void gui_session_restart_as(const char* name) {
         }
         pend_uid     = u->uid;
         pend_gid     = u->gid;
-        pend_session = gui_next_session++;
+        pend_session = cred_session_alloc();
         pend_ngroups = user_groups_of(u->uid, pend_groups, CRED_MAX_GROUPS);
         str_copy(pend_name, u->name, sizeof pend_name);
     }
@@ -2139,6 +2153,118 @@ static void cmd_sessionstorm(const char* args) {
 }
 SHELL_CMD(sessionstorm) = { "sessionstorm", "<user-a> <user-b> <rounds> [mode]", 0,
                             SHELL_G_TEST, cmd_sessionstorm, SHELL_P_ADMIN };
+
+/* §M32 (2026-09-27) — `seattest <a> <b>`: TWO ACCOUNTS SIGNED IN AT ONCE.
+ *
+ * `a` signs in to the desktop (it takes the console seat); `b` opens a
+ * BACKGROUND session beside it (the shape of a text login while the desktop
+ * is in use).  Each sets a different wallpaper.  With the one-cache design
+ * this replaced, b's attach overwrote a's preferences in the shared cache and
+ * b's wallpaper went onto a's screen — so the checks are about WHO SEES WHAT:
+ *   1. b's session reads b's wallpaper;
+ *   2. the console (a SYSTEM task, and the compositor) still reads a's;
+ *   3. what the compositor actually RENDERED is a's colour (wallpaper_status,
+ *      i.e. the screen, not the config);
+ *   4. a still holds the seat, and each store holds only its owner's choice;
+ *   5. b ending its session leaves a's screen and seat alone.
+ * Changes the machine's stores; hidden, wants a scratch disk, like
+ * `sessiontest`. */
+static volatile int seat_b_state;        /* 0 idle, 1 attached+applied, 2 go detach, 3 done */
+static int seat_b_uid, seat_b_gid;
+static char seat_b_seen[64];
+static int seat_b_token = -99;
+static void seat_b_main(void) {
+    struct task* me = task_current();
+    if (!me || cred_become_user(me->pid, seat_b_uid, seat_b_gid, NULL, 0, cred_session_alloc()) != 0) {
+        kprintf("seattest: could not become uid %d\n", seat_b_uid);
+        seat_b_state = 3;
+        return;
+    }
+    seat_b_token = config_user_attach(seat_b_uid, CFG_SEAT_IF_FREE);
+    config_apply("gui.wallpaper", "solid:0000FF");
+    str_copy(seat_b_seen, config_get("gui.wallpaper", ""), sizeof seat_b_seen);
+    seat_b_state = 1;
+    while (seat_b_state != 2) task_msleep(20);
+    config_user_detach(seat_b_uid, seat_b_token);
+    seat_b_state = 3;
+}
+
+static int seat_status_is(const char* want) {
+    const char* st = wallpaper_status();
+    int i = 0;
+    while (want[i] && st[i] == want[i]) i++;
+    return want[i] == 0;
+}
+
+static void gui_seattest_main(void) {
+    const struct user_account* ua = user_by_name(st_a);
+    const struct user_account* ub = user_by_name(st_b);
+    if (!ua || !ub) { kprintf("seattest: no such account\n"); return; }
+    if (!config_persist_path()) { kprintf("seattest: no writable volume\n"); return; }
+    int uida = ua->uid;
+    int fails = 0;
+
+    gui_session_restart_as(st_a);
+    if (st_wait_uid(uida, 1)) { kprintf("seattest: '%s' never became active\n", st_a); return; }
+    config_apply("gui.wallpaper", "solid:FF0000");        /* a's choice, a's screen */
+    task_msleep(400);                                     /* let the compositor repaint */
+
+    seat_b_uid = ub->uid; seat_b_gid = ub->gid; seat_b_state = 0;
+    if (!task_spawn_detached("seat-b", seat_b_main)) { kprintf("seattest: cannot spawn\n"); return; }
+    for (int i = 0; i < 200 && seat_b_state == 0; i++) task_msleep(20);
+    if (seat_b_state != 1) { kprintf("seattest: b's session never came up\n"); return; }
+    task_msleep(400);                                     /* a repaint, if one were coming */
+
+    int ok1 = st_same(seat_b_seen, "solid:0000FF");
+    kprintf("seattest: 1 %s - '%s' (background, token %d) reads gui.wallpaper='%s'\n",
+            ok1 ? "ok  " : "FAIL", st_b, seat_b_token, seat_b_seen);
+    fails += !ok1;
+    const char* cw = config_get("gui.wallpaper", "");
+    int ok2 = st_same(cw, "solid:FF0000");
+    kprintf("seattest: 2 %s - the console reads gui.wallpaper='%s'\n", ok2 ? "ok  " : "FAIL", cw);
+    fails += !ok2;
+    int ok3 = seat_status_is("solid FF0000");
+    kprintf("seattest: 3 %s - the screen shows '%s'\n", ok3 ? "ok  " : "FAIL", wallpaper_status());
+    fails += !ok3;
+    char pa[96], pb[96];
+    st_user_path(uida, pa, sizeof pa);
+    st_user_path(ub->uid, pb, sizeof pb);
+    int ok4 = config_user_active() == uida && seat_b_token == 0 &&
+              st_file_has_value(pa, "gui.wallpaper", "solid:FF0000") &&
+              st_file_has_value(pb, "gui.wallpaper", "solid:0000FF");
+    kprintf("seattest: 4 %s - console uid %d (want %d); stores: a %s, b %s\n",
+            ok4 ? "ok  " : "FAIL", config_user_active(), uida,
+            st_file_has_value(pa, "gui.wallpaper", "solid:FF0000") ? "FF0000" : "WRONG",
+            st_file_has_value(pb, "gui.wallpaper", "solid:0000FF") ? "0000FF" : "WRONG");
+    fails += !ok4;
+
+    seat_b_state = 2;
+    for (int i = 0; i < 200 && seat_b_state != 3; i++) task_msleep(20);
+    task_msleep(400);
+    const char* cw2 = config_get("gui.wallpaper", "");
+    int ok5 = config_user_active() == uida && st_same(cw2, "solid:FF0000") &&
+              seat_status_is("solid FF0000");
+    kprintf("seattest: 5 %s - after '%s' left: console uid %d, wallpaper '%s', screen '%s'\n",
+            ok5 ? "ok  " : "FAIL", st_b, config_user_active(), cw2, wallpaper_status());
+    fails += !ok5;
+
+    kprintf("seattest: %s (%d failure(s))\n", fails ? "FAIL" : "PASS", fails);
+}
+
+static void cmd_seattest(const char* args) {
+    int i = 0;
+    while (args && *args == ' ') args++;
+    while (args && *args && *args != ' ' && i < (int)sizeof st_a - 1) st_a[i++] = *args++;
+    st_a[i] = 0; i = 0;
+    while (args && *args == ' ') args++;
+    while (args && *args && *args != ' ' && i < (int)sizeof st_b - 1) st_b[i++] = *args++;
+    st_b[i] = 0;
+    if (!st_a[0] || !st_b[0]) { kprintf("usage: seattest <user-a> <user-b>\n"); return; }
+    if (!task_spawn_detached("seattest", gui_seattest_main))
+        kprintf("seattest: cannot spawn\n");
+}
+SHELL_CMD(seattest) = { "seattest", "<user-a> <user-b>", 0, SHELL_G_TEST,
+                        cmd_seattest, SHELL_P_ADMIN };
 
 /* ---------------------------------------------------------------------------
  * `logouttest` — the orderly session end's FALSIFIER (hidden).
