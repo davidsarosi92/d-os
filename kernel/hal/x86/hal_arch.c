@@ -109,11 +109,40 @@ static void enable_sse(void) {
     __asm__ volatile ("mov %0, %%cr4" :: "r"(cr4));
 }
 
+/* §M86 — NO-EXECUTE.  CPUID.80000001:EDX[20] says the CPU has it;
+ * EFER.NXE (MSR 0xC0000080, bit 11) turns it on.  It only means anything
+ * under PAE — the classic 32-bit entry has no bit 63 — so vmm.c decides
+ * whether to USE it; this only makes it legal.
+ *
+ * PER CPU, AND BEFORE THE CPU RUNS ANY USER TASK: with NXE clear, bit 63 in
+ * an entry is RESERVED, and a walk that meets it takes a reserved-bit page
+ * fault — so a core that missed this would fault on every user page the
+ * others had marked non-executable, and only once the balancer moved a task
+ * there.  Hence here, in the function every AP already runs for its SSE bits. */
+static int cpu_has_nx(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                      : "a"(0x80000000u), "c"(0u));
+    if (a < 0x80000001u) return 0;
+    __asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                      : "a"(0x80000001u), "c"(0u));
+    return (d >> 20) & 1u;
+}
+static void enable_nx(void) {
+    if (!cpu_has_nx()) return;
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080u));
+    lo |= 1u << 11;
+    __asm__ volatile ("wrmsr" :: "a"(lo), "d"(hi), "c"(0xC0000080u));
+}
+int x86_cpu_has_nx(void) { return cpu_has_nx(); }
+
 /* The per-CPU half of arch bring-up — everything an AP must repeat for itself.
  * Mirrors the x86_64 twin; missing it makes a task fault only once the load
  * balancer moves it onto a core that never ran this. */
 void hal_arch_init_this_cpu(void) {
     enable_sse();
+    enable_nx();
 }
 
 void hal_arch_early_init(void) {
@@ -121,6 +150,7 @@ void hal_arch_early_init(void) {
     gdt_init();
     idt_init();
     enable_sse();
+    enable_nx();
 }
 
 /* ---------------------------------------------------------------------------

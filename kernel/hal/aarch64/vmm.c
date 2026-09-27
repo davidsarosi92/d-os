@@ -630,3 +630,7 @@ uintptr_t vmm_space_mmap_cursor(struct vmm_space* s) {
 void vmm_space_set_mmap_cursor(struct vmm_space* s, uintptr_t v) {
     if (s) s->mmap_cursor = v;
 }
+
+/* §M86 — UXN has been set on every non-VMM_EXEC user page since §M25 (above);
+ * the architecture has no mode without it. */
+int vmm_nx_active(void) { return 1; }

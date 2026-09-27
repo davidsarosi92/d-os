@@ -18,6 +18,7 @@
 #include "uaccess.h"      /* §1.1 — fault-fixup table for EL0 memory copies */
 #include "drvguard.h"   /* §M33 Tier 0 — contain a driver fault */
 #include "task.h"
+#include "proc.h"
 #include "vmm.h"   /* §A1 — vmm_cow_fault on a write to a fork-shared page */
 #include "hal_api.h"
 #include "crash.h"      /* §M47 — record every fault */
@@ -252,6 +253,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                                  ct ? ct->name : "?", (uintptr_t)tf->elr,
                                  (uintptr_t)far, 11, "EL0 synchronous exception");
                 }
+            user_excursion_fault(11);   /* an excursion returns to its caller */
                 task_exit_code(139);          /* 128 + SIGSEGV */
             }
             dump_and_halt("synchronous", tf);

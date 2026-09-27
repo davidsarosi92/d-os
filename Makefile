@@ -71,7 +71,8 @@ MUSL_COREUTIL_BLOBS := $(patsubst %,user/%_muslblob.o,$(MUSL_COREUTILS))
 # test for "the chrome still works when the app behind it is frozen".
 MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o \
                    user/wedgewin_muslblob.o user/pthreadtest_muslblob.o \
-                   user/epollmusl_muslblob.o user/netmuslserv_muslblob.o
+                   user/epollmusl_muslblob.o user/netmuslserv_muslblob.o \
+                   user/nxtest_muslblob.o
 # §M37 dynamic-linking artifacts — the ld.so blob + the dynamically linked tests.
 MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
                    user/libgreet_blob.o user/solibtest_dynblob.o \
@@ -589,6 +590,7 @@ else ifeq ($(ARCH),aarch64)
                      user/sigtest_blob.o user/muslhello_muslblob.o \
                      user/epollmusl_muslblob.o \
                      user/netmuslserv_muslblob.o \
+                     user/nxtest_muslblob.o \
                      $(MUSL_COREUTIL_BLOBS)
 
   # §M60 — the embedded default wallpaper (all arches).

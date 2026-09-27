@@ -109,4 +109,15 @@ int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
  * it by calling one thing rather than by somebody remembering. */
 void user_excursion_end(void);
 
+/* 2026-09-27 — called by the arch fault handlers for a USER fault: if the
+ * faulting program is a synchronous excursion (proc_exec_elf and the self-
+ * tests run on their caller's task), record `sig` and teleport back to the
+ * caller instead of killing the task.  Returns only when the task is NOT on an
+ * excursion, in which case the handler goes on to task_exit_code as before.
+ *
+ * Found by nxtest on aarch64: a program faulting in an excursion took the
+ * `serial-cmd` service down with it, and on x86 the same fault kills the
+ * interactive shell that typed the command. */
+void user_excursion_fault(int sig);
+
 #endif

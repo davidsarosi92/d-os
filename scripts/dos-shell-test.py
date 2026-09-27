@@ -440,8 +440,12 @@ def qemu_argv(a, sersock, monsock):
                      "-device", "virtio-blk-device,drive=hd0"]
     else:
         qemu = "qemu-system-i386" if a.arch == "i386" else "qemu-system-x86_64"
+        # §M86 — the SAME CPU run_qemu.sh gives a person: qemu32 has no NX, so
+        # without `+nx` the i386 no-execute path would never be exercised.
+        cpu = a.cpu or ("qemu32,+nx" if a.arch == "i386" else "")
         argv = [
-            qemu, "-cdrom", "build/%s/d-os.iso" % a.arch,
+            qemu, "-cdrom", "build/%s/d-os.iso" % a.arch] + \
+            (["-cpu", cpu] if cpu else []) + [
             "-smp", str(a.smp), "-m", a.mem, "-display", "none",
             "-serial", "unix:%s,server,nowait" % sersock,
             "-monitor", "unix:%s,server,nowait" % monsock, "-no-reboot",
@@ -508,6 +512,9 @@ def main():
     # 1024M: what run_qemu.sh gives, and past that point i386 can actually
     # use the extra RAM (§M48 raised the identity map to 1 GiB).
     ap.add_argument("--mem", default="1024M")
+    ap.add_argument("--cpu", default="",
+                    help="QEMU -cpu for x86 (default i386: qemu32,+nx; "
+                         "qemu32,-pae reaches the classic-paging path)")
     ap.add_argument("--disk", default="")
     # --empty is the harness spelling of run_qemu.sh's flag of the same name: a
     # FRESHLY FORMATTED, empty volume.  A test that reuses whatever the last run

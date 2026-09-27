@@ -326,6 +326,7 @@ static int proc_exec_common(const void* image, size_t len,
     if (me) me->mm = s;              /* a fresh space carries a fresh cursor */
     vmm_space_switch(s);
 
+    if (me) me->exc_fault = 0;
     enter_user_mode_wrap(lp.entry, user_sp);
 
     /* §1.1/§M71 — the excursion left ring 3 through the SYS_EXIT teleport, which
@@ -333,11 +334,13 @@ static int proc_exec_common(const void* image, size_t len,
      * other excursion paths never got this line. */
     user_excursion_end();
 
+    int fault = me ? me->exc_fault : 0;
+    if (me) me->exc_fault = 0;
     fd_close_all();                    /* reclaim any fds the program opened */
     vmm_space_switch(prev);
     if (me) me->mm = prev;
     vmm_space_destroy(s);
-    return 0;
+    return fault ? -(128 + fault) : 0;
 }
 
 int proc_exec_elf(const void* image, size_t len) {
@@ -634,6 +637,19 @@ void enter_user_mode_wrap(uintptr_t user_ip, uintptr_t user_sp) {
 
 void user_excursion_teleport(void) {
     struct task* me = task_current();
+    /* The resume point is ordinary kernel code on an ordinary task, which
+     * runs with interrupts ON.  The trap that brings us here may have masked
+     * them (an x86 interrupt gate, an aarch64 exception entry), and the
+     * resume path restores registers but not the flags — so a task could come
+     * back from an excursion and carry on with the timer masked. */
+    hal_intr_enable();
     hal_syscall_exit_to_kernel(me->exc_resume[0], me->exc_resume[1]);
     for (;;) { }                         /* not reached */
+}
+
+void user_excursion_fault(int sig) {
+    struct task* me = task_current();
+    if (!me || me->user_task || !me->exc_kstack) return;   /* a real process */
+    me->exc_fault = sig ? sig : 11;
+    user_excursion_teleport();
 }

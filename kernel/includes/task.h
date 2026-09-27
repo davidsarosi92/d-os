@@ -192,6 +192,11 @@ struct task {
      * that started the excursion, on the task's OWN stack; 0 = no excursion. */
     uintptr_t     exc_resume[2];
     uintptr_t     exc_kstack;
+    /* 2026-09-27 — a FAULT ends an excursion the way SYS_EXIT does: the signal
+     * number is left here and the fault handler teleports back, so the program
+     * dies and the TASK THAT HOSTED IT (a shell, the serial-cmd service) does
+     * not.  proc_exec_* returns -(128 + exc_fault).  0 = exited normally. */
+    int           exc_fault;
     /* M35 — thread: this task SHARES its `mm` with its creator (clone), so its
      * reap must NOT destroy the address space (the thread group still uses it).
      * 0 for a process that owns its mm; 1 for a cloned thread. */

@@ -115,9 +115,31 @@ static void enable_sse(void) {
  * Call AFTER percpu_init_ap() so this_cpu_id() is valid.  (All three were
  * BSP-only until 2026-08-01, which is why x86_64 `-smp 2` collapsed the moment
  * a ring-3 task was load-balanced onto the AP — see DOCS §8.) */
+/* §M86 — NO-EXECUTE.  CPUID.80000001:EDX[20], turned on by EFER.NXE (bit 11
+ * of MSR 0xC0000080).  PER CPU and before any user task runs here: with NXE
+ * clear, bit 63 in an entry is RESERVED and every walk that meets it faults. */
+static int cpu_has_nx(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                      : "a"(0x80000000u), "c"(0u));
+    if (a < 0x80000001u) return 0;
+    __asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                      : "a"(0x80000001u), "c"(0u));
+    return (d >> 20) & 1u;
+}
+static void enable_nx(void) {
+    if (!cpu_has_nx()) return;
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080u));
+    lo |= 1u << 11;
+    __asm__ volatile ("wrmsr" :: "a"(lo), "d"(hi), "c"(0xC0000080u));
+}
+int x86_cpu_has_nx(void) { return cpu_has_nx(); }
+
 void hal_arch_init_this_cpu(void) {
     gdt_load_cpu_tss();
     enable_sse();
+    enable_nx();
     syscall_init_64();
 }
 
@@ -126,6 +148,7 @@ void hal_arch_early_init(void) {
     gdt_init();          /* also LTRs the BSP's own TSS */
     idt_init();
     enable_sse();
+    enable_nx();
     syscall_init_64();
 }
 

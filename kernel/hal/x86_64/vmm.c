@@ -48,7 +48,7 @@
 #define PTE_RW    0x002
 #define PTE_US    0x004
 #define PTE_PS    0x080
-#define PTE_NX    (1ull << 63)           /* not used yet — Phase 7+ */
+#define PTE_NX    (1ull << 63)           /* §M86 — user W^X, see nx_bits */
 
 #define PAGE_MASK_4K  0x000FFFFFFFFFF000ull   /* 4 KiB-aligned phys addr */
 #define PAGE_MASK_2M  0x000FFFFFFFE00000ull   /* 2 MiB-aligned phys addr */
@@ -87,6 +87,12 @@ void vmm_init(void) {
     kprintf("vmm: 4-level paging active, PML4 @ %p, "
             "identity 1 GiB via 2 MiB pages (inherited from boot)\n",
             (void*)pml4);
+    {
+        extern int x86_cpu_has_nx(void);
+        kprintf("vmm: no-execute %s\n", x86_cpu_has_nx()
+                ? "ON for user pages (W^X: data, heap and stack cannot run)"
+                : "unavailable (the CPU has no NX)");
+    }
 }
 
 uintptr_t vmm_kernel_pd_phys(void) {
@@ -663,6 +669,21 @@ int vmm_cow_fault(uintptr_t fault_va) {
     return 1;
 }
 
+/* §M86 — NO-EXECUTE for user pages (the i386 twin in hal/x86/vmm.c says
+ * why user pages only: §M67's modules execute from the kernel heap).  EFER.NXE
+ * is set on every CPU by hal_arch.c; `g_nx` records that the boot CPU has it,
+ * and every CPU of one machine agrees. */
+extern int x86_cpu_has_nx(void);
+static int g_nx = -1;
+static inline int nx_on(void) {
+    if (g_nx < 0) g_nx = x86_cpu_has_nx();
+    return g_nx;
+}
+static inline uint64_t nx_bits(uint32_t flags) {
+    return (nx_on() && (flags & VMM_USER) && !(flags & VMM_EXEC)) ? PTE_NX : 0;
+}
+int vmm_nx_active(void) { return nx_on(); }
+
 int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
                   uint32_t flags) {
     if (!s) return vmm_map(virt, phys, flags);
@@ -675,7 +696,8 @@ int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
      * A fresh map is free — nothing has it cached. */
     int was_present = (pt[IDX_PT(virt)] & PTE_P) != 0;
     pt[IDX_PT(virt)] = ((uint64_t)phys & PAGE_MASK_4K)
-                     | PTE_P | ((uint64_t)flags & (PTE_RW | PTE_US | VMM_SHARED));
+                     | PTE_P | ((uint64_t)flags & (PTE_RW | PTE_US | VMM_SHARED))
+                     | nx_bits(flags);
     if (was_present) hal_tlb_shootdown(0, virt);
     else             invlpg(virt);
     return 0;
@@ -701,7 +723,8 @@ int vmm_space_protect(struct vmm_space* s, uintptr_t virt, uint32_t flags) {
     if ((pte & PTE_P) == 0) return -1;             /* not present */
     pt[IDX_PT(virt)] = (pte & PAGE_MASK_4K) | PTE_P
                      | ((uint64_t)flags & (PTE_RW | PTE_US))
-                     | (pte & VMM_SHARED);
+                     | (pte & VMM_SHARED)
+                     | nx_bits(flags | (uint32_t)(pte & PTE_US));
     hal_tlb_shootdown(0, virt);          /* §M51 — may drop PTE_RW */
     return 0;
 }
@@ -738,7 +761,7 @@ static void walk_subtree(uint64_t* tbl, uint64_t* ktbl, int depth, uintptr_t va,
              * i386 and x86_64 PTE layouts agree there, which is the whole
              * reason vmm.h can define one set of flags for both. */
             cb(ctx, entry_va, (uintptr_t)(e & PAGE_MASK_4K),
-                    (uint32_t)(e & ~PAGE_MASK_4K));
+                    (uint32_t)(e & 0xFFFu) | ((e & PTE_NX) ? 0u : (uint32_t)VMM_EXEC));
         }
     }
 }

@@ -14480,8 +14480,79 @@ aarch64 by console (link state, wifisim join, disable → Wi-Fi state, RAM disk
 format/mount/write/unmount/remove, `tcptest` PASS, ping 3/3), 0 faults.
 
 
+### 4.104 No-execute for user pages on x86, and what the test found on the way (§M86 closed, 2026-09-27)
+
+§M86's one open item.  `VMM_EXEC` has existed since §M25 and was "advisory on
+x86" ever since: the VMM never even stored it, so every user page — data,
+heap, stack — was executable on both x86 arches.  aarch64 always enforced it
+through UXN.
+
+**What it is now.**  Bit 63 (NX) on every USER page mapped without `VMM_EXEC`
+— i386 under PAE and x86_64 — with `EFER.NXE` set on EVERY CPU in
+`hal_arch_init_this_cpu()` (with NXE clear, bit 63 is a RESERVED bit and a walk
+that meets it faults, so a core that missed it would fault on every page the
+others had marked).  A page is executable exactly when its mapping asked:
+a `PF_X` ELF segment, `PROT_EXEC` on `mmap`/`mprotect`.  Every path that
+rebuilds an entry carries it over — fork's clone, the COW copy, mprotect, the
+§M75 walk.  **Kernel pages stay executable on purpose**: §M67's modules run
+from the kernel heap, so marking kernel memory NX needs the loader to map module
+code separately first.  The boot log says which case a machine is in
+(`vmm: no-execute ON for user pages …` / `unavailable (the CPU has no NX)` /
+`unavailable (classic paging has no NX bit)`), and `vmm_nx_active()` answers
+the same question in code.
+
+**The everyday i386 machine had no NX at all.**  QEMU's default `qemu32` CPU
+has PAE and not NX, so the harness and `run_qemu.sh` now pass
+`-cpu qemu32,+nx` (overridable: `--cpu` / `DOS_CPU`; `qemu32,-pae` still
+reaches the classic-paging path, verified: NX unavailable, the test SKIPs).
+The same shape as §M48's missing NIC and §M49's missing `-smp`: a feature the
+path a person runs never exercises is a feature nobody has tested.
+
+**`nxtest`** — an unmodified musl binary, all three arches.  A control first (a
+page written, then `mprotect`ed READ|EXEC, runs — otherwise "the data page
+faulted" could mean nothing can run from mmap at all), then a static data page
+and a stack buffer, each in a forked child that must be KILLED; the parent
+reads the verdict from the wait status.  Measured: `err=15` (present, user,
+instruction fetch) at the exact buffer address on i386 and x86_64, and the same
+refusal through UXN on aarch64.  On a machine without NX the kernel says so
+through `DOS_NX=0` and the data page RUNNING is reported as the correct
+outcome, not a failure.  Regression: musl, .so + dlopen, fork, signals,
+pthreads, C++, TLS, ringtest, crypto, tcptest, and NetSurf rendering its
+welcome page — all unchanged.
+
+**Four defects the work turned up, all fixed:**
+
+1. **The ELF loader destroyed a page shared by two segments.**  It allocated a
+   fresh zeroed frame for every page of every segment, so where one segment
+   ended and the next began on the same page, the second replaced the first and
+   the first segment's bytes on that page were lost.  GNU ld normally starts
+   each segment on a new page, which is why nothing broke — and with NX it would
+   have been worse, the end of the code becoming a non-executable page.  The
+   loader now remembers boundary pages and a second segment on one copies INTO
+   it and maps it with the UNION of the two permissions.
+2. **x86_64 recorded every user page fault at address 0.**  The console line
+   printed CR2; the crash record (`crash`, `/proc/crash`, the Crash Reports
+   window) passed a literal 0 — which reads as a NULL dereference whatever
+   happened.
+3. **aarch64 trapped EL0 cache maintenance.**  `SCTLR_EL1.UCT/UCI/DZE` were
+   clear, so any program that WRITES code (`__builtin___clear_cache`, a JIT,
+   TinyCC) died with EC 0x18 on its first cache operation.  Set on every CPU,
+   as every aarch64 OS does.
+4. **A faulting excursion killed the task that hosted it.**  `proc_exec_elf`
+   and the self-tests run a program synchronously on the CALLER's task (the
+   shell, the `serial-cmd` service); a fault there went to `task_exit`, so the
+   program's crash took the shell with it.  Now `user_excursion_fault()` records
+   the signal and returns through the same teleport `SYS_EXIT` uses;
+   `proc_exec_*` returns `-(128 + sig)`.  That teleport also re-enables
+   interrupts now — the resume path restores registers and not flags, so a task
+   could come back from an excursion with the timer masked.  Falsifier:
+   `nxtest excursion` (a write to 0x10 inside the excursion) → `rc=-139` and the
+   next command runs, on all three arches.
+
+
 ## 8. Change log
 
+- **2026-09-27 — §M86 closed: no-execute for user pages on i386 PAE and x86_64 (`nxtest`, harness CPU `qemu32,+nx`); ELF loader keeps a page shared by two segments; x86_64 crash records carry the fault address; aarch64 lets EL0 maintain its caches; a faulting excursion no longer kills its host task (DOCS §4.104).**
 - **2026-09-27 — §M87: Network, Wi-Fi (with a simulated adapter) and Disks pages in the Control Panel; a taskbar network indicator with a chooser; `vfs_umount`, an exFAT formatter (fsck-clean), RAM disks, link state; the module fingerprint covers `net_device`; the translation gap measured (`locale missing`) and closed (DOCS §4.103).**
 - **2026-09-27 — The desktop asks who you are: a greeter whenever more than the first-run root exists, an uncloseable lock (no X, Esc ignored), a Sign in button, `gui signout` (DOCS §4.91 stage 10.1).**
 - **2026-09-26 — §M85 stage 4b: sbsa-ref has a disk (AHCI on the system bus), USB (xHCI, now 64-bit end to end) and a network (new e1000e driver); `acpi`, `lspci`; the hardware watchdog no longer reboots a machine whose every CPU is ticking (DOCS §4.102).**

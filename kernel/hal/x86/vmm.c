@@ -51,6 +51,7 @@
 #define E_US   0x004ull
 #define E_PS   0x080ull                        /* large page (PDE only) */
 #define E_OS   (0x400ull | 0x800ull)           /* VMM_SHARED | VMM_COW  */
+#define E_NX   (1ull << 63)                    /* §M86 — PAE only       */
 
 #define PAGE_MASK32   0xFFFFF000ull
 #define PAGE_MASK64   0x000FFFFFFFFFF000ull    /* bits 12..51 */
@@ -65,6 +66,28 @@
 #define KMAP_CPUS        64                     /* 512 slots: one PAE PT */
 
 static int g_pae;                               /* chosen once, in vmm_init */
+/* §M86 — NO-EXECUTE for user pages.  Needs PAE (bit 63 exists only in the
+ * 64-bit entry) and a CPU that has it (EFER.NXE is set per CPU by hal_arch.c).
+ *
+ * APPLIED TO USER PAGES ONLY, and on purpose: the kernel's identity map holds
+ * the heap, and §M67's modules execute from it, so marking kernel memory NX
+ * would need the module loader to map its code separately first.  What this
+ * buys is W^X for PROGRAMS — a user page is executable exactly when its
+ * mapping asked for VMM_EXEC (a PF_X segment, PROT_EXEC) — which is where a
+ * stack or heap overflow would otherwise become code.  M25's VMM_EXEC had been
+ * "advisory on x86" since it was written; this is the day it stops being. */
+static int g_nx;
+
+/* The NX bit a USER mapping with these VMM_* flags gets. */
+static inline uint64_t nx_bits(uint32_t flags) {
+    return (g_nx && (flags & VMM_USER) && !(flags & VMM_EXEC)) ? E_NX : 0;
+}
+/* Back the other way: a present user entry's executability as VMM_EXEC, so a
+ * path that rebuilds an entry (fork, a shared page) carries it over. */
+static inline uint32_t exec_of(uint64_t pte) {
+    return (pte & E_NX) ? 0u : (uint32_t)VMM_EXEC;
+}
+int vmm_nx_active(void) { return g_nx; }
 
 /* classic format */
 static uint32_t kernel_pd[1024]  __attribute__((aligned(4096)));
@@ -158,8 +181,11 @@ int      vmm_pae_active(void) { return g_pae; }
 
 extern int x86_cpu_has_pae(void);                /* hal_arch.c */
 
+extern int x86_cpu_has_nx(void);                 /* hal_arch.c */
+
 void vmm_init(void) {
     g_pae = x86_cpu_has_pae();
+    g_nx  = g_pae && x86_cpu_has_nx();
 
     if (!g_pae) {
         for (int i = 0; i < 1024; i++) kernel_pd[i] = 0;
@@ -189,6 +215,12 @@ void vmm_init(void) {
             g_pae ? "PAE, 64-bit entries, 2 MiB pages"
                   : "classic 32-bit, 4 MiB PSE pages",
             IDENTITY_MAP_MIB, (void*)(uintptr_t)kroot_phys());
+    /* Say which, because "the program crashed on a data page" and "NX is off
+     * so nothing is enforced" must be distinguishable from a log. */
+    kprintf("vmm: no-execute %s\n",
+            g_nx ? "ON for user pages (W^X: data, heap and stack cannot run)"
+                 : g_pae ? "unavailable (the CPU has no NX)"
+                         : "unavailable (classic paging has no NX bit)");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -250,7 +282,8 @@ static int map_in_root_ex(void* root, uint32_t virt, uint64_t phys,
      * translation, so every CPU has to be told; a fresh map cannot be cached
      * anywhere, so it need not be. */
     int was_present = (pte_get(pt, j) & E_P) != 0;
-    pte_set(pt, j, (phys & addr_mask()) | E_P | (flags & (E_RW | E_US | E_OS)));
+    pte_set(pt, j, (phys & addr_mask()) | E_P | (flags & (E_RW | E_US | E_OS)) |
+                   nx_bits(flags));
     if (was_present && notify) hal_tlb_shootdown(0, virt);
     else                       invlpg(virt);
     return 0;
@@ -275,7 +308,8 @@ static int protect_in_root(void* root, uint32_t virt, uint32_t flags) {
     uint32_t j = pte_index(virt);
     uint64_t pte = pte_get(pt, j);
     if (!(pte & E_P)) return -1;
-    pte_set(pt, j, (pte & addr_mask()) | E_P | (flags & (E_RW | E_US)) | (pte & E_OS));
+    pte_set(pt, j, (pte & addr_mask()) | E_P | (flags & (E_RW | E_US)) | (pte & E_OS) |
+                   nx_bits(flags | (uint32_t)(pte & E_US)));
     hal_tlb_shootdown(0, virt);                     /* §M51 — may drop RW */
     return 0;
 }
@@ -447,22 +481,24 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
             uint64_t frame = pte & addr_mask();
 
             if (pte & VMM_SHARED) {
-                uint32_t fl = VMM_USER | VMM_SHARED | ((pte & E_RW) ? VMM_WRITABLE : 0);
+                uint32_t fl = VMM_USER | VMM_SHARED | ((pte & E_RW) ? VMM_WRITABLE : 0) |
+                              exec_of(pte);
                 if (map_in_root(child->root, virt, frame, fl) != 0) {
                     vmm_space_destroy(child); return NULL;
                 }
             } else if ((pte & E_RW) || (pte & VMM_COW)) {
                 uint16_t* rc = cow_slot(frame);
                 if (rc) cow_ref_share(rc);
-                map_in_root_ex(parent->root, virt, frame, VMM_USER | VMM_COW, /*notify*/0);
-                if (map_in_root(child->root, virt, frame, VMM_USER | VMM_COW) != 0) {
+                uint32_t cf = VMM_USER | VMM_COW | exec_of(pte);   /* §M86 */
+                map_in_root_ex(parent->root, virt, frame, cf, /*notify*/0);
+                if (map_in_root(child->root, virt, frame, cf) != 0) {
                     vmm_space_destroy(child); return NULL;
                 }
             } else {
                 pmm_phys_t nf = pmm_alloc_frame_user();   /* §M86 — may be highmem */
                 if (!nf) { vmm_space_destroy(child); return NULL; }
                 kmap_copy_frame(nf, frame);
-                if (map_in_root(child->root, virt, nf, VMM_USER) != 0) {
+                if (map_in_root(child->root, virt, nf, VMM_USER | exec_of(pte)) != 0) {
                     pmm_free_frame(nf); vmm_space_destroy(child); return NULL;
                 }
             }
@@ -491,13 +527,13 @@ int vmm_cow_fault(uintptr_t fault_va) {
     uint16_t* rc = cow_slot(old);
     if (!rc || cow_ref_sole(rc)) {
         /* Last (or untracked) sharer — writable in place. */
-        pte_set(pt, j, old | E_P | E_US | E_RW);
+        pte_set(pt, j, old | E_P | E_US | E_RW | (pte & E_NX));
         if (rc) __atomic_store_n(rc, 0, __ATOMIC_RELEASE);
     } else {
         pmm_phys_t nf = pmm_alloc_frame_user();       /* §M86 — may be highmem */
         if (!nf) return 0;                            /* OOM → real fault */
         kmap_copy_frame(nf, old);
-        pte_set(pt, j, (nf & addr_mask()) | E_P | E_US | E_RW);
+        pte_set(pt, j, (nf & addr_mask()) | E_P | E_US | E_RW | (pte & E_NX));
         /* Give up our share only after the copy (cowref.h). */
         if (cow_ref_put_copy(rc)) pmm_free_frame(old);
     }
@@ -531,7 +567,8 @@ void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
             uint64_t pte = pte_get(pt, j);
             if (!(pte & E_P)) continue;
             cb(ctx, ((uintptr_t)gi << pde_shift()) | ((uintptr_t)j << 12),
-               pte & addr_mask(), (uint32_t)(pte & 0xFFFu));
+               pte & addr_mask(), (uint32_t)(pte & 0xFFFu & ~(uint64_t)VMM_EXEC) |
+                                  exec_of(pte));
         }
     }
 }

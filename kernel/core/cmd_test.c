@@ -76,6 +76,8 @@ extern const unsigned char _binary_user_linuxhello_elf_start[] __attribute__((we
 extern const unsigned char _binary_user_linuxhello_elf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_netmuslserv_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_netmuslserv_muslelf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_nxtest_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_nxtest_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_epollmusl_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_epollmusl_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_muslhello_muslelf_start[] __attribute__((weak));
@@ -865,6 +867,32 @@ static void cmd_netmuslserv(void) {
     kprintf("netmuslserv: returned rc=%d\n", rc);
 }
 
+/* §M86 — `nxtest`: no-execute through an UNMODIFIED musl binary.  The
+ * program forks a child for each thing that must NOT run, so the fault it is
+ * supposed to take kills the child and not this shell (see user/nxtest.c). */
+static void cmd_nxtest(const char* args) {
+    const unsigned char* a = _binary_user_nxtest_muslelf_start;
+    const unsigned char* b = _binary_user_nxtest_muslelf_end;
+    if (!a || !b) { console_write("nxtest: not embedded for this arch\n"); return; }
+    kprintf("nxtest: no-execute is %s on this machine\n",
+            vmm_nx_active() ? "ON" : "UNAVAILABLE");
+    int excursion = args && args[0] == 'e';
+    /* ONE extra variable per exec (proc_set_exec_env), so the mode wins when
+     * both would apply: the excursion test does not look at DOS_NX. */
+    proc_set_exec_env(excursion ? "DOS_NXTEST=excursion"
+                                : vmm_nx_active() ? "DOS_NX=1" : "DOS_NX=0");
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(a, (unsigned long)(b - a));
+    if (me) me->linux_abi = prev;
+    kprintf("nxtest: returned rc=%d\n", rc);
+    if (excursion)
+        kprintf(rc == -(128 + 11)
+                ? "nxtest: PASS - the program died of SIGSEGV and this task is still running\n"
+                : "nxtest: FAIL - expected rc=-139 from a faulting excursion\n");
+}
+
 static void cmd_musltest(void) {
     if (!_binary_user_muslhello_muslelf_start) {
         console_write("musltest: not embedded — run `make musl` then rebuild\n");
@@ -1107,6 +1135,8 @@ TEST(linuxtest,     t_linuxtest,     "", "a hand-built Linux-ABI binary");
 TEST(wedgewin,      t_wedgewin,      "", "a client that opens a window and then freezes");
 TEST(pthreadtest,   t_pthreadtest,   "", "REAL musl pthreads");
 TEST(epollmusltest, t_epollmusltest, "", "epoll through unmodified musl");
+static void t_nxtest(const char* a) { cmd_nxtest(a); }
+TEST(nxtest, t_nxtest, "[excursion]", "no-execute: data and stack pages must not run");
 TEST(netmuslserv,   t_netmuslserv,   "", "bind/listen/accept through real musl");
 TEST(musltest,      t_musltest,      "", "an unmodified static musl binary");
 TEST(musldyntest,   t_musldyntest,   "", "a dynamically linked musl binary");

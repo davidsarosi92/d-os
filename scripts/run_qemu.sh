@@ -297,8 +297,14 @@ fi
 ISO=build/$ARCH/d-os.iso
 
 case "$ARCH" in
-    i386)   QEMU=qemu-system-i386 ;;
-    x86_64) QEMU=qemu-system-x86_64 ;;
+    # §M86 — `+nx`: QEMU's default i386 CPU (qemu32) has PAE but NOT the
+    # no-execute bit, so the everyday i386 machine enforced no W^X at all and
+    # nothing tested it.  DOS_CPU overrides (e.g. `qemu32,-pae` for the
+    # classic-paging path, which must keep being reachable).
+    i386)   QEMU=qemu-system-i386
+            CPU_ARGS="-cpu ${DOS_CPU:-qemu32,+nx}" ;;
+    x86_64) QEMU=qemu-system-x86_64
+            CPU_ARGS="${DOS_CPU:+-cpu $DOS_CPU}" ;;
     *) echo "Unsupported ARCH '$ARCH' — supported: i386, x86_64, aarch64" >&2; exit 1 ;;
 esac
 
@@ -461,7 +467,7 @@ if command -v "$QEMU" >/dev/null 2>&1; then
         DISK_ARGS="-drive if=virtio,file=$DISK,format=raw -boot d"
     fi
 
-    exec "$QEMU" -rtc base=localtime $EXTRA -serial "file:$SERLOG" \
+    exec "$QEMU" $CPU_ARGS -rtc base=localtime $EXTRA -serial "file:$SERLOG" \
          -monitor "unix:$MONSOCK,server,nowait" $DISK_ARGS \
          -device ib700 -action watchdog=inject-nmi -cdrom "$ISO" \
          $QEMU_EXTRA_ARGS

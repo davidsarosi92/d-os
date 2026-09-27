@@ -113,6 +113,14 @@ void aarch64_mmu_enable_this_cpu(void) {
     uint64_t sctlr;
     __asm__ volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
     sctlr |= (1ULL << 0) | (1ULL << 2) | (1ULL << 12);
+    /* §M86 (found by nxtest, 2026-09-27) — let EL0 do its OWN cache
+     * maintenance, as every aarch64 OS does: UCT (15) reads CTR_EL0, UCI (26)
+     * permits DC CVAU / IC IVAU, DZE (14) permits DC ZVA.  Without them any
+     * program that WRITES code — a JIT, TinyCC's -run, anything calling
+     * __builtin___clear_cache — traps with EC 0x18 on its first cache
+     * operation, and the fault reads like an unrelated crash.  None of the
+     * three can reach memory the process could not already write. */
+    sctlr |= (1ULL << 14) | (1ULL << 15) | (1ULL << 26);
     __asm__ volatile ("msr sctlr_el1, %0\n isb" :: "r"(sctlr));
 }
 

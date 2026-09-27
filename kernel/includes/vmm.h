@@ -132,6 +132,12 @@ struct vmm_space;
 
 /* Create a new user address space (kernel mapped, user region empty).
  * Returns NULL on OOM. */
+/* §M86 — is no-execute enforced for user pages on this machine?  1 when a
+ * user mapping without VMM_EXEC really cannot be executed (x86 PAE / long mode
+ * with a CPU that has NX; aarch64 always, through UXN), 0 when VMM_EXEC is
+ * only advisory (i386 classic paging, or a CPU without NX). */
+int vmm_nx_active(void);
+
 struct vmm_space* vmm_space_create(void);
 
 /* Free a space: its user page tables + the top-level table.  Must NOT be

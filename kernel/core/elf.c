@@ -78,8 +78,34 @@ static void copy_bytes(uint8_t* dst, const uint8_t* src, size_t n) {
  * Assumes p_vaddr and p_offset share page alignment (the standard ELF
  * constraint; true for our static images).  BSS (memsz > filesz) is covered
  * by the zeroing. */
+/* §M86 — A PAGE SHARED BY TWO SEGMENTS.
+ *
+ * The loader used to allocate a fresh, ZEROED frame for every page of every
+ * segment and map it — so where one segment ends and the next begins on the
+ * SAME page, the second mapping replaced the first and that page lost the
+ * first segment's bytes.  GNU ld normally starts each segment on a new page,
+ * which is why nothing broke; a tightly linked binary (`-N`, `--nmagic`, a
+ * hand-written linker script) would have lost the tail of its code.  And with
+ * no-execute enforced it would be worse than lost bytes: the shared page takes
+ * the SECOND segment's permissions, so the end of the code segment becomes a
+ * non-executable data page.
+ *
+ * Overlap can only happen at a segment boundary, so the loader remembers the
+ * pages it has already placed, and a later segment landing on one of them
+ * copies into THAT frame (no zeroing) and maps it with the UNION of the two
+ * segments' permissions — the only mapping that keeps both correct. */
+struct placed_page { uintptr_t va; pmm_phys_t frame; uint32_t flags; };
+#define PLACED_MAX 16          /* 2 per segment; on the kernel stack */
+struct placed_set { struct placed_page p[PLACED_MAX]; int n; };
+
+static struct placed_page* placed_find(struct placed_set* ps, uintptr_t va) {
+    for (int i = 0; ps && i < ps->n; i++) if (ps->p[i].va == va) return &ps->p[i];
+    return NULL;
+}
+
 static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len,
-                       const struct phdr_norm* p, uintptr_t bias) {
+                       const struct phdr_norm* p, uintptr_t bias,
+                       struct placed_set* placed) {
     if (p->offset + p->filesz < p->offset) return ELF_ESEGBOUND;   /* overflow */
     if (p->offset + p->filesz > len)       return ELF_ESEGBOUND;
 
@@ -94,11 +120,16 @@ static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len
     for (uintptr_t off = 0; off < span; off += PAGE_SIZE) {
         /* §M86 — a USER page, so it may come from highmem, and the kernel
          * writes it through a short kmap rather than the direct map. */
-        pmm_phys_t frame = pmm_alloc_frame_user();
+        uintptr_t va = va_base + off;
+        struct placed_page* prev = placed_find(placed, va);
+        pmm_phys_t frame = prev ? prev->frame : pmm_alloc_frame_user();
         if (!frame) return ELF_ENOMEM;
         uint8_t* dst = (uint8_t*)kmap_frame(frame);
-        if (!dst) { pmm_free_frame(frame); return ELF_ENOMEM; }
-        for (int i = 0; i < (int)PAGE_SIZE; i++) dst[i] = 0;
+        if (!dst) { if (!prev) pmm_free_frame(frame); return ELF_ENOMEM; }
+        /* A page the previous segment already filled keeps its bytes; only
+         * the part this segment owns is written below (its BSS tail is
+         * already zero from the first placement). */
+        if (!prev) for (int i = 0; i < (int)PAGE_SIZE; i++) dst[i] = 0;
 
         /* Copy the slice of file data that lands in this page.  `fpos` is
          * the byte offset within the segment's file image for the first
@@ -114,9 +145,20 @@ static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len
         }
         kunmap_frame(dst);
 
-        if (vmm_space_map(space, va_base + off, frame, flags) != 0) {
-            pmm_free_frame(frame);
+        uint32_t pf = prev ? (prev->flags | flags) : flags;   /* union */
+        if (vmm_space_map(space, va, frame, pf) != 0) {
+            if (!prev) pmm_free_frame(frame);
             return ELF_ENOMEM;
+        }
+        if (prev) {
+            prev->flags = pf;
+        } else if (placed && placed->n < PLACED_MAX &&
+                   (off == 0 || off + PAGE_SIZE >= span)) {
+            /* Only a segment's FIRST and LAST page can be shared. */
+            placed->p[placed->n].va    = va;
+            placed->p[placed->n].frame = frame;
+            placed->p[placed->n].flags = pf;
+            placed->n++;
         }
     }
     return ELF_OK;
@@ -125,6 +167,8 @@ static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len
 int elf_load_ex(struct vmm_space* space, const void* image_v, size_t len,
                 uintptr_t load_bias, struct elf_load_info* out) {
     const uint8_t* image = (const uint8_t*)image_v;
+    struct placed_set placed;                   /* §M86 — shared boundary pages */
+    placed.n = 0;
     if (len < EI_NIDENT) return ELF_EBADMAG;
     if (image[0] != 0x7F || image[1] != 'E' || image[2] != 'L' || image[3] != 'F')
         return ELF_EBADMAG;
@@ -220,7 +264,7 @@ int elf_load_ex(struct vmm_space* space, const void* image_v, size_t len,
             eh.phoff < p.offset + p.filesz)
             phdr_from_load = p.vaddr + bias + (eh.phoff - p.offset);
 
-        int rc = map_segment(space, image, len, &p, bias);
+        int rc = map_segment(space, image, len, &p, bias, &placed);
         if (rc != ELF_OK) return rc;
         loaded++;
     }

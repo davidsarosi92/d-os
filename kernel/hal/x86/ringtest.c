@@ -105,7 +105,10 @@ int arch_ringtest(void) {
     msg[i] = 0;
 
     /* The space owns both frames from here: destroying it frees them. */
-    if (vmm_space_map(sp, 0x40000000, code_phys,  VMM_WRITABLE | VMM_USER) != 0 ||
+    /* §M86 — the code page must ASK to be executable: with no-execute on, a
+     * user page without VMM_EXEC is data, and ring 3 would fault on its
+     * first instruction. */
+    if (vmm_space_map(sp, 0x40000000, code_phys,  VMM_WRITABLE | VMM_USER | VMM_EXEC) != 0 ||
         vmm_space_map(sp, 0x40001000, stack_phys, VMM_WRITABLE | VMM_USER) != 0) {
         console_write("ringtest: vmm_space_map failed\n");
         vmm_space_destroy(sp);

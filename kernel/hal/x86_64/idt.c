@@ -24,6 +24,7 @@
 #include "gdt.h"
 #include "syscall.h"
 #include "task.h"
+#include "proc.h"
 #include "crash.h"      /* §M47 — record every fault */
 #include "watchdog.h"   /* §4.67 follow-up — name the STALLED cpu in an NMI */
 #include "lapic.h"
@@ -629,8 +630,16 @@ void isr_handler(struct int_frame* f) {
                     (unsigned long)f->err_code, (void*)(uintptr_t)ucr2,
                     (void*)(uintptr_t)ucr3, (void*)vmm_space_root_phys(t->mm));
             /* §M47 — record it for the reporting sinks (see the i386 twin). */
+            /* The fault ADDRESS goes into the record too (found 2026-09-27:
+             * it was a literal 0 here while the console line above printed
+             * CR2 — so `crash` and /proc/crash said "address 0" for every
+             * user page fault on x86_64, which reads as a NULL dereference
+             * whatever actually happened).  CR2 means something only for a
+             * page fault; for the other traps it is stale, so 0 there. */
             crash_report(CRASH_USER_FAULT, t->pid, t->name,
-                         (uintptr_t)f->rip, 0, sig, exception_name[f->int_no]);
+                         (uintptr_t)f->rip, f->int_no == 14 ? (uintptr_t)ucr2 : 0,
+                         sig, exception_name[f->int_no]);
+            user_excursion_fault(sig);   /* an excursion returns to its caller */
             task_exit_code(128 + sig);   /* noreturn */
         }
         /* §M54 — a kernel #PF's fault ADDRESS is the most informative number

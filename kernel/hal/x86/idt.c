@@ -22,6 +22,7 @@
 #include "gdt.h"
 #include "syscall.h"
 #include "task.h"
+#include "proc.h"
 #include "crash.h"
 #include "watchdog.h"   /* §4.67 follow-up — name the STALLED cpu in an NMI */
 #include "vmm.h"
@@ -730,6 +731,7 @@ void isr_handler(struct int_frame* f) {
             crash_report(CRASH_USER_FAULT, t->pid, t->name,
                          (uintptr_t)f->eip, (uintptr_t)_cr2, sig,
                          exception_name[f->int_no]);
+            user_excursion_fault(sig);   /* an excursion returns to its caller */
             task_exit_code(128 + sig);   /* noreturn: reschedules; reaper frees mm */
         }
 
