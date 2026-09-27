@@ -43,6 +43,7 @@
  * ============================================================================= */
 
 #include "gui.h"
+#include "locale.h"   /* §M87 — translated fragments */
 #include "widget.h"
 #include "ui.h"
 #include "itemview.h"
@@ -141,12 +142,12 @@ static int ac_cell(void* ctx, int i, int c, char* out, int cap) {
             /* "Administrator" and "the protected account" are different facts
              * and root is both; saying only the first would hide the one rule
              * a reader most needs to know before pressing Delete. */
-            if (u->uid == CRED_UID_ROOT)        n = ac_put(out, cap, 0, "Administrator (protected)");
-            else if (user_is_admin_uid(u->uid)) n = ac_put(out, cap, 0, "Administrator");
-            else                                n = ac_put(out, cap, 0, "Standard");
+            if (u->uid == CRED_UID_ROOT)        n = ac_put(out, cap, 0, lstr("Administrator (protected)"));
+            else if (user_is_admin_uid(u->uid)) n = ac_put(out, cap, 0, lstr("Administrator"));
+            else                                n = ac_put(out, cap, 0, lstr("Standard"));
             break;
         case AC_LOGIN:
-            n = ac_put(out, cap, 0, u->has_password ? "yes" : "no password");
+            n = ac_put(out, cap, 0, lstr(u->has_password ? "yes" : "no password"));
             break;
         case AC_HOME:  n = ac_put(out, cap, 0, u->home); break;
     }
@@ -442,11 +443,11 @@ static void done_password(const char* pw) {
         static char m[140];
         int n;
         if (rc == 0) {
-            n = ac_put(m, sizeof m, 0, "Password set for ");
+            n = ac_put(m, sizeof m, 0, lstr("Password set for "));
             n = ac_put(m, sizeof m, n, u->name);
-            n = ac_put(m, sizeof m, n, " (");
+            n = ac_put(m, sizeof m, n, lstr(" ("));
             n = ac_put_int(m, sizeof m, n, plen);
-            n = ac_put(m, sizeof m, n, " chars, fp ");
+            n = ac_put(m, sizeof m, n, lstr(" chars, fp "));
             /* §M81 — THE FINGERPRINT, and the panel VERIFIES ITS OWN WORK.
              *
              * When both ends of the chain report ONE character and the sign-in
@@ -466,9 +467,9 @@ static void done_password(const char* pw) {
                 char fp[3];
                 user_secret_fingerprint(pw, fp);
                 n = ac_put(m, sizeof m, n, fp);
-                n = ac_put(m, sizeof m, n, user_check_password(u->name, pw) == 0
+                n = ac_put(m, sizeof m, n, lstr(user_check_password(u->name, pw) == 0
                                                ? ", verified ok).  They can sign in now."
-                                               : ", VERIFY FAILED - the record did not take).");
+                                               : ", VERIFY FAILED - the record did not take)."));
             }
         } else {
             /* §M81 — THE REASON THAT ACTUALLY FIRED, and WHO WE ARE.
@@ -486,12 +487,12 @@ static void done_password(const char* pw) {
              * without saying who it was acting as leaves the user to deduce the
              * one thing the machine already knows. */
             char who[40];
-            n = ac_put(m, sizeof m, 0, "NOT changed - ");
+            n = ac_put(m, sizeof m, 0, lstr("NOT changed - "));
             n = ac_put(m, sizeof m, n, users_last_refusal());
-            n = ac_put(m, sizeof m, n, ".  Acting as ");
+            n = ac_put(m, sizeof m, n, lstr(".  Acting as "));
             n = ac_put(m, sizeof m, n,
                        cred_owner_name(cred_current(), who, sizeof who));
-            n = ac_put(m, sizeof m, n, ".");
+            n = ac_put(m, sizeof m, n, lstr("."));
         }
         (void)n;
         ac_say(m);
@@ -509,7 +510,7 @@ static void act_password(struct w_button* b, void* ctx) {
     const struct user_account* u = ac_selected();
     if (!u) return;
     char t[48];
-    int n = ac_put(t, sizeof t, 0, "New password for ");
+    int n = ac_put(t, sizeof t, 0, lstr("New password for "));
     ac_put(t, sizeof t, n, u->name);
     ac_prompt(t, 1, done_password);
 }
@@ -557,12 +558,12 @@ static void act_autologin(struct w_button* b, void* ctx) {
     static char m[160];
     int n;
     if (already) {
-        n = ac_put(m, sizeof m, 0, "Auto sign-in is off.  The picker will ask.");
+        n = ac_put(m, sizeof m, 0, lstr("Auto sign-in is off.  The picker will ask."));
     } else {
-        n = ac_put(m, sizeof m, 0, "Signing in to ");
+        n = ac_put(m, sizeof m, 0, lstr("Signing in to "));
         n = ac_put(m, sizeof m, n, u->name);
-        n = ac_put(m, sizeof m, n, " automatically from now on (it has no "
-                                   "password, so there is nothing to ask).");
+        n = ac_put(m, sizeof m, n, lstr(" automatically from now on (it has no "
+                                   "password, so there is nothing to ask)."));
     }
     (void)n;
     ac_say(m);
@@ -579,11 +580,11 @@ static void act_delete(struct w_button* b, void* ctx) {
      * rather than acting on a single click.  The file manager's recursive
      * delete made the same move, for the same reason. */
     static char body[176];
-    int n = ac_put(body, sizeof body, 0, "Delete '");
+    int n = ac_put(body, sizeof body, 0, lstr("Delete '"));
     n = ac_put(body, sizeof body, n, u->name);
-    n = ac_put(body, sizeof body, n, "'?\nIts uid is retired permanently, and "
+    n = ac_put(body, sizeof body, n, lstr("'?\nIts uid is retired permanently, and "
                                      "the files it owns\nwill then belong to no "
-                                     "account.");
+                                     "account."));
     (void)n;
     struct gui_dialog_req req = { 0 };
     req.title       = "Delete account";
@@ -620,33 +621,29 @@ static void ac_update_controls(void) {
     static char msg[224];
     int n = 0;
     if (!u) {
-        n = ac_put(msg, sizeof msg, 0, "Select an account.");
+        n = ac_put(msg, sizeof msg, 0, lstr("Select an account."));
         if (!me_is_admin())
-            n = ac_put(msg, sizeof msg, n,
-                       "  You are signed in as a standard user, so you may "
-                       "change your own password and nothing else.");
+            n = ac_put(msg, sizeof msg, n, lstr("  You are signed in as a standard user, so you may "
+                       "change your own password and nothing else."));
     } else {
         n = ac_put(msg, sizeof msg, 0, u->name);
-        n = ac_put(msg, sizeof msg, n, " - uid ");
+        n = ac_put(msg, sizeof msg, n, lstr(" - uid "));
         n = ac_put_int(msg, sizeof msg, n, u->uid);
         if (!u->has_password)
-            n = ac_put(msg, sizeof msg, n, ", cannot sign in (no password)");
+            n = ac_put(msg, sizeof msg, n, lstr(", cannot sign in (no password)"));
         /* WHY a control is dead, in the words a person needs.  A greyed button
          * with no explanation is the failure devicepanel.c warns about; the
          * difference here is that the reason changes with the selection, so it
          * belongs on the line that also changes. */
         if (u->uid == CRED_UID_ROOT)
-            n = ac_put(msg, sizeof msg, n,
-                       ".  root is protected: it cannot be deleted or demoted "
-                       "by anyone, including root.");
+            n = ac_put(msg, sizeof msg, n, lstr(".  root is protected: it cannot be deleted or demoted "
+                       "by anyone, including root."));
         else if (user_is_admin_uid(u->uid) && !me_is_root())
-            n = ac_put(msg, sizeof msg, n,
-                       ".  This is an administrator - only root may change or "
-                       "remove one.");
+            n = ac_put(msg, sizeof msg, n, lstr(".  This is an administrator - only root may change or "
+                       "remove one."));
         else if (!me_is_admin() && !is_me(u))
-            n = ac_put(msg, sizeof msg, n,
-                       ".  Not your account: a standard user may change only "
-                       "their own password.");
+            n = ac_put(msg, sizeof msg, n, lstr(".  Not your account: a standard user may change only "
+                       "their own password."));
     }
     (void)n;
     w_label_set(ac_detail, msg);

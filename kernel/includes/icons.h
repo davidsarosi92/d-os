@@ -77,6 +77,20 @@ enum icon_id {
     ICON_ACCESS,        /* accessibility                               */
     ICON_BACKUP,        /* backup                                      */
     ICON_REMOTE,        /* remote desktop                              */
+    /* §M87 — the taskbar's network indicator.  SIX pictures for six answers
+     * (net_get_state), for §M23's reason: "the cable is out", "I turned it
+     * off", "there is no adapter" and "no address" each call for a different
+     * fix, and one "offline" glyph would send the user looking for the wrong
+     * one.  Drawn in COLOUR, so no vector artwork (see icon_draw). */
+    ICON_NET_WIRED,     /* online through a cable                      */
+    ICON_NET_NOLINK,    /* adapter present, no carrier                 */
+    ICON_NET_NOADDR,    /* link up, no IPv4 address                    */
+    ICON_NET_DISABLED,  /* the user disabled the adapter               */
+    ICON_NET_NONE,      /* no network adapter at all                   */
+    ICON_WIFI_1,        /* Wi-Fi, weak / fair / strong signal          */
+    ICON_WIFI_2,
+    ICON_WIFI_3,
+    ICON_WIFI_OFF,      /* wireless adapter, not associated            */
     ICON__COUNT
 };
 

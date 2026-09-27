@@ -279,6 +279,85 @@ void icon_draw(struct gfx_surface* s, int x, int y, int n, int id) {
     }
 
     case ICON_APP:
+    /* §M87 — THE NETWORK INDICATOR, as LINE ART in the theme's text colour.
+     *
+     * The first version was a coloured tile like the app icons, and in the
+     * taskbar it stood out as the one filled square between two outline
+     * glyphs (the keyboard and the speaker are vector line art) — reported by
+     * picture, not by anybody.  So: the same single-colour stroke language as
+     * its neighbours, and the STATE carried by an overlay in a signal colour
+     * (red cross = broken, amber "!" = incomplete) or by dimming (= switched
+     * off).  Geometry is in sixteenths of the box computed with the box size
+     * itself, not with a whole-pixel unit, because at a 26 px tray icon one
+     * unit rounds to 1 px and the glyph came out a speck in a big box. */
+    case ICON_NET_WIRED:
+    case ICON_NET_NOLINK:
+    case ICON_NET_NOADDR:
+    case ICON_NET_DISABLED:
+    case ICON_NET_NONE: {
+        const cp_theme* th = cp_current_theme();
+        uint32_t ink = (id == ICON_NET_WIRED || id == ICON_NET_NOADDR)
+                     ? th->text : th->muted;
+        int t = n / 12 > 1 ? n / 12 : 1;               /* stroke width      */
+        #define P(k) ((k) * n / 16)
+        /* the upstream box: an OUTLINE, like the keyboard's keys */
+        gfx_fill(s, x + P(5), y + P(1), P(6), t, ink);
+        gfx_fill(s, x + P(5), y + P(5) - t, P(6), t, ink);
+        gfx_fill(s, x + P(5), y + P(1), t, P(4), ink);
+        gfx_fill(s, x + P(11) - t, y + P(1), t, P(4), ink);
+        /* stem, bus, drops */
+        gfx_fill(s, x + P(8) - t / 2, y + P(5), t, P(3), ink);
+        gfx_fill(s, x + P(2) + t, y + P(8), P(12) - 2 * t, t, ink);
+        gfx_fill(s, x + P(3), y + P(8), t, P(3), ink);
+        gfx_fill(s, x + P(13) - t, y + P(8), t, P(3), ink);
+        /* the two stations, solid */
+        gfx_fill(s, x + P(1), y + P(11), P(5), P(4), ink);
+        gfx_fill(s, x + P(10), y + P(11), P(5), P(4), ink);
+        if (id == ICON_NET_NOLINK || id == ICON_NET_NONE) {
+            /* a red cross over the bus: the link is not there */
+            int c = P(5);
+            for (int i = 0; i < c; i++) {
+                gfx_fill(s, x + P(8) - c / 2 + i, y + P(8) - c / 2 + i + t / 2, t + 1, t + 1, C_RED);
+                gfx_fill(s, x + P(8) + c / 2 - i, y + P(8) - c / 2 + i + t / 2, t + 1, t + 1, C_RED);
+            }
+        } else if (id == ICON_NET_NOADDR) {
+            /* amber "!" beside the upstream box: up, but not usable yet */
+            gfx_fill(s, x + P(13), y + P(1), t + 1, P(4), C_AMBER);
+            gfx_fill(s, x + P(13), y + P(6), t + 1, t + 1, C_AMBER);
+        }
+        /* DISABLED: the dimmed glyph alone — "switched off", not "broken". */
+        #undef P
+        break;
+    }
+
+    /* §M87 — WI-FI: three rising bars, lit by signal strength, in the same
+     * line-art language.  Bars rather than a fan of arcs because arcs at this
+     * size are stair-stepped blobs, and a signal meter is the one reading of
+     * this glyph people actually need. */
+    case ICON_WIFI_1:
+    case ICON_WIFI_2:
+    case ICON_WIFI_3:
+    case ICON_WIFI_OFF: {
+        const cp_theme* th = cp_current_theme();
+        int lit = (id == ICON_WIFI_1) ? 1 : (id == ICON_WIFI_2) ? 2
+                : (id == ICON_WIFI_3) ? 3 : 0;
+        int bw = n / 5;
+        for (int b = 0; b < 3; b++) {
+            int h = (n * (5 + 4 * b)) / 16;
+            gfx_fill(s, x + n / 8 + b * (bw + n / 10), y + n - n / 16 - h, bw, h,
+                     b < lit ? th->text : th->line);
+        }
+        if (!lit) {
+            int t = n / 12 > 1 ? n / 12 : 1;
+            int c = n / 3;
+            for (int i = 0; i < c; i++) {
+                gfx_fill(s, x + n - c - n / 16 + i, y + n / 16 + i, t + 1, t + 1, C_RED);
+                gfx_fill(s, x + n - n / 16 - i,     y + n / 16 + i, t + 1, t + 1, C_RED);
+            }
+        }
+        break;
+    }
+
     default: {
         tile(s, x, y, n, C_GREY);
         /* A window: title bar + body, the most neutral thing an unknown
@@ -317,6 +396,9 @@ static const struct { const char* name; int id; } names[] = {
     { "muted",     ICON_VOLUME_MUTED },
     { "noaudio",   ICON_VOLUME_OFF },
     { "chip",      ICON_CHIP      },
+    { "network",   ICON_NET_WIRED },
+    { "wifi",      ICON_WIFI_3    },
+    { "storage",   ICON_STORAGE   },
     { NULL, 0 }
 };
 

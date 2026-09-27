@@ -14337,8 +14337,152 @@ at `-smp 4` `hardlock` produces a softlockup report and no NMI, because the
 watchdog task on another CPU keeps petting — the per-CPU sweep is what reports
 that case.
 
+### 4.103 Network and storage in the Control Panel; the translation gap, measured (§M87, 2026-09-27)
+
+Asked for directly: *"Network and its settings belong in the Control Panel.  A
+network icon next to the clock, like the sound one — network or no network,
+Wi-Fi or no Wi-Fi, maybe a Wi-Fi chooser.  Disk management in the Control
+Panel, with its functions.  The translation is incomplete."*  Four pieces, and
+each one needed a layer underneath that did not exist.
+
+#### The network, as a person sees it
+
+`net_state.c` answers one question — *am I online, through what, and if not,
+why not* — with SIX outcomes (`NETSTATE_*`): no adapter, disabled, no link,
+no address, wired, wireless.  **Four of them are failures that call for four
+different fixes**, so a two-state icon would send the user looking for the
+wrong one (§M23's three-sound-icon argument, one layer over).  The taskbar
+icon, the Network page and `netstate` all read `net_get_state()`; three
+readers of `net_device` would eventually disagree.
+
+`struct net_device` grew four APPENDED fields: `admin_down` (the user turned
+it off: TX refused at the one emit gate, RX dropped, the driver keeps running
+so enabling is instant), `link` (carrier — **NULL means unknown and is
+reported as unknown**, never assumed up), `wireless` (a `net_wireless_ops`
+table: scan / connect / disconnect / status) and `config_src` (built-in
+default / DHCP / static — *an address shown without saying where it came from
+leaves nobody able to tell a configured machine from an unconfigured one*).
+virtio-net (PCI and MMIO) now negotiates `VIRTIO_NET_F_STATUS`, e1000e reads
+`STATUS.LU`; QEMU's `set_link net0 off` turns the icon into the red-cross
+glyph and `netstate` into "not connected", and `on` restores both.
+
+**Static addresses are §M63 keys** (`net.static` + `net.static.{ip,netmask,
+gateway,dns}`) applied by a boot service and a `CONFIG_WATCH`, so the panel's
+Save and a typed `conf set` are one operation; they survive a reboot
+(verified).  The watcher is QUIET: the store is overlaid key by key at boot and
+`net.static = 1` can arrive before the address it switches on.
+`net_primary()` passes over a disabled adapter while another is usable and
+never picks a simulated one.
+
+#### Wi-Fi — and why there is a simulated adapter
+
+**QEMU emulates no Wi-Fi hardware**, so the chooser would otherwise be code no
+run could execute (§M59's reason for declining `wl_data_device`).
+`wifisim.c` is a wireless adapter that scans three fixed networks, joins an
+open one freely and a WPA2 one only with the right passphrase (so the
+password prompt and "wrong passphrase" are both reachable), and carries NO
+traffic: transmit refuses every frame and `NETDEV_F_SIMULATED` keeps it out of
+routing.  Off unless asked for (`wifisim on`, `net.wifisim`), and labelled
+"simulated" everywhere it appears.  A real driver fills the same ops table.
+
+#### The taskbar indicator
+
+Between the sound and keyboard indicators (network, volume, clock — the order
+people know).  Line art in the theme's text colour like its neighbours — the
+first version was a filled coloured tile and stood out as the one square
+between two outline glyphs, found by picture.  State is the overlay: red cross
+(no link / no adapter), amber "!" (no address), dimmed (disabled), bars by
+signal for Wi-Fi.  The flyout lists the networks in range, "Disconnect" while
+joined, and "Network settings".  **Nothing in the chrome waits**: a click runs
+on the compositor with the WM lock held, so it only records what was asked for
+and the desktop task's `second_tick` spawns the scan or the join; an open
+network joins on a click, a secured one opens the Wi-Fi window preselected,
+because a passphrase needs a text field.
+
+#### The Network page, the address dialog, the Wi-Fi window
+
+Adapters in a table (type, state, address, SOURCE, MAC), Enable / Disable /
+Renew / Configure / Test / Wi-Fi.  Everything that waits (DHCP, the test's
+ping + DNS lookup, a join) runs on a detached task and reports through a
+result the window's tick shows — *a window whose host sits in a six-second
+DHCP exchange looks exactly like a hung program*.  Test reports gateway and
+DNS SEPARATELY, because "the router answers, names do not resolve" and
+"nothing answers" are different problems.  The address dialog is Built-in /
+Automatic / Manual with the four fields prefilled from what the machine is
+doing NOW, validated as a whole before anything is applied (a half-applied
+address is neither configuration).
+
+#### Disks: umount, a formatter, and a disk that is safe to break
+
+`storage.c` + the Disks page: list (size, filesystem READ from the disk by
+signature — exFAT / FAT / NTFS / ext / partitioned / empty / unknown — mount
+point, free space), mount at `/media/<dev>`, unmount, format, sync, RAM disks.
+`disk` is the same on a console, and both read one `storage_query()`.
+
+- **`vfs_umount` did not exist.**  Mount records now keep the device, the
+  mountpoint dentry and what the mount COVERED (restored on unmount instead of
+  leaked).  Refusals are named: files open below it (counted per mount by
+  walking a file's dentry chain at open and close, so no pointer into the
+  record table can go stale), a nested mount, or a HOLD — the settings store
+  holds `/mnt`, so "Unmount" on the system disk answers *the system depends on
+  it (the settings store)* instead of pulling the store out from under every
+  later save.  New fs ops `umount` / `evict` / `statfs`, appended.
+- **`exfat_format`** writes boot region + checksum + backup, one FAT, the
+  bitmap, a COMPRESSED up-case table (60 bytes: identity runs plus a-z) and a
+  root with the volume label.  **Verified by `fsck.exfat -n`: clean**, with a
+  directory and files the guest wrote after formatting.
+- **`bcache_invalidate`** drops a device's cached sectors after writing them
+  back, so a reformatted disk is not read through a cache of the old one.
+  `blk_unregister` and `devfs_unregister` exist now; a removed `/dev` entry is
+  ORPHANED rather than freed (an open file's `dentry` and `inode` may still
+  point at it) and its node answers every call with an error.
+- **Why RAM disks**: the only disk most runs have is the one the settings live
+  on, virtio-blk drives one device and AHCI takes the first disk — so a disk
+  that is safe to format is a RAM disk (`ramdisk.c`, 1-256 MiB, a quarter of RAM
+  always kept free, zero-filled).  Useful on its own as a scratch volume.
+
+Format asks first in a modal naming the disk; the confirm button says
+"Format", not "OK".  Its result is handed to the Disks page as DATA (§M22.7:
+the dialog's task must not write another window's widgets).
+
+#### The bug the network work found: a module built against an old header
+
+`ifconfig` took `EXCEPTION 5` at a garbage eip and then an NMI.  The loopback
+MODULE had been compiled before `net.h` grew and was never rebuilt — the
+module rule had no `-MMD`, so header edits did not reach modules — and the
+§M67 fingerprint did not list `struct net_device`, so the stale module loaded
+and `dev->link` was read past the end of its struct.  Both fixed: module
+objects track headers, and the fingerprint covers `net_device` and
+`block_device`.
+
+#### The translation gap, measured
+
+`locale missing on` records every key the active catalogue cannot answer, as
+it is DRAWN; `locale missing` lists them.  Switching to Hungarian and opening
+every panel found 49, and a static sweep of every `CONFIG_KEY` (name, help,
+values) and `SETTINGS_PANEL` (name, summary) found 79 — **no setting's help
+text had ever been translated**, and the table view never translated its
+COLUMN TITLES (now it does, in one place: a heading is always an interface
+word, a cell may be user data).  The older panels' composed messages route
+their fragments through `lstr` with the English fragment as the key.  **One
+cause was not a missing entry at all:** `w_checkbox` copied its text into 64
+bytes, so a longer help was cut — and the cut key matched nothing (now 128;
+`w_label` 96 → 160).  After the sweep the runtime list is down to numbers
+(24/32/48), punctuation and composed status lines holding data.  The volume
+flyout's four strings were English literals too.  `gui.login` was removed: it
+had no reader after the sign-in fix, and a switch that changes nothing is
+worse than none.
+
+**Verified:** i386 driven by mouse (tray flyout, Network page Test = "gateway
+answers, names resolve", address dialog Manual + Save → `eth0 static`, persisted
+across a reboot; Disks page refusal on `/mnt`, format dialog); x86_64 and
+aarch64 by console (link state, wifisim join, disable → Wi-Fi state, RAM disk
+format/mount/write/unmount/remove, `tcptest` PASS, ping 3/3), 0 faults.
+
+
 ## 8. Change log
 
+- **2026-09-27 — §M87: Network, Wi-Fi (with a simulated adapter) and Disks pages in the Control Panel; a taskbar network indicator with a chooser; `vfs_umount`, an exFAT formatter (fsck-clean), RAM disks, link state; the module fingerprint covers `net_device`; the translation gap measured (`locale missing`) and closed (DOCS §4.103).**
 - **2026-09-27 — The desktop asks who you are: a greeter whenever more than the first-run root exists, an uncloseable lock (no X, Esc ignored), a Sign in button, `gui signout` (DOCS §4.91 stage 10.1).**
 - **2026-09-26 — §M85 stage 4b: sbsa-ref has a disk (AHCI on the system bus), USB (xHCI, now 64-bit end to end) and a network (new e1000e driver); `acpi`, `lspci`; the hardware watchdog no longer reboots a machine whose every CPU is ticking (DOCS §4.102).**
 - **2026-09-26 — §M85 stage 4: the aarch64 kernel runs at a fixed VA and loads anywhere; offset direct map and PMM base; modules within reach; sbsa-ref boots to a shell (DOCS §4.101).**

@@ -141,6 +141,33 @@ int devfs_register(struct devfs_node* node) {
     return 0;
 }
 
+/* §M87 — a device that has gone away.  Its node may be static driver memory
+ * or about to be freed, so the /dev entry is ORPHANED (vfs_orphan_child) and
+ * its inode repointed at `node_gone`, whose every operation fails: a task that
+ * still holds it open gets an error, never a read through freed memory. */
+static ssize_t gone_read(void* ctx, void* buf, size_t n, uint64_t off) {
+    (void)ctx; (void)buf; (void)n; (void)off; return -1;
+}
+static ssize_t gone_write(void* ctx, const void* buf, size_t n, uint64_t off) {
+    (void)ctx; (void)buf; (void)n; (void)off; return -1;
+}
+static struct devfs_node node_gone = {
+    .name = "(removed)", .kind = DEVFS_CHAR,
+    .read = gone_read, .write = gone_write,
+};
+
+int devfs_unregister(struct devfs_node* node) {
+    if (!node) return -1;
+    /* Still queued (devfs not up yet)?  Then it never became a file. */
+    for (struct devfs_node** pp = &pending_head; *pp; pp = &(*pp)->_next)
+        if (*pp == node) { *pp = node->_next; node->_next = NULL; return 0; }
+    if (!dev_dir) return -1;
+    struct inode* ino = vfs_orphan_child(dev_dir, node->name);
+    if (!ino) return -1;
+    ino->private = &node_gone;
+    return 0;
+}
+
 void devfs_init(void) {
     /* Resolve /dev — must exist (ramfs creates it at mount). */
     struct file* f = vfs_open("/dev", VFS_RDONLY);

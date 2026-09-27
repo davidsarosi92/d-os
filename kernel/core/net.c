@@ -247,9 +247,18 @@ struct net_device* net_find(const char* name) {
  * table, and making a routing decision depend on it means one added driver can
  * silently redirect every packet in the system. */
 struct net_device* net_primary(void) {
-    for (struct net_device* n = g_head; n; n = n->next)
-        if (!(n->flags & NETDEV_F_LOOPBACK)) return n;
-    return NULL;
+    /* §M87: a SIMULATED adapter never carries traffic, so it is never the
+     * route; and an adapter the user DISABLED is passed over while another
+     * one is usable — but still returned when it is the only one, so that a
+     * send fails with "the network is down" at the transmit gate instead of
+     * with "no network device", which would be a lie about the hardware. */
+    struct net_device* fallback = NULL;
+    for (struct net_device* n = g_head; n; n = n->next) {
+        if (n->flags & (NETDEV_F_LOOPBACK | NETDEV_F_SIMULATED)) continue;
+        if (!n->admin_down) return n;
+        if (!fallback) fallback = n;
+    }
+    return fallback;
 }
 
 static struct net_device* net_loopback(void) {
@@ -271,7 +280,8 @@ struct net_device* net_route(uint32_t dst_ip) {
     if ((dst_ip >> 24) == 127) return net_loopback();
 
     for (struct net_device* n = g_head; n; n = n->next) {
-        if (n->flags & NETDEV_F_LOOPBACK) continue;
+        if (n->flags & (NETDEV_F_LOOPBACK | NETDEV_F_SIMULATED)) continue;
+        if (n->admin_down) continue;
         if (n->netmask && (dst_ip & n->netmask) == (n->ip & n->netmask)) return n;
     }
     return net_primary();
@@ -647,6 +657,9 @@ static uint8_t g_txframe[ETH_FRAME_MAX];
 static int eth_send_locked(struct net_device* dev, const uint8_t* dst_mac,
                            uint16_t ethertype, const void* payload, uint32_t len) {
     if (len > ETH_MTU) return -1;
+    /* §M87 — the admin gate.  ONE place every emit path passes through, so a
+     * disabled adapter cannot be reached by a path somebody forgot. */
+    if (dev->admin_down) return -1;
     struct eth_hdr* eh = (struct eth_hdr*)g_txframe;
     mac_copy(eh->dst, dst_mac);
     mac_copy(eh->src, dev->mac);
@@ -2298,6 +2311,7 @@ static void ipv4_input(struct net_device* dev, const uint8_t* src_mac,
  * block; the source MAC is threaded down so replies never need to look one up. */
 void net_rx(struct net_device* dev, const uint8_t* frame, uint32_t len) {
     if (len < ETH_HLEN) { dev->rx_dropped++; return; }
+    if (dev->admin_down) { dev->rx_dropped++; return; }     /* §M87 */
     const struct eth_hdr* eh = (const struct eth_hdr*)frame;
 
     /* Accept frames addressed to us or broadcast. */

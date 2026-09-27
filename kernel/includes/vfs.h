@@ -216,6 +216,21 @@ struct fs_type {
      * does not deliver.  The default errs in the direction that cannot become
      * isolation theatre. */
     int stores_ownership;
+
+    /* §M87 — OPTIONAL, APPENDED.  An fs that leaves them NULL cannot be
+     * unmounted (umount says so) and reports no free space.
+     *
+     * `umount` is called with the VFS namespace lock held, AFTER the VFS has
+     * checked that nothing below the mountpoint is open; it must write back
+     * everything it holds and free its per-volume state.  The VFS then frees
+     * the dentry tree, calling `evict` for each inode so the fs can free what
+     * `inode->private` points at.  0 = done, non-zero = refused (nothing has
+     * been torn down yet, so a refusal leaves the mount intact).
+     *
+     * `statfs` answers in BYTES: total and free on the volume. */
+    int  (*umount)(struct dentry* mountpoint);
+    void (*evict)(struct inode* inode);
+    int  (*statfs)(struct dentry* mountpoint, uint64_t* total, uint64_t* free);
 };
 
 /* ------------------------------------------------------------------- */
@@ -305,7 +320,42 @@ struct vfs_mount {
     char        path[64];
     const char* fs_name;
     int         stores_ownership;       /* copied from the fs_type at mount */
+    /* §M87 — what the disk manager needs.  Appended. */
+    char        dev_name[16];           /* backing block device, "" = none   */
+    int         open_files;             /* files open below this mount now   */
+    const char* hold;                   /* non-NULL = a subsystem depends on
+                                         * this mount and umount is refused,
+                                         * NAMING it ("settings store")       */
+    /* VFS-private: what the mount covered, restored by umount. */
+    struct dentry* mp;
+    struct inode*  covered_inode;
+    struct dentry* covered_children;
+    struct fs_type* fs;
 };
+
+/* §M87 — detach the filesystem mounted at `path`.
+ *   0   done
+ *  -1   no mount there / "/" (the root is never unmounted)
+ *  -2   busy: files are open below it
+ *  -3   busy: another mount is nested below it
+ *  -4   held by a subsystem (vfs_mount_at(i)->hold names it)
+ *  -5   the filesystem cannot be unmounted (no umount op) or refused */
+int  vfs_umount(const char* path);
+
+/* Unlink `name` from `parent` without freeing anything (see vfs.c); returns
+ * its inode, or NULL. */
+struct inode* vfs_orphan_child(struct dentry* parent, const char* name);
+
+/* Mark a mount as depended upon: umount will refuse, naming `who`.  NULL
+ * releases it.  0 on success, -1 when nothing is mounted at `path`. */
+int  vfs_mount_hold(const char* path, const char* who);
+
+/* The mount (if any) that `dev_name` is mounted on, or NULL. */
+const struct vfs_mount* vfs_mount_of_dev(const char* dev_name);
+
+/* Total and free bytes of the volume holding `path`.  0 on success, -1 when
+ * the filesystem does not say. */
+int  vfs_statfs(const char* path, uint64_t* total, uint64_t* free);
 
 int  vfs_mount_count(void);
 const struct vfs_mount* vfs_mount_at(int i);

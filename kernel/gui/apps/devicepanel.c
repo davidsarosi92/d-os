@@ -58,6 +58,7 @@
  * ============================================================================= */
 
 #include "gui.h"
+#include "locale.h"   /* §M87 — translated fragments */
 #include "gui_app.h"
 #include "icons.h"
 #include "widget.h"
@@ -90,7 +91,7 @@ static int put(char* out, int cap, int n, const char* s) {
 }
 
 static int put_int(char* out, int cap, int n, int v) {
-    if (v < 0) { n = put(out, cap, n, "-"); v = -v; }
+    if (v < 0) { n = put(out, cap, n, lstr("-")); v = -v; }
     char d[12];
     int k = 0;
     if (!v) d[k++] = '0';
@@ -140,12 +141,12 @@ static void dp_where(struct driver* d, char* out, int cap) {
     int n = 0;
     int pid = drvuser_pid(d->name);
     if (pid > 0) {
-        n = put(out, cap, n, "ring 3 pid ");
+        n = put(out, cap, n, lstr("ring 3 pid "));
         n = put_int(out, cap, n, pid);
     } else {
-        n = put(out, cap, n, "kernel");
+        n = put(out, cap, n, lstr("kernel"));
         if (driver_domain(d) == DOMAIN_USER)
-            n = put(out, cap, n, " (->ring 3 on restart)");
+            n = put(out, cap, n, lstr(" (->ring 3 on restart)"));
     }
     (void)n;
 }
@@ -195,13 +196,13 @@ static int dm_get(void* ctx, int i, struct item_entry* out) {
      * decide whether this row needs attention: what it is, and whether
      * anything is driving it. */
     int n = put(dm_label, sizeof dm_label, 0, h->name);
-    n = put(dm_label, sizeof dm_label, n, " - ");
-    if (!h->online)   n = put(dm_label, sizeof dm_label, n, "not present");
+    n = put(dm_label, sizeof dm_label, n, lstr(" - "));
+    if (!h->online)   n = put(dm_label, sizeof dm_label, n, lstr("not present"));
     else if (!d)      n = put(dm_label, sizeof dm_label, n,
                              (h->is_pci &&
                               !hw_needs_driver(h->class_code, h->subclass))
                              ? "no driver needed" : "NO DRIVER");
-    else              n = put(dm_label, sizeof dm_label, n, dp_state(driver_state(d)));
+    else              n = put(dm_label, sizeof dm_label, n, lstr(dp_state(driver_state(d))));
     (void)n;
 
     out->label = dm_label;
@@ -239,9 +240,9 @@ static int dm_col_weight(void* ctx, int c) {
  * none), and the punctuation carries the structure. */
 static int put_bdf(char* out, int cap, int n, uint16_t bdf) {
     n = put_hex(out, cap, n, (unsigned)(bdf >> 8));
-    n = put(out, cap, n, ":");
+    n = put(out, cap, n, lstr(":"));
     n = put_hex(out, cap, n, (unsigned)((bdf >> 3) & 0x1F));
-    n = put(out, cap, n, ".");
+    n = put(out, cap, n, lstr("."));
     n = put_hex(out, cap, n, (unsigned)(bdf & 7));
     return n;
 }
@@ -257,15 +258,15 @@ static int dm_cell(void* ctx, int i, int c, char* out, int cap) {
     case COL_HW: put(out, cap, 0, h->name); break;
 
     case COL_ADDR:
-        if (!h->online)     put(out, cap, 0, "offline");
+        if (!h->online)     put(out, cap, 0, lstr("offline"));
         else if (h->is_pci) put_bdf(out, cap, 0, h->bdf);
-        else                put(out, cap, 0, "platform");
+        else                put(out, cap, 0, lstr("platform"));
         break;
 
     case COL_ID:
         if (h->is_pci) {
             int n = put_hex(out, cap, 0, h->vendor);
-            n = put(out, cap, n, ":");
+            n = put(out, cap, n, lstr(":"));
             put_hex(out, cap, n, h->device);
         }
         break;
@@ -278,32 +279,32 @@ static int dm_cell(void* ctx, int i, int c, char* out, int cap) {
         if (h->driver)      put(out, cap, 0, h->driver);
         else if (h->online && h->is_pci &&
                  !hw_needs_driver(h->class_code, h->subclass))
-            put(out, cap, 0, "(not needed)");
+            put(out, cap, 0, lstr("(not needed)"));
         /* ASCII, deliberately.  The console pads columns by BYTE count and an
          * em-dash is three bytes to one column, so "— none —" was twelve bytes
          * wide and eight columns wide and pushed the rest of the row sideways.
          * A table whose alignment depends on the encoding of one cell is a
          * table that will come apart again. */
-        else if (h->online) put(out, cap, 0, "(none)");
+        else if (h->online) put(out, cap, 0, lstr("(none)"));
         break;
 
     case COL_STATE:
-        if (!h->online)  put(out, cap, 0, "not present");
+        if (!h->online)  put(out, cap, 0, lstr("not present"));
         else if (!d) {
             /* "Needs one" and "wants none" are different answers, and printing
              * the first for a host bridge makes the column untrustworthy — after
              * which the row that DOES need attention reads like more of the
              * same. */
             if (h->is_pci && !hw_needs_driver(h->class_code, h->subclass))
-                put(out, cap, 0, "no driver needed");
+                put(out, cap, 0, lstr("no driver needed"));
             else
-                put(out, cap, 0, "needs a driver");
+                put(out, cap, 0, lstr("needs a driver"));
         }
         /* State 0 is "nothing has probed this yet" — §M67 attaches a module
          * without starting it.  `dp_state` prints "-" for that, which is the
          * driver registry's shorthand and tells a person nothing. */
-        else if (driver_state(d) == 0) put(out, cap, 0, "not started");
-        else             put(out, cap, 0, dp_state(driver_state(d)));
+        else if (driver_state(d) == 0) put(out, cap, 0, lstr("not started"));
+        else             put(out, cap, 0, lstr(dp_state(driver_state(d))));
         break;
 
     case COL_WHERE:
@@ -322,7 +323,7 @@ static int dm_cell(void* ctx, int i, int c, char* out, int cap) {
             domain_isolation_of(driver_domain(d),
                                 (d->flags & DRVF_DMA) ? 1 : 0,
                                 drvuser_confined(d->name));
-        put(out, cap, 0, domain_isolation_name(iso));
+        put(out, cap, 0, lstr(domain_isolation_name(iso)));
         break;
     }
 
@@ -401,8 +402,8 @@ static void dm_refresh_detail(void) {
     int n = put(msg, sizeof msg, 0, h->name);
 
     if (!h->online) {
-        n = put(msg, sizeof msg, n, " - not present; the driver is here if it "
-                                    "ever is");
+        n = put(msg, sizeof msg, n, lstr(" - not present; the driver is here if it "
+                                    "ever is"));
         (void)n;
         w_label_set(dm_detail, msg);
         return;
@@ -414,32 +415,32 @@ static void dm_refresh_detail(void) {
             n = put(msg, sizeof msg, n,
                     " - present; nothing drives it and nothing should");
         else
-            n = put(msg, sizeof msg, n, " - present, and nothing here drives it");
+            n = put(msg, sizeof msg, n, lstr(" - present, and nothing here drives it"));
         (void)n;
         w_label_set(dm_detail, msg);
         return;
     }
 
-    n = put(msg, sizeof msg, n, " - driver ");
+    n = put(msg, sizeof msg, n, lstr(" - driver "));
     n = put(msg, sizeof msg, n, d->name);
-    n = put(msg, sizeof msg, n, " v");
+    n = put(msg, sizeof msg, n, lstr(" v"));
     n = put(msg, sizeof msg, n, d->version ? d->version : "?");
 
     char decl[40];
     domain_set_str(d->domains ? d->domains : DOMAIN_KERNEL, decl, sizeof decl);
-    n = put(msg, sizeof msg, n, ", can run: ");
+    n = put(msg, sizeof msg, n, lstr(", can run: "));
     n = put(msg, sizeof msg, n, decl);
 
     if (d->flags & DRVF_DMA) {
         const char* why = domain_isolation_reason(1);
         if (why && drvuser_confined(d->name) == 0) {
-            n = put(msg, sizeof msg, n, " - DMA: ");
+            n = put(msg, sizeof msg, n, lstr(" - DMA: "));
             n = put(msg, sizeof msg, n, why);
         } else {
-            n = put(msg, sizeof msg, n, " - DMA, device confined");
+            n = put(msg, sizeof msg, n, lstr(" - DMA, device confined"));
         }
     } else if (d->flags & DRVF_BOOT_CRITICAL) {
-        n = put(msg, sizeof msg, n, " - boot-critical, cannot be moved");
+        n = put(msg, sizeof msg, n, lstr(" - boot-critical, cannot be moved"));
     }
     (void)n;
     w_label_set(dm_detail, msg);

@@ -701,6 +701,8 @@ CORE_C_SRCS := \
     kernel/core/taskstat.c \
     kernel/core/sysmon.c \
     kernel/core/block.c \
+    kernel/core/storage.c \
+    kernel/drivers/block/ramdisk.c \
     kernel/core/block_cache.c \
     kernel/core/lock.c \
     kernel/core/splash.c \
@@ -745,6 +747,8 @@ CORE_C_SRCS := \
     kernel/gui/apps/controlpanel.c \
     kernel/gui/apps/displaypanel.c \
     kernel/gui/apps/devicepanel.c \
+    kernel/gui/apps/netpanel.c \
+    kernel/gui/apps/diskpanel.c \
     kernel/gui/apps/accountspanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
@@ -783,6 +787,8 @@ CORE_C_SRCS := \
     kernel/core/net.c \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \
+    kernel/core/net_state.c \
+    kernel/drivers/net/wifisim.c \
     kernel/core/futex.c \
     kernel/core/workqueue.c \
     kernel/core/ktime.c \
@@ -841,6 +847,8 @@ CORE_C_SRCS := \
     kernel/core/net.c \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \
+    kernel/core/net_state.c \
+    kernel/drivers/net/wifisim.c \
     kernel/core/audio.c \
     kernel/core/random.c \
     kernel/core/fd.c \
@@ -857,6 +865,8 @@ CORE_C_SRCS := \
     kernel/core/multiboot.c \
     kernel/core/module.c \
     kernel/core/block.c \
+    kernel/core/storage.c \
+    kernel/drivers/block/ramdisk.c \
     kernel/core/task.c \
     kernel/core/taskstat.c \
     kernel/core/sysmon.c \
@@ -938,6 +948,8 @@ CORE_C_SRCS := \
     kernel/gui/apps/controlpanel.c \
     kernel/gui/apps/displaypanel.c \
     kernel/gui/apps/devicepanel.c \
+    kernel/gui/apps/netpanel.c \
+    kernel/gui/apps/diskpanel.c \
     kernel/gui/apps/accountspanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
@@ -1024,6 +1036,8 @@ CORE_C_SRCS := \
     kernel/core/taskstat.c \
     kernel/core/sysmon.c \
     kernel/core/block.c \
+    kernel/core/storage.c \
+    kernel/drivers/block/ramdisk.c \
     kernel/core/block_cache.c \
     kernel/core/lock.c \
     kernel/core/splash.c \
@@ -1068,6 +1082,8 @@ CORE_C_SRCS := \
     kernel/gui/apps/controlpanel.c \
     kernel/gui/apps/displaypanel.c \
     kernel/gui/apps/devicepanel.c \
+    kernel/gui/apps/netpanel.c \
+    kernel/gui/apps/diskpanel.c \
     kernel/gui/apps/accountspanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
@@ -1106,6 +1122,8 @@ CORE_C_SRCS := \
     kernel/core/net.c \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \
+    kernel/core/net_state.c \
+    kernel/drivers/net/wifisim.c \
     kernel/drivers/audio/ac97.c \
     kernel/core/audio.c \
     kernel/core/futex.c \
@@ -2602,13 +2620,19 @@ $(OBJ_DIR)/user/netsurf_res_blob.o: user/netsurf_res.bin
 # -fno-common anyway; stating it means the build does not depend on that.
 MODULE_CFLAGS := $(CFLAGS) $(INCLUDES) -DDOS_MODULE_BUILD -fno-common
 
+# -MMD -MP HERE TOO (§M87).  The kernel's objects tracked their headers since
+# §M65 and the modules did not, so `net.h` grew four fields, the kernel was
+# rebuilt against the new layout, and the loopback module kept the old one —
+# `ifconfig` then read `dev->link` past the end of the module's struct and
+# jumped through it (EXCEPTION 5 at a garbage eip, then an NMI).  The .d file
+# sits next to the .ko and is included below.
 $(BUILD_DIR)/modules/%.ko: kernel/drivers/audio/%.c
 	@mkdir -p $(@D)
-	$(CC) $(MODULE_CFLAGS) -c $< -o $@
+	$(CC) $(MODULE_CFLAGS) -MMD -MP -MF $@.d -c $< -o $@
 
 $(BUILD_DIR)/modules/%.ko: kernel/drivers/net/%.c
 	@mkdir -p $(@D)
-	$(CC) $(MODULE_CFLAGS) -c $< -o $@
+	$(CC) $(MODULE_CFLAGS) -MMD -MP -MF $@.d -c $< -o $@
 
 # The modules this build ships.  `hda` is the demonstration and it is a REAL
 # one: Intel HDA is a full audio controller — MMIO BAR, codec verb interface,
@@ -2743,6 +2767,7 @@ clean-all:
 # The dependency files produced above.  `-include` (not `include`) so a fresh
 # tree with no .d files yet is not an error.
 -include $(shell find $(OBJ_DIR) -name '*.d' 2>/dev/null)
+-include $(wildcard $(BUILD_DIR)/modules/*.ko.d)
 
 # --- vector fonts (§M69) ---------------------------------------------------
 # The generated tables are COMMITTED, exactly like assets/icons_vector.c: an

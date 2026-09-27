@@ -369,6 +369,12 @@ int config_attach_persistent(const char* dir) {
     int loaded = config_load_path(persist_path);
     if (loaded == 0) {
         kprintf("config: persistent store %s loaded\n", persist_path);
+        /* §M87 — the settings (and the user store, the shortcuts and the
+         * package store beside them) live on this volume from now on, so the
+         * disk manager must not be able to unmount or format it underneath
+         * them.  The hold NAMES the dependency, which is what a refused
+         * "Unmount" says to the person who pressed it. */
+        vfs_mount_hold(dir, "the settings store");
         return 0;
     }
 
@@ -378,6 +384,7 @@ int config_attach_persistent(const char* dir) {
      * failure, which is the exact bug this milestone exists to remove. */
     if (save_to(persist_path) == 0) {
         kprintf("config: persistent store %s created\n", persist_path);
+        vfs_mount_hold(dir, "the settings store");          /* §M87 */
         return 0;
     }
 

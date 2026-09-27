@@ -84,6 +84,10 @@ void bcache_mark_dirty(struct bcache_buf* b);
  * (in which case the corresponding `dirty` flag is left set). */
 int  bcache_sync(struct block_device* dev);
 
+/* §M87 — write back, then DROP every cached sector of `dev` (umount, format,
+ * a removed disk).  Returns how many slots were still held and kept. */
+int  bcache_invalidate(struct block_device* dev);
+
 /* Diagnostic snapshot — used by `bctest` and a future /proc/blockcache. */
 struct bcache_stats {
     uint32_t slots;

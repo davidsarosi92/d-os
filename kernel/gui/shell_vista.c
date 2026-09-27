@@ -28,6 +28,9 @@
 #include "klog.h"          /* a drag must leave evidence on the serial log */
 #include "icons.h"         /* ICON_APP — the item_entry's default glyph */
 #include "audio.h"         /* §M23 — the taskbar sound indicator */
+#include "net.h"           /* §M87 — the taskbar network indicator */
+#include "netui.h"
+#include "task.h"
 #include "gfx.h"
 #include "rtc.h"
 #include "keymap.h"
@@ -94,6 +97,11 @@
  * status indicator's flyout, not a settings page.  The Sound page in the
  * Control Panel is where the full set lives (§M63 renders it from the
  * CONFIG_KEY descriptors with no per-key UI code). */
+/* §M87 — the network indicator, between the sound one and the keyboard one:
+ * the order every desktop people know uses (network, volume, clock). */
+#define NET_W       (TRAY_ICON + TRAY_GAP)
+#define NETPOP_W    cp_px(250)
+#define NETPOP_MAX  8            /* networks the flyout lists                  */
 #define VOLPOP_W    180
 #define VOLPOP_H    76
 #define SM_W        (18 * cp_fw() + 24)
@@ -414,6 +422,8 @@ static char clock_str[CLOCK_STR_MAX] = "";
 static int vol_pop_open = 0;
 /* §M67 tail — keyboard indicator + its flyout. */
 static int kbd_pop_open = 0;
+/* §M87 — network indicator + its flyout. */
+static int net_pop_open = 0;
 
 /* The button's box, so draw and hit-test cannot disagree about where it is. */
 static void vol_box(int* x, int* y, int* w, int* h) {
@@ -455,7 +465,7 @@ static void kbd_collect(void) {
 
 /* The button's box — the same one-place rule as vol_box. */
 static void kbd_box(int* x, int* y, int* w, int* h) {
-    *x = scr_w - CLOCK_W - VOL_W - KBD_W;
+    *x = scr_w - CLOCK_W - VOL_W - NET_W - KBD_W;
     *y = scr_h - TASKBAR_H + (TASKBAR_H - KBD_ICON) / 2;
     *w = KBD_W;
     *h = KBD_ICON;
@@ -547,11 +557,216 @@ static void kbd_list_box(int* x, int* y, int* w, int* h) {
     *h = kb_list_h();
 }
 static int kbdpop_x(void) {
-    int x = scr_w - CLOCK_W - VOL_W - KBDPOP_W;
+    int x = scr_w - CLOCK_W - VOL_W - NET_W - KBDPOP_W;
     if (x < 0) x = 0;
     return x;
 }
 static int kbdpop_y(void) { return scr_h - TASKBAR_H - kbdpop_h(); }
+
+/* ---------------------------------------------------------------------------
+ * §M87 — THE NETWORK INDICATOR.
+ *
+ * Same rules as its two neighbours: ALWAYS DRAWN (a machine with no adapter
+ * shows the "no adapter" glyph rather than nothing — "there is no icon" is not
+ * a diagnosis), one flyout at a time, and the picture comes from ONE function,
+ * `net_get_state`, which the Network page and `netstate` also read.
+ *
+ * THE FLYOUT IS A LIST: the Wi-Fi networks in range (when there is a wireless
+ * adapter), then "Disconnect" while joined, then "Network settings".  An OPEN
+ * network joins on a click; a SECURED one opens the Wi-Fi window with it
+ * selected, because a passphrase needs a text field and chrome has none.
+ *
+ * NOTHING HERE WAITS.  A click is dispatched on the compositor with the WM
+ * lock held (§M22.7), and a radio scan or a join can take seconds.  So the
+ * click only records what was asked for, and `vista_second_tick` — which runs
+ * on the desktop task with no lock held — spawns the task that does it.  The
+ * cost is up to half a second before a scan starts, which the flyout covers
+ * with "Searching...".
+ * ------------------------------------------------------------------------- */
+
+static void net_box(int* x, int* y, int* w, int* h) {
+    *x = scr_w - CLOCK_W - VOL_W - NET_W;
+    *y = scr_h - TASKBAR_H + (TASKBAR_H - TRAY_ICON) / 2;
+    *w = NET_W;
+    *h = TRAY_ICON;
+}
+
+/* The icon for a state.  Wireless states draw the bars; everything else draws
+ * the wired glyph with the overlay that names the problem. */
+static int net_icon_for(const struct net_state* st) {
+    int wireless = st->dev && st->dev->wireless;
+    switch (st->state) {
+    case NETSTATE_WIRELESS:
+        return st->signal >= 66 ? ICON_WIFI_3 : st->signal >= 33 ? ICON_WIFI_2
+                                                               : ICON_WIFI_1;
+    case NETSTATE_WIRED:      return ICON_NET_WIRED;
+    case NETSTATE_NO_ADDRESS: return ICON_NET_NOADDR;
+    case NETSTATE_NO_LINK:    return wireless ? ICON_WIFI_OFF : ICON_NET_NOLINK;
+    case NETSTATE_DISABLED:   return ICON_NET_DISABLED;
+    default:                  return ICON_NET_NONE;
+    }
+}
+static int net_icon_seen = -1;    /* what the taskbar last drew — second_tick */
+
+/* The scan snapshot the flyout lists.  Filled by a task (netpop_scan_task)
+ * into the STAGING copy and swapped in by second_tick, so the painter never
+ * reads a list a scan is halfway through writing. */
+static struct wifi_network netpop_nets[NETPOP_MAX];
+static int netpop_n;
+static struct wifi_network netpop_stage[NETPOP_MAX];
+static volatile int netpop_stage_n;
+static volatile int netpop_scan_done;
+static volatile int netpop_scanning;
+static volatile int netpop_want_scan;
+static char netpop_want_join[WIFI_SSID_MAX];
+static volatile int netpop_want_leave;
+
+static void netpop_scan_task(void) {
+    struct net_device* d = net_first_wireless();
+    int k = (d && d->wireless->scan) ? d->wireless->scan(d, netpop_stage, NETPOP_MAX) : 0;
+    netpop_stage_n = k > 0 ? k : 0;
+    __atomic_store_n(&netpop_scan_done, 1, __ATOMIC_RELEASE);
+    task_exit();
+}
+
+static int netpop_joined(struct wifi_status* ws) {
+    struct net_device* d = net_first_wireless();
+    return d && d->wireless->status && d->wireless->status(d, ws) == 0 && ws->associated;
+}
+
+/* Rows: [networks] [Disconnect?] [Network settings]. */
+enum { NR_NET = 0, NR_LEAVE, NR_SETTINGS };
+static int netpop_rows(void) {
+    struct wifi_status ws;
+    return netpop_n + (netpop_joined(&ws) ? 1 : 0) + 1;
+}
+static int netpop_kind(int i, int* net_idx) {
+    struct wifi_status ws;
+    if (i < netpop_n) { *net_idx = i; return NR_NET; }
+    i -= netpop_n;
+    if (netpop_joined(&ws)) { if (i == 0) return NR_LEAVE; i--; }
+    return NR_SETTINGS;
+}
+
+static int np_count(void* c) { (void)c; return netpop_rows(); }
+static char np_row_lbl[WIFI_SSID_MAX + 24];
+static int np_get(void* c, int i, struct item_entry* out) {
+    (void)c;
+    if (i < 0 || i >= netpop_rows()) return -1;
+    int ni = -1;
+    switch (netpop_kind(i, &ni)) {
+    case NR_NET: {
+        const struct wifi_network* w = &netpop_nets[ni];
+        int n = 0;
+        for (int k = 0; w->ssid[k] && n < (int)sizeof np_row_lbl - 1; k++)
+            np_row_lbl[n++] = w->ssid[k];
+        if (w->security != WIFI_SEC_OPEN) {
+            const char* t = lstr("tray.secured");
+            np_row_lbl[n++] = ' ';
+            for (int k = 0; t[k] && n < (int)sizeof np_row_lbl - 1; k++)
+                np_row_lbl[n++] = t[k];
+        }
+        np_row_lbl[n] = 0;
+        out->label = np_row_lbl;
+        out->icon  = w->signal >= 66 ? ICON_WIFI_3 : w->signal >= 33 ? ICON_WIFI_2
+                                                                     : ICON_WIFI_1;
+        return 0;
+    }
+    case NR_LEAVE:
+        out->label = lstr("wifi.btn.disconnect");
+        out->icon  = ICON_WIFI_OFF;
+        out->group_start = 1;
+        return 0;
+    default:
+        out->label = lstr("tray.netsettings");
+        out->icon  = ICON_SETTINGS;
+        out->group_start = 1;
+        return 0;
+    }
+}
+static void np_activate(void* c, int i) {
+    (void)c;
+    int ni = -1;
+    switch (netpop_kind(i, &ni)) {
+    case NR_NET:
+        if (netpop_nets[ni].security == WIFI_SEC_OPEN) {
+            int k = 0;
+            for (; netpop_nets[ni].ssid[k] && k < WIFI_SSID_MAX - 1; k++)
+                netpop_want_join[k] = netpop_nets[ni].ssid[k];
+            netpop_want_join[k] = 0;
+        } else {
+            netui_open_wifi(netpop_nets[ni].ssid);   /* queues a window: safe here */
+        }
+        break;
+    case NR_LEAVE:    netpop_want_leave = 1; break;
+    default:          netui_open_panel(); break;
+    }
+}
+/* The joined network is the selection — the keyboard flyout's rule: what the
+ * list MEANS here is "which one is active", and the icon column carries it as
+ * a glyph too, so a screenshot shows it without the highlight. */
+static int np_active(void) {
+    struct wifi_status ws;
+    if (!netpop_joined(&ws)) return -1;
+    for (int i = 0; i < netpop_n; i++) {
+        const char* a = netpop_nets[i].ssid; const char* b = ws.ssid;
+        while (*a && *a == *b) { a++; b++; }
+        if (*a == *b) return i;
+    }
+    return -1;
+}
+static int np_row_h(void* c) { (void)c; return SM_ITEM_H; }
+static const struct item_model net_model = {
+    .count = np_count, .get = np_get, .activate = np_activate, .row_h = np_row_h,
+};
+
+/* Two lines of header: the title, and the state sentence. */
+#define NETPOP_HEAD (2 * cp_fh() + cp_px(20))
+
+static int net_list_h(void) {
+    const struct item_view* v = sm_view();
+    int rows = netpop_rows();
+    return (v && v->height_for) ? v->height_for(NETPOP_W, rows, &net_model) : 0;
+}
+static int netpop_h(void) {
+    int extra = (net_first_wireless() && netpop_scanning) ? cp_fh() + cp_px(8) : 0;
+    return NETPOP_HEAD + extra + net_list_h() + cp_px(6);
+}
+static int netpop_x(void) {
+    int x = scr_w - CLOCK_W - VOL_W - NETPOP_W;
+    return x < 0 ? 0 : x;
+}
+static int netpop_y(void) { return scr_h - TASKBAR_H - netpop_h(); }
+static void net_list_box(int* x, int* y, int* w, int* h) {
+    int extra = (net_first_wireless() && netpop_scanning) ? cp_fh() + cp_px(8) : 0;
+    *x = netpop_x() + cp_px(4);
+    *y = netpop_y() + NETPOP_HEAD + extra;
+    *w = NETPOP_W - cp_px(8);
+    *h = net_list_h();
+}
+
+/* The state sentence, shared by the flyout header. */
+static char netpop_line[80];
+static const char* net_state_line(void) {
+    struct net_state st;
+    net_get_state(&st);
+    int n = 0;
+    const char* a = lstr(net_state_name(st.state));
+    for (int k = 0; a[k] && n < (int)sizeof netpop_line - 1; k++) netpop_line[n++] = a[k];
+    if (st.dev && n < (int)sizeof netpop_line - 20) {
+        netpop_line[n++] = ' '; netpop_line[n++] = '-'; netpop_line[n++] = ' ';
+        const char* nm = st.dev->name;
+        for (int k = 0; nm[k] && n < (int)sizeof netpop_line - 1; k++) netpop_line[n++] = nm[k];
+        if (st.dev->ip) {
+            char ip[16];
+            net_fmt_ip(st.dev->ip, ip);
+            netpop_line[n++] = ' ';
+            for (int k = 0; ip[k] && n < (int)sizeof netpop_line - 1; k++) netpop_line[n++] = ip[k];
+        }
+    }
+    netpop_line[n] = 0;
+    return netpop_line;
+}
 
 static int volpop_x(void) {
     int x = scr_w - CLOCK_W - VOLPOP_W;
@@ -752,6 +967,8 @@ static void publish_popup(void) {
                                                VOLPOP_W, VOLPOP_H);
     else if (kbd_pop_open) gui_panel_set_popup(1, kbdpop_x(), kbdpop_y(),
                                                KBDPOP_W, kbdpop_h());
+    else if (net_pop_open) gui_panel_set_popup(1, netpop_x(), netpop_y(),
+                                               NETPOP_W, netpop_h());
     else                   gui_panel_set_popup(0, 0, 0, 0, 0);
 }
 
@@ -874,6 +1091,7 @@ static void vista_init(int w, int h) {
     menu_hover = -1;
     vol_pop_open = 0;
     kbd_pop_open = 0;
+    net_pop_open = 0;
     clock_str[0] = 0;
     publish_popup();
 
@@ -961,6 +1179,39 @@ static void vista_draw(struct gfx_surface* back) {
         icon_draw(back, vx + (vw - VOL_ICON) / 2, vy, VOL_ICON, vol_icon_id());
     }
 
+    /* §M87 — the network indicator.  ALWAYS drawn, same argument. */
+    {
+        int nx, ny, nw, nh;
+        net_box(&nx, &ny, &nw, &nh);
+        struct net_state st;
+        net_get_state(&st);
+        int id = net_icon_for(&st);
+        net_icon_seen = id;
+        icon_draw(back, nx + (nw - TRAY_ICON) / 2, ny, TRAY_ICON, id);
+    }
+
+    /* §M87 — the network flyout. */
+    if (net_pop_open) {
+        int px = netpop_x(), py = netpop_y(), ph = netpop_h();
+        gfx_fill(back, px, py, NETPOP_W, ph, COL_SM_BG);
+        gfx_fill(back, px, py, NETPOP_W, 1, COL_TB_HILITE);
+        gfx_fill(back, px, py, 1, ph, COL_TB_HILITE);
+        gfx_fill(back, px + NETPOP_W - 1, py, 1, ph, 0xFF141B26u);
+        cp_text(back, px + cp_px(10), py + cp_px(7), lstr("tray.network"),
+                COL_TB_HILITE);
+        cp_text(back, px + cp_px(10), py + cp_px(11) + cp_fh(), net_state_line(),
+                COL_TEXT);
+        gfx_fill(back, px + cp_px(8), py + NETPOP_HEAD - 1,
+                 NETPOP_W - cp_px(16), 1, COL_SEP);
+        if (net_first_wireless() && netpop_scanning)
+            cp_text(back, px + cp_px(10), py + NETPOP_HEAD + cp_px(4),
+                    lstr("tray.searching"), COL_TB_HILITE);
+        int bx, by, bw, bh;
+        net_list_box(&bx, &by, &bw, &bh);
+        const struct item_view* v = sm_view();
+        if (v && v->draw) v->draw(back, bx, by, bw, bh, &net_model, np_active(), 0);
+    }
+
     /* §M67 tail — the keyboard indicator: icon + the active layout's name.
      * ALWAYS DRAWN, for the reason the sound button is: a control that
      * disappears leaves nothing to point at.  The name is upper-cased because
@@ -1031,13 +1282,14 @@ static void vista_draw(struct gfx_surface* back) {
         int pct = (vol * 100 + 128) / 256;
 
         if (!audio_available()) {
-            cp_text(back, px + 10, py + 12, "No audio device", COL_TEXT);
-            cp_text(back, px + 10, py + 30, "nothing to play through", COL_TB_HILITE);
+            cp_text(back, px + 10, py + 12, lstr("tray.noaudio"), COL_TEXT);
+            cp_text(back, px + 10, py + 30, lstr("tray.noaudio2"), COL_TB_HILITE);
         } else {
             char line[24];
             int n = 0;
-            const char* lbl = "Volume ";
-            for (int i = 0; lbl[i]; i++) line[n++] = lbl[i];
+            const char* lbl = lstr("tray.volume");
+            for (int i = 0; lbl[i] && n < 16; i++) line[n++] = lbl[i];
+            line[n++] = ' ';
             if (pct >= 100) { line[n++] = '1'; line[n++] = '0'; line[n++] = '0'; }
             else if (pct >= 10) { line[n++] = (char)('0' + pct / 10); line[n++] = (char)('0' + pct % 10); }
             else line[n++] = (char)('0' + pct);
@@ -1054,7 +1306,7 @@ static void vista_draw(struct gfx_surface* back) {
             gfx_fill(back, tx + (fill ? fill - 2 : 0), tyy - 3, 4, 12,
                      muted ? 0xFF8B94A6u : COL_TEXT);
 
-            cp_text(back, px + 10, py + 52, muted ? "[ Unmute ]" : "[ Mute ]", COL_TEXT);
+            cp_text(back, px + 10, py + 52, lstr(muted ? "tray.unmute" : "tray.mute"), COL_TEXT);
         }
     }
 
@@ -1201,6 +1453,51 @@ static int vista_click(int x, int y) {
         /* fall through: a click outside only dismissed the flyout */
     }
 
+    /* §M87 — the network flyout, under the same popup rule. */
+    if (net_pop_open) {
+        int px = netpop_x(), py = netpop_y(), ph = netpop_h();
+        int inside = (x >= px && x < px + NETPOP_W && y >= py && y < py + ph);
+        if (inside) {
+            int bx, by, bw, bh;
+            net_list_box(&bx, &by, &bw, &bh);
+            const struct item_view* v = sm_view();
+            int idx = (v && v->hit) ? v->hit(x - bx, y - by, bw, bh, &net_model, 0)
+                                    : -1;
+            if (idx >= 0) {
+                np_activate(NULL, idx);
+                net_pop_open = 0;
+                publish_popup();
+                gui_request_frame();
+                return 1;
+            }
+        }
+        net_pop_open = 0;
+        publish_popup();
+        gui_request_frame();
+        if (inside) return 1;
+    }
+
+    /* The network button itself. */
+    {
+        int nx, ny, nw, nh;
+        net_box(&nx, &ny, &nw, &nh);
+        if (x >= nx && x < nx + nw && y >= scr_h - TASKBAR_H) {
+            net_pop_open = !net_pop_open;
+            if (net_pop_open) {
+                /* Show what the last scan found at once and ask for a fresh
+                 * one; second_tick starts it OFF this lock. */
+                netpop_want_scan = 1;
+                netpop_scanning = net_first_wireless() != NULL;
+            }
+            vol_pop_open = 0;
+            kbd_pop_open = 0;
+            menu_open = 0;
+            publish_popup();
+            gui_request_frame();
+            return 1;
+        }
+    }
+
     /* The sound button itself. */
     {
         int vx, vy, vw, vh;
@@ -1208,6 +1505,7 @@ static int vista_click(int x, int y) {
         if (x >= vx && x < vx + vw && y >= scr_h - TASKBAR_H) {
             vol_pop_open = !vol_pop_open;
             kbd_pop_open = 0;
+            net_pop_open = 0;
             menu_open = 0;                       /* one popup at a time */
             publish_popup();
             gui_request_frame();
@@ -1223,6 +1521,7 @@ static int vista_click(int x, int y) {
             kbd_pop_open = !kbd_pop_open;
             if (kbd_pop_open) kbd_collect();   /* snapshot for draw + hit test */
             vol_pop_open = 0;
+            net_pop_open = 0;
             menu_open = 0;
             publish_popup();
             gui_request_frame();
@@ -1266,6 +1565,7 @@ static int vista_click(int x, int y) {
         menu_hover = -1;
         vol_pop_open = 0;
         kbd_pop_open = 0;
+        net_pop_open = 0;
         publish_popup();
         return 1;
         }
@@ -1292,9 +1592,47 @@ static int put2(char* s, int p, unsigned v) {
     return p + 2;
 }
 
+/* §M87 — the network indicator's deferred work, run from second_tick on the
+ * desktop task (no WM lock).  Returns 1 when the chrome must be redrawn. */
+static int net_tray_tick(void) {
+    int dirty = 0;
+    if (netpop_want_scan) {
+        netpop_want_scan = 0;
+        if (net_first_wireless()) {
+            netpop_scan_done = 0;
+            if (!task_spawn_detached("wifi-scan", netpop_scan_task))
+                netpop_scanning = 0;
+        }
+    }
+    if (__atomic_load_n(&netpop_scan_done, __ATOMIC_ACQUIRE)) {
+        netpop_scan_done = 0;
+        int k = netpop_stage_n;
+        for (int i = 0; i < k; i++) netpop_nets[i] = netpop_stage[i];
+        netpop_n = k;
+        netpop_scanning = 0;
+        if (net_pop_open) publish_popup();       /* its height changed */
+        dirty = 1;
+    }
+    if (netpop_want_join[0]) {
+        if (netui_wifi_join_async(netpop_want_join) == 0) netpop_want_join[0] = 0;
+    }
+    if (netpop_want_leave) {
+        if (netui_wifi_leave_async() == 0) netpop_want_leave = 0;
+    }
+    /* The icon follows the state: a cable pulled, an adapter disabled from a
+     * prompt, a network joined — each changes the picture within a tick, and
+     * only a CHANGE costs a repaint. */
+    struct net_state st;
+    net_get_state(&st);
+    if (net_icon_for(&st) != net_icon_seen) dirty = 1;
+    if (net_pop_open) { publish_popup(); dirty = 1; }
+    return dirty;
+}
+
 static int vista_second_tick(void) {
+    int net_dirty = net_tray_tick();
     struct rtc_time t;
-    if (rtc_read(&t) != 0) return 0;
+    if (rtc_read(&t) != 0) return net_dirty;
 
     /* "YYYY-MM-DD  HH:MM:SS" — ISO date (unambiguous in every locale) and the
      * wall clock.  The keyboard layout USED to be appended here and now has its
@@ -1321,7 +1659,7 @@ static int vista_second_tick(void) {
             return 1;
         }
     }
-    return 0;
+    return net_dirty;
 }
 
 DESKTOP_SHELL(vista) = {

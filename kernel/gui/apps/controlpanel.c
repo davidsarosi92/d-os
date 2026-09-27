@@ -54,7 +54,7 @@ static int cp_get(void* ctx, int i, struct item_entry* out) {
      * registration would detach every setting from its panel.  Same rule as
      * the app names in the Start menu — the English string is the key. */
     out->label = lstr(p->name);
-    out->sub   = p->summary;
+    out->sub   = p->summary ? lstr(p->summary) : NULL;   /* §M87 */
     out->icon  = p->icon ? p->icon : ICON_SETTINGS;
     out->dim   = 0;
     return 0;
@@ -79,7 +79,9 @@ static int cp_cell(void* ctx, int i, int c, char* out, int cap) {
     (void)ctx;
     const struct settings_panel* p = settings_panel_at(i);
     if (!p || cap <= 0) { if (cap) out[0] = 0; return -1; }
-    const char* src = (c == 0) ? p->name : (p->summary ? p->summary : "");
+    /* §M87 — both cells are interface words: translated (the name was
+     * translated in the list view and left English in the table). */
+    const char* src = lstr((c == 0) ? p->name : (p->summary ? p->summary : ""));
     int k = 0;
     for (; src[k] && k < cap - 1; k++) out[k] = src[k];
     out[k] = 0;

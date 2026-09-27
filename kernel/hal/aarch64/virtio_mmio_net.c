@@ -196,6 +196,13 @@ static void vnet_poll(struct net_device* dev) {
     if (r32(R_INTSTATUS) & 1) w32(R_INTACK, 1);
 }
 
+/* §M87 — carrier from the config-space status word (after mac[6]). */
+static int g_has_status;
+static int vnet_link(struct net_device* dev) {
+    (void)dev;
+    return (*(volatile uint16_t*)(g_base + R_CONFIG + 6) & 1) != 0;
+}
+
 int virtio_mmio_net_init(void) {
     for (int i = 0; i < board_virtio_count(); i++) {
         uintptr_t base = (uintptr_t)board_virtio_base(i);
@@ -219,7 +226,10 @@ int virtio_mmio_net_init(void) {
     int have_mac = (feat_lo >> VIRTIO_NET_F_MAC_BIT) & 1;
     w32(R_DEVFEATSEL, 1); (void)r32(R_DEVFEAT);
     w32(R_DRVFEATSEL, 1); w32(R_DRVFEAT, 1u << VIRTIO_F_VERSION_1_BIT);
-    w32(R_DRVFEATSEL, 0); w32(R_DRVFEAT, have_mac ? (1u << VIRTIO_NET_F_MAC_BIT) : 0);
+    /* §M87 — STATUS (bit 16) when offered: the carrier the panel reports. */
+    g_has_status = (feat_lo >> 16) & 1;
+    w32(R_DRVFEATSEL, 0); w32(R_DRVFEAT, (have_mac ? (1u << VIRTIO_NET_F_MAC_BIT) : 0)
+                                         | (g_has_status ? (1u << 16) : 0));
 
     w32(R_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK);
     if (!(r32(R_STATUS) & ST_FEATURES_OK)) {
@@ -257,6 +267,7 @@ int virtio_mmio_net_init(void) {
     g_eth0.mtu      = ETH_MTU;
     g_eth0.transmit = vnet_transmit;
     g_eth0.poll     = vnet_poll;
+    g_eth0.link     = g_has_status ? vnet_link : NULL;
     net_register(&g_eth0);
 
     kprintf("virtio-net: up at mmio %x (mac from %s)\n",

@@ -53,6 +53,7 @@
  * ============================================================================= */
 
 #include "gui.h"
+#include "locale.h"
 #include "widget.h"
 #include "itemview.h"
 #include "icons.h"
@@ -221,7 +222,7 @@ static int lock_try(const char* user, const char* pass) {
         if (g_lock.status) {
             static char m[96];
             int n = 0;
-            const char* a = "Incorrect password for '";
+            const char* a = lstr("Incorrect password for '");
             for (int i = 0; a[i] && n < 94; i++) m[n++] = a[i];
             for (int i = 0; user[i] && n < 92; i++) m[n++] = user[i];
             m[n++] = '\'';
@@ -246,18 +247,18 @@ static int lock_try(const char* user, const char* pass) {
                 const struct user_account* u = user_by_name(user);
                 int plen = 0;
                 while (pass && pass[plen]) plen++;
-                const char* b = (u && !u->has_password)
+                const char* b = lstr((u && !u->has_password)
                     ? " - that account has no sign-in secret"
-                    : " - ";
+                    : " - ");
                 for (int i = 0; b[i] && n < 88; i++) m[n++] = b[i];
                 if (!(u && !u->has_password)) {
                     if (plen == 0) {
-                        const char* z = "nothing was typed";
+                        const char* z = lstr("nothing was typed");
                         for (int i = 0; z[i] && n < 92; i++) m[n++] = z[i];
                     } else {
                         if (plen >= 10) m[n++] = (char)('0' + plen / 10);
                         m[n++] = (char)('0' + plen % 10);
-                        const char* z = " char(s) received, fp ";
+                        const char* z = lstr(" char(s) received, fp ");
                         for (int i = 0; z[i] && n < 92; i++) m[n++] = z[i];
                         /* The other end of the fingerprint — see users.h.  If
                          * this differs from the one the accounts panel printed,
@@ -626,8 +627,8 @@ CONFIG_KEY(ck_gui_locktest) = {
     .scope = CFG_SCOPE_MACHINE,
 };
 
-CONFIG_KEY(ck_gui_login) = {
-    .key = "gui.login", .group = "System", .type = CFG_BOOL, .def = "0",
-    .help = "require authentication before the desktop can be used",
-    .scope = CFG_SCOPE_MACHINE,
-};
+/* `gui.login` WAS HERE and is gone (2026-09-27): the desktop now asks who you
+ * are whenever more than the first-run root account exists
+ * (users_greeter_needed), so the key had no reader left — and a switch in the
+ * System panel that changes nothing is worse than no switch, because the next
+ * person to flip it concludes the sign-in screen is broken. */

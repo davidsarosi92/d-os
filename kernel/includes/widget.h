@@ -300,7 +300,7 @@ int  w_box_scroll_by(struct widget* w, int dl);
 /* ---- Label ---------------------------------------------------------------- */
 struct w_label {
     struct widget base;
-    char     text[96];
+    char     text[160];     /* §M87 — 96 cut the longer translated sentences */
     /* The RIGHT-HAND half of a caption band.  The design's table footer is two
      * sided — a count on the left and a total on the right — and two labels in
      * one box would each paint their own `tray` band over the other's.  Empty

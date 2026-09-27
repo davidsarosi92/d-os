@@ -24,6 +24,7 @@
  * ============================================================================= */
 
 #include "gui.h"
+#include "locale.h"   /* §M87 — translated fragments */
 #include "gui_app.h"
 #include "icons.h"
 #include "widget.h"
@@ -103,7 +104,7 @@ static void dlg_tick(struct gui_window* win) {
     if (dlg_count) {
         char msg[64];
         int n = 0;
-        const char* a = "Keeping this resolution in ";
+        const char* a = lstr("Keeping this resolution in ");
         for (int i = 0; a[i] && n < (int)sizeof msg - 8; i++) msg[n++] = a[i];
         int v = dlg_left;
         if (v >= 10) msg[n++] = (char)('0' + v / 10);
@@ -320,7 +321,7 @@ static int dp_get(void* ctx, int i, struct item_entry* out) {
     int cw = 0, chh = 0;
     gui_current_mode(&cw, &chh);
     out->label = dp_labels[i];
-    out->sub   = (m.w == cw && m.h == chh) ? "current" : NULL;
+    out->sub   = (m.w == cw && m.h == chh) ? lstr("current") : NULL;
     out->icon  = ICON_DISPLAY;
     out->dim   = 0;
     return 0;

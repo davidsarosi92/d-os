@@ -24,6 +24,7 @@
  * ============================================================================= */
 
 #include "vfs.h"
+#include "block_cache.h"
 #include "kmutex.h"
 #include "cred.h"
 #include "audit.h"
@@ -217,6 +218,33 @@ struct dentry* vfs_attach_child(struct dentry* parent, const char* name, struct 
     return NS_LOCKED(struct dentry*, vfs_attach_child_unlocked(parent, name, inode));
 }
 
+/* §M87 — take `name` out of `parent`'s directory listing WITHOUT freeing it.
+ *
+ * For a device that goes away (a removed RAM disk): its /dev entry must stop
+ * being findable, but a task may still hold it open, and both `struct file`
+ * fields point into it (`inode`, and `dentry`, which vfs_close walks to find
+ * the mount).  Freeing either would turn that close into a use-after-free.
+ * So the dentry is unlinked and ORPHANED: its parent pointer stays (the walk
+ * still ends at the right mount), its memory stays, and the caller gets the
+ * inode back to neuter.  A few hundred bytes per removed device, on purpose. */
+struct inode* vfs_orphan_child(struct dentry* parent, const char* name) {
+    struct inode* ino = NULL;
+    kmutex_lock(&ns_lock);
+    struct dentry** pp = parent ? &parent->children : NULL;
+    while (pp && *pp) {
+        if (streq((*pp)->name, name)) {
+            struct dentry* d = *pp;
+            *pp = d->sibling;
+            d->sibling = NULL;
+            ino = d->inode;
+            break;
+        }
+        pp = &(*pp)->sibling;
+    }
+    kmutex_unlock(&ns_lock);
+    return ino;
+}
+
 /* ------------------------------------------------------------------- */
 /* Mount.                                                               */
 /* ------------------------------------------------------------------- */
@@ -232,6 +260,18 @@ struct dentry* vfs_attach_child(struct dentry* parent, const char* name, struct 
 #define VFS_MAX_MOUNTS 8
 static struct vfs_mount g_mounts[VFS_MAX_MOUNTS];
 static int g_nmounts;
+
+/* §M87 — the mount a dentry lives under: the nearest ancestor (or itself)
+ * that is a mountpoint.  Walked upward, so the innermost mount wins, which is
+ * the right answer for a nested mount.  Caller holds ns_lock. */
+static struct vfs_mount* mount_of_dentry(struct dentry* d) {
+    for (; d; d = d->parent) {
+        for (int i = 0; i < g_nmounts; i++)
+            if (g_mounts[i].mp == d) return &g_mounts[i];
+        if (d->parent == d) break;
+    }
+    return NULL;
+}
 
 static int vfs_mount_unlocked(const char* fs_name, const char* path, const char* dev_name) {
     if (!fs_name || !path) return -1;
@@ -273,12 +313,23 @@ static int vfs_mount_unlocked(const char* fs_name, const char* path, const char*
      * dentry (vfs_init left mp->inode NULL there).  The previous inode
      * is leaked for now — ramfs bootstrap directories carry no payload,
      * and a proper umount path is a later milestone. */
-    if (mp != root) mp->inode = NULL;
+    /* §M87 — no longer leaked: remembered, and restored by umount.  Also
+     * refuse a second mount on the SAME dentry — the first one's tree would
+     * be silently shadowed and could then never be unmounted. */
+    for (int k = 0; k < g_nmounts; k++)
+        if (g_mounts[k].mp == mp && mp != root) {
+            kprintf("vfs_mount: %s is already a mountpoint\n", path);
+            return -6;
+        }
+    struct inode*  covered = (mp != root) ? mp->inode : NULL;
+    struct dentry* covered_children = (mp != root) ? mp->children : NULL;
+    if (mp != root) { mp->inode = NULL; mp->children = NULL; }
 
     /* Hand off to the fs to fill in the mountpoint. */
     int r = fs->mount(bdev, mp);
     if (r != 0) {
         kprintf("vfs_mount: %s->mount() failed: %d\n", fs_name, r);
+        if (mp != root) { mp->inode = covered; mp->children = covered_children; }
         return r;
     }
     /* Record it.  The ownership declaration is COPIED from the fs_type rather
@@ -291,6 +342,20 @@ static int vfs_mount_unlocked(const char* fs_name, const char* path, const char*
         m->path[i] = 0;
         m->fs_name         = fs->name;
         m->stores_ownership = fs->stores_ownership;
+        /* §M87 — enough to undo it: the device, the dentry, and what the
+         * mount covered (umount puts the placeholder directory back instead
+         * of leaving a mountpoint with no inode, which every later lookup
+         * would treat as a missing path). */
+        i = 0;
+        for (; dev_name && dev_name[i] && i < (int)sizeof m->dev_name - 1; i++)
+            m->dev_name[i] = dev_name[i];
+        m->dev_name[i]      = 0;
+        m->open_files       = 0;
+        m->hold             = NULL;
+        m->mp               = mp;
+        m->covered_inode    = covered;
+        m->covered_children = covered_children;
+        m->fs               = fs;
     }
 
     if (dev_name) kprintf("vfs: mounted %s (%s) at %s\n", fs_name, dev_name, path);
@@ -365,6 +430,8 @@ static struct file* vfs_open_unlocked(const char* path, int flags) {
     f->dentry = d;
     f->flags  = flags;
     f->pos    = 0;
+    struct vfs_mount* m = mount_of_dentry(d);
+    if (m) m->open_files++;
     return f;
 }
 struct file* vfs_open(const char* path, int flags) {
@@ -374,6 +441,13 @@ struct file* vfs_open(const char* path, int flags) {
 int vfs_close(struct file* f) {
     if (!f) return -1;
     if (f->inode && f->inode->ops && f->inode->ops->close) f->inode->ops->close(f);
+    /* §M87 — the mount is found again from the dentry rather than remembered
+     * in the file: mount records move when one is removed, and a pointer kept
+     * across that would decrement somebody else's count. */
+    kmutex_lock(&ns_lock);
+    struct vfs_mount* m = f->dentry ? mount_of_dentry(f->dentry) : NULL;
+    if (m && m->open_files > 0) m->open_files--;
+    kmutex_unlock(&ns_lock);
     kfree(f);
     return 0;
 }
@@ -773,6 +847,109 @@ int vfs_ownership_is_persistent(const char* path) {
     const struct vfs_mount* m = vfs_mount_for(path);
     if (!m) return -1;
     return m->stores_ownership ? 1 : 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * §M87 — UMOUNT.
+ *
+ * There was none: mounts were made at boot and lived until power-off, which
+ * is why the mount record could be a table that only ever grew.  A disk
+ * manager needs the other half — a volume must be detachable before it is
+ * formatted, and a removable one before it is removed.
+ *
+ * REFUSAL IS THE COMMON CASE AND EACH REASON IS NAMED.  An open file below the
+ * mountpoint, a mount nested inside it, or a subsystem that depends on it (the
+ * settings store lives on /mnt) — any of these makes an unmount a use-after-
+ * free waiting to happen, so it is refused with the reason rather than forced.
+ * There is no "lazy" unmount: a detach that finishes "later, when nobody is
+ * looking" is a teardown with no owner.
+ *
+ * ORDER: the fs writes back and frees its volume state FIRST (while the tree
+ * still exists, so a refusal leaves everything intact), then the VFS frees the
+ * dentries and inodes, then the placeholder the mount covered is put back.
+ * ------------------------------------------------------------------------- */
+
+static void free_tree(struct dentry* d, struct fs_type* fs) {
+    struct dentry* c = d->children;
+    while (c) {
+        struct dentry* next = c->sibling;
+        free_tree(c, fs);
+        if (c->inode) {
+            if (fs && fs->evict) fs->evict(c->inode);
+            kfree(c->inode);
+        }
+        kfree(c);
+        c = next;
+    }
+    d->children = NULL;
+}
+
+static int path_is_below(const char* inner, const char* outer) {
+    int n = 0;
+    while (outer[n]) n++;
+    for (int k = 0; k < n; k++) if (inner[k] != outer[k]) return 0;
+    return inner[n] == '/' && inner[n + 1] != 0;
+}
+
+static int vfs_umount_unlocked(const char* path) {
+    int idx = -1;
+    for (int i = 0; i < g_nmounts; i++)
+        if (streq(g_mounts[i].path, path)) idx = i;
+    if (idx < 0 || streq(path, "/")) return -1;
+    struct vfs_mount* m = &g_mounts[idx];
+    if (m->hold) return -4;
+    if (m->open_files > 0) return -2;
+    for (int i = 0; i < g_nmounts; i++)
+        if (i != idx && path_is_below(g_mounts[i].path, path)) return -3;
+    if (!m->fs || !m->fs->umount) return -5;
+    if (m->fs->umount(m->mp) != 0) return -5;
+
+    struct dentry* mp = m->mp;
+    free_tree(mp, m->fs);
+    if (mp->inode) {
+        if (m->fs->evict) m->fs->evict(mp->inode);
+        kfree(mp->inode);
+    }
+    mp->inode    = m->covered_inode;
+    mp->children = m->covered_children;
+
+    /* The block cache still holds the volume's sectors.  Written back by the
+     * fs's umount; DROPPED here, so a disk that is formatted or replaced next
+     * is read fresh instead of through a cache of the old contents. */
+    if (m->dev_name[0]) {
+        struct block_device* bd = blk_find(m->dev_name);
+        if (bd) { bcache_sync(bd); bcache_invalidate(bd); }
+    }
+    kprintf("vfs: unmounted %s%s%s\n", path, m->dev_name[0] ? " from " : "",
+            m->dev_name);
+    for (int i = idx; i + 1 < g_nmounts; i++) g_mounts[i] = g_mounts[i + 1];
+    g_nmounts--;
+    return 0;
+}
+int vfs_umount(const char* path) {
+    return NS_LOCKED(int, vfs_umount_unlocked(path));
+}
+
+int vfs_mount_hold(const char* path, const char* who) {
+    int r = -1;
+    kmutex_lock(&ns_lock);
+    for (int i = 0; i < g_nmounts; i++)
+        if (streq(g_mounts[i].path, path)) { g_mounts[i].hold = who; r = 0; }
+    kmutex_unlock(&ns_lock);
+    return r;
+}
+
+const struct vfs_mount* vfs_mount_of_dev(const char* dev_name) {
+    if (!dev_name || !dev_name[0]) return NULL;
+    for (int i = 0; i < g_nmounts; i++)
+        if (streq(g_mounts[i].dev_name, dev_name)) return &g_mounts[i];
+    return NULL;
+}
+
+int vfs_statfs(const char* path, uint64_t* total, uint64_t* free) {
+    const struct vfs_mount* m = vfs_mount_for(path);
+    if (!m || !m->fs || !m->fs->statfs) return -1;
+    return m->fs->statfs(m->mp, total, free);
 }
 
 /* ---------------------------------------------------------------------------

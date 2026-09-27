@@ -10,6 +10,7 @@
  * ============================================================================= */
 
 #include "block.h"
+#include "block_cache.h"
 #include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "vfs.h"
 #include "devfs.h"
@@ -75,8 +76,14 @@ int blk_register(struct block_device* dev) {
     /* Publish it as a file.  A failure here is not fatal: the block device
      * still works for mounts and for `blk`, it simply has no /dev entry —
      * and the log says which of the two happened. */
-    if (blk_node_count < BLK_MAX_DEVFS) {
-        struct devfs_node* nd = &blk_nodes[blk_node_count++];
+    /* §M87 — a slot freed by blk_unregister is reused, so creating and
+     * destroying RAM disks does not use up the table. */
+    int slot = -1;
+    for (int i = 0; i < blk_node_count; i++)
+        if (!blk_nodes[i].ctx) { slot = i; break; }
+    if (slot < 0 && blk_node_count < BLK_MAX_DEVFS) slot = blk_node_count++;
+    if (slot >= 0) {
+        struct devfs_node* nd = &blk_nodes[slot];
         nd->name  = dev->name;
         nd->kind  = DEVFS_BLOCK;
         nd->read  = blk_devfs_read;
@@ -185,6 +192,26 @@ void blk_for_each(blk_iter_fn fn, void* ctx) {
  * order, so a machine with both a virtio disk and a SATA one keeps mounting the
  * virtio one it mounted yesterday.  A rule that reordered volumes between boots
  * would move where settings live without anybody asking. */
+/* §M87 — withdraw a device (a destroyed RAM disk).  The CALLER guarantees it
+ * is not mounted (the disk manager checks vfs_mount_of_dev first); this drops
+ * its cached sectors, its /dev entry and its registry link.  0, or -1 when it
+ * was not registered. */
+int blk_unregister(struct block_device* dev) {
+    struct block_device** pp = &head;
+    while (*pp && *pp != dev) pp = &(*pp)->next;
+    if (!*pp) return -1;
+    bcache_invalidate(dev);
+    for (int i = 0; i < blk_node_count; i++)
+        if (blk_nodes[i].ctx == dev) {
+            devfs_unregister(&blk_nodes[i]);
+            blk_nodes[i].ctx = NULL;
+        }
+    *pp = dev->next;
+    dev->next = NULL;
+    kprintf("blk: %s unregistered\n", dev->name);
+    return 0;
+}
+
 int blk_mount_first(const char* fs, const char* at, const char** out_name) {
     for (struct block_device* d = head; d; d = d->next) {
         if (vfs_mount(fs, at, d->name) == 0) {

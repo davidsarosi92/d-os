@@ -1,4 +1,16 @@
-# Where things stand (2026-09-24)
+# Where things stand (2026-09-27)
+
+## §M87 shipped — network and storage in the Control Panel (DOCS §4.103)
+
+Network page + taskbar network indicator + Wi-Fi chooser (a SIMULATED adapter,
+`wifisim on`, because QEMU has no Wi-Fi), Disks page (`disk` on a console):
+mount / unmount / format / RAM disks.  `locale missing on` + `locale missing`
+measures untranslated strings as they are drawn.  Open, in order:
+1. a second virtio-blk disk (the driver is single-device; RAM disks stand in);
+2. partition tables (the probe reports "partitioned" and stops);
+3. a real Wi-Fi driver behind `net_wireless_ops`;
+4. the phone emulator (§M84 stages 1-2) — the fourth standard test machine.
+
 
 ## §M83 is written up in PLAN.md — everything a package, repos split last
 

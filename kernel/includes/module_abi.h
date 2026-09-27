@@ -56,6 +56,8 @@
 #include "driver.h"
 #include "ksym.h"
 #include "audio.h"
+#include "net.h"
+#include "block.h"
 
 /* -----------------------------------------------------------------------------
  * THE HAND-MAINTAINED HALF.
@@ -105,6 +107,8 @@
     X(driver_ops)               \
     X(ksym)                     \
     X(audio_dev)                \
+    X(net_device)               \
+    X(block_device)             \
     MODULE_ABI_ARCH_STRUCTS(X)
 
 #define MODULE_ABI_STRUCT_COUNT_ONE(_s) + 1

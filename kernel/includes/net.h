@@ -92,7 +92,119 @@ struct net_device {
     uint32_t rx_packets, tx_packets;
     uint32_t rx_bytes,   tx_bytes;
     uint32_t rx_dropped;
+
+    /* ---- §M87 — what a network PANEL needs to know.  APPENDED, never
+     * inserted: every driver fills this struct field by field today, but a
+     * positional initialiser anywhere would be silently re-bound by an
+     * insertion (§M58's scar, written into widget.h for the same reason). ---- */
+
+    /* The USER took this adapter down ("Disable" in the panel, `ifconfig
+     * <dev> down`).  Transmit is refused and received frames are dropped — the
+     * driver keeps running, so enabling it again is instant and needs no
+     * re-initialisation.  Kept DISTINCT from "no carrier": "I turned it off"
+     * and "the cable is out" are different facts to the person reading the
+     * tray icon, and the icon draws them differently (§M23's three-icon rule). */
+    uint32_t    admin_down;
+
+    /* Carrier: 1 = link up, 0 = link down.  NULL = the device cannot tell,
+     * which is REPORTED as "unknown" rather than assumed up — a tray icon that
+     * says "connected" because nobody asked is the icon lying. */
+    int  (*link)(struct net_device* dev);
+
+    /* Non-NULL = a WIRELESS adapter.  The ops are the whole difference between
+     * a wired and a wireless device as far as the stack is concerned: frames
+     * are frames once associated. */
+    const struct net_wireless_ops* wireless;
+
+    /* Where `ip`/`netmask`/`gateway` came from — NETCFG_*.  A panel that shows
+     * an address without saying whether a DHCP server handed it out or the
+     * driver's built-in default is still sitting there leaves the user unable
+     * to tell a configured machine from an unconfigured one. */
+    uint32_t    config_src;
 };
+
+#define NETCFG_DEFAULT  0   /* the driver's built-in (QEMU SLIRP) numbers     */
+#define NETCFG_DHCP     1   /* a lease from a DHCP server                     */
+#define NETCFG_STATIC   2   /* the user typed them (net.static.* keys)        */
+
+/* Flag: a SIMULATED device (§M87's `wifisim`).  It never carries traffic, so
+ * it must never be picked as a route — otherwise enabling a test adapter
+ * would silently take the machine off the network. */
+#define NETDEV_F_SIMULATED 0x00000002u
+
+/* ----------------------- Wireless (§M87) ---------------------------------- */
+
+#define WIFI_SSID_MAX  33          /* 32 octets + NUL                         */
+
+#define WIFI_SEC_OPEN  0
+#define WIFI_SEC_WPA2  1
+
+struct wifi_network {
+    char     ssid[WIFI_SSID_MAX];
+    int      signal;               /* 0..100 — a percentage, not dBm: the UI
+                                    * draws bars, and every driver maps its
+                                    * own units ONCE rather than every caller */
+    int      security;             /* WIFI_SEC_*                              */
+};
+
+struct wifi_status {
+    int      associated;           /* 1 = joined a network                    */
+    char     ssid[WIFI_SSID_MAX];
+    int      signal;               /* 0..100, of the joined network           */
+};
+
+struct net_wireless_ops {
+    /* Fill up to `max` networks in range; returns how many (may be 0), or <0
+     * when the radio could not scan. */
+    int (*scan)(struct net_device* dev, struct wifi_network* out, int max);
+    /* Join `ssid`.  `pass` may be NULL/"" for an open network.  0 = joined;
+     * -1 = no such network; -2 = wrong passphrase; -3 = radio failure.  The
+     * three are kept apart because they call for three different things from
+     * the person holding the password. */
+    int (*connect)(struct net_device* dev, const char* ssid, const char* pass);
+    int (*disconnect)(struct net_device* dev);
+    int (*status)(struct net_device* dev, struct wifi_status* out);
+};
+
+/* ----------------------- Panel-level helpers (§M87) ----------------------- */
+
+/* The ONE answer to "is this machine online, and how" — read by the taskbar
+ * icon, the network panel and `netstate`, so the three cannot disagree. */
+#define NETSTATE_NONE       0   /* no adapter at all (other than loopback)   */
+#define NETSTATE_DISABLED   1   /* every adapter was turned off by the user   */
+#define NETSTATE_NO_LINK    2   /* adapters, none with a carrier / association */
+#define NETSTATE_NO_ADDRESS 3   /* a link, but no IPv4 address                */
+#define NETSTATE_WIRED      4   /* online through a wired adapter             */
+#define NETSTATE_WIRELESS   5   /* online through a wireless adapter          */
+
+struct net_state {
+    int         state;          /* NETSTATE_*                                 */
+    struct net_device* dev;     /* the adapter the state describes, or NULL   */
+    int         signal;         /* wireless: 0..100; otherwise -1             */
+    int         link_known;     /* 0 when the carrier had to be assumed       */
+};
+void net_get_state(struct net_state* out);
+
+/* Carrier of one device: 1 / 0 / -1 unknown.  Wireless = associated. */
+int  net_link_state(struct net_device* dev);
+
+/* Enable / disable an adapter (admin state).  0 on success. */
+int  net_set_admin(struct net_device* dev, int up);
+
+/* Apply an address by hand.  Marks it NETCFG_STATIC.  0 on success. */
+int  net_set_static(struct net_device* dev, uint32_t ip, uint32_t mask,
+                    uint32_t gw, uint32_t dns);
+
+const char* net_state_name(int state);
+
+/* Apply net.static.* to the default adapter (boot + the config watcher).
+ * 0 applied, 1 static config is off, <0 the keys do not parse (nothing
+ * changed). */
+int  net_apply_static_config(void);
+
+/* The first adapter with wireless ops, or NULL. */
+struct net_device* net_first_wireless(void);
+const char* net_config_src_name(uint32_t src);
 
 /* ----------------------- Registry ----------------------------------------- */
 

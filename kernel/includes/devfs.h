@@ -74,6 +74,9 @@ struct devfs_node {
  * node is attached immediately; otherwise it queues until devfs_init
  * flushes the queue. */
 int  devfs_register(struct devfs_node* node);
+/* §M87 — withdraw a node (a device that went away).  Open handles keep
+ * working in the sense that every call on them fails cleanly. */
+int  devfs_unregister(struct devfs_node* node);
 
 /* One-shot init.  Resolves /dev (must already exist via ramfs's mount),
  * registers built-in nodes (/dev/null, /dev/zero), and flushes any

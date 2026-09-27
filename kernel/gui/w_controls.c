@@ -69,7 +69,11 @@ static void box_outline(struct gfx_surface* s, int x, int y, int w, int h,
 
 struct w_checkbox {
     struct widget base;
-    char text[64];
+    /* §M87 — 128, not 64: the generic settings panel puts a key's HELP here,
+     * and at 64 the longer ones were cut — which also cut the catalogue key,
+     * so the Hungarian panel showed those in English (found by `locale
+     * missing`, which recorded the truncated key). */
+    char text[128];
     int  checked;
 };
 
@@ -646,7 +650,7 @@ WIDGET_CLASS(wc_combo) = {
 
 struct w_switch {
     struct widget base;
-    char text[64];
+    char text[128];                 /* §M87 — see w_checkbox */
     int  on;
 };
 

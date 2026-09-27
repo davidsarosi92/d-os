@@ -245,6 +245,31 @@ static int bcache_sync_unlocked(struct block_device* dev) {
     return failed ? -2 : 0;
 }
 
+/* §M87 — forget every cached sector of `dev`.  Dirty ones are written first
+ * (a drop that lost a write would be silent corruption), and a slot some
+ * caller still HOLDS is left alone and counted: invalidating a buffer out
+ * from under its holder would hand the next reader of that LBA a stale page
+ * while the holder believes it owns the only copy.  Returns the number of
+ * held slots that could not be dropped (0 = the device is gone from the
+ * cache). */
+int bcache_invalidate(struct block_device* dev) {
+    if (!initialized || !dev) return 0;
+    kmutex_lock(&bc_lock);
+    bcache_sync_unlocked(dev);
+    int held = 0;
+    for (uint32_t i = 0; i < BCACHE_SLOTS; i++) {
+        struct bcache_buf* b = &slots[i];
+        if (!b->valid || b->dev != dev) continue;
+        if (b->refcount > 0) { held++; continue; }
+        bc_unlink(b);
+        b->valid = 0;
+        b->dirty = 0;
+        b->dev   = NULL;
+    }
+    kmutex_unlock(&bc_lock);
+    return held;
+}
+
 /* ----------------------------------------------------------------------- */
 /* Stats.                                                                  */
 /* ----------------------------------------------------------------------- */

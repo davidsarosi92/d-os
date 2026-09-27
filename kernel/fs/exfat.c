@@ -50,6 +50,8 @@
 #include "kmalloc.h"
 #include "printf.h"
 #include "module.h"
+#include "timer.h"
+#include "exfat.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -1560,13 +1562,252 @@ static int exfat_mount(struct block_device* dev, struct dentry* mp) {
 }
 
 /* ---------------------------------------------------------------------- */
+/* §M87 — unmount, free space, and FORMAT.                                 */
+/* ---------------------------------------------------------------------- */
+
+static struct exfat_fs* fs_of_mp(struct dentry* mp) {
+    if (!mp || !mp->inode || !mp->inode->private) return NULL;
+    return ((struct exfat_inode*)mp->inode->private)->fs;
+}
+
+/* The VFS has already refused if anything below is open.  Everything the
+ * volume wrote goes to the disk BEFORE the per-volume state is freed; the VFS
+ * then frees the tree through exfat_evict. */
+static int exfat_umount(struct dentry* mp) {
+    struct exfat_fs* fs = fs_of_mp(mp);
+    if (!fs) return -1;
+    kmutex_lock(&fs->lock);
+    int r = bcache_sync(fs->dev);
+    kmutex_unlock(&fs->lock);
+    if (r != 0) {
+        /* A volume whose last writes did not reach the disk is NOT detached:
+         * the cache still holds the only copy, and dropping it would be the
+         * data loss the refusal exists to prevent. */
+        kprintf("exfat: %s: write-back failed - NOT unmounting\n", fs->dev->name);
+        return -1;
+    }
+    kfree(fs);
+    return 0;
+}
+
+static void exfat_evict(struct inode* ino) {
+    if (ino && ino->private) { kfree(ino->private); ino->private = NULL; }
+}
+
+/* Free space = clear bits in the allocation bitmap.  Counted rather than
+ * cached: a cached counter must be updated by every allocate and free, and a
+ * missed site makes the disk manager report space the volume does not have. */
+static int exfat_statfs(struct dentry* mp, uint64_t* total, uint64_t* freeb) {
+    struct exfat_fs* fs = fs_of_mp(mp);
+    if (!fs) return -1;
+    kmutex_lock(&fs->lock);
+    uint64_t base = cluster_first_lba(fs, fs->bitmap_cluster);
+    uint64_t nsec = (fs->bitmap_size + fs->bytes_per_sector - 1) / fs->bytes_per_sector;
+    uint64_t used = 0;
+    for (uint64_t sct = 0; sct < nsec; sct++) {
+        struct bcache_buf* b = bcache_get(fs->dev, base + sct);
+        if (!b) { kmutex_unlock(&fs->lock); return -1; }
+        for (uint32_t i = 0; i < fs->bytes_per_sector; i++) {
+            uint64_t bit0 = (sct * fs->bytes_per_sector + i) * 8ull;
+            if (bit0 >= fs->cluster_count) break;
+            uint8_t v = b->data[i];
+            for (int k = 0; k < 8 && bit0 + k < fs->cluster_count; k++)
+                if (v & (1u << k)) used++;
+        }
+        bcache_release(b);
+    }
+    kmutex_unlock(&fs->lock);
+    if (total) *total = (uint64_t)fs->cluster_count * fs->bytes_per_cluster;
+    if (freeb) *freeb = ((uint64_t)fs->cluster_count - used) * fs->bytes_per_cluster;
+    return 0;
+}
+
+
+/* The boot-region checksum (exFAT spec §3.4): every byte of sectors 0..10
+ * except VolumeFlags (106, 107) and PercentInUse (112), which change during
+ * normal use and must not invalidate the checksum. */
+static uint32_t boot_checksum(const uint8_t* region, uint32_t bytes) {
+    uint32_t c = 0;
+    for (uint32_t i = 0; i < bytes; i++) {
+        if (i == 106 || i == 107 || i == 112) continue;
+        c = ((c & 1) ? 0x80000000u : 0) + (c >> 1) + region[i];
+    }
+    return c;
+}
+
+static uint32_t table_checksum(const uint8_t* d, uint32_t n) {
+    uint32_t c = 0;
+    for (uint32_t i = 0; i < n; i++) c = ((c & 1) ? 0x80000000u : 0) + (c >> 1) + d[i];
+    return c;
+}
+
+/* A COMPRESSED up-case table (spec §7.2.5.1): 0xFFFF followed by N means "the
+ * next N code points map to themselves".  So: identity up to 'a', then a..z
+ * to A..Z, then identity for everything else.  60 bytes instead of 5836, and
+ * complete — a code point the table does not name is not "unmapped", it is
+ * inside an identity run.  (Latin-1 and Latin-2 letters stay as they are:
+ * names are compared case-SENSITIVELY for those, which is a limitation, not a
+ * corruption.) */
+static uint32_t build_upcase(uint8_t* out) {
+    uint32_t n = 0;
+    wle16(out + n, 0xFFFF); n += 2; wle16(out + n, 0x0061); n += 2;
+    for (uint16_t c = 'a'; c <= 'z'; c++) { wle16(out + n, (uint16_t)(c - 32)); n += 2; }
+    wle16(out + n, 0xFFFF); n += 2; wle16(out + n, (uint16_t)(0x10000 - 0x7B)); n += 2;
+    return n;
+}
+
+/* Write one sector through the block layer.  The cache is dropped for the
+ * whole device before and after, so the format is not read back through a
+ * cache of the previous filesystem. */
+static int wr(struct block_device* d, uint64_t lba, const uint8_t* buf) {
+    return blk_write(d, lba, 1, buf);
+}
+
+int exfat_format(struct block_device* dev, const char* label) {
+    if (!dev || dev->sector_size != 512) return -1;
+    uint64_t total = dev->sector_count;
+    if (total < 2048) return -2;                     /* < 1 MiB: pointless */
+
+    /* Cluster size by volume size — the table mkfs.exfat uses, rounded. */
+    uint32_t spc_shift = total <= (256ull << 11) ? 3      /* <=256 MiB: 4 KiB  */
+                       : total <= (32ull << 21) ? 6       /* <=32 GiB: 32 KiB  */
+                       : 8;                               /* else: 128 KiB     */
+    uint32_t spc = 1u << spc_shift;
+    uint32_t fat_off = 128;                               /* aligned, roomy    */
+    uint32_t fat_len = 1, heap_off = 0, clusters = 0;
+    for (int it = 0; it < 4; it++) {                      /* converges at once */
+        heap_off = ((fat_off + fat_len + spc - 1) / spc) * spc;
+        clusters = (uint32_t)((total - heap_off) / spc);
+        fat_len  = (uint32_t)(((uint64_t)(clusters + 2) * 4 + 511) / 512);
+    }
+    uint32_t cbytes   = spc * 512u;
+    uint32_t bm_bytes = (clusters + 7) / 8;
+    uint32_t bm_clus  = (bm_bytes + cbytes - 1) / cbytes;
+    uint32_t up_clus  = 1;                                /* 60 bytes */
+    uint32_t c_bitmap = 2, c_upcase = 2 + bm_clus, c_root = c_upcase + up_clus;
+    uint32_t used     = bm_clus + up_clus + 1;
+    if (used + 1 > clusters) return -2;
+
+    uint8_t* sec = (uint8_t*)kcalloc(1, 512);
+    uint8_t* region = (uint8_t*)kcalloc(1, 11 * 512);
+    if (!sec || !region) { kfree(sec); kfree(region); return -3; }
+    bcache_invalidate(dev);
+    int rc = 0;
+
+    /* ---- boot region (sectors 0..10), then its checksum sector ---- */
+    uint8_t* bs = region;
+    bs[0] = 0xEB; bs[1] = 0x76; bs[2] = 0x90;
+    for (int i = 0; i < 8; i++) bs[3 + i] = (uint8_t)"EXFAT   "[i];
+    wle64(bs + 64, 0);                                    /* PartitionOffset   */
+    wle64(bs + 72, total);                                /* VolumeLength      */
+    wle32(bs + 80, fat_off);
+    wle32(bs + 84, fat_len);
+    wle32(bs + 88, heap_off);
+    wle32(bs + 92, clusters);
+    wle32(bs + 96, c_root);
+    wle32(bs + 100, (uint32_t)(timer_now_ns() >> 10) ^ 0x44534F53u); /* serial */
+    wle16(bs + 104, 0x0100);                              /* revision 1.0      */
+    wle16(bs + 106, 0);                                   /* VolumeFlags       */
+    bs[108] = 9;                                          /* 512-byte sectors  */
+    bs[109] = (uint8_t)spc_shift;
+    bs[110] = 1;                                          /* NumberOfFats      */
+    bs[111] = 0x80;
+    bs[112] = 0xFF;                                       /* PercentInUse: n/a */
+    for (int i = 120; i < 510; i++) bs[i] = 0xF4;         /* boot code: hlt    */
+    bs[510] = 0x55; bs[511] = 0xAA;
+    for (int k = 1; k <= 8; k++) {                        /* extended boot     */
+        region[k * 512 + 510] = 0x55; region[k * 512 + 511] = 0xAA;
+    }
+    uint32_t ck = boot_checksum(region, 11 * 512);
+    for (int copy = 0; copy < 2 && !rc; copy++) {         /* main + backup     */
+        uint64_t base = copy ? 12 : 0;
+        for (int k = 0; k < 11 && !rc; k++) rc = wr(dev, base + k, region + k * 512);
+        for (int i = 0; i < 512; i += 4) wle32(sec + i, ck);
+        if (!rc) rc = wr(dev, base + 11, sec);
+    }
+
+    /* ---- FAT: media + reserved, then one chain per metadata object ---- */
+    for (uint32_t k = 0; k < fat_len && !rc; k++) {
+        for (int i = 0; i < 512; i++) sec[i] = 0;
+        for (int i = 0; i < 128; i++) {
+            uint32_t e = k * 128 + (uint32_t)i, v = 0;
+            if (e == 0) v = 0xFFFFFFF8u;
+            else if (e == 1) v = 0xFFFFFFFFu;
+            else if (e >= c_bitmap && e < c_upcase)
+                v = (e + 1 < c_upcase) ? e + 1 : 0xFFFFFFFFu;
+            else if (e == c_upcase || e == c_root) v = 0xFFFFFFFFu;
+            wle32(sec + i * 4, v);
+        }
+        rc = wr(dev, fat_off + k, sec);
+    }
+
+    /* ---- the allocation bitmap: the first `used` clusters are taken ---- */
+    uint64_t lba_bm = heap_off + (uint64_t)(c_bitmap - 2) * spc;
+    for (uint32_t k = 0; k < bm_clus * spc && !rc; k++) {
+        for (int i = 0; i < 512; i++) {
+            uint32_t bit0 = (k * 512 + (uint32_t)i) * 8;
+            uint8_t v = 0;
+            for (int b = 0; b < 8; b++) if (bit0 + b < used) v |= (uint8_t)(1u << b);
+            sec[i] = v;
+        }
+        rc = wr(dev, lba_bm + k, sec);
+    }
+
+    /* ---- the up-case table ---- */
+    uint8_t up[64];
+    uint32_t up_len = build_upcase(up);
+    uint32_t up_ck  = table_checksum(up, up_len);
+    uint64_t lba_up = heap_off + (uint64_t)(c_upcase - 2) * spc;
+    for (uint32_t k = 0; k < spc && !rc; k++) {
+        for (int i = 0; i < 512; i++) sec[i] = 0;
+        if (k == 0) for (uint32_t i = 0; i < up_len; i++) sec[i] = up[i];
+        rc = wr(dev, lba_up + k, sec);
+    }
+
+    /* ---- the root directory: label, bitmap, up-case, then end ---- */
+    uint64_t lba_root = heap_off + (uint64_t)(c_root - 2) * spc;
+    for (uint32_t k = 0; k < spc && !rc; k++) {
+        for (int i = 0; i < 512; i++) sec[i] = 0;
+        if (k == 0) {
+            uint8_t* e = sec;
+            int ll = 0;
+            while (label && label[ll] && ll < 11) ll++;
+            e[0] = ll ? 0x83 : 0x03;                      /* volume label      */
+            e[1] = (uint8_t)ll;
+            for (int i = 0; i < ll; i++) wle16(e + 2 + i * 2, (uint8_t)label[i]);
+            e += 32;
+            e[0] = 0x81;                                  /* allocation bitmap */
+            wle32(e + 20, c_bitmap);
+            wle64(e + 24, bm_bytes);
+            e += 32;
+            e[0] = 0x82;                                  /* up-case table     */
+            wle32(e + 4, up_ck);
+            wle32(e + 20, c_upcase);
+            wle64(e + 24, up_len);
+        }
+        rc = wr(dev, lba_root + k, sec);
+    }
+    if (!rc) blk_flush(dev);
+    bcache_invalidate(dev);
+    kfree(sec);
+    kfree(region);
+    if (rc) { kprintf("exfat: format of %s FAILED (I/O error)\n", dev->name); return -4; }
+    kprintf("exfat: formatted %s - %u clusters of %u bytes, label '%s'\n",
+            dev->name, clusters, cbytes, label ? label : "");
+    return 0;
+}
+
+/* ---------------------------------------------------------------------- */
 /* Module registration.                                                    */
 /* ---------------------------------------------------------------------- */
 
 static struct fs_type exfat_fs_type = {
-    .name  = "exfat",
-    .mount = exfat_mount,
-    .next  = NULL,
+    .name   = "exfat",
+    .mount  = exfat_mount,
+    .next   = NULL,
+    .umount = exfat_umount,             /* §M87 */
+    .evict  = exfat_evict,
+    .statfs = exfat_statfs,
 };
 
 static int exfat_module_init(void) {

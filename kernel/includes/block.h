@@ -88,6 +88,9 @@ void blk_get_stats(struct blk_stats* out);
  * (typical convention: virtio = "vda", "vdb", ...; SATA = "sda";
  * NVMe = "nvme0n1").  Returns 0 on success. */
 int  blk_register(struct block_device* dev);
+/* §M87 — withdraw a device that is going away.  Not mounted is the CALLER's
+ * precondition.  0 on success, -1 when it was not registered. */
+int  blk_unregister(struct block_device* dev);
 
 /* Look up by name.  Returns NULL if not registered. */
 struct block_device* blk_find(const char* name);

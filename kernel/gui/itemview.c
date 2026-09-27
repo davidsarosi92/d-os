@@ -736,7 +736,10 @@ static int t_layout(const struct item_model* m, int w, int* xs, int* ws) {
     if (rows > T_SCAN) rows = T_SCAN;
     for (int c = 0; c < n; c++) {
         int style = t_style(m, c);
-        const char* t = m->col_title ? m->col_title(m->ctx, c) : "";
+        /* §M87 — a column TITLE is always an interface word (a cell may be
+         * user data and is the model's to translate; a heading never is), so
+         * the view translates it — measured and drawn from the same lookup. */
+        const char* t = m->col_title ? lstr(m->col_title(m->ctx, c)) : "";
         /* The header is drawn in the ordinary face whatever the column is, so
          * it is measured in that one — a mono column with a proportional title
          * measured as mono comes out narrower than its own heading. */
@@ -879,7 +882,7 @@ static void table_draw(struct gfx_surface* s, int x, int y, int w, int h,
      * the kind of thing that stops being aligned the moment a name is long. */
     gfx_fill(s, x, y, w, T_HEAD_H, t->tray);
     for (int c = 0; c < n; c++) {
-        const char* ct = m->col_title ? m->col_title(m->ctx, c) : "";
+        const char* ct = m->col_title ? lstr(m->col_title(m->ctx, c)) : "";
         if (!ct) continue;
         int style = t_style(m, c);
         int cw = ws[c] - T_GAP;

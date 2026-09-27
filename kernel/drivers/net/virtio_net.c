@@ -74,6 +74,9 @@
 
 /* virtio-net feature bits. */
 #define VIRTIO_NET_F_MAC      (1u << 5)        /* config MAC is valid         */
+#define VIRTIO_NET_F_STATUS   (1u << 16)       /* §M87: config `status` valid */
+#define VN_OFF_NET_STATUS     0x1A             /* u16, after mac[6]           */
+#define VIRTIO_NET_S_LINK_UP  1
 
 #define QSIZE                 256              /* QEMU virtio-net queue size  */
 #define QUEUE_BYTES           (4096 * 3)
@@ -289,6 +292,15 @@ static void vnet_irq(struct int_frame* f) {
 
 /* ----------------------- DRIVER() lifecycle ------------------------------- */
 
+/* §M87 — carrier, from the device's own status word.  Only installed when the
+ * device offered VIRTIO_NET_F_STATUS; otherwise the link is UNKNOWN, which the
+ * panel says in those words. */
+static int g_vnet_has_status;
+static int vnet_link(struct net_device* dev) {
+    (void)dev;
+    return (inw(g_vnet.io_base + VN_OFF_NET_STATUS) & VIRTIO_NET_S_LINK_UP) != 0;
+}
+
 static int vnet_probe(void* ctx) {
     (void)ctx;
     struct pci_device pd;
@@ -319,7 +331,11 @@ static int vnet_init(void* ctx) {
      * We deliberately do NOT take MRG_RXBUF (keeps the header at 10 bytes)
      * or checksum-offload (we compute our own checksums). */
     uint32_t dev_feat = inl(io + VN_OFF_DEV_FEAT);
-    uint32_t drv_feat = dev_feat & VIRTIO_NET_F_MAC;
+    /* §M87 — and STATUS when offered, which is what lets the network panel
+     * and the tray say "cable out" (QEMU's `set_link net0 off`) instead of
+     * assuming a link nobody measured. */
+    uint32_t drv_feat = dev_feat & (VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS);
+    g_vnet_has_status = (drv_feat & VIRTIO_NET_F_STATUS) != 0;
     outl(io + VN_OFF_DRV_FEAT, drv_feat);
     outb(io + VN_OFF_DEV_STATUS,
          VSTAT_ACKNOWLEDGE | VSTAT_DRIVER | VSTAT_FEATURES_OK);
@@ -367,6 +383,7 @@ static int vnet_init(void* ctx) {
     g_eth0.mtu      = ETH_MTU;
     g_eth0.transmit = vnet_transmit;
     g_eth0.poll     = vnet_poll;
+    g_eth0.link     = g_vnet_has_status ? vnet_link : NULL;
     g_eth0.priv     = &g_vnet;
     net_register(&g_eth0);
 

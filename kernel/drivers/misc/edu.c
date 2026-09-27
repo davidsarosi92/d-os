@@ -285,7 +285,7 @@ static int edu_shutdown(void* ctx) {
 CONFIG_KEY(ck_edu_dma_bits) = {
     .key = "driver.edu.dma_bits", .group = "System", .type = CFG_INT,
     .min = 20, .max = 64, .def = "28",
-    .help = "how many address bits the edu device has — match QEMU's dma_mask",
+    .help = "how many address bits the edu device has - match QEMU's dma_mask",
 };
 
 static const struct driver_ops edu_ops = {

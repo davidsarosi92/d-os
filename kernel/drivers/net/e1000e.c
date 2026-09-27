@@ -147,6 +147,12 @@ static void e1000e_poll(struct net_device* dev) {
     }
 }
 
+/* §M87 — carrier, straight from STATUS.LU. */
+static int e1000e_link(struct net_device* dev) {
+    (void)dev;
+    return (rd(R_STATUS) & STATUS_LU) != 0;
+}
+
 static int e1000e_probe(void* ctx) {
     (void)ctx;
     return pci_find_device(E1000_VENDOR, E1000E_82574L, &g_e.pd) == 0 ? 0 : -1;
@@ -213,6 +219,7 @@ static int e1000e_init(void* ctx) {
     g_dev.mtu      = ETH_MTU;
     g_dev.transmit = e1000e_transmit;
     g_dev.poll     = e1000e_poll;
+    g_dev.link     = e1000e_link;
     g_dev.priv     = &g_e;
     net_register(&g_dev);
     g_e.present = 1;

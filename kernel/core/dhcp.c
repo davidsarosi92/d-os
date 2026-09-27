@@ -225,6 +225,7 @@ static void dhcp_renew_work(struct work* w);
 
 static void dhcp_apply(struct net_device* dev) {
     dev->ip = g_dhcp.offered_ip;
+    dev->config_src = NETCFG_DHCP;              /* §M87 — say where it came from */
     if (g_dhcp.mask)   dev->netmask = g_dhcp.mask;
     if (g_dhcp.router) dev->gateway = g_dhcp.router;
     if (g_dhcp.dns)    net_set_dns(g_dhcp.dns);
@@ -318,6 +319,27 @@ void dhcp_status(void) {
     net_fmt_ip(g_dhcp.server_id, s);
     kprintf("dhcp: %s has %s from server %s, %us of %us left\n",
             g_dhcp.dev ? g_dhcp.dev->name : "?", a, s, left, g_dhcp.lease_s);
+}
+
+/* §M87 — the lease as DATA, for the network panel.  dhcp_status() prints;
+ * a panel cannot parse a console line, and a second copy of the arithmetic
+ * would be a second chance for the two to disagree about "seconds left". */
+int dhcp_lease(struct net_device** dev, uint32_t* server,
+               uint32_t* left_s, uint32_t* lease_s) {
+    if (!g_dhcp.bound) return -1;
+    uint64_t now = timer_now_ns();
+    if (dev)     *dev     = g_dhcp.dev;
+    if (server)  *server  = g_dhcp.server_id;
+    if (lease_s) *lease_s = g_dhcp.lease_s;
+    if (left_s)  *left_s  = (g_dhcp.expires_ns > now)
+                          ? (uint32_t)((g_dhcp.expires_ns - now) / 1000000000ull) : 0;
+    return 0;
+}
+
+/* A static address replaces a lease: forget it, or the renewal timer would
+ * quietly put the DHCP address back an hour later. */
+void dhcp_release_local(void) {
+    g_dhcp.bound = 0;
 }
 
 /* ----------------------- the boot-time service ---------------------------- */
