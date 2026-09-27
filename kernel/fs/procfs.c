@@ -253,6 +253,13 @@ static void gen_meminfo(struct procfs_writer* w) {
     pw_puts(w, "pmm.frames.used:    "); pw_put_uint(w, us);  pw_putc(w, '\n');
     pw_puts(w, "pmm.mib.total:      "); pw_put_uint(w, (mgr * 4) / 1024); pw_putc(w, '\n');
     pw_puts(w, "pmm.mib.free:       "); pw_put_uint(w, (fr  * 4) / 1024); pw_putc(w, '\n');
+    {   /* §M72 — the reserve */
+        uint32_t rkb, refused; int low;
+        pmm_reserve_stats(&rkb, &refused, &low);
+        pw_puts(w, "pmm.reserve.kib:    "); pw_put_uint(w, rkb);     pw_putc(w, '\n');
+        pw_puts(w, "pmm.reserve.low:    "); pw_put_uint(w, (unsigned)low); pw_putc(w, '\n');
+        pw_puts(w, "pmm.reserve.refused:"); pw_put_uint(w, refused); pw_putc(w, '\n');
+    }
     /* §M19.5.3 — per NUMA node: size, free, and how many allocations were
      * served from the asking CPU's own node vs had to fall back elsewhere. */
     pw_puts(w, "pmm.numa.nodes:     "); pw_put_uint(w, (unsigned)pmm_node_count()); pw_putc(w, '\n');

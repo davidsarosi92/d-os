@@ -108,8 +108,8 @@ struct shm* shm_create(size_t size) {
     s->refcount = 1;
     s->nframes  = n;
     for (int i = 0; i < n; i++) {
-        pmm_phys_t f = pmm_alloc_frame();
-        if (!f) {                               /* OOM — unwind */
+        pmm_phys_t f = pmm_alloc_frame_user_low();   /* §M72 — user memory */
+        if (f == PMM_ALLOC_FAIL) {              /* OOM or reserve — unwind */
             for (int j = 0; j < i; j++) pmm_free_frame(s->frames[j]);
             kfree(s);
             return NULL;
@@ -133,8 +133,8 @@ int shm_grow(struct shm* s, size_t size) {
     if (n <= s->nframes) return 0;
     if (n > SHM_MAX_FRAMES) return -1;
     for (int i = s->nframes; i < n; i++) {
-        pmm_phys_t f = pmm_alloc_frame();
-        if (!f) return -1;                      /* keep what we already grew to */
+        pmm_phys_t f = pmm_alloc_frame_user_low();   /* §M72 — user memory */
+        if (f == PMM_ALLOC_FAIL) return -1;     /* keep what we already grew to */
         uint8_t* p = (uint8_t*)phys_to_virt(f);
         for (int b = 0; b < 4096; b++) p[b] = 0;
         s->frames[i] = f;

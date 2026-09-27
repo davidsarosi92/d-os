@@ -77,6 +77,7 @@ static void session_entry(void) {
     struct task* me = task_current();
     if (!me) { kfree(r); return; }
 
+    users_ensure_home_of(r->uid);       /* while still SYSTEM, see gui.c */
     if (cred_become_user(me->pid, r->uid, r->gid, r->groups, r->ngroups,
                          r->session) != 0) {
         console_write("login: could not adopt the account's identity — "

@@ -439,7 +439,7 @@ int vmm_cow_fault(uintptr_t fault_va) {
         l3[i3] = (pte & ~PTE_AP_RO_BIT) & ~PTE_SW_COW;
         __atomic_store_n(rc, 0, __ATOMIC_RELEASE);
     } else {
-        pmm_phys_t nf = pmm_alloc_frame();
+        pmm_phys_t nf = pmm_alloc_frame_user();         /* §M72 — user memory */
         if (nf == PMM_ALLOC_FAIL) return 0;             /* OOM → a real fault */
         const uint8_t* src = (const uint8_t*)phys_to_virt(old);
         uint8_t* dst = (uint8_t*)phys_to_virt(nf);

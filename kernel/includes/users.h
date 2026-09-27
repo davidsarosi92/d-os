@@ -182,6 +182,8 @@ struct user_account {
 
 /* The directory a session uses as its home (see home_real). */
 const char* user_home(const struct user_account* u);
+/* Create the account's home now if it is missing (a session is opening). */
+void users_ensure_home_of(int uid);
 
 struct group_entry {
     int  used;

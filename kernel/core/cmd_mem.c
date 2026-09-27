@@ -200,19 +200,22 @@ extern const unsigned char _binary_user_memhog_aarch64_elf_start[] __attribute__
 extern const unsigned char _binary_user_memhog_aarch64_elf_end[]   __attribute__((weak));
 
 static void mem_memhog(const char* a) {
-    (void)a;
     const unsigned char *s = 0, *e = 0;
     if (_binary_user_memhog_elf_start)         { s = _binary_user_memhog_elf_start;         e = _binary_user_memhog_elf_end; }
     else if (_binary_user_memhog_x86_64_elf_start)  { s = _binary_user_memhog_x86_64_elf_start;  e = _binary_user_memhog_x86_64_elf_end; }
     else if (_binary_user_memhog_aarch64_elf_start) { s = _binary_user_memhog_aarch64_elf_start; e = _binary_user_memhog_aarch64_elf_end; }
     if (!s || !e) { console_write("memhog: no ELF embedded for this arch\n"); return; }
 
-    int pid = proc_spawn("memhog", s, (size_t)(e - s));
+    /* §M72 — `memhog fill`: grow until refused (the reserve's falsifier). */
+    int fill = a && a[0] == 'f';
+    const char* argv[2] = { "memhog", "fill" };
+    int pid = fill ? proc_spawn_argv("memhog", s, (size_t)(e - s), 2, argv, 0)
+                   : proc_spawn("memhog", s, (size_t)(e - s));
     if (pid < 0) { console_write("memhog: spawn failed\n"); return; }
     kprintf("memhog: pid %d — `ps` twice and subtract; `kill %d` when done\n", pid, pid);
 }
 
-SHELL_CMD(memhog)    = { "memhog",    "", "ring-3 process that grows 1 MiB/2 s (memory-column falsifier)",
+SHELL_CMD(memhog)    = { "memhog",    "[fill]", "ring-3 process that grows 1 MiB/2 s (memory-column falsifier)",
                          SHELL_G_TEST, mem_memhog, SHELL_P_ADMIN };
 
 /* ---------------------------------------------------------------------------

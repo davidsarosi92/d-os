@@ -35,7 +35,27 @@
 #define STEP_MS      2000u                /* every 2 seconds  */
 #define MAX_STEPS    16u                  /* 16 MiB, then hold */
 
-int main(void) {
+/* §M72 — `memhog fill`: grow as fast as it can until the kernel REFUSES, then
+ * say at what size and hold.  The falsifier for the reserve: with the reserve
+ * working, this process is refused while the shell, the compositor and `crash`
+ * still get memory; without it, the machine runs dry wherever the next
+ * allocation happens to be. */
+static int fill_mode(void) {
+    printf("memhog: pid %d - filling 4 MiB at a time until refused\n", getpid());
+    unsigned held_kb = 0;
+    for (;;) {
+        unsigned char* p = (unsigned char*)mmap(4u * STEP_BYTES, -1);
+        if (!p) break;
+        for (unsigned off = 0; off < 4u * STEP_BYTES; off += 4096) p[off] = 1;
+        held_kb += 4u * STEP_BYTES / 1024u;
+    }
+    printf("memhog: REFUSED after %u KB - holding it; the shell must still answer\n", held_kb);
+    for (;;) nanosleep_ms(1000);
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && argv[1][0] == 'f') return fill_mode();
     unsigned held_kb = 0;
 
     printf("memhog: pid %d — 1 MiB every 2 s, up to %d MiB\n",

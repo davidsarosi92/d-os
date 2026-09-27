@@ -231,6 +231,11 @@ void       pmm_node_stats(int node, struct pmm_node_info* out);
 void       pmm_node_zone_stats(int node, int zone, uint32_t* out_free_per_order,
                                uint32_t* out_managed);
 
+/* §M72 — user memory, refused below `mem.reserve_kb` (pmm.c). */
+pmm_phys_t pmm_alloc_frame_user_low(void);
+void pmm_reserve_changed(void);
+void pmm_reserve_stats(uint32_t* reserve_kb, uint32_t* refused, int* low);
+
 /* Human-readable one-line dump.  Used by `meminfo`. */
 void pmm_print_stats(void);
 void pmm_validate(const char* tag);   /* DEBUG: free-list integrity walk */

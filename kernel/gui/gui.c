@@ -2082,6 +2082,9 @@ static void gui_session_main(void) {
     gui_cfg_release();
 
     if (pend_uid >= 0) {
+        /* The home first, while this task is still SYSTEM: an ordinary account
+         * cannot create `/home` in a root-owned `/` (§M72 finding). */
+        users_ensure_home_of(pend_uid);
         struct task* me = task_current();
         if (!me || cred_become_user(me->pid, pend_uid, pend_gid, pend_groups,
                                     pend_ngroups, pend_session) != 0) {

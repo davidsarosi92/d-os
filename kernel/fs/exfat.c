@@ -43,6 +43,10 @@
  *
  * ============================================================================= */
 
+#include "shellcmd.h"
+#include "settings.h"
+#include "config.h"
+#include "audit.h"
 #include "cred.h"      /* §M32 — CRED_UID_ROOT for a new owner record */
 #include "vfs.h"
 #include "block.h"
@@ -140,7 +144,19 @@ struct exfat_fs {
      * twice.  Coarse on purpose: correctness first, and the disk under it
      * serialises requests anyway. */
     struct kmutex lock;
+    /* §M72 — free clusters, COUNTED once at mount and kept by the allocator
+     * (bitmap_alloc / bitmap_free), so `df` and the write-path reserve do
+     * not read the whole bitmap each time.  A counter kept beside the thing
+     * it counts can drift, so AUDIT(exfat_free) re-counts the bitmap and
+     * compares — the check, not the hope, keeps it honest. */
+    uint64_t free_clusters;
 };
+
+/* Mounted volumes, for the audit (and nothing else). */
+#define EXFAT_MAX_MOUNTS 4
+static struct exfat_fs* g_mounts[EXFAT_MAX_MOUNTS];
+static int64_t bitmap_count_used(struct exfat_fs* fs);          /* §M72 */
+static int fs_reserve_allows(struct exfat_fs* fs, uint64_t clusters);
 
 /* Per-inode private.  For directories, `dirent_*` fields are unused (the
  * directory's identity is its FirstCluster).  For regular files they
@@ -313,6 +329,7 @@ static uint32_t bitmap_alloc(struct exfat_fs* fs) {
                     b->data[i] |= (uint8_t)(1u << bit);
                     bcache_mark_dirty(b);
                     bcache_release(b);
+                    if (fs->free_clusters) fs->free_clusters--;
                     return (uint32_t)(2 + cluster_no);
                 }
             }
@@ -864,6 +881,7 @@ static ssize_t exfat_write(struct file* f, const void* buf, size_t n,
     uint64_t clusters_need = (end + fs->bytes_per_cluster - 1) / fs->bytes_per_cluster;
     if (clusters_need > clusters_have) {
         uint64_t to_add = clusters_need - clusters_have;
+        if (!fs_reserve_allows(fs, to_add)) return -1;   /* §M72 — nothing written */
         uint32_t prev_tail = (ei->first_cluster < 2) ? 0
                                                      : chain_tail(fs, ei->first_cluster);
         for (uint64_t i = 0; i < to_add; i++) {
@@ -1003,7 +1021,9 @@ static void bitmap_free(struct exfat_fs* fs, uint32_t cluster) {
                  + byte / fs->bytes_per_sector;
     struct bcache_buf* b = bcache_get(fs->dev, lba);
     if (!b) return;
-    b->data[byte % fs->bytes_per_sector] &= (uint8_t)~(1u << bit);
+    uint8_t* byp = &b->data[byte % fs->bytes_per_sector];
+    if (*byp & (uint8_t)(1u << bit)) fs->free_clusters++;   /* §M72 — only a real free counts */
+    *byp &= (uint8_t)~(1u << bit);
     bcache_mark_dirty(b);
     bcache_release(b);
 }
@@ -1246,6 +1266,7 @@ static int exfat_make(struct inode* dir, const char* name, struct inode** out,
     /* A directory owns a cluster from the start; a file may own none. */
     uint32_t new_cluster = 0;
     if (as_dir) {
+        if (!fs_reserve_allows(fs, 1)) return -5;        /* §M72 — the reserve */
         new_cluster = bitmap_alloc(fs);
         if (!new_cluster) return -5;            /* volume full */
         if (cluster_zero(fs, new_cluster) != 0) {
@@ -1660,6 +1681,12 @@ static int exfat_mount(struct block_device* dev, struct dentry* mp) {
         kfree(fs);
         return -7;
     }
+    {   /* §M72 — count the free clusters once; the allocator keeps it after. */
+        int64_t used = bitmap_count_used(fs);
+        fs->free_clusters = used < 0 ? 0 : (uint64_t)fs->cluster_count - (uint64_t)used;
+        for (int k = 0; k < EXFAT_MAX_MOUNTS; k++)
+            if (!g_mounts[k]) { g_mounts[k] = fs; break; }
+    }
 
     /* Build the root inode and attach it to the mountpoint dentry. */
     struct inode* rino = (struct inode*)kcalloc(1, sizeof(struct inode));
@@ -1714,6 +1741,7 @@ static int exfat_umount(struct dentry* mp) {
         kprintf("exfat: %s: write-back failed - NOT unmounting\n", fs->dev->name);
         return -1;
     }
+    for (int k = 0; k < EXFAT_MAX_MOUNTS; k++) if (g_mounts[k] == fs) g_mounts[k] = NULL;
     kfree(fs);
     return 0;
 }
@@ -1725,16 +1753,15 @@ static void exfat_evict(struct inode* ino) {
 /* Free space = clear bits in the allocation bitmap.  Counted rather than
  * cached: a cached counter must be updated by every allocate and free, and a
  * missed site makes the disk manager report space the volume does not have. */
-static int exfat_statfs(struct dentry* mp, uint64_t* total, uint64_t* freeb) {
-    struct exfat_fs* fs = fs_of_mp(mp);
-    if (!fs) return -1;
-    kmutex_lock(&fs->lock);
+/* Count the used clusters by reading the bitmap.  Caller holds fs->lock.
+ * Returns -1 if a bitmap sector cannot be read. */
+static int64_t bitmap_count_used(struct exfat_fs* fs) {
     uint64_t base = cluster_first_lba(fs, fs->bitmap_cluster);
     uint64_t nsec = (fs->bitmap_size + fs->bytes_per_sector - 1) / fs->bytes_per_sector;
     uint64_t used = 0;
     for (uint64_t sct = 0; sct < nsec; sct++) {
         struct bcache_buf* b = bcache_get(fs->dev, base + sct);
-        if (!b) { kmutex_unlock(&fs->lock); return -1; }
+        if (!b) return -1;
         for (uint32_t i = 0; i < fs->bytes_per_sector; i++) {
             uint64_t bit0 = (sct * fs->bytes_per_sector + i) * 8ull;
             if (bit0 >= fs->cluster_count) break;
@@ -1744,11 +1771,71 @@ static int exfat_statfs(struct dentry* mp, uint64_t* total, uint64_t* freeb) {
         }
         bcache_release(b);
     }
+    return (int64_t)used;
+}
+
+static int exfat_statfs(struct dentry* mp, uint64_t* total, uint64_t* freeb) {
+    struct exfat_fs* fs = fs_of_mp(mp);
+    if (!fs) return -1;
+    kmutex_lock(&fs->lock);
+    uint64_t fr = fs->free_clusters;              /* §M72 — the kept count */
     kmutex_unlock(&fs->lock);
     if (total) *total = (uint64_t)fs->cluster_count * fs->bytes_per_cluster;
-    if (freeb) *freeb = ((uint64_t)fs->cluster_count - used) * fs->bytes_per_cluster;
+    if (freeb) *freeb = fr * fs->bytes_per_cluster;
     return 0;
 }
+
+/* §M72 — the volume's reserve.  A USER's allocation that would leave less
+ * than `fs.reserve_kb` free is refused; the system (settings store, crash
+ * log, account database — all on this volume) keeps writing.  The same rule
+ * as the memory reserve one layer down, and for the same reason: the first
+ * thing to notice a full disk should not be the settings store failing to
+ * save.  Caller holds fs->lock. */
+static int fs_reserve_allows(struct exfat_fs* fs, uint64_t clusters) {
+    if (cred_current()->owner != TASK_OWNER_USER) return 1;
+    long kb = config_get_long("fs.reserve_kb", 1024);
+    uint64_t rc = kb > 0 ? ((uint64_t)kb * 1024 + fs->bytes_per_cluster - 1) / fs->bytes_per_cluster : 0;
+    static int said;
+    if (fs->free_clusters >= rc + clusters) {
+        if (said && fs->free_clusters > rc + rc / 4 + 16) said = 0;   /* re-arm */
+        return 1;
+    }
+    if (!said) {
+        said = 1;
+        kprintf("exfat: %s is at its %ld KiB reserve - users' writes that need "
+                "space are refused (the system keeps the reserve)\n", fs->dev->name, kb);
+    }
+    return 0;
+}
+
+/* §M72 — the kept free count must equal what the bitmap says. */
+static int audit_exfat_free(int verbose) {
+    int bad = 0, any = 0;
+    for (int i = 0; i < EXFAT_MAX_MOUNTS; i++) {
+        struct exfat_fs* fs = g_mounts[i];
+        if (!fs) continue;
+        any++;
+        kmutex_lock(&fs->lock);
+        int64_t used = bitmap_count_used(fs);
+        uint64_t kept = fs->free_clusters;
+        kmutex_unlock(&fs->lock);
+        uint64_t real = used < 0 ? 0 : (uint64_t)fs->cluster_count - (uint64_t)used;
+        if (used < 0 || real != kept) {
+            bad++;
+            kprintf("audit exfat-free: %s - kept %u free clusters, the bitmap says %u\n",
+                    fs->dev->name, (unsigned)kept, (unsigned)real);
+        } else if (verbose) {
+            kprintf("audit exfat-free: %s - %u free clusters, matches the bitmap\n",
+                    fs->dev->name, (unsigned)kept);
+        }
+    }
+    return any ? bad : AUDIT_SKIP;
+}
+AUDIT(exfat_free) = {
+    .name = "exfat-free",
+    .what = "every mounted exFAT volume's kept free-cluster count equals its bitmap",
+    .run  = audit_exfat_free,
+};
 
 
 /* The boot-region checksum (exFAT spec §3.4): every byte of sectors 0..10
@@ -1946,3 +2033,26 @@ static int exfat_module_init(void) {
 }
 
 MODULE("exfat", "fs", exfat_module_init);
+
+/* §M72 — declared beside its reader (fs_reserve_allows). */
+CONFIG_KEY(ck_fs_reserve) = {
+    .key = "fs.reserve_kb", .group = "System", .type = CFG_INT, .def = "1024",
+    .help = "space kept back on a volume: users' writes are refused below this "
+            "much free (KiB)",
+};
+
+/* §M72 — the audit's falsifier (hidden, like leaktest): skew the kept count by
+ * one cluster, run the audit — it must report exactly that — and put it back. */
+static void cmd_exfatfreetest(const char* a) {
+    (void)a;
+    struct exfat_fs* fs = g_mounts[0];
+    if (!fs) { kprintf("exfatfreetest: no exFAT volume mounted\n"); return; }
+    kmutex_lock(&fs->lock); fs->free_clusters++; kmutex_unlock(&fs->lock);
+    int v = audit_exfat_free(0);
+    kmutex_lock(&fs->lock); fs->free_clusters--; kmutex_unlock(&fs->lock);
+    int clean = audit_exfat_free(0);
+    kprintf("exfatfreetest: skewed %d violation(s) (want 1), restored %d (want 0): %s\n",
+            v, clean, (v == 1 && clean == 0) ? "PASS" : "FAIL");
+}
+SHELL_CMD(exfatfreetest) = { "exfatfreetest", "", 0, SHELL_G_TEST,
+                             cmd_exfatfreetest, SHELL_P_ADMIN };

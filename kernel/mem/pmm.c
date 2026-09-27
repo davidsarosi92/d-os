@@ -64,6 +64,8 @@
 #include "hal_api.h"
 #include "printf.h"
 #include "percpu.h"
+#include "config.h"
+#include "settings.h"
 #include <stdint.h>
 
 /* -------------------------------------------------------------------------- */
@@ -926,8 +928,83 @@ pmm_phys_t pmm_alloc_frame(void) {
  * resource. */
 int pmm_frame_is_highmem(pmm_phys_t frame) { return !frame_is_direct(frame); }
 
+/* ---------------------------------------------------------------------------
+ * §M72 — THE RESERVE.
+ *
+ * A reserve is only real if something is REFUSED.  What is refused here is
+ * USER memory: every page a program's address space asks for comes through
+ * pmm_alloc_frame_user*() (anonymous mmap, brk, the stack, ELF segments, COW
+ * copies, memfd/shm), and those stop at `mem.reserve_kb`.  Everything else —
+ * page tables, the heap, the compositor's surfaces, a crash report, the fault
+ * path — keeps drawing, because the reserve exists to keep THE MACHINE able to
+ * answer while something is eating it.  The intent is carried by the ENTRY
+ * POINT rather than a flag on every call: "who may not take the last frames"
+ * is one short list (this function's callers), which is the §M67 export-list
+ * argument applied to memory.
+ *
+ * THE RESERVE IS RESIDENT PHYSICAL MEMORY, and nothing here ever backs it with
+ * or measures it against a disk (§M74's rules): a reserve redeemable only
+ * through I/O needs memory to collect.
+ *
+ * It ANNOUNCES the crossing once, not per refusal — a low-memory condition
+ * that prints per page buries the log exactly when the log is the only
+ * instrument left — and again when memory is back above the reserve with a
+ * margin (so a hover at the line does not become a stream).  Not an OOM killer:
+ * choosing a victim is the user's escalation (Task Manager, `fkill`, and §M72's
+ * pause), and the reserve's job is to keep the machine able to ask. */
+static volatile int g_reserve_frames = -1;
+static volatile int g_low;                /* 1 while below the reserve */
+static uint32_t g_refused;                /* user frames refused, lifetime */
+
+static int reserve_frames(void) {
+    int r = g_reserve_frames;
+    if (r < 0) {
+        long kb = config_get_long("mem.reserve_kb", 4096);
+        if (kb < 0) kb = 0;
+        r = (int)(kb / 4);
+        g_reserve_frames = r;
+    }
+    return r;
+}
+
+static int reserve_allows(uint32_t n) {
+    uint32_t fr = pmm_free_frames();
+    uint32_t r  = (uint32_t)reserve_frames();
+    if (fr >= r + n) {
+        if (g_low && fr > r + r / 4 + 64 &&
+            __atomic_exchange_n(&g_low, 0, __ATOMIC_ACQ_REL))
+            kprintf("mem: free memory is back above the reserve (%u KiB free, "
+                    "reserve %u KiB)\n", fr * 4, r * 4);
+        return 1;
+    }
+    __atomic_add_fetch(&g_refused, 1, __ATOMIC_RELAXED);
+    if (!__atomic_exchange_n(&g_low, 1, __ATOMIC_ACQ_REL))
+        kprintf("mem: LOW MEMORY - %u KiB free is at the %u KiB reserve; programs' "
+                "new memory is refused until some is released (the system keeps "
+                "the reserve)\n", fr * 4, r * 4);
+    return 0;
+}
+
+void pmm_reserve_changed(void) { g_reserve_frames = -1; }
+void pmm_reserve_stats(uint32_t* reserve_kb, uint32_t* refused, int* low) {
+    if (reserve_kb) *reserve_kb = (uint32_t)reserve_frames() * 4;
+    if (refused) *refused = __atomic_load_n(&g_refused, __ATOMIC_RELAXED);
+    /* OBSERVED, not remembered (audit rule 2): the latch only moves on the
+     * next user allocation, and "below" read from it after the hog was
+     * killed would report a state that no longer exists. */
+    if (low) *low = pmm_free_frames() < (uint32_t)reserve_frames();
+}
+
 pmm_phys_t pmm_alloc_frame_user(void) {
+    if (!reserve_allows(1)) return PMM_ALLOC_FAIL;
     return page_alloc(0, ZONE_HIGHMEM);
+}
+
+/* The same, for a user frame the kernel must reach through a plain pointer
+ * (memfd/shm, zeroed and copied by the kernel): never highmem. */
+pmm_phys_t pmm_alloc_frame_user_low(void) {
+    if (!reserve_allows(1)) return PMM_ALLOC_FAIL;
+    return page_alloc(0, ZONE_DEFAULT);
 }
 
 /* The portable half of kmap: where every frame is directly mapped (x86_64,
@@ -1239,6 +1316,13 @@ void pmm_print_stats(void) {
             (total_free * 4) / 1024, (total_mgr * 4) / 1024,
             zm[ZONE_DMA], zf[ZONE_DMA], zm[ZONE_DMA32], zf[ZONE_DMA32],
             zm[ZONE_NORMAL], zf[ZONE_NORMAL], zm[ZONE_HIGHMEM], zf[ZONE_HIGHMEM]);
+    {
+        uint32_t rkb, refused; int low;
+        pmm_reserve_stats(&rkb, &refused, &low);
+        kprintf("pmm: reserve %u KiB for the system (mem.reserve_kb) - %s, %u user "
+                "frame(s) refused so far\n", rkb, low ? "BELOW it now" : "above it",
+                refused);
+    }
     if (g_nr_nodes > 1)
         for (int nd = 0; nd < g_nr_nodes; nd++) {
             struct pmm_node_info ni;
@@ -1247,3 +1331,18 @@ void pmm_print_stats(void) {
                     nd, (ni.managed * 4) / 1024, (ni.free * 4) / 1024, ni.hit, ni.miss);
         }
 }
+
+/* §M72 — the reserve is a machine setting (a user store may not lower it). */
+CONFIG_KEY(ck_mem_reserve) = {
+    .key = "mem.reserve_kb", .group = "System", .type = CFG_INT, .def = "4096",
+    .help = "memory kept back for the system: programs' new memory is refused "
+            "below this much free (KiB)",
+};
+static void reserve_watch(const char* key, const char* value) {
+    (void)key; (void)value;
+    pmm_reserve_changed();
+}
+CONFIG_WATCH(pmm_reserve_watch) = {
+    .prefix  = "mem.reserve_kb",
+    .changed = reserve_watch,
+};

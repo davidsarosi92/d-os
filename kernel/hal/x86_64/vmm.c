@@ -565,7 +565,7 @@ static uintptr_t clone_subtree(uint64_t* ptbl, uint64_t* ktbl, int depth,
                 continue;
             }
             /* Read-only (code) → eager private copy. */
-            pmm_phys_t fphys = pmm_alloc_frame();
+            pmm_phys_t fphys = pmm_alloc_frame_user();      /* §M72 */
             if (!fphys) return 0;
             const uint8_t* src = (const uint8_t*)phys_to_virt(fphys_old);
             uint8_t* dst = (uint8_t*)phys_to_virt(fphys);
@@ -652,7 +652,7 @@ int vmm_cow_fault(uintptr_t fault_va) {
         __atomic_store_n(rc, 0, __ATOMIC_RELEASE);
     } else {
         /* Shared (or untracked → always copy, see cow_slot): private copy. */
-        pmm_phys_t nf = pmm_alloc_frame();
+        pmm_phys_t nf = pmm_alloc_frame_user();     /* §M72 — user memory */
         if (!nf) return 0;                          /* OOM → treat as real fault */
         const uint8_t* src = (const uint8_t*)phys_to_virt(old);
         uint8_t* dst = (uint8_t*)phys_to_virt(nf);

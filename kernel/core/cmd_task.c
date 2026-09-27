@@ -397,11 +397,39 @@ static void loop_hog_main(void) {
  * lazy (the GUI window teardown reaps its own shells; CLI kills stay
  * as DEAD entries in `ps` until something reaps them — good enough
  * for a teaching kernel, and visible state is a feature here). */
-static void cmd_kill(const char* args) {
+/* §M72 — a pid, or the NAME of exactly one live task.  A name matching two
+ * tasks is refused rather than guessed: killing the wrong one of two is worse
+ * than asking for the number. */
+struct name_find { const char* name; int pid; int hits; };
+static void name_find_cb(const struct task* t, int cur, void* c) {
+    (void)cur;
+    struct name_find* f = (struct name_find*)c;
+    if (t->state == TASK_DEAD) return;
+    int i = 0;
+    while (f->name[i] && t->name[i] == f->name[i]) i++;
+    if (f->name[i] == 0 && t->name[i] == 0) { f->pid = t->pid; f->hits++; }
+}
+static int resolve_pid(const char* args, const char* verb, int* out) {
     int pid = 0, any = 0;
     while (*args == ' ') args++;
     for (; *args >= '0' && *args <= '9'; args++) { pid = pid * 10 + (*args - '0'); any = 1; }
-    if (!any) { console_write("kill: usage: kill <pid>\n"); return; }
+    if (any) { *out = pid; return 0; }
+    if (!*args) { kprintf("%s: usage: %s <pid|name>\n", verb, verb); return -1; }
+    char nm[TASK_NAME_MAX + 1];
+    int i = 0;
+    while (args[i] && args[i] != ' ' && i < TASK_NAME_MAX) { nm[i] = args[i]; i++; }
+    nm[i] = 0;
+    struct name_find f = { nm, -1, 0 };
+    task_for_each(name_find_cb, &f);
+    if (f.hits == 1) { *out = f.pid; return 0; }
+    if (f.hits == 0) kprintf("%s: no task named '%s'\n", verb, nm);
+    else             kprintf("%s: %d tasks are named '%s' - give the pid\n", verb, f.hits, nm);
+    return -1;
+}
+
+static void cmd_kill(const char* args) {
+    int pid = 0;
+    if (resolve_pid(args, "kill", &pid) != 0) return;
     if (task_current() && task_current()->pid == pid) {
         console_write("kill: refusing to kill the calling shell\n");
         return;
@@ -416,10 +444,8 @@ static void cmd_kill(const char* args) {
  * that never reaches a cooperative yield, so plain `kill` can't touch it).  It
  * dies at its next timer preemption in user mode. */
 static void cmd_fkill(const char* args) {
-    int pid = 0, any = 0;
-    while (*args == ' ') args++;
-    for (; *args >= '0' && *args <= '9'; args++) { pid = pid * 10 + (*args - '0'); any = 1; }
-    if (!any) { console_write("fkill: usage: fkill <pid>\n"); return; }
+    int pid = 0;
+    if (resolve_pid(args, "fkill", &pid) != 0) return;
     if (task_current() && task_current()->pid == pid) {
         console_write("fkill: refusing to kill the calling shell\n");
         return;
@@ -804,9 +830,9 @@ SHELL_CMD(yield)      = { "yield", "", "give up the rest of this quantum",
  * their own work and nobody else's.  Marking the verb ADMIN would have made
  * that check unreachable for exactly the people it was written for — a rule
  * derived from "is this dangerous" instead of "whose is it". */
-SHELL_CMD(kill)       = { "kill", "<pid>", "ask a task to exit",
+SHELL_CMD(kill)       = { "kill", "<pid|name>", "ask a task to exit",
                           SHELL_G_TASK, cmd_kill, SHELL_P_ANY };
-SHELL_CMD(fkill)      = { "fkill", "<pid>", "force-kill a wedged ring-3 task",
+SHELL_CMD(fkill)      = { "fkill", "<pid|name>", "force-kill a wedged ring-3 task",
                           SHELL_G_TASK, cmd_fkill, SHELL_P_ANY };
 /* §M32 — ANY, for the same reason as `kill`, and it is the third correction of
  * the same misjudgement: this verb's scope is the ARGUMENT's sign and the

@@ -11,6 +11,8 @@
  * for the next reader to learn.
  * =========================================================================== */
 
+#include "config.h"
+#include "pmm.h"
 #include "shellcmd.h"
 #include "cmd_util.h"
 #include "console.h"
@@ -328,6 +330,33 @@ static void cmd_chown(const char* args) {
     else if (r == -3) kprintf("chown: %s: the volume did not take the change - left as it was\n", path);
     else              kprintf("chown: %s now belongs to %s (uid %d)\n", path, u->name, u->uid);
 }
+
+/* §M72 — `df`: every mount, its size and what is free.  exFAT answers from
+ * its kept count (checked by `audit exfat-free`); the RAM filesystems have no
+ * size of their own — they are bounded by memory, so they report that, with
+ * the memory reserve beside it, rather than a made-up capacity. */
+static void cmd_df(const char* args) {
+    (void)args;
+    kprintf("MOUNT   FS   SIZE   FREE\n");
+    for (int i = 0; i < vfs_mount_count(); i++) {
+        const struct vfs_mount* m = vfs_mount_at(i);
+        if (!m) continue;
+        uint64_t tot = 0, fr = 0;
+        if (vfs_statfs(m->path, &tot, &fr) == 0) {
+            kprintf("%s   %s   %u KiB   %u KiB (%u%%)\n", m->path, m->fs_name,
+                    (unsigned)(tot / 1024), (unsigned)(fr / 1024),
+                    tot ? (unsigned)(fr * 100 / tot) : 0u);
+        } else {
+            uint32_t rkb; pmm_reserve_stats(&rkb, NULL, NULL);
+            kprintf("%s   %s   (memory)   %u KiB of RAM free, %u KiB of it the "
+                    "system's reserve\n", m->path, m->fs_name,
+                    pmm_free_frames() * 4, rkb);
+        }
+    }
+    kprintf("df: a user's writes stop at fs.reserve_kb = %ld KiB free on a volume\n",
+            config_get_long("fs.reserve_kb", 1024));
+}
+SHELL_CMD(df) = { "df", "", "free space on every mount", SHELL_G_FS, cmd_df, SHELL_P_ANY };
 
 /* §M32 — `stat <path>`: owner, group, mode, size, and whether the volume
  * keeps them.  The test for on-disk ownership reads it after a reboot. */

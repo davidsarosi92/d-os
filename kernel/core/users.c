@@ -605,6 +605,17 @@ static void make_home(struct user_account* u) {
     vfs_chown(u->home_real, u->uid, u->gid);
 }
 
+/* §M72 finding — the home is made where a SESSION needs it, not only when a
+ * volume is attached: a machine booted with no disk never ran
+ * users_ensure_homes, so `/root` did not exist and the per-account desktop
+ * fell back to the machine's.  Idempotent. */
+void users_ensure_home_of(int uid) {
+    for (int i = 0; i < USER_MAX_ACCOUNTS; i++) {
+        struct user_account* u = &g_users[i];
+        if (u->used && u->uid == uid && u->home[0]) { make_home(u); return; }
+    }
+}
+
 void users_ensure_homes(void) {
     for (int i = 0; i < USER_MAX_ACCOUNTS; i++) {
         struct user_account* u = &g_users[i];
