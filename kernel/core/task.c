@@ -159,6 +159,7 @@ static const char* state_name(enum task_state s) {
     switch (s) {
         case TASK_RUNNABLE: return "RUN";
         case TASK_SLEEPING: return "SLP";
+        case TASK_STOPPED:  return "STOP";
         case TASK_DEAD:     return "DEAD";
     }
     return "?";
@@ -1857,6 +1858,18 @@ static void wake_blocked_task(struct task* t) {
     wake_waitq_sleeper(t);
 }
 
+/* §M72 — STOPPED -> RUNNABLE, exactly once however many callers race: the
+ * state is the claim (CAS), and whoever wins the claim enqueues. */
+static int resume_stopped(struct task* t) {
+    int want = TASK_STOPPED;
+    t->stop_pending = 0;
+    if (!__atomic_compare_exchange_n((int*)&t->state, &want, (int)TASK_RUNNABLE, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return 0;
+    task_enqueue(t);
+    return 1;
+}
+
 /* §M32 stage 7 — MAY THE CALLER SIGNAL THIS TASK?
  *
  * One predicate, used by both kill paths.  A SYSTEM or KERNEL caller may
@@ -1883,6 +1896,7 @@ int task_kill(int pid) {
     if (!may_signal(t)) return -2;           /* §M32 — not yours */
     t->kill_pending = 1;
     wake_blocked_task(t);                    /* so it notices now, not at its deadline */
+    resume_stopped(t);                       /* §M72 — a paused task must run to die */
     task_notify_change();                    /* M22.4 — liveness will change */
     return 0;
 }
@@ -1913,6 +1927,7 @@ int task_force_kill(int pid) {
     t->kill_pending = 1;
     t->kill_forced  = 1;
     wake_blocked_task(t);                    /* §M49 — see task_kill */
+    resume_stopped(t);                       /* §M72 — see task_kill */
     task_notify_change();
     return 0;
 }
@@ -1923,9 +1938,75 @@ int task_force_kill(int pid) {
  * the point a busy-looping user task (frozen browser) can never reach through
  * the cooperative task_yield path.  A task force-killed while in a syscall is
  * left for its return-to-user / next cooperative yield instead. */
+/* §M72 — PAUSE HERE.  Called with interrupts off from the timer IRQ, with the
+ * interrupted context in ring 3: the task holds no kernel lock, no print lock,
+ * no VFS lock, so taking it off the CPU cannot stop anything else.  The same
+ * two-step discipline as task_msleep (§M54): mark, detach, and re-check that
+ * nobody resumed us in between — or a racing `cont` would leave us awake, on
+ * no queue, never picked again. */
+static void stop_self(struct task* self) {
+    /* Interrupts off for the two-step: the syscall-return caller has them on,
+     * and a tick between "mark" and "detach" would reschedule a half-stopped
+     * task.  In the IRQ caller they are already off and stay so. */
+    uint32_t fl = hal_intr_save();
+    self->stop_pending = 0;
+    self->state = TASK_STOPPED;
+    rq_detach_anywhere(self);
+    if (self->state != TASK_STOPPED) { task_enqueue(self); hal_intr_restore(fl); return; }
+    klog(KLOG_INFO, "task", "pid %d '%s' stopped (cpu %u ms so far)\n",
+         self->pid, self->name, (unsigned)self->cpu_ms);
+    task_notify_change();
+    hal_intr_restore(fl);
+    schedule();                          /* off every queue until task_cont */
+}
+
+int task_stop(int pid) {
+    if (pid == 0) return -1;
+    struct task* t = task_find(pid);
+    if (!t || t->is_idle || t->state == TASK_DEAD) return -1;
+    if (!may_signal(t)) return -2;
+    if (!t->user_task) return -3;
+    t->stop_pending = 1;
+    task_notify_change();
+    return 0;
+}
+
+/* §M72 — rule 7's falsifier (`stoptest`, hidden): put a STOPPED task on a
+ * runqueue ON PURPOSE, have the audit find it, and take it off again.  The
+ * task stays STOPPED throughout, so pick never runs it. */
+int task_stop_audit_selftest(int pid) {
+    struct task* t = task_find(pid);
+    if (!t || t->state != TASK_STOPPED) return -1;
+    uint32_t fl = hal_intr_save();
+    task_enqueue(t);                         /* the violation */
+    hal_intr_restore(fl);
+    struct rq_audit a;
+    task_rq_audit(&a);
+    int seen = a.stopped_queued;
+    fl = hal_intr_save();
+    rq_detach_anywhere(t);                   /* put it right */
+    hal_intr_restore(fl);
+    task_rq_audit(&a);
+    return seen * 10 + a.stopped_queued;     /* want 10: seen once, gone after */
+}
+
+int task_cont(int pid) {
+    struct task* t = task_find(pid);
+    if (!t || t->state == TASK_DEAD) return -1;
+    if (!may_signal(t)) return -2;
+    int was = resume_stopped(t);
+    task_notify_change();
+    return was ? 0 : 1;                  /* 1 = it was not stopped (request cancelled) */
+}
+
 void task_force_kill_point(int from_user) {
     if (!from_user) return;
     struct task* self = task_current();
+    if (self && self->stop_pending && !self->kill_pending && !self->is_idle &&
+        self->user_task && self->state == TASK_RUNNABLE) {
+        stop_self(self);
+        return;
+    }
     if (self && self->kill_forced && !self->is_idle && self->state != TASK_DEAD) {
         /* §M47 — a task reclaimed by force is a failure worth reporting: from
          * the user's side the app "stopped responding", and they should be able
@@ -2968,6 +3049,7 @@ int task_rq_audit(struct rq_audit* out) {
             for (int guard = RQ_WALK_MAX; ; guard--) {
                 len++;
                 load += task_load_contrib(t);
+                if (t->state == TASK_STOPPED)   a.stopped_queued++;   /* rule 7 */
                 if (t->cpu_home < 0)            a.orphan_home++;
                 else if (t->cpu_home != i)      a.bad_home++;
                 if (!t->rq_next || !t->rq_prev || guard <= 1) { closed = 0; break; }
@@ -3005,7 +3087,7 @@ int task_rq_audit(struct rq_audit* out) {
     if (out) *out = a;
     /* Structural rules only — see the contract in task.h for why `lost` and
      * `bad_load` are reported but not counted here. */
-    return a.bad_home + a.orphan_home + a.bad_count + a.broken_ring;
+    return a.bad_home + a.orphan_home + a.bad_count + a.broken_ring + a.stopped_queued;
 }
 
 

@@ -93,6 +93,11 @@ enum task_state {
     TASK_RUNNABLE,
     TASK_SLEEPING,
     TASK_DEAD,
+    /* §M72 — PAUSED: off every runqueue, keeps every frame, resumable.  Set
+     * only at a ring-3 safe point (task_force_kill_point), so a stopped task
+     * holds no kernel lock.  Appended: the numeric values of the three above
+     * appear in logs and diagnostics. */
+    TASK_STOPPED,
 };
 
 struct task {
@@ -329,6 +334,8 @@ struct task {
      * while in a syscall dies at its next return-to-user / cooperative yield
      * instead.  Used to reclaim a wedged ring-3 app (e.g. a frozen browser). */
     volatile int kill_forced;
+    /* §M72 — pause requested; honoured at the next ring-3 safe point. */
+    volatile int stop_pending;
     /* M22.3 — CPU time accounting: ms actually spent on a CPU.
      * `sched_in_ms` stamps switch-in; switch-out accumulates into
      * `cpu_ms`.  Feeds `ps` and the GUI task manager. */
@@ -717,6 +724,14 @@ int  task_should_stop(void);
  * task_kill.  Meant for a frozen user app (browser) — do NOT force-kill kernel
  * threads (they may hold locks); those still use the cooperative task_kill. */
 int  task_force_kill(int pid);
+/* §M72 — pause / resume a PROGRAM.  task_stop requests it; it takes effect at
+ * the program's next preemption in ring 3 (where it holds no kernel lock), or
+ * when it returns there from a blocking call.  0, -1 no such task, -2 not
+ * yours, -3 a kernel thread (they hold locks; pausing one could stop the
+ * machine).  task_cont undoes either a stop or a pending request. */
+int  task_stop(int pid);
+int  task_cont(int pid);
+int  task_stop_audit_selftest(int pid);   /* §M72 — `stoptest` */
 
 /* §M46 — opt a user task (pid) into runaway auto-force-kill after `ms` of CPU
  * hogging with no voluntary yield (0 disables).  Set by a launcher per package. */
@@ -812,6 +827,7 @@ struct rq_audit {
     int broken_ring;        /* rule 4 — not circular within the bound        */
     int lost;               /* rule 5 — ready, unqueued, running nowhere     */
     int bad_load;           /* rule 6 — published rq_load is stale           */
+    int stopped_queued;     /* rule 7 (§M72) — a STOPPED task on a runqueue  */
 };
 
 /* Returns the number of STRUCTURAL violations — rules 1-4 only, the ones that

@@ -743,6 +743,13 @@ int sys_kill(int pid, int sig) {
             if (!ok) return -1;
         }
     }
+    /* §M72 — STOP and CONT are not DELIVERED, they are ACTED ON: neither
+     * runs a handler (STOP cannot be caught or ignored, and CONT's effect is
+     * the resumption itself), so they go straight to the scheduler.  They
+     * used to be named in all three signal.c files and implemented nowhere:
+     * a SIGSTOP set a pending bit whose default action was to terminate. */
+    if (sig == SIGSTOP || sig == SIGTSTP) return task_stop(pid) == 0 ? 0 : -1;
+    if (sig == SIGCONT) { task_cont(pid); return 0; }
     t->sig_pending |= (1u << sig);
     return 0;
 }

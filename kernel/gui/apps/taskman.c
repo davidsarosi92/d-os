@@ -128,6 +128,9 @@ static const char* state_short(enum task_state st) {
     case TASK_RUNNABLE: return "RUN ";
     case TASK_SLEEPING: return "SLP ";
     case TASK_DEAD:     return "DEAD";
+    /* §M72 — its own word, never RUN or SLP: a paused program that looks
+     * like a wedged one gets force-killed by the person looking at it. */
+    case TASK_STOPPED:  return "STOP";
     default:            return "?   ";
     }
 }
@@ -566,6 +569,31 @@ static void tm_kill_force(struct w_button* b, void* ctx) {
                        : "not found or protected (pid 0 / idle)");
 }
 
+/* §M72 "Pause / Resume" — ONE button that does whichever the selected task
+ * needs (the Device Manager's "Move" argument: a pair would always have one
+ * half greyed out, and a control whose usual state is disabled is one nobody
+ * learns).  A paused program keeps all its memory and resumes exactly where
+ * it stopped; this is the rung below "End task". */
+static void tm_pause(struct w_button* b, void* ctx) {
+    (void)b; (void)ctx;
+    struct taskman* tm = (struct taskman*)gui_window_ctx(tm_win);
+    if (!tm) return;
+    int pid = tm_selected_pid(tm);
+    if (pid < 0) return;
+    struct task* t = task_find(pid);
+    const char* msg;
+    if (t && t->state == TASK_STOPPED) {
+        msg = task_cont(pid) == 0 ? "resumed" : "could not resume";
+    } else {
+        int rc = task_stop(pid);
+        msg = rc == 0  ? "pausing - it stops at its next moment in user mode"
+            : rc == -3 ? "kernel threads cannot be paused"
+            : rc == -2 ? "not yours" : "not found";
+    }
+    tm_refresh(tm_win);
+    tm_say(tm, msg);
+}
+
 /* §M75 — WHAT THE REFRESH COSTS, reported rather than reasoned about.
  *
  * Reported from use: *"with the Task Manager running the CPU sits at 75 %."*
@@ -654,7 +682,7 @@ static void tm_tick(struct gui_window* win) {
  * the pointers the tick and the refresh use are only valid until the next
  * layout.  That is the same contract every composed panel here follows. */
 enum {
-    TM_ID_TABLE = 1, TM_ID_CHARTS, TM_ID_ROW, TM_ID_END, TM_ID_FKILL,
+    TM_ID_TABLE = 1, TM_ID_CHARTS, TM_ID_ROW, TM_ID_END, TM_ID_FKILL, TM_ID_PAUSE,
     TM_ID_STATUS, TM_ID_CHART0,     /* …CHART0 + SYSMON_NSERIES - 1 */
 };
 
@@ -665,13 +693,14 @@ static void tm_ui_event(struct gui_window* win, int id, int type, int value,
     if (type != UI_EV_CLICK) return;
     if (id == TM_ID_END)   tm_kill(NULL, tm);
     if (id == TM_ID_FKILL) tm_kill_force(NULL, tm);
+    if (id == TM_ID_PAUSE) tm_pause(NULL, tm);
 }
 
 static void tm_layout(struct gui_window* win) {
     struct taskman* tm = (struct taskman*)gui_window_ctx(win);
     if (!tm) return;
 
-    struct ui_spec spec[8 + SYSMON_NSERIES];
+    struct ui_spec spec[9 + SYSMON_NSERIES];
     int n = 0;
     spec[n++] = (struct ui_spec){ .id = TM_ID_TABLE, .cls = "view",
         .text = "table", .weight = 1, .flags = UI_EDGE | UI_FOCUSABLE };
@@ -685,6 +714,8 @@ static void tm_layout(struct gui_window* win) {
         .flags = UI_ROW | UI_FILL_W };
     spec[n++] = (struct ui_spec){ .id = TM_ID_END, .parent = TM_ID_ROW,
         .cls = "button", .text = "End task" };
+    spec[n++] = (struct ui_spec){ .id = TM_ID_PAUSE, .parent = TM_ID_ROW,
+        .cls = "button", .text = "Pause / Resume" };
     spec[n++] = (struct ui_spec){ .id = TM_ID_FKILL, .parent = TM_ID_ROW,
         .cls = "button", .text = "Force kill" };
     spec[n++] = (struct ui_spec){ .id = TM_ID_STATUS, .cls = "label",

@@ -847,6 +847,11 @@ void isr_handler(struct int_frame* f) {
      * syscall is never torn down half-way through one. */
         hal_intr_enable();
         syscall_dispatch(f);
+        /* §M72 — the way back to ring 3 is a safe point too (no kernel lock
+         * is held once the call has returned): a pending stop or forced kill
+         * takes effect here, so a program that spends its life blocked in
+         * system calls is not out of reach of either. */
+        task_force_kill_point(1);
         /* M34 — deliver a pending signal on the way back to ring 3 (rewrites
          * the trapframe to enter the handler; no-op in kernel mode). */
         signal_deliver(f);

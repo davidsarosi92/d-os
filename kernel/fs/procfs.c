@@ -395,6 +395,7 @@ static const char* state_name(enum task_state s) {
     switch (s) {
         case TASK_RUNNABLE: return "RUN";
         case TASK_SLEEPING: return "SLP";
+        case TASK_STOPPED:  return "STOP";
         case TASK_DEAD:     return "DEAD";
     }
     return "?";

@@ -152,6 +152,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                  * unmasking here does not disturb the return to EL0. */
                 hal_intr_enable();
                 aarch64_syscall(tf);
+                task_force_kill_point(1);     /* §M72 — return to EL0 is a safe point */
                 /* §A1 — deliver a pending signal on the way back to EL0, the
                  * same hook point the x86 ports use.  It must run AFTER the
                  * syscall so the handler frame captures the syscall's result

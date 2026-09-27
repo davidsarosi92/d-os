@@ -223,10 +223,10 @@ static void rq_audit_print(const char* tag, const struct rq_audit* a, int bad) {
     /* Structural verdict first, because that is the pass/fail one; the two
      * soft counters follow, labelled, so a stale estimate can never be
      * mistaken for a corrupted runqueue. */
-    kprintf("%s: %d queued | struct: home %d orphan %d count %d ring %d -> %s"
+    kprintf("%s: %d queued | struct: home %d orphan %d count %d ring %d stopped %d -> %s"
             " | soft: lost %d load %d\n",
             tag, a->tasks_queued, a->bad_home, a->orphan_home, a->bad_count,
-            a->broken_ring, bad ? "VIOLATIONS" : "consistent",
+            a->broken_ring, a->stopped_queued, bad ? "VIOLATIONS" : "consistent",
             a->lost, a->bad_load);
 }
 
@@ -439,6 +439,78 @@ static void cmd_kill(const char* args) {
     else if (r == -2) kprintf("kill: pid %d belongs to somebody else\n", pid);
     else              kprintf("kill: pid %d not found or protected\n", pid);
 }
+
+/* §M72 — `stop <pid|name>` / `cont <pid|name>`: pause a program and resume
+ * it.  The program keeps every frame it holds and stays resumable; it stops
+ * at its next moment in ring 3, where it holds no kernel lock — so a program
+ * in the middle of a system call finishes that call first. */
+static void cmd_stop(const char* args) {
+    int pid = 0;
+    if (resolve_pid(args, "stop", &pid) != 0) return;
+    int r = task_stop(pid);
+    if (r == 0)       kprintf("stop: pid %d will stop at its next moment in user mode\n", pid);
+    else if (r == -2) kprintf("stop: pid %d belongs to somebody else\n", pid);
+    else if (r == -3) kprintf("stop: pid %d is a kernel thread - only programs can be "
+                              "paused (a paused kernel thread could hold a lock the "
+                              "machine needs)\n", pid);
+    else              kprintf("stop: pid %d not found\n", pid);
+}
+static void cmd_cont(const char* args) {
+    int pid = 0;
+    if (resolve_pid(args, "cont", &pid) != 0) return;
+    int r = task_cont(pid);
+    if (r == 0)       kprintf("cont: pid %d resumed\n", pid);
+    else if (r == 1)  kprintf("cont: pid %d was not stopped (any pending stop cancelled)\n", pid);
+    else if (r == -2) kprintf("cont: pid %d belongs to somebody else\n", pid);
+    else              kprintf("cont: pid %d not found\n", pid);
+}
+/* §M72 — `stoptest`: the falsifier set for the pause.  (1) a program blocked
+ * inside a system call is asked to stop and must NOT stop there — only on its
+ * way back to user mode; (2) rule 7 of the runqueue audit must see a STOPPED
+ * task put on a queue on purpose.  Hidden (help = 0), like leaktest. */
+extern const unsigned char _binary_user_memhog_elf_start[]         __attribute__((weak));
+extern const unsigned char _binary_user_memhog_elf_end[]           __attribute__((weak));
+extern const unsigned char _binary_user_memhog_x86_64_elf_start[]  __attribute__((weak));
+extern const unsigned char _binary_user_memhog_x86_64_elf_end[]    __attribute__((weak));
+extern const unsigned char _binary_user_memhog_aarch64_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_memhog_aarch64_elf_end[]   __attribute__((weak));
+static void cmd_stoptest(const char* args) {
+    (void)args;
+    const unsigned char *s = 0, *e = 0;
+    if (_binary_user_memhog_elf_start)             { s = _binary_user_memhog_elf_start;         e = _binary_user_memhog_elf_end; }
+    else if (_binary_user_memhog_x86_64_elf_start) { s = _binary_user_memhog_x86_64_elf_start;  e = _binary_user_memhog_x86_64_elf_end; }
+    else if (_binary_user_memhog_aarch64_elf_start){ s = _binary_user_memhog_aarch64_elf_start; e = _binary_user_memhog_aarch64_elf_end; }
+    if (!s) { kprintf("stoptest: no memhog embedded\n"); return; }
+    /* memhog sleeps 2 s between steps, i.e. it spends nearly all its time
+     * blocked inside nanosleep — a system call. */
+    int pid = proc_spawn("stoptest-prog", s, (size_t)(e - s));
+    if (pid < 0) { kprintf("stoptest: spawn failed\n"); return; }
+    task_msleep(300);
+    struct task* t = task_find(pid);
+    int blocked_at_request = t && t->state == TASK_SLEEPING;
+    task_stop(pid);
+    task_msleep(200);
+    t = task_find(pid);
+    int still_blocked = t && t->state == TASK_SLEEPING;    /* NOT stopped mid-call */
+    int stopped = 0;
+    for (int i = 0; i < 60 && t && t->state != TASK_STOPPED; i++) { task_msleep(50); t = task_find(pid); }
+    stopped = t && t->state == TASK_STOPPED;
+    int rule7 = stopped ? task_stop_audit_selftest(pid) : -1;
+    task_cont(pid);
+    task_force_kill(pid);
+    int ok = blocked_at_request && still_blocked && stopped && rule7 == 10;
+    kprintf("stoptest: blocked at the request %s, still blocked 200 ms later %s, "
+            "stopped once back in user mode %s, audit rule 7 %s -> %s\n",
+            blocked_at_request ? "yes" : "NO", still_blocked ? "yes" : "NO",
+            stopped ? "yes" : "NO", rule7 == 10 ? "saw it and cleared" : "WRONG",
+            ok ? "PASS" : "FAIL");
+}
+SHELL_CMD(stoptest) = { "stoptest", "", 0, SHELL_G_TEST, cmd_stoptest, SHELL_P_ADMIN };
+
+SHELL_CMD(stop) = { "stop", "<pid|name>", "pause a program (keeps its memory, resumable)",
+                    SHELL_G_TASK, cmd_stop, SHELL_P_ANY };
+SHELL_CMD(cont) = { "cont", "<pid|name>", "resume a paused program",
+                    SHELL_G_TASK, cmd_cont, SHELL_P_ANY };
 
 /* §M46 — force-kill: reclaims a WEDGED ring-3 task (one spinning in userland
  * that never reaches a cooperative yield, so plain `kill` can't touch it).  It

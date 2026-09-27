@@ -177,6 +177,9 @@ struct kdirent { uint16_t reclen; uint8_t type; char name[]; };
 #define SIGUSR2    12
 #define SIGTERM    15
 #define SIGCHLD    17
+#define SIGCONT    18       /* §M72 — resume a stopped task (Linux's number)    */
+#define SIGSTOP    19       /* §M72 — stop it; unblockable, uncatchable         */
+#define SIGTSTP    20       /* §M72 — terminal stop: treated as SIGSTOP here    */
 #define SIG_DFL    0        /* default action (terminate or ignore)            */
 #define SIG_IGN    1        /* ignore                                          */
 

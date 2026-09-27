@@ -700,6 +700,7 @@ static const struct locale_entry en_strings[] = {
     { "greeter.title", "d-os - sign in to continue" },
     { "Sign in", "Sign in" },
     { "lock.prompt.signin", "Nobody is signed in.  Choose an account and sign in." },
+    { "Pause / Resume", "Pause / Resume" },
 };
 
 LOCALE_CATALOG(loc_en) = {
@@ -1174,6 +1175,7 @@ static const struct locale_entry hu_strings[] = {
     { "greeter.title", "d-os - jelentkezz be a folytat\xE1shoz" },
     { "Sign in", "Bejelentkez\xE9s" },
     { "lock.prompt.signin", "Senki nincs bejelentkezve.  V\xE1lasszon fi\xF3kot, \xE9s jelentkezzen be." },
+    { "Pause / Resume", "Sz\xFCnet / Folytat\xE1s" },
 };
 
 LOCALE_CATALOG(loc_hu) = {
