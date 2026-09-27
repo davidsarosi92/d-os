@@ -5,11 +5,15 @@
 Network page + taskbar network indicator + Wi-Fi chooser (a SIMULATED adapter,
 `wifisim on`, because QEMU has no Wi-Fi), Disks page (`disk` on a console):
 mount / unmount / format / RAM disks.  `locale missing on` + `locale missing`
-measures untranslated strings as they are drawn.  Open, in order:
-1. a second virtio-blk disk (the driver is single-device; RAM disks stand in);
-2. partition tables (the probe reports "partitioned" and stops);
-3. a real Wi-Fi driver behind `net_wireless_ops`;
-4. the phone emulator (§M84 stages 1-2) — the fourth standard test machine.
+measures untranslated strings as they are drawn.  Agreed order (2026-09-27, see PLAN "Open work — exact state"):
+1. finish the half-done milestones — §M23 virtio-sound IRQ, §M26/§M59
+   `wl_data_device`, §M32 simultaneous sessions + on-disk ownership, §M85
+   sbsa-ref display + INTx routing, §M86 NX on i386 PAE, §M19.5 NUMA zones;
+2. then §M82, §M72, §M74, §M73 (any order; §M74 needs §M72);
+3. then §M81 (the GUI seams verdict).
+Any defect found on the way is fixed first, whatever it touches.
+Also open from §M87: a second virtio-blk disk, partition tables, a real Wi-Fi
+driver.  The phone emulator (§M84) is not in the agreed list yet.
 
 
 ## §M83 is written up in PLAN.md — everything a package, repos split last
