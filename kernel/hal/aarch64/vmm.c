@@ -602,6 +602,17 @@ static uint64_t* user_l3_of(struct vmm_space* s, uintptr_t va) {
     if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) return NULL;
     return (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
 }
+
+int vmm_space_swapped_entry(struct vmm_space* s, uintptr_t va, uint32_t* slot, uint32_t* flags) {
+    if (!s || ((va >> 30) & 0x1FF) < 4 || (va >> 39)) return -1;
+    uint64_t* l3 = user_l3_of(s, va);
+    if (!l3) return -1;
+    uint64_t e = l3[(va >> 12) & 0x1FF];
+    if ((e & PTE_VALID) || !(e & VMM_SWPE_MARK)) return -1;
+    *slot = (uint32_t)(e >> 12);
+    *flags = VMM_USER | ((e & VMM_SWPE_W) ? VMM_WRITABLE : 0) | ((e & VMM_SWPE_X) ? VMM_EXEC : 0);
+    return 0;
+}
 int vmm_space_mark_swapped(struct vmm_space* s, uintptr_t va, uint32_t slot, uint32_t flags) {
     if (!s || va < (4ull << 30)) return -1;         /* user region only */
     uint64_t* l3 = user_l3_of(s, va);

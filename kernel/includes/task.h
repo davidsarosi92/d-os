@@ -744,6 +744,7 @@ int  task_force_kill(int pid);
  * machine).  task_cont undoes either a stop or a pending request. */
 int  task_stop(int pid);
 int  task_cont(int pid);
+int  task_cont_lazy(int pid);             /* §M74 — resume; pages come back on fault */
 int  task_stop_audit_selftest(int pid);   /* §M72 — `stoptest` */
 /* §M72 stage 3 — exclusive right to rewrite a STOPPED task's pages.  claim
  * returns 0 if the task is stopped and nobody else holds it, -1 otherwise;

@@ -646,3 +646,32 @@ static void blkstormtest(const char* args) {
 }
 SHELL_CMD(blkstormtest) = { "blkstormtest", "[ms]", 0, SHELL_G_TEST, blkstormtest, SHELL_P_ADMIN };
 
+
+/* `blkbench` (hidden, 2026-09-27) — what ONE request costs, with no cache in
+ * the way: 200 reads of 8 sectors at scattered LBAs straight through
+ * blk_read, timed, with the completion interrupts counted.  Written because a
+ * swap-in measured 10.8 ms per page, 98 % of it inside one such read, and
+ * "the disk is slow" and "the completion never wakes the waiter" look the same
+ * from above. */
+#include "shellcmd.h"
+static void cmd_blkbench(const char* args) {
+    (void)args;
+    struct block_device* d = blk_find("vda");
+    if (!d) { kprintf("blkbench: no vda\n"); return; }
+    static uint8_t buf[4096];
+    uint32_t irq0 = vblk_irqs;
+    uint64_t t0 = timer_now_ns(), worst = 0;
+    int n = 200, bad = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t lba = ((uint64_t)i * 7919u * 8u) % (d->sector_count - 8);
+        uint64_t a = timer_now_ns();
+        if (blk_read(d, lba, 8, buf) != 0) bad++;
+        uint64_t dt = timer_now_ns() - a;
+        if (dt > worst) worst = dt;
+    }
+    uint64_t total = timer_now_ns() - t0;
+    kprintf("blkbench: %d reads of 4 KiB, mean %u us, worst %u us, %u completion "
+            "interrupt(s), %d error(s)\n", n, (unsigned)(total / 1000u / (uint64_t)n),
+            (unsigned)(worst / 1000u), vblk_irqs - irq0, bad);
+}
+SHELL_CMD(blkbench) = { "blkbench", "", 0, SHELL_G_TEST, cmd_blkbench, SHELL_P_ADMIN };

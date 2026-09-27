@@ -34,7 +34,9 @@
 #include "config.h"
 #include "uaccess.h"   /* §1.1 — fault-fixup table for user copies */
 #include "drvguard.h"  /* §M33 Tier 0 — contain a driver fault */
-#include "vmm.h"       /* M34 — vmm_cow_fault on a write to a fork-shared page */
+#include "vmm.h"
+#include "swap.h"
+#include "percpu.h"       /* M34 — vmm_cow_fault on a write to a fork-shared page */
 #include "percpu.h"    /* §M54 — name the CPU in the ring-0 fault dump */
 #include <stdint.h>
 
@@ -578,6 +580,12 @@ void isr_handler(struct int_frame* f) {
             uint64_t cr2;
             __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
             if (vmm_cow_fault((uintptr_t)cr2)) return;
+            /* §M74 rung 3 — see the i386 twin. */
+            {
+                int can_sleep = (f->cs & 3) == 3 ||
+                                ((f->rflags & 0x200) && this_cpu()->preempt_count == 0);
+                if (swap_in_fault((uintptr_t)cr2, can_sleep)) return;
+            }
         }
         /* §1.1 — user-access exception table (see the i386 twin): a kernel-mode
          * fault inside a uaccess primitive resumes at its fixup, so a user

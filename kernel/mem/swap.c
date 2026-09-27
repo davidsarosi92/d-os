@@ -60,6 +60,8 @@
 #include "lock.h"
 #include "kmutex.h"
 #include "timer.h"
+#include "pcache.h"
+#include "hal_api.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -146,8 +148,10 @@ static int store_open(const char** why) {
 
 struct swap_req {
     struct work w;
-    int         op;                 /* 1 = evict, 2 = restore */
+    int         op;                 /* 1 = evict, 2 = restore, 3 = one page back */
     struct task* t;
+    struct vmm_space* mm;           /* op 3 */
+    uintptr_t   va;                 /* op 3 */
     struct swap_report rep;
     volatile int done;
 };
@@ -282,9 +286,60 @@ out:
     kfree(c);
 }
 
+/* §M74 rung 3 — ONE page back, for a fault.  Re-checked here, under the
+ * serialising mutex: two threads of one program can fault the same page, and
+ * the second must find it already present rather than read a released slot. */
+static uint32_t g_swapins, g_swapin_fail;
+static uint64_t g_in_read_ns, g_in_total_ns;       /* where a swap-in's time goes */
+static void do_restore_one_body(struct swap_req* r, uint64_t t0);
+static void do_restore_one(struct swap_req* r) {
+    uint64_t t0 = timer_now_ns();
+    do_restore_one_body(r, t0);
+    g_in_total_ns += timer_now_ns() - t0;
+}
+static void do_restore_one_body(struct swap_req* r, uint64_t t0) {
+    (void)t0;
+    struct swap_report* rep = &r->rep;
+    uint32_t slot, fl;
+    rep->result = SWAP_OK;
+    if (vmm_space_swapped_entry(r->mm, r->va, &slot, &fl) != 0) return;   /* already back */
+    if (!g_store) { rep->why = "the swap store is gone"; rep->result = SWAP_FAILED; return; }
+    pmm_phys_t f = pmm_alloc_frame_user();
+    if (f == PMM_ALLOC_FAIL) { pcache_reclaim(64); f = pmm_alloc_frame_user(); }
+    if (f == PMM_ALLOC_FAIL) {
+        rep->why = "no memory to read the page back into";
+        rep->result = SWAP_FAILED;
+        return;
+    }
+    g_store->pos = (uint64_t)slot * 4096u;
+    uint64_t tr = timer_now_ns();
+    ssize_t got = vfs_read(g_store, g_buf, 4096);
+    g_in_read_ns += timer_now_ns() - tr;
+    if (got != 4096) {
+        pmm_free_frame(f);
+        rep->why = "a read from the swap store failed";
+        rep->result = SWAP_FAILED;
+        return;
+    }
+    void* dst = kmap_frame(f);
+    for (int k = 0; k < 4096; k++) ((uint8_t*)dst)[k] = g_buf[k];
+    kunmap_frame(dst);
+    if (vmm_space_map(r->mm, r->va, f, fl | VMM_USER) != 0) {
+        pmm_free_frame(f);
+        rep->why = "the page could not be mapped back";
+        rep->result = SWAP_FAILED;
+        return;
+    }
+    swap_slot_release(slot);
+    rep->restored = 1;
+    g_swapins++;
+}
+
 static void swap_work(struct work* w) {
     struct swap_req* r = (struct swap_req*)w;
-    if (r->op == 1) do_evict(r); else do_restore(r);
+    if (r->op == 1) do_evict(r);
+    else if (r->op == 3) do_restore_one(r);
+    else do_restore(r);
     __atomic_store_n(&r->done, 1, __ATOMIC_RELEASE);
 }
 
@@ -351,6 +406,65 @@ int swap_stop_evict(int pid, struct swap_report* rep) {
     swap_evict_task(t, rep);
     task_swap_release(t, 1);
     return rep->evicted ? 0 : -1;
+}
+
+/* The task that OWNS an address space (its counter is the one to adjust): the
+ * faulting task itself unless it is a thread borrowing the space. */
+struct owner_find { struct vmm_space* mm; struct task* owner; };
+static void owner_cb(const struct task* t, int cur, void* c) {
+    (void)cur;
+    struct owner_find* o = (struct owner_find*)c;
+    if (t->mm == o->mm && !t->mm_shared && t->state != TASK_DEAD) o->owner = (struct task*)t;
+}
+
+/* §M74 rung 3 — a fault on an evicted page reads it back and retries.
+ * `can_sleep` is the ARCH's judgement: the fault came from user mode, or from
+ * a kernel access made with interrupts on and no spinlock held — reading the
+ * store sleeps, and sleeping anywhere else is a deadlock or a corrupted lock.
+ * Returns 1 when the page is back (retry the instruction), 0 when this was not
+ * an evicted page or it cannot come back (the fault is then a real one). */
+int swap_in_fault(uintptr_t va, int can_sleep) {
+    struct task* t = task_current();
+    if (!t || !t->mm) return 0;
+    va &= ~(uintptr_t)4095;
+    uint32_t slot, fl;
+    if (vmm_space_swapped_entry(t->mm, va, &slot, &fl) != 0) return 0;
+    if (!can_sleep) return 0;
+    struct swap_req req;
+    for (unsigned i = 0; i < sizeof req; i++) ((char*)&req)[i] = 0;
+    req.op = 3; req.mm = t->mm; req.va = va;
+    uint32_t ifl = hal_intr_save();
+    hal_intr_enable();                        /* the read sleeps */
+    /* Once the store is open, a swap-in needs no worker: the kworker exists so
+     * the store is CREATED with SYSTEM credentials, and reading an open file
+     * checks nothing.  Going direct removes a queue round trip and a polling
+     * sleep from every page that comes back. */
+    if (g_store) {
+        kmutex_lock(&g_swap_mx);
+        do_restore_one(&req);
+        kmutex_unlock(&g_swap_mx);
+    } else {
+        run_req(&req);
+    }
+    hal_intr_restore(ifl);
+    if (req.rep.result != SWAP_OK) {
+        if (!g_swapin_fail++)
+            kprintf("swap: pid %d '%s' - page %p cannot come back: %s\n",
+                    t->pid, t->name, (void*)va, req.rep.why ? req.rep.why : "?");
+        return 0;
+    }
+    if (req.rep.restored) {
+        struct owner_find o = { t->mm, t->mm_shared ? NULL : t };
+        if (!o.owner) task_for_each(owner_cb, &o);
+        if (o.owner && o.owner->swapped_pages)
+            __atomic_sub_fetch(&o.owner->swapped_pages, 1, __ATOMIC_RELAXED);
+    }
+    return 1;
+}
+uint32_t swap_in_count(void) { return g_swapins; }
+void swap_in_timing(uint32_t* read_us, uint32_t* total_us) {
+    *read_us = (uint32_t)(g_in_read_ns / 1000u);
+    *total_us = (uint32_t)(g_in_total_ns / 1000u);
 }
 
 /* ---- the invariant -------------------------------------------------------- */

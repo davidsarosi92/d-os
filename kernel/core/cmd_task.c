@@ -18,6 +18,8 @@
 #include "printf.h"
 #include "task.h"
 #include "swap.h"
+#include "block_cache.h"
+#include "block.h"
 #include "pmm.h"
 #include "percpu.h"
 #include "lock.h"
@@ -663,6 +665,64 @@ static void cmd_killusertest(const char* args) {
             n, clean, faulted, other, faulted || other ? "FAIL" : "PASS");
 }
 SHELL_CMD(killusertest) = { "killusertest", "", 0, SHELL_G_TEST, cmd_killusertest, SHELL_P_ADMIN };
+
+/* `swapfaulttest` (hidden, §M74 rung 3) — evict a running program and resume
+ * it WITHOUT reading anything back: every page must return through the swap-in
+ * fault as the program touches it.  memhog verify re-checks all 8 MiB twice a
+ * second, so it touches every evicted page; its "pass N ok" lines after the
+ * resume are the byte check, and here the kernel checks that the number of
+ * pages that came back by fault is the number that went out. */
+static void cmd_swapfaulttest(const char* args) {
+    (void)args;
+    const unsigned char *s = 0, *e = 0;
+    if (_binary_user_memhog_elf_start)             { s = _binary_user_memhog_elf_start;         e = _binary_user_memhog_elf_end; }
+    else if (_binary_user_memhog_x86_64_elf_start) { s = _binary_user_memhog_x86_64_elf_start;  e = _binary_user_memhog_x86_64_elf_end; }
+    else if (_binary_user_memhog_aarch64_elf_start){ s = _binary_user_memhog_aarch64_elf_start; e = _binary_user_memhog_aarch64_elf_end; }
+    if (!s) { kprintf("swapfaulttest: no memhog embedded\n"); return; }
+    const char* argv[2] = { "memhog", "verify" };
+    int pid = proc_spawn_argv("swapf-prog", s, (size_t)(e - s), 2, argv, 0);
+    if (pid < 0) { kprintf("swapfaulttest: spawn failed\n"); return; }
+    task_msleep(2500);
+    task_stop(pid);
+    struct task* t = task_find(pid);
+    for (int i = 0; i < 100 && t && t->state != TASK_STOPPED; i++) { task_msleep(20); t = task_find(pid); }
+    if (!t || t->state != TASK_STOPPED || task_swap_claim(t) != 0) {
+        kprintf("swapfaulttest: could not pause it - FAIL\n"); task_kill_tree(pid); return;
+    }
+    struct swap_report rep;
+    swap_evict_task(t, &rep);
+    task_swap_release(t, 1);
+    uint32_t in0 = swap_in_count();
+    extern uint64_t g_exfat_chain_steps;
+    struct bcache_stats b0, b1;
+    bcache_get_stats(&b0);
+    uint64_t cs0 = g_exfat_chain_steps;
+    task_cont_lazy(pid);
+    task_msleep(9000);                        /* every page back, then checked */
+    uint32_t back = swap_in_count() - in0;
+    bcache_get_stats(&b1);
+    extern uint64_t g_bc_io_ns, g_bc_ra_runs, g_bc_ra_sectors;
+    { struct block_device* vd = blk_find("vda");
+      kprintf("swapfaulttest: bcache disk-read time %u ms, read-ahead runs %u (%u sectors), vda sectors %u\n",
+              (unsigned)(g_bc_io_ns / 1000000u), (unsigned)g_bc_ra_runs, (unsigned)g_bc_ra_sectors,
+              vd ? (unsigned)vd->sector_count : 0); }
+    kprintf("swapfaulttest: bcache hits %u misses %u flushes %u; FAT links followed %u\n",
+            (unsigned)(b1.hits - b0.hits), (unsigned)(b1.misses - b0.misses),
+            (unsigned)(b1.flushes - b0.flushes), (unsigned)(g_exfat_chain_steps - cs0));
+    uint32_t left = t->swapped_pages;
+    uint32_t used = 0;
+    swap_stats(&used, 0);
+    task_kill_tree(pid);
+    int ok = rep.evicted >= 2048 && back == rep.evicted && left == 0 && used == 0;
+    uint32_t rd_us = 0, tot_us = 0;
+    swap_in_timing(&rd_us, &tot_us);
+    kprintf("swapfaulttest: swap-in time %u ms, of it reading the store %u ms (%u us per page)\n",
+            tot_us / 1000u, rd_us / 1000u, back ? tot_us / back : 0);
+    kprintf("swapfaulttest: evicted %u, came back by fault %u, still out %u, slots in use %u "
+            "-> %s (the program's own 'pass N ok' after the resume is the byte check)\n",
+            rep.evicted, back, left, used, ok ? "PASS" : "FAIL");
+}
+SHELL_CMD(swapfaulttest) = { "swapfaulttest", "", 0, SHELL_G_TEST, cmd_swapfaulttest, SHELL_P_ADMIN };
 
 SHELL_CMD(evicttest) = { "evicttest", "", 0, SHELL_G_TEST, cmd_evicttest, SHELL_P_ADMIN };
 

@@ -697,6 +697,19 @@ void vmm_space_walk_swapped(struct vmm_space* s, vmm_swapped_fn cb, void* ctx) {
     }
 }
 
+int vmm_space_swapped_entry(struct vmm_space* s, uintptr_t va, uint32_t* slot, uint32_t* flags) {
+    if (!s) return -1;
+    uint32_t v = (uint32_t)va, gi = pde_index(v);
+    if (pde_is_kernel_shared(s, gi)) return -1;
+    uint64_t pde = pde_get(s->root, gi);
+    if (!(pde & E_P) || (pde & E_PS)) return -1;
+    uint64_t pte = pte_get(pde & addr_mask(), pte_index(v));
+    if ((pte & E_P) || !(pte & VMM_SWPE_MARK)) return -1;
+    *slot = (uint32_t)(pte >> 12);
+    *flags = VMM_USER | ((pte & VMM_SWPE_W) ? VMM_WRITABLE : 0) | ((pte & VMM_SWPE_X) ? VMM_EXEC : 0);
+    return 0;
+}
+
 /* §M75 — a QUERY: must not build the table (cow_slot would). */
 uint32_t vmm_frame_share_count(uint64_t phys) {
     if (!g_cow_ref) return 0;

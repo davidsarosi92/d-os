@@ -44,7 +44,11 @@ void timer_init(uint32_t hz);
 /* The reschedule SGI carries no payload — the actual reschedule happens in the
  * GIC IRQ-exit path (schedule_check runs after every EOI).  This handler just
  * exists so the dispatcher doesn't log it as "unhandled". */
-static void resched_sgi_handler(uint32_t intid) { (void)intid; }
+static volatile uint32_t g_sgi_sent, g_sgi_recv;
+static void resched_sgi_handler(uint32_t intid) {
+    (void)intid;
+    __atomic_add_fetch(&g_sgi_recv, 1, __ATOMIC_RELAXED);
+}
 
 /* Assembly trampoline (smp_entry.S) + the per-CPU stack-top table it reads. */
 extern void smp_secondary_entry(void);
@@ -79,8 +83,18 @@ int     acpi_cpu_node(int slot)     { int n = dtb_cpu_node(slot); return n < 0 ?
 void smp_send_reschedule(int cpu_index) {
     if (cpu_index < 0 || cpu_index >= AARCH64_MAX_CPUS) return;
     /* §M85 — gic.c knows which GIC this is (v2: GICD_SGIR; v3: ICC_SGI1R). */
+    __atomic_add_fetch(&g_sgi_sent, 1, __ATOMIC_RELAXED);
     gic_send_sgi(cpu_index, RESCHED_SGI);
 }
+/* `sgistat` (hidden) — reschedule SGIs sent against SGIs received: "the kick
+ * never arrives" and "the kick arrives and is ignored" are different bugs. */
+#include "shellcmd.h"
+#include "printf.h"
+static void cmd_sgistat(const char* a) {
+    (void)a;
+    kprintf("sgistat: reschedule SGIs sent %u, received %u\n", g_sgi_sent, g_sgi_recv);
+}
+SHELL_CMD(sgistat) = { "sgistat", "", 0, SHELL_G_TEST, cmd_sgistat, SHELL_P_ADMIN };
 
 /* x86 leftover — the generic timer needs no shared calibration constant. */
 void smp_set_lapic_timer_count(uint32_t c) { (void)c; }

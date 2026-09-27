@@ -674,8 +674,34 @@ static void task_enqueue(struct task* t) {
     spin_unlock_irqrestore(&rq->rq_lock, fl);
 
     /* If we enqueued onto a different CPU, kick it so it picks up
-     * the work without waiting up to a quantum for its own tick. */
-    if (cpu != this_cpu_id()) smp_send_reschedule(cpu);
+     * the work without waiting up to a quantum for its own tick.
+     *
+     * THE KICK HAS TO SAY WHAT IT MEANS (2026-09-27).  The IPI's handler runs
+     * schedule_check(), which does nothing unless `need_resched` is set — and
+     * nothing set it, on any arch.  So the kick only ever helped a CPU that
+     * was IDLE (its idle loop reschedules by itself); a task woken for a BUSY
+     * CPU waited for that CPU's next tick or the end of its quantum.  Worst on
+     * aarch64 (100 Hz tick, every disk completion on CPU 0): `diskstorm` took
+     * 513 ms on one CPU and 4.7-7 s on two, each I/O-bound wakeup waiting out
+     * someone else's time slice.  Set it first, then kick. */
+    if (cpu != this_cpu_id()) {
+        struct percpu* target = percpu_at(cpu);
+        if (target) {
+            __atomic_store_n(&target->wake_kick, 1, __ATOMIC_RELEASE);
+            __atomic_store_n(&target->need_resched, 1, __ATOMIC_RELEASE);
+        }
+        smp_send_reschedule(cpu);
+    } else if (t != this_cpu()->current) {
+        /* The same request for THIS CPU: a disk interrupt waking its waiter
+         * here left it waiting for the running task's quantum — a 10 ms tick
+         * on aarch64, which is why ARM swap-in cost ~8x more on two CPUs than
+         * on one.  Consumed at the interrupt's exit (or the next schedule_check).
+         * Not for the running task itself: several fix-up paths re-enqueue
+         * `self`, and that is not a newcomer to make room for. */
+        struct percpu* me = this_cpu();
+        __atomic_store_n(&me->wake_kick, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&me->need_resched, 1, __ATOMIC_RELEASE);
+    }
 }
 
 /* ------------------------------------------------------------------- */
@@ -2049,6 +2075,18 @@ int task_cont(int pid) {
     return was ? 0 : 1;                  /* 1 = it was not stopped (request cancelled) */
 }
 
+/* §M74 rung 3 — resume WITHOUT reading evicted pages back first: they return
+ * one by one as the program touches them (swap_in_fault).  Kernel-internal —
+ * the pressure policy and its tests; `cont` from a person stays eager. */
+int task_cont_lazy(int pid) {
+    struct task* t = task_find(pid);
+    if (!t || t->state == TASK_DEAD) return -1;
+    if (t->swap_busy) return -5;
+    int was = resume_stopped(t);
+    task_notify_change();
+    return was ? 0 : 1;
+}
+
 void task_force_kill_point(int from_user) {
     if (!from_user) return;
     struct task* self = task_current();
@@ -2812,6 +2850,7 @@ void schedule_request(void) {
      * IRQ exit on CPU N consumes it.  Cross-CPU preempt IPI (vector
      * 0x41) sets the receiver's bit before schedule_check runs. */
     struct percpu* me = this_cpu();
+    me->tick_due = 1;                       /* §M74 — a quantum to charge */
     me->need_resched = 1;
     /* M31 — per-CPU liveness heartbeat for the softlockup detector.  This
      * runs from the timer IRQ, so it advances once per tick on every CPU
@@ -2851,13 +2890,19 @@ void schedule_check(void) {
     if (preempt_count() != 0) return;   /* hot path asked us to wait */
 
     me->need_resched = 0;
-    /* §M49 — spend one quantum of the running task's budget.  This is the
-     * only place time is charged, and it runs once per tick, so a
-     * "quantum" is exactly one timer tick regardless of how often
-     * schedule() is called for other reasons. */
+    /* §M49 — spend one quantum of the running task's budget, ONLY for a tick
+     * (§M74: this also runs for a cross-CPU wake kick, and charging those
+     * would drain a task's budget by how often OTHER tasks wake up). */
     {
         struct task* cur = me->current;
-        if (cur && !cur->is_idle) cur->deficit -= (int)TASK_WEIGHT_BASE;
+        if (__atomic_exchange_n(&me->tick_due, 0, __ATOMIC_ACQ_REL) && cur && !cur->is_idle)
+            cur->deficit -= (int)TASK_WEIGHT_BASE;
+        /* §M74 — a wake kick ends the running task's turn: deficit 0 makes
+         * schedule_locked rotate it to the tail with a FRESH budget, so the
+         * woken task runs now and the preempted one loses no share. */
+        if (__atomic_exchange_n(&me->wake_kick, 0, __ATOMIC_ACQ_REL) && cur && !cur->is_idle &&
+            cur->deficit > 0)
+            cur->deficit = 0;
     }
     /* §M49 — wake expired timed sleepers first (they may be the most
      * deserving thing to run), then balance, so a task pulled in this

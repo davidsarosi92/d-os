@@ -24,6 +24,7 @@
  * ============================================================================= */
 
 #include "block_cache.h"
+#include "timer.h"
 #include "hal_api.h"   /* phys_to_virt / virt_to_phys — kernel direct map */
 #include "block.h"
 #include "pmm.h"
@@ -150,6 +151,56 @@ static struct bcache_buf* pick_victim(void) {
 static struct kmutex bc_lock = KMUTEX_INIT("bcache");
 
 static struct bcache_buf* bcache_get_unlocked(struct block_device* dev, uint64_t lba, int no_read);
+
+/* §M74 — READ-AHEAD WITHIN A PAGE (2026-09-27).  A miss used to read ONE
+ * sector per disk request, so a 4 KiB page cost eight synchronous requests —
+ * every file read on the machine, the page cache's fills and §M74's swap-in
+ * among them (measured: ~15 ms per swapped page coming back).  Now a miss reads
+ * the run of consecutive UNCACHED sectors after it, up to a page, in one
+ * request, and parks the extra ones in victim slots.  It stops at the first
+ * sector already cached (never overwrite a cached copy, which may be dirty and
+ * newer than the disk) and at the end of the device.  `b` is the slot already
+ * chosen for `lba`; bc_lock is held.  Returns 0 if `b` was filled here. */
+static uint8_t bc_ra_buf[BC_PER_FRAME * BC_SECTOR];
+uint64_t g_bc_io_ns, g_bc_ra_runs, g_bc_ra_sectors;   /* §M74 — instrument */
+static int bc_timed_read1(struct block_device* dev, uint64_t lba, void* buf) {
+    uint64_t t0 = timer_now_ns();
+    int r = blk_read(dev, lba, 1, buf);
+    g_bc_io_ns += timer_now_ns() - t0;
+    return r;
+}
+static int bc_readahead(struct block_device* dev, uint64_t lba, struct bcache_buf* b) {
+    uint32_t k = 1;
+    while (k < BC_PER_FRAME && lba + k < dev->sector_count && !find_entry(dev, lba + k)) k++;
+    if (k == 1) return -1;                             /* nothing to gain */
+    uint64_t t0 = timer_now_ns();
+    int rr = blk_read(dev, lba, k, bc_ra_buf);
+    g_bc_io_ns += timer_now_ns() - t0;
+    if (rr != 0) return -1;
+    g_bc_ra_runs++; g_bc_ra_sectors += k;
+    for (uint32_t i = 0; i < BC_SECTOR; i++) b->data[i] = bc_ra_buf[i];
+    /* PIN `b` while victims are chosen: it is still invalid with refcount 0,
+     * and pick_victim returns the first free slot — i.e. `b` itself — which
+     * made the first version stop after one sector and throw away the other
+     * seven it had just read (8 misses per page, measured). */
+    uint32_t saved_ref = b->refcount;
+    b->refcount = 1;
+    for (uint32_t j = 1; j < k; j++) {
+        struct bcache_buf* v = pick_victim();
+        if (!v || v == b) break;
+        /* A SPECULATIVE sector never costs a write-back: evicting a dirty slot
+         * means a synchronous one-sector write for data nobody asked for, and
+         * measured that way `diskstorm` ran 558 -> 1531 ms.  Stop instead. */
+        if (v->valid && v->dirty) break;
+        if (v->valid) { stats.evictions++; bc_unlink(v); v->valid = 0; }
+        for (uint32_t i = 0; i < BC_SECTOR; i++) v->data[i] = bc_ra_buf[j * BC_SECTOR + i];
+        v->dev = dev; v->lba = lba + j; v->refcount = 0; v->dirty = 0; v->valid = 1;
+        v->lru_tick = ++lru_counter;
+        bc_link(v);
+    }
+    b->refcount = saved_ref;
+    return 0;
+}
 struct bcache_buf* bcache_get(struct block_device* dev, uint64_t lba) {
     kmutex_lock(&bc_lock);
     struct bcache_buf* b = bcache_get_unlocked(dev, lba, 0);
@@ -203,7 +254,9 @@ static struct bcache_buf* bcache_get_unlocked(struct block_device* dev, uint64_t
      * them doubled the I/O of every sequential write. */
     if (no_read) {
         for (uint32_t i = 0; i < BC_SECTOR; i++) b->data[i] = 0;
-    } else if (blk_read(dev, lba, 1, b->data) != 0) {
+    } else if (bc_readahead(dev, lba, b) == 0) {
+        /* §M74 — filled together with the next uncached sectors (see below) */
+    } else if (bc_timed_read1(dev, lba, b->data) != 0) {
         b->valid = 0;                                       /* leave slot empty on I/O fail */
         return NULL;
     }

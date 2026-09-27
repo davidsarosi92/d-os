@@ -34,6 +34,9 @@ int  swap_evict_task(struct task* t, struct swap_report* out);
 int  swap_restore_task(struct task* t, struct swap_report* out);
 
 int  swap_stop_evict(int pid, struct swap_report* rep);   /* pause + evict */
+int  swap_in_fault(uintptr_t va, int can_sleep);   /* §M74 rung 3 */
+uint32_t swap_in_count(void);
+void     swap_in_timing(uint32_t* read_us, uint32_t* total_us);
 void swap_stats(uint32_t* used, uint32_t* total);
 void swap_slot_release(uint32_t slot);
 int  swap_audit(int verbose);

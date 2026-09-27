@@ -26,6 +26,8 @@
 #include "crash.h"
 #include "watchdog.h"   /* §4.67 follow-up — name the STALLED cpu in an NMI */
 #include "vmm.h"
+#include "swap.h"
+#include "percpu.h"
 #include "percpu.h"    /* §M54 — name the CPU in the ring-0 fault dump */
 #include "lapic.h"
 #include "ioapic.h"
@@ -672,6 +674,14 @@ void isr_handler(struct int_frame* f) {
             uint32_t cr2;
             __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
             if (vmm_cow_fault(cr2)) return;
+            /* §M74 rung 3 — an evicted page: read it back and retry.  It may
+             * sleep only from user mode, or from a kernel access made with
+             * interrupts on and no spinlock held (swap.c). */
+            {
+                int can_sleep = (f->cs & 3) == 3 ||
+                                ((f->eflags & 0x200) && this_cpu()->preempt_count == 0);
+                if (swap_in_fault(cr2, can_sleep)) return;
+            }
         }
 
         uint32_t _cr2 = 0;

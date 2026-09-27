@@ -105,6 +105,17 @@ struct percpu {
      * I care about are gone from that CPU". */
     volatile uint32_t tlb_req;     /* bumped by whoever wants this CPU flushed */
     volatile uint32_t tlb_ack;     /* set to tlb_req by this CPU, after flushing */
+    /* §M74 (2026-09-27) — WHY a reschedule was asked for, because the two
+     * reasons want different things.  `tick_due`: a timer tick — charge the
+     * running task one quantum.  `wake_kick`: another CPU woke a task here —
+     * charge nothing, but end the running task's turn now so the woken one
+     * runs (it goes to the back with a fresh budget: it loses latency, not
+     * share).  Before, every schedule_check charged a quantum and nothing
+     * handed the CPU over, so a task woken for a busy CPU waited out that
+     * CPU's whole budget.  Appended at the END: x86_64's swapgs path reaches
+     * the start of this struct by fixed offset. */
+    volatile int tick_due;
+    volatile int wake_kick;
 };
 
 /* Bring up the per-CPU table on the BSP.  Records the BSP's APIC ID

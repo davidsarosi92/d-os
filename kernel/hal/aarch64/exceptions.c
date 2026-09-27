@@ -19,7 +19,9 @@
 #include "drvguard.h"   /* §M33 Tier 0 — contain a driver fault */
 #include "task.h"
 #include "proc.h"
-#include "vmm.h"   /* §A1 — vmm_cow_fault on a write to a fork-shared page */
+#include "vmm.h"
+#include "swap.h"
+#include "percpu.h"   /* §A1 — vmm_cow_fault on a write to a fork-shared page */
 #include "hal_api.h"
 #include "crash.h"      /* §M47 — record every fault */
 
@@ -225,6 +227,24 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                     __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
                     if (vmm_af_fault((uintptr_t)far)) {              /* retry */
                         check_el0_return(tf, "access-flag");
+                        return;
+                    }
+                }
+            }
+            /* §M74 rung 3 — a TRANSLATION fault (FSC 0b0001LL) on an evicted
+             * page: read it back and retry.  Sleeps only from EL0, or from an
+             * EL1 access made with IRQs unmasked (SPSR.I clear) and no spinlock
+             * held. */
+            {
+                uint64_t ec = esr >> 26;
+                if ((ec == 0x20 || ec == 0x21 || ec == 0x24 || ec == 0x25) &&
+                    (esr & 0x3C) == 0x04) {
+                    uint64_t far;
+                    __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
+                    int can_sleep = (tf->spsr & 0xF) == 0 ||
+                                    (!(tf->spsr & (1u << 7)) && this_cpu()->preempt_count == 0);
+                    if (swap_in_fault((uintptr_t)far, can_sleep)) {
+                        check_el0_return(tf, "swap-in");
                         return;
                     }
                 }

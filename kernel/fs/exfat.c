@@ -288,9 +288,11 @@ static uint32_t chain_next(struct exfat_fs* fs, uint32_t cur, int no_fat_chain) 
 
 /* Walk a cluster chain `n` steps from `start`.  Returns EXFAT_FAT_EOC
  * if the chain ends before reaching `n`. */
+uint64_t g_exfat_chain_steps;          /* §M74 — instrument: FAT links followed */
 static uint32_t chain_skip(struct exfat_fs* fs, uint32_t start, uint32_t n,
                            int no_fat_chain) {
     uint32_t cur = start;
+    g_exfat_chain_steps += n;
     for (uint32_t i = 0; i < n; i++) {
         cur = chain_next(fs, cur, no_fat_chain);
         if (cur >= EXFAT_FAT_EOC_FIRST) return EXFAT_FAT_EOC;

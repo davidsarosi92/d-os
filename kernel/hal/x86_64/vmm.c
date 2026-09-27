@@ -879,6 +879,17 @@ static void walk_swapped_subtree(uint64_t* tbl, uint64_t* ktbl, int depth, uintp
         walk_swapped_subtree(table_at((uintptr_t)e), kchild, depth + 1, entry_va, cb, ctx);
     }
 }
+int vmm_space_swapped_entry(struct vmm_space* s, uintptr_t va, uint32_t* slot, uint32_t* flags) {
+    if (!s) return -1;
+    uint64_t* pt = walk_to_pt_root(s->pml4, va, /*create*/0, 0);
+    if (!pt) return -1;
+    uint64_t e = pt[IDX_PT(va)];
+    if ((e & PTE_P) || !(e & VMM_SWPE_MARK)) return -1;
+    *slot = (uint32_t)(e >> 12);
+    *flags = VMM_USER | ((e & VMM_SWPE_W) ? VMM_WRITABLE : 0) | ((e & VMM_SWPE_X) ? VMM_EXEC : 0);
+    return 0;
+}
+
 void vmm_space_walk_swapped(struct vmm_space* s, vmm_swapped_fn cb, void* ctx) {
     if (!s || !cb) return;
     walk_swapped_subtree(s->pml4, (uint64_t*)pml4, 0, 0, cb, ctx);

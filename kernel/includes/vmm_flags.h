@@ -97,6 +97,10 @@ typedef void (*vmm_swapped_fn)(void* ctx, uintptr_t va, uint32_t slot, uint32_t 
 int  vmm_space_mark_swapped(struct vmm_space* space, uintptr_t va, uint32_t slot,
                             uint32_t flags);
 void vmm_space_walk_swapped(struct vmm_space* space, vmm_swapped_fn cb, void* ctx);
+/* §M74 rung 3 — the one entry at `va`: 0 and its slot + VMM_* flags if it is
+ * an evicted page, -1 otherwise.  The swap-in fault asks this. */
+int  vmm_space_swapped_entry(struct vmm_space* space, uintptr_t va,
+                             uint32_t* slot, uint32_t* flags);
 void swap_slot_release(uint32_t slot);
 
 /* ---------------------------------------------------------------------------
