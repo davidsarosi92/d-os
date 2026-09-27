@@ -216,7 +216,7 @@ fixed first, whatever it touches.
 
 | Milestone | Done | Open |
 |-----------|------|------|
-| §M19.5 | highmem, slab caching, SRAT parser | per-NUMA-node PMM zones |
+| §M19.5 | ✅ complete — per-node zones (§4.106) | — (per-node slab caches: later) |
 | §M23 | ✅ complete (the virtio-sound interrupt was already in place — measured) | — |
 | §M26 / §M59 | Wayland core + upstream clients; two clipboards, `/dev/clipboard` | `wl_data_device` |
 | §M32 | stages 1-10.1 | simultaneous sessions; on-disk ownership |
@@ -262,7 +262,7 @@ what); a session can pick a theme and push on it.
 | M19 | Memory at scale — slab, huge pages, near-NUMA   | Memory           | ✅ DOCS §4.8, §4.10 |
 | M18.6 | SMP polish — per-CPU runqueue + load balancer ✅, preempt_count ✅, taskset ✅, cross-CPU IPI ✅, MSI/MSI-X ✅ | Concurrency | §M18.6 (balancer completed by §M49) |
 | M49 | Load distribution — periodic balance, demand metric, blocking sleeps/console reads, priority/`nice`, deferred-work pool (first consumer: xHCI drain), `sched`/`wqtest` | Concurrency | ✅ DOCS §4.46 |
-| M19.5 | Memory polish — HIGHMEM ✅ (x86_64), empty-slab caching ✅, SRAT/NUMA ✅ (parser) | Memory | ✅ HIGHMEM (x86_64 §M19.5, i386 kmap/PAE §M86 — DOCS §4.94/§4.96), empty-slab caching, SRAT parser.  **OPEN: per-NUMA-node PMM zones (§M19.5.3)** |
+| M19.5 | Memory polish — HIGHMEM ✅ (x86_64), empty-slab caching ✅, SRAT/NUMA ✅ (parser) | Memory | ✅ HIGHMEM (x86_64 §M19.5, i386 kmap/PAE §M86 — DOCS §4.94/§4.96), empty-slab caching, SRAT parser, **per-NUMA-node PMM zones (DOCS §4.106)** |
 | M20 | x64 (long mode) port (UP)                       | Architecture     | ✅ DOCS §4.X (closed by §M20.5) |
 | M20.5 | x64 SMP + APIC + ring-3 (int 0x80) — Phase A/B/C | Architecture | ✅ §M20.5 |
 | M20.6 | x86_64 closure — SYSCALL/SYSRET, xHCI + virtio-blk 64-bit DMA | Architecture | ✅ SYSCALL entry + USB/blk DMA shipped (SYSRET-out not used — we `iretq` back, so the GDT reorder was never needed) — §M20.6 |
@@ -1544,17 +1544,10 @@ likely to refill).
 
 ### §M19.5.3 — ACPI SRAT parsing → per-NUMA-node zones
 
-**Status quo:** PMM has one set of zones (DMA / NORMAL / HIGHMEM)
-shared across the whole system.  On a multi-socket NUMA machine,
-this means cross-socket memory traffic.
-
-**Design:** parse SRAT (System Resource Affinity Table) from ACPI;
-build `pmm_node[]` with per-node zones.  `pmm_alloc_frame()`
-takes a node hint (default: this_cpu's home node).  Slab too,
-ideally, but that's a deeper refactor.
-
-**Files:** `kernel/acpi/acpi.c` (SRAT walker), `kernel/mem/pmm.c`
-(per-node zones), `kernel/core/percpu.h` (cpu → node map).
+✅ Shipped 2026-09-27, see DOCS.md §4.106.  **Lesson learned:** the fallback
+order must be NODE-major — zone-major (spare DMA32, take a remote node's
+NORMAL first) starves node 0, which is where low memory lives, of local
+memory on every machine with RAM above 4 GiB on another node.
 
 **Definition of done (whole §M19.5):**
 - `meminfo` shows HIGHMEM with actual frames managed (non-zero).

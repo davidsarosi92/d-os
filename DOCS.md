@@ -14617,8 +14617,87 @@ and `diskstorm` PASS afterwards.
 3. The edu IRQ request on ARM pointed at INTID 0 (see above).
 
 
+### 4.106 Per-NUMA-node memory zones, and a scheduler that could not let go (§M19.5 closed, 2026-09-27)
+
+§M19.5.3's parser had been in place since M19: `acpi.c` read SRAT, every CPU
+knew its node (`percpu.numa_node`), and the allocator ignored all of it — one
+set of zones for the whole machine.  Now there is **one zone set per node**
+(`zones_n[PMM_MAX_NODES][NR_ZONES]`, `kernel/mem/pmm.c`) and `page_alloc`
+prefers the running CPU's node.
+
+**Where the node information comes from, and when.**  `pmm_init` runs before
+ACPI can be read (acpi_init maps its tables through the VMM and allocates), so
+it seeds everything into node 0 — which is also the permanent shape of every
+machine that is not NUMA.  Afterwards the arch records ranges with
+`pmm_numa_add_range(base, len, node)` and calls `pmm_numa_commit()` ONCE:
+x86 from SRAT right after `acpi_init`, aarch64 from the device tree's
+`numa-node-id` on `/memory` nodes (either property order) right after
+`pmm_init`; `numa-node-id` on `cpu@` nodes now feeds `acpi_cpu_node` there too.
+Commit takes every free block off node 0's lists and pushes it onto its own
+node's, **halving any block a node boundary crosses**, then recounts `managed`
+per node from `page_state` — and compares the totals before and after, saying
+`!! NUMA re-home changed the totals` if a frame was lost or invented.  Frames
+already allocated stay put and go home when freed (page_free asks
+`node_of_pfn`).  A second ACPI walker inside pmm_init was the alternative; a
+few blocks moved once at boot is cheaper than a parser kept in step forever.
+
+**Two rules keep a block inside one node**, the same two that already kept it
+inside one zone: seeding stops a run at a node boundary, and coalescing refuses
+a buddy on another node.  `pmm_validate` (`memcheck`) now also checks that every
+block on a node's list belongs to that node.
+
+**The fallback order is NODE-major** — the preferred node's zones in the usual
+downward order, then the other nodes', with the 16 MiB ZONE_DMA taken only
+after every node's higher zones.  **The first version was zone-major and wrong
+on the commonest layout:** it preferred another node's NORMAL memory to the
+local node's DMA32 (to spare DMA32), but node 0 is where low memory lives, so
+node 0's CPUs got REMOTE memory whenever any other node had some above 4 GiB —
+measured on x86_64 `-m 6G` over three nodes: asked for node 0, got node 1.
+Linux dropped zone-ordered lists (4.14) for the same reason.
+
+**Surfaces:** `meminfo` and `/proc/meminfo` show size, free, and
+**local / fallback allocation counts per node** (`pmm.nodeN.mib.total: …
+local: … fallback: …`); `buddyinfo` prints one line per (node, zone).  New
+API: `page_alloc_node`, `pmm_local_node`, `pmm_node_of`, `pmm_node_stats`,
+`pmm_node_zone_stats`, `pmm_node_count`.
+
+**`numatest` (`SHELL_P_ADMIN`)** pins itself to each CPU in turn, allocates 256
+frames, counts how many are on the CPU's node, then asks each node explicitly,
+then validates the free lists.  **It can fail, and was made to:** with
+`page_alloc` asking node 0 regardless, the same run gives `CPU 1 (node 1):
+0/256 frames local … FAIL`.
+
+**Verified:**
+- i386 -smp 2, two 256 MiB nodes: 256/256 local on both CPUs, PASS.
+- x86_64 -smp 3 -m 6G, three uneven nodes (1300/3000/1844 MiB, so node 1 spans
+  the 4 GiB line and blocks had to be split): every CPU 256/256 local, PASS,
+  lists consistent.
+- aarch64 virt -smp 2, two 512 MiB nodes (the tree lists them in REVERSE order):
+  PASS.
+- Without `-numa` on all three arches: `numatest` SKIPs, `memcheck`,
+  `schedstorm`, `killstorm`, `rqcheck`, `musltest`, `forktest` and
+  `highmemtest all` unchanged.
+
+**Found on the way and fixed (not NUMA): a task could not move itself off a
+quiet CPU.**  `task_set_affinity` on a RUNNING task queues it on an allowed CPU,
+where pick skips it while `on_cpu` says it is still running on the old one; the
+old CPU's `schedule_locked` then found nothing else to run and — in its "no
+candidate" branch — **kept prev running without asking whether prev was still
+allowed there**.  So the move waited for an unrelated task to arrive on the old
+CPU, which on a quiet one is never: `numatest` could not reach CPUs 0 and 2 on
+x86_64 -smp 3.  `hardlock`'s own pinning loop had depended on the same luck.
+The branch now keeps prev only if its mask includes this CPU; otherwise it goes
+to idle and the target CPU picks the task up once it is off this stack.
+
+**Open:** slab caches are not per-node (a slab page comes from the local node
+when it is allocated, but a cached object is handed to whichever CPU asks);
+`PMM_MAX_NODES` is 8 and `PMM_MAX_RANGES` 16, refused with a message beyond;
+the EFI boot path on aarch64 carries no affinity (its memory map has none) —
+an ACPI SRAT reader there is the way, when a NUMA ARM board needs it.
+
 ## 8. Change log
 
+- **2026-09-27 — §M19.5 closed: per-NUMA-node PMM zones (SRAT on x86, `numa-node-id` on aarch64), node-major fallback, per-node counters in `/proc/meminfo` + `buddyinfo`, `numatest`; the scheduler no longer keeps a task on a CPU its affinity excludes (DOCS §4.106).**
 - **2026-09-27 — §M85 closed: sbsa-ref's bochs-display (fb_present backends), PCI INTx routing from ACPI `_PRT` and DT `interrupt-map`, the host bridge window; `hal_irq_attach`; interrupt-driven e1000e; drvrt level-triggered lines; edu on its interrupt; `edutest` restored; a clock slot that says when there is no clock (DOCS §4.105).**
 - **2026-09-27 — §M86 closed: no-execute for user pages on i386 PAE and x86_64 (`nxtest`, harness CPU `qemu32,+nx`); ELF loader keeps a page shared by two segments; x86_64 crash records carry the fault address; aarch64 lets EL0 maintain its caches; a faulting excursion no longer kills its host task (DOCS §4.104).**
 - **2026-09-27 — §M87: Network, Wi-Fi (with a simulated adapter) and Disks pages in the Control Panel; a taskbar network indicator with a chooser; `vfs_umount`, an exFAT formatter (fsck-clean), RAM disks, link state; the module fingerprint covers `net_device`; the translation gap measured (`locale missing`) and closed (DOCS §4.103).**

@@ -137,6 +137,24 @@ void aarch64_main_entry(uint64_t dtb) {
     pmm_init();
     kmalloc_init();
 
+    /* §M19.5.3 — the tree's numa-node-id on each RAM range becomes the
+     * allocator's per-node zones (x86 does the same from SRAT).  After
+     * pmm_init because the ranges are clamped against what it manages. */
+    {
+        int dtb_mem_node(int i);
+        int dtb_mem_count(void);
+        int dtb_mem_range(int i, uint64_t* base, uint64_t* size);
+        for (int i = 0; i < dtb_mem_count(); i++) {
+            uint64_t b, sz;
+            int nid = dtb_mem_node(i);
+            if (nid < 0 || dtb_mem_range(i, &b, &sz) != 0) continue;
+            if (pmm_numa_add_range(b, sz, nid) != 0)
+                kprintf("pmm: DTB range %d (node %d) not used - table full or node too large\n",
+                        i, nid);
+        }
+        pmm_numa_commit();
+    }
+
     /* Quick heap round-trip so a heap fault shows up here, not mid-scheduler. */
     {
         void* a = kmalloc(64);

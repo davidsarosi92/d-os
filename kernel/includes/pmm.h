@@ -210,6 +210,27 @@ uint32_t pmm_used_frames(void);
  * by the `buddyinfo` shell command. */
 void pmm_zone_stats(int zone, uint32_t* out_free_per_order, uint32_t* out_managed);
 
+/* ---------------------------------------------------------------------------
+ * §M19.5.3 — NUMA.  One zone set per node; page_alloc prefers the running
+ * CPU's node and falls back to the others before descending a zone.  Ranges
+ * come from SRAT (x86) or the device tree (ARM), are recorded with
+ * pmm_numa_add_range and applied ONCE by pmm_numa_commit, which moves every
+ * free block to its node.  A machine that is not NUMA is node 0 throughout.
+ * --------------------------------------------------------------------------- */
+struct pmm_node_info {
+    uint32_t managed, free;         /* frames                                  */
+    uint32_t hit, miss;             /* allocations served locally / remotely   */
+};
+int        pmm_numa_add_range(uint64_t base, uint64_t len, int node);
+void       pmm_numa_commit(void);
+int        pmm_node_count(void);
+int        pmm_local_node(void);
+int        pmm_node_of(pmm_phys_t phys);   /* which node owns this frame */
+pmm_phys_t page_alloc_node(int order, int zone_hint, int node);
+void       pmm_node_stats(int node, struct pmm_node_info* out);
+void       pmm_node_zone_stats(int node, int zone, uint32_t* out_free_per_order,
+                               uint32_t* out_managed);
+
 /* Human-readable one-line dump.  Used by `meminfo`. */
 void pmm_print_stats(void);
 void pmm_validate(const char* tag);   /* DEBUG: free-list integrity walk */

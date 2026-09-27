@@ -253,6 +253,18 @@ static void gen_meminfo(struct procfs_writer* w) {
     pw_puts(w, "pmm.frames.used:    "); pw_put_uint(w, us);  pw_putc(w, '\n');
     pw_puts(w, "pmm.mib.total:      "); pw_put_uint(w, (mgr * 4) / 1024); pw_putc(w, '\n');
     pw_puts(w, "pmm.mib.free:       "); pw_put_uint(w, (fr  * 4) / 1024); pw_putc(w, '\n');
+    /* §M19.5.3 — per NUMA node: size, free, and how many allocations were
+     * served from the asking CPU's own node vs had to fall back elsewhere. */
+    pw_puts(w, "pmm.numa.nodes:     "); pw_put_uint(w, (unsigned)pmm_node_count()); pw_putc(w, '\n');
+    for (int nd = 0; nd < pmm_node_count(); nd++) {
+        struct pmm_node_info ni;
+        pmm_node_stats(nd, &ni);
+        pw_puts(w, "pmm.node"); pw_put_uint(w, (unsigned)nd);
+        pw_puts(w, ".mib.total: "); pw_put_uint(w, (ni.managed * 4) / 1024);
+        pw_puts(w, " free: ");      pw_put_uint(w, (ni.free * 4) / 1024);
+        pw_puts(w, " local: ");     pw_put_uint(w, ni.hit);
+        pw_puts(w, " fallback: ");  pw_put_uint(w, ni.miss); pw_putc(w, '\n');
+    }
 
     /* Heap */
     struct kmstat ks;

@@ -1436,7 +1436,17 @@ static void schedule_locked(struct percpu* me) {
     }
 
     if (!next) {
-        if (prev->state == TASK_RUNNABLE && !prev->is_idle) return;
+        /* Keep running prev only if it is still ALLOWED here.  A task that
+         * narrowed its own affinity away from this CPU (task_set_affinity on
+         * a running task) has already been queued on an allowed CPU, where
+         * pick skips it while on_cpu says it is still running HERE — so if
+         * this CPU just kept it, the move would wait for some unrelated task
+         * to arrive and displace it, which on a quiet CPU is never.  Found
+         * 2026-09-27 by `numatest`, which pins itself to each CPU in turn and
+         * could not reach two of three on x86_64 -smp 3 (the same wait made
+         * `hardlock`'s own pinning loop a matter of luck). */
+        if (prev->state == TASK_RUNNABLE && !prev->is_idle &&
+            (prev->cpu_mask & (1u << this_cpu_id()))) return;
         struct task* idle = me->idle;
         if (!idle || idle->state != TASK_RUNNABLE) return;
         if (idle == prev) return;

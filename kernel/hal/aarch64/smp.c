@@ -63,7 +63,11 @@ uint8_t lapic_id(void) {
 
 int     acpi_ncpus(void)            { return AARCH64_MAX_CPUS; }
 uint8_t acpi_cpu_apic_id(int i)     { return (uint8_t)i; }   /* linear Aff0    */
-int     acpi_cpu_node(int slot)     { (void)slot; return 0; }
+/* §M19.5.3 — the device tree's numa-node-id for this CPU (0 when it gives
+ * none).  Slots are linear in Aff0 and in the tree's cpu@ order on the boards
+ * this runs on (virt, sbsa-ref). */
+int dtb_cpu_node(int i);
+int     acpi_cpu_node(int slot)     { int n = dtb_cpu_node(slot); return n < 0 ? 0 : n; }
 
 /* ---- cross-CPU reschedule (PSCI has no IPI; use a GIC SGI) ------------------ */
 

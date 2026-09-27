@@ -21,6 +21,7 @@
 #include "proc.h"        /* §M75 — memhog spawns a ring-3 process */
 #include "timer.h"
 #include "task.h"
+#include "percpu.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -40,18 +41,24 @@ static void cmd_slabinfo(void) {
 static void cmd_buddyinfo(void) {
     const char* zone_names[NR_ZONES] = { "DMA", "DMA32", "NORMAL", "HIGHMEM" };
     uint32_t order_counts[BUDDY_MAX_ORDER + 1];
+    int nodes = pmm_node_count();
     kprintf("ZONE     MANAGED  FREE-BLOCKS-PER-ORDER (0..%u)\n",
             BUDDY_MAX_ORDER);
-    for (int z = 0; z < NR_ZONES; z++) {
-        uint32_t managed = 0;
-        pmm_zone_stats(z, order_counts, &managed);
-        kprintf("%s ", zone_names[z]);
-        kprintf("m=%u  ", managed);
-        for (int o = 0; o <= BUDDY_MAX_ORDER; o++) {
-            kprintf("%u ", order_counts[o]);
+    /* §M19.5.3 — one line per (node, zone) on a NUMA machine, so where free
+     * memory sits is visible rather than summed away. */
+    for (int nd = 0; nd < nodes; nd++)
+        for (int z = 0; z < NR_ZONES; z++) {
+            uint32_t managed = 0;
+            if (nodes > 1) pmm_node_zone_stats(nd, z, order_counts, &managed);
+            else           pmm_zone_stats(z, order_counts, &managed);
+            if (nodes > 1) kprintf("node %d ", nd);
+            kprintf("%s ", zone_names[z]);
+            kprintf("m=%u  ", managed);
+            for (int o = 0; o <= BUDDY_MAX_ORDER; o++) {
+                kprintf("%u ", order_counts[o]);
+            }
+            kprintf("\n");
         }
-        kprintf("\n");
-    }
 }
 
 /* M25 stage 1 — per-process address space self-test.  Creates a fresh
@@ -115,6 +122,47 @@ static void mem_meminfo(const char* a) {
  * means the links AND page_state agree, which is why it is not simply a count. */
 static void mem_memcheck(const char* a) { (void)a; pmm_validate("memcheck"); }
 
+/* §M19.5.3 — `numatest`: does an allocation land on the asking CPU's node?
+ * Pins itself to each CPU in turn (and CHECKS it got there — affinity is a
+ * request until the next schedule, §M31's hardlock lesson), allocates frames
+ * and counts where they came from; then asks each node explicitly.  It can
+ * fail: with the node preference removed from page_alloc every CPU gets node
+ * 0's memory, and the per-CPU line says so. */
+#define NUMATEST_FRAMES 256
+static void mem_numatest(const char* a) {
+    (void)a;
+    int nodes = pmm_node_count();
+    if (nodes <= 1) { kprintf("numatest: SKIP - one memory node (boot with -numa)\n"); return; }
+    static pmm_phys_t fr[NUMATEST_FRAMES];
+    struct task* me = task_current();
+    int bad = 0;
+    for (int c = 0; c < smp_ncpus(); c++) {
+        task_set_affinity(me, 1u << c);
+        for (int i = 0; i < 100 && this_cpu_id() != c; i++) task_yield();
+        if (this_cpu_id() != c) { kprintf("numatest: could not move to CPU %d\n", c); bad++; continue; }
+        int want = pmm_local_node(), local = 0, got = 0;
+        for (int i = 0; i < NUMATEST_FRAMES; i++) {
+            fr[i] = pmm_alloc_frame();
+            if (fr[i] == PMM_ALLOC_FAIL) break;
+            got++;
+            if (pmm_node_of(fr[i]) == want) local++;
+        }
+        for (int i = 0; i < got; i++) pmm_free_frame(fr[i]);
+        kprintf("numatest: CPU %d (node %d): %d/%d frames local\n", c, want, local, got);
+        if (local != got || !got) bad++;
+    }
+    task_set_affinity(me, 0xFFFFFFFFu);
+    for (int nd = 0; nd < nodes; nd++) {
+        pmm_phys_t f = page_alloc_node(0, ZONE_DEFAULT, nd);
+        int on = f == PMM_ALLOC_FAIL ? -1 : pmm_node_of(f);
+        kprintf("numatest: asked node %d, got a frame on node %d\n", nd, on);
+        if (on != nd) bad++;
+        if (f != PMM_ALLOC_FAIL) pmm_free_frame(f);
+    }
+    pmm_validate("numatest");
+    kprintf("numatest: %s\n", bad ? "FAIL" : "PASS");
+}
+
 static void mem_slabinfo (const char* a) { (void)a; cmd_slabinfo();  }
 static void mem_buddyinfo(const char* a) { (void)a; cmd_buddyinfo(); }
 static void mem_mmtest   (const char* a) { (void)a; cmd_mmtest();    }
@@ -125,6 +173,8 @@ SHELL_CMD(memcheck)  = { "memcheck",  "", "validate the buddy free lists now",
                          SHELL_G_MEM,  mem_memcheck, SHELL_P_ADMIN };
 SHELL_CMD(slabinfo)  = { "slabinfo",  "", "slab caches",
                          SHELL_G_MEM,  mem_slabinfo, SHELL_P_ANY };
+SHELL_CMD(numatest)  = { "numatest",  "", "allocations land on the CPU's own NUMA node",
+                         SHELL_G_MEM,  mem_numatest, SHELL_P_ADMIN };
 SHELL_CMD(buddyinfo) = { "buddyinfo", "", "buddy free lists by order",
                          SHELL_G_MEM,  mem_buddyinfo, SHELL_P_ANY };
 SHELL_CMD(mmtest)    = { "mmtest",    "", "allocator self-test",

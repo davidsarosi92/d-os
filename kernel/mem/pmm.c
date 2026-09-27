@@ -63,6 +63,7 @@
 #include "multiboot.h"
 #include "hal_api.h"
 #include "printf.h"
+#include "percpu.h"
 #include <stdint.h>
 
 /* -------------------------------------------------------------------------- */
@@ -102,9 +103,40 @@ struct zone {
     pmm_phys_t  free_lists[BUDDY_MAX_ORDER + 1];  /* head = phys of first free block, 0 = empty */
     uint32_t    nr_at_order[BUDDY_MAX_ORDER + 1]; /* diagnostic */
     spinlock_t  lock;
+    int         node;               /* §M19.5.3 — the NUMA node it belongs to */
+    int         type;               /* ZONE_DMA .. ZONE_HIGHMEM              */
 };
 
-static struct zone zones[NR_ZONES];
+/* §M19.5.3 — ONE ZONE SET PER NUMA NODE.
+ *
+ * Until SRAT (or a device tree's numa-node-id) is read, every frame belongs to
+ * node 0 and only zones_n[0] is populated — which is also the permanent shape
+ * of every machine that is not NUMA.  pmm_numa_commit() then moves each free
+ * block into its own node's zone set and, from that point on, a block NEVER
+ * straddles two nodes (seeding stops at a node boundary, coalescing refuses to
+ * merge across one — the same two rules that already keep a block inside one
+ * zone).
+ *
+ * WHY THE READING HAPPENS LATE AND IS APPLIED BY MOVING BLOCKS.  pmm_init runs
+ * before the ACPI tables can be read: acpi_init maps them through the VMM and
+ * allocates, i.e. it needs the allocator this would configure.  Parsing SRAT
+ * by hand in pmm_init would be a second ACPI walker (checksum, RSDT/XSDT, the
+ * affinity structures) kept in step with the real one.  A handful of free
+ * blocks moved once at boot costs microseconds; a second parser costs forever.
+ * Frames already ALLOCATED when the move happens stay where they are and are
+ * freed into their correct node later, because page_free asks node_of_pfn. */
+#define PMM_MAX_NODES   8
+#define PMM_MAX_RANGES 16
+static struct zone zones_n[PMM_MAX_NODES][NR_ZONES];
+
+struct node_range { uint32_t start, end; int node; };
+static struct node_range g_nrng[PMM_MAX_RANGES];
+static int g_nrng_n;                /* ranges known (0 = not NUMA)            */
+static int g_nr_nodes = 1;          /* nodes with memory, highest id + 1      */
+/* Allocations that got memory from the node they asked for, and those that
+ * had to fall back to another — Linux's numa_hit/numa_miss.  Relaxed atomics:
+ * they are statistics, and a lock here would serialise every allocation. */
+static uint32_t g_node_hit[PMM_MAX_NODES], g_node_miss[PMM_MAX_NODES];
 
 /* Symbols from linker.ld marking the kernel image bounds. */
 extern uint8_t kernel_start[];
@@ -140,6 +172,24 @@ static int zone_of_pfn(uint32_t pfn) {
     if (pfn <  ZONE_DMA_FRAME_LIMIT)   return ZONE_DMA;
     if (pfn <  ZONE_DMA32_FRAME_LIMIT) return ZONE_DMA32;
     return ZONE_NORMAL;
+}
+
+/* §M19.5.3 — which node owns this pfn?  0 for anything no affinity range
+ * names (and for everything on a machine that is not NUMA), because a frame
+ * must belong SOMEWHERE and node 0 is where it lived before NUMA was read. */
+static int g_numa_live;             /* ranges are in force (set by commit)   */
+static int node_of_pfn(uint32_t pfn) {
+    if (!g_numa_live) return 0;
+    for (int i = 0; i < g_nrng_n; i++)
+        if (pfn >= g_nrng[i].start && pfn < g_nrng[i].end) return g_nrng[i].node;
+    return 0;
+}
+
+/* The zone a pfn's frame is managed by, or NULL outside the managed span. */
+static struct zone* zone_for_pfn(uint32_t pfn) {
+    int zi = zone_of_pfn(pfn);
+    if (zi < 0) return 0;
+    return &zones_n[node_of_pfn(pfn)][zi];
 }
 
 /* Bump-allocate from the boot arena.  Word-aligned; no free.  See pmm.h. */
@@ -366,12 +416,13 @@ static uint32_t seed_range(uint32_t from, uint32_t to) {
     while (pfn < to) {
         if (page_state[pfn] != PS_USED) { pfn++; continue; }
 
-        int zi = zone_of_pfn(pfn);
-        if (zi < 0) { pfn++; continue; }
-        struct zone* z = &zones[zi];
+        struct zone* z = zone_for_pfn(pfn);
+        if (!z) { pfn++; continue; }
 
+        /* A run stops at a zone boundary AND at a node boundary (§M19.5.3). */
         uint32_t run_end = pfn;
-        while (run_end < z->end_pfn && run_end < to && page_state[run_end] == PS_USED)
+        while (run_end < z->end_pfn && run_end < to && page_state[run_end] == PS_USED &&
+               node_of_pfn(run_end) == z->node)
             run_end++;
 
         while (pfn < run_end) {
@@ -402,8 +453,8 @@ void pmm_seed_deferred(void) {
     uint32_t n = seed_range(pmm_deferred_from, pmm_nr_frames);
     pmm_deferred_from = pmm_nr_frames;
     kprintf("pmm: %u MiB above 4 GiB seeded through kmap — HIGHMEM m=%u f=%u\n",
-            (n * 4) / 1024, zones[ZONE_HIGHMEM].managed,
-            zones[ZONE_HIGHMEM].free_frames);
+            (n * 4) / 1024, zones_n[0][ZONE_HIGHMEM].managed,
+            zones_n[0][ZONE_HIGHMEM].free_frames);
 }
 
 /* §M86 — the physical-address ceiling the paging hardware can express.  The
@@ -496,32 +547,31 @@ void pmm_init(void) {
             (unsigned)(covered >> 20), (unsigned)(max_phys >> 20), pmm_nr_frames,
             arena >> 10, (void*)arena_base);
 
-    /* Set up zone descriptors. */
-    zones[ZONE_DMA].name        = "DMA";
-    zones[ZONE_DMA].start_pfn   = 0;
-    zones[ZONE_DMA].end_pfn     = ZONE_DMA_FRAME_LIMIT;
-    spin_lock_init(&zones[ZONE_DMA].lock);
-
-    zones[ZONE_DMA32].name      = "DMA32";
-    zones[ZONE_DMA32].start_pfn = ZONE_DMA_FRAME_LIMIT;
-    zones[ZONE_DMA32].end_pfn   = pmm_direct_end_pfn < ZONE_DMA32_FRAME_LIMIT
-                                ? pmm_direct_end_pfn : ZONE_DMA32_FRAME_LIMIT;
-    spin_lock_init(&zones[ZONE_DMA32].lock);
-
-    /* Empty whenever the machine has 4 GiB or less — which is ALWAYS on i386,
-     * where 32-bit page tables cannot express a higher address anyway. */
-    zones[ZONE_NORMAL].name      = "NORMAL";
-    zones[ZONE_NORMAL].start_pfn = ZONE_DMA32_FRAME_LIMIT;
-    zones[ZONE_NORMAL].end_pfn   = pmm_direct_end_pfn > ZONE_DMA32_FRAME_LIMIT
-                                 ? pmm_direct_end_pfn : ZONE_DMA32_FRAME_LIMIT;
-    spin_lock_init(&zones[ZONE_NORMAL].lock);
-
+    /* Set up zone descriptors — the same four bounds for every node; which
+     * node a frame belongs to is node_of_pfn's answer, not the zone's. */
+    static const char* const znames[NR_ZONES] = { "DMA", "DMA32", "NORMAL", "HIGHMEM" };
+    uint32_t zs[NR_ZONES], ze[NR_ZONES];
+    zs[ZONE_DMA]     = 0;
+    ze[ZONE_DMA]     = ZONE_DMA_FRAME_LIMIT;
+    zs[ZONE_DMA32]   = ZONE_DMA_FRAME_LIMIT;
+    ze[ZONE_DMA32]   = pmm_direct_end_pfn < ZONE_DMA32_FRAME_LIMIT
+                     ? pmm_direct_end_pfn : ZONE_DMA32_FRAME_LIMIT;
+    /* NORMAL is empty whenever the machine has 4 GiB or less — which is ALWAYS
+     * on i386, where 32-bit page tables cannot express a higher address. */
+    zs[ZONE_NORMAL]  = ZONE_DMA32_FRAME_LIMIT;
+    ze[ZONE_NORMAL]  = pmm_direct_end_pfn > ZONE_DMA32_FRAME_LIMIT
+                     ? pmm_direct_end_pfn : ZONE_DMA32_FRAME_LIMIT;
     /* §M86 — everything past the direct map.  Empty on x86_64 and aarch64,
      * where the direct map covers all RAM. */
-    zones[ZONE_HIGHMEM].name      = "HIGHMEM";
-    zones[ZONE_HIGHMEM].start_pfn = pmm_direct_end_pfn;
-    zones[ZONE_HIGHMEM].end_pfn   = pmm_nr_frames;
-    spin_lock_init(&zones[ZONE_HIGHMEM].lock);
+    zs[ZONE_HIGHMEM] = pmm_direct_end_pfn;
+    ze[ZONE_HIGHMEM] = pmm_nr_frames;
+    for (int nd = 0; nd < PMM_MAX_NODES; nd++)
+        for (int zi = 0; zi < NR_ZONES; zi++) {
+            struct zone* z = &zones_n[nd][zi];
+            z->name = znames[zi]; z->start_pfn = zs[zi]; z->end_pfn = ze[zi];
+            z->node = nd; z->type = zi;
+            spin_lock_init(&z->lock);
+        }
 
     /* Initialize every frame as PS_NONE (doesn't exist).  The mmap walk
      * flips bits to PS_USED for frames inside AVAILABLE regions, then
@@ -634,10 +684,10 @@ void pmm_init(void) {
 
     kprintf("pmm: buddy ready — DMA m=%u f=%u, DMA32 m=%u f=%u, NORMAL m=%u f=%u, "
             "HIGHMEM m=%u f=%u (%u MiB total free)\n",
-            zones[ZONE_DMA].managed,    zones[ZONE_DMA].free_frames,
-            zones[ZONE_DMA32].managed,  zones[ZONE_DMA32].free_frames,
-            zones[ZONE_NORMAL].managed, zones[ZONE_NORMAL].free_frames,
-            zones[ZONE_HIGHMEM].managed, zones[ZONE_HIGHMEM].free_frames,
+            zones_n[0][ZONE_DMA].managed,    zones_n[0][ZONE_DMA].free_frames,
+            zones_n[0][ZONE_DMA32].managed,  zones_n[0][ZONE_DMA32].free_frames,
+            zones_n[0][ZONE_NORMAL].managed, zones_n[0][ZONE_NORMAL].free_frames,
+            zones_n[0][ZONE_HIGHMEM].managed, zones_n[0][ZONE_HIGHMEM].free_frames,
             (initially_free * 4) / 1024);
 }
 
@@ -695,9 +745,12 @@ static void buddy_free_in_zone(struct zone* z, uint32_t pfn, int order) {
         uint32_t buddy_pfn = pfn ^ (1u << order);
 
         /* Buddy must exist and be in the SAME zone — never coalesce
-         * across DMA/NORMAL boundary. */
+         * across DMA/NORMAL boundary — and on the SAME node (§M19.5.3): a
+         * merged block spanning two nodes would be handed out as local to
+         * one of them while half of it is remote. */
         if (buddy_pfn >= pmm_nr_frames || buddy_pfn < pmm_pfn_base) break;
         if (buddy_pfn <  z->start_pfn || buddy_pfn >= z->end_pfn) break;
+        if (g_numa_live && node_of_pfn(buddy_pfn) != z->node) break;
 
         /* Buddy must be free at the same order. */
         if (page_state[buddy_pfn] != (uint8_t)order) break;
@@ -746,8 +799,9 @@ pmm_phys_t page_alloc_below(int order, pmm_phys_t limit) {
     /* Lowest zone first: its memory is the scarcest and the most likely to fit,
      * which is the opposite of page_alloc's preference and correct here. */
     const int order_zones[3] = { ZONE_DMA, ZONE_DMA32, ZONE_NORMAL };
-    for (int zi = 0; zi < 3; zi++) {
-        struct zone* z = &zones[order_zones[zi]];
+    for (int zn = 0; zn < 3 * g_nr_nodes; zn++) {
+        int zi = zn / g_nr_nodes;
+        struct zone* z = &zones_n[zn % g_nr_nodes][order_zones[zi]];
         uint32_t fl = spin_lock_irqsave(&z->lock);
         /* Blocks of exactly this order first; then split a larger one whose
          * base already fits, since the lower half of a fitting block fits. */
@@ -775,7 +829,33 @@ pmm_phys_t page_alloc_below(int order, pmm_phys_t limit) {
     return PMM_ALLOC_FAIL;
 }
 
+/* §M19.5.3 — the node the running CPU sits on; 0 until NUMA is known. */
+int pmm_local_node(void) {
+    if (g_nr_nodes <= 1) return 0;
+    int n = this_cpu()->numa_node;
+    return (n >= 0 && n < g_nr_nodes) ? n : 0;
+}
+
 pmm_phys_t page_alloc(int order, int zone_hint) {
+    return page_alloc_node(order, zone_hint, pmm_local_node());
+}
+
+/* NODE-major: the preferred node's zones first (in the usual downward order),
+ * then the other nodes' — EXCEPT ZONE_DMA, the 16 MiB ISA zone, which is taken
+ * only after every node's higher zones are exhausted.
+ *
+ * THE FIRST VERSION WAS ZONE-MAJOR AND WRONG ON THE COMMONEST LAYOUT.  It
+ * reasoned that DMA32 is precious (a frame spent there is one a 32-bit device
+ * can no longer get) and so preferred ANOTHER node's NORMAL memory to the
+ * local node's DMA32.  But node 0 is where low memory is — on a real two-socket
+ * machine and in every QEMU -numa layout — so node 0's CPUs NEVER received
+ * local memory while any other node had some above 4 GiB: measured on x86_64
+ * -m 6G across three nodes, `numatest` asked node 0 and got node 1.  Linux
+ * removed zone-ordered zonelists (4.14) for this reason.  DMA32 on a 64-bit
+ * machine is 4 GiB and its narrow consumers allocate at bring-up; ZONE_DMA is
+ * the genuinely scarce one, and it keeps its last-resort place. */
+pmm_phys_t page_alloc_node(int order, int zone_hint, int node) {
+    if (node < 0 || node >= g_nr_nodes) node = 0;
     if (order < 0 || order > BUDDY_MAX_ORDER) return PMM_ALLOC_FAIL;
 
     /* Fall back DOWNWARD from the hint — a lower zone satisfies every
@@ -804,9 +884,20 @@ pmm_phys_t page_alloc(int order, int zone_hint) {
         try_order[n++] = ZONE_DMA;
     }
 
-    for (int i = 0; i < n; i++) {
-        uint32_t pfn = buddy_alloc_in_zone(&zones[try_order[i]], order);
-        if (pfn) return pfn_to_phys(pfn);
+    /* Pass 0: every zone but DMA, node by node (preferred first).
+     * Pass 1: ZONE_DMA, node by node. */
+    for (int pass = 0; pass < 2; pass++)
+    for (int k = 0; k < g_nr_nodes; k++) {
+        int nd = k == 0 ? node : (k <= node ? k - 1 : k);   /* preferred first */
+        for (int i = 0; i < n; i++) {
+            if ((try_order[i] == ZONE_DMA) != (pass == 1)) continue;
+            uint32_t pfn = buddy_alloc_in_zone(&zones_n[nd][try_order[i]], order);
+            if (!pfn) continue;
+            if (g_nr_nodes > 1)
+                __atomic_add_fetch(nd == node ? &g_node_hit[node] : &g_node_miss[node],
+                                   1, __ATOMIC_RELAXED);
+            return pfn_to_phys(pfn);
+        }
     }
     return PMM_ALLOC_FAIL;
 }
@@ -816,10 +907,10 @@ void page_free(pmm_phys_t phys, int order) {
     if (phys & (PMM_FRAME_SIZE - 1)) return;   /* misaligned — caller bug */
 
     uint32_t pfn = phys_to_pfn(phys);
-    int zi = zone_of_pfn(pfn);
-    if (zi < 0) return;
+    struct zone* z = zone_for_pfn(pfn);
+    if (!z) return;
 
-    buddy_free_in_zone(&zones[zi], pfn, order);
+    buddy_free_in_zone(z, pfn, order);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -905,30 +996,168 @@ void pmm_free_contiguous(pmm_phys_t addr, uint32_t n) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* §M19.5.3 — NUMA: learn which node owns which memory, then re-home blocks.   */
+/* -------------------------------------------------------------------------- */
+
+static int g_numa_committed;
+
+/* Record one affinity range (from SRAT on x86, a device tree's numa-node-id on
+ * ARM).  Takes effect at pmm_numa_commit(); refused afterwards, because a range
+ * learned later would contradict blocks that are already on their node's
+ * lists.  Returns 0, or -1 when the table is full or the node id too large —
+ * said by the caller, which knows where the range came from. */
+int pmm_numa_add_range(uint64_t base, uint64_t len, int node) {
+    if (g_numa_committed || node < 0 || node >= PMM_MAX_NODES || !len) return -1;
+    if (g_nrng_n == PMM_MAX_RANGES) return -1;
+    uint64_t s = base / PMM_FRAME_SIZE, e = (base + len) / PMM_FRAME_SIZE;
+    if (s >= pmm_nr_frames) return 0;             /* beyond managed RAM: nothing */
+    if (e > pmm_nr_frames) e = pmm_nr_frames;
+    if (e <= s) return 0;
+    g_nrng[g_nrng_n].start = (uint32_t)s;
+    g_nrng[g_nrng_n].end   = (uint32_t)e;
+    g_nrng[g_nrng_n].node  = node;
+    g_nrng_n++;
+    return 0;
+}
+
+/* The node every frame of [pfn, pfn + 2^order) belongs to, or -1 when a range
+ * boundary falls inside the block (so it must be split). */
+static int block_node(uint32_t pfn, int order) {
+    uint32_t end = pfn + (1u << order);
+    for (int i = 0; i < g_nrng_n; i++) {
+        if (g_nrng[i].start > pfn && g_nrng[i].start < end) return -1;
+        if (g_nrng[i].end   > pfn && g_nrng[i].end   < end) return -1;
+    }
+    return node_of_pfn(pfn);
+}
+
+/* Put a free block onto its node's list for zone type `zi`, splitting it
+ * where a node boundary crosses it.  Caller holds node 0's zone lock; the
+ * target's is taken here (lock order: node 0 first, which every caller of
+ * this obeys and nothing else nests). */
+static void rehome_block(int zi, uint32_t pfn, int order) {
+    int nd = block_node(pfn, order);
+    if (nd < 0) {                                  /* straddles: halve it */
+        rehome_block(zi, pfn, order - 1);
+        rehome_block(zi, pfn + (1u << (order - 1)), order - 1);
+        return;
+    }
+    struct zone* z = &zones_n[nd][zi];
+    uint32_t fl = 0;
+    if (nd) fl = spin_lock_irqsave(&z->lock);
+    zone_push(z, pfn, order);
+    z->free_frames += 1u << order;
+    if (nd) spin_unlock_irqrestore(&z->lock, fl);
+}
+
+/* Apply the recorded ranges: every free block leaves node 0 for its own node,
+ * and `managed` is recounted per node from page_state (a frame the allocator
+ * knows about is any frame not PS_NONE).  The recount is CHECKED against the
+ * old total — a mismatch means a frame was lost or invented in the move, and
+ * that is said loudly rather than left to be found as a leak.  A machine with
+ * no ranges, or with every range on node 0, stays exactly as it was. */
+void pmm_numa_commit(void) {
+    if (g_numa_committed) return;
+    g_numa_committed = 1;
+    int top = 0;
+    for (int i = 0; i < g_nrng_n; i++) if (g_nrng[i].node > top) top = g_nrng[i].node;
+    if (!g_nrng_n || top == 0) { g_nrng_n = 0; return; }
+
+    uint32_t managed_before = pmm_managed_frames(), free_before = pmm_free_frames();
+    g_numa_live = 1;                /* from here node_of_pfn answers from ranges */
+    for (int zi = 0; zi < NR_ZONES; zi++) {
+        struct zone* z0 = &zones_n[0][zi];
+        uint32_t fl = spin_lock_irqsave(&z0->lock);
+        pmm_phys_t heads[BUDDY_MAX_ORDER + 1];
+        for (int o = 0; o <= BUDDY_MAX_ORDER; o++) {
+            heads[o] = z0->free_lists[o];
+            z0->free_lists[o] = 0;
+            z0->nr_at_order[o] = 0;
+        }
+        z0->free_frames = 0;
+        g_nr_nodes = top + 1;       /* published under the lock of the first zone */
+        for (int o = 0; o <= BUDDY_MAX_ORDER; o++)
+            for (pmm_phys_t cur = heads[o]; cur; ) {
+                pmm_phys_t next = link_load(cur);      /* push overwrites the link */
+                rehome_block(zi, phys_to_pfn(cur), o);
+                cur = next;
+            }
+        spin_unlock_irqrestore(&z0->lock, fl);
+    }
+
+    /* Recount managed per node. */
+    for (int nd = 0; nd < g_nr_nodes; nd++)
+        for (int zi = 0; zi < NR_ZONES; zi++) zones_n[nd][zi].managed = 0;
+    for (uint32_t pfn = pmm_pfn_base; pfn < pmm_nr_frames; pfn++) {
+        if (page_state[pfn] == PS_NONE) continue;
+        struct zone* z = zone_for_pfn(pfn);
+        if (z) z->managed++;
+    }
+    uint32_t managed_after = pmm_managed_frames(), free_after = pmm_free_frames();
+    if (managed_after != managed_before || free_after != free_before)
+        kprintf("pmm: !! NUMA re-home changed the totals: managed %u -> %u, "
+                "free %u -> %u\n", managed_before, managed_after, free_before, free_after);
+    for (int nd = 0; nd < g_nr_nodes; nd++) {
+        struct pmm_node_info ni;
+        pmm_node_stats(nd, &ni);
+        kprintf("pmm: NUMA node %d: %u MiB (%u MiB free)\n",
+                nd, (ni.managed * 4) / 1024, (ni.free * 4) / 1024);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Stats.                                                                     */
 /* -------------------------------------------------------------------------- */
 
-uint32_t pmm_managed_frames(void) {
-    return zones[ZONE_DMA].managed + zones[ZONE_DMA32].managed
-         + zones[ZONE_NORMAL].managed + zones[ZONE_HIGHMEM].managed;
+static uint32_t sum_zones(int free) {
+    uint32_t t = 0;
+    for (int nd = 0; nd < g_nr_nodes; nd++)
+        for (int zi = 0; zi < NR_ZONES; zi++)
+            t += free ? zones_n[nd][zi].free_frames : zones_n[nd][zi].managed;
+    return t;
 }
-uint32_t pmm_free_frames(void) {
-    return zones[ZONE_DMA].free_frames + zones[ZONE_DMA32].free_frames
-         + zones[ZONE_NORMAL].free_frames + zones[ZONE_HIGHMEM].free_frames;
-}
+uint32_t pmm_managed_frames(void) { return sum_zones(0); }
+uint32_t pmm_free_frames(void)    { return sum_zones(1); }
 uint32_t pmm_used_frames(void) {
     return pmm_managed_frames() - pmm_free_frames();
 }
 
+/* Summed over every node — the view every caller had before NUMA. */
 void pmm_zone_stats(int zone, uint32_t* out_free_per_order, uint32_t* out_managed) {
     if (zone < 0 || zone >= NR_ZONES) return;
-    struct zone* z = &zones[zone];
-
-    if (out_managed) *out_managed = z->managed;
-    if (out_free_per_order) {
-        for (int o = 0; o <= BUDDY_MAX_ORDER; o++)
-            out_free_per_order[o] = z->nr_at_order[o];
+    if (out_managed) *out_managed = 0;
+    if (out_free_per_order)
+        for (int o = 0; o <= BUDDY_MAX_ORDER; o++) out_free_per_order[o] = 0;
+    for (int nd = 0; nd < g_nr_nodes; nd++) {
+        struct zone* z = &zones_n[nd][zone];
+        if (out_managed) *out_managed += z->managed;
+        if (out_free_per_order)
+            for (int o = 0; o <= BUDDY_MAX_ORDER; o++)
+                out_free_per_order[o] += z->nr_at_order[o];
     }
+}
+
+/* §M19.5.3 — the per-node views. */
+int pmm_node_of(pmm_phys_t phys) { return node_of_pfn(phys_to_pfn(phys)); }
+int pmm_node_count(void) { return g_nr_nodes; }
+void pmm_node_zone_stats(int node, int zone, uint32_t* out_free_per_order,
+                         uint32_t* out_managed) {
+    if (node < 0 || node >= g_nr_nodes || zone < 0 || zone >= NR_ZONES) return;
+    struct zone* z = &zones_n[node][zone];
+    if (out_managed) *out_managed = z->managed;
+    if (out_free_per_order)
+        for (int o = 0; o <= BUDDY_MAX_ORDER; o++) out_free_per_order[o] = z->nr_at_order[o];
+}
+void pmm_node_stats(int node, struct pmm_node_info* out) {
+    if (!out) return;
+    out->managed = out->free = out->hit = out->miss = 0;
+    if (node < 0 || node >= g_nr_nodes) return;
+    for (int zi = 0; zi < NR_ZONES; zi++) {
+        out->managed += zones_n[node][zi].managed;
+        out->free    += zones_n[node][zi].free_frames;
+    }
+    out->hit  = __atomic_load_n(&g_node_hit[node],  __ATOMIC_RELAXED);
+    out->miss = __atomic_load_n(&g_node_miss[node], __ATOMIC_RELAXED);
 }
 
 /* DEBUG — walk every zone's free lists following the intrusive links and
@@ -937,8 +1166,9 @@ void pmm_zone_stats(int zone, uint32_t* out_free_per_order, uint32_t* out_manage
  * Compares the walked count against nr_at_order.  Bounded so a cyclic/garbage
  * chain can't loop forever. */
 void pmm_validate(const char* tag) {
-    for (int zi = 0; zi < NR_ZONES; zi++) {
-        struct zone* z = &zones[zi];
+    for (int zn = 0; zn < NR_ZONES * g_nr_nodes; zn++) {
+        int zi = zn % NR_ZONES;
+        struct zone* z = &zones_n[zn / NR_ZONES][zi];
         for (int o = 0; o <= BUDDY_MAX_ORDER; o++) {
             pmm_phys_t cur = z->free_lists[o];
             pmm_phys_t prevnode = 0;
@@ -954,6 +1184,11 @@ void pmm_validate(const char* tag) {
                 if (pfn >= pmm_nr_frames || pfn < pmm_pfn_base) {
                     kprintf("PMMCHK[%s]: z%d o%d node pfn=%x OUT OF RANGE (phys=%llx)\n", tag, zi, o, pfn,
                             (unsigned long long)cur);
+                    return;
+                }
+                if (node_of_pfn(pfn) != z->node) {
+                    kprintf("PMMCHK[%s]: node %d z%d o%d block pfn=%x belongs to node %d\n",
+                            tag, z->node, zi, o, pfn, node_of_pfn(pfn));
                     return;
                 }
                 if (page_state[pfn] != (uint8_t)o) {
@@ -991,11 +1226,24 @@ void pmm_validate(const char* tag) {
 void pmm_print_stats(void) {
     uint32_t total_mgr  = pmm_managed_frames();
     uint32_t total_free = pmm_free_frames();
+    uint32_t zm[NR_ZONES], zf[NR_ZONES];
+    for (int zi = 0; zi < NR_ZONES; zi++) {
+        zm[zi] = zf[zi] = 0;
+        for (int nd = 0; nd < g_nr_nodes; nd++) {
+            zm[zi] += zones_n[nd][zi].managed;
+            zf[zi] += zones_n[nd][zi].free_frames;
+        }
+    }
     kprintf("pmm: managed=%u free=%u used=%u (%u/%u MiB free) | DMA: m=%u f=%u | DMA32: m=%u f=%u | NORMAL: m=%u f=%u | HIGHMEM: m=%u f=%u\n",
             total_mgr, total_free, total_mgr - total_free,
             (total_free * 4) / 1024, (total_mgr * 4) / 1024,
-            zones[ZONE_DMA].managed,    zones[ZONE_DMA].free_frames,
-            zones[ZONE_DMA32].managed,  zones[ZONE_DMA32].free_frames,
-            zones[ZONE_NORMAL].managed, zones[ZONE_NORMAL].free_frames,
-            zones[ZONE_HIGHMEM].managed, zones[ZONE_HIGHMEM].free_frames);
+            zm[ZONE_DMA], zf[ZONE_DMA], zm[ZONE_DMA32], zf[ZONE_DMA32],
+            zm[ZONE_NORMAL], zf[ZONE_NORMAL], zm[ZONE_HIGHMEM], zf[ZONE_HIGHMEM]);
+    if (g_nr_nodes > 1)
+        for (int nd = 0; nd < g_nr_nodes; nd++) {
+            struct pmm_node_info ni;
+            pmm_node_stats(nd, &ni);
+            kprintf("pmm: node %d: %u MiB, %u MiB free, local %u, fell back %u\n",
+                    nd, (ni.managed * 4) / 1024, (ni.free * 4) / 1024, ni.hit, ni.miss);
+        }
 }

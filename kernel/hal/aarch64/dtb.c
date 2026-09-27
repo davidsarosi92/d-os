@@ -71,6 +71,15 @@ struct fdt_header {
 #define DTB_MAX_RANGES 16
 static uint64_t g_mem_base[DTB_MAX_RANGES], g_mem_size[DTB_MAX_RANGES];
 static int      g_nmem;
+/* §M19.5.3 — the NUMA node of each RAM range and each CPU, from the tree's
+ * `numa-node-id` properties (-1 = the tree does not say).  A /memory node may
+ * carry the property before or after its `reg`, so both orders are handled:
+ * ranges added by the node inherit the id it has seen so far, and an id that
+ * arrives later is stamped onto every range the node already added. */
+static int      g_mem_nid[DTB_MAX_RANGES];
+static int      g_memnode_first, g_memnode_nid = -1;
+#define DTB_MAX_CPU_NID 32
+static int      g_cpu_nid[DTB_MAX_CPU_NID];
 static uint64_t g_rsv_base[DTB_MAX_RANGES], g_rsv_size[DTB_MAX_RANGES];
 static int      g_nrsv;
 static uint64_t g_ram_base;              /* lowest range's base (legacy getter) */
@@ -315,7 +324,11 @@ static void fdt_parse(const struct fdt_header* h) {
                 in_cpus = 1; cpus_depth = depth;   /* children are at depth+1 */
             }
             if (in_cpus && depth == cpus_depth + 1 && str_prefix(name, "cpu@")) {
+                if (g_ncpu < DTB_MAX_CPU_NID) g_cpu_nid[g_ncpu] = -1;
                 g_ncpu++;
+            }
+            if (depth == 2 && str_prefix(name, "memory")) {
+                g_memnode_first = g_nmem; g_memnode_nid = -1;
             }
         } else if (tok == FDT_END_NODE) {
             if (in_cpus && depth == cpus_depth) in_cpus = 0;
@@ -365,6 +378,16 @@ static void fdt_parse(const struct fdt_header* h) {
             }
             /* /memory@.../reg = one or more <base size> tuples. */
             const char* cur = (depth >= 1 && depth <= 8) ? namestk[depth - 1] : "";
+            if (str_prefix(pname, "numa-node-id") && len == 4) {
+                int nid = (int)rd32(val);
+                if (depth == 2 && str_prefix(cur, "memory")) {
+                    g_memnode_nid = nid;
+                    for (int i = g_memnode_first; i < g_nmem; i++) g_mem_nid[i] = nid;
+                } else if (in_cpus && depth == cpus_depth + 1 && str_prefix(cur, "cpu@") &&
+                           g_ncpu >= 1 && g_ncpu <= DTB_MAX_CPU_NID) {
+                    g_cpu_nid[g_ncpu - 1] = nid;
+                }
+            }
             uint32_t tup = 4 * (acells + scells);
             if (depth == 2 && !g_have_bi_mem && str_prefix(cur, "memory") && str_prefix(pname, "reg") &&
                 acells >= 1 && acells <= 2 && scells >= 1 && scells <= 2) {
@@ -377,6 +400,7 @@ static void fdt_parse(const struct fdt_header* h) {
                                 DTB_MAX_RANGES, (void*)(uintptr_t)b0, (unsigned)(sz >> 20));
                         continue;
                     }
+                    g_mem_nid[g_nmem] = g_memnode_nid;
                     g_mem_base[g_nmem] = b0; g_mem_size[g_nmem] = sz; g_nmem++;
                 }
             }
@@ -419,6 +443,7 @@ void dtb_init(uint64_t x0) {
          * map says which pages are really free.  Taken first, so a tree parsed
          * below can add devices but not RAM. */
         for (uint32_t i = 0; i < g_bi.nmem && g_nmem < DTB_MAX_RANGES; i++) {
+            g_mem_nid[g_nmem] = -1;       /* the EFI map carries no affinity */
             g_mem_base[g_nmem] = g_bi.mem[i].base; g_mem_size[g_nmem] = g_bi.mem[i].size; g_nmem++;
         }
         g_have_bi_mem = g_bi.nmem > 0;
@@ -482,3 +507,6 @@ int dtb_rsv_range(int i, uint64_t* base, uint64_t* size) {
     *base = g_rsv_base[i]; *size = g_rsv_size[i]; return 0;
 }
 int      dtb_ncpu(void)     { return g_ncpu; }
+/* §M19.5.3 — -1 where the tree gives no numa-node-id. */
+int dtb_mem_node(int i)  { return (i >= 0 && i < g_nmem) ? g_mem_nid[i] : -1; }
+int dtb_cpu_node(int i)  { return (i >= 0 && i < g_ncpu && i < DTB_MAX_CPU_NID) ? g_cpu_nid[i] : -1; }

@@ -202,6 +202,19 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * same pass enumerates LAPIC + IOAPIC topology for SMP (M18). */
     acpi_init();
 
+    /* §M19.5.3 — SRAT's memory affinity becomes the allocator's per-node zone
+     * sets.  Here and not in pmm_init, because the tables are only readable
+     * once the VMM and the allocator exist (see pmm.c).  A machine without
+     * SRAT records nothing and pmm_numa_commit leaves it untouched. */
+    for (int i = 0; i < acpi_mem_affinity_count(); i++) {
+        uint32_t node; uint64_t base, len;
+        if (acpi_mem_affinity_get(i, &node, &base, &len) == 0 &&
+            pmm_numa_add_range(base, len, (int)node) != 0)
+            kprintf("pmm: SRAT range %d (node %u) not used - table full or node too large\n",
+                    i, node);
+    }
+    pmm_numa_commit();
+
     /* §M33 stage 5 — ask whether this machine has DMA remapping hardware.
      * Immediately after ACPI because the DMAR is an ACPI table, and BEFORE any
      * driver is placed, so `/proc/security` and the isolation column are
