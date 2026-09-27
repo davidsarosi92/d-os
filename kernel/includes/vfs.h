@@ -132,6 +132,13 @@ struct inode_ops {
      * would need a directory-entry rewrite — deferred). */
     int (*rename)(struct inode* dir, const char* oldname,
                   const char* newname, struct inode* child);
+    /* §M32 (2026-09-27) — OPTIONAL, APPENDED.  Persist `child`'s owner_uid,
+     * owner_gid and mode (already changed in memory) to the volume.  Called
+     * by chmod, chown and by a user's create.  0 = stored; non-zero = the
+     * change could not be written, and the VFS puts the in-memory values
+     * back rather than enforce something the disk will forget.  NULL = the
+     * fs does not store ownership (then fs_type.stores_ownership is 0). */
+    int (*setattr)(struct inode* dir, const char* name, struct inode* child);
 };
 
 /* Inode — owned by the fs that created it.  `private` is fs-defined. */
@@ -312,6 +319,9 @@ int  vfs_permitted(const struct inode* ino, int want);
  * and there is no reason an ordinary user needs it. */
 int  vfs_chmod(const char* path, uint32_t mode);
 int  vfs_chown(const char* path, int uid, int gid);
+/* §M32 — what `stat` prints. */
+struct vfs_stat { int uid, gid; uint32_t mode; uint64_t size; int is_dir; };
+int  vfs_stat(const char* path, struct vfs_stat* st);
 
 /* One mounted filesystem.  The VFS kept no record of its mounts before §M32,
  * so nothing could answer "which filesystem is this path on" — the question

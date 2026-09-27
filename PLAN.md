@@ -219,7 +219,7 @@ fixed first, whatever it touches.
 | §M19.5 | ✅ complete — per-node zones (§4.106) | — (per-node slab caches: later) |
 | §M23 | ✅ complete (the virtio-sound interrupt was already in place — measured) | — |
 | §M26 / §M59 | ✅ complete — `wl_data_device` bridged to the d-os clipboard (§4.107) | — (drag and drop, primary selection over Wayland: later) |
-| §M32 | stages 1-10.1; simultaneous sessions (§4.108) | on-disk ownership |
+| §M32 | ✅ complete — simultaneous sessions (§4.108), on-disk ownership (§4.109) | — (fast user switching: two live desktops) |
 | §M85 | ✅ complete (§4.105) | — (sbsa-ref clock via UEFI runtime: later) |
 | §M86 | ✅ RAM above 4 GiB; user no-execute on x86 (§4.104) | — |
 | §M81 | steps 1-2, step 3 in part | chrome still hand-drawn; the verdict |
@@ -284,7 +284,7 @@ what); a session can pick a theme and push on it.
 | M29 | Services / daemons — SERVICE() registry + supervisor (autostart, restart policy) + service bus (endpoint / contract / transport, location-independent binding) | Architecture | ✅ DOCS §4.21 |
 | M30 | Task scheduling — cron service (crontab, timer loop, RTC-driven jobs) | Architecture | ✅ DOCS §4.23 |
 | M31 | Watchdog — heartbeat freeze detection (per-task / per-CPU softlockup / hardware) | Reliability | ✅ DOCS §4.22 (L1+L2) + L3 hardware watchdog (DOCS §4.67, §4.102.1 per-alarm decision) |
-| M32 | **Multi-user — identity, accounts, permissions** | Security | ◐ stages 1-10 + 10.1 (DOCS §4.91): accounts, ownership, permissions, per-user settings, lock/greeter asks who you are (2026-09-27).  simultaneous sessions (DOCS §4.108).  **OPEN: on-disk ownership (no filesystem here stores it)** |
+| M32 | **Multi-user — identity, accounts, permissions** | Security | ◐ stages 1-10 + 10.1 (DOCS §4.91): accounts, ownership, permissions, per-user settings, lock/greeter asks who you are (2026-09-27).  simultaneous sessions (DOCS §4.108), on-disk ownership on exFAT (DOCS §4.109) — ✅ |
 | M33 | Execution domains — a service's run location as a declared capability + config choice; driver placement is the flagship case | Reliability | ✅ COMPLETE 2026-08-29 (DOCS §4.82): Tier 0/1/2, shared-controller arbitration, IOMMU stage 5, and per-driver DMA domains proven by a driver in ring 3 whose device is refused outside its own buffer.  OPEN, none of it gating the claim: the modern virtio transport (legacy has no feature bit 33 — a virtio-driver item), a REAL DMA driver ported to drvrt, richer state replay |
 | **M46** | **Resilient control plane — SAK hotkeys + force-kill** — Ctrl+Alt+Del = always-live Task Manager, Ctrl+Alt+X = kill last/frozen app, window chrome (close/min/restore) works even when the app is wedged (close ⇒ force-kill), Task Manager force-quit; the enabler is a real force-kill of a wedged ring-3 process | Reliability / UX | ✅ DOCS §4.37 |
 | M58 | Text selection — pointer grab + press/motion/release, selection model (text bytes / terminal cells), word + line selection | UX | ✅ DOCS §4.69 (pointer grab, terminal + editor selection) + §4.75 (scrollback-anchored selection) |

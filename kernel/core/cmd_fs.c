@@ -22,10 +22,18 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Why did an open fail?  "not found" for a file that exists and was REFUSED
+ * sent the reader looking for a missing file (§M32, 2026-09-27: `cat` of
+ * another user's 0600 file printed the VFS's refusal and then "not found"). */
+static const char* open_failure(const char* path) {
+    struct vfs_stat st;
+    return vfs_stat(path, &st) == 0 ? "permission denied" : "not found";
+}
+
 static void cmd_ls(const char* path) {
     if (!path || !*path) path = "/";
     struct file* f = vfs_open(path, VFS_RDONLY);
-    if (!f) { kprintf("ls: %s: not found\n", path); return; }
+    if (!f) { kprintf("ls: %s: %s\n", path, open_failure(path)); return; }
 
     struct dirent de;
     int n;
@@ -42,7 +50,7 @@ static void cmd_ls(const char* path) {
 static void cmd_cat(const char* path) {
     if (!path || !*path) { console_write("cat: missing path\n"); return; }
     struct file* f = vfs_open(path, VFS_RDONLY);
-    if (!f) { kprintf("cat: %s: not found\n", path); return; }
+    if (!f) { kprintf("cat: %s: %s\n", path, open_failure(path)); return; }
 
     char buf[128];
     ssize_t got;
@@ -75,12 +83,12 @@ static void cmd_mount(const char* args) {
     /* §M32 stage 5 — WITH NO ARGUMENTS, LIST WHAT IS MOUNTED AND SAY WHETHER
      * ITS PERMISSIONS ARE REAL.
      *
-     * This is not a convenience.  The whole ownership model is enforced from
-     * RAM, and on this machine NO filesystem stores an owner across a reboot:
-     * ramfs/devfs/procfs are volatile, and exFAT has no owner field, no mode
-     * field and nowhere to put them.  A user who sets a file to 0600 and
-     * reboots gets a world-readable file back, and our own next boot — or any
-     * other operating system — reads it.
+     * This is not a convenience.  The ownership model is enforced from RAM,
+     * and only a filesystem that STORES it keeps it across a reboot: ramfs,
+     * devfs and procfs are volatile; exFAT stores owner and mode since
+     * 2026-09-27 in a d-os Vendor Extension entry inside each file's own entry
+     * set (exfat.c).  Another operating system reading the volume ignores
+     * that entry — which is true of every filesystem's permissions.
      *
      * *That is a fact about the machine, so it belongs ON the machine and not
      * only in a design document* — the §M33 honesty gate applied to storage.
@@ -90,20 +98,23 @@ static void cmd_mount(const char* args) {
         int n = vfs_mount_count();
         if (n == 0) { console_write("mount: nothing mounted\n"); return; }
         console_write("PATH  FS  OWNERSHIP\n");
-        int any_advisory = 0;
+        int any_advisory = 0, any_stored = 0;
         for (int i = 0; i < n; i++) {
             const struct vfs_mount* m = vfs_mount_at(i);
             if (!m) continue;
             kprintf("%s   %s   %s\n", m->path, m->fs_name,
-                    m->stores_ownership ? "stored on the volume"
+                    m->stores_ownership ? "STORED on the volume (survives a reboot)"
                                         : "ADVISORY — not stored, lost at power-off");
             if (!m->stores_ownership) any_advisory = 1;
+            else                      any_stored = 1;
         }
         if (any_advisory)
             console_write("mount: permissions on an ADVISORY volume are enforced by "
                           "this kernel while it runs and are invisible to every "
-                          "other system; a filesystem with owner fields (ext2) is "
-                          "what would make them real.\n");
+                          "other system.\n");
+        if (any_stored) console_write("mount: a STORED volume keeps owner and mode on disk; other "
+                      "operating systems do not enforce them (no filesystem's "
+                      "permissions survive being read by a system that ignores them).\n");
         return;
     }
     char fs[32];   int fi = 0;
@@ -292,6 +303,7 @@ static void cmd_chmod(const char* args) {
     int r = vfs_chmod(path, mode);
     if (r == -1)      kprintf("chmod: %s: no such path\n", path);
     else if (r == -2) kprintf("chmod: %s: only the owner or an administrator may change the mode\n", path);
+    else if (r == -3) kprintf("chmod: %s: the volume did not take the change - left as it was\n", path);
     else              kprintf("chmod: %s is now %d%d%d%d\n", path,
                               (int)((mode >> 9) & 7), (int)((mode >> 6) & 7),
                               (int)((mode >> 3) & 7), (int)(mode & 7));
@@ -313,9 +325,27 @@ static void cmd_chown(const char* args) {
     int r = vfs_chown(path, u->uid, u->gid);
     if (r == -1)      kprintf("chown: %s: no such path\n", path);
     else if (r == -2) console_write("chown: only an administrator may give a file away\n");
+    else if (r == -3) kprintf("chown: %s: the volume did not take the change - left as it was\n", path);
     else              kprintf("chown: %s now belongs to %s (uid %d)\n", path, u->name, u->uid);
 }
 
+/* §M32 — `stat <path>`: owner, group, mode, size, and whether the volume
+ * keeps them.  The test for on-disk ownership reads it after a reboot. */
+static void cmd_stat(const char* args) {
+    while (args && *args == ' ') args++;
+    if (!args || !*args) { console_write("usage: stat <path>\n"); return; }
+    struct vfs_stat st;
+    if (vfs_stat(args, &st) != 0) { kprintf("stat: %s: no such path\n", args); return; }
+    const struct user_account* u = user_by_uid(st.uid);
+    const struct vfs_mount* m = vfs_mount_for(args);
+    kprintf("%s: %s, owner %s (uid %d) gid %d, mode %d%d%d%d, %u bytes, %s\n",
+            args, st.is_dir ? "directory" : "file", u ? u->name : "?", st.uid, st.gid,
+            (int)((st.mode >> 9) & 7), (int)((st.mode >> 6) & 7),
+            (int)((st.mode >> 3) & 7), (int)(st.mode & 7), (unsigned)st.size,
+            (m && m->stores_ownership) ? "stored on the volume" : "not stored (lost at power-off)");
+}
+SHELL_CMD(stat)  = { "stat", "<path>", "owner, mode and size of a file",
+                     SHELL_G_FS, cmd_stat, SHELL_P_ANY };
 SHELL_CMD(chmod) = { "chmod", "<path> <octal-mode>", "change a file's permission bits",
                      SHELL_G_FS, cmd_chmod, SHELL_P_ANY };
 SHELL_CMD(chown) = { "chown", "<path> <user>", "change a file's owner (admin only)",

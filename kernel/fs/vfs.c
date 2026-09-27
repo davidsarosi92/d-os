@@ -551,6 +551,11 @@ static int vfs_mutator_unlocked(const char* path, int is_dir) {
         if (c->owner == TASK_OWNER_USER) {
             ino->owner_uid = cred_uid(c);
             ino->owner_gid = cred_gid(c);
+            /* ...and on a filesystem that stores ownership, the disk has to
+             * hear it too, or the file is the user's until the next mount. */
+            if (parent->inode->dir_ops && parent->inode->dir_ops->setattr &&
+                parent->inode->dir_ops->setattr(parent->inode, last, ino) != 0)
+                klog(KLOG_WARN, "vfs", "%s: owner not stored on the volume\n", last);
         }
     }
 
@@ -786,6 +791,17 @@ int vfs_permitted(const struct inode* ino, int want) {
     return ((int)bits & want) == want;
 }
 
+/* §M32 — hand a changed owner/mode to the filesystem, if it keeps them.  A
+ * failure is reported, and the callers put the old values back: enforcing a
+ * mode the disk did not take would be true until the next mount and then
+ * silently false. */
+static int persist_attr(struct dentry* d) {
+    if (!d->parent || !d->parent->inode) return 0;          /* a mount root */
+    const struct inode_ops* ops = d->parent->inode->dir_ops;
+    if (!ops || !ops->setattr) return 0;                    /* volatile fs */
+    return ops->setattr(d->parent->inode, d->name, d->inode);
+}
+
 static int vfs_chmod_unlocked(const char* path, uint32_t mode) {
     struct dentry* d = resolve_path(path, NULL, NULL);
     if (!d || !d->inode) return -1;
@@ -795,7 +811,9 @@ static int vfs_chmod_unlocked(const char* path, uint32_t mode) {
      * power to change the grant makes the mode self-modifying. */
     if (c->owner == TASK_OWNER_USER && !cred_is_admin(c) &&
         cred_uid(c) != d->inode->owner_uid) return -2;
+    uint32_t was = d->inode->mode;
     d->inode->mode = mode & 07777u;
+    if (persist_attr(d) != 0) { d->inode->mode = was; return -3; }
     return 0;
 }
 int vfs_chmod(const char* path, uint32_t mode) {
@@ -810,10 +828,29 @@ static int vfs_chown_unlocked(const char* path, int uid, int gid) {
      * ownership-based rule gets escaped from the inside, and no ordinary
      * workflow here needs it. */
     if (c->owner == TASK_OWNER_USER && !cred_is_admin(c)) return -2;
+    int ou = d->inode->owner_uid, og = d->inode->owner_gid;
     if (uid != CRED_UID_NONE) d->inode->owner_uid = uid;
     if (gid != CRED_UID_NONE) d->inode->owner_gid = gid;
+    if (persist_attr(d) != 0) { d->inode->owner_uid = ou; d->inode->owner_gid = og; return -3; }
     return 0;
 }
+/* §M32 — owner, mode, size and kind of `path`, as this kernel enforces them.
+ * 0, or -1 if the path does not resolve. */
+static int vfs_stat_unlocked(const char* path, struct vfs_stat* st) {
+    struct dentry* d = resolve_path(path, NULL, NULL);
+    if (!d || !d->inode) return -1;
+    st->uid  = d->inode->owner_uid;
+    st->gid  = d->inode->owner_gid;
+    st->mode = d->inode->mode;
+    st->size = d->inode->size;
+    st->is_dir = d->inode->type == INODE_DIR;
+    return 0;
+}
+int vfs_stat(const char* path, struct vfs_stat* st) {
+    if (!st) return -1;
+    return NS_LOCKED(int, vfs_stat_unlocked(path, st));
+}
+
 int vfs_chown(const char* path, int uid, int gid) {
     return NS_LOCKED(int, vfs_chown_unlocked(path, uid, gid));
 }

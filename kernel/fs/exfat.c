@@ -43,6 +43,7 @@
  *
  * ============================================================================= */
 
+#include "cred.h"      /* §M32 — CRED_UID_ROOT for a new owner record */
 #include "vfs.h"
 #include "block.h"
 #include "block_cache.h"
@@ -68,6 +69,13 @@
 #define EXFAT_TYPE_FILE           0x85u
 #define EXFAT_TYPE_STREAM         0xC0u
 #define EXFAT_TYPE_NAME           0xC1u
+/* §M32 — a Vendor Extension directory entry (spec 7.8): a BENIGN secondary
+ * entry, part of a file's entry set and covered by its SetChecksum, carrying a
+ * 16-byte vendor GUID and 14 bytes the vendor defines.  Implementations that
+ * do not know the GUID ignore it — which is exactly the property that lets
+ * ownership live INSIDE the file's own entry set rather than in a side-car
+ * map that must be kept in step with it. */
+#define EXFAT_TYPE_VENDOR_EXT     0xE0u
 #define EXFAT_TYPE_BITMAP         0x81u
 #define EXFAT_TYPE_UPCASE         0x82u
 #define EXFAT_TYPE_LABEL          0x83u
@@ -90,6 +98,18 @@
  * sidesteps multi-name-entry edge cases for now. */
 #define EXFAT_MAX_NAME            30                /* ASCII chars excl. NUL */
 #define EXFAT_MAX_NAME_ENTRIES    2                 /* 30 chars / 15 per entry */
+/* File + Stream + names + our Vendor Extension. */
+#define EXFAT_MAX_SET_ENTRIES     (1 + 1 + EXFAT_MAX_NAME_ENTRIES + 1)
+
+/* d-os's ownership record.  The GUID is ours (random, fixed forever — it is
+ * the format's identity); VendorDefined holds:
+ *   [0..1] "dO"  [2] version 1  [3] reserved  [4..7] uid  [8..11] gid
+ *   [12..13] mode (the rwx bits and the three special bits). */
+static const uint8_t DOS_OWNER_GUID[16] = {
+    0x7b, 0x3f, 0x91, 0x0c, 0x5e, 0xa2, 0x4d, 0x61,
+    0x9a, 0x0e, 0xd0, 0x57, 0x4f, 0x53, 0x2d, 0x31,
+};
+struct owner_rec { int uid, gid; uint32_t mode; };
 
 /* ---------------------------------------------------------------------- */
 /* Per-mount + per-inode state.                                           */
@@ -137,6 +157,7 @@ struct exfat_inode {
                                             built: bounds a NoFatChain parent */
     uint32_t dirent_index;               /* 0-based index of File entry within parent */
     uint8_t  sec_count;                  /* SecondaryCount from File entry */
+    int      has_owner_rec;              /* its set carries our Vendor Extension */
 };
 
 /* ---------------------------------------------------------------------- */
@@ -484,6 +505,8 @@ struct parsed_file {
     uint32_t first_cluster;
     uint64_t data_length;
     uint32_t dirent_index;
+    int      has_owner;                  /* a d-os Vendor Extension was found */
+    struct owner_rec own;
 };
 
 static struct inode* build_inode(struct exfat_fs* fs,
@@ -506,6 +529,7 @@ static struct inode* build_inode(struct exfat_fs* fs,
     ei->parent_size            = parent_size;
     ei->dirent_index           = pf->dirent_index;
     ei->sec_count              = pf->sec_count;
+    ei->has_owner_rec          = pf->has_owner;
 
     ino->size    = pf->data_length;
     ino->private = ei;
@@ -518,11 +542,15 @@ static struct inode* build_inode(struct exfat_fs* fs,
         ino->ops     = &exfat_file_ops;
         ino->dir_ops = NULL;
     }
-    /* §M32 — exFAT has NO owner and NO mode on disk, so every inode is
-     * synthesised with the defaults at every mount.  That is the whole of what
-     * `fs_type.stores_ownership = 0` means, and `mount` says so out loud: what
-     * this kernel enforces on /mnt is true until the power goes off. */
+    /* §M32 — defaults first (a file written by another system has no owner
+     * record, and root:root 0644/0755 is what it gets), then the owner record
+     * from the file's own entry set when there is one. */
     vfs_inode_defaults(ino);
+    if (pf->has_owner) {
+        ino->owner_uid = pf->own.uid;
+        ino->owner_gid = pf->own.gid;
+        ino->mode      = pf->own.mode & 07777u;
+    }
     return ino;
 }
 
@@ -537,6 +565,29 @@ static struct inode* build_inode(struct exfat_fs* fs,
 
 typedef int (*dir_visit_fn)(const char* name, const struct parsed_file* pf,
                             void* ctx);
+
+/* Is this entry OUR owner record?  Fills `out` if so. */
+static int owner_rec_parse(const uint8_t* e, struct owner_rec* out) {
+    if (e[0] != EXFAT_TYPE_VENDOR_EXT) return 0;
+    for (int i = 0; i < 16; i++) if (e[2 + i] != DOS_OWNER_GUID[i]) return 0;
+    const uint8_t* v = e + 18;
+    if (v[0] != 'd' || v[1] != 'O' || v[2] != 1) return 0;
+    out->uid  = (int)le32(v + 4);
+    out->gid  = (int)le32(v + 8);
+    out->mode = le16(v + 12);
+    return 1;
+}
+static void owner_rec_build(uint8_t* e, const struct owner_rec* r) {
+    memset_(e, 0, EXFAT_ENTRY_SIZE);
+    e[0] = EXFAT_TYPE_VENDOR_EXT;
+    e[1] = 0;                            /* GeneralSecondaryFlags: no allocation */
+    for (int i = 0; i < 16; i++) e[2 + i] = DOS_OWNER_GUID[i];
+    uint8_t* v = e + 18;
+    v[0] = 'd'; v[1] = 'O'; v[2] = 1; v[3] = 0;
+    wle32(v + 4, (uint32_t)r->uid);
+    wle32(v + 8, (uint32_t)r->gid);
+    wle16(v + 12, (uint16_t)(r->mode & 07777u));
+}
 
 static int scan_directory(struct exfat_fs* fs, uint32_t parent_first_cluster,
                           int parent_no_fat_chain, uint64_t limit,
@@ -584,6 +635,12 @@ static int scan_directory(struct exfat_fs* fs, uint32_t parent_first_cluster,
             ne++;
         }
         if (ne == 0) { idx += 1 + pf.sec_count; continue; }
+        /* §M32 — the rest of the set: our owner record, if any. */
+        for (int j = 2 + ne; j <= pf.sec_count; j++) {
+            uint8_t ve[EXFAT_ENTRY_SIZE];
+            if (dir_entry_read(&it, idx + j, ve) != 0) break;
+            if (owner_rec_parse(ve, &pf.own)) { pf.has_owner = 1; break; }
+        }
 
         char nbuf[EXFAT_MAX_NAME + 1];
         if (decode_name(name_ptrs, ne, pf.name_length, nbuf, sizeof nbuf) <= 0) {
@@ -738,9 +795,9 @@ static int exfat_write_meta(struct inode* fi) {
     };
 
     int total = 1 + ei->sec_count;
-    if (total > 1 + 1 + EXFAT_MAX_NAME_ENTRIES) return -1;
+    if (total > EXFAT_MAX_SET_ENTRIES) return -1;
 
-    uint8_t buf[(1 + 1 + EXFAT_MAX_NAME_ENTRIES) * EXFAT_ENTRY_SIZE];
+    uint8_t buf[EXFAT_MAX_SET_ENTRIES * EXFAT_ENTRY_SIZE];
     for (int i = 0; i < total; i++) {
         if (dir_entry_read(&it, ei->dirent_index + i, buf + i * EXFAT_ENTRY_SIZE) != 0)
             return -1;
@@ -1102,10 +1159,11 @@ static uint32_t dir_find_or_grow(struct inode* dir, int need) {
  * ---------------------------------------------------------------------- */
 static int build_entry_set(uint8_t* set, const char* name, int name_len,
                            int is_dir, uint32_t first_cluster,
-                           uint64_t data_len, uint8_t stream_flags) {
+                           uint64_t data_len, uint8_t stream_flags,
+                           const struct owner_rec* own) {
     int name_entries = (name_len + 14) / 15;
     if (name_len <= 0 || name_entries > EXFAT_MAX_NAME_ENTRIES) return -1;
-    int sec_count = 1 + name_entries;
+    int sec_count = 1 + name_entries + (own ? 1 : 0);
     int total_e   = 1 + sec_count;
 
     memset_(set, 0, (size_t)total_e * EXFAT_ENTRY_SIZE);
@@ -1136,6 +1194,9 @@ static int build_entry_set(uint8_t* set, const char* name, int name_len,
             wle16(ne + 2 + k * 2, ch);
         }
     }
+    /* §M32 — the owner record goes AFTER the names: the spec orders a set's
+     * secondaries as stream, names, then any others. */
+    if (own) owner_rec_build(set + (2 + name_entries) * EXFAT_ENTRY_SIZE, own);
 
     wle16(fe + 2, set_checksum(set, total_e * EXFAT_ENTRY_SIZE));
     return total_e;
@@ -1168,15 +1229,19 @@ static int exfat_make(struct inode* dir, const char* name, struct inode** out,
     }
     int name_entries = (name_len + 14) / 15;
     if (name_entries > EXFAT_MAX_NAME_ENTRIES)      return -1;
-    int sec_count    = 1 + name_entries;            /* stream + name entries */
+    int sec_count    = 1 + name_entries + 1;        /* stream + names + owner */
     int total_e      = 1 + sec_count;               /* + file entry */
+    /* §M32 — every set this driver writes carries an owner record, with the
+     * defaults until the VFS says otherwise (a user's create is followed by a
+     * setattr), so later changes are an in-place rewrite. */
+    struct owner_rec own = { CRED_UID_ROOT, CRED_GID_ROOT, as_dir ? 0755u : 0644u };
 
     /* Find a slot in the parent directory, growing it when it is full. */
     uint32_t slot = dir_find_or_grow(dir, total_e);
     if (slot == (uint32_t)-1) return -2;
 
     /* Build the entries in a local buffer. */
-    uint8_t set[(1 + 1 + EXFAT_MAX_NAME_ENTRIES) * EXFAT_ENTRY_SIZE];
+    uint8_t set[EXFAT_MAX_SET_ENTRIES * EXFAT_ENTRY_SIZE];
 
     /* A directory owns a cluster from the start; a file may own none. */
     uint32_t new_cluster = 0;
@@ -1195,7 +1260,7 @@ static int exfat_make(struct inode* dir, const char* name, struct inode** out,
 
     if (build_entry_set(set, name, name_len, as_dir, new_cluster,
                         as_dir ? fs->bytes_per_cluster : 0,
-                        as_dir ? 0x03 : 0x00) != total_e) {
+                        as_dir ? 0x03 : 0x00, &own) != total_e) {
         if (new_cluster) bitmap_free(fs, new_cluster);
         return -1;
     }
@@ -1225,6 +1290,8 @@ static int exfat_make(struct inode* dir, const char* name, struct inode** out,
         .first_cluster = new_cluster,
         .data_length   = as_dir ? fs->bytes_per_cluster : 0,
         .dirent_index  = slot,
+        .has_owner     = 1,
+        .own           = own,
     };
     struct inode* ino = build_inode(fs, &pf, dei->first_cluster, dei->no_fat_chain,
                                     dir->size);
@@ -1288,38 +1355,16 @@ static int exfat_unlink(struct inode* dir, const char* name,
  * other order leaves the chain allocated and unreferenced, i.e. the file is
  * simply gone.  Losing the name is recoverable, losing the file is not.
  * ---------------------------------------------------------------------- */
-static int exfat_rename(struct inode* dir, const char* oldname,
-                        const char* newname, struct inode* child) {
+/* Write a COMPLETE new entry set for `target` under `name` (with its current
+ * owner record), then delete the old one — see the rename header above for
+ * why "new first, old second".  Used by rename, and by setattr for a set that
+ * has no owner record yet (one written by another system, or before §M32
+ * stored ownership), which needs a bigger set than the one it has. */
+static int relocate_set(struct inode* dir, const char* newname, int new_len,
+                        struct inode* target) {
     struct exfat_inode* dei = (struct exfat_inode*)dir->private;
-    if (!dei) return -1;
-    struct exfat_fs* fs = dei->fs;
-
-    int new_len = (int)strlen_(newname);
-    /* -5, not -1: "the name is too long for this filesystem" is a different
-     * thing from "that rename cannot be done", and a caller that cannot tell
-     * them apart reports the wrong reason to the user.  (It reported "same
-     * directory only?" for a 43-character name, which sent the first test
-     * looking in entirely the wrong place.) */
-    if (new_len == 0) return -1;
-    if (new_len > EXFAT_MAX_NAME) return -5;
-
-    struct inode* target = child;
-    if (!target && (exfat_lookup(dir, oldname, &target) != 0 || !target)) return -1;
     struct exfat_inode* tei = (struct exfat_inode*)target->private;
-    if (!tei) return -1;
-
-    /* Renaming to the name it already has is success, and must NOT go through
-     * the write-then-delete below — that would delete the set just written. */
-    if (streq_(oldname, newname)) return 0;
-
-    /* REFUSE AN EXISTING TARGET, the rule §4.73 paid for: a filesystem that
-     * can hold one name twice does not have a namespace.  The VFS may also
-     * check, but the fs owns its directory and must not depend on that. */
-    {
-        struct inode* dup = NULL;
-        if (exfat_lookup(dir, newname, &dup) == 0 && dup) return -2;
-    }
-
+    struct exfat_fs* fs = dei->fs;
     /* The new set describes exactly what the old one did — same cluster, same
      * length, same kind — with a different name. */
     int is_dir = (target->type == INODE_DIR);
@@ -1327,9 +1372,12 @@ static int exfat_rename(struct inode* dir, const char* oldname,
     if (tei->first_cluster) flags |= 0x01;                 /* AllocationPossible */
     if (tei->no_fat_chain)  flags |= 0x02;                 /* NoFatChain         */
 
-    uint8_t set[(1 + 1 + EXFAT_MAX_NAME_ENTRIES) * EXFAT_ENTRY_SIZE];
+    uint8_t set[EXFAT_MAX_SET_ENTRIES * EXFAT_ENTRY_SIZE];
+    /* §M32 — the owner travels with the file; a rename of a file written by
+     * another system gives it a record carrying what this kernel enforces. */
+    struct owner_rec own = { target->owner_uid, target->owner_gid, target->mode };
     int total_e = build_entry_set(set, newname, new_len, is_dir,
-                                  tei->first_cluster, target->size, flags);
+                                  tei->first_cluster, target->size, flags, &own);
     if (total_e < 0) return -1;
 
     uint32_t slot = dir_find_or_grow(dir, total_e);
@@ -1362,6 +1410,7 @@ static int exfat_rename(struct inode* dir, const char* oldname,
      * renamed and then silently stop growing. */
     tei->dirent_index = slot;
     tei->sec_count    = (uint8_t)(total_e - 1);
+    tei->has_owner_rec = 1;
     /* And the parent's SHAPE, which dir_find_or_grow may just have changed:
      * the new slot can lie in a cluster the directory gained a moment ago,
      * beyond the size (and past the NoFatChain run) this inode remembers. */
@@ -1370,6 +1419,81 @@ static int exfat_rename(struct inode* dir, const char* oldname,
 
     bcache_sync(fs->dev);
     return 0;
+}
+
+static int exfat_rename(struct inode* dir, const char* oldname,
+                        const char* newname, struct inode* child) {
+    struct exfat_inode* dei = (struct exfat_inode*)dir->private;
+    if (!dei) return -1;
+
+    int new_len = (int)strlen_(newname);
+    /* -5, not -1: "the name is too long for this filesystem" is a different
+     * thing from "that rename cannot be done", and a caller that cannot tell
+     * them apart reports the wrong reason to the user.  (It reported "same
+     * directory only?" for a 43-character name, which sent the first test
+     * looking in entirely the wrong place.) */
+    if (new_len == 0) return -1;
+    if (new_len > EXFAT_MAX_NAME) return -5;
+
+    struct inode* target = child;
+    if (!target && (exfat_lookup(dir, oldname, &target) != 0 || !target)) return -1;
+    struct exfat_inode* tei = (struct exfat_inode*)target->private;
+    if (!tei) return -1;
+
+    /* Renaming to the name it already has is success, and must NOT go through
+     * the write-then-delete below — that would delete the set just written. */
+    if (streq_(oldname, newname)) return 0;
+
+    /* REFUSE AN EXISTING TARGET, the rule §4.73 paid for: a filesystem that
+     * can hold one name twice does not have a namespace.  The VFS may also
+     * check, but the fs owns its directory and must not depend on that. */
+    {
+        struct inode* dup = NULL;
+        if (exfat_lookup(dir, newname, &dup) == 0 && dup) return -2;
+    }
+
+    return relocate_set(dir, newname, new_len, target);
+}
+
+
+/* §M32 — store the inode's owner and mode in its entry set.  In place when
+ * the set already carries our record (every set this driver has written since
+ * 2026-09-27); otherwise the set is rewritten one entry larger. */
+static int exfat_setattr(struct inode* dir, const char* name, struct inode* child) {
+    struct exfat_inode* dei = (struct exfat_inode*)dir->private;
+    struct exfat_inode* tei = child ? (struct exfat_inode*)child->private : NULL;
+    if (!dei || !tei || !name) return -1;
+    struct exfat_fs* fs = dei->fs;
+    struct owner_rec own = { child->owner_uid, child->owner_gid, child->mode };
+
+    if (tei->has_owner_rec) {
+        struct dir_iter it = {
+            .fs            = fs,
+            .first_cluster = dei->first_cluster,
+            .no_fat_chain  = dei->no_fat_chain,
+            .limit         = dir->size,
+        };
+        int total = 1 + tei->sec_count;
+        if (total > EXFAT_MAX_SET_ENTRIES) return -1;
+        uint8_t buf[EXFAT_MAX_SET_ENTRIES * EXFAT_ENTRY_SIZE];
+        for (int i = 0; i < total; i++)
+            if (dir_entry_read(&it, tei->dirent_index + i, buf + i * EXFAT_ENTRY_SIZE) != 0)
+                return -1;
+        if (buf[0] != EXFAT_TYPE_FILE) return -1;     /* the slot moved under us */
+        for (int k = 2; k < total; k++) {
+            struct owner_rec cur;
+            if (!owner_rec_parse(buf + k * EXFAT_ENTRY_SIZE, &cur)) continue;
+            owner_rec_build(buf + k * EXFAT_ENTRY_SIZE, &own);
+            wle16(buf + 2, set_checksum(buf, total * EXFAT_ENTRY_SIZE));
+            for (int i = 0; i < total; i++)
+                if (dir_entry_write(&it, tei->dirent_index + i, buf + i * EXFAT_ENTRY_SIZE) != 0)
+                    return -1;
+            bcache_sync(fs->dev);
+            return 0;
+        }
+        /* Flagged but not found: fall through and rewrite it whole. */
+    }
+    return relocate_set(dir, name, (int)strlen_(name), child);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1415,6 +1539,9 @@ static int exfat_unlink_locked(struct inode* dir, const char* name, struct inode
 static int exfat_rename_locked(struct inode* dir, const char* o, const char* n, struct inode* child) {
     return FS_LOCKED(fs_of_inode(dir), exfat_rename(dir, o, n, child));
 }
+static int exfat_setattr_locked(struct inode* dir, const char* n, struct inode* child) {
+    return FS_LOCKED(fs_of_inode(dir), exfat_setattr(dir, n, child));
+}
 
 static const struct file_ops exfat_file_ops = {
     .read    = exfat_read_locked,
@@ -1436,6 +1563,7 @@ static const struct inode_ops exfat_inode_ops_dir = {
     .mkdir  = exfat_mkdir_locked,
     .unlink = exfat_unlink_locked,
     .rename = exfat_rename_locked,
+    .setattr = exfat_setattr_locked,        /* §M32 — ownership on the volume */
 };
 
 /* ---------------------------------------------------------------------- */
@@ -1808,6 +1936,9 @@ static struct fs_type exfat_fs_type = {
     .umount = exfat_umount,             /* §M87 */
     .evict  = exfat_evict,
     .statfs = exfat_statfs,
+    /* §M32 (2026-09-27) — owner and mode live in each file's entry set, in a
+     * d-os Vendor Extension entry (see DOS_OWNER_GUID). */
+    .stores_ownership = 1,
 };
 
 static int exfat_module_init(void) {

@@ -13292,6 +13292,9 @@ which bypasses the check entirely.*
 
 #### What `mount` now says, and why it is harsher than the plan
 
+*(Superseded 2026-09-27 for exFAT — §4.109: ownership is now STORED in each
+file's own entry set.  What follows is the stage-5 reasoning, kept as history.)*
+
 **No filesystem on this machine stores ownership across a reboot.**
 ramfs/devfs/procfs are volatile; exFAT has no owner field, no mode field and
 nowhere to put them.  A side-car ownership map was the alternative and was
@@ -13623,7 +13626,7 @@ the real table so it exercises DETECTION rather than reporting.
   layer per signed-in account, answered by who asks.
 - **No setuid bit**, by decision: `login` and elevation are kernel-mediated, so
   there is no privilege-transfer mechanism sitting on every writable filesystem.
-- **On-disk ownership**, per the `mount` section above.
+- ~~**On-disk ownership**~~ — done 2026-09-27 for exFAT, §4.109.
 - **`su`** as a separate verb: `login` from an existing session does the same
   thing, and a second name for one mechanism is a second thing to gate.
 
@@ -14813,8 +14816,61 @@ allocator now (`cred_session_alloc`).
 person signing in to the DESKTOP replaces the first (fast user switching — two
 live desktops — is the per-session compositor, not done).
 
+### 4.109 Ownership on the disk: an exFAT Vendor Extension entry (§M32 closed, 2026-09-27)
+
+§4.91 declined a side-car ownership map — *a second source of truth that must be
+written in the same operation as the file or the two drift* — and left every
+permission on `/mnt` advisory.  The objection was right about a side-car and
+does not apply to what exFAT already offers: **a Vendor Extension directory
+entry** (spec 7.8, type 0xE0) is a *benign secondary* entry INSIDE a file's own
+entry set, covered by the same SetChecksum and written in the same directory
+update.  It carries a 16-byte vendor GUID and 14 vendor-defined bytes, and an
+implementation that does not know the GUID ignores it.
+
+**The record** (kernel/fs/exfat.c, `DOS_OWNER_GUID`): `"dO"`, version 1, uid,
+gid, mode — placed after the name entries (the spec's order: stream, names,
+others).
+- **Every set this driver writes carries one** (create, mkdir, rename), with the
+  defaults until the VFS says otherwise.
+- **Reading:** `scan_directory` finds it among the secondaries and `build_inode`
+  applies it over the defaults; a file with no record (written by another
+  system, or before this change) keeps root:root 0644/0755.
+- **Writing:** new optional dir-op `inode_ops.setattr(dir, name, child)`
+  (appended), called by `chmod`, `chown` and a user's create.  In place when
+  the set has the record; otherwise the whole set is rewritten one entry larger
+  through the rename path (`relocate_set`: new set first, old deleted second).
+  If the volume does not take it, the VFS puts the old values back and the
+  command says so (`-3`) — enforcing what the disk will forget is the thing
+  this closes.
+- `fs_type.stores_ownership = 1` for exFAT; `mount` says `STORED on the volume
+  (survives a reboot)`.  New `stat <path>`: owner, gid, mode, size, stored or not.
+
+**Verified (i386), across reboots and across ANOTHER operating system:**
+- Run 1: `chown alice` + `chmod 600` on a file, `chmod 700` on a directory.
+- The image was then mounted by the **Linux kernel's exFAT driver**: it read the
+  file, wrote its own file (no record) and renamed another.
+- Run 2 on that image: `stat` shows alice 0600 and 0700 intact, the Linux file
+  at the defaults; `chmod`/`chown` on the Linux file (the relocation path) hold.
+- Run 3, typed at the console: **bob is refused** (`permission denied for uid
+  1001 (wanted r, mode 0600, owner uid 1000)`) and cannot chmod it; **alice
+  reads it**.
+- **fsck:** exfatprogs 1.2.9 reports `clean` on both images.  The build image's
+  exfatprogs **1.1.3** does NOT — it reads every secondary after the stream as a
+  name (`failed to get name dentry`), which predates its benign-secondary
+  support; `scripts/fsck-exfat.sh <img>` builds and runs 1.2.9.
+
+**What it is not:** another system reading the volume does not enforce these
+bits (true of every filesystem's permissions), and **another system's rename or
+rewrite of a file may drop the record**, after which the file is back at the
+defaults — root-owned and world-readable.  A private file on a volume that
+travels is only as private as the least careful system that touches it.
+
+**Found on the way:** `cat` and `ls` printed `not found` for a file that exists
+and was refused — they say `permission denied` now.
+
 ## 8. Change log
 
+- **2026-09-27 — §M32 closed: owner and mode stored on exFAT in a Vendor Extension entry inside each file's entry set; `setattr` dir-op; `stat`; verified across reboots and a Linux mount; `cat`/`ls` say `permission denied` (DOCS §4.109).**
 - **2026-09-27 — §M32: simultaneous sessions — one config layer per signed-in account, resolved by the caller; the desktop takes the seat, a text login beside it runs in the background (`seattest`); one session-id allocator (DOCS §4.108).**
 - **2026-09-27 — §M26/§M59 closed: `wl_data_device` bridged to the d-os clipboard (UTF-8 ↔ Latin-2), `wlclip`; whole-message Wayland sends; `pipe`/`pipe2` as shared ABI ops (i386 had none); excursions return the exit status; program output no longer interleaves with kernel messages; UTF-8 on COM1 becomes Latin-2 (DOCS §4.107).**
 - **2026-09-27 — §M19.5 closed: per-NUMA-node PMM zones (SRAT on x86, `numa-node-id` on aarch64), node-major fallback, per-node counters in `/proc/meminfo` + `buddyinfo`, `numatest`; the scheduler no longer keeps a task on a CPU its affinity excludes (DOCS §4.106).**
