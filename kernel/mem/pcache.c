@@ -217,7 +217,7 @@ void pcache_stats(struct pcache_stats* out) {
 }
 
 CONFIG_KEY(ck_pagecache) = {
-    .key = "mem.pagecache", .group = "System", .type = CFG_BOOL, .def = "1",
+    .key = "mem.pagecache", .group = "Memory", .type = CFG_BOOL, .def = "1",
     .help = "share file pages between the programs that map them (one copy of libc.so)",
 };
 

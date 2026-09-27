@@ -774,6 +774,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/devicepanel.c \
     kernel/gui/apps/netpanel.c \
     kernel/gui/apps/diskpanel.c \
+    kernel/gui/apps/sysinfo.c \
     kernel/gui/apps/accountspanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
@@ -981,6 +982,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/devicepanel.c \
     kernel/gui/apps/netpanel.c \
     kernel/gui/apps/diskpanel.c \
+    kernel/gui/apps/sysinfo.c \
     kernel/gui/apps/accountspanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \
@@ -1121,6 +1123,7 @@ CORE_C_SRCS := \
     kernel/gui/apps/devicepanel.c \
     kernel/gui/apps/netpanel.c \
     kernel/gui/apps/diskpanel.c \
+    kernel/gui/apps/sysinfo.c \
     kernel/gui/apps/accountspanel.c \
     kernel/gui/shell_vista.c \
     kernel/gui/shell_bare.c \

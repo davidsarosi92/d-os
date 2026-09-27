@@ -161,6 +161,47 @@ void hal_set_tls_base(uintptr_t base) { (void)base; }
  * --------------------------------------------------------------------------- */
 const char* hal_arch_name(void) { return "aarch64"; }
 
+/* ---- the machine, described (hal_api.h) ----------------------------------
+ * MIDR_EL1: implementer [31:24], part number [15:4].  Only the parts this tree
+ * is actually run on are named; anything else is printed as its raw MIDR,
+ * because a wrong name is worse than a number somebody can look up. */
+void hal_cpu_model(char* out, int cap) {
+    if (!out || cap <= 0) return;
+    uint64_t midr;
+    __asm__ volatile ("mrs %0, midr_el1" : "=r"(midr));
+    uint32_t impl = (uint32_t)(midr >> 24) & 0xFF, part = (uint32_t)(midr >> 4) & 0xFFF;
+    const char* name = 0;
+    if (impl == 0x41) {                            /* Arm Ltd */
+        switch (part) {
+        case 0xD03: name = "Arm Cortex-A53"; break;
+        case 0xD07: name = "Arm Cortex-A57"; break;
+        case 0xD08: name = "Arm Cortex-A72"; break;
+        case 0xD0B: name = "Arm Cortex-A76"; break;
+        case 0xD0C: name = "Arm Neoverse-N1"; break;
+        case 0xD40: name = "Arm Neoverse-V1"; break;
+        case 0xD49: name = "Arm Neoverse-N2"; break;
+        }
+    } else if (impl == 0x00 && part == 0x051) {
+        name = "QEMU \"max\" CPU";
+    }
+    int n = 0;
+    if (name) {
+        for (; name[n] && n < cap - 1; n++) out[n] = name[n];
+        out[n] = 0;
+        return;
+    }
+    const char* p = "unknown (MIDR 0x";
+    for (; *p && n < cap - 1; p++) out[n++] = *p;
+    static const char hx[] = "0123456789abcdef";
+    for (int sh = 28; sh >= 0 && n < cap - 1; sh -= 4) out[n++] = hx[(midr >> sh) & 15];
+    if (n < cap - 1) out[n++] = ')';
+    out[n] = 0;
+}
+const char* hal_board_name(void) {
+    if (g_board.model) return g_board.model;
+    return g_board.src == BOARD_ACPI ? "an ACPI machine (no model string)" : NULL;
+}
+
 /* AArch64 EL0 only.  (AArch32 EL0 is an optional CPU feature and QEMU `virt`
  * with a modern -cpu does not provide it, so there is nothing to fall back to.) */
 int hal_elf_can_exec(unsigned cls, unsigned machine) {

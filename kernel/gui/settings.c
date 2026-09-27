@@ -39,6 +39,7 @@
 #include "dialog.h"
 #include "printf.h"
 #include "klog.h"
+#include "timer.h"        /* timer_ticks_ms — the live line's pace */
 #include <stddef.h>
 
 /* ------------------------------------------------------------------- */
@@ -101,9 +102,21 @@ int config_key_validate(const char* key, const char* value) {
             return in_list(d->values, value) ? 0 : -1;
         case CFG_INT: {
             const char* p = value;
-            if (*p == '-' || *p == '+') p++;
+            int neg = 0;
+            if (*p == '-' || *p == '+') neg = (*p++ == '-');
             if (!*p) return -1;
-            while (*p) { if (*p < '0' || *p > '9') return -1; p++; }
+            long v = 0;
+            while (*p) {
+                if (*p < '0' || *p > '9') return -1;
+                if (v < 100000000L) v = v * 10 + (*p - '0');
+                p++;
+            }
+            if (neg) v = -v;
+            /* THE DECLARED RANGE IS PART OF THE TYPE (2026-09-28).  Only the
+             * slider enforced it, by being unable to go further; a key edited
+             * as text (or with `conf set`) accepted any number, so
+             * mem.swap_size_mb = 5000 was taken for a 1..256 key. */
+            if (d->max > d->min && (v < d->min || v > d->max)) return -1;
             return 0;
         }
         default:
@@ -173,6 +186,10 @@ struct genpanel {
      * exist (see settings_open_test_pending). */
     const char* test_key;
     const char* test_value;
+    /* The panel's live line (settings_panel.live), if it has one. */
+    void      (*live)(char* buf, int cap);
+    char        live_text[192];
+    uint64_t    live_ms;
 };
 
 /* CLOSING WITH UNSAVED SETTINGS (2026-09-25, NEXT.md #1's leftover).
@@ -207,6 +224,7 @@ static void gp_ticket_put(struct gp_ticket* t) {
 #define GP_ID_GRID     9000
 #define GP_ID_STATUS   9001
 #define GP_ID_SAVE     9002
+#define GP_ID_LIVE     9003
 
 static void gp_status(struct genpanel* g, const char* text) {
     struct widget* w = ui_by_id(g->win, GP_ID_STATUS);
@@ -439,6 +457,12 @@ static void gp_layout(struct gui_window* win) {
 
     sp[k++] = (struct ui_spec){ .id = 1, .cls = "label", .text = g->group,
                                 .flags = UI_FILL_W };
+    if (g->live) {
+        g->live(g->live_text, sizeof g->live_text);
+        g->live_ms = timer_ticks_ms();
+        sp[k++] = (struct ui_spec){ .id = GP_ID_LIVE, .cls = "label",
+                                    .text = g->live_text, .flags = UI_FILL_W };
+    }
     /* A scrolling VIEWPORT holds the grid: a group with many keys no longer
      * needs a window tall enough for all of them, which is what the panel's
      * height used to be sized by hand for. */
@@ -516,7 +540,11 @@ static void gp_layout(struct gui_window* win) {
             ctrl.cls = nopt > 3 ? "combo" : "radio";
             ctrl.text = d->values;              /* already space-separated */
             ctrl.value = gp_enum_index(d, cur);
-        } else if (d->type == CFG_INT && d->max > d->min) {
+        } else if (d->type == CFG_INT && d->max > d->min && d->max - d->min <= 1000) {
+            /* A SLIDER ONLY WHERE A PIXEL IS A USEFUL STEP (2026-09-28).  A
+             * track is ~400 px; for "100 ms .. 1 hour" one pixel is nine
+             * seconds and nobody can land on 30000.  Such ranges get the text
+             * box, and config_key_validate enforces the declared range there. */
             ctrl.cls = "slider";
             ctrl.min = d->min; ctrl.max = d->max;
             ctrl.value = gp_atoi(cur);
@@ -609,18 +637,44 @@ static void gp_layout(struct gui_window* win) {
     }
 }
 
+/* The live line: re-read once a second, and damage ONLY that label when the
+ * text changed (§M69: a tick damages what it changed — a whole-window repaint
+ * per second is what made the Task Manager cost 40 ms a frame). */
+static void gp_tick(struct gui_window* win) {
+    struct genpanel* g = (struct genpanel*)gui_window_ctx(win);
+    if (!g || !g->live) return;
+    uint64_t now = timer_ticks_ms();
+    if (now - g->live_ms < 1000) return;
+    g->live_ms = now;
+    char t[sizeof g->live_text];
+    g->live(t, sizeof t);
+    int same = 1;
+    for (unsigned i = 0; i < sizeof t; i++) {
+        if (t[i] != g->live_text[i]) { same = 0; break; }
+        if (!t[i]) break;
+    }
+    if (same) return;
+    for (unsigned i = 0; i < sizeof t; i++) { g->live_text[i] = t[i]; if (!t[i]) break; }
+    struct widget* w = ui_by_id(win, GP_ID_LIVE);
+    const struct widget_class* c = w ? ui_class_find("label") : NULL;
+    if (!w || !c || !c->set_text) return;
+    c->set_text(w, g->live_text);
+    gui_window_request_redraw_rect(win, w->x, w->y, w->w, w->h);
+}
+
 /* Open the generic panel for `group`. */
-static void generic_panel_open(const char* group) {
+static void generic_panel_open(const char* group, void (*live)(char*, int)) {
     struct genpanel* g = (struct genpanel*)kcalloc(1, sizeof *g);
     if (!g) return;
     g->group = group;
+    g->live  = live;
     /* Taller than the old panel because the controls are real now: a radio
      * group is one row per option, not one line of text.  Height that a
      * SCROLLING container should own — see the open item in DOCS §4.78. */
     struct gui_window* win = gui_app_open(&(struct gui_app_spec){
             .title = group,
             .content_w = cp_px(560), .content_h = cp_px(360),  /* it scrolls */
-            .layout = gp_layout, .ctx = g,
+            .layout = gp_layout, .ctx = g, .tick = gp_tick,
             .on_close = gp_on_close,
         });
     if (!win) { kfree(g); return; }
@@ -665,7 +719,7 @@ void settings_panel_open(int i) {
     const struct settings_panel* p = settings_panel_at(i);
     if (!p) return;
     if (p->open) p->open();
-    else         generic_panel_open(p->name);
+    else         generic_panel_open(p->name, p->live);
 }
 
 /* =====================================================================
@@ -825,6 +879,7 @@ void settings_cmd(const char* args) {
             const struct config_key_def* d = config_key_find(key);
             kprintf("conf: '%s' is not a valid %s for %s", val, type_name(d->type), key);
             if (d->values) kprintf(" (%s)", d->values);
+            if (d->type == CFG_INT && d->max > d->min) kprintf(" (%d..%d)", d->min, d->max);
             kprintf("\n");
             return;
         }

@@ -5,8 +5,9 @@
 `ctr import busybox`, `ctr run busybox <cmd…>`, `ctr list`, `ctrescapetest`,
 `strace <pid|ctr|off>`.  A real `busybox:musl` OCI archive runs as uid 20001
 against its own root on all three arches; the escape test and
-`AUDIT(container-root)` pass.  **Next, in order:** the queued UI items below
-(swap page, translations, system summary), then §M81's verdict, then §M88
+`AUDIT(container-root)` pass.  **Then (2026-09-28) the queued UI items shipped (DOCS §4.116):** a Memory page,
+System information, translations 73 → 0 (`scripts/locale-sweep.py`), 32 windows,
+a taskbar that fits, rows that wrap.  **Next, in order:** §M81's verdict, then §M88
 (monitors) and §M89 (Java — scoped in PLAN.md: an address-space layer, Linux
 signal delivery and arm64 threads are the real work; the JDK comes with it).
 
@@ -25,7 +26,7 @@ Also open from §M87: a second virtio-blk disk, partition tables, a real Wi-Fi
 driver.  The phone emulator (§M84) is not in the agreed list yet.
 
 
-## Queued from use (2026-09-27) — asked for, not started
+## Queued from use (2026-09-27) — items 1-3 DONE 2026-09-28 (DOCS §4.116)
 
 1. **Swap in the Control Panel.** `mem.swap_policy` / `mem.swap_size_mb` (and
    `mem.pagecache`, `mem.age_ms`, `mem.cold_ms`, `mem.reserve_kb`) are declared

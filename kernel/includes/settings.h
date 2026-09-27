@@ -46,6 +46,13 @@ struct settings_panel {
     /* When `open` is NULL the panel is rendered by the GENERIC key panel over
      * every CONFIG_KEY whose group matches `name`.  That is the common case:
      * a settings page with no code. */
+    /* §M88-queue (2026-09-28) — OPTIONAL, APPENDED: one line of LIVE figures
+     * the generic panel shows under its title and refreshes once a second
+     * (the Memory page: free memory, swap in use, the page cache).  A setting
+     * is easier to choose next to the number it changes; a page that needs
+     * more than a line is a page with its own `open`.  The text may be a
+     * catalogue key or plain text, like every label. */
+    void      (*live)(char* buf, int cap);
 };
 
 extern struct settings_panel __start_settings_panels[];

@@ -769,11 +769,13 @@ static void accounts_panel_open(void) {
     gui_app_open(&sp);
 }
 
+/* Designated fields: a positional initializer silently re-binds when the
+ * struct grows (it did — `live` was appended; §M58's scar). */
 SETTINGS_PANEL(accounts) = {
-    "User accounts",
-    "who may use this machine, and what each of them may do",
-    ICON_APP,
-    accounts_panel_open
+    .name    = "User accounts",
+    .summary = "who may use this machine, and what each of them may do",
+    .icon    = ICON_USERS,          /* was ICON_APP, the generic window tile */
+    .open    = accounts_panel_open,
 };
 
 /* ===========================================================================

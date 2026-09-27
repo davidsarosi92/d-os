@@ -86,7 +86,8 @@ static void gui_cfg_release(void) {
 /* Metrics + palette (window chrome only — desktop chrome is the shell's).    */
 /* -------------------------------------------------------------------------- */
 
-#define GUI_MAX_WINDOWS 8
+/* GUI_MAX_WINDOWS lives in gui_priv.h ONLY — a second definition here agreed
+ * with it by coincidence until the day it did not (2026-09-28). */
 
 /* The Console Plate frame is ONE pixel.  M22 used two, which reads as a bevel
  * and is the single most old-fashioned thing about the old chrome. */

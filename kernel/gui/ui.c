@@ -89,6 +89,7 @@ struct ui_node {
     int min_w, pref_w, pref_h;          /* filled by measure                   */
     int x, y, cw, ch;                   /* filled by arrange                   */
     int hidden;                         /* dropped by a size-class rule        */
+    int wrapped;                        /* a row measured as flowing lines     */
 };
 
 struct ui_state {
@@ -391,7 +392,11 @@ static void measure_children(struct ui_state* st, int idx, int avail_w,
         if (st->n[i].parent != nd->id) continue;
         struct ui_node* c = &st->n[i];
         if (c->hidden) continue;
-        measure_node(st, i, share, size_class);
+        /* The share is for children that STRETCH (a weight): a chart asks for
+         * whatever it is offered.  A child with no weight is as wide as its
+         * content — offering it only a share made a button report the share,
+         * the row "fit", and the label was cut instead of the row wrapping. */
+        measure_node(st, i, (row && c->weight == 0) ? avail_w : share, size_class);
         nvis++;
         if (row) {
             main  += c->pref_w;
@@ -402,6 +407,37 @@ static void measure_children(struct ui_state* st, int idx, int avail_w,
         }
     }
     if (nvis > 1) main += UI_GAP * (nvis - 1);
+
+    /* A ROW THAT DOES NOT FIT WRAPS (2026-09-28).  Found by translating: the
+     * Task Manager's four buttons fit in English and not in Hungarian, and a
+     * row wider than its container simply ran on past the window's edge — the
+     * last button's label cut on both sides.  A translated caption is a
+     * different width (locale.h), so a row of them can never be sized for one
+     * language.  When the children's natural widths exceed what is offered,
+     * they FLOW onto further lines, and the row asks for the height that
+     * takes; arrange_children runs the same flow, so what is measured is what
+     * is placed.  A row that fits is untouched. */
+    if (row && main > avail_w && nvis > 1) {
+        int line_w = 0, line_h = 0, total_h = 0, lines = 0;
+        for (int i = 0; i < st->count; i++) {
+            if (st->n[i].parent != nd->id || st->n[i].hidden) continue;
+            struct ui_node* c = &st->n[i];
+            if (line_w > 0 && line_w + UI_GAP + c->pref_w > avail_w) {
+                total_h += line_h + (lines ? UI_GAP : 0);
+                lines++;
+                line_w = 0; line_h = 0;
+            }
+            line_w += (line_w ? UI_GAP : 0) + c->pref_w;
+            if (c->pref_h > line_h) line_h = c->pref_h;
+        }
+        total_h += line_h + (lines ? UI_GAP : 0);
+        nd->pref_w = avail_w;
+        nd->pref_h = total_h;
+        nd->min_w  = avail_w;
+        nd->wrapped = 1;
+        return;
+    }
+    nd->wrapped = 0;
 
     nd->pref_w = row ? main  : cross;
     nd->pref_h = row ? cross : main;
@@ -587,6 +623,23 @@ static void arrange_children(struct ui_state* st, int idx, int x, int y,
     int gaps  = UI_GAP * (nvis - 1);
     int space = (row ? w : h) - fixed - gaps;
     if (space < 0) space = 0;
+
+    /* The flow measure_children decided on (see there): same walk, placed. */
+    if (row && nd->wrapped && fixed + gaps > w) {
+        int cx = x, cy = y, line_h = 0;
+        for (int i = 0; i < st->count; i++) {
+            if (st->n[i].parent != nd->id || st->n[i].hidden) continue;
+            struct ui_node* c = &st->n[i];
+            if (cx > x && cx + c->pref_w > x + w) {
+                cx = x; cy += line_h + UI_GAP; line_h = 0;
+            }
+            int cwid = c->pref_w < w ? c->pref_w : w;
+            arrange_node(st, i, cx, cy, cwid, c->pref_h, size_class);
+            cx += cwid + UI_GAP;
+            if (c->pref_h > line_h) line_h = c->pref_h;
+        }
+        return;
+    }
 
     int cur = row ? x : y;
     /* §M69 — UI_ALIGN_END: start the run `space` further along, so the group
@@ -932,8 +985,8 @@ static const char* size_name(int sc) {
 static struct gui_window* ui_any_window(void) {
     struct gui_window* f = gui_wm_focused();
     if (f && gui_window_ui(f)) return f;
-    struct gui_window* list[16];
-    int n = gui_wm_windows(list, 16);
+    struct gui_window* list[32];
+    int n = gui_wm_windows(list, 32);
     for (int i = n - 1; i >= 0; i--)
         if (gui_window_ui(list[i])) return list[i];
     return NULL;

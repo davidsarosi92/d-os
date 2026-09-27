@@ -648,12 +648,12 @@ void swap_pressure_stats(uint32_t* out, uint32_t* passes, uint32_t* full) {
 }
 
 CONFIG_KEY(ck_swap_policy) = {
-    .key = "mem.swap_policy", .group = "System", .type = CFG_ENUM,
+    .key = "mem.swap_policy", .group = "Memory", .type = CFG_ENUM,
     .values = "off emergency normal", .def = "off",
     .help = "write idle program memory to disk: off, only when memory runs out, or routinely",
 };
 CONFIG_KEY(ck_swap_size) = {
-    .key = "mem.swap_size_mb", .group = "System", .type = CFG_INT, .min = 1, .max = 256,
+    .key = "mem.swap_size_mb", .group = "Memory", .type = CFG_INT, .min = 1, .max = 256,
     .def = "64",
     .help = "the swap area's size - and the most that may ever be swapped out",
 };
@@ -681,6 +681,8 @@ extern const unsigned char _binary_user_memhog_aarch64_elf_start[] __attribute__
 extern const unsigned char _binary_user_memhog_aarch64_elf_end[]   __attribute__((weak));
 #include "proc.h"
 #include "shellcmd.h"
+#include "locale.h"
+#include "icons.h"
 static void cmd_thrashtest(const char* args) {
     (void)args;
     const unsigned char *s = 0, *e = 0;
@@ -779,6 +781,54 @@ static void cmd_swap(const char* args) {
 SHELL_CMD(swap) = { "swap", "", "the swap area: policy, size, use, pages out and back",
                     SHELL_G_MEM, cmd_swap, SHELL_P_ANY };
 
+/* ---- the Memory page (Control Panel) --------------------------------------
+ *
+ * Asked for from use (2026-09-27): the swap settings in the Control Panel.
+ * The seven mem.* keys are declared where they are read (pmm.c, memage.c,
+ * this file, pcache.c) and name this group, so the page itself is the generic
+ * key panel — no per-key UI code — plus ONE live line: a swap size is easier
+ * to choose beside how much memory is free and how much swap is in use. */
+static void lv_put(char* b, int cap, int* n, const char* s) {
+    while (*s && *n < cap - 1) b[(*n)++] = *s++;
+    b[*n] = 0;
+}
+static void lv_num(char* b, int cap, int* n, uint32_t v) {
+    char t[12]; int k = 0;
+    do { t[k++] = (char)('0' + v % 10); v /= 10; } while (v && k < 11);
+    while (k && *n < cap - 1) b[(*n)++] = t[--k];
+    b[*n] = 0;
+}
+static void mem_live(char* b, int cap) {
+    int n = 0;
+    if (cap <= 0) return;
+    b[0] = 0;
+    refresh_cap();
+    uint32_t free_mb  = pmm_free_frames() / 256u;          /* 4 KiB frames */
+    uint32_t total_mb = pmm_nr_frames / 256u;
+    struct pcache_stats pc;
+    pcache_stats(&pc);
+    static const char* pol[] = { "off", "emergency", "normal" };
+    /* Composed from translated FRAGMENTS (locale.h: no formatting engine);
+     * re-composed on every refresh, so a language change shows within a
+     * second. */
+    lv_put(b, cap, &n, lstr("mem.live.free"));  lv_put(b, cap, &n, ": ");
+    lv_num(b, cap, &n, free_mb); lv_put(b, cap, &n, " / ");
+    lv_num(b, cap, &n, total_mb); lv_put(b, cap, &n, " MB    ");
+    lv_put(b, cap, &n, lstr("mem.live.swap")); lv_put(b, cap, &n, ": ");
+    lv_num(b, cap, &n, slots_used / 256u); lv_put(b, cap, &n, " / ");
+    lv_num(b, cap, &n, g_cap_slots / 256u); lv_put(b, cap, &n, " MB (");
+    lv_put(b, cap, &n, lstr(pol[swap_policy()])); lv_put(b, cap, &n, ")    ");
+    lv_put(b, cap, &n, lstr("mem.live.cache")); lv_put(b, cap, &n, ": ");
+    lv_num(b, cap, &n, pc.pages); lv_put(b, cap, &n, " ");
+    lv_put(b, cap, &n, lstr("mem.live.pages"));
+}
+SETTINGS_PANEL(sp_memory) = {
+    .name    = "Memory",
+    .summary = "swap, page cache, the reserve",
+    .icon    = ICON_MEMORY,
+    .live    = mem_live,
+};
+
 SHELL_CMD(thrashtest) = { "thrashtest", "", 0, SHELL_G_TEST, cmd_thrashtest, SHELL_P_ADMIN };
 
 /* ---- the invariant -------------------------------------------------------- */
@@ -870,7 +920,7 @@ int swap_audit_selftest(void) {
 }
 
 CONFIG_KEY(ck_suspend_store) = {
-    .key = "mem.suspend_store", .group = "System", .type = CFG_STRING, .def = "",
+    .key = "mem.suspend_store", .group = "Memory", .type = CFG_STRING, .def = "",
     .help = "where a paused program's memory is written when it is evicted "
             "(empty = a 'swapfile' on the persistent volume)",
 };

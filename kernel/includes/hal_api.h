@@ -370,6 +370,14 @@ uint64_t hal_fpu_test_read(void);
  * ------------------------------------------------------------------------- */
 const char* hal_arch_name(void);
 
+/* 2026-09-28 — the machine, described (the system summary page).
+ * hal_cpu_model: the processor's own name — CPUID's brand string on x86,
+ * MIDR_EL1 decoded on ARM ("unknown (MIDR ...)" rather than a guess).
+ * hal_board_name: the board — the device tree's /model, or the ACPI tables'
+ * OEM on a PC; NULL when the machine does not say. */
+void        hal_cpu_model(char* out, int cap);
+const char* hal_board_name(void);
+
 /* Can this kernel EXECUTE an ELF with this word size and machine type?
  * `cls` is EI_CLASS (1 = 32-bit, 2 = 64-bit), `machine` is e_machine
  * (3 = EM_386, 62 = EM_X86_64, 183 = EM_AARCH64).

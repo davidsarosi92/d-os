@@ -40,6 +40,7 @@
 #include "hal_api.h"
 #include "timer.h"
 #include "printf.h"
+#include "acpi.h"
 #include <stdint.h>
 
 static uint64_t g_tsc_hz;          /* 0 = unusable, keep the millisecond tick */
@@ -131,3 +132,35 @@ int hal_hires_init(void) {
 
 uint64_t hal_hires_ticks(void) { return rdtsc(); }
 uint64_t hal_hires_hz(void)    { return g_tsc_hz; }
+
+/* ---- the machine, described (hal_api.h) ----------------------------------
+ * Here because this file already owns the one cpuid helper both x86 arches
+ * share.  The brand string is 48 bytes in leaves 0x80000002..4, left-padded
+ * with spaces on some parts; older CPUs lack the leaves and say so. */
+void hal_cpu_model(char* out, int cap) {
+    if (!out || cap <= 0) return;
+    out[0] = 0;
+    uint32_t a, b, c, d;
+    cpuid(0x80000000u, &a, &b, &c, &d);
+    if (a < 0x80000004u) {
+        const char* s = "x86 (no brand string)";
+        int i = 0; for (; s[i] && i < cap - 1; i++) out[i] = s[i]; out[i] = 0;
+        return;
+    }
+    char brand[49];
+    uint32_t* w = (uint32_t*)brand;
+    for (uint32_t leaf = 0; leaf < 3; leaf++) {
+        cpuid(0x80000002u + leaf, &a, &b, &c, &d);
+        w[leaf * 4 + 0] = a; w[leaf * 4 + 1] = b; w[leaf * 4 + 2] = c; w[leaf * 4 + 3] = d;
+    }
+    brand[48] = 0;
+    int r = 0, n = 0;
+    while (brand[r] == ' ') r++;
+    for (; brand[r] && n < cap - 1; r++) {
+        if (brand[r] == ' ' && n && out[n - 1] == ' ') continue;   /* squeeze */
+        out[n++] = brand[r];
+    }
+    while (n && out[n - 1] == ' ') n--;
+    out[n] = 0;
+}
+const char* hal_board_name(void) { return acpi_oem_name(); }

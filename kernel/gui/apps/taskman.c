@@ -270,12 +270,14 @@ static int tm_m_columns(void* ctx) { (void)ctx; return TM_NCOLS; }
 static const char* tm_m_col_title(void* ctx, int col) {
     (void)ctx;
     switch (col) {
-    case TM_COL_PID:    return "PID";
-    case TM_COL_STATE:  return "STATE";
-    case TM_COL_MEM:    return "MEM";
+    /* Catalogue keys (2026-09-28, found by `locale missing`): these were
+     * English literals, so the Hungarian table had an English header. */
+    case TM_COL_PID:    return "PID";           /* the same word everywhere */
+    case TM_COL_STATE:  return "tm.col.state";
+    case TM_COL_MEM:    return "tm.col.mem";
     case TM_COL_CPUPCT: return "CPU%";
-    case TM_COL_CPU:    return "TIME";
-    default:            return "NAME";
+    case TM_COL_CPU:    return "tm.col.time";
+    default:            return "col.name";
     }
 }
 
@@ -467,11 +469,14 @@ static void tm_refresh(struct gui_window* win) {
         char sum[80];
         int p = 0;
         p = put_u32_pad(sum, p, (int)sizeof sum, (uint32_t)tm->ndisp, 0);
-        p = put_str(sum, p, (int)sizeof sum, " tasks");
+        /* Composed from translated FRAGMENTS, numbers in code (locale.h). */
+        p = put_str(sum, p, (int)sizeof sum, " ");
+        p = put_str(sum, p, (int)sizeof sum, lstr("tm.tasks"));
         if (selpid >= 0) {
             p = put_str(sum, p, (int)sizeof sum, "  -  pid ");
             p = put_u32_pad(sum, p, (int)sizeof sum, (uint32_t)selpid, 0);
-            p = put_str(sum, p, (int)sizeof sum, " selected");
+            p = put_str(sum, p, (int)sizeof sum, " ");
+            p = put_str(sum, p, (int)sizeof sum, lstr("tm.selected"));
         }
         sum[p] = 0;
         /* §M75 — THE TOTAL, asked for precisely: under the table and NOT part
@@ -488,7 +493,8 @@ static void tm_refresh(struct gui_window* win) {
          * load is a table missing a process. */
         char tot[64];
         int q = 0;
-        q = put_str(tot, q, (int)sizeof tot, "TOTAL ");
+        q = put_str(tot, q, (int)sizeof tot, lstr("tm.total"));
+        q = put_str(tot, q, (int)sizeof tot, " ");
         q = put_u32_pad(tot, q, (int)sizeof tot, (uint32_t)tm->total_mem_kb, 0);
         q = put_str(tot, q, (int)sizeof tot, " KB  -  cpu ");
         {

@@ -137,7 +137,9 @@
 #define COL_SM_HEAD (cp_current_theme()->tray)
 #define COL_ACCENT  (cp_current_theme()->accent)
 
-#define TB_MAX_BTNS 8
+/* As many as the WM can hold (GUI_MAX_WINDOWS); how many are DRAWN is
+ * tb_visible's decision — see there. */
+#define TB_MAX_BTNS 32
 
 static int scr_w = 0, scr_h = 0;
 
@@ -1023,24 +1025,57 @@ static void start_box(int* x, int* y, int* w, int* h) {
     *h = TASKBAR_H - cp_px(8);
 }
 
-static int tbtn_width(int nslots) {
-    int avail = scr_w - (START_W + 12) - CLOCK_W - 8;
-    if (nslots <= 0) return TBTN_W;
-    int w = avail / nslots - 6;
-    if (w > TBTN_W) w = TBTN_W;
-    if (w < 48)     w = 48;
+/* THE WINDOW-BUTTON STRIP (reworked 2026-09-28, when the window pool grew
+ * from 8 to 32).  Three defects, one geometry:
+ *   - the strip ended at the CLOCK, while the keyboard / network / volume
+ *     indicators sit left of the clock — a full strip ran under them;
+ *   - the width was computed with a 6 px gap and the buttons PLACED with
+ *     cp_px(6), so at any density above 100 % the row outgrew its own
+ *     arithmetic;
+ *   - the minimum was a literal 48 (an 8x8-era count) and nothing stopped a
+ *     row of minimum-width buttons from running off the strip.
+ * Now the strip is [after Start, before the first tray indicator), one gap
+ * value serves both the width and the placement, and when the windows do not
+ * fit at a readable width the LAST slot becomes "+N" (tb_visible), which
+ * cycles through the ones that have no button of their own. */
+#define TBTN_GAP   cp_px(6)
+#define TBTN_MIN   cp_px(96)
+static void kbd_box(int* x, int* y, int* w, int* h);
+static int tb_strip(int* x0) {
+    int kx, ky, kw, kh;
+    kbd_box(&kx, &ky, &kw, &kh);
+    *x0 = START_W + cp_px(12);
+    int avail = kx - TRAY_GAP - *x0;
+    return avail > 0 ? avail : 0;
+}
+/* How many buttons are drawn for `n` windows (the last may be "+N"). */
+static int tb_visible(int n) {
+    int x0, avail = tb_strip(&x0);
+    int fit = (avail + TBTN_GAP) / (TBTN_MIN + TBTN_GAP);
+    if (fit < 1) fit = 1;
+    return n <= fit ? n : fit;
+}
+static int tbtn_width(int nvis) {
+    int x0, avail = tb_strip(&x0);
+    if (nvis <= 0) return cp_px(TBTN_W);
+    int w = (avail + TBTN_GAP) / nvis - TBTN_GAP;
+    if (w > cp_px(TBTN_W)) w = cp_px(TBTN_W);
+    if (w < 1) w = 1;
     return w;
 }
 
-/* ONE window button's rect.  `n` is the caller's own count, so the two ends
+/* ONE window button's rect.  `nvis` is the caller's own count, so the two ends
  * cannot silently be sizing against different window lists. */
-static void tbtn_rect(int i, int n, int* x, int* y, int* w, int* h) {
-    int bw = tbtn_width(n);
+static void tbtn_rect(int i, int nvis, int* x, int* y, int* w, int* h) {
+    int x0;
+    tb_strip(&x0);
+    int bw = tbtn_width(nvis);
     *w = bw;
-    *x = START_W + cp_px(12) + i * (bw + cp_px(6));
+    *x = x0 + i * (bw + TBTN_GAP);
     *y = scr_h - TASKBAR_H + cp_px(5);
     *h = TASKBAR_H - cp_px(10);
 }
+static int tb_overflow_rot;              /* which hidden window "+N" raises next */
 
 /* WHAT THE HEADER SAYS.  `gui_session_user()` when somebody signed in at the
  * lock screen; otherwise the desktop is running as the system and says so —
@@ -1149,28 +1184,50 @@ static void vista_draw(struct gfx_surface* back) {
 
     /* One button per open window. */
     struct gui_window* slots[TB_MAX_BTNS];
-    int n  = gui_wm_windows(slots, TB_MAX_BTNS);
-    int bw = tbtn_width(n);
+    int n    = gui_wm_windows(slots, TB_MAX_BTNS);
+    int nvis = tb_visible(n);
+    int bw   = tbtn_width(nvis);
     struct gui_window* focused = gui_wm_focused();
-    for (int i = 0; i < n; i++) {
-        int f = (slots[i] == focused);
-        int m = gui_window_minimized(slots[i]);
+    for (int i = 0; i < nvis; i++) {
+        int over = (nvis < n && i == nvis - 1);   /* the "+N" slot */
+        int f = !over && (slots[i] == focused);
+        int m = !over && gui_window_minimized(slots[i]);
         int x, by, bh;
-        tbtn_rect(i, n, &x, &by, &bw, &bh);
+        tbtn_rect(i, nvis, &x, &by, &bw, &bh);
         cp_plate(back, x, by, bw, bh,
                  f ? COL_TBTN_F_TOP : (m ? cp_current_theme()->tray
                                          : COL_TBTN_TOP),
                  COL_TBTN_EDGE);
 
-        char t[20];
-        const char* title = gui_window_title(slots[i]);
-        int maxch = (bw - 12) / cp_fw();
-        if (maxch > (int)sizeof(t) - 1) maxch = (int)sizeof(t) - 1;
-        int k = 0;
-        for (; title[k] && k < maxch; k++) t[k] = title[k];
-        t[k] = 0;
-        cp_text(back, x + 6, ty + (TASKBAR_H - cp_fh()) / 2, t, COL_TEXT);
-        x += bw + 6;
+        /* The title FITTED BY MEASURING, and a cut MARKED with '~' — the
+         * toolkit's rule for every other truncation.  This used to take
+         * `(bw - 12) / cp_fw()` characters: a digit's advance times a count,
+         * so proportional titles were cut mid-word and unmarked ("Régió és
+         * bev"), which reads as a misspelling rather than as a cut. */
+        char t[64];
+        if (over) {
+            int k = 0, hidden = n - nvis + 1;
+            t[k++] = '+';
+            char d[8]; int dn = 0;
+            do { d[dn++] = (char)('0' + hidden % 10); hidden /= 10; } while (hidden);
+            while (dn) t[k++] = d[--dn];
+            t[k] = 0;
+        } else {
+            const char* title = gui_window_title(slots[i]);
+            int room = bw - 2 * cp_px(6);
+            int k = 0;
+            for (; title[k] && k < (int)sizeof t - 2; k++) t[k] = title[k];
+            t[k] = 0;
+            if (cp_text_w(t) > room) {
+                while (k > 0) {
+                    t[--k] = 0;
+                    t[k] = '~'; t[k + 1] = 0;
+                    if (cp_text_w(t) <= room) break;
+                    t[k] = 0;
+                }
+            }
+        }
+        cp_text(back, x + cp_px(6), ty + (TASKBAR_H - cp_fh()) / 2, t, COL_TEXT);
     }
 
     /* Clock. */
@@ -1596,11 +1653,18 @@ static int vista_click(int x, int y) {
 
     /* Window buttons — the same strip the painter laid out. */
     struct gui_window* slots[TB_MAX_BTNS];
-    int n = gui_wm_windows_locked(slots, TB_MAX_BTNS);
-    for (int i = 0; i < n; i++) {
+    int n    = gui_wm_windows_locked(slots, TB_MAX_BTNS);
+    int nvis = tb_visible(n);
+    for (int i = 0; i < nvis; i++) {
         int bx, by, bw, bh;
-        tbtn_rect(i, n, &bx, &by, &bw, &bh);
+        tbtn_rect(i, nvis, &bx, &by, &bw, &bh);
         if (x >= bx && x < bx + bw && y >= by && y < by + bh) {
+            if (nvis < n && i == nvis - 1) {
+                /* "+N": raise the hidden windows one after another. */
+                int hidden = n - nvis + 1;
+                gui_wm_taskbar_activate_locked(slots[nvis - 1 + (tb_overflow_rot++ % hidden)]);
+                return 1;
+            }
             gui_wm_taskbar_activate_locked(slots[i]);   /* M22.3 */
             return 1;
         }

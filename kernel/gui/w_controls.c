@@ -375,28 +375,65 @@ struct w_slider {
 #define SL_TRACK   cp_px(4)
 #define SL_KNOB_W  cp_px(10)
 
+/* THE VALUE IS SHOWN (2026-09-28).  Found by picture on the Memory page: a
+ * slider for a swap size in megabytes said nothing about which size it was on,
+ * so the only way to choose 128 was to drag and then Save and then look it up
+ * with `conf list`.  A control that sets a number must show the number.  The
+ * readout sits right of the track, in the MONO face so its width does not
+ * change as the digits do (a proportional readout would move the track's end
+ * while it is being dragged), and it is sized for the widest value the range
+ * allows.  ONE geometry helper serves drawing and hit-testing, so the knob
+ * drawn and the value picked cannot disagree. */
+static int sl_digits(int v) {
+    int n = v < 0 ? 2 : 1;
+    unsigned u = v < 0 ? (unsigned)(-v) : (unsigned)v;
+    while (u >= 10) { u /= 10; n++; }
+    return n;
+}
+static int sl_track_w(const struct w_slider* sl) {
+    int dmax = sl_digits(sl->max), dmin = sl_digits(sl->min);
+    int ro = (dmax > dmin ? dmax : dmin) * cp_cell_w() + cp_px(8);
+    int tw = sl->base.w - ro;
+    return tw < SL_KNOB_W * 3 ? sl->base.w : tw;   /* too narrow: no readout */
+}
+static void sl_itoa(int v, char* out) {
+    char t[12]; int k = 0, n = 0;
+    unsigned u = v < 0 ? (unsigned)(-v) : (unsigned)v;
+    do { t[k++] = (char)('0' + u % 10); u /= 10; } while (u && k < 11);
+    if (v < 0) out[n++] = '-';
+    while (k) out[n++] = t[--k];
+    out[n] = 0;
+}
+
 static void sl_draw(struct widget* w, struct gfx_surface* s) {
     struct w_slider* sl = (struct w_slider*)w;
     /* Everything derived from the widget's OWN height, so the knob fills the
      * target the user is aiming at instead of a fraction of it. */
     int kw = SL_KNOB_W, tr = SL_TRACK;
+    int tw = sl_track_w(sl);
     int track_y = w->y + (w->h - tr) / 2;
     int span = sl->max - sl->min;
     if (span <= 0) span = 1;
-    int pos = (sl->value - sl->min) * (w->w - kw) / span;
+    int pos = (sl->value - sl->min) * (tw - kw) / span;
     if (pos < 0) pos = 0;
-    if (pos > w->w - kw) pos = w->w - kw;
+    if (pos > tw - kw) pos = tw - kw;
 
-    gfx_fill(s, w->x, track_y, w->w, tr, CCOL_BOX_BG);
-    box_outline(s, w->x, track_y, w->w, tr, CCOL_BOX_EDGE);
+    gfx_fill(s, w->x, track_y, tw, tr, CCOL_BOX_BG);
+    box_outline(s, w->x, track_y, tw, tr, CCOL_BOX_EDGE);
     gfx_fill(s, w->x, track_y, pos + kw / 2, tr, CCOL_FILL);
     cp_fill_round(s, w->x + pos, w->y + cp_px(2), kw, w->h - 2 * cp_px(2),
                   cp_px(3),
                   gui_window_focused_widget(w->win) == w ? CCOL_FOCUS : CCOL_DIM);
+    if (tw < w->w) {
+        char num[14];
+        sl_itoa(sl->value, num);
+        int nw = sl_digits(sl->value) * cp_cell_w();
+        cp_mono_text(s, w->x + w->w - nw, w->y + (w->h - cp_cell_h()) / 2, num, CCOL_TEXT);
+    }
 }
 
 static void sl_set_from_x(struct w_slider* sl, int lx) {
-    int wpx = sl->base.w - SL_KNOB_W;
+    int wpx = sl_track_w(sl) - SL_KNOB_W;
     if (wpx < 1) wpx = 1;
     int span = sl->max - sl->min;
     int v = sl->min + (lx - SL_KNOB_W / 2) * span / wpx;

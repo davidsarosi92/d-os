@@ -85,6 +85,10 @@ int acpi_irq_override(int isa_irq, uint32_t* out_gsi, uint16_t* out_flags);
  * SRAT was found. */
 int acpi_numa_nodes(void);
 
+/* 2026-09-28 — "OEMID TABLEID" from the RSDT, trimmed; NULL before acpi_init
+ * or with no ACPI.  What a PC says about who built its firmware tables. */
+const char* acpi_oem_name(void);
+
 /* NUMA node ID for the i-th MADT CPU (same indexing as
  * acpi_cpu_apic_id).  Returns 0 if SRAT didn't claim this CPU. */
 int acpi_cpu_node(int madt_slot);

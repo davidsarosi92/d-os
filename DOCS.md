@@ -15387,8 +15387,73 @@ container yet (§M72's reserve and §M49's weights are the pieces); no registry
 pull (the image arrives as a file); Linux signal handlers are accepted and not
 delivered; `nlink` reports 1 for files (ramfs keeps the count private).
 
+### 4.116 A Memory page, System information, and translations measured again (2026-09-28)
+
+The three items queued from use on 2026-09-27 (NEXT.md "Queued from use").
+
+**Memory page.**  The seven `mem.*` keys (reserve, age sweep, cold threshold,
+swap policy, swap size, swap file, page cache) are declared where they are read
+and now name the group "Memory", so the page is the generic key panel plus ONE
+new capability: `settings_panel.live` (appended, optional) — a line of live
+figures under the title, refreshed once a second, damaging only its own label
+when the text changed.  The Memory page's line: free / total memory, swap in use
+/ ceiling and policy, page-cache pages, composed from translated fragments.  A
+new line-art icon (`ICON_MEMORY`) was added to the design set
+(`design/icons/project/…html`) and regenerated with `scripts/svgset2icons.py`.
+
+**The picture found three defects in the generic panel:**
+- a SLIDER did not show its value — the swap size could be chosen only by
+  dragging, saving and asking `conf list`.  It prints its value right of the
+  track now, in the mono face (a proportional readout would move the track's end
+  while dragging), with ONE geometry helper for drawing and hit-testing;
+- a slider was offered for ranges where a pixel is useless ("100 ms .. 1 hour"
+  is ~9 s a pixel): only ranges of at most 1000 get a slider, the rest a text box;
+- the declared `min`/`max` of an integer key were enforced only by the slider's
+  travel — `conf set mem.swap_size_mb 5000` was accepted for a 1..256 key.
+  `config_key_validate` checks the range, and `conf set` names it.
+
+**System information** (Control Panel; `sysinfo` on a console walks the SAME
+model): version, architecture, board, processor, logical CPUs, NUMA nodes,
+memory, swap, every disk (size, filesystem, mount, free), every network adapter
+(MAC, address), display mode and mode count, sound device, uptime.  A table
+model, refreshed once a second through `w_itemview_refresh` (only changed rows
+repaint).  New HAL entry points: `hal_cpu_model` (CPUID brand string on x86,
+MIDR decoded on ARM — an unrecognised core is shown by its MIDR, never guessed)
+and `hal_board_name` (the device tree's `/model`, or the RSDT OEM id on a PC —
+`acpi_oem_name`).
+
+**Translations, measured two ways.**  `scripts/locale-sweep.py` reads the source
+for every place a string becomes visible (CONFIG_KEY names, help and values,
+panel names and summaries, app names, spec titles/texts, lstr and widget
+calls) and diffs against both catalogues — it sees what the runtime recorder
+cannot (a setting scrolled out of view, a dialog nobody opened).  `locale
+missing on` then sees what the source sweep cannot (strings built in code: the
+Task Manager's column titles, its footer, the File Manager's count, the system
+monitor's series names).  **73 missing → 0 in both languages**, exceptions
+listed in the script with their reasons.  Fixed along the way: About still said
+"M22.2" and "i386 / x86_64" and placed its labels at 8x8-era pixel rows that
+overlapped (rewritten on the toolkit, the version from version.h); the Hello
+template did the same and spliced a count into English by byte offset; the File
+Manager's count had TWO digits ("50 entries" for 150).
+
+**Found by opening every panel at once:**
+- **the window pool held EIGHT windows** — a ninth failed with nothing but a
+  serial line.  32 now; a second `#define GUI_MAX_WINDOWS 8` in gui.c had agreed
+  with the header by coincidence (deleted);
+- the taskbar strip ended at the CLOCK, so a full strip ran under the keyboard,
+  network and volume indicators; its width used a 6 px gap and its placement
+  `cp_px(6)`; titles were cut by `count × digit width`, mid-glyph and unmarked.
+  Now the strip ends before the first indicator, one gap serves both, titles are
+  fitted by measurement and marked `~`, and windows that do not fit collapse
+  into a "+N" button that cycles through them;
+- **a row that does not fit wraps** (toolkit): the Task Manager's four buttons
+  fit in English and ran off the window in Hungarian.  Measure and arrange run
+  the same flow; a child with no weight is measured at its natural width (the
+  per-child SHARE is for stretching children such as charts).
+
 ## 8. Change log
 
+- **2026-09-28 — Control Panel: a Memory page (swap and the rest of `mem.*`, with a live line — `settings_panel.live`) and System information (`sysinfo`, `hal_cpu_model`, `hal_board_name`); translations measured by `scripts/locale-sweep.py` + `locale missing` and closed (73 → 0).  Fixed: sliders showed no value and were offered for unusable ranges, integer ranges were not validated, About/Hello out of date and overlapping, the File Manager count had two digits, only 8 windows could exist, the taskbar ran under its indicators and cut titles unmarked (now "+N"), and a row that did not fit ran off its window (it wraps) (DOCS §4.116).**
 - **2026-09-28 — §M73 COMPLETE: containers — a real OCI image (`busybox:musl`) unpacked in ring 3 (`ociunpack`, sha256/gzip/tar/links/whiteouts), run as its own uid against its own root (`cred.root`), a working directory (`cred.cwd`, lexical `..` clamped at the root), `ctr import|run|list`, `ctrescapetest`, `AUDIT(container-root)`; the Linux file/time/identity calls as shared §M50 operations with per-guest stat layouts as data (arm64 could not open a file); `strace`.  Fixed: stat inode = size+1, x86_64 getuid always 0, rt_sigaction running fcntl, the console not duplicable, redirected stdin polled from the keyboard, absolute realtime sleeps, `task_wait` leaking reap-owned children, and `task_exit_code` marking ANOTHER task dead after a migration (DOCS §4.115).**
 - **2026-09-27 — §M74 COMPLETE, rungs 3-4: swap-in by fault; eviction of RUNNING programs by pressure (atomic mark, one flush, then write), `mem.swap_policy` + `mem.swap_size_mb` as the ceiling, `swap`, `AUDIT(swap-slots)`; the three reserve rules shown.  Fixed: a wake-up never preempted (aarch64 `diskstorm` 4.7-7 s -> 457 ms), block-cache read-ahead, per-page shootdowns starving CPU 0 (DOCS §4.114).**
 - **2026-09-27 — §M74 rung 2: a page cache; private file mappings and the interpreter (musl's libc.so) are shared copy-on-write — the second dynamic program costs 580-620 KB less; reclaim of unmapped cache pages under pressure with no disk; `unmap` releases what it held and `munmap` is real.  Fixed: x86_64 `map` dropped `VMM_COW`, aarch64 `map` made every user page writable (DOCS §4.113).**

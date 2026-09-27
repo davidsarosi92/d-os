@@ -553,6 +553,8 @@ static void parse_srat(const struct srat* s) {
 /* Discover ACPI tables and extract everything we need for shutdown.
  * Returns 0 on success, -1 on any failure; on failure the cached state is
  * left in its init-to-zero form so `acpi_shutdown` safely no-ops. */
+static char g_oem[16];              /* RSDT OEM id + table id, trimmed */
+
 int acpi_init(void) {
     const struct rsdp* rsdp = find_rsdp();
     if (!rsdp) {
@@ -564,6 +566,27 @@ int acpi_init(void) {
     if (!rsdt || !sig4(rsdt->signature, "RSDT") || !checksum_ok(rsdt, rsdt->length)) {
         kprintf("ACPI: bad RSDT at %p\n", (void*)rsdt);
         return -1;
+    }
+
+    /* 2026-09-28 — who made the tables: the RSDT's OEM id and table id
+     * ("BOCHS  BXPC    " under QEMU).  The system summary page's "board"
+     * line; spaces trimmed, because the fields are space-padded by spec. */
+    {
+        int n = 0;
+        for (int i = 0; i < 6; i++) g_oem[n++] = rsdt->oem_id[i];
+        g_oem[n++] = ' ';
+        for (int i = 0; i < 8; i++) g_oem[n++] = rsdt->oem_table_id[i];
+        g_oem[n] = 0;
+        /* squeeze runs of spaces and trim */
+        int w = 0;
+        for (int r = 0; r < n; r++) {
+            char ch = g_oem[r];
+            if (ch < 32 || ch > 126) ch = ' ';
+            if (ch == ' ' && (w == 0 || g_oem[w - 1] == ' ')) continue;
+            g_oem[w++] = ch;
+        }
+        while (w && g_oem[w - 1] == ' ') w--;
+        g_oem[w] = 0;
     }
 
     /* RSDT payload is an array of 32-bit physical pointers, one per table.
@@ -717,6 +740,7 @@ int acpi_irq_override(int isa_irq, uint32_t* out_gsi, uint16_t* out_flags) {
 /* ------------------------------------------------------------------------- */
 
 int acpi_numa_nodes(void) { return g_numa_nodes; }
+const char* acpi_oem_name(void) { return g_oem[0] ? g_oem : NULL; }
 
 int acpi_cpu_node(int slot) {
     if (slot < 0 || slot >= ACPI_MAX_CPUS) return 0;

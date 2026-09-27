@@ -69,6 +69,9 @@ LABEL_TO_ID = {
     "Ecset":              "ICON_BRUSH",
     "Csomag":             "ICON_PACKAGE",
     "Kód":                "ICON_CODE",
+    # 2026-09-28 — the Memory page (swap, page cache, the reserve).  Drawn in
+    # the set's own language: a module with three chips and its pins.
+    "Memória":            "ICON_MEMORY",
 }
 
 S = 16384          # the fixed-point box vpath.c expects

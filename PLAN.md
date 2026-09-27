@@ -229,7 +229,7 @@ fixed first, whatever it touches.
 | §M72 | ✅ complete (§4.111) | — (eviction faults pages back: §M74) |
 | §M74 | ✅ complete (§4.112-§4.114) | — (multi-threaded victims, swap compression) |
 | §M73 | ✅ complete — rungs 1-3 (§4.115) | — (resource caps per container, network namespace, registry pull) |
-| queued UI | — | Memory/swap page in the Control Panel; translations re-measured; a system summary page (NEXT.md "Queued from use") |
+| queued UI | ✅ done (§4.116) — Memory page, System information, translations 73 → 0 | — |
 | §M88 | — | multiple monitors — asked for 2026-09-27, not designed yet |
 | §M89 | — | Java: a JRE (and the JDK with it) — asked for 2026-09-28, scoped below; in the queue after §M81 and §M88 |
 | §M68 | — | investigation, not started |

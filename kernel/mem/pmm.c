@@ -1345,7 +1345,7 @@ void pmm_print_stats(void) {
 
 /* §M72 — the reserve is a machine setting (a user store may not lower it). */
 CONFIG_KEY(ck_mem_reserve) = {
-    .key = "mem.reserve_kb", .group = "System", .type = CFG_INT, .def = "4096",
+    .key = "mem.reserve_kb", .group = "Memory", .type = CFG_INT, .def = "4096",
     .help = "memory kept back for the system: programs' new memory is refused "
             "below this much free (KiB)",
 };

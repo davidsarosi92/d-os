@@ -236,10 +236,19 @@ static void fm_refresh(struct fileman* fm) {
         if (best != i) swap_entries(fm, i, best);
     }
 
-    char st[32] = "   entries";
-    st[0] = (char)('0' + (total / 10) % 10);
-    st[1] = (char)('0' + total % 10);
-    if (total < 10) st[0] = ' ';
+    /* The count, then a translated word.  This used to write TWO digits into
+     * a fixed "   entries", so a directory of 150 said "50 entries". */
+    char st[48];
+    {
+        char d[12]; int k = 0, n = 0;
+        unsigned v = (unsigned)(total < 0 ? 0 : total);
+        do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v && k < 11);
+        while (k) st[n++] = d[--k];
+        st[n++] = ' ';
+        const char* w = lstr("fm.entries");
+        while (*w && n < (int)sizeof st - 1) st[n++] = *w++;
+        st[n] = 0;
+    }
     w_label_set(fm->status, st);
 }
 

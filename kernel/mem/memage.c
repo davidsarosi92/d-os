@@ -260,12 +260,12 @@ static void memage_main(void) {
 SERVICE("memage", memage_main, /*autostart*/1, SVC_RESTART_ALWAYS);
 
 CONFIG_KEY(ck_age_ms) = {
-    .key = "mem.age_ms", .group = "System", .type = CFG_INT, .min = 0, .max = 60000,
+    .key = "mem.age_ms", .group = "Memory", .type = CFG_INT, .min = 0, .max = 60000,
     .def = "1000",
     .help = "how often the accessed-bit sweep runs, in ms (0 = off)",
 };
 CONFIG_KEY(ck_cold_ms) = {
-    .key = "mem.cold_ms", .group = "System", .type = CFG_INT, .min = 100, .max = 3600000,
+    .key = "mem.cold_ms", .group = "Memory", .type = CFG_INT, .min = 100, .max = 3600000,
     .def = "30000",
     .help = "memory untouched for this long counts as cold",
 };

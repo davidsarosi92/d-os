@@ -47,7 +47,11 @@ struct gui_input;
 struct task;
 struct desktop_shell;
 
-#define GUI_MAX_WINDOWS 8
+/* 32 since 2026-09-28: at 8, opening a ninth window failed with nothing but a
+ * serial line ("window pool exhausted") — the translation sweep hit it by
+ * opening every panel at once.  A window is ~2 KB here (its pixels are
+ * separate), so 32 cost ~64 KB; the taskbar shows what fits and "+N". */
+#define GUI_MAX_WINDOWS 32
 
 #define BORDER      CP_BORDER
 #define MIN_W       160
