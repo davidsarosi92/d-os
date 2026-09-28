@@ -426,6 +426,7 @@ static const char* in_prefix(const char* name) {
     return 0;
 }
 static unsigned n_files, n_dirs, n_links, n_symlinks, n_symlink_skipped, n_other, n_whiteout;
+static unsigned n_failed;      /* §M89 — a write that did not happen fails the unpack */
 
 static void join(char* out, unsigned cap, const char* rel) {
     out[0] = 0;
@@ -563,13 +564,13 @@ static void extract_layer(const unsigned char* t, unsigned len) {
         mkdir_p(path);
         if (type == '5') { k_mkdir(path, mode); k_chmod(path, mode & 0777); n_dirs++; }
         else if (type == '0' || type == 0) {
-            if (write_file(path, data, (unsigned)sz, mode) != 0) printf("ociunpack: could not write %s\n", path);
+            if (write_file(path, data, (unsigned)sz, mode) != 0) { printf("ociunpack: could not write %s\n", path); n_failed++; }
             else n_files++;
         } else if (type == '1') {
             char tgt[256]; join(tgt, sizeof tgt, link);
             k_unlink(path);
             if (k_link(tgt, path) == 0) n_links++;
-            else printf("ociunpack: could not link %s -> %s\n", path, tgt);
+            else { printf("ociunpack: could not link %s -> %s\n", path, tgt); n_failed++; }
         } else if (type == '2') {
             k_unlink(path);
             /* §M89 — a REAL symbolic link, holding the image's own text: an
@@ -709,5 +710,11 @@ int main(int argc, char** argv) {
            "%u symlinks as links (%u skipped), %u whiteouts, %u other entries skipped - "
            "every blob matched its sha256\n", MY_ARCH, nl, n_files, n_dirs, n_links,
            n_symlinks, n_symlink_skipped, n_whiteout, n_other);
+    if (n_failed) {
+        /* A tree with holes is not an installed program: say so with the
+         * exit status, so a caller that installs software removes it. */
+        printf("ociunpack: %u entries could not be written - FAILED\n", n_failed);
+        return 2;
+    }
     return 0;
 }

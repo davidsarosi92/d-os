@@ -159,6 +159,9 @@ const struct shell_cmd* shell_cmd_at(int i);
 
 /* Exact lookup by verb.  NULL when nothing claims it. */
 const struct shell_cmd* shell_cmd_find(const char* verb);
+/* §M89 — run `line` as a program found on the PATH; 1 if one was found (and
+ * run), 0 if there is no such program (the caller says "unknown command"). */
+int shell_run_from_path(const char* line);
 
 /* ---------------------------------------------------------------------------
  * §M32 stage 4 — INTERACTIVE INPUT FOR A COMMAND, AND WHY IT IS A REGISTRY.

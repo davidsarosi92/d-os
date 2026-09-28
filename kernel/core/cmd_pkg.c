@@ -184,3 +184,113 @@ SHELL_CMD(tcc)     = { "tcc", "<src.c> -o <out> [args]", "compile C on the machi
                        SHELL_G_PKG, pk_tcc, SHELL_P_ADMIN };
 SHELL_CMD(pkgtest) = { "pkgtest", "", "store round trip: install, run, GC",
                        SHELL_G_TEST, pk_pkgtest, SHELL_P_ADMIN };
+
+/* ---- §M89 — programs on the PATH ------------------------------------------
+ *
+ * The shell's built-ins are a registry; everything else a user wants to run is
+ * a FILE — an installed application's link in /bin, a Linux program.  This is
+ * the fallback the dispatcher takes for a verb it does not know: split the
+ * line into arguments (double quotes group words), search the `env.PATH`
+ * setting for the verb (or take a path containing '/'), and run it in the
+ * foreground until it exits.
+ *
+ * WHICH PERSONALITY: a dynamically linked program (PT_INTERP) is a Linux one —
+ * everything installed from an image is — and so is anything that resolves
+ * into /mnt/apps; the rest are this system's own programs.  /proc/self/exe is
+ * the resolved path, which is how a JDK started as `java` finds its home. */
+#include "config.h"
+#include "cred.h"
+
+static int is_linux_elf(const uint8_t* img, size_t len, const char* real) {
+    const char* a = "/mnt/apps/";
+    int i = 0;
+    while (a[i] && real[i] == a[i]) i++;
+    if (!a[i]) return 1;
+    if (len < 64 || img[0] != 0x7F || img[1] != 'E' || img[2] != 'L' || img[3] != 'F') return 0;
+    int is64 = img[4] == 2;
+    uint64_t phoff = is64 ? *(const uint64_t*)(img + 32) : *(const uint32_t*)(img + 28);
+    uint16_t phent = *(const uint16_t*)(img + (is64 ? 54 : 42));
+    uint16_t phnum = *(const uint16_t*)(img + (is64 ? 56 : 44));
+    for (uint16_t k = 0; k < phnum; k++) {
+        uint64_t o = phoff + (uint64_t)k * phent;
+        if (o + 4 > len) break;
+        if (*(const uint32_t*)(img + o) == 3) return 1;          /* PT_INTERP */
+    }
+    return 0;
+}
+
+int shell_run_from_path(const char* line) {
+    /* Arguments, with "double quoted" words kept together. */
+    static char pool[1024];
+    const char* argv[32];
+    int argc = 0, used = 0;
+    const char* p = line;
+    while (*p && argc < 31) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        argv[argc++] = pool + used;
+        int q = 0;
+        while (*p && (q || *p != ' ')) {
+            if (*p == '"') { q = !q; p++; continue; }
+            if (used < (int)sizeof pool - 2) pool[used++] = *p;
+            p++;
+        }
+        pool[used++] = 0;
+    }
+    argv[argc] = NULL;
+    if (!argc) return 0;
+
+    /* The program: a path as given, else the first PATH entry that has it. */
+    char path[256], real[256];
+    path[0] = 0;
+    int has_slash = 0;
+    for (const char* v = argv[0]; *v; v++) if (*v == '/') has_slash = 1;
+    struct vfs_stat st;
+    if (has_slash) {
+        int k = 0; for (; argv[0][k] && k < 255; k++) path[k] = argv[0][k]; path[k] = 0;
+        if (vfs_stat(path, &st) != 0 || st.is_dir) return 0;
+    } else {
+        const char* pv = config_get("env.PATH", "/bin:/usr/bin");
+        while (*pv) {
+            int k = 0;
+            while (*pv && *pv != ':' && k < 200) path[k++] = *pv++;
+            if (*pv == ':') pv++;
+            if (!k) continue;
+            path[k++] = '/';
+            for (const char* v = argv[0]; *v && k < 255; v++) path[k++] = *v;
+            path[k] = 0;
+            if (vfs_stat(path, &st) == 0 && !st.is_dir) break;
+            path[0] = 0;
+        }
+        if (!path[0]) return 0;
+    }
+    if (vfs_realpath(path, real, sizeof real) != 0) { int k = 0; for (; path[k]; k++) real[k] = path[k]; real[k] = 0; }
+
+    struct file* f = vfs_open(real, VFS_RDONLY);
+    if (!f) return 0;
+    size_t sz = f->inode ? (size_t)f->inode->size : 0;
+    uint8_t* img = sz ? (uint8_t*)kmalloc(sz) : NULL;
+    ssize_t got = img ? vfs_read(f, img, sz) : -1;
+    vfs_close(f);
+    if (!img || got != (ssize_t)sz) { if (img) kfree(img); kprintf("%s: cannot read %s\n", argv[0], real); return 1; }
+    int linux_abi = is_linux_elf(img, sz, real);
+
+    /* The child inherits the cred, and with it /proc/self/exe. */
+    struct task* me = task_current();
+    char saved[sizeof me->cred.exe];
+    for (unsigned i = 0; i < sizeof saved; i++) saved[i] = me->cred.exe[i];
+    int k = 0; for (; real[k] && k < (int)sizeof me->cred.exe - 1; k++) me->cred.exe[k] = real[k];
+    me->cred.exe[k] = 0;
+    const char* name = argv[0];
+    for (const char* v = argv[0]; *v; v++) if (*v == '/') name = v + 1;
+    int pid = proc_spawn_argv(name, img, sz, argc, argv, linux_abi);
+    for (unsigned i = 0; i < sizeof saved; i++) me->cred.exe[i] = saved[i];
+    kfree(img);
+    if (pid < 0) { kprintf("%s: could not start %s\n", argv[0], real); return 1; }
+    struct task* t = task_find(pid);
+    if (t) task_set_reap_owned(t, 1);
+    int code = 0;
+    task_wait(pid, &code);
+    if (code) kprintf("[%s exited with status %d]\n", name, code);
+    return 1;
+}

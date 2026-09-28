@@ -54,7 +54,7 @@ a real Wi-Fi driver, and the rows under "Known defects — Open".
   `java Hello.java` runs from a plain shell.  Updates install beside the old
   version and move the profile; rollback = move it back; `pkg gc` removes the
   old one.  Source: the image file on the disk first, a TLS download later.
-  Containers stay available for isolation.  Next after §M89's Hello.java.
+  Containers stay available for isolation.  **DONE 2026-09-28 (DOCS §4.119): delivered, installed on boot, `java` runs from a plain shell.**
   **Refined by the user the same day:** the install place is a NON-OS folder
   on the persistent disk (`/mnt/apps/<name>/<version>/`, JDK tree only), and a
   `/bin`-launchable form is wanted too — which needs SYMBOLIC LINKS in the VFS

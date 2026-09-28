@@ -80,7 +80,10 @@ int shell_cmd_dispatch(const char* line) {
     verb[n] = '\0';
 
     const struct shell_cmd* c = shell_cmd_find(verb);
-    if (!c || !c->run) return 0;
+    /* §M89 — not a built-in: a PROGRAM on the PATH (an installed application
+     * in /bin, a Linux binary), run in the foreground with the whole line as
+     * its arguments.  Built-ins win, so no program can take over a command. */
+    if (!c || !c->run) return shell_run_from_path(line);
 
     /* §M32 stage 7 — THE PRIVILEGE GATE, in one place for every command.
      *

@@ -15634,8 +15634,25 @@ unpacked straight into `/mnt/apps/<name>/<version>/` on the persistent disk,
 never shadowed), `libc.musl-<arch>.so.1` linked to the dynamic linker, updates
 beside the old version, rollback with `use`.  A boot service relinks and
 installs anything in `/mnt/incoming/*.tar` not yet installed.  **Built and the
-refusal path verified; an end-to-end `app install jdk` + `java` from /bin is
-the first item of the next session**, with `run_qemu.sh`'s host-side delivery.
+refusal path verified.**
+
+**End to end, verified 2026-09-28 (x86_64, a fresh 64 MiB disk):** put an image
+at `build/apps/java.tar` (`docker save eclipse-temurin:21-jdk-alpine -o
+build/apps/java.tar`) and run `./scripts/run-x86_64.sh` (or aarch64).
+`scripts/deliver-apps.sh` (called by run_qemu.sh) grew the disk to 1.2 GiB
+keeping its files and put the archive in `/incoming`; the machine gets 3 GiB
+when an app is present.  On boot the `apps` service printed `java
+jdk-21.0.12.1+1 installed; 29 program(s) linked into /bin`, and from a plain
+shell `java -version` and `java /tmp/H.java` ("Hello from /bin/java on d-os")
+ran; `fsck.exfat` reports the volume clean.  The shell runs a PATH program by
+name now (`shell_run_from_path`: built-ins first, `env.PATH`, quotes group
+words; a dynamically linked program or anything under /mnt/apps runs under
+the Linux personality).  Found by this run: **exFAT names were capped at 30
+characters** (longer names could not be created and were invisible when read)
+— 63 now, the VFS's own limit; and **ociunpack reported success with files
+missing** — a write that fails now fails the unpack, and the installer removes
+the partial tree.  The JDK's `legal/` symlinks are skipped on exFAT (it stores
+none) — licence texts only.
 
 **How Java gets onto the machine, and how it is updated — the state today,
 said plainly.**  It is NEITHER built in NOR a package: it is an OCI image the

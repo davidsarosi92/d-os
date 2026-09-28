@@ -98,10 +98,13 @@
 #define EXFAT_FAT_BAD             0xFFFFFFF7u
 #define EXFAT_FAT_EOC             0xFFFFFFFFu
 
-/* In-memory caps for this milestone.  Keeps stack frames small and
- * sidesteps multi-name-entry edge cases for now. */
-#define EXFAT_MAX_NAME            30                /* ASCII chars excl. NUL */
-#define EXFAT_MAX_NAME_ENTRIES    2                 /* 30 chars / 15 per entry */
+/* The longest name handled.  The format allows 255; this was 30 "to keep
+ * stack frames small" — and every longer name failed to be CREATED and was
+ * INVISIBLE when read (a JDK's jmods/jdk.internal.vm.compiler.management.jmod
+ * is 42).  Now the VFS's own per-component limit (VFS_NAME_MAX, 63): a name
+ * the VFS can hold, the volume can store.  255 needs the VFS widened first. */
+#define EXFAT_MAX_NAME            63                /* ASCII chars excl. NUL */
+#define EXFAT_MAX_NAME_ENTRIES    5                 /* 15 per entry: 75 >= 63 */
 /* File + Stream + names + our Vendor Extension. */
 #define EXFAT_MAX_SET_ENTRIES     (1 + 1 + EXFAT_MAX_NAME_ENTRIES + 1)
 

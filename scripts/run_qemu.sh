@@ -171,6 +171,17 @@ dos_audio_note() {
     echo "run:   Silence them with --no-audio (the guest then has no sound card)." >&2
 }
 
+# §M89 — application images (build/apps/*.tar, `docker save <image>`) are
+# delivered onto the disk and installed by d-os on boot; see deliver-apps.sh.
+# A machine that will install or run one (a JDK) needs more than the default
+# memory: 3 GiB, unless DOS_MEM says otherwise.
+APPS_PRESENT=0
+if ls build/apps/*.tar >/dev/null 2>&1 && [ "$DISK_MODE" != none ] &&
+   { [ "$ARCH" = x86_64 ] || [ "$ARCH" = aarch64 ]; }; then
+    APPS_PRESENT=1
+    : "${DOS_MEM:=3G}"
+fi
+
 dos_prepare_disk() {
     _p="$1"
     case "$DISK_MODE" in
@@ -184,6 +195,9 @@ dos_prepare_disk() {
                 dos_format_disk "$_p" || return 0
             fi ;;
     esac
+    if [ -f "$_p" ] && [ "$APPS_PRESENT" = 1 ]; then
+        sh scripts/deliver-apps.sh "$_p" "$ARCH" >&2 || true
+    fi
     [ -f "$_p" ] && echo "$_p"
     return 0
 }
@@ -387,7 +401,7 @@ if command -v "$QEMU" >/dev/null 2>&1; then
     #   until §M48, which is what made Mesa run out of memory on a machine that
     #   had plenty), so this is the point where extra RAM starts being usable.
     #   x86_64 has no such ceiling at all.
-    EXTRA="-m 1024M -vga none -device VGA,vgamem_mb=32"
+    EXTRA="-m ${DOS_MEM:-1024M} -vga none -device VGA,vgamem_mb=32"
     # MORE THAN ONE CPU.  Until §M49 this script passed no -smp at all, so the
     # default run was uniprocessor and the per-CPU runqueue + load balancer
     # (§M18.6.1) NEVER EXECUTED on the path a person actually uses — every test
