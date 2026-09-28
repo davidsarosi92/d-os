@@ -27,6 +27,7 @@
 #include "swap.h"
 #include "percpu.h"     /* §M89 — getcpu */
 #include "timer.h"
+#include "vma.h"
 #include <stddef.h>
 
 /* Linux errno values the guests share (the ones the engine returns). */
@@ -1102,6 +1103,158 @@ static long h_fstatfs(struct abi_ctx* c) {
     return put_statfs(c, (uintptr_t)c->a[1], 0);
 }
 
+/* prctl: the thread name (PR_SET_NAME 15 / PR_GET_NAME 16 — a JVM names
+ * every thread it starts, and `ps` then shows them) and PR_SET_DUMPABLE /
+ * PR_GET_DUMPABLE (there are no core dumps; report "dumpable" and accept a
+ * change).  Anything else is EINVAL, which is what Linux answers for an
+ * option it does not know. */
+static long h_prctl(struct abi_ctx* c) {
+    struct task* t = task_current();
+    int opt = (int)c->a[0];
+    if (!t) return -ABI_EINVAL;
+    if (opt == 15) {                                      /* PR_SET_NAME */
+        char k[16];
+        if (abi_path(c->a[1], k, sizeof k) != 0) return -ABI_EFAULT;
+        k[15] = 0;
+        int i = 0;
+        for (; k[i] && i < TASK_NAME_MAX; i++) t->name[i] = k[i];
+        t->name[i] = 0;
+        return 0;
+    }
+    if (opt == 16) {                                      /* PR_GET_NAME */
+        if (!abi_w_ok(c->a[1], 16)) return -ABI_EFAULT;
+        char* d = (char*)(uintptr_t)c->a[1];
+        int i = 0;
+        for (; i < 15 && t->name[i]; i++) d[i] = t->name[i];
+        d[i] = 0;
+        return 0;
+    }
+    if (opt == 3) return 1;                               /* PR_GET_DUMPABLE */
+    if (opt == 4) return 0;                               /* PR_SET_DUMPABLE */
+    return -ABI_EINVAL;
+}
+
+/* getrusage(who, ru): user time from the task's own accounting (RUSAGE_SELF
+ * and RUSAGE_THREAD both answer for the caller; there is no per-process sum
+ * across threads yet, said here).  System time is not separated here — it is
+ * all reported as user time rather than invented.  struct rusage = two
+ * timevals then fourteen longs, all guest words. */
+static long h_getrusage(struct abi_ctx* c) {
+    unsigned w = c->map->word_bytes;
+    uintptr_t p = (uintptr_t)c->a[1];
+    if (!abi_w_ok(p, 18 * w)) return -ABI_EFAULT;
+    for (unsigned i = 0; i < 18 * w; i++) ((uint8_t*)p)[i] = 0;
+    struct task* t = task_current();
+    uint64_t ms = t ? t->cpu_ms : 0;
+    put_word(c, p, ms / 1000);
+    put_word(c, p + w, (ms % 1000) * 1000);
+    return 0;
+}
+
+/* ---- §M89 rung 3 — calls that lived only in the two x86 switches ----------
+ *
+ * Each was written once per x86 arch and never for arm64, where a JVM's
+ * sched_yield hit ENOSYS and its spin loops never gave the CPU away.  §M50's
+ * rule: an operation is written ONCE and every guest names it. */
+static long h_sched_yield(struct abi_ctx* c) { (void)c; task_msleep(1); return 0; }
+static long h_getrandom(struct abi_ctx* c) {
+    return sys_getrandom((void*)(uintptr_t)c->a[0], (size_t)c->a[1], (unsigned)c->a[2]);
+}
+/* madvise: MADV_DONTNEED (4) really drops pages (vma.c); the others are
+ * hints and are accepted. */
+static long h_madvise(struct abi_ctx* c) {
+    if ((int)c->a[2] == 4) return vma_madvise_dontneed((uintptr_t)c->a[0], (size_t)c->a[1]);
+    return 0;
+}
+/* membarrier: every command this kernel could be asked for is satisfied by
+ * the TLB shootdown and interrupt paths already serialising the CPUs; QUERY
+ * (0) answers "none registered-needed", the rest succeed. */
+static long h_membarrier(struct abi_ctx* c) { (void)c; return 0; }
+static long h_memfd_create(struct abi_ctx* c) { (void)c; int r = sys_memfd(0); return r < 0 ? -ABI_ENOMEM : r; }
+/* ftruncate: a memfd is sized; a regular file is EXTENDED by writing a zero
+ * at the new last byte (an in-memory file has no holes to punch, so
+ * shrinking is refused rather than faked). */
+static long h_ftruncate(struct abi_ctx* c) {
+    int fd = (int)c->a[0];
+    long size = (long)c->a[1];
+    struct ofile* o = fd_lookup(fd);
+    if (!o) return -ABI_EBADF;
+    if (o->kind == FD_SHM) return sys_memfd_resize(fd, (size_t)size) < 0 ? -ABI_EINVAL : 0;
+    if (o->kind != FD_VFS || !o->file || !o->file->inode || size < 0) return -ABI_EINVAL;
+    uint64_t cur = o->file->inode->size;
+    if ((uint64_t)size == cur) return 0;
+    if ((uint64_t)size < cur) { if (size == 0) { o->file->inode->size = 0; return 0; } return -ABI_EINVAL; }
+    uint64_t save = o->file->pos;
+    o->file->pos = (uint64_t)size - 1;
+    char z = 0;
+    long w = vfs_write(o->file, &z, 1);
+    o->file->pos = save;
+    return w == 1 ? 0 : -ABI_EINVAL;
+}
+/* mincore is NOT advisory: its RETURN VALUE is the answer.  Mesa's
+ * _eglPointerIsDereferencable asks it whether an address is mapped, and a
+ * blanket "success" once made libEGL dereference the literal 3 (§M40).  Since
+ * §M89 it also must not PREFAULT: a reserved page that was never touched is
+ * mapped-but-not-resident, and bringing it in would answer by changing. */
+static long h_mincore(struct abi_ctx* c) {
+    uintptr_t addr = (uintptr_t)c->a[0];
+    size_t len = (size_t)c->a[1];
+    size_t pages = (len + 4095) / 4096;
+    if (!pages) return 0;
+    if (!abi_w_ok(c->a[2], pages)) return -ABI_EFAULT;
+    return vma_mincore(addr, len, (uint8_t*)(uintptr_t)c->a[2]);
+}
+static long h_pread64(struct abi_ctx* c) {
+    int fd = (int)c->a[0];
+    long cur = sys_lseek(fd, 0, 1);
+    if (cur < 0) return -29;                                  /* ESPIPE */
+    sys_lseek(fd, (long)c->a[3], 0);
+    long r = sys_read(fd, (void*)(uintptr_t)c->a[1], (size_t)c->a[2]);
+    sys_lseek(fd, cur, 0);
+    return r;
+}
+static long h_pwrite64(struct abi_ctx* c) {
+    int fd = (int)c->a[0];
+    long cur = sys_lseek(fd, 0, 1);
+    if (cur < 0) return -29;
+    sys_lseek(fd, (long)c->a[3], 0);
+    long r = sys_write(fd, (const void*)(uintptr_t)c->a[1], (size_t)c->a[2]);
+    sys_lseek(fd, cur, 0);
+    return r;
+}
+/* The CPUs this task may run on, as a guest-word mask; the byte count is the
+ * return value.  An empty answer would read as "zero CPUs". */
+static long h_sched_getaffinity(struct abi_ctx* c) {
+    unsigned w = c->map->word_bytes;
+    if (c->a[1] < w) return -ABI_EINVAL;
+    if (!abi_w_ok(c->a[2], w)) return -ABI_EFAULT;
+    int n = smp_ncpus();
+    if (n <= 0) n = 1;
+    if (n > (int)(8 * w)) n = (int)(8 * w);
+    uint64_t m = (n >= 64) ? ~0ull : ((1ull << n) - 1ull);
+    put_word(c, (uintptr_t)c->a[2], m);
+    return (long)w;
+}
+static long h_sched_setaffinity(struct abi_ctx* c) { (void)c; return 0; }
+/* set_robust_list: accepted.  The kernel does not walk the list at thread
+ * death (a lock held by a thread that dies stays held — stated). */
+static long h_set_robust_list(struct abi_ctx* c) { (void)c; return 0; }
+/* ppoll(fds, nfds, timeout_ts, sigmask, size) — arm64 has no poll(2) at all.
+ * The mask swap is not done (a deferred signal arriving in the window is the
+ * known gap); the timeout is converted to milliseconds, rounded UP. */
+static long h_ppoll(struct abi_ctx* c) {
+    int ms = -1;
+    if (c->a[2]) {
+        unsigned w = (!c->map || c->map->word_bytes != 4) ? 8 : 4;
+        if (!abi_r_ok(c->a[2], 2 * w)) return -ABI_EFAULT;
+        uint64_t s = abi_get_word(c, c->a[2], 0), ns = abi_get_word(c, c->a[2], 1);
+        uint64_t t = s * 1000ull + (ns + 999999ull) / 1000000ull;
+        ms = t > 0x7FFFFFFF ? 0x7FFFFFFF : (int)t;
+    }
+    int r = sys_poll((struct pollfd*)(uintptr_t)c->a[0], (int)c->a[1], ms);
+    return r < 0 ? -ABI_EFAULT : r;
+}
+
 static long h_settid(struct abi_ctx* c) {
     (void)c;
     struct task* t = task_current();
@@ -1383,6 +1536,21 @@ static const struct {
     [ABI_CLOCK_GETRES]  = { "clock_getres", h_clock_getres  },
     [ABI_STATFS]        = { "statfs",       h_statfs        },
     [ABI_FSTATFS]       = { "fstatfs",      h_fstatfs       },
+    [ABI_PRCTL]         = { "prctl",        h_prctl         },
+    [ABI_GETRUSAGE]     = { "getrusage",    h_getrusage     },
+    [ABI_SCHED_YIELD]   = { "sched_yield",  h_sched_yield   },
+    [ABI_GETRANDOM]     = { "getrandom",    h_getrandom     },
+    [ABI_MADVISE]       = { "madvise",      h_madvise       },
+    [ABI_MEMBARRIER]    = { "membarrier",   h_membarrier    },
+    [ABI_MEMFD_CREATE]  = { "memfd_create", h_memfd_create  },
+    [ABI_FTRUNCATE]     = { "ftruncate",    h_ftruncate     },
+    [ABI_MINCORE]       = { "mincore",      h_mincore       },
+    [ABI_PREAD64]       = { "pread64",      h_pread64       },
+    [ABI_PWRITE64]      = { "pwrite64",     h_pwrite64      },
+    [ABI_SCHED_GETAFFINITY] = { "sched_getaffinity", h_sched_getaffinity },
+    [ABI_SCHED_SETAFFINITY] = { "sched_setaffinity", h_sched_setaffinity },
+    [ABI_SET_ROBUST_LIST]   = { "set_robust_list",   h_set_robust_list   },
+    [ABI_PPOLL]         = { "ppoll",        h_ppoll         },
     [ABI_OPEN]         = { "open",         h_open         },
     [ABI_OPENAT]       = { "openat",       h_openat       },
     [ABI_STAT]         = { "stat",         h_stat         },

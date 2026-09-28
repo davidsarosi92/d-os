@@ -74,6 +74,17 @@ int  vma_fault(uintptr_t va, int is_write, int can_sleep);
  * [va, va+len) is now either present or not ours to fill. */
 int  vma_prefault(uintptr_t va, uintptr_t len, int is_write);
 
+/* madvise(MADV_DONTNEED) on a private range: its pages go, and the next touch
+ * brings a fresh zero page (anonymous) or the file's page back (file).  What a
+ * garbage collector uses to give memory back without giving up the range. */
+long vma_madvise_dontneed(uintptr_t addr, size_t len);
+
+/* mincore: one byte per page, bit 0 = resident NOW.  A reserved page that was
+ * never touched is not resident — answering by prefaulting would change the
+ * answer by asking the question.  -ENOMEM if part of the range is not the
+ * program's at all. */
+long vma_mincore(uintptr_t addr, size_t len, uint8_t* vec_kernel);
+
 /* Arch hooks: copy the parent's set into a fork child, free a space's set. */
 void vma_clone(struct vmm_space* parent, struct vmm_space* child);
 void vma_destroy(struct vmm_space* mm);

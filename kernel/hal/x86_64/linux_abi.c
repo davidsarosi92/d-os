@@ -514,28 +514,9 @@ static void linux_syscall_body(struct int_frame* f) {
             f->rax = (uint64_t)sys_lseek((int)a0, (long)a1, (int)a2);
             return;
 
-        case LNX_pread64: {
-            /* pread64(fd, buf, count, offset) — positioned read that must NOT
-             * disturb the fd offset (musl's ld.so dlopen path reads .so headers
-             * this way).  Save/seek/read/restore around the plain fd cursor. */
-            int fd = (int)a0;
-            long cur = sys_lseek(fd, 0, 1 /*SEEK_CUR*/);
-            sys_lseek(fd, (long)a3, 0 /*SEEK_SET*/);
-            long r = sys_read(fd, (void*)a1, (size_t)a2);
-            if (cur >= 0) sys_lseek(fd, cur, 0 /*SEEK_SET*/);
-            f->rax = (uint64_t)r;
-            return;
-        }
-        case LNX_pwrite64: {
-            int fd = (int)a0;
-            long cur = sys_lseek(fd, 0, 1);
-            sys_lseek(fd, (long)a3, 0);
-            long r = sys_write(fd, (const void*)a1, (size_t)a2);
-            if (cur >= 0) sys_lseek(fd, cur, 0);
-            f->rax = (uint64_t)r;
-            return;
-        }
-        /* mmap / munmap / mprotect are ABI-engine operations (§M89). */
+
+        /* mmap / munmap / mprotect, pread64 / pwrite64 are ABI-engine
+         * operations (§M89). */
         case LNX_brk:
             /* No program break → report 0 so musl's malloc falls back to mmap. */
             f->rax = 0;
@@ -570,98 +551,17 @@ static void linux_syscall_body(struct int_frame* f) {
             f->rax = (uint64_t)(task_current() ? task_current()->pid : 0);
             return;
 
-        case LNX_set_robust_list:
-        /* LNX_rt_sigprocmask is NO LONGER here (§M56): it is a real operation
-         * in the ABI engine now.  Leaving the case would have shadowed it
-         * forever — the engine is consulted first but DECLINES numbers absent
-         * from the guest's map, and this stub then answered "success" without
-         * doing anything.  That is exactly how the real handler sat unreached
-         * on both x86 guests while working on arm64, whose map did name it. */
-        case LNX_membarrier:               /* UP + no reordering we care about */
-            /* Best-effort success: no robust futex list tracked yet, and
-             * musl's startup only needs these to "not fail".  (fcntl and
-             * rt_sigaction used to share this body — so rt_sigaction ran as
-             * fcntl(signo, act_pointer, ...); both are engine operations now,
-             * §M73.) */
-            f->rax = 0;
-            return;
-
+        /* set_robust_list, membarrier, memfd_create, ftruncate, getrandom,
+         * sched_{get,set}affinity, madvise, mincore and sched_yield are
+         * ABI-engine operations now (§M89 rung 3): they lived here and in the
+         * i386 switch only, so arm64 had none of them. */
         case LNX_ioctl:
             /* ENOTTY (not ENOSYS) → musl's isatty() reports "not a terminal". */
             f->rax = (uint64_t)-LNX_ENOTTY;
             return;
 
-        case LNX_memfd_create:
-            /* The NAME is advisory (Linux only uses it for /proc); we ignore it
-             * and hand back a zero-length shm object, which ftruncate sizes. */
-            f->rax = (uint64_t)(long)sys_memfd(0);
-            return;
-        case LNX_ftruncate:
-            f->rax = (uint64_t)(long)sys_memfd_resize((int)a0, (size_t)a1);
-            return;
 
-        case LNX_getrandom:
-            f->rax = (uint64_t)sys_getrandom((void*)a0, (size_t)a1, (unsigned)a2);
-            return;
 
-        case LNX_sched_setaffinity:
-            f->rax = 0;                    /* accepted; d-os schedules its own */
-            return;
-        case LNX_sched_getaffinity: {
-            /* getaffinity(pid, cpusetsize, mask) → BYTES written, mask filled.
-             * Report the CPUs this task may actually run on; a caller that gets
-             * an empty or error answer concludes there are zero CPUs. */
-            size_t cap = (size_t)a1;
-            if (!a2 || cap < sizeof(unsigned long)) {
-                f->rax = (uint64_t)-LNX_EINVAL; return;
-            }
-            if (!lnx_w_ok(a2, sizeof(unsigned long))) {
-                f->rax = (uint64_t)-LNX_EFAULT; return;
-            }
-            int n = smp_ncpus();
-            if (n <= 0) n = 1;
-            if (n > 64) n = 64;
-            unsigned long m = (n >= 64) ? ~0UL : ((1UL << n) - 1UL);
-            *(unsigned long*)a2 = m;
-            f->rax = sizeof(unsigned long);
-            return;
-        }
-        case LNX_madvise:
-            /* Purely advisory (MADV_*) — safe to accept and ignore. */
-            f->rax = 0;
-            return;
-        case LNX_mincore: {
-            /* mincore() is NOT advisory — its RETURN VALUE is the answer, and
-             * accepting it blindly is actively harmful.  Mesa's
-             * _eglPointerIsDereferencable() asks mincore whether an address is
-             * mapped; a bare `return 0` means "yes, mapped" for EVERY address,
-             * including the literal 3 that a version-3 wl_egl_window stores in
-             * its first word.  Mesa then took its legacy branch and dereferenced
-             * address 3 — a null fault inside wl_proxy_create_wrapper, one
-             * indirection away from the EGL triangle.  Lesson: a syscall stubbed
-             * as "succeed and ignore" is only safe when the CALLER ignores the
-             * result too; a query must answer truthfully or fail.
-             *
-             * Linux semantics: EINVAL if addr is not page-aligned, ENOMEM if the
-             * range holds unmapped pages, otherwise 0 with one byte per page in
-             * vec (bit 0 = resident).  Everything we have mapped is resident —
-             * no swap — so a mapped page reports 1. */
-            uintptr_t addr = a0, len = a1, uvec = a2;
-            if (addr & (PAGE_SIZE - 1)) { f->rax = (uint64_t)-LNX_EINVAL; return; }
-            uintptr_t pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-            if (!pages) { f->rax = 0; return; }
-            if (!lnx_w_ok(uvec, pages))   { f->rax = (uint64_t)-LNX_EFAULT; return; }
-            if (!vmm_user_access_ok(addr, pages * PAGE_SIZE, 0)) {
-                f->rax = (uint64_t)-LNX_ENOMEM; return;
-            }
-            for (uintptr_t i = 0; i < pages; i++) ((uint8_t*)uvec)[i] = 1;
-            f->rax = 0;
-            return;
-        }
-        case LNX_sched_yield:
-            task_msleep(1);                          /* cooperative yield */
-            f->rax = 0;
-            return;
 
         /* §M42 display bridge — a ring-3 graphical client (NetSurf's libnsfb
          * "dos" surface) drives a WM window through these.  Buffer/event

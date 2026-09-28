@@ -703,22 +703,14 @@ static void linux_syscall_body(struct int_frame* f) {
             return;
         }
 
-        case LNX_memfd_create:
-            /* The NAME is advisory (Linux only uses it for /proc); we ignore it
-             * and hand back a zero-length shm object, which ftruncate sizes. */
-            f->eax = (uint32_t)sys_memfd(0);
-            return;
+        /* memfd_create, getrandom, madvise, mincore, sched_yield: ABI-engine
+         * operations (§M89 rung 3).  ftruncate stays here: i386's ftruncate64
+         * splits its offset across two registers. */
         case LNX_ftruncate:
         case LNX_ftruncate64:
             f->eax = (uint32_t)sys_memfd_resize((int)f->ebx, (size_t)f->ecx);
             return;
 
-        case LNX_getrandom:
-            /* getrandom(buf=ebx, len=ecx, flags=edx) → the §M39 CSPRNG.  musl's
-             * arc4random / TLS seeding uses it. */
-            f->eax = (uint32_t)sys_getrandom((void*)f->ebx, (size_t)f->ecx,
-                                             (unsigned)f->edx);
-            return;
 
         case LNX_statx:
             /* Deliberately ENOSYS: musl (incl. ld.so's library dedup) falls back
@@ -879,36 +871,7 @@ static void linux_syscall_body(struct int_frame* f) {
             return;
         }
 
-        case LNX_madvise:
-            f->eax = 0;                              /* advisory — accept + ignore */
-            return;
 
-        case LNX_mincore: {
-            /* NOT advisory, unlike its neighbour above — the RETURN VALUE is the
-             * answer.  Mesa's _eglPointerIsDereferencable() asks mincore whether
-             * an address is mapped, so a blanket "success" would tell it that
-             * literally every address is dereferenceable (see the x86_64 twin,
-             * where exactly that made libEGL dereference the address 3).
-             * Linux: EINVAL if addr is unaligned, ENOMEM if the range holds
-             * unmapped pages, else 0 with one byte per page (bit 0 = resident;
-             * we never swap, so every mapped page reports resident). */
-            uintptr_t addr = f->ebx, len = f->ecx, uvec = f->edx;
-            if (addr & (LNX_PAGE_SIZE - 1)) { f->eax = (uint32_t)-LNX_EINVAL; return; }
-            uintptr_t pages = (len + LNX_PAGE_SIZE - 1) / LNX_PAGE_SIZE;
-            if (!pages) { f->eax = 0; return; }
-            if (!lnx_w_ok(uvec, pages))   { f->eax = (uint32_t)-LNX_EFAULT; return; }
-            if (!vmm_user_access_ok(addr, pages * LNX_PAGE_SIZE, 0)) {
-                f->eax = (uint32_t)-LNX_ENOMEM; return;
-            }
-            for (uintptr_t i = 0; i < pages; i++) ((uint8_t*)uvec)[i] = 1;
-            f->eax = 0;
-            return;
-        }
-
-        case LNX_sched_yield:
-            task_msleep(1);                          /* cooperative yield */
-            f->eax = 0;
-            return;
 
         /* §M42 display bridge — a ring-3 client (NetSurf's libnsfb "dos" surface)
          * drives a WM window.  Buffer/event pointers are in the caller's address

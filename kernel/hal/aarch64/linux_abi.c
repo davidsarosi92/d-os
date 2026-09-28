@@ -19,6 +19,7 @@
 
 #include "lnx_signal.h"   /* §M89 */
 #include "abi.h"
+#include "vmm.h"
 #include "task.h"
 #include "fd.h"
 #include "syscall.h"
@@ -96,8 +97,29 @@ void linux_syscall_dispatch(struct trapframe* tf) {
             r.pstate = tf->spsr;
             tf->x[0] = (uint64_t)proc_fork(&r);
         } else {
-            kprintf("linux/arm64: clone(CLONE_VM) — threads are A4\n");
-            tf->x[0] = (uint64_t)(-LNX_ENOSYS);
+            /* §M89 rung 3 — a THREAD: (flags, stack, ptid, tls, ctid). */
+            if (!tf->x[1]) { tf->x[0] = (uint64_t)-22; if (me) me->in_user_syscall = prev; return; }
+            struct user_regs r;
+            for (int i = 0; i < 31; i++) r.x[i] = tf->x[i];
+            r.pc     = tf->elr;
+            r.pstate = tf->spsr;
+            int* ctid = (flags & 0x00200000u /* CHILD_CLEARTID */) ? (int*)(uintptr_t)tf->x[4] : NULL;
+            if (ctid && !vmm_user_access_ok((uintptr_t)ctid, sizeof(int), 1)) {
+                tf->x[0] = (uint64_t)-14;
+                if (me) me->in_user_syscall = prev;
+                return;
+            }
+            uintptr_t tls = (flags & 0x00080000u /* SETTLS */) ? (uintptr_t)tf->x[3] : 0;
+            int tid = proc_clone_thread(&r, (uintptr_t)tf->x[1], tls, ctid);
+            if (tid >= 0) {
+                if ((flags & 0x00100000u /* PARENT_SETTID */) && tf->x[2] &&
+                    vmm_user_access_ok((uintptr_t)tf->x[2], sizeof(int), 1))
+                    *(int*)(uintptr_t)tf->x[2] = tid;
+                if ((flags & 0x01000000u /* CHILD_SETTID */) && tf->x[4] &&
+                    vmm_user_access_ok((uintptr_t)tf->x[4], sizeof(int), 1))
+                    *(int*)(uintptr_t)tf->x[4] = tid;
+            }
+            tf->x[0] = (uint64_t)(tid < 0 ? -11 /* EAGAIN */ : tid);
         }
         if (me) me->in_user_syscall = prev;
         return;

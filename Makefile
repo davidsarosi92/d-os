@@ -615,6 +615,7 @@ else ifeq ($(ARCH),aarch64)
                      user/nxtest_muslblob.o \
                      user/mmaptest_muslblob.o \
                      user/sigmusl_muslblob.o \
+                     user/pthreadtest_muslblob.o \
                      $(MUSL_COREUTIL_BLOBS)
 
   # §M60 — the embedded default wallpaper (all arches).

@@ -130,3 +130,68 @@ int proc_fork(struct user_regs* parent_regs) {
     task_release(child);                /* §4.96: built completely, now it may run */
     return child->pid;                       /* parent: fork() returns child pid */
 }
+
+/* ---------------------------------------------------------------------------
+ * §M89 rung 3 — clone(CLONE_VM): a THREAD, the aarch64 twin of the x86
+ * proc_clone_thread.  The child shares the address space, the descriptor
+ * table (CLONE_FILES, fdtable_share) and the signal dispositions
+ * (CLONE_SIGHAND), and resumes at the parent's post-`svc` point with x0 = 0 on
+ * the stack the caller supplied.
+ *
+ * TPIDR_EL0 is the whole of TLS on this arch, so CLONE_SETTLS is one `msr` in
+ * the child; without it the child inherits the parent's LIVE pointer (read
+ * with mrs, for the reason the fork bootstrap gives).
+ * ------------------------------------------------------------------------- */
+struct thread_boot {
+    struct vmm_space* space;
+    struct user_regs  regs;
+    uint64_t          tpidr;
+    struct fdtable*   fdt;
+};
+
+static void thread_child_bootstrap(void) {
+    struct thread_boot* b = (struct thread_boot*)task_start_arg();
+    struct task* me = task_current();
+    me->mm        = b->space;              /* SHARED with the creator */
+    me->mm_shared = 1;
+    me->user_task = 1;
+    fdtable_adopt(me, b->fdt);
+    struct user_regs  regs  = b->regs;
+    struct vmm_space* space = b->space;
+    uint64_t          tpidr = b->tpidr;
+    kfree(b);
+    vmm_space_switch(space);
+    __asm__ volatile ("msr tpidr_el0, %0" :: "r"(tpidr));
+    me->tls_base = (uintptr_t)tpidr;
+    me->has_tls  = 1;
+    enter_user_mode_regs(&regs);            /* → EL0, x0 = 0; no return */
+}
+
+int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
+                      uintptr_t tls, int* ctid_kaddr) {
+    struct task* parent = task_current();
+    if (!parent || !parent->mm || !child_stack) return -1;
+    struct thread_boot* b = (struct thread_boot*)kmalloc(sizeof *b);
+    if (!b) return -1;
+    b->space   = parent->mm;
+    b->regs    = *parent_regs;
+    b->regs.x[0] = 0;
+    b->regs.user_sp = child_stack;
+    if (tls) b->tpidr = tls;
+    else     __asm__ volatile ("mrs %0, tpidr_el0" : "=r"(b->tpidr));
+    b->fdt = fdtable_share(parent);
+    if (!b->fdt) { kfree(b); return -1; }
+
+    struct task* child = task_spawn_arg_held("thread", thread_child_bootstrap, b);
+    if (!child) { fdtable_put(b->fdt); kfree(b); return -1; }
+    child->mm_shared = 1;                   /* set early: it may run at once */
+    child->linux_abi = parent->linux_abi;
+    child->clear_tid = ctid_kaddr;          /* CLONE_CHILD_CLEARTID (task_exit) */
+    lnx_sig_thread(parent, child);          /* CLONE_SIGHAND: shared */
+    hal_fpu_save(parent->fpu_state);
+    for (unsigned i = 0; i < HAL_FPU_STATE_SIZE; i++)
+        child->fpu_state[i] = parent->fpu_state[i];
+    task_set_reap_owned(child, 1);          /* the creator joins it */
+    task_release(child);
+    return child->pid;
+}

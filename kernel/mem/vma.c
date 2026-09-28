@@ -399,6 +399,41 @@ long vma_mprotect(uintptr_t addr, size_t len, int prot) {
     return 0;
 }
 
+long vma_madvise_dontneed(uintptr_t addr, size_t len) {
+    struct task* t = task_current();
+    if (!t || !t->mm || (addr & (PG - 1))) return -E_INVAL;
+    uintptr_t end = addr + ((len + PG - 1) & ~(uintptr_t)(PG - 1));
+    if (end < addr) return -E_INVAL;
+    struct vma_set* s = set_of(t->mm, 0);
+    if (!s) return 0;
+    kmutex_lock(&s->lock);
+    for (struct vma* v = s->head; v && v->start < end; v = v->next) {
+        if (v->end <= addr || v->kind == VMA_EAGER) continue;   /* eager: its owner's pages */
+        uintptr_t a = v->start > addr ? v->start : addr;
+        uintptr_t b = v->end < end ? v->end : end;
+        unmap_pages(t->mm, a, b);
+    }
+    kmutex_unlock(&s->lock);
+    return 0;
+}
+
+long vma_mincore(uintptr_t addr, size_t len, uint8_t* vec) {
+    struct task* t = task_current();
+    if (!t || !t->mm || (addr & (PG - 1))) return -E_INVAL;
+    size_t pages = (len + PG - 1) / PG;
+    struct vma_set* s = set_of(t->mm, 0);
+    if (s) kmutex_lock(&s->lock);
+    long rc = 0;
+    for (size_t i = 0; i < pages; i++) {
+        uintptr_t va = addr + i * PG;
+        int p = vmm_space_probe(t->mm, va);
+        if (p == 0 && !(s && find(s, va))) { rc = -E_NOMEM; break; }
+        vec[i] = (p == 1) ? 1 : 0;
+    }
+    if (s) kmutex_unlock(&s->lock);
+    return rc;
+}
+
 uintptr_t vma_reserve_eager(struct vmm_space* mm, size_t npages, int prot) {
     struct vma_set* s = set_of(mm, 1);
     if (!s || npages == 0) return 0;

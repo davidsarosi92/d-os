@@ -112,8 +112,14 @@ int main(void) {
     }
     /* Reaching this line at all is half the result: an unblocked SIGALRM with
      * no handler terminates the process, so a stub sigprocmask would have
-     * killed us before the printf. */
-
+     * killed us before the printf.
+     *
+     * §M89 — and the SAME rule applies on the way out: unblocking with the
+     * alarm still pending and no handler is a death sentence, on Linux and,
+     * since Linux signals are real here, on d-os.  This test used to rely on
+     * the old kernel silently dropping an unhandled SIGALRM.  Ignoring the
+     * signal discards the pending instance (POSIX), then the mask can go. */
+    signal(SIGALRM, SIG_IGN);
     sigprocmask(SIG_SETMASK, &old_set, 0);
 
     /* --- pipe(), through the shared ABI op (§M59) -------------------------
