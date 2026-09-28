@@ -19,6 +19,7 @@ int   open (const char* path, int flags);
 int   close(int fd);
 void  exit (int code);
 void* mmap (size_t len, int fd);            /* fd<0 = anonymous */
+int   munmap(void* addr, size_t len);       /* §M89 — give a mapping back */
 int   getpid(void);
 
 /* Raw syscall, for the d-os operations a libc wrapper would only obscure —

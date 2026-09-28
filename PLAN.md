@@ -231,7 +231,8 @@ fixed first, whatever it touches.
 | §M73 | ✅ complete — rungs 1-3 (§4.115) | — (resource caps per container, network namespace, registry pull) |
 | queued UI | ✅ done (§4.116) — Memory page, System information, translations 73 → 0 | — |
 | §M88 | ✅ first cut (§4.118) | per-output modes, live re-arrangement, left/above, >16 MiB desktops |
-| §M89 | ◐ | Java: a JRE (and the JDK with it) — rungs 1-3 done (VMA layer, Linux signals, arm64 threads); `java -version` runs on x86_64 (DOCS §4.119) |
+| §M89 | ◐ → core ✅ | Java: `java Hello.java` from the unmodified JDK on x86_64 + aarch64 (DOCS §4.119); open: `app install` end to end, host-side delivery, rung 5 measurements |
+| §M90 | — | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — asked for 2026-09-28, scoped below; AFTER §M89 and the open items (decided), planned for Thursday evening |
 | §M68 | — | investigation, not started |
 | §M83, §M84 | — | designed, not started |
 
@@ -320,7 +321,8 @@ what); a session can pick a theme and push on it.
 | M85 | **aarch64 beyond `virt`: QEMU `sbsa-ref`** — asked for directly (2026-09-25).  The ARM port knows exactly ONE machine: ten places hardcode `virt`'s map (GICv2 at `0x08000000`, PL011 at `0x09000000`, virtio-mmio at `0x0a000000`, ECAM at `0x40_1000_0000`, RAM at `0x4000_0000`, the DTB loaded at `0x4800_0000`).  `sbsa-ref` is the reference for a STANDARD ARM server: firmware boot (TF-A + EDK2, UEFI), ACPI instead of a device tree, GICv3, devices on PCIe rather than virtio-mmio.  The deliverable is a port that DISCOVERS its board — which is also the precondition for any real phone (§M84) | Platform / Portability | ✅ COMPLETE (DOCS §4.99-§4.102, §4.105): board discovery, GICv3, UEFI + ACPI, relocatable kernel, disk/USB/network, bochs-display, PCI INTx routing (`_PRT` / `interrupt-map`).  Left for later: a real clock on sbsa-ref (UEFI runtime GetTime), a Normal-NC framebuffer mapping |
 | M86 | **Memory beyond the 4 GiB line on i386 and aarch64** — asked for directly (2026-09-25).  x86_64 already discovers its ceiling (§M48, verified to 128 GiB).  i386 manages only what its 1 GiB identity map covers (473 MiB free on a 512 MiB box; RAM past 1 GiB unused) and cannot address physical memory above 4 GiB at all without PAE; aarch64's early MMU identity-maps 0-4 GiB in 1 GiB blocks with RAM from `0x4000_0000`, so at most ~3 GiB is usable and `hal_extend_identity_map` caps at 4 GiB | Memory / Portability | ✅ COMPLETE (highmem §4.94, PAE §4.96, aarch64 TTBR1 §4.97, multi-range DTB §4.98, user no-execute on x86 §4.104).  Kernel pages stay executable (modules run from the heap) |
 | M87 | **Network and storage in the Control Panel** — asked for directly (2026-09-27): a Network page, a taskbar network indicator with a Wi-Fi chooser, disk management with its functions, and the missing translations | UX / Network / Storage | §M87 — ✅ SHIPPED (DOCS §4.103): six-state network status, link state, admin down, static config keys, a simulated Wi-Fi adapter (QEMU has no Wi-Fi), `vfs_umount` + holds, an exFAT formatter (fsck-clean), RAM disks, `locale missing`; open: a real Wi-Fi driver, partition tables, a second virtio disk |
-| M89 | **Java — a JRE, and the JDK with it** — asked for directly (2026-09-28): Alpine's musl-built OpenJDK as a §M73 image on x86_64 + aarch64 (i386: no current JDK exists).  Needs a real address-space layer (reservations, demand-zero, PROT_NONE, lazy file maps), Linux signal delivery with siginfo/ucontext, arm64 threads, and a bulk of small calls | Userland | §M89 — in progress: java -version on x86_64 (DOCS §4.119) |
+| M89 | **Java — a JRE, and the JDK with it** — asked for directly (2026-09-28): Alpine's musl-built OpenJDK as a §M73 image on x86_64 + aarch64 (i386: no current JDK exists).  Needs a real address-space layer (reservations, demand-zero, PROT_NONE, lazy file maps), Linux signal delivery with siginfo/ucontext, arm64 threads, and a bulk of small calls | Userland | §M89 — core done: the JDK runs Hello.java on both 64-bit arches (DOCS §4.119); installer + measurements open |
+| M90 | **Docker itself on d-os** — asked for directly (2026-09-28): "full Docker, not the desktop if it can be left out, but everything else".  The real `docker` CLI, `dockerd`, `containerd` and `runc` (static Go binaries) running on d-os and managing containers.  Needs Linux namespaces, cgroup v2, overlayfs, netlink + veth + bridge networking, mount/pivot_root, capabilities/seccomp, and the Go runtime's own demands | Userland | §M90 — scoped, not started |
 
 ### Cross-cutting constraints
 
@@ -6054,6 +6056,77 @@ virtual-memory system and the signal system as parts of its own machinery.
 not i386.
 
 ---
+
+## §M90 — Docker itself on d-os (no Docker Desktop)
+
+**Status: scoped, not started.  Asked for 2026-09-28: "teljes docker
+futtatása, nem kell desktop, ha kihagyható, de minden más igen".**
+
+### What "full Docker" is, and what it is not
+
+Docker Desktop is a Mac/Windows product that runs a Linux VM so Docker has a
+Linux kernel to talk to — it is exactly the part d-os replaces, so leaving it
+out is not a restriction but the point.  What remains is four Linux programs,
+all statically linked Go binaries: the `docker` CLI, `dockerd` (the Engine
+API), `containerd` (image and container lifecycle) and `runc` (which sets a
+container up with kernel features and execs its first process).  They run
+unmodified under the §M50 Linux personality, the way §M89's JDK does — which
+means d-os must provide the kernel features runc asks for, BY THE LINUX
+INTERFACE, not d-os's own `ctr` model.
+
+### What is missing, measured against the tree (2026-09-28)
+
+1. **The Go runtime.**  Goroutine preemption by SIGURG to a THREAD (§M89's
+   tgkill + interrupt-path delivery cover it), `clone` with the full flag
+   set, `epoll`, `futex`, `mmap` reservations (§M89 rung 1), `sigaltstack`
+   per thread, `rt_sigprocmask` for all 64 signals (done in §M89).  The CLI
+   alone is the first test: `docker version` without a daemon.
+2. **Namespaces** — `clone`/`unshare`/`setns` with CLONE_NEWNS, NEWPID,
+   NEWUTS, NEWIPC, NEWNET, NEWUSER, NEWCGROUP.  d-os has ONE of these in
+   spirit (§M73's per-task root and uid); a mount namespace means a per-task
+   MOUNT TABLE, a PID namespace a second pid numbering.  The largest single
+   piece.
+3. **mount(2) as Linux knows it** — bind mounts, `MS_PRIVATE/SLAVE`
+   propagation (runc sets it), `pivot_root`, `umount2(MNT_DETACH)`, `proc`,
+   `sysfs`, `tmpfs`, `devpts`, `mqueue` filesystem types.
+4. **overlayfs** (Docker's default storage driver; `vfs` driver as the first
+   step — plain copies, no kernel feature needed).
+5. **cgroup v2** — a `cgroup2` filesystem with cpu, memory, pids, io
+   controllers.  §M72's reserves are the enforcement underneath; the
+   filesystem is the interface.
+6. **Networking** — netlink (rtnetlink: links, addresses, routes), `veth`
+   pairs, a bridge, and NAT; or `--network host` / `--bridge=none` first.
+   iptables needs netfilter — the far end.
+7. **The rest of the surface**: capabilities (`capset`/`prctl` bounding
+   set), `seccomp` (runc loads a filter; accepting and not enforcing would be
+   theatre — enforcing a BPF filter is real work), `/proc/self/*` in depth,
+   `/sys/fs/cgroup`, unix sockets with SCM_CREDENTIALS, `openat2`, `statx`,
+   `xattrs`, device nodes (`mknod`), pty (`/dev/ptmx`) for `docker run -it`.
+
+### The estimate, and a route that lands something early
+
+**Larger than §M89, and larger than M21** — it is a second kernel
+personality's worth of subsystems (namespaces, cgroups, overlayfs,
+netlink).  So it is staged so each rung is usable on its own:
+
+1. **The Go runtime + the CLI**: `docker version` (client half).
+2. **dockerd with the most permissive settings**: `--storage-driver=vfs
+   --iptables=false --bridge=none --cgroup-manager=cgroupfs`, host network —
+   needs mount namespaces, pivot_root, a minimal cgroup2 and runc's setup
+   path; `docker run --network host busybox echo hi`.
+3. PID/UTS/IPC namespaces, cgroup limits enforced (`--memory`, `--cpus`).
+4. overlayfs.
+5. Networking: veth + bridge + NAT; `docker run -p 8080:80 nginx`.
+6. `docker build`, `docker run -it` (pty), volumes.
+
+**A cheaper alternative, stated so the choice is conscious:** implement the
+Docker Engine API (a REST protocol over a unix socket) NATIVELY on top of
+§M73's `ctr`, and run only the unmodified `docker` CLI against it.  Every
+`docker` command then works for what `ctr` can do, without namespaces or
+cgroups in the Linux sense — but it is not "Docker running on d-os", and the
+user asked for the real thing.  **The user's reason, worth keeping: real
+Docker updates itself upstream and does not become d-os's burden to
+maintain; a native Engine API would be.  Both may be built.**
 
 ## §M74 — Swap and demand paging: reclaim as a policy, not a favour
 

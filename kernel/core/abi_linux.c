@@ -98,7 +98,7 @@ static const struct abi_nument linux_i386_ents[] = {
     /* §M73 — files and time (i386 numbers; the *64 stat calls are the ones
      * musl uses, with struct stat64). */
     {   5, ABI_OPEN }, { 295, ABI_OPENAT },
-    { 195, ABI_STAT }, { 196, ABI_STAT /* lstat64 */ }, { 197, ABI_FSTAT }, { 300, ABI_FSTATAT },
+    { 195, ABI_STAT }, { 196, ABI_LSTAT /* lstat64 */ }, { 197, ABI_FSTAT }, { 300, ABI_FSTATAT },
     { 220, ABI_GETDENTS64 }, {  55, ABI_FCNTL }, { 221, ABI_FCNTL /* fcntl64 */ },
     {  33, ABI_ACCESS }, { 307, ABI_FACCESSAT }, {  85, ABI_READLINK }, { 305, ABI_READLINKAT },
     { 239, ABI_SENDFILE /* sendfile64 */ }, { 122, ABI_UNAME },
@@ -113,7 +113,7 @@ static const struct abi_nument linux_i386_ents[] = {
     { 158, ABI_SCHED_YIELD }, { 355, ABI_GETRANDOM }, { 219, ABI_MADVISE }, { 375, ABI_MEMBARRIER },
     { 356, ABI_MEMFD_CREATE }, { 218, ABI_MINCORE }, { 242, ABI_SCHED_GETAFFINITY },
     { 241, ABI_SCHED_SETAFFINITY }, { 311, ABI_SET_ROBUST_LIST },
-    { 268, ABI_STATFS64 }, { 269, ABI_FSTATFS64 },
+    { 268, ABI_STATFS64 }, { 269, ABI_FSTATFS64 }, {  83, ABI_SYMLINK }, { 304, ABI_SYMLINKAT },
     { 367, ABI_GETSOCKNAME },
     { 368, ABI_GETPEERNAME },
     { 369, ABI_SENDTO      },
@@ -189,7 +189,7 @@ static const struct abi_nument linux_amd64_ents[] = {
     { 107, ABI_GETEUID }, { 108, ABI_GETEGID }, { 115, ABI_GETGROUPS },
     /* §M73 — files and time (x86_64 numbers). */
     {   2, ABI_OPEN }, { 257, ABI_OPENAT },
-    {   4, ABI_STAT }, {   6, ABI_STAT /* lstat */ }, {   5, ABI_FSTAT }, { 262, ABI_FSTATAT },
+    {   4, ABI_STAT }, {   6, ABI_LSTAT }, {   5, ABI_FSTAT }, { 262, ABI_FSTATAT },
     { 217, ABI_GETDENTS64 }, {  72, ABI_FCNTL },
     {  21, ABI_ACCESS }, { 269, ABI_FACCESSAT }, {  89, ABI_READLINK }, { 267, ABI_READLINKAT },
     {  40, ABI_SENDFILE }, {  63, ABI_UNAME },
@@ -204,7 +204,7 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  24, ABI_SCHED_YIELD }, { 318, ABI_GETRANDOM }, {  28, ABI_MADVISE }, { 324, ABI_MEMBARRIER },
     { 319, ABI_MEMFD_CREATE }, {  77, ABI_FTRUNCATE }, {  27, ABI_MINCORE }, {  17, ABI_PREAD64 },
     {  18, ABI_PWRITE64 }, { 204, ABI_SCHED_GETAFFINITY }, { 203, ABI_SCHED_SETAFFINITY },
-    { 273, ABI_SET_ROBUST_LIST }, { 271, ABI_PPOLL },
+    { 273, ABI_SET_ROBUST_LIST }, { 271, ABI_PPOLL }, {  88, ABI_SYMLINK }, { 266, ABI_SYMLINKAT },
     { 288, ABI_ACCEPT4     },
     /* §M65 — d-os display-bridge op; the SAME number on every guest,
      * because it is ours to choose (Linux has no such call). */
@@ -281,7 +281,7 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 124, ABI_SCHED_YIELD }, { 278, ABI_GETRANDOM }, { 233, ABI_MADVISE }, { 283, ABI_MEMBARRIER },
     { 279, ABI_MEMFD_CREATE }, {  46, ABI_FTRUNCATE }, { 232, ABI_MINCORE }, {  67, ABI_PREAD64 },
     {  68, ABI_PWRITE64 }, { 123, ABI_SCHED_GETAFFINITY }, { 122, ABI_SCHED_SETAFFINITY },
-    {  99, ABI_SET_ROBUST_LIST }, {  73, ABI_PPOLL },
+    {  99, ABI_SET_ROBUST_LIST }, {  73, ABI_PPOLL }, {  36, ABI_SYMLINKAT },
     { 210, ABI_SHUTDOWN    },
     { 242, ABI_ACCEPT4     },
     /* §M65 — d-os display-bridge op; the SAME number on every guest,

@@ -13,8 +13,11 @@ static int dns_name(const char* host, unsigned char* out) {
     int op = 0, lp = 0, ls = 0;
     out[op++] = 0;
     for (const char* c = host; ; c++) {
-        if (*c == '.' || *c == '\0') { out[ls] = (unsigned char)lp; lp = 0; ls = op;
-                                       if (*c == '\0') break; out[op++] = 0; }
+        if (*c == '.' || *c == '\0') {
+            out[ls] = (unsigned char)lp; lp = 0; ls = op;
+            if (*c == '\0') break;
+            out[op++] = 0;
+        }
         else { out[op++] = (unsigned char)*c; lp++; }
     }
     out[op++] = 0;

@@ -56,6 +56,7 @@ enum inode_type {
     INODE_FILE,
     INODE_DIR,
     INODE_DEVICE,
+    INODE_SYMLINK,      /* §M89 — its content is the target path */
 };
 
 /* Open flags.  Mirror the lower bits of POSIX O_* but we own the values. */
@@ -146,6 +147,14 @@ struct inode_ops {
      * image's /bin is one busybox and hundreds of links to it — copies would
      * be hundreds of megabytes. */
     int (*link)(struct inode* dir, const char* name, struct inode* target);
+    /* §M89 — OPTIONAL, APPENDED.  A SYMBOLIC link `name` in `dir` whose
+     * content is `target` (stored verbatim, resolved at use).  NULL =
+     * unsupported (exFAT stores no links).  Needed so an installed program
+     * can be reached as /bin/<name> while it lives, and finds its own files,
+     * under /mnt/apps/<name>/<version>/ — and so a container image's symbolic
+     * links stop being skipped. */
+    int (*symlink)(struct inode* dir, const char* name, const char* target,
+                   struct inode** out);
 };
 
 /* Inode — owned by the fs that created it.  `private` is fs-defined. */
@@ -281,6 +290,15 @@ int     vfs_readdir(struct file* f, struct dirent* out);
  * They dispatch through `parent_inode->dir_ops`. */
 int  vfs_mkdir(const char* path);
 int  vfs_link(const char* oldpath, const char* newpath);   /* §M73 — a hard link */
+/* §M89 — symbolic links.  Every path lookup follows them (up to 40 hops, then
+ * refuses: a loop is an error, not a hang), except the LAST component of the
+ * nofollow forms — what unlink, rename, lstat and readlink operate on is the
+ * link itself.  vfs_realpath gives the fully resolved canonical path (what
+ * /proc/self/exe must report for a program started through a link, or a JDK
+ * started as /bin/java looks for its libraries under /bin/../lib). */
+int  vfs_symlink(const char* target, const char* linkpath);
+int  vfs_readlink(const char* path, char* out, size_t cap);   /* bytes, or <0 */
+int  vfs_realpath(const char* path, char* out, size_t cap);
 int  vfs_create(const char* path);          /* zero-byte regular file */
 
 /* Remove a regular file or an EMPTY directory.  Returns 0 on success,
@@ -332,8 +350,10 @@ int  vfs_permitted(const struct inode* ino, int want);
 int  vfs_chmod(const char* path, uint32_t mode);
 int  vfs_chown(const char* path, int uid, int gid);
 /* §M32 — what `stat` prints. */
-struct vfs_stat { int uid, gid; uint32_t mode; uint64_t size; int is_dir; };
+struct vfs_stat { int uid, gid; uint32_t mode; uint64_t size; int is_dir;
+                  int is_link;              /* §M89 — only vfs_lstat sets it */ };
 int  vfs_stat(const char* path, struct vfs_stat* st);
+int  vfs_lstat(const char* path, struct vfs_stat* st);   /* §M89 — the link itself */
 
 /* One mounted filesystem.  The VFS kept no record of its mounts before §M32,
  * so nothing could answer "which filesystem is this path on" — the question
@@ -399,6 +419,7 @@ struct dentry* vfs_attach_child(struct dentry* parent, const char* name,
 /* Diagnostic — used by the `ls` shell command at root. */
 struct dentry* vfs_root(void);
 struct dentry* vfs_resolve(const char* path);          /* §M73 — from the caller's root */
+struct dentry* vfs_resolve_nofollow(const char* path); /* §M89 — a final link is not followed */
 /* §M73 — `path` made canonical: relative → joined to the caller's working
  * directory, "." / ".." applied, ".." at the root stays there.  0 on success. */
 int vfs_canonical(const char* path, char* out, size_t cap);

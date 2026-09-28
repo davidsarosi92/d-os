@@ -249,6 +249,8 @@ static void syscall_dispatch_body(struct int_frame* f) {
         /* §M73 — directory calls. */
         case SYS_MKDIR:  f->eax = (uint32_t)sys_mkdir((const char*)f->ebx, (int)f->ecx); return;
         case SYS_LINK:   f->eax = (uint32_t)sys_link((const char*)f->ebx, (const char*)f->ecx); return;
+        case SYS_SYMLINK: f->eax = (uint32_t)sys_symlink((const char*)f->ebx, (const char*)f->ecx); return;
+        case SYS_MUNMAP:  f->eax = (uint32_t)sys_munmap((uintptr_t)f->ebx, (size_t)f->ecx); return;
         case SYS_CHMOD:  f->eax = (uint32_t)sys_chmod((const char*)f->ebx, (int)f->ecx); return;
         case SYS_UNLINK: f->eax = (uint32_t)sys_unlink((const char*)f->ebx); return;
 

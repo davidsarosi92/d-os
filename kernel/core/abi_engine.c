@@ -216,6 +216,16 @@ static long abi_stat_path(struct abi_ctx* c, unsigned long upath, unsigned long 
     return abi_put_stat(c, ubuf, &k);
 }
 static long h_stat(struct abi_ctx* c)  { return abi_stat_path(c, c->a[0], c->a[1]); }
+/* §M89 — lstat: the link, not what it names (it used to be served as stat,
+ * which was right only while there were no links). */
+static long abi_lstat_path(struct abi_ctx* c, unsigned long upath, unsigned long ubuf) {
+    char kp[256];
+    if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
+    struct kstat_full k;
+    if (sys_lstat_full_k(kp, &k) != 0) return -ABI_ENOENT;
+    return abi_put_stat(c, ubuf, &k);
+}
+static long h_lstat(struct abi_ctx* c) { return abi_lstat_path(c, c->a[0], c->a[1]); }
 static long h_fstat(struct abi_ctx* c) {
     struct kstat_full k;
     if (sys_fstat_full_k((int)c->a[0], &k) != 0) return -ABI_EBADF;
@@ -232,6 +242,8 @@ static long h_fstatat(struct abi_ctx* c) {
         }
     }
     if ((int)c->a[0] != AT_FDCWD_) return -ABI_ENOSYS;
+    if (c->a[3] & 0x100)                          /* AT_SYMLINK_NOFOLLOW (§M89) */
+        return abi_lstat_path(c, c->a[1], c->a[2]);
     return abi_stat_path(c, c->a[1], c->a[2]);
 }
 static long h_getdents64(struct abi_ctx* c) {
@@ -295,9 +307,14 @@ static int proc_exe_of(const char* p, char* out, unsigned cap) {
 static long abi_readlink_path(unsigned long upath, unsigned long ubuf, unsigned long size) {
     char kp[256];
     if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
-    char tgt[128];
+    char tgt[256];
     int n = proc_exe_of(kp, tgt, sizeof tgt);
     if (n == -2) return -ABI_ENOENT;
+    if (n == -1) {                                        /* §M89 — a real link? */
+        n = vfs_readlink(kp, tgt, sizeof tgt);
+        if (n == -1) return -ABI_ENOENT;
+        if (n == -2) return -ABI_EINVAL;                  /* exists, not a link */
+    }
     if (n >= 0) {
         if ((long)size <= 0) return -ABI_EINVAL;
         unsigned long m = (unsigned long)n < size ? (unsigned long)n : size;
@@ -305,11 +322,27 @@ static long abi_readlink_path(unsigned long upath, unsigned long ubuf, unsigned 
         for (unsigned long i = 0; i < m; i++) ((char*)(uintptr_t)ubuf)[i] = tgt[i];
         return (long)m;
     }
-    struct kstat_full k;
-    return sys_stat_full_k(kp, &k) == 0 ? -ABI_EINVAL : -ABI_ENOENT;
+    return -ABI_ENOENT;
 }
 static long h_readlink(struct abi_ctx* c)   { return abi_readlink_path(c->a[0], c->a[1], c->a[2]); }
 static long h_readlinkat(struct abi_ctx* c) { return abi_readlink_path(c->a[1], c->a[2], c->a[3]); }
+
+/* §M89 — symlink(target, linkpath) / symlinkat(target, dirfd, linkpath). */
+static long abi_symlink(unsigned long utarget, unsigned long ulink) {
+    char t[256], l[256];
+    if (abi_path(utarget, t, sizeof t) != 0 || abi_path(ulink, l, sizeof l) != 0) return -ABI_EFAULT;
+    int r = vfs_symlink(t, l);
+    if (r == 0) return 0;
+    if (r == -2) return -17;                              /* EEXIST */
+    if (r == -3) return -1;                               /* EPERM: this fs has no links */
+    if (r == -5) return -13;                              /* EACCES */
+    return -ABI_ENOENT;
+}
+static long h_symlink(struct abi_ctx* c)   { return abi_symlink(c->a[0], c->a[1]); }
+static long h_symlinkat(struct abi_ctx* c) {
+    if ((int)c->a[1] != AT_FDCWD_) return -ABI_ENOSYS;
+    return abi_symlink(c->a[0], c->a[2]);
+}
 
 /* sendfile(out, in, off*, count) — a read/write loop through a kernel buffer.
  * With an offset the input's own cursor is left untouched (seek, copy, seek
@@ -1580,6 +1613,9 @@ static const struct {
     [ABI_SET_ROBUST_LIST]   = { "set_robust_list",   h_set_robust_list   },
     [ABI_PPOLL]         = { "ppoll",        h_ppoll         },
     [ABI_STATFS64]      = { "statfs64",     h_statfs64      },
+    [ABI_LSTAT]         = { "lstat",        h_lstat         },
+    [ABI_SYMLINK]       = { "symlink",      h_symlink       },
+    [ABI_SYMLINKAT]     = { "symlinkat",    h_symlinkat     },
     [ABI_FSTATFS64]     = { "fstatfs64",    h_fstatfs64     },
     [ABI_OPEN]         = { "open",         h_open         },
     [ABI_OPENAT]       = { "openat",       h_openat       },

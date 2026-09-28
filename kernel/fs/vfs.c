@@ -53,6 +53,11 @@ struct dentry* vfs_root(void) { return root; }
 static struct dentry* resolve_path(const char* path, struct dentry** out_parent,
                                    const char** out_last_name);
 struct dentry* vfs_resolve(const char* path);
+static struct dentry* resolve_path_ex(const char* path, struct dentry** out_parent,
+                                      const char** out_last_name, int follow_last);
+struct dentry* vfs_resolve_nofollow(const char* path) {
+    return resolve_path_ex(path, NULL, NULL, 0);
+}
 struct dentry* vfs_resolve(const char* path) {
     return resolve_path(path, NULL, NULL);
 }
@@ -238,22 +243,113 @@ int vfs_canonical(const char* path, char* out, size_t cap) {
     return 0;
 }
 
+/* §M89 — the target a symbolic link holds, NUL-terminated.  -1 if `d` is not
+ * a link or cannot be read. */
+static int link_target(struct dentry* d, char* out, size_t cap) {
+    if (!d || !d->inode || d->inode->type != INODE_SYMLINK || !d->inode->ops ||
+        !d->inode->ops->read || cap < 2)
+        return -1;
+    struct file tmp = { d->inode, d, 0, 0, 0 };
+    ssize_t n = d->inode->ops->read(&tmp, out, cap - 1, 0);
+    if (n <= 0) return -1;
+    out[n] = 0;
+    return (int)n;
+}
+
+/* §M89 — rewrite a CANONICAL absolute path so that it contains no symbolic
+ * link (the last component excepted when !follow_last).  Textual, one link at
+ * a time, re-canonicalising after each splice: an absolute target restarts
+ * from this task's "/" (so a link inside a container resolves inside the
+ * container, as chroot requires), a relative one is taken from the link's own
+ * directory.  A component that does not exist ends the walk — the rest cannot
+ * contain a link, and a create needs exactly that path.  40 hops, then NULL:
+ * a loop is refused, never followed forever. */
+static const char* expand_links(const char* path, char* buf, size_t cap, int follow_last) {
+    char a[256], t[256], b[512];
+    size_t n = strlen_(path);
+    if (n + 1 > sizeof a) return NULL;
+    memcpy_(a, path, n + 1);
+    struct dentry* base = cred_fs_root();
+    if (!base) base = root;
+    for (int hops = 0; hops <= 40; hops++) {
+        struct dentry* cur = base;
+        const char* p = a + 1;
+        int spliced = 0;
+        while (*p) {
+            const char* slash = p;
+            while (*slash && *slash != '/') slash++;
+            size_t len = (size_t)(slash - p);
+            int last = (*slash == 0);
+            struct dentry* d = lookup_child(cur, p, len);
+            if (!d) break;
+            if (d->inode && d->inode->type == INODE_SYMLINK && (!last || follow_last)) {
+                if (link_target(d, t, sizeof t) < 0) return NULL;
+                size_t o = 0;
+                if (t[0] != '/') {                    /* relative: the link's directory */
+                    size_t pre = (size_t)(p - a);     /* "/dir/.../" including the slash */
+                    memcpy_(b, a, pre); o = pre;
+                }
+                size_t tl = strlen_(t);
+                memcpy_(b + o, t, tl); o += tl;
+                size_t rl = strlen_(slash);
+                if (o + rl + 1 > sizeof b) return NULL;
+                memcpy_(b + o, slash, rl + 1);
+                char c2[256];
+                const char* cc = vfs_canon(b, c2, sizeof c2);
+                if (!cc) return NULL;
+                size_t cl = strlen_(cc);
+                if (cl + 1 > sizeof a) return NULL;
+                memcpy_(a, cc, cl + 1);
+                spliced = 1;
+                break;
+            }
+            if (last) break;
+            if (!d->inode || d->inode->type != INODE_DIR) break;
+            cur = d;
+            p = slash + 1;
+        }
+        if (!spliced) {
+            size_t al = strlen_(a);
+            if (al + 1 > cap) return NULL;
+            memcpy_(buf, a, al + 1);
+            return buf;
+        }
+    }
+    return NULL;                                      /* ELOOP */
+}
+
+static struct dentry* resolve_path_ex(const char* path, struct dentry** out_parent,
+                                      const char** out_last_name, int follow_last);
 static struct dentry* resolve_path(const char* path,
                                    struct dentry** out_parent,
                                    const char**    out_last_name) {
+    return resolve_path_ex(path, out_parent, out_last_name, 1);
+}
+
+static struct dentry* resolve_path_ex(const char* path,
+                                      struct dentry** out_parent,
+                                      const char**    out_last_name,
+                                      int             follow_last) {
     if (!path || !path[0]) return NULL;
     /* §M73 — relative paths and dot components, made canonical first.  When
      * that rewrote the path, *out_last_name would point into this frame's
      * buffer, so it is reported only as "there is a last name" (the one caller
      * that asks, vfs_open, uses it for exactly that). */
-    char cb[256];
+    char cb[256], eb[256];
     const char* orig = path;
     path = vfs_canon(path, cb, sizeof cb);
     if (!path || path[0] != '/') return NULL;
+    /* §M89 — symbolic links, spliced out before the walk. */
+    {
+        const char* ex = expand_links(path, eb, sizeof eb, follow_last);
+        if (!ex) return NULL;
+        size_t a = strlen_(ex), b = strlen_(path);
+        if (a != b || !streq_n(ex, path, a)) path = ex;
+    }
     if (path != orig && out_last_name) {
-        /* the canonical path is absolute and dot-free, so this call takes the
-         * fast branch and does not come back here */
-        struct dentry* r = resolve_path(path, out_parent, NULL);
+        /* the canonical, link-free path takes the fast branch below when it
+         * comes back here (expanding it again finds nothing to splice) */
+        struct dentry* r = resolve_path_ex(path, out_parent, NULL, follow_last);
         *out_last_name = (out_parent && *out_parent) ? "" : NULL;
         return r;
     }
@@ -990,7 +1086,70 @@ static int vfs_stat_unlocked(const char* path, struct vfs_stat* st) {
 }
 int vfs_stat(const char* path, struct vfs_stat* st) {
     if (!st) return -1;
+    st->is_link = 0;
     return NS_LOCKED(int, vfs_stat_unlocked(path, st));
+}
+
+/* ---- §M89 — symbolic links -------------------------------------------------- */
+
+static int vfs_lstat_unlocked(const char* path, struct vfs_stat* st) {
+    struct dentry* d = resolve_path_ex(path, NULL, NULL, 0);
+    if (!d || !d->inode) return -1;
+    st->uid  = d->inode->owner_uid;
+    st->gid  = d->inode->owner_gid;
+    st->mode = d->inode->mode;
+    st->size = d->inode->size;
+    st->is_dir  = d->inode->type == INODE_DIR;
+    st->is_link = d->inode->type == INODE_SYMLINK;
+    return 0;
+}
+int vfs_lstat(const char* path, struct vfs_stat* st) {
+    if (!st) return -1;
+    return NS_LOCKED(int, vfs_lstat_unlocked(path, st));
+}
+
+static int vfs_readlink_unlocked(const char* path, char* out, size_t cap) {
+    struct dentry* d = resolve_path_ex(path, NULL, NULL, 0);
+    if (!d || !d->inode) return -1;                         /* ENOENT */
+    if (d->inode->type != INODE_SYMLINK) return -2;          /* EINVAL: not a link */
+    return link_target(d, out, cap);
+}
+int vfs_readlink(const char* path, char* out, size_t cap) {
+    return NS_LOCKED(int, vfs_readlink_unlocked(path, out, cap));
+}
+
+static int vfs_realpath_unlocked(const char* path, char* out, size_t cap) {
+    char cb[256];
+    const char* c = vfs_canon(path, cb, sizeof cb);
+    if (!c) return -1;
+    return expand_links(c, out, cap, 1) ? 0 : -1;
+}
+int vfs_realpath(const char* path, char* out, size_t cap) {
+    if (!path || !*path || !out) return -1;
+    return NS_LOCKED(int, vfs_realpath_unlocked(path, out, cap));
+}
+
+static int vfs_symlink_unlocked(const char* target, const char* linkpath) {
+    if (!target || !*target || strlen_(target) >= 255) return -1;
+    char buf[256];
+    const char* last;
+    if (split_parent(linkpath, buf, sizeof buf, &last) != 0 || !*last) return -1;
+    if (strlen_(last) > VFS_NAME_MAX) return -1;
+    struct dentry* parent = resolve_path(buf, NULL, NULL);
+    if (!parent || !parent->inode || parent->inode->type != INODE_DIR) return -1;
+    if (!parent->inode->dir_ops || !parent->inode->dir_ops->symlink) return -3;   /* EPERM: fs has none */
+    if (!vfs_permitted(parent->inode, VFS_PERM_WRITE)) return -5;
+    for (struct dentry* c = parent->children; c; c = c->sibling)
+        if (streq(c->name, last)) return -2;                                     /* EEXIST */
+    struct inode* ino = NULL;
+    if (parent->inode->dir_ops->symlink(parent->inode, last, target, &ino) != 0 || !ino) return -1;
+    const struct cred* cr = cred_current();
+    if (cr->owner == TASK_OWNER_USER) { ino->owner_uid = cred_uid(cr); ino->owner_gid = cred_gid(cr); }
+    ino->mode = 0777;                                      /* a link's own bits mean nothing */
+    return vfs_attach_child_unlocked(parent, last, ino) ? 0 : -1;
+}
+int vfs_symlink(const char* target, const char* linkpath) {
+    return NS_LOCKED(int, vfs_symlink_unlocked(target, linkpath));
 }
 
 int vfs_chown(const char* path, int uid, int gid) {

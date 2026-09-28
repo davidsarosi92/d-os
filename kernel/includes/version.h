@@ -17,7 +17,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define DOS_MILESTONE "M88"
+#define DOS_MILESTONE "M89"
 
 /* An OLDER section completed after that number shipped.  Empty ("") when there
  * is nothing to say — and it must be CLEARED when the next numbered milestone

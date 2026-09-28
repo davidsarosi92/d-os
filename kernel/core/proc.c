@@ -543,7 +543,9 @@ int proc_execve_env(const char* path, char* const uargv[], char* const uenvp[]) 
      * resolves "..", within this task's root).  Computed now, COMMITTED at the
      * point of no return below, so a failed exec keeps the old name. */
     char new_exe[sizeof me->cred.exe];
-    if (vfs_canonical(kpath, new_exe, sizeof new_exe) != 0) new_exe[0] = 0;
+    /* §M89 — the RESOLVED path: started through /bin/java, a JDK must see its
+     * real home, or it looks for its libraries under /bin/../lib. */
+    if (vfs_realpath(kpath, new_exe, sizeof new_exe) != 0) new_exe[0] = 0;
 
     /* §M32 stage 6 — THE EXECUTE BIT, AND THIS IS THE ONLY PLACE IT CAN LIVE.
      *

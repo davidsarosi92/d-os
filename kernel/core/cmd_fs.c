@@ -40,6 +40,15 @@ static void cmd_ls(const char* path) {
     struct dirent de;
     int n;
     while ((n = vfs_readdir(f, &de)) > 0) {
+        if (de.type == INODE_SYMLINK) {                  /* §M89 — show where it points */
+            char full[256], tgt[256];
+            int k = 0;
+            for (const char* q = path; *q && k < 200; q++) full[k++] = *q;
+            if (k && full[k - 1] != '/') full[k++] = '/';
+            for (const char* q = de.name; *q && k < 254; q++) full[k++] = *q;
+            full[k] = 0;
+            if (vfs_readlink(full, tgt, sizeof tgt) >= 0) { kprintf("  %s -> %s\n", de.name, tgt); continue; }
+        }
         const char* tag = (de.type == INODE_DIR) ? "/" : "";
         /* size is uint64_t; our kprintf doesn't speak %llu so truncate
          * for display — files >4 GiB will misprint until printf grows. */
@@ -47,6 +56,28 @@ static void cmd_ls(const char* path) {
     }
     if (n < 0) kprintf("ls: readdir failed\n");
     vfs_close(f);
+}
+
+/* §M89 — `ln -s <target> <link>` makes a symbolic link, `ln <file> <link>` a
+ * hard one (same filesystem only). */
+static void cmd_ln(const char* args) {
+    int sym = 0;
+    while (*args == ' ') args++;
+    if (args[0] == '-' && args[1] == 's' && (args[2] == ' ' || !args[2])) { sym = 1; args += 2; }
+    while (*args == ' ') args++;
+    char a[256], b[256];
+    int i = 0;
+    while (*args && *args != ' ' && i < 255) a[i++] = *args++;
+    a[i] = 0;
+    while (*args == ' ') args++;
+    i = 0;
+    while (*args && *args != ' ' && i < 255) b[i++] = *args++;
+    b[i] = 0;
+    if (!a[0] || !b[0]) { console_write("ln: usage: ln [-s] <target> <link>\n"); return; }
+    int r = sym ? vfs_symlink(a, b) : vfs_link(a, b);
+    if (r == 0) return;
+    kprintf("ln: %s: %s\n", b, r == -2 ? "exists" : r == -3 ? "this filesystem stores no links"
+                                   : r == -5 ? "permission denied" : "failed");
 }
 
 static void cmd_cat(const char* path) {
@@ -250,6 +281,7 @@ SHELL_CMD(mkdir) = { "mkdir", "<path>",            "create a directory",      SH
 SHELL_CMD(touch) = { "touch", "<path>",            "create an empty file",    SHELL_G_FS, cmd_touch, SHELL_P_ANY };
 SHELL_CMD(write) = { "write", "<path> <text>",     "write text to a file",    SHELL_G_FS, cmd_write, SHELL_P_ANY };
 SHELL_CMD(mount) = { "mount", "<fs> <path> [dev]", "mount a filesystem",      SHELL_G_FS, cmd_mount, SHELL_P_ADMIN };
+SHELL_CMD(ln)    = { "ln",    "[-s] <target> <link>", "make a link (-s: symbolic)", SHELL_G_FS, cmd_ln, SHELL_P_ANY };
 SHELL_CMD(cp)    = { "cp",    "<src> <dst>",       "copy a file",             SHELL_G_FS, cmd_cp, SHELL_P_ANY };
 SHELL_CMD(rm)    = { "rm",    "[-r] <path>",       "remove a file or a tree", SHELL_G_FS, cmd_rm, SHELL_P_ANY };
 SHELL_CMD(mv)    = { "mv",    "<src> <dst>",       "rename a file",           SHELL_G_FS, cmd_mv, SHELL_P_ANY };

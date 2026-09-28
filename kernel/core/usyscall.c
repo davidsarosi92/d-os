@@ -478,6 +478,12 @@ int sys_link(const char* uold, const char* unew) {
         strncpy_from_user(kn, unew, sizeof kn) < 0) return -1;
     return vfs_link(ko, kn);
 }
+int sys_symlink(const char* utarget, const char* ulink) {
+    char kt[256], kl[256];
+    if (!utarget || !ulink || strncpy_from_user(kt, utarget, sizeof kt) < 0 ||
+        strncpy_from_user(kl, ulink, sizeof kl) < 0) return -1;
+    return vfs_symlink(kt, kl);
+}
 int sys_chmod(const char* upath, int mode) {
     char kp[256];
     if (!upath || strncpy_from_user(kp, upath, sizeof kp) < 0) return -1;
@@ -780,7 +786,9 @@ static void stat_full_of(const struct inode* in, struct kstat_full* o) {
     o->nlink = in->type == INODE_DIR ? 2 : 1;          /* ramfs keeps the true count private */
     uint32_t perm = in->mode ? (in->mode & 07777u) : (in->type == INODE_DIR ? 0755u : 0644u);
     uint32_t fmt  = in->type == INODE_DIR ? KS_IFDIR
-                  : in->type == INODE_DEVICE ? KS_IFCHR : KS_IFREG;
+                  : in->type == INODE_DEVICE ? KS_IFCHR
+                  : in->type == INODE_SYMLINK ? KS_IFLNK : KS_IFREG;
+    if (in->type == INODE_SYMLINK) perm = 0777u;
     o->mode = fmt | perm;
     o->uid  = in->owner_uid < 0 ? 0 : in->owner_uid;
     o->gid  = in->owner_gid < 0 ? 0 : in->owner_gid;
@@ -788,6 +796,14 @@ static void stat_full_of(const struct inode* in, struct kstat_full* o) {
 int sys_stat_full_k(const char* kpath, struct kstat_full* out) {
     if (!kpath || !out) return -1;
     struct dentry* d = vfs_resolve(kpath);
+    if (!d || !d->inode) return -1;
+    stat_full_of(d->inode, out);
+    return 0;
+}
+/* §M89 — lstat: the link itself when the last component is one. */
+int sys_lstat_full_k(const char* kpath, struct kstat_full* out) {
+    if (!kpath || !out) return -1;
+    struct dentry* d = vfs_resolve_nofollow(kpath);
     if (!d || !d->inode) return -1;
     stat_full_of(d->inode, out);
     return 0;
@@ -907,7 +923,8 @@ long sys_getdents64_k(int fd, void* buf, size_t cap) {
         r[16] = (uint8_t)(reclen & 0xFF);                                        /* d_reclen */
         r[17] = (uint8_t)(reclen >> 8);
         r[18] = (de.type == INODE_DIR) ? 4 :                                     /* DT_DIR  */
-                (de.type == INODE_DEVICE) ? 2 : 8;                               /* DT_CHR/DT_REG */
+                (de.type == INODE_DEVICE) ? 2 :                                  /* DT_CHR  */
+                (de.type == INODE_SYMLINK) ? 10 : 8;                             /* DT_LNK / DT_REG */
         for (int i = 0; i < nlen; i++) r[19 + i] = (uint8_t)de.name[i];          /* d_name  */
         r[19 + nlen] = 0;
         used += reclen;

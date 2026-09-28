@@ -93,6 +93,8 @@
 #define SYS_LINK         49     /* (old, new) → 0 / <0 — a hard link            */
 #define SYS_CHMOD        50     /* (path, mode) → 0 / <0                        */
 #define SYS_UNLINK       51     /* (path) → 0 / <0                              */
+#define SYS_SYMLINK      52     /* (target, linkpath) → 0 / <0 — §M89           */
+#define SYS_MUNMAP       53     /* (addr, len) → 0 / <0 — §M89                  */
 
 /* §M65 — THE DISPLAY BRIDGE, reachable from BOTH personalities under ONE
  * number space.  These are d-os operations (Linux has no such calls), so the
@@ -228,6 +230,7 @@ long sys_mmap (size_t len, int fd);     /* map anon (fd<0) or a memfd's frames *
 long sys_munmap(uintptr_t addr, size_t len);   /* §M74 */
 int  sys_mkdir(const char* upath, int mode);   /* §M73 */
 int  sys_link(const char* uold, const char* unew);
+int  sys_symlink(const char* utarget, const char* ulink);      /* §M89 */
 int  sys_chmod(const char* upath, int mode);
 int  sys_unlink(const char* upath);
 long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
@@ -334,11 +337,13 @@ struct kstat_full {
 };
 #define KS_IFMT   0170000u
 #define KS_IFSOCK 0140000u
+#define KS_IFLNK  0120000u      /* §M89 */
 #define KS_IFREG  0100000u
 #define KS_IFDIR  0040000u
 #define KS_IFCHR  0020000u
 #define KS_IFIFO  0010000u
 int  sys_stat_full_k(const char* kpath, struct kstat_full* out);   /* -1: none */
+int  sys_lstat_full_k(const char* kpath, struct kstat_full* out);  /* §M89 */
 int  sys_fstat_full_k(int fd, struct kstat_full* out);             /* -1: EBADF */
 int  sys_fstat_k(int fd, struct kstat* out);
 int  sys_clock_gettime_k(int which, struct ktimespec* out);

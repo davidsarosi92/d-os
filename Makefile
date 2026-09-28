@@ -694,6 +694,7 @@ CORE_C_SRCS := \
     kernel/core/cmd_pci.c \
     kernel/core/cmd_task.c \
     kernel/core/container.c \
+    kernel/core/apps.c \
     kernel/core/cmd_sys.c \
     kernel/core/cmd_desktop.c \
     kernel/core/cmd_pkg.c \
@@ -943,6 +944,7 @@ CORE_C_SRCS := \
     kernel/core/cmd_pci.c \
     kernel/core/cmd_task.c \
     kernel/core/container.c \
+    kernel/core/apps.c \
     kernel/core/cmd_sys.c \
     kernel/core/cmd_desktop.c \
     kernel/core/cmd_pkg.c \
@@ -1049,6 +1051,7 @@ CORE_C_SRCS := \
     kernel/core/cmd_pci.c \
     kernel/core/cmd_task.c \
     kernel/core/container.c \
+    kernel/core/apps.c \
     kernel/core/cmd_sys.c \
     kernel/core/cmd_desktop.c \
     kernel/core/cmd_pkg.c \

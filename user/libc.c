@@ -95,6 +95,7 @@ long  read (int fd, void* buf, size_t n)       { return syscall3(SYS_READ,  fd, 
 int   open (const char* path, int flags)       { return (int)syscall3(SYS_OPEN, (long)path, flags, 0); }
 int   close(int fd)                            { return (int)syscall3(SYS_CLOSE, fd, 0, 0); }
 void  exit (int code)                          { syscall3(SYS_EXIT, code, 0, 0); for (;;) {} }
+int   munmap(void* addr, size_t len)          { return (int)syscall3(53 /* SYS_MUNMAP */, (long)addr, (long)len, 0); }
 void* mmap (size_t len, int fd)                { long r = syscall3(SYS_MMAP, (long)len, fd, 0);
                                                  return (r <= 0) ? (void*)0 : (void*)r; }
 int   getpid(void)                             { return (int)syscall3(SYS_GETPID, 0, 0, 0); }

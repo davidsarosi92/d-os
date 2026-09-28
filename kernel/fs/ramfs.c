@@ -131,7 +131,7 @@ static int rfs_unlink_op(struct inode* dir, const char* name,
                          struct inode* child) {
     (void)dir; (void)name;           /* emptiness checked by vfs_unlink */
     if (!child) return -1;
-    if (child->type == INODE_FILE) {
+    if (child->type == INODE_FILE || child->type == INODE_SYMLINK) {
         struct ramfs_file* rf = (struct ramfs_file*)child->private;
         /* §M73 — another name still points here: only this one goes. */
         if (rf && rf->nlink > 1) { rf->nlink--; return 0; }
@@ -161,6 +161,29 @@ static int rfs_link_op(struct inode* dir, const char* name, struct inode* target
     return 0;
 }
 
+static ssize_t rfs_write(struct file* f, const void* buf, size_t n, uint64_t off);
+
+/* §M89 — a symbolic link is a small file holding its target, typed so the
+ * VFS knows to follow it.  Written through the ordinary write path, so its
+ * storage and its freeing are exactly a file's. */
+static int rfs_symlink_op(struct inode* dir, const char* name, const char* target,
+                          struct inode** out) {
+    (void)dir; (void)name;
+    struct inode* ino = ramfs_alloc_inode(INODE_FILE);
+    if (!ino) return -1;
+    size_t n = 0;
+    while (target[n]) n++;
+    struct file tmp = { ino, NULL, 0, 0, 0 };
+    if (rfs_write(&tmp, target, n, 0) != (ssize_t)n) {
+        struct ramfs_file* rf = (struct ramfs_file*)ino->private;
+        rfs_free_pages(rf); kfree(rf); kfree(ino);
+        return -1;
+    }
+    ino->type = INODE_SYMLINK;
+    *out = ino;
+    return 0;
+}
+
 static const struct inode_ops ramfs_inode_ops = {
     .lookup = NULL,                  /* eager tree */
     .create = rfs_create_op,
@@ -168,6 +191,7 @@ static const struct inode_ops ramfs_inode_ops = {
     .unlink = rfs_unlink_op,         /* M22.1 — file manager Delete */
     .rename = rfs_rename_op,         /* M22.5 — file manager Rename */
     .link   = rfs_link_op,           /* §M73 — hard links */
+    .symlink = rfs_symlink_op,       /* §M89 — symbolic links */
 };
 
 /* ------------------------------------------------------------------- */

@@ -35,6 +35,15 @@ a real Wi-Fi driver, and the rows under "Known defects — Open".
 
 ## Queued from use (2026-09-28) — after §M89
 
+- **§M90 — Docker itself on d-os** (asked 2026-09-28: the real CLI, dockerd,
+  containerd, runc; Docker Desktop not needed).  Scoped in PLAN §M90: larger
+  than §M89 (namespaces, cgroup v2, overlayfs, netlink networking, the Go
+  runtime), staged so `docker version` and `docker run --network host` land
+  early.  **Order decided (2026-09-28): AFTER the open items.  Planned for
+  Thursday evening; possibly both routes (real dockerd AND a native Engine API
+  over ctr).  The user leans to the real Docker because it updates itself
+  upstream and does not become d-os's maintenance burden.**
+
 - **DECIDED (2026-09-28): Java is INSTALLED SOFTWARE, not a container.**  The
   user's direction: install once, it stays, it is listed among installed
   software, updates go the same way, executables reachable through PATH.

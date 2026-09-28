@@ -59,6 +59,7 @@ static int k_mkdir(const char* p, int mode)        { return (int)dos_syscall3(48
 static int k_link (const char* o, const char* n)   { return (int)dos_syscall3(49, (long)o, (long)n, 0); }
 static int k_chmod(const char* p, int mode)        { return (int)dos_syscall3(50, (long)p, mode, 0); }
 static int k_unlink(const char* p)                 { return (int)dos_syscall3(51, (long)p, 0, 0); }
+static int k_symlink(const char* t, const char* p) { return (int)dos_syscall3(52, (long)t, (long)p, 0); }
 
 /* ---- small string helpers ------------------------------------------------- */
 static int memcmp_(const char* a, const char* b, unsigned n) {
@@ -391,8 +392,11 @@ static unsigned char* gunzip(const unsigned char* g, unsigned glen, unsigned* ou
      * 20:1; 1 GiB is the ceiling whatever the ratio. */
     if (isize > (64u << 20) && (isize / 20u > glen || isize > (1024u << 20)))
         return 0;
-    unsigned char* out = (unsigned char*)malloc(isize + 1);
-    if (!out) return 0;
+    /* A mapping of its own, not the bump heap (which never frees): the caller
+     * gives it back after extracting, so a JDK's five layers are not all
+     * resident at once (§M89). */
+    unsigned char* out = (unsigned char*)mmap(isize + 1, -1);
+    if (!out || (long)out == -1) return 0;
     unsigned got = 0;
     if (inflate(g + p, glen - 8 - p, out, isize, &got) != 0 || got != isize) return 0;
     if (crc32(out, got) != want_crc) return 0;
@@ -402,6 +406,25 @@ static unsigned char* gunzip(const unsigned char* g, unsigned glen, unsigned* ou
 
 /* ---- extraction ------------------------------------------------------------ */
 static char g_root[128];
+/* §M89 — extract only the entries under this prefix (no leading "/", no
+ * trailing one), with the prefix REMOVED: "opt/java/openjdk/bin/java" lands
+ * at <root>/bin/java.  Empty = the whole image.  How an application is
+ * installed as software rather than run as a container: only its own tree
+ * is wanted, straight onto the persistent disk. */
+static char g_prefix[128];
+
+/* `name` with a leading "./" or "/" dropped; with a prefix set, the rest
+ * after it, "" for the prefix directory itself, NULL when outside it. */
+static const char* in_prefix(const char* name) {
+    while (name[0] == '.' && name[1] == '/') name += 2;
+    while (name[0] == '/') name++;
+    if (!g_prefix[0]) return name;
+    unsigned n = 0;
+    while (g_prefix[n]) { if (name[n] != g_prefix[n]) return 0; n++; }
+    if (name[n] == 0) return "";
+    if (name[n] == '/') return name + n + 1;
+    return 0;
+}
 static unsigned n_files, n_dirs, n_links, n_symlinks, n_symlink_skipped, n_other, n_whiteout;
 
 static void join(char* out, unsigned cap, const char* rel) {
@@ -503,6 +526,24 @@ static void extract_layer(const unsigned char* t, unsigned len) {
         }
         if (type == 'g') continue;
 
+        /* §M89 — only the chosen subtree, with its prefix removed. */
+        if (g_prefix[0]) {
+            const char* r = in_prefix(name);
+            if (!r) continue;
+            char tmp[256]; tmp[0] = 0; scat(tmp, r, sizeof tmp);
+            name[0] = 0; scat(name, tmp[0] ? tmp : ".", sizeof name);
+            if (type == '1') {                         /* a hard link's target moves too */
+                const char* lr = in_prefix(link);
+                if (!lr) { n_other++; continue; }      /* points outside the subtree */
+                char lt[101]; lt[0] = 0; scat(lt, lr, sizeof lt);
+                link[0] = 0; scat(link, lt, sizeof link);
+            } else if (type == '2' && link[0] == '/') {
+                const char* lr = in_prefix(link);      /* an absolute link INTO the tree */
+                if (lr) { char lt[101]; lt[0] = 0; scat(lt, g_root, sizeof lt); scat(lt, "/", sizeof lt);
+                          scat(lt, lr, sizeof lt); link[0] = 0; scat(link, lt, sizeof link); }
+            }
+        }
+
         /* whiteouts */
         const char* base = name; for (const char* c = name; *c; c++) if (*c == '/' && c[1]) base = c + 1;
         if (starts(base, ".wh.")) {
@@ -530,9 +571,15 @@ static void extract_layer(const unsigned char* t, unsigned len) {
             if (k_link(tgt, path) == 0) n_links++;
             else printf("ociunpack: could not link %s -> %s\n", path, tgt);
         } else if (type == '2') {
+            k_unlink(path);
+            /* §M89 — a REAL symbolic link, holding the image's own text: an
+             * absolute target resolves against the container's "/" when used
+             * from inside it, exactly as in the image.  Only a filesystem that
+             * stores no links (exFAT) gets the old approximation: a hard link
+             * when the target is an existing file, otherwise skipped. */
+            if (k_symlink(link, path) == 0) { n_symlinks++; continue; }
             char tgt[256]; resolve_link(name, link, tgt, sizeof tgt);
             struct stat st;
-            k_unlink(path);
             if (stat(tgt, &st) == 0 && st.type == 0 && k_link(tgt, path) == 0) n_symlinks++;
             else n_symlink_skipped++;
         } else n_other++;
@@ -574,11 +621,19 @@ static void write_config(const char* out, const char* cfg, unsigned n) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 4) die("usage: ociunpack <archive.tar> <rootfs-dir> <config-out>");
+    if (argc < 4) die("usage: ociunpack <archive.tar> <rootfs-dir|-> <config-out> [subtree]");
     g_tar = slurp(argv[1], &g_tarlen);
     if (!g_tar) die("cannot read the archive");
+    int config_only = streq(argv[2], "-");            /* §M89 — only image.conf */
     g_root[0] = 0; scat(g_root, argv[2], sizeof g_root);
-    k_mkdir(g_root, 0755);
+    if (argc > 4) {
+        const char* pf = argv[4];
+        while (*pf == '/') pf++;
+        g_prefix[0] = 0; scat(g_prefix, pf, sizeof g_prefix);
+        unsigned pl = (unsigned)strlen(g_prefix);
+        while (pl && g_prefix[pl - 1] == '/') g_prefix[--pl] = 0;
+    }
+    if (!config_only) k_mkdir(g_root, 0755);
 
     unsigned n;
     const char* idx = (const char*)tar_find(g_tar, g_tarlen, "index.json", &n);
@@ -629,7 +684,7 @@ int main(int argc, char** argv) {
     if (!ly || *ly != '[') die("no layers in the manifest");
     const char* le = match_close(ly, be);
     int nl = 0;
-    for (const char* p = ly + 1; p < le; ) {
+    for (const char* p = ly + 1; !config_only && p < le; ) {
         while (p < le && *p != '{') p++;
         if (p >= le) break;
         const char* oe = match_close(p, le);
@@ -645,6 +700,7 @@ int main(int argc, char** argv) {
             if (!t) { printf("ociunpack: layer %s does not decompress cleanly - refused\n", ld); exit(1); }
         }
         extract_layer(t, tl);
+        if (t != z) munmap((void*)t, tl + 1);   /* one layer at a time, not all of them at once */
         nl++;
         p = oe;
     }

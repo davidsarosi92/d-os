@@ -305,6 +305,8 @@ static void syscall_dispatch_body(struct int_frame* f) {
         /* §M73 — directory calls. */
         case SYS_MKDIR:  f->rax = (uint64_t)(int64_t)sys_mkdir((const char*)(uintptr_t)f->rbx, (int)f->rcx); return;
         case SYS_LINK:   f->rax = (uint64_t)(int64_t)sys_link((const char*)(uintptr_t)f->rbx, (const char*)(uintptr_t)f->rcx); return;
+        case SYS_SYMLINK: f->rax = (uint64_t)(int64_t)sys_symlink((const char*)(uintptr_t)f->rbx, (const char*)(uintptr_t)f->rcx); return;
+        case SYS_MUNMAP:  f->rax = (uint64_t)sys_munmap((uintptr_t)f->rbx, (size_t)f->rcx); return;
         case SYS_CHMOD:  f->rax = (uint64_t)(int64_t)sys_chmod((const char*)(uintptr_t)f->rbx, (int)f->rcx); return;
         case SYS_UNLINK: f->rax = (uint64_t)(int64_t)sys_unlink((const char*)(uintptr_t)f->rbx); return;
         case SYS_CONNECT:

@@ -144,6 +144,20 @@ static void read_conf(struct container* c, const char* path) {
     }
 }
 
+/* §M89 — the unpacker for other subsystems (apps.c installs software with it):
+ * `root` "-" writes only the image configuration to `conf`; a `subtree`
+ * extracts only the entries under it, the prefix removed.  0 or the
+ * unpacker's exit status. */
+int ctr_unpack(const char* archive, const char* root, const char* conf, const char* subtree) {
+    const unsigned char *us = 0, *ue = 0;
+    if (_binary_user_ociunpack_elf_start)             { us = _binary_user_ociunpack_elf_start;         ue = _binary_user_ociunpack_elf_end; }
+    else if (_binary_user_ociunpack_x86_64_elf_start) { us = _binary_user_ociunpack_x86_64_elf_start;  ue = _binary_user_ociunpack_x86_64_elf_end; }
+    else if (_binary_user_ociunpack_aarch64_elf_start){ us = _binary_user_ociunpack_aarch64_elf_start; ue = _binary_user_ociunpack_aarch64_elf_end; }
+    if (!us) return -1;
+    const char* argv[5] = { "ociunpack", archive, root, conf, subtree };
+    return run_and_wait("ociunpack", us, ue, subtree ? 5 : 4, argv);
+}
+
 static struct container* ctr_import(const char* name, const char* archive) {
     if (ctr_by_name(name)) return ctr_by_name(name);
     const unsigned char *us = 0, *ue = 0;
@@ -243,7 +257,7 @@ static void ctr_init_main(void) {
     const char* name = r->argv[0];
     for (const char* p = r->argv[0]; *p; p++) if (*p == '/') name = p + 1;
     /* §M89 — /proc/self/exe for the program (the child inherits the cred). */
-    if (vfs_canonical(r->argv[0], me->cred.exe, sizeof me->cred.exe) != 0) me->cred.exe[0] = 0;
+    if (vfs_realpath(r->argv[0], me->cred.exe, sizeof me->cred.exe) != 0) me->cred.exe[0] = 0;
     int pid = proc_spawn_argv(name, img, sz, r->argc, r->argv, /*linux_abi*/1);
     kfree(img);
     if (pid < 0) { kprintf("ctr: could not start %s\n", r->argv[0]); r->code = 126; r->done = 1; return; }

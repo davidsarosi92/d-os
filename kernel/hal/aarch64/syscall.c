@@ -308,6 +308,8 @@ static void aarch64_syscall_body(struct trapframe* tf) {
         /* §M73 — directory calls. */
         case SYS_MKDIR:  tf->x[0] = (uint64_t)(int64_t)sys_mkdir((const char*)tf->x[0], (int)tf->x[1]); break;
         case SYS_LINK:   tf->x[0] = (uint64_t)(int64_t)sys_link((const char*)tf->x[0], (const char*)tf->x[1]); break;
+        case SYS_SYMLINK: tf->x[0] = (uint64_t)(int64_t)sys_symlink((const char*)tf->x[0], (const char*)tf->x[1]); break;
+        case SYS_MUNMAP:  tf->x[0] = (uint64_t)sys_munmap((uintptr_t)tf->x[0], (size_t)tf->x[1]); break;
         case SYS_CHMOD:  tf->x[0] = (uint64_t)(int64_t)sys_chmod((const char*)tf->x[0], (int)tf->x[1]); break;
         case SYS_UNLINK: tf->x[0] = (uint64_t)(int64_t)sys_unlink((const char*)tf->x[0]); break;
 

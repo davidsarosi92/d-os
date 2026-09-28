@@ -15606,6 +15606,37 @@ TPIDR_EL0).  `pthreadtest` 20000/20000 on arm64.
   two x86 switches — arm64 had none.  One engine handler each now; the switch
   arms are deleted (§M56.1's rule).
 
+**RESULT (2026-09-28), both 64-bit arches, an unmodified Temurin 21:**
+`ctr run jre /opt/java/openjdk/bin/java -version` prints the version and exits
+0 on x86_64 AND aarch64 (the aarch64 JRE with no unhandled call at all); the
+full JDK's `java /tmp/Hello.java` — the source launcher, i.e. javac compiling in
+memory — prints `Hello from Java on d-os! amd64, 2 CPUs` / `aarch64, 2 CPUs`,
+runs four threads and allocates 128 MB through the garbage collector, exit 0.
+The last blocker was a REAL-TIME signal: a musl JDK installs a handler for
+SIGRTMAX-2 in NativeThread's initialiser, the kernel refused signals above 31,
+and the failure surfaced as `ArrayIndexOutOfBoundsException: -1` from the
+`finally` of the first file read.  Signals are 1..64 now (lnx_signal.c).
+Also found: ociunpack refused the JDK's 307 MB layer (an absolute 192 MB
+"bomb" cap — now a ratio rule) and kept every decompressed layer resident
+(freed per layer now).  Still ENOSYS and harmless: statx (musl falls back).
+
+**Symbolic links (VFS + ramfs), for installed software.**  `INODE_SYMLINK`,
+resolved textually before each walk (40 hops, then refused), the last
+component not followed by lstat/readlink/unlink/rename; `/proc/self/exe` is
+the RESOLVED path; symlink/symlinkat/lstat/`fstatat(AT_SYMLINK_NOFOLLOW)`,
+DT_LNK in getdents; `ln [-s]`, `ls` shows `name -> target`; ociunpack makes
+real links (exFAT, which stores none, keeps the old approximation).
+
+**Installed applications — `app install|list|use|remove`** (kernel/core/
+apps.c): only the image's own subtree (`<NAME>_HOME`, JAVA_HOME for a JDK)
+unpacked straight into `/mnt/apps/<name>/<version>/` on the persistent disk,
+`current` naming the active version, `/bin/<exe>` symlinks (a system program is
+never shadowed), `libc.musl-<arch>.so.1` linked to the dynamic linker, updates
+beside the old version, rollback with `use`.  A boot service relinks and
+installs anything in `/mnt/incoming/*.tar` not yet installed.  **Built and the
+refusal path verified; an end-to-end `app install jdk` + `java` from /bin is
+the first item of the next session**, with `run_qemu.sh`'s host-side delivery.
+
 **How Java gets onto the machine, and how it is updated — the state today,
 said plainly.**  It is NEITHER built in NOR a package: it is an OCI image the
 user brings.  `docker save eclipse-temurin:21-jdk-alpine` on a host → the
@@ -15644,6 +15675,8 @@ image on i386 is FXSAVE, not `_fpstate_32`; robust futex lists are not walked
 at thread death.
 
 ## 8. Change log
+
+- **2026-09-28 — §M89: Java runs.  An unmodified Temurin 21 JDK compiles and runs `Hello.java` (threads, GC) on x86_64 and aarch64; `java -version` from the JRE on both.  Built for it: a reservation layer (demand-zero, PROT_NONE, lazy file maps), Linux signals 1..64 with real frames on all three arches (faults to handlers, altstack, delivery on the interrupt path), arm64 threads, a real futex (it had failed on every call on x86_64 since M35), a dozen calls moved from the x86 switches into the shared engine, symbolic links, and `app install` for installed software.  Found on the way: ramfs's 16 MiB file ceiling, musl run "secure" for want of AT_UID, execve dropping envp, threads copying the fd table, clrex on aarch64 (DOCS §4.119).**
 
 - **2026-09-28 — §M88 (first cut): more than one monitor on all three arches — an output registry (`displays`), a portable bochs-display second-head driver, one virtual desktop composed across outputs, per-monitor taskbar/maximize/wallpaper/pointer policy, the Monitors page; harness `--second-display`/`--screenshot2`.  Fixed on the way: density taken from the desktop width, the drag copy path leaving a trail below the primary (DOCS §4.118).**
 - **2026-09-28 — §M81 COMPLETE: the verdict per seam (PLAN §M81), `scripts/gui-coupling.py` (tiered by declaring header; no app reaches compositor-private state), `gui_greeter_active` declared, one gate for disabled widgets + `gui disabletest` (a disabled list scrolled), and `gui bench` fixed (it reported 0 us/frame by reading mid-frame) (DOCS §4.117).**
