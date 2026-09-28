@@ -549,6 +549,8 @@ void gui_window_outer_for_content(int cw, int ch, int* ow, int* oh);
  * as its wl_output mode. */
 int  gui_screen_w(void);
 int  gui_screen_h(void);
+int  gui_desktop_w(void);   /* §M88 — all monitors together (gui_screen_* is the primary) */
+int  gui_desktop_h(void);
 
 /* §M26 — paint a raw ARGB pixel block into a window's content surface (at
  * content-relative x,y) and composite it.  The Wayland server uses this to turn

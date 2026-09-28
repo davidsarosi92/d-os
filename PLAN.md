@@ -230,7 +230,7 @@ fixed first, whatever it touches.
 | §M74 | ✅ complete (§4.112-§4.114) | — (multi-threaded victims, swap compression) |
 | §M73 | ✅ complete — rungs 1-3 (§4.115) | — (resource caps per container, network namespace, registry pull) |
 | queued UI | ✅ done (§4.116) — Memory page, System information, translations 73 → 0 | — |
-| §M88 | — | multiple monitors — asked for 2026-09-27, not designed yet |
+| §M88 | ✅ first cut (§4.118) | per-output modes, live re-arrangement, left/above, >16 MiB desktops |
 | §M89 | — | Java: a JRE (and the JDK with it) — asked for 2026-09-28, scoped below; in the queue after §M81 and §M88 |
 | §M68 | — | investigation, not started |
 | §M83, §M84 | — | designed, not started |
@@ -5902,6 +5902,61 @@ more than that would be the same theatre §M33 spent a milestone refusing.
 **Prerequisites, in order:** §M32 (identity) → §M72 (accounting + reserve) →
 rung 1 (per-process root) → the rest.  **§M32 is the gate**, which is a second
 independent reason it should be the next milestone.
+
+---
+
+## §M88 — More than one monitor
+
+**Status: FIRST CUT SHIPPED 2026-09-28 — DOCS §4.118 (registry, bochs-display second head on all three arches, one virtual desktop, per-monitor policy, Monitors page).  Open rungs: per-output mode setting, live re-arrangement, left/above, >16 MiB desktops, virtio-gpu second scanout, a taskbar per monitor.  Asked for from use
+(2026-09-27): "kelleni fog több monitort kezelni is".**
+
+### What is true today (measured)
+
+- **ONE display, by construction.**  `fb_present.h` describes a single
+  framebuffer; aarch64's `fb_backend_register` takes the FIRST display driver
+  and ignores the rest ("one scanout, one console"); x86 drives exactly the
+  Bochs-VBE registers of the boot framebuffer.
+- **The compositor is one surface pair.**  `fbsurf` (the scanout) and `backsurf`
+  (1920x1200 at 32 bpp, one contiguous `kmalloc` — BUDDY_MAX_ORDER 12 caps a
+  block at 16 MiB) and the wallpaper, the panel strip, window clamping,
+  maximize, the cursor and the mode set all read `gui_screen_w/h`.
+- **A second head is available on every test machine**: QEMU's `bochs-display`
+  (PCI 1234:1111 — a linear framebuffer in BAR0, the DISPI registers MMIO in
+  BAR2 + 0x500).  aarch64 already has a driver for it (sbsa-ref's display,
+  §M85), written against a shadow buffer + flush — the right shape for a
+  secondary output anywhere.  x86's std VGA carries the SAME id, so the
+  secondary driver must skip the device whose BAR0 is the boot framebuffer.
+
+### The design
+
+1. **An output registry** (`display.h`): an output is a name, a size, a
+   pixel buffer the compositor draws into, a `flush(rect)`, and a POSITION in
+   one virtual desktop.  Output 0 is the existing display, unchanged; others
+   register as they are found.  `displays` lists them.
+2. **ONE virtual desktop, not one compositor per screen.**  The compositor's
+   surfaces cover the UNION of the outputs, so windows, damage, the cursor and
+   dragging stay in one coordinate space and a window can straddle two
+   monitors.  Presenting splits each damaged rect across the outputs it touches
+   and flushes each part.  (Per-output surfaces would mean translating every
+   draw call — every window, the wallpaper, the cursor, the panel — for no
+   visible gain.)  The page flip is used only while there is ONE output; with
+   two, both are presented by blit + flush.
+3. **The union must fit, and says so when it does not**: a 1920x1200 +
+   1280x800 desktop is 15.4 MiB, under the 16 MiB block; two 1920x1200 screens
+   are 18.4 MiB and are REFUSED with that sentence (raising the buddy ceiling is
+   a separate, measured change).
+4. **Policy that is per-output**: the taskbar lives on the PRIMARY output;
+   maximize fills the output under the window's centre; new windows open on the
+   primary; the wallpaper is rendered per output (each fitted to its own size);
+   the pointer moves across the union and is clamped to the output under it
+   (outputs of different heights leave no dead strip to lose it in).
+5. **Arrangement is a setting**: `display.<name>.position` = right | left |
+   below | off (default right), in the Display panel.  A secondary output's
+   mode is fixed at 1280x800 in the first cut; mode setting stays primary-only
+   (§M61's contract per output is a later rung).
+6. **Test**: the harness gains `--second-display` (`-device bochs-display`) and a
+   per-head screendump, so both pictures are checked; `displays` on all three
+   arches.
 
 ---
 

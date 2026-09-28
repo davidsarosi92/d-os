@@ -149,6 +149,20 @@
 
       <div style="display:flex;flex-direction:column;align-items:center;gap:12px;">
         <div style="width:{{ iconSize }}px;height:{{ iconSize }}px;display:flex;align-items:center;justify-content:center;">
+          <svg viewBox="0 0 48 48" style="width:100%;height:100%" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="round">
+            <rect x="4" y="10" width="22" height="16"></rect>
+            <rect x="28" y="14" width="16" height="12"></rect>
+            <path d="M15 26 V32"></path>
+            <path d="M9 34 H21"></path>
+            <path d="M36 26 V32"></path>
+            <path d="M31 34 H41"></path>
+          </svg>
+        </div>
+        <sc-if value="{{ showLabels }}"><span style="font-size:12.5px;text-align:center;color:oklch(38% 0.008 260);">Monitorok</span></sc-if>
+      </div>
+
+      <div style="display:flex;flex-direction:column;align-items:center;gap:12px;">
+        <div style="width:{{ iconSize }}px;height:{{ iconSize }}px;display:flex;align-items:center;justify-content:center;">
           <svg viewBox="0 0 48 48" style="width:100%;height:100%" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter">
             <path d="M12 18 V8 H36 V18"></path>
             <rect x="6" y="18" width="36" height="14" rx="1"></rect>

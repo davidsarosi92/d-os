@@ -422,6 +422,9 @@ def qemu_argv(a, sersock, monsock):
                 "-device", "virtio-keyboard-device",
                 "-device", "virtio-mouse-device",
             ]
+            # §M88 — a second monitor: bochs-display on the PCIe bus.
+            if a.second_display:
+                argv += ["-device", "bochs-display,id=disp2"]
         # --disk used to be honoured on x86 ONLY, silently: the flag was
         # accepted, the ARM guest simply never saw a disk, and anything that
         # needed persistent storage "failed" on this arch for no visible
@@ -463,6 +466,9 @@ def qemu_argv(a, sersock, monsock):
             "-rtc", "base=localtime",
             "-device", "ib700", "-action", "watchdog=inject-nmi",
         ]
+        # §M88 — a second monitor (the same device on every arch).
+        if a.second_display:
+            argv += ["-device", "bochs-display,id=disp2"]
         # §M23 — AC97, the codec both x86 arches drive.  `hda` is the other
         # one and is a §M67 module here, so the built-in path is what an
         # ordinary boot exercises and what this attaches.
@@ -581,6 +587,12 @@ def main():
                          "commands (repeatable) — mouse_move/mouse_button for "
                          "driving the GUI, screendump for looking at it.  "
                          "Prefix with 'sleep <s>' to pause.")
+    ap.add_argument("--second-display", action="store_true",
+                    help="§M88 — attach a second monitor (QEMU bochs-display, "
+                         "id disp2); --screenshot2 dumps what it shows")
+    ap.add_argument("--screenshot2", default="",
+                    help="§M88 — after the commands, dump the SECOND monitor "
+                         "(device disp2) to this PPM path")
     ap.add_argument("--screenshot", default="",
                     help="after the commands, dump the framebuffer to this "
                          "PPM path (the QEMU monitor's screendump) — the only "
@@ -695,6 +707,11 @@ def main():
                 time.sleep(0.008 if mc.startswith("mouse_move") else 0.12)
             if a.screenshot:
                 mon.cmd("screendump " + os.path.abspath(a.screenshot))
+                time.sleep(2)
+            if a.screenshot2:
+                # HMP: `screendump <file> [device] [head]` — the device is a
+                # positional argument (QEMU 11 rejects "-d" before or after)
+                mon.cmd("screendump " + os.path.abspath(a.screenshot2) + " disp2")
                 time.sleep(2)
         mon.quit()
     finally:

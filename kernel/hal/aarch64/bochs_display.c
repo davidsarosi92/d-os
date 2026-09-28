@@ -63,6 +63,10 @@ static uint64_t g_shadow_phys;       /* the RAM the renderer draws into     */
 static uint32_t g_shadow_frames;
 static uint32_t g_w, g_h, g_pitch;
 static int      g_ready;
+/* §M88 — which device this driver made the PRIMARY display, so the portable
+ * second-monitor driver (bochs_out.c) takes a different one. */
+static int      g_primary_bdf = -1;
+int bochs_display_primary_bdf(void) { return g_primary_bdf; }
 
 static inline void wr(uint32_t idx, uint16_t v) { g_regs[idx] = v; }
 static inline uint16_t rd(uint32_t idx)         { return g_regs[idx]; }
@@ -212,6 +216,7 @@ int bochs_display_init(void) {
         return -1;
     }
     g_ready = 1;
+    g_primary_bdf = (pd.bus << 8) | (pd.slot << 3) | pd.func;
     fb_backend_register(&bochs_backend);
     kprintf("bochs-display: %ux%u at PCI %u:%u.%u, fb %p (%u MiB VRAM), regs %p\n",
             g_w, g_h, pd.bus, pd.slot, pd.func, (void*)(uintptr_t)fb_pa,

@@ -101,6 +101,8 @@ static int mode_rebuild_surfaces(void) {
     gfx_surface_free(&backsurf);
     gfx_surface_free(&wallsurf);
     fbsurf   = newfb;
+    scanout  = newfb;                   /* §M88 — one output: the same surface */
+    scanout.owns_px = 0;
     backsurf = nback;
     wallsurf = nwall;
     flip_ok  = 0;                       /* the flip belonged to the old size */
@@ -180,6 +182,15 @@ void apply_mode_change(void) {
     int rw = mode_req_w, rh = mode_req_h;
     if (!rw || !rh) return;
     mode_req_w = mode_req_h = 0;
+    /* §M88 — REFUSED, and said so, while more than one monitor is in use: the
+     * rebuild below re-derives the desktop from the primary alone and would
+     * drop the second monitor out of it.  Per-output mode setting is PLAN
+     * §M88's later rung. */
+    if (multi_out) {
+        kprintf("gui: resolution changes with more than one monitor are not "
+                "supported yet - unchanged\n");
+        return;
+    }
 
     int prev_w = fbsurf.w, prev_h = fbsurf.h;
     if (fb_mode_set((uint32_t)rw, (uint32_t)rh, 32) != 0) {

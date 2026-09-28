@@ -15478,8 +15478,57 @@ VERDICT"); this is what shipped with it.
 - Step 3's remainder (taskbar strip, flyouts, sign-in screen as item views;
   the window as a widget) is **declined**, with the reason recorded in PLAN.
 
+### 4.118 §M88 — More than one monitor (2026-09-28)
+
+**The first cut ships on all three arches.**  A second monitor is QEMU's
+`bochs-display` (the same device everywhere; the harness attaches it with
+`--second-display` and dumps it with `--screenshot2`).
+
+- **An output registry** (`display.h`, `kernel/core/display.c`): name, size, a
+  buffer the compositor draws into, a flush, a position.  Slot 0 is RESERVED for
+  the primary (drivers come up before the desktop, and "output 0 is the boot
+  display at (0,0)" is what every coordinate rests on).  `displays` lists them.
+- **A portable second-head driver** (`kernel/drivers/display/bochs_out.c`,
+  drvrt-based like edu.c): takes a 1234:1111 of class 0x0380 that is not the
+  primary (x86's boot VGA is class 0x0300; sbsa-ref's primary bochs-display is
+  named by `bochs_display_primary_bdf`), checks the DISPI id, sets 1280x800x32
+  and READS IT BACK, draws into a RAM shadow and flushes rectangles with aligned
+  32-bit stores (Device memory on ARM; one path everywhere).
+- **ONE virtual desktop.**  `fbsurf` is now the UNION of the outputs; `scanout`
+  is the primary's pixels.  `present_rect` hands every output the part of each
+  damaged rectangle that falls on it.  The page flip is used only with one
+  output.  A union that would not fit one allocator block (16 MiB) is REFUSED
+  with the numbers and the machine runs on the primary.
+- **Per-output policy:** the taskbar, Start menu and desktop icons live on the
+  primary (`gui_screen_w/h` is the PRIMARY now — density, dialog centring and a
+  Wayland client's output are about it; `gui_desktop_w/h` is the union);
+  maximize fills the monitor under the window; the wallpaper is fitted to each
+  monitor; a pointer entering a corner that belongs to no monitor is pulled
+  onto the nearest one; the taskbar strip is the primary's bottom (with a
+  monitor BELOW, "y >= work_h" had been the whole second screen).
+- **The Monitors page** (Control Panel): `display.bochs1.position` = right |
+  below | off, with a live line naming the outputs; applies at the next desktop
+  start.  New `ICON_MONITORS` in the design set.
+- A resolution change is REFUSED, with the reason, while two monitors are in use.
+
+**Found by the pictures:** the density had been derived from the desktop width
+(3200 px read as a huge screen, every control at the 200 % cap); and the drag
+copy path bounded its source at `work_h`, so dragging a window onto a monitor
+BELOW the primary left a trail of its contents — such moves take the painter.
+
+**Verified by driving the mouse** on i386: a window dragged from the primary to
+the secondary (no ghost left behind), clicked there (`clicks: 1`), maximized
+there (exactly 1280x800); the "below" arrangement with a drag down through the
+taskbar line, clean.  x86_64 and aarch64 (virtio-gpu primary + bochs-display):
+3200x1200 and 2560x800 desktops.
+
+**Open:** per-output mode setting; applying an arrangement without restarting
+the desktop; left/above; a desktop larger than 16 MiB (two 1920x1200 screens);
+virtio-gpu's own second scanout; a taskbar per monitor.
+
 ## 8. Change log
 
+- **2026-09-28 — §M88 (first cut): more than one monitor on all three arches — an output registry (`displays`), a portable bochs-display second-head driver, one virtual desktop composed across outputs, per-monitor taskbar/maximize/wallpaper/pointer policy, the Monitors page; harness `--second-display`/`--screenshot2`.  Fixed on the way: density taken from the desktop width, the drag copy path leaving a trail below the primary (DOCS §4.118).**
 - **2026-09-28 — §M81 COMPLETE: the verdict per seam (PLAN §M81), `scripts/gui-coupling.py` (tiered by declaring header; no app reaches compositor-private state), `gui_greeter_active` declared, one gate for disabled widgets + `gui disabletest` (a disabled list scrolled), and `gui bench` fixed (it reported 0 us/frame by reading mid-frame) (DOCS §4.117).**
 - **2026-09-28 — Control Panel: a Memory page (swap and the rest of `mem.*`, with a live line — `settings_panel.live`) and System information (`sysinfo`, `hal_cpu_model`, `hal_board_name`); translations measured by `scripts/locale-sweep.py` + `locale missing` and closed (73 → 0).  Fixed: sliders showed no value and were offered for unusable ranges, integer ranges were not validated, About/Hello out of date and overlapping, the File Manager count had two digits, only 8 windows could exist, the taskbar ran under its indicators and cut titles unmarked (now "+N"), and a row that did not fit ran off its window (it wraps) (DOCS §4.116).**
 - **2026-09-28 — §M73 COMPLETE: containers — a real OCI image (`busybox:musl`) unpacked in ring 3 (`ociunpack`, sha256/gzip/tar/links/whiteouts), run as its own uid against its own root (`cred.root`), a working directory (`cred.cwd`, lexical `..` clamped at the root), `ctr import|run|list`, `ctrescapetest`, `AUDIT(container-root)`; the Linux file/time/identity calls as shared §M50 operations with per-guest stat layouts as data (arm64 could not open a file); `strace`.  Fixed: stat inode = size+1, x86_64 getuid always 0, rt_sigaction running fcntl, the console not duplicable, redirected stdin polled from the keyboard, absolute realtime sleeps, `task_wait` leaking reap-owned children, and `task_exit_code` marking ANOTHER task dead after a migration (DOCS §4.115).**

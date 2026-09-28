@@ -305,6 +305,18 @@ extern struct gui_window* focused_win;
 extern spinlock_t         state_lock;                /* guards all of the above */
 
 extern struct gfx_surface fbsurf, backsurf, wallsurf;
+/* §M88 — MORE THAN ONE MONITOR.  `fbsurf.w/h` is the DESKTOP: the union of
+ * the outputs (display.h), which is what every window, damage rect and the
+ * pointer are measured in.  `scanout` is the PRIMARY display's real pixels
+ * (what fbsurf was before), and `multi_out` says the union is wider or taller
+ * than it.  With one output the two are the same surface and nothing below
+ * behaves differently. */
+extern struct gfx_surface scanout;
+extern int multi_out;
+/* The work area of the output under (x,y): the primary's stops above the
+ * taskbar, a secondary's is the whole monitor.  A point in no output gets the
+ * primary's. */
+void gui_output_workarea(int x, int y, int* ox, int* oy, int* ow, int* oh);
 extern int  work_h;                    /* screen minus the shell's chrome     */
 extern int  gmax_cols, gmax_rows;      /* terminal grid capacity, in cells    */
 extern volatile int need_frame;

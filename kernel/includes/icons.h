@@ -92,6 +92,7 @@ enum icon_id {
     ICON_WIFI_3,
     ICON_WIFI_OFF,      /* wireless adapter, not associated            */
     ICON_MEMORY,        /* memory: swap, page cache, the reserve       */
+    ICON_MONITORS,      /* §M88: more than one screen                  */
     ICON__COUNT
 };
 

@@ -72,6 +72,8 @@ LABEL_TO_ID = {
     # 2026-09-28 — the Memory page (swap, page cache, the reserve).  Drawn in
     # the set's own language: a module with three chips and its pins.
     "Memória":            "ICON_MEMORY",
+    # 2026-09-28 — §M88: the Monitors page (more than one screen).
+    "Monitorok":          "ICON_MONITORS",
 }
 
 S = 16384          # the fixed-point box vpath.c expects

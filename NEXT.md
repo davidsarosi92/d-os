@@ -7,8 +7,7 @@
 against its own root on all three arches; the escape test and
 `AUDIT(container-root)` pass.  **Then (2026-09-28) the queued UI items shipped (DOCS §4.116):** a Memory page,
 System information, translations 73 → 0 (`scripts/locale-sweep.py`), 32 windows,
-a taskbar that fits, rows that wrap.  **§M81 shipped the same day (DOCS §4.117, verdict in PLAN).  Next, in order:** §M88
-(monitors) and §M89 (Java — scoped in PLAN.md: an address-space layer, Linux
+a taskbar that fits, rows that wrap.  **§M81 shipped the same day (DOCS §4.117, verdict in PLAN), and §M88's first cut (DOCS §4.118: two monitors on all three arches).  Next:** §M89 (Java — scoped in PLAN.md: an address-space layer, Linux
 signal delivery and arm64 threads are the real work; the JDK comes with it).
 
 ## §M87 shipped — network and storage in the Control Panel (DOCS §4.103)

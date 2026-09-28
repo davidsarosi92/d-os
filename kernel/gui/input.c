@@ -35,6 +35,7 @@
  * clears anything still held.
  * =========================================================================== */
 
+#include "display.h"          /* §M88 */
 #include "gui_priv.h"
 #include "gui.h"
 #include "gui_internal.h"
@@ -253,7 +254,10 @@ void pevq_push(uint8_t type, int x, int y) {
 }
 /* Is (x,y) over the shell's chrome — the taskbar strip or the open popup? */
 static int in_panel_region(int x, int y) {
-    if (y >= work_h) return 1;                  /* taskbar strip (bottom_reserve) */
+    /* §M88 — the taskbar strip is the PRIMARY's bottom, not every row below
+     * work_h: with a monitor below the primary, "y >= work_h" was the whole
+     * second screen. */
+    if (y >= work_h && y < scanout.h && x < scanout.w) return 1;
     if (pnl_pop_on && x >= pnl_pop_x && x < pnl_pop_x + pnl_pop_w &&
         y >= pnl_pop_y && y < pnl_pop_y + pnl_pop_h) return 1;
     return 0;
@@ -386,6 +390,22 @@ void gui_mouse(int dx, int dy, unsigned buttons) {
     if (my < 0) my = 0;
     if (mx >= fbsurf.w) mx = fbsurf.w - 1;
     if (my >= fbsurf.h) my = fbsurf.h - 1;
+    /* §M88 — the union of two monitors of different sizes has corners that
+     * belong to NO monitor; a pointer there is invisible and lost.  Pull it
+     * back onto the nearest edge of the monitor it was heading for. */
+    if (multi_out && display_at_point(mx, my) < 0) {
+        int best = -1, bd = 0x7FFFFFFF, bx = mx, by = my;
+        for (int i = 0; i < display_count(); i++) {
+            int ox, oy, ow, oh;
+            struct display_output* o = display_at(i);
+            if (!o || !o->enabled || display_rect(i, &ox, &oy, &ow, &oh) != 0) continue;
+            int cx = mx < ox ? ox : (mx >= ox + ow ? ox + ow - 1 : mx);
+            int cy = my < oy ? oy : (my >= oy + oh ? oy + oh - 1 : my);
+            int d = (cx - mx) * (cx - mx) + (cy - my) * (cy - my);
+            if (d < bd) { bd = d; best = i; bx = cx; by = cy; }
+        }
+        if (best >= 0) { mx = bx; my = by; }
+    }
 
     unsigned pressed  =  buttons & ~btn_prev;
     unsigned released = ~buttons &  btn_prev;
@@ -712,7 +732,15 @@ drag_update:
         if (tgt_x < -(drag_win->w - 40)) tgt_x = -(drag_win->w - 40);
         if (tgt_x > fbsurf.w - 40)       tgt_x = fbsurf.w - 40;
         if (tgt_y < 0)                   tgt_y = 0;
-        if (tgt_y > work_h - TITLE_H)    tgt_y = work_h - TITLE_H;
+        /* §M88 — the title bar must not go under the taskbar of the monitor it
+         * is on; below the primary there IS no taskbar, so the bound is the
+         * desktop's bottom there. */
+        {
+            int ox, oy, ow, oh;
+            gui_output_workarea(tgt_x + 40, tgt_y, &ox, &oy, &ow, &oh);
+            int lim = oy + oh - TITLE_H;
+            if (tgt_y > lim) tgt_y = lim;
+        }
         uint64_t now = timer_ticks_ms();
         drag_motions++;
         if ((tgt_x != drag_win->x || tgt_y != drag_win->y) &&

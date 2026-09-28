@@ -58,6 +58,7 @@
 #include "kmalloc.h"
 #include "config.h"
 #include "lock.h"
+#include "display.h"          /* §M88 */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -445,7 +446,7 @@ static void draw_scene_rect(const struct scene_snapshot* s,
     if (panel_ready) {
         spin_lock(&panel_lock);
         gfx_blit(&backsurf, 0, work_h, &panelsurf, 0, work_h,
-                 fbsurf.w, fbsurf.h - work_h);
+                 scanout.w, scanout.h - work_h);           /* §M88: the primary's strip */
         if (pnl_pop_on) {
             int py = pnl_pop_y, ph = pnl_pop_h;
             if (py < panel_strip_top) { ph -= panel_strip_top - py; py = panel_strip_top; }
@@ -463,7 +464,7 @@ static void draw_scene_rect(const struct scene_snapshot* s,
          * does nothing.  The modal window itself never reaches this strip
          * (windows live above `work_h`), so this cannot dim the dialog. */
         if (s->modal_idx >= 0)
-            gfx_blend_fill(&backsurf, 0, work_h, fbsurf.w, fbsurf.h - work_h,
+            gfx_blend_fill(&backsurf, 0, work_h, scanout.w, scanout.h - work_h,
                            COL_MODAL_DIM);
     }
 
@@ -474,6 +475,36 @@ static void draw_scene_rect(const struct scene_snapshot* s,
 
     draw_cursor(&backsurf, s->cx, s->cy);
 }
+/* §M88 — present one rect of the back buffer: to the PRIMARY (the old path,
+ * a blit into its scanout + fb_present_flush, which is a no-op on x86 and the
+ * virtio-gpu transfer on aarch64), and to every other enabled output the part
+ * that falls on it, through that output's own flush.  With one output this is
+ * exactly the code it replaced. */
+static void present_rect(int x0, int y0, int x1, int y1) {
+    int n = multi_out ? display_count() : 1;
+    for (int i = 0; i < n; i++) {
+        int ox = 0, oy = 0, ow = scanout.w, oh = scanout.h;
+        struct display_output* o = NULL;
+        if (i > 0) {
+            o = display_at(i);
+            if (!o || !o->enabled) continue;
+            ox = o->x; oy = o->y; ow = o->w; oh = o->h;
+        }
+        int ax = x0 > ox ? x0 : ox, ay = y0 > oy ? y0 : oy;
+        int bx = x1 < ox + ow ? x1 : ox + ow, by = y1 < oy + oh ? y1 : oy + oh;
+        if (bx <= ax || by <= ay) continue;
+        if (i == 0) {
+            gfx_blit(&scanout, ax, ay, &backsurf, ax, ay, bx - ax, by - ay);
+            fb_present_flush(ax, ay, bx - ax, by - ay);
+        } else {
+            struct gfx_surface v = { .w = ow, .h = oh, .stride = o->stride, .px = o->px };
+            gfx_clear_clip(&v);
+            gfx_blit(&v, ax - ox, ay - oy, &backsurf, ax, ay, bx - ax, by - ay);
+            if (o->flush) o->flush(o, ax - ox, ay - oy, bx - ax, by - ay);
+        }
+    }
+}
+
 void compose(void) {
     /* §M77.2 — DO NOT PAINT A BATCH THAT IS STILL BEING ASSEMBLED.
      *
@@ -563,7 +594,15 @@ void compose(void) {
     if (mh.active && mh.win && mh.win == s.dwin && s.zn > 0 &&
         s.zsnap[s.zn - 1] == mh.win &&           /* topmost visible           */
         rn == 0 &&                               /* nothing else changed      */
-        (mh.nx != mh.ox || mh.ny != mh.oy)) {
+        (mh.nx != mh.ox || mh.ny != mh.oy) &&
+        /* §M88 — BELOW the primary's work area the copy's premise fails: its
+         * source is bounded at `work_h` ("rows under it hold the panel"),
+         * which on one monitor is the bottom of everything a window can be,
+         * and with a monitor BELOW the primary is the middle of the desktop —
+         * the part of the window under it was neither copied nor repainted,
+         * and a drag across left a trail of its contents on the second
+         * screen.  Such a move takes the painter, which is always right. */
+        !(multi_out && (mh.oy + mh.h > work_h || mh.ny + mh.h > work_h))) {
         fast = 1;
         bx0 = (mh.ox < mh.nx ? mh.ox : mh.nx) - 2;
         by0 = (mh.oy < mh.ny ? mh.oy : mh.ny) - 2;
@@ -714,15 +753,8 @@ void compose(void) {
         prev_dmg_n = fn;
         for (int k = 0; k < fn; k++) prev_dmg[k] = fr[k];
     } else {
-        for (int k = 0; k < fn; k++) {
-            gfx_blit(&fbsurf, fr[k].x0, fr[k].y0, &backsurf,
-                     fr[k].x0, fr[k].y0, fr[k].x1 - fr[k].x0, fr[k].y1 - fr[k].y0);
-            /* Push the freshly-blitted rect to the scanout.  No-op on x86 (the
-             * linear FB is the scanout); on aarch64 this is the virtio-gpu
-             * transfer+flush that makes the compositor visible. */
-            fb_present_flush(fr[k].x0, fr[k].y0,
-                             fr[k].x1 - fr[k].x0, fr[k].y1 - fr[k].y0);
-        }
+        for (int k = 0; k < fn; k++)
+            present_rect(fr[k].x0, fr[k].y0, fr[k].x1, fr[k].y1);
     }
 
     /* At the END, after the draw pass AND the present.  The first version of
@@ -802,12 +834,32 @@ void compose(void) {
  * must not swallow the version string), and its position depends on `work_h`,
  * which is the compositor's business and not the background's. */
 int paint_wallpaper(void) {
-    int rc = wallpaper_render(&wallsurf);
+    int rc;
+    if (!multi_out) {
+        rc = wallpaper_render(&wallsurf);
+    } else {
+        /* §M88 — each monitor gets the picture fitted to ITSELF, through a
+         * view into the one wallpaper surface; the gaps between monitors of
+         * different sizes are never shown, and are filled so they hold no
+         * stale pixels a window drag could smear across a monitor. */
+        gfx_fill(&wallsurf, 0, 0, wallsurf.w, wallsurf.h, 0xFF101820u);
+        rc = 0;
+        for (int i = 0; i < display_count(); i++) {
+            int ox, oy, ow, oh;
+            struct display_output* o = display_at(i);
+            if (!o || !o->enabled || display_rect(i, &ox, &oy, &ow, &oh) != 0) continue;
+            struct gfx_surface v = { .w = ow, .h = oh, .stride = wallsurf.stride,
+                                     .px = wallsurf.px + (size_t)oy * wallsurf.stride + ox };
+            gfx_clear_clip(&v);
+            int r = wallpaper_render(&v);
+            if (r) rc = r;
+        }
+    }
 
     /* Desktop milestone label — sizes itself to the string so any DOS_MILESTONE
      * length stays right-aligned (see kernel/includes/version.h). */
     int lbl_w = 0; for (const char* p = DOS_LABEL; *p; p++) lbl_w++;
-    int lx = wallsurf.w - lbl_w * GFX_GLYPH_W - 12;
+    int lx = scanout.w - lbl_w * GFX_GLYPH_W - 12;       /* §M88: on the primary */
     int ly = work_h - GFX_GLYPH_H - 8;
     /* A photograph can be any colour under the text, so give the label its own
      * dim backing rather than trusting contrast that the gradient guaranteed

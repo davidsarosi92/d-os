@@ -467,9 +467,13 @@ void toggle_maximize_locked(struct gui_window* w) {
     if (!w->maximized) {
         w->sav_x = w->x;  w->sav_y = w->y;
         w->sav_w = w->w;  w->sav_h = w->h;
-        w->x = 0;  w->y = 0;
-        w->pending_w = fbsurf.w;                /* work-area aware: height */
-        w->pending_h = work_h;                  /* stops above the taskbar */
+        /* §M88 — maximize fills the MONITOR the window is on (its centre),
+         * not the desktop: across two screens it would straddle the bezel. */
+        int ox, oy, ow, oh;
+        gui_output_workarea(w->x + w->w / 2, w->y + w->h / 2, &ox, &oy, &ow, &oh);
+        w->x = ox;  w->y = oy;
+        w->pending_w = ow;                      /* work-area aware: height */
+        w->pending_h = oh;                      /* stops above the taskbar */
         w->maximized = 1;
     } else {
         w->x = w->sav_x;  w->y = w->sav_y;
