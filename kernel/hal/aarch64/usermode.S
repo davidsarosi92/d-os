@@ -40,6 +40,7 @@ aarch64_enter_user:
     mov     x2, #0                      /* SPSR = EL0t, DAIF clear */
     msr     spsr_el1, x2
     isb
+    clrex                               /* §M89 — see RESTORE_TRAPFRAME */
     eret
 
 /* void aarch64_user_exit_to(uint64_t sp, uint64_t lr);  — teleport back to
@@ -71,6 +72,7 @@ enter_user_mode:
     mov     x2, #0                      /* SPSR = EL0t, DAIF clear (IRQs on) */
     msr     spsr_el1, x2
     isb
+    clrex                               /* §M89 — see RESTORE_TRAPFRAME */
     eret                                /* → EL0, never returns here */
 
 /* -----------------------------------------------------------------------------
@@ -145,4 +147,5 @@ enter_user_mode_regs:
      * every remaining load reads garbage. */
     ldr     x9,  [x9, #8 * 9]
     isb
+    clrex                               /* §M89 — see RESTORE_TRAPFRAME */
     eret                                /* → EL0; never returns here     */

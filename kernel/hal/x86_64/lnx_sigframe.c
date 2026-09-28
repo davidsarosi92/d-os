@@ -30,6 +30,7 @@
 #include "lnx_signal.h"
 #include "idt.h"
 #include "task.h"
+#include "percpu.h"
 #include "vmm.h"
 #include "hal_api.h"
 #include "fd.h"
@@ -97,11 +98,11 @@ static int build(struct int_frame* f, struct task* t, const struct lnx_delivery*
     gr[G_RIP] = f->rip; gr[G_EFL] = f->rflags;
     gr[G_CSGSFS] = (f->cs & 0xFFFF) | ((uint64_t)(f->ss & 0xFFFF) << 48);
     gr[G_ERR] = err; gr[G_TRAPNO] = trapno;
-    gr[G_OLDMASK] = (uint64_t)d->old_blocked >> 1;
+    gr[G_OLDMASK] = d->old_mask;
     gr[G_CR2] = cr2;
     for (int i = 0; i < G_N; i++) wr64(g + (uintptr_t)i * 8, gr[i]);
     wr64(uc + UC_FPREGS, fp);
-    wr64(uc + UC_SIGMASK, (uint64_t)d->old_blocked >> 1);   /* guest bit layout */
+    wr64(uc + UC_SIGMASK, d->old_mask);   /* guest bit layout */
 
     uintptr_t si = fr + INFO_OFF;
     wr32(si + 0, (uint32_t)d->info.signo);
@@ -130,7 +131,7 @@ void lnx_signal_deliver(void* frame) {
     struct int_frame* f = (struct int_frame*)frame;
     if ((f->cs & 3) != 3) return;
     struct task* t = task_current();
-    if (!t || !t->sig_pending) return;
+    if (!t || !lnx_sig_deliverable(t)) return;
     struct lnx_delivery d;
     if (!lnx_sig_next(t, (uintptr_t)f->rsp, &d)) return;
     if (build(f, t, &d, 0, 0, 0) != 0) {
@@ -180,7 +181,7 @@ void lnx_rt_sigreturn(void* frame) {
     f->rcx = rd64(g + G_RCX * 8); f->rsp = rd64(g + G_RSP * 8);
     f->rip = rd64(g + G_RIP * 8);
     f->rflags = (f->rflags & ~RFLAGS_USER_MASK) | (rd64(g + G_EFL * 8) & RFLAGS_USER_MASK);
-    lnx_sig_restore_mask(t, (uint32_t)(rd64(uc + UC_SIGMASK) << 1));
+    lnx_sig_restore_mask(t, rd64(uc + UC_SIGMASK));
     uintptr_t fp = (uintptr_t)rd64(uc + UC_FPREGS);
     if (fp && !(fp & 15) && vmm_user_access_ok(fp, FP_SIZE, 0)) {
         uint8_t* fx = fxarea(t->fpu_state);
@@ -189,4 +190,25 @@ void lnx_rt_sigreturn(void* frame) {
         *(uint32_t*)(fx + 24) &= 0x0000FFFFu;
         hal_fpu_restore(t->fpu_state);
     }
+}
+
+/* §M89 — the INTERRUPT return path: a thread spinning in user mode gets its
+ * signal here instead of at a system call it may never make.  Building the
+ * frame must not sleep, so the preemption count is raised around it — which
+ * makes vma_prefault decline — and a frame that would need a stack page
+ * brought in is NOT built: the signal goes back to pending for the next safe
+ * point (a syscall or a fault).  Picking the signal happens before that: a
+ * default-fatal one ends the task right here, the same thing the §M46
+ * force-kill point already does on this path. */
+void lnx_signal_deliver_irq(void* frame) {
+    struct int_frame* f = (struct int_frame*)frame;
+    if (!((f->cs & 3) == 3)) return;
+    struct task* t = task_current();
+    if (!t || !t->linux_abi || !lnx_sig_deliverable(t)) return;
+    struct lnx_delivery d;
+    if (!lnx_sig_next(t, (uintptr_t)(f->rsp), &d)) return;
+    this_cpu()->preempt_count++;
+    int rc = build(f, t, &d, 0, 0, 0);
+    this_cpu()->preempt_count--;
+    if (rc != 0) lnx_sig_repost(t, d.sig);
 }

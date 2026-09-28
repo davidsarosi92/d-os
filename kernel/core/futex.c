@@ -26,6 +26,7 @@
 #include "ktimer.h"
 #include "timer.h"
 #include "futex.h"
+#include "lnx_signal.h"
 #include "uaccess.h"
 #include <stdint.h>
 
@@ -89,7 +90,7 @@ long futex_wait(uintptr_t uaddr, uint32_t val, uint64_t deadline_ns) {
      * re-checks); only a deadline or a signal says otherwise. */
     if (deadline_ns && timer_now_ns() >= deadline_ns) return -FUTEX_ETIMEDOUT;
     struct task* me = task_current();
-    if (me && (me->sig_pending & ~me->sig_blocked)) return -FUTEX_EINTR;
+    if (me && lnx_sig_deliverable(me)) return -FUTEX_EINTR;
     return 0;
 }
 

@@ -707,6 +707,7 @@ void isr_handler(struct int_frame* f) {
          * so a wedged busy-looping ring-3 program is force-killable on x86_64. */
         task_force_kill_point((f->cs & 3) == 3);
         schedule_check();
+        lnx_signal_deliver_irq(f);                 /* §M89 — back to ring 3 */
         return;
     }
 
@@ -728,6 +729,7 @@ void isr_handler(struct int_frame* f) {
         lapic_eoi();
         task_force_kill_point((f->cs & 3) == 3);   /* §M46 — see IRQ block above */
         schedule_check();
+        lnx_signal_deliver_irq(f);                 /* §M89 — back to ring 3 */
         return;
     }
 

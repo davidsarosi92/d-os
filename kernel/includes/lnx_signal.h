@@ -37,7 +37,15 @@
 struct task;
 struct abi_ctx;
 
-#define LNX_NSIG 32
+/* 1..64 like Linux.  1..31 keep living in task->sig_pending/sig_blocked (the
+ * §M34 bits every other path already reads); the REAL-TIME half, 32..64, lives
+ * in the Linux signal state.  It had been refused at sigaction, and that was
+ * not harmless: a musl-built JDK installs a handler for SIGRTMAX-2 in
+ * NativeThread's class initialiser (it interrupts blocked I/O on close), so
+ * the refusal failed the JDK's first file read — surfacing as an
+ * ArrayIndexOutOfBoundsException(-1) thrown by the `finally` of the read that
+ * never began. */
+#define LNX_NSIG 65
 
 /* sa_flags — the same values on all three guests. */
 #define LNX_SA_NOCLDSTOP 0x00000001u
@@ -67,7 +75,7 @@ struct lnx_sigaction {
     uintptr_t handler;          /* 0 = SIG_DFL, 1 = SIG_IGN, else an address */
     uintptr_t restorer;         /* the libc's rt_sigreturn trampoline        */
     uint32_t  flags;            /* LNX_SA_*                                  */
-    uint32_t  mask;             /* blocked during the handler (kernel bits)  */
+    uint64_t  mask;             /* blocked during the handler (GUEST layout) */
 };
 
 /* What siginfo_t will carry.  Filled when the signal is POSTED — a fault's
@@ -84,7 +92,7 @@ struct lnx_delivery {
     int                  sig;
     struct lnx_sigaction act;
     struct lnx_siginfo   info;
-    uint32_t             old_blocked;   /* goes into uc_sigmask              */
+    uint64_t             old_mask;      /* uc_sigmask, guest layout (bit N-1) */
     uintptr_t            sp;            /* the stack to build the frame on   */
     int                  on_altstack;
 };
@@ -113,8 +121,19 @@ int  lnx_sig_fault(struct task* t, int sig, int code, uintptr_t addr,
                    uintptr_t user_sp, struct lnx_delivery* d);
 
 /* rt_sigreturn: the mask saved in the frame comes back (SIGKILL/SIGSTOP can
- * never be blocked, whatever the frame says). */
-void lnx_sig_restore_mask(struct task* t, uint32_t kernel_mask);
+ * never be blocked, whatever the frame says).  GUEST layout, 64 bits. */
+void lnx_sig_restore_mask(struct task* t, uint64_t guest_mask);
+
+/* The whole 64-signal view in GUEST layout (signal N at bit N-1), for
+ * sigprocmask / sigpending and the frames. */
+uint64_t lnx_sig_blocked64(struct task* t);
+void     lnx_sig_set_blocked64(struct task* t, uint64_t guest_mask);
+uint64_t lnx_sig_pending64(struct task* t);
+/* Is anything pending and not blocked (1..64)?  The cheap gate the return
+ * paths test before doing any work. */
+int      lnx_sig_deliverable(struct task* t);
+/* Put a picked signal back (its frame could not be built safely here). */
+void     lnx_sig_repost(struct task* t, int sig);
 
 /* The altstack's state for a ucontext's uc_stack. */
 void lnx_sig_altstack(struct task* t, uintptr_t* sp, uintptr_t* size, int* flags);
@@ -139,5 +158,6 @@ long lnx_h_kill(struct abi_ctx* c);
 void lnx_signal_deliver(void* frame);            /* on the way back to user mode */
 int  lnx_fault_deliver(void* frame, int sig, uintptr_t addr);   /* 1 = handled */
 void lnx_rt_sigreturn(void* frame);
+void lnx_signal_deliver_irq(void* frame);        /* the interrupt return path */
 
 #endif

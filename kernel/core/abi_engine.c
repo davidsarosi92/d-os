@@ -651,8 +651,9 @@ static long h_mmap_pgoff(struct abi_ctx* c) {
  * symptom.  These two functions are the entire fix, and they exist as named
  * functions rather than inline shifts so the next signal-shaped operation has
  * something obvious to call. */
-static uint32_t abi_sigset_to_kernel(uint64_t guest) { return (uint32_t)(guest << 1); }
-static uint64_t abi_sigset_to_guest (uint32_t kern)  { return (uint64_t)kern >> 1; }
+/* (The two converters that lived here are lnx_sig_blocked64 /
+ * lnx_sig_set_blocked64 / lnx_sig_pending64 now, in lnx_signal.c, which also
+ * hold the real-time half — §M89.) */
 
 /* How much of a guest `sigset_t` is worth touching.
  *
@@ -688,26 +689,26 @@ static long h_sigprocmask(struct abi_ctx* c) {
     int how = (int)c->a[0];
     unsigned long setp = c->a[1], oldp = c->a[2];
 
-    uint32_t old = t->sig_blocked;
-    if (oldp && !abi_sigset_write(c, oldp, abi_sigset_to_guest(old)))
+    /* §M89 — the whole 64-signal mask, in the guest's own layout: the
+     * real-time half (32..64) lives in the Linux signal state, and a
+     * JDK blocks and unblocks it. */
+    uint64_t old = lnx_sig_blocked64(t);
+    if (oldp && !abi_sigset_write(c, oldp, old))
         return -ABI_EFAULT;
     if (!setp) return 0;                        /* query only */
 
     uint64_t gw = 0;
     if (!abi_sigset_read(c, setp, &gw)) return -ABI_EFAULT;
-    uint32_t nw = abi_sigset_to_kernel(gw);
-    uint32_t nb;
+    uint64_t nb;
     switch (how) {
-    case ABI_SIG_BLOCK:   nb = old |  nw; break;
-    case ABI_SIG_UNBLOCK: nb = old & ~nw; break;
-    case ABI_SIG_SETMASK: nb = nw;        break;
+    case ABI_SIG_BLOCK:   nb = old |  gw; break;
+    case ABI_SIG_UNBLOCK: nb = old & ~gw; break;
+    case ABI_SIG_SETMASK: nb = gw;        break;
     default: return -ABI_EINVAL;
     }
-    /* SIGKILL is never blockable — see the delivery path's note.  Masking it
-     * here rather than only at delivery means `sigprocmask(SIG_BLOCK, full)`
-     * followed by a query reports the truth. */
-    nb &= ~(1u << 9);                           /* SIGKILL */
-    t->sig_blocked = nb;
+    /* SIGKILL and SIGSTOP are never blockable — set_blocked64 drops them, so
+     * `sigprocmask(SIG_BLOCK, full)` followed by a query reports the truth. */
+    lnx_sig_set_blocked64(t, nb);
 
     /* Unblocking may have made an already-pending signal deliverable, and the
      * task is about to return to ring 3 — where the delivery check runs — so
@@ -809,13 +810,13 @@ static long h_epoll_wait(struct abi_ctx* c) {
      * window — which is why it could not be done until the blocked mask was
      * real (it was a `return 0` stub until this milestone). */
     struct task* t = task_current();
-    uint32_t saved_mask = 0;
+    uint64_t saved_mask = 0;
     int mask_swapped = 0;
     if (maskp && t) {
         uint64_t gw = 0;
         if (!abi_sigset_read(c, maskp, &gw)) return -ABI_EFAULT;
-        saved_mask = t->sig_blocked;
-        t->sig_blocked = abi_sigset_to_kernel(gw) & ~(1u << 9);  /* SIGKILL */
+        saved_mask = lnx_sig_blocked64(t);
+        lnx_sig_set_blocked64(t, gw);                  /* §M89: all 64 signals */
         mask_swapped = 1;
     }
 
@@ -825,9 +826,9 @@ static long h_epoll_wait(struct abi_ctx* c) {
         return -ABI_EFAULT;
 
     uint64_t* k = (uint64_t*)kmalloc(sizeof(uint64_t) * 2 * (size_t)maxevents);
-    if (!k) { if (mask_swapped) t->sig_blocked = saved_mask; return -ABI_ENOMEM; }
+    if (!k) { if (mask_swapped) lnx_sig_set_blocked64(t, saved_mask); return -ABI_ENOMEM; }
     int n = sys_epoll_wait_k(epfd, k, maxevents, timeout);
-    if (mask_swapped) t->sig_blocked = saved_mask;   /* restore on EVERY path */
+    if (mask_swapped) lnx_sig_set_blocked64(t, saved_mask);   /* restore on EVERY path */
     if (n > 0) {
         uint8_t* out = (uint8_t*)(uintptr_t)outp;
         unsigned long doff = abi_epoll_data_off(c);
@@ -850,7 +851,7 @@ static long h_sigpending(struct abi_ctx* c) {
     /* Only the signals that are BOTH pending and blocked: an unblocked
      * pending signal is one the task simply has not returned to ring 3 to
      * collect yet, and reporting it would be a race, not information. */
-    uint64_t v = t ? abi_sigset_to_guest(t->sig_pending & t->sig_blocked) : 0;
+    uint64_t v = t ? (lnx_sig_pending64(t) & lnx_sig_blocked64(t)) : 0;
     if (!abi_sigset_write(c, p, v)) return -ABI_EFAULT;
     return 0;
 }
@@ -1097,6 +1098,33 @@ static long h_statfs(struct abi_ctx* c) {
     struct kstat_full st;
     if (sys_stat_full_k(kp, &st) != 0) return -ABI_ENOENT;
     return put_statfs(c, (uintptr_t)c->a[1], 0);
+}
+/* i386's statfs64(path, size, buf) / fstatfs64(fd, size, buf): the counts are
+ * 64-bit, f_type/f_bsize and the tail 32-bit, and the caller passes the size
+ * it was compiled with (84). */
+static long put_statfs64_i386(uintptr_t p) {
+    if (!abi_w_ok(p, 84)) return -ABI_EFAULT;
+    for (unsigned i = 0; i < 84; i++) ((uint8_t*)p)[i] = 0;
+    *(uint32_t*)(p + 0) = 0x858458f6u;
+    *(uint32_t*)(p + 4) = 4096;
+    uint64_t v[5] = { pmm_managed_frames(), pmm_free_frames(), pmm_free_frames(), 65536, 65536 };
+    for (int i = 0; i < 5; i++) *(uint64_t*)(p + 8 + 8 * (uintptr_t)i) = v[i];
+    *(uint32_t*)(p + 56) = 255;                               /* f_namelen */
+    *(uint32_t*)(p + 60) = 4096;                              /* f_frsize */
+    return 0;
+}
+static long h_statfs64(struct abi_ctx* c) {
+    char kp[256];
+    if (abi_path(c->a[0], kp, sizeof kp) != 0) return -ABI_EFAULT;
+    struct kstat_full st;
+    if (sys_stat_full_k(kp, &st) != 0) return -ABI_ENOENT;
+    if (c->a[1] < 84) return -ABI_EINVAL;
+    return put_statfs64_i386((uintptr_t)c->a[2]);
+}
+static long h_fstatfs64(struct abi_ctx* c) {
+    if (!fd_lookup((int)c->a[0]) && ((int)c->a[0] < 0 || (int)c->a[0] > 2)) return -ABI_EBADF;
+    if (c->a[1] < 84) return -ABI_EINVAL;
+    return put_statfs64_i386((uintptr_t)c->a[2]);
 }
 static long h_fstatfs(struct abi_ctx* c) {
     if (!fd_lookup((int)c->a[0]) && ((int)c->a[0] < 0 || (int)c->a[0] > 2)) return -ABI_EBADF;
@@ -1551,6 +1579,8 @@ static const struct {
     [ABI_SCHED_SETAFFINITY] = { "sched_setaffinity", h_sched_setaffinity },
     [ABI_SET_ROBUST_LIST]   = { "set_robust_list",   h_set_robust_list   },
     [ABI_PPOLL]         = { "ppoll",        h_ppoll         },
+    [ABI_STATFS64]      = { "statfs64",     h_statfs64      },
+    [ABI_FSTATFS64]     = { "fstatfs64",    h_fstatfs64     },
     [ABI_OPEN]         = { "open",         h_open         },
     [ABI_OPENAT]       = { "openat",       h_openat       },
     [ABI_STAT]         = { "stat",         h_stat         },

@@ -17,6 +17,12 @@
  *   5. SA_MASK — a signal in sa_mask, raised inside the handler, is held until
  *      the handler returns, then delivered.
  *   6. PTHREAD_KILL — a signal to another THREAD runs the handler on it.
+ *   7. NO SYSCALL — the same, to a thread spinning in pure user code that
+ *      never enters the kernel: only delivery on the INTERRUPT return path
+ *      can reach it (a pre-§M89-rung-2 kernel delivered at syscalls only).
+ *   8. REAL-TIME — SIGRTMAX-2 (what a musl JDK's NativeThread uses): a handler
+ *      is accepted, the signal is held while blocked, shows in sigpending,
+ *      and arrives when unblocked.
  * ============================================================================= */
 
 #define _GNU_SOURCE
@@ -102,6 +108,21 @@ static void* s6_thread(void* a) {
     return NULL;
 }
 
+/* 8 */
+static volatile int s8_hit;
+static void h_rt(int sig) { (void)sig; s8_hit++; }
+
+/* 7 */
+static volatile int s7_ready, s7_hit;
+static pthread_t s7_tid;
+static void h_usr1_spin(int sig) { (void)sig; s7_hit = 1; }
+static void* s7_thread(void* a) {
+    (void)a;
+    s7_ready = 1;
+    for (unsigned long i = 0; i < 3000000000ul && !s7_hit; i++) __asm__ volatile ("" ::: "memory");
+    return NULL;
+}
+
 int main(void) {
     struct sigaction sa;
 
@@ -176,6 +197,38 @@ int main(void) {
         pthread_kill(s6_tid, SIGTERM);
         pthread_join(s6_tid, NULL);
         verdict(s6_done && s6_ran_on_target, "pthread_kill runs the handler on the target thread");
+    }
+
+    /* 7 */
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = h_usr1_spin;
+    sigaction(SIGUSR1, &sa, NULL);
+    if (pthread_create(&s7_tid, NULL, s7_thread, NULL) != 0) {
+        verdict(0, "a thread spinning without syscalls is signalled (no threads)");
+    } else {
+        while (!s7_ready) sched_yield();
+        pthread_kill(s7_tid, SIGUSR1);
+        pthread_join(s7_tid, NULL);
+        verdict(s7_hit, "a thread spinning without syscalls is signalled (interrupt return path)");
+    }
+
+    /* 8 */
+    {
+        int rt = SIGRTMAX - 2;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = h_rt;
+        int ok = sigaction(rt, &sa, NULL) == 0;
+        sigset_t b, p;
+        sigemptyset(&b); sigaddset(&b, rt);
+        ok &= sigprocmask(SIG_BLOCK, &b, NULL) == 0;
+        raise(rt);
+        sigemptyset(&p); sigpending(&p);
+        int held = sigismember(&p, rt) == 1 && s8_hit == 0;
+        sigprocmask(SIG_UNBLOCK, &b, NULL);
+        getpid();                                   /* a return path to deliver on */
+        verdict(ok && held && s8_hit == 1,
+                "a real-time signal: accepted, held while blocked, delivered on unblock");
+        if (!(ok && held && s8_hit == 1)) printf("sigmusl: rt=%d ok=%d held=%d hits=%d\n", rt, ok, held, s8_hit);
     }
 
     printf("sigmusl: %s (%d failed)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

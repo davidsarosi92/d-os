@@ -27,6 +27,7 @@
 
 #include "lnx_signal.h"
 #include "task.h"
+#include "percpu.h"
 #include "vmm.h"
 #include "hal_api.h"
 #include "syscall.h"
@@ -99,7 +100,7 @@ static int build(struct trapframe* f, struct task* t, const struct lnx_delivery*
     wr64(uc + UC_STACK, ss_sp);
     wr32(uc + UC_STACK + 8, (uint32_t)(d->on_altstack ? LNX_SS_ONSTACK : ss_flags));
     wr64(uc + UC_STACK + 16, ss_size);
-    wr64(uc + UC_SIGMASK, (uint64_t)d->old_blocked >> 1);
+    wr64(uc + UC_SIGMASK, d->old_mask);
 
     uintptr_t mc = uc + UC_MCTX;
     wr64(mc + MC_FAULT, fault_addr);
@@ -137,7 +138,7 @@ void lnx_signal_deliver(void* frame) {
     struct trapframe* f = (struct trapframe*)frame;
     if ((f->spsr & 0xF) != 0) return;
     struct task* t = task_current();
-    if (!t || !t->sig_pending) return;
+    if (!t || !lnx_sig_deliverable(t)) return;
     struct lnx_delivery d;
     if (!lnx_sig_next(t, (uintptr_t)read_sp_el0(), &d)) return;
     if (build(f, t, &d, 0) != 0) {
@@ -188,7 +189,7 @@ void lnx_rt_sigreturn(void* frame) {
     write_sp_el0(rd64(mc + MC_SP));
     f->elr = rd64(mc + MC_PC);
     f->spsr = (f->spsr & ~SPSR_USER_MASK) | (rd64(mc + MC_PSTATE) & SPSR_USER_MASK);
-    lnx_sig_restore_mask(t, (uint32_t)(rd64(uc + UC_SIGMASK) << 1));
+    lnx_sig_restore_mask(t, rd64(uc + UC_SIGMASK));
     uintptr_t fp = mc + MC_RESERVED;
     if (rd32(fp) == FPSIMD_MAGIC && rd32(fp + 4) == FPSIMD_SIZE) {
         uint8_t* fa = fpu_area(t->fpu_state);
@@ -197,4 +198,25 @@ void lnx_rt_sigreturn(void* frame) {
         *(uint32_t*)(fa + 512) = rd32(fp + 12);           /* fpcr */
         hal_fpu_restore(t->fpu_state);
     }
+}
+
+/* §M89 — the INTERRUPT return path: a thread spinning in user mode gets its
+ * signal here instead of at a system call it may never make.  Building the
+ * frame must not sleep, so the preemption count is raised around it — which
+ * makes vma_prefault decline — and a frame that would need a stack page
+ * brought in is NOT built: the signal goes back to pending for the next safe
+ * point (a syscall or a fault).  Picking the signal happens before that: a
+ * default-fatal one ends the task right here, the same thing the §M46
+ * force-kill point already does on this path. */
+void lnx_signal_deliver_irq(void* frame) {
+    struct trapframe* f = (struct trapframe*)frame;
+    if (!((f->spsr & 0xF) == 0)) return;
+    struct task* t = task_current();
+    if (!t || !t->linux_abi || !lnx_sig_deliverable(t)) return;
+    struct lnx_delivery d;
+    if (!lnx_sig_next(t, (uintptr_t)(read_sp_el0()), &d)) return;
+    this_cpu()->preempt_count++;
+    int rc = build(f, t, &d, 0);
+    this_cpu()->preempt_count--;
+    if (rc != 0) lnx_sig_repost(t, d.sig);
 }

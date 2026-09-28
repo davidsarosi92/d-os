@@ -382,7 +382,15 @@ static unsigned char* gunzip(const unsigned char* g, unsigned glen, unsigned* ou
     if (p >= glen - 8) return 0;
     unsigned want_crc = g[glen-8] | (g[glen-7] << 8) | (g[glen-6] << 16) | ((unsigned)g[glen-5] << 24);
     unsigned isize    = g[glen-4] | (g[glen-3] << 8) | (g[glen-2] << 16) | ((unsigned)g[glen-1] << 24);
-    if (isize > (192u << 20)) return 0;                 /* refuse a gzip bomb */
+    /* Refuse a gzip BOMB by its RATIO, not its size (§M89).  The first rule
+     * was an absolute 192 MB, which refused the one thing this tool exists
+     * for once the thing was a JDK (a 158 MB layer that is 307 MB unpacked),
+     * and bounded nothing about a bomb that stays under it.  A bomb is
+     * characterised by an absurd ratio (1000:1 and up); real layers are 2-3:1.
+     * Small outputs are always fine; above 64 MB the ratio must stay under
+     * 20:1; 1 GiB is the ceiling whatever the ratio. */
+    if (isize > (64u << 20) && (isize / 20u > glen || isize > (1024u << 20)))
+        return 0;
     unsigned char* out = (unsigned char*)malloc(isize + 1);
     if (!out) return 0;
     unsigned got = 0;

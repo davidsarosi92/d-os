@@ -803,6 +803,7 @@ void isr_handler(struct int_frame* f) {
          * the interrupt controller will keep delivering ticks to
          * whichever task we pivot to. */
         schedule_check();
+        lnx_signal_deliver_irq(f);                 /* §M89 — back to ring 3 */
         return;
     }
 
@@ -829,6 +830,7 @@ void isr_handler(struct int_frame* f) {
         lapic_eoi();
         task_force_kill_point((f->cs & 3) == 3);   /* §M46 — see IRQ block above */
         schedule_check();
+        lnx_signal_deliver_irq(f);                 /* §M89 — back to ring 3 */
         return;
     }
 

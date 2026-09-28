@@ -60,9 +60,10 @@ static inline void write_sp_el0(uint64_t v) {
 void signal_deliver(struct trapframe* f) {
     if ((f->spsr & 0xF) != 0) return;          /* only when returning to EL0 */
     struct task* t = task_current();
+    /* §M89 — a Linux program gets Linux's frame and default actions, and its
+     * real-time signals do not show in sig_pending, so it is routed first. */
+    if (t && t->linux_abi) { lnx_signal_deliver(f); return; }
     if (!t || !t->sig_pending) return;
-    /* §M89 — a Linux program gets Linux's frame and default actions. */
-    if (t->linux_abi) { lnx_signal_deliver(f); return; }
 
     for (int sig = 1; sig < NSIG; sig++) {
         uint32_t bit = 1u << sig;
@@ -121,7 +122,7 @@ void signal_deliver(struct trapframe* f) {
  * next system call on every arch (NEXT.md: §M89 open item). */
 void signal_deliver_irq(struct trapframe* f) {
     struct task* t = task_current();
-    if (t && t->linux_abi) return;
+    if (t && t->linux_abi) { lnx_signal_deliver_irq(f); return; }
     signal_deliver(f);
 }
 

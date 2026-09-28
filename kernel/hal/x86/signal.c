@@ -44,9 +44,10 @@ enum { S_EAX, S_EBX, S_ECX, S_EDX, S_ESI, S_EDI, S_EBP, S_EIP, S_EFLAGS, S_ESP, 
 void signal_deliver(struct int_frame* f) {
     if ((f->cs & 3) != 3) return;              /* only when returning to ring 3 */
     struct task* t = task_current();
+    /* §M89 — a Linux program gets Linux's frame and default actions, and its
+     * real-time signals do not show in sig_pending, so it is routed first. */
+    if (t && t->linux_abi) { lnx_signal_deliver(f); return; }
     if (!t || !t->sig_pending) return;
-    /* §M89 — a Linux program gets Linux's frame and default actions. */
-    if (t->linux_abi) { lnx_signal_deliver(f); return; }
 
     for (int sig = 1; sig < NSIG; sig++) {
         uint32_t bit = 1u << sig;

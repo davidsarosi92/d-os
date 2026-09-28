@@ -35,6 +35,28 @@ a real Wi-Fi driver, and the rows under "Known defects — Open".
 
 ## Queued from use (2026-09-28) — after §M89
 
+- **DECIDED (2026-09-28): Java is INSTALLED SOFTWARE, not a container.**  The
+  user's direction: install once, it stays, it is listed among installed
+  software, updates go the same way, executables reachable through PATH.
+  Build: `pkg install java` unpacks ONLY the JDK tree (not the Alpine rootfs)
+  from the image into the §M35.5 store placed on the PERSISTENT disk
+  (`/mnt/store/<hash>-temurin-jdk-<version>/`), registers it (pkg list, the
+  Packages panel), and puts its `bin/` on PATH through the store's profile, so
+  `java Hello.java` runs from a plain shell.  Updates install beside the old
+  version and move the profile; rollback = move it back; `pkg gc` removes the
+  old one.  Source: the image file on the disk first, a TLS download later.
+  Containers stay available for isolation.  Next after §M89's Hello.java.
+  **Refined by the user the same day:** the install place is a NON-OS folder
+  on the persistent disk (`/mnt/apps/<name>/<version>/`, JDK tree only), and a
+  `/bin`-launchable form is wanted too — which needs SYMBOLIC LINKS in the VFS
+  and ramfs (`/bin/java -> /mnt/apps/java/<version>/bin/java`; copying the
+  binary would break its /proc/self/exe-based JAVA_HOME), a link an update
+  moves and a rollback moves back.  Temporary delivery: `run_qemu.sh` copies a
+  JDK image from `build/java/` onto the disk (`/mnt/incoming/`) before QEMU
+  starts when it is not there yet (hdiutil on macOS), and a boot service
+  installs anything in `/mnt/incoming/` not installed yet.  Replaced later by
+  a TLS download.
+
 - **Autologin works only when the autologin account has NO password.**  An
   account chosen for automatic sign-in that also has a password falls back to
   the lock screen.  Decide the rule (autologin is an explicit choice by an

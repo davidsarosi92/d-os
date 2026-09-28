@@ -231,7 +231,7 @@ fixed first, whatever it touches.
 | §M73 | ✅ complete — rungs 1-3 (§4.115) | — (resource caps per container, network namespace, registry pull) |
 | queued UI | ✅ done (§4.116) — Memory page, System information, translations 73 → 0 | — |
 | §M88 | ✅ first cut (§4.118) | per-output modes, live re-arrangement, left/above, >16 MiB desktops |
-| §M89 | — | Java: a JRE (and the JDK with it) — asked for 2026-09-28, scoped below; in the queue after §M81 and §M88 |
+| §M89 | ◐ | Java: a JRE (and the JDK with it) — rungs 1-3 done (VMA layer, Linux signals, arm64 threads); `java -version` runs on x86_64 (DOCS §4.119) |
 | §M68 | — | investigation, not started |
 | §M83, §M84 | — | designed, not started |
 
@@ -320,7 +320,7 @@ what); a session can pick a theme and push on it.
 | M85 | **aarch64 beyond `virt`: QEMU `sbsa-ref`** — asked for directly (2026-09-25).  The ARM port knows exactly ONE machine: ten places hardcode `virt`'s map (GICv2 at `0x08000000`, PL011 at `0x09000000`, virtio-mmio at `0x0a000000`, ECAM at `0x40_1000_0000`, RAM at `0x4000_0000`, the DTB loaded at `0x4800_0000`).  `sbsa-ref` is the reference for a STANDARD ARM server: firmware boot (TF-A + EDK2, UEFI), ACPI instead of a device tree, GICv3, devices on PCIe rather than virtio-mmio.  The deliverable is a port that DISCOVERS its board — which is also the precondition for any real phone (§M84) | Platform / Portability | ✅ COMPLETE (DOCS §4.99-§4.102, §4.105): board discovery, GICv3, UEFI + ACPI, relocatable kernel, disk/USB/network, bochs-display, PCI INTx routing (`_PRT` / `interrupt-map`).  Left for later: a real clock on sbsa-ref (UEFI runtime GetTime), a Normal-NC framebuffer mapping |
 | M86 | **Memory beyond the 4 GiB line on i386 and aarch64** — asked for directly (2026-09-25).  x86_64 already discovers its ceiling (§M48, verified to 128 GiB).  i386 manages only what its 1 GiB identity map covers (473 MiB free on a 512 MiB box; RAM past 1 GiB unused) and cannot address physical memory above 4 GiB at all without PAE; aarch64's early MMU identity-maps 0-4 GiB in 1 GiB blocks with RAM from `0x4000_0000`, so at most ~3 GiB is usable and `hal_extend_identity_map` caps at 4 GiB | Memory / Portability | ✅ COMPLETE (highmem §4.94, PAE §4.96, aarch64 TTBR1 §4.97, multi-range DTB §4.98, user no-execute on x86 §4.104).  Kernel pages stay executable (modules run from the heap) |
 | M87 | **Network and storage in the Control Panel** — asked for directly (2026-09-27): a Network page, a taskbar network indicator with a Wi-Fi chooser, disk management with its functions, and the missing translations | UX / Network / Storage | §M87 — ✅ SHIPPED (DOCS §4.103): six-state network status, link state, admin down, static config keys, a simulated Wi-Fi adapter (QEMU has no Wi-Fi), `vfs_umount` + holds, an exFAT formatter (fsck-clean), RAM disks, `locale missing`; open: a real Wi-Fi driver, partition tables, a second virtio disk |
-| M89 | **Java — a JRE, and the JDK with it** — asked for directly (2026-09-28): Alpine's musl-built OpenJDK as a §M73 image on x86_64 + aarch64 (i386: no current JDK exists).  Needs a real address-space layer (reservations, demand-zero, PROT_NONE, lazy file maps), Linux signal delivery with siginfo/ucontext, arm64 threads, and a bulk of small calls | Userland | §M89 — scoped, not started |
+| M89 | **Java — a JRE, and the JDK with it** — asked for directly (2026-09-28): Alpine's musl-built OpenJDK as a §M73 image on x86_64 + aarch64 (i386: no current JDK exists).  Needs a real address-space layer (reservations, demand-zero, PROT_NONE, lazy file maps), Linux signal delivery with siginfo/ucontext, arm64 threads, and a bulk of small calls | Userland | §M89 — in progress: java -version on x86_64 (DOCS §4.119) |
 
 ### Cross-cutting constraints
 
@@ -5962,10 +5962,21 @@ independent reason it should be the next milestone.
 
 ## §M89 — Java: a JRE, and the JDK with it
 
-**Status: scoped, not started.  Asked for 2026-09-28: "JRE futtatás valamilyen
-formában, hogy java programok el tudjanak indulni; ha nem sokkal nagyobb
-effort, akkor JDK is" — to be queued only if it is not larger than the largest
-milestone so far.**
+**Status: IN PROGRESS (2026-09-28) — rungs 1-3 done on all three arches;
+`java -version` runs on x86_64 from an unmodified Temurin 21 JRE image (DOCS
+§4.119).  Asked for 2026-09-28: "JRE futtatás valamilyen formában, hogy java
+programok el tudjanak indulni; ha nem sokkal nagyobb effort, akkor JDK is".**
+
+Lessons learned (each a defect independent of Java, found by running it):
+ramfs could not hold a file over 16 MiB (one contiguous kmalloc); the auxv
+lacked AT_UID..AT_EGID so musl ran every dynamic program "secure" ($ORIGIN and
+LD_LIBRARY_PATH ignored); execve dropped envp (the JRE launcher re-executes
+itself and looped); threads copied the descriptor table; **futex keyed through
+vmm_translate, which walks the kernel's tables on x86_64, so FUTEX_WAIT had
+failed on every call since M35 and musl spun instead of waiting**; an ENOSYS
+getcpu sent HotSpot to the legacy vsyscall page; a dozen calls existed only in
+the x86 switches, so arm64 had none.  *An ENOSYS is not a neutral answer when
+the caller's plan B is worse than an honest value.*
 
 ### The estimate, and the verdict on the size rule
 

@@ -15526,6 +15526,123 @@ taskbar line, clean.  x86_64 and aarch64 (virtio-gpu primary + bochs-display):
 the desktop; left/above; a desktop larger than 16 MiB (two 1920x1200 screens);
 virtio-gpu's own second scanout; a taskbar per monitor.
 
+### 4.119 §M89 — Java: an unmodified JRE and JDK in a container (2026-09-28)
+
+**The route is an IMAGE, not a port.**  Alpine's Temurin builds are linked
+against musl, and §M73 runs unmodified musl programs from an OCI image, so the
+milestone is `ctr import jre <archive>` + `ctr run jre /opt/java/openjdk/bin/java
+-version`.  The work was everything HotSpot needs from the kernel that nothing
+here had needed before — found by running it, one failure at a time.  i386 is
+out of scope (no current JDK exists for it); x86_64 and aarch64 are the
+targets.  Getting the image in: an OCI archive (`docker save`) on the exFAT
+disk (`build/java/*.img`, attached with `--disk`).
+
+**Rung 1 — the address space has a memory (`kernel/mem/vma.c`, `vma.h`).**
+The page tables said what was mapped NOW, and that was the only record, so an
+anonymous mmap allocated and zeroed every frame up front (capped at 256 MB),
+addresses came from a bump cursor that never went back, and PROT_NONE mapped a
+readable page.  Now each space has a sorted list of reservations (merged when
+adjacent anonymous ranges agree): demand-zero anonymous pages, lazily filled
+private file mappings (the §M74 page cache, copy-on-write), EAGER ranges for
+shm and driver windows, MAP_FIXED / MAP_FIXED_NOREPLACE, reuse after munmap,
+MADV_DONTNEED that really drops private pages, and mincore answered from the
+tables without prefaulting.  PROT_NONE is a present, KERNEL-ONLY page, so a
+guard page faults and its contents survive the round trip.  The allocator
+avoids what it does not track through two per-arch primitives
+(`vmm_space_probe`, `vmm_space_range_state`: nothing / user / the kernel's
+shared tables) instead of a hard-coded layout — the first 4 GiB reservation on
+x86_64 landed at 4 GiB exactly, stepping over the 3-4 GiB MMIO window by
+itself.  `vmm_user_access_ok` brings demand pages in before refusing a range,
+so a syscall writing into a fresh buffer works; the fault paths on all three
+arches call `vma_fault` after swap-in.  Two arch bugs fell out: aarch64's
+`vmm_space_protect` ignored VMM_USER (PROT_NONE read as readable), and i386's
+COW resolver forced the user bit on.  **`mmaptest`** (an unmodified musl
+binary; seven claims, each failing on the old kernel — the first by the 256 MB
+cap alone): 7/7 on i386, x86_64 and aarch64.
+
+**Rung 2 — Linux signals, delivered (`kernel/core/lnx_signal.c`,
+`hal/<arch>/lnx_sigframe.c`).**  rt_sigaction had been accepted and ignored,
+and every fault killed the process.  Dispositions are per PROCESS (shared by
+threads), pending/blocked stay per thread; the FRAME is Linux's
+`rt_sigframe` byte for byte on each arch (siginfo + ucontext with the machine
+context musl and HotSpot are compiled against, FP state included — and on
+i386 the OLD `sigframe` too, which musl's `__restore`/#119 expects for a
+handler without SA_SIGINFO).  Faults reach a handler with si_addr/si_code
+(SIGSEGV, SIGILL, SIGFPE, SIGBUS, SIGTRAP); rt_sigreturn restores what the
+handler changed, so rewriting the saved pc resumes elsewhere; sigaltstack,
+sa_mask, SA_NODEFER, SA_RESETHAND, kill/tkill/tgkill (a sibling THREAD may be
+signalled — the ancestry rule refused pthread_kill), Linux default actions,
+and a posted signal wakes a sleeping thread (futex returns EINTR).
+**`sigmusl`**: 6/6 on all three arches.
+
+**Rung 3 — arm64 Linux threads** (`proc_clone_thread` in hal/aarch64/fork.c:
+shared space, descriptor table and dispositions, CLONE_SETTLS into
+TPIDR_EL0).  `pthreadtest` 20000/20000 on arm64.
+
+**Found on the way — each a defect independent of Java:**
+- ramfs held a file in ONE contiguous kmalloc block: nothing over 16 MiB could
+  exist (the JRE's 101 MB `lib/modules` failed to write).  Pages now.
+- The auxv lacked AT_UID..AT_EGID, so musl ran EVERY dynamic program as
+  "secure": LD_LIBRARY_PATH and `$ORIGIN` ignored ("Error loading shared
+  library libjli.so" with the file right there).
+- `/proc/self/exe` did not exist (`cred.exe`, set by execve and ctr).
+- execve DROPPED envp — the JRE launcher sets LD_LIBRARY_PATH and re-executes
+  itself, so it looped forever.  argv/envp now reach the new image; the
+  initial stack checks that they fit its page (it never had) and refuses with
+  E2BIG instead of truncating; argv 16 → 64.
+- Threads COPIED the descriptor table (CLONE_FILES): now a shared,
+  refcounted `fdtable`.
+- **futex was keyed through `vmm_translate`, which walks the KERNEL's tables on
+  x86_64: FUTEX_WAIT failed on every call since M35**, and musl spun instead of
+  waiting (a JVM's main thread made 3.6 million futex calls waiting for its
+  first child).  Rewritten keyed by (space, address), with the private flag,
+  relative and absolute timeouts, bitset and requeue, as one engine op.
+- getcpu was ENOSYS, and HotSpot's fallback jumps to the legacy x86_64
+  vsyscall page (0xffffffffff600800) — the JVM died of SIGSEGV at an address
+  of its own invention.  Also sysinfo, get/set/prlimit, clock_getres, statfs,
+  prctl, getrusage.
+- sched_yield, getrandom, madvise, membarrier, memfd_create, ftruncate,
+  mincore, pread/pwrite, sched affinity, set_robust_list existed ONLY in the
+  two x86 switches — arm64 had none.  One engine handler each now; the switch
+  arms are deleted (§M56.1's rule).
+
+**How Java gets onto the machine, and how it is updated — the state today,
+said plainly.**  It is NEITHER built in NOR a package: it is an OCI image the
+user brings.  `docker save eclipse-temurin:21-jdk-alpine` on a host → the
+archive copied onto the exFAT disk → `ctr import jdk /mnt/jdk.tar` →
+`ctr run jdk /opt/java/openjdk/bin/java ...`.  **The unpacked tree lives in
+`/containers` on ramfs, so it is GONE after a reboot** and the import (minutes
+under emulation) has to be repeated.  Updating = saving a newer image and
+importing it under a new name; nothing tracks versions, nothing pins one.
+
+The three shapes it could take, and why the third is the recommendation:
+- *Built into the kernel image* (like busybox): a 150-300 MB kernel image,
+  a rebuild for every Java update, and every machine carries it whether it
+  wants Java or not.  Rejected.
+- *A §M35.5 package installed at boot*: the store is content-addressed and
+  versioned, which is right, but "installed at boot" is the wrong trigger for
+  300 MB — and the store would have to learn to hold an OCI tree.
+- *A persistent, versioned container store on the disk* (recommended): import
+  once into `/mnt/containers/<name>@<version>/`, found again at the next boot,
+  run by name; an update imports the new version BESIDE the old one and moves
+  a `jdk` → `jdk@21.0.13` pointer, the old one kept until removed — rollback
+  is moving the pointer back.  Later, `ctr pull` over §M39's TLS replaces the
+  host step.  Needs: the store on exFAT (hard links and the symlink-less
+  layout ociunpack already produces), a version read from the image's own
+  config, and `ctr list/rm/use`.
+
+**Decided (2026-09-28):** Java becomes INSTALLED SOFTWARE — `pkg install
+java` puts only the JDK tree into the package store on the persistent disk,
+lists it among installed packages, and exposes `bin/` through PATH; updates
+install beside the old version and move the profile (NEXT.md).
+
+**Open:** a signal to a thread spinning in user mode is delivered at its next
+system call or fault, not at a timer interrupt (building a frame may need to
+fault a stack page in, which an interrupt must not); cross-process shared
+futexes at different addresses; per-process rusage across threads; the FP
+image on i386 is FXSAVE, not `_fpstate_32`; robust futex lists are not walked
+at thread death.
+
 ## 8. Change log
 
 - **2026-09-28 — §M88 (first cut): more than one monitor on all three arches — an output registry (`displays`), a portable bochs-display second-head driver, one virtual desktop composed across outputs, per-monitor taskbar/maximize/wallpaper/pointer policy, the Monitors page; harness `--second-display`/`--screenshot2`.  Fixed on the way: density taken from the desktop width, the drag copy path leaving a trail below the primary (DOCS §4.118).**

@@ -53,10 +53,11 @@ enum {
 void signal_deliver(struct int_frame* f) {
     if ((f->cs & 3) != 3) return;              /* only when returning to ring 3 */
     struct task* t = task_current();
-    if (!t || !t->sig_pending) return;
     /* §M89 — a Linux program gets Linux's frame (siginfo + ucontext) and
-     * Linux's default actions; this in-house frame is for native programs. */
-    if (t->linux_abi) { lnx_signal_deliver(f); return; }
+     * Linux's default actions (and real-time signals, which do not show in
+     * sig_pending); this in-house frame is for native programs. */
+    if (t && t->linux_abi) { lnx_signal_deliver(f); return; }
+    if (!t || !t->sig_pending) return;
 
     for (int sig = 1; sig < NSIG; sig++) {
         uint32_t bit = 1u << sig;

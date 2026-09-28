@@ -70,6 +70,15 @@
     ldp     x28, x29, [sp, #16 * 14]
     ldr     x30,      [sp, #16 * 15]
     add     sp,  sp,  #272
+    /* §M89 — clear the local EXCLUSIVE MONITOR on every way back.  Between a
+     * thread's ldaxr and its stlxr the kernel may run another thread on this
+     * CPU; if that one's own ldaxr/stlxr touched the same lock word, the first
+     * thread's stlxr could SUCCEED on a reservation that is not its own — a
+     * lost update inside what the program believes is an atomic.  ARMv8 lets
+     * an exception return clear the monitor but does not require it; clearing
+     * it here costs one instruction and turns the interrupted store-exclusive
+     * into a failure its loop retries, which is always correct. */
+    clrex
 .endm
 
 /* Exception "type" codes handed to the C dispatcher.  Kept in sync with the

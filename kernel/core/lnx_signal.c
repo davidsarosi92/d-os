@@ -43,6 +43,8 @@ struct lnx_sighand {
 
 struct lnx_sigstate {
     struct lnx_sighand* sh;
+    uint64_t            rt_pending;          /* signals 32..64 at bit (sig-32) */
+    uint64_t            rt_blocked;
     uintptr_t           ss_sp, ss_size;
     int                 ss_flags;            /* LNX_SS_DISABLE when none      */
     struct lnx_siginfo  info[LNX_NSIG];
@@ -74,7 +76,7 @@ static struct lnx_sigstate* state_of(struct task* t, int create) {
     spin_lock_init(&h->lock);
     /* Seed from the native dispositions so a handler installed through the
      * §M34 interface is not forgotten when the Linux one is first used. */
-    for (int i = 1; i < LNX_NSIG; i++) {
+    for (int i = 1; i < 32; i++) {
         h->a[i].handler  = t->sig_handler[i];
         h->a[i].restorer = t->sig_restorer;
     }
@@ -98,6 +100,7 @@ void lnx_sig_fork(struct task* parent, struct task* child) {
     for (int i = 0; i < LNX_NSIG; i++) cs->sh->a[i] = ps->sh->a[i];
     spin_unlock_irqrestore(&ps->sh->lock, fl);
     cs->ss_sp = ps->ss_sp; cs->ss_size = ps->ss_size; cs->ss_flags = ps->ss_flags;
+    cs->rt_blocked = ps->rt_blocked;               /* a fork inherits the mask */
 }
 
 void lnx_sig_thread(struct task* parent, struct task* child) {
@@ -109,6 +112,7 @@ void lnx_sig_thread(struct task* parent, struct task* child) {
     cs->ss_flags = LNX_SS_DISABLE;             /* a new thread has no altstack */
     __atomic_add_fetch(&ps->sh->refs, 1, __ATOMIC_ACQ_REL);
     cs->sh = ps->sh;                           /* CLONE_SIGHAND               */
+    cs->rt_blocked = ps->rt_blocked;           /* ...and the creator's mask   */
     child->lsig = cs;
 }
 
@@ -156,10 +160,18 @@ int lnx_sig_post(struct task* t, int sig, const struct lnx_siginfo* info) {
         si.signo = sig;
         s->info[sig] = si;
     }
-    __atomic_or_fetch(&t->sig_pending, 1u << sig, __ATOMIC_ACQ_REL);
+    int blocked;
+    if (sig < 32) {
+        __atomic_or_fetch(&t->sig_pending, 1u << sig, __ATOMIC_ACQ_REL);
+        blocked = (t->sig_blocked & (1u << sig)) != 0;
+    } else {
+        if (!s) return -1;
+        __atomic_or_fetch(&s->rt_pending, 1ull << (sig - 32), __ATOMIC_ACQ_REL);
+        blocked = (s->rt_blocked & (1ull << (sig - 32))) != 0;
+    }
     /* A thread asleep in a futex or a sleep must notice now, not at its next
      * natural wake (a JVM handshake waits for exactly this). */
-    if (!(t->sig_blocked & (1u << sig)) && t != task_current()) task_signal_wake(t);
+    if (!blocked && t != task_current()) task_signal_wake(t);
     return 0;
 }
 
@@ -175,11 +187,19 @@ static uintptr_t pick_stack(struct lnx_sigstate* s, uint32_t flags, uintptr_t sp
 int lnx_sig_next(struct task* t, uintptr_t user_sp, struct lnx_delivery* d) {
     struct lnx_sigstate* s = state_of(t, 0);
     for (int sig = 1; sig < LNX_NSIG; sig++) {
-        uint32_t bit = 1u << sig;
-        uint32_t pend = __atomic_load_n(&t->sig_pending, __ATOMIC_ACQUIRE);
-        if (!(pend & bit)) continue;
-        if ((t->sig_blocked & bit) && sig != SIGKILL) continue;
-        __atomic_and_fetch(&t->sig_pending, ~bit, __ATOMIC_ACQ_REL);
+        if (sig < 32) {
+            uint32_t bit = 1u << sig;
+            uint32_t pend = __atomic_load_n(&t->sig_pending, __ATOMIC_ACQUIRE);
+            if (!(pend & bit)) continue;
+            if ((t->sig_blocked & bit) && sig != SIGKILL) continue;
+            __atomic_and_fetch(&t->sig_pending, ~bit, __ATOMIC_ACQ_REL);
+        } else {
+            if (!s) break;
+            uint64_t bit = 1ull << (sig - 32);
+            if (!(__atomic_load_n(&s->rt_pending, __ATOMIC_ACQUIRE) & bit)) continue;
+            if (s->rt_blocked & bit) continue;
+            __atomic_and_fetch(&s->rt_pending, ~bit, __ATOMIC_ACQ_REL);
+        }
 
         struct lnx_sigaction act = { 0, 0, 0, 0 };
         if (s) {
@@ -187,7 +207,7 @@ int lnx_sig_next(struct task* t, uintptr_t user_sp, struct lnx_delivery* d) {
             act = s->sh->a[sig];
             spin_unlock_irqrestore(&s->sh->lock, fl);
         } else {
-            act.handler = t->sig_handler[sig];
+            act.handler = sig < 32 ? t->sig_handler[sig] : SIG_DFL;
         }
         if (sig == SIGKILL) act.handler = SIG_DFL;
 
@@ -202,7 +222,7 @@ int lnx_sig_next(struct task* t, uintptr_t user_sp, struct lnx_delivery* d) {
         if (s) d->info = s->info[sig];
         else { d->info.signo = sig; d->info.code = LNX_SI_USER; d->info.pid = d->info.uid = 0; d->info.addr = 0; }
         d->info.signo = sig;
-        d->old_blocked = t->sig_blocked;
+        d->old_mask = lnx_sig_blocked64(t);
         d->sp = s ? pick_stack(s, act.flags, user_sp, &d->on_altstack) : user_sp;
         if (!s) d->on_altstack = 0;
         return 1;
@@ -211,9 +231,9 @@ int lnx_sig_next(struct task* t, uintptr_t user_sp, struct lnx_delivery* d) {
 }
 
 void lnx_sig_entered(struct task* t, const struct lnx_delivery* d) {
-    uint32_t add = d->act.mask;
-    if (!(d->act.flags & LNX_SA_NODEFER)) add |= 1u << d->sig;
-    t->sig_blocked = (t->sig_blocked | add) & ~(1u << SIGKILL);
+    uint64_t add = d->act.mask;
+    if (!(d->act.flags & LNX_SA_NODEFER)) add |= 1ull << (d->sig - 1);
+    lnx_sig_set_blocked64(t, lnx_sig_blocked64(t) | add);
     if (d->act.flags & LNX_SA_RESETHAND) {
         struct lnx_sigstate* s = state_of(t, 0);
         if (s) {
@@ -234,20 +254,46 @@ int lnx_sig_fault(struct task* t, int sig, int code, uintptr_t addr,
     act = s->sh->a[sig];
     spin_unlock_irqrestore(&s->sh->lock, fl);
     if (act.handler == SIG_DFL || act.handler == SIG_IGN) return 0;
-    if (t->sig_blocked & (1u << sig)) return 0;
+    if (lnx_sig_blocked64(t) & (1ull << (sig - 1))) return 0;
     d->sig = sig;
     d->act = act;
     d->info.signo = sig;
     d->info.code = code;
     d->info.addr = addr;
     d->info.pid = d->info.uid = 0;
-    d->old_blocked = t->sig_blocked;
+    d->old_mask = lnx_sig_blocked64(t);
     d->sp = pick_stack(s, act.flags, user_sp, &d->on_altstack);
     return 1;
 }
 
-void lnx_sig_restore_mask(struct task* t, uint32_t kernel_mask) {
-    t->sig_blocked = kernel_mask & ~((1u << SIGKILL) | (1u << SIGSTOP));
+void lnx_sig_restore_mask(struct task* t, uint64_t guest_mask) {
+    lnx_sig_set_blocked64(t, guest_mask);
+}
+
+uint64_t lnx_sig_blocked64(struct task* t) {
+    struct lnx_sigstate* s = state_of(t, 0);
+    return ((uint64_t)t->sig_blocked >> 1) | (s ? (s->rt_blocked << 31) : 0);
+}
+void lnx_sig_set_blocked64(struct task* t, uint64_t g) {
+    g &= ~((1ull << (SIGKILL - 1)) | (1ull << (SIGSTOP - 1)));   /* never blockable */
+    t->sig_blocked = (uint32_t)(g << 1);
+    uint64_t rt = g >> 31;
+    struct lnx_sigstate* s = state_of(t, rt != 0);
+    if (s) s->rt_blocked = rt;
+}
+uint64_t lnx_sig_pending64(struct task* t) {
+    struct lnx_sigstate* s = state_of(t, 0);
+    return ((uint64_t)t->sig_pending >> 1) | (s ? (s->rt_pending << 31) : 0);
+}
+int lnx_sig_deliverable(struct task* t) {
+    if (t->sig_pending & ~t->sig_blocked) return 1;
+    struct lnx_sigstate* s = state_of(t, 0);
+    return s && (s->rt_pending & ~s->rt_blocked);
+}
+void lnx_sig_repost(struct task* t, int sig) {
+    if (sig < 32) { __atomic_or_fetch(&t->sig_pending, 1u << sig, __ATOMIC_ACQ_REL); return; }
+    struct lnx_sigstate* s = state_of(t, 0);
+    if (s) __atomic_or_fetch(&s->rt_pending, 1ull << (sig - 32), __ATOMIC_ACQ_REL);
 }
 
 void lnx_sig_altstack(struct task* t, uintptr_t* sp, uintptr_t* size, int* flags) {
@@ -282,8 +328,6 @@ long lnx_h_sigaction(struct abi_ctx* c) {
     int sig = (int)c->a[0];
     unsigned long actp = c->a[1], oldp = c->a[2];
     if (!t) return -E_INVAL;
-    /* Real-time signals (32..64): refused, not accepted-and-never-delivered.
-     * musl probes 32..34 for its own internal signals and copes with EINVAL. */
     if (sig <= 0 || sig >= LNX_NSIG) return -E_INVAL;
     if ((sig == SIGKILL || sig == SIGSTOP) && actp) return -E_INVAL;
     struct lnx_sigstate* s = state_of(t, 1);
@@ -307,15 +351,18 @@ long lnx_h_sigaction(struct abi_ctx* c) {
         na.handler  = (uintptr_t)h;
         na.flags    = (uint32_t)flags;
         na.restorer = (flags & LNX_SA_RESTORER) ? (uintptr_t)rest : 0;
-        na.mask     = (uint32_t)(gm << 1) & ~((1u << SIGKILL) | (1u << SIGSTOP));
+        na.mask     = gm & ~((1ull << (SIGKILL - 1)) | (1ull << (SIGSTOP - 1)));
         fl = spin_lock_irqsave(&s->sh->lock);
         s->sh->a[sig] = na;
         spin_unlock_irqrestore(&s->sh->lock, fl);
         /* Keep the native view in step: the §M34 delivery path (native tasks)
          * and everything that asks "is this signal handled" read it. */
-        t->sig_handler[sig] = na.handler;
+        if (sig < 32) t->sig_handler[sig] = na.handler;
         /* Setting SIG_IGN discards a pending instance (POSIX). */
-        if (na.handler == SIG_IGN) __atomic_and_fetch(&t->sig_pending, ~(1u << sig), __ATOMIC_ACQ_REL);
+        if (na.handler == SIG_IGN) {
+            if (sig < 32) __atomic_and_fetch(&t->sig_pending, ~(1u << sig), __ATOMIC_ACQ_REL);
+            else          __atomic_and_fetch(&s->rt_pending, ~(1ull << (sig - 32)), __ATOMIC_ACQ_REL);
+        }
     }
     if (oldp) {
         if (write_word(c, oldp, 0, old.handler) || write_word(c, oldp, 1, old.flags) ||
@@ -323,7 +370,7 @@ long lnx_h_sigaction(struct abi_ctx* c) {
             return -E_FAULT;
         uintptr_t mp = (uintptr_t)(oldp + 3 * w);
         if (!vmm_user_access_ok(mp, 8, 1)) return -E_FAULT;
-        uint64_t gm = (uint64_t)old.mask >> 1;
+        uint64_t gm = old.mask;
         for (int i = 0; i < 8; i++) ((uint8_t*)mp)[i] = (uint8_t)(gm >> (8 * i));
     }
     return 0;
