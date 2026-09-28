@@ -406,6 +406,12 @@ void gui_window_close_now(struct gui_window* win);
 /* Non-zero while the session is being ended in order — an app must not open
  * new windows then (the lock screen's re-raise is the case this is for). */
 int  gui_session_ending(void);
+/* §M82 — is the desktop running as the sign-in screen, with no session behind
+ * it?  (The lock window words itself differently: "Sign in" vs "Locked".)
+ * Declared HERE since §M81's verdict: it used to be a local prototype in
+ * lockscreen.c, a seam no header named — the shape that let `usock_set_owner`
+ * be called with an implicit declaration for two milestones. */
+int  gui_greeter_active(void);
 /* Lifetime identity: is `win` still the window whose serial was `serial`? */
 uint32_t gui_window_serial(struct gui_window* win);
 int      gui_window_alive(struct gui_window* win, uint32_t serial);
@@ -656,6 +662,7 @@ void gui_slot_test(void);
  * as `hardlock`, `leaktest` and `drv crash` — deliberate, named, never the
  * default. */
 void gui_contract_test(void);
+void gui_disable_test(void);      /* §M81 — a disabled widget receives no input */
 
 /* §M81 — `gui threadtest`: create a widget for a window from a task that does
  * not host it, so `audit widget-threading` can be seen to detect §M22.7's

@@ -176,8 +176,21 @@ void app_widgets_reset(struct gui_window* win) {
  * full window blit per packet, which is the cost the old "motion only on
  * click" rule was avoiding.  Nothing is redrawn at all when the hover has not
  * moved, which is the common case while the pointer sits still. */
+/* §M81 — THE ONE GATE for "a disabled widget receives no input".
+ *
+ * The rule was written out at each place a target is resolved — the press, the
+ * click, both keyboard paths and the hover — which is a convention in one file
+ * rather than a mechanism: the WHEEL path resolved its target without it, so a
+ * disabled list still scrolled (found by the §M81 verdict's list of
+ * conventions, 2026-09-28).  Every resolution now goes through here, so a new
+ * event type that asks for a target inherits the rule instead of having to
+ * remember it. */
+static struct widget* live(struct widget* w) {
+    return (w && !w->disabled) ? w : NULL;
+}
+
 static void app_hover_to(struct gui_window* win, int lx, int ly) {
-    struct widget* hit = widget_at(win->widgets, lx, ly);
+    struct widget* hit = live(widget_at(win->widgets, lx, ly));
     struct widget* prev = NULL;
     for (struct widget* w = win->widgets; w; w = w->next)
         if (w->hovered) { prev = w; break; }
@@ -194,7 +207,7 @@ static void app_hover_to(struct gui_window* win, int lx, int ly) {
         if (!(prev->ops && prev->ops->hover && prev->ops->hover(prev, 0)))
             gui_window_request_redraw_rect(win, prev->x, prev->y, prev->w, prev->h);
     }
-    if (hit && !hit->disabled) {
+    if (hit) {
         hit->hovered = 1;
         if (!(hit->ops && hit->ops->hover && hit->ops->hover(hit, 1)))
             gui_window_request_redraw_rect(win, hit->x, hit->y, hit->w, hit->h);
@@ -266,7 +279,7 @@ int app_dispatch_event(struct gui_window* win, const struct app_event* e) {
          * to the focused one: that is what every toolkit does and what the
          * hand expects, and it means a list can be scrolled without clicking
          * into it first. */
-        struct widget* w = widget_at(win->widgets, e->x, e->y);
+        struct widget* w = live(widget_at(win->widgets, e->x, e->y));
         int dz = (int)(int8_t)e->phase;
         /* §M69 — WHICH WAY IS DOWN?  Asked for from use, and it is a real
          * disagreement rather than a preference nobody holds: a Windows wheel
@@ -353,8 +366,7 @@ int app_dispatch_event(struct gui_window* win, const struct app_event* e) {
              * Four dispatch points, one rule, checked at each — the same shape
              * as §4.79's title buttons, where the painter and the hit test had
              * computed the same box differently. */
-            struct widget* hit = widget_at(win->widgets, e->x, e->y);
-            if (hit && hit->disabled) hit = NULL;
+            struct widget* hit = live(widget_at(win->widgets, e->x, e->y));
             if (hit) {
                 hit->pressed = 1;
                 gui_window_request_redraw_rect(win, hit->x, hit->y,
@@ -389,8 +401,7 @@ int app_dispatch_event(struct gui_window* win, const struct app_event* e) {
         return ran;
     }
     if (e->type == AE_MOUSE) {
-        struct widget* w = widget_at(win->widgets, e->x, e->y);
-        if (w && w->disabled) return 0;                  /* see AE_POINTER */
+        struct widget* w = live(widget_at(win->widgets, e->x, e->y));
         if (!w || !w->ops || !w->ops->mouse) return 0;   /* nothing ran */
         w->ops->mouse(w, e->x - w->x, e->y - w->y, e->dbl);
     } else if (e->type == AE_KEY) {
@@ -399,8 +410,7 @@ int app_dispatch_event(struct gui_window* win, const struct app_event* e) {
          * anything is focused: at a mode the display cannot show, the keyboard
          * is the only input the user can aim. */
         if (win->key_hook) { win->key_hook(win, e->c); return 1; }
-        struct widget* w = win->focusw;
-        if (w && w->disabled) return 1;                  /* see AE_POINTER */
+        struct widget* w = live(win->focusw);
         if (w && w->ops && w->ops->key) w->ops->key(w, e->c);
     } else if (e->type == AE_KEYCODE) {
         /* §M65 — TAB CYCLES FOCUS, at the WINDOW level, before the focused
@@ -414,8 +424,7 @@ int app_dispatch_event(struct gui_window* win, const struct app_event* e) {
             gui_window_focus_cycle(win, back);
             return 1;
         }
-        struct widget* w = win->focusw;
-        if (w && w->disabled) return 1;                  /* see AE_POINTER */
+        struct widget* w = live(win->focusw);
         if (w && w->ops && w->ops->keycode) w->ops->keycode(w, e->kc, e->mods);
     } else {
         /* AE_BUTTON REACHES NO HANDLER ON A WIDGET WINDOW — and demanding a

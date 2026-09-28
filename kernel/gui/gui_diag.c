@@ -434,6 +434,65 @@ static void ct_open(void) {
     });
 }
 
+/* §M81 — `gui disabletest`: "a disabled widget receives no input", falsified.
+ *
+ * Two lists of 40 rows side by side, the LEFT one disabled.  A wheel notch is
+ * injected over each through the real per-window queue (aq_push, the path the
+ * compositor uses), and the lists' scroll offsets are read afterwards: the
+ * disabled one must not have moved and the enabled one must have — the second
+ * half is what makes a pass mean something (a wheel path that did nothing at
+ * all would also leave the first list still).  Built on its own app-host, read
+ * from here: the half that builds runs on the host, the half that observes
+ * must not. */
+static struct gui_window* dt_win;
+static struct w_listview *dt_off, *dt_on;
+static void dt_build(struct gui_window* win) {
+    gui_window_clear_widgets(win);
+    int cw = 0, ch = 0;
+    gui_window_content_size(win, &cw, &ch);
+    dt_off = w_listview_create(win, 4, 4, cw / 2 - 8, ch - 8, NULL);
+    dt_on  = w_listview_create(win, cw / 2 + 4, 4, cw / 2 - 8, ch - 8, NULL);
+    char t[8] = "row 00";
+    for (int i = 0; i < 40; i++) {
+        t[4] = (char)('0' + i / 10); t[5] = (char)('0' + i % 10);
+        if (dt_off) w_listview_add(dt_off, t, 0);
+        if (dt_on)  w_listview_add(dt_on, t, 0);
+    }
+    if (dt_off) dt_off->base.disabled = 1;
+}
+static void dt_open(void) {
+    gui_app_open(&(struct gui_app_spec){
+        .title = "disabletest",
+        .content_w = cp_px(360), .content_h = cp_px(200),
+        .place = GUI_PLACE_DIALOG,
+        .layout = dt_build, .slot = &dt_win,
+    });
+}
+void gui_disable_test(void) {
+    if (!gui_is_active()) { kprintf("disabletest: the GUI is not running\n"); return; }
+    dt_win = NULL; dt_off = dt_on = NULL;
+    gui_queue_open(dt_open);
+    for (int i = 0; i < 100 && !(dt_win && dt_off && dt_on); i++) task_msleep(20);
+    if (!dt_win || !dt_off || !dt_on) { kprintf("disabletest: no window appeared\n"); return; }
+    task_msleep(300);
+    struct w_listview* lists[2] = { dt_off, dt_on };
+    for (int k = 0; k < 2; k++) {
+        struct app_event e = {0};
+        e.type = AE_SCROLL;
+        e.x = (int16_t)(lists[k]->base.x + lists[k]->base.w / 2);
+        e.y = (int16_t)(lists[k]->base.y + lists[k]->base.h / 2);
+        e.phase = (uint8_t)(int8_t)-1;        /* one notch DOWN: scroll -= dz */
+        aq_push(dt_win, e);
+        need_frame = 1;
+    }
+    task_msleep(500);
+    int off = dt_off->scroll, on = dt_on->scroll;
+    int ok = (off == 0 && on > 0);
+    kprintf("disabletest: disabled list scroll %d (want 0), enabled list scroll %d "
+            "(want > 0) -> %s\n", off, on, ok ? "PASS" : "FAIL");
+    gui_window_close(dt_win);
+}
+
 void gui_contract_test(void) {
     if (!gui_is_active()) { kprintf("contracttest: the GUI is not running\n"); return; }
     ct_win = NULL;
@@ -562,17 +621,30 @@ void gui_compose_bench(int frames) {
         if (windows[i].used && windows[i].kind == WIN_APP) had = 1;
     if (!had) { gui_queue_open(bench_open); task_msleep(1200); }
 
+    /* §M81 — WAIT FOR EACH FRAME TO FINISH.  This slept a flat 40 ms per
+     * frame and then read the counters, while a full 1920x1200 composite
+     * takes 110-310 ms under emulation: it read the frame counter (bumped at
+     * the START of a compose) mid-frame and the time (added at the END)
+     * before it arrived, and reported "1 frame(s), 0 us/frame" — a benchmark
+     * saying the work is free.  Now each frame is requested and waited for on
+     * `frames_done`, which compose() bumps beside the time; a frame that
+     * never completes (a hung compositor) ends the run after 3 s instead of
+     * hanging the shell. */
+    uint32_t d0 = frames_done;
     uint64_t ns0 = total_compose_ns;
-    uint32_t f0  = frames_full + frames_partial;
     for (int i = 0; i < frames; i++) {
+        uint32_t before = __atomic_load_n(&frames_done, __ATOMIC_ACQUIRE);
         gui_damage_all();
         need_frame = 1;
-        /* Let the compositor actually run: this task is not it, and a loop that
-         * only queued damage would measure nothing but its own speed. */
-        task_msleep(40);
+        int waited = 0;
+        while (__atomic_load_n(&frames_done, __ATOMIC_ACQUIRE) == before && waited < 3000) {
+            task_msleep(5);
+            waited += 5;
+        }
+        if (waited >= 3000) break;
     }
     uint64_t ns = total_compose_ns - ns0;
-    uint32_t fr = (frames_full + frames_partial) - f0;
+    uint32_t fr = frames_done - d0;
 
     g_bench_ns = ns;
     g_bench_fr = fr;

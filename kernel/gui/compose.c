@@ -95,6 +95,7 @@ uint64_t total_blit_px = 0;              /* M22.7 — avg damage/frame */
  * duration, and pixels are only a proxy for it: the same rectangle costs a
  * different number of milliseconds on a 4 GHz core and under emulation. */
 uint64_t total_compose_ns = 0;
+volatile uint32_t frames_done = 0;     /* completed composites (see the end of compose) */
 
 /* Last present's dirty rects.  A page flip has buffer-age 2: the hidden
  * buffer is stale outside the regions touched in the last TWO presents, so
@@ -731,6 +732,10 @@ void compose(void) {
      * of the work does not merely understate it; it says the work is free. */
     uint64_t this_ns = timer_now_ns() - compose_t0;
     total_compose_ns += this_ns;
+    /* Counted HERE, at the end, beside the time — `frames_full/partial` are
+     * counted before the draw pass, so a reader between the two saw a frame
+     * with no time in it (`gui bench` reported "1 frame(s), 0 us/frame"). */
+    __atomic_add_fetch(&frames_done, 1, __ATOMIC_RELEASE);
 
     /* PERIODIC COMPOSE REPORT (gui.stats_ms, 0 = off).
      *

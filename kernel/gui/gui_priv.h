@@ -409,6 +409,7 @@ extern spinlock_t damage_lock;
  * pixel count the two are indistinguishable (§M69). */
 extern uint32_t frames_full, frames_partial;
 extern uint64_t total_compose_ns, total_blit_px;
+extern volatile uint32_t frames_done;
 extern uint32_t occluded_rects, painted_rects;
 extern int      g_occlude;
 

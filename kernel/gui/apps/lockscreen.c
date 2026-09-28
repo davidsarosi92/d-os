@@ -169,7 +169,6 @@ void gui_session_clear(void) { g_session_user[0] = 0; }
 
 /* Raising re-enters from on_close (a lock that was dismissed comes back), so
  * the two refer to each other and one of them has to be declared first. */
-int gui_greeter_active(void);          /* §M82 — gui.c */
 int gui_lock_raise(void);
 int gui_lock_active(void);
 

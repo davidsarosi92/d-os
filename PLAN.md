@@ -224,7 +224,7 @@ fixed first, whatever it touches.
 | §M32 | ✅ complete — simultaneous sessions (§4.108), on-disk ownership (§4.109) | — (fast user switching: two live desktops) |
 | §M85 | ✅ complete (§4.105) | — (sbsa-ref clock via UEFI runtime: later) |
 | §M86 | ✅ RAM above 4 GiB; user no-execute on x86 (§4.104) | — |
-| §M81 | steps 1-2, step 3 in part | chrome still hand-drawn; the verdict |
+| §M81 | ✅ complete — the verdict (§4.117) | — (step 3 remainder declined with the reason) |
 | §M82 | ✅ complete (§4.110) | — (two live desktops at once) |
 | §M72 | ✅ complete (§4.111) | — (eviction faults pages back: §M74) |
 | §M74 | ✅ complete (§4.112-§4.114) | — (multi-threaded victims, swap compression) |
@@ -313,7 +313,7 @@ what); a session can pick a theme and push on it.
 | M74 | ✅ **Swap and demand paging** — shipped, DOCS §4.112-§4.114 | Memory | §M74 |
 | M75 | **Task Manager: what each process is costing** — ✅ **SHIPPED 2026-09-10 (DOCS §4.88)**: per-process MEM (portable policy over three arch walkers; verified by DIFFERENCE on all three, same 1028 KB constant) + CPU% (a delta over §M53's clock, keyed by PID where damage is keyed by slot), a `blk_read/write/flush` request path that did not exist, a kernel history ring sampled by a service so the window is a VIEW, `WIDGET_CLASS("chart")`, and the Total as the footer.  **Its own instrument found the biggest cost in the tree: the GUI is 50 % of a 4-CPU box AT REST** — §M49's open item, never before given a number.  OWNER still gated on §M32 | UX / Instrumentation | ✅ DOCS §4.88 |
 | M76 | **The aarch64 native syscall dispatcher — SWEPT** — ✅ **SHIPPED 2026-09-10 (DOCS §4.89)**: 26 of i386's 60 cases → **60 of 60**.  Found while §M75's own falsifier drowned an ARM log in `unknown number 35`; every native program using sockets, stat/getdents, threads, getrandom, uname or the dosgui bridge was **silently x86-only**, and the failure is a log line and a -1 rather than a link error, which is why it survived from §M25 to §M75.  **The blocker was the HARNESS, not the sweep** — `uidemo` could not be started on ARM at all (§4.74), so `gui.autorun` had to exist first.  Three cases are REFUSED WITH A REASON rather than wired: aarch64 has no I/O address space, and a driver told its port window was granted would fault at first access | Architecture | ✅ DOCS §4.89 |
-| M81 | **The GUI's seams — an audit of how it is assembled** — the compositor, the widget toolkit and the apps have grown by accretion, and §M32's GUI work spent three rounds in the wrong file because of it: an undocumented placement convention, a flag honoured in one of four dispatch paths, a strip that clipped a popup silently, and a window that lays out only if it was created the right way.  **The deliverable is a VERDICT with measurements, not a rewrite**: which seams are real, which are conventions nobody wrote down, and which communications with the kernel should become declared interfaces | UX / Architecture | ◐ steps 1-2 ✅ (container is a widget; one window constructor `gui_app_open`), mandatory/optional behaviour ✅, step 3 ◐ (Start menu, keyboard and network flyouts are item-view lists).  **OPEN: taskbar, volume flyout and sign-in still hand-drawn; `struct gui_window` is not a widget; the written per-seam VERDICT with call counts** |
+| M81 | ✅ **The GUI's seams — an audit of how it is assembled** — the compositor, the widget toolkit and the apps have grown by accretion, and §M32's GUI work spent three rounds in the wrong file because of it: an undocumented placement convention, a flag honoured in one of four dispatch paths, a strip that clipped a popup silently, and a window that lays out only if it was created the right way.  **The deliverable is a VERDICT with measurements, not a rewrite**: which seams are real, which are conventions nobody wrote down, and which communications with the kernel should become declared interfaces | UX / Architecture | §M81 — ✅ SHIPPED (DOCS §4.117) |
 | M82 | **The SESSION becomes a first-class thing** — §M81 gave the GUI a real identity (`cred_become_user` on a session leader) and stopped there.  What the identity does not yet carry is a *desktop*: every user should have their own program list, icon field, wallpaper and environment, and the greeter and the lock should be SEPARATE from the session rather than windows inside it.  Includes per-user and system-wide `PATH`, with the user's overriding, and saving a session's state at sign-out | UX / Security | ✅ 2026-09-27, DOCS §4.110: persistent homes, per-account desktop, program list enforced at launch, `env.PATH`/`HOME`, greeter shell, open programs saved and restored; two privilege holes closed on the way |
 | M83 | **Everything is a package, and the tree splits along the package lines** — asked for directly: *what can be, goes into its own repository; everything modular; everything manageable from `pkg` — desktop, compositor, GUI, Wayland, everything.*  Today no package can come from OUTSIDE the kernel image (every payload is a blob compiled into the 61 MB `kernel.bin`, and `/store` is ramfs rebuilt per boot), 21 registries are linker sections that only a build can fill, and a §M67 module can carry exactly one `struct driver` against 41 exported symbols.  Apps are proposed as RING-3 programs (§M65's `dosgui_ui_build` already exists), gui-core / shells / Wayland as module packages — and **every ring-0 component is reviewed** (must stay / could move / unknown cost, with the reason and a measured boundary-crossing cost), because most of them are in the kernel by history rather than by requirement.  Staged so the REPOSITORY split comes LAST, gated on a green boundary audit — a split along lines the code does not yet respect is a refactor done across repositories | Architecture / Packaging | §M83 — designed, not started |
 | M84 | **A mobile interface — d-os must run on a PHONE** — asked for directly (2026-09-25), with the reason stated: *this is also why everything has to be modular.*  A phone is a different desktop SHELL (§M22's `DESKTOP_SHELL()` registry already makes that a file), a different INPUT model (touch, gestures, an on-screen keyboard — there is no touch input anywhere in the tree today), a different FORM FACTOR (portrait, small, high density — §M65's size classes and §M69's `cp_px()` density are the start), and different HARDWARE (SoC, device tree, panel, battery, modem).  Staged: a mobile shell + touch on emulated hardware first, a phone-shaped `virt` second, a real device last.  Depends on §M83 (the mobile shell, keyboard and apps as packages chosen per device, not a second kernel build) and on §M85 (no hardcoded board) | UX / Platform | §M84 — designed, not started |
@@ -5011,7 +5011,11 @@ with it.  It now describes code that arrives as a file.  The scope written into
 
 ## §M81 — The GUI's seams: an audit of how it is assembled
 
-**Status: proposed (2026-09-18).  Asked for directly after §M32's GUI work:
+**Status: SHIPPED 2026-09-28 — the verdict is below ("THE VERDICT"), DOCS
+§4.117.  Steps 1-2 and the mandatory-behaviour contract shipped 2026-09-18/19;
+step 3 was done for the Start menu and its remainder DECLINED with the reason.**
+
+**Original status: proposed (2026-09-18).  Asked for directly after §M32's GUI work:
 *review the GUI's components, the system, how the GUI is put together, the
 widgets too — including where they talk to the system.  How far can we
 decompose into components and abstract?***
@@ -5382,6 +5386,88 @@ result.
 The table measured above, RE-MEASURED after each step, plus `gui bench` before
 and after.  *A split that moves code without naming a contract has produced a
 second place to look, not a component.*
+
+### THE VERDICT (2026-09-28) — per seam, with the number that justifies it
+
+Measured by **`scripts/gui-coupling.py`**, which is §M81's hand count made
+repeatable: for every GUI file, the distinct compositor-core functions it calls
+(gui.c, wm.c, compose.c, input.c), SPLIT BY THE HEADER that declares them —
+`gui.h`/`gui_app.h` (apps), `gui_internal.h` (desktop shells), `gui_priv.h`
+(the compositor's own files) or none.  It validates itself first by reproducing
+§M70's known answer (`gterm.c` = 2, `gui_damage_win` + `gui_window_raise`) and
+exits non-zero if it cannot.
+
+**THE FINDING THE RAW COUNT HID: NO APPLICATION REACHES THE COMPOSITOR'S
+PRIVATE STATE.**  The "entangled" band of the first measurement (9+ calls:
+editor 12, lockscreen 12, settings 11, crashapp 10, fileman 9, wayland 9)
+consists ENTIRELY of `gui.h` calls — the app-window API is wide (create, close,
+ctx, content size, redraw, request layout, close guard, serial/alive, focus,
+title), but it is a declared public surface, not a reach into internals.  A
+count that cannot tell the two apart was measuring API breadth, not coupling.
+
+| seam | files | calls (tier) | verdict |
+|---|---|---|---|
+| **drawing primitives** — gfx, vfont, vpath, icons, cp_draw, theme, scrollbar, clipboard, wl_keymap | 9 | 0–2, public | **COMPONENTS.**  Liftable with their own header today. |
+| **the terminal** — gterm | 1 | 2 (1 public, 1 private) | **COMPONENT** (§M70's model, still 2). |
+| **the toolkit** — widget, w_controls, w_itemview, w_editor, w_menubar, w_box, w_chart, itemview, ui | 9 | 0–8, all public | **COMPONENT behind a declared surface.**  Every call is `gui.h`. |
+| **applications** — apps/*, dialog, settings, shortcut, dosgui | 22 | 1–12, **all public** | **CLIENTS of a declared interface.**  Breadth, not entanglement. |
+| **desktop shells** — shell_vista (18: 8 public + 10 shell), shell_bare, shell_greeter (0) | 3 | via `gui_internal.h` | **A SECOND DECLARED INTERFACE, crossed THREE times** — a tested seam (question 4). |
+| **the compositor's own files** — app_host, gui_mode, gui_diag, gterm | 4 | reach `gui_priv.h` | **FILE BOUNDARIES inside one component**, by declaration (gui_priv.h names them). |
+| **the Wayland bridge** — wayland.c | 1 | 9 public (incl. `gui_app_window_create`) | a DECLARED exception (it hosts on the server task, draws its own pixels). |
+
+**Reaching past the headers, found and fixed:** `lockscreen.c` called
+`gui_greeter_active` through a LOCAL PROTOTYPE — a seam no header named, the
+shape that let `usock_set_owner` run on an implicit declaration for two
+milestones.  Declared in gui.h now.  (`widget.c`'s apparent `str_copy` reach was
+the metric's error — a file's own static helper of the same name — and the
+script excludes names a file defines itself.)
+
+**Question 2 — which conventions are types, audits, or declared uncheckable:**
+
+| convention | status |
+|---|---|
+| window placement ("-1,-1 is not centre") | **TYPE** — `gui_app_open` placement intents (step 2) |
+| the singleton pointer and its clearing | **TYPE** — `spec.slot`, cleared on every close route (step 2) |
+| build once, lay out many | **REMOVED** — `ui_build` rebuilds (clears nodes and widgets together) |
+| a window needs an app-host | **LOUD + FALSIFIER** (`gui hosttest`); not a type, because creation stays with the apps |
+| mandatory widget ops; construction via `widget_init` | **AUDIT** `widget-contract` + `gui contracttest` |
+| a window's widgets belong to its host task | **AUDIT** `widget-threading` + `gui threadtest` |
+| **a disabled widget receives no input** | **ONE GATE** (`live()` in app_host.c) + **`gui disabletest`** — it was a rule written at five dispatch points and MISSING from the sixth (the wheel: a disabled list scrolled).  Control run without the gate: FAIL; with it: PASS on all three arches. |
+| visible text is a catalogue key | **CHECKED** — `scripts/locale-sweep.py` (source) + `locale missing` (runtime) |
+| optional ops appended, designated initialisers | **COMPILER** — `-Wmissing-field-initializers`, build kept silent (caught `accountspanel`'s positional panel the day `live` was appended) |
+| one definition of a shared limit | **COMPILER** — a second `GUI_MAX_WINDOWS` was found by the redefinition error when the header changed |
+| a tick damages what it changed | **DECLARED UNCHECKABLE**: a correct but wasteful repaint is not an invariant violation; it is a COST, measured by `gui.stats_ms` (kpx per frame) |
+| reports print from the compositor (`gui_diag_service`) | **DECLARED UNCHECKABLE** — which task prints is not observable from the output; the rule is kept in gui_priv.h beside the one service |
+
+**Question 3 — where the toolkit talks to the kernel.**  Configuration and
+language go through registries (`CONFIG_KEY`, `LOCALE_CATALOG`) — declared.
+Kernel-resident apps call the VFS, users and the clipboard directly, which is
+correct for code that IS kernel code; the ring-3 half of the seam is §M65's
+data-only `ui_spec`, and moving the apps out of ring 0 is §M83's subject, not
+this audit's.
+
+**Question 4 — what a second implementation costs.**  Crossed and cheap: the
+desktop shell (three), the item view (grid/list/table), the scrollbar (one,
+after four were merged).  Not crossed: the compositor itself.
+
+**STEP 3's REMAINDER IS DECLINED, WITH THE REASON.**  The taskbar's window
+strip was rebuilt on 2026-09-28 (one geometry for drawing and hit-testing,
+measured fitting, "+N"); converting it — and the volume flyout and sign-in
+screen — to item views would move code without localising any defect, which is
+what this milestone says a split must not do.  `struct gui_window` as a widget
+means rewriting `input.c`'s routing, which §M70 and this milestone both refuse
+without a falsifying test first.  Revisit if a defect localises there.
+
+**THE MEASUREMENT.**  `gui bench` itself was broken and said so only by an
+impossible number: it slept 40 ms per frame and read the counters mid-frame, so
+a 1920x1200 composite (~200 ms under emulation) was reported as "1 frame(s), 0
+us/frame".  It waits for each frame to COMPLETE now (`frames_done`, bumped
+beside the time).  Reference figures after the fix, i386 -smp 4 at 1920x1200:
+**212887 / 208357 / 199457 / 208144 / 202058 / 214595 us/frame** (7 % spread);
+x86_64 207877 / 196098; aarch64 (1280x800) 53339 / 140952.  **Earlier `gui
+bench` figures, including §M70's ~108 ms, are not comparable** — they came from
+the broken read and, on x86, from the clock that ran at 80 % before 2026-09-25.
+These are the baseline the next compositor change is measured against.
 
 ### The questions this milestone must answer, each with evidence
 

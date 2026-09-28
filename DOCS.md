@@ -15451,8 +15451,36 @@ Manager's count had TWO digits ("50 entries" for 150).
   the same flow; a child with no weight is measured at its natural width (the
   per-child SHARE is for stretching children such as charts).
 
+### 4.117 §M81 — the GUI's seams, the verdict (2026-09-28)
+
+**§M81 is complete.**  The verdict itself, per seam, is in PLAN §M81 ("THE
+VERDICT"); this is what shipped with it.
+
+- **`scripts/gui-coupling.py`** — the coupling metric as a script: distinct
+  compositor-core calls per GUI file, split by the declaring header
+  (public / shell / private / none), self-validated against §M70's `gterm.c ==
+  2`.  Its finding: no application reaches the compositor's private state; the
+  "entangled" files are wide users of the public app-window API.
+- **`gui_greeter_active` declared in gui.h** (it was a local prototype in
+  lockscreen.c — a seam no header named).
+- **ONE GATE for disabled widgets** — `live()` in app_host.c resolves every
+  input target (hover, press, click, key, keycode, WHEEL).  The rule had been
+  written at five points and was missing from the wheel path, so a disabled
+  list still scrolled.  **`gui disabletest`** falsifies it: two lists, the left
+  disabled, one notch injected over each through the real queue — PASS on all
+  three arches, and FAIL in a control build without the gate.
+- **`gui bench` measures again.**  It slept 40 ms a frame and read its counters
+  mid-frame, reporting "1 frame(s), 0 us/frame" for a ~200 ms composite; it now
+  waits for each frame to COMPLETE (`frames_done`, counted beside the time).
+  Reference: ~200-215 ms/frame at 1920x1200 on i386 and x86_64 under
+  emulation; earlier figures are not comparable (broken read; x86 clock at 80 %
+  before 2026-09-25).
+- Step 3's remainder (taskbar strip, flyouts, sign-in screen as item views;
+  the window as a widget) is **declined**, with the reason recorded in PLAN.
+
 ## 8. Change log
 
+- **2026-09-28 — §M81 COMPLETE: the verdict per seam (PLAN §M81), `scripts/gui-coupling.py` (tiered by declaring header; no app reaches compositor-private state), `gui_greeter_active` declared, one gate for disabled widgets + `gui disabletest` (a disabled list scrolled), and `gui bench` fixed (it reported 0 us/frame by reading mid-frame) (DOCS §4.117).**
 - **2026-09-28 — Control Panel: a Memory page (swap and the rest of `mem.*`, with a live line — `settings_panel.live`) and System information (`sysinfo`, `hal_cpu_model`, `hal_board_name`); translations measured by `scripts/locale-sweep.py` + `locale missing` and closed (73 → 0).  Fixed: sliders showed no value and were offered for unusable ranges, integer ranges were not validated, About/Hello out of date and overlapping, the File Manager count had two digits, only 8 windows could exist, the taskbar ran under its indicators and cut titles unmarked (now "+N"), and a row that did not fit ran off its window (it wraps) (DOCS §4.116).**
 - **2026-09-28 — §M73 COMPLETE: containers — a real OCI image (`busybox:musl`) unpacked in ring 3 (`ociunpack`, sha256/gzip/tar/links/whiteouts), run as its own uid against its own root (`cred.root`), a working directory (`cred.cwd`, lexical `..` clamped at the root), `ctr import|run|list`, `ctrescapetest`, `AUDIT(container-root)`; the Linux file/time/identity calls as shared §M50 operations with per-guest stat layouts as data (arm64 could not open a file); `strace`.  Fixed: stat inode = size+1, x86_64 getuid always 0, rt_sigaction running fcntl, the console not duplicable, redirected stdin polled from the keyboard, absolute realtime sleeps, `task_wait` leaking reap-owned children, and `task_exit_code` marking ANOTHER task dead after a migration (DOCS §4.115).**
 - **2026-09-27 — §M74 COMPLETE, rungs 3-4: swap-in by fault; eviction of RUNNING programs by pressure (atomic mark, one flush, then write), `mem.swap_policy` + `mem.swap_size_mb` as the ceiling, `swap`, `AUDIT(swap-slots)`; the three reserve rules shown.  Fixed: a wake-up never preempted (aarch64 `diskstorm` 4.7-7 s -> 457 ms), block-cache read-ahead, per-page shootdowns starving CPU 0 (DOCS §4.114).**
