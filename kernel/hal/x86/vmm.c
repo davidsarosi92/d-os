@@ -39,6 +39,7 @@
 #include "task.h"
 #include "percpu.h"
 #include "lock.h"
+#include "vma.h"     /* §M89 — reservations live beside the tables */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -228,7 +229,7 @@ void vmm_init(void) {
  * accessible in the CURRENTLY ACTIVE address space?  Walks the tables CR3
  * names.  `want_write` also requires the R/W bit.                          */
 /* ------------------------------------------------------------------------- */
-int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
+static int access_walk(uintptr_t va, uintptr_t len, int want_write) {
     if (len == 0) return 1;
     if (va < vmm_user_base()) return 0;             /* reject kernel/low addrs */
     if (va + len < va)        return 0;             /* overflow */
@@ -245,6 +246,14 @@ int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
         if (want_write && !(pte & E_RW)) return 0;
     }
     return 1;
+}
+
+/* §M89 — see the x86_64 twin: a demand page not mapped YET is still the
+ * program's, so it is brought in before the range is refused. */
+int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
+    if (access_walk(va, len, want_write)) return 1;
+    if (va < vmm_user_base() || va + len < va) return 0;
+    return vma_prefault(va, len, want_write) && access_walk(va, len, want_write);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -404,9 +413,8 @@ void vmm_print_status(void) {
 struct vmm_space {
     void*     root;         /* PD (classic) or PDPT (PAE); identity-mapped   */
     uint32_t  root_phys;    /* == (uint32_t)root, what CR3 is loaded with    */
-    /* §M48 — the mmap bump cursor lives with the ADDRESS SPACE, not the task:
-     * one space, one cursor, whichever thread bumps it. */
-    uintptr_t mmap_cursor;
+    void*     vma;          /* §M89 — the reservation set (vma.c owns it; it
+                             * replaced §M48's per-space mmap bump cursor) */
 };
 
 static int pde_is_kernel_shared(struct vmm_space* s, uint32_t gi) {
@@ -416,8 +424,8 @@ static int pde_is_kernel_shared(struct vmm_space* s, uint32_t gi) {
 struct vmm_space* vmm_space_create(void) {
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
     if (!s) return NULL;
-    s->mmap_cursor = 0;
 
+    s->vma = NULL;                                /* kmalloc does not zero */
     pmm_phys_t rf = pmm_alloc_frame();            /* low memory: CR3 needs it */
     if (!rf) { kfree(s); return NULL; }
     s->root = (void*)(uintptr_t)rf;
@@ -458,6 +466,7 @@ static inline uint16_t* cow_slot(uint64_t phys) {
 
 void vmm_space_destroy(struct vmm_space* s) {
     if (!s) return;
+    vma_destroy(s);                 /* §M89 — before the tables: it may unref files */
     /* Free every page table + user frame this space added on top of the
      * kernel snapshot.  Kernel-shared entries and large pages are left alone. */
     for (uint32_t gi = 0; gi < npde(); gi++) {
@@ -494,7 +503,6 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     if (!parent) return NULL;
     struct vmm_space* child = vmm_space_create();     /* kernel snapshot only */
     if (!child) return NULL;
-    child->mmap_cursor = parent->mmap_cursor;
 
     /* WRITABLE (or already COW) pages become copy-on-write in BOTH spaces,
      * ref-counted; read-only pages (code) are copied eagerly; borrowed shm
@@ -538,6 +546,7 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     /* §M51 — write access was taken AWAY from the parent, which may be
      * running on another core right now: one whole-space shootdown. */
     hal_tlb_shootdown(0, 0);
+    vma_clone(parent, child);       /* §M89 — the child inherits the reservations */
     return child;
 }
 
@@ -558,13 +567,15 @@ int vmm_cow_fault(uintptr_t fault_va) {
     uint16_t* rc = cow_slot(old);
     if (!rc || cow_ref_sole(rc)) {
         /* Last (or untracked) sharer — writable in place. */
-        pte_set(pt, j, old | E_P | E_US | E_RW | (pte & E_NX));
+        /* §M89 — the USER bit is kept, not forced: a PROT_NONE page is
+         * kernel-only, and a write to it must stay a fault after the copy. */
+        pte_set(pt, j, old | E_P | (pte & E_US) | E_RW | (pte & E_NX));
         if (rc) __atomic_store_n(rc, 0, __ATOMIC_RELEASE);
     } else {
         pmm_phys_t nf = pmm_alloc_frame_user();       /* §M86 — may be highmem */
         if (!nf) return 0;                            /* OOM → real fault */
         kmap_copy_frame(nf, old);
-        pte_set(pt, j, (nf & addr_mask()) | E_P | E_US | E_RW | (pte & E_NX));
+        pte_set(pt, j, (nf & addr_mask()) | E_P | (pte & E_US) | E_RW | (pte & E_NX));
         /* Give up our share only after the copy (cowref.h). */
         if (cow_ref_put_copy(rc)) pmm_free_frame(old);
     }
@@ -780,10 +791,6 @@ void vmm_space_switch(struct vmm_space* s) {
 /* User region base: 1 GiB, above the identity map and the kmap window. */
 uintptr_t vmm_user_base(void) { return 0x40000000u; }
 
-/* §M48 — the space's mmap bump cursor (policy stays in usyscall.c). */
-uintptr_t vmm_space_mmap_cursor(struct vmm_space* s) { return s ? s->mmap_cursor : 0; }
-void vmm_space_set_mmap_cursor(struct vmm_space* s, uintptr_t v) { if (s) s->mmap_cursor = v; }
-
 /* ---------------------------------------------------------------------------
  * §M86 — kmap_frame / kunmap_frame for i386 (contract in kmap.h).
  *
@@ -841,4 +848,49 @@ void kunmap_frame(void* p) {
     if (kmap_depth[c] > 0) kmap_depth[c]--;
     hal_intr_restore(fl);
     preempt_enable();
+}
+
+/* ---------------------------------------------------------------------------
+ * §M89 — the primitives vma.c needs (contract in vma.h).
+ * ------------------------------------------------------------------------- */
+void* vmm_space_vma(struct vmm_space* s) { return s ? s->vma : NULL; }
+void  vmm_space_set_vma(struct vmm_space* s, void* v) { if (s) s->vma = v; }
+
+/* 2.75 GiB: below the PCI hole QEMU opens under 4 GiB on both of its PC
+ * machines (0xE0000000 on pc, 0xB0000000 on q35 with enough RAM), where the
+ * kernel maps device windows after a space was created — a table the space
+ * never saw. */
+uintptr_t vmm_user_limit(void) { return 0xB0000000u; }
+
+int vmm_space_probe(struct vmm_space* s, uintptr_t va) {
+    if (!s) return 0;
+    uint32_t v = (uint32_t)va;
+    uint64_t pde = pde_get(s->root, pde_index(v));
+    if (!(pde & E_P) || (pde & E_PS) || pde_is_kernel_shared(s, pde_index(v))) return 0;
+    uint64_t pte = pte_get(pde & addr_mask(), pte_index(v));
+    if (pte & E_P) return 1;
+    if (pte & VMM_SWPE_MARK) return 2;
+    return 0;
+}
+
+int vmm_space_range_state(struct vmm_space* s, uintptr_t a, uintptr_t b) {
+    if (!s) return VMA_RS_KERNEL;
+    int st = 0;
+    const uintptr_t span = (uintptr_t)1 << pde_shift();
+    while (a < b) {
+        uint32_t gi = pde_index((uint32_t)a);
+        uint64_t pde = pde_get(s->root, gi);
+        uintptr_t next = (a & ~(span - 1)) + span;
+        if (pde & E_P) {
+            if ((pde & E_PS) || pde_is_kernel_shared(s, gi)) return st | VMA_RS_KERNEL;
+            uint64_t pt = pde & addr_mask();
+            for (uintptr_t p = a; p < b && (next <= a || p < next); p += 0x1000) {
+                uint64_t e = pte_get(pt, pte_index((uint32_t)p));
+                if ((e & E_P) || (e & VMM_SWPE_MARK)) { st |= VMA_RS_USER; break; }
+            }
+        }
+        if (next <= a) break;          /* wrapped past 4 GiB */
+        a = next;
+    }
+    return st;
 }

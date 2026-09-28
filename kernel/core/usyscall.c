@@ -56,12 +56,12 @@
 #include "timer.h"
 #include "ktimer.h"
 #include "random.h"
+#include "vma.h"
+#include "lock.h"
 #include <stddef.h>
 #include <stdint.h>
 
 #define PAGE_SIZE          4096u
-#define MMAP_BASE_OFFSET   0x08000000u   /* mmap region: base+128 MiB (above the
-                                          * image/interp/stack; see proc.c layout) */
 
 /* §M46/security — validated user<->kernel copies (see vmm.h).  Gate every ring-3
  * pointer through these so a bad pointer returns -1 (→ -EFAULT) instead of a
@@ -229,14 +229,62 @@ struct ofile* fd_lookup(int fd) {
     return t->fds[fd];
 }
 
+/* ---- §M89: the shared descriptor table (contract in fd.h) ----------------- */
+struct fdtable {
+    int           refs;
+    spinlock_t    lock;
+    struct ofile* fd[TASK_MAX_FDS];
+};
+
+/* Lock the CURRENT task's table for a slot update: a no-op for a private
+ * table (nobody else can see it), the table's lock for a shared one. */
+static uint32_t fdt_lock(struct task* t) {
+    return t->fdt ? spin_lock_irqsave(&t->fdt->lock) : 0;
+}
+static void fdt_unlock(struct task* t, uint32_t fl) {
+    if (t->fdt) spin_unlock_irqrestore(&t->fdt->lock, fl);
+}
+
+struct fdtable* fdtable_share(struct task* parent) {
+    if (!parent) return NULL;
+    if (!parent->fdt) {
+        struct fdtable* ft = (struct fdtable*)kcalloc(1, sizeof *ft);
+        if (!ft) return NULL;
+        spin_lock_init(&ft->lock);
+        ft->refs = 1;                                  /* the parent's */
+        /* MOVE, not copy: the references the inline slots held now belong to
+         * the shared table.  Only the parent is running on its table at this
+         * moment — it has no threads yet, by definition. */
+        for (int i = 0; i < TASK_MAX_FDS; i++) { ft->fd[i] = parent->fds_inline[i]; parent->fds_inline[i] = NULL; }
+        parent->fdt = ft;
+        parent->fds = ft->fd;
+    }
+    __atomic_add_fetch(&parent->fdt->refs, 1, __ATOMIC_ACQ_REL);
+    return parent->fdt;
+}
+
+void fdtable_adopt(struct task* t, struct fdtable* ft) {
+    if (!t || !ft) return;
+    t->fdt = ft;
+    t->fds = ft->fd;
+}
+
+void fdtable_put(struct fdtable* ft) {
+    if (!ft || __atomic_sub_fetch(&ft->refs, 1, __ATOMIC_ACQ_REL) != 0) return;
+    for (int i = 0; i < TASK_MAX_FDS; i++) if (ft->fd[i]) ofile_unref(ft->fd[i]);
+    kfree(ft);
+}
+
 /* Install `o` in the lowest free real-fd slot (>= 3).  Consumes the reference
  * on success; on failure returns -1 (caller unrefs). */
 static int fd_install(struct ofile* o) {
     struct task* t = task_current();
     if (!t) return -1;
+    uint32_t fl = fdt_lock(t);
     for (int fd = 3; fd < TASK_MAX_FDS; fd++) {
-        if (!t->fds[fd]) { t->fds[fd] = o; return fd; }
+        if (!t->fds[fd]) { t->fds[fd] = o; fdt_unlock(t, fl); return fd; }
     }
+    fdt_unlock(t, fl);
     return -1;
 }
 
@@ -450,7 +498,11 @@ int sys_close(int fd) {
         if (fd >= 0 && fd <= 2) return 0;
         return -1;
     }
-    task_current()->fds[fd] = NULL;
+    struct task* t = task_current();
+    uint32_t fl = fdt_lock(t);
+    if (t->fds[fd] != o) { fdt_unlock(t, fl); return -1; }   /* another thread closed it */
+    t->fds[fd] = NULL;
+    fdt_unlock(t, fl);
     ofile_unref(o);
     return 0;
 }
@@ -481,9 +533,10 @@ long sys_mmap(size_t len, int fd) {
 
     int n = (int)((len + PAGE_SIZE - 1) / PAGE_SIZE);
     if (n <= 0) n = 1;
-    if (vmm_space_mmap_cursor(t->mm) == 0)
-        vmm_space_set_mmap_cursor(t->mm, vmm_user_base() + MMAP_BASE_OFFSET);
-    uintptr_t va = vmm_space_mmap_cursor(t->mm);
+    /* §M89 — the address comes from the reservation set, so a native program
+     * and a Linux-ABI one in the same space can never be handed one range. */
+    uintptr_t va = vma_reserve_eager(t->mm, (size_t)n, 3 /* read|write */);
+    if (!va) return -1;
 
     if (fd < 0) {
         for (int i = 0; i < n; i++) {
@@ -510,176 +563,22 @@ long sys_mmap(size_t len, int fd) {
         }
         n = cnt;
     }
-    vmm_space_set_mmap_cursor(t->mm, va + (uintptr_t)n * PAGE_SIZE);
     return (long)va;
 }
 
-/* §M37 — full mmap for the Linux ABI (what musl's ld.so needs to load a .so):
- * honors `addr`+MAP_FIXED, maps file-backed regions (reads `len` bytes from the
- * VFS fd starting at `offset`), and translates prot → VMM flags so a text
- * segment is mapped executable.  Anonymous (fd<0 or MAP_ANONYMOUS) works too.
- * Returns the mapped user VA or -1.  (mprotect is a no-op elsewhere, which is
- * fine: every PT_LOAD is mapped here with its own prot; mprotect only tightens
- * RELRO afterwards.) */
-#define PROT_READ   0x1
-#define PROT_WRITE  0x2
-#define PROT_EXEC   0x4
-#define MAP_SHARED      0x01      /* §M74 — Linux value, same on all three arches */
-#define MAP_FIXED       0x10
-#define MAP_ANONYMOUS   0x20
-
+/* §M37 → §M89 — mmap / munmap / mprotect for the Linux ABI are the vma
+ * layer's (kernel/mem/vma.c): reservations, demand-zero anonymous pages, true
+ * PROT_NONE, lazily filled private file mappings, and addresses that are
+ * reused after munmap.  These wrappers keep the names every caller knows.
+ * Results are an address or a NEGATIVE ERRNO. */
 long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
                    int fd, uint64_t offset) {
-    struct task* t = task_current();
-    if (!t || !t->mm) return -1;
-    if (len > (256u << 20)) return -1;         /* §4.5 — cap a single mapping   */
-
-    int n = (int)((len + PAGE_SIZE - 1) / PAGE_SIZE);
-    if (n <= 0) n = 1;
-
-    uint32_t vf = VMM_USER;
-    if (prot & PROT_WRITE) vf |= VMM_WRITABLE;
-    if (prot & PROT_EXEC)  vf |= VMM_EXEC;
-
-    /* Target VA: MAP_FIXED honors the caller's addr; else bump-allocate. */
-    uintptr_t va;
-    if ((flags & MAP_FIXED) && addr) {
-        va = addr & ~(uintptr_t)(PAGE_SIZE - 1);
-        /* §2.5 — a fixed mapping must stay inside the user address range and
-         * not wrap; the target space is the task's own, so this only guards
-         * against a garbage/kernel addr, not against self-overwrite. */
-        if (va < vmm_user_base() || va + (uintptr_t)n * PAGE_SIZE < va) return -1;
-    } else {
-        if (vmm_space_mmap_cursor(t->mm) == 0)
-            vmm_space_set_mmap_cursor(t->mm, vmm_user_base() + MMAP_BASE_OFFSET);
-        va = vmm_space_mmap_cursor(t->mm);
-        vmm_space_set_mmap_cursor(t->mm, va + (uintptr_t)n * PAGE_SIZE);
-    }
-
-    /* File to read from for a file-backed mapping (else anonymous zero-fill).
-     *
-     * §M40 — a memfd (FD_SHM) is a THIRD case and must be handled separately:
-     * its whole purpose is that both sides see the SAME frames, so it maps the
-     * object's existing pages rather than allocating fresh ones.  Missing this
-     * branch is why an upstream Wayland client's mmap of its shm pool failed —
-     * the native sys_mmap had it, this Linux-facing entry point did not. */
-    struct file* file = NULL;
-    if (fd >= 0 && !(flags & MAP_ANONYMOUS)) {
-        struct ofile* o = fd_lookup(fd);
-        if (!o) return -1;
-        if (o->kind == FD_SHM && o->shm) {
-            struct shm* sh = o->shm;
-            int first = (int)(offset / PAGE_SIZE);
-            for (int i = 0; i < n; i++) {
-                int idx = first + i;
-                if (idx >= sh->nframes) break;      /* short object: stop here */
-                /* VMM_SHARED: the shm object owns these frames, so tearing the
-                 * address space down must not free them. */
-                if (vmm_space_map(t->mm, va + (uintptr_t)i * PAGE_SIZE,
-                                  sh->frames[idx],
-                                  vf | VMM_WRITABLE | VMM_SHARED) != 0)
-                    return -1;
-            }
-            return (long)va;
-        }
-        if (o->kind != FD_VFS || !o->file) return -1;
-        file = o->file;
-    }
-
-    /* §M74 rung 2 — a PRIVATE file mapping shares the page cache's frames
-     * copy-on-write (pcache.c): two programs mapping libc.so hold one copy of
-     * it, and a write by either copies first.  A MAP_SHARED file mapping, an
-     * unaligned offset and the cache switched off keep the eager private copy
-     * below. */
-    if (file && !(flags & MAP_SHARED) && !(offset & (PAGE_SIZE - 1)) &&
-        pcache_enabled()) {
-        for (int i = 0; i < n; i++) {
-            uintptr_t page_va = va + (uintptr_t)i * PAGE_SIZE;
-            if (flags & MAP_FIXED) vmm_space_unmap(t->mm, page_va);
-            pmm_phys_t fr;
-            if (pcache_map_page(file, offset / PAGE_SIZE + (uint64_t)i, &fr) != 0) return -1;
-            if (vmm_space_map(t->mm, page_va, fr,
-                              (vf & ~(uint32_t)VMM_WRITABLE) | VMM_COW) != 0) {
-                if (vmm_frame_unshare(fr)) pmm_free_frame(fr);   /* cannot be last */
-                return -1;
-            }
-        }
-        return (long)va;
-    }
-
-    for (int i = 0; i < n; i++) {
-        uintptr_t page_va = va + (uintptr_t)i * PAGE_SIZE;
-        /* MAP_FIXED may overlay an earlier reservation — drop the old PTE so
-         * the fresh frame maps cleanly. */
-        if (flags & MAP_FIXED) vmm_space_unmap(t->mm, page_va);
-
-        /* §M86 — a USER page, so it may be highmem.  A file-backed page is
-         * READ first into a kernel bounce page and only then copied through a
-         * kmap: vfs_read can sleep on the disk, and a kmap must not be held
-         * across a sleep (kmap.h). */
-        pmm_phys_t fr = pmm_alloc_frame_user();
-        if (!fr) return -1;
-        kmap_zero_frame(fr);
-
-        if (file) {
-            uint8_t* bounce = (uint8_t*)kmalloc(PAGE_SIZE);
-            if (!bounce) { pmm_free_frame(fr); return -1; }
-            for (int b = 0; b < (int)PAGE_SIZE; b++) bounce[b] = 0;
-            /* Positioned read; restore the fd cursor (musl owns it). */
-            uint64_t save = file->pos;
-            file->pos = offset + (uint64_t)i * PAGE_SIZE;
-            vfs_read(file, bounce, PAGE_SIZE);        /* short tail → stays 0  */
-            file->pos = save;
-            uint8_t* p = (uint8_t*)kmap_frame(fr);
-            if (p) {
-                for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = bounce[b];
-                kunmap_frame(p);
-            }
-            kfree(bounce);
-        }
-
-        if (vmm_space_map(t->mm, page_va, fr, vf) != 0) {
-            pmm_free_frame(fr);
-            return -1;
-        }
-    }
-    return (long)va;
+    return vma_mmap(addr, len, prot, flags, fd, offset);
 }
 
-/* §M74 — munmap(addr, len): drop the pages, releasing what each held
- * (vmm_space_unmap: a private frame is freed, a COW or page-cache frame loses
- * one sharer, a borrowed shm frame is left to its owner).  Until 2026-09-27
- * this was a success that did nothing: memory a program gave back stayed
- * mapped until it exited.  The address space itself is still a bump
- * allocator — the range is not reused — so this reclaims FRAMES, not
- * addresses. */
-long sys_munmap(uintptr_t addr, size_t len) {
-    struct task* t = task_current();
-    if (!t || !t->mm) return -1;
-    if (addr & (PAGE_SIZE - 1)) return -22;            /* EINVAL, as POSIX says */
-    if (len == 0) return -22;
-    uintptr_t end = addr + ((len + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1));
-    if (end < addr || addr < vmm_user_base()) return -22;
-    for (uintptr_t va = addr; va < end; va += PAGE_SIZE)
-        vmm_space_unmap(t->mm, va);
-    return 0;
-}
+long sys_munmap(uintptr_t addr, size_t len) { return vma_munmap(addr, len); }
 
-/* §M37 — mprotect(addr,len,prot): change protection of already-mapped user
- * pages (musl's mallocng maps PROT_NONE then mprotects to R/W; ld.so tightens
- * RELRO to read-only after relocation).  Pages not mapped are skipped. */
-long sys_mprotect(uintptr_t addr, size_t len, int prot) {
-    struct task* t = task_current();
-    if (!t || !t->mm) return -1;
-    uintptr_t start = addr & ~(uintptr_t)(PAGE_SIZE - 1);
-    uintptr_t end   = (addr + len + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
-    uint32_t vf = VMM_USER;                        /* user pages stay user */
-    if (prot & PROT_WRITE) vf |= VMM_WRITABLE;
-    if (prot & PROT_EXEC)  vf |= VMM_EXEC;
-    for (uintptr_t va = start; va < end; va += PAGE_SIZE)
-        vmm_space_protect(t->mm, va, vf);          /* ignore unmapped pages */
-    return 0;
-}
+long sys_mprotect(uintptr_t addr, size_t len, int prot) { return vma_mprotect(addr, len, prot); }
 
 int sys_memfd(size_t size) {
     struct shm* s = shm_create(size);
@@ -756,8 +655,12 @@ int sys_dup2(int oldfd, int newfd) {
      * Refusing it is what made redirection impossible (see fd_lookup). */
     if (newfd < 0 || newfd >= TASK_MAX_FDS) { if (fresh) ofile_unref(o); return -1; }
     struct task* t = task_current();
-    if (t->fds[newfd]) { ofile_unref(t->fds[newfd]); t->fds[newfd] = NULL; }
-    t->fds[newfd] = fresh ? o : ofile_ref(o);
+    struct ofile* nw = fresh ? o : ofile_ref(o);
+    uint32_t fl = fdt_lock(t);
+    struct ofile* old = t->fds[newfd];
+    t->fds[newfd] = nw;
+    fdt_unlock(t, fl);
+    if (old) ofile_unref(old);               /* outside the lock: may close a file */
     return newfd;
 }
 
@@ -782,12 +685,16 @@ int sys_dupfd(int fd, int minfd) {
      * the caller and can never be looked up again — which is precisely how a
      * Wayland client ended up passing descriptor zero to the compositor. */
     if (minfd < 3) minfd = 3;
+    struct ofile* nw = fresh ? o : ofile_ref(o);
+    uint32_t fl = fdt_lock(t);
     for (int i = minfd; i < TASK_MAX_FDS; i++) {
         if (t->fds[i]) continue;
-        t->fds[i] = fresh ? o : ofile_ref(o);
+        t->fds[i] = nw;
+        fdt_unlock(t, fl);
         return i;
     }
-    if (fresh) ofile_unref(o);
+    fdt_unlock(t, fl);
+    ofile_unref(nw);
     return -1;
 }
 
@@ -1608,6 +1515,15 @@ int sys_setitimer_u(const uint64_t* times) {
 void fd_close_all(void) {
     struct task* t = task_current();
     if (!t) return;
+    /* §M89 — a thread leaving a SHARED table closes nothing: the others are
+     * still using those descriptors.  The last one out closes them all. */
+    if (t->fdt) {
+        struct fdtable* ft = t->fdt;
+        t->fdt = NULL;
+        t->fds = t->fds_inline;
+        fdtable_put(ft);
+        return;
+    }
     for (int fd = 3; fd < TASK_MAX_FDS; fd++) {
         if (t->fds[fd]) { ofile_unref(t->fds[fd]); t->fds[fd] = NULL; }
     }

@@ -72,7 +72,8 @@ MUSL_COREUTIL_BLOBS := $(patsubst %,user/%_muslblob.o,$(MUSL_COREUTILS))
 MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o \
                    user/wedgewin_muslblob.o user/pthreadtest_muslblob.o \
                    user/epollmusl_muslblob.o user/netmuslserv_muslblob.o \
-                   user/nxtest_muslblob.o
+                   user/nxtest_muslblob.o user/mmaptest_muslblob.o \
+                   user/sigmusl_muslblob.o
 # §M37 dynamic-linking artifacts — the ld.so blob + the dynamically linked tests.
 MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
                    user/libgreet_blob.o user/solibtest_dynblob.o \
@@ -116,7 +117,8 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/uaccess.c \
       kernel/hal/x86/fork.c \
       kernel/hal/x86/signal.c \
-      kernel/hal/x86/linux_abi.c
+      kernel/hal/x86/linux_abi.c \
+      kernel/hal/x86/lnx_sigframe.c
 
   ARCH_ASM_SRCS := \
       kernel/hal/x86/boot.s \
@@ -313,6 +315,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/syscall.c \
       kernel/hal/x86_64/uaccess.c \
       kernel/hal/x86_64/linux_abi.c \
+      kernel/hal/x86_64/lnx_sigframe.c \
       kernel/hal/x86_64/fork.c \
       kernel/hal/x86_64/signal.c \
       kernel/hal/x86/lapic.c \
@@ -562,6 +565,7 @@ else ifeq ($(ARCH),aarch64)
       kernel/hal/aarch64/fork.c \
       kernel/hal/aarch64/signal.c \
       kernel/hal/aarch64/linux_abi.c \
+      kernel/hal/aarch64/lnx_sigframe.c \
       kernel/hal/aarch64/syscall.c \
       kernel/hal/aarch64/uaccess.c \
       kernel/hal/aarch64/fpu.c \
@@ -609,6 +613,8 @@ else ifeq ($(ARCH),aarch64)
                      user/epollmusl_muslblob.o \
                      user/netmuslserv_muslblob.o \
                      user/nxtest_muslblob.o \
+                     user/mmaptest_muslblob.o \
+                     user/sigmusl_muslblob.o \
                      $(MUSL_COREUTIL_BLOBS)
 
   # §M60 — the embedded default wallpaper (all arches).
@@ -829,6 +835,7 @@ CORE_C_SRCS := \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
+    kernel/core/lnx_signal.c \
     kernel/core/pkg.c \
     kernel/drivers/audio/ac97.c \
     kernel/core/audio.c \
@@ -844,6 +851,7 @@ CORE_C_SRCS := \
     kernel/mem/swap.c \
     kernel/mem/memage.c \
     kernel/mem/pcache.c \
+    kernel/mem/vma.c \
     kernel/mem/vmm_account.c \
     kernel/mem/kmalloc.c \
     kernel/mem/slab.c \
@@ -878,6 +886,7 @@ CORE_C_SRCS := \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
+    kernel/core/lnx_signal.c \
     kernel/core/net.c \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \
@@ -1006,6 +1015,7 @@ CORE_C_SRCS := \
     kernel/mem/swap.c \
     kernel/mem/memage.c \
     kernel/mem/pcache.c \
+    kernel/mem/vma.c \
     kernel/mem/vmm_account.c \
     kernel/mem/slab.c \
     kernel/mem/kmalloc.c \
@@ -1182,6 +1192,7 @@ CORE_C_SRCS := \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
     kernel/core/abi_linux.c \
+    kernel/core/lnx_signal.c \
     kernel/core/pkg.c \
     kernel/drivers/usb/xhci.c \
     kernel/drivers/usb/usb_hid.c \
@@ -1195,6 +1206,7 @@ CORE_C_SRCS := \
     kernel/mem/swap.c \
     kernel/mem/memage.c \
     kernel/mem/pcache.c \
+    kernel/mem/vma.c \
     kernel/mem/vmm_account.c \
     kernel/mem/kmalloc.c \
     kernel/mem/slab.c \

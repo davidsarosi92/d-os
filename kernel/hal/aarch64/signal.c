@@ -30,6 +30,7 @@
 #include "task.h"
 #include "vmm.h"
 #include "fd.h"
+#include "lnx_signal.h"
 #include <stdint.h>
 
 /* Matches the trapframe laid down by vectors.S (see exceptions.c/syscall.c). */
@@ -60,6 +61,8 @@ void signal_deliver(struct trapframe* f) {
     if ((f->spsr & 0xF) != 0) return;          /* only when returning to EL0 */
     struct task* t = task_current();
     if (!t || !t->sig_pending) return;
+    /* §M89 — a Linux program gets Linux's frame and default actions. */
+    if (t->linux_abi) { lnx_signal_deliver(f); return; }
 
     for (int sig = 1; sig < NSIG; sig++) {
         uint32_t bit = 1u << sig;
@@ -109,6 +112,17 @@ void signal_deliver(struct trapframe* f) {
         f->elr   = (uint64_t)h;                 /* eret enters the handler */
         return;                                 /* one signal per return */
     }
+}
+
+/* The IRQ return path.  A LINUX program's frame is not built here: the frame
+ * may land on a stack page that is not present yet, and bringing it in can
+ * sleep, which an interrupt must not.  x86 delivers only on the syscall path
+ * too; a signal to a thread spinning in user mode therefore waits for its
+ * next system call on every arch (NEXT.md: §M89 open item). */
+void signal_deliver_irq(struct trapframe* f) {
+    struct task* t = task_current();
+    if (t && t->linux_abi) return;
+    signal_deliver(f);
 }
 
 void signal_sigreturn(struct trapframe* f) {

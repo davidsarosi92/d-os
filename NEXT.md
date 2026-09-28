@@ -25,6 +25,23 @@ Also open from §M87: a second virtio-blk disk, partition tables, a real Wi-Fi
 driver.  The phone emulator (§M84) is not in the agreed list yet.
 
 
+## Agreed order (2026-09-28): §M89 Java FIRST, then EVERY open item below
+
+After §M89 ships, the open items are worked through, not left listed: the
+autologin rule (next item), §M88's open rungs (per-output modes, live
+re-arrangement, left/above, desktops over 16 MiB, a virtio-gpu second
+scanout, a taskbar per monitor), a second virtio-blk disk, partition tables,
+a real Wi-Fi driver, and the rows under "Known defects — Open".
+
+## Queued from use (2026-09-28) — after §M89
+
+- **Autologin works only when the autologin account has NO password.**  An
+  account chosen for automatic sign-in that also has a password falls back to
+  the lock screen.  Decide the rule (autologin is an explicit choice by an
+  admin and should win, with the password still guarding lock/unlock and
+  remote paths) and falsify it with `logouttest`/`gui signout` on a
+  password-protected autologin account.
+
 ## Queued from use (2026-09-27) — items 1-3 DONE 2026-09-28 (DOCS §4.116)
 
 1. **Swap in the Control Panel.** `mem.swap_policy` / `mem.swap_size_mb` (and

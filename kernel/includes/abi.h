@@ -202,6 +202,20 @@ enum abi_op {
      * signals are; the Linux-ABI half is an open item).  One answer for every
      * guest, where it used to be two switch cases and a gap on arm64. */
     ABI_LNX_SIGACTION,
+    /* §M89 — mmap with the offset in 4 KiB PAGES (i386's mmap2), the same
+     * operation as ABI_MMAP otherwise.  With both x86 guests routed here the
+     * per-arch mmap switch cases are gone. */
+    ABI_MMAP_PGOFF,
+    /* §M89 rung 2 — Linux signals, for real (lnx_signal.c): kill posts with
+     * SI_USER, tkill/tgkill to one THREAD (pthread_kill), sigaltstack for a
+     * handler that must not run on the stack that overflowed.  rt_sigaction
+     * (ABI_LNX_SIGACTION above) stopped being "accepted and ignored". */
+    ABI_KILL, ABI_TKILL, ABI_TGKILL, ABI_SIGALTSTACK,
+    /* §M89 — what a JVM asks before main(): futex for real (private ops,
+     * timeouts, bitset, requeue), getcpu, sysinfo, resource limits,
+     * clock_getres, statfs. */
+    ABI_FUTEX, ABI_GETCPU, ABI_SYSINFO, ABI_GETRLIMIT, ABI_SETRLIMIT, ABI_PRLIMIT64,
+    ABI_CLOCK_GETRES, ABI_STATFS, ABI_FSTATFS,
 
     ABI_OP_MAX
 };

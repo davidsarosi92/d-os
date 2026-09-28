@@ -30,13 +30,33 @@
 #include <stddef.h>
 #include "module.h"
 
-/* Per-file private data — capacity grows as needed; logical size lives
- * in `inode->size` so the VFS layer can print it without poking inside. */
+/* Per-file private data; the logical size lives in `inode->size` so the VFS
+ * layer can print it without poking inside.
+ *
+ * THE CONTENT IS A TABLE OF 4 KiB PAGES, NOT ONE BUFFER (§M89).  It used to be
+ * a single kmalloc'd block that doubled on growth, which quietly capped a file
+ * at the largest CONTIGUOUS block the heap can hand out (16 MiB, the buddy
+ * ceiling) and needed old+new at once to grow — a Java runtime's 101 MB
+ * `lib/modules` could not be created at all, and the write simply failed.
+ * Pages have neither limit: only the pointer table is contiguous (8 bytes per
+ * 4 KiB), and growing it copies pointers, not content.
+ *
+ * A NULL page is a HOLE and reads as zeros, so a file extended past its end
+ * by a seek costs nothing for the gap. */
+#define RFS_PAGE 4096u
 struct ramfs_file {
-    char*  data;
-    size_t cap;
+    char** pages;      /* pages[i] holds bytes [i*RFS_PAGE, (i+1)*RFS_PAGE)   */
+    size_t npages;     /* slots in `pages` (capacity of the table)             */
     int    nlink;      /* §M73 — names pointing at this file; freed at 0 */
 };
+
+static void rfs_free_pages(struct ramfs_file* rf) {
+    if (!rf->pages) return;
+    for (size_t i = 0; i < rf->npages; i++) if (rf->pages[i]) kfree(rf->pages[i]);
+    kfree(rf->pages);
+    rf->pages = NULL;
+    rf->npages = 0;
+}
 
 /* ------------------------------------------------------------------- */
 /* Memory helpers (no libc).                                            */
@@ -74,8 +94,8 @@ static struct inode* ramfs_alloc_inode(enum inode_type type) {
         ino->ops = &ramfs_file_ops;
         struct ramfs_file* rf = (struct ramfs_file*)kcalloc(1, sizeof(*rf));
         if (!rf) { kfree(ino); return NULL; }
-        rf->data = NULL;
-        rf->cap  = 0;
+        rf->pages  = NULL;
+        rf->npages = 0;
         rf->nlink = 1;
         ino->private = rf;
     }
@@ -116,7 +136,7 @@ static int rfs_unlink_op(struct inode* dir, const char* name,
         /* §M73 — another name still points here: only this one goes. */
         if (rf && rf->nlink > 1) { rf->nlink--; return 0; }
         if (rf) {
-            if (rf->data) kfree(rf->data);
+            rfs_free_pages(rf);
             kfree(rf);
         }
     }
@@ -161,8 +181,49 @@ static ssize_t rfs_read(struct file* f, void* buf, size_t n, uint64_t off) {
     if (off >= f->inode->size) return 0;        /* EOF */
     uint64_t avail = f->inode->size - off;
     size_t take = n < avail ? n : (size_t)avail;
-    memcpy_(buf, rf->data + off, take);
+    char* out = (char*)buf;
+    size_t done = 0;
+    while (done < take) {
+        uint64_t pos = off + done;
+        size_t pi = (size_t)(pos / RFS_PAGE), po = (size_t)(pos % RFS_PAGE);
+        size_t chunk = RFS_PAGE - po;
+        if (chunk > take - done) chunk = take - done;
+        const char* pg = pi < rf->npages ? rf->pages[pi] : NULL;
+        if (pg) memcpy_(out + done, pg + po, chunk);
+        else    for (size_t i = 0; i < chunk; i++) out[done + i] = 0;   /* a hole */
+        done += chunk;
+    }
     return (ssize_t)take;
+}
+
+/* Make the page table hold at least `need` slots.  Doubling keeps growth
+ * amortised O(1); what is copied is pointers, never content. */
+static int rfs_reserve(struct ramfs_file* rf, size_t need) {
+    if (need <= rf->npages) return 0;
+    size_t ncap = rf->npages ? rf->npages : 4;
+    while (ncap < need) ncap *= 2;
+    char** np = (char**)kcalloc(ncap, sizeof(char*));
+    if (!np) return -1;
+    for (size_t i = 0; i < rf->npages; i++) np[i] = rf->pages[i];
+    if (rf->pages) kfree(rf->pages);
+    rf->pages = np;
+    rf->npages = ncap;
+    return 0;
+}
+
+/* Zero [from, to) where pages exist — the bytes a truncate left behind.
+ * O_TRUNC only resets the size (vfs.c), so a later write beyond the new end
+ * would otherwise expose the old content in the gap. */
+static void rfs_zero_range(struct ramfs_file* rf, uint64_t from, uint64_t to) {
+    while (from < to) {
+        size_t pi = (size_t)(from / RFS_PAGE), po = (size_t)(from % RFS_PAGE);
+        size_t chunk = RFS_PAGE - po;
+        if (chunk > to - from) chunk = (size_t)(to - from);
+        if (pi >= rf->npages) return;
+        char* pg = rf->pages[pi];
+        if (pg) for (size_t i = 0; i < chunk; i++) pg[po + i] = 0;
+        from += chunk;
+    }
 }
 
 static ssize_t rfs_write(struct file* f, const void* buf, size_t n,
@@ -170,33 +231,36 @@ static ssize_t rfs_write(struct file* f, const void* buf, size_t n,
     if (!f || !f->inode) return -1;
     struct ramfs_file* rf = (struct ramfs_file*)f->inode->private;
     if (!rf) return -1;
+    if (n == 0) return 0;
 
-    /* ramfs lives entirely on the kernel heap (32-bit `size_t`).  A
-     * write past the addressable range can't actually be served — clip
-     * and let the caller see a short write. */
-    if (off > (uint64_t)(size_t)-1) return 0;
-    size_t off32  = (size_t)off;
-    size_t needed = off32 + n;
-    if (needed < off32) return -1;              /* size_t overflow */
-
-    /* Grow buffer if we don't have room.  Doubling keeps writes amortized
-     * O(1) and avoids the realloc-per-byte behavior a naive resize would
-     * produce. */
-    if (needed > rf->cap) {
-        size_t new_cap = rf->cap ? rf->cap : 64;
-        while (new_cap < needed) new_cap *= 2;
-        char* nd = (char*)kmalloc(new_cap);
-        if (!nd) return -1;
-        if (rf->data) memcpy_(nd, rf->data, (size_t)f->inode->size);
-        if (rf->data) kfree(rf->data);
-        rf->data = nd;
-        rf->cap  = new_cap;
-    }
-
-    memcpy_(rf->data + off32, buf, n);
+    /* ramfs lives on the kernel heap; its page index is a size_t. */
     uint64_t end = off + (uint64_t)n;
-    if (end > f->inode->size) f->inode->size = end;
-    return (ssize_t)n;
+    if (end < off || end / RFS_PAGE >= (uint64_t)((size_t)-1 / sizeof(char*))) return -1;
+    if (rfs_reserve(rf, (size_t)((end + RFS_PAGE - 1) / RFS_PAGE)) != 0) return -1;
+    if (off > f->inode->size) rfs_zero_range(rf, f->inode->size, off);
+
+    const char* in = (const char*)buf;
+    size_t done = 0;
+    while (done < n) {
+        uint64_t pos = off + done;
+        size_t pi = (size_t)(pos / RFS_PAGE), po = (size_t)(pos % RFS_PAGE);
+        size_t chunk = RFS_PAGE - po;
+        if (chunk > n - done) chunk = n - done;
+        if (!rf->pages[pi]) {
+            char* pg = (char*)kcalloc(1, RFS_PAGE);   /* zeroed: the rest of a new page reads as 0 */
+            if (!pg) {
+                /* Out of memory part way: report what landed, as a short write. */
+                if (done == 0) return -1;
+                break;
+            }
+            rf->pages[pi] = pg;
+        }
+        memcpy_(rf->pages[pi] + po, in + done, chunk);
+        done += chunk;
+    }
+    uint64_t newend = off + (uint64_t)done;
+    if (newend > f->inode->size) f->inode->size = newend;
+    return (ssize_t)done;
 }
 
 static int rfs_close(struct file* f) {

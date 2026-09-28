@@ -18,6 +18,7 @@
  * address space (task_reap → vmm_space_destroy).
  * ============================================================================= */
 
+#include "lnx_signal.h"   /* §M89 */
 #include "proc.h"
 #include "task.h"
 #include "vmm.h"
@@ -104,6 +105,7 @@ int proc_fork(struct user_regs* parent_regs) {
     /* Inherit the parent's signal dispositions (POSIX: fork keeps handlers). */
     for (int i = 0; i < NSIG; i++) child->sig_handler[i] = parent->sig_handler[i];
     child->sig_restorer = parent->sig_restorer;
+    lnx_sig_fork(parent, child);            /* §M89 — Linux dispositions, copied */
 
     /* Inherit the ABI personality: a fork()ing Linux/musl process (a shell)
      * must produce Linux-personality children so its execve'd programs are
@@ -147,16 +149,15 @@ int proc_fork(struct user_regs* parent_regs) {
  * its argument on the new stack — which is why this reuses the fork register
  * snapshot rather than taking an entry point like the native proc_clone.
  *
- * The fd "table" is per-task here, so the child gets ref-bumped copies of the
- * parent's descriptors.  Sharing the OBJECTS is what POSIX threads actually
- * need for I/O; a descriptor opened later by one thread is not yet visible to
- * the others (a real shared table is a follow-up).
+ * The thread SHARES the creator's descriptor table (§M89, fdtable_share):
+ * a descriptor opened later by one thread is visible to all of them, as
+ * CLONE_FILES promises.  (They used to get ref-bumped copies.)
  * ------------------------------------------------------------------------- */
 struct clone_boot_t {
     struct vmm_space* space;
     struct user_regs  regs;
     uintptr_t         tls;
-    struct ofile*     fds[TASK_MAX_FDS];
+    struct fdtable*   fdt;              /* §M89 — shared with the creator */
 };
 
 static void clone_thread_bootstrap(void) {
@@ -166,7 +167,7 @@ static void clone_thread_bootstrap(void) {
     me->mm        = b->space;               /* SHARED with the creator */
     me->mm_shared = 1;
     me->user_task = 1;
-    for (int i = 0; i < TASK_MAX_FDS; i++) me->fds[i] = b->fds[i];
+    fdtable_adopt(me, b->fdt);
 
     struct user_regs  regs  = b->regs;
     struct vmm_space* space = b->space;
@@ -206,18 +207,18 @@ int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
     b->regs.eax = 0;                    /* the child sees clone() == 0 */
     b->regs.user_sp = child_stack;
     b->tls     = tls;
-    for (int i = 0; i < TASK_MAX_FDS; i++)
-        b->fds[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
+    b->fdt     = fdtable_share(parent);   /* §M89 — CLONE_FILES: one table */
+    if (!b->fdt) { kfree(b); return -1; }
 
     struct task* child = task_spawn_arg_held("thread", clone_thread_bootstrap, b);
     if (!child) {
-        for (int i = 0; i < TASK_MAX_FDS; i++)
-            if (b->fds[i]) ofile_unref(b->fds[i]);
+        fdtable_put(b->fdt);
         kfree(b);
         return -1;
     }
     child->mm_shared   = 1;                 /* set early: it may run at once */
     child->linux_abi   = parent->linux_abi;
+    lnx_sig_thread(parent, child);          /* §M89 — CLONE_SIGHAND: shared */
     child->clear_tid   = ctid_kaddr;        /* CLONE_CHILD_CLEARTID (see task_exit) */
     hal_fpu_save(parent->fpu_state);
     for (unsigned i = 0; i < HAL_FPU_STATE_SIZE; i++)

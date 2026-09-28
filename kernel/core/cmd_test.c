@@ -78,6 +78,10 @@ extern const unsigned char _binary_user_netmuslserv_muslelf_start[] __attribute_
 extern const unsigned char _binary_user_netmuslserv_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_nxtest_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_nxtest_muslelf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_mmaptest_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_mmaptest_muslelf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_sigmusl_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_sigmusl_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_epollmusl_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_epollmusl_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_muslhello_muslelf_start[] __attribute__((weak));
@@ -893,6 +897,36 @@ static void cmd_nxtest(const char* args) {
                 : "nxtest: FAIL - expected rc=-139 from a faulting excursion\n");
 }
 
+/* §M89 rung 1 — `mmaptest`: reservations, demand-zero pages, PROT_NONE that
+ * faults, address reuse and a lazy file mapping, through an UNMODIFIED musl
+ * binary (user/mmaptest.c).  Every claim fails on the pre-§M89 kernel. */
+static void cmd_mmaptest(const char* args) {
+    (void)args;
+    const unsigned char* a = _binary_user_mmaptest_muslelf_start;
+    const unsigned char* b = _binary_user_mmaptest_muslelf_end;
+    if (!a || !b) { console_write("mmaptest: not embedded for this arch\n"); return; }
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(a, (unsigned long)(b - a));
+    if (me) me->linux_abi = prev;
+    kprintf("mmaptest: returned rc=%d\n", rc);
+}
+
+/* §M89 rung 2 — `sigmusl`: Linux signals as a JVM uses them (user/sigmusl.c). */
+static void cmd_sigmusl(const char* args) {
+    (void)args;
+    const unsigned char* a = _binary_user_sigmusl_muslelf_start;
+    const unsigned char* b = _binary_user_sigmusl_muslelf_end;
+    if (!a || !b) { console_write("sigmusl: not embedded for this arch\n"); return; }
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(a, (unsigned long)(b - a));
+    if (me) me->linux_abi = prev;
+    kprintf("sigmusl: returned rc=%d\n", rc);
+}
+
 static void cmd_musltest(void) {
     if (!_binary_user_muslhello_muslelf_start) {
         console_write("musltest: not embedded — run `make musl` then rebuild\n");
@@ -1137,6 +1171,8 @@ TEST(pthreadtest,   t_pthreadtest,   "", "REAL musl pthreads");
 TEST(epollmusltest, t_epollmusltest, "", "epoll through unmodified musl");
 static void t_nxtest(const char* a) { cmd_nxtest(a); }
 TEST(nxtest, t_nxtest, "[excursion]", "no-execute: data and stack pages must not run");
+TEST(sigmusl, cmd_sigmusl, "", "Linux signals: siginfo, faults to handlers, ucontext pc, altstack, sa_mask, pthread_kill (§M89)");
+TEST(mmaptest, cmd_mmaptest, "", "reservations, demand-zero, PROT_NONE, address reuse (§M89)");
 TEST(netmuslserv,   t_netmuslserv,   "", "bind/listen/accept through real musl");
 TEST(musltest,      t_musltest,      "", "an unmodified static musl binary");
 TEST(musldyntest,   t_musldyntest,   "", "a dynamically linked musl binary");

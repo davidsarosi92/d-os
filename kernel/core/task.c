@@ -77,6 +77,7 @@
  * context_switch that swaps away from it.
  * ============================================================================= */
 
+#include "lnx_signal.h"   /* §M89 */
 #include "task.h"
 #include "swap.h"
 #include "watchdog.h"   /* §M31 L3 — hw_watchdog_pet from the tick */
@@ -234,6 +235,7 @@ static void task_refresh_demand(struct task* t, uint64_t now);
  * remembering four places forever, and the next field would break it
  * again the same way. */
 static void task_sched_defaults(struct task* t) {
+    t->fds = t->fds_inline;          /* §M89 — every task starts with its own table */
     t->nice       = 0;
     t->weight     = TASK_WEIGHT_BASE;
     t->deficit    = (int)TASK_WEIGHT_BASE;
@@ -1889,6 +1891,11 @@ static void wake_blocked_task(struct task* t) {
     wake_waitq_sleeper(t);
 }
 
+/* §M89 — a signal was posted to `t`: if it is asleep, wake it so the wait it
+ * is in can notice (futex returns EINTR) and the signal is delivered on the
+ * way back.  Spurious by the same contract as a kill's wake. */
+void task_signal_wake(struct task* t) { wake_blocked_task(t); }
+
 /* §M72 — STOPPED -> RUNNABLE, exactly once however many callers race: the
  * state is the claim (CAS), and whoever wins the claim enqueues. */
 /* §M72 stage 3 — the swap claim and the resume are decided under ONE lock:
@@ -2279,6 +2286,7 @@ int task_reap(int pid) {
         t->mm = NULL;
     }
 
+    lnx_sig_free(t);                         /* §M89 — Linux signal state */
     if (t->kstack_base) kfree(t->kstack_base);
     kfree(t);
     task_notify_change();                    /* M22.4 — task disappeared */

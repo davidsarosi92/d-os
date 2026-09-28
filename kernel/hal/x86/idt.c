@@ -16,6 +16,8 @@
  * APIC (still on legacy 8259), SMP (single-CPU assumption everywhere).
  * ============================================================================= */
 
+#include "lnx_signal.h"   /* §M89 */
+#include "vma.h"      /* §M89 — demand pages */
 #include "idt.h"
 #include "hal.h"
 #include "printf.h"
@@ -681,6 +683,10 @@ void isr_handler(struct int_frame* f) {
                 int can_sleep = (f->cs & 3) == 3 ||
                                 ((f->eflags & 0x200) && this_cpu()->preempt_count == 0);
                 if (swap_in_fault(cr2, can_sleep)) return;
+                /* §M89 — a page a reservation says belongs here and that was
+                 * never touched: demand-zero, or a lazily filled file page.
+                 * Error-code bit 1 = the access was a write. */
+                if (vma_fault(cr2, (f->err_code & 2) != 0, can_sleep)) return;
             }
         }
 
@@ -732,6 +738,8 @@ void isr_handler(struct int_frame* f) {
         if ((f->cs & 3) == 3 && task_current()) {
             struct task* t = task_current();
             int sig = fault_signal((int)f->int_no);
+            /* §M89 — a Linux program that handles this signal gets it. */
+            if (lnx_fault_deliver(f, sig, (uintptr_t)_cr2)) return;
             kprintf("\nfault: user EXCEPTION %d (%s) pid %d '%s' "
                     "cs:eip=%x:%p err=%x cr2=%p — killing process\n",
                     f->int_no, exception_name[f->int_no], t->pid, t->name,

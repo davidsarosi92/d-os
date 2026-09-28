@@ -25,6 +25,7 @@
  * writes to its user stack pages just work.
  * ============================================================================= */
 
+#include "lnx_signal.h"   /* §M89 */
 #include "syscall.h"
 #include "idt.h"
 #include "task.h"
@@ -44,6 +45,8 @@ void signal_deliver(struct int_frame* f) {
     if ((f->cs & 3) != 3) return;              /* only when returning to ring 3 */
     struct task* t = task_current();
     if (!t || !t->sig_pending) return;
+    /* §M89 — a Linux program gets Linux's frame and default actions. */
+    if (t->linux_abi) { lnx_signal_deliver(f); return; }
 
     for (int sig = 1; sig < NSIG; sig++) {
         uint32_t bit = 1u << sig;

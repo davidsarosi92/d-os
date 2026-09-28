@@ -86,6 +86,7 @@
 #include "timer.h"
 #include "pci.h"
 #include "vmm.h"
+#include "vma.h"
 #include "pmm.h"
 #include "iommu.h"
 #include <stddef.h>
@@ -913,16 +914,15 @@ long drvuser_sys_mmio(uint64_t phys, uint64_t len) {
     struct task* t = task_current();
     if (!t || !t->mm) return DRV_EBAD;
 
-    if (vmm_space_mmap_cursor(t->mm) == 0)
-        vmm_space_set_mmap_cursor(t->mm, vmm_user_base() + 0x10000000u);
-    uintptr_t va = vmm_space_mmap_cursor(t->mm);
     uint64_t n = (len + 4095) / 4096;
+    /* §M89 — addresses come from the reservation set, like every mmap. */
+    uintptr_t va = vma_reserve_eager(t->mm, (size_t)n, 3);
+    if (!va) return DRV_ENORES;
     for (uint64_t i = 0; i < n; i++)
         if (vmm_space_map(t->mm, va + (uintptr_t)i * 4096,
                           (uintptr_t)(phys + i * 4096),
                           VMM_USER | VMM_WRITABLE | VMM_CACHE_DIS | VMM_SHARED) != 0)
             return DRV_ENORES;
-    vmm_space_set_mmap_cursor(t->mm, va + (uintptr_t)n * 4096);
     kprintf("drv-user: '%s' mapped its %x-byte register window at %x in ring 3\n",
             d->mf->name, (unsigned)len, (unsigned)va);
     d->h_mmio_va = va;
@@ -983,15 +983,13 @@ long drvuser_sys_dma(int bytes, int addr_bits, uint64_t* out_dev) {
 
     struct task* t = task_current();
     if (!t || !t->mm) return DRV_EBAD;
-    if (vmm_space_mmap_cursor(t->mm) == 0)
-        vmm_space_set_mmap_cursor(t->mm, vmm_user_base() + 0x10000000u);
-    uintptr_t va = vmm_space_mmap_cursor(t->mm);
+    uintptr_t va = vma_reserve_eager(t->mm, frames, 3);
+    if (!va) return DRV_ENORES;
     for (uint32_t i = 0; i < frames; i++)
         if (vmm_space_map(t->mm, va + (uintptr_t)i * 4096,
                           (uintptr_t)(phys + (uint64_t)i * 4096),
                           VMM_USER | VMM_WRITABLE | VMM_SHARED) != 0)
             return DRV_ENORES;
-    vmm_space_set_mmap_cursor(t->mm, va + (uintptr_t)frames * 4096);
 
     d->dma_phys = phys;
     /* Record it where every other resource lives, so `drv res` and the device

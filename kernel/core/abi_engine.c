@@ -9,6 +9,7 @@
  * that it does not fit is the design telling you something.
  * ============================================================================= */
 
+#include "lnx_signal.h"   /* §M89 */
 #include "abi.h"
 #include "dosgui.h"     /* §M65 — the toolkit build op */
 #include "printf.h"
@@ -21,6 +22,11 @@
 #include "vmm.h"        /* vmm_user_access_ok — guest-pointer validation */
 #include "vfs.h"        /* §M73 — VFS_* open flags */
 #include "shellcmd.h"   /* §M73 — strace */
+#include "futex.h"      /* §M89 */
+#include "pmm.h"        /* §M89 — sysinfo */
+#include "swap.h"
+#include "percpu.h"     /* §M89 — getcpu */
+#include "timer.h"
 #include <stddef.h>
 
 /* Linux errno values the guests share (the ones the engine returns). */
@@ -261,14 +267,48 @@ static long h_faccessat(struct abi_ctx* c) {
 }
 /* readlink: this VFS has no symlinks, so an existing path is "not a link"
  * (EINVAL) and a missing one ENOENT — exactly what realpath() needs to walk. */
-static long abi_readlink_path(unsigned long upath) {
+/* §M89 — /proc/self/exe (and /proc/<pid>/exe) is the one link that matters:
+ * a program asks it where it was started from.  musl's loader expands $ORIGIN
+ * with it and a JRE's launcher finds JAVA_HOME with it.  Answered from the
+ * cred's exe, with readlink's contract: NOT NUL-terminated, truncated to the
+ * buffer, the byte count returned. */
+static int proc_exe_of(const char* p, char* out, unsigned cap) {
+    const char* pre = "/proc/";
+    for (int i = 0; pre[i]; i++) if (p[i] != pre[i]) return -1;
+    p += 6;
+    struct task* t = NULL;
+    if (p[0] == 's' && p[1] == 'e' && p[2] == 'l' && p[3] == 'f') { t = task_current(); p += 4; }
+    else {
+        int pid = 0, n = 0;
+        while (*p >= '0' && *p <= '9') { pid = pid * 10 + (*p++ - '0'); n++; }
+        if (!n) return -1;
+        t = task_find(pid);
+    }
+    if (p[0] != '/' || p[1] != 'e' || p[2] != 'x' || p[3] != 'e' || p[4]) return -1;
+    if (!t || !t->cred.exe[0]) return -2;
+    unsigned n = 0;
+    while (n + 1 < cap && t->cred.exe[n]) { out[n] = t->cred.exe[n]; n++; }
+    out[n] = 0;
+    return (int)n;
+}
+static long abi_readlink_path(unsigned long upath, unsigned long ubuf, unsigned long size) {
     char kp[256];
     if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
+    char tgt[128];
+    int n = proc_exe_of(kp, tgt, sizeof tgt);
+    if (n == -2) return -ABI_ENOENT;
+    if (n >= 0) {
+        if ((long)size <= 0) return -ABI_EINVAL;
+        unsigned long m = (unsigned long)n < size ? (unsigned long)n : size;
+        if (!abi_w_ok(ubuf, m)) return -ABI_EFAULT;
+        for (unsigned long i = 0; i < m; i++) ((char*)(uintptr_t)ubuf)[i] = tgt[i];
+        return (long)m;
+    }
     struct kstat_full k;
     return sys_stat_full_k(kp, &k) == 0 ? -ABI_EINVAL : -ABI_ENOENT;
 }
-static long h_readlink(struct abi_ctx* c)   { return abi_readlink_path(c->a[0]); }
-static long h_readlinkat(struct abi_ctx* c) { return abi_readlink_path(c->a[1]); }
+static long h_readlink(struct abi_ctx* c)   { return abi_readlink_path(c->a[0], c->a[1], c->a[2]); }
+static long h_readlinkat(struct abi_ctx* c) { return abi_readlink_path(c->a[1], c->a[2], c->a[3]); }
 
 /* sendfile(out, in, off*, count) — a read/write loop through a kernel buffer.
  * With an offset the input's own cursor is left untouched (seek, copy, seek
@@ -339,7 +379,6 @@ static long h_chdir(struct abi_ctx* c) {
     for (unsigned i = 0; i < sizeof t->cred.cwd; i++) { t->cred.cwd[i] = canon[i]; if (!canon[i]) break; }
     return 0;
 }
-static long h_lnx_sigaction(struct abi_ctx* c) { (void)c; return 0; }
 static long h_getgroups(struct abi_ctx* c) {
     /* The primary group is the one supplementary group we report: `id` and
      * friends refuse an error here, and an empty list is a lie about admins. */
@@ -570,6 +609,12 @@ static long h_brk(struct abi_ctx* c) { (void)c; return 0; }
 static long h_mmap(struct abi_ctx* c) {
     return sys_mmap_full(c->a[0], (size_t)c->a[1], (int)c->a[2], (int)c->a[3],
                          (int)c->a[4], (uint64_t)c->a[5]);
+}
+/* i386 mmap2: the last argument counts pages, which is how a 32-bit guest
+ * reaches file offsets past 4 GiB. */
+static long h_mmap_pgoff(struct abi_ctx* c) {
+    return sys_mmap_full(c->a[0], (size_t)c->a[1], (int)c->a[2], (int)c->a[3],
+                         (int)c->a[4], (uint64_t)(uint32_t)c->a[5] * 4096u);
 }
 
 /* set_tid_address returns the caller's tid.  d-os has no separate tid space,
@@ -845,12 +890,216 @@ static long h_wait(struct abi_ctx* c) {
     return pid;
 }
 
-/* execve(path, argv, envp) — envp is not honoured yet (the initial stack
- * carries a fixed default environment, see build_initial_stack).  Does not
- * return on success. */
+/* execve(path, argv, envp) — §M89: envp IS honoured (it used to be dropped,
+ * and a JRE's launcher, which sets LD_LIBRARY_PATH and re-executes itself,
+ * looped forever).  Does not return on success. */
 static long h_execve(struct abi_ctx* c) {
-    return proc_execve((const char*)(uintptr_t)c->a[0],
-                       (char* const*)(uintptr_t)c->a[1]);
+    int r = proc_execve_env((const char*)(uintptr_t)c->a[0],
+                            (char* const*)(uintptr_t)c->a[1],
+                            (char* const*)(uintptr_t)c->a[2]);
+    return r == -7 ? -7 : (r < 0 ? -ABI_ENOENT : r);
+}
+
+/* ---- §M89 — the calls a JVM makes before main() ----------------------------
+ *
+ * Each of these answered -ENOSYS, and each looked optional until the JVM
+ * showed what it does instead: without getcpu, HotSpot's fallback jumps to
+ * the legacy x86_64 vsyscall page (0xffffffffff600800) — an address that has
+ * never existed here, so the JVM died with SIGSEGV at a pc of its own
+ * invention.  An ENOSYS is not a neutral answer when the caller's plan B is
+ * worse than an honest value. */
+
+/* futex(uaddr, op, val, timeout|val2, uaddr2, val3).  The PRIVATE flag is a
+ * hint (this kernel keys every futex by address space anyway) and is masked,
+ * not refused: refusing it made musl, which tries the private form first and
+ * falls back only on ENOSYS, SPIN instead of wait. */
+static long h_futex(struct abi_ctx* c) {
+    uintptr_t ua = (uintptr_t)c->a[0];
+    int op = (int)c->a[1], cmd = op & FUTEX_CMD_MASK;
+    uint32_t val = (uint32_t)c->a[2];
+    switch (cmd) {
+    case FUTEX_WAIT:
+    case FUTEX_WAIT_BITSET: {
+        uint64_t deadline = 0;
+        unsigned long tp = c->a[3];
+        if (tp) {
+            unsigned w = (!c->map || c->map->word_bytes != 4) ? 8 : 4;
+            if (!abi_r_ok(tp, 2 * w)) return -ABI_EFAULT;
+            uint64_t t = (uint64_t)abi_get_word(c, tp, 0) * 1000000000ull + abi_get_word(c, tp, 1);
+            if (cmd == FUTEX_WAIT) {
+                deadline = timer_now_ns() + t;                 /* relative */
+            } else if (op & FUTEX_CLOCK_REALTIME) {            /* absolute, wall clock */
+                struct ktimespec now;
+                sys_clock_gettime_k(CLOCK_REALTIME, &now);
+                uint64_t nw = now.sec * 1000000000ull + now.nsec;
+                deadline = timer_now_ns() + (t > nw ? t - nw : 0);
+            } else {
+                deadline = t;                                  /* absolute, monotonic */
+            }
+            if (!deadline) deadline = 1;                       /* 0 means "none" below */
+        }
+        return futex_wait(ua, val, deadline);
+    }
+    case FUTEX_WAKE:
+    case FUTEX_WAKE_BITSET:
+        return futex_wake(ua, (int)val);
+    case FUTEX_CMP_REQUEUE: {
+        uint32_t cur;
+        if (!abi_r_ok(ua, 4)) return -ABI_EFAULT;
+        cur = *(volatile uint32_t*)ua;
+        if (cur != (uint32_t)c->a[5]) return -11;             /* EAGAIN */
+    }   /* fall through */
+    case FUTEX_REQUEUE:
+        /* Requeue is an optimisation of "wake them all"; waking them all is
+         * correct (each re-checks its condition), just less efficient. */
+        futex_wake(ua, 0x7FFFFFFF);
+        futex_wake((uintptr_t)c->a[4], 0x7FFFFFFF);
+        return 0;
+    default:
+        return -38;                                            /* ENOSYS */
+    }
+}
+
+/* getcpu(cpu*, node*, cache*). */
+static long h_getcpu(struct abi_ctx* c) {
+    struct percpu* pc = this_cpu();
+    if (c->a[0]) { if (!abi_w_ok(c->a[0], 4)) return -ABI_EFAULT; *(uint32_t*)(uintptr_t)c->a[0] = (uint32_t)pc->cpu_index; }
+    if (c->a[1]) { if (!abi_w_ok(c->a[1], 4)) return -ABI_EFAULT; *(uint32_t*)(uintptr_t)c->a[1] = (uint32_t)pc->numa_node; }
+    return 0;
+}
+
+static void put_word(const struct abi_ctx* c, uintptr_t p, uint64_t v) {
+    if (c->map->word_bytes == 4) *(uint32_t*)p = (uint32_t)v;
+    else                         *(uint64_t*)p = v;
+}
+
+/* sysinfo(): memory in pages on a 32-bit guest (mem_unit 4096 — the byte
+ * counts would not fit a 32-bit field on a machine with 4 GiB or more),
+ * bytes on a 64-bit one. */
+static long h_sysinfo(struct abi_ctx* c) {
+    unsigned w = c->map->word_bytes;
+    unsigned size = w == 8 ? 112 : 64;
+    uintptr_t p = (uintptr_t)c->a[0];
+    if (!abi_w_ok(p, size)) return -ABI_EFAULT;
+    for (unsigned i = 0; i < size; i++) ((uint8_t*)p)[i] = 0;
+    uint32_t unit = (w == 8) ? 1u : 4096u;
+    uint64_t scale = 4096u / unit;
+    uint32_t su = 0, st = 0;
+    swap_stats(&su, &st);
+    put_word(c, p, timer_now_ns() / 1000000000ull);                /* uptime */
+    uintptr_t q = p + 4 * w;                                         /* after loads[3] */
+    put_word(c, q + 0 * w, (uint64_t)pmm_managed_frames() * scale);  /* totalram */
+    put_word(c, q + 1 * w, (uint64_t)pmm_free_frames() * scale);     /* freeram */
+    put_word(c, q + 4 * w, (uint64_t)st * scale);                    /* totalswap */
+    put_word(c, q + 5 * w, (uint64_t)(st - su) * scale);             /* freeswap */
+    uintptr_t procs = q + 6 * w;
+    *(uint16_t*)procs = (uint16_t)task_count();
+    uintptr_t mu = (w == 8) ? p + 104 : p + 52;
+    *(uint32_t*)mu = unit;
+    return 0;
+}
+
+/* Resource limits.  What is REAL here is reported (8 MiB is not the main
+ * thread's stack — PROC_STACK_PAGES is; TASK_MAX_FDS descriptors), the rest
+ * is unlimited because nothing enforces a limit.  A new limit at or under
+ * the maximum is accepted and NOT stored: nothing here would enforce it
+ * either, and refusing it would fail programs that lower their own limits as
+ * a courtesy. */
+#define RLIM_INF64 0xFFFFFFFFFFFFFFFFull
+static void rlimit_of(int res, uint64_t* cur, uint64_t* max) {
+    *cur = *max = RLIM_INF64;
+    switch (res) {
+    case 3: *cur = *max = 256ull * 4096ull; break;          /* RLIMIT_STACK: 1 MiB */
+    case 4: *cur = *max = 0; break;                         /* RLIMIT_CORE: no dumps */
+    case 7: *cur = *max = TASK_MAX_FDS; break;              /* RLIMIT_NOFILE */
+    default: break;
+    }
+}
+static long rlimit_set(int res, uint64_t cur, uint64_t max) {
+    uint64_t c0, m0;
+    rlimit_of(res, &c0, &m0);
+    if (cur > max) return -ABI_EINVAL;
+    if (max > m0) return -1;                                /* EPERM */
+    return 0;
+}
+static long h_getrlimit(struct abi_ctx* c) {
+    int res = (int)c->a[0];
+    unsigned w = c->map->word_bytes;
+    if (res < 0 || res > 15) return -ABI_EINVAL;
+    if (!abi_w_ok(c->a[1], 2 * w)) return -ABI_EFAULT;
+    uint64_t cur, max;
+    rlimit_of(res, &cur, &max);
+    if (w == 4) {                                           /* RLIM_INFINITY is ~0 */
+        if (cur > 0xFFFFFFFFull) cur = 0xFFFFFFFFull;
+        if (max > 0xFFFFFFFFull) max = 0xFFFFFFFFull;
+    }
+    put_word(c, (uintptr_t)c->a[1], cur);
+    put_word(c, (uintptr_t)c->a[1] + w, max);
+    return 0;
+}
+static long h_setrlimit(struct abi_ctx* c) {
+    int res = (int)c->a[0];
+    unsigned w = c->map->word_bytes;
+    if (res < 0 || res > 15) return -ABI_EINVAL;
+    if (!abi_r_ok(c->a[1], 2 * w)) return -ABI_EFAULT;
+    uint64_t cur = abi_get_word(c, c->a[1], 0), max = abi_get_word(c, c->a[1], 1);
+    if (w == 4) { if (cur == 0xFFFFFFFFull) cur = RLIM_INF64; if (max == 0xFFFFFFFFull) max = RLIM_INF64; }
+    return rlimit_set(res, cur, max);
+}
+/* prlimit64(pid, res, new*, old*): 64-bit pairs on every guest. */
+static long h_prlimit64(struct abi_ctx* c) {
+    int pid = (int)c->a[0], res = (int)c->a[1];
+    if (pid != 0 && pid != (task_current() ? task_current()->pid : -1)) return -3;  /* ESRCH: own only */
+    if (res < 0 || res > 15) return -ABI_EINVAL;
+    uint64_t cur, max;
+    rlimit_of(res, &cur, &max);
+    if (c->a[3]) {
+        if (!abi_w_ok(c->a[3], 16)) return -ABI_EFAULT;
+        ((uint64_t*)(uintptr_t)c->a[3])[0] = cur;
+        ((uint64_t*)(uintptr_t)c->a[3])[1] = max;
+    }
+    if (c->a[2]) {
+        if (!abi_r_ok(c->a[2], 16)) return -ABI_EFAULT;
+        return rlimit_set(res, ((uint64_t*)(uintptr_t)c->a[2])[0], ((uint64_t*)(uintptr_t)c->a[2])[1]);
+    }
+    return 0;
+}
+
+/* clock_getres: the resolution the clock really has (§M53's source). */
+static long h_clock_getres(struct abi_ctx* c) {
+    if (!c->a[1]) return 0;
+    return abi_put_ts(c, c->a[1], 0, 0, 1);
+}
+
+/* statfs / fstatfs.  The fields that matter to a program are the type, the
+ * block size and the name length; the counts are the machine's memory for an
+ * in-memory filesystem, which is where its data lives.  Layout: word-sized
+ * fields, except f_fsid (two ints) — which is exactly one word on a 64-bit
+ * guest and two on a 32-bit one. */
+static long put_statfs(struct abi_ctx* c, uintptr_t p, int wide64) {
+    unsigned w = wide64 ? 8 : c->map->word_bytes;
+    unsigned size = 11 * w + 8 + 4 * w;
+    if (!abi_w_ok(p, size)) return -ABI_EFAULT;
+    for (unsigned i = 0; i < size; i++) ((uint8_t*)p)[i] = 0;
+    uint64_t v[7] = { 0x858458f6ull, 4096, pmm_managed_frames(), pmm_free_frames(),
+                      pmm_free_frames(), 65536, 65536 };
+    uintptr_t q = p;
+    for (int i = 0; i < 7; i++) { put_word(c, q, v[i]); q += w; }
+    q += 8;                                                   /* f_fsid */
+    put_word(c, q, 255); q += w;                              /* f_namelen */
+    put_word(c, q, 4096);                                     /* f_frsize */
+    return 0;
+}
+static long h_statfs(struct abi_ctx* c) {
+    char kp[256];
+    if (abi_path(c->a[0], kp, sizeof kp) != 0) return -ABI_EFAULT;
+    struct kstat_full st;
+    if (sys_stat_full_k(kp, &st) != 0) return -ABI_ENOENT;
+    return put_statfs(c, (uintptr_t)c->a[1], 0);
+}
+static long h_fstatfs(struct abi_ctx* c) {
+    if (!fd_lookup((int)c->a[0]) && ((int)c->a[0] < 0 || (int)c->a[0] > 2)) return -ABI_EBADF;
+    return put_statfs(c, (uintptr_t)c->a[1], 0);
 }
 
 static long h_settid(struct abi_ctx* c) {
@@ -1072,6 +1321,7 @@ static const struct {
     [ABI_IOCTL]    = { "ioctl",    h_ioctl },
     [ABI_BRK]      = { "brk",      h_brk },
     [ABI_MMAP]     = { "mmap",     h_mmap },
+    [ABI_MMAP_PGOFF] = { "mmap2",  h_mmap_pgoff },
     [ABI_SET_TID_ADDRESS] = { "set_tid_address", h_settid },
     [ABI_SIGPROCMASK]     = { "sigprocmask",     h_sigprocmask },
     [ABI_TIMERFD_CREATE]  = { "timerfd_create",  h_timerfd_create  },
@@ -1119,7 +1369,20 @@ static const struct {
     [ABI_GETGROUPS]    = { "getgroups",    h_getgroups    },
     [ABI_GETCWD]       = { "getcwd",       h_getcwd       },
     [ABI_CHDIR]        = { "chdir",        h_chdir        },
-    [ABI_LNX_SIGACTION] = { "rt_sigaction", h_lnx_sigaction },
+    [ABI_LNX_SIGACTION] = { "rt_sigaction", lnx_h_sigaction },
+    [ABI_KILL]          = { "kill",         lnx_h_kill      },
+    [ABI_TKILL]         = { "tkill",        lnx_h_tkill     },
+    [ABI_TGKILL]        = { "tgkill",       lnx_h_tgkill    },
+    [ABI_SIGALTSTACK]   = { "sigaltstack",  lnx_h_sigaltstack },
+    [ABI_FUTEX]         = { "futex",        h_futex         },
+    [ABI_GETCPU]        = { "getcpu",       h_getcpu        },
+    [ABI_SYSINFO]       = { "sysinfo",      h_sysinfo       },
+    [ABI_GETRLIMIT]     = { "getrlimit",    h_getrlimit     },
+    [ABI_SETRLIMIT]     = { "setrlimit",    h_setrlimit     },
+    [ABI_PRLIMIT64]     = { "prlimit64",    h_prlimit64     },
+    [ABI_CLOCK_GETRES]  = { "clock_getres", h_clock_getres  },
+    [ABI_STATFS]        = { "statfs",       h_statfs        },
+    [ABI_FSTATFS]       = { "fstatfs",      h_fstatfs       },
     [ABI_OPEN]         = { "open",         h_open         },
     [ABI_OPENAT]       = { "openat",       h_openat       },
     [ABI_STAT]         = { "stat",         h_stat         },

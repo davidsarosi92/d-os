@@ -25,6 +25,7 @@
  *      as a real fault.
  * ============================================================================= */
 
+#include "lnx_signal.h"   /* §M89 */
 #include "proc.h"
 #include "task.h"
 #include "vmm.h"
@@ -110,6 +111,7 @@ int proc_fork(struct user_regs* parent_regs) {
     /* Inherit the parent's signal dispositions (POSIX: fork keeps handlers). */
     for (int i = 0; i < NSIG; i++) child->sig_handler[i] = parent->sig_handler[i];
     child->sig_restorer = parent->sig_restorer;
+    lnx_sig_fork(parent, child);            /* §M89 — Linux dispositions, copied */
 
     child->linux_abi = parent->linux_abi;
     child->has_tls   = parent->has_tls;

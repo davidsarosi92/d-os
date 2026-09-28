@@ -159,7 +159,17 @@ struct task {
     /* M25 stage 3/4 — per-process file-descriptor table.  Index → generic
      * open-file object (VFS file / shm / socket); fds 0/1/2 are the implicit
      * console (no object, handled in usyscall.c).  Zero-init by kcalloc. */
-    struct ofile* fds[TASK_MAX_FDS];
+    /* §M89 — `fds` POINTS at the table in use: this task's own `fds_inline`,
+     * or a `struct fdtable` it shares with the other threads of its process.
+     * Linux threads share one descriptor table (CLONE_FILES): what one thread
+     * opens, another may read.  They used to get COPIES, so a descriptor
+     * opened after the thread was created was invisible to it.  Every
+     * `t->fds[i]` in the tree reads through the pointer unchanged; only the
+     * creation (task_sched_defaults), clone and close-all paths know about
+     * the sharing. */
+    struct ofile**  fds;
+    struct ofile*   fds_inline[TASK_MAX_FDS];
+    struct fdtable* fdt;                    /* NULL = not shared            */
     /* M25 stage 4 — bump cursor for anonymous / shm mmap VAs in this task's
      * user space.  Reset by the exec path; grows upward per mmap. */
     /* Tier B — 1 for an INDEPENDENT user process (proc_spawn): it runs at
@@ -453,6 +463,10 @@ struct task {
     int       guest_nr;
     uintptr_t sig_handler[32];          /* NSIG (syscall.h) */
     uintptr_t sig_restorer;
+    /* §M89 — Linux-ABI signal state (dispositions shared by threads, the
+     * altstack, each pending signal's siginfo).  NULL until first used;
+     * lnx_signal.c owns it. */
+    struct lnx_sigstate* lsig;
     /* Per-task FPU / SIMD register file (2026-08-01).  The integer context
      * switch does not touch the FP/vector registers, so without this two tasks
      * doing FP work overwrite each other's registers — and on SMP a migrated
@@ -675,6 +689,7 @@ void task_list(void);
 
 /* Number of tasks currently in the queue (RUNNABLE + SLEEPING). */
 int  task_count(void);
+void task_signal_wake(struct task* t);   /* §M89 — wake a sleeper for a signal */
 
 /* Iterate every task in the run queue.  `is_current` is non-zero for the
  * currently scheduled task.  Used by procfs to render `/proc/tasks`. */

@@ -34,6 +34,7 @@
 #include "idt.h"
 #include "task.h"
 #include "vmm.h"
+#include "lnx_signal.h"
 #include <stdint.h>
 
 /* The ONLY RFLAGS bits ring-3 may set via sigreturn: the arithmetic +
@@ -53,6 +54,9 @@ void signal_deliver(struct int_frame* f) {
     if ((f->cs & 3) != 3) return;              /* only when returning to ring 3 */
     struct task* t = task_current();
     if (!t || !t->sig_pending) return;
+    /* §M89 — a Linux program gets Linux's frame (siginfo + ucontext) and
+     * Linux's default actions; this in-house frame is for native programs. */
+    if (t->linux_abi) { lnx_signal_deliver(f); return; }
 
     for (int sig = 1; sig < NSIG; sig++) {
         uint32_t bit = 1u << sig;

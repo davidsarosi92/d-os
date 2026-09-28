@@ -15,6 +15,8 @@
  * ============================================================================= */
 
 #include <stdint.h>
+#include "lnx_signal.h"   /* §M89 */
+#include "vma.h"      /* §M89 — demand pages */
 #include "uaccess.h"      /* §1.1 — fault-fixup table for EL0 memory copies */
 #include "drvguard.h"   /* §M33 Tier 0 — contain a driver fault */
 #include "task.h"
@@ -56,6 +58,8 @@ void aarch64_irq_dispatch(void) { }
  * decodes x8 and services SYS_PRINT/SYS_EXIT. */
 void signal_deliver(struct trapframe* tf) __attribute__((weak));
 void signal_deliver(struct trapframe* tf) { (void)tf; }
+void signal_deliver_irq(struct trapframe* tf) __attribute__((weak));
+void signal_deliver_irq(struct trapframe* tf) { (void)tf; }
 
 void aarch64_syscall(struct trapframe* tf) __attribute__((weak));
 void aarch64_syscall(struct trapframe* tf) { (void)tf; }
@@ -161,7 +165,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
              * kill (a wedged ring-3 package that never yields) is torn down
              * right here.  SPSR_EL1.M[3:0]==0 means "came from EL0". */
             task_force_kill_point((tf->spsr & 0xF) == 0);
-            signal_deliver(tf);           /* §A1 — same return-to-EL0 hook */
+            signal_deliver_irq(tf);       /* §A1 — same return-to-EL0 hook */
             check_el0_return(tf, "irq");
             return;                       /* return → RESTORE_TRAPFRAME → eret */
         case EXC_FIQ:
@@ -247,6 +251,14 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                         check_el0_return(tf, "swap-in");
                         return;
                     }
+                    /* §M89 — a reserved page never touched: demand-zero or a
+                     * lazily filled file page.  WnR (ESR bit 6) = a write;
+                     * an instruction abort (EC 0x20/0x21) is a read. */
+                    int wr = (ec == 0x24 || ec == 0x25) && ((esr >> 6) & 1);
+                    if (vma_fault((uintptr_t)far, wr, can_sleep)) {
+                        check_el0_return(tf, "demand-page");
+                        return;
+                    }
                 }
             }
             {
@@ -305,6 +317,24 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                 uint64_t far, sp0;
                 __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
                 __asm__ volatile ("mrs %0, sp_el0" : "=r"(sp0));
+                /* §M89 — a Linux program that HANDLES the signal this fault
+                 * means gets it (with the address) instead of dying.  The
+                 * signal follows the exception class: an undefined
+                 * instruction is SIGILL, a BRK SIGTRAP, an alignment fault
+                 * SIGBUS, an FP trap SIGFPE, an abort SIGSEGV. */
+                {
+                    uint64_t ec = esr >> 26;
+                    int lsig = 11;
+                    if (ec == 0x00) lsig = 4;
+                    else if (ec == 0x3C) lsig = 5;
+                    else if (ec == 0x22 || ec == 0x26 ||
+                             ((ec == 0x24 || ec == 0x25) && (esr & 0x3F) == 0x21)) lsig = 7;
+                    else if (ec == 0x2C) lsig = 8;
+                    if (lnx_fault_deliver(tf, lsig, (uintptr_t)far)) {
+                        check_el0_return(tf, "signal");
+                        return;
+                    }
+                }
                 /* ESR is the difference between "jumped to a bad address" and
                  * "dereferenced a bad address" — EC 0x20/0x21 is an INSTRUCTION
                  * abort (FAR = the PC itself), 0x24/0x25 a DATA abort (FAR = the

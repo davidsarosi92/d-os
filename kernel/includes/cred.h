@@ -165,6 +165,13 @@ struct cred {
      * to it is merely a path that no longer resolves, which is what Linux
      * reports for a deleted cwd too. */
     char cwd[96];
+    /* §M89 — the program this process is running, as a canonical path within
+     * `root` — what /proc/self/exe names.  Here for the same reason as cwd:
+     * every spawn, fork and thread inherits it, and execve replaces it.  A
+     * JRE's launcher finds its own libraries through it ($ORIGIN, and
+     * JAVA_HOME from the launcher's location); "" = unknown (an image the
+     * kernel embedded rather than read from a file). */
+    char exe[128];
 };
 
 /* The uid this identity really has: CRED_UID_NONE for anything that is not a

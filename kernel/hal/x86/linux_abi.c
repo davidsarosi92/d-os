@@ -18,6 +18,7 @@
  * ABi: eax = number, ebx/ecx/edx/esi/edi/ebp = args, return in eax.
  * ============================================================================= */
 
+#include "lnx_signal.h"   /* §M89 */
 #include "syscall.h"
 #include "idt.h"
 #include "task.h"
@@ -655,19 +656,16 @@ static void linux_syscall_body(struct int_frame* f) {
             return;
         }
 
-        case LNX_mprotect:
-            /* §M37: real mprotect(addr=ebx, len=ecx, prot=edx).  mallocng maps a
-             * PROT_NONE reservation then mprotects the used part to R/W; ld.so
-             * tightens RELRO to read-only.  Must actually change PTE perms. */
-            f->eax = (uint32_t)sys_mprotect(f->ebx, (size_t)f->ecx, (int)f->edx);
+        /* mmap2 / munmap / mprotect are ABI-engine operations (§M89); their
+         * arms here were unreachable and are gone. */
+        case 173:                                 /* rt_sigreturn (§M89) */
+            lnx_rt_sigreturn(f);
             return;
-
-
-        case LNX_munmap:
-            /* The d-os user mmap bump-allocates and does not reclaim yet, so
-             * unmap is a no-op (a small leak).  Real reclaim is a follow-up. */
-            f->eax = 0;
+        case 119: {                               /* sigreturn, the old frame (§M89) */
+            extern void lnx_sigreturn_old(void* frame);
+            lnx_sigreturn_old(f);
             return;
+        }
 
         case LNX_close:
             f->eax = (uint32_t)sys_close((int)f->ebx);
@@ -750,10 +748,10 @@ static void linux_syscall_body(struct int_frame* f) {
         }
 
         case LNX_execve:
-            /* execve(path=ebx, argv=ecx, envp=edx) — envp ignored for now (the
-             * child keeps the default env).  Replaces the image; on failure the
-             * old image continues. */
-            f->eax = (uint32_t)proc_execve((const char*)f->ebx, (char* const*)f->ecx);
+            /* execve(path=ebx, argv=ecx, envp=edx) — §M89: envp honoured.
+             * Replaces the image; on failure the old image continues. */
+            f->eax = (uint32_t)proc_execve_env((const char*)f->ebx, (char* const*)f->ecx,
+                                               (char* const*)f->edx);
             return;
 
         case LNX_waitpid:
@@ -852,27 +850,8 @@ static void linux_syscall_body(struct int_frame* f) {
             return;
         }
 
-        case LNX_futex:
-            /* musl's pthread mutexes/joins are futexes; without this a thread
-             * that has to WAIT spins on -ENOSYS forever. */
-            f->eax = (uint32_t)sys_futex((int*)f->ebx, (int)f->ecx, (int)f->edx);
-            return;
+        /* futex is an ABI-engine operation (§M89, futex.c). */
 
-        case LNX_mmap2: {
-            /* i386 mmap2(addr=ebx, len=ecx, prot=edx, flags=esi, fd=edi,
-             * pgoff=ebp) — pgoff is in PAGES.  §M37: full mmap so musl's ld.so
-             * can load shared objects (file-backed segments at an offset, some
-             * MAP_FIXED over a reservation) — not just anonymous malloc pages. */
-            uintptr_t addr = f->ebx;
-            uint32_t  len  = f->ecx;
-            int       prot = (int)f->edx;
-            int       flags = (int)f->esi;
-            int       fd   = (int)f->edi;
-            uint64_t  off  = (uint64_t)f->ebp * 4096u;   /* pgoff → byte offset */
-            long r = sys_mmap_full(addr, (size_t)len, prot, flags, fd, off);
-            f->eax = (r <= 0) ? (uint32_t)-12 /*ENOMEM*/ : (uint32_t)r;
-            return;
-        }
 
         case LNX_brk:
             /* No program break yet → report failure so musl's malloc uses

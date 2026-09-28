@@ -32,6 +32,7 @@
 #include "kmalloc.h"
 #include "printf.h"
 #include "task.h"   /* §A1 — vmm_cow_fault needs the current task's space */
+#include "vma.h"    /* §M89 — reservations live beside the tables */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -58,11 +59,8 @@ uint64_t* mmu_kernel_l1(void);          /* mmu.c — shared kernel L1 table */
 
 struct vmm_space {
     uint64_t* l1;                       /* level-1 table = TTBR0 root */
-
-    /* §M48 — the mmap bump cursor lives with the ADDRESS SPACE, not with the
-     * task.  See the i386 twin for why a per-task cursor (or a snapshot copied
-     * at clone time) lets one thread map over another's memory. */
-    uintptr_t mmap_cursor;
+    void*     vma;          /* §M89 — the reservation set (vma.c owns it; it
+                             * replaced §M48's per-space mmap bump cursor) */
 };
 
 /* Allocate a zeroed 4 KiB translation table, reached through the TTBR1
@@ -127,7 +125,7 @@ static uint64_t* next_table(uint64_t* tbl, uint64_t idx) {
  * L1(>>30)→L2(>>21)→L3(>>12), requiring PTE_VALID + PTE_AP_EL0 (AP[1], EL0 can
  * access) at the leaf; want_write also requires AP[2]==0 (bit 7 clear = writable).
  * A leaf can be an L2 2 MiB block or an L3 page.  Tables are identity-reachable. */
-int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
+static int access_walk(uintptr_t va, uintptr_t len, int want_write) {
     if (len == 0) return 1;
     if (va < vmm_user_base()) return 0;
     if (va + len < va)        return 0;
@@ -162,14 +160,20 @@ int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
     return 1;
 }
 
+/* §M89 — see the x86_64 twin: a demand page not mapped YET is still the
+ * program's, so it is brought in before the range is refused. */
+int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
+    if (access_walk(va, len, want_write)) return 1;
+    if (va < vmm_user_base() || va + len < va || va + len > (1ULL << 39)) return 0;
+    return vma_prefault(va, len, want_write) && access_walk(va, len, want_write);
+}
+
 /* Create a fresh address space: private L1 table with the kernel's identity
  * blocks copied in.  Returns NULL on OOM. */
 struct vmm_space* aarch64_vmm_create(void) {
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof *s);
     if (!s) return NULL;
-    /* kmalloc does not zero: an uninitialised bump cursor is handed straight
-     * back to the program as an mmap address. */
-    s->mmap_cursor = 0;
+    s->vma = NULL;                  /* kmalloc does not zero */
     s->l1 = alloc_table();
     if (!s->l1) { kfree(s); return NULL; }
     uint64_t* kl1 = mmu_kernel_l1();
@@ -363,10 +367,10 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     if (!parent) return NULL;
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof *s);
     if (!s) return NULL;
-    /* The child inherits the parent's mappings, so it inherits the mmap
-     * cursor too — restarting at the region base would re-issue addresses the
-     * child already has mapped (§M48). */
-    s->mmap_cursor = parent->mmap_cursor;
+    /* The child inherits the parent's reservations as well as its mappings
+     * (vma_clone at the end) — otherwise its allocator would re-issue ranges
+     * it already has mapped. */
+    s->vma = NULL;
     s->l1 = alloc_table();
     if (!s->l1) { kfree(s); return NULL; }
 
@@ -410,6 +414,7 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
      * the failure would be silent data corruption between parent and child,
      * visible only under -smp. */
     __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");
+    vma_clone(parent, s);           /* §M89 — the child inherits the reservations */
     return s;
 }
 
@@ -484,6 +489,7 @@ static void free_l2_subtree(uint64_t* l2) {
 }
 void vmm_space_destroy(struct vmm_space* s) {
     if (!s) return;
+    vma_destroy(s);                 /* §M89 — before the tables: it may unref files */
     for (int i = 4; i < 512; i++) {                 /* user region = VA >= 4 GiB */
         uint64_t e = s->l1[i];
         if ((e & PTE_VALID) && (e & PTE_TABLE)) {
@@ -587,6 +593,11 @@ int vmm_space_protect(struct vmm_space* s, uintptr_t va, uint32_t flags) {
     else                                              e3 |=  PTE_AP_RO;  /* read-only */
     if (flags & VMM_EXEC) e3 &= ~PTE_UXN;        /* EL0-executable */
     else                      e3 |=  PTE_UXN;
+    /* §M89 — VMM_USER is honoured: without it the page is EL1-only, which is
+     * how PROT_NONE keeps a page (and its contents) while making every EL0
+     * access fault.  It used to be ignored, so PROT_NONE read as readable. */
+    if (flags & VMM_USER) e3 |=  PTE_AP_EL0;
+    else                  e3 &= ~PTE_AP_EL0;
     l3[i] = e3;
     __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");   /* see unmap */
     return 0;
@@ -817,16 +828,61 @@ void vmm_space_switch(struct vmm_space* s) {
 }
 
 
-/* §M48 — the address space's mmap bump cursor.  Policy (where the region
- * starts, how far it may grow) stays in usyscall.c; the SPACE only owns the
- * storage, so every task sharing an mm shares one cursor. */
-uintptr_t vmm_space_mmap_cursor(struct vmm_space* s) {
-    return s ? s->mmap_cursor : 0;
-}
-void vmm_space_set_mmap_cursor(struct vmm_space* s, uintptr_t v) {
-    if (s) s->mmap_cursor = v;
-}
-
 /* §M86 — UXN has been set on every non-VMM_EXEC user page since §M25 (above);
  * the architecture has no mode without it. */
 int vmm_nx_active(void) { return 1; }
+
+/* ---------------------------------------------------------------------------
+ * §M89 — the primitives vma.c needs (contract in vma.h).
+ * ------------------------------------------------------------------------- */
+void* vmm_space_vma(struct vmm_space* s) { return s ? s->vma : NULL; }
+void  vmm_space_set_vma(struct vmm_space* s, void* v) { if (s) s->vma = v; }
+
+/* TTBR0 covers 39 bits (T0SZ = 25, mmu.c). */
+uintptr_t vmm_user_limit(void) { return (uintptr_t)1 << 39; }
+
+int vmm_space_probe(struct vmm_space* s, uintptr_t va) {
+    if (!s || va >= ((uintptr_t)1 << 39) || ((va >> 30) & 0x1FF) < 4) return 0;
+    uint64_t e1 = s->l1[(va >> 30) & 0x1FF];
+    if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) return 0;
+    uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
+    uint64_t e2 = l2[(va >> 21) & 0x1FF];
+    if (!((e2 & PTE_VALID) && (e2 & PTE_TABLE))) return 0;
+    uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
+    uint64_t e3 = l3[(va >> 12) & 0x1FF];
+    if (e3 & PTE_VALID) return 1;
+    if (e3 & VMM_SWPE_MARK) return 2;
+    return 0;
+}
+
+/* L1 slots 0-3 (the low 4 GiB) are the kernel's device identity map, shared
+ * by value into every space; everything above is private to the space. */
+int vmm_space_range_state(struct vmm_space* s, uintptr_t a, uintptr_t b) {
+    if (!s) return VMA_RS_KERNEL;
+    if (b > ((uintptr_t)1 << 39) || a < ((uintptr_t)4 << 30)) return VMA_RS_KERNEL;
+    int st = 0;
+    while (a < b) {
+        uint64_t e1 = s->l1[(a >> 30) & 0x1FF];
+        uintptr_t next = (a & ~(((uintptr_t)1 << 30) - 1)) + ((uintptr_t)1 << 30);
+        if (e1 & PTE_VALID) {
+            if (!(e1 & PTE_TABLE)) return st | VMA_RS_KERNEL;
+            uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
+            while (a < b && a < next) {
+                uint64_t e2 = l2[(a >> 21) & 0x1FF];
+                uintptr_t n2 = (a & ~(((uintptr_t)1 << 21) - 1)) + ((uintptr_t)1 << 21);
+                if (e2 & PTE_VALID) {
+                    if (!(e2 & PTE_TABLE)) return st | VMA_RS_KERNEL;
+                    uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
+                    for (uintptr_t p = a; p < b && p < n2; p += 0x1000) {
+                        uint64_t e3 = l3[(p >> 12) & 0x1FF];
+                        if ((e3 & PTE_VALID) || (e3 & VMM_SWPE_MARK)) return st | VMA_RS_USER;
+                    }
+                }
+                a = n2;
+            }
+            continue;
+        }
+        a = next;
+    }
+    return st;
+}

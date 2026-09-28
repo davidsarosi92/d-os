@@ -26,6 +26,7 @@
 #include "settings.h"
 #include "cred.h"
 #include "users.h"
+#include "lnx_signal.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -43,7 +44,8 @@
 #define PROC_INTERP_OFFSET 0x04000000u   /* §M37 dynamic linker load base      */
 #define PROC_STACK_TOP     0x06000000u   /* one past the highest stack page    */
 #define PROC_STACK_PAGES   256u          /* 1 MiB user stack                   */
-#define PROC_MAX_ARGV      16
+#define PROC_MAX_ARGV      64            /* §M89: was 16 — a real program passes more */
+#define PROC_MAX_ENV       64
 
 /* ---------------------------------------------------------------------------
  * M34 — build the System V initial process stack in a freshly-allocated user
@@ -103,6 +105,10 @@ static int u_strcopy(char* dst, const char* us, uint32_t max) {
 #define AT_PAGESZ  6
 #define AT_BASE    7       /* load base of the interpreter (0 if none)         */
 #define AT_ENTRY   9       /* entry point of the MAIN object (not the interp)  */
+#define AT_UID     11      /* §M89 — without these four musl runs SECURE      */
+#define AT_EUID    12
+#define AT_GID     13
+#define AT_EGID    14
 #define AT_CLKTCK  17
 #define AT_SECURE  23
 #define AT_RANDOM  25
@@ -193,11 +199,59 @@ static void env_home_for_exec(char* out, int cap) {
     env_put(out, cap, &n, u ? user_home(u) : "/");
 }
 
+/* `envc`/`envp`: the environment a caller of execve passed (Linux's
+ * semantics: exactly those strings), or envc < 0 for the default one (PATH,
+ * HOME, TERM, plus proc_set_exec_env's extra).
+ *
+ * §M89 — EVERYTHING (strings, AT_RANDOM, the pointer table, the auxv) lives on
+ * this ONE page, and nothing checked that it fit: a long enough argv would have
+ * written below the page, into whatever frame preceded it.  The size is now
+ * computed first and an oversized request refused (0 → the caller's E2BIG).
+ * An execve that dropped envp is how a JRE's launcher looped forever: it sets
+ * LD_LIBRARY_PATH, re-executes itself, and the new image — never seeing the
+ * variable — does it again. */
 static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
                                      int argc, const char* const argv[],
+                                     int envc, const char* const envp[],
                                      const struct loaded_prog* lp) {
     if (argc < 0) argc = 0;
-    if (argc > PROC_MAX_ARGV) argc = PROC_MAX_ARGV;
+    if (argc > PROC_MAX_ARGV) return 0;
+    if (envc > PROC_MAX_ENV) return 0;
+
+    /* The environment first (it decides the size). */
+    char path_var[160], home_var[96];
+    const char* env[PROC_MAX_ENV + TASK_EXEC_ENV_MAX];
+    int nenv = 0;
+    struct task* me = task_current();
+    if (envc >= 0) {
+        for (int i = 0; i < envc; i++) env[nenv++] = envp[i];
+    } else {
+        /* §M82 — PATH and HOME come from the session, not from a table: PATH
+         * is the `env.PATH` setting as THIS task sees it (its account's value
+         * over the machine's — config.c's layers), and HOME is its account's
+         * real home. */
+        env_path_for_exec(path_var, sizeof path_var);
+        env_home_for_exec(home_var, sizeof home_var);
+        env[nenv++] = path_var;
+        env[nenv++] = home_var;
+        env[nenv++] = "TERM=d-os";
+        /* §M40 — plus the caller-supplied variables for this exec (see
+         * proc_set_exec_env): per-launch data such as WAYLAND_SOCKET=<fd>. */
+        if (me)
+            for (int s = 0; s < TASK_EXEC_ENV_MAX; s++)
+                if (me->exec_extra_env[s][0]) env[nenv++] = me->exec_extra_env[s];
+    }
+    {
+        uintptr_t need = 16 + 16;                        /* AT_RANDOM + alignment */
+        for (int i = 0; i < argc; i++) need += u_strlen(argv[i]) + 1;
+        for (int i = 0; i < nenv; i++) need += u_strlen(env[i]) + 1;
+        need += (1 + (uintptr_t)argc + 1 + (uintptr_t)nenv + 1 + 14 * 2) * sizeof(uintptr_t);
+        if (need > PAGE_SIZE) {
+            kprintf("exec: arguments + environment need %u bytes, the initial stack page holds %u - refused (E2BIG)\n",
+                    (unsigned)need, (unsigned)PAGE_SIZE);
+            return 0;
+        }
+    }
 
     /* §M86 — the stack is a USER page and may be highmem: written through a
      * kmap, released at the single return below.  Nothing in between sleeps
@@ -217,31 +271,8 @@ static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
         argv_uva[i] = stack_va + koff;
     }
 
-    /* 1a. Copy a minimal default ENVIRONMENT below the args (a real per-exec
-     *     env is a follow-up; this makes getenv()/`env` meaningful).  Native
-     *     crt0 ignores envp; musl reads it. */
-    /* §M82 — PATH and HOME come from the session, not from a table: PATH is
-     * the `env.PATH` setting as THIS task sees it (its account's value over the
-     * machine's — config.c's layers), and HOME is its account's real home. */
-    char path_var[160], home_var[96];
-    env_path_for_exec(path_var, sizeof path_var);
-    env_home_for_exec(home_var, sizeof home_var);
-    const char* const default_env[] = { path_var, home_var, "TERM=d-os" };
-    const int base_env = (int)(sizeof default_env / sizeof default_env[0]);
-    /* §M40 — plus at most ONE caller-supplied variable for this exec (see
-     * proc_set_exec_env).  The launcher of a Wayland client has to pass
-     * WAYLAND_SOCKET=<fd>, which is per-launch data and cannot live in a static
-     * table; a full per-exec environ is the natural generalisation and this is
-     * the seam it will grow from. */
-    struct task* me = task_current();
-    const char* env[8];
-    int nenv = 0;
-    for (int i = 0; i < base_env; i++) env[nenv++] = default_env[i];
-    if (me) {
-        for (int s = 0; s < TASK_EXEC_ENV_MAX && nenv < 8; s++)
-            if (me->exec_extra_env[s][0]) env[nenv++] = me->exec_extra_env[s];
-    }
-    uintptr_t env_uva[8];
+    /* 1a. The environment strings below the args. */
+    uintptr_t env_uva[PROC_MAX_ENV + TASK_EXEC_ENV_MAX];
     for (int i = nenv - 1; i >= 0; i--) {
         uint32_t l = u_strlen(env[i]) + 1;
         koff -= l;
@@ -249,7 +280,7 @@ static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
         env_uva[i] = stack_va + koff;
     }
 
-    if (me)                                     /* one exec only — consumed */
+    if (me && envc < 0)                         /* one exec only — consumed */
         for (int s = 0; s < TASK_EXEC_ENV_MAX; s++) me->exec_extra_env[s][0] = '\0';
 
     /* 1b. Reserve + fill the 16 AT_RANDOM bytes just below the strings and
@@ -262,9 +293,10 @@ static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
     /* 2. Lay out the pointer table below the strings, keeping the final SP
      *    16-byte aligned.  Slots: argc + argv[argc] + argv-NULL + envp[nenv] +
      *    envp-NULL + auxv{ PAGESZ, CLKTCK, RANDOM, SECURE,
-     *    PHDR, PHENT, PHNUM, BASE, ENTRY, NULL } = 10 pairs. */
+     *    PHDR, PHENT, PHNUM, BASE, ENTRY, UID, EUID, GID, EGID, NULL } = 14
+     *    pairs. */
     uintptr_t slot = sizeof(uintptr_t);
-    uintptr_t nslots = 1 + (uintptr_t)argc + 1 + (uintptr_t)nenv + 1 + (10 * 2);
+    uintptr_t nslots = 1 + (uintptr_t)argc + 1 + (uintptr_t)nenv + 1 + (14 * 2);
     koff -= nslots * slot;
     koff &= ~(uintptr_t)0xF;                          /* 16-byte align the SP  */
 
@@ -286,6 +318,28 @@ static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
     w[k++] = AT_PHNUM; w[k++] = lp ? lp->main.phnum     : 0;
     w[k++] = AT_BASE;  w[k++] = lp ? lp->interp_base    : 0;
     w[k++] = AT_ENTRY; w[k++] = lp ? lp->main.entry     : 0;
+    /* §M89 — musl decides whether a process is "secure" (setuid-like) as
+     * `(aux[0] & 0x7800) != 0x7800 || uid != euid || gid != egid ||
+     * AT_SECURE`: bits 11-14 of aux[0] say which of AT_UID..AT_EGID were
+     * PRESENT.  Leaving them out therefore made EVERY dynamic musl program
+     * secure, so its loader ignored LD_LIBRARY_PATH and refused `$ORIGIN` —
+     * which is how a JRE finds libjli.so ("Error loading shared library
+     * libjli.so", with the file right there).  Real and effective ids are the
+     * same here: nothing on this system is setuid.  The values are the
+     * EXEC-ing task's, which is the process's own for execve; a task spawned
+     * by another and given a new identity afterwards (ctr) sees its parent's
+     * here and its own from getuid — equal pairs either way, which is the
+     * part the loader reads. */
+    {
+        struct task* ct = task_current();
+        int u = ct ? cred_uid(&ct->cred) : 0, g = ct ? cred_gid(&ct->cred) : 0;
+        if (u < 0) u = 0;
+        if (g < 0) g = 0;
+        w[k++] = AT_UID;  w[k++] = (uintptr_t)u;
+        w[k++] = AT_EUID; w[k++] = (uintptr_t)u;
+        w[k++] = AT_GID;  w[k++] = (uintptr_t)g;
+        w[k++] = AT_EGID; w[k++] = (uintptr_t)g;
+    }
     w[k++] = AT_NULL;  w[k++] = 0;                     /* auxv terminator       */
     kunmap_frame(base);
     return stack_va + koff;
@@ -379,7 +433,8 @@ static int proc_exec_common(const void* image, size_t len,
     uintptr_t stack_va;
     pmm_phys_t stk = map_user_stack(s, &stack_va);
     if (!stk) { vmm_space_destroy(s); return -1; }
-    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, argv, &lp);
+    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, argv, -1, NULL, &lp);
+    if (!user_sp) { vmm_space_destroy(s); return -1; }
 
     /* Bind the space to this task so the scheduler maintains CR3/TTBR0 across
      * any preemption during the excursion, activate it, then drop to user
@@ -430,30 +485,52 @@ int proc_exec_elf_argv(const void* image, size_t len,
  * it does not return (enter_user_mode).  Portable: only reached via the i386
  * syscall dispatcher today, but the body uses portable primitives.
  * --------------------------------------------------------------------------- */
-#define EXECVE_ARGBUF 2048u
+/* ONE page of strings for argv and envp together: they end up on one page of
+ * the new stack (build_initial_stack), so a larger buffer could only defer
+ * the refusal. */
+#define EXECVE_ARGBUF 4096u
+#define E2BIG_RC      (-7)
+
+/* Copy a NULL-terminated user vector of strings into `buf` at *off.  Returns
+ * the count, -1 for a bad pointer, E2BIG_RC when it does not fit — never a
+ * silently shortened vector (§M73's argv lesson: a truncated argument list is
+ * a different program). */
+static int marshal_vec(char* const uvec[], const char** out, int max, char* buf, uint32_t* off) {
+    if (!uvec) return 0;
+    int n = 0;
+    for (;; n++) {
+        if (!vmm_user_access_ok((uintptr_t)&uvec[n], sizeof(char*), 0)) return -1;
+        const char* s = uvec[n];
+        if (!s) return n;
+        if (n >= max || *off >= EXECVE_ARGBUF) return E2BIG_RC;
+        int l = u_strcopy(&buf[*off], s, EXECVE_ARGBUF - *off);
+        if (l < 0) return -1;
+        if (*off + (uint32_t)l + 1 >= EXECVE_ARGBUF) return E2BIG_RC;   /* cut short */
+        out[n] = &buf[*off];
+        *off += (uint32_t)l + 1;
+    }
+}
 
 int proc_execve(const char* path, char* const uargv[]) {
+    return proc_execve_env(path, uargv, NULL);
+}
+
+int proc_execve_env(const char* path, char* const uargv[], char* const uenvp[]) {
     struct task* me = task_current();
     if (!me || !me->mm) return -1;           /* only a user process can exec  */
 
-    /* 1. Marshal argv into kernel memory while the OLD space is still active
-     *    (user pointers valid).  argv[i] strings are copied into strbuf. */
+    /* 1. Marshal argv (and envp) into kernel memory while the OLD space is
+     *    still active (user pointers valid). */
     const char* kargv[PROC_MAX_ARGV];
+    const char* kenvp[PROC_MAX_ENV];
     char* strbuf = (char*)kmalloc(EXECVE_ARGBUF);
     if (!strbuf) return -1;
-    int argc = 0; uint32_t soff = 0;
-    if (uargv && vmm_user_access_ok((uintptr_t)uargv, sizeof(char*), 0)) {
-        for (argc = 0; argc < PROC_MAX_ARGV; argc++) {
-            /* §1.1 — validate the argv[] slot, then copy the string safely. */
-            if (!vmm_user_access_ok((uintptr_t)&uargv[argc], sizeof(char*), 0)) break;
-            const char* s = uargv[argc];
-            if (!s) break;
-            if (soff >= EXECVE_ARGBUF) break;
-            int l = u_strcopy(&strbuf[soff], s, EXECVE_ARGBUF - soff);
-            if (l < 0) { kfree(strbuf); return -1; }
-            kargv[argc] = &strbuf[soff];
-            soff += (uint32_t)l + 1;
-        }
+    uint32_t soff = 0;
+    int argc = marshal_vec(uargv, kargv, PROC_MAX_ARGV, strbuf, &soff);
+    int envc = uenvp ? marshal_vec(uenvp, kenvp, PROC_MAX_ENV, strbuf, &soff) : -1;
+    if (argc < 0 || (uenvp && envc < 0)) {
+        kfree(strbuf);
+        return (argc == E2BIG_RC || envc == E2BIG_RC) ? E2BIG_RC : -1;
     }
 
     /* 2. Read the ELF file into a kernel buffer.  §1.1 — `path` is the calling
@@ -462,6 +539,11 @@ int proc_execve(const char* path, char* const uargv[]) {
     if (u_strcopy(kpath, path, sizeof kpath) < 0) { kfree(strbuf); return -1; }
     struct file* f = vfs_open(kpath, VFS_RDONLY);
     if (!f) { kfree(strbuf); return -1; }
+    /* §M89 — what /proc/self/exe will name (vfs_canonical joins the cwd and
+     * resolves "..", within this task's root).  Computed now, COMMITTED at the
+     * point of no return below, so a failed exec keeps the old name. */
+    char new_exe[sizeof me->cred.exe];
+    if (vfs_canonical(kpath, new_exe, sizeof new_exe) != 0) new_exe[0] = 0;
 
     /* §M32 stage 6 — THE EXECUTE BIT, AND THIS IS THE ONLY PLACE IT CAN LIVE.
      *
@@ -497,13 +579,16 @@ int proc_execve(const char* path, char* const uargv[]) {
     uintptr_t stack_va;
     pmm_phys_t stk = map_user_stack(ns, &stack_va);
     if (!stk) { vmm_space_destroy(ns); kfree(img); kfree(strbuf); return -1; }
-    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, kargv, &lp);
+    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, kargv, envc, kenvp, &lp);
+    if (!user_sp) { vmm_space_destroy(ns); kfree(img); kfree(strbuf); return E2BIG_RC; }
 
     /* 4. Commit: swap to the new space, free the old one + scratch.  execve
      *    resets signal dispositions to default (custom handlers pointed into
      *    the old image); the restorer is re-registered by the new program. */
     for (int i = 0; i < NSIG; i++) me->sig_handler[i] = SIG_DFL;
     me->sig_pending = 0;
+    for (unsigned i = 0; i < sizeof me->cred.exe; i++) me->cred.exe[i] = new_exe[i];
+    lnx_sig_exec(me);                         /* §M89 — handlers pointed into the old image */
     struct vmm_space* old = task_swap_mm(me, ns);   /* under the walkers' lock */
     vmm_space_switch(ns);
     /* §M74 — a pressure eviction may be inside the OLD space; it pinned this
@@ -573,7 +658,7 @@ struct clone_boot {
     struct vmm_space* space;
     uintptr_t         entry;
     uintptr_t         user_sp;
-    struct ofile*     fds[TASK_MAX_FDS];
+    struct fdtable*   fdt;           /* §M89 — the shared descriptor table */
 };
 
 static void clone_bootstrap(void) {
@@ -583,7 +668,7 @@ static void clone_bootstrap(void) {
     me->mm          = b->space;      /* SHARED with the creator */
     me->mm_shared   = 1;
     me->user_task   = 1;
-    for (int i = 0; i < TASK_MAX_FDS; i++) me->fds[i] = b->fds[i];
+    fdtable_adopt(me, b->fdt);
 
     uintptr_t entry = b->entry, sp = b->user_sp;
     kfree(b);
@@ -603,12 +688,12 @@ int proc_clone(uintptr_t entry, uintptr_t stack) {
     b->space       = parent->mm;    /* share, don't clone */
     b->entry       = entry;
     b->user_sp     = stack;
-    for (int i = 0; i < TASK_MAX_FDS; i++)
-        b->fds[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
+    b->fdt         = fdtable_share(parent);
+    if (!b->fdt) { kfree(b); return -1; }
 
     struct task* t = task_spawn_arg_held("thread", clone_bootstrap, b);
     if (!t) {
-        for (int i = 0; i < TASK_MAX_FDS; i++) if (b->fds[i]) ofile_unref(b->fds[i]);
+        fdtable_put(b->fdt);
         kfree(b);
         return -1;
     }
@@ -644,7 +729,8 @@ int proc_spawn_argv_under(const char* name, const void* image, size_t len,
     if (!b) { vmm_space_destroy(s); return -1; }
     b->space     = s;
     b->entry     = lp.entry;
-    b->user_sp   = build_initial_stack(stk, stack_va, argc, argv, &lp);
+    b->user_sp   = build_initial_stack(stk, stack_va, argc, argv, -1, NULL, &lp);
+    if (!b->user_sp) { kfree(b); vmm_space_destroy(s); return -1; }
     b->linux_abi = linux_abi;
 
     /* ppid >= 0 parents the package explicitly (a GUI launcher passes the
@@ -668,6 +754,15 @@ int proc_spawn(const char* name, const void* image, size_t len) {
 void user_excursion_end(void) {
     struct task* me = task_current();
     if (me) me->in_user_syscall = 0;
+    /* §M89 — the program's signal state belonged to the PROGRAM, and its
+     * handlers point into an image that is gone: the hosting task must not
+     * carry them (or a mask the program set) into whatever it runs next. */
+    if (me) {
+        lnx_sig_free(me);
+        me->sig_blocked = 0;
+        me->sig_pending = 0;
+        for (int i = 0; i < NSIG; i++) me->sig_handler[i] = SIG_DFL;
+    }
 }
 
 /* ---------------------------------------------------------------------------

@@ -242,6 +242,8 @@ static void ctr_init_main(void) {
     }
     const char* name = r->argv[0];
     for (const char* p = r->argv[0]; *p; p++) if (*p == '/') name = p + 1;
+    /* §M89 — /proc/self/exe for the program (the child inherits the cred). */
+    if (vfs_canonical(r->argv[0], me->cred.exe, sizeof me->cred.exe) != 0) me->cred.exe[0] = 0;
     int pid = proc_spawn_argv(name, img, sz, r->argc, r->argv, /*linux_abi*/1);
     kfree(img);
     if (pid < 0) { kprintf("ctr: could not start %s\n", r->argv[0]); r->code = 126; r->done = 1; return; }

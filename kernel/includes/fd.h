@@ -70,6 +70,26 @@ struct ofile* ofile_from_epoll(struct epoll* e);
  * (§M56.2's readiness memo) rather than dereferencing the remembered one. */
 struct ofile* fd_lookup(int fd);
 
+/* §M89 — a descriptor table SHARED by the threads of one process (Linux's
+ * CLONE_FILES).  A task without threads keeps its own inline table and never
+ * allocates one of these.
+ *
+ *   fdtable_share(parent) — before creating a thread: move the parent onto a
+ *       shared table (first time) and return it with one reference for the
+ *       new thread;
+ *   fdtable_adopt(t, ft)  — in the new thread: take that reference;
+ *   fdtable_put(ft)       — give a reference back (a failed spawn).
+ *
+ * The table's lock serialises the slot updates (install, dup2, close), which
+ * two threads can now race on.  Lookups read the slot without it, as before —
+ * a descriptor closed by one thread WHILE another is inside a call on it is
+ * the known gap (Linux solves it with RCU and per-file references). */
+struct fdtable;
+struct task;
+struct fdtable* fdtable_share(struct task* parent);
+void            fdtable_adopt(struct task* t, struct fdtable* ft);
+void            fdtable_put(struct fdtable* ft);
+
 /* Refcount management.  ofile_unref drops the last reference → closes the
  * wrapped resource + frees the ofile. */
 struct ofile* ofile_ref  (struct ofile* o);

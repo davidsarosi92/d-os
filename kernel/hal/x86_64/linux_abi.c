@@ -25,6 +25,7 @@
  * Reference: arch/x86/entry/syscalls/syscall_64.tbl.
  * ============================================================================= */
 
+#include "lnx_signal.h"   /* §M89 */
 #include "syscall.h"
 #include "idt.h"
 #include "task.h"
@@ -534,22 +535,7 @@ static void linux_syscall_body(struct int_frame* f) {
             f->rax = (uint64_t)r;
             return;
         }
-        case LNX_mmap: {
-            /* x86_64 mmap(addr, len, prot, flags, fd, offset) — offset is in
-             * BYTES (unlike i386's mmap2 page-offset).  §M37: file-backed +
-             * MAP_FIXED so ld.so can map shared objects. */
-            long r = sys_mmap_full(a0, (size_t)a1, (int)a2, (int)a3,
-                                   (int)a4, (uint64_t)a5);
-            f->rax = (r <= 0) ? (uint64_t)-LNX_ENOMEM : (uint64_t)r;
-            return;
-        }
-        case LNX_mprotect:
-            f->rax = (uint64_t)sys_mprotect(a0, (size_t)a1, (int)a2);
-            return;
-        case LNX_munmap:
-            /* Bump-allocated user mmap does not reclaim yet (small leak). */
-            f->rax = 0;
-            return;
+        /* mmap / munmap / mprotect are ABI-engine operations (§M89). */
         case LNX_brk:
             /* No program break → report 0 so musl's malloc falls back to mmap. */
             f->rax = 0;
@@ -716,10 +702,11 @@ static void linux_syscall_body(struct int_frame* f) {
             return;
         }
         case LNX_execve:
-            /* execve(path=rdi, argv=rsi, envp=rdx) — envp ignored (child keeps
-             * the default env).  On success does not return (iretq into the new
-             * image); on failure the old image continues. */
-            f->rax = (uint64_t)proc_execve((const char*)a0, (char* const*)a1);
+            /* execve(path=rdi, argv=rsi, envp=rdx) — §M89: envp honoured.  On
+             * success does not return (iretq into the new image); on failure
+             * the old image continues. */
+            f->rax = (uint64_t)(long)proc_execve_env((const char*)a0, (char* const*)a1,
+                                                     (char* const*)a2);
             return;
         case LNX_wait4: {
             int code = 0;
@@ -732,15 +719,11 @@ static void linux_syscall_body(struct int_frame* f) {
             return;
         }
         /* pipe / pipe2 moved to the shared engine (§M59, abi_engine.c). */
-        case LNX_kill:
-            /* Posts the signal (sys_kill sets sig_pending); actual delivery to
-             * user handlers on x86_64 is a follow-up (needs the Linux rt_sigframe
-             * / ucontext layout).  Enough for waitpid-based job control. */
-            f->rax = (uint64_t)sys_kill((int)a0, (int)a1);
+        /* kill / tkill / tgkill are engine operations (§M89, lnx_signal.c). */
+        case 15:                                  /* rt_sigreturn (§M89) */
+            lnx_rt_sigreturn(f);
             return;
-        case LNX_futex:
-            f->rax = (uint64_t)sys_futex((int*)a0, (int)a1, (int)a2);
-            return;
+        /* futex is an ABI-engine operation (§M89, futex.c). */
 
         case LNX_poll:
             /* poll(fds=rdi, nfds=rsi, timeout_ms=rdx).  Linux's struct pollfd is

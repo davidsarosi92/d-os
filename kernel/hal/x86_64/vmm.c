@@ -37,6 +37,7 @@
 #include "printf.h"
 #include "kmalloc.h"
 #include "task.h"      /* task_current — COW resolves in the current space */
+#include "vma.h"       /* §M89 — reservations live beside the tables */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -164,7 +165,7 @@ uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
  * i386 check: walks PML4→PDPT→PD→PT via CR3, requiring P + U/S at every level
  * (and R/W too if want_write) so a syscall can safely touch a ring-3 pointer.
  * Every page table lives in the identity-mapped physical region. */
-int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
+static int access_walk(uintptr_t va, uintptr_t len, int want_write) {
     if (len == 0) return 1;
     if (va < vmm_user_base()) return 0;
     if (va + len < va)        return 0;                 /* overflow */
@@ -185,6 +186,16 @@ int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
         if (!mapped) return 0;
     }
     return 1;
+}
+
+/* §M89 — a range that is not mapped YET may still be the program's: a
+ * demand-zero reservation or a lazily filled file mapping.  Bring those pages
+ * in and look again, so read() into a freshly mmap'd buffer is not refused as
+ * a bad pointer.  PROT_NONE and truly unmapped ranges still fail. */
+int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
+    if (access_walk(va, len, want_write)) return 1;
+    if (va < vmm_user_base() || va + len < va) return 0;
+    return vma_prefault(va, len, want_write) && access_walk(va, len, want_write);
 }
 
 static uint64_t* walk_to_pt_root(uint64_t* root, uintptr_t virt, int create,
@@ -394,11 +405,8 @@ void vmm_print_status(void) {
 struct vmm_space {
     uint64_t* pml4;         /* process PML4 (identity: virt == phys) */
     uintptr_t pml4_phys;
-
-    /* §M48 — the mmap bump cursor lives with the ADDRESS SPACE, not with the
-     * task.  See the i386 twin for why a per-task cursor (or a snapshot copied
-     * at clone time) lets one thread map over another's memory. */
-    uintptr_t mmap_cursor;
+    void*     vma;          /* §M89 — the reservation set (vma.c owns it; it
+                             * replaced §M48's per-space mmap bump cursor) */
 };
 
 static inline uint64_t read_cr3(void) {
@@ -411,9 +419,7 @@ static inline void write_cr3(uint64_t v) {
 struct vmm_space* vmm_space_create(void) {
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
     if (!s) return NULL;
-    /* kmalloc does not zero: an uninitialised bump cursor is handed straight
-     * back to the program as an mmap address. */
-    s->mmap_cursor = 0;
+    s->vma = NULL;                  /* kmalloc does not zero */
 
     pmm_phys_t pml4_phys = pmm_alloc_frame();
     if (!pml4_phys) { kfree(s); return NULL; }
@@ -509,6 +515,7 @@ static void free_subtree(uint64_t* tbl, uint64_t* ktbl, int depth) {
 
 void vmm_space_destroy(struct vmm_space* s) {
     if (!s) return;
+    vma_destroy(s);                 /* §M89 — before the tables: it may unref files */
     free_subtree(s->pml4, (uint64_t*)pml4, 0);
     pmm_free_frame((pmm_phys_t)s->pml4_phys);
     kfree(s);
@@ -587,10 +594,10 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     if (!parent) return NULL;
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof(*s));
     if (!s) return NULL;
-    /* fork(): the child inherits the parent's mappings, so it must inherit the
-     * cursor too — restarting at the region base would re-issue addresses the
-     * child already has mapped. */
-    s->mmap_cursor = parent->mmap_cursor;
+    /* fork(): the child inherits the parent's reservations as well as its
+     * mappings (vma_clone at the end) — otherwise the child's allocator would
+     * re-issue ranges it already has mapped. */
+    s->vma = NULL;
     pmm_phys_t pml4_phys = pmm_alloc_frame();
     if (!pml4_phys) { kfree(s); return NULL; }
     s->pml4      = (uint64_t*)phys_to_virt(pml4_phys);
@@ -620,6 +627,7 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
      * shootdown, not one per page: the pages number in the thousands and every
      * remote CPU flushes everything anyway. */
     hal_tlb_shootdown(0, 0);
+    vma_clone(parent, s);           /* §M89 — the child inherits the reservations */
     return s;
 }
 
@@ -942,16 +950,58 @@ void vmm_space_switch(struct vmm_space* s) {
 uintptr_t vmm_user_base(void) { return 0x40000000u; }
 
 
-/* §M48 — the address space's mmap bump cursor.  Policy (where the region
- * starts, how far it may grow) stays in usyscall.c; the SPACE only owns the
- * storage, so every task sharing an mm shares one cursor. */
-uintptr_t vmm_space_mmap_cursor(struct vmm_space* s) {
-    return s ? s->mmap_cursor : 0;
-}
-void vmm_space_set_mmap_cursor(struct vmm_space* s, uintptr_t v) {
-    if (s) s->mmap_cursor = v;
-}
-
 /* The CR3 value of a space (0 for NULL = the kernel's).  For fault reports. */
 uintptr_t vmm_space_root_phys(struct vmm_space* s) { return s ? (uintptr_t)s->pml4_phys : 0; }
 
+
+/* ---------------------------------------------------------------------------
+ * §M89 — the primitives vma.c needs (contract in vma.h).
+ * ------------------------------------------------------------------------- */
+void* vmm_space_vma(struct vmm_space* s) { return s ? s->vma : NULL; }
+void  vmm_space_set_vma(struct vmm_space* s, void* v) { if (s) s->vma = v; }
+
+/* Everything under PML4[0]: the private PDPT every space gets at creation. */
+uintptr_t vmm_user_limit(void) { return (uintptr_t)1 << 39; }
+
+int vmm_space_probe(struct vmm_space* s, uintptr_t va) {
+    if (!s) return 0;
+    uint64_t* pt = walk_to_pt_root(s->pml4, va, /*create*/0, 0);
+    if (!pt) return 0;
+    uint64_t e = pt[IDX_PT(va)];
+    if (e & PTE_P) return 1;
+    if (e & VMM_SWPE_MARK) return 2;
+    return 0;
+}
+
+/* Walk the space and the kernel's tables side by side (free_subtree's rule:
+ * an entry IDENTICAL to the kernel's at the same index is the kernel's), and
+ * skip whole absent subtrees, so a 1 GiB query touches a handful of entries. */
+int vmm_space_range_state(struct vmm_space* s, uintptr_t a, uintptr_t b) {
+    if (!s) return VMA_RS_KERNEL;
+    const int shifts[4] = { 39, 30, 21, 12 };
+    int st = 0;
+    while (a < b) {
+        uint64_t* tbl  = s->pml4;
+        uint64_t* ktbl = (uint64_t*)pml4;
+        uintptr_t span = 0x1000;
+        for (int level = 0; level < 4; level++) {
+            span = (uintptr_t)1 << shifts[level];
+            unsigned idx = (unsigned)(a >> shifts[level]) & 0x1FFu;
+            uint64_t e = tbl[idx];
+            if (!(e & PTE_P)) {
+                if (level == 3 && (e & VMM_SWPE_MARK)) st |= VMA_RS_USER;   /* evicted */
+                break;                                        /* the span is empty */
+            }
+            if (ktbl && e == ktbl[idx]) return st | VMA_RS_KERNEL;
+            if (e & PTE_PS) return st | VMA_RS_KERNEL;        /* only the kernel maps large */
+            if (level == 3) { st |= VMA_RS_USER; break; }
+            uint64_t ke = ktbl ? ktbl[idx] : 0;
+            ktbl = (ktbl && (ke & PTE_P) && !(ke & PTE_PS)) ? table_at((uintptr_t)ke) : NULL;
+            tbl  = table_at((uintptr_t)e);
+        }
+        uintptr_t next = (a & ~(span - 1)) + span;
+        if (next <= a) break;
+        a = next;
+    }
+    return st;
+}

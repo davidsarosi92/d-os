@@ -17,6 +17,7 @@
  * belongs in the engine, so that x86 gets it too.
  * ============================================================================= */
 
+#include "lnx_signal.h"   /* §M89 */
 #include "abi.h"
 #include "task.h"
 #include "fd.h"
@@ -58,6 +59,14 @@ void linux_syscall_dispatch(struct trapframe* tf) {
     if (me) me->in_user_syscall = 1;
 
     unsigned long nr = tf->x[8];
+
+    /* §M89 — rt_sigreturn restores the WHOLE register set from the frame, so
+     * it must not have x0 overwritten by a return value afterwards. */
+    if (nr == 139) {
+        lnx_rt_sigreturn(tf);
+        if (me) me->in_user_syscall = prev;
+        return;
+    }
 
     if (nr == LNX_ARM64_exit || nr == LNX_ARM64_exit_group) {
         if (me && me->user_task) { fd_close_all(); task_exit_code((int)tf->x[0]); }

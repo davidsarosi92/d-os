@@ -18,6 +18,8 @@
  * Reference: AMD64 APM Vol 2 §8.9 (Long-Mode Interrupt Descriptors).
  * ============================================================================= */
 
+#include "lnx_signal.h"   /* §M89 */
+#include "vma.h"      /* §M89 — demand pages */
 #include "idt.h"
 #include "hal.h"
 #include "printf.h"
@@ -585,6 +587,8 @@ void isr_handler(struct int_frame* f) {
                 int can_sleep = (f->cs & 3) == 3 ||
                                 ((f->rflags & 0x200) && this_cpu()->preempt_count == 0);
                 if (swap_in_fault((uintptr_t)cr2, can_sleep)) return;
+                /* §M89 — see the i386 twin. */
+                if (vma_fault((uintptr_t)cr2, (f->err_code & 2) != 0, can_sleep)) return;
             }
         }
         /* §1.1 — user-access exception table (see the i386 twin): a kernel-mode
@@ -628,6 +632,10 @@ void isr_handler(struct int_frame* f) {
             uint64_t ucr2 = 0, ucr3 = 0;
             __asm__ volatile ("mov %%cr2, %0" : "=r"(ucr2));
             __asm__ volatile ("mov %%cr3, %0" : "=r"(ucr3));
+            /* §M89 — a Linux program that HANDLES this signal gets it, with
+             * the address, instead of dying: a JVM's null checks and stack
+             * guards are faults on purpose.  Unhandled, it dies as before. */
+            if (lnx_fault_deliver(f, sig, (uintptr_t)ucr2)) return;
             /* cr2 names the address, cr3 the address space the CPU was in —
              * "a page is missing" and "the task ran in somebody else's space"
              * look identical without the second. */
