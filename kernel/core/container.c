@@ -316,7 +316,8 @@ int ctr_run(struct container* c, int argc, const char* const argv[]) {
         return 126;
     }
     char tname[32] = "ctr:"; scat(tname, c->name, sizeof tname);
-    if (!task_spawn_arg(tname, ctr_init_main, r)) { kfree(r); return -1; }
+    if (!task_spawn_arg_console(tname, ctr_init_main, r, -1,
+                               task_current() ? task_current()->out_console : NULL)   /* §M89: the caller's terminal */) { kfree(r); return -1; }
     while (!r->done) task_msleep(20);
     int code = r->code;
     kfree(r);
@@ -455,7 +456,8 @@ static void cmd_ctrescapetest(const char* args) {
     if (r) {
         r->c = c;
         ctr_argv_add(r, "/bin/sleep"); ctr_argv_add(r, sl[1]);
-        if (task_spawn_arg(tname, ctr_init_main, r)) {
+        if (task_spawn_arg_console(tname, ctr_init_main, r, -1,
+                               task_current() ? task_current()->out_console : NULL)   /* §M89: the caller's terminal */) {
             task_msleep(800);
             audit_clean = ctr_audit(0);
             struct task* victim = NULL;

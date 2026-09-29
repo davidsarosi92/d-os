@@ -737,8 +737,19 @@ int proc_spawn_argv_under(const char* name, const void* image, size_t len,
 
     /* ppid >= 0 parents the package explicitly (a GUI launcher passes the
      * desktop pid so the browser groups under the GUI session, not init);
-     * ppid < 0 falls back to the caller. */
-    struct task* t = task_spawn_arg_under(name, user_task_bootstrap, b, ppid);
+     * ppid < 0 falls back to the caller.
+     *
+     * §M89 — the program writes to, and reads from, the TERMINAL it was
+     * started from: the caller's console binding goes to the child AT
+     * CREATION (the task may run on another core before this returns).  It
+     * used to be NULL, so a program started from a GUI terminal — `java`,
+     * `ctr run` — printed to the machine's suppressed console and read no
+     * keys: reported from use as "java's output is not the shell it was
+     * started from".  Closing the terminal kills its subtree, so the binding
+     * cannot outlive the window. */
+    struct task* me = task_current();
+    struct task* t = task_spawn_arg_console(name, user_task_bootstrap, b, ppid,
+                                            me ? me->out_console : NULL);
     if (!t) { kfree(b); vmm_space_destroy(s); return -1; }
     return t->pid;
 }
