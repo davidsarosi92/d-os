@@ -139,6 +139,12 @@ static int app_link(const char* name, int quiet) {
     scat(bin, "/", sizeof bin); scat(bin, cur, sizeof bin); scat(bin, "/bin", sizeof bin);
     struct file* d = vfs_open(bin, VFS_RDONLY);
     if (!d) return -1;
+    /* /bin may not exist yet: this runs from a boot service, and the kernel
+     * and the shell create /bin later.  Reported from use — the service said
+     * "linked" while every symlink had failed for want of its directory, so
+     * after a reboot `java` was unknown although `app list` showed it. */
+    vfs_mkdir("/bin");
+    vfs_mkdir("/lib");
     libc_link();
     struct dirent de;
     int made = 0;
@@ -343,16 +349,20 @@ static void apps_boot_entry(void) {
      * before that.  Wait a bounded while for it rather than race it. */
     for (int i = 0; i < 300 && !exists("/mnt/d-os.conf") && !exists(APPS_ROOT) && !exists(INCOMING); i++)
         task_msleep(100);
-    int relinked = 0;
+    int relinked = 0, programs = 0;
     struct file* d = vfs_open(APPS_ROOT, VFS_RDONLY);
     if (d) {
         struct dirent de;
         char names[16][32]; int nn = 0;
         while (vfs_readdir(d, &de) > 0 && nn < 16) if (de.type == INODE_DIR) scpy(names[nn++], de.name, 32);
         vfs_close(d);
-        for (int i = 0; i < nn; i++) if (app_link(names[i], 1) >= 0) relinked++;
+        for (int i = 0; i < nn; i++) {
+            int m = app_link(names[i], 1);
+            if (m > 0) { relinked++; programs += m; }
+            else kprintf("apps: %s is installed but NONE of its programs could be linked into /bin\n", names[i]);
+        }
     }
-    if (relinked) kprintf("apps: %d installed application(s) linked into /bin\n", relinked);
+    if (relinked) kprintf("apps: %d installed application(s), %d program(s) linked into /bin\n", relinked, programs);
 
     struct file* in = vfs_open(INCOMING, VFS_RDONLY);
     if (!in) return;

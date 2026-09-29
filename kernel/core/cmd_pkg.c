@@ -250,7 +250,9 @@ int shell_run_from_path(const char* line) {
         int k = 0; for (; argv[0][k] && k < 255; k++) path[k] = argv[0][k]; path[k] = 0;
         if (vfs_stat(path, &st) != 0 || st.is_dir) return 0;
     } else {
-        const char* pv = config_get("env.PATH", "/bin:/usr/bin");
+        char pbuf[200];
+        proc_path_value(pbuf, sizeof pbuf);          /* this task's, $PATH expanded */
+        const char* pv = pbuf;
         while (*pv) {
             int k = 0;
             while (*pv && *pv != ':' && k < 200) path[k++] = *pv++;

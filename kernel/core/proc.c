@@ -190,6 +190,19 @@ static void env_path_for_exec(char* out, int cap) {
     }
 }
 
+/* §M89 — the PATH this task sees, $PATH expanded: the ONE interpretation, used
+ * by exec's environment and by the shell's program lookup alike.  The shell's
+ * first version read the raw setting and did not expand `$PATH`, so for a
+ * signed-in user whose PATH is "<home>/bin:$PATH" an installed `java` in /bin
+ * was "unknown" — while the same lookup as the system worked. */
+void proc_path_value(char* out, int cap) {
+    char buf[200];
+    env_path_for_exec(buf, sizeof buf);
+    int i = 0;
+    for (const char* p = buf + 5; *p && i < cap - 1; p++) out[i++] = *p;   /* past "PATH=" */
+    out[i] = 0;
+}
+
 static void env_home_for_exec(char* out, int cap) {
     const struct cred* c = cred_current();
     const struct user_account* u = c->owner == TASK_OWNER_USER ? user_by_uid(c->uid) : NULL;

@@ -66,6 +66,8 @@ int proc_fork(struct user_regs* parent_regs);
  * ELF at `path` (loaded from the VFS), passing `argv`.  fds survive.  Returns
  * -1 (image intact) on failure; does not return on success. */
 int proc_execve(const char* path, char* const argv[]);
+/* §M89 — the calling task's PATH with $PATH expanded (no "PATH=" prefix). */
+void proc_path_value(char* out, int cap);
 /* §M89 — the same with the caller's environment (Linux execve semantics:
  * exactly `envp`, or the default one when it is NULL).  Returns -7 (E2BIG)
  * when argv + envp do not fit the initial stack page — refused, never cut. */
