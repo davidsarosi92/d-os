@@ -175,10 +175,11 @@ static int g_primary_registered;
 void gui_output_workarea(int x, int y, int* ox, int* oy, int* ow, int* oh) {
     int i = multi_out ? display_at_point(x, y) : 0;
     struct display_output* o = (i > 0) ? display_at(i) : NULL;
-    if (!o) { *ox = 0; *oy = 0; *ow = scanout.w; *oh = work_h; return; }
+    if (!o) { *ox = prim_x; *oy = prim_y; *ow = scanout.w; *oh = work_h; return; }
     *ox = o->x; *oy = o->y; *ow = o->w; *oh = o->h;
 }
 int work_h = 0;                  /* screen minus shell chrome     */
+int prim_x = 0, prim_y = 0;      /* §M88 — see gui_priv.h         */
 int gmax_cols = 0, gmax_rows = 0;
 /* §M46 — see gui_start: X on a package window force-kills a wedged client.
  * §M47.1 — but that is the FALLBACK, not the close path.  Killing on the first
@@ -961,7 +962,7 @@ static void desktop_main(void) {
             spin_lock(&panel_lock);
             if (shell && shell->draw) shell->draw(&panelsurf);
             spin_unlock(&panel_lock);
-            gui_damage(0, work_h, scanout.w, scanout.h - work_h);   /* taskbar */
+            gui_damage(prim_x, prim_y + work_h, scanout.w, scanout.h - work_h);   /* taskbar */
             /* Repaint the popup's CURRENT extent (if open) AND the extent it
              * had LAST frame (if it just closed or moved).  Without the "last"
              * rect a launcher menu that closes via the app-launch path — which
@@ -969,11 +970,11 @@ static void desktop_main(void) {
              * screen ("the menu won't disappear").  This runs OUTSIDE state_lock
              * (gui_damage takes damage_lock), so no lock nesting. */
             if (pnl_pop_on)
-                gui_damage(pnl_pop_x, pnl_pop_y, pnl_pop_w, pnl_pop_h);
+                gui_damage(prim_x + pnl_pop_x, prim_y + pnl_pop_y, pnl_pop_w, pnl_pop_h);
             if (last_pop_on &&
                 (!pnl_pop_on || last_pop_x != pnl_pop_x || last_pop_y != pnl_pop_y ||
                  last_pop_w != pnl_pop_w || last_pop_h != pnl_pop_h))
-                gui_damage(last_pop_x, last_pop_y, last_pop_w, last_pop_h);
+                gui_damage(prim_x + last_pop_x, prim_y + last_pop_y, last_pop_w, last_pop_h);
             last_pop_on = pnl_pop_on;
             last_pop_x = pnl_pop_x; last_pop_y = pnl_pop_y;
             last_pop_w = pnl_pop_w; last_pop_h = pnl_pop_h;
@@ -1349,6 +1350,7 @@ static void gui_compositor_main(void) {
         gui_diag_service();
         term_selection_service();       /* §M58 — repaint + copy */
         apply_mode_change();            /* §M61 — resolution, between frames */
+        apply_outputs_change();         /* §M88 — monitors re-arranged, same rule */
         apply_mode_revert();            /* §M61 — …and the undo, same rule */
 
         /* ~1 Hz per-window housekeeping.  (The shell clock moved to the
@@ -1700,7 +1702,7 @@ void gui_desktop_icons_changed(void) {
      * finer rect would need the shell's layout, and this runs on an add or a
      * delete — rare, human-paced events, not the per-click path that §4.61's
      * damage discipline is about. */
-    gui_damage(0, 0, fbsurf.w, work_h);
+    gui_damage(prim_x, prim_y, scanout.w, work_h);        /* §M88: the primary's */
 }
 
 int gui_wallpaper_reload(void) {
@@ -2740,6 +2742,90 @@ int gui_stop(void) {
     return gui_teardown();
 }
 
+/* §M88 — LAY THE OUTPUTS OUT AROUND THE PRIMARY.  `fb` is the primary's
+ * framebuffer on entry and the DESKTOP (the union of the enabled outputs) on
+ * return; `scanout` becomes the primary's pixels, and multi_out/prim_x/prim_y
+ * say how the two relate.  One function for the desktop's start and for a live
+ * re-arrangement (gui_mode.c), because two copies of "what is the desktop" are
+ * two chances to disagree about it.
+ *
+ * The union lives in ONE back buffer (one kmalloc), so it has to fit the
+ * largest block the allocator hands out; a desktop that would not is REFUSED
+ * with the numbers, and the machine runs on the primary alone rather than
+ * failing to start its desktop. */
+void gui_outputs_layout(struct gfx_surface* fb) {
+    scanout = *fb;
+    scanout.owns_px = 0;
+    multi_out = 0;
+    prim_x = prim_y = 0;
+    g_primary_out.w = fb->w; g_primary_out.h = fb->h;
+    g_primary_out.px = fb->px; g_primary_out.stride = fb->stride;
+    g_primary_out.flush = NULL; g_primary_out.primary = 1;
+    const char* nm = "primary";
+    for (int i = 0; nm[i]; i++) g_primary_out.name[i] = nm[i];
+    if (!g_primary_registered) { display_register(&g_primary_out); g_primary_registered = 1; }
+    display_apply_modes();
+    int nout = display_arrange();
+    if (nout <= 1) { g_primary_out.x = g_primary_out.y = 0; return; }
+    int uw = 0, uh = 0;
+    display_union(&uw, &uh);
+    uint64_t need = (uint64_t)uw * (uint64_t)uh * 4u;
+    uint64_t block = (uint64_t)PMM_FRAME_SIZE << BUDDY_MAX_ORDER;
+    if (need > block) {
+        kprintf("gui: a %dx%d desktop needs %u MiB in one block and the "
+                "largest is %u MiB - using the primary monitor only\n",
+                uw, uh, (unsigned)(need >> 20), (unsigned)(block >> 20));
+        gui_outputs_primary_only();
+        return;
+    }
+    fb->w = uw; fb->h = uh; fb->stride = uw;
+    fb->px = NULL;                          /* the desktop has no pixels of its own */
+    multi_out = 1;
+    prim_x = g_primary_out.x; prim_y = g_primary_out.y;
+    kprintf("gui: %d monitors - desktop %dx%d\n", nout, uw, uh);
+}
+
+/* Switch every secondary output off and put the primary back at the origin —
+ * the fallback when a desktop cannot be allocated. */
+void gui_outputs_primary_only(void) {
+    for (int i = 1; i < display_count(); i++)
+        if (display_at(i)) display_at(i)->enabled = 0;
+    g_primary_out.x = g_primary_out.y = 0;
+    prim_x = prim_y = 0;
+    multi_out = 0;
+}
+
+/* M22.7-B — the panel surface: primary-addressed, but only the bottom strip
+ * (taskbar reserve + popup headroom) is backed (see PANEL_POPUP_MAX).  The
+ * desktop task renders chrome into it; only the taskbar strip + open popup are
+ * ever composited from it.  Rebuilt by a mode change or a re-arrangement; the
+ * old buffer is freed only after the new one is in place.  §M88 — the
+ * PRIMARY's width and coordinates: the compositor places the strip at
+ * prim_x/prim_y (it used to be desktop-wide, which with a second monitor was a
+ * strip of pixels nothing ever drew). */
+int gui_panel_strip_build(void) {
+    int reserve = scanout.h - work_h;                       /* bottom_reserve */
+    int strip_h = reserve + PANEL_POPUP_MAX;
+    if (strip_h > scanout.h) strip_h = scanout.h;
+    uint32_t* nbuf = (uint32_t*)kmalloc((size_t)scanout.w * strip_h * 4);
+    if (!nbuf) return -1;
+    spin_lock(&panel_lock);
+    uint32_t* old = panel_buf;
+    panel_buf = nbuf;
+    panel_strip_top = scanout.h - strip_h;
+    panelsurf.w      = scanout.w;                           /* pretend full-screen */
+    panelsurf.h      = scanout.h;
+    panelsurf.stride = scanout.w;
+    panelsurf.px     = panel_buf - (size_t)panel_strip_top * scanout.w;
+    panelsurf.owns_px = 0;                                  /* panel_buf is the base */
+    gfx_set_clip(&panelsurf, 0, panel_strip_top, scanout.w, strip_h);
+    gfx_fill(&panelsurf, 0, panel_strip_top, scanout.w, strip_h, COL_WALL_BOT);
+    panel_ready = 1;
+    spin_unlock(&panel_lock);
+    if (old) kfree(old);
+    return 0;
+}
+
 int gui_start(void) {
     if (gui_active) return 0;
 
@@ -2832,36 +2918,7 @@ int gui_start(void) {
      * allocator hands out; a desktop that would not is REFUSED with the
      * numbers, and the machine runs on the primary alone rather than failing
      * to start its desktop. */
-    scanout = fbsurf;
-    scanout.owns_px = 0;
-    multi_out = 0;
-    {
-        g_primary_out.w = fbsurf.w; g_primary_out.h = fbsurf.h;
-        g_primary_out.px = fbsurf.px; g_primary_out.stride = fbsurf.stride;
-        g_primary_out.flush = NULL; g_primary_out.primary = 1;
-        const char* nm = "primary";
-        for (int i = 0; nm[i]; i++) g_primary_out.name[i] = nm[i];
-        if (!g_primary_registered) { display_register(&g_primary_out); g_primary_registered = 1; }
-        int nout = display_arrange();
-        if (nout > 1) {
-            int uw = 0, uh = 0;
-            display_union(&uw, &uh);
-            uint64_t need = (uint64_t)uw * (uint64_t)uh * 4u;
-            uint64_t block = (uint64_t)PMM_FRAME_SIZE << BUDDY_MAX_ORDER;
-            if (need > block) {
-                kprintf("gui: a %dx%d desktop needs %u MiB in one block and the "
-                        "largest is %u MiB - using the primary monitor only\n",
-                        uw, uh, (unsigned)(need >> 20), (unsigned)(block >> 20));
-                for (int i = 1; i < display_count(); i++)
-                    if (display_at(i)) display_at(i)->enabled = 0;
-            } else {
-                fbsurf.w = uw; fbsurf.h = uh; fbsurf.stride = uw;
-                fbsurf.px = NULL;            /* the desktop has no pixels of its own */
-                multi_out = 1;
-                kprintf("gui: %d monitors - desktop %dx%d\n", nout, uw, uh);
-            }
-        }
-    }
+    gui_outputs_layout(&fbsurf);
     if (gfx_surface_init(&backsurf, fbsurf.w, fbsurf.h) != 0 ||
         gfx_surface_init(&wallsurf, fbsurf.w, fbsurf.h) != 0) {
         kprintf("gui: backbuffer OOM\n");
@@ -2934,32 +2991,13 @@ int gui_start(void) {
      * The desktop task renders chrome into it; only the taskbar strip + open
      * popup are ever composited from it.  If it OOMs we run without a panel. */
     spin_lock_init(&panel_lock);
-    {
-        int reserve = scanout.h - work_h;                   /* bottom_reserve */
-        int strip_h = reserve + PANEL_POPUP_MAX;
-        if (strip_h > scanout.h) strip_h = scanout.h;
-        panel_strip_top = scanout.h - strip_h;              /* §M88: the primary's bottom */
-        panel_buf = (uint32_t*)kmalloc((size_t)fbsurf.w * strip_h * 4);
-        if (panel_buf) {
-            panelsurf.w      = fbsurf.w;                    /* pretend full-screen */
-            panelsurf.h      = fbsurf.h;
-            panelsurf.stride = fbsurf.w;
-            panelsurf.px     = panel_buf -
-                               (size_t)panel_strip_top * fbsurf.w;
-            panelsurf.owns_px = 0;                          /* panel_buf is the base */
-            gfx_set_clip(&panelsurf, 0, panel_strip_top, fbsurf.w, strip_h);
-            gfx_fill(&panelsurf, 0, panel_strip_top, fbsurf.w, strip_h,
-                     COL_WALL_BOT);
-            panel_ready = 1;
-        } else {
-            kprintf("gui: panel surface OOM - taskbar disabled\n");
-        }
-    }
+    if (gui_panel_strip_build() != 0)
+        kprintf("gui: panel surface OOM - taskbar disabled\n");
 
     spin_lock_init(&state_lock);
     spin_lock_init(&damage_lock);
-    mx = scanout.w / 2;                  /* §M88 — the pointer starts on the primary */
-    my = scanout.h / 2;
+    mx = prim_x + scanout.w / 2;         /* §M88 — the pointer starts on the primary */
+    my = prim_y + scanout.h / 2;
 
     gui_active = 1;
     vc_screen_suppress(1);

@@ -69,8 +69,16 @@
  * >4 MiB contiguous block.  Cost of the bump: two extra free-list heads
  * per zone, and page-alloc's power-of-2 rounding wastes up to ~7 MiB on a
  * 9.2 MiB surface — acceptable for a handful of full-screen surfaces (a
- * vmalloc-style scatter mapping would remove the waste; noted for later). */
-#define BUDDY_MAX_ORDER     12
+ * vmalloc-style scatter mapping would remove the waste; noted for later).
+ *
+ * §M88 (2026-09-29) — ORDER 13 = 32 MiB.  Two 1920x1200 monitors side by side
+ * are one 3840x1200 desktop, 18.4 MiB per full-desktop surface, which the
+ * 16 MiB ceiling refused (the machine fell back to one monitor).  The waste the
+ * paragraph above accepted would now be 13.6 MiB per surface, so kmalloc hands
+ * the unused TAIL of a large block back to the buddy (kmalloc.c, "exact"
+ * allocations) — the rounding cost is gone for every caller of 1 MiB or more,
+ * not just the compositor. */
+#define BUDDY_MAX_ORDER     13
 
 /* Sanity ceiling, NOT a memory-size policy.  A corrupt or hostile memory map
  * claiming petabytes must not make us try to allocate petabytes of metadata,

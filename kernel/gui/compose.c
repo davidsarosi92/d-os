@@ -324,7 +324,21 @@ static void draw_scene_rect(const struct scene_snapshot* s,
      * under every window.  Painted per damage rect like everything else here,
      * and clipped by the same clip box, so a shortcut only costs pixels when
      * its rectangle is actually dirty. */
-    if (first == 0 && shell && shell->draw_under) shell->draw_under(&backsurf);
+    if (first == 0 && shell && shell->draw_under) {
+        /* §M88 — the icon layer belongs to the primary and is drawn in its
+         * coordinates, through a view whose clip is the damage rect moved into
+         * them (identical to backsurf when the primary is at 0,0). */
+        struct gfx_surface pv = backsurf;
+        pv.px = backsurf.px + (size_t)prim_y * backsurf.stride + prim_x;
+        pv.w = scanout.w; pv.h = scanout.h;
+        pv.clip_x0 = backsurf.clip_x0 - prim_x; pv.clip_x1 = backsurf.clip_x1 - prim_x;
+        pv.clip_y0 = backsurf.clip_y0 - prim_y; pv.clip_y1 = backsurf.clip_y1 - prim_y;
+        if (pv.clip_x0 < 0) pv.clip_x0 = 0;
+        if (pv.clip_y0 < 0) pv.clip_y0 = 0;
+        if (pv.clip_x1 > pv.w) pv.clip_x1 = pv.w;
+        if (pv.clip_y1 > pv.h) pv.clip_y1 = pv.h;
+        if (pv.clip_x1 > pv.clip_x0 && pv.clip_y1 > pv.clip_y0) shell->draw_under(&pv);
+    }
 
     for (int i = first; i < s->zn; i++) {
         struct gui_window* win = s->zsnap[i];
@@ -445,13 +459,13 @@ static void draw_scene_rect(const struct scene_snapshot* s,
     /* M22.7-B — desktop chrome (taskbar always + open popup) from panelsurf. */
     if (panel_ready) {
         spin_lock(&panel_lock);
-        gfx_blit(&backsurf, 0, work_h, &panelsurf, 0, work_h,
+        gfx_blit(&backsurf, prim_x, prim_y + work_h, &panelsurf, 0, work_h,
                  scanout.w, scanout.h - work_h);           /* §M88: the primary's strip */
         if (pnl_pop_on) {
             int py = pnl_pop_y, ph = pnl_pop_h;
             if (py < panel_strip_top) { ph -= panel_strip_top - py; py = panel_strip_top; }
             if (ph > 0)
-                gfx_blit(&backsurf, pnl_pop_x, py, &panelsurf,
+                gfx_blit(&backsurf, prim_x + pnl_pop_x, prim_y + py, &panelsurf,
                          pnl_pop_x, py, pnl_pop_w, ph);
         }
         spin_unlock(&panel_lock);
@@ -464,7 +478,7 @@ static void draw_scene_rect(const struct scene_snapshot* s,
          * does nothing.  The modal window itself never reaches this strip
          * (windows live above `work_h`), so this cannot dim the dialog. */
         if (s->modal_idx >= 0)
-            gfx_blend_fill(&backsurf, 0, work_h, scanout.w, scanout.h - work_h,
+            gfx_blend_fill(&backsurf, prim_x, prim_y + work_h, scanout.w, scanout.h - work_h,
                            COL_MODAL_DIM);
     }
 
@@ -483,7 +497,7 @@ static void draw_scene_rect(const struct scene_snapshot* s,
 static void present_rect(int x0, int y0, int x1, int y1) {
     int n = multi_out ? display_count() : 1;
     for (int i = 0; i < n; i++) {
-        int ox = 0, oy = 0, ow = scanout.w, oh = scanout.h;
+        int ox = prim_x, oy = prim_y, ow = scanout.w, oh = scanout.h;
         struct display_output* o = NULL;
         if (i > 0) {
             o = display_at(i);
@@ -494,8 +508,8 @@ static void present_rect(int x0, int y0, int x1, int y1) {
         int bx = x1 < ox + ow ? x1 : ox + ow, by = y1 < oy + oh ? y1 : oy + oh;
         if (bx <= ax || by <= ay) continue;
         if (i == 0) {
-            gfx_blit(&scanout, ax, ay, &backsurf, ax, ay, bx - ax, by - ay);
-            fb_present_flush(ax, ay, bx - ax, by - ay);
+            gfx_blit(&scanout, ax - ox, ay - oy, &backsurf, ax, ay, bx - ax, by - ay);
+            fb_present_flush(ax - ox, ay - oy, bx - ax, by - ay);
         } else {
             struct gfx_surface v = { .w = ow, .h = oh, .stride = o->stride, .px = o->px };
             gfx_clear_clip(&v);
@@ -602,7 +616,7 @@ void compose(void) {
          * the part of the window under it was neither copied nor repainted,
          * and a drag across left a trail of its contents on the second
          * screen.  Such a move takes the painter, which is always right. */
-        !(multi_out && (mh.oy + mh.h > work_h || mh.ny + mh.h > work_h))) {
+        !(multi_out && (mh.oy + mh.h > prim_y + work_h || mh.ny + mh.h > prim_y + work_h))) {
         fast = 1;
         bx0 = (mh.ox < mh.nx ? mh.ox : mh.nx) - 2;
         by0 = (mh.oy < mh.ny ? mh.oy : mh.ny) - 2;
@@ -657,8 +671,8 @@ void compose(void) {
         if (t < -shy) t = -shy;
         if (r > fbsurf.w) r = fbsurf.w;
         if (r > fbsurf.w - shx) r = fbsurf.w - shx;
-        if (b > work_h) b = work_h;
-        if (b > work_h - shy) b = work_h - shy;
+        if (b > prim_y + work_h) b = prim_y + work_h;
+        if (b > prim_y + work_h - shy) b = prim_y + work_h - shy;
 
         if (r - l > 0 && b - t > 0) {
             gfx_move_within(&backsurf, l, t, l + shx, t + shy, r - l, b - t);
@@ -859,8 +873,8 @@ int paint_wallpaper(void) {
     /* Desktop milestone label — sizes itself to the string so any DOS_MILESTONE
      * length stays right-aligned (see kernel/includes/version.h). */
     int lbl_w = 0; for (const char* p = DOS_LABEL; *p; p++) lbl_w++;
-    int lx = scanout.w - lbl_w * GFX_GLYPH_W - 12;       /* §M88: on the primary */
-    int ly = work_h - GFX_GLYPH_H - 8;
+    int lx = prim_x + scanout.w - lbl_w * GFX_GLYPH_W - 12;   /* §M88: on the primary */
+    int ly = prim_y + work_h - GFX_GLYPH_H - 8;
     /* A photograph can be any colour under the text, so give the label its own
      * dim backing rather than trusting contrast that the gradient guaranteed
      * and an arbitrary image does not. */

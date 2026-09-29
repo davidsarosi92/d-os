@@ -244,6 +244,9 @@ void gui_wheel(int dz) {
     need_frame = 1;
 }
 void pevq_push(uint8_t type, int x, int y) {
+    /* §M88 — the shell works in the PRIMARY's coordinates; a key event carries
+     * a keycode in x/y, not a position. */
+    if (type != PEV_DESK_KEY) { x -= prim_x; y -= prim_y; }
     uint32_t n = (pevq_h + 1) % PEVQ_SZ;
     if (n == pevq_t) return;
     pevq[pevq_h].type = type;
@@ -257,7 +260,8 @@ static int in_panel_region(int x, int y) {
     /* §M88 — the taskbar strip is the PRIMARY's bottom, not every row below
      * work_h: with a monitor below the primary, "y >= work_h" was the whole
      * second screen. */
-    if (y >= work_h && y < scanout.h && x < scanout.w) return 1;
+    x -= prim_x; y -= prim_y;             /* the primary's coordinates */
+    if (y >= work_h && y < scanout.h && x >= 0 && x < scanout.w) return 1;
     if (pnl_pop_on && x >= pnl_pop_x && x < pnl_pop_x + pnl_pop_w &&
         y >= pnl_pop_y && y < pnl_pop_y + pnl_pop_h) return 1;
     return 0;

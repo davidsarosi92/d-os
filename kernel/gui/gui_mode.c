@@ -35,6 +35,7 @@
 #include "pmm.h"
 #include "config.h"
 #include "lock.h"
+#include "display.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -79,38 +80,54 @@ int gui_request_mode(int w, int h) {
 
 int gui_current_mode(int* w, int* h) {
     if (!gui_active) return -1;
-    if (w) *w = fbsurf.w;
-    if (h) *h = fbsurf.h;
+    if (w) *w = scanout.w;              /* §M88 — the PRIMARY's mode */
+    if (h) *h = scanout.h;
     return 0;
 }
 
-/* Re-establish every screen-sized thing after the display changed size. */
+/* Re-establish every screen-sized thing after the display changed size — or
+ * after the monitors were re-arranged (§M88), which is the same work: the
+ * desktop is re-derived from the primary and the other outputs by the ONE
+ * function that also builds it at start (gui_outputs_layout).
+ *
+ * Allocate the new buffers BEFORE freeing the old ones: an OOM must leave a
+ * working desktop, not a compositor with no backbuffer.  If the arrangement's
+ * desktop cannot be had, the primary alone is tried before giving up — and if
+ * even that fails, the old buffers stay, with the secondaries switched off so
+ * nothing presents from outside them. */
 static int mode_rebuild_surfaces(void) {
     struct gfx_surface newfb;
     if (gfx_fb_surface(&newfb) != 0) return -1;
+    struct gfx_surface prim = newfb;
+    gui_outputs_layout(&newfb);
 
-    /* Allocate the new buffers BEFORE freeing the old ones: an OOM must leave a
-     * working desktop, not a compositor with no backbuffer. */
     struct gfx_surface nback, nwall;
-    if (gfx_surface_init(&nback, newfb.w, newfb.h) != 0) return -2;
-    if (gfx_surface_init(&nwall, newfb.w, newfb.h) != 0) {
-        gfx_surface_free(&nback);
-        return -3;
+    int ok = gfx_surface_init(&nback, newfb.w, newfb.h) == 0;
+    if (ok && gfx_surface_init(&nwall, newfb.w, newfb.h) != 0) { gfx_surface_free(&nback); ok = 0; }
+    if (!ok && multi_out) {
+        kprintf("gui: no memory for a %dx%d desktop - using the primary monitor only\n",
+                newfb.w, newfb.h);
+        gui_outputs_primary_only();
+        newfb = prim;
+        ok = gfx_surface_init(&nback, newfb.w, newfb.h) == 0;
+        if (ok && gfx_surface_init(&nwall, newfb.w, newfb.h) != 0) { gfx_surface_free(&nback); ok = 0; }
+    }
+    if (!ok) {
+        gui_outputs_primary_only();
+        return -2;
     }
 
     gfx_surface_free(&backsurf);
     gfx_surface_free(&wallsurf);
     fbsurf   = newfb;
-    scanout  = newfb;                   /* §M88 — one output: the same surface */
-    scanout.owns_px = 0;
     backsurf = nback;
     wallsurf = nwall;
     flip_ok  = 0;                       /* the flip belonged to the old size */
 
     /* The page flip's second buffer is derived from the geometry, so it has to
      * be re-established — and if it cannot be, the single-buffer path is still
-     * correct (it only shears). */
-    {
+     * correct (it only shears).  §M88: only with ONE output. */
+    if (!multi_out) {
         volatile uint32_t* b0; volatile uint32_t* b1;
         if (fb_flip_init(&b0, &b1) == 0) {
             for (int i = 0; i < 2; i++) { flipbuf[i] = fbsurf; flipbuf[i].owns_px = 0; }
@@ -121,53 +138,47 @@ static int mode_rebuild_surfaces(void) {
         }
     }
 
-    /* Chrome: the shell recomputes its layout from the new size. */
-    if (shell && shell->init) shell->init(fbsurf.w, fbsurf.h);
-    work_h = fbsurf.h -
+    /* Chrome: the shell recomputes its layout from the PRIMARY's size. */
+    if (shell && shell->init) shell->init(scanout.w, scanout.h);
+    work_h = scanout.h -
              ((shell && shell->bottom_reserve) ? shell->bottom_reserve() : 0);
     gmax_cols = fbsurf.w / cp_cell_w();
     gmax_rows = fbsurf.h / cp_cell_h();
 
-    /* The panel strip is screen-addressed and screen-wide. */
-    {
-        int reserve  = fbsurf.h - work_h;
-        int strip_h  = reserve + PANEL_POPUP_MAX;
-        if (strip_h > fbsurf.h) strip_h = fbsurf.h;
-        uint32_t* nbuf = (uint32_t*)kmalloc((size_t)fbsurf.w * strip_h * 4);
-        if (nbuf) {
-            spin_lock(&panel_lock);
-            uint32_t* old = panel_buf;
-            panel_buf = nbuf;
-            panel_strip_top = fbsurf.h - strip_h;
-            panelsurf.w = fbsurf.w;
-            panelsurf.h = fbsurf.h;
-            panelsurf.stride = fbsurf.w;
-            panelsurf.px = panel_buf - (size_t)panel_strip_top * fbsurf.w;
-            panelsurf.owns_px = 0;
-            gfx_set_clip(&panelsurf, 0, panel_strip_top, fbsurf.w, strip_h);
-            gfx_fill(&panelsurf, 0, panel_strip_top, fbsurf.w, strip_h, COL_WALL_BOT);
-            panel_ready = 1;
-            spin_unlock(&panel_lock);
-            if (old) kfree(old);
-        }
-    }
+    if (gui_panel_strip_build() != 0)
+        kprintf("gui: panel strip OOM - the taskbar keeps its old size\n");
 
     paint_wallpaper();
+
+    /* The pointer may now be over a gap or off the desktop. */
+    if (mx >= fbsurf.w || my >= fbsurf.h || (multi_out && display_at_point(mx, my) < 0)) {
+        mx = prim_x + scanout.w / 2;
+        my = prim_y + scanout.h / 2;
+    }
     return 0;
 }
 
-/* Clamp every window into the new screen.  A window at x=1700 on a 1024-wide
- * display is unreachable — and unreachable is indistinguishable from lost. */
+/* Put every window back onto a monitor.  A window at x=1700 on a 1024-wide
+ * display is unreachable — and unreachable is indistinguishable from lost.
+ * §M88: "on a monitor" is the monitor under the window's centre, or the
+ * primary when that point is on none (a monitor switched off, or a gap). */
 static void mode_clamp_windows(void) {
     for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
         struct gui_window* w = &windows[i];
         if (!w->used) continue;
-        if (w->w > fbsurf.w) w->w = fbsurf.w;
-        if (w->h > work_h)   w->h = work_h;
-        if (w->x + w->w > fbsurf.w) w->x = fbsurf.w - w->w;
-        if (w->y + w->h > work_h)   w->y = work_h - w->h;
-        if (w->x < 0) w->x = 0;
-        if (w->y < 0) w->y = 0;
+        int cx = w->x + w->w / 2, cy = w->y + w->h / 2;
+        if (cx < 0 || cy < 0 || cx >= fbsurf.w || cy >= fbsurf.h ||
+            (multi_out && display_at_point(cx, cy) < 0)) {
+            cx = prim_x + scanout.w / 2; cy = prim_y + work_h / 2;
+        }
+        int ax, ay, aw, ah;
+        gui_output_workarea(cx, cy, &ax, &ay, &aw, &ah);
+        if (w->w > aw) w->w = aw;
+        if (w->h > ah) w->h = ah;
+        if (w->x + w->w > ax + aw) w->x = ax + aw - w->w;
+        if (w->y + w->h > ay + ah) w->y = ay + ah - w->h;
+        if (w->x < ax) w->x = ax;
+        if (w->y < ay) w->y = ay;
         /* A client-managed window must be TOLD, or it keeps painting at the old
          * size — §4.60 built exactly this notification for the resize grip, and
          * a mode change is the same event from a different cause. */
@@ -178,21 +189,46 @@ static void mode_clamp_windows(void) {
     }
 }
 
+/* §M88 rung (2026-09-29) — RE-ARRANGE THE MONITORS WHILE THE DESKTOP RUNS.
+ * A `display.*` setting used to apply at the next desktop start.  It is the
+ * same rebuild as a mode change minus the mode set, so it is queued the same
+ * way and applied between frames on the compositor task. */
+static volatile int outputs_req = 0;
+
+void gui_request_outputs(void) {
+    if (!gui_active) return;
+    outputs_req = 1;
+    need_frame = 1;
+}
+
+void apply_outputs_change(void) {
+    if (!outputs_req) return;
+    outputs_req = 0;
+    if (mode_rebuild_surfaces() != 0) {
+        kprintf("gui: re-arranging the monitors failed - unchanged\n");
+        return;
+    }
+    mode_clamp_windows();
+    gui_damage_all();
+    kprintf("gui: monitors re-arranged - desktop %dx%d, primary at %d,%d\n",
+            fbsurf.w, fbsurf.h, prim_x, prim_y);
+}
+
+static void outputs_conf_changed(const char* k, const char* v) {
+    (void)k; (void)v;
+    gui_request_outputs();
+}
+CONFIG_WATCH(outputs_watch) = { .prefix = "display.", .changed = outputs_conf_changed };
+
 void apply_mode_change(void) {
     int rw = mode_req_w, rh = mode_req_h;
     if (!rw || !rh) return;
     mode_req_w = mode_req_h = 0;
-    /* §M88 — REFUSED, and said so, while more than one monitor is in use: the
-     * rebuild below re-derives the desktop from the primary alone and would
-     * drop the second monitor out of it.  Per-output mode setting is PLAN
-     * §M88's later rung. */
-    if (multi_out) {
-        kprintf("gui: resolution changes with more than one monitor are not "
-                "supported yet - unchanged\n");
-        return;
-    }
+    /* §M88 — with more than one monitor this changes the PRIMARY; the rebuild
+     * re-derives the desktop around it (it used to be refused, because the
+     * rebuild knew only the primary and would have dropped the others). */
 
-    int prev_w = fbsurf.w, prev_h = fbsurf.h;
+    int prev_w = scanout.w, prev_h = scanout.h;       /* §M88 — the primary, not the desktop */
     if (fb_mode_set((uint32_t)rw, (uint32_t)rh, 32) != 0) {
         kprintf("gui: display refused %dx%d - unchanged\n", rw, rh);
         return;
@@ -224,9 +260,9 @@ void apply_mode_change(void) {
     }
     mode_clamp_windows();
     gui_damage_all();
-    kprintf("gui: mode %dx%d\n", fbsurf.w, fbsurf.h);
+    kprintf("gui: mode %dx%d\n", scanout.w, scanout.h);
     if (mode_pending_confirm && mode_applied_cb)
-        mode_applied_cb(fbsurf.w, fbsurf.h);
+        mode_applied_cb(scanout.w, scanout.h);
 }
 
 /* Restore the mode + window geometry saved before the last change.
@@ -260,7 +296,7 @@ void apply_mode_revert(void) {
     mode_pending_confirm = 0;
     mode_prev_w = mode_prev_h = 0;
     gui_damage_all();
-    kprintf("gui: reverted to %dx%d\n", fbsurf.w, fbsurf.h);
+    kprintf("gui: reverted to %dx%d\n", scanout.w, scanout.h);
 }
 
 void gui_mode_confirm(void) { mode_pending_confirm = 0; mode_prev_w = mode_prev_h = 0; }

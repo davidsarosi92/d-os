@@ -40,7 +40,7 @@ static int sames(const char* a, const char* b) {
 }
 
 int display_arrange(void) {
-    int right_edge = 0, bottom_edge = 0, n = 0;
+    int right_edge = 0, bottom_edge = 0, left_edge = 0, top_edge = 0, n = 0;
     for (int i = 0; i < g_n; i++) {
         struct display_output* o = g_out[i];
         if (!o) continue;
@@ -62,13 +62,63 @@ int display_arrange(void) {
         if (sames(pos, "below")) {
             o->x = 0; o->y = bottom_edge;
             bottom_edge += o->h;
+        } else if (sames(pos, "left")) {
+            left_edge -= o->w;
+            o->x = left_edge; o->y = 0;
+        } else if (sames(pos, "above")) {
+            top_edge -= o->h;
+            o->x = 0; o->y = top_edge;
         } else {                                  /* "right" and anything unknown */
             o->x = right_edge; o->y = 0;
             right_edge += o->w;
         }
         n++;
     }
+    /* §M88 rung (2026-09-29) — LEFT and ABOVE put an output at a negative
+     * position relative to the primary; the desktop's pixels start at (0,0),
+     * so everything is shifted until the leftmost/topmost edge is 0.  The
+     * primary then sits at (-left_edge, -top_edge) — the compositor reads that
+     * back as its `prim_x/prim_y` and keeps the shell, new windows and the
+     * taskbar in the primary's own coordinates (gui_priv.h). */
+    if (left_edge || top_edge)
+        for (int i = 0; i < g_n; i++)
+            if (g_out[i] && g_out[i]->enabled) { g_out[i]->x -= left_edge; g_out[i]->y -= top_edge; }
     return n;
+}
+
+/* "1920x1200" -> 1920, 1200; 0 on success. */
+static int parse_mode(const char* s, int* w, int* h) {
+    int a = 0, b = 0;
+    if (!s || *s < '0' || *s > '9') return -1;
+    while (*s >= '0' && *s <= '9') a = a * 10 + (*s++ - '0');
+    if (*s != 'x' && *s != 'X') return -1;
+    s++;
+    if (*s < '0' || *s > '9') return -1;
+    while (*s >= '0' && *s <= '9') b = b * 10 + (*s++ - '0');
+    if (*s || a < 320 || b < 200 || a > 4096 || b > 4096) return -1;
+    *w = a; *h = b;
+    return 0;
+}
+
+void display_apply_modes(void) {
+    for (int i = 1; i < g_n; i++) {
+        struct display_output* o = g_out[i];
+        if (!o || !o->set_mode) continue;
+        char key[48] = "display.";
+        int k = 8;
+        for (int j = 0; o->name[j] && k < 40; j++) key[k++] = o->name[j];
+        const char* suf = ".mode";
+        for (int j = 0; suf[j]; j++) key[k++] = suf[j];
+        key[k] = 0;
+        const char* m = config_get(key, "");
+        int w, h;
+        if (!m || !m[0] || parse_mode(m, &w, &h) != 0) continue;
+        if (w == o->w && h == o->h) continue;
+        if (o->set_mode(o, w, h) == 0)
+            kprintf("display: '%s' now %dx%d (%s)\n", o->name, o->w, o->h, key);
+        else
+            kprintf("display: '%s' refused %dx%d - keeping %dx%d\n", o->name, w, h, o->w, o->h);
+    }
 }
 
 void display_union(int* w, int* h) {
@@ -153,8 +203,14 @@ SETTINGS_PANEL(sp_monitors) = {
     .live    = mon_live,
 };
 
+CONFIG_KEY(ck_disp1_mode) = {
+    .key = "display.bochs1.mode", .group = "Monitors", .type = CFG_ENUM,
+    .values = "1280x800 1024x768 1600x900 1920x1080 1920x1200", .def = "1280x800",
+    .help = "the second monitor's resolution (applies when the desktop starts)",
+};
+
 CONFIG_KEY(ck_disp1_pos) = {
     .key = "display.bochs1.position", .group = "Monitors", .type = CFG_ENUM,
-    .values = "right below off", .def = "right",
-    .help = "where the second monitor sits: right of the primary, below it, or off (applies when the desktop starts)",
+    .values = "right left below above off", .def = "right",
+    .help = "where the second monitor sits beside the primary, or off (applies when the desktop starts)",
 };

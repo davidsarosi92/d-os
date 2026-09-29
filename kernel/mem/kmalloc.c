@@ -37,6 +37,7 @@
 #include "slab.h"
 #include "pmm.h"
 #include "printf.h"
+#include "lock.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -59,6 +60,32 @@ static uint32_t big_allocs   = 0;
 static uint32_t big_bytes    = 0;     /* sum of order_to_bytes for live big allocs */
 
 static int initialized = 0;
+
+/* §M88 (2026-09-29) — EXACT LARGE ALLOCATIONS.  The buddy rounds to a power of
+ * two, so an 18.4 MiB surface took a 32 MiB block and wasted 13.6 MiB.  From
+ * EXACT_MIN_ORDER up, the unused tail goes straight back to the buddy (the
+ * Linux alloc_pages_exact shape) and the allocation is remembered here by its
+ * page count, which kfree needs because the block is no longer one order.
+ * Below the threshold nothing changes: those are the hot paths, and their
+ * waste is at most half a megabyte.  The table is small because allocations
+ * this big are few (surfaces, the page cache's large buffers); when it is
+ * full the block is simply kept whole — correct, only wasteful. */
+#define BIG_EXACT        0xFDu
+#define EXACT_MIN_ORDER  8               /* 1 MiB */
+#define EXACT_SLOTS      64
+static struct { uint32_t pfn, pages; } g_exact[EXACT_SLOTS];
+static spinlock_t g_exact_lock = SPINLOCK_INIT;
+
+/* Free [pfn, pfn+n) as the largest aligned buddy blocks that fit. */
+static void free_frame_range(uint32_t pfn, uint32_t n) {
+    while (n) {
+        int o = BUDDY_MAX_ORDER;
+        while (o > 0 && (((pfn & ((1u << o) - 1)) != 0) || (1u << o) > n)) o--;
+        page_free((pmm_phys_t)pfn << 12, o);
+        pfn += 1u << o;
+        n   -= 1u << o;
+    }
+}
 
 /* -------------------------------------------------------------------------- */
 /* Small helpers.                                                             */
@@ -134,6 +161,21 @@ void* kmalloc(size_t size) {
         page_free(phys, order);
         return NULL;
     }
+    uint32_t pages = (uint32_t)((size + 4095u) >> 12);
+    if (order >= EXACT_MIN_ORDER && pages < (1u << order)) {
+        int slot = -1;
+        uint32_t fl = spin_lock_irqsave(&g_exact_lock);
+        for (int i = 0; i < EXACT_SLOTS; i++)
+            if (!g_exact[i].pages) { slot = i; g_exact[i].pfn = (uint32_t)(phys >> 12); g_exact[i].pages = pages; break; }
+        spin_unlock_irqrestore(&g_exact_lock, fl);
+        if (slot >= 0) {
+            free_frame_range((uint32_t)(phys >> 12) + pages, (1u << order) - pages);
+            big_alloc_order[phys >> 12] = BIG_EXACT;
+            big_allocs++;
+            big_bytes += pages * 4096u;
+            return phys_to_virt(phys);
+        }
+    }
     big_alloc_order[phys >> 12] = (uint8_t)order;
     big_allocs++;
     big_bytes += (1u << order) * 4096u;
@@ -189,6 +231,19 @@ void kfree(void* p) {
         return;
     }
 
+    if (big_alloc_order[pfn] == BIG_EXACT) {
+        uint32_t pages = 0;
+        uint32_t fl = spin_lock_irqsave(&g_exact_lock);
+        for (int i = 0; i < EXACT_SLOTS; i++)
+            if (g_exact[i].pages && g_exact[i].pfn == pfn) { pages = g_exact[i].pages; g_exact[i].pages = 0; break; }
+        spin_unlock_irqrestore(&g_exact_lock, fl);
+        big_alloc_order[pfn] = BIG_NONE;
+        if (!pages) { kprintf("kfree: exact allocation %p has no record - leaked\n", p); return; }
+        if (big_allocs) big_allocs--;
+        if (big_bytes >= pages * 4096u) big_bytes -= pages * 4096u;
+        free_frame_range(pfn, pages);
+        return;
+    }
     int order = big_alloc_order[pfn];
     big_alloc_order[pfn] = BIG_NONE;
     if (big_allocs) big_allocs--;

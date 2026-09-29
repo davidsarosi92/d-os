@@ -728,6 +728,9 @@ struct gui_window* window_alloc(const char* title, enum win_kind kind,
     }
 
     win->kind = kind;
+    /* §M88 — an app places its window in the PRIMARY's coordinates (it centres
+     * on gui_screen_w/h); the desktop may start further left or up. */
+    x += prim_x;  y += prim_y;
     win->x = x;  win->y = y;  win->w = w;  win->h = h;
     win->pending_w = win->pending_h = 0;
     win->want_close = 0;

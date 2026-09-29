@@ -20,8 +20,9 @@
  * copy of what changed — the shape virtio-gpu already has, so the compositor
  * cannot tell the outputs apart.
  *
- * The mode is fixed at DISPLAY2_W x DISPLAY2_H in this first cut (PLAN §M88,
- * rung 5: per-output mode setting comes later).
+ * It comes up at DISPLAY2_W x DISPLAY2_H; `display.bochs1.mode` changes it when
+ * the desktop starts (bo_set_mode — the whole VRAM window is mapped at init, so
+ * a larger mode needs no new mapping).
  * ============================================================================= */
 
 #include "driver.h"
@@ -56,6 +57,7 @@ static volatile uint16_t* g_regs;
 static volatile uint32_t* g_vram;
 static struct display_output g_out;
 static int g_bdf = -1;
+static uint64_t g_fblen;             /* the mapped VRAM, bytes */
 
 /* aarch64's primary bochs driver overrides this with the BDF it drives; on
  * every other machine no bochs-display is the primary. */
@@ -95,6 +97,47 @@ static void bo_flush(struct display_output* o, int x, int y, int w, int h) {
     }
 }
 
+/* Program the DISPI registers for w x h x 32 and read them BACK — the device
+ * clamps what it cannot do.  1 when the device took exactly that mode. */
+static int bo_program(int w, int h) {
+    wr(DISPI_ENABLE, 0);
+    wr(DISPI_BPP, 32);
+    wr(DISPI_XRES, (uint16_t)w);
+    wr(DISPI_YRES, (uint16_t)h);
+    wr(DISPI_VWIDTH, (uint16_t)w);
+    wr(DISPI_VHEIGHT, (uint16_t)h);
+    wr(DISPI_XOFF, 0);
+    wr(DISPI_YOFF, 0);
+    wr(DISPI_ENABLE, DISPI_ENABLED | DISPI_LFB);
+    return rd(DISPI_XRES) == w && rd(DISPI_YRES) == h && rd(DISPI_BPP) == 32;
+}
+
+/* §M88 rung — a new mode.  The new shadow is allocated BEFORE the device is
+ * touched, so running out of memory leaves the monitor exactly as it was; a
+ * mode the device clamps is undone the same way (§M61's rule, per output). */
+static int bo_set_mode(struct display_output* o, int w, int h) {
+    uint64_t need = (uint64_t)w * (uint64_t)h * 4u;
+    if (need > g_fblen) {
+        kprintf("bochs_out: %dx%d needs %u KiB of VRAM, the device has %u\n",
+                w, h, (unsigned)(need >> 10), (unsigned)(g_fblen >> 10));
+        return -1;
+    }
+    uint32_t* shadow = (uint32_t*)kmalloc((size_t)need);
+    if (!shadow) return -1;
+    int ow = o->w, oh = o->h;
+    if (!bo_program(w, h)) {
+        bo_program(ow, oh);
+        kfree(shadow);
+        return -1;
+    }
+    for (size_t i = 0; i < (size_t)w * h; i++) shadow[i] = 0xFF101820u;
+    uint32_t* old = o->px;
+    o->px = shadow; o->w = w; o->h = h; o->stride = w;
+    kfree(old);
+    bo_flush(o, 0, 0, w, h);
+    return 0;
+}
+
 static int bo_init(void* ctx) {
     (void)ctx;
     struct bo_find f = { .found = 0 };
@@ -117,7 +160,10 @@ static int bo_init(void* ctx) {
         return -1;
     }
     drv_handle hr = drv_mmio_request(&rt, mm, 4096, "bochs_out registers");
-    drv_handle hf = drv_mmio_request(&rt, fb, (size_t)need, "bochs_out framebuffer");
+    /* The WHOLE window, so a later bo_set_mode to a larger mode needs no new
+     * mapping (bochs-display's VRAM is 16 MiB by default). */
+    g_fblen = fblen > (32ull << 20) ? (32ull << 20) : fblen;
+    drv_handle hf = drv_mmio_request(&rt, fb, (size_t)g_fblen, "bochs_out framebuffer");
     if (hr < 0 || hf < 0) { kprintf("bochs_out: MMIO refused (%d, %d)\n", hr, hf); return -1; }
     g_regs = (volatile uint16_t*)((volatile uint8_t*)drv_mmio_ptr(hr) + DISPI_MMIO);
     g_vram = (volatile uint32_t*)drv_mmio_ptr(hf);
@@ -131,15 +177,7 @@ static int bo_init(void* ctx) {
         kprintf("bochs_out: DISPI id reads %x - register window not decoding\n", id);
         return -1;
     }
-    wr(DISPI_ENABLE, 0);
-    wr(DISPI_BPP, 32);
-    wr(DISPI_XRES, DISPLAY2_W);
-    wr(DISPI_YRES, DISPLAY2_H);
-    wr(DISPI_VWIDTH, DISPLAY2_W);
-    wr(DISPI_VHEIGHT, DISPLAY2_H);
-    wr(DISPI_XOFF, 0);
-    wr(DISPI_YOFF, 0);
-    wr(DISPI_ENABLE, DISPI_ENABLED | DISPI_LFB);
+    bo_program(DISPLAY2_W, DISPLAY2_H);
     int w = rd(DISPI_XRES), h = rd(DISPI_YRES);   /* read BACK: the device clamps */
     if (w != DISPLAY2_W || h != DISPLAY2_H || rd(DISPI_BPP) != 32) {
         kprintf("bochs_out: asked for %dx%d, the device reports %dx%d - not used\n",
@@ -152,7 +190,7 @@ static int bo_init(void* ctx) {
     for (size_t i = 0; i < (size_t)w * h; i++) shadow[i] = 0xFF101820u;   /* dark, not black */
 
     g_out = (struct display_output){ .w = w, .h = h, .px = shadow, .stride = w,
-                                     .flush = bo_flush };
+                                     .flush = bo_flush, .set_mode = bo_set_mode };
     const char* nm = "bochs1";
     for (int i = 0; nm[i]; i++) g_out.name[i] = nm[i];
     bo_flush(&g_out, 0, 0, w, h);

@@ -318,6 +318,17 @@ extern int multi_out;
  * primary's. */
 void gui_output_workarea(int x, int y, int* ox, int* oy, int* ow, int* oh);
 extern int  work_h;                    /* screen minus the shell's chrome     */
+/* §M88 rung (2026-09-29) — where the PRIMARY's top-left sits in the desktop.
+ * 0,0 unless a monitor is arranged left of or above it.  The shell, the
+ * taskbar, `work_h`, the popup extents and every window an app places are in
+ * the PRIMARY's coordinates; the compositor adds these where it meets desktop
+ * coordinates (window_alloc, the panel blits, the icon layer's view, the pointer
+ * events handed to the shell, the primary's present). */
+extern int  prim_x, prim_y;
+void gui_outputs_layout(struct gfx_surface* fb);   /* gui.c — primary fb in, desktop out */
+void gui_outputs_primary_only(void);
+int  gui_panel_strip_build(void);
+void apply_outputs_change(void);                   /* gui_mode.c — a queued re-arrangement */
 extern int  gmax_cols, gmax_rows;      /* terminal grid capacity, in cells    */
 extern volatile int need_frame;
 extern const struct desktop_shell* shell;
