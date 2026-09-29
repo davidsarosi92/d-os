@@ -52,6 +52,13 @@
 
 int ctr_unpack(const char* archive, const char* root, const char* conf, const char* subtree);
 
+/* The application being installed right now ("" = none), so the shell can say
+ * "java is being installed" instead of "unknown command" — reported from use:
+ * the first boot's install takes minutes, and a command typed meanwhile was
+ * simply "unknown", which reads as "the install did not work". */
+static char g_installing[32];
+const char* apps_installing(void) { return g_installing; }
+
 static unsigned slen(const char* s) { unsigned n = 0; while (s && s[n]) n++; return n; }
 static void scpy(char* d, const char* s, unsigned cap) {
     unsigned i = 0; for (; s && s[i] && i + 1 < cap; i++) d[i] = s[i]; d[i] = 0;
@@ -186,12 +193,22 @@ static void sanitize(char* v) {
 
 /* Install `archive` as application `name`.  0 installed, 1 already there,
  * <0 refused (with the reason printed). */
+static int app_install_body(const char* archive, const char* name);
 int app_install(const char* archive, const char* name) {
     if (!name || !*name || slen(name) > 24) { kprintf("app: a name of 1..24 characters is needed\n"); return -1; }
     if (!exists(APPS_ROOT) && vfs_mkdir(APPS_ROOT) != 0) {
         kprintf("app: %s cannot be created - installed software needs the persistent disk\n", APPS_ROOT);
         return -2;
     }
+    /* Raised FIRST: even reading the image's configuration means reading the
+     * whole archive, which takes minutes for a JDK. */
+    scpy(g_installing, name, sizeof g_installing);
+    int result = app_install_body(archive, name);
+    g_installing[0] = 0;
+    return result;
+}
+
+static int app_install_body(const char* archive, const char* name) {
     char conf[96]; conf[0] = 0; scat(conf, "/tmp/.app-", sizeof conf); scat(conf, name, sizeof conf); scat(conf, ".conf", sizeof conf);
     vfs_mkdir("/tmp");
     if (ctr_unpack(archive, "-", conf, NULL) != 0) { kprintf("app: %s could not be read as an image\n", archive); return -3; }
@@ -215,6 +232,16 @@ int app_install(const char* archive, const char* name) {
     char base[128], dest[192];
     base[0] = 0; scat(base, APPS_ROOT "/", sizeof base); scat(base, name, sizeof base);
     dest[0] = 0; scat(dest, base, sizeof dest); scat(dest, "/", sizeof dest); scat(dest, ver, sizeof dest);
+    /* INSTALLED means the record written LAST exists — not merely the
+     * directory.  A machine switched off half way through leaves a partial
+     * tree, and taking that for an installed program would make the next
+     * boot report success over a JDK with holes in it.  So: no record, the
+     * tree goes and the install starts again. */
+    char rec[224]; rec[0] = 0; scat(rec, dest, sizeof rec); scat(rec, "/.app", sizeof rec);
+    if (exists(dest) && !exists(rec)) {
+        kprintf("app: %s %s was left half-installed (interrupted?) - removing it and installing again\n", name, ver);
+        vfs_unlink_recursive(dest);
+    }
     if (exists(dest)) {
         kprintf("app: %s %s is already installed at %s\n", name, ver, dest);
         vfs_unlink(conf);
@@ -252,6 +279,7 @@ int app_install(const char* archive, const char* name) {
 }
 
 static void app_list(void) {
+    if (g_installing[0]) kprintf("  %s: INSTALLING NOW - it appears in /bin when this finishes\n", g_installing);
     struct file* d = vfs_open(APPS_ROOT, VFS_RDONLY);
     if (!d) { kprintf("no installed applications (%s does not exist)\n", APPS_ROOT); return; }
     struct dirent de;
@@ -342,7 +370,8 @@ static void apps_boot_entry(void) {
         if (exists(mark)) continue;
         scpy(name, files[i], sizeof name);
         name[slen(name) - 4] = 0;                          /* "java.tar" -> "java" */
-        kprintf("apps: %s was delivered and is not installed yet - installing it now\n", path);
+        kprintf("apps: %s was delivered and is not installed yet - installing it now "
+                "(this takes a few minutes on first boot; `app list` shows when it is ready)\n", path);
         int r = app_install(path, name);
         if (r >= 0) write_small(mark, "installed\n");
     }

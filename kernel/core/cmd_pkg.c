@@ -262,7 +262,17 @@ int shell_run_from_path(const char* line) {
             if (vfs_stat(path, &st) == 0 && !st.is_dir) break;
             path[0] = 0;
         }
-        if (!path[0]) return 0;
+        if (!path[0]) {
+            /* Not there — but perhaps not there YET. */
+            extern const char* apps_installing(void);
+            const char* inst = apps_installing();
+            if (inst && inst[0]) {
+                kprintf("%s: not found - '%s' is being installed right now; try again in a few "
+                        "minutes (`app list` shows when it is ready)\n", argv[0], inst);
+                return 1;
+            }
+            return 0;
+        }
     }
     if (vfs_realpath(path, real, sizeof real) != 0) { int k = 0; for (; path[k]; k++) real[k] = path[k]; real[k] = 0; }
 
