@@ -2756,7 +2756,7 @@ int gui_start(void) {
     if (!in_session_leader) {
         const char* al = users_autologin_account();
         if (al) {
-            kprintf("gui: autologin to '%s' (it has no password)\n", al);
+            kprintf("gui: autologin to '%s'\n", al);
             gui_session_restart_as(al);
             return 0;
         }

@@ -537,11 +537,11 @@ static void del_answered(int answer, void* ctx) {
 
 /* §M81 — SIGN THIS ACCOUNT IN WITHOUT ASKING.
  *
- * Asked for from use, with the condition attached: *only a passwordless account
- * may be chosen for this.*  That is the right condition and it is enforced by
- * `users_autologin_account()` as well, because a gate the BUTTON keeps is a
- * gate that only applies to people who use the button — `setconf` reaches the
- * same key.
+ * First asked for with the condition *only a passwordless account may be
+ * chosen*; reversed from use on 2026-09-29, because the account a person wants
+ * opened for them is their own, which has a password.  The gate that remains
+ * — an administrator decides — is config.c's machine-scope check, so it holds
+ * for `setconf` as much as for this button.
  *
  * ONE BUTTON, BOTH DIRECTIONS, like the admin toggle beside it: a pair would
  * always have one member greyed, and a control whose only state is disabled is
@@ -562,8 +562,9 @@ static void act_autologin(struct w_button* b, void* ctx) {
     } else {
         n = ac_put(m, sizeof m, 0, lstr("Signing in to "));
         n = ac_put(m, sizeof m, n, u->name);
-        n = ac_put(m, sizeof m, n, lstr(" automatically from now on (it has no "
-                                   "password, so there is nothing to ask)."));
+        n = ac_put(m, sizeof m, n, lstr(" automatically at power-on.  Its "
+                                   "password still guards the lock screen and "
+                                   "sign-in after Sign out."));
     }
     (void)n;
     ac_say(m);
@@ -606,10 +607,11 @@ static void ac_update_controls(void) {
     if (ac_btn_pw)    ac_btn_pw->base.disabled    = !may_set_password(u);
     if (ac_btn_admin) ac_btn_admin->base.disabled = !may_toggle_admin(u);
     if (ac_btn_del)   ac_btn_del->base.disabled   = !may_delete(u);
-    /* Only a passwordless account, and only an admin may decide it — the same
-     * two facts `users_autologin_account()` re-checks at boot. */
+    /* A person account, and only an admin may decide it — the same facts
+     * `users_autologin_account()` and config.c's machine-scope gate re-check.
+     * (A password no longer rules it out: 2026-09-29, users.c.) */
     if (ac_btn_auto)  ac_btn_auto->base.disabled =
-        !(u && !u->has_password && me_is_admin());
+        !(u && u->type == USER_TYPE_PERSON && me_is_admin());
 
     if (!ac_detail) return;
     /* A pending answer wins over the selection description, exactly once. */

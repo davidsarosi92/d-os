@@ -66,12 +66,12 @@ a real Wi-Fi driver, and the rows under "Known defects — Open".
   installs anything in `/mnt/incoming/` not installed yet.  Replaced later by
   a TLS download.
 
-- **Autologin works only when the autologin account has NO password.**  An
-  account chosen for automatic sign-in that also has a password falls back to
-  the lock screen.  Decide the rule (autologin is an explicit choice by an
-  admin and should win, with the password still guarding lock/unlock and
-  remote paths) and falsify it with `logouttest`/`gui signout` on a
-  password-protected autologin account.
+- ~~**Autologin works only when the autologin account has NO password.**~~
+  **DONE 2026-09-29:** the admin's choice wins at power-on (the key is machine
+  scope, so only an administrator can set it); the password still guards the
+  lock screen, the picker after Sign out and `login`.  Verified on i386: a
+  password-protected `dave` is signed in at boot, `gui signout` raises the
+  sign-in window.
 
 ## Queued from use (2026-09-27) — items 1-3 DONE 2026-09-28 (DOCS §4.116)
 

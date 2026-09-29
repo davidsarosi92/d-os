@@ -807,9 +807,9 @@ const char* users_default_name(void) {
  *
  *   - the named account EXISTS and is a PERSON — a system identity is not
  *     something to open a desktop as;
- *   - it has NO PASSWORD, which is the setting's whole meaning.  An account
- *     with one is saying it wants to be asked, and honouring an autologin over
- *     that would make the password decorative;
+ *   - (it used to have to have NO PASSWORD — removed 2026-09-29, see the
+ *     note in the body: the key is admin-only, so it is already the explicit
+ *     decision a password was standing in for);
  * A THIRD CONDITION WAS WRITTEN AND REMOVED, because building it proved it
  * wrong: "…and it is the only person account."  That reading of *"if there is
  * more than one user, the picker too"* is the safe-looking one, and it makes
@@ -836,12 +836,22 @@ const char* users_autologin_account(void) {
                 "own a session - asking instead\n", want);
         return NULL;
     }
-    if (u->has_password) {
-        kprintf("users: autologin names '%s', which HAS a password - asking "
-                "instead (an account with a password is asking to be asked)\n",
-                want);
-        return NULL;
-    }
+    /* §M89 follow-up (2026-09-29) — A PASSWORD NO LONGER VETOES IT.  Reported
+     * from use: autologin worked only on an account WITHOUT a password, so the
+     * one account a person actually wants opened for them — their own, which
+     * has one — could never be.  The key is MACHINE scope and config.c refuses
+     * it to anybody but an administrator, so its presence IS an admin's
+     * explicit decision that this machine opens that desktop at power-on (a
+     * machine in a locked room, a kiosk, a VM).  What the password still
+     * guards is everything that is not "the machine was switched on": the
+     * lock screen, the picker after Sign out (that path never comes here —
+     * gui_session_main starts the next session as the leader), `login` on a
+     * text console, and every remote path.  Said at boot, because a machine
+     * that signs a protected account in should say that it did. */
+    if (u->has_password)
+        kprintf("users: autologin to '%s', which has a password - an "
+                "administrator chose it; the password still guards the lock "
+                "screen, sign-in after Sign out and `login`\n", u->name);
     return u->name;
 }
 
@@ -1344,8 +1354,9 @@ SHELL_CMD(groupmod) = { "groupmod", "<group> add|del <user>", "change group memb
 CONFIG_KEY(ck_autologin) = {
     .key = "users.autologin", .group = "System", .type = CFG_STRING,
     .def = "",
-    .help = "sign in to this account without asking (it must have no password, "
-            "and be the only account)",
+    .help = "sign in to this account at power-on without asking (an "
+            "administrator's choice; its password still guards the lock screen "
+            "and sign-in after Sign out)",
     .scope = CFG_SCOPE_MACHINE,
 };
 
