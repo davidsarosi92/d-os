@@ -894,7 +894,19 @@ static struct task* spawn_common_ex(const char* name, void (*entry)(void),
     /* §M49 — bind the console HERE, before the task can be enqueued.
      * Doing it from the caller after spawn returns is an SMP race:
      * the task may already be running on another core.  Same reason
-     * start_arg is set here. */
+     * start_arg is set here.
+     *
+     * §M89 — a USER program's children (its threads, its forks, what it
+     * execs) inherit its terminal.  They used to get none, so a JVM started
+     * from a terminal printed `java -version` from its JavaMain THREAD to the
+     * machine's console — suppressed under the GUI — and the terminal showed
+     * nothing at all, which from a chair is a hang.  Kernel threads keep the
+     * explicit-only rule: a daemon spawned by a command must not write into
+     * whichever window happened to run it. */
+    {
+        struct task* sp = task_current();
+        if (!console && sp && sp->user_task) console = sp->out_console;
+    }
     t->out_console = console;
 
     str_copy_n(t->name, name, sizeof t->name);
@@ -2808,7 +2820,9 @@ void waitq_init(struct waitq* wq) {
 }
 
 uint32_t waitq_lock(struct waitq* wq) {
-    return spin_lock_irqsave(&wq->lock);
+    uint32_t f = spin_lock_irqsave(&wq->lock);
+    spin_note_owner(&wq->lock, __builtin_return_address(0));
+    return f;
 }
 
 void waitq_unlock(struct waitq* wq, uint32_t flags) {

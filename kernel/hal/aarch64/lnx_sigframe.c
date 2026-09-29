@@ -26,6 +26,7 @@
  * ============================================================================= */
 
 #include "lnx_signal.h"
+#include "lock.h"
 #include "task.h"
 #include "percpu.h"
 #include "vmm.h"
@@ -201,18 +202,33 @@ void lnx_rt_sigreturn(void* frame) {
 }
 
 /* §M89 — the INTERRUPT return path: a thread spinning in user mode gets its
- * signal here instead of at a system call it may never make.  Building the
- * frame must not sleep, so the preemption count is raised around it — which
- * makes vma_prefault decline — and a frame that would need a stack page
- * brought in is NOT built: the signal goes back to pending for the next safe
- * point (a syscall or a fault).  Picking the signal happens before that: a
- * default-fatal one ends the task right here, the same thing the §M46
- * force-kill point already does on this path. */
+ * signal here instead of at a system call it may never make.
+ *
+ * THIS IS A PREEMPTION POINT, SO IT MAY SLEEP (2026-09-29).  Every caller
+ * runs it after the EOI and after schedule_check — the task can already be
+ * switched out right here, and the §M46 force-kill ends tasks right here — and
+ * the interrupted context is USER mode, so no kernel lock is held.  That is
+ * the state Linux's exit-to-user loop handles signals in, with interrupts
+ * back on.  The first version instead raised the preemption count so a frame
+ * needing a stack page brought in was not built and the signal went back to
+ * pending.  On aarch64 the frame is ~4.7 KB (the 4 KiB FP/SIMD reserve), so it
+ * reached below the pages a thread had ever touched on EVERY delivery: the
+ * signal was re-posted forever to a thread that never makes a system call —
+ * `sigmusl` test 7 failed on every aarch64 run.  Now the ordinary delivery
+ * runs here (prefault allowed; an unusable stack kills, exactly as at a
+ * syscall).  The old non-sleeping shape stays for the one case where this
+ * is NOT a preemption point: a raised preemption count. */
 void lnx_signal_deliver_irq(void* frame) {
     struct trapframe* f = (struct trapframe*)frame;
     if (!((f->spsr & 0xF) == 0)) return;
     struct task* t = task_current();
     if (!t || !t->linux_abi || !lnx_sig_deliverable(t)) return;
+    if (preempt_count() == 0) {
+        hal_intr_enable();
+        lnx_signal_deliver(frame);
+        hal_intr_disable();
+        return;
+    }
     struct lnx_delivery d;
     if (!lnx_sig_next(t, (uintptr_t)(read_sp_el0()), &d)) return;
     this_cpu()->preempt_count++;

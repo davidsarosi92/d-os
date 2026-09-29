@@ -82,6 +82,10 @@ void spin_lock(spinlock_t* l);
  * IRQ-off, exactly like spin_lock. */
 int spin_trylock(spinlock_t* l);
 
+/* Record `site` as where `l` was last acquired — for wrappers (waitq_lock),
+ * so a stuck report names the real holder rather than the wrapper. */
+void spin_note_owner(spinlock_t* l, void* site);
+
 /* ---------------------------------------------------------------------------
  * preempt_disable / preempt_enable
  *

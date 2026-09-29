@@ -126,6 +126,30 @@ void spin_report_where(void) {
 void hal_tlb_service_pending(void) __attribute__((weak));
 void hal_tlb_service_pending(void) { }
 
+/* WHO HOLDS IT (2026-09-29).  The report above names the WAITER; a deadlock
+ * is diagnosed by the HOLDER, and on aarch64 (no NMI) the holder's CPU may be
+ * spinning somewhere silent with interrupts off.  So every acquisition leaves
+ * its call site in a small table hashed by the lock's address — one store on
+ * the hot path, no CPU-id lookup (that is an MMIO read on x86) — and the
+ * stuck report prints the entry for its lock.  A collision overwrites another
+ * lock's entry; the lock address is stored beside the site, so a stale or
+ * foreign entry is recognisable rather than misleading. */
+#define SPIN_OWNER_SLOTS 256
+static struct { spinlock_t* lock; void* site; } g_spin_owner[SPIN_OWNER_SLOTS];
+
+static inline unsigned spin_owner_slot(spinlock_t* l) {
+    uintptr_t a = (uintptr_t)l;
+    return (unsigned)((a >> 2) ^ (a >> 10)) & (SPIN_OWNER_SLOTS - 1);
+}
+
+/* Overwrite the recorded site with a more useful one — a wrapper such as
+ * waitq_lock would otherwise be recorded as the holder of every waitq. */
+void spin_note_owner(spinlock_t* l, void* site) {
+    unsigned k = spin_owner_slot(l);
+    g_spin_owner[k].lock = l;
+    g_spin_owner[k].site = site;
+}
+
 static inline void spin_acquire(spinlock_t* l, void* caller) {
     unsigned long spins = 0;
     while (!atomic_cmpxchg(&l->locked, 0, 1)) {
@@ -137,6 +161,13 @@ static inline void spin_acquire(spinlock_t* l, void* caller) {
             serial_write(" caller=");
             spin_serial_hex((uintptr_t)caller);
             serial_write(" — probable deadlock\n");
+            {
+                unsigned k = spin_owner_slot(l);
+                serial_write("   held since: ");
+                if (g_spin_owner[k].lock == l) spin_serial_hex((uintptr_t)g_spin_owner[k].site);
+                else serial_write("(unknown - slot reused)");
+                serial_write("\n");
+            }
             spin_report_where();
             /* §M47 — also record it.  The serial line above is lock-free and
              * always works; the record is what a GUI/file/network sink can
@@ -145,6 +176,11 @@ static inline void spin_acquire(spinlock_t* l, void* caller) {
                          (uintptr_t)l, 0, "spinlock spun past the sanity limit");
             spins = 0;                       /* re-arm: keep reporting while stuck */
         }
+    }
+    {
+        unsigned k = spin_owner_slot(l);
+        g_spin_owner[k].lock = l;
+        g_spin_owner[k].site = caller;
     }
 }
 

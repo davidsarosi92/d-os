@@ -191,7 +191,11 @@ int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
     hal_fpu_save(parent->fpu_state);
     for (unsigned i = 0; i < HAL_FPU_STATE_SIZE; i++)
         child->fpu_state[i] = parent->fpu_state[i];
-    task_set_reap_owned(child, 1);          /* the creator joins it */
+    /* §M89 — a Linux thread is joined through its CLEARTID futex, never by
+     * waitpid: nobody collects it, so the reaper must (it used to be
+     * reap_owned, and every JVM thread stayed a DEAD zombie).  A native
+     * in-tree-libc thread is joined with waitpid and stays owned. */
+    task_set_reap_owned(child, parent->linux_abi ? 0 : 1);
     task_release(child);
     return child->pid;
 }
