@@ -10,6 +10,7 @@
  * ============================================================================= */
 
 #include "block.h"
+#include "partition.h"
 #include "block_cache.h"
 #include "shellcmd.h"   /* §M70 — the commands register themselves */
 #include "vfs.h"
@@ -43,7 +44,7 @@ static int streq(const char* a, const char* b) {
  * than silently rounded, because a write that lands on the wrong sector
  * boundary corrupts a filesystem in a way nothing reports until much later.
  * ---------------------------------------------------------------------- */
-#define BLK_MAX_DEVFS 8
+#define BLK_MAX_DEVFS 32         /* disks + their partitions */
 static struct devfs_node blk_nodes[BLK_MAX_DEVFS];
 static int               blk_node_count;
 
@@ -70,8 +71,19 @@ static ssize_t blk_devfs_write(void* ctx, const void* buf, size_t n, uint64_t of
 int blk_register(struct block_device* dev) {
     if (!dev || !dev->name || !dev->read) return -1;
     if (blk_find(dev->name)) return -2;             /* duplicate name */
-    dev->next = head;
-    head = dev;
+    /* APPENDED, not prepended (2026-10-01).  The registry is walked by
+     * blk_mount_first to pick the boot volume, and "first" has to mean the
+     * FIRST disk: with prepending, a second exFAT disk (vdb) registered after
+     * vda became the head, and the next boot would have put /mnt — and with it
+     * every setting, account and shortcut — on the wrong disk.  It never showed
+     * while a machine had one disk.  Partitions (partition.c) register right
+     * after their disk, so a partitioned vda is tried as vda, then vda1. */
+    dev->next = NULL;
+    {
+        struct block_device** pp = &head;
+        while (*pp) pp = &(*pp)->next;
+        *pp = dev;
+    }
 
     /* Publish it as a file.  A failure here is not fatal: the block device
      * still works for mounts and for `blk`, it simply has no /dev entry —
@@ -103,6 +115,10 @@ int blk_register(struct block_device* dev) {
             (unsigned)dev->sector_count,
             (unsigned)((dev->sector_count * (uint64_t)dev->sector_size) /
                        (1024u * 1024u)));
+    /* A partition table on it?  Each partition registers as its own device
+     * (partition.c), right after its disk — so blk_mount_first, walking in
+     * registration order, tries vda and then vda1. */
+    part_scan(dev);
     return 0;
 }
 
@@ -198,6 +214,10 @@ void blk_for_each(blk_iter_fn fn, void* ctx) {
  * was not registered. */
 int blk_unregister(struct block_device* dev) {
     struct block_device** pp = &head;
+    while (*pp && *pp != dev) pp = &(*pp)->next;
+    if (!*pp) return -1;
+    part_forget(dev);                    /* its partitions go first */
+    pp = &head;                          /* part_forget edited the list */
     while (*pp && *pp != dev) pp = &(*pp)->next;
     if (!*pp) return -1;
     bcache_invalidate(dev);

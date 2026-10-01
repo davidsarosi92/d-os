@@ -28,6 +28,7 @@
 
 #include "storage.h"
 #include "block.h"
+#include "partition.h"
 #include "block_cache.h"
 #include "vfs.h"
 #include "exfat.h"
@@ -170,15 +171,19 @@ int storage_umount(const char* dev_or_path) {
 int storage_format(const char* devname, const char* label) {
     struct block_device* d = blk_find(devname);
     if (!d) return STOR_ENODEV;
-    if (vfs_mount_of_dev(devname)) return STOR_EMOUNTED;
+    if (vfs_mount_of_dev(devname) || part_mounted(d)) return STOR_EMOUNTED;
     int r = exfat_format(d, label);
+    /* A whole-disk volume over what was a partition table: the old partition
+     * devices would keep pointing into the middle of the new filesystem. */
+    if (r == 0 && !part_is(d)) part_forget(d);
     return r == 0 ? STOR_OK : r == -3 ? STOR_ENOMEM : STOR_EIO;
 }
 
 int storage_remove(const char* devname) {
-    if (!blk_find(devname)) return STOR_ENODEV;
+    struct block_device* d = blk_find(devname);
+    if (!d) return STOR_ENODEV;
     if (!ramdisk_is(devname)) return STOR_ENOTREMOVABLE;
-    if (vfs_mount_of_dev(devname)) return STOR_EMOUNTED;
+    if (vfs_mount_of_dev(devname) || part_mounted(d)) return STOR_EMOUNTED;
     return ramdisk_destroy(devname) == 0 ? STOR_OK : STOR_EIO;
 }
 
@@ -267,6 +272,16 @@ static void cmd_disk(const char* args) {
     else if (sq(w[0], "umount") && n >= 2) rc = storage_umount(w[1]);
     else if (sq(w[0], "format") && n >= 2) rc = storage_format(w[1], n >= 3 ? w[2] : "");
     else if (sq(w[0], "remove") && n >= 2) rc = storage_remove(w[1]);
+    else if (sq(w[0], "partition") && n >= 3 && (sq(w[2], "gpt") || sq(w[2], "mbr"))) {
+        /* One partition spanning the disk, then `disk format <dev>1`. */
+        struct block_device* d = blk_find(w[1]);
+        int r = d ? part_create_one(d, sq(w[2], "gpt")) : -1;
+        kprintf("disk: partition: %s\n", r == 0 ? "done - format it with `disk format <dev>1`" :
+                r == -2 ? "the disk or one of its partitions is mounted" :
+                r == -3 ? "not a 512-byte-sector disk of at least 4 MiB" :
+                !d ? "no such device" : "failed");
+        return;
+    }
     else if (sq(w[0], "sync"))             rc = storage_sync_all();
     else if (sq(w[0], "ramdisk") && n >= 2) {
         uint32_t mb = 0;
@@ -278,7 +293,8 @@ static void cmd_disk(const char* args) {
     }
     if (rc == -100) {
         kprintf("usage: disk [list | mount <dev> [path] | umount <dev|path> |\n"
-                "             format <dev> [label] | ramdisk <MiB> | remove <dev> | sync]\n");
+                "             format <dev> [label] | partition <dev> gpt|mbr |\n"
+                "             ramdisk <MiB> | remove <dev> | sync]\n");
         return;
     }
     if (rc == STOR_EHELD) {

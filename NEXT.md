@@ -30,7 +30,7 @@ driver.  The phone emulator (§M84) is not in the agreed list yet.
 After §M89 ships, the open items are worked through, not left listed: the
 autologin rule (next item), §M88's open rungs (per-output modes, live
 re-arrangement, left/above, desktops over 16 MiB, a virtio-gpu second
-scanout — DONE 2026-10-01; a taskbar per monitor still open), a second virtio-blk disk (DONE 2026-10-01), partition tables,
+scanout — DONE 2026-10-01; a taskbar per monitor still open), a second virtio-blk disk (DONE 2026-10-01), partition tables (DONE 2026-10-01),
 a real Wi-Fi driver, and the rows under "Known defects — Open".
 
 ## Queued from use (2026-09-28) — after §M89

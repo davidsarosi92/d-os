@@ -735,6 +735,7 @@ CORE_C_SRCS := \
     kernel/core/taskstat.c \
     kernel/core/sysmon.c \
     kernel/core/block.c \
+    kernel/core/partition.c \
     kernel/core/storage.c \
     kernel/drivers/block/ramdisk.c \
     kernel/core/block_cache.c \
@@ -910,6 +911,7 @@ CORE_C_SRCS := \
     kernel/core/multiboot.c \
     kernel/core/module.c \
     kernel/core/block.c \
+    kernel/core/partition.c \
     kernel/core/storage.c \
     kernel/drivers/block/ramdisk.c \
     kernel/core/task.c \
@@ -1092,6 +1094,7 @@ CORE_C_SRCS := \
     kernel/core/taskstat.c \
     kernel/core/sysmon.c \
     kernel/core/block.c \
+    kernel/core/partition.c \
     kernel/core/storage.c \
     kernel/drivers/block/ramdisk.c \
     kernel/core/block_cache.c \
