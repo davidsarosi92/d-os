@@ -278,6 +278,13 @@ if [ "$ARCH" = "aarch64" ]; then
         DISK_ARGS="-drive file=$DISK,if=none,id=hd0,format=raw \
                    -device virtio-blk-device,drive=hd0"
     fi
+    # A second disk (vdb) when asked for: DOS_DISK2=<raw image>.  Created empty
+    # (32 MiB) if it does not exist; format it in the guest with `disk format vdb`.
+    if [ -n "${DOS_DISK2:-}" ]; then
+        [ -f "$DOS_DISK2" ] || dd if=/dev/zero of="$DOS_DISK2" bs=1048576 count=32 2>/dev/null
+        DISK_ARGS="$DISK_ARGS -drive file=$DOS_DISK2,if=none,id=hd1,format=raw \
+                   -device virtio-blk-device,drive=hd1"
+    fi
 
     # M21 Phase H: QEMU's direct-ELF `-kernel` entry passes no DTB pointer (x0=0)
     #   and places no DTB in RAM, so load one at a fixed address (0x48000000) for
@@ -479,6 +486,11 @@ if command -v "$QEMU" >/dev/null 2>&1; then
     # boot the disk instead of the CD, hanging with no output at all.
     if [ -n "$DISK" ]; then
         DISK_ARGS="-drive if=virtio,file=$DISK,format=raw -boot d"
+    fi
+    # A second disk (vdb), AFTER the first so PCI order keeps the boot volume vda.
+    if [ -n "${DOS_DISK2:-}" ]; then
+        if [ ! -f "$DOS_DISK2" ]; then dd if=/dev/zero of="$DOS_DISK2" bs=1048576 count=32 2>/dev/null; fi
+        DISK_ARGS="$DISK_ARGS -drive if=virtio,file=$DOS_DISK2,format=raw"
     fi
 
     exec "$QEMU" $CPU_ARGS -rtc base=localtime $EXTRA -serial "file:$SERLOG" \

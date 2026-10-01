@@ -84,22 +84,34 @@ struct virtio_blk_req_hdr { uint32_t type; uint32_t reserved; uint64_t sector; }
 #define VIRTIO_BLK_T_IN     0           /* read                               */
 #define VIRTIO_BLK_T_OUT    1           /* write                              */
 
-/* Queue memory — Normal RAM, identity-mapped so virt == phys for the device's
- * DMA.  16-byte aligned (desc needs it; avail/used are fine at 16 too). */
-static struct virtq_desc  q_desc[QSIZE]        __attribute__((aligned(16)));
-static struct virtq_avail q_avail              __attribute__((aligned(16)));
-static struct virtq_used  q_used               __attribute__((aligned(16)));
-static struct virtio_blk_req_hdr q_hdr         __attribute__((aligned(16)));
-static volatile uint8_t   q_status             __attribute__((aligned(16)));
-
-static uintptr_t g_base;
-static int       g_slot = -1;   /* transport slot, for its SPI */
-static uint16_t  g_last_used;
-static struct block_device g_vda;
+/* §M87 open item (2026-10-01) — ONE OF SEVERAL DISKS.  Everything that was a
+ * file-scope singleton (the ring, the request header, the lock, the wait queue,
+ * the interrupt count, the block device) is per device: two disks are two
+ * rings, and one lock across both would serialise disks that have nothing to
+ * do with each other.  Ring memory is Normal RAM in the image; the device is
+ * handed its PHYSICAL address (kptr_phys). */
+#define VMB_MAX 4
+struct vmb {
+    struct virtq_desc  q_desc[QSIZE]        __attribute__((aligned(16)));
+    struct virtq_avail q_avail              __attribute__((aligned(16)));
+    struct virtq_used  q_used               __attribute__((aligned(16)));
+    struct virtio_blk_req_hdr q_hdr         __attribute__((aligned(16)));
+    volatile uint8_t   q_status             __attribute__((aligned(16)));
+    uintptr_t          base;
+    int                slot;               /* transport slot, for its SPI */
+    uint16_t           last_used;
+    struct kmutex      lock;
+    struct waitq       wq;
+    volatile uint32_t  irqs;
+    char               name[8];
+    struct block_device bd;
+};
+static struct vmb g_vmb[VMB_MAX];
+static int g_nvmb;
 
 /* ---- MMIO + barrier helpers ------------------------------------------------ */
-static inline void     w32(uint32_t off, uint32_t v) { *(volatile uint32_t*)(g_base + off) = v; }
-static inline uint32_t r32(uint32_t off)             { return *(volatile uint32_t*)(g_base + off); }
+static inline void     w32(struct vmb* v, uint32_t off, uint32_t x) { *(volatile uint32_t*)(v->base + off) = x; }
+static inline uint32_t r32(struct vmb* v, uint32_t off)             { return *(volatile uint32_t*)(v->base + off); }
 static inline void dsb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
 
 /* ---- one synchronous block request ----------------------------------------- *
@@ -109,33 +121,30 @@ static inline void dsb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
  * a completion wait with NO bound at all.  Now serialised by a kmutex, bounded
  * by 5 s of real time, and yielding the CPU while it waits where it may.
  *
- * THE COMPLETION INTERRUPT (2026-09-25, NEXT.md #2's leftover).  The x86
- * driver sleeps on its interrupt; this one polled with task_yield, which on an
- * otherwise idle CPU is a busy loop by another name — the waiting task is the
- * only runnable one, so yield returns at once and the core never halts.  Same
- * shape as virtio-blk on x86 and virtio-snd here: the SPI for this transport
- * slot (INTID 48 + slot on QEMU `virt`) acknowledges InterruptStatus (which is
- * what lowers the level line) and wakes the waiter — two things and no third.
- * The wait learns interrupts work by RECEIVING one; until then, and whenever it
- * may not sleep, it polls as before, and it never sleeps without a 2 ms
- * backstop, so a lost interrupt costs latency, never the request. */
+ * THE COMPLETION INTERRUPT (2026-09-25, NEXT.md #2's leftover): the SPI for
+ * this transport slot (INTID 48 + slot on QEMU `virt`) acknowledges
+ * InterruptStatus (which is what lowers the level line) and wakes the waiter —
+ * two things and no third.  The wait learns interrupts work by RECEIVING one;
+ * until then, and whenever it may not sleep, it polls, and it never sleeps
+ * without a 2 ms backstop, so a lost interrupt costs latency, never the
+ * request. */
 void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
 void gic_enable_irq(uint32_t intid);
 
-static struct kmutex     vmb_lock = KMUTEX_INIT("virtio-mmio-blk");
-static struct waitq      vmb_wq   = WAITQ_INIT;
-static volatile uint32_t vmb_irqs;
-
+/* Each disk has its own SPI, so the handler finds its device by INTID. */
 static void vmb_irq(uint32_t intid) {
-    (void)intid;
-    if (!g_base) return;
-    uint32_t st = r32(R_INTSTATUS);
-    if (!st) return;                                  /* not ours */
-    w32(R_INTACK, st);
-    vmb_irqs++;            /* the first one proves the line: the wait may sleep */
-    uint32_t fl = waitq_lock(&vmb_wq);
-    waitq_wake_all(&vmb_wq);
-    waitq_unlock(&vmb_wq, fl);
+    for (int i = 0; i < g_nvmb; i++) {
+        struct vmb* v = &g_vmb[i];
+        if (!v->base || board_virtio_intid(v->slot) != intid) continue;
+        uint32_t st = r32(v, R_INTSTATUS);
+        if (!st) return;                              /* not ours */
+        w32(v, R_INTACK, st);
+        v->irqs++;         /* the first one proves the line: the wait may sleep */
+        uint32_t fl = waitq_lock(&v->wq);
+        waitq_wake_all(&v->wq);
+        waitq_unlock(&v->wq, fl);
+        return;
+    }
 }
 
 static void vmb_backstop(struct ktimer* t) {
@@ -145,58 +154,58 @@ static void vmb_backstop(struct ktimer* t) {
     waitq_unlock(wq, fl);
 }
 
-static int vmb_done(void) {
+static int vmb_done(struct vmb* v) {
     dsb();
-    return *(volatile uint16_t*)&q_used.idx != g_last_used;
+    return *(volatile uint16_t*)&v->q_used.idx != v->last_used;
 }
 
-static int vmb_rw_unlocked(uint64_t lba, uint32_t count, void* buf, int is_write);
-static int vmb_rw(uint64_t lba, uint32_t count, void* buf, int is_write) {
-    kmutex_lock(&vmb_lock);
-    int rc = vmb_rw_unlocked(lba, count, buf, is_write);
-    kmutex_unlock(&vmb_lock);
+static int vmb_rw_unlocked(struct vmb* v, uint64_t lba, uint32_t count, void* buf, int is_write);
+static int vmb_rw(struct vmb* v, uint64_t lba, uint32_t count, void* buf, int is_write) {
+    kmutex_lock(&v->lock);
+    int rc = vmb_rw_unlocked(v, lba, count, buf, is_write);
+    kmutex_unlock(&v->lock);
     return rc;
 }
 
-static int vmb_rw_unlocked(uint64_t lba, uint32_t count, void* buf, int is_write) {
-    q_hdr.type     = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
-    q_hdr.reserved = 0;
-    q_hdr.sector   = lba;
+static int vmb_rw_unlocked(struct vmb* v, uint64_t lba, uint32_t count, void* buf, int is_write) {
+    v->q_hdr.type     = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
+    v->q_hdr.reserved = 0;
+    v->q_hdr.sector   = lba;
 
-    q_desc[0].addr = kptr_phys(&q_hdr);
-    q_desc[0].len  = sizeof q_hdr;
-    q_desc[0].flags = VRING_DESC_F_NEXT;
-    q_desc[0].next = 1;
+    v->q_desc[0].addr = kptr_phys(&v->q_hdr);
+    v->q_desc[0].len  = sizeof v->q_hdr;
+    v->q_desc[0].flags = VRING_DESC_F_NEXT;
+    v->q_desc[0].next = 1;
 
-    q_desc[1].addr = kptr_phys(buf);
-    q_desc[1].len  = count * SECTOR;
-    q_desc[1].flags = VRING_DESC_F_NEXT | (is_write ? 0 : VRING_DESC_F_WRITE);
-    q_desc[1].next = 2;
+    v->q_desc[1].addr = kptr_phys(buf);
+    v->q_desc[1].len  = count * SECTOR;
+    v->q_desc[1].flags = VRING_DESC_F_NEXT | (is_write ? 0 : VRING_DESC_F_WRITE);
+    v->q_desc[1].next = 2;
 
-    q_desc[2].addr = kptr_phys((const void*)&q_status);
-    q_desc[2].len  = 1;
-    q_desc[2].flags = VRING_DESC_F_WRITE;
-    q_desc[2].next = 0;
+    v->q_desc[2].addr = kptr_phys((const void*)&v->q_status);
+    v->q_desc[2].len  = 1;
+    v->q_desc[2].flags = VRING_DESC_F_WRITE;
+    v->q_desc[2].next = 0;
 
-    q_status = 0xff;
+    v->q_status = 0xff;
 
-    uint16_t ai = q_avail.idx;
-    q_avail.ring[ai % QSIZE] = 0;          /* head descriptor index          */
+    uint16_t ai = v->q_avail.idx;
+    v->q_avail.ring[ai % QSIZE] = 0;       /* head descriptor index          */
     dsb();
-    q_avail.idx = ai + 1;
+    v->q_avail.idx = ai + 1;
     dsb();
 
-    w32(R_QUEUENOTIFY, 0);                  /* kick queue 0                   */
+    w32(v, R_QUEUENOTIFY, 0);               /* kick queue 0                   */
 
     uint64_t deadline = timer_ticks_ms() + 5000;
-    while (!vmb_done()) {
+    while (!vmb_done(v)) {
         if (timer_ticks_ms() > deadline) {
-            kprintf("virtio-mmio-blk: request timed out after 5000 ms\n");
+            kprintf("virtio-mmio-blk: %s request timed out after 5000 ms\n", v->name);
             return -1;
         }
         struct task* me = task_current();
         int may_sleep = me && !me->is_idle && preempt_count() == 0;
-        if (!vmb_irqs || !may_sleep) {
+        if (!v->irqs || !may_sleep) {
             if (may_sleep) task_yield();
             continue;
         }
@@ -205,43 +214,109 @@ static int vmb_rw_unlocked(uint64_t lba, uint32_t count, void* buf, int is_write
             if (!told) {
                 told = 1;
                 kprintf("virtio-mmio-blk: completion interrupts work - requests "
-                        "now sleep instead of polling (%u so far)\n", vmb_irqs);
+                        "now sleep instead of polling (%u so far)\n", v->irqs);
             }
         }
         struct ktimer t = { 0, 0, 0, 0, 0 };
-        ktimer_arm_after(&t, 2000000ull, vmb_backstop, &vmb_wq);
-        uint32_t fl = waitq_lock(&vmb_wq);
-        if (!vmb_done()) waitq_block(&vmb_wq);
-        waitq_unlock(&vmb_wq, fl);
+        ktimer_arm_after(&t, 2000000ull, vmb_backstop, &v->wq);
+        uint32_t fl = waitq_lock(&v->wq);
+        if (!vmb_done(v)) waitq_block(&v->wq);
+        waitq_unlock(&v->wq, fl);
         ktimer_cancel(&t);
     }
-    g_last_used++;
+    v->last_used++;
     dsb();
 
-    if (r32(R_INTSTATUS) & 1) w32(R_INTACK, 1);
-    return (q_status == 0) ? 0 : -1;
+    if (r32(v, R_INTSTATUS) & 1) w32(v, R_INTACK, 1);
+    return (v->q_status == 0) ? 0 : -1;
 }
 
 static int vmb_read(struct block_device* dev, uint64_t lba, uint32_t count, void* buf) {
-    (void)dev;
+    struct vmb* v = (struct vmb*)dev->priv;
     for (uint32_t i = 0; i < count; i++)
-        if (vmb_rw(lba + i, 1, (uint8_t*)buf + i * SECTOR, 0) != 0) return -1;
+        if (vmb_rw(v, lba + i, 1, (uint8_t*)buf + i * SECTOR, 0) != 0) return -1;
     return 0;
 }
 static int vmb_write(struct block_device* dev, uint64_t lba, uint32_t count, const void* buf) {
-    (void)dev;
+    struct vmb* v = (struct vmb*)dev->priv;
     for (uint32_t i = 0; i < count; i++)
-        if (vmb_rw(lba + i, 1, (uint8_t*)(uintptr_t)buf + i * SECTOR, 1) != 0) return -1;
+        if (vmb_rw(v, lba + i, 1, (uint8_t*)(uintptr_t)buf + i * SECTOR, 1) != 0) return -1;
     return 0;
 }
 
 /* ---- probe + init ---------------------------------------------------------- */
 
-/* Scan the 32 MMIO slots for a virtio-block (deviceID 2) modern transport,
- * negotiate features, set up queue 0, and register it as /dev/vda.  Called
- * once from the aarch64 bring-up; a no-op (returns -1) if no disk is attached. */
+static int vmb_init_one(struct vmb* v, int idx) {
+    kmutex_init(&v->lock, "virtio-mmio-blk");
+    waitq_init(&v->wq);
+
+    /* Reset, then ACKNOWLEDGE + DRIVER. */
+    w32(v, R_STATUS, 0);
+    w32(v, R_STATUS, ST_ACK);
+    w32(v, R_STATUS, ST_ACK | ST_DRIVER);
+
+    /* Feature negotiation: accept only VIRTIO_F_VERSION_1 (feature bit 32). */
+    w32(v, R_DEVFEATSEL, 1); (void)r32(v, R_DEVFEAT);
+    w32(v, R_DRVFEATSEL, 1); w32(v, R_DRVFEAT, 1u << VIRTIO_F_VERSION_1_BIT);
+    w32(v, R_DEVFEATSEL, 0); (void)r32(v, R_DEVFEAT);
+    w32(v, R_DRVFEATSEL, 0); w32(v, R_DRVFEAT, 0);
+
+    w32(v, R_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK);
+    if (!(r32(v, R_STATUS) & ST_FEATURES_OK)) {
+        kprintf("virtio-mmio: device rejected features\n");
+        return -1;
+    }
+
+    /* Set up virtqueue 0. */
+    w32(v, R_QUEUESEL, 0);
+    if (r32(v, R_QUEUEREADY) != 0) { kprintf("virtio-mmio: queue busy\n"); return -1; }
+    uint32_t qmax = r32(v, R_QUEUENUMMAX);
+    if (qmax < QSIZE) { kprintf("virtio-mmio: QueueNumMax %u < %u\n", qmax, QSIZE); return -1; }
+    w32(v, R_QUEUENUM, QSIZE);
+
+    uint64_t d = kptr_phys(v->q_desc);
+    uint64_t a = kptr_phys(&v->q_avail);
+    uint64_t u = kptr_phys(&v->q_used);
+    w32(v, R_QDESC_LO, (uint32_t)d);  w32(v, R_QDESC_HI, (uint32_t)(d >> 32));
+    w32(v, R_QDRV_LO,  (uint32_t)a);  w32(v, R_QDRV_HI,  (uint32_t)(a >> 32));
+    w32(v, R_QDEV_LO,  (uint32_t)u);  w32(v, R_QDEV_HI,  (uint32_t)(u >> 32));
+    w32(v, R_QUEUEREADY, 1);
+
+    w32(v, R_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
+
+    /* The completion interrupt: handler first, then unmask (the install-then-
+     * unmask split gic.c mirrors from x86). */
+    gic_register_handler(board_virtio_intid(v->slot), vmb_irq);
+    gic_enable_irq(board_virtio_intid(v->slot));
+
+    /* Capacity (sectors) is the first u64 of the block config space. */
+    uint64_t cap = (uint64_t)r32(v, R_CONFIG) | ((uint64_t)r32(v, R_CONFIG + 4) << 32);
+
+    v->name[0] = 'v'; v->name[1] = 'd'; v->name[2] = (char)('a' + idx); v->name[3] = 0;
+    v->bd.name         = v->name;
+    v->bd.sector_size  = SECTOR;
+    v->bd.sector_count = cap;
+    v->bd.read         = vmb_read;
+    v->bd.write        = vmb_write;
+    v->bd.flush        = NULL;
+    v->bd.priv         = v;
+    blk_register(&v->bd);
+
+    kprintf("virtio-mmio: /dev/%s ready (%u sectors, %u MiB) at slot base %p\n",
+            v->name, (unsigned)cap, (unsigned)(cap / 2048), (void*)v->base);
+    return 0;
+}
+
+/* Scan the MMIO slots for virtio-block (deviceID 2) modern transports and
+ * register each as vda, vdb, ...  Called once from the aarch64 bring-up; -1
+ * when no disk is attached.
+ *
+ * DESCENDING: QEMU `virt` hands the FIRST `-device` on the command line the
+ * HIGHEST-numbered transport, so walking the slots downwards makes the
+ * command-line order the vda/vdb order — the first disk stays the boot
+ * volume's, as it was with one. */
 int virtio_mmio_blk_init(void) {
-    for (int i = 0; i < board_virtio_count(); i++) {
+    for (int i = board_virtio_count() - 1; i >= 0 && g_nvmb < VMB_MAX; i--) {
         uintptr_t base = (uintptr_t)board_virtio_base(i);
         uint32_t magic = *(volatile uint32_t*)(base + R_MAGIC);
         if (magic != VIRTIO_MAGIC) continue;
@@ -250,64 +325,11 @@ int virtio_mmio_blk_init(void) {
         if (dev == 0) continue;                  /* empty transport slot       */
         kprintf("virtio-mmio: slot %d dev=%u ver=%u\n", i, dev, ver);
         if (dev != 2 || ver != 2) continue;      /* want a modern block device */
-        g_base = base;
-        g_slot = i;
-        break;
+        struct vmb* v = &g_vmb[g_nvmb];
+        v->base = base;
+        v->slot = i;
+        g_nvmb++;                                /* the IRQ handler may see it now */
+        if (vmb_init_one(v, g_nvmb - 1) != 0) { v->base = 0; g_nvmb--; }
     }
-    if (!g_base) return -1;                      /* no virtio-blk attached     */
-
-    /* Reset, then ACKNOWLEDGE + DRIVER. */
-    w32(R_STATUS, 0);
-    w32(R_STATUS, ST_ACK);
-    w32(R_STATUS, ST_ACK | ST_DRIVER);
-
-    /* Feature negotiation: accept only VIRTIO_F_VERSION_1 (feature bit 32). */
-    w32(R_DEVFEATSEL, 1); (void)r32(R_DEVFEAT);
-    w32(R_DRVFEATSEL, 1); w32(R_DRVFEAT, 1u << VIRTIO_F_VERSION_1_BIT);
-    w32(R_DEVFEATSEL, 0); (void)r32(R_DEVFEAT);
-    w32(R_DRVFEATSEL, 0); w32(R_DRVFEAT, 0);
-
-    w32(R_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK);
-    if (!(r32(R_STATUS) & ST_FEATURES_OK)) {
-        kprintf("virtio-mmio: device rejected features\n");
-        return -1;
-    }
-
-    /* Set up virtqueue 0. */
-    w32(R_QUEUESEL, 0);
-    if (r32(R_QUEUEREADY) != 0) { kprintf("virtio-mmio: queue busy\n"); return -1; }
-    uint32_t qmax = r32(R_QUEUENUMMAX);
-    if (qmax < QSIZE) { kprintf("virtio-mmio: QueueNumMax %u < %u\n", qmax, QSIZE); return -1; }
-    w32(R_QUEUENUM, QSIZE);
-
-    uint64_t d = kptr_phys(q_desc);
-    uint64_t a = kptr_phys(&q_avail);
-    uint64_t u = kptr_phys(&q_used);
-    w32(R_QDESC_LO, (uint32_t)d);  w32(R_QDESC_HI, (uint32_t)(d >> 32));
-    w32(R_QDRV_LO,  (uint32_t)a);  w32(R_QDRV_HI,  (uint32_t)(a >> 32));
-    w32(R_QDEV_LO,  (uint32_t)u);  w32(R_QDEV_HI,  (uint32_t)(u >> 32));
-    w32(R_QUEUEREADY, 1);
-
-    w32(R_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
-
-    /* The completion interrupt: handler first, then unmask (the install-then-
-     * unmask split gic.c mirrors from x86). */
-    gic_register_handler(board_virtio_intid(g_slot), vmb_irq);
-    gic_enable_irq(board_virtio_intid(g_slot));
-
-    /* Capacity (sectors) is the first u64 of the block config space. */
-    uint64_t cap = (uint64_t)r32(R_CONFIG) | ((uint64_t)r32(R_CONFIG + 4) << 32);
-
-    g_vda.name         = "vda";
-    g_vda.sector_size  = SECTOR;
-    g_vda.sector_count = cap;
-    g_vda.read         = vmb_read;
-    g_vda.write        = vmb_write;
-    g_vda.flush        = NULL;
-    g_vda.priv         = NULL;
-    blk_register(&g_vda);
-
-    kprintf("virtio-mmio: /dev/vda ready (%u sectors, %u MiB) at slot base %p\n",
-            (unsigned)cap, (unsigned)(cap / 2048), (void*)g_base);
-    return 0;
+    return g_nvmb ? 0 : -1;
 }

@@ -191,14 +191,26 @@ struct virtio_blk {
     /* Pinned header / status buffers — one outstanding request at a time. */
     struct virtio_blk_req_hdr* req_hdr;
     volatile uint8_t*          req_status;
+
+    /* §M87 open item (2026-10-01) — ONE OF SEVERAL.  Everything that was a
+     * file-scope singleton (the request lock, the completion wait queue, the
+     * interrupt count, the block device) is per DEVICE now: two disks are two
+     * descriptor rings, and one lock across both would serialise disks that
+     * have nothing to do with each other. */
+    struct kmutex            lock;
+    struct waitq             wq;
+    volatile uint32_t        irqs;
+    uint8_t                  irq_line;
+    char                     name[8];          /* "vda", "vdb", ...           */
+    struct block_device      bd;
 };
 
-/* Singleton — only one virtio-blk supported today.  When multi-device
- * support lands, this becomes a list and the block_device.priv points
- * at the per-device state. */
-static struct virtio_blk g_vblk;
-static struct block_device g_vda;
-static int g_vblk_present = 0;
+/* Up to VBLK_MAX disks, named vda.. in PCI scan order.  The first is the boot
+ * volume's (mounted at /mnt); the others are there for `mount` and the
+ * Storage page. */
+#define VBLK_MAX 4
+static struct virtio_blk g_vblk_dev[VBLK_MAX];
+static int g_nvblk = 0;
 
 /* ----------------------- Small helpers ------------------------------------ */
 
@@ -315,9 +327,6 @@ static int vblk_init_buffers(struct virtio_blk* v) {
  * may not sleep (boot, preemption off), it polls, and it never sleeps without a
  * 2 ms backstop — a lost interrupt costs latency, never the request. */
 #define VBLK_TIMEOUT_MS  5000u
-static struct kmutex     vblk_lock = KMUTEX_INIT("virtio-blk");
-static struct waitq      vblk_wq   = WAITQ_INIT;
-static volatile uint32_t vblk_irqs;
 
 static void vblk_irq(struct int_frame* f);
 static int vblk_may_sleep(void) {
@@ -334,21 +343,21 @@ static int vblk_wait(struct virtio_blk* v) {
     uint64_t deadline = timer_ticks_ms() + VBLK_TIMEOUT_MS;
     while (*(volatile uint16_t*)&v->used->idx == v->last_used_idx) {
         if (timer_ticks_ms() > deadline) return -1;
-        if (!vblk_irqs || !vblk_may_sleep()) { hal_cpu_pause(); continue; }
+        if (!v->irqs || !vblk_may_sleep()) { hal_cpu_pause(); continue; }
         {
             static int told;
             if (!told) {
                 told = 1;
                 kprintf("virtio-blk: completion interrupts work - requests now "
-                        "sleep instead of polling (%u so far)\n", vblk_irqs);
+                        "sleep instead of polling (%u so far)\n", v->irqs);
             }
         }
         struct ktimer t = { 0, 0, 0, 0, 0 };
-        ktimer_arm_after(&t, 2000000ull, vblk_backstop, &vblk_wq);
-        uint32_t fl = waitq_lock(&vblk_wq);
+        ktimer_arm_after(&t, 2000000ull, vblk_backstop, &v->wq);
+        uint32_t fl = waitq_lock(&v->wq);
         if (*(volatile uint16_t*)&v->used->idx == v->last_used_idx)
-            waitq_block(&vblk_wq);
-        waitq_unlock(&vblk_wq, fl);
+            waitq_block(&v->wq);
+        waitq_unlock(&v->wq, fl);
         ktimer_cancel(&t);
     }
     return 0;
@@ -358,9 +367,9 @@ static int vblk_request_unlocked(struct virtio_blk* v, uint32_t type, uint64_t l
                                  void* buf, uint32_t nsectors);
 static int vblk_request(struct virtio_blk* v, uint32_t type, uint64_t lba,
                         void* buf, uint32_t nsectors) {
-    kmutex_lock(&vblk_lock);
+    kmutex_lock(&v->lock);
     int rc = vblk_request_unlocked(v, type, lba, buf, nsectors);
-    kmutex_unlock(&vblk_lock);
+    kmutex_unlock(&v->lock);
     return rc;
 }
 
@@ -371,16 +380,22 @@ static int vblk_request(struct virtio_blk* v, uint32_t type, uint64_t lba,
 static volatile int vblk_test_noack;
 static volatile uint32_t vblk_test_hits;
 
+/* One handler for every disk: they may share a line (PIIX routes four PIRQs
+ * to a handful of IRQs), so it asks EACH device whether the interrupt was its
+ * own — the ISR read is also what lowers that device's line. */
 static void vblk_irq(struct int_frame* f) {
     (void)f;
     if (vblk_test_noack) { vblk_test_hits++; return; }
-    if (!g_vblk.io_base) return;
-    uint8_t isr = inb(g_vblk.io_base + VBLK_OFF_ISR_STATUS);   /* read-to-clear */
-    if (!(isr & 1)) return;                                    /* not ours      */
-    vblk_irqs++;           /* the first one proves the line: the wait may sleep */
-    uint32_t fl = waitq_lock(&vblk_wq);
-    waitq_wake_all(&vblk_wq);
-    waitq_unlock(&vblk_wq, fl);
+    for (int i = 0; i < g_nvblk; i++) {
+        struct virtio_blk* v = &g_vblk_dev[i];
+        if (!v->io_base) continue;
+        uint8_t isr = inb(v->io_base + VBLK_OFF_ISR_STATUS);   /* read-to-clear */
+        if (!(isr & 1)) continue;                              /* not this one  */
+        v->irqs++;         /* the first one proves the line: the wait may sleep */
+        uint32_t fl = waitq_lock(&v->wq);
+        waitq_wake_all(&v->wq);
+        waitq_unlock(&v->wq, fl);
+    }
 }
 
 static int vblk_request_unlocked(struct virtio_blk* v, uint32_t type, uint64_t lba,
@@ -491,11 +506,16 @@ static int vblk_probe(void* ctx) {
     return 0;
 }
 
-static int vblk_init(void* ctx) {
-    (void)ctx;
-    struct pci_device pd;
-    if (pci_find_device(VIRTIO_VENDOR, VIRTIO_BLK_DEVICE, &pd) != 0) return -1;
+struct vblk_scan { struct pci_device pd[VBLK_MAX]; int n; };
+static void vblk_visit(const struct pci_device* d, void* ctx) {
+    struct vblk_scan* sc = (struct vblk_scan*)ctx;
+    if (sc->n < VBLK_MAX && d->vendor_id == VIRTIO_VENDOR && d->device_id == VIRTIO_BLK_DEVICE)
+        sc->pd[sc->n++] = *d;
+}
 
+/* Bring up one disk; 0 on success. */
+static int vblk_init_one(struct virtio_blk* v, const struct pci_device* p, int idx) {
+    struct pci_device pd = *p;
     uint16_t io = pci_bar_io_base(pd.bar[0]);
     if (!io) {
         kprintf("virtio-blk: BAR0 is not I/O-space\n");
@@ -508,7 +528,10 @@ static int vblk_init(void* ctx) {
     cmd |= PCI_CMD_IO_SPACE | PCI_CMD_BUS_MASTER;
     pci_write16(pd.bus, pd.slot, pd.func, PCI_COMMAND, cmd);
 
-    g_vblk.io_base = io;
+    kmutex_init(&v->lock, "virtio-blk");
+    waitq_init(&v->wq);
+    v->irqs = 0;
+    v->io_base = io;
 
     /* Reset + handshake. */
     vblk_write_status(io, 0);
@@ -520,16 +543,17 @@ static int vblk_init(void* ctx) {
     vblk_write_status(io, VSTAT_ACKNOWLEDGE | VSTAT_DRIVER | VSTAT_FEATURES_OK);
     if ((vblk_read_status(io) & VSTAT_FEATURES_OK) == 0) {
         kprintf("virtio-blk: FEATURES_OK rejected\n");
+        v->io_base = 0;
         return -3;
     }
 
     /* Read capacity (in 512-byte sectors) from device-specific config. */
     uint32_t cap_lo = inl(io + VBLK_OFF_CAPACITY);
     uint32_t cap_hi = inl(io + VBLK_OFF_CAPACITY + 4);
-    g_vblk.capacity_sectors = ((uint64_t)cap_hi << 32) | cap_lo;
+    v->capacity_sectors = ((uint64_t)cap_hi << 32) | cap_lo;
 
-    if (vblk_init_queue(&g_vblk) != 0)    return -4;
-    if (vblk_init_buffers(&g_vblk) != 0) return -5;
+    if (vblk_init_queue(v) != 0)    { v->io_base = 0; return -4; }
+    if (vblk_init_buffers(v) != 0) { v->io_base = 0; return -5; }
 
     /* Driver is ready. */
     vblk_write_status(io, VSTAT_ACKNOWLEDGE | VSTAT_DRIVER
@@ -539,33 +563,49 @@ static int vblk_init(void* ctx) {
      * device may have none, and line 0 is the TIMER (§M66's lesson).  With it
      * installed, ask the device to interrupt; the wait still polls until the
      * first one proves the line (vblk_irq), so a line that never fires costs
-     * latency and nothing else.  Without it, completions stay polled. */
+     * latency and nothing else.  Without it, completions stay polled.  ONE
+     * handler per LINE: two disks on one line would otherwise be asked twice
+     * per interrupt (irq_install chains). */
+    v->irq_line = pd.irq_line;
     if (pd.irq_line != 0xFF && pd.irq_line != 0) {
-        irq_install(pd.irq_line, vblk_irq);
-        g_vblk.avail->flags = 0;
+        int seen = 0;
+        for (int k = 0; k < idx; k++)
+            if (g_vblk_dev[k].io_base && g_vblk_dev[k].irq_line == pd.irq_line) seen = 1;
+        if (!seen) irq_install(pd.irq_line, vblk_irq);
+        v->avail->flags = 0;
     }
 
-    /* Register the abstract block device. */
-    g_vda.name         = "vda";
-    g_vda.sector_size  = SECTOR_SIZE;
-    g_vda.sector_count = g_vblk.capacity_sectors;
-    g_vda.read         = vblk_read_op;
-    g_vda.write        = vblk_write_op;
-    g_vda.flush        = NULL;
-    g_vda.priv         = &g_vblk;
-    g_vda.next         = NULL;
-    blk_register(&g_vda);
+    /* Register the abstract block device.  /dev/<name> is published by
+     * blk_register() — by the layer every block driver shares. */
+    v->name[0] = 'v'; v->name[1] = 'd'; v->name[2] = (char)('a' + idx); v->name[3] = 0;
+    v->bd.name         = v->name;
+    v->bd.sector_size  = SECTOR_SIZE;
+    v->bd.sector_count = v->capacity_sectors;
+    v->bd.read         = vblk_read_op;
+    v->bd.write        = vblk_write_op;
+    v->bd.flush        = NULL;
+    v->bd.priv         = v;
+    v->bd.next         = NULL;
+    blk_register(&v->bd);
 
-    /* /dev/vda is published by blk_register() now — by the layer every block
-     * driver shares, so aarch64's driver gets it too instead of this being an
-     * x86-only convenience.  Registering here as well would be a duplicate
-     * name in devfs. */
-
-    g_vblk_present = 1;
-    kprintf("virtio-blk: %u sectors at PCI %u:%u.%u io=%x irq=%u\n",
-            (unsigned)g_vblk.capacity_sectors,
-            pd.bus, pd.slot, pd.func, io, pd.irq_line);
+    kprintf("virtio-blk: %s %u sectors at PCI %u:%u.%u io=%x irq=%u\n", v->name,
+            (unsigned)v->capacity_sectors, pd.bus, pd.slot, pd.func, io, pd.irq_line);
     return 0;
+}
+
+static int vblk_init(void* ctx) {
+    (void)ctx;
+    struct vblk_scan sc = { .n = 0 };
+    pci_scan(vblk_visit, &sc);
+    if (!sc.n) return -1;
+    int up = 0;
+    for (int i = 0; i < sc.n; i++) {
+        /* g_nvblk counts the slots the IRQ handler walks; it advances before
+         * the bring-up so an interrupt arriving mid-way finds the device. */
+        g_nvblk = i + 1;
+        if (vblk_init_one(&g_vblk_dev[i], &sc.pd[i], i) == 0) up++;
+    }
+    return up ? 0 : -2;
 }
 
 static const struct driver_ops vblk_ops = {
@@ -610,7 +650,7 @@ static void blkstormtest(const char* args) {
     unsigned ms = 0;
     while (args && *args >= '0' && *args <= '9') ms = ms * 10 + (unsigned)(*args++ - '0');
     if (ms == 0 || ms > 3000) ms = 2000;
-    if (!g_vblk.io_base) { kprintf("blkstormtest: no virtio-blk disk attached\n"); return; }
+    if (!g_nvblk || !g_vblk_dev[0].io_base) { kprintf("blkstormtest: no virtio-blk disk attached\n"); return; }
     struct task* me = task_current();
     if (me) task_set_affinity(me, 1u << 1);
     int cpu = -1;
@@ -618,7 +658,7 @@ static void blkstormtest(const char* args) {
     if (cpu != 1) { kprintf("blkstormtest: needs a second CPU (run with -smp 2+)\n"); return; }
 
     uint32_t before = g_pit_starved;
-    uint64_t irqs0 = vblk_irqs;
+    uint64_t irqs0 = g_vblk_dev[0].irqs;
     vblk_test_hits = 0;
     vblk_test_noack = 1;
     /* A read of the LAST sector — not one the block cache is likely to hold,
@@ -638,7 +678,7 @@ static void blkstormtest(const char* args) {
     kprintf("blkstormtest: left the disk's interrupt unacknowledged for %u ms - "
             "%u unacknowledged invocation(s), the detector reported %u episode(s), "
             "%u completion interrupt(s) after: %s\n",
-            ms, vblk_test_hits, after - before, (unsigned)(vblk_irqs - irqs0),
+            ms, vblk_test_hits, after - before, (unsigned)(g_vblk_dev[0].irqs - irqs0),
             vblk_test_hits < 1000 ? "INCONCLUSIVE (no storm happened)" :
             after != before ? "PASS (the storm was named)"
                             : "FAIL (a real storm went unreported)");
@@ -659,7 +699,7 @@ static void cmd_blkbench(const char* args) {
     struct block_device* d = blk_find("vda");
     if (!d) { kprintf("blkbench: no vda\n"); return; }
     static uint8_t buf[4096];
-    uint32_t irq0 = vblk_irqs;
+    uint32_t irq0 = g_nvblk ? g_vblk_dev[0].irqs : 0;
     uint64_t t0 = timer_now_ns(), worst = 0;
     int n = 200, bad = 0;
     for (int i = 0; i < n; i++) {
@@ -672,6 +712,6 @@ static void cmd_blkbench(const char* args) {
     uint64_t total = timer_now_ns() - t0;
     kprintf("blkbench: %d reads of 4 KiB, mean %u us, worst %u us, %u completion "
             "interrupt(s), %d error(s)\n", n, (unsigned)(total / 1000u / (uint64_t)n),
-            (unsigned)(worst / 1000u), vblk_irqs - irq0, bad);
+            (unsigned)(worst / 1000u), (g_nvblk ? g_vblk_dev[0].irqs : 0) - irq0, bad);
 }
 SHELL_CMD(blkbench) = { "blkbench", "", 0, SHELL_G_TEST, cmd_blkbench, SHELL_P_ADMIN };

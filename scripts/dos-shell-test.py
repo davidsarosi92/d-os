@@ -442,6 +442,9 @@ def qemu_argv(a, sersock, monsock):
         if a.disk:
             argv += ["-drive", "if=none,id=hd0,file=%s,format=raw" % a.disk,
                      "-device", "virtio-blk-device,drive=hd0"]
+        if a.disk2:
+            argv += ["-drive", "if=none,id=hd1,file=%s,format=raw" % a.disk2,
+                     "-device", "virtio-blk-device,drive=hd1"]
     else:
         qemu = "qemu-system-i386" if a.arch == "i386" else "qemu-system-x86_64"
         # §M86 — the SAME CPU run_qemu.sh gives a person: qemu32 has no NX, so
@@ -501,6 +504,9 @@ def qemu_argv(a, sersock, monsock):
                      # CLAUDE.md documents the trap; the harness should not make
                      # everyone rediscover it.
                      "-boot", "d"]
+        if a.disk2:
+            # AFTER the first disk: PCI slot order is the guest's vda/vdb order.
+            argv += ["-drive", "if=virtio,file=%s,format=raw" % a.disk2]
     return argv + list(a.extra)
 
 
@@ -523,6 +529,9 @@ def main():
                     help="QEMU -cpu for x86 (default i386: qemu32,+nx; "
                          "qemu32,-pae reaches the classic-paging path)")
     ap.add_argument("--disk", default="")
+    ap.add_argument("--disk2", default="",
+                    help="a SECOND virtio disk (raw image; created empty, 32 MiB, "
+                         "when the file does not exist) — the guest names it vdb")
     # --empty is the harness spelling of run_qemu.sh's flag of the same name: a
     # FRESHLY FORMATTED, empty volume.  A test that reuses whatever the last run
     # left behind is a test whose result depends on the order the tests ran in,
@@ -616,6 +625,9 @@ def main():
     a = ap.parse_args()
 
     os.chdir(ROOT)
+    if a.disk2 and not os.path.exists(a.disk2):
+        with open(a.disk2, "wb") as f:
+            f.truncate(32 << 20)
 
     if a.empty is not None:
         # mkfs.exfat lives in the build container, not on a Mac host.  Formatting
