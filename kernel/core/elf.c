@@ -11,6 +11,7 @@
 
 #include "elf.h"
 #include "vmm.h"
+#include "vma.h"
 #include "pmm.h"
 #include "kmap.h"
 #include "printf.h"
@@ -73,6 +74,23 @@ static void copy_bytes(uint8_t* dst, const uint8_t* src, size_t n) {
     for (size_t i = 0; i < n; i++) dst[i] = src[i];
 }
 
+/* §M90 (2026-10-01) — WHERE THE IMAGE'S BYTES COME FROM.  The loader used to
+ * need the whole file in one kernel buffer, and so did every caller: execve
+ * refused anything over 16 MiB and a shell launch asked kmalloc for the file's
+ * full size — a 44 MB `docker` or a 100 MB `dockerd` could not start at all.
+ * Now a load reads the HEADERS from a buffer and everything past it from the
+ * file itself, page by page (the middle pages come from the page cache
+ * anyway, §M74).  `buf` covers [0, buflen); `len` is the file's length. */
+struct elf_img { const uint8_t* buf; size_t buflen; size_t len; struct file* f; };
+
+#include "vfs.h"
+static int img_copy(const struct elf_img* im, uint8_t* dst, size_t off, size_t n) {
+    if (off + n <= im->buflen) { copy_bytes(dst, im->buf + off, n); return 0; }
+    if (!im->f) return -1;
+    im->f->pos = off;
+    return vfs_read(im->f, dst, n) == (ssize_t)n ? 0 : -1;
+}
+
 /* Map one PT_LOAD segment into `space`: page-by-page allocate a frame, zero
  * it, copy the segment's file bytes that fall in this page, and map it.
  * Assumes p_vaddr and p_offset share page alignment (the standard ELF
@@ -112,11 +130,11 @@ static struct placed_page* placed_find(struct placed_set* ps, uintptr_t va) {
  * map one file's pages into the other's program. */
 #include "pcache.h"
 
-static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len,
+static int map_segment(struct vmm_space* space, const struct elf_img* im,
                        const struct phdr_norm* p, uintptr_t bias,
                        struct placed_set* placed, struct file* src) {
     if (p->offset + p->filesz < p->offset) return ELF_ESEGBOUND;   /* overflow */
-    if (p->offset + p->filesz > len)       return ELF_ESEGBOUND;
+    if (p->offset + p->filesz > im->len)   return ELF_ESEGBOUND;
 
     uint32_t flags = VMM_USER;
     if (p->flags & PF_W) flags |= VMM_WRITABLE;
@@ -167,7 +185,11 @@ static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len
             uintptr_t avail  = p->filesz - seg_lo;
             uintptr_t room   = PAGE_SIZE - dst_lo;
             uintptr_t n      = avail < room ? avail : room;
-            copy_bytes(dst + dst_lo, image + p->offset + seg_lo, (size_t)n);
+            if (img_copy(im, dst + dst_lo, p->offset + seg_lo, (size_t)n) != 0) {
+                kunmap_frame(dst);
+                if (!prev) pmm_free_frame(frame);
+                return ELF_ESEGBOUND;
+            }
         }
         kunmap_frame(dst);
 
@@ -190,9 +212,10 @@ static int map_segment(struct vmm_space* space, const uint8_t* image, size_t len
     return ELF_OK;
 }
 
-static int elf_load_impl(struct vmm_space* space, const void* image_v, size_t len,
+static int elf_load_impl(struct vmm_space* space, const struct elf_img* im,
                          uintptr_t load_bias, struct elf_load_info* out, struct file* src) {
-    const uint8_t* image = (const uint8_t*)image_v;
+    const uint8_t* image = im->buf;
+    size_t len = im->buflen;              /* the HEADERS must lie in the buffer */
     struct placed_set placed;                   /* §M86 — shared boundary pages */
     placed.n = 0;
     if (len < EI_NIDENT) return ELF_EBADMAG;
@@ -272,10 +295,10 @@ static int elf_load_impl(struct vmm_space* space, const void* image_v, size_t le
         }
         if (p.type == PT_INTERP && out) {
             /* Copy the interpreter path (bounded, NUL-terminated). */
-            if (p.offset + p.filesz > len) return ELF_ESEGBOUND;
+            if (p.offset + p.filesz > im->len) return ELF_ESEGBOUND;
             uintptr_t n = p.filesz;
             if (n >= sizeof out->interp) n = sizeof out->interp - 1;
-            for (uintptr_t j = 0; j < n; j++) out->interp[j] = (char)image[p.offset + j];
+            if (img_copy(im, (uint8_t*)out->interp, p.offset, n) != 0) return ELF_ESEGBOUND;
             out->interp[n] = '\0';
             out->has_interp = 1;
             continue;
@@ -290,7 +313,24 @@ static int elf_load_impl(struct vmm_space* space, const void* image_v, size_t le
             eh.phoff < p.offset + p.filesz)
             phdr_from_load = p.vaddr + bias + (eh.phoff - p.offset);
 
-        int rc = map_segment(space, image, len, &p, bias, &placed, src);
+        /* §M90 (2026-10-01) — A SEGMENT MAY ONLY LAND WHERE A PROGRAM MAY
+         * LIVE.  A fixed-address image is placed at its own p_vaddr, and on
+         * x86_64 the kernel itself runs at low virtual addresses: a static Go
+         * binary linked at 0x200000 (`docker`) was mapped THROUGH the page
+         * tables the kernel shares with every process, writing a user page
+         * into the kernel's own text mapping — any ELF could overwrite the
+         * kernel.  Refused, with the address, before anything is mapped. */
+        {
+            uintptr_t lo = (p.vaddr + bias) & PAGE_MASK;
+            uintptr_t hi = p.vaddr + bias + p.memsz;
+            if (hi < lo || hi > vmm_user_limit() ||
+                vmm_space_range_state(space, lo, (hi + PAGE_SIZE - 1) & PAGE_MASK) & VMA_RS_KERNEL) {
+                kprintf("elf: segment %lx..%lx lies in the kernel's address range on "
+                        "this machine - not loaded\n", (unsigned long)lo, (unsigned long)hi);
+                return ELF_EKERNELVA;
+            }
+        }
+        int rc = map_segment(space, im, &p, bias, &placed, src);
         if (rc != ELF_OK) return rc;
         loaded++;
     }
@@ -310,11 +350,39 @@ static int elf_load_impl(struct vmm_space* space, const void* image_v, size_t le
  * The image must be the file's whole contents, byte for byte. */
 int elf_load_ex_file(struct vmm_space* space, const void* image, size_t len,
                      uintptr_t load_bias, struct elf_load_info* out, struct file* src) {
-    return elf_load_impl(space, image, len, load_bias, out, src);
+    struct elf_img im = { (const uint8_t*)image, len, len, src };
+    return elf_load_impl(space, &im, load_bias, out, src);
 }
 int elf_load_ex(struct vmm_space* space, const void* image, size_t len,
                 uintptr_t load_bias, struct elf_load_info* out) {
-    return elf_load_impl(space, image, len, load_bias, out, NULL);
+    struct elf_img im = { (const uint8_t*)image, len, len, NULL };
+    return elf_load_impl(space, &im, load_bias, out, NULL);
+}
+
+/* §M90 — load straight from an open file: only the headers are buffered. */
+#include "kmalloc.h"
+int elf_head(struct file* f, uint8_t* buf, size_t cap, size_t* got) {
+    *got = 0;
+    if (!f || !f->inode) return -1;
+    size_t flen = (size_t)f->inode->size;
+    size_t n = flen < cap ? flen : cap;
+    f->pos = 0;
+    if (vfs_read(f, buf, n) != (ssize_t)n) return -1;
+    *got = n;
+    return 0;
+}
+int elf_load_file(struct vmm_space* space, struct file* f, uintptr_t load_bias,
+                  struct elf_load_info* out) {
+    if (!f || !f->inode || f->inode->size == 0) return ELF_EBADMAG;
+    size_t cap = ELF_HEAD_BYTES;
+    uint8_t* head = (uint8_t*)kmalloc(cap);
+    if (!head) return ELF_ENOMEM;
+    size_t got = 0;
+    if (elf_head(f, head, cap, &got) != 0) { kfree(head); return ELF_EBADHDR; }
+    struct elf_img im = { head, got, (size_t)f->inode->size, f };
+    int rc = elf_load_impl(space, &im, load_bias, out, f);
+    kfree(head);
+    return rc;
 }
 
 int elf_load(struct vmm_space* space, const void* image, size_t len,

@@ -43,6 +43,7 @@ struct vmm_space;
 #define ELF_ESEGBOUND  -5       /* a segment's file range exceeds the image  */
 #define ELF_ENOMEM     -6       /* PMM/map allocation failed                 */
 #define ELF_EBADARCH   -7       /* built for a DIFFERENT machine/word size   */
+#define ELF_EKERNELVA  -8       /* a segment overlaps the kernel's addresses */
 
 /* Rich load result (§M37).  All addresses are USER virtual addresses in the
  * target space; `load_bias` is what was added to each p_vaddr (0 for ET_EXEC,
@@ -68,6 +69,16 @@ int elf_load_ex(struct vmm_space* space, const void* image, size_t len,
 struct file;
 int elf_load_ex_file(struct vmm_space* space, const void* image, size_t len,
                      uintptr_t load_bias, struct elf_load_info* out, struct file* src);
+
+/* §M90 — the same, straight from an open file: the headers (the first
+ * ELF_HEAD_BYTES) are buffered, every segment byte past them is read from the
+ * file, so a program's size is no longer bounded by one kernel allocation. */
+#define ELF_HEAD_BYTES 65536
+int elf_load_file(struct vmm_space* space, struct file* f, uintptr_t load_bias,
+                  struct elf_load_info* out);
+/* Read the file's first min(size, cap) bytes into `buf` (for a caller that
+ * inspects the headers itself, e.g. to choose a personality). */
+int elf_head(struct file* f, uint8_t* buf, size_t cap, size_t* got);
 
 /* Back-compat thin wrapper: load a static/native image at its own vaddrs and
  * hand back just the entry point (the pre-§M37 contract). */

@@ -43,6 +43,12 @@ int proc_spawn(const char* name, const void* image, size_t len);
  * the Linux-ABI personality.  This is how a GUI package (NetSurf) is launched —
  * a real, preemptible, force-killable user task rather than a synchronous
  * excursion nested on the launcher's task. */
+/* §M90 — spawn a program straight from an open file (the headers are read,
+ * the segments mapped from the file; no size limit).  The file may be closed
+ * when this returns. */
+struct file;
+int proc_spawn_file(const char* name, struct file* f, int argc,
+                    const char* const argv[], int linux_abi);
 int proc_spawn_argv(const char* name, const void* image, size_t len,
                     int argc, const char* const argv[], int linux_abi);
 

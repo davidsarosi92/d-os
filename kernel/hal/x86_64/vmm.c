@@ -699,6 +699,15 @@ int vmm_nx_active(void) { return nx_on(); }
 int vmm_space_map(struct vmm_space* s, uintptr_t virt, uintptr_t phys,
                   uint32_t flags) {
     if (!s) return vmm_map(virt, phys, flags);
+    /* §M90 (2026-10-01) — A USER PAGE NEVER GOES THROUGH A TABLE THE KERNEL
+     * SHARES.  The upper levels of the kernel's own mapping are copied BY
+     * VALUE into every process, so a walk that creates a user entry under one
+     * writes into the KERNEL's table — for every process at once (a static
+     * Linux binary linked over the kernel's addresses did exactly that).  The
+     * ELF loader refuses such images first; this is the last line, so no
+     * other path (mmap, a fault) can do it either. */
+    if ((flags & VMM_USER) && (vmm_space_range_state(s, virt, virt + 0x1000) & VMA_RS_KERNEL))
+        return -1;
     uint64_t* pt = walk_to_pt_root(s->pml4, virt, /*create*/1, flags);
     if (!pt) return -1;
     /* VMM_SHARED (0x400) rides in PTE bit 10 (OS-available) so

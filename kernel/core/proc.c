@@ -371,10 +371,22 @@ static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
  * and the interpreter file is read through the global VFS into a kernel buffer,
  * so this is safe to call before switching to `s`.
  * --------------------------------------------------------------------------- */
+static int load_interp(struct vmm_space* s, struct loaded_prog* lp);
 static int load_program(struct vmm_space* s, const void* image, size_t len,
                         struct loaded_prog* lp) {
     int rc = elf_load_ex(s, image, len, vmm_user_base(), &lp->main);
     if (rc != ELF_OK) return rc;
+    return load_interp(s, lp);
+}
+/* §M90 — the same for a program on disk, read through the file (no copy of
+ * the whole image in the kernel). */
+static int load_program_file(struct vmm_space* s, struct file* f, struct loaded_prog* lp) {
+    int rc = elf_load_file(s, f, vmm_user_base(), &lp->main);
+    if (rc != ELF_OK) return rc;
+    return load_interp(s, lp);
+}
+static int load_interp(struct vmm_space* s, struct loaded_prog* lp) {
+    int rc;
     lp->entry       = lp->main.entry;
     lp->interp_base = 0;
 
@@ -386,21 +398,13 @@ static int load_program(struct vmm_space* s, const void* image, size_t len,
          * and then the bit would mean "is a file" rather than "may be run". */
         struct file* f = vfs_open(lp->main.interp, VFS_RDONLY);
         if (!f) return ELF_ENOLOAD;                   /* interpreter missing   */
-        size_t isz = f->inode ? (size_t)f->inode->size : 0;
-        if (isz == 0 || isz > (16u << 20)) { vfs_close(f); return ELF_ENOLOAD; }
-        uint8_t* iimg = (uint8_t*)kmalloc(isz);
-        if (!iimg) { vfs_close(f); return ELF_ENOMEM; }
-        ssize_t ird = vfs_read(f, iimg, isz);
-        if (ird < (ssize_t)isz) { vfs_close(f); kfree(iimg); return ELF_ENOLOAD; }
 
         /* §M74 — with the file, so ld.so (which in musl IS libc.so) is shared
          * through the page cache by every dynamic program instead of copied
-         * into each.  The file stays open until the load is done. */
+         * into each.  §M90 — and read from it directly (no size limit). */
         struct elf_load_info ii;
-        rc = elf_load_ex_file(s, iimg, isz,
-                              vmm_user_base() + PROC_INTERP_OFFSET, &ii, f);
+        rc = elf_load_file(s, f, vmm_user_base() + PROC_INTERP_OFFSET, &ii);
         vfs_close(f);
-        kfree(iimg);
         if (rc != ELF_OK) return rc;
         lp->interp_base = ii.load_bias;               /* AT_BASE               */
         lp->entry       = ii.entry;                   /* start in ld.so        */
@@ -576,26 +580,21 @@ int proc_execve_env(const char* path, char* const uargv[], char* const uenvp[]) 
         kfree(strbuf);
         return -1;
     }
-    size_t sz = f->inode ? (size_t)f->inode->size : 0;
-    if (sz == 0 || sz > (16u << 20)) { vfs_close(f); kfree(strbuf); return -1; }
-    uint8_t* img = (uint8_t*)kmalloc(sz);
-    if (!img) { vfs_close(f); kfree(strbuf); return -1; }
-    ssize_t rd = vfs_read(f, img, sz);
-    vfs_close(f);
-    if (rd < (ssize_t)sz) { kfree(img); kfree(strbuf); return -1; }
-
-    /* 3. Build the new address space + initial stack. */
+    /* 3. Build the new address space + initial stack — §M90: loaded straight
+     *    from the file (it used to be read whole into the kernel, and anything
+     *    over 16 MiB was refused: no Go program could be exec'd). */
     struct vmm_space* ns = vmm_space_create();
-    if (!ns) { kfree(img); kfree(strbuf); return -1; }
+    if (!ns) { vfs_close(f); kfree(strbuf); return -1; }
     struct loaded_prog lp;
-    if (load_program(ns, img, sz, &lp) != ELF_OK) {
-        vmm_space_destroy(ns); kfree(img); kfree(strbuf); return -1;
+    if (load_program_file(ns, f, &lp) != ELF_OK) {
+        vfs_close(f); vmm_space_destroy(ns); kfree(strbuf); return -1;
     }
+    vfs_close(f);
     uintptr_t stack_va;
     pmm_phys_t stk = map_user_stack(ns, &stack_va);
-    if (!stk) { vmm_space_destroy(ns); kfree(img); kfree(strbuf); return -1; }
+    if (!stk) { vmm_space_destroy(ns); kfree(strbuf); return -1; }
     uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, kargv, envc, kenvp, &lp);
-    if (!user_sp) { vmm_space_destroy(ns); kfree(img); kfree(strbuf); return E2BIG_RC; }
+    if (!user_sp) { vmm_space_destroy(ns); kfree(strbuf); return E2BIG_RC; }
 
     /* 4. Commit: swap to the new space, free the old one + scratch.  execve
      *    resets signal dispositions to default (custom handlers pointed into
@@ -610,7 +609,6 @@ int proc_execve_env(const char* path, char* const uargv[], char* const uenvp[]) 
      * task and releases in a bounded batch. */
     while (__atomic_load_n(&me->swap_busy, __ATOMIC_ACQUIRE)) task_msleep(2);
     if (old) vmm_space_destroy(old);
-    kfree(img);
     kfree(strbuf);
 
     /* 5. Resume in ring 3 at the new entry (one-way).  For a dynamic binary
@@ -726,15 +724,33 @@ int proc_clone(uintptr_t entry, uintptr_t stack) {
  * makes a faulting/wedged package terminate cleanly (isr_handler kills the
  * *task*, the reaper frees its space) and force-killable (M46), instead of
  * taking down the shell/desktop task the excursion would have run on. */
+static int spawn_loaded(const char* name, struct vmm_space* s, struct loaded_prog* lpp,
+                        int argc, const char* const argv[], int linux_abi, int ppid);
 int proc_spawn_argv_under(const char* name, const void* image, size_t len,
                           int argc, const char* const argv[], int linux_abi,
                           int ppid) {
     struct vmm_space* s = vmm_space_create();
     if (!s) return -1;
-
     struct loaded_prog lp;
     int rc = load_program(s, image, len, &lp);
     if (rc != ELF_OK) { vmm_space_destroy(s); return rc; }
+    return spawn_loaded(name, s, &lp, argc, argv, linux_abi, ppid);
+}
+
+/* §M90 — the same for a program on disk: no whole-file buffer. */
+int proc_spawn_file(const char* name, struct file* f, int argc,
+                    const char* const argv[], int linux_abi) {
+    struct vmm_space* s = vmm_space_create();
+    if (!s) return -1;
+    struct loaded_prog lp;
+    int rc = load_program_file(s, f, &lp);
+    if (rc != ELF_OK) { vmm_space_destroy(s); return rc; }
+    return spawn_loaded(name, s, &lp, argc, argv, linux_abi, -1);
+}
+
+static int spawn_loaded(const char* name, struct vmm_space* s, struct loaded_prog* lpp,
+                        int argc, const char* const argv[], int linux_abi, int ppid) {
+    struct loaded_prog lp = *lpp;
 
     uintptr_t stack_va;
     pmm_phys_t stk = map_user_stack(s, &stack_va);

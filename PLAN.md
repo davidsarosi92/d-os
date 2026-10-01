@@ -6128,6 +6128,13 @@ user asked for the real thing.  **The user's reason, worth keeping: real
 Docker updates itself upstream and does not become d-os's burden to
 maintain; a native Engine API would be.  Both may be built.**
 
+**Decided with the user (2026-10-01): `ctr` STAYS.**  It remains the tool that
+opens and unpacks images (§M73's `ociunpack`), and its role grows toward
+Docker's — the natural home of the native Engine API route — while the real
+dockerd/containerd/runc run beside it under the Linux personality.  Neither
+replaces the other: `ctr` is d-os's own, always-available container path;
+upstream Docker is the compatible one.
+
 ## §M74 — Swap and demand paging: reclaim as a policy, not a favour
 
 **Status: SHIPPED 2026-09-27 — DOCS §4.112 (accessed-bit sweep), §4.113 (page

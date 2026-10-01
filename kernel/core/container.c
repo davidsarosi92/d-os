@@ -37,6 +37,7 @@
 #include "task.h"
 #include "proc.h"
 #include "vfs.h"
+#include "elf.h"
 #include "cred.h"
 #include "kmalloc.h"
 #include "printf.h"
@@ -245,21 +246,13 @@ static void ctr_init_main(void) {
         kprintf("ctr: '%s' is not in container '%s'\n", r->argv[0], r->c->name);
         r->code = 127; r->done = 1; return;
     }
-    size_t sz = f->inode ? (size_t)f->inode->size : 0;
-    uint8_t* img = sz ? (uint8_t*)kmalloc(sz) : NULL;
-    ssize_t got = img ? vfs_read(f, img, sz) : -1;
-    vfs_close(f);
-    if (!img || got != (ssize_t)sz) {
-        if (img) kfree(img);
-        kprintf("ctr: cannot read %s\n", r->argv[0]);
-        r->code = 126; r->done = 1; return;
-    }
     const char* name = r->argv[0];
     for (const char* p = r->argv[0]; *p; p++) if (*p == '/') name = p + 1;
     /* §M89 — /proc/self/exe for the program (the child inherits the cred). */
     if (vfs_realpath(r->argv[0], me->cred.exe, sizeof me->cred.exe) != 0) me->cred.exe[0] = 0;
-    int pid = proc_spawn_argv(name, img, sz, r->argc, r->argv, /*linux_abi*/1);
-    kfree(img);
+    /* §M90 — loaded from the file, not read whole into the kernel. */
+    int pid = proc_spawn_file(name, f, r->argc, r->argv, /*linux_abi*/1);
+    vfs_close(f);
     if (pid < 0) { kprintf("ctr: could not start %s\n", r->argv[0]); r->code = 126; r->done = 1; return; }
     struct task* t = task_find(pid);
     if (t) task_set_reap_owned(t, 1);

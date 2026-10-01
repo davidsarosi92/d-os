@@ -195,7 +195,8 @@ SHELL_CMD(pkgtest) = { "pkgtest", "", "store round trip: install, run, GC",
  * foreground until it exits.
  *
  * WHICH PERSONALITY: a dynamically linked program (PT_INTERP) is a Linux one —
- * everything installed from an image is — and so is anything that resolves
+ * everything installed from an image is — so is a static one with a PT_NOTE
+ * (see is_linux_elf), and so is anything that resolves
  * into /mnt/apps; the rest are this system's own programs.  /proc/self/exe is
  * the resolved path, which is how a JDK started as `java` finds its home. */
 #include "config.h"
@@ -214,7 +215,14 @@ static int is_linux_elf(const uint8_t* img, size_t len, const char* real) {
     for (uint16_t k = 0; k < phnum; k++) {
         uint64_t o = phoff + (uint64_t)k * phent;
         if (o + 4 > len) break;
-        if (*(const uint32_t*)(img + o) == 3) return 1;          /* PT_INTERP */
+        uint32_t t = *(const uint32_t*)(img + o);
+        if (t == 3) return 1;                                    /* PT_INTERP */
+        /* §M90 — a STATIC Linux program has no interpreter, but every Linux
+         * toolchain leaves a PT_NOTE (the GNU ABI tag / build id, Go's build
+         * id) and this system's own programs are linked with none — only LOAD
+         * and GNU_STACK.  A statically linked Go binary (docker, dockerd,
+         * runc) is the case this exists for. */
+        if (t == 4) return 1;                                    /* PT_NOTE   */
     }
     return 0;
 }
@@ -280,12 +288,18 @@ int shell_run_from_path(const char* line) {
 
     struct file* f = vfs_open(real, VFS_RDONLY);
     if (!f) return 0;
-    size_t sz = f->inode ? (size_t)f->inode->size : 0;
-    uint8_t* img = sz ? (uint8_t*)kmalloc(sz) : NULL;
-    ssize_t got = img ? vfs_read(f, img, sz) : -1;
-    vfs_close(f);
-    if (!img || got != (ssize_t)sz) { if (img) kfree(img); kprintf("%s: cannot read %s\n", argv[0], real); return 1; }
+    /* §M90 — only the HEADERS are read here; the program is loaded from the
+     * file (a 44 MB `docker` did not fit one kernel allocation). */
+    uint8_t* img = (uint8_t*)kmalloc(ELF_HEAD_BYTES);
+    size_t sz = 0;
+    if (!img || elf_head(f, img, ELF_HEAD_BYTES, &sz) != 0 || !sz) {
+        if (img) kfree(img);
+        vfs_close(f);
+        kprintf("%s: cannot read %s\n", argv[0], real);
+        return 1;
+    }
     int linux_abi = is_linux_elf(img, sz, real);
+    kfree(img);
 
     /* The child inherits the cred, and with it /proc/self/exe. */
     struct task* me = task_current();
@@ -295,9 +309,9 @@ int shell_run_from_path(const char* line) {
     me->cred.exe[k] = 0;
     const char* name = argv[0];
     for (const char* v = argv[0]; *v; v++) if (*v == '/') name = v + 1;
-    int pid = proc_spawn_argv(name, img, sz, argc, argv, linux_abi);
+    int pid = proc_spawn_file(name, f, argc, argv, linux_abi);
+    vfs_close(f);
     for (unsigned i = 0; i < sizeof saved; i++) me->cred.exe[i] = saved[i];
-    kfree(img);
     if (pid < 0) { kprintf("%s: could not start %s\n", argv[0], real); return 1; }
     struct task* t = task_find(pid);
     if (t) task_set_reap_owned(t, 1);
