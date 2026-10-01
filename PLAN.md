@@ -230,7 +230,7 @@ fixed first, whatever it touches.
 | §M74 | ✅ complete (§4.112-§4.114) | — (multi-threaded victims, swap compression) |
 | §M73 | ✅ complete — rungs 1-3 (§4.115) | — (resource caps per container, network namespace, registry pull) |
 | queued UI | ✅ done (§4.116) — Memory page, System information, translations 73 → 0 | — |
-| §M88 | ✅ first cut (§4.118) | per-output modes, live re-arrangement, left/above, >16 MiB desktops |
+| §M88 | ✅ (§4.118) | open: a taskbar per monitor |
 | §M89 | ◐ → core ✅ | Java: `java Hello.java` from the unmodified JDK on x86_64 + aarch64 (DOCS §4.119); open: `app install` end to end, host-side delivery, rung 5 measurements |
 | §M90 | — | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — asked for 2026-09-28, scoped below; AFTER §M89 and the open items (decided), planned for Thursday evening |
 | §M68 | — | investigation, not started |
@@ -5909,7 +5909,7 @@ independent reason it should be the next milestone.
 
 ## §M88 — More than one monitor
 
-**Status: FIRST CUT SHIPPED 2026-09-28 — DOCS §4.118 (registry, bochs-display second head on all three arches, one virtual desktop, per-monitor policy, Monitors page).  Open rungs: per-output mode setting, live re-arrangement, left/above, >16 MiB desktops, virtio-gpu second scanout, a taskbar per monitor.  Asked for from use
+**Status: FIRST CUT SHIPPED 2026-09-28 — DOCS §4.118 (registry, bochs-display second head on all three arches, one virtual desktop, per-monitor policy, Monitors page).  Rungs done 2026-10-01 (§4.118): per-output modes, live re-arrangement, left/above, >16 MiB desktops, virtio-gpu second scanout.  Open: a taskbar per monitor (shell-contract change + UX choice).  Asked for from use
 (2026-09-27): "kelleni fog több monitort kezelni is".**
 
 ### What is true today (measured)

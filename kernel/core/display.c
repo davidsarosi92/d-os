@@ -206,11 +206,11 @@ SETTINGS_PANEL(sp_monitors) = {
 CONFIG_KEY(ck_disp1_mode) = {
     .key = "display.bochs1.mode", .group = "Monitors", .type = CFG_ENUM,
     .values = "1280x800 1024x768 1600x900 1920x1080 1920x1200", .def = "1280x800",
-    .help = "the second monitor's resolution (applies when the desktop starts)",
+    .help = "the second monitor's resolution",
 };
 
 CONFIG_KEY(ck_disp1_pos) = {
     .key = "display.bochs1.position", .group = "Monitors", .type = CFG_ENUM,
     .values = "right left below above off", .def = "right",
-    .help = "where the second monitor sits beside the primary, or off (applies when the desktop starts)",
+    .help = "where the second monitor sits beside the primary, or off",
 };

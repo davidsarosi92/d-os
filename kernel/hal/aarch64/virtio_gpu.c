@@ -31,6 +31,8 @@
 #include "pmm.h"
 #include "printf.h"
 #include "hal_api.h"
+#include "display.h"
+#include "settings.h"
 #include "board.h"   /* §M85 — virtio slots from the device tree */   /* kptr_phys — device addresses are PHYSICAL (§M86) */
 #include <stdint.h>
 #include <stddef.h>
@@ -290,12 +292,23 @@ static int vgpu_mode_get(int index, struct fb_mode* out) {
     return 0;
 }
 
-static int vgpu_mode_set(uint32_t w, uint32_t h, uint32_t bpp) {
-    if (!g_ready) return -2;                 /* no device — cannot change     */
-    if (bpp != 32) return -3;                /* one pixel format on purpose   */
-    if (w < 320 || h < 200 || w > 4096 || h > 4096) return -4;
-    if (w == g_w && h == g_h) return 0;      /* already there                 */
+/* ONE SCANOUT'S STATE — the primary's and (§M88) the second output's are two
+ * instances of it, driven by ONE switch routine: a second copy of the
+ * build-then-switch-then-tear-down sequence would be a second chance to get
+ * its ordering wrong. */
+struct vscan {
+    uint32_t scanout;              /* the device's scanout index            */
+    uint32_t id_a, id_b;           /* the two resource ids it alternates     */
+    uint32_t res_id;               /* 0 = nothing bound yet                  */
+    uint64_t fb_phys;              /* PMM_ALLOC_FAIL = none                  */
+    uint32_t frames;
+    uint32_t w, h, pitch;
+};
 
+/* Build a w x h framebuffer + resource and switch `sc` to it; the old one is
+ * taken apart only after the switch.  0 on success; on failure nothing that
+ * was showing has changed. */
+static int vgpu_scanout_switch(struct vscan* sc, uint32_t w, uint32_t h) {
     uint32_t pitch   = w * FB_BPP;
     uint64_t bytes   = (uint64_t)pitch * h;
     uint32_t nframes = (uint32_t)((bytes + 4095) / 4096);
@@ -308,9 +321,12 @@ static int vgpu_mode_set(uint32_t w, uint32_t h, uint32_t bpp) {
                 "(buddy order ceiling)\n", w, h, nframes);
         return -5;
     }
+    {   /* a new monitor shows the desktop's dark, not whatever RAM held */
+        uint32_t* px = (uint32_t*)phys_to_virt(nfb);
+        for (uint64_t k = 0; k < (uint64_t)w * h; k++) px[k] = 0xFF101820u;
+    }
 
-    uint32_t new_id = (g_res_id == GPU_RESOURCE_ID) ? GPU_RESOURCE_ID + 1
-                                                    : GPU_RESOURCE_ID;
+    uint32_t new_id = (sc->res_id == sc->id_a) ? sc->id_b : sc->id_a;
 
     /* 2. New resource + backing.  Both can fail; both undo cleanly because the
      *    scanout still points at the old resource. */
@@ -344,15 +360,15 @@ static int vgpu_mode_set(uint32_t w, uint32_t h, uint32_t bpp) {
     }
 
     /* 3. THE SWITCH — one command, and the point of no return. */
-    struct virtio_gpu_set_scanout* sc = (void*)g_cmd;
-    *sc = (struct virtio_gpu_set_scanout){
+    struct virtio_gpu_set_scanout* ss = (void*)g_cmd;
+    *ss = (struct virtio_gpu_set_scanout){
         .hdr = { .type = VIRTIO_GPU_CMD_SET_SCANOUT },
         .r = { .x = 0, .y = 0, .width = w, .height = h },
-        .scanout_id = GPU_SCANOUT_ID, .resource_id = new_id,
+        .scanout_id = sc->scanout, .resource_id = new_id,
     };
-    if (gpu_submit(sizeof *sc) != VIRTIO_GPU_RESP_OK_NODATA) {
-        kprintf("virtio-gpu: set_scanout(%ux%u) refused — staying at %ux%u\n",
-                w, h, g_w, g_h);
+    if (gpu_submit(sizeof *ss) != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("virtio-gpu: set_scanout %u (%ux%u) refused — staying at %ux%u\n",
+                sc->scanout, w, h, sc->w, sc->h);
         struct virtio_gpu_resource_unref* u = (void*)g_cmd;
         *u = (struct virtio_gpu_resource_unref){
             .hdr = { .type = VIRTIO_GPU_CMD_RESOURCE_UNREF }, .resource_id = new_id };
@@ -364,36 +380,138 @@ static int vgpu_mode_set(uint32_t w, uint32_t h, uint32_t bpp) {
     /* 4. Only now is the old one dead.  Detach before unref: the device is
      *    holding a pointer into RAM we are about to hand back to the
      *    allocator, and the order is how it learns to stop. */
-    uint64_t old_fb     = g_fb_phys;
-    uint32_t old_frames = g_frames;
-    uint32_t old_id     = g_res_id;
+    uint64_t old_fb     = sc->fb_phys;
+    uint32_t old_frames = sc->frames;
+    uint32_t old_id     = sc->res_id;
+    if (old_id) {
+        struct virtio_gpu_resource_detach_backing* d = (void*)g_cmd;
+        *d = (struct virtio_gpu_resource_detach_backing){
+            .hdr = { .type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING },
+            .resource_id = old_id };
+        gpu_submit(sizeof *d);
+        struct virtio_gpu_resource_unref* u = (void*)g_cmd;
+        *u = (struct virtio_gpu_resource_unref){
+            .hdr = { .type = VIRTIO_GPU_CMD_RESOURCE_UNREF }, .resource_id = old_id };
+        gpu_submit(sizeof *u);
+    }
 
-    struct virtio_gpu_resource_detach_backing* d = (void*)g_cmd;
-    *d = (struct virtio_gpu_resource_detach_backing){
-        .hdr = { .type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING },
-        .resource_id = old_id };
-    gpu_submit(sizeof *d);
-    struct virtio_gpu_resource_unref* u = (void*)g_cmd;
-    *u = (struct virtio_gpu_resource_unref){
-        .hdr = { .type = VIRTIO_GPU_CMD_RESOURCE_UNREF }, .resource_id = old_id };
-    gpu_submit(sizeof *u);
+    sc->fb_phys = nfb;
+    sc->frames  = nframes;
+    sc->res_id  = new_id;
+    sc->w = w; sc->h = h; sc->pitch = pitch;
+    if (old_id && old_fb != PMM_ALLOC_FAIL && old_frames)
+        pmm_free_contiguous(old_fb, old_frames);
+    return 0;
+}
 
-    g_fb_phys = nfb;
-    g_frames  = nframes;
-    g_res_id  = new_id;
-    g_w = w; g_h = h; g_pitch = pitch;
+static struct vscan g_prim_scan = { .scanout = GPU_SCANOUT_ID,
+    .id_a = GPU_RESOURCE_ID, .id_b = GPU_RESOURCE_ID + 1 };
+
+static int vgpu_mode_set(uint32_t w, uint32_t h, uint32_t bpp) {
+    if (!g_ready) return -2;                 /* no device — cannot change     */
+    if (bpp != 32) return -3;                /* one pixel format on purpose   */
+    if (w < 320 || h < 200 || w > 4096 || h > 4096) return -4;
+    if (w == g_w && h == g_h) return 0;      /* already there                 */
+
+    g_prim_scan.res_id = g_res_id; g_prim_scan.fb_phys = g_fb_phys;
+    g_prim_scan.frames = g_frames; g_prim_scan.w = g_w; g_prim_scan.h = g_h;
+    int rc = vgpu_scanout_switch(&g_prim_scan, w, h);
+    if (rc) return rc;
+    g_fb_phys = g_prim_scan.fb_phys;
+    g_frames  = g_prim_scan.frames;
+    g_res_id  = g_prim_scan.res_id;
+    g_w = w; g_h = h; g_pitch = g_prim_scan.pitch;
 
     /* The console + GUI read the geometry from fb_terminal, so tell it before
      * anything draws — a renderer using the old pitch writes diagonal stripes,
      * which looks like a device bug and is arithmetic. */
-    fb_adopt_mode((volatile uint32_t*)phys_to_virt(nfb), w, h, pitch);
-    if (old_fb != PMM_ALLOC_FAIL && old_frames)
-        pmm_free_contiguous(old_fb, old_frames);
-
+    fb_adopt_mode((volatile uint32_t*)phys_to_virt(g_fb_phys), w, h, g_pitch);
     kprintf("virtio-gpu: mode %ux%u (resource %u, %u frames)\n",
-            w, h, new_id, nframes);
+            w, h, g_res_id, g_frames);
     return 0;
 }
+
+/* ==========================================================================
+ * §M88 rung (2026-09-29) — THE DEVICE'S SECOND SCANOUT AS A SECOND MONITOR.
+ *
+ * QEMU's virtio-gpu can drive several heads (`max_outputs=N`); the config
+ * space says how many (`num_scanouts`, offset 8).  Scanout 1 becomes the
+ * display output "virtio1": its own RAM framebuffer (the compositor draws
+ * straight into it — this memory is ordinary RAM, not Device memory, so no
+ * shadow is needed) and a flush that is the primary's transfer + resource
+ * flush with its own resource id.  Not asked for when there is one head.
+ * ========================================================================== */
+static struct vscan g_sec_scan = { .scanout = 1, .id_a = 10, .id_b = 11,
+                                   .fb_phys = PMM_ALLOC_FAIL };
+static struct display_output g_sec_out;
+
+static void vgpu_rect_push(uint32_t res, uint32_t pitch, uint32_t x, uint32_t y,
+                           uint32_t w, uint32_t h) {
+    dsb();   /* make the CPU's pixel writes visible to the device's DMA read */
+    struct virtio_gpu_transfer_to_host_2d* t = (void*)g_cmd;
+    t->hdr = (struct virtio_gpu_ctrl_hdr){ .type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D };
+    t->r = (struct virtio_gpu_rect){ .x = x, .y = y, .width = w, .height = h };
+    t->offset = (uint64_t)y * pitch + (uint64_t)x * FB_BPP;
+    t->resource_id = res;
+    t->padding = 0;
+    gpu_submit(sizeof *t);
+
+    struct virtio_gpu_resource_flush* f = (void*)g_cmd;
+    f->hdr = (struct virtio_gpu_ctrl_hdr){ .type = VIRTIO_GPU_CMD_RESOURCE_FLUSH };
+    f->r = (struct virtio_gpu_rect){ .x = x, .y = y, .width = w, .height = h };
+    f->resource_id = res;
+    f->padding = 0;
+    gpu_submit(sizeof *f);
+}
+
+static void vsec_flush(struct display_output* o, int x, int y, int w, int h) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > o->w) w = o->w - x;
+    if (y + h > o->h) h = o->h - y;
+    if (w <= 0 || h <= 0) return;
+    vgpu_rect_push(g_sec_scan.res_id, g_sec_scan.pitch, (uint32_t)x, (uint32_t)y,
+                   (uint32_t)w, (uint32_t)h);
+}
+
+static int vsec_set_mode(struct display_output* o, int w, int h) {
+    if (w < 320 || h < 200 || w > 4096 || h > 4096) return -1;
+    if (vgpu_scanout_switch(&g_sec_scan, (uint32_t)w, (uint32_t)h) != 0) return -1;
+    o->px = (uint32_t*)phys_to_virt(g_sec_scan.fb_phys);
+    o->w = w; o->h = h; o->stride = w;
+    vsec_flush(o, 0, 0, w, h);
+    return 0;
+}
+
+static void vgpu_second_scanout(void) {
+    uint32_t n = r32(0x100 + 8);                  /* config.num_scanouts */
+    if (n < 2) return;
+    if (vgpu_scanout_switch(&g_sec_scan, FB_WIDTH, FB_HEIGHT) != 0) {
+        kprintf("virtio-gpu: %u scanouts, but the second could not be set up\n", n);
+        return;
+    }
+    g_sec_out = (struct display_output){
+        .w = (int)g_sec_scan.w, .h = (int)g_sec_scan.h, .stride = (int)g_sec_scan.w,
+        .px = (uint32_t*)phys_to_virt(g_sec_scan.fb_phys),
+        .flush = vsec_flush, .set_mode = vsec_set_mode };
+    const char* nm = "virtio1";
+    for (int i = 0; nm[i]; i++) g_sec_out.name[i] = nm[i];
+    vsec_flush(&g_sec_out, 0, 0, g_sec_out.w, g_sec_out.h);
+    if (display_register(&g_sec_out) >= 0)
+        kprintf("virtio-gpu: scanout 1 is a second monitor, %ux%u (%u scanouts)\n",
+                g_sec_scan.w, g_sec_scan.h, n);
+}
+
+CONFIG_KEY(ck_virtio1_mode) = {
+    .key = "display.virtio1.mode", .group = "Monitors", .type = CFG_ENUM,
+    .values = "1280x800 1024x768 1600x900 1920x1080 1920x1200", .def = "1280x800",
+    .help = "the second monitor's resolution",
+};
+CONFIG_KEY(ck_virtio1_pos) = {
+    .key = "display.virtio1.position", .group = "Monitors", .type = CFG_ENUM,
+    .values = "right left below above off", .def = "right",
+    .help = "where the second monitor sits beside the primary, or off",
+};
 
 /* Copy a dirty rect out of guest RAM into the host resource, then present it.
  * fb_terminal calls this after every render primitive.  Rects are clamped to
@@ -404,22 +522,7 @@ static void vgpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     if (x + w > g_w) w = g_w - x;
     if (y + h > g_h) h = g_h - y;
 
-    dsb();   /* make the CPU's pixel writes visible to the device's DMA read */
-
-    struct virtio_gpu_transfer_to_host_2d* t = (void*)g_cmd;
-    t->hdr = (struct virtio_gpu_ctrl_hdr){ .type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D };
-    t->r = (struct virtio_gpu_rect){ .x = x, .y = y, .width = w, .height = h };
-    t->offset = (uint64_t)y * g_pitch + (uint64_t)x * FB_BPP;
-    t->resource_id = g_res_id;
-    t->padding = 0;
-    gpu_submit(sizeof *t);
-
-    struct virtio_gpu_resource_flush* f = (void*)g_cmd;
-    f->hdr = (struct virtio_gpu_ctrl_hdr){ .type = VIRTIO_GPU_CMD_RESOURCE_FLUSH };
-    f->r = (struct virtio_gpu_rect){ .x = x, .y = y, .width = w, .height = h };
-    f->resource_id = g_res_id;
-    f->padding = 0;
-    gpu_submit(sizeof *f);
+    vgpu_rect_push(g_res_id, g_pitch, x, y, w, h);
 }
 
 /* ---- bring-up -------------------------------------------------------------- */
@@ -524,6 +627,7 @@ int virtio_gpu_init(void) {
     }
     kprintf("virtio-gpu: %dx%d scanout up, FB @ %p (%u frames) at slot base %p\n",
             FB_WIDTH, FB_HEIGHT, (void*)(uintptr_t)g_fb_phys, nframes, (void*)g_base);
+    vgpu_second_scanout();                        /* §M88 — a second head, if any */
 
     /* Hand the framebuffer to the portable console.  fb_term_init_direct fills
      * the buffer with the background colour, which its fb_present_flush pushes

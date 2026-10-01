@@ -418,7 +418,8 @@ def qemu_argv(a, sersock, monsock):
         # is the same shape as the bug the comment above describes.
         if not a.no_display:
             argv += [
-                "-device", "virtio-gpu-device",
+                "-device", "virtio-gpu-device,id=gpu0" +
+                    (",max_outputs=%d" % a.gpu_outputs if a.gpu_outputs > 1 else ""),
                 "-device", "virtio-keyboard-device",
                 "-device", "virtio-mouse-device",
             ]
@@ -590,6 +591,9 @@ def main():
     ap.add_argument("--second-display", action="store_true",
                     help="§M88 — attach a second monitor (QEMU bochs-display, "
                          "id disp2); --screenshot2 dumps what it shows")
+    ap.add_argument("--gpu-outputs", type=int, default=1,
+                    help="§M88 — aarch64: heads on the virtio-gpu (max_outputs); "
+                         "with 2, --screenshot2 dumps head 1")
     ap.add_argument("--screenshot2", default="",
                     help="§M88 — after the commands, dump the SECOND monitor "
                          "(device disp2) to this PPM path")
@@ -711,7 +715,8 @@ def main():
             if a.screenshot2:
                 # HMP: `screendump <file> [device] [head]` — the device is a
                 # positional argument (QEMU 11 rejects "-d" before or after)
-                mon.cmd("screendump " + os.path.abspath(a.screenshot2) + " disp2")
+                dev = "disp2" if a.second_display else "gpu0 1"
+                mon.cmd("screendump " + os.path.abspath(a.screenshot2) + " " + dev)
                 time.sleep(2)
         mon.quit()
     finally:

@@ -15522,9 +15522,40 @@ there (exactly 1280x800); the "below" arrangement with a drag down through the
 taskbar line, clean.  x86_64 and aarch64 (virtio-gpu primary + bochs-display):
 3200x1200 and 2560x800 desktops.
 
-**Open:** per-output mode setting; applying an arrangement without restarting
-the desktop; left/above; a desktop larger than 16 MiB (two 1920x1200 screens);
-virtio-gpu's own second scanout; a taskbar per monitor.
+**The rungs (2026-09-29/10-01):**
+- **A desktop past 16 MiB.**  `BUDDY_MAX_ORDER` 12 → 13 (32 MiB blocks), and
+  kmalloc hands the unused TAIL of every block of 1 MiB or more back to the
+  buddy (`EXACT_MIN_ORDER`, a 64-slot record of page counts for kfree) — so
+  two 1920x1200 monitors (a 3840x1200 desktop, 18.4 MiB per surface) cost
+  what they need: measured +12.8 MiB over a 1920x1200 + 1280x800 desktop,
+  where whole blocks would have cost ~32 MiB more.
+- **Per-output modes:** `display.<name>.mode` through an appended `set_mode`
+  op (bochs_out reprograms DISPI and swaps its shadow; virtio-gpu builds a new
+  resource).  The new buffer is allocated before the device is touched, and a
+  clamped mode is undone.
+- **Left and above:** `display_arrange` places outputs around the primary and
+  then shifts the desktop to start at (0,0); the primary's offset is
+  `prim_x/prim_y`.  The shell, the taskbar strip, `work_h`, popup extents and
+  every window an app places stay in the PRIMARY's coordinates — the
+  compositor adds the offset in `window_alloc`, the panel blits, a VIEW of the
+  back buffer for the icon layer, `pevq_push` (the shell's pointer events) and
+  the primary's present.  Every change is a no-op at offset 0.
+- **Live re-arrangement:** a `display.*` change re-derives the desktop on the
+  compositor between frames — the SAME `gui_outputs_layout` the desktop starts
+  with, and §M61's rebuild path (allocate before freeing; fall back to the
+  primary alone).  Windows are put back on a monitor; the primary's own mode
+  may now change with two monitors (it used to be refused).
+- **virtio-gpu's second scanout** (aarch64): `num_scanouts` from config space;
+  scanout 1 is the output `virtio1`, built by the same build-switch-teardown
+  routine the primary's mode set now uses (one copy).  Harness: `--gpu-outputs 2`.
+
+Verified by picture: i386 two 1920x1200 heads; left/above with the Start menu
+opened by a driven click on the offset primary; live left → 1920x1200 → below
+→ primary 1280x800; x86_64 and aarch64 (bochs-display and virtio-gpu heads).
+
+**Open:** a taskbar per monitor — a change to the desktop-shell contract (one
+`draw(panelsurf)` today) and a UX choice (Windows' "all taskbars" vs "the
+taskbar where the window is"), not yet decided.
 
 ### 4.119 §M89 — Java: an unmodified JRE and JDK in a container (2026-09-28)
 
@@ -15693,6 +15724,7 @@ at thread death.
 
 ## 8. Change log
 
+- **2026-10-01 — §M88 rungs: desktops past 16 MiB (buddy order 13 + exact large kmalloc), per-output modes, left/above arrangements, live re-arrangement, virtio-gpu's second scanout (DOCS §4.118).  Only the per-monitor taskbar remains open.**
 - **2026-09-29 — Autologin to an account WITH a password.  `users.autologin` is machine scope (admin-only), so it is already the explicit decision the "no password" rule stood in for; it now signs such an account in at power-on and says so at boot, while the password still guards the lock screen, the picker after Sign out (that path never re-enters the autologin decision) and `login`.  Accounts panel button, help text and both catalogues follow.**
 - **2026-09-29 — §M89 from use: `java -version` in a terminal looked frozen.  Its output came from the JavaMain THREAD, which had no terminal (a user task's children now inherit its `out_console`), and every JVM thread stayed a DEAD zombie (a Linux thread is joined through its CLEARTID futex, so it is no longer reap-owned).  Found on the way by the aarch64 regression: a signal to a thread spinning in user code was re-posted forever (the ~4.7 KB arm64 frame always reached an untouched stack page and the IRQ path refused to fault it in) — the IRQ return is a preemption point, so it now delivers with interrupts on and prefault allowed, on all three arches (`sigmusl` 20/20 on aarch64, was 0/5 for test 7).  An intermittent aarch64 `out_lock` deadlock seen alongside it did not recur in 4×15 commands; `SPINLOCK STUCK` now also prints `held since` — the site that took the lock (a 256-slot table hashed by lock address; `waitq_lock` records its caller).**
 - **2026-09-28 — §M89: Java runs.  An unmodified Temurin 21 JDK compiles and runs `Hello.java` (threads, GC) on x86_64 and aarch64; `java -version` from the JRE on both.  Built for it: a reservation layer (demand-zero, PROT_NONE, lazy file maps), Linux signals 1..64 with real frames on all three arches (faults to handlers, altstack, delivery on the interrupt path), arm64 threads, a real futex (it had failed on every call on x86_64 since M35), a dozen calls moved from the x86 switches into the shared engine, symbolic links, and `app install` for installed software.  Found on the way: ramfs's 16 MiB file ceiling, musl run "secure" for want of AT_UID, execve dropping envp, threads copying the fd table, clrex on aarch64 (DOCS §4.119).**
