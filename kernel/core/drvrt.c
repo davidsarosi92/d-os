@@ -307,10 +307,10 @@ drv_handle drv_mmio_request(struct drv_rt* rt, uint64_t phys, size_t len,
         vmm_map(va + o, (uintptr_t)phys + o, VMM_WRITABLE);
     r->va = va;
 #else
-    /* aarch64: the kernel identity-maps device space in 1 GiB blocks, so the
-     * physical address IS the pointer once its block is present. */
-    mmu_map_device_1gib(phys);
-    r->va = (uintptr_t)phys;
+    /* aarch64 (§M90): device memory lives in the kernel half; the pointer comes
+     * from hal_mmio_map, not from the physical address. */
+    r->va = (uintptr_t)hal_mmio_map(phys, len);
+    if (!r->va) return DRV_ENORES;          /* the slot is released with the rest */
 #endif
     return h;
 }

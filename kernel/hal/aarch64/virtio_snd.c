@@ -677,7 +677,8 @@ static int snd_dev_init(struct snd_dev* d, uintptr_t base) {
  * output stream is what §M23 is scoped to). */
 int virtio_snd_init(void) {
     for (int i = 0; i < board_virtio_count(); i++) {
-        uintptr_t base = (uintptr_t)board_virtio_base(i);
+        uintptr_t base = (uintptr_t)hal_mmio_map(board_virtio_base(i), 0x200);   /* §M90 */
+        if (!base) continue;
         if (*(volatile uint32_t*)(base + R_MAGIC) != VIRTIO_MAGIC) continue;
         if (*(volatile uint32_t*)(base + R_VERSION) != 2) continue;
         if (*(volatile uint32_t*)(base + R_DEVICEID) != VIRTIO_DEVID_SOUND) continue;

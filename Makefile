@@ -110,6 +110,7 @@ ifeq ($(ARCH),i386)
       kernel/hal/x86/task_arch.c \
       kernel/hal/x86/lapic.c \
       kernel/hal/x86/tlb.c \
+      kernel/hal/x86/mmio.c \
       kernel/hal/x86/tsc.c \
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/smp.c \
@@ -320,6 +321,7 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/signal.c \
       kernel/hal/x86/lapic.c \
       kernel/hal/x86/tlb.c \
+      kernel/hal/x86/mmio.c \
       kernel/hal/x86/tsc.c \
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/pci.c \
@@ -834,6 +836,7 @@ CORE_C_SRCS := \
     kernel/core/ktime.c \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
+    kernel/core/eventfd.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
@@ -885,6 +888,7 @@ CORE_C_SRCS := \
     kernel/core/ktime.c \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
+    kernel/core/eventfd.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
@@ -1195,6 +1199,7 @@ CORE_C_SRCS := \
     kernel/core/ktime.c \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
+    kernel/core/eventfd.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \

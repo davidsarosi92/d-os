@@ -37,7 +37,8 @@
 #include "task.h"
 #include "vfs.h"
 #include "fd.h"
-#include "timerfd.h"       /* §M53 stage 3 — timer descriptors */
+#include "timerfd.h"
+#include "eventfd.h"       /* §M53 stage 3 — timer descriptors */
 #include "epoll.h"          /* §M56 — readiness sets            */
 #include "vmm.h"
 #include "pcache.h"
@@ -325,6 +326,7 @@ long sys_write_k(int fd, const void* buf, size_t n) {
     if (o->kind == FD_VFS)  return (long)vfs_write(o->file, buf, n);
     if (o->kind == FD_SOCK) return usock_send(o->sock, buf, n, NULL);
     if (o->kind == FD_NETSOCK) return netsock_write(o->nsock, buf, n);
+    if (o->kind == FD_EVENT) return eventfd_write(o->efd, buf, n, !o->nonblock);   /* §M90 */
     return -1;                                 /* shm: not write(2)-able */
 }
 
@@ -409,6 +411,7 @@ long sys_read_k(int fd, void* buf, size_t n) {
      * it.  Blocking by default, like every other read here; a caller that
      * wants the non-blocking form uses poll(2), which is the whole point of
      * the descriptor existing. */
+    if (o->kind == FD_EVENT) return eventfd_read(o->efd, buf, n, block);   /* §M90 */
     if (o->kind == FD_TIMER) {
         long r = timerfd_read(o->tfd, buf, n, block);
         /* Reading a timerfd RESETS its expiration count, so it stops being
@@ -1221,6 +1224,12 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
     case FD_TIMER:
         if (timerfd_can_read(o->tfd)) r |= POLLIN;
         break;
+    /* §M90 — an eventfd: readable while its counter is non-zero, writable
+     * while one more can be added (Go's netpoller wakes itself through one). */
+    case FD_EVENT:
+        if (eventfd_can_read(o->efd))  r |= POLLIN;
+        if (eventfd_can_write(o->efd)) r |= POLLOUT;
+        break;
     /* §M56 — an AF_INET socket used to fall through to "always ready", so a
      * loop polling one span at full speed and every epoll_wait on it returned
      * instantly. */
@@ -1377,6 +1386,20 @@ int sys_poll(struct pollfd* pfds, int nfds, int timeout) {
  * the kernel's own interface.  The personality layer converts; the native ABI
  * speaks the one unit the clock speaks.
  * --------------------------------------------------------------------------- */
+/* §M90 — eventfd(initval, flags): EFD_SEMAPHORE = 1, EFD_NONBLOCK =
+ * O_NONBLOCK (0x800); EFD_CLOEXEC is accepted (this system keeps no
+ * close-on-exec set for such descriptors). */
+int sys_eventfd_create(uint64_t init, int flags) {
+    struct eventfd* e = eventfd_create_obj(init, flags & 1);
+    if (!e) return -12;
+    struct ofile* o = ofile_from_eventfd(e);
+    if (!o) { eventfd_close(e); return -12; }
+    if (flags & 0x800) o->nonblock = 1;
+    int fd = fd_install(o);
+    if (fd < 0) ofile_unref(o);
+    return fd;
+}
+
 int sys_timerfd_create(void) {
     struct timerfd* tf = timerfd_create_obj();
     if (!tf) return -1;

@@ -245,6 +245,7 @@ int  sys_dup2(int oldfd, int newfd);    /* redirect a descriptor               *
 int  sys_kill(int pid, int sig);        /* post a signal to a task             */
 /* §M53 stage 3 — see the SYS_TIMERFD_* notes above. */
 int  sys_timerfd_create(void);
+int  sys_eventfd_create(uint64_t init, int flags);   /* §M90 */
 int  sys_timerfd_settime(int fd, int abs, uint64_t value_ns, uint64_t interval_ns);
 int  sys_timerfd_gettime_k(int fd, uint64_t* remaining_ns, uint64_t* interval_ns);
 int  sys_timerfd_settime_u(int fd, int abs, const uint64_t* times);

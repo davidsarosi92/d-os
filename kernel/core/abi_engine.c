@@ -525,6 +525,14 @@ static unsigned long abi_itimerspec_bytes(const struct abi_ctx* c) {
 #define ABI_ITS_VAL_SEC  2
 #define ABI_ITS_VAL_NSEC 3
 
+/* §M90 — eventfd2(initval, flags) / eventfd(initval). */
+static long h_eventfd(struct abi_ctx* c) {
+    return sys_eventfd_create((uint64_t)(uint32_t)c->a[0], (int)c->a[1]);
+}
+static long h_eventfd_old(struct abi_ctx* c) {
+    return sys_eventfd_create((uint64_t)(uint32_t)c->a[0], 0);
+}
+
 static long h_timerfd_create(struct abi_ctx* c) {
     (void)c;
     /* The clockid and flags are accepted and ignored: there is one clock here
@@ -1539,6 +1547,8 @@ static const struct {
     [ABI_SET_TID_ADDRESS] = { "set_tid_address", h_settid },
     [ABI_SIGPROCMASK]     = { "sigprocmask",     h_sigprocmask },
     [ABI_TIMERFD_CREATE]  = { "timerfd_create",  h_timerfd_create  },
+    [ABI_EVENTFD]         = { "eventfd2",        h_eventfd         },
+    [ABI_EVENTFD_OLD]     = { "eventfd",         h_eventfd_old     },
     [ABI_TIMERFD_SETTIME] = { "timerfd_settime", h_timerfd_settime },
     [ABI_TIMERFD_GETTIME] = { "timerfd_gettime", h_timerfd_gettime },
     [ABI_SETITIMER]       = { "setitimer",       h_setitimer       },

@@ -187,10 +187,9 @@ static int e1000e_init(void* ctx) {
     if (bar0 & 1) { kprintf("e1000e: BAR0 is I/O space?\n"); return -1; }
     uint32_t mmio = bar0 & ~0xFu;
     if (!mmio) { kprintf("e1000e: BAR0 is not programmed\n"); return -1; }
-    /* x86: identity-map the register window uncached (a no-op on aarch64,
-     * where the low 4 GiB is already device memory). */
-    vmm_map_4mib(mmio & 0xFFC00000u, mmio & 0xFFC00000u, VMM_WRITABLE | VMM_CACHE_DIS);
-    g_e.regs = (volatile uint8_t*)(uintptr_t)mmio;
+    /* §M90 — through hal_mmio_map (where this arch keeps device memory). */
+    g_e.regs = (volatile uint8_t*)hal_mmio_map(mmio, 0x20000);
+    if (!g_e.regs) { kprintf("e1000e: cannot map the registers\n"); return -1; }
 
     /* Reset, then mask every interrupt source: this driver polls. */
     wr(R_IMC, 0xFFFFFFFFu);

@@ -7,7 +7,8 @@
 #include "fd.h"
 #include "hal_api.h"   /* phys_to_virt / virt_to_phys — kernel direct map */
 #include "vfs.h"
-#include "timerfd.h" /* §M53 stage 3 — FD_TIMER */
+#include "timerfd.h"
+#include "eventfd.h"   /* §M90 */ /* §M53 stage 3 — FD_TIMER */
 #include "epoll.h"   /* §M56 — FD_EPOLL         */
 #include "pmm.h"
 #include "kmalloc.h"
@@ -71,6 +72,12 @@ struct ofile* ofile_from_timerfd(struct timerfd* t) {
     return o;
 }
 
+struct ofile* ofile_from_eventfd(struct eventfd* e) {
+    struct ofile* o = ofile_alloc(FD_EVENT);
+    if (o) { o->efd = e; eventfd_set_owner(e, o); }
+    return o;
+}
+
 struct ofile* ofile_from_epoll(struct epoll* e) {
     struct ofile* o = ofile_alloc(FD_EPOLL);
     if (o) o->ep = e;
@@ -102,6 +109,7 @@ void ofile_unref(struct ofile* o) {
         case FD_TIMER:   if (o->tfd)   timerfd_close(o->tfd);    break;
         case FD_EPOLL:   if (o->ep)    epoll_close(o->ep);       break;
         case FD_CONSOLE: break;                   /* nothing behind it */
+        case FD_EVENT:   if (o->efd)   eventfd_close(o->efd);    break;
     }
     kfree(o);
 }

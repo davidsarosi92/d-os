@@ -20,7 +20,8 @@
 
 #include "pci.h"
 #include "printf.h"
-#include "board.h"   /* §M85 — the machine, discovered */
+#include "board.h"
+#include "hal_api.h"   /* §M85 — the machine, discovered */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -47,15 +48,18 @@ static int pci_present(void) { return ECAM_BASE != 0; }
  * our own code. */
 static int bus_ok(uint8_t bus) { return ((uint64_t)bus << 20) < g_board.ecam_size; }
 
+/* §M90 — the config space is reached through hal_mmio_map (device memory in
+ * the kernel half), not at its physical address. */
+static uintptr_t g_ecam_va;
 static void pci_map_ecam(void) {
     if (g_mapped || !pci_present()) return;
-    mmu_map_device_1gib(ECAM_BASE);             /* reach the config space       */
+    g_ecam_va = (uintptr_t)hal_mmio_map(ECAM_BASE, g_board.ecam_size ? g_board.ecam_size : (256u << 20));
     g_mmio_next = MMIO_BASE;
     g_mapped = 1;
 }
 
 static inline volatile void* cfg(uint8_t bus, uint8_t slot, uint8_t func, uint32_t off) {
-    return (volatile void*)(uintptr_t)(ECAM_BASE
+    return (volatile void*)(g_ecam_va
         + ((uint64_t)bus << 20) + ((uint64_t)slot << 15)
         + ((uint64_t)func << 12) + off);
 }

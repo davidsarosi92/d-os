@@ -996,13 +996,10 @@ static int xhci_init(void* ctx) {
 
     /* Map a generous window (one 4 MiB PSE PDE) so all of cap/op/rt/db
      * regions land in a single contiguous virtual range. */
-    uint32_t mmio_aligned = mmio_phys & 0xFFC00000u;
-    if (vmm_map_4mib(mmio_aligned, mmio_aligned,
-                     VMM_WRITABLE | VMM_CACHE_DIS) != 0 ) {
-        /* If the region was already mapped earlier (PSE identity range
-         * extends to 256 MiB) we silently accept that and continue. */
-    }
-    xhc.mmio = (volatile uint8_t*)(uintptr_t)mmio_phys;
+    /* §M90 — through hal_mmio_map (aarch64 keeps device memory in the kernel
+     * half; x86 identity-maps it uncached, as this code did by hand). */
+    xhc.mmio = (volatile uint8_t*)hal_mmio_map(mmio_phys, 0x10000);
+    if (!xhc.mmio) { kprintf("xhci: cannot map the registers\n"); return -1; }
 
     if (xhci_reset_and_init() != 0) {
         kprintf("xhci: init failed\n"); return -1;

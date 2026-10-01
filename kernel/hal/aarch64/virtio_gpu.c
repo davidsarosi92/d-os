@@ -529,7 +529,8 @@ static void vgpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 
 static int gpu_transport_init(void) {
     for (int i = 0; i < board_virtio_count(); i++) {
-        uintptr_t base = (uintptr_t)board_virtio_base(i);
+        uintptr_t base = (uintptr_t)hal_mmio_map(board_virtio_base(i), 0x200);   /* §M90 */
+        if (!base) continue;
         if (*(volatile uint32_t*)(base + R_MAGIC) != VIRTIO_MAGIC) continue;
         uint32_t ver = *(volatile uint32_t*)(base + R_VERSION);
         uint32_t dev = *(volatile uint32_t*)(base + R_DEVICEID);

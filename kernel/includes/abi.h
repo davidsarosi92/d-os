@@ -107,6 +107,8 @@ enum abi_op {
      * guest ABI — which is why the map now carries it (see abi_map.word_bytes)
      * rather than the handler guessing. */
     ABI_TIMERFD_CREATE,
+    ABI_EVENTFD,            /* §M90 — eventfd2 (and the old eventfd, flags 0) */
+    ABI_EVENTFD_OLD,
     ABI_TIMERFD_SETTIME,
     ABI_TIMERFD_GETTIME,
     ABI_SETITIMER,

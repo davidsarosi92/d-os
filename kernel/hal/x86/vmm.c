@@ -903,3 +903,7 @@ int vmm_space_range_state(struct vmm_space* s, uintptr_t a, uintptr_t b) {
     }
     return st;
 }
+
+/* §M90 — see vmm.h.  On x86 the kernel still owns everything below the user
+ * base (the x86_64 kernel itself is linked low), so the two coincide. */
+uintptr_t vmm_user_min(void) { return vmm_user_base(); }

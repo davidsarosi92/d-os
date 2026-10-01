@@ -19,13 +19,22 @@
  * file is arch-specific and lives under kernel/hal/aarch64/).
  * ============================================================================= */
 
-#include "board.h"   /* §M85 — the machine, discovered */
+#include "board.h"
+#include "hal_api.h"   /* §M85 — the machine, discovered */
 #include <stdint.h>
 
 /* PL011 register block base: the board's (§M85), or `virt`'s before the device
  * tree has been read — this UART is the one that reports everything that
  * happens BEFORE that, so it cannot wait for it. */
-#define PL011_BASE   (g_board.uart ? (uintptr_t)g_board.uart : 0x09000000UL)
+/* §M90 — reached through hal_mmio_map once the board is known (device memory
+ * is in the kernel half; no process's TTBR0 carries it).  Before that — the
+ * first lines of a raw boot, on the boot CPU's template TTBR0 — the identity
+ * address `virt` puts the PL011 at still works. */
+static uintptr_t s_uart_va;
+void uart_mmio_prime(void) {
+    if (g_board.uart && !s_uart_va) s_uart_va = (uintptr_t)hal_mmio_map(g_board.uart, 0x1000);
+}
+#define PL011_BASE   (s_uart_va ? s_uart_va : (g_board.uart ? (uintptr_t)g_board.uart : 0x09000000UL))
 
 /* §M85 — on a FIRMWARE boot the console's address is not known until the
  * description has been read, and `virt`'s default is the wrong device on any

@@ -309,7 +309,7 @@ long vma_mmap(uintptr_t addr, size_t len, int prot, int flags, int fd, uint64_t 
         /* MAP_FIXED may land anywhere in the user range the program owns —
          * including below the mmap window (ld.so maps a library's segments
          * over its own reservation), so the bound is the user base, not lo. */
-        int st = (va < vmm_user_base() || va + size < va || va + size > hi)
+        int st = (va < vmm_user_min() || va + size < va || va + size > hi)
                  ? VMA_RS_KERNEL : vmm_space_range_state(mm, va, va + size);
         if (st & VMA_RS_KERNEL) {    /* the kernel's tables are never the program's */
             kmutex_unlock(&s->lock);
@@ -359,7 +359,7 @@ long vma_munmap(uintptr_t addr, size_t len) {
     if (!t || !t->mm) return -E_INVAL;
     if ((addr & (PG - 1)) || len == 0) return -E_INVAL;
     uintptr_t end = addr + ((len + PG - 1) & ~(uintptr_t)(PG - 1));
-    if (end < addr || addr < vmm_user_base() || end > vmm_user_limit()) return -E_INVAL;
+    if (end < addr || addr < vmm_user_min() || end > vmm_user_limit()) return -E_INVAL;
     if (vmm_space_range_state(t->mm, addr, end) & VMA_RS_KERNEL) return -E_INVAL;
     struct vma_set* s = set_of(t->mm, 0);
     if (s) {
@@ -379,7 +379,7 @@ long vma_mprotect(uintptr_t addr, size_t len, int prot) {
     if (!t || !t->mm) return -E_INVAL;
     if (addr & (PG - 1)) return -E_INVAL;
     uintptr_t end = (addr + len + PG - 1) & ~(uintptr_t)(PG - 1);
-    if (end < addr || addr < vmm_user_base() || end > vmm_user_limit()) return -E_INVAL;
+    if (end < addr || addr < vmm_user_min() || end > vmm_user_limit()) return -E_INVAL;
     if (vmm_space_range_state(t->mm, addr, end) & VMA_RS_KERNEL) return -E_INVAL;
     uint32_t vf = prot_to_vf(prot);
     struct vma_set* s = set_of(t->mm, 0);

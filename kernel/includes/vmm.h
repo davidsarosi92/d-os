@@ -187,6 +187,11 @@ uintptr_t vmm_space_root_phys(struct vmm_space* space);
  * x86_64 return 1 GiB (0x40000000); aarch64 returns 4 GiB (its identity
  * map covers the low 4 GiB). */
 uintptr_t vmm_user_base(void);
+/* §M90 — the LOWEST address a program may own (a fixed-address Linux binary,
+ * MAP_FIXED, a user pointer passed to a syscall).  vmm_user_base() stays where
+ * this system's own programs and PIE images are placed; on aarch64 the region
+ * below it is the program's too (64 KiB up), on x86 not yet. */
+uintptr_t vmm_user_min(void);
 
 /* ===========================================================================
  * §M75 — what does a space actually hold?

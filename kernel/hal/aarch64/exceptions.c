@@ -20,6 +20,8 @@
 #include "uaccess.h"      /* §1.1 — fault-fixup table for EL0 memory copies */
 #include "drvguard.h"   /* §M33 Tier 0 — contain a driver fault */
 #include "task.h"
+#include "printf.h"
+#include "config.h"
 #include "proc.h"
 #include "vmm.h"
 #include "swap.h"
@@ -58,6 +60,7 @@ void aarch64_irq_dispatch(void) { }
  * decodes x8 and services SYS_PRINT/SYS_EXIT. */
 void signal_deliver(struct trapframe* tf) __attribute__((weak));
 void signal_deliver(struct trapframe* tf) { (void)tf; }
+int lnx_fault_deliver_esr(void* frame, int sig, uintptr_t addr, uint64_t esr);
 void signal_deliver_irq(struct trapframe* tf) __attribute__((weak));
 void signal_deliver_irq(struct trapframe* tf) { (void)tf; }
 
@@ -176,8 +179,17 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
             dump_and_halt("SError (async abort)", tf);
             break;
         case EXC_SYNC: {
-            uint64_t esr;
+            /* §M90 (2026-10-01) — ESR AND FAR ARE READ ONCE, HERE.  They are
+             * per-CPU registers that the NEXT exception on this CPU overwrites,
+             * and the handlers below may SLEEP (bringing a page in from swap or
+             * a file) — another thread then runs, faults, and leaves its own
+             * values behind.  FAR used to be re-read after those calls, so a
+             * fault that could not be resolved was reported to the program
+             * with ANOTHER thread's address: a Go runtime received a SIGSEGV
+             * "at" a heap address while its PC sat in a `yield` loop. */
+            uint64_t esr, far_at_entry;
             __asm__ volatile ("mrs %0, esr_el1" : "=r"(esr));
+            __asm__ volatile ("mrs %0, far_el1" : "=r"(far_at_entry));
             if ((esr >> 26) == EC_SVC64) {   /* EL0/EL1 `svc` → syscall path */
                 /* Run the syscall with interrupts ENABLED — identical treatment
                  * to the x86 `int 0x80` / SYSCALL branches, and for the same
@@ -228,7 +240,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                     (esr & 0x3C) == 0x08) {
                     extern int vmm_af_fault(uintptr_t va);
                     uint64_t far;
-                    __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
+                    far = far_at_entry;
                     if (vmm_af_fault((uintptr_t)far)) {              /* retry */
                         check_el0_return(tf, "access-flag");
                         return;
@@ -244,7 +256,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                 if ((ec == 0x20 || ec == 0x21 || ec == 0x24 || ec == 0x25) &&
                     (esr & 0x3C) == 0x04) {
                     uint64_t far;
-                    __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
+                    far = far_at_entry;
                     int can_sleep = (tf->spsr & 0xF) == 0 ||
                                     (!(tf->spsr & (1u << 7)) && this_cpu()->preempt_count == 0);
                     if (swap_in_fault((uintptr_t)far, can_sleep)) {
@@ -268,7 +280,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                     int is_write  = (int)((esr >> 6) & 1);
                     if (is_write && (dfsc & 0x3C) == 0x0C) {   /* permission fault */
                         uint64_t far;
-                        __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
+                        far = far_at_entry;
                         if (vmm_cow_fault((uintptr_t)far)) return;   /* retry */
                     }
                 }
@@ -296,7 +308,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                      * reading it at all — a FAR of 0 looks exactly like a null
                      * dereference and is not always one. */
                     uint64_t fa = 0;
-                    __asm__ volatile ("mrs %0, far_el1" : "=r"(fa));
+                    fa = far_at_entry;
                     drvguard_report((int)(esr >> 26), "EL1 abort", pc,
                                     (uintptr_t)fa);
                     tf->elr  = (uint64_t)rip_;
@@ -315,7 +327,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
             if ((tf->spsr & 0xF) == 0) {
                 extern void task_exit_code(int) __attribute__((noreturn));
                 uint64_t far, sp0;
-                __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
+                far = far_at_entry;
                 __asm__ volatile ("mrs %0, sp_el0" : "=r"(sp0));
                 /* §M89 — a Linux program that HANDLES the signal this fault
                  * means gets it (with the address) instead of dying.  The
@@ -325,12 +337,22 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                 {
                     uint64_t ec = esr >> 26;
                     int lsig = 11;
-                    if (ec == 0x00) lsig = 4;
+                    /* §M90 — a trapped system-register access (EC 0x18) is
+                     * an illegal instruction to the program, as on Linux, and
+                     * FAR means nothing for it. */
+                    if (ec == 0x00 || ec == 0x18) { lsig = 4; far = tf->elr; }
                     else if (ec == 0x3C) lsig = 5;
                     else if (ec == 0x22 || ec == 0x26 ||
                              ((ec == 0x24 || ec == 0x25) && (esr & 0x3F) == 0x21)) lsig = 7;
                     else if (ec == 0x2C) lsig = 8;
-                    if (lnx_fault_deliver(tf, lsig, (uintptr_t)far)) {
+                    if (config_get_long("debug.user_faults", 0)) {
+                        struct task* ct = task_current();
+                        kprintf("fault: pid %d '%s' sig %d esr %lx far %lx elr %lx sp %lx\n",
+                                ct ? ct->pid : -1, ct ? ct->name : "?", lsig,
+                                (unsigned long)esr, (unsigned long)far,
+                                (unsigned long)tf->elr, (unsigned long)sp0);
+                    }
+                    if (lnx_fault_deliver_esr(tf, lsig, (uintptr_t)far, esr)) {
                         check_el0_return(tf, "signal");
                         return;
                     }

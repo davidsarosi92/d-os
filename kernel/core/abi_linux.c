@@ -66,6 +66,8 @@ static const struct abi_nument linux_i386_ents[] = {
     { 224, ABI_GETTID   },
     /* §M53 stage 3 — timing. */
     { 322, ABI_TIMERFD_CREATE  },
+    { 328, ABI_EVENTFD         },
+    { 323, ABI_EVENTFD_OLD     },
     { 325, ABI_TIMERFD_SETTIME },
     { 254, ABI_EPOLL_CREATE },      /* epoll_create  */
     { 329, ABI_EPOLL_CREATE },      /* epoll_create1 */
@@ -156,6 +158,8 @@ static const struct abi_nument linux_amd64_ents[] = {
     { 293, ABI_PIPE2    },
     /* §M53 stage 3 — timing. */
     { 283, ABI_TIMERFD_CREATE  },
+    { 290, ABI_EVENTFD         },
+    { 284, ABI_EVENTFD_OLD     },
     { 286, ABI_TIMERFD_SETTIME },
     { 213, ABI_EPOLL_CREATE },      /* epoll_create  */
     { 291, ABI_EPOLL_CREATE },      /* epoll_create1 */
@@ -234,6 +238,7 @@ static const struct abi_nument linux_arm64_ents[] = {
     {  59, ABI_PIPE2    },          /* arm64 has only pipe2 */
     /* §M53 stage 3 — timing. */
     {  85, ABI_TIMERFD_CREATE  },
+    {  19, ABI_EVENTFD         },
     {  86, ABI_TIMERFD_SETTIME },
     {  20, ABI_EPOLL_CREATE },      /* epoll_create1 — arm64 has no plain
                                      * epoll_create, and no plain epoll_wait

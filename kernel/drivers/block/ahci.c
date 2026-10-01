@@ -487,9 +487,10 @@ static int ahci_init(void* ctx) {
     /* Map it uncached.  §M33 stage 5 paid for the second half of that: a device
      * register read through a cached mapping returns whatever the CPU cached
      * the first time and silently stops tracking the hardware. */
-    uint32_t aligned = abar & 0xFFC00000u;
-    vmm_map_4mib(aligned, aligned, VMM_WRITABLE | VMM_CACHE_DIS);
-    g_ahci.abar = (volatile uint8_t*)(uintptr_t)abar;
+    /* §M90 — through hal_mmio_map, which knows where this arch keeps device
+     * memory (aarch64: the kernel half, not an identity map in every process). */
+    g_ahci.abar = (volatile uint8_t*)hal_mmio_map(abar, 0x2000);
+    if (!g_ahci.abar) { kprintf("ahci: cannot map the HBA registers\n"); return -1; }
 
     bios_handoff();
     hw32(HBA_GHC, hr32(HBA_GHC) | GHC_AE);

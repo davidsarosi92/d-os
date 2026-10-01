@@ -43,6 +43,14 @@ int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write);
 
 uint64_t* mmu_kernel_l1(void);          /* mmu.c — shared kernel L1 table */
 
+/* §M90 (2026-10-01) — the user region is ALL of TTBR0 from 64 KiB up (the
+ * lowest pages stay unmapped so a NULL dereference faults, Linux's
+ * mmap_min_addr).  It began at 4 GiB while the kernel's Device identity map
+ * occupied L1 slots 0..3 in every process. */
+#define USER_L1_FIRST 0
+#define USER_VA_MIN   0x10000ULL
+uintptr_t vmm_user_min(void) { return USER_VA_MIN; }
+
 /* ---- descriptor bit fields (stage-1, 4 KiB granule) ------------------------ */
 #define PTE_VALID     (1ULL << 0)
 #define PTE_TABLE     (1ULL << 1)       /* at L1/L2: points to a next-level table */
@@ -127,7 +135,7 @@ static uint64_t* next_table(uint64_t* tbl, uint64_t idx) {
  * A leaf can be an L2 2 MiB block or an L3 page.  Tables are identity-reachable. */
 static int access_walk(uintptr_t va, uintptr_t len, int want_write) {
     if (len == 0) return 1;
-    if (va < vmm_user_base()) return 0;
+    if (va < USER_VA_MIN)     return 0;
     if (va + len < va)        return 0;
     /* THE TOP OF THE TTBR0 RANGE (§M86 stage 3, 2026-09-26).  The walk below
      * indexes with `(p >> 30) & 0x1FF`, i.e. it looks only at bits 38..30 —
@@ -164,7 +172,7 @@ static int access_walk(uintptr_t va, uintptr_t len, int want_write) {
  * program's, so it is brought in before the range is refused. */
 int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
     if (access_walk(va, len, want_write)) return 1;
-    if (va < vmm_user_base() || va + len < va || va + len > (1ULL << 39)) return 0;
+    if (va < USER_VA_MIN || va + len < va || va + len > (1ULL << 39)) return 0;
     return vma_prefault(va, len, want_write) && access_walk(va, len, want_write);
 }
 
@@ -176,8 +184,11 @@ struct vmm_space* aarch64_vmm_create(void) {
     s->vma = NULL;                  /* kmalloc does not zero */
     s->l1 = alloc_table();
     if (!s->l1) { kfree(s); return NULL; }
-    uint64_t* kl1 = mmu_kernel_l1();
-    for (int i = 0; i < 4; i++) s->l1[i] = kl1[i];   /* share kernel low-4 GiB */
+    /* §M90 — NOTHING of the kernel's is copied in any more.  The low 4 GiB used
+     * to be the kernel's Device identity map, present in every process — on
+     * exactly the addresses a Linux program is linked at (0x200000).  Device
+     * memory lives in TTBR1 now (mmu.c, hal_mmio_map), so the whole TTBR0
+     * range from USER_VA_MIN up belongs to the program. */
     return s;
 }
 
@@ -374,10 +385,7 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     s->l1 = alloc_table();
     if (!s->l1) { kfree(s); return NULL; }
 
-    uint64_t* kl1 = mmu_kernel_l1();
-    for (int i = 0; i < 4; i++) s->l1[i] = kl1[i];      /* kernel low 4 GiB */
-
-    for (int i1 = 4; i1 < 512; i1++) {                  /* user region only */
+    for (int i1 = USER_L1_FIRST; i1 < 512; i1++) {      /* §M90: all of it is user */
         uint64_t e1 = parent->l1[i1];
         if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) continue;
         uint64_t* pl2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
@@ -490,7 +498,7 @@ static void free_l2_subtree(uint64_t* l2) {
 void vmm_space_destroy(struct vmm_space* s) {
     if (!s) return;
     vma_destroy(s);                 /* §M89 — before the tables: it may unref files */
-    for (int i = 4; i < 512; i++) {                 /* user region = VA >= 4 GiB */
+    for (int i = USER_L1_FIRST; i < 512; i++) {                 /* user region = VA >= 4 GiB */
         uint64_t e = s->l1[i];
         if ((e & PTE_VALID) && (e & PTE_TABLE)) {
             uint64_t* l2 = (uint64_t*)phys_to_virt(e & PTE_ADDR_MASK);
@@ -645,7 +653,7 @@ void vmm_space_swap_undo(struct vmm_space* s, uintptr_t va, uint64_t raw) {
 }
 
 int vmm_space_swapped_entry(struct vmm_space* s, uintptr_t va, uint32_t* slot, uint32_t* flags) {
-    if (!s || ((va >> 30) & 0x1FF) < 4 || (va >> 39)) return -1;
+    if (!s || va < USER_VA_MIN || (va >> 39)) return -1;
     uint64_t* l3 = user_l3_of(s, va);
     if (!l3) return -1;
     uint64_t e = l3[(va >> 12) & 0x1FF];
@@ -670,7 +678,7 @@ int vmm_space_mark_swapped(struct vmm_space* s, uintptr_t va, uint32_t slot, uin
 }
 void vmm_space_walk_swapped(struct vmm_space* s, vmm_swapped_fn cb, void* ctx) {
     if (!s || !cb) return;
-    for (uint64_t i = 4; i < 512; i++) {
+    for (uint64_t i = USER_L1_FIRST; i < 512; i++) {
         uint64_t e1 = s->l1[i];
         if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) continue;
         uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
@@ -708,7 +716,7 @@ void vmm_space_walk_swapped(struct vmm_space* s, vmm_swapped_fn cb, void* ctx) {
 void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
     if (!s || !cb) return;
 
-    for (uint64_t i = 4; i < 512; i++) {                /* user region only   */
+    for (uint64_t i = USER_L1_FIRST; i < 512; i++) {                /* user region only   */
         uint64_t e1 = s->l1[i];
         if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) continue;
         uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
@@ -744,7 +752,7 @@ void vmm_space_walk(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
 uint32_t vmm_space_age(struct vmm_space* s, vmm_walk_fn cb, void* ctx) {
     if (!s) return 0;
     uint32_t cleared = 0;
-    for (uint64_t i = 4; i < 512; i++) {
+    for (uint64_t i = USER_L1_FIRST; i < 512; i++) {
         uint64_t e1 = s->l1[i];
         if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) continue;
         uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
@@ -787,7 +795,7 @@ int vmm_af_fault(uintptr_t va) {
     if (!t || !t->mm) return 0;
     struct vmm_space* s = t->mm;
     uint64_t i = (va >> 30) & 511, j = (va >> 21) & 511, k = (va >> 12) & 511;
-    if (i < 4 || (va >> 39)) return 0;
+    if (va < USER_VA_MIN || (va >> 39)) return 0;
     uint64_t e1 = s->l1[i];
     if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) return 0;
     uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
@@ -842,7 +850,7 @@ void  vmm_space_set_vma(struct vmm_space* s, void* v) { if (s) s->vma = v; }
 uintptr_t vmm_user_limit(void) { return (uintptr_t)1 << 39; }
 
 int vmm_space_probe(struct vmm_space* s, uintptr_t va) {
-    if (!s || va >= ((uintptr_t)1 << 39) || ((va >> 30) & 0x1FF) < 4) return 0;
+    if (!s || va >= ((uintptr_t)1 << 39) || va < USER_VA_MIN) return 0;
     uint64_t e1 = s->l1[(va >> 30) & 0x1FF];
     if (!((e1 & PTE_VALID) && (e1 & PTE_TABLE))) return 0;
     uint64_t* l2 = (uint64_t*)phys_to_virt(e1 & PTE_ADDR_MASK);
@@ -859,7 +867,7 @@ int vmm_space_probe(struct vmm_space* s, uintptr_t va) {
  * by value into every space; everything above is private to the space. */
 int vmm_space_range_state(struct vmm_space* s, uintptr_t a, uintptr_t b) {
     if (!s) return VMA_RS_KERNEL;
-    if (b > ((uintptr_t)1 << 39) || a < ((uintptr_t)4 << 30)) return VMA_RS_KERNEL;
+    if (b > ((uintptr_t)1 << 39) || a < USER_VA_MIN) return VMA_RS_KERNEL;   /* §M90 */
     int st = 0;
     while (a < b) {
         uint64_t e1 = s->l1[(a >> 30) & 0x1FF];

@@ -317,7 +317,8 @@ static int vmb_init_one(struct vmb* v, int idx) {
  * volume's, as it was with one. */
 int virtio_mmio_blk_init(void) {
     for (int i = board_virtio_count() - 1; i >= 0 && g_nvmb < VMB_MAX; i--) {
-        uintptr_t base = (uintptr_t)board_virtio_base(i);
+        uintptr_t base = (uintptr_t)hal_mmio_map(board_virtio_base(i), 0x200);   /* §M90 */
+        if (!base) continue;
         uint32_t magic = *(volatile uint32_t*)(base + R_MAGIC);
         if (magic != VIRTIO_MAGIC) continue;
         uint32_t ver = *(volatile uint32_t*)(base + R_VERSION);

@@ -61,6 +61,13 @@ void board_finish(void) {
             uint64_t b = g_board.virtio_base[j];  g_board.virtio_base[j] = g_board.virtio_base[j - 1];  g_board.virtio_base[j - 1] = b;
             uint32_t q = g_board.virtio_intid[j]; g_board.virtio_intid[j] = g_board.virtio_intid[j - 1]; g_board.virtio_intid[j - 1] = q;
         }
+    /* §M90 — the console's and the interrupt controller's pointers, made NOW:
+     * a crash report prints through the UART and must not have to create a
+     * mapping (and take a lock) in the middle of a fault. */
+    extern void uart_mmio_prime(void);
+    extern void gic_mmio_prime(void);
+    uart_mmio_prime();
+    gic_mmio_prime();
 }
 
 static const char* src_of(uint32_t bit) {

@@ -27,11 +27,12 @@ struct usock;                   /* unix socket endpoint (stage 5)          */
  * `dup2(10, 1)` afterwards — and an empty slot cannot be copied anywhere.  So a
  * dup of an empty std slot yields an FD_CONSOLE ofile, which reads and writes
  * exactly as the empty slot would. */
-enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER, FD_EPOLL, FD_CONSOLE };
+enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER, FD_EPOLL, FD_CONSOLE, FD_EVENT };
 
 struct netsock;                 /* network (AF_INET) socket — usyscall.c        */
 struct timerfd;                 /* §M53 stage 3 — a deadline behind a descriptor */
 struct epoll;                   /* §M56 — a readiness set behind a descriptor   */
+struct eventfd;                 /* §M90 — a counter behind a descriptor         */
 struct ofile;
 /* §M73 — the ofile to duplicate for `fd`: its table entry, or for an empty
  * std slot a NEW console ofile (*fresh set: the caller owns that reference). */
@@ -54,6 +55,7 @@ struct ofile {
     struct netsock* nsock;      /* FD_NETSOCK (M24 socket API) */
     struct timerfd* tfd;        /* FD_TIMER (§M53 stage 3) */
     struct epoll* ep;           /* FD_EPOLL (§M56)         */
+    struct eventfd* efd;        /* FD_EVENT (§M90)         */
 };
 
 /* Wrap a resource in a fresh ofile (refcount 1), or NULL on OOM. */
@@ -63,6 +65,7 @@ struct ofile* ofile_from_sock(struct usock* s);
 struct ofile* ofile_from_netsock(struct netsock* s);
 struct ofile* ofile_from_timerfd(struct timerfd* t);
 struct ofile* ofile_from_epoll(struct epoll* e);
+struct ofile* ofile_from_eventfd(struct eventfd* e);
 
 /* Resolve a descriptor of the CURRENT task to its open file description, or
  * NULL if it is not open.  A live table read, not a cached pointer — which is

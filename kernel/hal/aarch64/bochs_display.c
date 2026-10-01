@@ -80,10 +80,9 @@ static uint64_t bar_addr(const struct pci_device* d, int i) {
     return a;
 }
 
-/* A BAR above the always-mapped low 4 GiB gets its 1 GiB Device block. */
+/* §M90 — every BAR through hal_mmio_map (device memory in the kernel half). */
 static void* map_bar(uint64_t pa) {
-    if (pa >= (1ull << 32)) mmu_map_device_1gib(pa);
-    return (void*)(uintptr_t)pa;
+    return (void*)hal_mmio_map(pa, 16u << 20);
 }
 
 static void bochs_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {

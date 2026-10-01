@@ -14,10 +14,17 @@
  * ============================================================================= */
 
 #include "rtc.h"
-#include "board.h"   /* §M85 — the machine, discovered */
+#include "board.h"
+#include "hal_api.h"   /* §M85 — the machine, discovered */
 #include <stdint.h>
 
-#define PL031_BASE  ((uintptr_t)g_board.rtc)       /* §M85: 0 = none */
+/* §M85: 0 = none.  §M90: the pointer from hal_mmio_map. */
+static uintptr_t s_rtc_va;
+static inline uintptr_t pl031_base(void) {
+    if (!s_rtc_va && g_board.rtc) s_rtc_va = (uintptr_t)hal_mmio_map(g_board.rtc, 0x1000);
+    return s_rtc_va;
+}
+#define PL031_BASE  pl031_base()
 #define PL031_DR    0x000               /* data register: seconds since epoch */
 
 int rtc_read(struct rtc_time* out) {

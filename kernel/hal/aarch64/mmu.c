@@ -4,9 +4,12 @@
  * THE LAYOUT (4 KiB granule, 39-bit halves: T0SZ = T1SZ = 25)
  *
  *   TTBR1 (kernel, every CPU, never switched)
- *     slots 0..510   the DIRECT MAP: VA KERNEL_DIRECT_MAP_BASE + (PA -
+ *     slots 0..479   the DIRECT MAP: VA KERNEL_DIRECT_MAP_BASE + (PA -
  *                    aarch64_phys_offset), 1 GiB Normal blocks, only over RAM
  *                    the boot description names (holes stay unmapped);
+ *     slots 480..509 DEVICE WINDOWS (§M90): 1 GiB Device blocks handed out by
+ *                    hal_mmio_map — every register a driver touches is reached
+ *                    here, so no process's TTBR0 needs device memory;
  *     slot 511       the kernel IMAGE at KIMAGE_VBASE, through an L2 table of
  *                    2 MiB blocks onto wherever the image was loaded.
  *   TTBR0 (per process; this file's l1_table is the kernel-thread template)
@@ -65,6 +68,8 @@ struct dos_bootinfo aarch64_bootinfo; /* copied here before anything allocates *
 int      aarch64_have_bootinfo;
 int      aarch64_uart_hold;           /* firmware boot: console unknown yet  */
 
+#define DEV_SLOT_FIRST 480      /* §M90 — TTBR1 slots 480..509: device windows */
+#define DEV_SLOT_END   510
 static uint64_t l1_table[512]  __attribute__((aligned(4096)));  /* TTBR0 tmpl  */
 static uint64_t l1_ttbr1[512]  __attribute__((aligned(4096)));  /* kernel half */
 static uint64_t l2_kimage[512] __attribute__((aligned(4096)));  /* the image   */
@@ -181,7 +186,7 @@ void aarch64_mmu_early(uint64_t pa, uint64_t va, uint64_t arg) {
      * construction; the raw boot's device tree is read through it (a firmware
      * boot maps its described RAM before touching anything else). */
     uint64_t islot = ((base_pa & ~(GIB - 1)) - aarch64_phys_offset) >> 30;
-    if (islot < 511) l1_ttbr1[islot] = normal_block(base_pa & ~(GIB - 1)) | DESC_UXN;
+    if (islot < DEV_SLOT_FIRST) l1_ttbr1[islot] = normal_block(base_pa & ~(GIB - 1)) | DESC_UXN;
 
     /* The temporary identity map of the image, 4-level so any PA works. */
     idmap_l0[(base_pa >> 39) & 511] = (uint64_t)(uintptr_t)idmap_l1 | DESC_TABLE;
@@ -212,7 +217,7 @@ void mmu_direct_map_range(uint64_t base, uint64_t size) {
     if (base < aarch64_phys_offset) base = aarch64_phys_offset;
     uint64_t first = (base - aarch64_phys_offset) >> 30;
     uint64_t last  = (end - aarch64_phys_offset + GIB - 1) >> 30;
-    if (last > 511) last = 511;
+    if (last > DEV_SLOT_FIRST) last = DEV_SLOT_FIRST;      /* §M90: the device windows */
     for (uint64_t i = first; i < last; i++)
         if (!(l1_ttbr1[i] & DESC_VALID))
             l1_ttbr1[i] = normal_block(aarch64_phys_offset + i * GIB) | DESC_UXN;
@@ -221,10 +226,56 @@ void mmu_direct_map_range(uint64_t base, uint64_t size) {
 
 /* Without a description of the RAM: map contiguously up to end_phys. */
 uint64_t mmu_direct_map_extend(uint64_t end_phys) {
-    uint64_t cap = aarch64_phys_offset + 511 * GIB;
+    uint64_t cap = aarch64_phys_offset + (uint64_t)DEV_SLOT_FIRST * GIB;
     if (end_phys > cap) end_phys = cap;
     mmu_direct_map_range(aarch64_phys_offset, end_phys - aarch64_phys_offset);
     return end_phys;
+}
+
+/* §M90 (2026-10-01) — hal_mmio_map: device memory in the KERNEL half.
+ *
+ * Every register used to be reached at its physical address through the low
+ * 4 GiB Device identity map in TTBR0 — present in EVERY process, exactly where
+ * Linux programs are linked (a static Go binary at 0x200000).  Now a device
+ * window is a 1 GiB Device block in a TTBR1 slot, shared by every CPU and
+ * every process, and the pointer is KERNEL_DIRECT_MAP_BASE + slot GiB + the
+ * offset.  Windows spanning several GiB get consecutive slots so the pointer
+ * arithmetic stays linear.  Mappings are never torn down (30 GiB-sized slots
+ * outlive every board this port knows). */
+#include "lock.h"
+#include <stddef.h>
+static struct { uint64_t pa_gib; uint32_t n, slot; } g_devwin[DEV_SLOT_END - DEV_SLOT_FIRST];
+static int g_ndevwin;
+static uint32_t g_next_devslot = DEV_SLOT_FIRST;
+static spinlock_t g_devwin_lock = SPINLOCK_INIT;
+
+volatile void* hal_mmio_map(uint64_t phys, size_t len) {
+    if (!phys) return NULL;
+    uint64_t first = phys >> 30, last = (phys + (len ? len : 1) - 1) >> 30;
+    uint32_t n = (uint32_t)(last - first + 1);
+    uint32_t fl = spin_lock_irqsave(&g_devwin_lock);
+    for (int i = 0; i < g_ndevwin; i++)
+        if (g_devwin[i].pa_gib <= first && last < g_devwin[i].pa_gib + g_devwin[i].n) {
+            uint32_t slot = g_devwin[i].slot + (uint32_t)(first - g_devwin[i].pa_gib);
+            spin_unlock_irqrestore(&g_devwin_lock, fl);
+            return (volatile void*)(uintptr_t)(KERNEL_DIRECT_MAP_BASE + (uint64_t)slot * GIB +
+                                               (phys & (GIB - 1)));
+        }
+    if (g_next_devslot + n > DEV_SLOT_END || g_ndevwin >= (int)(sizeof g_devwin / sizeof g_devwin[0])) {
+        spin_unlock_irqrestore(&g_devwin_lock, fl);
+        return NULL;
+    }
+    uint32_t slot = g_next_devslot;
+    g_next_devslot += n;
+    for (uint32_t k = 0; k < n; k++)
+        l1_ttbr1[slot + k] = ((first + k) << 30) | DESC_BLOCK | DESC_AF |
+                             DESC_ATTR(ATTR_DEVICE) | DESC_UXN | DESC_PXN;
+    g_devwin[g_ndevwin].pa_gib = first; g_devwin[g_ndevwin].n = n; g_devwin[g_ndevwin].slot = slot;
+    g_ndevwin++;
+    __asm__ volatile ("dsb ishst\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");
+    spin_unlock_irqrestore(&g_devwin_lock, fl);
+    return (volatile void*)(uintptr_t)(KERNEL_DIRECT_MAP_BASE + (uint64_t)slot * GIB +
+                                       (phys & (GIB - 1)));
 }
 
 /* Kept for the boot banner: the old Phase-A entry point is now boot.S's job. */

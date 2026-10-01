@@ -107,6 +107,13 @@ void timer_init(uint32_t tick_hz) {
     write_cntp_tval(interval);
     write_cntp_ctl(CNTP_CTL_ENABLE);    /* enable, unmasked (IMASK = 0)       */
 
+    /* §M90 (2026-10-01) — EL0 MAY READ THE VIRTUAL COUNTER (CNTKCTL_EL1.
+     * EL0VCTEN), as on Linux, where it is how the vDSO and every Go program
+     * tell the time without a system call.  Left at its reset value, Go's
+     * first `mrs cntvct_el0` trapped (EC 0x18) on every CPU.  Per CPU: the
+     * register is banked, so each CPU that runs this sets its own. */
+    __asm__ volatile ("msr cntkctl_el1, %0\nisb" :: "r"((uint64_t)(1u << 1)));
+
     uart_early_puts("aarch64: generic timer armed (CNTP, INTID 30)\n");
 }
 

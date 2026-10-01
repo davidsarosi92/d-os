@@ -29,7 +29,8 @@
  * a later phase.
  * ============================================================================= */
 
-#include "board.h"   /* §M85 — the machine, discovered */
+#include "board.h"
+#include "hal_api.h"   /* §M85 — the machine, discovered */
 #include <stdint.h>
 
 void uart_early_puts(const char* s);
@@ -41,8 +42,26 @@ void uart_early_puthex(uint64_t v);
 void schedule_check(void) __attribute__((weak));
 
 /* ---- register banks (QEMU `virt`, GICv2) ------------------------------------ */
-#define GICD_BASE   ((uintptr_t)g_board.gicd)      /* §M85: from the board */
-#define GICC_BASE   ((uintptr_t)g_board.gicc)
+/* §M85: the addresses come from the board; §M90: the POINTERS from
+ * hal_mmio_map (device memory lives in the kernel half now), cached so the
+ * IRQ path never maps.  gic_mmio_prime() fills them at board_finish. */
+static uintptr_t s_gicd, s_gicc, s_gicr;
+static inline uintptr_t gic_d(void) {
+    if (!s_gicd) s_gicd = (uintptr_t)hal_mmio_map(g_board.gicd, 0x10000);
+    return s_gicd;
+}
+static inline uintptr_t gic_c(void) {
+    if (!s_gicc && g_board.gicc) s_gicc = (uintptr_t)hal_mmio_map(g_board.gicc, 0x10000);
+    return s_gicc;
+}
+static inline uintptr_t gic_r(void) {
+    if (!s_gicr && g_board.gicr)
+        s_gicr = (uintptr_t)hal_mmio_map(g_board.gicr, g_board.gicr_size ? g_board.gicr_size : 0x1000000);
+    return s_gicr;
+}
+void gic_mmio_prime(void) { (void)gic_d(); (void)gic_c(); (void)gic_r(); }
+#define GICD_BASE   gic_d()
+#define GICC_BASE   gic_c()
 
 /* Distributor registers (byte offsets from GICD_BASE). */
 #define GICD_CTLR         0x000   /* Distributor control (enable).            */
@@ -121,8 +140,8 @@ static uintptr_t rd_cache[64];
 static uintptr_t gicr_this_cpu(void) {
     uint32_t aff = my_aff();
     if ((aff & 0xFF) < 64 && rd_cache[aff & 0xFF]) return rd_cache[aff & 0xFF];
-    uintptr_t end = (uintptr_t)(g_board.gicr + (g_board.gicr_size ? g_board.gicr_size : 0x1000000));
-    for (uintptr_t f = (uintptr_t)g_board.gicr; f < end; f += GICR_FRAME) {
+    uintptr_t end = gic_r() + (uintptr_t)(g_board.gicr_size ? g_board.gicr_size : 0x1000000);
+    for (uintptr_t f = gic_r(); f && f < end; f += GICR_FRAME) {
         uint64_t typer = mmio_r64(f + GICR_TYPER);
         if ((uint32_t)(typer >> 32) == aff) {
             if ((aff & 0xFF) < 64) rd_cache[aff & 0xFF] = f;

@@ -442,4 +442,17 @@ void     hal_io_bitmap_forget(const void* bm);
  * `virt`'s 0x0901_0000 on sbsa-ref, where nothing answers there. */
 int hal_platform_window(const char* name, uint64_t* base, uint64_t* len);
 
+/* §M90 (2026-10-01) — THE ONE WAY TO REACH A DEVICE'S REGISTERS.  Returns a
+ * kernel pointer to [phys, phys+len), mapped as device memory, or NULL.
+ *
+ * Until now a register address WAS its pointer: x86 identity-mapped device
+ * windows into the kernel's low addresses, aarch64 identity-mapped the whole
+ * low 4 GiB as Device memory in every TTBR0.  Both put the kernel's own
+ * mappings exactly where a Linux program is linked (0x200000, 0x400000), so no
+ * unmodified fixed-address Linux binary — Docker's Go programs among them —
+ * could be loaded.  Every MMIO pointer is made here now, so WHERE device memory
+ * lives is one arch decision: aarch64 puts it in the kernel half (TTBR1); x86
+ * still identity-maps (the x86_64 kernel itself sits low — a separate move). */
+volatile void* hal_mmio_map(uint64_t phys, size_t len);
+
 #endif

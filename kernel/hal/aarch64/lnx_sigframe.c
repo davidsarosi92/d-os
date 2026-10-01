@@ -152,12 +152,18 @@ void lnx_signal_deliver(void* frame) {
 
 /* Called for an EL0 abort / undefined instruction.  `sig` is decided by the
  * caller from the ESR; the code follows it. */
+int lnx_fault_deliver_esr(void* frame, int sig, uintptr_t addr, uint64_t esr);
 int lnx_fault_deliver(void* frame, int sig, uintptr_t addr) {
+    uint64_t esr;
+    __asm__ volatile ("mrs %0, esr_el1" : "=r"(esr));
+    return lnx_fault_deliver_esr(frame, sig, addr, esr);
+}
+/* §M90 — with the ESR the exception handler read at ENTRY (a later read may
+ * belong to another thread, see exceptions.c). */
+int lnx_fault_deliver_esr(void* frame, int sig, uintptr_t addr, uint64_t esr) {
     struct trapframe* f = (struct trapframe*)frame;
     struct task* t = task_current();
     if (!t || !t->linux_abi || (f->spsr & 0xF) != 0) return 0;
-    uint64_t esr;
-    __asm__ volatile ("mrs %0, esr_el1" : "=r"(esr));
     uint64_t ec = esr >> 26;
     int code = LNX_SI_KERNEL;
     if (sig == 11) {
