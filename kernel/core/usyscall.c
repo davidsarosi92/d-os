@@ -1905,6 +1905,16 @@ int sys_connect(int fd, uint32_t ip, int port) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_NETSOCK) return -1;
     struct netsock* ns = o->nsock;
+    /* §M90 — connect() on a DATAGRAM socket names its default peer: write and
+     * read then mean sendto/recvfrom with that peer.  Go's resolver opens its
+     * DNS socket exactly so ("dial udp 10.0.2.3:53"), and it used to be
+     * refused — no name could be resolved by a Go program (docker pull). */
+    if (ns->type == SOCK_DGRAM) {
+        if (ns_ensure_bound(ns, 0) != 0) return -1;
+        ns->connected = (ip || port) ? 1 : 0;   /* AF_UNSPEC (0,0) dissolves it */
+        ns->peer_ip = ip; ns->peer_port = (uint16_t)port;
+        return 0;
+    }
     if (ns->type != SOCK_STREAM) return -1;
     if (ns->conn) return -1;                     /* already connected          */
     struct tcp_conn* c = net_tcp_connect(ip, (uint16_t)port, 0);
@@ -1987,6 +1997,13 @@ int sys_getsockname_k(int fd, uint32_t* ip_out, int* port_out) {
     struct netsock* ns = o->nsock;
     uint32_t ip = ns->local_ip; uint16_t port = ns->local_port;
     if (ns->conn) net_tcp_local(ns->conn, &ip, &port);
+    /* §M90 — a connected datagram socket answers with the address it sends
+     * from (Go asks right after connect, to know its own end). */
+    if (!ns->conn && ns->type == SOCK_DGRAM && !ip && ns->connected) {
+        struct net_device* dev = net_route(ns->peer_ip);
+        if (!dev) dev = net_primary();
+        if (dev) ip = dev->ip;
+    }
     if (ip_out)   *ip_out   = ip;
     if (port_out) *port_out = port;
     return 0;
@@ -1996,6 +2013,11 @@ int sys_getpeername_k(int fd, uint32_t* ip_out, int* port_out) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_NETSOCK) return -1;
     struct netsock* ns = o->nsock;
+    if (ns->type == SOCK_DGRAM && ns->connected) {   /* §M90 — its default peer */
+        if (ip_out)   *ip_out   = ns->peer_ip;
+        if (port_out) *port_out = ns->peer_port;
+        return 0;
+    }
     if (!ns->conn) return -1;                    /* not connected              */
     uint32_t ip = 0; uint16_t port = 0;
     net_tcp_peer(ns->conn, &ip, &port);
@@ -2046,12 +2068,21 @@ int sys_getpeername(int fd, uint32_t* ip_out, int* port_out) {
 
 /* Stream read/write over a connected SOCK_STREAM socket (called by
  * sys_read/sys_write when the fd is FD_NETSOCK). */
+static long ns_dgram_recv(struct netsock* ns, void* buf, size_t n, uint32_t* ip_out, int* port_out);
 static long netsock_write(struct netsock* ns, const void* buf, size_t n) {
+    if (ns->type == SOCK_DGRAM) {                /* §M90 — a connected datagram socket */
+        if (!ns->connected) return -1;
+        struct net_device* dev = net_primary();
+        if (!dev || n > 65507u) return -1;
+        if (net_udp_send(dev, ns->peer_ip, ns->local_port, ns->peer_port, buf, n) != 0) return -1;
+        return (long)n;
+    }
     if (ns->type != SOCK_STREAM || !ns->conn) return -1;
     int r = net_tcp_send(ns->conn, buf, (uint32_t)n, ns->nonblock);
     return (r == NET_EAGAIN) ? -SOCK_EAGAIN : r;
 }
 static long netsock_read(struct netsock* ns, void* buf, size_t n) {
+    if (ns->type == SOCK_DGRAM) return ns_dgram_recv(ns, buf, n, NULL, NULL);   /* §M90 */
     if (ns->type != SOCK_STREAM || !ns->conn) return -1;
     if (ns->rd_shut) return 0;                   /* shutdown(SHUT_RD) = EOF   */
     int r = net_tcp_recv(ns->conn, buf, (uint32_t)n, ns->nonblock, 0);
@@ -2100,7 +2131,11 @@ long sys_sendto(int fd, const void* buf, size_t n, uint32_t ip, int port) {
 long sys_recvfrom_k(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_NETSOCK) return -1;
-    struct netsock* ns = o->nsock;
+    return ns_dgram_recv(o->nsock, buf, n, ip_out, port_out);
+}
+/* One datagram (the body recvfrom always had; read() on a connected datagram
+ * socket shares it since §M90). */
+static long ns_dgram_recv(struct netsock* ns, void* buf, size_t n, uint32_t* ip_out, int* port_out) {
     struct net_device* dev = net_primary();
     if (!dev) return -1;
 
@@ -2431,4 +2466,20 @@ void fd_snapshot_for_fork(struct task* parent, struct ofile** out, uint32_t* clo
         out[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
     if (cloexec) *cloexec = *fd_cx(parent);
     fdt_unlock(parent, fl);
+}
+
+/* §M90 — the n-th open descriptor of the CALLING task (for /proc/self/fd),
+ * or -1 past the last.  0, 1 and 2 are always open: an empty std slot is the
+ * console. */
+int fd_nth_open(int n) {
+    struct task* t = task_current();
+    if (!t || n < 0) return -1;
+    int found = -1, k = 0;
+    uint32_t fl = fdt_lock(t);
+    for (int fd = 0; fd < TASK_MAX_FDS; fd++) {
+        if (!(fd <= 2 || t->fds[fd])) continue;
+        if (k++ == n) { found = fd; break; }
+    }
+    fdt_unlock(t, fl);
+    return found;
 }

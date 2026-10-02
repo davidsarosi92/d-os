@@ -34,7 +34,8 @@
 #include "memage.h"
 #include "hal_api.h"     /* §M90 — hal_cpu_model */
 #include "percpu.h"      /* §M90 — smp_ncpus */
-#include "cgroupfs.h"    /* §M90 — /proc/self/cgroup */
+#include "cgroupfs.h"
+#include "fd.h"      /* §M90 — fd_nth_open */    /* §M90 — /proc/self/cgroup */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -224,6 +225,38 @@ static int attach_node(struct procfs_node* node) {
         return -2;
     }
     return 0;
+}
+
+/* §M90 — /proc/self/fd: one entry per open descriptor of the task that READS
+ * the directory, generated at readdir time (the descriptor table is the
+ * caller's, so nothing can be cached in the shared dentry tree — there is no
+ * lookup, only the listing).  Go's os/exec and docker's CLI enumerate it to
+ * find what to close; without it `docker load` stopped at the first step. */
+static int fd_dir_readdir(struct file* f, struct dirent* out) {
+    if (!f || !out) return -1;
+    int fd = fd_nth_open((int)f->pos);
+    if (fd < 0) return 0;
+    char tmp[12]; int n = 0;
+    do { tmp[n++] = (char)('0' + fd % 10); fd /= 10; } while (fd);
+    int i = 0;
+    while (n) out->name[i++] = tmp[--n];
+    out->name[i] = 0;
+    out->type = INODE_SYMLINK;
+    out->size = 0;
+    f->pos++;
+    return 1;
+}
+static const struct file_ops procfs_fddir_ops = { .read = NULL, .write = NULL,
+                                                  .readdir = fd_dir_readdir, .close = NULL };
+static void attach_fd_dir(void) {
+    struct dentry* self = proc_subdir("self", 4);
+    if (!self) return;
+    struct inode* ino = (struct inode*)kcalloc(1, sizeof(struct inode));
+    if (!ino) return;
+    ino->type = INODE_DIR;
+    vfs_inode_defaults(ino);
+    ino->ops = &procfs_fddir_ops;
+    if (!vfs_attach_child(self, "fd", ino)) kfree(ino);
 }
 
 int procfs_register(struct procfs_node* node) {
@@ -583,6 +616,7 @@ void procfs_init(void) {
     attach_node(&nd_cpuinfo);
     attach_node(&nd_mountinfo);
     attach_node(&nd_selfcgroup);
+    attach_fd_dir();
     attach_node(&nd_selfmounts);
     attach_node(&nd_mounts);
     attach_node(&nd_modules);

@@ -6095,6 +6095,13 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
   answer with the server half.  The road there fixed ten kernel defects (DOCS
   change log) — register state at program entry, std-slot close at exit,
   listener HUP, unlink of open files, fork-snapshot and COW races.
+- 2026-10-02 later: connected UDP sockets (Go's resolver: DNS works, docker
+  pull reaches the registry's TLS), /proc/self/fd.  Measured blockers for the
+  last step, in order: `docker load` → the daemon's untar child calls
+  unshare(CLONE_NEWNS) (mount namespaces); `docker pull` → no CA bundle where
+  Go looks (/etc/ssl/certs/ca-certificates.crt); /proc/self/status; and
+  containerd's 40 MB exec from exFAT can exceed dockerd's 15 s start window
+  (start containerd first and pass --containerd until exec is faster).
 - NEXT (rung 2's last step): `docker run --network host busybox echo hi` — an
   image (pull through SLIRP or `docker load` of §M73's busybox tarball), then
   runc's container setup: mount namespaces, bind mounts, pivot_root, /proc in
