@@ -837,6 +837,7 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
+    kernel/core/flock.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
@@ -889,6 +890,7 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
+    kernel/core/flock.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
@@ -1200,6 +1202,7 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
+    kernel/core/flock.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \

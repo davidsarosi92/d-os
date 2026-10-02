@@ -39,6 +39,7 @@
 #include "vmm.h"
 #include "usermode.h"
 #include "driver.h"
+#include "flock.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -891,6 +892,39 @@ SHELL_CMD(timerfdtest) = { "timerfdtest", "[ms]", "timerfd drift against the ori
                            SHELL_G_TEST, cmd_timerfdtest, SHELL_P_ANY };
 SHELL_CMD(alarmtest)   = { "alarmtest",   "[ms]", "setitimer + SIGALRM delivery",
                            SHELL_G_TEST, cmd_alarmtest, SHELL_P_ANY };
+/* §M90 — `flocktest`: flock's rules, each one able to fail.  Two opens of
+ * one file are two OWNERS: EX held by the first must refuse the second, both
+ * as EX and as SH (LOCK_NB, so a broken lock shows as a wrong number instead
+ * of a hang); after LOCK_UN the second gets it; and closing the last
+ * reference of a holder must release, or a crashed holder locks the file
+ * forever. */
+static void sy_flocktest(const char* args) {
+    (void)args;
+    const char* path = "/tmp-flocktest";
+    struct file* f1 = vfs_open(path, VFS_RDWR | VFS_CREATE);
+    struct file* f2 = f1 ? vfs_open(path, VFS_RDWR) : NULL;
+    struct ofile* a = f1 ? ofile_from_file(f1) : NULL;
+    struct ofile* b = f2 ? ofile_from_file(f2) : NULL;
+    if (!a || !b) { console_write("flock: FAIL (could not open the file twice)\n"); return; }
+    int r1 = flock_op(a, 2);               /* EX             -> 0   */
+    int r2 = flock_op(b, 2 | 4);           /* EX|NB, other    -> -11 */
+    int r3 = flock_op(b, 1 | 4);           /* SH|NB vs EX     -> -11 */
+    int r4 = flock_op(a, 8);               /* UN              -> 0   */
+    int r5 = flock_op(b, 1 | 4);           /* SH|NB           -> 0   */
+    int r6 = flock_op(a, 1 | 4);           /* SH|NB, shared   -> 0   */
+    int r7 = flock_op(a, 2 | 4);           /* EX|NB vs b's SH -> -11 */
+    ofile_unref(b);                        /* last close of b releases */
+    int r8 = flock_op(a, 2 | 4);           /* EX|NB           -> 0   */
+    ofile_unref(a);
+    vfs_unlink(path);
+    kprintf("flock: %d %d %d %d %d %d %d %d (want 0 -11 -11 0 0 0 -11 0)\n",
+            r1, r2, r3, r4, r5, r6, r7, r8);
+    int ok = r1 == 0 && r2 == -11 && r3 == -11 && r4 == 0 && r5 == 0 &&
+             r6 == 0 && r7 == -11 && r8 == 0;
+    console_write(ok ? "flock: ok\n" : "flock: FAIL\n");
+}
+SHELL_CMD(flocktest)   = { "flocktest",   "", "flock(2): owners, sharing, release on close",
+                           SHELL_G_TEST, sy_flocktest, SHELL_P_ANY };
 SHELL_CMD(epolltest)   = { "epolltest",   "", "readiness sets, and the scan cost measured",
                            SHELL_G_TEST, sy_epolltest, SHELL_P_ANY };
 

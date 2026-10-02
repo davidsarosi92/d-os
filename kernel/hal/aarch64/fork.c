@@ -191,6 +191,7 @@ int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
     child->linux_abi = parent->linux_abi;
     child->clear_tid = ctid_kaddr;          /* CLONE_CHILD_CLEARTID (task_exit) */
     lnx_sig_thread(parent, child);          /* CLONE_SIGHAND: shared */
+    child->tgid = task_tgid(parent);         /* §M90 — one process, many threads */
     hal_fpu_save(parent->fpu_state);
     for (unsigned i = 0; i < HAL_FPU_STATE_SIZE; i++)
         child->fpu_state[i] = parent->fpu_state[i];

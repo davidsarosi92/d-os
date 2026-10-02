@@ -17,6 +17,7 @@
 #include "syscall.h"
 #include "task.h"
 #include "fd.h"
+#include "flock.h"      /* §M90 */
 #include "proc.h"
 #include "kmalloc.h"
 #include "vmm.h"        /* vmm_user_access_ok — guest-pointer validation */
@@ -63,6 +64,34 @@ static long h_seek(struct abi_ctx* c) {
 /* §M73 — directory calls.  The VFS answers -1 (not found), -2 (exists) or -5
  * (not permitted); a Linux program wants ENOENT / EEXIST / EACCES. */
 #define AT_FDCWD_ (-100)
+
+/* §M90 — DIRECTORY DESCRIPTORS for every *at call.  They used to accept only
+ * AT_FDCWD and answer ENOSYS otherwise — and Go's os.RemoveAll, containerd's
+ * snapshotters and every openat-walking tree copier pass a real directory fd.
+ * `*at(dirfd, rel)` means exactly "resolve rel against dirfd instead of the
+ * working directory", and relative names here are resolved in ONE place,
+ * vfs_canon, against cred_fs_cwd() — so for the duration of the call that is
+ * what the directory's path stands in for (task->at_dir).  An absolute name
+ * ignores dirfd, as on Linux (vfs_canon never consults the cwd for one). */
+struct abi_at { char dir[256]; int set; };
+static long abi_at_begin(int dirfd, struct abi_at* a) {
+    a->set = 0;
+    if (dirfd == AT_FDCWD_) return 0;
+    int r = sys_fd_dirpath(dirfd, a->dir, sizeof a->dir);
+    if (r < 0) return r;
+    struct task* t = task_current();
+    if (!t) return -9;
+    t->at_dir = a->dir;
+    a->set = 1;
+    return 0;
+}
+static void abi_at_end(struct abi_at* a) {
+    if (a->set) { struct task* t = task_current(); if (t) t->at_dir = NULL; }
+}
+#define AT_WRAP(dirfd, expr) ({                                         \
+        struct abi_at _at; long _r = abi_at_begin((int)(dirfd), &_at);  \
+        if (_r == 0) { _r = (expr); abi_at_end(&_at); }                 \
+        _r; })
 static long lnx_err(int r) {
     if (r >= 0) return r;
     if (r == -2) return -17;             /* EEXIST */
@@ -71,18 +100,17 @@ static long lnx_err(int r) {
 }
 static long h_mkdir(struct abi_ctx* c)   { return lnx_err(sys_mkdir((const char*)c->a[0], (int)c->a[1])); }
 static long h_mkdirat(struct abi_ctx* c) {
-    if ((int)c->a[0] != AT_FDCWD_) return -38;           /* ENOSYS */
-    return lnx_err(sys_mkdir((const char*)c->a[1], (int)c->a[2]));
+    return AT_WRAP(c->a[0], lnx_err(sys_mkdir((const char*)c->a[1], (int)c->a[2])));
 }
 static long h_link(struct abi_ctx* c)    { return lnx_err(sys_link((const char*)c->a[0], (const char*)c->a[1])); }
 static long h_linkat(struct abi_ctx* c) {
-    if ((int)c->a[0] != AT_FDCWD_ || (int)c->a[2] != AT_FDCWD_) return -38;
-    return lnx_err(sys_link((const char*)c->a[1], (const char*)c->a[3]));
+    /* Two directories: served when they are the same one (one override). */
+    if ((int)c->a[0] != (int)c->a[2]) return -38;
+    return AT_WRAP(c->a[0], lnx_err(sys_link((const char*)c->a[1], (const char*)c->a[3])));
 }
 static long h_chmod(struct abi_ctx* c)   { return lnx_err(sys_chmod((const char*)c->a[0], (int)c->a[1])); }
 static long h_fchmodat(struct abi_ctx* c) {
-    if ((int)c->a[0] != AT_FDCWD_) return -38;
-    return lnx_err(sys_chmod((const char*)c->a[1], (int)c->a[2]));
+    return AT_WRAP(c->a[0], lnx_err(sys_chmod((const char*)c->a[1], (int)c->a[2])));
 }
 /* §M90 — chown / lchown / fchownat.  dockerd chowns its API socket to the
  * docker group and the daemon root to the remapped root; containerd and runc
@@ -101,14 +129,8 @@ static long h_chown(struct abi_ctx* c) {
     return chown_err(sys_chown((const char*)c->a[0], (int)c->a[1], (int)c->a[2]));
 }
 static long h_fchownat(struct abi_ctx* c) {
-    if ((int)c->a[0] != AT_FDCWD_) return -38;
     if (c->a[4] & 0x1000) return -38;    /* AT_EMPTY_PATH: chown of an fd */
-    return chown_err(sys_chown((const char*)c->a[1], (int)c->a[2], (int)c->a[3]));
-}
-static long h_unlink(struct abi_ctx* c)  { return lnx_err(sys_unlink((const char*)c->a[0])); }
-static long h_unlinkat(struct abi_ctx* c) {
-    if ((int)c->a[0] != AT_FDCWD_) return -38;
-    return lnx_err(sys_unlink((const char*)c->a[1]));   /* AT_REMOVEDIR: the VFS unlinks both */
+    return AT_WRAP(c->a[0], chown_err(sys_chown((const char*)c->a[1], (int)c->a[2], (int)c->a[3])));
 }
 
 static long h_mprotect(struct abi_ctx* c) {
@@ -127,7 +149,15 @@ static long h_ui_build(struct abi_ctx* c) {
     return dosgui_ui_build((int)c->a[0], (const void*)c->a[1], (int)c->a[2]);
 }
 
+/* §M90 — getpid is the PROCESS (the thread group), gettid the thread.  They
+ * used to be one number per task, so every Go or JVM thread answered getpid()
+ * with a different pid. */
 static long h_getpid(struct abi_ctx* c) {
+    (void)c;
+    struct task* t = task_current();
+    return t ? task_tgid(t) : 0;
+}
+static long h_gettid(struct abi_ctx* c) {
     (void)c;
     struct task* t = task_current();
     return t ? t->pid : 0;
@@ -135,7 +165,13 @@ static long h_getpid(struct abi_ctx* c) {
 static long h_getppid(struct abi_ctx* c) {
     (void)c;
     struct task* t = task_current();
-    return t ? t->ppid : 0;
+    if (!t) return 0;
+    /* A thread's parent is its PROCESS's parent. */
+    if (t->tgid && t->tgid != t->pid) {
+        struct task* lead = task_find(t->tgid);
+        if (lead) return lead->ppid;
+    }
+    return t->ppid;
 }
 
 #define ABI_EPERM 1
@@ -174,6 +210,35 @@ static int abi_path(unsigned long up, char* k, unsigned cap) {
     return (up && copy_str_from_user(k, (uintptr_t)up, cap) >= 0) ? 0 : -1;
 }
 
+/* §M90 — unlink vs rmdir, kept apart as Linux keeps them.  The VFS unlinks
+ * both kinds, so the ABI decides: unlink() / unlinkat(…, 0) on a directory is
+ * EISDIR, unlinkat(…, AT_REMOVEDIR) on a non-directory ENOTDIR, a non-empty
+ * directory ENOTEMPTY.  The errno is load-bearing: Go's os.RemoveAll tries a
+ * plain unlinkat first and continues into the directory ONLY on EISDIR (or
+ * EPERM/EACCES); the EEXIST this used to answer stopped it cold. */
+#define ABI_AT_REMOVEDIR 0x200
+static long abi_unlink_kind(unsigned long upath, int want_dir) {
+    char kp[256];
+    if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
+    struct kstat_full k;
+    if (sys_lstat_full_k(kp, &k) != 0) return -ABI_ENOENT;
+    int is_dir = (k.mode & KS_IFMT) == KS_IFDIR;
+    if (is_dir && !want_dir) return -21;                 /* EISDIR  */
+    if (!is_dir && want_dir) return -20;                 /* ENOTDIR */
+    int r = sys_unlink((const char*)upath);
+    if (r >= 0) return 0;
+    if (r == -2) return -39;                             /* ENOTEMPTY */
+    if (r == -5) return -13;                             /* EACCES */
+    return -ABI_ENOENT;
+}
+static long h_unlink(struct abi_ctx* c)  { return abi_unlink_kind(c->a[0], 0); }
+static long h_unlinkat(struct abi_ctx* c) {
+    return AT_WRAP(c->a[0], abi_unlink_kind(c->a[1], (c->a[2] & ABI_AT_REMOVEDIR) != 0));
+}
+static long h_rmdir(struct abi_ctx* c)   { return abi_unlink_kind(c->a[0], 1); }
+/* §M90 — fsync(fd) / fdatasync(fd) / syncfs(fd): one write-back. */
+static long h_fsync(struct abi_ctx* c)   { return sys_fsync((int)c->a[0]); }
+
 /* §M90 — close-on-exec from a creation flag.  O_CLOEXEC, SOCK_CLOEXEC,
  * EPOLL_CLOEXEC, EFD_CLOEXEC and TFD_CLOEXEC are all the same bit, 02000000,
  * on every guest we speak.  Applied to the descriptor a handler returns. */
@@ -211,8 +276,7 @@ static long abi_open_common(struct abi_ctx* c, unsigned long upath, unsigned lon
 }
 static long h_open(struct abi_ctx* c)   { return abi_open_common(c, c->a[0], c->a[1]); }
 static long h_openat(struct abi_ctx* c) {
-    if ((int)c->a[0] != AT_FDCWD_) return -ABI_ENOSYS;   /* no directory descriptors */
-    return abi_open_common(c, c->a[1], c->a[2]);
+    return AT_WRAP(c->a[0], abi_open_common(c, c->a[1], c->a[2]));
 }
 
 /* Write one field of the guest's struct stat. */
@@ -271,10 +335,9 @@ static long h_fstatat(struct abi_ctx* c) {
             return abi_put_stat(c, c->a[2], &k);
         }
     }
-    if ((int)c->a[0] != AT_FDCWD_) return -ABI_ENOSYS;
     if (c->a[3] & 0x100)                          /* AT_SYMLINK_NOFOLLOW (§M89) */
-        return abi_lstat_path(c, c->a[1], c->a[2]);
-    return abi_stat_path(c, c->a[1], c->a[2]);
+        return AT_WRAP(c->a[0], abi_lstat_path(c, c->a[1], c->a[2]));
+    return AT_WRAP(c->a[0], abi_stat_path(c, c->a[1], c->a[2]));
 }
 static long h_getdents64(struct abi_ctx* c) {
     return sys_getdents64((int)c->a[0], (void*)c->a[1], (size_t)c->a[2]);
@@ -313,8 +376,7 @@ static long abi_access_path(unsigned long upath) {
 }
 static long h_access(struct abi_ctx* c)    { return abi_access_path(c->a[0]); }
 static long h_faccessat(struct abi_ctx* c) {
-    if ((int)c->a[0] != AT_FDCWD_) return -ABI_ENOSYS;
-    return abi_access_path(c->a[1]);
+    return AT_WRAP(c->a[0], abi_access_path(c->a[1]));
 }
 /* readlink: this VFS has no symlinks, so an existing path is "not a link"
  * (EINVAL) and a missing one ENOENT — exactly what realpath() needs to walk. */
@@ -363,7 +425,51 @@ static long abi_readlink_path(unsigned long upath, unsigned long ubuf, unsigned 
     return -ABI_ENOENT;
 }
 static long h_readlink(struct abi_ctx* c)   { return abi_readlink_path(c->a[0], c->a[1], c->a[2]); }
-static long h_readlinkat(struct abi_ctx* c) { return abi_readlink_path(c->a[1], c->a[2], c->a[3]); }
+static long h_readlinkat(struct abi_ctx* c) {
+    return AT_WRAP(c->a[0], abi_readlink_path(c->a[1], c->a[2], c->a[3]));
+}
+
+/* §M90 — rename(2) family.  An existing target is REPLACED (vfs_rename_replace,
+ * one hold of the namespace lock).  Across directories the VFS has no move
+ * yet: a regular file is copied and the original unlinked — NOT atomic, and
+ * said so here; a directory gets EXDEV, which is what Linux answers across
+ * filesystems and what careful callers already handle. */
+static long abi_rename(unsigned long uold, unsigned long unew, int noreplace) {
+    char o[256], n[256];
+    if (abi_path(uold, o, sizeof o) != 0 || abi_path(unew, n, sizeof n) != 0) return -ABI_EFAULT;
+    struct kstat_full k;
+    if (sys_stat_full_k(o, &k) != 0) return -ABI_ENOENT;
+    struct kstat_full kt;
+    int exists = sys_stat_full_k(n, &kt) == 0;
+    if (exists && noreplace) return -17;                 /* EEXIST */
+    int r = vfs_rename_replace(o, n);
+    if (r == 0) return 0;
+    if (r == -2) return -21;                             /* EISDIR: target is a directory */
+    if (r != -3) return -ABI_ENOENT;
+    if ((k.mode & KS_IFMT) == KS_IFDIR) return -18;      /* EXDEV */
+    if (exists && (kt.mode & KS_IFMT) == KS_IFDIR) return -21;
+    if (exists && vfs_unlink(n) != 0) return -13;        /* EACCES */
+    if (vfs_copy(o, n) != 0) return -5;                  /* EIO */
+    vfs_unlink(o);
+    return 0;
+}
+/* §M90 — flock(fd, op): see core/flock.c. */
+static long h_flock(struct abi_ctx* c) {
+    struct ofile* o = fd_lookup((int)c->a[0]);
+    if (!o) return -ABI_EBADF;
+    return flock_op(o, (int)c->a[1]);
+}
+static long h_rename(struct abi_ctx* c) { return abi_rename(c->a[0], c->a[1], 0); }
+static long h_renameat(struct abi_ctx* c) {
+    if ((int)c->a[0] != (int)c->a[2]) return -ABI_ENOSYS;   /* two different bases */
+    return AT_WRAP(c->a[0], abi_rename(c->a[1], c->a[3], 0));
+}
+static long h_renameat2(struct abi_ctx* c) {
+    unsigned long fl = c->a[4];
+    if (fl & ~1ul) return -ABI_EINVAL;                   /* only RENAME_NOREPLACE */
+    if ((int)c->a[0] != (int)c->a[2]) return -ABI_ENOSYS;
+    return AT_WRAP(c->a[0], abi_rename(c->a[1], c->a[3], (int)(fl & 1)));
+}
 
 /* §M89 — symlink(target, linkpath) / symlinkat(target, dirfd, linkpath). */
 static long abi_symlink(unsigned long utarget, unsigned long ulink) {
@@ -378,8 +484,7 @@ static long abi_symlink(unsigned long utarget, unsigned long ulink) {
 }
 static long h_symlink(struct abi_ctx* c)   { return abi_symlink(c->a[0], c->a[1]); }
 static long h_symlinkat(struct abi_ctx* c) {
-    if ((int)c->a[1] != AT_FDCWD_) return -ABI_ENOSYS;
-    return abi_symlink(c->a[0], c->a[2]);
+    return AT_WRAP(c->a[1], abi_symlink(c->a[0], c->a[2]));
 }
 
 /* sendfile(out, in, off*, count) — a read/write loop through a kernel buffer.
@@ -1015,7 +1120,15 @@ static long h_pipe2(struct abi_ctx* c) { return pipe_common(c, c->a[1]); }
 
 static long h_wait(struct abi_ctx* c) {
     int code = 0;
-    int pid = task_wait((int)c->a[0], &code);
+    /* wait4(pid, status, options, rusage): WNOHANG (1) honoured since §M90; a
+     * caller with no such child hears ECHILD — it used to hear -1, EPERM.
+     * pid < -1 / 0 (a process group) waits for any child: groups are recorded
+     * (setpgid) but not yet used to select. */
+    int want = (int)c->a[0];
+    if (want < -1 || want == 0) want = -1;
+    int pid = task_wait_ex(want, &code, (int)(c->a[2] & 1));
+    if (pid < 0) return -10;                              /* ECHILD */
+    if (pid == 0) return 0;                               /* WNOHANG, nobody yet */
     if (c->a[1]) {
         /* The status slot is the GUEST's pointer — validate it here, where its
          * origin is known.  (§M46's lesson, three times over.) */
@@ -1761,7 +1874,7 @@ static const struct {
     [ABI_GETPID]   = { "getpid",   h_getpid },
     [ABI_UI_BUILD] = { "ui_build", h_ui_build },
     [ABI_GETPPID]  = { "getppid",  h_getppid },
-    [ABI_GETTID]   = { "gettid",   h_getpid },      /* no separate tid space */
+    [ABI_GETTID]   = { "gettid",   h_gettid },      /* §M90 — the thread's own id */
     [ABI_EXIT]     = { "exit",     h_exit },
     [ABI_READV]    = { "readv",    h_readv },
     [ABI_WRITEV]   = { "writev",   h_writev },
@@ -1814,6 +1927,12 @@ static const struct {
     [ABI_CHMOD]        = { "chmod",        h_chmod        },
     [ABI_FCHMODAT]     = { "fchmodat",     h_fchmodat     },
     [ABI_CHOWN]        = { "chown",        h_chown        },
+    [ABI_RENAME]       = { "rename",       h_rename       },
+    [ABI_FLOCK]        = { "flock",        h_flock        },
+    [ABI_FSYNC]        = { "fsync",        h_fsync        },
+    [ABI_RMDIR]        = { "rmdir",        h_rmdir        },
+    [ABI_RENAMEAT]     = { "renameat",     h_renameat     },
+    [ABI_RENAMEAT2]    = { "renameat2",    h_renameat2    },
     [ABI_FCHOWNAT]     = { "fchownat",     h_fchownat     },
     [ABI_UNLINK]       = { "unlink",       h_unlink       },
     [ABI_UNLINKAT]     = { "unlinkat",     h_unlinkat     },
@@ -1908,12 +2027,33 @@ int abi_invoke(enum abi_op op, struct abi_ctx* c, long* out) {
  * permanent answer.  Calls the engine does not name are still printed (as
  * "-> arch switch"), so a trace has no gaps. */
 static volatile int g_trace;
+/* §M90 — `strace name <task name>`: a program whose pid is not known before
+ * it starts (a daemon a script launches), and every thread of it.  -2 in
+ * g_trace selects this. */
+static char g_trace_name[16];
 static int abi_traced(void) {
     int t = g_trace;
     if (!t) return 0;
     struct task* me = task_current();
     if (!me) return 0;
-    return t > 0 ? me->pid == t : me->cred.container != 0;
+    if (t == -2) {
+        /* The process's NAME: a thread is named "thread", so ask its leader. */
+        struct task* lead = (me->tgid && me->tgid != me->pid) ? task_find(me->tgid) : me;
+        const char* n = lead ? lead->name : me->name;
+        for (int i = 0; ; i++) {
+            if (g_trace_name[i] != n[i]) return 0;
+            if (!n[i]) return 1;
+        }
+    }
+    /* §M90 — a pid means its whole PROCESS: Go's work runs on threads. */
+    return t > 0 ? (me->pid == t || task_tgid(me) == t) : me->cred.container != 0;
+}
+/* The calls an event loop makes by the thousand and that say nothing about
+ * progress; left out of a trace so the rest can be read. */
+static int abi_trace_noise(enum abi_op op) {
+    return op == ABI_FUTEX || op == ABI_NANOSLEEP || op == ABI_CLOCK_GETTIME ||
+           op == ABI_SIGPROCMASK || op == ABI_EPOLL_WAIT || op == ABI_SCHED_YIELD ||
+           op == ABI_GETTID || op == ABI_GETPID;
 }
 
 int abi_dispatch(const struct abi_map* map, unsigned long nr,
@@ -1922,7 +2062,7 @@ int abi_dispatch(const struct abi_map* map, unsigned long nr,
                  long* out) {
     enum abi_op op = abi_lookup(map, nr);
     { struct task* me = task_current(); if (me) me->guest_nr = (int)nr + 1; }
-    int tr = abi_traced();
+    int tr = abi_traced() && !abi_trace_noise(op);
     if (op == ABI_OP_NONE) {
         if (tr) kprintf("strace[%d] #%lu(%lx, %lx, %lx) -> arch switch\n",
                         task_current()->pid, nr, a0, a1, a2);
@@ -1946,12 +2086,22 @@ static void cmd_strace(const char* args) {
     if (!*a) { kprintf("strace: %s\n", g_trace == 0 ? "off" : g_trace < 0 ? "every container task" : "one pid"); return; }
     if (a[0] == 'c') { g_trace = -1; kprintf("strace: tracing every task in a container\n"); return; }
     if (a[0] == 'o') { g_trace = 0;  kprintf("strace: off\n"); return; }
+    if (a[0] == 'n') {                               /* name <task name> */
+        while (*a && *a != ' ') a++;
+        while (*a == ' ') a++;
+        int i = 0;
+        for (; a[i] && a[i] != ' ' && i < (int)sizeof g_trace_name - 1; i++) g_trace_name[i] = a[i];
+        g_trace_name[i] = 0;
+        g_trace = -2;
+        kprintf("strace: tracing every process named '%s' (futex/sleep/epoll_wait omitted)\n", g_trace_name);
+        return;
+    }
     int v = 0;
     while (*a >= '0' && *a <= '9') v = v * 10 + (*a++ - '0');
     g_trace = v;
     kprintf("strace: %s\n", v ? "tracing that pid" : "off");
 }
-SHELL_CMD(strace) = { "strace", "[<pid> | ctr | off]",
+SHELL_CMD(strace) = { "strace", "[<pid> | name <task> | ctr | off]",
                       "print every guest (Linux-ABI) syscall of a task, with its result",
                       SHELL_G_TASK, cmd_strace, SHELL_P_ADMIN };
 

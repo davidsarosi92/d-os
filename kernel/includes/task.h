@@ -522,7 +522,27 @@ struct task {
      * written only through fd.h's fd_*cloexec* helpers, which pick the right
      * one — the same split `fds` / `fdt` already makes. */
     uint32_t  fd_cloexec_inline;
+    /* §M90 — while one *at call runs on a real directory descriptor: that
+     * directory's path, standing in for cred.cwd (cred_fs_cwd answers with
+     * it), so a relative name resolves against the descriptor and not the
+     * working directory.  Set and cleared around the call by the ABI layer;
+     * points at its stack.  NULL otherwise. */
+    const char* at_dir;
+    /* §M90 — THREAD GROUP.  0 for a process (it is its own group: the group id
+     * is its pid); a Linux thread (clone CLONE_THREAD) carries its process's
+     * pid here.  Linux's process model hangs on it and this kernel had none:
+     * a fork made by a THREAD became that thread's child, so a wait4 from any
+     * other thread of the process — Go reaps from whichever thread is free —
+     * found no such child and waited forever; and the threads themselves were
+     * "children" that wait(-1) saw as alive.  task_tgid() reads it. */
+    int         tgid;
+    /* §M90 — set by task_exit_group on every thread of the group (code + 1;
+     * 0 = none): task_exit_code reports this instead of its own code. */
+    int         group_exit_plus1;
 };
+
+/* §M90 — the process a task belongs to: its own pid unless it is a thread. */
+static inline int task_tgid(const struct task* t) { return t->tgid ? t->tgid : t->pid; }
 
 /* Set up the scheduler and convert the current `kernel_main` context
  * into pid 0 (named "kernel").  Must be called once, after kmalloc is
@@ -647,6 +667,9 @@ void task_finish_first_switch(void);
  * task_exit_code() records a code first (shown by ps, logged by init). */
 void task_exit(void) __attribute__((noreturn));
 void task_exit_code(int code) __attribute__((noreturn));
+/* §M90 — exit_group: end every thread of the caller's process, then the
+ * caller; the group's code is what the parent's wait sees. */
+void task_exit_group(int code) __attribute__((noreturn));
 
 /* M27 — process model.
  *
@@ -687,6 +710,9 @@ void task_set_reap_owned(struct task* t, int owned);
  * death — the building block M29's service supervisor uses to notice a
  * service crash and restart it.  Woken by task_exit_code. */
 int task_wait(int pid, int* code);
+/* §M90 — the same with WNOHANG: returns 0 when a matching child is alive but
+ * none has exited.  Waits are by PROCESS (task_tgid) and never count threads. */
+int task_wait_ex(int pid, int* code, int nohang);
 
 /* Internal scheduler entry — pick next RUNNABLE task and context_switch
  * to it.  Both task_yield and the IRQ-driven preemption path call this.

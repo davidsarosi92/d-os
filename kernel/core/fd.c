@@ -10,6 +10,7 @@
 #include "timerfd.h"
 #include "eventfd.h"   /* §M90 */ /* §M53 stage 3 — FD_TIMER */
 #include "epoll.h"   /* §M56 — FD_EPOLL         */
+#include "flock.h"   /* §M90 — locks die with their description */
 #include "pmm.h"
 #include "kmalloc.h"
 #include <stddef.h>
@@ -84,8 +85,13 @@ struct ofile* ofile_from_epoll(struct epoll* e) {
     return o;
 }
 
+/* §M90 — ATOMIC.  A plain ++/-- was safe while one task owned a table; since
+ * §M89 the threads of a process share one, and a Go program dups, passes and
+ * closes descriptors from several threads at once — two CPUs racing a plain
+ * decrement lose one, and the object is then freed under a live descriptor
+ * (or never freed). */
 struct ofile* ofile_ref(struct ofile* o) {
-    if (o) o->refcount++;
+    if (o) __atomic_add_fetch(&o->refcount, 1, __ATOMIC_ACQ_REL);
     return o;
 }
 
@@ -100,9 +106,9 @@ struct ofile* fd_dup_source(int fd, int* fresh) {
 
 void ofile_unref(struct ofile* o) {
     if (!o) return;
-    if (--o->refcount > 0) return;
+    if (__atomic_sub_fetch(&o->refcount, 1, __ATOMIC_ACQ_REL) > 0) return;
     switch (o->kind) {
-        case FD_VFS:  if (o->file) vfs_close(o->file);   break;
+        case FD_VFS:  flock_release(o); if (o->file) vfs_close(o->file);   break;
         case FD_SHM:  if (o->shm)  shm_unref(o->shm);    break;
         case FD_SOCK: if (o->sock) usock_close(o->sock); break;
         case FD_NETSOCK: if (o->nsock) netsock_close(o->nsock); break;

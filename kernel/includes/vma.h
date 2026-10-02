@@ -73,6 +73,8 @@ int  vma_fault(uintptr_t va, int is_write, int can_sleep);
  * mmap'd buffer does not see "not mapped".  Returns 1 if every page of
  * [va, va+len) is now either present or not ours to fill. */
 int  vma_prefault(uintptr_t va, uintptr_t len, int is_write);
+/* §M90 — print what covers `va` (diagnostics; task context). */
+void vma_explain(uintptr_t va);
 
 /* madvise(MADV_DONTNEED) on a private range: its pages go, and the next touch
  * brings a fresh zero page (anonymous) or the file's page back (file).  What a

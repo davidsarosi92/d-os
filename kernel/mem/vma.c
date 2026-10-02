@@ -291,7 +291,17 @@ long vma_mmap(uintptr_t addr, size_t len, int prot, int flags, int fd, uint64_t 
             /* §M74 rung 2's rule, now LAZY: a private file mapping shares the
              * page cache's frames copy-on-write, filled on first touch.  A
              * 101 MB file mapped whole costs nothing until it is read. */
-            kind = (!(flags & VMA_MAP_SHARED) && pcache_enabled()) ? VMA_FILE : VMA_EAGER;
+            /* §M90 — a READ-ONLY shared mapping is served from the page cache
+             * too: since writes update the cached pages in place
+             * (pcache_update) it sees the file as it changes, which is the
+             * whole of MAP_SHARED for a reader — and the shape bbolt uses
+             * (mmap PROT_READ + pwrite; the eager copy below handed it stale
+             * pages and containerd's metadata "page 2 already freed").  A
+             * WRITABLE shared mapping stays an eager copy: stores through it
+             * would need writing back to the file, which nothing does yet —
+             * not coherent, as before §M89, and said so at map_file_copy. */
+            int ro_shared = (flags & VMA_MAP_SHARED) && !(vf & VMM_WRITABLE);
+            kind = ((!(flags & VMA_MAP_SHARED) || ro_shared) && pcache_enabled()) ? VMA_FILE : VMA_EAGER;
         } else return -E_NODEV;
     }
     if (kind == VMA_EAGER && size > EAGER_MAX) return -E_NOMEM;
@@ -492,11 +502,23 @@ int vma_prefault(uintptr_t va, uintptr_t len, int is_write) {
     struct task* t = task_current();
     if (!t || !t->mm || len == 0) return 0;
     if (this_cpu()->preempt_count != 0) return 0;      /* may not sleep here */
-    struct vma_set* s = set_of(t->mm, 0);
-    if (!s) return 0;
     uintptr_t a = va & ~(uintptr_t)(PG - 1);
     uintptr_t b = va + len;
     if (b < va) return 0;
+    /* §M90 — a page that is PRESENT but copy-on-write (every page of a
+     * process that has forked) is read-only until somebody writes it.  A
+     * program's own store resolves that through the fault; a KERNEL write
+     * checked with vmm_user_access_ok(…, write) — a signal frame, a syscall's
+     * result — was refused instead, and the loop below skipped the page as
+     * "already there".  dockerd forks containerd, so from then on its next
+     * SIGURG found its signal stack "unusable" and the daemon was killed.
+     * Resolve the COW here, exactly as the write fault would; a page that is
+     * not COW is left alone (vmm_cow_fault answers 0). */
+    if (is_write)
+        for (uintptr_t p = a; p < b; p += PG)
+            if (vmm_space_probe(t->mm, p) == 1) vmm_cow_fault(p);
+    struct vma_set* s = set_of(t->mm, 0);
+    if (!s) return 1;                    /* the caller re-checks the walk */
     kmutex_lock(&s->lock);
     int ok = 1;
     for (uintptr_t p = a; p < b; p += PG) {
@@ -535,6 +557,27 @@ void vma_destroy(struct vmm_space* mm) {
 }
 
 /* ---- diagnostics ------------------------------------------------------------ */
+
+/* §M90 — what covers `va` in the current task, and what its page-table entry
+ * says: for a refusal report ("no usable stack") to name the cause — no
+ * reservation, a PROT_NONE one, an eager one, or a page that is simply absent
+ * where it should not be.  Takes the set's mutex: task context only. */
+void vma_explain(uintptr_t va) {
+    struct task* t = task_current();
+    if (!t || !t->mm) { kprintf("vma:   %p: no address space\n", (void*)va); return; }
+    int probe = vmm_space_probe(t->mm, va & ~(uintptr_t)(PG - 1));
+    struct vma_set* s = set_of(t->mm, 0);
+    if (!s) { kprintf("vma:   %p: no reservation set (pte probe %d)\n", (void*)va, probe); return; }
+    kmutex_lock(&s->lock);
+    struct vma* v = find(s, va);
+    if (!v) kprintf("vma:   %p: NO reservation covers it (pte probe %d)\n", (void*)va, probe);
+    else kprintf("vma:   %p: in %p-%p %c%c %s (pte probe %d, preempt %d)\n", (void*)va,
+                 (void*)v->start, (void*)v->end,
+                 (v->vf & VMM_USER) ? 'r' : '-', (v->vf & VMM_WRITABLE) ? 'w' : '-',
+                 v->kind == VMA_ANON ? "anon" : v->kind == VMA_FILE ? "file" : "eager",
+                 probe, (int)this_cpu()->preempt_count);
+    kmutex_unlock(&s->lock);
+}
 
 void vma_dump(struct vmm_space* mm) {
     struct vma_set* s = set_of(mm, 0);

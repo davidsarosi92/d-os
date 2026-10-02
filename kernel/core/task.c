@@ -922,7 +922,10 @@ static struct task* spawn_common_ex(const char* name, void (*entry)(void),
          * launcher, so it must NOT be taken down as part of a parent's subtree. */
         if (g_init_pid > 0 && ppid_override == g_init_pid) t->survives_parent = 1;
     } else {
-        t->ppid    = cur ? cur->pid : 0;
+        /* §M90 — the PROCESS of the caller, not the calling thread: a child
+         * belongs to the process, so any of its threads may wait for it, and
+         * it outlives the thread that happened to create it. */
+        t->ppid    = cur ? task_tgid(cur) : 0;
     }
     t->pgid = cur ? cur->pgid : 0;           /* §M90 — group + session follow the caller */
     t->sid  = cur ? cur->sid  : 0;
@@ -2285,6 +2288,23 @@ int task_reap(int pid) {
         prev->next = t->next;
         if (master_head == t) master_head = t->next;
     }
+    /* §M90 — THE ADDRESS SPACE OUTLIVES ITS FIRST OWNER.  Only the task that
+     * created a space owns it (threads are mm_shared), and its reap destroyed
+     * the space — correct only if it is the last to go.  exit_group from a
+     * worker thread (Go exits from any thread) kills the leader too, and the
+     * leader was routinely reaped while the other threads were still on their
+     * way out: their CLEARTID store then hit page tables that had been freed,
+     * a kernel data abort in task_exit_code.  So ownership PASSES to another
+     * task still using the space, decided here under the same lock that just
+     * unlinked this one; the last one destroys it. */
+    int mm_handed_on = 0;
+    if (t->user_task && t->mm && !t->mm_shared && master_head) {
+        struct task* c = master_head;
+        do {
+            if (c->mm == t->mm) { c->mm_shared = 0; mm_handed_on = 1; break; }
+            c = c->next;
+        } while (c != master_head);
+    }
     spin_unlock_irqrestore(&master_lock, fl);
 
     /* Tier B — free an independent user task's address space now.  Safe here:
@@ -2292,7 +2312,7 @@ int task_reap(int pid) {
      * so its vmm_space is loaded nowhere and can be torn down.  (Its fds were
      * closed at SYS_EXIT while it was still current.)  A kernel thread's mm is
      * NULL / borrowed, so only user_task owns one to free. */
-    if (t->user_task && t->mm && !t->mm_shared) {
+    if (t->user_task && t->mm && !t->mm_shared && !mm_handed_on) {
         /* §M74 — an eviction may still be walking this space (it pinned the
          * task, not the space); it finishes in a bounded batch. */
         while (__atomic_load_n(&t->swap_busy, __ATOMIC_ACQUIRE)) task_msleep(2);
@@ -2470,6 +2490,10 @@ void task_start_init(void) {
  * at once — it releases master_lock before taking the queue lock). */
 static void wait_scan_locked(int parent_pid, int want,
                              int* any_alive, int* dead_pid, int* dead_code) {
+    /* §M90 — a wait is the PROCESS's (any thread may reap its children), and
+     * a THREAD is not a child to wait for: it is joined through its CLEARTID
+     * futex, and counting it as an "alive child" made wait(-1) block forever
+     * in any multi-threaded program. */
     *any_alive = 0;
     *dead_pid  = -1;
     *dead_code = 0;
@@ -2477,7 +2501,8 @@ static void wait_scan_locked(int parent_pid, int want,
     if (master_head) {
         struct task* c = master_head;
         do {
-            if (c->ppid == parent_pid && (want <= 0 || c->pid == want)) {
+            if (c->ppid == parent_pid && (want <= 0 || c->pid == want) &&
+                !(c->tgid && c->tgid != c->pid)) {
                 if (c->state == TASK_DEAD) {
                     if (*dead_pid < 0) { *dead_pid = c->pid; *dead_code = c->exit_code; }
                 } else {
@@ -2490,10 +2515,47 @@ static void wait_scan_locked(int parent_pid, int want,
     spin_unlock_irqrestore(&master_lock, fl);
 }
 
-int task_wait(int pid, int* code) {
+int task_wait(int pid, int* code) { return task_wait_ex(pid, code, 0); }
+
+/* §M90 — exit_group(2): the whole PROCESS ends, from whichever thread asked.
+ * Before thread groups existed this was the calling task's exit plus the
+ * kill-tree of whatever it had created — so a Go program calling os.Exit on a
+ * worker thread (Go exits from any thread) left its leader and the other
+ * threads running.  Every other thread of the group is told to die (the
+ * ordinary kill: woken if asleep, honoured at its next safe point) carrying
+ * the group's code, then the caller exits.  Kernel threads have no group. */
+void task_exit_group(int code) {
+    struct task* self = task_current();
+    if (!self) for (;;) hal_cpu_halt();
+    int g = task_tgid(self);
+    int pids[64];
+    int n = 0;
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    if (master_head) {
+        struct task* c = master_head;
+        do {
+            if (c != self && c->state != TASK_DEAD && task_tgid(c) == g && n < 64) {
+                c->group_exit_plus1 = code + 1;
+                pids[n++] = c->pid;
+            }
+            c = c->next;
+        } while (c != master_head);
+    }
+    spin_unlock_irqrestore(&master_lock, fl);
+    for (int i = 0; i < n; i++) task_kill(pids[i]);
+    self->group_exit_plus1 = code + 1;
+    fd_close_all();
+    task_exit_code(code);
+}
+
+/* §M90 — task_wait with WNOHANG: 0 when a matching child exists but none has
+ * exited yet (instead of sleeping).  containerd's reaper drains its children
+ * with wait4(-1, WNOHANG) from a SIGCHLD loop; a wait that ignored the flag
+ * parked that thread for as long as any child lived. */
+int task_wait_ex(int pid, int* code, int nohang) {
     struct task* self = task_current();
     if (!self) return -1;
-    int me = self->pid;
+    int me = task_tgid(self);                /* §M90 — the process waits */
 
     uint32_t f = waitq_lock(&child_exit_wq);
     for (;;) {
@@ -2527,6 +2589,7 @@ int task_wait(int pid, int* code) {
             waitq_unlock(&child_exit_wq, f);
             return -1;
         }
+        if (nohang) { waitq_unlock(&child_exit_wq, f); return 0; }
         /* A matching child is alive but not yet dead — park until some
          * task exits and wakes us, then re-scan. */
         waitq_block(&child_exit_wq);
@@ -2594,6 +2657,10 @@ void task_exit_code(int code) {
      * off at the point of no return below; nothing before that uses it. */
     struct task* self = task_current();
     struct percpu* me;
+    /* §M90 — a thread taken down by its group's exit_group reports the
+     * GROUP's code, whatever route its kill took (143 by default): the
+     * leader's exit code is what the parent's wait4 sees. */
+    if (self && self->group_exit_plus1) code = self->group_exit_plus1 - 1;
 
     /* §M40 — CLONE_CHILD_CLEARTID.  musl's pthread_join parks on a futex at
      * this address, and the contract is that the KERNEL zeroes it and wakes the
@@ -2604,9 +2671,25 @@ void task_exit_code(int code) {
     if (self->clear_tid) {
         int* p = self->clear_tid;
         self->clear_tid = NULL;
-        *p = 0;
-        sys_futex(p, 1 /* FUTEX_WAKE */, 0x7fffffff);
+        /* §M90 — checked, because it is a store into user memory from the
+         * kernel: the page may be copy-on-write since a fork (resolved by the
+         * check) or gone with a group that is coming down (skipped, instead of
+         * a kernel data abort). */
+        if (vmm_user_access_ok((uintptr_t)p, sizeof(int), 1)) {
+            *p = 0;
+            sys_futex(p, 1 /* FUTEX_WAKE */, 0x7fffffff);
+        }
     }
+
+    /* §M90 — EVERY way out of a user task lets go of its descriptors.  Only
+     * the SYS_EXIT / exit_group paths called fd_close_all; a thread taken down
+     * by a kill (exit_group's, a signal's, `kill`) left through here holding
+     * its reference to the process's SHARED table — so the table, and every
+     * pipe in it, outlived the process.  dockerd ran `runc features`, read its
+     * output, and waited for an EOF that never came: runc's threads were dead
+     * and still holding the write end.  Idempotent: a table already released
+     * leaves the private one empty. */
+    if (self->user_task) fd_close_all();
 
     /* NO ARMED TIMER MAY OUTLIVE THE STACK IT LIVES ON (2026-09-25).  See
      * ktimer_cancel_range: a task leaving from inside a wait (task_yield exits

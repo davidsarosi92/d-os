@@ -2346,3 +2346,25 @@ void fd_close_on_exec(void) {
     fdt_unlock(t, fl);
     for (int i = 0; i < n; i++) ofile_unref(gone[i]);
 }
+
+/* §M90 — the path of a DIRECTORY descriptor, for the *at calls.  0, -9
+ * (EBADF) when `fd` is not an open file, -20 (ENOTDIR) when it is not a
+ * directory. */
+int sys_fd_dirpath(int fd, char* out, size_t cap) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_VFS || !o->file || !o->file->dentry) return -9;
+    if (!o->file->inode || o->file->inode->type != INODE_DIR) return -20;
+    return vfs_dentry_path(o->file->dentry, out, cap) == 0 ? 0 : -2;
+}
+
+/* §M90 — fsync / fdatasync / syncfs on a descriptor (see vfs_fsync_file).
+ * Anything that is not a file has nothing to write back: 0, as on Linux for a
+ * pipe is EINVAL — but no caller here depends on that, and bbolt calls it
+ * only on its database file.  -9 EBADF for a bad descriptor, -5 EIO when the
+ * device refused a write. */
+int sys_fsync(int fd) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o) return (fd >= 0 && fd <= 2) ? 0 : -9;
+    if (o->kind != FD_VFS || !o->file) return 0;
+    return vfs_fsync_file(o->file) == 0 ? 0 : -5;
+}

@@ -605,8 +605,11 @@ static void linux_syscall_body(struct int_frame* f) {
     }
 
     switch (f->eax) {
+        case LNX_exit_group:                     /* §M90 — the whole process */
+            if (task_current() && task_current()->user_task) task_exit_group((int)f->ebx);
+            linux_exit(f, (int)f->ebx);              /* an excursion: teleport back */
+            return;
         case LNX_exit:
-        case LNX_exit_group:
             linux_exit(f, (int)f->ebx);          /* never returns */
             return;
 

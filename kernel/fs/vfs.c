@@ -656,12 +656,14 @@ ssize_t vfs_read(struct file* f, void* buf, size_t n) {
 
 ssize_t vfs_write(struct file* f, const void* buf, size_t n) {
     if (!f || !f->inode || !f->inode->ops || !f->inode->ops->write) return -1;
+    uint64_t at = f->pos;
     ssize_t r = f->inode->ops->write(f, buf, n, f->pos);
     if (r > 0) f->pos += (uint64_t)r;
-    /* §M74 — the file changed: a cached copy of it is now wrong.  After the
+    /* §M74/§M90 — the file changed: its cached pages are brought up to date in
+     * place, so mappings of them see the write (pcache_update).  After the
      * write and outside the filesystem's lock (the cache reads through the
      * filesystem, so the order is always cache -> fs, never the reverse). */
-    if (r > 0 && f->inode->pc_id) pcache_invalidate(f->inode);
+    if (r > 0 && f->inode->pc_id) pcache_update(f->inode, at, buf, (size_t)r);
     return r;
 }
 
@@ -813,6 +815,23 @@ static int vfs_unlink_unlocked(const char* path) {
     kfree(d);
     return 0;
 }
+/* §M90 — fsync(2): write back what the file's volume holds dirty.  The
+ * block cache keeps no per-file dirty list, so the unit is the VOLUME — more
+ * than asked, never less, which is the direction fsync may err in.  A file on
+ * a volume with no device (ramfs) has nothing to write: done. */
+int vfs_fsync_file(struct file* f) {
+    if (!f || !f->dentry) return -1;
+    char dev[16];
+    dev[0] = 0;
+    kmutex_lock(&ns_lock);
+    struct vfs_mount* m = mount_of_dentry(f->dentry);
+    if (m) for (int i = 0; i < (int)sizeof dev - 1 && (dev[i] = m->dev_name[i]); i++) dev[i + 1] = 0;
+    kmutex_unlock(&ns_lock);
+    if (!dev[0]) return 0;
+    struct block_device* bd = blk_find(dev);
+    return bd ? bcache_sync(bd) : 0;
+}
+
 int vfs_unlink(const char* path) {
     return NS_LOCKED(int, vfs_unlink_unlocked(path));
 }
@@ -879,6 +898,65 @@ static int vfs_rename_unlocked(const char* oldpath, const char* newpath) {
 }
 int vfs_rename(const char* oldpath, const char* newpath) {
     return NS_LOCKED(int, vfs_rename_unlocked(oldpath, newpath));
+}
+
+/* §M90 — rename(2)'s contract: an existing TARGET is replaced.  Programs
+ * write a temporary file and rename it over the real one (containerd's
+ * metadata, every atomic config save), and a rename that refuses an existing
+ * target breaks exactly that.  Done under ONE hold of the namespace lock, so
+ * nobody can observe the gap between the unlink and the rename.  A directory
+ * target is refused (-2): replacing one needs it empty and is not wanted yet.
+ * Same-directory only, like vfs_rename; -3 says "different directories" so the
+ * caller can decide what crossing means for it. */
+static int vfs_rename_replace_unlocked(const char* oldpath, const char* newpath) {
+    char obuf[256], nbuf[256];
+    const char *olast, *nlast;
+    if (split_parent(oldpath, obuf, sizeof obuf, &olast) != 0) return -1;
+    if (split_parent(newpath, nbuf, sizeof nbuf, &nlast) != 0) return -1;
+    struct dentry* op = resolve_path(obuf, NULL, NULL);
+    struct dentry* np = resolve_path(nbuf, NULL, NULL);
+    if (!op || !np) return -1;
+    if (op != np) return -3;
+    int r = vfs_rename_unlocked(oldpath, newpath);
+    if (r != -2) return r;
+    struct dentry* t = resolve_path(newpath, NULL, NULL);
+    if (!t || !t->inode || t->inode->type == INODE_DIR) return -2;
+    if (vfs_unlink_unlocked(newpath) != 0) return -1;
+    return vfs_rename_unlocked(oldpath, newpath);
+}
+int vfs_rename_replace(const char* oldpath, const char* newpath) {
+    return NS_LOCKED(int, vfs_rename_replace_unlocked(oldpath, newpath));
+}
+
+/* §M90 — the path of a dentry AS THE CALLING TASK SEES IT (relative to its
+ * §M73 root), for the *at calls' directory descriptors.  "" for the root, as
+ * cred.cwd spells it.  -1 when it does not fit, or when the dentry is outside
+ * the task's root (a descriptor carried into a container must not name what
+ * lies above the container's "/"). */
+static int vfs_dentry_path_unlocked(struct dentry* d, char* out, size_t cap) {
+    struct dentry* top = cred_fs_root();
+    if (!top) top = root;
+    const char* parts[48];
+    int np = 0;
+    while (d && d != top) {
+        if (d == root || !d->parent || d->parent == d) return -1;   /* above the task's root */
+        if (np == 48) return -1;
+        parts[np++] = d->name;
+        d = d->parent;
+    }
+    if (!d) return -1;
+    size_t o = 0;
+    for (int i = np - 1; i >= 0; i--) {
+        if (o + 1 >= cap) return -1;
+        out[o++] = '/';
+        for (const char* q = parts[i]; *q; q++) { if (o + 1 >= cap) return -1; out[o++] = *q; }
+    }
+    out[o] = 0;
+    return 0;
+}
+int vfs_dentry_path(struct dentry* d, char* out, size_t cap) {
+    if (!d || !out || cap < 2) return -1;
+    return NS_LOCKED(int, vfs_dentry_path_unlocked(d, out, cap));
 }
 
 int vfs_copy(const char* src, const char* dst) {

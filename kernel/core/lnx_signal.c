@@ -92,6 +92,14 @@ static void sighand_put(struct lnx_sighand* h) {
 /* ---- lifetime -------------------------------------------------------------- */
 
 void lnx_sig_fork(struct task* parent, struct task* child) {
+    /* §M90 — the mask of signals 1..31 lives on the task (sig_blocked), not in
+     * the Linux state, and was never copied: a child or a new thread started
+     * with NOTHING blocked.  Go blocks every signal around clone() so that a
+     * new thread cannot take one before it has installed its signal stack;
+     * ours could, and the first SIGURG to land in that window found no usable
+     * stack and killed the thread (and with it dockerd's containerd start).
+     * POSIX: a fork child and a new thread inherit the creator's mask. */
+    if (parent && child) child->sig_blocked = parent->sig_blocked;
     struct lnx_sigstate* ps = parent ? parent->lsig : NULL;
     if (!ps || !child) return;
     struct lnx_sigstate* cs = state_of(child, 1);
@@ -105,6 +113,7 @@ void lnx_sig_fork(struct task* parent, struct task* child) {
 
 void lnx_sig_thread(struct task* parent, struct task* child) {
     if (!parent || !child) return;
+    child->sig_blocked = parent->sig_blocked;  /* §M90 — see lnx_sig_fork */
     struct lnx_sigstate* ps = state_of(parent, 1);
     if (!ps) return;
     struct lnx_sigstate* cs = (struct lnx_sigstate*)kcalloc(1, sizeof *cs);

@@ -38,11 +38,11 @@
  * mappings needs a reverse map.  Unmapped cache pages are reclaimable, which
  * is what `mem.swap_policy = off` still gets (§M74's rung-2 promise).
  *
- * CONSISTENCY.  A write to a file drops its cached pages (vfs_write), as do
- * truncation on open, unlink and unmount (rename cannot replace a file here —
- * it refuses an existing target — so it needs no hook).  A program that mapped the file
- * before the write keeps the old contents — POSIX leaves a MAP_PRIVATE view of
- * a concurrent write unspecified, and a snapshot is the conservative answer.
+ * CONSISTENCY.  A write to a file UPDATES its cached pages in place (§M90,
+ * pcache_update — it used to drop them, which gave every existing mapping a
+ * stale snapshot and broke MAP_SHARED readers such as bbolt).  Truncation on
+ * open, unlink and unmount still drop them; rename(2) replacing a target goes
+ * through unlink, so the replaced file's pages go with it.
  * The key is an id given to the INODE on first use, never its address: every
  * filesystem here allocates inodes with kcalloc, so a new inode at a reused
  * address has id 0 and can never hit a dead file's pages.
@@ -168,6 +168,45 @@ void pcache_invalidate(struct inode* ino) {
     kmutex_unlock(&g_lock);
 }
 
+/* §M90 — a write UPDATES the cached pages in place instead of dropping them.
+ *
+ * Dropping gave every existing mapping a snapshot: the cache let go, the
+ * mappings kept the old frame (detached), and the next reader of the file got
+ * a fresh one.  That is a legal MAP_PRIVATE answer and a broken MAP_SHARED
+ * one — and the program that cares is bbolt (containerd's metadata, and most
+ * Go databases): it READS its file through a shared read-only mapping and
+ * WRITES it with pwrite, so each transaction's new meta page and freelist were
+ * invisible to the next one, which then found "page 2 already freed" and
+ * panicked.  Linux has one page cache that both paths go through; here the
+ * write copies its bytes into whatever pages of the file are cached, so every
+ * mapping of them — shared, or private and not yet copied — sees the file as
+ * it now is.  A private mapping that already wrote (COW-copied) keeps its own
+ * copy, as it must.
+ *
+ * `buf` is kernel memory (vfs_write's contract: §M46's bounce buffers keep
+ * ring-3 pointers out of the VFS).  Pages that are not cached are not created
+ * — the next fault reads them from the file, which now holds the new data. */
+void pcache_update(struct inode* ino, uint64_t off, const void* buf, size_t n) {
+    if (!ino || !ino->pc_id || !buf || n == 0) return;
+    const uint8_t* src = (const uint8_t*)buf;
+    kmutex_lock(&g_lock);
+    uint32_t id = ino->pc_id;
+    uint64_t end = off + n;
+    for (uint64_t idx = off / 4096u; idx * 4096u < end; idx++) {
+        struct pc_page* e = g_hash[hslot(id, idx)];
+        while (e && !(e->id == id && e->idx == idx)) e = e->next;
+        if (!e) continue;
+        uint64_t pg   = idx * 4096u;
+        uint64_t from = off > pg ? off : pg;
+        uint64_t to   = end < pg + 4096u ? end : pg + 4096u;
+        uint8_t* p = (uint8_t*)kmap_frame(e->frame);
+        for (uint64_t b = from; b < to; b++) p[b - pg] = src[b - off];
+        kunmap_frame(p);
+        g_st.updated++;
+    }
+    kmutex_unlock(&g_lock);
+}
+
 void pcache_drop_all(void) {
     kmutex_lock(&g_lock);
     for (int h = 0; h < PC_HASH; h++)
@@ -221,8 +260,38 @@ CONFIG_KEY(ck_pagecache) = {
     .help = "share file pages between the programs that map them (one copy of libc.so)",
 };
 
+/* §M90 — `pcache test`: the coherence pcache_update promises, able to fail.
+ * A page of a file is taken as a mapping would take it, the file is written
+ * through the VFS, and the MAPPED FRAME is read back: it must hold the new
+ * bytes (the old drop-on-write answer left it holding the old ones). */
+static void pcache_selftest(void) {
+    const char* path = "/tmp-pcachetest";
+    struct file* f = vfs_open(path, VFS_RDWR | VFS_CREATE | VFS_TRUNC);
+    if (!f) { kprintf("pcache test: FAIL (cannot create %s)\n", path); return; }
+    vfs_write(f, "AAAAAAAA", 8);
+    pmm_phys_t fr = 0;
+    if (pcache_map_page(f, 0, &fr) != 0) {
+        kprintf("pcache test: FAIL (could not map page 0)\n");
+        vfs_close(f); vfs_unlink(path); return;
+    }
+    f->pos = 2;
+    vfs_write(f, "BB", 2);                     /* a pwrite into the mapped page */
+    uint8_t* p = (uint8_t*)kmap_frame(fr);
+    char got[9];
+    for (int i = 0; i < 8; i++) got[i] = (char)p[i];
+    got[8] = 0;
+    kunmap_frame(p);
+    if (vmm_frame_unshare(fr)) pmm_free_frame(fr);   /* drop the "mapping's" share */
+    vfs_close(f);
+    vfs_unlink(path);
+    int ok = got[0] == 'A' && got[1] == 'A' && got[2] == 'B' && got[3] == 'B' && got[4] == 'A';
+    kprintf("pcache test: mapped page reads \"%s\" after the write (want AABBAAAA) -> %s\n",
+            got, ok ? "ok" : "FAIL");
+}
+
 static void cmd_pcache(const char* args) {
     while (args && *args == ' ') args++;
+    if (args && args[0] == 't') { pcache_selftest(); return; }
     if (args && args[0] == 'd') {
         uint32_t n = pcache_reclaim(0xFFFFFFFFu);
         kprintf("pcache: dropped %u unmapped page(s)\n", n);
@@ -235,10 +304,11 @@ static void cmd_pcache(const char* args) {
             pcache_enabled() ? "on" : "OFF (mem.pagecache = 0)",
             st.pages, st.pages * 4u, st.mapped, st.hits, st.misses, st.reads);
     kprintf("pcache: dropped %u (freed %u, detached from their mappings %u), %u by reclaim, "
-            "%u by file changes\n",
-            st.freed + st.detached, st.freed, st.detached, st.reclaimed, st.invalidated);
+            "%u by truncation/removal; %u updated in place by writes\n",
+            st.freed + st.detached, st.freed, st.detached, st.reclaimed, st.invalidated,
+            st.updated);
 }
-SHELL_CMD(pcache) = { "pcache", "[drop]", "the page cache: file pages shared between programs",
+SHELL_CMD(pcache) = { "pcache", "[drop|test]", "the page cache: file pages shared between programs",
                       SHELL_G_MEM, cmd_pcache, SHELL_P_ANY };
 
 /* `sharetest` (hidden) — rung 2's measurement, asked of the machine rather

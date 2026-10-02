@@ -6080,9 +6080,20 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
   `/proc/self/mountinfo` + `/proc/mounts`; fixed on the way: draining a full
   pipe never announced the writer's POLLOUT, polling an epoll set consumed a
   ONESHOT arming.
+- Rung 2, second step (2026-10-02): dockerd boots containerd, runs runc's
+  feature checks, creates its containerd client; stops at "Devices cgroup
+  isn't mounted".  Built: thread groups (tgid), process-wide exit_group and
+  wait, flock, fsync family, directory descriptors for *at, rename replacing,
+  a coherent page cache for read-only MAP_SHARED (bbolt); fixed signal-mask
+  inheritance, kernel writes to COW pages, killed threads leaking the shared
+  fd table, the address space freed under live threads.
+- NEXT: cgroup v2 — `/proc/self/cgroup` ("0::/") and a `cgroup2` filesystem
+  at /sys/fs/cgroup (controllers, cgroup.procs, memory/pids limits on §M72's
+  reserves); then mount namespaces + pivot_root for runc.
 - Open, noted for later: containerd-shim daemonizes (fork, parent exits) — a
   Linux-personality child must then outlive its parent (today the kill-tree
-  rule ends it); TASK_MAX_FDS is 32.
+  rule ends it); TASK_MAX_FDS is 32; dockerd allows containerd 15 s to start
+  and exec of the 40 MB binary from exFAT takes ~10 s under emulation.
 
 ### What "full Docker" is, and what it is not
 

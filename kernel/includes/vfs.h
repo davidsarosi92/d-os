@@ -311,6 +311,14 @@ int  vfs_unlink(const char* path);
  * parent.  Returns 0, -1 on failure (unsupported fs, missing source),
  * -2 if the new name already exists. */
 int  vfs_rename(const char* oldpath, const char* newpath);
+/* §M90 — rename(2): replaces an existing (non-directory) target atomically.
+ * -2 the target is a directory, -3 the two names are in different
+ * directories, -1 otherwise. */
+int  vfs_rename_replace(const char* oldpath, const char* newpath);
+/* §M90 — fsync(2): write back the dirty blocks of the file's volume. */
+int  vfs_fsync_file(struct file* f);
+/* §M90 — a dentry's path as the calling task sees it ("" = its root). */
+int  vfs_dentry_path(struct dentry* d, char* out, size_t cap);
 
 /* M22.5 — copy a regular file (read/write loop through the fs ops;
  * dst is created/truncated).  Returns 0 / -1. */

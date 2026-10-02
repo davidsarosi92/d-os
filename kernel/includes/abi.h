@@ -176,7 +176,11 @@ enum abi_op {
      * accept only AT_FDCWD: this VFS has no directory descriptors). */
     ABI_MKDIR, ABI_MKDIRAT, ABI_LINK, ABI_LINKAT, ABI_CHMOD, ABI_FCHMODAT,
     ABI_UNLINK, ABI_UNLINKAT,
-    ABI_CHOWN, ABI_FCHOWNAT,  /* §M90 — lchown maps to ABI_CHOWN: no per-call
+    ABI_CHOWN, ABI_FCHOWNAT,
+    ABI_RENAME, ABI_RENAMEAT, ABI_RENAMEAT2,   /* §M90 */
+    ABI_FLOCK,                                 /* §M90 */
+    ABI_FSYNC,              /* §M90 — fsync, fdatasync and syncfs alike */
+    ABI_RMDIR,              /* §M90 */  /* §M90 — lchown maps to ABI_CHOWN: no per-call
                                * link handling, see h_fchownat */
     /* §M73 — identity.  The answer is the task's §M32 credential: a container
      * program asks "who am I" and must hear its container's uid, not a

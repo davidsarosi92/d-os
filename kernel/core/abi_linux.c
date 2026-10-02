@@ -99,6 +99,11 @@ static const struct abi_nument linux_i386_ents[] = {
     /* §M90 — chown32 212, lchown32 198, fchownat 298 (the 16-bit-uid
      * chown 182 / lchown 16 are left unmapped: musl never calls them). */
     { 212, ABI_CHOWN }, { 198, ABI_CHOWN }, { 298, ABI_FCHOWNAT },
+    /* §M90 — rename 38, renameat 302, renameat2 353. */
+    {  38, ABI_RENAME }, { 302, ABI_RENAMEAT }, { 353, ABI_RENAMEAT2 },
+    { 143, ABI_FLOCK },
+    /* §M90 — fsync 118, fdatasync 148, syncfs 344; rmdir 40. */
+    { 118, ABI_FSYNC }, { 148, ABI_FSYNC }, { 344, ABI_FSYNC }, {  40, ABI_RMDIR },
     {  15, ABI_CHMOD }, { 306, ABI_FCHMODAT }, { 10, ABI_UNLINK }, { 301, ABI_UNLINKAT },
     /* §M73 — i386 identity: the 32-bit-uid calls (getuid32 199, getgid32 200,
      * geteuid32 201, getegid32 202, setuid32 213, setgid32 214). */
@@ -199,6 +204,11 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  83, ABI_MKDIR }, { 258, ABI_MKDIRAT }, {  86, ABI_LINK }, { 265, ABI_LINKAT },
     /* §M90 — chown 92, lchown 94, fchownat 260. */
     {  92, ABI_CHOWN }, {  94, ABI_CHOWN }, { 260, ABI_FCHOWNAT },
+    /* §M90 — rename 82, renameat 264, renameat2 316. */
+    {  82, ABI_RENAME }, { 264, ABI_RENAMEAT }, { 316, ABI_RENAMEAT2 },
+    {  73, ABI_FLOCK },
+    /* §M90 — fsync 74, fdatasync 75, syncfs 306; rmdir 84. */
+    {  74, ABI_FSYNC }, {  75, ABI_FSYNC }, { 306, ABI_FSYNC }, {  84, ABI_RMDIR },
     {  90, ABI_CHMOD }, { 268, ABI_FCHMODAT }, { 87, ABI_UNLINK }, { 263, ABI_UNLINKAT },
     /* §M73 — x86_64 identity: getuid 102, getgid 104, setuid 105, setgid 106,
      * geteuid 107, getegid 108. */
@@ -283,6 +293,11 @@ static const struct abi_nument linux_arm64_ents[] = {
      * fchmodat 53, unlinkat 35. */
     /* §M90 — fchownat 54 (arm64 has no plain chown/lchown). */
     {  54, ABI_FCHOWNAT },
+    /* §M90 — renameat 38, renameat2 276 (no plain rename on arm64). */
+    {  38, ABI_RENAMEAT }, { 276, ABI_RENAMEAT2 },
+    {  32, ABI_FLOCK },
+    /* §M90 — fsync 82, fdatasync 83, syncfs 267 (no plain rmdir on arm64). */
+    {  82, ABI_FSYNC }, {  83, ABI_FSYNC }, { 267, ABI_FSYNC },
     {  34, ABI_MKDIRAT }, {  37, ABI_LINKAT }, {  53, ABI_FCHMODAT }, {  35, ABI_UNLINKAT },
     /* §M73 — arm64 identity: setgid 144, setuid 146, getuid 174, geteuid 175,
      * getgid 176, getegid 177. */

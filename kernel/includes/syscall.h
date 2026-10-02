@@ -234,6 +234,8 @@ int  sys_symlink(const char* utarget, const char* ulink);      /* §M89 */
 int  sys_chmod(const char* upath, int mode);
 int  sys_chown(const char* upath, int uid, int gid);   /* §M90 */
 int  sys_socket_info(int fd, int* family, int* type, int* listening);   /* §M90 */
+int  sys_fd_dirpath(int fd, char* out, size_t cap);                    /* §M90 */
+int  sys_fsync(int fd);                                                /* §M90 */
 int  sys_unlink(const char* upath);
 long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
                    int fd, uint64_t offset);

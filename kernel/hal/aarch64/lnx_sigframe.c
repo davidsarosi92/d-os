@@ -26,6 +26,7 @@
  * ============================================================================= */
 
 #include "lnx_signal.h"
+#include "vma.h"           /* §M90 — vma_explain */
 #include "lock.h"
 #include "task.h"
 #include "percpu.h"
@@ -145,8 +146,17 @@ void lnx_signal_deliver(void* frame) {
     struct lnx_delivery d;
     if (!lnx_sig_next(t, (uintptr_t)read_sp_el0(), &d)) return;
     if (build(f, t, &d, 0) != 0) {
-        kprintf("signal: pid %d cannot take signal %d (no usable stack or restorer) - killed\n",
-                t->pid, d.sig);
+        /* Say WHICH stack was refused: the thread's own SP, or the alternate
+         * stack it registered — the two failures have different causes. */
+        uintptr_t ss_sp, ss_size; int ss_flags;
+        lnx_sig_altstack(t, &ss_sp, &ss_size, &ss_flags);
+        kprintf("signal: pid %d '%s' cannot take signal %d (no usable stack or restorer) - killed\n"
+                "signal:   sp_el0=%p frame-sp=%p on_alt=%d altstack=%p+%p flags=%x pc=%p handler=%p\n",
+                t->pid, t->name, d.sig, (void*)read_sp_el0(), (void*)d.sp, d.on_altstack,
+                (void*)ss_sp, (void*)ss_size, ss_flags, (void*)f->elr, (void*)d.act.handler);
+        vma_explain(d.sp - 16);
+        vma_explain(d.sp - 4096);
+        vma_explain(d.sp - 8192);
         fd_close_all();
         task_exit_code(128 + 11);
     }

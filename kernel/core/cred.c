@@ -64,6 +64,7 @@ struct dentry* cred_fs_root(void) {
 }
 const char* cred_fs_cwd(void) {
     struct task* t = task_current();
+    if (t && t->at_dir) return t->at_dir;    /* §M90 — an *at call's directory */
     return t ? t->cred.cwd : "";
 }
 
