@@ -624,14 +624,9 @@ int modload_load(const char* path) {
     if (!image) { kprintf("insmod: out of memory (%d bytes)\n", (int)total); goto out; }
     uintptr_t base = ((uintptr_t)image + maxalign - 1) & ~(uintptr_t)(maxalign - 1);
 
-    kprintf("MODDBG total=%d maxalign=%d image=%p base=%p\n",
-            (int)total, (int)maxalign, image, (void*)base);
     for (uint16_t i = 0; i < shnum; i++) {
         if (!(sh[i].sh_flags & SHF_ALLOC)) continue;
         uintptr_t cur = base + place[i].addr;
-        kprintf("MODDBG  %s off=%d size=%d align=%d at=%p\n", SECNAME(i),
-                (int)place[i].addr, (int)sh[i].sh_size,
-                (int)sh[i].sh_addralign, (void*)cur);
         place[i].addr = cur;
 
         if (sh[i].sh_type == SHT_NOBITS) {

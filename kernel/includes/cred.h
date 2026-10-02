@@ -172,6 +172,10 @@ struct cred {
      * JAVA_HOME from the launcher's location); "" = unknown (an image the
      * kernel embedded rather than read from a file). */
     char exe[128];
+    /* §M90 — APPENDED (cred.c builds a cred positionally). — the file-creation mask, stored PLUS ONE so a zeroed cred (the
+     * kcalloc'd kernel tasks) means the conventional 022 rather than 000.
+     * Inherited with the rest of the identity; read via umask(2). */
+    int umask_plus1;
 };
 
 /* The uid this identity really has: CRED_UID_NONE for anything that is not a

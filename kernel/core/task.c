@@ -924,6 +924,8 @@ static struct task* spawn_common_ex(const char* name, void (*entry)(void),
     } else {
         t->ppid    = cur ? cur->pid : 0;
     }
+    t->pgid = cur ? cur->pgid : 0;           /* §M90 — group + session follow the caller */
+    t->sid  = cur ? cur->sid  : 0;
     t->state       = TASK_RUNNABLE;
     /* §M32 — identity, inherited HERE and nowhere else.  Assigning creds from
      * a call site after spawn returns would be assigning them to a task another

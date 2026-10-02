@@ -232,6 +232,8 @@ int  sys_mkdir(const char* upath, int mode);   /* §M73 */
 int  sys_link(const char* uold, const char* unew);
 int  sys_symlink(const char* utarget, const char* ulink);      /* §M89 */
 int  sys_chmod(const char* upath, int mode);
+int  sys_chown(const char* upath, int uid, int gid);   /* §M90 */
+int  sys_socket_info(int fd, int* family, int* type, int* listening);   /* §M90 */
 int  sys_unlink(const char* upath);
 long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
                    int fd, uint64_t offset);
@@ -246,6 +248,13 @@ int  sys_kill(int pid, int sig);        /* post a signal to a task             *
 /* §M53 stage 3 — see the SYS_TIMERFD_* notes above. */
 int  sys_timerfd_create(void);
 int  sys_eventfd_create(uint64_t init, int flags);   /* §M90 */
+/* §M90 — named AF_UNIX stream sockets; negative = Linux errno. */
+int  sys_unix_socket(int nonblock);
+int  sys_unix_bind(int fd, const char* name);
+int  sys_unix_listen(int fd, int backlog);
+int  sys_unix_connect(int fd, const char* name);
+int  sys_unix_accept(int fd, int nonblock_new);
+const char* sys_unix_name(int fd);
 int  sys_timerfd_settime(int fd, int abs, uint64_t value_ns, uint64_t interval_ns);
 int  sys_timerfd_gettime_k(int fd, uint64_t* remaining_ns, uint64_t* interval_ns);
 int  sys_timerfd_settime_u(int fd, int abs, const uint64_t* times);

@@ -33,6 +33,7 @@
 #include "printf.h"
 #include "task.h"   /* §A1 — vmm_cow_fault needs the current task's space */
 #include "vma.h"    /* §M89 — reservations live beside the tables */
+#include "vmm.h"    /* §M90 — vmm_space_map, VMM_* flags (the trampoline) */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -49,6 +50,8 @@ uint64_t* mmu_kernel_l1(void);          /* mmu.c — shared kernel L1 table */
  * occupied L1 slots 0..3 in every process. */
 #define USER_L1_FIRST 0
 #define USER_VA_MIN   0x10000ULL
+#define AARCH64_SIGTRAMP_VA 0x7FFFFFF000ULL     /* §M90 — the top page of TTBR0 */
+void vmm_map_sigtramp(struct vmm_space* s);
 uintptr_t vmm_user_min(void) { return USER_VA_MIN; }
 
 /* ---- descriptor bit fields (stage-1, 4 KiB granule) ------------------------ */
@@ -178,12 +181,36 @@ int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
 
 /* Create a fresh address space: private L1 table with the kernel's identity
  * blocks copied in.  Returns NULL on OOM. */
+/* §M90 (2026-10-01) — THE SIGNAL-RETURN TRAMPOLINE, Linux's vDSO
+ * __kernel_rt_sigreturn.  On arm64 a program is not obliged to supply
+ * sa_restorer: Go never does, and Linux returns its handlers through a
+ * trampoline in the vDSO.  Without one, the first SIGURG Go uses to preempt a
+ * goroutine killed the process ("no usable stack or restorer").  ONE frame,
+ * shared read-only by every space at a fixed address at the top of TTBR0:
+ *     mov x8, #139      (rt_sigreturn)
+ *     svc #0                                                                 */
+static uint64_t g_sigtramp_pa;
+void vmm_map_sigtramp(struct vmm_space* s) {
+    if (!g_sigtramp_pa) {
+        uint64_t pa = pmm_alloc_frame();
+        if (!pa) return;
+        uint32_t* code = (uint32_t*)phys_to_virt(pa);
+        for (int i = 0; i < 1024; i++) code[i] = 0xd4200000u;     /* brk #0 */
+        code[0] = 0xd2801168u;                                     /* mov x8, #139 */
+        code[1] = 0xd4000001u;                                     /* svc #0       */
+        __asm__ volatile ("dc cvau, %0\ndsb ish\nic ivau, %0\ndsb ish\nisb" :: "r"(code) : "memory");
+        g_sigtramp_pa = pa;
+    }
+    vmm_space_map(s, AARCH64_SIGTRAMP_VA, g_sigtramp_pa, VMM_USER | VMM_EXEC | VMM_SHARED);
+}
+
 struct vmm_space* aarch64_vmm_create(void) {
     struct vmm_space* s = (struct vmm_space*)kmalloc(sizeof *s);
     if (!s) return NULL;
     s->vma = NULL;                  /* kmalloc does not zero */
     s->l1 = alloc_table();
     if (!s->l1) { kfree(s); return NULL; }
+    vmm_map_sigtramp(s);            /* §M90 — the rt_sigreturn trampoline */
     /* §M90 — NOTHING of the kernel's is copied in any more.  The low 4 GiB used
      * to be the kernel's Device identity map, present in every process — on
      * exactly the addresses a Linux program is linked at (0x200000).  Device
@@ -243,20 +270,14 @@ void aarch64_vmm_kernel_switch(void) {
 void vmm_print_status(void) {
     uint64_t tcr;
     __asm__ volatile ("mrs %0, tcr_el1" : "=r"(tcr));
-    kprintf("aarch64 MMU: 4 KiB granule, 39-bit VA; image + devices = TTBR0 identity "
-            "(low 4 GiB); RAM = TTBR1 direct map @ %p (%s); per-process EL0 "
-            "spaces via vmm.c (VA >= 4 GiB)\n", (void*)KERNEL_DIRECT_MAP_BASE,
+    kprintf("aarch64 MMU: 4 KiB granule, 39-bit VA; RAM = TTBR1 direct map @ %p (%s), "
+            "devices = TTBR1 windows (hal_mmio_map); per-process EL0 spaces from "
+            "64 KiB\n", (void*)KERNEL_DIRECT_MAP_BASE,
             (tcr & (1ULL << 23)) ? "WALKS DISABLED" : "on");
 }
 
-/* x86 drivers (xhci.c) call vmm_map_4mib to identity-map an MMIO BAR window.
- * On aarch64 the PCIe 32-bit MMIO window (where pci.c assigns BARs, 0x1000_0000)
- * is already covered by the low-1-GiB Device block in mmu.c's identity map, so
- * this is a no-op that reports success.  Kept so xhci.c links unchanged. */
-int vmm_map_4mib(uint32_t va, uint32_t pa, int flags) {
-    (void)va; (void)pa; (void)flags;
-    return 0;
-}
+/* (vmm_map_4mib is gone on this arch, §M90: every driver reaches its registers
+ * through hal_mmio_map, which knows device memory lives in the kernel half.) */
 
 /* ===========================================================================
  * Portable per-process address-space API (M25 stage 1).

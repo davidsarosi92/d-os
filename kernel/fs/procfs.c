@@ -32,6 +32,8 @@
 #include "klog.h"
 #include "pmm.h"
 #include "memage.h"
+#include "hal_api.h"     /* §M90 — hal_cpu_model */
+#include "percpu.h"      /* §M90 — smp_ncpus */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -249,6 +251,13 @@ static void gen_meminfo(struct procfs_writer* w) {
     uint32_t mgr = pmm_managed_frames();
     uint32_t fr  = pmm_free_frames();
     uint32_t us  = pmm_used_frames();
+    /* §M90 — Linux's own lines FIRST: programs written for Linux (dockerd, a
+     * JVM sizing its heap) look for "MemTotal:" and friends by name; the
+     * system's own detail follows and is skipped by them. */
+    pw_puts(w, "MemTotal:       "); pw_put_uint(w, mgr * 4u); pw_puts(w, " kB\n");
+    pw_puts(w, "MemFree:        "); pw_put_uint(w, fr * 4u);  pw_puts(w, " kB\n");
+    pw_puts(w, "MemAvailable:   "); pw_put_uint(w, fr * 4u);  pw_puts(w, " kB\n");
+    pw_puts(w, "SwapTotal:      0 kB\nSwapFree:       0 kB\n");
     pw_puts(w, "pmm.frames.managed: "); pw_put_uint(w, mgr); pw_putc(w, '\n');
     pw_puts(w, "pmm.frames.free:    "); pw_put_uint(w, fr);  pw_putc(w, '\n');
     pw_puts(w, "pmm.frames.used:    "); pw_put_uint(w, us);  pw_putc(w, '\n');
@@ -464,6 +473,81 @@ static void gen_kmsg(struct procfs_writer* w) {
 static struct procfs_node nd_version = { .name = "version", .gen = gen_version };
 static struct procfs_node nd_uptime  = { .name = "uptime",  .gen = gen_uptime  };
 static struct procfs_node nd_meminfo = { .name = "meminfo", .gen = gen_meminfo };
+
+/* §M90 — /proc/cpuinfo, in Linux's shape: one block per CPU.  Read by Go
+ * (dockerd's CPU-variant probe), by a JVM and by build tools; absent, they
+ * warn or guess. */
+static void gen_cpuinfo(struct procfs_writer* w) {
+    char model[64];
+    hal_cpu_model(model, sizeof model);
+    int n = smp_ncpus();
+    for (int i = 0; i < n; i++) {
+        pw_puts(w, "processor\t: "); pw_put_uint(w, (uint32_t)i); pw_putc(w, '\n');
+#if defined(__aarch64__)
+        pw_puts(w, "BogoMIPS\t: 125.00\nFeatures\t: fp asimd evtstrm cpuid\n"
+                   "CPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\n"
+                   "CPU part\t: 0xd08\nCPU revision\t: 3\n");
+        pw_puts(w, "model name\t: "); pw_puts(w, model); pw_putc(w, '\n');
+#else
+        pw_puts(w, "vendor_id\t: GenuineIntel\nmodel name\t: "); pw_puts(w, model);
+        pw_puts(w, "\nflags\t\t: fpu tsc cx8 cmov mmx fxsr sse sse2\n");
+#endif
+        pw_putc(w, '\n');
+    }
+}
+static struct procfs_node nd_cpuinfo = { .name = "cpuinfo", .gen = gen_cpuinfo };
+
+/* §M90 — the mount table in Linux's two shapes.  dockerd reads
+ * /proc/self/mountinfo to find the parent mount of its data root (to set
+ * propagation), runc and containerd read it to decide what is already
+ * mounted; with no file they warn and fall back, or refuse.
+ *
+ * There are no mount NAMESPACES here, so "self" is the same table for every
+ * process — the file lives at /proc/self/mountinfo as a plain node (procfs has
+ * no per-pid directories), which is exactly what a reader opening "self" gets
+ * on Linux when it has never unshared.
+ *
+ * /proc and /dev are not entries in the VFS mount table — procfs and devfs
+ * hang their nodes off ramfs directories (see the header).  To a Linux reader
+ * they ARE filesystems of type proc / devtmpfs, and a tool that checks "is
+ * /proc mounted" before trusting it would otherwise refuse, so they are listed
+ * with those types.  Device numbers are synthetic (0:<id>): there is no dev_t
+ * here, and nothing that reads this file compares them with stat(). */
+static void mi_line(struct procfs_writer* w, int id, int parent, const char* mp,
+                    const char* type, const char* src, int info) {
+    if (info) {
+        pw_put_uint(w, (uint32_t)id); pw_putc(w, ' ');
+        pw_put_uint(w, (uint32_t)parent); pw_puts(w, " 0:");
+        pw_put_uint(w, (uint32_t)id); pw_puts(w, " / ");
+        pw_puts(w, mp); pw_puts(w, " rw,relatime shared:"); pw_put_uint(w, (uint32_t)id);
+        pw_puts(w, " - "); pw_puts(w, type); pw_putc(w, ' ');
+        pw_puts(w, src); pw_puts(w, " rw\n");
+    } else {
+        pw_puts(w, src); pw_putc(w, ' '); pw_puts(w, mp); pw_putc(w, ' ');
+        pw_puts(w, type); pw_puts(w, " rw,relatime 0 0\n");
+    }
+}
+static void gen_mounts_common(struct procfs_writer* w, int info) {
+    int n = vfs_mount_count();
+    int root_id = 1;
+    for (int i = 0; i < n; i++) {
+        const struct vfs_mount* m = vfs_mount_at(i);
+        if (!m) continue;
+        int id = i + 1;
+        int is_root = (m->path[0] == '/' && m->path[1] == 0);
+        if (is_root) root_id = id;
+        mi_line(w, id, is_root ? 0 : root_id, m->path,
+                m->fs_name ? m->fs_name : "none",
+                m->dev_name[0] ? m->dev_name : (m->fs_name ? m->fs_name : "none"), info);
+    }
+    mi_line(w, n + 1, root_id, "/proc", "proc", "proc", info);
+    mi_line(w, n + 2, root_id, "/dev", "devtmpfs", "devtmpfs", info);
+}
+static void gen_mountinfo(struct procfs_writer* w) { gen_mounts_common(w, 1); }
+static void gen_mounts(struct procfs_writer* w)    { gen_mounts_common(w, 0); }
+static struct procfs_node nd_mountinfo  = { .name = "self/mountinfo", .gen = gen_mountinfo };
+static struct procfs_node nd_selfmounts = { .name = "self/mounts",    .gen = gen_mounts };
+static struct procfs_node nd_mounts     = { .name = "mounts",         .gen = gen_mounts };
 static struct procfs_node nd_modules = { .name = "modules", .gen = gen_modules };
 static struct procfs_node nd_drivers = { .name = "drivers", .gen = gen_drivers };
 static struct procfs_node nd_console = { .name = "console", .gen = gen_console };
@@ -487,6 +571,10 @@ void procfs_init(void) {
     attach_node(&nd_version);
     attach_node(&nd_uptime);
     attach_node(&nd_meminfo);
+    attach_node(&nd_cpuinfo);
+    attach_node(&nd_mountinfo);
+    attach_node(&nd_selfmounts);
+    attach_node(&nd_mounts);
     attach_node(&nd_modules);
     attach_node(&nd_drivers);
     attach_node(&nd_console);

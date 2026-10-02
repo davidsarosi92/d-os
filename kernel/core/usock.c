@@ -25,7 +25,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define USOCK_BUF   4096        /* per-endpoint receive ring */
+#define USOCK_BUF   32768       /* per-endpoint receive ring (§M90: was 4096 —
+                                 * gRPC frames between docker and dockerd are
+                                 * 16 KiB and more, and a ring smaller than one
+                                 * frame turns every message into many wakeups) */
+#define USOCK_ACCQ  16          /* §M90 — pending connections per listener */
 #define USOCK_FDQ   8           /* max queued passed-fds per endpoint */
 
 struct usock {
@@ -47,6 +51,20 @@ struct usock {
      * Safe as a bare pointer because the ofile OWNS this object: it is freed
      * by ofile_unref, so the pointer cannot outlive what it points at. */
     struct ofile* owner;
+    /* §M90 — NAMED sockets (AF_UNIX bound to a path).  An endpoint is one of:
+     * a member of a connected pair (peer set, or NULL once it closed), an
+     * UNBOUND/BOUND socket that is neither (fresh from socket(2)), or a
+     * LISTENER holding connections waiting for accept(2). */
+    int           listening;
+    int           backlog;
+    struct usock* accq[USOCK_ACCQ];     /* server ends, waiting for accept   */
+    int           acc_n;
+    char          path[108];            /* bound name ("" = unnamed)         */
+    int           ever_connected;       /* send/recv before connect: ENOTCONN */
+    /* §M90 — writers blocked because THIS endpoint's ring is full; woken by
+     * recv after it drains.  Before this, a full ring made write(2) return 0,
+     * which a stream writer cannot interpret (it is neither EAGAIN nor EOF). */
+    struct waitq  writers;
 };
 
 void usock_set_owner(struct usock* s, struct ofile* o) { if (s) s->owner = o; }
@@ -60,6 +78,9 @@ int usock_pair(struct usock** a, struct usock** b) {
     sb->peer = sa;
     waitq_init(&sa->readers);
     waitq_init(&sb->readers);
+    waitq_init(&sa->writers);
+    waitq_init(&sb->writers);
+    sa->ever_connected = sb->ever_connected = 1;
     *a = sa;
     *b = sb;
     return 0;
@@ -130,6 +151,7 @@ long usock_recv(struct usock* s, void* buf, size_t n, int block,
     if (!s) { if (passfile_out) *passfile_out = NULL; return -1; }
 
     uint32_t f = waitq_lock(&s->readers);
+    int was_full = 0;
 
     /* Wait until there is something to receive — bytes or a passed fd — or the
      * peer has closed (then we return EOF/0), or the caller is non-blocking. */
@@ -138,12 +160,18 @@ long usock_recv(struct usock* s, void* buf, size_t n, int block,
 
     uint8_t* dst = (uint8_t*)buf;
     size_t got = 0;
+    was_full = s->count >= USOCK_BUF;
     while (got < n && s->count > 0) {
         dst[got++] = s->rx[s->head];
         s->head = (s->head + 1) % USOCK_BUF;
         s->count--;
     }
 
+    if (got > 0) {                       /* §M90 — room for a blocked writer */
+        uint32_t wf = waitq_lock(&s->writers);
+        waitq_wake_all(&s->writers);
+        waitq_unlock(&s->writers, wf);
+    }
     if (passfile_out) {
         if (s->fdq_count > 0) {
             *passfile_out = s->fdq[0];
@@ -154,11 +182,17 @@ long usock_recv(struct usock* s, void* buf, size_t n, int block,
         }
     }
     waitq_unlock(&s->readers, f);
+    /* §M90 — draining a FULL ring makes the PEER writable: that is a readiness
+     * change too, and nothing announced it — a poll(POLLOUT) on a full pipe
+     * slept until something unrelated woke it, and an edge-triggered epoll
+     * (Go's netpoller) would never hear of it at all.  Only the full -> not
+     * full transition matters: usock_can_write is "count < USOCK_BUF". */
+    if (got > 0 && was_full) fd_readiness_changed(NULL);
     return (long)got;
 }
 
 /* Readiness queries for poll(2). */
-int usock_can_read(struct usock* s)  { return s && s->count > 0; }
+int usock_can_read(struct usock* s)  { return s && (s->count > 0 || s->acc_n > 0); }
 int usock_can_write(struct usock* s) { return s && s->peer && s->peer->count < USOCK_BUF; }
 /* §M56.1 — is the other end still there?  `peer` is cleared by usock_close, so
  * this is the whole hangup story for a pipe or socketpair.  Kept separate from
@@ -173,8 +207,17 @@ int usock_peer_open(struct usock* s) { return s && s->peer != NULL; }
  *
  * Waking the peer's readers (under its queue lock) is what lets a task blocked
  * in recv(peer) return EOF once we go away instead of hanging forever. */
+static void reg_remove(struct usock* s);
 void usock_close(struct usock* s) {
     if (!s) return;
+    if (s->path[0] || s->listening) reg_remove(s);
+    for (int i = 0; i < s->acc_n; i++) usock_close(s->accq[i]);   /* never accepted */
+    s->acc_n = 0;
+    {   /* a blocked writer must see the end, not sleep on freed memory */
+        uint32_t wf = waitq_lock(&s->writers);
+        waitq_wake_all(&s->writers);
+        waitq_unlock(&s->writers, wf);
+    }
     struct usock* p = s->peer;
     if (p) {
         uint32_t f = waitq_lock(&p->readers);
@@ -185,4 +228,141 @@ void usock_close(struct usock* s) {
     }
     for (int i = 0; i < s->fdq_count; i++) ofile_unref(s->fdq[i]);
     kfree(s);
+}
+
+
+/* =============================================================================
+ * §M90 (2026-10-01) — NAMED UNIX SOCKETS: socket(AF_UNIX) + bind(path) +
+ * listen + accept, and connect(path).  Docker is built on them: the CLI talks
+ * to dockerd over /var/run/docker.sock, dockerd to containerd over its gRPC
+ * socket — before this d-os had only socketpair(2), and dockerd stopped at
+ * "socket: address family not supported by protocol".
+ *
+ * A bound name lives in a small registry (the authority for connect), and a
+ * FILE is created at the path as well, because programs treat the socket as
+ * a file: dockerd chmods it, a client tests that it exists, an old one is
+ * removed before re-binding.  An abstract name (sun_path[0] == 0) has no file.
+ * Only SOCK_STREAM — what Docker, containerd and gRPC use.
+ * ============================================================================= */
+#include "lock.h"
+#include "vfs.h"
+
+#define UREG_MAX 64
+static struct { char path[108]; struct usock* s; } g_ureg[UREG_MAX];
+static spinlock_t g_ureg_lock = SPINLOCK_INIT;
+
+static int ueq(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+static void reg_remove(struct usock* s) {
+    uint32_t fl = spin_lock_irqsave(&g_ureg_lock);
+    for (int i = 0; i < UREG_MAX; i++) if (g_ureg[i].s == s) { g_ureg[i].s = NULL; g_ureg[i].path[0] = 0; }
+    spin_unlock_irqrestore(&g_ureg_lock, fl);
+}
+
+struct usock* usock_new(void) {
+    struct usock* s = (struct usock*)kcalloc(1, sizeof *s);
+    if (!s) return NULL;
+    waitq_init(&s->readers);
+    waitq_init(&s->writers);
+    return s;
+}
+
+/* name: a path (absolute, as the caller canonicalised it) or "@abstract". */
+int usock_bind(struct usock* s, const char* name) {
+    if (!s || !name || !name[0]) return -22;                  /* EINVAL */
+    if (s->path[0] || s->peer || s->listening) return -22;
+    uint32_t fl = spin_lock_irqsave(&g_ureg_lock);
+    int slot = -1;
+    for (int i = 0; i < UREG_MAX; i++) {
+        if (g_ureg[i].s && ueq(g_ureg[i].path, name)) { spin_unlock_irqrestore(&g_ureg_lock, fl); return -98; } /* EADDRINUSE */
+        if (!g_ureg[i].s && slot < 0) slot = i;
+    }
+    if (slot < 0) { spin_unlock_irqrestore(&g_ureg_lock, fl); return -105; }   /* ENOBUFS */
+    int k = 0; for (; name[k] && k < 107; k++) g_ureg[slot].path[k] = name[k];
+    g_ureg[slot].path[k] = 0;
+    g_ureg[slot].s = s;
+    spin_unlock_irqrestore(&g_ureg_lock, fl);
+    for (k = 0; name[k] && k < 107; k++) s->path[k] = name[k];
+    s->path[k] = 0;
+    if (name[0] == '/') {
+        struct vfs_stat st;
+        if (vfs_stat(name, &st) == 0) { reg_remove(s); s->path[0] = 0; return -98; }   /* the file exists */
+        struct file* f = vfs_open(name, VFS_WRONLY | VFS_CREATE);
+        if (!f) { reg_remove(s); s->path[0] = 0; return -2; }                        /* ENOENT (no dir) */
+        vfs_close(f);
+    }
+    return 0;
+}
+
+int usock_listen(struct usock* s, int backlog) {
+    if (!s || s->peer) return -22;
+    if (!s->path[0]) return -22;              /* an unbound listener cannot be reached */
+    s->listening = 1;
+    s->backlog = backlog < 1 ? 1 : backlog > USOCK_ACCQ ? USOCK_ACCQ : backlog;
+    return 0;
+}
+
+int usock_connect(struct usock* s, const char* name) {
+    if (!s || s->listening) return -22;
+    if (s->peer || s->ever_connected) return -106;           /* EISCONN */
+    struct usock* l = NULL;
+    uint32_t fl = spin_lock_irqsave(&g_ureg_lock);
+    for (int i = 0; i < UREG_MAX; i++)
+        if (g_ureg[i].s && ueq(g_ureg[i].path, name)) { l = g_ureg[i].s; break; }
+    spin_unlock_irqrestore(&g_ureg_lock, fl);
+    if (!l || !l->listening) return name[0] == '/' ? -111 : -111;   /* ECONNREFUSED */
+    struct usock* srv = usock_new();
+    if (!srv) return -12;
+    uint32_t lf = waitq_lock(&l->readers);
+    if (l->acc_n >= l->backlog) { waitq_unlock(&l->readers, lf); kfree(srv); return -11; }  /* EAGAIN */
+    srv->peer = s; s->peer = srv;
+    srv->ever_connected = s->ever_connected = 1;
+    l->accq[l->acc_n++] = srv;
+    waitq_wake_all(&l->readers);
+    waitq_unlock(&l->readers, lf);
+    fd_readiness_changed(l->owner);
+    return 0;
+}
+
+/* The next pending connection, or NULL: -11 (EAGAIN) when non-blocking and
+ * none is waiting. */
+int usock_accept(struct usock* l, int block, struct usock** out) {
+    *out = NULL;
+    if (!l || !l->listening) return -22;
+    uint32_t f = waitq_lock(&l->readers);
+    while (l->acc_n == 0) {
+        if (!block) { waitq_unlock(&l->readers, f); return -11; }
+        waitq_block(&l->readers);
+    }
+    *out = l->accq[0];
+    for (int i = 1; i < l->acc_n; i++) l->accq[i - 1] = l->accq[i];
+    l->acc_n--;
+    waitq_unlock(&l->readers, f);
+    return 0;
+}
+
+int usock_is_listener(struct usock* s) { return s && s->listening; }
+const char* usock_name(struct usock* s) { return s ? s->path : ""; }
+int usock_connected(struct usock* s) { return s && s->ever_connected; }
+
+/* A STREAM write: blocks while the peer's ring is full (or returns -11 when
+ * non-blocking), -32 (EPIPE) once the peer is gone, -107 (ENOTCONN) before a
+ * connection.  usock_send itself stays the non-blocking primitive the self-
+ * tests and the Wayland server rely on. */
+long usock_write(struct usock* s, const void* buf, size_t n, int block) {
+    if (!s) return -9;
+    if (!s->ever_connected) return -107;
+    for (;;) {
+        if (!s->peer) return -32;
+        long w = usock_send(s, buf, n, NULL);
+        if (w != 0 || n == 0) return w < 0 ? -32 : w;
+        if (!block) return -11;
+        struct usock* p = s->peer;
+        if (!p) return -32;
+        uint32_t f = waitq_lock(&p->writers);
+        if (s->peer && s->peer->count >= USOCK_BUF) waitq_block(&p->writers);
+        waitq_unlock(&p->writers, f);
+    }
 }

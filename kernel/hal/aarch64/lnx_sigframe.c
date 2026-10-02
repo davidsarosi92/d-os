@@ -77,7 +77,9 @@ static uint64_t rd64(uintptr_t a) { return *(volatile uint64_t*)a; }
 static uint32_t rd32(uintptr_t a) { return *(volatile uint32_t*)a; }
 
 static int build(struct trapframe* f, struct task* t, const struct lnx_delivery* d, uint64_t fault_addr) {
-    if (!d->act.restorer) return -1;
+    /* §M90 — no sa_restorer: return through the kernel's trampoline page
+     * (vmm.c), as Linux's vDSO does.  Go relies on it. */
+    uintptr_t restorer = d->act.restorer ? (uintptr_t)d->act.restorer : (uintptr_t)0x7FFFFFF000ULL;
     uintptr_t sp = d->sp & ~(uintptr_t)15;
     uintptr_t rec = sp - REC_SIZE;
     uintptr_t fr = (rec - FRAME_SIZE) & ~(uintptr_t)15;
@@ -129,7 +131,7 @@ static int build(struct trapframe* f, struct task* t, const struct lnx_delivery*
     f->x[1] = si;
     f->x[2] = uc;
     f->x[29] = rec;
-    f->x[30] = (uint64_t)d->act.restorer;
+    f->x[30] = (uint64_t)restorer;
     f->elr = (uint64_t)d->act.handler;
     lnx_sig_entered(t, d);
     return 0;

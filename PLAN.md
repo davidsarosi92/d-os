@@ -322,7 +322,7 @@ what); a session can pick a theme and push on it.
 | M86 | **Memory beyond the 4 GiB line on i386 and aarch64** — asked for directly (2026-09-25).  x86_64 already discovers its ceiling (§M48, verified to 128 GiB).  i386 manages only what its 1 GiB identity map covers (473 MiB free on a 512 MiB box; RAM past 1 GiB unused) and cannot address physical memory above 4 GiB at all without PAE; aarch64's early MMU identity-maps 0-4 GiB in 1 GiB blocks with RAM from `0x4000_0000`, so at most ~3 GiB is usable and `hal_extend_identity_map` caps at 4 GiB | Memory / Portability | ✅ COMPLETE (highmem §4.94, PAE §4.96, aarch64 TTBR1 §4.97, multi-range DTB §4.98, user no-execute on x86 §4.104).  Kernel pages stay executable (modules run from the heap) |
 | M87 | **Network and storage in the Control Panel** — asked for directly (2026-09-27): a Network page, a taskbar network indicator with a Wi-Fi chooser, disk management with its functions, and the missing translations | UX / Network / Storage | §M87 — ✅ SHIPPED (DOCS §4.103): six-state network status, link state, admin down, static config keys, a simulated Wi-Fi adapter (QEMU has no Wi-Fi), `vfs_umount` + holds, an exFAT formatter (fsck-clean), RAM disks, `locale missing`; open: a real Wi-Fi driver, partition tables, a second virtio disk |
 | M89 | **Java — a JRE, and the JDK with it** — asked for directly (2026-09-28): Alpine's musl-built OpenJDK as a §M73 image on x86_64 + aarch64 (i386: no current JDK exists).  Needs a real address-space layer (reservations, demand-zero, PROT_NONE, lazy file maps), Linux signal delivery with siginfo/ucontext, arm64 threads, and a bulk of small calls | Userland | §M89 — core done: the JDK runs Hello.java on both 64-bit arches (DOCS §4.119); installer + measurements open |
-| M90 | **Docker itself on d-os** — asked for directly (2026-09-28): "full Docker, not the desktop if it can be left out, but everything else".  The real `docker` CLI, `dockerd`, `containerd` and `runc` (static Go binaries) running on d-os and managing containers.  Needs Linux namespaces, cgroup v2, overlayfs, netlink + veth + bridge networking, mount/pivot_root, capabilities/seccomp, and the Go runtime's own demands | Userland | §M90 — scoped, not started |
+| M90 | **Docker itself on d-os** — asked for directly (2026-09-28): "full Docker, not the desktop if it can be left out, but everything else".  The real `docker` CLI, `dockerd`, `containerd` and `runc` (static Go binaries) running on d-os and managing containers.  Needs Linux namespaces, cgroup v2, overlayfs, netlink + veth + bridge networking, mount/pivot_root, capabilities/seccomp, and the Go runtime's own demands | Userland | §M90 — IN PROGRESS: rung 1 done (CLI), rung 2 under way (dockerd) |
 
 ### Cross-cutting constraints
 
@@ -6059,8 +6059,30 @@ not i386.
 
 ## §M90 — Docker itself on d-os (no Docker Desktop)
 
-**Status: scoped, not started.  Asked for 2026-09-28: "teljes docker
+**Status: IN PROGRESS.  Asked for 2026-09-28: "teljes docker
 futtatása, nem kell desktop, ha kihagyható, de minden más igen".**
+
+**Progress (aarch64; x86_64 waits for the higher-half kernel move — the
+fixed-address Go binaries load at 0x200000, inside the low identity map):**
+- Rung 1 DONE (2026-10-01): the unmodified `docker` CLI runs, `docker version`
+  prints the client half.  Needed: programs streamed from the file (no 16 MiB
+  ELF limit), eventfd, umask, faccessat2, /proc/cpuinfo + Linux meminfo lines,
+  CNTVCT readable from EL0, a signal-return trampoline page (Go installs no
+  sa_restorer), ESR/FAR read once at exception entry.
+- Rung 2 under way (2026-10-02): `dockerd` starts, creates and adopts its API
+  socket and launches its managed containerd.  Built for it: named AF_UNIX
+  stream sockets (bind/listen/accept/connect, abstract names), a real
+  `getsockopt` (it answered success and wrote nothing — Go read SO_TYPE as 0
+  and panicked), **edge-triggered epoll** (§M56 had refused EPOLLET; Go
+  registers every fd that way), **close-on-exec** (there was none — Go's
+  fork/exec learns success from a CLOEXEC pipe), sessions/process groups
+  (`setsid` & co.), `chown`/`fchownat`, `PR_SET_PDEATHSIG`,
+  `/proc/self/mountinfo` + `/proc/mounts`; fixed on the way: draining a full
+  pipe never announced the writer's POLLOUT, polling an epoll set consumed a
+  ONESHOT arming.
+- Open, noted for later: containerd-shim daemonizes (fork, parent exits) — a
+  Linux-personality child must then outlive its parent (today the kill-tree
+  rule ends it); TASK_MAX_FDS is 32.
 
 ### What "full Docker" is, and what it is not
 

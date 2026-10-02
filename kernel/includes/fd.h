@@ -132,6 +132,16 @@ long usock_send_whole(struct usock* s, const void* buf, size_t n, struct ofile* 
 long usock_recv (struct usock* s, void* buf, size_t n, int block,
                  struct ofile** passfile_out);
 void usock_close(struct usock* s);
+/* §M90 — named sockets; negative returns are Linux errnos. */
+struct usock* usock_new(void);
+int  usock_bind(struct usock* s, const char* name);
+int  usock_listen(struct usock* s, int backlog);
+int  usock_connect(struct usock* s, const char* name);
+int  usock_accept(struct usock* l, int block, struct usock** out);
+int  usock_is_listener(struct usock* s);
+int  usock_connected(struct usock* s);
+const char* usock_name(struct usock* s);
+long usock_write(struct usock* s, const void* buf, size_t n, int block);
 /* §M56.2 — bind the endpoint to the open file description that owns it, so a
  * readiness change can name itself.  Declared here rather than called on
  * faith: without a prototype the compiler assumes `int usock_set_owner()`,
@@ -147,6 +157,20 @@ int  usock_peer_open (struct usock* s);  /* other end still there? (§M56.1)  */
  * poll() wakes and re-scans.  Defined in usyscall.c (owns the global
  * readiness wait-queue); declared here so the socket layer can raise it. */
 void fd_readiness_signal(void);
+/* §M90 — how many readiness events have been signalled so far (wraps).  The
+ * edge for edge-triggered epoll: "something happened since I last looked". */
+uint32_t fd_readiness_seq(void);
+
+/* §M90 — close-on-exec (usyscall.c, see struct fdtable).  A descriptor is
+ * created WITHOUT the bit (fd_install, dup2, F_DUPFD clear it); the ABI layer
+ * sets it from O_CLOEXEC / SOCK_CLOEXEC / F_SETFD; fork copies the mask; the
+ * execve commit point closes what is marked. */
+struct task;
+int      fd_set_cloexec(int fd, int on);     /* 0, or -1 for a bad fd */
+int      fd_get_cloexec(int fd);             /* 0/1, or -1 for a bad fd */
+uint32_t fd_cloexec_mask(struct task* t);
+void     fd_cloexec_restore(struct task* t, uint32_t mask);
+void     fd_close_on_exec(void);
 
 /* §M56.2 — the same wake, but naming the description that changed.
  *

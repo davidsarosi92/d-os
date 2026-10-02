@@ -251,7 +251,7 @@ const struct cred* cred_current(void) {
         { CRED_UID_NONE, CRED_UID_NONE, CRED_UID_NONE, CRED_UID_NONE,
           CRED_UID_NONE, CRED_UID_NONE, CRED_UID_NONE, CRED_UID_NONE },
         CRED_SESSION_NONE,
-        NULL, 0, "", ""                  /* §M73 — the machine's root, no container, cwd "/"; §M89 no exe */
+        NULL, 0, "", "", 0               /* §M73 — the machine's root, no container, cwd "/"; §M89 no exe; §M90 umask 022 */
     };
     struct task* t = task_current();
     /* Before task_init, or on a CPU that has not taken a task yet.  "There is

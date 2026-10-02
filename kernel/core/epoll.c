@@ -29,6 +29,10 @@ struct epitem {
     uint32_t events;            /* what the caller asked to hear about */
     uint64_t data;              /* opaque cookie, handed back verbatim */
     int      used;
+    /* §M90 — EPOLLET: the readiness-event count at the scan that last
+     * reported this item, and whether it has been reported since (re)arming. */
+    uint32_t et_seen;
+    int      et_reported;
 };
 
 struct epoll {
@@ -62,12 +66,6 @@ static struct epitem* find_locked(struct epoll* ep, int fd) {
 int epoll_ctl_obj(struct epoll* ep, int op, int fd, uint32_t events, uint64_t data) {
     if (!ep || fd < 0) return -EP_EINVAL;
 
-    /* Refuse edge-triggered rather than quietly downgrading it.  A program
-     * written for EPOLLET drains each fd once per report; served
-     * level-triggered it would be handed the same fd forever and spin while
-     * appearing to work.  A loud -EINVAL points at the one line to change. */
-    if (op != EPOLL_CTL_DEL && (events & EPOLLET)) return -EP_EINVAL;
-
     uint32_t f = spin_lock_irqsave(&ep->lock);
     int rc = 0;
     struct epitem* e = find_locked(ep, fd);
@@ -79,6 +77,7 @@ int epoll_ctl_obj(struct epoll* ep, int op, int fd, uint32_t events, uint64_t da
             if (!ep->it[i].used) {
                 ep->it[i].used = 1; ep->it[i].fd = fd;
                 ep->it[i].events = events; ep->it[i].data = data;
+                ep->it[i].et_reported = 0;
                 e = &ep->it[i];
                 break;
             }
@@ -88,6 +87,7 @@ int epoll_ctl_obj(struct epoll* ep, int op, int fd, uint32_t events, uint64_t da
     case EPOLL_CTL_MOD:
         if (!e) { rc = -EP_ENOENT; break; }
         e->events = events; e->data = data;
+        e->et_reported = 0;             /* re-arming reports the current state */
         break;
     case EPOLL_CTL_DEL:
         if (!e) { rc = -EP_ENOENT; break; }
@@ -125,6 +125,11 @@ struct ep_scan_ctx {
     struct epoll_ev* out;
     int              maxevents;
     int              n;         /* events written by the last scan */
+    /* §M90 — a PEEK (another set or a poll asking "would this set fire?")
+     * must not consume what only a real epoll_wait may: an edge, or a
+     * ONESHOT arming.  Before this, polling an epoll fd that held a ONESHOT
+     * item disarmed it, and the wait that followed never reported it. */
+    int              peek;
 };
 
 /* Which bits are reported without being asked for.  Same rule as poll's, and
@@ -161,9 +166,30 @@ struct ep_scan_ctx {
  * runs) and does NOT demonstrate a speedup.  It is the right shape, not a
  * proven win, and saying so is cheaper than someone later trusting the claim.
  */
+/* EDGE-TRIGGERED (§M90).  §M56 refused EPOLLET, on the argument that serving
+ * it level-triggered makes a program that drains once per report spin.  True —
+ * and Go's runtime registers EVERY descriptor edge-triggered with EPOLLOUT in
+ * the mask, so a level answer would report an idle writable socket on every
+ * netpoll and the scheduler would never block.  Refusing it stopped every Go
+ * network program (dockerd adopting its API socket) instead.
+ *
+ * What edge-triggered promises is "you are told when something HAPPENS to the
+ * descriptor".  Every such happening already goes through ONE routine,
+ * fd_readiness_signal, because poll(2)'s blocking wait depends on it — so its
+ * event count is a complete record of happenings.  An EPOLLET item is reported
+ * when it is ready AND that count moved since the scan that last reported it
+ * (or it was just added / modified, which Linux also reports).  It cannot MISS
+ * an edge: an edge is a signal, a signal bumps the count, and the count is
+ * read at the start of the scan under the same lock the bump takes.  It can
+ * report one that was not this descriptor's (the count is global) — a
+ * spurious wakeup, which every ET consumer must tolerate anyway because Linux
+ * produces them too, and which costs one EAGAIN.  Per-descriptor counts would
+ * remove those, and would need every producer to know its descriptor — the
+ * enumeration the readiness memo above died of. */
 static int ep_scan(void* c) {
     struct ep_scan_ctx* s = (struct ep_scan_ctx*)c;
     int n = 0;
+    uint32_t seq = fd_readiness_seq();
 
     uint32_t f = spin_lock_irqsave(&s->ep->lock);
     for (int i = 0; i < EPOLL_MAX_ITEMS && n < s->maxevents; i++) {
@@ -175,6 +201,10 @@ static int ep_scan(void* c) {
         uint32_t rev = fd_readiness_of(e->fd, fd_lookup(e->fd))
                      & (e->events | EP_ALWAYS);
         if (!rev) continue;
+        if (e->events & EPOLLET) {
+            if (e->et_reported && e->et_seen == seq) continue;   /* no edge since */
+            if (!s->peek) { e->et_reported = 1; e->et_seen = seq; }
+        }
 
         s->out[n].events = rev;
         s->out[n].data   = e->data;
@@ -184,7 +214,7 @@ static int ep_scan(void* c) {
          * caller re-arms with MOD, which is the whole point of the flag (it
          * hands ownership of the fd to whoever took the event without a
          * remove/add round trip). */
-        if (e->events & EPOLLONESHOT) e->events &= ~(EPOLLIN | EPOLLOUT);
+        if ((e->events & EPOLLONESHOT) && !s->peek) e->events &= ~(EPOLLIN | EPOLLOUT);
     }
     spin_unlock_irqrestore(&s->ep->lock, f);
 
@@ -213,7 +243,7 @@ int epoll_has_events(struct epoll* ep) {
         t->epoll_depth++;
     }
     struct epoll_ev one;
-    struct ep_scan_ctx c = { ep, &one, 1, 0 };
+    struct ep_scan_ctx c = { ep, &one, 1, 0, 1 };
     int r = ep_scan(&c) > 0;
     if (t) t->epoll_depth--;
     return r;
@@ -222,7 +252,7 @@ int epoll_has_events(struct epoll* ep) {
 int epoll_wait_obj(struct epoll* ep, struct epoll_ev* out, int maxevents,
                    int timeout_ms) {
     if (!ep || !out || maxevents <= 0) return -EP_EINVAL;
-    struct ep_scan_ctx c = { ep, out, maxevents, 0 };
+    struct ep_scan_ctx c = { ep, out, maxevents, 0, 0 };
     fd_readiness_wait(ep_scan, &c, timeout_ms);
     return c.n;
 }

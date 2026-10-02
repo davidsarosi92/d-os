@@ -501,6 +501,27 @@ struct task {
     uint32_t  cred_seq;
     int       owner_birth;
     int       uid_birth;
+    /* §M90 — POSIX process group and session.  0 = the boot group/session
+     * (reported as 1, init's), so the four tasks built by hand and every
+     * kernel thread are correct by construction.  Inherited in spawn_common
+     * (fork, clone and spawn alike); changed only by setsid/setpgid.  Nothing
+     * delivers signals by group yet and there is no controlling terminal —
+     * these exist because a forked child calling setsid (Go's SysProcAttr,
+     * every daemon) must succeed and must then really BE a session leader:
+     * a second setsid in it is refused, as on Linux. */
+    int       pgid;
+    int       sid;
+    /* §M90 — prctl(PR_SET_PDEATHSIG): the signal asked for when the parent
+     * dies.  Recorded and reported; the DELIVERY is the kill-tree rule in
+     * task_exit_code, which already ends every non-detached child when its
+     * parent exits — at least as strong as any death signal.  Not inherited
+     * (Linux clears it on fork). */
+    int       pdeathsig;
+    /* §M90 — close-on-exec bits of the PRIVATE descriptor table (bit i =
+     * fds_inline[i]); a shared table keeps its own (struct fdtable).  Read and
+     * written only through fd.h's fd_*cloexec* helpers, which pick the right
+     * one — the same split `fds` / `fdt` already makes. */
+    uint32_t  fd_cloexec_inline;
 };
 
 /* Set up the scheduler and convert the current `kernel_main` context

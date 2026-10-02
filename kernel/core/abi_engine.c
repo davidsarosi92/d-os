@@ -84,6 +84,27 @@ static long h_fchmodat(struct abi_ctx* c) {
     if ((int)c->a[0] != AT_FDCWD_) return -38;
     return lnx_err(sys_chmod((const char*)c->a[1], (int)c->a[2]));
 }
+/* §M90 — chown / lchown / fchownat.  dockerd chowns its API socket to the
+ * docker group and the daemon root to the remapped root; containerd and runc
+ * chown every layer they unpack.  The owner is an int here and (uid_t)-1
+ * arrives as 0xFFFFFFFF, which the cast turns into CRED_UID_NONE — "leave it".
+ * AT_SYMLINK_NOFOLLOW is accepted and does nothing different: ownership of a
+ * symlink itself is not something any reader here consults.  Only AT_FDCWD:
+ * this VFS has no directory descriptors (the *at rule of §M73). */
+static long chown_err(int r) {
+    if (r >= 0) return 0;
+    if (r == -2) return -1;              /* EPERM  */
+    if (r == -3) return -5;              /* EIO    */
+    return -2;                           /* ENOENT */
+}
+static long h_chown(struct abi_ctx* c) {
+    return chown_err(sys_chown((const char*)c->a[0], (int)c->a[1], (int)c->a[2]));
+}
+static long h_fchownat(struct abi_ctx* c) {
+    if ((int)c->a[0] != AT_FDCWD_) return -38;
+    if (c->a[4] & 0x1000) return -38;    /* AT_EMPTY_PATH: chown of an fd */
+    return chown_err(sys_chown((const char*)c->a[1], (int)c->a[2], (int)c->a[3]));
+}
 static long h_unlink(struct abi_ctx* c)  { return lnx_err(sys_unlink((const char*)c->a[0])); }
 static long h_unlinkat(struct abi_ctx* c) {
     if ((int)c->a[0] != AT_FDCWD_) return -38;
@@ -153,6 +174,15 @@ static int abi_path(unsigned long up, char* k, unsigned cap) {
     return (up && copy_str_from_user(k, (uintptr_t)up, cap) >= 0) ? 0 : -1;
 }
 
+/* §M90 — close-on-exec from a creation flag.  O_CLOEXEC, SOCK_CLOEXEC,
+ * EPOLL_CLOEXEC, EFD_CLOEXEC and TFD_CLOEXEC are all the same bit, 02000000,
+ * on every guest we speak.  Applied to the descriptor a handler returns. */
+#define ABI_O_CLOEXEC 0x80000u
+static long abi_cx(long fd, unsigned long flags) {
+    if (fd >= 0 && (flags & ABI_O_CLOEXEC)) fd_set_cloexec((int)fd, 1);
+    return fd;
+}
+
 /* Linux open flags → VFS flags.  The access mode, O_CREAT and O_TRUNC share
  * their bits on every guest we speak; O_DIRECTORY does not, so the caller
  * checks it against the map. */
@@ -177,7 +207,7 @@ static long abi_open_common(struct abi_ctx* c, unsigned long upath, unsigned lon
     }
     /* sys_open copies from a RING-3 path, which is what upath is. */
     long r = sys_open((const char*)upath, abi_open_flags(flags));
-    return r < 0 ? -ABI_ENOENT : r;
+    return r < 0 ? -ABI_ENOENT : abi_cx(r, flags);
 }
 static long h_open(struct abi_ctx* c)   { return abi_open_common(c, c->a[0], c->a[1]); }
 static long h_openat(struct abi_ctx* c) {
@@ -251,16 +281,24 @@ static long h_getdents64(struct abi_ctx* c) {
 }
 
 /* fcntl: F_DUPFD must really duplicate (libwayland dups every fd it sends,
- * and a "successful" 0 is a dup to fd 0); O_NONBLOCK is honoured; the rest
- * (CLOEXEC, locks) is accepted and not tracked.  The command numbers are the
- * same on every guest we speak (asm-generic). */
+ * and a "successful" 0 is a dup to fd 0); O_NONBLOCK is honoured; FD_CLOEXEC
+ * is real since §M90 (F_GETFD/F_SETFD, F_DUPFD_CLOEXEC); locks are accepted
+ * and not tracked.  The command numbers are the same on every guest we speak
+ * (asm-generic). */
 static long h_fcntl(struct abi_ctx* c) {
     int fd = (int)c->a[0], cmd = (int)c->a[1];
     long arg = (long)c->a[2];
     if (cmd == 0 || cmd == 1030) {                          /* F_DUPFD, F_DUPFD_CLOEXEC */
         int nfd = sys_dupfd(fd, (int)arg);
-        return nfd < 0 ? -ABI_EINVAL : nfd;
+        if (nfd < 0) return -ABI_EINVAL;
+        if (cmd == 1030) fd_set_cloexec(nfd, 1);
+        return nfd;
     }
+    if (cmd == 1) {                                         /* F_GETFD */
+        int r = fd_get_cloexec(fd);
+        return r < 0 ? -ABI_EBADF : r;                      /* FD_CLOEXEC is 1 */
+    }
+    if (cmd == 2) return fd_set_cloexec(fd, (int)(arg & 1)) < 0 ? -ABI_EBADF : 0;   /* F_SETFD */
     if (cmd == 4) { sys_socket_setnonblock(fd, (arg & 04000) ? 1 : 0); return 0; }   /* F_SETFL */
     if (cmd == 3) return sys_socket_getnonblock(fd) > 0 ? 04000 : 0;                /* F_GETFL */
     return 0;
@@ -387,10 +425,10 @@ static long h_dup2(struct abi_ctx* c) {
     int r = sys_dup2((int)c->a[0], (int)c->a[1]);
     return r < 0 ? -ABI_EBADF : r;
 }
-static long h_dup3(struct abi_ctx* c) {                 /* flags: only O_CLOEXEC, untracked */
+static long h_dup3(struct abi_ctx* c) {                 /* flags: only O_CLOEXEC */
     if ((int)c->a[0] == (int)c->a[1]) return -ABI_EINVAL;
     int r = sys_dup2((int)c->a[0], (int)c->a[1]);
-    return r < 0 ? -ABI_EBADF : r;
+    return r < 0 ? -ABI_EBADF : abi_cx(r, c->a[2]);
 }
 static long h_getcwd(struct abi_ctx* c) {
     const char* cwd = cred_fs_cwd();
@@ -525,9 +563,62 @@ static unsigned long abi_itimerspec_bytes(const struct abi_ctx* c) {
 #define ABI_ITS_VAL_SEC  2
 #define ABI_ITS_VAL_NSEC 3
 
+/* §M90 — umask(mask): set the creation mask, return the previous one. */
+static long h_umask(struct abi_ctx* c) {
+    struct task* t = task_current();
+    if (!t) return 022;
+    int old = t->cred.umask_plus1 ? t->cred.umask_plus1 - 1 : 022;
+    t->cred.umask_plus1 = (int)(c->a[0] & 0777) + 1;
+    return old;
+}
+
+/* §M90 — sessions and process groups (see task.h: pgid/sid).  0 stored means
+ * the boot group, reported as 1 so no caller ever sees a group id of 0. */
+static int abi_pg_of(const struct task* t)  { return t->pgid ? t->pgid : 1; }
+static int abi_sid_of(const struct task* t) { return t->sid  ? t->sid  : 1; }
+static struct task* abi_pid_target(long pid) {
+    struct task* self = task_current();
+    if (pid == 0 || (self && pid == self->pid)) return self;
+    return task_find((int)pid);
+}
+static long h_setsid(struct abi_ctx* c) {
+    (void)c;
+    struct task* t = task_current();
+    if (!t) return -1;
+    if (t->pgid == t->pid) return -1;    /* EPERM: already a group leader */
+    t->sid = t->pgid = t->pid;
+    return t->pid;
+}
+static long h_getsid(struct abi_ctx* c) {
+    struct task* t = abi_pid_target((long)c->a[0]);
+    return t ? abi_sid_of(t) : -3;       /* ESRCH */
+}
+static long h_getpgid(struct abi_ctx* c) {
+    struct task* t = abi_pid_target((long)c->a[0]);
+    return t ? abi_pg_of(t) : -3;
+}
+static long h_getpgrp(struct abi_ctx* c) {
+    (void)c;
+    struct task* t = task_current();
+    return t ? abi_pg_of(t) : 1;
+}
+/* setpgid(pid, pgid): only on yourself or a child of yours (POSIX); a session
+ * leader cannot move; pgid 0 means "a group named after the target". */
+static long h_setpgid(struct abi_ctx* c) {
+    struct task* self = task_current();
+    struct task* t = abi_pid_target((long)c->a[0]);
+    if (!self || !t) return -3;                          /* ESRCH */
+    if (t != self && t->ppid != self->pid) return -3;
+    if ((long)c->a[1] < 0) return -22;                   /* EINVAL */
+    if (t->sid == t->pid) return -1;                     /* EPERM: session leader */
+    int pg = (int)c->a[1] ? (int)c->a[1] : t->pid;
+    t->pgid = (pg == 1) ? 0 : pg;
+    return 0;
+}
+
 /* §M90 — eventfd2(initval, flags) / eventfd(initval). */
 static long h_eventfd(struct abi_ctx* c) {
-    return sys_eventfd_create((uint64_t)(uint32_t)c->a[0], (int)c->a[1]);
+    return abi_cx(sys_eventfd_create((uint64_t)(uint32_t)c->a[0], (int)c->a[1]), c->a[1]);
 }
 static long h_eventfd_old(struct abi_ctx* c) {
     return sys_eventfd_create((uint64_t)(uint32_t)c->a[0], 0);
@@ -539,8 +630,8 @@ static long h_timerfd_create(struct abi_ctx* c) {
      * (timer_now_ns) and it is monotonic, so CLOCK_MONOTONIC is what every
      * caller gets whatever it asked for.  Failing instead would stop programs
      * that pass CLOCK_REALTIME out of habit and never depend on the
-     * difference. */
-    return sys_timerfd_create();
+     * difference.  TFD_CLOEXEC is honoured (§M90). */
+    return abi_cx(sys_timerfd_create(), c->a[1]);
 }
 
 static long h_timerfd_settime(struct abi_ctx* c) {
@@ -815,10 +906,9 @@ static void abi_st32(uint8_t* p, uint32_t v) {
 static long h_epoll_create(struct abi_ctx* c) {
     /* epoll_create's `size` hint and epoll_create1's flags are both accepted
      * and ignored: the size hint has been advisory since Linux 2.6.8, and the
-     * only flag is EPOLL_CLOEXEC, which is meaningful once this kernel has
-     * close-on-exec at all. */
-    (void)c;
-    return sys_epoll_create();
+     * only flag is EPOLL_CLOEXEC — honoured since §M90.  (A size hint never
+     * has that bit set: it would be a hint of half a million descriptors.) */
+    return abi_cx(sys_epoll_create(), c->a[0]);
 }
 
 static long h_epoll_ctl(struct abi_ctx* c) {
@@ -902,7 +992,7 @@ static long h_sigpending(struct abi_ctx* c) {
  * x86_64's old switch arm handed the guest pointer straight to sys_pipe,
  * which stores through it with no check at all (§M46's boundary, missed in
  * one place).  pipe2 honours O_NONBLOCK (0x800 on every Linux arch here) on
- * both ends; O_CLOEXEC is accepted and meaningless until exec closes fds. */
+ * both ends, and O_CLOEXEC (§M90). */
 #define ABI_O_NONBLOCK 0x800
 static long pipe_common(struct abi_ctx* c, unsigned long flags) {
     if (!abi_user_w_ok(c->a[0], 2 * sizeof(int))) return -ABI_EFAULT;
@@ -914,6 +1004,8 @@ static long pipe_common(struct abi_ctx* c, unsigned long flags) {
         if (a) a->nonblock = 1;
         if (b) b->nonblock = 1;
     }
+    abi_cx(k[0], flags);
+    abi_cx(k[1], flags);
     ((int*)(uintptr_t)c->a[0])[0] = k[0];
     ((int*)(uintptr_t)c->a[0])[1] = k[1];
     return 0;
@@ -1198,6 +1290,16 @@ static long h_prctl(struct abi_ctx* c) {
         d[i] = 0;
         return 0;
     }
+    if (opt == 1) {                                       /* PR_SET_PDEATHSIG */
+        if (c->a[1] > 64) return -ABI_EINVAL;
+        t->pdeathsig = (int)c->a[1];
+        return 0;
+    }
+    if (opt == 2) {                                       /* PR_GET_PDEATHSIG */
+        if (!abi_w_ok(c->a[1], 4)) return -ABI_EFAULT;
+        *(int32_t*)(uintptr_t)c->a[1] = t->pdeathsig;
+        return 0;
+    }
     if (opt == 3) return 1;                               /* PR_GET_DUMPABLE */
     if (opt == 4) return 0;                               /* PR_SET_DUMPABLE */
     return -ABI_EINVAL;
@@ -1239,7 +1341,12 @@ static long h_madvise(struct abi_ctx* c) {
  * the TLB shootdown and interrupt paths already serialising the CPUs; QUERY
  * (0) answers "none registered-needed", the rest succeed. */
 static long h_membarrier(struct abi_ctx* c) { (void)c; return 0; }
-static long h_memfd_create(struct abi_ctx* c) { (void)c; int r = sys_memfd(0); return r < 0 ? -ABI_ENOMEM : r; }
+static long h_memfd_create(struct abi_ctx* c) {
+    int r = sys_memfd(0);
+    if (r < 0) return -ABI_ENOMEM;
+    if (c->a[1] & 1u) fd_set_cloexec(r, 1);             /* MFD_CLOEXEC */
+    return r;
+}
 /* ftruncate: a memfd is sized; a regular file is EXTENDED by writing a zero
  * at the new last byte (an in-memory file has no holes to punch, so
  * shrinking is refused rather than faked). */
@@ -1416,9 +1523,58 @@ static void abi_addr_out(unsigned long uaddr, unsigned long ulen,
         *(uint32_t*)(uintptr_t)ulen = (uint32_t)sizeof sa;
 }
 
+/* §M90 — AF_UNIX: a sockaddr_un is family (2 bytes) + a path of up to 108,
+ * NUL-terminated unless it fills the space; sun_path[0] == 0 is the ABSTRACT
+ * namespace (kept as "@name", no file).  A relative path is made absolute
+ * against the caller's working directory, so two programs naming the same
+ * socket from different directories meet. */
+#define ABI_AF_UNIX 1
+static int abi_addr_un(unsigned long uaddr, unsigned long len, char* out, int cap) {
+    if (len < 3 || len > 110 || !abi_user_r_ok(uaddr, len)) return -1;
+    const uint8_t* p = (const uint8_t*)(uintptr_t)uaddr;
+    if ((p[0] | (p[1] << 8)) != ABI_AF_UNIX) return -2;
+    char raw[112];
+    int n = 0;
+    if (p[2] == 0) {
+        raw[n++] = '@';
+        for (unsigned long i = 3; i < len && n < 108; i++) raw[n++] = p[i] ? (char)p[i] : '@';
+    } else {
+        for (unsigned long i = 2; i < len && p[i] && n < 108; i++) raw[n++] = (char)p[i];
+    }
+    raw[n] = 0;
+    if (raw[0] == '@' || raw[0] == '/') {
+        int k = 0; for (; raw[k] && k < cap - 1; k++) out[k] = raw[k];
+        out[k] = 0;
+        return 0;
+    }
+    return vfs_canonical(raw, out, (size_t)cap) == 0 ? 0 : -1;
+}
+static void abi_un_out(unsigned long uaddr, unsigned long ulen, const char* name) {
+    if (!uaddr || !ulen || !abi_user_r_ok(ulen, sizeof(uint32_t))) return;
+    uint32_t room = *(uint32_t*)(uintptr_t)ulen;
+    uint8_t sa[110];
+    int n = 0;
+    sa[n++] = ABI_AF_UNIX; sa[n++] = 0;
+    if (name && name[0]) {
+        const char* q = name[0] == '@' ? name + 1 : name;
+        if (name[0] == '@') sa[n++] = 0;
+        for (; *q && n < 109; q++) sa[n++] = (uint8_t)*q;
+        if (name[0] != '@') sa[n++] = 0;
+    }
+    uint32_t w = room < (uint32_t)n ? room : (uint32_t)n;
+    if (w && abi_user_w_ok(uaddr, w))
+        for (uint32_t i = 0; i < w; i++) ((uint8_t*)(uintptr_t)uaddr)[i] = sa[i];
+    if (abi_user_w_ok(ulen, sizeof(uint32_t))) *(uint32_t*)(uintptr_t)ulen = (uint32_t)n;
+}
+static int abi_fd_is_unix(int fd) { return sys_fd_kind(fd) == 2; }   /* FD_SOCK */
+
 static long h_socket(struct abi_ctx* c) {
     int domain = (int)c->a[0];
     int type   = (int)c->a[1];
+    if (domain == ABI_AF_UNIX) {
+        if ((type & 0xF) != 1) return -ABI_EAFNOSUPPORT;   /* SOCK_STREAM only */
+        return abi_cx(sys_unix_socket(type & ABI_SOCK_NONBLOCK), (unsigned long)type);
+    }
     if (domain != ABI_AF_INET) return -ABI_EAFNOSUPPORT;
     int fd = sys_socket(domain, type & 0xFF, (int)c->a[2]);
     if (fd < 0) return -ABI_EOPNOTSUPP;
@@ -1426,10 +1582,17 @@ static long h_socket(struct abi_ctx* c) {
      * `while (recvmsg(...) >= 0)` and needs the EAGAIN only a non-blocking
      * socket produces (§M39). */
     if (type & ABI_SOCK_NONBLOCK) sys_socket_setnonblock(fd, 1);
-    return fd;
+    return abi_cx(fd, (unsigned long)type);
 }
 
 static long h_bind(struct abi_ctx* c) {
+    if (abi_fd_is_unix((int)c->a[0])) {
+        char nm[112];
+        int r = abi_addr_un(c->a[1], c->a[2], nm, sizeof nm);
+        if (r == -2) return -ABI_EAFNOSUPPORT;
+        if (r) return -ABI_EINVAL;
+        return sys_unix_bind((int)c->a[0], nm);
+    }
     uint32_t ip; int port;
     int r = abi_addr_in(c->a[1], &ip, &port);
     if (r == -1) return -ABI_EFAULT;
@@ -1438,6 +1601,13 @@ static long h_bind(struct abi_ctx* c) {
 }
 
 static long h_connect(struct abi_ctx* c) {
+    if (abi_fd_is_unix((int)c->a[0])) {
+        char nm[112];
+        int r = abi_addr_un(c->a[1], c->a[2], nm, sizeof nm);
+        if (r == -2) return -ABI_EAFNOSUPPORT;
+        if (r) return -ABI_EINVAL;
+        return sys_unix_connect((int)c->a[0], nm);
+    }
     uint32_t ip; int port;
     int r = abi_addr_in(c->a[1], &ip, &port);
     if (r == -1) return -ABI_EFAULT;
@@ -1450,23 +1620,30 @@ static long h_connect(struct abi_ctx* c) {
 }
 
 static long h_listen(struct abi_ctx* c) {
+    if (abi_fd_is_unix((int)c->a[0])) return sys_unix_listen((int)c->a[0], (int)c->a[1]);
     return sys_listen((int)c->a[0], (int)c->a[1]) == 0 ? 0 : -ABI_EINVAL;
 }
 
 /* accept(fd, addr, addrlen) and accept4(fd, addr, addrlen, flags). */
 static long h_accept_common(struct abi_ctx* c, int flags) {
+    if (abi_fd_is_unix((int)c->a[0])) {
+        int nfd = sys_unix_accept((int)c->a[0], flags & ABI_SOCK_NONBLOCK);
+        if (nfd >= 0) abi_un_out(c->a[1], c->a[2], "");      /* the peer is unnamed */
+        return abi_cx(nfd, (unsigned long)flags);
+    }
     uint32_t ip = 0; int port = 0;
     int fd = sys_accept_k((int)c->a[0], &ip, &port);
     if (fd == -ABI_EAGAIN) return -ABI_EAGAIN;
     if (fd < 0) return -ABI_EINVAL;
     abi_addr_out(c->a[1], c->a[2], ip, port);
     if (flags & ABI_SOCK_NONBLOCK) sys_socket_setnonblock(fd, 1);
-    return fd;
+    return abi_cx(fd, (unsigned long)flags);
 }
 static long h_accept (struct abi_ctx* c) { return h_accept_common(c, 0); }
 static long h_accept4(struct abi_ctx* c) { return h_accept_common(c, (int)c->a[3]); }
 
 static long h_getsockname(struct abi_ctx* c) {
+    if (abi_fd_is_unix((int)c->a[0])) { abi_un_out(c->a[1], c->a[2], sys_unix_name((int)c->a[0])); return 0; }
     uint32_t ip = 0; int port = 0;
     if (sys_getsockname_k((int)c->a[0], &ip, &port) != 0) return -ABI_EINVAL;
     abi_addr_out(c->a[1], c->a[2], ip, port);
@@ -1474,6 +1651,7 @@ static long h_getsockname(struct abi_ctx* c) {
 }
 
 static long h_getpeername(struct abi_ctx* c) {
+    if (abi_fd_is_unix((int)c->a[0])) { abi_un_out(c->a[1], c->a[2], ""); return 0; }
     uint32_t ip = 0; int port = 0;
     if (sys_getpeername_k((int)c->a[0], &ip, &port) != 0) return -ABI_ENOTCONN;
     abi_addr_out(c->a[1], c->a[2], ip, port);
@@ -1516,7 +1694,54 @@ static long h_shutdown(struct abi_ctx* c) {
  * failure as fatal, while ignoring them costs at most a timeout that never
  * fires.  The day one of them changes behaviour, it stops being a stub. */
 static long h_setsockopt(struct abi_ctx* c) { (void)c; return 0; }
-static long h_getsockopt(struct abi_ctx* c) { (void)c; return 0; }
+/* §M90 — getsockopt(fd, level, name, val, len*).  It used to succeed and write
+ * NOTHING — the "accept and forget" shape this tree keeps paying for: Go's
+ * net.FileListener asks SO_TYPE, read back whatever its stack held (0), found
+ * no address type for "unix, type 0", and dereferenced the nil address it got
+ * (dockerd panicked while adopting its own API socket).  The SOL_SOCKET
+ * questions a program can act on are answered from the descriptor; anything
+ * else keeps the old answer — success with 0 written — because that is what
+ * every existing caller (TLS, NetSurf, musl's resolver) has been running on,
+ * and it is now at least a WRITTEN zero instead of stale stack. */
+#define ABI_SOL_SOCKET    1
+#define ABI_SO_TYPE       3
+#define ABI_SO_ERROR      4
+#define ABI_SO_SNDBUF     7
+#define ABI_SO_RCVBUF     8
+#define ABI_SO_PEERCRED  17
+#define ABI_SO_ACCEPTCONN 30
+#define ABI_SO_DOMAIN    39
+static long h_getsockopt(struct abi_ctx* c) {
+    int fd = (int)c->a[0], level = (int)c->a[1], name = (int)c->a[2];
+    unsigned long uval = c->a[3], ulen = c->a[4];
+    int family, type, listening;
+    if (sys_socket_info(fd, &family, &type, &listening) != 0) return -88;   /* ENOTSOCK */
+    int v = 0;
+    if (level == ABI_SOL_SOCKET) {
+        switch (name) {
+        case ABI_SO_TYPE:       v = type; break;
+        case ABI_SO_DOMAIN:     v = family; break;
+        case ABI_SO_ACCEPTCONN: v = listening; break;
+        case ABI_SO_ERROR:      v = 0; break;   /* errors are reported by the call that hit them */
+        case ABI_SO_SNDBUF:
+        case ABI_SO_RCVBUF:     v = 32768; break;
+        /* No peer credentials are tracked yet: answering zeros would say "the
+         * peer is root, pid 0", which an authorising server would believe. */
+        case ABI_SO_PEERCRED:   return -92;     /* ENOPROTOOPT */
+        default: break;
+        }
+    }
+    if (!ulen || !abi_user_r_ok(ulen, sizeof(uint32_t))) return -ABI_EFAULT;
+    uint32_t room = *(uint32_t*)(uintptr_t)ulen;
+    uint32_t w = room < 4 ? room : 4;
+    if (w) {
+        if (!uval || !abi_user_w_ok(uval, w)) return -ABI_EFAULT;
+        for (uint32_t i = 0; i < w; i++)
+            ((uint8_t*)(uintptr_t)uval)[i] = (uint8_t)((uint32_t)v >> (8 * i));   /* little-endian guests */
+    }
+    if (abi_user_w_ok(ulen, sizeof(uint32_t))) *(uint32_t*)(uintptr_t)ulen = w;
+    return 0;
+}
 
 /* The operation table, indexed by `enum abi_op`.  A NULL slot means "declared
  * in the vocabulary, no handler yet" — abi_invoke reports that as unhandled so
@@ -1548,6 +1773,12 @@ static const struct {
     [ABI_SIGPROCMASK]     = { "sigprocmask",     h_sigprocmask },
     [ABI_TIMERFD_CREATE]  = { "timerfd_create",  h_timerfd_create  },
     [ABI_EVENTFD]         = { "eventfd2",        h_eventfd         },
+    [ABI_UMASK]           = { "umask",           h_umask           },
+    [ABI_SETSID]          = { "setsid",          h_setsid          },
+    [ABI_GETSID]          = { "getsid",          h_getsid          },
+    [ABI_SETPGID]         = { "setpgid",         h_setpgid         },
+    [ABI_GETPGID]         = { "getpgid",         h_getpgid         },
+    [ABI_GETPGRP]         = { "getpgrp",         h_getpgrp         },
     [ABI_EVENTFD_OLD]     = { "eventfd",         h_eventfd_old     },
     [ABI_TIMERFD_SETTIME] = { "timerfd_settime", h_timerfd_settime },
     [ABI_TIMERFD_GETTIME] = { "timerfd_gettime", h_timerfd_gettime },
@@ -1582,6 +1813,8 @@ static const struct {
     [ABI_LINKAT]       = { "linkat",       h_linkat       },
     [ABI_CHMOD]        = { "chmod",        h_chmod        },
     [ABI_FCHMODAT]     = { "fchmodat",     h_fchmodat     },
+    [ABI_CHOWN]        = { "chown",        h_chown        },
+    [ABI_FCHOWNAT]     = { "fchownat",     h_fchownat     },
     [ABI_UNLINK]       = { "unlink",       h_unlink       },
     [ABI_UNLINKAT]     = { "unlinkat",     h_unlinkat     },
     [ABI_GETUID]       = { "getuid",       h_getuid       },

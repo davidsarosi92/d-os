@@ -247,6 +247,15 @@ int shell_run_from_path(const char* line) {
     }
     argv[argc] = NULL;
     if (!argc) return 0;
+    /* §M90 — a trailing `&` starts the program in the BACKGROUND: the shell
+     * prints its pid and takes the next command while it runs (a daemon —
+     * dockerd — has to be running while its client is used).  Its output
+     * still goes to this terminal; init collects it when it ends. */
+    int background = 0;
+    if (argc > 1 && argv[argc - 1][0] == '&' && !argv[argc - 1][1]) {
+        background = 1;
+        argv[--argc] = NULL;
+    }
 
     /* The program: a path as given, else the first PATH entry that has it. */
     char path[256], real[256];
@@ -313,6 +322,7 @@ int shell_run_from_path(const char* line) {
     vfs_close(f);
     for (unsigned i = 0; i < sizeof saved; i++) me->cred.exe[i] = saved[i];
     if (pid < 0) { kprintf("%s: could not start %s\n", argv[0], real); return 1; }
+    if (background) { kprintf("[%d] %s\n", pid, name); return 1; }
     struct task* t = task_find(pid);
     if (t) task_set_reap_owned(t, 1);
     int code = 0;

@@ -238,14 +238,31 @@ static void cmd_epolltest(void) {
         sys_close(pfds[0]); sys_close(pfds[1]);
     }
 
-    /* --- 4. edge-triggered is REFUSED, not silently downgraded --------- */
-    int rc = sys_epoll_ctl_k(ep, EPOLL_CTL_MOD, tfd, POLLIN | EPOLLET, 0);
-    if (rc >= 0) {
-        console_write("epoll: FAIL (EPOLLET accepted — a program written for "
-                      "it would spin)\n");
-        ok = 0;
-    } else {
-        kprintf("epoll: EPOLLET refused with %d (correct)\n", rc);
+    /* --- 4. edge-triggered (§M90): reported once per EDGE, not per level --
+     * A byte arrives -> reported.  Nothing happens -> NOT reported again,
+     * although the byte is still unread (that is the difference from level).
+     * A second byte arrives -> reported again although the fd never stopped
+     * being readable (Linux's ET wakes on each arrival, and Go relies on it).
+     * The middle step is what fails if ET is served as level; the last is
+     * what fails if an edge is lost. */
+    if (sys_pipe(pfds) == 0) {
+        int ep2 = sys_epoll_create();
+        int et_ok = ep2 >= 0
+            && sys_epoll_ctl_k(ep2, EPOLL_CTL_ADD, pfds[0], POLLIN | EPOLLET, 0x5555ull) == 0;
+        char c = 'e';
+        sys_write_k(pfds[1], &c, 1);
+        int n1 = et_ok ? sys_epoll_wait_k(ep2, evbuf, 8, 1000) : -1;
+        int n2 = et_ok ? sys_epoll_wait_k(ep2, evbuf, 8, 0)    : -1;
+        sys_write_k(pfds[1], &c, 1);
+        int n3 = et_ok ? sys_epoll_wait_k(ep2, evbuf, 8, 1000) : -1;
+        kprintf("epoll: EPOLLET first=%d again=%d after-new-byte=%d (want 1 0 1)\n",
+                n1, n2, n3);
+        if (n1 != 1 || n2 != 0 || n3 != 1) {
+            console_write("epoll: FAIL (edge-triggered semantics)\n");
+            ok = 0;
+        }
+        if (ep2 >= 0) sys_close(ep2);
+        sys_close(pfds[0]); sys_close(pfds[1]);
     }
 
     /* --- 4b. the readiness memo must never hide a transition ------------ */

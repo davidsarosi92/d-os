@@ -19,13 +19,12 @@
  * bundled in with the interface.  Saying so plainly is better than implying an
  * efficiency the code does not have.
  *
- * LEVEL-TRIGGERED ONLY.  EPOLLET is accepted and ignored... no: it is
- * REJECTED.  Silently treating an edge-triggered registration as
- * level-triggered would work — a level-triggered loop is a superset — but a
- * program written for EPOLLET drains each fd exactly once per report, and a
- * level-triggered kernel would then hand it the same fd forever.  It would
- * "work" and spin.  An honest -EINVAL sends the author to the one line that
- * needs changing.
+ * LEVEL- AND EDGE-TRIGGERED.  §M56 rejected EPOLLET (served level-triggered
+ * it makes a drain-once program spin); §M90 implements it, because Go's
+ * runtime registers every descriptor edge-triggered and a refusal stopped all
+ * Go networking.  The edge is the global readiness-event count — see the note
+ * above ep_scan in epoll.c for why that cannot miss an edge and what it costs
+ * (an occasional spurious report, which ET consumers tolerate by contract).
  *
  * Readiness itself is NOT defined here: it comes from fd_readiness() in fd.h,
  * which poll(2) uses too.  Two definitions of "ready" would drift.
@@ -51,7 +50,7 @@ struct epoll;
 #define EPOLLERR     0x008
 #define EPOLLHUP     0x010
 #define EPOLLRDHUP   0x2000             /* peer closed its writing half */
-#define EPOLLET      0x80000000u        /* rejected — see the header */
+#define EPOLLET      0x80000000u        /* §M90 — supported, see the header */
 #define EPOLLONESHOT 0x40000000u
 
 /* One reported event, in KERNEL layout.  The guest's `struct epoll_event` is
@@ -68,7 +67,7 @@ struct epoll* epoll_create_obj(void);
 void          epoll_close(struct epoll* ep);
 
 /* op is EPOLL_CTL_*.  Returns 0, or a negative errno-shaped code:
- * -EINVAL (bad op / EPOLLET), -ENOENT (MOD/DEL of an unregistered fd),
+ * -EINVAL (bad op), -ENOENT (MOD/DEL of an unregistered fd),
  * -EEXIST (ADD of a registered fd), -ENOSPC (set full). */
 int epoll_ctl_obj(struct epoll* ep, int op, int fd, uint32_t events, uint64_t data);
 

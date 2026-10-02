@@ -610,6 +610,7 @@ int proc_execve_env(const char* path, char* const uargv[], char* const uenvp[]) 
     while (__atomic_load_n(&me->swap_busy, __ATOMIC_ACQUIRE)) task_msleep(2);
     if (old) vmm_space_destroy(old);
     kfree(strbuf);
+    fd_close_on_exec();                       /* §M90 — past the point of no return */
 
     /* 5. Resume in ring 3 at the new entry (one-way).  For a dynamic binary
      *    this is the interpreter's entry; ld.so then jumps to the program. */

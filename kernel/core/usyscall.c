@@ -235,7 +235,21 @@ struct fdtable {
     int           refs;
     spinlock_t    lock;
     struct ofile* fd[TASK_MAX_FDS];
+    uint32_t      cloexec;              /* §M90 — bit i: close fd[i] at exec */
 };
+
+/* §M90 — CLOSE-ON-EXEC.  This kernel had none: every descriptor survived
+ * execve.  Mostly that only leaked, but one idiom depends on it absolutely —
+ * Go (and posix_spawn in musl) learn whether a fork+exec WORKED from a pipe
+ * whose write end is close-on-exec in the child: a successful exec closes it
+ * and the parent reads EOF; a failure writes the errno into it.  Without
+ * close-on-exec the parent waits for an EOF that never comes (dockerd starting
+ * containerd).  One bit per slot, beside the table it describes; 32 slots, so
+ * one word. */
+_Static_assert(TASK_MAX_FDS <= 32, "fd_cloexec is one 32-bit mask");
+static uint32_t* fd_cx(struct task* t) {
+    return t->fdt ? &t->fdt->cloexec : &t->fd_cloexec_inline;
+}
 
 /* Lock the CURRENT task's table for a slot update: a no-op for a private
  * table (nobody else can see it), the table's lock for a shared one. */
@@ -257,6 +271,8 @@ struct fdtable* fdtable_share(struct task* parent) {
          * the shared table.  Only the parent is running on its table at this
          * moment — it has no threads yet, by definition. */
         for (int i = 0; i < TASK_MAX_FDS; i++) { ft->fd[i] = parent->fds_inline[i]; parent->fds_inline[i] = NULL; }
+        ft->cloexec = parent->fd_cloexec_inline;        /* the bits move with the slots */
+        parent->fd_cloexec_inline = 0;
         parent->fdt = ft;
         parent->fds = ft->fd;
     }
@@ -283,7 +299,12 @@ static int fd_install(struct ofile* o) {
     if (!t) return -1;
     uint32_t fl = fdt_lock(t);
     for (int fd = 3; fd < TASK_MAX_FDS; fd++) {
-        if (!t->fds[fd]) { t->fds[fd] = o; fdt_unlock(t, fl); return fd; }
+        if (!t->fds[fd]) {
+            t->fds[fd] = o;
+            *fd_cx(t) &= ~(1u << fd);           /* a new descriptor is inherited by exec */
+            fdt_unlock(t, fl);
+            return fd;
+        }
     }
     fdt_unlock(t, fl);
     return -1;
@@ -324,7 +345,10 @@ long sys_write_k(int fd, const void* buf, size_t n) {
     struct ofile* o = fd_lookup(fd);
     if (!o) return -1;
     if (o->kind == FD_VFS)  return (long)vfs_write(o->file, buf, n);
-    if (o->kind == FD_SOCK) return usock_send(o->sock, buf, n, NULL);
+    /* §M90 — a STREAM write: blocks while the peer is full (EAGAIN when
+     * non-blocking), EPIPE once it is gone.  It returned 0 when the ring was
+     * full, which a writer can read as nothing at all. */
+    if (o->kind == FD_SOCK) return usock_write(o->sock, buf, n, !o->nonblock);
     if (o->kind == FD_NETSOCK) return netsock_write(o->nsock, buf, n);
     if (o->kind == FD_EVENT) return eventfd_write(o->efd, buf, n, !o->nonblock);   /* §M90 */
     return -1;                                 /* shm: not write(2)-able */
@@ -492,6 +516,14 @@ int sys_chmod(const char* upath, int mode) {
     if (!upath || strncpy_from_user(kp, upath, sizeof kp) < 0) return -1;
     return vfs_chmod(kp, (uint32_t)mode & 07777u);
 }
+/* §M90 — chown: owner and/or group of a path (-1 = leave as is).  The VFS
+ * applies the policy (admin only, see vfs_chown) and says which refusal it
+ * was: -1 no such path, -2 not permitted, -3 the volume refused to persist. */
+int sys_chown(const char* upath, int uid, int gid) {
+    char kp[256];
+    if (!upath || strncpy_from_user(kp, upath, sizeof kp) < 0) return -1;
+    return vfs_chown(kp, uid, gid);
+}
 int sys_unlink(const char* upath) {
     char kp[256];
     if (!upath || strncpy_from_user(kp, upath, sizeof kp) < 0) return -1;
@@ -511,6 +543,7 @@ int sys_close(int fd) {
     uint32_t fl = fdt_lock(t);
     if (t->fds[fd] != o) { fdt_unlock(t, fl); return -1; }   /* another thread closed it */
     t->fds[fd] = NULL;
+    *fd_cx(t) &= ~(1u << fd);
     fdt_unlock(t, fl);
     ofile_unref(o);
     return 0;
@@ -668,6 +701,7 @@ int sys_dup2(int oldfd, int newfd) {
     uint32_t fl = fdt_lock(t);
     struct ofile* old = t->fds[newfd];
     t->fds[newfd] = nw;
+    *fd_cx(t) &= ~(1u << newfd);             /* POSIX: dup2 clears FD_CLOEXEC */
     fdt_unlock(t, fl);
     if (old) ofile_unref(old);               /* outside the lock: may close a file */
     return newfd;
@@ -699,6 +733,7 @@ int sys_dupfd(int fd, int minfd) {
     for (int i = minfd; i < TASK_MAX_FDS; i++) {
         if (t->fds[i]) continue;
         t->fds[i] = nw;
+        *fd_cx(t) &= ~(1u << i);
         fdt_unlock(t, fl);
         return i;
     }
@@ -1162,8 +1197,16 @@ static struct waitq readiness_wq = WAITQ_INIT;
  * direction: a false negative would be a wait that never receives anything. */
 static volatile uint32_t g_netsock_scans;
 
+/* §M90 — every readiness event, counted.  Bumped under the queue lock by the
+ * one routine every producer already calls, so it is exactly as complete as
+ * the wake-ups poll(2) depends on — which is what makes it safe to build
+ * edge-triggered epoll on (see epoll.c). */
+static volatile uint32_t g_readiness_seq;
+uint32_t fd_readiness_seq(void) { return g_readiness_seq; }
+
 void fd_readiness_signal(void) {
     uint32_t f = waitq_lock(&readiness_wq);
+    g_readiness_seq++;
     waitq_wake_all(&readiness_wq);
     waitq_unlock(&readiness_wq, f);
 }
@@ -1561,12 +1604,14 @@ void fd_close_all(void) {
         struct fdtable* ft = t->fdt;
         t->fdt = NULL;
         t->fds = t->fds_inline;
+        t->fd_cloexec_inline = 0;
         fdtable_put(ft);
         return;
     }
     for (int fd = 3; fd < TASK_MAX_FDS; fd++) {
         if (t->fds[fd]) { ofile_unref(t->fds[fd]); t->fds[fd] = NULL; }
     }
+    t->fd_cloexec_inline = 0;
 }
 
 /* ---- network sockets (M24 socket API — AF_INET) --------------------------- */
@@ -1735,6 +1780,52 @@ int sys_socket(int domain, int type, int proto) {
  * an AF_INET socket need completely different primitives, and handling only the
  * latter made libwayland's first read fail with a bare -1 — which musl turned
  * into EPERM, a spectacularly misleading errno for "wrong fd type". */
+/* §M90 — AF_UNIX sockets with NAMES (socket/bind/listen/accept/connect on a
+ * path); the semantics are usock.c's.  Negative returns are Linux errnos. */
+int sys_unix_socket(int nonblock) {
+    struct usock* u = usock_new();
+    if (!u) return -12;
+    struct ofile* o = ofile_from_sock(u);
+    if (!o) { usock_close(u); return -12; }
+    o->nonblock = nonblock ? 1 : 0;
+    int fd = fd_install(o);
+    if (fd < 0) { ofile_unref(o); return -24; }               /* EMFILE */
+    return fd;
+}
+static struct usock* unix_of(int fd) {
+    struct ofile* o = fd_lookup(fd);
+    return (o && o->kind == FD_SOCK) ? o->sock : NULL;
+}
+int sys_unix_bind(int fd, const char* name) {
+    struct usock* u = unix_of(fd);
+    return u ? usock_bind(u, name) : -88;                       /* ENOTSOCK */
+}
+int sys_unix_listen(int fd, int backlog) {
+    struct usock* u = unix_of(fd);
+    return u ? usock_listen(u, backlog) : -88;
+}
+int sys_unix_connect(int fd, const char* name) {
+    struct usock* u = unix_of(fd);
+    return u ? usock_connect(u, name) : -88;
+}
+int sys_unix_accept(int fd, int nonblock_new) {
+    struct ofile* lo = fd_lookup(fd);
+    if (!lo || lo->kind != FD_SOCK) return -88;
+    struct usock* s = NULL;
+    int r = usock_accept(lo->sock, !lo->nonblock, &s);
+    if (r < 0) return r;
+    struct ofile* o = ofile_from_sock(s);
+    if (!o) { usock_close(s); return -12; }
+    o->nonblock = nonblock_new ? 1 : 0;
+    int nfd = fd_install(o);
+    if (nfd < 0) { ofile_unref(o); return -24; }
+    return nfd;
+}
+const char* sys_unix_name(int fd) {
+    struct usock* u = unix_of(fd);
+    return u ? usock_name(u) : NULL;
+}
+
 int sys_fd_kind(int fd) {
     struct ofile* o = fd_lookup(fd);
     return o ? (int)o->kind : -1;
@@ -2183,4 +2274,75 @@ void usyscall_boundary_test(int on) {
     kprintf("boundarytest: gate %s on '%s' — `audit ring3-boundary` must %s\n",
             on ? "LEFT ARMED" : "cleared", me->name ? me->name : "?",
             on ? "fail" : "pass");
+}
+
+/* §M90 — what getsockopt(SOL_SOCKET, ...) needs to answer truthfully about a
+ * descriptor: its family (Linux numbering: 1 = AF_UNIX, 2 = AF_INET), its type
+ * (1 = SOCK_STREAM, 2 = SOCK_DGRAM) and whether it is listening.  0, or -1 when
+ * `fd` is not a socket at all (the caller turns that into ENOTSOCK). */
+int sys_socket_info(int fd, int* family, int* type, int* listening) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o) return -1;
+    if (o->kind == FD_SOCK) {
+        *family = 1; *type = 1;                   /* AF_UNIX streams only */
+        *listening = usock_is_listener(o->sock);
+        return 0;
+    }
+    if (o->kind == FD_NETSOCK && o->nsock) {
+        *family = 2; *type = o->nsock->type;
+        *listening = o->nsock->lsock != NULL;
+        return 0;
+    }
+    return -1;
+}
+
+/* §M90 — close-on-exec, see the note at struct fdtable. */
+int fd_set_cloexec(int fd, int on) {
+    struct task* t = task_current();
+    if (!t || fd < 0 || fd >= TASK_MAX_FDS) return -1;
+    uint32_t fl = fdt_lock(t);
+    /* An EMPTY 0/1/2 is the console (§M59), a valid descriptor: Go's runtime
+     * checks fds 0-2 with F_GETFD at startup and dies "cannot open standard
+     * fds" when it hears EBADF. */
+    int ok = t->fds[fd] != NULL || fd <= 2;
+    if (ok) { if (on) *fd_cx(t) |= 1u << fd; else *fd_cx(t) &= ~(1u << fd); }
+    fdt_unlock(t, fl);
+    return ok ? 0 : -1;
+}
+int fd_get_cloexec(int fd) {
+    struct task* t = task_current();
+    if (!t || fd < 0 || fd >= TASK_MAX_FDS) return -1;
+    uint32_t fl = fdt_lock(t);
+    int r = (t->fds[fd] || fd <= 2) ? (int)((*fd_cx(t) >> fd) & 1u) : -1;
+    fdt_unlock(t, fl);
+    return r;
+}
+uint32_t fd_cloexec_mask(struct task* t) {
+    if (!t) return 0;
+    uint32_t fl = fdt_lock(t);
+    uint32_t m = *fd_cx(t);
+    fdt_unlock(t, fl);
+    return m;
+}
+void fd_cloexec_restore(struct task* t, uint32_t mask) {
+    if (t) *fd_cx(t) = mask;            /* a fork child's own, still private table */
+}
+/* At the point of no return in execve: close every marked descriptor.  The
+ * references are taken out under the lock and released after it, because
+ * releasing one may close a file or a socket (which wakes, and may sleep). */
+void fd_close_on_exec(void) {
+    struct task* t = task_current();
+    if (!t) return;
+    struct ofile* gone[TASK_MAX_FDS];
+    int n = 0;
+    uint32_t fl = fdt_lock(t);
+    uint32_t m = *fd_cx(t);
+    for (int fd = 0; fd < TASK_MAX_FDS; fd++) {
+        if (!(m & (1u << fd))) continue;
+        if (t->fds[fd]) gone[n++] = t->fds[fd];
+        t->fds[fd] = NULL;
+    }
+    *fd_cx(t) = 0;
+    fdt_unlock(t, fl);
+    for (int i = 0; i < n; i++) ofile_unref(gone[i]);
 }
