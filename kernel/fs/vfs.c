@@ -688,6 +688,12 @@ static int split_parent(const char* path, char* parent_buf, size_t cap,
     if (len == 0 || len + 2 > cap) return -1;
     if (c != parent_buf + 1) memcpy_(parent_buf + 1, c, len + 1);
     char* s = parent_buf + 1;                   /* the canonical path */
+    /* §M90 — "dir/" names the same entry as "dir" (POSIX): mkdir("a/b/") is
+     * how Go's MkdirAll spells its last step, and the trailing slash used to
+     * leave an empty last name — ENOENT for a directory that was about to be
+     * created.  The canonicaliser returns an absolute, dot-free path as is,
+     * so the slash survives to here. */
+    while (len > 1 && s[len - 1] == '/') s[--len] = 0;
 
     int last_slash = -1;
     for (size_t i = 0; i < len; i++) if (s[i] == '/') last_slash = (int)i;
@@ -804,7 +810,8 @@ static int vfs_unlink_unlocked(const char* path) {
     struct dentry*  d    = parent->children;
     while (d && !streq(d->name, last)) { link = &d->sibling; d = d->sibling; }
     if (!d || !d->inode) return -1;
-    if (d->inode->type == INODE_DIR && d->children) return -2;   /* not empty */
+    if (d->inode->type == INODE_DIR && d->children &&
+        !(d->inode->vflags & VFS_IF_OWN_CHILDREN)) return -2;   /* not empty */
     if (d->inode->type == INODE_DEVICE) return -1;               /* devfs nodes */
 
     pcache_invalidate(d->inode);                 /* §M74 — before the inode goes */
@@ -812,6 +819,10 @@ static int vfs_unlink_unlocked(const char* path) {
     if (r != 0) return r;
 
     *link = d->sibling;                          /* splice out of the tree */
+    /* §M90 — a VFS_IF_OWN_CHILDREN directory's remaining entries are the
+     * fs's synthesised files: their inodes went with the fs's unlink, the
+     * dentries are ours to free. */
+    while (d->children) { struct dentry* c = d->children; d->children = c->sibling; kfree(c); }
     kfree(d);
     return 0;
 }

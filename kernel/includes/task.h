@@ -539,6 +539,9 @@ struct task {
     /* §M90 — set by task_exit_group on every thread of the group (code + 1;
      * 0 = none): task_exit_code reports this instead of its own code. */
     int         group_exit_plus1;
+    /* §M90 — the cgroup v2 node this task is in (cgroupfs.c owns the type);
+     * NULL = the root.  Inherited at spawn, moved by writing cgroup.procs. */
+    void*       cgroup;
 };
 
 /* §M90 — the process a task belongs to: its own pid unless it is a thread. */

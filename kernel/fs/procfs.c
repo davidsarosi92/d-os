@@ -34,6 +34,7 @@
 #include "memage.h"
 #include "hal_api.h"     /* §M90 — hal_cpu_model */
 #include "percpu.h"      /* §M90 — smp_ncpus */
+#include "cgroupfs.h"    /* §M90 — /proc/self/cgroup */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -545,6 +546,14 @@ static void gen_mounts_common(struct procfs_writer* w, int info) {
 }
 static void gen_mountinfo(struct procfs_writer* w) { gen_mounts_common(w, 1); }
 static void gen_mounts(struct procfs_writer* w)    { gen_mounts_common(w, 0); }
+/* §M90 — /proc/self/cgroup in the unified-hierarchy form, "0::<path>": the
+ * line runc, containerd and dockerd read to find the cgroup they run in. */
+static void gen_selfcgroup(struct procfs_writer* w) {
+    char path[256];
+    cgroup_path_of(task_current(), path, sizeof path);
+    pw_puts(w, "0::"); pw_puts(w, path); pw_putc(w, '\n');
+}
+static struct procfs_node nd_selfcgroup = { .name = "self/cgroup",    .gen = gen_selfcgroup };
 static struct procfs_node nd_mountinfo  = { .name = "self/mountinfo", .gen = gen_mountinfo };
 static struct procfs_node nd_selfmounts = { .name = "self/mounts",    .gen = gen_mounts };
 static struct procfs_node nd_mounts     = { .name = "mounts",         .gen = gen_mounts };
@@ -573,6 +582,7 @@ void procfs_init(void) {
     attach_node(&nd_meminfo);
     attach_node(&nd_cpuinfo);
     attach_node(&nd_mountinfo);
+    attach_node(&nd_selfcgroup);
     attach_node(&nd_selfmounts);
     attach_node(&nd_mounts);
     attach_node(&nd_modules);

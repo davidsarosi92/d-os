@@ -184,7 +184,15 @@ struct inode {
      * use.  0 until then, and every filesystem allocates inodes zeroed, so a
      * new inode at a reused address can never match a dead file's pages. */
     uint32_t pc_id;
+    /* §M90 — APPENDED.  VFS_IF_* behaviour flags (0 for every existing fs). */
+    uint32_t vflags;
 };
+
+/* §M90 — a directory whose filesystem decides whether it may be removed while
+ * it still has entries: its children are the fs's own synthesised files (a
+ * cgroup's control files), so "the directory is not empty" is not the test —
+ * the fs's unlink op is, and the VFS frees the child dentries after it agrees. */
+#define VFS_IF_OWN_CHILDREN 0x1u
 
 /* Directory entry — name + inode pointer + tree links.  We keep an
  * intrusive tree so vfs.c can walk the namespace without per-fs hooks

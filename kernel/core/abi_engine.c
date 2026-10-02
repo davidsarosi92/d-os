@@ -1324,12 +1324,30 @@ static long h_clock_getres(struct abi_ctx* c) {
  * in-memory filesystem, which is where its data lives.  Layout: word-sized
  * fields, except f_fsid (two ints) — which is exactly one word on a 64-bit
  * guest and two on a 32-bit one. */
-static long put_statfs(struct abi_ctx* c, uintptr_t p, int wide64) {
+/* §M90 — f_type is the MAGIC of the filesystem the path is on, not always
+ * ramfs's: runc and dockerd tell the cgroup v2 hierarchy from everything else
+ * by statfs("/sys/fs/cgroup").f_type == CGROUP2_SUPER_MAGIC, and Go's os
+ * package asks the same question of /proc. */
+static uint32_t abi_fs_magic(const char* kpath) {
+    if (!kpath) return 0x858458f6u;
+    /* /proc and /dev are ramfs directories here, presented as proc / devtmpfs */
+    if (kpath[0] == '/' && kpath[1] == 'p' && kpath[2] == 'r' && kpath[3] == 'o' &&
+        kpath[4] == 'c' && (kpath[5] == 0 || kpath[5] == '/')) return 0x9fa0u;
+    if (kpath[0] == '/' && kpath[1] == 'd' && kpath[2] == 'e' && kpath[3] == 'v' &&
+        (kpath[4] == 0 || kpath[4] == '/')) return 0x01021994u;
+    const struct vfs_mount* m = vfs_mount_for(kpath);
+    const char* n = m ? m->fs_name : NULL;
+    if (!n) return 0x858458f6u;
+    if (n[0] == 'c' && n[1] == 'g') return 0x63677270u;         /* cgroup2 */
+    if (n[0] == 'e' && n[1] == 'x') return 0x2011bab0u;         /* exfat   */
+    return 0x858458f6u;                                         /* ramfs   */
+}
+static long put_statfs(struct abi_ctx* c, uintptr_t p, int wide64, uint32_t magic) {
     unsigned w = wide64 ? 8 : c->map->word_bytes;
     unsigned size = 11 * w + 8 + 4 * w;
     if (!abi_w_ok(p, size)) return -ABI_EFAULT;
     for (unsigned i = 0; i < size; i++) ((uint8_t*)p)[i] = 0;
-    uint64_t v[7] = { 0x858458f6ull, 4096, pmm_managed_frames(), pmm_free_frames(),
+    uint64_t v[7] = { magic, 4096, pmm_managed_frames(), pmm_free_frames(),
                       pmm_free_frames(), 65536, 65536 };
     uintptr_t q = p;
     for (int i = 0; i < 7; i++) { put_word(c, q, v[i]); q += w; }
@@ -1343,7 +1361,7 @@ static long h_statfs(struct abi_ctx* c) {
     if (abi_path(c->a[0], kp, sizeof kp) != 0) return -ABI_EFAULT;
     struct kstat_full st;
     if (sys_stat_full_k(kp, &st) != 0) return -ABI_ENOENT;
-    return put_statfs(c, (uintptr_t)c->a[1], 0);
+    return put_statfs(c, (uintptr_t)c->a[1], 0, abi_fs_magic(kp));
 }
 /* i386's statfs64(path, size, buf) / fstatfs64(fd, size, buf): the counts are
  * 64-bit, f_type/f_bsize and the tail 32-bit, and the caller passes the size
@@ -1374,7 +1392,14 @@ static long h_fstatfs64(struct abi_ctx* c) {
 }
 static long h_fstatfs(struct abi_ctx* c) {
     if (!fd_lookup((int)c->a[0]) && ((int)c->a[0] < 0 || (int)c->a[0] > 2)) return -ABI_EBADF;
-    return put_statfs(c, (uintptr_t)c->a[1], 0);
+    /* §M90 — the descriptor's own filesystem: its path from its dentry. */
+    char kp[256];
+    uint32_t magic = 0x858458f6u;
+    struct ofile* o = fd_lookup((int)c->a[0]);
+    if (o && o->kind == FD_VFS && o->file && o->file->dentry &&
+        vfs_dentry_path(o->file->dentry, kp, sizeof kp) == 0)
+        magic = abi_fs_magic(kp[0] ? kp : "/");
+    return put_statfs(c, (uintptr_t)c->a[1], 0, magic);
 }
 
 /* prctl: the thread name (PR_SET_NAME 15 / PR_GET_NAME 16 — a JVM names

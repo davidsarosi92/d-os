@@ -928,6 +928,7 @@ static struct task* spawn_common_ex(const char* name, void (*entry)(void),
         t->ppid    = cur ? task_tgid(cur) : 0;
     }
     t->pgid = cur ? cur->pgid : 0;           /* §M90 — group + session follow the caller */
+    t->cgroup = cur ? cur->cgroup : NULL;    /* §M90 — a child starts in its parent's cgroup */
     t->sid  = cur ? cur->sid  : 0;
     t->state       = TASK_RUNNABLE;
     /* §M32 — identity, inherited HERE and nowhere else.  Assigning creds from
