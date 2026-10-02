@@ -54,6 +54,7 @@
 #include "pmm.h"
 #include "kmap.h"
 #include "kmutex.h"
+#include "lock.h"
 #include "kmalloc.h"
 #include "printf.h"
 #include "config.h"
@@ -77,6 +78,46 @@ static struct pc_page* g_hash[PC_HASH];
 static struct kmutex   g_lock = KMUTEX_INIT("pcache");
 static uint32_t        g_next_id = 1;
 static struct pcache_stats g_st;
+
+/* §M90 — WHICH FRAMES THE CACHE HOLDS, one bit each, so the frame allocator
+ * can refuse to free one of them (pmm_free_frame asks pcache_owns_frame).
+ * Since writes update cached pages in place, a cache frame freed by some
+ * other path while the cache still holds it is no longer a stale view — the
+ * next write to the file copies its bytes into whatever the allocator handed
+ * that frame to.  The check turns that into a named leak instead. */
+static uint8_t*   g_owned;
+static spinlock_t g_owned_lk = SPINLOCK_INIT;
+static uint8_t* owned_map(void) {
+    uint8_t* m = __atomic_load_n(&g_owned, __ATOMIC_ACQUIRE);
+    if (m) return m;
+    uint32_t fl = spin_lock_irqsave(&g_owned_lk);
+    if (!g_owned) {
+        /* From the HEAP, never bootmem: bootmem is what the COW reference
+         * table is built from on the first fork, and taking ~100 KB of it here
+         * left that table unbuildable at 3 GiB — with no table every COW
+         * release frees the frame outright (cowref.h). */
+        uint32_t n = (pmm_nr_frames - pmm_pfn_base + 7) / 8;
+        uint8_t* a = (uint8_t*)kcalloc(1, n);
+        if (a) __atomic_store_n(&g_owned, a, __ATOMIC_RELEASE);
+    }
+    spin_unlock_irqrestore(&g_owned_lk, fl);
+    return g_owned;
+}
+static void owned_set(pmm_phys_t f, int on) {
+    uint8_t* m = owned_map();
+    uint64_t fn = (uint64_t)f >> 12;
+    if (!m || fn < pmm_pfn_base || fn >= pmm_nr_frames) return;
+    fn -= pmm_pfn_base;
+    if (on) __atomic_or_fetch(&m[fn >> 3], (uint8_t)(1u << (fn & 7)), __ATOMIC_ACQ_REL);
+    else    __atomic_and_fetch(&m[fn >> 3], (uint8_t)~(1u << (fn & 7)), __ATOMIC_ACQ_REL);
+}
+int pcache_owns_frame(pmm_phys_t f) {
+    uint8_t* m = __atomic_load_n(&g_owned, __ATOMIC_ACQUIRE);
+    uint64_t fn = (uint64_t)f >> 12;
+    if (!m || fn < pmm_pfn_base || fn >= pmm_nr_frames) return 0;
+    fn -= pmm_pfn_base;
+    return (m[fn >> 3] >> (fn & 7)) & 1;
+}
 
 static inline uint32_t hslot(uint32_t id, uint64_t idx) {
     return (uint32_t)((id * 2654435761u) ^ (uint32_t)idx ^ (uint32_t)(idx >> 20)) & (PC_HASH - 1);
@@ -111,6 +152,7 @@ static pmm_phys_t fill_page(struct file* f, uint64_t idx) {
 /* Drop one entry (lock held).  Sole holder: free.  Still mapped: detach — the
  * mappings keep the frame and the last of them frees it. */
 static void drop_entry(struct pc_page* e) {
+    owned_set(e->frame, 0);                  /* §M90 — the cache lets go first */
     if (vmm_frame_unshare(e->frame)) { pmm_free_frame(e->frame); g_st.freed++; }
     else                               g_st.detached++;
     g_st.pages--;
@@ -137,6 +179,7 @@ int pcache_map_page(struct file* f, uint64_t idx, pmm_phys_t* out) {
         e = (struct pc_page*)kcalloc(1, sizeof *e);
         if (!e) { pmm_free_frame(fr); kmutex_unlock(&g_lock); return -1; }
         e->id = id; e->idx = idx; e->frame = fr;
+        owned_set(fr, 1);                    /* §M90 */
         e->next = g_hash[h]; g_hash[h] = e;
         g_st.pages++;
         g_st.misses++;

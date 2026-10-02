@@ -542,8 +542,10 @@ else ifeq ($(ARCH),aarch64)
   # -fno-tree-loop-distribute-patterns: stop gcc turning the hand-written
   #   memset/memcpy loops in lib.c into calls to themselves (infinite
   #   recursion) — the standard freestanding-libc footgun.
+  # §M90 — -fno-omit-frame-pointer: keep the x29 frame-record chain, so a
+  # kernel fault's dump can name its callers (exceptions.c dump_and_halt).
   CFLAGS  := -mgeneral-regs-only -mno-outline-atomics \
-             -fno-tree-loop-distribute-patterns $(COMMON_CFLAGS)
+             -fno-tree-loop-distribute-patterns -fno-omit-frame-pointer $(COMMON_CFLAGS)
   LINKER_SCRIPT := linker-aarch64.ld
   LDFLAGS := -T $(LINKER_SCRIPT) -nostdlib
   LIBGCC  := $(shell $(CC) -print-libgcc-file-name)
@@ -838,6 +840,7 @@ CORE_C_SRCS := \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
     kernel/core/flock.c \
+    kernel/core/netlink.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
@@ -892,6 +895,7 @@ CORE_C_SRCS := \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
     kernel/core/flock.c \
+    kernel/core/netlink.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
@@ -1205,6 +1209,7 @@ CORE_C_SRCS := \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
     kernel/core/flock.c \
+    kernel/core/netlink.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \

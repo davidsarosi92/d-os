@@ -77,9 +77,7 @@ int proc_fork(struct user_regs* parent_regs) {
     b->space       = child_space;
     b->regs        = *parent_regs;
     b->regs.rax    = 0;                      /* child: fork() returns 0         */
-    for (int i = 0; i < TASK_MAX_FDS; i++)
-        b->fds[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
-    b->cloexec = fd_cloexec_mask(parent);
+    fd_snapshot_for_fork(parent, b->fds, &b->cloexec);   /* §M90 — under the table lock */
 
     struct task* child = task_spawn_arg_held("forked", fork_child_bootstrap, b);
     if (!child) {

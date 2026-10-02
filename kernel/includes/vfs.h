@@ -186,6 +186,12 @@ struct inode {
     uint32_t pc_id;
     /* §M90 — APPENDED.  VFS_IF_* behaviour flags (0 for every existing fs). */
     uint32_t vflags;
+    /* §M90 — APPENDED.  Open files on this inode, and a removal deferred
+     * until the last of them closes (POSIX: an unlinked file lives while it
+     * is open).  The VFS keeps both; a filesystem never sees them. */
+    int           opens;
+    struct inode* unlink_dir;               /* non-NULL: unlinked, removal pending */
+    char*         unlink_name;
 };
 
 /* §M90 — a directory whose filesystem decides whether it may be removed while
@@ -212,7 +218,13 @@ struct file {
     uint64_t       pos;                     /* read/write cursor — owned by VFS layer */
     int            flags;
     void*          private;                 /* fs-private state */
+    /* §M90 — APPENDED.  VFS_FILE_MAGIC while open, VFS_FILE_DEAD once closed:
+     * a second close, or a close of memory something overwrote, is caught in
+     * vfs_close with its caller instead of freeing garbage. */
+    uint32_t       magic;
 };
+#define VFS_FILE_MAGIC 0xF11E0B3Eu
+#define VFS_FILE_DEAD  0xDEADF11Eu
 
 /* fs_type — describes a filesystem implementation (ramfs, exfat, ...). */
 struct fs_type {

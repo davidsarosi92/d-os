@@ -56,6 +56,8 @@ struct elf_load_info {
     uint16_t  phentsize;      /* e_phentsize (for AT_PHENT)                        */
     int       has_interp;     /* PT_INTERP present?                               */
     char      interp[96];     /* interpreter path (NUL-terminated) if has_interp   */
+    uintptr_t img_end;        /* §M90 — one past the highest PT_LOAD byte (+bias):
+                               * where the program break starts                    */
 };
 
 /* Load `image` (`len` bytes) into `space`, applying `load_bias` to every

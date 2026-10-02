@@ -33,7 +33,8 @@
 #include "printf.h"
 #include "task.h"   /* §A1 — vmm_cow_fault needs the current task's space */
 #include "vma.h"    /* §M89 — reservations live beside the tables */
-#include "vmm.h"    /* §M90 — vmm_space_map, VMM_* flags (the trampoline) */
+#include "vmm.h"
+#include "lock.h"    /* §M90 — vmm_space_map, VMM_* flags (the trampoline) */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -449,7 +450,7 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
 
 /* Resolve a write fault on a COW page in the CURRENT address space.  Returns 1
  * if it was ours to handle (retry the instruction), 0 if it is a real fault. */
-int vmm_cow_fault(uintptr_t fault_va) {
+static int cow_fault_unlocked(uintptr_t fault_va) {
     struct task* t = task_current();
     if (!t || !t->mm) return 0;
     uint64_t* l1 = t->mm->l1;
@@ -463,7 +464,12 @@ int vmm_cow_fault(uintptr_t fault_va) {
     uint64_t* l3 = (uint64_t*)phys_to_virt(e2 & PTE_ADDR_MASK);
     unsigned i3 = (unsigned)((fault_va >> 12) & 0x1FF);
     uint64_t pte = l3[i3];
-    if (!(pte & PTE_VALID) || !(pte & PTE_SW_COW)) return 0;   /* not a COW page */
+    if (!(pte & PTE_VALID)) return 0;
+    /* §M90 — another thread of this process resolved it first (its write
+     * fault and ours raced on two CPUs): the page is writable now, so this
+     * fault is satisfied — retry, do not report a SIGSEGV for it. */
+    if (!(pte & PTE_SW_COW))
+        return ((pte & PTE_AP_EL0) && !(pte & PTE_AP_RO_BIT)) ? 1 : 0;
 
     uintptr_t old = (uintptr_t)(pte & PTE_ADDR_MASK);
     uint16_t* rc  = cow_slot(old);
@@ -487,6 +493,20 @@ int vmm_cow_fault(uintptr_t fault_va) {
      * the read-only entry we just replaced.  See vmm_space_clone. */
     __asm__ volatile ("dsb ish\ntlbi vmalle1is\ndsb ish\nisb" ::: "memory");
     return 1;
+}
+
+/* §M90 — ONE COW resolution at a time.  The read-check-modify of the entry was
+ * unlocked, and a forked Go process has many threads writing the same freshly
+ * COW-marked pages at once: two CPUs could both copy one page and both drop a
+ * share — freeing the frame the CHILD still maps — or the second could find
+ * the entry already resolved and report a SIGSEGV for a writable page (dockerd
+ * died of exactly that: "unexpected signal", SEGV_ACCERR, in its GC). */
+static spinlock_t g_cow_fault_lock = SPINLOCK_INIT;
+int vmm_cow_fault(uintptr_t fault_va) {
+    uint32_t fl = spin_lock_irqsave(&g_cow_fault_lock);
+    int r = cow_fault_unlocked(fault_va);
+    spin_unlock_irqrestore(&g_cow_fault_lock, fl);
+    return r;
 }
 
 /* Free the user-region tables (l1[4..]) + their frames; kernel-shared

@@ -73,6 +73,44 @@ enter_user_mode:
     msr     spsr_el1, x2
     isb
     clrex                               /* §M89 — see RESTORE_TRAPFRAME */
+    /* §M90 — A PROGRAM STARTS WITH EVERY GENERAL REGISTER ZERO, as on Linux.
+     * They held the entry address (x0), the stack (x1) and whatever the kernel
+     * had been computing — kernel data handed to ring 3, and worse: x0 at
+     * entry is the ABI's rtld_fini.  A static glibc program registers a
+     * non-zero x0 as an exit handler, so at exit it "called rtld_fini" =
+     * jumped to its own entry point and ran again (docker-init, which then
+     * wrote into its already-protected RELRO and died). */
+    mov     x0, xzr
+    mov     x1, xzr
+    mov     x2, xzr
+    mov     x3, xzr
+    mov     x4, xzr
+    mov     x5, xzr
+    mov     x6, xzr
+    mov     x7, xzr
+    mov     x8, xzr
+    mov     x9, xzr
+    mov     x10, xzr
+    mov     x11, xzr
+    mov     x12, xzr
+    mov     x13, xzr
+    mov     x14, xzr
+    mov     x15, xzr
+    mov     x16, xzr
+    mov     x17, xzr
+    mov     x18, xzr
+    mov     x19, xzr
+    mov     x20, xzr
+    mov     x21, xzr
+    mov     x22, xzr
+    mov     x23, xzr
+    mov     x24, xzr
+    mov     x25, xzr
+    mov     x26, xzr
+    mov     x27, xzr
+    mov     x28, xzr
+    mov     x29, xzr
+    mov     x30, xzr
     eret                                /* → EL0, never returns here */
 
 /* -----------------------------------------------------------------------------

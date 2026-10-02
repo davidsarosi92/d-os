@@ -36,6 +36,7 @@
 #include "syscall.h"
 #include "task.h"
 #include "vfs.h"
+#include "netlink.h"   /* §M90 */
 #include "fd.h"
 #include "timerfd.h"
 #include "eventfd.h"       /* §M53 stage 3 — timer descriptors */
@@ -351,6 +352,7 @@ long sys_write_k(int fd, const void* buf, size_t n) {
     if (o->kind == FD_SOCK) return usock_write(o->sock, buf, n, !o->nonblock);
     if (o->kind == FD_NETSOCK) return netsock_write(o->nsock, buf, n);
     if (o->kind == FD_EVENT) return eventfd_write(o->efd, buf, n, !o->nonblock);   /* §M90 */
+    if (o->kind == FD_NETLINK) return nl_send(o->nl, buf, n);                      /* §M90 */
     return -1;                                 /* shm: not write(2)-able */
 }
 
@@ -436,6 +438,7 @@ long sys_read_k(int fd, void* buf, size_t n) {
      * wants the non-blocking form uses poll(2), which is the whole point of
      * the descriptor existing. */
     if (o->kind == FD_EVENT) return eventfd_read(o->efd, buf, n, block);   /* §M90 */
+    if (o->kind == FD_NETLINK) return nl_recv(o->nl, buf, n, block, 0, 0); /* §M90 */
     if (o->kind == FD_TIMER) {
         long r = timerfd_read(o->tfd, buf, n, block);
         /* Reading a timerfd RESETS its expiration count, so it stops being
@@ -1256,7 +1259,12 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
          * lets a reader finish what is already queued before it closes down —
          * collapsing the two would throw away the tail of every conversation
          * whose writer closed promptly. */
-        if (!usock_peer_open(o->sock)) {
+        /* §M90 — a LISTENING socket has no peer by nature: it is ready only
+         * when a connection waits (POLLIN, above), never "hung up".  Reporting
+         * HUP made it look ready forever, and Go's netpoller — woken by every
+         * readiness event — retried accept() in a loop that never slept
+         * (dockerd serving its API socket at full CPU). */
+        if (!usock_peer_open(o->sock) && !usock_is_listener(o->sock)) {
             r |= POLLRDHUP;
             if (!usock_can_read(o->sock)) r |= POLLHUP;
         }
@@ -1272,6 +1280,12 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
     case FD_EVENT:
         if (eventfd_can_read(o->efd))  r |= POLLIN;
         if (eventfd_can_write(o->efd)) r |= POLLOUT;
+        break;
+    /* §M90 — a netlink socket: readable while a reply waits; a request is
+     * answered at once, so it is always writable. */
+    case FD_NETLINK:
+        if (nl_can_read(o->nl)) r |= POLLIN;
+        r |= POLLOUT;
         break;
     /* §M56 — an AF_INET socket used to fall through to "always ready", so a
      * loop polling one span at full speed and every epoll_wait on it returned
@@ -1608,7 +1622,17 @@ void fd_close_all(void) {
         fdtable_put(ft);
         return;
     }
-    for (int fd = 3; fd < TASK_MAX_FDS; fd++) {
+    /* §M90 — FROM 0, not 3.  Since §M59 a redirected 0/1/2 is an ordinary
+     * slot holding a real ofile (an empty one is the console and is skipped
+     * here), and a program started with its output on a PIPE holds the
+     * pipe's write end in slot 1.  Starting at 3 left it open forever when
+     * the program exited: the reader never saw EOF (dockerd waited for the
+     * end of `docker-init --version` until the API never came up).  The
+     * shared-table path above (fdtable_put) always closed every slot, which
+     * is why a multi-threaded child's pipes did reach EOF. */
+    /* An EXCURSION (proc_exec_elf, the self-tests) runs on a host task that
+     * outlives the program and keeps its own std streams: from 3 there. */
+    for (int fd = t->user_task ? 0 : 3; fd < TASK_MAX_FDS; fd++) {
         if (t->fds[fd]) { ofile_unref(t->fds[fd]); t->fds[fd] = NULL; }
     }
     t->fd_cloexec_inline = 0;
@@ -2293,6 +2317,10 @@ int sys_socket_info(int fd, int* family, int* type, int* listening) {
         *listening = o->nsock->lsock != NULL;
         return 0;
     }
+    if (o->kind == FD_NETLINK) {                  /* §M90 — AF_NETLINK, SOCK_RAW */
+        *family = 16; *type = 3; *listening = 0;
+        return 0;
+    }
     return -1;
 }
 
@@ -2367,4 +2395,40 @@ int sys_fsync(int fd) {
     if (!o) return (fd >= 0 && fd <= 2) ? 0 : -9;
     if (o->kind != FD_VFS || !o->file) return 0;
     return vfs_fsync_file(o->file) == 0 ? 0 : -5;
+}
+
+/* §M90 — socket(AF_NETLINK, …, proto).  -93 EPROTONOSUPPORT for a protocol
+ * other than NETLINK_ROUTE (see netlink.c for what it answers). */
+int sys_netlink_socket(int proto, int nonblock) {
+    struct nlsock* s = nl_create(proto);
+    if (!s) return -93;
+    struct ofile* o = ofile_from_netlink(s);
+    if (!o) { nl_close(s); return -12; }
+    o->nonblock = nonblock ? 1 : 0;
+    int fd = fd_install(o);
+    if (fd < 0) { ofile_unref(o); return -24; }
+    return fd;
+}
+
+/* §M90 — a fork's copy of the descriptor table, UNDER THE TABLE'S LOCK.
+ *
+ * fork.c used to walk parent->fds taking a reference on each entry with no
+ * lock.  With a SHARED table (any multi-threaded parent — every Go program)
+ * another thread can close a descriptor in the middle of that walk: it clears
+ * the slot and drops the last reference while the forking thread is taking
+ * one on the same pointer — a reference to freed memory, inherited by the
+ * child.  When the child later released it, it decremented whatever object
+ * the allocator had put there since: a different open file, closed under its
+ * owner, closed again by the owner — the double close that took the machine
+ * down after dockerd came up (it forks runc/docker-init while its other
+ * threads open and close files).  close() clears the slot under this same
+ * lock, so a reference taken here is always taken while the table still holds
+ * one.  `out` receives TASK_MAX_FDS entries; the close-on-exec mask comes
+ * from the same instant. */
+void fd_snapshot_for_fork(struct task* parent, struct ofile** out, uint32_t* cloexec) {
+    uint32_t fl = fdt_lock(parent);
+    for (int i = 0; i < TASK_MAX_FDS; i++)
+        out[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
+    if (cloexec) *cloexec = *fd_cx(parent);
+    fdt_unlock(parent, fl);
 }

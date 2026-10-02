@@ -30,6 +30,8 @@
 #include <stdint.h>
 #include "lock.h"
 #include "pmm.h"
+#include "kmalloc.h"
+#include "printf.h"
 
 /* THE TABLE ITSELF, BUILT ONCE (2026-09-26).  Every arch built it lazily on
  * first use with no lock: `if (!tbl) { tbl = alloc; zero it; }`.  Two CPUs
@@ -49,6 +51,13 @@ static inline uint16_t* cow_table_get(uint16_t** tbl, uint32_t* nr, spinlock_t* 
          * END; callers must also refuse fn < pmm_pfn_base. */
         uint32_t n = pmm_nr_frames - pmm_pfn_base;
         uint16_t* a = (uint16_t*)pmm_bootmem_alloc(n * (uint32_t)sizeof(uint16_t));
+        /* §M90 — bootmem is a boot-time pool, and the table is built on the
+         * first fork: by then it may be spent (3 GiB of RAM needs 1.5 MB here).
+         * Without a table every COW release frees the frame at once, i.e. a
+         * page still mapped by the other side of a fork goes back to the
+         * allocator — so fall back to the heap, and say so if even that fails. */
+        if (!a) a = (uint16_t*)kmalloc(n * (uint32_t)sizeof(uint16_t));
+        if (!a) kprintf("!! COW: no memory for the %u-frame reference table - fork sharing is UNSAFE\n", n);
         if (a) {
             for (uint32_t i = 0; i < n; i++) a[i] = 0;
             *nr = pmm_nr_frames;

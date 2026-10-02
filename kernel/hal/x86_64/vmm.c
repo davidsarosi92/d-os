@@ -31,6 +31,7 @@
  * ============================================================================= */
 
 #include "vmm.h"
+#include "lock.h"
 #include "hal_api.h"   /* §M51 — hal_tlb_shootdown */
 #include "pmm.h"
 #include "cowref.h"
@@ -636,7 +637,7 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
  * (the faulting instruction is simply retried), 0 if it is a real fault the
  * caller must handle.  Walks PML4→PDPT→PD→PT of task->mm; every table is
  * reachable through the identity map. */
-int vmm_cow_fault(uintptr_t fault_va) {
+static int cow_fault_unlocked(uintptr_t fault_va) {
     struct task* t = task_current();
     if (!t || !t->mm) return 0;
     uint64_t* pml4t = t->mm->pml4;
@@ -653,7 +654,9 @@ int vmm_cow_fault(uintptr_t fault_va) {
     uint64_t* pt = table_at((uintptr_t)e);
     unsigned pti = (unsigned)((fault_va >> 12) & 0x1FF);
     uint64_t pte = pt[pti];
-    if (!(pte & PTE_P) || !(pte & VMM_COW)) return 0;   /* not a COW page */
+    if (!(pte & PTE_P)) return 0;
+    /* §M90 — resolved meanwhile by another thread: retry (see aarch64). */
+    if (!(pte & VMM_COW)) return ((pte & PTE_RW) && (pte & PTE_US)) ? 1 : 0;
 
     uintptr_t old = (uintptr_t)pte & PAGE_MASK_4K;
     uint16_t* rc = cow_slot(old);
@@ -679,6 +682,20 @@ int vmm_cow_fault(uintptr_t fault_va) {
      * one.  Without this it writes through a translation we already replaced. */
     hal_tlb_shootdown(0, fault_va & ~(uintptr_t)0xFFF);
     return 1;
+}
+
+/* §M90 — ONE COW resolution at a time.  The read-check-modify of the entry was
+ * unlocked, and a forked Go process has many threads writing the same freshly
+ * COW-marked pages at once: two CPUs could both copy one page and both drop a
+ * share — freeing the frame the CHILD still maps — or the second could find
+ * the entry already resolved and report a SIGSEGV for a writable page (dockerd
+ * died of exactly that: "unexpected signal", SEGV_ACCERR, in its GC). */
+static spinlock_t g_cow_fault_lock = SPINLOCK_INIT;
+int vmm_cow_fault(uintptr_t fault_va) {
+    uint32_t fl = spin_lock_irqsave(&g_cow_fault_lock);
+    int r = cow_fault_unlocked(fault_va);
+    spin_unlock_irqrestore(&g_cow_fault_lock, fl);
+    return r;
 }
 
 /* §M86 — NO-EXECUTE for user pages (the i386 twin in hal/x86/vmm.c says

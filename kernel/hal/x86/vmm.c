@@ -550,7 +550,7 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     return child;
 }
 
-int vmm_cow_fault(uintptr_t fault_va) {
+static int cow_fault_unlocked(uintptr_t fault_va) {
     struct task* t = task_current();
     if (!t || !t->mm) return 0;
     struct vmm_space* s = t->mm;
@@ -561,7 +561,9 @@ int vmm_cow_fault(uintptr_t fault_va) {
     uint64_t pt = pde & addr_mask();
     uint32_t j  = pte_index(va);
     uint64_t pte = pte_get(pt, j);
-    if (!(pte & E_P) || !(pte & VMM_COW)) return 0;   /* not COW → real fault */
+    if (!(pte & E_P)) return 0;
+    /* §M90 — resolved meanwhile by another thread: retry (see aarch64). */
+    if (!(pte & VMM_COW)) return ((pte & E_RW) && (pte & E_US)) ? 1 : 0;
 
     uint64_t old = pte & addr_mask();
     uint16_t* rc = cow_slot(old);
@@ -581,6 +583,20 @@ int vmm_cow_fault(uintptr_t fault_va) {
     }
     hal_tlb_shootdown(0, va & ~0xFFFu);             /* §M51 */
     return 1;
+}
+
+/* §M90 — ONE COW resolution at a time.  The read-check-modify of the entry was
+ * unlocked, and a forked Go process has many threads writing the same freshly
+ * COW-marked pages at once: two CPUs could both copy one page and both drop a
+ * share — freeing the frame the CHILD still maps — or the second could find
+ * the entry already resolved and report a SIGSEGV for a writable page (dockerd
+ * died of exactly that: "unexpected signal", SEGV_ACCERR, in its GC). */
+static spinlock_t g_cow_fault_lock = SPINLOCK_INIT;
+int vmm_cow_fault(uintptr_t fault_va) {
+    uint32_t fl = spin_lock_irqsave(&g_cow_fault_lock);
+    int r = cow_fault_unlocked(fault_va);
+    spin_unlock_irqrestore(&g_cow_fault_lock, fl);
+    return r;
 }
 
 int vmm_space_map(struct vmm_space* s, uintptr_t virt, uint64_t phys, uint32_t flags) {

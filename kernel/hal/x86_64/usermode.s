@@ -96,6 +96,24 @@ enter_user_mode:
     or qword [rsp], 0x200              ; IF=1 so timer IRQs preempt ring 3
     push qword 0x1B                    ; CS3  (user code, RPL 3)
     push rdi                           ; RIP3 (user entry)
+    ; §M90 — every general register zero at program entry, as on Linux: rdx
+    ; is the ABI's rtld_fini (a static glibc registers a non-zero one as an
+    ; exit handler and jumps to it at exit), and the rest held kernel values.
+    xor eax, eax
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+    xor esi, esi
+    xor edi, edi
+    xor ebp, ebp
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
     iretq                              ; → ring 3, never returns here
 
 ; -----------------------------------------------------------------------------

@@ -117,6 +117,15 @@ enter_user_mode:
     push ecx                                    ; EFLAGS
     push 0x1B                                   ; CS3 = GDT_USER_CS | RPL 3
     push eax                                    ; EIP3 (user entry)
+    ; §M90 — every general register zero at program entry (edx is the ABI's
+    ; rtld_fini; the rest held kernel values).
+    xor eax, eax
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+    xor esi, esi
+    xor edi, edi
+    xor ebp, ebp
     iret                                        ; → ring 3, never returns here
 
 ; -----------------------------------------------------------------------------

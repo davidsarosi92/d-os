@@ -11,8 +11,11 @@
 #include "eventfd.h"   /* §M90 */ /* §M53 stage 3 — FD_TIMER */
 #include "epoll.h"   /* §M56 — FD_EPOLL         */
 #include "flock.h"   /* §M90 — locks die with their description */
+#include "netlink.h" /* §M90 */
 #include "pmm.h"
 #include "kmalloc.h"
+#include "printf.h"
+#include "task.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -79,6 +82,12 @@ struct ofile* ofile_from_eventfd(struct eventfd* e) {
     return o;
 }
 
+struct ofile* ofile_from_netlink(struct nlsock* s) {
+    struct ofile* o = ofile_alloc(FD_NETLINK);
+    if (o) { o->nl = s; nl_set_owner(s, o); }
+    return o;
+}
+
 struct ofile* ofile_from_epoll(struct epoll* e) {
     struct ofile* o = ofile_alloc(FD_EPOLL);
     if (o) o->ep = e;
@@ -106,7 +115,22 @@ struct ofile* fd_dup_source(int fd, int* fresh) {
 
 void ofile_unref(struct ofile* o) {
     if (!o) return;
-    if (__atomic_sub_fetch(&o->refcount, 1, __ATOMIC_ACQ_REL) > 0) return;
+    /* §M90 — a released description is POISONED (kind 0x0DEAD) before it is
+     * freed, so a stale pointer that is closed again is caught HERE, named
+     * with its callers, instead of freeing twice and corrupting whatever the
+     * heap hands out next (it surfaced as a garbage struct file in vfs_close). */
+    if ((int)o->kind == 0x0DEAD) {
+        kprintf("!! ofile %p released AGAIN (stale descriptor) from %p\n", (void*)o,
+                __builtin_return_address(0));
+        return;
+    }
+    int left = __atomic_sub_fetch(&o->refcount, 1, __ATOMIC_ACQ_REL);
+    if (left > 0) return;
+    if (left < 0) {
+        kprintf("!! ofile %p refcount underflow (kind %d) from %p\n", (void*)o, (int)o->kind,
+                __builtin_return_address(0));
+        return;
+    }
     switch (o->kind) {
         case FD_VFS:  flock_release(o); if (o->file) vfs_close(o->file);   break;
         case FD_SHM:  if (o->shm)  shm_unref(o->shm);    break;
@@ -116,7 +140,9 @@ void ofile_unref(struct ofile* o) {
         case FD_EPOLL:   if (o->ep)    epoll_close(o->ep);       break;
         case FD_CONSOLE: break;                   /* nothing behind it */
         case FD_EVENT:   if (o->efd)   eventfd_close(o->efd);    break;
+        case FD_NETLINK: if (o->nl)    nl_close(o->nl);          break;
     }
+    o->kind = (enum fd_kind)0x0DEAD;     /* the poison, see above */
     kfree(o);
 }
 

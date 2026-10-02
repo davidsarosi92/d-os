@@ -99,9 +99,7 @@ int proc_fork(struct user_regs* parent_regs) {
     b->regs.x[0]  = 0;                       /* child: fork() returns 0 */
     /* Read it LIVE rather than from the task struct — see the bootstrap. */
     __asm__ volatile ("mrs %0, tpidr_el0" : "=r"(b->tpidr));
-    for (int i = 0; i < TASK_MAX_FDS; i++)
-        b->fds[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
-    b->cloexec = fd_cloexec_mask(parent);
+    fd_snapshot_for_fork(parent, b->fds, &b->cloexec);   /* §M90 — under the table lock */
 
     struct task* child = task_spawn_arg_held("forked", fork_child_bootstrap, b);
     if (!child) {

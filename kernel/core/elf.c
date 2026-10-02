@@ -269,6 +269,7 @@ static int elf_load_impl(struct vmm_space* space, const struct elf_img* im,
         out->entry = 0; out->load_bias = bias; out->phdr_uva = 0;
         out->phnum = eh.phnum; out->phentsize = eh.phentsize;
         out->has_interp = 0; out->interp[0] = '\0';
+        out->img_end = 0;
     }
 
     int loaded = 0;
@@ -333,6 +334,7 @@ static int elf_load_impl(struct vmm_space* space, const struct elf_img* im,
         int rc = map_segment(space, im, &p, bias, &placed, src);
         if (rc != ELF_OK) return rc;
         loaded++;
+        if (out && p.vaddr + bias + p.memsz > out->img_end) out->img_end = p.vaddr + bias + p.memsz;
     }
     if (!loaded) return ELF_ENOLOAD;
 

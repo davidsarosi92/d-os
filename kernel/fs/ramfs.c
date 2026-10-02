@@ -173,7 +173,7 @@ static int rfs_symlink_op(struct inode* dir, const char* name, const char* targe
     if (!ino) return -1;
     size_t n = 0;
     while (target[n]) n++;
-    struct file tmp = { ino, NULL, 0, 0, 0 };
+    struct file tmp = { ino, NULL, 0, 0, 0, 0 };   /* never closed: no magic */
     if (rfs_write(&tmp, target, n, 0) != (ssize_t)n) {
         struct ramfs_file* rf = (struct ramfs_file*)ino->private;
         rfs_free_pages(rf); kfree(rf); kfree(ino);

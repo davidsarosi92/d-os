@@ -6090,9 +6090,15 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
 - cgroup v2 DONE (2026-10-02): `cgroup2` at /sys/fs/cgroup with real
   membership, delegation, kill, freeze; limits stored, enforcement in rung 3.
   dockerd then loads/restores containers and stops at the network controller.
-- NEXT: rtnetlink (AF_NETLINK/NETLINK_ROUTE: links, addresses, routes as
-  dumps) and /proc/<pid>/task/<tid>/ns/net; then mount namespaces +
-  pivot_root for runc.
+- rtnetlink DONE, and **dockerd is UP (2026-10-02)**: it boots containerd,
+  runs runc/docker-init, serves the API; `docker version` and `docker info`
+  answer with the server half.  The road there fixed ten kernel defects (DOCS
+  change log) — register state at program entry, std-slot close at exit,
+  listener HUP, unlink of open files, fork-snapshot and COW races.
+- NEXT (rung 2's last step): `docker run --network host busybox echo hi` — an
+  image (pull through SLIRP or `docker load` of §M73's busybox tarball), then
+  runc's container setup: mount namespaces, bind mounts, pivot_root, /proc in
+  the container, `mknod`/`umount2`, the seccomp filter, capabilities.
 - Open, noted for later: containerd-shim daemonizes (fork, parent exits) — a
   Linux-personality child must then outlive its parent (today the kill-tree
   rule ends it); TASK_MAX_FDS is 32; dockerd allows containerd 15 s to start

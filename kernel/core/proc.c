@@ -21,6 +21,7 @@
 #include "hal_api.h"
 #include "vfs.h"
 #include "fd.h"
+#include "vma.h"   /* §M90 — vma_brk_init */
 #include "random.h"
 #include "config.h"
 #include "settings.h"
@@ -376,6 +377,7 @@ static int load_program(struct vmm_space* s, const void* image, size_t len,
                         struct loaded_prog* lp) {
     int rc = elf_load_ex(s, image, len, vmm_user_base(), &lp->main);
     if (rc != ELF_OK) return rc;
+    vma_brk_init(s, lp->main.img_end);             /* §M90 — the program break */
     return load_interp(s, lp);
 }
 /* §M90 — the same for a program on disk, read through the file (no copy of
@@ -383,6 +385,7 @@ static int load_program(struct vmm_space* s, const void* image, size_t len,
 static int load_program_file(struct vmm_space* s, struct file* f, struct loaded_prog* lp) {
     int rc = elf_load_file(s, f, vmm_user_base(), &lp->main);
     if (rc != ELF_OK) return rc;
+    vma_brk_init(s, lp->main.img_end);             /* §M90 — the program break */
     return load_interp(s, lp);
 }
 static int load_interp(struct vmm_space* s, struct loaded_prog* lp) {
@@ -639,6 +642,12 @@ struct user_boot {
 static void user_task_bootstrap(void) {
     struct user_boot* b = (struct user_boot*)task_start_arg();
     struct task* me = task_current();
+    /* §M90 — a task enters user mode through here ONCE.  A second pass means
+     * its saved kernel context was rewound to its first frame — the program
+     * restarts at its entry with its first stack, and `b` was freed. */
+    if (me->guest_nr)
+        kprintf("!! user_task_bootstrap RE-ENTERED for pid %d '%s' (last guest syscall %d)\n",
+                me->pid, me->name, me->guest_nr - 1);
     uintptr_t entry = b->entry, sp = b->user_sp;
 
     me->mm          = b->space;

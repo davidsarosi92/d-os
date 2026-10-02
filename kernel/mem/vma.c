@@ -65,6 +65,10 @@ struct vma_set {
     struct kmutex lock;
     struct vma*   head;
     uint32_t      faults;         /* demand pages provided (diagnostics)             */
+    /* §M90 — the program break: [brk_start, brk_cur) is the heap brk(2)
+     * grows.  0 = no break (an image loaded without one: brk answers 0, the
+     * old "no break" reply, and a libc falls back to mmap). */
+    uintptr_t     brk_start, brk_cur;
 };
 
 static spinlock_t g_create = SPINLOCK_INIT;
@@ -538,6 +542,8 @@ void vma_clone(struct vmm_space* parent, struct vmm_space* child) {
     if (!cs) return;
     kmutex_lock(&ps->lock);
     struct vma** tail = &cs->head;
+    cs->brk_start = ps->brk_start;      /* §M90 — fork keeps the break */
+    cs->brk_cur   = ps->brk_cur;
     for (struct vma* v = ps->head; v; v = v->next) {
         struct vma* c = vma_new(v->start, v->end, v->vf, v->kind, v->file, v->off);
         if (!c) break;               /* the child then lacks a reservation, not memory */
@@ -609,3 +615,40 @@ static void cmd_maps(const char* args) {
 }
 SHELL_CMD(maps) = { "maps", "<pid>", "a process's address-space reservations (§M89)",
                     SHELL_G_DEV, cmd_maps, SHELL_P_ANY };
+
+/* ---- §M90 — the program break ---------------------------------------------- */
+
+void vma_brk_init(struct vmm_space* mm, uintptr_t img_end) {
+    struct vma_set* s = set_of(mm, 1);
+    if (!s) return;
+    uintptr_t b = (img_end + PG - 1) & ~(uintptr_t)(PG - 1);
+    s->brk_start = s->brk_cur = b;
+}
+
+/* brk(2), Linux's contract: the return is the break AFTER the call — the old
+ * one when the request is refused — never an error code.  It always answered
+ * 0 here, which a libc reads as "no break at all": glibc then ran its rarely
+ * travelled no-brk paths (a non-contiguous main arena on mmap), and a static
+ * glibc program (docker-init) did not survive them.  The heap is ordinary
+ * anonymous memory: growing maps [old page end, new page end) demand-zero
+ * with MAP_FIXED_NOREPLACE (it must not take over a mapping the program made
+ * there), shrinking unmaps the pages no longer covered. */
+long vma_brk(uintptr_t addr) {
+    struct task* t = task_current();
+    if (!t || !t->mm) return 0;
+    struct vma_set* s = set_of(t->mm, 0);
+    if (!s || !s->brk_start) return 0;
+    uintptr_t cur = s->brk_cur;
+    if (addr < s->brk_start) return (long)cur;
+    uintptr_t oldp = (cur + PG - 1) & ~(uintptr_t)(PG - 1);
+    uintptr_t newp = (addr + PG - 1) & ~(uintptr_t)(PG - 1);
+    if (newp > oldp) {
+        long r = vma_mmap(oldp, newp - oldp, VMA_PROT_READ | VMA_PROT_WRITE,
+                          VMA_MAP_PRIVATE | VMA_MAP_ANONYMOUS | VMA_MAP_FIXED_NOREPLACE, -1, 0);
+        if (r < 0 || (uintptr_t)r != oldp) return (long)cur;
+    } else if (newp < oldp) {
+        vma_munmap(newp, oldp - newp);
+    }
+    s->brk_cur = addr;
+    return (long)addr;
+}

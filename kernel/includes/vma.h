@@ -55,6 +55,10 @@ struct ofile;
  * or a negative errno (-ENOMEM, -EINVAL, -EEXIST, -EBADF, -EACCES). */
 long vma_mmap(uintptr_t addr, size_t len, int prot, int flags, int fd, uint64_t off);
 long vma_munmap(uintptr_t addr, size_t len);
+/* §M90 — the program break: set at exec from the image's end, then brk(2). */
+struct vmm_space;
+void vma_brk_init(struct vmm_space* mm, uintptr_t img_end);
+long vma_brk(uintptr_t addr);
 long vma_mprotect(uintptr_t addr, size_t len, int prot);
 
 /* Reserve `npages` of address space in `mm` for a caller that maps the pages

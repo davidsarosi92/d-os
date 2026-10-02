@@ -923,6 +923,31 @@ static void sy_flocktest(const char* args) {
              r6 == 0 && r7 == -11 && r8 == 0;
     console_write(ok ? "flock: ok\n" : "flock: FAIL\n");
 }
+/* §M90 — `unlinkopentest`: POSIX says an unlinked file lives while it is
+ * open.  Open, write, unlink, then read back THROUGH THE OPEN FILE and close —
+ * the old VFS freed the inode at unlink, so the read and the close touched
+ * freed memory.  Also checks the name is really gone at once. */
+static void sy_unlinkopentest(const char* args) {
+    (void)args;
+    const char* path = "/tmp-unlinkopen";
+    struct file* f = vfs_open(path, VFS_RDWR | VFS_CREATE | VFS_TRUNC);
+    if (!f) { console_write("unlinkopen: FAIL (create)\n"); return; }
+    vfs_write(f, "still-here", 10);
+    int ur = vfs_unlink(path);
+    struct vfs_stat st;
+    int gone = vfs_stat(path, &st) != 0;
+    char buf[16] = { 0 };
+    f->pos = 0;
+    long n = vfs_read(f, buf, 10);
+    vfs_close(f);
+    int again = vfs_stat(path, &st) != 0;
+    kprintf("unlinkopen: unlink=%d name-gone=%d read=%d '%s' after-close-gone=%d\n",
+            ur, gone, (int)n, buf, again);
+    int ok = ur == 0 && gone && n == 10 && buf[0] == 's' && buf[9] == 'e' && again;
+    console_write(ok ? "unlinkopen: ok\n" : "unlinkopen: FAIL\n");
+}
+SHELL_CMD(unlinkopentest) = { "unlinkopentest", "", "an unlinked file stays readable while open",
+                              SHELL_G_TEST, sy_unlinkopentest, SHELL_P_ANY };
 SHELL_CMD(flocktest)   = { "flocktest",   "", "flock(2): owners, sharing, release on close",
                            SHELL_G_TEST, sy_flocktest, SHELL_P_ANY };
 SHELL_CMD(epolltest)   = { "epolltest",   "", "readiness sets, and the scan cost measured",

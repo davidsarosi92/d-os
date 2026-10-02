@@ -18,6 +18,7 @@
 #include "task.h"
 #include "fd.h"
 #include "flock.h"      /* §M90 */
+#include "netlink.h"    /* §M90 */
 #include "proc.h"
 #include "kmalloc.h"
 #include "vmm.h"        /* vmm_user_access_ok — guest-pointer validation */
@@ -840,9 +841,9 @@ static long h_readv(struct abi_ctx* c) {
  * question correctly is not the same as implementing the call. */
 static long h_ioctl(struct abi_ctx* c) { (void)c; return -ABI_ENOTTY; }
 
-/* brk: report failure so a libc falls back to mmap.  d-os has no program
- * break, and pretending otherwise would hand out addresses nothing backs. */
-static long h_brk(struct abi_ctx* c) { (void)c; return 0; }
+/* brk: the real program break since §M90 (vma.c, vma_brk) — the break after
+ * the call, Linux's contract.  An image loaded without one still answers 0. */
+static long h_brk(struct abi_ctx* c) { return vma_brk((uintptr_t)c->a[0]); }
 
 static long h_mmap(struct abi_ctx* c) {
     return sys_mmap_full(c->a[0], (size_t)c->a[1], (int)c->a[2], (int)c->a[3],
@@ -1706,9 +1707,58 @@ static void abi_un_out(unsigned long uaddr, unsigned long ulen, const char* name
 }
 static int abi_fd_is_unix(int fd) { return sys_fd_kind(fd) == 2; }   /* FD_SOCK */
 
+/* §M90 — AF_NETLINK (netlink.c).  sockaddr_nl = { u16 family = 16, u16 pad,
+ * u32 pid, u32 groups }; the kernel's address is pid 0, and a reader that
+ * checks the sender (Go's netlink library does) wants to see exactly that. */
+#define ABI_AF_NETLINK 16
+static int abi_fd_is_netlink(int fd) { return sys_fd_kind(fd) == (int)FD_NETLINK; }
+static void abi_nl_out(unsigned long uaddr, unsigned long ulen, uint32_t pid) {
+    if (!uaddr || !ulen || !abi_user_r_ok(ulen, sizeof(uint32_t))) return;
+    uint32_t room = *(uint32_t*)(uintptr_t)ulen;
+    uint8_t sa[12] = { ABI_AF_NETLINK, 0, 0, 0,
+                       (uint8_t)pid, (uint8_t)(pid >> 8), (uint8_t)(pid >> 16), (uint8_t)(pid >> 24),
+                       0, 0, 0, 0 };
+    uint32_t w = room < 12 ? room : 12;
+    if (w && abi_user_w_ok(uaddr, w))
+        for (uint32_t i = 0; i < w; i++) ((uint8_t*)(uintptr_t)uaddr)[i] = sa[i];
+    if (abi_user_w_ok(ulen, sizeof(uint32_t))) *(uint32_t*)(uintptr_t)ulen = 12;
+}
+static long abi_nl_send(int fd, unsigned long ubuf, unsigned long len) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETLINK) return -ABI_EBADF;
+    if (len > 65536) return -ABI_EINVAL;
+    if (len && !abi_user_r_ok(ubuf, len)) return -ABI_EFAULT;
+    uint8_t* k = (uint8_t*)kmalloc(len ? len : 1);
+    if (!k) return -12;
+    for (unsigned long i = 0; i < len; i++) k[i] = ((const uint8_t*)(uintptr_t)ubuf)[i];
+    long r = nl_send(o->nl, k, len);
+    kfree(k);
+    return r;
+}
+static long abi_nl_recv(int fd, unsigned long ubuf, unsigned long len, int flags) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_NETLINK) return -ABI_EBADF;
+    if (len > 65536) len = 65536;
+    if (len && !abi_user_w_ok(ubuf, len)) return -ABI_EFAULT;
+    uint8_t* k = (uint8_t*)kmalloc(len ? len : 1);
+    if (!k) return -12;
+    int block = !o->nonblock && !(flags & 0x40 /* MSG_DONTWAIT */);
+    long r = nl_recv(o->nl, k, len, block, flags & 0x2 /* MSG_PEEK */, flags & 0x20 /* MSG_TRUNC */);
+    if (r > 0) {
+        unsigned long c = (unsigned long)r < len ? (unsigned long)r : len;
+        for (unsigned long i = 0; i < c; i++) ((uint8_t*)(uintptr_t)ubuf)[i] = k[i];
+    }
+    kfree(k);
+    return r;
+}
+
 static long h_socket(struct abi_ctx* c) {
     int domain = (int)c->a[0];
     int type   = (int)c->a[1];
+    if (domain == ABI_AF_NETLINK) {                       /* §M90 */
+        if ((type & 0xF) != 3 && (type & 0xF) != 2) return -94;   /* ESOCKTNOSUPPORT */
+        return abi_cx(sys_netlink_socket((int)c->a[2], type & ABI_SOCK_NONBLOCK), (unsigned long)type);
+    }
     if (domain == ABI_AF_UNIX) {
         if ((type & 0xF) != 1) return -ABI_EAFNOSUPPORT;   /* SOCK_STREAM only */
         return abi_cx(sys_unix_socket(type & ABI_SOCK_NONBLOCK), (unsigned long)type);
@@ -1724,6 +1774,14 @@ static long h_socket(struct abi_ctx* c) {
 }
 
 static long h_bind(struct abi_ctx* c) {
+    if (abi_fd_is_netlink((int)c->a[0])) {               /* §M90 — sockaddr_nl */
+        if (c->a[2] < 12 || !abi_user_r_ok(c->a[1], 12)) return -ABI_EINVAL;
+        const uint8_t* sa = (const uint8_t*)(uintptr_t)c->a[1];
+        if ((sa[0] | sa[1] << 8) != ABI_AF_NETLINK) return -ABI_EINVAL;
+        uint32_t pid = (uint32_t)sa[4] | (uint32_t)sa[5] << 8 | (uint32_t)sa[6] << 16 | (uint32_t)sa[7] << 24;
+        uint32_t grp = (uint32_t)sa[8] | (uint32_t)sa[9] << 8 | (uint32_t)sa[10] << 16 | (uint32_t)sa[11] << 24;
+        return nl_bind(fd_lookup((int)c->a[0])->nl, pid, grp);
+    }
     if (abi_fd_is_unix((int)c->a[0])) {
         char nm[112];
         int r = abi_addr_un(c->a[1], c->a[2], nm, sizeof nm);
@@ -1739,6 +1797,7 @@ static long h_bind(struct abi_ctx* c) {
 }
 
 static long h_connect(struct abi_ctx* c) {
+    if (abi_fd_is_netlink((int)c->a[0])) return 0;         /* §M90 — to the kernel: always so */
     if (abi_fd_is_unix((int)c->a[0])) {
         char nm[112];
         int r = abi_addr_un(c->a[1], c->a[2], nm, sizeof nm);
@@ -1781,6 +1840,10 @@ static long h_accept (struct abi_ctx* c) { return h_accept_common(c, 0); }
 static long h_accept4(struct abi_ctx* c) { return h_accept_common(c, (int)c->a[3]); }
 
 static long h_getsockname(struct abi_ctx* c) {
+    if (abi_fd_is_netlink((int)c->a[0])) {
+        abi_nl_out(c->a[1], c->a[2], nl_portid(fd_lookup((int)c->a[0])->nl));
+        return 0;
+    }
     if (abi_fd_is_unix((int)c->a[0])) { abi_un_out(c->a[1], c->a[2], sys_unix_name((int)c->a[0])); return 0; }
     uint32_t ip = 0; int port = 0;
     if (sys_getsockname_k((int)c->a[0], &ip, &port) != 0) return -ABI_EINVAL;
@@ -1807,6 +1870,7 @@ static long h_recv(struct abi_ctx* c) {
 }
 
 static long h_sendto(struct abi_ctx* c) {
+    if (abi_fd_is_netlink((int)c->a[0])) return abi_nl_send((int)c->a[0], c->a[1], c->a[2]);
     if (!c->a[4]) return sys_write((int)c->a[0], (const void*)c->a[1], (size_t)c->a[2]);
     uint32_t ip; int port;
     int r = abi_addr_in(c->a[4], &ip, &port);
@@ -1816,6 +1880,11 @@ static long h_sendto(struct abi_ctx* c) {
 }
 
 static long h_recvfrom(struct abi_ctx* c) {
+    if (abi_fd_is_netlink((int)c->a[0])) {
+        long r = abi_nl_recv((int)c->a[0], c->a[1], c->a[2], (int)c->a[3]);
+        if (r >= 0 && c->a[4]) abi_nl_out(c->a[4], c->a[5], 0);   /* from the kernel */
+        return r;
+    }
     uint32_t ip = 0; int port = 0;
     long n = sys_recvfrom_u((int)c->a[0], (uintptr_t)c->a[1], (size_t)c->a[2],
                             &ip, &port);
@@ -2056,6 +2125,7 @@ static volatile int g_trace;
  * it starts (a daemon a script launches), and every thread of it.  -2 in
  * g_trace selects this. */
 static char g_trace_name[16];
+static int  g_trace_all;          /* §M90 — `strace all …`: keep the noisy calls too */
 static int abi_traced(void) {
     int t = g_trace;
     if (!t) return 0;
@@ -2087,7 +2157,7 @@ int abi_dispatch(const struct abi_map* map, unsigned long nr,
                  long* out) {
     enum abi_op op = abi_lookup(map, nr);
     { struct task* me = task_current(); if (me) me->guest_nr = (int)nr + 1; }
-    int tr = abi_traced() && !abi_trace_noise(op);
+    int tr = abi_traced() && (g_trace_all || !abi_trace_noise(op));
     if (op == ABI_OP_NONE) {
         if (tr) kprintf("strace[%d] #%lu(%lx, %lx, %lx) -> arch switch\n",
                         task_current()->pid, nr, a0, a1, a2);
@@ -2111,6 +2181,13 @@ static void cmd_strace(const char* args) {
     if (!*a) { kprintf("strace: %s\n", g_trace == 0 ? "off" : g_trace < 0 ? "every container task" : "one pid"); return; }
     if (a[0] == 'c') { g_trace = -1; kprintf("strace: tracing every task in a container\n"); return; }
     if (a[0] == 'o') { g_trace = 0;  kprintf("strace: off\n"); return; }
+    if (a[0] == 'a' && a[1] == 'l') {               /* all <args>: no noise filter */
+        g_trace_all = 1;
+        while (*a && *a != ' ') a++;
+        while (*a == ' ') a++;
+    } else if (a[0] == 'n' || (a[0] >= '0' && a[0] <= '9')) {
+        g_trace_all = 0;
+    }
     if (a[0] == 'n') {                               /* name <task name> */
         while (*a && *a != ' ') a++;
         while (*a == ' ') a++;
@@ -2126,7 +2203,7 @@ static void cmd_strace(const char* args) {
     g_trace = v;
     kprintf("strace: %s\n", v ? "tracing that pid" : "off");
 }
-SHELL_CMD(strace) = { "strace", "[<pid> | name <task> | ctr | off]",
+SHELL_CMD(strace) = { "strace", "[all] [<pid> | name <task> | ctr | off]",
                       "print every guest (Linux-ABI) syscall of a task, with its result",
                       SHELL_G_TASK, cmd_strace, SHELL_P_ADMIN };
 

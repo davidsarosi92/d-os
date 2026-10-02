@@ -1038,7 +1038,17 @@ pmm_phys_t pmm_alloc_contiguous(uint32_t n) {
     return page_alloc(order, ZONE_DEFAULT);
 }
 
+/* §M90 — see pcache.c (owned_map): a frame the page cache still holds must
+ * never go back to the allocator through another path. */
+int pcache_owns_frame(pmm_phys_t f) __attribute__((weak));
+int pcache_owns_frame(pmm_phys_t f) { (void)f; return 0; }
+
 void pmm_free_frame(pmm_phys_t addr) {
+    if (pcache_owns_frame(addr)) {
+        kprintf("!! pmm_free_frame: frame %lx is still held by the page cache - NOT freed "
+                "(caller %p)\n", (unsigned long)addr, __builtin_return_address(0));
+        return;
+    }
     page_free(addr, 0);
 }
 

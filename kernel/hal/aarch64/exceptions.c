@@ -101,6 +101,22 @@ static void dump_and_halt(const char* what, struct trapframe* tf) {
             uart_early_puts("  kstack ");
             uart_early_puthex((uint64_t)(uintptr_t)ct->kstack_base);
         }
+        /* §M90 — WHO CALLED: the link register and the frame-record chain
+         * (x29 → {prev x29, return address}), bounded to this task's kernel
+         * stack so a corrupt chain cannot fault the dump.  A fault in a shared
+         * routine (vfs_close) says nothing until it names its caller. */
+        uart_early_puts("\n  lr      = "); uart_early_puthex(tf->x[30]);
+        uart_early_puts("\n  trace  :");
+        uint64_t fp = tf->x[29];
+        uintptr_t lo = ct && ct->kstack_base ? (uintptr_t)ct->kstack_base : 0;
+        uintptr_t hi = lo ? lo + TASK_KSTACK_SZ : 0;
+        for (int i = 0; i < 12 && lo && fp >= lo && fp + 16 <= hi && !(fp & 7); i++) {
+            uint64_t ret = ((const uint64_t*)(uintptr_t)fp)[1];
+            uart_early_puts(" "); uart_early_puthex(ret);
+            uint64_t nfp = ((const uint64_t*)(uintptr_t)fp)[0];
+            if (nfp <= fp) break;
+            fp = nfp;
+        }
     }
     /* §M47 — record it BEFORE applying the policy: halt and reboot both never
      * return, so a record written afterwards would never exist. */
@@ -369,6 +385,11 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                 uart_early_puts(" far="); uart_early_puthex(far);
                 uart_early_puts(" esr="); uart_early_puthex(esr);
                 uart_early_puts(" sp_el0="); uart_early_puthex(sp0);
+                /* §M90 — the caller: the link register and the frame pointer,
+                 * so a fault in a function reached twice can say from where. */
+                uart_early_puts(" lr="); uart_early_puthex(tf->x[30]);
+                uart_early_puts(" fp="); uart_early_puthex(tf->x[29]);
+
                 {
                     struct task* ct = task_current();
                     uart_early_puts(" task="); uart_early_puts(ct ? ct->name : "?");

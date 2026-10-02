@@ -461,6 +461,7 @@ static int cg_unlink(struct inode* dir, const char* name, struct inode* child) {
     if (!child || child->type != INODE_DIR) return -1;      /* control files stay */
     struct cgroup* cg = (struct cgroup*)child->private;
     if (!cg || cg_is_root(cg) || cg->nchildren > 0) return -2;
+    for (int k = 0; k < K_N; k++) if (cg->files[k].opens > 0) return -2;   /* a control file is open */
     struct scan s;
     cg_scan(cg, &s, NULL, 0);
     if (s.alive) return -2;                                 /* EBUSY: members */

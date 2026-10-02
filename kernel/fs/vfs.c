@@ -249,7 +249,7 @@ static int link_target(struct dentry* d, char* out, size_t cap) {
     if (!d || !d->inode || d->inode->type != INODE_SYMLINK || !d->inode->ops ||
         !d->inode->ops->read || cap < 2)
         return -1;
-    struct file tmp = { d->inode, d, 0, 0, 0 };
+    struct file tmp = { d->inode, d, 0, 0, 0, 0 };   /* never closed: no magic */
     ssize_t n = d->inode->ops->read(&tmp, out, cap - 1, 0);
     if (n <= 0) return -1;
     out[n] = 0;
@@ -625,6 +625,8 @@ static struct file* vfs_open_unlocked(const char* path, int flags) {
     f->dentry = d;
     f->flags  = flags;
     f->pos    = 0;
+    f->magic  = VFS_FILE_MAGIC;
+    d->inode->opens++;                       /* §M90 — see vfs_close / unlink */
     struct vfs_mount* m = mount_of_dentry(d);
     if (m) m->open_files++;
     return f;
@@ -635,13 +637,35 @@ struct file* vfs_open(const char* path, int flags) {
 
 int vfs_close(struct file* f) {
     if (!f) return -1;
+    if (f->magic != VFS_FILE_MAGIC) {
+        kprintf("!! vfs_close: %s struct file %p (magic %x inode %p) from %p\n",
+                f->magic == VFS_FILE_DEAD ? "ALREADY CLOSED" : "CORRUPT",
+                (void*)f, f->magic, (void*)f->inode, __builtin_return_address(0));
+        return -1;                       /* never free what is not ours to free */
+    }
+    f->magic = VFS_FILE_DEAD;
     if (f->inode && f->inode->ops && f->inode->ops->close) f->inode->ops->close(f);
     /* §M87 — the mount is found again from the dentry rather than remembered
      * in the file: mount records move when one is removed, and a pointer kept
      * across that would decrement somebody else's count. */
     kmutex_lock(&ns_lock);
-    struct vfs_mount* m = f->dentry ? mount_of_dentry(f->dentry) : NULL;
+    /* §M90 — the dentry may be gone (the file was unlinked while open): the
+     * mount is then not found from it, and its count is left as it was. */
+    struct vfs_mount* m = f->dentry && f->inode && !f->inode->unlink_dir
+                        ? mount_of_dentry(f->dentry) : NULL;
     if (m && m->open_files > 0) m->open_files--;
+    /* §M90 — the LAST close of an unlinked file performs the removal that
+     * vfs_unlink deferred: until now its inode (and, on ramfs, its pages)
+     * had to stay valid for this open file. */
+    struct inode* ino = f->inode;
+    if (ino && ino->opens > 0 && --ino->opens == 0 && ino->unlink_dir) {
+        struct inode* dir = ino->unlink_dir;
+        char* nm = ino->unlink_name;
+        ino->unlink_dir = NULL; ino->unlink_name = NULL;
+        pcache_invalidate(ino);
+        if (dir->dir_ops && dir->dir_ops->unlink) dir->dir_ops->unlink(dir, nm ? nm : "", ino);
+        if (nm) kfree(nm);
+    }
     kmutex_unlock(&ns_lock);
     kfree(f);
     return 0;
@@ -813,6 +837,22 @@ static int vfs_unlink_unlocked(const char* path) {
     if (d->inode->type == INODE_DIR && d->children &&
         !(d->inode->vflags & VFS_IF_OWN_CHILDREN)) return -2;   /* not empty */
     if (d->inode->type == INODE_DEVICE) return -1;               /* devfs nodes */
+
+    /* §M90 — STILL OPEN: the name goes now, the file when its last opener
+     * closes it (vfs_close).  Freeing it here left every open descriptor
+     * pointing at freed memory — a daemon that removes a file it still holds
+     * (or renames a new one over it) then crashed the kernel at close. */
+    if (d->inode->type != INODE_DIR && d->inode->opens > 0) {
+        size_t nl = strlen_(last);
+        char* nm = (char*)kmalloc(nl + 1);
+        if (!nm) return -1;
+        for (size_t i = 0; i <= nl; i++) nm[i] = last[i];
+        d->inode->unlink_dir  = parent->inode;
+        d->inode->unlink_name = nm;
+        *link = d->sibling;
+        kfree(d);
+        return 0;
+    }
 
     pcache_invalidate(d->inode);                 /* §M74 — before the inode goes */
     int r = parent->inode->dir_ops->unlink(parent->inode, last, d->inode);
