@@ -179,6 +179,7 @@ void     fd_close_on_exec(void);
  * under the table's lock (see usyscall.c for the race it closes). */
 void     fd_snapshot_for_fork(struct task* parent, struct ofile** out, uint32_t* cloexec);
 int      fd_nth_open(int n);                 /* §M90 — /proc/self/fd's listing */
+void     fd_unshare_table(void);             /* §M90 — unshare(CLONE_FILES) */
 
 /* §M56.2 — the same wake, but naming the description that changed.
  *

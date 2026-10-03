@@ -102,6 +102,26 @@ static const struct abi_nument linux_i386_ents[] = {
     /* §M90 — rename 38, renameat 302, renameat2 353. */
     {  38, ABI_RENAME }, { 302, ABI_RENAMEAT }, { 353, ABI_RENAMEAT2 },
     { 143, ABI_FLOCK },
+    /* §M90 — chroot 61, unshare 310, mount 21, umount2 52. */
+    {  61, ABI_CHROOT }, { 310, ABI_UNSHARE }, {  21, ABI_MOUNT }, {  52, ABI_UMOUNT2 },
+    { 217, ABI_PIVOT_ROOT },
+    { 452, ABI_FCHMODAT2 },  /* §M90 — same number on every guest (post-5.x unified table) */
+    { 320, ABI_UTIMENSAT }, { 412, ABI_UTIMENSAT },  /* §M90 — and its time64 twin */
+    {  95, ABI_FCHOWN }, { 207, ABI_FCHOWN },  /* §M90 — fchown, fchown32 */
+    /* §M90 — the extended-attribute family: set/lset/fset, get/lget/fget,
+     * list/llist/flist, remove/lremove/fremove, consecutive on every guest. */
+    { 226, ABI_XATTR_SET },
+    { 227, ABI_XATTR_SET },
+    { 228, ABI_XATTR_FSET },
+    { 229, ABI_XATTR_GET },
+    { 230, ABI_XATTR_GET },
+    { 231, ABI_XATTR_FGET },
+    { 232, ABI_XATTR_LIST },
+    { 233, ABI_XATTR_LIST },
+    { 234, ABI_XATTR_FLIST },
+    { 235, ABI_XATTR_REMOVE },
+    { 236, ABI_XATTR_REMOVE },
+    { 237, ABI_XATTR_FREMOVE },
     /* §M90 — fsync 118, fdatasync 148, syncfs 344; rmdir 40. */
     { 118, ABI_FSYNC }, { 148, ABI_FSYNC }, { 344, ABI_FSYNC }, {  40, ABI_RMDIR },
     {  15, ABI_CHMOD }, { 306, ABI_FCHMODAT }, { 10, ABI_UNLINK }, { 301, ABI_UNLINKAT },
@@ -207,6 +227,26 @@ static const struct abi_nument linux_amd64_ents[] = {
     /* §M90 — rename 82, renameat 264, renameat2 316. */
     {  82, ABI_RENAME }, { 264, ABI_RENAMEAT }, { 316, ABI_RENAMEAT2 },
     {  73, ABI_FLOCK },
+    /* §M90 — chroot 161, unshare 272, mount 165, umount2 166. */
+    { 161, ABI_CHROOT }, { 272, ABI_UNSHARE }, { 165, ABI_MOUNT }, { 166, ABI_UMOUNT2 },
+    { 155, ABI_PIVOT_ROOT },
+    { 452, ABI_FCHMODAT2 },  /* §M90 — same number on every guest (post-5.x unified table) */
+    { 280, ABI_UTIMENSAT },  /* §M90 */
+    {  93, ABI_FCHOWN },  /* §M90 */
+    /* §M90 — the extended-attribute family: set/lset/fset, get/lget/fget,
+     * list/llist/flist, remove/lremove/fremove, consecutive on every guest. */
+    { 188, ABI_XATTR_SET },
+    { 189, ABI_XATTR_SET },
+    { 190, ABI_XATTR_FSET },
+    { 191, ABI_XATTR_GET },
+    { 192, ABI_XATTR_GET },
+    { 193, ABI_XATTR_FGET },
+    { 194, ABI_XATTR_LIST },
+    { 195, ABI_XATTR_LIST },
+    { 196, ABI_XATTR_FLIST },
+    { 197, ABI_XATTR_REMOVE },
+    { 198, ABI_XATTR_REMOVE },
+    { 199, ABI_XATTR_FREMOVE },
     /* §M90 — fsync 74, fdatasync 75, syncfs 306; rmdir 84. */
     {  74, ABI_FSYNC }, {  75, ABI_FSYNC }, { 306, ABI_FSYNC }, {  84, ABI_RMDIR },
     {  90, ABI_CHMOD }, { 268, ABI_FCHMODAT }, { 87, ABI_UNLINK }, { 263, ABI_UNLINKAT },
@@ -296,6 +336,26 @@ static const struct abi_nument linux_arm64_ents[] = {
     /* §M90 — renameat 38, renameat2 276 (no plain rename on arm64). */
     {  38, ABI_RENAMEAT }, { 276, ABI_RENAMEAT2 },
     {  32, ABI_FLOCK },
+    /* §M90 — chroot 51, unshare 97, mount 40, umount2 39. */
+    {  51, ABI_CHROOT }, {  97, ABI_UNSHARE }, {  40, ABI_MOUNT }, {  39, ABI_UMOUNT2 },
+    {  41, ABI_PIVOT_ROOT },
+    { 452, ABI_FCHMODAT2 },  /* §M90 — same number on every guest (post-5.x unified table) */
+    {  88, ABI_UTIMENSAT },  /* §M90 */
+    {  55, ABI_FCHOWN },  /* §M90 */
+    /* §M90 — the extended-attribute family: set/lset/fset, get/lget/fget,
+     * list/llist/flist, remove/lremove/fremove, consecutive on every guest. */
+    { 5, ABI_XATTR_SET },
+    { 6, ABI_XATTR_SET },
+    { 7, ABI_XATTR_FSET },
+    { 8, ABI_XATTR_GET },
+    { 9, ABI_XATTR_GET },
+    { 10, ABI_XATTR_FGET },
+    { 11, ABI_XATTR_LIST },
+    { 12, ABI_XATTR_LIST },
+    { 13, ABI_XATTR_FLIST },
+    { 14, ABI_XATTR_REMOVE },
+    { 15, ABI_XATTR_REMOVE },
+    { 16, ABI_XATTR_FREMOVE },
     /* §M90 — fsync 82, fdatasync 83, syncfs 267 (no plain rmdir on arm64). */
     {  82, ABI_FSYNC }, {  83, ABI_FSYNC }, { 267, ABI_FSYNC },
     {  34, ABI_MKDIRAT }, {  37, ABI_LINKAT }, {  53, ABI_FCHMODAT }, {  35, ABI_UNLINKAT },

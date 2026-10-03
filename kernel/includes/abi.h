@@ -180,6 +180,13 @@ enum abi_op {
     ABI_RENAME, ABI_RENAMEAT, ABI_RENAMEAT2,   /* §M90 */
     ABI_FLOCK,                                 /* §M90 */
     ABI_FSYNC,              /* §M90 — fsync, fdatasync and syncfs alike */
+    ABI_CHROOT, ABI_UNSHARE, ABI_MOUNT, ABI_UMOUNT2,   /* §M90 */
+    ABI_PIVOT_ROOT,                                    /* §M90 */
+    ABI_FCHMODAT2,                                     /* §M90 */
+    ABI_UTIMENSAT,                                     /* §M90 */
+    ABI_XATTR_SET, ABI_XATTR_FSET, ABI_XATTR_GET, ABI_XATTR_FGET,      /* §M90 */
+    ABI_XATTR_LIST, ABI_XATTR_FLIST, ABI_XATTR_REMOVE, ABI_XATTR_FREMOVE,
+    ABI_FCHOWN,                                        /* §M90 */
     ABI_RMDIR,              /* §M90 */  /* §M90 — lchown maps to ABI_CHOWN: no per-call
                                * link handling, see h_fchownat */
     /* §M73 — identity.  The answer is the task's §M32 credential: a container

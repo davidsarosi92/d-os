@@ -483,6 +483,10 @@ int sys_open(const char* path, int flags) {
     if (!path) return -1;
     char kpath[256];                                        /* §1.1 */
     if (strncpy_from_user(kpath, path, sizeof kpath) < 0) return -1;
+    return sys_open_k(kpath, flags);
+}
+/* §M90 — open from a KERNEL path (the ABI layer rewrites /proc/self/fd/N). */
+int sys_open_k(const char* kpath, int flags) {
     struct file* f = vfs_open(kpath, flags ? flags : VFS_RDONLY);
     if (!f) return -1;
     struct ofile* o = ofile_from_file(f);
@@ -2482,4 +2486,39 @@ int fd_nth_open(int n) {
     }
     fdt_unlock(t, fl);
     return found;
+}
+
+/* §M90 — unshare(CLONE_FILES): this thread stops sharing its process's
+ * descriptor table and continues with a private COPY (a reference to every
+ * open description, the close-on-exec bits with them).  A task whose table is
+ * already private has nothing to do. */
+void fd_unshare_table(void) {
+    struct task* t = task_current();
+    if (!t || !t->fdt) return;
+    struct ofile* copy[TASK_MAX_FDS];
+    uint32_t cx = 0;
+    fd_snapshot_for_fork(t, copy, &cx);
+    struct fdtable* ft = t->fdt;
+    t->fdt = NULL;
+    t->fds = t->fds_inline;
+    for (int i = 0; i < TASK_MAX_FDS; i++) t->fds_inline[i] = copy[i];
+    t->fd_cloexec_inline = cx;
+    fdtable_put(ft);
+}
+
+/* §M90 — the path of the file behind descriptor `fd` (any VFS file, not only
+ * a directory), as the caller sees it.  0, or -1. */
+int sys_fd_path(int fd, char* out, size_t cap) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_VFS || !o->file || !o->file->dentry) return -1;
+    if (o->file->inode && o->file->inode->unlink_dir) return -1;   /* deleted */
+    return vfs_dentry_path(o->file->dentry, out, cap) == 0 ? 0 : -1;
+}
+
+/* §M90 — see vfs.c (fd_vfs_dentry): the dentry of the caller's descriptor. */
+struct dentry* fd_vfs_dentry(int fd) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_VFS || !o->file || !o->file->dentry) return NULL;
+    if (o->file->inode && o->file->inode->unlink_dir) return NULL;
+    return o->file->dentry;
 }

@@ -542,6 +542,14 @@ struct task {
     /* §M90 — the cgroup v2 node this task is in (cgroupfs.c owns the type);
      * NULL = the root.  Inherited at spawn, moved by writing cgroup.procs. */
     void*       cgroup;
+    /* §M90 — the mount namespace this task is in: 0 = the machine's.  A new
+     * one is made by unshare(CLONE_NEWNS) / clone; inherited at spawn.  See
+     * abi_engine.c h_unshare for what a namespace does and does not separate
+     * yet. */
+    int         mntns;
+    /* §M90 — pivot_root's put_old, relative to the new root ("" = none): the
+     * one umount2 target that is answered without a mount table. */
+    char        pivot_old[96];
 };
 
 /* §M90 — the process a task belongs to: its own pid unless it is a thread. */

@@ -237,6 +237,8 @@ int  sys_socket_info(int fd, int* family, int* type, int* listening);   /* §M90
 int  sys_fd_dirpath(int fd, char* out, size_t cap);                    /* §M90 */
 int  sys_fsync(int fd);                                                /* §M90 */
 int  sys_netlink_socket(int proto, int nonblock);                      /* §M90 */
+int  sys_open_k(const char* kpath, int flags);                         /* §M90 */
+int  sys_fd_path(int fd, char* out, size_t cap);                       /* §M90 */
 int  sys_unlink(const char* upath);
 long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
                    int fd, uint64_t offset);

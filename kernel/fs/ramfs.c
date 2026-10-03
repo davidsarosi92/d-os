@@ -152,6 +152,14 @@ static int rfs_rename_op(struct inode* dir, const char* oldname,
     return child ? 0 : -1;
 }
 
+/* §M90 — a move between directories: names live in the VFS's dentry tree,
+ * which the VFS relinks after we say yes. */
+static int rfs_move_op(struct inode* odir, const char* oname, struct inode* ndir,
+                       const char* nname, struct inode* child) {
+    (void)odir; (void)oname; (void)ndir; (void)nname;
+    return child ? 0 : -1;
+}
+
 static int rfs_link_op(struct inode* dir, const char* name, struct inode* target) {
     (void)dir; (void)name;
     if (!target || target->type != INODE_FILE) return -1;
@@ -192,6 +200,7 @@ static const struct inode_ops ramfs_inode_ops = {
     .rename = rfs_rename_op,         /* M22.5 — file manager Rename */
     .link   = rfs_link_op,           /* §M73 — hard links */
     .symlink = rfs_symlink_op,       /* §M89 — symbolic links */
+    .move    = rfs_move_op,          /* §M90 — rename across directories */
 };
 
 /* ------------------------------------------------------------------- */

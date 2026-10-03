@@ -946,6 +946,37 @@ static void sy_unlinkopentest(const char* args) {
     int ok = ur == 0 && gone && n == 10 && buf[0] == 's' && buf[9] == 'e' && again;
     console_write(ok ? "unlinkopen: ok\n" : "unlinkopen: FAIL\n");
 }
+/* §M90 — `renametest`: rename across directories (docker writes a layer's
+ * metadata in tmp/ and renames it into the store), a directory over an EMPTY
+ * directory, and the two refusals that keep the tree a tree: a directory into
+ * its own subtree, and over a non-empty directory. */
+static void sy_renametest(const char* args) {
+    (void)args;
+    struct vfs_stat st;
+    vfs_mkdir("/rt");
+    vfs_mkdir("/rt/a");
+    vfs_mkdir("/rt/b");
+    vfs_mkdir("/rt/b/full");
+    vfs_create("/rt/b/full/x");
+    vfs_create("/rt/a/f");
+    int slash = vfs_stat("/rt/b/", &st) == 0 && vfs_stat("/rt/b//", &st) == 0;  /* "dir/" = "dir" */
+    int r1 = vfs_rename_replace("/rt/a", "/rt/b/moved");              /* cross-dir dir */
+    int ok1 = r1 == 0 && vfs_stat("/rt/b/moved/f", &st) == 0 && vfs_stat("/rt/a", &st) != 0;
+    int r2 = vfs_rename_replace("/rt/b", "/rt/b/moved/inside");       /* into itself */
+    vfs_mkdir("/rt/empty");
+    int r3 = vfs_rename_replace("/rt/b/moved", "/rt/empty");          /* over empty dir */
+    int ok3 = r3 == 0 && vfs_stat("/rt/empty/f", &st) == 0 && vfs_stat("/rt/b/moved", &st) != 0;
+    int r4 = vfs_rename_replace("/rt/empty", "/rt/b/full");           /* over non-empty */
+    int r5 = vfs_rename_replace("/rt/empty/f", "/rt/f2");             /* cross-dir file */
+    int ok5 = r5 == 0 && vfs_stat("/rt/f2", &st) == 0;
+    kprintf("renametest: crossdir=%d into-self=%d over-empty=%d over-full=%d file=%d slash=%d\n",
+            r1, r2, r3, r4, r5, slash);
+    vfs_unlink_recursive("/rt");
+    int ok = ok1 && r2 == -1 && ok3 && r4 == -4 && ok5 && slash;
+    console_write(ok ? "renametest: ok\n" : "renametest: FAIL\n");
+}
+SHELL_CMD(renametest) = { "renametest", "", "rename across directories, and its refusals",
+                          SHELL_G_TEST, sy_renametest, SHELL_P_ANY };
 SHELL_CMD(unlinkopentest) = { "unlinkopentest", "", "an unlinked file stays readable while open",
                               SHELL_G_TEST, sy_unlinkopentest, SHELL_P_ANY };
 SHELL_CMD(flocktest)   = { "flocktest",   "", "flock(2): owners, sharing, release on close",

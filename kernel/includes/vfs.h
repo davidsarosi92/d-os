@@ -36,7 +36,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define VFS_NAME_MAX  63                /* per-component max bytes (NUL excluded) */
+/* §M90 — 255, Linux's NAME_MAX.  It was 63, and every content-addressed store
+ * names its objects by a sha256 in HEX — 64 characters: containerd's
+ * ingest/<sha>/ref, docker's vfs/dir/<sha>, an OCI layout's blobs/sha256/<sha>
+ * all failed to be CREATED, as ENOENT, which reads as a missing directory
+ * rather than a name one character too long. */
+#define VFS_NAME_MAX  255               /* per-component max bytes (NUL excluded) */
 
 /* No `<sys/types.h>` in a freestanding build — supply our own. */
 #ifndef _SSIZE_T_DEFINED
@@ -155,6 +160,14 @@ struct inode_ops {
      * links stop being skipped. */
     int (*symlink)(struct inode* dir, const char* name, const char* target,
                    struct inode** out);
+    /* §M90 — OPTIONAL, APPENDED.  Move `child` from `odir`/`oname` to
+     * `ndir`/`nname`, two DIFFERENT directories of the same mount (rename
+     * within one directory stays `rename`).  The target name is free when
+     * this is called.  The VFS relinks the dentry on success.  NULL =
+     * unsupported, answered EXDEV — which is what made docker's layer store
+     * (write a set in tmp/, rename it into place) impossible. */
+    int (*move)(struct inode* odir, const char* oname, struct inode* ndir,
+                const char* nname, struct inode* child);
 };
 
 /* Inode — owned by the fs that created it.  `private` is fs-defined. */
@@ -327,13 +340,15 @@ int  vfs_create(const char* path);          /* zero-byte regular file */
  * removed inode are NOT tracked — close them first. */
 int  vfs_unlink(const char* path);
 
-/* M22.5 — rename WITHIN one directory: both paths must share the same
- * parent.  Returns 0, -1 on failure (unsupported fs, missing source),
- * -2 if the new name already exists. */
+/* M22.5 — rename.  Within one directory, or (§M90) into another directory
+ * of the same mount when the fs has a `move` op.  Returns 0, -1 on failure
+ * (missing source, a directory into its own subtree, a mount point), -2 if
+ * the new name already exists, -3 across mounts / no `move`, -5 denied. */
 int  vfs_rename(const char* oldpath, const char* newpath);
-/* §M90 — rename(2): replaces an existing (non-directory) target atomically.
- * -2 the target is a directory, -3 the two names are in different
- * directories, -1 otherwise. */
+/* §M90 — rename(2): replaces an existing target atomically — a file by a
+ * file, an EMPTY directory by a directory.  -2 a file over a directory,
+ * -3 cannot cross (see vfs_rename), -4 the target directory is not empty,
+ * -1 otherwise. */
 int  vfs_rename_replace(const char* oldpath, const char* newpath);
 /* §M90 — fsync(2): write back the dirty blocks of the file's volume. */
 int  vfs_fsync_file(struct file* f);

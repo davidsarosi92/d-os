@@ -194,7 +194,13 @@ static struct dentry* lookup_child(struct dentry* parent,
  * and not a starting point).  Returns `path` itself when there is nothing to
  * do (the common case: absolute, no dot components), `buf` otherwise, NULL if
  * the result does not fit. */
-static const char* vfs_canon(const char* path, char* buf, size_t cap) {
+/* §M90 — the dentry behind the CALLER's descriptor `fd` (a VFS file), or
+ * NULL: what /proc/self/fd/N names.  usyscall.c owns the descriptor table. */
+struct dentry* fd_vfs_dentry(int fd) __attribute__((weak));
+struct dentry* fd_vfs_dentry(int fd) { (void)fd; return NULL; }
+static int vfs_dentry_path_unlocked(struct dentry* d, char* out, size_t cap);
+
+static const char* vfs_canon_plain(const char* path, char* buf, size_t cap) {
     int dots = 0;
     for (const char* q = path; *q; q++)
         if (*q == '.' && (q == path || q[-1] == '/') &&
@@ -233,6 +239,71 @@ static const char* vfs_canon(const char* path, char* buf, size_t cap) {
     if (o == 0) buf[o++] = '/';
     buf[o] = 0;
     return buf;
+}
+
+/* §M90 — /proc/self/fd/N[/rest] (and /proc/thread-self/…) is Linux's magic
+ * link to descriptor N's file.  /proc has no per-process tree here, so it is
+ * resolved in this one function every path passes through: replaced by that
+ * file's path, `rest` kept.  It is applied to the CANONICAL path, after a
+ * relative name has been joined to its directory — Go's os.Root opens
+ * "/proc/self/fd" as a directory and then chmods "22" relative to it, so a
+ * check on the raw argument alone never sees the link.  1 if `out` holds the
+ * rewritten path. */
+static int vfs_fd_magic(const char* path, char* out, size_t cap) {
+    static const char* const pre[2] = { "/proc/self/fd/", "/proc/thread-self/fd/" };
+    for (int w = 0; w < 2; w++) {
+        size_t i = 0;
+        while (pre[w][i] && path[i] == pre[w][i]) i++;
+        if (pre[w][i]) continue;
+        int fd = 0, digits = 0;
+        while (path[i] >= '0' && path[i] <= '9') { fd = fd * 10 + (path[i++] - '0'); digits++; }
+        if (!digits || (path[i] && path[i] != '/')) return 0;
+        struct dentry* d = fd_vfs_dentry(fd);
+        if (!d) return 0;
+        char m[256];
+        if (vfs_dentry_path_unlocked(d, m, sizeof m) != 0) return 0;
+        size_t o = 0;
+        for (; m[o] && o + 1 < cap; o++) out[o] = m[o];
+        if (o == 0 && o + 1 < cap) out[o++] = '/';
+        for (; path[i] && o + 1 < cap; i++) out[o++] = path[i];
+        out[o] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static const char* vfs_canon(const char* path, char* buf, size_t cap) {
+    const char* c = vfs_canon_plain(path, buf, cap);
+    if (!c) return NULL;
+    /* §M90 — "dir/" names "dir" (POSIX).  The fast branch hands back an
+     * absolute, dot-free path untouched, slash and all, and the walk then met
+     * an EMPTY last component: stat("…/") failed, so Go's MkdirAll — stat,
+     * else mkdir, else stat again — answered EEXIST for a directory that was
+     * there all along (docker's container start). */
+    {
+        size_t n = 0;
+        while (c[n]) n++;
+        if (n > 1 && c[n - 1] == '/') {
+            if (c != buf) {
+                if (n + 1 > cap) return NULL;
+                for (size_t i = 0; i <= n; i++) buf[i] = c[i];
+                c = buf;
+            }
+            while (n > 1 && buf[n - 1] == '/') buf[--n] = 0;
+        }
+    }
+    char m[256];
+    if (!vfs_fd_magic(c, m, sizeof m)) return c;
+    c = vfs_canon_plain(m, buf, cap);
+    if (!c) return NULL;
+    if (c == m) {                                   /* already canonical: lives in m */
+        size_t n = 0;
+        while (m[n]) n++;
+        if (n + 1 > cap) return NULL;
+        for (size_t i = 0; i <= n; i++) buf[i] = m[i];
+        c = buf;
+    }
+    return c;
 }
 
 int vfs_canonical(const char* path, char* out, size_t cap) {
@@ -915,6 +986,49 @@ int vfs_link(const char* oldpath, const char* newpath) {
 /* M22.5 — rename / copy / recursive delete.                            */
 /* ------------------------------------------------------------------- */
 
+/* §M90 — rename into ANOTHER directory of the same mount: the fs's `move`
+ * op, then the dentry is unlinked from one parent's child list and linked
+ * into the other's.  -3 = cannot be done here (another mount, or the fs has
+ * no move): the caller decides what crossing means (EXDEV for rename(2)).
+ * -2 = the target name exists.  -1 = not found / not allowed — including a
+ * directory moved into its own subtree, which would detach it from the tree,
+ * and a mount point, which is not the mounted filesystem's to move. */
+static int vfs_move_unlocked(struct dentry* op, const char* olast,
+                             struct dentry* np, const char* nlast) {
+    if (!op->inode || op->inode->type != INODE_DIR) return -1;
+    if (!np->inode || np->inode->type != INODE_DIR) return -1;
+    if (strlen_(nlast) > VFS_NAME_MAX) return -1;
+    if (mount_of_dentry(op) != mount_of_dentry(np)) return -3;
+    if (!op->inode->dir_ops || !op->inode->dir_ops->move ||
+        op->inode->dir_ops != np->inode->dir_ops) return -3;
+    if (!vfs_permitted(op->inode, VFS_PERM_WRITE) ||
+        !vfs_permitted(np->inode, VFS_PERM_WRITE)) return -5;
+    struct dentry* d = NULL;
+    for (struct dentry* c = op->children; c; c = c->sibling)
+        if (streq(c->name, olast)) { d = c; break; }
+    if (!d || !d->inode || d->inode->type == INODE_DEVICE) return -1;
+    for (struct dentry* c = np->children; c; c = c->sibling)
+        if (streq(c->name, nlast)) return -2;
+    for (int i = 0; i < g_nmounts; i++) if (g_mounts[i].mp == d) return -1;
+    for (struct dentry* a = np; a; a = a->parent) {          /* not into itself */
+        if (a == d) return -1;
+        if (a->parent == a) break;
+    }
+    int r = op->inode->dir_ops->move(op->inode, olast, np->inode, nlast, d->inode);
+    if (r != 0) return r;
+    /* Relink: out of the old parent's list, into the new one's. */
+    struct dentry** pp = &op->children;
+    while (*pp && *pp != d) pp = &(*pp)->sibling;
+    if (*pp) *pp = d->sibling;
+    d->parent  = np;
+    d->sibling = np->children;
+    np->children = d;
+    size_t i = 0;
+    for (; nlast[i] && i < sizeof(d->name) - 1; i++) d->name[i] = nlast[i];
+    d->name[i] = 0;
+    return 0;
+}
+
 static int vfs_rename_unlocked(const char* oldpath, const char* newpath) {
     char obuf[256], nbuf[256];
     const char *olast, *nlast;
@@ -924,7 +1038,8 @@ static int vfs_rename_unlocked(const char* oldpath, const char* newpath) {
 
     struct dentry* oparent = resolve_path(obuf, NULL, NULL);
     struct dentry* nparent = resolve_path(nbuf, NULL, NULL);
-    if (!oparent || oparent != nparent) return -1;   /* same-dir only */
+    if (!oparent || !nparent) return -1;
+    if (oparent != nparent) return vfs_move_unlocked(oparent, olast, nparent, nlast);
     if (!oparent->inode || oparent->inode->type != INODE_DIR) return -1;
     if (!oparent->inode->dir_ops || !oparent->inode->dir_ops->rename) return -1;
     if (strlen_(nlast) > VFS_NAME_MAX) return -1;
@@ -956,8 +1071,9 @@ int vfs_rename(const char* oldpath, const char* newpath) {
  * metadata, every atomic config save), and a rename that refuses an existing
  * target breaks exactly that.  Done under ONE hold of the namespace lock, so
  * nobody can observe the gap between the unlink and the rename.  A directory
- * target is refused (-2): replacing one needs it empty and is not wanted yet.
- * Same-directory only, like vfs_rename; -3 says "different directories" so the
+ * target is replaced only by a directory and only when empty (-2: a file over
+ * a directory, -4: not empty).  Across directories when the filesystem can
+ * move (§M90); -3 says it cannot (another mount, or no `move` op) so the
  * caller can decide what crossing means for it. */
 static int vfs_rename_replace_unlocked(const char* oldpath, const char* newpath) {
     char obuf[256], nbuf[256];
@@ -967,11 +1083,17 @@ static int vfs_rename_replace_unlocked(const char* oldpath, const char* newpath)
     struct dentry* op = resolve_path(obuf, NULL, NULL);
     struct dentry* np = resolve_path(nbuf, NULL, NULL);
     if (!op || !np) return -1;
-    if (op != np) return -3;
     int r = vfs_rename_unlocked(oldpath, newpath);
     if (r != -2) return r;
     struct dentry* t = resolve_path(newpath, NULL, NULL);
-    if (!t || !t->inode || t->inode->type == INODE_DIR) return -2;
+    if (!t || !t->inode) return -2;
+    if (t->inode->type == INODE_DIR) {
+        /* POSIX: a directory may replace an EMPTY directory (an image
+         * store renames a finished tree over its empty placeholder). */
+        struct dentry* s0 = resolve_path(oldpath, NULL, NULL);
+        if (!s0 || !s0->inode || s0->inode->type != INODE_DIR) return -2;
+        if (t->children) return -4;                      /* not empty */
+    }
     if (vfs_unlink_unlocked(newpath) != 0) return -1;
     return vfs_rename_unlocked(oldpath, newpath);
 }

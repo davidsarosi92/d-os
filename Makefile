@@ -634,6 +634,13 @@ else ifeq ($(ARCH),aarch64)
   ifneq ($(wildcard assets/wallpaper-default.bmp),)
     ARCH_EXTRA_OBJS += assets/wallpaper_blob.o
   endif
+  # §M90 — the CA trust bundle, provisioned to /etc/ssl/cert.pem at boot (one
+  # of the paths Go's crypto/x509 searches).  The x86 arches embed it with
+  # their Mbed TLS programs; ARM had none, so `docker pull` failed TLS with
+  # "certificate signed by unknown authority".
+  ifneq ($(wildcard third_party/cacert.pem),)
+    ARCH_EXTRA_OBJS += third_party/cacert_blob.o
+  endif
 
   # Tier B — in-tree user libc build knobs (aarch64).  Uses the cross toolchain
   # ($(CC)/$(LD)/$(CROSS)objcopy); user base is 4 GiB (above the identity map).
@@ -2110,7 +2117,7 @@ $(patsubst %,user/%.muslelf,$(MBEDTLS_PROGS)): user/%.muslelf: user/%.c $(MUSL_L
 # VFS at /etc/ssl/cert.pem during boot (kernel.c).
 $(OBJ_DIR)/third_party/cacert_blob.o: third_party/cacert.pem
 	@mkdir -p $(@D)
-	objcopy --input-target=binary $(USER_OCARGS) third_party/cacert.pem $@
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) third_party/cacert.pem $@
 
 # §M60 — the default wallpaper, embedded so a fresh boot has a real background
 # rather than a gradient and an instruction.  It is a 24-bpp uncompressed BMP

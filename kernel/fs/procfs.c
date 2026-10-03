@@ -26,6 +26,7 @@
 #include "drvuser.h"    /* §M33 Tier 2 — a placed driver's pid + restarts */
 #include "drvguard.h"   /* §M33 Tier 0 — faults-contained */
 #include "task.h"
+#include "cred.h"
 #include "console.h"
 #include "config.h"
 #include "timer.h"
@@ -587,6 +588,43 @@ static void gen_selfcgroup(struct procfs_writer* w) {
     pw_puts(w, "0::"); pw_puts(w, path); pw_putc(w, '\n');
 }
 static struct procfs_node nd_selfcgroup = { .name = "self/cgroup",    .gen = gen_selfcgroup };
+
+/* §M90 — /proc/self/status, the lines programs actually parse: the ids, the
+ * thread count, the memory figure, and the CAPABILITY masks — dockerd and runc
+ * read CapEff/CapBnd to know what they may grant a container.  This kernel has
+ * no capability sets: an administrator holds every privilege and anyone else
+ * none, which is exactly what all-ones / all-zeros say. */
+struct st_count { int tgid; int threads; };
+static void st_count_fn(const struct task* t, int is_current, void* ctx) {
+    (void)is_current;
+    struct st_count* c = (struct st_count*)ctx;
+    if (t->state != TASK_DEAD && task_tgid(t) == c->tgid) c->threads++;
+}
+static void gen_selfstatus(struct procfs_writer* w) {
+    struct task* t = task_current();
+    if (!t) return;
+    int uid = cred_uid(&t->cred);
+    if (uid < 0) uid = 0;
+    int admin = cred_is_admin(&t->cred) || uid == 0;
+    struct st_count c = { task_tgid(t), 0 };
+    task_for_each(st_count_fn, &c);
+    uint64_t priv = 0;
+    task_mem_bytes(t, &priv, NULL, NULL);
+    pw_puts(w, "Name:\t"); pw_puts(w, t->name);
+    pw_puts(w, "\nUmask:\t0022\nState:\tR (running)\nTgid:\t"); pw_put_uint(w, (unsigned)task_tgid(t));
+    pw_puts(w, "\nPid:\t"); pw_put_uint(w, (unsigned)t->pid);
+    pw_puts(w, "\nPPid:\t"); pw_put_uint(w, (unsigned)t->ppid);
+    pw_puts(w, "\nUid:\t"); for (int i = 0; i < 4; i++) { pw_put_uint(w, (unsigned)uid); pw_putc(w, i < 3 ? '\t' : '\n'); }
+    pw_puts(w, "Gid:\t"); for (int i = 0; i < 4; i++) { pw_put_uint(w, (unsigned)uid); pw_putc(w, i < 3 ? '\t' : '\n'); }
+    pw_puts(w, "Groups:\t\nVmRSS:\t"); pw_put_uint(w, (unsigned)(priv / 1024)); pw_puts(w, " kB\n");
+    pw_puts(w, "Threads:\t"); pw_put_uint(w, (unsigned)c.threads);
+    const char* caps = admin ? "000001ffffffffff" : "0000000000000000";
+    pw_puts(w, "\nCapInh:\t0000000000000000\nCapPrm:\t"); pw_puts(w, caps);
+    pw_puts(w, "\nCapEff:\t"); pw_puts(w, caps);
+    pw_puts(w, "\nCapBnd:\t"); pw_puts(w, caps);
+    pw_puts(w, "\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\n");
+}
+static struct procfs_node nd_selfstatus = { .name = "self/status", .gen = gen_selfstatus };
 static struct procfs_node nd_mountinfo  = { .name = "self/mountinfo", .gen = gen_mountinfo };
 static struct procfs_node nd_selfmounts = { .name = "self/mounts",    .gen = gen_mounts };
 static struct procfs_node nd_mounts     = { .name = "mounts",         .gen = gen_mounts };
@@ -616,6 +654,7 @@ void procfs_init(void) {
     attach_node(&nd_cpuinfo);
     attach_node(&nd_mountinfo);
     attach_node(&nd_selfcgroup);
+    attach_node(&nd_selfstatus);
     attach_fd_dir();
     attach_node(&nd_selfmounts);
     attach_node(&nd_mounts);

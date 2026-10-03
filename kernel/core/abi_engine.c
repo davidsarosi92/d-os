@@ -99,19 +99,110 @@ static long lnx_err(int r) {
     if (r == -5) return -13;             /* EACCES */
     return -2;                           /* ENOENT */
 }
+static int abi_fd_magic(char* k, unsigned cap);
 static long h_mkdir(struct abi_ctx* c)   { return lnx_err(sys_mkdir((const char*)c->a[0], (int)c->a[1])); }
 static long h_mkdirat(struct abi_ctx* c) {
     return AT_WRAP(c->a[0], lnx_err(sys_mkdir((const char*)c->a[1], (int)c->a[2])));
 }
 static long h_link(struct abi_ctx* c)    { return lnx_err(sys_link((const char*)c->a[0], (const char*)c->a[1])); }
+/* §M90 — a guest path made absolute against a directory descriptor, for the
+ * calls that take TWO (linkat): the at_dir override in AT_WRAP serves one.
+ * A relative path with AT_FDCWD is left relative — the VFS joins the working
+ * directory itself.  0, or a negative errno. */
+static long abi_at_join(int dirfd, unsigned long upath, char* out, unsigned cap) {
+    char rel[256];
+    if (!(upath && copy_str_from_user(rel, (uintptr_t)upath, sizeof rel) >= 0)) return -14;
+    if (rel[0] == '/' || dirfd == AT_FDCWD_) {
+        unsigned i = 0;
+        for (; rel[i] && i + 1 < cap; i++) out[i] = rel[i];
+        out[i] = 0;
+        return 0;
+    }
+    int r = sys_fd_dirpath(dirfd, out, cap);
+    if (r < 0) return r;
+    unsigned o = 0;
+    while (out[o]) o++;
+    if (o == 0 || out[o - 1] != '/') { if (o + 1 >= cap) return -36; out[o++] = '/'; }
+    for (unsigned i = 0; rel[i]; i++) { if (o + 1 >= cap) return -36; out[o++] = rel[i]; }
+    out[o] = 0;
+    return 0;
+}
 static long h_linkat(struct abi_ctx* c) {
-    /* Two directories: served when they are the same one (one override). */
-    if ((int)c->a[0] != (int)c->a[2]) return -38;
-    return AT_WRAP(c->a[0], lnx_err(sys_link((const char*)c->a[1], (const char*)c->a[3])));
+    /* linkat(olddir, old, newdir, new, flags).  The two directories may
+     * differ — an image layer's tar hard-links bin/[[ to bin/[ through two
+     * descriptors of one directory, and Go's os.Root opens one per step. */
+    if (c->a[4] & 0x1000) return -38;                    /* AT_EMPTY_PATH */
+    char ko[256], kn[256];
+    long r = abi_at_join((int)c->a[0], c->a[1], ko, sizeof ko);
+    if (r == 0) r = abi_at_join((int)c->a[2], c->a[3], kn, sizeof kn);
+    if (r) return r;
+    abi_fd_magic(ko, sizeof ko);
+    return lnx_err(vfs_link(ko, kn));
 }
 static long h_chmod(struct abi_ctx* c)   { return lnx_err(sys_chmod((const char*)c->a[0], (int)c->a[1])); }
 static long h_fchmodat(struct abi_ctx* c) {
     return AT_WRAP(c->a[0], lnx_err(sys_chmod((const char*)c->a[1], (int)c->a[2])));
+}
+static int abi_path(unsigned long up, char* k, unsigned cap);
+/* §M90 — utimensat(dirfd, path, times, flags) / futimens (path NULL).  The
+ * VFS keeps NO timestamps — stat answers 0 for all three on every file — so
+ * a time set here is unobservable by any reader, and refusing would only stop
+ * the programs that set them as a courtesy (Go's os.Chtimes after an image
+ * layer is unpacked, tar, cp -p).  What IS checked is everything a caller
+ * could act on: the file must exist (ENOENT) and the descriptor be open
+ * (EBADF).  When the VFS grows times, this is where they are stored. */
+static long h_utimensat(struct abi_ctx* c) {
+    if (!c->a[1]) {                                      /* futimens(fd, …) */
+        struct kstat_full k;
+        return sys_fstat_full_k((int)c->a[0], &k) == 0 ? 0 : -9;
+    }
+    return AT_WRAP(c->a[0], ({
+        char kp[256]; struct kstat_full k; long _e = 0;
+        if (abi_path(c->a[1], kp, sizeof kp) != 0) _e = -14;
+        else if (((c->a[3] & 0x100) ? sys_lstat_full_k(kp, &k)
+                                     : sys_stat_full_k(kp, &k)) != 0) _e = -2;
+        _e; }));
+}
+/* §M90 — extended attributes.  No filesystem here stores any, and the
+ * answers say exactly that, each in the errno a caller acts on: reading an
+ * attribute is ENODATA ("this file has none of that name" — docker's vfs
+ * driver asks every layer for security.capability and copies what exists),
+ * listing returns an empty list, and setting or removing one is EOPNOTSUPP
+ * ("this filesystem has no attributes"), never a success that stores
+ * nothing.  The file itself must exist (ENOENT / EBADF) either way. */
+static long abi_xattr_target(struct abi_ctx* c, int by_fd) {
+    struct kstat_full k;
+    if (by_fd) return sys_fstat_full_k((int)c->a[0], &k) == 0 ? 0 : -9;
+    char kp[256];
+    if (abi_path(c->a[0], kp, sizeof kp) != 0) return -14;
+    return sys_lstat_full_k(kp, &k) == 0 ? 0 : -2;
+}
+static long h_xattr_get(struct abi_ctx* c)  { long r = abi_xattr_target(c, 0); return r ? r : -61; }
+static long h_xattr_fget(struct abi_ctx* c) { long r = abi_xattr_target(c, 1); return r ? r : -61; }
+static long h_xattr_list(struct abi_ctx* c) { return abi_xattr_target(c, 0); }   /* 0 bytes */
+static long h_xattr_flist(struct abi_ctx* c){ return abi_xattr_target(c, 1); }
+static long h_xattr_set(struct abi_ctx* c)  { long r = abi_xattr_target(c, 0); return r ? r : -95; }
+static long h_xattr_fset(struct abi_ctx* c) { long r = abi_xattr_target(c, 1); return r ? r : -95; }
+
+/* §M90 — fchmodat2(dirfd, path, mode, flags): fchmodat with the flags word
+ * the old call never had.  AT_SYMLINK_NOFOLLOW on a symlink asks to change
+ * the LINK's mode, which Linux refuses with EOPNOTSUPP (a link's mode means
+ * nothing) — answered the same here; on anything else it is plain chmod.
+ * AT_EMPTY_PATH (chmod the descriptor itself) is not served. */
+static long h_fchmodat2(struct abi_ctx* c) {
+    unsigned long fl = c->a[3];
+    if (fl & 0x1000) return -38;                         /* AT_EMPTY_PATH */
+    if (fl & ~0x1100UL) return -22;                      /* EINVAL */
+    if (fl & 0x100) {                                    /* AT_SYMLINK_NOFOLLOW */
+        long r = AT_WRAP(c->a[0], ({
+            char kp[256]; struct kstat_full k; long _e = 0;
+            if (abi_path(c->a[1], kp, sizeof kp) != 0) _e = -ABI_EFAULT;
+            else if (sys_lstat_full_k(kp, &k) != 0) _e = -2;   /* ENOENT */
+            else if ((k.mode & KS_IFMT) == KS_IFLNK) _e = -95;   /* EOPNOTSUPP */
+            _e; }));
+        if (r) return r;
+    }
+    return h_fchmodat(c);
 }
 /* §M90 — chown / lchown / fchownat.  dockerd chowns its API socket to the
  * docker group and the daemon root to the remapped root; containerd and runc
@@ -128,6 +219,14 @@ static long chown_err(int r) {
 }
 static long h_chown(struct abi_ctx* c) {
     return chown_err(sys_chown((const char*)c->a[0], (int)c->a[1], (int)c->a[2]));
+}
+/* §M90 — fchown(fd, uid, gid): chown of the file a descriptor names (docker
+ * chowns every file of a layer it copies, by descriptor).  Through the
+ * descriptor's path, so it is the same check and the same store as chown. */
+static long h_fchown(struct abi_ctx* c) {
+    char kp[256];
+    if (sys_fd_path((int)c->a[0], kp, sizeof kp) != 0) return -9;   /* EBADF */
+    return chown_err(vfs_chown(kp[0] ? kp : "/", (int)c->a[1], (int)c->a[2]));
 }
 static long h_fchownat(struct abi_ctx* c) {
     if (c->a[4] & 0x1000) return -38;    /* AT_EMPTY_PATH: chown of an fd */
@@ -207,8 +306,42 @@ static int abi_w_ok(unsigned long p, unsigned long n) { return p && vmm_user_acc
 static int abi_r_ok(unsigned long p, unsigned long n) { return p && vmm_user_access_ok((uintptr_t)p, (uintptr_t)n, 0); }
 
 /* Copy a guest path in.  0 on success. */
+/* §M90 — /proc/self/fd/N (and /proc/thread-self/fd/N) is Linux's "magic
+ * link" to whatever descriptor N refers to: programs reach an open file or
+ * directory through it by NAME — containerd chmods its blob store "via
+ * pre-opened /proc/self/fd/22".  /proc here has no per-process tree, so the
+ * link is resolved where every guest path enters: rewritten to the path of
+ * the descriptor's file (anything after N is kept).  A descriptor that is not
+ * a file of the VFS (a pipe, a socket) is left as is and does not resolve.
+ * Returns 1 when `k` was rewritten. */
+static int abi_fd_magic(char* k, unsigned cap) {
+    const char* pre[2] = { "/proc/self/fd/", "/proc/thread-self/fd/" };
+    for (int w = 0; w < 2; w++) {
+        unsigned i = 0;
+        while (pre[w][i] && k[i] == pre[w][i]) i++;
+        if (pre[w][i]) continue;
+        int fd = 0, digits = 0;
+        while (k[i] >= '0' && k[i] <= '9') { fd = fd * 10 + (k[i++] - '0'); digits++; }
+        if (!digits || (k[i] && k[i] != '/')) return 0;
+        char dir[256];
+        if (sys_fd_path(fd, dir, sizeof dir) != 0) return 0;
+        char rest[256];
+        unsigned r = 0;
+        while (k[i] && r + 1 < sizeof rest) rest[r++] = k[i++];
+        rest[r] = 0;
+        unsigned o = 0;
+        if (!dir[0]) dir[0] = '/', dir[1] = 0;
+        for (unsigned j = 0; dir[j] && o + 1 < cap; j++) k[o++] = dir[j];
+        for (unsigned j = 0; rest[j] && o + 1 < cap; j++) k[o++] = rest[j];
+        k[o] = 0;
+        return 1;
+    }
+    return 0;
+}
 static int abi_path(unsigned long up, char* k, unsigned cap) {
-    return (up && copy_str_from_user(k, (uintptr_t)up, cap) >= 0) ? 0 : -1;
+    if (!(up && copy_str_from_user(k, (uintptr_t)up, cap) >= 0)) return -1;
+    abi_fd_magic(k, cap);
+    return 0;
 }
 
 /* §M90 — unlink vs rmdir, kept apart as Linux keeps them.  The VFS unlinks
@@ -271,8 +404,8 @@ static long abi_open_common(struct abi_ctx* c, unsigned long upath, unsigned lon
         if (sys_stat_full_k(kp, &st) != 0) return -ABI_ENOENT;
         if ((st.mode & KS_IFMT) != KS_IFDIR) return -ABI_ENOTDIR;
     }
-    /* sys_open copies from a RING-3 path, which is what upath is. */
-    long r = sys_open((const char*)upath, abi_open_flags(flags));
+    /* §M90 — from the kernel copy: it may have been rewritten (/proc/self/fd). */
+    long r = sys_open_k(kp, abi_open_flags(flags));
     return r < 0 ? -ABI_ENOENT : abi_cx(r, flags);
 }
 static long h_open(struct abi_ctx* c)   { return abi_open_common(c, c->a[0], c->a[1]); }
@@ -407,9 +540,26 @@ static int proc_exe_of(const char* p, char* out, unsigned cap) {
 }
 static long abi_readlink_path(unsigned long upath, unsigned long ubuf, unsigned long size) {
     char kp[256];
-    if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
+    if (!(upath && copy_str_from_user(kp, (uintptr_t)upath, sizeof kp) >= 0)) return -ABI_EFAULT;
     char tgt[256];
     int n = proc_exe_of(kp, tgt, sizeof tgt);
+    /* §M90 — readlink("/proc/self/fd/N") names the descriptor's file. */
+    if (n == -1) {
+        /* Canonical first: Go opens "/proc/self/fd" as a directory and
+         * reads "22" relative to it, which the raw argument never shows. */
+        char m[256];
+        if (vfs_canonical(kp, m, sizeof m) != 0) {
+            unsigned i = 0;
+            for (; kp[i] && i < sizeof m - 1; i++) m[i] = kp[i];
+            m[i] = 0;
+        }
+        if (abi_fd_magic(m, sizeof m)) {
+            n = 0;
+            while ((unsigned)n + 1 < sizeof tgt && m[n]) { tgt[n] = m[n]; n++; }
+            tgt[n] = 0;
+        }
+    }
+    if (n == -1) abi_fd_magic(kp, sizeof kp);
     if (n == -2) return -ABI_ENOENT;
     if (n == -1) {                                        /* §M89 — a real link? */
         n = vfs_readlink(kp, tgt, sizeof tgt);
@@ -446,6 +596,8 @@ static long abi_rename(unsigned long uold, unsigned long unew, int noreplace) {
     int r = vfs_rename_replace(o, n);
     if (r == 0) return 0;
     if (r == -2) return -21;                             /* EISDIR: target is a directory */
+    if (r == -4) return -39;                             /* ENOTEMPTY */
+    if (r == -5) return -13;                             /* EACCES */
     if (r != -3) return -ABI_ENOENT;
     if ((k.mode & KS_IFMT) == KS_IFDIR) return -18;      /* EXDEV */
     if (exists && (kt.mode & KS_IFMT) == KS_IFDIR) return -21;
@@ -454,6 +606,149 @@ static long abi_rename(unsigned long uold, unsigned long unew, int noreplace) {
     vfs_unlink(o);
     return 0;
 }
+/* §M90 — chroot(path): the task's "/" becomes `path` — §M73's per-task root,
+ * which every later spawn and fork inherits.  Administrators only (Linux:
+ * CAP_SYS_CHROOT).  The working directory is moved to the new root: this
+ * kernel keeps it as a path WITHIN the root, so leaving it would reinterpret
+ * the old path under the new "/", which is neither Linux's answer nor safe. */
+static long h_chroot(struct abi_ctx* c) {
+    char kp[256];
+    if (abi_path(c->a[0], kp, sizeof kp) != 0) return -ABI_EFAULT;
+    struct task* t = task_current();
+    if (!t) return -ABI_EINVAL;
+    if (cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
+    struct dentry* d = vfs_resolve(kp);
+    if (!d || !d->inode) return -ABI_ENOENT;
+    if (d->inode->type != INODE_DIR) return -ABI_ENOTDIR;
+    t->cred.root = d;
+    t->cred.cwd[0] = 0;
+    return 0;
+}
+
+/* §M90 — unshare(flags).  WHAT IS SEPARATED, honestly:
+ *   CLONE_NEWNS   a new mount namespace id (task->mntns).  Every mount here is
+ *                 already PRIVATE — this kernel has no mount propagation at
+ *                 all — so the propagation changes a runtime makes right after
+ *                 (MS_PRIVATE|MS_REC on "/") are true as asked.  Mounts made
+ *                 inside the new namespace are not yet kept out of the
+ *                 machine's tree (mount() below refuses what it cannot keep).
+ *   CLONE_FS      a task's root and cwd are already its own (cred copy).
+ *   CLONE_FILES   a private copy of a shared descriptor table.
+ *   CLONE_SYSVSEM no System V semaphores exist: nothing to separate.
+ * Any other namespace (PID, NET, UTS, IPC, USER, CGROUP, TIME) is REFUSED with
+ * EINVAL rather than pretended. */
+#define CLONE_NEWNS_   0x00020000ul
+#define CLONE_FS_      0x00000200ul
+#define CLONE_FILES_   0x00000400ul
+#define CLONE_SYSVSEM_ 0x00040000ul
+static int g_next_mntns = 1;
+static long h_unshare(struct abi_ctx* c) {
+    unsigned long fl = c->a[0];
+    unsigned long known = CLONE_NEWNS_ | CLONE_FS_ | CLONE_FILES_ | CLONE_SYSVSEM_;
+    if (fl & ~known) {
+        kprintf("unshare: flags %lx not supported (only NEWNS/FS/FILES/SYSVSEM)\n", fl & ~known);
+        return -ABI_EINVAL;
+    }
+    struct task* t = task_current();
+    if (!t) return -ABI_EINVAL;
+    if (fl & CLONE_NEWNS_) {
+        if (cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
+        t->mntns = __atomic_add_fetch(&g_next_mntns, 1, __ATOMIC_RELAXED);
+    }
+    if (fl & CLONE_FILES_) fd_unshare_table();
+    return 0;
+}
+
+/* §M90 — mount(source, target, fstype, flags, data), the part that is true
+ * today: a PROPAGATION change (MS_PRIVATE / MS_SLAVE / MS_SHARED /
+ * MS_UNBINDABLE, optionally MS_REC) on an existing directory — answered 0,
+ * because there is no propagation here at all and every mount behaves as
+ * private.  Anything that would ATTACH something (bind mounts, proc, tmpfs,
+ * sysfs, …) is refused and NAMED on the console, so the next step of a
+ * container runtime's setup is visible instead of guessed. */
+#define MS_BIND_        0x1000ul
+#define MS_REC_         0x4000ul
+#define MS_PROPAGATION_ (0x20000ul | 0x40000ul | 0x80000ul | 0x100000ul)
+static long h_mount(struct abi_ctx* c) {
+    char tgt[256], fst[32], src[128];
+    if (abi_path(c->a[1], tgt, sizeof tgt) != 0) return -ABI_EFAULT;
+    fst[0] = 0; src[0] = 0;
+    if (c->a[2]) abi_path(c->a[2], fst, sizeof fst);
+    if (c->a[0]) abi_path(c->a[0], src, sizeof src);
+    unsigned long fl = c->a[3];
+    if ((fl & MS_PROPAGATION_) && !(fl & ~(MS_PROPAGATION_ | MS_REC_))) {
+        struct kstat_full k;
+        return sys_stat_full_k(tgt, &k) == 0 ? 0 : -ABI_ENOENT;
+    }
+    /* A directory bound ONTO ITSELF (`mount --rbind d d`): what a runtime does
+     * to make `d` a mount point before chroot/pivot_root.  The tree seen at
+     * `d` afterwards is exactly the tree seen there before, which is all the
+     * request changes here — answered 0. */
+    if ((fl & MS_BIND_) && src[0] && !(fl & ~(MS_BIND_ | MS_REC_ | MS_PROPAGATION_))) {
+        int same = 1;
+        for (unsigned i = 0; same && (src[i] || tgt[i]); i++) if (src[i] != tgt[i]) same = 0;
+        struct kstat_full k;
+        if (same) return sys_stat_full_k(tgt, &k) == 0 ? 0 : -ABI_ENOENT;
+    }
+    kprintf("mount: '%s' on '%s' type '%s' flags %lx - not supported yet\n", src, tgt, fst, fl);
+    return -ABI_EPERM;
+}
+/* §M90 — pivot_root(new_root, put_old).  The calling task's "/" becomes
+ * new_root — §M73's per-task root, as chroot sets it.  Linux also attaches the
+ * OLD root at put_old; this kernel cannot attach a tree twice, so put_old stays
+ * an empty directory — and every runtime follows pivot_root with
+ * umount2(put_old, MNT_DETACH) + rmdir, whose result (the old root
+ * unreachable) is exactly this.  That umount is answered 0 below. */
+static long h_pivot_root(struct abi_ctx* c) {
+    char nr[256], po[256];
+    if (abi_path(c->a[0], nr, sizeof nr) != 0 || abi_path(c->a[1], po, sizeof po) != 0)
+        return -ABI_EFAULT;
+    struct task* t = task_current();
+    if (!t) return -ABI_EINVAL;
+    if (cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
+    struct dentry* d = vfs_resolve(nr);
+    struct dentry* o = vfs_resolve(po);
+    if (!d || !d->inode || !o || !o->inode) return -ABI_ENOENT;
+    if (d->inode->type != INODE_DIR || o->inode->type != INODE_DIR) return -ABI_ENOTDIR;
+    /* put_old must lie at or under new_root */
+    struct dentry* p = o;
+    while (p && p != d && p->parent && p->parent != p) p = p->parent;
+    if (p != d) return -ABI_EINVAL;
+    /* remember put_old's path RELATIVE to the new root, for the umount2 */
+    char rel[96]; rel[0] = 0;
+    {
+        const struct dentry* chain[16]; int n = 0;
+        for (const struct dentry* q = o; q && q != d && n < 16; q = q->parent) chain[n++] = q;
+        unsigned k = 0;
+        for (int i = n - 1; i >= 0; i--) {
+            if (k + 1 < sizeof rel) rel[k++] = '/';
+            for (const char* s = chain[i]->name; *s && k + 1 < sizeof rel; s++) rel[k++] = *s;
+        }
+        rel[k] = 0;
+    }
+    t->cred.root = d;
+    t->cred.cwd[0] = 0;
+    for (unsigned i = 0; i < sizeof t->pivot_old; i++) { t->pivot_old[i] = rel[i]; if (!rel[i]) break; }
+    return 0;
+}
+static long h_umount2(struct abi_ctx* c) {
+    char tgt[256];
+    if (abi_path(c->a[0], tgt, sizeof tgt) != 0) return -ABI_EFAULT;
+    struct task* t = task_current();
+    /* the old root of a pivot_root (see above): "/.pivot_root…", or the same
+     * path relative ("oldroot", "./oldroot") */
+    if (t && t->pivot_old[0]) {
+        const char* a = tgt; const char* b = t->pivot_old;
+        while (a[0] == '.' && a[1] == '/') a += 2;
+        if (*a != '/') b++;                         /* compare without the leading '/' */
+        int same = 1;
+        for (unsigned i = 0; same && (a[i] || b[i]); i++) if (a[i] != b[i]) same = 0;
+        if (same) { t->pivot_old[0] = 0; return 0; }
+    }
+    kprintf("umount2: '%s' flags %lx - not supported yet\n", tgt, c->a[1]);
+    return -ABI_EINVAL;
+}
+
 /* §M90 — flock(fd, op): see core/flock.c. */
 static long h_flock(struct abi_ctx* c) {
     struct ofile* o = fd_lookup((int)c->a[0]);
@@ -2023,6 +2318,22 @@ static const struct {
     [ABI_CHOWN]        = { "chown",        h_chown        },
     [ABI_RENAME]       = { "rename",       h_rename       },
     [ABI_FLOCK]        = { "flock",        h_flock        },
+    [ABI_CHROOT]       = { "chroot",       h_chroot       },
+    [ABI_UNSHARE]      = { "unshare",      h_unshare      },
+    [ABI_MOUNT]        = { "mount",        h_mount        },
+    [ABI_UMOUNT2]      = { "umount2",      h_umount2      },
+    [ABI_PIVOT_ROOT]   = { "pivot_root",   h_pivot_root   },
+    [ABI_FCHMODAT2]    = { "fchmodat2",    h_fchmodat2    },
+    [ABI_UTIMENSAT]    = { "utimensat",    h_utimensat    },
+    [ABI_FCHOWN]       = { "fchown",       h_fchown       },
+    [ABI_XATTR_SET]    = { "setxattr",     h_xattr_set    },
+    [ABI_XATTR_FSET]   = { "fsetxattr",    h_xattr_fset   },
+    [ABI_XATTR_GET]    = { "getxattr",     h_xattr_get    },
+    [ABI_XATTR_FGET]   = { "fgetxattr",    h_xattr_fget   },
+    [ABI_XATTR_LIST]   = { "listxattr",    h_xattr_list   },
+    [ABI_XATTR_FLIST]  = { "flistxattr",   h_xattr_flist  },
+    [ABI_XATTR_REMOVE] = { "removexattr",  h_xattr_set    },
+    [ABI_XATTR_FREMOVE]= { "fremovexattr", h_xattr_fset   },
     [ABI_FSYNC]        = { "fsync",        h_fsync        },
     [ABI_RMDIR]        = { "rmdir",        h_rmdir        },
     [ABI_RENAMEAT]     = { "renameat",     h_renameat     },
@@ -2126,6 +2437,9 @@ static volatile int g_trace;
  * g_trace selects this. */
 static char g_trace_name[16];
 static int  g_trace_all;          /* §M90 — `strace all …`: keep the noisy calls too */
+static int  g_trace_err;          /* §M90 — `strace err …`: only calls that FAILED, one line each
+                                   * (a daemon makes tens of thousands of calls; the
+                                   * one that broke it is the one that returned <0) */
 static int abi_traced(void) {
     int t = g_trace;
     if (!t) return 0;
@@ -2168,10 +2482,26 @@ int abi_dispatch(const struct abi_map* map, unsigned long nr,
     c.a[3] = a3; c.a[4] = a4; c.a[5] = a5;
     c.nr   = nr;
     c.map  = map;
-    if (tr) kprintf("strace[%d] %s(%lx, %lx, %lx, %lx) ...\n", task_current()->pid,
-                    g_ops[op].name ? g_ops[op].name : "?", a0, a1, a2, a3);
+    if (tr && !g_trace_err)
+        kprintf("strace[%d] %s(%lx, %lx, %lx, %lx) ...\n", task_current()->pid,
+                g_ops[op].name ? g_ops[op].name : "?", a0, a1, a2, a3);
     int ran = abi_invoke(op, &c, out);
-    if (tr) kprintf("strace[%d]   = %ld\n", task_current()->pid, ran ? *out : -38L);
+    long res = ran ? *out : -38L;
+    if (tr && !g_trace_err)
+        kprintf("strace[%d]   = %ld\n", task_current()->pid, res);
+    else if (tr && res < 0 && res > -4096) {
+        /* One line, with the first argument read as a path when it is one
+         * the caller could pass (the *at calls carry it in a1). */
+        char pth[96]; pth[0] = 0;
+        unsigned long pa = (op == ABI_OPEN || op == ABI_CHMOD || op == ABI_MKDIR ||
+                            op == ABI_UNLINK || op == ABI_RMDIR || op == ABI_CHOWN) ? a0 :
+                           (op == ABI_OPENAT || op == ABI_MKDIRAT || op == ABI_FCHMODAT ||
+                            op == ABI_UNLINKAT || op == ABI_FCHOWNAT || op == ABI_RENAMEAT ||
+                            op == ABI_RENAMEAT2 || op == ABI_LINKAT) ? a1 : 0;
+        if (pa && copy_str_from_user(pth, (uintptr_t)pa, sizeof pth) < 0) pth[0] = 0;
+        kprintf("strace[%d] %s(%lx, %lx, %lx) = %ld %s\n", task_current()->pid,
+                g_ops[op].name ? g_ops[op].name : "?", a0, a1, a2, res, pth);
+    }
     return ran;
 }
 
@@ -2181,12 +2511,16 @@ static void cmd_strace(const char* args) {
     if (!*a) { kprintf("strace: %s\n", g_trace == 0 ? "off" : g_trace < 0 ? "every container task" : "one pid"); return; }
     if (a[0] == 'c') { g_trace = -1; kprintf("strace: tracing every task in a container\n"); return; }
     if (a[0] == 'o') { g_trace = 0;  kprintf("strace: off\n"); return; }
-    if (a[0] == 'a' && a[1] == 'l') {               /* all <args>: no noise filter */
-        g_trace_all = 1;
+    if (a[0] == 'e' && a[1] == 'r') {               /* err <args>: failures only */
+        g_trace_err = 1; g_trace_all = 0;
+        while (*a && *a != ' ') a++;
+        while (*a == ' ') a++;
+    } else if (a[0] == 'a' && a[1] == 'l') {        /* all <args>: no noise filter */
+        g_trace_all = 1; g_trace_err = 0;
         while (*a && *a != ' ') a++;
         while (*a == ' ') a++;
     } else if (a[0] == 'n' || (a[0] >= '0' && a[0] <= '9')) {
-        g_trace_all = 0;
+        g_trace_all = 0; g_trace_err = 0;
     }
     if (a[0] == 'n') {                               /* name <task name> */
         while (*a && *a != ' ') a++;
