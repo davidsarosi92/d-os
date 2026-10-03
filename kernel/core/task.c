@@ -931,6 +931,7 @@ static struct task* spawn_common_ex(const char* name, void (*entry)(void),
     t->cgroup = cur ? cur->cgroup : NULL;    /* §M90 — a child starts in its parent's cgroup */
     t->mntns  = cur ? cur->mntns  : 0;       /* §M90 — and in its mount namespace */
     t->sid  = cur ? cur->sid  : 0;
+    t->oom_score_adj = cur ? cur->oom_score_adj : 0;   /* §M90 — inherited */
     t->state       = TASK_RUNNABLE;
     /* §M32 — identity, inherited HERE and nowhere else.  Assigning creds from
      * a call site after spawn returns would be assigning them to a task another
@@ -2123,6 +2124,39 @@ int task_cont(int pid) {
     return was ? 0 : 1;                  /* 1 = it was not stopped (request cancelled) */
 }
 
+/* §M90 — who adopts the orphaned children of `dying`: its nearest living
+ * ancestor that asked to be a child subreaper (prctl PR_SET_CHILD_SUBREAPER),
+ * else init.  Linux's rule (find_new_reaper): the search starts at the dying
+ * task's PARENT — a subreaper's own children go to the next one up.  Caller
+ * holds master_lock; the ring is walked by hand because task_find takes it. */
+static struct task* ring_find_locked(int pid) {
+    if (!master_head || pid < 0) return NULL;
+    struct task* c = master_head;
+    do { if (c->pid == pid) return c; c = c->next; } while (c != master_head);
+    return NULL;
+}
+static int adopter_for_locked(const struct task* dying) {
+    int pid = dying->ppid;
+    for (int depth = 0; depth < 64 && pid > 0 && pid != g_init_pid; depth++) {
+        struct task* a = ring_find_locked(pid);
+        if (!a) break;
+        if (a->child_subreaper && a->state != TASK_DEAD) return a->pid;
+        pid = a->ppid;
+    }
+    return g_init_pid;
+}
+/* Hand `c` to `adopter`.  A Linux process forked by a parent that has now
+ * gone was reap-owned only because that parent would wait(2) for it; adopted
+ * by init it must lose the mark, or init's universal sweep (which skips
+ * reap_owned tasks) leaves it a zombie forever.  A subreaper keeps it — it
+ * waits for adopted children as for its own.  A kernel subsystem's owned task
+ * (the service supervisor, a container, a GUI host) keeps its mark whoever
+ * adopts it: its OWNER, not its parent, collects it (§M57). */
+static void adopt_locked(struct task* c, int adopter) {
+    c->ppid = adopter;
+    if (adopter == g_init_pid && c->linux_abi) c->reap_owned = 0;
+}
+
 /* §M74 rung 3 — resume WITHOUT reading evicted pages back first: they return
  * one by one as the program touches them (swap_in_fault).  Kernel-internal —
  * the pressure policy and its tests; `cont` from a person stays eager. */
@@ -2267,13 +2301,15 @@ int task_reap(int pid) {
     /* Unlink from the master ring (circular SLL — walk for the prev). */
     uint32_t fl = spin_lock_irqsave(&master_lock);
 
-    /* M27 — re-parent any surviving children to init before this pid
-     * disappears, so their ppid never dangles on a freed/re-used pid.
-     * (Walk the whole ring; task counts are small.) */
+    /* M27 — re-parent any surviving children before this pid disappears, so
+     * their ppid never dangles on a freed/re-used pid: to the nearest
+     * subreaper ancestor (§M90), else to init.  (Walk the whole ring; task
+     * counts are small.) */
     if (master_head) {
+        int adopter = adopter_for_locked(t);
         struct task* c = master_head;
         do {
-            if (c->ppid == t->pid && c != t) c->ppid = g_init_pid;
+            if (c->ppid == t->pid && c != t) adopt_locked(c, adopter);
             c = c->next;
         } while (c != master_head);
     }
@@ -2764,7 +2800,7 @@ void task_exit_code(int code) {
             do {
                 if (c->ppid == self->pid && c != self && c->state != TASK_DEAD) {
                     if (c->survives_parent) {
-                        c->ppid = g_init_pid;              /* detached: outlives us */
+                        adopt_locked(c, adopter_for_locked(self));   /* detached: outlives us */
                     } else if (nk < KILLTREE_MAX) {
                         kforce[nk] = (char)(c->user_task ? 1 : 0);
                         kids[nk++] = c->pid;
@@ -3475,3 +3511,25 @@ void kmutex_unlock(struct kmutex* m) {
 }
 
 int kmutex_held_by_me(struct kmutex* m) { return m->owner == kmutex_me(); }
+
+/* §M90 — the caller's mount namespace, for the VFS's bind visibility (vfs.c
+ * owns paths and cannot see struct task). */
+int task_mntns_current(void) {
+    struct task* t = task_current();
+    return t ? t->mntns : 0;
+}
+
+/* §M90 — the caller's process id, for /proc/<pid>/… aliasing in vfs.c. */
+/* §M90 — the /proc/<pid> target of the current lookup (vfs.c, procfs.c). */
+void task_set_proc_target(int pid) {
+    struct task* t = task_current();
+    if (t) t->proc_target_pid = pid;
+}
+int task_tgid_alive(int pid) {
+    struct task* t = task_find(pid);
+    return t && t->state != TASK_DEAD;
+}
+int task_tgid_current(void) {
+    struct task* t = task_current();
+    return t ? task_tgid(t) : -1;
+}

@@ -16,7 +16,8 @@
  *   RTM_GETROUTE dump (the connected route of every configured device and
  *                the default route via its gateway — net_route's own table)
  *   RTM_GETNEIGH / GETRULE / GETQDISC dumps: empty (DONE)
- *   RTM_SETLINK  that only asks a device to be UP: acknowledged (they are)
+ *   RTM_SETLINK / RTM_NEWLINK without NLM_F_CREATE that only ask an existing
+ *                device to be UP: acknowledged (they are)
  * Everything else that would CHANGE the configuration (new links, addresses,
  * routes — a bridge, a veth pair) is refused with EOPNOTSUPP and named in the
  * answer, not acknowledged: pretending a veth was made would fail later, far
@@ -37,6 +38,7 @@
 #include "waitq.h"
 #include "task.h"
 #include "fd.h"
+#include "printf.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -280,11 +282,31 @@ static void handle(struct nlsock* s, const uint8_t* m, uint32_t len, struct nlb*
         }
         put_done(b, seq, pid);
         return;
+    case RTM_NEWLINK:
     case RTM_SETLINK: {
-        /* Accepted only when it asks for nothing beyond "up": the devices are. */
+        /* "Bring an EXISTING device up" is accepted under either spelling:
+         * vishvananda/netlink's LinkSetUp — what libnetwork uses to raise "lo"
+         * in every sandbox, the host's default one included — sends it as
+         * RTM_NEWLINK with Change = Flags = IFF_UP and no attributes, while
+         * ip(8) sends RTM_SETLINK.  Neither creates anything without
+         * NLM_F_CREATE, and every device here is already up, so the request is
+         * true as asked.  The device must exist (ENODEV, as on Linux).
+         * Anything more — creating a link (a bridge, a veth pair), renaming,
+         * an MTU, taking a device DOWN — is still refused and NAMED. */
+        uint32_t idx = len >= 32 ? r32(m + 20) : 0;
         uint32_t want_flags = len >= 32 ? r32(m + 24) : 0, change = len >= 32 ? r32(m + 28) : 0;
-        int only_up = (len <= 32) && ((change & ~0x1u) == 0) && (!change || (want_flags & 0x1));
-        put_error(b, only_up ? 0 : -95 /* EOPNOTSUPP */, m, pid);
+        int creates = (type == RTM_NEWLINK) && (flags & (0x400 /* CREATE */ | 0x200 /* EXCL */));
+        int only_up = !creates && (len <= 32) && ((change & ~0x1u) == 0) &&
+                      (!change || (want_flags & 0x1));
+        if (!only_up) {
+            kprintf("netlink: %s (index %u, change %x, flags %x, %u attribute bytes) refused - "
+                    "link configuration is M90 rung 5\n",
+                    type == RTM_NEWLINK ? "RTM_NEWLINK" : "RTM_SETLINK", idx, change, want_flags,
+                    len > 32 ? len - 32 : 0);
+            put_error(b, -95 /* EOPNOTSUPP */, m, pid);
+            return;
+        }
+        put_error(b, (idx >= 1 && (int)idx <= l.n) ? 0 : -19 /* ENODEV */, m, pid);
         return;
     }
     default:
@@ -292,6 +314,8 @@ static void handle(struct nlsock* s, const uint8_t* m, uint32_t len, struct nlb*
             put_done(b, seq, pid);
             return;
         }
+        kprintf("netlink: message type %u (flags %x) refused - no configuration changes yet\n",
+                type, flags);
         put_error(b, -95 /* EOPNOTSUPP: no configuration changes yet */, m, pid);
         return;
     }
@@ -449,10 +473,26 @@ static void cmd_nltest(const char* args) {
     kprintf("nltest: GETROUTE dump: %d route(s), default %d (want %d)\n", routes, deflt, want_def);
     if (deflt != want_def || routes < want) ok = 0;
 
-    n = nlt_ask(s, RTM_NEWLINK, F_ACK, 0, rx, NL_DGRAM);
+    n = nlt_ask(s, RTM_NEWLINK, F_ACK | 0x400 /* CREATE */, 0, rx, NL_DGRAM);
     int err = (n >= 20 && r16(rx + 4) == NLMSG_ERROR) ? (int)r32(rx + 16) : 0;
-    kprintf("nltest: NEWLINK (a configuration change) -> error %d (want -95)\n", err);
+    kprintf("nltest: NEWLINK|CREATE (a configuration change) -> error %d (want -95)\n", err);
     if (err != -95) ok = 0;
+
+    /* LinkSetUp's shape: RTM_NEWLINK, index 1, Change = Flags = IFF_UP. */
+    {
+        uint8_t req[32];
+        for (int i = 0; i < 32; i++) req[i] = 0;
+        w32(req, 32); w16(req + 4, RTM_NEWLINK); w16(req + 6, 1 | F_ACK); w32(req + 8, 78);
+        w32(req + 20, 1); w32(req + 24, 1); w32(req + 28, 1);
+        n = (nl_send(s, req, 32) == 32) ? (int)nl_recv(s, rx, NL_DGRAM, 0, 0, 0) : -1;
+        int up = (n >= 20 && r16(rx + 4) == NLMSG_ERROR) ? (int)r32(rx + 16) : -999;
+        w32(req + 20, 999);
+        n = (nl_send(s, req, 32) == 32) ? (int)nl_recv(s, rx, NL_DGRAM, 0, 0, 0) : -1;
+        int nodev = (n >= 20 && r16(rx + 4) == NLMSG_ERROR) ? (int)r32(rx + 16) : -999;
+        kprintf("nltest: NEWLINK up on index 1 -> %d (want 0), on index 999 -> %d (want -19)\n",
+                up, nodev);
+        if (up != 0 || nodev != -19) ok = 0;
+    }
 
     kfree(rx);
     nl_close(s);

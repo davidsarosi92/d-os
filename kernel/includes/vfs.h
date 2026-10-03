@@ -62,6 +62,7 @@ enum inode_type {
     INODE_DIR,
     INODE_DEVICE,
     INODE_SYMLINK,      /* §M89 — its content is the target path */
+    INODE_FIFO,         /* §M90 — a named pipe: opening it joins inode->fifo */
 };
 
 /* Open flags.  Mirror the lower bits of POSIX O_* but we own the values. */
@@ -101,6 +102,12 @@ struct file_ops {
     ssize_t (*write)  (struct file*, const void* buf, size_t n, uint64_t off);
     int     (*readdir)(struct file*, struct dirent* out);
     int     (*close)  (struct file*);
+    /* §M90 — OPTIONAL, APPENDED.  Called once after a successful open,
+     * outside the namespace lock, in the opening task.  procfs generates the
+     * file's content here — at open, as Linux does for most of /proc — so a
+     * read sees the state of the process the PATH named, whichever thread
+     * later reads it. */
+    int     (*open)   (struct file*);
 };
 
 /* Directory-inode operations: namespace mutators + lazy lookup.
@@ -205,6 +212,10 @@ struct inode {
     int           opens;
     struct inode* unlink_dir;               /* non-NULL: unlinked, removal pending */
     char*         unlink_name;
+    /* §M90 — APPENDED.  INODE_FIFO: the pipe every open of this inode shares
+     * (fifo.c), NULL while nobody has it open.  Valid while any open holds the
+     * inode, which every FIFO end does through its VFS open. */
+    struct fifo*  fifo;
 };
 
 /* §M90 — a directory whose filesystem decides whether it may be removed while
@@ -222,6 +233,14 @@ struct dentry {
     struct dentry*  parent;
     struct dentry*  children;               /* first child */
     struct dentry*  sibling;                /* next sibling under same parent */
+    /* §M90 — APPENDED.  A BIND MOUNT is a redirect on its target: a walk
+     * that arrives here continues at `bound` instead, when the walking task
+     * can see the bind (vfs_bind: made in mount namespace `bound_ns`, as the
+     * `bound_seq`-th bind).  The target keeps its own inode and children, so
+     * an unmount restores exactly what was there. */
+    struct dentry*  bound;
+    int             bound_ns;
+    unsigned        bound_seq;
 };
 
 /* Open file handle — per-call-to-open instance state. */
@@ -330,6 +349,11 @@ int  vfs_link(const char* oldpath, const char* newpath);   /* §M73 — a hard l
  * /proc/self/exe must report for a program started through a link, or a JDK
  * started as /bin/java looks for its libraries under /bin/../lib). */
 int  vfs_symlink(const char* target, const char* linkpath);
+/* §M90 — a named pipe at `path` (mknod S_IFIFO / mkfifo).  Only on a
+ * filesystem that keeps it in memory: on a persistent one the node would come
+ * back after a reboot as an empty regular file, so it is refused (-3).
+ * 0; -1 no parent, -2 exists, -3 unsupported here, -5 not permitted. */
+int  vfs_mkfifo(const char* path);
 int  vfs_readlink(const char* path, char* out, size_t cap);   /* bytes, or <0 */
 int  vfs_realpath(const char* path, char* out, size_t cap);
 int  vfs_create(const char* path);          /* zero-byte regular file */
@@ -426,6 +450,26 @@ struct vfs_mount {
  *  -4   held by a subsystem (vfs_mount_at(i)->hold names it)
  *  -5   the filesystem cannot be unmounted (no umount op) or refused */
 int  vfs_umount(const char* path);
+
+/* §M90 — bind mounts and mount namespaces.
+ *
+ * vfs_bind(src, tgt): make `tgt` show what `src` shows — a file or a
+ * directory, any filesystem (a /proc namespace handle pinned onto a file is
+ * how dockerd keeps a network namespace; runc builds a container's /etc from
+ * file binds).  Made in the CALLER's mount namespace, and seen there and in
+ * every namespace created from it AFTERWARDS (Linux's copy-at-unshare,
+ * without copying a table).  0, -1 not found, -2 already bound, -3 the kinds
+ * differ (a directory onto a file or the reverse), -4 out of slots.
+ * vfs_unbind(tgt): 0, or -1 when `tgt` is not a bind visible to the caller.
+ * vfs_mntns_new(parent): a fresh mount namespace id (unshare(CLONE_NEWNS)),
+ * or -1 when the table is full. */
+int  vfs_canonical_link(const char* path, char* out, size_t cap);
+int  vfs_bind(const char* src, const char* tgt);
+int  vfs_unbind(const char* tgt);
+int  vfs_mntns_new(int parent);
+/* One line per bind visible to the caller ("src tgt"), for /proc/self/mountinfo. */
+int  vfs_bind_count(void);
+int  vfs_bind_nth(int i, char* src, size_t scap, char* tgt, size_t tcap);
 
 /* Unlink `name` from `parent` without freeing anything (see vfs.c); returns
  * its inode, or NULL. */

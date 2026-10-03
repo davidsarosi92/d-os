@@ -93,6 +93,7 @@ static void abi_at_end(struct abi_at* a) {
         struct abi_at _at; long _r = abi_at_begin((int)(dirfd), &_at);  \
         if (_r == 0) { _r = (expr); abi_at_end(&_at); }                 \
         _r; })
+static int abi_path(unsigned long up, char* k, unsigned cap);
 static long lnx_err(int r) {
     if (r >= 0) return r;
     if (r == -2) return -17;             /* EEXIST */
@@ -100,11 +101,47 @@ static long lnx_err(int r) {
     return -2;                           /* ENOENT */
 }
 static int abi_fd_magic(char* k, unsigned cap);
+unsigned long procfs_ns_ino(const char* kind);   /* procfs.c */
 static long h_mkdir(struct abi_ctx* c)   { return lnx_err(sys_mkdir((const char*)c->a[0], (int)c->a[1])); }
 static long h_mkdirat(struct abi_ctx* c) {
     return AT_WRAP(c->a[0], lnx_err(sys_mkdir((const char*)c->a[1], (int)c->a[2])));
 }
 static long h_link(struct abi_ctx* c)    { return lnx_err(sys_link((const char*)c->a[0], (const char*)c->a[1])); }
+
+/* §M90 — mknod(path, mode, dev) / mknodat(dirfd, …).  What it can make here,
+ * honestly:
+ *   S_IFIFO          a named pipe (vfs_mkfifo; memory-backed filesystems
+ *                    only — EPERM on a volume that could not keep it)
+ *   S_IFREG or 0     an empty regular file
+ *   S_IFCHR/S_IFBLK  REFUSED with EPERM and named: device nodes are devfs's,
+ *                    and a node pointing at a device number nothing here
+ *                    resolves would be a file that lies about what it is
+ *   S_IFSOCK         refused likewise (a socket's name is made by bind)
+ * The permission bits honour the caller's umask, as mkdir's do. */
+static long abi_mknod(unsigned long upath, unsigned long mode) {
+    char kp[256];
+    if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
+    unsigned fmt = (unsigned)mode & 0170000u;
+    struct task* t = task_current();
+    unsigned um = (t && t->cred.umask_plus1) ? (unsigned)t->cred.umask_plus1 - 1 : 022u;
+    unsigned perm = (unsigned)mode & 07777u & ~um;
+    int r;
+    if (fmt == 0010000u)                  r = vfs_mkfifo(kp);
+    else if (fmt == 0 || fmt == 0100000u) r = vfs_create(kp);
+    else {
+        kprintf("mknod: '%s' type %o refused - device/socket nodes are not made by mknod here\n",
+                kp, fmt);
+        return -1;                                             /* EPERM */
+    }
+    if (r == -2) return -17;                                   /* EEXIST */
+    if (r == -3) return -1;                                    /* EPERM: not on this fs */
+    if (r == -5) return -13;                                   /* EACCES */
+    if (r != 0)  return -2;                                    /* ENOENT */
+    vfs_chmod(kp, perm);
+    return 0;
+}
+static long h_mknod(struct abi_ctx* c)   { return abi_mknod(c->a[0], c->a[1]); }
+static long h_mknodat(struct abi_ctx* c) { return AT_WRAP(c->a[0], abi_mknod(c->a[1], c->a[2])); }
 /* §M90 — a guest path made absolute against a directory descriptor, for the
  * calls that take TWO (linkat): the at_dir override in AT_WRAP serves one.
  * A relative path with AT_FDCWD is left relative — the VFS joins the working
@@ -227,6 +264,19 @@ static long h_fchown(struct abi_ctx* c) {
     char kp[256];
     if (sys_fd_path((int)c->a[0], kp, sizeof kp) != 0) return -9;   /* EBADF */
     return chown_err(vfs_chown(kp[0] ? kp : "/", (int)c->a[1], (int)c->a[2]));
+}
+/* §M90 — fchmod(fd, mode): the mode of the file behind a descriptor, through
+ * its path (as fchown).  It was missing on every guest — Go's os.WriteFile
+ * into a temp file and Chmod on it is how containerd's shim writes its
+ * bootstrap.json, and the start failed there. */
+static long h_fchmod(struct abi_ctx* c) {
+    char kp[256];
+    if (sys_fd_path((int)c->a[0], kp, sizeof kp) != 0) return -9;   /* EBADF */
+    int r = vfs_chmod(kp[0] ? kp : "/", (uint32_t)c->a[1] & 07777u);
+    if (r == 0)  return 0;
+    if (r == -2) return -1;                  /* EPERM: not the owner      */
+    if (r == -3) return -5;                  /* EIO: the volume refused   */
+    return -2;                               /* ENOENT */
 }
 static long h_fchownat(struct abi_ctx* c) {
     if (c->a[4] & 0x1000) return -38;    /* AT_EMPTY_PATH: chown of an fd */
@@ -363,6 +413,7 @@ static long abi_unlink_kind(unsigned long upath, int want_dir) {
     if (r >= 0) return 0;
     if (r == -2) return -39;                             /* ENOTEMPTY */
     if (r == -5) return -13;                             /* EACCES */
+    if (r == -6) return -16;                             /* EBUSY: a bind's target */
     return -ABI_ENOENT;
 }
 static long h_unlink(struct abi_ctx* c)  { return abi_unlink_kind(c->a[0], 0); }
@@ -404,9 +455,13 @@ static long abi_open_common(struct abi_ctx* c, unsigned long upath, unsigned lon
         if (sys_stat_full_k(kp, &st) != 0) return -ABI_ENOENT;
         if ((st.mode & KS_IFMT) != KS_IFDIR) return -ABI_ENOTDIR;
     }
-    /* §M90 — from the kernel copy: it may have been rewritten (/proc/self/fd). */
-    long r = sys_open_k(kp, abi_open_flags(flags));
-    return r < 0 ? -ABI_ENOENT : abi_cx(r, flags);
+    /* §M90 — from the kernel copy: it may have been rewritten (/proc/self/fd).
+     * O_NONBLOCK (04000) and O_PATH (010000000) have the same bits on every
+     * guest we speak; both matter to a FIFO (whether open waits for the other
+     * end; whether it is an end at all), and O_NONBLOCK to every later read. */
+    long r = sys_open_ex_k(kp, abi_open_flags(flags), (flags & 04000u) != 0,
+                           (flags & 010000000u) != 0);
+    return r < 0 ? r : abi_cx(r, flags);
 }
 static long h_open(struct abi_ctx* c)   { return abi_open_common(c, c->a[0], c->a[1]); }
 static long h_openat(struct abi_ctx* c) {
@@ -548,12 +603,28 @@ static long abi_readlink_path(unsigned long upath, unsigned long ubuf, unsigned 
         /* Canonical first: Go opens "/proc/self/fd" as a directory and
          * reads "22" relative to it, which the raw argument never shows. */
         char m[256];
-        if (vfs_canonical(kp, m, sizeof m) != 0) {
+        if (vfs_canonical_link(kp, m, sizeof m) != 0) {
             unsigned i = 0;
             for (; kp[i] && i < sizeof m - 1; i++) m[i] = kp[i];
             m[i] = 0;
         }
-        if (abi_fd_magic(m, sizeof m)) {
+        /* §M90 — a namespace handle reads as "<kind>:[<inode>]". */
+        {
+            const char* pre = "/proc/self/ns/";
+            unsigned i = 0;
+            while (pre[i] && m[i] == pre[i]) i++;
+            unsigned long ino = pre[i] ? 0 : procfs_ns_ino(m + i);
+            if (ino) {
+                n = 0;
+                for (const char* q = m + i; *q && n < 32; q++) tgt[n++] = *q;
+                tgt[n++] = ':'; tgt[n++] = '[';
+                char dg[12]; int nd = 0;
+                do { dg[nd++] = (char)('0' + ino % 10); ino /= 10; } while (ino);
+                while (nd) tgt[n++] = dg[--nd];
+                tgt[n++] = ']'; tgt[n] = 0;
+            }
+        }
+        if (n == -1 && abi_fd_magic(m, sizeof m)) {
             n = 0;
             while ((unsigned)n + 1 < sizeof tgt && m[n]) { tgt[n] = m[n]; n++; }
             tgt[n] = 0;
@@ -641,7 +712,6 @@ static long h_chroot(struct abi_ctx* c) {
 #define CLONE_FS_      0x00000200ul
 #define CLONE_FILES_   0x00000400ul
 #define CLONE_SYSVSEM_ 0x00040000ul
-static int g_next_mntns = 1;
 static long h_unshare(struct abi_ctx* c) {
     unsigned long fl = c->a[0];
     unsigned long known = CLONE_NEWNS_ | CLONE_FS_ | CLONE_FILES_ | CLONE_SYSVSEM_;
@@ -653,7 +723,9 @@ static long h_unshare(struct abi_ctx* c) {
     if (!t) return -ABI_EINVAL;
     if (fl & CLONE_NEWNS_) {
         if (cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
-        t->mntns = __atomic_add_fetch(&g_next_mntns, 1, __ATOMIC_RELAXED);
+        int ns = vfs_mntns_new(t->mntns);
+        if (ns < 0) return -12;                          /* ENOMEM: the table is full */
+        t->mntns = ns;
     }
     if (fl & CLONE_FILES_) fd_unshare_table();
     return 0;
@@ -666,11 +738,12 @@ static long h_unshare(struct abi_ctx* c) {
  * private.  Anything that would ATTACH something (bind mounts, proc, tmpfs,
  * sysfs, …) is refused and NAMED on the console, so the next step of a
  * container runtime's setup is visible instead of guessed. */
+#define MS_REMOUNT_     0x20ul
 #define MS_BIND_        0x1000ul
 #define MS_REC_         0x4000ul
 #define MS_PROPAGATION_ (0x20000ul | 0x40000ul | 0x80000ul | 0x100000ul)
 static long h_mount(struct abi_ctx* c) {
-    char tgt[256], fst[32], src[128];
+    char tgt[256], fst[32], src[256];
     if (abi_path(c->a[1], tgt, sizeof tgt) != 0) return -ABI_EFAULT;
     fst[0] = 0; src[0] = 0;
     if (c->a[2]) abi_path(c->a[2], fst, sizeof fst);
@@ -690,6 +763,17 @@ static long h_mount(struct abi_ctx* c) {
         struct kstat_full k;
         if (same) return sys_stat_full_k(tgt, &k) == 0 ? 0 : -ABI_ENOENT;
     }
+    /* §M90 — a real bind (vfs_bind): a file or a directory shown at another
+     * path, in this task's mount namespace.  MS_REC changes nothing here — a
+     * bind already carries everything below its source. */
+    if ((fl & MS_BIND_) && !(fl & MS_REMOUNT_) && src[0]) {
+        int r = vfs_bind(src, tgt);
+        if (r == 0) return 0;
+        if (r == -1) return -ABI_ENOENT;
+        if (r == -2) return -16;                         /* EBUSY  */
+        if (r == -3) return -ABI_ENOTDIR;
+        return -12;                                      /* ENOMEM */
+    }
     kprintf("mount: '%s' on '%s' type '%s' flags %lx - not supported yet\n", src, tgt, fst, fl);
     return -ABI_EPERM;
 }
@@ -699,6 +783,38 @@ static long h_mount(struct abi_ctx* c) {
  * an empty directory — and every runtime follows pivot_root with
  * umount2(put_old, MNT_DETACH) + rmdir, whose result (the old root
  * unreachable) is exactly this.  That umount is answered 0 below. */
+/* §M90 — setns(fd, nstype): join the namespace a /proc/<…>/ns handle names.
+ * Every kind but mount has exactly ONE namespace on this machine, which the
+ * caller is already in — so joining it is true as asked (0), after checking
+ * the descriptor really is a handle and `nstype` (0 = any) matches it.  A
+ * MOUNT handle names a namespace this file cannot recover from the descriptor
+ * (the handle is a shared /proc file, not a reference), so joining one is
+ * refused rather than guessed. */
+static long h_setns(struct abi_ctx* c) {
+    char p[96];
+    if (sys_fd_path((int)c->a[0], p, sizeof p) != 0) return -9;           /* EBADF */
+    const char* pre = "/proc/self/ns/";
+    unsigned i = 0;
+    while (pre[i] && p[i] == pre[i]) i++;
+    if (pre[i]) return -ABI_EINVAL;                                       /* not a handle */
+    static const struct { const char* k; unsigned long flag; } kinds[] = {
+        { "net", 0x40000000ul }, { "mnt", 0x00020000ul }, { "pid", 0x20000000ul },
+        { "uts", 0x04000000ul }, { "ipc", 0x08000000ul }, { "cgroup", 0x02000000ul },
+        { "user", 0x10000000ul }, { "time", 0x00000080ul },
+    };
+    for (unsigned k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {
+        const char* a = kinds[k].k; const char* b = p + i;
+        while (*a && *a == *b) { a++; b++; }
+        if (*a || *b) continue;
+        if (c->a[1] && c->a[1] != kinds[k].flag) return -ABI_EINVAL;
+        if (kinds[k].flag == 0x00020000ul) {
+            kprintf("setns: joining a mount namespace by handle is not supported yet\n");
+            return -ABI_EINVAL;
+        }
+        return 0;
+    }
+    return -ABI_EINVAL;
+}
 static long h_pivot_root(struct abi_ctx* c) {
     char nr[256], po[256];
     if (abi_path(c->a[0], nr, sizeof nr) != 0 || abi_path(c->a[1], po, sizeof po) != 0)
@@ -745,7 +861,9 @@ static long h_umount2(struct abi_ctx* c) {
         for (unsigned i = 0; same && (a[i] || b[i]); i++) if (a[i] != b[i]) same = 0;
         if (same) { t->pivot_old[0] = 0; return 0; }
     }
-    kprintf("umount2: '%s' flags %lx - not supported yet\n", tgt, c->a[1]);
+    if (vfs_unbind(tgt) == 0) return 0;                  /* §M90 — a bind */
+    /* Linux answers EINVAL for "not a mount point" — what every runtime's
+     * defensive unmount of a path that was never mounted receives. */
     return -ABI_EINVAL;
 }
 
@@ -841,7 +959,7 @@ static long h_getcwd(struct abi_ctx* c) {
     return (long)(n + 1);                               /* bytes, NUL included */
 }
 static long h_chdir(struct abi_ctx* c) {
-    char kp[256], canon[96];
+    char kp[256], canon[256];
     if (abi_path(c->a[0], kp, sizeof kp) != 0) return -ABI_EFAULT;
     if (vfs_canonical(kp, canon, sizeof canon) != 0) return -36;       /* ENAMETOOLONG */
     struct kstat_full st;
@@ -988,6 +1106,10 @@ static long h_setsid(struct abi_ctx* c) {
     if (!t) return -1;
     if (t->pgid == t->pid) return -1;    /* EPERM: already a group leader */
     t->sid = t->pgid = t->pid;
+    /* §M90 — a new session is how a Linux program DETACHES (daemon(3),
+     * setsid(1)): it outlives its parent instead of dying with it (task.c's
+     * "a parent takes its subtree down" rule), adopted by a subreaper or init. */
+    t->survives_parent = 1;
     return t->pid;
 }
 static long h_getsid(struct abi_ctx* c) {
@@ -1014,6 +1136,12 @@ static long h_setpgid(struct abi_ctx* c) {
     if (t->sid == t->pid) return -1;                     /* EPERM: session leader */
     int pg = (int)c->a[1] ? (int)c->a[1] : t->pid;
     t->pgid = (pg == 1) ? 0 : pg;
+    /* §M90 — becoming the leader of a NEW process group (setpgid(0, 0), Go's
+     * SysProcAttr.Setpgid) is the other way a Linux program detaches from the
+     * job it was started in: containerd starts its shim daemon so, and the
+     * launcher (`containerd-shim-runc-v2 start`) exits right after — the
+     * daemon must not be taken down with it. */
+    if (pg == t->pid) t->survives_parent = 1;
     return 0;
 }
 
@@ -1734,6 +1862,15 @@ static long h_prctl(struct abi_ctx* c) {
         *(int32_t*)(uintptr_t)c->a[1] = t->pdeathsig;
         return 0;
     }
+    if (opt == 36) {                                      /* PR_SET_CHILD_SUBREAPER */
+        t->child_subreaper = c->a[1] ? 1 : 0;
+        return 0;
+    }
+    if (opt == 37) {                                      /* PR_GET_CHILD_SUBREAPER */
+        if (!abi_w_ok(c->a[1], 4)) return -ABI_EFAULT;
+        *(int32_t*)(uintptr_t)c->a[1] = t->child_subreaper;
+        return 0;
+    }
     if (opt == 3) return 1;                               /* PR_GET_DUMPABLE */
     if (opt == 4) return 0;                               /* PR_SET_DUMPABLE */
     return -ABI_EINVAL;
@@ -2311,6 +2448,9 @@ static const struct {
     [ABI_GETSOCKOPT]   = { "getsockopt",   h_getsockopt   },
     [ABI_MKDIR]        = { "mkdir",        h_mkdir        },
     [ABI_MKDIRAT]      = { "mkdirat",      h_mkdirat      },
+    [ABI_MKNOD]        = { "mknod",        h_mknod        },   /* §M90 */
+    [ABI_FCHMOD]       = { "fchmod",       h_fchmod       },   /* §M90 */
+    [ABI_MKNODAT]      = { "mknodat",      h_mknodat      },   /* §M90 */
     [ABI_LINK]         = { "link",         h_link         },
     [ABI_LINKAT]       = { "linkat",       h_linkat       },
     [ABI_CHMOD]        = { "chmod",        h_chmod        },
@@ -2326,6 +2466,7 @@ static const struct {
     [ABI_FCHMODAT2]    = { "fchmodat2",    h_fchmodat2    },
     [ABI_UTIMENSAT]    = { "utimensat",    h_utimensat    },
     [ABI_FCHOWN]       = { "fchown",       h_fchown       },
+    [ABI_SETNS]        = { "setns",        h_setns        },
     [ABI_XATTR_SET]    = { "setxattr",     h_xattr_set    },
     [ABI_XATTR_FSET]   = { "fsetxattr",    h_xattr_fset   },
     [ABI_XATTR_GET]    = { "getxattr",     h_xattr_get    },

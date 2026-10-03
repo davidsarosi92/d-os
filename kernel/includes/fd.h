@@ -28,7 +28,7 @@ struct usock;                   /* unix socket endpoint (stage 5)          */
  * dup of an empty std slot yields an FD_CONSOLE ofile, which reads and writes
  * exactly as the empty slot would. */
 enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER, FD_EPOLL, FD_CONSOLE, FD_EVENT,
-               FD_NETLINK /* §M90 */ };
+               FD_NETLINK /* §M90 */, FD_FIFO /* §M90 — a named pipe end, fifo.c */ };
 
 struct netsock;                 /* network (AF_INET) socket — usyscall.c        */
 struct timerfd;                 /* §M53 stage 3 — a deadline behind a descriptor */
@@ -59,6 +59,14 @@ struct ofile {
     struct epoll* ep;           /* FD_EPOLL (§M56)         */
     struct eventfd* efd;        /* FD_EVENT (§M90)         */
     struct nlsock* nl;          /* FD_NETLINK (§M90)       */
+    /* §M90 — APPENDED.  FD_FIFO: `file` is the VFS open of the FIFO's inode
+     * (path, fstat, the hold that defers an unlink) and `fifo` the inode's
+     * shared pipe this description is attached to, as FIFO_R and/or FIFO_W.
+     * `fifo_wseen` is the writer generation this open has seen — POLLHUP
+     * waits for a writer that came after it (fifo.c). */
+    struct fifo*   fifo;
+    unsigned       fifo_role;
+    uint32_t       fifo_wseen;
 };
 
 /* Wrap a resource in a fresh ofile (refcount 1), or NULL on OOM. */

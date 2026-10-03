@@ -106,7 +106,61 @@ static void pw_put_uptime(struct procfs_writer* w, uint64_t total_ms) {
 struct file_state {
     char*  content;
     size_t size;
+    int    pid;                     /* §M90 — the process the path named, 0 = opener */
 };
+
+/* §M90 — see procfs.h.  The target is recorded on the opening task by the
+ * path lookup (vfs_proc_alias) and consumed at open, in the same call. */
+struct task* procfs_target(void) {
+    struct task* t = task_current();
+    if (t && t->proc_target_pid > 0) {
+        struct task* x = task_find(t->proc_target_pid);
+        if (x) return x;
+    }
+    return t;
+}
+
+/* Generate the node's content into a fresh state for `f`. */
+static struct file_state* procfs_generate(struct file* f, struct procfs_node* node) {
+    struct procfs_writer w = { 0 };
+    if (node->gen) node->gen(&w);
+    struct file_state* st = (struct file_state*)kcalloc(1, sizeof(*st));
+    if (!st) { if (w.buf) kfree(w.buf); return NULL; }
+    st->content = w.buf;
+    st->size    = w.len;
+    struct task* cur = task_current();
+    st->pid = (cur && cur->proc_target_pid > 0) ? cur->proc_target_pid : 0;
+    f->private  = st;
+    f->inode->size = st->size;                  /* update for stat */
+    return st;
+}
+
+/* §M90 — content at OPEN (procfs.h always said so; it used to be the first
+ * read): the target recorded by this open's lookup is consumed here and
+ * cleared, so it can never leak into a later open. */
+static int procfs_open(struct file* f) {
+    struct task* cur = task_current();
+    if (f && f->inode && f->inode->private && !f->private)
+        procfs_generate(f, (struct procfs_node*)f->inode->private);
+    if (cur) cur->proc_target_pid = 0;
+    return 0;
+}
+
+/* §M90 — a write to a writable node (oom_score_adj).  Only the process
+ * itself or an administrator may change another process's value. */
+static ssize_t procfs_write(struct file* f, const void* buf, size_t n, uint64_t off) {
+    (void)off;
+    if (!f || !f->inode) return -1;
+    struct procfs_node* node = (struct procfs_node*)f->inode->private;
+    if (!node || !node->write) return -1;
+    struct file_state* st = (struct file_state*)f->private;
+    struct task* cur = task_current();
+    struct task* t = (st && st->pid > 0) ? task_find(st->pid) : cur;
+    if (!t || !cur) return -1;
+    if (task_tgid(t) != task_tgid(cur) && !cred_is_admin(&cur->cred) && cred_uid(&cur->cred) != 0)
+        return -1;
+    return (ssize_t)node->write(t, (const char*)buf, n);
+}
 
 /* file_ops signature after the M12 VFS refactor: explicit byte offset.
  * The generated buffer is keyed to the open file handle (cached in
@@ -117,22 +171,9 @@ static ssize_t procfs_read(struct file* f, void* buf, size_t n, uint64_t off) {
     struct procfs_node* node = (struct procfs_node*)f->inode->private;
     if (!node) return -1;
 
-    /* First read of this open instance — generate content into a fresh
-     * writer and stash for subsequent slices. */
-    if (!f->private) {
-        struct procfs_writer w = { 0 };
-        if (node->gen) node->gen(&w);
-
-        struct file_state* st = (struct file_state*)kcalloc(1, sizeof(*st));
-        if (!st) {
-            if (w.buf) kfree(w.buf);
-            return -1;
-        }
-        st->content = w.buf;
-        st->size    = w.len;
-        f->private  = st;
-        f->inode->size = st->size;              /* update for stat */
-    }
+    /* Normally generated at open (procfs_open); a file opened some other
+     * way generates on its first read. */
+    if (!f->private && !procfs_generate(f, node)) return -1;
 
     struct file_state* st = (struct file_state*)f->private;
     if (!st->content || off >= st->size) return 0;          /* EOF */
@@ -156,9 +197,10 @@ static int procfs_close(struct file* f) {
 
 static const struct file_ops procfs_file_ops = {
     .read    = procfs_read,
-    .write   = NULL,                            /* read-only for now */
+    .write   = procfs_write,                    /* §M90 — writable nodes only */
     .readdir = NULL,
     .close   = procfs_close,
+    .open    = procfs_open,                     /* §M90 — generate at open */
 };
 
 /* ---------------------------------------------------------------------- */
@@ -584,7 +626,7 @@ static void gen_mounts(struct procfs_writer* w)    { gen_mounts_common(w, 0); }
  * line runc, containerd and dockerd read to find the cgroup they run in. */
 static void gen_selfcgroup(struct procfs_writer* w) {
     char path[256];
-    cgroup_path_of(task_current(), path, sizeof path);
+    cgroup_path_of(procfs_target(), path, sizeof path);
     pw_puts(w, "0::"); pw_puts(w, path); pw_putc(w, '\n');
 }
 static struct procfs_node nd_selfcgroup = { .name = "self/cgroup",    .gen = gen_selfcgroup };
@@ -601,7 +643,7 @@ static void st_count_fn(const struct task* t, int is_current, void* ctx) {
     if (t->state != TASK_DEAD && task_tgid(t) == c->tgid) c->threads++;
 }
 static void gen_selfstatus(struct procfs_writer* w) {
-    struct task* t = task_current();
+    struct task* t = procfs_target();
     if (!t) return;
     int uid = cred_uid(&t->cred);
     if (uid < 0) uid = 0;
@@ -625,8 +667,87 @@ static void gen_selfstatus(struct procfs_writer* w) {
     pw_puts(w, "\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\n");
 }
 static struct procfs_node nd_selfstatus = { .name = "self/status", .gen = gen_selfstatus };
+
+/* §M90 — /proc/<pid>/oom_score_adj (-1000..1000, read and written by
+ * containerd, its shim and runc) and oom_score (what an OOM killer would rank
+ * by: there is none — §M72 refuses allocations instead — so 0).  See
+ * task.h's oom_score_adj. */
+static void gen_oomadj(struct procfs_writer* w) {
+    struct task* t = procfs_target();
+    int v = t ? t->oom_score_adj : 0;
+    if (v < 0) { pw_putc(w, '-'); v = -v; }
+    pw_put_uint(w, (unsigned)v); pw_putc(w, '\n');
+}
+static long write_oomadj(struct task* t, const char* buf, size_t n) {
+    long v = 0; int neg = 0; size_t i = 0, d = 0;
+    while (i < n && (buf[i] == ' ' || buf[i] == '\t')) i++;
+    if (i < n && (buf[i] == '-' || buf[i] == '+')) { neg = buf[i] == '-'; i++; }
+    while (i < n && buf[i] >= '0' && buf[i] <= '9' && d < 6) { v = v * 10 + (buf[i] - '0'); i++; d++; }
+    while (i < n && (buf[i] == '\n' || buf[i] == ' ')) i++;
+    if (!d || i != n) return -22;                                     /* EINVAL */
+    if (neg) v = -v;
+    if (v < -1000 || v > 1000) return -22;
+    t->oom_score_adj = (int)v;
+    return (long)n;
+}
+static void gen_oomscore(struct procfs_writer* w) { pw_puts(w, "0\n"); }
+static struct procfs_node nd_oomadj   = { .name = "self/oom_score_adj", .gen = gen_oomadj,
+                                          .write = write_oomadj };
+static struct procfs_node nd_oomscore = { .name = "self/oom_score", .gen = gen_oomscore };
 static struct procfs_node nd_mountinfo  = { .name = "self/mountinfo", .gen = gen_mountinfo };
 static struct procfs_node nd_selfmounts = { .name = "self/mounts",    .gen = gen_mounts };
+/* §M90 — /proc/self/ns/<kind>: namespace HANDLES.  A program opens one to
+ * hold or join a namespace (dockerd bind-mounts its net handle to keep the
+ * default sandbox's namespace; runc setns()es into configured ones).  This
+ * machine has ONE namespace of every kind except mount (vfs_mntns_new), so a
+ * handle is a name; what it identifies is answered by readlink ("net:[N]",
+ * the Linux numbers of the initial namespaces) and by setns.  Reading one
+ * gives that same line. */
+static const char* const g_ns_kinds[] = { "net", "mnt", "pid", "uts", "ipc", "cgroup", "user", "time" };
+static void gen_ns_line(struct procfs_writer* w, const char* kind);
+#define NS_GEN(k) static void gen_ns_##k(struct procfs_writer* w) { gen_ns_line(w, #k); }
+NS_GEN(net) NS_GEN(mnt) NS_GEN(pid) NS_GEN(uts) NS_GEN(ipc) NS_GEN(cgroup) NS_GEN(user) NS_GEN(time)
+static struct procfs_node nd_ns[] = {
+    { .name = "net", .gen = gen_ns_net }, { .name = "mnt", .gen = gen_ns_mnt },
+    { .name = "pid", .gen = gen_ns_pid }, { .name = "uts", .gen = gen_ns_uts },
+    { .name = "ipc", .gen = gen_ns_ipc }, { .name = "cgroup", .gen = gen_ns_cgroup },
+    { .name = "user", .gen = gen_ns_user }, { .name = "time", .gen = gen_ns_time },
+};
+/* The inode numbers Linux gives its initial namespaces (procfs_ns_ino). */
+unsigned long procfs_ns_ino(const char* kind) {
+    static const unsigned long ino[] = { 4026531840ul, 4026531841ul, 4026531836ul,
+        4026531838ul, 4026531839ul, 4026531835ul, 4026531837ul, 4026531834ul };
+    for (unsigned i = 0; i < sizeof g_ns_kinds / sizeof g_ns_kinds[0]; i++) {
+        const char* a = g_ns_kinds[i]; const char* b = kind;
+        while (*a && *a == *b) { a++; b++; }
+        if (!*a && !*b) return ino[i];
+    }
+    return 0;
+}
+static void gen_ns_line(struct procfs_writer* w, const char* kind) {
+    pw_puts(w, kind); pw_puts(w, ":["); pw_put_uint(w, (uint32_t)procfs_ns_ino(kind)); pw_puts(w, "]\n");
+}
+static void attach_ns_dir(void) {
+    struct dentry* self = proc_subdir("self", 4);
+    if (!self) return;
+    struct inode* dino = (struct inode*)kcalloc(1, sizeof(struct inode));
+    if (!dino) return;
+    dino->type = INODE_DIR;
+    vfs_inode_defaults(dino);
+    if (proc_dir && proc_dir->inode) dino->ops = proc_dir->inode->ops;
+    struct dentry* ns = vfs_attach_child(self, "ns", dino);
+    if (!ns) { kfree(dino); return; }
+    for (unsigned i = 0; i < sizeof nd_ns / sizeof nd_ns[0]; i++) {
+        struct inode* ino = (struct inode*)kcalloc(1, sizeof(struct inode));
+        if (!ino) return;
+        ino->type = INODE_FILE;
+        vfs_inode_defaults(ino);
+        ino->ops = &procfs_file_ops;
+        ino->private = &nd_ns[i];
+        if (!vfs_attach_child(ns, nd_ns[i].name, ino)) kfree(ino);
+    }
+}
+
 static struct procfs_node nd_mounts     = { .name = "mounts",         .gen = gen_mounts };
 static struct procfs_node nd_modules = { .name = "modules", .gen = gen_modules };
 static struct procfs_node nd_drivers = { .name = "drivers", .gen = gen_drivers };
@@ -655,7 +776,10 @@ void procfs_init(void) {
     attach_node(&nd_mountinfo);
     attach_node(&nd_selfcgroup);
     attach_node(&nd_selfstatus);
+    attach_node(&nd_oomadj);
+    attach_node(&nd_oomscore);
     attach_fd_dir();
+    attach_ns_dir();
     attach_node(&nd_selfmounts);
     attach_node(&nd_mounts);
     attach_node(&nd_modules);

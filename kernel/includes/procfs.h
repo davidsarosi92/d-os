@@ -46,11 +46,20 @@ void pw_put_hex (struct procfs_writer*, unsigned int v, int min_digits);
 /* Per-file generator.  Called at open; content is then served by reads. */
 typedef void (*procfs_gen_fn)(struct procfs_writer* w);
 
+struct task;
 struct procfs_node {
     const char*   name;
     procfs_gen_fn gen;
     struct procfs_node* _next;          /* internal: pre-init queue link */
+    /* §M90 — OPTIONAL, APPENDED.  A WRITABLE node: `buf` is what was written
+     * (not terminated), `target` the process the path named (/proc/<pid>/…,
+     * else the writer).  Returns n, or a negative errno.  NULL = read-only. */
+    long (*write)(struct task* target, const char* buf, size_t n);
 };
+
+/* §M90 — the process a per-process generator answers for: the one the path
+ * named (/proc/<pid>/status), else the caller.  Valid inside a gen. */
+struct task* procfs_target(void);
 
 /* Register a node — same queue/flush pattern as devfs.  Pre-init
  * registrations queue and are attached when `procfs_init` runs. */

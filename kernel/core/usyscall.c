@@ -38,6 +38,7 @@
 #include "vfs.h"
 #include "netlink.h"   /* §M90 */
 #include "fd.h"
+#include "fifo.h"
 #include "timerfd.h"
 #include "eventfd.h"       /* §M53 stage 3 — timer descriptors */
 #include "epoll.h"          /* §M56 — readiness sets            */
@@ -353,6 +354,7 @@ long sys_write_k(int fd, const void* buf, size_t n) {
     if (o->kind == FD_NETSOCK) return netsock_write(o->nsock, buf, n);
     if (o->kind == FD_EVENT) return eventfd_write(o->efd, buf, n, !o->nonblock);   /* §M90 */
     if (o->kind == FD_NETLINK) return nl_send(o->nl, buf, n);                      /* §M90 */
+    if (o->kind == FD_FIFO) return fifo_write(o, buf, n, !o->nonblock);            /* §M90 */
     return -1;                                 /* shm: not write(2)-able */
 }
 
@@ -439,6 +441,7 @@ long sys_read_k(int fd, void* buf, size_t n) {
      * the descriptor existing. */
     if (o->kind == FD_EVENT) return eventfd_read(o->efd, buf, n, block);   /* §M90 */
     if (o->kind == FD_NETLINK) return nl_recv(o->nl, buf, n, block, 0, 0); /* §M90 */
+    if (o->kind == FD_FIFO) return fifo_read(o, buf, n, block);           /* §M90 */
     if (o->kind == FD_TIMER) {
         long r = timerfd_read(o->tfd, buf, n, block);
         /* Reading a timerfd RESETS its expiration count, so it stops being
@@ -487,12 +490,31 @@ int sys_open(const char* path, int flags) {
 }
 /* §M90 — open from a KERNEL path (the ABI layer rewrites /proc/self/fd/N). */
 int sys_open_k(const char* kpath, int flags) {
+    long r = sys_open_ex_k(kpath, flags, 0, 0);
+    return r < 0 ? -1 : (int)r;
+}
+/* §M90 — the full open: `nonblock` is O_NONBLOCK (it belongs to the open file
+ * DESCRIPTION, and was dropped on the floor here before), `opath` is O_PATH
+ * (a name, not an end: a FIFO opened so is NOT attached to its pipe).  A FIFO
+ * becomes an FD_FIFO end (fifo.c) and may block until its other end opens.
+ * The fd, or a NEGATIVE Linux errno (-2 when the VFS refused: not found / not
+ * permitted, as before; -6/-4/-12 from the FIFO). */
+long sys_open_ex_k(const char* kpath, int flags, int nonblock, int opath) {
     struct file* f = vfs_open(kpath, flags ? flags : VFS_RDONLY);
-    if (!f) return -1;
+    if (!f) return -2;
     struct ofile* o = ofile_from_file(f);
-    if (!o) { vfs_close(f); return -1; }
+    if (!o) { vfs_close(f); return -12; }
+    o->nonblock = nonblock ? 1 : 0;
+    if (!opath && f->inode && f->inode->type == INODE_FIFO) {
+        unsigned role = 0;
+        if (flags & VFS_RDONLY) role |= FIFO_R;
+        if (flags & VFS_WRONLY) role |= FIFO_W;
+        o->kind = FD_FIFO;
+        int e = fifo_attach(o, role, nonblock);
+        if (e < 0) { o->kind = FD_VFS; ofile_unref(o); return e; }
+    }
     int fd = fd_install(o);
-    if (fd < 0) { ofile_unref(o); return -1; }
+    if (fd < 0) { ofile_unref(o); return -24; }               /* EMFILE */
     return fd;
 }
 
@@ -832,7 +854,8 @@ static void stat_full_of(const struct inode* in, struct kstat_full* o) {
     uint32_t perm = in->mode ? (in->mode & 07777u) : (in->type == INODE_DIR ? 0755u : 0644u);
     uint32_t fmt  = in->type == INODE_DIR ? KS_IFDIR
                   : in->type == INODE_DEVICE ? KS_IFCHR
-                  : in->type == INODE_SYMLINK ? KS_IFLNK : KS_IFREG;
+                  : in->type == INODE_SYMLINK ? KS_IFLNK
+                  : in->type == INODE_FIFO ? KS_IFIFO : KS_IFREG;
     if (in->type == INODE_SYMLINK) perm = 0777u;
     o->mode = fmt | perm;
     o->uid  = in->owner_uid < 0 ? 0 : in->owner_uid;
@@ -865,6 +888,7 @@ int sys_fstat_full_k(int fd, struct kstat_full* out) {
     out->ino   = (uint64_t)((uintptr_t)o >> 3);
     switch (o->kind) {
     case FD_VFS:
+    case FD_FIFO:                                   /* §M90 — the FIFO's own inode */
         if (o->file && o->file->inode) { stat_full_of(o->file->inode, out); return 0; }
         out->mode = KS_IFREG | 0644u; return 0;
     case FD_SOCK: case FD_NETSOCK: out->mode = KS_IFSOCK | 0777u; return 0;
@@ -969,7 +993,8 @@ long sys_getdents64_k(int fd, void* buf, size_t cap) {
         r[17] = (uint8_t)(reclen >> 8);
         r[18] = (de.type == INODE_DIR) ? 4 :                                     /* DT_DIR  */
                 (de.type == INODE_DEVICE) ? 2 :                                  /* DT_CHR  */
-                (de.type == INODE_SYMLINK) ? 10 : 8;                             /* DT_LNK / DT_REG */
+                (de.type == INODE_SYMLINK) ? 10 :                                /* DT_LNK  */
+                (de.type == INODE_FIFO) ? 1 : 8;                                 /* DT_FIFO / DT_REG */
         for (int i = 0; i < nlen; i++) r[19 + i] = (uint8_t)de.name[i];          /* d_name  */
         r[19 + nlen] = 0;
         used += reclen;
@@ -1290,6 +1315,10 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
     case FD_NETLINK:
         if (nl_can_read(o->nl)) r |= POLLIN;
         r |= POLLOUT;
+        break;
+    /* §M90 — a named pipe end: Linux pipe_poll's rules (fifo.c). */
+    case FD_FIFO:
+        r |= fifo_readiness(o);
         break;
     /* §M56 — an AF_INET socket used to fall through to "always ready", so a
      * loop polling one span at full speed and every epoll_wait on it returned
@@ -2510,7 +2539,7 @@ void fd_unshare_table(void) {
  * a directory), as the caller sees it.  0, or -1. */
 int sys_fd_path(int fd, char* out, size_t cap) {
     struct ofile* o = fd_lookup(fd);
-    if (!o || o->kind != FD_VFS || !o->file || !o->file->dentry) return -1;
+    if (!o || (o->kind != FD_VFS && o->kind != FD_FIFO) || !o->file || !o->file->dentry) return -1;
     if (o->file->inode && o->file->inode->unlink_dir) return -1;   /* deleted */
     return vfs_dentry_path(o->file->dentry, out, cap) == 0 ? 0 : -1;
 }
@@ -2518,7 +2547,7 @@ int sys_fd_path(int fd, char* out, size_t cap) {
 /* §M90 — see vfs.c (fd_vfs_dentry): the dentry of the caller's descriptor. */
 struct dentry* fd_vfs_dentry(int fd) {
     struct ofile* o = fd_lookup(fd);
-    if (!o || o->kind != FD_VFS || !o->file || !o->file->dentry) return NULL;
+    if (!o || (o->kind != FD_VFS && o->kind != FD_FIFO) || !o->file || !o->file->dentry) return NULL;
     if (o->file->inode && o->file->inode->unlink_dir) return NULL;
     return o->file->dentry;
 }

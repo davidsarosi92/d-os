@@ -5,6 +5,7 @@
  * ============================================================================= */
 
 #include "fd.h"
+#include "fifo.h"
 #include "hal_api.h"   /* phys_to_virt / virt_to_phys — kernel direct map */
 #include "vfs.h"
 #include "timerfd.h"
@@ -141,6 +142,7 @@ void ofile_unref(struct ofile* o) {
         case FD_CONSOLE: break;                   /* nothing behind it */
         case FD_EVENT:   if (o->efd)   eventfd_close(o->efd);    break;
         case FD_NETLINK: if (o->nl)    nl_close(o->nl);          break;
+        case FD_FIFO:    fifo_detach(o); if (o->file) vfs_close(o->file); break;
     }
     o->kind = (enum fd_kind)0x0DEAD;     /* the poison, see above */
     kfree(o);

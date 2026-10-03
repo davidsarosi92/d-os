@@ -40,6 +40,7 @@
 #include "usermode.h"
 #include "driver.h"
 #include "flock.h"
+#include "fifo.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -946,6 +947,191 @@ static void sy_unlinkopentest(const char* args) {
     int ok = ur == 0 && gone && n == 10 && buf[0] == 's' && buf[9] == 'e' && again;
     console_write(ok ? "unlinkopen: ok\n" : "unlinkopen: FAIL\n");
 }
+/* §M90 — `fifotest`: named pipes (fifo.c), every rule a program depends on,
+ * checked on the real open path (vfs_open + fifo_attach, as sys_open_ex_k
+ * does): mkfifo twice (EEXIST), stat says S_IFIFO, a non-blocking writer with
+ * no reader (ENXIO), a non-blocking reader that sees NO hang-up before any
+ * writer existed, data through, EAGAIN on an empty pipe with a live writer,
+ * POLLHUP + EOF after the writer leaves, the pipe discarded with the last end,
+ * and a BLOCKING reader that waits for a writer arriving 100 ms later on
+ * another task — containerd's exact pattern for a container's stdout. */
+static const char* const FT_PATH = "/fifotest.p";
+static volatile int g_ft_writer_opened;
+static int ft_open(unsigned role, int nonblock, struct ofile** out) {
+    struct file* f = vfs_open(FT_PATH, (role & FIFO_W) ? ((role & FIFO_R) ? VFS_RDWR : VFS_WRONLY)
+                                                     : VFS_RDONLY);
+    struct ofile* o = f ? ofile_from_file(f) : NULL;
+    if (!o) { if (f) vfs_close(f); return -2; }
+    o->nonblock = nonblock;
+    o->kind = FD_FIFO;
+    int e = fifo_attach(o, role, nonblock);
+    if (e < 0) { o->kind = FD_VFS; ofile_unref(o); return e; }
+    *out = o;
+    return 0;
+}
+static void ft_late_writer(void) {
+    task_msleep(100);
+    g_ft_writer_opened = 1;
+    struct ofile* w = NULL;
+    if (ft_open(FIFO_W, 0, &w) == 0) {
+        fifo_write(w, "late", 4, 1);
+        ofile_unref(w);
+    }
+}
+static void sy_fifotest(const char* args) {
+    (void)args;
+    vfs_unlink(FT_PATH);
+    int mk = vfs_mkfifo(FT_PATH), mk2 = vfs_mkfifo(FT_PATH);
+    struct kstat_full k;
+    int isfifo = sys_stat_full_k(FT_PATH, &k) == 0 && (k.mode & KS_IFMT) == KS_IFIFO;
+    struct ofile *r = NULL, *w = NULL;
+    struct ofile* tmp = NULL;
+    int enxio = ft_open(FIFO_W, 1, &tmp);
+    int ro = ft_open(FIFO_R, 1, &r);
+    uint32_t ev0 = r ? fifo_readiness(r) : 0;            /* want: no POLLHUP */
+    int wo = ft_open(FIFO_W, 1, &w);
+    long wr = w ? fifo_write(w, "hello", 5, 0) : -99;
+    uint32_t ev1 = r ? fifo_readiness(r) : 0;            /* want: POLLIN */
+    char buf[8] = { 0 };
+    long rd = r ? fifo_read(r, buf, sizeof buf - 1, 0) : -99;
+    long again = r ? fifo_read(r, buf + 6, 1, 0) : -99;  /* empty, writer alive: EAGAIN */
+    if (w) ofile_unref(w);
+    uint32_t ev2 = r ? fifo_readiness(r) : 0;            /* want: POLLHUP */
+    long eof = r ? fifo_read(r, buf + 6, 1, 0) : -99;
+    if (r) ofile_unref(r);
+    int enxio2 = ft_open(FIFO_W, 1, &tmp);               /* pipe gone with its last end */
+
+    g_ft_writer_opened = 0;
+    struct ofile* br = NULL;
+    task_spawn_arg("fifotest-w", ft_late_writer, NULL);
+    int bo = ft_open(FIFO_R, 0, &br);                    /* BLOCKS until the writer */
+    int waited = g_ft_writer_opened;
+    char lb[8] = { 0 };
+    long lr = br ? fifo_read(br, lb, 4, 1) : -99;
+    long leof = br ? fifo_read(br, lb + 5, 1, 1) : -99;  /* writer has closed: EOF */
+    if (br) ofile_unref(br);
+    int un = vfs_unlink(FT_PATH);
+
+    kprintf("fifotest: mkfifo=%d again=%d S_IFIFO=%d nb-writer=%d reader=%d hup-before=%d "
+            "writer=%d write=%d in=%d read=%d '%s' empty=%d hup-after=%d eof=%d gone=%d\n",
+            mk, mk2, isfifo, enxio, ro, (ev0 & POLLHUP) ? 1 : 0, wo, (int)wr,
+            (ev1 & POLLIN) ? 1 : 0, (int)rd, buf, (int)again, (ev2 & POLLHUP) ? 1 : 0,
+            (int)eof, enxio2);
+    kprintf("fifotest: blocking reader=%d waited-for-writer=%d read=%d '%s' eof=%d unlink=%d\n",
+            bo, waited, (int)lr, lb, (int)leof, un);
+    int ok = mk == 0 && mk2 == -2 && isfifo && enxio == -6 && ro == 0 && !(ev0 & POLLHUP) &&
+             wo == 0 && wr == 5 && (ev1 & POLLIN) && rd == 5 && buf[0] == 'h' && buf[4] == 'o' &&
+             again == -11 && (ev2 & POLLHUP) && eof == 0 && enxio2 == -6 &&
+             bo == 0 && waited && lr == 4 && lb[0] == 'l' && lb[3] == 'e' && leof == 0 && un == 0;
+    console_write(ok ? "fifotest: ok\n" : "fifotest: FAIL\n");
+}
+/* §M90 — `subreapertest`: prctl(PR_SET_CHILD_SUBREAPER) as containerd's shim
+ * uses it.  A helper ("sr") marks itself a subreaper and starts "mid"; mid
+ * starts "leaf" (detached, as a setsid/setpgid program is) and exits at once.
+ * The leaf must then belong to sr — not to init — and sr must collect its
+ * exit status with an ordinary wait.  The control run does the same without
+ * the subreaper mark: the leaf must go to init.  Kernel tasks drive it so the
+ * test exercises exactly the adoption code in task.c. */
+static volatile int g_srt_leaf, g_srt_mark;
+static void srt_leaf(void) { task_msleep(150); task_exit_code(7); }
+static void srt_mid(void) {
+    struct task* l = task_spawn("srt-leaf", srt_leaf);
+    if (l) { l->survives_parent = 1; task_set_reap_owned(l, 1); g_srt_leaf = l->pid; }
+}
+static volatile int g_srt_ppid, g_srt_code, g_srt_done;
+static void srt_sr(void) {
+    struct task* me = task_current();
+    me->child_subreaper = g_srt_mark;
+    g_srt_leaf = 0;
+    struct task* m = task_spawn("srt-mid", srt_mid);
+    int mpid = m ? m->pid : -1;
+    int code = -1;
+    if (mpid > 0) task_wait(mpid, &code);             /* mid has gone */
+    for (int i = 0; i < 50 && !g_srt_leaf; i++) task_msleep(2);
+    struct task* l = g_srt_leaf ? task_find(g_srt_leaf) : NULL;
+    g_srt_ppid = l ? l->ppid : -1;
+    g_srt_code = -1;
+    if (g_srt_mark && l) task_wait(g_srt_leaf, (int*)&g_srt_code);
+    else if (l) { task_set_reap_owned(l, 0); }        /* control: init collects it */
+    g_srt_done = 1;
+}
+static int srt_run(int mark, int* sr_pid) {
+    g_srt_mark = mark; g_srt_done = 0; g_srt_ppid = -1;
+    struct task* sr = task_spawn("srt-sr", srt_sr);
+    if (!sr) return -1;
+    *sr_pid = sr->pid;
+    for (int i = 0; i < 300 && !g_srt_done; i++) task_msleep(5);
+    return g_srt_done ? 0 : -1;
+}
+static void sy_subreapertest(const char* args) {
+    (void)args;
+    int sr1 = 0, sr2 = 0;
+    int r1 = srt_run(1, &sr1);
+    int p1 = g_srt_ppid, c1 = g_srt_code;
+    int r2 = srt_run(0, &sr2);
+    int p2 = g_srt_ppid;
+    int init = task_reaper_pid();
+    kprintf("subreaper: with mark: done=%d leaf ppid %d (subreaper %d) code %d (want 7); "
+            "without: done=%d leaf ppid %d (init %d)\n", r1 == 0, p1, sr1, c1, r2 == 0, p2, init);
+    int ok = r1 == 0 && p1 == sr1 && c1 == 7 && r2 == 0 && p2 == init;
+    console_write(ok ? "subreaper: ok\n" : "subreaper: FAIL\n");
+}
+/* §M90 — `oomtest`: /proc/<pid>/oom_score_adj as containerd's shim uses it —
+ * written for the caller, read back through /proc/self and /proc/<own pid>,
+ * inherited by a child, read for that child through /proc/<ITS pid> (a
+ * FOREIGN pid: procfs generates for the process the path named), a value out
+ * of range refused, and a per-process file NOT offered under a foreign pid
+ * (/proc/<pid>/mountinfo) answering "no such file" rather than the caller's. */
+static void bt_path(char* out, const char* a, int n1, const char* b, int n2, const char* c);
+static long ot_read(const char* path) {
+    struct file* f = vfs_open(path, VFS_RDONLY);
+    if (!f) return -99999;
+    char b[16] = { 0 };
+    long n = vfs_read(f, b, sizeof b - 1);
+    vfs_close(f);
+    if (n <= 0) return -99998;
+    long v = 0; int i = 0, neg = 0;
+    if (b[0] == '-') { neg = 1; i = 1; }
+    for (; b[i] >= '0' && b[i] <= '9'; i++) v = v * 10 + (b[i] - '0');
+    return neg ? -v : v;
+}
+static long ot_write(const char* path, const char* v) {
+    struct file* f = vfs_open(path, VFS_WRONLY);
+    if (!f) return -99999;
+    size_t len = 0; while (v[len]) len++;
+    long n = vfs_write(f, v, len);
+    vfs_close(f);
+    return n;
+}
+static void ot_child(void) { task_msleep(300); }
+static void sy_oomtest(const char* args) {
+    (void)args;
+    struct task* me = task_current();
+    int saved = me->oom_score_adj;
+    char p[48], q[48], r[48];
+    bt_path(p, "/proc/", task_tgid(me), "/oom_score_adj", -1, "");
+    long w1 = ot_write("/proc/self/oom_score_adj", "-250\n");
+    long a = ot_read("/proc/self/oom_score_adj"), b = ot_read(p);
+    struct task* c = task_spawn("oomtest-child", ot_child);
+    long cv = -1, bad = 0, foreign_mi = 0;
+    if (c) {
+        bt_path(q, "/proc/", c->pid, "/oom_score_adj", -1, "");
+        bt_path(r, "/proc/", c->pid, "/mountinfo", -1, "");
+        cv = ot_read(q);
+        struct file* f = vfs_open(r, VFS_RDONLY);
+        foreign_mi = f ? 1 : 0;
+        if (f) vfs_close(f);
+    }
+    bad = ot_write("/proc/self/oom_score_adj", "5000");
+    long after = ot_read("/proc/self/oom_score_adj");
+    me->oom_score_adj = saved;
+    kprintf("oomtest: write=%d self=%d own-pid=%d child(foreign pid)=%d out-of-range=%d "
+            "still=%d foreign-mountinfo-opened=%d\n",
+            (int)w1, (int)a, (int)b, (int)cv, (int)bad, (int)after, (int)foreign_mi);
+    int ok = w1 == 5 && a == -250 && b == -250 && cv == -250 && bad < 0 && after == -250 &&
+             !foreign_mi;
+    console_write(ok ? "oomtest: ok\n" : "oomtest: FAIL\n");
+}
 /* §M90 — `renametest`: rename across directories (docker writes a layer's
  * metadata in tmp/ and renames it into the store), a directory over an EMPTY
  * directory, and the two refusals that keep the tree a tree: a directory into
@@ -977,6 +1163,78 @@ static void sy_renametest(const char* args) {
 }
 SHELL_CMD(renametest) = { "renametest", "", "rename across directories, and its refusals",
                           SHELL_G_TEST, sy_renametest, SHELL_P_ANY };
+/* "<a><n1><b>[<n2>]<c>" — this kernel has no snprintf. */
+static void bt_num(char** o, int v) {
+    char d[12]; int n = 0;
+    do { d[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n) *(*o)++ = d[--n];
+}
+static void bt_path(char* out, const char* a, int n1, const char* b, int n2, const char* c) {
+    char* o = out;
+    while (*a) *o++ = *a++;
+    bt_num(&o, n1);
+    while (*b) *o++ = *b++;
+    if (n2 >= 0) bt_num(&o, n2);
+    while (*c) *o++ = *c++;
+    *o = 0;
+}
+/* §M90 — `bindtest`: bind mounts and mount namespaces.  A directory bind and
+ * a FILE bind (a namespace handle, dockerd's use), a bind target refuses
+ * unlink, and visibility runs one way: a namespace created after a bind sees
+ * it, a bind made inside that namespace is invisible to its parent. */
+static void sy_bindtest(const char* args) {
+    (void)args;
+    struct vfs_stat st;
+    struct task* me = task_current();
+    int home = me->mntns;
+    vfs_mkdir("/bt"); vfs_mkdir("/bt/src"); vfs_mkdir("/bt/tgt"); vfs_mkdir("/bt/tgt2");
+    vfs_create("/bt/src/f");
+    vfs_create("/bt/file");
+    int b1 = vfs_bind("/bt/src", "/bt/tgt");
+    int see1 = vfs_stat("/bt/tgt/f", &st) == 0;
+    int b2 = vfs_bind("/proc/self/ns/net", "/bt/file");
+    char buf[32] = { 0 };
+    struct file* f = vfs_open("/bt/file", VFS_RDONLY);
+    if (f) { vfs_read(f, buf, sizeof buf - 1); vfs_close(f); }
+    int fileok = buf[0] == 'n' && buf[1] == 'e' && buf[2] == 't' && buf[3] == ':';
+    int busy = vfs_unlink("/bt/tgt");
+    int ns = vfs_mntns_new(home);
+    me->mntns = ns;
+    int child_sees = vfs_stat("/bt/tgt/f", &st) == 0;          /* made before: visible */
+    int b3 = vfs_bind("/bt/src", "/bt/tgt2");
+    int child_own = vfs_stat("/bt/tgt2/f", &st) == 0;
+    me->mntns = home;
+    int parent_blind = vfs_stat("/bt/tgt2/f", &st) != 0;       /* made inside: invisible */
+    int u_wrong = vfs_unbind("/bt/tgt2");                     /* not ours to remove */
+    me->mntns = ns;  int u2 = vfs_unbind("/bt/tgt2");  me->mntns = home;
+    int u1 = vfs_unbind("/bt/tgt"), u3 = vfs_unbind("/bt/file");
+    int gone = vfs_stat("/bt/tgt/f", &st) != 0;
+    kprintf("bindtest: dir=%d see=%d file=%d '%s' busy=%d ns=%d child-sees=%d child-bind=%d "
+            "child-own=%d parent-blind=%d unbind-foreign=%d unbind=%d/%d/%d gone=%d\n",
+            b1, see1, b2, fileok ? "net:" : "?", busy, ns, child_sees, b3, child_own,
+            parent_blind, u_wrong, u1, u2, u3, gone);
+    /* the /proc spellings Go uses for its own threads, and one it must not get */
+    char pa[64], pb[64], pc[64];
+    bt_path(pa, "/proc/", task_tgid(me), "/task/", me->pid, "/ns/net");
+    bt_path(pb, "/proc/", task_tgid(me), "/status", -1, "");
+    bt_path(pc, "/proc/", task_tgid(me) + 7777, "/status", -1, "");
+    int al = vfs_stat(pa, &st) == 0 && vfs_stat(pb, &st) == 0 &&
+             vfs_stat("/proc/thread-self/ns/net", &st) == 0 && vfs_stat(pc, &st) != 0;
+    kprintf("bindtest: proc aliases %s\n", al ? "ok" : "WRONG");
+    vfs_unlink_recursive("/bt");
+    int ok = al && b1 == 0 && see1 && b2 == 0 && fileok && busy == -6 && ns > 0 && child_sees &&
+             b3 == 0 && child_own && parent_blind && u_wrong == -1 && u1 == 0 && u2 == 0 &&
+             u3 == 0 && gone;
+    console_write(ok ? "bindtest: ok\n" : "bindtest: FAIL\n");
+}
+SHELL_CMD(bindtest) = { "bindtest", "", "bind mounts and mount-namespace visibility",
+                        SHELL_G_TEST, sy_bindtest, SHELL_P_ANY };
+SHELL_CMD(subreapertest) = { "subreapertest", "", "orphans go to the nearest child subreaper",
+                              SHELL_G_TEST, sy_subreapertest, SHELL_P_ANY };
+SHELL_CMD(oomtest) = { "oomtest", "", "/proc/<pid>/oom_score_adj: write, inherit, foreign read",
+                        SHELL_G_TEST, sy_oomtest, SHELL_P_ANY };
+SHELL_CMD(fifotest) = { "fifotest", "", "named pipes: open rules, EOF/HUP, a blocking reader",
+                         SHELL_G_TEST, sy_fifotest, SHELL_P_ANY };
 SHELL_CMD(unlinkopentest) = { "unlinkopentest", "", "an unlinked file stays readable while open",
                               SHELL_G_TEST, sy_unlinkopentest, SHELL_P_ANY };
 SHELL_CMD(flocktest)   = { "flocktest",   "", "flock(2): owners, sharing, release on close",

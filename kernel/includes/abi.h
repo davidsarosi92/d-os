@@ -187,6 +187,9 @@ enum abi_op {
     ABI_XATTR_SET, ABI_XATTR_FSET, ABI_XATTR_GET, ABI_XATTR_FGET,      /* §M90 */
     ABI_XATTR_LIST, ABI_XATTR_FLIST, ABI_XATTR_REMOVE, ABI_XATTR_FREMOVE,
     ABI_FCHOWN,                                        /* §M90 */
+    ABI_SETNS,                                         /* §M90 */
+    ABI_MKNOD, ABI_MKNODAT,                            /* §M90 — FIFOs, regular files */
+    ABI_FCHMOD,                                        /* §M90 */
     ABI_RMDIR,              /* §M90 */  /* §M90 — lchown maps to ABI_CHOWN: no per-call
                                * link handling, see h_fchownat */
     /* §M73 — identity.  The answer is the task's §M32 credential: a container

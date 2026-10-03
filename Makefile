@@ -846,6 +846,7 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
+    kernel/core/fifo.c \
     kernel/core/flock.c \
     kernel/core/netlink.c \
     kernel/core/itimer.c \
@@ -901,6 +902,7 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
+    kernel/core/fifo.c \
     kernel/core/flock.c \
     kernel/core/netlink.c \
     kernel/core/itimer.c \
@@ -1215,6 +1217,7 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
+    kernel/core/fifo.c \
     kernel/core/flock.c \
     kernel/core/netlink.c \
     kernel/core/itimer.c \

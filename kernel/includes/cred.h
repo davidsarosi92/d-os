@@ -163,8 +163,12 @@ struct cred {
      * dentry because nothing here counts references to dentries — a pointer
      * to a directory somebody removed would be a dangling one, while a path
      * to it is merely a path that no longer resolves, which is what Linux
-     * reports for a deleted cwd too. */
-    char cwd[96];
+     * reports for a deleted cwd too.
+     * §M90 — 256, the size of every other path buffer here: containerd starts
+     * its shim with the bundle directory as the working directory
+     * (/run/containerd/io.containerd.runtime.v2.task/<ns>/<64 hex>, ~110
+     * characters), and at 96 that chdir failed ENAMETOOLONG. */
+    char cwd[256];
     /* §M89 — the program this process is running, as a canonical path within
      * `root` — what /proc/self/exe names.  Here for the same reason as cwd:
      * every spawn, fork and thread inherits it, and execve replaces it.  A

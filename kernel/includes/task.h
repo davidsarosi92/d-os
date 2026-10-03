@@ -517,6 +517,22 @@ struct task {
      * parent exits — at least as strong as any death signal.  Not inherited
      * (Linux clears it on fork). */
     int       pdeathsig;
+    /* §M90 — prctl(PR_SET_CHILD_SUBREAPER): an orphan whose parent dies is
+     * adopted by its nearest living ancestor with this set, instead of by
+     * init — and that ancestor waits for it as for its own child.  How
+     * containerd's shim collects the exit status of a container's process
+     * after runc (its real parent) has gone.  Not inherited (Linux clears it
+     * on fork); the fork paths build a fresh struct, so it starts 0. */
+    int       child_subreaper;
+    /* §M90 — /proc/<pid>/oom_score_adj: stored, inherited by children (as on
+     * Linux) and read back.  There is no OOM killer choosing victims here —
+     * §M72's reserves REFUSE allocations instead — so the value orders nothing
+     * yet; it is kept because containerd and runc read and write it (the
+     * shim copies its parent's, plus one) and fail when it is missing. */
+    int       oom_score_adj;
+    /* §M90 — the process a /proc/<pid>/X path named during THIS task's current
+     * lookup (vfs_proc_alias), consumed by procfs at open.  0 = self. */
+    int       proc_target_pid;
     /* §M90 — close-on-exec bits of the PRIVATE descriptor table (bit i =
      * fds_inline[i]); a shared table keeps its own (struct fdtable).  Read and
      * written only through fd.h's fd_*cloexec* helpers, which pick the right

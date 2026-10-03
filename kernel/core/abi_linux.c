@@ -108,6 +108,9 @@ static const struct abi_nument linux_i386_ents[] = {
     { 452, ABI_FCHMODAT2 },  /* §M90 — same number on every guest (post-5.x unified table) */
     { 320, ABI_UTIMENSAT }, { 412, ABI_UTIMENSAT },  /* §M90 — and its time64 twin */
     {  95, ABI_FCHOWN }, { 207, ABI_FCHOWN },  /* §M90 — fchown, fchown32 */
+    { 346, ABI_SETNS },  /* §M90 */
+    {  14, ABI_MKNOD }, { 297, ABI_MKNODAT },  /* §M90 */
+    {  94, ABI_FCHMOD },  /* §M90 */
     /* §M90 — the extended-attribute family: set/lset/fset, get/lget/fget,
      * list/llist/flist, remove/lremove/fremove, consecutive on every guest. */
     { 226, ABI_XATTR_SET },
@@ -233,6 +236,9 @@ static const struct abi_nument linux_amd64_ents[] = {
     { 452, ABI_FCHMODAT2 },  /* §M90 — same number on every guest (post-5.x unified table) */
     { 280, ABI_UTIMENSAT },  /* §M90 */
     {  93, ABI_FCHOWN },  /* §M90 */
+    { 308, ABI_SETNS },  /* §M90 */
+    { 133, ABI_MKNOD }, { 259, ABI_MKNODAT },  /* §M90 */
+    {  91, ABI_FCHMOD },  /* §M90 */
     /* §M90 — the extended-attribute family: set/lset/fset, get/lget/fget,
      * list/llist/flist, remove/lremove/fremove, consecutive on every guest. */
     { 188, ABI_XATTR_SET },
@@ -342,6 +348,9 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 452, ABI_FCHMODAT2 },  /* §M90 — same number on every guest (post-5.x unified table) */
     {  88, ABI_UTIMENSAT },  /* §M90 */
     {  55, ABI_FCHOWN },  /* §M90 */
+    { 268, ABI_SETNS },  /* §M90 */
+    {  33, ABI_MKNODAT },  /* §M90 */
+    {  52, ABI_FCHMOD },  /* §M90 */
     /* §M90 — the extended-attribute family: set/lset/fset, get/lget/fget,
      * list/llist/flist, remove/lremove/fremove, consecutive on every guest. */
     { 5, ABI_XATTR_SET },

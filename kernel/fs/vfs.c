@@ -200,6 +200,58 @@ struct dentry* fd_vfs_dentry(int fd) __attribute__((weak));
 struct dentry* fd_vfs_dentry(int fd) { (void)fd; return NULL; }
 static int vfs_dentry_path_unlocked(struct dentry* d, char* out, size_t cap);
 
+/* ------------------------------------------------------------------- */
+/* §M90 — bind mounts and mount namespaces (see vfs.h).                 */
+/* ------------------------------------------------------------------- */
+
+/* The caller's mount namespace: task.c owns tasks, this file owns paths. */
+int task_mntns_current(void) __attribute__((weak));
+int task_mntns_current(void) { return 0; }
+
+/* A namespace is (parent, the bind sequence number at its creation).  Ids are
+ * never reused, so a bind's `bound_ns` can never come to mean another
+ * namespace; 256 namespaces over a boot is far more than one container
+ * runtime creates (one per container), and a full table REFUSES the unshare
+ * rather than handing two containers one namespace. */
+#define VFS_MAX_MNTNS 256
+static struct { int parent; unsigned born; } g_ns[VFS_MAX_MNTNS] = { { -1, 0 } };
+static int      g_ns_n = 1;                 /* id 0 = the machine's namespace */
+static unsigned g_bind_seq;
+
+#define VFS_MAX_BINDS 256
+static struct { struct dentry* tgt; struct dentry* src; } g_binds[VFS_MAX_BINDS];
+static int g_nbinds;
+
+/* Is `d`'s bind visible to the caller?  Made in the caller's own namespace,
+ * or in an ancestor of it BEFORE the descendant on the way down was created. */
+static int bind_visible(const struct dentry* d) {
+    int me = task_mntns_current();
+    if (d->bound_ns == me) return 1;
+    for (int n = me; n > 0 && n < g_ns_n; n = g_ns[n].parent) {
+        if (g_ns[n].parent == d->bound_ns) return d->bound_seq < g_ns[n].born;
+    }
+    return 0;
+}
+/* Where a walk arriving at `d` really continues.  Bounded: a bind of a bind
+ * of a bind is followed, a cycle is not (and cannot be built — vfs_bind
+ * resolves its source through the binds first). */
+static struct dentry* follow_bind(struct dentry* d) {
+    for (int i = 0; d && d->bound && i < 8 && bind_visible(d); i++) d = d->bound;
+    return d;
+}
+
+int vfs_mntns_new(int parent) {
+    kmutex_lock(&ns_lock);
+    int id = -1;
+    if (g_ns_n < VFS_MAX_MNTNS && parent >= 0 && parent < g_ns_n) {
+        id = g_ns_n++;
+        g_ns[id].parent = parent;
+        g_ns[id].born   = g_bind_seq;
+    }
+    kmutex_unlock(&ns_lock);
+    return id;
+}
+
 static const char* vfs_canon_plain(const char* path, char* buf, size_t cap) {
     int dots = 0;
     for (const char* q = path; *q; q++)
@@ -211,8 +263,11 @@ static const char* vfs_canon_plain(const char* path, char* buf, size_t cap) {
     size_t n = 0;
     if (path[0] != '/') {                       /* relative: from the working directory */
         const char* cwd = cred_fs_cwd();
-        for (size_t i = 0; cwd[i] && n + 1 < sizeof tmp; i++) tmp[n++] = cwd[i];
-        if (n + 1 < sizeof tmp) tmp[n++] = '/';
+        /* §M90 — a working directory that does not fit is a refusal, never a
+         * truncation: a cut cwd joined to the name is ANOTHER path. */
+        for (size_t i = 0; cwd[i]; i++) { if (n + 1 >= sizeof tmp) return NULL; tmp[n++] = cwd[i]; }
+        if (n + 1 >= sizeof tmp) return NULL;
+        tmp[n++] = '/';
     }
     for (size_t i = 0; path[i]; i++) { if (n + 1 >= sizeof tmp) return NULL; tmp[n++] = path[i]; }
     tmp[n] = 0;
@@ -272,6 +327,94 @@ static int vfs_fd_magic(const char* path, char* out, size_t cap) {
     return 0;
 }
 
+/* §M90 — /proc has no per-process or per-thread tree; these spellings all
+ * name the CALLER's view, which is what /proc/self serves:
+ *   /proc/thread-self/X               -> /proc/self/X
+ *   /proc/<pid>[/task/<tid>]/X        -> /proc/self/X  when <pid> is the
+ *                                        caller's own process (Go names its
+ *                                        own threads this way: netns.Get)
+ *   /proc/self/task/<tid>/X           -> /proc/self/X
+ *   /proc/<any pid>[/task/<tid>]/ns/X -> /proc/self/ns/X  (one namespace of
+ *                                        each kind but mount)
+ * Another process's fd table, status or mountinfo stay unanswered — a wrong
+ * answer is worse than a missing one.  1 if `out` holds the rewrite. */
+int task_tgid_current(void) __attribute__((weak));
+int task_tgid_current(void) { return -1; }
+/* §M90 — /proc/<another pid>/X: the alias below maps it onto /proc/self/X and
+ * records WHICH process on the calling task (task.c), for procfs to generate
+ * from at open; every /proc path resets it first, so it never outlives the
+ * lookup that set it.  Weak defaults for a build without the task layer. */
+void task_set_proc_target(int pid) __attribute__((weak));
+void task_set_proc_target(int pid) { (void)pid; }
+int  task_tgid_alive(int pid) __attribute__((weak));
+int  task_tgid_alive(int pid) { (void)pid; return 0; }
+/* The per-process files that answer for ANOTHER process.  The rest of
+ * /proc/self (fd/, mountinfo, …) is the caller's own view and is not offered
+ * under a foreign pid — better ENOENT than the caller's data under another
+ * process's name. */
+static int proc_foreign_ok(const char* rest) {
+    static const char* const ok[] = { "oom_score_adj", "oom_score", "status", "cgroup" };
+    for (unsigned i = 0; i < sizeof ok / sizeof ok[0]; i++) {
+        const char* a = ok[i]; const char* b = rest;
+        while (*a && *a == *b) { a++; b++; }
+        if (!*a && (*b == 0 || *b == '/')) return 1;
+    }
+    return 0;
+}
+static int vfs_proc_alias(const char* c, char* out, size_t cap) {
+    const char* pre = "/proc/";
+    size_t i = 0;
+    while (pre[i] && c[i] == pre[i]) i++;
+    if (pre[i]) return 0;
+    task_set_proc_target(0);                        /* §M90 — see above */
+    const char* rest = NULL;
+    int own = 0;                                    /* the caller's own process */
+    long fpid = 0;                                  /* a foreign process's pid */
+    const char* ts = "thread-self/";
+    size_t j = 0;
+    while (ts[j] && c[i + j] == ts[j]) j++;
+    if (!ts[j]) { rest = c + i + j; own = 1; }
+    size_t k = i;
+    if (!rest) {
+        const char* sf = "self/";
+        j = 0;
+        while (sf[j] && c[i + j] == sf[j]) j++;
+        if (!sf[j]) { k = i + j; own = 1; }
+        else {
+            long pid = 0; size_t d = 0;
+            while (c[k] >= '0' && c[k] <= '9') { pid = pid * 10 + (c[k] - '0'); k++; d++; }
+            if (!d || c[k] != '/') return 0;
+            k++;
+            own = pid == task_tgid_current();
+            if (!own) fpid = pid;
+        }
+        /* an optional "task/<tid>/" */
+        const char* tk = "task/";
+        j = 0;
+        while (tk[j] && c[k + j] == tk[j]) j++;
+        if (!tk[j]) {
+            size_t m = k + j, d = 0;
+            while (c[m] >= '0' && c[m] <= '9') { m++; d++; }
+            if (d && c[m] == '/') k = m + 1;
+            else if (d && c[m] == 0) return 0;      /* the thread directory itself */
+        }
+        if (k == i + 5 && own && c[k - 1] == '/' && c[i] == 's') return 0;   /* plain /proc/self/X */
+        int is_ns = c[k] == 'n' && c[k + 1] == 's' && (c[k + 2] == '/' || c[k + 2] == 0);
+        if (!own && !is_ns) {
+            if (!fpid || !proc_foreign_ok(c + k) || !task_tgid_alive((int)fpid)) return 0;
+            task_set_proc_target((int)fpid);
+        }
+        rest = c + k;
+    }
+    const char* self = "/proc/self/";
+    size_t o = 0;
+    for (; self[o] && o + 1 < cap; o++) out[o] = self[o];
+    for (; *rest && o + 1 < cap; rest++) out[o++] = *rest;
+    while (o > 1 && out[o - 1] == '/') o--;
+    out[o] = 0;
+    return 1;
+}
+
 static const char* vfs_canon(const char* path, char* buf, size_t cap) {
     const char* c = vfs_canon_plain(path, buf, cap);
     if (!c) return NULL;
@@ -293,6 +436,16 @@ static const char* vfs_canon(const char* path, char* buf, size_t cap) {
         }
     }
     char m[256];
+    {
+        char a[256];
+        if (vfs_proc_alias(c, a, sizeof a)) {
+            size_t n = 0;
+            while (a[n]) n++;
+            if (n + 1 > cap) return NULL;
+            for (size_t i = 0; i <= n; i++) buf[i] = a[i];
+            c = buf;
+        }
+    }
     if (!vfs_fd_magic(c, m, sizeof m)) return c;
     c = vfs_canon_plain(m, buf, cap);
     if (!c) return NULL;
@@ -304,6 +457,23 @@ static const char* vfs_canon(const char* path, char* buf, size_t cap) {
         c = buf;
     }
     return c;
+}
+
+/* §M90 — canonical WITHOUT resolving a /proc/self/fd/N magic link: for
+ * readlink, whose whole question is what that link names.  The /proc aliases
+ * still apply (thread-self, task/<tid>, <pid>/ns). */
+int vfs_canonical_link(const char* path, char* out, size_t cap) {
+    if (!path || !*path || !out) return -1;
+    const char* c = vfs_canon_plain(path, out, cap);
+    if (!c) return -1;
+    char a[256];
+    if (vfs_proc_alias(c, a, sizeof a)) c = a;
+    if (c != out) {
+        size_t n = strlen_(c);
+        if (n + 1 > cap) return -1;
+        memcpy_(out, c, n + 1);
+    }
+    return 0;
 }
 
 int vfs_canonical(const char* path, char* out, size_t cap) {
@@ -451,11 +621,11 @@ static struct dentry* resolve_path_ex(const char* path,
             /* Last component — return parent + name without descending. */
             if (out_parent)    *out_parent    = cur;
             if (out_last_name) *out_last_name = last_start;
-            return lookup_child(cur, last_start, comp_len);
+            return follow_bind(lookup_child(cur, last_start, comp_len));
         }
 
         /* Intermediate component — must exist and be a directory. */
-        struct dentry* nxt = lookup_child(cur, p, comp_len);
+        struct dentry* nxt = follow_bind(lookup_child(cur, p, comp_len));
         if (!nxt || !nxt->inode || nxt->inode->type != INODE_DIR) return NULL;
         cur = nxt;
         p = slash + 1;
@@ -703,7 +873,11 @@ static struct file* vfs_open_unlocked(const char* path, int flags) {
     return f;
 }
 struct file* vfs_open(const char* path, int flags) {
-    return NS_LOCKED(struct file*, vfs_open_unlocked(path, flags));
+    struct file* f = NS_LOCKED(struct file*, vfs_open_unlocked(path, flags));
+    /* §M90 — the fs's open hook, outside the lock (a generator may walk the
+     * namespace itself: /proc/self/mountinfo). */
+    if (f && f->inode && f->inode->ops && f->inode->ops->open) f->inode->ops->open(f);
+    return f;
 }
 
 int vfs_close(struct file* f) {
@@ -816,11 +990,14 @@ static int split_parent(const char* path, char* parent_buf, size_t cap,
 /* Dispatch a namespace mutator to the parent inode's dir_ops.  Returns
  * 0 on success.  Walks the path, attaches the freshly-created child
  * inode (returned by the fs) under the parent dentry. */
-static int vfs_mutator_unlocked(const char* path, int is_dir);
-static int vfs_mutator(const char* path, int is_dir) {
-    return NS_LOCKED(int, vfs_mutator_unlocked(path, is_dir));
+/* `kind`: 0 a regular file, 1 a directory, 2 a FIFO (§M90 — made by the fs's
+ * `create` and turned into INODE_FIFO here: the fs stores nothing for it). */
+static int vfs_mutator_unlocked(const char* path, int kind);
+static int vfs_mutator(const char* path, int kind) {
+    return NS_LOCKED(int, vfs_mutator_unlocked(path, kind));
 }
-static int vfs_mutator_unlocked(const char* path, int is_dir) {
+static int vfs_mutator_unlocked(const char* path, int kind) {
+    int is_dir = kind == 1;
     char buf[256];
     const char* last;
     if (split_parent(path, buf, sizeof buf, &last) != 0) return -1;
@@ -836,6 +1013,13 @@ static int vfs_mutator_unlocked(const char* path, int is_dir) {
         is_dir ? parent->inode->dir_ops->mkdir
                : parent->inode->dir_ops->create;
     if (!op) return -1;
+    /* §M90 — a FIFO only where nodes live in memory.  A block-backed
+     * filesystem would hand it back after a reboot as an empty regular file
+     * (exFAT has no node type to store), so the honest answer is a refusal. */
+    if (kind == 2) {
+        struct vfs_mount* m = mount_of_dentry(parent);
+        if (m && m->dev_name[0]) return -3;
+    }
 
     /* Refuse a duplicate name up front.  The fs may also enforce this
      * (and should, for races once SMP lands), but checking here keeps
@@ -847,6 +1031,7 @@ static int vfs_mutator_unlocked(const char* path, int is_dir) {
     struct inode* ino = NULL;
     int r = op(parent->inode, last, &ino);
     if (r != 0 || !ino) return r ? r : -3;
+    if (kind == 2) { ino->type = INODE_FIFO; ino->size = 0; }
 
     /* §M32 — A NEW FILE BELONGS TO WHOEVER MADE IT.
      *
@@ -881,6 +1066,7 @@ static int vfs_mutator_unlocked(const char* path, int is_dir) {
 
 int vfs_create(const char* path) { return vfs_mutator(path, 0); }
 int vfs_mkdir (const char* path) { return vfs_mutator(path, 1); }
+int vfs_mkfifo(const char* path) { return vfs_mutator(path, 2); }
 
 /* Remove `path` (file or empty dir).  The fs op frees the inode; we
  * then detach + free the dentry.  Mount roots refuse removal because
@@ -905,6 +1091,7 @@ static int vfs_unlink_unlocked(const char* path) {
     struct dentry*  d    = parent->children;
     while (d && !streq(d->name, last)) { link = &d->sibling; d = d->sibling; }
     if (!d || !d->inode) return -1;
+    if (d->bound) return -6;          /* §M90 — a bind's target: busy (EBUSY) */
     if (d->inode->type == INODE_DIR && d->children &&
         !(d->inode->vflags & VFS_IF_OWN_CHILDREN)) return -2;   /* not empty */
     if (d->inode->type == INODE_DEVICE) return -1;               /* devfs nodes */
@@ -1624,3 +1811,65 @@ static void cmd_inodetest(const char* args) {
 }
 
 SHELL_CMD(inodetest) = { "inodetest", "", NULL, SHELL_G_TEST, cmd_inodetest, SHELL_P_ADMIN };
+
+/* ------------------------------------------------------------------- */
+/* §M90 — vfs_bind / vfs_unbind (see vfs.h and the table above).        */
+/* ------------------------------------------------------------------- */
+
+/* The TARGET dentry itself, not what a bind on it would redirect to. */
+static struct dentry* bind_target_unlocked(const char* path) {
+    char buf[256];
+    const char* last;
+    if (split_parent(path, buf, sizeof buf, &last) != 0 || !*last) return NULL;
+    struct dentry* parent = resolve_path(buf, NULL, NULL);
+    if (!parent || !parent->inode || parent->inode->type != INODE_DIR) return NULL;
+    return lookup_child(parent, last, strlen_(last));
+}
+
+int vfs_bind(const char* src, const char* tgt) {
+    kmutex_lock(&ns_lock);
+    int r;
+    struct dentry* S = resolve_path(src, NULL, NULL);
+    struct dentry* T = bind_target_unlocked(tgt);
+    if (!S || !S->inode || !T || !T->inode) r = -1;
+    else if (T->bound && bind_visible(T)) r = -2;
+    else if ((S->inode->type == INODE_DIR) != (T->inode->type == INODE_DIR)) r = -3;
+    else if (g_nbinds >= VFS_MAX_BINDS) r = -4;
+    else if (S == T) r = 0;                       /* onto itself: nothing changes */
+    else {
+        T->bound_seq = ++g_bind_seq;
+        T->bound_ns  = task_mntns_current();
+        T->bound     = S;
+        g_binds[g_nbinds].tgt = T;
+        g_binds[g_nbinds].src = S;
+        g_nbinds++;
+        r = 0;
+    }
+    kmutex_unlock(&ns_lock);
+    return r;
+}
+
+int vfs_unbind(const char* tgt) {
+    kmutex_lock(&ns_lock);
+    int r = -1;
+    struct dentry* T = bind_target_unlocked(tgt);
+    if (T && T->bound && bind_visible(T)) {
+        T->bound = NULL;
+        for (int i = 0; i < g_nbinds; i++)
+            if (g_binds[i].tgt == T) { g_binds[i] = g_binds[--g_nbinds]; break; }
+        r = 0;
+    }
+    kmutex_unlock(&ns_lock);
+    return r;
+}
+
+int vfs_bind_count(void) { return g_nbinds; }
+int vfs_bind_nth(int i, char* src, size_t scap, char* tgt, size_t tcap) {
+    kmutex_lock(&ns_lock);
+    int r = -1;
+    if (i >= 0 && i < g_nbinds && g_binds[i].tgt->bound && bind_visible(g_binds[i].tgt) &&
+        vfs_dentry_path_unlocked(g_binds[i].src, src, scap) == 0 &&
+        vfs_dentry_path_unlocked(g_binds[i].tgt, tgt, tcap) == 0) r = 0;
+    kmutex_unlock(&ns_lock);
+    return r;
+}
